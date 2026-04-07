@@ -1,0 +1,23 @@
+[project]
+name = "spectral-analyzer"
+version = "0.1.0"
+description = "Musical spectral analyzer — GPU-accelerated CQT with stereo PIL rendering and interactive OpenGL viewer"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "librosa",
+    "torch",
+    "Pillow",
+    "matplotlib",
+]
+
+[project.optional-dependencies]
+mp3 = ["miniaudio"]
+viewer = ["pygame", "PyOpenGL"]
+all = ["miniaudio", "pygame", "PyOpenGL"]
+
+[project.scripts]
+bass-analyze = "bass_analysis:main"
+bass-plot = "bass_plot:main"
+bass-view = "bass_viewer:main"

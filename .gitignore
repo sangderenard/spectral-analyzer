@@ -1,0 +1,28 @@
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+
+# Analysis outputs
+*_analysis/
+
+# Audio files
+*.wav
+*.mp3
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
+*.txt
+
+# Environments
+.venv/
+venv/
+env/
+
+# Distribution
+dist/
+build/
+*.egg-info/
+

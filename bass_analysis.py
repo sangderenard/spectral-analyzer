@@ -165,6 +165,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trim-pad", action="store_true", default=False,
                         help="Trim padding regions from the edges of spectrogram images "
                              "(only affects display, not analysis).")
+    parser.add_argument("--start-time", type=float, default=None,
+                        help="Start time in seconds for partial analysis. "
+                             "If omitted, analysis starts from the beginning.")
+    parser.add_argument("--end-time", type=float, default=None,
+                        help="End time in seconds for partial analysis. "
+                             "If omitted, analysis runs to the end.")
     return parser.parse_args()
 
 
@@ -732,43 +738,70 @@ def db_power(power: np.ndarray) -> np.ndarray:
 def analyze(
     freqs: np.ndarray, times: np.ndarray, power: np.ndarray, cfg: AnalysisConfig
 ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+    n_frames = power.shape[1]
     bass_mask = band_mask(freqs, cfg.bass_min, cfg.bass_max)
     kick_mask = band_mask(freqs, cfg.kick_min, cfg.kick_max)
     bulge_mask = band_mask(freqs, cfg.bulge_min, cfg.bulge_max)
 
-    if not np.any(bass_mask):
-        raise ValueError("Bass band mask is empty. Adjust --bass-min / --bass-max.")
-    if not np.any(kick_mask):
-        raise ValueError("Kick band mask is empty. Adjust --kick-min / --kick-max.")
-    if not np.any(bulge_mask):
-        raise ValueError("Bulge band mask is empty. Adjust --bulge-min / --bulge-max.")
+    # When CQT fmin is above the bass/kick/bulge range (e.g. Hybrid mode
+    # or narrow partial analysis), produce zeroed metrics instead of crashing.
+    has_bass = np.any(bass_mask)
+    has_kick = np.any(kick_mask)
+    has_bulge = np.any(bulge_mask)
 
-    kick_freqs = freqs[kick_mask]
-    bass_power = power[bass_mask, :]
-    kick_power = power[kick_mask, :]
-    bulge_power = power[bulge_mask, :]
+    if not has_bass:
+        print("  Warning: bass band outside CQT range — metrics zeroed")
+    if not has_kick:
+        print("  Warning: kick band outside CQT range — metrics zeroed")
+    if not has_bulge:
+        print("  Warning: bulge band outside CQT range — metrics zeroed")
 
-    bass_energy_db = db_power(bass_power.sum(axis=0))
-    bulge_energy_db = db_power(bulge_power.sum(axis=0))
+    zeros = np.zeros(n_frames, dtype=np.float64)
+    nans = np.full(n_frames, np.nan, dtype=np.float64)
 
-    dt = np.median(np.diff(times)) if len(times) > 1 else 0.01
-    smooth_width = max(1, int(round((cfg.envelope_smooth_ms / 1000.0) / max(dt, 1e-6))))
-    bulge_energy_db_smooth = moving_average(bulge_energy_db, smooth_width)
+    if has_bass:
+        bass_power = power[bass_mask, :]
+        bass_energy_db = db_power(bass_power.sum(axis=0))
+        bass_delta = np.diff(bass_power, axis=1, prepend=bass_power[:, :1])
+        bass_flux_db = db_power(np.maximum(bass_delta, 0.0).sum(axis=0) + EPS)
+    else:
+        bass_energy_db = zeros.copy()
+        bass_flux_db = zeros.copy()
 
-    kick_centroid_hz = weighted_centroid(kick_freqs, kick_power)
-    kick_peak_freq_hz = peak_frequency(kick_freqs, kick_power)
-    kick_rolloff_low_hz, kick_rolloff_high_hz = rolloff_pair(kick_freqs, kick_power, 0.15, 0.85)
+    if has_kick:
+        kick_freqs = freqs[kick_mask]
+        kick_power = power[kick_mask, :]
+        kick_centroid_hz = weighted_centroid(kick_freqs, kick_power)
+        kick_peak_freq_hz = peak_frequency(kick_freqs, kick_power)
+        kick_rolloff_low_hz, kick_rolloff_high_hz = rolloff_pair(
+            kick_freqs, kick_power, 0.15, 0.85)
+        kick_energy_db = db_power(kick_power.sum(axis=0))
+    else:
+        kick_centroid_hz = nans.copy()
+        kick_peak_freq_hz = nans.copy()
+        kick_rolloff_low_hz = nans.copy()
+        kick_rolloff_high_hz = nans.copy()
+        kick_energy_db = zeros.copy()
 
-    lowest_rep_freq_hz, highest_rep_freq_hz = track_edge_frequencies(freqs, power, cfg.edge_threshold_db)
+    if has_bulge:
+        bulge_power = power[bulge_mask, :]
+        bulge_energy_db = db_power(bulge_power.sum(axis=0))
+        dt = np.median(np.diff(times)) if len(times) > 1 else 0.01
+        smooth_width = max(1, int(round(
+            (cfg.envelope_smooth_ms / 1000.0) / max(dt, 1e-6))))
+        bulge_energy_db_smooth = moving_average(bulge_energy_db, smooth_width)
+    else:
+        bulge_energy_db_smooth = zeros.copy()
 
-    bass_delta = np.diff(bass_power, axis=1, prepend=bass_power[:, :1])
-    bass_flux_db = db_power(np.maximum(bass_delta, 0.0).sum(axis=0) + EPS)
+    lowest_rep_freq_hz, highest_rep_freq_hz = track_edge_frequencies(
+        freqs, power, cfg.edge_threshold_db)
 
-    peaks_idx, _ = find_peaks(bulge_energy_db_smooth, prominence=cfg.peak_prominence_db)
+    peaks_idx, _ = find_peaks(bulge_energy_db_smooth,
+                              prominence=cfg.peak_prominence_db)
 
     return {
         "bass_energy_db": bass_energy_db,
-        "kick_energy_db": db_power(kick_power.sum(axis=0)),
+        "kick_energy_db": kick_energy_db,
         "bulge_energy_db": bulge_energy_db_smooth,
         "kick_centroid_hz": kick_centroid_hz,
         "kick_peak_freq_hz": kick_peak_freq_hz,
@@ -978,6 +1011,22 @@ def main() -> None:
     is_stereo = not np.array_equal(x_left, x_right)
     # Mono mix for analysis (metrics, onset).
     x_mono = (x_left + x_right) * 0.5
+
+    # --- Time-region slicing (partial analysis) ---
+    if args.start_time is not None or args.end_time is not None:
+        total_samples = len(x_left)
+        s0 = 0
+        s1 = total_samples
+        if args.start_time is not None:
+            s0 = max(0, min(total_samples, int(args.start_time * sr)))
+        if args.end_time is not None:
+            s1 = max(s0, min(total_samples, int(args.end_time * sr)))
+        if s1 > s0:
+            x_left = x_left[s0:s1]
+            x_right = x_right[s0:s1]
+            x_mono = x_mono[s0:s1]
+            print(f"  Partial analysis: {s0/sr:.3f}s – {s1/sr:.3f}s "
+                  f"({s1-s0} samples of {total_samples})")
 
     # --- Compositing ---
     composite_regions = None

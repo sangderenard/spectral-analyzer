@@ -32,6 +32,7 @@ class PlotSeries:
     dot_radius: int = 2
     data_x: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     data_y: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
+    clip_color: tuple[int, int, int] | None = None  # if set, segments outside clip range use this color
 
 
 # ---------------------------------------------------------------------------
@@ -60,6 +61,10 @@ class PlotWidget:
         self.y_max: float | None = None
         self.grid_lines: int = 4
         self._font: pygame.font.Font | None = None
+        # Clip boundary lines — horizontal lines drawn in clip_boundary_color
+        self.clip_lo: float | None = None   # lower clip boundary (Y value)
+        self.clip_hi: float | None = None   # upper clip boundary (Y value)
+        self.clip_boundary_color: tuple[int, int, int] = (200, 50, 50)
 
     def _ensure_font(self) -> None:
         if self._font is None:
@@ -152,14 +157,36 @@ class PlotWidget:
             lbl = font.render(f"{val:.2g}", True, self.AXIS_COLOR)
             surf.blit(lbl, (x + 2, gy - lbl.get_height() // 2))
 
+        # --- clip boundary lines ---
+        if self.clip_lo is not None and ylo <= self.clip_lo <= yhi:
+            _, cy = to_px(xlo, self.clip_lo)
+            pygame.draw.line(surf, self.clip_boundary_color,
+                             (inner_x, cy), (inner_x + inner_w, cy), 1)
+        if self.clip_hi is not None and ylo <= self.clip_hi <= yhi:
+            _, cy = to_px(xlo, self.clip_hi)
+            pygame.draw.line(surf, self.clip_boundary_color,
+                             (inner_x, cy), (inner_x + inner_w, cy), 1)
+
         # --- series ---
+        c_lo = self.clip_lo if self.clip_lo is not None else -float("inf")
+        c_hi = self.clip_hi if self.clip_hi is not None else float("inf")
         for s in self.series:
             if s.data_x.size == 0:
                 continue
             pts = [to_px(float(s.data_x[i]), float(s.data_y[i]))
                    for i in range(len(s.data_x))]
             if s.line and len(pts) >= 2:
-                pygame.draw.lines(surf, s.color, False, pts, 1)
+                if s.clip_color is not None:
+                    # Draw segments, switching color for clipped portions
+                    for j in range(len(pts) - 1):
+                        y0_val = float(s.data_y[j])
+                        y1_val = float(s.data_y[j + 1])
+                        clipped = (y0_val < c_lo or y0_val > c_hi or
+                                   y1_val < c_lo or y1_val > c_hi)
+                        col = s.clip_color if clipped else s.color
+                        pygame.draw.line(surf, col, pts[j], pts[j + 1], 1)
+                else:
+                    pygame.draw.lines(surf, s.color, False, pts, 1)
             if s.dots:
                 for px, py in pts:
                     pygame.draw.circle(surf, s.color, (px, py), s.dot_radius)

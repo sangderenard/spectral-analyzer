@@ -188,6 +188,25 @@ class GlyphAtlas:
 # Shader sources
 # ---------------------------------------------------------------------------
 
+OVERLAY_VERT_SRC = """
+#version 330 compatibility
+out vec2 vUV;
+void main() {
+    gl_Position = gl_Vertex;
+    vUV = gl_MultiTexCoord0.xy;
+}
+"""
+
+OVERLAY_FRAG_SRC = """
+#version 330 compatibility
+in vec2 vUV;
+out vec4 fragColor;
+uniform sampler2D uTex;
+void main() {
+    fragColor = texture(uTex, vUV);
+}
+"""
+
 VERT_SRC = """
 #version 330 compatibility
 out vec2 vUV;
@@ -200,6 +219,7 @@ void main() {
 FRAG_SRC = """
 #version 330 compatibility
 #define MAX_FIELDS 16
+#define N_CHAN 4
 
 in vec2 vUV;
 out vec4 fragColor;
@@ -211,8 +231,17 @@ uniform int   uFieldCount;
 uniform ivec4 uFieldDesc[MAX_FIELDS];   // (tex_unit, tex_chan, target, norm_mode)
 uniform vec4  uFieldParams[MAX_FIELDS]; // (gamma, scale, 0, 0)
 
+uniform int   uMonoMixMode;            // 0=avg 1=first 2=last 3=mid 4=side
+uniform vec4  uChannelHue;             // hue for each of the 4 data channels (0-1)
+uniform vec4  uChannelSat;             // saturation for each data channel (0-1)
+uniform int   uBlendMode;             // 0=additive  1=subtractive
 uniform vec4  uOutGamma;               // per-display-channel post-agg gamma
 uniform vec4  uOutScale;               // per-display-channel post-agg scale
+
+// HDR dynamic range compression
+uniform int   uHdrNormalizer;          // 0=none 1=clamp 2=reinhard 3=sigmoid 4=linear
+uniform vec2  uHdrInputRange;          // (lo, hi) — expected input range
+uniform vec2  uHdrOutputRange;         // (lo, hi) — desired output range
 
 vec4 sampleTex(int u) {
     if (u == 0) return texture(uTex0, vUV);
@@ -243,9 +272,44 @@ float applyNorm(float v, int mode) {
     return clamp(v, 0.0, 1.0);
 }
 
+float mixChannel(float first, float last, float sum, float count) {
+    if (count <= 0.0) return 0.0;
+    if (count <= 1.0) return first;
+    // count >= 2 — apply mono mix mode
+    if (uMonoMixMode == 1) return first;                    // First / L
+    if (uMonoMixMode == 2) return last;                     // Last / R
+    if (uMonoMixMode == 3) return (first + last) * 0.5;    // Mid
+    if (uMonoMixMode == 4) return abs(first - last) * 0.5; // Side
+    return sum / count;                                      // 0 = Average
+}
+
+// HSL to RGB — attempt hue in [0,1], saturation [0,1], lightness = value
+vec3 hsl2rgb(float h, float s, float l) {
+    float c = (1.0 - abs(2.0 * l - 1.0)) * s;
+    float hp = h * 6.0;
+    float x = c * (1.0 - abs(mod(hp, 2.0) - 1.0));
+    vec3 rgb;
+    if      (hp < 1.0) rgb = vec3(c, x, 0.0);
+    else if (hp < 2.0) rgb = vec3(x, c, 0.0);
+    else if (hp < 3.0) rgb = vec3(0.0, c, x);
+    else if (hp < 4.0) rgb = vec3(0.0, x, c);
+    else if (hp < 5.0) rgb = vec3(x, 0.0, c);
+    else               rgb = vec3(c, 0.0, x);
+    float m = l - c * 0.5;
+    return rgb + m;
+}
+
 void main() {
-    vec4 accum  = vec4(0.0);
-    vec4 counts = vec4(0.0);
+    // Per-channel accumulators (4 data channels)
+    vec4 accum   = vec4(0.0);
+    vec4 counts  = vec4(0.0);
+    vec4 first_v = vec4(0.0);
+    vec4 last_v  = vec4(0.0);
+    // Alpha accumulator (target == 4)
+    float alpha_accum = 0.0;
+    float alpha_count = 0.0;
+    float alpha_first = 0.0;
+    float alpha_last  = 0.0;
 
     for (int i = 0; i < MAX_FIELDS; i++) {
         if (i >= uFieldCount) break;
@@ -265,37 +329,94 @@ void main() {
         float normed = applyNorm(raw, nMode);
         float val    = pow(normed, gamma) * scale;
 
-        if      (target == 0) { accum.r += val; counts.r += 1.0; }
-        else if (target == 1) { accum.g += val; counts.g += 1.0; }
-        else if (target == 2) { accum.b += val; counts.b += 1.0; }
-        else if (target == 3) { accum.a += val; counts.a += 1.0; }
-        else if (target == 4) { accum.r += val; counts.r += 1.0;   // W = R+G+B
-                                 accum.g += val; counts.g += 1.0;
-                                 accum.b += val; counts.b += 1.0; }
-        else if (target == 5) { accum.g += val; counts.g += 1.0;   // C = G+B
-                                 accum.b += val; counts.b += 1.0; }
-        else if (target == 6) { accum.r += val; counts.r += 1.0;   // M = R+B
-                                 accum.b += val; counts.b += 1.0; }
-        else if (target == 7) { accum.r += val; counts.r += 1.0;   // Y = R+G
-                                 accum.g += val; counts.g += 1.0; }
+        if (target <= 3) {
+            // Data channels 0-3
+            if (target == 0) { if (counts.r == 0.0) first_v.r = val; last_v.r = val; accum.r += val; counts.r += 1.0; }
+            if (target == 1) { if (counts.g == 0.0) first_v.g = val; last_v.g = val; accum.g += val; counts.g += 1.0; }
+            if (target == 2) { if (counts.b == 0.0) first_v.b = val; last_v.b = val; accum.b += val; counts.b += 1.0; }
+            if (target == 3) { if (counts.a == 0.0) first_v.a = val; last_v.a = val; accum.a += val; counts.a += 1.0; }
+        } else if (target == 4) {
+            // Alpha channel
+            if (alpha_count == 0.0) alpha_first = val;
+            alpha_last = val;
+            alpha_accum += val;
+            alpha_count += 1.0;
+        }
     }
 
-    // Average when multiple fields target the same channel
-    if (counts.r > 1.0) accum.r /= counts.r;
-    if (counts.g > 1.0) accum.g /= counts.g;
-    if (counts.b > 1.0) accum.b /= counts.b;
-    if (counts.a > 1.0) accum.a /= counts.a;
+    // Per-channel aggregation via mono mix mode
+    vec4 mixed;
+    mixed.r = mixChannel(first_v.r, last_v.r, accum.r, counts.r);
+    mixed.g = mixChannel(first_v.g, last_v.g, accum.g, counts.g);
+    mixed.b = mixChannel(first_v.b, last_v.b, accum.b, counts.b);
+    mixed.a = mixChannel(first_v.a, last_v.a, accum.a, counts.a);
 
-    // Global post-aggregation normalization
-    accum.r = pow(accum.r, uOutGamma.x) * uOutScale.x;
-    accum.g = pow(accum.g, uOutGamma.y) * uOutScale.y;
-    accum.b = pow(accum.b, uOutGamma.z) * uOutScale.z;
-    accum.a = pow(accum.a, uOutGamma.w) * uOutScale.w;
+    // Alpha aggregation
+    float alpha_val = mixChannel(alpha_first, alpha_last, alpha_accum, alpha_count);
+    if (alpha_count == 0.0) alpha_val = 1.0;
 
-    // Default alpha to 1 if no field targets it
-    if (counts.a == 0.0) accum.a = 1.0;
+    // Convert each data channel's intensity to RGB via its HSL hue, then blend
+    vec3 rgb = vec3(0.0);
+    float hues[N_CHAN] = float[](uChannelHue.x, uChannelHue.y, uChannelHue.z, uChannelHue.w);
+    float sats[N_CHAN] = float[](uChannelSat.x, uChannelSat.y, uChannelSat.z, uChannelSat.w);
+    float vals[N_CHAN] = float[](mixed.r, mixed.g, mixed.b, mixed.a);
+    float cnts[N_CHAN] = float[](counts.r, counts.g, counts.b, counts.a);
 
-    fragColor = clamp(accum, 0.0, 1.0);
+    if (uBlendMode == 0) {
+        // Additive: sum HSL-colored contributions
+        for (int ch = 0; ch < N_CHAN; ch++) {
+            if (cnts[ch] <= 0.0) continue;
+            float v = clamp(vals[ch], 0.0, 1.0);
+            // lightness = v * 0.5 so full value gives L=0.5 (maximum chroma)
+            rgb += hsl2rgb(hues[ch], sats[ch], v * 0.5);
+        }
+    } else {
+        // Subtractive: multiply (1 - contribution)
+        rgb = vec3(1.0);
+        bool any_active = false;
+        for (int ch = 0; ch < N_CHAN; ch++) {
+            if (cnts[ch] <= 0.0) continue;
+            any_active = true;
+            float v = clamp(vals[ch], 0.0, 1.0);
+            vec3 ink = hsl2rgb(hues[ch], sats[ch], v * 0.5);
+            rgb *= (vec3(1.0) - ink);
+        }
+        if (any_active) rgb = vec3(1.0) - rgb;
+        else rgb = vec3(0.0);
+    }
+
+    // Post-aggregation gamma/scale (applied to final RGB)
+    rgb.r = pow(max(rgb.r, 0.0), uOutGamma.x) * uOutScale.x;
+    rgb.g = pow(max(rgb.g, 0.0), uOutGamma.y) * uOutScale.y;
+    rgb.b = pow(max(rgb.b, 0.0), uOutGamma.z) * uOutScale.z;
+    alpha_val = pow(max(alpha_val, 0.0), uOutGamma.w) * uOutScale.w;
+
+    // HDR normalization (pre-clip, post-blend)
+    if (uHdrNormalizer > 0) {
+        float span_in = uHdrInputRange.y - uHdrInputRange.x;
+        if (abs(span_in) < 1e-12) span_in = 1.0;
+        float span_out = uHdrOutputRange.y - uHdrOutputRange.x;
+        for (int c = 0; c < 3; c++) {
+            float v = (c == 0) ? rgb.r : ((c == 1) ? rgb.g : rgb.b);
+            float t = (v - uHdrInputRange.x) / span_in;
+            if (uHdrNormalizer == 1) {       // Clamp
+                t = clamp(t, 0.0, 1.0);
+            } else if (uHdrNormalizer == 2) { // Reinhard
+                t = max(t, 0.0);
+                t = t / (1.0 + t);
+            } else if (uHdrNormalizer == 3) { // Sigmoid
+                t = 1.0 / (1.0 + exp(-6.0 * (t - 0.5)));
+            } else if (uHdrNormalizer == 4) { // Linear Compress
+                t = clamp(t, 0.0, 1.0);
+            }
+            float mapped = uHdrOutputRange.x + t * span_out;
+            if (c == 0) rgb.r = mapped;
+            else if (c == 1) rgb.g = mapped;
+            else rgb.b = mapped;
+        }
+    }
+
+    fragColor = clamp(vec4(rgb, alpha_val), 0.0, 1.0);
 }
 """
 
@@ -412,8 +533,16 @@ FIELD_DISPLAY = {
 }
 
 NORM_MODES = ["linear", "dB", "rank_order"]
-TARGET_LABELS = ["none", "R", "G", "B", "A", "W", "C", "M", "Y"]
-TARGET_VALUES = [-1, 0, 1, 2, 3, 4, 5, 6, 7]
+TARGET_LABELS = ["none", "Ch1", "Ch2", "Ch3", "Ch4", "Alpha"]
+TARGET_VALUES = [-1, 0, 1, 2, 3, 4]
+BLEND_MODES = ["Additive", "Subtractive"]
+
+# HDR normalizer modes for pre-clip post-blend compression
+HDR_NORMALIZERS = ["None", "Clamp", "Reinhard", "Sigmoid", "Linear Compress"]
+
+# Default channel hues (evenly spaced on the colour wheel, 0-1 range)
+DEFAULT_CHANNEL_HUES = [0.0, 0.25, 0.5, 0.75]      # red, yellow-green, cyan, violet
+DEFAULT_CHANNEL_SATS = [1.0, 1.0, 1.0, 1.0]
 
 # Virtual texture channel layouts — same channel packing as bass_plot.py
 _TEXTURE_LAYOUTS: dict[str, dict[str, str | None]] = {
@@ -424,6 +553,7 @@ _TEXTURE_LAYOUTS: dict[str, dict[str, str | None]] = {
     "cqt_mag_stereo":    {"R": "mag_left",   "G": "mag_right",  "B": "mag_similarity",  "A": None},
     "cqt_phase_stereo":  {"R": "phase_left", "G": "phase_right","B": "phase_similarity","A": None},
     "onset":             {"R": "onset",       "G": None,         "B": None,              "A": None},
+    "wavelet_coeffs":    {"R": "wvlt_approx","G": "wvlt_detail", "B": None,              "A": None},
 }
 
 
@@ -433,11 +563,34 @@ class FieldSource:
     display_name: str
     tex_name: str
     tex_channel: int  # 0=R 1=G 2=B 3=A
+    category: str = "cqt"  # "cqt" | "fb" | "wvlt"
+    available: bool = True  # False → greyed out in tree
+
+
+# Category display order and labels for the data tree
+_FIELD_CATEGORIES = [
+    ("cqt", "CQT"),
+    ("fb", "Filterbank"),
+    ("wvlt", "Wavelet"),
+]
+
+# Map field names to categories
+_FIELD_CATEGORY_MAP: dict[str, str] = {
+    "real_left": "cqt", "imag_left": "cqt",
+    "real_right": "cqt", "imag_right": "cqt",
+    "mag_left": "cqt", "phase_left": "cqt",
+    "mag_right": "cqt", "phase_right": "cqt",
+    "mag_similarity": "cqt", "phase_similarity": "cqt",
+    "onset": "cqt",
+    "fb_mag_left": "fb", "fb_phase_left": "fb",
+    "fb_mag_right": "fb", "fb_phase_right": "fb",
+    "wvlt_approx": "wvlt", "wvlt_detail": "wvlt",
+}
 
 
 @dataclass
 class FieldConfig:
-    target: int = -1       # display channel: 0=R 1=G 2=B 3=A, -1=disabled
+    target: int = -1       # data channel 0-3, alpha=4, -1=disabled
     norm_mode: int = 0     # 0=linear 1=dB 2=rank_order
     gamma: float = 1.0
     scale: float = 1.0
@@ -451,6 +604,159 @@ class GlobalDefaults:
     scale: float = 1.0
     out_gamma: float = 1.0
     out_scale: float = 1.0
+    channel_hues: list[float] | None = None   # per-channel hue (0-1), len 4
+    channel_sats: list[float] | None = None   # per-channel saturation (0-1), len 4
+    blend_mode: int = 0                        # 0=additive, 1=subtractive
+    # HDR dynamic range controls
+    hdr_input_lo: float = 0.0     # expected input floor (can be negative)
+    hdr_input_hi: float = 1.0     # expected input ceiling (can exceed 1)
+    hdr_output_lo: float = 0.0    # desired output floor
+    hdr_output_hi: float = 1.0    # desired output ceiling
+    hdr_normalizer: int = 0       # index into HDR_NORMALIZERS
+
+    def __post_init__(self) -> None:
+        if self.channel_hues is None:
+            self.channel_hues = list(DEFAULT_CHANNEL_HUES)
+        if self.channel_sats is None:
+            self.channel_sats = list(DEFAULT_CHANNEL_SATS)
+
+
+# ---------------------------------------------------------------------------
+# Overlay display mode — common grid normalization + layer compositing
+# ---------------------------------------------------------------------------
+
+OVERLAY_AXIS_ROLES = ["time", "frequency", "amplitude", "scale"]
+OVERLAY_AXIS_LABELS = {
+    "time": "Time",
+    "frequency": "Frequency",
+    "amplitude": "Amplitude",
+    "scale": "Scale",
+}
+
+OVERLAY_SOURCES = ["cqt", "fb", "wavelet"]
+OVERLAY_SOURCE_LABELS = {"cqt": "CQT", "fb": "Filterbank", "wavelet": "Wavelet"}
+
+
+@dataclass
+class OverlayLayer:
+    """One data source layer in the overlay composite."""
+    source: str = "cqt"        # "cqt" | "fb" | "wavelet"
+    enabled: bool = True
+    opacity: float = 1.0       # 0..1
+    x_role: str = "time"       # which data dimension maps to screen X
+    y_role: str = "frequency"  # which data dimension maps to screen Y
+    channel: int = 0           # data channel used (0=Ch1 .. 3=Ch4)
+
+    @property
+    def transposed(self) -> bool:
+        """True when axes are swapped from the native orientation."""
+        return self.x_role == "frequency" and self.y_role == "time"
+
+
+@dataclass
+class OverlayConfig:
+    """Global settings for the overlay display mode."""
+    layers: list[OverlayLayer] | None = None
+    common_x: str = "time"        # master X axis interpretation
+    common_y: str = "frequency"   # master Y axis interpretation
+
+    def __post_init__(self) -> None:
+        if self.layers is None:
+            self.layers = [
+                OverlayLayer("cqt", True, 1.0, "time", "frequency", 0),
+                OverlayLayer("fb", False, 0.7, "time", "frequency", 0),
+                OverlayLayer("wavelet", False, 0.5, "time", "scale", 0),
+            ]
+
+
+def _overlay_resample_to_grid(
+    data: np.ndarray,
+    src_x: np.ndarray,
+    src_y: np.ndarray,
+    dst_x: np.ndarray,
+    dst_y: np.ndarray,
+    transpose: bool = False,
+) -> np.ndarray:
+    """Resample a 2-D (rows=Y, cols=X) array onto a common grid.
+
+    *src_x*, *src_y* are the native coordinate arrays of *data*.
+    *dst_x*, *dst_y* define the target grid.  Nearest-neighbour lookup
+    is used so the native dtype and precision are preserved.
+
+    If *transpose* is True the data's axes are swapped before resampling
+    (rows become X, cols become Y).
+    """
+    if transpose:
+        data = data.T
+        src_x, src_y = src_y, src_x
+
+    out_h = len(dst_y)
+    out_w = len(dst_x)
+    if out_h == 0 or out_w == 0 or data.size == 0:
+        return np.zeros((out_h, out_w), dtype=data.dtype)
+
+    h_src, w_src = data.shape[:2]
+
+    # Map destination coordinates into source index space via
+    # nearest-neighbour lookup in the sorted source axes.
+    xi = np.clip(np.searchsorted(src_x, dst_x) - 1, 0, w_src - 1)
+    yi = np.clip(np.searchsorted(src_y, dst_y) - 1, 0, h_src - 1)
+
+    return data[np.ix_(yi, xi)]
+
+
+def _hsl2rgb_vec(h: float, s: float, l: float) -> tuple[float, float, float]:
+    """CPU replica of the GLSL hsl2rgb used in the spectrogram shader."""
+    c = (1.0 - abs(2.0 * l - 1.0)) * s
+    hp = h * 6.0
+    x = c * (1.0 - abs((hp % 2.0) - 1.0))
+    if hp < 1.0:
+        rgb = (c, x, 0.0)
+    elif hp < 2.0:
+        rgb = (x, c, 0.0)
+    elif hp < 3.0:
+        rgb = (0.0, c, x)
+    elif hp < 4.0:
+        rgb = (0.0, x, c)
+    elif hp < 5.0:
+        rgb = (x, 0.0, c)
+    else:
+        rgb = (c, 0.0, x)
+    m = l - c * 0.5
+    return (rgb[0] + m, rgb[1] + m, rgb[2] + m)
+
+
+def _broadcast_hsl2rgb_additive(
+    out: np.ndarray, v: np.ndarray, h: float, s: float,
+) -> None:
+    """Add per-pixel HSL(h, s, v*0.5) → RGB into *out* (H×W×3).
+
+    Replicates the shader's ``rgb += hsl2rgb(hue, sat, v * 0.5);``
+    loop exactly.  *v* is (H, W) float32 in [0, 1].
+    """
+    # l = v * 0.5  →  c = (1 - |2l - 1|) * s = (1 - |v - 1|) * s = v * s
+    # (since v in [0,1], 2l-1 = v-1 ∈ [-1,0], abs → 1-v, 1-abs → v)
+    c = v * s
+    hp = h * 6.0
+    x = c * (1.0 - abs((hp % 2.0) - 1.0))
+    m = v * 0.5 - c * 0.5   # l - c/2
+
+    if hp < 1.0:
+        r, g, b = c, x, np.float32(0.0)
+    elif hp < 2.0:
+        r, g, b = x, c, np.float32(0.0)
+    elif hp < 3.0:
+        r, g, b = np.float32(0.0), c, x
+    elif hp < 4.0:
+        r, g, b = np.float32(0.0), x, c
+    elif hp < 5.0:
+        r, g, b = x, np.float32(0.0), c
+    else:
+        r, g, b = c, np.float32(0.0), x
+
+    out[:, :, 0] += r + m
+    out[:, :, 1] += g + m
+    out[:, :, 2] += b + m
 
 
 # ---------------------------------------------------------------------------
@@ -1398,24 +1704,89 @@ class FilterBankDecomposition:
         return fpath
 
 
-def _build_field_sources(has_onset: bool) -> list[FieldSource]:
-    """Build the list of data fields from the virtual texture layouts."""
+def _build_field_sources(has_onset: bool,
+                         has_fb: bool = False,
+                         has_wvlt: bool = False) -> list[FieldSource]:
+    """Build the list of data fields from the virtual texture layouts.
+
+    Includes placeholder entries for filterbank and wavelet sources
+    so they appear in the tree (greyed out when unavailable).
+
+    Audio is always stored as L+R internally; mono-derived fields use
+    the shader's *uMonoMixMode* uniform to mix L and R on the GPU.
+    """
     seen: set[str] = set()
     sources: list[FieldSource] = []
     for tex_name, layout in _TEXTURE_LAYOUTS.items():
         if tex_name == "onset" and not has_onset:
+            # Still add as unavailable so it shows in tree
+            sources.append(FieldSource(
+                name="onset",
+                display_name=FIELD_DISPLAY.get("onset", "onset"),
+                tex_name=tex_name,
+                tex_channel=0,
+                category="cqt",
+                available=False,
+            ))
+            seen.add("onset")
+            continue
+        if tex_name == "wavelet_coeffs":
+            # Wavelet fields handled separately below with has_wvlt flag
             continue
         for ch_idx, ch_key in enumerate("RGBA"):
             field_name = layout.get(ch_key)
             if field_name is None or field_name in seen:
                 continue
             seen.add(field_name)
+            cat = _FIELD_CATEGORY_MAP.get(field_name, "cqt")
             sources.append(FieldSource(
                 name=field_name,
                 display_name=FIELD_DISPLAY.get(field_name, field_name),
                 tex_name=tex_name,
                 tex_channel=ch_idx,
+                category=cat,
+                available=True,
             ))
+
+    # Filterbank L/R fields.
+    # tex_names use dedicated "fb_*_polar" keys so they do NOT alias
+    # the CQT textures — _compute_fb_envelopes uploads under these keys
+    # and _render_fb_tf binds them through _set_field_uniforms.
+    fb_fields = [
+        ("fb_mag_left",    "FB Mag L",   "fb_left_polar",  0),
+        ("fb_phase_left",  "FB Phase L", "fb_left_polar",  1),
+        ("fb_mag_right",   "FB Mag R",   "fb_right_polar", 0),
+        ("fb_phase_right", "FB Phase R", "fb_right_polar", 1),
+    ]
+    for fname, dname, tname, ch in fb_fields:
+        if fname not in seen:
+            seen.add(fname)
+            sources.append(FieldSource(
+                name=fname,
+                display_name=dname,
+                tex_name=tname,
+                tex_channel=ch,
+                category="fb",
+                available=has_fb,
+            ))
+
+    # Wavelet approximation/detail
+    wvlt_fields = [
+        ("wvlt_approx", "Wvlt Approx", "wavelet_coeffs", 0),
+        ("wvlt_detail", "Wvlt Detail", "wavelet_coeffs", 1),
+    ]
+    for fname, dname, tname, ch in wvlt_fields:
+        if fname not in seen:
+            seen.add(fname)
+            sources.append(FieldSource(
+                name=fname,
+                display_name=dname,
+                tex_name=tname,
+                tex_channel=ch,
+                category="wvlt",
+                available=has_wvlt,
+            ))
+
     return sources
 
 
@@ -1955,11 +2326,19 @@ class MenuBar:
 # Scrollable item list — reusable scrolling row list with selection
 # ---------------------------------------------------------------------------
 
+def _hue_to_rgb(h: float, s: float = 1.0) -> tuple[int, int, int]:
+    """Convert hue (0-1) and saturation to an RGB tuple for UI display."""
+    import colorsys
+    r, g, b = colorsys.hls_to_rgb(h, 0.5, s)
+    return (int(r * 255), int(g * 255), int(b * 255))
+
+
 _TGT_COLORS: dict[str, tuple[int, int, int]] = {
-    "R": (255, 80, 80), "G": (80, 255, 80),
-    "B": (80, 80, 255), "A": (200, 200, 200),
-    "W": (255, 255, 255), "C": (80, 255, 255),
-    "M": (255, 80, 255), "Y": (255, 255, 80),
+    "Ch1": _hue_to_rgb(DEFAULT_CHANNEL_HUES[0]),
+    "Ch2": _hue_to_rgb(DEFAULT_CHANNEL_HUES[1]),
+    "Ch3": _hue_to_rgb(DEFAULT_CHANNEL_HUES[2]),
+    "Ch4": _hue_to_rgb(DEFAULT_CHANNEL_HUES[3]),
+    "Alpha": (200, 200, 200),
     "none": (80, 80, 80),
 }
 
@@ -2131,14 +2510,240 @@ class ScrollableItemList:
 
 
 # ---------------------------------------------------------------------------
+# Tree item list — collapsible category tree for data sources
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TreeCategory:
+    """One collapsible category in a :class:`TreeItemList`."""
+    key: str
+    label: str
+    expanded: bool = True
+
+
+class TreeItemList:
+    """Scrollable tree with collapsible category headers.
+
+    Items are grouped by category. Categories can be expanded/collapsed.
+    Unavailable items appear greyed out and cannot be selected.
+    """
+
+    ROW_H = 22
+    CAT_H = 24
+    MORE_H = 18
+    PAD = 6
+    INDENT = 16  # extra indent for items under a category
+
+    def __init__(self, title: str, max_visible: int = 12) -> None:
+        self.title = title
+        self.categories: list[TreeCategory] = []
+        self.items: list[ListItem] = []
+        # Map item key → category key
+        self.item_categories: dict[str, str] = {}
+        # Map item key → available flag
+        self.item_available: dict[str, bool] = {}
+        self.selected_idx: int = 0
+        self.scroll_offset: int = 0
+        self.max_visible = max_visible
+        self._row_rects: list[pygame.Rect] = []
+        self._cat_rects: dict[str, pygame.Rect] = {}
+        self._flat_indices: list[int] = []  # maps visible row → items index
+        self._more_up_rect: pygame.Rect | None = None
+        self._more_down_rect: pygame.Rect | None = None
+        self._rendered_h: int = 0
+
+    def _build_flat_list(self) -> list[tuple[str, int | None]]:
+        """Build a flat list of (type, data) tuples for rendering.
+
+        Returns list of ("cat", cat_idx) and ("item", item_idx).
+        """
+        flat: list[tuple[str, int | None]] = []
+        cat_items: dict[str, list[int]] = {c.key: [] for c in self.categories}
+        for i, item in enumerate(self.items):
+            cat_key = self.item_categories.get(item.key, "")
+            if cat_key in cat_items:
+                cat_items[cat_key].append(i)
+
+        for ci, cat in enumerate(self.categories):
+            items_in_cat = cat_items.get(cat.key, [])
+            if not items_in_cat:
+                continue
+            flat.append(("cat", ci))
+            if cat.expanded:
+                for ii in items_in_cat:
+                    flat.append(("item", ii))
+        return flat
+
+    @property
+    def needs_scroll(self) -> bool:
+        return len(self._build_flat_list()) > self.max_visible
+
+    def clamp(self) -> None:
+        n = len(self.items)
+        if n == 0:
+            self.selected_idx = 0
+            self.scroll_offset = 0
+            return
+        self.selected_idx = max(0, min(self.selected_idx, n - 1))
+        flat = self._build_flat_list()
+        max_off = max(0, len(flat) - self.max_visible)
+        self.scroll_offset = max(0, min(self.scroll_offset, max_off))
+
+    def scroll_to_selected(self) -> None:
+        flat = self._build_flat_list()
+        # Find the flat index of the selected item
+        flat_idx = -1
+        for fi, (ftype, fdata) in enumerate(flat):
+            if ftype == "item" and fdata == self.selected_idx:
+                flat_idx = fi
+                break
+        if flat_idx < 0:
+            return
+        if flat_idx < self.scroll_offset:
+            self.scroll_offset = flat_idx
+        if flat_idx >= self.scroll_offset + self.max_visible:
+            self.scroll_offset = flat_idx - self.max_visible + 1
+
+    def render(self, surf: pygame.Surface, font: pygame.font.Font,
+               x: int, y: int, w: int) -> int:
+        self._row_rects = []
+        self._cat_rects = {}
+        self._flat_indices = []
+        self._more_up_rect = None
+        self._more_down_rect = None
+        pad = self.PAD
+        start_y = y
+
+        # Title
+        ttl = font.render(f"\u2500\u2500 {self.title} \u2500\u2500",
+                           True, (180, 180, 180))
+        surf.blit(ttl, (pad, y + 2))
+        y += self.ROW_H + 2
+
+        flat = self._build_flat_list()
+        if not flat:
+            dim = font.render("(no sources)", True, (100, 100, 100))
+            surf.blit(dim, (pad + 4, y + 3))
+            y += self.ROW_H + 2
+            self._rendered_h = y - start_y
+            return self._rendered_h
+
+        self.clamp()
+        vis_start = self.scroll_offset
+        vis_end = min(len(flat), vis_start + self.max_visible)
+
+        # Scroll-up
+        if vis_start > 0:
+            btn = pygame.Rect(pad, y, w - 2 * pad, self.MORE_H)
+            pygame.draw.rect(surf, (40, 40, 55), btn)
+            pygame.draw.rect(surf, (60, 60, 80), btn, 1)
+            arr = font.render(f"\u25b2 more ({vis_start})", True, (140, 140, 170))
+            surf.blit(arr, (w // 2 - arr.get_width() // 2, y + 1))
+            self._more_up_rect = btn
+            y += self.MORE_H + 2
+
+        for fi in range(vis_start, vis_end):
+            ftype, fdata = flat[fi]
+            if ftype == "cat":
+                cat = self.categories[fdata]
+                rect = pygame.Rect(pad, y, w - 2 * pad, self.CAT_H)
+                pygame.draw.rect(surf, (38, 38, 48), rect)
+                pygame.draw.rect(surf, (70, 70, 90), rect, 1)
+                arrow = "\u25bc" if cat.expanded else "\u25b6"
+                ct = font.render(f"{arrow} {cat.label}", True,
+                                 (200, 200, 220))
+                surf.blit(ct, (pad + 4, y + 4))
+                self._cat_rects[cat.key] = rect
+                y += self.CAT_H + 1
+            elif ftype == "item":
+                item = self.items[fdata]
+                avail = self.item_available.get(item.key, True)
+                rect = pygame.Rect(pad + self.INDENT, y,
+                                   w - 2 * pad - self.INDENT, self.ROW_H)
+                if fdata == self.selected_idx and avail:
+                    pygame.draw.rect(surf, (50, 50, 70), rect)
+                pygame.draw.rect(surf, (55, 55, 68) if avail
+                                 else (40, 40, 45), rect, 1)
+                tc = (200, 200, 200) if avail else (80, 80, 90)
+                txt = font.render(item.display_name, True, tc)
+                surf.blit(txt, (pad + self.INDENT + 4, y + 3))
+                if avail:
+                    color = _TGT_COLORS.get(item.tag_color_key, (80, 80, 80))
+                    arrow = font.render(f"\u2192 {item.tag}", True, color)
+                else:
+                    arrow = font.render("\u2014", True, (60, 60, 70))
+                surf.blit(arrow, (w - 60, y + 3))
+                self._row_rects.append(rect)
+                self._flat_indices.append(fdata)
+                y += self.ROW_H + 2
+
+        # Scroll-down
+        remaining = len(flat) - vis_end
+        if remaining > 0:
+            btn = pygame.Rect(pad, y, w - 2 * pad, self.MORE_H)
+            pygame.draw.rect(surf, (40, 40, 55), btn)
+            pygame.draw.rect(surf, (60, 60, 80), btn, 1)
+            arr = font.render(f"\u25bc more ({remaining})", True, (140, 140, 170))
+            surf.blit(arr, (w // 2 - arr.get_width() // 2, y + 1))
+            self._more_down_rect = btn
+            y += self.MORE_H + 2
+
+        self._rendered_h = y - start_y
+        return self._rendered_h
+
+    def handle_click(self, lx: int, ly: int) -> int | None:
+        # Category headers — toggle expand/collapse
+        for cat_key, rect in self._cat_rects.items():
+            if rect.collidepoint(lx, ly):
+                for cat in self.categories:
+                    if cat.key == cat_key:
+                        cat.expanded = not cat.expanded
+                        break
+                return -1  # consumed, no selection change
+
+        # More buttons
+        if self._more_up_rect and self._more_up_rect.collidepoint(lx, ly):
+            self.scroll_offset = max(0, self.scroll_offset - self.max_visible)
+            return -1
+        if self._more_down_rect and self._more_down_rect.collidepoint(lx, ly):
+            flat = self._build_flat_list()
+            max_off = max(0, len(flat) - self.max_visible)
+            self.scroll_offset = min(max_off,
+                                     self.scroll_offset + self.max_visible)
+            return -1
+
+        # Item rows
+        for vi, rect in enumerate(self._row_rects):
+            if rect.collidepoint(lx, ly):
+                idx = self._flat_indices[vi]
+                avail = self.item_available.get(
+                    self.items[idx].key, True)
+                if not avail:
+                    return -1  # unavailable — consume but don't select
+                self.selected_idx = idx
+                return idx
+        return None
+
+    def handle_scroll(self, direction: int) -> bool:
+        flat = self._build_flat_list()
+        if len(flat) <= self.max_visible:
+            return False
+        max_off = max(0, len(flat) - self.max_visible)
+        self.scroll_offset = max(0, min(self.scroll_offset + direction,
+                                        max_off))
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Synthesis product — one output from the synthesizer
 # ---------------------------------------------------------------------------
 
-PHASE_MODES = ["original", "griffin_lim", "zero_phase"]
+PHASE_MODES = ["original", "griffin_lim", "zero_phase", "freq_carrier"]
 PHASE_LABELS = {
     "original":    "Original Phase",
     "griffin_lim":  "Griffin-Lim",
     "zero_phase":  "Zero Phase",
+    "freq_carrier": "Freq Carrier",
 }
 
 
@@ -2265,6 +2870,58 @@ def _apply_curve(xs: np.ndarray, norm_mode: int,
     return np.clip(np.power(normed, gamma) * scale, 0.0, 1.0).astype(np.float32)
 
 
+def _apply_curve_unclipped(xs: np.ndarray, norm_mode: int,
+                           gamma: float, scale: float) -> np.ndarray:
+    """Like _apply_curve but without final [0,1] clamp — preserves HDR range.
+
+    The normalization step still maps the domain, but the gamma*scale
+    output is left unbounded so the curves plot can show where values
+    exceed the normal [0,1] display range.
+    """
+    if norm_mode == 1:  # dB
+        safe = np.maximum(xs, 1e-12)
+        db = 10.0 * np.log10(safe)
+        normed = (db + 60.0) / 60.0   # no clamp
+    else:
+        normed = xs  # no clamp
+    return (np.power(np.maximum(normed, 0.0), gamma) * scale).astype(np.float32)
+
+
+def _hdr_normalize(ys: np.ndarray, gd: "GlobalDefaults") -> np.ndarray:
+    """Apply the HDR normalizer to pre-clip post-blend values.
+
+    Maps from the configured input range [hdr_input_lo, hdr_input_hi]
+    into [hdr_output_lo, hdr_output_hi] using the selected tone-mapping
+    curve.  Operates on raw unclipped values.
+    """
+    mode = gd.hdr_normalizer
+    lo_in = gd.hdr_input_lo
+    hi_in = gd.hdr_input_hi
+    lo_out = gd.hdr_output_lo
+    hi_out = gd.hdr_output_hi
+    span_in = hi_in - lo_in if abs(hi_in - lo_in) > 1e-12 else 1.0
+    span_out = hi_out - lo_out
+
+    if mode == 0:  # None — raw passthrough
+        return ys
+
+    # Remap into [0, 1] input space
+    t = (ys - lo_in) / span_in
+
+    if mode == 1:  # Clamp
+        t = np.clip(t, 0.0, 1.0)
+    elif mode == 2:  # Reinhard
+        t = np.maximum(t, 0.0)
+        t = t / (1.0 + t)
+    elif mode == 3:  # Sigmoid
+        t = 1.0 / (1.0 + np.exp(-6.0 * (t - 0.5)))
+    elif mode == 4:  # Linear Compress
+        t = np.clip(t, 0.0, 1.0)
+
+    # Map to output range
+    return (lo_out + t * span_out).astype(np.float32)
+
+
 def _jitter_color(base: tuple[int, int, int],
                   idx: int) -> tuple[int, int, int]:
     """Shift brightness for the *idx*-th duplicate on the same target."""
@@ -2281,11 +2938,11 @@ def _jitter_color(base: tuple[int, int, int],
 # ---------------------------------------------------------------------------
 
 class FieldTabPanel(Panel):
-    """Panel with a tab per data field + global defaults + output controls.
+    """Panel with a tree of data fields grouped by source category,
+    per-field controls, global defaults, and output controls.
 
-    Contains two :class:`ScrollableItemList` sections:
-    *  **Data Fields** (top) — the analysis products loaded from disk.
-    *  **Synthesis** (bottom) — outputs produced by viewport synthesis.
+    Data sources are displayed in a collapsible tree with categories
+    (CQT, Filterbank, Wavelet).  Unavailable sources appear greyed out.
     """
 
     PANEL_W = 280
@@ -2309,40 +2966,79 @@ class FieldTabPanel(Panel):
         self._dragging: str | None = None
         self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
 
-        # Data-field item list (top section)
-        self.data_list = ScrollableItemList("Data Fields", max_visible=10)
+        # Data-field tree list (top section) — grouped by category
+        self.data_list = TreeItemList("Data Sources", max_visible=14)
         self._sync_data_list()
 
         # Plot widget (bottom section — shows normalised data curves)
         self.plot = PlotWidget()
         self.plot.title = "Data Curves"
-        self.plot.y_min = 0.0
-        self.plot.y_max = 1.0
+        self.plot.y_min = None  # auto-range to show full HDR extent
+        self.plot.y_max = None
+        self.plot.clip_lo = 0.0
+        self.plot.clip_hi = 1.0
         self._plot_h: int = 140  # pixel height of the plot box
 
     def _sync_data_list(self) -> None:
-        """Rebuild data_list items from fields/configs."""
+        """Rebuild data_list items and categories from fields/configs."""
+        # Build categories from _FIELD_CATEGORIES
+        cats: list[TreeCategory] = []
+        seen_cats: set[str] = set()
+        for fs in self.fields:
+            if fs.category not in seen_cats:
+                seen_cats.add(fs.category)
+        for cat_key, cat_label in _FIELD_CATEGORIES:
+            if cat_key in seen_cats:
+                # Preserve existing expanded state if category exists
+                existing = None
+                for c in self.data_list.categories:
+                    if c.key == cat_key:
+                        existing = c
+                        break
+                if existing:
+                    cats.append(existing)
+                else:
+                    cats.append(TreeCategory(key=cat_key, label=cat_label))
+        self.data_list.categories = cats
+
         items: list[ListItem] = []
+        item_categories: dict[str, str] = {}
+        item_available: dict[str, bool] = {}
         for i, fs in enumerate(self.fields):
             cfg = self.configs[i]
-            tgt_text = TARGET_LABELS[TARGET_VALUES.index(cfg.target)]
+            tgt_text = TARGET_LABELS[TARGET_VALUES.index(cfg.target)] if fs.available else "—"
             items.append(ListItem(
                 key=fs.name,
                 display_name=fs.display_name,
                 tag=tgt_text,
-                tag_color_key=tgt_text,
+                tag_color_key=tgt_text if fs.available else "none",
             ))
+            item_categories[fs.name] = fs.category
+            item_available[fs.name] = fs.available
         self.data_list.items = items
+        self.data_list.item_categories = item_categories
+        self.data_list.item_available = item_available
         self.data_list.selected_idx = self.selected_idx
 
     _CURVE_XS = np.linspace(0.0, 1.0, 256, dtype=np.float32)
 
     def _rebuild_plot_series(self) -> None:
-        """Recompute transfer-curve series from current field configs."""
+        """Recompute transfer-curve series from current field configs.
+
+        Uses unclipped curve values so the plot shows exactly where data
+        exceeds [0,1].  If an HDR normalizer is active, a second
+        (normalized) series is overlaid.  Clips show as red segments.
+        """
         xs = self._CURVE_XS
         gd = self.global_defaults
         target_seen: dict[int, int] = {}  # target → count seen so far
         series: list[PlotSeries] = []
+
+        # Extend input X range to cover the HDR input window
+        # so curves show the full input→output mapping
+        x_lo = min(0.0, gd.hdr_input_lo)
+        x_hi = max(1.0, gd.hdr_input_hi)
+        xs_hdr = np.linspace(x_lo, x_hi, 256, dtype=np.float32)
 
         for i, (fs, cfg) in enumerate(zip(self.fields, self.configs)):
             if cfg.target < 0:
@@ -2351,7 +3047,8 @@ class FieldTabPanel(Panel):
             gamma = cfg.gamma if not cfg.use_global else gd.gamma
             scale = cfg.scale if not cfg.use_global else gd.scale
 
-            ys = _apply_curve(xs, norm_mode, gamma, scale)
+            # Unclipped curve — shows true output before any clamping
+            ys_raw = _apply_curve_unclipped(xs_hdr, norm_mode, gamma, scale)
 
             tgt_label = TARGET_LABELS[TARGET_VALUES.index(cfg.target)]
             base_color = _TGT_COLORS.get(tgt_label, (180, 180, 180))
@@ -2364,10 +3061,30 @@ class FieldTabPanel(Panel):
                 label=fs.display_name,
                 color=color,
                 line=True,
-                data_x=xs,
-                data_y=ys,
+                data_x=xs_hdr,
+                data_y=ys_raw,
+                clip_color=(200, 50, 50),  # red for clipped segments
             ))
 
+            # If HDR normalizer is active, add the normalized curve
+            if gd.hdr_normalizer > 0:
+                ys_norm = _hdr_normalize(ys_raw, gd)
+                series.append(PlotSeries(
+                    key=f"{fs.name}_hdr",
+                    label=f"{fs.display_name} HDR",
+                    color=_jitter_color(
+                        (min(255, color[0] + 40),
+                         min(255, color[1] + 40),
+                         min(255, color[2] + 40)), 0),
+                    line=True,
+                    dots=False,
+                    data_x=xs_hdr,
+                    data_y=ys_norm,
+                ))
+
+        # Update clip boundary lines based on output range
+        self.plot.clip_lo = gd.hdr_output_lo
+        self.plot.clip_hi = gd.hdr_output_hi
         self.plot.series = series
 
     # ---- Rendering --------------------------------------------------------
@@ -2430,15 +3147,49 @@ class FieldTabPanel(Panel):
         upper_rows.append(("slider", ("o_gamma", gd.out_gamma, 0.1, 5.0, "{:.2f}")))
         upper_rows.append(("slider", ("o_scale", gd.out_scale, 0.01, 10.0, "{:.2f}")))
 
+        # Blend mode
+        upper_rows.append(("dropdown", ("blend_mode",
+                                         BLEND_MODES[gd.blend_mode], BLEND_MODES)))
+
+        # Channel HSL controls
+        upper_rows.append(("label", "\u2500\u2500 Channel Hues \u2500\u2500"))
+        for ci in range(4):
+            upper_rows.append(("label", f"Ch{ci + 1} Hue / Sat"))
+            upper_rows.append(("slider", (f"ch{ci}_hue", gd.channel_hues[ci], 0.0, 1.0, "{:.2f}")))
+            upper_rows.append(("slider", (f"ch{ci}_sat", gd.channel_sats[ci], 0.0, 1.0, "{:.2f}")))
+
+        # HDR Dynamic Range controls
+        upper_rows.append(("label", ""))
+        upper_rows.append(("label", "\u2500\u2500 HDR / Dynamic Range \u2500\u2500"))
+        upper_rows.append(("dropdown", ("hdr_norm",
+                                         HDR_NORMALIZERS[gd.hdr_normalizer],
+                                         HDR_NORMALIZERS)))
+        upper_rows.append(("label", "Input Range"))
+        upper_rows.append(("slider", ("hdr_in_lo", gd.hdr_input_lo, -2.0, 1.0, "{:.2f}")))
+        upper_rows.append(("slider", ("hdr_in_hi", gd.hdr_input_hi, 0.0, 5.0, "{:.2f}")))
+        upper_rows.append(("label", "Output Range"))
+        upper_rows.append(("slider", ("hdr_out_lo", gd.hdr_output_lo, -1.0, 1.0, "{:.2f}")))
+        upper_rows.append(("slider", ("hdr_out_hi", gd.hdr_output_hi, 0.0, 3.0, "{:.2f}")))
+
         # --- Pre-compute total height ---
-        # Data list
+        # Data list — estimate from flat list produced by tree
+        flat = self.data_list._build_flat_list()
+        vis_rows = min(len(flat), self.data_list.max_visible)
         data_list_h = self.data_list.ROW_H + 2  # title
-        if self.data_list.items:
-            data_list_h += self.data_list.visible_count * (self.ROW_H + 2)
+        if flat:
+            for fi in range(self.data_list.scroll_offset,
+                            self.data_list.scroll_offset + vis_rows):
+                if fi >= len(flat):
+                    break
+                ftype, _ = flat[fi]
+                if ftype == "cat":
+                    data_list_h += self.data_list.CAT_H + 1
+                else:
+                    data_list_h += self.ROW_H + 2
             if self.data_list.scroll_offset > 0:
                 data_list_h += self.data_list.MORE_H + 2
             vis_end = self.data_list.scroll_offset + self.data_list.max_visible
-            if vis_end < len(self.data_list.items):
+            if vis_end < len(flat):
                 data_list_h += self.data_list.MORE_H + 2
         else:
             data_list_h += self.ROW_H + 2
@@ -2469,7 +3220,9 @@ class FieldTabPanel(Panel):
                 key, current, opts = rdata
                 greyed = (key == "f_norm" and field_uses_global)
                 prefix = {"f_target": "Tgt:", "f_norm": "Nrm:",
-                          "g_norm": "Nrm:"}.get(key, key[:4])
+                          "g_norm": "Nrm:",
+                          "blend_mode": "Blend:",
+                          "hdr_norm": "HDR:"}.get(key, key[:4])
                 lbl_col = (100, 100, 100) if greyed else (160, 160, 160)
                 lbl = font.render(prefix, True, lbl_col)
                 surf.blit(lbl, (self.PAD, y + 2))
@@ -2621,17 +3374,24 @@ class FieldTabPanel(Panel):
                     return True
 
             # Dropdowns
-            for key in ("f_target", "f_norm", "g_norm"):
+            for key in ("f_target", "f_norm", "g_norm", "blend_mode",
+                        "hdr_norm"):
                 if key in self._item_map:
                     rect, opts = self._item_map[key]
                     if rect.collidepoint(lx, ly):
                         self._open_dropdown(key, opts, rect, pr)
                         return True
 
-            # Slider +/- buttons
-            for key in ("f_gamma", "f_scale",
-                        "g_gamma", "g_scale",
-                        "o_gamma", "o_scale"):
+            # Slider +/- buttons and track drag — collect all slider keys
+            _slider_keys = ["f_gamma", "f_scale",
+                            "g_gamma", "g_scale",
+                            "o_gamma", "o_scale"]
+            for ci in range(4):
+                _slider_keys.append(f"ch{ci}_hue")
+                _slider_keys.append(f"ch{ci}_sat")
+            _slider_keys.extend(["hdr_in_lo", "hdr_in_hi",
+                                 "hdr_out_lo", "hdr_out_hi"])
+            for key in _slider_keys:
                 minus_k = f"{key}_minus"
                 plus_k = f"{key}_plus"
                 if minus_k in self._item_map:
@@ -2646,9 +3406,7 @@ class FieldTabPanel(Panel):
                         return True
 
             # Slider track drag
-            for key in ("f_gamma", "f_scale",
-                        "g_gamma", "g_scale",
-                        "o_gamma", "o_scale"):
+            for key in _slider_keys:
                 if key in self._item_map:
                     rect, (vmin, vmax) = self._item_map[key]
                     if rect.collidepoint(lx, ly):
@@ -2711,6 +3469,10 @@ class FieldTabPanel(Panel):
                 NORM_MODES.index(value)
         elif key == "g_norm":
             self.global_defaults.norm_mode = NORM_MODES.index(value)
+        elif key == "blend_mode":
+            self.global_defaults.blend_mode = BLEND_MODES.index(value)
+        elif key == "hdr_norm":
+            self.global_defaults.hdr_normalizer = HDR_NORMALIZERS.index(value)
 
     def _update_slider(self, key: str, lx: int,
                        rect: pygame.Rect,
@@ -2734,6 +3496,20 @@ class FieldTabPanel(Panel):
             gd.out_gamma = val
         elif key == "o_scale":
             gd.out_scale = val
+        elif key.startswith("ch") and key.endswith("_hue"):
+            ci = int(key[2])
+            gd.channel_hues[ci] = val
+        elif key.startswith("ch") and key.endswith("_sat"):
+            ci = int(key[2])
+            gd.channel_sats[ci] = val
+        elif key == "hdr_in_lo":
+            gd.hdr_input_lo = val
+        elif key == "hdr_in_hi":
+            gd.hdr_input_hi = val
+        elif key == "hdr_out_lo":
+            gd.hdr_output_lo = val
+        elif key == "hdr_out_hi":
+            gd.hdr_output_hi = val
 
     def _nudge_slider(self, key: str, direction: int) -> None:
         """Move a slider by one logical step. direction: +1 or -1."""
@@ -2747,7 +3523,13 @@ class FieldTabPanel(Panel):
             "f_gamma": cfg.gamma, "f_scale": cfg.scale,
             "g_gamma": gd.gamma, "g_scale": gd.scale,
             "o_gamma": gd.out_gamma, "o_scale": gd.out_scale,
-        }.get(key, 0.0)
+            "hdr_in_lo": gd.hdr_input_lo, "hdr_in_hi": gd.hdr_input_hi,
+            "hdr_out_lo": gd.hdr_output_lo, "hdr_out_hi": gd.hdr_output_hi,
+        }
+        for ci in range(4):
+            current[f"ch{ci}_hue"] = gd.channel_hues[ci]
+            current[f"ch{ci}_sat"] = gd.channel_sats[ci]
+        current = current.get(key, 0.0)
         step = (vmax - vmin) / 50.0
         val = round(max(vmin, min(vmax, current + direction * step)), 2)
         self._apply_slider_value(key, val)
@@ -2788,6 +3570,55 @@ _STATUS_COLORS = {
     "error": (255, 80, 80),
 }
 
+# Backing data channel → synthesis role routing
+ROUTE_SOURCES = ["Ch1", "Ch2", "Ch3", "Ch4", "Alpha"]
+ROUTE_SOURCE_TARGETS = {"Ch1": 0, "Ch2": 1, "Ch3": 2, "Ch4": 3, "Alpha": 4}
+ROUTE_ROLES = ["magnitude", "phase", "mask"]
+ROUTE_ROLE_LABELS = {"magnitude": "Mag", "phase": "Phase", "mask": "Mask"}
+ROUTE_AUDIO_CHANNELS = ["left", "right"]
+ROUTE_AUDIO_CH_LABELS = {"left": "L", "right": "R"}
+MONO_MIX_MODES = ["Average", "L Only", "R Only", "Mid", "Side"]
+
+
+@dataclass
+class ChannelRouting:
+    """Maps backing data channels (Ch1-Ch4, Alpha) to synthesis roles.
+
+    Audio is always stored as L+R internally.  Mono signals are
+    derived from L+R via *mono_mix_mode* (index into MONO_MIX_MODES).
+    """
+    left_mag: str = "Ch1"
+    left_phase: str = "Ch2"
+    left_mask: str = "Alpha"
+    right_mag: str = "Ch1"
+    right_phase: str = "Ch2"
+    right_mask: str = "Alpha"
+    mono_mix_mode: int = 0  # index into MONO_MIX_MODES
+
+    def get(self, audio_ch: str, role: str) -> str:
+        """Return the backing data channel key for given audio_ch and role."""
+        return getattr(self, f"{audio_ch}_{role}", "Ch1")
+
+    def set(self, audio_ch: str, role: str, source: str) -> None:
+        setattr(self, f"{audio_ch}_{role}", source)
+
+    def resolve_field(self, source: str,
+                      field_sources: list,
+                      field_configs: list) -> str | None:
+        """Return the raw_arrays field name assigned to a backing channel.
+
+        Scans *field_configs* for the first field whose *target* matches
+        the numeric target of *source* (e.g. Ch1→0).  Returns the
+        corresponding :class:`FieldSource` name, or *None*.
+        """
+        tgt = ROUTE_SOURCE_TARGETS.get(source)
+        if tgt is None:
+            return None
+        for fs, cfg in zip(field_sources, field_configs):
+            if cfg.target == tgt and fs.available:
+                return fs.name
+        return None
+
 
 class SynthesisPanel(Panel):
     """Async synthesis job queue panel.
@@ -2799,8 +3630,14 @@ class SynthesisPanel(Panel):
     ROW_H = 22
     BTN_W = 40
     PAD = 6
-    _SYNTH_MODE_KEYS = ["icqt", "fb", "hybrid"]
-    _SYNTH_MODE_OPTIONS = ["iCQT (full CQT)", "Filterbank (full FB)", "Hybrid (FB low / iCQT high)"]
+    _SYNTH_MODE_KEYS = ["icqt", "fb", "hybrid", "fb_tf", "wavelet"]
+    _SYNTH_MODE_OPTIONS = [
+        "iCQT (full CQT)",
+        "Filterbank (full FB)",
+        "Hybrid (FB low / iCQT high)",
+        "FB from TF (viewport)",
+        "Wavelet reconstruction",
+    ]
 
     def __init__(self, *, side: str = "right") -> None:
         super().__init__(title="Synthesis", side=side)
@@ -2810,12 +3647,16 @@ class SynthesisPanel(Panel):
         self._worker_thread: threading.Thread | None = None
         self._lock = threading.Lock()
         self.synth_mode_idx: int = 0  # index into _SYNTH_MODE_KEYS
+        self.channel_routing = ChannelRouting()
+        self.use_adjusted: bool = False   # apply viewer norm/gamma/scale to synth data
         # Callbacks set by the viewer
         self.on_play: Any = None          # (SynthJob) -> None
         self.on_stop: Any = None          # () -> None
         self.on_synth_icqt: Any = None    # () -> None
         self.on_synth_fb: Any = None      # () -> None
         self.on_synth_hybrid: Any = None  # () -> None
+        self.on_synth_fb_tf: Any = None   # () -> None
+        self.on_synth_wavelet: Any = None # () -> None
         self._playing_job_id: int | None = None
         # Per-row button rects (surface-local)
         self._play_rects: dict[int, pygame.Rect] = {}
@@ -2829,6 +3670,7 @@ class SynthesisPanel(Panel):
         self._set_fb_n_bands: Any = lambda v: None
         self._has_audio: Any = lambda: False
         self._has_synth: Any = lambda: False
+        self._has_wavelet: Any = lambda: False
         # Dropdown UI state
         self._active_dropdown: str | None = None
         self._dropdown_opts: list[str] = []
@@ -2836,6 +3678,7 @@ class SynthesisPanel(Panel):
         self._dropdown_item_rects: list[pygame.Rect] = []
         # Button rects for controls
         self._ctrl_rects: dict[str, pygame.Rect] = {}
+
 
     # -- job management ----------------------------------------------------
 
@@ -2874,10 +3717,99 @@ class SynthesisPanel(Panel):
                 job.error_msg = str(exc)
                 job.completed_at = time.time()
 
+    @staticmethod
+    def _apply_field_adjustment(arr: np.ndarray,
+                                cfg: "FieldConfig",
+                                gd: "GlobalDefaults | None") -> np.ndarray:
+        """Apply norm → gamma → scale to *arr* on CPU, mirroring the shader.
+
+        Uses per-field config; falls back to *gd* when ``cfg.use_global``
+        is set.  Returns a new array — never mutates the input.
+        """
+        norm_mode = gd.norm_mode if (cfg.use_global and gd) else cfg.norm_mode
+        gamma = gd.gamma if (cfg.use_global and gd) else cfg.gamma
+        scale = gd.scale if (cfg.use_global and gd) else cfg.scale
+        return _apply_curve(arr, norm_mode, gamma, scale)
+
+    @staticmethod
+    def _resolve_routing(p: dict) -> dict[str, np.ndarray]:
+        """Build a *routed_arrays* dict from channel routing + field mappings.
+
+        Returns a dict with keys like ``"magnitude_left"``,
+        ``"phase_left"``, ``"mask_left"``, etc., mapping to the
+        native-dtype raw arrays from the backing data channels the user
+        selected in the routing panel.
+
+        When ``p["use_adjusted"]`` is truthy, applies the per-field
+        norm/gamma/scale pipeline (mirroring the GPU shader) to each
+        array before returning it.
+
+        Falls back to the default CQT fields when no routing is provided.
+
+        The optional ``p["field_resolver"]`` callable ``(str) -> ndarray | None``
+        is used to look up *any* field name — including derived fields
+        (``mag_left``, ``mag_right``, …) and filterbank grids
+        (``fb_mag_left``, …) that are not directly stored in
+        ``p["raw_arrays"]``.
+        """
+        raw: dict[str, np.ndarray] = p["raw_arrays"]
+        resolver = p.get("field_resolver")  # callable(str) -> ndarray|None
+        routing: ChannelRouting | None = p.get("routing")
+        field_sources: list | None = p.get("field_sources")
+        field_configs: list | None = p.get("field_configs")
+        use_adjusted: bool = bool(p.get("use_adjusted", False))
+        global_defaults: GlobalDefaults | None = p.get("global_defaults")
+
+        def _lookup(fname: str) -> np.ndarray | None:
+            """Try the resolver first, then fall back to raw dict."""
+            if resolver is not None:
+                arr = resolver(fname)
+                if arr is not None:
+                    return arr
+            return raw.get(fname)
+
+        result: dict[str, np.ndarray] = {}
+
+        if routing is None or field_sources is None or field_configs is None:
+            # Legacy fallback — use the hardcoded CQT complex fields
+            for side in ("left", "right"):
+                mag = _lookup(f"mag_{side}")
+                if mag is None:
+                    mag = _lookup(f"real_{side}")
+                pha = _lookup(f"phase_{side}")
+                if pha is None:
+                    pha = _lookup(f"imag_{side}")
+                result[f"magnitude_{side}"] = mag
+                result[f"phase_{side}"] = pha
+            return result
+
+        for audio_ch in ROUTE_AUDIO_CHANNELS:
+            for role in ROUTE_ROLES:
+                src_key = routing.get(audio_ch, role)
+                fname = routing.resolve_field(
+                    src_key, field_sources, field_configs)
+                if fname is not None:
+                    arr = _lookup(fname)
+                    if arr is not None:
+                        if use_adjusted:
+                            tgt = ROUTE_SOURCE_TARGETS.get(src_key)
+                            for fs, fc in zip(field_sources, field_configs):
+                                if fc.target == tgt and fs.available and fs.name == fname:
+                                    arr = SynthesisPanel._apply_field_adjustment(
+                                        arr, fc, global_defaults)
+                                    break
+                        result[f"{role}_{audio_ch}"] = arr
+                    else:
+                        result[f"{role}_{audio_ch}"] = None  # type: ignore[assignment]
+                else:
+                    result[f"{role}_{audio_ch}"] = None  # type: ignore[assignment]
+        return result
+
     def _execute(self, job: SynthJob) -> None:
         p = job.params
         synth: ViewportSynthPlayer = p["synth"]
         if job.source_type == "cqt":
+            routed = self._resolve_routing(p)
             result = synth.synthesise_to_array(
                 p["raw_arrays"], p["freqs"], p["times"],
                 p["view_x0"], p["view_x1"],
@@ -2885,7 +3817,8 @@ class SynthesisPanel(Panel):
                 p["n_frames"], p["n_bins"],
                 p["t_start"], p["t_dur"], p["sr"],
                 p["is_stereo"], p.get("normalize", True),
-                phase_mode=p.get("phase_mode", "original"))
+                phase_mode=p.get("phase_mode", "original"),
+                routed_arrays=routed)
             if result is None:
                 raise ValueError("Empty viewport")
             stereo, dur, vt0, vt1 = result
@@ -2937,11 +3870,251 @@ class SynthesisPanel(Panel):
             job.duration = dur
             job.view_t0 = vt0
             job.view_t1 = vt1
+        elif job.source_type == "fb_tf":
+            self._execute_fb_tf(job, synth, p)
+        elif job.source_type == "wavelet":
+            self._execute_wavelet(job, p)
         elif job.source_type == "hybrid":
             self._execute_hybrid(job, synth, p)
 
+    def _execute_fb_tf(self, job: SynthJob,
+                       synth: "ViewportSynthPlayer",
+                       p: dict) -> None:
+        """FB-from-TF synthesis: interpret TF viewport data as band
+        envelopes and reconstruct via additive synthesis.
+
+        Each frequency row in the viewport is treated as one band.
+        The routed magnitude data supplies per-band amplitude envelopes.
+
+        Phase behaviour follows ``phase_mode`` (same options as iCQT):
+
+        * ``"zero_phase"`` — pure envelope summation, no carrier or
+          phase modulation.  This is the default.
+        * ``"original"`` — use routed phase data directly as
+          instantaneous phase (can be CQT phase, filterbank phase,
+          or any data channel the user routes to the phase slot).
+        * ``"griffin_lim"`` — derive phase via Griffin-Lim iteration
+          over a per-band STFT round-trip.
+        """
+        sr: int = p["sr"]
+        freqs: np.ndarray = p["freqs"]
+        times: np.ndarray = p["times"]
+        x0, x1 = int(p["view_x0"]), int(p["view_x1"])
+        y0, y1 = int(p["view_y0"]), int(p["view_y1"])
+        is_stereo: bool = p.get("is_stereo", True)
+        normalize: bool = p.get("normalize", True)
+        phase_mode: str = p.get("phase_mode", "zero_phase")
+
+        routed = self._resolve_routing(p)
+
+        n_frames = x1 - x0
+        n_bins = y1 - y0
+        if n_frames <= 0 or n_bins <= 0:
+            raise ValueError("Empty viewport")
+
+        view_freqs = freqs[y0:y1]
+        view_times = times[x0:x1]
+        dur = float(view_times[-1] - view_times[0]) if len(view_times) > 1 else 0.0
+        vt0 = float(view_times[0])
+        vt1 = float(view_times[-1])
+        n_samples = int(round(dur * sr)) if dur > 0 else n_frames * synth.hop_length
+        if n_samples <= 0:
+            raise ValueError("Zero-length output")
+
+        def _channel_from_routed(routed_d: dict, ch: str) -> np.ndarray:
+            mag_arr = routed_d.get(f"magnitude_{ch}")
+            pha_arr = routed_d.get(f"phase_{ch}")
+            # Build envelope grid  (n_bins, n_frames)
+            if mag_arr is not None:
+                env = np.abs(np.asarray(mag_arr[y0:y1, x0:x1],
+                                        dtype=np.float64))
+            else:
+                env = np.ones((n_bins, n_frames), dtype=np.float64)
+            if pha_arr is not None and phase_mode == "original":
+                pha = np.asarray(pha_arr[y0:y1, x0:x1], dtype=np.float64)
+            else:
+                pha = None
+
+            output = np.zeros(n_samples, dtype=np.float64)
+            frame_t = np.linspace(0.0, 1.0, n_frames)
+            sample_t = np.linspace(0.0, 1.0, n_samples)
+            t = np.arange(n_samples, dtype=np.float64) / sr
+
+            if phase_mode == "zero_phase":
+                # Pure envelope summation — no carrier, no phase
+                for bi in range(n_bins):
+                    amp = np.interp(sample_t, frame_t, env[bi])
+                    output += amp
+            elif phase_mode == "freq_carrier":
+                # Free-running cosine carrier at each band centre freq
+                for bi in range(n_bins):
+                    fc = float(view_freqs[bi])
+                    amp = np.interp(sample_t, frame_t, env[bi])
+                    output += amp * np.cos(2.0 * np.pi * fc * t)
+            elif phase_mode == "original" and pha is not None:
+                # Use routed phase data as instantaneous phase
+                for bi in range(n_bins):
+                    amp = np.interp(sample_t, frame_t, env[bi])
+                    inst_phase = np.interp(sample_t, frame_t, pha[bi])
+                    output += amp * np.cos(inst_phase)
+            elif phase_mode == "griffin_lim":
+                # Griffin-Lim: iteratively estimate phase from magnitude.
+                # Build a complex spectrogram-like matrix from the band
+                # envelopes, run Griffin-Lim round-trips through per-bin
+                # iFFT/FFT, then sum the resulting band signals.
+                n_gl_iters = 20
+                rng = np.random.default_rng(42)
+                # Random initial phase per (bin, frame)
+                est_phase = 2.0 * np.pi * rng.random((n_bins, n_frames))
+                hop = max(1, n_samples // n_frames)
+                for _it in range(n_gl_iters):
+                    # Synthesise with current phase estimate
+                    sig = np.zeros(n_samples, dtype=np.float64)
+                    for bi in range(n_bins):
+                        fc = float(view_freqs[bi])
+                        amp = np.interp(sample_t, frame_t, env[bi])
+                        ph = np.interp(sample_t, frame_t, est_phase[bi])
+                        sig += amp * np.cos(2.0 * np.pi * fc * t + ph)
+                    # Re-analyse: extract instantaneous phase at each
+                    # band centre via windowed DFT
+                    for bi in range(n_bins):
+                        fc = float(view_freqs[bi])
+                        for fi in range(n_frames):
+                            centre = int(fi * hop)
+                            half_w = hop
+                            s0 = max(0, centre - half_w)
+                            s1 = min(n_samples, centre + half_w)
+                            seg = sig[s0:s1]
+                            if len(seg) == 0:
+                                continue
+                            tt = np.arange(len(seg), dtype=np.float64) / sr
+                            ref = np.exp(-2j * np.pi * fc * tt)
+                            est_phase[bi, fi] = np.angle(np.sum(seg * ref))
+                # Final synthesis with converged phases
+                for bi in range(n_bins):
+                    fc = float(view_freqs[bi])
+                    amp = np.interp(sample_t, frame_t, env[bi])
+                    ph = np.interp(sample_t, frame_t, est_phase[bi])
+                    output += amp * np.cos(2.0 * np.pi * fc * t + ph)
+            else:
+                # Fallback: if "original" selected but no phase data
+                # routed, degrade gracefully to zero-phase
+                for bi in range(n_bins):
+                    amp = np.interp(sample_t, frame_t, env[bi])
+                    output += amp
+            return output
+
+        sig_l = _channel_from_routed(routed, "left")
+        if is_stereo:
+            sig_r = _channel_from_routed(routed, "right")
+        else:
+            sig_r = sig_l
+
+        # Fade edges
+        fade = min(256, n_samples // 4)
+        if fade > 1:
+            ramp = np.linspace(0.0, 1.0, fade)
+            sig_l[:fade] *= ramp
+            sig_l[-fade:] *= ramp[::-1]
+            sig_r[:fade] *= ramp
+            sig_r[-fade:] *= ramp[::-1]
+
+        if normalize:
+            peak = max(np.abs(sig_l).max(), np.abs(sig_r).max(), 1e-12)
+            sig_l = sig_l / peak * 0.8
+            sig_r = sig_r / peak * 0.8
+
+        i16_l = (sig_l * 32767).clip(-32768, 32767).astype(np.int16)
+        i16_r = (sig_r * 32767).clip(-32768, 32767).astype(np.int16)
+        stereo = np.column_stack([i16_l, i16_r])
+        job.result_stereo = stereo
+        job.duration = dur
+        job.view_t0 = vt0
+        job.view_t1 = vt1
+
     @staticmethod
-    def _execute_hybrid(job: SynthJob, synth: "ViewportSynthPlayer",
+    def _execute_wavelet(job: SynthJob, p: dict) -> None:
+        """Wavelet reconstruction: inverse DWT of viewport coefficients.
+
+        Reads wavelet coefficients (stored as ``[approx, d1, d2, …]``),
+        windows to the viewport's time range, and reconstructs via
+        ``pywt.waverec``.
+        """
+        import pywt
+
+        wv_coeffs: list[np.ndarray] = p["wv_coeffs"]
+        wv_meta: dict = p.get("wv_meta", {})
+        sr: int = p["sr"]
+        t0: float = p["t0"]
+        t1: float = p["t1"]
+        normalize: bool = p.get("normalize", True)
+        wavelet_name: str = wv_meta.get("wavelet", "db4")
+
+        if not wv_coeffs:
+            raise ValueError("No wavelet coefficients")
+
+        # The finest detail level has the most samples and matches the
+        # original signal length.  Determine total signal length from it.
+        finest = wv_coeffs[-1]
+        n_levels = len(wv_coeffs)  # [approx, d1, d2, …]
+        total_samples = len(finest) * 2  # detail at level L ≈ N/2
+        # More precise: total signal length = pywt.waverec output length
+        # We use a dummy reconstruction to find the actual length.
+        dur_total = total_samples / sr if sr > 0 else 1.0
+
+        # Window coefficients to the viewport time range.
+        # Each level k has length ≈ N / 2^k (approx is level n_levels-1,
+        # detail_1 is level n_levels-2, etc.).
+        frac0 = max(0.0, t0 / dur_total) if dur_total > 0 else 0.0
+        frac1 = min(1.0, t1 / dur_total) if dur_total > 0 else 1.0
+
+        windowed: list[np.ndarray] = []
+        for coeff in wv_coeffs:
+            n = len(coeff)
+            s0 = int(frac0 * n)
+            s1 = max(s0 + 1, int(frac1 * n))
+            s1 = min(s1, n)
+            windowed.append(coeff[s0:s1].copy())
+
+        # Ensure all coefficient arrays have compatible lengths for waverec
+        # (each level must be ceil(prev_level_len / 2) or ±1).
+        # Pad/trim detail levels to consistent dyadic lengths.
+        target_len = len(windowed[0])  # approx level
+        aligned: list[np.ndarray] = [windowed[0]]
+        for i in range(1, len(windowed)):
+            expected = target_len
+            c = windowed[i]
+            if len(c) < expected:
+                c = np.pad(c, (0, expected - len(c)))
+            elif len(c) > expected:
+                c = c[:expected]
+            aligned.append(c)
+            target_len = expected * 2  # next level is 2× current
+
+        sig = pywt.waverec(aligned, wavelet_name)
+        sig = np.asarray(sig, dtype=np.float64)
+
+        # Fade edges
+        n_samples = len(sig)
+        fade = min(256, n_samples // 4)
+        if fade > 1:
+            ramp = np.linspace(0.0, 1.0, fade)
+            sig[:fade] *= ramp
+            sig[-fade:] *= ramp[::-1]
+
+        if normalize:
+            peak = max(np.abs(sig).max(), 1e-12)
+            sig = sig / peak * 0.8
+
+        dur = float(t1 - t0)
+        i16 = (sig * 32767).clip(-32768, 32767).astype(np.int16)
+        stereo = np.column_stack([i16, i16])
+        job.result_stereo = stereo
+        job.duration = dur
+        job.view_t0 = t0
+        job.view_t1 = t1
+
+    def _execute_hybrid(self, job: SynthJob, synth: "ViewportSynthPlayer",
                         p: dict) -> None:
         """Hybrid synthesis: FB below crossover + iCQT above, with
         complementary Linkwitz-Riley filtering at the boundary.
@@ -2954,6 +4127,7 @@ class SynthesisPanel(Panel):
         normalize: bool = p.get("normalize", True)
 
         # --- iCQT portion (full viewport, will be high-passed) ---
+        routed = self._resolve_routing(p)
         icqt_result = synth.synthesise_to_array(
             p["raw_arrays"], p["freqs"], p["times"],
             p["view_x0"], p["view_x1"],
@@ -2961,7 +4135,8 @@ class SynthesisPanel(Panel):
             p["n_frames"], p["n_bins"],
             p["t_start"], p["t_dur"], sr,
             is_stereo, False,
-            phase_mode=p.get("phase_mode", "original"))
+            phase_mode=p.get("phase_mode", "original"),
+            routed_arrays=routed)
         if icqt_result is None:
             raise ValueError("Empty viewport")
         icqt_stereo_i16, dur, vt0, vt1 = icqt_result
@@ -3029,8 +4204,8 @@ class SynthesisPanel(Panel):
         with self._lock:
             for j in self.jobs:
                 tag = j.status
-                color_key = {"done": "G", "running": "B",
-                             "error": "R", "queued": "none"}.get(j.status, "none")
+                color_key = {"done": "Ch2", "running": "Ch3",
+                             "error": "Ch1", "queued": "none"}.get(j.status, "none")
                 items.append(ListItem(
                     key=str(j.job_id),
                     display_name=j.label,
@@ -3118,6 +4293,11 @@ class SynthesisPanel(Panel):
                                     "Normalize Loudness",
                                     self._get_normalize())
 
+        # Section: Use viewer adjustments toggle
+        y = self._render_toggle_btn(surf, font, y, w, "use_adjusted",
+                                    "Apply Viewer Adjustments",
+                                    self.use_adjusted)
+
         # Section: Synth mode dropdown
         y = self._render_dropdown_btn(surf, font, y, w, "synth_mode",
                                       "Synth:", self._SYNTH_MODE_OPTIONS,
@@ -3126,8 +4306,13 @@ class SynthesisPanel(Panel):
         # Section: Synthesize button
         has_synth = self._has_synth()
         has_audio = self._has_audio()
+        has_wavelet = self._has_wavelet()
         cur_smode = self._SYNTH_MODE_KEYS[self.synth_mode_idx]
-        can_synth = has_synth and (cur_smode == "icqt" or has_audio)
+        can_synth = has_synth and (
+            cur_smode in ("icqt", "fb_tf")
+            or (cur_smode in ("fb", "hybrid") and has_audio)
+            or (cur_smode == "wavelet" and has_wavelet)
+        )
         btn_w = w - 2 * self.PAD
         self._render_action_btn(surf, font, self.PAD, y, btn_w,
                                 "synth_go", "Synthesize", can_synth,
@@ -3137,6 +4322,57 @@ class SynthesisPanel(Panel):
         # Section: Filterbank bands
         y = self._render_dropdown_btn(surf, font, y, w, "fb_n_bands",
                                       "FB Bands:", self._FB_BAND_OPTIONS, bands_idx)
+
+        # Section: Channel Routing
+        pygame.draw.line(surf, (60, 60, 70), (self.PAD, y),
+                         (w - self.PAD, y))
+        y += 2
+        hdr = font.render("\u2500\u2500 Channel Routing \u2500\u2500",
+                          True, (180, 180, 180))
+        surf.blit(hdr, (self.PAD, y + 2))
+        y += self.ROW_H + 2
+
+        routing = self.channel_routing
+        n_src = len(ROUTE_SOURCES)
+        lbl_w = 60  # width for role label
+        avail_w = w - self.PAD - lbl_w - self.PAD
+        col_w = max(36, avail_w // n_src)  # auto-size for 5 buttons
+        for audio_ch in ROUTE_AUDIO_CHANNELS:
+            ch_label = ROUTE_AUDIO_CH_LABELS[audio_ch]
+            ch_hdr = font.render(f"{ch_label}:", True, (140, 180, 220))
+            surf.blit(ch_hdr, (self.PAD, y + 2))
+            y += self.ROW_H
+            for role in ROUTE_ROLES:
+                role_lbl = ROUTE_ROLE_LABELS[role]
+                rl = font.render(role_lbl, True, (140, 140, 150))
+                surf.blit(rl, (self.PAD + 8, y + 3))
+                bx = self.PAD + lbl_w
+                cur_src = routing.get(audio_ch, role)
+                for src in ROUTE_SOURCES:
+                    btn_key = f"rt_{audio_ch}_{role}_{src}"
+                    active = (cur_src == src)
+                    # Tint button with the channel's hue colour
+                    tint = _TGT_COLORS.get(src, (80, 80, 80))
+                    if active:
+                        bg = tint
+                    else:
+                        bg = (tint[0] // 4, tint[1] // 4, tint[2] // 4)
+                    br = pygame.Rect(bx, y, col_w - 2, self.ROW_H)
+                    pygame.draw.rect(surf, bg, br)
+                    border = tint if not active else (220, 220, 220)
+                    pygame.draw.rect(surf, border, br, 1)
+                    tc = (255, 255, 255) if active else tint
+                    st = font.render(src, True, tc)
+                    surf.blit(st, (bx + col_w // 2 - st.get_width() // 2,
+                                   y + 3))
+                    self._ctrl_rects[btn_key] = br
+                    bx += col_w
+                y += self.ROW_H + 2
+
+        # Mono mix mode selector
+        y = self._render_dropdown_btn(surf, font, y, w, "mono_mix",
+                                      "Mono Mix:", MONO_MIX_MODES,
+                                      routing.mono_mix_mode)
 
         # Separator
         pygame.draw.line(surf, (60, 60, 70), (self.PAD, y),
@@ -3198,8 +4434,8 @@ class SynthesisPanel(Panel):
 
     # -- events ------------------------------------------------------------
 
-    _PHASE_KEYS = ["original", "griffin_lim", "zero_phase"]
-    _PHASE_OPTIONS = ["Original Phase", "Griffin-Lim", "Zero Phase"]
+    _PHASE_KEYS = ["original", "griffin_lim", "zero_phase", "freq_carrier"]
+    _PHASE_OPTIONS = ["Original Phase", "Griffin-Lim", "Zero Phase", "Freq Carrier"]
     _FB_BAND_VALUES = [4, 8, 16, 32, 64]
     _FB_BAND_OPTIONS = ["4", "8", "16", "32", "64"]
 
@@ -3236,6 +4472,8 @@ class SynthesisPanel(Panel):
                                                         rect.w, 0))
                     elif key == "normalize":
                         self._set_normalize(not self._get_normalize())
+                    elif key == "use_adjusted":
+                        self.use_adjusted = not self.use_adjusted
                     elif key == "synth_mode":
                         self._open_dropdown("synth_mode",
                                             self._SYNTH_MODE_OPTIONS,
@@ -3250,12 +4488,29 @@ class SynthesisPanel(Panel):
                             self.on_synth_fb()
                         elif smode == "hybrid" and self._has_synth() and self._has_audio() and self.on_synth_hybrid:
                             self.on_synth_hybrid()
+                        elif smode == "fb_tf" and self._has_synth() and self.on_synth_fb_tf:
+                            self.on_synth_fb_tf()
+                        elif smode == "wavelet" and self._has_wavelet() and self.on_synth_wavelet:
+                            self.on_synth_wavelet()
                     elif key == "fb_n_bands":
                         self._open_dropdown("fb_n_bands",
                                             self._FB_BAND_OPTIONS,
                                             pygame.Rect(rect.x,
                                                         rect.y + rect.h,
                                                         rect.w, 0))
+                    elif key == "mono_mix":
+                        self._open_dropdown("mono_mix",
+                                            MONO_MIX_MODES,
+                                            pygame.Rect(rect.x,
+                                                        rect.y + rect.h,
+                                                        rect.w, 0))
+                    elif key.startswith("rt_"):
+                        # rt_{audio_ch}_{role}_{source}
+                        parts = key.split("_", 3)
+                        if len(parts) == 4:
+                            _, audio_ch, role, source = parts
+                            self.channel_routing.set(audio_ch, role, source)
+
                     return True
 
             # Job action buttons
@@ -3303,6 +4558,9 @@ class SynthesisPanel(Panel):
             self.synth_mode_idx = idx
         elif key == "fb_n_bands" and 0 <= idx < len(self._FB_BAND_VALUES):
             self._set_fb_n_bands(self._FB_BAND_VALUES[idx])
+        elif key == "mono_mix" and 0 <= idx < len(MONO_MIX_MODES):
+            self.channel_routing.mono_mix_mode = idx
+
 
     def render_dropdown_overlay(self) -> pygame.Surface | None:
         if not self._active_dropdown:
@@ -3346,6 +4604,417 @@ class SynthesisPanel(Panel):
         self._playing_job_id = job_id
         if self.on_play:
             self.on_play(job)
+
+
+# ---------------------------------------------------------------------------
+# Image input panel — load images and convert to TF / TSC / FB
+# ---------------------------------------------------------------------------
+
+_IMG_CONVERT_MODES = ["TF", "TSC", "FB"]
+_IMG_CONVERT_LABELS = {
+    "TF": "Time-Frequency",
+    "TSC": "Time-Scale Coefficients",
+    "FB": "Filterbank (TF)",
+}
+_IMG_INTERP_MODES = ["bilinear", "bicubic", "nearest", "lanczos"]
+_IMG_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+class ImageInputPanel(Panel):
+    """Panel for loading image files, converting them to TF representations.
+
+    Images can be converted to:
+    * TF — mapped directly to time-frequency magnitude/phase arrays
+    * TSC — treated as time-scale coefficient arrays
+    * FB — mapped to filterbank envelope arrays
+
+    Configurable: frequency range, time range, interpolation, target
+    dimensions (bins × frames).
+    """
+
+    PANEL_W = 280
+    ROW_H = 22
+    PAD = 6
+
+    def __init__(self, *, side: str = "left",
+                 image_dir: str = "") -> None:
+        super().__init__(title="Image Input", side=side)
+        self.image_dir: str = image_dir or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "input_images")
+        os.makedirs(self.image_dir, exist_ok=True)
+
+        # Image file list
+        self.image_list = ScrollableItemList("Image Files", max_visible=8)
+        self._image_paths: list[str] = []
+        self._refresh_images()
+
+        # Conversion settings
+        self.convert_mode_idx: int = 0   # index into _IMG_CONVERT_MODES
+        self.interp_idx: int = 0         # index into _IMG_INTERP_MODES
+        self.target_bins: int = 1200     # frequency bins
+        self.target_frames: int = 1000   # time frames
+        self.freq_min: float = 16.35     # Hz (C0)
+        self.freq_max: float = 19912.13  # Hz (~D#9)
+        self.time_start: float = 0.0     # seconds
+        self.time_duration: float = 10.0 # seconds
+
+        # Result data (populated after conversion)
+        self._converted_data: np.ndarray | None = None
+        self._converted_mode: str | None = None
+
+        # UI state
+        self._ctrl_rects: dict[str, pygame.Rect] = {}
+        self._active_dropdown: str | None = None
+        self._dropdown_opts: list[str] = []
+        self._dropdown_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self._dropdown_item_rects: list[pygame.Rect] = []
+        self._dragging: str | None = None
+        self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
+        self._status_msg: str = ""
+
+        # Callback: (data, mode, freq_range, time_range) -> None
+        self.on_converted: Any = None
+
+    # -- scanning -----------------------------------------------------------
+
+    def _refresh_images(self) -> None:
+        self._image_paths = []
+        items: list[ListItem] = []
+        if os.path.isdir(self.image_dir):
+            for fn in sorted(os.listdir(self.image_dir)):
+                ext = os.path.splitext(fn)[1].lower()
+                if ext in _IMG_EXTENSIONS:
+                    self._image_paths.append(
+                        os.path.join(self.image_dir, fn))
+                    items.append(ListItem(
+                        key=fn, display_name=fn,
+                        tag=ext, tag_color_key="none"))
+        self.image_list.items = items
+
+    # -- conversion ---------------------------------------------------------
+
+    def _load_image_as_array(self, path: str) -> np.ndarray:
+        """Load image file as float array, shape (H, W) or (H, W, C)."""
+        from PIL import Image
+        img = Image.open(path)
+        arr = np.asarray(img)
+        return arr
+
+    def _interpolate_2d(self, data: np.ndarray,
+                        out_h: int, out_w: int) -> np.ndarray:
+        """Resize 2D array to (out_h, out_w) using selected interpolation."""
+        from scipy.ndimage import zoom
+        mode = _IMG_INTERP_MODES[self.interp_idx]
+        order = {"nearest": 0, "bilinear": 1, "bicubic": 3,
+                 "lanczos": 5}.get(mode, 1)
+        h, w = data.shape[:2]
+        if h == 0 or w == 0:
+            return np.zeros((out_h, out_w), dtype=data.dtype)
+        factor_h = out_h / h
+        factor_w = out_w / w
+        if data.ndim == 2:
+            return zoom(data, (factor_h, factor_w), order=order)
+        # Multi-channel: zoom spatial dims only
+        return zoom(data, (factor_h, factor_w, 1), order=order)
+
+    def convert_selected(self) -> None:
+        """Convert the currently selected image to the chosen format."""
+        idx = self.image_list.selected_idx
+        if idx < 0 or idx >= len(self._image_paths):
+            self._status_msg = "No image selected"
+            return
+        path = self._image_paths[idx]
+        mode = _IMG_CONVERT_MODES[self.convert_mode_idx]
+        try:
+            raw = self._load_image_as_array(path)
+        except Exception as exc:
+            self._status_msg = f"Load error: {exc}"
+            return
+
+        # Convert to grayscale intensity if multi-channel
+        if raw.ndim == 3:
+            if raw.shape[2] == 4:
+                # RGBA — use alpha-premultiplied luminance
+                rgb = raw[:, :, :3].astype(np.float64)
+                alpha = raw[:, :, 3:4].astype(np.float64) / 255.0
+                gray = (0.2126 * rgb[:, :, 0] + 0.7152 * rgb[:, :, 1]
+                        + 0.0722 * rgb[:, :, 2]) * alpha[:, :, 0]
+            else:
+                gray = (0.2126 * raw[:, :, 0].astype(np.float64)
+                        + 0.7152 * raw[:, :, 1].astype(np.float64)
+                        + 0.0722 * raw[:, :, 2].astype(np.float64))
+        else:
+            gray = raw.astype(np.float64)
+
+        # Normalise to 0–1
+        vmin, vmax = gray.min(), gray.max()
+        if vmax > vmin:
+            gray = (gray - vmin) / (vmax - vmin)
+        else:
+            gray = np.zeros_like(gray)
+
+        # Resize to target dimensions: (bins, frames)
+        resized = self._interpolate_2d(
+            gray, self.target_bins, self.target_frames)
+
+        self._converted_data = resized
+        self._converted_mode = mode
+        self._status_msg = (f"Converted: {resized.shape[0]}×{resized.shape[1]}"
+                            f" ({mode})")
+
+        if self.on_converted:
+            freq_range = (self.freq_min, self.freq_max)
+            time_range = (self.time_start,
+                          self.time_start + self.time_duration)
+            self.on_converted(resized, mode, freq_range, time_range)
+
+    # -- render -------------------------------------------------------------
+
+    def render(self) -> pygame.Surface | None:
+        if not self.visible:
+            return None
+        self._ensure_font()
+        font = self.font
+        w = self.PANEL_W
+        self._ctrl_rects.clear()
+        self._item_map.clear()
+        self._refresh_images()
+
+        est_h = 700
+        surf = pygame.Surface((w, est_h), pygame.SRCALPHA)
+        surf.fill((30, 30, 30, 210))
+        y = self.PAD
+
+        # Section: Image file list
+        data_h = self.image_list.render(surf, font, 0, y, w)
+        y += data_h
+
+        # Separator
+        pygame.draw.line(surf, (60, 60, 70), (self.PAD, y),
+                         (w - self.PAD, y))
+        y += 4
+
+        # Section: Convert mode dropdown
+        lbl = font.render("Output:", True, (160, 160, 160))
+        surf.blit(lbl, (self.PAD, y + 2))
+        btn_x = 80
+        btn_w = w - btn_x - self.PAD
+        btn_rect = pygame.Rect(btn_x, y, btn_w, self.ROW_H)
+        bg = (80, 80, 120) if self._active_dropdown == "conv_mode" \
+            else (60, 60, 80)
+        pygame.draw.rect(surf, bg, btn_rect)
+        pygame.draw.rect(surf, (100, 100, 120), btn_rect, 1)
+        ct = font.render(
+            _IMG_CONVERT_LABELS[_IMG_CONVERT_MODES[self.convert_mode_idx]],
+            True, (220, 220, 220))
+        surf.blit(ct, (btn_x + 4, y + 3))
+        self._ctrl_rects["conv_mode"] = btn_rect
+        y += self.ROW_H + 2
+
+        # Section: Interpolation dropdown
+        lbl2 = font.render("Interp:", True, (160, 160, 160))
+        surf.blit(lbl2, (self.PAD, y + 2))
+        btn_rect2 = pygame.Rect(btn_x, y, btn_w, self.ROW_H)
+        bg2 = (80, 80, 120) if self._active_dropdown == "interp" \
+            else (60, 60, 80)
+        pygame.draw.rect(surf, bg2, btn_rect2)
+        pygame.draw.rect(surf, (100, 100, 120), btn_rect2, 1)
+        it = font.render(_IMG_INTERP_MODES[self.interp_idx],
+                         True, (220, 220, 220))
+        surf.blit(it, (btn_x + 4, y + 3))
+        self._ctrl_rects["interp"] = btn_rect2
+        y += self.ROW_H + 2
+
+        # Section: Sliders for bins, frames, freq, time
+        slider_defs = [
+            ("bins", "Bins:", self.target_bins, 64, 4800),
+            ("frames", "Frames:", self.target_frames, 100, 10000),
+            ("freq_min", "Freq Lo:", self.freq_min, 1.0, 20000.0),
+            ("freq_max", "Freq Hi:", self.freq_max, 10.0, 22050.0),
+            ("time_dur", "Duration:", self.time_duration, 0.1, 300.0),
+        ]
+        for key, label, val, vmin, vmax in slider_defs:
+            sl = font.render(label, True, (140, 140, 150))
+            surf.blit(sl, (self.PAD, y + 3))
+            # Value
+            if isinstance(val, int):
+                vt = font.render(str(val), True, (200, 200, 200))
+            else:
+                vt = font.render(f"{val:.1f}", True, (200, 200, 200))
+            surf.blit(vt, (self.PAD + 72, y + 3))
+
+            # +/- buttons
+            minus_r = pygame.Rect(w - self.PAD - 44, y, 20, self.ROW_H)
+            plus_r = pygame.Rect(w - self.PAD - 22, y, 20, self.ROW_H)
+            pygame.draw.rect(surf, (50, 50, 65), minus_r)
+            pygame.draw.rect(surf, (80, 80, 100), minus_r, 1)
+            m_lbl = font.render("\u2212", True, (180, 180, 180))
+            surf.blit(m_lbl, (minus_r.x + 5, y + 3))
+            pygame.draw.rect(surf, (50, 50, 65), plus_r)
+            pygame.draw.rect(surf, (80, 80, 100), plus_r, 1)
+            p_lbl = font.render("+", True, (180, 180, 180))
+            surf.blit(p_lbl, (plus_r.x + 5, y + 3))
+            self._ctrl_rects[f"{key}_minus"] = minus_r
+            self._ctrl_rects[f"{key}_plus"] = plus_r
+            y += self.ROW_H + 2
+
+        # Convert button
+        y += 2
+        conv_btn = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
+        pygame.draw.rect(surf, (50, 80, 140), conv_btn)
+        pygame.draw.rect(surf, (100, 100, 120), conv_btn, 1)
+        cl = font.render("Convert Image", True, (220, 220, 220))
+        surf.blit(cl, (w // 2 - cl.get_width() // 2, y + 3))
+        self._ctrl_rects["convert_go"] = conv_btn
+        y += self.ROW_H + 4
+
+        # Status line
+        if self._status_msg:
+            st = font.render(self._status_msg[:40], True, (160, 160, 160))
+            surf.blit(st, (self.PAD, y + 2))
+            y += self.ROW_H + 2
+
+        # Crop
+        final_h = max(y + self.PAD, 100)
+        final_surf = pygame.Surface((w, final_h), pygame.SRCALPHA)
+        final_surf.blit(surf, (0, 0))
+        return final_surf
+
+    # -- events -------------------------------------------------------------
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        if not self.visible:
+            return False
+        pr = self.panel_rect
+
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+
+            # Dropdown overlay first
+            if self._active_dropdown:
+                for i, ir in enumerate(self._dropdown_item_rects):
+                    if ir.collidepoint(mx, my):
+                        self._select_dropdown(i)
+                        return True
+                self._active_dropdown = None
+                return True
+
+            if not pr.collidepoint(mx, my):
+                return False
+            lx, ly = mx - pr.x, my - pr.y
+            ly += self._panel_scroll_y
+
+            # Image list click
+            hit = self.image_list.handle_click(lx, ly)
+            if hit is not None:
+                return True
+
+            # Controls
+            for key, rect in self._ctrl_rects.items():
+                if rect.collidepoint(lx, ly):
+                    if key == "conv_mode":
+                        self._open_dropdown(
+                            "conv_mode",
+                            [_IMG_CONVERT_LABELS[m]
+                             for m in _IMG_CONVERT_MODES],
+                            rect)
+                    elif key == "interp":
+                        self._open_dropdown("interp",
+                                            _IMG_INTERP_MODES, rect)
+                    elif key == "convert_go":
+                        self.convert_selected()
+                    elif key.endswith("_minus") or key.endswith("_plus"):
+                        self._nudge_slider(key)
+                    return True
+
+            return True
+
+        if event.type == MOUSEBUTTONUP and event.button == 1:
+            mx, my = event.pos
+            if pr.collidepoint(mx, my):
+                return True
+
+        if event.type == MOUSEMOTION:
+            mx, my = event.pos
+            if pr.collidepoint(mx, my):
+                return True
+
+        if event.type == MOUSEWHEEL:
+            return self._handle_panel_wheel(event)
+
+        return False
+
+    def _open_dropdown(self, key: str, options: list[str],
+                       anchor: pygame.Rect) -> None:
+        self._active_dropdown = key
+        self._dropdown_opts = options
+        self._dropdown_rect = anchor
+
+    def _select_dropdown(self, idx: int) -> None:
+        key = self._active_dropdown
+        self._active_dropdown = None
+        if key == "conv_mode" and 0 <= idx < len(_IMG_CONVERT_MODES):
+            self.convert_mode_idx = idx
+        elif key == "interp" and 0 <= idx < len(_IMG_INTERP_MODES):
+            self.interp_idx = idx
+
+    def _nudge_slider(self, btn_key: str) -> None:
+        """Handle +/- button clicks for value sliders."""
+        base = btn_key.rsplit("_", 1)[0]
+        direction = 1 if btn_key.endswith("_plus") else -1
+        if base == "bins":
+            step = 100 * direction
+            self.target_bins = max(64, min(4800,
+                                           self.target_bins + step))
+        elif base == "frames":
+            step = 100 * direction
+            self.target_frames = max(100, min(10000,
+                                              self.target_frames + step))
+        elif base == "freq_min":
+            step = 10.0 * direction
+            self.freq_min = max(1.0, min(self.freq_max - 10,
+                                         self.freq_min + step))
+        elif base == "freq_max":
+            step = 100.0 * direction
+            self.freq_max = max(self.freq_min + 10,
+                                min(22050.0, self.freq_max + step))
+        elif base == "time_dur":
+            step = 1.0 * direction
+            self.time_duration = max(0.1, min(300.0,
+                                              self.time_duration + step))
+
+    def render_dropdown_overlay(self) -> pygame.Surface | None:
+        if not self._active_dropdown:
+            return None
+        opts = self._dropdown_opts
+        if not opts:
+            return None
+        self._ensure_font()
+        font = self.font
+        pr = self.panel_rect
+        item_h = self.ROW_H
+        ow = self._dropdown_rect.w
+        oh = len(opts) * item_h
+        overlay = pygame.Surface((ow, oh), pygame.SRCALPHA)
+        overlay.fill((40, 40, 55, 240))
+        self._dropdown_item_rects = []
+        for i, label in enumerate(opts):
+            iy = i * item_h
+            rect = pygame.Rect(
+                pr.x + self._dropdown_rect.x,
+                pr.y + self._dropdown_rect.y + self._dropdown_rect.h + iy
+                - self._panel_scroll_y,
+                ow, item_h)
+            self._dropdown_item_rects.append(rect)
+            txt = font.render(label, True, (220, 220, 220))
+            overlay.blit(txt, (4, iy + 3))
+            if i < len(opts) - 1:
+                pygame.draw.line(overlay, (60, 60, 70),
+                                 (0, iy + item_h - 1),
+                                 (ow, iy + item_h - 1))
+        pygame.draw.rect(overlay, (100, 100, 130),
+                         pygame.Rect(0, 0, ow, oh), 1)
+        return overlay
 
 
 # ---------------------------------------------------------------------------
@@ -3417,12 +5086,15 @@ class SourcePanel(Panel):
         self.include_cqt: bool = True
         self.include_fb: bool = False
         self.fb_hybrid: bool = False  # hybrid = FB low / CQT high
+        self.fb_q_norm: bool = False  # divide by sqrt(bw) for spectral density
         self.include_wavelet: bool = False
 
         # Wavelet settings
         self.wavelet_family_idx: int = 0   # index into _WAVELET_FAMILIES
         self.wavelet_order_idx: int = 0    # index into family-specific orders
-        self.wavelet_level: int = 5        # decomposition depth
+        self.wavelet_depth_pct: float = 100.0  # 0-100% of max available depth
+        self.wavelet_depth_abs: int = 5        # absolute level 0-50
+        self.wavelet_depth_mode: int = 0       # 0=percentage, 1=absolute
         self.wavelet_ext_idx: int = 0      # index into _WAVELET_EXTENSIONS
 
         # CQT settings
@@ -3441,6 +5113,7 @@ class SourcePanel(Panel):
             _snap_to_note(4000.0),  # ~B7
         ]
         self.fb_filter_type_idx: int = 0  # index into _FILTER_TYPES
+        self.fb_label_mode_idx: int = 1  # 0=Range, 1=Mid+BW
         self.fb_hop: int = 512  # hop length for FB envelope computation
         # Auto (log) settings — mirrors CQT-style controls
         self.fb_bpo: int = 12        # bands per octave
@@ -3460,6 +5133,8 @@ class SourcePanel(Panel):
         self.region_start: float = 0.0    # seconds
         self.region_end: float = 0.0      # seconds (0 = full file)
         self._wav_duration: float = 0.0   # total duration of selected WAV
+        self._wav_sr: int = 0                 # sample rate of selected WAV
+        self._wav_n_samples: int = 0          # sample count of selected WAV
 
         # Active / A / B
         self.active_folder: str | None = None
@@ -3611,12 +5286,53 @@ class SourcePanel(Panel):
             sr_file, raw = _wf.read(self._wav_paths[idx])
             n_samples = raw.shape[0] if raw.ndim >= 1 else len(raw)
             self._wav_duration = n_samples / sr_file
+            self._wav_sr = sr_file
+            self._wav_n_samples = n_samples
         except Exception:
             self._wav_duration = 0.0
+            self._wav_sr = 0
+            self._wav_n_samples = 0
         # Clamp sliders to new duration
         if self._wav_duration > 0:
             self.region_end = min(self.region_end, self._wav_duration)
             self.region_start = min(self.region_start, self.region_end)
+
+    def _current_wavelet_name(self) -> str:
+        """Resolve the pywt wavelet name from current UI settings."""
+        fam = _WAVELET_FAMILIES[self.wavelet_family_idx]
+        if fam == "Discrete Meyer":
+            return "dmey"
+        prefix = _WAVELET_FAMILY_PREFIX.get(fam, "db")
+        orders = _WAVELET_ORDERS.get(fam, ["\u2014"])
+        safe_idx = min(self.wavelet_order_idx, len(orders) - 1)
+        return prefix + orders[safe_idx]
+
+    def _wavelet_max_level(self) -> int:
+        """Max DWT decomposition level for current signal & wavelet."""
+        n = self._wav_n_samples
+        if n <= 0:
+            return 20  # fallback when no file selected
+        # Account for region selection
+        if self._wav_sr > 0:
+            if self.region_start > 0 or self.region_end > 0:
+                s0 = int(self.region_start * self._wav_sr) if self.region_start > 0 else 0
+                s1 = int(self.region_end * self._wav_sr) if self.region_end > 0 else n
+                n = max(1, min(n, s1) - max(0, s0))
+        try:
+            import pywt
+            return max(1, pywt.dwt_max_level(n, self._current_wavelet_name()))
+        except Exception:
+            # Fallback: conservative estimate
+            if n > 1:
+                return max(1, int(math.floor(math.log2(n))))
+            return 1
+
+    def _wavelet_level_from_pct(self) -> int:
+        """Compute the actual decomposition level from current depth settings."""
+        max_lev = self._wavelet_max_level()
+        if self.wavelet_depth_mode == 1:
+            return max(1, min(self.wavelet_depth_abs, max_lev))
+        return max(1, int(round(self.wavelet_depth_pct / 100.0 * max_lev)))
 
     # ---- Analysis ---------------------------------------------------------
 
@@ -3714,6 +5430,10 @@ class SourcePanel(Panel):
                         mono = raw_wav.mean(axis=1).astype(np.float32) / 32768.0
                     else:
                         mono = raw_wav.astype(np.float32) / 32768.0
+                    is_wav_stereo = raw_wav.ndim == 2
+                    if is_wav_stereo:
+                        left_ch = raw_wav[:, 0].astype(np.float32) / 32768.0
+                        right_ch = raw_wav[:, 1].astype(np.float32) / 32768.0
                     # Slice to time region if set
                     if has_region and sr_wav is not None:
                         s0 = int(r_start * sr_wav) if r_start > 0 else 0
@@ -3721,6 +5441,9 @@ class SourcePanel(Panel):
                         s0 = max(0, min(len(mono), s0))
                         s1 = max(s0, min(len(mono), s1))
                         mono = mono[s0:s1]
+                        if is_wav_stereo:
+                            left_ch = left_ch[s0:s1]
+                            right_ch = right_ch[s0:s1]
                     ftype = _FILTER_TYPES[self.fb_filter_type_idx]
                     fb = FilterBankDecomposition(sr_wav, ftype)
                     fb_auto = _FB_CONFIG_MODES[
@@ -3741,6 +5464,36 @@ class SourcePanel(Panel):
                     self._fb_decomp = fb
                     if self.on_fb_computed:
                         self.on_fb_computed(fb)
+
+                    # Always produce L+R envelopes (mono input → L=R)
+                    fb_dir = os.path.join(outdir, "filterbank")
+                    if is_wav_stereo:
+                        ch_pairs = [("left", left_ch),
+                                    ("right", right_ch)]
+                    else:
+                        ch_pairs = [("left", mono)]
+                    for ch_label, ch_sig in ch_pairs:
+                        fb_ch = FilterBankDecomposition(sr_wav, ftype)
+                        fb_ch.compute(ch_sig, bands)
+                        mags_ch, phases_ch, hops_ch = (
+                            fb_ch.compute_envelopes())
+                        data_ch: dict[str, np.ndarray] = {
+                            "n_bands": np.int64(len(mags_ch)),
+                            "hops": np.array(hops_ch, dtype=np.int64),
+                        }
+                        for ii, (m, p) in enumerate(
+                                zip(mags_ch, phases_ch)):
+                            data_ch[f"mag_{ii}"] = m
+                            data_ch[f"phase_{ii}"] = p
+                        np.savez_compressed(
+                            os.path.join(fb_dir,
+                                         f"fb_envelopes_{ch_label}.npz"),
+                            **data_ch)
+                    if not is_wav_stereo:
+                        import shutil
+                        shutil.copy2(
+                            os.path.join(fb_dir, "fb_envelopes_left.npz"),
+                            os.path.join(fb_dir, "fb_envelopes_right.npz"))
 
                 # Wavelet decomposition
                 if do_wavelet:
@@ -3769,9 +5522,15 @@ class SourcePanel(Panel):
                                        len(orders) - 1)
                         wv_name = prefix + orders[safe_idx]
                     ext_mode = _WAVELET_EXTENSIONS[self.wavelet_ext_idx]
+                    wv_max = pywt.dwt_max_level(len(wv_signal), wv_name)
+                    if self.wavelet_depth_mode == 1:
+                        wv_level = max(1, min(self.wavelet_depth_abs, wv_max))
+                    else:
+                        wv_level = max(1, int(round(
+                            self.wavelet_depth_pct / 100.0 * wv_max)))
                     coeffs = pywt.wavedec(wv_signal, wv_name,
                                           mode=ext_mode,
-                                          level=self.wavelet_level)
+                                          level=wv_level)
                     # Save wavelet coefficients
                     wv_dir = os.path.join(outdir, "wavelet")
                     os.makedirs(wv_dir, exist_ok=True)
@@ -3785,9 +5544,11 @@ class SourcePanel(Panel):
                         os.path.join(wv_dir, "wavelet_data.npz"), **wv_data)
                     import json as _json
                     wv_meta = {
-                        "wavelet": wv_name, "level": self.wavelet_level,
+                        "wavelet": wv_name, "level": wv_level,
                         "extension": ext_mode, "sr": sr_wav,
                         "n_levels": len(coeffs) - 1,
+                        "depth_pct": self.wavelet_depth_pct,
+                        "max_level": wv_max,
                     }
                     if wav_path:
                         wv_meta["wav_path"] = os.path.abspath(wav_path)
@@ -3972,6 +5733,11 @@ class SourcePanel(Panel):
                                         "fb_hybrid", "Hybrid (FB low / CQT high)",
                                         self.fb_hybrid)
             y += self.ROW_H + 2
+            cx3 = self.PAD + 10
+            cx3 = self._render_checkbox(surf, font, cx3, y, w,
+                                        "fb_q_norm", "Q-width normalization",
+                                        self.fb_q_norm)
+            y += self.ROW_H + 2
 
         # Derive effective mode string for legacy sections
         show_cqt = self.include_cqt
@@ -4120,7 +5886,7 @@ class SourcePanel(Panel):
                                       if _FB_LABEL_MODES[self.fb_label_mode_idx] == "Mid+BW"
                                       else band.auto_label(sr_preview)),
                         tag=tag,
-                        tag_color_key="B" if has_fb else "none",
+                        tag_color_key="Ch3" if has_fb else "none",
                     ))
                 self._band_list.items = band_items
                 y += self._band_list.render(surf, font, 0, y, w)
@@ -4168,11 +5934,28 @@ class SourcePanel(Panel):
                     surf, font, y, w, "wv_order", "Order:",
                     orders, safe_idx)
 
-            # Decomposition level
-            y = self._render_slider(
-                surf, font, y, w, "wv_level", "Level:",
-                float(self.wavelet_level), 1.0, 12.0, "{:.0f}",
-                log=False)
+            # Decomposition depth mode + slider
+            _depth_modes = ["% of max", "Absolute"]
+            y = self._render_dropdown_btn(
+                surf, font, y, w, "wv_depth_mode", "Depth:",
+                _depth_modes, self.wavelet_depth_mode)
+            max_lev = self._wavelet_max_level()
+            actual_lev = self._wavelet_level_from_pct()
+            if self.wavelet_depth_mode == 0:
+                y = self._render_slider(
+                    surf, font, y, w, "wv_depth_pct", "",
+                    self.wavelet_depth_pct, 1.0, 100.0, "{:.0f}%",
+                    log=False)
+            else:
+                y = self._render_slider(
+                    surf, font, y, w, "wv_depth_abs", "",
+                    float(self.wavelet_depth_abs), 1.0, 50.0, "{:.0f}",
+                    log=False)
+            depth_txt = font.render(
+                f"  \u2192 level {actual_lev} / {max_lev}", True,
+                (140, 160, 180))
+            surf.blit(depth_txt, (self.PAD, y + 1))
+            y += self.ROW_H
 
             # Extension mode
             y = self._render_dropdown_btn(
@@ -4396,7 +6179,8 @@ class SourcePanel(Panel):
             for ck_key, attr in [("inc_cqt", "include_cqt"),
                                  ("inc_fb", "include_fb"),
                                  ("inc_wavelet", "include_wavelet"),
-                                 ("fb_hybrid", "fb_hybrid")]:
+                                 ("fb_hybrid", "fb_hybrid"),
+                                 ("fb_q_norm", "fb_q_norm")]:
                 if ck_key in self._item_map:
                     rect, _ = self._item_map[ck_key]
                     if rect.collidepoint(lx, ly):
@@ -4411,6 +6195,7 @@ class SourcePanel(Panel):
             for key in ("chan_mode",
                         "fb_ftype", "fb_cfg", "fb_lbl",
                         "wv_family", "wv_order", "wv_ext",
+                        "wv_depth_mode",
                         "rs_engine", "rs_interp", "rs_taps", "rs_prec"):
                 if key in self._item_map:
                     rect, opts = self._item_map[key]
@@ -4421,7 +6206,7 @@ class SourcePanel(Panel):
             # Slider +/- buttons and track drag
             slider_keys = ["hop", "bpo", "fmin", "fmax",
                            "fb_bpo", "fb_fmin", "fb_fmax",
-                           "wv_level",
+                           "wv_depth_pct", "wv_depth_abs",
                            "region_start", "region_end"]
             slider_keys += [f"xo_{i}" for i in range(len(self.fb_crossovers))]
             for skey in slider_keys:
@@ -4539,6 +6324,8 @@ class SourcePanel(Panel):
             self.wavelet_order_idx = orders.index(value)
         elif key == "wv_ext":
             self.wavelet_ext_idx = _WAVELET_EXTENSIONS.index(value)
+        elif key == "wv_depth_mode":
+            self.wavelet_depth_mode = ["% of max", "Absolute"].index(value)
         elif key == "fb_ftype":
             self.fb_filter_type_idx = _FILTER_TYPES.index(value)
         elif key == "fb_cfg":
@@ -4593,8 +6380,10 @@ class SourcePanel(Panel):
             self.region_end = round(max(0.0, min(dur, val)), 2)
             if self.region_end > 0 and self.region_end < self.region_start:
                 self.region_start = self.region_end
-        elif key == "wv_level":
-            self.wavelet_level = max(1, min(12, int(round(val))))
+        elif key == "wv_depth_pct":
+            self.wavelet_depth_pct = max(1.0, min(100.0, float(val)))
+        elif key == "wv_depth_abs":
+            self.wavelet_depth_abs = max(1, min(50, int(round(val))))
         elif key.startswith("xo_"):
             idx = int(key[3:])
             if 0 <= idx < len(self.fb_crossovers):
@@ -4648,8 +6437,12 @@ class SourcePanel(Panel):
                 max(0.0, min(dur, self.region_end + step * direction)), 2)
             if self.region_end > 0 and self.region_end < self.region_start:
                 self.region_start = self.region_end
-        elif key == "wv_level":
-            self.wavelet_level = max(1, min(12, self.wavelet_level + direction))
+        elif key == "wv_depth_pct":
+            self.wavelet_depth_pct = max(1.0, min(100.0,
+                self.wavelet_depth_pct + 5.0 * direction))
+        elif key == "wv_depth_abs":
+            self.wavelet_depth_abs = max(1, min(50,
+                self.wavelet_depth_abs + direction))
         elif key.startswith("xo_"):
             idx = int(key[3:])
             if 0 <= idx < len(self.fb_crossovers):
@@ -5684,6 +7477,18 @@ class ViewportSynthPlayer:
         """
         if mode == "zero_phase":
             return np.abs(cqt).astype(np.complex128)
+        if mode == "freq_carrier":
+            mag = np.abs(cqt)
+            n_bins, n_frames = cqt.shape
+            hop = self.hop_length
+            sr = self.sr
+            phase = np.zeros_like(mag)
+            for bi in range(n_bins):
+                fc = float(view_freqs[bi])
+                for fi in range(n_frames):
+                    t_sec = fi * hop / sr
+                    phase[bi, fi] = 2.0 * np.pi * fc * t_sec
+            return mag * np.exp(1j * phase)
         if mode == "griffin_lim":
             mag = np.abs(cqt)
             n_bins, n_frames = cqt.shape
@@ -5737,6 +7542,62 @@ class ViewportSynthPlayer:
             pad = max(pad, oct_pad)
         return pad
 
+    # -- Routing-aware CQT helpers ----------------------------------------
+
+    def _build_cqt_from_routing(
+        self,
+        raw_arrays: dict[str, np.ndarray],
+        routed: dict[str, np.ndarray | None] | None,
+        audio_ch: str,
+        y0: int, y1: int, ex0: int, ex1: int,
+        phase_mode: str,
+        view_freqs: np.ndarray,
+        n_bins: int,
+    ) -> np.ndarray:
+        """Build a complex CQT slice for *audio_ch* using routed fields.
+
+        When *routed* is ``None`` or the relevant fields are missing, falls
+        back to the default ``real_<ch> + 1j * imag_<ch>`` path.
+
+        The magnitude slot is treated as magnitude, the phase slot as
+        phase — always ``m * exp(1j * p)``.  The user controls what
+        data lands in each slot via the routing patch panel.
+        """
+        mag_arr = routed.get(f"magnitude_{audio_ch}") if routed else None
+        pha_arr = routed.get(f"phase_{audio_ch}") if routed else None
+
+        if mag_arr is not None and pha_arr is not None:
+            m = np.asarray(mag_arr[y0:y1, ex0:ex1], dtype=np.float64)
+            p = np.asarray(pha_arr[y0:y1, ex0:ex1], dtype=np.float64)
+            cqt = m * np.exp(1j * p)
+        else:
+            # Default fallback — hardcoded CQT complex fields
+            real = np.asarray(
+                raw_arrays[f"real_{audio_ch}"][y0:y1, ex0:ex1],
+                dtype=np.float64)
+            imag = np.asarray(
+                raw_arrays[f"imag_{audio_ch}"][y0:y1, ex0:ex1],
+                dtype=np.float64)
+            cqt = real + 1j * imag
+
+        return self._apply_phase_mode(cqt, phase_mode,
+                                       view_freqs, y0, n_bins)
+
+    @staticmethod
+    def _extract_routing_mask(
+        raw_arrays: dict[str, np.ndarray],
+        routed: dict[str, np.ndarray | None] | None,
+        audio_ch: str,
+        y0: int, y1: int, ex0: int, ex1: int,
+    ) -> np.ndarray | None:
+        """Return the mask array from routing, or None if unset."""
+        if routed is None:
+            return None
+        mask_arr = routed.get(f"mask_{audio_ch}")
+        if mask_arr is None:
+            return None
+        return np.asarray(mask_arr[y0:y1, ex0:ex1], dtype=np.float64)
+
     def synthesise_to_array(self, raw_arrays: dict[str, np.ndarray],
                             freqs: np.ndarray, times: np.ndarray,
                             view_x0: float, view_x1: float,
@@ -5748,6 +7609,7 @@ class ViewportSynthPlayer:
                             phase_mode: str = "original",
                             tf_mask: np.ndarray | None = None,
                             ola_norms: dict[int, np.ndarray] | None = None,
+                            routed_arrays: dict[str, np.ndarray | None] | None = None,
                             ) -> tuple[np.ndarray, float, float, float] | None:
         """Run iCQT and return ``(stereo_i16, duration, view_t0, view_t1)``.
 
@@ -5767,6 +7629,12 @@ class ViewportSynthPlayer:
             :meth:`_compute_ola_norms`.  When provided the iCQT uses these
             instead of computing its own, ensuring consistent normalisation
             across partitioned synthesis calls.
+        routed_arrays : dict, optional
+            Mapping from ``"magnitude_left"``, ``"phase_left"``,
+            ``"mask_left"``, etc. to raw numpy arrays (native dtype,
+            unscaled) resolved from the channel routing panel.  When
+            provided, the synthesiser reads data from these arrays
+            instead of the hardcoded CQT fields.
         """
         x0 = max(0, int(math.floor(view_x0)))
         x1 = min(n_frames, int(math.ceil(view_x1)))
@@ -5791,12 +7659,15 @@ class ViewportSynthPlayer:
         n_vf = ex1 - ex0
 
         # Build complex CQT slices (extended range)
-        real_l = np.asarray(raw_arrays["real_left"][y0:y1, ex0:ex1],
-                            dtype=np.float64)
-        imag_l = np.asarray(raw_arrays["imag_left"][y0:y1, ex0:ex1],
-                            dtype=np.float64)
-        cqt_l = self._apply_phase_mode(real_l + 1j * imag_l, phase_mode,
-                                         view_freqs, y0, n_bins)
+        cqt_l = self._build_cqt_from_routing(
+            raw_arrays, routed_arrays, "left",
+            y0, y1, ex0, ex1, phase_mode, view_freqs, n_bins)
+
+        # Apply routing mask if available
+        mask_l = self._extract_routing_mask(
+            raw_arrays, routed_arrays, "left", y0, y1, ex0, ex1)
+        if mask_l is not None:
+            cqt_l = cqt_l * mask_l
 
         # Apply TF mask if provided
         if tf_mask is not None:
@@ -5815,12 +7686,13 @@ class ViewportSynthPlayer:
                            ola_norms=ola_norms)
 
         if is_stereo:
-            real_r = np.asarray(raw_arrays["real_right"][y0:y1, ex0:ex1],
-                                dtype=np.float64)
-            imag_r = np.asarray(raw_arrays["imag_right"][y0:y1, ex0:ex1],
-                                dtype=np.float64)
-            cqt_r = self._apply_phase_mode(real_r + 1j * imag_r, phase_mode,
-                                             view_freqs, y0, n_bins)
+            cqt_r = self._build_cqt_from_routing(
+                raw_arrays, routed_arrays, "right",
+                y0, y1, ex0, ex1, phase_mode, view_freqs, n_bins)
+            mask_r = self._extract_routing_mask(
+                raw_arrays, routed_arrays, "right", y0, y1, ex0, ex1)
+            if mask_r is not None:
+                cqt_r = cqt_r * mask_r
             if tf_mask is not None:
                 cqt_r = cqt_r * tf_mask
             sig_r_full = _icqt(cqt_r, view_freqs, y0, n_bins, n_vf,
@@ -6159,7 +8031,12 @@ class SpectrogramViewer:
             self._load_npz(analysis_dir)
 
         # --- Field sources ---
-        self.field_sources = _build_field_sources(self._has_onset)
+        _has_fb = (analysis_dir is not None and
+                   os.path.isdir(os.path.join(analysis_dir, "filterbank")))
+        _has_wvlt = (analysis_dir is not None and
+                     os.path.isdir(os.path.join(analysis_dir, "wavelet")))
+        self.field_sources = _build_field_sources(
+            self._has_onset, has_fb=_has_fb, has_wvlt=_has_wvlt)
         self.field_configs = [FieldConfig() for _ in self.field_sources]
         self.global_defaults = GlobalDefaults()
 
@@ -6198,7 +8075,14 @@ class SpectrogramViewer:
         ]
         self.subplots_ts: list[SubPlot] = [SubPlot("waveform", "Waveform")]
         self.subplots_tsc: list[SubPlot] = [SubPlot("scalogram", "Scalogram")]
+        self.subplots_overlay: list[SubPlot] = [SubPlot("overlay", "Overlay")]
         self.tiling_strategy: TilingStrategy = TilingStrategy.COLUMNS
+
+        # Overlay composite config
+        self.overlay_config = OverlayConfig()
+        self._overlay_tex_id: int = 0
+        self._overlay_dirty: bool = True
+        self._overlay_gd_snap: tuple = ()  # snapshot of GD values at last bake
 
         # Wavelet time-scale cache
         self._wv_coeffs: list[np.ndarray] = []    # [approx, d1, d2, ...]
@@ -6359,6 +8243,8 @@ class SpectrogramViewer:
             "mag_similarity":   (0.0, 1.0),
             "phase_similarity": (0.0, 1.0),
             "onset":            (0.0, 1.0),
+            "wvlt_approx":      (0.0, 1.0),
+            "wvlt_detail":      (0.0, 1.0),
         }
         print("  done")
 
@@ -6397,6 +8283,48 @@ class SpectrogramViewer:
             return ((1.0 + np.cos(pl - pr)) / 2.0).astype(np.float32)
 
         return np.zeros((y1 - y0, x1 - x0), dtype=np.float32)
+
+    def _resolve_field_array(self, field_name: str) -> np.ndarray | None:
+        """Return the full 2-D array for *field_name* at native dtype.
+
+        Handles raw arrays stored directly in ``_raw_arrays`` as well as
+        derived fields (``mag_left``, ``mag_right``, ``mag_similarity``,
+        ``phase_similarity``) that are computed from the raw complex
+        components.
+
+        Returns ``None`` when the field cannot be resolved.
+        """
+        if field_name in self._raw_arrays:
+            return self._raw_arrays[field_name]
+
+        if field_name == "mag_left":
+            r = self._raw_arrays["real_left"]
+            i = self._raw_arrays["imag_left"]
+            return np.sqrt(np.asarray(r, dtype=r.dtype) ** 2 +
+                           np.asarray(i, dtype=i.dtype) ** 2)
+        if field_name == "mag_right":
+            r = self._raw_arrays["real_right"]
+            i = self._raw_arrays["imag_right"]
+            return np.sqrt(np.asarray(r, dtype=r.dtype) ** 2 +
+                           np.asarray(i, dtype=i.dtype) ** 2)
+        if field_name == "mag_similarity":
+            ml = self._resolve_field_array("mag_left")
+            mr = self._resolve_field_array("mag_right")
+            if ml is None or mr is None:
+                return None
+            peak = np.maximum(ml, mr)
+            return np.where(peak < EPS, 1.0,
+                            np.minimum(ml, mr) / peak)
+        if field_name == "phase_similarity":
+            pl = self._raw_arrays.get("phase_left")
+            pr = self._raw_arrays.get("phase_right")
+            if pl is None or pr is None:
+                return None
+            return (1.0 + np.cos(
+                np.asarray(pl, dtype=pl.dtype) -
+                np.asarray(pr, dtype=pr.dtype))) / 2.0
+
+        return None
 
     def _normalize_field(self, data: np.ndarray,
                          field_name: str,
@@ -6469,8 +8397,9 @@ class SpectrogramViewer:
         x1 = min(self.n_frames, int(math.ceil(self.view_x1)))
         # For hybrid, convert unified Y to CQT bin indices
         cqt_off = self._hybrid_cross_bin() if self.tf_source == "hybrid" else 0.0
-        y0 = max(0, int(math.floor(self.view_y0 - cqt_off)))
-        y1 = min(self.n_bins, int(math.ceil(self.view_y1 - cqt_off)))
+        cqt_skip = self._hybrid_cqt_skip_bins() if self.tf_source == "hybrid" else 0
+        y0 = max(0, int(math.floor(self.view_y0 - cqt_off)) + cqt_skip)
+        y1 = min(self.n_bins, int(math.ceil(self.view_y1 - cqt_off)) + cqt_skip)
         if x1 <= x0 or y1 <= y0:
             self._scan_complete = True
             return
@@ -6622,6 +8551,8 @@ class SpectrogramViewer:
         self.synth_panel.on_synth_icqt = self._toggle_synth
         self.synth_panel.on_synth_fb = self._submit_fb_audio_job
         self.synth_panel.on_synth_hybrid = self._submit_hybrid_synth_job
+        self.synth_panel.on_synth_fb_tf = self._submit_fb_tf_job
+        self.synth_panel.on_synth_wavelet = self._submit_wavelet_synth_job
         self.synth_panel._get_phase_mode = lambda: self.phase_mode
         self.synth_panel._set_phase_mode = lambda v: setattr(self, "phase_mode", v)
         self.synth_panel._get_normalize = lambda: self.normalize_loudness
@@ -6630,6 +8561,8 @@ class SpectrogramViewer:
         self.synth_panel._set_fb_n_bands = lambda v: setattr(self, "fb_n_bands", v)
         self.synth_panel._has_audio = lambda: self.audio_path is not None
         self.synth_panel._has_synth = lambda: self.synth is not None
+        self.synth_panel._has_wavelet = lambda: bool(self._wv_coeffs)
+
         self.dock.register("synthesis", self.synth_panel)
         _app_root = os.path.dirname(os.path.abspath(__file__))
         input_dir = os.path.join(_app_root, "input")
@@ -6640,6 +8573,10 @@ class SpectrogramViewer:
         self.file_panel.on_set_active = self._load_analysis_folder
         self.file_panel.on_unload = self._unload_data
         self.dock.register("files", self.file_panel)
+        self.image_panel = ImageInputPanel(
+            side="left",
+            image_dir=os.path.join(_app_root, "input_images"))
+        self.dock.register("images", self.image_panel)
         self.dock.right_key = "fields"
         self.dock.left_key = "files"
 
@@ -6820,6 +8757,10 @@ class SpectrogramViewer:
                          action=lambda: self._set_display_mode("ts"),
                          toggle_state=lambda: self.display_mode == "ts",
                          radio_group="display_mode"),
+                MenuItem("Overlay",
+                         action=lambda: self._set_display_mode("overlay"),
+                         toggle_state=lambda: self.display_mode == "overlay",
+                         radio_group="display_mode"),
             ]),
             MenuItem("TF Source", children=[
                 MenuItem("CQT",
@@ -6856,6 +8797,7 @@ class SpectrogramViewer:
             MenuItem("CQT Subplots", children=_subplot_toggles(self.subplots_tf_cqt, "tf")),
             MenuItem("FB Subplots", children=_subplot_toggles(self.subplots_tf_fb, "tf")),
             MenuItem("TS Subplots", children=_subplot_toggles(self.subplots_ts, "ts")),
+            MenuItem("Overlay Subplots", children=_subplot_toggles(self.subplots_overlay, "overlay")),
             MenuItem("-"),
             MenuItem("Lock Zoom", children=[
                 MenuItem("Both Axes",
@@ -6953,6 +8895,15 @@ class SpectrogramViewer:
                 if not self._wv_coeffs:
                     self._load_wavelet_data()
                 self._compute_wavelet_scalogram()
+        elif mode == "overlay":
+            # Ensure all backing data is loaded
+            if self._fb_dirty:
+                self._compute_fb_envelopes()
+            if self._wv_dirty:
+                if not self._wv_coeffs:
+                    self._load_wavelet_data()
+                self._compute_wavelet_scalogram()
+            self._overlay_dirty = True
         elif mode == "tf" and self.tf_source == "fb" and self._fb_dirty:
             self._compute_fb_envelopes()
         y_min, y_max = self._y_data_range()
@@ -7042,6 +8993,8 @@ class SpectrogramViewer:
                 src = self.subplots_tf_cqt
         elif self.display_mode == "tsc":
             src = self.subplots_tsc
+        elif self.display_mode == "overlay":
+            src = self.subplots_overlay
         else:
             src = self.subplots_ts
         return [sp for sp in src if sp.visible]
@@ -7064,6 +9017,9 @@ class SpectrogramViewer:
         elif self.display_mode == "tsc":
             if subplot.key == "scalogram":
                 self._render_tsc(sx, sy, sw, sh)
+        elif self.display_mode == "overlay":
+            if subplot.key == "overlay":
+                self._render_overlay(sx, sy, sw, sh)
         elif self.display_mode == "ts":
             if subplot.key == "waveform":
                 self._render_ts(sx, sy, sw, sh)
@@ -7267,7 +9223,12 @@ class SpectrogramViewer:
         self._scan_complete = True
 
         # Rebuild field sources
-        self.field_sources = _build_field_sources(self._has_onset)
+        _has_fb = os.path.isdir(
+            os.path.join(self.analysis_dir, "filterbank")) if self.analysis_dir else False
+        _has_wvlt = os.path.isdir(
+            os.path.join(self.analysis_dir, "wavelet")) if self.analysis_dir else False
+        self.field_sources = _build_field_sources(
+            self._has_onset, has_fb=_has_fb, has_wvlt=_has_wvlt)
         self.field_configs = [FieldConfig() for _ in self.field_sources]
         for i, fs in enumerate(self.field_sources):
             if fs.name == "mag_left":
@@ -7447,8 +9408,12 @@ class SpectrogramViewer:
         sr_file, raw = _wf.read(self.audio_path)
         if raw.ndim == 2:
             mono = raw.mean(axis=1).astype(np.float32) / 32768.0
+            left_ch = raw[:, 0].astype(np.float32) / 32768.0
+            right_ch = raw[:, 1].astype(np.float32) / 32768.0
+            is_stereo = True
         else:
             mono = raw.astype(np.float32) / 32768.0
+            is_stereo = False
         ftype_idx = self.file_panel.fb_filter_type_idx if self.file_panel else 0
         ftype = _FILTER_TYPES[ftype_idx]
         bpo = self.file_panel.fb_bpo if self.file_panel else 12
@@ -7460,6 +9425,32 @@ class SpectrogramViewer:
         fb = FilterBankDecomposition(sr_file, ftype)
         fb.compute_and_save(mono, bands, self.analysis_dir, sr_file,
                             wav_path=self.audio_path)
+        # Always produce L+R envelopes (mono input → L=R)
+        fb_dir = os.path.join(self.analysis_dir, "filterbank")
+        if is_stereo:
+            ch_pairs = [("left", left_ch), ("right", right_ch)]
+        else:
+            ch_pairs = [("left", mono)]
+        for ch_label, ch_sig in ch_pairs:
+            fb_ch = FilterBankDecomposition(sr_file, ftype)
+            fb_ch.compute(ch_sig, bands)
+            mags_ch, phases_ch, hops_ch = fb_ch.compute_envelopes()
+            data_ch: dict[str, np.ndarray] = {
+                "n_bands": np.int64(len(mags_ch)),
+                "hops": np.array(hops_ch, dtype=np.int64),
+            }
+            for ii, (m, p) in enumerate(zip(mags_ch, phases_ch)):
+                data_ch[f"mag_{ii}"] = m
+                data_ch[f"phase_{ii}"] = p
+            np.savez_compressed(
+                os.path.join(fb_dir,
+                             f"fb_envelopes_{ch_label}.npz"),
+                **data_ch)
+        if not is_stereo:
+            import shutil
+            shutil.copy2(
+                os.path.join(fb_dir, "fb_envelopes_left.npz"),
+                os.path.join(fb_dir, "fb_envelopes_right.npz"))
         print("FB broadening complete.")
 
     def _start_broadening(self, synth_mode: str) -> None:
@@ -7505,6 +9496,7 @@ class SpectrogramViewer:
             params={
                 "synth": self.synth,
                 "raw_arrays": self._raw_arrays,
+                "field_resolver": self._resolve_field_array,
                 "freqs": self._freqs,
                 "times": self.times,
                 "view_x0": self.view_x0, "view_x1": self.view_x1,
@@ -7514,6 +9506,11 @@ class SpectrogramViewer:
                 "sr": sr_val, "is_stereo": self.is_stereo,
                 "normalize": self.normalize_loudness,
                 "phase_mode": self.phase_mode,
+                "routing": self.synth_panel.channel_routing if self.synth_panel else None,
+                "field_sources": self.field_sources,
+                "field_configs": self.field_configs,
+                "use_adjusted": self.synth_panel.use_adjusted if self.synth_panel else False,
+                "global_defaults": self.global_defaults,
             })
         if self.synth_panel:
             self.synth_panel.submit(job)
@@ -7582,6 +9579,7 @@ class SpectrogramViewer:
             params={
                 "synth": self.synth,
                 "raw_arrays": self._raw_arrays,
+                "field_resolver": self._resolve_field_array,
                 "freqs": self._freqs,
                 "times": self.times,
                 "view_x0": self.view_x0, "view_x1": self.view_x1,
@@ -7595,6 +9593,68 @@ class SpectrogramViewer:
                 "cross_hz": cross_hz,
                 "f_lo": f_lo,
                 "n_bands": self.fb_n_bands,
+                "routing": self.synth_panel.channel_routing if self.synth_panel else None,
+                "field_sources": self.field_sources,
+                "field_configs": self.field_configs,
+                "use_adjusted": self.synth_panel.use_adjusted if self.synth_panel else False,
+                "global_defaults": self.global_defaults,
+            })
+        if self.synth_panel:
+            self.synth_panel.submit(job)
+
+    def _submit_fb_tf_job(self) -> None:
+        """Submit an FB-from-TF synthesis job using routed viewport data."""
+        if not self.synth or not self._loaded:
+            return
+        sr_val = int(self._npz["sr"]) if self._npz is not None and "sr" in self._npz else 44100
+        label = (f"FB-TF {self.view_x0:.0f}-{self.view_x1:.0f} / "
+                 f"{self.view_y0:.0f}-{self.view_y1:.0f}")
+        sp = self.synth_panel
+        job = SynthJob(
+            job_id=0, label=label, source_type="fb_tf",
+            params={
+                "synth": self.synth,
+                "raw_arrays": self._raw_arrays,
+                "field_resolver": self._resolve_field_array,
+                "freqs": self._freqs,
+                "times": self.times,
+                "view_x0": self.view_x0, "view_x1": self.view_x1,
+                "view_y0": self.view_y0, "view_y1": self.view_y1,
+                "n_frames": self.n_frames, "n_bins": self.n_bins,
+                "t_start": self.t_start, "t_dur": self.t_dur,
+                "sr": sr_val, "is_stereo": self.is_stereo,
+                "normalize": self.normalize_loudness,
+                "phase_mode": self.phase_mode,
+                "routing": sp.channel_routing if sp else None,
+                "field_sources": self.field_sources,
+                "field_configs": self.field_configs,
+                "use_adjusted": sp.use_adjusted if sp else False,
+                "global_defaults": self.global_defaults,
+            })
+        if sp:
+            sp.submit(job)
+
+    def _submit_wavelet_synth_job(self) -> None:
+        """Submit a wavelet reconstruction synthesis job."""
+        if not self._wv_coeffs:
+            return
+        sr_val = int(self._npz["sr"]) if self._npz is not None and "sr" in self._npz else 44100
+
+        # Map viewport frame range to time
+        x0 = max(0, int(math.floor(self.view_x0)))
+        x1 = min(self.n_frames, int(math.ceil(self.view_x1)))
+        t0 = self.t_start + x0 / self.n_frames * self.t_dur
+        t1 = self.t_start + x1 / self.n_frames * self.t_dur
+
+        label = f"Wavelet {t0:.2f}-{t1:.2f}s"
+        job = SynthJob(
+            job_id=0, label=label, source_type="wavelet",
+            params={
+                "wv_coeffs": self._wv_coeffs,
+                "wv_meta": self._wv_meta,
+                "sr": sr_val,
+                "t0": t0, "t1": t1,
+                "normalize": self.normalize_loudness,
             })
         if self.synth_panel:
             self.synth_panel.submit(job)
@@ -7642,7 +9702,7 @@ class SpectrogramViewer:
         elif key == K_t:
             self.show_time_axis = not self.show_time_axis
         elif key == K_d:
-            _modes = ["tf", "tsc", "ts"]
+            _modes = ["tf", "tsc", "ts", "overlay"]
             idx = _modes.index(self.display_mode) if self.display_mode in _modes else 0
             self._set_display_mode(_modes[(idx + 1) % len(_modes)])
         elif key == K_x:
@@ -7730,6 +9790,9 @@ class SpectrogramViewer:
         """Full Y data range for the current display mode."""
         if self.display_mode == "ts":
             return (-1.0, 1.0)
+        if self.display_mode == "overlay":
+            # Use CQT bin count as canonical Y extent
+            return (0.0, float(self.n_bins) if self.n_bins > 0 else 1.0)
         if self.display_mode == "tsc":
             n = self._wv_n_levels if self._wv_n_levels > 0 else 1
             return (0.0, float(n))
@@ -7739,7 +9802,9 @@ class SpectrogramViewer:
             return (0.0, float(n))
         if self.tf_source == "hybrid":
             n_fb = len(self._fb_bands) if self._fb_bands else 0
-            return (0.0, float(n_fb + self.n_bins))
+            skip = self._hybrid_cqt_skip_bins()
+            n_cqt_above = max(0, self.n_bins - skip)
+            return (0.0, float(n_fb + n_cqt_above))
         # cqt: CQT bin indices as Y axis
         return (0.0, float(self.n_bins))
 
@@ -7853,6 +9918,10 @@ class SpectrogramViewer:
         frag = gl_shaders.compileShader(FRAG_SRC, GL_FRAGMENT_SHADER)
         self._program = gl_shaders.compileProgram(vert, frag)
 
+        ov = gl_shaders.compileShader(OVERLAY_VERT_SRC, GL_VERTEX_SHADER)
+        of = gl_shaders.compileShader(OVERLAY_FRAG_SRC, GL_FRAGMENT_SHADER)
+        self._overlay_program = gl_shaders.compileProgram(ov, of)
+
         # Invalidate textures (GL context may have been recreated)
         self._front_tex_ids = {}
         self._back_tex_ids = {}
@@ -7930,10 +9999,30 @@ class SpectrogramViewer:
 
         glUniform1i(loc("uFieldCount"), field_idx)
 
+        # Mono mix mode from the synthesis panel's channel routing
+        mmm = 0
+        if self.synth_panel:
+            mmm = self.synth_panel.channel_routing.mono_mix_mode
+        glUniform1i(loc("uMonoMixMode"), mmm)
+
+        # HSL channel hues, saturations, and blend mode
+        h = gd.channel_hues
+        s = gd.channel_sats
+        glUniform4f(loc("uChannelHue"), h[0], h[1], h[2], h[3])
+        glUniform4f(loc("uChannelSat"), s[0], s[1], s[2], s[3])
+        glUniform1i(loc("uBlendMode"), gd.blend_mode)
+
         glUniform4f(loc("uOutGamma"),
                     gd.out_gamma, gd.out_gamma, gd.out_gamma, gd.out_gamma)
         glUniform4f(loc("uOutScale"),
                     gd.out_scale, gd.out_scale, gd.out_scale, gd.out_scale)
+
+        # HDR dynamic range compression
+        glUniform1i(loc("uHdrNormalizer"), gd.hdr_normalizer)
+        glUniform2f(loc("uHdrInputRange"),
+                    gd.hdr_input_lo, gd.hdr_input_hi)
+        glUniform2f(loc("uHdrOutputRange"),
+                    gd.hdr_output_lo, gd.hdr_output_hi)
 
     # ---- Rendering --------------------------------------------------------
 
@@ -8350,14 +10439,17 @@ class SpectrogramViewer:
         tex_w = min(max_len, max_w)
         self._wv_n_frames = tex_w
 
+        # Detect native dtype from coefficients
+        native_dt = coeffs[0].dtype if len(coeffs) > 0 else np.float32
+
         # Resample each level to tex_w, take absolute value as magnitude
-        mag_grid = np.zeros((n_rows, tex_w), dtype=np.float32)
+        mag_grid = np.zeros((n_rows, tex_w), dtype=native_dt)
         dst_t = np.linspace(0.0, 1.0, tex_w)
         for i, c in enumerate(coeffs):
             n_src = len(c)
             if n_src == 0:
                 continue
-            absv = np.abs(c).astype(np.float32)
+            absv = np.abs(c)
             if n_src == tex_w:
                 mag_grid[i] = absv
             else:
@@ -8368,15 +10460,15 @@ class SpectrogramViewer:
         gmax = float(mag_grid.max()) if mag_grid.size else 1.0
         if gmax < 1e-12:
             gmax = 1.0
-        mag_norm = np.clip(mag_grid / gmax, 0.0, 1.0).astype(np.float32)
+        mag_norm = np.clip(mag_grid / gmax, 0.0, 1.0)
 
         # Sign-based phase proxy: positive → 0, negative → pi
-        phase_grid = np.zeros((n_rows, tex_w), dtype=np.float32)
+        phase_grid = np.zeros((n_rows, tex_w), dtype=native_dt)
         for i, c in enumerate(coeffs):
             n_src = len(c)
             if n_src == 0:
                 continue
-            sign_arr = np.where(c >= 0, 0.0, np.pi).astype(np.float32)
+            sign_arr = np.where(c >= 0, 0.0, np.pi)
             if n_src == tex_w:
                 phase_grid[i] = sign_arr
             else:
@@ -8384,44 +10476,32 @@ class SpectrogramViewer:
                 phase_grid[i] = np.interp(dst_t, src_t, sign_arr)
         phase_norm = np.clip(
             (phase_grid + np.pi) / (2.0 * np.pi), 0.0, 1.0
-        ).astype(np.float32)
+        )
 
         # Clean up old wavelet textures
         for old_id in self._wv_shader_tex_ids.values():
             glDeleteTextures([old_id])
         self._wv_shader_tex_ids = {}
 
-        zeros = np.zeros((n_rows, tex_w), dtype=np.float32)
-        alpha = np.ones((n_rows, tex_w), dtype=np.float32)
-        sim_ones = np.ones((n_rows, tex_w), dtype=np.float32)
+        zeros = np.zeros((n_rows, tex_w), dtype=native_dt)
+        alpha = np.ones((n_rows, tex_w), dtype=native_dt)
 
         def _pack_and_upload(r, g, b, a) -> int:
             rgba = np.stack([r, g, b, a], axis=-1).astype(np.float32)
-            rgba = np.ascontiguousarray(rgba[::-1])  # row 0 at bottom
+            rgba = np.ascontiguousarray(rgba)
             return self._upload_texture_float(rgba)
 
-        self._wv_shader_tex_ids["cqt_left_polar"] = _pack_and_upload(
+        self._wv_shader_tex_ids["wavelet_coeffs"] = _pack_and_upload(
             mag_norm, phase_norm, zeros, alpha)
-        self._wv_shader_tex_ids["cqt_right_polar"] = _pack_and_upload(
-            mag_norm, phase_norm, zeros, alpha)
-        real_part = (mag_norm * np.cos(phase_grid)).astype(np.float32)
-        imag_part = (mag_norm * np.sin(phase_grid)).astype(np.float32)
-        ri_abs = max(float(np.abs(real_part).max()),
-                     float(np.abs(imag_part).max()), 1e-12)
-        real_norm = np.clip(
-            (real_part / ri_abs + 1.0) * 0.5, 0.0, 1.0
-        ).astype(np.float32)
-        imag_norm = np.clip(
-            (imag_part / ri_abs + 1.0) * 0.5, 0.0, 1.0
-        ).astype(np.float32)
-        self._wv_shader_tex_ids["cqt_left_complex"] = _pack_and_upload(
-            real_norm, imag_norm, zeros, alpha)
-        self._wv_shader_tex_ids["cqt_right_complex"] = _pack_and_upload(
-            real_norm, imag_norm, zeros, alpha)
-        self._wv_shader_tex_ids["cqt_mag_stereo"] = _pack_and_upload(
-            mag_norm, mag_norm, sim_ones, alpha)
-        self._wv_shader_tex_ids["cqt_phase_stereo"] = _pack_and_upload(
-            phase_norm, phase_norm, sim_ones, alpha)
+
+        # Store pre-normalization wavelet grids so _get_field_slice can
+        # access them by canonical field name (same pattern as FB).
+        self._raw_arrays["wvlt_approx"] = mag_grid
+        self._raw_arrays["wvlt_detail"] = phase_grid
+        # Update field ranges for wavelet data
+        wvlt_mag_max = float(gmax) if gmax > 1e-12 else 1.0
+        self._field_ranges["wvlt_approx"] = (0.0, wvlt_mag_max)
+        self._field_ranges["wvlt_detail"] = (0.0, float(np.pi))
 
         self._wv_dirty = False
         print(f"Wavelet scalogram: {n_rows} levels, tex {n_rows}×{tex_w}")
@@ -8437,10 +10517,10 @@ class SpectrogramViewer:
             return
 
         n_levels = self._wv_n_levels if self._wv_n_levels > 0 else 1
-        wv_frames = float(self._wv_n_frames) if self._wv_n_frames > 0 else 1.0
+        cqt_total = float(self.n_frames) if self.n_frames > 0 else 1.0
 
-        u0 = self.view_x0 / wv_frames
-        u1 = self.view_x1 / wv_frames
+        u0 = self.view_x0 / cqt_total
+        u1 = self.view_x1 / cqt_total
         v0 = self.view_y0 / n_levels
         v1 = self.view_y1 / n_levels
 
@@ -8478,6 +10558,294 @@ class SpectrogramViewer:
         glUseProgram(0)
         glActiveTexture(GL_TEXTURE0)
         self._tex_units = saved_tex_units
+
+    # ---- Overlay composite rendering ----------------------------------------
+
+    def _render_overlay(self, sx: int, sy: int, sw: int, sh: int) -> None:
+        """Render the overlay composite: all enabled layers resampled to a
+        common grid then blended into a single GL texture.
+
+        Each layer produces a 2-D magnitude array in its native shape.
+        The arrays are resampled to the CQT grid size (n_bins x n_frames)
+        using :func:`_overlay_resample_to_grid`, optionally transposing
+        when the layer's axis roles are swapped.
+
+        Compositing mirrors the spectrogram GLSL shader exactly:
+
+        - Per-layer: norm → gamma → scale via ``_apply_curve``
+        - Tinted using the layer's channel hue/sat from
+          ``global_defaults.channel_hues / channel_sats``
+        - HSL→RGB via ``_hsl2rgb_vec`` (same formula as the shader)
+        - Blended using ``global_defaults.blend_mode``
+          (0 = additive, 1 = subtractive)
+        - Post-blend ``out_gamma`` and ``out_scale`` applied per component
+        """
+        if sw <= 0 or sh <= 0:
+            return
+
+        # Canonical grid dims — use CQT shape as reference
+        grid_h = self.n_bins if self.n_bins > 0 else 256
+        grid_w = self.n_frames if self.n_frames > 0 else 256
+
+        # Destination coordinate axes — physical units so every source
+        # maps onto the same frequency / time grid accurately.
+        # Time: use CQT time array (uniformly hop-spaced).
+        if len(self.times) == grid_w:
+            dst_x = np.asarray(self.times, dtype=np.float64)
+        else:
+            dst_x = np.linspace(self.t_start, self.t_end, grid_w,
+                                dtype=np.float64)
+        # Frequency: use CQT frequency array (log-spaced, Hz).
+        if len(self._freqs) == grid_h:
+            dst_y = np.asarray(self._freqs, dtype=np.float64)
+        else:
+            dst_y = np.arange(grid_h, dtype=np.float64)
+
+        # Auto-detect when GlobalDefaults changed since last bake
+        gd = self.global_defaults
+        gd_snap = (gd.norm_mode, gd.gamma, gd.scale,
+                   gd.out_gamma, gd.out_scale, gd.blend_mode,
+                   gd.hdr_normalizer, gd.hdr_input_lo, gd.hdr_input_hi,
+                   gd.hdr_output_lo, gd.hdr_output_hi,
+                   tuple(gd.channel_hues or ()),
+                   tuple(gd.channel_sats or ()),
+                   tuple((fc.target, fc.norm_mode, fc.gamma, fc.scale,
+                          fc.use_global) for fc in self.field_configs))
+        if gd_snap != self._overlay_gd_snap:
+            self._overlay_dirty = True
+
+        if self._overlay_dirty or self._overlay_tex_id == 0:
+            hues = gd.channel_hues or list(DEFAULT_CHANNEL_HUES)
+            sats = gd.channel_sats or list(DEFAULT_CHANNEL_SATS)
+
+            # Ensure backing data is loaded for all source categories
+            if self._fb_dirty:
+                self._compute_fb_envelopes()
+            if self._wv_dirty:
+                if not self._wv_coeffs:
+                    self._load_wavelet_data()
+                self._compute_wavelet_scalogram()
+
+            # ---- Pre-compute per-category frequency & time axes -----------
+            # Filterbank: centre frequency of each band (ascending Hz)
+            _fb_freq_y: np.ndarray | None = None
+            if hasattr(self, "_fb_bands") and self._fb_bands:
+                _fb_freq_y = np.array(
+                    [b.centre for b in self._fb_bands], dtype=np.float64)
+
+            # Wavelet: octave-band centres from DWT structure.
+            # coeffs = [approx, detail_1(cD_L), ..., detail_L(cD_1)]
+            # detail_k = cD_{L-k+1}  → band [sr/2^(j+1), sr/2^j]
+            #   where j = L - k + 1, centre = sr / 2^(j+0.5)
+            _wv_freq_y: np.ndarray | None = None
+            if self._wv_meta and self._wv_coeffs:
+                _wv_sr = float(self._wv_meta.get("sr", 48000))
+                _wv_L = len(self._wv_coeffs) - 1  # number of detail levels
+                _wvf = np.zeros(len(self._wv_coeffs), dtype=np.float64)
+                # Approx: treat as one more octave below coarsest detail
+                _wvf[0] = _wv_sr / 2.0 ** (_wv_L + 1.5)
+                for _k in range(1, _wv_L + 1):
+                    _j = _wv_L - _k + 1   # DWT decomposition level
+                    _wvf[_k] = _wv_sr / 2.0 ** (_j + 0.5)
+                _wv_freq_y = _wvf
+
+            # Iterate every field_source with an assigned channel target.
+            # Resolve its data, resample to the common grid, and composite
+            # using the channel's hue/sat — mirroring the GLSL shader.
+            layer_data: list[tuple[np.ndarray, int, float]] = []
+            for fs, fc in zip(self.field_sources, self.field_configs):
+                if fc.target < 0 or fc.target > 3:
+                    continue
+                arr = self._resolve_field_array(fs.name)
+                if arr is None or arr.size == 0:
+                    continue
+                if arr.ndim != 2:
+                    continue
+                src_h, src_w = arr.shape
+
+                # Determine source category to pick the right axes
+                cat = _FIELD_CATEGORY_MAP.get(fs.name, fs.category)
+
+                # --- frequency axis (Y) ---
+                if cat == "fb" and _fb_freq_y is not None \
+                        and len(_fb_freq_y) == src_h:
+                    src_y = _fb_freq_y
+                elif cat == "wvlt" and _wv_freq_y is not None \
+                        and len(_wv_freq_y) == src_h:
+                    src_y = _wv_freq_y
+                elif cat == "cqt" and len(self._freqs) == src_h:
+                    src_y = np.asarray(self._freqs, dtype=np.float64)
+                else:
+                    src_y = np.arange(src_h, dtype=np.float64)
+
+                # --- time axis (X) ---
+                if cat == "cqt" and len(self.times) == src_w:
+                    src_x = np.asarray(self.times, dtype=np.float64)
+                else:
+                    # FB / wavelet resampled to their own tex_w — map
+                    # linearly over the same physical time span as CQT.
+                    src_x = np.linspace(self.t_start, self.t_end, src_w,
+                                        dtype=np.float64)
+
+                resampled = _overlay_resample_to_grid(
+                    arr, src_x, src_y, dst_x, dst_y,
+                    transpose=False)
+
+                # Take absolute value for signed fields (real/imag)
+                resampled = np.abs(resampled)
+
+                # Normalise raw magnitude to [0, 1] range
+                rmax = float(resampled.max()) if resampled.size else 1.0
+                if rmax < 1e-12:
+                    rmax = 1.0
+                raw_norm = (resampled / rmax).astype(np.float32)
+
+                # Resolve effective per-field parameters (custom or global)
+                eff_norm = fc.norm_mode if not fc.use_global else gd.norm_mode
+                eff_gamma = fc.gamma if not fc.use_global else gd.gamma
+                eff_scale = fc.scale if not fc.use_global else gd.scale
+
+                # Apply the viewer's norm → gamma → scale curve
+                curved = _apply_curve(raw_norm, eff_norm,
+                                      eff_gamma, eff_scale)
+                layer_data.append((curved, fc.target % len(hues)))
+
+            # Blend using the same algorithm as the GLSL shader
+            rgb = np.zeros((grid_h, grid_w, 3), dtype=np.float32)
+
+            if gd.blend_mode == 0:
+                # Additive: sum hsl-coloured contributions
+                for curved, ch in layer_data:
+                    v = np.clip(curved, 0.0, 1.0)
+                    _broadcast_hsl2rgb_additive(
+                        rgb, v, hues[ch], sats[ch])
+            else:
+                # Subtractive: rgb = 1 - product(1 - ink)
+                rgb[:] = 1.0
+                any_active = False
+                for curved, ch in layer_data:
+                    v = np.clip(curved, 0.0, 1.0)
+                    ink = np.zeros_like(rgb)
+                    _broadcast_hsl2rgb_additive(
+                        ink, v, hues[ch], sats[ch])
+                    rgb *= (1.0 - ink)
+                    any_active = True
+                if any_active:
+                    rgb = 1.0 - rgb
+                else:
+                    rgb[:] = 0.0
+
+            # Post-blend out_gamma / out_scale (matches shader)
+            for c_idx in range(3):
+                rgb[:, :, c_idx] = np.power(
+                    np.maximum(rgb[:, :, c_idx], 0.0),
+                    gd.out_gamma) * gd.out_scale
+
+            # HDR normalization (pre-clip, post-blend — matches shader)
+            if gd.hdr_normalizer > 0:
+                span_in = gd.hdr_input_hi - gd.hdr_input_lo
+                if abs(span_in) < 1e-12:
+                    span_in = 1.0
+                span_out = gd.hdr_output_hi - gd.hdr_output_lo
+                for c_idx in range(3):
+                    ch = rgb[:, :, c_idx]
+                    t = (ch - gd.hdr_input_lo) / span_in
+                    if gd.hdr_normalizer == 1:      # Clamp
+                        t = np.clip(t, 0.0, 1.0)
+                    elif gd.hdr_normalizer == 2:    # Reinhard
+                        t = np.maximum(t, 0.0)
+                        t = t / (1.0 + t)
+                    elif gd.hdr_normalizer == 3:    # Sigmoid
+                        t = 1.0 / (1.0 + np.exp(-6.0 * (t - 0.5)))
+                    elif gd.hdr_normalizer == 4:    # Linear Compress
+                        t = np.clip(t, 0.0, 1.0)
+                    rgb[:, :, c_idx] = gd.hdr_output_lo + t * span_out
+
+            # Final clamp for display
+            rgb = np.clip(rgb, 0.0, 1.0)
+
+            alpha = np.ones((grid_h, grid_w, 1), dtype=np.float32)
+            composite = np.concatenate([rgb, alpha], axis=-1)
+
+            # Upload as GL texture
+            if self._overlay_tex_id:
+                glDeleteTextures([self._overlay_tex_id])
+            rgba = np.ascontiguousarray(composite)
+            self._overlay_tex_id = self._upload_texture_float(rgba)
+            self._overlay_dirty = False
+            self._overlay_gd_snap = gd_snap
+
+        # Draw textured quad (fixed-function pipeline — no shader needed)
+        if not self._overlay_tex_id:
+            return
+
+        ww, wh = self.win_w, self.win_h
+        nx0 = 2.0 * sx / ww - 1.0
+        ny0 = 1.0 - 2.0 * (sy + sh) / wh
+        nx1 = 2.0 * (sx + sw) / ww - 1.0
+        ny1 = 1.0 - 2.0 * sy / wh
+
+        # UV from viewport
+        u0 = self.view_x0 / max(float(grid_w), 1.0)
+        u1 = self.view_x1 / max(float(grid_w), 1.0)
+        v0 = self.view_y0 / max(float(grid_h), 1.0)
+        v1 = self.view_y1 / max(float(grid_h), 1.0)
+
+        glUseProgram(self._overlay_program)
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, self._overlay_tex_id)
+        glUniform1i(glGetUniformLocation(self._overlay_program, "uTex"), 0)
+        glBegin(GL_QUADS)
+        glTexCoord2f(u0, v0); glVertex2f(nx0, ny0)
+        glTexCoord2f(u1, v0); glVertex2f(nx1, ny0)
+        glTexCoord2f(u1, v1); glVertex2f(nx1, ny1)
+        glTexCoord2f(u0, v1); glVertex2f(nx0, ny1)
+        glEnd()
+        glUseProgram(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+    def _overlay_source_magnitude(self, layer: OverlayLayer) -> np.ndarray | None:
+        """Return a 2-D magnitude array for the given overlay layer source.
+
+        Uses the same pre-computed grids stored by the TF / TSC pipelines
+        in ``_raw_arrays`` so that channel selection (left / right) works
+        and no redundant recomputation is done.
+
+        Shape is (rows, cols) in each source's native orientation:
+        - CQT: (n_bins, n_frames) — ``|real + j*imag|``
+        - FB: (n_bands, tex_w) — ``fb_mag_left`` / ``fb_mag_right``
+        - Wavelet: (n_levels, tex_w) — ``wvlt_approx``  (mono only)
+        """
+        src = layer.source
+        side = "left" if layer.channel == 0 else "right"
+
+        if src == "cqt":
+            r = self._raw_arrays.get(f"real_{side}")
+            im = self._raw_arrays.get(f"imag_{side}")
+            if r is None:
+                return None
+            mag = np.sqrt(r.astype(np.float64) ** 2 +
+                          (im.astype(np.float64) ** 2 if im is not None
+                           else 0.0))
+            return mag.astype(r.dtype)
+
+        if src == "fb":
+            # Use the pre-resampled stereo grids stored by
+            # _compute_fb_envelopes (fb_mag_left / fb_mag_right).
+            grid = self._raw_arrays.get(f"fb_mag_{side}")
+            if grid is not None:
+                return grid
+            # Fallback: try the other side or mono data
+            grid = self._raw_arrays.get("fb_mag_left")
+            return grid
+
+        if src == "wavelet":
+            # Wavelet data is mono — stored as wvlt_approx by
+            # _compute_wavelet_scalogram.
+            grid = self._raw_arrays.get("wvlt_approx")
+            return grid
+
+        return None
 
     # ---- Filterbank-as-TF rendering ----------------------------------------
 
@@ -8558,33 +10926,84 @@ class SpectrogramViewer:
         mag_grid = np.zeros((n_bands, tex_w), dtype=np.float32)
         phase_grid = np.zeros((n_bands, tex_w), dtype=np.float32)
         dst_idx = np.arange(tex_w)
-        for i in range(n_bands):
-            n_src = len(mags[i])
-            if n_src == 0:
-                continue
-            if n_src == tex_w:
-                mag_grid[i] = mags[i]
-                phase_grid[i] = phases[i]
-            else:
-                # Nearest-neighbour mapping: each dst texel picks the
-                # closest source frame.
-                src_sel = np.clip(
-                    (dst_idx * n_src + tex_w // 2) // tex_w,
-                    0, n_src - 1)
-                mag_grid[i] = mags[i][src_sel]
-                phase_grid[i] = phases[i][src_sel]
+
+        def _resample_envelopes(m_list, p_list):
+            """Resample ragged per-band envelopes to (n_bands, tex_w)."""
+            dt = m_list[0].dtype if len(m_list) > 0 else np.float32
+            mg = np.zeros((n_bands, tex_w), dtype=dt)
+            pg = np.zeros((n_bands, tex_w), dtype=dt)
+            for i in range(n_bands):
+                n_src = len(m_list[i])
+                if n_src == 0:
+                    continue
+                if n_src == tex_w:
+                    mg[i] = m_list[i]
+                    pg[i] = p_list[i]
+                else:
+                    src_sel = np.clip(
+                        (dst_idx * n_src + tex_w // 2) // tex_w,
+                        0, n_src - 1)
+                    mg[i] = m_list[i][src_sel]
+                    pg[i] = p_list[i][src_sel]
+            return mg, pg
+
+        mag_grid, phase_grid = _resample_envelopes(mags, phases)
+
+        # --- Always load L+R envelopes (mono input stored L=R) ----------
+        mag_grid_l = mag_grid       # fallback: mono for both
+        phase_grid_l = phase_grid
+        mag_grid_r = mag_grid
+        phase_grid_r = phase_grid
+
+        for ch_label in ("left", "right"):
+            ch_path = os.path.join(fb_dir, f"fb_envelopes_{ch_label}.npz")
+            if os.path.isfile(ch_path):
+                d = np.load(ch_path)
+                if "n_bands" in d:
+                    n_ch = int(d["n_bands"])
+                    if n_ch == n_bands:
+                        m_ch = [d[f"mag_{i}"] for i in range(n_ch)]
+                        p_ch = [d[f"phase_{i}"] for i in range(n_ch)]
+                        mg_ch, pg_ch = _resample_envelopes(m_ch, p_ch)
+                        if ch_label == "left":
+                            mag_grid_l = mg_ch
+                            phase_grid_l = pg_ch
+                        else:
+                            mag_grid_r = mg_ch
+                            phase_grid_r = pg_ch
+
+        # --- Bandwidth energy regularization (optional) --------------------
+        # In a log-spaced filterbank the higher bands are exponentially
+        # wider so they capture proportionally more broadband energy.
+        # Divide each band row by sqrt(bandwidth_hz) to convert raw
+        # amplitude to spectral density before the global-max scaling.
+        _do_q_norm = (self.file_panel is not None and self.file_panel.fb_q_norm)
+        if _do_q_norm and hasattr(self, "_fb_bands") and self._fb_bands:
+            fb_sr = int(_meta.get("sr", 44100)) if os.path.isfile(meta_path) else 44100
+            _nyq = fb_sr / 2.0
+            bw_divisors = np.ones(n_bands, dtype=np.float32)
+            for i, band in enumerate(self._fb_bands):
+                bw = min(band.fmax, _nyq) - max(band.fmin, 0.0)
+                if bw > 0:
+                    bw_divisors[i] = np.sqrt(bw)
+            # Apply as column vector — divides every sample in each row
+            bw_col = bw_divisors[:, np.newaxis]
+            mag_grid_l = mag_grid_l / bw_col
+            mag_grid_r = mag_grid_r / bw_col
+        self._fb_q_norm_last = _do_q_norm
 
         # --- Upload shader-compatible RGBA float32 textures ---------------
-        mag_max = float(mag_grid.max()) if mag_grid.size else 1.0
-        if mag_max < 1e-12:
-            mag_max = 1.0
-        mag_norm = np.clip(mag_grid / mag_max, 0.0, 1.0).astype(np.float32)
-
-        phase_norm = np.clip(
-            (phase_grid + np.pi) / (2.0 * np.pi), 0.0, 1.0
-        ).astype(np.float32)
-
-        sim_ones = np.ones((n_bands, tex_w), dtype=np.float32)
+        # Shared max across L/R so they scale identically.
+        # Preserve native dtype through normalization; float32 conversion
+        # happens only at the GPU upload boundary (_pack_and_upload).
+        mag_max_lr = max(float(mag_grid_l.max()),
+                         float(mag_grid_r.max()), 1e-12)
+        mag_norm_l = np.clip(mag_grid_l / mag_max_lr, 0.0, 1.0)
+        mag_norm_r = np.clip(mag_grid_r / mag_max_lr, 0.0, 1.0)
+        phase_norm_l = np.clip(
+            (phase_grid_l + np.pi) / (2.0 * np.pi), 0.0, 1.0)
+        phase_norm_r = np.clip(
+            (phase_grid_r + np.pi) / (2.0 * np.pi), 0.0, 1.0)
 
         # Clean up old FB textures
         for old_id in self._fb_shader_tex_ids.values():
@@ -8592,41 +11011,30 @@ class SpectrogramViewer:
         self._fb_shader_tex_ids = {}
 
         def _pack_and_upload(r, g, b, a) -> int:
-            """Stack channels, flip Y (band 0 at bottom), upload."""
+            """Stack channels and upload. Row 0 = band 0 = V=0 = bottom."""
             rgba = np.stack([r, g, b, a], axis=-1).astype(np.float32)
-            rgba = np.ascontiguousarray(rgba[::-1])
+            rgba = np.ascontiguousarray(rgba)
             return self._upload_texture_float(rgba)
 
-        alpha = np.ones((n_bands, tex_w), dtype=np.float32)
-        zeros = np.zeros((n_bands, tex_w), dtype=np.float32)
+        alpha = np.ones((n_bands, tex_w), dtype=mag_grid_l.dtype)
+        zeros = np.zeros((n_bands, tex_w), dtype=mag_grid_l.dtype)
 
-        # cqt_left_polar:  R=mag_left,  G=phase_left
-        self._fb_shader_tex_ids["cqt_left_polar"] = _pack_and_upload(
-            mag_norm, phase_norm, zeros, alpha)
-        # cqt_right_polar: R=mag_right, G=phase_right  (mono FB → same)
-        self._fb_shader_tex_ids["cqt_right_polar"] = _pack_and_upload(
-            mag_norm, phase_norm, zeros, alpha)
-        # cqt_left_complex:  R=real_left, G=imag_left
-        real_part = (mag_norm * np.cos(phase_grid)).astype(np.float32)
-        imag_part = (mag_norm * np.sin(phase_grid)).astype(np.float32)
-        # Normalise real/imag to [0,1] range
-        ri_abs = max(float(np.abs(real_part).max()),
-                     float(np.abs(imag_part).max()), 1e-12)
-        real_norm = np.clip((real_part / ri_abs + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
-        imag_norm = np.clip((imag_part / ri_abs + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
-        self._fb_shader_tex_ids["cqt_left_complex"] = _pack_and_upload(
-            real_norm, imag_norm, zeros, alpha)
-        self._fb_shader_tex_ids["cqt_right_complex"] = _pack_and_upload(
-            real_norm, imag_norm, zeros, alpha)
-        # cqt_mag_stereo: R=mag_left, G=mag_right, B=mag_similarity
-        self._fb_shader_tex_ids["cqt_mag_stereo"] = _pack_and_upload(
-            mag_norm, mag_norm, sim_ones, alpha)
-        # cqt_phase_stereo: R=phase_left, G=phase_right, B=phase_similarity
-        self._fb_shader_tex_ids["cqt_phase_stereo"] = _pack_and_upload(
-            phase_norm, phase_norm, sim_ones, alpha)
+        # Only L/R polar textures needed — mono is derived in the
+        # shader by mapping both L and R to the same display colour.
+        self._fb_shader_tex_ids["fb_left_polar"] = _pack_and_upload(
+            mag_norm_l, phase_norm_l, zeros, alpha)
+        self._fb_shader_tex_ids["fb_right_polar"] = _pack_and_upload(
+            mag_norm_r, phase_norm_r, zeros, alpha)
+
+        # Store pre-normalization FB grids so the routing / synthesis
+        # pipeline can access them by canonical field name.
+        self._raw_arrays["fb_mag_left"] = mag_grid_l
+        self._raw_arrays["fb_phase_left"] = phase_grid_l
+        self._raw_arrays["fb_mag_right"] = mag_grid_r
+        self._raw_arrays["fb_phase_right"] = phase_grid_r
 
         print(f"Filterbank TF: {n_bands} bands, "
-              f"tex {n_bands}×{tex_w}")
+              f"tex {n_bands}\u00d7{tex_w}")
 
     def _render_fb_tf(self, sx: int, sy: int, sw: int, sh: int,
                       kind: str = "mag") -> None:
@@ -8637,6 +11045,10 @@ class SpectrogramViewer:
         """
         if sw <= 0 or sh <= 0:
             return
+        # Detect Q-norm toggle and force recompute
+        _want_q = (self.file_panel is not None and self.file_panel.fb_q_norm)
+        if _want_q != getattr(self, "_fb_q_norm_last", False):
+            self._fb_dirty = True
         if self._fb_dirty:
             self._compute_fb_envelopes()
 
@@ -8690,11 +11102,26 @@ class SpectrogramViewer:
         glActiveTexture(GL_TEXTURE0)
         self._tex_units = saved_tex_units
 
+    def _hybrid_cqt_skip_bins(self) -> int:
+        """Return how many low-frequency CQT bins to skip in hybrid mode.
+
+        In hybrid mode, filterbank envelopes cover the low frequencies
+        and CQT covers the highs.  CQT bins whose centre frequency
+        falls below the highest FB band's upper edge are redundant and
+        should be truncated so the two sources meet without overlap.
+        """
+        if not self._fb_bands or len(self._freqs) == 0:
+            return 0
+        # Upper edge of the topmost FB band is the crossover
+        cross_hz = max(b.fmax for b in self._fb_bands)
+        skip = int(np.searchsorted(self._freqs, cross_hz))
+        return min(skip, self.n_bins)
+
     def _hybrid_cross_bin(self) -> float:
         """Return the unified-Y coordinate at the hybrid crossover.
 
         In the hybrid coordinate system FB bands occupy [0..n_fb) and
-        CQT bins occupy [n_fb..n_fb+n_cqt_bins).  The crossover sits
+        CQT bins occupy [n_fb..n_fb+n_cqt_above).  The crossover sits
         at n_fb.
         """
         n_fb = len(self._fb_bands) if self._fb_bands else 0
@@ -8704,10 +11131,12 @@ class SpectrogramViewer:
                           sw: int, sh: int) -> None:
         """Composite FB (low freqs) and CQT (high freqs) into one view.
 
-        The unified Y axis places FB bands at [0..n_fb) and CQT bins at
-        [n_fb..n_fb+n_cqt_bins).  Below the crossover the filterbank
-        Hilbert-envelope texture is drawn; above it the progressive-scan
-        CQT texture is drawn.
+        The unified Y axis places FB bands at [0..n_fb) and CQT bins
+        (above crossover only) at [n_fb..n_fb+n_cqt_above).  Below the
+        crossover the filterbank Hilbert-envelope texture is drawn;
+        above it the progressive-scan CQT texture is drawn.  CQT bins
+        below the crossover frequency are truncated so the two sources
+        meet without overlap.
         """
         if sw <= 0 or sh <= 0:
             return
@@ -8788,6 +11217,9 @@ class SpectrogramViewer:
         """
         if sw <= 0 or sh <= 0:
             return
+        _want_q = (self.file_panel is not None and self.file_panel.fb_q_norm)
+        if _want_q != getattr(self, "_fb_q_norm_last", False):
+            self._fb_dirty = True
         if self._fb_dirty:
             self._compute_fb_envelopes()
         if not self._fb_shader_tex_ids or not self._program:

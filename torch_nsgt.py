@@ -33,6 +33,27 @@ import torch
 # Utility windows — ref: nsgt/util.py
 # ═══════════════════════════════════════════════════════════════════════════
 
+_NSGT_WINDOWS: tuple[str, ...] = (
+    "hann",
+    "hamming",
+    "blackman",
+    "blackmanharris",
+)
+
+
+def _canonical_nsgt_window(window: str) -> str:
+    key = str(window).strip().lower().replace("_", "").replace("-", "")
+    aliases = {
+        "bh": "blackmanharris",
+        "blackharris": "blackmanharris",
+    }
+    key = aliases.get(key, key)
+    if key not in _NSGT_WINDOWS:
+        raise ValueError(
+            f"Unsupported NSGT window {window!r}. "
+            f"Expected one of {list(_NSGT_WINDOWS)}")
+    return key
+
 
 def hannwin(length: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     """Periodic Hann window.  Ref: nsgt/util.py hannwin."""
@@ -43,6 +64,49 @@ def hannwin(length: int, *, device: torch.device, dtype: torch.dtype) -> torch.T
     r = r + 1.0
     r = r * 0.5
     return r
+
+
+def hammingwin(length: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Circular Hamming window with peak at index 0."""
+    r = torch.arange(length, device=device, dtype=dtype)
+    phase = r * (2.0 * math.pi / length)
+    return 0.54 + 0.46 * torch.cos(phase)
+
+
+def blackmanwin(length: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Circular Blackman window with peak at index 0."""
+    r = torch.arange(length, device=device, dtype=dtype)
+    phase = r * (2.0 * math.pi / length)
+    return 0.42 + 0.5 * torch.cos(phase) + 0.08 * torch.cos(2.0 * phase)
+
+
+def blackmanharriswin(length: int, *, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Circular Blackman-Harris window with peak at index 0."""
+    r = torch.arange(length, device=device, dtype=dtype)
+    phase = r * (2.0 * math.pi / length)
+    return (0.35875
+            + 0.48829 * torch.cos(phase)
+            + 0.14128 * torch.cos(2.0 * phase)
+            + 0.01168 * torch.cos(3.0 * phase))
+
+
+def _make_nsgt_window(
+    length: int,
+    window: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    key = _canonical_nsgt_window(window)
+    if key == "hann":
+        return hannwin(length, device=device, dtype=dtype)
+    if key == "hamming":
+        return hammingwin(length, device=device, dtype=dtype)
+    if key == "blackman":
+        return blackmanwin(length, device=device, dtype=dtype)
+    if key == "blackmanharris":
+        return blackmanharriswin(length, device=device, dtype=dtype)
+    raise AssertionError(f"Unhandled NSGT window {window!r}")
 
 
 def blackharr(
@@ -120,7 +184,11 @@ class OctScale:
     bpo: int       # bins (bands) per octave
     beyond: int = 0
 
-    def __post_init__(self) -> None:
+    def __init__(self, fmin: float, fmax: float, bpo: int, beyond: int = 0, q_override: float = None):
+        self.fmin = fmin
+        self.fmax = fmax
+        self.bpo = bpo
+        self.beyond = beyond
         lfmin = math.log2(self.fmin)
         lfmax = math.log2(self.fmax)
         bnds = int(math.ceil(lfmax - lfmin) * self.bpo) + 1
@@ -131,7 +199,7 @@ class OctScale:
         self._fmin = 2.0 ** lfmin_
         self._fmax = 2.0 ** lfmax_
         self._pow2n = 2.0 ** odiv
-        self._q = math.sqrt(self._pow2n) / (self._pow2n - 1.0) / 2.0
+        self._q = q_override if q_override is not None else math.sqrt(self._pow2n) / (self._pow2n - 1.0) / 2.0
 
     def __len__(self) -> int:
         return self.bnds
@@ -172,8 +240,10 @@ def nsgfwin(
     Ls: int,
     *,
     min_win: int = 4,
+    window: str = "hann",
     device: torch.device,
     dtype: torch.dtype,
+    # window_size: int | None = None,
 ) -> tuple[list[torch.Tensor], torch.Tensor, torch.Tensor]:
     """Construct NSGT analysis windows g_k, positions rfbas, lengths M.
 
@@ -212,11 +282,12 @@ def nsgfwin(
     # ── Build windows g_k — batched by unique size ──
     M_list = M_int.tolist()
     unique_sizes = sorted(set(M_list))
-    # Pre-generate one hann window per unique size
-    hann_cache: dict[int, torch.Tensor] = {}
+    # Pre-generate one analysis window per unique size
+    window_cache: dict[int, torch.Tensor] = {}
     for m in unique_sizes:
-        hann_cache[m] = hannwin(m, device=device, dtype=dtype)
-    g: list[torch.Tensor] = [hann_cache[m] for m in M_list]
+        window_cache[m] = _make_nsgt_window(
+            m, window, device=device, dtype=dtype)
+    g: list[torch.Tensor] = [window_cache[m] for m in M_list]
 
     # ── Fixup center positions ──
     fbas[lbas] = (fbas[lbas - 1] + fbas[lbas + 1]) / 2.0
@@ -769,6 +840,7 @@ class CQ_NSGT:
         sr: int,
         Ls: int,
         *,
+        window: str = "hann",
         real: bool = True,
         reducedform: int = 0,
         device: torch.device | None = None,
@@ -785,6 +857,7 @@ class CQ_NSGT:
         self.bpo = bpo
         self.sr = sr
         self.Ls = Ls
+        self.window = _canonical_nsgt_window(window)
         self.real = real
         self.reducedform = reducedform
         self.device = device
@@ -800,7 +873,7 @@ class CQ_NSGT:
 
         # ── Windows ──
         self.g, rfbas, self.M = nsgfwin(
-            frqs, q, sr, Ls, device=device, dtype=dtype)
+            frqs, q, sr, Ls, window=self.window, device=device, dtype=dtype)
 
         # ── Window ranges ──
         self.wins, self.nn = calcwinrange(self.g, rfbas, Ls)
@@ -1623,6 +1696,8 @@ def fidelity_curve_nsgt(
     fmax: float = 16000.0,
     bins_per_octave: int = 48,
     Ls: int = 0,
+    window: str = "hann",
+    window_size: int | None = None,  # Deprecated, ignored
 ) -> dict:
     """Compute the NSGT fidelity / loss-map for use by the parameter solver.
 
@@ -1638,11 +1713,12 @@ def fidelity_curve_nsgt(
     if Ls <= 0:
         Ls = sr
 
+    window = _canonical_nsgt_window(window)
     fmax = min(fmax, sr / 2.0)
     fmin = max(fmin, 1e-3)
 
     # ── Cache lookup ──────────────────────────────────────────────────
-    cache_key = (sr, bins_per_octave, Ls,
+    cache_key = (sr, bins_per_octave, Ls, window,
                  _quantise(fmin), _quantise(fmax))
     if cache_key in _fidelity_nsgt_cache:
         return _fidelity_nsgt_cache[cache_key]
@@ -1659,23 +1735,30 @@ def fidelity_curve_nsgt(
     dtype  = torch.float64
 
     # ── Bank geometry — no dual windows, no plans ─────────────────────
-    try:
-        scale    = OctScale(fmin, fmax, bins_per_octave)
-        frqs_t, q_t = scale(device=device, dtype=dtype)
 
+
+
+    try:
+        # If window_size is set, use it to determine Q for the highest frequency band
+        scale = OctScale(fmin, fmax, bins_per_octave)
+        frqs_t, q_t = scale(device=device, dtype=dtype)
         nf    = sr / 2.0
         valid = (frqs_t > 0) & (frqs_t < nf)
         frqs_v = frqs_t[valid]
         q_v    = q_t[valid]
 
+        print(f"[NSGT DEBUG] frqs_t.shape={frqs_t.shape} valid.sum()={valid.sum().item()} frqs_v.shape={frqs_v.shape}")
         if frqs_v.numel() == 0:
+            print("[NSGT DEBUG] No valid frequency bands after filtering. Returning _EMPTY.")
             return _EMPTY
 
         g, rfbas, M_int = nsgfwin(frqs_v, q_v, sr, Ls,
-                                   device=device, dtype=dtype)
+                       window=window,
+                       device=device, dtype=dtype)
         wins, nn = calcwinrange(g, rfbas, Ls)
         pr = check_painless(g, wins, nn, M_int)
-    except Exception:
+    except Exception as e:
+        print(f"[NSGT DEBUG] Exception in fidelity_curve_nsgt: {e}")
         return _EMPTY
 
     # ── Extract per-band metrics (positive-frequency bands only) ──────
@@ -1685,13 +1768,18 @@ def fidelity_curve_nsgt(
     n_pos = lbas
 
     freqs_np   = frqs_v.cpu().numpy().astype(np.float64)           # (n_pos,)
-    q_np       = np.maximum(q_v.cpu().numpy().astype(np.float64),
-                            1e-30)                                  # (n_pos,)
-    # M_int[1 : lbas+1] = window sizes for the positive-freq bands
+    q_oct_np   = np.maximum(q_v.cpu().numpy().astype(np.float64),
+                            1e-30)                                  # OctScale design Q
+    # M_int[1 : lbas+1] = frequency-domain window sizes (FFT bins).
+    # Each band k has M_k output coefficients per input block of Ls samples,
+    # so the physical resolutions are:
+    #   δf = M_k · sr / Ls   (actual band bandwidth; accounts for min_win clamping)
+    #   δt = Ls / (M_k · sr) (time step between successive output coefficients)
+    # These are exactly reciprocal: δt · δf = 1 (critically-sampled NSGT).
     support_np = M_int[1 : lbas + 1].cpu().numpy().astype(np.float64)
-
-    delta_f = freqs_np / q_np
-    delta_t = support_np / float(sr)
+    delta_f    = support_np * float(sr) / float(Ls)
+    delta_t    = float(Ls)  / (support_np * float(sr))
+    q_np = freqs_np / np.maximum(delta_f, 1e-30)   # Q from M_k geometry
 
     from torch_cqt_new import _loss_rgb_from_metrics
     loss_rgb = _loss_rgb_from_metrics(freqs_np, delta_t, delta_f, sr, q_np)
@@ -1708,7 +1796,8 @@ def fidelity_curve_nsgt(
         "delta_t":            delta_t,
         "delta_f":            delta_f,
         "loss_rgb":           loss_rgb,
-        "q_factors":          q_np,
+        "q_factors":          q_np,       # Q from actual M_k geometry
+        "q_factors_design":   q_oct_np,   # Q from OctScale formula (design intent)
         "support":            support_np,
         "painless":           pr,
         "painless_violation": painless_violation,
@@ -1716,6 +1805,7 @@ def fidelity_curve_nsgt(
         "frame_bound_upper":  pr.frame_bound_upper,
         "condition_number":   pr.condition_number,
         "n_bands":            n_pos,
+        "window":             window,
     }
 
     # ── Cache with bounded eviction (oldest entry) ────────────────────

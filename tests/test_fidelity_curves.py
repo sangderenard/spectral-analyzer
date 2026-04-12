@@ -1,7 +1,13 @@
 import numpy as np
 import pytest
 
-from torch_cqt_new import fidelity_curve, fidelity_curve_dwt, fidelity_curve_fb
+from torch_cqt_new import (
+    fidelity_curve,
+    fidelity_curve_cwt,
+    fidelity_curve_dwt,
+    fidelity_curve_fb,
+)
+from torch_nsgt import fidelity_curve_nsgt
 
 
 def test_cqt_fidelity_uses_actual_filter_support():
@@ -22,10 +28,12 @@ def test_cqt_fidelity_uses_actual_filter_support():
 
     alpha = (2.0 ** (2.0 / bpo) - 1.0) / (2.0 ** (2.0 / bpo) + 1.0)
     expected_support = (filter_scale / alpha) / fmin
+    expected_delta_f = 1.50018310546875 * fmin * alpha / filter_scale
 
     assert fc["freqs"][0] == pytest.approx(fmin)
     assert fc["frame_spacing"][0] == pytest.approx(hop / sr)
     assert fc["filter_support"][0] == pytest.approx(expected_support)
+    assert fc["delta_f"][0] == pytest.approx(expected_delta_f)
     assert fc["delta_t"][0] == pytest.approx(expected_support)
     assert fc["delta_t"][0] > fc["frame_spacing"][0] * 100.0
 
@@ -70,3 +78,42 @@ def test_dwt_fidelity_has_own_dyadic_band_curve():
     assert fc["band_hi"][0] == pytest.approx((sr / 2.0) / (2.0 ** level))
     assert fc["coefficient_spacing"][0] == pytest.approx((2.0 ** level) / sr)
     assert fc["filter_support"][0] > fc["coefficient_spacing"][0]
+
+
+def test_cwt_fidelity_accepts_sigma_schedule():
+    class SigmaSchedule:
+        n_octaves = 3
+
+        def __call__(self, octave_idx, base_value):
+            return float(base_value + octave_idx)
+
+    fc = fidelity_curve_cwt(
+        sr=48_000,
+        fmin=30.0,
+        fmax=240.0,
+        scales_per_octave=12,
+        hop_length=1,
+        wavelet="morlet",
+        sigma=6.0,
+        sigma_func=SigmaSchedule(),
+    )
+
+    assert fc["freqs"].size > 0
+    assert fc["frame_spacing"].shape == fc["freqs"].shape
+    assert fc["sigma_per_octave"] == [6.0, 7.0, 8.0]
+
+
+def test_nsgt_fidelity_accepts_custom_window_and_real_length():
+    fc = fidelity_curve_nsgt(
+        sr=48_000,
+        fmin=30.0,
+        fmax=960.0,
+        bins_per_octave=24,
+        Ls=48_000 * 3,
+        window="blackmanharris",
+    )
+
+    assert fc["freqs"].size > 0
+    assert fc["window"] == "blackmanharris"
+    assert np.all(fc["delta_t"] > 0)
+    assert np.all(fc["delta_f"] > 0)

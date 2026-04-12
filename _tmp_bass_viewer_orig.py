@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import io
-import json
 import math
 import os
 import threading
@@ -758,7 +757,7 @@ _FIELD_CATEGORY_MAP: dict[str, str] = {
     "wvlt_approx": "wvlt", "wvlt_detail": "wvlt",
 }
 
-from dataclasses import dataclass, field
+
 @dataclass
 class FieldConfig:
     target: int = -1       # data channel 0-3, alpha=4, -1=disabled
@@ -990,17 +989,11 @@ _GRID_STYLE_COLORS = {
 
 
 # ---------------------------------------------------------------------------
-# CAFLS — Complex-Anchored Filterbank Logarithmic Scaling
-# Lower scale bound for CWT: seismic floor (~0.01 Hz).
-# log2(cafls_anchor / CAFLS_SEISMIC_FLOOR) ≈ 11.6 octaves of scale range.
-CAFLS_SEISMIC_FLOOR: float = 0.01  # Hz
-
 # Filter bank decomposition — arbitrary crossover with perfect reconstruction
 # ---------------------------------------------------------------------------
 
 _FILTER_TYPES = ["Linkwitz-Riley 4", "Butterworth 4", "Butterworth 8"]
 _CQT_ALGORITHMS = ["librosa", "nsgt"]
-_CQT_WINDOWS = ["hann", "hamming", "blackman", "blackmanharris"]
 _FB_CONFIG_MODES = ["Manual", "Auto (log)"]
 
 
@@ -1136,23 +1129,6 @@ class BandDef:
         return f"{mid_str}Hz {note} bw{bw_str}"
 
 
-def _is_cuda_oom(e: Exception) -> bool:
-    """Return True if *e* is a CUDA out-of-memory condition.
-
-    PyTorch raises torch.cuda.OutOfMemoryError for tensor allocations but
-    uses plain RuntimeError for cuFFT workspace allocations and other driver-
-    level memory failures.  Both must be treated as OOM for retry logic.
-    """
-    import torch
-    if isinstance(e, torch.cuda.OutOfMemoryError):
-        return True
-    msg = str(e).lower()
-    return any(k in msg for k in (
-        "out of memory", "cuda error", "cufft", "cublas",
-        "cudnn", "cuda: device-side assert", "cudamallocasync",
-    ))
-
-
 class FilterBankDecomposition:
     """Apply a set of crossover filters to a mono signal, producing
     perfectly-reconstructing subbands.
@@ -1242,66 +1218,6 @@ class FilterBankDecomposition:
         bands.append(BandDef(fmin=prev, fmax=top))
         for b in bands:
             b.label = b.auto_label(sr)
-        return bands
-
-    @staticmethod
-    def bands_from_cafls(
-        anchor: float,
-        bpo: int,
-        banded_width: int,
-        sr: int,
-    ) -> list[BandDef]:
-        """Generate CAFLS-anchored filterbank bands.
-
-        One center band is placed at *anchor* (f_a).  Striated bands
-        extend *banded_width* octaves each side of the anchor, following
-        the scale law  f_n = anchor * 2^(n/bpo).  Beyond the striated
-        zone: one solid lowpass (below) down to DC, and one solid
-        highpass (above) up to Nyquist.
-
-        All crossovers sit at the geometric midpoint between adjacent
-        band centres (scale law: anchor * 2^((n+0.5)/bpo)).
-        """
-        import math as _math
-        nyq = sr / 2.0
-        bpo = max(1, bpo)
-        banded_width = max(0, banded_width)
-
-        # Band centres: n = -banded_width*bpo … +banded_width*bpo
-        # (bpo subdivisions per octave, banded_width octaves each side)
-        n_steps = banded_width * bpo          # steps each side
-        def ctr(n: int) -> float:
-            return anchor * (2.0 ** (n / bpo))
-
-        # Crossover between step n and step n+1
-        def xo(n: int) -> float:
-            return anchor * (2.0 ** ((n + 0.5) / bpo))
-
-        # Outer crossovers (striated ↔ solid)
-        lp_hi  = anchor * (2.0 ** ((-n_steps - 0.5) / bpo))  # LP→striated
-        hp_lo  = anchor * (2.0 ** (( n_steps + 0.5) / bpo))  # striated→HP
-
-        bands: list[BandDef] = []
-
-        # Solid lowpass
-        bands.append(BandDef(fmin=0.0, fmax=lp_hi, label="LP"))
-
-        # Striated bands: from -n_steps to +n_steps inclusive
-        prev = lp_hi
-        for n in range(-n_steps, n_steps):
-            hi = xo(n)
-            centre = ctr(n)
-            label = (f"f\u2090" if n == 0
-                     else f"f\u2090\u00b72^({n}/{bpo})")
-            bands.append(BandDef(fmin=prev, fmax=hi, label=label))
-            prev = hi
-        # Last striated band: n = +n_steps
-        bands.append(BandDef(fmin=prev, fmax=hp_lo,
-                             label=f"f\u2090\u00b72^({n_steps}/{bpo})"))
-
-        # Solid highpass
-        bands.append(BandDef(fmin=hp_lo, fmax=nyq, label="HP"))
-
         return bands
 
     def compute(self, signal: np.ndarray, bands: list[BandDef]) -> None:
@@ -1558,22 +1474,12 @@ class FilterBankDecomposition:
                     torch.cuda.empty_cache()
                     break  # success
 
-                except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
-                    if isinstance(_e, RuntimeError) and not _is_cuda_oom(_e):
-                        raise
-                    # del locals()[name] is a Python no-op — use explicit deletes
-                    try: del stacked
-                    except NameError: pass
-                    try: del sig
-                    except NameError: pass
-                    try: del Xf
-                    except NameError: pass
-                    try: del analytic
-                    except NameError: pass
-                    try: del env_chunk
-                    except NameError: pass
-                    try: del phi_chunk
-                    except NameError: pass
+                except torch.cuda.OutOfMemoryError:
+                    # Clean up whatever partial allocs exist
+                    for name in ('stacked', 'sig', 'Xf', 'analytic',
+                                 'env_chunk', 'phi_chunk'):
+                        if name in locals():
+                            del locals()[name]
                     torch.cuda.empty_cache()
 
                     max_bands = max(1, chunk_size // 2)
@@ -1732,424 +1638,22 @@ class FilterBankDecomposition:
                 sos = butter(order, wn, btype="band", output="sos")
             return sosfilt(sos, signal).astype(np.float32)
 
-    def _lp_exponent(self) -> int:
-        """Exponent N for zero-phase LP shape: lp(f,fc) = 1/(1+(f/fc)^N).
-
-        LR order maps directly (LR4 → N=4).  Butterworth order k maps to
-        N=2k so that the zero-phase response matches the squared Butterworth
-        magnitude, which is the LR-equivalent profile.
-        """
-        if self.filter_type.startswith("Linkwitz-Riley"):
-            return int(self.filter_type.split()[-1])
-        if self.filter_type.startswith("Butterworth"):
-            return 2 * int(self.filter_type.split()[-1])
-        return 4
-
-    def _filter_bands_gpu(
-        self,
-        signal: np.ndarray,
-        bands: list["BandDef"],
-        nyq: float,
-        n_samples: int,
-        n_bands: int,
-        fb_dir: str,
-        sr: int,
-        meta_bands: list,
-        all_subs: list,
-        t0: float,
-        progress_cb: Any,
-    ) -> None:
-        """GPU FFT zero-phase perfectly-reconstructing band filtering.
-
-        Uses a cascade LP-difference partition:
-
-            H_0(f)     = lp(f, xo[0])
-            H_i(f)     = lp(f, xo[i]) - lp(f, xo[i-1])   for 1 <= i < n-1
-            H_{n-1}(f) = 1 - lp(f, xo[n-2])
-
-        where  lp(f, fc) = 1 / (1 + (f/fc)^order)  (standard LR formula,
-        real-valued → zero-phase).  HP = 1 - LP ensures Σ H_i(f) = 1 at
-        every frequency, guaranteeing perfect reconstruction.
-
-        OOM strategy (two dimensions):
-          1. Band-batch halving: try all n_bands together; halve on OOM.
-          2. Time-chunk halving (overlap-save): if even 1 band cannot fit
-             with the full-length FFT, split the signal into time blocks
-             and process with proper overlap to avoid wrap artefacts.
-             Block count doubles every halving so all VRAM is used.
-        Neither dimension falls back to CPU — raises on exhaustion.
-        """
-        import torch
-
-        device = torch.device("cuda")
-        order = self._lp_exponent()
-
-        # Crossover frequencies: fmax of every band except the last.
-        xo: list[float] = [
-            max(1e-6, min(float(bands[i].fmax), nyq * (1.0 - 1e-9)))
-            for i in range(n_bands - 1)
-        ]
-
-        # --- Estimate overlap needed for time-chunk mode ------------------
-        # IR decay of lp(f,fc)=1/(1+(f/fc)^N) ≈ exp(-2π·fc·t / N).
-        # Use 5 time-constants → M ≈ 5·sr / (2π·fc_min / N).
-        fc_min = float(xo[0]) if xo else 1.0
-        overlap_M = max(1024, int(math.ceil(5.0 * order * sr / (2.0 * math.pi * fc_min))))
-
-        # ---- helpers -------------------------------------------------------
-
-        def _lp_vec(fc: float, freqs_t: "torch.Tensor") -> "torch.Tensor":
-            """Real LP response on *device* for crossover *fc*."""
-            r = (freqs_t / fc).pow(order)
-            return 1.0 / (1.0 + r)
-
-        def _build_H_batch(
-            band_slice: range,
-            freqs_t: "torch.Tensor",
-            prev_lp_t: "torch.Tensor",
-        ) -> "tuple[torch.Tensor, torch.Tensor]":
-            """Return (H_batch, final_lp) for the given band slice.
-
-            H_batch : (len(band_slice), n_rfft) float32 on device
-            final_lp: (n_rfft,) float32 — LP at upper edge of last band
-            """
-            H_list: list["torch.Tensor"] = []
-            lp_cursor = prev_lp_t
-            for bi in band_slice:
-                band = bands[bi]
-                if bi < n_bands - 1:
-                    curr_lp = _lp_vec(xo[bi], freqs_t)
-                else:
-                    curr_lp = None   # last band — HP residual
-                if not band.enabled:
-                    H_list.append(torch.zeros_like(freqs_t))
-                elif curr_lp is None:
-                    H_list.append(1.0 - lp_cursor)
-                else:
-                    H_list.append(curr_lp - lp_cursor)
-                if curr_lp is not None:
-                    lp_cursor = curr_lp
-            return torch.stack(H_list), lp_cursor   # (B, n_rfft), (n_rfft,)
-
-        # ================================================================
-        # FULL-SIGNAL MODE: rfft(whole signal) kept on GPU; band-batch
-        # halving handles VRAM pressure.
-        # ================================================================
-        def _run_full_signal(
-            S: "torch.Tensor",        # (n_rfft,) complex64 on device
-            freqs_t: "torch.Tensor",  # (n_rfft,) float32 on device
-            n_fft: int,
-        ) -> bool:
-            """Process all bands using full-signal FFT.  Returns True on
-            success.  Cleans up *all* temporaries on partial OOM and
-            re-raises only when a single-band chunk still cannot fit."""
-            done = 0
-            batch_sz = n_bands
-            prev_lp = torch.zeros(S.shape[0], device=device, dtype=torch.float32)
-
-            while done < n_bands:
-                chunk_sz = min(batch_sz, n_bands - done)
-
-                # ---- OOM retry (band dimension) --------------------------
-                H_batch = Y_batch = out_batch = final_lp = None
-                while True:
-                    try:
-                        H_batch, final_lp = _build_H_batch(
-                            range(done, done + chunk_sz), freqs_t, prev_lp)
-                        Y_batch = S.unsqueeze(0) * H_batch   # (B, n_rfft) cplx
-                        del H_batch; H_batch = None
-                        out_batch = torch.fft.irfft(Y_batch, n=n_fft)[..., :n_samples]
-                        del Y_batch; Y_batch = None
-                        torch.cuda.empty_cache()
-                        break
-                    except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
-                        if isinstance(_e, RuntimeError) and not _is_cuda_oom(_e):
-                            raise
-                        if H_batch  is not None: del H_batch;  H_batch  = None
-                        if Y_batch  is not None: del Y_batch;  Y_batch  = None
-                        if out_batch is not None: del out_batch; out_batch = None
-                        if final_lp is not None: del final_lp; final_lp = None
-                        torch.cuda.empty_cache()
-                        if chunk_sz <= 1:
-                            return False   # escalate to time-chunk mode
-                        chunk_sz //= 2
-                        batch_sz = chunk_sz
-                        print(f"\n  GPU OOM (band-batch) — reducing to "
-                              f"{chunk_sz} bands/chunk", flush=True)
-
-                # download and write WAVs
-                batch_np = out_batch.cpu().numpy()
-                del out_batch
-                _write_wav_batch(done, chunk_sz, batch_np)
-
-                prev_lp = final_lp
-                done += chunk_sz
-                _print_progress(done, t0, progress_cb)
-
-            return True
-
-        # ================================================================
-        # TIME-CHUNK (OVERLAP-SAVE) MODE: signal is split into blocks;
-        # each block processed for all B bands.  Both the block size and
-        # the band batch size halve independently on OOM.
-        # ================================================================
-        def _run_chunked(freqs_gen_fn: "Any") -> None:
-            """Process in time blocks using overlap-save.
-
-            freqs_gen_fn(n_rfft) → (freqs_t, H_precomputed?) — not used here;
-            H is rebuilt per block since n_rfft changes with block size.
-            """
-            # Start: one block covers the whole signal (halved on OOM).
-            C = 1 << math.ceil(math.log2(max(n_samples, 2)))
-
-            done = 0
-            band_batch_sz = n_bands
-
-            # Pre-allocate all subband output buffers on CPU up-front.
-            for bi in range(n_bands):
-                all_subs[bi] = np.zeros(n_samples, dtype=np.float32)
-
-            # LP cursor at the lower boundary of each band batch: computed
-            # once per band-batch start and reused across block retries.
-            # We store it as a numpy array so it survives tensor deletions.
-            cursor_np: np.ndarray | None = None  # None → band 0, prev_lp = 0
-
-            while done < n_bands:
-                # bslice is always derived from the current band_batch_sz.
-                bslice = range(done, min(done + band_batch_sz, n_bands))
-                chunk_sz = len(bslice)
-
-                # ---- overlap-save over time blocks ----------------------
-                # Retry loop halves C on OOM; halves band_batch_sz and
-                # restarts the outer while if the band slice must shrink.
-                need_band_restart = False
-
-                while True:
-                    n_block  = 1 << math.ceil(math.log2(max(C + overlap_M, 2)))
-                    n_rfft_b = n_block // 2 + 1
-
-                    # Build freq axis and restore LP cursor for this n_rfft
-                    freqs_b = torch.linspace(
-                        0, nyq, n_rfft_b, device=device, dtype=torch.float32)
-                    if cursor_np is None:
-                        prev_lp_b = torch.zeros(
-                            n_rfft_b, device=device, dtype=torch.float32)
-                    else:
-                        prev_lp_b = torch.from_numpy(cursor_np).to(device)
-                        if prev_lp_b.shape[0] != n_rfft_b:
-                            # n_rfft changed (C halved): recompute cursor
-                            # from scratch by advancing through all prior xo.
-                            prev_lp_b = torch.zeros(
-                                n_rfft_b, device=device, dtype=torch.float32)
-                            for xi in range(done):
-                                if xi < n_bands - 1:
-                                    prev_lp_b = _lp_vec(xo[xi], freqs_b)
-
-                    # Build H for this band slice
-                    H_b = final_lp_b = None
-                    try:
-                        H_b, final_lp_b = _build_H_batch(
-                            bslice, freqs_b, prev_lp_b)
-                        del freqs_b, prev_lp_b
-                        torch.cuda.empty_cache()
-                    except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
-                        if isinstance(_e, RuntimeError) and not _is_cuda_oom(_e):
-                            raise
-                        if H_b        is not None: del H_b
-                        if final_lp_b is not None: del final_lp_b
-                        del freqs_b, prev_lp_b
-                        torch.cuda.empty_cache()
-                        if chunk_sz > 1:
-                            band_batch_sz = max(1, band_batch_sz // 2)
-                            print(f"\n  GPU OOM (chunk H-build) — band batch "
-                                  f"→ {band_batch_sz}", flush=True)
-                            need_band_restart = True
-                            break
-                        if C <= overlap_M:
-                            raise RuntimeError(
-                                f"CUDA OOM: cannot build H for 1 band at "
-                                f"block size {n_block} (n_rfft={n_rfft_b}). "
-                                f"Insufficient VRAM.")
-                        C = max(overlap_M, C // 2)
-                        print(f"\n  GPU OOM (chunk H-build) — C halved "
-                              f"→ {C}", flush=True)
-                        continue   # retry with smaller block
-
-                    # Process every time block with this H
-                    n_time_blocks = math.ceil(n_samples / C)
-                    block_oom = False
-                    for blk in range(n_time_blocks):
-                        out_start = blk * C
-                        out_end   = min(out_start + C, n_samples)
-                        if out_start >= n_samples:
-                            break
-                        valid_len = out_end - out_start
-
-                        in_start  = out_start - overlap_M
-                        seg = np.zeros(n_block, dtype=np.float32)
-                        s0, s1 = max(0, in_start), min(n_samples, in_start + n_block)
-                        seg[s0 - in_start: s0 - in_start + (s1 - s0)] = (
-                            signal[s0:s1].astype(np.float32))
-
-                        S_blk = H_Y = out_blk = None
-                        try:
-                            S_blk = torch.fft.rfft(
-                                torch.from_numpy(seg).to(device))
-                            H_Y   = S_blk.unsqueeze(0) * H_b
-                            del S_blk; S_blk = None
-                            out_blk = torch.fft.irfft(H_Y, n=n_block)
-                            del H_Y;  H_Y = None
-                            valid_out = out_blk[
-                                :, overlap_M: overlap_M + valid_len
-                            ].cpu().numpy()
-                            del out_blk; out_blk = None
-                            torch.cuda.empty_cache()
-                        except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
-                            if isinstance(_e, RuntimeError) and not _is_cuda_oom(_e):
-                                raise
-                            if S_blk  is not None: del S_blk
-                            if H_Y    is not None: del H_Y
-                            if out_blk is not None: del out_blk
-                            del H_b; H_b = None
-                            if final_lp_b is not None:
-                                del final_lp_b; final_lp_b = None
-                            torch.cuda.empty_cache()
-                            if chunk_sz > 1:
-                                band_batch_sz = max(1, band_batch_sz // 2)
-                                print(f"\n  GPU OOM (time block) — band batch "
-                                      f"→ {band_batch_sz}", flush=True)
-                                need_band_restart = True
-                            elif C <= overlap_M:
-                                raise RuntimeError(
-                                    f"CUDA OOM: time block C={C} at minimum. "
-                                    f"Insufficient VRAM.")
-                            else:
-                                C = max(overlap_M, C // 2)
-                                print(f"\n  GPU OOM (time block) — C halved "
-                                      f"→ {C}", flush=True)
-                            block_oom = True
-                            break
-
-                        for j, bi in enumerate(bslice):
-                            all_subs[bi][out_start:out_end] = valid_out[j]
-
-                    if block_oom or need_band_restart:
-                        if H_b        is not None: del H_b
-                        if final_lp_b is not None: del final_lp_b
-                        break   # exit inner while → either retry or restart outer
-
-                    # Success: advance LP cursor past this batch
-                    cursor_np = final_lp_b.cpu().numpy()
-                    del H_b, final_lp_b
-                    torch.cuda.empty_cache()
-                    break   # exit inner while, success
-
-                if need_band_restart:
-                    continue   # outer while: recompute bslice from new band_batch_sz
-
-                # Commit WAVs for this band batch
-                _write_wav_batch_direct(bslice)
-                done += chunk_sz
-                _print_progress(done, t0, progress_cb)
-
-        # ================================================================
-        # Shared helpers
-        # ================================================================
-        def _write_wav_batch(done: int, chunk_sz: int,
-                             batch_np: "np.ndarray") -> None:
-            for j in range(chunk_sz):
-                bi = done + j
-                sub = batch_np[j].astype(np.float32)
-                all_subs[bi] = sub
-                _write_one_wav(bi, sub)
-
-        def _write_wav_batch_direct(bslice: range) -> None:
-            for bi in bslice:
-                _write_one_wav(bi, all_subs[bi])
-
-        def _write_one_wav(bi: int, sub: "np.ndarray") -> None:
-            fname = f"band_{bi:02d}.wav"
-            fpath = os.path.join(fb_dir, fname)
-            peak = float(np.abs(sub).max())
-            scaled = ((sub / peak * 32767).astype(np.int16)
-                      if peak > 0 else np.zeros(len(sub), dtype=np.int16))
-            wavfile.write(fpath, sr, scaled)
-            meta_bands[bi] = {
-                "index": bi,
-                "fmin": bands[bi].fmin,
-                "fmax": bands[bi].fmax,
-                "label": bands[bi].label,
-                "file": fname,
-                "peak_amplitude": peak,
-            }
-
-        def _print_progress(done: int, t0: float, cb: Any) -> None:
-            elapsed = time.monotonic() - t0
-            eta = (elapsed / done) * (n_bands - done) if done > 0 else 0.0
-            print(
-                f"\r  Filtering bands: {done}/{n_bands} "
-                f"({done * 100 // n_bands}%) — "
-                f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining",
-                end="", flush=True,
-            )
-            if cb:
-                cb(done / n_bands * 0.5, f"Filtering {done}/{n_bands}")
-
-        # ================================================================
-        # Dispatch: attempt full-signal; escalate to time-chunk on OOM.
-        # ================================================================
-        n_fft = 1 << math.ceil(math.log2(max(n_samples, 2)))
-        n_rfft = n_fft // 2 + 1
-
-        # Upload signal FFT — if this alone OOMs, go straight to chunked
-        S = freqs_t = None
-        try:
-            padded = np.zeros(n_fft, dtype=np.float32)
-            padded[:n_samples] = signal.astype(np.float32)
-            S = torch.fft.rfft(torch.from_numpy(padded).to(device))
-            del padded
-            torch.cuda.empty_cache()
-            freqs_t = torch.linspace(
-                0, nyq, n_rfft, device=device, dtype=torch.float32)
-        except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
-            if isinstance(_e, RuntimeError) and not _is_cuda_oom(_e):
-                raise
-            if S      is not None: del S
-            if freqs_t is not None: del freqs_t
-            torch.cuda.empty_cache()
-            print("  GPU: signal FFT too large for VRAM — using time-chunk mode",
-                  flush=True)
-            _run_chunked(None)
-            print()
-            return
-
-        ok = _run_full_signal(S, freqs_t, n_fft)
-        del S, freqs_t
-        torch.cuda.empty_cache()
-
-        if not ok:
-            print("\n  GPU: escalating to time-chunk (overlap-save) mode",
-                  flush=True)
-            _run_chunked(None)
-
-        print()
-
     def compute_and_save(self, signal: np.ndarray, bands: list["BandDef"],
                          analysis_dir: str, sr: int,
                          batch_size: int = 32,
                          wav_path: str | None = None,
                          progress_cb: Any = None) -> None:
-        """Filter, save WAVs, and bake envelopes.
+        """Filter, save WAVs, and bake envelopes in batches.
 
-        Filtering: GPU FFT zero-phase cascade-LP-difference decomposition
-        (perfect reconstruction, zero-phase, full VRAM utilisation with
-        band-batch and time-chunk OOM halving).  Falls back to CPU only
-        when CUDA is not available.
+        Filtering uses the existing IIR sosfilt (preserving exact LR
+        phase alignment) but runs bands in parallel threads since
+        sosfilt releases the GIL.  Hilbert envelope computation is
+        dispatched to GPU when available via ``compute_envelopes``.
 
-        After completion ``self.bands`` is set; ``self.subbands`` is
-        empty (WAV files on disk are the authoritative copies).
+        After completion ``self.bands`` is set but ``self.subbands`` is
+        empty (the WAV files on disk are the authoritative copies).
         """
-        import torch
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         self._source_signal = signal.copy()
         self.bands = list(bands)
@@ -2165,53 +1669,49 @@ class FilterBankDecomposition:
         all_subs: list[np.ndarray | None] = [None] * n_bands
         t0 = time.monotonic()
 
-        if torch.cuda.is_available():
-            # --- GPU zero-phase FFT filtering ----------------------------
-            self._filter_bands_gpu(signal, bands, nyq, n_samples, n_bands,
-                                   fb_dir, sr, meta_bands, all_subs, t0,
-                                   progress_cb)
-        else:
-            # --- CPU thread pool (CUDA unavailable) ----------------------
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+        # --- Parallel IIR filtering + WAV write ---------------------------
+        # sosfilt releases the GIL so threads give true parallelism here.
+        n_workers = min(os.cpu_count() or 4, 16)
 
-            n_workers = min(os.cpu_count() or 4, 16)
+        def _filter_and_write(i: int) -> dict:
+            sub = self._filter_one_band(signal, bands[i], nyq)
+            all_subs[i] = sub
+            fname = f"band_{i:02d}.wav"
+            fpath = os.path.join(fb_dir, fname)
+            peak = float(np.abs(sub).max())
+            if peak > 0:
+                scaled = (sub / peak * 32767).astype(np.int16)
+            else:
+                scaled = np.zeros(len(sub), dtype=np.int16)
+            wavfile.write(fpath, sr, scaled)
+            return {
+                "index": i,
+                "fmin": bands[i].fmin,
+                "fmax": bands[i].fmax,
+                "label": bands[i].label,
+                "file": fname,
+                "peak_amplitude": peak,
+            }
 
-            def _filter_and_write(i: int) -> dict:
-                sub = self._filter_one_band(signal, bands[i], nyq)
-                all_subs[i] = sub
-                fname = f"band_{i:02d}.wav"
-                fpath = os.path.join(fb_dir, fname)
-                peak = float(np.abs(sub).max())
-                if peak > 0:
-                    scaled = (sub / peak * 32767).astype(np.int16)
-                else:
-                    scaled = np.zeros(len(sub), dtype=np.int16)
-                wavfile.write(fpath, sr, scaled)
-                return {
-                    "index": i, "fmin": bands[i].fmin, "fmax": bands[i].fmax,
-                    "label": bands[i].label, "file": fname,
-                    "peak_amplitude": peak,
-                }
-
-            done_count = 0
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_filter_and_write, i): i
-                           for i in range(n_bands)}
-                for fut in as_completed(futures):
-                    i = futures[fut]
-                    meta_bands[i] = fut.result()
-                    done_count += 1
-                    frac = done_count / n_bands * 0.5
-                    if done_count % 20 == 0 or done_count == n_bands:
-                        elapsed = time.monotonic() - t0
-                        eta = (elapsed / done_count) * (n_bands - done_count)
-                        print(f"\r  Filtering bands: {done_count}/{n_bands} "
-                              f"({done_count * 100 // n_bands}%) — "
-                              f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining",
-                              end="", flush=True)
-                    if progress_cb:
-                        progress_cb(frac, f"Filtering {done_count}/{n_bands}")
-            print()
+        done_count = 0
+        with ThreadPoolExecutor(max_workers=n_workers) as pool:
+            futures = {pool.submit(_filter_and_write, i): i
+                       for i in range(n_bands)}
+            for fut in as_completed(futures):
+                i = futures[fut]
+                meta_bands[i] = fut.result()
+                done_count += 1
+                frac = done_count / n_bands * 0.5  # filtering = 0..50%
+                if done_count % 20 == 0 or done_count == n_bands:
+                    elapsed = time.monotonic() - t0
+                    eta = (elapsed / done_count) * (n_bands - done_count)
+                    print(f"\r  Filtering bands: {done_count}/{n_bands} "
+                          f"({done_count * 100 // n_bands}%) — "
+                          f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining",
+                          end="", flush=True)
+                if progress_cb:
+                    progress_cb(frac, f"Filtering {done_count}/{n_bands}")
+        print()
 
         # --- Compute Hilbert envelopes (GPU when available) ---------------
         # Temporarily set self.subbands so compute_envelopes can use them,
@@ -3812,7 +3312,6 @@ class FieldTabPanel(Panel):
         # --- Upper half: data field list + controls ---
         upper_rows: list[tuple[str, Any]] = []
 
-
         # Selected field controls
         sel = self.selected_idx
         sel_fs = self.fields[sel]
@@ -3824,15 +3323,14 @@ class FieldTabPanel(Panel):
         upper_rows.append(("toggle", ("f_custom", "Custom", not sel_cfg.use_global)))
 
         gd = self.global_defaults
-        eff_norm = NORM_MODES[sel_cfg.norm_mode if not sel_cfg.use_global else gd.norm_mode]
+        eff_norm = NORM_MODES[sel_cfg.norm_mode if not sel_cfg.use_global
+                              else gd.norm_mode]
         eff_gamma = sel_cfg.gamma if not sel_cfg.use_global else gd.gamma
         eff_scale = sel_cfg.scale if not sel_cfg.use_global else gd.scale
 
         upper_rows.append(("dropdown", ("f_norm", eff_norm, NORM_MODES)))
         upper_rows.append(("slider", ("f_gamma", eff_gamma, 0.1, 5.0, "{:.2f}")))
         upper_rows.append(("slider", ("f_scale", eff_scale, 0.01, 10.0, "{:.2f}")))
-
-
 
         upper_rows.append(("label", ""))
 
@@ -4160,21 +3658,18 @@ class FieldTabPanel(Panel):
         ]
 
     def _select_dropdown(self, key: str, value: str) -> None:
-        cfg = self.configs[self.selected_idx]
         if key == "f_target":
-            cfg.target = TARGET_VALUES[TARGET_LABELS.index(value)]
+            self.configs[self.selected_idx].target = \
+                TARGET_VALUES[TARGET_LABELS.index(value)]
         elif key == "f_norm":
-            cfg.norm_mode = NORM_MODES.index(value)
+            self.configs[self.selected_idx].norm_mode = \
+                NORM_MODES.index(value)
         elif key == "g_norm":
             self.global_defaults.norm_mode = NORM_MODES.index(value)
         elif key == "blend_mode":
             self.global_defaults.blend_mode = BLEND_MODES.index(value)
         elif key == "hdr_norm":
             self.global_defaults.hdr_normalizer = HDR_NORMALIZERS.index(value)
-        elif key == "cwt_wavelet":
-            cfg.cwt_wavelet = value
-        elif key == "dwt_wavelet":
-            cfg.dwt_wavelet = value
 
     def _update_slider(self, key: str, lx: int,
                        rect: pygame.Rect,
@@ -4208,20 +3703,6 @@ class FieldTabPanel(Panel):
             gd.hdr_output_lo = val
         elif key == "hdr_out_hi":
             gd.hdr_output_hi = val
-        # Per-transform window/time support
-        elif key == "cqt_bins":
-            cfg.cqt_bins = int(val)
-        elif key == "cqt_q":
-            cfg.cqt_q = float(val)
-        elif key == "fb_window":
-            cfg.fb_window = int(val)
-        elif key == "fb_bandwidth":
-            cfg.fb_bandwidth = float(val)
-        elif key == "cwt_width":
-            cfg.cwt_width = int(val)
-        elif key == "dwt_levels":
-            cfg.dwt_levels = int(val)
-        # nsgt_window_size does not belong here; handled in SourcePanel
 
     def _nudge_slider(self, key: str, direction: int) -> None:
         """Move a slider by one logical step. direction: +1 or -1."""
@@ -6891,12 +6372,6 @@ class SourcePanel(Panel):
         self.input_dir: str = input_dir or os.getcwd()
         self.output_root: str = output_root or self.input_dir
 
-        # CAFLS — Complex-Anchored Filterbank Logarithmic Scaling
-        # f_a is the singularity where log-frequency (CQT) flips to
-        # log-period (CWT). CQT fmin is clamped here; CWT fmax is capped here.
-        # FB bridges both sides, spanning from CWT fmin to CQT fmax.
-        self.cafls_anchor: float = 30.87  # f_a ≈ B0 (nearest note to 30 Hz)
-
         # WAV file list
         self.wav_list = ScrollableItemList("WAV Files", max_visible=6)
         self._wav_paths: list[str] = []
@@ -6907,12 +6382,11 @@ class SourcePanel(Panel):
         self.channel_mode_idx: int = 0
 
         # Source include flags (non-exclusive checkboxes)
-        # Disabling an engine opts out of that frequency band entirely.
         self.include_cqt: bool = True
-        self.include_fb: bool = True
+        self.include_fb: bool = False
         self.fb_hybrid: bool = False  # hybrid = FB low / CQT high
         self.fb_q_norm: bool = False  # divide by sqrt(bw) for spectral density
-        self.include_wavelet: bool = True
+        self.include_wavelet: bool = False
 
         # Wavelet settings
         self.wavelet_family_idx: int = 0   # index into _WAVELET_FAMILIES
@@ -6921,30 +6395,25 @@ class SourcePanel(Panel):
         self.wavelet_depth_abs: int = 5        # absolute level 0-50
         self.wavelet_depth_mode: int = 0       # 0=percentage, 1=absolute
         self.wavelet_ext_idx: int = 0      # index into _WAVELET_EXTENSIONS
-        self.wavelet_mode_idx: int = 1     # 0=DWT, 1=CWT; default CWT
+        self.wavelet_mode_idx: int = 0     # 0=DWT, 1=CWT
         self.cwt_wavelet_idx: int = 0      # index into _CWT_WAVELET_TYPES
         self.cwt_scales_per_octave: int = 12
         self.cwt_sigma: float = 6.0
         self.cwt_epsilon: float = 0.01
-        # CWT range is always [CAFLS_SEISMIC_FLOOR, cafls_anchor] — no user controls
-
+        self.cwt_fmin: float = 0.1      # Hz, lower bound for CWT analysis
+        self.cwt_fmax: float = 0.0      # Hz, upper bound; 0 = sr/4.0
 
         # CQT settings
         self.cqt_algorithm_idx: int = 0  # index into _CQT_ALGORITHMS
-        self.cqt_window_idx: int = 0     # index into _CQT_WINDOWS
-        # Window size is derived from Q / range demand — not set manually.
         self.hop_length: int = 512
         self.bins_per_octave: int = 1200
         self.cqt_filter_scale: float = 1.0  # librosa CQT filter quality factor
-        self.cqt_fmin: float = 30.87  # CAFLS anchor (B0 ≈ f_a)
+        self.cqt_fmin: float = 16.35  # C0
         self.cqt_fmax: float = 19912.13  # D#9 (snapped)
         self._cqt_expanded: bool = True
         self._loss_map = PlotWidget()
         self._loss_map.title = ""
         self._loss_map.grid_lines = 0
-
-        # DWT levels (acts as window depth)
-        self.dwt_levels: int = 5
 
         # Filter bank settings
         self._fb_expanded: bool = True
@@ -6957,12 +6426,10 @@ class SourcePanel(Panel):
         self.fb_filter_type_idx: int = 0  # index into _FILTER_TYPES
         self.fb_label_mode_idx: int = 1  # 0=Range, 1=Mid+BW
         self.fb_hop: int = 512  # hop length for FB envelope computation
-        # CAFLS filterbank settings
-        # fb_bpo: striations per log-scale step (density of striated bands)
-        # fb_banded_width: octaves each side of anchor with striated bands;
-        #   beyond this the FB uses a solid highpass (above) and lowpass (below)
-        self.fb_bpo: int = 12
-        self.fb_banded_width: int = 3   # octaves of striated zone each side
+        # Auto (log) settings — mirrors CQT-style controls
+        self.fb_bpo: int = 12        # bands per octave
+        self.fb_fmin: float = 16.35  # C0
+        self.fb_fmax: float = 19912.13  # D#9
         self._fb_decomp: FilterBankDecomposition | None = None
 
         # Resampling preferences
@@ -7007,6 +6474,22 @@ class SourcePanel(Panel):
         self._band_list = ScrollableItemList("Filter Bands", max_visible=8)
         self._band_list_bands: list[BandDef] = []  # current preview bands
 
+        # Solver state
+        self._solving: bool = False
+        self._solver_thread: threading.Thread | None = None
+        self._solver_progress: str = ""
+        self._solver_result: Any = None  # SolverResult or None
+        self._solver_error: str | None = None
+        self._pre_solve_losses: tuple[float, float, float] | None = None
+        # Schedule-mode params: set of (engine, param_name)
+        # A param in _schedule_params is solved per-octave instead of as a
+        # single global value.  It must NOT also be in _param_locks.
+        self._schedule_params: set[tuple[str, str]] = set()
+        # Solver-discovered schedules (ScheduleVec per param), populated after solve
+        self._solver_schedules: dict[str, dict[str, Any]] = {}
+        # Parameter locks: {engine: {param_name: True}}
+        self._param_locks: dict[str, set[str]] = {
+            "cqt": set(), "fb": set(), "cwt": set()}
 
         # Callbacks
         self.on_set_active: Any = None
@@ -7087,14 +6570,8 @@ class SourcePanel(Panel):
                         for vhash, vinfo in manifest.get("versions", {}).items():
                             short = vhash[:8]
                             settings = vinfo.get("settings", {})
-                            _fs = settings.get("cqt_filter_scale")
-                            _fs_desc = f" qx{_fs}" if _fs is not None else ""
-                            _win = settings.get("cqt_window")
-                            _win_desc = f" {_win}" if _win else ""
                             desc = (f"h{settings.get('hop_length', '?')}"
                                     f" b{settings.get('bins_per_octave', '?')}"
-                                    f"{_fs_desc}"
-                                    f"{_win_desc}"
                                     f" {settings.get('cqt_fmin', '?')}"
                                     f"-{settings.get('cqt_fmax', '?')}Hz")
                             versions.append((vhash, desc))
@@ -7177,20 +6654,24 @@ class SourcePanel(Panel):
         fmax = _snap_to_note_down(nyq)
         if fmax <= 0:
             fmax = _snap_to_note(nyq)
-        # cqt fmin: must be >= CAFLS anchor; snap up from anchor
-        cqt_fmin = _snap_to_note_up(self.cafls_anchor)
-        if cqt_fmin >= fmax:
-            cqt_fmin = self.cafls_anchor
+        # fmin: snap up to semitone at or above floor
+        fmin = _snap_to_note_up(lo_raw)
+        if fmin >= fmax:
+            fmin = _snap_to_note_down(fmax / 2.0)
+        self.fb_fmax = round(fmax, 6)
+        self.fb_fmin = round(fmin, 6)
         self.cqt_fmax = round(fmax, 6)
-        self.cqt_fmin = round(cqt_fmin, 6)
+        self.cqt_fmin = round(fmin, 6)
 
     def _clamp_freq_range(self) -> None:
         """Clamp all freq sliders to valid range after region change."""
         lo, hi = self._freq_limits()
-        # CQT fmin is floored at the CAFLS anchor
-        cqt_lo = max(lo, self.cafls_anchor)
-        if self.cqt_fmin < cqt_lo:
-            self.cqt_fmin = round(_snap_to_note_up(cqt_lo), 6)
+        if self.fb_fmin < lo:
+            self.fb_fmin = round(_snap_to_note_up(lo), 6)
+        if self.fb_fmax > hi:
+            self.fb_fmax = round(_snap_to_note_down(hi), 6)
+        if self.cqt_fmin < lo:
+            self.cqt_fmin = round(_snap_to_note_up(lo), 6)
         if self.cqt_fmax > hi:
             self.cqt_fmax = round(_snap_to_note_down(hi), 6)
 
@@ -7240,8 +6721,199 @@ class SourcePanel(Panel):
             return max(1, min(self.wavelet_depth_abs, max_lev))
         return max(1, int(round(self.wavelet_depth_pct / 100.0 * max_lev)))
 
-    # ---- Analysis ---------------------------------------------------------
-    # (Solver removed — unguided and too slow to be useful.)
+    # ---- Solver -----------------------------------------------------------
+
+    def _solver_limit(self, engine: str, param: str,
+                      default_hi: float) -> float:
+        """Return the upper bound for a param, expanded by solver if available."""
+        if self._solver_result is not None:
+            bounds = self._solver_result.bounds_used.get(engine, {})
+            if param in bounds:
+                _, hi = bounds[param]
+                return max(default_hi, hi)
+            # Also check if solver pushed the value beyond the old limit
+            val = self._solver_result.params.get(engine, {}).get(param)
+            if val is not None and isinstance(val, (int, float)):
+                return max(default_hi, float(val) * 1.2)
+        return default_hi
+
+    def _run_solver(self) -> None:
+        """Launch the fidelity solver in a background thread."""
+        if self._solving:
+            return
+        self._solving = True
+        self._solver_error = None
+        self._solver_progress = "Starting"
+        self._solver_result = None
+        # Capture current manual losses for before/after comparison
+        try:
+            _bars = [b for b in self._loss_map.bars if b.rgb.shape[0] > 0]
+            _pr = max((float(b.rgb[:, 0].max()) for b in _bars), default=0.0)
+            _pg = max((float(b.rgb[:, 1].max()) for b in _bars), default=0.0)
+            _pb = max((float(b.rgb[:, 2].max()) for b in _bars), default=0.0)
+            self._pre_solve_losses = (_pr, _pg, _pb)
+        except Exception:
+            self._pre_solve_losses = None
+
+        sr = self._wav_sr if self._wav_sr > 0 else 44100
+        engines: list[str] = []
+        if self.include_cqt:
+            engines.append("cqt")
+        if self.include_fb:
+            engines.append("fb")
+        if self.include_wavelet:
+            engines.append("cwt")
+        if not engines:
+            engines = ["cqt"]
+
+        # Build locks from current values of locked params
+        locks: dict[str, dict[str, Any]] = {}
+        _cwt_fmax_eff = self.cwt_fmax if self.cwt_fmax > 0 else sr / 4.0
+        lock_map = {
+            "cqt": {
+                "algorithm": _CQT_ALGORITHMS[self.cqt_algorithm_idx],
+                "bins_per_octave": self.bins_per_octave,
+                "hop_length": self.hop_length,
+                "fmin": self.cqt_fmin,
+                "fmax": self.cqt_fmax,
+                "filter_scale": self.cqt_filter_scale,
+            },
+            "fb": {
+                "bands_per_octave": self.fb_bpo,
+                "hop_length": self.fb_hop,
+                "fmin": self.fb_fmin,
+                "fmax": self.fb_fmax,
+                "filter_type": (_FILTER_TYPES[self.fb_filter_type_idx]
+                                if self.fb_filter_type_idx < len(_FILTER_TYPES)
+                                else "Linkwitz-Riley 4"),
+            },
+            "cwt": {
+                "scales_per_octave": self.cwt_scales_per_octave,
+                "hop_length": 1,
+                "fmin": self.cwt_fmin,
+                "fmax": _cwt_fmax_eff,
+                "sigma": self.cwt_sigma,
+                "wavelet": _CWT_WAVELET_TYPES[
+                    min(self.cwt_wavelet_idx, len(_CWT_WAVELET_TYPES) - 1)],
+            },
+        }
+        for eng in engines:
+            for pname in self._param_locks.get(eng, set()):
+                if pname in lock_map.get(eng, {}):
+                    if eng not in locks:
+                        locks[eng] = {}
+                    locks[eng][pname] = lock_map[eng][pname]
+
+        # Always lock the CQT algorithm — solver shouldn't flip it
+        if "cqt" in engines:
+            locks.setdefault("cqt", {})["algorithm"] = \
+                _CQT_ALGORITHMS[self.cqt_algorithm_idx]
+
+        def _cb(xk, convergence=0):
+            self._solver_progress = f"conv={convergence:.4f}"
+
+        _schedule_params_snapshot = set(self._schedule_params)
+
+        def _worker() -> None:
+            try:
+                from fidelity_solver import solve
+                result = solve(
+                    sr=sr,
+                    engines=engines,
+                    locks=locks,
+                    schedule_params=_schedule_params_snapshot,
+                    max_iter=150,
+                    seed=42,
+                    callback=_cb,
+                )
+                self._solver_result = result
+                self._apply_solver_result(result)
+            except Exception as exc:
+                self._solver_error = str(exc)
+            finally:
+                self._solving = False
+
+        self._solver_thread = threading.Thread(target=_worker, daemon=True)
+        self._solver_thread.start()
+
+    def _apply_solver_result(self, result: Any) -> None:
+        """Push solver-found values back into panel controls."""
+        cqt_vals = result.params.get("cqt", {})
+        fb_vals = result.params.get("fb", {})
+        cwt_vals = result.params.get("cwt", {})
+
+        # CQT
+        if "algorithm" not in result.locked.get("cqt", {}):
+            if "algorithm" in cqt_vals:
+                algo = str(cqt_vals["algorithm"])
+                if algo in _CQT_ALGORITHMS:
+                    self.cqt_algorithm_idx = _CQT_ALGORITHMS.index(algo)
+        if "bins_per_octave" not in result.locked.get("cqt", {}):
+            if "bins_per_octave" in cqt_vals:
+                self.bins_per_octave = _snap_bpo(cqt_vals["bins_per_octave"])
+        if "hop_length" not in result.locked.get("cqt", {}):
+            if "hop_length" in cqt_vals:
+                raw = max(16, min(8192, int(cqt_vals["hop_length"])))
+                self.hop_length = 2 ** round(math.log2(raw))
+        if "fmin" not in result.locked.get("cqt", {}):
+            if "fmin" in cqt_vals:
+                self.cqt_fmin = round(_snap_to_note(
+                    max(0.5, float(cqt_vals["fmin"]))), 6)
+        if "fmax" not in result.locked.get("cqt", {}):
+            if "fmax" in cqt_vals:
+                self.cqt_fmax = round(_snap_to_note(
+                    max(20.0, float(cqt_vals["fmax"]))), 6)
+        if "filter_scale" not in result.locked.get("cqt", {}):
+            if "filter_scale" in cqt_vals:
+                self.cqt_filter_scale = max(0.1, min(8.0, float(cqt_vals["filter_scale"])))
+
+        # FB
+        if "bands_per_octave" not in result.locked.get("fb", {}):
+            if "bands_per_octave" in fb_vals:
+                self.fb_bpo = max(1, min(96, int(fb_vals["bands_per_octave"])))
+        if "hop_length" not in result.locked.get("fb", {}):
+            if "hop_length" in fb_vals:
+                self.fb_hop = max(16, min(8192, int(fb_vals["hop_length"])))
+        if "fmin" not in result.locked.get("fb", {}):
+            if "fmin" in fb_vals:
+                self.fb_fmin = round(_snap_to_note(
+                    max(0.5, float(fb_vals["fmin"]))), 6)
+        if "fmax" not in result.locked.get("fb", {}):
+            if "fmax" in fb_vals:
+                self.fb_fmax = round(_snap_to_note(
+                    max(20.0, float(fb_vals["fmax"]))), 6)
+        if "filter_type" not in result.locked.get("fb", {}):
+            if "filter_type" in fb_vals:
+                ft = str(fb_vals["filter_type"])
+                if ft in _FILTER_TYPES:
+                    self.fb_filter_type_idx = _FILTER_TYPES.index(ft)
+
+        # CWT
+        if "scales_per_octave" not in result.locked.get("cwt", {}):
+            if "scales_per_octave" in cwt_vals:
+                self.cwt_scales_per_octave = max(
+                    1, min(240, int(cwt_vals["scales_per_octave"])))
+        if "sigma" not in result.locked.get("cwt", {}):
+            if "sigma" in cwt_vals:
+                self.cwt_sigma = max(1.0, min(60.0, float(cwt_vals["sigma"])))
+        if "epsilon" not in result.locked.get("cwt", {}):
+            if "epsilon" in cwt_vals:
+                self.cwt_epsilon = max(0.0, min(1.0, float(cwt_vals["epsilon"])))
+        if "fmin" not in result.locked.get("cwt", {}):
+            if "fmin" in cwt_vals:
+                self.cwt_fmin = round(max(0.001, float(cwt_vals["fmin"])), 6)
+        if "fmax" not in result.locked.get("cwt", {}):
+            if "fmax" in cwt_vals:
+                self.cwt_fmax = round(max(0.001, float(cwt_vals["fmax"])), 6)
+
+        # Store solver schedules so analysis can use bpo_func / hop_func
+        try:
+            from fidelity_solver import ScheduleVec as _SV
+            self._solver_schedules: dict[str, dict[str, Any]] = {}
+            for _eng, _sched_dict in (result.schedules or {}).items():
+                self._solver_schedules[_eng] = dict(_sched_dict)
+        except Exception:
+            pass
 
     # ---- Analysis ---------------------------------------------------------
 
@@ -7303,37 +6975,21 @@ class SourcePanel(Panel):
                     phase_idx = _phases.index("cqt")
                     _set_progress(phase_idx / n_phases, "CQT analysis")
                     import subprocess, sys
-                    # CAFLS: CQT fmin is floored at the anchor
-                    cqt_fmin = max(self.cqt_fmin, self.cafls_anchor)
+                    cqt_fmin = self.cqt_fmin
                     if do_hybrid and hybrid_xf is not None:
-                        # Hybrid further raises CQT fmin to crossover
-                        cqt_fmin = max(cqt_fmin, hybrid_xf)
+                        # CQT only above crossover
+                        cqt_fmin = max(self.cqt_fmin, hybrid_xf)
                     taps = int(_RESAMPLE_TAPS[self.resample_taps_idx])
-                    cqt_bpo_sched = None
-                    cqt_hop_sched = None
-                    cqt_fs_sched = None
                     cmd = [
                         sys.executable, "-m", "bass_analysis",
                         wav_path,
                         "--hop-length", str(self.hop_length),
                         "--bins-per-octave", str(self.bins_per_octave),
-                        "--cqt-filter-scale", str(self.cqt_filter_scale),
-                        "--cqt-window", _CQT_WINDOWS[
-                            min(self.cqt_window_idx, len(_CQT_WINDOWS) - 1)],
                         "--cqt-fmin", str(cqt_fmin),
                         "--cqt-fmax", str(self.cqt_fmax),
                         "--resample-taps", str(taps),
                         "--outdir", outdir,
                     ]
-                    if cqt_bpo_sched is not None and hasattr(cqt_bpo_sched, "to_list"):
-                        cmd += ["--cqt-bpo-schedule",
-                                json.dumps(cqt_bpo_sched.to_list())]
-                    if cqt_hop_sched is not None and hasattr(cqt_hop_sched, "to_list"):
-                        cmd += ["--cqt-hop-schedule",
-                                json.dumps(cqt_hop_sched.to_list())]
-                    if cqt_fs_sched is not None and hasattr(cqt_fs_sched, "to_list"):
-                        cmd += ["--cqt-filter-scale-schedule",
-                                json.dumps(cqt_fs_sched.to_list())]
                     if has_region:
                         if r_start > 0:
                             cmd += ["--start-time", str(r_start)]
@@ -7384,9 +7040,9 @@ class SourcePanel(Panel):
                     fb_ceil = hybrid_xf if (do_hybrid
                                             and hybrid_xf is not None) else None
                     if fb_auto:
-                        bands = FilterBankDecomposition.bands_from_cafls(
-                            self.cafls_anchor, self.fb_bpo,
-                            self.fb_banded_width, sr_wav)
+                        bands = FilterBankDecomposition.bands_from_log_spacing(
+                            self.fb_bpo, self.fb_fmin, self.fb_fmax,
+                            sr_wav, ceiling=fb_ceil)
                     else:
                         bands = FilterBankDecomposition.bands_from_crossovers(
                             self.fb_crossovers, sr_wav)
@@ -7466,11 +7122,9 @@ class SourcePanel(Panel):
                         y_t = torch.from_numpy(wv_signal).to(device)
 
                         cwt_eps = self.cwt_epsilon if self.cwt_epsilon > 0 else None
-                        # CAFLS: CWT scale runs from seismic floor up to anchor (f_a)
-                        cwt_fmax = self.cafls_anchor
-                        dur_floor = max(CAFLS_SEISMIC_FLOOR,
-                                        1.0 / (len(wv_signal) / sr_wav))
-                        cwt_fmin = dur_floor
+                        # Frequency range: subsonic up to Nyquist/4
+                        cwt_fmax = float(sr_wav) / 4.0
+                        cwt_fmin = max(0.1, 1.0 / (len(wv_signal) / sr_wav))
 
                         W, freqs_t = _torch_cwt(
                             y_t, sr_wav,
@@ -7713,29 +7367,8 @@ class SourcePanel(Panel):
                                       "Chan:", _CHANNEL_MODES,
                                       self.channel_mode_idx)
 
-        # === CAFLS anchor ===
-        # f_a is the log-coordinate singularity:  CQT fmin ≥ f_a,  CWT fmax ≤ f_a.
-        # FB bridges both sides and spans from CWT fmin all the way to CQT fmax.
-        _anchor_lo, _anchor_hi_raw = self._freq_limits()
-        _anchor_hi = min(300.0, _anchor_hi_raw)  # keep slider in sub-bass range
-        _anchor_note = _freq_to_note_name(self.cafls_anchor)
-        y = self._render_section_header(surf, font, y, w,
-                                        "CAFLS Anchor (f\u2090)", "cafls_hdr", True)
-        y = self._render_slider(
-            surf, font, y, w, "cafls_anchor", "f\u2090:",
-            self.cafls_anchor, max(1.0, _anchor_lo), _anchor_hi,
-            _freq_fmt(self.cafls_anchor),
-            note_label=True, log=True)
-        # Regime legend
-        _reg_txt = font.render(
-            f"\u2190 CWT (log-period)  |  CQT (log-freq) \u2192   [{_anchor_note}]",
-            True, (130, 170, 200))
-        surf.blit(_reg_txt, (self.PAD, y + 2))
-        y += self.ROW_H + 4
-
         # === Source include checkboxes ===
-        # Each checkbox opts out of the corresponding frequency band entirely.
-        lbl = font.render("Bands:", True, (160, 160, 160))
+        lbl = font.render("Include:", True, (160, 160, 160))
         surf.blit(lbl, (self.PAD, y + 3))
         cx = self.PAD + lbl.get_width() + 6
         cx = self._render_checkbox(surf, font, cx, y, w, "inc_cqt",
@@ -7743,7 +7376,7 @@ class SourcePanel(Panel):
         cx = self._render_checkbox(surf, font, cx, y, w, "inc_fb",
                                    "FB", self.include_fb)
         cx = self._render_checkbox(surf, font, cx, y, w, "inc_wavelet",
-                                   "CWT", self.include_wavelet)
+                                   "WV", self.include_wavelet)
         y += self.ROW_H + 2
         # Hybrid checkbox (only relevant when FB is included)
         if self.include_fb:
@@ -7774,10 +7407,6 @@ class SourcePanel(Panel):
                                               "cqt_algo", "Algorithm:",
                                               _CQT_ALGORITHMS,
                                               self.cqt_algorithm_idx)
-                y = self._render_dropdown_btn(surf, font, y, w,
-                                              "cqt_window", "Window:",
-                                              _CQT_WINDOWS,
-                                              self.cqt_window_idx)
                 _is_nsgt = _CQT_ALGORITHMS[self.cqt_algorithm_idx] == "nsgt"
                 if not _is_nsgt:
                     y = self._render_slider(surf, font, y, w, "hop", "Hop:",
@@ -7788,23 +7417,25 @@ class SourcePanel(Panel):
                                         log=True)
                 if not _is_nsgt:
                     _fs_hi = max(4.0, self.cqt_filter_scale,
-                                 4.0)
+                                 self._solver_limit("cqt", "filter_scale", 4.0))
                     y = self._render_slider(surf, font, y, w, "cqt_filter_scale",
-                                            "Q scale:", self.cqt_filter_scale,
+                                            "FilterQ:", self.cqt_filter_scale,
                                             0.1, _fs_hi, "{:.2f}", log=False)
                 _cqt_lo, _cqt_hi = self._freq_limits()
-                # CQT fmin is always floored at the CAFLS anchor
-                eff_cqt_fmin = max(self.cqt_fmin, self.cafls_anchor)
                 if is_hybrid:
                     # In Hybrid the CQT fMin is auto-raised to crossover
                     xf_cqt = hybrid_crossover_freq(self.bins_per_octave,
                                                    self.hop_length, sr_preview)
-                    eff_cqt_fmin = max(eff_cqt_fmin, xf_cqt)
-                _cqt_fmin_lo = max(_cqt_lo, self.cafls_anchor)
-                y = self._render_slider(surf, font, y, w, "fmin", "fMin\u2265f\u2090:",
-                                        eff_cqt_fmin, _cqt_fmin_lo, _cqt_hi,
-                                        _freq_fmt(eff_cqt_fmin),
-                                        note_label=True, log=True)
+                    eff_fmin = max(self.cqt_fmin, xf_cqt)
+                    y = self._render_slider(surf, font, y, w, "fmin", "fMin:",
+                                            eff_fmin, _cqt_lo, _cqt_hi,
+                                            _freq_fmt(eff_fmin),
+                                            note_label=True, log=True)
+                else:
+                    y = self._render_slider(surf, font, y, w, "fmin", "fMin:",
+                                            self.cqt_fmin, _cqt_lo, _cqt_hi,
+                                            _freq_fmt(self.cqt_fmin),
+                                            note_label=True, log=True)
                 y = self._render_slider(surf, font, y, w, "fmax", "fMax:",
                                         self.cqt_fmax, _cqt_lo, _cqt_hi,
                                         _freq_fmt(self.cqt_fmax),
@@ -7852,13 +7483,21 @@ class SourcePanel(Panel):
                 fb_auto = _FB_CONFIG_MODES[self.fb_config_mode_idx] != "Manual"
 
                 # FB controls — always visible (mirrors CQT controls)
-                _fb_bpo_hi = max(48.0, float(self.fb_bpo), 48.0)
+                _fb_bpo_hi = max(48.0, float(self.fb_bpo), self._solver_limit("fb", "bands_per_octave", 48.0))
                 y = self._render_slider(
                     surf, font, y, w, "fb_bpo", "BPO:",
                     float(self.fb_bpo), 1.0, _fb_bpo_hi, log=False)
+                _fb_lo, _fb_hi = self._freq_limits()
                 y = self._render_slider(
-                    surf, font, y, w, "fb_banded_width", "Banded±:",
-                    float(self.fb_banded_width), 1.0, 12.0, log=False)
+                    surf, font, y, w, "fb_fmin", "fMin:",
+                    self.fb_fmin, _fb_lo, _fb_hi,
+                    _freq_fmt(self.fb_fmin),
+                    note_label=True, log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "fb_fmax", "fMax:",
+                    self.fb_fmax, _fb_lo, _fb_hi,
+                    _freq_fmt(self.fb_fmax),
+                    note_label=True, log=True)
                 y = self._render_slider(
                     surf, font, y, w, "fb_hop", "Hop:",
                     float(self.fb_hop), 64.0, 2048.0, log=True)
@@ -7901,10 +7540,15 @@ class SourcePanel(Panel):
                     bands = FilterBankDecomposition.bands_from_crossovers(
                         self.fb_crossovers, sr_preview)
                 else:
-                    # --- Auto (CAFLS-anchored) band computation ---
-                    bands = FilterBankDecomposition.bands_from_cafls(
-                        self.cafls_anchor, self.fb_bpo,
-                        self.fb_banded_width, sr_preview)
+                    # --- Auto (log-spaced) band computation ---
+                    fb_preview_ceil: float | None = None
+                    if is_hybrid:
+                        fb_preview_ceil = hybrid_crossover_freq(
+                            self.bins_per_octave, self.hop_length,
+                            sr_preview)
+                    bands = FilterBankDecomposition.bands_from_log_spacing(
+                        self.fb_bpo, self.fb_fmin, self.fb_fmax,
+                        sr_preview, ceiling=fb_preview_ceil)
 
                 # --- Resulting bands preview (fixed-height scrollable) ---
                 self._band_list_bands = bands
@@ -7963,25 +7607,29 @@ class SourcePanel(Panel):
                 y = self._render_dropdown_btn(
                     surf, font, y, w, "cwt_wavelet", "Wavelet:",
                     _CWT_WAVELET_TYPES, self.cwt_wavelet_idx)
-                _cwt_spo_hi = max(120.0, float(self.cwt_scales_per_octave), 120.0)
+                _cwt_spo_hi = max(120.0, float(self.cwt_scales_per_octave), self._solver_limit("cwt", "scales_per_octave", 120.0))
                 y = self._render_slider(
                     surf, font, y, w, "cwt_spo", "Scales/oct:",
                     float(self.cwt_scales_per_octave), 1.0, _cwt_spo_hi,
                     "{:.0f}", log=False)
                 if _CWT_WAVELET_TYPES[self.cwt_wavelet_idx] == "morlet":
-                    _sig_hi = max(30.0, self.cwt_sigma, 30.0)
+                    _sig_hi = max(30.0, self.cwt_sigma, self._solver_limit("cwt", "sigma", 30.0))
                     y = self._render_slider(
                         surf, font, y, w, "cwt_sigma", "σ:",
                         self.cwt_sigma, 1.0, _sig_hi, "{:.1f}", log=False)
                 y = self._render_slider(
                     surf, font, y, w, "cwt_epsilon", "ε:",
                     self.cwt_epsilon, 0.0, 1.0, "{:.3f}", log=False)
-                # CWT range is always [CAFLS_SEISMIC_FLOOR, cafls_anchor]
-                _cwt_info = font.render(
-                    f"Scale: {CAFLS_SEISMIC_FLOOR} Hz \u2192 {self.cafls_anchor:.2f} Hz (f\u2090)",
-                    True, (120, 150, 140))
-                surf.blit(_cwt_info, (self.PAD, y + 2))
-                y += self.ROW_H
+                _cwt_flim_lo, _cwt_flim_hi = self._freq_limits()
+                _cwt_fmax_eff = self.cwt_fmax if self.cwt_fmax > 0 else sr_preview / 4.0
+                y = self._render_slider(
+                    surf, font, y, w, "cwt_fmin", "fMin:",
+                    self.cwt_fmin, max(0.001, _cwt_flim_lo), _cwt_flim_hi,
+                    _freq_fmt(self.cwt_fmin), note_label=True, log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "cwt_fmax", "fMax:",
+                    _cwt_fmax_eff, max(0.001, _cwt_flim_lo), _cwt_flim_hi,
+                    _freq_fmt(_cwt_fmax_eff), note_label=True, log=True)
                 wn_txt = font.render(
                     f"CWT: {_CWT_WAVELET_TYPES[self.cwt_wavelet_idx]}  "
                     f"σ={self.cwt_sigma:.1f}  ε={self.cwt_epsilon:.3f}",
@@ -8110,22 +7758,12 @@ class SourcePanel(Panel):
 
                 if show_cqt:
                     _algo = _CQT_ALGORITHMS[self.cqt_algorithm_idx]
-                    _cqt_window = _CQT_WINDOWS[
-                        min(self.cqt_window_idx, len(_CQT_WINDOWS) - 1)]
                     if _algo == "nsgt":
-                        _dur = self._effective_duration()
-                        _Ls_preview = max(
-                            1, int(round((_dur if _dur > 0 else 1.0) * sr_preview)))
                         fc = _fidelity_nsgt(
                             sr_preview,
                             fmin=self.cqt_fmin,
                             fmax=self.cqt_fmax,
-                            bins_per_octave=self.bins_per_octave,
-                            Ls=_Ls_preview,
-                            window=_cqt_window,
-                            window_size=2048)  # derived from Q/range
-                            
-                            
+                            bins_per_octave=self.bins_per_octave)
                         _pr = fc.get("painless")
                         _cond = fc.get("condition_number", 0.0)
                         if _pr is not None and _pr.is_painless:
@@ -8135,18 +7773,10 @@ class SourcePanel(Panel):
                         else:
                             _cqt_label = "NSGT"
                     else:
-                        _cqt_bpo_func = None
-                        _cqt_hop_func = None
-                        _cqt_fs_func = None
                         fc = _fidelity_curve(
                             sr_preview, self.hop_length,
                             self.cqt_fmin, self.cqt_fmax,
-                            self.bins_per_octave,
-                            self.cqt_filter_scale,
-                            window=_cqt_window,
-                            bpo_func=_cqt_bpo_func,
-                            hop_func=_cqt_hop_func,
-                            filter_scale_func=_cqt_fs_func)
+                            self.bins_per_octave)
                         _cqt_label = "CQT"
                     f_cqt = fc["freqs"]
                     if len(f_cqt) > 1:
@@ -8159,21 +7789,12 @@ class SourcePanel(Panel):
                     ft = _FILTER_TYPES[self.fb_filter_type_idx] \
                         if self.fb_filter_type_idx < len(_FILTER_TYPES) \
                         else "Linkwitz-Riley 4"
-                    _fb_bpo_func = None
-                    _fb_hop_func = None
-                    _fb_bands_lm = FilterBankDecomposition.bands_from_cafls(
-                        self.cafls_anchor, self.fb_bpo,
-                        self.fb_banded_width, sr_preview)
-                    _fb_fmin_lm = _fb_bands_lm[0].fmin if _fb_bands_lm else 0.0
-                    _fb_fmax_lm = _fb_bands_lm[-1].fmax if _fb_bands_lm else sr_preview / 2.0
                     fb = _fidelity_fb(
                         sr_preview,
                         bands_per_octave=self.fb_bpo,
-                        fmin=_fb_fmin_lm, fmax=_fb_fmax_lm,
+                        fmin=self.fb_fmin, fmax=self.fb_fmax,
                         hop_length=self.fb_hop,
-                        filter_type=ft,
-                        bpo_func=_fb_bpo_func,
-                        hop_func=_fb_hop_func)
+                        filter_type=ft)
                     f_fb = fb["freqs"]
                     if len(f_fb) > 1:
                         log_fb = np.log10(np.maximum(f_fb, 1e-6)).astype(np.float32)
@@ -8186,19 +7807,15 @@ class SourcePanel(Panel):
                         wv_type = _CWT_WAVELET_TYPES[
                             min(self.cwt_wavelet_idx,
                                 len(_CWT_WAVELET_TYPES) - 1)]
-                        _cwt_fmax_lm = self.cafls_anchor
-                        _cwt_fmin_lm = CAFLS_SEISMIC_FLOOR
-                        _cwt_bpo_func = None
-                        _cwt_sigma_func = None
+                        _cwt_fmax_lm = (self.cwt_fmax if self.cwt_fmax > 0
+                                        else sr_preview / 4.0)
                         wv = _fidelity_cwt(
                             sr_preview,
-                            fmin=_cwt_fmin_lm, fmax=_cwt_fmax_lm,
+                            fmin=self.cwt_fmin, fmax=_cwt_fmax_lm,
                             scales_per_octave=self.cwt_scales_per_octave,
                             hop_length=1,
                             wavelet=wv_type,
-                            sigma=self.cwt_sigma,
-                            bpo_func=_cwt_bpo_func,
-                            sigma_func=_cwt_sigma_func)
+                            sigma=self.cwt_sigma)
                         _wv_label = "CWT"
                     else:
                         wv_name = self._current_wavelet_name()
@@ -8269,8 +7886,9 @@ class SourcePanel(Panel):
             y += self._loss_map.render(surf, 0, y, w, plot_h, font)
             y += 2
 
-        # (Solver UI removed — solver was unguided and too slow.)
-        if False:
+        # === Solver locks & button ===
+        any_source = show_cqt or show_fb or self.include_wavelet
+        if any_source:
             # Lock checkboxes — show lockable params per active engine
             lbl = font.render("Lock:", True, (160, 140, 100))
             surf.blit(lbl, (self.PAD, y + 3))
@@ -8280,7 +7898,6 @@ class SourcePanel(Panel):
             _is_nsgt_lock = _CQT_ALGORITHMS[self.cqt_algorithm_idx] == "nsgt"
             if show_cqt:
                 _lock_items += [
-                    ("lock_cqt_window", "Win", "cqt"),
                     ("lock_cqt_bpo", "BPO", "cqt"),
                     ("lock_cqt_fmin", "fMin", "cqt"),
                     ("lock_cqt_fmax", "fMax", "cqt"),
@@ -8288,7 +7905,7 @@ class SourcePanel(Panel):
                 if not _is_nsgt_lock:
                     _lock_items += [
                         ("lock_cqt_hop", "Hop", "cqt"),
-                        ("lock_cqt_fs", "Qx", "cqt"),
+                        ("lock_cqt_fs", "Q", "cqt"),
                     ]
             if show_fb:
                 _lock_items += [
@@ -8306,7 +7923,6 @@ class SourcePanel(Panel):
                 ]
 
             _lock_param_map = {
-                "lock_cqt_window": ("cqt", "window"),
                 "lock_cqt_bpo": ("cqt", "bins_per_octave"),
                 "lock_cqt_hop": ("cqt", "hop_length"),
                 "lock_cqt_fmin": ("cqt", "fmin"),
@@ -8336,8 +7952,8 @@ class SourcePanel(Panel):
 
             # Solver scope hint — what is free to optimize
             _short_names = {
-                "window": "Win", "bins_per_octave": "BPO", "hop_length": "hop",
-                "fmin": "fMin", "fmax": "fMax", "filter_scale": "Qx",
+                "bins_per_octave": "BPO", "hop_length": "hop",
+                "fmin": "fMin", "fmax": "fMax", "filter_scale": "Q",
                 "bands_per_octave": "BPO", "scales_per_octave": "SPO",
                 "sigma": "σ", "epsilon": "ε",
             }
@@ -8346,7 +7962,7 @@ class SourcePanel(Panel):
             if show_cqt:
                 _cqt_all = (["hop_length", "filter_scale"]
                             if not _is_nsgt_lock else [])
-                _cqt_all = ["window"] + _cqt_all + ["bins_per_octave", "fmin", "fmax"]
+                _cqt_all += ["bins_per_octave", "fmin", "fmax"]
                 _hint_engines.append(("cqt", _cqt_all))
             if show_fb:
                 _hint_engines.append(
@@ -8380,7 +7996,7 @@ class SourcePanel(Panel):
                 "cqt": ([] if _is_nsgt_lock else
                         [("sched_cqt_bpo", "BPO", "cqt"),
                          ("sched_cqt_hop", "Hop", "cqt"),
-                         ("sched_cqt_fs", "Qx", "cqt")]),
+                         ("sched_cqt_fs", "Q", "cqt")]),
                 "fb":  [("sched_fb_bpo", "fBPO", "fb"),
                         ("sched_fb_hop", "fHop", "fb")],
                 "cwt": [("sched_cwt_spo", "SPO", "cwt"),
@@ -8625,12 +8241,69 @@ class SourcePanel(Panel):
                         setattr(self, attr, not getattr(self, attr))
                         return True
 
+            # Lock checkboxes (solver invariants)
+            _lock_param_map = {
+                "lock_cqt_bpo": ("cqt", "bins_per_octave"),
+                "lock_cqt_hop": ("cqt", "hop_length"),
+                "lock_cqt_fmin": ("cqt", "fmin"),
+                "lock_cqt_fmax": ("cqt", "fmax"),
+                "lock_cqt_fs": ("cqt", "filter_scale"),
+                "lock_fb_bpo": ("fb", "bands_per_octave"),
+                "lock_fb_hop": ("fb", "hop_length"),
+                "lock_fb_fmin": ("fb", "fmin"),
+                "lock_fb_fmax": ("fb", "fmax"),
+                "lock_cwt_spo": ("cwt", "scales_per_octave"),
+                "lock_cwt_sigma": ("cwt", "sigma"),
+                "lock_cwt_fmin": ("cwt", "fmin"),
+                "lock_cwt_fmax": ("cwt", "fmax"),
+            }
+            for lk_key, (lk_eng, lk_param) in _lock_param_map.items():
+                if lk_key in self._item_map:
+                    rect, _ = self._item_map[lk_key]
+                    if rect.collidepoint(lx, ly):
+                        s = self._param_locks.setdefault(lk_eng, set())
+                        if lk_param in s:
+                            s.discard(lk_param)
+                        else:
+                            s.add(lk_param)
+                        return True
+
+            # Schedule-mode checkboxes (per-octave plan for free params)
+            _sched_param_map_ev = {
+                "sched_cqt_bpo": ("cqt", "bins_per_octave"),
+                "sched_cqt_hop": ("cqt", "hop_length"),
+                "sched_cqt_fs":  ("cqt", "filter_scale"),
+                "sched_fb_bpo":  ("fb", "bands_per_octave"),
+                "sched_fb_hop":  ("fb", "hop_length"),
+                "sched_cwt_spo": ("cwt", "scales_per_octave"),
+                "sched_cwt_sig": ("cwt", "sigma"),
+            }
+            for sk_key, (sk_eng, sk_param) in _sched_param_map_ev.items():
+                if sk_key in self._item_map:
+                    rect, _ = self._item_map[sk_key]
+                    if rect.collidepoint(lx, ly):
+                        key_pair = (sk_eng, sk_param)
+                        if key_pair in self._schedule_params:
+                            self._schedule_params.discard(key_pair)
+                        else:
+                            # Can't be both locked and scheduled
+                            self._param_locks.get(sk_eng, set()).discard(sk_param)
+                            self._schedule_params.add(key_pair)
+                        return True
+
+            # Solve button
+            if "solve_btn" in self._item_map:
+                rect, _ = self._item_map["solve_btn"]
+                if rect.collidepoint(lx, ly) and not self._solving:
+                    self._run_solver()
+                    return True
+
             # Band list click
             if self._band_list.handle_click(lx, ly) is not None:
                 return True
 
             # Dropdowns
-            for key in ("chan_mode", "cqt_algo", "cqt_window",
+            for key in ("chan_mode", "cqt_algo",
                         "fb_ftype", "fb_cfg", "fb_lbl",
                         "wv_mode", "cwt_wavelet",
                         "wv_family", "wv_order", "wv_ext",
@@ -8643,12 +8316,12 @@ class SourcePanel(Panel):
                         return True
 
             # Slider +/- buttons and track drag
-            slider_keys = ["cafls_anchor",
-                           "hop", "bpo", "fmin", "fmax",
+            slider_keys = ["hop", "bpo", "fmin", "fmax",
                            "cqt_filter_scale",
-                           "fb_bpo", "fb_banded_width", "fb_hop",
+                           "fb_bpo", "fb_fmin", "fb_fmax", "fb_hop",
                            "wv_depth_pct", "wv_depth_abs",
                            "cwt_spo", "cwt_sigma", "cwt_epsilon",
+                           "cwt_fmin", "cwt_fmax",
                            "region_start", "region_end"]
             slider_keys += [f"xo_{i}" for i in range(len(self.fb_crossovers))]
             for skey in slider_keys:
@@ -8759,8 +8432,6 @@ class SourcePanel(Panel):
             self.channel_mode_idx = _CHANNEL_MODES.index(value)
         elif key == "cqt_algo":
             self.cqt_algorithm_idx = _CQT_ALGORITHMS.index(value)
-        elif key == "cqt_window":
-            self.cqt_window_idx = _CQT_WINDOWS.index(value)
         elif key == "wv_mode":
             self.wavelet_mode_idx = _WAVELET_MODES.index(value)
         elif key == "cwt_wavelet":
@@ -8801,23 +8472,11 @@ class SourcePanel(Panel):
                 math.log(vmax) - math.log(vmin)))
         else:
             val = vmin + frac * (vmax - vmin)
-        # ...existing code...
         self._apply_slider_value(key, val)
-
-    def _apply_cafls_anchor(self, val: float) -> None:
-        """Set the CAFLS anchor and enforce constraints on dependent freqs."""
-        lo, hi = self._freq_limits()
-        self.cafls_anchor = round(_snap_to_note(max(1.0, min(300.0, val))), 6)
-        # Push CQT fmin up to anchor if below
-        if self.cqt_fmin < self.cafls_anchor:
-            self.cqt_fmin = round(_snap_to_note_up(self.cafls_anchor), 6)
-        # CWT upper scale bound is always the anchor; no state to update here
 
     def _apply_slider_value(self, key: str, val: float) -> None:
         """Clamp + snap a raw slider value and store it."""
-        if key == "cafls_anchor":
-            self._apply_cafls_anchor(val)
-        elif key == "hop":
+        if key == "hop":
             raw = max(64, min(2048, int(val)))
             self.hop_length = 2 ** round(math.log2(raw))
             self._clamp_hybrid_cqt_fmin()
@@ -8826,23 +8485,32 @@ class SourcePanel(Panel):
             self._clamp_hybrid_cqt_fmin()
         elif key == "fmin":
             lo, hi = self._freq_limits()
-            # CQT fmin cannot go below the CAFLS anchor
-            eff_lo = max(lo, self.cafls_anchor)
-            self.cqt_fmin = round(_snap_to_note(max(eff_lo, min(hi, val))), 6)
+            self.cqt_fmin = round(_snap_to_note(max(lo, min(hi, val))), 6)
         elif key == "fmax":
             lo, hi = self._freq_limits()
             self.cqt_fmax = round(_snap_to_note(max(lo, min(hi, val))), 6)
         elif key == "fb_bpo":
-            _hi = max(48, int(48))
+            _hi = max(48, int(self._solver_limit("fb", "bands_per_octave", 48)))
             self.fb_bpo = max(1, min(_hi, int(round(val))))
-        elif key == "fb_banded_width":
-            self.fb_banded_width = max(1, min(12, int(round(val))))
+        elif key == "fb_fmin":
+            lo, hi = self._freq_limits()
+            self.fb_fmin = round(_snap_to_note(max(lo, min(hi, val))), 6)
+        elif key == "fb_fmax":
+            lo, hi = self._freq_limits()
+            self.fb_fmax = round(_snap_to_note(max(lo, min(hi, val))), 6)
         elif key == "fb_hop":
             raw = max(64, min(2048, int(val)))
             self.fb_hop = 2 ** round(math.log2(raw))
         elif key == "cqt_filter_scale":
-            _fs_hi = max(4.0, 4.0)
+            _fs_hi = max(4.0, self._solver_limit("cqt", "filter_scale", 4.0))
             self.cqt_filter_scale = max(0.1, min(_fs_hi, float(val)))
+        elif key == "cwt_fmin":
+            lo, hi = self._freq_limits()
+            self.cwt_fmin = round(max(0.001, min(hi, val)), 6)
+        elif key == "cwt_fmax":
+            lo, hi = self._freq_limits()
+            sr = self._wav_sr if self._wav_sr > 0 else 44100
+            self.cwt_fmax = round(max(0.001, min(sr / 2.0, val)), 6)
         elif key == "region_start":
             dur = self._wav_duration or 1.0
             self.region_start = round(max(0.0, min(dur, val)), 2)
@@ -8860,10 +8528,10 @@ class SourcePanel(Panel):
         elif key == "wv_depth_abs":
             self.wavelet_depth_abs = max(1, min(50, int(round(val))))
         elif key == "cwt_spo":
-            _hi = max(120, int(120))
+            _hi = max(120, int(self._solver_limit("cwt", "scales_per_octave", 120)))
             self.cwt_scales_per_octave = max(1, min(_hi, int(round(val))))
         elif key == "cwt_sigma":
-            _hi = max(30.0, 30.0)
+            _hi = max(30.0, self._solver_limit("cwt", "sigma", 30.0))
             self.cwt_sigma = max(1.0, min(_hi, float(val)))
         elif key == "cwt_epsilon":
             self.cwt_epsilon = max(0.0, min(1.0, float(val)))
@@ -8877,11 +8545,7 @@ class SourcePanel(Panel):
 
     def _nudge_slider(self, key: str, direction: int) -> None:
         """Move a slider by one logical step. direction: +1 or -1."""
-        if key == "cafls_anchor":
-            midi = 69 + 12 * math.log2(max(self.cafls_anchor, 1.0) / 440.0)
-            midi = round(midi) + direction
-            self._apply_cafls_anchor(_midi_to_freq(midi))
-        elif key == "hop":
+        if key == "hop":
             exp = round(math.log2(self.hop_length)) + direction
             self.hop_length = max(64, min(2048, 2 ** exp))
             self._clamp_hybrid_cqt_fmin()
@@ -8892,12 +8556,10 @@ class SourcePanel(Panel):
             self.bins_per_octave = _BPO_SNAPS[idx]
             self._clamp_hybrid_cqt_fmin()
         elif key == "fmin":
-            # CQT fmin: nudge in semitones, floored at CAFLS anchor
             lo, hi = self._freq_limits()
-            eff_lo = max(lo, self.cafls_anchor)
-            midi = 69 + 12 * math.log2(max(self.cqt_fmin, eff_lo) / 440.0)
+            midi = 69 + 12 * math.log2(self.cqt_fmin / 440.0)
             midi = round(midi) + direction
-            self.cqt_fmin = round(max(eff_lo, min(hi,
+            self.cqt_fmin = round(max(lo, min(hi,
                                   _midi_to_freq(midi))), 6)
         elif key == "fmax":
             lo, hi = self._freq_limits()
@@ -8906,11 +8568,20 @@ class SourcePanel(Panel):
             self.cqt_fmax = round(max(lo, min(hi,
                                   _midi_to_freq(midi))), 6)
         elif key == "fb_bpo":
-            _hi = max(48, int(48))
+            _hi = max(48, int(self._solver_limit("fb", "bands_per_octave", 48)))
             self.fb_bpo = max(1, min(_hi, self.fb_bpo + direction))
-        elif key == "fb_banded_width":
-            self.fb_banded_width = max(1, min(12,
-                self.fb_banded_width + direction))
+        elif key == "fb_fmin":
+            lo, hi = self._freq_limits()
+            midi = 69 + 12 * math.log2(self.fb_fmin / 440.0)
+            midi = round(midi) + direction
+            self.fb_fmin = round(max(lo, min(hi,
+                                 _midi_to_freq(midi))), 6)
+        elif key == "fb_fmax":
+            lo, hi = self._freq_limits()
+            midi = 69 + 12 * math.log2(self.fb_fmax / 440.0)
+            midi = round(midi) + direction
+            self.fb_fmax = round(max(lo, min(hi,
+                                 _midi_to_freq(midi))), 6)
         elif key == "region_start":
             step = 0.1
             dur = self._wav_duration or 1.0
@@ -8934,11 +8605,11 @@ class SourcePanel(Panel):
             self.wavelet_depth_abs = max(1, min(50,
                 self.wavelet_depth_abs + direction))
         elif key == "cwt_spo":
-            _hi = max(120, int(120))
+            _hi = max(120, int(self._solver_limit("cwt", "scales_per_octave", 120)))
             self.cwt_scales_per_octave = max(1, min(_hi,
                 self.cwt_scales_per_octave + direction))
         elif key == "cwt_sigma":
-            _hi = max(30.0, 30.0)
+            _hi = max(30.0, self._solver_limit("cwt", "sigma", 30.0))
             self.cwt_sigma = max(1.0, min(_hi,
                 self.cwt_sigma + 0.5 * direction))
         elif key == "cwt_epsilon":
@@ -8948,9 +8619,21 @@ class SourcePanel(Panel):
             exp = round(math.log2(self.fb_hop)) + direction
             self.fb_hop = max(64, min(2048, 2 ** exp))
         elif key == "cqt_filter_scale":
-            _fs_hi = max(4.0, 4.0)
+            _fs_hi = max(4.0, self._solver_limit("cqt", "filter_scale", 4.0))
             self.cqt_filter_scale = max(0.1, min(_fs_hi,
                 round(self.cqt_filter_scale + 0.1 * direction, 2)))
+        elif key == "cwt_fmin":
+            midi = 69 + 12 * math.log2(max(self.cwt_fmin, 0.001) / 440.0)
+            midi = round(midi) + direction
+            lo, hi = self._freq_limits()
+            self.cwt_fmin = round(max(0.001, min(hi, _midi_to_freq(midi))), 6)
+        elif key == "cwt_fmax":
+            sr = self._wav_sr if self._wav_sr > 0 else 44100
+            eff = self.cwt_fmax if self.cwt_fmax > 0 else sr / 4.0
+            midi = 69 + 12 * math.log2(max(eff, 0.001) / 440.0)
+            midi = round(midi) + direction
+            lo, hi = self._freq_limits()
+            self.cwt_fmax = round(max(0.001, min(sr / 2.0, _midi_to_freq(midi))), 6)
         elif key.startswith("xo_"):
             idx = int(key[3:])
             if 0 <= idx < len(self.fb_crossovers):
@@ -9156,8 +8839,6 @@ def _reduce_2d(data: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     dimension is left unchanged (GL_LINEAR handles upsampling).
     """
     h, w = data.shape
-    if h == 0 or w == 0:
-        return np.zeros((out_h, out_w), dtype=np.float32)
     result = data.astype(np.float64)
 
     if h > out_h:
@@ -9374,7 +9055,7 @@ class ViewportSynthPlayer:
     Reconstructs a time-domain waveform from the visible CQT viewport
     using proper overlap-add inversion of the multi-rate CQT.  Each
     octave is inverted at its decimated sample rate using the same
-    configured windowed sinusoidal basis used during analysis, then
+    Hann-windowed sinusoidal basis used during analysis, then
     upsampled and summed to produce near-perfect reconstruction for
     the selected frequency band.
 
@@ -9395,25 +9076,11 @@ class ViewportSynthPlayer:
 
     def __init__(self, sr: int, hop_length: int,
                  bins_per_octave: int,
-                 filter_scale: float = 1.0,
-                 window: str = "hann",
                  resample_taps: int = 64,
-                 precision: str = "32-bit float",
-                 *,
-                 fmin: float = 32.70319566257483,
-                 cqt_bpo_schedule: list[int] | None = None,
-                 cqt_hop_schedule: list[int] | None = None,
-                 cqt_filter_scale_schedule: list[float] | None = None) -> None:
+                 precision: str = "32-bit float") -> None:
         self.sr = sr
         self.hop_length = hop_length
         self.bins_per_octave = bins_per_octave
-        self.filter_scale = filter_scale
-        self.window = window
-        self.fmin = fmin
-        self.cqt_bpo_schedule = list(cqt_bpo_schedule) if cqt_bpo_schedule else None
-        self.cqt_hop_schedule = list(cqt_hop_schedule) if cqt_hop_schedule else None
-        self.cqt_filter_scale_schedule = (
-            list(cqt_filter_scale_schedule) if cqt_filter_scale_schedule else None)
         self.resample_taps = resample_taps
         self.precision = precision
         if precision == "64-bit float":
@@ -9430,21 +9097,6 @@ class ViewportSynthPlayer:
         self._sound: pygame.mixer.Sound | None = None
         self.view_t0: float = 0.0
         self.view_t1: float = 0.0
-
-    def _has_cqt_schedule(self) -> bool:
-        return bool(self.cqt_bpo_schedule or self.cqt_hop_schedule or
-                    self.cqt_filter_scale_schedule)
-
-    def _cqt_schedule_funcs(self) -> tuple[Any | None, Any | None, Any | None]:
-        from torch_cqt_new import ExplicitOctaveSchedule
-
-        bpo_func = (ExplicitOctaveSchedule(self.cqt_bpo_schedule, integer=True)
-                    if self.cqt_bpo_schedule else None)
-        hop_func = (ExplicitOctaveSchedule(self.cqt_hop_schedule, integer=True)
-                    if self.cqt_hop_schedule else None)
-        fs_func = (ExplicitOctaveSchedule(self.cqt_filter_scale_schedule)
-                   if self.cqt_filter_scale_schedule else None)
-        return bpo_func, hop_func, fs_func
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -9471,9 +9123,7 @@ class ViewportSynthPlayer:
         bpo = self.bins_per_octave
         hop = self.hop_length
         sr = self.sr
-        alpha = ((2.0 ** (2.0 / bpo) - 1.0)
-                 / (2.0 ** (2.0 / bpo) + 1.0))
-        Q = self.filter_scale / max(alpha, 1e-30)
+        Q = 1.0 / (2.0 ** (1.0 / bpo) - 1.0)
         n_octaves = int(math.ceil(n_total_bins / bpo))
         norms: dict[int, np.ndarray] = {}
 
@@ -9551,19 +9201,10 @@ class ViewportSynthPlayer:
         _torch_real = torch.float64 if self._np_real == np.float64 else torch.float32
         _torch_complex = torch.complex128 if self._np_complex == np.complex128 else torch.complex64
 
+        fmin = float(view_freqs[0])
         out_len = n_view_frames * self.hop_length
-        bpo_func, hop_func, fs_func = self._cqt_schedule_funcs()
-        if self._has_cqt_schedule():
-            full = np.zeros((n_total_bins, n_view_frames), dtype=self._np_complex)
-            n_rows = min(cqt_slice.shape[0], max(0, n_total_bins - y0))
-            full[y0:y0 + n_rows, :cqt_slice.shape[1]] = cqt_slice[:n_rows]
-            cqt_in = full
-            fmin = float(self.fmin)
-        else:
-            cqt_in = np.asarray(cqt_slice, dtype=self._np_complex)
-            fmin = float(view_freqs[0])
 
-        C = torch.from_numpy(np.asarray(cqt_in, dtype=self._np_complex)).to(
+        C = torch.from_numpy(np.asarray(cqt_slice, dtype=self._np_complex)).to(
             device=device, dtype=_torch_complex)
 
         resample_kw = {
@@ -9577,11 +9218,6 @@ class ViewportSynthPlayer:
             hop_length=self.hop_length,
             fmin=fmin,
             bins_per_octave=self.bins_per_octave,
-            filter_scale=self.filter_scale,
-            window=self.window,
-            bpo_func=bpo_func,
-            hop_func=hop_func,
-            filter_scale_func=fs_func,
             length=out_len,
             device=device,
             dtype=_torch_real,
@@ -9709,42 +9345,20 @@ class ViewportSynthPlayer:
             "resampling_method": "sinc_interp_kaiser",
             "beta": 14.769656459379492,
         }
-        bpo_func, hop_func, fs_func = self._cqt_schedule_funcs()
 
-        if self._has_cqt_schedule():
-            C, freqs = _torch_cqt(
-                y, self.sr,
-                hop_length=self.hop_length,
-                fmin=float(self.fmin),
-                n_bins=n_total_bins,
-                bins_per_octave=self.bins_per_octave,
-                filter_scale=self.filter_scale,
-                window=self.window,
-                bpo_func=bpo_func,
-                hop_func=hop_func,
-                filter_scale_func=fs_func,
-                pad_mode="constant" if zero_front else "reflect",
-                device=device,
-                dtype=_torch_real,
-                resample_kw=resample_kw,
-            )
-            full = C.cpu().numpy().astype(self._np_complex)
-            result = full[y0:y0 + n_view_bins, :]
-        else:
-            C, freqs = _torch_cqt(
-                y, self.sr,
-                hop_length=self.hop_length,
-                fmin=fmin,
-                n_bins=n_view_bins,
-                bins_per_octave=self.bins_per_octave,
-                filter_scale=self.filter_scale,
-                window=self.window,
-                pad_mode="constant" if zero_front else "reflect",
-                device=device,
-                dtype=_torch_real,
-                resample_kw=resample_kw,
-            )
-            result = C.cpu().numpy().astype(self._np_complex)
+        C, freqs = _torch_cqt(
+            y, self.sr,
+            hop_length=self.hop_length,
+            fmin=fmin,
+            n_bins=n_view_bins,
+            bins_per_octave=self.bins_per_octave,
+            pad_mode="constant" if zero_front else "reflect",
+            device=device,
+            dtype=_torch_real,
+            resample_kw=resample_kw,
+        )
+
+        result = C.cpu().numpy().astype(self._np_complex)
 
         # Trim or pad frames to match expected n_view_frames
         actual_frames = result.shape[-1]
@@ -9815,9 +9429,7 @@ class ViewportSynthPlayer:
         """
         bpo = self.bins_per_octave
         hop = self.hop_length
-        alpha = ((2.0 ** (2.0 / bpo) - 1.0)
-                 / (2.0 ** (2.0 / bpo) + 1.0))
-        Q = self.filter_scale / max(alpha, 1e-30)
+        Q = 1.0 / (2.0 ** (1.0 / bpo) - 1.0)
         n_octaves = int(math.ceil(n_bins / bpo))
         pad = 0
         for octave in range(n_octaves):
@@ -10879,37 +10491,12 @@ class SpectrogramViewer:
             self.player = AudioPlayer(self.audio_path)
         if self._npz is not None:
             sr_val = int(self._npz["sr"]) if "sr" in self._npz else 44100
-            hop_val = int(self._npz["cqt_grid_hop_length"]) if "cqt_grid_hop_length" in self._npz else (
-                int(self._npz["hop_length"]) if "hop_length" in self._npz else 512)
+            hop_val = int(self._npz["hop_length"]) if "hop_length" in self._npz else 512
             bpo_val = int(self._npz["bins_per_octave"]) if "bins_per_octave" in self._npz else 1200
-            fs_val = float(self._npz["cqt_filter_scale"]) if "cqt_filter_scale" in self._npz else 1.0
-            win_val = (str(self._npz["cqt_window"].item())
-                       if "cqt_window" in self._npz else "hann")
-            fmin_val = float(self._npz["cqt_fmin"]) if "cqt_fmin" in self._npz else (
-                float(self._freqs[0]) if self._freqs.size else 16.35)
-            bpo_sched = (self._npz["cqt_bpo_schedule"].astype(np.int32).tolist()
-                         if "cqt_bpo_schedule" in self._npz else None)
-            hop_sched = (self._npz["cqt_hop_schedule"].astype(np.int32).tolist()
-                         if "cqt_hop_schedule" in self._npz else None)
-            fs_sched = (self._npz["cqt_filter_scale_schedule"].astype(np.float32).tolist()
-                        if "cqt_filter_scale_schedule" in self._npz else None)
-            if self.file_panel:
-                self.file_panel.hop_length = int(self._npz["hop_length"]) if "hop_length" in self._npz else self.file_panel.hop_length
-                self.file_panel.bins_per_octave = bpo_val
-                self.file_panel.cqt_filter_scale = fs_val
-                self.file_panel.cqt_fmin = fmin_val
-                self.file_panel.cqt_fmax = float(self._npz["cqt_fmax"]) if "cqt_fmax" in self._npz else self.file_panel.cqt_fmax
-                if win_val in _CQT_WINDOWS:
-                    self.file_panel.cqt_window_idx = _CQT_WINDOWS.index(win_val)
-            _fp = self.file_panel
-            taps_val = int(_RESAMPLE_TAPS[_fp.resample_taps_idx if _fp else 3])
-            prec_val = _RESAMPLE_PRECISIONS[_fp.resample_precision_idx if _fp else 2]
+            taps_val = int(_RESAMPLE_TAPS[self.resample_taps_idx])
+            prec_val = _RESAMPLE_PRECISIONS[self.resample_precision_idx]
             self.synth = ViewportSynthPlayer(sr_val, hop_val, bpo_val,
-                                             fs_val, win_val, taps_val, prec_val,
-                                             fmin=fmin_val,
-                                             cqt_bpo_schedule=bpo_sched,
-                                             cqt_hop_schedule=hop_sched,
-                                             cqt_filter_scale_schedule=fs_sched)
+                                             taps_val, prec_val)
         self.phase_mode: str = "original"
         self.normalize_loudness: bool = True
         self.fb_n_bands: int = 16
@@ -11591,35 +11178,11 @@ class SpectrogramViewer:
             self.player = None
         if self._npz is not None:
             sr_val = int(self._npz["sr"]) if "sr" in self._npz else 44100
-            hop_val = int(self._npz["cqt_grid_hop_length"]) if "cqt_grid_hop_length" in self._npz else (
-                int(self._npz["hop_length"]) if "hop_length" in self._npz else 512)
+            hop_val = int(self._npz["hop_length"]) if "hop_length" in self._npz else 512
             bpo_val = int(self._npz["bins_per_octave"]) if "bins_per_octave" in self._npz else 1200
-            fs_val = float(self._npz["cqt_filter_scale"]) if "cqt_filter_scale" in self._npz else 1.0
-            win_val = (str(self._npz["cqt_window"].item())
-                       if "cqt_window" in self._npz else "hann")
-            fmin_val = float(self._npz["cqt_fmin"]) if "cqt_fmin" in self._npz else (
-                float(self._freqs[0]) if self._freqs.size else 16.35)
-            bpo_sched = (self._npz["cqt_bpo_schedule"].astype(np.int32).tolist()
-                         if "cqt_bpo_schedule" in self._npz else None)
-            hop_sched = (self._npz["cqt_hop_schedule"].astype(np.int32).tolist()
-                         if "cqt_hop_schedule" in self._npz else None)
-            fs_sched = (self._npz["cqt_filter_scale_schedule"].astype(np.float32).tolist()
-                        if "cqt_filter_scale_schedule" in self._npz else None)
-            if self.file_panel:
-                self.file_panel.hop_length = int(self._npz["hop_length"]) if "hop_length" in self._npz else self.file_panel.hop_length
-                self.file_panel.bins_per_octave = bpo_val
-                self.file_panel.cqt_filter_scale = fs_val
-                self.file_panel.cqt_fmin = fmin_val
-                self.file_panel.cqt_fmax = float(self._npz["cqt_fmax"]) if "cqt_fmax" in self._npz else self.file_panel.cqt_fmax
-                if win_val in _CQT_WINDOWS:
-                    self.file_panel.cqt_window_idx = _CQT_WINDOWS.index(win_val)
         else:
             # No CQT: read sr from filterbank or wavelet metadata
-            sr_val, hop_val, bpo_val, fs_val, win_val = 44100, 512, 1200, 1.0, "hann"
-            fmin_val = 16.35
-            bpo_sched = None
-            hop_sched = None
-            fs_sched = None
+            sr_val, hop_val, bpo_val = 44100, 512, 1200
             fb_meta_path = os.path.join(folder_path, "filterbank",
                                         "filterbank_meta.json")
             if os.path.isfile(fb_meta_path):
@@ -11635,15 +11198,10 @@ class SpectrogramViewer:
                     with open(wv_meta_path, "r") as f:
                         wv_meta = _json.load(f)
                     sr_val = int(wv_meta.get("sr", 44100))
-        _fp = self.file_panel
-        taps_val = int(_RESAMPLE_TAPS[_fp.resample_taps_idx if _fp else 3])
-        prec_val = _RESAMPLE_PRECISIONS[_fp.resample_precision_idx if _fp else 2]
+        taps_val = int(_RESAMPLE_TAPS[self.resample_taps_idx])
+        prec_val = _RESAMPLE_PRECISIONS[self.resample_precision_idx]
         self.synth = ViewportSynthPlayer(sr_val, hop_val, bpo_val,
-                                         fs_val, win_val, taps_val, prec_val,
-                                         fmin=fmin_val,
-                                         cqt_bpo_schedule=bpo_sched,
-                                         cqt_hop_schedule=hop_sched,
-                                         cqt_filter_scale_schedule=fs_sched)
+                                         taps_val, prec_val)
 
         pygame.display.set_caption(
             f"Spectrogram Viewer \u2014 {os.path.basename(folder_path)}")
@@ -11722,8 +11280,7 @@ class SpectrogramViewer:
             return False
         sr = int(self._npz["sr"]) if "sr" in self._npz else 44100
         bpo = int(self._npz["bins_per_octave"]) if "bins_per_octave" in self._npz else 1200
-        hop = int(self._npz["cqt_grid_hop_length"]) if "cqt_grid_hop_length" in self._npz else (
-            int(self._npz["hop_length"]) if "hop_length" in self._npz else 512)
+        hop = int(self._npz["hop_length"]) if "hop_length" in self._npz else 512
         xf = hybrid_crossover_freq(bpo, hop, sr)
         f0 = float(self._freqs[0])
         if f0 < xf * 0.8:
@@ -11738,8 +11295,7 @@ class SpectrogramViewer:
             return False
         sr = int(self._npz["sr"]) if "sr" in self._npz else 44100
         bpo = int(self._npz["bins_per_octave"]) if "bins_per_octave" in self._npz else 1200
-        hop = int(self._npz["cqt_grid_hop_length"]) if "cqt_grid_hop_length" in self._npz else (
-            int(self._npz["hop_length"]) if "hop_length" in self._npz else 512)
+        hop = int(self._npz["hop_length"]) if "hop_length" in self._npz else 512
         xf = hybrid_crossover_freq(bpo, hop, sr)
         result = FilterBankDecomposition.load_meta(self.analysis_dir)
         if result is None:
@@ -11758,18 +11314,6 @@ class SpectrogramViewer:
         import subprocess as _sp, sys as _sys
         bpo = int(self._npz["bins_per_octave"]) if "bins_per_octave" in self._npz else 1200
         hop = int(self._npz["hop_length"]) if "hop_length" in self._npz else 512
-        fs = float(self._npz["cqt_filter_scale"]) if "cqt_filter_scale" in self._npz else (
-            self.file_panel.cqt_filter_scale if self.file_panel else 1.0)
-        cqt_window = (str(self._npz["cqt_window"].item())
-                      if "cqt_window" in self._npz else (
-                          _CQT_WINDOWS[self.file_panel.cqt_window_idx]
-                          if self.file_panel else "hann"))
-        bpo_sched = (self._npz["cqt_bpo_schedule"].astype(np.int32).tolist()
-                     if "cqt_bpo_schedule" in self._npz else None)
-        hop_sched = (self._npz["cqt_hop_schedule"].astype(np.int32).tolist()
-                     if "cqt_hop_schedule" in self._npz else None)
-        fs_sched = (self._npz["cqt_filter_scale_schedule"].astype(np.float32).tolist()
-                    if "cqt_filter_scale_schedule" in self._npz else None)
         fmin = self.file_panel.cqt_fmin if self.file_panel else 16.35
         fmax = self.file_panel.cqt_fmax if self.file_panel else 19912.13
         cmd = [
@@ -11777,18 +11321,10 @@ class SpectrogramViewer:
             self.audio_path,
             "--hop-length", str(hop),
             "--bins-per-octave", str(bpo),
-            "--cqt-filter-scale", str(fs),
-            "--cqt-window", cqt_window,
             "--cqt-fmin", str(fmin),
             "--cqt-fmax", str(fmax),
             "--outdir", self.analysis_dir,
         ]
-        if bpo_sched:
-            cmd += ["--cqt-bpo-schedule", json.dumps(bpo_sched)]
-        if hop_sched:
-            cmd += ["--cqt-hop-schedule", json.dumps(hop_sched)]
-        if fs_sched:
-            cmd += ["--cqt-filter-scale-schedule", json.dumps(fs_sched)]
         print(f"Broadening CQT: fmin={fmin:.1f} Hz (full range) ...")
         _sp.check_call(cmd,
                        cwd=os.path.dirname(os.path.abspath(__file__)))
@@ -11815,11 +11351,11 @@ class SpectrogramViewer:
         ftype_idx = self.file_panel.fb_filter_type_idx if self.file_panel else 0
         ftype = _FILTER_TYPES[ftype_idx]
         bpo = self.file_panel.fb_bpo if self.file_panel else 12
-        anchor = self.file_panel.cafls_anchor if self.file_panel else 30.87
-        banded_width = self.file_panel.fb_banded_width if self.file_panel else 3
-        print(f"Broadening FB: CAFLS anchor={anchor:.2f} Hz, banded±{banded_width} oct ...")
-        bands = FilterBankDecomposition.bands_from_cafls(
-            anchor, bpo, banded_width, sr_file)
+        fmin = self.file_panel.fb_fmin if self.file_panel else 16.35
+        fmax = self.file_panel.fb_fmax if self.file_panel else 19912.13
+        print(f"Broadening FB: {fmin:.1f}-{fmax:.1f} Hz (full range) ...")
+        bands = FilterBankDecomposition.bands_from_log_spacing(
+            bpo, fmin, fmax, sr_file)  # no ceiling
         fb = FilterBankDecomposition(sr_file, ftype)
         fb.compute_and_save(mono, bands, self.analysis_dir, sr_file,
                             wav_path=self.audio_path)
@@ -13121,122 +12657,113 @@ class SpectrogramViewer:
             glEnd()
 
             # Floating control panel anchored below the region
-            try:
-                panel_result = self._build_region_panel()
-                if panel_result is not None:
-                    psurf, hitboxes = panel_result
-                    pw, ph = psurf.get_size()
-                    # Position: centred horizontally under the region, clamped to window
-                    pcx = (sx0 + sx1) // 2 - pw // 2
-                    pcy = sy1 + 4
-                    if pcy + ph > self.win_h:
-                        pcy = sy0 - ph - 4  # above if no room below
-                    pcx = max(0, min(pcx, self.win_w - pw))
-                    pcy = max(0, min(pcy, self.win_h - ph))
-                    self._region_panel_rect = pygame.Rect(pcx, pcy, pw, ph)
-                    self._region_hitboxes = hitboxes
+            panel_result = self._build_region_panel()
+            if panel_result is not None:
+                psurf, hitboxes = panel_result
+                pw, ph = psurf.get_size()
+                # Position: centred horizontally under the region, clamped to window
+                pcx = (sx0 + sx1) // 2 - pw // 2
+                pcy = sy1 + 4
+                if pcy + ph > self.win_h:
+                    pcy = sy0 - ph - 4  # above if no room below
+                pcx = max(0, min(pcx, self.win_w - pw))
+                pcy = max(0, min(pcy, self.win_h - ph))
+                self._region_panel_rect = pygame.Rect(pcx, pcy, pw, ph)
+                self._region_hitboxes = hitboxes
 
-                    tex = self._upload_pygame_surface(psurf)
-                    px0 = 2.0 * pcx / self.win_w - 1.0
-                    px1 = 2.0 * (pcx + pw) / self.win_w - 1.0
-                    py1 = 1.0 - 2.0 * pcy / self.win_h
-                    py0 = 1.0 - 2.0 * (pcy + ph) / self.win_h
+                tex = self._upload_pygame_surface(psurf)
+                px0 = 2.0 * pcx / self.win_w - 1.0
+                px1 = 2.0 * (pcx + pw) / self.win_w - 1.0
+                py1 = 1.0 - 2.0 * pcy / self.win_h
+                py0 = 1.0 - 2.0 * (pcy + ph) / self.win_h
 
-                    glEnable(GL_TEXTURE_2D)
-                    glBindTexture(GL_TEXTURE_2D, tex)
-                    glColor4f(1.0, 1.0, 1.0, 1.0)
-                    glBegin(GL_QUADS)
-                    glTexCoord2f(0, 0); glVertex2f(px0, py0)
-                    glTexCoord2f(1, 0); glVertex2f(px1, py0)
-                    glTexCoord2f(1, 1); glVertex2f(px1, py1)
-                    glTexCoord2f(0, 1); glVertex2f(px0, py1)
-                    glEnd()
-                    glDisable(GL_TEXTURE_2D)
-            except (pygame.error, MemoryError):
-                pass
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, tex)
+                glColor4f(1.0, 1.0, 1.0, 1.0)
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 0); glVertex2f(px0, py0)
+                glTexCoord2f(1, 0); glVertex2f(px1, py0)
+                glTexCoord2f(1, 1); glVertex2f(px1, py1)
+                glTexCoord2f(0, 1); glVertex2f(px0, py1)
+                glEnd()
+                glDisable(GL_TEXTURE_2D)
 
         # --- GUI panels (dock) ---
         if self.dock:
             for panel in self.dock.panels_visible():
-                try:
-                    panel_surf = panel.render()
-                    if not panel_surf:
-                        continue
-                    dd_surf = panel.render_dropdown_overlay()
-                    if dd_surf and hasattr(panel, "_active_dropdown") and panel._active_dropdown:
-                        dr = panel._dropdown_rect
-                        panel_surf.blit(dd_surf, (dr.x, dr.y))
+                panel_surf = panel.render()
+                if not panel_surf:
+                    continue
+                dd_surf = panel.render_dropdown_overlay()
+                if dd_surf and hasattr(panel, "_active_dropdown") and panel._active_dropdown:
+                    dr = panel._dropdown_rect
+                    panel_surf.blit(dd_surf, (dr.x, dr.y))
 
-                    # Clip to available panel height with scroll offset
-                    panel_surf = panel._apply_panel_scroll(panel_surf)
+                # Clip to available panel height with scroll offset
+                panel_surf = panel._apply_panel_scroll(panel_surf)
 
-                    tex = self._upload_pygame_surface(panel_surf)
-                    pw, ph = panel_surf.get_size()
-                    pr = panel.panel_rect
-                    px0 = 2.0 * pr.x / self.win_w - 1.0
-                    px1 = 2.0 * (pr.x + pw) / self.win_w - 1.0
-                    py1 = 1.0 - 2.0 * pr.y / self.win_h
-                    py0 = py1 - 2.0 * ph / self.win_h
+                tex = self._upload_pygame_surface(panel_surf)
+                pw, ph = panel_surf.get_size()
+                pr = panel.panel_rect
+                px0 = 2.0 * pr.x / self.win_w - 1.0
+                px1 = 2.0 * (pr.x + pw) / self.win_w - 1.0
+                py1 = 1.0 - 2.0 * pr.y / self.win_h
+                py0 = py1 - 2.0 * ph / self.win_h
 
-                    glEnable(GL_TEXTURE_2D)
-                    glBindTexture(GL_TEXTURE_2D, tex)
-                    glColor4f(1, 1, 1, 1)
-                    glBegin(GL_QUADS)
-                    glTexCoord2f(0, 0); glVertex2f(px0, py0)
-                    glTexCoord2f(1, 0); glVertex2f(px1, py0)
-                    glTexCoord2f(1, 1); glVertex2f(px1, py1)
-                    glTexCoord2f(0, 1); glVertex2f(px0, py1)
-                    glEnd()
-                    glDisable(GL_TEXTURE_2D)
-                except (pygame.error, MemoryError):
-                    pass
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, tex)
+                glColor4f(1, 1, 1, 1)
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 0); glVertex2f(px0, py0)
+                glTexCoord2f(1, 0); glVertex2f(px1, py0)
+                glTexCoord2f(1, 1); glVertex2f(px1, py1)
+                glTexCoord2f(0, 1); glVertex2f(px0, py1)
+                glEnd()
+                glDisable(GL_TEXTURE_2D)
 
         # --- Menu bar ---
         if self.menu_bar and self.menu_bar.visible:
-            try:
-                bar_surf = self.menu_bar.render(self.win_w)
-                if bar_surf:
-                    tex = self._upload_pygame_surface(bar_surf)
-                    bw, bh = bar_surf.get_size()
-                    # top of screen in GL coords
-                    bx0 = -1.0
-                    bx1 = 1.0
-                    by1 = 1.0
-                    by0 = 1.0 - 2.0 * bh / self.win_h
+            bar_surf = self.menu_bar.render(self.win_w)
+            if bar_surf:
+                tex = self._upload_pygame_surface(bar_surf)
+                bw, bh = bar_surf.get_size()
+                # top of screen in GL coords
+                bx0 = -1.0
+                bx1 = 1.0
+                by1 = 1.0
+                by0 = 1.0 - 2.0 * bh / self.win_h
 
-                    glEnable(GL_TEXTURE_2D)
-                    glBindTexture(GL_TEXTURE_2D, tex)
-                    glColor4f(1, 1, 1, 1)
-                    glBegin(GL_QUADS)
-                    glTexCoord2f(0, 1); glVertex2f(bx0, by1)
-                    glTexCoord2f(1, 1); glVertex2f(bx1, by1)
-                    glTexCoord2f(1, 0); glVertex2f(bx1, by0)
-                    glTexCoord2f(0, 0); glVertex2f(bx0, by0)
-                    glEnd()
-                    glDisable(GL_TEXTURE_2D)
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, tex)
+                glColor4f(1, 1, 1, 1)
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 1); glVertex2f(bx0, by1)
+                glTexCoord2f(1, 1); glVertex2f(bx1, by1)
+                glTexCoord2f(1, 0); glVertex2f(bx1, by0)
+                glTexCoord2f(0, 0); glVertex2f(bx0, by0)
+                glEnd()
+                glDisable(GL_TEXTURE_2D)
 
-                dd_surf = self.menu_bar.render_dropdown()
-                if dd_surf:
-                    dr = self.menu_bar.dropdown_screen_rect
-                    tex = self._upload_pygame_surface(dd_surf)
-                    dw, dh = dd_surf.get_size()
-                    dx0 = -1.0 + 2.0 * dr.x / self.win_w
-                    dx1 = dx0 + 2.0 * dw / self.win_w
-                    dy1 = 1.0 - 2.0 * dr.y / self.win_h
-                    dy0 = dy1 - 2.0 * dh / self.win_h
+            dd_surf = self.menu_bar.render_dropdown()
+            if dd_surf:
+                dr = self.menu_bar.dropdown_screen_rect
+                tex = self._upload_pygame_surface(dd_surf)
+                dw, dh = dd_surf.get_size()
+                dx0 = -1.0 + 2.0 * dr.x / self.win_w
+                dx1 = dx0 + 2.0 * dw / self.win_w
+                dy1 = 1.0 - 2.0 * dr.y / self.win_h
+                dy0 = dy1 - 2.0 * dh / self.win_h
 
-                    glEnable(GL_TEXTURE_2D)
-                    glBindTexture(GL_TEXTURE_2D, tex)
-                    glColor4f(1, 1, 1, 1)
-                    glBegin(GL_QUADS)
-                    glTexCoord2f(0, 1); glVertex2f(dx0, dy1)
-                    glTexCoord2f(1, 1); glVertex2f(dx1, dy1)
-                    glTexCoord2f(1, 0); glVertex2f(dx1, dy0)
-                    glTexCoord2f(0, 0); glVertex2f(dx0, dy0)
-                    glEnd()
-                    glDisable(GL_TEXTURE_2D)
-            except (pygame.error, MemoryError):
-                pass
+                glEnable(GL_TEXTURE_2D)
+                glBindTexture(GL_TEXTURE_2D, tex)
+                glColor4f(1, 1, 1, 1)
+                glBegin(GL_QUADS)
+                glTexCoord2f(0, 1); glVertex2f(dx0, dy1)
+                glTexCoord2f(1, 1); glVertex2f(dx1, dy1)
+                glTexCoord2f(1, 0); glVertex2f(dx1, dy0)
+                glTexCoord2f(0, 0); glVertex2f(dx0, dy0)
+                glEnd()
+                glDisable(GL_TEXTURE_2D)
 
         # --- HUD ---
         self._render_hud()
@@ -13457,10 +12984,8 @@ class SpectrogramViewer:
             # ── CWT format ──
             W_real = npz["W_real"]
             W_imag = npz["W_imag"]
-            # Flip so row 0 = largest scale (lowest freq) → sits at texture
-            # bottom → screen bottom, consistent with CQT low-freq-at-bottom.
-            self._wv_W = np.flipud(W_real + 1j * W_imag)
-            self._wv_freqs = npz["freqs"][::-1]
+            self._wv_W = W_real + 1j * W_imag
+            self._wv_freqs = npz["freqs"]
             self._wv_coeffs = []  # clear DWT data
             self._wv_meta = meta
             self._wv_n_levels = self._wv_W.shape[0]  # n_scales
@@ -14423,23 +13948,13 @@ class SpectrogramViewer:
             min_gap = 14
             shown_levels: list[tuple[int, float, str]] = []
             last_screen_y = -999.0
-            _cwt_freqs = self._wv_freqs  # None for DWT, (n_scales,) for CWT
             for i in range(n_levels):
                 level_centre = float(i) + 0.5
                 if not (self.view_y0 <= level_centre <= self.view_y1):
                     continue
                 scr_y = bin_to_sy(level_centre)
                 if abs(scr_y - last_screen_y) >= min_gap:
-                    if _cwt_freqs is not None and i < len(_cwt_freqs):
-                        # CWT: label with actual scale frequency
-                        f = float(_cwt_freqs[i])
-                        if f < 1.0:
-                            lbl = f"{f:.3f}Hz"
-                        elif f < 10.0:
-                            lbl = f"{f:.2f}Hz"
-                        else:
-                            lbl = f"{f:.1f}Hz"
-                    elif i == 0:
+                    if i == 0:
                         lbl = "Approx"
                     else:
                         lbl = f"D{i}"

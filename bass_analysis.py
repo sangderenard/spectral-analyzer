@@ -34,7 +34,7 @@ import json
 import math
 import os
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -50,6 +50,24 @@ except ImportError:
 
 EPS = 1e-12
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+
+
+def _parse_schedule_arg(raw: str | None, *, integer: bool) -> list[int] | list[float] | None:
+    """Parse a JSON list CLI schedule argument."""
+    if not raw:
+        return None
+    data = json.loads(raw)
+    if not isinstance(data, list):
+        raise ValueError("schedule arguments must be JSON lists")
+    if integer:
+        return [int(round(float(v))) for v in data]
+    return [float(v) for v in data]
+
+
+def _schedule_hashable(values: Sequence[int | float] | None) -> list[int | float] | None:
+    if values is None:
+        return None
+    return [float(v) if isinstance(v, float) else int(v) for v in values]
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +86,11 @@ def settings_hash(cfg: "AnalysisConfig", composite_spec: str | None = None,
     canonical = {
         "hop_length": cfg.hop_length,
         "bins_per_octave": cfg.bins_per_octave,
+        "cqt_filter_scale": round(cfg.cqt_filter_scale, 4),
+        "cqt_window": cfg.cqt_window,
+        "cqt_bpo_schedule": _schedule_hashable(cfg.cqt_bpo_schedule),
+        "cqt_hop_schedule": _schedule_hashable(cfg.cqt_hop_schedule),
+        "cqt_filter_scale_schedule": _schedule_hashable(cfg.cqt_filter_scale_schedule),
         "cqt_fmin": round(cfg.cqt_fmin, 4),
         "cqt_fmax": round(cfg.cqt_fmax, 4),
         "bass_min": round(cfg.bass_min, 4),
@@ -97,6 +120,12 @@ def settings_hash(cfg: "AnalysisConfig", composite_spec: str | None = None,
 class AnalysisConfig:
     hop_length: int = 512           # CQT hop in samples (~11.6 ms at 44.1 kHz)
     bins_per_octave: int = 1200     # 1 cent per bin
+    cqt_filter_scale: float = 1.0   # librosa/torch CQT filter_scale (Q multiplier)
+    cqt_window: str = "hann"
+    cqt_bpo_schedule: list[int] | None = None
+    cqt_hop_schedule: list[int] | None = None
+    cqt_filter_scale_schedule: list[float] | None = None
+    cqt_grid_hop_length: int | None = None  # derived common frame step for scheduled CQT
     cqt_fmin: float = 16.35        # lowest CQT bin — C0, lowest piano/organ note
     cqt_fmax: float = 20000.0      # highest CQT bin (capped at Nyquist)
     # fmin can go as low as ~1 Hz without breaking librosa; the only hard
@@ -134,6 +163,16 @@ def parse_args() -> argparse.Namespace:
                         help="CQT hop length in samples (default 512)")
     parser.add_argument("--bins-per-octave", type=int, default=1200,
                         help="CQT bins per octave; 1200 = 1 cent/bin (default 1200)")
+    parser.add_argument("--cqt-filter-scale", type=float, default=1.0,
+                        help="CQT filter_scale / Q multiplier (default 1.0).")
+    parser.add_argument("--cqt-window", type=str, default="hann",
+                        help="CQT window family (hann, hamming, blackman, blackmanharris).")
+    parser.add_argument("--cqt-bpo-schedule", type=str, default=None,
+                        help="JSON list of per-octave CQT bins-per-octave values.")
+    parser.add_argument("--cqt-hop-schedule", type=str, default=None,
+                        help="JSON list of per-octave CQT decimated hop values.")
+    parser.add_argument("--cqt-filter-scale-schedule", type=str, default=None,
+                        help="JSON list of per-octave CQT filter_scale values.")
     parser.add_argument("--cqt-fmin", type=float, default=16.35,
                         help="Lowest CQT frequency in Hz (default 16.35 = C0). "
                              "Can go as low as ~1 Hz; 0 is undefined. "
@@ -259,13 +298,37 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
       power       – magnitude squared,         shape (n_bins, n_frames)  float32
       cqt_complex – complex CQT coefficients,  shape (n_bins, n_frames)  complex64
     """
-    from torch_cqt_new import cqt as _torch_cqt
+    from torch_cqt_new import (
+        ExplicitOctaveSchedule,
+        _common_hop_and_strides,
+        cqt as _torch_cqt,
+    )
 
     if cfg.cqt_fmin <= 0:
         raise ValueError(f"--cqt-fmin must be > 0 Hz (got {cfg.cqt_fmin}); try 5 for infrasonic sub-bass.")
     fmax = min(cfg.cqt_fmax, sr / 2.0 * 0.95)
-    n_bins = int(math.floor(cfg.bins_per_octave * math.log2(fmax / cfg.cqt_fmin)))
+    sched_octaves = max(
+        [len(v) for v in (
+            cfg.cqt_bpo_schedule,
+            cfg.cqt_hop_schedule,
+            cfg.cqt_filter_scale_schedule,
+        ) if v],
+        default=0,
+    )
+    if cfg.cqt_bpo_schedule:
+        n_bins = sum(cfg.cqt_bpo_schedule)
+    else:
+        n_bins = int(math.floor(
+            cfg.bins_per_octave * math.log2(fmax / cfg.cqt_fmin)))
     hop = cfg.hop_length
+    bpo_func = (ExplicitOctaveSchedule(cfg.cqt_bpo_schedule, integer=True)
+                if cfg.cqt_bpo_schedule else None)
+    hop_func = (ExplicitOctaveSchedule(cfg.cqt_hop_schedule, integer=True)
+                if cfg.cqt_hop_schedule else None)
+    fs_func = (ExplicitOctaveSchedule(cfg.cqt_filter_scale_schedule)
+               if cfg.cqt_filter_scale_schedule else None)
+    n_octaves = (sched_octaves if sched_octaves > 0
+                 else max(1, int(math.ceil(math.log2(max(fmax / cfg.cqt_fmin, 1.001))))))
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     y = torch.as_tensor(np.asarray(x), device=device)
@@ -282,6 +345,11 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
         fmin=cfg.cqt_fmin,
         n_bins=n_bins,
         bins_per_octave=cfg.bins_per_octave,
+        filter_scale=cfg.cqt_filter_scale,
+        window=cfg.cqt_window,
+        bpo_func=bpo_func,
+        hop_func=hop_func,
+        filter_scale_func=fs_func,
         pad_mode="constant" if zero_front else "reflect",
         device=device,
         resample_kw=resample_kw,
@@ -294,7 +362,19 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
     cqt_complex = cqt_np.astype(np.complex64)
 
     n_frames = cqt_complex.shape[-1]
-    times = np.arange(n_frames) * (hop / sr)
+    if cfg.cqt_hop_schedule:
+        dec_hops = cfg.cqt_hop_schedule[:n_octaves]
+        orig_hops: list[int] = []
+        scale = 1
+        for hop_oct in dec_hops:
+            orig_hops.append(int(hop_oct) * scale)
+            if int(hop_oct) % 2 == 0:
+                scale *= 2
+        grid_hop, _ = _common_hop_and_strides(orig_hops)
+    else:
+        grid_hop = hop
+    cfg.cqt_grid_hop_length = int(grid_hop)
+    times = np.arange(n_frames) * (grid_hop / sr)
     return freqs, times, power, cqt_complex
 
 
@@ -394,10 +474,19 @@ def semitone_mask_for_freqs(freqs: np.ndarray, bins_per_octave: int) -> Tuple[np
     A bin is "on a semitone" when it is within half a bin-width of a semitone
     boundary in cent space.
     """
-    cents_per_bin = 1200.0 / bins_per_octave
     midi_frac = 12.0 * np.log2(np.clip(freqs, 1e-9, None) / 440.0) + 69.0
     cents_from_semitone = (midi_frac * 100.0) % 100.0
-    on_semitone = np.minimum(cents_from_semitone, 100.0 - cents_from_semitone) < (cents_per_bin / 2.0)
+    if len(midi_frac) > 1:
+        cents_per_bin = np.empty_like(midi_frac)
+        cents_per_bin[0] = abs((midi_frac[1] - midi_frac[0]) * 100.0)
+        cents_per_bin[-1] = abs((midi_frac[-1] - midi_frac[-2]) * 100.0)
+        if len(midi_frac) > 2:
+            cents_per_bin[1:-1] = abs((midi_frac[2:] - midi_frac[:-2]) * 50.0)
+    else:
+        cents_per_bin = np.full_like(midi_frac, 1200.0 / bins_per_octave)
+    on_semitone = (
+        np.minimum(cents_from_semitone, 100.0 - cents_from_semitone)
+        < (cents_per_bin / 2.0))
     midi_rounded = np.rint(midi_frac).astype(int)
     names: List[str] = [""] * len(freqs)
     for i in np.flatnonzero(on_semitone):
@@ -706,7 +795,10 @@ def write_summary_txt(
         f"Duration: {len(x) / sr:.3f} s",
         f"CQT frames: {len(times)}",
         f"CQT bins/octave: {cfg.bins_per_octave}  ({1200 / cfg.bins_per_octave:.2f} cents/bin)",
-        f"Hop length: {cfg.hop_length} samples  ({cfg.hop_length / sr * 1000:.1f} ms)",
+        f"Hop length: {cfg.cqt_grid_hop_length or cfg.hop_length} samples  "
+        f"({(cfg.cqt_grid_hop_length or cfg.hop_length) / sr * 1000:.1f} ms)",
+        f"CQT Q scale: {cfg.cqt_filter_scale:.3f}",
+        f"CQT window: {cfg.cqt_window}",
         "",
         "Band configuration:",
         f"  Bass band:  {cfg.bass_min:.1f} - {cfg.bass_max:.1f} Hz",
@@ -762,7 +854,13 @@ def _update_manifest(outdir: str, shash: str, cfg: "AnalysisConfig",
         "created": datetime.datetime.now().isoformat(),
         "settings": {
             "hop_length": cfg.hop_length,
+            "cqt_grid_hop_length": cfg.cqt_grid_hop_length,
             "bins_per_octave": cfg.bins_per_octave,
+            "cqt_filter_scale": cfg.cqt_filter_scale,
+            "cqt_window": cfg.cqt_window,
+            "cqt_bpo_schedule": cfg.cqt_bpo_schedule,
+            "cqt_hop_schedule": cfg.cqt_hop_schedule,
+            "cqt_filter_scale_schedule": cfg.cqt_filter_scale_schedule,
             "cqt_fmin": cfg.cqt_fmin,
             "cqt_fmax": cfg.cqt_fmax,
             "bass_min": cfg.bass_min,
@@ -828,6 +926,14 @@ def main() -> None:
     cfg = AnalysisConfig(
         hop_length=args.hop_length,
         bins_per_octave=args.bins_per_octave,
+        cqt_filter_scale=args.cqt_filter_scale,
+        cqt_window=str(args.cqt_window).strip().lower(),
+        cqt_bpo_schedule=_parse_schedule_arg(
+            args.cqt_bpo_schedule, integer=True),
+        cqt_hop_schedule=_parse_schedule_arg(
+            args.cqt_hop_schedule, integer=True),
+        cqt_filter_scale_schedule=_parse_schedule_arg(
+            args.cqt_filter_scale_schedule, integer=False),
         cqt_fmin=args.cqt_fmin,
         cqt_fmax=args.cqt_fmax,
         bass_view_max_freq=args.bass_view_max_freq,
@@ -907,7 +1013,8 @@ def main() -> None:
 
     # --- Onset enhancement (on mono) ---
     print("Computing time-domain onset enhancement...")
-    onset = compute_onset_envelope(x_mono, sr, freqs, cfg.hop_length, len(times))
+    onset = compute_onset_envelope(
+        x_mono, sr, freqs, cfg.cqt_grid_hop_length or cfg.hop_length, len(times))
     power_db = db_power(power_mono)
     per_bin_range = (np.max(power_db, axis=1) - np.min(power_db, axis=1))[:, None]
     boost_db = onset * np.clip(per_bin_range, 0, 6.0)
@@ -944,9 +1051,12 @@ def main() -> None:
         cumsum[0] = 0.0
         np.cumsum(sample_is_pad, out=cumsum[1:])
 
-        Q_val = 1.0 / (2.0 ** (1.0 / cfg.bins_per_octave) - 1.0)
+        alpha = ((2.0 ** (2.0 / cfg.bins_per_octave) - 1.0)
+                 / (2.0 ** (2.0 / cfg.bins_per_octave) + 1.0))
+        Q_val = cfg.cqt_filter_scale / max(alpha, 1e-30)
         kernel_half = np.ceil(Q_val * sr / freqs / 2.0).astype(np.int64)
-        frame_centers = (np.arange(len(times)) * cfg.hop_length).astype(np.int64)
+        grid_hop = cfg.cqt_grid_hop_length or cfg.hop_length
+        frame_centers = (np.arange(len(times)) * grid_hop).astype(np.int64)
 
         n_bins = len(freqs)
         n_frames = len(times)
@@ -971,7 +1081,7 @@ def main() -> None:
         f"  {len(freqs)} bins  ({cents_per_bin:.2f}¢/bin)  "
         f"{n_semitones} semitones  "
         f"{len(times)} frames  "
-        f"hop={cfg.hop_length / sr * 1000:.1f} ms"
+        f"hop={(cfg.cqt_grid_hop_length or cfg.hop_length) / sr * 1000:.1f} ms"
         f"  {'stereo' if is_stereo else 'mono'}"
     )
 
@@ -1026,6 +1136,11 @@ def main() -> None:
         sr=np.int32(sr),
         bins_per_octave=np.int32(cfg.bins_per_octave),
         hop_length=np.int32(cfg.hop_length),
+        cqt_grid_hop_length=np.int32(cfg.cqt_grid_hop_length or cfg.hop_length),
+        cqt_filter_scale=np.float32(cfg.cqt_filter_scale),
+        cqt_window=np.array(cfg.cqt_window),
+        cqt_fmin=np.float32(cfg.cqt_fmin),
+        cqt_fmax=np.float32(cfg.cqt_fmax),
         color_gamma=np.float32(cfg.color_gamma),
         image_dpi=np.int32(cfg.image_dpi),
         seconds_per_inch=np.float32(cfg.seconds_per_inch),
@@ -1040,6 +1155,15 @@ def main() -> None:
         wav_path=np.array(wav_path),
         settings_hash=np.array(shash),
     )
+    if cfg.cqt_bpo_schedule:
+        save_dict["cqt_bpo_schedule"] = np.asarray(
+            cfg.cqt_bpo_schedule, dtype=np.int32)
+    if cfg.cqt_hop_schedule:
+        save_dict["cqt_hop_schedule"] = np.asarray(
+            cfg.cqt_hop_schedule, dtype=np.int32)
+    if cfg.cqt_filter_scale_schedule:
+        save_dict["cqt_filter_scale_schedule"] = np.asarray(
+            cfg.cqt_filter_scale_schedule, dtype=np.float32)
     # Add metrics arrays
     for k, v in metrics.items():
         save_dict[f"metrics_{k}"] = v.astype(np.float32)

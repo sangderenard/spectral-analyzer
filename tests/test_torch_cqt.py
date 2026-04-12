@@ -2,6 +2,7 @@
 import numpy as np
 import torch
 import librosa
+import pytest
 import sys, pathlib
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import torch_cqt_new as torch_cqt
@@ -14,6 +15,23 @@ BPO = 48
 N_BINS = BPO * 8  # 384 bins, 8 octaves
 HOP = 512
 FILTER_SCALE = 1.0
+
+
+class ConstantSchedule:
+    def __init__(self, value, n_octaves):
+        self.value = value
+        self.n_octaves = n_octaves
+
+    def __call__(self, octave_idx, base_value):
+        return self.value
+
+
+class IdentitySchedule:
+    def __init__(self, n_octaves):
+        self.n_octaves = n_octaves
+
+    def __call__(self, octave_idx, base_value):
+        return base_value
 
 def _make_signal():
     """Multi-tone test signal."""
@@ -133,6 +151,74 @@ def test_roundtrip_librosa_comparison():
     print(f"  librosa: corr={corr_lib:.6f}  rms={rms_lib:.6f}")
     print(f"  ours:    corr={corr_ours:.6f}  rms={rms_ours:.6f}")
     print(f"  rms_orig={np.sqrt(np.mean(y**2)):.6f}")
+
+
+def test_constant_schedule_matches_scalar_forward_and_inverse():
+    y = _make_signal()
+    n_octaves = N_BINS // BPO
+    bpo_sched = IdentitySchedule(n_octaves)
+    hop_sched = IdentitySchedule(n_octaves)
+    fs_sched = IdentitySchedule(n_octaves)
+
+    C_scalar, freqs_scalar = torch_cqt.cqt(
+        y, sr=SR, hop_length=HOP, fmin=FMIN,
+        n_bins=N_BINS, bins_per_octave=BPO,
+        filter_scale=FILTER_SCALE,
+        device=torch.device("cpu"),
+    )
+    C_sched, freqs_sched = torch_cqt.cqt(
+        y, sr=SR, hop_length=HOP, fmin=FMIN,
+        n_bins=N_BINS, bins_per_octave=BPO,
+        filter_scale=FILTER_SCALE,
+        bpo_func=bpo_sched,
+        hop_func=hop_sched,
+        filter_scale_func=fs_sched,
+        device=torch.device("cpu"),
+    )
+
+    assert np.allclose(freqs_scalar.cpu().numpy(), freqs_sched.cpu().numpy())
+    assert np.allclose(C_scalar.cpu().numpy(), C_sched.cpu().numpy(), atol=1e-5, rtol=1e-5)
+
+    y_scalar = torch_cqt.icqt(
+        C_scalar, sr=SR, hop_length=HOP, fmin=FMIN,
+        bins_per_octave=BPO, filter_scale=FILTER_SCALE,
+        length=len(y), device=torch.device("cpu"),
+    )
+    y_sched = torch_cqt.icqt(
+        C_sched, sr=SR, hop_length=HOP, fmin=FMIN,
+        bins_per_octave=BPO, filter_scale=FILTER_SCALE,
+        bpo_func=bpo_sched,
+        hop_func=hop_sched,
+        filter_scale_func=fs_sched,
+        length=len(y), device=torch.device("cpu"),
+    )
+
+    assert np.allclose(y_scalar.cpu().numpy(), y_sched.cpu().numpy(), atol=1e-5, rtol=1e-5)
+
+
+@pytest.mark.parametrize("window", ["hann", "hamming", "blackmanharris"])
+def test_forward_and_inverse_accept_custom_windows(window):
+    y = _make_signal()
+    C, freqs = torch_cqt.cqt(
+        y, sr=SR, hop_length=HOP, fmin=FMIN,
+        n_bins=N_BINS, bins_per_octave=BPO,
+        filter_scale=FILTER_SCALE,
+        window=window,
+        device=torch.device("cpu"),
+    )
+
+    y_hat = torch_cqt.icqt(
+        C, sr=SR, hop_length=HOP, fmin=FMIN,
+        bins_per_octave=BPO, filter_scale=FILTER_SCALE,
+        window=window,
+        length=len(y), device=torch.device("cpu"),
+    )
+
+    assert freqs.shape == (N_BINS,)
+    assert C.shape[0] == N_BINS
+    assert y_hat.shape[-1] == len(y)
+    assert np.isfinite(C.cpu().numpy()).all()
+    assert np.isfinite(y_hat.cpu().numpy()).all()
 
 
 if __name__ == "__main__":

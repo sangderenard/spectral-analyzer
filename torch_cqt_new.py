@@ -15,7 +15,8 @@ import numpy as np
 import torch
 import torchaudio.functional as TAF
 from dataclasses import dataclass, field
-from typing import Callable, Protocol, TypedDict, runtime_checkable
+from math import gcd
+from typing import Callable, Protocol, Sequence, TypedDict, runtime_checkable
 
 # ── Progress observation ─────────────────────────────────────────────────
 
@@ -109,8 +110,15 @@ class CQTProgressCallback(Protocol):
 # librosa.note_to_hz("C1")
 _C1_HZ = 32.70319566257483
 
-# librosa.filters.WINDOW_BANDWIDTHS["hann"]
-_HANN_BANDWIDTH = 1.50018310546875
+# librosa.filters.WINDOW_BANDWIDTHS (subset mirrored locally)
+_WINDOW_BANDWIDTHS: dict[str, float] = {
+    "hann": 1.50018310546875,
+    "hamming": 1.3629455320350348,
+    "blackman": 1.7269681554262326,
+    "blackmanharris": 2.0045975283585014,
+}
+_HANN_BANDWIDTH = _WINDOW_BANDWIDTHS["hann"]
+_CQT_WINDOWS: tuple[str, ...] = tuple(_WINDOW_BANDWIDTHS.keys())
 
 
 # ── Dtype helpers ────────────────────────────────────────────────────────
@@ -144,6 +152,24 @@ def _to_float(dtype: torch.dtype) -> torch.dtype:
     if dtype.is_floating_point:
         return dtype
     raise ValueError(f"No float counterpart for {dtype}")
+
+
+def _canonical_cqt_window(window: str) -> str:
+    key = str(window).strip().lower().replace("_", "").replace("-", "")
+    aliases = {
+        "bh": "blackmanharris",
+        "blackharris": "blackmanharris",
+    }
+    key = aliases.get(key, key)
+    if key not in _WINDOW_BANDWIDTHS:
+        raise ValueError(
+            f"Unsupported CQT window {window!r}. "
+            f"Expected one of {sorted(_WINDOW_BANDWIDTHS)}")
+    return key
+
+
+def _window_bandwidth(window: str) -> float:
+    return _WINDOW_BANDWIDTHS[_canonical_cqt_window(window)]
 
 
 # ── Pad ──────────────────────────────────────────────────────────────────
@@ -248,20 +274,65 @@ def _wavelet_lengths(
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Window function — matching scipy.signal.get_window("hann", n)
+# Window functions — matching scipy.signal.get_window(..., fftbins=True)
 # ══════════════════════════════════════════════════════════════════════════
 
-def _hann_window(n: int, device: torch.device,
-                 dtype: torch.dtype = torch.float64) -> torch.Tensor:
-    """Hann window matching ``scipy.signal.get_window('hann', n)``.
+def _periodic_window(
+    n: int,
+    window: str,
+    device: torch.device,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Periodic window matching ``scipy.signal.get_window(..., fftbins=True)``.
 
-    scipy uses: w[k] = 0.5 * (1 - cos(2*pi*k / N))   (denominator = N)
-    torch hann_window(periodic=True) uses the same formula.
-    torch hann_window(periodic=False) uses denominator = N-1 (WRONG for us).
+    This is the window family used by librosa's CQT wavelet builder.
     """
-    # periodic=True gives denominator=N, matching scipy
-    return torch.hann_window(n, periodic=True, dtype=dtype,
-                             device=device)
+    if n <= 0:
+        return torch.empty(0, dtype=dtype, device=device)
+    if n == 1:
+        return torch.ones(1, dtype=dtype, device=device)
+    key = _canonical_cqt_window(window)
+    k = torch.arange(n, dtype=dtype, device=device)
+    phase = 2.0 * math.pi * k / float(n)
+    cos1 = torch.cos(phase)
+    if key == "hann":
+        return 0.5 - 0.5 * cos1
+    if key == "hamming":
+        return 0.54 - 0.46 * cos1
+    if key == "blackman":
+        return 0.42 - 0.5 * cos1 + 0.08 * torch.cos(2.0 * phase)
+    if key == "blackmanharris":
+        return (0.35875
+                - 0.48829 * cos1
+                + 0.14128 * torch.cos(2.0 * phase)
+                - 0.01168 * torch.cos(3.0 * phase))
+    raise AssertionError(f"Unhandled CQT window {window!r}")
+
+
+def _periodic_window_bank(
+    col: torch.Tensor,
+    n_vals: torch.Tensor,
+    window: str,
+) -> torch.Tensor:
+    """Vectorized periodic window bank for varying integer lengths."""
+    key = _canonical_cqt_window(window)
+    phase = 2.0 * math.pi * col / n_vals
+    cos1 = torch.cos(phase)
+    ones = torch.ones_like(cos1)
+    if key == "hann":
+        out = 0.5 - 0.5 * cos1
+    elif key == "hamming":
+        out = 0.54 - 0.46 * cos1
+    elif key == "blackman":
+        out = 0.42 - 0.5 * cos1 + 0.08 * torch.cos(2.0 * phase)
+    elif key == "blackmanharris":
+        out = (0.35875
+               - 0.48829 * cos1
+               + 0.14128 * torch.cos(2.0 * phase)
+               - 0.01168 * torch.cos(3.0 * phase))
+    else:
+        raise AssertionError(f"Unhandled CQT window {window!r}")
+    return torch.where(n_vals <= 1.0, ones, out)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -272,6 +343,7 @@ def _hann_window(n: int, device: torch.device,
 def _wavelet(
     freqs: torch.Tensor,
     sr: float,
+    window: str = "hann",
     filter_scale: float = 1.0,
     alpha: torch.Tensor | None = None,
     device: torch.device | None = None,
@@ -306,7 +378,7 @@ def _wavelet(
         # floor(ilen) samples of real window, zero-pad to ceil(ilen)
         n_min = int(math.floor(ilen))
         n_max = int(math.ceil(ilen))
-        win = _hann_window(n_min, device, dtype=dtype)
+        win = _periodic_window(n_min, window, device, dtype=dtype)
         if n_max > n_min:
             win = _pad(win, 0, n_max - n_min, mode="constant")
         # Set any samples beyond floor(ilen) to zero (librosa does window[n_min:] = 0)
@@ -340,6 +412,7 @@ def _wavelet(
 def _vqt_filter_fft(
     sr: float,
     freqs: torch.Tensor,
+    window: str,
     filter_scale: float,
     hop_length: int,
     alpha: torch.Tensor,
@@ -356,7 +429,7 @@ def _vqt_filter_fft(
     """
     # Step 1: build time-domain basis via wavelet()
     basis, lengths = _wavelet(
-        freqs, sr, filter_scale=filter_scale,
+        freqs, sr, window=window, filter_scale=filter_scale,
         alpha=alpha, device=device, dtype=dtype)
 
     n_fft = basis.shape[1]
@@ -481,6 +554,7 @@ def _build_wavelet_sub(
     lengths: torch.Tensor,
     n_fft: int,
     sr: float,
+    window: str,
     device: torch.device,
     dtype: torch.dtype,
     progress: CQTProgress | None = None,
@@ -518,7 +592,7 @@ def _build_wavelet_sub(
             del phase
 
             n_vals = int_lens.unsqueeze(1).to(dtype)
-            win = 0.5 * (1.0 - torch.cos(2.0 * math.pi * col / n_vals))
+            win = _periodic_window_bank(col, n_vals, window)
             win = win * mask
             sig = sig * win
             del t, win, col, mask, n_vals
@@ -574,6 +648,7 @@ def _build_wavelet_batch(
     lengths: torch.Tensor,
     n_fft: int,
     sr: float,
+    window: str,
     device: torch.device,
     dtype: torch.dtype,
     batch_size: int = 64,
@@ -588,7 +663,7 @@ def _build_wavelet_batch(
     Returns (B, n_fft//2+1) complex on *device*.
     """
     return _build_wavelet_sub(
-        batch_size, freqs, lengths, n_fft, sr, device, dtype,
+        batch_size, freqs, lengths, n_fft, sr, window, device, dtype,
         progress=progress, on_progress=on_progress)
 
 
@@ -600,6 +675,7 @@ def _cqt_response_streaming(
     lengths: torch.Tensor,
     my_sr: float,
     full_sr: float,
+    window: str,
     filter_scale: float,
     pad_mode: str,
     device: torch.device,
@@ -649,7 +725,7 @@ def _cqt_response_streaming(
         try:
             fft_rows = _build_wavelet_batch(
                 freqs[f_start:f_end], lengths[f_start:f_end],
-                n_fft, my_sr, device, dtype, batch_size=f_bs,
+                n_fft, my_sr, window, device, dtype, batch_size=f_bs,
                 progress=progress, on_progress=on_progress)
             fft_rows = fft_rows * sr_scale
 
@@ -827,6 +903,61 @@ def _trim_stack(
 # Must return an int.
 OctaveBPOFunc = Callable[[int, int], int]
 OctaveHopFunc = Callable[[int, int], int]
+OctaveFloatFunc = Callable[[int, float], float]
+
+
+class ExplicitOctaveSchedule:
+    """Serializable explicit per-octave schedule callable."""
+
+    def __init__(self, values: Sequence[int | float], *,
+                 integer: bool = False) -> None:
+        self._values = [int(v) if integer else float(v) for v in values]
+        self._integer = integer
+        self.n_octaves = len(self._values)
+
+    def __call__(self, octave_idx: int,
+                 base_value: int | float) -> int | float:
+        if 0 <= octave_idx < len(self._values):
+            val = self._values[octave_idx]
+        else:
+            val = base_value
+        return int(round(val)) if self._integer else float(val)
+
+    def to_list(self) -> list[int | float]:
+        return list(self._values)
+
+
+def _schedule_n_octaves(*funcs: object) -> int | None:
+    """Return the first explicit schedule length advertised by a callable."""
+    for func in funcs:
+        n_octaves = getattr(func, "n_octaves", None)
+        if isinstance(n_octaves, int) and n_octaves > 0:
+            return n_octaves
+    return None
+
+
+def _common_hop_and_strides(hops_in_samples: Sequence[int]) -> tuple[int, list[int]]:
+    """Compute a common time-grid step and per-octave strides."""
+    common = 0
+    for hop in hops_in_samples:
+        common = hop if common == 0 else gcd(common, int(hop))
+    common = max(common, 1)
+    strides = [max(1, int(hop) // common) for hop in hops_in_samples]
+    return common, strides
+
+
+def _expand_octave_time_grid(
+    octave_resp: torch.Tensor,
+    stride: int,
+    common_cols: int,
+) -> torch.Tensor:
+    """Sample-and-hold expand an octave response onto a common time grid."""
+    if stride <= 1:
+        return octave_resp[..., :common_cols]
+    n_src = 1 + max(0, (common_cols - 1) // stride)
+    trimmed = octave_resp[..., :n_src]
+    expanded = trimmed.repeat_interleave(stride, dim=-1)
+    return expanded[..., :common_cols]
 
 
 def _build_variable_freq_grid(
@@ -884,8 +1015,10 @@ def fidelity_curve(
     fmax: float = 20000.0,
     bins_per_octave: int = 12,
     filter_scale: float = 1.0,
+    window: str = "hann",
     bpo_func: OctaveBPOFunc | None = None,
     hop_func: OctaveHopFunc | None = None,
+    filter_scale_func: OctaveFloatFunc | None = None,
 ) -> dict[str, np.ndarray]:
     """Compute the time-frequency fidelity curve for given CQT parameters.
 
@@ -902,11 +1035,17 @@ def fidelity_curve(
     bins_per_octave : int
         Base BPO (may be overridden per-octave by *bpo_func*).
     filter_scale : float
-        CQT filter scale.
+        CQT filter scale (Q multiplier).  May be overridden per-octave by
+        *filter_scale_func*.
+    window : str
+        Window family used by the CQT basis.  Affects the effective
+        frequency-domain main-lobe width.
     bpo_func : callable(octave_index, base_bpo) → int, optional
         Per-octave BPO override.
     hop_func : callable(octave_index, base_hop) → int, optional
         Per-octave hop override.
+    filter_scale_func : callable(octave_index, base_filter_scale) → float, optional
+        Per-octave filter scale override.  Same signature as hop_func.
 
     Returns
     -------
@@ -923,6 +1062,8 @@ def fidelity_curve(
         conf_temporal  : (N,) float — envelope Nyquist margin (clamped 0–1)
         conf_nyquist   : (N,) float — proximity to Nyquist (clamped 0–1)
     """
+    window = _canonical_cqt_window(window)
+    window_bw = _window_bandwidth(window)
     n_octaves = max(1, int(math.ceil(math.log2(max(fmax / fmin, 1.001)))))
 
     # Per-octave BPO
@@ -944,19 +1085,26 @@ def fidelity_curve(
             h_oct = decimated_hop
         hop_list.append(h_oct)
 
+    # Per-octave filter scale
+    if filter_scale_func is not None:
+        fs_list: list[float] = [filter_scale_func(i, filter_scale)
+                                 for i in range(n_octaves)]
+    else:
+        fs_list = [filter_scale] * n_octaves
+
     freqs_list: list[float] = []
     dt_list: list[float] = []
     df_list: list[float] = []
     oct_idx_list: list[int] = []
     frame_dt_list: list[float] = []
     q_list: list[float] = []
-    frame_dt_list: list[float] = []
     support_dt_list: list[float] = []
 
     for j_bottom in range(n_octaves):
         oct_top_idx = n_octaves - 1 - j_bottom  # 0 = top
         bpo = bpo_list[oct_top_idx]
         hop = hop_list[oct_top_idx]
+        fs  = fs_list[oct_top_idx]
         oct_lo = fmin * (2.0 ** j_bottom)
 
         # Effective sr after decimation
@@ -967,8 +1115,8 @@ def fidelity_curve(
             if f > fmax:
                 break
             alpha = _alpha_from_bpo(bpo)
-            Q = filter_scale / max(alpha, 1e-30)
-            delta_f = f * alpha
+            Q = fs / max(alpha, 1e-30)
+            delta_f = window_bw * f / max(Q, 1e-30)
 
             # Match the actual basis geometry: the CQT wavelet length is
             # Q * sr / f samples at the octave's effective sample rate.
@@ -1053,6 +1201,8 @@ def fidelity_curve(
         "octave_index": np.array(oct_idx_list, dtype=np.int32),
         "bpo_per_octave": bpo_list,
         "hop_per_octave": hop_list,
+        "filter_scale_per_octave": fs_list,
+        "window": window,
         "Q": q_arr,
         "frame_spacing": frame_dt_arr,
         "filter_support": support_dt_arr,
@@ -1322,6 +1472,7 @@ def fidelity_curve_cwt(
     sigma: float = 6.0,
     bpo_func: OctaveBPOFunc | None = None,
     hop_func: OctaveHopFunc | None = None,
+    sigma_func: OctaveFloatFunc | None = None,
 ) -> dict[str, np.ndarray]:
     """Fidelity / loss-map for a Continuous Wavelet Transform.
 
@@ -1336,9 +1487,11 @@ def fidelity_curve_cwt(
         Per-octave scales-per-octave override.
     hop_func : callable(octave_index, base_hop) → int, optional
         Per-octave hop override.
+    sigma_func : callable(octave_index, base_sigma) → float, optional
+        Per-octave Morlet σ override.  Only applied when wavelet == "morlet".
 
     Returns dict with keys: freqs, delta_t, delta_f, loss_rgb,
-    octave_index, bpo_per_octave, hop_per_octave.
+    octave_index, bpo_per_octave, hop_per_octave, sigma_per_octave.
     """
     if fmax is None:
         fmax = sr / 4.0
@@ -1352,6 +1505,8 @@ def fidelity_curve_cwt(
                 for i in range(n_octaves)]
     hop_list = [hop_func(i, hop_length) if hop_func else hop_length
                 for i in range(n_octaves)]
+    sigma_list: list[float] = [sigma_func(i, sigma) if sigma_func else sigma
+                                for i in range(n_octaves)]
 
     sqrt2 = math.sqrt(2.0)
     two_pi = 2.0 * math.pi
@@ -1360,10 +1515,12 @@ def fidelity_curve_cwt(
     dt_list: list[float] = []
     df_list: list[float] = []
     oct_idx_list: list[int] = []
+    frame_dt_list: list[float] = []
 
     for j in range(n_octaves):
         spo = spo_list[j]
         hop = hop_list[j]
+        sig = sigma_list[j]
         oct_lo = fmin * (2.0 ** j)
         hop_t = hop / sr
 
@@ -1373,8 +1530,8 @@ def fidelity_curve_cwt(
                 break
 
             if wavelet == "morlet":
-                delta_f = f / (sigma * sqrt2)
-                delta_t_filter = sigma / (two_pi * max(f, 1e-30))
+                delta_f = f / (sig * sqrt2)
+                delta_t_filter = sig / (two_pi * max(f, 1e-30))
             elif wavelet == "ricker":
                 delta_f = f / 2.0
                 delta_t_filter = 1.0 / max(f, 1e-30)
@@ -1407,6 +1564,7 @@ def fidelity_curve_cwt(
         "octave_index": np.array(oct_idx_list, dtype=np.int32),
         "bpo_per_octave": spo_list,
         "hop_per_octave": hop_list,
+        "sigma_per_octave": sigma_list,
         "frame_spacing": frame_dt,
     }
 
@@ -1423,6 +1581,7 @@ def cqt(
     n_bins: int = 84,
     bins_per_octave: int = 12,
     filter_scale: float = 1.0,
+    window: str = "hann",
     scale: bool = True,
     pad_mode: str = "constant",
     device: torch.device | None = None,
@@ -1434,6 +1593,7 @@ def cqt(
     n_fft_max: int = 2**20,
     bpo_func: OctaveBPOFunc | None = None,
     hop_func: OctaveHopFunc | None = None,
+    filter_scale_func: OctaveFloatFunc | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Torch clone of ``librosa.cqt`` / ``librosa.vqt`` (gamma=0).
 
@@ -1460,6 +1620,12 @@ def cqt(
     hop_func : callable(octave_index, base_hop) → int, optional
         Per-octave hop-length override.  ``octave_index`` 0 is the top
         octave.  Receives the *current* decimated hop.
+    filter_scale_func : callable(octave_index, base_filter_scale) → float, optional
+        Per-octave filter-scale override.  ``octave_index`` 0 is the top
+        octave.
+    window : str, optional
+        Window family for the CQT basis.  One of ``hann``, ``hamming``,
+        ``blackman``, or ``blackmanharris``.
 
     Returns
     -------
@@ -1474,23 +1640,32 @@ def cqt(
         dtype = y.dtype if y.dtype.is_floating_point else torch.float64
     if fmin is None:
         fmin = _C1_HZ
+    window = _canonical_cqt_window(window)
 
     y_t = y.to(device=device, dtype=dtype)
+
+    schedule_octaves = _schedule_n_octaves(
+        bpo_func, hop_func, filter_scale_func)
 
     # ── Per-octave BPO schedule ──
     if bpo_func is not None:
         # Variable BPO mode: compute octave count from fmin/fmax derived
         # from n_bins and base bpo, then build non-uniform grid.
-        fmax_target = fmin * 2.0 ** (n_bins / bins_per_octave)
-        n_octaves = max(1, int(math.ceil(math.log2(
-            max(fmax_target / fmin, 1.001)))))
+        if schedule_octaves is not None:
+            n_octaves = schedule_octaves
+        else:
+            fmax_target = fmin * 2.0 ** (n_bins / bins_per_octave)
+            n_octaves = max(1, int(math.ceil(math.log2(
+                max(fmax_target / fmin, 1.001)))))
         freqs, bpo_per_oct = _build_variable_freq_grid(
             fmin, n_octaves, bins_per_octave, bpo_func, device, dtype)
         n_bins = len(freqs)
         # Per-octave filter counts (top-down order, matching bpo_per_oct)
         filters_per_oct = list(bpo_per_oct)
     else:
-        n_octaves = int(math.ceil(n_bins / bins_per_octave))
+        n_octaves = (schedule_octaves
+                     if schedule_octaves is not None
+                     else int(math.ceil(n_bins / bins_per_octave)))
         n_filters = min(bins_per_octave, n_bins)
         freqs = _cqt_frequencies(n_bins, fmin, bins_per_octave, device,
                                  dtype=dtype)
@@ -1500,6 +1675,12 @@ def cqt(
         remainder = n_bins - n_filters * (n_octaves - 1)
         if remainder > 0 and n_octaves > 1:
             filters_per_oct[-1] = remainder
+
+    if filter_scale_func is not None:
+        fs_per_oct = [float(filter_scale_func(i, filter_scale))
+                      for i in range(n_octaves)]
+    else:
+        fs_per_oct = [float(filter_scale)] * n_octaves
 
     # ── Guardrails ──
     fmax = freqs[-1].item()
@@ -1519,8 +1700,9 @@ def cqt(
     deepest_sr = sr / (2 ** (n_octaves - 1)) if n_octaves > 1 else sr
     deepest_len = sig_len / (2 ** (n_octaves - 1)) if n_octaves > 1 else sig_len
     bottom_bpo = bpo_per_oct[-1]
-    Q_approx = 1.0 / (2.0 ** (1.0 / bottom_bpo) - 1)
-    wavelet_approx = Q_approx * deepest_sr / (fmin * filter_scale)
+    alpha_bottom = _alpha_from_bpo(bottom_bpo)
+    Q_approx = fs_per_oct[-1] / max(alpha_bottom, 1e-30)
+    wavelet_approx = Q_approx * deepest_sr / max(fmin, 1e-30)
     nfft_approx = 2 ** math.ceil(math.log2(max(1, wavelet_approx)))
     if deepest_len < nfft_approx:
         warnings.warn(
@@ -1552,14 +1734,6 @@ def cqt(
     else:
         alpha = _relative_bandwidth(freqs)
 
-    lengths = _wavelet_lengths(freqs, sr, filter_scale, _HANN_BANDWIDTH, alpha)
-
-    # ── Progress init ──
-    if progress is not None:
-        with progress._lock:
-            progress.n_octaves = n_octaves
-            progress.total_start_time = time.monotonic()
-
     # ── Build per-octave slice schedule (top-down) ──
     # Slices into the freq/alpha/lengths arrays, grouped by octave.
     # freqs is ordered low-to-high.  Octave i=0 is top (highest freq).
@@ -1571,9 +1745,22 @@ def cqt(
         oct_slices.append(slice(start, end))
         end = start
 
+    lengths = torch.empty_like(freqs)
+    for i, sl in enumerate(oct_slices):
+        lengths[sl] = _wavelet_lengths(
+            freqs[sl], sr, fs_per_oct[i], _HANN_BANDWIDTH, alpha[sl])
+
+    # ── Progress init ──
+    if progress is not None:
+        with progress._lock:
+            progress.n_octaves = n_octaves
+            progress.total_start_time = time.monotonic()
+
     # ── Iterate down the octaves ──
     my_y, my_sr, my_hop = y_t, float(sr), hop_length
+    my_scale = 1
     vqt_resp: list[torch.Tensor] = []
+    orig_hops: list[int] = []
 
     for i in range(n_octaves):
         sl = oct_slices[i]
@@ -1584,9 +1771,11 @@ def cqt(
 
         freqs_oct = freqs[sl]
         alpha_oct = alpha[sl]
+        filter_scale_oct = fs_per_oct[i]
+        orig_hops.append(int(my_hop * my_scale))
 
         n_fft, oct_lengths = _compute_n_fft(
-            freqs_oct, my_sr, filter_scale, my_hop, alpha_oct)
+            freqs_oct, my_sr, filter_scale_oct, my_hop, alpha_oct)
 
         # ── Auto-resample gate ──
         oct_y = my_y
@@ -1604,7 +1793,7 @@ def cqt(
                 oct_y = _resample(oct_y, orig_sr=2, target_sr=1,
                                   scale=True, resample_kw=resample_kw)
                 n_fft, oct_lengths = _compute_n_fft(
-                    freqs_oct, oct_sr, filter_scale, oct_hop, alpha_oct)
+                    freqs_oct, oct_sr, filter_scale_oct, oct_hop, alpha_oct)
 
         if progress is not None:
             with progress._lock:
@@ -1639,7 +1828,7 @@ def cqt(
         vqt_resp.append(
             _cqt_response_streaming(
                 my_y_padded, n_fft, oct_hop, freqs_oct, oct_lengths,
-                oct_sr, float(sr), filter_scale, pad_mode, device,
+                oct_sr, float(sr), window, filter_scale_oct, pad_mode, device,
                 dtype, batch_size, progress=progress,
                 on_progress=on_progress))
 
@@ -1647,6 +1836,7 @@ def cqt(
         if my_hop % 2 == 0:
             my_hop //= 2
             my_sr /= 2.0
+            my_scale *= 2
             my_y = _resample(my_y, orig_sr=2, target_sr=1, scale=True,
                              resample_kw=resample_kw)
         else:
@@ -1659,6 +1849,16 @@ def cqt(
                     f"(={2**(n_octaves-1)}) for full decimation.",
                     stacklevel=2,
                 )
+
+    common_hop, strides = _common_hop_and_strides(orig_hops)
+    if any(stride > 1 for stride in strides):
+        common_cols = min(
+            (resp.shape[-1] - 1) * stride + 1
+            for resp, stride in zip(vqt_resp, strides))
+        vqt_resp = [
+            _expand_octave_time_grid(resp, stride, common_cols)
+            for resp, stride in zip(vqt_resp, strides)
+        ]
 
     V = _trim_stack(vqt_resp, n_bins)
 
@@ -2196,6 +2396,10 @@ def icqt(
     fmin: float | None = None,
     bins_per_octave: int = 12,
     filter_scale: float = 1.0,
+    window: str = "hann",
+    bpo_func: OctaveBPOFunc | None = None,
+    hop_func: OctaveHopFunc | None = None,
+    filter_scale_func: OctaveFloatFunc | None = None,
     scale: bool = True,
     length: int | None = None,
     device: torch.device | None = None,
@@ -2226,13 +2430,30 @@ def icqt(
     cdtype = _to_complex(dtype)
     if fmin is None:
         fmin = _C1_HZ
+    window = _canonical_cqt_window(window)
 
     C_t = C.to(device=device, dtype=cdtype)
 
     n_bins = C_t.shape[-2]
-    n_octaves = int(math.ceil(n_bins / bins_per_octave))
-
-    freqs = _cqt_frequencies(n_bins, fmin, bins_per_octave, device, dtype=dtype)
+    if bpo_func is not None:
+        n_octaves = (_schedule_n_octaves(bpo_func, hop_func, filter_scale_func)
+                     or int(math.ceil(n_bins / bins_per_octave)))
+        freqs, bpo_per_oct = _build_variable_freq_grid(
+            fmin, n_octaves, bins_per_octave, bpo_func, device, dtype)
+        if len(freqs) != n_bins:
+            raise ValueError(
+                "Scheduled iCQT requires a frequency grid with exactly "
+                f"{n_bins} bins, got {len(freqs)}")
+        filters_per_oct = list(bpo_per_oct)
+    else:
+        n_octaves = int(math.ceil(n_bins / bins_per_octave))
+        freqs = _cqt_frequencies(n_bins, fmin, bins_per_octave, device,
+                                 dtype=dtype)
+        n_filters = min(bins_per_octave, n_bins)
+        filters_per_oct = [n_filters] * n_octaves
+        remainder = n_bins - n_filters * (n_octaves - 1)
+        if remainder > 0 and n_octaves > 1:
+            filters_per_oct[-1] = remainder
 
     if n_bins == 1:
         r = 2.0 ** (1.0 / bins_per_octave)
@@ -2241,7 +2462,21 @@ def icqt(
     else:
         alpha = _relative_bandwidth(freqs)
 
-    lengths = _wavelet_lengths(freqs, sr, filter_scale, _HANN_BANDWIDTH, alpha)
+    oct_slices: list[slice] = []
+    end = n_bins
+    for n_oct_filters in filters_per_oct:
+        start = end - n_oct_filters
+        oct_slices.append(slice(start, end))
+        end = start
+
+    fs_per_oct = [float(filter_scale_func(i, filter_scale))
+                  if filter_scale_func is not None else float(filter_scale)
+                  for i in range(n_octaves)]
+
+    lengths = torch.empty_like(freqs)
+    for i, sl in enumerate(oct_slices):
+        lengths[sl] = _wavelet_lengths(
+            freqs[sl], sr, fs_per_oct[i], _HANN_BANDWIDTH, alpha[sl])
 
     # Trim CQT frames if length is given
     if length is not None:
@@ -2252,24 +2487,34 @@ def icqt(
     C_scale = lengths.sqrt()
 
     # Build per-octave sr/hop schedule
-    srs: list[float] = [float(sr)]
-    hops: list[int] = [hop_length]
-    for _ in range(n_octaves - 1):
-        if hops[0] % 2 == 0:
-            srs.insert(0, srs[0] * 0.5)
-            hops.insert(0, hops[0] // 2)
-        else:
-            srs.insert(0, srs[0])
-            hops.insert(0, hops[0])
+    srs: list[float] = []
+    hops: list[int] = []
+    orig_hops: list[int] = []
+    my_sr = float(sr)
+    my_hop = hop_length
+    my_scale = 1
+    for i in range(n_octaves):
+        if hop_func is not None:
+            my_hop = hop_func(i, my_hop)
+        srs.append(my_sr)
+        hops.append(my_hop)
+        orig_hops.append(int(my_hop * my_scale))
+        if my_hop % 2 == 0:
+            my_sr *= 0.5
+            my_hop //= 2
+            my_scale *= 2
+
+    _, strides = _common_hop_and_strides(orig_hops)
 
     y: torch.Tensor | None = None
 
     for i, (my_sr, my_hop) in enumerate(zip(srs, hops)):
-        n_oct_filters = min(bins_per_octave, n_bins - bins_per_octave * i)
-        sl = slice(bins_per_octave * i, bins_per_octave * i + n_oct_filters)
+        sl = oct_slices[i]
+        filter_scale_oct = fs_per_oct[i]
+        stride = strides[i]
 
         fft_basis, n_fft, oct_lengths = _vqt_filter_fft(
-            my_sr, freqs[sl], filter_scale, my_hop,
+            my_sr, freqs[sl], window, filter_scale_oct, my_hop,
             alpha=alpha[sl], device=device, dtype=dtype)
 
         # librosa: ``inv_basis = fft_basis.conjugate().T.todense()``
@@ -2282,10 +2527,13 @@ def icqt(
         freq_power = freq_power * (n_fft / oct_lengths)
 
         # librosa einsum back-projection
+        C_oct = C_t[..., sl, :]
+        if stride > 1:
+            C_oct = C_oct[..., ::stride]
         if scale:
-            weighted = (C_scale[sl] * freq_power).unsqueeze(-1) * C_t[..., sl, :]
+            weighted = (C_scale[sl] * freq_power).unsqueeze(-1) * C_oct
         else:
-            weighted = freq_power.unsqueeze(-1) * C_t[..., sl, :]
+            weighted = freq_power.unsqueeze(-1) * C_oct
 
         D_oct = torch.matmul(inv_basis.to(cdtype),
                              weighted.to(cdtype))

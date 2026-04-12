@@ -4,7 +4,7 @@ Supports:
   • Standalone CLI with full report
   • Programmatic API for integration into bass_viewer
   • Per-parameter locks (invariants): any value can be frozen
-  • Per-octave schedules: BPO / hop / window solved as a vector, not a scalar
+  • Per-octave schedules: BPO / hop / Q-scale / sigma solved as a vector, not a scalar
   • ScheduleVec: callable per-octave plan implementing OctaveBPOFunc / OctaveHopFunc
   • Dynamic limit discovery — solver explores beyond hardcoded UI ranges
   • CQT engine "algorithm" choice: librosa (pseudoinverse) or nsgt (painless frame)
@@ -28,7 +28,9 @@ import numpy as np
 from scipy.optimize import differential_evolution
 
 from torch_cqt_new import (
+    _CQT_WINDOWS,
     OctaveBPOFunc,
+    OctaveFloatFunc,
     OctaveHopFunc,
     fidelity_curve,
     fidelity_curve_cwt,
@@ -105,11 +107,13 @@ def _n_octaves_for(fmin: float, fmax: float) -> int:
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-# Params that support per-octave scheduling, per engine
+# Params that support per-octave scheduling, per engine.
+# hop_length is excluded from CWT: it is always 1 (continuous analysis)
+# and is not exposed in the viewer UI, so scheduling it is meaningless.
 SCHEDULABLE: dict[str, frozenset[str]] = {
     "cqt": frozenset({"bins_per_octave", "hop_length", "filter_scale"}),
     "fb":  frozenset({"bands_per_octave", "hop_length"}),
-    "cwt": frozenset({"scales_per_octave", "hop_length", "sigma"}),
+    "cwt": frozenset({"scales_per_octave", "sigma"}),
 }
 
 
@@ -176,9 +180,14 @@ class ParamDesc:
 # Engine configuration — all tuneable params for each engine
 # ═══════════════════════════════════════════════════════════════════════════
 
+
 _FILTER_TYPES = ["Linkwitz-Riley 4", "Butterworth 4", "Butterworth 8"]
 _CWT_WAVELETS = ["morlet", "morse", "ricker"]
 _CQT_ALGORITHMS = ["librosa", "nsgt"]
+_CQT_WINDOW_CHOICES = list(_CQT_WINDOWS)
+_DWT_WAVELETS = [
+    "haar", "db1", "db2", "db4", "db8", "sym2", "sym4", "coif1", "coif2"
+]
 
 
 def build_param_registry(
@@ -199,7 +208,14 @@ def build_param_registry(
         Computed from fmin/fmax if not supplied.
     """
     if engines is None:
-        engines = ["cqt", "fb", "cwt"]
+        engines = ["cqt", "fb", "cwt", "dwt"]
+        if "dwt" in engines:
+            params.extend([
+                ParamDesc("wavelet", "dwt", "choice",
+                          0, len(_DWT_WAVELETS) - 1, 0,
+                          choices=_DWT_WAVELETS),
+                ParamDesc("levels", "dwt", "int", 1, 12, 6),
+            ])
     if schedule_params is None:
         schedule_params = set()
     if octave_counts is None:
@@ -230,6 +246,9 @@ def build_param_registry(
                       20.0, nyquist, min(20000.0, nyquist)),
             _sched("cqt", "filter_scale",
                    ParamDesc("filter_scale", "cqt", "float", 0.1, 10.0, 1.0)),
+            ParamDesc("window", "cqt", "choice",
+                      0, len(_CQT_WINDOW_CHOICES) - 1, 0,
+                      choices=_CQT_WINDOW_CHOICES),
         ])
 
     if "fb" in engines:
@@ -315,20 +334,25 @@ def _decode_vals(
 
 def _extract_funcs(
     ev: dict[str, Any],
-) -> tuple[OctaveBPOFunc | None, OctaveHopFunc | None, Any]:
-    """Pull bpo_func, hop_func, window_func from decoded engine vals.
+) -> tuple[OctaveBPOFunc | None, OctaveHopFunc | None,
+           OctaveFloatFunc | None, OctaveFloatFunc | None]:
+    """Pull per-octave callables from decoded engine values.
 
-    Returns (bpo_func, hop_func, sigma_func) where each is None if not
-    a ScheduleVec (i.e., scalar or not present).
+    Returns (bpo_func, hop_func, filter_scale_func, sigma_func).
+    Each is None when the parameter was solved as a global scalar.
     """
-    bpo_raw  = ev.get("bins_per_octave") or ev.get("bands_per_octave") or ev.get("scales_per_octave")
-    hop_raw  = ev.get("hop_length")
-    win_raw  = ev.get("filter_scale") or ev.get("sigma")
+    bpo_raw = (ev.get("bins_per_octave")
+               or ev.get("bands_per_octave")
+               or ev.get("scales_per_octave"))
+    hop_raw = ev.get("hop_length")
+    fs_raw  = ev.get("filter_scale")
+    sig_raw = ev.get("sigma")
 
-    bpo_func = bpo_raw  if isinstance(bpo_raw,  ScheduleVec) else None
-    hop_func = hop_raw  if isinstance(hop_raw,  ScheduleVec) else None
-    win_func = win_raw  if isinstance(win_raw,  ScheduleVec) else None
-    return bpo_func, hop_func, win_func
+    bpo_func          = bpo_raw if isinstance(bpo_raw, ScheduleVec) else None
+    hop_func          = hop_raw if isinstance(hop_raw, ScheduleVec) else None
+    filter_scale_func = fs_raw  if isinstance(fs_raw,  ScheduleVec) else None
+    sigma_func        = sig_raw if isinstance(sig_raw,  ScheduleVec) else None
+    return bpo_func, hop_func, filter_scale_func, sigma_func
 
 
 def _scalar(v: Any, default: float) -> float:
@@ -350,14 +374,16 @@ def _evaluate(
     all_params: list[ParamDesc],
     sr: int,
     engines: list[str],
+    signal_length: int | None = None,
 ) -> float:
     """Objective function: weighted sum of worst-case loss across engines."""
     vals = _decode_vals(x, all_params)
     total_loss = 0.0
 
+
     for eng in engines:
         ev = vals.get(eng, {})
-        bpo_func, hop_func, win_func = _extract_funcs(ev)
+        bpo_func, hop_func, filter_scale_func, sigma_func = _extract_funcs(ev)
         try:
             if eng == "cqt":
                 algo = str(ev.get("algorithm", "librosa"))
@@ -367,6 +393,8 @@ def _evaluate(
                         fmin=_scalar(ev.get("fmin"), 16.35),
                         fmax=_scalar(ev.get("fmax"), 20000.0),
                         bins_per_octave=_int_scalar(ev.get("bins_per_octave"), 48),
+                        Ls=signal_length or sr,
+                        window=str(ev.get("window", "hann")),
                     )
                     rgb = fc.get("loss_rgb", np.zeros((1, 3)))
                     pr = fc.get("painless")
@@ -383,8 +411,10 @@ def _evaluate(
                         fmax=_scalar(ev.get("fmax"), 20000.0),
                         bins_per_octave=_int_scalar(ev.get("bins_per_octave"), 48),
                         filter_scale=_scalar(ev.get("filter_scale"), 1.0),
+                        window=str(ev.get("window", "hann")),
                         bpo_func=bpo_func,
                         hop_func=hop_func,
+                        filter_scale_func=filter_scale_func,
                     )
                     rgb = fc.get("loss_rgb", np.zeros((1, 3)))
             elif eng == "fb":
@@ -400,8 +430,6 @@ def _evaluate(
                 )
                 rgb = fc.get("loss_rgb", np.zeros((1, 3)))
             elif eng == "cwt":
-                _sigma_func = win_func if win_func is not None else None
-                # CWT sigma_func: wrap ScheduleVec so it matches the hop_func sig
                 fc = fidelity_curve_cwt(
                     sr,
                     fmin=_scalar(ev.get("fmin"), 0.1),
@@ -412,8 +440,24 @@ def _evaluate(
                     sigma=_scalar(ev.get("sigma"), 6.0),
                     bpo_func=bpo_func,
                     hop_func=hop_func,
+                    sigma_func=sigma_func,
                 )
                 rgb = fc.get("loss_rgb", np.zeros((1, 3)))
+            elif eng == "dwt":
+                # DWT: no fidelity_curve_dwt yet, so use a placeholder loss
+                # TODO: implement real DWT fidelity curve
+                # For now, penalize for non-default wavelet/levels as a stub
+                wavelet = str(ev.get("wavelet", "db4"))
+                levels = _int_scalar(ev.get("levels"), 6)
+                # Placeholder: lower loss for longer wavelet support, more levels
+                support_len = {
+                    "haar": 2, "db1": 2, "db2": 4, "db4": 8, "db8": 16,
+                    "sym2": 4, "sym4": 8, "coif1": 6, "coif2": 12
+                }.get(wavelet, 8)
+                # Lower support_len = worse time resolution, higher levels = more freq resolution
+                # Loss is lower for higher levels and longer support
+                loss = 1.0 / (levels * support_len)
+                rgb = np.array([[loss, loss * 0.5, loss * 0.2]])
             else:
                 continue
         except Exception:
@@ -441,6 +485,7 @@ def solve(
     engines: list[str] | None = None,
     locks: dict[str, dict[str, Any]] | None = None,
     schedule_params: set[tuple[str, str]] | None = None,
+    signal_length: int | None = None,
     max_iter: int = 200,
     seed: int | None = 42,
     callback: Callable[[Any], None] | None = None,
@@ -479,14 +524,22 @@ def solve(
 
     # Compute octave count per engine from locked/default fmin+fmax
     octave_counts: dict[str, int] = {}
-    _fmin_defaults = {"cqt": 16.35, "fb": 16.35, "cwt": 0.1}
+    # CAFLS defaults: CQT starts at anchor f_a ≈ B0; CWT ends at anchor;
+    # FB spans full range (subsonic to Nyquist).
+    _cafls_anchor = 30.87  # B0 ≈ f_a
+    _fmin_defaults = {"cqt": _cafls_anchor, "fb": 0.1, "cwt": 0.1, "dwt": 16.35}
     _fmax_defaults = {"cqt": min(20000.0, sr / 2.0),
                       "fb": min(20000.0, sr / 2.0),
-                      "cwt": sr / 4.0}
+                      "cwt": _cafls_anchor,
+                      "dwt": min(20000.0, sr / 2.0)}
     for eng in engines:
-        fmin = float(locks.get(eng, {}).get("fmin", _fmin_defaults.get(eng, 16.35)))
-        fmax = float(locks.get(eng, {}).get("fmax", _fmax_defaults.get(eng, sr / 2.0)))
-        octave_counts[eng] = _n_octaves_for(fmin, fmax)
+        if eng == "dwt":
+            # DWT: octaves not meaningful, set to 1
+            octave_counts[eng] = 1
+        else:
+            fmin = float(locks.get(eng, {}).get("fmin", _fmin_defaults.get(eng, 16.35)))
+            fmax = float(locks.get(eng, {}).get("fmax", _fmax_defaults.get(eng, sr / 2.0)))
+            octave_counts[eng] = _n_octaves_for(fmin, fmax)
 
     all_params = build_param_registry(sr, engines,
                                       schedule_params=schedule_params,
@@ -508,12 +561,12 @@ def solve(
 
     if not bounds:
         x0 = np.array([])
-        best_cost = _evaluate(x0, free_params, all_params, sr, engines)
+        best_cost = _evaluate(x0, free_params, all_params, sr, engines, signal_length)
     else:
         result = differential_evolution(
             _evaluate,
             bounds=bounds,
-            args=(free_params, all_params, sr, engines),
+            args=(free_params, all_params, sr, engines, signal_length),
             maxiter=max_iter,
             seed=seed,
             tol=1e-6,
@@ -530,9 +583,10 @@ def solve(
     # Compute final fidelity for each engine
     per_engine: dict[str, dict] = {}
     peak_r = peak_g = peak_b = 0.0
+
     for eng in engines:
         ev = final_vals.get(eng, {})
-        bpo_func, hop_func, win_func = _extract_funcs(ev)
+        bpo_func, hop_func, filter_scale_func, sigma_func = _extract_funcs(ev)
         try:
             if eng == "cqt":
                 algo = str(ev.get("algorithm", "librosa"))
@@ -542,6 +596,8 @@ def solve(
                         fmin=_scalar(ev.get("fmin"), 16.35),
                         fmax=_scalar(ev.get("fmax"), 20000.0),
                         bins_per_octave=_int_scalar(ev.get("bins_per_octave"), 48),
+                        Ls=signal_length or sr,
+                        window=str(ev.get("window", "hann")),
                     )
                 else:
                     fc = fidelity_curve(
@@ -551,8 +607,10 @@ def solve(
                         fmax=_scalar(ev.get("fmax"), 20000.0),
                         bins_per_octave=_int_scalar(ev.get("bins_per_octave"), 48),
                         filter_scale=_scalar(ev.get("filter_scale"), 1.0),
+                        window=str(ev.get("window", "hann")),
                         bpo_func=bpo_func,
                         hop_func=hop_func,
+                        filter_scale_func=filter_scale_func,
                     )
             elif eng == "fb":
                 fc = fidelity_curve_fb(
@@ -576,7 +634,14 @@ def solve(
                     sigma=_scalar(ev.get("sigma"), 6.0),
                     bpo_func=bpo_func,
                     hop_func=hop_func,
+                    sigma_func=sigma_func,
                 )
+            elif eng == "dwt":
+                # DWT: no fidelity_curve_dwt yet, so just record params
+                wavelet = str(ev.get("wavelet", "db4"))
+                levels = _int_scalar(ev.get("levels"), 6)
+                fc = {"wavelet": wavelet, "levels": levels,
+                      "loss_rgb": np.array([[0.0, 0.0, 0.0]])}
             else:
                 continue
         except Exception:

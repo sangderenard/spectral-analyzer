@@ -862,6 +862,21 @@ def _build_variable_freq_grid(
     return freqs, bpo_per_oct
 
 
+def _alpha_from_bpo(bpo: int) -> float:
+    """Relative bandwidth for a constant-Q octave with *bpo* bins."""
+    bpo = max(int(bpo), 1)
+    num = 2.0 ** (2.0 / bpo) - 1.0
+    den = 2.0 ** (2.0 / bpo) + 1.0
+    return num / den
+
+
+def _dwt_equivalent_filter_len(dec_len: int, level: int) -> int:
+    """Equivalent analysis-filter length in original-rate samples."""
+    dec_len = max(int(dec_len), 1)
+    level = max(int(level), 1)
+    return 1 + (dec_len - 1) * ((1 << level) - 1)
+
+
 def fidelity_curve(
     sr: int,
     hop_length: int = 512,
@@ -933,6 +948,10 @@ def fidelity_curve(
     dt_list: list[float] = []
     df_list: list[float] = []
     oct_idx_list: list[int] = []
+    frame_dt_list: list[float] = []
+    q_list: list[float] = []
+    frame_dt_list: list[float] = []
+    support_dt_list: list[float] = []
 
     for j_bottom in range(n_octaves):
         oct_top_idx = n_octaves - 1 - j_bottom  # 0 = top
@@ -947,21 +966,30 @@ def fidelity_curve(
             f = oct_lo * (2.0 ** (k / bpo))
             if f > fmax:
                 break
-            # Q factor for this bin
-            Q = filter_scale / (2.0 ** (1.0 / bpo) - 1.0)
-            # Frequency resolution = f / Q
-            delta_f = f / Q
-            # Time resolution = hop / effective_sr
-            delta_t = hop / eff_sr
+            alpha = _alpha_from_bpo(bpo)
+            Q = filter_scale / max(alpha, 1e-30)
+            delta_f = f * alpha
+
+            # Match the actual basis geometry: the CQT wavelet length is
+            # Q * sr / f samples at the octave's effective sample rate.
+            filter_support = Q / max(f, 1e-30)
+            frame_spacing = hop / eff_sr
+            delta_t = max(filter_support, frame_spacing)
 
             freqs_list.append(f)
             dt_list.append(delta_t)
             df_list.append(delta_f)
             oct_idx_list.append(oct_top_idx)
+            q_list.append(Q)
+            frame_dt_list.append(frame_spacing)
+            support_dt_list.append(filter_support)
 
     freqs_arr = np.array(freqs_list)
     dt_arr = np.array(dt_list)
     df_arr = np.array(df_list)
+    q_arr = np.array(q_list)
+    frame_dt_arr = np.array(frame_dt_list)
+    support_dt_arr = np.array(support_dt_list)
     unc_arr = dt_arr * df_arr
     gabor = 1.0 / (4.0 * math.pi)
 
@@ -970,7 +998,7 @@ def fidelity_curve(
     # Temporal confidence:  can the hop rate track each bin's envelope?
     # envelope_sr = 1/Δt, required Nyquist = 2·Δf
     # margin = envelope_sr / (2·Δf),  clamped to [0, 1]
-    env_sr = 1.0 / np.maximum(dt_arr, 1e-30)
+    env_sr = 1.0 / np.maximum(frame_dt_arr, 1e-30)
     conf_temporal = np.minimum(1.0, env_sr / (2.0 * np.maximum(df_arr, 1e-30)))
 
     # Nyquist confidence: how much of the filter sits below sr/2?
@@ -995,10 +1023,8 @@ def fidelity_curve(
     # GREEN — degraded (losing detail, but data still exists)
     #   temporal aliasing onset: envelope_sr can't track envelope BW
     temporal_loss = 1.0 - conf_temporal
-    #   temporal smearing: filter length > 50 ms → transient blur
-    Q_arr = filter_scale / (2.0 ** (1.0 / np.maximum(
-        np.array([bpo_list[o] for o in oct_idx_list]), 1)) - 1.0)
-    filter_len_sec = Q_arr / np.maximum(freqs_arr, 1e-30)
+    #   temporal smearing: actual basis support > 50 ms → transient blur
+    filter_len_sec = support_dt_arr
     smear_loss = np.clip((filter_len_sec - 0.05) / 0.45, 0.0, 1.0)
     #   spectral broadening: Δf/f exceeds a semitone (1/12 octave)
     relative_bw = df_arr / np.maximum(freqs_arr, 1e-30)
@@ -1027,6 +1053,9 @@ def fidelity_curve(
         "octave_index": np.array(oct_idx_list, dtype=np.int32),
         "bpo_per_octave": bpo_list,
         "hop_per_octave": hop_list,
+        "Q": q_arr,
+        "frame_spacing": frame_dt_arr,
+        "filter_support": support_dt_arr,
         "confidence": confidence,
         "conf_temporal": conf_temporal,
         "conf_nyquist": conf_nyquist,
@@ -1040,6 +1069,7 @@ def _loss_rgb_from_metrics(
     delta_f: np.ndarray,
     sr: int,
     filter_scale_or_Q: np.ndarray | float,
+    sampling_delta_t: np.ndarray | None = None,
 ) -> np.ndarray:
     """Shared three-tier RGB loss computation used by all fidelity functions.
 
@@ -1056,7 +1086,8 @@ def _loss_rgb_from_metrics(
         0.0, 1.0).astype(np.float32)
 
     # GREEN — degraded
-    env_sr = 1.0 / np.maximum(delta_t, 1e-30)
+    sample_dt = delta_t if sampling_delta_t is None else sampling_delta_t
+    env_sr = 1.0 / np.maximum(sample_dt, 1e-30)
     conf_temporal = np.minimum(1.0, env_sr / (2.0 * np.maximum(delta_f, 1e-30)))
     temporal_loss = 1.0 - conf_temporal
     Q_arr = np.asarray(filter_scale_or_Q, dtype=np.float64)
@@ -1096,9 +1127,10 @@ def fidelity_curve_fb(
 ) -> dict[str, np.ndarray]:
     """Fidelity / loss-map for a filter-bank decomposition.
 
-    The filter bank uses fixed-order crossover filters whose effective Q
-    depends on filter type and crossover spacing.  The time resolution
-    is determined by the hop (envelope frame rate) and the filter ring-down.
+    This models the filter bank as a zero-phase residual split followed by
+    Hilbert-envelope sampling.  Frequency resolution is set by band width,
+    and time resolution is limited by the envelope hop and the band-limited
+    modulation Nyquist criterion.  It does not assume causal ring-down.
 
     Parameters
     ----------
@@ -1119,14 +1151,25 @@ def fidelity_curve_fb(
     hop_list = [hop_func(i, hop_length) if hop_func else hop_length
                 for i in range(n_octaves)]
 
-    order_map = {"Butterworth 2": 2, "Linkwitz-Riley 4": 4,
-                 "Linkwitz-Riley 8": 8, "Bessel 4": 3}
-    n_cycles = order_map.get(filter_type, 4)
+    filter_orders = {
+        "Linkwitz-Riley 4": 4,
+        "Butterworth 4": 4,
+        "Butterworth 8": 8,
+    }
+    if filter_type in filter_orders:
+        filter_order = filter_orders[filter_type]
+    elif filter_type.startswith("Linkwitz-Riley"):
+        filter_order = max(2, int(filter_type.split()[-1]))
+    elif filter_type.startswith("Butterworth"):
+        filter_order = max(2, int(filter_type.split()[-1]))
+    else:
+        filter_order = 4
 
     freqs_list: list[float] = []
     dt_list: list[float] = []
     df_list: list[float] = []
     oct_idx_list: list[int] = []
+    frame_dt_list: list[float] = []
 
     for j in range(n_octaves):
         bpo = bpo_list[j]
@@ -1141,20 +1184,22 @@ def fidelity_curve_fb(
             if f > fmax:
                 break
             delta_f = f * bw_ratio
-            ring_t = n_cycles / max(f, 1e-30)
-            delta_t = max(ring_t, hop_t)
+            delta_t = max(1.0 / max(2.0 * delta_f, 1e-30), hop_t)
 
             freqs_list.append(f)
             df_list.append(delta_f)
             dt_list.append(delta_t)
             oct_idx_list.append(j)
+            frame_dt_list.append(hop_t)
 
     freqs = np.array(freqs_list, dtype=np.float64)
     delta_t = np.array(dt_list, dtype=np.float64)
     delta_f = np.array(df_list, dtype=np.float64)
+    frame_dt = np.array(frame_dt_list, dtype=np.float64)
 
     Q_arr = freqs / np.maximum(delta_f, 1e-30)
-    loss_rgb = _loss_rgb_from_metrics(freqs, delta_t, delta_f, sr, Q_arr)
+    loss_rgb = _loss_rgb_from_metrics(
+        freqs, delta_t, delta_f, sr, Q_arr, sampling_delta_t=frame_dt)
     return {
         "freqs": freqs,
         "delta_t": delta_t,
@@ -1163,6 +1208,107 @@ def fidelity_curve_fb(
         "octave_index": np.array(oct_idx_list, dtype=np.int32),
         "bpo_per_octave": bpo_list,
         "hop_per_octave": hop_list,
+        "frame_spacing": frame_dt,
+        "filter_order": np.full_like(freqs, filter_order, dtype=np.float64),
+        "filter_type": np.array([filter_type] * len(freqs), dtype=object),
+    }
+
+
+def fidelity_curve_dwt(
+    sr: int,
+    wavelet: str = "db4",
+    level: int = 6,
+    extension: str = "symmetric",
+) -> dict[str, np.ndarray]:
+    """Fidelity / loss-map for a discrete wavelet transform.
+
+    The DWT is modelled as a dyadic analysis tree with one approximation
+    band plus one detail band per decomposition level.  The per-level time
+    support comes from the wavelet analysis filter length after dyadic
+    upsampling through the cascade.
+    """
+    if sr <= 0:
+        raise ValueError("sr must be positive")
+    level = max(1, int(level))
+
+    try:
+        import pywt
+    except ImportError as exc:
+        raise RuntimeError("fidelity_curve_dwt requires pywt") from exc
+
+    wave = pywt.Wavelet(wavelet)
+    dec_len = int(getattr(wave, "dec_len", 2))
+    nyq = sr / 2.0
+
+    freqs_list: list[float] = []
+    dt_list: list[float] = []
+    df_list: list[float] = []
+    band_lo_list: list[float] = []
+    band_hi_list: list[float] = []
+    level_list: list[int] = []
+    approx_mask: list[bool] = []
+    names: list[str] = []
+    support_dt_list: list[float] = []
+    spacing_dt_list: list[float] = []
+
+    approx_hi = nyq / (2.0 ** level)
+    approx_bw = max(approx_hi, 1e-30)
+    approx_support = _dwt_equivalent_filter_len(dec_len, level) / sr
+    approx_spacing = (2.0 ** level) / sr
+    freqs_list.append(max(approx_hi / 2.0, 1e-6))
+    dt_list.append(max(approx_support, approx_spacing))
+    df_list.append(approx_bw)
+    band_lo_list.append(0.0)
+    band_hi_list.append(approx_hi)
+    level_list.append(level)
+    approx_mask.append(True)
+    names.append(f"A{level}")
+    support_dt_list.append(approx_support)
+    spacing_dt_list.append(approx_spacing)
+
+    for lev in range(level, 0, -1):
+        f_lo = nyq / (2.0 ** lev)
+        f_hi = nyq / (2.0 ** (lev - 1))
+        f_hi = min(f_hi, nyq)
+        if f_hi <= f_lo:
+            continue
+        bw = max(f_hi - f_lo, 1e-30)
+        support = _dwt_equivalent_filter_len(dec_len, lev) / sr
+        spacing = (2.0 ** lev) / sr
+        freqs_list.append(math.sqrt(f_lo * f_hi))
+        dt_list.append(max(support, spacing))
+        df_list.append(bw)
+        band_lo_list.append(f_lo)
+        band_hi_list.append(f_hi)
+        level_list.append(lev)
+        approx_mask.append(False)
+        names.append(f"D{lev}")
+        support_dt_list.append(support)
+        spacing_dt_list.append(spacing)
+
+    freqs = np.array(freqs_list, dtype=np.float64)
+    delta_t = np.array(dt_list, dtype=np.float64)
+    delta_f = np.array(df_list, dtype=np.float64)
+    q_arr = freqs / np.maximum(delta_f, 1e-30)
+    spacing_dt = np.array(spacing_dt_list, dtype=np.float64)
+    loss_rgb = _loss_rgb_from_metrics(
+        freqs, delta_t, delta_f, sr, q_arr, sampling_delta_t=spacing_dt)
+
+    return {
+        "freqs": freqs,
+        "delta_t": delta_t,
+        "delta_f": delta_f,
+        "loss_rgb": loss_rgb,
+        "band_lo": np.array(band_lo_list, dtype=np.float64),
+        "band_hi": np.array(band_hi_list, dtype=np.float64),
+        "level_index": np.array(level_list, dtype=np.int32),
+        "is_approximation": np.array(approx_mask, dtype=bool),
+        "band_name": np.array(names, dtype=object),
+        "filter_support": np.array(support_dt_list, dtype=np.float64),
+        "coefficient_spacing": spacing_dt,
+        "dec_len": np.full_like(freqs, dec_len, dtype=np.float64),
+        "wavelet": np.array([wavelet] * len(freqs), dtype=object),
+        "extension": np.array([extension] * len(freqs), dtype=object),
     }
 
 
@@ -1243,13 +1389,16 @@ def fidelity_curve_cwt(
             df_list.append(delta_f)
             dt_list.append(delta_t)
             oct_idx_list.append(j)
+            frame_dt_list.append(hop_t)
 
     freqs = np.array(freqs_list, dtype=np.float64)
     delta_t = np.array(dt_list, dtype=np.float64)
     delta_f = np.array(df_list, dtype=np.float64)
+    frame_dt = np.array(frame_dt_list, dtype=np.float64)
 
     Q_arr = freqs / np.maximum(delta_f, 1e-30)
-    loss_rgb = _loss_rgb_from_metrics(freqs, delta_t, delta_f, sr, Q_arr)
+    loss_rgb = _loss_rgb_from_metrics(
+        freqs, delta_t, delta_f, sr, Q_arr, sampling_delta_t=frame_dt)
     return {
         "freqs": freqs,
         "delta_t": delta_t,
@@ -1258,6 +1407,7 @@ def fidelity_curve_cwt(
         "octave_index": np.array(oct_idx_list, dtype=np.int32),
         "bpo_per_octave": spo_list,
         "hop_per_octave": hop_list,
+        "frame_spacing": frame_dt,
     }
 
 

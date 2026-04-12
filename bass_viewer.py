@@ -7750,6 +7750,7 @@ class SourcePanel(Panel):
         if any_source:
             try:
                 from torch_cqt_new import (fidelity_curve as _fidelity_curve,
+                                           fidelity_curve_dwt as _fidelity_dwt,
                                            fidelity_curve_fb as _fidelity_fb,
                                            fidelity_curve_cwt as _fidelity_cwt)
                 from torch_nsgt import fidelity_curve_nsgt as _fidelity_nsgt
@@ -7802,25 +7803,37 @@ class SourcePanel(Panel):
                             rgb=fb["loss_rgb"], x=log_fb))
 
                 if self.include_wavelet:
-                    wv_type = "morlet"
                     if self.wavelet_mode_idx == 1:
                         wv_type = _CWT_WAVELET_TYPES[
                             min(self.cwt_wavelet_idx,
                                 len(_CWT_WAVELET_TYPES) - 1)]
-                    _cwt_fmax_lm = (self.cwt_fmax if self.cwt_fmax > 0
-                                    else sr_preview / 4.0)
-                    wv = _fidelity_cwt(
-                        sr_preview,
-                        fmin=self.cwt_fmin, fmax=_cwt_fmax_lm,
-                        scales_per_octave=self.cwt_scales_per_octave,
-                        hop_length=1,
-                        wavelet=wv_type,
-                        sigma=self.cwt_sigma)
+                        _cwt_fmax_lm = (self.cwt_fmax if self.cwt_fmax > 0
+                                        else sr_preview / 4.0)
+                        wv = _fidelity_cwt(
+                            sr_preview,
+                            fmin=self.cwt_fmin, fmax=_cwt_fmax_lm,
+                            scales_per_octave=self.cwt_scales_per_octave,
+                            hop_length=1,
+                            wavelet=wv_type,
+                            sigma=self.cwt_sigma)
+                        _wv_label = "CWT"
+                    else:
+                        wv_name = self._current_wavelet_name()
+                        wv_level = self._wavelet_level_from_pct()
+                        ext_mode = _WAVELET_EXTENSIONS[
+                            min(self.wavelet_ext_idx,
+                                len(_WAVELET_EXTENSIONS) - 1)]
+                        wv = _fidelity_dwt(
+                            sr_preview,
+                            wavelet=wv_name,
+                            level=wv_level,
+                            extension=ext_mode)
+                        _wv_label = "DWT"
                     f_wv = wv["freqs"]
                     if len(f_wv) > 1:
                         log_wv = np.log10(np.maximum(f_wv, 1e-6)).astype(np.float32)
                         self._loss_map.add_bar(HeatmapBar(
-                            key="wv", label="WV",
+                            key="wv", label=_wv_label,
                             rgb=wv["loss_rgb"], x=log_wv))
 
                 # Frequency markers — subsonic through audible

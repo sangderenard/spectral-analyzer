@@ -10,6 +10,7 @@ dependencies = [
     "torch",
     "Pillow",
     "matplotlib",
+    "soundfile",
 ]
 
 [project.optional-dependencies]

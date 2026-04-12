@@ -38,8 +38,14 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
-from scipy.io import wavfile
 from scipy.signal import find_peaks
+
+try:
+    import soundfile as _sf
+    _HAS_SOUNDFILE = True
+except ImportError:
+    _HAS_SOUNDFILE = False
+    from scipy.io import wavfile
 
 
 EPS = 1e-12
@@ -115,6 +121,7 @@ class AnalysisConfig:
                                     # > 1 pushes noise floor toward black, strong
                                     # fundamentals/harmonics dominate the colour range.
                                     # < 1 expands quiet detail at the cost of noise.
+    resample_taps: int = 64         # anti-alias filter length for octave decimation
 
 
 def parse_args() -> argparse.Namespace:
@@ -165,6 +172,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--trim-pad", action="store_true", default=False,
                         help="Trim padding regions from the edges of spectrogram images "
                              "(only affects display, not analysis).")
+    parser.add_argument("--resample-taps", type=int, default=64,
+                        help="Anti-alias filter length for octave decimation (default 64).")
     parser.add_argument("--start-time", type=float, default=None,
                         help="Start time in seconds for partial analysis. "
                              "If omitted, analysis starts from the beginning.")
@@ -182,16 +191,13 @@ def ensure_dir(path: str) -> None:
 # Audio loading
 # ---------------------------------------------------------------------------
 
-def load_wav_stereo_float(path: str) -> Tuple[int, np.ndarray, np.ndarray]:
-    """Load WAV → (sr, left, right) as float64.  Mono files return identical L/R."""
-    sample_rate, data = wavfile.read(path)
+def _to_float64_stereo(data: np.ndarray, sr: int) -> Tuple[int, np.ndarray, np.ndarray]:
+    """Normalise raw audio → (sr, left, right) as float64.  Clamps peaks > 1."""
     if np.issubdtype(data.dtype, np.integer):
         max_abs = max(abs(np.iinfo(data.dtype).min), abs(np.iinfo(data.dtype).max))
         data = data.astype(np.float64) / max_abs
     elif np.issubdtype(data.dtype, np.floating):
         data = data.astype(np.float64)
-    else:
-        raise TypeError(f"Unsupported WAV dtype: {data.dtype}")
     data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
     if data.ndim == 2:
         left, right = data[:, 0], data[:, 1]
@@ -201,38 +207,40 @@ def load_wav_stereo_float(path: str) -> Tuple[int, np.ndarray, np.ndarray]:
     if peak > 1.0:
         left = left / peak
         right = right / peak
-    return sample_rate, left, right
-
-
-def load_mp3_stereo_float(path: str) -> Tuple[int, np.ndarray, np.ndarray]:
-    """Load MP3 → (sr, left, right) via miniaudio.  Decodes to stereo."""
-    try:
-        import miniaudio
-    except ImportError:
-        raise ImportError("miniaudio is required for MP3 support: pip install miniaudio")
-    decoded = miniaudio.decode_file(
-        path,
-        output_format=miniaudio.SampleFormat.FLOAT32,
-        nchannels=2,
-    )
-    interleaved = np.frombuffer(decoded.samples, dtype=np.float32).astype(np.float64)
-    left = interleaved[0::2].copy()
-    right = interleaved[1::2].copy()
-    left = np.nan_to_num(left, nan=0.0, posinf=0.0, neginf=0.0)
-    right = np.nan_to_num(right, nan=0.0, posinf=0.0, neginf=0.0)
-    peak = max(np.max(np.abs(left)), np.max(np.abs(right)), 1e-12)
-    if peak > 1.0:
-        left = left / peak
-        right = right / peak
-    return decoded.sample_rate, left, right
+    return sr, left, right
 
 
 def load_audio_stereo(path: str) -> Tuple[int, np.ndarray, np.ndarray]:
-    """Load audio → (sr, left, right).  Mono files return identical channels."""
+    """Load any supported audio file → (sr, left, right) as float64.
+
+    Uses soundfile (libsndfile) as the primary backend — supports WAV, FLAC,
+    OGG/Vorbis, AIFF, W64, RF64, and many others.  Falls back to miniaudio
+    for MP3 when soundfile is unavailable, or scipy for WAV-only.
+    """
+    if _HAS_SOUNDFILE:
+        data, sr = _sf.read(path, dtype="float64", always_2d=False)
+        return _to_float64_stereo(data, sr)
+    # Fallback chain
     ext = os.path.splitext(path)[1].lower()
     if ext == ".mp3":
-        return load_mp3_stereo_float(path)
-    return load_wav_stereo_float(path)
+        try:
+            import miniaudio
+        except ImportError:
+            raise ImportError(
+                "Install soundfile (pip install soundfile) for broad codec support, "
+                "or miniaudio (pip install miniaudio) for MP3.")
+        decoded = miniaudio.decode_file(
+            path,
+            output_format=miniaudio.SampleFormat.FLOAT32,
+            nchannels=2,
+        )
+        interleaved = np.frombuffer(decoded.samples, dtype=np.float32).astype(np.float64)
+        left = interleaved[0::2].copy()
+        right = interleaved[1::2].copy()
+        return _to_float64_stereo(np.column_stack([left, right]), decoded.sample_rate)
+    # WAV-only fallback
+    sr, data = wavfile.read(path)
+    return _to_float64_stereo(data, sr)
 
 
 # ---------------------------------------------------------------------------
@@ -240,213 +248,52 @@ def load_audio_stereo(path: str) -> Tuple[int, np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 
 def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute CQT power spectrogram on GPU via multi-rate FFT convolution.
+    """Compute CQT power spectrogram via torch_cqt_new.
 
-    Replicates the librosa multi-rate CQT algorithm:
-      1. Compute CQT filter kernels per octave (frequency-domain, on CPU — tiny).
-      2. Process octaves top-down: FFT-convolve the signal with the octave's
-         kernel bank, hop-sample the result, then decimate the signal by 2×
-         (Nyquist halves) for the next octave.  All convolution and decimation
-         runs on GPU.
-      3. Lower octaves operate on the decimated signal so the hop stays the
-         same sample count but covers longer real time — identical to librosa.
+    Delegates to the production-tested ``torch_cqt_new.cqt`` engine —
+    the single authoritative CQT implementation in this codebase.
 
     Returns:
       freqs       – center Hz for each bin,    shape (n_bins,)
       times       – center time per frame,     shape (n_frames,)
-      power       – magnitude squared,         shape (n_bins, n_frames)
+      power       – magnitude squared,         shape (n_bins, n_frames)  float32
       cqt_complex – complex CQT coefficients,  shape (n_bins, n_frames)  complex64
     """
-    import librosa
+    from torch_cqt_new import cqt as _torch_cqt
 
     if cfg.cqt_fmin <= 0:
         raise ValueError(f"--cqt-fmin must be > 0 Hz (got {cfg.cqt_fmin}); try 5 for infrasonic sub-bass.")
     fmax = min(cfg.cqt_fmax, sr / 2.0 * 0.95)
     n_bins = int(math.floor(cfg.bins_per_octave * math.log2(fmax / cfg.cqt_fmin)))
-    n_octaves = int(math.ceil(n_bins / cfg.bins_per_octave))
-    bins_per_octave = cfg.bins_per_octave
     hop = cfg.hop_length
 
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    y = torch.as_tensor(np.asarray(x), device=device)
 
-    # --- Build per-octave CQT filter kernels (CPU, then move to GPU) ---
-    # librosa.filters.constant_q gives us time-domain kernels for one octave
-    # (bins_per_octave filters).  We FFT them to the length needed for
-    # overlap-add convolution with the (decimated) signal at that octave.
-    freqs_all = librosa.cqt_frequencies(n_bins, fmin=cfg.cqt_fmin,
-                                        bins_per_octave=bins_per_octave)
+    resample_kw = {
+        "lowpass_filter_width": cfg.resample_taps,
+        "resampling_method": "sinc_interp_kaiser",
+        "beta": 14.769656459379492,
+    }
 
-    # Determine n_frames from the top octave (full-rate signal).
-    n_frames = 1 + (len(x) - 1) // hop
+    C, freqs_t = _torch_cqt(
+        y, sr,
+        hop_length=hop,
+        fmin=cfg.cqt_fmin,
+        n_bins=n_bins,
+        bins_per_octave=cfg.bins_per_octave,
+        pad_mode="constant" if zero_front else "reflect",
+        device=device,
+        resample_kw=resample_kw,
+    )
 
-    # Pre-allocate output on GPU — all octaves scatter into this.
-    power_gpu = torch.empty((n_bins, n_frames), dtype=torch.float32, device=device)
-    cqt_gpu = torch.empty((n_bins, n_frames), dtype=torch.complex64, device=device)
+    freqs = freqs_t.cpu().numpy()
+    cqt_np = C.cpu().numpy()
 
-    # Reflect-pad the signal so CQT frames exist from time=0, matching
-    # librosa's behavior.  Pad length = longest kernel across all octaves.
-    Q = 1.0 / (2.0 ** (1.0 / bins_per_octave) - 1.0)
-    # The longest kernel is for the lowest bin at the lowest octave.
-    # At octave k, sr_k = sr / 2^k, longest kernel ≈ Q * sr_k / fmin_oct.
-    # But in sample counts of the *original* signal, that's Q * sr / fmin
-    # (the decimation and freq scale cancel).  Pad the original signal by
-    # half the longest kernel (centered).
-    max_kernel_samples = int(np.ceil(Q * sr / freqs_all[0]))
-    pad_len = max_kernel_samples // 2
-    # Reflect-pad front so CQT frames exist from time=0.
-    # Zero-pad back so analysis fades to silence at the end.
-    x32 = x.astype(np.float32)
-    x_padded = np.pad(x32, (pad_len, pad_len), mode="constant", constant_values=0.0)
-    if not zero_front:
-        # Overwrite front padding with reflection for smooth start.
-        x_padded[:pad_len] = x32[pad_len:0:-1]
+    power = (np.abs(cqt_np) ** 2).clip(min=EPS).astype(np.float32)
+    cqt_complex = cqt_np.astype(np.complex64)
 
-    sig = torch.from_numpy(x_padded).to(device)
-    del x_padded, x32
-
-    # Build the decimation anti-alias filter once (Kaiser-windowed sinc,
-    # 129 taps, β=10 → ~90 dB stopband rejection, matching librosa quality).
-    _aa_len = 129
-    _aa_half = _aa_len // 2
-    _aa_t = torch.arange(-_aa_half, _aa_half + 1, dtype=torch.float32, device=device)
-    _aa_sinc = torch.sinc(_aa_t / 2.0)  # cutoff at Nyquist/2
-    _aa_kaiser = torch.kaiser_window(_aa_len, periodic=False, beta=10.0).to(device)
-    _aa_filt = _aa_sinc * _aa_kaiser
-    _aa_filt = (_aa_filt / _aa_filt.sum()).view(1, 1, -1)
-
-    oct_sr = sr  # effective sample rate at current octave
-    for octave in range(n_octaves):
-        # Which bins belong to this octave (top-down: highest octave first).
-        bin_start = n_bins - (octave + 1) * bins_per_octave
-        bin_end = n_bins - octave * bins_per_octave
-        if bin_start < 0:
-            bin_start = 0
-        n_oct_bins = bin_end - bin_start
-        if n_oct_bins <= 0:
-            continue
-
-        oct_fmin = freqs_all[bin_start]
-
-        # Build time-domain CQT kernels for this octave directly.
-        # Each kernel is a Hann-windowed complex sinusoid at the bin's
-        # center frequency.  Length = Q / freq * sr (longer for lower
-        # pitches), with Q = filter_scale / (2^(1/bpo) - 1).
-        oct_freqs = freqs_all[bin_start:bin_end]
-        kernel_lengths = np.ceil(Q * oct_sr / oct_freqs).astype(int)
-        max_klen = int(kernel_lengths.max())
-        # Use actual max kernel length — fft_len handles power-of-2 padding
-        # for FFT efficiency.  Padding kernel_len to a power of 2 would
-        # inflate center, pushing hop-sample indices past the signal at
-        # lower octaves.
-        kernel_len = max_klen
-        basis_dense = np.zeros((n_oct_bins, kernel_len), dtype=np.complex64)
-        for i in range(n_oct_bins):
-            klen = kernel_lengths[i]
-            t = np.arange(klen, dtype=np.float64)
-            # Periodic Hann window (fftbins=True): matches librosa's spectral
-            # properties.  periodic = half-period = klen/(klen) not klen/(klen-1).
-            win = 0.5 - 0.5 * np.cos(2.0 * np.pi * t / klen)
-            # L1-normalised kernel (norm=1): divide by klen so
-            # sum(abs(kernel)) ≈ 1.
-            kernel = (win / klen) * np.exp(2j * np.pi * oct_freqs[i] * t / oct_sr)
-            # Center the kernel in the padded array.
-            start = (kernel_len - klen) // 2
-            basis_dense[i, start:start + klen] = kernel.astype(np.complex64)
-
-        # FFT length for overlap-add: next power of 2 >= sig_len + kernel_len - 1
-        sig_len = sig.shape[0]
-        fft_len = 1
-        while fft_len < sig_len + kernel_len - 1:
-            fft_len *= 2
-
-        # FFT of signal (once per octave, reused across all bin batches).
-        sig_fft = torch.fft.fft(sig, n=fft_len)                       # (fft_len,)
-
-        # Hop-sample indices (shared across batches).
-        # Padded signal layout: [reflect_front | original_audio | reflect_back]
-        # Audio starts at sample oct_pad in the decimated padded signal.
-        # Convolution output for signal position m is at index m + center.
-        # So frame f → signal position (oct_pad + f*hop) → conv index (oct_pad + f*hop + center).
-        center = kernel_len // 2
-        oct_pad = pad_len >> octave  # pad_len in decimated samples
-        # Frame count from original (unpadded) signal length at this octave.
-        orig_oct_len = len(x) >> octave
-        n_oct_frames = 1 + (orig_oct_len - 1) // hop
-        # Crop to exactly n_frames at top octave, proportional at lower.
-        n_oct_frames = min(n_oct_frames, n_frames if octave == 0
-                           else (n_frames + (1 << octave) - 1) // (1 << octave))
-        indices = torch.arange(n_oct_frames, device=device) * hop + oct_pad + center
-        indices = indices.clamp(min=0, max=sig_len + kernel_len - 2)
-
-        # Determine batch size from available GPU memory.
-        # Each bin in a batch needs ~2 * fft_len * 8 bytes (kernel FFT + conv result, complex64).
-        free_mem = torch.cuda.mem_get_info(device)[0]
-        bytes_per_bin = 2 * fft_len * 8
-        batch_size = max(1, int(free_mem * 0.5) // bytes_per_bin)
-        batch_size = min(batch_size, n_oct_bins)
-
-        # Pre-allocate oct_power and oct_cqt on GPU for all bins in this octave.
-        oct_power = torch.empty((n_oct_bins, n_oct_frames), dtype=torch.float32, device=device)
-        oct_cqt = torch.empty((n_oct_bins, n_oct_frames), dtype=torch.complex64, device=device)
-
-        for b_start in range(0, n_oct_bins, batch_size):
-            b_end = min(b_start + batch_size, n_oct_bins)
-            batch = torch.from_numpy(basis_dense[b_start:b_end]).to(device)
-            batch_fft = torch.fft.fft(batch.conj(), n=fft_len, dim=1)
-            del batch
-            conv = torch.fft.ifft(batch_fft * sig_fft[None, :], dim=1)
-            del batch_fft
-            cqt_batch = conv[:, indices]
-            del conv
-            oct_power[b_start:b_end] = (cqt_batch.real ** 2 + cqt_batch.imag ** 2).clamp(min=EPS)
-            oct_cqt[b_start:b_end] = cqt_batch
-            del cqt_batch
-
-        del sig_fft
-
-        # Scatter into output.  Lower octaves have fewer frames (signal was
-        # decimated); we need to place them at the correct time positions.
-        # At octave k, each frame spans 2^k original hops.  Librosa
-        # upsamples by duplicating each frame 2^k times; we do the same to
-        # fill the full n_frames columns.
-        if octave == 0:
-            # Top octave: frames align 1:1.
-            cols = min(n_oct_frames, n_frames)
-            power_gpu[bin_start:bin_end, :cols] = oct_power[:, :cols]
-            cqt_gpu[bin_start:bin_end, :cols] = oct_cqt[:, :cols]
-            if cols < n_frames:
-                power_gpu[bin_start:bin_end, cols:] = oct_power[:, -1:]
-                cqt_gpu[bin_start:bin_end, cols:] = oct_cqt[:, -1:]
-        else:
-            # Each frame covers 2^octave original frames.  Repeat to fill.
-            repeat_factor = 2 ** octave
-            expanded = oct_power.repeat_interleave(repeat_factor, dim=1)
-            expanded_c = oct_cqt.repeat_interleave(repeat_factor, dim=1)
-            cols = min(expanded.shape[1], n_frames)
-            power_gpu[bin_start:bin_end, :cols] = expanded[:, :cols]
-            cqt_gpu[bin_start:bin_end, :cols] = expanded_c[:, :cols]
-            if cols < n_frames:
-                power_gpu[bin_start:bin_end, cols:] = expanded[:, -1:]
-                cqt_gpu[bin_start:bin_end, cols:] = expanded_c[:, -1:]
-            del expanded_c
-
-        # Free octave intermediates.
-        del oct_power, oct_cqt
-
-        # Decimate signal by 2 for next octave.
-        if octave < n_octaves - 1:
-            sig = torch.nn.functional.conv1d(
-                sig.view(1, 1, -1), _aa_filt, padding=_aa_half,
-            ).view(-1)[::2]
-            oct_sr //= 2
-
-    del _aa_filt
-    power = power_gpu.cpu().numpy()
-    cqt_complex = cqt_gpu.cpu().numpy()
-    del power_gpu, cqt_gpu, sig
-    torch.cuda.empty_cache()
-
-    freqs = freqs_all
+    n_frames = cqt_complex.shape[-1]
     times = np.arange(n_frames) * (hop / sr)
     return freqs, times, power, cqt_complex
 
@@ -996,6 +843,7 @@ def main() -> None:
         envelope_smooth_ms=args.envelope_smooth_ms,
         seconds_per_inch=args.seconds_per_inch,
         color_gamma=args.color_gamma,
+        resample_taps=args.resample_taps,
     )
 
     wav_path = os.path.abspath(args.wav_path)

@@ -681,6 +681,11 @@ def _cqt_response_streaming(
     device: torch.device,
     dtype: torch.dtype,
     batch_size: int = 64,
+    out: torch.Tensor | None = None,
+    out_filter_offset: int = 0,
+    out_stride: int = 1,
+    out_common_cols: int | None = None,
+    apply_scale: bool = False,
     progress: CQTProgress | None = None,
     on_progress: CQTProgressCallback | None = None,
 ) -> torch.Tensor:
@@ -701,8 +706,11 @@ def _cqt_response_streaming(
     n_frames = max(1, 1 + (padded_len - n_fft) // hop_length)
 
     lead = y.shape[:-1]
-    out = torch.empty(*lead, n_filters, n_frames,
-                      dtype=cdtype, device=device)
+    direct_write = out is not None
+    if out is None:
+        out = torch.empty(*lead, n_filters, n_frames,
+                          dtype=cdtype, device=device)
+    out_device = out.device
 
     n_freq_bins = n_fft // 2 + 1
 
@@ -749,8 +757,37 @@ def _cqt_response_streaming(
                         frames_view[t_start:t_end], n=n_fft, dim=1,
                     ).to(cdtype)
 
-                    out[..., f_start:f_end, t_start:t_end] = torch.matmul(
-                        fft_rows, F.T)
+                    resp_batch = torch.matmul(fft_rows, F.T)
+                    if apply_scale:
+                        resp_batch = resp_batch / lengths[
+                            f_start:f_end
+                        ].unsqueeze(-1).sqrt()
+                    if direct_write:
+                        dst_f0 = out_filter_offset + f_start
+                        dst_f1 = out_filter_offset + f_end
+                        if out_stride <= 1:
+                            if out_device.type == "cpu":
+                                out[..., dst_f0:dst_f1, t_start:t_end] = (
+                                    resp_batch.cpu())
+                            else:
+                                out[..., dst_f0:dst_f1, t_start:t_end] = resp_batch
+                        else:
+                            dst_t0 = t_start * out_stride
+                            dst_t1 = min(out_common_cols or out.shape[-1],
+                                         t_end * out_stride)
+                            if dst_t1 > dst_t0:
+                                expanded = resp_batch.repeat_interleave(
+                                    out_stride, dim=-1)
+                                expanded = expanded[..., :dst_t1 - dst_t0]
+                                if out_device.type == "cpu":
+                                    out[..., dst_f0:dst_f1, dst_t0:dst_t1] = (
+                                        expanded.cpu())
+                                else:
+                                    out[..., dst_f0:dst_f1, dst_t0:dst_t1] = expanded
+                                del expanded
+                    else:
+                        out[..., f_start:f_end, t_start:t_end] = resp_batch
+                    del resp_batch
                     del F
 
                     if progress is not None:
@@ -891,6 +928,7 @@ def _trim_stack(
         end -= n_oct
 
     return cqt_out
+
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1756,10 +1794,80 @@ def cqt(
             progress.n_octaves = n_octaves
             progress.total_start_time = time.monotonic()
 
+    # ── CUDA direct-write plan ------------------------------------------
+    # Keep the working set on GPU, but write completed octave batches
+    # directly into the final host dump so we never need a full resident
+    # CQT tensor on CUDA during analysis.
+    direct_host_write = (device.type == "cuda")
+    vqt_resp: list[torch.Tensor] = []
+    common_hop = 0
+    strides: list[int] = []
+    common_cols = 0
+    V_host: torch.Tensor | None = None
+    if direct_host_write:
+        plan_y = y_t
+        plan_sr = float(sr)
+        plan_hop = hop_length
+        plan_scale = 1
+        plan_orig_hops: list[int] = []
+        plan_frames: list[int] = []
+        for i in range(n_octaves):
+            sl = oct_slices[i]
+            if hop_func is not None:
+                plan_hop = hop_func(i, plan_hop)
+
+            freqs_oct = freqs[sl]
+            alpha_oct = alpha[sl]
+            filter_scale_oct = fs_per_oct[i]
+            plan_orig_hops.append(int(plan_hop * plan_scale))
+
+            n_fft, _ = _compute_n_fft(
+                freqs_oct, plan_sr, filter_scale_oct, plan_hop, alpha_oct)
+
+            plan_oct_y = plan_y
+            plan_oct_sr = plan_sr
+            plan_oct_hop = plan_hop
+            if n_fft_max > 0:
+                fmax_oct = freqs_oct[-1].item()
+                while n_fft > n_fft_max:
+                    if plan_oct_sr / 4.0 < fmax_oct:
+                        break
+                    if plan_oct_hop % 2 != 0:
+                        break
+                    plan_oct_sr /= 2.0
+                    plan_oct_hop //= 2
+                    plan_oct_y = _resample(
+                        plan_oct_y, orig_sr=2, target_sr=1, scale=True,
+                        resample_kw=resample_kw)
+                    n_fft, _ = _compute_n_fft(
+                        freqs_oct, plan_oct_sr, filter_scale_oct,
+                        plan_oct_hop, alpha_oct)
+
+            plan_sig_len = int(max(plan_oct_y.shape[-1], n_fft))
+            plan_frames.append(max(1, 1 + plan_sig_len // plan_oct_hop))
+
+            if plan_hop % 2 == 0:
+                plan_hop //= 2
+                plan_sr /= 2.0
+                plan_scale *= 2
+                plan_y = _resample(
+                    plan_y, orig_sr=2, target_sr=1, scale=True,
+                    resample_kw=resample_kw)
+
+        common_hop, strides = _common_hop_and_strides(plan_orig_hops)
+        common_cols = min(
+            (n_f - 1) * stride + 1
+            for n_f, stride in zip(plan_frames, strides)
+        )
+        V_host = torch.empty(
+            (*y_t.shape[:-1], n_bins, common_cols),
+            dtype=_to_complex(dtype),
+            device=torch.device("cpu"),
+        )
+
     # ── Iterate down the octaves ──
     my_y, my_sr, my_hop = y_t, float(sr), hop_length
     my_scale = 1
-    vqt_resp: list[torch.Tensor] = []
     orig_hops: list[int] = []
 
     for i in range(n_octaves):
@@ -1825,12 +1933,26 @@ def cqt(
         else:
             my_y_padded = oct_y
 
-        vqt_resp.append(
+        if direct_host_write:
             _cqt_response_streaming(
                 my_y_padded, n_fft, oct_hop, freqs_oct, oct_lengths,
                 oct_sr, float(sr), window, filter_scale_oct, pad_mode, device,
-                dtype, batch_size, progress=progress,
-                on_progress=on_progress))
+                dtype, batch_size,
+                out=V_host,
+                out_filter_offset=sl.start,
+                out_stride=strides[i],
+                out_common_cols=common_cols,
+                apply_scale=scale,
+                progress=progress,
+                on_progress=on_progress,
+            )
+        else:
+            vqt_resp.append(
+                _cqt_response_streaming(
+                    my_y_padded, n_fft, oct_hop, freqs_oct, oct_lengths,
+                    oct_sr, float(sr), window, filter_scale_oct, pad_mode,
+                    device, dtype, batch_size, progress=progress,
+                    on_progress=on_progress))
 
         # librosa: downsample for next octave
         if my_hop % 2 == 0:
@@ -1849,6 +1971,21 @@ def cqt(
                     f"(={2**(n_octaves-1)}) for full decimation.",
                     stacklevel=2,
                 )
+
+    if direct_host_write:
+        V = V_host
+        try:
+            V = V_host.to(device)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            warnings.warn(
+                "CUDA OOM moving final CQT result back to GPU; returning "
+                "the host-resident output instead.",
+                stacklevel=2,
+            )
+            V = V_host
+            freqs = freqs.cpu()
+        return V, freqs
 
     common_hop, strides = _common_hop_and_strides(orig_hops)
     if any(stride > 1 for stride in strides):

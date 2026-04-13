@@ -64,6 +64,17 @@ def _snr(sig: np.ndarray, recon: np.ndarray) -> float:
     return 20.0 * np.log10(sig_rms / max(err, 1e-30))
 
 
+def _dominant_freq(sig: np.ndarray, sr: int) -> float:
+    sig = np.asarray(sig, dtype=np.float64)
+    if len(sig) < 8:
+        return 0.0
+    win = np.hanning(len(sig))
+    spec = np.fft.rfft(sig * win)
+    freqs = np.fft.rfftfreq(len(sig), 1.0 / sr)
+    idx = int(np.argmax(np.abs(spec[1:])) + 1)
+    return float(freqs[idx])
+
+
 # =====================================================================
 #  CQT round-trip  (ViewportSynthPlayer)
 # =====================================================================
@@ -163,9 +174,10 @@ class TestFilterbankRoundTrip:
 
     @pytest.fixture(autouse=True)
     def _setup(self):
-        from bass_viewer import FilterBankDecomposition, BandDef
+        from bass_viewer import FilterBankDecomposition, BandDef, SourcePanel
         self.FB = FilterBankDecomposition
         self.BandDef = BandDef
+        self.SourcePanel = SourcePanel
 
     def _bands(self, n, fmin=20.0, fmax=20000.0, sr=44100):
         edges = np.geomspace(fmin, fmax, n + 1)
@@ -237,6 +249,37 @@ class TestFilterbankRoundTrip:
         env = mags[0].astype(np.float64)
         assert (env / max(env.max(), 1e-12)).std() > 0.05, "AM not captured"
 
+    def test_default_hops_are_fidelity_biased(self):
+        sp = self.SourcePanel(input_dir=ROOT, output_root=ROOT)
+        assert sp.cwt_hop_length == 1
+        assert sp.fb_hop == 1
+
+    def test_save_envelopes_respects_explicit_hop(self, tmp_path):
+        sr = 8000
+        sig = _tone(sr, 0.25, 440.0).astype(np.float32)
+        fb = self.FB(sr, "Linkwitz-Riley 4")
+        bands = [self.BandDef(fmin=200.0, fmax=1000.0)]
+        bands[0].label = bands[0].auto_label(sr)
+        fb.compute(sig, bands)
+        fb.save(str(tmp_path), sr, envelope_hop=1)
+        cached = self.FB.load_envelopes(str(tmp_path))
+        assert cached is not None
+        _, _, hops = cached
+        assert hops == [1]
+
+    def test_save_filterbank_meta_persists_cafls_center(self, tmp_path):
+        sr = 8000
+        sig = _tone(sr, 0.25, 440.0).astype(np.float32)
+        fb = self.FB(sr, "Linkwitz-Riley 4")
+        bands = self.FB.bands_from_cafls(anchor=55.0, bpo=12,
+                                         banded_width=1, sr=sr)
+        fb.compute(sig, bands)
+        fb.save(str(tmp_path), sr, envelope_hop=1)
+
+        meta, _ = self.FB.load_meta(str(tmp_path))
+
+        assert meta["cafls_center_hz"] == pytest.approx(55.0, rel=1e-6)
+
 
 # =====================================================================
 #  Wavelet round-trip  (SynthesisPanel._execute_wavelet + pywt)
@@ -250,9 +293,12 @@ class TestWaveletRoundTrip:
 
     @pytest.fixture()
     def _import_synth(self):
-        from bass_viewer import SynthesisPanel, SynthJob
+        from bass_viewer import (
+            SynthesisPanel, SynthJob, _reconstruct_wavelet_viewport,
+        )
         self.SynthPanel = SynthesisPanel
         self.SynthJob = SynthJob
+        self.reconstruct_wavelet = _reconstruct_wavelet_viewport
 
     def test_full_range_perfect(self):
         sig = _tone(44100, 0.5, 440.0)
@@ -321,6 +367,109 @@ class TestWaveletRoundTrip:
         full = self.pywt.waverec(coeffs, "db4")[:len(sig)]
         part = self.pywt.waverec(mod, "db4")[:len(sig)]
         assert np.abs(full - part).max() > 1e-4
+
+    @pytest.mark.usefixtures("_import_synth")
+    def test_execute_wavelet_cwt_analysis_order(self):
+        import torch
+        import torch_cqt_new as torch_cqt
+
+        sr = 200
+        dur = 8.0
+        freq = 5.0
+        t = torch.arange(int(sr * dur), dtype=torch.float64) / sr
+        sig = torch.sin(2.0 * np.pi * freq * t)
+        W, freqs = torch_cqt.cwt(
+            sig, sr, fmin=1.0, fmax=50.0,
+            scales_per_octave=12, hop_length=1,
+            wavelet="morlet", device="cpu",
+        )
+
+        job = self.SynthJob(job_id=0, label="cwt")
+        self.SynthPanel._execute_wavelet(job, {
+            "wv_W": W.numpy().copy(),
+            "wv_freqs": freqs.numpy().copy(),
+            "wv_meta": {
+                "type": "cwt",
+                "wavelet": "morlet",
+                "hop_length": 1,
+                "n_samples": len(sig),
+            },
+            "sr": sr,
+            "t0": 0.0,
+            "t1": dur,
+            "normalize": False,
+        })
+        recon = job.result_stereo[:, 0].astype(np.float64) / 32767.0
+        orig = sig.numpy().astype(np.float64)
+        margin = sr // 2
+        n = min(len(orig), len(recon))
+        corr = _xcorr_peak(orig[margin:n - margin], recon[margin:n - margin])
+        assert corr > 0.95
+
+    @pytest.mark.usefixtures("_import_synth")
+    def test_execute_wavelet_respects_extension_mode(self):
+        sr = 4096
+        dur = 1.0
+        sig = _chirp(sr, dur, 80.0, 900.0).astype(np.float64)
+        coeffs = self.pywt.wavedec(
+            sig, "db4", mode="periodization", level=6,
+        )
+
+        job = self.SynthJob(job_id=0, label="dwt")
+        self.SynthPanel._execute_wavelet(job, {
+            "wv_coeffs": [c.copy() for c in coeffs],
+            "wv_meta": {
+                "type": "dwt",
+                "wavelet": "db4",
+                "extension": "periodization",
+                "n_samples": len(sig),
+            },
+            "sr": sr,
+            "t0": 0.0,
+            "t1": dur,
+            "normalize": False,
+        })
+        recon = job.result_stereo[:, 0].astype(np.float64) / 32767.0
+        margin = sr // 16
+        n = min(len(sig), len(recon))
+        corr = _xcorr_peak(sig[margin:n - margin], recon[margin:n - margin])
+        assert corr > 0.9
+
+    @pytest.mark.usefixtures("_import_synth")
+    def test_cwt_wavelet_space_time_scale_changes_length_and_pitch(self):
+        import torch
+        import torch_cqt_new as torch_cqt
+
+        sr = 200
+        dur = 12.0
+        freq = 5.0
+        t = torch.arange(int(sr * dur), dtype=torch.float64) / sr
+        sig = torch.sin(2.0 * np.pi * freq * t)
+        W, freqs = torch_cqt.cwt(
+            sig, sr, fmin=1.0, fmax=50.0,
+            scales_per_octave=12, hop_length=1,
+            wavelet="morlet", device="cpu",
+        )
+
+        scaled = self.reconstruct_wavelet(
+            sr=sr,
+            t0=0.0,
+            t1=dur,
+            wv_meta={
+                "type": "cwt",
+                "wavelet": "morlet",
+                "hop_length": 1,
+                "n_samples": len(sig),
+            },
+            W_complex=W.numpy(),
+            wv_freqs=freqs.numpy(),
+            playback_rate=2.0,
+        )
+
+        assert abs(len(scaled) - int(round(len(sig) / 2.0))) <= 1
+        peak = _dominant_freq(scaled, sr)
+        ratio = peak / freq
+        assert 1.7 < ratio < 2.3, f"expected ~2x pitch, got ratio {ratio:.3f}"
 
 
 # =====================================================================

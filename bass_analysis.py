@@ -102,6 +102,8 @@ def settings_hash(cfg: "AnalysisConfig", composite_spec: str | None = None,
         "edge_threshold_db": round(cfg.edge_threshold_db, 4),
         "peak_prominence_db": round(cfg.peak_prominence_db, 4),
         "envelope_smooth_ms": round(cfg.envelope_smooth_ms, 4),
+        "cqt_compute_dtype": cfg.cqt_compute_dtype,
+        "cqt_save_dtype": cfg.cqt_save_dtype,
     }
     if composite_spec:
         canonical["composite"] = composite_spec
@@ -128,6 +130,14 @@ class AnalysisConfig:
     cqt_grid_hop_length: int | None = None  # derived common frame step for scheduled CQT
     cqt_fmin: float = 16.35        # lowest CQT bin — C0, lowest piano/organ note
     cqt_fmax: float = 20000.0      # highest CQT bin (capped at Nyquist)
+    # compute_dtype controls the transform math itself.  Save dtype is separate
+    # and only affects how the result is encoded on disk.
+    cqt_compute_dtype: str = "float64"   # "float32" or "float64"
+    # save_dtype: on-disk dtype for CQT real/imag arrays.  Analysis always runs
+    # at cfg.cqt_compute_dtype; this only controls the encoding written to disk.
+    # float16 requires a stored scale factor (cqt_scale) so magnitudes are
+    # exactly restored on load.  float32 is the default; float64 for archival.
+    cqt_save_dtype: str = "float32"      # "float32", "float16", or "float64"
     # fmin can go as low as ~1 Hz without breaking librosa; the only hard
     # constraint is fmin > 0 and the signal must contain at least a few
     # periods of the lowest frequency (at 5 Hz that's just 0.2 s of audio).
@@ -213,6 +223,21 @@ def parse_args() -> argparse.Namespace:
                              "(only affects display, not analysis).")
     parser.add_argument("--resample-taps", type=int, default=64,
                         help="Anti-alias filter length for octave decimation (default 64).")
+    parser.add_argument("--cqt-precision", type=str, default=None,
+                        choices=["64x32", "64x16", "32x16", "64x64"],
+                        help="CQT precision shorthand: <compute_bits>x<save_bits>. "
+                             "64x32 = float64 compute, float32 save. "
+                             "64x16 = float64 compute, float16 save (~50%% smaller). "
+                             "32x16 = float32 compute (half VRAM), float16 save. "
+                             "64x64 = float64 compute and save (archival).")
+    parser.add_argument("--cqt-compute-precision", type=str, default=None,
+                        choices=["32", "64"],
+                        help="CQT compute precision in bits. "
+                             "Affects transform math only, not NPZ encoding. Default 64.")
+    parser.add_argument("--cqt-save-precision", type=str, default=None,
+                        choices=["16", "32", "64"],
+                        help="CQT save precision in bits. "
+                             "Affects NPZ encoding only. Default 32.")
     parser.add_argument("--start-time", type=float, default=None,
                         help="Start time in seconds for partial analysis. "
                              "If omitted, analysis starts from the beginning.")
@@ -295,8 +320,10 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
     Returns:
       freqs       – center Hz for each bin,    shape (n_bins,)
       times       – center time per frame,     shape (n_frames,)
-      power       – magnitude squared,         shape (n_bins, n_frames)  float32
-      cqt_complex – complex CQT coefficients,  shape (n_bins, n_frames)  complex64
+      power       – magnitude squared,         shape (n_bins, n_frames)
+      cqt_complex – complex CQT coefficients,  shape (n_bins, n_frames)
+                    dtype: complex64 when compute_dtype="float32",
+                           complex128 when compute_dtype="float64"
     """
     from torch_cqt_new import (
         ExplicitOctaveSchedule,
@@ -330,8 +357,10 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
     n_octaves = (sched_octaves if sched_octaves > 0
                  else max(1, int(math.ceil(math.log2(max(fmax / cfg.cqt_fmin, 1.001))))))
 
+    real_dt = np.float64 if cfg.cqt_compute_dtype == "float64" else np.float32
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    y = torch.as_tensor(np.asarray(x), device=device)
+    torch_dtype = torch.float64 if real_dt == np.float64 else torch.float32
+    y = torch.as_tensor(np.asarray(x), device=device, dtype=torch_dtype)
 
     resample_kw = {
         "lowpass_filter_width": cfg.resample_taps,
@@ -352,14 +381,16 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
         filter_scale_func=fs_func,
         pad_mode="constant" if zero_front else "reflect",
         device=device,
+        dtype=torch_dtype,
         resample_kw=resample_kw,
     )
 
-    freqs = freqs_t.cpu().numpy()
-    cqt_np = C.cpu().numpy()
+    freqs = freqs_t.cpu().numpy().astype(real_dt, copy=False)
+    cqt_np = C.cpu().numpy()  # complex64 (float32) or complex128 (float64)
 
-    power = (np.abs(cqt_np) ** 2).clip(min=EPS).astype(np.float32)
-    cqt_complex = cqt_np.astype(np.complex64)
+    power = (np.abs(cqt_np) ** 2).clip(min=EPS).astype(real_dt, copy=False)
+    # Keep native precision; caller controls save dtype via cfg.cqt_save_dtype
+    cqt_complex = cqt_np
 
     n_frames = cqt_complex.shape[-1]
     if cfg.cqt_hop_schedule:
@@ -374,7 +405,7 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
     else:
         grid_hop = hop
     cfg.cqt_grid_hop_length = int(grid_hop)
-    times = np.arange(n_frames) * (grid_hop / sr)
+    times = np.arange(n_frames, dtype=real_dt) * real_dt(grid_hop / sr)
     return freqs, times, power, cqt_complex
 
 
@@ -384,6 +415,7 @@ def compute_cqt(x: np.ndarray, sr: int, cfg: AnalysisConfig, zero_front: bool = 
 
 def compute_onset_envelope(
     x: np.ndarray, sr: int, freqs: np.ndarray, hop: int, n_frames: int,
+    compute_dtype: str = "float64",
 ) -> np.ndarray:
     """Compute a per-bin, per-frame onset strength from short-window time-domain
     energy, to sharpen transient edges that the CQT smears.
@@ -397,10 +429,11 @@ def compute_onset_envelope(
     per-bin to [0, 1].  This can be additively blended with the CQT power
     to enhance transient clarity without altering steady-state tones.
     """
-    device = torch.device("cuda")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    real_dt = np.float64 if compute_dtype == "float64" else np.float32
+    torch_dtype = torch.float64 if real_dt == np.float64 else torch.float32
     n_bins = len(freqs)
-    onset = np.zeros((n_bins, n_frames), dtype=np.float32)
-    sig = torch.from_numpy(x.astype(np.float32)).to(device)
+    onset = np.zeros((n_bins, n_frames), dtype=real_dt)
 
     # Short RMS window: 2× hop gives one sub-division per CQT frame.
     rms_win = 2 * hop
@@ -431,11 +464,11 @@ def compute_onset_envelope(
             continue
         # Apply filter on CPU (sosfilt isn't on GPU, but it's a tiny 8th-order
         # IIR on a 1-D signal — negligible time vs the FFT convolutions).
-        filtered = sosfilt(sos, x).astype(np.float32)
+        filtered = sosfilt(sos, x).astype(real_dt, copy=False)
 
         # RMS envelope via GPU conv1d with a squared signal.
-        fsig = torch.from_numpy(filtered ** 2).to(device)
-        box = torch.ones(1, 1, rms_win, device=device) / rms_win
+        fsig = torch.from_numpy(filtered ** 2).to(device=device, dtype=torch_dtype)
+        box = torch.ones(1, 1, rms_win, device=device, dtype=torch_dtype) / rms_win
         rms_sq = torch.nn.functional.conv1d(
             fsig.view(1, 1, -1), box, padding=rms_win // 2
         ).view(-1)
@@ -453,8 +486,8 @@ def compute_onset_envelope(
         for bi in bin_indices:
             onset[bi] = onset_str
 
-    del sig
-    torch.cuda.empty_cache()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     return onset
 
 
@@ -506,11 +539,15 @@ def band_mask(freqs: np.ndarray, fmin: float, fmax: float) -> np.ndarray:
 def moving_average(x: np.ndarray, width: int) -> np.ndarray:
     if width <= 1:
         return x.copy()
-    return np.convolve(x, np.ones(width) / width, mode="same")
+    kernel = np.ones(width, dtype=x.dtype) / np.asarray(width, dtype=x.dtype)
+    return np.convolve(x, kernel, mode="same").astype(x.dtype, copy=False)
 
 
 def weighted_centroid(freqs: np.ndarray, power_band: np.ndarray) -> np.ndarray:
-    return (freqs[:, None] * power_band).sum(axis=0) / (power_band.sum(axis=0) + EPS)
+    real_dt = np.result_type(freqs.dtype, power_band.dtype, np.float32)
+    eps = real_dt.type(EPS)
+    return ((freqs[:, None] * power_band).sum(axis=0)
+            / (power_band.sum(axis=0) + eps)).astype(real_dt, copy=False)
 
 
 def peak_frequency(freqs: np.ndarray, power_band: np.ndarray) -> np.ndarray:
@@ -521,7 +558,7 @@ def rolloff_pair(
     freqs: np.ndarray, power_band: np.ndarray, low_q: float = 0.15, high_q: float = 0.85
 ) -> Tuple[np.ndarray, np.ndarray]:
     csum = np.cumsum(power_band, axis=0)
-    total = csum[-1, :] + EPS
+    total = csum[-1, :] + np.result_type(power_band.dtype, np.float32).type(EPS)
     lo = np.clip(np.argmax(csum >= (total * low_q)[None, :], axis=0), 0, len(freqs) - 1)
     hi = np.clip(np.argmax(csum >= (total * high_q)[None, :], axis=0), 0, len(freqs) - 1)
     return freqs[lo], freqs[hi]
@@ -530,12 +567,13 @@ def rolloff_pair(
 def track_edge_frequencies(
     freqs: np.ndarray, power: np.ndarray, edge_threshold_db: float
 ) -> Tuple[np.ndarray, np.ndarray]:
-    rel_ratio = 10.0 ** (edge_threshold_db / 10.0)
-    threshold = (np.max(power, axis=0) + EPS) * rel_ratio
+    real_dt = np.result_type(freqs.dtype, power.dtype, np.float32)
+    rel_ratio = real_dt.type(10.0) ** real_dt.type(edge_threshold_db / 10.0)
+    threshold = (np.max(power, axis=0) + real_dt.type(EPS)) * rel_ratio
     active = power >= threshold[None, :]
     any_active = active.any(axis=0)
-    low = np.full(power.shape[1], np.nan)
-    high = np.full(power.shape[1], np.nan)
+    low = np.full(power.shape[1], np.nan, dtype=real_dt)
+    high = np.full(power.shape[1], np.nan, dtype=real_dt)
     low_idx = np.argmax(active, axis=0)
     high_idx = active.shape[0] - 1 - np.argmax(active[::-1], axis=0)
     low[any_active] = freqs[low_idx[any_active]]
@@ -544,7 +582,9 @@ def track_edge_frequencies(
 
 
 def db_power(power: np.ndarray) -> np.ndarray:
-    return 10.0 * np.log10(np.maximum(power, EPS))
+    real_dt = np.result_type(power.dtype, np.float32)
+    eps = real_dt.type(EPS)
+    return real_dt.type(10.0) * np.log10(np.maximum(power, eps))
 
 
     def _norm_gamma(db: np.ndarray) -> np.ndarray:
@@ -675,6 +715,7 @@ def analyze(
     freqs: np.ndarray, times: np.ndarray, power: np.ndarray, cfg: AnalysisConfig
 ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
     n_frames = power.shape[1]
+    real_dt = np.result_type(freqs.dtype, power.dtype, np.float32)
     bass_mask = band_mask(freqs, cfg.bass_min, cfg.bass_max)
     kick_mask = band_mask(freqs, cfg.kick_min, cfg.kick_max)
     bulge_mask = band_mask(freqs, cfg.bulge_min, cfg.bulge_max)
@@ -692,14 +733,17 @@ def analyze(
     if not has_bulge:
         print("  Warning: bulge band outside CQT range — metrics zeroed")
 
-    zeros = np.zeros(n_frames, dtype=np.float64)
-    nans = np.full(n_frames, np.nan, dtype=np.float64)
+    zeros = np.zeros(n_frames, dtype=real_dt)
+    nans = np.full(n_frames, np.nan, dtype=real_dt)
 
     if has_bass:
         bass_power = power[bass_mask, :]
         bass_energy_db = db_power(bass_power.sum(axis=0))
         bass_delta = np.diff(bass_power, axis=1, prepend=bass_power[:, :1])
-        bass_flux_db = db_power(np.maximum(bass_delta, 0.0).sum(axis=0) + EPS)
+        bass_flux_db = db_power(
+            np.maximum(bass_delta, real_dt.type(0.0)).sum(axis=0)
+            + real_dt.type(EPS)
+        )
     else:
         bass_energy_db = zeros.copy()
         bass_flux_db = zeros.copy()
@@ -951,6 +995,21 @@ def main() -> None:
         color_gamma=args.color_gamma,
         resample_taps=args.resample_taps,
     )
+    # Parse precision controls.  --cqt-precision is a shorthand; the explicit
+    # flags override it when provided.
+    _prec_map = {
+        "64x32": ("float64", "float32"),
+        "64x16": ("float64", "float16"),
+        "32x16": ("float32", "float16"),
+        "64x64": ("float64", "float64"),
+    }
+    if args.cqt_precision:
+        cfg.cqt_compute_dtype, cfg.cqt_save_dtype = _prec_map[args.cqt_precision]
+    if args.cqt_compute_precision:
+        cfg.cqt_compute_dtype = f"float{args.cqt_compute_precision}"
+    if args.cqt_save_precision:
+        cfg.cqt_save_dtype = f"float{args.cqt_save_precision}"
+    print(f"  CQT precision: compute={cfg.cqt_compute_dtype}  save={cfg.cqt_save_dtype}")
 
     wav_path = os.path.abspath(args.wav_path)
     if not os.path.isfile(wav_path):
@@ -1002,26 +1061,33 @@ def main() -> None:
 
     use_zero_front = composite_regions is not None
 
-    # --- CQT for both channels ---
-    print("Computing CQT (left)...")
-    freqs, times, power_L, cqt_L = compute_cqt(x_left, sr, cfg, zero_front=use_zero_front)
-    print("Computing CQT (right)...")
-    _, _, power_R, cqt_R = compute_cqt(x_right, sr, cfg, zero_front=use_zero_front)
-
-    # Mono power for analysis / onset (average).
-    power_mono = (power_L + power_R) * 0.5
+    # --- CQT ---
+    if is_stereo:
+        print("Computing CQT (left)...")
+        freqs, times, power_L, cqt_L = compute_cqt(
+            x_left, sr, cfg, zero_front=use_zero_front)
+        print("Computing CQT (right)...")
+        _, _, power_R, cqt_R = compute_cqt(
+            x_right, sr, cfg, zero_front=use_zero_front)
+        # Mono power for analysis / onset (average).
+        power_mono = (power_L + power_R) * power_L.dtype.type(0.5)
+    else:
+        print("Computing CQT (mono)...")
+        freqs, times, power_mono, cqt_L = compute_cqt(
+            x_mono, sr, cfg, zero_front=use_zero_front)
+        cqt_R = None
 
     # --- Onset enhancement (on mono) ---
     print("Computing time-domain onset enhancement...")
     onset = compute_onset_envelope(
-        x_mono, sr, freqs, cfg.cqt_grid_hop_length or cfg.hop_length, len(times))
+        x_mono, sr, freqs, cfg.cqt_grid_hop_length or cfg.hop_length,
+        len(times), compute_dtype=cfg.cqt_compute_dtype)
     power_db = db_power(power_mono)
     per_bin_range = (np.max(power_db, axis=1) - np.min(power_db, axis=1))[:, None]
-    boost_db = onset * np.clip(per_bin_range, 0, 6.0)
-    boost_lin = 10.0 ** (boost_db / 10.0)
-    power_L = power_L * boost_lin
-    power_R = power_R * boost_lin
-    power_mono = (power_L + power_R) * 0.5
+    real_dt = power_mono.dtype.type
+    boost_db = onset * np.clip(per_bin_range, real_dt(0.0), real_dt(6.0))
+    boost_lin = real_dt(10.0) ** (boost_db / real_dt(10.0))
+    power_mono = (power_mono * boost_lin).astype(power_mono.dtype, copy=False)
 
     # --- Build pad mask (per-frame boolean: True = pad region) ---
     pad_mask = np.ones(len(times), dtype=bool)  # assume all pad until proven real
@@ -1041,13 +1107,14 @@ def main() -> None:
     # that is wider at low frequencies and narrower at high frequencies.
     pad_influence = None
     if composite_regions is not None:
+        real_dt = np.float64 if cfg.cqt_compute_dtype == "float64" else np.float32
         total_samples = len(x_mono)
-        sample_is_pad = np.ones(total_samples, dtype=np.float32)
+        sample_is_pad = np.ones(total_samples, dtype=real_dt)
         for ri in composite_regions:
             s0 = max(0, ri.composite_start_sample)
             s1 = min(total_samples, ri.composite_end_sample)
             sample_is_pad[s0:s1] = 0.0
-        cumsum = np.empty(total_samples + 1, dtype=np.float64)
+        cumsum = np.empty(total_samples + 1, dtype=real_dt)
         cumsum[0] = 0.0
         np.cumsum(sample_is_pad, out=cumsum[1:])
 
@@ -1060,7 +1127,7 @@ def main() -> None:
 
         n_bins = len(freqs)
         n_frames = len(times)
-        pad_influence = np.empty((n_bins, n_frames), dtype=np.float32)
+        pad_influence = np.empty((n_bins, n_frames), dtype=real_dt)
         chunk = 500
         for b0 in range(0, n_bins, chunk):
             b1 = min(b0 + chunk, n_bins)
@@ -1068,9 +1135,11 @@ def main() -> None:
             fc = frame_centers[None, :]              # (1, n_frames)
             starts = np.clip(fc - h, 0, total_samples)
             ends = np.clip(fc + h, 0, total_samples)
-            wlen = (ends - starts).astype(np.float64)
+            wlen = (ends - starts).astype(real_dt)
             wsum = cumsum[ends] - cumsum[starts]
-            pad_influence[b0:b1] = (wsum / np.maximum(wlen, 1.0)).astype(np.float32)
+            pad_influence[b0:b1] = (
+                wsum / np.maximum(wlen, real_dt(1.0))
+            ).astype(real_dt, copy=False)
         del cumsum, sample_is_pad
 
     semitone_mask, note_names = semitone_mask_for_freqs(freqs, cfg.bins_per_octave)
@@ -1115,20 +1184,50 @@ def main() -> None:
                           args.trim_pad)
     versioned_npz = f"cqt_data_{shash}.npz"
     print(f"Saving compressed CQT tensors ({versioned_npz}) ...")
+    _SAVE_DTYPE_MAP = {
+        "float16": np.float16,
+        "float32": np.float32,
+        "float64": np.float64,
+    }
+    save_np_dtype = _SAVE_DTYPE_MAP.get(cfg.cqt_save_dtype, np.float32)
+
+    # For float16 we must normalize to [-1, 1] before encoding; float16's
+    # maximum representable value is only 65504, and CQT coefficients can
+    # exceed that for loud signals.  The scale is stored in the NPZ so the
+    # viewer can restore exact magnitudes for iCQT reconstruction.
+    if save_np_dtype == np.float16:
+        scale_candidates = [
+            float(np.abs(cqt_L.real).max()),
+            float(np.abs(cqt_L.imag).max()),
+        ]
+        if is_stereo:
+            scale_candidates += [
+                float(np.abs(cqt_R.real).max()),
+                float(np.abs(cqt_R.imag).max()),
+            ]
+        cqt_scale = max(scale_candidates) or 1.0
+
+        def _to_save(arr: np.ndarray) -> np.ndarray:
+            return (arr / cqt_scale).astype(np.float16)
+    else:
+        cqt_scale = None
+
+        def _to_save(arr: np.ndarray) -> np.ndarray:
+            return arr.astype(save_np_dtype)
+
+    def _to_aux_save(arr: np.ndarray) -> np.ndarray:
+        return np.asarray(arr, dtype=save_np_dtype)
+
     save_dict = dict(
-        freqs=freqs.astype(np.float32),
-        times=times.astype(np.float32),
-        power_left=power_L.astype(np.float32),
-        power_right=power_R.astype(np.float32),
-        real_left=cqt_L.real.astype(np.float32),
-        imag_left=cqt_L.imag.astype(np.float32),
-        real_right=cqt_R.real.astype(np.float32),
-        imag_right=cqt_R.imag.astype(np.float32),
-        phase_left=np.angle(cqt_L).astype(np.float32),
-        phase_right=np.angle(cqt_R).astype(np.float32),
-        onset=onset.astype(np.float32),
+        freqs=_to_aux_save(freqs),
+        times=_to_aux_save(times),
+        real_left=_to_save(cqt_L.real),
+        imag_left=_to_save(cqt_L.imag),
+        onset=_to_aux_save(onset),
         pad_mask=pad_mask,
-        pad_influence=pad_influence if pad_influence is not None else np.empty((0, 0), dtype=np.float32),
+        pad_influence=(_to_aux_save(pad_influence)
+                       if pad_influence is not None
+                       else np.empty((0, 0), dtype=save_np_dtype)),
         semitone_mask=semitone_mask,
         note_names=np.array(note_names, dtype="U12"),
         peaks_idx=peaks_idx.astype(np.int64),
@@ -1137,24 +1236,34 @@ def main() -> None:
         bins_per_octave=np.int32(cfg.bins_per_octave),
         hop_length=np.int32(cfg.hop_length),
         cqt_grid_hop_length=np.int32(cfg.cqt_grid_hop_length or cfg.hop_length),
-        cqt_filter_scale=np.float32(cfg.cqt_filter_scale),
+        cqt_filter_scale=save_np_dtype(cfg.cqt_filter_scale),
         cqt_window=np.array(cfg.cqt_window),
-        cqt_fmin=np.float32(cfg.cqt_fmin),
-        cqt_fmax=np.float32(cfg.cqt_fmax),
-        color_gamma=np.float32(cfg.color_gamma),
+        cqt_fmin=save_np_dtype(cfg.cqt_fmin),
+        cqt_fmax=save_np_dtype(cfg.cqt_fmax),
+        color_gamma=save_np_dtype(cfg.color_gamma),
         image_dpi=np.int32(cfg.image_dpi),
-        seconds_per_inch=np.float32(cfg.seconds_per_inch),
-        auto_fmin=np.float32(auto_fmin),
-        fmax_actual=np.float32(fmax_actual),
-        bass_fmax=np.float32(bass_fmax),
-        treble_fmin=np.float32(treble_fmin),
+        seconds_per_inch=save_np_dtype(cfg.seconds_per_inch),
+        auto_fmin=save_np_dtype(auto_fmin),
+        fmax_actual=save_np_dtype(fmax_actual),
+        bass_fmax=save_np_dtype(bass_fmax),
+        treble_fmin=save_np_dtype(treble_fmin),
         trim_pad=np.bool_(args.trim_pad),
         is_stereo=np.bool_(is_stereo),
-        bulge_min=np.float32(cfg.bulge_min),
-        bulge_max=np.float32(cfg.bulge_max),
+        bulge_min=save_np_dtype(cfg.bulge_min),
+        bulge_max=save_np_dtype(cfg.bulge_max),
         wav_path=np.array(wav_path),
         settings_hash=np.array(shash),
     )
+    # Only store the right channel when the source is genuinely stereo.
+    # For mono files x_left == x_right so storing both wastes 2× space.
+    # The viewer aliases right = left on load when real_right is absent.
+    if is_stereo:
+        save_dict["real_right"] = _to_save(cqt_R.real)
+        save_dict["imag_right"] = _to_save(cqt_R.imag)
+    # For float16 saves, persist the scale factor so the viewer can restore
+    # exact magnitudes for display and iCQT reconstruction.
+    if cqt_scale is not None:
+        save_dict["cqt_scale"] = np.float64(cqt_scale)
     if cfg.cqt_bpo_schedule:
         save_dict["cqt_bpo_schedule"] = np.asarray(
             cfg.cqt_bpo_schedule, dtype=np.int32)
@@ -1163,10 +1272,10 @@ def main() -> None:
             cfg.cqt_hop_schedule, dtype=np.int32)
     if cfg.cqt_filter_scale_schedule:
         save_dict["cqt_filter_scale_schedule"] = np.asarray(
-            cfg.cqt_filter_scale_schedule, dtype=np.float32)
+            cfg.cqt_filter_scale_schedule, dtype=save_np_dtype)
     # Add metrics arrays
     for k, v in metrics.items():
-        save_dict[f"metrics_{k}"] = v.astype(np.float32)
+        save_dict[f"metrics_{k}"] = _to_aux_save(v)
     np.savez_compressed(os.path.join(outdir, versioned_npz), **save_dict)
     # Also write a legacy symlink / copy so old code can find cqt_data.npz
     legacy_path = os.path.join(outdir, "cqt_data.npz")
@@ -1185,11 +1294,18 @@ def main() -> None:
     # --- Save composited audio for viewer playback ---
     if composite_regions is not None:
         stereo = np.column_stack([x_left, x_right])
-        stereo_i16 = (stereo * 32767).clip(-32768, 32767).astype(np.int16)
-        composite_wav = os.path.join(outdir, "composite_audio.wav")
-        wavfile.write(composite_wav, sr, stereo_i16)
-        print(f"  composite_audio.wav     composited playback audio ({len(x_left)/sr:.3f} s)")
-        del stereo, stereo_i16
+        if _HAS_SOUNDFILE:
+            composite_path = os.path.join(outdir, "composite_audio.flac")
+            _sf.write(composite_path, stereo, sr, subtype="PCM_24", format="FLAC")
+            label = "composite_audio.flac"
+        else:
+            composite_path = os.path.join(outdir, "composite_audio.wav")
+            stereo_i16 = (stereo * 32767).clip(-32768, 32767).astype(np.int16)
+            wavfile.write(composite_path, sr, stereo_i16)
+            del stereo_i16
+            label = "composite_audio.wav"
+        print(f"  {label:<28} composited playback audio ({len(x_left)/sr:.3f} s)")
+        del stereo
 
     # --- Write CSV / TXT outputs ---
     write_metrics_csv(os.path.join(outdir, "frame_metrics.csv"), times, metrics)

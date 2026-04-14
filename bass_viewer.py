@@ -38,12 +38,16 @@ pip install numpy pygame PyOpenGL Pillow scipy
 from __future__ import annotations
 
 import argparse
+import gc
 import io
 import json
 import math
 import os
+import shutil
+import struct
 import threading
 import time
+import zlib
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -78,6 +82,56 @@ _AUDIO_EXTS = frozenset((
     ".mp3", ".w64", ".rf64", ".mat", ".pvf", ".htk", ".sds",
     ".raw", ".voc", ".sd2", ".xi", ".wve", ".mpc",
 ))
+
+
+# ---------------------------------------------------------------------------
+# Global CPU RAM backpressure
+# ---------------------------------------------------------------------------
+
+def _ram_available_mb() -> float:
+    """Return available system RAM in MB.  Returns inf when psutil is absent."""
+    try:
+        import psutil as _ps
+        return _ps.virtual_memory().available / (1024 * 1024)
+    except ImportError:
+        return float("inf")
+
+
+def _backpressure_wait(
+    label: str = "",
+    floor_mb: float | None = None,
+    interval_s: float = 0.05,
+) -> None:
+    """Block until available system RAM is above *floor_mb*.
+
+    The floor defaults to SPECTRAL_RAM_FLOOR_MB (env variable, default 512 MB).
+    Call this BEFORE every significant CPU allocation:
+      - before each band's subband allocation in _alloc_sub_buffer
+      - before each envelope batch in compute_envelopes
+      - before each shard write
+      - before any large intermediate array (sosfilt outputs, etc.)
+    This is the universal CPU-RAM throttle. No-op when psutil is unavailable.
+    """
+    import time as _time, gc as _gc
+    if floor_mb is None:
+        floor_mb = max(
+            0.0,
+            float(os.environ.get("SPECTRAL_RAM_FLOOR_MB", "512") or 512))
+    if floor_mb <= 0:
+        return
+    avail = _ram_available_mb()
+    if avail == float("inf") or avail >= floor_mb:
+        return
+    tag = f" [{label}]" if label else ""
+    print(f"\r  RAM floor{tag}: {avail:.0f} MB free < {floor_mb:.0f} MB — waiting",
+          end="", flush=True)
+    while True:
+        _gc.collect()
+        avail = _ram_available_mb()
+        if avail >= floor_mb:
+            print()
+            return
+        _time.sleep(interval_s)
 
 
 def _load_audio(path: str) -> tuple[int, np.ndarray]:
@@ -121,6 +175,46 @@ def _load_audio_float(path: str) -> tuple[int, np.ndarray]:
     elif data.dtype != np.float64:
         data = data.astype(np.float64)
     return sr, data
+
+
+def _write_png_u16(path: str, img_u16: np.ndarray) -> None:
+    """Write a uint16 RGB/RGBA image to PNG (16-bit per channel)."""
+    arr = np.asarray(img_u16)
+    if arr.dtype != np.uint16:
+        raise ValueError("img_u16 must be uint16")
+    if arr.ndim != 3 or arr.shape[2] not in (3, 4):
+        raise ValueError("img_u16 must have shape (H, W, 3|4)")
+
+    h, w, c = arr.shape
+    color_type = 2 if c == 3 else 6  # RGB / RGBA
+    arr_be = np.ascontiguousarray(arr.astype(">u2", copy=False))
+
+    # PNG scanlines: one filter byte (0 = None) followed by row bytes.
+    rows = []
+    for y in range(h):
+        rows.append(b"\x00" + arr_be[y].tobytes())
+    idat = zlib.compress(b"".join(rows), level=6)
+
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", crc)
+        )
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 16, color_type, 0, 0, 0)
+    blob = (
+        sig
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
+
+    with open(path, "wb") as f:
+        f.write(blob)
 
 
 # ---------------------------------------------------------------------------
@@ -1006,7 +1100,7 @@ def _reconstruct_wavelet_viewport(
 
         hop = max(1, int(wv_meta.get("hop_length", 1) or 1))
         total_samples = meta_n_samples if meta_n_samples > 0 else (
-            int(np.asarray(W_complex).shape[1]) * hop)
+            int(W_complex.shape[1]) * hop)
         frac0, frac1 = _fraction_window(t0, t1, total_samples, sr)
         f0, f1 = _fraction_to_index_range(frac0, frac1, int(W_complex.shape[1]))
 
@@ -1532,7 +1626,10 @@ class FilterBankDecomposition:
         self.sr: int = sr
         self.filter_type: str = filter_type
         self.bands: list[BandDef] = []
-        self.subbands: list[np.ndarray] = []    # filtered signal per band
+        self.subbands: list[np.ndarray | None] = []    # filtered signal per band
+        self._subband_files: list[str | None] = []
+        self._subband_file_meta: list[dict[str, Any] | None] = []
+        self._subband_real_dt: np.dtype = np.float32
         self._source_signal: np.ndarray | None = None
 
     @staticmethod
@@ -1690,42 +1787,53 @@ class FilterBankDecomposition:
 
     def _compute_lr(self, signal: np.ndarray, nyq: float,
                     half_order: int) -> None:
-        """Linkwitz-Riley crossover: cascade two Butterworth filters of
-        half the order, then square the response.  Adjacent LP+HP sum flat."""
+        """Linkwitz-Riley crossover with perfect reconstruction.
+
+        Uses the cascade LP-difference method identical to the GPU path
+        (_filter_bands_gpu):
+
+            H_0(f)     = LP²(xo_0)                             first band
+            H_i(f)     = LP²(xo_i) - LP²(xo_{i-1})             middle bands
+            H_{n-1}(f) = signal  - LP²(xo_{n-2})              last band (HP residual)
+
+        where LP²(fc) = sosfilt(sos, sosfilt(sos, signal)) with sos being the
+        half-order Butterworth LP at fc.  This guarantees Σ H_i = signal
+        (perfect reconstruction) regardless of the number of bands.
+        """
         from scipy.signal import butter, sosfilt
         real_dt = np.result_type(signal.dtype, np.float32)
 
-        residual = signal.copy()
-        for band in self.bands:
+        n_bands = len(self.bands)
+        sig = np.asarray(signal, dtype=real_dt)
+
+        prev_lp2: np.ndarray | None = None   # LP²(xo_{i-1}) × signal
+
+        for i, band in enumerate(self.bands):
             if not band.enabled:
-                self.subbands.append(np.zeros_like(signal))
-                continue
-            flo = band.fmin
-            fhi = band.fmax
-            if flo <= 0.0 and fhi >= nyq:
-                # Full band
-                self.subbands.append(residual.copy())
+                # Disabled: output zeros but advance LP cursor so neighbours sum correctly
+                if i < n_bands - 1:
+                    fc = min(float(band.fmax), nyq * 0.9999)
+                    wn = max(fc / nyq, 1e-4)
+                    sos = butter(half_order, wn, btype="low", output="sos")
+                    prev_lp2 = np.asarray(
+                        sosfilt(sos, sosfilt(sos, sig)), dtype=real_dt)
+                self.subbands.append(np.zeros_like(sig))
                 continue
 
-            if flo <= 0.0:
-                # Lowpass
-                wn = min(fhi / nyq, 0.9999)
+            if i < n_bands - 1:
+                # Not the last band: LP²(fmax) is the upper crossover
+                fc = min(float(band.fmax), nyq * 0.9999)
+                wn = max(fc / nyq, 1e-4)
                 sos = butter(half_order, wn, btype="low", output="sos")
-                filtered = sosfilt(sos, sosfilt(sos, signal))
-            elif fhi >= nyq:
-                # Highpass
-                wn = max(flo / nyq, 0.0001)
-                sos = butter(half_order, wn, btype="high", output="sos")
-                filtered = sosfilt(sos, sosfilt(sos, signal))
+                curr_lp2 = np.asarray(
+                    sosfilt(sos, sosfilt(sos, sig)), dtype=real_dt)
+                sub = curr_lp2 if prev_lp2 is None else curr_lp2 - prev_lp2
+                prev_lp2 = curr_lp2
             else:
-                # Bandpass = LP(fhi) cascaded twice, minus LP(flo) cascaded twice
-                wn_lo = max(flo / nyq, 0.0001)
-                wn_hi = min(fhi / nyq, 0.9999)
-                sos_lo = butter(half_order, wn_lo, btype="high", output="sos")
-                sos_hi = butter(half_order, wn_hi, btype="low", output="sos")
-                filtered = sosfilt(sos_hi, sosfilt(sos_hi,
-                            sosfilt(sos_lo, sosfilt(sos_lo, signal))))
-            self.subbands.append(np.asarray(filtered, dtype=real_dt))
+                # Last band: HP residual = signal minus all LP energy below
+                sub = sig if prev_lp2 is None else sig - prev_lp2
+
+            self.subbands.append(np.asarray(sub, dtype=real_dt))
 
     def _compute_butterworth(self, signal: np.ndarray, nyq: float,
                              order: int) -> None:
@@ -1757,7 +1865,9 @@ class FilterBankDecomposition:
         """RMS error between sum-of-bands and original signal (0.0 = perfect)."""
         if self._source_signal is None or not self.subbands:
             return float("inf")
-        recon = sum(self.subbands)
+        recon = np.zeros_like(self._source_signal)
+        for i in range(len(self.subbands)):
+            recon += np.asarray(self.get_subband(i), dtype=recon.dtype)
         err = self._source_signal - recon
         return float(np.sqrt(np.mean(err ** 2)))
 
@@ -1771,14 +1881,19 @@ class FilterBankDecomposition:
             return np.zeros(0, dtype=np.float32)
         if band_mask is None:
             band_mask = [b.enabled for b in self.bands]
-        out = np.zeros_like(self.subbands[0])
-        for include, sub in zip(band_mask, self.subbands):
+        out = np.zeros_like(self.get_subband(0))
+        for i, include in enumerate(band_mask):
             if include:
-                out += sub
+                out += np.asarray(self.get_subband(i), dtype=out.dtype)
         return out
 
     def compute_envelopes(self, hop: int | list[int] | None = None,
                           hilbert_progress: Any = None,
+                          band_result_cb: Any = None,
+                          resume_state: dict[str, Any] | None = None,
+                          drop_after_callback: bool = False,
+                          stream_chunk_dir: str | None = None,
+                          stream_chunk_dtype: np.dtype | None = None,
                           ) -> tuple[list[np.ndarray], list[np.ndarray],
                                      list[int]]:
         """Compute per-band magnitude and phase envelopes via analytic signal.
@@ -1797,7 +1912,19 @@ class FilterBankDecomposition:
         if not self.subbands:
             return [], [], []
         n_bands = len(self.subbands)
-        n_samples = len(self.subbands[0])
+        first_sub = next((s for s in self.subbands if isinstance(s, np.ndarray)), None)
+        if first_sub is None:
+            for i in range(n_bands):
+                cand = self.get_subband(i)
+                if len(cand) > 0:
+                    first_sub = cand
+                    break
+        if first_sub is None:
+            # Nothing to process from subbands; only valid when resume_state
+            # already marked all bands complete.
+            n_samples = 0
+        else:
+            n_samples = len(first_sub)
 
         # Resolve per-band hops
         if hop is None:
@@ -1807,19 +1934,88 @@ class FilterBankDecomposition:
         else:
             hops = list(hop)
 
+        mags_seed, phases_seed, completed = self._resolve_envelope_resume_state(
+            n_bands, resume_state)
+
         # --- Try GPU path ---------------------------------------------------
         try:
             import torch
             if torch.cuda.is_available():
-                return self._compute_envelopes_gpu(
+                return self._compute_envelopes_stft_gpu(
                     torch, n_samples, hops,
-                    hilbert_progress=hilbert_progress)
+                    hilbert_progress=hilbert_progress,
+                    band_result_cb=band_result_cb,
+                    mags_out=mags_seed,
+                    phases_out=phases_seed,
+                    completed=completed,
+                    drop_after_callback=drop_after_callback,
+                    stream_chunk_dir=stream_chunk_dir,
+                    stream_chunk_dtype=stream_chunk_dtype)
+            print("  Hilbert/STFT path: CPU fallback (CUDA unavailable)",
+                  flush=True)
         except ImportError:
-            pass
+            print("  Hilbert/STFT path: CPU fallback (torch unavailable)",
+                  flush=True)
 
         # --- CPU fallback ----------------------------------------------------
         return self._compute_envelopes_cpu(
-            n_samples, hops, hilbert_progress=hilbert_progress)
+            n_samples, hops, hilbert_progress=hilbert_progress,
+            band_result_cb=band_result_cb,
+            mags_out=mags_seed,
+            phases_out=phases_seed,
+            completed=completed,
+            drop_after_callback=drop_after_callback)
+
+    @staticmethod
+    def _resolve_envelope_resume_state(
+        n_bands: int,
+        resume_state: dict[str, Any] | None,
+    ) -> tuple[list[np.ndarray | None], list[np.ndarray | None], list[bool]]:
+        mags_out: list[np.ndarray | None] = [None] * n_bands
+        phases_out: list[np.ndarray | None] = [None] * n_bands
+        completed = [False] * n_bands
+        if not resume_state:
+            return mags_out, phases_out, completed
+
+        state_completed = list(resume_state.get("completed", []))
+        state_mags = list(resume_state.get("mags", []))
+        state_phases = list(resume_state.get("phases", []))
+        limit = min(n_bands, len(state_completed))
+        for i in range(limit):
+            if not bool(state_completed[i]):
+                continue
+            completed[i] = True
+            if i >= len(state_mags) or i >= len(state_phases):
+                continue
+            mag = state_mags[i]
+            phase = state_phases[i]
+            if mag is None or phase is None:
+                continue
+            mags_out[i] = np.asarray(mag)
+            phases_out[i] = np.asarray(phase)
+        return mags_out, phases_out, completed
+
+    @staticmethod
+    def _finalize_envelope_results(
+        mags_out: list[np.ndarray | None],
+        phases_out: list[np.ndarray | None],
+        hops: list[int],
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+        missing = [
+            i for i, (m, p) in enumerate(zip(mags_out, phases_out))
+            if m is None or p is None
+        ]
+        if missing:
+            raise RuntimeError(
+                "Hilbert envelope computation finished with missing bands: "
+                + ", ".join(str(i + 1) for i in missing[:8])
+                + (" ..." if len(missing) > 8 else "")
+            )
+        return (
+            [np.asarray(m) for m in mags_out],  # all non-None after validation
+            [np.asarray(p) for p in phases_out],  # all non-None after validation
+            hops,
+        )
 
 
     @staticmethod
@@ -1853,175 +2049,688 @@ class FilterBankDecomposition:
         row = np.arange(n_frames)
         return frames_e[row, local_idx], frames_p[row, local_idx]
 
-    def _compute_envelopes_gpu(self, torch: Any, n_samples: int,
-                               hops: list[int],
-                               hilbert_progress: Any = None,
-                               ) -> tuple[list[np.ndarray], list[np.ndarray],
-                                          list[int]]:
-        """Batched GPU Hilbert transform with VRAM-aware chunking.
+    @staticmethod
+    def _extract_frame_peaks_quadrature(
+        real: np.ndarray,
+        imag: np.ndarray,
+        h: int,
+        n_samples: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Peak-pick magnitude/phase from real + Hilbert-imag quadrature."""
+        n_frames = int(math.ceil(n_samples / h))
+        total = n_frames * h
+        pad = total - n_samples
+        real_dt = np.result_type(real.dtype, imag.dtype, np.float32)
+        if pad > 0:
+            real_p = np.zeros(total, dtype=real_dt)
+            imag_p = np.zeros(total, dtype=real_dt)
+            real_p[:n_samples] = real[:n_samples]
+            imag_p[:n_samples] = imag[:n_samples]
+        else:
+            real_p = np.asarray(real[:n_samples], dtype=real_dt)
+            imag_p = np.asarray(imag[:n_samples], dtype=real_dt)
+        frames_r = real_p.reshape(n_frames, h)
+        frames_i = imag_p.reshape(n_frames, h)
+        power = frames_r * frames_r + frames_i * frames_i
+        local_idx = np.argmax(power, axis=1)
+        row = np.arange(n_frames)
+        mag = np.asarray(np.sqrt(power[row, local_idx]), dtype=real_dt)
+        phase = np.asarray(
+            np.arctan2(frames_i[row, local_idx], frames_r[row, local_idx]),
+            dtype=real_dt,
+        )
+        return mag, phase
 
-        Preserves the native precision of the subbands.  Extracts frame
-        peaks per-chunk so neither VRAM nor system RAM need full
-        (n_bands, n_samples) arrays.
+    @staticmethod
+    def _extract_frame_peaks_quadrature_torch(
+        torch: Any,
+        real_t: Any,
+        imag_t: Any,
+        h: int,
+        n_samples: int,
+    ) -> tuple[Any, Any]:
+        n_frames = int(math.ceil(n_samples / h))
+        total = n_frames * h
+        pad = total - n_samples
+        if pad > 0:
+            real_p = torch.zeros(total, device=real_t.device, dtype=real_t.dtype)
+            imag_p = torch.zeros(total, device=imag_t.device, dtype=imag_t.dtype)
+            real_p[:n_samples] = real_t[:n_samples]
+            imag_p[:n_samples] = imag_t[:n_samples]
+        else:
+            real_p = real_t[:n_samples]
+            imag_p = imag_t[:n_samples]
+        frames_r = real_p.reshape(n_frames, h)
+        frames_i = imag_p.reshape(n_frames, h)
+        power = frames_r.square() + frames_i.square()
+        local_idx = torch.argmax(power, dim=1)
+        row = torch.arange(n_frames, device=real_t.device)
+        mag = torch.sqrt(power[row, local_idx])
+        phase = torch.atan2(frames_i[row, local_idx], frames_r[row, local_idx])
+        return mag, phase
+
+    @staticmethod
+    def _stft_n_fft(hop: int) -> int:
+        """STFT FFT length: next power of 2 of 4×hop, minimum 32."""
+        return max(32, 1 << math.ceil(math.log2(max(4 * hop, 4))))
+
+    @staticmethod
+    def _hilbert_rfft_filter(n_samples: int, cplx_dt: np.dtype) -> np.ndarray:
+        n_rfft = n_samples // 2 + 1
+        filt = np.zeros(n_rfft, dtype=cplx_dt)
+        if n_rfft <= 1:
+            return filt
+        if n_samples % 2 == 0:
+            filt[1:-1] = -1.0j
+        else:
+            filt[1:] = -1.0j
+        return filt
+
+    def _compute_envelope_band_cpu(
+        self,
+        sub: np.ndarray,
+        h: int,
+        n_samples: int,
+        hilbert_filter: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        from scipy.fft import irfft, rfft
+
+        real_dt = np.result_type(sub.dtype, np.float32)
+        cplx_dt = np.complex128 if real_dt == np.float64 else np.complex64
+        h_filter = (hilbert_filter if hilbert_filter is not None
+                    else self._hilbert_rfft_filter(n_samples, cplx_dt))
+        real_band = np.asarray(sub, dtype=real_dt)
+        imag_band = np.asarray(
+            irfft(rfft(real_band) * h_filter, n=n_samples),
+            dtype=real_dt,
+        )
+        return self._extract_frame_peaks_quadrature(
+            real_band, imag_band, h, n_samples)
+
+    def _compute_envelope_band_stft_cpu(
+        self,
+        sub: np.ndarray,
+        h: int,
+        n_samples: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """CPU STFT envelope: Hann-windowed spectral-peak amplitude and phase.
+
+        For each hop frame, applies a Hann window of length n_fft = 4×hop
+        (next power of two), computes the rfft, and reads off the magnitude
+        and phase of the dominant frequency bin.  This retains the true
+        spectral phase of the band's carrier rather than the broadband
+        instantaneous phase produced by the rfft/Hilbert approach.
+        """
+        from scipy.fft import rfft as _rfft
+
+        real_dt = np.result_type(sub.dtype, np.float32)
+        nfft = self._stft_n_fft(h)
+        sub_arr = np.asarray(sub[:n_samples], dtype=real_dt)
+        n_frames = math.ceil(n_samples / h)
+        win = np.hanning(nfft).astype(real_dt)
+        mags = np.empty(n_frames, dtype=real_dt)
+        phases = np.empty(n_frames, dtype=real_dt)
+        for fi in range(n_frames):
+            s = fi * h
+            seg = np.zeros(nfft, dtype=real_dt)
+            e = min(s + nfft, n_samples)
+            seg[:e - s] = sub_arr[s:e]
+            seg *= win
+            X = _rfft(seg)
+            pwr = X.real * X.real + X.imag * X.imag
+            pk = int(np.argmax(pwr))
+            mags[fi] = float(math.sqrt(float(pwr[pk])))
+            phases[fi] = float(math.atan2(float(X.imag[pk]), float(X.real[pk])))
+        return mags, phases
+
+    def _compute_envelopes_stft_gpu(
+        self,
+        torch: Any,
+        n_samples: int,
+        hops: list[int],
+        hilbert_progress: Any = None,
+        band_result_cb: Any = None,
+        mags_out: list[np.ndarray | None] | None = None,
+        phases_out: list[np.ndarray | None] | None = None,
+        completed: list[bool] | None = None,
+        drop_after_callback: bool = False,
+        stream_chunk_dir: str | None = None,
+        stream_chunk_dtype: np.dtype | None = None,
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+        """Two-stage OOM STFT-based per-band amplitude/phase envelope.
+
+        Replaces the single-shot rfft/irfft Hilbert with a Hann-windowed
+        STFT (n_fft = 4×hop, next power of two).  For every hop-aligned
+        frame the dominant frequency bin carries both the instantaneous
+        amplitude and the true spectral phase, giving richer phase
+        information than the time-domain quadrature peak-pick.
+
+        Memory management — two independent OOM stages:
+
+          Stage 1 (time division): when an STFT kernel OOMs, *T_cur*
+            (samples per GPU dispatch) is halved and the failed segment
+            is retried immediately.  All results from already-completed
+            time segments are kept in *frame_parts* (no work is lost).
+            *T_seg* persists so future batches inherit the last working
+            segment size.
+
+          Stage 2 (band reduction): when *T_cur* cannot be halved
+            further (already at *T_MIN* = 4 × max STFT window), halve
+            *band_chunk* and reset *T_cur = n_samples* so stage 1 can
+            re-discover the right size under the new (less crowded) VRAM
+            conditions.  Bands that remain in the new (smaller) chunk
+            keep their already-accumulated partial frames; deferred bands
+            are cleared and will reprocess from scratch in a later batch.
+
+        The innermost retry uses a *chunk_results* staging dict: partial
+        results are only committed to *frame_parts* after the entire
+        segment succeeds, guaranteeing no duplicate frames on retry.
         """
         n_bands = len(self.subbands)
         device = torch.device("cuda")
 
-        # Detect native precision from the first subband
-        native_dtype = np.result_type(self.subbands[0])
-        if native_dtype == np.float64:
-            real_dt = np.float64
-            cplx_dt = np.complex128
-            real_bytes = 8
-            cplx_bytes = 16
-        else:
-            real_dt = np.float32
-            cplx_dt = np.complex64
-            real_bytes = 4
-            cplx_bytes = 8
+        first_sub = next((s for s in self.subbands if isinstance(s, np.ndarray)), None)
+        if first_sub is None:
+            for i in range(n_bands):
+                cand = self.get_subband(i)
+                if len(cand) > 0:
+                    first_sub = cand
+                    break
+        if first_sub is None:
+            raise RuntimeError("No subband data available for Hilbert processing.")
+        native_dtype = np.result_type(first_sub)
+        real_dt: np.dtype = np.float64 if native_dtype == np.float64 else np.float32  # type: ignore[assignment]
+        torch_real = torch.float64 if real_dt == np.float64 else torch.float32
 
-        # --- VRAM budget --------------------------------------------------
-        # Exact peak trace for B bands of N samples (R=real, C=complex bytes):
-        #
-        # Resident always: h_filt = N*C
-        #
-        # Step  Tensors on device              Total VRAM
-        # ----  ----------------------------   ----------------------------
-        #  1    sig.to(device)                  N*C + B*N*R
-        #  2    Xf = fft(sig)  [sig+Xf live]   N*C + B*N*R + B*N*C   ← candidate
-        #  3    del sig                         N*C + B*N*C
-        #  4    Xf.mul_(h_filt) [in-place]      N*C + B*N*C
-        #  5    analytic = ifft(Xf) [Xf+ana]    N*C + 2*B*N*C         ← candidate
-        #  6    del Xf                          N*C + B*N*C
-        #  7    .abs()/.angle() + .float()       N*C + B*N*C + B*N*4   ← candidate
-        #
-        # Peak = max(step2, step5, step7)
-        #   step2 = N*C + B*N*(R + C)
-        #   step5 = N*C + 2*B*N*C
-        #   step7 = N*C + B*N*(C + 4)
-        #
-        # For f64: R=8,C=16 → step2= B*N*24, step5= B*N*32 → peak=step5
-        # For f32: R=4,C=8  → step2= B*N*12, step5= B*N*16 → peak=step5
-        # In both cases step5 dominates.
-        #
-        # peak_total = N*C + 2*B*N*C
-        # Solve: B = (usable - N*C) / (2*N*C)
+        if mags_out is None:
+            mags_out = [None] * n_bands
+        if phases_out is None:
+            phases_out = [None] * n_bands
+        if completed is None:
+            completed = [False] * n_bands
+
+        done_count = sum(1 for f in completed if f)
+        if hilbert_progress and done_count:
+            hilbert_progress(done_count, n_bands)
+
+        pending = [i for i in range(n_bands) if not completed[i]]
+        if not pending:
+            if drop_after_callback:
+                return [], [], hops
+            return self._finalize_envelope_results(mags_out, phases_out, hops)
+
+        print(f"  Hilbert/STFT path: CUDA GPU ({len(pending)} pending bands)",
+              flush=True)
+
+        n_ffts = [self._stft_n_fft(hops[i]) for i in range(n_bands)]
+
+        # T_MIN: smallest useful time segment — at least 4 full STFT windows
+        # for every pending band so each dispatch yields ≥ 4 frames.
+        T_MIN = max(512, max(n_ffts[i] * 4 for i in pending))
+        T_MIN = min(T_MIN, n_samples)
+
+        # Deterministic efficiency grid: choose initial (band_chunk, T_seg)
+        # by maximizing throughput score under detected GPU + host RAM caps.
+        real_item = np.dtype(real_dt).itemsize
+        cplx_item = np.dtype(np.complex128 if real_dt == np.float64 else np.complex64).itemsize
+        # GPU budget is derived only from live free VRAM (no fixed MB constants,
+        # no environment override for GPU memory amount).
+        gpu_budget_bytes: int | None = None
         try:
-            free_mem = torch.cuda.mem_get_info()[0]
+            free_b, _total_b = torch.cuda.mem_get_info(device=device)
+            gpu_budget_bytes = int(float(free_b) * 0.70)
         except Exception:
-            free_mem = 2 * 1024**3
-        usable = int(free_mem * 0.5)                  # use at most 50% of free VRAM
-        h_filt_cost = n_samples * cplx_bytes          # N*C  (h_filt)
-        per_band_peak = 2 * n_samples * cplx_bytes    # 2*N*C per band at step5
-        max_bands = max(1, int((usable - h_filt_cost) // per_band_peak))
+            gpu_budget_bytes = None
 
-        print(f"  VRAM budget: {free_mem / 1024**2:.0f} MB free, "
-              f"{(h_filt_cost + per_band_peak * max_bands) / 1024**2:.0f} MB for "
-              f"{max_bands}/{n_bands} bands/chunk")
+        # Build candidate segment lengths by repeated halving (deterministic).
+        seg_grid: list[int] = []
+        t_probe = n_samples
+        while True:
+            if t_probe not in seg_grid:
+                seg_grid.append(t_probe)
+            if t_probe <= T_MIN:
+                break
+            t_probe = max(T_MIN, t_probe // 2)
 
-        # --- One-sided Hilbert filter (native complex, uploaded once) -----
-        h_filter_np = np.zeros(n_samples, dtype=cplx_dt)
-        h_filter_np[0] = 1.0
-        if n_samples % 2 == 0:
-            h_filter_np[1:n_samples // 2] = 2.0
-            h_filter_np[n_samples // 2] = 1.0
-        else:
-            h_filter_np[1:(n_samples + 1) // 2] = 2.0
-        h_filt = torch.from_numpy(h_filter_np).to(device)
+        # Per-band frame counts / host result bytes (mag+phase).
+        frames_total = {bi: max(1, math.ceil(n_samples / hops[bi])) for bi in pending}
+        host_bytes_per_band = {bi: frames_total[bi] * 2 * real_item for bi in pending}
 
-        mags_out: list[np.ndarray] = [None] * n_bands   # type: ignore[list-item]
-        phases_out: list[np.ndarray] = [None] * n_bands  # type: ignore[list-item]
+        def _gpu_bytes_for_band(bi: int, t_seg: int) -> int:
+            nfft = n_ffts[bi]
+            h = hops[bi]
+            n_frames_seg = max(1, math.ceil(t_seg / max(h, 1)))
+            n_bins = nfft // 2 + 1
+            preload = (t_seg + nfft) * real_item
+            stft_core = n_bins * n_frames_seg * cplx_item
+            # Conservative multiplier for intermediate tensors / workspaces.
+            return int(preload + stft_core * 4)
 
-        chunk_start = 0
-        while chunk_start < n_bands:
-            chunk_end = min(chunk_start + max_bands, n_bands)
+        # Sort pending bands by cost descending for safe worst-case chunk estimates.
+        pending_host_sorted = sorted(
+            pending, key=lambda bi: host_bytes_per_band[bi], reverse=True
+        )
 
-            while True:
-                chunk_size = chunk_end - chunk_start
+        # Start at maximum concurrency as requested, then reduce only on OOM
+        # using the alternating diagonal walk (time, bands, time, ...).
+        T_seg: int = n_samples
+        band_chunk: int = len(pending)
+        _gpu_src = ("live-free-vram" if gpu_budget_bytes is not None
+                    else "unknown-vram (OOM fallback)")
+        print(
+            f"  Hilbert grid: band_chunk={band_chunk}, T_seg={T_seg} "
+            f"(gpu={_gpu_src})",
+            flush=True,
+        )
+
+        pend_pos = 0
+        # Diagonal OOM walk: alternate reducing time and band count.
+        trade_reduce_time_next = True
+
+        while pend_pos < len(pending):
+            chunk_end = min(pend_pos + band_chunk, len(pending))
+            chunk = pending[pend_pos:chunk_end]
+            # Disk-backed finalized Hilbert buffers (written per time chunk).
+            chunk_outputs: dict[int, tuple[np.memmap, np.memmap, str, str]] = {}
+
+            chunk_dt = np.dtype(stream_chunk_dtype if stream_chunk_dtype is not None else real_dt)
+
+            def _init_chunk_outputs(_chunk: list[int]) -> dict[int, tuple[np.memmap, np.memmap, str, str]]:
+                out: dict[int, tuple[np.memmap, np.memmap, str, str]] = {}
+                for _bi in _chunk:
+                    _n_frames_b = math.ceil(n_samples / hops[_bi])
+                    if stream_chunk_dir:
+                        _mag_path = self._envelope_stream_mag_path(stream_chunk_dir, _bi)
+                        _phi_path = self._envelope_stream_phase_path(stream_chunk_dir, _bi)
+                        os.makedirs(os.path.dirname(_mag_path), exist_ok=True)
+                    else:
+                        _mag_path = os.path.join(
+                            os.getcwd(),
+                            f".tmp_fb_hilbert_band_{_bi:05d}_mag.npy",
+                        )
+                        _phi_path = os.path.join(
+                            os.getcwd(),
+                            f".tmp_fb_hilbert_band_{_bi:05d}_phase.npy",
+                        )
+                    _mag_mode = "r+" if os.path.isfile(_mag_path) else "w+"
+                    _phi_mode = "r+" if os.path.isfile(_phi_path) else "w+"
+                    _mag_mm = np.lib.format.open_memmap(
+                        _mag_path, mode=_mag_mode, dtype=chunk_dt, shape=(_n_frames_b,))
+                    _phi_mm = np.lib.format.open_memmap(
+                        _phi_path, mode=_phi_mode, dtype=chunk_dt, shape=(_n_frames_b,))
+                    out[_bi] = (_mag_mm, _phi_mm, _mag_path, _phi_path)
+                return out
+
+            def _cleanup_chunk_outputs(_out: dict[int, tuple[np.memmap, np.memmap, str, str]]) -> None:
+                for _mag_mm, _phi_mm, _mag_path, _phi_path in _out.values():
+                    try:
+                        _mag_mm.flush()
+                    except Exception:
+                        pass
+                    try:
+                        _phi_mm.flush()
+                    except Exception:
+                        pass
+                    try:
+                        del _mag_mm
+                    except Exception:
+                        pass
+                    try:
+                        del _phi_mm
+                    except Exception:
+                        pass
+                    if not stream_chunk_dir:
+                        for _p in (_mag_path, _phi_path):
+                            try:
+                                if os.path.isfile(_p):
+                                    os.remove(_p)
+                            except OSError:
+                                pass
+
+            chunk_outputs: dict[int, tuple[np.memmap, np.memmap, str, str]] = {}
+
+            T_cur: int = T_seg   # local time segment; may shrink during loop
+            t = 0
+            need_outer_restart = False
+
+            while t < n_samples:
+                _backpressure_wait(label=f"stft_gpu t={t}")
+                t_end = min(t + T_cur, n_samples)
+
+                # Per-band frame range for this time segment
+                # Frame f belongs to [t, t_end) when f*h ∈ [t, t_end).
+                # With center=False STFT and sig starting at f_lo*h:
+                #   local frame k → global frame f_lo + k
+                seg_info: list[tuple[int, int, int]] = []  # (f_lo, f_hi, needed_len)
+                for bi in chunk:
+                    h = hops[bi]
+                    nfft = n_ffts[bi]
+                    n_frames_total = math.ceil(n_samples / h)
+                    f_lo = (math.ceil(t / h) if t > 0 else 0)
+                    f_hi = min(math.ceil(t_end / h), n_frames_total)
+                    nsf = f_hi - f_lo
+                    needed = (nfft + (nsf - 1) * h) if nsf > 0 else 0
+                    seg_info.append((f_lo, f_hi, needed))
+
+                # chunk_results: staged results — committed to chunk_outputs
+                # only after this segment succeeds.
+                chunk_results: dict[int, tuple[int, int, np.ndarray, np.ndarray]] = {}
+                stacked_segs: list[Any] = []
+                oom_err = False
+
+                def _oom_cooldown() -> None:
+                    # Slow down rapid OOM retry loops so CUDA alloc state can settle.
+                    try:
+                        torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    gc.collect()
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    time.sleep(3.0)
+
                 try:
-                    stacked = np.stack([
-                        np.asarray(self.subbands[i], dtype=real_dt)
-                        for i in range(chunk_start, chunk_end)
-                    ])
-                    sig = torch.from_numpy(stacked).to(device)
-                    del stacked
+                    # 1. Preload every band's time segment to GPU
+                    for j, bi in enumerate(chunk):
+                        f_lo, f_hi, needed = seg_info[j]
+                        nsf = f_hi - f_lo
+                        if nsf <= 0:
+                            stacked_segs.append(None)
+                            continue
+                        sig_start = f_lo * hops[bi]
+                        seg_np = np.zeros(needed, dtype=real_dt)
+                        avail = max(0, min(needed, n_samples - sig_start))
+                        if avail > 0:
+                            src = self.subbands[bi]
+                            if src is None:
+                                src = self.get_subband(bi)
+                            seg_np[:avail] = np.asarray(
+                                src[sig_start: sig_start + avail],
+                                dtype=real_dt,
+                            )
+                        stacked_segs.append(torch.from_numpy(seg_np).to(device))
 
-                    Xf = torch.fft.fft(sig, dim=-1)
-                    del sig
-                    Xf.mul_(h_filt)
-                    analytic = torch.fft.ifft(Xf, dim=-1)
-                    del Xf
                     torch.cuda.empty_cache()
 
-                    env_chunk = analytic.abs().cpu().numpy()
-                    phi_chunk = analytic.angle().cpu().numpy()
-                    del analytic
-                    torch.cuda.empty_cache()
-                    break  # success
+                    # 2. STFT → dominant-bin mag + spectral phase per band.
+                    # Group by (hop, nfft, n_frames) so each group runs in
+                    # one batched torch.stft call instead of serial per-band calls.
+                    grouped: dict[tuple[int, int, int], list[tuple[int, int]]] = {}
+                    for j, bi in enumerate(chunk):
+                        f_lo, f_hi, _needed = seg_info[j]
+                        nsf = f_hi - f_lo
+                        if nsf <= 0 or stacked_segs[j] is None:
+                            continue
+                        key = (hops[bi], n_ffts[bi], nsf)
+                        grouped.setdefault(key, []).append((j, bi))
 
-                except (torch.cuda.OutOfMemoryError, RuntimeError) as _e:
+                    for (h, nfft, nsf), members in grouped.items():
+                        win = torch.hann_window(nfft, device=device, dtype=torch_real)
+                        batch = torch.stack([stacked_segs[j] for j, _bi in members], dim=0)
+                        Zxx = torch.stft(
+                            batch,
+                            n_fft=nfft,
+                            hop_length=h,
+                            win_length=nfft,
+                            window=win,
+                            center=False,
+                            return_complex=True,
+                        )  # (B, n_bins, n_actual_frames)
+                        del win, batch
+
+                        Zxx = Zxx[:, :, :nsf]
+                        power = Zxx.real.square() + Zxx.imag.square()
+                        peak_bins = torch.argmax(power, dim=1)  # (B, nsf)
+                        z_peak = torch.gather(
+                            Zxx, 1, peak_bins.unsqueeze(1)).squeeze(1)  # (B, nsf)
+                        del Zxx, power, peak_bins
+
+                        mag_np = (z_peak.abs()
+                                  .to(dtype=torch_real)
+                                  .cpu().numpy()
+                                  .astype(real_dt, copy=False))
+                        phi_np = (torch.angle(z_peak)
+                                  .to(dtype=torch_real)
+                                  .cpu().numpy()
+                                  .astype(real_dt, copy=False))
+                        del z_peak
+                        torch.cuda.empty_cache()
+
+                        for row_idx, (j, bi) in enumerate(members):
+                            f_lo, f_hi, _needed = seg_info[j]
+                            chunk_results[bi] = (
+                                f_lo,
+                                f_hi,
+                                mag_np[row_idx],
+                                phi_np[row_idx],
+                            )
+
+                except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as _e:
                     if isinstance(_e, RuntimeError) and not _is_cuda_oom(_e):
                         raise
-                    # del locals()[name] is a Python no-op — use explicit deletes
-                    try: del stacked
-                    except NameError: pass
-                    try: del sig
-                    except NameError: pass
-                    try: del Xf
-                    except NameError: pass
-                    try: del analytic
-                    except NameError: pass
-                    try: del env_chunk
-                    except NameError: pass
-                    try: del phi_chunk
-                    except NameError: pass
+                    oom_err = True
+                finally:
+                    for st in stacked_segs:
+                        if st is not None:
+                            del st
+                    stacked_segs.clear()
+                    gc.collect()
                     torch.cuda.empty_cache()
 
-                    max_bands = max(1, chunk_size // 2)
-                    chunk_end = min(chunk_start + max_bands, n_bands)
-                    print(f"  OOM — reducing to {max_bands} bands/chunk")
-                    if chunk_size <= 1:
-                        raise  # truly cannot fit even 1 band
+                if oom_err:
+                    _oom_cooldown()
+                    # Explicitly unload subbands touched by the failed attempt
+                    # so the retry starts from a cleaner RAM state.
+                    for _bi in chunk:
+                        if _bi < len(completed) and not completed[_bi]:
+                            self.subbands[_bi] = None
+                    gc.collect()
+                    reduced = False
+                    for _ in range(2):
+                        reduce_time = trade_reduce_time_next
+                        trade_reduce_time_next = not trade_reduce_time_next
+                        if reduce_time:
+                            new_T = T_cur // 2
+                            if new_T >= T_MIN:
+                                T_cur = new_T
+                                T_seg = T_cur
+                                print(
+                                    f"\n  STFT OOM (time) — T_seg → {T_cur} samples",
+                                    flush=True,
+                                )
+                                reduced = True
+                                break
+                        else:
+                            if band_chunk > 1:
+                                new_bc = max(1, band_chunk // 2)
+                                new_chunk = pending[pend_pos: pend_pos + new_bc]
+                                band_chunk = new_bc
+                                chunk = new_chunk
+                                chunk_end = pend_pos + new_bc
+                                # Preserve already-written outputs for retained bands.
+                                keep = set(chunk)
+                                for _bi in list(chunk_outputs.keys()):
+                                    if _bi not in keep:
+                                        _m, _p, _m_path, _p_path = chunk_outputs.pop(_bi)
+                                        try:
+                                            _m.flush()
+                                            _p.flush()
+                                        except Exception:
+                                            pass
+                                        try:
+                                            del _m
+                                            del _p
+                                        except Exception:
+                                            pass
+                                for _bi in chunk:
+                                    if _bi not in chunk_outputs:
+                                        # Lazily allocate output buffer only when needed.
+                                        pass
+                                # Keep current time segmentation; continue diagonal
+                                # walk by alternating next OOM action.
+                                seg_info = seg_info[:len(chunk)]
+                                print(
+                                    f"\n  STFT OOM (bands) — band_chunk → {band_chunk}",
+                                    flush=True,
+                                )
+                                reduced = True
+                                break
+                    if reduced:
+                        continue   # same t with reduced shape
 
-            # Frame peak extraction per band — vectorized, O(n_samples) numpy
-            for j, i in enumerate(range(chunk_start, chunk_end)):
-                mags_out[i], phases_out[i] = self._extract_frame_peaks(
-                    env_chunk[j], phi_chunk[j], hops[i], n_samples)
-            del env_chunk, phi_chunk
+                    # Single band at minimum time → CPU fallback
+                    bi = chunk[0]
+                    print(f"\n  STFT OOM — band {bi + 1}/{n_bands} → CPU",
+                          flush=True)
+                    src = self.subbands[bi]
+                    if src is None:
+                        src = self.get_subband(bi)
+                    mags_out[bi], phases_out[bi] = (
+                        self._compute_envelope_band_stft_cpu(
+                            np.asarray(src, dtype=real_dt),
+                            hops[bi], n_samples))
+                    completed[bi] = True
+                    if band_result_cb:
+                        band_result_cb(bi, mags_out[bi], phases_out[bi], hops[bi])
+                    # Band is finalized; release source subband immediately.
+                    if bi < len(self.subbands):
+                        self.subbands[bi] = None
+                    done_count += 1
+                    if hilbert_progress:
+                        hilbert_progress(done_count, n_bands)
+                    pend_pos += 1
+                    need_outer_restart = True
+                    break  # exit time loop; outer while re-derives chunk
 
-            print(f"  Hilbert envelopes: {chunk_end}/{n_bands} bands on GPU")
+                # Success: commit this segment's results directly to outputs
+                for bi, (f_lo, f_hi, mag_np, phi_np) in chunk_results.items():
+                    if bi not in chunk_outputs:
+                        chunk_outputs.update(_init_chunk_outputs([bi]))
+                    out_mag, out_phi, _mag_path, _phi_path = chunk_outputs[bi]
+                    out_mag[f_lo:f_hi] = mag_np[:max(0, f_hi - f_lo)]
+                    out_phi[f_lo:f_hi] = phi_np[:max(0, f_hi - f_lo)]
+                    out_mag.flush()
+                    out_phi.flush()
+
+                t = t_end  # advance to next time segment
+                if t < n_samples:
+                    print(
+                        f"\r  STFT segments: {t_end}/{n_samples} samples "
+                        f"(bands {chunk[0] + 1}-{chunk[-1] + 1}, T={T_cur})",
+                        end="",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"\r  STFT segments: {n_samples}/{n_samples} samples "
+                        f"(bands {chunk[0] + 1}-{chunk[-1] + 1}, T={T_cur})",
+                        end="",
+                        flush=True,
+                    )
+
+            if need_outer_restart:
+                _cleanup_chunk_outputs(chunk_outputs)
+                continue  # outer while: re-derive chunk from updated pend_pos/band_chunk
+
+            print()
+            # All time segments done for this chunk → finalize and checkpoint
+            for bi in chunk:
+                if mags_out[bi] is not None:
+                    continue  # already set by CPU fallback (shouldn't reach here)
+                if bi not in chunk_outputs:
+                    # No successful chunk writes for this band in this pass;
+                    # materialize an empty buffer so downstream callbacks
+                    # receive a consistent array.
+                    chunk_outputs.update(_init_chunk_outputs([bi]))
+                out_mag, out_phi, _mag_path, _phi_path = chunk_outputs[bi]
+                mags_out[bi] = np.asarray(out_mag)
+                phases_out[bi] = np.asarray(out_phi)
+                completed[bi] = True
+                if band_result_cb:
+                    band_result_cb(bi, mags_out[bi], phases_out[bi], hops[bi])
+                if drop_after_callback:
+                    mags_out[bi] = None
+                    phases_out[bi] = None
+                # Band is finalized; release source subband immediately.
+                if bi < len(self.subbands):
+                    self.subbands[bi] = None
+                done_count += 1
+
+            _cleanup_chunk_outputs(chunk_outputs)
+
+            gc.collect()
+            torch.cuda.empty_cache()
             if hilbert_progress:
-                hilbert_progress(chunk_end, n_bands)
+                hilbert_progress(done_count, n_bands)
+            print(f"  STFT envelopes: {done_count}/{n_bands} bands on GPU",
+                  flush=True)
 
-            chunk_start = chunk_end
+            pend_pos = chunk_end
 
-        del h_filt
-        torch.cuda.empty_cache()
-        return mags_out, phases_out, hops
+        if drop_after_callback:
+            return [], [], hops
+        return self._finalize_envelope_results(mags_out, phases_out, hops)
 
     def _compute_envelopes_cpu(self, n_samples: int,
                                hops: list[int],
                                hilbert_progress: Any = None,
+                               band_result_cb: Any = None,
+                               mags_out: list[np.ndarray | None] | None = None,
+                               phases_out: list[np.ndarray | None] | None = None,
+                               completed: list[bool] | None = None,
+                               drop_after_callback: bool = False,
                                ) -> tuple[list[np.ndarray], list[np.ndarray],
                                           list[int]]:
-        """Serial CPU Hilbert envelope computation (scipy fallback)."""
-        from scipy.signal import hilbert
+        """Serial CPU Hilbert envelope computation (RFFT fallback)."""
 
         n_bands = len(self.subbands)
-        mags: list[np.ndarray] = []
-        phases: list[np.ndarray] = []
+        if mags_out is None:
+            mags_out = [None] * n_bands
+        if phases_out is None:
+            phases_out = [None] * n_bands
+        if completed is None:
+            completed = [False] * n_bands
+
+        first_sub = next((s for s in self.subbands if isinstance(s, np.ndarray)), None)
+        if first_sub is None:
+            for i in range(n_bands):
+                cand = self.get_subband(i)
+                if len(cand) > 0:
+                    first_sub = cand
+                    break
+        if first_sub is None:
+            raise RuntimeError("No subband data available for Hilbert processing.")
+        real_dt = np.result_type(first_sub.dtype, np.float32)
+        cplx_dt = np.complex128 if real_dt == np.float64 else np.complex64
+        hilbert_filter = self._hilbert_rfft_filter(n_samples, cplx_dt)
+        done_count = sum(1 for flag in completed if flag)
+        if hilbert_progress and done_count:
+            hilbert_progress(done_count, n_bands)
+
         for i, sub in enumerate(self.subbands):
-            h = hops[i]
-            real_dt = np.result_type(sub.dtype, np.float32)
-            analytic = hilbert(np.asarray(sub, dtype=real_dt))
-            env = np.asarray(np.abs(analytic), dtype=real_dt)
-            phi = np.asarray(np.angle(analytic), dtype=real_dt)
-            m, p = self._extract_frame_peaks(env, phi, h, n_samples)
-            mags.append(m)
-            phases.append(p)
-            if hilbert_progress and (i % 10 == 0 or i == n_bands - 1):
-                hilbert_progress(i + 1, n_bands)
-        return mags, phases, hops
+            if completed[i]:
+                continue
+            if sub is None:
+                sub = self.get_subband(i)
+            _backpressure_wait(label=f"envelope_cpu band_{i}")
+            mags_out[i], phases_out[i] = self._compute_envelope_band_cpu(
+                np.asarray(sub, dtype=real_dt), hops[i], n_samples, hilbert_filter)
+            completed[i] = True
+            if band_result_cb:
+                band_result_cb(i, mags_out[i], phases_out[i], hops[i])
+            if drop_after_callback:
+                mags_out[i] = None
+                phases_out[i] = None
+            # Band is finalized; release source subband immediately.
+            self.subbands[i] = None
+            done_count += 1
+            if hilbert_progress and (done_count % 10 == 0 or done_count == n_bands):
+                hilbert_progress(done_count, n_bands)
+        if drop_after_callback:
+            return [], [], hops
+        return self._finalize_envelope_results(mags_out, phases_out, hops)
 
     # ------------------------------------------------------------------
     # CQT ↔ filterbank band mapping
@@ -2165,6 +2874,7 @@ class FilterBankDecomposition:
         order = self._lp_exponent()
         real_dt = np.result_type(signal.dtype, np.float32)
         torch_real = torch.float64 if real_dt == np.float64 else torch.float32
+        itemsize = np.dtype(real_dt).itemsize
 
         # Crossover frequencies: fmax of every band except the last.
         xo: list[float] = [
@@ -2172,6 +2882,56 @@ class FilterBankDecomposition:
             for i in range(n_bands - 1)
         ]
 
+        est_subband_bytes = int(n_bands) * int(n_samples) * int(itemsize)
+        # Automatic RAM policy (no env-based caps/overrides): go disk-backed
+        # when projected subband footprint is a substantial fraction of
+        # currently available physical RAM.
+        avail_ram_bytes = 0
+        try:
+            import psutil  # type: ignore
+            avail_ram_bytes = int(psutil.virtual_memory().available)
+        except Exception:
+            try:
+                import ctypes
+                class _MEMSTAT(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_uint32),
+                        ("dwMemoryLoad", ctypes.c_uint32),
+                        ("ullTotalPhys", ctypes.c_uint64),
+                        ("ullAvailPhys", ctypes.c_uint64),
+                        ("ullTotalPageFile", ctypes.c_uint64),
+                        ("ullAvailPageFile", ctypes.c_uint64),
+                        ("ullTotalVirtual", ctypes.c_uint64),
+                        ("ullAvailVirtual", ctypes.c_uint64),
+                        ("ullAvailExtendedVirtual", ctypes.c_uint64),
+                    ]
+                ms = _MEMSTAT()
+                ms.dwLength = ctypes.sizeof(_MEMSTAT)
+                if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms)):  # type: ignore[attr-defined]
+                    avail_ram_bytes = int(ms.ullAvailPhys)
+            except Exception:
+                avail_ram_bytes = 0
+        if avail_ram_bytes <= 0:
+            # If RAM availability is unknown, prefer disk-backed safety.
+            disk_backed = True
+        else:
+            # Switch to disk-backed before projected buffers can pressure RAM.
+            disk_backed = est_subband_bytes > int(0.40 * avail_ram_bytes)
+        # Alternate OOM reductions diagonally: time, bands, time, bands...
+        oom_reduce_time_next = True
+        if disk_backed:
+            os.makedirs(fb_dir, exist_ok=True)
+            print(
+                "  Filterbank buffer mode: disk-backed "
+                f"(~{est_subband_bytes / (1024**3):.2f} GiB projected)",
+                flush=True,
+            )
+        else:
+            print(
+                "  Filterbank buffer mode: RAM-backed "
+                f"(~{est_subband_bytes / (1024**3):.2f} GiB projected)",
+                flush=True,
+            )
         # --- Estimate overlap needed for time-chunk mode ------------------
         # IR decay of lp(f,fc)=1/(1+(f/fc)^N) ≈ exp(-2π·fc·t / N).
         # Use 5 time-constants → M ≈ 5·sr / (2π·fc_min / N).
@@ -2195,23 +2955,64 @@ class FilterBankDecomposition:
             H_batch : (len(band_slice), n_rfft) float32 on device
             final_lp: (n_rfft,) float32 — LP at upper edge of last band
             """
+            bis = list(band_slice)
+            if not bis:
+                return torch.empty((0, freqs_t.shape[0]), device=device, dtype=torch_real), prev_lp_t
+
+            non_last = [bi for bi in bis if bi < n_bands - 1]
+            if non_last:
+                fc_t = torch.as_tensor(
+                    [xo[bi] for bi in non_last], device=device, dtype=torch_real)
+                curr_lps = 1.0 / (1.0 + (freqs_t.unsqueeze(0) / fc_t.unsqueeze(1)).pow(order))
+                prev_stack = torch.empty_like(curr_lps)
+                prev_stack[0] = prev_lp_t
+                if curr_lps.shape[0] > 1:
+                    prev_stack[1:] = curr_lps[:-1]
+                diff_lps = curr_lps - prev_stack
+                final_lp = curr_lps[-1]
+            else:
+                curr_lps = torch.empty((0, freqs_t.shape[0]), device=device, dtype=torch_real)
+                diff_lps = curr_lps
+                final_lp = prev_lp_t
+
+            diff_map: dict[int, torch.Tensor] = {
+                bi: diff_lps[i] for i, bi in enumerate(non_last)
+            }
+            prev_map: dict[int, torch.Tensor] = {}
+            for i, bi in enumerate(non_last):
+                prev_map[bi] = prev_stack[i]
+
             H_list: list["torch.Tensor"] = []
-            lp_cursor = prev_lp_t
-            for bi in band_slice:
+            for bi in bis:
                 band = bands[bi]
-                if bi < n_bands - 1:
-                    curr_lp = _lp_vec(xo[bi], freqs_t)
-                else:
-                    curr_lp = None   # last band — HP residual
                 if not band.enabled:
                     H_list.append(torch.zeros_like(freqs_t))
-                elif curr_lp is None:
-                    H_list.append(1.0 - lp_cursor)
+                elif bi == n_bands - 1:
+                    if non_last:
+                        prev_for_last = final_lp
+                    else:
+                        prev_for_last = prev_lp_t
+                    H_list.append(1.0 - prev_for_last)
                 else:
-                    H_list.append(curr_lp - lp_cursor)
-                if curr_lp is not None:
-                    lp_cursor = curr_lp
-            return torch.stack(H_list), lp_cursor   # (B, n_rfft), (n_rfft,)
+                    H_list.append(diff_map[bi])
+            return torch.stack(H_list), final_lp   # (B, n_rfft), (n_rfft,)
+
+        def _alloc_sub_buffer(bi: int) -> np.ndarray:
+            cur = all_subs[bi]
+            if cur is not None:
+                return cur
+            # Backpressure: wait for RAM headroom before any new allocation.
+            _backpressure_wait(label=f"band_{bi}")
+            if disk_backed:
+                # Write directly to permanent band shard path.
+                path = os.path.join(fb_dir, f"band_{bi:02d}.npy")
+                mm = np.lib.format.open_memmap(
+                    path, mode="w+", dtype=real_dt, shape=(n_samples,))
+                all_subs[bi] = mm
+                return mm
+            arr = np.zeros(n_samples, dtype=real_dt)
+            all_subs[bi] = arr
+            return arr
 
         # ================================================================
         # FULL-SIGNAL MODE: rfft(whole signal) kept on GPU; band-batch
@@ -2225,6 +3026,7 @@ class FilterBankDecomposition:
             """Process all bands using full-signal FFT.  Returns True on
             success.  Cleans up *all* temporaries on partial OOM and
             re-raises only when a single-band chunk still cannot fit."""
+            nonlocal oom_reduce_time_next
             done = 0
             batch_sz = n_bands
             prev_lp = torch.zeros(S.shape[0], device=device, dtype=torch_real)
@@ -2254,15 +3056,24 @@ class FilterBankDecomposition:
                         torch.cuda.empty_cache()
                         if chunk_sz <= 1:
                             return False   # escalate to time-chunk mode
+                        reduce_time = oom_reduce_time_next
+                        oom_reduce_time_next = not oom_reduce_time_next
+                        if reduce_time:
+                            print(
+                                "\n  GPU OOM (full-signal) — switching to "
+                                "time-chunk mode",
+                                flush=True,
+                            )
+                            return False
                         chunk_sz //= 2
                         batch_sz = chunk_sz
                         print(f"\n  GPU OOM (band-batch) — reducing to "
                               f"{chunk_sz} bands/chunk", flush=True)
 
-                # download and write WAVs
+                # Download and write band shard chunks.
                 batch_np = out_batch.cpu().numpy()
                 del out_batch
-                _write_wav_batch(done, chunk_sz, batch_np)
+                _write_shard_batch(done, chunk_sz, batch_np)
 
                 prev_lp = final_lp
                 done += chunk_sz
@@ -2281,15 +3092,12 @@ class FilterBankDecomposition:
             freqs_gen_fn(n_rfft) → (freqs_t, H_precomputed?) — not used here;
             H is rebuilt per block since n_rfft changes with block size.
             """
+            nonlocal oom_reduce_time_next
             # Start: one block covers the whole signal (halved on OOM).
             C = 1 << math.ceil(math.log2(max(n_samples, 2)))
 
             done = 0
             band_batch_sz = n_bands
-
-            # Pre-allocate all subband output buffers on CPU up-front.
-            for bi in range(n_bands):
-                all_subs[bi] = np.zeros(n_samples, dtype=real_dt)
 
             # LP cursor at the lower boundary of each band batch: computed
             # once per band-batch start and reused across block retries.
@@ -2341,12 +3149,27 @@ class FilterBankDecomposition:
                         if final_lp_b is not None: del final_lp_b
                         del freqs_b, prev_lp_b
                         torch.cuda.empty_cache()
-                        if chunk_sz > 1:
-                            band_batch_sz = max(1, band_batch_sz // 2)
-                            print(f"\n  GPU OOM (chunk H-build) — band batch "
-                                  f"→ {band_batch_sz}", flush=True)
-                            need_band_restart = True
-                            break
+                        reduced = False
+                        for _ in range(2):
+                            reduce_time = oom_reduce_time_next
+                            oom_reduce_time_next = not oom_reduce_time_next
+                            if reduce_time and C > overlap_M:
+                                C = max(overlap_M, C // 2)
+                                print(f"\n  GPU OOM (chunk H-build) — C halved "
+                                      f"→ {C}", flush=True)
+                                reduced = True
+                                break
+                            if (not reduce_time) and chunk_sz > 1:
+                                band_batch_sz = max(1, band_batch_sz // 2)
+                                print(f"\n  GPU OOM (chunk H-build) — band batch "
+                                      f"→ {band_batch_sz}", flush=True)
+                                need_band_restart = True
+                                reduced = True
+                                break
+                        if reduced:
+                            if need_band_restart:
+                                break
+                            continue
                         if C <= overlap_M:
                             raise RuntimeError(
                                 f"CUDA OOM: cannot build H for 1 band at "
@@ -2396,16 +3219,28 @@ class FilterBankDecomposition:
                             if final_lp_b is not None:
                                 del final_lp_b; final_lp_b = None
                             torch.cuda.empty_cache()
-                            if chunk_sz > 1:
-                                band_batch_sz = max(1, band_batch_sz // 2)
-                                print(f"\n  GPU OOM (time block) — band batch "
-                                      f"→ {band_batch_sz}", flush=True)
-                                need_band_restart = True
-                            elif C <= overlap_M:
-                                raise RuntimeError(
-                                    f"CUDA OOM: time block C={C} at minimum. "
-                                    f"Insufficient VRAM.")
-                            else:
+                            reduced = False
+                            for _ in range(2):
+                                reduce_time = oom_reduce_time_next
+                                oom_reduce_time_next = not oom_reduce_time_next
+                                if reduce_time and C > overlap_M:
+                                    C = max(overlap_M, C // 2)
+                                    print(f"\n  GPU OOM (time block) — C halved "
+                                          f"→ {C}", flush=True)
+                                    reduced = True
+                                    break
+                                if (not reduce_time) and chunk_sz > 1:
+                                    band_batch_sz = max(1, band_batch_sz // 2)
+                                    print(f"\n  GPU OOM (time block) — band batch "
+                                          f"→ {band_batch_sz}", flush=True)
+                                    need_band_restart = True
+                                    reduced = True
+                                    break
+                            if not reduced:
+                                if C <= overlap_M:
+                                    raise RuntimeError(
+                                        f"CUDA OOM: time block C={C} at minimum. "
+                                        f"Insufficient VRAM.")
                                 C = max(overlap_M, C // 2)
                                 print(f"\n  GPU OOM (time block) — C halved "
                                       f"→ {C}", flush=True)
@@ -2413,7 +3248,10 @@ class FilterBankDecomposition:
                             break
 
                         for j, bi in enumerate(bslice):
-                            all_subs[bi][out_start:out_end] = valid_out[j]
+                            buf = _alloc_sub_buffer(bi)
+                            buf[out_start:out_end] = valid_out[j]
+                            if isinstance(buf, np.memmap):
+                                buf.flush()
 
                     if block_oom or need_band_restart:
                         if H_b        is not None: del H_b
@@ -2435,12 +3273,15 @@ class FilterBankDecomposition:
         # ================================================================
         # Shared helpers
         # ================================================================
-        def _write_wav_batch(done: int, chunk_sz: int,
-                             batch_np: "np.ndarray") -> None:
+        def _write_shard_batch(done: int, chunk_sz: int,
+                               batch_np: "np.ndarray") -> None:
             for j in range(chunk_sz):
                 bi = done + j
                 sub = np.asarray(batch_np[j], dtype=real_dt)
-                all_subs[bi] = sub
+                buf = _alloc_sub_buffer(bi)
+                buf[:] = sub
+                if isinstance(buf, np.memmap):
+                    buf.flush()
 
         def _print_progress(done: int, t0: float, cb: Any) -> None:
             elapsed = time.monotonic() - t0
@@ -2494,37 +3335,84 @@ class FilterBankDecomposition:
         print()
 
     @staticmethod
-    def _write_band_audio_file(
+    def _write_band_npy_shard(
         fb_dir: str,
         bi: int,
-        sub: np.ndarray,
+        sub: np.ndarray | None,
         band: "BandDef",
         sr: int,
         save_precision: str,
+        *,
+        src_npy_path: str | None = None,
     ) -> dict[str, Any]:
-        peak = float(np.abs(sub).max())
-        normed = (sub / peak if peak > 0 else np.zeros_like(sub))
-        if save_precision == "16-bit":
-            if _HAS_SOUNDFILE:
-                fname = f"band_{bi:02d}.flac"
-                fpath = os.path.join(fb_dir, fname)
-                _sf.write(fpath, normed, sr, subtype="PCM_16", format="FLAC")
-            else:
-                fname = f"band_{bi:02d}.wav"
-                fpath = os.path.join(fb_dir, fname)
-                scaled = ((normed * 32767).astype(np.int16)
-                          if peak > 0 else np.zeros(len(sub), dtype=np.int16))
-                wavfile.write(fpath, sr, scaled)
+        """Save one band shard as a .npy file.
+
+        NPY stores the raw float signal at full computation precision with
+        zero information loss.  The peak amplitude is recorded in metadata
+        for reference but is NOT needed for reconstruction (the signal is
+        stored unnormalized).
+
+        If *src_npy_path* points to an existing `.npy` shard whose dtype
+        already matches *save_precision*, it is reused directly.
+        Otherwise a fresh np.save is issued.
+        """
+        save_dt = _precision_label_to_real_dtype(save_precision)
+        fname = f"band_{bi:02d}.npy"
+        fpath = os.path.join(fb_dir, fname)
+
+        src_arr: np.ndarray | None = None
+        if src_npy_path is not None and os.path.isfile(src_npy_path):
+            src_arr = np.load(src_npy_path, mmap_mode="r", allow_pickle=False)
+        elif sub is not None:
+            src_arr = np.asarray(sub)
         else:
-            fname = f"band_{bi:02d}.wav"
-            fpath = os.path.join(fb_dir, fname)
-            save_dt = _precision_label_to_real_dtype(save_precision)
-            payload = np.asarray(normed, dtype=save_dt)
-            if _HAS_SOUNDFILE:
-                subtype = "DOUBLE" if save_precision == "64-bit" else "FLOAT"
-                _sf.write(fpath, payload, sr, subtype=subtype, format="WAV")
+            raise RuntimeError(
+                f"Missing source band data for band {bi} while writing {fname}"
+            )
+
+        peak = float(np.abs(np.asarray(src_arr)).max())
+        moved = False
+        same_path = (
+            src_npy_path is not None
+            and os.path.abspath(src_npy_path) == os.path.abspath(fpath)
+        )
+        if src_npy_path is not None and os.path.isfile(src_npy_path):
+            # Existing `.npy` shard: reuse directly when dtype already matches.
+            if hasattr(sub, 'flush'):
+                sub.flush()
+            src_dt = src_arr.dtype if src_arr is not None else None
+            if src_dt == save_dt:
+                if same_path:
+                    moved = True
+                else:
+                    import shutil as _shutil
+                    _shutil.move(src_npy_path, fpath)
+                moved = True
+        if not moved:
+            _backpressure_wait(label=f"write_band_{bi}_npy")
+            if same_path:
+                # Avoid writing over a file that is currently mmap-open.
+                tmp_path = fpath + ".tmp.npy"
+                out_arr = np.asarray(src_arr, dtype=save_dt)
+                if isinstance(src_arr, np.memmap):
+                    _mm_obj = getattr(src_arr, "_mmap", None)
+                    try:
+                        src_arr.flush()
+                    except Exception:
+                        pass
+                    if _mm_obj is not None:
+                        try:
+                            _mm_obj.close()
+                        except Exception:
+                            pass
+                    del src_arr
+                    gc.collect()
+                np.save(tmp_path, out_arr)
+                del out_arr
+                os.replace(tmp_path, fpath)
             else:
-                wavfile.write(fpath, sr, payload)
+                np.save(fpath, np.asarray(src_arr, dtype=save_dt))
+
         return {
             "index": bi,
             "fmin": band.fmin,
@@ -2532,20 +3420,143 @@ class FilterBankDecomposition:
             "label": band.label,
             "file": fname,
             "peak_amplitude": peak,
+            "format": "npy",
         }
 
-    def _write_band_audio_files(
+    def _write_band_npy_shards(
         self, fb_dir: str, sr: int, save_precision: str,
     ) -> list[dict[str, Any]]:
-        return [
-            self._write_band_audio_file(fb_dir, i, sub, band, sr, save_precision)
-            for i, (band, sub) in enumerate(zip(self.bands, self.subbands))
-        ]
+        """Write/update all band `.npy` shards from available sources."""
+        results = []
+        for i, band in enumerate(self.bands):
+            sub = self.subbands[i] if i < len(self.subbands) else None
+            src_path = None
+            if i < len(self._subband_files):
+                src_path = self._subband_files[i]
+            if src_path is None:
+                fallback = os.path.join(fb_dir, f"band_{i:02d}.npy")
+                if os.path.isfile(fallback):
+                    src_path = fallback
+            results.append(self._write_band_npy_shard(
+                fb_dir, i, sub, band, sr, save_precision,
+                src_npy_path=src_path,
+            ))
+
+        return results
+
+    def _reduce_existing_band_npy_bitdepth(
+        self, fb_dir: str, sr: int, save_precision: str,
+    ) -> list[dict[str, Any]]:
+        """Reduce existing band `.npy` shards to save precision only.
+
+        This path is disk-only: it requires existing `.npy` sources and does
+        not use in-memory subband arrays.
+        """
+        results: list[dict[str, Any]] = []
+        for i, band in enumerate(self.bands):
+            src_path = None
+            if i < len(self._subband_files):
+                cand = self._subband_files[i]
+                if cand and os.path.isfile(cand):
+                    src_path = cand
+            if src_path is None:
+                cand = os.path.join(fb_dir, f"band_{i:02d}.npy")
+                if os.path.isfile(cand):
+                    src_path = cand
+            if src_path is None:
+                raise RuntimeError(
+                    f"Missing required on-disk band shard for band {i}"
+                )
+            results.append(self._write_band_npy_shard(
+                fb_dir, i, None, band, sr, save_precision,
+                src_npy_path=src_path,
+            ))
+        return results
+
+    @staticmethod
+    def _envelope_path(analysis_dir: str) -> str:
+        return os.path.join(analysis_dir, "filterbank", "fb_envelopes.npz")
+
+    @staticmethod
+    def _envelope_stream_mag_path(analysis_dir: str, band_idx: int) -> str:
+        return os.path.join(
+            analysis_dir, "filterbank", f"fb_envelope_mag_{int(band_idx):05d}.npy"
+        )
+
+    @staticmethod
+    def _envelope_stream_phase_path(analysis_dir: str, band_idx: int) -> str:
+        return os.path.join(
+            analysis_dir, "filterbank", f"fb_envelope_phase_{int(band_idx):05d}.npy"
+        )
+
+    @staticmethod
+    def _save_npz_atomic(path: str, data: dict[str, np.ndarray]) -> None:
+        root, _ = os.path.splitext(path)
+        tmp_base = root + ".tmp"
+        tmp_actual = tmp_base + ".npz"
+        try:
+            np.savez_compressed(tmp_base, **data)
+            os.replace(tmp_actual, path)
+        finally:
+            try:
+                if os.path.exists(tmp_actual):
+                    os.remove(tmp_actual)
+            except OSError:
+                pass
+
+    def _write_filterbank_meta(
+        self,
+        fb_dir: str,
+        sr: int,
+        n_bands: int,
+        meta_bands: list[dict[str, Any]],
+        *,
+        save_precision: str,
+        band_audio_precision: str,
+        wav_path: str | None = None,
+        intermediate_precision: str | None = None,
+    ) -> None:
+        import json as _json
+
+        meta: dict[str, Any] = {
+            "filter_type": self.filter_type,
+            "sr": sr,
+            "n_bands": n_bands,
+            "bands": meta_bands,
+            "save_precision": save_precision,
+            "band_audio_precision": band_audio_precision,
+        }
+        if intermediate_precision is not None:
+            meta["intermediate_precision"] = intermediate_precision
+        center_hz = _infer_fb_center_hz_from_bands(self.bands)
+        if center_hz is not None:
+            meta["cafls_center_hz"] = float(center_hz)
+        if wav_path:
+            meta["wav_path"] = os.path.abspath(wav_path)
+        with open(os.path.join(fb_dir, "filterbank_meta.json"), "w") as f:
+            _json.dump(meta, f, indent=2)
+
+    @staticmethod
+    def _bands_match_meta(
+        meta_bands: list[dict[str, Any]],
+        bands: list["BandDef"],
+    ) -> bool:
+        if len(meta_bands) != len(bands):
+            return False
+        for meta_band, band in zip(meta_bands, bands):
+            if not math.isclose(float(meta_band.get("fmin", 0.0)), float(band.fmin),
+                                rel_tol=0.0, abs_tol=1e-9):
+                return False
+            if not math.isclose(float(meta_band.get("fmax", 0.0)), float(band.fmax),
+                                rel_tol=0.0, abs_tol=1e-9):
+                return False
+        return True
 
     def compute_and_save(self, signal: np.ndarray, bands: list["BandDef"],
                          analysis_dir: str, sr: int,
                          batch_size: int = 32,
                          envelope_hop: int | list[int] | None = None,
+                         intermediate_precision: str | None = None,
                          save_precision: str = "32-bit",
                          wav_path: str | None = None,
                          progress_cb: Any = None) -> None:
@@ -2568,57 +3579,158 @@ class FilterBankDecomposition:
         nyq = self.sr / 2.0
         n_bands = len(bands)
         n_samples = len(signal)
+        if intermediate_precision is None:
+            intermediate_precision = (
+                "64-bit" if np.result_type(signal.dtype) == np.float64
+                else "32-bit"
+            )
 
         fb_dir = os.path.join(analysis_dir, "filterbank")
         os.makedirs(fb_dir, exist_ok=True)
 
-        all_subs: list[np.ndarray | None] = [None] * n_bands
         t0 = time.monotonic()
-
-        if torch.cuda.is_available():
-            # --- GPU zero-phase FFT filtering ----------------------------
-            self._filter_bands_gpu(signal, bands, nyq, n_samples, n_bands,
-                                   fb_dir, sr, all_subs, t0,
-                                   progress_cb)
+        if envelope_hop is None:
+            expected_hops = [self.band_hop(b, self.sr) for b in self.bands]
+        elif isinstance(envelope_hop, int):
+            expected_hops = [envelope_hop] * n_bands
         else:
-            # --- CPU thread pool (CUDA unavailable) ----------------------
-            from concurrent.futures import ThreadPoolExecutor, as_completed
+            expected_hops = list(envelope_hop)
 
-            n_workers = min(os.cpu_count() or 4, 16)
+        resume_state = self.load_envelope_checkpoint_state(analysis_dir)
+        if resume_state is not None and resume_state.get("hops") != expected_hops:
+            print("  Ignoring stale Hilbert checkpoint (hop mismatch)")
+            resume_state = None
 
-            def _filter_and_store(i: int) -> int:
-                sub = self._filter_one_band(signal, bands[i], nyq)
-                all_subs[i] = sub
-                return i
+        reuse_saved = False
+        meta_loaded = self.load_meta(analysis_dir)
+        if meta_loaded is not None:
+            meta_top, meta_bands = meta_loaded
+            # Reuse existing permanent filterbank bands regardless of whether
+            # Hilbert checkpoint exists.
+            _meta_ok = (
+                int(meta_top.get("sr", sr)) == sr
+                and meta_top.get("filter_type", self.filter_type) == self.filter_type
+                and self._bands_match_meta(meta_bands, bands)
+                and len(meta_bands) == n_bands
+            )
+            if _meta_ok:
+                real_dt = _precision_label_to_real_dtype(intermediate_precision)
+                _subs: list[np.ndarray | None] = [None] * n_bands
+                _completed = (
+                    list(resume_state.get("completed", []))
+                    if resume_state is not None else [False] * n_bands
+                )
+                if len(_completed) != n_bands:
+                    _completed = [False] * n_bands
+                for _bi, bm in enumerate(meta_bands):
+                    if _completed[_bi]:
+                        # Hilbert already complete for this band.
+                        continue
+                    fpath = os.path.join(fb_dir, bm["file"])
+                    if not os.path.isfile(fpath):
+                        _meta_ok = False
+                        break
+                    _mm = np.load(fpath, mmap_mode='r', allow_pickle=False)
+                    if len(_mm) != n_samples:
+                        _meta_ok = False
+                        break
+                    _subs[_bi] = _mm.astype(real_dt, copy=False)
+            if _meta_ok:
+                self.subbands = _subs
+                self._subband_real_dt = real_dt
+                self._subband_files = [
+                    os.path.join(fb_dir, bm["file"]) for bm in meta_bands
+                ]
+                self._subband_file_meta = [dict(bm) for bm in meta_bands]
+                reuse_saved = True
+                if resume_state is None:
+                    resume_state = {
+                        "hops": list(expected_hops),
+                        "completed": [False] * n_bands,
+                    }
+                    print("  Reusing existing filterbank bands from disk "
+                          "(no refilter; Hilbert will run)")
+                else:
+                    done = sum(1 for flag in resume_state["completed"] if flag)
+                    print(f"  Resuming Hilbert checkpoint: {done}/{n_bands} bands "
+                          f"(bands mmap-backed, no eager RAM load)")
 
-            done_count = 0
-            with ThreadPoolExecutor(max_workers=n_workers) as pool:
-                futures = {pool.submit(_filter_and_store, i): i
-                           for i in range(n_bands)}
-                for fut in as_completed(futures):
-                    fut.result()
-                    done_count += 1
-                    frac = done_count / n_bands * 0.5
-                    if done_count % 20 == 0 or done_count == n_bands:
-                        elapsed = time.monotonic() - t0
-                        eta = (elapsed / done_count) * (n_bands - done_count)
-                        print(f"\r  Filtering bands: {done_count}/{n_bands} "
-                              f"({done_count * 100 // n_bands}%) — "
-                              f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining",
-                              end="", flush=True)
-                    if progress_cb:
-                        progress_cb(frac, f"Filtering {done_count}/{n_bands}")
-            print()
+        if not reuse_saved:
+            all_subs: list[np.ndarray | None] = [None] * n_bands
+            if torch.cuda.is_available():
+                # --- GPU zero-phase FFT filtering ------------------------
+                self._filter_bands_gpu(signal, bands, nyq, n_samples, n_bands,
+                                       fb_dir, sr, all_subs, t0,
+                                       progress_cb)
+            else:
+                # --- CPU thread pool (CUDA unavailable) ------------------
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                n_workers = min(os.cpu_count() or 4, 16)
+
+                def _filter_and_store(i: int) -> int:
+                    sub = self._filter_one_band(signal, bands[i], nyq)
+                    all_subs[i] = sub
+                    return i
+
+                done_count = 0
+                with ThreadPoolExecutor(max_workers=n_workers) as pool:
+                    futures = {pool.submit(_filter_and_store, i): i
+                               for i in range(n_bands)}
+                    for fut in as_completed(futures):
+                        fut.result()
+                        done_count += 1
+                        frac = done_count / n_bands * 0.5
+                        if done_count % 20 == 0 or done_count == n_bands:
+                            elapsed = time.monotonic() - t0
+                            eta = (elapsed / done_count) * (n_bands - done_count)
+                            print(f"\r  Filtering bands: {done_count}/{n_bands} "
+                                  f"({done_count * 100 // n_bands}%) — "
+                                  f"{elapsed:.1f}s elapsed, ~{eta:.0f}s remaining",
+                                  end="", flush=True)
+                        if progress_cb:
+                            progress_cb(frac, f"Filtering {done_count}/{n_bands}")
+                print()
+
+            self.subbands = [s for s in all_subs]  # type: ignore[misc]
+            del all_subs
+
+            # Persist restart-safe intermediary sidecars before Hilbert starts.
+            interim_bands = self._write_band_npy_shards(
+                fb_dir, sr, intermediate_precision)
+            self._subband_real_dt = _precision_label_to_real_dtype(intermediate_precision)
+            self._subband_files = [
+                os.path.join(fb_dir, bm["file"]) for bm in interim_bands
+            ]
+            self._subband_file_meta = [dict(bm) for bm in interim_bands]
+            self._write_filterbank_meta(
+                fb_dir, sr, n_bands, interim_bands,
+                save_precision=save_precision,
+                band_audio_precision=intermediate_precision,
+                wav_path=wav_path,
+                intermediate_precision=intermediate_precision,
+            )
 
         # --- Compute Hilbert envelopes (GPU when available) ---------------
-        # Temporarily set self.subbands so compute_envelopes can use them,
-        # then clear to free memory.
         if progress_cb:
             progress_cb(0.5, "Hilbert envelopes")
         print("  Computing Hilbert envelopes ...", end="", flush=True)
         t1 = time.monotonic()
-        self.subbands = [s for s in all_subs]  # type: ignore[misc]
-        del all_subs
+        env_save_dt = _precision_label_to_np_dtype(save_precision)
+
+        checkpoint_state = {
+            "mags": [None] * n_bands,
+            "phases": [None] * n_bands,
+            "hops": list(expected_hops),
+            "completed": [False] * n_bands,
+        }
+        if resume_state is not None:
+            rs_hops = list(resume_state.get("hops", []))
+            rs_done = list(resume_state.get("completed", []))
+            if len(rs_hops) == n_bands:
+                checkpoint_state["hops"] = [int(h) for h in rs_hops]
+            if len(rs_done) == n_bands:
+                checkpoint_state["completed"] = [bool(x) for x in rs_done]
 
         def _hilbert_progress(chunk_done: int, chunk_total: int) -> None:
             # Hilbert = 50..90% of total
@@ -2626,36 +3738,83 @@ class FilterBankDecomposition:
             if progress_cb:
                 progress_cb(frac, f"Hilbert {chunk_done}/{chunk_total}")
 
-        mags, phases, hops = self.compute_envelopes(
-            hop=envelope_hop,
-            hilbert_progress=_hilbert_progress)
+        def _checkpoint_band(
+            band_idx: int,
+            mag: np.ndarray,
+            phase: np.ndarray,
+            hop_val: int,
+        ) -> None:
+            checkpoint_state["mags"][band_idx] = None
+            checkpoint_state["phases"][band_idx] = None
+            checkpoint_state["hops"][band_idx] = int(hop_val)
+            checkpoint_state["completed"][band_idx] = True
+            self.save_envelope_progress_state(
+                analysis_dir,
+                hops=list(checkpoint_state["hops"]),
+                completed=list(checkpoint_state["completed"]),
+            )
+            # Persist finalized per-band envelope shards in save precision.
+            mag_path = self._envelope_stream_mag_path(analysis_dir, band_idx)
+            phase_path = self._envelope_stream_phase_path(analysis_dir, band_idx)
+            need_write = True
+            try:
+                if os.path.isfile(mag_path) and os.path.isfile(phase_path):
+                    mm = np.load(mag_path, mmap_mode="r", allow_pickle=False)
+                    pm = np.load(phase_path, mmap_mode="r", allow_pickle=False)
+                    need_write = (
+                        mm.dtype != env_save_dt
+                        or pm.dtype != env_save_dt
+                        or len(mm) != len(mag)
+                        or len(pm) != len(phase)
+                    )
+            except Exception:
+                need_write = True
+            if need_write:
+                np.save(mag_path, np.asarray(mag, dtype=env_save_dt))
+                np.save(phase_path, np.asarray(phase, dtype=env_save_dt))
+
+        if not all(bool(x) for x in checkpoint_state["completed"]):
+            # Streaming Hilbert: each band is checkpoint-written on completion
+            # and immediately dropped from RAM.
+            _mags_ignored, _phases_ignored, _hops_ignored = self.compute_envelopes(
+                hop=envelope_hop,
+                hilbert_progress=_hilbert_progress,
+                band_result_cb=_checkpoint_band,
+                resume_state=checkpoint_state,
+                drop_after_callback=True,
+                stream_chunk_dir=analysis_dir,
+                stream_chunk_dtype=np.dtype(env_save_dt))
+        hops = list(checkpoint_state["hops"])
+        if not all(bool(x) for x in checkpoint_state["completed"]):
+            missing = [str(i + 1) for i, done in enumerate(checkpoint_state["completed"]) if not done]
+            raise RuntimeError(
+                "Hilbert checkpoint incomplete after run; missing bands: "
+                + ", ".join(missing[:8])
+                + (" ..." if len(missing) > 8 else "")
+            )
         print(f" done ({time.monotonic() - t1:.1f}s)")
         if progress_cb:
             progress_cb(0.9, "Saving")
-        meta_bands = self._write_band_audio_files(fb_dir, sr, save_precision)
+        # Final band shard conversion uses on-disk .npy sources only.
+        meta_bands = self._reduce_existing_band_npy_bitdepth(
+            fb_dir, sr, save_precision
+        )
+        self._write_filterbank_meta(
+            fb_dir, sr, n_bands, meta_bands,
+            save_precision=save_precision,
+            band_audio_precision=save_precision,
+            wav_path=wav_path,
+            intermediate_precision=intermediate_precision,
+        )
+
+        # --- Finalize envelope progress marker (per-band envelope shards
+        # remain on disk and are loaded lazily when needed) -----------------
+        self.save_envelope_progress_state(
+            analysis_dir,
+            hops=hops,
+            completed=[True] * n_bands,
+        )
         self.subbands = []  # free the subband memory after envelopes + sidecars
-
-        # --- Write metadata JSON ------------------------------------------
-        import json as _json
-        meta: dict = {
-            "filter_type": self.filter_type,
-            "sr": sr,
-            "n_bands": n_bands,
-            "bands": meta_bands,
-            "save_precision": save_precision,
-            "band_audio_precision": save_precision,
-        }
-        center_hz = _infer_fb_center_hz_from_bands(self.bands)
-        if center_hz is not None:
-            meta["cafls_center_hz"] = float(center_hz)
-        if wav_path:
-            meta["wav_path"] = os.path.abspath(wav_path)
-        with open(os.path.join(fb_dir, "filterbank_meta.json"), "w") as f:
-            _json.dump(meta, f, indent=2)
-
-        # --- Write envelopes NPZ -----------------------------------------
-        self.save_envelopes(analysis_dir, mags, phases, hops,
-                            save_precision=save_precision)
         print(f"  Filterbank complete: {n_bands} bands in "
               f"{time.monotonic() - t0:.1f}s")
         if progress_cb:
@@ -2664,7 +3823,7 @@ class FilterBankDecomposition:
     def save(self, analysis_dir: str, sr: int,
              envelope_hop: int | list[int] | None = None,
              save_precision: str = "32-bit") -> None:
-        """Save subbands as WAV files + metadata, and bake Hilbert
+        """Save subbands as `.npy` shards + metadata, and bake Hilbert
         envelopes into *fb_envelopes.npz* with per-band hops derived
         from each band's bandwidth.
 
@@ -2687,7 +3846,7 @@ class FilterBankDecomposition:
         # Keep native-precision subbands alive through envelope analysis, then
         # write reduced sidecars only once the dependent analysis is finished.
         mags, phases, hops = self.compute_envelopes(hop=envelope_hop)
-        meta["bands"] = self._write_band_audio_files(fb_dir, sr, save_precision)
+        meta["bands"] = self._write_band_npy_shards(fb_dir, sr, save_precision)
         import json
         with open(os.path.join(fb_dir, "filterbank_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -2697,26 +3856,40 @@ class FilterBankDecomposition:
 
     @staticmethod
     def envelope_save_dict(
-        mags: list[np.ndarray],
-        phases: list[np.ndarray],
+        mags: list[np.ndarray | None],
+        phases: list[np.ndarray | None],
         hops: list[int],
         *,
         save_precision: str = "32-bit",
+        completed: list[bool] | None = None,
     ) -> dict[str, np.ndarray]:
         """Build an NPZ payload for filterbank envelopes."""
+        n_bands = len(hops)
+        if completed is None:
+            completed = [True] * n_bands
+        if len(mags) != n_bands or len(phases) != n_bands or len(completed) != n_bands:
+            raise ValueError("Envelope payload lengths must match n_bands")
+
         save_dtype = _precision_label_to_np_dtype(save_precision)
+        completed_idx = [
+            i for i, done in enumerate(completed)
+            if done and mags[i] is not None and phases[i] is not None
+        ]
         mag_encoded, mag_scale = _encode_scaled_float_arrays(
-            [np.asarray(m) for m in mags], save_dtype)
-        phase_encoded = [np.asarray(p, dtype=save_dtype) for p in phases]
+            [np.asarray(mags[i]) for i in completed_idx], save_dtype)
+        phase_encoded = [
+            np.asarray(phases[i], dtype=save_dtype) for i in completed_idx
+        ]
         data: dict[str, np.ndarray] = {
-            "n_bands": np.int64(len(mags)),
+            "n_bands": np.int64(n_bands),
             "hops": np.array(hops, dtype=np.int64),
+            "completed": np.array(completed, dtype=np.uint8),
         }
         if mag_scale is not None:
             data["mag_scale"] = np.float64(mag_scale)
-        for i, (m, p) in enumerate(zip(mag_encoded, phase_encoded)):
-            data[f"mag_{i}"] = m
-            data[f"phase_{i}"] = p
+        for slot, band_idx in enumerate(completed_idx):
+            data[f"mag_{band_idx}"] = mag_encoded[slot]
+            data[f"phase_{band_idx}"] = phase_encoded[slot]
         return data
 
     def save_envelopes(self, analysis_dir: str,
@@ -2730,8 +3903,76 @@ class FilterBankDecomposition:
         os.makedirs(fb_dir, exist_ok=True)
         data = self.envelope_save_dict(
             mags, phases, hops, save_precision=save_precision)
-        np.savez_compressed(
-            os.path.join(fb_dir, "fb_envelopes.npz"), **data)
+        self._save_npz_atomic(self._envelope_path(analysis_dir), data)
+
+    def save_envelope_progress_state(
+        self,
+        analysis_dir: str,
+        *,
+        hops: list[int],
+        completed: list[bool],
+    ) -> None:
+        """Write lightweight progress metadata to the main envelope file.
+
+        This updates *fb_envelopes.npz* after each completed band without
+        materializing large mag/phase arrays in RAM.
+        """
+        fb_dir = os.path.join(analysis_dir, "filterbank")
+        os.makedirs(fb_dir, exist_ok=True)
+        data: dict[str, np.ndarray] = {
+            "n_bands": np.int64(len(hops)),
+            "hops": np.array([int(h) for h in hops], dtype=np.int64),
+            "completed": np.array(completed, dtype=np.uint8),
+            "progress_only": np.uint8(1),
+        }
+        self._save_npz_atomic(self._envelope_path(analysis_dir), data)
+
+    @staticmethod
+    def load_envelope_checkpoint_state(
+        analysis_dir: str,
+    ) -> dict[str, Any] | None:
+        # Active path: resume state lives in fb_envelopes.npz
+        path = FilterBankDecomposition._envelope_path(analysis_dir)
+        if os.path.isfile(path):
+            with np.load(path) as d:
+                if "n_bands" not in d or "completed" not in d or "hops" not in d:
+                    return None
+                n = int(d["n_bands"])
+                hops = d["hops"].tolist()
+                completed = [bool(x) for x in np.asarray(d["completed"]).tolist()]
+                if len(completed) != n:
+                    return None
+                if len(hops) != n:
+                    return None
+                return {
+                    "hops": hops,
+                    "completed": completed,
+                }
+        return None
+
+    @staticmethod
+    def load_envelope_band_shard(
+        analysis_dir: str,
+        band_idx: int,
+    ) -> tuple[np.ndarray, np.ndarray, int] | None:
+        mag_path = FilterBankDecomposition._envelope_stream_mag_path(
+            analysis_dir, band_idx)
+        phi_path = FilterBankDecomposition._envelope_stream_phase_path(
+            analysis_dir, band_idx)
+        if os.path.isfile(mag_path) and os.path.isfile(phi_path):
+            mag = np.load(mag_path, mmap_mode="r", allow_pickle=False)
+            phase_arr = np.load(phi_path, mmap_mode="r", allow_pickle=False)
+            phase_dt = (np.float32 if phase_arr.dtype == np.float16
+                        else phase_arr.dtype)
+            phase = np.asarray(phase_arr, dtype=phase_dt)
+            hop = 1
+            state = FilterBankDecomposition.load_envelope_checkpoint_state(analysis_dir)
+            if state is not None:
+                hops = list(state.get("hops", []))
+                if 0 <= band_idx < len(hops):
+                    hop = int(hops[band_idx])
+            return np.asarray(mag), phase, hop
+        return None
 
     @staticmethod
     def load_envelopes(analysis_dir: str
@@ -2743,26 +3984,45 @@ class FilterBankDecomposition:
                             "fb_envelopes.npz")
         if not os.path.isfile(path):
             return None
-        d = np.load(path)
-        if "n_bands" not in d:
-            # Legacy single-hop format — ignore, will recompute
-            return None
-        n = int(d["n_bands"])
-        hops = d["hops"].tolist()
-        mag_scale = float(d["mag_scale"]) if "mag_scale" in d else None
-        mags = [_decode_scaled_float_array(d[f"mag_{i}"], mag_scale)
-                for i in range(n)]
-        phases = []
-        for i in range(n):
-            phase_arr = d[f"phase_{i}"]
-            phase_dt = np.float32 if phase_arr.dtype == np.float16 else phase_arr.dtype
-            phases.append(np.asarray(phase_arr, dtype=phase_dt))
-        return mags, phases, hops
+        with np.load(path) as d:
+            if "n_bands" not in d:
+                # Legacy single-hop format — ignore, will recompute
+                return None
+            n = int(d["n_bands"])
+            completed = ([bool(x) for x in np.asarray(d["completed"]).tolist()]
+                         if "completed" in d else [True] * n)
+            if not all(completed):
+                return None
+            hops = d["hops"].tolist()
+            if "progress_only" in d:
+                mags: list[np.ndarray] = []
+                phases: list[np.ndarray] = []
+                for i in range(n):
+                    loaded = FilterBankDecomposition.load_envelope_band_shard(
+                        analysis_dir, i)
+                    if loaded is None:
+                        return None
+                    mag, phase, _hop = loaded
+                    mags.append(np.asarray(mag))
+                    phases.append(np.asarray(phase))
+                return mags, phases, hops
+            mag_scale = float(d["mag_scale"]) if "mag_scale" in d else None
+            for i in range(n):
+                if f"mag_{i}" not in d or f"phase_{i}" not in d:
+                    return None
+            mags = [_decode_scaled_float_array(d[f"mag_{i}"], mag_scale)
+                    for i in range(n)]
+            phases = []
+            for i in range(n):
+                phase_arr = d[f"phase_{i}"]
+                phase_dt = np.float32 if phase_arr.dtype == np.float16 else phase_arr.dtype
+                phases.append(np.asarray(phase_arr, dtype=phase_dt))
+            return mags, phases, hops
 
     @staticmethod
     def load_meta(analysis_dir: str
                   ) -> tuple[dict, list[dict]] | None:
-        """Load only the filterbank metadata (no WAV data).
+        """Load only filterbank metadata (no band shard payloads).
 
         Returns ``(top_meta, bands_list)`` or *None*.
         """
@@ -2774,6 +4034,38 @@ class FilterBankDecomposition:
         with open(meta_path) as f:
             meta = json.load(f)
         return meta, meta["bands"]
+
+    def get_subband(self, band_idx: int) -> np.ndarray:
+        """Return one subband, loading it lazily from disk if needed."""
+        if band_idx < 0 or band_idx >= len(self.subbands):
+            return np.zeros(0, dtype=self._subband_real_dt)
+        cached = self.subbands[band_idx]
+        if isinstance(cached, np.ndarray):
+            return cached
+        fpath = (self._subband_files[band_idx]
+                 if band_idx < len(self._subband_files) else None)
+        bm = (self._subband_file_meta[band_idx]
+              if band_idx < len(self._subband_file_meta) else None)
+        if not fpath or not os.path.isfile(fpath):
+            arr = np.zeros(0, dtype=self._subband_real_dt)
+            self.subbands[band_idx] = arr
+            return arr
+
+        if fpath.lower().endswith(".npy"):
+            raw = np.load(fpath, mmap_mode="r", allow_pickle=False)
+            arr = raw.astype(self._subband_real_dt, copy=False)
+        else:
+            # Legacy scaled payload: restore original float scale.
+            _sr_wav, data = _load_audio(fpath)
+            peak = float((bm or {}).get("peak_amplitude", 1.0))
+            if np.issubdtype(data.dtype, np.integer):
+                imax = max(abs(np.iinfo(data.dtype).min),
+                           np.iinfo(data.dtype).max)
+                arr = data.astype(self._subband_real_dt) / imax * peak
+            else:
+                arr = data.astype(self._subband_real_dt) * peak
+        self.subbands[band_idx] = arr
+        return arr
 
     @staticmethod
     def load(analysis_dir: str, compute_precision: str | None = None
@@ -2789,50 +4081,38 @@ class FilterBankDecomposition:
         fb = FilterBankDecomposition(meta["sr"], meta.get("filter_type", "Linkwitz-Riley 4"))
         real_dt = (_precision_label_to_real_dtype(compute_precision)
                    if compute_precision else np.float32)
+        fb._subband_real_dt = real_dt
         n_bands = len(meta["bands"])
         t0 = time.monotonic()
         for idx, bm in enumerate(meta["bands"]):
             fb.bands.append(BandDef(
                 fmin=bm["fmin"], fmax=bm["fmax"], label=bm.get("label", "")))
             fpath = os.path.join(fb_dir, bm["file"])
-            if os.path.isfile(fpath):
-                sr_wav, data = _load_audio(fpath)
-                if np.issubdtype(data.dtype, np.integer):
-                    sub = data.astype(real_dt) / max(abs(np.iinfo(data.dtype).min), np.iinfo(data.dtype).max) * bm.get("peak_amplitude", 1.0)
-                else:
-                    sub = data.astype(real_dt) * bm.get("peak_amplitude", 1.0)
-                fb.subbands.append(sub)
-            else:
-                fb.subbands.append(np.zeros(0, dtype=real_dt))
+            fb._subband_files.append(fpath if os.path.isfile(fpath) else None)
+            fb._subband_file_meta.append(dict(bm))
+            fb.subbands.append(None)
             # Progress every 20 bands or on the last one
             if idx % 20 == 0 or idx == n_bands - 1:
                 elapsed = time.monotonic() - t0
                 pct = (idx + 1) / n_bands * 100
                 eta = (elapsed / (idx + 1)) * (n_bands - idx - 1) if idx > 0 else 0.0
-                print(f"\r  Loading filterbank WAVs: {idx + 1}/{n_bands} "
+                print(f"\r  Loading filterbank metadata: {idx + 1}/{n_bands} "
                       f"({pct:.0f}%) — {elapsed:.1f}s elapsed, "
                       f"~{eta:.0f}s remaining", end="", flush=True)
         print()  # newline after progress
         return fb
 
     def graduate_band(self, band_idx: int, output_dir: str, sr: int) -> str:
-        """Export a single subband as a standalone FLAC file in output_dir.
-        Returns the written file path."""
+        """Export a single subband as a standalone .npy file in output_dir.
+        Returns the written file path.  Raw (unnormalized) float signal is
+        stored so no precision is lost on export.
+        """
         band = self.bands[band_idx]
-        sub = self.subbands[band_idx]
+        sub = self.get_subband(band_idx)
         safe_label = band.label.replace(" ", "_").replace("/", "-")
-        peak = float(np.abs(sub).max())
-        if _HAS_SOUNDFILE:
-            fname = f"fb_{safe_label}.flac"
-            fpath = os.path.join(output_dir, fname)
-            normed = (sub / peak if peak > 0 else np.zeros_like(sub))
-            _sf.write(fpath, normed, sr, subtype="PCM_16", format="FLAC")
-        else:
-            fname = f"fb_{safe_label}.wav"
-            fpath = os.path.join(output_dir, fname)
-            scaled = ((sub / peak * 32767).astype(np.int16)
-                      if peak > 0 else np.zeros(len(sub), dtype=np.int16))
-            wavfile.write(fpath, sr, scaled)
+        fname = f"fb_{safe_label}.npy"
+        fpath = os.path.join(output_dir, fname)
+        np.save(fpath, np.asarray(sub))
         return fpath
 
 
@@ -4101,6 +5381,8 @@ class FieldTabPanel(Panel):
         self._dropdown_item_rects: list[pygame.Rect] = []
         self._dragging: str | None = None
         self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
+        self.on_save_view_png16: Any = None
+        self._status_msg: str = ""
 
         # Data-field tree list (top section) — grouped by category
         self.data_list = TreeItemList("Data Sources", max_visible=14)
@@ -4282,6 +5564,9 @@ class FieldTabPanel(Panel):
         upper_rows.append(("label", "\u2500\u2500 Output \u2500\u2500"))
         upper_rows.append(("slider", ("o_gamma", gd.out_gamma, 0.1, 5.0, "{:.2f}")))
         upper_rows.append(("slider", ("o_scale", gd.out_scale, 0.01, 10.0, "{:.2f}")))
+        upper_rows.append(("button", ("save_view_png16", "Save View PNG (16-bit)")))
+        if self._status_msg:
+            upper_rows.append(("label", self._status_msg[:36]))
 
         # Blend mode
         upper_rows.append(("dropdown", ("blend_mode",
@@ -4446,6 +5731,15 @@ class FieldTabPanel(Panel):
                         pygame.Rect(track_x, y, track_w, self.ROW_H),
                         (vmin, vmax))
 
+            elif rtype == "button":
+                key, label_text = rdata
+                btn_rect = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
+                pygame.draw.rect(surf, (50, 80, 140), btn_rect)
+                pygame.draw.rect(surf, (100, 100, 120), btn_rect, 1)
+                txt = font.render(label_text, True, (220, 220, 220))
+                surf.blit(txt, (btn_rect.x + (btn_rect.w - txt.get_width()) // 2, y + 3))
+                self._item_map[key] = (btn_rect, None)
+
             y += self.ROW_H + 2
 
         # --- Rebuild & render plot widget ---
@@ -4504,6 +5798,22 @@ class FieldTabPanel(Panel):
                         cfg.gamma = gd.gamma
                         cfg.scale = gd.scale
                     cfg.use_global = not cfg.use_global
+                    return True
+
+            if "save_view_png16" in self._item_map:
+                rect, _ = self._item_map["save_view_png16"]
+                if rect.collidepoint(lx, ly):
+                    if self.on_save_view_png16:
+                        try:
+                            out_path = self.on_save_view_png16()
+                            if out_path:
+                                self._status_msg = f"Saved: {os.path.basename(out_path)}"
+                            else:
+                                self._status_msg = "Save skipped"
+                        except Exception as exc:
+                            self._status_msg = f"Save error: {exc}"
+                    else:
+                        self._status_msg = "Save handler missing"
                     return True
 
             # Dropdowns
@@ -7680,6 +8990,12 @@ class SourcePanel(Panel):
         super().__init__(title="Source", side=side)
         self.input_dir: str = input_dir or os.getcwd()
         self.output_root: str = output_root or self.input_dir
+        self.presets_dir: str = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "source_presets")
+        self._preset_names: list[str] = []
+        self._preset_selected_idx: int = 0
+        self._preset_applied_once: bool = False
+        self._refresh_presets()
 
         # CAFLS / hybrid center
         # f_a is the shared center of the hybrid scale crossover. CWT and
@@ -7784,6 +9100,7 @@ class SourcePanel(Panel):
         self.folder_list = ScrollableItemList("Analysis Folders", max_visible=6)
         self._folder_paths: list[str] = []
         self._refresh_folders()
+        self._bootstrap_default_preset()
 
         # UI state
         self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
@@ -7885,6 +9202,71 @@ class SourcePanel(Panel):
 
     def _analysis_save_precision(self) -> str:
         return _ANALYSIS_SAVE_PRECISIONS[self.analysis_save_precision_idx]
+
+    # ---- Presets ----------------------------------------------------------
+
+    def _refresh_presets(self) -> None:
+        os.makedirs(self.presets_dir, exist_ok=True)
+        names: list[str] = []
+        for fn in sorted(os.listdir(self.presets_dir)):
+            if fn.lower().endswith(".json"):
+                names.append(fn)
+        self._preset_names = names
+        if self._preset_names:
+            self._preset_selected_idx = max(
+                0, min(self._preset_selected_idx, len(self._preset_names) - 1))
+        else:
+            self._preset_selected_idx = 0
+
+    def _apply_preset_file(self, preset_name: str) -> None:
+        p = os.path.join(self.presets_dir, preset_name)
+        if not os.path.isfile(p):
+            return
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            self.apply_settings_dict(data)
+            print(f"Applied source preset: {preset_name}")
+        except Exception as e:
+            print(f"  preset load failed ({preset_name}): {e}")
+
+    def _bootstrap_default_preset(self) -> None:
+        """Ensure `high_resolution.json` exists and auto-apply first preset."""
+        self._refresh_presets()
+        target_name = "high_resolution.json"
+        target_path = os.path.join(self.presets_dir, target_name)
+
+        if not os.path.isfile(target_path):
+            candidates: list[str] = []
+            if self.active_folder:
+                candidates.append(self.active_folder)
+            sel_idx = self.folder_list.selected_idx
+            if 0 <= sel_idx < len(self._folder_paths):
+                raw = self._folder_paths[sel_idx]
+                folder = raw.rsplit("::", 1)[0] if "::" in raw else raw
+                candidates.append(folder)
+            for raw in self._folder_paths:
+                if "::" in raw:
+                    continue
+                candidates.append(raw)
+            src_path = None
+            for folder in candidates:
+                sp = os.path.join(folder, "analysis_settings.json")
+                if os.path.isfile(sp):
+                    src_path = sp
+                    break
+            if src_path is not None:
+                try:
+                    shutil.copy2(src_path, target_path)
+                    print(f"Created default source preset: {target_name}")
+                except Exception as e:
+                    print(f"  default preset copy failed: {e}")
+
+        self._refresh_presets()
+        if self._preset_names and not self._preset_applied_once:
+            self._preset_selected_idx = 0
+            self._apply_preset_file(self._preset_names[0])
+            self._preset_applied_once = True
 
     # ---- Scanning ---------------------------------------------------------
 
@@ -8136,11 +9518,17 @@ class SourcePanel(Panel):
 
     # ---- Analysis ---------------------------------------------------------
 
-    def _run_analysis(self) -> None:
-        idx = self.wav_list.selected_idx
-        if idx < 0 or idx >= len(self._wav_paths):
-            return
-        wav_path = self._wav_paths[idx]
+    def _run_analysis(self, *,
+                      _force_wav_path: str | None = None,
+                      _force_outdir: str | None = None,
+                      _resume: bool = False) -> None:
+        if _force_wav_path is not None:
+            wav_path = _force_wav_path
+        else:
+            idx = self.wav_list.selected_idx
+            if idx < 0 or idx >= len(self._wav_paths):
+                return
+            wav_path = self._wav_paths[idx]
         self._analyzing = True
         self._analysis_error = None
         self._analysis_progress = 0.0
@@ -8167,18 +9555,26 @@ class SourcePanel(Panel):
         def _worker() -> None:
             try:
                 base_name = os.path.splitext(os.path.basename(wav_path))[0]
-                outdir = os.path.join(self.output_root,
-                                      f"{base_name}_analysis")
+                outdir = (_force_outdir if _force_outdir is not None
+                          else os.path.join(self.output_root,
+                                            f"{base_name}_analysis"))
                 os.makedirs(outdir, exist_ok=True)
                 compute_precision = self._analysis_compute_precision()
                 save_precision = self._analysis_save_precision()
                 compute_np_dtype = _precision_label_to_real_dtype(compute_precision)
 
-                # Snapshot all UI settings so the analysis can be resumed
-                # or reproduced later, and loaded back via "Load Sett".
+                # Snapshot all UI settings + source wav path so the analysis
+                # can be resumed or reproduced later, and loaded via "Load Sett".
                 _settings_path = os.path.join(outdir, "analysis_settings.json")
+                _s = self.settings_dict()
+                _s["_wav_path"] = wav_path
                 with open(_settings_path, "w", encoding="utf-8") as _sf:
-                    json.dump(self.settings_dict(), _sf, indent=2)
+                    json.dump(_s, _sf, indent=2)
+
+                # Helper: file-existence skip for resume mode
+                def _done(*rel_parts: str) -> bool:
+                    return _resume and os.path.isfile(
+                        os.path.join(outdir, *rel_parts))
 
                 # Time region for partial analysis
                 r_start = self.region_start
@@ -8201,7 +9597,9 @@ class SourcePanel(Panel):
                 # CQT analysis
                 if do_cqt or do_hybrid:
                     phase_idx = _phases.index("cqt")
-                    _set_progress(phase_idx / n_phases, "CQT analysis")
+                    phase_base = phase_idx / n_phases
+                    phase_span = 1.0 / n_phases
+                    _set_progress(phase_base, "CQT analysis")
                     import subprocess, sys
                     if do_hybrid and sr_wav is not None:
                         cqt_fmin = self._hybrid_effective_cqt_fmin(sr_wav)
@@ -8243,13 +9641,122 @@ class SourcePanel(Panel):
                             cmd += ["--start-time", str(r_start)]
                         if r_end > 0:
                             cmd += ["--end-time", str(r_end)]
-                    subprocess.check_call(cmd,
-                                          cwd=os.path.dirname(
-                                              os.path.abspath(__file__)))
+                    proc = subprocess.Popen(
+                        cmd,
+                        cwd=os.path.dirname(os.path.abspath(__file__)),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                        bufsize=1,
+                    )
+                    assert proc.stdout is not None
+                    for line in proc.stdout:
+                        ln = line.rstrip("\r\n")
+                        if ln.startswith("[PROGRESS] "):
+                            try:
+                                rest = ln[len("[PROGRESS] "):].strip()
+                                frac_txt, label = rest.split(" ", 1)
+                                cqt_frac = max(0.0, min(1.0, float(frac_txt)))
+                                _set_progress(
+                                    phase_base + cqt_frac * phase_span,
+                                    f"CQT {label}",
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            print(ln, flush=True)
+                    ret = proc.wait()
+                    if ret != 0:
+                        raise RuntimeError(f"CQT analysis failed (exit {ret})")
                     _set_progress((phase_idx + 1) / n_phases, "CQT done")
 
                 # Filter bank decomposition
-                if do_fb or do_hybrid:
+                _fb_meta_exists = os.path.isfile(
+                    os.path.join(outdir, "filterbank", "filterbank_meta.json"))
+                _fb_env_exists = os.path.isfile(
+                    os.path.join(outdir, "filterbank", "fb_envelopes.npz"))
+                _fb_done = False
+                if _resume and _fb_meta_exists and _fb_env_exists:
+                    try:
+                        _fb_state = FilterBankDecomposition.load_envelope_checkpoint_state(outdir)
+                        _fb_done = bool(
+                            _fb_state is not None
+                            and len(_fb_state.get("completed", [])) > 0
+                            and all(bool(x) for x in _fb_state.get("completed", []))
+                        )
+                    except Exception:
+                        _fb_done = False
+                _fb_skip = _resume and _fb_meta_exists and _fb_env_exists and _fb_done
+                if (do_fb or do_hybrid) and _fb_skip:
+                    _set_progress(1.0 / n_phases if "fb" in _phases else 0.5,
+                                  "FB already done")
+                    try:
+                        # Envelopes are complete — build decomp from metadata only.
+                        # Band NPY files are NOT opened; subbands stay empty.
+                        _meta = FilterBankDecomposition.load_meta(outdir)
+                        if _meta is None:
+                            raise RuntimeError("filterbank_meta.json missing")
+                        _meta_top, _meta_bands = _meta
+                        _fb_loaded = FilterBankDecomposition(
+                            _meta_top["sr"],
+                            _meta_top.get("filter_type", "Linkwitz-Riley 4"))
+                        for _bm in _meta_bands:
+                            _fb_loaded.bands.append(BandDef(
+                                fmin=_bm["fmin"], fmax=_bm["fmax"],
+                                label=_bm.get("label", "")))
+                        # Resume reconciliation: if envelopes are already complete,
+                        # ensure band shards are reduced to save precision.
+                        _target_save = save_precision
+                        _target_dt = _precision_label_to_real_dtype(_target_save)
+                        _need_reduce = (
+                            str(_meta_top.get("band_audio_precision", ""))
+                            != str(_target_save)
+                        )
+                        if not _need_reduce:
+                            for _i, _bm in enumerate(_meta_bands):
+                                _bp = os.path.join(
+                                    outdir, "filterbank",
+                                    str(_bm.get("file", f"band_{_i:02d}.npy")))
+                                if not os.path.isfile(_bp):
+                                    raise RuntimeError(
+                                        f"Missing band shard for resume: {_bp}"
+                                    )
+                                _bdt = np.lib.format.open_memmap(_bp, mode="r").dtype
+                                if _bdt != _target_dt:
+                                    _need_reduce = True
+                                    break
+                        if _need_reduce:
+                            _set_progress(1.0 / n_phases if "fb" in _phases else 0.5,
+                                          "FB shard bit-depth reconcile")
+                            _reduced = _fb_loaded._reduce_existing_band_npy_bitdepth(
+                                os.path.join(outdir, "filterbank"),
+                                int(_meta_top.get("sr", sr_wav)),
+                                _target_save,
+                            )
+                            _fb_loaded._write_filterbank_meta(
+                                os.path.join(outdir, "filterbank"),
+                                int(_meta_top.get("sr", sr_wav)),
+                                len(_reduced),
+                                _reduced,
+                                save_precision=_target_save,
+                                band_audio_precision=_target_save,
+                                wav_path=_meta_top.get("wav_path"),
+                                intermediate_precision=_meta_top.get(
+                                    "intermediate_precision"),
+                            )
+                            print(
+                                f"  FB shards reduced to {_target_save} on resume.",
+                                flush=True,
+                            )
+                        self._fb_decomp = _fb_loaded
+                        self._fb_decomp_dir = outdir
+                        if self.on_fb_computed:
+                            self.on_fb_computed(_fb_loaded)
+                    except Exception as _fe:
+                        print(f"  FB load for resume failed: {_fe}; recomputing")
+                        _fb_skip = False  # fall through to recompute below
+
+                if (do_fb or do_hybrid) and not _fb_skip:
                     phase_idx = _phases.index("fb")
                     phase_base = phase_idx / n_phases
                     phase_span = 1.0 / n_phases
@@ -8293,6 +9800,7 @@ class SourcePanel(Panel):
                             self.fb_crossovers, sr_wav)
                     fb.compute_and_save(mono, bands, outdir, sr_wav,
                                         envelope_hop=self.fb_hop,
+                                        intermediate_precision=compute_precision,
                                         save_precision=save_precision,
                                         wav_path=wav_path,
                                         progress_cb=_fb_progress)
@@ -8308,11 +9816,26 @@ class SourcePanel(Panel):
                                     ("right", right_ch)]
                     else:
                         ch_pairs = [("left", mono)]
-                    for ch_label, ch_sig in ch_pairs:
+                    for ch_idx, (ch_label, ch_sig) in enumerate(ch_pairs):
                         fb_ch = FilterBankDecomposition(sr_wav, ftype)
                         fb_ch.compute(ch_sig, bands)
+                        n_ch = max(1, len(ch_pairs))
+
+                        def _fb_ch_progress(done: int, total: int) -> None:
+                            ch_frac = (ch_idx + (done / max(total, 1))) / n_ch
+                            tgt = phase_base + (
+                                min(1.0, 0.85 + 0.15 * ch_frac) * phase_span
+                            )
+                            _set_progress(
+                                max(self._analysis_progress, tgt),
+                                f"FB-Hilbert {ch_label} {done}/{total}",
+                            )
+
                         mags_ch, phases_ch, hops_ch = (
-                            fb_ch.compute_envelopes(hop=self.fb_hop))
+                            fb_ch.compute_envelopes(
+                                hop=self.fb_hop,
+                                hilbert_progress=_fb_ch_progress,
+                            ))
                         data_ch = FilterBankDecomposition.envelope_save_dict(
                             mags_ch, phases_ch, hops_ch,
                             save_precision=save_precision)
@@ -8324,7 +9847,9 @@ class SourcePanel(Panel):
                     # already falls back to left values when right is absent.
 
                 # Wavelet decomposition
-                if do_wavelet:
+                _wv_skip = _resume and os.path.isfile(
+                    os.path.join(outdir, "wavelet", "wavelet_meta.json"))
+                if do_wavelet and not _wv_skip:
                     phase_idx = _phases.index("wv")
                     _set_progress(phase_idx / n_phases, "Wavelet decomp")
                     if raw_wav is None:
@@ -8352,6 +9877,7 @@ class SourcePanel(Panel):
                     if self.wavelet_mode_idx == 1:
                         # ── CWT path (torch_cqt_new) ──
                         import torch
+                        from torch_cqt_new import CQTProgress as _CWTProgress
                         from torch_cqt_new import cwt as _torch_cwt
 
                         cwt_wtype = _CWT_WAVELET_TYPES[self.cwt_wavelet_idx]
@@ -8372,6 +9898,19 @@ class SourcePanel(Panel):
                         dur_floor = max(CAFLS_SEISMIC_FLOOR,
                                         1.0 / (len(wv_signal) / sr_wav))
                         cwt_fmin = dur_floor
+                        phase_base = phase_idx / n_phases
+                        phase_span = 1.0 / n_phases
+                        cwt_progress = _CWTProgress()
+
+                        def _cwt_progress_cb(progress_obj: Any) -> None:
+                            batches_total = max(
+                                1, int(getattr(progress_obj, "filter_batches_total", 0) or 1))
+                            batches_done = int(getattr(progress_obj, "filter_batches_done", 0))
+                            frac = max(0.0, min(1.0, batches_done / batches_total))
+                            _set_progress(
+                                phase_base + frac * phase_span,
+                                f"CWT {batches_done}/{batches_total}",
+                            )
 
                         W, freqs_t = _torch_cwt(
                             y_t, sr_wav,
@@ -8384,21 +9923,69 @@ class SourcePanel(Panel):
                             device=device,
                             dtype=torch_real,
                             epsilon=cwt_eps,
+                            progress=cwt_progress,
+                            on_progress=_cwt_progress_cb,
                         )
-                        W_np = W.cpu().numpy()
-                        freqs_np = freqs_t.cpu().numpy()
-                        (W_real_s, W_imag_s), W_scale = _encode_scaled_float_arrays(
-                            [W_np.real, W_np.imag], wv_save_dtype)
-                        wv_npz_data: dict[str, np.ndarray] = {
-                            "W_real": W_real_s,
-                            "W_imag": W_imag_s,
-                            "freqs": freqs_np.astype(wv_save_dtype, copy=False),
+                        n_scales, n_frames = int(W.shape[0]), int(W.shape[1])
+                        stream_dir = os.path.join(wv_dir, "wavelet_data.stream")
+                        os.makedirs(stream_dir, exist_ok=True)
+                        real_path = os.path.join(stream_dir, "W_real.npy")
+                        imag_path = os.path.join(stream_dir, "W_imag.npy")
+                        freqs_path = os.path.join(stream_dir, "freqs.npy")
+
+                        W_scale = None
+                        if wv_save_dtype == np.float16:
+                            W_scale = max(float(W.abs().max().item()), 1.0)
+
+                        W_real_mm = np.lib.format.open_memmap(
+                            real_path, mode="w+", dtype=wv_save_dtype,
+                            shape=(n_scales, n_frames))
+                        W_imag_mm = np.lib.format.open_memmap(
+                            imag_path, mode="w+", dtype=wv_save_dtype,
+                            shape=(n_scales, n_frames))
+                        row_chunk = max(
+                            1,
+                            int(os.environ.get("SPECTRAL_CWT_SAVE_SCALE_CHUNK", "64") or 64),
+                        )
+                        for s0 in range(0, n_scales, row_chunk):
+                            s1 = min(n_scales, s0 + row_chunk)
+                            W_chunk = W[s0:s1]
+                            if W_scale is not None:
+                                r_np = (W_chunk.real / W_scale).detach().cpu().numpy()
+                                i_np = (W_chunk.imag / W_scale).detach().cpu().numpy()
+                            else:
+                                r_np = W_chunk.real.detach().cpu().numpy()
+                                i_np = W_chunk.imag.detach().cpu().numpy()
+                            W_real_mm[s0:s1, :] = r_np.astype(wv_save_dtype, copy=False)
+                            W_imag_mm[s0:s1, :] = i_np.astype(wv_save_dtype, copy=False)
+                            W_real_mm.flush()
+                            W_imag_mm.flush()
+                            frac = max(0.0, min(1.0, s1 / max(n_scales, 1)))
+                            _set_progress(
+                                phase_base + frac * phase_span,
+                                f"CWT save {s1}/{n_scales}",
+                            )
+                        del W_real_mm, W_imag_mm
+                        freqs_np = freqs_t.detach().cpu().numpy().astype(
+                            wv_save_dtype, copy=False)
+                        np.save(freqs_path, freqs_np)
+                        stream_manifest = {
+                            "format": "wavelet_stream_v1",
+                            "arrays": {
+                                "W_real": "wavelet_data.stream/W_real.npy",
+                                "W_imag": "wavelet_data.stream/W_imag.npy",
+                                "freqs": "wavelet_data.stream/freqs.npy",
+                            },
                         }
-                        if W_scale is not None:
-                            wv_npz_data["W_scale"] = np.float64(W_scale)
-                        np.savez_compressed(
+                        with open(os.path.join(wv_dir, "wavelet_data.stream.json"),
+                                  "w", encoding="utf-8") as mf:
+                            _json.dump(stream_manifest, mf, indent=2)
+                        np.savez(
                             os.path.join(wv_dir, "wavelet_data.npz"),
-                            **wv_npz_data,
+                            stream_manifest=np.array("wavelet_data.stream.json"),
+                            n_scales=np.int64(n_scales),
+                            n_frames=np.int64(n_frames),
+                            save_precision=np.array(save_precision),
                         )
                         wv_meta = {
                             "type": "cwt",
@@ -8410,16 +9997,18 @@ class SourcePanel(Panel):
                             "n_samples": int(len(wv_signal)),
                             "hop_length": self.cwt_hop_length,
                             "scales_per_octave": self.cwt_scales_per_octave,
-                            "n_scales": int(W_np.shape[0]),
+                            "n_scales": n_scales,
                             "fmin": float(cwt_fmin),
                             "fmax": float(cwt_fmax),
                         }
+                        if W_scale is not None:
+                            wv_meta["W_scale"] = float(W_scale)
                         if wav_path:
                             wv_meta["wav_path"] = os.path.abspath(wav_path)
                         with open(os.path.join(wv_dir, "wavelet_meta.json"),
                                   "w") as wf:
                             _json.dump(wv_meta, wf, indent=2)
-                        del W, freqs_t, W_np, y_t
+                        del W, freqs_t, y_t
                     else:
                         # ── DWT path (pywt) ──
                         import pywt
@@ -8492,6 +10081,12 @@ class SourcePanel(Panel):
                 _set_progress(1.0, "Complete")
                 self._refresh_folders()
             except Exception as exc:
+                try:
+                    import traceback as _tb
+                    print("\n[Analysis Error]")
+                    print(_tb.format_exc(), flush=True)
+                except Exception:
+                    pass
                 self._analysis_error = str(exc)
             finally:
                 self._analyzing = False
@@ -8501,6 +10096,41 @@ class SourcePanel(Panel):
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
         self._analysis_thread = t
+
+    def _run_resume(self) -> None:
+        """Resume analysis on the selected folder — skip stages already on disk."""
+        idx = self.folder_list.selected_idx
+        if idx < 0 or idx >= len(self._folder_paths):
+            return
+        raw = self._folder_paths[idx]
+        folder_path = raw.rsplit("::", 1)[0] if "::" in raw else raw
+
+        settings_path = os.path.join(folder_path, "analysis_settings.json")
+        wav_path: str | None = None
+        if os.path.isfile(settings_path):
+            try:
+                with open(settings_path, "r", encoding="utf-8") as _f:
+                    _d = json.load(_f)
+                wav_path = _d.get("_wav_path")
+                # Apply saved UI settings so phase config matches the folder
+                self.apply_settings_dict(_d)
+            except Exception as _e:
+                print(f"  resume: failed to read settings: {_e}")
+
+        # Fall back to currently selected WAV if wav_path not stored
+        if not wav_path or not os.path.isfile(wav_path):
+            widx = self.wav_list.selected_idx
+            if 0 <= widx < len(self._wav_paths):
+                wav_path = self._wav_paths[widx]
+            else:
+                self._analysis_error = "Resume: no wav found (select WAV or re-analyze)"
+                return
+
+        self._run_analysis(
+            _force_wav_path=wav_path,
+            _force_outdir=folder_path,
+            _resume=True,
+        )
 
     def _graduate_band(self, band_idx: int) -> None:
         """Export a filter bank band as a standalone WAV in the input dir."""
@@ -8639,6 +10269,14 @@ class SourcePanel(Panel):
         surf = pygame.Surface((w, est_h), pygame.SRCALPHA)
         surf.fill((30, 30, 30, 210))
         y = self.PAD
+
+        # === Source presets ===
+        self._refresh_presets()
+        preset_opts = self._preset_names if self._preset_names else ["(none)"]
+        preset_idx = self._preset_selected_idx if self._preset_names else 0
+        y = self._render_dropdown_btn(
+            surf, font, y, w, "src_preset", "Preset:",
+            preset_opts, preset_idx)
 
         # === WAV file list ===
         y += self.wav_list.render(surf, font, 0, y, w)
@@ -9475,51 +11113,61 @@ class SourcePanel(Panel):
         # === Folder action buttons ===
         sel_idx = self.folder_list.selected_idx
         has_sel = 0 <= sel_idx < len(self._folder_paths)
-        btn_labels = [("Set Active", "set_active"),
-                      ("A", "set_a"),
-                      ("B", "set_b"),
-                      ("Load Sett", "load_settings"),
-                      ("Unload", "unload"),
-                      ("Del", "delete_folder")]
-        bw = (w - 2 * self.PAD - (len(btn_labels) - 1) * 2) // len(btn_labels)
-        bx = self.PAD
-        # Check if selected folder has analysis_settings.json
+        # Check if selected folder has analysis_settings.json (needed by resume)
         sel_has_settings = False
         if has_sel:
             _sfp = self._folder_paths[sel_idx]
+            _sfp_base = _sfp.rsplit("::", 1)[0] if "::" in _sfp else _sfp
             sel_has_settings = os.path.isfile(
-                os.path.join(_sfp, "analysis_settings.json"))
-        for label_text, bkey in btn_labels:
-            br = pygame.Rect(bx, y, bw, self.ROW_H)
-            if bkey == "delete_folder":
-                bg_c = (80, 40, 40) if has_sel else (50, 35, 35)
-                fg_c = (255, 160, 160) if has_sel else (120, 80, 80)
-            elif bkey == "set_active":
-                bg_c = (40, 60, 80) if has_sel else (30, 40, 50)
-                fg_c = (160, 200, 255) if has_sel else (80, 100, 120)
-            elif bkey == "set_a":
-                bg_c = (60, 40, 80) if has_sel else (40, 30, 50)
-                fg_c = (200, 160, 255) if has_sel else (100, 80, 120)
-            elif bkey == "set_b":
-                bg_c = (40, 60, 60) if has_sel else (30, 40, 40)
-                fg_c = (160, 240, 200) if has_sel else (80, 120, 100)
-            elif bkey == "load_settings":
-                _active = has_sel and sel_has_settings
-                bg_c = (50, 65, 40) if _active else (35, 40, 30)
-                fg_c = (190, 240, 140) if _active else (90, 110, 70)
-            elif bkey == "unload":
-                bg_c = (70, 60, 30) if has_sel else (45, 40, 25)
-                fg_c = (240, 220, 120) if has_sel else (110, 100, 60)
-            else:
-                bg_c = (80, 60, 40) if has_sel else (50, 40, 30)
-                fg_c = (255, 200, 160) if has_sel else (120, 100, 80)
-            pygame.draw.rect(surf, bg_c, br)
-            pygame.draw.rect(surf, (100, 100, 120), br, 1)
-            bt = font.render(label_text, True, fg_c)
-            surf.blit(bt, (bx + bw // 2 - bt.get_width() // 2, y + 3))
-            self._item_map[bkey] = (br, None)
-            bx += bw + 2
-        y += self.ROW_H + 4
+                os.path.join(_sfp_base, "analysis_settings.json"))
+
+        def _draw_folder_btn_row(row_labels: list[tuple[str, str]]) -> None:
+            nonlocal y
+            n = len(row_labels)
+            bw_r = (w - 2 * self.PAD - (n - 1) * 2) // n
+            bx_r = self.PAD
+            for label_text, bkey in row_labels:
+                br = pygame.Rect(bx_r, y, bw_r, self.ROW_H)
+                if bkey == "delete_folder":
+                    bg_c = (80, 40, 40) if has_sel else (50, 35, 35)
+                    fg_c = (255, 160, 160) if has_sel else (120, 80, 80)
+                elif bkey == "set_active":
+                    bg_c = (40, 60, 80) if has_sel else (30, 40, 50)
+                    fg_c = (160, 200, 255) if has_sel else (80, 100, 120)
+                elif bkey == "set_a":
+                    bg_c = (60, 40, 80) if has_sel else (40, 30, 50)
+                    fg_c = (200, 160, 255) if has_sel else (100, 80, 120)
+                elif bkey == "set_b":
+                    bg_c = (40, 60, 60) if has_sel else (30, 40, 40)
+                    fg_c = (160, 240, 200) if has_sel else (80, 120, 100)
+                elif bkey == "load_settings":
+                    _active = has_sel and sel_has_settings
+                    bg_c = (50, 65, 40) if _active else (35, 40, 30)
+                    fg_c = (190, 240, 140) if _active else (90, 110, 70)
+                elif bkey == "resume_folder":
+                    _active = has_sel and not self._analyzing
+                    bg_c = (30, 70, 50) if _active else (25, 45, 35)
+                    fg_c = (120, 255, 180) if _active else (60, 110, 80)
+                elif bkey == "unload":
+                    bg_c = (70, 60, 30) if has_sel else (45, 40, 25)
+                    fg_c = (240, 220, 120) if has_sel else (110, 100, 60)
+                else:
+                    bg_c = (80, 60, 40) if has_sel else (50, 40, 30)
+                    fg_c = (255, 200, 160) if has_sel else (120, 100, 80)
+                pygame.draw.rect(surf, bg_c, br)
+                pygame.draw.rect(surf, (100, 100, 120), br, 1)
+                bt = font.render(label_text, True, fg_c)
+                surf.blit(bt, (bx_r + bw_r // 2 - bt.get_width() // 2, y + 3))
+                self._item_map[bkey] = (br, None)
+                bx_r += bw_r + 2
+            y += self.ROW_H + 2
+
+        _draw_folder_btn_row([("Set Active", "set_active"), ("A", "set_a"),
+                               ("B", "set_b"), ("Unload", "unload")])
+        _draw_folder_btn_row([("Load Sett", "load_settings"),
+                               ("Resume", "resume_folder"),
+                               ("Del", "delete_folder")])
+        y += 2
 
         # Crop surface to actual content height
         final = pygame.Surface((w, y), pygame.SRCALPHA)
@@ -9606,7 +11254,7 @@ class SourcePanel(Panel):
                 return True
 
             # Dropdowns
-            for key in ("chan_mode", "analysis_compute_prec",
+            for key in ("src_preset", "chan_mode", "analysis_compute_prec",
                         "analysis_save_prec", "cqt_algo", "cqt_window",
                         "fb_ftype", "fb_cfg", "fb_lbl",
                         "wv_mode", "cwt_wavelet",
@@ -9676,6 +11324,13 @@ class SourcePanel(Panel):
                     self._graduate_band(bi)
                     return True
 
+            # Resume button
+            if "resume_folder" in self._item_map:
+                rect, _ = self._item_map["resume_folder"]
+                if rect.collidepoint(lx, ly) and not self._analyzing:
+                    self._run_resume()
+                    return True
+
             # Folder action buttons
             for bkey in ("set_active", "set_a", "set_b",
                         "load_settings", "unload", "delete_folder"):
@@ -9732,7 +11387,13 @@ class SourcePanel(Panel):
         ]
 
     def _select_dropdown(self, key: str, value: str) -> None:
-        if key == "chan_mode":
+        if key == "src_preset":
+            if value == "(none)":
+                return
+            if value in self._preset_names:
+                self._preset_selected_idx = self._preset_names.index(value)
+                self._apply_preset_file(value)
+        elif key == "chan_mode":
             self.channel_mode_idx = _CHANNEL_MODES.index(value)
         elif key == "analysis_compute_prec":
             self.analysis_compute_precision_idx = _ANALYSIS_COMPUTE_PRECISIONS.index(value)
@@ -10203,6 +11864,13 @@ class _LazyPhaseArray:
         self.ndim = real_mm.ndim
         self.dtype = np.dtype(np.float32)
 
+    @property
+    def size(self) -> int:
+        n = 1
+        for s in self.shape:
+            n *= s
+        return n
+
     def __getitem__(self, key: object) -> np.ndarray:
         r = np.asarray(self._r[key], dtype=np.float32)
         i = np.asarray(self._i[key], dtype=np.float32)
@@ -10213,6 +11881,29 @@ class _LazyPhaseArray:
         r = np.asarray(self._r, dtype=np.float32)
         i = np.asarray(self._i, dtype=np.float32)
         return np.angle(r + 1j * i).astype(dtype)
+
+
+class _LazyComplexArray:
+    """Read-only complex view backed by separate real/imag arrays."""
+
+    def __init__(self, real_mm: np.ndarray, imag_mm: np.ndarray) -> None:
+        self._r = real_mm
+        self._i = imag_mm
+        self.shape = real_mm.shape
+        self.ndim = real_mm.ndim
+        self.dtype = np.dtype(np.complex64)
+
+    @property
+    def size(self) -> int:
+        n = 1
+        for s in self.shape:
+            n *= s
+        return n
+
+    def __getitem__(self, key: object) -> np.ndarray:
+        r = np.asarray(self._r[key], dtype=np.float32)
+        i = np.asarray(self._i[key], dtype=np.float32)
+        return (r + 1j * i).astype(np.complex64)
 
 
 def _reduce_2d(data: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
@@ -11569,7 +13260,26 @@ class SpectrogramViewer:
             else:
                 npz_path = os.path.join(analysis_dir, "cqt_data.npz")
         print(f"Loading {npz_path} ...")
-        self._npz = np.load(npz_path, mmap_mode="r", allow_pickle=True)
+        npz_obj = np.load(npz_path, mmap_mode="r", allow_pickle=True)
+        if "stream_manifest" in npz_obj:
+            manifest_rel = str(npz_obj["stream_manifest"])
+            manifest_path = os.path.join(analysis_dir, manifest_rel)
+            npz_obj.close()
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                stream_meta = json.load(f)
+            stream_dir = os.path.join(
+                analysis_dir, str(stream_meta.get("stream_dir", "")))
+            arrays = stream_meta.get("arrays", {})
+            mapped: dict[str, np.ndarray] = {}
+            for key, rel in arrays.items():
+                mapped[key] = np.load(
+                    os.path.join(stream_dir, rel),
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+            self._npz = mapped
+        else:
+            self._npz = npz_obj
         self._settings_hash = str(
             self._npz["settings_hash"]) if "settings_hash" in self._npz else ""
 
@@ -12747,6 +14457,7 @@ class SpectrogramViewer:
         self._glyph_atlas.build()
         self.gui = FieldTabPanel(self.field_sources, self.field_configs,
                                  self.global_defaults, side="right")
+        self.gui.on_save_view_png16 = self._export_view_png16
         self.hybrid_panel = HybridViewPanel(self.hybrid_view, side="right")
         self.hybrid_panel._is_active = (
             lambda: self.display_mode == "tf" and self.tf_source == "hybrid")
@@ -13876,6 +15587,7 @@ class SpectrogramViewer:
         fb_hop = self.file_panel.fb_hop if self.file_panel else 1
         fb.compute_and_save(mono, bands, self.analysis_dir, sr_file,
                             envelope_hop=fb_hop,
+                            intermediate_precision=compute_precision,
                             save_precision=save_precision,
                             wav_path=self.audio_path)
         if self.file_panel is not None:
@@ -14972,7 +16684,8 @@ class SpectrogramViewer:
     def _render_spectral_passes(self, tex_ids: dict[str, int],
                                 sx: int, sy: int, sw: int, sh: int,
                                 u0: float, v0: float,
-                                u1: float, v1: float) -> None:
+                                u1: float, v1: float,
+                                *, present: bool = True) -> None:
         """Run the full GPU pipeline: gather → blend → reduce → display.
 
         All modes (CQT TF, filterbank TF, wavelet TSC, overlay) call
@@ -15048,6 +16761,13 @@ class SpectrogramViewer:
         # ---- GPU Reduction: auto-detect min/max of pass-2 output ---------
         self._gpu_reduce_minmax(sw, sh)
 
+        if not present:
+            glBindFramebuffer(GL_FRAMEBUFFER, 0)
+            glViewport(0, 0, ww, wh)
+            glUseProgram(0)
+            glActiveTexture(GL_TEXTURE0)
+            return
+
         # ---- Pass 3: HDR normalize + out_gamma/scale + clamp → screen ----
         glBindFramebuffer(GL_FRAMEBUFFER, 0)
         glViewport(0, 0, ww, wh)
@@ -15082,6 +16802,162 @@ class SpectrogramViewer:
 
         glUseProgram(0)
         glActiveTexture(GL_TEXTURE0)
+
+    def _postprocess_pass2_rgba(self, rgba: np.ndarray) -> np.ndarray:
+        """Apply pass-3 HDR + output gamma/scale on CPU."""
+        gd = self.global_defaults
+        out = np.asarray(rgba, dtype=np.float32).copy()
+
+        if gd.hdr_normalizer > 0:
+            lo_in = float(self._auto_hdr_min.min())
+            hi_in = float(self._auto_hdr_max.max())
+            span_in = max(hi_in - lo_in, 1e-9)
+            lo_out = float(gd.hdr_output_lo)
+            hi_out = float(gd.hdr_output_hi)
+            span_out = hi_out - lo_out
+
+            t = (out - lo_in) / span_in
+            if gd.hdr_normalizer == 1:  # Clamp
+                t = np.clip(t, 0.0, 1.0)
+            elif gd.hdr_normalizer == 2:  # Reinhard
+                t = np.maximum(t, 0.0)
+                t = t / (1.0 + t)
+            elif gd.hdr_normalizer == 3:  # Sigmoid
+                t = 1.0 / (1.0 + np.exp(-6.0 * (t - 0.5)))
+            elif gd.hdr_normalizer == 4:  # Linear Compress
+                t = np.clip(t, 0.0, 1.0)
+            out = lo_out + t * span_out
+
+        out = np.maximum(out, 0.0)
+        g = float(gd.out_gamma)
+        s = float(gd.out_scale)
+        out = np.power(out, g) * s
+        return np.clip(out, 0.0, 1.0).astype(np.float32)
+
+    def _export_view_png16(self) -> str | None:
+        """Export current spectral view as 16-bit PNG into input_images."""
+        if self.display_mode == "ts":
+            print("Save view PNG: waveform mode is not supported.")
+            return None
+        if not self._pass1_program:
+            print("Save view PNG: shaders not initialized.")
+            return None
+        if not self._ensure_progressive_scan_sources():
+            print("Save view PNG: no spectral sources available.")
+            return None
+
+        out_w = max(1, int(math.ceil(self.view_x1 - self.view_x0)))
+        out_h = max(1, int(math.ceil(self.view_y1 - self.view_y0)))
+        max_tex = int(glGetIntegerv(GL_MAX_TEXTURE_SIZE))
+        if out_w > max_tex or out_h > max_tex:
+            print(f"Save view PNG: clamped to GL max texture size {max_tex}.")
+            out_w = min(out_w, max_tex)
+            out_h = min(out_h, max_tex)
+
+        bindings = list(self._active_field_bindings(
+            mode=self.display_mode, tf_source=self.tf_source))
+        if not bindings:
+            print("Save view PNG: no active fields.")
+            return None
+
+        cfg_by_field = {
+            fs.name: cfg for fs, cfg in zip(self.field_sources, self.field_configs)
+        }
+        needed = {fs.tex_name for _, fs, _ in bindings}
+        tex_names = sorted([t for t in needed if t in _TEXTURE_LAYOUTS])[:8]
+        if not tex_names:
+            print("Save view PNG: no mapped textures for current fields.")
+            return None
+
+        view_x0 = float(self.view_x0)
+        view_x1 = float(self.view_x1)
+        view_y0 = float(self.view_y0)
+        view_y1 = float(self.view_y1)
+        tex_bufs: dict[str, np.ndarray] = {}
+
+        for tex_name in tex_names:
+            layout = _TEXTURE_LAYOUTS.get(tex_name)
+            if layout is None:
+                continue
+            buf = np.zeros((out_h, out_w, 4), dtype=np.float32)
+            for ci, ch_key in enumerate("RGBA"):
+                field_name = layout.get(ch_key)
+                if field_name is None:
+                    if ch_key == "A":
+                        buf[:, :, ci] = 1.0
+                    continue
+                data = self._scan_field_chunk(
+                    field_name, view_x0, view_x1, view_y0, view_y1,
+                    0, out_w, out_w, out_h,
+                ).astype(np.float32, copy=False)
+
+                cfg = cfg_by_field.get(field_name)
+                fnorm = cfg.norm_mode if (cfg and not cfg.use_global) else self.global_defaults.norm_mode
+                if fnorm == 2:
+                    flat = data.ravel()
+                    n = flat.size
+                    if n > 0:
+                        order = flat.argsort().argsort()
+                        data = (order.astype(np.float32) / max(n - 1, 1)).reshape(data.shape)
+                    else:
+                        data = np.zeros_like(data, dtype=np.float32)
+                buf[:, :, ci] = data
+
+            # Match CQT pad-influence alpha handling from progressive scan.
+            if (self.display_mode == "tf" and self.tf_source == "cqt"
+                    and self._pad_influence is not None):
+                cx0 = max(0, int(math.floor(view_x0)))
+                cx1 = min(self.n_frames, int(math.ceil(view_x1)))
+                y0 = max(0, int(math.floor(view_y0)))
+                y1 = min(self.n_bins, int(math.ceil(view_y1)))
+                pi_slice = np.asarray(self._pad_influence[y0:y1, cx0:cx1], dtype=np.float32)
+                alpha = _reduce_2d(1.0 - pi_slice, out_h, out_w)
+                buf[:, :, 3] = np.clip(alpha, 0.0, 1.0).astype(np.float32, copy=False)
+
+            tex_bufs[tex_name] = np.ascontiguousarray(buf)
+
+        tmp_tex_ids: dict[str, int] = {}
+        old_tex_units = dict(self._tex_units)
+        old_viewport = glGetIntegerv(GL_VIEWPORT)
+        try:
+            for tex_name, buf in tex_bufs.items():
+                tmp_tex_ids[tex_name] = self._upload_texture_float(buf)
+
+            self._tex_units = {tex_name: i for i, tex_name in enumerate(tex_names)}
+            self._render_spectral_passes(
+                tmp_tex_ids, 0, 0, out_w, out_h, 0.0, 0.0, 1.0, 1.0,
+                present=False,
+            )
+
+            glBindFramebuffer(GL_FRAMEBUFFER, self._fbo2)
+            glReadBuffer(GL_COLOR_ATTACHMENT0)
+            raw = glReadPixels(0, 0, out_w, out_h, GL_RGBA, GL_FLOAT)
+            arr = np.frombuffer(raw, dtype=np.float32).reshape(out_h, out_w, 4)
+            arr = np.ascontiguousarray(arr[::-1, :, :])  # GL origin -> image origin
+            arr = self._postprocess_pass2_rgba(arr)
+            rgb16 = np.clip(np.round(arr[:, :, :3] * 65535.0), 0, 65535).astype(np.uint16)
+
+            out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_images")
+            os.makedirs(out_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            base = f"view_texture_{ts}"
+            out_path = os.path.join(out_dir, f"{base}.png")
+            i = 1
+            while os.path.exists(out_path):
+                out_path = os.path.join(out_dir, f"{base}_{i:02d}.png")
+                i += 1
+            _write_png_u16(out_path, rgb16)
+            print(f"Saved 16-bit view texture: {out_path} ({out_w}x{out_h})")
+            return out_path
+        finally:
+            self._tex_units = old_tex_units
+            glBindFramebuffer(GL_FRAMEBUFFER, 0)
+            if old_viewport is not None and len(old_viewport) == 4:
+                glViewport(int(old_viewport[0]), int(old_viewport[1]),
+                           int(old_viewport[2]), int(old_viewport[3]))
+            for tex_id in tmp_tex_ids.values():
+                if tex_id:
+                    glDeleteTextures([tex_id])
 
     def _gpu_reduce_minmax(self, w: int, h: int) -> None:
         """Run the GPU min/max reduction chain on the pass-2 FBO output.
@@ -15492,7 +17368,7 @@ class SpectrogramViewer:
         if fb is None or band_idx >= len(fb.subbands) or sw <= 0 or sh <= 0:
             return
 
-        mono = fb.subbands[band_idx]
+        mono = fb.get_subband(band_idx)
         sr = fb.sr
         n_samples = len(mono)
         if n_samples == 0:
@@ -15583,26 +17459,58 @@ class SpectrogramViewer:
             return False
         wv_dir = os.path.join(self.analysis_dir, "wavelet")
         npz_path = os.path.join(wv_dir, "wavelet_data.npz")
+        stream_manifest_path = os.path.join(wv_dir, "wavelet_data.stream.json")
         meta_path = os.path.join(wv_dir, "wavelet_meta.json")
-        if not os.path.isfile(npz_path):
+        if not os.path.isfile(npz_path) and not os.path.isfile(stream_manifest_path):
             return False
         import json as _json
         meta: dict = {}
         if os.path.isfile(meta_path):
             with open(meta_path) as f:
                 meta = _json.load(f)
-        npz = np.load(npz_path, allow_pickle=False)
+        npz = np.load(npz_path, allow_pickle=False) if os.path.isfile(npz_path) else None
+        stream_meta: dict[str, Any] | None = None
+        if npz is not None and "stream_manifest" in npz:
+            stream_manifest_path = os.path.join(wv_dir, str(npz["stream_manifest"]))
+        if os.path.isfile(stream_manifest_path):
+            with open(stream_manifest_path, "r", encoding="utf-8") as sf:
+                stream_meta = _json.load(sf)
 
         wv_type = meta.get("type", "dwt")  # default for legacy data
-        if wv_type == "cwt" or "W_real" in npz:
+        if wv_type == "cwt" or (npz is not None and "W_real" in npz) or stream_meta is not None:
             # ── CWT format ──
-            W_scale = float(npz["W_scale"]) if "W_scale" in npz else None
-            W_real = _decode_scaled_float_array(npz["W_real"], W_scale)
-            W_imag = _decode_scaled_float_array(npz["W_imag"], W_scale)
+            W_scale = float(meta.get("W_scale", 0.0) or 0.0) or None
+            if stream_meta is not None:
+                arrays = stream_meta.get("arrays", {})
+                W_real_raw = np.load(
+                    os.path.join(wv_dir, arrays["W_real"]),
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+                W_imag_raw = np.load(
+                    os.path.join(wv_dir, arrays["W_imag"]),
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+                freqs_arr = np.load(
+                    os.path.join(wv_dir, arrays["freqs"]),
+                    mmap_mode="r",
+                    allow_pickle=False,
+                )
+                W_real = (_ScaledArray(W_real_raw, W_scale)
+                          if W_scale is not None else W_real_raw)
+                W_imag = (_ScaledArray(W_imag_raw, W_scale)
+                          if W_scale is not None else W_imag_raw)
+            else:
+                assert npz is not None
+                W_scale_npz = float(npz["W_scale"]) if "W_scale" in npz else None
+                W_real = _decode_scaled_float_array(npz["W_real"], W_scale_npz)
+                W_imag = _decode_scaled_float_array(npz["W_imag"], W_scale_npz)
+                freqs_arr = npz["freqs"]
             # Keep native analysis order in memory for synthesis:
             # rows / freqs stay high-to-low exactly as produced by CWT.
-            self._wv_W = np.ascontiguousarray(W_real + 1j * W_imag)
-            self._wv_freqs = np.ascontiguousarray(npz["freqs"])
+            self._wv_W = _LazyComplexArray(W_real, W_imag)
+            self._wv_freqs = np.asarray(freqs_arr)
             self._wv_coeffs = []  # clear DWT data
             self._wv_meta = meta
             self._wv_n_levels = self._wv_W.shape[0]  # n_scales
@@ -15612,6 +17520,7 @@ class SpectrogramViewer:
                   f"{self._wv_n_frames} frames from {wv_dir}")
         else:
             # ── DWT format ──
+            assert npz is not None
             n_levels = int(npz["n_levels"])
             coeff_scale = float(npz["wv_scale"]) if "wv_scale" in npz else None
             coeffs: list[np.ndarray] = [
@@ -15629,6 +17538,8 @@ class SpectrogramViewer:
             self._wv_dirty = True
             print(f"Wavelet DWT: loaded {n_levels} detail levels + approx "
                   f"from {wv_dir}")
+        if npz is not None and hasattr(npz, "close"):
+            npz.close()
         return True
 
     def _compute_wavelet_scalogram(self) -> None:
@@ -15645,28 +17556,43 @@ class SpectrogramViewer:
 
         if is_cwt:
             # ── CWT: keep analysis order for synthesis, flip only for display ──
-            W = np.flipud(self._wv_W)
-            n_rows, n_cols = W.shape
+            W_src = self._wv_W
+            n_rows, n_cols = W_src.shape
             max_w = int(glGetIntegerv(GL_MAX_TEXTURE_SIZE))
             tex_w = min(n_cols, max_w)
             self._wv_n_frames = n_cols
             native_dt = np.float32
-
-            mag_grid_full = np.abs(W).astype(native_dt)
-            phase_grid_full = np.angle(W).astype(native_dt)
-            # Downsample columns if needed
+            mag_grid_tex = np.zeros((n_rows, tex_w), dtype=native_dt)
+            phase_grid_tex = np.zeros((n_rows, tex_w), dtype=native_dt)
             if tex_w < n_cols:
-                dst_t = np.linspace(0.0, 1.0, tex_w)
-                src_t = np.linspace(0.0, 1.0, n_cols)
-                mg2 = np.zeros((n_rows, tex_w), dtype=native_dt)
-                pg2 = np.zeros((n_rows, tex_w), dtype=native_dt)
-                for i in range(n_rows):
-                    mg2[i] = np.interp(dst_t, src_t, mag_grid_full[i])
-                    pg2[i] = np.interp(dst_t, src_t, phase_grid_full[i])
-                mag_grid_tex, phase_grid_tex = mg2, pg2
+                src_sel = np.clip(
+                    (np.arange(tex_w, dtype=np.int64) * n_cols + tex_w // 2) // tex_w,
+                    0, n_cols - 1,
+                ).astype(np.int64, copy=False)
             else:
-                mag_grid_tex = mag_grid_full
-                phase_grid_tex = phase_grid_full
+                src_sel = None
+            row_chunk = max(
+                1,
+                int(os.environ.get("SPECTRAL_CWT_SCALOGRAM_ROW_CHUNK", "64") or 64),
+            )
+            gmax = 1e-12
+            for dr0 in range(0, n_rows, row_chunk):
+                dr1 = min(n_rows, dr0 + row_chunk)
+                # Display order is flipped vertically.
+                sr0 = n_rows - dr1
+                sr1 = n_rows - dr0
+                # Flip rows inside each chunk so the overall texture is
+                # truly vertically reversed (not just chunk-reordered).
+                W_chunk = np.asarray(W_src[sr0:sr1, :])[::-1, :]
+                if src_sel is not None:
+                    W_chunk = W_chunk[:, src_sel]
+                mag_chunk = np.abs(W_chunk).astype(native_dt, copy=False)
+                phase_chunk = np.angle(W_chunk).astype(native_dt, copy=False)
+                mag_grid_tex[dr0:dr1, :] = mag_chunk
+                phase_grid_tex[dr0:dr1, :] = phase_chunk
+                gmax = max(gmax, float(mag_chunk.max()))
+            mag_grid_full = mag_grid_tex
+            phase_grid_full = phase_grid_tex
         else:
             # ── DWT: resampled ragged coefficient arrays ──
             coeffs = self._wv_coeffs

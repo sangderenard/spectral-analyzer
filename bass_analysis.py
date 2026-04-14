@@ -33,6 +33,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 from dataclasses import dataclass
 from typing import Dict, List, Sequence, Tuple
 
@@ -251,6 +252,209 @@ def ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
+def _ram_available_mb() -> float:
+    """Return available system RAM in MB.  Returns inf when psutil is absent."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024 * 1024)
+    except ImportError:
+        return float("inf")
+
+
+def _backpressure_wait(
+    label: str = "",
+    floor_mb: float | None = None,
+    interval_s: float = 0.05,
+) -> None:
+    """Block until system RAM is above *floor_mb*.
+
+    The floor defaults to SPECTRAL_RAM_FLOOR_MB (env, default 512 MB).
+    Runs a tight loop sleeping *interval_s* seconds between checks.
+    No-op when psutil is unavailable.
+
+    Call this before any allocation that could grow unbounded:
+    - before each sosfilt call in the onset loop
+    - before each shard write in _save_cqt_stream_bundle
+    - before allocating any large intermediate array
+    """
+    import time as _time
+    if floor_mb is None:
+        floor_mb = max(
+            0.0,
+            float(os.environ.get("SPECTRAL_RAM_FLOOR_MB", "512") or 512))
+    if floor_mb <= 0:
+        return
+    avail = _ram_available_mb()
+    if avail == float("inf") or avail >= floor_mb:
+        return
+    tag = f" [{label}]" if label else ""
+    print(f"\r  RAM backpressure{tag}: {avail:.0f} MB free < {floor_mb:.0f} MB floor — waiting",
+          end="", flush=True)
+    import gc as _gc
+    while True:
+        _gc.collect()
+        avail = _ram_available_mb()
+        if avail >= floor_mb:
+            print()  # newline after the waiting message
+            return
+        _time.sleep(interval_s)
+
+
+def _stream_write_npy(path: str, arr: np.ndarray) -> None:
+    """Write *arr* to .npy in row-chunks with RAM backpressure.
+
+    Chunks are sized by SPECTRAL_STREAM_WRITE_CHUNK_MB (default 64 MB).
+    Before each chunk write we check available RAM against SPECTRAL_RAM_FLOOR_MB
+    and block until headroom is restored.  This lets the disk I/O pipeline
+    naturally throttle computation — if writes are slow, RAM stays bounded.
+    """
+    arr_np = np.asarray(arr)
+    mm = np.lib.format.open_memmap(
+        path, mode="w+", dtype=arr_np.dtype, shape=arr_np.shape)
+    if arr_np.ndim < 2 or arr_np.shape[0] <= 1:
+        mm[...] = arr_np
+        mm.flush()
+        del mm
+        return
+
+    target_mb = max(
+        4,
+        int(os.environ.get("SPECTRAL_STREAM_WRITE_CHUNK_MB", "64") or 64),
+    )
+    row_bytes = int(np.prod(arr_np.shape[1:])) * arr_np.dtype.itemsize
+    rows_per_chunk = max(1, (target_mb * 1024 * 1024) // max(row_bytes, 1))
+    n_rows = arr_np.shape[0]
+    for r0 in range(0, n_rows, rows_per_chunk):
+        _backpressure_wait(label=os.path.basename(path))
+        r1 = min(n_rows, r0 + rows_per_chunk)
+        mm[r0:r1, ...] = arr_np[r0:r1, ...]
+        mm.flush()
+    del mm
+
+
+def _save_cqt_stream_bundle(
+    outdir: str,
+    shash: str,
+    save_dict: dict[str, np.ndarray],
+) -> tuple[str, str]:
+    """Persist CQT payload as streamable .npy shards + JSON manifest.
+
+    Each shard is written via _stream_write_npy which:
+      - chunks by SPECTRAL_STREAM_WRITE_CHUNK_MB (default 64 MB)
+      - blocks between chunks when RAM < SPECTRAL_RAM_FLOOR_MB
+    This gives disk-speed backpressure on the whole save pipeline.
+    """
+    stream_dir_name = f"cqt_data_{shash}.stream"
+    stream_dir = os.path.join(outdir, stream_dir_name)
+    os.makedirs(stream_dir, exist_ok=True)
+    arrays: dict[str, str] = {}
+    for key, val in save_dict.items():
+        _backpressure_wait(label=key)   # wait before allocating next shard
+        fname = f"{key}.npy"
+        _stream_write_npy(os.path.join(stream_dir, fname), np.asarray(val))
+        arrays[key] = fname
+    manifest_name = f"cqt_data_{shash}.stream.json"
+    manifest_path = os.path.join(outdir, manifest_name)
+    manifest = {
+        "format": "cqt_stream_v1",
+        "settings_hash": shash,
+        "stream_dir": stream_dir_name,
+        "arrays": arrays,
+    }
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+    return manifest_name, stream_dir
+
+
+# ---------------------------------------------------------------------------
+# Resume detection — skip recomputing stages whose shard files exist
+# ---------------------------------------------------------------------------
+
+# Keys that must be present for a valid CQT resume (before onset).
+_CQT_RESUME_KEYS = [
+    "freqs", "times", "real_left", "imag_left",
+    "sr", "bins_per_octave", "hop_length", "cqt_grid_hop_length", "is_stereo",
+]
+# Keys needed for a full resume (past onset as well).
+_FULL_RESUME_KEYS = _CQT_RESUME_KEYS + [
+    "onset", "semitone_mask", "note_names", "peaks_idx",
+]
+
+
+def _stream_dir_for(outdir: str, shash: str) -> str:
+    return os.path.join(outdir, f"cqt_data_{shash}.stream")
+
+
+def _shard_exists(stream_dir: str, key: str) -> bool:
+    p = os.path.join(stream_dir, f"{key}.npy")
+    return os.path.isfile(p) and os.path.getsize(p) > 0
+
+
+def _resume_stage(outdir: str, shash: str) -> str:
+    """Return resume stage for the given output directory and settings hash.
+
+    Possible return values
+    ----------------------
+    "none"  — no prior analysis; run everything from scratch.
+    "cqt"   — CQT shards exist; can skip audio → CQT, start from onset.
+    "full"  — All shards including onset exist; skip to metrics/reporting.
+    """
+    sd = _stream_dir_for(outdir, shash)
+    if not os.path.isdir(sd):
+        return "none"
+
+    # Detect stereo from the existing shard if possible.
+    is_stereo_shard = os.path.join(sd, "is_stereo.npy")
+    if _shard_exists(sd, "is_stereo"):
+        is_stereo = bool(np.load(is_stereo_shard))
+    else:
+        is_stereo = os.path.isfile(os.path.join(sd, "real_right.npy"))
+
+    required_cqt = list(_CQT_RESUME_KEYS)
+    if is_stereo:
+        required_cqt += ["real_right", "imag_right"]
+
+    if not all(_shard_exists(sd, k) for k in required_cqt):
+        return "none"
+
+    required_full = list(_FULL_RESUME_KEYS)
+    if is_stereo:
+        required_full += ["real_right", "imag_right"]
+    if all(_shard_exists(sd, k) for k in required_full):
+        return "full"
+
+    return "cqt"
+
+
+def _load_shard(stream_dir: str, key: str) -> np.ndarray:
+    return np.load(os.path.join(stream_dir, f"{key}.npy"), allow_pickle=False)
+
+
+def _load_cqt_from_stream(outdir: str, shash: str) -> dict:
+    """Load CQT complex arrays and metadata from an existing stream directory."""
+    sd = _stream_dir_for(outdir, shash)
+    is_stereo = bool(_load_shard(sd, "is_stereo"))
+    sr = int(_load_shard(sd, "sr"))
+    bins_per_octave = int(_load_shard(sd, "bins_per_octave"))
+    hop_length = int(_load_shard(sd, "hop_length"))
+    cqt_grid_hop_length = int(_load_shard(sd, "cqt_grid_hop_length"))
+    freqs = _load_shard(sd, "freqs")
+    times = _load_shard(sd, "times")
+    real_left = _load_shard(sd, "real_left")
+    imag_left = _load_shard(sd, "imag_left")
+    cqt_L = real_left + 1j * imag_left
+    del real_left, imag_left
+    cqt_R = None
+    if is_stereo:
+        real_right = _load_shard(sd, "real_right")
+        imag_right = _load_shard(sd, "imag_right")
+        cqt_R = real_right + 1j * imag_right
+        del real_right, imag_right
+    return dict(sr=sr, bins_per_octave=bins_per_octave, hop_length=hop_length,
+                cqt_grid_hop_length=cqt_grid_hop_length, freqs=freqs, times=times,
+                cqt_L=cqt_L, cqt_R=cqt_R, is_stereo=is_stereo)
+
+
 # ---------------------------------------------------------------------------
 # Audio loading
 # ---------------------------------------------------------------------------
@@ -421,14 +625,23 @@ def compute_onset_envelope(
     energy, to sharpen transient edges that the CQT smears.
 
     For each CQT frequency bin, we bandpass-filter the signal around that
-    frequency (±1 semitone), compute a short-window RMS envelope (window =
-    2 * hop samples for sub-frame resolution), then take the half-wave-rectified
-    first difference as onset strength.
+    frequency (±1 semitone) using IIR filters, compute a short-window RMS
+    envelope (window = 2 * hop samples for sub-frame resolution), then take
+    the half-wave-rectified first difference as onset strength.
+
+    CPU RAM backpressure
+    --------------------
+    Each sosfilt call allocates ~signal_len × dtype_bytes of RAM.  To prevent
+    runaway allocation when many semitones are processed in sequence, we
+    explicitly delete intermediates and invoke gc after each band.  An
+    optional env var SPECTRAL_ONSET_RAM_MB caps working-set size by pausing
+    between bands when psutil reports available RAM below that threshold.
 
     Returns onset strength matrix (n_bins, n_frames), values ≥ 0, normalised
     per-bin to [0, 1].  This can be additively blended with the CQT power
     to enhance transient clarity without altering steady-state tones.
     """
+    import gc
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     real_dt = np.float64 if compute_dtype == "float64" else np.float32
     torch_dtype = torch.float64 if real_dt == np.float64 else torch.float32
@@ -437,54 +650,52 @@ def compute_onset_envelope(
 
     # Short RMS window: 2× hop gives one sub-division per CQT frame.
     rms_win = 2 * hop
-    # Process in semitone-wide groups (100 bins at 1200 bpo) to keep
-    # the bandpass filter count manageable.  Bins within a semitone share
-    # the same bandpass, and we spread the result across them.
-    semitone_cents = 100
-    bins_per_semitone = max(1, int(round(1200.0 / (1200.0 / len(freqs) * (1200.0 / 1200.0)))))
-    # Simpler: group by semitone index.
     midi_vals = 12.0 * np.log2(np.clip(freqs, 1e-9, None) / 440.0) + 69.0
     semitone_ids = np.round(midi_vals).astype(int)
     unique_semitones = np.unique(semitone_ids)
 
+    from scipy.signal import butter, sosfilt
     for semi in unique_semitones:
+        _backpressure_wait(label=f"onset_semi_{semi}")
+
         bin_indices = np.flatnonzero(semitone_ids == semi)
         center_freq = 440.0 * 2.0 ** ((semi - 69.0) / 12.0)
-        # Bandpass: ±1 semitone.
         f_lo = center_freq * 2.0 ** (-1.0 / 12.0)
         f_hi = center_freq * 2.0 ** (1.0 / 12.0)
         nyq = sr / 2.0
         if f_hi >= nyq or f_lo <= 0:
             continue
-        # Design bandpass on CPU (tiny), apply on GPU via FFT.
-        from scipy.signal import butter, sosfilt
         try:
             sos = butter(4, [f_lo / nyq, f_hi / nyq], btype="band", output="sos")
         except ValueError:
             continue
-        # Apply filter on CPU (sosfilt isn't on GPU, but it's a tiny 8th-order
-        # IIR on a 1-D signal — negligible time vs the FFT convolutions).
+
         filtered = sosfilt(sos, x).astype(real_dt, copy=False)
 
-        # RMS envelope via GPU conv1d with a squared signal.
+        # RMS envelope via GPU conv1d on squared signal.
         fsig = torch.from_numpy(filtered ** 2).to(device=device, dtype=torch_dtype)
+        del filtered  # release CPU copy immediately — backpressure on RAM
         box = torch.ones(1, 1, rms_win, device=device, dtype=torch_dtype) / rms_win
         rms_sq = torch.nn.functional.conv1d(
             fsig.view(1, 1, -1), box, padding=rms_win // 2
         ).view(-1)
-        # Hop-sample to CQT frame grid.
+        del fsig, box
+
         frame_indices = torch.arange(n_frames, device=device) * hop
         frame_indices = frame_indices.clamp(max=rms_sq.shape[0] - 1)
         rms_frames = rms_sq[frame_indices].cpu().numpy()
-        # Half-wave rectified first difference = onset strength.
+        del rms_sq, frame_indices
+
         onset_str = np.maximum(np.diff(rms_frames, prepend=rms_frames[0]), 0.0)
-        # Normalise per-semitone.
         peak = onset_str.max()
         if peak > 0:
             onset_str /= peak
-        # Write to all bins in this semitone.
         for bi in bin_indices:
             onset[bi] = onset_str
+        del onset_str, rms_frames
+
+        # Explicit GC pass so the next sosfilt starts clean.
+        gc.collect()
 
     if device.type == "cuda":
         torch.cuda.empty_cache()
@@ -967,6 +1178,11 @@ def delete_version(analysis_dir: str, shash: str) -> bool:
 
 def main() -> None:
     args = parse_args()
+    def _emit_progress(frac: float, label: str) -> None:
+        frac = max(0.0, min(1.0, float(frac)))
+        print(f"[PROGRESS] {frac:.4f} {label}", flush=True)
+
+    _emit_progress(0.01, "init")
     cfg = AnalysisConfig(
         hop_length=args.hop_length,
         bins_per_octave=args.bins_per_octave,
@@ -1019,7 +1235,39 @@ def main() -> None:
     outdir = args.outdir or os.path.join(os.path.dirname(wav_path), f"{base_name}_analysis")
     ensure_dir(outdir)
 
-    # --- Load stereo ---
+    # --- Compute settings hash early so resume can be checked before audio load ---
+    shash = settings_hash(cfg, args.composite,
+                          getattr(args, 'gap_seconds', 0.5),
+                          args.trim_pad)
+
+    # --- Write itinerary file: tracks which stages are complete ---
+    itinerary_path = os.path.join(outdir, f"itinerary_{shash}.json")
+
+    def _load_itinerary() -> dict:
+        if os.path.isfile(itinerary_path):
+            try:
+                with open(itinerary_path) as _f:
+                    return json.load(_f)
+            except Exception:
+                pass
+        return {}
+
+    def _mark_stage(stage: str) -> None:
+        it = _load_itinerary()
+        it[stage] = True
+        with open(itinerary_path, "w") as _f:
+            json.dump(it, _f, indent=2)
+
+    def _stage_done(stage: str) -> bool:
+        return bool(_load_itinerary().get(stage, False))
+
+    # --- Check resume stage ---
+    resume = _resume_stage(outdir, shash)
+    if resume != "none":
+        print(f"  Resume detected (hash={shash}, stage={resume})")
+
+    # --- Load stereo (always needed — onset requires audio signal) ---
+    _emit_progress(0.05, "load_audio")
     sr, x_left, x_right = load_audio_stereo(wav_path)
     is_stereo = not np.array_equal(x_left, x_right)
     # Mono mix for analysis (metrics, onset).
@@ -1038,7 +1286,7 @@ def main() -> None:
             x_left = x_left[s0:s1]
             x_right = x_right[s0:s1]
             x_mono = x_mono[s0:s1]
-            print(f"  Partial analysis: {s0/sr:.3f}s – {s1/sr:.3f}s "
+            print(f"  Partial analysis: {s0/sr:.3f}s - {s1/sr:.3f}s "
                   f"({s1-s0} samples of {total_samples})")
 
     # --- Compositing ---
@@ -1055,33 +1303,59 @@ def main() -> None:
         composite_regions = regions_L
         for ri in composite_regions:
             print(f"  Region {ri.seg_idx}: original "
-                  f"{ri.original_start_s:.3f}s – {ri.original_end_s:.3f}s "
-                  f"→ composite {ri.composite_start_sample/sr:.3f}s – "
+                  f"{ri.original_start_s:.3f}s - {ri.original_end_s:.3f}s "
+                  f"-> composite {ri.composite_start_sample/sr:.3f}s - "
                   f"{ri.composite_end_sample/sr:.3f}s")
 
     use_zero_front = composite_regions is not None
 
-    # --- CQT ---
-    if is_stereo:
-        print("Computing CQT (left)...")
-        freqs, times, power_L, cqt_L = compute_cqt(
-            x_left, sr, cfg, zero_front=use_zero_front)
-        print("Computing CQT (right)...")
-        _, _, power_R, cqt_R = compute_cqt(
-            x_right, sr, cfg, zero_front=use_zero_front)
-        # Mono power for analysis / onset (average).
-        power_mono = (power_L + power_R) * power_L.dtype.type(0.5)
+    # --- CQT (skip if stream shards already exist for this hash) ---
+    if resume in ("cqt", "full"):
+        print("Loading CQT from stream shards (resume)...")
+        _rd = _load_cqt_from_stream(outdir, shash)
+        sr = _rd['sr']
+        freqs = _rd['freqs']
+        times = _rd['times']
+        cqt_L = _rd['cqt_L']
+        cqt_R = _rd['cqt_R']
+        is_stereo = _rd['is_stereo']
+        cfg.cqt_grid_hop_length = _rd['cqt_grid_hop_length']
+        # Reconstruct power from loaded complex arrays.
+        power_L_arr = (np.abs(cqt_L) ** 2).clip(min=EPS)
+        if is_stereo:
+            power_R_arr = (np.abs(cqt_R) ** 2).clip(min=EPS)
+            power_mono = (power_L_arr + power_R_arr) * power_L_arr.dtype.type(0.5)
+        else:
+            power_mono = power_L_arr
+        del _rd
     else:
-        print("Computing CQT (mono)...")
-        freqs, times, power_mono, cqt_L = compute_cqt(
-            x_mono, sr, cfg, zero_front=use_zero_front)
-        cqt_R = None
+        if is_stereo:
+            _emit_progress(0.10, "cqt_left")
+            print("Computing CQT (left)...")
+            freqs, times, power_L, cqt_L = compute_cqt(
+                x_left, sr, cfg, zero_front=use_zero_front)
+            _emit_progress(0.38, "cqt_right")
+            print("Computing CQT (right)...")
+            _, _, power_R, cqt_R = compute_cqt(
+                x_right, sr, cfg, zero_front=use_zero_front)
+            power_mono = (power_L + power_R) * power_L.dtype.type(0.5)
+        else:
+            _emit_progress(0.10, "cqt_mono")
+            print("Computing CQT (mono)...")
+            freqs, times, power_mono, cqt_L = compute_cqt(
+                x_mono, sr, cfg, zero_front=use_zero_front)
+            cqt_R = None
 
-    # --- Onset enhancement (on mono) ---
-    print("Computing time-domain onset enhancement...")
-    onset = compute_onset_envelope(
-        x_mono, sr, freqs, cfg.cqt_grid_hop_length or cfg.hop_length,
-        len(times), compute_dtype=cfg.cqt_compute_dtype)
+    # --- Onset enhancement (skip if already in stream shards) ---
+    if resume == "full":
+        print("Loading onset from stream shards (resume)...")
+        onset = _load_shard(_stream_dir_for(outdir, shash), "onset")
+    else:
+        _emit_progress(0.60, "onset")
+        print("Computing time-domain onset enhancement...")
+        onset = compute_onset_envelope(
+            x_mono, sr, freqs, cfg.cqt_grid_hop_length or cfg.hop_length,
+            len(times), compute_dtype=cfg.cqt_compute_dtype)
     power_db = db_power(power_mono)
     per_bin_range = (np.max(power_db, axis=1) - np.min(power_db, axis=1))[:, None]
     real_dt = power_mono.dtype.type
@@ -1147,13 +1421,14 @@ def main() -> None:
     cents_per_bin = 1200.0 / cfg.bins_per_octave
     n_semitones = int(semitone_mask.sum())
     print(
-        f"  {len(freqs)} bins  ({cents_per_bin:.2f}¢/bin)  "
+        f"  {len(freqs)} bins  ({cents_per_bin:.2f} cents/bin)  "
         f"{n_semitones} semitones  "
         f"{len(times)} frames  "
         f"hop={(cfg.cqt_grid_hop_length or cfg.hop_length) / sr * 1000:.1f} ms"
         f"  {'stereo' if is_stereo else 'mono'}"
     )
 
+    _emit_progress(0.72, "analyze")
     metrics, peaks_idx = analyze(freqs, times, power_mono, cfg)
 
     # Auto-trim: find the lowest frequency bin that actually carries energy
@@ -1166,7 +1441,7 @@ def main() -> None:
         auto_fmin = max(auto_fmin * 2.0 ** (-1.0 / 12.0), float(freqs[0]))
     else:
         auto_fmin = float(freqs[0])
-    print(f"  Auto-trim: lowest active frequency ≈ {auto_fmin:.1f} Hz")
+    print(f"  Auto-trim: lowest active frequency ~= {auto_fmin:.1f} Hz")
 
     duration_s = len(x_mono) / sr
     fig_width_in = max(8.0, duration_s / cfg.seconds_per_inch)
@@ -1175,146 +1450,151 @@ def main() -> None:
     bass_fmax = min(cfg.bass_view_max_freq, fmax_actual)
     treble_fmin = min(cfg.treble_view_min_freq, fmax_actual)
 
-    print(f"  Duration {duration_s:.1f} s → figure width {fig_width_in:.1f} in "
-          f"@ {cfg.seconds_per_inch} s/in  (γ={cfg.color_gamma})")
+    print(f"  Duration {duration_s:.1f} s -> figure width {fig_width_in:.1f} in "
+          f"@ {cfg.seconds_per_inch} s/in  (gamma={cfg.color_gamma})")
 
     # --- Save compressed CQT tensors + plotting metadata ---
-    shash = settings_hash(cfg, args.composite,
-                          getattr(args, 'gap_seconds', 0.5),
-                          args.trim_pad)
+    # shash was computed early (before audio load) for resume detection.
     versioned_npz = f"cqt_data_{shash}.npz"
-    print(f"Saving compressed CQT tensors ({versioned_npz}) ...")
-    _SAVE_DTYPE_MAP = {
-        "float16": np.float16,
-        "float32": np.float32,
-        "float64": np.float64,
-    }
-    save_np_dtype = _SAVE_DTYPE_MAP.get(cfg.cqt_save_dtype, np.float32)
-
-    # For float16 we must normalize to [-1, 1] before encoding; float16's
-    # maximum representable value is only 65504, and CQT coefficients can
-    # exceed that for loud signals.  The scale is stored in the NPZ so the
-    # viewer can restore exact magnitudes for iCQT reconstruction.
-    if save_np_dtype == np.float16:
-        scale_candidates = [
-            float(np.abs(cqt_L.real).max()),
-            float(np.abs(cqt_L.imag).max()),
-        ]
-        if is_stereo:
-            scale_candidates += [
-                float(np.abs(cqt_R.real).max()),
-                float(np.abs(cqt_R.imag).max()),
-            ]
-        cqt_scale = max(scale_candidates) or 1.0
-
-        def _to_save(arr: np.ndarray) -> np.ndarray:
-            return (arr / cqt_scale).astype(np.float16)
+    if resume in ("cqt", "full"):
+        # Stream shards already on disk — skip the entire write.
+        print(f"CQT stream already saved ({versioned_npz}), skipping resave.")
     else:
-        cqt_scale = None
+        print(f"Saving streamed CQT tensors ({versioned_npz}) ...")
+        _SAVE_DTYPE_MAP = {
+            "float16": np.float16,
+            "float32": np.float32,
+            "float64": np.float64,
+        }
+        save_np_dtype = _SAVE_DTYPE_MAP.get(cfg.cqt_save_dtype, np.float32)
 
-        def _to_save(arr: np.ndarray) -> np.ndarray:
-            return arr.astype(save_np_dtype)
+        # For float16 we must normalize to [-1, 1] before encoding; float16's
+        # maximum representable value is only 65504, and CQT coefficients can
+        # exceed that for loud signals.  The scale is stored in the NPZ so the
+        # viewer can restore exact magnitudes for iCQT reconstruction.
+        if save_np_dtype == np.float16:
+            scale_candidates = [
+                float(np.abs(cqt_L.real).max()),
+                float(np.abs(cqt_L.imag).max()),
+            ]
+            if is_stereo:
+                scale_candidates += [
+                    float(np.abs(cqt_R.real).max()),
+                    float(np.abs(cqt_R.imag).max()),
+                ]
+            cqt_scale = max(scale_candidates) or 1.0
 
-    def _to_aux_save(arr: np.ndarray) -> np.ndarray:
-        return np.asarray(arr, dtype=save_np_dtype)
+            def _to_save(arr: np.ndarray) -> np.ndarray:
+                return (arr / cqt_scale).astype(np.float16)
+        else:
+            cqt_scale = None
 
-    save_dict = dict(
-        freqs=_to_aux_save(freqs),
-        times=_to_aux_save(times),
-        real_left=_to_save(cqt_L.real),
-        imag_left=_to_save(cqt_L.imag),
-        onset=_to_aux_save(onset),
-        pad_mask=pad_mask,
-        pad_influence=(_to_aux_save(pad_influence)
-                       if pad_influence is not None
-                       else np.empty((0, 0), dtype=save_np_dtype)),
-        semitone_mask=semitone_mask,
-        note_names=np.array(note_names, dtype="U12"),
-        peaks_idx=peaks_idx.astype(np.int64),
-        # Config scalars
-        sr=np.int32(sr),
-        bins_per_octave=np.int32(cfg.bins_per_octave),
-        hop_length=np.int32(cfg.hop_length),
-        cqt_grid_hop_length=np.int32(cfg.cqt_grid_hop_length or cfg.hop_length),
-        cqt_filter_scale=save_np_dtype(cfg.cqt_filter_scale),
-        cqt_window=np.array(cfg.cqt_window),
-        cqt_fmin=save_np_dtype(cfg.cqt_fmin),
-        cqt_fmax=save_np_dtype(cfg.cqt_fmax),
-        color_gamma=save_np_dtype(cfg.color_gamma),
-        image_dpi=np.int32(cfg.image_dpi),
-        seconds_per_inch=save_np_dtype(cfg.seconds_per_inch),
-        auto_fmin=save_np_dtype(auto_fmin),
-        fmax_actual=save_np_dtype(fmax_actual),
-        bass_fmax=save_np_dtype(bass_fmax),
-        treble_fmin=save_np_dtype(treble_fmin),
-        trim_pad=np.bool_(args.trim_pad),
-        is_stereo=np.bool_(is_stereo),
-        bulge_min=save_np_dtype(cfg.bulge_min),
-        bulge_max=save_np_dtype(cfg.bulge_max),
-        wav_path=np.array(wav_path),
-        settings_hash=np.array(shash),
-    )
-    # Only store the right channel when the source is genuinely stereo.
-    # For mono files x_left == x_right so storing both wastes 2× space.
-    # The viewer aliases right = left on load when real_right is absent.
-    if is_stereo:
-        save_dict["real_right"] = _to_save(cqt_R.real)
-        save_dict["imag_right"] = _to_save(cqt_R.imag)
-    # For float16 saves, persist the scale factor so the viewer can restore
-    # exact magnitudes for display and iCQT reconstruction.
-    if cqt_scale is not None:
-        save_dict["cqt_scale"] = np.float64(cqt_scale)
-    if cfg.cqt_bpo_schedule:
-        save_dict["cqt_bpo_schedule"] = np.asarray(
-            cfg.cqt_bpo_schedule, dtype=np.int32)
-    if cfg.cqt_hop_schedule:
-        save_dict["cqt_hop_schedule"] = np.asarray(
-            cfg.cqt_hop_schedule, dtype=np.int32)
-    if cfg.cqt_filter_scale_schedule:
-        save_dict["cqt_filter_scale_schedule"] = np.asarray(
-            cfg.cqt_filter_scale_schedule, dtype=save_np_dtype)
-    # Add metrics arrays
-    for k, v in metrics.items():
-        save_dict[f"metrics_{k}"] = _to_aux_save(v)
-    np.savez_compressed(os.path.join(outdir, versioned_npz), **save_dict)
-    # Also write a legacy symlink / copy so old code can find cqt_data.npz
-    legacy_path = os.path.join(outdir, "cqt_data.npz")
-    if os.path.isfile(legacy_path) or os.path.islink(legacy_path):
-        os.remove(legacy_path)
-    try:
-        os.symlink(versioned_npz, legacy_path)
-    except OSError:
-        import shutil
-        shutil.copy2(os.path.join(outdir, versioned_npz), legacy_path)
-    del cqt_L, cqt_R  # free memory after saving
+            def _to_save(arr: np.ndarray) -> np.ndarray:
+                return arr.astype(save_np_dtype)
+
+        def _to_aux_save(arr: np.ndarray) -> np.ndarray:
+            return np.asarray(arr, dtype=save_np_dtype)
+
+        save_dict = dict(
+            freqs=_to_aux_save(freqs),
+            times=_to_aux_save(times),
+            real_left=_to_save(cqt_L.real),
+            imag_left=_to_save(cqt_L.imag),
+            onset=_to_aux_save(onset),
+            pad_mask=pad_mask,
+            pad_influence=(_to_aux_save(pad_influence)
+                           if pad_influence is not None
+                           else np.empty((0, 0), dtype=save_np_dtype)),
+            semitone_mask=semitone_mask,
+            note_names=np.array(note_names, dtype="U12"),
+            peaks_idx=peaks_idx.astype(np.int64),
+            # Config scalars
+            sr=np.int32(sr),
+            bins_per_octave=np.int32(cfg.bins_per_octave),
+            hop_length=np.int32(cfg.hop_length),
+            cqt_grid_hop_length=np.int32(cfg.cqt_grid_hop_length or cfg.hop_length),
+            cqt_filter_scale=save_np_dtype(cfg.cqt_filter_scale),
+            cqt_window=np.array(cfg.cqt_window),
+            cqt_fmin=save_np_dtype(cfg.cqt_fmin),
+            cqt_fmax=save_np_dtype(cfg.cqt_fmax),
+            color_gamma=save_np_dtype(cfg.color_gamma),
+            image_dpi=np.int32(cfg.image_dpi),
+            seconds_per_inch=save_np_dtype(cfg.seconds_per_inch),
+            auto_fmin=save_np_dtype(auto_fmin),
+            fmax_actual=save_np_dtype(fmax_actual),
+            bass_fmax=save_np_dtype(bass_fmax),
+            treble_fmin=save_np_dtype(treble_fmin),
+            trim_pad=np.bool_(args.trim_pad),
+            is_stereo=np.bool_(is_stereo),
+            bulge_min=save_np_dtype(cfg.bulge_min),
+            bulge_max=save_np_dtype(cfg.bulge_max),
+            wav_path=np.array(wav_path),
+            settings_hash=np.array(shash),
+        )
+        # Only store the right channel when the source is genuinely stereo.
+        # For mono files x_left == x_right so storing both wastes 2× space.
+        # The viewer aliases right = left on load when real_right is absent.
+        if is_stereo:
+            save_dict["real_right"] = _to_save(cqt_R.real)
+            save_dict["imag_right"] = _to_save(cqt_R.imag)
+        # For float16 saves, persist the scale factor so the viewer can restore
+        # exact magnitudes for display and iCQT reconstruction.
+        if cqt_scale is not None:
+            save_dict["cqt_scale"] = np.float64(cqt_scale)
+        if cfg.cqt_bpo_schedule:
+            save_dict["cqt_bpo_schedule"] = np.asarray(
+                cfg.cqt_bpo_schedule, dtype=np.int32)
+        if cfg.cqt_hop_schedule:
+            save_dict["cqt_hop_schedule"] = np.asarray(
+                cfg.cqt_hop_schedule, dtype=np.int32)
+        if cfg.cqt_filter_scale_schedule:
+            save_dict["cqt_filter_scale_schedule"] = np.asarray(
+                cfg.cqt_filter_scale_schedule, dtype=save_np_dtype)
+        # Add metrics arrays
+        for k, v in metrics.items():
+            save_dict[f"metrics_{k}"] = _to_aux_save(v)
+        _emit_progress(0.80, "save_stream")
+        manifest_name, _stream_dir = _save_cqt_stream_bundle(outdir, shash, save_dict)
+        # Tiny pointer NPZ: keeps legacy discovery path while data lives in shards.
+        np.savez(
+            os.path.join(outdir, versioned_npz),
+            stream_manifest=np.array(manifest_name),
+            settings_hash=np.array(shash),
+            sr=np.int32(sr),
+            bins_per_octave=np.int32(cfg.bins_per_octave),
+            wav_path=np.array(wav_path),
+            is_stereo=np.bool_(is_stereo),
+        )
+        # Also write a legacy symlink / copy so old code can find cqt_data.npz
+        legacy_path = os.path.join(outdir, "cqt_data.npz")
+        if os.path.isfile(legacy_path) or os.path.islink(legacy_path):
+            os.remove(legacy_path)
+        try:
+            os.symlink(versioned_npz, legacy_path)
+        except OSError:
+            shutil.copy2(os.path.join(outdir, versioned_npz), legacy_path)
+        del cqt_L, cqt_R  # free memory after saving
+    _mark_stage("cqt_saved")
 
     # --- Update versions manifest ---
     _update_manifest(outdir, shash, cfg, args)
 
-    # --- Save composited audio for viewer playback ---
-    if composite_regions is not None:
-        stereo = np.column_stack([x_left, x_right])
-        if _HAS_SOUNDFILE:
-            composite_path = os.path.join(outdir, "composite_audio.flac")
-            _sf.write(composite_path, stereo, sr, subtype="PCM_24", format="FLAC")
-            label = "composite_audio.flac"
-        else:
-            composite_path = os.path.join(outdir, "composite_audio.wav")
-            stereo_i16 = (stereo * 32767).clip(-32768, 32767).astype(np.int16)
-            wavfile.write(composite_path, sr, stereo_i16)
-            del stereo_i16
-            label = "composite_audio.wav"
-        print(f"  {label:<28} composited playback audio ({len(x_left)/sr:.3f} s)")
-        del stereo
+    # Composite audio is NOT saved as WAV/FLAC — the complex CQT shards in
+    # the stream directory are the sole audio representation on disk.
+    # Use iCQT reconstruction in the viewer if playback is needed.
 
     # --- Write CSV / TXT outputs ---
+    _emit_progress(0.94, "write_reports")
     write_metrics_csv(os.path.join(outdir, "frame_metrics.csv"), times, metrics)
     write_peaks_csv(os.path.join(outdir, "detected_bulges.csv"), times, metrics, peaks_idx)
     write_summary_txt(os.path.join(outdir, "summary.txt"), wav_path, sr, x_mono,
                       times, metrics, peaks_idx, cfg)
+    _mark_stage("reports_written")
 
+    _emit_progress(1.00, "complete")
     print(f"\nAnalysis complete. Outputs written to: {outdir}")
-    print(f"  {versioned_npz}  compressed tensors (settings hash: {shash})")
+    print(f"  {versioned_npz}  stream manifest pointer (settings hash: {shash})")
+    print(f"  itinerary_{shash}.json  stage completion log (for resume)")
     print("  cqt_data.npz            (points to latest version)")
     print("  frame_metrics.csv")
     print("  detected_bulges.csv")

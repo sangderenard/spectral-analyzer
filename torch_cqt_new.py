@@ -533,6 +533,52 @@ def _compute_n_fft(
     return n_fft, lengths
 
 
+def _optimal_tile(
+    n_filters: int,
+    n_frames: int,
+    n_fft: int,
+    bytes_complex: int,
+    vram_budget: int,
+) -> tuple[int, int]:
+    """Compute the GPU-optimal (K_filters, T_frames) tile for the matmul.
+
+    For ``filter_bank (K × F) @ frames_rfft (F × T) → output (K × T)``
+    the working-set memory is:
+        W = (K + T) × F × bc + K × T × bc   (bc = bytes per complex element)
+
+    With F = n_fft//2+1 and a fixed budget M, the AM-GM optimum with K = T is:
+        K² + 2·K·F = M/bc   →   K = −F + √(F² + M/bc)
+
+    Both K and T are clamped to [1, n_filters] and [1, n_frames] respectively.
+    The result is the *starting* tile; OOM-halving in the caller will shrink it
+    further if VRAM is more constrained than the budget suggests.
+    """
+    F = n_fft // 2 + 1
+    bc = bytes_complex
+    discriminant = F * F + vram_budget / bc
+    K_opt = max(1, int(-F + math.sqrt(discriminant)))
+    K_opt = min(K_opt, n_filters)
+    # Given K, solve T: K×T×bc + T×F×bc + K×F×bc = M → T = (M/bc − K×F) / (F + K)
+    denom = F + K_opt
+    T_opt = max(1, int((vram_budget / bc - K_opt * F) // max(denom, 1)))
+    T_opt = min(T_opt, n_frames)
+    return K_opt, T_opt
+
+
+def _vram_budget(device: torch.device, fraction: float = 0.6) -> int:
+    """Return available VRAM budget in bytes for one tile allocation.
+
+    Uses *fraction* of free VRAM on CUDA; falls back to 512 MB on CPU.
+    """
+    if device.type == "cuda":
+        try:
+            free, _ = torch.cuda.mem_get_info(device)
+            return max(64 * 1024 * 1024, int(free * fraction))
+        except Exception:
+            return 512 * 1024 * 1024
+    return 512 * 1024 * 1024
+
+
 def _try_or_halve(fn, batch_size, *args, **kwargs):
     """Call fn(batch_size, *args, **kwargs). On CUDA OOM, halve batch_size and retry.
 
@@ -724,8 +770,19 @@ def _cqt_response_streaming(
     # Strided view: (n_frames, n_fft) — zero extra memory, just a view.
     frames_view = sig_padded.unfold(0, n_fft, hop_length)
 
+    # --- Compute optimal starting tile size from available VRAM ---
+    # For the matmul filter_bank(K×F) @ frames_rfft(F×T) → (K×T):
+    #   Working set = (K+T)×F×bc + K×T×bc  (bc = bytes per complex).
+    # The AM-GM optimum with K=T gives K = −F + √(F²+M/bc).
+    # This is the *starting* size; OOM halving below handles tighter budgets.
+    _bc = 8 if dtype == torch.float32 else 16  # bytes per complex element
+    _budget = _vram_budget(device)
+    _K_opt, _T_opt = _optimal_tile(n_filters, n_frames, n_fft, _bc, _budget)
+    # batch_size argument acts as an upper cap; default is large (no cap effect).
+    f_bs = min(batch_size, _K_opt)
+    _t_bs_init = min(batch_size, _T_opt)
+
     # --- Filter loop with OOM halving ---
-    f_bs = batch_size
     f_start = 0
     while f_start < n_filters:
         f_end = min(f_start + f_bs, n_filters)
@@ -743,7 +800,7 @@ def _cqt_response_streaming(
                     progress.frame_batches_total = math.ceil(n_frames / max(1, batch_size))
 
             # --- Frame loop with OOM halving ---
-            t_bs = batch_size
+            t_bs = _t_bs_init  # start from VRAM-optimal T, halve on OOM
             t_start = 0
             while t_start < n_frames:
                 t_end = min(t_start + t_bs, n_frames)
@@ -766,11 +823,19 @@ def _cqt_response_streaming(
                         dst_f0 = out_filter_offset + f_start
                         dst_f1 = out_filter_offset + f_end
                         if out_stride <= 1:
-                            if out_device.type == "cpu":
-                                out[..., dst_f0:dst_f1, t_start:t_end] = (
-                                    resp_batch.cpu())
-                            else:
-                                out[..., dst_f0:dst_f1, t_start:t_end] = resp_batch
+                            # Clip t_end to the output buffer width so that
+                            # zero-padded short octave signals (padded to n_fft
+                            # before entry) never exceed V_host's column count.
+                            dst_t1 = min(out_common_cols or out.shape[-1], t_end)
+                            n_out_cols = dst_t1 - t_start
+                            if n_out_cols > 0:
+                                rb = resp_batch[..., :n_out_cols]
+                                if out_device.type == "cpu":
+                                    out[..., dst_f0:dst_f1, t_start:dst_t1] = (
+                                        rb.cpu())
+                                else:
+                                    out[..., dst_f0:dst_f1, t_start:dst_t1] = rb
+                                del rb
                         else:
                             dst_t0 = t_start * out_stride
                             dst_t1 = min(out_common_cols or out.shape[-1],
@@ -2110,6 +2175,7 @@ def _morse_freq(
     sr: float,
     beta: float = 4.0,
     gamma: float = 3.0,
+    **_unused: Any,
 ) -> torch.Tensor:
     """Generalized Morse wavelet in frequency domain.
 

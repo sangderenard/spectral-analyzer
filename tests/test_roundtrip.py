@@ -87,7 +87,7 @@ class TestCQTRoundTrip:
         from bass_viewer import ViewportSynthPlayer
         self.VSP = ViewportSynthPlayer
 
-    def _roundtrip(self, sig, sr=22050, bpo=48, hop=256):
+    def _roundtrip(self, sig, sr=22050, bpo=48, hop=1):
         import librosa
         fmin = 32.0
         fmax = sr / 2.0 * 0.95
@@ -279,6 +279,126 @@ class TestFilterbankRoundTrip:
         meta, _ = self.FB.load_meta(str(tmp_path))
 
         assert meta["cafls_center_hz"] == pytest.approx(55.0, rel=1e-6)
+
+    def test_compute_and_save_persists_intermediate_sidecars_before_hilbert_failure(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        sr = 8000
+        sig = _tone(sr, 0.25, 440.0).astype(np.float64)
+        fb = self.FB(sr, "Linkwitz-Riley 4")
+        bands = [self.BandDef(fmin=200.0, fmax=1000.0)]
+        bands[0].label = bands[0].auto_label(sr)
+        expected_mag = np.linspace(0.1, 0.4, 4, dtype=np.float64)
+        expected_phase = np.linspace(0.0, 0.3, 4, dtype=np.float64)
+
+        def _boom(this, hop=None, hilbert_progress=None,
+                  band_result_cb=None, resume_state=None):
+            if band_result_cb is not None:
+                band_result_cb(0, expected_mag, expected_phase, 1)
+            raise RuntimeError("hilbert boom")
+
+        monkeypatch.setattr(self.FB, "compute_envelopes", _boom)
+
+        with pytest.raises(RuntimeError, match="hilbert boom"):
+            fb.compute_and_save(
+                sig, bands, str(tmp_path), sr,
+                envelope_hop=1,
+                intermediate_precision="64-bit",
+                save_precision="32-bit",
+            )
+
+        meta, band_meta = self.FB.load_meta(str(tmp_path))
+        assert meta["band_audio_precision"] == "64-bit"
+        assert meta["intermediate_precision"] == "64-bit"
+        assert meta["save_precision"] == "32-bit"
+        assert os.path.isfile(os.path.join(tmp_path, "filterbank",
+                                           band_meta[0]["file"]))
+
+        checkpoint = self.FB.load_envelope_checkpoint(str(tmp_path))
+        assert checkpoint is not None
+        assert checkpoint["completed"] == [True]
+        np.testing.assert_allclose(checkpoint["mags"][0], expected_mag)
+        np.testing.assert_allclose(checkpoint["phases"][0], expected_phase)
+
+    def test_compute_and_save_finalizes_requested_save_precision(self, tmp_path):
+        sr = 8000
+        sig = _tone(sr, 0.25, 440.0).astype(np.float64)
+        fb = self.FB(sr, "Linkwitz-Riley 4")
+        bands = [self.BandDef(fmin=200.0, fmax=1000.0)]
+        bands[0].label = bands[0].auto_label(sr)
+
+        fb.compute_and_save(
+            sig, bands, str(tmp_path), sr,
+            envelope_hop=1,
+            intermediate_precision="64-bit",
+            save_precision="32-bit",
+        )
+
+        meta, _ = self.FB.load_meta(str(tmp_path))
+        assert meta["band_audio_precision"] == "32-bit"
+        assert meta["intermediate_precision"] == "64-bit"
+        assert meta["save_precision"] == "32-bit"
+        assert not os.path.exists(os.path.join(
+            tmp_path, "filterbank", "fb_envelopes.partial.npz"))
+
+        cached = self.FB.load_envelopes(str(tmp_path))
+        assert cached is not None
+        _, _, hops = cached
+        assert hops == [1]
+
+    def test_compute_and_save_resumes_checkpoint_without_refiltering(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        import torch
+
+        sr = 8000
+        sig = _tone(sr, 0.25, 440.0).astype(np.float64)
+        bands = [self.BandDef(fmin=200.0, fmax=1000.0)]
+        bands[0].label = bands[0].auto_label(sr)
+        orig_compute_envelopes = self.FB.compute_envelopes
+
+        def _boom(this, hop=None, hilbert_progress=None,
+                  band_result_cb=None, resume_state=None):
+            if band_result_cb is not None:
+                band_result_cb(
+                    0,
+                    np.linspace(0.1, 0.4, 4, dtype=np.float64),
+                    np.linspace(0.0, 0.3, 4, dtype=np.float64),
+                    1,
+                )
+            raise RuntimeError("hilbert boom")
+
+        monkeypatch.setattr(self.FB, "compute_envelopes", _boom)
+
+        with pytest.raises(RuntimeError, match="hilbert boom"):
+            self.FB(sr, "Linkwitz-Riley 4").compute_and_save(
+                sig, bands, str(tmp_path), sr,
+                envelope_hop=1,
+                intermediate_precision="64-bit",
+                save_precision="32-bit",
+            )
+
+        monkeypatch.setattr(self.FB, "compute_envelopes", orig_compute_envelopes)
+        monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+        def _refiltered(*args, **kwargs):
+            raise AssertionError("unexpected refilter")
+
+        monkeypatch.setattr(self.FB, "_filter_one_band", _refiltered)
+
+        self.FB(sr, "Linkwitz-Riley 4").compute_and_save(
+            sig, bands, str(tmp_path), sr,
+            envelope_hop=1,
+            intermediate_precision="64-bit",
+            save_precision="32-bit",
+        )
+
+        cached = self.FB.load_envelopes(str(tmp_path))
+        assert cached is not None
 
 
 # =====================================================================

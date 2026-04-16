@@ -7,7 +7,10 @@ Forward:  cqt(y, sr, ...) → C  complex (..., n_bins, n_frames)
 Inverse:  icqt(C, sr, ...) → y  float   (..., n_samples)
 """
 from __future__ import annotations
+import gc
 import math
+import os
+import tempfile
 import threading
 import time
 import warnings
@@ -713,8 +716,57 @@ def _build_wavelet_batch(
         progress=progress, on_progress=on_progress)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Helpers for mmap-based streaming signal input
+# ══════════════════════════════════════════════════════════════════════════
+
+def _make_temp_npy() -> str:
+    """Return a unique temp file path for a .npy mmap (not yet created)."""
+    fd, path = tempfile.mkstemp(suffix=".cqt_tmp.npy")
+    os.close(fd)
+    return path
+
+
+def _decimate_mmap_2x(
+    src: np.ndarray,
+    out_path: str,
+    device: torch.device,
+    resample_kw: "ResampleKW | None" = None,
+    chunk_samples: int = 2_000_000,
+) -> np.ndarray:
+    """Decimate *src* 2× into a new numpy memmap at *out_path*.
+
+    Processes *src* in chunks to avoid loading it entirely into RAM.
+    Returns the open writable memmap (caller must keep reference alive).
+    Edge artifacts from stateless chunk resampling are ~64 samples per
+    chunk boundary — negligible for chunks >> 64 samples.
+    """
+    n_src = len(src)
+    # torchaudio 2:1 resample gives ceil(n / 2) output samples
+    n_dst = (n_src + 1) // 2
+    dst = np.lib.format.open_memmap(out_path, mode="w+",
+                                     dtype=src.dtype, shape=(n_dst,))
+    kw = dict(resample_kw) if resample_kw else {}
+    write_pos = 0
+    read_pos = 0
+    while read_pos < n_src:
+        end = min(n_src, read_pos + chunk_samples)
+        chunk_np = np.asarray(src[read_pos:end])
+        chunk_t = torch.as_tensor(chunk_np, device=device,
+                                   dtype=torch.float64 if chunk_np.dtype == np.float64
+                                   else torch.float32)
+        dec_t = TAF.resample(chunk_t, 2, 1, **kw)
+        n_out = dec_t.shape[-1]
+        dst[write_pos: write_pos + n_out] = dec_t.cpu().numpy()
+        write_pos += n_out
+        read_pos = end
+        del chunk_t, dec_t
+    dst.flush()
+    return dst
+
+
 def _cqt_response_streaming(
-    y: torch.Tensor,
+    y: "torch.Tensor | None",
     n_fft: int,
     hop_length: int,
     freqs: torch.Tensor,
@@ -726,49 +778,55 @@ def _cqt_response_streaming(
     pad_mode: str,
     device: torch.device,
     dtype: torch.dtype,
-    batch_size: int = 64,
-    out: torch.Tensor | None = None,
-    out_filter_offset: int = 0,
-    out_stride: int = 1,
-    out_common_cols: int | None = None,
+    batch_size: int = 0,  # 0 = uncapped: VRAM budget alone governs tile size
+    shard_sink=None,          # callable(f_global_start, f_global_end, t_out_start, t_out_end, tile_np)
+    sink_filter_offset: int = 0,
+    sink_stride: int = 1,
+    sink_common_cols: int | None = None,
     apply_scale: bool = False,
     progress: CQTProgress | None = None,
     on_progress: CQTProgressCallback | None = None,
-) -> torch.Tensor:
+    signal_mmap: "np.ndarray | None" = None,  # 1D numpy array; when set, y must be None
+    signal_chunk_frames: int = 2048,           # output frames per VRAM chunk (mmap path)
+    signal_offset: int = 0,                    # sample offset into signal_mmap where signal starts
+) -> None:
     """Batch CQT with OOM-catch-and-halve on every allocation.
 
     Batches filters and frames independently. On any CUDA OOM the
     responsible batch size is halved and that chunk is retried.
     No size estimation — the GPU itself is the arbiter.
+
+    Every completed tile is passed immediately to *shard_sink*:
+        shard_sink(f_global_start, f_global_end, t_out_start, t_out_end, tile_np)
+    where *tile_np* is a numpy array of shape (n_filters_tile, n_frames_tile)
+    with complex dtype.  The sink writes real/imag to disk and handles
+    backpressure — no tensor is retained in RAM beyond the current tile.
+
+    When *signal_mmap* is provided, the signal is loaded into VRAM in
+    chunks of *signal_chunk_frames* output frames at a time.  The full
+    signal is never resident in VRAM simultaneously.
     """
     cdtype = _to_complex(dtype)
     n_filters = len(freqs)
     sr_scale = math.sqrt(full_sr / my_sr)
 
-    sig = y.reshape(-1)
-    sig_len = sig.shape[-1]
-
-    padded_len = sig_len + n_fft
-    n_frames = max(1, 1 + (padded_len - n_fft) // hop_length)
-
-    lead = y.shape[:-1]
-    direct_write = out is not None
-    if out is None:
-        out = torch.empty(*lead, n_filters, n_frames,
-                          dtype=cdtype, device=device)
-    out_device = out.device
-
-    n_freq_bins = n_fft // 2 + 1
-
-    # Pre-pad signal once — boundary conditions handled upfront.
-    pad_amt = n_fft // 2
-    if pad_mode == "constant":
-        sig_padded = torch.nn.functional.pad(sig, (pad_amt, pad_amt))
+    # Determine signal length and set up the full-tensor path if needed.
+    if signal_mmap is not None:
+        sig_n = len(signal_mmap)
+        sig_padded = None
+        frames_view = None
     else:
-        sig_padded = _pad(sig, pad_amt, pad_amt, mode=pad_mode)
+        sig = y.reshape(-1)
+        sig_n = sig.shape[-1]
+        pad_amt = n_fft // 2
+        if pad_mode == "constant":
+            sig_padded = torch.nn.functional.pad(sig, (pad_amt, pad_amt))
+        else:
+            sig_padded = _pad(sig, pad_amt, pad_amt, mode=pad_mode)
+        frames_view = sig_padded.unfold(0, n_fft, hop_length)
 
-    # Strided view: (n_frames, n_fft) — zero extra memory, just a view.
-    frames_view = sig_padded.unfold(0, n_fft, hop_length)
+    n_frames = max(1, 1 + sig_n // hop_length)
+    n_freq_bins = n_fft // 2 + 1
 
     # --- Compute optimal starting tile size from available VRAM ---
     # For the matmul filter_bank(K×F) @ frames_rfft(F×T) → (K×T):
@@ -778,9 +836,10 @@ def _cqt_response_streaming(
     _bc = 8 if dtype == torch.float32 else 16  # bytes per complex element
     _budget = _vram_budget(device)
     _K_opt, _T_opt = _optimal_tile(n_filters, n_frames, n_fft, _bc, _budget)
-    # batch_size argument acts as an upper cap; default is large (no cap effect).
-    f_bs = min(batch_size, _K_opt)
-    _t_bs_init = min(batch_size, _T_opt)
+    # batch_size=0 means uncapped — VRAM budget is the sole constraint.
+    # Only apply the cap when an explicit positive limit was requested.
+    f_bs = _K_opt if batch_size <= 0 else min(batch_size, _K_opt)
+    _t_bs_init = _T_opt if batch_size <= 0 else min(batch_size, _T_opt)
 
     # --- Filter loop with OOM halving ---
     f_start = 0
@@ -799,77 +858,157 @@ def _cqt_response_streaming(
                     progress.filter_batches_total = math.ceil(n_filters / max(1, f_bs))
                     progress.frame_batches_total = math.ceil(n_frames / max(1, batch_size))
 
-            # --- Frame loop with OOM halving ---
+            # --- Frame loop (supports both full-tensor and mmap-chunk paths) ---
             t_bs = _t_bs_init  # start from VRAM-optimal T, halve on OOM
             t_start = 0
             while t_start < n_frames:
-                t_end = min(t_start + t_bs, n_frames)
+                if signal_mmap is not None:
+                    # ── Mmap path: load one signal chunk into VRAM ──
+                    t_chunk_end = min(t_start + signal_chunk_frames, n_frames)
+                    n_chunk_f = t_chunk_end - t_start
 
-                try:
-                    # Vectorized batch rfft — one kernel launch per batch.
-                    # frames_view slice is a strided view; rfft makes it
-                    # contiguous internally → (fb, n_freq_bins).  OOM
-                    # halving protects this allocation.
-                    F = torch.fft.rfft(
-                        frames_view[t_start:t_end], n=n_fft, dim=1,
-                    ).to(cdtype)
+                    # Signal samples for frames [t_start, t_chunk_end):
+                    #   frame k spans mmap[signal_offset + k*hop - n_fft//2 :
+                    #                      signal_offset + k*hop + n_fft//2]
+                    # signal_offset shifts all reads so that frame 0 is centred
+                    # on the true analysis start (not the pre-padding start).
+                    # Reads that fall before sample 0 or after sig_n-1 are
+                    # zero-filled — but with adequate pre/post padding those
+                    # zero regions are never reached.
+                    half = n_fft // 2
+                    raw_s = signal_offset + t_start * hop_length - half
+                    raw_e = signal_offset + (t_chunk_end - 1) * hop_length + half  # exclusive
+                    act_s = max(0, raw_s)
+                    act_e = min(sig_n, raw_e)
+                    left_pad  = max(0, -raw_s)
+                    right_pad = max(0, raw_e - sig_n)
+                    total_samp = left_pad + (act_e - act_s) + right_pad
+                    # total_samp == (n_chunk_f - 1)*hop + n_fft  ✓
 
-                    resp_batch = torch.matmul(fft_rows, F.T)
-                    if apply_scale:
-                        resp_batch = resp_batch / lengths[
-                            f_start:f_end
-                        ].unsqueeze(-1).sqrt()
-                    if direct_write:
-                        dst_f0 = out_filter_offset + f_start
-                        dst_f1 = out_filter_offset + f_end
-                        if out_stride <= 1:
-                            # Clip t_end to the output buffer width so that
-                            # zero-padded short octave signals (padded to n_fft
-                            # before entry) never exceed V_host's column count.
-                            dst_t1 = min(out_common_cols or out.shape[-1], t_end)
+                    chunk_np = np.empty(total_samp, dtype=signal_mmap.dtype)
+                    if left_pad > 0:
+                        chunk_np[:left_pad] = 0.0
+                    if act_e > act_s:
+                        chunk_np[left_pad: left_pad + (act_e - act_s)] = \
+                            signal_mmap[act_s:act_e]
+                    if right_pad > 0:
+                        chunk_np[left_pad + (act_e - act_s):] = 0.0
+
+                    chunk_t = torch.as_tensor(chunk_np, device=device, dtype=dtype)
+                    del chunk_np
+                    frames_chunk = chunk_t.unfold(0, n_fft, hop_length)
+                    # frames_chunk shape: (n_chunk_f, n_fft)  ✓
+
+                    # Inner frame sub-batching with OOM halving
+                    tc = 0
+                    while tc < n_chunk_f:
+                        tc_end = min(tc + t_bs, n_chunk_f)
+                        try:
+                            F = torch.fft.rfft(
+                                frames_chunk[tc:tc_end], n=n_fft, dim=1,
+                            ).to(cdtype)
+                            resp_batch = torch.matmul(fft_rows, F.T)
+                            if apply_scale:
+                                resp_batch = resp_batch / lengths[
+                                    f_start:f_end
+                                ].unsqueeze(-1).sqrt()
+
+                            g_t0 = t_start + tc
+                            g_t1 = t_start + tc_end
+                            dst_f0 = sink_filter_offset + f_start
+                            dst_f1 = sink_filter_offset + f_end
+                            if sink_stride <= 1:
+                                dst_t1 = min(sink_common_cols or n_frames, g_t1)
+                                n_out_cols = dst_t1 - g_t0
+                                if n_out_cols > 0 and shard_sink is not None:
+                                    tile = resp_batch[..., :n_out_cols].cpu().numpy()
+                                    shard_sink(dst_f0, dst_f1, g_t0, dst_t1, tile)
+                                    del tile
+                            else:
+                                dst_t0 = g_t0 * sink_stride
+                                dst_t1 = min(
+                                    sink_common_cols or (n_frames * sink_stride),
+                                    g_t1 * sink_stride)
+                                if dst_t1 > dst_t0 and shard_sink is not None:
+                                    expanded = resp_batch.repeat_interleave(
+                                        sink_stride, dim=-1)
+                                    expanded = expanded[..., :dst_t1 - dst_t0]
+                                    tile = expanded.cpu().numpy()
+                                    del expanded
+                                    shard_sink(dst_f0, dst_f1, dst_t0, dst_t1, tile)
+                                    del tile
+                            del resp_batch, F
+
+                            if progress is not None:
+                                with progress._lock:
+                                    progress.frame_batches_done += 1
+                                    progress.frame_batch_size = t_bs
+                                if on_progress is not None:
+                                    on_progress(progress)
+                            tc = tc_end  # success
+
+                        except torch.cuda.OutOfMemoryError:
+                            torch.cuda.empty_cache()
+                            if t_bs <= 1:
+                                raise
+                            t_bs = max(1, t_bs // 2)
+                            # retry same tc
+
+                    del chunk_t, frames_chunk
+                    t_start = t_chunk_end  # advance by whole chunk
+
+                else:
+                    # ── Full-tensor path (existing behaviour) ──
+                    t_end = min(t_start + t_bs, n_frames)
+                    try:
+                        F = torch.fft.rfft(
+                            frames_view[t_start:t_end], n=n_fft, dim=1,
+                        ).to(cdtype)
+
+                        resp_batch = torch.matmul(fft_rows, F.T)
+                        if apply_scale:
+                            resp_batch = resp_batch / lengths[
+                                f_start:f_end
+                            ].unsqueeze(-1).sqrt()
+
+                        dst_f0 = sink_filter_offset + f_start
+                        dst_f1 = sink_filter_offset + f_end
+                        if sink_stride <= 1:
+                            dst_t1 = min(sink_common_cols or n_frames, t_end)
                             n_out_cols = dst_t1 - t_start
-                            if n_out_cols > 0:
-                                rb = resp_batch[..., :n_out_cols]
-                                if out_device.type == "cpu":
-                                    out[..., dst_f0:dst_f1, t_start:dst_t1] = (
-                                        rb.cpu())
-                                else:
-                                    out[..., dst_f0:dst_f1, t_start:dst_t1] = rb
-                                del rb
+                            if n_out_cols > 0 and shard_sink is not None:
+                                tile = resp_batch[..., :n_out_cols].cpu().numpy()
+                                shard_sink(dst_f0, dst_f1, t_start, dst_t1, tile)
+                                del tile
                         else:
-                            dst_t0 = t_start * out_stride
-                            dst_t1 = min(out_common_cols or out.shape[-1],
-                                         t_end * out_stride)
-                            if dst_t1 > dst_t0:
-                                expanded = resp_batch.repeat_interleave(
-                                    out_stride, dim=-1)
+                            dst_t0 = t_start * sink_stride
+                            dst_t1 = min(sink_common_cols or (n_frames * sink_stride),
+                                         t_end * sink_stride)
+                            if dst_t1 > dst_t0 and shard_sink is not None:
+                                expanded = resp_batch.repeat_interleave(sink_stride, dim=-1)
                                 expanded = expanded[..., :dst_t1 - dst_t0]
-                                if out_device.type == "cpu":
-                                    out[..., dst_f0:dst_f1, dst_t0:dst_t1] = (
-                                        expanded.cpu())
-                                else:
-                                    out[..., dst_f0:dst_f1, dst_t0:dst_t1] = expanded
+                                tile = expanded.cpu().numpy()
                                 del expanded
-                    else:
-                        out[..., f_start:f_end, t_start:t_end] = resp_batch
-                    del resp_batch
-                    del F
+                                shard_sink(dst_f0, dst_f1, dst_t0, dst_t1, tile)
+                                del tile
+                        del resp_batch
+                        del F
 
-                    if progress is not None:
-                        with progress._lock:
-                            progress.frame_batches_done += 1
-                            progress.frame_batch_size = t_bs
-                        if on_progress is not None:
-                            on_progress(progress)
+                        if progress is not None:
+                            with progress._lock:
+                                progress.frame_batches_done += 1
+                                progress.frame_batch_size = t_bs
+                            if on_progress is not None:
+                                on_progress(progress)
 
-                    t_start = t_end  # success — advance
+                        t_start = t_end  # success — advance
 
-                except torch.cuda.OutOfMemoryError:
-                    torch.cuda.empty_cache()
-                    if t_bs <= 1:
-                        raise
-                    t_bs = max(1, t_bs // 2)
-                    # retry same t_start
+                    except torch.cuda.OutOfMemoryError:
+                        torch.cuda.empty_cache()
+                        if t_bs <= 1:
+                            raise
+                        t_bs = max(1, t_bs // 2)
+                        # retry same t_start
 
             del fft_rows
             if device.type == "cuda":
@@ -892,7 +1031,6 @@ def _cqt_response_streaming(
             # retry same f_start
 
     del sig_padded, frames_view
-    return out
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1690,14 +1828,17 @@ def cqt(
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
     resample_kw: ResampleKW | None = None,
-    batch_size: int = 64,
+    batch_size: int = 0,  # 0 = uncapped: VRAM budget alone governs tile size
     progress: CQTProgress | None = None,
     on_progress: CQTProgressCallback | None = None,
     n_fft_max: int = 2**20,
     bpo_func: OctaveBPOFunc | None = None,
     hop_func: OctaveHopFunc | None = None,
     filter_scale_func: OctaveFloatFunc | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    shards: "dict | None" = None,  # {"real": np.memmap, "imag": np.memmap} — written directly, nothing returned
+    signal_n_samples: "int | None" = None,  # true analysis length when mmap contains pre/post padding
+    signal_offset: int = 0,  # sample offset INTO the mmap where the true signal starts
+) -> "tuple[np.ndarray, int] | tuple[np.ndarray, int]":
     """Torch clone of ``librosa.cqt`` / ``librosa.vqt`` (gamma=0).
 
     Parameters
@@ -1735,17 +1876,27 @@ def cqt(
     C     : complex (..., n_bins, n_frames) on *device*
     freqs : float (n_bins,) on *device*
     """
-    if not isinstance(y, torch.Tensor):
+    _y_is_mmap = isinstance(y, np.ndarray)
+    if not _y_is_mmap and not isinstance(y, torch.Tensor):
         y = torch.as_tensor(np.asarray(y))
     if device is None:
-        device = y.device
+        device = y.device if isinstance(y, torch.Tensor) else torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu")
     if dtype is None:
-        dtype = y.dtype if y.dtype.is_floating_point else torch.float64
+        if isinstance(y, torch.Tensor):
+            dtype = y.dtype if y.dtype.is_floating_point else torch.float64
+        else:
+            dtype = torch.float64 if y.dtype == np.float64 else torch.float32
     if fmin is None:
         fmin = _C1_HZ
     window = _canonical_cqt_window(window)
 
-    y_t = y.to(device=device, dtype=dtype)
+    if _y_is_mmap:
+        y_t = None                          # never load full array into VRAM
+        y_n_samples = int(np.asarray(y).reshape(-1).shape[0])
+    else:
+        y_t = y.to(device=device, dtype=dtype)
+        y_n_samples = int(y_t.shape[-1])
 
     schedule_octaves = _schedule_n_octaves(
         bpo_func, hop_func, filter_scale_func)
@@ -1799,7 +1950,7 @@ def cqt(
             stacklevel=2,
         )
     # Check signal length vs decimation depth
-    sig_len = y_t.shape[-1]
+    sig_len = y_n_samples  # works for both mmap and tensor paths
     deepest_sr = sr / (2 ** (n_octaves - 1)) if n_octaves > 1 else sr
     deepest_len = sig_len / (2 ** (n_octaves - 1)) if n_octaves > 1 else sig_len
     bottom_bpo = bpo_per_oct[-1]
@@ -1859,215 +2010,288 @@ def cqt(
             progress.n_octaves = n_octaves
             progress.total_start_time = time.monotonic()
 
-    # ── CUDA direct-write plan ------------------------------------------
-    # Keep the working set on GPU, but write completed octave batches
-    # directly into the final host dump so we never need a full resident
-    # CQT tensor on CUDA during analysis.
-    direct_host_write = (device.type == "cuda")
-    vqt_resp: list[torch.Tensor] = []
-    common_hop = 0
-    strides: list[int] = []
-    common_cols = 0
-    V_host: torch.Tensor | None = None
-    if direct_host_write:
-        plan_y = y_t
-        plan_sr = float(sr)
-        plan_hop = hop_length
-        plan_scale = 1
-        plan_orig_hops: list[int] = []
-        plan_frames: list[int] = []
-        for i in range(n_octaves):
-            sl = oct_slices[i]
-            if hop_func is not None:
-                plan_hop = hop_func(i, plan_hop)
+    # ── Pre-pass: compute strides and common_cols analytically (no signal tensor) ──
+    # All sample counts are tracked with integer arithmetic; no VRAM allocation.
+    # _compute_n_fft does a GPU sync (.max().item()) on the per-octave freq
+    # tensors (tiny), which is necessary and cheap.
+    # Also caches (n_fft, lengths, n_extra_dec) per octave for the main loop.
+    #
+    # When signal_n_samples is provided (padded mmap path), use the TRUE
+    # analysis length for frame-count arithmetic, not the padded mmap length.
+    _plan_n = int(signal_n_samples if signal_n_samples is not None
+                  else y_n_samples)  # signal sample count at current decimation level
+    _plan_sr = float(sr)
+    _plan_hop = hop_length
+    _plan_scale = 1
+    _plan_orig_hops: list[int] = []
+    _plan_frames: list[int] = []
+    _oct_plan: list[tuple[int, torch.Tensor, int]] = []  # (n_fft, lengths, n_extra_dec)
+    for _pi in range(n_octaves):
+        _psl = oct_slices[_pi]
+        if hop_func is not None:
+            _plan_hop = hop_func(_pi, _plan_hop)
+        _pfreqs = freqs[_psl]
+        _palpha = alpha[_psl]
+        _pfs = fs_per_oct[_pi]
+        _plan_orig_hops.append(int(_plan_hop * _plan_scale))
+        _pn_fft, _poct_lengths = _compute_n_fft(_pfreqs, _plan_sr, _pfs,
+                                                  _plan_hop, _palpha)
+        _plan_oct_n = _plan_n       # signal sample count at this octave's rate
+        _plan_oct_sr = _plan_sr
+        _plan_oct_hop = _plan_hop
+        _extra_dec = 0
+        if n_fft_max > 0:
+            _pfmax = float(_pfreqs[-1].item())
+            while _pn_fft > n_fft_max:
+                if _plan_oct_sr / 4.0 < _pfmax:
+                    break
+                if _plan_oct_hop % 2 != 0:
+                    break
+                _plan_oct_sr /= 2.0
+                _plan_oct_hop //= 2
+                _plan_oct_n = (_plan_oct_n + 1) // 2   # ceil(n/2) — matches torchaudio
+                _extra_dec += 1
+                _pn_fft, _poct_lengths = _compute_n_fft(_pfreqs, _plan_oct_sr, _pfs,
+                                                          _plan_oct_hop, _palpha)
+        _oct_plan.append((_pn_fft, _poct_lengths, _extra_dec))
+        _psig_len = max(_plan_oct_n, _pn_fft)
+        _plan_frames.append(max(1, 1 + _psig_len // _plan_oct_hop))
+        if _plan_hop % 2 == 0:
+            _plan_hop //= 2
+            _plan_sr /= 2.0
+            _plan_scale *= 2
+            _plan_n = (_plan_n + 1) // 2    # ceil(n/2) — matches torchaudio
 
-            freqs_oct = freqs[sl]
-            alpha_oct = alpha[sl]
-            filter_scale_oct = fs_per_oct[i]
-            plan_orig_hops.append(int(plan_hop * plan_scale))
+    common_hop, strides = _common_hop_and_strides(_plan_orig_hops)
+    common_cols = min(
+        (_nf - 1) * _st + 1
+        for _nf, _st in zip(_plan_frames, strides)
+    )
 
-            n_fft, _ = _compute_n_fft(
-                freqs_oct, plan_sr, filter_scale_oct, plan_hop, alpha_oct)
-
-            plan_oct_y = plan_y
-            plan_oct_sr = plan_sr
-            plan_oct_hop = plan_hop
-            if n_fft_max > 0:
-                fmax_oct = freqs_oct[-1].item()
-                while n_fft > n_fft_max:
-                    if plan_oct_sr / 4.0 < fmax_oct:
-                        break
-                    if plan_oct_hop % 2 != 0:
-                        break
-                    plan_oct_sr /= 2.0
-                    plan_oct_hop //= 2
-                    plan_oct_y = _resample(
-                        plan_oct_y, orig_sr=2, target_sr=1, scale=True,
-                        resample_kw=resample_kw)
-                    n_fft, _ = _compute_n_fft(
-                        freqs_oct, plan_oct_sr, filter_scale_oct,
-                        plan_oct_hop, alpha_oct)
-
-            plan_sig_len = int(max(plan_oct_y.shape[-1], n_fft))
-            plan_frames.append(max(1, 1 + plan_sig_len // plan_oct_hop))
-
-            if plan_hop % 2 == 0:
-                plan_hop //= 2
-                plan_sr /= 2.0
-                plan_scale *= 2
-                plan_y = _resample(
-                    plan_y, orig_sr=2, target_sr=1, scale=True,
-                    resample_kw=resample_kw)
-
-        common_hop, strides = _common_hop_and_strides(plan_orig_hops)
-        common_cols = min(
-            (n_f - 1) * stride + 1
-            for n_f, stride in zip(plan_frames, strides)
-        )
-        V_host = torch.empty(
-            (*y_t.shape[:-1], n_bins, common_cols),
-            dtype=_to_complex(dtype),
-            device=torch.device("cpu"),
-        )
+    # Build per-tile shard sink from the shards dict.
+    # The sink is called with (f_global_start, f_global_end, t_out_start, t_out_end, tile_np)
+    # where tile_np is complex numpy.  It writes real+imag directly to the
+    # pre-allocated memmap shards — no tensor is retained beyond the tile.
+    if shards is not None:
+        _shard_sink = shards["_sink"]
+    else:
+        _shard_sink = None
 
     # ── Iterate down the octaves ──
-    my_y, my_sr, my_hop = y_t, float(sr), hop_length
-    my_scale = 1
-    orig_hops: list[int] = []
+    if _y_is_mmap:
+        _mmap_1d = np.asarray(y).reshape(-1)
+        _mmap_sr = float(sr)
+        _mmap_hop = hop_length
+        _mmap_scale = 1
+        # _cur_mmap is the signal at the current (progressively decimated) rate.
+        # _cur_mmap_owned: True when we allocated it and must delete it at cleanup.
+        _cur_mmap = _mmap_1d
+        _cur_mmap_owned = False
+        _cur_mmap_path: str | None = None
+        _all_temp_paths: list[str] = []
+        _all_temp_mmaps: list[np.ndarray] = []
+        # Track the offset (in SAMPLES at the current decimation level) where
+        # the true analysis signal starts inside the padded mmap.  This is
+        # halved by ceil-division each time the mmap is decimated 2×.
+        _cur_offset: int = signal_offset
+        try:
+            for i in range(n_octaves):
+                sl = oct_slices[i]
+                if hop_func is not None:
+                    _mmap_hop = hop_func(i, _mmap_hop)
 
-    for i in range(n_octaves):
-        sl = oct_slices[i]
+                freqs_oct = freqs[sl]
+                filter_scale_oct = fs_per_oct[i]
+                n_fft, oct_lengths, n_extra = _oct_plan[i]
 
-        # Per-octave hop override
-        if hop_func is not None:
-            my_hop = hop_func(i, my_hop)
+                # ── Auto-resample gate: apply n_extra additional 2× decimations ──
+                oct_mmap = _cur_mmap
+                oct_sr = _mmap_sr
+                oct_hop = _mmap_hop
+                oct_offset = _cur_offset  # offset into oct_mmap at this level
+                oct_extra_paths: list[str] = []
+                oct_extra_mmaps: list[np.ndarray] = []
+                for _ in range(n_extra):
+                    _tp = _make_temp_npy()
+                    _all_temp_paths.append(_tp)
+                    _dm = _decimate_mmap_2x(oct_mmap, _tp, device, resample_kw)
+                    _all_temp_mmaps.append(_dm)
+                    oct_extra_paths.append(_tp)
+                    oct_extra_mmaps.append(_dm)
+                    oct_mmap = _dm
+                    oct_sr /= 2.0
+                    oct_hop //= 2
+                    oct_offset = (oct_offset + 1) // 2  # ceil — matches torchaudio decimation
 
-        freqs_oct = freqs[sl]
-        alpha_oct = alpha[sl]
-        filter_scale_oct = fs_per_oct[i]
-        orig_hops.append(int(my_hop * my_scale))
+                if progress is not None:
+                    with progress._lock:
+                        progress.octave = i
+                        progress.octave_n_filters = len(freqs_oct)
+                        progress.octave_n_fft = n_fft
+                        progress.octave_freq_lo = freqs_oct[0].item()
+                        progress.octave_freq_hi = freqs_oct[-1].item()
+                        progress.filters_done = 0
+                        progress.filter_batches_done = 0
+                        progress.frame_batches_done = 0
+                        progress.octave_start_time = time.monotonic()
+                    if on_progress is not None:
+                        on_progress(progress)
 
-        n_fft, oct_lengths = _compute_n_fft(
-            freqs_oct, my_sr, filter_scale_oct, my_hop, alpha_oct)
+                oct_n = len(oct_mmap)
+                if oct_n < n_fft:
+                    warnings.warn(
+                        f"Octave {i} mmap length {oct_n} < n_fft={n_fft}; "
+                        f"freq [{freqs_oct[0].item():.1f}, {freqs_oct[-1].item():.1f}] Hz "
+                        f"will be zero-padded.",
+                        stacklevel=2,
+                    )
 
-        # ── Auto-resample gate ──
-        oct_y = my_y
-        oct_sr = my_sr
-        oct_hop = my_hop
-        if n_fft_max > 0:
-            fmax_oct = freqs_oct[-1].item()
-            while n_fft > n_fft_max:
-                if oct_sr / 4.0 < fmax_oct:
-                    break
-                if oct_hop % 2 != 0:
-                    break
+                _cqt_response_streaming(
+                    None, n_fft, oct_hop, freqs_oct, oct_lengths,
+                    oct_sr, float(sr), window, filter_scale_oct, pad_mode, device,
+                    dtype, batch_size,
+                    shard_sink=_shard_sink,
+                    sink_filter_offset=sl.start,
+                    sink_stride=strides[i],
+                    sink_common_cols=common_cols,
+                    apply_scale=scale,
+                    progress=progress,
+                    on_progress=on_progress,
+                    signal_mmap=oct_mmap,
+                    signal_offset=oct_offset,
+                )
+
+                # Decimate for next octave (equivalent to my_y = _resample(my_y, 2→1))
+                if _mmap_hop % 2 == 0:
+                    _mmap_hop //= 2
+                    _mmap_sr /= 2.0
+                    _mmap_scale *= 2
+                    _cur_offset = (_cur_offset + 1) // 2  # ceil — matches torchaudio
+                    if i < n_octaves - 1:
+                        _tp = _make_temp_npy()
+                        _all_temp_paths.append(_tp)
+                        _dm = _decimate_mmap_2x(_cur_mmap, _tp, device, resample_kw)
+                        _all_temp_mmaps.append(_dm)
+                        # Replace current mmap (we keep the old path in _all_temp_paths
+                        # for final cleanup — don't delete early, Windows locks files).
+                        _cur_mmap = _dm
+                        _cur_mmap_owned = True
+                        _cur_mmap_path = _tp
+                else:
+                    if i < n_octaves - 1:
+                        warnings.warn(
+                            f"hop_length becomes odd ({_mmap_hop}) at octave {i}; "
+                            f"remaining {n_octaves - 1 - i} lower octave(s) will NOT "
+                            f"be decimated. Use hop_length divisible by "
+                            f"2**{n_octaves-1}={2**(n_octaves-1)} for full decimation.",
+                            stacklevel=2,
+                        )
+        finally:
+            # Release all mmap references so Windows can delete the files.
+            _cur_mmap = None
+            for _mm in _all_temp_mmaps:
+                del _mm
+            _all_temp_mmaps.clear()
+            import gc as _gc
+            _gc.collect()
+            for _tp in _all_temp_paths:
+                try:
+                    os.unlink(_tp)
+                except Exception:
+                    pass
+
+    else:
+        # ── Tensor path (existing behaviour) ──
+        my_y, my_sr, my_hop = y_t, float(sr), hop_length
+        my_scale = 1
+
+        for i in range(n_octaves):
+            sl = oct_slices[i]
+
+            # Per-octave hop override
+            if hop_func is not None:
+                my_hop = hop_func(i, my_hop)
+
+            freqs_oct = freqs[sl]
+            filter_scale_oct = fs_per_oct[i]
+
+            # Use n_fft / lengths cached from the analytical pre-pass.
+            n_fft, oct_lengths, n_extra = _oct_plan[i]
+
+            # ── Auto-resample gate (apply pre-computed count — no while loop) ──
+            oct_y = my_y
+            oct_sr = my_sr
+            oct_hop = my_hop
+            for _ in range(n_extra):
                 oct_sr /= 2.0
                 oct_hop //= 2
                 oct_y = _resample(oct_y, orig_sr=2, target_sr=1,
                                   scale=True, resample_kw=resample_kw)
-                n_fft, oct_lengths = _compute_n_fft(
-                    freqs_oct, oct_sr, filter_scale_oct, oct_hop, alpha_oct)
 
-        if progress is not None:
-            with progress._lock:
-                progress.octave = i
-                progress.octave_n_filters = len(freqs_oct)
-                progress.octave_n_fft = n_fft
-                progress.octave_freq_lo = freqs_oct[0].item()
-                progress.octave_freq_hi = freqs_oct[-1].item()
-                progress.filters_done = 0
-                progress.filter_batches_done = 0
-                progress.frame_batches_done = 0
-                progress.octave_start_time = time.monotonic()
-            if on_progress is not None:
-                on_progress(progress)
+            if progress is not None:
+                with progress._lock:
+                    progress.octave = i
+                    progress.octave_n_filters = len(freqs_oct)
+                    progress.octave_n_fft = n_fft
+                    progress.octave_freq_lo = freqs_oct[0].item()
+                    progress.octave_freq_hi = freqs_oct[-1].item()
+                    progress.filters_done = 0
+                    progress.filter_batches_done = 0
+                    progress.frame_batches_done = 0
+                    progress.octave_start_time = time.monotonic()
+                if on_progress is not None:
+                    on_progress(progress)
 
-        # Pad signal if shorter than n_fft
-        if oct_y.shape[-1] < n_fft:
-            pad_ratio = n_fft / oct_y.shape[-1]
-            warnings.warn(
-                f"Octave loop i={i} (sr_eff={oct_sr:.0f}): signal "
-                f"length {oct_y.shape[-1]} < n_fft={n_fft} "
-                f"({pad_ratio:.1f}× zero-pad). "
-                f"Freq range [{freqs_oct[0].item():.1f}, "
-                f"{freqs_oct[-1].item():.1f}] Hz will be degraded.",
-                stacklevel=2,
-            )
-            my_y_padded = _pad(oct_y, 0, n_fft - oct_y.shape[-1],
-                               mode="constant")
-        else:
-            my_y_padded = oct_y
+            # Pad signal if shorter than n_fft
+            if oct_y.shape[-1] < n_fft:
+                pad_ratio = n_fft / oct_y.shape[-1]
+                warnings.warn(
+                    f"Octave loop i={i} (sr_eff={oct_sr:.0f}): signal "
+                    f"length {oct_y.shape[-1]} < n_fft={n_fft} "
+                    f"({pad_ratio:.1f}× zero-pad). "
+                    f"Freq range [{freqs_oct[0].item():.1f}, "
+                    f"{freqs_oct[-1].item():.1f}] Hz will be degraded.",
+                    stacklevel=2,
+                )
+                my_y_padded = _pad(oct_y, 0, n_fft - oct_y.shape[-1],
+                                   mode="constant")
+            else:
+                my_y_padded = oct_y
 
-        if direct_host_write:
             _cqt_response_streaming(
                 my_y_padded, n_fft, oct_hop, freqs_oct, oct_lengths,
                 oct_sr, float(sr), window, filter_scale_oct, pad_mode, device,
                 dtype, batch_size,
-                out=V_host,
-                out_filter_offset=sl.start,
-                out_stride=strides[i],
-                out_common_cols=common_cols,
+                shard_sink=_shard_sink,
+                sink_filter_offset=sl.start,
+                sink_stride=strides[i],
+                sink_common_cols=common_cols,
                 apply_scale=scale,
                 progress=progress,
                 on_progress=on_progress,
             )
-        else:
-            vqt_resp.append(
-                _cqt_response_streaming(
-                    my_y_padded, n_fft, oct_hop, freqs_oct, oct_lengths,
-                    oct_sr, float(sr), window, filter_scale_oct, pad_mode,
-                    device, dtype, batch_size, progress=progress,
-                    on_progress=on_progress))
 
-        # librosa: downsample for next octave
-        if my_hop % 2 == 0:
-            my_hop //= 2
-            my_sr /= 2.0
-            my_scale *= 2
-            my_y = _resample(my_y, orig_sr=2, target_sr=1, scale=True,
-                             resample_kw=resample_kw)
-        else:
-            if i < n_octaves - 1:
-                warnings.warn(
-                    f"hop_length becomes odd ({my_hop}) at octave loop "
-                    f"i={i}; remaining {n_octaves - 1 - i} lower octave(s) "
-                    f"will NOT be decimated (no 2× downsampling). "
-                    f"Use a hop_length divisible by 2**{n_octaves-1} "
-                    f"(={2**(n_octaves-1)}) for full decimation.",
-                    stacklevel=2,
-                )
+            # librosa: downsample for next octave
+            if my_hop % 2 == 0:
+                my_hop //= 2
+                my_sr /= 2.0
+                my_scale *= 2
+                my_y = _resample(my_y, orig_sr=2, target_sr=1, scale=True,
+                                 resample_kw=resample_kw)
+            else:
+                if i < n_octaves - 1:
+                    warnings.warn(
+                        f"hop_length becomes odd ({my_hop}) at octave loop "
+                        f"i={i}; remaining {n_octaves - 1 - i} lower octave(s) "
+                        f"will NOT be decimated (no 2× downsampling). "
+                        f"Use a hop_length divisible by 2**{n_octaves-1} "
+                        f"(={2**(n_octaves-1)}) for full decimation.",
+                        stacklevel=2,
+                    )
 
-    if direct_host_write:
-        V = V_host
-        try:
-            V = V_host.to(device)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            warnings.warn(
-                "CUDA OOM moving final CQT result back to GPU; returning "
-                "the host-resident output instead.",
-                stacklevel=2,
-            )
-            V = V_host
-            freqs = freqs.cpu()
-        return V, freqs
+    freqs_np = freqs.cpu().numpy()
+    return freqs_np, common_cols
 
-    common_hop, strides = _common_hop_and_strides(orig_hops)
-    if any(stride > 1 for stride in strides):
-        common_cols = min(
-            (resp.shape[-1] - 1) * stride + 1
-            for resp, stride in zip(vqt_resp, strides))
-        vqt_resp = [
-            _expand_octave_time_grid(resp, stride, common_cols)
-            for resp, stride in zip(vqt_resp, strides)
-        ]
-
-    V = _trim_stack(vqt_resp, n_bins)
-
-    if scale:
-        V = V / lengths.unsqueeze(-1).sqrt()
-
-    return V, freqs
 
 
 # ══════════════════════════════════════════════════════════════════════════

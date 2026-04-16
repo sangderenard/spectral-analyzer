@@ -75,6 +75,87 @@ def _dominant_freq(sig: np.ndarray, sr: int) -> float:
     return float(freqs[idx])
 
 
+def _band_peak(sig: np.ndarray, sr: int, lo: float, hi: float) -> float:
+    sig = np.asarray(sig, dtype=np.float64)
+    spec = np.abs(np.fft.rfft(sig * np.hanning(len(sig))))
+    freqs = np.fft.rfftfreq(len(sig), 1.0 / sr)
+    mask = (freqs >= lo) & (freqs <= hi)
+    if not np.any(mask):
+        return 0.0
+    return float(spec[mask].max())
+
+
+def test_settings_hash_separates_fft_algorithms():
+    from bass_analysis import AnalysisConfig, settings_token
+
+    cfg_a = AnalysisConfig(fft_algorithm="librosa")
+    cfg_b = AnalysisConfig(fft_algorithm="stft")
+
+    assert settings_token(cfg_a) != settings_token(cfg_b)
+
+
+def test_analysis_inventory_accumulates_engine_runs(tmp_path):
+    from bass_viewer import _load_analysis_inventory, _record_analysis_inventory_run
+
+    outdir = str(tmp_path)
+    _record_analysis_inventory_run(
+        outdir,
+        engine="fft",
+        run_key="hash_a",
+        info={"engine": "fft", "algorithm": "librosa", "npz": "cqt_data_hash_a.npz"},
+    )
+    _record_analysis_inventory_run(
+        outdir,
+        engine="fft",
+        run_key="hash_b",
+        info={"engine": "fft", "algorithm": "stft", "npz": "cqt_data_hash_b.npz"},
+    )
+    _record_analysis_inventory_run(
+        outdir,
+        engine="wavelet",
+        run_key="cwt_a",
+        info={"engine": "wavelet", "algorithm": "cwt", "data": "wavelet/wavelet_data.npz"},
+    )
+
+    inv = _load_analysis_inventory(outdir)
+    fft_runs = [row for row in inv["datasets"] if row["engine"] == "fft"]
+    assert len(fft_runs) == 2
+    assert {run["algorithm"] for run in fft_runs} == {"librosa", "stft"}
+    assert any(row["engine"] == "wavelet" and row["algorithm"] == "cwt"
+               for row in inv["datasets"])
+
+
+def test_bass_analysis_writes_modern_fft_inventory(tmp_path):
+    import json
+    from analysis_itinerary import AnalysisInventory
+    from bass_analysis import AnalysisConfig, _write_analysis_inventory
+
+    analysis_dir = tmp_path / "demo_analysis"
+    analysis_dir.mkdir()
+
+    cfg = AnalysisConfig(fft_algorithm="stft", stft_n_fft=4096, hop_length=512)
+    _write_analysis_inventory(
+        str(analysis_dir),
+        "abc12345",
+        cfg,
+        wav_path="demo.wav",
+        total_duration_s=12.0,
+        start_time_s=2.0,
+        end_time_s=8.0,
+    )
+
+    raw = json.loads((analysis_dir / "analysis_inventory.json").read_text(encoding="utf-8"))
+    inv = AnalysisInventory.from_dict(raw)
+    fft_rows = [ds for ds in inv.datasets if ds.engine == "fft"]
+
+    assert len(fft_rows) == 1
+    assert fft_rows[0].dataset_key == "fft:abc12345"
+    assert fft_rows[0].algorithm == "stft"
+    assert fft_rows[0].settings["stft_n_fft"] == 4096
+    assert fft_rows[0].time_range.start_sec == 2.0
+    assert fft_rows[0].time_range.end_sec == 8.0
+
+
 # =====================================================================
 #  CQT round-trip  (ViewportSynthPlayer)
 # =====================================================================
@@ -590,6 +671,149 @@ class TestWaveletRoundTrip:
         peak = _dominant_freq(scaled, sr)
         ratio = peak / freq
         assert 1.7 < ratio < 2.3, f"expected ~2x pitch, got ratio {ratio:.3f}"
+
+    @pytest.mark.usefixtures("_import_synth")
+    def test_cwt_wavelet_uses_working_hop_metadata(self):
+        n_frames = 900
+        W = np.zeros((8, n_frames), dtype=np.complex128)
+        freqs = np.geomspace(10.0, 1.0, 8).astype(np.float64)
+        n_samples = 28800
+        out = self.reconstruct_wavelet(
+            sr=480,
+            t0=0.0,
+            t1=n_samples / 480.0,
+            wv_meta={
+                "type": "cwt",
+                "wavelet": "morlet",
+                "hop_length": 1,
+                "working_hop_length": 32,
+                "n_samples": n_samples,
+            },
+            W_complex=W,
+            wv_freqs=freqs,
+        )
+
+        assert len(out) == n_frames * 32
+
+    @pytest.mark.usefixtures("_import_synth")
+    def test_cwt_wavelet_respects_visible_scale_band(self):
+        from bass_viewer import ViewportBoundaryConfig
+
+        n_frames = 96
+        W = np.zeros((4, n_frames), dtype=np.complex128)
+        W[0, :] = 10.0 + 0.0j   # highest-frequency source row
+        W[-1, :] = 1.0 + 0.0j   # lowest-frequency source row
+        freqs = np.geomspace(8.0, 1.0, 4).astype(np.float64)
+        cfg = ViewportBoundaryConfig()
+
+        low_band = self.reconstruct_wavelet(
+            sr=96,
+            t0=0.0,
+            t1=1.0,
+            wv_meta={
+                "type": "cwt",
+                "wavelet": "morlet",
+                "hop_length": 1,
+                "n_samples": n_frames,
+            },
+            W_complex=W,
+            wv_freqs=freqs,
+            view_x0=0.0,
+            view_x1=float(n_frames),
+            view_y0=0.0,
+            view_y1=1.0,
+            viewport_boundary=cfg,
+        )
+        high_band = self.reconstruct_wavelet(
+            sr=96,
+            t0=0.0,
+            t1=1.0,
+            wv_meta={
+                "type": "cwt",
+                "wavelet": "morlet",
+                "hop_length": 1,
+                "n_samples": n_frames,
+            },
+            W_complex=W,
+            wv_freqs=freqs,
+            view_x0=0.0,
+            view_x1=float(n_frames),
+            view_y0=3.0,
+            view_y1=4.0,
+            viewport_boundary=cfg,
+        )
+
+        lo_level = float(np.mean(np.abs(low_band)))
+        hi_level = float(np.mean(np.abs(high_band)))
+        assert lo_level > 0.0
+        assert hi_level > lo_level * 2.0
+
+
+class TestFilterbankScalerHelpers:
+
+    def test_heterodyne_shift_moves_band_up_by_scale(self):
+        from bass_viewer import _heterodyne_shift_signal
+
+        sr = 2000
+        sig = _tone(sr, 1.0, 20.0, gain=0.8)
+        shifted = _heterodyne_shift_signal(
+            sig, sr, freq_lo=18.0, freq_hi=22.0, scale=8.0)
+        peak = _dominant_freq(shifted, sr)
+        assert 145.0 < peak < 175.0
+
+    def test_soft_fft_bandpass_prefers_requested_viewport_band(self):
+        from bass_viewer import ViewportBoundaryConfig, _soft_fft_bandpass
+
+        sr = 2000
+        sig = _multitone(sr, 1.0, [10.0, 180.0], gain=0.7)
+        out, lo_eff, hi_eff = _soft_fft_bandpass(
+            sig, sr,
+            base_lo=5.0,
+            base_hi=20.0,
+            cfg=ViewportBoundaryConfig(),
+            filter_type="Linkwitz-Riley 4",
+        )
+
+        assert 4.0 <= lo_eff <= 6.0
+        assert 19.0 <= hi_eff <= 21.0
+        lo_peak = _band_peak(out, sr, 8.0, 12.0)
+        hi_peak = _band_peak(out, sr, 170.0, 190.0)
+        assert lo_peak > hi_peak * 8.0
+
+
+class TestFFTScalerHelpers:
+
+    def test_fft_scaler_stft_params_follow_low_frequency(self):
+        from bass_viewer import _fft_scaler_stft_params
+
+        n_fft_lo, hop_lo = _fft_scaler_stft_params(
+            sr=48000, freq_lo=20.0, hop_hint=512,
+            bins_per_octave=24, filter_scale=1.0, signal_len=48000,
+        )
+        n_fft_hi, hop_hi = _fft_scaler_stft_params(
+            sr=48000, freq_lo=200.0, hop_hint=512,
+            bins_per_octave=24, filter_scale=1.0, signal_len=48000,
+        )
+
+        assert n_fft_lo > n_fft_hi
+        assert hop_lo >= hop_hi
+        assert n_fft_lo & (n_fft_lo - 1) == 0
+        assert n_fft_hi & (n_fft_hi - 1) == 0
+
+    def test_phase_vocoder_stft_changes_time_and_pitch_independently(self):
+        from bass_viewer import _phase_vocoder_stft
+
+        sr = 4000
+        sig = _tone(sr, 1.0, 110.0, gain=0.8)
+        out = _phase_vocoder_stft(
+            sig, sr,
+            n_fft=1024, hop=256, window="hann",
+            time_scale=2.0, pitch_scale=4.0,
+        )
+
+        assert abs(len(out) - int(round(len(sig) / 2.0))) <= 80
+        peak = _dominant_freq(out, sr)
+        assert 380.0 < peak < 500.0
 
 
 # =====================================================================

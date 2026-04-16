@@ -65,6 +65,18 @@ from OpenGL.GL import *
 from OpenGL.GL import shaders as gl_shaders
 from PIL import Image, ImageDraw, ImageFont
 
+from analysis_itinerary import (
+    AnalysisArtifact,
+    AnalysisDatasetRecord,
+    AnalysisGlobalSettings,
+    AnalysisInventory,
+    AnalysisItinerary,
+    AnalysisRun,
+    AnalysisTimeRange,
+    FFTAnalysisSettings,
+    FilterbankAnalysisSettings,
+    WaveletAnalysisSettings,
+)
 from plot_widget import PlotWidget, PlotSeries, PlotMarker, HeatmapBar
 
 # Preferred audio backend: soundfile (libsndfile) handles WAV, FLAC, OGG, AIFF, etc.
@@ -82,6 +94,110 @@ _AUDIO_EXTS = frozenset((
     ".mp3", ".w64", ".rf64", ".mat", ".pvf", ".htk", ".sds",
     ".raw", ".voc", ".sd2", ".xi", ".wve", ".mpc",
 ))
+
+_ANALYSIS_INVENTORY_FILE = "analysis_inventory.json"
+
+
+def _load_analysis_inventory(analysis_dir: str) -> dict[str, Any]:
+    path = os.path.join(analysis_dir, _ANALYSIS_INVENTORY_FILE)
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return AnalysisInventory.from_dict(data).to_dict()
+        except Exception:
+            pass
+    return AnalysisInventory().to_dict()
+
+
+def _save_analysis_inventory(analysis_dir: str, data: dict[str, Any]) -> None:
+    path = os.path.join(analysis_dir, _ANALYSIS_INVENTORY_FILE)
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(AnalysisInventory.from_dict(data).to_dict(), f, indent=2, sort_keys=True)
+    os.replace(tmp_path, path)
+
+
+def _record_analysis_inventory_run(
+    analysis_dir: str,
+    *,
+    engine: str,
+    run_key: str,
+    info: dict[str, Any],
+) -> None:
+    inv = AnalysisInventory.from_dict(_load_analysis_inventory(analysis_dir))
+    normalized = dict(info)
+    settings_hash = str(normalized.get("settings_hash", "")) or str(run_key)
+    dataset_key = str(normalized.get("dataset_key", "")) or f"{engine}:{run_key}"
+    range_info = normalized.get("time_range", {})
+    if not range_info and isinstance(normalized.get("settings", {}), dict):
+        st = dict(normalized.get("settings", {}))
+        if any(k in st for k in ("region_start", "region_end", "region_total")):
+            range_info = {
+                "start_sec": st.get("region_start", 0.0),
+                "end_sec": st.get("region_end", 0.0),
+                "total_sec": st.get("region_total", 0.0),
+            }
+    artifacts: list[AnalysisArtifact] = []
+    artifact_fields = {
+        "npz": "npz",
+        "legacy_npz": "npz_legacy",
+        "meta": "meta",
+        "data": "data",
+        "manifest": "manifest",
+        "envelopes": "envelopes",
+        "versions_manifest": "versions_manifest",
+    }
+    for src_key, art_kind in artifact_fields.items():
+        val = normalized.get(src_key)
+        if val:
+            artifacts.append(AnalysisArtifact(
+                kind=art_kind,
+                path=str(val),
+                settings_hash=settings_hash,
+                folder=analysis_dir,
+            ))
+    dataset = AnalysisDatasetRecord(
+        dataset_key=dataset_key,
+        engine=str(engine),
+        algorithm=str(normalized.get("algorithm", "")),
+        run_key=str(run_key),
+        settings_hash=settings_hash,
+        folder=analysis_dir,
+        status=str(normalized.get("status", "materialized")),
+        label=str(normalized.get("label", "")),
+        time_range=AnalysisTimeRange.from_dict(dict(range_info)).clamped(),
+        settings=dict(normalized.get("settings", {})),
+        artifacts=artifacts,
+        metadata={
+            k: v for k, v in normalized.items()
+            if k not in {
+                "dataset_key", "algorithm", "settings_hash", "status", "label",
+                "settings", "npz", "legacy_npz", "meta", "data", "manifest",
+                "envelopes", "versions_manifest",
+            }
+        },
+    )
+    inv.upsert_dataset(dataset)
+    _save_analysis_inventory(analysis_dir, inv.to_dict())
+
+
+def _inventory_dataset_timeline_segments(
+    datasets: list[AnalysisDatasetRecord],
+) -> list[tuple[float, float, tuple[int, int, int], int]]:
+    out: list[tuple[float, float, tuple[int, int, int], int]] = []
+    color_map: dict[str, tuple[int, int, int]] = {
+        "fft": (110, 150, 210),
+        "filterbank": (140, 185, 120),
+        "wavelet": (198, 148, 98),
+    }
+    for dataset in datasets:
+        lo, hi = dataset.time_range.as_fraction_span()
+        rgb = color_map.get(dataset.engine, (170, 170, 170))
+        alpha = 96 if len(datasets) > 1 else 168
+        out.append((lo, hi, rgb, alpha))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +809,7 @@ FRAG_SRC = PASS1_FRAG_SRC
 # ---------------------------------------------------------------------------
 
 class AudioPlayer:
-    def __init__(self, path: str) -> None:
+    def __init__(self, path: str, time_offset: float = 0.0) -> None:
         self.path = path
         sr, data = _load_audio(path)
         if np.issubdtype(data.dtype, np.floating):
@@ -706,10 +822,11 @@ class AudioPlayer:
             data = np.column_stack([data, data])
         self.sr = sr
         self.data = data
-        self.duration = len(data) / sr
-        self.position = 0.0
+        self.time_offset = time_offset
+        self.duration = time_offset + len(data) / sr
+        self.position = time_offset
         self.playing = False
-        self._play_offset: float = 0.0
+        self._play_offset: float = time_offset
         self._music_buf: io.BytesIO | None = None
 
     @staticmethod
@@ -734,9 +851,9 @@ class AudioPlayer:
 
     def play(self, start_s: float | None = None) -> None:
         if start_s is not None:
-            self.position = max(0.0, min(start_s, self.duration))
+            self.position = max(self.time_offset, min(start_s, self.duration))
         self.stop()
-        start_sample = int(self.position * self.sr)
+        start_sample = int((self.position - self.time_offset) * self.sr)
         if start_sample >= len(self.data):
             return
         self._play_offset = self.position
@@ -772,7 +889,7 @@ class AudioPlayer:
         return self.position
 
     def seek(self, t: float) -> None:
-        t = max(0.0, min(t, self.duration))
+        t = max(self.time_offset, min(t, self.duration))
         was_playing = self.playing
         self.stop()
         self.position = t
@@ -837,7 +954,7 @@ class FieldSource:
 
 # Category display order and labels for the data tree
 _FIELD_CATEGORIES = [
-    ("cqt", "CQT"),
+    ("cqt", "FFT"),
     ("fb", "Filterbank"),
     ("wvlt", "Wavelet"),
 ]
@@ -900,7 +1017,7 @@ OVERLAY_AXIS_LABELS = {
 }
 
 OVERLAY_SOURCES = ["cqt", "fb", "wavelet"]
-OVERLAY_SOURCE_LABELS = {"cqt": "CQT", "fb": "Filterbank", "wavelet": "Wavelet"}
+OVERLAY_SOURCE_LABELS = {"cqt": "FFT", "fb": "Filterbank", "wavelet": "Wavelet"}
 
 
 @dataclass
@@ -952,6 +1069,107 @@ class HybridViewConfig:
 
 
 @dataclass
+class ViewportEdgeConfig:
+    clip: bool = True
+    margin: float = 0.0
+    rolloff: float = 0.0
+
+
+@dataclass
+class ViewportBoundaryConfig:
+    x_neg: ViewportEdgeConfig = field(default_factory=ViewportEdgeConfig)
+    x_pos: ViewportEdgeConfig = field(default_factory=ViewportEdgeConfig)
+    y_neg: ViewportEdgeConfig = field(default_factory=ViewportEdgeConfig)
+    y_pos: ViewportEdgeConfig = field(default_factory=ViewportEdgeConfig)
+
+
+class ViewportBoundaryWidget:
+    """Reusable UI helper for defining viewport interpretation on each edge."""
+
+    _EDGE_SPECS = [
+        ("x_neg", "X-", "left / negative time"),
+        ("x_pos", "X+", "right / positive time"),
+        ("y_neg", "Y-", "bottom / negative axis"),
+        ("y_pos", "Y+", "top / positive axis"),
+    ]
+
+    def __init__(self, prefix: str = "vp") -> None:
+        self.prefix = prefix
+
+    def slider_keys(self) -> list[str]:
+        keys: list[str] = []
+        for edge_key, _, _ in self._EDGE_SPECS:
+            keys.append(f"{self.prefix}_{edge_key}_margin")
+            keys.append(f"{self.prefix}_{edge_key}_rolloff")
+        return keys
+
+    def build_rows(self, cfg: ViewportBoundaryConfig,
+                   context: dict[str, str] | None = None) -> list[tuple[str, Any]]:
+        ctx = context or {}
+        rows: list[tuple[str, Any]] = [
+            ("label_col", ("Viewport Meaning", (210, 210, 210))),
+            ("label_col", (ctx.get("x_summary", "X: viewport"), (160, 160, 168))),
+            ("label_col", (ctx.get("y_summary", "Y: viewport"), (160, 160, 168))),
+            ("label_col", ("Margin / rolloff are in viewport spans", (120, 120, 128))),
+        ]
+        for edge_key, short_label, desc in self._EDGE_SPECS:
+            edge = getattr(cfg, edge_key)
+            rows.append(("label_col", (f"{short_label}  {desc}", (190, 190, 196))))
+            rows.append(("toggle", (
+                f"{self.prefix}_{edge_key}_clip",
+                "Clip outside",
+                edge.clip,
+            )))
+            rows.append(("slider", (
+                f"{self.prefix}_{edge_key}_margin",
+                "Margin",
+                edge.margin,
+                -1.0,
+                1.0,
+                "{:+.2f}",
+            )))
+            rows.append(("slider", (
+                f"{self.prefix}_{edge_key}_rolloff",
+                "Rolloff",
+                edge.rolloff,
+                0.0,
+                1.0,
+                "{:.2f}",
+            )))
+        return rows
+
+    def handle_toggle(self, key: str, cfg: ViewportBoundaryConfig) -> bool:
+        suffix = "_clip"
+        if not key.startswith(f"{self.prefix}_") or not key.endswith(suffix):
+            return False
+        edge_key = key[len(self.prefix) + 1:-len(suffix)]
+        if not hasattr(cfg, edge_key):
+            return False
+        edge = getattr(cfg, edge_key)
+        edge.clip = not edge.clip
+        return True
+
+    def apply_slider_value(self, key: str, val: float,
+                           cfg: ViewportBoundaryConfig) -> bool:
+        if not key.startswith(f"{self.prefix}_"):
+            return False
+        payload = key[len(self.prefix) + 1:]
+        for attr in ("margin", "rolloff"):
+            suffix = f"_{attr}"
+            if payload.endswith(suffix):
+                edge_key = payload[:-len(suffix)]
+                if not hasattr(cfg, edge_key):
+                    return False
+                edge = getattr(cfg, edge_key)
+                if attr == "margin":
+                    edge.margin = max(-1.0, min(1.0, round(float(val), 2)))
+                else:
+                    edge.rolloff = max(0.0, min(1.0, round(float(val), 2)))
+                return True
+        return False
+
+
+@dataclass
 class WaveletViewConfig:
     """Settings for the time-scale (TSC) wavelet display panel.
 
@@ -967,10 +1185,54 @@ class WaveletViewConfig:
     """
     time_scale_log2: float = 0.0   # log₂ of playback time-scale factor
     normalize: bool = True          # normalize output loudness
+    viewport_boundary: ViewportBoundaryConfig = field(
+        default_factory=ViewportBoundaryConfig)
 
     @property
     def time_scale(self) -> float:
         return 2.0 ** self.time_scale_log2
+
+
+FILTERBANK_SCALER_METHODS = ["heterodyne"]
+FILTERBANK_SCALER_METHOD_LABELS = {"heterodyne": "Heterodyne"}
+FFT_SCALER_METHODS = ["stft"]
+FFT_SCALER_METHOD_LABELS = {"stft": "STFT"}
+
+
+@dataclass
+class FilterbankScalerConfig:
+    """Settings for direct filterbank-band playback/scaling."""
+
+    method: str = "heterodyne"
+    scale_log2: float = 0.0
+    normalize: bool = True
+    use_only_existing_bands: bool = True
+    viewport_boundary: ViewportBoundaryConfig = field(
+        default_factory=ViewportBoundaryConfig)
+
+    @property
+    def scale(self) -> float:
+        return 2.0 ** self.scale_log2
+
+
+@dataclass
+class FFTScalerConfig:
+    """Settings for direct FFT-domain viewport scaling."""
+
+    method: str = "stft"
+    time_scale_log2: float = 0.0
+    pitch_scale_log2: float = 0.0
+    normalize: bool = True
+    viewport_boundary: ViewportBoundaryConfig = field(
+        default_factory=ViewportBoundaryConfig)
+
+    @property
+    def time_scale(self) -> float:
+        return 2.0 ** self.time_scale_log2
+
+    @property
+    def pitch_scale(self) -> float:
+        return 2.0 ** self.pitch_scale_log2
 
 
 def _fraction_window(t0: float, t1: float, total_samples: int, sr: int) -> tuple[float, float]:
@@ -996,6 +1258,430 @@ def _fraction_to_index_range(frac0: float, frac1: float, n: int) -> tuple[int, i
     return i0, min(i1, n)
 
 
+def _effective_cwt_hop_length(n_samples: int, n_frames: int, requested_hop: int) -> int:
+    """Infer the original-sample spacing represented by adjacent CWT frames."""
+    requested = max(1, int(requested_hop))
+    if n_samples <= 0 or n_frames <= 1:
+        return requested
+    inferred = int(round((int(n_samples) - 1) / max(int(n_frames) - 1, 1)))
+    return max(1, inferred)
+
+
+def _viewport_axis_window(
+    n: int,
+    view0: float,
+    view1: float,
+    neg_rule: ViewportEdgeConfig,
+    pos_rule: ViewportEdgeConfig,
+) -> tuple[int, int, np.ndarray]:
+    """Return a source slice and feathered weights for one viewport axis."""
+    if n <= 0:
+        return 0, 0, np.zeros(0, dtype=np.float64)
+    lo_view = max(0.0, min(float(n), min(float(view0), float(view1))))
+    hi_view = max(lo_view, min(float(n), max(float(view0), float(view1))))
+    span = max(hi_view - lo_view, 1.0)
+
+    lo_eff = 0.0 if not neg_rule.clip else (lo_view - float(neg_rule.margin) * span)
+    hi_eff = float(n) if not pos_rule.clip else (hi_view + float(pos_rule.margin) * span)
+    lo_eff = max(0.0, min(float(n), lo_eff))
+    hi_eff = max(lo_eff, min(float(n), hi_eff))
+
+    src0 = max(0, min(n - 1, int(math.floor(lo_eff)))) if hi_eff > lo_eff else 0
+    src1 = max(src0 + 1, min(n, int(math.ceil(hi_eff)))) if hi_eff > lo_eff else 0
+    if src1 <= src0:
+        return 0, 0, np.zeros(0, dtype=np.float64)
+
+    coords = np.arange(src0, src1, dtype=np.float64) + 0.5
+    weights = np.ones(src1 - src0, dtype=np.float64)
+
+    if neg_rule.clip:
+        roll = max(0.0, float(neg_rule.rolloff) * span)
+        if roll <= 1e-12:
+            weights *= (coords >= lo_eff).astype(np.float64)
+        else:
+            ramp_hi = lo_eff + roll
+            left = np.clip((coords - lo_eff) / max(ramp_hi - lo_eff, 1e-12), 0.0, 1.0)
+            left[coords >= ramp_hi] = 1.0
+            weights *= left
+
+    if pos_rule.clip:
+        roll = max(0.0, float(pos_rule.rolloff) * span)
+        if roll <= 1e-12:
+            weights *= (coords <= hi_eff).astype(np.float64)
+        else:
+            ramp_lo = hi_eff - roll
+            right = np.clip((hi_eff - coords) / max(hi_eff - ramp_lo, 1e-12), 0.0, 1.0)
+            right[coords <= ramp_lo] = 1.0
+            weights *= right
+
+    return src0, src1, weights
+
+
+def _fb_band_edges_hz(bands: list[BandDef], nyq: float) -> np.ndarray:
+    """Return contiguous band-edge frequencies for a stored filterbank."""
+    if not bands:
+        return np.asarray([0.0, float(max(nyq, 0.0))], dtype=np.float64)
+    edges = [max(0.0, float(bands[0].fmin))]
+    for band in bands:
+        edges.append(max(edges[-1], min(float(nyq), float(band.fmax))))
+    return np.asarray(edges, dtype=np.float64)
+
+
+def _cqt_bin_edges_hz(freqs: np.ndarray, nyq: float) -> np.ndarray:
+    """Return interpolated edge frequencies for CQT centre frequencies."""
+    centers = np.asarray(freqs, dtype=np.float64)
+    if centers.size == 0:
+        return np.asarray([0.0, float(max(nyq, 0.0))], dtype=np.float64)
+    if centers.size == 1:
+        c = float(max(centers[0], 1e-9))
+        lo = max(0.0, c / math.sqrt(2.0))
+        hi = min(float(nyq), c * math.sqrt(2.0))
+        return np.asarray([lo, hi], dtype=np.float64)
+    mids = np.sqrt(np.maximum(centers[:-1], 1e-12) * np.maximum(centers[1:], 1e-12))
+    first = max(0.0, centers[0] * centers[0] / max(mids[0], 1e-12))
+    last = min(float(nyq), centers[-1] * centers[-1] / max(mids[-1], 1e-12))
+    return np.asarray([first] + mids.tolist() + [last], dtype=np.float64)
+
+
+def _interp_fb_edge_freq(edges: np.ndarray, pos: float) -> float:
+    """Map a fractional filterbank-row coordinate to a frequency edge."""
+    if edges.size <= 1:
+        return 0.0
+    n = edges.size - 1
+    pos = max(0.0, min(float(n), float(pos)))
+    i0 = max(0, min(n - 1, int(math.floor(pos))))
+    i1 = min(n, i0 + 1)
+    frac = max(0.0, min(1.0, pos - i0))
+    return float(edges[i0] + frac * (edges[i1] - edges[i0]))
+
+
+def _viewport_freq_window_from_cqt(
+    freqs: np.ndarray,
+    view_y0: float,
+    view_y1: float,
+    cfg: ViewportBoundaryConfig,
+    nyq: float,
+) -> tuple[float, float, float, float]:
+    """Return base/effective frequency bounds implied by a CQT viewport."""
+    centers = np.asarray(freqs, dtype=np.float64)
+    if centers.size == 0:
+        return 0.0, float(max(nyq, 0.0)), 0.0, float(max(nyq, 0.0))
+    edges = _cqt_bin_edges_hz(centers, nyq)
+    base_lo = _interp_fb_edge_freq(edges, min(float(view_y0), float(view_y1)))
+    base_hi = _interp_fb_edge_freq(edges, max(float(view_y0), float(view_y1)))
+    if base_hi < base_lo:
+        base_lo, base_hi = base_hi, base_lo
+    span = max(base_hi - base_lo, 1e-6)
+    lo_eff = 0.0 if not cfg.y_neg.clip else (base_lo - float(cfg.y_neg.margin) * span)
+    hi_eff = float(nyq) if not cfg.y_pos.clip else (base_hi + float(cfg.y_pos.margin) * span)
+    lo_eff = max(0.0, min(float(nyq), lo_eff))
+    hi_eff = max(lo_eff, min(float(nyq), hi_eff))
+    return float(base_lo), float(base_hi), float(lo_eff), float(hi_eff)
+
+
+def _viewport_freq_window_from_bands(
+    bands: list[BandDef],
+    view_y0: float,
+    view_y1: float,
+    cfg: ViewportBoundaryConfig,
+    nyq: float,
+) -> tuple[float, float, float, float]:
+    """Return base/effective frequency bounds implied by the viewport."""
+    if not bands:
+        return 0.0, float(max(nyq, 0.0)), 0.0, float(max(nyq, 0.0))
+    edges = _fb_band_edges_hz(bands, nyq)
+    base_lo = _interp_fb_edge_freq(edges, min(float(view_y0), float(view_y1)))
+    base_hi = _interp_fb_edge_freq(edges, max(float(view_y0), float(view_y1)))
+    if base_hi < base_lo:
+        base_lo, base_hi = base_hi, base_lo
+    span = max(base_hi - base_lo, 1e-6)
+    lo_eff = 0.0 if not cfg.y_neg.clip else (base_lo - float(cfg.y_neg.margin) * span)
+    hi_eff = float(nyq) if not cfg.y_pos.clip else (base_hi + float(cfg.y_pos.margin) * span)
+    lo_eff = max(0.0, min(float(nyq), lo_eff))
+    hi_eff = max(lo_eff, min(float(nyq), hi_eff))
+    return float(base_lo), float(base_hi), float(lo_eff), float(hi_eff)
+
+
+def _heterodyne_shift_signal(
+    signal: np.ndarray,
+    sr: int,
+    *,
+    freq_lo: float,
+    freq_hi: float,
+    scale: float,
+) -> np.ndarray:
+    """Shift a band by moving its geometric centre via analytic heterodyning.
+
+    Delegates to :func:`signal_tools.heterodyne_shift`.
+    """
+    from signal_tools import heterodyne_shift
+    return heterodyne_shift(signal, sr, freq_lo=freq_lo, freq_hi=freq_hi, scale=scale)
+
+
+def _soft_fft_bandpass(
+    signal: np.ndarray,
+    sr: int,
+    *,
+    base_lo: float,
+    base_hi: float,
+    cfg: ViewportBoundaryConfig,
+    filter_type: str,
+) -> tuple[np.ndarray, float, float]:
+    """Extract a derived soft band using viewport edges and project filter slope."""
+    x = np.asarray(signal, dtype=np.float64)
+    if x.size == 0 or sr <= 0:
+        return np.zeros(0, dtype=np.float64), 0.0, 0.0
+    nyq = 0.5 * float(sr)
+    base_lo = max(0.0, min(nyq, float(base_lo)))
+    base_hi = max(base_lo, min(nyq, float(base_hi)))
+    span = max(base_hi - base_lo, max(base_hi, 1.0))
+    lo_eff = 0.0 if not cfg.y_neg.clip else (base_lo - float(cfg.y_neg.margin) * span)
+    hi_eff = nyq if not cfg.y_pos.clip else (base_hi + float(cfg.y_pos.margin) * span)
+    lo_eff = max(0.0, min(nyq, lo_eff))
+    hi_eff = max(lo_eff, min(nyq, hi_eff))
+    if hi_eff <= 0.0 or hi_eff <= lo_eff:
+        return np.zeros_like(x), lo_eff, hi_eff
+
+    exp_n = max(1, int(FilterBankDecomposition(sr, filter_type)._lp_exponent()))
+    lo_roll = max(0.0, float(cfg.y_neg.rolloff) * span)
+    hi_roll = max(0.0, float(cfg.y_pos.rolloff) * span)
+
+    freqs = np.fft.rfftfreq(x.size, d=1.0 / float(sr))
+    X = np.fft.rfft(x)
+    mask = np.ones_like(freqs, dtype=np.float64)
+
+    if cfg.y_neg.clip:
+        if lo_roll <= 1e-12:
+            mask *= (freqs >= lo_eff).astype(np.float64)
+        else:
+            width = max(lo_roll, 1e-9)
+            trans = np.clip((freqs - lo_eff) / width, 0.0, 1.0)
+            mask *= np.power(trans, 1.0 / exp_n)
+            mask[freqs >= lo_eff + width] = 1.0
+
+    if cfg.y_pos.clip:
+        if hi_roll <= 1e-12:
+            mask *= (freqs <= hi_eff).astype(np.float64)
+        else:
+            width = max(hi_roll, 1e-9)
+            trans = np.clip((hi_eff - freqs) / width, 0.0, 1.0)
+            mask *= np.power(trans, 1.0 / exp_n)
+            mask[freqs <= hi_eff - width] = 1.0
+
+    y = np.fft.irfft(X * mask, n=x.size)
+    return np.asarray(y, dtype=np.float64), float(lo_eff), float(hi_eff)
+
+
+def _next_pow2(v: float) -> int:
+    v = max(1.0, float(v))
+    return 1 << int(math.ceil(math.log2(v)))
+
+
+def _fft_scaler_stft_params(
+    *,
+    sr: int,
+    freq_lo: float,
+    hop_hint: int,
+    bins_per_octave: int,
+    filter_scale: float,
+    signal_len: int,
+) -> tuple[int, int]:
+    """Choose STFT n_fft/hop from current CQT-style viewport settings."""
+    sr = max(1, int(sr))
+    hop_hint = max(1, int(hop_hint))
+    bpo = max(1, int(bins_per_octave))
+    alpha = ((2.0 ** (2.0 / bpo) - 1.0) /
+             max(2.0 ** (2.0 / bpo) + 1.0, 1e-12))
+    q = max(float(filter_scale), 1e-6) / max(alpha, 1e-12)
+    flo = max(float(freq_lo), 1.0)
+    target = q * sr / flo
+    target = max(256.0, min(131072.0, target))
+    n_fft = _next_pow2(target)
+    if signal_len > 0:
+        n_fft = min(n_fft, max(256, _next_pow2(max(signal_len, 256))))
+    hop = max(1, min(max(1, n_fft // 4), hop_hint))
+    return int(n_fft), int(hop)
+
+
+# ---------------------------------------------------------------------------
+# Shared STFT engine — used by the phase vocoder, envelope analysis, and any
+# other FFT-engine consumer.  Centralised here so the algorithm choice (window
+# shape, centering, normalisation flag) is a single change point.
+# ---------------------------------------------------------------------------
+
+def _stft_engine_window(window: str, n_fft: int) -> "torch.Tensor":
+    """Return an (n_fft,) float32 analysis window tensor.
+
+    scipy.signal.get_window is used for coefficient generation only (no FFT)
+    so that the full named-window set (hann, hamming, blackman,
+    blackmanharris, …) is available without duplicating the lookup table.
+    """
+    from scipy.signal import get_window
+    import torch
+    return torch.from_numpy(
+        get_window(window, n_fft, fftbins=True).astype(np.float32)
+    )
+
+
+def _stft_engine_forward(
+    xt: "torch.Tensor",
+    n_fft: int,
+    hop: int,
+    win_t: "torch.Tensor",
+) -> "torch.Tensor":
+    """Centred, one-sided torch STFT.  Returns (n_bins, n_frames) complex64."""
+    import torch
+    return torch.stft(
+        xt, n_fft=n_fft, hop_length=hop, win_length=n_fft,
+        window=win_t, center=True, pad_mode="reflect",
+        normalized=False, onesided=True, return_complex=True,
+    )
+
+
+def _stft_engine_inverse(
+    Z: "torch.Tensor",
+    n_fft: int,
+    hop: int,
+    win_t: "torch.Tensor",
+    length: int | None = None,
+) -> "torch.Tensor":
+    """Inverse of _stft_engine_forward.  Returns (N,) float32."""
+    import torch
+    kwargs: dict = dict(
+        n_fft=n_fft, hop_length=hop, win_length=n_fft,
+        window=win_t, center=True, normalized=False, onesided=True,
+    )
+    if length is not None:
+        kwargs["length"] = length
+    return torch.istft(Z, **kwargs)
+
+
+def _stft_engine_phase_vocoder(
+    Z: "torch.Tensor",
+    n_fft: int,
+    hop: int,
+    stretch_rate: float,
+) -> "torch.Tensor":
+    """Chunked torch IF phase vocoder.
+
+    Interpolates the STFT spectrogram *Z* (n_bins, n_frames) along the time
+    axis at rate *stretch_rate*, tracking instantaneous frequency to maintain
+    phase coherence.  Returns a (n_bins, n_out_frames) complex64 tensor.
+
+    Memory budget: each chunk allocates ~7 × n_bins × K float32 tensors.
+    chunk_w is chosen so this stays under 512 MiB regardless of the
+    n_bins / n_frames trade-off.
+    """
+    import torch
+
+    n_bins, n_frames = Z.shape
+    if n_frames <= 1:
+        return Z
+
+    stretch_rate = max(float(stretch_rate), 1e-9)
+    time_steps = torch.arange(
+        0.0, float(n_frames - 1), stretch_rate, dtype=torch.float32
+    )  # (n_steps,)
+    phi_adv = (
+        (2.0 * math.pi * hop / float(n_fft))
+        * torch.arange(n_bins, dtype=torch.float32)
+    )  # (n_bins,)
+
+    # Start greedy — try all frames at once.  On OOM, halve the chunk and
+    # retry; phase_acc is only committed on success so correctness is preserved.
+    chunk_w = len(time_steps)
+    out_parts: list[torch.Tensor] = []
+    phase_acc = torch.angle(Z[:, 0])  # (n_bins,) float32
+    start = 0
+
+    while start < len(time_steps):
+        end = min(start + chunk_w, len(time_steps))
+        try:
+            ts_c = time_steps[start:end]                                   # (K,)
+            i_c = ts_c.floor().long().clamp(max=n_frames - 2)             # (K,)
+            frac_c = ts_c - i_c.float()                                    # (K,)
+
+            C0 = Z[:, i_c]          # (n_bins, K) complex64
+            C1 = Z[:, i_c + 1]
+
+            mag_c = (1.0 - frac_c) * C0.abs() + frac_c * C1.abs()        # float32
+
+            dp = torch.angle(C1) - torch.angle(C0) - phi_adv.unsqueeze(1) # (n_bins, K)
+            dp = dp - 2.0 * math.pi * torch.round(dp / (2.0 * math.pi))
+
+            cum = torch.cumsum(phi_adv.unsqueeze(1) + dp, dim=1)           # (n_bins, K)
+            phase_block = phase_acc.unsqueeze(1) + cum                      # (n_bins, K)
+            chunk_out = torch.polar(mag_c, phase_block)                     # (n_bins, K) complex64
+            new_acc = phase_block[:, -1]
+
+            out_parts.append(chunk_out)
+            phase_acc = new_acc
+            start = end
+        except (RuntimeError, MemoryError) as _e:
+            if chunk_w <= 1:
+                raise
+            _is_oom = (isinstance(_e, MemoryError)
+                       or "out of memory" in str(_e).lower())
+            if not _is_oom:
+                raise
+            gc.collect()
+            chunk_w = max(1, chunk_w // 2)
+            # retry the same start position with a smaller chunk
+
+    return torch.cat(out_parts, dim=1)  # (n_bins, n_steps)
+
+
+def _phase_vocoder_stft(
+    signal: np.ndarray,
+    sr: int,
+    *,
+    n_fft: int,
+    hop: int,
+    window: str,
+    time_scale: float,
+    pitch_scale: float,
+) -> np.ndarray:
+    """Apply STFT phase-vocoder scaling with independent time/pitch controls.
+
+    Thin orchestrator: delegates forward/inverse transforms and the phase
+    vocoder to the shared _stft_engine_* functions above so that algorithm
+    changes propagate everywhere in the FFT engine automatically.
+    """
+    try:
+        import torch
+        import torch.nn.functional as F
+    except ImportError as exc:
+        raise ImportError("torch is required for the STFT phase vocoder") from exc
+
+    x = np.asarray(signal, dtype=np.float32)
+    if x.size == 0 or sr <= 0:
+        return np.zeros(0, dtype=np.float64)
+    n_fft = max(16, int(n_fft))
+    hop = max(1, int(hop))
+    time_scale = max(float(time_scale), 1e-9)
+    pitch_scale = max(float(pitch_scale), 1e-9)
+    stretch_rate = max(time_scale / pitch_scale, 1e-9)
+
+    win_t = _stft_engine_window(window, n_fft)
+    xt = torch.from_numpy(x)
+
+    Z = _stft_engine_forward(xt, n_fft, hop, win_t)
+    Z_pv = _stft_engine_phase_vocoder(Z, n_fft, hop, stretch_rate)
+    y_t = _stft_engine_inverse(
+        Z_pv, n_fft, hop, win_t,
+        length=None if Z_pv.shape[1] != Z.shape[1] else xt.shape[0],
+    )
+
+    if abs(pitch_scale - 1.0) > 1e-6 and y_t.numel() > 1:
+        out_len = max(1, int(round(int(y_t.shape[0]) / pitch_scale)))
+        y_t = F.interpolate(
+            y_t.view(1, 1, -1), size=out_len,
+            mode="linear", align_corners=True,
+        ).view(-1)
+
+    return y_t.numpy().astype(np.float64)
+
+
 def _torch_resize_lastdim(y_t: Any, out_len: int) -> Any:
     """Resize the last dimension of a torch tensor on its current device."""
     import torch.nn.functional as F
@@ -1011,6 +1697,113 @@ def _torch_resize_lastdim(y_t: Any, out_len: int) -> Any:
     return F.interpolate(
         y_view, size=out_len, mode="linear", align_corners=True,
     ).reshape(lead_shape + (out_len,))
+
+
+def _icwt_streaming_viewport(
+    *,
+    W_complex: Any,
+    s0: int,
+    s1: int,
+    f0: int,
+    f1: int,
+    freqs_np: np.ndarray,
+    scale_weights: np.ndarray | None,
+    frame_weights: np.ndarray | None,
+    sr: int,
+    hop: int,
+    wavelet_name: str,
+    wavelet_kw: dict[str, Any],
+    playback_rate: float,
+    batch_size: int,
+    length: int | None,
+) -> np.ndarray:
+    """Stream CWT viewport inversion in scale batches to avoid full-GPU OOM."""
+    import torch
+    import torch.nn.functional as F
+    from torch_cqt_new import _CWT_WAVELETS, _adm_ssq
+
+    if f1 <= f0:
+        return np.zeros(0, dtype=np.float64)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.float64
+    n_scales = max(0, int(s1 - s0))
+    in_frames = max(1, int(f1 - f0))
+    if n_scales <= 0:
+        return np.zeros(0, dtype=np.float64)
+    out_frames = in_frames
+    if abs(playback_rate - 1.0) > 1e-6 and in_frames > 1:
+        out_frames = max(1, int(round(in_frames / playback_rate)))
+
+    freqs_t = torch.tensor(
+        np.ascontiguousarray(freqs_np[s0:s1]), device=device, dtype=dtype
+    )
+    if n_scales > 1:
+        log2_ratios = torch.log2(freqs_t[:-1] / freqs_t[1:])
+        nv = float(1.0 / log2_ratios.mean().item())
+    else:
+        nv = 1.0
+    dj = math.log(2.0) / nv
+    wavelet_fn = _CWT_WAVELETS[wavelet_name]
+    Cpsi = _adm_ssq(
+        wavelet_fn,
+        wavelet_kw,
+        float(sr),
+        ref_freq=float(freqs_t[n_scales // 2].item()),
+    )
+    coeff = (2.0 / Cpsi) * dj
+
+    y_frames = torch.zeros(out_frames, dtype=dtype, device=device)
+    bs = max(1, min(int(batch_size or 64), n_scales))
+    s_start = 0
+    while s_start < n_scales:
+        s_end = min(s_start + bs, n_scales)
+        try:
+            W_chunk_np = np.ascontiguousarray(
+                np.asarray(W_complex[s0 + s_start:s0 + s_end, f0:f1])
+            )
+            W_chunk_t = torch.as_tensor(W_chunk_np, device=device)
+            if out_frames != in_frames and int(W_chunk_t.shape[-1]) > 1:
+                real_t = _torch_resize_lastdim(W_chunk_t.real, out_frames)
+                imag_t = _torch_resize_lastdim(W_chunk_t.imag, out_frames)
+                W_chunk_t = torch.complex(real_t, imag_t)
+            if scale_weights is not None and scale_weights.size > 0:
+                sw = torch.as_tensor(
+                    np.ascontiguousarray(scale_weights[s_start:s_end]),
+                    device=device, dtype=dtype,
+                ).unsqueeze(-1)
+                W_chunk_t = W_chunk_t * sw
+            if frame_weights is not None and frame_weights.size > 0:
+                fw_np = np.ascontiguousarray(frame_weights)
+                if out_frames != in_frames and fw_np.shape[0] > 1:
+                    fw_t = torch.as_tensor(fw_np, device=device, dtype=dtype)
+                    fw_t = _torch_resize_lastdim(fw_t, out_frames)
+                else:
+                    fw_t = torch.as_tensor(fw_np, device=device, dtype=dtype)
+                W_chunk_t = W_chunk_t * fw_t.unsqueeze(0)
+            y_frames += W_chunk_t.real.to(dtype).sum(dim=0)
+            s_start = s_end
+        except torch.cuda.OutOfMemoryError:
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if bs <= 1:
+                raise
+            bs = max(1, bs // 2)
+
+    y_frames = coeff * y_frames
+    if hop == 1:
+        if length is not None:
+            y_frames = y_frames[:int(length)]
+        return y_frames.detach().cpu().numpy().astype(np.float64, copy=False)
+
+    out_len = int(length) if length is not None else int(out_frames * hop)
+    y = F.interpolate(
+        y_frames.unsqueeze(0).unsqueeze(0),
+        size=out_len,
+        mode="linear",
+        align_corners=True,
+    ).squeeze()
+    return y.detach().cpu().numpy().astype(np.float64, copy=False)
 
 
 def _rescale_dwt_coeffs(
@@ -1081,6 +1874,11 @@ def _reconstruct_wavelet_viewport(
     wv_freqs: np.ndarray | None = None,
     playback_rate: float = 1.0,
     target_len: int | None = None,
+    view_x0: float | None = None,
+    view_x1: float | None = None,
+    view_y0: float | None = None,
+    view_y1: float | None = None,
+    viewport_boundary: ViewportBoundaryConfig | None = None,
 ) -> np.ndarray:
     """Reconstruct a wavelet viewport from the original analysis buffers.
 
@@ -1092,32 +1890,53 @@ def _reconstruct_wavelet_viewport(
     meta_n_samples = int(wv_meta.get("n_samples", 0) or 0)
 
     if wv_type == "cwt":
-        import torch
-        from torch_cqt_new import icwt as _torch_icwt
-
         if W_complex is None or wv_freqs is None:
             raise ValueError("No CWT scalogram data")
 
-        hop = max(1, int(wv_meta.get("hop_length", 1) or 1))
-        total_samples = meta_n_samples if meta_n_samples > 0 else (
-            int(W_complex.shape[1]) * hop)
-        frac0, frac1 = _fraction_window(t0, t1, total_samples, sr)
-        f0, f1 = _fraction_to_index_range(frac0, frac1, int(W_complex.shape[1]))
+        hop = _effective_cwt_hop_length(
+            meta_n_samples,
+            int(W_complex.shape[1]),
+            int(
+                wv_meta.get(
+                    "working_hop_length",
+                    wv_meta.get("hop_length", 1),
+                ) or 1
+            ),
+        )
+        n_total_frames = int(W_complex.shape[1])
+        if viewport_boundary is not None and view_x0 is not None and view_x1 is not None:
+            f0, f1, frame_weights = _viewport_axis_window(
+                n_total_frames,
+                float(view_x0),
+                float(view_x1),
+                viewport_boundary.x_neg,
+                viewport_boundary.x_pos,
+            )
+        else:
+            total_samples = meta_n_samples if meta_n_samples > 0 else (
+                int(W_complex.shape[1]) * hop)
+            frac0, frac1 = _fraction_window(t0, t1, total_samples, sr)
+            f0, f1 = _fraction_to_index_range(frac0, frac1, n_total_frames)
+            frame_weights = None
 
-        W_slice = np.ascontiguousarray(np.asarray(W_complex[:, f0:f1]))
         freqs_np = np.ascontiguousarray(np.asarray(wv_freqs).reshape(-1))
-        if freqs_np.shape[0] != W_slice.shape[0]:
+        if freqs_np.shape[0] != int(W_complex.shape[0]):
             raise ValueError("CWT frequency grid does not match scalogram rows")
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        W_t = torch.as_tensor(W_slice, device=device)
-        freqs_t = torch.as_tensor(freqs_np, device=device)
-
-        if abs(playback_rate - 1.0) > 1e-6 and int(W_t.shape[-1]) > 1:
-            out_frames = max(1, int(round(int(W_t.shape[-1]) / playback_rate)))
-            W_r = _torch_resize_lastdim(W_t.real, out_frames)
-            W_i = _torch_resize_lastdim(W_t.imag, out_frames)
-            W_t = torch.complex(W_r, W_i)
+        n_rows = int(W_complex.shape[0])
+        if viewport_boundary is not None and view_y0 is not None and view_y1 is not None:
+            dy0, dy1, display_weights = _viewport_axis_window(
+                n_rows,
+                float(view_y0),
+                float(view_y1),
+                viewport_boundary.y_neg,
+                viewport_boundary.y_pos,
+            )
+            s0 = n_rows - dy1
+            s1 = n_rows - dy0
+            scale_weights = np.ascontiguousarray(display_weights[::-1].copy())
+        else:
+            s0, s1 = 0, n_rows
+            scale_weights = None
 
         wavelet_name = wv_meta.get("wavelet", "morlet")
         wavelet_kw: dict[str, Any] = {}
@@ -1127,22 +1946,36 @@ def _reconstruct_wavelet_viewport(
         if eps is not None and float(eps) <= 0.0:
             eps = None
 
-        base_len = max(1, int(W_t.shape[-1]) * hop)
-        sig_t = _torch_icwt(
-            W_t,
-            freqs_t,
-            sr,
-            hop_length=hop,
-            wavelet=wavelet_name,
+        out_frames = max(1, int(f1 - f0))
+        if abs(playback_rate - 1.0) > 1e-6 and out_frames > 1:
+            out_frames = max(1, int(round(out_frames / playback_rate)))
+        base_len = max(1, out_frames * hop)
+        sig = _icwt_streaming_viewport(
+            W_complex=W_complex,
+            s0=s0,
+            s1=s1,
+            f0=f0,
+            f1=f1,
+            freqs_np=freqs_np,
+            scale_weights=scale_weights,
+            frame_weights=frame_weights,
+            sr=sr,
+            hop=hop,
+            wavelet_name=wavelet_name,
             wavelet_kw=wavelet_kw,
-            device=W_t.device,
-            epsilon=eps,
+            playback_rate=playback_rate,
             batch_size=int(wv_meta.get("batch_size", 64) or 64),
             length=base_len,
         )
-        if target_len is not None:
-            sig_t = _torch_resize_lastdim(sig_t, int(target_len))
-        return sig_t.detach().cpu().numpy().astype(np.float64, copy=False)
+        if target_len is not None and len(sig) != int(target_len):
+            import torch
+
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            sig_t = torch.as_tensor(
+                np.ascontiguousarray(sig), device=device, dtype=torch.float64,
+            )
+            sig = _torch_resize_lastdim(sig_t, int(target_len)).cpu().numpy()
+        return np.asarray(sig, dtype=np.float64, copy=False)
 
     import pywt
     import torch
@@ -1154,13 +1987,36 @@ def _reconstruct_wavelet_viewport(
     extension = str(wv_meta.get("extension", "symmetric"))
     total_samples = meta_n_samples if meta_n_samples > 0 else int(len(wv_coeffs[-1]) * 2)
     frac0, frac1 = _fraction_window(t0, t1, total_samples, sr)
+    row_weights: np.ndarray | None = None
+    if viewport_boundary is not None and view_y0 is not None and view_y1 is not None:
+        _, _, row_weights = _viewport_axis_window(
+            len(wv_coeffs),
+            float(view_y0),
+            float(view_y1),
+            viewport_boundary.y_neg,
+            viewport_boundary.y_pos,
+        )
 
     masked: list[np.ndarray] = []
-    for coeff in wv_coeffs:
+    for i, coeff in enumerate(wv_coeffs):
         n = len(coeff)
-        s0, s1 = _fraction_to_index_range(frac0, frac1, n)
-        mc = np.zeros_like(coeff)
-        mc[s0:s1] = coeff[s0:s1]
+        if viewport_boundary is not None and view_x0 is not None and view_x1 is not None:
+            vx0 = float(view_x0) / max(float(max(1, len(wv_coeffs[-1]))), 1.0) * n
+            vx1 = float(view_x1) / max(float(max(1, len(wv_coeffs[-1]))), 1.0) * n
+            s0, s1, x_weights = _viewport_axis_window(
+                n, vx0, vx1, viewport_boundary.x_neg, viewport_boundary.x_pos
+            )
+        else:
+            s0, s1 = _fraction_to_index_range(frac0, frac1, n)
+            x_weights = None
+        mc = np.zeros_like(coeff, dtype=np.float64)
+        coeff_src = np.asarray(coeff, dtype=np.float64)
+        if s1 > s0:
+            mc[s0:s1] = coeff_src[s0:s1]
+            if x_weights is not None and x_weights.size == (s1 - s0):
+                mc[s0:s1] *= x_weights
+        if row_weights is not None and i < len(row_weights):
+            mc *= float(row_weights[i])
         masked.append(mc)
 
     masked = _rescale_dwt_coeffs(masked, wavelet_name, extension, playback_rate)
@@ -1380,7 +2236,8 @@ CAFLS_SEISMIC_FLOOR: float = 0.01  # Hz
 # ---------------------------------------------------------------------------
 
 _FILTER_TYPES = ["Linkwitz-Riley 4", "Butterworth 4", "Butterworth 8"]
-_CQT_ALGORITHMS = ["librosa", "nsgt"]
+_CQT_ALGORITHMS = ["librosa", "nsgt", "stft"]
+_CQT_ALGORITHM_LABELS = ["CQT", "CQ-NSGT", "STFT"]
 _CQT_WINDOWS = ["hann", "hamming", "blackman", "blackmanharris"]
 _FB_CONFIG_MODES = ["Manual", "Auto (log)"]
 
@@ -1407,6 +2264,14 @@ _RESAMPLE_PRECISIONS = ["16-bit", "24-bit", "32-bit float", "64-bit float"]
 _ANALYSIS_COMPUTE_PRECISIONS = ["32-bit", "64-bit"]
 _ANALYSIS_SAVE_PRECISIONS = ["16-bit", "32-bit", "64-bit"]
 
+# Signal-engine output sample-rate options.  0 = native (no resample).
+_SIGNAL_OUT_SR_OPTIONS: list[int] = [0, 8000, 11025, 16000, 22050, 44100, 48000, 88200, 96000]
+_SIGNAL_OUT_SR_LABELS: list[str] = ["native", "8k", "11k", "16k", "22k", "44.1k", "48k", "88.2k", "96k"]
+
+# Signal-engine save-precision options → (soundfile subtype, numpy write dtype)
+_SIGNAL_SAVE_PRECISIONS: list[str] = ["16-bit int", "24-bit int", "32-bit float", "64-bit float"]
+_SIGNAL_SAVE_SF_SUBTYPE: list[str] = ["PCM_16", "PCM_24", "FLOAT", "DOUBLE"]
+_SIGNAL_SAVE_NP_DTYPE: list[str] = ["int16", "int16", "float32", "float64"]
 
 def _precision_label_to_np_dtype(label: str) -> np.dtype:
     return {
@@ -1622,9 +2487,11 @@ class FilterBankDecomposition:
     crossover point.  Linkwitz-Riley 4th-order crossovers sum flat.
     """
 
-    def __init__(self, sr: int, filter_type: str = "Linkwitz-Riley 4") -> None:
+    def __init__(self, sr: int, filter_type: str = "Linkwitz-Riley 4",
+                 filter_mode: str = "fir") -> None:
         self.sr: int = sr
         self.filter_type: str = filter_type
+        self.filter_mode: str = filter_mode   # "fir" or "iir"
         self.bands: list[BandDef] = []
         self.subbands: list[np.ndarray | None] = []    # filtered signal per band
         self._subband_files: list[str | None] = []
@@ -1770,96 +2637,73 @@ class FilterBankDecomposition:
 
     def compute(self, signal: np.ndarray, bands: list[BandDef]) -> None:
         """Apply crossover filters and store subbands."""
-        from scipy.signal import butter, sosfilt
+        from filter_engine import decompose_bands, FIR, IIR
 
         self._source_signal = signal.copy()
         self.bands = list(bands)
         self.subbands = []
         nyq = self.sr / 2.0
 
-        if self.filter_type.startswith("Linkwitz-Riley"):
-            order = int(self.filter_type.split()[-1])
-            half_order = order // 2
-            self._compute_lr(signal, nyq, half_order)
-        else:
-            order = int(self.filter_type.split()[-1])
-            self._compute_butterworth(signal, nyq, order)
+        order = int(self.filter_type.split()[-1])
+        # LR uses half-order for IIR cascade; FIR uses full order directly
+        iir_order = order // 2 if self.filter_type.startswith("Linkwitz-Riley") else order
+        mode = IIR if self.filter_mode == "iir" else FIR
+
+        crossovers = []
+        for b in bands[:-1]:  # all but last band supply their upper edge
+            crossovers.append(float(b.fmax))
+        crossovers = [xo for xo in crossovers if 0 < xo < nyq]
+
+        # Disabled bands: compute with all crossovers then zero out
+        subbands = decompose_bands(
+            signal, self.sr, crossovers,
+            filter_mode=mode,
+            order=order if mode == FIR else iir_order,
+        )
+        for i, band in enumerate(bands):
+            sub = subbands[i] if i < len(subbands) else np.zeros_like(signal)
+            if not band.enabled:
+                sub = np.zeros_like(sub)
+            self.subbands.append(np.asarray(sub, dtype=np.result_type(signal.dtype, np.float32)))
 
     def _compute_lr(self, signal: np.ndarray, nyq: float,
                     half_order: int) -> None:
-        """Linkwitz-Riley crossover with perfect reconstruction.
+        """Legacy IIR Linkwitz-Riley cascade (called only when filter_mode=="iir").
 
-        Uses the cascade LP-difference method identical to the GPU path
-        (_filter_bands_gpu):
-
-            H_0(f)     = LP²(xo_0)                             first band
-            H_i(f)     = LP²(xo_i) - LP²(xo_{i-1})             middle bands
-            H_{n-1}(f) = signal  - LP²(xo_{n-2})              last band (HP residual)
-
-        where LP²(fc) = sosfilt(sos, sosfilt(sos, signal)) with sos being the
-        half-order Butterworth LP at fc.  This guarantees Σ H_i = signal
-        (perfect reconstruction) regardless of the number of bands.
+        Kept for reference; compute() now routes through filter_engine.
         """
-        from scipy.signal import butter, sosfilt
+        from filter_engine import decompose_bands, IIR
         real_dt = np.result_type(signal.dtype, np.float32)
-
-        n_bands = len(self.bands)
-        sig = np.asarray(signal, dtype=real_dt)
-
-        prev_lp2: np.ndarray | None = None   # LP²(xo_{i-1}) × signal
-
+        crossovers = [min(float(b.fmax), nyq * 0.9999)
+                      for b in self.bands[:-1] if b.fmax < nyq]
+        subbands = decompose_bands(signal, self.sr, crossovers,
+                                   filter_mode=IIR, order=half_order)
         for i, band in enumerate(self.bands):
+            sub = subbands[i] if i < len(subbands) else np.zeros_like(signal)
             if not band.enabled:
-                # Disabled: output zeros but advance LP cursor so neighbours sum correctly
-                if i < n_bands - 1:
-                    fc = min(float(band.fmax), nyq * 0.9999)
-                    wn = max(fc / nyq, 1e-4)
-                    sos = butter(half_order, wn, btype="low", output="sos")
-                    prev_lp2 = np.asarray(
-                        sosfilt(sos, sosfilt(sos, sig)), dtype=real_dt)
-                self.subbands.append(np.zeros_like(sig))
-                continue
-
-            if i < n_bands - 1:
-                # Not the last band: LP²(fmax) is the upper crossover
-                fc = min(float(band.fmax), nyq * 0.9999)
-                wn = max(fc / nyq, 1e-4)
-                sos = butter(half_order, wn, btype="low", output="sos")
-                curr_lp2 = np.asarray(
-                    sosfilt(sos, sosfilt(sos, sig)), dtype=real_dt)
-                sub = curr_lp2 if prev_lp2 is None else curr_lp2 - prev_lp2
-                prev_lp2 = curr_lp2
-            else:
-                # Last band: HP residual = signal minus all LP energy below
-                sub = sig if prev_lp2 is None else sig - prev_lp2
-
+                sub = np.zeros_like(sub)
             self.subbands.append(np.asarray(sub, dtype=real_dt))
 
     def _compute_butterworth(self, signal: np.ndarray, nyq: float,
                              order: int) -> None:
-        """Standard Butterworth crossover (not guaranteed flat sum)."""
-        from scipy.signal import butter, sosfilt
-        real_dt = np.result_type(signal.dtype, np.float32)
+        """Legacy IIR Butterworth per-band (called only when filter_mode=="iir").
 
+        Kept for reference; compute() now routes through filter_engine.
+        """
+        from filter_engine import apply_bandpass, IIR
+        real_dt = np.result_type(signal.dtype, np.float32)
         for band in self.bands:
             if not band.enabled:
                 self.subbands.append(np.zeros_like(signal))
                 continue
-            flo = band.fmin
-            fhi = band.fmax
-            if flo <= 0.0 and fhi >= nyq:
+            flo = band.fmin if band.fmin > 0 else None
+            fhi = band.fmax if band.fmax < nyq else None
+            if flo is None and fhi is None:
                 self.subbands.append(signal.copy())
                 continue
-            if flo <= 0.0:
-                wn = min(fhi / nyq, 0.9999)
-                sos = butter(order, wn, btype="low", output="sos")
-            elif fhi >= nyq:
-                wn = max(flo / nyq, 0.0001)
-                sos = butter(order, wn, btype="high", output="sos")
-            else:
-                wn = [max(flo / nyq, 0.0001), min(fhi / nyq, 0.9999)]
-                sos = butter(order, wn, btype="band", output="sos")
-            self.subbands.append(np.asarray(sosfilt(sos, signal), dtype=real_dt))
+            sub = apply_bandpass(signal, self.sr, flo, fhi,
+                                 filter_mode=IIR, order=order)
+            self.subbands.append(np.asarray(sub, dtype=real_dt))
 
     def reconstruction_error(self) -> float:
         """RMS error between sum-of-bands and original signal (0.0 = perfect)."""
@@ -2779,7 +3623,7 @@ class FilterBankDecomposition:
     def _filter_one_band(self, signal: np.ndarray, band: "BandDef",
                          nyq: float) -> np.ndarray:
         """Filter *signal* for a single band and return the subband array."""
-        from scipy.signal import butter, sosfilt
+        from filter_engine import apply_bandpass, FIR, IIR
         real_dt = np.result_type(signal.dtype, np.float32)
 
         if not band.enabled:
@@ -2788,39 +3632,15 @@ class FilterBankDecomposition:
         if flo <= 0.0 and fhi >= nyq:
             return signal.copy()
 
-        if self.filter_type.startswith("Linkwitz-Riley"):
-            order = int(self.filter_type.split()[-1])
-            half = order // 2
-            if flo <= 0.0:
-                wn = min(fhi / nyq, 0.9999)
-                sos = butter(half, wn, btype="low", output="sos")
-                return np.asarray(sosfilt(sos, sosfilt(sos, signal)),
-                                  dtype=real_dt)
-            if fhi >= nyq:
-                wn = max(flo / nyq, 0.0001)
-                sos = butter(half, wn, btype="high", output="sos")
-                return np.asarray(sosfilt(sos, sosfilt(sos, signal)),
-                                  dtype=real_dt)
-            wn_lo = max(flo / nyq, 0.0001)
-            wn_hi = min(fhi / nyq, 0.9999)
-            sos_lo = butter(half, wn_lo, btype="high", output="sos")
-            sos_hi = butter(half, wn_hi, btype="low", output="sos")
-            return np.asarray(
-                sosfilt(sos_hi, sosfilt(sos_hi,
-                        sosfilt(sos_lo, sosfilt(sos_lo, signal)))),
-                dtype=real_dt)
-        else:
-            order = int(self.filter_type.split()[-1])
-            if flo <= 0.0:
-                wn = min(fhi / nyq, 0.9999)
-                sos = butter(order, wn, btype="low", output="sos")
-            elif fhi >= nyq:
-                wn = max(flo / nyq, 0.0001)
-                sos = butter(order, wn, btype="high", output="sos")
-            else:
-                wn = [max(flo / nyq, 0.0001), min(fhi / nyq, 0.9999)]
-                sos = butter(order, wn, btype="band", output="sos")
-            return np.asarray(sosfilt(sos, signal), dtype=real_dt)
+        mode = IIR if self.filter_mode == "iir" else FIR
+        order = int(self.filter_type.split()[-1])
+        flo_arg = flo if flo > 0 else None
+        fhi_arg = fhi if fhi < nyq else None
+        return np.asarray(
+            apply_bandpass(signal, self.sr, flo_arg, fhi_arg,
+                           filter_mode=mode, order=order),
+            dtype=real_dt,
+        )
 
     def _lp_exponent(self) -> int:
         """Exponent N for zero-phase LP shape: lp(f,fc) = 1/(1+(f/fc)^N).
@@ -3520,6 +4340,7 @@ class FilterBankDecomposition:
 
         meta: dict[str, Any] = {
             "filter_type": self.filter_type,
+            "filter_mode": self.filter_mode,
             "sr": sr,
             "n_bands": n_bands,
             "bands": meta_bands,
@@ -4078,7 +4899,8 @@ class FilterBankDecomposition:
             return None
         with open(meta_path) as f:
             meta = json.load(f)
-        fb = FilterBankDecomposition(meta["sr"], meta.get("filter_type", "Linkwitz-Riley 4"))
+        fb = FilterBankDecomposition(meta["sr"], meta.get("filter_type", "Linkwitz-Riley 4"),
+                                     filter_mode=meta.get("filter_mode", "fir"))
         real_dt = (_precision_label_to_real_dtype(compute_precision)
                    if compute_precision else np.float32)
         fb._subband_real_dt = real_dt
@@ -4765,7 +5587,348 @@ class ListItem:
     display_name: str     # shown label
     tag: str = "none"     # short right-side tag text (target channel, etc.)
     tag_color_key: str = "none"   # lookup in _TGT_COLORS
+    timeline_segments: list[tuple[float, float, tuple[int, int, int], int]] = field(default_factory=list)
 
+
+@dataclass
+class ModularSubpanelSpec:
+    """Specification for one modular panel inside a scrollable stack."""
+    key: str
+    title: str
+    summary_lines: list[str] = field(default_factory=list)
+    expanded: bool = True
+    enabled: bool = True
+    accent_rgb: tuple[int, int, int] = (120, 140, 200)
+    body_height: int = 0
+    render_body: Any = None
+    payload: Any = None
+
+
+@dataclass
+class SubpanelAddOption:
+    key: str
+    label: str
+    accent_rgb: tuple[int, int, int] = (100, 120, 160)
+
+
+@dataclass(order=True)
+class HierarchicalControlRecord:
+    path: tuple[str, ...]
+    rect: Any = field(compare=False)
+    kind: str = field(compare=False, default="button")
+    payload: Any = field(compare=False, default=None)
+
+
+class HierarchicalControlTable:
+    """Hierarchical identity table for controls inside a modular UI stack."""
+
+    def __init__(self) -> None:
+        self.records: list[HierarchicalControlRecord] = []
+
+    def clear(self) -> None:
+        self.records = []
+
+    def register(
+        self,
+        path: tuple[str, ...],
+        rect: Any,
+        *,
+        kind: str = "button",
+        payload: Any = None,
+    ) -> None:
+        self.records.append(HierarchicalControlRecord(
+            tuple(str(p) for p in path), rect, kind=kind, payload=payload))
+
+    def sorted_records(self) -> list[HierarchicalControlRecord]:
+        return sorted(self.records)
+
+    def hit(self, x: int, y: int) -> HierarchicalControlRecord | None:
+        for rec in self.records:
+            if rec.rect.collidepoint(x, y):
+                return rec
+        return None
+
+
+class ScrollableSubpanelList:
+    """Reusable scrollable stack of collapsible modular subpanels.
+
+    Each subpanel has a header plus optional body content. Bodies can either be
+    rendered from summary text or by a caller-provided render callback.
+    """
+
+    TITLE_H = 22
+    HEADER_H = 22
+    PAD = 6
+    BODY_PAD = 6
+
+    def __init__(
+        self,
+        title: str,
+        *,
+        max_height: int = 220,
+        key_prefix: str = "subpanel",
+    ) -> None:
+        self.title = title
+        self.max_height = max(60, int(max_height))
+        self.key_prefix = str(key_prefix)
+        self.subpanels: list[ModularSubpanelSpec] = []
+        self.selected_key: str | None = None
+        self.scroll_y: int = 0
+        self._rendered_h: int = 0
+        self._viewport_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self._header_rects: dict[str, pygame.Rect] = {}
+        self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
+        self._content_h: int = 0
+        self.add_options: list[SubpanelAddOption] = []
+        self.show_remove_button: bool = False
+        self._selected_add_option_idx: int = 0
+        self._add_dropdown_rect: pygame.Rect | None = None
+        self._add_confirm_rect: pygame.Rect | None = None
+        self._add_button_rects: dict[str, pygame.Rect] = {}  # kept for compat
+        self._remove_button_rect: pygame.Rect | None = None
+        self.control_table = HierarchicalControlTable()
+
+    def set_subpanels(self, subpanels: list[ModularSubpanelSpec]) -> None:
+        self.subpanels = list(subpanels)
+        keys = {sp.key for sp in self.subpanels}
+        if self.selected_key not in keys:
+            self.selected_key = self.subpanels[0].key if self.subpanels else None
+        self._clamp_scroll()
+
+    def set_add_options(self, options: list[SubpanelAddOption]) -> None:
+        self.add_options = list(options)
+
+    def _summary_height(
+        self,
+        spec: ModularSubpanelSpec,
+        font: pygame.font.Font,
+        body_w: int,
+    ) -> int:
+        if not spec.summary_lines:
+            return 0
+        line_h = max(font.get_linesize(), self.HEADER_H - 4)
+        return len(spec.summary_lines) * line_h + 2 * self.BODY_PAD
+
+    def _body_height(
+        self,
+        spec: ModularSubpanelSpec,
+        font: pygame.font.Font,
+        body_w: int,
+    ) -> int:
+        if not spec.expanded:
+            return 0
+        if spec.render_body is not None:
+            return max(0, int(spec.body_height))
+        return self._summary_height(spec, font, body_w)
+
+    def _total_content_height(self, font: pygame.font.Font, body_w: int) -> int:
+        total = 0
+        for spec in self.subpanels:
+            total += self.HEADER_H + self._body_height(spec, font, body_w)
+        return total
+
+    def _clamp_scroll(self) -> None:
+        max_scroll = max(0, self._content_h - self.max_height)
+        self.scroll_y = max(0, min(int(self.scroll_y), int(max_scroll)))
+
+    def render(
+        self,
+        surf: pygame.Surface,
+        font: pygame.font.Font,
+        x: int,
+        y: int,
+        w: int,
+    ) -> int:
+        start_y = y
+        self._header_rects = {}
+        self._item_map = {}
+        self._add_button_rects = {}
+        self._remove_button_rect = None
+        self.control_table.clear()
+
+        ttl = font.render(f"\u2500\u2500 {self.title} \u2500\u2500",
+                          True, (180, 180, 180))
+        surf.blit(ttl, (x + self.PAD, y + 2))
+        y += self.TITLE_H + 2
+
+        viewport_h = self.max_height
+        viewport = pygame.Rect(x + self.PAD, y, w - 2 * self.PAD, viewport_h)
+        pygame.draw.rect(surf, (34, 36, 44), viewport)
+        pygame.draw.rect(surf, (58, 62, 74), viewport, 1)
+        self._viewport_rect = viewport
+
+        body_w = max(1, viewport.w)
+        self._content_h = self._total_content_height(font, body_w)
+        self._clamp_scroll()
+        content_h = max(viewport_h, self._content_h)
+        content = pygame.Surface((body_w, content_h), pygame.SRCALPHA)
+        content.fill((0, 0, 0, 0))
+
+        cy = 0
+        line_h = max(font.get_linesize(), self.HEADER_H - 4)
+        for spec in self.subpanels:
+            hdr = pygame.Rect(0, cy, body_w, self.HEADER_H)
+            is_selected = (spec.key == self.selected_key)
+            base = (48, 52, 66) if is_selected else (42, 46, 56)
+            if not spec.enabled:
+                base = (36, 36, 40)
+            pygame.draw.rect(content, base, hdr)
+            pygame.draw.rect(content, spec.accent_rgb, hdr, 1)
+            arrow = "\u25bc" if spec.expanded else "\u25b6"
+            title_color = (230, 230, 230) if spec.enabled else (120, 120, 120)
+            txt = font.render(f" {arrow} {spec.title}", True, title_color)
+            content.blit(txt, (4, cy + 3))
+            hit = pygame.Rect(
+                viewport.x + hdr.x,
+                viewport.y + hdr.y - self.scroll_y,
+                hdr.w,
+                hdr.h,
+            )
+            self._header_rects[spec.key] = hit
+            self._item_map[f"{self.key_prefix}:{spec.key}:header"] = (hit, spec)
+            cy += self.HEADER_H
+
+            body_h = self._body_height(spec, font, body_w)
+            if body_h <= 0:
+                continue
+            body_rect = pygame.Rect(0, cy, body_w, body_h)
+            pygame.draw.rect(content, (28, 30, 38), body_rect)
+            pygame.draw.rect(content, (50, 54, 68), body_rect, 1)
+            if spec.render_body is not None:
+                def _register_body_control(
+                    path: tuple[str, ...],
+                    rect: Any,
+                    *,
+                    kind: str = "button",
+                    payload: Any = None,
+                ) -> None:
+                    hit = pygame.Rect(
+                        viewport.x + rect.x,
+                        viewport.y + rect.y - self.scroll_y,
+                        rect.w,
+                        rect.h,
+                    )
+                    self.control_table.register(path, hit, kind=kind, payload=payload)
+                spec.render_body(
+                    content, font, body_rect, spec, self._item_map, _register_body_control)
+            else:
+                ty = cy + self.BODY_PAD
+                for line in spec.summary_lines:
+                    if not line:
+                        ty += line_h
+                        continue
+                    st = font.render(line, True, (180, 188, 196))
+                    content.blit(st, (self.BODY_PAD, ty))
+                    ty += line_h
+            cy += body_h
+
+        prev_clip = surf.get_clip()
+        surf.set_clip(viewport)
+        surf.blit(content, (viewport.x, viewport.y - self.scroll_y))
+        surf.set_clip(prev_clip)
+
+        if self._content_h > viewport_h:
+            track = pygame.Rect(viewport.right - 6, viewport.y + 2, 4, viewport_h - 4)
+            pygame.draw.rect(surf, (46, 48, 56), track)
+            thumb_h = max(24, int(track.h * viewport_h / max(self._content_h, 1)))
+            max_scroll = max(1, self._content_h - viewport_h)
+            thumb_y = track.y + int((track.h - thumb_h) * self.scroll_y / max_scroll)
+            thumb = pygame.Rect(track.x, thumb_y, track.w, thumb_h)
+            pygame.draw.rect(surf, (110, 120, 145), thumb)
+
+        footer_y = y + viewport_h + 4
+        footer_h = self._render_footer(surf, font, x, footer_y, w)
+
+        self._rendered_h = (y - start_y) + viewport_h + 2 + footer_h
+        return self._rendered_h
+
+    def _render_footer(
+        self,
+        surf: pygame.Surface,
+        font: pygame.font.Font,
+        x: int,
+        footer_y: int,
+        w: int,
+    ) -> int:
+        """Render the dropdown+Add engine footer. Returns height consumed."""
+        self._add_dropdown_rect = None
+        self._add_confirm_rect = None
+        self._add_button_rects = {}
+        self._remove_button_rect = None
+        if not self.add_options and not self.show_remove_button:
+            return 0
+        btn_h = self.HEADER_H
+        bx = x + self.PAD
+        footer_h = btn_h + 2
+        if self.show_remove_button:
+            rw = max(80, min(120, w // 4))
+            rr = pygame.Rect(bx, footer_y, rw, btn_h)
+            pygame.draw.rect(surf, (84, 56, 56), rr)
+            pygame.draw.rect(surf, (132, 88, 88), rr, 1)
+            rt = font.render("Remove Sel", True, (235, 220, 220))
+            surf.blit(rt, (rr.x + 6, rr.y + 3))
+            self._remove_button_rect = rr
+            bx = rr.right + 6
+        if self.add_options:
+            self._selected_add_option_idx = max(
+                0, min(self._selected_add_option_idx, len(self.add_options) - 1))
+            opt = self.add_options[self._selected_add_option_idx]
+            avail_w = (x + w - self.PAD) - bx - 6
+            dd_w = max(70, avail_w * 2 // 3)
+            confirm_w = max(36, avail_w - dd_w - 4)
+            dd_rect = pygame.Rect(bx, footer_y, dd_w, btn_h)
+            pygame.draw.rect(surf, (38, 42, 54), dd_rect)
+            pygame.draw.rect(surf, opt.accent_rgb, dd_rect, 1)
+            dd_txt = font.render(f"◄ {opt.label} ►", True, (220, 226, 235))
+            surf.blit(dd_txt, (dd_rect.x + 6, dd_rect.y + 3))
+            self._add_dropdown_rect = dd_rect
+            add_rect = pygame.Rect(dd_rect.right + 4, footer_y, confirm_w, btn_h)
+            pygame.draw.rect(surf, (44, 68, 44), add_rect)
+            pygame.draw.rect(surf, (80, 140, 80), add_rect, 1)
+            add_txt = font.render("+ Add", True, (180, 240, 180))
+            surf.blit(add_txt, (add_rect.x + add_rect.w // 2 - add_txt.get_width() // 2,
+                                add_rect.y + 3))
+            self._add_confirm_rect = add_rect
+        return footer_h
+
+    def handle_click(self, lx: int, ly: int) -> str | None:
+        if self._remove_button_rect and self._remove_button_rect.collidepoint(lx, ly):
+            return f"remove:{self.selected_key or ''}"
+        if self._add_dropdown_rect and self._add_dropdown_rect.collidepoint(lx, ly):
+            if self.add_options:
+                self._selected_add_option_idx = (
+                    self._selected_add_option_idx + 1) % len(self.add_options)
+            return "add_cycle"
+        if self._add_confirm_rect and self._add_confirm_rect.collidepoint(lx, ly):
+            if self.add_options:
+                opt = self.add_options[self._selected_add_option_idx]
+                return f"add:{opt.key}"
+            return "add_cycle"
+        # legacy: individual add-button rects (unused when dropdown active)
+        for opt_key, rect in self._add_button_rects.items():
+            if rect.collidepoint(lx, ly):
+                return f"add:{opt_key}"
+        if not self._viewport_rect.collidepoint(lx, ly):
+            return None
+        rec = self.control_table.hit(lx, ly)
+        if rec is not None:
+            return "control:" + "|".join(rec.path)
+        for key, rect in self._header_rects.items():
+            if rect.collidepoint(lx, ly):
+                self.selected_key = key
+                for spec in self.subpanels:
+                    if spec.key == key:
+                        spec.expanded = not spec.expanded
+                        break
+                return key
+        return ""
+
+    def handle_scroll(self, direction: int) -> bool:
+        if self._content_h <= self.max_height:
+            return False
+        self.scroll_y += int(direction) * 28
+        self._clamp_scroll()
+        return True
 
 class ScrollableItemList:
     """Generic scrollable list widget rendered onto a parent surface.
@@ -4864,6 +6027,8 @@ class ScrollableItemList:
             if idx == self.selected_idx:
                 pygame.draw.rect(surf, (50, 50, 70), rect)
             pygame.draw.rect(surf, (60, 60, 80), rect, 1)
+            if item.timeline_segments:
+                self._render_timeline(surf, rect, item.timeline_segments)
             txt = font.render(item.display_name, True, (200, 200, 200))
             surf.blit(txt, (pad + 4, y + 3))
             color = _TGT_COLORS.get(item.tag_color_key, (80, 80, 80))
@@ -4885,6 +6050,33 @@ class ScrollableItemList:
 
         self._rendered_h = y - start_y
         return self._rendered_h
+
+    @staticmethod
+    def _render_timeline(
+        surf: pygame.Surface,
+        rect: Any,
+        segments: list[tuple[float, float, tuple[int, int, int], int]],
+    ) -> None:
+        bar = pygame.Rect(rect.x + 4, rect.y + rect.h - 7, max(10, rect.w - 70), 4)
+        pygame.draw.rect(surf, (28, 30, 36), bar)
+        for lo, hi, rgb, alpha in segments:
+            x0 = bar.x + int(max(0.0, min(1.0, lo)) * bar.w)
+            x1 = bar.x + int(max(0.0, min(1.0, hi)) * bar.w)
+            if x1 <= x0:
+                x1 = min(bar.right, x0 + 1)
+            try:
+                pygame.draw.rect(
+                    surf,
+                    (int(rgb[0]), int(rgb[1]), int(rgb[2]), int(alpha)),
+                    pygame.Rect(x0, bar.y, max(1, x1 - x0), bar.h),
+                )
+            except Exception:
+                pygame.draw.rect(
+                    surf,
+                    rgb,
+                    pygame.Rect(x0, bar.y, max(1, x1 - x0), bar.h),
+                )
+        pygame.draw.rect(surf, (70, 74, 84), bar, 1)
 
     def handle_click(self, lx: int, ly: int) -> int | None:
         """Test click at surface-local *(lx, ly)*.
@@ -6038,7 +7230,7 @@ class HybridViewPanel(Panel):
 
         rows: list[tuple[str, Any]] = [
             ("label", "Hybrid stack"),
-            ("label", "CWT bottom  |  FB centered  |  CQT top"),
+            ("label", "CWT bottom  |  FB centered  |  FFT top"),
         ]
         if not self._is_active():
             rows.append(("label", "Active in TF -> Hybrid"))
@@ -6186,13 +7378,12 @@ class TimeScaleViewPanel(Panel):
     BTN_H = 26
     _LOG2_MIN = -5.0
     _LOG2_MAX = 5.0
-    _SNAP_LOG2 = [-5.0, -4.0, -3.0, -2.0, -1.0,
-                  0.0,
-                  1.0,  2.0,  3.0,  4.0,  5.0]
+    _TARGET_MIDI = 72  # C5
 
     def __init__(self, config: WaveletViewConfig, *, side: str = "right") -> None:
         super().__init__(title="Wavelet Playback", side=side)
         self.config = config
+        self.viewport_widget = ViewportBoundaryWidget(prefix="vp")
         self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
         self._dragging: str | None = None
         # Playback state (updated by viewer via _play_wavelet_direct)
@@ -6204,6 +7395,29 @@ class TimeScaleViewPanel(Panel):
         # Callbacks wired by the viewer
         self.on_play: Any = lambda: None   # () → triggers synthesis+play
         self.on_stop: Any = lambda: None   # () → stop playback
+        self.get_viewport_context: Any = lambda: {}
+        self.get_scale_slider_range: Any = lambda: (self._LOG2_MIN, self._LOG2_MAX)
+
+    def _log2_range(self) -> tuple[float, float]:
+        try:
+            lo, hi = self.get_scale_slider_range()
+        except Exception:
+            lo, hi = self._LOG2_MIN, self._LOG2_MAX
+        lo = float(lo)
+        hi = float(hi)
+        if hi <= lo:
+            lo, hi = self._LOG2_MIN, self._LOG2_MAX
+        return lo, hi
+
+    @staticmethod
+    def _snap_log2_values(l2min: float, l2max: float) -> list[float]:
+        i0 = int(math.ceil(l2min))
+        i1 = int(math.floor(l2max))
+        snaps = [float(i) for i in range(i0, i1 + 1)]
+        if 0.0 not in snaps and l2min <= 0.0 <= l2max:
+            snaps.append(0.0)
+            snaps.sort()
+        return snaps
 
     # ------------------------------------------------------------------
     def stop_playback(self) -> None:
@@ -6238,6 +7452,8 @@ class TimeScaleViewPanel(Panel):
 
         ts = self.config.time_scale
         l2 = self.config.time_scale_log2
+        l2min, l2max = self._log2_range()
+        snap_log2 = self._snap_log2_values(l2min, l2max)
 
         # Status line
         if self._status == "synthesizing":
@@ -6258,11 +7474,19 @@ class TimeScaleViewPanel(Panel):
             ("label_col", ("Wavelet Time-Scale Playback", bright)),
             ("label_col", (status_str, status_col)),
             ("log_slider", ("time_scale_log2", "Scale",
-                            l2, self._LOG2_MIN, self._LOG2_MAX)),
+                            l2, l2min, l2max)),
             ("toggle", ("normalize", "Normalize loudness",
                         self.config.normalize)),
-            ("play_stop", None),
         ]
+        rows.extend(
+            self.viewport_widget.build_rows(
+                self.config.viewport_boundary,
+                self.get_viewport_context(),
+            )
+        )
+        rows.extend([
+            ("play_stop", None),
+        ])
 
         row_heights = []
         for rtype, _ in rows:
@@ -6298,6 +7522,28 @@ class TimeScaleViewPanel(Panel):
                 surf.blit(txt, (self.PAD + 24, y + 3))
                 self._item_map[key] = (rect, None)
 
+            elif rtype == "slider":
+                key, label, value, vmin, vmax, fmt = rdata
+                txt = font.render(label, True, bright)
+                surf.blit(txt, (self.PAD, y + 3))
+                lbl_w = max(78, txt.get_width() + 8)
+                val_txt = font.render(fmt.format(value), True, (200, 200, 200))
+                val_x = w - self.PAD - val_txt.get_width()
+                surf.blit(val_txt, (val_x, y + 3))
+                track_x = self.PAD + lbl_w
+                track_w = max(40, val_x - track_x - 8)
+                track = pygame.Rect(track_x, y + 8, track_w, 6)
+                pygame.draw.rect(surf, (50, 50, 60), track)
+                frac = (value - vmin) / max(vmax - vmin, 1e-9)
+                frac = max(0.0, min(1.0, frac))
+                thumb_x = track.x + int(round(frac * track.w))
+                pygame.draw.rect(surf, (120, 140, 200),
+                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                self._item_map[key] = (
+                    pygame.Rect(track.x, y, track.w, rh),
+                    (vmin, vmax),
+                )
+
             elif rtype == "log_slider":
                 key, label, log2_val, l2min, l2max = rdata
                 lbl_txt = font.render(label, True, bright)
@@ -6320,7 +7566,7 @@ class TimeScaleViewPanel(Panel):
                 pygame.draw.rect(surf, (50, 50, 60), track)
 
                 # Tick marks at every integer log₂ — label ×1 centre
-                for snap in self._SNAP_LOG2:
+                for snap in snap_log2:
                     frac_s = (snap - l2min) / (l2max - l2min)
                     tx = track.x + int(round(frac_s * track.w))
                     h_tick = 8 if snap == 0.0 else 4
@@ -6400,12 +7646,19 @@ class TimeScaleViewPanel(Panel):
                     self.on_stop()
                     return True
                 if meta is None:
+                    if self.viewport_widget.handle_toggle(
+                        key, self.config.viewport_boundary
+                    ):
+                        return True
                     # Toggle boolean config field
                     setattr(self.config, key, not getattr(self.config, key))
                     return True
                 # Log-slider drag
                 self._dragging = key
-                self._update_log_slider(key, lx, rect, meta[0], meta[1])
+                if key == "time_scale_log2":
+                    self._update_log_slider(key, lx, rect, meta[0], meta[1])
+                else:
+                    self._update_slider(key, lx, rect, meta[0], meta[1])
                 return True
             return True
 
@@ -6424,7 +7677,11 @@ class TimeScaleViewPanel(Panel):
                 mx, _ = event.pos
                 lx = mx - pr.x
                 rect, meta = self._item_map[self._dragging]
-                self._update_log_slider(self._dragging, lx, rect,
+                if self._dragging == "time_scale_log2":
+                    self._update_log_slider(self._dragging, lx, rect,
+                                            meta[0], meta[1])
+                else:
+                    self._update_slider(self._dragging, lx, rect,
                                         meta[0], meta[1])
                 return True
             mx, my = event.pos
@@ -6441,9 +7698,9 @@ class TimeScaleViewPanel(Panel):
                 if rect.collidepoint(lx, ly):
                     step = 0.25 * (1 if event.y > 0 else -1)
                     cur = self.config.time_scale_log2
+                    l2min, l2max = self._log2_range()
                     self.config.time_scale_log2 = round(
-                        max(self._LOG2_MIN,
-                            min(self._LOG2_MAX, cur + step)), 3)
+                        max(l2min, min(l2max, cur + step)), 3)
                     return True
             return self._handle_panel_wheel(event)
 
@@ -6455,11 +7712,805 @@ class TimeScaleViewPanel(Panel):
         frac = max(0.0, min(1.0, (lx - rect.x) / max(rect.w, 1)))
         raw = l2min + frac * (l2max - l2min)
         # Snap to integer log₂ values when within ~0.1 unit
-        for snap in self._SNAP_LOG2:
+        for snap in self._snap_log2_values(l2min, l2max):
             if abs(raw - snap) < 0.10:
                 raw = float(snap)
                 break
         setattr(self.config, key, round(raw, 3))
+
+    def _update_slider(self, key: str, lx: int,
+                       rect: pygame.Rect,
+                       vmin: float, vmax: float) -> None:
+        frac = max(0.0, min(1.0, (lx - rect.x) / max(rect.w, 1)))
+        val = round(vmin + frac * (vmax - vmin), 2)
+        if self.viewport_widget.apply_slider_value(
+            key, val, self.config.viewport_boundary
+        ):
+            return
+
+
+class FilterbankScalerPanel(Panel):
+    """Dockable direct-playback panel for filterbank-band scaling."""
+
+    ROW_H = 22
+    PAD = 6
+    BTN_H = 26
+    _LOG2_MIN = -5.0
+    _LOG2_MAX = 5.0
+    _TARGET_MIDI = 72  # C5
+
+    def __init__(self, config: FilterbankScalerConfig, *, side: str = "right") -> None:
+        super().__init__(title="Filterbank Scaler", side=side)
+        self.config = config
+        self.viewport_widget = ViewportBoundaryWidget(prefix="fbvp")
+        self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
+        self._dragging: str | None = None
+        self._active_dropdown: str | None = None
+        self._dropdown_opts: list[str] = []
+        self._dropdown_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self._dropdown_item_rects: list[pygame.Rect] = []
+        self._status: str = "idle"
+        self._error_msg: str = ""
+        self._playing_channel: pygame.mixer.Channel | None = None
+        self._playing_sound: Any = None
+        self._synth_thread: threading.Thread | None = None
+        self._is_active: Any = lambda: False
+        self.on_play: Any = lambda: None
+        self.on_stop: Any = lambda: None
+        self.get_viewport_context: Any = lambda: {}
+        self.get_scale_slider_range: Any = lambda: (self._LOG2_MIN, self._LOG2_MAX)
+
+    def _log2_range(self) -> tuple[float, float]:
+        try:
+            lo, hi = self.get_scale_slider_range()
+        except Exception:
+            lo, hi = self._LOG2_MIN, self._LOG2_MAX
+        lo = float(lo)
+        hi = float(hi)
+        if hi <= lo:
+            lo, hi = self._LOG2_MIN, self._LOG2_MAX
+        return lo, hi
+
+    @staticmethod
+    def _snap_log2_values(l2min: float, l2max: float) -> list[float]:
+        i0 = int(math.ceil(l2min))
+        i1 = int(math.floor(l2max))
+        snaps = [float(i) for i in range(i0, i1 + 1)]
+        if 0.0 not in snaps and l2min <= 0.0 <= l2max:
+            snaps.append(0.0)
+            snaps.sort()
+        return snaps
+
+    def stop_playback(self) -> None:
+        if self._playing_channel is not None:
+            try:
+                self._playing_channel.stop()
+            except Exception:
+                pass
+            self._playing_channel = None
+        self._playing_sound = None
+        self._status = "idle"
+
+    def _open_dropdown(self, key: str, options: list[str], anchor: pygame.Rect) -> None:
+        self._active_dropdown = key
+        self._dropdown_opts = list(options)
+        self._dropdown_rect = anchor
+
+    def _select_dropdown(self, idx: int) -> None:
+        key = self._active_dropdown
+        self._active_dropdown = None
+        if key == "method" and 0 <= idx < len(FILTERBANK_SCALER_METHODS):
+            self.config.method = FILTERBANK_SCALER_METHODS[idx]
+
+    def render(self) -> pygame.Surface | None:
+        if not self.visible:
+            return None
+        self._ensure_font()
+        font = self.font
+        w = self.PANEL_W
+        self._item_map = {}
+
+        if self._status == "playing" and self._playing_channel is not None:
+            if not self._playing_channel.get_busy():
+                self._status = "idle"
+                self._playing_channel = None
+                self._playing_sound = None
+
+        bright = (210, 210, 210)
+        dim = (150, 150, 155)
+        scale = self.config.scale
+        l2 = self.config.scale_log2
+        l2min, l2max = self._log2_range()
+        snap_log2 = self._snap_log2_values(l2min, l2max)
+
+        if self._status == "synthesizing":
+            status_col = (120, 180, 255)
+            status_str = "Preparing band…"
+        elif self._status == "playing":
+            status_col = (100, 220, 120)
+            status_str = f"Playing  ×{scale:.3f}"
+        elif self._status == "error":
+            status_col = (255, 100, 100)
+            status_str = f"Error: {self._error_msg[:26]}"
+        else:
+            status_col = dim
+            status_str = "Idle"
+
+        method_label = FILTERBANK_SCALER_METHOD_LABELS.get(
+            self.config.method, self.config.method.title())
+
+        rows: list[tuple[str, Any]] = [
+            ("label_col", ("Filterbank Scaler", bright)),
+            ("label_col", (status_str, status_col)),
+            ("dropdown", ("method", "Method", method_label)),
+            ("log_slider", ("scale_log2", "Scale", l2, l2min, l2max)),
+            ("toggle", ("use_only_existing_bands", "Use only existing bands",
+                        self.config.use_only_existing_bands)),
+            ("toggle", ("normalize", "Normalize loudness",
+                        self.config.normalize)),
+        ]
+        rows.extend(
+            self.viewport_widget.build_rows(
+                self.config.viewport_boundary,
+                self.get_viewport_context(),
+            )
+        )
+        rows.append(("play_stop", None))
+
+        row_heights = [
+            self.BTN_H if rtype == "play_stop" else self.ROW_H
+            for rtype, _ in rows
+        ]
+        total_h = self.PAD * 2 + sum(rh + 2 for rh in row_heights)
+        surf = pygame.Surface((w, total_h), pygame.SRCALPHA)
+        surf.fill((30, 30, 30, 210))
+
+        y = self.PAD
+        for (rtype, rdata), rh in zip(rows, row_heights):
+            if rtype == "label_col":
+                text, col = rdata
+                txt = font.render(text, True, col)
+                surf.blit(txt, (self.PAD, y + 3))
+
+            elif rtype == "toggle":
+                key, label, value = rdata
+                rect = pygame.Rect(self.PAD, y, w - 2 * self.PAD, rh)
+                box = pygame.Rect(self.PAD, y + 3, 16, 16)
+                pygame.draw.rect(surf, (45, 45, 55), box)
+                pygame.draw.rect(surf, (90, 90, 110), box, 1)
+                if value:
+                    pygame.draw.line(surf, (120, 200, 120),
+                                     (box.x + 2, box.y + 8),
+                                     (box.x + 6, box.y + 12), 2)
+                    pygame.draw.line(surf, (120, 200, 120),
+                                     (box.x + 6, box.y + 12),
+                                     (box.x + 13, box.y + 3), 2)
+                txt = font.render(label, True, bright)
+                surf.blit(txt, (self.PAD + 24, y + 3))
+                self._item_map[key] = (rect, None)
+
+            elif rtype == "dropdown":
+                key, label, value = rdata
+                txt = font.render(label, True, bright)
+                surf.blit(txt, (self.PAD, y + 3))
+                btn_w = 120
+                btn_x = w - self.PAD - btn_w
+                btn = pygame.Rect(btn_x, y + 1, btn_w, rh - 2)
+                pygame.draw.rect(surf, (50, 50, 60), btn, border_radius=3)
+                pygame.draw.rect(surf, (90, 90, 110), btn, 1, border_radius=3)
+                val_txt = font.render(value, True, (220, 220, 220))
+                surf.blit(val_txt, (btn.x + 6, y + 3))
+                tri = [(btn.right - 14, y + 9), (btn.right - 6, y + 9), (btn.right - 10, y + 14)]
+                pygame.draw.polygon(surf, (180, 180, 190), tri)
+                self._item_map[key] = (btn, "dropdown")
+
+            elif rtype == "slider":
+                key, label, value, vmin, vmax, fmt = rdata
+                txt = font.render(label, True, bright)
+                surf.blit(txt, (self.PAD, y + 3))
+                lbl_w = max(78, txt.get_width() + 8)
+                val_txt = font.render(fmt.format(value), True, (200, 200, 200))
+                val_x = w - self.PAD - val_txt.get_width()
+                surf.blit(val_txt, (val_x, y + 3))
+                track_x = self.PAD + lbl_w
+                track_w = max(40, val_x - track_x - 8)
+                track = pygame.Rect(track_x, y + 8, track_w, 6)
+                pygame.draw.rect(surf, (50, 50, 60), track)
+                frac = (value - vmin) / max(vmax - vmin, 1e-9)
+                frac = max(0.0, min(1.0, frac))
+                thumb_x = track.x + int(round(frac * track.w))
+                pygame.draw.rect(surf, (120, 140, 200),
+                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                self._item_map[key] = (
+                    pygame.Rect(track.x, y, track.w, rh),
+                    (vmin, vmax),
+                )
+
+            elif rtype == "log_slider":
+                key, label, log2_val, lo, hi = rdata
+                lbl_txt = font.render(label, True, bright)
+                surf.blit(lbl_txt, (self.PAD, y + 3))
+                lbl_w = lbl_txt.get_width() + 8
+                actual = 2.0 ** log2_val
+                val_str = f"÷{1.0/actual:.2f}" if actual < 1.0 else f"×{actual:.2f}"
+                val_txt = font.render(val_str, True, (200, 200, 200))
+                val_x = w - self.PAD - val_txt.get_width()
+                surf.blit(val_txt, (val_x, y + 3))
+                track_x = self.PAD + lbl_w
+                track_w = max(40, val_x - track_x - 8)
+                track = pygame.Rect(track_x, y + 8, track_w, 6)
+                pygame.draw.rect(surf, (50, 50, 60), track)
+                for snap in snap_log2:
+                    frac_s = (snap - lo) / max(hi - lo, 1e-9)
+                    tx = track.x + int(round(frac_s * track.w))
+                    h_tick = 8 if snap == 0.0 else 4
+                    pygame.draw.line(surf, (90, 90, 110),
+                                     (tx, track.y - 1),
+                                     (tx, track.y + h_tick), 1)
+                frac = (log2_val - lo) / max(hi - lo, 1e-9)
+                frac = max(0.0, min(1.0, frac))
+                thumb_x = track.x + int(round(frac * track.w))
+                thumb_col = (100, 200, 120) if abs(log2_val) < 0.05 else (120, 140, 200)
+                pygame.draw.rect(surf, thumb_col,
+                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                self._item_map[key] = (
+                    pygame.Rect(track.x, y, track.w, rh),
+                    (lo, hi),
+                )
+
+            elif rtype == "play_stop":
+                btn_w = (w - self.PAD * 3) // 2
+                playing = self._status in ("playing", "synthesizing")
+                play_rect = pygame.Rect(self.PAD, y, btn_w, rh)
+                stop_rect = pygame.Rect(self.PAD * 2 + btn_w, y, btn_w, rh)
+                pygame.draw.rect(surf, (50, 100, 50) if not playing else (35, 60, 35),
+                                 play_rect, border_radius=4)
+                pygame.draw.rect(surf, (80, 160, 80), play_rect, 1, border_radius=4)
+                pygame.draw.rect(surf, (100, 50, 50) if playing else (50, 35, 35),
+                                 stop_rect, border_radius=4)
+                pygame.draw.rect(surf, (160, 80, 80), stop_rect, 1, border_radius=4)
+                ptxt = font.render("▶ Play", True,
+                                   (180, 255, 180) if not playing else (100, 140, 100))
+                stxt = font.render("■ Stop", True,
+                                   (255, 180, 180) if playing else (120, 80, 80))
+                surf.blit(ptxt, (play_rect.x + (btn_w - ptxt.get_width()) // 2,
+                                 play_rect.y + (rh - ptxt.get_height()) // 2))
+                surf.blit(stxt, (stop_rect.x + (btn_w - stxt.get_width()) // 2,
+                                 stop_rect.y + (rh - stxt.get_height()) // 2))
+                self._item_map["_play"] = (play_rect, "play")
+                self._item_map["_stop"] = (stop_rect, "stop")
+
+            y += rh + 2
+
+        return surf
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        if not self.visible:
+            return False
+        pr = self.panel_rect
+
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+            if self._active_dropdown:
+                for i, ir in enumerate(self._dropdown_item_rects):
+                    if ir.collidepoint(mx, my):
+                        self._select_dropdown(i)
+                        return True
+                self._active_dropdown = None
+                return True
+            if not pr.collidepoint(mx, my):
+                return False
+            lx = mx - pr.x
+            ly = my - pr.y + self._panel_scroll_y
+            for key, (rect, meta) in self._item_map.items():
+                if not rect.collidepoint(lx, ly):
+                    continue
+                if meta == "play":
+                    if self._status not in ("playing", "synthesizing"):
+                        self.on_play()
+                    return True
+                if meta == "stop":
+                    self.on_stop()
+                    return True
+                if meta == "dropdown":
+                    self._open_dropdown(
+                        key,
+                        [FILTERBANK_SCALER_METHOD_LABELS[m]
+                         for m in FILTERBANK_SCALER_METHODS],
+                        pygame.Rect(rect.x, rect.y + rect.h, rect.w, 0),
+                    )
+                    return True
+                if meta is None:
+                    if self.viewport_widget.handle_toggle(
+                        key, self.config.viewport_boundary
+                    ):
+                        return True
+                    setattr(self.config, key, not getattr(self.config, key))
+                    return True
+                self._dragging = key
+                if key == "scale_log2":
+                    self._update_log_slider(key, lx, rect, meta[0], meta[1])
+                else:
+                    self._update_slider(key, lx, rect, meta[0], meta[1])
+                return True
+            return True
+
+        if event.type == MOUSEBUTTONUP and event.button == 1:
+            if self._dragging:
+                self._dragging = None
+                return True
+            mx, my = event.pos
+            return pr.collidepoint(mx, my)
+
+        if event.type == MOUSEMOTION:
+            if self._dragging:
+                if not event.buttons[0]:
+                    self._dragging = None
+                    return True
+                mx, _ = event.pos
+                lx = mx - pr.x
+                rect, meta = self._item_map[self._dragging]
+                if self._dragging == "scale_log2":
+                    self._update_log_slider(self._dragging, lx, rect, meta[0], meta[1])
+                else:
+                    self._update_slider(self._dragging, lx, rect, meta[0], meta[1])
+                return True
+            mx, my = event.pos
+            return pr.collidepoint(mx, my)
+
+        if event.type == MOUSEWHEEL:
+            mx, my = pygame.mouse.get_pos()
+            if not pr.collidepoint(mx, my):
+                return False
+            lx = mx - pr.x
+            ly = my - pr.y + self._panel_scroll_y
+            if "scale_log2" in self._item_map:
+                rect, _meta = self._item_map["scale_log2"]
+                if rect.collidepoint(lx, ly):
+                    step = 0.25 * (1 if event.y > 0 else -1)
+                    cur = self.config.scale_log2
+                    l2min, l2max = self._log2_range()
+                    self.config.scale_log2 = round(
+                        max(l2min, min(l2max, cur + step)), 3)
+                    return True
+            return self._handle_panel_wheel(event)
+
+        return False
+
+    def _update_log_slider(self, key: str, lx: int,
+                           rect: pygame.Rect,
+                           l2min: float, l2max: float) -> None:
+        frac = max(0.0, min(1.0, (lx - rect.x) / max(rect.w, 1)))
+        raw = l2min + frac * (l2max - l2min)
+        for snap in self._snap_log2_values(l2min, l2max):
+            if abs(raw - snap) < 0.10:
+                raw = float(snap)
+                break
+        setattr(self.config, key, round(raw, 3))
+
+    def _update_slider(self, key: str, lx: int,
+                       rect: pygame.Rect,
+                       vmin: float, vmax: float) -> None:
+        frac = max(0.0, min(1.0, (lx - rect.x) / max(rect.w, 1)))
+        val = round(vmin + frac * (vmax - vmin), 2)
+        if self.viewport_widget.apply_slider_value(
+            key, val, self.config.viewport_boundary
+        ):
+            return
+
+    def render_dropdown_overlay(self) -> pygame.Surface | None:
+        if not self._active_dropdown:
+            return None
+        opts = self._dropdown_opts
+        if not opts:
+            return None
+        self._ensure_font()
+        font = self.font
+        pr = self.panel_rect
+        item_h = self.ROW_H
+        ow = self._dropdown_rect.w
+        oh = len(opts) * item_h
+        overlay = pygame.Surface((ow, oh), pygame.SRCALPHA)
+        overlay.fill((40, 40, 55, 240))
+        self._dropdown_item_rects = []
+        for i, label in enumerate(opts):
+            iy = i * item_h
+            ir_screen = pygame.Rect(pr.x + self._dropdown_rect.x,
+                                    pr.y + self._dropdown_rect.y + iy
+                                    - self._panel_scroll_y,
+                                    ow, item_h)
+            self._dropdown_item_rects.append(ir_screen)
+            pygame.draw.rect(overlay, (60, 60, 80), (0, iy, ow, item_h), 1)
+            txt = font.render(label, True, (220, 220, 220))
+            overlay.blit(txt, (4, iy + 3))
+        return overlay
+
+
+class FFTScalerPanel(Panel):
+    """Dockable direct-playback panel for FFT-domain scaling."""
+
+    ROW_H = 22
+    PAD = 6
+    BTN_H = 26
+    _LOG2_MIN = -5.0
+    _LOG2_MAX = 5.0
+    _TARGET_MIDI = 72  # C5
+
+    def __init__(self, config: FFTScalerConfig, *, side: str = "right") -> None:
+        super().__init__(title="FFT Scaler", side=side)
+        self.config = config
+        self.viewport_widget = ViewportBoundaryWidget(prefix="fftvp")
+        self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
+        self._dragging: str | None = None
+        self._active_dropdown: str | None = None
+        self._dropdown_opts: list[str] = []
+        self._dropdown_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
+        self._dropdown_item_rects: list[pygame.Rect] = []
+        self._status: str = "idle"
+        self._error_msg: str = ""
+        self._playing_channel: pygame.mixer.Channel | None = None
+        self._playing_sound: Any = None
+        self._synth_thread: threading.Thread | None = None
+        self._is_active: Any = lambda: False
+        self.on_play: Any = lambda: None
+        self.on_stop: Any = lambda: None
+        self.get_viewport_context: Any = lambda: {}
+        self.get_pitch_slider_range: Any = lambda: (self._LOG2_MIN, self._LOG2_MAX)
+
+    def stop_playback(self) -> None:
+        if self._playing_channel is not None:
+            try:
+                self._playing_channel.stop()
+            except Exception:
+                pass
+            self._playing_channel = None
+        self._playing_sound = None
+        self._status = "idle"
+
+    def _open_dropdown(self, key: str, options: list[str], anchor: pygame.Rect) -> None:
+        self._active_dropdown = key
+        self._dropdown_opts = list(options)
+        self._dropdown_rect = anchor
+
+    def _select_dropdown(self, idx: int) -> None:
+        key = self._active_dropdown
+        self._active_dropdown = None
+        if key == "method" and 0 <= idx < len(FFT_SCALER_METHODS):
+            self.config.method = FFT_SCALER_METHODS[idx]
+
+    def _pitch_log2_range(self) -> tuple[float, float]:
+        try:
+            lo, hi = self.get_pitch_slider_range()
+        except Exception:
+            lo, hi = self._LOG2_MIN, self._LOG2_MAX
+        lo = float(lo)
+        hi = float(hi)
+        if hi <= lo:
+            lo, hi = self._LOG2_MIN, self._LOG2_MAX
+        return lo, hi
+
+    @staticmethod
+    def _snap_log2_values(l2min: float, l2max: float) -> list[float]:
+        i0 = int(math.ceil(l2min))
+        i1 = int(math.floor(l2max))
+        snaps = [float(i) for i in range(i0, i1 + 1)]
+        if 0.0 not in snaps and l2min <= 0.0 <= l2max:
+            snaps.append(0.0)
+            snaps.sort()
+        return snaps
+
+    def render(self) -> pygame.Surface | None:
+        if not self.visible:
+            return None
+        self._ensure_font()
+        font = self.font
+        w = self.PANEL_W
+        self._item_map = {}
+
+        if self._status == "playing" and self._playing_channel is not None:
+            if not self._playing_channel.get_busy():
+                self._status = "idle"
+                self._playing_channel = None
+                self._playing_sound = None
+
+        bright = (210, 210, 210)
+        dim = (150, 150, 155)
+        if self._status == "synthesizing":
+            status_col = (120, 180, 255)
+            status_str = "Analyzing…"
+        elif self._status == "playing":
+            status_col = (100, 220, 120)
+            status_str = (f"Playing  T×{self.config.time_scale:.3f}  "
+                          f"P×{self.config.pitch_scale:.3f}")
+        elif self._status == "error":
+            status_col = (255, 100, 100)
+            status_str = f"Error: {self._error_msg[:26]}"
+        else:
+            status_col = dim
+            status_str = "Idle"
+
+        method_label = FFT_SCALER_METHOD_LABELS.get(
+            self.config.method, self.config.method.title())
+        p_lo, p_hi = self._pitch_log2_range()
+        p_snaps = self._snap_log2_values(p_lo, p_hi)
+        t_snaps = self._snap_log2_values(self._LOG2_MIN, self._LOG2_MAX)
+
+        rows: list[tuple[str, Any]] = [
+            ("label_col", ("FFT Scaler", bright)),
+            ("label_col", (status_str, status_col)),
+            ("dropdown", ("method", "Method", method_label)),
+            ("log_slider", ("time_scale_log2", "Time", self.config.time_scale_log2,
+                            self._LOG2_MIN, self._LOG2_MAX, t_snaps)),
+            ("log_slider", ("pitch_scale_log2", "Pitch", self.config.pitch_scale_log2,
+                            p_lo, p_hi, p_snaps)),
+            ("toggle", ("normalize", "Normalize loudness", self.config.normalize)),
+        ]
+        rows.extend(
+            self.viewport_widget.build_rows(
+                self.config.viewport_boundary,
+                self.get_viewport_context(),
+            )
+        )
+        rows.append(("play_stop", None))
+
+        row_heights = [
+            self.BTN_H if rtype == "play_stop" else self.ROW_H
+            for rtype, _ in rows
+        ]
+        total_h = self.PAD * 2 + sum(rh + 2 for rh in row_heights)
+        surf = pygame.Surface((w, total_h), pygame.SRCALPHA)
+        surf.fill((30, 30, 30, 210))
+
+        y = self.PAD
+        for (rtype, rdata), rh in zip(rows, row_heights):
+            if rtype == "label_col":
+                text, col = rdata
+                txt = font.render(text, True, col)
+                surf.blit(txt, (self.PAD, y + 3))
+            elif rtype == "toggle":
+                key, label, value = rdata
+                rect = pygame.Rect(self.PAD, y, w - 2 * self.PAD, rh)
+                box = pygame.Rect(self.PAD, y + 3, 16, 16)
+                pygame.draw.rect(surf, (45, 45, 55), box)
+                pygame.draw.rect(surf, (90, 90, 110), box, 1)
+                if value:
+                    pygame.draw.line(surf, (120, 200, 120),
+                                     (box.x + 2, box.y + 8),
+                                     (box.x + 6, box.y + 12), 2)
+                    pygame.draw.line(surf, (120, 200, 120),
+                                     (box.x + 6, box.y + 12),
+                                     (box.x + 13, box.y + 3), 2)
+                txt = font.render(label, True, bright)
+                surf.blit(txt, (self.PAD + 24, y + 3))
+                self._item_map[key] = (rect, None)
+            elif rtype == "dropdown":
+                key, label, value = rdata
+                txt = font.render(label, True, bright)
+                surf.blit(txt, (self.PAD, y + 3))
+                btn_w = 120
+                btn_x = w - self.PAD - btn_w
+                btn = pygame.Rect(btn_x, y + 1, btn_w, rh - 2)
+                pygame.draw.rect(surf, (50, 50, 60), btn, border_radius=3)
+                pygame.draw.rect(surf, (90, 90, 110), btn, 1, border_radius=3)
+                val_txt = font.render(value, True, (220, 220, 220))
+                surf.blit(val_txt, (btn.x + 6, y + 3))
+                tri = [(btn.right - 14, y + 9), (btn.right - 6, y + 9), (btn.right - 10, y + 14)]
+                pygame.draw.polygon(surf, (180, 180, 190), tri)
+                self._item_map[key] = (btn, "dropdown")
+            elif rtype == "slider":
+                key, label, value, vmin, vmax, fmt = rdata
+                txt = font.render(label, True, bright)
+                surf.blit(txt, (self.PAD, y + 3))
+                lbl_w = max(78, txt.get_width() + 8)
+                val_txt = font.render(fmt.format(value), True, (200, 200, 200))
+                val_x = w - self.PAD - val_txt.get_width()
+                surf.blit(val_txt, (val_x, y + 3))
+                track_x = self.PAD + lbl_w
+                track_w = max(40, val_x - track_x - 8)
+                track = pygame.Rect(track_x, y + 8, track_w, 6)
+                pygame.draw.rect(surf, (50, 50, 60), track)
+                frac = (value - vmin) / max(vmax - vmin, 1e-9)
+                frac = max(0.0, min(1.0, frac))
+                thumb_x = track.x + int(round(frac * track.w))
+                pygame.draw.rect(surf, (120, 140, 200),
+                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                self._item_map[key] = (
+                    pygame.Rect(track.x, y, track.w, rh),
+                    (vmin, vmax),
+                )
+            elif rtype == "log_slider":
+                key, label, log2_val, l2min, l2max, snaps = rdata
+                lbl_txt = font.render(label, True, bright)
+                surf.blit(lbl_txt, (self.PAD, y + 3))
+                lbl_w = lbl_txt.get_width() + 8
+                actual = 2.0 ** log2_val
+                val_str = f"÷{1.0/actual:.2f}" if actual < 1.0 else f"×{actual:.2f}"
+                val_txt = font.render(val_str, True, (200, 200, 200))
+                val_x = w - self.PAD - val_txt.get_width()
+                surf.blit(val_txt, (val_x, y + 3))
+                track_x = self.PAD + lbl_w
+                track_w = max(40, val_x - track_x - 8)
+                track = pygame.Rect(track_x, y + 8, track_w, 6)
+                pygame.draw.rect(surf, (50, 50, 60), track)
+                for snap in snaps:
+                    frac_s = (snap - l2min) / max(l2max - l2min, 1e-9)
+                    tx = track.x + int(round(frac_s * track.w))
+                    h_tick = 8 if snap == 0.0 else 4
+                    pygame.draw.line(surf, (90, 90, 110),
+                                     (tx, track.y - 1),
+                                     (tx, track.y + h_tick), 1)
+                frac = (log2_val - l2min) / max(l2max - l2min, 1e-9)
+                frac = max(0.0, min(1.0, frac))
+                thumb_x = track.x + int(round(frac * track.w))
+                thumb_col = (100, 200, 120) if abs(log2_val) < 0.05 else (120, 140, 200)
+                pygame.draw.rect(surf, thumb_col,
+                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                self._item_map[key] = (
+                    pygame.Rect(track.x, y, track.w, rh),
+                    (l2min, l2max),
+                )
+            elif rtype == "play_stop":
+                btn_w = (w - self.PAD * 3) // 2
+                playing = self._status in ("playing", "synthesizing")
+                play_rect = pygame.Rect(self.PAD, y, btn_w, rh)
+                stop_rect = pygame.Rect(self.PAD * 2 + btn_w, y, btn_w, rh)
+                pygame.draw.rect(surf, (50, 100, 50) if not playing else (35, 60, 35),
+                                 play_rect, border_radius=4)
+                pygame.draw.rect(surf, (80, 160, 80), play_rect, 1, border_radius=4)
+                pygame.draw.rect(surf, (100, 50, 50) if playing else (50, 35, 35),
+                                 stop_rect, border_radius=4)
+                pygame.draw.rect(surf, (160, 80, 80), stop_rect, 1, border_radius=4)
+                ptxt = font.render("▶ Play", True,
+                                   (180, 255, 180) if not playing else (100, 140, 100))
+                stxt = font.render("■ Stop", True,
+                                   (255, 180, 180) if playing else (120, 80, 80))
+                surf.blit(ptxt, (play_rect.x + (btn_w - ptxt.get_width()) // 2,
+                                 play_rect.y + (rh - ptxt.get_height()) // 2))
+                surf.blit(stxt, (stop_rect.x + (btn_w - stxt.get_width()) // 2,
+                                 stop_rect.y + (rh - stxt.get_height()) // 2))
+                self._item_map["_play"] = (play_rect, "play")
+                self._item_map["_stop"] = (stop_rect, "stop")
+            y += rh + 2
+        return surf
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        if not self.visible:
+            return False
+        pr = self.panel_rect
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            mx, my = event.pos
+            if self._active_dropdown:
+                for i, ir in enumerate(self._dropdown_item_rects):
+                    if ir.collidepoint(mx, my):
+                        self._select_dropdown(i)
+                        return True
+                self._active_dropdown = None
+                return True
+            if not pr.collidepoint(mx, my):
+                return False
+            lx = mx - pr.x
+            ly = my - pr.y + self._panel_scroll_y
+            for key, (rect, meta) in self._item_map.items():
+                if not rect.collidepoint(lx, ly):
+                    continue
+                if meta == "play":
+                    if self._status not in ("playing", "synthesizing"):
+                        self.on_play()
+                    return True
+                if meta == "stop":
+                    self.on_stop()
+                    return True
+                if meta == "dropdown":
+                    self._open_dropdown(
+                        key,
+                        [FFT_SCALER_METHOD_LABELS[m] for m in FFT_SCALER_METHODS],
+                        pygame.Rect(rect.x, rect.y + rect.h, rect.w, 0),
+                    )
+                    return True
+                if meta is None:
+                    if self.viewport_widget.handle_toggle(
+                        key, self.config.viewport_boundary
+                    ):
+                        return True
+                    setattr(self.config, key, not getattr(self.config, key))
+                    return True
+                self._dragging = key
+                if key in ("time_scale_log2", "pitch_scale_log2"):
+                    self._update_log_slider(key, lx, rect, meta[0], meta[1])
+                else:
+                    self._update_slider(key, lx, rect, meta[0], meta[1])
+                return True
+            return True
+
+        if event.type == MOUSEBUTTONUP and event.button == 1:
+            if self._dragging:
+                self._dragging = None
+                return True
+            mx, my = event.pos
+            return pr.collidepoint(mx, my)
+
+        if event.type == MOUSEMOTION:
+            if self._dragging:
+                if not event.buttons[0]:
+                    self._dragging = None
+                    return True
+                mx, _ = event.pos
+                lx = mx - pr.x
+                rect, meta = self._item_map[self._dragging]
+                if self._dragging in ("time_scale_log2", "pitch_scale_log2"):
+                    self._update_log_slider(self._dragging, lx, rect, meta[0], meta[1])
+                else:
+                    self._update_slider(self._dragging, lx, rect, meta[0], meta[1])
+                return True
+            mx, my = event.pos
+            return pr.collidepoint(mx, my)
+
+        if event.type == MOUSEWHEEL:
+            mx, my = pygame.mouse.get_pos()
+            if not pr.collidepoint(mx, my):
+                return False
+            lx = mx - pr.x
+            ly = my - pr.y + self._panel_scroll_y
+            for key in ("time_scale_log2", "pitch_scale_log2"):
+                if key in self._item_map:
+                    rect, meta = self._item_map[key]
+                    if rect.collidepoint(lx, ly):
+                        step = 0.25 * (1 if event.y > 0 else -1)
+                        cur = getattr(self.config, key)
+                        setattr(self.config, key, round(
+                            max(meta[0], min(meta[1], cur + step)), 3))
+                        return True
+            return self._handle_panel_wheel(event)
+
+        return False
+
+    def _update_log_slider(self, key: str, lx: int,
+                           rect: pygame.Rect,
+                           l2min: float, l2max: float) -> None:
+        frac = max(0.0, min(1.0, (lx - rect.x) / max(rect.w, 1)))
+        raw = l2min + frac * (l2max - l2min)
+        for snap in self._snap_log2_values(l2min, l2max):
+            if abs(raw - snap) < 0.10:
+                raw = float(snap)
+                break
+        setattr(self.config, key, round(raw, 3))
+
+    def _update_slider(self, key: str, lx: int,
+                       rect: pygame.Rect,
+                       vmin: float, vmax: float) -> None:
+        frac = max(0.0, min(1.0, (lx - rect.x) / max(rect.w, 1)))
+        val = round(vmin + frac * (vmax - vmin), 2)
+        if self.viewport_widget.apply_slider_value(
+            key, val, self.config.viewport_boundary
+        ):
+            return
+
+    def render_dropdown_overlay(self) -> pygame.Surface | None:
+        if not self._active_dropdown:
+            return None
+        opts = self._dropdown_opts
+        if not opts:
+            return None
+        self._ensure_font()
+        font = self.font
+        pr = self.panel_rect
+        item_h = self.ROW_H
+        ow = self._dropdown_rect.w
+        oh = len(opts) * item_h
+        overlay = pygame.Surface((ow, oh), pygame.SRCALPHA)
+        overlay.fill((40, 40, 55, 240))
+        self._dropdown_item_rects = []
+        for i, label in enumerate(opts):
+            iy = i * item_h
+            ir_screen = pygame.Rect(pr.x + self._dropdown_rect.x,
+                                    pr.y + self._dropdown_rect.y + iy
+                                    - self._panel_scroll_y,
+                                    ow, item_h)
+            self._dropdown_item_rects.append(ir_screen)
+            pygame.draw.rect(overlay, (60, 60, 80), (0, iy, ow, item_h), 1)
+            txt = font.render(label, True, (220, 220, 220))
+            overlay.blit(txt, (4, iy + 3))
+        return overlay
 
 
 # ---------------------------------------------------------------------------
@@ -7760,7 +9811,6 @@ class ImageInputPanel(Panel):
         self.freq_min: float = 16.35     # Hz (C0)
         self.freq_max: float = 19912.13  # Hz (~D#9)
         self.time_start: float = 0.0     # seconds
-        self.time_duration: float = 10.0 # seconds
 
         # Result data (populated after conversion)
         self._converted_data: np.ndarray | None = None
@@ -7935,7 +9985,6 @@ class ImageInputPanel(Panel):
             ("frames", "Frames:", self.target_frames, 100, 10000),
             ("freq_min", "Freq Lo:", self.freq_min, 1.0, 20000.0),
             ("freq_max", "Freq Hi:", self.freq_max, 10.0, 22050.0),
-            ("time_dur", "Duration:", self.time_duration, 0.1, 300.0),
         ]
         for key, label, val, vmin, vmax in slider_defs:
             sl = font.render(label, True, (140, 140, 150))
@@ -8082,10 +10131,7 @@ class ImageInputPanel(Panel):
             step = 100.0 * direction
             self.freq_max = max(self.freq_min + 10,
                                 min(22050.0, self.freq_max + step))
-        elif base == "time_dur":
-            step = 1.0 * direction
-            self.time_duration = max(0.1, min(300.0,
-                                              self.time_duration + step))
+
 
     def render_dropdown_overlay(self) -> pygame.Surface | None:
         if not self._active_dropdown:
@@ -8165,6 +10211,14 @@ _SIG_GLIDE_MODES = ["None", "Linear", "Exponential", "Logarithmic"]
 _SIG_BIT_DEPTHS = ["16-bit int", "24-bit int", "32-bit float"]
 _SIG_CHANNELS = ["Mono", "Stereo"]
 _SIG_GEN_MODES = ["Tone Generator", "Silent Track", "Record Input"]
+
+# ---------------------------------------------------------------------------
+# Signal Generator v2 — HarmonicLattice / WitnessAwareSynth builder options
+# ---------------------------------------------------------------------------
+
+_SGV2_PATH_TYPES = ["Constant Freq", "Exp Decay", "Power Law Decay"]
+_SGV2_MANIFOLDS = ["Pure Sine", "Phase Warped", "Harmonic Measure"]
+_SGV2_DRIFT_TYPES = ["None", "Sinusoidal"]
 
 
 def _generate_wave_cycle(shape: str, phase: np.ndarray,
@@ -8984,6 +11038,13 @@ class SourcePanel(Panel):
     ROW_H = 22
     PAD = 6
 
+    _MODULE_ADD_OPTIONS = [
+        SubpanelAddOption("fft", "FFT", (110, 150, 210)),
+        SubpanelAddOption("fb", "FB", (140, 185, 120)),
+        SubpanelAddOption("wavelet", "Wavelet", (198, 148, 98)),
+        SubpanelAddOption("signal", "Signal", (170, 120, 200)),
+    ]
+
     def __init__(self, *, side: str = "left",
                  input_dir: str = "",
                  output_root: str = "") -> None:
@@ -9044,10 +11105,14 @@ class SourcePanel(Panel):
         self.analysis_save_precision_idx: int = 1     # index into _ANALYSIS_SAVE_PRECISIONS
         # Window size is derived from Q / range demand — not set manually.
         self.hop_length: int = 512
+        self.stft_n_fft: int = 4096
         self.bins_per_octave: int = 1200
         self.cqt_filter_scale: float = 1.0  # librosa CQT filter quality factor
         self.cqt_fmin: float = 30.87  # CAFLS anchor (B0 ≈ f_a)
         self.cqt_fmax: float = 19912.13  # D#9 (snapped)
+        self.cqt_bpo_schedule: list[int] | None = None
+        self.cqt_hop_schedule: list[int] | None = None
+        self.cqt_filter_scale_schedule: list[float] | None = None
         self._cqt_expanded: bool = True
         self._loss_map = PlotWidget()
         self._loss_map.title = ""
@@ -9065,6 +11130,7 @@ class SourcePanel(Panel):
             _snap_to_note(4000.0),  # ~B7
         ]
         self.fb_filter_type_idx: int = 0  # index into _FILTER_TYPES
+        self.fb_filter_mode: str = "fir"  # "fir" or "iir"
         self.fb_label_mode_idx: int = 1  # 0=Range, 1=Mid+BW
         self.fb_hop: int = 1  # hop length for FB envelope computation
         # CAFLS filterbank settings
@@ -9109,6 +11175,7 @@ class SourcePanel(Panel):
         self._dropdown_rect: pygame.Rect = pygame.Rect(0, 0, 0, 0)
         self._dropdown_item_rects: list[pygame.Rect] = []
         self._dragging: str | None = None
+        self._module_dragging_rec: Any = None
         self._analyzing: bool = False
         self._analysis_thread: threading.Thread | None = None
         self._analysis_error: str | None = None
@@ -9118,7 +11185,71 @@ class SourcePanel(Panel):
         # Band list — scrollable fixed-height list for band preview
         self._band_list = ScrollableItemList("Filter Bands", max_visible=8)
         self._band_list_bands: list[BandDef] = []  # current preview bands
+        self._module_stack = ScrollableSubpanelList(
+            "Analysis Modules",
+            max_height=180,
+            key_prefix="source_module",
+        )
+        self._module_stack.set_add_options(self._MODULE_ADD_OPTIONS)
+        self._module_stack.show_remove_button = True
+        self._analysis_itinerary: list[dict[str, Any]] = []
+        self._show_legacy_engine_sections: bool = False
+        self._reset_analysis_itinerary_defaults()
 
+        # ---- Source section collapse state ----
+        self._wav_sources_expanded: bool = False   # collapsed by default
+        self._siggen_expanded: bool = True          # expanded by default
+
+        # ---- Signal Generator v2 state ----
+        # Path / frequency
+        self._sgv2_path_idx: int = 0               # index into _SGV2_PATH_TYPES
+        self._sgv2_freq_start: float = 110.0        # fundamental Hz
+        self._sgv2_tau: float = 3.5                 # decay tau (s)
+        self._sgv2_power: float = 1.0               # power law exponent
+        # Manifold
+        self._sgv2_manifold_idx: int = 1            # index into _SGV2_MANIFOLDS
+        self._sgv2_warp_strength: float = 0.25
+        self._sgv2_max_harmonics: int = 6
+        # Harmonic structure
+        self._sgv2_partial_count: int = 6
+        self._sgv2_amp_decay_tau: float = 5.0
+        # Shape sigmoid envelope
+        self._sgv2_shape_low: float = 0.1
+        self._sgv2_shape_high: float = 0.8
+        self._sgv2_shape_center: float = 1.0
+        self._sgv2_shape_width: float = 0.5
+        # Drift
+        self._sgv2_drift_idx: int = 1               # index into _SGV2_DRIFT_TYPES
+        self._sgv2_drift_rate: float = 0.07
+        self._sgv2_drift_max: float = 0.15
+        self._sgv2_drift_harm_power: float = 0.8
+        # Witness thresholds (expert)
+        self._sgv2_witness_bwd: float = 6.2832      # ≈ 2π rad
+        self._sgv2_witness_fwd: float = 6.2832
+        self._sgv2_witness_max_sup: float = 8.0
+        self._sgv2_witness_step: float = 0.0005
+        self._sgv2_witness_int_steps: int = 32
+        # Density policy (expert)
+        self._sgv2_oversample: float = 24.0
+        self._sgv2_min_sr: float = 96000.0
+        self._sgv2_max_sr: float = 5_000_000.0
+        self._sgv2_deriv_weight: float = 0.75
+        self._sgv2_support_weight: float = 1.25
+        # Projection (expert)
+        self._sgv2_out_sr: int = 48000
+        self._sgv2_proj_half_sup_ms: float = 1.5
+        # Output format
+        self._sgv2_duration: float = 5.0
+        self._sgv2_bit_depth_idx: int = 0           # index into _SIG_BIT_DEPTHS
+        self._sgv2_channels_idx: int = 0            # 0=Mono, 1=Stereo
+        # Generation status
+        self._sgv2_generating: bool = False
+        self._sgv2_status: str = ""
+        self._sgv2_thread: threading.Thread | None = None
+        # Sub-section expansion (all collapsed by default — expert controls)
+        self._sgv2_witness_expanded: bool = False
+        self._sgv2_density_expanded: bool = False
+        self._sgv2_proj_expanded: bool = False
 
         # Callbacks
         self.on_set_active: Any = None
@@ -9130,10 +11261,11 @@ class SourcePanel(Panel):
 
     # ---- Settings serialisation -------------------------------------------
 
+    _STR_SETTINGS = ("fb_filter_mode",)
     _INT_SETTINGS = (
         "channel_mode_idx", "cqt_algorithm_idx", "cqt_window_idx",
         "analysis_compute_precision_idx", "analysis_save_precision_idx",
-        "hop_length", "bins_per_octave",
+        "hop_length", "stft_n_fft", "bins_per_octave",
         "fb_config_mode_idx", "fb_filter_type_idx", "fb_label_mode_idx",
         "fb_hop", "fb_bpo", "fb_banded_width",
         "wavelet_family_idx", "wavelet_order_idx", "wavelet_depth_abs",
@@ -9163,7 +11295,21 @@ class SourcePanel(Panel):
             d[k] = float(getattr(self, k))
         for k in self._BOOL_SETTINGS:
             d[k] = bool(getattr(self, k))
+        for k in self._STR_SETTINGS:
+            d[k] = str(getattr(self, k))
         d["fb_crossovers"] = [float(x) for x in self.fb_crossovers]
+        d["cqt_bpo_schedule"] = (
+            [int(x) for x in self.cqt_bpo_schedule]
+            if self.cqt_bpo_schedule else None
+        )
+        d["cqt_hop_schedule"] = (
+            [int(x) for x in self.cqt_hop_schedule]
+            if self.cqt_hop_schedule else None
+        )
+        d["cqt_filter_scale_schedule"] = (
+            [float(x) for x in self.cqt_filter_scale_schedule]
+            if self.cqt_filter_scale_schedule else None
+        )
         return d
 
     def apply_settings_dict(self, d: dict) -> None:
@@ -9194,14 +11340,1452 @@ class SourcePanel(Panel):
         for k in self._BOOL_SETTINGS:
             if k in d:
                 setattr(self, k, bool(d[k]))
+        if "fb_filter_mode" in d:
+            self.fb_filter_mode = str(d["fb_filter_mode"]) if str(d["fb_filter_mode"]) in ("fir", "iir") else "fir"
         if "fb_crossovers" in d:
             self.fb_crossovers = [float(x) for x in d["fb_crossovers"]]
+        if "cqt_bpo_schedule" in d:
+            raw = d["cqt_bpo_schedule"]
+            self.cqt_bpo_schedule = [int(x) for x in raw] if raw else None
+        if "cqt_hop_schedule" in d:
+            raw = d["cqt_hop_schedule"]
+            self.cqt_hop_schedule = [int(x) for x in raw] if raw else None
+        if "cqt_filter_scale_schedule" in d:
+            raw = d["cqt_filter_scale_schedule"]
+            self.cqt_filter_scale_schedule = [float(x) for x in raw] if raw else None
 
     def _analysis_compute_precision(self) -> str:
         return _ANALYSIS_COMPUTE_PRECISIONS[self.analysis_compute_precision_idx]
 
     def _analysis_save_precision(self) -> str:
         return _ANALYSIS_SAVE_PRECISIONS[self.analysis_save_precision_idx]
+
+    def _reset_analysis_itinerary_defaults(self) -> None:
+        self._analysis_itinerary = []
+        self._add_analysis_module("fft")
+        self._add_analysis_module("fb")
+        self._add_analysis_module("wavelet")
+        self._sync_engine_flags_from_itinerary()
+
+    def _next_analysis_module_key(self, engine: str) -> str:
+        base = str(engine)
+        nums: list[int] = []
+        for item in self._analysis_itinerary:
+            if str(item.get("engine")) != base:
+                continue
+            ikey = str(item.get("key", ""))
+            if ikey.startswith(base + "_"):
+                try:
+                    nums.append(int(ikey.split("_")[-1]))
+                except Exception:
+                    pass
+        return f"{base}_{(max(nums) + 1) if nums else 1}"
+
+    def _add_analysis_module(self, engine: str) -> str:
+        engine = str(engine)
+        key = self._next_analysis_module_key(engine)
+        total_sec = max(0.0, float(self._wav_duration))
+        self._analysis_itinerary.append({
+            "key": key,
+            "engine": engine,
+            "start_sec": float(self.region_start),
+            "end_sec": float(self.region_end),
+            "total_sec": total_sec,
+        })
+        self._module_stack.selected_key = key
+        self._sync_engine_flags_from_itinerary()
+        return key
+
+    def _remove_analysis_module(self, key: str | None) -> None:
+        if not key:
+            return
+        self._analysis_itinerary = [
+            item for item in self._analysis_itinerary
+            if str(item.get("key", "")) != str(key)
+        ]
+        keys = [str(item.get("key", "")) for item in self._analysis_itinerary]
+        if self._module_stack.selected_key not in keys:
+            self._module_stack.selected_key = keys[-1] if keys else None
+        self._sync_engine_flags_from_itinerary()
+
+    def _sync_engine_flags_from_itinerary(self) -> None:
+        engines = {str(item.get("engine", "")) for item in self._analysis_itinerary}
+        self.include_cqt = "fft" in engines
+        self.include_fb = "fb" in engines
+        self.include_wavelet = "wavelet" in engines
+        if not self.include_fb:
+            self.fb_hybrid = False
+
+    def _module_item(self, module_key: str) -> dict[str, Any] | None:
+        for item in self._analysis_itinerary:
+            if str(item.get("key", "")) == str(module_key):
+                return item
+        return None
+
+    def _sync_itinerary_from_engine_toggle(self, engine: str, enabled: bool) -> None:
+        if enabled:
+            if not any(str(item.get("engine", "")) == engine
+                       for item in self._analysis_itinerary):
+                self._add_analysis_module(engine)
+            else:
+                self._sync_engine_flags_from_itinerary()
+            return
+        self._analysis_itinerary = [
+            item for item in self._analysis_itinerary
+            if str(item.get("engine", "")) != engine
+        ]
+        self._sync_engine_flags_from_itinerary()
+
+    def _analysis_module_title(self, engine: str, ordinal: int) -> str:
+        labels = {
+            "fft": "FFT",
+            "fb": "Filterbank",
+            "wavelet": "Wavelet",
+            "signal": "Signal",
+        }
+        return f"{labels.get(engine, engine.title())} {ordinal}"
+
+    def build_analysis_itinerary(self) -> AnalysisItinerary:
+        globals_cfg = AnalysisGlobalSettings(
+            channel_mode_idx=self.channel_mode_idx,
+            analysis_compute_precision_idx=self.analysis_compute_precision_idx,
+            analysis_save_precision_idx=self.analysis_save_precision_idx,
+            cafls_anchor=self.cafls_anchor,
+            hybrid_redundancy_octaves=self.hybrid_redundancy_octaves,
+            resample_engine_idx=self.resample_engine_idx,
+            resample_interp_idx=self.resample_interp_idx,
+            resample_taps_idx=self.resample_taps_idx,
+            resample_precision_idx=self.resample_precision_idx,
+            region_start=self.region_start,
+            region_end=self.region_end,
+        )
+        runs: list[AnalysisRun] = []
+        ordinals: dict[str, int] = {"fft": 0, "fb": 0, "wavelet": 0, "signal": 0}
+        fft_algos = ["librosa", "nsgt", "stft"]
+        for item in self._analysis_itinerary:
+            engine = str(item.get("engine", ""))
+            key = str(item.get("key", ""))
+            ordinals[engine] = ordinals.get(engine, 0) + 1
+            label = self._analysis_module_title(engine, ordinals[engine])
+            time_range = AnalysisTimeRange(
+                start_sec=float(item.get("start_sec", 0.0) or 0.0),
+                end_sec=float(item.get("end_sec", 0.0) or 0.0),
+                total_sec=float(item.get("total_sec", self._wav_duration) or 0.0),
+            ).clamped()
+            if engine == "fft":
+                runs.append(AnalysisRun(
+                    key=key,
+                    engine=engine,
+                    label=label,
+                    time_range=time_range,
+                    settings=FFTAnalysisSettings(
+                        fft_algorithm=fft_algos[
+                            min(self.cqt_algorithm_idx, len(fft_algos) - 1)
+                        ],
+                        cqt_window_idx=self.cqt_window_idx,
+                        hop_length=self.hop_length,
+                        stft_n_fft=self.stft_n_fft,
+                        bins_per_octave=self.bins_per_octave,
+                        cqt_filter_scale=self.cqt_filter_scale,
+                        cqt_fmin=self.cqt_fmin,
+                        cqt_fmax=self.cqt_fmax,
+                        cqt_bpo_schedule=(
+                            list(getattr(self, "cqt_bpo_schedule", None) or [])
+                            or None
+                        ),
+                        cqt_hop_schedule=(
+                            list(getattr(self, "cqt_hop_schedule", None) or [])
+                            or None
+                        ),
+                        cqt_filter_scale_schedule=(
+                            list(getattr(self, "cqt_filter_scale_schedule", None) or [])
+                            or None
+                        ),
+                        prefilter_bp_fmin=(
+                            float(item["prefilter_bp_fmin"])
+                            if item.get("prefilter_bp_fmin") is not None else None
+                        ),
+                        prefilter_bp_fmax=(
+                            float(item["prefilter_bp_fmax"])
+                            if item.get("prefilter_bp_fmax") is not None else None
+                        ),
+                        heterodyne_hz=float(item.get("heterodyne_hz") or 0.0),
+                        postfilter_bp_fmin=(
+                            float(item["postfilter_bp_fmin"])
+                            if item.get("postfilter_bp_fmin") is not None else None
+                        ),
+                        postfilter_bp_fmax=(
+                            float(item["postfilter_bp_fmax"])
+                            if item.get("postfilter_bp_fmax") is not None else None
+                        ),
+                        filter_mode=str(item.get("filter_mode", "fir")),
+                        spline_detrend=(
+                            dict(item["spline_detrend"])
+                            if isinstance(item.get("spline_detrend"), dict) else None
+                        ),
+                    ),
+                ))
+            elif engine == "fb":
+                runs.append(AnalysisRun(
+                    key=key,
+                    engine=engine,
+                    label=label,
+                    time_range=time_range,
+                    settings=FilterbankAnalysisSettings(
+                        fb_filter_type_idx=self.fb_filter_type_idx,
+                        fb_label_mode_idx=self.fb_label_mode_idx,
+                        fb_hop=self.fb_hop,
+                        fb_config_mode_idx=self.fb_config_mode_idx,
+                        fb_bpo=self.fb_bpo,
+                        fb_banded_width=self.fb_banded_width,
+                        fb_crossovers=[float(x) for x in self.fb_crossovers],
+                        fb_hybrid=self.fb_hybrid,
+                        fb_q_norm=self.fb_q_norm,
+                        prefilter_bp_fmin=(
+                            float(item["prefilter_bp_fmin"])
+                            if item.get("prefilter_bp_fmin") is not None else None
+                        ),
+                        prefilter_bp_fmax=(
+                            float(item["prefilter_bp_fmax"])
+                            if item.get("prefilter_bp_fmax") is not None else None
+                        ),
+                        heterodyne_hz=float(item.get("heterodyne_hz") or 0.0),
+                        postfilter_bp_fmin=(
+                            float(item["postfilter_bp_fmin"])
+                            if item.get("postfilter_bp_fmin") is not None else None
+                        ),
+                        postfilter_bp_fmax=(
+                            float(item["postfilter_bp_fmax"])
+                            if item.get("postfilter_bp_fmax") is not None else None
+                        ),
+                        filter_mode=str(item.get("filter_mode", "fir")),
+                        spline_detrend=(
+                            dict(item["spline_detrend"])
+                            if isinstance(item.get("spline_detrend"), dict) else None
+                        ),
+                    ),
+                ))
+            elif engine == "wavelet":
+                runs.append(AnalysisRun(
+                    key=key,
+                    engine=engine,
+                    label=label,
+                    time_range=time_range,
+                    settings=WaveletAnalysisSettings(
+                        wavelet_mode_idx=self.wavelet_mode_idx,
+                        wavelet_family_idx=self.wavelet_family_idx,
+                        wavelet_order_idx=self.wavelet_order_idx,
+                        wavelet_depth_pct=self.wavelet_depth_pct,
+                        wavelet_depth_abs=self.wavelet_depth_abs,
+                        wavelet_depth_mode=self.wavelet_depth_mode,
+                        wavelet_ext_idx=self.wavelet_ext_idx,
+                        cwt_wavelet_idx=self.cwt_wavelet_idx,
+                        cwt_hop_length=self.cwt_hop_length,
+                        cwt_scales_per_octave=self.cwt_scales_per_octave,
+                        cwt_sigma=self.cwt_sigma,
+                        cwt_epsilon=self.cwt_epsilon,
+                        prefilter_bp_fmin=(
+                            float(item["prefilter_bp_fmin"])
+                            if item.get("prefilter_bp_fmin") is not None else None
+                        ),
+                        prefilter_bp_fmax=(
+                            float(item["prefilter_bp_fmax"])
+                            if item.get("prefilter_bp_fmax") is not None else None
+                        ),
+                        heterodyne_hz=float(item.get("heterodyne_hz") or 0.0),
+                        postfilter_bp_fmin=(
+                            float(item["postfilter_bp_fmin"])
+                            if item.get("postfilter_bp_fmin") is not None else None
+                        ),
+                        postfilter_bp_fmax=(
+                            float(item["postfilter_bp_fmax"])
+                            if item.get("postfilter_bp_fmax") is not None else None
+                        ),
+                        filter_mode=str(item.get("filter_mode", "fir")),
+                        spline_detrend=(
+                            dict(item["spline_detrend"])
+                            if isinstance(item.get("spline_detrend"), dict) else None
+                        ),
+                    ),
+                ))
+            elif engine == "signal":
+                # Signal engine: re-uses FFTAnalysisSettings to carry filter/heterodyne
+                # config only — no spectral parameters matter for execution.
+                runs.append(AnalysisRun(
+                    key=key,
+                    engine=engine,
+                    label=label,
+                    time_range=time_range,
+                    settings=FFTAnalysisSettings(
+                        prefilter_bp_fmin=(
+                            float(item["prefilter_bp_fmin"])
+                            if item.get("prefilter_bp_fmin") is not None else None
+                        ),
+                        prefilter_bp_fmax=(
+                            float(item["prefilter_bp_fmax"])
+                            if item.get("prefilter_bp_fmax") is not None else None
+                        ),
+                        heterodyne_hz=float(item.get("heterodyne_hz") or 0.0),
+                        postfilter_bp_fmin=(
+                            float(item["postfilter_bp_fmin"])
+                            if item.get("postfilter_bp_fmin") is not None else None
+                        ),
+                        postfilter_bp_fmax=(
+                            float(item["postfilter_bp_fmax"])
+                            if item.get("postfilter_bp_fmax") is not None else None
+                        ),
+                        filter_mode=str(item.get("filter_mode", "fir")),
+                        spline_detrend=(
+                            dict(item["spline_detrend"])
+                            if isinstance(item.get("spline_detrend"), dict) else None
+                        ),
+                    ),
+                    metadata={
+                        "signal_out_sr_idx": int(item.get("signal_out_sr_idx", 0)),
+                        "signal_save_precision_idx": int(item.get("signal_save_precision_idx", 2)),
+                    },
+                ))
+        return AnalysisItinerary(
+            globals=globals_cfg,
+            runs=runs,
+            metadata={"source": "SourcePanel"},
+        )
+
+    def _step_pow2(self, value: int, direction: int, lo: int, hi: int) -> int:
+        exp = round(math.log2(max(value, 1))) + int(direction)
+        return max(lo, min(hi, 2 ** exp))
+
+    def _cycle_index(self, idx: int, options: list[Any], direction: int) -> int:
+        if not options:
+            return 0
+        return (int(idx) + int(direction)) % len(options)
+
+    def _render_module_body(
+        self,
+        surf: Any,
+        font: Any,
+        body_rect: Any,
+        spec: ModularSubpanelSpec,
+        _item_map: dict[str, tuple[Any, Any]],
+        register_control: Any,
+    ) -> None:
+        engine = str((spec.payload or {}).get("engine", ""))
+        key = str(spec.key)
+        x0 = body_rect.x + 6
+        y = body_rect.y + 6
+        row_h = 20
+
+        def _label(text: str, y0: int) -> None:
+            surf.blit(font.render(text, True, (205, 210, 220)), (x0, y0 + 2))
+
+        def _button(path_suffix: tuple[str, ...], x: int, y0: int, w: int, label: str) -> None:
+            rect = pygame.Rect(x, y0, w, row_h)
+            pygame.draw.rect(surf, (56, 60, 74), rect)
+            pygame.draw.rect(surf, (96, 102, 126), rect, 1)
+            surf.blit(font.render(label, True, (230, 230, 235)), (x + 5, y0 + 2))
+            register_control(("module", key) + path_suffix, rect, kind="button")
+
+        def _module_slider(
+            label: str, val: float, vmin: float, vmax: float,
+            path_name: str, y0: int,
+            fmt: str = "{:.1f}", log: bool = False,
+        ) -> int:
+            btn_w = 20
+            val_w = 38
+            lbl_end = body_rect.x + 56
+            _label(label, y0)
+            # Minus button
+            minus_r = pygame.Rect(lbl_end, y0, btn_w, row_h)
+            pygame.draw.rect(surf, (56, 60, 74), minus_r)
+            pygame.draw.rect(surf, (96, 102, 126), minus_r, 1)
+            surf.blit(font.render("\u2212", True, (230, 230, 235)),
+                      (minus_r.x + (btn_w - font.size("\u2212")[0]) // 2, y0 + 2))
+            register_control(("module", key, path_name, "prev"), minus_r, kind="button")
+            # Track
+            track_x = lbl_end + btn_w + 2
+            track_end = body_rect.right - val_w - 4 - btn_w - 2
+            track_w = max(track_end - track_x, 10)
+            pygame.draw.rect(surf, (44, 46, 56),
+                             pygame.Rect(track_x, y0 + 7, track_w, 6))
+            if log and vmin > 0 and vmax > vmin:
+                frac = (math.log(max(val, vmin)) - math.log(vmin)) / (
+                    math.log(vmax) - math.log(vmin))
+            else:
+                frac = (val - vmin) / max(vmax - vmin, 1e-9)
+            frac = max(0.0, min(1.0, frac))
+            thumb_x = track_x + int(frac * track_w)
+            pygame.draw.rect(surf, (110, 135, 190),
+                             pygame.Rect(thumb_x - 4, y0 + 2, 8, row_h - 4))
+            track_r = pygame.Rect(track_x, y0, track_w, row_h)
+            register_control(("module", key, path_name, "drag"), track_r,
+                             kind="slider", payload=(vmin, vmax, log))
+            # Plus button
+            plus_r = pygame.Rect(track_end + 2, y0, btn_w, row_h)
+            pygame.draw.rect(surf, (56, 60, 74), plus_r)
+            pygame.draw.rect(surf, (96, 102, 126), plus_r, 1)
+            surf.blit(font.render("+", True, (230, 230, 235)),
+                      (plus_r.x + (btn_w - font.size("+")[0]) // 2, y0 + 2))
+            register_control(("module", key, path_name, "next"), plus_r, kind="button")
+            # Value label
+            surf.blit(font.render(fmt.format(val), True, (200, 200, 210)),
+                      (plus_r.right + 4, y0 + 2))
+            return y0 + row_h + 4
+
+        def _stepper(label: str, value: str, path_name: str, y0: int) -> int:
+            _label(label, y0)
+            _button((path_name, "prev"), body_rect.right - 92, y0, 24, "-")
+            val_rect = pygame.Rect(body_rect.right - 66, y0, 42, row_h)
+            pygame.draw.rect(surf, (38, 40, 48), val_rect)
+            pygame.draw.rect(surf, (76, 80, 94), val_rect, 1)
+            surf.blit(font.render(value, True, (220, 220, 220)), (val_rect.x + 4, y0 + 2))
+            _button((path_name, "next"), body_rect.right - 22, y0, 24, "+")
+            return y0 + row_h + 4
+
+        mod_item = self._module_item(key) or {}
+        rng = AnalysisTimeRange(
+            start_sec=float(mod_item.get("start_sec", 0.0) or 0.0),
+            end_sec=float(mod_item.get("end_sec", 0.0) or 0.0),
+            total_sec=float(mod_item.get("total_sec", self._wav_duration) or 0.0),
+        ).clamped()
+        _total = max(rng.total_sec, 1.0)
+
+        def _cycler(label: str, value: str, path_name: str, y0: int) -> int:
+            _label(label, y0)
+            _button((path_name, "prev"), body_rect.right - 152, y0, 24, "<")
+            val_rect = pygame.Rect(body_rect.right - 126, y0, 100, row_h)
+            pygame.draw.rect(surf, (38, 40, 48), val_rect)
+            pygame.draw.rect(surf, (76, 80, 94), val_rect, 1)
+            surf.blit(font.render(value[:14], True, (220, 220, 220)), (val_rect.x + 4, y0 + 2))
+            _button((path_name, "next"), body_rect.right - 24, y0, 24, ">")
+            return y0 + row_h + 4
+
+        _lo, _hi = self._freq_limits()
+        _sr = self._wav_sr if self._wav_sr > 0 else 44100
+        _end_val = (rng.effective_end_sec()
+                    if not (rng.end_sec <= 0.0 and rng.total_sec > 0.0)
+                    else _total)
+
+        def _text_row(text: str, y0: int, color: tuple = (160, 165, 175)) -> int:
+            surf.blit(font.render(text, True, color), (x0, y0 + 2))
+            return y0 + row_h + 2
+
+        def _freq_slider(label: str, val: float, lo: float, hi: float,
+                         path_name: str, y0: int) -> int:
+            note = _freq_to_note_name(val)
+            fmt = _freq_fmt(val) + f" {note}"
+            # Use the fmt just for display via the value label override trick:
+            # _module_slider renders fmt.format(val) — we need a custom display.
+            # Render track/buttons via _module_slider then overdraw the label area.
+            btn_w = 20
+            val_w = 56
+            lbl_end = body_rect.x + 56
+            _label(label, y0)
+            minus_r = pygame.Rect(lbl_end, y0, btn_w, row_h)
+            pygame.draw.rect(surf, (56, 60, 74), minus_r)
+            pygame.draw.rect(surf, (96, 102, 126), minus_r, 1)
+            surf.blit(font.render("\u2212", True, (230, 230, 235)),
+                      (minus_r.x + (btn_w - font.size("\u2212")[0]) // 2, y0 + 2))
+            register_control(("module", key, path_name, "prev"), minus_r, kind="button")
+            track_x = lbl_end + btn_w + 2
+            track_end = body_rect.right - val_w - 4 - btn_w - 2
+            track_w = max(track_end - track_x, 10)
+            pygame.draw.rect(surf, (44, 46, 56),
+                             pygame.Rect(track_x, y0 + 7, track_w, 6))
+            safe_lo = max(lo, 1e-3)
+            safe_hi = max(hi, safe_lo + 1.0)
+            frac = (math.log(max(val, safe_lo)) - math.log(safe_lo)) / (
+                math.log(safe_hi) - math.log(safe_lo))
+            frac = max(0.0, min(1.0, frac))
+            thumb_x = track_x + int(frac * track_w)
+            pygame.draw.rect(surf, (110, 135, 190),
+                             pygame.Rect(thumb_x - 4, y0 + 2, 8, row_h - 4))
+            register_control(("module", key, path_name, "drag"), track_r := pygame.Rect(track_x, y0, track_w, row_h),
+                             kind="slider", payload=(safe_lo, safe_hi, True))
+            plus_r = pygame.Rect(track_end + 2, y0, btn_w, row_h)
+            pygame.draw.rect(surf, (56, 60, 74), plus_r)
+            pygame.draw.rect(surf, (96, 102, 126), plus_r, 1)
+            surf.blit(font.render("+", True, (230, 230, 235)),
+                      (plus_r.x + (btn_w - font.size("+")[0]) // 2, y0 + 2))
+            register_control(("module", key, path_name, "next"), plus_r, kind="button")
+            disp = _freq_fmt(val).format(val) + " " + note
+            surf.blit(font.render(disp, True, (200, 200, 210)),
+                      (plus_r.right + 4, y0 + 2))
+            return y0 + row_h + 4
+
+        # --- Collapsible "Filtering" section (shared by all engine branches) ---
+        # Layout when open:
+        #   ▼ Filtering  [summary]
+        #     Filter mode: FIR (HQ) / IIR (Fast)  (filter_mode_toggle)
+        #     Pre-filter:
+        #       HP cutoff / HP [off]    (pf_fmin)
+        #       LP cutoff / LP [off]    (pf_fmax)
+        #     ─ Shift Hz ─              (heterodyne_hz)
+        #     Spline detrend:           [on / off toggle]
+        #       Smoothing               (spline_detrend_smoothing)  [when on]
+        #       [Subtract / Divide]     (spline_detrend_mode_toggle) [when on]
+        #     Post-filter:
+        #       HP cutoff / HP [off]    (post_fmin)
+        #       LP cutoff / LP [off]    (post_fmax)
+        # State in mod_item["_filter_open"]; floor snap → None = that edge off.
+        # Spline detrend on/off: key absent = off, key present = on with that value.
+
+        def _sub_header(label: str, y0: int) -> int:
+            """Render a dim indented sub-section label (not clickable)."""
+            _r = pygame.Rect(x0 + 4, y0, body_rect.right - x0 - 4, row_h)
+            pygame.draw.rect(surf, (26, 28, 38), _r)
+            surf.blit(font.render(label, True, (100, 115, 140)), (x0 + 8, y0 + 2))
+            return y0 + row_h + 2
+
+        def _filter_section(y0: int, lo_floor: float) -> int:
+            _pre_lo = mod_item.get("prefilter_bp_fmin", None)
+            _pre_hi = mod_item.get("prefilter_bp_fmax", None)
+            _hd_hz  = float(mod_item.get("heterodyne_hz", 0.0) or 0.0)
+            _post_lo = mod_item.get("postfilter_bp_fmin", None)
+            _post_hi = mod_item.get("postfilter_bp_fmax", None)
+            _spln_cfg: dict | None = mod_item.get("spline_detrend") or None
+            _filt_open: bool = bool(mod_item.get("_filter_open", False))
+
+            # --- Header ---
+            _arrow = "\u25bc" if _filt_open else "\u25b6"
+            _parts: list[str] = []
+            if _pre_lo is not None:
+                _parts.append(f"pre\u2191{_freq_fmt(_pre_lo)}")
+            if _pre_hi is not None:
+                _parts.append(f"pre\u2193{_freq_fmt(_pre_hi)}")
+            if abs(_hd_hz) > 0.001:
+                _parts.append(f"{_hd_hz:+.0f}Hz")
+            if _spln_cfg is not None:
+                _tm = _spln_cfg.get("trend_mode", "knots")
+                _tv = (_spln_cfg.get("n_knots", 2) if _tm == "knots" else
+                       f"{_spln_cfg.get('cutoff_hz', 0.5):.2g}Hz" if _tm == "hz" else
+                       f"{_spln_cfg.get('segment_sec', 2.0):.1g}s" if _tm == "seg" else
+                       f"{_spln_cfg.get('smoothing', 1e5):.1e}")
+                _parts.append(f"spln·{_tm}:{_tv}")
+            if _post_lo is not None:
+                _parts.append(f"post\u2191{_freq_fmt(_post_lo)}")
+            if _post_hi is not None:
+                _parts.append(f"post\u2193{_freq_fmt(_post_hi)}")
+            _summ = "  " + ", ".join(_parts) if _parts else "  —"
+            _hdr_rect = pygame.Rect(x0, y0, body_rect.right - x0, row_h)
+            pygame.draw.rect(surf, (32, 36, 46), _hdr_rect)
+            pygame.draw.rect(surf, (55, 60, 75), _hdr_rect, 1)
+            surf.blit(font.render(f" {_arrow} Filtering{_summ}", True, (160, 185, 215)),
+                      (x0 + 2, y0 + 2))
+            register_control(("module", key, "filter_section_toggle", "do"),
+                             _hdr_rect, kind="button")
+            y0 += row_h + 4
+
+            if not _filt_open:
+                return y0
+
+            _nyq = (_sr / 2.0) if _sr > 0 else 24000.0
+
+            # --- Filter mode toggle (FIR / IIR) ---
+            _filter_mode = mod_item.get("filter_mode", "fir")
+            _fm_lbl = "FIR (HQ)" if _filter_mode == "fir" else "IIR (Fast)"
+            _fm_color = (30, 55, 80) if _filter_mode == "fir" else (60, 40, 30)
+            _fm_rect = pygame.Rect(x0, y0, body_rect.right - x0, row_h)
+            pygame.draw.rect(surf, _fm_color, _fm_rect)
+            pygame.draw.rect(surf, (80, 100, 130), _fm_rect, 1)
+            surf.blit(font.render(f" Filter mode: {_fm_lbl}", True, (180, 210, 240)),
+                      (x0 + 4, y0 + 2))
+            register_control(("module", key, "filter_mode_toggle", "do"),
+                             _fm_rect, kind="button")
+            y0 += row_h + 4
+
+            # --- Pre-filter ---
+            y0 = _sub_header("Pre-filter:", y0)
+            _lo_disp = float(_pre_lo) if _pre_lo is not None else lo_floor
+            y0 = _freq_slider(
+                "HP cutoff" if _pre_lo is not None else "HP [off]",
+                _lo_disp, lo_floor, _hi, "pf_fmin", y0)
+            _hi_disp = float(_pre_hi) if _pre_hi is not None else _hi
+            y0 = _freq_slider(
+                "LP cutoff" if _pre_hi is not None else "LP [off]",
+                _hi_disp, lo_floor, _hi, "pf_fmax", y0)
+
+            # --- Heterodyne ---
+            y0 = _module_slider("Shift Hz", _hd_hz, -_nyq, _nyq,
+                                "heterodyne_hz", y0, fmt="{:+.1f}")
+
+            # ── Spline detrender panel ──────────────────────────────────────
+            # Collapsible sub-panel. Header row toggles on/off; arrow toggles
+            # the expanded body. State: mod_item["spline_detrend"] = config dict
+            # or None/absent; mod_item["_spline_open"] = bool.
+            _SPLN_FIT_OPTS    = ["waveform", "rms_env", "hilbert_env",
+                                 "peak_env", "median_env"]
+            _SPLN_FIT_LBLS    = {"waveform": "Waveform",  "rms_env": "RMS env",
+                                 "hilbert_env": "Hilbert", "peak_env": "Peak",
+                                 "median_env": "Median"}
+            _SPLN_TREND_OPTS  = ["knots", "hz", "seg", "smooth"]
+            _SPLN_TREND_LBLS  = {"knots": "Knots", "hz": "Hz",
+                                 "seg": "Sec/knot", "smooth": "Smooth s"}
+            _SPLN_ORDER_OPTS  = [1, 3, 5]
+            _SPLN_ORDER_LBLS  = {1: "1 lin", 3: "3 cubic", 5: "5 quin"}
+            _SPLN_MODE_OPTS   = ["subtract", "divide", "normalize"]
+            _SPLN_MODE_LBLS   = {"subtract": "Subtract", "divide": "Divide",
+                                 "normalize": "Normalize"}
+            _SPLN_EDGE_OPTS   = ["natural", "clamped", "mirror"]
+            _SPLN_EDGE_LBLS   = {"natural": "Natural", "clamped": "Clamped",
+                                 "mirror": "Mirror"}
+
+            _spln_on   = _spln_cfg is not None
+            _spln_open = bool(mod_item.get("_spline_open", False))
+            _sc        = _spln_cfg or {}  # shorthand for cfg dict when on
+
+            # Header row: arrow (expand/collapse) + label + on-indicator
+            _sarrow = "\u25bc" if _spln_open else "\u25b6"
+            _shdr_bg = (24, 46, 32) if _spln_on else (36, 36, 44)
+            _shdr_border = (55, 120, 65) if _spln_on else (65, 65, 80)
+            _shdr_r = pygame.Rect(x0, y0, body_rect.right - x0, row_h)
+            pygame.draw.rect(surf, _shdr_bg, _shdr_r)
+            pygame.draw.rect(surf, _shdr_border, _shdr_r, 1)
+            _on_dot = "\u25cf " if _spln_on else "\u25cb "  # filled/empty circle
+            _shdr_txt = f" {_sarrow} {_on_dot}Spline detrend"
+            surf.blit(font.render(_shdr_txt, True,
+                                  (150, 215, 160) if _spln_on else (120, 125, 140)),
+                      (x0 + 2, y0 + 2))
+            # Right side: toggle on/off button
+            _stog_w = 36
+            _stog_r = pygame.Rect(body_rect.right - _stog_w - 2, y0 + 1,
+                                  _stog_w, row_h - 2)
+            pygame.draw.rect(surf, (40, 80, 50) if _spln_on else (60, 40, 40), _stog_r)
+            pygame.draw.rect(surf, (80, 160, 100) if _spln_on else (100, 70, 70), _stog_r, 1)
+            surf.blit(font.render("ON" if _spln_on else "OFF", True,
+                                  (130, 220, 150) if _spln_on else (200, 120, 120)),
+                      (_stog_r.x + 4, y0 + 2))
+            register_control(("module", key, "spline_enable_toggle", "do"),
+                             _stog_r, kind="button")
+            register_control(("module", key, "spline_expand_toggle", "do"),
+                             pygame.Rect(x0, y0, body_rect.right - x0 - _stog_w - 4, row_h),
+                             kind="button")
+            y0 += row_h + 3
+
+            if _spln_open and _spln_on:
+                # ── Fit target cycler ─────────────────────────────────────
+                _ft = str(_sc.get("fit_target", "waveform"))
+                y0 = _cycler("Fit", _SPLN_FIT_LBLS.get(_ft, _ft),
+                             "spln_fit_target", y0)
+
+                # ── Trend mode cycler ─────────────────────────────────────
+                _tm = str(_sc.get("trend_mode", "knots"))
+                y0 = _cycler("Trend", _SPLN_TREND_LBLS.get(_tm, _tm),
+                             "spln_trend_mode", y0)
+
+                # ── Trend value slider (depends on current trend_mode) ────
+                if _tm == "knots":
+                    _nk = int(_sc.get("n_knots", 2))
+                    y0 = _module_slider("  Knots", float(_nk), 1.0, 64.0,
+                                        "spln_n_knots", y0, fmt="{:.0f}")
+                elif _tm == "hz":
+                    _hz = float(_sc.get("cutoff_hz", 0.5))
+                    y0 = _module_slider("  Hz cut", _hz, 0.001, 50.0,
+                                        "spln_cutoff_hz", y0, fmt="{:.4f}", log=True)
+                elif _tm == "seg":
+                    _seg = float(_sc.get("segment_sec", 2.0))
+                    y0 = _module_slider("  Sec/knot", _seg, 0.05, 300.0,
+                                        "spln_segment_sec", y0, fmt="{:.2f}", log=True)
+                else:  # smooth
+                    _ss = float(_sc.get("smoothing", 1e5))
+                    y0 = _module_slider("  Smooth s", _ss, 0.1, 1e9,
+                                        "spln_smoothing", y0, fmt="{:.2e}", log=True)
+
+                # ── Polynomial order cycler ───────────────────────────────
+                _ord = int(_sc.get("spline_order", 3))
+                y0 = _cycler("Order", _SPLN_ORDER_LBLS.get(_ord, str(_ord)),
+                             "spln_order", y0)
+
+                # ── Application mode cycler ───────────────────────────────
+                _mode = str(_sc.get("mode", "subtract"))
+                y0 = _cycler("Mode", _SPLN_MODE_LBLS.get(_mode, _mode),
+                             "spln_mode", y0)
+
+                # ── Edge handling cycler ──────────────────────────────────
+                _edge = str(_sc.get("edge", "natural"))
+                y0 = _cycler("Edge", _SPLN_EDGE_LBLS.get(_edge, _edge),
+                             "spln_edge", y0)
+
+                # ── Robust IRLS toggle ────────────────────────────────────
+                _rob = bool(_sc.get("robust", False))
+                _rob_bg = (30, 52, 70) if _rob else (42, 42, 52)
+                _rob_r = pygame.Rect(x0, y0, body_rect.right - x0, row_h)
+                pygame.draw.rect(surf, _rob_bg, _rob_r)
+                pygame.draw.rect(surf, (70, 110, 160) if _rob else (70, 70, 85), _rob_r, 1)
+                surf.blit(font.render(
+                    f" Robust IRLS: {'on' if _rob else 'off'}", True,
+                    (150, 200, 240) if _rob else (130, 135, 150)),
+                    (x0 + 4, y0 + 2))
+                register_control(("module", key, "spln_robust_toggle", "do"),
+                                 _rob_r, kind="button")
+                y0 += row_h + 3
+                if _rob:
+                    _ri = int(_sc.get("robust_iters", 4))
+                    y0 = _module_slider("  IRLS iters", float(_ri), 1.0, 12.0,
+                                        "spln_robust_iters", y0, fmt="{:.0f}")
+
+                # ── Gain compensation toggle ──────────────────────────────
+                _gc = bool(_sc.get("gain_comp", False))
+                _gc_bg = (50, 38, 62) if _gc else (42, 42, 52)
+                _gc_r = pygame.Rect(x0, y0, body_rect.right - x0, row_h)
+                pygame.draw.rect(surf, _gc_bg, _gc_r)
+                pygame.draw.rect(surf, (120, 80, 160) if _gc else (70, 70, 85), _gc_r, 1)
+                surf.blit(font.render(
+                    f" Gain comp: {'on' if _gc else 'off'}", True,
+                    (200, 160, 240) if _gc else (130, 135, 150)),
+                    (x0 + 4, y0 + 2))
+                register_control(("module", key, "spln_gain_comp_toggle", "do"),
+                                 _gc_r, kind="button")
+                y0 += row_h + 3
+
+                # ── Blend slider ──────────────────────────────────────────
+                _blend = float(_sc.get("blend", 1.0))
+                y0 = _module_slider("Blend", _blend, 0.0, 1.0,
+                                    "spln_blend", y0, fmt="{:.2f}")
+
+                # ── Soft floor slider (divide/normalize modes) ────────────
+                if _mode in ("divide", "normalize"):
+                    _sf = float(_sc.get("soft_floor", 1e-6))
+                    y0 = _module_slider("Soft floor", _sf, 1e-12, 0.1,
+                                        "spln_soft_floor", y0, fmt="{:.1e}", log=True)
+
+                # ── Envelope window (envelope fit targets) ────────────────
+                if _ft not in ("waveform", "hilbert_env"):
+                    _ew = float(_sc.get("env_window_ms", 50.0))
+                    y0 = _module_slider("Env win ms", _ew, 2.0, 2000.0,
+                                        "spln_env_win", y0, fmt="{:.0f}", log=True)
+
+            # --- Post-filter ---
+            y0 = _sub_header("Post-filter:", y0)
+            _plo_disp = float(_post_lo) if _post_lo is not None else lo_floor
+            y0 = _freq_slider(
+                "HP cutoff" if _post_lo is not None else "HP [off]",
+                _plo_disp, lo_floor, _hi, "post_fmin", y0)
+            _phi_disp = float(_post_hi) if _post_hi is not None else _hi
+            y0 = _freq_slider(
+                "LP cutoff" if _post_hi is not None else "LP [off]",
+                _phi_disp, lo_floor, _hi, "post_fmax", y0)
+
+            return y0
+
+        if engine == "fft":
+            _algo = _CQT_ALGORITHMS[self.cqt_algorithm_idx]
+            _is_nsgt = _algo == "nsgt"
+            _is_stft = _algo == "stft"
+            _cqt_win = _CQT_WINDOWS[self.cqt_window_idx]
+            y = _cycler("Algorithm", _CQT_ALGORITHM_LABELS[self.cqt_algorithm_idx], "algorithm", y)
+            y = _cycler("Window", _cqt_win, "window", y)
+            if not _is_nsgt:
+                y = _module_slider("Hop", float(self.hop_length), 64.0, 2048.0,
+                                   "hop", y, fmt="{:.0f}", log=True)
+            if _is_stft:
+                y = _module_slider("NFFT", float(self.stft_n_fft), 256.0, 131072.0,
+                                   "stft_n_fft", y, fmt="{:.0f}", log=True)
+            else:
+                y = _module_slider("BPO", float(self.bins_per_octave), 12.0, 1200.0,
+                                   "bpo", y, fmt="{:.0f}", log=True)
+            if not _is_nsgt and not _is_stft:
+                _fs_hi = max(4.0, self.cqt_filter_scale)
+                y = _module_slider("Q scale", self.cqt_filter_scale, 0.1, _fs_hi,
+                                   "cqt_filter_scale", y, fmt="{:.2f}")
+            _eff_fmin = max(self.cqt_fmin, self.cafls_anchor)
+            _fmin_lo = max(_lo, self.cafls_anchor)
+            y = _freq_slider("fMin", _eff_fmin, _fmin_lo, _hi, "fmin", y)
+            y = _freq_slider("fMax", self.cqt_fmax, _lo, _hi, "fmax", y)
+            y = _module_slider("Redund±", self.hybrid_redundancy_octaves, 0.0, 8.0,
+                               "hybrid_redundancy", y, fmt="{:.2f}")
+            y = _filter_section(y, _fmin_lo)
+            y = _module_slider("Start", rng.start_sec, 0.0, _total,
+                               "range_start", y, fmt="{:.2f}")
+            y = _module_slider("End", _end_val, 0.0, _total,
+                               "range_end", y, fmt="{:.2f}")
+
+        elif engine == "fb":
+            _fb_auto = _FB_CONFIG_MODES[self.fb_config_mode_idx] != "Manual"
+            _fb_mode_lbl = "FIR (HQ)" if self.fb_filter_mode == "fir" else "IIR (Fast)"
+            y = _cycler("Filter", _FILTER_TYPES[self.fb_filter_type_idx], "filter_type", y)
+            y = _cycler("FilterMode", _fb_mode_lbl, "fb_filter_mode", y)
+            y = _cycler("Config", _FB_CONFIG_MODES[self.fb_config_mode_idx], "fb_config_mode", y)
+            y = _cycler("Labels", _FB_LABEL_MODES[self.fb_label_mode_idx], "fb_label_mode", y)
+            hybrid_label = "On" if self.fb_hybrid else "Off"
+            y = _cycler("Hybrid", hybrid_label, "hybrid_toggle", y)
+            _fb_bpo_hi = max(48.0, float(self.fb_bpo))
+            y = _module_slider("BPO", float(self.fb_bpo), 1.0, _fb_bpo_hi,
+                               "fb_bpo", y, fmt="{:.0f}")
+            y = _module_slider("Banded±", float(self.fb_banded_width), 1.0, 12.0,
+                               "fb_banded_width", y, fmt="{:.0f}")
+            y = _module_slider("Env hop", float(self.fb_hop), 1.0, 2048.0,
+                               "fb_hop", y, fmt="{:.0f}", log=True)
+            if not _fb_auto:
+                # Manual crossover sliders
+                _xo_lo, _xo_hi = _lo, _hi
+                for _xi, _xo in enumerate(self.fb_crossovers):
+                    y = _freq_slider(f"X{_xi+1}", _xo, _xo_lo, _xo_hi,
+                                     f"xo_{_xi}", y)
+                # Add / Remove crossover buttons
+                _btn_half = (body_rect.width - 12) // 2
+                _add_r = pygame.Rect(body_rect.x + 4, y, _btn_half, row_h)
+                _rem_r = pygame.Rect(body_rect.x + 4 + _btn_half + 4, y, _btn_half, row_h)
+                pygame.draw.rect(surf, (40, 70, 40), _add_r)
+                pygame.draw.rect(surf, (70, 100, 70), _add_r, 1)
+                _at = font.render("+ Add XO", True, (160, 230, 160))
+                surf.blit(_at, (_add_r.x + _add_r.w // 2 - _at.get_width() // 2, y + 2))
+                register_control(("module", key, "fb_add_xo", "do"), _add_r, kind="button")
+                pygame.draw.rect(surf, (70, 40, 40), _rem_r)
+                pygame.draw.rect(surf, (100, 70, 70), _rem_r, 1)
+                _rt = font.render("- Remove", True, (230, 160, 160))
+                surf.blit(_rt, (_rem_r.x + _rem_r.w // 2 - _rt.get_width() // 2, y + 2))
+                register_control(("module", key, "fb_rem_xo", "do"), _rem_r, kind="button")
+                y += row_h + 4
+            # Band preview (up to 6 lines)
+            try:
+                if _fb_auto:
+                    _bands = FilterBankDecomposition.bands_from_cafls(
+                        self.cafls_anchor, self.fb_bpo,
+                        self.fb_banded_width, _sr)
+                else:
+                    _bands = FilterBankDecomposition.bands_from_crossovers(
+                        self.fb_crossovers, _sr)
+            except Exception:
+                _bands = []
+            _band_lbl_mode = _FB_LABEL_MODES[self.fb_label_mode_idx]
+            _max_show = 6
+            for _bi, _band in enumerate(_bands[:_max_show]):
+                _bl = (_band.mid_label(_sr) if _band_lbl_mode == "Mid+BW"
+                       else _band.auto_label(_sr))
+                surf.blit(font.render(f"  {_bi}: {_bl}", True, (140, 170, 140)),
+                          (x0, y + 2))
+                y += row_h + 2
+            if len(_bands) > _max_show:
+                surf.blit(font.render(f"  +{len(_bands) - _max_show} more",
+                                      True, (100, 120, 100)), (x0, y + 2))
+                y += row_h + 2
+            elif not _bands:
+                y = _text_row("  (no bands defined)", y, (100, 100, 100))
+            y = _filter_section(y, _lo)
+            y = _module_slider("Start", rng.start_sec, 0.0, _total,
+                               "range_start", y, fmt="{:.2f}")
+            y = _module_slider("End", _end_val, 0.0, _total,
+                               "range_end", y, fmt="{:.2f}")
+
+        elif engine == "wavelet":
+            y = _cycler("Mode", _WAVELET_MODES[self.wavelet_mode_idx], "wavelet_mode", y)
+            if self.wavelet_mode_idx == 1:
+                # CWT
+                y = _cycler("Wavelet", _CWT_WAVELET_TYPES[self.cwt_wavelet_idx], "cwt_wavelet", y)
+                y = _module_slider("Hop", float(self.cwt_hop_length), 1.0, 2048.0,
+                                   "cwt_hop", y, fmt="{:.0f}", log=True)
+                _cwt_spo_hi = max(120.0, float(self.cwt_scales_per_octave))
+                y = _module_slider("Scales/oct", float(self.cwt_scales_per_octave),
+                                   1.0, _cwt_spo_hi, "cwt_spo", y, fmt="{:.0f}")
+                if _CWT_WAVELET_TYPES[self.cwt_wavelet_idx] == "morlet":
+                    _sig_hi = max(30.0, self.cwt_sigma)
+                    y = _module_slider("\u03c3", self.cwt_sigma, 1.0, _sig_hi,
+                                       "cwt_sigma", y, fmt="{:.1f}")
+                y = _module_slider("\u03b5", self.cwt_epsilon, 0.0, 1.0,
+                                   "cwt_epsilon", y, fmt="{:.3f}")
+                _cwt_hi = self.cafls_anchor
+                y = _text_row(f"  {CAFLS_SEISMIC_FLOOR:.2f}\u2013{_cwt_hi:.2f} Hz", y, (120, 150, 140))
+            else:
+                # DWT
+                _fam = _WAVELET_FAMILIES[self.wavelet_family_idx]
+                y = _cycler("Family", _fam, "wavelet_family", y)
+                _orders = _WAVELET_ORDERS.get(_fam, ["\u2014"])
+                if _orders != ["\u2014"]:
+                    _safe_ord = min(self.wavelet_order_idx, len(_orders) - 1)
+                    y = _cycler("Order", _orders[_safe_ord], "wv_order", y)
+                _depth_modes = ["% of max", "Absolute"]
+                y = _cycler("Depth", _depth_modes[self.wavelet_depth_mode], "wv_depth_mode", y)
+                _max_lev = float(max(self._wavelet_max_level(), 1))
+                _act_lev = self._wavelet_level_from_pct()
+                if self.wavelet_depth_mode == 0:
+                    y = _module_slider("Depth%", self.wavelet_depth_pct, 1.0, 100.0,
+                                       "wv_depth_pct", y, fmt="{:.0f}")
+                else:
+                    y = _module_slider("Depth", float(self.wavelet_depth_abs),
+                                       1.0, _max_lev, "wavelet_depth", y, fmt="{:.0f}")
+                y = _text_row(f"  \u2192 level {_act_lev} / {int(_max_lev)}", y, (140, 160, 180))
+                _exts = _WAVELET_EXTENSIONS
+                y = _cycler("Ext", _exts[min(self.wavelet_ext_idx, len(_exts) - 1)], "wv_ext", y)
+            y = _filter_section(y, _lo)
+            y = _module_slider("Start", rng.start_sec, 0.0, _total,
+                               "range_start", y, fmt="{:.2f}")
+            y = _module_slider("End", _end_val, 0.0, _total,
+                               "range_end", y, fmt="{:.2f}")
+
+        elif engine == "signal":
+            # Signal engine: filter + heterodyne only — no spectral transform.
+            # Output is time-domain WAV for rapid filter audition.
+            y = _text_row("  Filter-chain  →  time signal", y, (170, 140, 200))
+            y = _filter_section(y, _lo)
+            # Output sample-rate override
+            _sig_sr_idx = int(mod_item.get("signal_out_sr_idx", 0))
+            _sig_sr_idx = max(0, min(_sig_sr_idx, len(_SIGNAL_OUT_SR_LABELS) - 1))
+            y = _cycler("Out SR", _SIGNAL_OUT_SR_LABELS[_sig_sr_idx], "signal_out_sr_idx", y)
+            # Save precision override
+            _sig_prec_idx = int(mod_item.get("signal_save_precision_idx", 2))
+            _sig_prec_idx = max(0, min(_sig_prec_idx, len(_SIGNAL_SAVE_PRECISIONS) - 1))
+            y = _cycler("Save as", _SIGNAL_SAVE_PRECISIONS[_sig_prec_idx], "signal_save_precision_idx", y)
+            y = _module_slider("Start", rng.start_sec, 0.0, _total,
+                               "range_start", y, fmt="{:.2f}")
+            y = _module_slider("End", _end_val, 0.0, _total,
+                               "range_end", y, fmt="{:.2f}")
+
+    def _build_analysis_module_specs(self) -> list[ModularSubpanelSpec]:
+        _ROW = 24   # pixels per slider/cycler row (row_h=20 + 4 gap)
+        _TXT = 22   # pixels per text-only info row
+        _PAD = 6    # top padding inside body
+
+        def _fft_height() -> int:
+            _is_nsgt = _CQT_ALGORITHMS[self.cqt_algorithm_idx] == "nsgt"
+            rows = 2  # Algorithm, Window
+            if not _is_nsgt:
+                rows += 2  # Hop, Q scale
+            rows += 3  # BPO, fMin, fMax
+            rows += 1  # Redund±
+            _mi = self._module_item(key)
+            rows += 1  # Filtering header
+            if _mi and _mi.get("_filter_open"):
+                rows += 7  # Pre sub-header + 2 pre sliders + shift hz + Post sub-header + 2 post sliders
+            rows += 2  # Start, End
+            return _PAD + rows * _ROW
+
+        def _fb_height() -> int:
+            _fb_auto = _FB_CONFIG_MODES[self.fb_config_mode_idx] != "Manual"
+            _sr = self._wav_sr if self._wav_sr > 0 else 44100
+            rows = 7  # Filter, Config, Labels, Hybrid, BPO, Banded±, Env hop
+            if not _fb_auto:
+                rows += len(self.fb_crossovers)  # XO sliders
+                rows += 1  # Add/Remove button row
+            try:
+                if _fb_auto:
+                    _bands = FilterBankDecomposition.bands_from_cafls(
+                        self.cafls_anchor, self.fb_bpo, self.fb_banded_width, _sr)
+                else:
+                    _bands = FilterBankDecomposition.bands_from_crossovers(
+                        self.fb_crossovers, _sr)
+            except Exception:
+                _bands = []
+            _shown = min(6, len(_bands))
+            _mi = self._module_item(key)
+            rows += 1  # Filtering header
+            if _mi and _mi.get("_filter_open"):
+                rows += 7  # Pre sub-header + 2 pre sliders + shift hz + Post sub-header + 2 post sliders
+            rows += 2  # Start, End
+            return _PAD + rows * _ROW + (_shown + (1 if len(_bands) > 6 else 0)) * _TXT
+
+        def _wv_height() -> int:
+            rows = 1  # Mode
+            if self.wavelet_mode_idx == 1:
+                # CWT
+                rows += 3  # Wavelet, Hop, Scales/oct
+                if _CWT_WAVELET_TYPES[self.cwt_wavelet_idx] == "morlet":
+                    rows += 1  # sigma
+                rows += 1  # epsilon
+                _mi = self._module_item(key)
+                rows += 1  # Filtering header
+                if _mi and _mi.get("_filter_open"):
+                    rows += 7  # Pre sub-header + 2 pre sliders + shift hz + Post sub-header + 2 post sliders
+                rows += 2  # Start, End
+                return _PAD + rows * _ROW + _TXT  # + info text line
+            else:
+                # DWT
+                _fam = _WAVELET_FAMILIES[self.wavelet_family_idx]
+                rows += 1  # Family
+                if _WAVELET_ORDERS.get(_fam, ["\u2014"]) != ["\u2014"]:
+                    rows += 1  # Order
+                rows += 2  # Depth mode, depth slider
+                rows += 1  # Ext
+                _mi = self._module_item(key)
+                rows += 1  # Filtering header
+                if _mi and _mi.get("_filter_open"):
+                    rows += 7  # Pre sub-header + 2 pre sliders + shift hz + Post sub-header + 2 post sliders
+                rows += 2  # Start, End
+                return _PAD + rows * _ROW + _TXT  # + level info text
+
+        specs: list[ModularSubpanelSpec] = []
+        ordinals: dict[str, int] = {"fft": 0, "fb": 0, "wavelet": 0, "signal": 0}
+        for item in self._analysis_itinerary:
+            engine = str(item.get("engine", ""))
+            ordinals[engine] = ordinals.get(engine, 0) + 1
+            key = str(item.get("key", self._next_analysis_module_key(engine)))
+            if engine == "fft":
+                specs.append(ModularSubpanelSpec(
+                    key=key,
+                    title=self._analysis_module_title(engine, ordinals[engine]),
+                    summary_lines=[],
+                    expanded=True,
+                    enabled=True,
+                    accent_rgb=(110, 150, 210),
+                    body_height=_fft_height(),
+                    render_body=self._render_module_body,
+                    payload=item,
+                ))
+            elif engine == "fb":
+                specs.append(ModularSubpanelSpec(
+                    key=key,
+                    title=self._analysis_module_title(engine, ordinals[engine]),
+                    summary_lines=[],
+                    expanded=True,
+                    enabled=True,
+                    accent_rgb=(140, 185, 120),
+                    body_height=_fb_height(),
+                    render_body=self._render_module_body,
+                    payload=item,
+                ))
+            elif engine == "wavelet":
+                specs.append(ModularSubpanelSpec(
+                    key=key,
+                    title=self._analysis_module_title(engine, ordinals[engine]),
+                    summary_lines=[],
+                    expanded=True,
+                    enabled=True,
+                    accent_rgb=(198, 148, 98),
+                    body_height=_wv_height(),
+                    render_body=self._render_module_body,
+                    payload=item,
+                ))
+            elif engine == "signal":
+                _mi = self._module_item(key)
+                _sig_rows = 6  # info text + filter header + Out SR + Save as + Start + End
+                if _mi and _mi.get("_filter_open"):
+                    _sig_rows += 7
+                _sig_h = _PAD + _sig_rows * _ROW + _TXT
+                specs.append(ModularSubpanelSpec(
+                    key=key,
+                    title=self._analysis_module_title(engine, ordinals[engine]),
+                    summary_lines=[],
+                    expanded=True,
+                    enabled=True,
+                    accent_rgb=(170, 120, 200),
+                    body_height=_sig_h,
+                    render_body=self._render_module_body,
+                    payload=item,
+                ))
+        return specs
+
+    def _handle_module_control(self, path: tuple[str, ...]) -> bool:
+        if len(path) < 4 or path[0] != "module":
+            return False
+        module_key = path[1]
+        control = path[2]
+        action = path[3]
+        mod_item = self._module_item(module_key)
+        if mod_item is None:
+            return False
+
+        delta = -1 if action == "prev" else 1
+        if control == "algorithm":
+            self.cqt_algorithm_idx = self._cycle_index(
+                self.cqt_algorithm_idx, _CQT_ALGORITHM_LABELS, delta)
+            return True
+        if control == "window":
+            self.cqt_window_idx = self._cycle_index(
+                self.cqt_window_idx, _CQT_WINDOWS, delta)
+            return True
+        if control == "hop":
+            self.hop_length = self._step_pow2(self.hop_length, delta, 64, 2048)
+            return True
+        if control == "stft_n_fft":
+            self.stft_n_fft = self._step_pow2(self.stft_n_fft, delta, 256, 131072)
+            return True
+        if control == "bpo":
+            idx = (_BPO_SNAPS.index(self.bins_per_octave)
+                   if self.bins_per_octave in _BPO_SNAPS else 0)
+            idx = max(0, min(len(_BPO_SNAPS) - 1, idx + delta))
+            self.bins_per_octave = _BPO_SNAPS[idx]
+            return True
+        if control == "filter_type":
+            self.fb_filter_type_idx = self._cycle_index(
+                self.fb_filter_type_idx, _FILTER_TYPES, delta)
+            return True
+        if control == "fb_filter_mode":
+            self.fb_filter_mode = "iir" if self.fb_filter_mode == "fir" else "fir"
+            return True
+        if control == "fb_hop":
+            self.fb_hop = self._step_pow2(max(self.fb_hop, 1), delta, 1, 2048)
+            return True
+        if control == "hybrid_toggle":
+            self.fb_hybrid = not self.fb_hybrid
+            return True
+        if control == "wavelet_mode":
+            self.wavelet_mode_idx = self._cycle_index(
+                self.wavelet_mode_idx, _WAVELET_MODES, delta)
+            return True
+        if control == "cwt_wavelet":
+            self.cwt_wavelet_idx = self._cycle_index(
+                self.cwt_wavelet_idx, _CWT_WAVELET_TYPES, delta)
+            return True
+        if control == "cwt_hop":
+            self.cwt_hop_length = max(1, min(2048, self.cwt_hop_length + delta))
+            return True
+        if control == "wavelet_family":
+            self.wavelet_family_idx = self._cycle_index(
+                self.wavelet_family_idx, _WAVELET_FAMILIES, delta)
+            self.wavelet_order_idx = 0
+            return True
+        if control == "wavelet_depth":
+            max_lev = self._wavelet_max_level()
+            self.wavelet_depth_abs = max(1, min(max_lev, self.wavelet_depth_abs + delta))
+            self.wavelet_depth_mode = 1
+            return True
+        if control == "range_start":
+            total = max(0.0, float(self._wav_duration))
+            cur = float(mod_item.get("start_sec", 0.0) or 0.0)
+            end = float(mod_item.get("end_sec", 0.0) or 0.0)
+            new_val = max(0.0, min(total if total > 0 else cur + 0.5, cur + 0.5 * delta))
+            mod_item["start_sec"] = round(new_val, 2)
+            if end > 0.0 and end < new_val:
+                mod_item["end_sec"] = round(new_val, 2)
+            mod_item["total_sec"] = total
+            return True
+        # --- prefilter + heterodyne per-item controls ---
+        if control == "pf_fmin":
+            _sr = float(self._wav_sr) if self._wav_sr > 0 else 44100.0
+            _nyq = _sr / 2.0
+            _lo, _ = self._freq_limits()
+            cur = float(mod_item.get("prefilter_bp_fmin") or _lo)
+            new_val = max(_lo, min(_nyq * 0.99, cur * (2.0 ** (delta * 0.5)) if cur > _lo * 1.05 else _lo * 1.5))
+            if new_val <= _lo * 1.01:
+                # At the floor — lowpass-only mode (no highpass edge)
+                mod_item.pop("prefilter_bp_fmin", None)
+            else:
+                mod_item["prefilter_bp_fmin"] = round(new_val, 4)
+            return True
+        if control == "pf_fmax":
+            _sr = float(self._wav_sr) if self._wav_sr > 0 else 44100.0
+            _nyq = _sr / 2.0
+            _, _hi_lim = self._freq_limits()
+            cur = float(mod_item.get("prefilter_bp_fmax") or _hi_lim)
+            new_val = max(0.1, min(_nyq * 0.999, cur * (2.0 ** (delta * 0.5))))
+            if new_val >= _hi_lim * 0.999:
+                mod_item.pop("prefilter_bp_fmax", None)
+            else:
+                mod_item["prefilter_bp_fmax"] = round(new_val, 4)
+            return True
+        if control == "heterodyne_hz":
+            _sr = float(self._wav_sr) if self._wav_sr > 0 else 44100.0
+            _nyq = _sr / 2.0
+            cur = float(mod_item.get("heterodyne_hz") or 0.0)
+            # Step size scales with magnitude to allow fine and coarse adjustment.
+            step = max(0.01, abs(cur) * 0.1) if cur != 0.0 else 1.0
+            new_val = max(-_nyq, min(_nyq, cur + delta * step))
+            # Snap to zero when close (double-click resets)
+            if abs(new_val) < 0.001:
+                new_val = 0.0
+            mod_item["heterodyne_hz"] = round(new_val, 4)
+            return True
+        if control == "post_fmin":
+            _sr = float(self._wav_sr) if self._wav_sr > 0 else 44100.0
+            _nyq = _sr / 2.0
+            _lo, _ = self._freq_limits()
+            cur = float(mod_item.get("postfilter_bp_fmin") or _lo)
+            new_val = max(_lo, min(_nyq * 0.99, cur * (2.0 ** (delta * 0.5)) if cur > _lo * 1.05 else _lo * 1.5))
+            if new_val <= _lo * 1.01:
+                mod_item.pop("postfilter_bp_fmin", None)
+            else:
+                mod_item["postfilter_bp_fmin"] = round(new_val, 4)
+            return True
+        if control == "post_fmax":
+            _sr = float(self._wav_sr) if self._wav_sr > 0 else 44100.0
+            _nyq = _sr / 2.0
+            _, _hi_lim = self._freq_limits()
+            cur = float(mod_item.get("postfilter_bp_fmax") or _hi_lim)
+            new_val = max(0.1, min(_nyq * 0.999, cur * (2.0 ** (delta * 0.5))))
+            if new_val >= _hi_lim * 0.999:
+                mod_item.pop("postfilter_bp_fmax", None)
+            else:
+                mod_item["postfilter_bp_fmax"] = round(new_val, 4)
+            return True
+        if control == "range_end":
+            total = max(0.0, float(self._wav_duration))
+            cur = float(mod_item.get("end_sec", 0.0) or 0.0)
+            start = float(mod_item.get("start_sec", 0.0) or 0.0)
+            if cur <= 0.0:
+                cur = total
+            new_val = cur + 0.5 * delta
+            if total > 0.0 and new_val >= total:
+                mod_item["end_sec"] = 0.0
+            else:
+                mod_item["end_sec"] = round(max(start, max(0.0, new_val)), 2)
+            mod_item["total_sec"] = total
+            return True
+        # --- cycler controls ---
+        if control == "fb_config_mode":
+            self.fb_config_mode_idx = self._cycle_index(
+                self.fb_config_mode_idx, _FB_CONFIG_MODES, delta)
+            return True
+        if control == "fb_label_mode":
+            self.fb_label_mode_idx = self._cycle_index(
+                self.fb_label_mode_idx, _FB_LABEL_MODES, delta)
+            return True
+        if control == "wv_order":
+            _fam = _WAVELET_FAMILIES[self.wavelet_family_idx]
+            _orders = _WAVELET_ORDERS.get(_fam, ["—"])
+            self.wavelet_order_idx = self._cycle_index(
+                self.wavelet_order_idx, _orders, delta)
+            return True
+        if control == "wv_ext":
+            self.wavelet_ext_idx = self._cycle_index(
+                self.wavelet_ext_idx, _WAVELET_EXTENSIONS, delta)
+            return True
+        if control == "wv_depth_mode":
+            # 0 = percent, 1 = absolute
+            self.wavelet_depth_mode = 1 - self.wavelet_depth_mode
+            return True
+        # --- add / remove crossover ---
+        if control == "filter_section_toggle" and action == "do":
+            mod_item["_filter_open"] = not bool(mod_item.get("_filter_open", False))
+            return True
+        if control == "filter_mode_toggle" and action == "do":
+            cur = mod_item.get("filter_mode", "fir")
+            mod_item["filter_mode"] = "iir" if cur == "fir" else "fir"
+            return True
+        # ── Spline detrender controls ─────────────────────────────────────
+        _SPLN_DEFAULTS = {
+            "fit_target": "waveform", "trend_mode": "knots",
+            "n_knots": 2, "cutoff_hz": 0.5, "segment_sec": 2.0,
+            "smoothing": 1e5, "spline_order": 3, "mode": "subtract",
+            "edge": "natural", "robust": False, "robust_iters": 4,
+            "robust_c": 4.685, "gain_comp": False, "blend": 1.0,
+            "soft_floor": 1e-6, "env_window_ms": 50.0, "env_hop_frac": 0.25,
+            "max_fit_points": 8192,
+        }
+        if control == "spline_enable_toggle" and action == "do":
+            if mod_item.get("spline_detrend") is None:
+                mod_item["spline_detrend"] = dict(_SPLN_DEFAULTS)
+                mod_item["_spline_open"] = True
+            else:
+                mod_item["spline_detrend"] = None
+            return True
+        if control == "spline_expand_toggle" and action == "do":
+            # Only expand/collapse when already on; clicking the header while
+            # off does nothing extra (use the ON button to enable).
+            if mod_item.get("spline_detrend") is not None:
+                mod_item["_spline_open"] = not bool(mod_item.get("_spline_open", False))
+            return True
+        # ── Cycler controls ───────────────────────────────────────────────
+        def _spln_cycle(field: str, opts: list, delta: int) -> bool:
+            _cfg = mod_item.get("spline_detrend")
+            if _cfg is None:
+                return False
+            cur = _cfg.get(field, opts[0])
+            try:
+                idx = opts.index(cur)
+            except ValueError:
+                idx = 0
+            _cfg[field] = opts[(idx + int(delta)) % len(opts)]
+            mod_item["spline_detrend"] = _cfg
+            return True
+        if control == "spln_fit_target":
+            return _spln_cycle("fit_target",
+                ["waveform", "rms_env", "hilbert_env", "peak_env", "median_env"], delta)
+        if control == "spln_trend_mode":
+            return _spln_cycle("trend_mode", ["knots", "hz", "seg", "smooth"], delta)
+        if control == "spln_order":
+            return _spln_cycle("spline_order", [1, 3, 5], delta)
+        if control == "spln_mode":
+            return _spln_cycle("mode", ["subtract", "divide", "normalize"], delta)
+        if control == "spln_edge":
+            return _spln_cycle("edge", ["natural", "clamped", "mirror"], delta)
+        # ── Toggle controls ───────────────────────────────────────────────
+        if control == "spln_robust_toggle" and action == "do":
+            _cfg = mod_item.get("spline_detrend")
+            if _cfg is not None:
+                _cfg["robust"] = not bool(_cfg.get("robust", False))
+                mod_item["spline_detrend"] = _cfg
+            return True
+        if control == "spln_gain_comp_toggle" and action == "do":
+            _cfg = mod_item.get("spline_detrend")
+            if _cfg is not None:
+                _cfg["gain_comp"] = not bool(_cfg.get("gain_comp", False))
+                mod_item["spline_detrend"] = _cfg
+            return True
+        # ── Numeric slider controls ───────────────────────────────────────
+        def _spln_set_num(field: str, val_fn) -> bool:
+            _cfg = mod_item.get("spline_detrend")
+            if _cfg is None:
+                return False
+            _cfg[field] = val_fn(_cfg.get(field, _SPLN_DEFAULTS.get(field, 1.0)))
+            mod_item["spline_detrend"] = _cfg
+            return True
+        if control == "spln_n_knots":
+            cur = int(mod_item.get("spline_detrend", {}).get("n_knots", 2))
+            new = max(1, min(64, cur + int(delta)))
+            _cfg = mod_item.get("spline_detrend")
+            if _cfg is not None:
+                _cfg["n_knots"] = new
+                mod_item["spline_detrend"] = _cfg
+            return True
+        if control == "spln_robust_iters":
+            cur = int(mod_item.get("spline_detrend", {}).get("robust_iters", 4))
+            new = max(1, min(12, cur + int(delta)))
+            _cfg = mod_item.get("spline_detrend")
+            if _cfg is not None:
+                _cfg["robust_iters"] = new
+                mod_item["spline_detrend"] = _cfg
+            return True
+        if control == "spln_cutoff_hz":
+            return _spln_set_num("cutoff_hz",
+                lambda v: max(0.001, min(50.0, float(v) * (math.sqrt(2.0) ** delta))))
+        if control == "spln_segment_sec":
+            return _spln_set_num("segment_sec",
+                lambda v: max(0.05, min(300.0, float(v) * (math.sqrt(2.0) ** delta))))
+        if control == "spln_smoothing":
+            return _spln_set_num("smoothing",
+                lambda v: max(0.1, min(1e9, float(v) * (math.sqrt(2.0) ** delta))))
+        if control == "spln_blend":
+            return _spln_set_num("blend",
+                lambda v: round(max(0.0, min(1.0, float(v) + delta * 0.05)), 3))
+        if control == "spln_soft_floor":
+            return _spln_set_num("soft_floor",
+                lambda v: max(1e-12, min(0.1, float(v) * (math.sqrt(2.0) ** delta))))
+        if control == "spln_env_win":
+            return _spln_set_num("env_window_ms",
+                lambda v: max(2.0, min(2000.0, float(v) * (math.sqrt(2.0) ** delta))))
+        if control == "signal_out_sr_idx":
+            cur_idx = int(mod_item.get("signal_out_sr_idx", 0))
+            mod_item["signal_out_sr_idx"] = self._cycle_index(
+                cur_idx, _SIGNAL_OUT_SR_LABELS, delta)
+            return True
+        if control == "signal_save_precision_idx":
+            cur_idx = int(mod_item.get("signal_save_precision_idx", 2))
+            mod_item["signal_save_precision_idx"] = self._cycle_index(
+                cur_idx, _SIGNAL_SAVE_PRECISIONS, delta)
+            return True
+        if control == "fb_add_xo" and action == "do":
+            top = max(self.fb_crossovers) if self.fb_crossovers else 200.0
+            self.fb_crossovers.append(min(top * 2.0, 20000.0))
+            self.fb_crossovers.sort()
+            return True
+        if control == "fb_rem_xo" and action == "do":
+            if self.fb_crossovers:
+                self.fb_crossovers.pop()
+            return True
+        # --- nudge-slider controls (±1 step via plus/minus buttons) ---
+        _nudge_keys = {
+            "fmin", "fmax", "stft_n_fft", "cqt_filter_scale", "hybrid_redundancy",
+            "fb_bpo", "fb_banded_width", "cwt_spo", "cwt_sigma",
+            "cwt_epsilon", "wv_depth_pct",
+        }
+        if control in _nudge_keys:
+            self._nudge_slider(control, delta)
+            return True
+        if control.startswith("xo_"):
+            self._nudge_slider(control, delta)
+            return True
+        return False
+
+    def _apply_module_slider_drag(self, rec: Any, lx: int) -> None:
+        """Update a module slider value from a drag event at panel-local x=lx."""
+        path = rec.path  # ("module", module_key, control_name, "drag")
+        if len(path) < 4:
+            return
+        module_key = path[1]
+        control_name = path[2]
+        vmin, vmax, is_log = rec.payload
+        rect = rec.rect
+        frac = max(0.0, min(1.0, (lx - rect.x) / max(rect.w, 1)))
+        if is_log and vmin > 0 and vmax > vmin:
+            val = math.exp(math.log(vmin) + frac * (math.log(vmax) - math.log(vmin)))
+        else:
+            val = vmin + frac * (vmax - vmin)
+
+        if control_name in ("range_start", "range_end"):
+            mod_item = self._module_item(module_key)
+            if mod_item is None:
+                return
+            total = max(0.0, float(mod_item.get("total_sec", self._wav_duration) or 0.0))
+            if control_name == "range_start":
+                end = float(mod_item.get("end_sec", 0.0) or 0.0)
+                new_val = round(max(0.0, min(total, val)), 2)
+                mod_item["start_sec"] = new_val
+                if end > 0.0 and end < new_val:
+                    mod_item["end_sec"] = new_val
+            else:
+                start = float(mod_item.get("start_sec", 0.0) or 0.0)
+                new_val = round(max(start, min(total, val)), 2)
+                mod_item["end_sec"] = new_val
+        elif control_name in ("pf_fmin", "pf_fmax", "heterodyne_hz",
+                               "post_fmin", "post_fmax"):
+            mod_item = self._module_item(module_key)
+            if mod_item is None:
+                return
+            _sr = float(self._wav_sr) if self._wav_sr > 0 else 44100.0
+            _nyq = _sr / 2.0
+            _lo, _hi_lim = self._freq_limits()
+            if control_name == "pf_fmin":
+                if val <= _lo * 1.01:
+                    mod_item.pop("prefilter_bp_fmin", None)
+                else:
+                    mod_item["prefilter_bp_fmin"] = round(max(_lo, min(_nyq * 0.99, val)), 4)
+            elif control_name == "pf_fmax":
+                if val >= _hi_lim * 0.999:
+                    mod_item.pop("prefilter_bp_fmax", None)
+                else:
+                    mod_item["prefilter_bp_fmax"] = round(max(0.1, min(_nyq * 0.999, val)), 4)
+            elif control_name == "post_fmin":
+                if val <= _lo * 1.01:
+                    mod_item.pop("postfilter_bp_fmin", None)
+                else:
+                    mod_item["postfilter_bp_fmin"] = round(max(_lo, min(_nyq * 0.99, val)), 4)
+            elif control_name == "post_fmax":
+                if val >= _hi_lim * 0.999:
+                    mod_item.pop("postfilter_bp_fmax", None)
+                else:
+                    mod_item["postfilter_bp_fmax"] = round(max(0.1, min(_nyq * 0.999, val)), 4)
+            else:
+                new_hz = round(max(-_nyq, min(_nyq, val)), 4)
+                if abs(new_hz) < 0.001:
+                    new_hz = 0.0
+                mod_item["heterodyne_hz"] = new_hz
+        elif control_name in ("spln_n_knots", "spln_cutoff_hz", "spln_segment_sec",
+                               "spln_smoothing", "spln_blend", "spln_soft_floor",
+                               "spln_env_win", "spln_robust_iters"):
+            mod_item = self._module_item(module_key)
+            if mod_item is None:
+                return
+            _cfg = mod_item.get("spline_detrend")
+            if _cfg is None:
+                return
+            _field_map = {
+                "spln_n_knots":     ("n_knots",       lambda v: max(1, min(64, int(round(v))))),
+                "spln_cutoff_hz":   ("cutoff_hz",     lambda v: max(0.001, min(50.0, float(v)))),
+                "spln_segment_sec": ("segment_sec",   lambda v: max(0.05, min(300.0, float(v)))),
+                "spln_smoothing":   ("smoothing",     lambda v: max(0.1, min(1e9, float(v)))),
+                "spln_blend":       ("blend",         lambda v: max(0.0, min(1.0, float(v)))),
+                "spln_soft_floor":  ("soft_floor",    lambda v: max(1e-12, min(0.1, float(v)))),
+                "spln_env_win":     ("env_window_ms", lambda v: max(2.0, min(2000.0, float(v)))),
+                "spln_robust_iters":("robust_iters",  lambda v: max(1, min(12, int(round(v))))),
+            }
+            if control_name in _field_map:
+                _fld, _clamp = _field_map[control_name]
+                _cfg[_fld] = _clamp(val)
+                mod_item["spline_detrend"] = _cfg
+        else:
+            _ctrl_key_map = {
+                "hop": "hop",
+                "stft_n_fft": "stft_n_fft",
+                "bpo": "bpo",
+                "fb_hop": "fb_hop",
+                "cwt_hop": "cwt_hop",
+                "wavelet_depth": "wv_depth_abs",
+                "fmin": "fmin",
+                "fmax": "fmax",
+                "cqt_filter_scale": "cqt_filter_scale",
+                "hybrid_redundancy": "hybrid_redundancy",
+                "fb_bpo": "fb_bpo",
+                "fb_banded_width": "fb_banded_width",
+                "cwt_spo": "cwt_spo",
+                "cwt_sigma": "cwt_sigma",
+                "cwt_epsilon": "cwt_epsilon",
+                "wv_depth_pct": "wv_depth_pct",
+            }
+            if control_name.startswith("xo_"):
+                self._apply_slider_value(control_name, val)
+            else:
+                slider_key = _ctrl_key_map.get(control_name)
+                if slider_key:
+                    self._apply_slider_value(slider_key, val)
 
     # ---- Presets ----------------------------------------------------------
 
@@ -9290,6 +12874,7 @@ class SourcePanel(Panel):
         """
         self._folder_paths = []
         self._folder_versions: dict[str, list[tuple[str, str]]] = {}
+        self._folder_inventory: dict[str, list[tuple[str, str]]] = {}
         items: list[ListItem] = []
         roots = [self.output_root]
         parent = os.path.dirname(self.output_root)
@@ -9310,7 +12895,11 @@ class SourcePanel(Panel):
                 has_cqt = (os.path.isfile(os.path.join(fp, "cqt_data.npz")) or
                            bool(_glob.glob(os.path.join(fp, "cqt_data_*.npz"))))
                 has_fb = os.path.isdir(os.path.join(fp, "filterbank"))
-                if not (has_cqt or has_fb):
+                # Detect partial save: stream shard dir exists but no .npz pointer yet
+                # (crash during _save_cqt_stream_bundle on a previous run).
+                has_partial = (not has_cqt and not has_fb and
+                               bool(_glob.glob(os.path.join(fp, "cqt_data_*.stream"))))
+                if not (has_cqt or has_fb or has_partial):
                     continue
                 seen.add(fp)
                 self._folder_paths.append(fp)
@@ -9328,6 +12917,8 @@ class SourcePanel(Panel):
                     suffix = " [CQT]"
                 elif has_fb:
                     suffix = " [FB]"
+                elif has_partial:
+                    suffix = " [partial]"
 
                 # Check for versions manifest
                 manifest_path = os.path.join(fp, "versions.json")
@@ -9340,13 +12931,18 @@ class SourcePanel(Panel):
                         for vhash, vinfo in manifest.get("versions", {}).items():
                             short = vhash[:8]
                             settings = vinfo.get("settings", {})
+                            _algo = settings.get("fft_algorithm")
+                            _algo_desc = f"{str(_algo).upper()} " if _algo else ""
+                            _nfft = settings.get("stft_n_fft")
+                            _nfft_desc = f" nfft{_nfft}" if _nfft else ""
                             _fs = settings.get("cqt_filter_scale")
                             _fs_desc = f" qx{_fs}" if _fs is not None else ""
                             _win = settings.get("cqt_window")
                             _win_desc = f" {_win}" if _win else ""
-                            desc = (f"h{settings.get('hop_length', '?')}"
-                                    f" b{settings.get('bins_per_octave', '?')}"
-                                    f"{_fs_desc}"
+                            _shape_desc = (_nfft_desc if str(_algo).lower() == "stft"
+                                           else f" b{settings.get('bins_per_octave', '?')}{_fs_desc}")
+                            desc = (f"{_algo_desc}h{settings.get('hop_length', '?')}"
+                                    f"{_shape_desc}"
                                     f"{_win_desc}"
                                     f" {settings.get('cqt_fmin', '?')}"
                                     f"-{settings.get('cqt_fmax', '?')}Hz")
@@ -9354,12 +12950,47 @@ class SourcePanel(Panel):
                     except Exception:
                         pass
                 self._folder_versions[fp] = versions
+                inventory_rows: list[tuple[str, str]] = []
+                inv_path = os.path.join(fp, _ANALYSIS_INVENTORY_FILE)
+                if os.path.isfile(inv_path):
+                    try:
+                        inv = AnalysisInventory.from_dict(_load_analysis_inventory(fp))
+                        for dataset in inv.datasets:
+                            algo = f" {dataset.algorithm}" if dataset.algorithm else ""
+                            htxt = f" [{dataset.settings_hash}]" if dataset.settings_hash else ""
+                            inventory_rows.append((
+                                dataset.dataset_key,
+                                f"{dataset.engine}{algo}{htxt}",
+                            ))
+                    except Exception:
+                        pass
+                self._folder_inventory[fp] = inventory_rows
 
                 n_ver = len(versions)
+                # Inventory rows whose hash is already covered by a versions entry
+                # are redundant — suppress them to avoid duplicate sub-items.
+                _ver_hashes: set[str] = {vhash for vhash, _ in versions}
+                inventory_rows_unique = [
+                    (dkey, ddesc) for dkey, ddesc in inventory_rows
+                    if not any(
+                        dkey == f"fft:{vh}" or dkey.endswith(f":{vh}")
+                        for vh in _ver_hashes
+                    )
+                ]
+                n_inv = len(inventory_rows_unique)
                 ver_hint = f" ({n_ver}v)" if n_ver > 1 else ""
+                inv_hint = f" ({n_inv}d)" if n_inv > 0 else ""
+                folder_timeline: list[tuple[float, float, tuple[int, int, int], int]] = []
+                if inventory_rows:
+                    try:
+                        inv = AnalysisInventory.from_dict(_load_analysis_inventory(fp))
+                        folder_timeline = _inventory_dataset_timeline_segments(inv.datasets)
+                    except Exception:
+                        folder_timeline = []
                 items.append(ListItem(
-                    key=fp, display_name=fn + suffix + ver_hint,
-                    tag=tag or "-"))
+                    key=fp, display_name=fn + suffix + ver_hint + inv_hint,
+                    tag=tag or "-",
+                    timeline_segments=folder_timeline))
 
                 # Add sub-items for each version
                 for vhash, desc in versions:
@@ -9370,6 +13001,85 @@ class SourcePanel(Panel):
                         tag_color_key="none",
                     ))
                     self._folder_paths.append(f"{fp}::{vhash}")
+                if inventory_rows:
+                    try:
+                        inv = AnalysisInventory.from_dict(_load_analysis_inventory(fp))
+                        dataset_map = {ds.dataset_key: ds for ds in inv.datasets}
+                    except Exception:
+                        dataset_map = {}
+                else:
+                    dataset_map = {}
+                for dataset_key, desc in inventory_rows_unique:
+                    ds = dataset_map.get(dataset_key)
+                    ds_timeline = (_inventory_dataset_timeline_segments([ds])
+                                   if ds is not None else [])
+                    items.append(ListItem(
+                        key=f"{fp}::dataset::{dataset_key}",
+                        display_name=f"  @{desc}",
+                        tag="data",
+                        tag_color_key="none",
+                        timeline_segments=ds_timeline,
+                    ))
+                    self._folder_paths.append(f"{fp}::dataset::{dataset_key}")
+
+                # ---- Stream-directory scan: show EVERY analysis attempt ----
+                # Glob for all cqt_data_*.stream/ directories.  Any that are
+                # not already represented by a versions.json or inventory entry
+                # are shown as resumable sub-items so no run is ever invisible,
+                # even if it crashed before writing the manifest or inventory.
+                _ver_hashes_set: set[str] = {vhash for vhash, _ in versions}
+                _inv_hashes_set: set[str] = {
+                    row[0].split(":")[-1] for row in inventory_rows
+                }
+                _already_shown: set[str] = _ver_hashes_set | _inv_hashes_set
+                for _sd in sorted(_glob.glob(os.path.join(fp, "cqt_data_*.stream"))):
+                    if not os.path.isdir(_sd):
+                        continue
+                    _sname = os.path.basename(_sd)          # cqt_data_{hash}.stream
+                    _shash = _sname[len("cqt_data_"):-len(".stream")]
+                    if _shash in _already_shown:
+                        continue  # already listed via versions.json or inventory
+                    # Determine shard status
+                    _has_shards = (
+                        os.path.isfile(os.path.join(_sd, "real_left.npy")) and
+                        os.path.isfile(os.path.join(_sd, "imag_left.npy"))
+                    )
+                    _has_manifest = os.path.isfile(
+                        os.path.join(fp, f"cqt_data_{_shash}.stream.json"))
+                    if _has_manifest:
+                        _status = "done"
+                    elif _has_shards:
+                        _status = "shards"
+                    else:
+                        _status = "empty"
+                    # Try to read embedded settings snapshot for display
+                    _snap_desc = ""
+                    _snap_path = os.path.join(_sd, f"settings_{_shash}.json")
+                    if os.path.isfile(_snap_path):
+                        try:
+                            import json as _js
+                            with open(_snap_path, encoding="utf-8") as _sf2:
+                                _snap = _js.load(_sf2)
+                            _algo = _snap.get("fft_algorithm", "")
+                            _hop  = _snap.get("hop_length", "?")
+                            _bpo  = _snap.get("bins_per_octave", "?")
+                            _fmin = _snap.get("cqt_fmin", "?")
+                            _fmax = _snap.get("cqt_fmax", "?")
+                            _snap_desc = (f" {str(_algo).upper()}"
+                                          f" h{_hop} b{_bpo}"
+                                          f" {_fmin}-{_fmax}Hz")
+                        except Exception:
+                            pass
+                    _stream_key = f"{fp}::stream::{_shash}"
+                    items.append(ListItem(
+                        key=_stream_key,
+                        display_name=(f"  #{_shash[:6]}{_snap_desc}"
+                                      f"  [{_status}]"),
+                        tag="stream",
+                        tag_color_key="none",
+                    ))
+                    self._folder_paths.append(_stream_key)
+                    _already_shown.add(_shash)
 
         self.folder_list.items = items
 
@@ -9486,17 +13196,39 @@ class SourcePanel(Panel):
         safe_idx = min(self.wavelet_order_idx, len(orders) - 1)
         return prefix + orders[safe_idx]
 
-    def _wavelet_max_level(self) -> int:
-        """Max DWT decomposition level for current signal & wavelet."""
-        n = self._wav_n_samples
+    def _analysis_sample_span(
+        self,
+        time_range: AnalysisTimeRange | None = None,
+        *,
+        sr: int | None = None,
+        n_samples: int | None = None,
+    ) -> tuple[int, int, int]:
+        sr_eff = int(self._wav_sr if sr is None else sr)
+        n_eff = int(self._wav_n_samples if n_samples is None else n_samples)
+        if n_eff <= 0:
+            return 0, 0, 0
+        rng = (time_range or AnalysisTimeRange(
+            start_sec=float(self.region_start),
+            end_sec=float(self.region_end),
+            total_sec=float(self._wav_duration),
+        )).clamped()
+        s0 = int(max(0.0, rng.start_sec) * sr_eff) if sr_eff > 0 else 0
+        if rng.end_sec > 0.0 and sr_eff > 0:
+            s1 = int(rng.end_sec * sr_eff)
+        else:
+            s1 = n_eff
+        s0 = max(0, min(n_eff, s0))
+        s1 = max(s0, min(n_eff, s1))
+        return s0, s1, max(0, s1 - s0)
+
+    def _wavelet_max_level(
+        self,
+        time_range: AnalysisTimeRange | None = None,
+    ) -> int:
+        """Max DWT decomposition level for the active or provided signal span."""
+        _s0, _s1, n = self._analysis_sample_span(time_range)
         if n <= 0:
             return 20  # fallback when no file selected
-        # Account for region selection
-        if self._wav_sr > 0:
-            if self.region_start > 0 or self.region_end > 0:
-                s0 = int(self.region_start * self._wav_sr) if self.region_start > 0 else 0
-                s1 = int(self.region_end * self._wav_sr) if self.region_end > 0 else n
-                n = max(1, min(n, s1) - max(0, s0))
         try:
             import pywt
             return max(1, pywt.dwt_max_level(n, self._current_wavelet_name()))
@@ -9513,15 +13245,182 @@ class SourcePanel(Panel):
             return max(1, min(self.wavelet_depth_abs, max_lev))
         return max(1, int(round(self.wavelet_depth_pct / 100.0 * max_lev)))
 
+    def _format_storage_size(self, n_bytes: float) -> str:
+        units = ["B", "KB", "MB", "GB", "TB"]
+        value = float(max(0.0, n_bytes))
+        unit_idx = 0
+        while value >= 1024.0 and unit_idx < len(units) - 1:
+            value /= 1024.0
+            unit_idx += 1
+        if unit_idx == 0:
+            return f"{int(round(value))} {units[unit_idx]}"
+        return f"{value:.1f} {units[unit_idx]}"
+
+    def _run_time_range_dict(self, run: AnalysisRun) -> dict[str, float]:
+        rng = run.time_range.clamped()
+        return {
+            "start_sec": float(rng.start_sec),
+            "end_sec": float(rng.end_sec),
+            "total_sec": float(rng.total_sec or self._wav_duration),
+        }
+
+    def _project_analysis_run(self, run: AnalysisRun) -> dict[str, Any]:
+        rng = run.time_range.clamped()
+        sr = max(1, int(self._wav_sr or 44100))
+        _s0, _s1, n_samples = self._analysis_sample_span(rng, sr=sr)
+        duration_sec = (n_samples / sr) if sr > 0 else 0.0
+        save_precision = self._analysis_save_precision()
+        save_dt = np.dtype(_precision_label_to_np_dtype(save_precision))
+        real_itemsize = int(save_dt.itemsize)
+        lines: list[str] = []
+        storage_bytes = 0.0
+        color = (170, 170, 170)
+        device_hint = "cpu"
+        if run.engine == "fft" and isinstance(run.settings, FFTAnalysisSettings):
+            color = (110, 150, 210)
+            if str(run.settings.fft_algorithm).lower() == "stft":
+                n_fft = max(256, int(run.settings.stft_n_fft or 4096))
+                n_bins_full = n_fft // 2 + 1
+                freqs_all = np.linspace(0.0, sr / 2.0, n_bins_full, dtype=np.float64)
+                freq_lo = max(0.0, float(run.settings.cqt_fmin))
+                freq_hi = min(float(run.settings.cqt_fmax), sr / 2.0)
+                b_lo = max(0, int(np.searchsorted(freqs_all, freq_lo, side="left")))
+                b_hi = min(n_bins_full, max(b_lo + 1, int(np.searchsorted(freqs_all, freq_hi, side="right"))))
+                bins = max(1, b_hi - b_lo)
+            else:
+                freq_lo = max(1e-6, float(run.settings.cqt_fmin))
+                freq_hi = max(freq_lo * 1.0001, float(run.settings.cqt_fmax))
+                octaves = max(0.0, math.log2(freq_hi / freq_lo))
+                bins = max(1, int(math.ceil(run.settings.bins_per_octave * octaves)))
+            frames = max(1, int(math.ceil(n_samples / max(1, run.settings.hop_length))))
+            storage_bytes = float(frames * bins * 2 * real_itemsize)
+            if str(run.settings.fft_algorithm).lower() == "stft":
+                lines.append(f"STFT {frames:,}x{bins:,} nfft={n_fft}")
+            else:
+                lines.append(f"{run.settings.fft_algorithm.upper()} {frames:,}x{bins:,}")
+        elif run.engine == "fb" and isinstance(run.settings, FilterbankAnalysisSettings):
+            color = (140, 185, 120)
+            if _FB_CONFIG_MODES[run.settings.fb_config_mode_idx] != "Manual":
+                bands = FilterBankDecomposition.bands_from_cafls(
+                    self.cafls_anchor,
+                    run.settings.fb_bpo,
+                    run.settings.fb_banded_width,
+                    sr,
+                )
+            else:
+                bands = FilterBankDecomposition.bands_from_crossovers(
+                    run.settings.fb_crossovers,
+                    sr,
+                )
+            band_count = max(1, len(bands))
+            env_frames = max(1, int(math.ceil(n_samples / max(1, run.settings.fb_hop))))
+            env_bytes = float(env_frames * band_count * 2 * 2 * real_itemsize)
+            band_bytes = float(n_samples * band_count * real_itemsize)
+            storage_bytes = env_bytes + band_bytes
+            lines.append(f"{band_count} bands, {env_frames:,} env frames")
+        elif run.engine == "wavelet" and isinstance(run.settings, WaveletAnalysisSettings):
+            color = (198, 148, 98)
+            if run.settings.wavelet_mode_idx == 1:
+                device_hint = "torch/cuda" if self._torch_cuda_available() else "torch/cpu"
+                fmin = max(CAFLS_SEISMIC_FLOOR, 1.0 / max(duration_sec, 1e-6))
+                fmax = max(fmin * 1.0001, float(self.cafls_anchor))
+                octaves = max(0.0, math.log2(fmax / fmin))
+                scales = max(1, int(math.ceil(
+                    run.settings.cwt_scales_per_octave * octaves
+                )))
+                frames = max(1, int(math.ceil(
+                    n_samples / max(1, run.settings.cwt_hop_length)
+                )))
+                storage_bytes = float(scales * frames * 2 * real_itemsize)
+                lines.append(f"CWT {scales:,}x{frames:,}")
+            else:
+                device_hint = "numpy/pywt"
+                max_lev = self._wavelet_max_level(rng)
+                if run.settings.wavelet_depth_mode == 1:
+                    level = max(1, min(run.settings.wavelet_depth_abs, max_lev))
+                else:
+                    level = max(1, int(round(
+                        run.settings.wavelet_depth_pct / 100.0 * max_lev
+                    )))
+                storage_bytes = float(max(1, n_samples) * real_itemsize * 1.25)
+                lines.append(f"DWT level {level}/{max_lev}")
+        elif run.engine == "signal":
+            color = (170, 120, 200)
+            device_hint = "numpy"
+            n_channels = 2  # conservative: assume stereo
+            # Determine output SR (may be resampled)
+            _sig_sr_idx = int(run.metadata.get("signal_out_sr_idx", 0))
+            _sig_sr_idx = max(0, min(_sig_sr_idx, len(_SIGNAL_OUT_SR_OPTIONS) - 1))
+            _out_sr = _SIGNAL_OUT_SR_OPTIONS[_sig_sr_idx]
+            if _out_sr > 0:
+                out_n_smp = int(n_samples * _out_sr / max(sr, 1))
+            else:
+                out_n_smp = n_samples
+            # Bytes per sample depends on save precision
+            _sig_prec_idx = int(run.metadata.get("signal_save_precision_idx", 2))
+            _sig_prec_idx = max(0, min(_sig_prec_idx, len(_SIGNAL_SAVE_PRECISIONS) - 1))
+            _bps = {0: 2, 1: 3, 2: 4, 3: 8}[_sig_prec_idx]  # 16/24/32f/64f bytes/samp
+            storage_bytes = float(out_n_smp * n_channels * _bps)
+            _sr_lbl = _SIGNAL_OUT_SR_LABELS[_sig_sr_idx]
+            lines.append(f"Signal WAV {out_n_smp:,} smp ×{n_channels}ch "
+                         f"@ {_sr_lbl} {_SIGNAL_SAVE_PRECISIONS[_sig_prec_idx]}")
+        return {
+            "key": run.key,
+            "label": run.label or run.key,
+            "engine": run.engine,
+            "time_range": rng,
+            "duration_sec": duration_sec,
+            "bytes": storage_bytes,
+            "size_label": self._format_storage_size(storage_bytes),
+            "detail": " | ".join(lines) if lines else run.engine,
+            "device": device_hint,
+            "color": color,
+        }
+
+    def _project_itinerary_demands(
+        self,
+        itinerary: AnalysisItinerary | None = None,
+    ) -> dict[str, Any]:
+        plan = itinerary or self.build_analysis_itinerary()
+        rows = [self._project_analysis_run(run) for run in plan.enabled_runs()]
+        total_bytes = sum(float(row["bytes"]) for row in rows)
+        return {
+            "rows": rows,
+            "total_bytes": total_bytes,
+            "total_label": self._format_storage_size(total_bytes),
+        }
+
+    def _torch_cuda_available(self) -> bool:
+        try:
+            import torch
+            return bool(torch.cuda.is_available())
+        except Exception:
+            return False
+
+    def _analysis_run_output_dir(self, base_outdir: str, run: AnalysisRun) -> str:
+        if run.engine == "fft":
+            return base_outdir
+        return os.path.join(base_outdir, f"{run.engine}_{run.key}")
+
+    def _save_analysis_itinerary_receipt(
+        self,
+        outdir: str,
+        itinerary: AnalysisItinerary,
+    ) -> None:
+        itinerary_path = os.path.join(outdir, "analysis_itinerary.json")
+        with open(itinerary_path, "w", encoding="utf-8") as f:
+            json.dump(itinerary.to_dict(), f, indent=2, sort_keys=True)
+
     # ---- Analysis ---------------------------------------------------------
     # (Solver removed — unguided and too slow to be useful.)
 
     # ---- Analysis ---------------------------------------------------------
 
-    def _run_analysis(self, *,
+    def _run_analysis_legacy(self, *,
                       _force_wav_path: str | None = None,
                       _force_outdir: str | None = None,
                       _resume: bool = False) -> None:
+        exit()
         if _force_wav_path is not None:
             wav_path = _force_wav_path
         else:
@@ -9562,6 +13461,14 @@ class SourcePanel(Panel):
                 compute_precision = self._analysis_compute_precision()
                 save_precision = self._analysis_save_precision()
                 compute_np_dtype = _precision_label_to_real_dtype(compute_precision)
+                fft_algorithm = _CQT_ALGORITHMS[
+                    min(self.cqt_algorithm_idx, len(_CQT_ALGORITHMS) - 1)
+                ]
+                run_time_range = {
+                    "start_sec": float(self.region_start),
+                    "end_sec": float(self.region_end),
+                    "total_sec": float(self._wav_duration),
+                }
 
                 # Snapshot all UI settings + source wav path so the analysis
                 # can be resumed or reproduced later, and loaded via "Load Sett".
@@ -9606,14 +13513,22 @@ class SourcePanel(Panel):
                     else:
                         # CAFLS center still floors plain CQT analysis.
                         cqt_fmin = max(self.cqt_fmin, self.cafls_anchor)
+                    # Pre-flight: fmin must be strictly below fmax
+                    if cqt_fmin >= self.cqt_fmax:
+                        raise RuntimeError(
+                            f"CQT fmin ({cqt_fmin:.1f} Hz) >= fmax "
+                            f"({self.cqt_fmax:.1f} Hz). "
+                            f"Lower the CAFLS anchor or raise fMax."
+                        )
                     taps = int(_RESAMPLE_TAPS[self.resample_taps_idx])
-                    cqt_bpo_sched = None
-                    cqt_hop_sched = None
-                    cqt_fs_sched = None
+                    cqt_bpo_sched = getattr(self, "cqt_bpo_schedule", None)
+                    cqt_hop_sched = getattr(self, "cqt_hop_schedule", None)
+                    cqt_fs_sched = getattr(self, "cqt_filter_scale_schedule", None)
                     cmd = [
                         sys.executable, "-m", "bass_analysis",
                         wav_path,
                         "--hop-length", str(self.hop_length),
+                        "--fft-algorithm", fft_algorithm,
                         "--bins-per-octave", str(self.bins_per_octave),
                         "--cqt-filter-scale", str(self.cqt_filter_scale),
                         "--cqt-window", _CQT_WINDOWS[
@@ -9627,15 +13542,36 @@ class SourcePanel(Panel):
                         "--cqt-save-precision", _precision_label_to_bits(
                             save_precision),
                     ]
-                    if cqt_bpo_sched is not None and hasattr(cqt_bpo_sched, "to_list"):
-                        cmd += ["--cqt-bpo-schedule",
-                                json.dumps(cqt_bpo_sched.to_list())]
-                    if cqt_hop_sched is not None and hasattr(cqt_hop_sched, "to_list"):
-                        cmd += ["--cqt-hop-schedule",
-                                json.dumps(cqt_hop_sched.to_list())]
-                    if cqt_fs_sched is not None and hasattr(cqt_fs_sched, "to_list"):
-                        cmd += ["--cqt-filter-scale-schedule",
-                                json.dumps(cqt_fs_sched.to_list())]
+                    if fft_algorithm == "stft":
+                        cmd += ["--stft-n-fft", str(int(self.stft_n_fft))]
+                    # For STFT streaming, pass settings_hash as --shash
+                    if fft_algorithm == "stft":
+                        from bass_analysis import settings_token, AnalysisConfig
+                        compute_dtype_label = str(compute_precision).replace('64', 'float64').replace('32', 'float32') if '64' in str(compute_precision) or '32' in str(compute_precision) else str(compute_precision)
+                        save_dtype_label = str(save_precision).replace('64', 'float64').replace('32', 'float32') if '64' in str(save_precision) or '32' in str(save_precision) else str(save_precision)
+                        cfg = AnalysisConfig(
+                            fft_algorithm=fft_algorithm,
+                            hop_length=self.hop_length,
+                            stft_n_fft=int(self.stft_n_fft),
+                            bins_per_octave=self.bins_per_octave,
+                            cqt_filter_scale=self.cqt_filter_scale,
+                            cqt_window=_CQT_WINDOWS[min(self.cqt_window_idx, len(_CQT_WINDOWS) - 1)],
+                            cqt_bpo_schedule=(list(cqt_bpo_sched) if cqt_bpo_sched else None),
+                            cqt_hop_schedule=(list(cqt_hop_sched) if cqt_hop_sched else None),
+                            cqt_filter_scale_schedule=(list(cqt_fs_sched) if cqt_fs_sched else None),
+                            cqt_fmin=cqt_fmin,
+                            cqt_fmax=self.cqt_fmax,
+                            cqt_compute_dtype=compute_dtype_label,
+                            cqt_save_dtype=save_dtype_label,
+                        )
+                        shash = settings_token(cfg)
+                        cmd += ["--shash", shash]
+                    if cqt_bpo_sched:
+                        cmd += ["--cqt-bpo-schedule", json.dumps(list(cqt_bpo_sched))]
+                    if cqt_hop_sched:
+                        cmd += ["--cqt-hop-schedule", json.dumps(list(cqt_hop_sched))]
+                    if cqt_fs_sched:
+                        cmd += ["--cqt-filter-scale-schedule", json.dumps(list(cqt_fs_sched))]
                     if has_region:
                         if r_start > 0:
                             cmd += ["--start-time", str(r_start)]
@@ -9668,6 +13604,50 @@ class SourcePanel(Panel):
                     ret = proc.wait()
                     if ret != 0:
                         raise RuntimeError(f"CQT analysis failed (exit {ret})")
+                    _fft_hash = ""
+                    try:
+                        _fft_npz = np.load(
+                            os.path.join(outdir, "cqt_data.npz"),
+                            mmap_mode="r",
+                            allow_pickle=True,
+                        )
+                        _fft_hash = str(_fft_npz["settings_hash"])
+                        if hasattr(_fft_npz, "close"):
+                            _fft_npz.close()
+                    except Exception:
+                        _fft_hash = ""
+                    _record_analysis_inventory_run(
+                        outdir,
+                        engine="fft",
+                        run_key=_fft_hash or fft_algorithm,
+                        info={
+                            "dataset_key": f"fft:{_fft_hash or fft_algorithm}",
+                            "engine": "fft",
+                            "algorithm": fft_algorithm,
+                            "settings_hash": _fft_hash,
+                            "label": f"FFT {fft_algorithm.upper()}",
+                            "npz": (f"cqt_data_{_fft_hash}.npz"
+                                    if _fft_hash else "cqt_data.npz"),
+                            "legacy_npz": "cqt_data.npz",
+                            "versions_manifest": "versions.json",
+                            "settings": {
+                                "fft_algorithm": fft_algorithm,
+                                "hop_length": self.hop_length,
+                                "stft_n_fft": self.stft_n_fft,
+                                "bins_per_octave": self.bins_per_octave,
+                                "cqt_filter_scale": self.cqt_filter_scale,
+                                "cqt_window": _CQT_WINDOWS[
+                                    min(self.cqt_window_idx, len(_CQT_WINDOWS) - 1)
+                                ],
+                                "cqt_fmin": cqt_fmin,
+                                "cqt_fmax": self.cqt_fmax,
+                                "region_start": self.region_start,
+                                "region_end": self.region_end,
+                                "region_total": self._wav_duration,
+                            },
+                            "time_range": run_time_range,
+                        },
+                    )
                     _set_progress((phase_idx + 1) / n_phases, "CQT done")
 
                 # Filter bank decomposition
@@ -9699,7 +13679,8 @@ class SourcePanel(Panel):
                         _meta_top, _meta_bands = _meta
                         _fb_loaded = FilterBankDecomposition(
                             _meta_top["sr"],
-                            _meta_top.get("filter_type", "Linkwitz-Riley 4"))
+                            _meta_top.get("filter_type", "Linkwitz-Riley 4"),
+                            filter_mode=self.fb_filter_mode)
                         for _bm in _meta_bands:
                             _fb_loaded.bands.append(BandDef(
                                 fmin=_bm["fmin"], fmax=_bm["fmax"],
@@ -9788,9 +13769,8 @@ class SourcePanel(Panel):
                             left_ch = left_ch[s0:s1]
                             right_ch = right_ch[s0:s1]
                     ftype = _FILTER_TYPES[self.fb_filter_type_idx]
-                    fb = FilterBankDecomposition(sr_wav, ftype)
-                    fb_auto = _FB_CONFIG_MODES[
-                        self.fb_config_mode_idx] != "Manual"
+                    fb = FilterBankDecomposition(sr_wav, ftype,
+                                                filter_mode=self.fb_filter_mode)
                     if fb_auto:
                         bands = FilterBankDecomposition.bands_from_cafls(
                             self.cafls_anchor, self.fb_bpo,
@@ -9808,6 +13788,33 @@ class SourcePanel(Panel):
                     self._fb_decomp_dir = outdir
                     if self.on_fb_computed:
                         self.on_fb_computed(fb)
+                    _record_analysis_inventory_run(
+                        outdir,
+                        engine="filterbank",
+                        run_key=f"{ftype}|{save_precision}",
+                        info={
+                            "dataset_key": f"filterbank:{ftype}:{save_precision}",
+                            "engine": "filterbank",
+                            "algorithm": ftype,
+                            "label": f"FB {ftype}",
+                            "meta": os.path.join("filterbank", "filterbank_meta.json"),
+                            "envelopes": os.path.join("filterbank", "fb_envelopes.npz"),
+                            "save_precision": save_precision,
+                            "settings": {
+                                "fb_filter_type": ftype,
+                                "fb_hop": self.fb_hop,
+                                "fb_bpo": self.fb_bpo,
+                                "fb_banded_width": self.fb_banded_width,
+                                "fb_hybrid": self.fb_hybrid,
+                                "fb_q_norm": self.fb_q_norm,
+                                "fb_crossovers": [float(x) for x in self.fb_crossovers],
+                                "region_start": self.region_start,
+                                "region_end": self.region_end,
+                                "region_total": self._wav_duration,
+                            },
+                            "time_range": run_time_range,
+                        },
+                    )
 
                     # Always produce L+R envelopes (mono input → L=R)
                     fb_dir = os.path.join(outdir, "filterbank")
@@ -9817,7 +13824,8 @@ class SourcePanel(Panel):
                     else:
                         ch_pairs = [("left", mono)]
                     for ch_idx, (ch_label, ch_sig) in enumerate(ch_pairs):
-                        fb_ch = FilterBankDecomposition(sr_wav, ftype)
+                        fb_ch = FilterBankDecomposition(sr_wav, ftype,
+                                                        filter_mode=self.fb_filter_mode)
                         fb_ch.compute(ch_sig, bands)
                         n_ch = max(1, len(ch_pairs))
 
@@ -9927,6 +13935,8 @@ class SourcePanel(Panel):
                             on_progress=_cwt_progress_cb,
                         )
                         n_scales, n_frames = int(W.shape[0]), int(W.shape[1])
+                        cwt_working_hop = _effective_cwt_hop_length(
+                            len(wv_signal), n_frames, self.cwt_hop_length)
                         stream_dir = os.path.join(wv_dir, "wavelet_data.stream")
                         os.makedirs(stream_dir, exist_ok=True)
                         real_path = os.path.join(stream_dir, "W_real.npy")
@@ -9996,6 +14006,7 @@ class SourcePanel(Panel):
                             "sr": sr_wav,
                             "n_samples": int(len(wv_signal)),
                             "hop_length": self.cwt_hop_length,
+                            "working_hop_length": cwt_working_hop,
                             "scales_per_octave": self.cwt_scales_per_octave,
                             "n_scales": n_scales,
                             "fmin": float(cwt_fmin),
@@ -10009,6 +14020,34 @@ class SourcePanel(Panel):
                                   "w") as wf:
                             _json.dump(wv_meta, wf, indent=2)
                         del W, freqs_t, y_t
+                        _record_analysis_inventory_run(
+                            outdir,
+                            engine="wavelet",
+                            run_key=f"cwt|{cwt_wtype}|{save_precision}",
+                            info={
+                                "dataset_key": f"wavelet:cwt:{cwt_wtype}:{save_precision}",
+                                "engine": "wavelet",
+                                "algorithm": "cwt",
+                                "wavelet": cwt_wtype,
+                                "label": f"CWT {cwt_wtype}",
+                                "meta": os.path.join("wavelet", "wavelet_meta.json"),
+                                "data": os.path.join("wavelet", "wavelet_data.npz"),
+                                "manifest": os.path.join("wavelet", "wavelet_data.stream.json"),
+                                "save_precision": save_precision,
+                                "settings": {
+                                    "wavelet_mode": "cwt",
+                                    "wavelet": cwt_wtype,
+                                    "cwt_hop_length": self.cwt_hop_length,
+                                    "cwt_scales_per_octave": self.cwt_scales_per_octave,
+                                    "cwt_sigma": self.cwt_sigma,
+                                    "cwt_epsilon": self.cwt_epsilon,
+                                    "region_start": self.region_start,
+                                    "region_end": self.region_end,
+                                    "region_total": self._wav_duration,
+                                },
+                                "time_range": run_time_range,
+                            },
+                        )
                     else:
                         # ── DWT path (pywt) ──
                         import pywt
@@ -10059,6 +14098,32 @@ class SourcePanel(Panel):
                         with open(os.path.join(wv_dir, "wavelet_meta.json"),
                                   "w") as wf:
                             _json.dump(wv_meta, wf, indent=2)
+                        _record_analysis_inventory_run(
+                            outdir,
+                            engine="wavelet",
+                            run_key=f"dwt|{wv_name}|{save_precision}",
+                            info={
+                                "dataset_key": f"wavelet:dwt:{wv_name}:{save_precision}",
+                                "engine": "wavelet",
+                                "algorithm": "dwt",
+                                "wavelet": wv_name,
+                                "label": f"DWT {wv_name}",
+                                "meta": os.path.join("wavelet", "wavelet_meta.json"),
+                                "data": os.path.join("wavelet", "wavelet_data.npz"),
+                                "save_precision": save_precision,
+                                "settings": {
+                                    "wavelet_mode": "dwt",
+                                    "wavelet": wv_name,
+                                    "wavelet_depth_mode": self.wavelet_depth_mode,
+                                    "wavelet_depth_pct": self.wavelet_depth_pct,
+                                    "wavelet_depth_abs": self.wavelet_depth_abs,
+                                    "region_start": self.region_start,
+                                    "region_end": self.region_end,
+                                    "region_total": self._wav_duration,
+                                },
+                                "time_range": run_time_range,
+                            },
+                        )
 
                 if do_hybrid and sr_wav is not None:
                     hybrid_meta = {
@@ -10097,25 +14162,1143 @@ class SourcePanel(Panel):
         t.start()
         self._analysis_thread = t
 
+    def _execute_fft_analysis_run(
+        self,
+        *,
+        wav_path: str,
+        base_outdir: str,
+        run: AnalysisRun,
+        progress_cb: Any,
+    ) -> tuple[str, list[AnalysisArtifact]]:
+        import subprocess
+        import sys
+        from engine_reporter import EngineRunReporter
+        reporter = EngineRunReporter(progress_cb, run_label=run.label)
+
+        compute_precision = self._analysis_compute_precision()
+        save_precision = self._analysis_save_precision()
+        fft_settings = run.settings if isinstance(run.settings, FFTAnalysisSettings) else None
+        fft_algorithm = (
+            str(fft_settings.fft_algorithm)
+            if fft_settings is not None else
+            _CQT_ALGORITHMS[min(self.cqt_algorithm_idx, len(_CQT_ALGORITHMS) - 1)]
+        )
+        hop_length = int(fft_settings.hop_length) if fft_settings is not None else int(self.hop_length)
+        stft_n_fft = (
+            int(fft_settings.stft_n_fft)
+            if fft_settings is not None else int(self.stft_n_fft)
+        )
+        bins_per_octave = (
+            int(fft_settings.bins_per_octave)
+            if fft_settings is not None else int(self.bins_per_octave)
+        )
+        cqt_filter_scale = (
+            float(fft_settings.cqt_filter_scale)
+            if fft_settings is not None else float(self.cqt_filter_scale)
+        )
+        cqt_window_idx = (
+            int(fft_settings.cqt_window_idx)
+            if fft_settings is not None else int(self.cqt_window_idx)
+        )
+        cqt_window = _CQT_WINDOWS[min(cqt_window_idx, len(_CQT_WINDOWS) - 1)]
+        cqt_fmin = max(
+            float(fft_settings.cqt_fmin) if fft_settings is not None else float(self.cqt_fmin),
+            self.cafls_anchor,
+        )
+        cqt_fmax = (
+            float(fft_settings.cqt_fmax)
+            if fft_settings is not None else float(self.cqt_fmax)
+        )
+        cqt_bpo_schedule = (
+            list(fft_settings.cqt_bpo_schedule)
+            if fft_settings is not None and fft_settings.cqt_bpo_schedule else None
+        )
+        cqt_hop_schedule = (
+            list(fft_settings.cqt_hop_schedule)
+            if fft_settings is not None and fft_settings.cqt_hop_schedule else None
+        )
+        cqt_filter_scale_schedule = (
+            list(fft_settings.cqt_filter_scale_schedule)
+            if fft_settings is not None and fft_settings.cqt_filter_scale_schedule else None
+        )
+        if cqt_fmin >= cqt_fmax:
+            raise RuntimeError(
+                f"CQT fmin ({cqt_fmin:.1f} Hz) >= fmax ({cqt_fmax:.1f} Hz)."
+            )
+        cmd = [
+            sys.executable, "-m", "bass_analysis",
+            wav_path,
+            "--hop-length", str(hop_length),
+            "--fft-algorithm", fft_algorithm,
+            "--bins-per-octave", str(bins_per_octave),
+            "--cqt-filter-scale", str(cqt_filter_scale),
+            "--cqt-window", cqt_window,
+            "--cqt-fmin", str(cqt_fmin),
+            "--cqt-fmax", str(cqt_fmax),
+            "--resample-taps", str(int(_RESAMPLE_TAPS[self.resample_taps_idx])),
+            "--outdir", base_outdir,
+            "--cqt-compute-precision", _precision_label_to_bits(compute_precision),
+            "--cqt-save-precision", _precision_label_to_bits(save_precision),
+        ]
+        if cqt_bpo_schedule:
+            cmd += ["--cqt-bpo-schedule", json.dumps(cqt_bpo_schedule)]
+        if cqt_hop_schedule:
+            cmd += ["--cqt-hop-schedule", json.dumps(cqt_hop_schedule)]
+        if cqt_filter_scale_schedule:
+            cmd += ["--cqt-filter-scale-schedule", json.dumps(cqt_filter_scale_schedule)]
+        if fft_algorithm == "stft":
+            cmd += ["--stft-n-fft", str(stft_n_fft)]
+        # For STFT streaming, pass settings_hash as --shash
+        if fft_algorithm == "stft":
+            # Compute a settings hash for STFT (reuse CQT hash logic if needed)
+            from bass_analysis import settings_token, AnalysisConfig
+            # Build a minimal config for token
+            # Use string labels for dtype fields to ensure JSON serializability
+            compute_dtype_label = str(compute_precision).replace('64', 'float64').replace('32', 'float32') if '64' in str(compute_precision) or '32' in str(compute_precision) else str(compute_precision)
+            save_dtype_label = str(save_precision).replace('64', 'float64').replace('32', 'float32') if '64' in str(save_precision) or '32' in str(save_precision) else str(save_precision)
+            cfg = AnalysisConfig(
+                fft_algorithm=fft_algorithm,
+                hop_length=hop_length,
+                stft_n_fft=stft_n_fft,
+                bins_per_octave=bins_per_octave,
+                cqt_filter_scale=cqt_filter_scale,
+                cqt_window=cqt_window,
+                cqt_bpo_schedule=cqt_bpo_schedule,
+                cqt_hop_schedule=cqt_hop_schedule,
+                cqt_filter_scale_schedule=cqt_filter_scale_schedule,
+                cqt_fmin=cqt_fmin,
+                cqt_fmax=cqt_fmax,
+                cqt_compute_dtype=compute_dtype_label,
+                cqt_save_dtype=save_dtype_label,
+            )
+            shash = settings_token(cfg)
+            cmd += ["--shash", shash]
+        if self.region_start > 0:
+            cmd += ["--start-time", str(self.region_start)]
+        if self.region_end > 0:
+            cmd += ["--end-time", str(self.region_end)]
+        # Last-resort hash override (non-STFT; STFT computes its own shash above).
+        # Set on synthesised itinerary runs when no settings file matched a pinned
+        # stream hash — passes --shash so bass_analysis finds the right stream dir
+        # even though the settings-derived hash would differ.
+        if fft_algorithm != "stft" and fft_settings is not None:
+            _shash_ov = getattr(fft_settings, "shash_override", None)
+            if _shash_ov:
+                cmd += ["--shash", _shash_ov]
+        # Per-item prefilter + heterodyne + postfilter
+        if fft_settings is not None:
+            if fft_settings.prefilter_bp_fmin is not None:
+                cmd += ["--prefilter-bp-fmin", str(fft_settings.prefilter_bp_fmin)]
+            if fft_settings.prefilter_bp_fmax is not None:
+                cmd += ["--prefilter-bp-fmax", str(fft_settings.prefilter_bp_fmax)]
+            if fft_settings.heterodyne_hz != 0.0:
+                cmd += ["--heterodyne-hz", str(fft_settings.heterodyne_hz)]
+            if fft_settings.postfilter_bp_fmin is not None:
+                cmd += ["--postfilter-bp-fmin", str(fft_settings.postfilter_bp_fmin)]
+            if fft_settings.postfilter_bp_fmax is not None:
+                cmd += ["--postfilter-bp-fmax", str(fft_settings.postfilter_bp_fmax)]
+            if hasattr(fft_settings, "filter_mode") and fft_settings.filter_mode != "fir":
+                cmd += ["--filter-mode", fft_settings.filter_mode]
+            _spln_d = getattr(fft_settings, "spline_detrend", None)
+            if isinstance(_spln_d, dict):
+                cmd += ["--spline-detrend"]
+                def _sa(flag, val, default=None):
+                    if default is None or val != default:
+                        cmd.extend([flag, str(val)])
+                _sa("--spline-fit-target",   _spln_d.get("fit_target", "waveform"),    "waveform")
+                _sa("--spline-trend-mode",   _spln_d.get("trend_mode", "knots"),       "knots")
+                _sa("--spline-n-knots",      _spln_d.get("n_knots", 2),               2)
+                _sa("--spline-cutoff-hz",    _spln_d.get("cutoff_hz", 0.5),           0.5)
+                _sa("--spline-segment-sec",  _spln_d.get("segment_sec", 2.0),         2.0)
+                _sa("--spline-smoothing",    _spln_d.get("smoothing", 1e5),           1e5)
+                _sa("--spline-order",        _spln_d.get("spline_order", 3),          3)
+                _sa("--spline-mode",         _spln_d.get("mode", "subtract"),         "subtract")
+                _sa("--spline-edge",         _spln_d.get("edge", "natural"),          "natural")
+                if _spln_d.get("robust", False):
+                    cmd += ["--spline-robust"]
+                _sa("--spline-robust-iters", _spln_d.get("robust_iters", 4),          4)
+                if _spln_d.get("gain_comp", False):
+                    cmd += ["--spline-gain-comp"]
+                _sa("--spline-blend",        _spln_d.get("blend", 1.0),              1.0)
+                _sa("--spline-soft-floor",   _spln_d.get("soft_floor", 1e-6),        1e-6)
+                _sa("--spline-env-window-ms",_spln_d.get("env_window_ms", 50.0),     50.0)
+        reporter.phase("subprocess")
+        proc = subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            ln = line.rstrip("\r\n")
+            if ln.startswith("[PROGRESS] "):
+                try:
+                    rest = ln[len("[PROGRESS] "):].strip()
+                    frac_txt, label = rest.split(" ", 1)
+                    reporter.batch(1)
+                    reporter.progress(float(frac_txt), f"{run.label} {label}")
+                except Exception:
+                    pass
+            else:
+                print(ln, flush=True)
+        ret = proc.wait()
+        if ret != 0:
+            raise RuntimeError(f"FFT analysis failed (exit {ret})")
+        settings_hash = ""
+        try:
+            npz = np.load(
+                os.path.join(base_outdir, "cqt_data.npz"),
+                mmap_mode="r",
+                allow_pickle=True,
+            )
+            settings_hash = str(npz["settings_hash"])
+            if hasattr(npz, "close"):
+                npz.close()
+        except Exception:
+            settings_hash = ""
+        npz_name = f"cqt_data_{settings_hash}.npz" if settings_hash else "cqt_data.npz"
+        run.metadata["stats"] = reporter.finalize()
+        _record_analysis_inventory_run(
+            base_outdir,
+            engine="fft",
+            run_key=settings_hash or run.key,
+            info={
+                "dataset_key": f"fft:{settings_hash or run.key}",
+                "engine": "fft",
+                "algorithm": fft_algorithm,
+                "settings_hash": settings_hash,
+                "label": run.label or f"FFT {fft_algorithm.upper()}",
+                "npz": npz_name,
+                "legacy_npz": "cqt_data.npz",
+                "versions_manifest": "versions.json",
+                "settings": {
+                    "fft_algorithm": fft_algorithm,
+                    "hop_length": hop_length,
+                    "stft_n_fft": stft_n_fft,
+                    "bins_per_octave": bins_per_octave,
+                    "cqt_filter_scale": cqt_filter_scale,
+                    "cqt_window": cqt_window,
+                    "cqt_bpo_schedule": cqt_bpo_schedule,
+                    "cqt_hop_schedule": cqt_hop_schedule,
+                    "cqt_filter_scale_schedule": cqt_filter_scale_schedule,
+                    "cqt_fmin": cqt_fmin,
+                    "cqt_fmax": cqt_fmax,
+                    "region_start": self.region_start,
+                    "region_end": self.region_end,
+                    "region_total": self._wav_duration,
+                },
+                "time_range": self._run_time_range_dict(run),
+            },
+        )
+        return settings_hash, [
+            AnalysisArtifact(kind="npz", path=npz_name, settings_hash=settings_hash, folder=base_outdir),
+            AnalysisArtifact(kind="npz_legacy", path="cqt_data.npz", settings_hash=settings_hash, folder=base_outdir),
+            AnalysisArtifact(kind="versions_manifest", path="versions.json", settings_hash=settings_hash, folder=base_outdir),
+        ]
+
+    def _execute_filterbank_analysis_run(
+        self,
+        *,
+        wav_path: str,
+        base_outdir: str,
+        run: AnalysisRun,
+        progress_cb: Any,
+        resume: bool = False,
+    ) -> tuple[str, list[AnalysisArtifact]]:
+        from engine_reporter import EngineRunReporter
+        reporter = EngineRunReporter(progress_cb, run_label=run.label)
+        reporter.phase("setup")
+        compute_precision = self._analysis_compute_precision()
+        save_precision = self._analysis_save_precision()
+        compute_np_dtype = _precision_label_to_real_dtype(compute_precision)
+        sr_wav, raw_wav = _load_audio(wav_path)
+        run_dir = self._analysis_run_output_dir(base_outdir, run)
+        os.makedirs(run_dir, exist_ok=True)
+        fb_meta_path = os.path.join(run_dir, "filterbank", "filterbank_meta.json")
+        fb_env_path = os.path.join(run_dir, "filterbank", "fb_envelopes.npz")
+        fb_skip = False
+        if resume and os.path.isfile(fb_meta_path) and os.path.isfile(fb_env_path):
+            try:
+                state = FilterBankDecomposition.load_envelope_checkpoint_state(run_dir)
+                fb_skip = bool(
+                    state is not None
+                    and len(state.get("completed", [])) > 0
+                    and all(bool(x) for x in state.get("completed", []))
+                )
+            except Exception:
+                fb_skip = False
+        if fb_skip:
+            meta = FilterBankDecomposition.load_meta(run_dir)
+            if meta is None:
+                raise RuntimeError("filterbank_meta.json missing")
+            meta_top, meta_bands = meta
+            fb_loaded = FilterBankDecomposition(
+                meta_top["sr"],
+                meta_top.get("filter_type", "Linkwitz-Riley 4"),
+            )
+            for band_meta in meta_bands:
+                fb_loaded.bands.append(BandDef(
+                    fmin=band_meta["fmin"],
+                    fmax=band_meta["fmax"],
+                    label=band_meta.get("label", ""),
+                ))
+            self._fb_decomp = fb_loaded
+            self._fb_decomp_dir = run_dir
+            if self.on_fb_computed:
+                self.on_fb_computed(fb_loaded)
+        else:
+            def _to_compute(arr: np.ndarray) -> np.ndarray:
+                if np.issubdtype(arr.dtype, np.integer):
+                    return arr.astype(compute_np_dtype) / max(abs(np.iinfo(arr.dtype).min), np.iinfo(arr.dtype).max)
+                return arr.astype(compute_np_dtype)
+
+            mono = _to_compute(raw_wav.mean(axis=1) if raw_wav.ndim == 2 else raw_wav)
+            is_stereo = raw_wav.ndim == 2
+            if is_stereo:
+                left_ch = _to_compute(raw_wav[:, 0])
+                right_ch = _to_compute(raw_wav[:, 1])
+            s0, s1, _span = self._analysis_sample_span(sr=sr_wav, n_samples=len(mono))
+            mono = mono[s0:s1]
+            if is_stereo:
+                left_ch = left_ch[s0:s1]
+                right_ch = right_ch[s0:s1]
+            ftype = _FILTER_TYPES[self.fb_filter_type_idx]
+            if _FB_CONFIG_MODES[self.fb_config_mode_idx] != "Manual":
+                bands = FilterBankDecomposition.bands_from_cafls(
+                    self.cafls_anchor, self.fb_bpo, self.fb_banded_width, sr_wav
+                )
+            else:
+                bands = FilterBankDecomposition.bands_from_crossovers(
+                    self.fb_crossovers, sr_wav
+                )
+            reporter.phase("filter")
+            fb = FilterBankDecomposition(sr_wav, ftype,
+                                         filter_mode=self.fb_filter_mode)
+            fb.compute_and_save(
+                envelope_hop=self.fb_hop,
+                intermediate_precision=compute_precision,
+                save_precision=save_precision,
+                wav_path=wav_path,
+                progress_cb=lambda frac, label: reporter.progress(frac, f"{run.label} {label}"),
+            )
+            self._fb_decomp = fb
+            self._fb_decomp_dir = run_dir
+            if self.on_fb_computed:
+                self.on_fb_computed(fb)
+            reporter.phase("hilbert")
+            fb_dir = os.path.join(run_dir, "filterbank")
+            channel_pairs = [("left", mono)] if not is_stereo else [("left", left_ch), ("right", right_ch)]
+            for ch_idx, (ch_label, ch_sig) in enumerate(channel_pairs):
+                fb_ch = FilterBankDecomposition(sr_wav, ftype,
+                                               filter_mode=self.fb_filter_mode)
+                fb_ch.compute(ch_sig, bands)
+
+                def _fb_ch_progress(done: int, total: int) -> None:
+                    ch_frac = (ch_idx + (done / max(total, 1))) / max(1, len(channel_pairs))
+                    reporter.batch(1)
+                    reporter.progress(min(1.0, 0.85 + 0.15 * ch_frac),
+                                f"{run.label} Hilbert {ch_label} {done}/{total}")
+
+                mags_ch, phases_ch, hops_ch = fb_ch.compute_envelopes(
+                    hop=self.fb_hop,
+                    hilbert_progress=_fb_ch_progress,
+                )
+                data_ch = FilterBankDecomposition.envelope_save_dict(
+                    mags_ch, phases_ch, hops_ch, save_precision=save_precision)
+                np.savez_compressed(
+                    os.path.join(fb_dir, f"fb_envelopes_{ch_label}.npz"),
+                    **data_ch,
+                )
+        reporter.phase("record")
+        rel_meta = os.path.relpath(fb_meta_path, base_outdir)
+        rel_env = os.path.relpath(fb_env_path, base_outdir)
+        run_hash = f"{run.key}|{_FILTER_TYPES[self.fb_filter_type_idx]}|{save_precision}"
+        _record_analysis_inventory_run(
+            base_outdir,
+            engine="filterbank",
+            run_key=run_hash,
+            info={
+                "dataset_key": f"filterbank:{run.key}:{save_precision}",
+                "engine": "filterbank",
+                "algorithm": _FILTER_TYPES[self.fb_filter_type_idx],
+                "settings_hash": run_hash,
+                "label": run.label or f"FB {_FILTER_TYPES[self.fb_filter_type_idx]}",
+                "meta": rel_meta,
+                "envelopes": rel_env,
+                "save_precision": save_precision,
+                "settings": {
+                    "fb_filter_type": _FILTER_TYPES[self.fb_filter_type_idx],
+                    "fb_hop": self.fb_hop,
+                    "fb_bpo": self.fb_bpo,
+                    "fb_banded_width": self.fb_banded_width,
+                    "fb_hybrid": self.fb_hybrid,
+                    "fb_q_norm": self.fb_q_norm,
+                    "fb_crossovers": [float(x) for x in self.fb_crossovers],
+                    "region_start": self.region_start,
+                    "region_end": self.region_end,
+                    "region_total": self._wav_duration,
+                    "run_output_dir": os.path.relpath(run_dir, base_outdir),
+                },
+                "time_range": self._run_time_range_dict(run),
+            },
+        )
+        run.metadata["stats"] = reporter.finalize()
+        return run_hash, [
+            AnalysisArtifact(kind="meta", path=rel_meta, settings_hash=run_hash, folder=base_outdir),
+            AnalysisArtifact(kind="envelopes", path=rel_env, settings_hash=run_hash, folder=base_outdir),
+        ]
+
+    def _execute_wavelet_analysis_run(
+        self,
+        *,
+        wav_path: str,
+        base_outdir: str,
+        run: AnalysisRun,
+        progress_cb: Any,
+        resume: bool = False,
+    ) -> tuple[str, list[AnalysisArtifact]]:
+        from engine_reporter import EngineRunReporter
+        reporter = EngineRunReporter(progress_cb, run_label=run.label)
+        reporter.phase("setup")
+        compute_precision = self._analysis_compute_precision()
+        save_precision = self._analysis_save_precision()
+        compute_np_dtype = _precision_label_to_real_dtype(compute_precision)
+        sr_wav, raw_wav = _load_audio(wav_path)
+        run_dir = self._analysis_run_output_dir(base_outdir, run)
+        wv_dir = os.path.join(run_dir, "wavelet")
+        os.makedirs(wv_dir, exist_ok=True)
+        meta_path = os.path.join(wv_dir, "wavelet_meta.json")
+        data_path = os.path.join(wv_dir, "wavelet_data.npz")
+        manifest_path = os.path.join(wv_dir, "wavelet_data.stream.json")
+        if resume and os.path.isfile(meta_path):
+            run_hash = f"{run.key}|wavelet|{save_precision}"
+            artifacts = [
+                AnalysisArtifact(
+                    kind="meta",
+                    path=os.path.relpath(meta_path, base_outdir),
+                    settings_hash=run_hash,
+                    folder=base_outdir,
+                )
+            ]
+            if os.path.isfile(data_path):
+                artifacts.append(AnalysisArtifact(
+                    kind="data",
+                    path=os.path.relpath(data_path, base_outdir),
+                    settings_hash=run_hash,
+                    folder=base_outdir,
+                ))
+            return run_hash, artifacts
+        if raw_wav.ndim == 2:
+            wv_signal = raw_wav.mean(axis=1)
+        else:
+            wv_signal = raw_wav.copy()
+        if np.issubdtype(wv_signal.dtype, np.integer):
+            wv_signal = wv_signal.astype(compute_np_dtype) / max(abs(np.iinfo(raw_wav.dtype).min), np.iinfo(raw_wav.dtype).max)
+        else:
+            wv_signal = wv_signal.astype(compute_np_dtype)
+        s0, s1, _span = self._analysis_sample_span(sr=sr_wav, n_samples=len(wv_signal))
+        wv_signal = wv_signal[s0:s1]
+        wv_save_dtype = _precision_label_to_np_dtype(save_precision)
+        rel_manifest = ""
+        if self.wavelet_mode_idx == 1:
+            reporter.phase("cwt")
+            import torch
+            from torch_cqt_new import CQTProgress as _CWTProgress
+            from torch_cqt_new import cwt as _torch_cwt
+
+            cwt_wtype = _CWT_WAVELET_TYPES[self.cwt_wavelet_idx]
+            cwt_kw: dict[str, Any] = {}
+            if cwt_wtype == "morlet":
+                cwt_kw["sigma"] = self.cwt_sigma
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            torch_real = torch.float64 if compute_np_dtype == np.float64 else torch.float32
+            y_t = torch.from_numpy(wv_signal).to(device=device, dtype=torch_real)
+            cwt_eps = self.cwt_epsilon if self.cwt_epsilon > 0 else None
+            cwt_fmax = self.cafls_anchor
+            dur_floor = max(CAFLS_SEISMIC_FLOOR, 1.0 / max(len(wv_signal) / sr_wav, 1e-6))
+            cwt_fmin = dur_floor
+            cwt_progress = _CWTProgress()
+
+            def _cwt_progress_cb(progress_obj: Any) -> None:
+                batches_total = max(1, int(getattr(progress_obj, "filter_batches_total", 0) or 1))
+                batches_done = int(getattr(progress_obj, "filter_batches_done", 0))
+                reporter.batch(1)
+                reporter.progress(batches_done / batches_total, f"{run.label} CWT {batches_done}/{batches_total}")
+
+            W, freqs_t = _torch_cwt(
+                y_t, sr_wav,
+                fmin=cwt_fmin,
+                fmax=cwt_fmax,
+                scales_per_octave=self.cwt_scales_per_octave,
+                hop_length=max(1, self.cwt_hop_length),
+                wavelet=cwt_wtype,
+                wavelet_kw=cwt_kw,
+                device=device,
+                dtype=torch_real,
+                epsilon=cwt_eps,
+                progress=cwt_progress,
+                on_progress=_cwt_progress_cb,
+            )
+            n_scales, n_frames = int(W.shape[0]), int(W.shape[1])
+            cwt_working_hop = _effective_cwt_hop_length(
+                len(wv_signal), n_frames, self.cwt_hop_length
+            )
+            stream_dir = os.path.join(wv_dir, "wavelet_data.stream")
+            os.makedirs(stream_dir, exist_ok=True)
+            real_path = os.path.join(stream_dir, "W_real.npy")
+            imag_path = os.path.join(stream_dir, "W_imag.npy")
+            freqs_path = os.path.join(stream_dir, "freqs.npy")
+            W_scale = None
+            if wv_save_dtype == np.float16:
+                W_scale = max(float(W.abs().max().item()), 1.0)
+            W_real_mm = np.lib.format.open_memmap(real_path, mode="w+", dtype=wv_save_dtype, shape=(n_scales, n_frames))
+            W_imag_mm = np.lib.format.open_memmap(imag_path, mode="w+", dtype=wv_save_dtype, shape=(n_scales, n_frames))
+            reporter.phase("save", n_total=n_scales)
+            row_chunk = max(1, int(os.environ.get("SPECTRAL_CWT_SAVE_SCALE_CHUNK", "64") or 64))
+            for row0 in range(0, n_scales, row_chunk):
+                row1 = min(n_scales, row0 + row_chunk)
+                W_chunk = W[row0:row1]
+                if W_scale is not None:
+                    r_np = (W_chunk.real / W_scale).detach().cpu().numpy()
+                    i_np = (W_chunk.imag / W_scale).detach().cpu().numpy()
+                else:
+                    r_np = W_chunk.real.detach().cpu().numpy()
+                    i_np = W_chunk.imag.detach().cpu().numpy()
+                W_real_mm[row0:row1, :] = r_np.astype(wv_save_dtype, copy=False)
+                W_imag_mm[row0:row1, :] = i_np.astype(wv_save_dtype, copy=False)
+                W_real_mm.flush()
+                W_imag_mm.flush()
+                reporter.batch(row1 - row0)
+                reporter.progress(row1 / max(n_scales, 1), f"{run.label} save {row1}/{n_scales}")
+            del W_real_mm, W_imag_mm
+            np.save(freqs_path, freqs_t.detach().cpu().numpy().astype(wv_save_dtype, copy=False))
+            with open(manifest_path, "w", encoding="utf-8") as mf:
+                json.dump({
+                    "format": "wavelet_stream_v1",
+                    "arrays": {
+                        "W_real": "wavelet_data.stream/W_real.npy",
+                        "W_imag": "wavelet_data.stream/W_imag.npy",
+                        "freqs": "wavelet_data.stream/freqs.npy",
+                    },
+                }, mf, indent=2)
+            np.savez(
+                data_path,
+                stream_manifest=np.array("wavelet_data.stream.json"),
+                n_scales=np.int64(n_scales),
+                n_frames=np.int64(n_frames),
+                save_precision=np.array(save_precision),
+            )
+            with open(meta_path, "w", encoding="utf-8") as wf:
+                json.dump({
+                    "type": "cwt",
+                    "wavelet": cwt_wtype,
+                    "save_precision": save_precision,
+                    "sigma": self.cwt_sigma,
+                    "epsilon": self.cwt_epsilon,
+                    "sr": sr_wav,
+                    "n_samples": int(len(wv_signal)),
+                    "hop_length": self.cwt_hop_length,
+                    "working_hop_length": cwt_working_hop,
+                    "scales_per_octave": self.cwt_scales_per_octave,
+                    "n_scales": n_scales,
+                    "fmin": float(cwt_fmin),
+                    "fmax": float(cwt_fmax),
+                    "device": str(device),
+                    "wav_path": os.path.abspath(wav_path) if wav_path else "",
+                }, wf, indent=2)
+            run_hash = f"{run.key}|cwt|{cwt_wtype}|{save_precision}"
+            algorithm = "cwt"
+            label = f"{run.label or 'CWT'} {cwt_wtype}"
+            rel_manifest = os.path.relpath(manifest_path, base_outdir)
+        else:
+            reporter.phase("dwt")
+            import pywt
+            fam = _WAVELET_FAMILIES[self.wavelet_family_idx]
+            prefix = _WAVELET_FAMILY_PREFIX.get(fam, "db")
+            orders = _WAVELET_ORDERS.get(fam, ["-"])
+            wv_name = "dmey" if fam == "Discrete Meyer" else prefix + orders[min(self.wavelet_order_idx, len(orders) - 1)]
+            ext_mode = _WAVELET_EXTENSIONS[self.wavelet_ext_idx]
+            wv_max = pywt.dwt_max_level(len(wv_signal), wv_name)
+            if self.wavelet_depth_mode == 1:
+                wv_level = max(1, min(self.wavelet_depth_abs, wv_max))
+            else:
+                wv_level = max(1, int(round(self.wavelet_depth_pct / 100.0 * wv_max)))
+            coeffs = pywt.wavedec(wv_signal, wv_name, mode=ext_mode, level=wv_level)
+            coeffs_save, coeff_scale = _encode_scaled_float_arrays(
+                [np.asarray(c) for c in coeffs], wv_save_dtype)
+            wv_data: dict[str, np.ndarray] = {"n_levels": np.int64(len(coeffs) - 1), "approx": coeffs_save[0]}
+            if coeff_scale is not None:
+                wv_data["wv_scale"] = np.float64(coeff_scale)
+            for li, detail in enumerate(coeffs_save[1:], 1):
+                wv_data[f"detail_{li}"] = detail
+            np.savez_compressed(data_path, **wv_data)
+            with open(meta_path, "w", encoding="utf-8") as wf:
+                json.dump({
+                    "type": "dwt",
+                    "save_precision": save_precision,
+                    "wavelet": wv_name,
+                    "level": wv_level,
+                    "extension": ext_mode,
+                    "sr": sr_wav,
+                    "n_samples": int(len(wv_signal)),
+                    "n_levels": len(coeffs) - 1,
+                    "depth_pct": self.wavelet_depth_pct,
+                    "max_level": wv_max,
+                    "wav_path": os.path.abspath(wav_path) if wav_path else "",
+                }, wf, indent=2)
+            run_hash = f"{run.key}|dwt|{wv_name}|{save_precision}"
+            algorithm = "dwt"
+            label = f"{run.label or 'DWT'} {wv_name}"
+        rel_meta = os.path.relpath(meta_path, base_outdir)
+        rel_data = os.path.relpath(data_path, base_outdir)
+        info = {
+            "dataset_key": f"wavelet:{run.key}:{algorithm}:{save_precision}",
+            "engine": "wavelet",
+            "algorithm": algorithm,
+            "settings_hash": run_hash,
+            "label": label,
+            "meta": rel_meta,
+            "data": rel_data,
+            "save_precision": save_precision,
+            "settings": {
+                "wavelet_mode": algorithm,
+                "cwt_hop_length": self.cwt_hop_length,
+                "cwt_scales_per_octave": self.cwt_scales_per_octave,
+                "cwt_sigma": self.cwt_sigma,
+                "cwt_epsilon": self.cwt_epsilon,
+                "wavelet_depth_mode": self.wavelet_depth_mode,
+                "wavelet_depth_pct": self.wavelet_depth_pct,
+                "wavelet_depth_abs": self.wavelet_depth_abs,
+                "region_start": self.region_start,
+                "region_end": self.region_end,
+                "region_total": self._wav_duration,
+                "run_output_dir": os.path.relpath(run_dir, base_outdir),
+            },
+            "time_range": self._run_time_range_dict(run),
+        }
+        run.metadata["stats"] = reporter.finalize()
+        artifacts = [
+            AnalysisArtifact(kind="meta", path=rel_meta, settings_hash=run_hash, folder=base_outdir),
+            AnalysisArtifact(kind="data", path=rel_data, settings_hash=run_hash, folder=base_outdir),
+        ]
+        if rel_manifest:
+            info["manifest"] = rel_manifest
+            artifacts.append(AnalysisArtifact(kind="manifest", path=rel_manifest, settings_hash=run_hash, folder=base_outdir))
+        _record_analysis_inventory_run(base_outdir, engine="wavelet", run_key=run_hash, info=info)
+        return run_hash, artifacts
+
+    def _execute_signal_analysis_run(
+        self,
+        *,
+        wav_path: str,
+        base_outdir: str,
+        run: AnalysisRun,
+        progress_cb: Any,
+    ) -> tuple[str, list[AnalysisArtifact]]:
+        """Apply the filter/heterodyne chain and write the result as a WAV file.
+
+        No spectral transform is performed.  The output is a time-domain WAV
+        at the configured output sample-rate and bit-depth for quick audition.
+        """
+        import soundfile as _sf2
+        from filter_engine import build_streaming_filter, FIR, IIR
+        from engine_reporter import EngineRunReporter
+        reporter = EngineRunReporter(progress_cb, run_label=run.label)
+
+        sig_settings = run.settings if isinstance(run.settings, FFTAnalysisSettings) else None
+        _fmode = IIR if (sig_settings is not None and sig_settings.filter_mode == "iir") else FIR
+
+        sr_wav, raw_wav = _load_audio(wav_path)
+        time_range = run.time_range.clamped()
+        s0 = int(round(time_range.start_sec * sr_wav))
+        s1 = (int(round(time_range.effective_end_sec() * sr_wav))
+              if time_range.end_sec > 0 else len(raw_wav))
+        s0 = max(0, min(s0, len(raw_wav)))
+        s1 = max(s0, min(s1, len(raw_wav)))
+        signal = raw_wav[s0:s1]  # native dtype preserved
+
+        reporter.phase("filter")
+        reporter.progress(0.0, "signal filter")
+
+        # Build filter chain elements
+        pre_filt = None
+        if sig_settings is not None and sig_settings.prefilter_bp_fmin is not None:
+            pre_filt = build_streaming_filter(
+                sr_wav,
+                sig_settings.prefilter_bp_fmin,
+                sig_settings.prefilter_bp_fmax,
+                filter_mode=_fmode, order=8)
+        elif sig_settings is not None and sig_settings.prefilter_bp_fmax is not None:
+            pre_filt = build_streaming_filter(
+                sr_wav, None, sig_settings.prefilter_bp_fmax,
+                filter_mode=_fmode, order=8)
+
+        het_hz = float(sig_settings.heterodyne_hz if sig_settings is not None else 0.0)
+
+        post_filt = None
+        if sig_settings is not None and sig_settings.postfilter_bp_fmin is not None:
+            post_filt = build_streaming_filter(
+                sr_wav,
+                sig_settings.postfilter_bp_fmin,
+                sig_settings.postfilter_bp_fmax,
+                filter_mode=_fmode, order=8)
+        elif sig_settings is not None and sig_settings.postfilter_bp_fmax is not None:
+            post_filt = build_streaming_filter(
+                sr_wav, None, sig_settings.postfilter_bp_fmax,
+                filter_mode=_fmode, order=8)
+
+        # Process channel(s) in one pass (signal is short enough for single-shot)
+        is_stereo = signal.ndim == 2 and signal.shape[1] == 2
+        def _process_ch(ch: np.ndarray) -> np.ndarray:
+            if pre_filt is not None:
+                ch = pre_filt.process(ch)
+            if abs(het_hz) > 0.001:
+                t = np.arange(len(ch), dtype=np.float64) / sr_wav
+                carrier = np.cos(2.0 * np.pi * het_hz * t)
+                ch = ch * carrier
+            if post_filt is not None:
+                ch = post_filt.process(ch)
+            return ch
+
+        if is_stereo:
+            out_l = _process_ch(signal[:, 0].astype(np.float64))
+            out_r = _process_ch(signal[:, 1].astype(np.float64))
+            out = np.stack([out_l, out_r], axis=1)
+        else:
+            mono = signal[:, 0] if signal.ndim == 2 else signal
+            out = _process_ch(mono.astype(np.float64))
+
+        # Spline detrender (post-process; needs the full signal).
+        _spln_d = (getattr(sig_settings, "spline_detrend", None)
+                   if sig_settings is not None else None)
+        if isinstance(_spln_d, dict):
+            from signal_tools import SplineDetrenderConfig, spline_detrend as _spline_detrend
+            _spln_cfg_obj = SplineDetrenderConfig.from_dict(_spln_d)
+            if is_stereo:
+                out_l, _ = _spline_detrend(out[:, 0], sr_wav, _spln_cfg_obj)
+                out_r, _ = _spline_detrend(out[:, 1], sr_wav, _spln_cfg_obj)
+                out = np.stack([out_l, out_r], axis=1)
+            else:
+                out, _ = _spline_detrend(out, sr_wav, _spln_cfg_obj)
+
+        reporter.progress(0.8, "signal write")
+
+        # --- Output sample-rate (override) ---
+        out_sr_idx = int(run.metadata.get("signal_out_sr_idx", 0))
+        out_sr_idx = max(0, min(out_sr_idx, len(_SIGNAL_OUT_SR_OPTIONS) - 1))
+        target_sr = _SIGNAL_OUT_SR_OPTIONS[out_sr_idx]
+        if target_sr > 0 and target_sr != sr_wav:
+            reporter.phase("resample")
+            # Resample using the global policy (engine / taps / interp).
+            # Processing dtype is preserved through this step; only the rate changes.
+            _re_eng = _RESAMPLE_ENGINES[min(self.resample_engine_idx,
+                                            len(_RESAMPLE_ENGINES) - 1)]
+            _re_taps = int(_RESAMPLE_TAPS[min(self.resample_taps_idx,
+                                              len(_RESAMPLE_TAPS) - 1)])
+            _re_interp = _RESAMPLE_INTERPS[min(self.resample_interp_idx,
+                                               len(_RESAMPLE_INTERPS) - 1)]
+            from fractions import Fraction
+            _ratio = Fraction(target_sr, sr_wav).limit_denominator(512)
+            _p, _q = _ratio.numerator, _ratio.denominator
+            def _resamp(x: np.ndarray) -> np.ndarray:
+                if _re_eng == "soxr":
+                    try:
+                        import soxr as _soxr
+                        return _soxr.resample(x, sr_wav, target_sr, quality="HQ")
+                    except ImportError:
+                        pass
+                from scipy.signal import resample_poly as _rp
+                return _rp(x, _p, _q, padtype="line",
+                           window=("kaiser", _re_taps))
+            if is_stereo:
+                out = np.stack([_resamp(out[:, 0]), _resamp(out[:, 1])], axis=1)
+            else:
+                out = _resamp(out)
+            out_sr = target_sr
+        else:
+            reporter.phase("resample_skip")
+            out_sr = sr_wav
+
+        reporter.phase("write")
+        # --- Save precision (per-engine override) ---
+        save_prec_idx = int(run.metadata.get("signal_save_precision_idx", 2))
+        save_prec_idx = max(0, min(save_prec_idx, len(_SIGNAL_SAVE_SF_SUBTYPE) - 1))
+        sf_subtype = _SIGNAL_SAVE_SF_SUBTYPE[save_prec_idx]
+        write_np_dtype = _SIGNAL_SAVE_NP_DTYPE[save_prec_idx]
+        # For integer subtypes scale to [-1, 1] range then cast (WAV integer format
+        # expects normalised float for PCM in soundfile).
+        out_write = out.astype(np.float64)
+        if sf_subtype in ("PCM_16", "PCM_24"):
+            _peak = np.max(np.abs(out_write))
+            if _peak > 0.0:
+                out_write = out_write / _peak  # normalise to ±1.0 for PCM encode
+
+        run_dir = self._analysis_run_output_dir(base_outdir, run)
+        os.makedirs(run_dir, exist_ok=True)
+        wav_out_name = "signal.wav"
+        wav_out_path = os.path.join(run_dir, wav_out_name)
+        _sf2.write(wav_out_path, out_write.astype(
+            {"float32": np.float32, "float64": np.float64,
+             "int16": np.float32}.get(write_np_dtype, np.float32)),
+            out_sr, subtype=sf_subtype)
+
+        meta = {
+            "engine": "signal",
+            "sr": out_sr,
+            "source_sr": sr_wav,
+            "n_samples": int(len(out_write)),
+            "n_channels": 2 if is_stereo else 1,
+            "heterodyne_hz": het_hz,
+            "prefilter_bp_fmin": sig_settings.prefilter_bp_fmin if sig_settings else None,
+            "prefilter_bp_fmax": sig_settings.prefilter_bp_fmax if sig_settings else None,
+            "postfilter_bp_fmin": sig_settings.postfilter_bp_fmin if sig_settings else None,
+            "postfilter_bp_fmax": sig_settings.postfilter_bp_fmax if sig_settings else None,
+            "filter_mode": sig_settings.filter_mode if sig_settings else "fir",
+            "save_precision": _SIGNAL_SAVE_PRECISIONS[save_prec_idx],
+            "wav_out": wav_out_name,
+            "wav_path": os.path.abspath(wav_path),
+            "time_range": self._run_time_range_dict(run),
+        }
+        meta_name = "signal_meta.json"
+        with open(os.path.join(run_dir, meta_name), "w", encoding="utf-8") as mf:
+            json.dump(meta, mf, indent=2)
+
+        reporter.batch(int(len(out_write)))
+        reporter.progress(1.0, "signal done")
+        run.metadata["stats"] = reporter.finalize()
+        run_hash = f"{run.key}|signal|{het_hz}|{_fmode}"
+        rel_wav = os.path.relpath(wav_out_path, base_outdir)
+        rel_meta = os.path.relpath(os.path.join(run_dir, meta_name), base_outdir)
+        info = {
+            "dataset_key": f"signal:{run.key}",
+            "engine": "signal",
+            "settings_hash": run_hash,
+            "label": run.label or "Signal",
+            "wav": rel_wav,
+            "meta": rel_meta,
+            "settings": meta,
+            "time_range": self._run_time_range_dict(run),
+        }
+        _record_analysis_inventory_run(base_outdir, engine="signal", run_key=run_hash, info=info)
+        return run_hash, [
+            AnalysisArtifact(kind="wav", path=rel_wav, settings_hash=run_hash, folder=base_outdir),
+            AnalysisArtifact(kind="meta", path=rel_meta, settings_hash=run_hash, folder=base_outdir),
+        ]
+
+    def _run_analysis(self, *,
+                      _force_wav_path: str | None = None,
+                      _force_outdir: str | None = None,
+                      _resume: bool = False,
+                      _force_itinerary: "AnalysisItinerary | None" = None) -> None:
+        if _force_wav_path is not None:
+            wav_path = _force_wav_path
+        else:
+            idx = self.wav_list.selected_idx
+            if idx < 0 or idx >= len(self._wav_paths):
+                return
+            wav_path = self._wav_paths[idx]
+        itinerary = _force_itinerary if _force_itinerary is not None else self.build_analysis_itinerary()
+        planned_runs = itinerary.enabled_runs()
+        if not planned_runs:
+            return
+        self._analyzing = True
+        self._analysis_error = None
+        self._analysis_progress = 0.0
+        self._analysis_phase = "Planning"
+
+        def _set_progress(frac: float, phase: str) -> None:
+            self._analysis_progress = max(0.0, min(1.0, frac))
+            self._analysis_phase = phase
+
+        def _worker() -> None:
+            original_settings = self.settings_dict()
+            base_name = os.path.splitext(os.path.basename(wav_path))[0]
+            outdir = (_force_outdir if _force_outdir is not None
+                      else os.path.join(self.output_root, f"{base_name}_analysis"))
+            current_run: AnalysisRun | None = None
+            try:
+                os.makedirs(outdir, exist_ok=True)
+                settings_blob = self.settings_dict()
+                settings_blob["_wav_path"] = wav_path
+                settings_blob["_analysis_itinerary"] = itinerary.to_dict()
+                with open(os.path.join(outdir, "analysis_settings.json"), "w", encoding="utf-8") as sf:
+                    json.dump(settings_blob, sf, indent=2, sort_keys=True)
+                projections = self._project_itinerary_demands(itinerary)
+                weights = [max(float(row["bytes"]), 1.0) for row in projections["rows"]]
+                total_weight = max(sum(weights), 1.0)
+                weight_done = 0.0
+                self._save_analysis_itinerary_receipt(outdir, itinerary)
+                for idx, run in enumerate(planned_runs):
+                    current_run = run
+                    itinerary.apply_run_to(self, run)
+                    self.region_start = float(run.time_range.start_sec)
+                    self.region_end = float(run.time_range.end_sec)
+                    run.status = "running"
+                    run.output_folder = self._analysis_run_output_dir(outdir, run)
+                    self._save_analysis_itinerary_receipt(outdir, itinerary)
+                    run_weight = weights[idx]
+                    phase_base = weight_done / total_weight
+                    phase_span = run_weight / total_weight
+
+                    def _run_progress(frac: float, label: str) -> None:
+                        _set_progress(phase_base + max(0.0, min(1.0, frac)) * phase_span, label)
+
+                    if run.engine == "fft":
+                        run.settings_hash, run.deposits = self._execute_fft_analysis_run(
+                            wav_path=wav_path,
+                            base_outdir=outdir,
+                            run=run,
+                            progress_cb=_run_progress,
+                        )
+                    elif run.engine == "fb":
+                        run.settings_hash, run.deposits = self._execute_filterbank_analysis_run(
+                            wav_path=wav_path,
+                            base_outdir=outdir,
+                            run=run,
+                            progress_cb=_run_progress,
+                            resume=_resume,
+                        )
+                    elif run.engine == "wavelet":
+                        run.settings_hash, run.deposits = self._execute_wavelet_analysis_run(
+                            wav_path=wav_path,
+                            base_outdir=outdir,
+                            run=run,
+                            progress_cb=_run_progress,
+                            resume=_resume,
+                        )
+                    elif run.engine == "signal":
+                        run.settings_hash, run.deposits = self._execute_signal_analysis_run(
+                            wav_path=wav_path,
+                            base_outdir=outdir,
+                            run=run,
+                            progress_cb=_run_progress,
+                        )
+                    else:
+                        raise RuntimeError(f"Unsupported analysis engine: {run.engine}")
+                    run.status = "completed"
+                    self._save_analysis_itinerary_receipt(outdir, itinerary)
+                    # Back up analysis_settings.json with the run's hash so resume
+                    # can always find the exact configuration that produced this dataset.
+                    if run.settings_hash:
+                        _src = os.path.join(outdir, "analysis_settings.json")
+                        _dst = os.path.join(
+                            outdir, f"analysis_settings_{run.settings_hash}.json")
+                        if os.path.isfile(_src) and not os.path.isfile(_dst):
+                            try:
+                                import shutil as _shutil
+                                _shutil.copy2(_src, _dst)
+                            except Exception:
+                                pass
+                    weight_done += run_weight
+                    _set_progress(weight_done / total_weight, f"{run.label} done")
+                _set_progress(1.0, "Complete")
+                self._refresh_folders()
+            except Exception as exc:
+                if current_run is not None:
+                    current_run.status = "failed"
+                    current_run.metadata["error"] = str(exc)
+                    try:
+                        self._save_analysis_itinerary_receipt(outdir, itinerary)
+                    except Exception:
+                        pass
+                try:
+                    import traceback as _tb
+                    print("\n[Analysis Error]")
+                    print(_tb.format_exc(), flush=True)
+                except Exception:
+                    pass
+                self._analysis_error = str(exc)
+            finally:
+                try:
+                    self.apply_settings_dict(original_settings)
+                except Exception:
+                    pass
+                self._analyzing = False
+                self._analysis_progress = 0.0
+                self._analysis_phase = ""
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        self._analysis_thread = t
+
     def _run_resume(self) -> None:
         """Resume analysis on the selected folder — skip stages already on disk."""
         idx = self.folder_list.selected_idx
         if idx < 0 or idx >= len(self._folder_paths):
             return
         raw = self._folder_paths[idx]
-        folder_path = raw.rsplit("::", 1)[0] if "::" in raw else raw
 
-        settings_path = os.path.join(folder_path, "analysis_settings.json")
-        wav_path: str | None = None
-        if os.path.isfile(settings_path):
+        # Determine if a specific stream hash was selected (via ::stream:: key).
+        # If so, use that hash to load the exact settings file for that run
+        # rather than sorting all available files and picking the first one.
+        _pinned_hash: str | None = None
+        if "::stream::" in raw:
+            _parts = raw.split("::stream::")
+            folder_path = _parts[0]
+            _pinned_hash = _parts[1] if len(_parts) > 1 else None
+        elif "::" in raw:
+            folder_path = raw.rsplit("::", 1)[0]
+        else:
+            folder_path = raw
+
+        _d: dict = {}
+        _settings_candidates: list[str] = []
+        import glob as _glob
+
+        if _pinned_hash:
+            # Pinned hash: look for the exact settings backup first, then fall
+            # back to the embedded stream snapshot, then the generic file.
+            _exact = os.path.join(folder_path, f"analysis_settings_{_pinned_hash}.json")
+            _settings_candidates.append(_exact)
+            # Also check inside the stream dir for the embedded snapshot.
+            _sdir = os.path.join(folder_path, f"cqt_data_{_pinned_hash}.stream")
+            _snap = os.path.join(_sdir, f"settings_{_pinned_hash}.json")
+            _settings_candidates.append(_snap)
+        else:
+            # No specific hash: prefer hash-stamped backups over the generic one,
+            # since the generic file may have been overwritten by a later partial run.
+            for _hf in sorted(_glob.glob(
+                    os.path.join(folder_path, "analysis_settings_*.json")), reverse=True):
+                _settings_candidates.append(_hf)
+        _settings_candidates.append(os.path.join(folder_path, "analysis_settings.json"))
+
+        for _sp in _settings_candidates:
+            if os.path.isfile(_sp):
+                try:
+                    with open(_sp, "r", encoding="utf-8") as _f:
+                        _d = json.load(_f)
+                    break
+                except Exception as _e:
+                    print(f"  resume: failed to read {_sp}: {_e}")
+
+        # If a specific hash was pinned but the loaded settings don't match —
+        # e.g. analysis_settings.json was overwritten by a subsequent run —
+        # do a full scan of every settings file in the folder looking for one
+        # whose stored itinerary references the pinned hash.  This recovers
+        # from the common case where the user started a second run before the
+        # first one's results were backed up under the hash-stamped filename.
+        if _pinned_hash and _d:
+            _itin = _d.get("_analysis_itinerary", {})
+            _itin_hashes = {
+                r.get("settings_hash", "") or r.get("hash", "")
+                for r in _itin.get("runs", [])
+            }
+            if _pinned_hash not in _itin_hashes:
+                print(f"  resume: loaded settings don't match pinned hash {_pinned_hash}; "
+                      f"scanning all settings files for a match...")
+                _found_match = False
+                for _hf in sorted(_glob.glob(
+                        os.path.join(folder_path, "analysis_settings*.json"))):
+                    try:
+                        with open(_hf, "r", encoding="utf-8") as _f2:
+                            _d2 = json.load(_f2)
+                        _i2 = _d2.get("_analysis_itinerary", {})
+                        _h2 = {
+                            r.get("settings_hash", "") or r.get("hash", "")
+                            for r in _i2.get("runs", [])
+                        }
+                        if _pinned_hash in _h2:
+                            print(f"  resume: found matching settings in {_hf}")
+                            _d = _d2
+                            _found_match = True
+                            break
+                    except Exception:
+                        pass
+                if not _found_match:
+                    print(f"  resume: no settings file found for hash {_pinned_hash} — "
+                          f"the analysis folder may be missing analysis_settings_{_pinned_hash}.json")
+
+        wav_path: str | None = _d.get("_wav_path")
+
+        # Restore the exact itinerary that was planned for the original run.
+        # We must NOT fall back to whatever is currently set in the UI — that
+        # could include engines (e.g. filterbank, wavelet) that were never
+        # part of this dataset's analysis.
+        stored_itinerary_dict = _d.get("_analysis_itinerary")
+        forced_itinerary: "AnalysisItinerary | None" = None
+        if stored_itinerary_dict:
             try:
-                with open(settings_path, "r", encoding="utf-8") as _f:
-                    _d = json.load(_f)
-                wav_path = _d.get("_wav_path")
-                # Apply saved UI settings so phase config matches the folder
+                forced_itinerary = AnalysisItinerary.from_dict(stored_itinerary_dict)
+                # Reset run statuses to "planned" so _run_analysis re-executes them.
+                for _run in forced_itinerary.runs:
+                    if _run.status in ("completed", "failed"):
+                        _run.status = "planned"
+            except Exception as _e:
+                print(f"  resume: could not restore itinerary from settings: {_e}")
+
+        if not forced_itinerary and _pinned_hash:
+            # Last resort: no settings file could be matched to this stream hash.
+            # Treat the stream directory as self-describing data: read the embedded
+            # settings_{hash}.json snapshot that bass_analysis writes before any
+            # mmap allocation and synthesise a minimal AnalysisRun from it.
+            # The run carries shash_override so bass_analysis receives --shash and
+            # targets the exact stream directory, bypassing hash recomputation.
+            _lrsd = os.path.join(folder_path, f"cqt_data_{_pinned_hash}.stream")
+            _lrsnap_path = os.path.join(_lrsd, f"settings_{_pinned_hash}.json")
+            _lrsnap: dict = {}
+            if os.path.isfile(_lrsnap_path):
+                try:
+                    with open(_lrsnap_path, "r", encoding="utf-8") as _lrf:
+                        _lrsnap = json.load(_lrf)
+                except Exception as _lre:
+                    print(f"  resume: last-resort snapshot read failed: {_lre}")
+            if _lrsnap:
+                print(f"  resume: synthesising itinerary from stream snapshot "
+                      f"(last resort, hash={_pinned_hash})")
+                _lr_s = FFTAnalysisSettings(
+                    fft_algorithm=str(_lrsnap.get("fft_algorithm", "librosa")),
+                    hop_length=int(_lrsnap.get("hop_length", 512)),
+                    bins_per_octave=int(_lrsnap.get("bins_per_octave", 1200)),
+                    cqt_filter_scale=float(_lrsnap.get("cqt_filter_scale", 1.0)),
+                    cqt_fmin=float(_lrsnap.get("cqt_fmin", 30.87)),
+                    cqt_fmax=float(_lrsnap.get("cqt_fmax", 19912.13)),
+                    heterodyne_hz=float(_lrsnap.get("heterodyne_hz", 0.0)),
+                    shash_override=_pinned_hash,
+                )
+                if _lrsnap.get("cqt_bpo_schedule"):
+                    _lr_s.cqt_bpo_schedule = list(_lrsnap["cqt_bpo_schedule"])
+                if _lrsnap.get("cqt_hop_schedule"):
+                    _lr_s.cqt_hop_schedule = list(_lrsnap["cqt_hop_schedule"])
+                if _lrsnap.get("cqt_filter_scale_schedule"):
+                    _lr_s.cqt_filter_scale_schedule = list(
+                        _lrsnap["cqt_filter_scale_schedule"])
+                if _lrsnap.get("prefilter_bp_fmin") is not None:
+                    _lr_s.prefilter_bp_fmin = float(_lrsnap["prefilter_bp_fmin"])
+                if _lrsnap.get("prefilter_bp_fmax") is not None:
+                    _lr_s.prefilter_bp_fmax = float(_lrsnap["prefilter_bp_fmax"])
+                _lr_run = AnalysisRun(
+                    key="fft_cqt_recovered",
+                    engine="fft",
+                    settings=_lr_s,
+                    label=f"[recovered {_pinned_hash[:6]}]",
+                    status="planned",
+                )
+                forced_itinerary = AnalysisItinerary(runs=[_lr_run])
+                # Use wav_path from the snapshot if we don't already have one.
+                if not wav_path or not os.path.isfile(str(wav_path)):
+                    _lr_wav = _lrsnap.get("wav_path")
+                    if _lr_wav and os.path.isfile(str(_lr_wav)):
+                        wav_path = str(_lr_wav)
+            else:
+                print(f"  resume: no settings snapshot found in stream dir — "
+                      f"cannot synthesise itinerary for hash {_pinned_hash}")
+
+        if not forced_itinerary:
+            self._analysis_error = (
+                "Resume: no stored itinerary found — cannot resume without knowing "
+                "which analysis engines were originally planned."
+            )
+            return
+
+        # Apply the stored UI settings so display params (gamma, fmin, etc.) match.
+        if _d:
+            try:
                 self.apply_settings_dict(_d)
             except Exception as _e:
-                print(f"  resume: failed to read settings: {_e}")
+                print(f"  resume: failed to apply stored settings: {_e}")
 
         # Fall back to currently selected WAV if wav_path not stored
         if not wav_path or not os.path.isfile(wav_path):
@@ -10130,6 +15313,7 @@ class SourcePanel(Panel):
             _force_wav_path=wav_path,
             _force_outdir=folder_path,
             _resume=True,
+            _force_itinerary=forced_itinerary,
         )
 
     def _graduate_band(self, band_idx: int) -> None:
@@ -10253,6 +15437,164 @@ class SourcePanel(Panel):
         self._item_map[key] = (click_rect, None)
         return x + total_w
 
+    # ---- Signal Generator v2 synthesis -----------------------------------
+
+    def _run_siggen_v2(self) -> None:
+        """Build a WitnessAwareSynthDriver from panel state and render to WAV."""
+        if self._sgv2_generating:
+            return
+        self._sgv2_generating = True
+        self._sgv2_status = "Generating…"
+
+        def _worker() -> None:
+            try:
+                from signal_generator_v2 import (
+                    ConstantField, ExponentialDecayPhasePath,
+                    ExponentialEnvelope, HarmonicLattice,
+                    HarmonicMeasureManifold, LatticeVoice,
+                    NullDriftModel, PhaseWarpedManifold,
+                    PureSineManifold, SigmoidField,
+                    SmoothSinusoidalDriftModel, SynthFactory,
+                    WitnessAwareSynthDriver, WitnessThresholds,
+                    DensityPolicy, EmissionRange, ProjectionPolicy,
+                    PowerLawDecayPhasePath,
+                )
+                import math as _math
+
+                # --- Phase path ---
+                if self._sgv2_path_idx == 0:
+                    # Constant frequency: wrap in a trivial linear path
+                    class _ConstantPath:
+                        def __init__(self, f: float) -> None:
+                            self._f = f
+                        def phase(self, t: float) -> float:
+                            return 2.0 * _math.pi * self._f * t
+                        def frequency_hz(self, t: float) -> float:
+                            return self._f
+                    master_path = _ConstantPath(self._sgv2_freq_start)
+                elif self._sgv2_path_idx == 1:
+                    master_path = ExponentialDecayPhasePath(
+                        initial_frequency_hz=self._sgv2_freq_start,
+                        tau_seconds=self._sgv2_tau,
+                    )
+                else:
+                    master_path = PowerLawDecayPhasePath(
+                        initial_frequency_hz=self._sgv2_freq_start,
+                        tau_seconds=self._sgv2_tau,
+                        power=self._sgv2_power,
+                    )
+
+                # --- Manifold ---
+                if self._sgv2_manifold_idx == 0:
+                    manifold = PureSineManifold()
+                elif self._sgv2_manifold_idx == 1:
+                    manifold = PhaseWarpedManifold(
+                        harmonic_warp_strength=self._sgv2_warp_strength)
+                else:
+                    manifold = HarmonicMeasureManifold(
+                        max_harmonics=max(1, self._sgv2_max_harmonics))
+
+                # --- Drift model ---
+                if self._sgv2_drift_idx == 0:
+                    drift = NullDriftModel()
+                else:
+                    drift = SmoothSinusoidalDriftModel(
+                        base_rate_hz=self._sgv2_drift_rate,
+                        max_offset_hz=self._sgv2_drift_max,
+                        harmonic_scaling_power=self._sgv2_drift_harm_power,
+                    )
+
+                # --- Voices (harmonic partials 1..N) ---
+                voices = []
+                for idx in range(1, self._sgv2_partial_count + 1):
+                    amplitude = ExponentialEnvelope(
+                        initial=1.0 / idx,
+                        tau_seconds=self._sgv2_amp_decay_tau * (1.0 + 0.1 * idx),
+                    )
+                    shape = SigmoidField(
+                        low=self._sgv2_shape_low,
+                        high=self._sgv2_shape_high,
+                        center=self._sgv2_shape_center,
+                        width=self._sgv2_shape_width,
+                    )
+                    voices.append(LatticeVoice(
+                        name=f"partial_{idx}",
+                        harmonic_index=idx,
+                        master_phase_path=master_path,
+                        waveform_manifold=manifold,
+                        amplitude_field=amplitude,
+                        shape_field=shape,
+                        drift_model=drift,
+                        gain=1.0,
+                        phase_offset=0.0,
+                    ))
+                lattice = HarmonicLattice(voices)
+
+                # --- Driver ---
+                driver = WitnessAwareSynthDriver(
+                    lattice=lattice,
+                    witness_thresholds=WitnessThresholds(
+                        backward_phase_radians=self._sgv2_witness_bwd,
+                        forward_phase_radians=self._sgv2_witness_fwd,
+                        max_support_seconds=self._sgv2_witness_max_sup,
+                        support_search_step_seconds=self._sgv2_witness_step,
+                        integration_steps_per_check=self._sgv2_witness_int_steps,
+                    ),
+                    density_policy=DensityPolicy(
+                        oversampling_factor=self._sgv2_oversample,
+                        min_sample_rate=self._sgv2_min_sr,
+                        max_sample_rate=self._sgv2_max_sr,
+                        derivative_weight=self._sgv2_deriv_weight,
+                        support_weight=self._sgv2_support_weight,
+                    ),
+                    projection_policy=ProjectionPolicy(
+                        output_sample_rate=float(self._sgv2_out_sr),
+                        projection_half_support_seconds=self._sgv2_proj_half_sup_ms / 1000.0,
+                    ),
+                )
+
+                # --- Render ---
+                emission_range = EmissionRange(
+                    start_time=0.0, end_time=self._sgv2_duration)
+                samples = driver.emit_uniform_real(emission_range)
+
+                import numpy as _np
+                data = _np.array(samples, dtype=_np.float64)
+                peak = float(_np.abs(data).max())
+                if peak > 0.0:
+                    data /= peak
+
+                n_ch = 2 if self._sgv2_channels_idx == 1 else 1
+                if n_ch == 2:
+                    data = _np.stack([data, data], axis=1)
+
+                # --- Write ---
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                depth = _SIG_BIT_DEPTHS[self._sgv2_bit_depth_idx]
+                use_flac = (depth != "32-bit float") and _HAS_SOUNDFILE
+                ext = ".flac" if use_flac else ".wav"
+                out_path = os.path.join(
+                    self.input_dir, f"sgv2_{ts}{ext}")
+                if use_flac:
+                    subtype = "PCM_24" if depth == "24-bit int" else "PCM_16"
+                    _sf.write(out_path, data, self._sgv2_out_sr,
+                              subtype=subtype, format="FLAC")
+                else:
+                    from scipy.io import wavfile as _wf
+                    _wf.write(out_path, self._sgv2_out_sr,
+                              data.astype(_np.float32))
+
+                self._sgv2_status = f"Wrote {os.path.basename(out_path)}"
+                self._refresh_wavs()
+
+            except Exception as exc:
+                self._sgv2_status = f"Error: {exc}"
+            finally:
+                self._sgv2_generating = False
+
+        self._sgv2_thread = threading.Thread(target=_worker, daemon=True)
+        self._sgv2_thread.start()
+
     # ---- Main render ------------------------------------------------------
 
     def render(self) -> pygame.Surface | None:
@@ -10265,36 +15607,230 @@ class SourcePanel(Panel):
         self._refresh_folders()
 
         # Pre-compute total height — band list now scrolls internally
-        est_h = 1800
+        est_h = 3600
         surf = pygame.Surface((w, est_h), pygame.SRCALPHA)
         surf.fill((30, 30, 30, 210))
         y = self.PAD
 
-        # === Source presets ===
-        self._refresh_presets()
-        preset_opts = self._preset_names if self._preset_names else ["(none)"]
-        preset_idx = self._preset_selected_idx if self._preset_names else 0
-        y = self._render_dropdown_btn(
-            surf, font, y, w, "src_preset", "Preset:",
-            preset_opts, preset_idx)
+        # =====================================================================
+        # === WAV Sources (collapsible, collapsed by default) ===
+        # =====================================================================
+        y = self._render_section_header(surf, font, y, w,
+                                        "WAV Sources", "wav_sources_hdr",
+                                        self._wav_sources_expanded)
+        if self._wav_sources_expanded:
+            # Source presets
+            self._refresh_presets()
+            preset_opts = self._preset_names if self._preset_names else ["(none)"]
+            preset_idx = self._preset_selected_idx if self._preset_names else 0
+            y = self._render_dropdown_btn(
+                surf, font, y, w, "src_preset", "Preset:",
+                preset_opts, preset_idx)
 
-        # === WAV file list ===
-        y += self.wav_list.render(surf, font, 0, y, w)
+            # WAV file list
+            y += self.wav_list.render(surf, font, 0, y, w)
 
-        # === Channel mode ===
-        y = self._render_dropdown_btn(surf, font, y, w, "chan_mode",
-                                      "Chan:", _CHANNEL_MODES,
-                                      self.channel_mode_idx)
-        y = self._render_dropdown_btn(surf, font, y, w,
-                                      "analysis_compute_prec", "Compute:",
-                                      _ANALYSIS_COMPUTE_PRECISIONS,
-                                      self.analysis_compute_precision_idx)
-        y = self._render_dropdown_btn(surf, font, y, w,
-                                      "analysis_save_prec", "Save:",
-                                      _ANALYSIS_SAVE_PRECISIONS,
-                                      self.analysis_save_precision_idx)
+            # Channel mode
+            y = self._render_dropdown_btn(surf, font, y, w, "chan_mode",
+                                          "Chan:", _CHANNEL_MODES,
+                                          self.channel_mode_idx)
+            y = self._render_dropdown_btn(surf, font, y, w,
+                                          "analysis_compute_prec", "Compute:",
+                                          _ANALYSIS_COMPUTE_PRECISIONS,
+                                          self.analysis_compute_precision_idx)
+            y = self._render_dropdown_btn(surf, font, y, w,
+                                          "analysis_save_prec", "Save:",
+                                          _ANALYSIS_SAVE_PRECISIONS,
+                                          self.analysis_save_precision_idx)
 
-        # === CAFLS anchor ===
+            self._module_stack.set_subpanels(self._build_analysis_module_specs())
+            y += self._module_stack.render(surf, font, 0, y, w)
+            y += 4
+        else:
+            # Still need module_stack built for itinerary generation even when collapsed
+            self._module_stack.set_subpanels(self._build_analysis_module_specs())
+
+        # =====================================================================
+        # === Signal Generator v2 (collapsible, expanded by default) ===
+        # =====================================================================
+        y = self._render_section_header(surf, font, y, w,
+                                        "Signal Generator v2", "siggen_hdr",
+                                        self._siggen_expanded)
+        if self._siggen_expanded:
+            # -- Phase path --
+            y = self._render_dropdown_btn(surf, font, y, w,
+                                          "sgv2_path", "Path:",
+                                          _SGV2_PATH_TYPES, self._sgv2_path_idx)
+            _nyq_sgv2 = self._sgv2_out_sr / 2.0
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_freq", "Freq:",
+                self._sgv2_freq_start, 1.0, _nyq_sgv2,
+                _freq_fmt(self._sgv2_freq_start), note_label=True, log=True)
+            if self._sgv2_path_idx > 0:   # decay paths need tau
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_tau", "\u03c4 (s):",
+                    self._sgv2_tau, 0.01, 60.0, "{:.2f}", log=True)
+            if self._sgv2_path_idx == 2:  # power law needs exponent
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_power", "Power:",
+                    self._sgv2_power, 0.1, 10.0, "{:.2f}", log=False)
+
+            # -- Manifold --
+            y = self._render_dropdown_btn(surf, font, y, w,
+                                          "sgv2_manifold", "Manifold:",
+                                          _SGV2_MANIFOLDS, self._sgv2_manifold_idx)
+            if self._sgv2_manifold_idx == 1:
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_warp", "Warp:",
+                    self._sgv2_warp_strength, 0.0, 2.0, "{:.2f}", log=False)
+            elif self._sgv2_manifold_idx == 2:
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_maxharm", "Max H:",
+                    float(self._sgv2_max_harmonics), 1.0, 32.0, "{:.0f}", log=False)
+
+            # -- Harmonic structure --
+            pygame.draw.line(surf, (55, 60, 70),
+                             (self.PAD, y), (w - self.PAD, y))
+            y += 3
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_partials", "Partials:",
+                float(self._sgv2_partial_count), 1.0, 32.0, "{:.0f}", log=False)
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_amp_tau", "Amp \u03c4:",
+                self._sgv2_amp_decay_tau, 0.1, 60.0, "{:.2f}", log=True)
+
+            # -- Shape sigmoid envelope --
+            _sg_hdr = font.render("  Shape Envelope (sigmoid):",
+                                  True, (130, 150, 170))
+            surf.blit(_sg_hdr, (self.PAD, y + 2))
+            y += self.ROW_H
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_shape_lo", "  Low:",
+                self._sgv2_shape_low, 0.0, 1.0, "{:.2f}", log=False)
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_shape_hi", "  High:",
+                self._sgv2_shape_high, 0.0, 1.0, "{:.2f}", log=False)
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_shape_ctr", "  Center:",
+                self._sgv2_shape_center, 0.0, 30.0, "{:.2f}", log=False)
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_shape_wid", "  Width:",
+                self._sgv2_shape_width, 0.01, 10.0, "{:.2f}", log=True)
+
+            # -- Drift --
+            pygame.draw.line(surf, (55, 60, 70),
+                             (self.PAD, y), (w - self.PAD, y))
+            y += 3
+            y = self._render_dropdown_btn(surf, font, y, w,
+                                          "sgv2_drift", "Drift:",
+                                          _SGV2_DRIFT_TYPES, self._sgv2_drift_idx)
+            if self._sgv2_drift_idx == 1:
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_drift_rate", "  Rate:",
+                    self._sgv2_drift_rate, 0.001, 10.0, "{:.3f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_drift_max", "  Max Hz:",
+                    self._sgv2_drift_max, 0.001, 100.0, "{:.3f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_drift_pwr", "  H Power:",
+                    self._sgv2_drift_harm_power, 0.0, 4.0, "{:.2f}", log=False)
+
+            # -- Witness thresholds (expert, sub-collapsible) --
+            y = self._render_section_header(
+                surf, font, y, w,
+                "Witness Thresholds", "sgv2_witness_hdr",
+                self._sgv2_witness_expanded)
+            if self._sgv2_witness_expanded:
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_w_bwd", "Bwd \u03c6:",
+                    self._sgv2_witness_bwd, 0.1, 100.0, "{:.2f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_w_fwd", "Fwd \u03c6:",
+                    self._sgv2_witness_fwd, 0.1, 100.0, "{:.2f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_w_max_sup", "Max sup:",
+                    self._sgv2_witness_max_sup, 0.1, 60.0, "{:.1f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_w_step", "Step:",
+                    self._sgv2_witness_step, 0.0001, 0.1, "{:.4f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_w_int", "Int steps:",
+                    float(self._sgv2_witness_int_steps), 4.0, 256.0, "{:.0f}", log=True)
+
+            # -- Density policy (expert, sub-collapsible) --
+            y = self._render_section_header(
+                surf, font, y, w,
+                "Density Policy", "sgv2_density_hdr",
+                self._sgv2_density_expanded)
+            if self._sgv2_density_expanded:
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_oversamp", "Oversamp:",
+                    self._sgv2_oversample, 1.0, 128.0, "{:.1f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_min_sr", "Min SR:",
+                    self._sgv2_min_sr, 8000.0, 384000.0, "{:.0f}", log=True)
+                _sgv2_max_sr_m = self._sgv2_max_sr / 1_000_000.0
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_max_sr_m", "Max SR(M):",
+                    _sgv2_max_sr_m, 0.1, 50.0, "{:.1f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_deriv_w", "Deriv w:",
+                    self._sgv2_deriv_weight, 0.0, 5.0, "{:.2f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_sup_w", "Support w:",
+                    self._sgv2_support_weight, 0.0, 5.0, "{:.2f}", log=False)
+
+            # -- Projection (expert, sub-collapsible) --
+            y = self._render_section_header(
+                surf, font, y, w,
+                "Projection", "sgv2_proj_hdr",
+                self._sgv2_proj_expanded)
+            if self._sgv2_proj_expanded:
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_out_sr", "Out SR:",
+                    float(self._sgv2_out_sr), 8000.0, 192000.0, "{:.0f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "sgv2_half_sup_ms", "Half sup ms:",
+                    self._sgv2_proj_half_sup_ms, 0.01, 50.0, "{:.2f}", log=True)
+
+            # -- Output format --
+            pygame.draw.line(surf, (55, 60, 70),
+                             (self.PAD, y), (w - self.PAD, y))
+            y += 3
+            y = self._render_slider(
+                surf, font, y, w, "sgv2_duration", "Duration:",
+                self._sgv2_duration, 0.1, 600.0, "{:.1f}", log=False)
+            y = self._render_dropdown_btn(surf, font, y, w,
+                                          "sgv2_bit_depth", "Depth:",
+                                          _SIG_BIT_DEPTHS, self._sgv2_bit_depth_idx)
+            y = self._render_dropdown_btn(surf, font, y, w,
+                                          "sgv2_channels", "Channels:",
+                                          _SIG_CHANNELS, self._sgv2_channels_idx)
+
+            # -- Generate button --
+            gen_r = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
+            if self._sgv2_generating:
+                pygame.draw.rect(surf, (50, 40, 15), gen_r)
+                pygame.draw.rect(surf, (200, 160, 40), gen_r, 1)
+                _gt = font.render("Generating…", True, (255, 230, 150))
+            else:
+                pygame.draw.rect(surf, (35, 70, 90), gen_r)
+                pygame.draw.rect(surf, (70, 120, 150), gen_r, 1)
+                _gt = font.render("Generate (v2)", True, (160, 220, 255))
+            surf.blit(_gt, (gen_r.x + gen_r.w // 2 - _gt.get_width() // 2, y + 3))
+            self._item_map["sgv2_gen_btn"] = (gen_r, None)
+            y += self.ROW_H + 2
+
+            # Status message
+            if self._sgv2_status:
+                _sc = (120, 200, 120) if "Wrote" in self._sgv2_status else (255, 160, 100)
+                _st = font.render(self._sgv2_status[:42], True, _sc)
+                surf.blit(_st, (self.PAD, y + 2))
+                y += self.ROW_H
+
+        # =====================================================================
+        # === CAFLS anchor (always visible when not collapsed in wav sources) ===
+
         # f_a is the shared hybrid center. CWT and CQT can overlap around it
         # via redundancy, while FB stays centered here with its own width.
         _anchor_lo, _anchor_hi_raw = self._freq_limits()
@@ -10309,35 +15845,10 @@ class SourcePanel(Panel):
             note_label=True, log=True)
         # Regime legend
         _reg_txt = font.render(
-            f"\u2190 CWT (log-period)  |  CQT (log-freq) \u2192   [{_anchor_note}]",
+            f"\u2190 CWT (log-period)  |  FFT (log-freq) \u2192   [{_anchor_note}]",
             True, (130, 170, 200))
         surf.blit(_reg_txt, (self.PAD, y + 2))
         y += self.ROW_H + 4
-
-        # === Source include checkboxes ===
-        # Each checkbox opts out of the corresponding frequency band entirely.
-        lbl = font.render("Bands:", True, (160, 160, 160))
-        surf.blit(lbl, (self.PAD, y + 3))
-        cx = self.PAD + lbl.get_width() + 6
-        cx = self._render_checkbox(surf, font, cx, y, w, "inc_cqt",
-                                   "CQT", self.include_cqt)
-        cx = self._render_checkbox(surf, font, cx, y, w, "inc_fb",
-                                   "FB", self.include_fb)
-        cx = self._render_checkbox(surf, font, cx, y, w, "inc_wavelet",
-                                   "CWT", self.include_wavelet)
-        y += self.ROW_H + 2
-        # Hybrid checkbox (only relevant when FB is included)
-        if self.include_fb:
-            cx2 = self.PAD + 10
-            cx2 = self._render_checkbox(surf, font, cx2, y, w,
-                                        "fb_hybrid", "Hybrid (CWT low / FB center / CQT high)",
-                                        self.fb_hybrid)
-            y += self.ROW_H + 2
-            cx3 = self.PAD + 10
-            cx3 = self._render_checkbox(surf, font, cx3, y, w,
-                                        "fb_q_norm", "Q-width normalization",
-                                        self.fb_q_norm)
-            y += self.ROW_H + 2
 
         # Derive effective mode string for legacy sections
         show_cqt = self.include_cqt
@@ -10346,28 +15857,35 @@ class SourcePanel(Panel):
         sr_preview = self._wav_sr if self._wav_sr > 0 else 44100
 
         # === CQT settings (collapsible) ===
-        if show_cqt or is_hybrid:
+        if self._show_legacy_engine_sections and (show_cqt or is_hybrid):
             y = self._render_section_header(surf, font, y, w,
-                                            "CQT Settings", "cqt_hdr",
+                                            "FFT Analysis", "cqt_hdr",
                                             self._cqt_expanded)
             if self._cqt_expanded:
                 y = self._render_dropdown_btn(surf, font, y, w,
                                               "cqt_algo", "Algorithm:",
-                                              _CQT_ALGORITHMS,
+                                              _CQT_ALGORITHM_LABELS,
                                               self.cqt_algorithm_idx)
                 y = self._render_dropdown_btn(surf, font, y, w,
                                               "cqt_window", "Window:",
                                               _CQT_WINDOWS,
                                               self.cqt_window_idx)
-                _is_nsgt = _CQT_ALGORITHMS[self.cqt_algorithm_idx] == "nsgt"
+                _algo = _CQT_ALGORITHMS[self.cqt_algorithm_idx]
+                _is_nsgt = _algo == "nsgt"
+                _is_stft = _algo == "stft"
                 if not _is_nsgt:
                     y = self._render_slider(surf, font, y, w, "hop", "Hop:",
                                             float(self.hop_length), 64.0, 2048.0,
                                             log=True)
-                y = self._render_slider(surf, font, y, w, "bpo", "BPO:",
-                                        float(self.bins_per_octave), 12.0, 1200.0,
-                                        log=True)
-                if not _is_nsgt:
+                if _is_stft:
+                    y = self._render_slider(surf, font, y, w, "stft_n_fft", "NFFT:",
+                                            float(self.stft_n_fft), 256.0, 131072.0,
+                                            "{:.0f}", log=True)
+                else:
+                    y = self._render_slider(surf, font, y, w, "bpo", "BPO:",
+                                            float(self.bins_per_octave), 12.0, 1200.0,
+                                            log=True)
+                if not _is_nsgt and not _is_stft:
                     _fs_hi = max(4.0, self.cqt_filter_scale,
                                  4.0)
                     y = self._render_slider(surf, font, y, w, "cqt_filter_scale",
@@ -10391,7 +15909,7 @@ class SourcePanel(Panel):
                                         _freq_fmt(self.cqt_fmax),
                                         note_label=True, log=True)
         # === Hybrid crossover info ===
-        if is_hybrid:
+        if self._show_legacy_engine_sections and is_hybrid:
             hy_cqt_lo, hy_cwt_hi = self._hybrid_redundancy_edges(sr_preview)
             y = self._render_slider(
                 surf, font, y, w, "hybrid_redundancy", "Redundancy\u00b1:",
@@ -10412,7 +15930,7 @@ class SourcePanel(Panel):
             y += self.ROW_H + 2
 
         # === Filter bank settings (collapsible) ===
-        if show_fb or is_hybrid:
+        if self._show_legacy_engine_sections and (show_fb or is_hybrid):
             y = self._render_section_header(surf, font, y, w,
                                             "Filter Bank", "fb_hdr",
                                             self._fb_expanded)
@@ -10535,7 +16053,7 @@ class SourcePanel(Panel):
                     y += self.ROW_H
 
         # === Wavelet decomposition (collapsible) ===
-        if self.include_wavelet:
+        if self._show_legacy_engine_sections and self.include_wavelet:
             y = self._render_section_header(surf, font, y, w,
                                             "Wavelet Decomposition",
                                             "wv_hdr", True)
@@ -10713,9 +16231,13 @@ class SourcePanel(Panel):
                     _cqt_window = _CQT_WINDOWS[
                         min(self.cqt_window_idx, len(_CQT_WINDOWS) - 1)]
                     if _algo == "nsgt":
-                        _dur = self._effective_duration()
-                        _Ls_preview = max(
-                            1, int(round((_dur if _dur > 0 else 1.0) * sr_preview)))
+                        # _Ls_preview is used only for the fidelity/painless
+                        # check.  Both Lk and Mk scale identically with Ls, so
+                        # the painless ratios and loss-map colours are identical
+                        # for any Ls.  Using the full recording length causes
+                        # O(Ls) GPU allocations (flat_idx, flat_vals, x) that
+                        # easily exceed 6–7 GiB for long files.  Cap at 1 s.
+                        _Ls_preview = sr_preview
                         fc = _fidelity_nsgt(
                             sr_preview,
                             fmin=self.cqt_fmin,
@@ -10724,16 +16246,14 @@ class SourcePanel(Panel):
                             Ls=_Ls_preview,
                             window=_cqt_window,
                             window_size=2048)  # derived from Q/range
-                            
-                            
                         _pr = fc.get("painless")
                         _cond = fc.get("condition_number", 0.0)
                         if _pr is not None and _pr.is_painless:
-                            _cqt_label = f"NSGT \u2713 cond={_cond:.0f}"
+                            _cqt_label = f"CQ-NSGT \u2713 cond={_cond:.0f}"
                         elif _pr is not None:
-                            _cqt_label = f"NSGT \u26a0 NOT PAINLESS"
+                            _cqt_label = f"CQ-NSGT \u26a0 NOT PAINLESS"
                         else:
-                            _cqt_label = "NSGT"
+                            _cqt_label = "CQ-NSGT"
                     else:
                         _cqt_bpo_func = None
                         _cqt_hop_func = None
@@ -11071,6 +16591,63 @@ class SourcePanel(Panel):
                 y += self.ROW_H
 
         # === Analyze button ===
+        demand = self._project_itinerary_demands()
+        y = self._render_section_header(
+            surf, font, y, w, "Projected Data Demand", "demand_hdr", True
+        )
+        demand_rect = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
+        pygame.draw.rect(surf, (34, 38, 46), demand_rect)
+        pygame.draw.rect(surf, (68, 78, 92), demand_rect, 1)
+        demand_txt = font.render(
+            f"{len(demand['rows'])} runs  |  est. {demand['total_label']}",
+            True,
+            (210, 220, 235),
+        )
+        surf.blit(demand_txt, (demand_rect.x + 6, demand_rect.y + 3))
+        y += self.ROW_H + 2
+        for row in demand["rows"][:6]:
+            row_rect = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
+            pygame.draw.rect(surf, (28, 31, 38), row_rect)
+            pygame.draw.rect(surf, (52, 58, 70), row_rect, 1)
+            lo, hi = row["time_range"].as_fraction_span()
+            tl_x = row_rect.right - 66
+            tl_w = 58
+            tl_rect = pygame.Rect(tl_x, row_rect.y + row_rect.h - 6, tl_w, 3)
+            pygame.draw.rect(surf, (46, 46, 52), tl_rect)
+            span_x = tl_rect.x + int(lo * tl_w)
+            span_w = max(1, int(max(0.01, hi - lo) * tl_w))
+            pygame.draw.rect(surf, row["color"], pygame.Rect(span_x, tl_rect.y, span_w, tl_rect.h))
+            left_txt = font.render(
+                f"{row['label']}: {row['size_label']}",
+                True,
+                (225, 225, 230),
+            )
+            detail_txt = font.render(
+                row["detail"][:20],
+                True,
+                (145, 160, 176),
+            )
+            surf.blit(left_txt, (row_rect.x + 6, row_rect.y + 2))
+            surf.blit(detail_txt, (row_rect.x + 6, row_rect.y + 11))
+            y += self.ROW_H + 1
+        if len(demand["rows"]) > 6:
+            more_txt = font.render(
+                f"+{len(demand['rows']) - 6} more planned runs",
+                True,
+                (150, 160, 170),
+            )
+            surf.blit(more_txt, (self.PAD + 2, y + 2))
+            y += self.ROW_H
+
+        # Warn if CQT fmin (floored at cafls_anchor) would exceed fmax
+        _eff_cqt_fmin = max(self.cqt_fmin, self.cafls_anchor)
+        _cqt_range_invalid = (show_cqt or is_hybrid) and _eff_cqt_fmin >= self.cqt_fmax
+        if _cqt_range_invalid:
+            _warn = font.render(
+                f"\u26a0 fMin({_eff_cqt_fmin:.0f}Hz) >= fMax({self.cqt_fmax:.0f}Hz)",
+                True, (255, 160, 60))
+            surf.blit(_warn, (self.PAD, y + 2))
+            y += self.ROW_H + 2
         btn_rect = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
         if self._analyzing:
             # Background: dark amber
@@ -11202,6 +16779,25 @@ class SourcePanel(Panel):
             if self._active_dropdown:
                 self._active_dropdown = None
 
+            # Module slider drag start: check before handle_click to intercept
+            # track hits before they reach the button dispatch path.
+            _mod_rec = self._module_stack.control_table.hit(lx, ly)
+            if _mod_rec is not None and _mod_rec.kind == "slider":
+                self._module_dragging_rec = _mod_rec
+                self._apply_module_slider_drag(_mod_rec, lx)
+                return True
+
+            module_hit = self._module_stack.handle_click(lx, ly)
+            if module_hit is not None:
+                if module_hit.startswith("add:"):
+                    self._add_analysis_module(module_hit.split(":", 1)[1])
+                elif module_hit.startswith("remove:"):
+                    self._remove_analysis_module(module_hit.split(":", 1)[1] or None)
+                elif module_hit.startswith("control:"):
+                    parts = tuple(p for p in module_hit.split(":", 1)[1].split("|") if p)
+                    self._handle_module_control(parts)
+                return True
+
             # WAV list click
             if self.wav_list.handle_click(lx, ly) is not None:
                 self._update_wav_duration()
@@ -11212,6 +16808,31 @@ class SourcePanel(Panel):
                 return True
 
             # Section headers (collapse/expand)
+            if "wav_sources_hdr" in self._item_map:
+                rect, _ = self._item_map["wav_sources_hdr"]
+                if rect.collidepoint(lx, ly):
+                    self._wav_sources_expanded = not self._wav_sources_expanded
+                    return True
+            if "siggen_hdr" in self._item_map:
+                rect, _ = self._item_map["siggen_hdr"]
+                if rect.collidepoint(lx, ly):
+                    self._siggen_expanded = not self._siggen_expanded
+                    return True
+            if "sgv2_witness_hdr" in self._item_map:
+                rect, _ = self._item_map["sgv2_witness_hdr"]
+                if rect.collidepoint(lx, ly):
+                    self._sgv2_witness_expanded = not self._sgv2_witness_expanded
+                    return True
+            if "sgv2_density_hdr" in self._item_map:
+                rect, _ = self._item_map["sgv2_density_hdr"]
+                if rect.collidepoint(lx, ly):
+                    self._sgv2_density_expanded = not self._sgv2_density_expanded
+                    return True
+            if "sgv2_proj_hdr" in self._item_map:
+                rect, _ = self._item_map["sgv2_proj_hdr"]
+                if rect.collidepoint(lx, ly):
+                    self._sgv2_proj_expanded = not self._sgv2_proj_expanded
+                    return True
             if "cqt_hdr" in self._item_map:
                 rect, _ = self._item_map["cqt_hdr"]
                 if rect.collidepoint(lx, ly):
@@ -11246,7 +16867,17 @@ class SourcePanel(Panel):
                 if ck_key in self._item_map:
                     rect, _ = self._item_map[ck_key]
                     if rect.collidepoint(lx, ly):
-                        setattr(self, attr, not getattr(self, attr))
+                        if ck_key == "inc_cqt":
+                            self._sync_itinerary_from_engine_toggle(
+                                "fft", not self.include_cqt)
+                        elif ck_key == "inc_fb":
+                            self._sync_itinerary_from_engine_toggle(
+                                "fb", not self.include_fb)
+                        elif ck_key == "inc_wavelet":
+                            self._sync_itinerary_from_engine_toggle(
+                                "wavelet", not self.include_wavelet)
+                        else:
+                            setattr(self, attr, not getattr(self, attr))
                         return True
 
             # Band list click
@@ -11260,7 +16891,9 @@ class SourcePanel(Panel):
                         "wv_mode", "cwt_wavelet",
                         "wv_family", "wv_order", "wv_ext",
                         "wv_depth_mode",
-                        "rs_engine", "rs_interp", "rs_taps", "rs_prec"):
+                        "rs_engine", "rs_interp", "rs_taps", "rs_prec",
+                        "sgv2_path", "sgv2_manifold", "sgv2_drift",
+                        "sgv2_bit_depth", "sgv2_channels"):
                 if key in self._item_map:
                     rect, opts = self._item_map[key]
                     if rect.collidepoint(lx, ly):
@@ -11269,12 +16902,25 @@ class SourcePanel(Panel):
 
             # Slider +/- buttons and track drag
             slider_keys = ["cafls_anchor", "hybrid_redundancy",
-                           "hop", "bpo", "fmin", "fmax",
+                           "hop", "stft_n_fft", "bpo", "fmin", "fmax",
                            "cqt_filter_scale",
                            "fb_bpo", "fb_banded_width", "fb_hop",
                            "wv_depth_pct", "wv_depth_abs",
                            "cwt_hop", "cwt_spo", "cwt_sigma", "cwt_epsilon",
-                           "region_start", "region_end"]
+                           "region_start", "region_end",
+                           # Signal Generator v2 sliders
+                           "sgv2_freq", "sgv2_tau", "sgv2_power",
+                           "sgv2_warp", "sgv2_maxharm",
+                           "sgv2_partials", "sgv2_amp_tau",
+                           "sgv2_shape_lo", "sgv2_shape_hi",
+                           "sgv2_shape_ctr", "sgv2_shape_wid",
+                           "sgv2_drift_rate", "sgv2_drift_max", "sgv2_drift_pwr",
+                           "sgv2_w_bwd", "sgv2_w_fwd", "sgv2_w_max_sup",
+                           "sgv2_w_step", "sgv2_w_int",
+                           "sgv2_oversamp", "sgv2_min_sr", "sgv2_max_sr_m",
+                           "sgv2_deriv_w", "sgv2_sup_w",
+                           "sgv2_out_sr", "sgv2_half_sup_ms",
+                           "sgv2_duration"]
             slider_keys += [f"xo_{i}" for i in range(len(self.fb_crossovers))]
             for skey in slider_keys:
                 minus_k = f"{skey}_minus"
@@ -11295,6 +16941,13 @@ class SourcePanel(Panel):
                         self._dragging = skey
                         self._update_slider(skey, lx, rect, vmin, vmax, is_log)
                         return True
+
+            # Signal Generator v2 button
+            if "sgv2_gen_btn" in self._item_map:
+                rect, _ = self._item_map["sgv2_gen_btn"]
+                if rect.collidepoint(lx, ly) and not self._sgv2_generating:
+                    self._run_siggen_v2()
+                    return True
 
             # Analyze button
             if "analyze_btn" in self._item_map:
@@ -11343,6 +16996,9 @@ class SourcePanel(Panel):
             return True
 
         if event.type == MOUSEBUTTONUP and event.button == 1:
+            if self._module_dragging_rec is not None:
+                self._module_dragging_rec = None
+                return True
             if self._dragging:
                 self._dragging = None
                 return True
@@ -11351,6 +17007,14 @@ class SourcePanel(Panel):
                 return True
 
         if event.type == MOUSEMOTION:
+            if self._module_dragging_rec is not None:
+                if not event.buttons[0]:
+                    self._module_dragging_rec = None
+                else:
+                    mx, my = event.pos
+                    lx = mx - pr.x
+                    self._apply_module_slider_drag(self._module_dragging_rec, lx)
+                return True
             if self._dragging:
                 if not event.buttons[0]:
                     self._dragging = None
@@ -11367,6 +17031,12 @@ class SourcePanel(Panel):
                 return True
 
         if event.type == MOUSEWHEEL:
+            mx, my = pygame.mouse.get_pos()
+            if pr.collidepoint(mx, my):
+                lx, ly = mx - pr.x, my - pr.y + self._panel_scroll_y
+                if self._module_stack._viewport_rect.collidepoint(lx, ly):
+                    if self._module_stack.handle_scroll(-event.y):
+                        return True
             return self._handle_panel_wheel(event)
 
         return False
@@ -11400,7 +17070,11 @@ class SourcePanel(Panel):
         elif key == "analysis_save_prec":
             self.analysis_save_precision_idx = _ANALYSIS_SAVE_PRECISIONS.index(value)
         elif key == "cqt_algo":
-            self.cqt_algorithm_idx = _CQT_ALGORITHMS.index(value)
+            # opts list is _CQT_ALGORITHM_LABELS; map label → internal index
+            if value in _CQT_ALGORITHM_LABELS:
+                self.cqt_algorithm_idx = _CQT_ALGORITHM_LABELS.index(value)
+            elif value in _CQT_ALGORITHMS:
+                self.cqt_algorithm_idx = _CQT_ALGORITHMS.index(value)
         elif key == "cqt_window":
             self.cqt_window_idx = _CQT_WINDOWS.index(value)
         elif key == "wv_mode":
@@ -11432,6 +17106,23 @@ class SourcePanel(Panel):
             self.resample_taps_idx = _RESAMPLE_TAPS.index(value)
         elif key == "rs_prec":
             self.resample_precision_idx = _RESAMPLE_PRECISIONS.index(value)
+        # --- Signal Generator v2 dropdowns ---
+        elif key == "sgv2_path":
+            if value in _SGV2_PATH_TYPES:
+                self._sgv2_path_idx = _SGV2_PATH_TYPES.index(value)
+        elif key == "sgv2_manifold":
+            if value in _SGV2_MANIFOLDS:
+                self._sgv2_manifold_idx = _SGV2_MANIFOLDS.index(value)
+        elif key == "sgv2_drift":
+            if value in _SGV2_DRIFT_TYPES:
+                self._sgv2_drift_idx = _SGV2_DRIFT_TYPES.index(value)
+        elif key == "sgv2_bit_depth":
+            if value in _SIG_BIT_DEPTHS:
+                self._sgv2_bit_depth_idx = _SIG_BIT_DEPTHS.index(value)
+        elif key == "sgv2_channels":
+            _ch = ["Mono", "Stereo"]
+            if value in _ch:
+                self._sgv2_channels_idx = _ch.index(value)
 
     def _update_slider(self, key: str, lx: int,
                        rect: pygame.Rect,
@@ -11464,6 +17155,9 @@ class SourcePanel(Panel):
         elif key == "hop":
             raw = max(64, min(2048, int(val)))
             self.hop_length = 2 ** round(math.log2(raw))
+        elif key == "stft_n_fft":
+            raw = max(256, min(131072, int(val)))
+            self.stft_n_fft = 2 ** round(math.log2(raw))
         elif key == "bpo":
             self.bins_per_octave = _snap_bpo(val)
         elif key == "fmin":
@@ -11520,6 +17214,66 @@ class SourcePanel(Panel):
                 self.fb_crossovers[idx] = round(
                     _snap_to_note(max(lo, min(hi, val))), 6)
                 self.fb_crossovers.sort()
+        # --- Signal Generator v2 sliders ---
+        elif key == "sgv2_freq":
+            nyq = self._sgv2_out_sr / 2.0
+            self._sgv2_freq_start = round(
+                _snap_to_note(max(1.0, min(nyq, val))), 6)
+        elif key == "sgv2_tau":
+            self._sgv2_tau = max(0.01, min(60.0, float(val)))
+        elif key == "sgv2_power":
+            self._sgv2_power = max(0.1, min(10.0, float(val)))
+        elif key == "sgv2_warp":
+            self._sgv2_warp_strength = max(0.0, min(2.0, float(val)))
+        elif key == "sgv2_maxharm":
+            self._sgv2_max_harmonics = max(1, min(32, int(round(val))))
+        elif key == "sgv2_partials":
+            self._sgv2_partial_count = max(1, min(32, int(round(val))))
+        elif key == "sgv2_amp_tau":
+            self._sgv2_amp_decay_tau = max(0.1, min(60.0, float(val)))
+        elif key == "sgv2_shape_lo":
+            self._sgv2_shape_low = max(0.0, min(1.0, float(val)))
+        elif key == "sgv2_shape_hi":
+            self._sgv2_shape_high = max(0.0, min(1.0, float(val)))
+        elif key == "sgv2_shape_ctr":
+            self._sgv2_shape_center = max(0.0, min(30.0, float(val)))
+        elif key == "sgv2_shape_wid":
+            self._sgv2_shape_width = max(0.01, min(10.0, float(val)))
+        elif key == "sgv2_drift_rate":
+            self._sgv2_drift_rate = max(0.001, min(10.0, float(val)))
+        elif key == "sgv2_drift_max":
+            self._sgv2_drift_max = max(0.001, min(100.0, float(val)))
+        elif key == "sgv2_drift_pwr":
+            self._sgv2_drift_harm_power = max(0.0, min(4.0, float(val)))
+        elif key == "sgv2_w_bwd":
+            self._sgv2_witness_bwd = max(0.1, min(100.0, float(val)))
+        elif key == "sgv2_w_fwd":
+            self._sgv2_witness_fwd = max(0.1, min(100.0, float(val)))
+        elif key == "sgv2_w_max_sup":
+            self._sgv2_witness_max_sup = max(0.1, min(60.0, float(val)))
+        elif key == "sgv2_w_step":
+            self._sgv2_witness_step = max(0.0001, min(0.1, float(val)))
+        elif key == "sgv2_w_int":
+            self._sgv2_witness_int_steps = max(4, min(256, int(round(val))))
+        elif key == "sgv2_oversamp":
+            self._sgv2_oversample = max(1.0, min(128.0, float(val)))
+        elif key == "sgv2_min_sr":
+            self._sgv2_min_sr = max(8000.0, min(384000.0, float(val)))
+        elif key == "sgv2_max_sr_m":
+            self._sgv2_max_sr = max(0.1, min(50.0, float(val))) * 1_000_000.0
+        elif key == "sgv2_deriv_w":
+            self._sgv2_deriv_weight = max(0.0, min(5.0, float(val)))
+        elif key == "sgv2_sup_w":
+            self._sgv2_support_weight = max(0.0, min(5.0, float(val)))
+        elif key == "sgv2_out_sr":
+            _sr_steps = [8000, 11025, 16000, 22050, 32000, 44100,
+                         48000, 88200, 96000, 176400, 192000]
+            closest = min(_sr_steps, key=lambda s: abs(s - val))
+            self._sgv2_out_sr = closest
+        elif key == "sgv2_half_sup_ms":
+            self._sgv2_proj_half_sup_ms = max(0.01, min(50.0, float(val)))
+        elif key == "sgv2_duration":
+            self._sgv2_duration = max(0.1, min(600.0, float(val)))
 
     def _nudge_slider(self, key: str, direction: int) -> None:
         """Move a slider by one logical step. direction: +1 or -1."""
@@ -11535,6 +17289,9 @@ class SourcePanel(Panel):
         elif key == "hop":
             exp = round(math.log2(self.hop_length)) + direction
             self.hop_length = max(64, min(2048, 2 ** exp))
+        elif key == "stft_n_fft":
+            exp = round(math.log2(max(256, self.stft_n_fft))) + direction
+            self.stft_n_fft = max(256, min(131072, 2 ** exp))
         elif key == "bpo":
             idx = _BPO_SNAPS.index(self.bins_per_octave) if \
                 self.bins_per_octave in _BPO_SNAPS else 0
@@ -11622,15 +17379,123 @@ class SourcePanel(Panel):
                 self.fb_crossovers[idx] = round(max(lo, min(hi,
                     _midi_to_freq(midi))), 6)
                 self.fb_crossovers.sort()
+        # --- Signal Generator v2 nudges ---
+        elif key == "sgv2_freq":
+            midi = 69 + 12 * math.log2(max(self._sgv2_freq_start, 1.0) / 440.0)
+            midi = round(midi) + direction
+            nyq = self._sgv2_out_sr / 2.0
+            self._sgv2_freq_start = round(
+                _snap_to_note(max(1.0, min(nyq, _midi_to_freq(midi)))), 6)
+        elif key == "sgv2_tau":
+            self._sgv2_tau = round(
+                max(0.01, min(60.0, self._sgv2_tau * (2.0 ** (direction * 0.5)))), 4)
+        elif key == "sgv2_power":
+            self._sgv2_power = round(
+                max(0.1, min(10.0, self._sgv2_power + 0.1 * direction)), 2)
+        elif key == "sgv2_warp":
+            self._sgv2_warp_strength = round(
+                max(0.0, min(2.0, self._sgv2_warp_strength + 0.05 * direction)), 3)
+        elif key == "sgv2_maxharm":
+            self._sgv2_max_harmonics = max(1, min(32, self._sgv2_max_harmonics + direction))
+        elif key == "sgv2_partials":
+            self._sgv2_partial_count = max(1, min(32, self._sgv2_partial_count + direction))
+        elif key == "sgv2_amp_tau":
+            self._sgv2_amp_decay_tau = round(
+                max(0.1, min(60.0, self._sgv2_amp_decay_tau * (2.0 ** (direction * 0.5)))), 3)
+        elif key == "sgv2_shape_lo":
+            self._sgv2_shape_low = round(
+                max(0.0, min(1.0, self._sgv2_shape_low + 0.05 * direction)), 2)
+        elif key == "sgv2_shape_hi":
+            self._sgv2_shape_high = round(
+                max(0.0, min(1.0, self._sgv2_shape_high + 0.05 * direction)), 2)
+        elif key == "sgv2_shape_ctr":
+            self._sgv2_shape_center = round(
+                max(0.0, min(30.0, self._sgv2_shape_center + 0.5 * direction)), 2)
+        elif key == "sgv2_shape_wid":
+            self._sgv2_shape_width = round(
+                max(0.01, min(10.0, self._sgv2_shape_width * (2.0 ** (direction * 0.5)))), 3)
+        elif key == "sgv2_drift_rate":
+            self._sgv2_drift_rate = round(
+                max(0.001, min(10.0, self._sgv2_drift_rate * (2.0 ** (direction * 0.5)))), 4)
+        elif key == "sgv2_drift_max":
+            self._sgv2_drift_max = round(
+                max(0.001, min(100.0, self._sgv2_drift_max * (2.0 ** (direction * 0.5)))), 4)
+        elif key == "sgv2_drift_pwr":
+            self._sgv2_drift_harm_power = round(
+                max(0.0, min(4.0, self._sgv2_drift_harm_power + 0.1 * direction)), 2)
+        elif key == "sgv2_w_bwd":
+            self._sgv2_witness_bwd = round(
+                max(0.1, min(100.0, self._sgv2_witness_bwd + 0.5 * direction)), 2)
+        elif key == "sgv2_w_fwd":
+            self._sgv2_witness_fwd = round(
+                max(0.1, min(100.0, self._sgv2_witness_fwd + 0.5 * direction)), 2)
+        elif key == "sgv2_w_max_sup":
+            self._sgv2_witness_max_sup = round(
+                max(0.1, min(60.0, self._sgv2_witness_max_sup + 0.5 * direction)), 1)
+        elif key == "sgv2_w_step":
+            self._sgv2_witness_step = round(
+                max(0.0001, min(0.1, self._sgv2_witness_step * (2.0 ** (direction * 0.5)))), 6)
+        elif key == "sgv2_w_int":
+            self._sgv2_witness_int_steps = max(
+                4, min(256, self._sgv2_witness_int_steps * (2 if direction > 0 else 1) //
+                       (1 if direction > 0 else 2)))
+        elif key == "sgv2_oversamp":
+            self._sgv2_oversample = round(
+                max(1.0, min(128.0, self._sgv2_oversample * (2.0 ** (direction * 0.5)))), 2)
+        elif key == "sgv2_min_sr":
+            _sr_steps = [8000, 11025, 16000, 22050, 32000, 44100,
+                         48000, 88200, 96000, 176400, 192000, 384000]
+            ci = min(range(len(_sr_steps)),
+                     key=lambda i: abs(_sr_steps[i] - int(self._sgv2_min_sr)))
+            ci = max(0, min(len(_sr_steps) - 1, ci + direction))
+            self._sgv2_min_sr = float(_sr_steps[ci])
+        elif key == "sgv2_max_sr_m":
+            self._sgv2_max_sr = max(0.1, min(50.0,
+                (self._sgv2_max_sr / 1_000_000.0) * (2.0 ** (direction * 0.5)))) * 1_000_000.0
+        elif key == "sgv2_deriv_w":
+            self._sgv2_deriv_weight = round(
+                max(0.0, min(5.0, self._sgv2_deriv_weight + 0.1 * direction)), 2)
+        elif key == "sgv2_sup_w":
+            self._sgv2_support_weight = round(
+                max(0.0, min(5.0, self._sgv2_support_weight + 0.1 * direction)), 2)
+        elif key == "sgv2_out_sr":
+            _sr_steps = [8000, 11025, 16000, 22050, 32000, 44100,
+                         48000, 88200, 96000, 176400, 192000]
+            ci = min(range(len(_sr_steps)),
+                     key=lambda i: abs(_sr_steps[i] - self._sgv2_out_sr))
+            ci = max(0, min(len(_sr_steps) - 1, ci + direction))
+            self._sgv2_out_sr = _sr_steps[ci]
+        elif key == "sgv2_half_sup_ms":
+            self._sgv2_proj_half_sup_ms = round(
+                max(0.01, min(50.0,
+                    self._sgv2_proj_half_sup_ms * (2.0 ** (direction * 0.5)))), 3)
+        elif key == "sgv2_duration":
+            step = 1.0 if self._sgv2_duration >= 10.0 else 0.5
+            self._sgv2_duration = round(
+                max(0.1, min(600.0, self._sgv2_duration + step * direction)), 1)
 
     def _handle_folder_action(self, action: str) -> None:
         idx = self.folder_list.selected_idx
         if idx < 0 or idx >= len(self._folder_paths):
             return
         raw = self._folder_paths[idx]
+        dataset_key = ""
 
         # Detect version sub-item  (key = "{folder}::{hash}")
-        if "::" in raw:
+        if "::dataset::" in raw:
+            folder_path, dataset_key = raw.split("::dataset::", 1)
+            version_hash = ""
+            try:
+                inv = AnalysisInventory.from_dict(_load_analysis_inventory(folder_path))
+                dataset = next(
+                    ds for ds in inv.datasets
+                    if ds.dataset_key == dataset_key
+                )
+                if dataset.engine == "fft" and dataset.settings_hash:
+                    version_hash = dataset.settings_hash
+            except Exception:
+                pass
+        elif "::" in raw:
             folder_path, version_hash = raw.rsplit("::", 1)
         else:
             folder_path, version_hash = raw, ""
@@ -11663,6 +17528,8 @@ class SourcePanel(Panel):
             if self.on_load_settings:
                 self.on_load_settings(folder_path)
         elif action == "delete_folder":
+            if dataset_key:
+                return
             if version_hash:
                 # Delete a single version via the manifest system
                 from bass_analysis import delete_version
@@ -13070,6 +18937,9 @@ class SpectrogramViewer:
         self._pad_influence: np.ndarray | None = None
         self._field_ranges: dict[str, tuple[float, float]] = {}
         self._mipmap: Any = None
+        # Heterodyne carrier stored with the dataset (Hz, signed).
+        # physical_freq = analysis_freq - _heterodyne_hz
+        self._heterodyne_hz: float = 0.0
 
         if analysis_dir is not None:
             self._load_npz(analysis_dir)
@@ -13130,6 +19000,8 @@ class SpectrogramViewer:
         self.overlay_config = OverlayConfig()
         self.hybrid_view = HybridViewConfig()
         self.wavelet_view = WaveletViewConfig()
+        self.filterbank_scaler_view = FilterbankScalerConfig()
+        self.fft_scaler_view = FFTScalerConfig()
         self._hybrid_meta_loaded: bool = False
         self._hybrid_center_hz: float = 30.87
         self._hybrid_redundancy_octaves: float = 0.0
@@ -13325,6 +19197,8 @@ class SpectrogramViewer:
         self._freqs = self._npz["freqs"]
         self._semitone_mask = self._npz["semitone_mask"]
         self._note_names = list(self._npz["note_names"])
+        # Heterodyne offset stored by the analysis pipeline (0.0 if absent).
+        self._heterodyne_hz = float(self._npz["heterodyne_hz"]) if "heterodyne_hz" in self._npz else 0.0
 
         pi = self._npz["pad_influence"]
         self._pad_influence = pi if pi.size > 0 else None
@@ -14467,11 +20341,32 @@ class SpectrogramViewer:
         self.wavelet_panel._is_active = (lambda: self.display_mode == "tsc")
         self.wavelet_panel.on_play = self._play_wavelet_direct
         self.wavelet_panel.on_stop = self._stop_wavelet_direct
+        self.wavelet_panel.get_viewport_context = self._wavelet_viewport_context
+        self.wavelet_panel.get_scale_slider_range = self._wavelet_scale_slider_range
+        self.filterbank_scaler_panel = FilterbankScalerPanel(
+            self.filterbank_scaler_view, side="right")
+        self.filterbank_scaler_panel._is_active = (
+            lambda: self.display_mode == "tf" and self.tf_source == "fb")
+        self.filterbank_scaler_panel.on_play = self._play_filterbank_scaler_direct
+        self.filterbank_scaler_panel.on_stop = self._stop_filterbank_scaler_direct
+        self.filterbank_scaler_panel.get_viewport_context = (
+            self._filterbank_scaler_viewport_context)
+        self.filterbank_scaler_panel.get_scale_slider_range = (
+            self._filterbank_scaler_scale_slider_range)
+        self.fft_scaler_panel = FFTScalerPanel(self.fft_scaler_view, side="right")
+        self.fft_scaler_panel._is_active = (
+            lambda: self.display_mode == "tf" and self.tf_source == "cqt")
+        self.fft_scaler_panel.on_play = self._play_fft_scaler_direct
+        self.fft_scaler_panel.on_stop = self._stop_fft_scaler_direct
+        self.fft_scaler_panel.get_viewport_context = self._fft_scaler_viewport_context
+        self.fft_scaler_panel.get_pitch_slider_range = self._fft_scaler_pitch_slider_range
 
         self.dock = PanelDock()
         self.dock.register("fields", self.gui)
         self.dock.register("hybrid_view", self.hybrid_panel)
         self.dock.register("wavelet_view", self.wavelet_panel)
+        self.dock.register("filterbank_scaler", self.filterbank_scaler_panel)
+        self.dock.register("fft_scaler", self.fft_scaler_panel)
         self.synth_panel = SynthesisPanel(side="right")
         self.synth_panel.on_play = self._play_synth_job
         self.synth_panel.on_stop = self._stop_synth_job
@@ -14522,7 +20417,14 @@ class SpectrogramViewer:
         Panel._top_offset = self.menu_bar.bar_height
 
         if self.audio_path and os.path.isfile(self.audio_path):
-            self.player = AudioPlayer(self.audio_path)
+            _proc_wav = (os.path.join(self.analysis_dir,
+                                      f"processed_audio_{self._settings_hash}.wav")
+                         if self._settings_hash and self.analysis_dir else None)
+            if _proc_wav and os.path.isfile(_proc_wav):
+                _t_off = float(self.times[0]) if self.times is not None and len(self.times) > 0 else 0.0
+                self.player = AudioPlayer(_proc_wav, time_offset=_t_off)
+            else:
+                self.player = AudioPlayer(self.audio_path)
         if self._npz is not None:
             sr_val = int(self._npz["sr"]) if "sr" in self._npz else 44100
             hop_val = int(self._npz["cqt_grid_hop_length"]) if "cqt_grid_hop_length" in self._npz else (
@@ -14544,10 +20446,14 @@ class SpectrogramViewer:
                 self.file_panel.hybrid_redundancy_octaves = (
                     self._hybrid_redundancy_octaves)
                 self.file_panel.hop_length = int(self._npz["hop_length"]) if "hop_length" in self._npz else self.file_panel.hop_length
+                self.file_panel.stft_n_fft = int(self._npz["stft_n_fft"]) if "stft_n_fft" in self._npz and int(self._npz["stft_n_fft"]) > 0 else self.file_panel.stft_n_fft
                 self.file_panel.bins_per_octave = bpo_val
                 self.file_panel.cqt_filter_scale = fs_val
                 self.file_panel.cqt_fmin = fmin_val
                 self.file_panel.cqt_fmax = float(self._npz["cqt_fmax"]) if "cqt_fmax" in self._npz else self.file_panel.cqt_fmax
+                self.file_panel.cqt_bpo_schedule = list(bpo_sched) if bpo_sched else None
+                self.file_panel.cqt_hop_schedule = list(hop_sched) if hop_sched else None
+                self.file_panel.cqt_filter_scale_schedule = list(fs_sched) if fs_sched else None
                 if win_val in _CQT_WINDOWS:
                     self.file_panel.cqt_window_idx = _CQT_WINDOWS.index(win_val)
                 if self._wv_meta:
@@ -14754,7 +20660,7 @@ class SpectrogramViewer:
                          radio_group="display_mode"),
             ]),
             MenuItem("TF Source", children=[
-                MenuItem("CQT",
+                MenuItem("FFT",
                          action=lambda: self._set_tf_source("cqt"),
                          toggle_state=lambda: self.tf_source == "cqt",
                          radio_group="tf_source"),
@@ -14762,7 +20668,7 @@ class SpectrogramViewer:
                          action=lambda: self._set_tf_source("fb"),
                          toggle_state=lambda: self.tf_source == "fb",
                          radio_group="tf_source"),
-                MenuItem("Hybrid (CWT low / FB overlap / CQT high)",
+                MenuItem("Hybrid (CWT low / FB overlap / FFT high)",
                          action=lambda: self._set_tf_source("hybrid"),
                          toggle_state=lambda: self.tf_source == "hybrid",
                          radio_group="tf_source"),
@@ -14785,7 +20691,7 @@ class SpectrogramViewer:
                          toggle_state=lambda: self.tiling_strategy == TilingStrategy.SQUARE,
                          radio_group="tiling"),
             ]),
-            MenuItem("CQT Subplots", children=_subplot_toggles(self.subplots_tf_cqt, "tf")),
+            MenuItem("FFT Subplots", children=_subplot_toggles(self.subplots_tf_cqt, "tf")),
             MenuItem("FB Subplots", children=_subplot_toggles(self.subplots_tf_fb, "tf")),
             MenuItem("TS Subplots", children=_subplot_toggles(self.subplots_ts, "ts")),
             MenuItem("Overlay Subplots", children=_subplot_toggles(self.subplots_overlay, "overlay")),
@@ -15323,7 +21229,14 @@ class SpectrogramViewer:
         if self.player:
             self.player.stop()
         if audio and os.path.isfile(audio):
-            self.player = AudioPlayer(audio)
+            _proc_wav2 = (os.path.join(self.analysis_dir,
+                                       f"processed_audio_{self._settings_hash}.wav")
+                          if self._settings_hash and self.analysis_dir else None)
+            if _proc_wav2 and os.path.isfile(_proc_wav2):
+                _t_off2 = float(self.times[0]) if self.times is not None and len(self.times) > 0 else 0.0
+                self.player = AudioPlayer(_proc_wav2, time_offset=_t_off2)
+            else:
+                self.player = AudioPlayer(audio)
         else:
             self.player = None
         if self._npz is not None:
@@ -15347,10 +21260,14 @@ class SpectrogramViewer:
                 self.file_panel.hybrid_redundancy_octaves = (
                     self._hybrid_redundancy_octaves)
                 self.file_panel.hop_length = int(self._npz["hop_length"]) if "hop_length" in self._npz else self.file_panel.hop_length
+                self.file_panel.stft_n_fft = int(self._npz["stft_n_fft"]) if "stft_n_fft" in self._npz and int(self._npz["stft_n_fft"]) > 0 else self.file_panel.stft_n_fft
                 self.file_panel.bins_per_octave = bpo_val
                 self.file_panel.cqt_filter_scale = fs_val
                 self.file_panel.cqt_fmin = fmin_val
                 self.file_panel.cqt_fmax = float(self._npz["cqt_fmax"]) if "cqt_fmax" in self._npz else self.file_panel.cqt_fmax
+                self.file_panel.cqt_bpo_schedule = list(bpo_sched) if bpo_sched else None
+                self.file_panel.cqt_hop_schedule = list(hop_sched) if hop_sched else None
+                self.file_panel.cqt_filter_scale_schedule = list(fs_sched) if fs_sched else None
                 if win_val in _CQT_WINDOWS:
                     self.file_panel.cqt_window_idx = _CQT_WINDOWS.index(win_val)
         else:
@@ -15583,8 +21500,9 @@ class SpectrogramViewer:
         print(f"Broadening FB: CAFLS anchor={anchor:.2f} Hz, banded±{banded_width} oct ...")
         bands = FilterBankDecomposition.bands_from_cafls(
             anchor, bpo, banded_width, sr_file)
-        fb = FilterBankDecomposition(sr_file, ftype)
         fb_hop = self.file_panel.fb_hop if self.file_panel else 1
+        _fb_filter_mode = self.file_panel.fb_filter_mode if self.file_panel else "fir"
+        fb = FilterBankDecomposition(sr_file, ftype, filter_mode=_fb_filter_mode)
         fb.compute_and_save(mono, bands, self.analysis_dir, sr_file,
                             envelope_hop=fb_hop,
                             intermediate_precision=compute_precision,
@@ -15600,7 +21518,8 @@ class SpectrogramViewer:
         else:
             ch_pairs = [("left", mono)]
         for ch_label, ch_sig in ch_pairs:
-            fb_ch = FilterBankDecomposition(sr_file, ftype)
+            fb_ch = FilterBankDecomposition(sr_file, ftype,
+                                           filter_mode=_fb_filter_mode)
             fb_ch.compute(ch_sig, bands)
             mags_ch, phases_ch, hops_ch = fb_ch.compute_envelopes(
                 hop=fb_hop)
@@ -15984,7 +21903,523 @@ class SpectrogramViewer:
         if self.synth:
             self.synth.stop()
 
+    # ---- Filterbank scaler direct playback -------------------------------
+
+    def _filterbank_scaler_fb(self, *, load: bool = True) -> "FilterBankDecomposition | None":
+        live_fb = self._live_fb_decomp_for_current_analysis()
+        if live_fb is not None:
+            return live_fb
+        if self._ts_fb is not None and self._ts_fb_dir == self.analysis_dir:
+            return self._ts_fb
+        if (not load) or self.analysis_dir is None:
+            return None
+        compute_precision = (self.file_panel._analysis_compute_precision()
+                             if self.file_panel else None)
+        fb = FilterBankDecomposition.load(
+            self.analysis_dir, compute_precision=compute_precision)
+        if fb is not None and fb.subbands:
+            self._ts_fb = fb
+            self._ts_fb_dir = self.analysis_dir
+        return fb
+
+    def _filterbank_scaler_total_samples(self) -> int:
+        if self.audio_path and os.path.isfile(self.audio_path):
+            try:
+                if _HAS_SOUNDFILE:
+                    return int(_sf.info(self.audio_path).frames)
+                sr_audio, data = _load_audio(self.audio_path)
+                return int(len(data))
+            except Exception:
+                pass
+        fb = self._filterbank_scaler_fb(load=False)
+        if fb is not None and fb.subbands:
+            for band in fb.subbands:
+                if isinstance(band, np.ndarray):
+                    return int(len(band))
+            if fb._subband_files:
+                arr = fb.get_subband(0)
+                return int(len(arr))
+        if self._npz is not None and "n_samples" in self._npz:
+            return int(self._npz["n_samples"])
+        if self.player is not None:
+            return int(len(self.player.data))
+        return max(1, int(self.n_frames))
+
+    def _filterbank_scaler_sample_window(
+        self, total_samples: int, cfg: ViewportBoundaryConfig
+    ) -> tuple[int, int, np.ndarray]:
+        total_frames = max(1, int(self.n_frames))
+        sample_view0 = (max(0.0, min(float(total_frames), float(self.view_x0)))
+                        / float(total_frames)) * float(total_samples)
+        sample_view1 = (max(0.0, min(float(total_frames), float(self.view_x1)))
+                        / float(total_frames)) * float(total_samples)
+        return _viewport_axis_window(
+            int(total_samples), sample_view0, sample_view1, cfg.x_neg, cfg.x_pos)
+
+    def _filterbank_scaler_viewport_context(self) -> dict[str, str]:
+        fb = self._filterbank_scaler_fb(load=False)
+        bands = list(fb.bands) if fb is not None else list(self._fb_bands)
+        total_samples = max(1, self._filterbank_scaler_total_samples())
+        sr_val = int(self._npz["sr"]) if self._npz is not None and "sr" in self._npz else (
+            fb.sr if fb is not None else 44100)
+        sr_val = max(1, int(sr_val))
+        s0, s1, _ = self._filterbank_scaler_sample_window(
+            total_samples, self.filterbank_scaler_view.viewport_boundary)
+        x_summary = f"X: {s0 / sr_val:.3f}s .. {s1 / sr_val:.3f}s"
+        if bands:
+            nyq = 0.5 * float(sr_val)
+            base_lo, base_hi, eff_lo, eff_hi = _viewport_freq_window_from_bands(
+                bands, self.view_y0, self.view_y1,
+                self.filterbank_scaler_view.viewport_boundary, nyq)
+            y_summary = (f"Y: {eff_lo:.3f} Hz .. {eff_hi:.3f} Hz"
+                         if self.filterbank_scaler_view.use_only_existing_bands
+                         else f"Y: derive {base_lo:.3f} Hz .. {base_hi:.3f} Hz")
+        else:
+            y_summary = "Y: filterbank bands unavailable"
+        return {"x_summary": x_summary, "y_summary": y_summary}
+
+    def _filterbank_scaler_scale_slider_range(self) -> tuple[float, float]:
+        fb = self._filterbank_scaler_fb(load=False)
+        bands = list(fb.bands) if fb is not None else list(self._fb_bands)
+        if not bands:
+            return FilterbankScalerPanel._LOG2_MIN, FilterbankScalerPanel._LOG2_MAX
+        sr_val = int(self._npz["sr"]) if self._npz is not None and "sr" in self._npz else (
+            fb.sr if fb is not None else 44100)
+        nyq = 0.5 * float(max(1, sr_val))
+        _, _, eff_lo, eff_hi = _viewport_freq_window_from_bands(
+            bands, self.view_y0, self.view_y1,
+            self.filterbank_scaler_view.viewport_boundary, nyq)
+        target_c5 = _midi_to_freq(FilterbankScalerPanel._TARGET_MIDI)
+        lo = FilterbankScalerPanel._LOG2_MIN
+        hi = FilterbankScalerPanel._LOG2_MAX
+        if eff_lo > 0.0 and math.isfinite(eff_lo):
+            hi = max(hi, float(math.ceil(math.log2(target_c5 / eff_lo))))
+        if eff_hi > 0.0 and math.isfinite(eff_hi):
+            lo = min(lo, float(math.floor(math.log2(target_c5 / eff_hi))))
+        if hi <= lo:
+            return FilterbankScalerPanel._LOG2_MIN, FilterbankScalerPanel._LOG2_MAX
+        return lo, hi
+
+    def _stop_filterbank_scaler_direct(self) -> None:
+        fp = getattr(self, "filterbank_scaler_panel", None)
+        if fp is not None:
+            fp.stop_playback()
+
+    def _play_filterbank_scaler_direct(self) -> None:
+        fp = self.filterbank_scaler_panel
+        if fp is None:
+            return
+
+        self._stop_filterbank_scaler_direct()
+        fp._status = "synthesizing"
+
+        def _worker() -> None:
+            try:
+                fb = self._filterbank_scaler_fb(load=True)
+                if fb is None or not fb.bands:
+                    raise RuntimeError("No filterbank data loaded")
+                sr_val = max(1, int(fb.sr))
+                cfg = fp.config
+                total_samples = max(1, self._filterbank_scaler_total_samples())
+                s0, s1, time_weights = self._filterbank_scaler_sample_window(
+                    total_samples, cfg.viewport_boundary)
+                if s1 <= s0:
+                    raise RuntimeError("Viewport time window is empty")
+
+                nyq = 0.5 * float(sr_val)
+                base_lo, base_hi, eff_lo, eff_hi = _viewport_freq_window_from_bands(
+                    fb.bands, self.view_y0, self.view_y1, cfg.viewport_boundary, nyq)
+                y0, y1, band_weights = _viewport_axis_window(
+                    len(fb.bands), self.view_y0, self.view_y1,
+                    cfg.viewport_boundary.y_neg, cfg.viewport_boundary.y_pos)
+                if cfg.use_only_existing_bands:
+                    if y1 <= y0:
+                        raise RuntimeError("No stored bands intersect the viewport")
+                    seg_len = s1 - s0
+                    mixed = np.zeros(seg_len, dtype=np.float64)
+                    used = 0
+                    for off, bi in enumerate(range(y0, y1)):
+                        weight = float(band_weights[off]) if off < len(band_weights) else 1.0
+                        if weight <= 1e-9:
+                            continue
+                        band_sig = np.asarray(fb.get_subband(bi)[s0:s1], dtype=np.float64)
+                        if band_sig.size == 0:
+                            continue
+                        mixed[:band_sig.size] += weight * band_sig
+                        used += 1
+                    if used == 0:
+                        raise RuntimeError("Selected stored bands are empty")
+                    src = mixed
+                    src_lo = max(0.0, min(float(b.fmin) for b in fb.bands[y0:y1]))
+                    src_hi = max(src_lo + 1e-6, max(float(b.fmax) for b in fb.bands[y0:y1]))
+                else:
+                    if self.audio_path and os.path.isfile(self.audio_path):
+                        sr_audio, mono = _load_audio_float(self.audio_path)
+                        if int(sr_audio) != sr_val:
+                            raise RuntimeError("Audio and filterbank sample rates differ")
+                        full_src = mono
+                    else:
+                        full_src = np.asarray(fb.reconstruct(), dtype=np.float64)
+                    if s1 > len(full_src):
+                        s1 = len(full_src)
+                        time_weights = time_weights[:max(0, s1 - s0)]
+                    if s1 <= s0:
+                        raise RuntimeError("Derived source is empty")
+                    band_in = np.asarray(full_src[s0:s1], dtype=np.float64)
+                    src, src_lo, src_hi = _soft_fft_bandpass(
+                        band_in, sr_val,
+                        base_lo=base_lo, base_hi=base_hi,
+                        cfg=cfg.viewport_boundary,
+                        filter_type=(self.file_panel and _FILTER_TYPES[self.file_panel.fb_filter_type_idx])
+                        or fb.filter_type,
+                    )
+
+                if time_weights.size > 0:
+                    src = src[:time_weights.size] * time_weights[:len(src)]
+                if cfg.method == "heterodyne":
+                    sig = _heterodyne_shift_signal(
+                        src, sr_val, freq_lo=src_lo, freq_hi=src_hi, scale=cfg.scale)
+                else:
+                    raise RuntimeError(f"Unsupported method: {cfg.method}")
+
+                fade = min(256, len(sig) // 4)
+                if fade > 1:
+                    ramp = np.linspace(0.0, 1.0, fade)
+                    sig[:fade] *= ramp
+                    sig[-fade:] *= ramp[::-1]
+                if cfg.normalize:
+                    peak = float(np.max(np.abs(sig))) if len(sig) else 0.0
+                    if peak > 1e-12:
+                        sig = sig / peak * 0.8
+
+                i16 = (sig * 32767.0).clip(-32768, 32767).astype(np.int16)
+                stereo = np.column_stack([i16, i16])
+                sound = pygame.sndarray.make_sound(stereo)
+                channel = sound.play()
+                fp._playing_sound = sound
+                fp._playing_channel = channel
+                fp._status = "playing"
+            except Exception as exc:
+                fp._status = "error"
+                fp._error_msg = str(exc)[:60]
+
+        fp._synth_thread = threading.Thread(target=_worker, daemon=True)
+        fp._synth_thread.start()
+
+    # ---- FFT scaler direct playback -------------------------------------
+
+    def _fft_scaler_total_samples(self) -> int:
+        if self.audio_path and os.path.isfile(self.audio_path):
+            try:
+                if _HAS_SOUNDFILE:
+                    return int(_sf.info(self.audio_path).frames)
+                sr_audio, data = _load_audio(self.audio_path)
+                return int(len(data))
+            except Exception:
+                pass
+        if self.player is not None:
+            return int(len(self.player.data))
+        if self._npz is not None and "n_samples" in self._npz:
+            return int(self._npz["n_samples"])
+        hop = int(self._npz["hop_length"]) if self._npz is not None and "hop_length" in self._npz else 512
+        return max(1, int(self.n_frames) * hop)
+
+    def _fft_scaler_sample_window(
+        self, total_samples: int, cfg: ViewportBoundaryConfig
+    ) -> tuple[int, int, np.ndarray]:
+        total_frames = max(1, int(self.n_frames))
+        sample_view0 = (max(0.0, min(float(total_frames), float(self.view_x0)))
+                        / float(total_frames)) * float(total_samples)
+        sample_view1 = (max(0.0, min(float(total_frames), float(self.view_x1)))
+                        / float(total_frames)) * float(total_samples)
+        return _viewport_axis_window(
+            int(total_samples), sample_view0, sample_view1, cfg.x_neg, cfg.x_pos)
+
+    def _fft_scaler_viewport_context(self) -> dict[str, str]:
+        total_samples = max(1, self._fft_scaler_total_samples())
+        sr_val = int(self._npz["sr"]) if self._npz is not None and "sr" in self._npz else 44100
+        sr_val = max(1, sr_val)
+        s0, s1, _ = self._fft_scaler_sample_window(
+            total_samples, self.fft_scaler_view.viewport_boundary)
+        x_summary = f"X: {s0 / sr_val:.3f}s .. {s1 / sr_val:.3f}s"
+        if self._freqs is not None and len(self._freqs):
+            nyq = 0.5 * float(sr_val)
+            _b0, _b1, eff_lo, eff_hi = _viewport_freq_window_from_cqt(
+                self._freqs, self.view_y0, self.view_y1,
+                self.fft_scaler_view.viewport_boundary, nyq)
+            y_summary = f"Y: {eff_lo:.3f} Hz .. {eff_hi:.3f} Hz"
+        else:
+            y_summary = "Y: CQT frequencies unavailable"
+        return {"x_summary": x_summary, "y_summary": y_summary}
+
+    def _fft_scaler_pitch_slider_range(self) -> tuple[float, float]:
+        lo = FFTScalerPanel._LOG2_MIN
+        hi = FFTScalerPanel._LOG2_MAX
+        if self._freqs is None or len(self._freqs) == 0:
+            return lo, hi
+        sr_val = int(self._npz["sr"]) if self._npz is not None and "sr" in self._npz else 44100
+        nyq = 0.5 * float(max(1, sr_val))
+        _b0, _b1, eff_lo, eff_hi = _viewport_freq_window_from_cqt(
+            self._freqs, self.view_y0, self.view_y1,
+            self.fft_scaler_view.viewport_boundary, nyq)
+        target_c5 = _midi_to_freq(FFTScalerPanel._TARGET_MIDI)
+        if eff_lo > 0.0 and math.isfinite(eff_lo):
+            hi = max(hi, float(math.ceil(math.log2(target_c5 / eff_lo))))
+        if eff_hi > 0.0 and math.isfinite(eff_hi):
+            lo = min(lo, float(math.floor(math.log2(target_c5 / eff_hi))))
+        if hi <= lo:
+            return FFTScalerPanel._LOG2_MIN, FFTScalerPanel._LOG2_MAX
+        return lo, hi
+
+    def _stop_fft_scaler_direct(self) -> None:
+        fp = getattr(self, "fft_scaler_panel", None)
+        if fp is not None:
+            fp.stop_playback()
+
+    def _play_fft_scaler_direct(self) -> None:
+        fp = self.fft_scaler_panel
+        if fp is None or not self.audio_path or not os.path.isfile(self.audio_path):
+            return
+
+        self._stop_fft_scaler_direct()
+        fp._status = "synthesizing"
+
+        def _worker() -> None:
+            try:
+                import torch
+                import torch.nn.functional as _F
+
+                cfg = fp.config
+                if self._freqs is None or len(self._freqs) == 0:
+                    raise RuntimeError("No CQT frequency grid loaded")
+                if cfg.method != "stft":
+                    raise RuntimeError(f"Unsupported method: {cfg.method}")
+
+                # ── 1. File metadata — no audio loaded yet ────────────────────
+                if _HAS_SOUNDFILE:
+                    _info = _sf.info(self.audio_path)
+                    sr_val = max(1, int(_info.samplerate))
+                    total_samples = int(_info.frames)
+                    _mono_full: np.ndarray | None = None
+                else:
+                    _sr_full, _mono_full = _load_audio_float(self.audio_path)
+                    sr_val = max(1, int(_sr_full))
+                    total_samples = int(len(_mono_full))
+
+                s0, s1, time_weights = self._fft_scaler_sample_window(
+                    total_samples, cfg.viewport_boundary)
+                if s1 <= s0:
+                    raise RuntimeError("Viewport time window is empty")
+
+                nyq = 0.5 * float(sr_val)
+                base_lo, base_hi, eff_lo, eff_hi = _viewport_freq_window_from_cqt(
+                    self._freqs, self.view_y0, self.view_y1, cfg.viewport_boundary, nyq)
+
+                hop_hint = (int(self._npz["cqt_grid_hop_length"])
+                            if self._npz is not None and "cqt_grid_hop_length" in self._npz else (
+                            int(self._npz["hop_length"])
+                            if self._npz is not None and "hop_length" in self._npz else 512))
+                bpo_val = (int(self._npz["bins_per_octave"])
+                           if self._npz is not None and "bins_per_octave" in self._npz else 12)
+                fs_val = (float(self._npz["cqt_filter_scale"])
+                          if self._npz is not None and "cqt_filter_scale" in self._npz else 1.0)
+                cqt_window = (str(self._npz["cqt_window"].item())
+                              if self._npz is not None and "cqt_window" in self._npz
+                              else (_CQT_WINDOWS[self.file_panel.cqt_window_idx]
+                                    if self.file_panel else "hann"))
+
+                # ── 2. Estimate n_fft to determine real-signal padding ────────
+                # Load ½-window of real audio on each side of the viewport so
+                # the STFT window never sees zeros or a reflected edge at the
+                # viewport boundary.  This preserves low-frequency phase
+                # integrity where n_fft (and therefore the required context) is
+                # largest.
+                n_fft_est, _ = _fft_scaler_stft_params(
+                    sr=sr_val, freq_lo=max(eff_lo, 1.0), hop_hint=hop_hint,
+                    bins_per_octave=bpo_val, filter_scale=fs_val, signal_len=0)
+                lead = n_fft_est // 2
+                p0 = max(0, s0 - lead)
+                p1 = min(total_samples, s1 + lead)
+                actual_lead = s0 - p0   # real samples available on the left
+
+                # ── 3. Stream-load padded viewport slice ─────────────────────
+                fp._status = "synth: load"
+                _backpressure_wait("pv_load")
+                if _HAS_SOUNDFILE:
+                    _raw, _ = _sf.read(
+                        self.audio_path, start=p0, stop=p1,
+                        dtype="float32", always_2d=False,
+                    )
+                    mono: np.ndarray = (
+                        _raw.mean(axis=1).astype(np.float32)
+                        if _raw.ndim == 2 else np.asarray(_raw, dtype=np.float32)
+                    )
+                else:
+                    assert _mono_full is not None
+                    mono = np.asarray(_mono_full[p0:p1], dtype=np.float32)
+                    del _mono_full
+
+                # ── 4. FFT band-isolation on the full padded slice ────────────
+                fp._status = "synth: filter"
+                _backpressure_wait("pv_filter")
+                band_sig, band_lo, band_hi = _soft_fft_bandpass(
+                    mono, sr_val,
+                    base_lo=base_lo, base_hi=base_hi,
+                    cfg=cfg.viewport_boundary,
+                    filter_type=("Linkwitz-Riley 4" if self.file_panel is None
+                                 else _FILTER_TYPES[self.file_panel.fb_filter_type_idx]),
+                )
+                del mono
+
+                # Apply time_weights to the core viewport region only; the
+                # periphery stays undistorted to give clean window context.
+                if time_weights.size > 0:
+                    core_end = actual_lead + (s1 - s0)
+                    core = band_sig[actual_lead:core_end].copy()
+                    core = core[:time_weights.size] * time_weights[:len(core)]
+                    band_sig = np.concatenate([
+                        band_sig[:actual_lead], core, band_sig[core_end:],
+                    ])
+
+                if not np.any(np.abs(band_sig) > 1e-12):
+                    raise RuntimeError("Viewport band is empty")
+
+                # ── 5. Exact STFT parameters ──────────────────────────────────
+                n_fft, hop = _fft_scaler_stft_params(
+                    sr=sr_val, freq_lo=max(band_lo, 1.0), hop_hint=hop_hint,
+                    bins_per_octave=bpo_val, filter_scale=fs_val,
+                    signal_len=len(band_sig),
+                )
+
+                # ── 6. Forward STFT ───────────────────────────────────────────
+                fp._status = "synth: STFT"
+                _backpressure_wait("pv_fwd_stft")
+                win_t = _stft_engine_window(cqt_window, n_fft)
+                xt = torch.from_numpy(band_sig.astype(np.float32))
+                del band_sig
+                Z = _stft_engine_forward(xt, n_fft, hop, win_t)
+                del xt
+
+                # ── 7. Phase vocoder (greedy, OOM-retry halving) ──────────────
+                fp._status = "synth: PV"
+                stretch_rate = max(
+                    cfg.time_scale / max(cfg.pitch_scale, 1e-9), 1e-9)
+                Z_pv = _stft_engine_phase_vocoder(Z, n_fft, hop, stretch_rate)
+                del Z
+
+                # ── 8. Inverse STFT ───────────────────────────────────────────
+                fp._status = "synth: iSTFT"
+                y_t = _stft_engine_inverse(Z_pv, n_fft, hop, win_t)
+                del Z_pv
+
+                # ── 9. Pitch resampling ───────────────────────────────────────
+                if abs(cfg.pitch_scale - 1.0) > 1e-6 and y_t.numel() > 1:
+                    out_len = max(1, int(round(int(y_t.shape[0]) / cfg.pitch_scale)))
+                    y_t = _F.interpolate(
+                        y_t.view(1, 1, -1), size=out_len,
+                        mode="linear", align_corners=True,
+                    ).view(-1)
+
+                sig = y_t.numpy().astype(np.float64)
+                del y_t
+
+                # ── 10. Trim real-signal periphery from output ────────────────
+                # After PV + pitch-resample, each input sample maps to
+                # 1/time_scale output samples; trim the lead accordingly.
+                if actual_lead > 0:
+                    out_trim = max(0, int(actual_lead / cfg.time_scale))
+                    sig = sig[out_trim:]
+
+                # ── 11. Fade + normalise ──────────────────────────────────────
+                fade = min(256, len(sig) // 4)
+                if fade > 1:
+                    ramp = np.linspace(0.0, 1.0, fade)
+                    sig[:fade] *= ramp
+                    sig[-fade:] *= ramp[::-1]
+                if cfg.normalize:
+                    peak = float(np.max(np.abs(sig))) if len(sig) else 0.0
+                    if peak > 1e-12:
+                        sig = sig / peak * 0.8
+
+                i16 = (sig * 32767.0).clip(-32768, 32767).astype(np.int16)
+                stereo = np.column_stack([i16, i16])
+                sound = pygame.sndarray.make_sound(stereo)
+                channel = sound.play()
+                fp._playing_sound = sound
+                fp._playing_channel = channel
+                fp._status = "playing"
+            except Exception as exc:
+                fp._status = "error"
+                fp._error_msg = str(exc)[:60]
+
+        fp._synth_thread = threading.Thread(target=_worker, daemon=True)
+        fp._synth_thread.start()
+
     # ---- Wavelet direct playback (TimeScaleViewPanel) --------------------
+
+    def _wavelet_viewport_context(self) -> dict[str, str]:
+        total_frames = max(1, int(self._wv_n_frames))
+        x0 = max(0.0, min(float(total_frames), float(self.view_x0)))
+        x1 = max(x0, min(float(total_frames), float(self.view_x1)))
+        total_samples = int(self._wv_meta.get("n_samples", 0) or 0)
+        if total_samples <= 0:
+            hop = max(
+                1,
+                int(
+                    self._wv_meta.get(
+                        "working_hop_length",
+                        self._wv_meta.get("hop_length", 1),
+                    ) or 1
+                ),
+            )
+            total_samples = max(1, total_frames * hop)
+        sr_val = int(self._wv_meta.get("sr", 0) or 0)
+        if sr_val <= 0 and self._npz is not None and "sr" in self._npz:
+            sr_val = int(self._npz["sr"])
+        sr_val = max(sr_val, 1)
+        total_dur = total_samples / float(sr_val)
+        t0 = (x0 / float(total_frames)) * total_dur
+        t1 = (x1 / float(total_frames)) * total_dur
+
+        y0 = max(0.0, min(float(self._wv_n_levels), float(self.view_y0)))
+        y1 = max(y0, min(float(self._wv_n_levels), float(self.view_y1)))
+        if self._wv_freqs is not None and len(self._wv_freqs) == self._wv_n_levels:
+            disp_freqs = np.asarray(self._wv_freqs[::-1], dtype=np.float64)
+            idx0 = max(0, min(len(disp_freqs) - 1, int(math.floor(y0))))
+            idx1 = max(0, min(len(disp_freqs) - 1, max(0, int(math.ceil(y1)) - 1)))
+            f_lo = float(disp_freqs[min(idx0, idx1)])
+            f_hi = float(disp_freqs[max(idx0, idx1)])
+            y_summary = f"Y: {f_lo:.3f} Hz .. {f_hi:.3f} Hz"
+        else:
+            y_summary = f"Y: row {y0:.1f} .. {y1:.1f}"
+
+        return {
+            "x_summary": f"X: {t0:.3f}s .. {t1:.3f}s",
+            "y_summary": y_summary,
+        }
+
+    def _wavelet_scale_slider_range(self) -> tuple[float, float]:
+        lo = TimeScaleViewPanel._LOG2_MIN
+        hi = TimeScaleViewPanel._LOG2_MAX
+        if self._wv_freqs is None or len(self._wv_freqs) == 0 or self._wv_n_levels <= 0:
+            return lo, hi
+
+        disp_freqs = np.asarray(self._wv_freqs[::-1], dtype=np.float64)
+        y0 = max(0.0, min(float(self._wv_n_levels), float(self.view_y0)))
+        y1 = max(y0, min(float(self._wv_n_levels), float(self.view_y1)))
+        idx0 = max(0, min(len(disp_freqs) - 1, int(math.floor(y0))))
+        idx1 = max(0, min(len(disp_freqs) - 1, max(0, int(math.ceil(y1)) - 1)))
+        f_lo = float(min(disp_freqs[idx0], disp_freqs[idx1]))
+        f_hi = float(max(disp_freqs[idx0], disp_freqs[idx1]))
+        target_c5 = _midi_to_freq(TimeScaleViewPanel._TARGET_MIDI)
+
+        if f_lo > 0.0 and math.isfinite(f_lo):
+            hi = max(hi, float(math.ceil(math.log2(target_c5 / f_lo))))
+        if f_hi > 0.0 and math.isfinite(f_hi):
+            lo = min(lo, float(math.floor(math.log2(target_c5 / f_hi))))
+        if hi <= lo:
+            return TimeScaleViewPanel._LOG2_MIN, TimeScaleViewPanel._LOG2_MAX
+        return lo, hi
 
     def _play_wavelet_direct(self) -> None:
         """Synthesise the visible wavelet viewport with the panel's time-scale
@@ -16015,7 +22450,15 @@ class SpectrogramViewer:
         total_samples = int(wv_meta.get("n_samples", 0) or 0)
         if total_samples <= 0:
             if self._wv_W is not None and wv_meta.get("type", "dwt") == "cwt":
-                hop = max(1, int(wv_meta.get("hop_length", 1) or 1))
+                hop = max(
+                    1,
+                    int(
+                        wv_meta.get(
+                            "working_hop_length",
+                            wv_meta.get("hop_length", 1),
+                        ) or 1
+                    ),
+                )
                 total_samples = int(self._wv_W.shape[1]) * hop
             elif self._wv_coeffs:
                 total_samples = int(len(self._wv_coeffs[-1]) * 2)
@@ -16038,6 +22481,11 @@ class SpectrogramViewer:
                     W_complex=self._wv_W,
                     wv_freqs=self._wv_freqs,
                     playback_rate=time_scale,
+                    view_x0=float(self.view_x0),
+                    view_x1=float(self.view_x1),
+                    view_y0=float(self.view_y0),
+                    view_y1=float(self.view_y1),
+                    viewport_boundary=wp.config.viewport_boundary,
                 )
 
                 # Fade edges
@@ -18444,8 +24892,14 @@ class SpectrogramViewer:
                 if not name:
                     continue
                 freq = float(self._freqs[i])
-                labels.append((bin_to_sy(float(i)),
-                               f"{name}  {freq:.1f} Hz"))
+                # When heterodyne was applied, display the physical (pre-shift) frequency.
+                phys = freq - self._heterodyne_hz
+                if self._heterodyne_hz != 0.0:
+                    labels.append((bin_to_sy(float(i)),
+                                   f"{name}  {phys:.1f} Hz"))
+                else:
+                    labels.append((bin_to_sy(float(i)),
+                                   f"{name}  {freq:.1f} Hz"))
             draw_h_labels(labels)
 
         if self.show_freq_axis and self.display_mode == "tf" and self.tf_source == "hybrid":
@@ -18484,10 +24938,13 @@ class SpectrogramViewer:
                     scr_y = bin_to_sy(self._hybrid_freq_to_bin(f, grid_h))
                     if abs(scr_y - last_screen_y) < 14:
                         continue
-                    fmt = _freq_fmt(f)
-                    label = f"{fmt.format(f)} Hz"
-                    if f >= 20.0:
-                        label = f"{label}  {_freq_to_note_name(f)}"
+                    # Physical frequency if heterodyne was applied.
+                    phys_f = f - self._heterodyne_hz
+                    fmt = _freq_fmt(phys_f if self._heterodyne_hz != 0.0 else f)
+                    label = f"{fmt.format(phys_f if self._heterodyne_hz != 0.0 else f)} Hz"
+                    note_f = phys_f if self._heterodyne_hz != 0.0 else f
+                    if note_f >= 20.0:
+                        label = f"{label}  {_freq_to_note_name(note_f)}"
                     shown_ticks.append((scr_y, label))
                     last_screen_y = scr_y
 

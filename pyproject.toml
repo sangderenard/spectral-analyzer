@@ -16,7 +16,8 @@ dependencies = [
 [project.optional-dependencies]
 mp3 = ["miniaudio"]
 viewer = ["pygame", "PyOpenGL"]
-all = ["miniaudio", "pygame", "PyOpenGL"]
+midi = ["mido"]
+all = ["miniaudio", "pygame", "PyOpenGL", "mido"]
 
 [project.scripts]
 bass-analyze = "bass_analysis:main"

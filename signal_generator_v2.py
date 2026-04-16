@@ -79,12 +79,18 @@ class WitnessThresholds:
     """
     Controls how much accumulated phase is required to consider
     a local point in time 'witnessed' by surrounding history/future.
+
+    Note: ``integration_steps_per_check`` was previously used by the witness
+    search loop.  That loop is now incremental (one 2-point trapezoid slice per
+    step), so that field no longer affects witness accuracy.  It is repurposed
+    here as the tap count for any ``DriftModel`` subclass that does not supply
+    a closed-form ``phase_integral_at`` and falls back to numerical integration.
     """
     backward_phase_radians: float = PI2
     forward_phase_radians: float = PI2
     max_support_seconds: float = 10.0
     support_search_step_seconds: float = 1e-3
-    integration_steps_per_check: int = 24
+    integration_steps_per_check: int = 64
 
 
 @dataclass(frozen=True)
@@ -321,6 +327,10 @@ class ExponentialDecayPhasePath(PhasePath):
     def frequency_hz(self, t: float) -> float:
         return self._f0 * math.exp(-t / self._tau)
 
+    def chirp_rate_hz_per_s(self, t: float) -> float:
+        # d/dt [f0 * exp(-t/tau)] = -f0/tau * exp(-t/tau)
+        return -self._f0 / self._tau * math.exp(-t / self._tau)
+
     def phase(self, t: float) -> float:
         return self._phase0 + PI2 * self._f0 * self._tau * (1.0 - math.exp(-t / self._tau))
 
@@ -354,6 +364,14 @@ class PowerLawDecayPhasePath(PhasePath):
             raise ValueError("time below domain for PowerLawDecayPhasePath")
         return self._f0 / ((1.0 + t / self._tau) ** self._power)
 
+    def chirp_rate_hz_per_s(self, t: float) -> float:
+        # d/dt [f0 / (1 + t/tau)^p] = -f0*p / (tau * (1 + t/tau)^(p+1))
+        if t < -self._tau:
+            raise ValueError("time below domain for PowerLawDecayPhasePath")
+        return -self._f0 * self._power / (
+            self._tau * (1.0 + t / self._tau) ** (self._power + 1.0)
+        )
+
     def phase(self, t: float) -> float:
         if t < -self._tau:
             raise ValueError("time below domain for PowerLawDecayPhasePath")
@@ -370,6 +388,33 @@ class PowerLawDecayPhasePath(PhasePath):
         return self._phase0 + PI2 * f0 * integral
 
 
+class ConstantPhasePath(PhasePath):
+    """
+    Stable-pitch path: f(t) = f0 (constant).
+
+    phase(t) = phase0 + 2π·f0·t
+    chirp_rate = 0  (exact, no numerical fallback needed)
+    """
+
+    def __init__(self, frequency_hz: float, phase0: float = 0.0) -> None:
+        if frequency_hz < 0.0:
+            raise ValueError("frequency_hz must be >= 0")
+        self._f0     = frequency_hz
+        self._phase0 = phase0
+
+    def frequency_hz(self, t: float) -> float:
+        return self._f0
+
+    def chirp_rate_hz_per_s(self, t: float) -> float:
+        return 0.0
+
+    def phase(self, t: float) -> float:
+        return self._phase0 + PI2 * self._f0 * t
+
+    def accumulated_phase(self, t0: float, t1: float, steps: int = 32) -> float:
+        return PI2 * self._f0 * (t1 - t0)
+
+
 # ============================================================
 # Drift models
 # ============================================================
@@ -377,7 +422,14 @@ class PowerLawDecayPhasePath(PhasePath):
 class DriftModel(ABC):
     """
     Drift is additive in frequency space by default.
+
+    ``_fallback_integration_steps`` controls how many trapezoid taps are used
+    by ``phase_integral_at`` when a subclass does not supply a closed-form
+    override.  Set it on the instance after construction, or pass
+    ``WitnessThresholds.integration_steps_per_check`` through to it.
     """
+
+    _fallback_integration_steps: int = 64
 
     @abstractmethod
     def frequency_offset_hz(self, t: float, harmonic_index: int) -> float:
@@ -387,11 +439,18 @@ class DriftModel(ABC):
         """Integral of 2π·frequency_offset_hz from 0 to t.
 
         Subclasses with a closed form should override this.
-        The default falls back to numerical trapezoid integration.
+        The default falls back to numerical trapezoid integration using
+        ``self._fallback_integration_steps`` taps.
         """
         return PI2 * integrate_trapezoid(
             lambda tau: self.frequency_offset_hz(tau, harmonic_index),
-            0.0, t, steps=64,
+            0.0, t, steps=self._fallback_integration_steps,
+        )
+
+    def chirp_rate_hz_per_s(self, t: float, harmonic_index: int) -> float:
+        """d/dt of frequency_offset_hz.  Override with closed form where possible."""
+        return differentiate_central(
+            lambda tau: self.frequency_offset_hz(tau, harmonic_index), t
         )
 
 
@@ -400,6 +459,9 @@ class NullDriftModel(DriftModel):
         return 0.0
 
     def phase_integral_at(self, t: float, harmonic_index: int) -> float:
+        return 0.0
+
+    def chirp_rate_hz_per_s(self, t: float, harmonic_index: int) -> float:
         return 0.0
 
 
@@ -433,6 +495,13 @@ class SmoothSinusoidalDriftModel(DriftModel):
             return 0.0
         scale = 1.0 / (harmonic_index ** self._harmonic_scaling_power)
         return self._max_offset_hz * scale * (1.0 - math.cos(PI2 * rate * t)) / rate
+
+    def chirp_rate_hz_per_s(self, t: float, harmonic_index: int) -> float:
+        # d/dt [max_offset * scale * sin(2π*rate*t)] = max_offset * scale * 2π*rate * cos(2π*rate*t)
+        scale = 1.0 / (harmonic_index ** self._harmonic_scaling_power)
+        return self._max_offset_hz * scale * PI2 * self._base_rate_hz * math.cos(
+            PI2 * self._base_rate_hz * t
+        )
 
 
 # ============================================================
@@ -534,6 +603,13 @@ class LatticeVoice:
     def effective_angular_frequency(self, t: float) -> float:
         return PI2 * self.effective_frequency_hz(t)
 
+    def chirp_rate_hz_per_s(self, t: float) -> float:
+        """Analytic instantaneous chirp rate (Hz/s) using path + drift closed forms."""
+        return (
+            self._harmonic_index * self._master_phase_path.chirp_rate_hz_per_s(t)
+            + self._drift_model.chirp_rate_hz_per_s(t, self._harmonic_index)
+        )
+
     def approximate_effective_phase(self, t: float) -> float:
         """
         Keeps master phase exact, then adds a drift integral.
@@ -568,6 +644,12 @@ class HarmonicLattice:
         if not voices:
             raise ValueError("HarmonicLattice requires at least one voice")
         self._voices = list(voices)
+        # The voice with the lowest harmonic index always has the lowest
+        # instantaneous frequency (all share the same master path; drift is tiny).
+        # Cache it so DensityPlanner / WitnessPlanner can query it cheaply.
+        self._min_harmonic_voice: LatticeVoice = min(
+            self._voices, key=lambda v: v.harmonic_index
+        )
 
     @property
     def voices(self) -> Sequence[LatticeVoice]:
@@ -583,15 +665,206 @@ class HarmonicLattice:
         return max(abs(v.effective_frequency_hz(t)) for v in self._voices)
 
     def max_abs_chirp_like_measure(self, t: float) -> float:
+        """Instantaneous chirp magnitude, using analytic derivatives where available."""
+        return max(abs(v.chirp_rate_hz_per_s(t)) for v in self._voices)
+
+
+# ============================================================
+# Output admissibility planning
+# ============================================================
+
+@dataclass(frozen=True)
+class VoiceAdmissibilityVerdict:
+    """
+    Describes how much a voice must be attenuated and/or warp-capped to
+    remain admissible under a target output sample rate.
+
+    gain_taper:
+        Multiplicative gain attenuation in [0, 1].  1.0 = untouched.
+    warp_cap:
+        Maximum |warp·shape_state| product the manifold should see.
+        Relevant only for PhaseWarpedManifold.
+    harmonic_gain:
+        Per-harmonic-index gain taper.  None means the voice passes all harmonics at full gain.
+    """
+    gain_taper: float
+    warp_cap: float
+    harmonic_gain: float  # in [0, 1]
+
+
+class OutputAdmissibilityPlanner:
+    """
+    Estimates whether each ``LatticeVoice`` in a lattice will produce
+    spectral content above the output Nyquist and derives taper values
+    that attenuate the excess before projection.
+
+    The estimate is intentionally conservative: it models sideband spray
+    from drift and phase-warp as a fixed margin above the nominal voice
+    frequency, then soft-clips any energy whose ceiling exceeds ``nyquist``.
+
+    Margin conventions
+    ------------------
+    ``drift_margin_factor``
+        Fraction of the voice's nominal frequency added as an upper-sideband
+        margin to account for sinusoidal drift.  E.g. 0.05 = ±5 % drift
+        sidebands.
+
+    ``warp_margin_factor``
+        Fraction of the voice's nominal frequency added per unit of warp
+        strength × shape_state.  A warp of 0.25 at shape_state 1.0 with a
+        margin factor of 2.0 adds 0.5× the nominal frequency.
+
+    ``soft_knee_width``
+        Width (in Hz) of the soft-knee rolloff at the Nyquist boundary.
+        Energy within [nyquist − knee, nyquist] is tapered smoothly to zero.
+    """
+
+    def __init__(
+        self,
+        output_sample_rate: float,
+        drift_margin_factor: float = 0.05,
+        warp_margin_factor: float = 2.0,
+        soft_knee_width: float = 500.0,
+    ) -> None:
+        if output_sample_rate <= 0.0:
+            raise ValueError("output_sample_rate must be > 0")
+        self._output_sr      = output_sample_rate
+        self._nyquist        = output_sample_rate * 0.5
+        self._drift_margin   = drift_margin_factor
+        self._warp_margin    = warp_margin_factor
+        self._soft_knee_width = max(1.0, soft_knee_width)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def estimate_spectral_ceiling(
+        self, voice: LatticeVoice, t: float
+    ) -> float:
         """
-        Approximate a curvature-related measure by differentiating
-        effective frequency numerically.
+        Upper bound on the spectral content produced by *voice* at time *t*,
+        accounting for drift sidebands and phase-warp harmonics.
         """
-        max_value = 0.0
-        for voice in self._voices:
-            value = abs(differentiate_central(voice.effective_frequency_hz, t))
-            max_value = max(max_value, value)
-        return max_value
+        f_nom   = abs(voice.effective_frequency_hz(t))
+        drift_offset = abs(voice._drift_model.frequency_offset_hz(t, voice.harmonic_index))
+
+        # Warp sideband spray: PhaseWarpedManifold with warp·shape_state = W
+        # adds energy near (1 + W) × f_nom as a rough upper bound.
+        warp_strength = getattr(voice._waveform_manifold,
+                                '_harmonic_warp_strength', 0.0)
+        shape = voice.shape_state(t)
+        warp_ceiling_extra = self._warp_margin * warp_strength * abs(shape) * f_nom
+
+        drift_ceiling_extra = (
+            self._drift_margin * f_nom + drift_offset
+        )
+
+        return f_nom + max(drift_ceiling_extra, warp_ceiling_extra)
+
+    def compute_verdict(self, voice: LatticeVoice, t: float) -> VoiceAdmissibilityVerdict:
+        """
+        Return a ``VoiceAdmissibilityVerdict`` for *voice* at time *t*.
+        """
+        ceiling = self.estimate_spectral_ceiling(voice, t)
+        nyquist  = self._nyquist
+        knee     = self._soft_knee_width
+
+        # Gain taper: soft-knee rolloff from 1→0 over [nyquist-knee, nyquist].
+        # Content above nyquist is zeroed; content in the knee is smoothly faded.
+        if ceiling <= nyquist - knee:
+            gain_taper = 1.0
+        elif ceiling >= nyquist:
+            gain_taper = 0.0
+        else:
+            # Linear knee taper (could be raised to a power for smoother rolloff)
+            gain_taper = (nyquist - ceiling) / knee
+
+        # Warp cap: if the voice is in or near the knee, reduce warp to
+        # prevent further sideband spray.  The cap is proportional to headroom.
+        warp_strength = getattr(voice._waveform_manifold,
+                                '_harmonic_warp_strength', 0.0)
+        f_nom = max(1e-12, abs(voice.effective_frequency_hz(t)))
+        headroom = max(0.0, nyquist - f_nom)
+        # Maximum |warp| that keeps warp ceiling < nyquist:
+        # warp * shape * f_nom * warp_margin < headroom
+        shape = abs(voice.shape_state(t))
+        denom = self._warp_margin * max(1e-12, shape) * f_nom
+        warp_cap = min(warp_strength, headroom / denom) if denom > 0 else warp_strength
+
+        return VoiceAdmissibilityVerdict(
+            gain_taper=clamp(gain_taper, 0.0, 1.0),
+            warp_cap=clamp(warp_cap, 0.0, max(warp_strength, 1.0)),
+            harmonic_gain=clamp(gain_taper, 0.0, 1.0),
+        )
+
+
+# ============================================================
+# Complex pre-projection filter
+# ============================================================
+
+class ComplexPreProjectionFilter:
+    """
+    Applies admissibility-guided filtering to each voice contribution
+    **before** samples are summed and **before** projection to a real
+    uniform output grid.
+
+    This is a two-stage filter:
+
+    Stage 1 — parameter domain:
+        Evaluates each voice under a potentially modified warp strength
+        (derived from ``VoiceAdmissibilityVerdict.warp_cap``) so that phase
+        spray from warp is bounded before the analytic sample is even computed.
+
+    Stage 2 — complex sample domain:
+        Multiplies the voice's complex contribution by
+        ``VoiceAdmissibilityVerdict.gain_taper``, attenuating energy that
+        would alias at the target output rate.
+
+    The filter is **stateless and causal-free**: every call to
+    ``evaluate_complex`` is independent.  It can therefore be inserted into
+    any emit loop without changing the witness or density contracts.
+
+    Usage
+    -----
+    Pass an instance to ``WitnessAwareSynthDriver`` (or directly to
+    ``AdaptiveEmitter``) to activate pre-projection filtering.  If ``None``
+    is supplied (the default), the pipeline runs unfiltered.
+    """
+
+    def __init__(self, planner: OutputAdmissibilityPlanner) -> None:
+        self._planner = planner
+
+    def evaluate_lattice_filtered(
+        self, lattice: HarmonicLattice, t: float
+    ) -> complex:
+        """
+        Evaluate all voices with per-voice admissibility gain taper applied.
+
+        The warp cap is enforced by temporarily substituting the manifold's
+        ``_harmonic_warp_strength`` attribute when the verdict requires it.
+        The substitution is restored before returning, so the voice object
+        is not permanently mutated.
+        """
+        acc = 0j
+        for voice in lattice.voices:
+            verdict = self._planner.compute_verdict(voice, t)
+
+            # Stage 1: enforce warp cap via temporary manifold attribute override.
+            manifold = voice._waveform_manifold
+            original_warp = getattr(manifold, '_harmonic_warp_strength', None)
+            if original_warp is not None and original_warp > verdict.warp_cap:
+                manifold._harmonic_warp_strength = verdict.warp_cap
+
+            # Stage 2: evaluate voice, then apply gain taper.
+            z = voice.evaluate_complex(t)
+            z *= verdict.gain_taper
+
+            # Restore manifold warp.
+            if original_warp is not None and original_warp > verdict.warp_cap:
+                manifold._harmonic_warp_strength = original_warp
+
+            acc += z
+        return acc
 
 
 # ============================================================
@@ -656,13 +929,10 @@ class WitnessPlanner:
         return SupportBudget(backward_seconds=backward, forward_seconds=forward)
 
     def compute_support_budget_for_lattice(self, lattice: HarmonicLattice, t: float) -> SupportBudget:
-        max_backward = 0.0
-        max_forward = 0.0
-        for voice in lattice.voices:
-            budget = self.compute_support_budget_for_voice(voice, t)
-            max_backward = max(max_backward, budget.backward_seconds)
-            max_forward = max(max_forward, budget.forward_seconds)
-        return SupportBudget(backward_seconds=max_backward, forward_seconds=max_forward)
+        # The lowest-harmonic voice has the lowest instantaneous frequency and
+        # therefore accumulates phase most slowly, always requiring the largest
+        # temporal support window.  Checking all voices is redundant work.
+        return self.compute_support_budget_for_voice(lattice._min_harmonic_voice, t)
 
 
 # ============================================================
@@ -710,6 +980,11 @@ class DensityPlanner:
 class AdaptiveEmitter:
     """
     Emits complex samples on an adaptive internal timeline.
+
+    If a ``ComplexPreProjectionFilter`` is supplied, each sample is evaluated
+    through the filter instead of the raw lattice sum.  This allows analytic
+    admissibility filtering (gain taper + warp cap) to act in the one-sided
+    complex domain before any real projection occurs.
     """
 
     def __init__(
@@ -717,10 +992,18 @@ class AdaptiveEmitter:
         lattice: HarmonicLattice,
         density_planner: DensityPlanner,
         witness_planner: WitnessPlanner,
+        pre_projection_filter: Optional[ComplexPreProjectionFilter] = None,
     ) -> None:
         self._lattice = lattice
         self._density_planner = density_planner
         self._witness_planner = witness_planner
+        self._filter = pre_projection_filter
+
+    def _sample_lattice(self, t: float) -> complex:
+        """Evaluate lattice at *t*, applying the pre-projection filter if set."""
+        if self._filter is not None:
+            return self._filter.evaluate_lattice_filtered(self._lattice, t)
+        return self._lattice.evaluate_complex(t)
 
     def emit(self, emission_range: EmissionRange) -> AdaptiveSampleBuffer:
         emission_range.validate()
@@ -730,7 +1013,7 @@ class AdaptiveEmitter:
         end = emission_range.end_time
 
         while t < end:
-            value = self._lattice.evaluate_complex(t)
+            value = self._sample_lattice(t)
             buffer.add(t, value)
 
             dt = self._density_planner.local_dt(self._lattice, t)
@@ -743,7 +1026,7 @@ class AdaptiveEmitter:
             t = t_next
 
         if not buffer.samples or buffer.samples[-1].t < end:
-            buffer.add(end, self._lattice.evaluate_complex(end))
+            buffer.add(end, self._sample_lattice(end))
 
         return buffer
 
@@ -773,6 +1056,11 @@ class ProjectionKernel(ABC):
     def weight(self, x: float) -> float:
         raise NotImplementedError
 
+    def weight_array(self, x_arr):
+        """Vectorised weight over a numpy array.  Override for performance."""
+        import numpy as np
+        return np.vectorize(self.weight)(x_arr)
+
 
 class SincKernel(ProjectionKernel):
     """
@@ -784,6 +1072,11 @@ class SincKernel(ProjectionKernel):
         if abs(x) < 1e-12:
             return 1.0
         return math.sin(PI2 * 0.5 * x) / (PI2 * 0.5 * x)
+
+    def weight_array(self, x_arr):
+        import numpy as np
+        px = math.pi * x_arr
+        return np.where(np.abs(px) < 1e-12, 1.0, np.sin(px) / px)
 
 
 class AdaptiveProjector:
@@ -870,6 +1163,182 @@ class AdaptiveProjector:
     ) -> List[float]:
         return [z.real for z in self.project_complex(buffer, start_time, end_time)]
 
+    # ------------------------------------------------------------------
+    # Vectorised backends
+    # ------------------------------------------------------------------
+
+    def _build_projection_arrays(self, buffer: AdaptiveSampleBuffer):
+        """Convert AdaptiveSampleBuffer to three numpy arrays for vectorised projection.
+
+        Returns ``(t_arr, v_arr, dt_arr)`` where:
+
+        * ``t_arr``  – sample times, shape ``(n,)``, dtype ``float64``
+        * ``v_arr``  – complex sample values, shape ``(n,)``, dtype ``complex128``
+        * ``dt_arr`` – local nominal dt per sample (centred finite difference of
+          neighbours), shape ``(n,)``, dtype ``float64``
+        """
+        import numpy as np
+        times  = buffer.times()
+        values = buffer.values()
+        n = len(times)
+        if n == 0:
+            empty_f = np.array([], dtype=np.float64)
+            return empty_f, np.array([], dtype=np.complex128), empty_f
+        t_arr  = np.array(times,  dtype=np.float64)
+        v_arr  = np.array(values, dtype=np.complex128)
+        dt_arr = np.empty(n, dtype=np.float64)
+        if n == 1:
+            dt_arr[0] = 1.0 / self._policy.output_sample_rate
+        else:
+            dt_arr[0]  = t_arr[1] - t_arr[0]
+            dt_arr[-1] = t_arr[-1] - t_arr[-2]
+            if n > 2:
+                dt_arr[1:-1] = 0.5 * (t_arr[2:] - t_arr[:-2])
+        return t_arr, v_arr, dt_arr
+
+    def project_complex_numpy(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+    ):
+        """Numpy-vectorised projection to a uniform complex grid.
+
+        The inner sinc-weight summation runs as numpy C code instead of a
+        Python ``for``-loop, eliminating per-sample Python overhead in the
+        kernel evaluation.  The outer loop (one Python iteration per output
+        sample) remains; for a fully loop-free path use
+        :meth:`project_complex_torch`.
+
+        Returns a ``numpy.ndarray`` of ``complex128``.
+        """
+        import numpy as np
+        if not buffer.samples:
+            return np.array([], dtype=np.complex128)
+
+        t_arr, v_arr, dt_arr = self._build_projection_arrays(buffer)
+
+        dt_out = 1.0 / self._policy.output_sample_rate
+        t_out  = np.arange(start_time, end_time + dt_out * 0.5, dt_out)
+        if len(t_out) == 0 or t_out[-1] < end_time - dt_out * 1e-6:
+            t_out = np.append(t_out, end_time)
+
+        half_support = self._policy.projection_half_support_seconds
+        lo_arr = np.searchsorted(t_arr, t_out - half_support, side='left')
+        hi_arr = np.searchsorted(t_arr, t_out + half_support, side='right')
+
+        out = np.zeros(len(t_out), dtype=np.complex128)
+        for i in range(len(t_out)):
+            lo, hi = int(lo_arr[i]), int(hi_arr[i])
+            if lo >= hi:
+                out[i] = buffer.evaluate_linear(float(t_out[i]))
+                continue
+            t_sl  = t_arr[lo:hi]
+            v_sl  = v_arr[lo:hi]
+            dt_sl = dt_arr[lo:hi]
+            x   = (float(t_out[i]) - t_sl) / np.maximum(dt_sl, 1e-12)
+            w   = self._kernel.weight_array(x)
+            den = float(np.abs(w).sum())
+            out[i] = (np.dot(w, v_sl) / den) if den != 0.0 else buffer.evaluate_linear(float(t_out[i]))
+        return out
+
+    def project_real_numpy(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+    ):
+        """Numpy-vectorised projection to a uniform real grid.
+
+        Returns a ``numpy.ndarray`` of ``float64`` (real part of the analytic signal).
+        """
+        return self.project_complex_numpy(buffer, start_time, end_time).real
+
+    def project_complex_torch(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+        device: str = 'cpu',
+    ):
+        """Fully-vectorised torch projection — no Python loop over output samples.
+
+        Builds a padded ``(n_out × max_window)`` gather matrix entirely in
+        numpy (no Python loop), then evaluates all sinc weights as a single
+        tensor operation.  Pass ``device='cuda'`` to run on GPU.
+
+        Returns a ``numpy.ndarray`` of ``complex128``.
+
+        Note: this path hardcodes the normalised-sinc formula; custom
+        ``ProjectionKernel`` subclasses are not honoured here.
+        """
+        import numpy as np
+        import torch
+
+        if not buffer.samples:
+            return np.array([], dtype=np.complex128)
+
+        t_np, v_np, dt_np = self._build_projection_arrays(buffer)
+        n_adaptive = len(t_np)
+
+        dt_out   = 1.0 / self._policy.output_sample_rate
+        t_out_np = np.arange(start_time, end_time + dt_out * 0.5, dt_out)
+        if len(t_out_np) == 0 or t_out_np[-1] < end_time - dt_out * 1e-6:
+            t_out_np = np.append(t_out_np, end_time)
+        n_out = len(t_out_np)
+
+        half_support = self._policy.projection_half_support_seconds
+        lo_arr = np.searchsorted(t_np, t_out_np - half_support, side='left')
+        hi_arr = np.searchsorted(t_np, t_out_np + half_support, side='right')
+
+        window_sizes = (hi_arr - lo_arr).astype(np.int64)
+        max_win = int(window_sizes.max()) if n_out > 0 and window_sizes.max() > 0 else 1
+
+        # Build (n_out × max_win) index matrix with no Python loop.
+        # src_candidates[i, j] = lo_arr[i] + j; mask out j >= window_sizes[i].
+        offsets        = np.arange(max_win, dtype=np.int64)
+        src_candidates = lo_arr[:, None].astype(np.int64) + offsets[None, :]
+        valid_mask     = offsets[None, :] < window_sizes[:, None]
+        idx_matrix     = np.where(valid_mask, src_candidates, 0)
+        idx_matrix     = np.clip(idx_matrix, 0, n_adaptive - 1)
+
+        t_gathered   = t_np[idx_matrix]
+        v_r_gathered = v_np.real[idx_matrix]
+        v_i_gathered = v_np.imag[idx_matrix]
+        dt_gathered  = dt_np[idx_matrix]
+
+        dtype   = torch.float64
+        t_out_t = torch.tensor(t_out_np[:, None], dtype=dtype, device=device)
+        t_g     = torch.tensor(t_gathered,    dtype=dtype, device=device)
+        v_r     = torch.tensor(v_r_gathered,  dtype=dtype, device=device)
+        v_i     = torch.tensor(v_i_gathered,  dtype=dtype, device=device)
+        dt_g    = torch.tensor(dt_gathered,   dtype=dtype, device=device)
+        vm      = torch.tensor(valid_mask,    dtype=torch.bool, device=device)
+
+        x  = (t_out_t - t_g) / dt_g.clamp(min=1e-12)
+        px = math.pi * x
+        w  = torch.where(px.abs() < 1e-12, torch.ones_like(px), px.sin() / px)
+        w  = w.masked_fill(~vm, 0.0)
+
+        denom    = w.abs().sum(dim=1).clamp(min=1e-12)
+        out_real = (w * v_r).sum(dim=1) / denom
+        out_imag = (w * v_i).sum(dim=1) / denom
+
+        return out_real.cpu().numpy() + 1j * out_imag.cpu().numpy()
+
+    def project_real_torch(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+        device: str = 'cpu',
+    ):
+        """Fully-vectorised torch projection to real.
+
+        Returns a ``numpy.ndarray`` of ``float64``.
+        """
+        return self.project_complex_torch(buffer, start_time, end_time, device=device).real
+
 
 # ============================================================
 # Top-level synth driver
@@ -883,8 +1352,17 @@ class WitnessAwareSynthDriver:
     - the lattice (shared-path harmonic structure)
     - witness planning
     - density planning
-    - adaptive emission
+    - adaptive emission  (optionally with a ComplexPreProjectionFilter)
     - projection to uniform output
+
+    Passing ``pre_projection_filter`` activates pre-projection admissibility
+    filtering in the analytic complex construction space.  The filter runs
+    per-voice before summation, so the complex adaptive buffer is already
+    band-safe before the final projection kernel runs.
+
+    Alternatively, call ``attach_admissibility_filter(output_sample_rate)``
+    after construction to auto-build a filter from the projection policy's
+    sample rate.
     """
 
     def __init__(
@@ -893,12 +1371,51 @@ class WitnessAwareSynthDriver:
         witness_thresholds: WitnessThresholds,
         density_policy: DensityPolicy,
         projection_policy: ProjectionPolicy,
+        pre_projection_filter: Optional[ComplexPreProjectionFilter] = None,
     ) -> None:
         self._lattice = lattice
         self._witness_planner = WitnessPlanner(witness_thresholds)
         self._density_planner = DensityPlanner(density_policy, self._witness_planner)
-        self._emitter = AdaptiveEmitter(lattice, self._density_planner, self._witness_planner)
+        self._emitter = AdaptiveEmitter(
+            lattice, self._density_planner, self._witness_planner,
+            pre_projection_filter=pre_projection_filter,
+        )
         self._projector = AdaptiveProjector(projection_policy)
+        self._projection_policy = projection_policy
+        # Propagate the configurable tap count to every drift model in the lattice.
+        for voice in lattice.voices:
+            voice._drift_model._fallback_integration_steps = (
+                witness_thresholds.integration_steps_per_check
+            )
+
+    def attach_admissibility_filter(
+        self,
+        output_sample_rate: Optional[float] = None,
+        drift_margin_factor: float = 0.05,
+        warp_margin_factor: float = 2.0,
+        soft_knee_width: float = 500.0,
+    ) -> "WitnessAwareSynthDriver":
+        """
+        Build and attach an ``OutputAdmissibilityPlanner`` + ``ComplexPreProjectionFilter``
+        configured for the target output rate (defaults to the projection policy's rate).
+
+        Returns ``self`` for chaining::
+
+            driver = factory.build(...).attach_admissibility_filter()
+        """
+        sr = output_sample_rate or self._projection_policy.output_sample_rate
+        planner = OutputAdmissibilityPlanner(
+            output_sample_rate=sr,
+            drift_margin_factor=drift_margin_factor,
+            warp_margin_factor=warp_margin_factor,
+            soft_knee_width=soft_knee_width,
+        )
+        filt = ComplexPreProjectionFilter(planner)
+        self._emitter = AdaptiveEmitter(
+            self._lattice, self._density_planner, self._witness_planner,
+            pre_projection_filter=filt,
+        )
+        return self
 
     @property
     def lattice(self) -> HarmonicLattice:
@@ -995,4 +1512,74 @@ def example_build_driver() -> WitnessAwareSynthDriver:
         initial_frequency_hz=80.0,
         tau_seconds=3.5,
         partial_count=6,
-        waveform_manifold=Pha
+        waveform_manifold=PhaseWarpedManifold(harmonic_warp_strength=0.35),
+        drift_model=SmoothSinusoidalDriftModel(
+            base_rate_hz=0.05,
+            max_offset_hz=0.08,
+            harmonic_scaling_power=1.0,
+        ),
+    )
+
+    driver = WitnessAwareSynthDriver(
+        lattice=lattice,
+        witness_thresholds=WitnessThresholds(
+            backward_phase_radians=PI2,
+            forward_phase_radians=PI2,
+            max_support_seconds=8.0,
+            support_search_step_seconds=0.0005,
+            integration_steps_per_check=32,
+        ),
+        density_policy=DensityPolicy(
+            oversampling_factor=24.0,
+            min_sample_rate=96_000.0,
+            max_sample_rate=5_000_000.0,
+            derivative_weight=0.75,
+            support_weight=1.25,
+        ),
+        projection_policy=ProjectionPolicy(
+            output_sample_rate=192_000.0,
+            projection_half_support_seconds=0.0015,
+            projection_kernel_steps=256,
+        ),
+    )
+    driver.attach_admissibility_filter()
+    return driver
+
+
+def example_render() -> None:
+    import numpy as np
+
+    driver       = example_build_driver()
+    render_range = EmissionRange(start_time=0.0, end_time=2.0)
+
+    adaptive = driver.emit_adaptive_complex(render_range)
+    real_np  = driver._projector.project_real_numpy(
+        adaptive, render_range.start_time, render_range.end_time
+    )
+    witness = driver.witness_trace(render_range, step_seconds=0.1)
+
+    print(f"Adaptive samples:     {len(adaptive)}")
+    print(f"Uniform real samples: {len(real_np)}")
+    print("First 5 adaptive samples:")
+    for sp in adaptive.samples[:5]:
+        print(f"  t={sp.t:.9f}, z={sp.value}")
+
+    print("Witness budgets:")
+    for t, budget in witness[:5]:
+        print(
+            f"  t={t:.3f}, backward={budget.backward_seconds:.6f}s, "
+            f"forward={budget.forward_seconds:.6f}s"
+        )
+
+    # Write 32-bit float mono WAV.
+    import scipy.io.wavfile as _wavfile
+    peak        = float(np.abs(real_np).max()) or 1.0
+    f32         = (real_np / peak).astype(np.float32)
+    sample_rate = int(driver._projector._policy.output_sample_rate)
+    output_path = "output.wav"
+    _wavfile.write(output_path, sample_rate, f32)
+    print(f"Written {output_path}: {len(f32)} samples @ {sample_rate} Hz, 32-bit float mono")
+
+
+if __name__ == "__main__":
+    example_render()

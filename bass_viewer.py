@@ -10220,6 +10220,41 @@ _SGV2_PATH_TYPES = ["Constant Freq", "Exp Decay", "Power Law Decay"]
 _SGV2_MANIFOLDS = ["Pure Sine", "Phase Warped", "Harmonic Measure"]
 _SGV2_DRIFT_TYPES = ["None", "Sinusoidal"]
 
+# ---------------------------------------------------------------------------
+# Sequence / Arpeggio engine options
+# ---------------------------------------------------------------------------
+
+_SEQ_SCALES = [
+    "aeolian", "blues", "chromatic", "dorian", "harmonic_minor",
+    "ionian", "locrian", "lydian", "melodic_minor", "mixolydian",
+    "pentatonic_major", "pentatonic_minor", "phrygian", "whole_tone",
+]
+_SEQ_PATTERN_PRESETS: dict[str, list[int]] = {
+    "up":        [0, 1, 2, 3, 4],
+    "down":      [4, 3, 2, 1, 0],
+    "up-down":   [0, 1, 2, 3, 4, 3, 2, 1],
+    "skip-up":   [0, 2, 4, 6, 8],
+    "skip-down": [8, 6, 4, 2, 0],
+    "pendulum":  [0, 4, 1, 3, 2],
+    "cascade":   [0, 2, 4, 1, 3, 5],
+    "wave":      [0, 1, 3, 5, 7, 6, 4, 2],
+}
+_SEQ_RHYTHM_PRESETS: dict[str, list[float]] = {
+    "even-8":     [0.5],
+    "even-16":    [0.25],
+    "dotted-8":   [0.75, 0.25],
+    "swing":      [0.67, 0.33],
+    "long-short": [0.75, 0.5],
+    "gallop":     [0.25, 0.25, 0.5],
+}
+_SEQ_VELOCITY_PRESETS: dict[str, list[float]] = {
+    "flat":     [1.0],
+    "accent-1": [1.0, 0.7, 0.7, 0.7],
+    "swell":    [0.5, 0.7, 0.9, 1.0, 0.9, 0.7, 0.5, 0.3],
+    "decay":    [1.0, 0.8, 0.6, 0.4],
+    "vary":     [1.0, 0.65, 0.85, 0.55, 0.95],
+}
+
 
 def _generate_wave_cycle(shape: str, phase: np.ndarray,
                          pulse_width: float = 0.5) -> np.ndarray:
@@ -11250,6 +11285,26 @@ class SourcePanel(Panel):
         self._sgv2_witness_expanded: bool = False
         self._sgv2_density_expanded: bool = False
         self._sgv2_proj_expanded: bool = False
+
+        # ---- Sequence / Arpeggio engine state ----
+        self._seq_expanded: bool = False
+        self._seq_scale_idx: int = 11            # pentatonic_minor
+        self._seq_root_hz: float = 110.0
+        self._seq_pattern_preset_idx: int = 2    # up-down
+        self._seq_rhythm_preset_idx: int = 0     # even-8
+        self._seq_velocity_preset_idx: int = 1   # accent-1
+        self._seq_bpm: float = 100.0
+        self._seq_legato: float = 0.85
+        self._seq_octave_span: int = 2
+        self._seq_repeats: int = 2
+        self._seq_partial_count: int = 5
+        self._seq_amp_decay_tau: float = 0.22
+        self._seq_warp_strength: float = 0.18
+        self._seq_carry_phase: bool = True
+        self._seq_harmonic_lock: bool = False
+        self._seq_generating: bool = False
+        self._seq_status: str = ""
+        self._seq_thread: threading.Thread | None = None
 
         # Callbacks
         self.on_set_active: Any = None
@@ -15595,6 +15650,112 @@ class SourcePanel(Panel):
         self._sgv2_thread = threading.Thread(target=_worker, daemon=True)
         self._sgv2_thread.start()
 
+    def _run_sequence_v2(self) -> None:
+        """Render ArpeggioRule sequence via sequence_engine; write WAV to input_dir."""
+        if self._seq_generating:
+            return
+        self._seq_generating = True
+        self._seq_status = "Generating sequence…"
+
+        def _worker() -> None:
+            try:
+                from sequence_engine import (
+                    ArpeggioRule, SequenceRenderer, LatticeBuilder,
+                    TimbrePreset, MODAL_SCALES,
+                )
+                from signal_generator_v2 import (
+                    PhaseWarpedManifold, SmoothSinusoidalDriftModel,
+                )
+                import numpy as _np, wave as _wave
+
+                scale_name = _SEQ_SCALES[self._seq_scale_idx]
+                pat_name   = list(_SEQ_PATTERN_PRESETS.keys())[
+                    self._seq_pattern_preset_idx]
+                rhy_name   = list(_SEQ_RHYTHM_PRESETS.keys())[
+                    self._seq_rhythm_preset_idx]
+                vel_name   = list(_SEQ_VELOCITY_PRESETS.keys())[
+                    self._seq_velocity_preset_idx]
+
+                rule = ArpeggioRule(
+                    root_hz=self._seq_root_hz,
+                    scale=scale_name,
+                    pattern=list(_SEQ_PATTERN_PRESETS[pat_name]),
+                    rhythm_beats=list(_SEQ_RHYTHM_PRESETS[rhy_name]),
+                    bpm=self._seq_bpm,
+                    velocity_curve=list(_SEQ_VELOCITY_PRESETS[vel_name]),
+                    legato_fraction=self._seq_legato,
+                    partial_count=self._seq_partial_count,
+                    octave_span=self._seq_octave_span,
+                    repeats=self._seq_repeats,
+                )
+                schedule = rule.generate()
+
+                preset = TimbrePreset(
+                    waveform_manifold=PhaseWarpedManifold(
+                        harmonic_warp_strength=self._seq_warp_strength),
+                    drift_model=SmoothSinusoidalDriftModel(
+                        base_rate_hz=0.06,
+                        max_offset_hz=0.025,
+                        harmonic_scaling_power=0.5,
+                    ),
+                    amplitude_decay_tau=self._seq_amp_decay_tau,
+                    shape_low=0.1,
+                    shape_high=0.9,
+                    shape_center=2.0,
+                    shape_width=1.5,
+                )
+
+                builder  = LatticeBuilder(timbre=preset)
+                renderer = SequenceRenderer(
+                    builder=builder,
+                    harmonic_lock=self._seq_harmonic_lock,
+                )
+                buffer = renderer.render(schedule, carry_phase=self._seq_carry_phase)
+
+                if not buffer.samples:
+                    self._seq_status = "Error: empty render"
+                    return
+
+                # Evaluate at output sample rate
+                total_s = buffer.samples[-1].t
+                n_samples = max(1, int(round(total_s * self._sgv2_out_sr)))
+                t_out = _np.linspace(0.0, total_s, n_samples, endpoint=False)
+                samples = _np.array(
+                    [buffer.evaluate_linear(float(t)).real for t in t_out],
+                    dtype=_np.float64,
+                )
+
+                # Normalise
+                peak = _np.max(_np.abs(samples))
+                if peak > 0.0:
+                    samples = samples * (0.9 / peak)
+
+                # Build output filename
+                root_note = _freq_to_note_name(self._seq_root_hz)
+                stem = (f"seq_{root_note}_{scale_name}_{pat_name}"
+                        f"_{int(self._seq_bpm)}bpm").replace(" ", "_")
+                out_path = os.path.join(self.input_dir, stem + ".wav")
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+                with _wave.open(out_path, "w") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(self._sgv2_out_sr)
+                    pcm = (samples * 32767.0).clip(-32768, 32767).astype(_np.int16)
+                    wf.writeframes(pcm.tobytes())
+
+                self._seq_status = f"Wrote {os.path.basename(out_path)}"
+                self._refresh_wavs()
+
+            except Exception as exc:
+                import traceback
+                self._seq_status = f"Error: {exc}"
+            finally:
+                self._seq_generating = False
+
+        self._seq_thread = threading.Thread(target=_worker, daemon=True)
+        self._seq_thread.start()
+
     # ---- Main render ------------------------------------------------------
 
     def render(self) -> pygame.Surface | None:
@@ -15806,6 +15967,89 @@ class SourcePanel(Panel):
             y = self._render_dropdown_btn(surf, font, y, w,
                                           "sgv2_channels", "Channels:",
                                           _SIG_CHANNELS, self._sgv2_channels_idx)
+
+            # -- Sequence / Arpeggio (sub-collapsible) --
+            pygame.draw.line(surf, (55, 60, 70),
+                             (self.PAD, y), (w - self.PAD, y))
+            y += 3
+            y = self._render_section_header(
+                surf, font, y, w,
+                "Sequence / Arpeggio", "seq_hdr",
+                self._seq_expanded)
+            if self._seq_expanded:
+                _seq_scale_names = _SEQ_SCALES
+                _seq_pat_names   = list(_SEQ_PATTERN_PRESETS.keys())
+                _seq_rhy_names   = list(_SEQ_RHYTHM_PRESETS.keys())
+                _seq_vel_names   = list(_SEQ_VELOCITY_PRESETS.keys())
+
+                y = self._render_dropdown_btn(
+                    surf, font, y, w, "seq_scale", "Scale:",
+                    _seq_scale_names, self._seq_scale_idx)
+                _nyq_seq = self._sgv2_out_sr / 2.0
+                y = self._render_slider(
+                    surf, font, y, w, "seq_root", "Root:",
+                    self._seq_root_hz, 1.0, _nyq_seq,
+                    _freq_fmt(self._seq_root_hz), note_label=True, log=True)
+                y = self._render_dropdown_btn(
+                    surf, font, y, w, "seq_pattern", "Pattern:",
+                    _seq_pat_names, self._seq_pattern_preset_idx)
+                y = self._render_dropdown_btn(
+                    surf, font, y, w, "seq_rhythm", "Rhythm:",
+                    _seq_rhy_names, self._seq_rhythm_preset_idx)
+                y = self._render_dropdown_btn(
+                    surf, font, y, w, "seq_velocity", "Velocity:",
+                    _seq_vel_names, self._seq_velocity_preset_idx)
+                y = self._render_slider(
+                    surf, font, y, w, "seq_bpm", "BPM:",
+                    self._seq_bpm, 20.0, 300.0, "{:.1f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "seq_legato", "Legato:",
+                    self._seq_legato, 0.05, 1.0, "{:.2f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "seq_octaves", "Octaves:",
+                    float(self._seq_octave_span), 1.0, 5.0, "{:.0f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "seq_repeats", "Repeats:",
+                    float(self._seq_repeats), 1.0, 16.0, "{:.0f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "seq_partials", "Partials:",
+                    float(self._seq_partial_count), 1.0, 16.0, "{:.0f}", log=False)
+                y = self._render_slider(
+                    surf, font, y, w, "seq_amp_tau", "Amp \u03c4:",
+                    self._seq_amp_decay_tau, 0.01, 4.0, "{:.2f}", log=True)
+                y = self._render_slider(
+                    surf, font, y, w, "seq_warp", "Warp:",
+                    self._seq_warp_strength, 0.0, 1.5, "{:.2f}", log=False)
+
+                # Checkboxes: carry phase, harmonic lock
+                cx = self.PAD
+                cx = self._render_checkbox(
+                    surf, font, cx, y, (w - self.PAD) // 2,
+                    "seq_carry_phase", "Carry φ", self._seq_carry_phase)
+                self._render_checkbox(
+                    surf, font, cx, y, w - cx,
+                    "seq_harm_lock", "H-Lock", self._seq_harmonic_lock)
+                y += self.ROW_H + 2
+
+                # Generate Sequence button
+                seq_gen_r = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
+                if self._seq_generating:
+                    pygame.draw.rect(surf, (40, 50, 15), seq_gen_r)
+                    pygame.draw.rect(surf, (160, 200, 40), seq_gen_r, 1)
+                    _sgt = font.render("Generating…", True, (220, 255, 150))
+                else:
+                    pygame.draw.rect(surf, (35, 80, 50), seq_gen_r)
+                    pygame.draw.rect(surf, (70, 150, 100), seq_gen_r, 1)
+                    _sgt = font.render("Generate Sequence", True, (160, 255, 200))
+                surf.blit(_sgt, (seq_gen_r.x + seq_gen_r.w // 2 - _sgt.get_width() // 2, y + 3))
+                self._item_map["seq_gen_btn"] = (seq_gen_r, None)
+                y += self.ROW_H + 2
+
+                if self._seq_status:
+                    _sc = (120, 200, 120) if "Wrote" in self._seq_status else (255, 160, 100)
+                    _st = font.render(self._seq_status[:42], True, _sc)
+                    surf.blit(_st, (self.PAD, y + 2))
+                    y += self.ROW_H
 
             # -- Generate button --
             gen_r = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
@@ -16833,6 +17077,11 @@ class SourcePanel(Panel):
                 if rect.collidepoint(lx, ly):
                     self._sgv2_proj_expanded = not self._sgv2_proj_expanded
                     return True
+            if "seq_hdr" in self._item_map:
+                rect, _ = self._item_map["seq_hdr"]
+                if rect.collidepoint(lx, ly):
+                    self._seq_expanded = not self._seq_expanded
+                    return True
             if "cqt_hdr" in self._item_map:
                 rect, _ = self._item_map["cqt_hdr"]
                 if rect.collidepoint(lx, ly):
@@ -16880,6 +17129,15 @@ class SourcePanel(Panel):
                             setattr(self, attr, not getattr(self, attr))
                         return True
 
+            # Sequence / Arpeggio checkboxes
+            for ck_key, attr in [("seq_carry_phase", "_seq_carry_phase"),
+                                  ("seq_harm_lock",   "_seq_harmonic_lock")]:
+                if ck_key in self._item_map:
+                    rect, _ = self._item_map[ck_key]
+                    if rect.collidepoint(lx, ly):
+                        setattr(self, attr, not getattr(self, attr))
+                        return True
+
             # Band list click
             if self._band_list.handle_click(lx, ly) is not None:
                 return True
@@ -16920,7 +17178,11 @@ class SourcePanel(Panel):
                            "sgv2_oversamp", "sgv2_min_sr", "sgv2_max_sr_m",
                            "sgv2_deriv_w", "sgv2_sup_w",
                            "sgv2_out_sr", "sgv2_half_sup_ms",
-                           "sgv2_duration"]
+                           "sgv2_duration",
+                           # Sequence / Arpeggio sliders
+                           "seq_root", "seq_bpm", "seq_legato",
+                           "seq_octaves", "seq_repeats", "seq_partials",
+                           "seq_amp_tau", "seq_warp"]
             slider_keys += [f"xo_{i}" for i in range(len(self.fb_crossovers))]
             for skey in slider_keys:
                 minus_k = f"{skey}_minus"
@@ -16947,6 +17209,13 @@ class SourcePanel(Panel):
                 rect, _ = self._item_map["sgv2_gen_btn"]
                 if rect.collidepoint(lx, ly) and not self._sgv2_generating:
                     self._run_siggen_v2()
+                    return True
+
+            # Sequence / Arpeggio generate button
+            if "seq_gen_btn" in self._item_map:
+                rect, _ = self._item_map["seq_gen_btn"]
+                if rect.collidepoint(lx, ly) and not self._seq_generating:
+                    self._run_sequence_v2()
                     return True
 
             # Analyze button
@@ -17123,6 +17392,21 @@ class SourcePanel(Panel):
             _ch = ["Mono", "Stereo"]
             if value in _ch:
                 self._sgv2_channels_idx = _ch.index(value)
+        elif key == "seq_scale":
+            if value in _SEQ_SCALES:
+                self._seq_scale_idx = _SEQ_SCALES.index(value)
+        elif key == "seq_pattern":
+            _pats = list(_SEQ_PATTERN_PRESETS.keys())
+            if value in _pats:
+                self._seq_pattern_preset_idx = _pats.index(value)
+        elif key == "seq_rhythm":
+            _rhys = list(_SEQ_RHYTHM_PRESETS.keys())
+            if value in _rhys:
+                self._seq_rhythm_preset_idx = _rhys.index(value)
+        elif key == "seq_velocity":
+            _vels = list(_SEQ_VELOCITY_PRESETS.keys())
+            if value in _vels:
+                self._seq_velocity_preset_idx = _vels.index(value)
 
     def _update_slider(self, key: str, lx: int,
                        rect: pygame.Rect,
@@ -17274,6 +17558,25 @@ class SourcePanel(Panel):
             self._sgv2_proj_half_sup_ms = max(0.01, min(50.0, float(val)))
         elif key == "sgv2_duration":
             self._sgv2_duration = max(0.1, min(600.0, float(val)))
+        # --- Sequence / Arpeggio sliders ---
+        elif key == "seq_root":
+            nyq = self._sgv2_out_sr / 2.0
+            self._seq_root_hz = round(
+                _snap_to_note(max(1.0, min(nyq, val))), 6)
+        elif key == "seq_bpm":
+            self._seq_bpm = max(20.0, min(300.0, float(val)))
+        elif key == "seq_legato":
+            self._seq_legato = max(0.05, min(1.0, float(val)))
+        elif key == "seq_octaves":
+            self._seq_octave_span = max(1, min(5, int(round(val))))
+        elif key == "seq_repeats":
+            self._seq_repeats = max(1, min(16, int(round(val))))
+        elif key == "seq_partials":
+            self._seq_partial_count = max(1, min(16, int(round(val))))
+        elif key == "seq_amp_tau":
+            self._seq_amp_decay_tau = max(0.01, min(4.0, float(val)))
+        elif key == "seq_warp":
+            self._seq_warp_strength = max(0.0, min(1.5, float(val)))
 
     def _nudge_slider(self, key: str, direction: int) -> None:
         """Move a slider by one logical step. direction: +1 or -1."""
@@ -17473,6 +17776,31 @@ class SourcePanel(Panel):
             step = 1.0 if self._sgv2_duration >= 10.0 else 0.5
             self._sgv2_duration = round(
                 max(0.1, min(600.0, self._sgv2_duration + step * direction)), 1)
+        # --- Sequence / Arpeggio nudges ---
+        elif key == "seq_root":
+            midi = 69 + 12 * math.log2(max(self._seq_root_hz, 1.0) / 440.0)
+            midi = round(midi) + direction
+            nyq = self._sgv2_out_sr / 2.0
+            self._seq_root_hz = round(
+                _snap_to_note(max(1.0, min(nyq, _midi_to_freq(midi)))), 6)
+        elif key == "seq_bpm":
+            self._seq_bpm = round(
+                max(20.0, min(300.0, self._seq_bpm + 5.0 * direction)), 1)
+        elif key == "seq_legato":
+            self._seq_legato = round(
+                max(0.05, min(1.0, self._seq_legato + 0.05 * direction)), 2)
+        elif key == "seq_octaves":
+            self._seq_octave_span = max(1, min(5, self._seq_octave_span + direction))
+        elif key == "seq_repeats":
+            self._seq_repeats = max(1, min(16, self._seq_repeats + direction))
+        elif key == "seq_partials":
+            self._seq_partial_count = max(1, min(16, self._seq_partial_count + direction))
+        elif key == "seq_amp_tau":
+            self._seq_amp_decay_tau = round(
+                max(0.01, min(4.0, self._seq_amp_decay_tau * (2.0 ** (direction * 0.5)))), 3)
+        elif key == "seq_warp":
+            self._seq_warp_strength = round(
+                max(0.0, min(1.5, self._seq_warp_strength + 0.05 * direction)), 2)
 
     def _handle_folder_action(self, action: str) -> None:
         idx = self.folder_list.selected_idx

@@ -333,6 +333,40 @@ def _write_png_u16(path: str, img_u16: np.ndarray) -> None:
         f.write(blob)
 
 
+def _write_png_u8(path: str, img_u8: np.ndarray) -> None:
+    """Write a uint8 RGB image to PNG (8-bit per channel)."""
+    arr = np.asarray(img_u8)
+    if arr.dtype != np.uint8:
+        raise ValueError("img_u8 must be uint8")
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError("img_u8 must have shape (H, W, 3)")
+
+    h, w, _ = arr.shape
+    rows = [b"\x00" + arr[y].tobytes() for y in range(h)]
+    idat = zlib.compress(b"".join(rows), level=6)
+
+    def _chunk(tag: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(tag + payload) & 0xFFFFFFFF
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", crc)
+        )
+
+    sig = b"\x89PNG\r\n\x1a\n"
+    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)  # bit_depth=8, color_type=2 (RGB)
+    blob = (
+        sig
+        + _chunk(b"IHDR", ihdr)
+        + _chunk(b"IDAT", idat)
+        + _chunk(b"IEND", b"")
+    )
+
+    with open(path, "wb") as f:
+        f.write(blob)
+
+
 # ---------------------------------------------------------------------------
 # Glyph atlas — tiny texture with all characters needed for axis labels
 # ---------------------------------------------------------------------------
@@ -753,14 +787,150 @@ out vec4 fragColor;
 uniform sampler2D uPass2Tex;           // raw blended RGB from pass 2
 
 uniform int   uHdrNormalizer;          // 0=none 1=clamp 2=reinhard 3=sigmoid 4=linear
-uniform vec2  uHdrInputRange;         // (min, max) auto-detected from data
-uniform vec2  uHdrOutputRange;        // (lo, hi) user-controlled output range
-uniform vec4  uOutGamma;              // display gamma per component
-uniform vec4  uOutScale;              // display scale per component
+uniform vec2  uHdrInputRange;          // (min, max) auto-detected from data
+uniform vec2  uHdrOutputRange;         // (lo, hi) user-controlled output range
+uniform vec4  uOutGamma;               // display gamma per component
+uniform vec4  uOutScale;               // display scale per component
+
+// Post-FX
+uniform int   uFxMode;                 // 0=none … see _FX_PRESETS
+uniform vec2  uTexelSize;              // 1/width, 1/height
+uniform float uFxTime;                 // wall clock seconds (for animation)
+
+// ---- helpers --------------------------------------------------------
+
+float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 sampleNeighbour(vec2 uv, float ox, float oy) {
+    return texture(uPass2Tex, uv + vec2(ox, oy) * uTexelSize).rgb;
+}
+
+// Emboss: treat luma as height, compute Sobel gradient, fake single light
+vec3 fx_emboss(vec3 base, vec2 uv, float bumpScale) {
+    float tl = luma(sampleNeighbour(uv, -1.0,  1.0));
+    float tc = luma(sampleNeighbour(uv,  0.0,  1.0));
+    float tr = luma(sampleNeighbour(uv,  1.0,  1.0));
+    float ml = luma(sampleNeighbour(uv, -1.0,  0.0));
+    float mr = luma(sampleNeighbour(uv,  1.0,  0.0));
+    float bl = luma(sampleNeighbour(uv, -1.0, -1.0));
+    float bc = luma(sampleNeighbour(uv,  0.0, -1.0));
+    float br = luma(sampleNeighbour(uv,  1.0, -1.0));
+
+    float gx = (tr + 2.0*mr + br) - (tl + 2.0*ml + bl);
+    float gy = (tl + 2.0*tc + tr) - (bl + 2.0*bc + br);
+
+    vec3 normal = normalize(vec3(gx * bumpScale, gy * bumpScale, 1.0));
+    vec3 light  = normalize(vec3(0.6, 0.8, 1.0));
+    float diff  = clamp(dot(normal, light), 0.0, 1.0);
+    float amb   = 0.25;
+    return base * (amb + (1.0 - amb) * diff);
+}
+
+// Two-light deep relief
+vec3 fx_deep_relief(vec3 base, vec2 uv) {
+    float tl = luma(sampleNeighbour(uv, -2.0,  2.0));
+    float tr = luma(sampleNeighbour(uv,  2.0,  2.0));
+    float bl = luma(sampleNeighbour(uv, -2.0, -2.0));
+    float br = luma(sampleNeighbour(uv,  2.0, -2.0));
+    float ml = luma(sampleNeighbour(uv, -2.0,  0.0));
+    float mr = luma(sampleNeighbour(uv,  2.0,  0.0));
+    float tc = luma(sampleNeighbour(uv,  0.0,  2.0));
+    float bc = luma(sampleNeighbour(uv,  0.0, -2.0));
+
+    float gx = (tr + 2.0*mr + br) - (tl + 2.0*ml + bl);
+    float gy = (tl + 2.0*tc + tr) - (bl + 2.0*bc + br);
+    vec3 normal = normalize(vec3(gx * 3.0, gy * 3.0, 1.0));
+
+    vec3 l1 = normalize(vec3( 0.7,  0.5, 1.0));
+    vec3 l2 = normalize(vec3(-0.5, -0.8, 0.7));
+    float d1 = clamp(dot(normal, l1), 0.0, 1.0);
+    float d2 = clamp(dot(normal, l2), 0.0, 1.0) * 0.35;
+    float spec = pow(clamp(dot(reflect(-l1, normal), vec3(0,0,1)), 0.0, 1.0), 24.0) * 0.4;
+
+    float lit = 0.15 + 0.75 * d1 + d2 + spec;
+    return clamp(base * lit + vec3(spec), 0.0, 1.0);
+}
+
+// Neon glow: additive bloom from a wide sample ring
+vec3 fx_neon_glow(vec3 base, vec2 uv) {
+    vec3 bloom = vec3(0.0);
+    float w = 0.0;
+    for (int i = -3; i <= 3; i++) {
+        for (int j = -3; j <= 3; j++) {
+            if (i == 0 && j == 0) continue;
+            float d = float(i*i + j*j);
+            float wt = exp(-d * 0.18);
+            bloom += sampleNeighbour(uv, float(i)*1.8, float(j)*1.8) * wt;
+            w += wt;
+        }
+    }
+    bloom /= w;
+    // Retain only the bright part of the bloom
+    bloom = max(bloom - 0.25, 0.0) * 2.2;
+    return clamp(base + bloom, 0.0, 1.0);
+}
+
+// Liquid blob: blur + contrast crush — everything melts into pools
+vec3 fx_liquid_blob(vec3 base, vec2 uv) {
+    // 5x5 Gaussian-ish blur
+    vec3 acc = vec3(0.0);
+    float total = 0.0;
+    for (int i = -2; i <= 2; i++) {
+        for (int j = -2; j <= 2; j++) {
+            float wt = exp(-float(i*i + j*j) * 0.35);
+            acc += sampleNeighbour(uv, float(i)*2.5, float(j)*2.5) * wt;
+            total += wt;
+        }
+    }
+    vec3 blurred = acc / total;
+    // Threshold + stretch — pushes dark→black, bright→saturated
+    vec3 c = (blurred - 0.3) * 2.8;
+    // Saturate: move toward max channel
+    float mx = max(c.r, max(c.g, c.b));
+    float mn = min(c.r, min(c.g, c.b));
+    float sat_boost = (mx - mn) * 0.6;
+    c = c + sat_boost * (c - mx * 0.5);
+    return clamp(c, 0.0, 1.0);
+}
+
+// Posterize: N tonal steps per channel
+vec3 fx_posterize(vec3 c, float steps) {
+    return floor(c * steps + 0.5) / steps;
+}
+
+// Scanlines: dim every Nth row
+vec3 fx_scanlines(vec3 c, vec2 uv, float spacing) {
+    float line = mod(floor(uv.y / uTexelSize.y), spacing);
+    float mask = (line < spacing * 0.55) ? 1.0 : 0.35;
+    return c * mask;
+}
+
+// Chromatic aberration: per-channel UV shift
+vec3 fx_chromatic_ab(vec2 uv) {
+    float s = 2.5;
+    float r = texture(uPass2Tex, uv + vec2( s, 0.0) * uTexelSize).r;
+    float g = texture(uPass2Tex, uv).g;
+    float b = texture(uPass2Tex, uv + vec2(-s, 0.0) * uTexelSize).b;
+    return vec3(r, g, b);
+}
+
+// Heat haze: sinusoidal UV warp animated by uFxTime
+vec3 fx_heat_haze(vec2 uv) {
+    float freq = 22.0;
+    float amp  = 2.2;
+    float speed = 0.6;
+    vec2 warp = vec2(
+        sin(uv.y * freq + uFxTime * speed) * amp,
+        cos(uv.x * freq * 0.7 + uFxTime * speed * 1.3) * amp * 0.5
+    ) * uTexelSize;
+    return texture(uPass2Tex, uv + warp).rgb;
+}
+
+// ---- main -----------------------------------------------------------
 
 void main() {
     vec4 data = texture(uPass2Tex, vUV);
-    vec3 rgb = data.rgb;
+    vec3 rgb   = data.rgb;
     float alpha_val = data.a;
 
     // HDR normalize: map [auto_min, auto_max] → [out_lo, out_hi]
@@ -771,28 +941,41 @@ void main() {
         for (int c = 0; c < 3; c++) {
             float v = (c == 0) ? rgb.r : ((c == 1) ? rgb.g : rgb.b);
             float t = (v - uHdrInputRange.x) / span_in;
-            if (uHdrNormalizer == 1) {       // Clamp
-                t = clamp(t, 0.0, 1.0);
-            } else if (uHdrNormalizer == 2) { // Reinhard
-                t = max(t, 0.0);
-                t = t / (1.0 + t);
-            } else if (uHdrNormalizer == 3) { // Sigmoid
-                t = 1.0 / (1.0 + exp(-6.0 * (t - 0.5)));
-            } else if (uHdrNormalizer == 4) { // Linear Compress
-                t = clamp(t, 0.0, 1.0);
-            }
+            if      (uHdrNormalizer == 1) { t = clamp(t, 0.0, 1.0); }
+            else if (uHdrNormalizer == 2) { t = max(t, 0.0); t = t / (1.0 + t); }
+            else if (uHdrNormalizer == 3) { t = 1.0 / (1.0 + exp(-6.0 * (t - 0.5))); }
+            else if (uHdrNormalizer == 4) { t = clamp(t, 0.0, 1.0); }
             float mapped = uHdrOutputRange.x + t * span_out;
-            if (c == 0) rgb.r = mapped;
+            if      (c == 0) rgb.r = mapped;
             else if (c == 1) rgb.g = mapped;
-            else rgb.b = mapped;
+            else             rgb.b = mapped;
         }
     }
 
-    // Display output gamma/scale — after HDR normalization
+    // Display output gamma/scale
     rgb.r = pow(max(rgb.r, 0.0), uOutGamma.x) * uOutScale.x;
     rgb.g = pow(max(rgb.g, 0.0), uOutGamma.y) * uOutScale.y;
     rgb.b = pow(max(rgb.b, 0.0), uOutGamma.z) * uOutScale.z;
     alpha_val = pow(max(alpha_val, 0.0), uOutGamma.w) * uOutScale.w;
+
+    // ---- Post-FX (applied after gamma/scale, before final clamp) ----
+    if (uFxMode == 1) {
+        rgb = fx_emboss(rgb, vUV, 2.5);
+    } else if (uFxMode == 2) {
+        rgb = fx_deep_relief(rgb, vUV);
+    } else if (uFxMode == 3) {
+        rgb = fx_neon_glow(rgb, vUV);
+    } else if (uFxMode == 4) {
+        rgb = fx_liquid_blob(rgb, vUV);
+    } else if (uFxMode == 5) {
+        rgb = fx_posterize(rgb, 6.0);
+    } else if (uFxMode == 6) {
+        rgb = fx_scanlines(rgb, vUV, 3.0);
+    } else if (uFxMode == 7) {
+        rgb = fx_chromatic_ab(vUV);
+    } else if (uFxMode == 8) {
+        rgb = fx_heat_haze(vUV);
+    }
 
     // THE ONLY CLAMP IN THE ENTIRE PIPELINE
     fragColor = clamp(vec4(rgb, alpha_val), 0.0, 1.0);
@@ -920,8 +1103,44 @@ TARGET_LABELS = ["none", "Ch1", "Ch2", "Ch3", "Ch4", "Alpha"]
 TARGET_VALUES = [-1, 0, 1, 2, 3, 4]
 BLEND_MODES = ["Additive", "Subtractive"]
 
+# Common export dimension presets for the spectral_resize post-processor
+_EXPORT_PRESETS: list[str] = [
+    "native",
+    "1920x1080",
+    "2560x1440",
+    "3840x2160",
+    "7680x4320",
+    "1280x720",
+    "800x600",
+    "4096x2048",
+    "8192x4096",
+]
+
 # HDR normalizer modes for pre-clip post-blend compression
 HDR_NORMALIZERS = ["None", "Clamp", "Reinhard", "Sigmoid", "Linear Compress"]
+
+# Resize / interpolation methods — unified across display and export
+_RESIZE_METHODS: list[str] = [
+    "Spectral",    # semi-NN + exact-area (default).  Display: GL_NEAREST.
+    "Nearest",     # pure nearest neighbor.           Display: GL_NEAREST.
+    "Bilinear",    # cubic / Lanczos smooth.          Display: GL_LINEAR.
+]
+# Corresponding blend_nn fraction for resize_spectral() export.
+#   0 = pure Lanczos/cubic, 1 = pure NN, 0.72 = semi-NN default.
+_RESIZE_METHOD_BLEND_NN: list[float] = [0.72, 1.0, 0.0]
+
+# Post-FX aesthetic shader modes (applied after HDR/gamma, before final clamp)
+_FX_PRESETS: list[str] = [
+    "None",
+    "Emboss",         # luminance-as-height, fake directional light, preserves hue
+    "Deep Relief",    # stronger emboss — bilateral normals + two lights
+    "Neon Glow",      # additive bloom halo around bright regions
+    "Liquid Blob",    # gaussian blur + threshold + chroma stretch — molten look
+    "Posterize",      # quantize to N tonal bands — dramatic banding
+    "Scanlines",      # fine horizontal dimming stripes — CRT / data-tape aesthetic
+    "Chromatic Ab",   # per-channel lateral shift — prismatic fringe
+    "Heat Haze",      # animated sinusoidal UV warp — shimmering distortion
+]
 
 # Default channel hues (evenly spaced on the colour wheel, 0-1 range)
 DEFAULT_CHANNEL_HUES = [0.0, 0.25, 0.5, 0.75]      # red, yellow-green, cyan, violet
@@ -996,6 +1215,8 @@ class GlobalDefaults:
     hdr_output_lo: float = 0.0    # desired output floor
     hdr_output_hi: float = 1.0    # desired output ceiling
     hdr_normalizer: int = 0       # index into HDR_NORMALIZERS
+    fx_mode: int = 0              # index into _FX_PRESETS
+    resize_method: int = 0        # index into _RESIZE_METHODS
 
     def __post_init__(self) -> None:
         if self.channel_hues is None:
@@ -6574,6 +6795,8 @@ class FieldTabPanel(Panel):
         self._dragging: str | None = None
         self._item_map: dict[str, tuple[pygame.Rect, Any]] = {}
         self.on_save_view_png16: Any = None
+        self.on_export_resize: Any = None   # callable(w, h) -> str | None
+        self._export_resize_preset: str = _EXPORT_PRESETS[0]
         self._status_msg: str = ""
 
         # Data-field tree list (top section) — grouped by category
@@ -6757,8 +6980,20 @@ class FieldTabPanel(Panel):
         upper_rows.append(("slider", ("o_gamma", gd.out_gamma, 0.1, 5.0, "{:.2f}")))
         upper_rows.append(("slider", ("o_scale", gd.out_scale, 0.01, 10.0, "{:.2f}")))
         upper_rows.append(("button", ("save_view_png16", "Save View PNG (16-bit)")))
+        upper_rows.append(("label", "\u2500\u2500 Resize Method \u2500\u2500"))
+        upper_rows.append(("dropdown", ("resize_method",
+                                         _RESIZE_METHODS[gd.resize_method], _RESIZE_METHODS)))
+        upper_rows.append(("label", "\u2500\u2500 Export & Resize \u2500\u2500"))
+        upper_rows.append(("dropdown", ("export_size", self._export_resize_preset,
+                                         _EXPORT_PRESETS)))
+        upper_rows.append(("button", ("export_and_resize", "Export + Resize")))
         if self._status_msg:
             upper_rows.append(("label", self._status_msg[:36]))
+
+        # Post-FX aesthetic shader selector
+        upper_rows.append(("label", "\u2500\u2500 Post FX \u2500\u2500"))
+        upper_rows.append(("dropdown", ("post_fx",
+                                         _FX_PRESETS[gd.fx_mode], _FX_PRESETS)))
 
         # Blend mode
         upper_rows.append(("dropdown", ("blend_mode",
@@ -7008,9 +7243,36 @@ class FieldTabPanel(Panel):
                         self._status_msg = "Save handler missing"
                     return True
 
+            if "export_and_resize" in self._item_map:
+                rect, _ = self._item_map["export_and_resize"]
+                if rect.collidepoint(lx, ly):
+                    preset = self._export_resize_preset
+                    if preset == "native":
+                        if self.on_save_view_png16:
+                            try:
+                                out_path = self.on_save_view_png16()
+                                self._status_msg = (f"Saved: {os.path.basename(out_path)}"
+                                                    if out_path else "Save skipped")
+                            except Exception as exc:
+                                self._status_msg = f"Save error: {exc}"
+                        else:
+                            self._status_msg = "Save handler missing"
+                    else:
+                        if self.on_export_resize:
+                            try:
+                                w, h = (int(x) for x in preset.split("x"))
+                                out_path = self.on_export_resize(w, h)
+                                self._status_msg = (f"Resized: {os.path.basename(out_path)}"
+                                                    if out_path else "Resize skipped")
+                            except Exception as exc:
+                                self._status_msg = f"Resize error: {exc}"
+                        else:
+                            self._status_msg = "Resize handler missing"
+                    return True
+
             # Dropdowns
             for key in ("f_target", "f_norm", "g_norm", "blend_mode",
-                        "hdr_norm"):
+                        "hdr_norm", "export_size", "post_fx", "resize_method"):
                 if key in self._item_map:
                     rect, opts = self._item_map[key]
                     if rect.collidepoint(lx, ly):
@@ -7106,6 +7368,12 @@ class FieldTabPanel(Panel):
             self.global_defaults.blend_mode = BLEND_MODES.index(value)
         elif key == "hdr_norm":
             self.global_defaults.hdr_normalizer = HDR_NORMALIZERS.index(value)
+        elif key == "export_size":
+            self._export_resize_preset = value
+        elif key == "post_fx":
+            self.global_defaults.fx_mode = _FX_PRESETS.index(value)
+        elif key == "resize_method":
+            self.global_defaults.resize_method = _RESIZE_METHODS.index(value)
         elif key == "cwt_wavelet":
             cfg.cwt_wavelet = value
         elif key == "dwt_wavelet":
@@ -20660,6 +20928,7 @@ class SpectrogramViewer:
         self.gui = FieldTabPanel(self.field_sources, self.field_configs,
                                  self.global_defaults, side="right")
         self.gui.on_save_view_png16 = self._export_view_png16
+        self.gui.on_export_resize = self._export_view_and_resize
         self.hybrid_panel = HybridViewPanel(self.hybrid_view, side="right")
         self.hybrid_panel._is_active = (
             lambda: self.display_mode == "tf" and self.tf_source == "hybrid")
@@ -23423,11 +23692,17 @@ class SpectrogramViewer:
         """Bind data textures and set pass-1 uniforms (field gather only)."""
         loc = lambda n: glGetUniformLocation(self._program, n)
 
+        # Resolve filter from resize_method: Bilinear uses GL_LINEAR, others NEAREST
+        _rm = getattr(self.global_defaults, 'resize_method', 0)
+        _data_filter = GL_LINEAR if _rm == 2 else GL_NEAREST
+
         for tex_name, unit in self._tex_units.items():
             if tex_name not in tex_ids:
                 continue
             glActiveTexture(GL_TEXTURE0 + unit)
             glBindTexture(GL_TEXTURE_2D, tex_ids[tex_name])
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, _data_filter)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, _data_filter)
             glUniform1i(loc(f"uTex{unit}"), unit)
 
         gd = self.global_defaults
@@ -23554,6 +23829,11 @@ class SpectrogramViewer:
 
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, self._fbo2_tex)
+        # Display filter matches resize_method: Bilinear→LINEAR, others→NEAREST
+        _rm = int(getattr(gd, 'resize_method', 0))
+        _disp_filter = GL_LINEAR if _rm == 2 else GL_NEAREST
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, _disp_filter)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, _disp_filter)
         glUniform1i(p3loc("uPass2Tex"), 0)
 
         glUniform1i(p3loc("uHdrNormalizer"), gd.hdr_normalizer)
@@ -23567,6 +23847,12 @@ class SpectrogramViewer:
                     gd.out_gamma, gd.out_gamma, gd.out_gamma, gd.out_gamma)
         glUniform4f(p3loc("uOutScale"),
                     gd.out_scale, gd.out_scale, gd.out_scale, gd.out_scale)
+
+        # Post-FX uniforms
+        glUniform1i(p3loc("uFxMode"), int(gd.fx_mode))
+        glUniform2f(p3loc("uTexelSize"),
+                    1.0 / max(ww, 1), 1.0 / max(wh, 1))
+        glUniform1f(p3loc("uFxTime"), float(time.monotonic() % 3600.0))
 
         # Draw final quad at the actual viewport position
         glBegin(GL_QUADS)
@@ -23608,10 +23894,116 @@ class SpectrogramViewer:
         g = float(gd.out_gamma)
         s = float(gd.out_scale)
         out = np.power(out, g) * s
-        return np.clip(out, 0.0, 1.0).astype(np.float32)
+        out = np.clip(out, 0.0, 1.0)
+
+        # CPU Post-FX (mirrors GPU _FX_PRESETS modes; runs for export path)
+        fx = int(getattr(gd, 'fx_mode', 0))
+        if fx != 0:
+            from scipy.ndimage import uniform_filter
+            rgb = out[..., :3]
+            luma = (rgb[..., 0] * 0.2126 + rgb[..., 1] * 0.7152 + rgb[..., 2] * 0.0722)
+
+            if fx in (1, 2):          # Emboss / Deep Relief
+                radius = 1 if fx == 1 else 2
+                bump  = 2.5 if fx == 1 else 3.0
+                from scipy.ndimage import sobel
+                gx = sobel(luma, axis=1) * bump
+                gy = sobel(luma, axis=0) * bump
+                mag = np.sqrt(gx**2 + gy**2 + 1.0)
+                nx_ = gx / mag; ny_ = gy / mag; nz_ = 1.0 / mag
+                lx_, ly_, lz_ = 0.6, 0.8, 1.0
+                lm = np.sqrt(lx_**2 + ly_**2 + lz_**2)
+                lx_, ly_, lz_ = lx_/lm, ly_/lm, lz_/lm
+                diff = np.clip(nx_*lx_ + ny_*ly_ + nz_*lz_, 0.0, 1.0)
+                if fx == 2:
+                    # second light from opposite diagonal
+                    lx2, ly2, lz2 = -0.5/np.sqrt(1.14), -0.8/np.sqrt(1.14), 0.7/np.sqrt(1.14)
+                    diff2 = np.clip(nx_*lx2 + ny_*ly2 + nz_*lz2, 0.0, 1.0) * 0.35
+                    diff = 0.15 + 0.75*diff + diff2
+                else:
+                    diff = 0.25 + 0.75*diff
+                out[..., :3] = np.clip(rgb * diff[..., None], 0.0, 1.0)
+
+            elif fx == 3:             # Neon Glow
+                blurred = uniform_filter(rgb, size=(5, 5, 1))
+                bloom = np.clip(blurred - 0.25, 0.0, None) * 2.2
+                out[..., :3] = np.clip(rgb + bloom, 0.0, 1.0)
+
+            elif fx == 4:             # Liquid Blob
+                blurred = uniform_filter(rgb, size=(9, 9, 1))
+                c = (blurred - 0.3) * 2.8
+                mx = np.max(c, axis=-1, keepdims=True)
+                mn = np.min(c, axis=-1, keepdims=True)
+                sat_b = (mx - mn) * 0.6
+                c = c + sat_b * (c - mx * 0.5)
+                out[..., :3] = np.clip(c, 0.0, 1.0)
+
+            elif fx == 5:             # Posterize
+                out[..., :3] = np.floor(rgb * 6.0 + 0.5) / 6.0
+
+            elif fx == 6:             # Scanlines
+                h = out.shape[0]
+                mask = np.ones(h, dtype=np.float32)
+                mask[1::3] = 0.35
+                out[..., :3] = np.clip(rgb * mask[:, None, None], 0.0, 1.0)
+
+            elif fx == 7:             # Chromatic Ab (horizontal shift, CPU approx)
+                shift = 3
+                r_ch = np.roll(rgb[..., 0], shift, axis=1)
+                b_ch = np.roll(rgb[..., 2], -shift, axis=1)
+                out[..., 0] = r_ch
+                out[..., 2] = b_ch
+
+            elif fx == 8:             # Heat Haze — static on export (no time axis)
+                pass                  # leave as-is; animated effect needs GPU
+
+        return out.astype(np.float32)
+
+    def _export_view_and_resize(self, target_w: int, target_h: int) -> str | None:
+        """Export the current view as 8-bit PNG + sidecar, then post-process
+        to *target_w* × *target_h* via spectral_resize.  Returns the path of
+        the resized image (or the raw PNG if resize fails)."""
+        raw_path = self._export_view_png16()
+        if raw_path is None:
+            return None
+        try:
+            import importlib.util as _ilu
+            _sr_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                    "spectral_resize.py")
+            spec = _ilu.spec_from_file_location("spectral_resize", _sr_path)
+            sr = _ilu.module_from_spec(spec)          # type: ignore[arg-type]
+            spec.loader.exec_module(sr)               # type: ignore[union-attr]
+
+            img_u16, _ = sr._read_png_any(raw_path)
+            sidecar_path = os.path.splitext(raw_path)[0] + ".json"
+            sidecar_data = sr._load_sidecar(sidecar_path) if os.path.isfile(sidecar_path) else None
+            freq_axis = sidecar_data.get("freq_axis_hz") if sidecar_data else None
+
+            resized = sr.resize_spectral(
+                img_u16, target_w, target_h,
+                blend_nn=_RESIZE_METHOD_BLEND_NN[
+                    int(getattr(self.global_defaults, 'resize_method', 0))],
+                freq_axis_hz=freq_axis,
+                verbose=True,
+            )
+
+            stem = os.path.splitext(raw_path)[0]
+            out_path = f"{stem}_{target_w}x{target_h}.png"
+            sr._write_png_u8(out_path, resized)
+            print(f"  resized export: {out_path} ({target_w}x{target_h})")
+
+            if sidecar_data is not None:
+                out_sidecar = sr._derive_output_sidecar(
+                    sidecar_data, target_w, target_h, out_path)
+                sr._write_sidecar(os.path.splitext(out_path)[0] + ".json", out_sidecar)
+
+            return out_path
+        except Exception as exc:
+            print(f"Export+resize failed ({exc}); returning raw PNG: {raw_path}")
+            return raw_path
 
     def _export_view_png16(self) -> str | None:
-        """Export current spectral view as 16-bit PNG into input_images."""
+        """Export current spectral view as 16-bit PNG + JSON sidecar into the analysis dir."""
         if self.display_mode == "ts":
             print("Save view PNG: waveform mode is not supported.")
             return None
@@ -23711,9 +24103,13 @@ class SpectrogramViewer:
             arr = np.frombuffer(raw, dtype=np.float32).reshape(out_h, out_w, 4)
             arr = np.ascontiguousarray(arr[::-1, :, :])  # GL origin -> image origin
             arr = self._postprocess_pass2_rgba(arr)
-            rgb16 = np.clip(np.round(arr[:, :, :3] * 65535.0), 0, 65535).astype(np.uint16)
+            rgb8 = np.clip(np.round(arr[:, :, :3] * 255.0), 0, 255).astype(np.uint8)
 
-            out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_images")
+            # Output directory: prefer analysis_dir, fall back to input_images/
+            if self.analysis_dir and os.path.isdir(self.analysis_dir):
+                out_dir = self.analysis_dir
+            else:
+                out_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "input_images")
             os.makedirs(out_dir, exist_ok=True)
             ts = time.strftime("%Y%m%d_%H%M%S")
             base = f"view_texture_{ts}"
@@ -23722,8 +24118,109 @@ class SpectrogramViewer:
             while os.path.exists(out_path):
                 out_path = os.path.join(out_dir, f"{base}_{i:02d}.png")
                 i += 1
-            _write_png_u16(out_path, rgb16)
+            _write_png_u8(out_path, rgb8)
+
+            # ---- JSON sidecar: analytical metadata + pre-encoding axis maps ----
+            view_x0 = float(self.view_x0)
+            view_x1 = float(self.view_x1)
+            view_y0 = float(self.view_y0)
+            view_y1 = float(self.view_y1)
+
+            # Per-row frequency axis (row 0 = top = view_y1, row H-1 = view_y0)
+            freqs_arr = np.asarray(self._freqs, dtype=np.float64)
+            bin_src = np.arange(len(freqs_arr), dtype=np.float64)
+            row_bins = view_y1 - (np.arange(out_h) + 0.5) * (view_y1 - view_y0) / out_h
+            if freqs_arr.size >= 2:
+                freq_axis_hz = np.interp(row_bins, bin_src, freqs_arr).tolist()
+            elif freqs_arr.size == 1:
+                freq_axis_hz = [float(freqs_arr[0])] * out_h
+            else:
+                freq_axis_hz = [0.0] * out_h
+
+            # Per-column time axis (col 0 = left = view_x0)
+            times_arr = np.asarray(self.times, dtype=np.float64)
+            frame_src = np.arange(len(times_arr), dtype=np.float64)
+            col_frames = view_x0 + (np.arange(out_w) + 0.5) * (view_x1 - view_x0) / out_w
+            if times_arr.size >= 2:
+                time_axis_s = np.interp(col_frames, frame_src, times_arr).tolist()
+            elif times_arr.size == 1:
+                time_axis_s = [float(times_arr[0])] * out_w
+            else:
+                time_axis_s = [0.0] * out_w
+
+            # Viewport bounds in Hz and seconds
+            if freqs_arr.size >= 2:
+                vp_freq_lo = float(np.interp(view_y0, bin_src, freqs_arr))
+                vp_freq_hi = float(np.interp(view_y1, bin_src, freqs_arr))
+            else:
+                vp_freq_lo = vp_freq_hi = 0.0
+            if times_arr.size >= 2:
+                vp_t_lo = float(np.interp(view_x0, frame_src, times_arr))
+                vp_t_hi = float(np.interp(view_x1, frame_src, times_arr))
+            else:
+                vp_t_lo = float(self.t_start)
+                vp_t_hi = float(self.t_end)
+
+            # Read analytical metadata from the settings JSON if available —
+            # SpectrogramViewer does not store sample_rate / hop_length as
+            # direct attributes (those live on SourcePanel).
+            _settings_meta: dict = {}
+            if self.analysis_dir:
+                import glob as _glob
+                _scands = sorted(
+                    _glob.glob(os.path.join(self.analysis_dir,
+                                            "analysis_settings*.json")),
+                    key=os.path.getmtime, reverse=True)
+                for _sp in _scands:
+                    try:
+                        with open(_sp, encoding="utf-8") as _sf:
+                            _settings_meta = json.load(_sf)
+                        break
+                    except Exception:
+                        pass
+            _sr_meta  = int(_settings_meta.get("sample_rate",
+                            getattr(self, "sample_rate", 0)))
+            _hop_meta = int(_settings_meta.get("hop_length",
+                            getattr(self, "hop_length", 0)))
+            _bpo_meta = int(_settings_meta.get("bins_per_octave",
+                            getattr(self, "bins_per_octave", 0)))
+            _fmin_meta = float(_settings_meta.get("cqt_fmin",
+                               getattr(self, "cqt_fmin", 0.0)))
+            _fmax_meta = float(_settings_meta.get("cqt_fmax",
+                               getattr(self, "cqt_fmax", 0.0)))
+
+            sidecar = {
+                "schema_version": 1,
+                "timestamp": ts,
+                "image_file": os.path.basename(out_path),
+                "image_shape": [out_h, out_w],
+                "channels": 3,
+                "bit_depth": 8,
+                "encoding": "uint8",
+                "scale_factor": 255,
+                "display_mode": str(self.display_mode),
+                "tf_source": str(self.tf_source),
+                "sample_rate": _sr_meta,
+                "hop_length": _hop_meta,
+                "bins_per_octave": _bpo_meta,
+                "cqt_fmin_hz": _fmin_meta,
+                "cqt_fmax_hz": _fmax_meta,
+                "heterodyne_hz": float(getattr(self, "_heterodyne_hz", 0.0)),
+                "n_bins_total": int(self.n_bins),
+                "n_frames_total": int(self.n_frames),
+                "viewport_frame_range": [view_x0, view_x1],
+                "viewport_bin_range": [view_y0, view_y1],
+                "viewport_time_range_s": [vp_t_lo, vp_t_hi],
+                "viewport_freq_range_hz": [vp_freq_lo, vp_freq_hi],
+                "freq_axis_hz": freq_axis_hz,
+                "time_axis_s": time_axis_s,
+            }
+            sidecar_path = out_path[:-4] + ".json" if out_path.endswith(".png") else out_path + ".json"
+            with open(sidecar_path, "w", encoding="utf-8") as sf:
+                json.dump(sidecar, sf, indent=2)
+
             print(f"Saved 16-bit view texture: {out_path} ({out_w}x{out_h})")
+            print(f"  sidecar: {sidecar_path}")
             return out_path
         finally:
             self._tex_units = old_tex_units

@@ -35,6 +35,7 @@ class PlotSeries:
     data_x: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     data_y: np.ndarray = field(default_factory=lambda: np.empty(0, dtype=np.float32))
     clip_color: tuple[int, int, int] | None = None  # if set, segments outside clip range use this color
+    alpha: int = 255  # 0–255; values < 255 use a per-series alpha-blended surface
 
 
 @dataclass
@@ -274,21 +275,40 @@ class PlotWidget:
                     continue
                 pts = [to_px(float(s.data_x[i]), float(s.data_y[i]))
                        for i in range(len(s.data_x))]
-                if s.line and len(pts) >= 2:
+                # Choose target surface: separate SRCALPHA surface for alpha < 255
+                if s.alpha < 255:
+                    layer = pygame.Surface((w, h), pygame.SRCALPHA)
+                    layer.fill((0, 0, 0, 0))
+                    draw_surf = layer
+                    draw_offset = (-x, -y)
+                else:
+                    draw_surf = surf
+                    draw_offset = (0, 0)
+
+                def _shifted(pts, off):
+                    return [(px + off[0], py + off[1]) for px, py in pts]
+
+                spts = _shifted(pts, draw_offset)
+
+                if s.line and len(spts) >= 2:
                     if s.clip_color is not None:
-                        for j in range(len(pts) - 1):
+                        for j in range(len(spts) - 1):
                             y0_val = float(s.data_y[j])
                             y1_val = float(s.data_y[j + 1])
                             clipped = (y0_val < c_lo or y0_val > c_hi or
                                        y1_val < c_lo or y1_val > c_hi)
                             col = s.clip_color if clipped else s.color
-                            pygame.draw.line(surf, col, pts[j], pts[j + 1], 1)
+                            pygame.draw.line(draw_surf, col, spts[j], spts[j + 1], 1)
                     else:
-                        pygame.draw.lines(surf, s.color, False, pts, 1)
+                        pygame.draw.lines(draw_surf, s.color, False, spts, 1)
                 if s.dots:
-                    for px, py in pts:
-                        pygame.draw.circle(surf, s.color, (px, py),
+                    for px, py in spts:
+                        pygame.draw.circle(draw_surf, s.color, (px, py),
                                            s.dot_radius)
+
+                if s.alpha < 255:
+                    layer.set_alpha(s.alpha)
+                    surf.blit(layer, (x, y))
 
         # --- vertical markers (top labels) ---
         for m in self.markers:

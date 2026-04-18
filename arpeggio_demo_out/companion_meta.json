@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "channels": [
+    "L",
+    "R",
+    "amplitude",
+    "f_inst"
+  ],
+  "dtype": "float32",
+  "byte_stride": 16,
+  "layout": "interleaved",
+  "sample_rate": 192000,
+  "n_samples": 3063361,
+  "viz_rate_hz": 120.0,
+  "viz_step": 1600,
+  "n_viz_samples": 1915,
+  "duration_s": 15.955005208333333,
+  "gl_attribs": {
+    "xy_lissajous": {
+      "index": 0,
+      "size": 2,
+      "type": "GL_FLOAT",
+      "stride": 16,
+      "offset": 0,
+      "note": "L=X R=Y for Lissajous; (L+R)*0.707=X (L-R)*0.707=Y for vectorscope"
+    },
+    "amp_finst": {
+      "index": 1,
+      "size": 2,
+      "type": "GL_FLOAT",
+      "stride": 16,
+      "offset": 8,
+      "note": "[0]=amplitude [1]=f_inst_hz"
+    }
+  },
+  "vectorscope_glsl": "vec2 vs = vec2((L+R)*0.70710678, (L-R)*0.70710678);",
+  "files": {
+    "full_rate": "companion_full.f32",
+    "viz_rate": "companion_viz.f32",
+    "meta": "companion_meta.json"
+  }
+}

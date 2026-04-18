@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from bisect import bisect_left
 from dataclasses import dataclass, field
-from typing import Callable, Iterable, List, Optional, Protocol, Sequence, Tuple
+from typing import Any, Callable, Iterable, List, Optional, Protocol, Sequence, Tuple
 import cmath
 import math
 
@@ -71,6 +71,70 @@ class SupportsComplexEvaluation(Protocol):
 
 
 # ============================================================
+# Parameter self-description
+# ============================================================
+
+@dataclass
+class KnobSpec:
+    """Self-description of one configurable parameter on a pipeline class.
+
+    Pipeline classes advertise their configurable parameters via a ``knobs()``
+    classmethod returning ``List[KnobSpec]``.  UI layers iterate the list to
+    generate controls without any hard-coded knowledge of per-class parameters.
+
+    Attributes
+    ----------
+    name:
+        Python attribute / ``__init__`` parameter name.  Dot-path notation
+        (e.g. ``"adsr.attack"``) traverses nested objects.
+    label:
+        Short human-readable label for the UI.
+    dtype:
+        ``"float"`` | ``"int"`` | ``"bool"`` | ``"choice"`` | ``"knots"``
+    default:
+        Default value for the parameter.
+    low / high:
+        Numeric bounds.
+    step:
+        Discrete increment (0 → UI chooses automatically).
+    unit:
+        Display unit string, e.g. ``"Hz"``, ``"s"``.
+    choices:
+        Ordered option strings for ``dtype="choice"`` knobs.
+    is_log:
+        Slider operates on a logarithmic scale when ``True``.
+    group:
+        Section label; a new section header is rendered whenever this
+        field differs from the previous knob's group.
+    fmt:
+        Python ``format()`` spec used to render the numeric value.
+    source_class:
+        Name of the pipeline class this attribute maps to (informational).
+    rebuild_layout:
+        When ``True`` the UI should rebuild its full control layout after
+        this knob changes (e.g. switching envelope type).
+    visible_when:
+        ``(attr_path, expected_value_str)`` — knob is hidden unless
+        ``str(get_nested_attr(obj, attr_path)) == expected_value_str``.
+    """
+    name:           str
+    label:          str
+    dtype:          str                      = "float"
+    default:        Any                      = None
+    low:            float                    = 0.0
+    high:           float                    = 1.0
+    step:           float                    = 0.0
+    unit:           str                      = ""
+    choices:        List[str]                = field(default_factory=list)
+    is_log:         bool                     = False
+    group:          str                      = ""
+    fmt:            str                      = ".3g"
+    source_class:   str                      = ""
+    rebuild_layout: bool                     = False
+    visible_when:   Optional[Tuple[str, str]] = None
+
+
+# ============================================================
 # Core support dataclasses
 # ============================================================
 
@@ -92,6 +156,16 @@ class WitnessThresholds:
     support_search_step_seconds: float = 1e-3
     integration_steps_per_check: int = 64
 
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("backward_phase_radians",     "Backward phase",  "float", PI2, 0.1,  PI2 * 4, 0, "rad", [], False, "Witness", ".3f"),
+            KnobSpec("forward_phase_radians",       "Forward phase",   "float", PI2, 0.1,  PI2 * 4, 0, "rad", [], False, "Witness", ".3f"),
+            KnobSpec("max_support_seconds",         "Max support",     "float", 10.0, 0.01, 30.0,  0, "s",   [], True,  "Witness", ".3f"),
+            KnobSpec("support_search_step_seconds", "Search step",     "float", 1e-3, 1e-5, 0.1,   0, "s",   [], True,  "Witness", ".5f"),
+            KnobSpec("integration_steps_per_check", "Integ. steps",    "int",   64,   4,    512,   4, "",    [], False, "Witness", ".0f"),
+        ]
+
 
 @dataclass(frozen=True)
 class DensityPolicy:
@@ -112,6 +186,16 @@ class DensityPolicy:
     def max_dt(self) -> float:
         return 1.0 / self.min_sample_rate
 
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("oversampling_factor", "Oversample",    "float", 16.0,    2.0,     64.0,      0, "\u00d7",  [], True,  "Density", ".1f"),
+            KnobSpec("min_sample_rate",     "Min SR",        "float", 48000.0, 8000.0,  192000.0,  0, "Hz",  [], True,  "Density", ".0f"),
+            KnobSpec("max_sample_rate",     "Max SR",        "float", 1e7,     96000.0, 4e6,       0, "Hz",  [], True,  "Density", ".0f"),
+            KnobSpec("derivative_weight",   "Deriv. weight", "float", 0.5,     0.0,     2.0,       0, "",    [], False, "Density", ".3f"),
+            KnobSpec("support_weight",      "Support wt.",   "float", 1.0,     0.0,     4.0,       0, "",    [], False, "Density", ".3f"),
+        ]
+
 
 @dataclass(frozen=True)
 class ProjectionPolicy:
@@ -121,6 +205,14 @@ class ProjectionPolicy:
     output_sample_rate: float = 48000.0
     projection_half_support_seconds: float = 0.002
     projection_kernel_steps: int = 256
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("output_sample_rate",              "Output SR",     "float", 48000.0, 8000.0, 192000.0, 0, "Hz", [], True,  "Projection", ".0f"),
+            KnobSpec("projection_half_support_seconds", "Half support",  "float", 0.002,   5e-5,   0.05,     0, "s",  [], True,  "Projection", ".5f"),
+            KnobSpec("projection_kernel_steps",         "Kernel steps",  "int",   256,     8,      2048,     8, "",   [], False, "Projection", ".0f"),
+        ]
 
 
 @dataclass(frozen=True)
@@ -234,6 +326,10 @@ class PureSineManifold(WaveformManifold):
     def evaluate(self, phase: float, shape_state: float = 0.0) -> complex:
         return safe_expj(phase)
 
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return []
+
 
 class PhaseWarpedManifold(WaveformManifold):
     """
@@ -252,6 +348,12 @@ class PhaseWarpedManifold(WaveformManifold):
             + 0.5 * warp * math.sin(2.0 * phase)
         )
         return safe_expj(warped_phase)
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("harmonic_warp_strength", "Warp strength", "float", 0.25, 0.0, 2.0, 0, "", [], False, "Manifold", ".3f"),
+        ]
 
 
 class HarmonicMeasureManifold(WaveformManifold):
@@ -280,6 +382,12 @@ class HarmonicMeasureManifold(WaveformManifold):
         if norm == 0.0:
             return 0j
         return acc / norm
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("max_harmonics", "Max harmonics", "int", 8, 1, 32, 1, "", [], False, "Manifold", ".0f"),
+        ]
 
 
 # ============================================================
@@ -334,6 +442,14 @@ class ExponentialDecayPhasePath(PhasePath):
     def phase(self, t: float) -> float:
         return self._phase0 + PI2 * self._f0 * self._tau * (1.0 - math.exp(-t / self._tau))
 
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("initial_frequency_hz", "f\u2080",    "float", 440.0, 1.0,  20000.0, 0, "Hz",  [], True,  "Exp Decay Path", ".2f"),
+            KnobSpec("tau_seconds",          "\u03c4",      "float", 0.5,  0.01, 10.0,    0, "s",   [], True,  "Exp Decay Path", ".3f"),
+            KnobSpec("phase0",               "Phase\u2080", "float", 0.0, -PI2,  PI2,     0, "rad", [], False, "Exp Decay Path", ".3f"),
+        ]
+
 
 class PowerLawDecayPhasePath(PhasePath):
     """
@@ -387,6 +503,15 @@ class PowerLawDecayPhasePath(PhasePath):
 
         return self._phase0 + PI2 * f0 * integral
 
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("initial_frequency_hz", "f\u2080",    "float", 440.0, 1.0,  20000.0, 0, "Hz",  [], True,  "Power Decay Path", ".2f"),
+            KnobSpec("tau_seconds",          "\u03c4",      "float", 0.5,  0.01, 10.0,    0, "s",   [], True,  "Power Decay Path", ".3f"),
+            KnobSpec("power",                "Power",  "float", 1.0,  0.1,  8.0,     0, "",    [], False, "Power Decay Path", ".2f"),
+            KnobSpec("phase0",               "Phase\u2080", "float", 0.0, -PI2,  PI2,     0, "rad", [], False, "Power Decay Path", ".3f"),
+        ]
+
 
 class ConstantPhasePath(PhasePath):
     """
@@ -413,6 +538,63 @@ class ConstantPhasePath(PhasePath):
 
     def accumulated_phase(self, t0: float, t1: float, steps: int = 32) -> float:
         return PI2 * self._f0 * (t1 - t0)
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("frequency_hz", "Frequency", "float", 440.0, 1.0, 20000.0, 0, "Hz",  [], True,  "Phase Path", ".2f"),
+            KnobSpec("phase0",       "Phase\u2080",    "float", 0.0, -PI2, PI2,     0, "rad", [], False, "Phase Path", ".3f"),
+        ]
+
+
+class LinearChirpPhasePath(PhasePath):
+    """
+    Linear-chirp path: f(t) = f_start + chirp_rate * (t - t_start)
+
+    Exact closed-form phase and chirp rate — no numerical integration needed.
+    This is the canonical PhasePath for a ChirpSegment from tf_ray_engine:
+      phase(t) = phase_at_start + 2π * (f_start*(t-t_start) + chirp_rate/2*(t-t_start)²)
+
+    chirp_rate_hz_per_s is the real-time df/dt (can be negative for descending chirps).
+    t_start anchors the phase zero — typically the segment's t_start in real time.
+    """
+
+    def __init__(
+        self,
+        f_start:             float,
+        chirp_rate_hz_per_s: float,
+        phase_at_start:      float = 0.0,
+        t_start:             float = 0.0,
+    ) -> None:
+        if f_start < 0.0:
+            raise ValueError("f_start must be >= 0")
+        self._f0   = float(f_start)
+        self._cr   = float(chirp_rate_hz_per_s)
+        self._phi0 = float(phase_at_start)
+        self._t0   = float(t_start)
+
+    def frequency_hz(self, t: float) -> float:
+        return self._f0 + self._cr * (t - self._t0)
+
+    def chirp_rate_hz_per_s(self, t: float) -> float:   # type: ignore[override]
+        return self._cr
+
+    def phase(self, t: float) -> float:
+        dt = t - self._t0
+        return self._phi0 + PI2 * (self._f0 * dt + 0.5 * self._cr * dt * dt)
+
+    def accumulated_phase(self, t0: float, t1: float, steps: int = 32) -> float:
+        # Exact closed form — steps parameter is intentionally ignored
+        return self.phase(t1) - self.phase(t0)
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("f_start",             "f start",    "float", 440.0,  1.0,     20000.0, 0, "Hz",   [], True,  "Chirp Path", ".2f"),
+            KnobSpec("chirp_rate_hz_per_s", "Chirp rate", "float", 0.0,   -5000.0,  5000.0,  0, "Hz/s", [], False, "Chirp Path", ".1f"),
+            KnobSpec("phase_at_start",      "Phase\u2080",     "float", 0.0,   -PI2,     PI2,     0, "rad",  [], False, "Chirp Path", ".3f"),
+            KnobSpec("t_start",             "t start",    "float", 0.0,    0.0,     10.0,    0, "s",    [], False, "Chirp Path", ".3f"),
+        ]
 
 
 # ============================================================
@@ -464,6 +646,10 @@ class NullDriftModel(DriftModel):
     def chirp_rate_hz_per_s(self, t: float, harmonic_index: int) -> float:
         return 0.0
 
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return []
+
 
 class SmoothSinusoidalDriftModel(DriftModel):
     """
@@ -502,6 +688,14 @@ class SmoothSinusoidalDriftModel(DriftModel):
         return self._max_offset_hz * scale * PI2 * self._base_rate_hz * math.cos(
             PI2 * self._base_rate_hz * t
         )
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("base_rate_hz",           "Rate",          "float", 0.1, 0.0,  20.0,  0, "Hz", [], True,  "Drift", ".3f"),
+            KnobSpec("max_offset_hz",          "Max offset",    "float", 0.5, 0.0,  500.0, 0, "Hz", [], True,  "Drift", ".2f"),
+            KnobSpec("harmonic_scaling_power", "Harm. scale",   "float", 1.0, 0.0,  4.0,   0, "",   [], False, "Drift", ".2f"),
+        ]
 
 
 # ============================================================
@@ -547,6 +741,410 @@ class SigmoidField(TimeField):
     def value(self, t: float) -> float:
         u = 1.0 / (1.0 + math.exp(-(t - self._center) / self._width))
         return self._low + (self._high - self._low) * u
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("low",    "Low",    "float", 0.0, 0.0, 1.0,  0, "",  [], False, "Sigmoid", ".3f"),
+            KnobSpec("high",   "High",   "float", 1.0, 0.0, 1.0,  0, "",  [], False, "Sigmoid", ".3f"),
+            KnobSpec("center", "Center", "float", 0.5, 0.0, 10.0, 0, "s", [], False, "Sigmoid", ".3f"),
+            KnobSpec("width",  "Width",  "float", 0.1, 1e-4, 1.0, 0, "s", [], True,  "Sigmoid", ".4f"),
+        ]
+
+
+class LinearRampField(TimeField):
+    """
+    Linearly interpolates from *start_value* to *end_value* over [t0, t1].
+    Clamps to the endpoint values outside that range.
+    """
+
+    def __init__(
+        self,
+        start_value: float,
+        end_value:   float,
+        t0:          float = 0.0,
+        t1:          float = 1.0,
+    ) -> None:
+        if t1 <= t0:
+            raise ValueError("LinearRampField requires t1 > t0")
+        self._v0 = float(start_value)
+        self._v1 = float(end_value)
+        self._t0 = float(t0)
+        self._t1 = float(t1)
+
+    def value(self, t: float) -> float:
+        if t <= self._t0:
+            return self._v0
+        if t >= self._t1:
+            return self._v1
+        alpha = (t - self._t0) / (self._t1 - self._t0)
+        return self._v0 + alpha * (self._v1 - self._v0)
+
+
+class PiecewiseLinearField(TimeField):
+    """
+    Arbitrary piecewise-linear envelope defined by a list of (time, value) knots.
+
+    Knots must be in strictly increasing time order.
+    Extrapolates flat (holds the first/last value) outside the knot range.
+
+    Example — a simple trapezoid::
+
+        PiecewiseLinearField([(0.0, 0.0), (0.02, 1.0), (0.8, 1.0), (1.0, 0.0)])
+    """
+
+    def __init__(self, knots: List[Tuple[float, float]]) -> None:
+        if len(knots) < 2:
+            raise ValueError("PiecewiseLinearField needs at least 2 knots")
+        ts = [k[0] for k in knots]
+        for i in range(1, len(ts)):
+            if ts[i] <= ts[i - 1]:
+                raise ValueError("PiecewiseLinearField knot times must be strictly increasing")
+        self._knots: List[Tuple[float, float]] = list(knots)
+
+    def value(self, t: float) -> float:
+        if t <= self._knots[0][0]:
+            return self._knots[0][1]
+        if t >= self._knots[-1][0]:
+            return self._knots[-1][1]
+        # binary search for bracketing pair
+        lo, hi = 0, len(self._knots) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if self._knots[mid][0] <= t:
+                lo = mid
+            else:
+                hi = mid
+        t0, v0 = self._knots[lo]
+        t1, v1 = self._knots[hi]
+        alpha = (t - t0) / (t1 - t0)
+        return v0 + alpha * (v1 - v0)
+
+
+class PiecewiseSplineField(TimeField):
+    """
+    Smooth cubic spline envelope through a list of (time, value) knots.
+
+    Uses a natural cubic spline (second derivative = 0 at both endpoints).
+    The curve passes exactly through every knot.  Unlike piecewise-linear,
+    it may overshoot between knots — useful for smooth, flowing shapes.
+
+    Extrapolates flat (holds the first/last value) outside the knot range.
+
+    Requires at least 3 knots (2 knots fall back to linear).
+
+    Example — smooth bell::
+
+        PiecewiseSplineField([(0.0, 0.0), (0.1, 0.8), (0.5, 1.0), (0.9, 0.8), (1.0, 0.0)])
+    """
+
+    def __init__(self, knots: List[Tuple[float, float]]) -> None:
+        if len(knots) < 2:
+            raise ValueError("PiecewiseSplineField needs at least 2 knots")
+        ts = [k[0] for k in knots]
+        for i in range(1, len(ts)):
+            if ts[i] <= ts[i - 1]:
+                raise ValueError("PiecewiseSplineField knot times must be strictly increasing")
+        self._t0 = ts[0]
+        self._t1 = ts[-1]
+        self._v0 = knots[0][1]
+        self._v1 = knots[-1][1]
+        from scipy.interpolate import CubicSpline
+        import numpy as np
+        self._spline = CubicSpline(
+            np.array(ts, dtype=float),
+            np.array([k[1] for k in knots], dtype=float),
+            bc_type="natural",
+        )
+
+    def value(self, t: float) -> float:
+        if t <= self._t0:
+            return self._v0
+        if t >= self._t1:
+            return self._v1
+        return float(self._spline(t))
+
+
+class PiecewiseMonotoneField(TimeField):
+    """
+    Smooth monotone-cubic (PCHIP) envelope through a list of (time, value) knots.
+
+    PCHIP (Piecewise Cubic Hermite Interpolating Polynomial) passes exactly
+    through every knot and is *guaranteed not to overshoot* between them — the
+    value stays within the range of neighbouring knots.  This makes it the
+    preferred choice for amplitude envelopes where a natural cubic spline would
+    ring or dip below zero.
+
+    Extrapolates flat (holds the first/last value) outside the knot range.
+
+    Example — smooth ADSR-like curve::
+
+        PiecewiseMonotoneField([(0.0, 0.0), (0.01, 1.0), (0.1, 0.7), (0.8, 0.7), (1.0, 0.0)])
+    """
+
+    def __init__(self, knots: List[Tuple[float, float]]) -> None:
+        if len(knots) < 2:
+            raise ValueError("PiecewiseMonotoneField needs at least 2 knots")
+        ts = [k[0] for k in knots]
+        for i in range(1, len(ts)):
+            if ts[i] <= ts[i - 1]:
+                raise ValueError("PiecewiseMonotoneField knot times must be strictly increasing")
+        self._t0 = ts[0]
+        self._t1 = ts[-1]
+        self._v0 = knots[0][1]
+        self._v1 = knots[-1][1]
+        from scipy.interpolate import PchipInterpolator
+        import numpy as np
+        self._spline = PchipInterpolator(
+            np.array(ts, dtype=float),
+            np.array([k[1] for k in knots], dtype=float),
+        )
+
+    def value(self, t: float) -> float:
+        if t <= self._t0:
+            return self._v0
+        if t >= self._t1:
+            return self._v1
+        return float(self._spline(t))
+
+
+class ADSREnvelope(TimeField):
+    """
+    Classic 4-stage amplitude envelope (Attack → Decay → Sustain → Release).
+
+    All time parameters are seconds measured from t=0 (local note on).
+
+    Stage boundaries
+    ────────────────
+    [0,               attack_time)             — ramp  0 → peak_level
+    [attack_time,     attack_time+decay_time)  — ramp  peak_level → sustain_level
+    [attack+decay,    release_start)           — hold  sustain_level
+    [release_start,   release_start+release)   — ramp  sustain_level → 0
+    [release_start+release, …)                 — 0
+
+    *release_start* defaults to ``note_duration - release_time`` so the tail
+    ends exactly at the note boundary.  Pass ``note_duration=None`` (default)
+    to omit the release stage entirely (sustain holds forever).
+
+    If the note is shorter than attack+decay, those two stages are
+    time-compressed proportionally so they still fit within the available
+    pre-release window.
+    """
+
+    def __init__(
+        self,
+        attack_time:   float = 0.005,
+        decay_time:    float = 0.04,
+        sustain_level: float = 0.75,
+        release_time:  float = 0.08,
+        peak_level:    float = 1.0,
+        note_duration: Optional[float] = None,
+    ) -> None:
+        if attack_time < 0.0:
+            raise ValueError("attack_time must be >= 0")
+        if decay_time < 0.0:
+            raise ValueError("decay_time must be >= 0")
+        if release_time < 0.0:
+            raise ValueError("release_time must be >= 0")
+        if not (0.0 <= sustain_level <= 1.0):
+            raise ValueError("sustain_level must be in [0, 1]")
+        if peak_level < 0.0:
+            raise ValueError("peak_level must be >= 0")
+
+        self._pk = float(peak_level)
+        self._s  = float(sustain_level)
+        self._r  = float(release_time)
+
+        # Compute the window available for A+D before the release ramp starts.
+        if note_duration is not None:
+            avail_ad = max(0.0, float(note_duration) - float(release_time))
+            self._rel_start: Optional[float] = float(note_duration) - float(release_time)
+        else:
+            avail_ad = None
+            self._rel_start = None
+
+        # Compress A+D proportionally if they would exceed available time.
+        raw_ad = float(attack_time) + float(decay_time)
+        if avail_ad is not None and raw_ad > avail_ad and raw_ad > 0.0:
+            scale = avail_ad / raw_ad
+            self._a = float(attack_time) * scale
+            self._d = float(decay_time) * scale
+        else:
+            self._a = float(attack_time)
+            self._d = float(decay_time)
+
+    def value(self, t: float) -> float:
+        if t < 0.0:
+            return 0.0
+
+        # --- Attack ---
+        if t < self._a:
+            return self._pk * (t / self._a) if self._a > 0.0 else self._pk
+
+        # --- Decay ---
+        t_post_a = t - self._a
+        if t_post_a < self._d:
+            frac = t_post_a / self._d if self._d > 0.0 else 1.0
+            return self._pk + (self._s - self._pk) * frac
+
+        # --- Sustain / Release ---
+        if self._rel_start is None or t < self._rel_start:
+            return self._s
+
+        # --- Release ---
+        t_rel = t - self._rel_start
+        if self._r <= 0.0 or t_rel >= self._r:
+            return 0.0
+        return self._s * (1.0 - t_rel / self._r)
+
+    @classmethod
+    def knobs(cls) -> List[KnobSpec]:
+        return [
+            KnobSpec("attack_time",   "Attack",  "float", 0.005, 0.001, 2.0, 0, "s", [], True,  "ADSR", ".4f"),
+            KnobSpec("decay_time",    "Decay",   "float", 0.04,  0.001, 2.0, 0, "s", [], True,  "ADSR", ".4f"),
+            KnobSpec("sustain_level", "Sustain", "float", 0.75,  0.0,   1.0, 0, "",  [], False, "ADSR", ".3f"),
+            KnobSpec("release_time",  "Release", "float", 0.08,  0.001, 4.0, 0, "s", [], True,  "ADSR", ".4f"),
+            KnobSpec("peak_level",    "Peak",    "float", 1.0,   0.0,   2.0, 0, "",  [], False, "ADSR", ".3f"),
+        ]
+
+
+# ============================================================
+# Complex-domain envelopes
+# ============================================================
+
+class ComplexEnvelope(ABC):
+    """
+    Post-lattice complex-domain shaping hook.
+
+    Applied to the fully-summed instantaneous analytic value z(t) *before*
+    the sample enters ``AdaptiveSampleBuffer``.  This is the earliest possible
+    place to reshape energy after the harmonic voices have been combined.
+
+    The analytic nature of z is preserved by any linear complex operation,
+    which includes all three concrete forms below.
+
+    Three canonical forms
+    ─────────────────────
+    AmplitudeEnvelopeShaper   z → E(t) · z            (E ∈ ℝ⁺, |z| scaled, arg unchanged)
+    PhaseRotationEnvelope     z → z · e^{jΘ(t)}       (|z| unchanged, arg rotated)
+    ComplexGainEnvelope       z → z · M(t) · e^{jΘ(t)} (both simultaneously)
+
+    Any ``TimeField`` (including ``ADSREnvelope``) can be wrapped in
+    ``AmplitudeEnvelopeShaper`` to become a ``ComplexEnvelope``.
+
+    Use ``EnvelopeChain`` to compose multiple stages in sequence.
+    """
+
+    @abstractmethod
+    def evaluate(self, t: float, z: complex) -> complex:
+        raise NotImplementedError
+
+
+class AmplitudeEnvelopeShaper(ComplexEnvelope):
+    """
+    Real-valued amplitude shaping in the analytic complex domain.
+
+    Multiplies z by a real scalar E(t):
+
+        z  →  E(t) · z
+
+    The phase/frequency structure is untouched — only the instantaneous energy
+    envelope changes.  z remains analytic.
+
+    Any ``TimeField`` works as the amplitude field, including ``ADSREnvelope``,
+    ``ExponentialEnvelope``, ``PiecewiseLinearField``, etc.
+    """
+
+    def __init__(self, amplitude_field: TimeField) -> None:
+        self._field = amplitude_field
+
+    def evaluate(self, t: float, z: complex) -> complex:
+        return self._field.value(t) * z
+
+
+class PhaseRotationEnvelope(ComplexEnvelope):
+    """
+    Time-varying phase rotation without amplitude change.
+
+    Multiplies z by the unit phasor e^{jΘ(t)}:
+
+        z  →  z · e^{jΘ(t)}
+
+    |z| is preserved exactly; arg(z) gains a time-varying offset Θ(t).
+
+    The instantaneous frequency of the resulting signal becomes
+    f_orig(t) + dΘ/dt / 2π, so this is analytic-domain FM.
+
+    Typical uses
+    ────────────
+    Vibrato   — ``SmoothSinusoidalDriftModel`` already handles this per-voice;
+                use this envelope for a post-summing global FM layer.
+    Portamento — ``LinearRampField(start_phase, end_phase)`` shifts the whole
+                signal's frequency axis smoothly over a note transition.
+    Phase seed — ``ConstantField(offset)`` injects a fixed global phase offset
+                without touching amplitude.
+    """
+
+    def __init__(self, angle_field: TimeField) -> None:
+        self._angle_field = angle_field
+
+    def evaluate(self, t: float, z: complex) -> complex:
+        return z * cmath.rect(1.0, self._angle_field.value(t))
+
+
+class ComplexGainEnvelope(ComplexEnvelope):
+    """
+    Full complex multiplication: simultaneously shape amplitude AND rotate phase.
+
+    The gain function is G(t) = M(t) · e^{jΘ(t)}, applied as:
+
+        z  →  z · G(t)
+
+    M(t) = magnitude modulation (any TimeField, e.g. ``ADSREnvelope``).
+    Θ(t) = phase modulation in radians (any TimeField; defaults to zero).
+
+    Special cases
+    ─────────────
+    Θ = 0    →  same as AmplitudeEnvelopeShaper(magnitude_field)
+    M = 1    →  same as PhaseRotationEnvelope(phase_field)
+    M = ADSR, Θ = sinusoidal → amplitude-shaped vibrato that deepens with loudness
+    """
+
+    def __init__(
+        self,
+        magnitude_field: TimeField,
+        phase_field:     Optional[TimeField] = None,
+    ) -> None:
+        self._mag   = magnitude_field
+        self._phase = phase_field if phase_field is not None else ConstantField(0.0)
+
+    def evaluate(self, t: float, z: complex) -> complex:
+        return z * cmath.rect(self._mag.value(t), self._phase.value(t))
+
+
+class EnvelopeChain(ComplexEnvelope):
+    """
+    Apply a sequence of ``ComplexEnvelope`` instances in order.
+
+    The output of each stage feeds the next:
+
+        z  →  E₁(z)  →  E₂(z)  →  …  →  Eₙ(z)
+
+    Example — ADSR amplitude with sinusoidal vibrato on top::
+
+        EnvelopeChain(
+            AmplitudeEnvelopeShaper(ADSREnvelope(attack_time=0.01, ...)),
+            PhaseRotationEnvelope(SmoothSinusoidalDriftModel(...)),
+        )
+    """
+
+    def __init__(self, *envelopes: ComplexEnvelope) -> None:
+        self._chain = list(envelopes)
+
+    def evaluate(self, t: float, z: complex) -> complex:
+        for env in self._chain:
+            z = env.evaluate(t, z)
+        return z
 
 
 # ============================================================
@@ -985,6 +1583,14 @@ class AdaptiveEmitter:
     through the filter instead of the raw lattice sum.  This allows analytic
     admissibility filtering (gain taper + warp cap) to act in the one-sided
     complex domain before any real projection occurs.
+
+    If a ``ComplexEnvelope`` is supplied via *complex_envelope*, it is applied
+    as the final stage after the lattice sum (and after any pre-projection
+    filter): each fully-formed complex sample z is passed through
+    ``envelope.evaluate(t, z)`` before being stored.  This is the earliest
+    possible place to reshape energy in the analytic domain — all waveform
+    geometry is already in z, and the envelope acts as a complex scalar
+    multiplier on that geometry.
     """
 
     def __init__(
@@ -993,17 +1599,23 @@ class AdaptiveEmitter:
         density_planner: DensityPlanner,
         witness_planner: WitnessPlanner,
         pre_projection_filter: Optional[ComplexPreProjectionFilter] = None,
+        complex_envelope: Optional["ComplexEnvelope"] = None,
     ) -> None:
         self._lattice = lattice
         self._density_planner = density_planner
         self._witness_planner = witness_planner
         self._filter = pre_projection_filter
+        self._envelope = complex_envelope
 
     def _sample_lattice(self, t: float) -> complex:
-        """Evaluate lattice at *t*, applying the pre-projection filter if set."""
+        """Evaluate lattice at *t*, applying filter then envelope if set."""
         if self._filter is not None:
-            return self._filter.evaluate_lattice_filtered(self._lattice, t)
-        return self._lattice.evaluate_complex(t)
+            z = self._filter.evaluate_lattice_filtered(self._lattice, t)
+        else:
+            z = self._lattice.evaluate_complex(t)
+        if self._envelope is not None:
+            z = self._envelope.evaluate(t, z)
+        return z
 
     def emit(self, emission_range: EmissionRange) -> AdaptiveSampleBuffer:
         emission_range.validate()
@@ -1339,6 +1951,116 @@ class AdaptiveProjector:
         """
         return self.project_complex_torch(buffer, start_time, end_time, device=device).real
 
+    # ------------------------------------------------------------------
+    # Quadrature (stereo) projections — no phase folding
+    # ------------------------------------------------------------------
+
+    def project_quadrature(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+    ) -> Tuple[List[float], List[float]]:
+        """Project to stereo quadrature pair (L, R) = (cos, sin) components.
+
+        Unlike project_real, this preserves the full phase geometry: each
+        distinct phase state maps to a unique (L, R) point in the plane.
+        No folding, no projection-induced interference.
+
+        Returns ``(L, R)`` where each is a list of float.
+        """
+        z_list = self.project_complex(buffer, start_time, end_time)
+        return [z.real for z in z_list], [z.imag for z in z_list]
+
+    def project_quadrature_numpy(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+    ):
+        """Numpy-vectorised quadrature projection.
+
+        Returns ``(L, R)`` as a pair of ``numpy.ndarray`` of ``float64``,
+        preserving the native dtype of the complex projection.
+        """
+        z = self.project_complex_numpy(buffer, start_time, end_time)
+        return z.real.copy(), z.imag.copy()
+
+    def project_quadrature_torch(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+        device: str = 'cpu',
+    ):
+        """Fully-vectorised torch quadrature projection.
+
+        Returns ``(L, R)`` as a pair of ``numpy.ndarray`` of ``float64``.
+        """
+        z = self.project_complex_torch(buffer, start_time, end_time, device=device)
+        return z.real.copy(), z.imag.copy()
+
+    # ------------------------------------------------------------------
+    # Phase gradient projection — ray-world rendering
+    # ------------------------------------------------------------------
+
+    def project_phase_gradient_numpy(
+        self,
+        buffer: AdaptiveSampleBuffer,
+        start_time: float,
+        end_time: float,
+    ):
+        """Project to instantaneous frequency (phase gradient) on a uniform grid.
+
+        Computes ``f(t) = dφ/dt / (2π)`` from consecutive complex analytic
+        samples via the unbiased estimator:
+            f_k = angle(z_{k+1} · conj(z_k)) / (2π · Δt_k)
+
+        This operates on the adaptive (oversampled) internal buffer before
+        any decimation — frequency accuracy exceeds what any spectrogram
+        can achieve from the real projection.
+
+        Returns ``(f_inst, t_axis)`` as ``numpy.ndarray`` of ``float64``.
+        ``t_axis`` is uniformly spaced; ``f_inst`` is the phase gradient
+        resampled onto it via nearest-neighbour assignment (same as
+        AnalyticalTFRenderer.render_from_buffer).
+        """
+        import numpy as np
+
+        times  = buffer.times()
+        values = buffer.values()
+        if len(times) < 2:
+            dt_out = 1.0 / self._policy.output_sample_rate
+            t_axis = np.arange(start_time, end_time + dt_out * 0.5, dt_out)
+            return np.zeros(len(t_axis), dtype=np.float64), t_axis
+
+        t_arr = np.array(times,  dtype=np.float64)
+        z_arr = np.array(values, dtype=np.complex128)
+
+        dt_arr = np.diff(t_arr)
+        dz     = z_arr[1:] * np.conj(z_arr[:-1])
+        f_inst_raw = np.angle(dz) / (PI2 * np.maximum(dt_arr, 1e-15))
+        t_mid      = 0.5 * (t_arr[:-1] + t_arr[1:])
+
+        mask   = (t_mid >= start_time) & (t_mid <= end_time)
+        t_pts  = t_mid[mask]
+        f_pts  = f_inst_raw[mask]
+
+        dt_out = 1.0 / self._policy.output_sample_rate
+        t_axis = np.arange(start_time, end_time + dt_out * 0.5, dt_out)
+        if len(t_axis) == 0 or t_axis[-1] < end_time - dt_out * 1e-6:
+            t_axis = np.append(t_axis, end_time)
+
+        f_out = np.zeros(len(t_axis), dtype=np.float64)
+        if len(t_pts) > 0:
+            col_idx = np.clip(
+                np.round((t_pts - start_time) / (end_time - start_time) * (len(t_axis) - 1)).astype(int),
+                0, len(t_axis) - 1,
+            )
+            f_out[col_idx] = f_pts  # last-write wins for collisions
+
+        return f_out, t_axis
+
 
 # ============================================================
 # Top-level synth driver
@@ -1372,13 +2094,16 @@ class WitnessAwareSynthDriver:
         density_policy: DensityPolicy,
         projection_policy: ProjectionPolicy,
         pre_projection_filter: Optional[ComplexPreProjectionFilter] = None,
+        complex_envelope: Optional["ComplexEnvelope"] = None,
     ) -> None:
         self._lattice = lattice
         self._witness_planner = WitnessPlanner(witness_thresholds)
         self._density_planner = DensityPlanner(density_policy, self._witness_planner)
+        self._complex_envelope = complex_envelope
         self._emitter = AdaptiveEmitter(
             lattice, self._density_planner, self._witness_planner,
             pre_projection_filter=pre_projection_filter,
+            complex_envelope=complex_envelope,
         )
         self._projector = AdaptiveProjector(projection_policy)
         self._projection_policy = projection_policy
@@ -1414,6 +2139,7 @@ class WitnessAwareSynthDriver:
         self._emitter = AdaptiveEmitter(
             self._lattice, self._density_planner, self._witness_planner,
             pre_projection_filter=filt,
+            complex_envelope=self._complex_envelope,
         )
         return self
 
@@ -1432,12 +2158,257 @@ class WitnessAwareSynthDriver:
         adaptive = self.emit_adaptive_complex(emission_range)
         return self._projector.project_real(adaptive, emission_range.start_time, emission_range.end_time)
 
+    def emit_quadrature_stereo(
+        self,
+        emission_range: EmissionRange,
+    ) -> Tuple[object, object]:
+        """Emit the analytic signal as a quadrature stereo pair (L, R).
+
+        L(t) = A(t)·cos(φ(t))   — in-phase (same as mono)
+        R(t) = A(t)·sin(φ(t))   — quadrature
+
+        This is a direct embedding of the complex plane into two real channels.
+        Phase maps to angle in the stereo plane rather than collapsing into
+        mono interference. No phase folding, no projection-induced degeneracy.
+
+        Returns ``(L, R)`` as ``numpy.ndarray`` of the buffer's native dtype.
+        """
+        adaptive = self.emit_adaptive_complex(emission_range)
+        return self._projector.project_quadrature_numpy(
+            adaptive, emission_range.start_time, emission_range.end_time
+        )
+
+    def emit_phase_gradient(
+        self,
+        emission_range: EmissionRange,
+    ) -> Tuple[object, object]:
+        """Emit instantaneous frequency (phase gradient field) on a uniform grid.
+
+        Computes f(t) = dφ/dt / (2π) from the oversampled analytic buffer
+        before any decimation — accuracy exceeds spectrogram-based estimates.
+
+        Returns ``(f_inst, t_axis)`` as ``numpy.ndarray`` of ``float64``.
+        Use f_inst to drive a phase-accumulator synth, ray visualization, or
+        frequency-domain rendering without projection artifacts.
+        """
+        adaptive = self.emit_adaptive_complex(emission_range)
+        return self._projector.project_phase_gradient_numpy(
+            adaptive, emission_range.start_time, emission_range.end_time
+        )
+
     def witness_trace(
         self,
         emission_range: EmissionRange,
         step_seconds: float,
     ) -> List[Tuple[float, SupportBudget]]:
         return self._emitter.witness_budget_trace(emission_range, step_seconds)
+
+
+# ============================================================
+# Analytical time-frequency renderer
+# ============================================================
+
+class AnalyticalTFRenderer:
+    """
+    Time-frequency images computed directly from analytic signal geometry —
+    no FFT, no windowing, no projection artifacts.
+
+    render_from_lattice(lattice, t_start, t_end)
+        Samples each voice's instantaneous frequency f(t) and amplitude A(t)
+        on a uniform time grid and paints a Gaussian ridge into TF space.
+        Frequency accuracy is bounded only by the analytic PhasePath
+        derivatives, not by any spectral estimation step.
+
+    render_from_buffer(buffer, t_start, t_end)
+        Estimates instantaneous frequency from consecutive complex analytic
+        samples via phase differences:
+            f_k = ∠(z_{k+1} · z̄_k) / (2π · Δt_k)
+        This is the optimal unbiased frequency estimator for an analytic signal
+        — more accurate than any DFT-based spectrogram because it uses the
+        one-sided complex signal before projection to real, at the adaptive
+        (possibly oversampled) internal grid spacing.
+
+    In both modes the output is a (n_freq, n_time) float64 amplitude array
+    plus the corresponding t_axis and f_axis arrays for plotting.
+    """
+
+    def __init__(self, freq_sigma_hz: float = 8.0) -> None:
+        """
+        freq_sigma_hz
+            1σ width of the Gaussian smearing kernel applied in the frequency
+            dimension.  Smaller = sharper ridges; larger = smoother image.
+            Has no analogue in FFT-based spectrograms — it is purely a
+            display parameter, not a time-frequency resolution tradeoff.
+        """
+        self._sigma = max(freq_sigma_hz, 1e-3)
+
+    # ------------------------------------------------------------------
+    # Render from voice geometry
+    # ------------------------------------------------------------------
+
+    def render_from_lattice(
+        self,
+        lattice: "HarmonicLattice",
+        t_start: float,
+        t_end: float,
+        n_time: int = 512,
+        n_freq: int = 512,
+        freq_min: Optional[float] = None,
+        freq_max: Optional[float] = None,
+        log_freq: bool = True,
+    ) -> Tuple[object, object, object]:
+        """
+        Paint each voice as a frequency ridge in TF space.
+
+        Returns ``(image, t_axis, f_axis)``.
+        image shape: (n_freq, n_time), dtype float64.
+        """
+        import numpy as np
+
+        t_axis = np.linspace(t_start, t_end, n_time)
+
+        t_mid = 0.5 * (t_start + t_end)
+        f_all = [abs(v.effective_frequency_hz(t_mid)) for v in lattice.voices]
+        fmin  = freq_min or max(1.0, min(f_all) * 0.7)
+        fmax  = freq_max or max(f_all) * 1.4
+        f_axis = self._make_freq_axis(fmin, fmax, n_freq, log_freq)
+
+        image = np.zeros((n_freq, n_time), dtype=np.float64)
+
+        for voice in lattice.voices:
+            f_ridge = np.fromiter(
+                (voice.effective_frequency_hz(t) for t in t_axis),
+                dtype=float, count=n_time,
+            )
+            A_ridge = np.fromiter(
+                (voice.amplitude(t) for t in t_axis),
+                dtype=float, count=n_time,
+            )
+            # (n_freq × n_time) vectorised outer product — one op per voice.
+            diff  = f_axis[:, None] - f_ridge[None, :]
+            image += np.exp(-0.5 * (diff / self._sigma) ** 2) * A_ridge[None, :]
+
+        return image, t_axis, f_axis
+
+    # ------------------------------------------------------------------
+    # Render from complex analytic buffer
+    # ------------------------------------------------------------------
+
+    def render_from_buffer(
+        self,
+        buffer: "AdaptiveSampleBuffer",
+        t_start: float,
+        t_end: float,
+        n_time: int = 512,
+        n_freq: int = 512,
+        freq_min: Optional[float] = None,
+        freq_max: Optional[float] = None,
+        log_freq: bool = True,
+    ) -> Tuple[object, object, object]:
+        """
+        Estimate instantaneous frequency from the complex analytic buffer and
+        render a TF image.
+
+        Uses ``f_k = ∠(z_{k+1}·z̄_k) / (2π·Δt_k)`` at each pair of
+        consecutive adaptive samples.  This estimator is unbiased for locally
+        stationary analytic signals and uses the full oversampled internal grid
+        rather than the decimated real output — accuracy far exceeds FFT.
+
+        Returns ``(image, t_axis, f_axis)``.
+        image shape: (n_freq, n_time), dtype float64.
+        """
+        import numpy as np
+
+        if len(buffer) < 2:
+            raise ValueError("Buffer must contain at least 2 samples")
+
+        t_arr = np.array(buffer.times())
+        z_arr = np.array(buffer.values())
+
+        # Phase-difference instantaneous frequency — avoids unwrap issues.
+        dt_arr = np.diff(t_arr)
+        dz     = z_arr[1:] * np.conj(z_arr[:-1])
+        f_inst = np.angle(dz) / (PI2 * np.maximum(dt_arr, 1e-15))
+        t_mid  = 0.5 * (t_arr[:-1] + t_arr[1:])
+        A_mid  = 0.5 * (np.abs(z_arr[:-1]) + np.abs(z_arr[1:]))
+
+        # Restrict to the requested range; keep only positive instantaneous freqs.
+        mask   = (t_mid >= t_start) & (t_mid <= t_end) & (f_inst > 0)
+        t_pts  = t_mid[mask]
+        f_pts  = f_inst[mask]
+        A_pts  = A_mid[mask]
+
+        t_axis = np.linspace(t_start, t_end, n_time)
+        if len(t_pts) == 0:
+            fmin   = freq_min or 20.0
+            fmax   = freq_max or 20_000.0
+            f_axis = self._make_freq_axis(fmin, fmax, n_freq, log_freq)
+            return np.zeros((n_freq, n_time), dtype=np.float64), t_axis, f_axis
+
+        fmin   = freq_min or max(1.0, float(np.percentile(f_pts, 2)) * 0.7)
+        fmax   = freq_max or float(np.percentile(f_pts, 98)) * 1.4
+        f_axis = self._make_freq_axis(fmin, fmax, n_freq, log_freq)
+        image  = np.zeros((n_freq, n_time), dtype=np.float64)
+
+        # Scatter buffer points into nearest time-axis columns.
+        col_idx = np.clip(
+            np.round((t_pts - t_start) / (t_end - t_start) * (n_time - 1)).astype(int),
+            0, n_time - 1,
+        )
+
+        # Vectorised Gaussian paint: (n_freq × m) — one matrix op.
+        diff  = f_axis[:, None] - f_pts[None, :]
+        gauss = np.exp(-0.5 * (diff / self._sigma) ** 2) * A_pts[None, :]
+        np.add.at(image, (slice(None), col_idx), gauss)
+
+        return image, t_axis, f_axis
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_freq_axis(fmin: float, fmax: float, n: int, log: bool):
+        import numpy as np
+        if log:
+            return np.logspace(math.log10(max(fmin, 1e-3)), math.log10(fmax), n)
+        return np.linspace(fmin, fmax, n)
+
+    @staticmethod
+    def save_png(
+        image,
+        t_axis,
+        f_axis,
+        path: str,
+        title: str = "Analytical TF Image",
+        log_amplitude: bool = True,
+        dpi: int = 150,
+    ) -> None:
+        """Save a TF image array to PNG via matplotlib."""
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError:
+            raise ImportError("matplotlib required — pip install matplotlib")
+        import numpy as np
+
+        img = np.log1p(image) if log_amplitude else image
+        fig, ax = plt.subplots(figsize=(11, 4), dpi=dpi)
+        ax.imshow(
+            img,
+            aspect="auto",
+            origin="lower",
+            extent=[float(t_axis[0]), float(t_axis[-1]),
+                    float(f_axis[0]), float(f_axis[-1])],
+            cmap="inferno",
+            interpolation="bilinear",
+        )
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Frequency (Hz)")
+        ax.set_title(title)
+        plt.tight_layout()
+        plt.savefig(path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        print(f"TF image saved: {path}")
 
 
 # ============================================================

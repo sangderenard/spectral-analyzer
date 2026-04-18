@@ -16,6 +16,8 @@ Thumbs.db
 *.swp
 *~
 *.txt
+*.png
+*.wav
 
 # Environments
 .venv/

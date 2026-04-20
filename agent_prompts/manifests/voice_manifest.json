@@ -1,0 +1,1924 @@
+{
+  "instance_type": "voice",
+  "class_name": "AnalyticVoice",
+  "description": "Single analytic voice: oscillator, envelope, chirp, harmonics, FM/AM, granular emission",
+  "field_count": 54,
+  "groups": {
+    "Oscillator": [
+      {
+        "name": "freq_hz",
+        "label": "Freq",
+        "dtype": "float",
+        "default": 440.0,
+        "low": 1.0,
+        "high": 20000.0,
+        "step": 0,
+        "unit": "Hz",
+        "choices": [],
+        "is_log": true,
+        "group": "Oscillator",
+        "fmt": ".1f",
+        "visible_when": null
+      },
+      {
+        "name": "semitone_offset",
+        "label": "Offset",
+        "dtype": "float",
+        "default": 0.0,
+        "low": -48.0,
+        "high": 48.0,
+        "step": 0,
+        "unit": "st",
+        "choices": [],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".2f",
+        "visible_when": null
+      },
+      {
+        "name": "note_tracking",
+        "label": "Tracking",
+        "dtype": "choice",
+        "default": "note",
+        "low": 0,
+        "high": 2,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "note",
+          "root",
+          "free"
+        ],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": "",
+        "visible_when": null
+      },
+      {
+        "name": "amplitude",
+        "label": "Amplitude",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.0,
+        "high": 4.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "phase_origin",
+        "label": "Phase",
+        "dtype": "float",
+        "default": 0.0,
+        "low": -3.141592653589793,
+        "high": 3.141592653589793,
+        "step": 0,
+        "unit": "rad",
+        "choices": [],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "pre_delay",
+        "label": "Pre-delay",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 2.0,
+        "step": 0,
+        "unit": "s",
+        "choices": [],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "voice_role",
+        "label": "Role",
+        "dtype": "choice",
+        "default": "signal",
+        "low": 0,
+        "high": 3,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "signal",
+          "air",
+          "transient",
+          "body"
+        ],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".3g",
+        "visible_when": null
+      },
+      {
+        "name": "seq_role",
+        "label": "Arr. role",
+        "dtype": "choice",
+        "default": "melody",
+        "low": 0,
+        "high": 3,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "melody",
+          "bass",
+          "root",
+          "stab"
+        ],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".3g",
+        "visible_when": null
+      },
+      {
+        "name": "register",
+        "label": "Register",
+        "dtype": "choice",
+        "default": "all",
+        "low": 0,
+        "high": 3,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "all",
+          "bass",
+          "mid",
+          "high"
+        ],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".3g",
+        "visible_when": null
+      },
+      {
+        "name": "polyphony_count",
+        "label": "Polyphony",
+        "dtype": "int",
+        "default": 1,
+        "low": 1,
+        "high": 16,
+        "step": 1,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".0f",
+        "visible_when": null
+      },
+      {
+        "name": "polyphony_mode",
+        "label": "Poly mode",
+        "dtype": "choice",
+        "default": "sympathetic",
+        "low": 0,
+        "high": 1,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "sympathetic",
+          "unsympathetic"
+        ],
+        "is_log": false,
+        "group": "Oscillator",
+        "fmt": ".3g",
+        "visible_when": null
+      }
+    ],
+    "Envelope": [
+      {
+        "name": "env_type",
+        "label": "Env type",
+        "dtype": "choice",
+        "default": "adsr",
+        "low": 0,
+        "high": 3,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "adsr",
+          "spline",
+          "monotone",
+          "linear"
+        ],
+        "is_log": false,
+        "group": "Envelope",
+        "fmt": ".0f",
+        "visible_when": null
+      },
+      {
+        "name": "adsr.attack",
+        "label": "Attack",
+        "dtype": "float",
+        "default": 0.005,
+        "low": 0.001,
+        "high": 2.0,
+        "step": 0,
+        "unit": "s",
+        "choices": [],
+        "is_log": true,
+        "group": "Envelope",
+        "fmt": ".4f",
+        "visible_when": [
+          "env_type",
+          "adsr"
+        ]
+      },
+      {
+        "name": "adsr.decay",
+        "label": "Decay",
+        "dtype": "float",
+        "default": 0.04,
+        "low": 0.001,
+        "high": 2.0,
+        "step": 0,
+        "unit": "s",
+        "choices": [],
+        "is_log": true,
+        "group": "Envelope",
+        "fmt": ".4f",
+        "visible_when": [
+          "env_type",
+          "adsr"
+        ]
+      },
+      {
+        "name": "adsr.sustain",
+        "label": "Sustain",
+        "dtype": "float",
+        "default": 0.75,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Envelope",
+        "fmt": ".3f",
+        "visible_when": [
+          "env_type",
+          "adsr"
+        ]
+      },
+      {
+        "name": "adsr.release",
+        "label": "Release",
+        "dtype": "float",
+        "default": 0.08,
+        "low": 0.001,
+        "high": 4.0,
+        "step": 0,
+        "unit": "s",
+        "choices": [],
+        "is_log": true,
+        "group": "Envelope",
+        "fmt": ".4f",
+        "visible_when": [
+          "env_type",
+          "adsr"
+        ]
+      },
+      {
+        "name": "adsr.peak",
+        "label": "Peak",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.0,
+        "high": 2.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Envelope",
+        "fmt": ".3f",
+        "visible_when": [
+          "env_type",
+          "adsr"
+        ]
+      }
+    ],
+    "Chirp": [
+      {
+        "name": "chirp.chirp_type",
+        "label": "Chirp type",
+        "dtype": "choice",
+        "default": "none",
+        "low": 0,
+        "high": 3,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "none",
+          "linear",
+          "exponential",
+          "power"
+        ],
+        "is_log": false,
+        "group": "Chirp",
+        "fmt": ".0f",
+        "visible_when": null
+      },
+      {
+        "name": "chirp.f_delta_start",
+        "label": "\u0394f start",
+        "dtype": "float",
+        "default": 0.0,
+        "low": -5000.0,
+        "high": 5000.0,
+        "step": 0,
+        "unit": "Hz",
+        "choices": [],
+        "is_log": false,
+        "group": "Chirp",
+        "fmt": ".1f",
+        "visible_when": null
+      },
+      {
+        "name": "chirp.f_delta_end",
+        "label": "\u0394f end",
+        "dtype": "float",
+        "default": 0.0,
+        "low": -5000.0,
+        "high": 5000.0,
+        "step": 0,
+        "unit": "Hz",
+        "choices": [],
+        "is_log": false,
+        "group": "Chirp",
+        "fmt": ".1f",
+        "visible_when": null
+      },
+      {
+        "name": "chirp.tau",
+        "label": "Tau",
+        "dtype": "float",
+        "default": 0.5,
+        "low": 0.01,
+        "high": 10.0,
+        "step": 0,
+        "unit": "s",
+        "choices": [],
+        "is_log": true,
+        "group": "Chirp",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "chirp.chirp_power",
+        "label": "Power",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.1,
+        "high": 8.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Chirp",
+        "fmt": ".2f",
+        "visible_when": null
+      }
+    ],
+    "FM": [
+      {
+        "name": "fm.depth_hz",
+        "label": "FM depth",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 2000.0,
+        "step": 0,
+        "unit": "Hz",
+        "choices": [],
+        "is_log": true,
+        "group": "FM",
+        "fmt": ".1f",
+        "visible_when": null
+      }
+    ],
+    "AM": [
+      {
+        "name": "am.depth_amp",
+        "label": "AM depth",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "AM",
+        "fmt": ".3f",
+        "visible_when": null
+      }
+    ],
+    "Loop": [
+      {
+        "name": "loop_start",
+        "label": "Loop start",
+        "dtype": "float",
+        "default": 0.1,
+        "low": 0.0,
+        "high": 0.99,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Loop",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "loop_end",
+        "label": "Loop end",
+        "dtype": "float",
+        "default": 0.9,
+        "low": 0.01,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Loop",
+        "fmt": ".3f",
+        "visible_when": null
+      }
+    ],
+    "Harmonic": [
+      {
+        "name": "manifold_type",
+        "label": "Manifold",
+        "dtype": "choice",
+        "default": "pure",
+        "low": 0,
+        "high": 2,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "pure",
+          "harmonic",
+          "harmonic_warp"
+        ],
+        "is_log": false,
+        "group": "Harmonic",
+        "fmt": ".0f",
+        "visible_when": null
+      },
+      {
+        "name": "harmonic_count",
+        "label": "Count",
+        "dtype": "int",
+        "default": 8,
+        "low": 1,
+        "high": 32,
+        "step": 1,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Harmonic",
+        "fmt": ".0f",
+        "visible_when": null
+      },
+      {
+        "name": "harmonic_brightness",
+        "label": "Brightness",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.0,
+        "high": 4.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Harmonic",
+        "fmt": ".2f",
+        "visible_when": null
+      },
+      {
+        "name": "harmonic_warp_strength",
+        "label": "Warp str.",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 2.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Harmonic",
+        "fmt": ".3f",
+        "visible_when": null
+      }
+    ],
+    "Emission": [
+      {
+        "name": "emission_mode",
+        "label": "Emission",
+        "dtype": "choice",
+        "default": "single",
+        "low": 0,
+        "high": 1,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "single",
+          "granular"
+        ],
+        "is_log": false,
+        "group": "Emission",
+        "fmt": ".0f",
+        "visible_when": null
+      }
+    ],
+    "Granular: Freq": [
+      {
+        "name": "granular.center_frequency_hz",
+        "label": "Center freq",
+        "dtype": "float",
+        "default": 440.0,
+        "low": 20.0,
+        "high": 20000.0,
+        "step": 0,
+        "unit": "Hz",
+        "choices": [],
+        "is_log": true,
+        "group": "Granular: Freq",
+        "fmt": ".1f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.grain_pitch_spread_semitones",
+        "label": "Pitch spread",
+        "dtype": "float",
+        "default": 3.0,
+        "low": 0.0,
+        "high": 24.0,
+        "step": 0,
+        "unit": "st",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Freq",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.grain_harmonic_lock",
+        "label": "Harm. lock",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Freq",
+        "fmt": ".3f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.grain_highband_bias",
+        "label": "Highband bias",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 3.0,
+        "step": 0,
+        "unit": "oct",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Freq",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Birth": [
+      {
+        "name": "granular.grain_density_hz",
+        "label": "Density",
+        "dtype": "float",
+        "default": 20.0,
+        "low": 0.5,
+        "high": 500.0,
+        "step": 0,
+        "unit": "/s",
+        "choices": [],
+        "is_log": true,
+        "group": "Granular: Birth",
+        "fmt": ".1f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.birth_jitter",
+        "label": "Jitter",
+        "dtype": "float",
+        "default": 0.5,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Birth",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.burst_probability",
+        "label": "Burst prob.",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Birth",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.burst_size",
+        "label": "Burst size",
+        "dtype": "int",
+        "default": 4,
+        "low": 2,
+        "high": 32,
+        "step": 1,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Birth",
+        "fmt": ".0f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.burst_spread_s",
+        "label": "Burst spread",
+        "dtype": "float",
+        "default": 0.015,
+        "low": 0.001,
+        "high": 0.2,
+        "step": 0,
+        "unit": "s",
+        "choices": [],
+        "is_log": true,
+        "group": "Granular: Birth",
+        "fmt": ".3f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Duration": [
+      {
+        "name": "granular.grain_duration_s",
+        "label": "Duration",
+        "dtype": "float",
+        "default": 0.05,
+        "low": 0.002,
+        "high": 2.0,
+        "step": 0,
+        "unit": "s",
+        "choices": [],
+        "is_log": true,
+        "group": "Granular: Duration",
+        "fmt": ".3f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.grain_duration_jitter",
+        "label": "Dur. jitter",
+        "dtype": "float",
+        "default": 0.3,
+        "low": 0.0,
+        "high": 2.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Duration",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Chirp": [
+      {
+        "name": "granular.grain_chirp_depth",
+        "label": "Chirp depth",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 2.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Chirp",
+        "fmt": ".3f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.grain_chirp_jitter",
+        "label": "Chirp jitter",
+        "dtype": "float",
+        "default": 0.5,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Chirp",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Phase": [
+      {
+        "name": "granular.grain_phase_randomness",
+        "label": "Phase rand.",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Phase",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Manifold": [
+      {
+        "name": "granular.grain_manifold_mix",
+        "label": "Manifold mix",
+        "dtype": "float",
+        "default": 0.0,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Manifold",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Amp": [
+      {
+        "name": "granular.gain",
+        "label": "Grain gain",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.0,
+        "high": 4.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Amp",
+        "fmt": ".3f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.grain_amp_jitter",
+        "label": "Amp jitter",
+        "dtype": "float",
+        "default": 0.2,
+        "low": 0.0,
+        "high": 2.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Amp",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Envelope": [
+      {
+        "name": "granular.attack_frac",
+        "label": "Atk frac.",
+        "dtype": "float",
+        "default": 0.15,
+        "low": 0.01,
+        "high": 0.5,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Envelope",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.release_frac",
+        "label": "Rel frac.",
+        "dtype": "float",
+        "default": 0.35,
+        "low": 0.01,
+        "high": 0.8,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Envelope",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ],
+    "Granular: Meta": [
+      {
+        "name": "granular.grain_coherence",
+        "label": "Coherence",
+        "dtype": "float",
+        "default": 0.5,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Meta",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.coherence_mode",
+        "label": "Coh. mode",
+        "dtype": "choice",
+        "default": "uniform",
+        "low": 0,
+        "high": 0,
+        "step": 0,
+        "unit": "",
+        "choices": [
+          "uniform",
+          "sine",
+          "random_walk",
+          "burst",
+          "gradient",
+          "perlin_walk"
+        ],
+        "is_log": false,
+        "group": "Granular: Meta",
+        "fmt": "",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.coherence_rate_hz",
+        "label": "Coh. rate",
+        "dtype": "float",
+        "default": 0.5,
+        "low": 0.01,
+        "high": 10.0,
+        "step": 0,
+        "unit": "Hz",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Meta",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      },
+      {
+        "name": "granular.coherence_depth",
+        "label": "Coh. depth",
+        "dtype": "float",
+        "default": 0.3,
+        "low": 0.0,
+        "high": 1.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "Granular: Meta",
+        "fmt": ".2f",
+        "visible_when": [
+          "emission_mode",
+          "granular"
+        ]
+      }
+    ]
+  },
+  "fields": [
+    {
+      "name": "freq_hz",
+      "label": "Freq",
+      "dtype": "float",
+      "default": 440.0,
+      "low": 1.0,
+      "high": 20000.0,
+      "step": 0,
+      "unit": "Hz",
+      "choices": [],
+      "is_log": true,
+      "group": "Oscillator",
+      "fmt": ".1f",
+      "visible_when": null
+    },
+    {
+      "name": "semitone_offset",
+      "label": "Offset",
+      "dtype": "float",
+      "default": 0.0,
+      "low": -48.0,
+      "high": 48.0,
+      "step": 0,
+      "unit": "st",
+      "choices": [],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".2f",
+      "visible_when": null
+    },
+    {
+      "name": "note_tracking",
+      "label": "Tracking",
+      "dtype": "choice",
+      "default": "note",
+      "low": 0,
+      "high": 2,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "note",
+        "root",
+        "free"
+      ],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": "",
+      "visible_when": null
+    },
+    {
+      "name": "amplitude",
+      "label": "Amplitude",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.0,
+      "high": 4.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "phase_origin",
+      "label": "Phase",
+      "dtype": "float",
+      "default": 0.0,
+      "low": -3.141592653589793,
+      "high": 3.141592653589793,
+      "step": 0,
+      "unit": "rad",
+      "choices": [],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "pre_delay",
+      "label": "Pre-delay",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 2.0,
+      "step": 0,
+      "unit": "s",
+      "choices": [],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "voice_role",
+      "label": "Role",
+      "dtype": "choice",
+      "default": "signal",
+      "low": 0,
+      "high": 3,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "signal",
+        "air",
+        "transient",
+        "body"
+      ],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".3g",
+      "visible_when": null
+    },
+    {
+      "name": "seq_role",
+      "label": "Arr. role",
+      "dtype": "choice",
+      "default": "melody",
+      "low": 0,
+      "high": 3,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "melody",
+        "bass",
+        "root",
+        "stab"
+      ],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".3g",
+      "visible_when": null
+    },
+    {
+      "name": "register",
+      "label": "Register",
+      "dtype": "choice",
+      "default": "all",
+      "low": 0,
+      "high": 3,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "all",
+        "bass",
+        "mid",
+        "high"
+      ],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".3g",
+      "visible_when": null
+    },
+    {
+      "name": "polyphony_count",
+      "label": "Polyphony",
+      "dtype": "int",
+      "default": 1,
+      "low": 1,
+      "high": 16,
+      "step": 1,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".0f",
+      "visible_when": null
+    },
+    {
+      "name": "polyphony_mode",
+      "label": "Poly mode",
+      "dtype": "choice",
+      "default": "sympathetic",
+      "low": 0,
+      "high": 1,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "sympathetic",
+        "unsympathetic"
+      ],
+      "is_log": false,
+      "group": "Oscillator",
+      "fmt": ".3g",
+      "visible_when": null
+    },
+    {
+      "name": "env_type",
+      "label": "Env type",
+      "dtype": "choice",
+      "default": "adsr",
+      "low": 0,
+      "high": 3,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "adsr",
+        "spline",
+        "monotone",
+        "linear"
+      ],
+      "is_log": false,
+      "group": "Envelope",
+      "fmt": ".0f",
+      "visible_when": null
+    },
+    {
+      "name": "adsr.attack",
+      "label": "Attack",
+      "dtype": "float",
+      "default": 0.005,
+      "low": 0.001,
+      "high": 2.0,
+      "step": 0,
+      "unit": "s",
+      "choices": [],
+      "is_log": true,
+      "group": "Envelope",
+      "fmt": ".4f",
+      "visible_when": [
+        "env_type",
+        "adsr"
+      ]
+    },
+    {
+      "name": "adsr.decay",
+      "label": "Decay",
+      "dtype": "float",
+      "default": 0.04,
+      "low": 0.001,
+      "high": 2.0,
+      "step": 0,
+      "unit": "s",
+      "choices": [],
+      "is_log": true,
+      "group": "Envelope",
+      "fmt": ".4f",
+      "visible_when": [
+        "env_type",
+        "adsr"
+      ]
+    },
+    {
+      "name": "adsr.sustain",
+      "label": "Sustain",
+      "dtype": "float",
+      "default": 0.75,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Envelope",
+      "fmt": ".3f",
+      "visible_when": [
+        "env_type",
+        "adsr"
+      ]
+    },
+    {
+      "name": "adsr.release",
+      "label": "Release",
+      "dtype": "float",
+      "default": 0.08,
+      "low": 0.001,
+      "high": 4.0,
+      "step": 0,
+      "unit": "s",
+      "choices": [],
+      "is_log": true,
+      "group": "Envelope",
+      "fmt": ".4f",
+      "visible_when": [
+        "env_type",
+        "adsr"
+      ]
+    },
+    {
+      "name": "adsr.peak",
+      "label": "Peak",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.0,
+      "high": 2.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Envelope",
+      "fmt": ".3f",
+      "visible_when": [
+        "env_type",
+        "adsr"
+      ]
+    },
+    {
+      "name": "chirp.chirp_type",
+      "label": "Chirp type",
+      "dtype": "choice",
+      "default": "none",
+      "low": 0,
+      "high": 3,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "none",
+        "linear",
+        "exponential",
+        "power"
+      ],
+      "is_log": false,
+      "group": "Chirp",
+      "fmt": ".0f",
+      "visible_when": null
+    },
+    {
+      "name": "chirp.f_delta_start",
+      "label": "\u0394f start",
+      "dtype": "float",
+      "default": 0.0,
+      "low": -5000.0,
+      "high": 5000.0,
+      "step": 0,
+      "unit": "Hz",
+      "choices": [],
+      "is_log": false,
+      "group": "Chirp",
+      "fmt": ".1f",
+      "visible_when": null
+    },
+    {
+      "name": "chirp.f_delta_end",
+      "label": "\u0394f end",
+      "dtype": "float",
+      "default": 0.0,
+      "low": -5000.0,
+      "high": 5000.0,
+      "step": 0,
+      "unit": "Hz",
+      "choices": [],
+      "is_log": false,
+      "group": "Chirp",
+      "fmt": ".1f",
+      "visible_when": null
+    },
+    {
+      "name": "chirp.tau",
+      "label": "Tau",
+      "dtype": "float",
+      "default": 0.5,
+      "low": 0.01,
+      "high": 10.0,
+      "step": 0,
+      "unit": "s",
+      "choices": [],
+      "is_log": true,
+      "group": "Chirp",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "chirp.chirp_power",
+      "label": "Power",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.1,
+      "high": 8.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Chirp",
+      "fmt": ".2f",
+      "visible_when": null
+    },
+    {
+      "name": "fm.depth_hz",
+      "label": "FM depth",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 2000.0,
+      "step": 0,
+      "unit": "Hz",
+      "choices": [],
+      "is_log": true,
+      "group": "FM",
+      "fmt": ".1f",
+      "visible_when": null
+    },
+    {
+      "name": "am.depth_amp",
+      "label": "AM depth",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "AM",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "loop_start",
+      "label": "Loop start",
+      "dtype": "float",
+      "default": 0.1,
+      "low": 0.0,
+      "high": 0.99,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Loop",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "loop_end",
+      "label": "Loop end",
+      "dtype": "float",
+      "default": 0.9,
+      "low": 0.01,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Loop",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "manifold_type",
+      "label": "Manifold",
+      "dtype": "choice",
+      "default": "pure",
+      "low": 0,
+      "high": 2,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "pure",
+        "harmonic",
+        "harmonic_warp"
+      ],
+      "is_log": false,
+      "group": "Harmonic",
+      "fmt": ".0f",
+      "visible_when": null
+    },
+    {
+      "name": "harmonic_count",
+      "label": "Count",
+      "dtype": "int",
+      "default": 8,
+      "low": 1,
+      "high": 32,
+      "step": 1,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Harmonic",
+      "fmt": ".0f",
+      "visible_when": null
+    },
+    {
+      "name": "harmonic_brightness",
+      "label": "Brightness",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.0,
+      "high": 4.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Harmonic",
+      "fmt": ".2f",
+      "visible_when": null
+    },
+    {
+      "name": "harmonic_warp_strength",
+      "label": "Warp str.",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 2.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Harmonic",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "emission_mode",
+      "label": "Emission",
+      "dtype": "choice",
+      "default": "single",
+      "low": 0,
+      "high": 1,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "single",
+        "granular"
+      ],
+      "is_log": false,
+      "group": "Emission",
+      "fmt": ".0f",
+      "visible_when": null
+    },
+    {
+      "name": "granular.center_frequency_hz",
+      "label": "Center freq",
+      "dtype": "float",
+      "default": 440.0,
+      "low": 20.0,
+      "high": 20000.0,
+      "step": 0,
+      "unit": "Hz",
+      "choices": [],
+      "is_log": true,
+      "group": "Granular: Freq",
+      "fmt": ".1f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_pitch_spread_semitones",
+      "label": "Pitch spread",
+      "dtype": "float",
+      "default": 3.0,
+      "low": 0.0,
+      "high": 24.0,
+      "step": 0,
+      "unit": "st",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Freq",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_harmonic_lock",
+      "label": "Harm. lock",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Freq",
+      "fmt": ".3f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_highband_bias",
+      "label": "Highband bias",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 3.0,
+      "step": 0,
+      "unit": "oct",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Freq",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_density_hz",
+      "label": "Density",
+      "dtype": "float",
+      "default": 20.0,
+      "low": 0.5,
+      "high": 500.0,
+      "step": 0,
+      "unit": "/s",
+      "choices": [],
+      "is_log": true,
+      "group": "Granular: Birth",
+      "fmt": ".1f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.birth_jitter",
+      "label": "Jitter",
+      "dtype": "float",
+      "default": 0.5,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Birth",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.burst_probability",
+      "label": "Burst prob.",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Birth",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.burst_size",
+      "label": "Burst size",
+      "dtype": "int",
+      "default": 4,
+      "low": 2,
+      "high": 32,
+      "step": 1,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Birth",
+      "fmt": ".0f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.burst_spread_s",
+      "label": "Burst spread",
+      "dtype": "float",
+      "default": 0.015,
+      "low": 0.001,
+      "high": 0.2,
+      "step": 0,
+      "unit": "s",
+      "choices": [],
+      "is_log": true,
+      "group": "Granular: Birth",
+      "fmt": ".3f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_duration_s",
+      "label": "Duration",
+      "dtype": "float",
+      "default": 0.05,
+      "low": 0.002,
+      "high": 2.0,
+      "step": 0,
+      "unit": "s",
+      "choices": [],
+      "is_log": true,
+      "group": "Granular: Duration",
+      "fmt": ".3f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_duration_jitter",
+      "label": "Dur. jitter",
+      "dtype": "float",
+      "default": 0.3,
+      "low": 0.0,
+      "high": 2.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Duration",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_chirp_depth",
+      "label": "Chirp depth",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 2.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Chirp",
+      "fmt": ".3f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_chirp_jitter",
+      "label": "Chirp jitter",
+      "dtype": "float",
+      "default": 0.5,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Chirp",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_phase_randomness",
+      "label": "Phase rand.",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Phase",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_manifold_mix",
+      "label": "Manifold mix",
+      "dtype": "float",
+      "default": 0.0,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Manifold",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.gain",
+      "label": "Grain gain",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.0,
+      "high": 4.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Amp",
+      "fmt": ".3f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_amp_jitter",
+      "label": "Amp jitter",
+      "dtype": "float",
+      "default": 0.2,
+      "low": 0.0,
+      "high": 2.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Amp",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.attack_frac",
+      "label": "Atk frac.",
+      "dtype": "float",
+      "default": 0.15,
+      "low": 0.01,
+      "high": 0.5,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Envelope",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.release_frac",
+      "label": "Rel frac.",
+      "dtype": "float",
+      "default": 0.35,
+      "low": 0.01,
+      "high": 0.8,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Envelope",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.grain_coherence",
+      "label": "Coherence",
+      "dtype": "float",
+      "default": 0.5,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Meta",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.coherence_mode",
+      "label": "Coh. mode",
+      "dtype": "choice",
+      "default": "uniform",
+      "low": 0,
+      "high": 0,
+      "step": 0,
+      "unit": "",
+      "choices": [
+        "uniform",
+        "sine",
+        "random_walk",
+        "burst",
+        "gradient",
+        "perlin_walk"
+      ],
+      "is_log": false,
+      "group": "Granular: Meta",
+      "fmt": "",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.coherence_rate_hz",
+      "label": "Coh. rate",
+      "dtype": "float",
+      "default": 0.5,
+      "low": 0.01,
+      "high": 10.0,
+      "step": 0,
+      "unit": "Hz",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Meta",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    },
+    {
+      "name": "granular.coherence_depth",
+      "label": "Coh. depth",
+      "dtype": "float",
+      "default": 0.3,
+      "low": 0.0,
+      "high": 1.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "Granular: Meta",
+      "fmt": ".2f",
+      "visible_when": [
+        "emission_mode",
+        "granular"
+      ]
+    }
+  ]
+}

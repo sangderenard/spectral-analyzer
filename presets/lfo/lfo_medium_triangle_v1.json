@@ -1,0 +1,24 @@
+{
+  "instance_type": "lfo",
+  "instance_id": "lfo_medium_triangle_v1",
+  "label": "Medium Triangle",
+  "description": "Mid-rate triangle LFO. Linear slopes give a mechanical, symmetrical feel. Good for tremolo or pitch wobble at note-scale rates.",
+  "tags": ["medium", "triangle", "tremolo", "wobble"],
+  "summary": {
+    "rate": "2.0 Hz (0.5s period)",
+    "shape": "Triangle",
+    "depth": 0.8,
+    "use_cases": ["tremolo", "note-scale pitch wobble", "AM depth"]
+  },
+  "engine_version": "score-0.1",
+  "created_at": "2026-04-19T00:00:00",
+  "payload": {
+    "key": "lfopreset01",
+    "label": "Medium Triangle",
+    "rate_hz": 2.0,
+    "shape": "Triangle",
+    "phase_offset": 0.0,
+    "depth": 0.8,
+    "color": [160, 200, 80]
+  }
+}

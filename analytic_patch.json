@@ -1,87 +1,22 @@
 {
-  "name": "default",
+  "name": "union_layering_fixture",
+  "system_audio": {
+    "output_device_name": "",
+    "output_channels": 2,
+    "input_device_name": "",
+    "input_channels": 0,
+    "export_to_file": true,
+    "export_sample_rate": 48000,
+    "export_bit_depth": 24
+  },
   "voices": [
     {
-      "key": "3d5fee7a",
-      "label": "V1",
-      "freq_hz": 97.18454259358617,
+      "key": "bassbody",
+      "label": "Bass Body",
+      "freq_hz": 110.0,
       "semitone_offset": 0.0,
       "note_tracking": "note",
-      "amplitude": 1.0,
-      "phase_origin": 0.0,
-      "chirp": {
-        "f_delta_start": 189.39393939393904,
-        "f_delta_end": -75.75757575757598,
-        "chirp_type": "power",
-        "tau": 0.30010465178188733,
-        "chirp_power": 0.4291666666666667
-      },
-      "fm": {
-        "source_key": "",
-        "depth_hz": 30.303030303030305,
-        "depth_amp": 0.2
-      },
-      "am": {
-        "source_key": "",
-        "depth_hz": 2.0,
-        "depth_amp": 0.09090909090909091
-      },
-      "env_type": "spline",
-      "adsr": {
-        "attack": 0.16432865731462926,
-        "decay": 0.05410821643286573,
-        "sustain": 0.573529411764706,
-        "release": 0.2895791583166333,
-        "peak": 1.0
-      },
-      "env_knots": [
-        [
-          0.0,
-          0.0
-        ],
-        [
-          0.12024048096192384,
-          0.7308823529411765
-        ],
-        [
-          0.32064128256513025,
-          0.8838235294117648
-        ],
-        [
-          0.779559118236473,
-          0.5794117647058824
-        ],
-        [
-          1.0,
-          0.0
-        ]
-      ],
-      "loop_start": 0.07875,
-      "loop_end": 0.9,
-      "loop_enabled": false,
-      "muted": false,
-      "color": [
-        100,
-        160,
-        255
-      ],
-      "pre_delay": 0.0,
-      "manifold_type": "harmonic",
-      "harmonic_count": 22,
-      "harmonic_brightness": 0.5151515151515151,
-      "harmonic_warp_strength": 0.5075757575757576,
-      "voice_role": "signal",
-      "seq_role": "melody",
-      "emission_mode": "single",
-      "granular": null
-    },
-    {
-      "key": "4a5a2743",
-      "label": "V2",
-      "freq_hz": 12.818613688034754,
-      "semitone_offset": -12.0,
-      "note_tracking": "root",
-      "amplitude": 0.9242424242424242,
+      "amplitude": 0.9,
       "phase_origin": 0.0,
       "chirp": {
         "f_delta_start": 0.0,
@@ -92,223 +27,343 @@
       },
       "fm": null,
       "am": null,
-      "env_type": "spline",
+      "env_type": "adsr",
       "adsr": {
-        "attack": 0.005,
-        "decay": 0.04,
-        "sustain": 0.75,
-        "release": 0.08,
+        "attack": 0.01,
+        "decay": 0.12,
+        "sustain": 0.8,
+        "release": 0.14,
         "peak": 1.0
       },
-      "env_knots": [
-        [
-          0.0,
-          0.0
-        ],
-        [
-          0.01,
-          1.0
-        ],
-        [
-          0.09519038076152304,
-          0.4147058823529412
-        ],
-        [
-          0.12024048096192384,
-          0.20147058823529423
-        ],
-        [
-          1.0,
-          0.0
-        ]
-      ],
+      "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.1, 0.8], [0.8, 0.8], [1.0, 0.0]],
       "loop_start": 0.1,
       "loop_end": 0.9,
       "loop_enabled": false,
       "muted": false,
-      "color": [
-        255,
-        130,
-        60
-      ],
+      "color": [110, 170, 255],
+      "pre_delay": 0.0,
+      "manifold_type": "harmonic",
+      "harmonic_count": 12,
+      "harmonic_brightness": 0.7,
+      "harmonic_warp_strength": 0.1,
+      "voice_role": "body",
+      "seq_role": "bass",
+      "register": "bass",
+      "emission_mode": "single",
+      "granular": null
+    },
+    {
+      "key": "basstrns",
+      "label": "Bass Transient",
+      "freq_hz": 110.0,
+      "semitone_offset": 0.0,
+      "note_tracking": "note",
+      "amplitude": 0.45,
+      "phase_origin": 0.0,
+      "chirp": {
+        "f_delta_start": 0.0,
+        "f_delta_end": 0.0,
+        "chirp_type": "none",
+        "tau": 0.5,
+        "chirp_power": 1.0
+      },
+      "fm": null,
+      "am": null,
+      "env_type": "adsr",
+      "adsr": {
+        "attack": 0.002,
+        "decay": 0.03,
+        "sustain": 0.2,
+        "release": 0.05,
+        "peak": 1.0
+      },
+      "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.08, 0.3], [0.25, 0.1], [1.0, 0.0]],
+      "loop_start": 0.1,
+      "loop_end": 0.9,
+      "loop_enabled": false,
+      "muted": false,
+      "color": [255, 150, 90],
       "pre_delay": 0.0,
       "manifold_type": "pure",
       "harmonic_count": 8,
       "harmonic_brightness": 1.0,
-      "harmonic_warp_strength": 1.3181818181818181,
+      "harmonic_warp_strength": 0.0,
       "voice_role": "transient",
+      "seq_role": "bass",
+      "register": "bass",
+      "emission_mode": "single",
+      "granular": null
+    },
+    {
+      "key": "rootpedl",
+      "label": "Root Pedal",
+      "freq_hz": 55.0,
+      "semitone_offset": 0.0,
+      "note_tracking": "root",
+      "amplitude": 0.55,
+      "phase_origin": 0.0,
+      "chirp": {
+        "f_delta_start": 0.0,
+        "f_delta_end": 0.0,
+        "chirp_type": "none",
+        "tau": 0.5,
+        "chirp_power": 1.0
+      },
+      "fm": null,
+      "am": null,
+      "env_type": "adsr",
+      "adsr": {
+        "attack": 0.02,
+        "decay": 0.08,
+        "sustain": 0.9,
+        "release": 0.2,
+        "peak": 1.0
+      },
+      "env_knots": [[0.0, 0.0], [0.02, 1.0], [0.1, 0.9], [0.8, 0.9], [1.0, 0.0]],
+      "loop_start": 0.1,
+      "loop_end": 0.9,
+      "loop_enabled": false,
+      "muted": false,
+      "color": [140, 200, 140],
+      "pre_delay": 0.0,
+      "manifold_type": "harmonic",
+      "harmonic_count": 10,
+      "harmonic_brightness": 0.55,
+      "harmonic_warp_strength": 0.08,
+      "voice_role": "body",
+      "seq_role": "root",
+      "register": "mid",
+      "emission_mode": "single",
+      "granular": null
+    },
+    {
+      "key": "stabbody",
+      "label": "Stab Body",
+      "freq_hz": 220.0,
+      "semitone_offset": 0.0,
+      "note_tracking": "note",
+      "amplitude": 0.65,
+      "phase_origin": 0.0,
+      "chirp": {
+        "f_delta_start": 0.0,
+        "f_delta_end": 0.0,
+        "chirp_type": "none",
+        "tau": 0.5,
+        "chirp_power": 1.0
+      },
+      "fm": null,
+      "am": null,
+      "env_type": "adsr",
+      "adsr": {
+        "attack": 0.01,
+        "decay": 0.06,
+        "sustain": 0.45,
+        "release": 0.12,
+        "peak": 1.0
+      },
+      "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.1, 0.5], [0.45, 0.4], [1.0, 0.0]],
+      "loop_start": 0.1,
+      "loop_end": 0.9,
+      "loop_enabled": false,
+      "muted": false,
+      "color": [210, 120, 180],
+      "pre_delay": 0.0,
+      "manifold_type": "harmonic",
+      "harmonic_count": 9,
+      "harmonic_brightness": 0.75,
+      "harmonic_warp_strength": 0.18,
+      "voice_role": "body",
+      "seq_role": "stab",
+      "register": "mid",
+      "emission_mode": "single",
+      "granular": null
+    },
+    {
+      "key": "stabairx",
+      "label": "Stab Air",
+      "freq_hz": 440.0,
+      "semitone_offset": 12.0,
+      "note_tracking": "note",
+      "amplitude": 0.32,
+      "phase_origin": 0.0,
+      "chirp": {
+        "f_delta_start": 0.0,
+        "f_delta_end": 0.0,
+        "chirp_type": "none",
+        "tau": 0.5,
+        "chirp_power": 1.0
+      },
+      "fm": null,
+      "am": null,
+      "env_type": "adsr",
+      "adsr": {
+        "attack": 0.004,
+        "decay": 0.04,
+        "sustain": 0.18,
+        "release": 0.08,
+        "peak": 1.0
+      },
+      "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.06, 0.25], [0.2, 0.08], [1.0, 0.0]],
+      "loop_start": 0.1,
+      "loop_end": 0.9,
+      "loop_enabled": false,
+      "muted": false,
+      "color": [245, 210, 110],
+      "pre_delay": 0.0,
+      "manifold_type": "pure",
+      "harmonic_count": 8,
+      "harmonic_brightness": 1.0,
+      "harmonic_warp_strength": 0.0,
+      "voice_role": "air",
+      "seq_role": "stab",
+      "register": "high",
+      "emission_mode": "single",
+      "granular": null
+    },
+    {
+      "key": "leadbody",
+      "label": "Lead Body",
+      "freq_hz": 330.0,
+      "semitone_offset": 0.0,
+      "note_tracking": "note",
+      "amplitude": 0.5,
+      "phase_origin": 0.0,
+      "chirp": {
+        "f_delta_start": 0.0,
+        "f_delta_end": 0.0,
+        "chirp_type": "none",
+        "tau": 0.5,
+        "chirp_power": 1.0
+      },
+      "fm": null,
+      "am": null,
+      "env_type": "adsr",
+      "adsr": {
+        "attack": 0.01,
+        "decay": 0.08,
+        "sustain": 0.6,
+        "release": 0.14,
+        "peak": 1.0
+      },
+      "env_knots": [[0.0, 0.0], [0.02, 1.0], [0.12, 0.7], [0.72, 0.6], [1.0, 0.0]],
+      "loop_start": 0.1,
+      "loop_end": 0.9,
+      "loop_enabled": false,
+      "muted": false,
+      "color": [120, 220, 170],
+      "pre_delay": 0.0,
+      "manifold_type": "harmonic",
+      "harmonic_count": 11,
+      "harmonic_brightness": 0.68,
+      "harmonic_warp_strength": 0.12,
+      "voice_role": "body",
       "seq_role": "melody",
+      "register": "high",
+      "emission_mode": "single",
+      "granular": null
+    },
+    {
+      "key": "leadairx",
+      "label": "Lead Air",
+      "freq_hz": 660.0,
+      "semitone_offset": 12.0,
+      "note_tracking": "note",
+      "amplitude": 0.22,
+      "phase_origin": 0.0,
+      "chirp": {
+        "f_delta_start": 0.0,
+        "f_delta_end": 0.0,
+        "chirp_type": "none",
+        "tau": 0.5,
+        "chirp_power": 1.0
+      },
+      "fm": null,
+      "am": null,
+      "env_type": "adsr",
+      "adsr": {
+        "attack": 0.003,
+        "decay": 0.03,
+        "sustain": 0.15,
+        "release": 0.06,
+        "peak": 1.0
+      },
+      "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.05, 0.2], [0.18, 0.06], [1.0, 0.0]],
+      "loop_start": 0.1,
+      "loop_end": 0.9,
+      "loop_enabled": false,
+      "muted": false,
+      "color": [255, 235, 160],
+      "pre_delay": 0.0,
+      "manifold_type": "pure",
+      "harmonic_count": 8,
+      "harmonic_brightness": 1.0,
+      "harmonic_warp_strength": 0.0,
+      "voice_role": "air",
+      "seq_role": "melody",
+      "register": "high",
       "emission_mode": "single",
       "granular": null
     }
   ],
   "lfos": [],
-  "modules": [
-    {
-      "key": "76aa1fa4",
-      "label": "Mod1",
-      "module_type": "pitch_quantizer",
-      "muted": false,
-      "color": [
-        200,
-        140,
-        220
-      ],
-      "rate_hz": 1.0,
-      "shape": "Sine",
-      "phase_offset": 0.0,
-      "depth": 1.0,
-      "quantizer_scale_degrees": [],
-      "interpolation_mode": "discrete",
-      "portamento_time": 0.05,
-      "slew_rate": 100.0,
-      "slew2_accel": 200.0,
-      "spline_tension": 0.5
-    }
-  ],
+  "modules": [],
   "controls": [],
   "mixers": [
     {
       "key": "__mix__",
       "label": "Mix",
       "projection_active": true,
-      "color": [
-        200,
-        200,
-        100,
-        255
-      ],
-      "export_to_file": true,
+      "color": [200, 200, 100, 255],
+      "export_to_file": false,
       "export_sample_rate": 48000,
-      "export_bit_depth": 16
+      "export_bit_depth": 24
     }
   ],
   "param_nodes": [],
   "duration": 2.0,
-  "tuning": {
-    "root_hz": 261.626,
-    "temperament": "custom",
-    "custom_cents": [
-      0.0,
-      90.225,
-      193.157,
-      294.135,
-      386.314,
-      498.045,
-      590.224,
-      696.578,
-      792.18,
-      889.735,
-      996.09,
-      1082.892
-    ],
-    "scale_degrees": [
-      0,
-      1,
-      2,
-      3,
-      4,
-      5,
-      6,
-      7,
-      8,
-      9,
-      10,
-      11
-    ],
-    "scale_name": "chromatic",
-    "preset_name": "well_tempered_c"
-  },
-  "preview_sr": 192000,
-  "seq_scale": "octatonic_wh",
-  "seq_bpm": 85.68181818181819,
-  "seq_pattern_idx": 5,
-  "seq_legato": 1.0,
-  "seq_portamento_s": 2.0,
+  "preview_sr": 48000,
+  "seq_scale": "pentatonic_minor",
+  "seq_bpm": 108.0,
+  "seq_pattern_idx": 1,
+  "seq_legato": 0.82,
+  "seq_portamento_s": 0.04,
   "seq_octave_span": 3,
-  "seq_tonic_hz": 206.7168399194968,
+  "seq_tonic_hz": 110.0,
   "seq_bass_octave": -1,
   "seq_root_octave": -2,
-  "seq_stab_octave": 1,
-  "seq_chord_prog": "i_VII_VI_V",
-  "seq_repeats": 16,
+  "seq_stab_octave": 0,
+  "seq_chord_prog": "I_IV_V_I",
+  "seq_repeats": 2,
   "seq_custom_semitones": "",
   "projection_mode": "mono",
   "projection_rotation_hz": 0.0,
   "normalize_output": true,
   "routing": {
     "nodes": [
-      "3d5fee7a",
-      "4a5a2743",
-      "__mix__",
-      "__patch_tonic__",
-      "__patch_seq__",
-      "76aa1fa4"
+      "bassbody",
+      "basstrns",
+      "rootpedl",
+      "stabbody",
+      "stabairx",
+      "leadbody",
+      "leadairx",
+      "__mix__"
     ],
     "edges": [
-      {
-        "src": "3d5fee7a",
-        "dst": "__mix__",
-        "w": 1.0,
-        "angle": 0.0,
-        "delay": 0.0
-      },
-      {
-        "src": "4a5a2743",
-        "dst": "__mix__",
-        "w": 0.25,
-        "angle": 0.0,
-        "delay": 0.0
-      },
-      {
-        "src": "3d5fee7a",
-        "dst": "4a5a2743",
-        "w": 1.0,
-        "angle": 0.0,
-        "delay": 0.0
-      },
-      {
-        "src": "__mix__",
-        "dst": "3d5fee7a",
-        "w": 0.3333333333,
-        "angle": 0.5235987756,
-        "delay": 0.521
-      },
-      {
-        "src": "4a5a2743",
-        "dst": "3d5fee7a",
-        "w": 0.75,
-        "angle": 0.0,
-        "delay": -0.156
-      },
-      {
-        "src": "__patch_seq__",
-        "dst": "76aa1fa4",
-        "w": 1.4166666667,
-        "angle": 0.0,
-        "delay": 0.0
-      },
-      {
-        "src": "76aa1fa4",
-        "dst": "3d5fee7a",
-        "w": 1.0,
-        "angle": 0.0,
-        "delay": 0.0
-      },
-      {
-        "src": "76aa1fa4",
-        "dst": "4a5a2743",
-        "w": 1.0,
-        "angle": 0.0,
-        "delay": 0.0
-      }
+      {"src": "bassbody", "dst": "__mix__", "w": 1.0, "angle": 0.0, "delay": 0.0},
+      {"src": "basstrns", "dst": "__mix__", "w": 0.9, "angle": 0.0, "delay": 0.0},
+      {"src": "rootpedl", "dst": "__mix__", "w": 0.75, "angle": 0.0, "delay": 0.0},
+      {"src": "stabbody", "dst": "__mix__", "w": 0.8, "angle": 0.0, "delay": 0.0},
+      {"src": "stabairx", "dst": "__mix__", "w": 0.65, "angle": 0.0, "delay": 0.0},
+      {"src": "leadbody", "dst": "__mix__", "w": 0.82, "angle": 0.0, "delay": 0.0},
+      {"src": "leadairx", "dst": "__mix__", "w": 0.6, "angle": 0.0, "delay": 0.0}
     ],
     "param_edges": [],
     "feedback": {
-      "enabled": true,
+      "enabled": false,
       "delay_s": 0.0,
       "decay": 0.0,
-      "max_iterations": 8,
+      "max_iterations": 1000,
       "ringdown_mode": "decay_to_silence",
       "ringdown_max_s": 4.0,
       "ringdown_threshold": 0.0001
@@ -319,92 +374,179 @@
   "rhythm_division": 16,
   "rhythm_patterns": [
     {
-      "name": "Pat 1",
-      "steps": [
-        true,
-        false,
-        false,
-        false,
-        true,
-        false,
-        false,
-        false,
-        false,
-        false,
-        true,
-        false,
-        false,
-        false,
-        true,
-        false
-      ],
-      "vel": [
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0
-      ]
+      "name": "All Pulse",
+      "steps": [true, false, false, false, true, false, false, false, true, false, false, false, true, false, false, false],
+      "vel": [1.0, 1.0, 1.0, 1.0, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.95, 1.0, 1.0, 1.0],
+      "art": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    {
+      "name": "All Sync",
+      "steps": [true, false, false, true, false, false, true, false, false, false, true, false, false, true, false, false],
+      "vel": [1.0, 1.0, 1.0, 0.85, 1.0, 1.0, 0.92, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.88, 1.0, 1.0],
+      "art": [0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
     }
   ],
-  "rhythm_phrase": [
-    0
-  ],
+  "rhythm_phrase": [0, 1],
   "rhythm_active_pat": 0,
-  "rhythm_swing": 0.25125000000000003,
-  "rhythm_pocket": -0.3446969696969697,
-  "rhythm_gate": 0.5,
-  "rhythm_prog_bars": 1,
+  "rhythm_swing": 0.0,
+  "rhythm_pocket": 0.0,
+  "rhythm_gate": 0.62,
+  "rhythm_prog_bars": 2,
   "rhythm_fit_mode": "drop",
+  "rhythm_pages": {
+    "bass": {
+      "rhythm_enabled": true,
+      "rhythm_division": 16,
+      "rhythm_patterns": [
+        {
+          "name": "Bass Body",
+          "steps": [true, false, false, false, false, false, true, false, true, false, false, false, false, false, true, false],
+          "vel": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.82, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 1.0],
+          "art": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        }
+      ],
+      "rhythm_phrase": [0, 0],
+      "rhythm_active_pat": 0,
+      "rhythm_swing": 0.0,
+      "rhythm_pocket": -0.01,
+      "rhythm_gate": 0.75,
+      "rhythm_prog_bars": 2,
+      "rhythm_fit_mode": "drop",
+      "phrase_arcs": [],
+      "module_pats": {}
+    },
+    "bass+transient": {
+      "rhythm_enabled": true,
+      "rhythm_division": 16,
+      "rhythm_patterns": [
+        {
+          "name": "Bass Attack",
+          "steps": [true, false, false, false, false, false, true, false, false, false, false, false, false, false, true, false],
+          "vel": [1.4, 1.0, 1.0, 1.0, 1.0, 1.0, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.25, 1.0],
+          "art": [1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0]
+        }
+      ],
+      "rhythm_phrase": [0, 0],
+      "rhythm_active_pat": 0,
+      "rhythm_swing": 0.0,
+      "rhythm_pocket": -0.015,
+      "rhythm_gate": 0.22,
+      "rhythm_prog_bars": 2,
+      "rhythm_fit_mode": "drop",
+      "phrase_arcs": [],
+      "module_pats": {}
+    },
+    "mid": {
+      "rhythm_enabled": true,
+      "rhythm_division": 16,
+      "rhythm_patterns": [
+        {
+          "name": "Mid Stabs",
+          "steps": [false, false, true, false, false, false, false, false, false, false, true, false, false, false, false, false],
+          "vel": [1.0, 1.0, 0.95, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+          "art": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        }
+      ],
+      "rhythm_phrase": [0, 0],
+      "rhythm_active_pat": 0,
+      "rhythm_swing": 0.03,
+      "rhythm_pocket": 0.01,
+      "rhythm_gate": 0.48,
+      "rhythm_prog_bars": 2,
+      "rhythm_fit_mode": "drop",
+      "phrase_arcs": [],
+      "module_pats": {}
+    },
+    "high": {
+      "rhythm_enabled": true,
+      "rhythm_division": 16,
+      "rhythm_patterns": [
+        {
+          "name": "High Lead",
+          "steps": [false, true, false, false, false, true, false, false, false, true, false, false, false, true, false, false],
+          "vel": [1.0, 0.75, 1.0, 1.0, 1.0, 0.85, 1.0, 1.0, 1.0, 0.8, 1.0, 1.0, 1.0, 0.92, 1.0, 1.0],
+          "art": [0, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0]
+        }
+      ],
+      "rhythm_phrase": [0, 0],
+      "rhythm_active_pat": 0,
+      "rhythm_swing": 0.04,
+      "rhythm_pocket": 0.015,
+      "rhythm_gate": 0.44,
+      "rhythm_prog_bars": 2,
+      "rhythm_fit_mode": "drop",
+      "phrase_arcs": [],
+      "module_pats": {}
+    },
+    "high+air": {
+      "rhythm_enabled": true,
+      "rhythm_division": 16,
+      "rhythm_patterns": [
+        {
+          "name": "High Air Overlay",
+          "steps": [false, false, false, true, false, false, false, true, false, false, false, true, false, false, false, true],
+          "vel": [1.0, 1.0, 1.0, 0.68, 1.0, 1.0, 1.0, 0.72, 1.0, 1.0, 1.0, 0.7, 1.0, 1.0, 1.0, 0.8],
+          "art": [0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 1, 0, 0, 0, 2]
+        }
+      ],
+      "rhythm_phrase": [0, 0],
+      "rhythm_active_pat": 0,
+      "rhythm_swing": 0.05,
+      "rhythm_pocket": 0.02,
+      "rhythm_gate": 0.22,
+      "rhythm_prog_bars": 2,
+      "rhythm_fit_mode": "drop",
+      "phrase_arcs": [],
+      "module_pats": {}
+    }
+  },
   "seq_probabilities": {
-    "double_back": 0.22727272727272727,
-    "subversion": 0.20075757575757575,
-    "chromatic": 0.2159090909090909,
-    "modal": 0.38257575757575757
+    "double_back": 0.0,
+    "subversion": 0.0,
+    "chromatic": 0.0,
+    "modal": 0.0
   },
   "dynamics_program": {
     "enabled": true,
     "curve": {
-      "shape": "swell",
+      "shape": "flat",
       "scope_bars": 1.0,
-      "intensity": 0.5
+      "intensity": 0.2
     },
     "accent": {
-      "name": "Dyn",
-      "levels": [
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0,
-        1.0
-      ]
+      "name": "All Dyn",
+      "levels": [1.2, 1.0, 1.0, 1.0, 1.1, 1.0, 1.0, 1.0, 1.2, 1.0, 1.0, 1.0, 1.1, 1.0, 1.0, 1.0]
+    }
+  },
+  "dynamics_pages": {
+    "bass": {
+      "enabled": true,
+      "curve": {
+        "shape": "drop",
+        "scope_bars": 2.0,
+        "intensity": 0.35
+      },
+      "accent": {
+        "name": "Bass Dyn",
+        "levels": [1.5, 1.0, 1.0, 1.0, 0.9, 1.0, 1.25, 1.0, 1.4, 1.0, 1.0, 1.0, 0.9, 1.0, 1.2, 1.0]
+      }
+    },
+    "high+air": {
+      "enabled": true,
+      "curve": {
+        "shape": "crescendo",
+        "scope_bars": 2.0,
+        "intensity": 0.45
+      },
+      "accent": {
+        "name": "Air Dyn",
+        "levels": [1.0, 1.0, 1.0, 1.1, 1.0, 1.0, 1.0, 1.15, 1.0, 1.0, 1.0, 1.2, 1.0, 1.0, 1.0, 1.25]
+      }
     }
   },
   "improv_program": {
-    "enabled": true,
-    "prob_grace": 0.48863636363636365,
+    "enabled": false,
+    "prob_grace": 0.0,
     "prob_chirp": 0.0,
     "prob_echo": 0.0,
     "grace": {
@@ -428,25 +570,69 @@
       "vel_falloff": 0.7,
       "max_notes": 4
     },
-    "improv_steps": [
-      [
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        false,
-        true,
-        false,
-        false,
-        false,
-        true,
-        false
+    "improv_steps": [[]]
+  },
+  "improv_pages": {
+    "high": {
+      "enabled": true,
+      "prob_grace": 0.15,
+      "prob_chirp": 0.35,
+      "prob_echo": 0.0,
+      "grace": {
+        "mode": "chromatic",
+        "position": "pre",
+        "duration_frac": 0.08,
+        "trim_main": true,
+        "vel_scale": 0.6,
+        "direction": 0
+      },
+      "chirp": {
+        "steps": 3,
+        "shape": "up",
+        "mode": "chromatic",
+        "duration_frac": 0.18,
+        "vel_scale": 0.7
+      },
+      "echo": {
+        "lookback_bars": 1,
+        "duration_frac": 0.4,
+        "vel_falloff": 0.7,
+        "max_notes": 3
+      },
+      "improv_steps": [
+        [false, true, false, false, false, true, false, false, false, true, false, false, false, true, false, false]
       ]
-    ]
-  }
+    },
+    "high+air": {
+      "enabled": true,
+      "prob_grace": 0.1,
+      "prob_chirp": 0.0,
+      "prob_echo": 0.25,
+      "grace": {
+        "mode": "modal",
+        "position": "post",
+        "duration_frac": 0.07,
+        "trim_main": false,
+        "vel_scale": 0.55,
+        "direction": 1
+      },
+      "chirp": {
+        "steps": 4,
+        "shape": "bounce",
+        "mode": "chromatic",
+        "duration_frac": 0.2,
+        "vel_scale": 0.65
+      },
+      "echo": {
+        "lookback_bars": 1,
+        "duration_frac": 0.55,
+        "vel_falloff": 0.78,
+        "max_notes": 4
+      },
+      "improv_steps": [
+        [false, false, false, true, false, false, false, true, false, false, false, true, false, false, false, true]
+      ]
+    }
+  },
+  "rhythm_layer_mode": "union"
 }

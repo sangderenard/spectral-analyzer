@@ -1,0 +1,29 @@
+{
+  "instance_type": "dynamics_program",
+  "instance_id": "dynamics_random_jitter_v1",
+  "label": "Random Jitter",
+  "description": "Random per-note velocity variation at moderate intensity. Adds human feel by making every note slightly different. The accent pattern is uniform so randomness is the only source of variation.",
+  "tags": ["random", "humanize", "jitter", "velocity"],
+  "summary": {
+    "enabled": true,
+    "curve_shape": "random — per-note random multiplier",
+    "intensity": 0.4,
+    "accent_pattern": "uniform 1.0",
+    "use_cases": ["humanization", "organic feel", "anti-quantize texture"]
+  },
+  "engine_version": "score-0.1",
+  "created_at": "2026-04-19T00:00:00",
+  "payload": {
+    "enabled": true,
+    "curve": {
+      "shape": "random",
+      "scope_bars": 1.0,
+      "intensity": 0.4
+    },
+    "accent": {
+      "name": "Dyn",
+      "levels": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    }
+  }
+}

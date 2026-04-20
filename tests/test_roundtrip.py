@@ -375,7 +375,7 @@ class TestFilterbankRoundTrip:
         expected_phase = np.linspace(0.0, 0.3, 4, dtype=np.float64)
 
         def _boom(this, hop=None, hilbert_progress=None,
-                  band_result_cb=None, resume_state=None):
+                  band_result_cb=None, resume_state=None, **kwargs):
             if band_result_cb is not None:
                 band_result_cb(0, expected_mag, expected_phase, 1)
             raise RuntimeError("hilbert boom")
@@ -443,7 +443,7 @@ class TestFilterbankRoundTrip:
         orig_compute_envelopes = self.FB.compute_envelopes
 
         def _boom(this, hop=None, hilbert_progress=None,
-                  band_result_cb=None, resume_state=None):
+                  band_result_cb=None, resume_state=None, **kwargs):
             if band_result_cb is not None:
                 band_result_cb(
                     0,

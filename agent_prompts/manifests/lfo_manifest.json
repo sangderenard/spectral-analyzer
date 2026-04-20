@@ -1,0 +1,142 @@
+{
+  "instance_type": "lfo",
+  "class_name": "LFODefinition",
+  "description": "Low-frequency oscillator: rate, shape, depth, phase offset",
+  "field_count": 4,
+  "groups": {
+    "LFO": [
+      {
+        "name": "rate_hz",
+        "label": "Rate",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.01,
+        "high": 50.0,
+        "step": 0,
+        "unit": "Hz",
+        "choices": [],
+        "is_log": true,
+        "group": "LFO",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "phase_offset",
+        "label": "Phase offset",
+        "dtype": "float",
+        "default": 0.0,
+        "low": -3.141592653589793,
+        "high": 3.141592653589793,
+        "step": 0,
+        "unit": "rad",
+        "choices": [],
+        "is_log": false,
+        "group": "LFO",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "depth",
+        "label": "Depth",
+        "dtype": "float",
+        "default": 1.0,
+        "low": 0.0,
+        "high": 2.0,
+        "step": 0,
+        "unit": "",
+        "choices": [],
+        "is_log": false,
+        "group": "LFO",
+        "fmt": ".3f",
+        "visible_when": null
+      },
+      {
+        "name": "shape",
+        "label": "Shape",
+        "dtype": "choice",
+        "default": "Sine",
+        "low": 0,
+        "high": 3,
+        "step": 1,
+        "unit": "",
+        "choices": [
+          "Sine",
+          "Triangle",
+          "Sawtooth",
+          "Square"
+        ],
+        "is_log": false,
+        "group": "LFO",
+        "fmt": ".3g",
+        "visible_when": null
+      }
+    ]
+  },
+  "fields": [
+    {
+      "name": "rate_hz",
+      "label": "Rate",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.01,
+      "high": 50.0,
+      "step": 0,
+      "unit": "Hz",
+      "choices": [],
+      "is_log": true,
+      "group": "LFO",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "phase_offset",
+      "label": "Phase offset",
+      "dtype": "float",
+      "default": 0.0,
+      "low": -3.141592653589793,
+      "high": 3.141592653589793,
+      "step": 0,
+      "unit": "rad",
+      "choices": [],
+      "is_log": false,
+      "group": "LFO",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "depth",
+      "label": "Depth",
+      "dtype": "float",
+      "default": 1.0,
+      "low": 0.0,
+      "high": 2.0,
+      "step": 0,
+      "unit": "",
+      "choices": [],
+      "is_log": false,
+      "group": "LFO",
+      "fmt": ".3f",
+      "visible_when": null
+    },
+    {
+      "name": "shape",
+      "label": "Shape",
+      "dtype": "choice",
+      "default": "Sine",
+      "low": 0,
+      "high": 3,
+      "step": 1,
+      "unit": "",
+      "choices": [
+        "Sine",
+        "Triangle",
+        "Sawtooth",
+        "Square"
+      ],
+      "is_log": false,
+      "group": "LFO",
+      "fmt": ".3g",
+      "visible_when": null
+    }
+  ]
+}

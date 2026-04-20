@@ -1,0 +1,60 @@
+{
+  "instance_type": "voice",
+  "instance_id": "voice_harmonic_bright_lead_v1",
+  "label": "Harmonic Bright Lead",
+  "description": "Harmonic manifold lead with moderate brightness rolloff and a subtle upward linear chirp on attack. Sits in mid-to-high register. Good for melodic lines that need presence without being harsh.",
+  "tags": ["lead", "harmonic", "bright", "chirped", "melody"],
+  "summary": {
+    "role": "signal",
+    "seq_role": "melody",
+    "register": "all",
+    "character": ["bright", "harmonic", "present", "slightly chirped"],
+    "pitch_behavior": "linear upward chirp: +120Hz at onset, settling to 0Hz",
+    "spectral_behavior": "8 harmonics, brightness rolloff 1.5 (amp_k = 1/k^1.5)",
+    "envelope_behavior": "punchy attack (8ms), moderate release (100ms), 70% sustain"
+  },
+  "engine_version": "score-0.1",
+  "created_at": "2026-04-19T00:00:00",
+  "payload": {
+    "key": "preset01",
+    "label": "Harmonic Bright Lead",
+    "freq_hz": 440.0,
+    "semitone_offset": 0.0,
+    "note_tracking": "note",
+    "amplitude": 0.85,
+    "phase_origin": 0.0,
+    "chirp": {
+      "f_delta_start": 120.0,
+      "f_delta_end": 0.0,
+      "chirp_type": "linear",
+      "tau": 0.04,
+      "chirp_power": 1.0
+    },
+    "fm": null,
+    "am": null,
+    "env_type": "adsr",
+    "adsr": {
+      "attack": 0.008,
+      "decay": 0.06,
+      "sustain": 0.7,
+      "release": 0.1,
+      "peak": 1.0
+    },
+    "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.1, 0.75], [0.85, 0.75], [1.0, 0.0]],
+    "loop_start": 0.1,
+    "loop_end": 0.9,
+    "loop_enabled": false,
+    "muted": false,
+    "color": [255, 200, 80],
+    "pre_delay": 0.0,
+    "manifold_type": "harmonic",
+    "harmonic_count": 8,
+    "harmonic_brightness": 1.5,
+    "harmonic_warp_strength": 0.0,
+    "voice_role": "signal",
+    "seq_role": "melody",
+    "register": "all",
+    "emission_mode": "single",
+    "granular": null
+  }
+}

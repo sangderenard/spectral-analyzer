@@ -1,0 +1,60 @@
+{
+  "instance_type": "voice",
+  "instance_id": "voice_warped_harmonic_fx_v1",
+  "label": "Warped Harmonic FX",
+  "description": "Inharmonic spectral texture created by warping harmonic ratios away from integer multiples. Combined with a power-law chirp gives an evolving metallic or bell-like quality. Best used as an effect or color layer, not a melody carrier.",
+  "tags": ["fx", "inharmonic", "warped", "metallic", "texture", "color"],
+  "summary": {
+    "role": "signal",
+    "seq_role": "melody",
+    "register": "mid",
+    "character": ["metallic", "inharmonic", "bell-like", "evolving"],
+    "pitch_behavior": "power-law chirp: +200Hz onset, slow decay power 2.5",
+    "spectral_behavior": "harmonic_warp, 12 partials, moderate brightness, warp strength 0.6",
+    "envelope_behavior": "fast attack (5ms), long decay into medium sustain, slow release (150ms)"
+  },
+  "engine_version": "score-0.1",
+  "created_at": "2026-04-19T00:00:00",
+  "payload": {
+    "key": "preset05",
+    "label": "Warped Harmonic FX",
+    "freq_hz": 440.0,
+    "semitone_offset": 0.0,
+    "note_tracking": "note",
+    "amplitude": 0.8,
+    "phase_origin": 0.0,
+    "chirp": {
+      "f_delta_start": 200.0,
+      "f_delta_end": 0.0,
+      "chirp_type": "power",
+      "tau": 0.15,
+      "chirp_power": 2.5
+    },
+    "fm": null,
+    "am": null,
+    "env_type": "adsr",
+    "adsr": {
+      "attack": 0.005,
+      "decay": 0.12,
+      "sustain": 0.4,
+      "release": 0.15,
+      "peak": 1.0
+    },
+    "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.1, 0.75], [0.85, 0.75], [1.0, 0.0]],
+    "loop_start": 0.1,
+    "loop_end": 0.9,
+    "loop_enabled": false,
+    "muted": false,
+    "color": [200, 100, 255],
+    "pre_delay": 0.0,
+    "manifold_type": "harmonic_warp",
+    "harmonic_count": 12,
+    "harmonic_brightness": 1.3,
+    "harmonic_warp_strength": 0.6,
+    "voice_role": "signal",
+    "seq_role": "melody",
+    "register": "all",
+    "emission_mode": "single",
+    "granular": null
+  }
+}

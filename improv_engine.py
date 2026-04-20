@@ -425,6 +425,7 @@ def _make_echo(
     beat_s:   float,
     params:   EchoParams,
     rng:      _random.Random,
+    beats_per_bar: float = 4.0,
 ) -> List:
     """
     Replay a slice of *history* compressed into the tail of *ev*'s time slot.
@@ -438,7 +439,7 @@ def _make_echo(
     if not history:
         return []
 
-    bar_s        = beat_s * 4.0
+    bar_s        = beat_s * max(1e-6, beats_per_bar)
     window_start = ev.start_time - params.lookback_bars * bar_s
     candidates   = [h for h in history if h.start_time >= window_start]
     if not candidates:
@@ -488,6 +489,7 @@ def apply_improv(
     phrase:            List[int],
     cycle_bars:        int,
     rng:               Optional[_random.Random] = None,
+    beats_per_bar:     float = 4.0,
 ) -> List:
     """
     Evaluate improv ornaments for every eligible onset in *events*.
@@ -515,7 +517,7 @@ def apply_improv(
 
     _rng   = rng if rng is not None else _random.Random()
     div    = max(1, rhythm_division)
-    bar_s  = beat_s * 4.0
+    bar_s  = beat_s * max(1e-6, beats_per_bar)
     step_s = bar_s / div
     extra  = []
 
@@ -547,6 +549,7 @@ def apply_improv(
 
         # ── Echo ───────────────────────────────────────────────────────────
         if program.prob_echo > 0.0 and _rng.random() < program.prob_echo:
-            extra.extend(_make_echo(ev, history, beat_s, program.echo, _rng))
+            extra.extend(_make_echo(ev, history, beat_s, program.echo, _rng,
+                                    beats_per_bar=beats_per_bar))
 
     return extra

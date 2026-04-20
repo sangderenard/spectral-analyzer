@@ -2074,8 +2074,15 @@ def cqt(
     # pre-allocated memmap shards — no tensor is retained beyond the tile.
     if shards is not None:
         _shard_sink = shards["_sink"]
+        _C_acc = None
     else:
-        _shard_sink = None
+        # No shards: accumulate tiles in-memory, return (C_tensor, freqs_np)
+        _np_cdtype = np.complex64 if dtype == torch.float32 else np.complex128
+        _C_acc = np.zeros((n_bins, common_cols), dtype=_np_cdtype)
+
+        def _shard_sink(f0: int, f1: int, t0: int, t1: int,
+                        tile: np.ndarray) -> None:
+            _C_acc[f0:f1, t0:t1] = tile
 
     # ── Iterate down the octaves ──
     if _y_is_mmap:
@@ -2290,6 +2297,8 @@ def cqt(
                     )
 
     freqs_np = freqs.cpu().numpy()
+    if _C_acc is not None:
+        return torch.as_tensor(_C_acc, device=device), freqs
     return freqs_np, common_cols
 
 

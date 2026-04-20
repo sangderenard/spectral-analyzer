@@ -1,0 +1,60 @@
+{
+  "instance_type": "voice",
+  "instance_id": "voice_simple_sine_lead_v1",
+  "label": "Simple Sine Lead",
+  "description": "Pure sine wave melody lead. No harmonic content, no chirp, no modulation. The minimal starting point for any lead voice.",
+  "tags": ["lead", "pure", "sine", "melody", "starter"],
+  "summary": {
+    "role": "signal",
+    "seq_role": "melody",
+    "register": "all",
+    "character": ["pure", "clean", "simple"],
+    "pitch_behavior": "none — static frequency",
+    "spectral_behavior": "pure sine, no harmonics",
+    "envelope_behavior": "fast attack (5ms), moderate release (80ms), 75% sustain"
+  },
+  "engine_version": "score-0.1",
+  "created_at": "2026-04-19T00:00:00",
+  "payload": {
+    "key": "preset00",
+    "label": "Simple Sine Lead",
+    "freq_hz": 440.0,
+    "semitone_offset": 0.0,
+    "note_tracking": "note",
+    "amplitude": 1.0,
+    "phase_origin": 0.0,
+    "chirp": {
+      "f_delta_start": 0.0,
+      "f_delta_end": 0.0,
+      "chirp_type": "none",
+      "tau": 0.5,
+      "chirp_power": 1.0
+    },
+    "fm": null,
+    "am": null,
+    "env_type": "adsr",
+    "adsr": {
+      "attack": 0.005,
+      "decay": 0.04,
+      "sustain": 0.75,
+      "release": 0.08,
+      "peak": 1.0
+    },
+    "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.1, 0.75], [0.85, 0.75], [1.0, 0.0]],
+    "loop_start": 0.1,
+    "loop_end": 0.9,
+    "loop_enabled": false,
+    "muted": false,
+    "color": [100, 160, 255],
+    "pre_delay": 0.0,
+    "manifold_type": "pure",
+    "harmonic_count": 8,
+    "harmonic_brightness": 1.0,
+    "harmonic_warp_strength": 0.0,
+    "voice_role": "signal",
+    "seq_role": "melody",
+    "register": "all",
+    "emission_mode": "single",
+    "granular": null
+  }
+}

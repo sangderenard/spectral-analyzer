@@ -1,0 +1,60 @@
+{
+  "instance_type": "voice",
+  "instance_id": "voice_soft_body_bass_v1",
+  "label": "Soft Body Bass",
+  "description": "Low-register root-tracking bass voice with a warm harmonic stack and slow attack. Provides harmonic foundation. Designed to lock to the chord root rather than melody note.",
+  "tags": ["bass", "warm", "harmonic", "root", "body"],
+  "summary": {
+    "role": "body",
+    "seq_role": "bass",
+    "register": "bass",
+    "character": ["warm", "round", "soft", "foundational"],
+    "pitch_behavior": "none — static, root-tracking",
+    "spectral_behavior": "6 harmonics, warm rolloff (brightness 2.0 = strong upper decay)",
+    "envelope_behavior": "slow attack (30ms), long release (200ms), 80% sustain"
+  },
+  "engine_version": "score-0.1",
+  "created_at": "2026-04-19T00:00:00",
+  "payload": {
+    "key": "preset02",
+    "label": "Soft Body Bass",
+    "freq_hz": 110.0,
+    "semitone_offset": 0.0,
+    "note_tracking": "root",
+    "amplitude": 1.0,
+    "phase_origin": 0.0,
+    "chirp": {
+      "f_delta_start": 0.0,
+      "f_delta_end": 0.0,
+      "chirp_type": "none",
+      "tau": 0.5,
+      "chirp_power": 1.0
+    },
+    "fm": null,
+    "am": null,
+    "env_type": "adsr",
+    "adsr": {
+      "attack": 0.03,
+      "decay": 0.08,
+      "sustain": 0.8,
+      "release": 0.2,
+      "peak": 1.0
+    },
+    "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.1, 0.75], [0.85, 0.75], [1.0, 0.0]],
+    "loop_start": 0.1,
+    "loop_end": 0.9,
+    "loop_enabled": false,
+    "muted": false,
+    "color": [80, 120, 200],
+    "pre_delay": 0.0,
+    "manifold_type": "harmonic",
+    "harmonic_count": 6,
+    "harmonic_brightness": 2.0,
+    "harmonic_warp_strength": 0.0,
+    "voice_role": "body",
+    "seq_role": "bass",
+    "register": "bass",
+    "emission_mode": "single",
+    "granular": null
+  }
+}

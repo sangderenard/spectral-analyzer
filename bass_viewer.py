@@ -1783,73 +1783,22 @@ def _stft_engine_phase_vocoder(
     hop: int,
     stretch_rate: float,
 ) -> "torch.Tensor":
-    """Chunked torch IF phase vocoder.
+    """Shim: delegates to complex_phase_vocoder.time_stretch.
 
-    Interpolates the STFT spectrogram *Z* (n_bins, n_frames) along the time
-    axis at rate *stretch_rate*, tracking instantaneous frequency to maintain
-    phase coherence.  Returns a (n_bins, n_out_frames) complex64 tensor.
-
-    Memory budget: each chunk allocates ~7 × n_bins × K float32 tensors.
-    chunk_w is chosen so this stays under 512 MiB regardless of the
-    n_bins / n_frames trade-off.
+    For STFT bins, freqs[k] = k * sr / n_fft.  Passing freqs=arange(n_bins)
+    and sr=n_fft yields phi_adv[k] = 2π * k * hop / n_fft — identical to the
+    original formula — while all algorithm and OOM logic lives in the module.
     """
     import torch
+    import complex_phase_vocoder as _cpv
 
-    n_bins, n_frames = Z.shape
-    if n_frames <= 1:
-        return Z
-
-    stretch_rate = max(float(stretch_rate), 1e-9)
-    time_steps = torch.arange(
-        0.0, float(n_frames - 1), stretch_rate, dtype=torch.float32
-    )  # (n_steps,)
-    phi_adv = (
-        (2.0 * math.pi * hop / float(n_fft))
-        * torch.arange(n_bins, dtype=torch.float32)
-    )  # (n_bins,)
-
-    # Start greedy — try all frames at once.  On OOM, halve the chunk and
-    # retry; phase_acc is only committed on success so correctness is preserved.
-    chunk_w = len(time_steps)
-    out_parts: list[torch.Tensor] = []
-    phase_acc = torch.angle(Z[:, 0])  # (n_bins,) float32
-    start = 0
-
-    while start < len(time_steps):
-        end = min(start + chunk_w, len(time_steps))
-        try:
-            ts_c = time_steps[start:end]                                   # (K,)
-            i_c = ts_c.floor().long().clamp(max=n_frames - 2)             # (K,)
-            frac_c = ts_c - i_c.float()                                    # (K,)
-
-            C0 = Z[:, i_c]          # (n_bins, K) complex64
-            C1 = Z[:, i_c + 1]
-
-            mag_c = (1.0 - frac_c) * C0.abs() + frac_c * C1.abs()        # float32
-
-            dp = torch.angle(C1) - torch.angle(C0) - phi_adv.unsqueeze(1) # (n_bins, K)
-            dp = dp - 2.0 * math.pi * torch.round(dp / (2.0 * math.pi))
-
-            cum = torch.cumsum(phi_adv.unsqueeze(1) + dp, dim=1)           # (n_bins, K)
-            phase_block = phase_acc.unsqueeze(1) + cum                      # (n_bins, K)
-            chunk_out = torch.polar(mag_c, phase_block)                     # (n_bins, K) complex64
-            new_acc = phase_block[:, -1]
-
-            out_parts.append(chunk_out)
-            phase_acc = new_acc
-            start = end
-        except (RuntimeError, MemoryError) as _e:
-            if chunk_w <= 1:
-                raise
-            _is_oom = (isinstance(_e, MemoryError)
-                       or "out of memory" in str(_e).lower())
-            if not _is_oom:
-                raise
-            gc.collect()
-            chunk_w = max(1, chunk_w // 2)
-            # retry the same start position with a smaller chunk
-
-    return torch.cat(out_parts, dim=1)  # (n_bins, n_steps)
+    device = Z.device
+    Z_np = Z.cpu().numpy()  # (n_bins, n_frames) complex
+    n_bins = Z_np.shape[0]
+    # freqs=k, sr=n_fft → phi_adv = 2π·k·hop/n_fft (STFT bin definition)
+    freqs = np.arange(n_bins, dtype=np.float64)
+    out_np = _cpv.time_stretch(Z_np, freqs, hop, int(n_fft), float(stretch_rate))
+    return torch.as_tensor(out_np, device=device)
 
 
 def _phase_vocoder_stft(
@@ -1888,10 +1837,10 @@ def _phase_vocoder_stft(
 
     Z = _stft_engine_forward(xt, n_fft, hop, win_t)
     Z_pv = _stft_engine_phase_vocoder(Z, n_fft, hop, stretch_rate)
-    y_t = _stft_engine_inverse(
-        Z_pv, n_fft, hop, win_t,
-        length=None if Z_pv.shape[1] != Z.shape[1] else xt.shape[0],
-    )
+    # Pass the expected time-stretched length so torch.istft centre-trims
+    # correctly regardless of how many PV output frames were produced.
+    stretched_len = int(round(xt.shape[0] * time_scale))
+    y_t = _stft_engine_inverse(Z_pv, n_fft, hop, win_t, length=stretched_len)
 
     if abs(pitch_scale - 1.0) > 1e-6 and y_t.numel() > 1:
         out_len = max(1, int(round(int(y_t.shape[0]) / pitch_scale)))
@@ -3417,8 +3366,22 @@ class FilterBankDecomposition:
                             os.getcwd(),
                             f".tmp_fb_hilbert_band_{_bi:05d}_phase.npy",
                         )
-                    _mag_mode = "r+" if os.path.isfile(_mag_path) else "w+"
-                    _phi_mode = "r+" if os.path.isfile(_phi_path) else "w+"
+                    # Use "r+" only when the existing file has the exact shape+dtype
+                    # we need — stale files from previous runs with a different hop
+                    # size would silently give wrong-shaped memmaps otherwise.
+                    def _pick_mode(_path: str) -> str:
+                        if not os.path.isfile(_path):
+                            return "w+"
+                        try:
+                            _mm = np.lib.format.open_memmap(_path, mode="r")
+                            _ok = (_mm.shape == (_n_frames_b,)
+                                   and _mm.dtype == chunk_dt)
+                            del _mm
+                            return "r+" if _ok else "w+"
+                        except Exception:
+                            return "w+"
+                    _mag_mode = _pick_mode(_mag_path)
+                    _phi_mode = _pick_mode(_phi_path)
                     _mag_mm = np.lib.format.open_memmap(
                         _mag_path, mode=_mag_mode, dtype=chunk_dt, shape=(_n_frames_b,))
                     _phi_mm = np.lib.format.open_memmap(
@@ -4885,10 +4848,10 @@ class FilterBankDecomposition:
         center_hz = _infer_fb_center_hz_from_bands(self.bands)
         if center_hz is not None:
             meta["cafls_center_hz"] = float(center_hz)
-        # Keep native-precision subbands alive through envelope analysis, then
-        # write reduced sidecars only once the dependent analysis is finished.
-        mags, phases, hops = self.compute_envelopes(hop=envelope_hop)
+        # Write band npy shards BEFORE compute_envelopes, because compute_envelopes
+        # nulls subbands[i] as it processes each band to free RAM.
         meta["bands"] = self._write_band_npy_shards(fb_dir, sr, save_precision)
+        mags, phases, hops = self.compute_envelopes(hop=envelope_hop)
         import json
         with open(os.path.join(fb_dir, "filterbank_meta.json"), "w") as f:
             json.dump(meta, f, indent=2)
@@ -4968,6 +4931,51 @@ class FilterBankDecomposition:
             "progress_only": np.uint8(1),
         }
         self._save_npz_atomic(self._envelope_path(analysis_dir), data)
+
+    @staticmethod
+    def load_envelope_checkpoint(
+        analysis_dir: str,
+    ) -> dict[str, Any] | None:
+        """Load a checkpoint written by compute_and_save's band_result_cb.
+
+        Returns ``{"completed": [bool, ...], "mags": [array|None, ...],
+        "phases": [array|None, ...], "hops": [int, ...]}`` or *None*.
+        """
+        path = FilterBankDecomposition._envelope_path(analysis_dir)
+        if not os.path.isfile(path):
+            return None
+        with np.load(path) as d:
+            if "n_bands" not in d or "completed" not in d or "hops" not in d:
+                return None
+            n = int(d["n_bands"])
+            hops = d["hops"].tolist()
+            completed = [bool(x) for x in np.asarray(d["completed"]).tolist()]
+            if len(completed) != n or len(hops) != n:
+                return None
+            mags: list[Any] = []
+            phases: list[Any] = []
+            for i in range(n):
+                if f"mag_{i}" in d and f"phase_{i}" in d:
+                    mag_raw = np.asarray(d[f"mag_{i}"])
+                    scale = float(d["mag_scale"]) if "mag_scale" in d else 1.0
+                    mag_decoded = mag_raw.astype(np.float64) * scale
+                    phase_raw = np.asarray(d[f"phase_{i}"])
+                    phase_decoded = phase_raw.astype(np.float64)
+                    mags.append(mag_decoded)
+                    phases.append(phase_decoded)
+                else:
+                    # Try per-band stream shards
+                    loaded = FilterBankDecomposition.load_envelope_band_shard(
+                        analysis_dir, i)
+                    if loaded is not None:
+                        m, p, _ = loaded
+                        mags.append(np.asarray(m, dtype=np.float64))
+                        phases.append(np.asarray(p, dtype=np.float64))
+                    else:
+                        mags.append(None)
+                        phases.append(None)
+            return {"completed": completed, "mags": mags,
+                    "phases": phases, "hops": hops}
 
     @staticmethod
     def load_envelope_checkpoint_state(
@@ -6110,6 +6118,7 @@ class ScrollableSubpanelList:
             surf.blit(add_txt, (add_rect.x + add_rect.w // 2 - add_txt.get_width() // 2,
                                 add_rect.y + 3))
             self._add_confirm_rect = add_rect
+            self._add_button_rects[opt.key] = add_rect
         return footer_h
 
     def handle_click(self, lx: int, ly: int) -> str | None:

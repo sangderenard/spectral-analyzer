@@ -23,11 +23,17 @@ Dependencies
 from __future__ import annotations
 
 import argparse
+import copy
+import contextlib
+from fractions import Fraction
+import hashlib
+import io
 import json
 import math
 import os
 import random as _random
 import threading
+import traceback
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -43,6 +49,7 @@ from pygame.locals import (
     K_SPACE, K_ESCAPE, K_TAB, K_DELETE, K_s, K_o, K_n,
     K_LCTRL, K_RCTRL, K_z,
 )
+from pygame import KMOD_CTRL, KMOD_SHIFT
 from OpenGL.GL import (
     GL_BLEND, GL_CLAMP_TO_EDGE, GL_COLOR_BUFFER_BIT, GL_LINEAR,
     GL_LINE_LOOP, GL_LINE_STRIP, GL_LINES, GL_NEAREST, GL_ONE_MINUS_SRC_ALPHA,
@@ -58,6 +65,7 @@ from OpenGL.GL import (
 from plot_widget import PlotWidget, PlotSeries, PlotMarker
 from bass_viewer import (GlyphAtlas, Panel, PanelDock,
                          ScrollableSubpanelList, ModularSubpanelSpec, SubpanelAddOption)
+import complex_phase_vocoder as cpv
 
 try:
     from signal_generator_v2 import KnobSpec
@@ -160,6 +168,12 @@ except Exception:
     CHIRP_SHAPES = ["up", "down", "bounce", "random"]
     CHIRP_MODES  = ["chromatic", "modal"]
 
+from rhythm_tree import (
+    BeatNode, BeatTree, WarpCurve,
+    build_warp_curve, iter_leaf_events, iter_grouped_events,
+    GROUP_COLORS,
+)
+
 # ---------------------------------------------------------------------------
 # Sequence / demo UI presets
 # ---------------------------------------------------------------------------
@@ -180,6 +194,17 @@ _SEQ_PATTERN_PRESETS: list[tuple[str, list[int]]] = [
     ("skip",     [0, 4, 2, 6, 1, 5]),
 ]
 _SEQ_PATTERN_NAMES: list[str] = [n for n, _ in _SEQ_PATTERN_PRESETS]
+_SEQ_RUBATO_SHAPES: list[str] = ["off", "sine", "troughs", "slow_go", "go_slow"]
+_SEQ_RUBATO_SCOPES: list[str] = ["bar", "phrase"]
+_METER_IRRATIONAL_SNAPS: list[float] = sorted([
+    math.sqrt(2.0),
+    math.sqrt(3.0),
+    math.sqrt(5.0),
+    (1.0 + math.sqrt(5.0)) * 0.5,
+    math.e,
+    math.pi,
+    math.tau,
+])
 
 # Roman numeral → 0-based scale degree (try longest match first)
 _ROMAN_DEGREE: dict[str, int] = {
@@ -358,6 +383,10 @@ class AnalyticVoice:
     harmonic_warp_strength: float = 0.0  # stretches harmonic ratios; 0 = exact integer multiples
     voice_role:          str   = "signal"  # "signal" | "air" | "transient" | "body"
     seq_role:            str   = "melody"  # "melody" | "bass" | "root" | "stab"
+    register:            str   = "all"     # "all" | "bass" | "mid" | "high" — rhythm page routing
+    polyphony_count:     int   = 1         # how many simultaneous lines fit before another chair is needed
+    polyphony_mode:      str   = "sympathetic"  # "sympathetic" | "unsympathetic"
+    body_type:           str   = "direct"  # standard instrument body / resonator type tag
     emission_mode:       str   = "single"  # "single" | "granular"
     granular:            Any   = None      # GrainPopulationSpec when emission_mode=="granular"
 
@@ -402,6 +431,10 @@ class AnalyticVoice:
             "harmonic_warp_strength": self.harmonic_warp_strength,
             "voice_role": self.voice_role,
             "seq_role":   self.seq_role,
+            "register":   self.register,
+            "polyphony_count": self.polyphony_count,
+            "polyphony_mode":  self.polyphony_mode,
+            "body_type": self.body_type,
             "emission_mode": self.emission_mode,
             "granular": (self.granular.to_dict()
                          if self.granular is not None and hasattr(self.granular, "to_dict")
@@ -413,6 +446,8 @@ class AnalyticVoice:
         _ROLES    = ["signal", "air", "transient", "body"]
         _ENV      = ["adsr", "spline", "monotone", "linear"]
         _MANIFOLD = ["pure", "harmonic", "harmonic_warp"]
+        _POLY_MODES = ["sympathetic", "unsympathetic"]
+        _BODY_TYPES = ["direct", "string_plate", "reed_box", "brass_bell", "drum_shell", "pipe_column", "voice_body"]
         return [
             # Oscillator
             KnobSpec("freq_hz",       "Freq",       "float",  440.0, 1.0,    20000.0, 0, "Hz",  [], True,  "Oscillator", ".1f", "ConstantPhasePath"),
@@ -422,9 +457,16 @@ class AnalyticVoice:
             KnobSpec("amplitude",    "Amplitude",  "float",  1.0,   0.0,     4.0,     0, "",    [], False, "Oscillator", ".3f"),
             KnobSpec("phase_origin", "Phase",      "float",  0.0,  -math.pi, math.pi, 0, "rad", [], False, "Oscillator", ".3f", "ConstantPhasePath"),
             KnobSpec("pre_delay",    "Pre-delay",  "float",  0.0,   0.0,     2.0,     0, "s",   [], False, "Oscillator", ".3f"),
-            KnobSpec("voice_role",   "Role",       "choice", "signal", 0, 3, 1, "",   _ROLES, False, "Oscillator"),
+            KnobSpec("voice_role",   "Role",       "choice", "signal", 0, 3, 1, "",   _ROLES,    False, "Oscillator"),
             KnobSpec("seq_role",     "Arr. role",  "choice", "melody", 0, 3, 1, "",
                      ["melody", "bass", "root", "stab"], False, "Oscillator"),
+            KnobSpec("register",     "Register",   "choice", "all",    0, 3, 1, "",
+                     ["all", "bass", "mid", "high"],     False, "Oscillator"),
+            KnobSpec("polyphony_count", "Polyphony", "int", 1, 1, 16, 1, "", [], False, "Oscillator", ".0f"),
+            KnobSpec("polyphony_mode",  "Poly mode", "choice", "sympathetic", 0, 1, 1, "",
+                     _POLY_MODES, False, "Oscillator"),
+            KnobSpec("body_type",       "Body",       "choice", "direct", 0, max(0, len(_BODY_TYPES) - 1), 1, "",
+                     _BODY_TYPES, False, "Oscillator"),
             # Envelope
             KnobSpec("env_type",     "Env type",   "choice", "adsr", 0, 3,   1, "",   _ENV,   False, "Envelope",   ".0f", "", True),
             KnobSpec("adsr.attack",  "Attack",     "float",  0.005, 0.001, 2.0,  0, "s", [], True,  "Envelope", ".4f", "ADSREnvelope", False, ("env_type", "adsr")),
@@ -529,6 +571,16 @@ class AnalyticVoice:
         p.seq_role            = d.get("seq_role", "melody")
         if p.seq_role not in ("melody", "bass", "root", "stab"):
             p.seq_role = "melody"
+        p.register            = d.get("register", "all")
+        if p.register not in ("all", "bass", "mid", "high"):
+            p.register = "all"
+        p.polyphony_count     = max(1, min(16, int(d.get("polyphony_count", 1))))
+        p.polyphony_mode      = str(d.get("polyphony_mode", "sympathetic"))
+        if p.polyphony_mode not in ("sympathetic", "unsympathetic"):
+            p.polyphony_mode = "sympathetic"
+        p.body_type           = str(d.get("body_type", "direct"))
+        if p.body_type not in ("direct", "string_plate", "reed_box", "brass_bell", "drum_shell", "pipe_column", "voice_body"):
+            p.body_type = "direct"
         p.emission_mode       = d.get("emission_mode", "single")
         # L2 fix: validate enum-like string fields — silently fall back to the
         # default rather than loading a typo that would synthesize silence.
@@ -562,6 +614,192 @@ class AnalyticVoice:
         else:
             p.granular = None
         return p
+
+
+@dataclass
+class PerformerPlacement:
+    """One humanized performer instance derived from a chair assignment."""
+    key: str
+    label: str
+    chair_key: str
+    chair_index: int = 1
+    performer_index: int = 1
+    source_voice_keys: list = field(default_factory=list)
+    source_layer_keys: list = field(default_factory=list)
+    assigned_note_keys: list = field(default_factory=list)
+    body_type: str = "direct"
+    x: float = 0.0
+    y: float = 0.0
+    z: float = 1.1   # height above stage floor (meters); 1.1 = seated player reference
+    face_x: float = 0.0    # aperture normal X — instrument faces conductor at origin
+    face_y: float = -1.0   # aperture normal Y
+    face_z: float = 0.0    # aperture normal Z
+    radius: float = 0.0
+    angle_deg: float = 0.0
+    geometric_delay_ms: float = 0.0
+    humanization_ms: float = 0.0
+    phase_offset_rad: float = 0.0
+    gain_db: float = 0.0
+    pan: float = 0.0
+
+
+@dataclass
+class Chair:
+    """A chair section such as 1st chair / 2nd chair within one Part."""
+    key: str
+    label: str
+    part_key: str
+    chair_index: int = 1
+    specificity_rank: int = 0
+    source_voice_keys: list = field(default_factory=list)
+    source_layer_keys: list = field(default_factory=list)
+    performer_count: int = 1
+    performers: list = field(default_factory=list)  # list[PerformerPlacement]
+    solver_hints: dict = field(default_factory=dict)
+
+
+@dataclass
+class NoteTarget:
+    """The most holistic entity to which a NoteEvent is dispatched.
+
+    The dispatch chain (most → least coordinated):
+      "performer" — PerformerPlacement: knows position, delay, phase, gain, pan.
+                    Multiple performers create a spatially-spread ensemble sound.
+      "chair"     — Chair section: instrument-level grouping without per-seat
+                    placement (uses shared voice signal, no geometric transforms).
+      "voice"     — AnalyticVoice direct: no spatial context; raw synthesis only.
+
+    ``voices`` is always the resolved list of AnalyticVoice objects that will
+    actually synthesize audio regardless of the target_type chosen.
+    """
+    target_type: str              # "performer" | "chair" | "voice"
+    voices: list                  # list[AnalyticVoice]
+    performers: list              # list[PerformerPlacement]  — non-empty iff target_type=="performer"
+    chairs: list                  # list[Chair]               — non-empty iff target_type in ("performer","chair")
+    part: object                  # Part | None
+
+
+@dataclass
+class Part:
+    """A resolved orchestral part, derived from the arrangement solver."""
+    key: str                          # unique id, e.g. "bass-signal" or "high-melody"
+    label: str                        # display name
+    register: str                     # "bass" | "mid" | "high" | "all"
+    seq_role: str                     # "melody" | "bass" | "root" | "stab" | ""
+    voice_role: str                   # "signal" | "air" | "transient" | "body" | ""
+    voice_keys: list = field(default_factory=list)   # AnalyticVoice.key values
+    player_count: int = 1             # default one performer per part
+    # Solver-derived performance envelope hint (optional, can be empty dict)
+    solver_hints: dict = field(default_factory=dict)
+    chairs: list = field(default_factory=list)       # list[Chair]
+
+
+@dataclass
+class PlacementResonatorConfig:
+    """Patch-level placement-owned room/resonator defaults for deployed physics."""
+
+    enabled: bool = False
+    room_shape: str = "polygon"
+    scene_path: str = ""
+    room_radius: float = 3.4
+    room_height: float = 3.6
+    feedback_iterations: int = 1
+    feedback_gain: float = 0.16
+    passive_loss: float = 0.48
+    band_split_mode: str = "fir"
+    fir_taps: int = 65
+    high_cone_deg: float = 70.0
+    diffuse_strength: float = 0.42
+    air_db_per_m: float = 0.01
+    air_highband_db_per_m: float = 0.02
+    temperature_c: float = 20.0
+    humidity_rel: float = 0.5
+    deployed_module_key: str = ""
+    owner_module_type: str = "placement"
+    # Mic array preset key from mic_arrays registry.
+    # Empty string = legacy stereo pair (binaural_standard is the default when non-empty).
+    receiver_array_key: str = "binaural_standard"
+    # World-space receiver array center (meters, same coord space as room).
+    receiver_pos_x: float = 0.0
+    receiver_pos_y: float = 0.0
+    receiver_pos_z: float = 1.5
+    # Forward direction the array faces (normalized at use time).
+    receiver_fwd_x: float = 0.0
+    receiver_fwd_y: float = 1.0
+    receiver_fwd_z: float = 0.0
+    # Layout mode for performer packing.
+    # "auto" = register-based semicircle (existing behaviour).
+    # "stage" = dome-backed concert stage with proper orchestral section rows:
+    #   1st/2nd Violins front-left arc, Violas center, Cellos right, Basses rear-right,
+    #   Woodwinds center-rear, Brass right-rear, Percussion left-rear.
+    layout_mode: str = "auto"
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": bool(self.enabled),
+            "room_shape": str(self.room_shape),
+            "scene_path": str(self.scene_path),
+            "room_radius": float(self.room_radius),
+            "room_height": float(self.room_height),
+            "feedback_iterations": int(self.feedback_iterations),
+            "feedback_gain": float(self.feedback_gain),
+            "passive_loss": float(self.passive_loss),
+            "band_split_mode": str(self.band_split_mode),
+            "fir_taps": int(self.fir_taps),
+            "high_cone_deg": float(self.high_cone_deg),
+            "diffuse_strength": float(self.diffuse_strength),
+            "air_db_per_m": float(self.air_db_per_m),
+            "air_highband_db_per_m": float(self.air_highband_db_per_m),
+            "temperature_c": float(self.temperature_c),
+            "humidity_rel": float(self.humidity_rel),
+            "deployed_module_key": str(self.deployed_module_key),
+            "owner_module_type": str(self.owner_module_type),
+            "receiver_array_key": str(self.receiver_array_key),
+            "receiver_pos_x": float(self.receiver_pos_x),
+            "receiver_pos_y": float(self.receiver_pos_y),
+            "receiver_pos_z": float(self.receiver_pos_z),
+            "receiver_fwd_x": float(self.receiver_fwd_x),
+            "receiver_fwd_y": float(self.receiver_fwd_y),
+            "receiver_fwd_z": float(self.receiver_fwd_z),
+            "layout_mode": str(self.layout_mode),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PlacementResonatorConfig":
+        cfg = cls()
+        cfg.enabled = bool(d.get("enabled", True))
+        cfg.room_shape = str(d.get("room_shape", "polygon"))
+        if cfg.room_shape not in ("polygon", "circular", "obj_mesh"):
+            cfg.room_shape = "polygon"
+        cfg.scene_path = str(d.get("scene_path", ""))
+        cfg.room_radius = max(1.0, float(d.get("room_radius", 3.4)))
+        cfg.room_height = max(1.5, float(d.get("room_height", 3.6)))
+        cfg.feedback_iterations = max(0, int(d.get("feedback_iterations", 1)))
+        cfg.feedback_gain = max(0.0, float(d.get("feedback_gain", 0.16)))
+        cfg.passive_loss = max(0.0, min(0.98, float(d.get("passive_loss", 0.48))))
+        cfg.band_split_mode = str(d.get("band_split_mode", "fir"))
+        if cfg.band_split_mode not in ("fir", "fft"):
+            cfg.band_split_mode = "fir"
+        cfg.fir_taps = max(5, int(d.get("fir_taps", 65)) | 1)
+        cfg.high_cone_deg = max(5.0, min(180.0, float(d.get("high_cone_deg", 70.0))))
+        cfg.diffuse_strength = max(0.0, float(d.get("diffuse_strength", 0.42)))
+        cfg.air_db_per_m = max(0.0, float(d.get("air_db_per_m", 0.01)))
+        cfg.air_highband_db_per_m = max(0.0, float(d.get("air_highband_db_per_m", 0.02)))
+        cfg.temperature_c = float(d.get("temperature_c", 20.0))
+        cfg.humidity_rel = max(0.0, min(1.0, float(d.get("humidity_rel", 0.5))))
+        cfg.deployed_module_key = str(d.get("deployed_module_key", ""))
+        cfg.owner_module_type = str(d.get("owner_module_type", "placement") or "placement")
+        cfg.receiver_array_key = str(d.get("receiver_array_key", "binaural_standard"))
+        cfg.receiver_pos_x = float(d.get("receiver_pos_x", 0.0))
+        cfg.receiver_pos_y = float(d.get("receiver_pos_y", 0.0))
+        cfg.receiver_pos_z = float(d.get("receiver_pos_z", 1.5))
+        cfg.receiver_fwd_x = float(d.get("receiver_fwd_x", 0.0))
+        cfg.receiver_fwd_y = float(d.get("receiver_fwd_y", 1.0))
+        cfg.receiver_fwd_z = float(d.get("receiver_fwd_z", 0.0))
+        cfg.layout_mode = str(d.get("layout_mode", "auto"))
+        if cfg.layout_mode not in ("auto", "stage"):
+            cfg.layout_mode = "auto"
+        return cfg
 
 
 @dataclass
@@ -1125,6 +1363,25 @@ class QuantizerHandle:
             octave += 1
         return dpo * octave + float(nearest)
 
+    def _quantize_st_array(self, semitones: np.ndarray) -> np.ndarray:
+        arr = np.asarray(semitones, dtype=np.float64)
+        dpo = float(self._tuning.divisions_per_octave)
+        degrees = np.asarray(self._scale_degrees, dtype=np.float64)
+        if arr.size == 0:
+            return arr.copy()
+        octave = np.floor(arr / dpo)
+        pc = arr - dpo * octave
+        deltas = np.abs(pc[:, None] - degrees[None, :])
+        nearest_idx = np.argmin(deltas, axis=1)
+        nearest = degrees[nearest_idx]
+        wrap_delta = np.abs((degrees[0] + dpo) - pc)
+        wrap_mask = wrap_delta < np.abs(nearest - pc)
+        nearest = nearest.copy()
+        nearest[wrap_mask] = degrees[0]
+        octave = octave.copy()
+        octave[wrap_mask] += 1.0
+        return dpo * octave + nearest
+
     def _to_st(self, value: float, domain: str) -> float:
         if domain == "hz":
             if value <= 0.0:
@@ -1132,10 +1389,26 @@ class QuantizerHandle:
             return 12.0 * math.log2(value / self._tuning.root_hz)
         return float(value)
 
+    def _to_st_array(self, values: np.ndarray, domain: str) -> np.ndarray:
+        arr = np.asarray(values, dtype=np.float64)
+        if domain != "hz":
+            return arr.copy()
+        out = np.zeros_like(arr)
+        pos = arr > 0.0
+        if np.any(pos):
+            out[pos] = 12.0 * np.log2(arr[pos] / self._tuning.root_hz)
+        return out
+
     def _from_st(self, st: float, domain: str) -> float:
         if domain == "hz":
             return self._tuning.semitone_to_hz(st)
         return st
+
+    def _from_st_array(self, st: np.ndarray, domain: str) -> np.ndarray:
+        arr = np.asarray(st, dtype=np.float64)
+        if domain != "hz":
+            return arr.copy()
+        return self._tuning.root_hz * np.power(2.0, arr / 12.0)
 
     # ── main entry point ──────────────────────────────────────────────────
     def __call__(
@@ -1228,6 +1501,33 @@ class QuantizerHandle:
         self._state["position"] = pos
         return self._from_st(pos, domain)
 
+    def process_series(
+        self,
+        values: np.ndarray,
+        original_values: "np.ndarray | None" = None,
+        domain: str = "semitone",
+        dt: float = 0.0,
+    ) -> np.ndarray:
+        """Quantize a full series, using vectorized math when possible."""
+        vals = np.asarray(values, dtype=np.float64)
+        orig = vals if original_values is None else np.asarray(original_values, dtype=np.float64)
+        if vals.shape != orig.shape:
+            raise ValueError("values and original_values must have the same shape")
+        if vals.ndim != 1:
+            raise ValueError("process_series expects a 1-D array")
+        if vals.size == 0:
+            return vals.copy()
+        if self._mode == "discrete" or dt <= 0.0:
+            value_st = self._to_st_array(vals, domain)
+            target_st = self._quantize_st_array(value_st)
+            self._state["target"] = float(target_st[-1])
+            self._state["position"] = float(target_st[-1])
+            return self._from_st_array(target_st, domain)
+        out = np.empty_like(vals, dtype=np.float64)
+        for i in range(vals.size):
+            out[i] = self(vals[i], orig[i], domain=domain, dt=dt)
+        return out
+
     def reset(self) -> None:
         """Clear all integrator state (call before a new note or patch reset)."""
         self._state["position"]    = None
@@ -1284,6 +1584,10 @@ class AnalyticMixer:
     export_to_file:     bool = False
     export_sample_rate: int  = 48000
     export_bit_depth:   int  = 24
+    # Signal layer this mixer operates at.  The only valid mixer layer is
+    # "master" — the single top-level mix bus that receives room SM mic
+    # streams and any instrument signals routed directly here.
+    mixer_layer: str = "master"
 
     def to_dict(self) -> dict:
         return {"key": self.key, "label": self.label,
@@ -1291,7 +1595,8 @@ class AnalyticMixer:
                 "color": self.color,
                 "export_to_file":     self.export_to_file,
                 "export_sample_rate": self.export_sample_rate,
-                "export_bit_depth":   self.export_bit_depth}
+                "export_bit_depth":   self.export_bit_depth,
+                "mixer_layer":        self.mixer_layer}
 
     @classmethod
     def knobs(cls) -> list["KnobSpec"]:
@@ -1310,8 +1615,76 @@ class AnalyticMixer:
         o.export_to_file     = bool(d.get("export_to_file",     False))
         o.export_sample_rate = int(d.get("export_sample_rate",  48000))
         o.export_bit_depth   = int(d.get("export_bit_depth",    24))
+        o.mixer_layer        = str(d.get("mixer_layer", "master"))
         return o
 
+
+@dataclass
+class SystemAudioDevice:
+    output_device_name: str = ""
+    output_channels:    int = 2
+    input_device_name:  str = ""
+    input_channels:     int = 0
+    export_to_file:     bool = True
+    export_sample_rate: int  = 48000
+    export_bit_depth:   int  = 24
+    # Transient runtime state
+    _reported_output_devices: list = field(default_factory=list)
+    _reported_input_devices:  list = field(default_factory=list)
+    _reported_output_name:    str  = ""
+    _reported_input_name:     str  = ""
+    _reported_output_hw_channels: int = 0
+    _reported_input_hw_channels:  int = 0
+    _reported_output_hw_rate: int = 0
+    _reported_input_hw_rate:  int = 0
+    _preview_backend:         str  = "pygame.mixer"
+    _preview_backend_channels:int  = 2
+    _input_buffers:           list = field(default_factory=list)  # list[np.ndarray]
+
+    def to_dict(self) -> dict:
+        return {
+            "output_device_name": self.output_device_name,
+            "output_channels":    self.output_channels,
+            "input_device_name":  self.input_device_name,
+            "input_channels":     self.input_channels,
+            "export_to_file":     self.export_to_file,
+            "export_sample_rate": self.export_sample_rate,
+            "export_bit_depth":   self.export_bit_depth,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SystemAudioDevice":
+        o = cls()
+        o.output_device_name = str(d.get("output_device_name", ""))
+        o.output_channels    = max(1, int(d.get("output_channels", 2)))
+        o.input_device_name  = str(d.get("input_device_name", ""))
+        o.input_channels     = max(0, int(d.get("input_channels", 0)))
+        o.export_to_file     = bool(d.get("export_to_file", True))
+        o.export_sample_rate = int(d.get("export_sample_rate", 48000))
+        o.export_bit_depth   = int(d.get("export_bit_depth", 24))
+        return o
+
+    @classmethod
+    def knobs(cls) -> list["KnobSpec"]:
+        return [
+            KnobSpec("output_channels",    "Output Ch.", "int",  2, 1, 16, 1, "", [], False, "Routing Device", ".0f"),
+            KnobSpec("input_channels",     "Input Ch.",  "int",  0, 0, 16, 1, "", [], False, "Routing Device", ".0f"),
+            KnobSpec("export_to_file",     "Render Main","bool", True, 0, 1, 0, "", [], False, "File Render"),
+            KnobSpec("export_sample_rate", "Render SR",  "int", 48000, 8000, 384000, 1, "Hz", [], False, "File Render", ".0f"),
+            KnobSpec("export_bit_depth",   "Render Bits","int", 24, 16, 32, 1, "", [], False, "File Render", ".0f"),
+        ]
+
+    def output_key(self, idx: int) -> str:
+        return f"__sys_out_{idx + 1}__"
+
+    def input_key(self, idx: int) -> str:
+        return f"__sys_in_{idx + 1}__"
+
+    def output_keys(self) -> list[str]:
+        return [self.output_key(i) for i in range(max(1, int(self.output_channels)))]
+
+    def input_keys(self) -> list[str]:
+        return [self.input_key(i) for i in range(max(0, int(self.input_channels)))]
 
 
 try:
@@ -1326,7 +1699,132 @@ except ImportError:
 from routing_engine import (RoutingEdge, FeedbackConfig, RoutingGraph,
                              ParamEdge, solve_routing_complex,
                              solve_routing_with_ringdown, estimate_ringdown_samples,
-                             compute_latency_compensation, solve_param_routing)
+                             compute_latency_compensation, solve_param_routing,
+                             _safe_inverse)
+from patch_to_driver import (build_driver_config,
+                              _resolve_f0, _build_harmonics, _build_env_knots,
+                              _CHIRP_CODE, CHIRP_NONE)
+from performer_engine import (init_driver_state, multi_level_driver_step,
+                               DriverConfig, DriverState, driver_synthesis_step)
+
+
+def _list_audio_devices(iscapture: bool) -> list[str]:
+    try:
+        if not pygame.get_init():
+            return []
+        from pygame._sdl2.audio import get_audio_device_names
+        return [str(x) for x in get_audio_device_names(bool(iscapture))]
+    except Exception:
+        return []
+
+
+def _probe_default_sounddevice(iscapture: bool, requested_channels: int,
+                               requested_rate: int = 48000) -> tuple[str, int, int]:
+    try:
+        import sounddevice as sd
+        devsel = sd.default.device
+        if isinstance(devsel, (list, tuple)):
+            dev_idx = int(devsel[0] if iscapture else devsel[1])
+        else:
+            dev_idx = int(devsel)
+        info = sd.query_devices(dev_idx)
+        name = str(info.get("name", ""))
+        max_ch_key = "max_input_channels" if iscapture else "max_output_channels"
+        channels = int(info.get(max_ch_key, 0))
+        rate = int(float(info.get("default_samplerate", requested_rate) or requested_rate))
+        return name, max(0, channels), max(0, rate)
+    except Exception:
+        return "", 0, 0
+
+
+def _probe_audio_device(name: str, iscapture: bool, requested_channels: int,
+                        requested_rate: int = 48000) -> tuple[str, int, int]:
+    if not str(name or "").strip():
+        return _probe_default_sounddevice(iscapture, requested_channels, requested_rate)
+    try:
+        if not pygame.get_init():
+            return "", 0, 0
+        from pygame._sdl2.audio import (
+            AudioDevice, AUDIO_F32, AUDIO_ALLOW_ANY_CHANGE,
+        )
+        names = _list_audio_devices(iscapture)
+        devname = str(name or "").strip()
+        if not devname:
+            if not names:
+                return "", 0, 0
+            devname = names[0]
+
+        def _probe_cb(_dev, mv):
+            if not iscapture:
+                try:
+                    mv[:] = b"\x00" * len(mv)
+                except Exception:
+                    pass
+
+        dev = AudioDevice(
+            devicename=devname,
+            iscapture=bool(iscapture),
+            frequency=max(8000, int(requested_rate)),
+            audioformat=AUDIO_F32,
+            numchannels=max(1, int(requested_channels)),
+            chunksize=512,
+            allowed_changes=AUDIO_ALLOW_ANY_CHANGE,
+            callback=_probe_cb,
+        )
+        actual = max(0, int(getattr(dev, "numchannels", 0)))
+        actual_rate = max(0, int(getattr(dev, "frequency", 0)))
+        actual_name = str(getattr(dev, "devicename", devname))
+        dev.close()
+        return actual_name, actual, actual_rate
+    except Exception:
+        return str(name or "").strip(), 0, 0
+
+
+def _refresh_system_audio_report(sysdev: "SystemAudioDevice") -> None:
+    sysdev._reported_output_devices = _list_audio_devices(False)
+    sysdev._reported_input_devices = _list_audio_devices(True)
+    out_name, out_ch, out_rate = _probe_audio_device(
+        sysdev.output_device_name, False,
+        max(1, sysdev.output_channels),
+        requested_rate=max(8000, int(sysdev.export_sample_rate)),
+    )
+    in_req = max(1, sysdev.input_channels) if sysdev.input_channels > 0 else 2
+    in_name, in_ch, in_rate = _probe_audio_device(
+        sysdev.input_device_name, True, in_req,
+        requested_rate=max(8000, int(sysdev.export_sample_rate)),
+    )
+    sysdev._reported_output_name = out_name
+    sysdev._reported_input_name = in_name
+    sysdev._reported_output_hw_channels = out_ch
+    sysdev._reported_input_hw_channels = in_ch
+    sysdev._reported_output_hw_rate = out_rate
+    sysdev._reported_input_hw_rate = in_rate
+
+
+def _prepare_output_bus_for_device(out_bus: np.ndarray, src_sr: int,
+                                   dst_sr: int, dst_channels: int) -> np.ndarray:
+    """Resample and channel-map a float bus for an SDL audio device."""
+    bus = np.asarray(out_bus, dtype=np.float32)
+    if bus.ndim == 1:
+        bus = bus[:, None]
+    if bus.shape[1] < 1:
+        bus = np.zeros((len(bus), 1), dtype=np.float32)
+    if dst_sr != src_sr:
+        cols = []
+        for ci in range(bus.shape[1]):
+            cols.append(_resample_audio(bus[:, ci], src_sr, dst_sr))
+        bus = np.column_stack(cols).astype(np.float32, copy=False)
+    dst_ch = max(1, int(dst_channels))
+    if bus.shape[1] < dst_ch:
+        if bus.shape[1] == 1:
+            bus = np.repeat(bus, dst_ch, axis=1)
+        else:
+            reps = (dst_ch + bus.shape[1] - 1) // bus.shape[1]
+            bus = np.tile(bus, (1, reps))[:, :dst_ch]
+    elif bus.shape[1] > dst_ch:
+        bus = bus[:, :dst_ch]
+    return np.clip(bus, -1.0, 1.0).astype(np.float32, copy=False)
+
 
 
 @dataclass
@@ -1658,8 +2156,28 @@ class AnalyticModule:
     iau_elevation_ch2:       float = 0.0
     iau_distance_ch2:        float = 0.0
     iau_width_ch2:           float = 0.0
+    # State machine parameters (meaningful when module_type == "state_machine")
+    sm_plugin:      str   = ""     # plugin filename stem (no path, no .py)
+    sm_n_items:     int   = 1      # number of physics items
+    sm_items:       list  = field(default_factory=list)  # item names from plugin
+    sm_vars:        list  = field(default_factory=list)  # output var names from plugin
+    sm_state_vars:  list  = field(default_factory=list)  # persisted scalar state vars from plugin
+    sm_params:      dict  = field(default_factory=dict)  # plugin parameter values
+    sm_use_torch:   bool  = False  # prefer torch tensors when available
+    # Signal layer this SM module operates at.  Determines where in the
+    # causal chain it sits:
+    #   "performer"  — receives driver outputs (keyed by item_slot), owns
+    #                  instrument states, emits per-instrument signals
+    #   "room"       — receives instrument outputs, emits mic stream(s)
+    # Empty string means unspecified (legacy / backward-compat).
+    signal_layer:   str   = ""
+    # Transient — not serialized
+    _sm_state:     dict  = field(default_factory=dict)  # {item: {var: scalar}}
+    _sm_out_cache: dict  = field(default_factory=dict)  # {node_key: complex128 array}
+    _sm_log_text:  str   = ""                           # captured plugin log/output
+    _sm_aux_state: dict  = field(default_factory=dict)  # plugin-owned transient caches/state
 
-    _MODULE_TYPES = ["lfo", "passthrough", "pitch_quantizer", "interaural"]
+    _MODULE_TYPES = ["lfo", "passthrough", "pitch_quantizer", "interaural", "state_machine"]
     _LFO_SHAPES   = ["Sine", "Triangle", "Sawtooth", "Square"]
     _INTERP_MODES = ["discrete", "portamento", "slew", "slew2", "spline", "legato"]
 
@@ -1718,6 +2236,13 @@ class AnalyticModule:
     def lfo_ch_key(self, i: int) -> str:
         return f"{self.key}_lfoch{i}"
 
+    def sm_out_key(self, item: str, var: str) -> str:
+        return f"{self.key}_sm_{item}_{var}"
+
+    def sm_out_keys(self) -> list:
+        return [self.sm_out_key(item, var)
+                for item in self.sm_items for var in self.sm_vars]
+
     @staticmethod
     def default_lfo_channel() -> dict:
         return {"scale": 0.0, "amplitude": 1.0, "rate_hz": 1.0,
@@ -1744,7 +2269,15 @@ class AnalyticModule:
                 "iau_azimuth_ch2":         self.iau_azimuth_ch2,
                 "iau_elevation_ch2":       self.iau_elevation_ch2,
                 "iau_distance_ch2":        self.iau_distance_ch2,
-                "iau_width_ch2":           self.iau_width_ch2}
+                "iau_width_ch2":           self.iau_width_ch2,
+                "sm_plugin":               self.sm_plugin,
+                "sm_n_items":              self.sm_n_items,
+                "sm_items":                list(self.sm_items),
+                "sm_vars":                 list(self.sm_vars),
+                "sm_state_vars":           list(self.sm_state_vars),
+                "sm_params":               dict(self.sm_params),
+                "sm_use_torch":            self.sm_use_torch,
+                "signal_layer":            self.signal_layer}
 
     @classmethod
     def from_dict(cls, d: dict) -> "AnalyticModule":
@@ -1777,6 +2310,29 @@ class AnalyticModule:
         o.iau_elevation_ch2  = float(d.get("iau_elevation_ch2",  0.0))
         o.iau_distance_ch2   = float(d.get("iau_distance_ch2",   0.0))
         o.iau_width_ch2      = float(d.get("iau_width_ch2",      0.0))
+        o.sm_plugin          = str(d.get("sm_plugin",    ""))
+        o.sm_n_items         = int(d.get("sm_n_items",   1))
+        o.sm_items           = list(d.get("sm_items",    []))
+        o.sm_vars            = list(d.get("sm_vars",     []))
+        o.sm_state_vars      = list(d.get("sm_state_vars", d.get("sm_vars", [])))
+        o.sm_params          = dict(d.get("sm_params",   {}))
+        o.sm_use_torch       = bool(d.get("sm_use_torch", False))
+        if o.module_type == "state_machine" and o.sm_plugin:
+            _plug = _load_sm_plugin(o.sm_plugin)
+            if _plug is not None:
+                if not o.sm_vars:
+                    o.sm_vars = _sm_plugin_output_vars(_plug)
+                if not o.sm_state_vars:
+                    o.sm_state_vars = _sm_plugin_state_vars(_plug)
+                if not o.sm_items:
+                    o.sm_items = _sm_plugin_item_names(_plug, o.sm_n_items)
+                _defs = _sm_plugin_default_params(_plug)
+                o.sm_params = {**_defs, **o.sm_params}
+        o._sm_state          = {}
+        o._sm_out_cache      = {}
+        o._sm_log_text       = ""
+        o._sm_aux_state      = {}
+        o.signal_layer       = str(d.get("signal_layer", ""))
         return o
 
 
@@ -1786,6 +2342,163 @@ def _module_param_attrs(module_type: str) -> list:
         k.name for k in AnalyticModule.knobs()
         if k.visible_when == ("module_type", module_type)
     ]
+
+
+def _knob_label_map(knobs: list) -> dict[str, str]:
+    return {k.name: k.label for k in knobs}
+
+
+def _routing_edge_attr_specs(patch: "AnalyticPatch") -> list[tuple[str, str]]:
+    """Return per-edge pseudo-attrs for routing-grid knobs with readable labels."""
+    specs: list[tuple[str, str]] = []
+    node_keys = _patch_node_keys(patch)
+    for src_key in node_keys:
+        src_lbl = _routing_node_label(src_key, patch)
+        for dst_key in node_keys:
+            dst_lbl = _routing_node_label(dst_key, patch)
+            specs.append((f"routing.mix::{src_key}::{dst_key}",
+                          f"Mix / {src_lbl} -> {dst_lbl}"))
+            specs.append((f"routing.angle::{src_key}::{dst_key}",
+                          f"Angle / {src_lbl} -> {dst_lbl}"))
+            specs.append((f"routing.delay::{src_key}::{dst_key}",
+                          f"Delay / {src_lbl} -> {dst_lbl}"))
+    return specs
+
+
+def _parse_routing_edge_attr(attr: str) -> "tuple[str, str, str] | None":
+    prefix, sep, rest = attr.partition("::")
+    if not sep or prefix not in {"routing.mix", "routing.angle", "routing.delay"}:
+        return None
+    src_key, sep2, dst_key = rest.partition("::")
+    if not sep2 or not src_key or not dst_key:
+        return None
+    kind = prefix.split(".", 1)[1]
+    return kind, src_key, dst_key
+
+
+def _param_target_node_specs(patch: "AnalyticPatch") -> list[tuple[str, str]]:
+    """Return selectable ParamNode target nodes with readable labels."""
+    specs: list[tuple[str, str]] = []
+    specs.extend((v.key, v.label) for v in patch.voices)
+    specs.extend((l.key, f"~ {l.label}") for l in patch.lfos)
+    for mod in patch.modules:
+        specs.append((mod.key, f"\u2B21 {mod.label}"))
+        if mod.module_type == "interaural":
+            specs.append((mod.ch1_key(), f"\u2B21 {mod.label} ch1"))
+            specs.append((mod.ch2_key(), f"\u2B21 {mod.label} ch2"))
+    for mix in patch.mixers:
+        specs.append((mix.key, f"\u2261 {mix.label}"))
+    return specs
+
+
+def _param_target_attr_specs(patch: "AnalyticPatch", node_key: str) -> list[tuple[str, str]]:
+    """Return (raw_attr, display_label) choices for a ParamNode target node."""
+    if not node_key:
+        return []
+    voice = next((v for v in patch.voices if v.key == node_key), None)
+    if voice is not None:
+        voice_labels = {
+            "freq_hz": "Frequency",
+            "amplitude": "Amplitude",
+            "semitone_offset": "Semitone Offset",
+            "chirp.f_delta_start": "Chirp Start",
+            "chirp.f_delta_end": "Chirp End",
+            "adsr.attack": "Attack",
+            "adsr.decay": "Decay",
+            "adsr.sustain": "Sustain",
+            "adsr.release": "Release",
+            "fm.depth_hz": "FM Depth Hz",
+            "fm.depth_amp": "FM Depth Amp",
+            "am.depth_hz": "AM Depth Hz",
+            "am.depth_amp": "AM Depth Amp",
+            "harmonic_brightness": "Harmonic Brightness",
+            "harmonic_warp_strength": "Harmonic Warp",
+            "harmonic_count": "Harmonic Count",
+            "granular.grain_density_hz": "Grain Density",
+            "granular.grain_duration_s": "Grain Duration",
+            "granular.grain_scatter": "Grain Scatter",
+            "granular.grain_pitch_scatter": "Grain Pitch Scatter",
+            "granular.grain_manifold_mix": "Grain Manifold Mix",
+            "granular.grain_amplitude_jitter": "Grain Amp Jitter",
+        }
+        return [(attr, voice_labels.get(attr, attr)) for attr in _VOICE_PARAM_ATTRS]
+    lfo = next((l for l in patch.lfos if l.key == node_key), None)
+    if lfo is not None:
+        labels = _knob_label_map(LFODefinition.knobs())
+        return [(k.name, labels.get(k.name, k.name)) for k in LFODefinition.knobs()
+                if k.dtype in ("float", "int", "bool", "choice")]
+    mod = next((m for m in patch.modules
+                if m.key == node_key or
+                (m.module_type == "interaural" and node_key in (m.ch1_key(), m.ch2_key()))), None)
+    if mod is not None:
+        labels = _knob_label_map(AnalyticModule.knobs())
+        attrs = _module_param_attrs(mod.module_type)
+        return [(attr, labels.get(attr, attr)) for attr in attrs]
+    mix = next((m for m in patch.mixers if m.key == node_key), None)
+    if mix is not None:
+        return _routing_edge_attr_specs(patch)
+    return []
+
+
+_VOICE_ROLE_PRESETS: dict = {
+    # "signal": default — no overrides needed; leave as-is
+    "air": {
+        # Noise-like: no defined pitch tracking, high inharmonicity via FM,
+        # slow attack, looped sustain body
+        "harmonic_mode": "inharmonic",
+        "env_attack_s":   0.08,
+        "env_decay_s":    0.2,
+        "env_sustain":    0.85,
+        "env_release_s":  0.5,
+        "loop_enabled":   True,
+        "loop_start":     0.15,
+        "loop_end":       0.75,
+        "fm_index":       0.8,
+    },
+    "transient": {
+        # Percussive: instant attack, very fast decay, chirp sweep at onset,
+        # high initial FM index for clang character
+        "harmonic_mode": "harmonic",
+        "env_attack_s":   0.001,
+        "env_decay_s":    0.06,
+        "env_sustain":    0.0,
+        "env_release_s":  0.08,
+        "loop_enabled":   False,
+        "chirp.chirp_type":    "exponential",
+        "chirp.f_delta_start": 220.0,   # Hz above nominal, swept to 0 at attack end
+        "chirp.f_delta_end":   0.0,
+        "chirp.tau":           0.015,   # sweep time constant in seconds
+        "fm_index":       3.0,
+    },
+    "body": {
+        # Full resonant core: medium attack, long sustain, looped
+        "harmonic_mode": "harmonic",
+        "env_attack_s":   0.04,
+        "env_decay_s":    0.12,
+        "env_sustain":    0.9,
+        "env_release_s":  0.8,
+        "loop_enabled":   True,
+        "loop_start":     0.10,
+        "loop_end":       0.85,
+        "fm_index":       0.25,
+    },
+}
+
+
+def _apply_voice_role_preset(voice: "AnalyticVoice", role: str) -> None:
+    """Apply parameter overrides for the given voice_role to *voice* in-place."""
+    overrides = _VOICE_ROLE_PRESETS.get(role)
+    if overrides is None:
+        return
+    for attr, val in overrides.items():
+        if "." in attr:
+            parts = attr.split(".", 1)
+            sub = getattr(voice, parts[0], None)
+            if sub is not None:
+                setattr(sub, parts[1], val)
+        else:
+            if hasattr(voice, attr):
+                setattr(voice, attr, val)
 
 
 def _ensure_granular(voice: "AnalyticVoice") -> "object":
@@ -1811,32 +2524,72 @@ def _resample_audio(arr: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
 # rather than audio — do NOT auto-route to the mix bus.
 _PATCH_VIRTUAL_KEYS: tuple = ("__patch_tonic__", "__patch_seq__")
 
+
+def _system_output_keys(patch: "AnalyticPatch") -> list[str]:
+    return patch.system_audio.output_keys() if getattr(patch, "system_audio", None) else []
+
+
+def _system_input_keys(patch: "AnalyticPatch") -> list[str]:
+    return patch.system_audio.input_keys() if getattr(patch, "system_audio", None) else []
+
+
+def _runtime_performer_keys(patch: "AnalyticPatch") -> list[str]:
+    keys: list[str] = []
+    for pt in getattr(patch, "parts", []):
+        for ch in getattr(pt, "chairs", []):
+            for pf in getattr(ch, "performers", []):
+                if getattr(pf, "key", ""):
+                    keys.append(pf.key)
+    return keys
+
+
+def _sanitize_system_io_edges(g: RoutingGraph, patch: "AnalyticPatch") -> None:
+    sys_in = set(_system_input_keys(patch))
+    sys_out = set(_system_output_keys(patch))
+    if not sys_in and not sys_out:
+        return
+    g.edges = [
+        e for e in g.edges
+        if e.src_key not in sys_out and e.dst_key not in sys_in
+    ]
+
 def _patch_node_keys(
     patch: "AnalyticPatch",
     include_params:   bool = True,
     include_controls: bool = True,
+    include_performers: bool = False,
 ) -> list:
     """Canonical ordered node key list:
-    virtual-patch-nodes -> voices -> LFOs -> modules -> controls -> mixers -> param_nodes.
+    virtual-patch-nodes -> voices -> LFOs -> module signal nodes -> controls -> mixers -> param_nodes.
 
     The two virtual patch nodes (__patch_tonic__, __patch_seq__) carry Hz
     pitch-domain signals (not audio) and are excluded from auto-mix routing.
     """
     keys = list(_PATCH_VIRTUAL_KEYS)
+    keys += _system_input_keys(patch)
+    if include_performers:
+        keys += _runtime_performer_keys(patch)
     keys += [v.key for v in patch.voices]
     keys += [l.key for l in patch.lfos]
     for m in patch.modules:
-        keys.append(m.key)
         if m.module_type == "interaural":
             keys.append(m.ch1_key())
             keys.append(m.ch2_key())
         elif m.module_type == "lfo" and m.lfo_channels:
+            keys.append(m.key)
             for i in range(len(m.lfo_channels)):
                 keys.append(m.lfo_ch_key(i))
+        elif m.module_type == "state_machine":
+            keys.append(m.key)
+            for k in m.sm_out_keys():
+                keys.append(k)
+        else:
+            keys.append(m.key)
     if include_controls:
         for cs in patch.controls:
             keys += [sl.key for sl in cs.sliders]
     keys += [m.key for m in patch.mixers]
+    keys += _system_output_keys(patch)
     if include_params:
         keys += [pn.key for pn in patch.param_nodes]
     return keys
@@ -1847,8 +2600,17 @@ def _routing_node_label(key: str, patch: "AnalyticPatch") -> str:
         return f"Tonic ({_hz_to_note_name(patch.seq_tonic_hz, patch.tuning)})"
     if key == "__patch_seq__":
         return "Seq.Pitch"
+    for i, sys_key in enumerate(_system_input_keys(patch)):
+        if sys_key == key:
+            return f"System In {i + 1}"
+    for i, sys_key in enumerate(_system_output_keys(patch)):
+        if sys_key == key:
+            return f"System Out {i + 1}"
     if key == "__mix__":
         return "Mix"
+    for m in patch.mixers:
+        if m.key == key:
+            return m.label
     for v in patch.voices:
         if v.key == key:
             return v.label
@@ -1867,6 +2629,11 @@ def _routing_node_label(key: str, patch: "AnalyticPatch") -> str:
             for i in range(len(mod.lfo_channels)):
                 if mod.lfo_ch_key(i) == key:
                     return f"{mod.label} ch{i}"
+        elif mod.module_type == "state_machine":
+            for item in mod.sm_items:
+                for var in mod.sm_vars:
+                    if mod.sm_out_key(item, var) == key:
+                        return f"{mod.label}.{item}.{var}"
     for cs in patch.controls:
         for sl in cs.sliders:
             if sl.key == key:
@@ -1882,8 +2649,15 @@ def _routing_node_color(key: str, patch: "AnalyticPatch") -> tuple:
         return (80, 180, 255)    # blue  -- tonal centre
     if key == "__patch_seq__":
         return (80, 220, 160)    # teal  -- note-plan pitch stream
+    if key in _system_input_keys(patch):
+        return (70, 170, 170)
+    if key in _system_output_keys(patch):
+        return (220, 170, 90)
     if key == "__mix__":
         return (200, 200, 100)
+    for m in patch.mixers:
+        if m.key == key:
+            return tuple(m.color[:3])
     for v in patch.voices:
         if v.key == key:
             return tuple(v.color[:3])
@@ -1899,6 +2673,8 @@ def _routing_node_color(key: str, patch: "AnalyticPatch") -> tuple:
             for i in range(len(mod.lfo_channels)):
                 if mod.lfo_ch_key(i) == key:
                     return tuple(mod.color[:3])
+        if mod.module_type == "state_machine" and key in mod.sm_out_keys():
+            return tuple(mod.color[:3])
     for cs in patch.controls:
         for sl in cs.sliders:
             if sl.key == key:
@@ -1908,22 +2684,170 @@ def _routing_node_color(key: str, patch: "AnalyticPatch") -> tuple:
             return tuple(pn.color[:3])
     return (120, 120, 120)
 
+_ART_LABELS: dict = {0: "", 1: "S", 2: "L", 3: "D"}   # step cell overlay text
+_ART_GATE:   dict = {0: 1.0, 1: 0.28, 2: 1.15, 3: None}  # None = drone (hold to next onset)
+_ART_CHOICES: list = [0, 1, 2, 3]   # normal / staccato / legato / drone
+
+
+# ---------------------------------------------------------------------------
+# GridViewLayer — unified grid-cell view abstraction
+# ---------------------------------------------------------------------------
+# Every sub-module that overlays the step grid (rhythm on/off, dynamics
+# accent, improv eligibility, …) instantiates one of these with its own
+# callbacks for colour, label, and click behaviour.  The shared methods
+# _render_grid_layer() / _handle_grid_layer_click() on NavPanel do the
+# actual rendering and hit-testing, so all grids share identical layout,
+# tree-awareness, and interaction code.
+
+class GridViewLayer:
+    """Configuration for one visual/interactive layer on the rhythm grid."""
+
+    __slots__ = (
+        "name",
+        "read_fn",           # (leaf, step_i, extra) -> value
+        "bg_fn",             # (value, is_beat, depth, group) -> (r,g,b)
+        "brd_fn",            # (value, is_beat, depth, group) -> (r,g,b)
+        "label_fn",          # (value) -> (text, (r,g,b)) | None   (left-aligned)
+        "label_right_fn",    # (value) -> (text, (r,g,b)) | None   (right-aligned)
+        "click_fn",          # (leaf, step_i, extra) -> None   (left click)
+        "right_click_fn",    # (cell, lx, ly, pat, div) -> dict | None  (context menu)
+        "show_groups",       # bool — render group dots + merge bars
+        "show_depth",        # bool — render depth tick marks
+    )
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        read_fn,
+        bg_fn,
+        brd_fn,
+        label_fn=None,
+        label_right_fn=None,
+        click_fn=None,
+        right_click_fn=None,
+        show_groups: bool = False,
+        show_depth: bool = False,
+    ):
+        self.name            = name
+        self.read_fn         = read_fn
+        self.bg_fn           = bg_fn
+        self.brd_fn          = brd_fn
+        self.label_fn        = label_fn
+        self.label_right_fn  = label_right_fn
+        self.click_fn        = click_fn
+        self.right_click_fn  = right_click_fn
+        self.show_groups     = show_groups
+        self.show_depth      = show_depth
+
+
 @dataclass
 class RhythmPattern:
-    """Per-bar on/off step grid with per-step velocity."""
+    """Per-bar on/off step grid with per-step velocity and articulation.
+
+    Two representations coexist:
+    - Flat (legacy): steps / vel / art lists indexed by integer step.
+    - Tree:          beat_nodes (BeatTree) stores the same data with optional
+                     per-cell subdivision.  When beat_nodes is not None it is
+                     the authoritative representation; the flat lists serve as a
+                     projection cache for systems that haven't been updated yet.
+
+    Each pattern also owns independent layer trees for accent and improv.
+    These share the same [0,1) bar spine and warp but subdivide independently.
+
+    Use get_tree(div) to obtain a live BeatTree regardless of which mode is
+    active.  Use ensure_size(n) as before — it is safe to call on either mode.
+    """
     name:  str  = "Pat"
     steps: list = field(default_factory=lambda: [False] * 16)
     vel:   list = field(default_factory=lambda: [1.0] * 16)
+    art:   list = field(default_factory=lambda: [0] * 16)   # 0=normal 1=staccato 2=legato 3=drone
+    # Optional tree representation — None means flat mode
+    beat_nodes: "BeatTree | None" = field(default=None, compare=False, repr=False)
+    # Independent layer trees (created on demand, same spine, own subdivisions)
+    accent_tree: "BeatTree | None" = field(default=None, compare=False, repr=False)
+    improv_tree: "BeatTree | None" = field(default=None, compare=False, repr=False)
+
+    # ------------------------------------------------------------------
+    # Tree access
+    # ------------------------------------------------------------------
+
+    def get_tree(self, div: int = 16) -> "BeatTree":
+        """Return the live BeatTree, building from flat if not yet promoted."""
+        if self.beat_nodes is not None:
+            return self.beat_nodes
+        self.ensure_size(div)
+        self.beat_nodes = BeatTree.from_flat(self.steps, self.vel, self.art, home_div=div)
+        return self.beat_nodes
+
+    def get_accent_tree(self, div: int = 16) -> "BeatTree":
+        """Return the accent layer tree, creating a uniform one on first call.
+
+        Accent uses ``vel`` on each leaf as the accent level (0.0 – 2.0).
+        """
+        if self.accent_tree is not None:
+            return self.accent_tree
+        self.accent_tree = BeatTree.new_uniform(div, default_on=True, default_vel=1.0)
+        return self.accent_tree
+
+    def get_improv_tree(self, div: int = 16) -> "BeatTree":
+        """Return the improv-eligibility layer tree, creating uniform on first call.
+
+        Improv uses ``on`` on each leaf as eligibility (True = eligible).
+        """
+        if self.improv_tree is not None:
+            return self.improv_tree
+        self.improv_tree = BeatTree.new_uniform(div, default_on=False, default_vel=1.0)
+        return self.improv_tree
+
+    def snap_accent_to_rhythm(self) -> None:
+        """Restructure accent tree to match the rhythm tree's subdivisions."""
+        if self.beat_nodes is None or self.accent_tree is None:
+            return
+        self.accent_tree.snap_structure_from(self.beat_nodes)
+
+    def snap_improv_to_rhythm(self) -> None:
+        """Restructure improv tree to match the rhythm tree's subdivisions."""
+        if self.beat_nodes is None or self.improv_tree is None:
+            return
+        self.improv_tree.snap_structure_from(self.beat_nodes)
+
+    def sync_flat_from_tree(self, div: int | None = None) -> None:
+        """Project the tree back onto the flat arrays (for legacy consumers)."""
+        if self.beat_nodes is None:
+            return
+        n = div if div is not None else self.beat_nodes.home_div
+        self.ensure_size(n)
+        self.steps = self.beat_nodes.steps_array(n)
+        self.vel   = self.beat_nodes.vel_array(n)
+        self.art   = self.beat_nodes.art_array(n)
+
+    def is_tree_mode(self) -> bool:
+        return self.beat_nodes is not None
+
+    # ------------------------------------------------------------------
+    # Legacy flat API (unchanged behavior)
+    # ------------------------------------------------------------------
 
     def ensure_size(self, n: int) -> None:
-        """Grow steps/vel lists to at least n slots."""
+        """Grow steps/vel/art lists to at least n slots."""
         while len(self.steps) < n:
             self.steps.append(False)
         while len(self.vel) < n:
             self.vel.append(1.0)
+        while len(self.art) < n:
+            self.art.append(0)
 
     def to_dict(self) -> dict:
-        return {"name": self.name, "steps": list(self.steps), "vel": list(self.vel)}
+        d = {"name": self.name, "steps": list(self.steps),
+             "vel": list(self.vel), "art": list(self.art)}
+        if self.beat_nodes is not None:
+            d["beat_nodes"] = self.beat_nodes.to_dict()
+        if self.accent_tree is not None:
+            d["accent_tree"] = self.accent_tree.to_dict()
+        if self.improv_tree is not None:
+            d["improv_tree"] = self.improv_tree.to_dict()
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "RhythmPattern":
@@ -1931,12 +2855,147 @@ class RhythmPattern:
         rp.name  = d.get("name", "Pat")
         rp.steps = [bool(x) for x in d.get("steps", [])]
         rp.vel   = [float(x) for x in d.get("vel", [])]
+        rp.art   = [int(x) for x in d.get("art", [])]
+        if "beat_nodes" in d:
+            rp.beat_nodes = BeatTree.from_dict(d["beat_nodes"])
+        if "accent_tree" in d:
+            rp.accent_tree = BeatTree.from_dict(d["accent_tree"])
+        if "improv_tree" in d:
+            rp.improv_tree = BeatTree.from_dict(d["improv_tree"])
         return rp
+
+
+@dataclass
+class ResolvedNote:
+    """Persistent piano-roll note derived from the union score solve."""
+    note_id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
+    voice_key: str = ""
+    voice_label: str = ""
+    layer_key: str = "all"
+    start_time: float = 0.0
+    duration_s: float = 0.25
+    fundamental_hz: float = 440.0
+    velocity: float = 1.0
+    locked: bool = False
+    is_rest: bool = False
+
+    def to_dict(self) -> dict:
+        return {
+            "note_id": self.note_id,
+            "voice_key": self.voice_key,
+            "voice_label": self.voice_label,
+            "layer_key": self.layer_key,
+            "start_time": self.start_time,
+            "duration_s": self.duration_s,
+            "fundamental_hz": self.fundamental_hz,
+            "velocity": self.velocity,
+            "locked": self.locked,
+            "is_rest": self.is_rest,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "ResolvedNote":
+        n = cls()
+        n.note_id = str(d.get("note_id", n.note_id))
+        n.voice_key = str(d.get("voice_key", ""))
+        n.voice_label = str(d.get("voice_label", ""))
+        n.layer_key = str(d.get("layer_key", "all"))
+        n.start_time = float(d.get("start_time", 0.0))
+        n.duration_s = float(d.get("duration_s", 0.25))
+        n.fundamental_hz = float(d.get("fundamental_hz", 440.0))
+        n.velocity = float(d.get("velocity", 1.0))
+        n.locked = bool(d.get("locked", False))
+        n.is_rest = bool(d.get("is_rest", False))
+        return n
+
+
+@dataclass
+class RhythmPage:
+    """Complete rhythm configuration for one register-part (e.g. 'bass', 'mid').
+
+    The 'all' page is the global default; per-register pages override it for
+    voices that self-declare a matching register.  Any field left at its
+    default inherits from the 'all' page at schedule-build time.
+    """
+    # Core grid
+    rhythm_enabled:   bool  = False
+    rhythm_division:  int   = 16
+    rhythm_patterns:  list  = field(default_factory=lambda: [RhythmPattern(name="Pat 1")])
+    rhythm_phrase:    list  = field(default_factory=lambda: [0])
+    rhythm_active_pat: int  = 0
+    rhythm_swing:     float = 0.0
+    rhythm_pocket:    float = 0.0
+    rhythm_gate:      float = 0.5
+    rhythm_prog_bars: int   = 1
+    rhythm_fit_mode:  str   = "drop"
+    meter_numerator:  float = 0.0   # 0 = inherit patch meter
+    meter_denominator: float = 0.0  # 0 = inherit patch meter
+    stress_pattern:   list  = field(default_factory=list)  # e.g. [3, 2]
+    # Warp interpolation mode for the beat-tree engine ("linear" | "cosine")
+    warp_interpolator: str  = "linear"
+    # How the fractional part of meter_numerator is handled:
+    #   "warp" — absorbed into the warp curve weighted by stretch (invisible)
+    #   "grid" — shown as a visible fractional beat cell in the grid
+    frac_beat_mode: str = "warp"
+    # Per-module pattern binding: role → pattern index
+    # "dynamics" / "improv" / "cadence" → int index into rhythm_patterns
+    module_pats: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {
+            "rhythm_enabled":    self.rhythm_enabled,
+            "rhythm_division":   self.rhythm_division,
+            "rhythm_patterns":   [rp.to_dict() for rp in self.rhythm_patterns],
+            "rhythm_phrase":     list(self.rhythm_phrase),
+            "rhythm_active_pat": self.rhythm_active_pat,
+            "rhythm_swing":      self.rhythm_swing,
+            "rhythm_pocket":     self.rhythm_pocket,
+            "rhythm_gate":       self.rhythm_gate,
+            "rhythm_prog_bars":  self.rhythm_prog_bars,
+            "rhythm_fit_mode":   self.rhythm_fit_mode,
+            "meter_numerator":   self.meter_numerator,
+            "meter_denominator": self.meter_denominator,
+            "stress_pattern":    list(self.stress_pattern),
+            "warp_interpolator": self.warp_interpolator,
+            "frac_beat_mode":   self.frac_beat_mode,
+            "module_pats":       dict(self.module_pats),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RhythmPage":
+        pg = cls()
+        pg.rhythm_enabled    = bool(d.get("rhythm_enabled",   False))
+        pg.rhythm_division   = int(d.get("rhythm_division",   16))
+        pg.rhythm_patterns   = [RhythmPattern.from_dict(x)
+                                 for x in d.get("rhythm_patterns", [])] \
+                               or [RhythmPattern(name="Pat 1")]
+        pg.rhythm_phrase     = list(d.get("rhythm_phrase",    [0]))
+        pg.rhythm_active_pat = int(d.get("rhythm_active_pat", 0))
+        pg.rhythm_swing      = float(d.get("rhythm_swing",    0.0))
+        pg.rhythm_pocket     = float(d.get("rhythm_pocket",   0.0))
+        pg.rhythm_gate       = float(d.get("rhythm_gate",     0.5))
+        pg.rhythm_prog_bars  = int(d.get("rhythm_prog_bars",  1))
+        pg.rhythm_fit_mode   = str(d.get("rhythm_fit_mode",   "drop"))
+        pg.meter_numerator   = max(0.0, float(d.get("meter_numerator", 0.0)))
+        pg.meter_denominator = max(0.0, float(d.get("meter_denominator", 0.0)))
+        pg.stress_pattern    = [int(max(1, int(x))) for x in d.get("stress_pattern", []) if int(x) > 0]
+        pg.warp_interpolator = str(d.get("warp_interpolator", "linear"))
+        pg.frac_beat_mode    = str(d.get("frac_beat_mode", "warp"))
+        if pg.frac_beat_mode not in ("warp", "grid"):
+            pg.frac_beat_mode = "warp"
+        pg.module_pats       = dict(d.get("module_pats", {}))
+        return pg
+
+    @classmethod
+    def from_patch_fields(cls, d: dict) -> "RhythmPage":
+        """Build a RhythmPage from a legacy flat-field patch dict."""
+        return cls.from_dict(d)
 
 
 @dataclass
 class AnalyticPatch:
     name:       str   = "untitled"
+    system_audio: SystemAudioDevice = field(default_factory=SystemAudioDevice)
     voices:     list  = field(default_factory=list)
     lfos:       list  = field(default_factory=list)
     modules:    list  = field(default_factory=list)   # list[AnalyticModule]
@@ -1952,8 +3011,13 @@ class AnalyticPatch:
     seq_pattern_idx:     int   = 1     # index into _SEQ_PATTERN_PRESETS
     seq_legato:          float = 0.85
     seq_portamento_s:    float = 0.0   # glide time in seconds
+    seq_rubato_shape:    str   = "off"
+    seq_rubato_scope:    str   = "bar"
+    seq_rubato_amount:   float = 0.0
     seq_octave_span:     int   = 2
     seq_tonic_hz:        float = 440.0 # tonal center / scale root (key being performed)
+    meter_numerator:     float = 4.0
+    meter_denominator:   float = 4.0
     _seq_note_hz:        float = 0.0  # transient: current note Hz for __patch_seq__ (0 = use seq_tonic_hz)
     seq_bass_octave:     int   = -1   # octave offset for bass-role voices
     seq_root_octave:     int   = -2   # octave offset for root-role voices (pedal)
@@ -1965,10 +3029,22 @@ class AnalyticPatch:
     projection_mode:        str   = "mono"  # "mono"|"stereo_quadrature"|"stereo_ms"|"lissajous"
     projection_rotation_hz: float = 0.0    # rotates analytic projection plane at this rate
     normalize_output:       bool  = True   # peak-normalize the mix before projection
+    performer_phase_mode:   str   = "coherent"  # "coherent" | "individual"
     # Signal routing graph (analytic, pre-projection)
     routing: RoutingGraph = field(default_factory=RoutingGraph)
     # UI-only state — not serialized.  When set, only this voice key produces audio.
     solo_key: str | None = None
+    resolved_notes: list = field(default_factory=list)  # list[ResolvedNote]
+    # Param-series cache — not serialized.  Holds last frame's extracted param
+    # node series so _synthesize_patch can apply param overrides in a single
+    # solve rather than two.  One-buffer latency; reset on patch load/clear.
+    _param_series_cache: dict = field(default_factory=dict)
+    # Runtime-only arrangement solve metrics for future placement/allocation UI.
+    _arrangement_metrics: dict = field(default_factory=dict)
+    # Placement solver output: list of Part objects derived from arrangement metrics.
+    parts: list = field(default_factory=list)   # list[Part]
+    # Patch-level placement-owned resonator deployment config.
+    placement_resonator: PlacementResonatorConfig = field(default_factory=PlacementResonatorConfig)
     # Rhythm programmer
     rhythm_enabled:    bool  = False
     rhythm_division:   int   = 16   # steps per bar: 4 8 12 16 24 32
@@ -1980,19 +3056,152 @@ class AnalyticPatch:
     rhythm_gate:       float = 0.5  # note duration as fraction of step
     rhythm_prog_bars:  int   = 1    # bars one progression cycle spans
     rhythm_fit_mode:   str   = "drop"  # "drop"=truncate to pulses; "extend"=add bars to fit
+    stress_pattern:    list  = field(default_factory=list)  # default/all-page stress pattern
+    frac_beat_mode:    str   = "warp"  # "warp" | "grid" — how fractional meter is handled
     # Progression probability transforms (0.0 = never, 1.0 = always)
     seq_probabilities: "SequenceProbabilities" = field(
         default_factory=lambda: SequenceProbabilities())
     # Velocity dynamics program (curve + accent grid)
     dynamics_program:  "DynamicsProgram" = field(
         default_factory=lambda: DynamicsProgram())
+    dynamics_pages: dict = field(default_factory=dict)  # Dict[str, DynamicsProgram]
     # Stochastic ornament program (grace / chirp / echo)
     improv_program:    "ImprovProgram" = field(
         default_factory=lambda: ImprovProgram())
+    improv_pages: dict = field(default_factory=dict)  # Dict[str, ImprovProgram]
+    # How score pages combine for a voice. "union" = additive layers,
+    # "specific" = only the most-specific layer renders.
+    rhythm_layer_mode: str = "union"
+    # Per-register rhythm pages.  "all" = global default (mirrors the flat fields
+    # above for backward compat).  Additional keys: "bass", "mid", "high".
+    rhythm_pages: dict = field(default_factory=dict)  # Dict[str, RhythmPage]
+    # UI-only: which page is displayed in the rhythm section (not serialized).
+    rhythm_active_page: str = "all"
+
+    def _default_page(self) -> "RhythmPage":
+        """Build a RhythmPage that mirrors the current flat rhythm fields."""
+        pg = RhythmPage()
+        pg.rhythm_enabled    = self.rhythm_enabled
+        pg.rhythm_division   = self.rhythm_division
+        pg.rhythm_patterns   = self.rhythm_patterns
+        pg.rhythm_phrase     = self.rhythm_phrase
+        pg.rhythm_active_pat = self.rhythm_active_pat
+        pg.rhythm_swing      = self.rhythm_swing
+        pg.rhythm_pocket     = self.rhythm_pocket
+        pg.rhythm_gate       = self.rhythm_gate
+        pg.rhythm_prog_bars  = self.rhythm_prog_bars
+        pg.rhythm_fit_mode   = self.rhythm_fit_mode
+        pg.meter_numerator   = self.meter_numerator
+        pg.meter_denominator = self.meter_denominator
+        pg.stress_pattern    = list(self.stress_pattern)
+        pg.frac_beat_mode    = self.frac_beat_mode
+        return pg
+
+    def page_for(self, register: str) -> "RhythmPage":
+        """Return a single RhythmPage for *register* (used by UI page selector).
+
+        The 'all' page is always the live flat-field default.  Named pages are
+        stored in rhythm_pages with arbitrary tag-set keys (e.g. 'bass',
+        'bass+transient', 'stab+mid').  For UI display of a single named page,
+        pass the key directly.
+        """
+        if register != "all" and register in self.rhythm_pages:
+            return self.rhythm_pages[register]
+        return self._default_page()
+
+    def dynamics_for(self, key: str) -> "DynamicsProgram":
+        if key != "all" and key in self.dynamics_pages:
+            return self.dynamics_pages[key]
+        return self.dynamics_program
+
+    def improv_for(self, key: str) -> "ImprovProgram":
+        if key != "all" and key in self.improv_pages:
+            return self.improv_pages[key]
+        return self.improv_program
+
+    def beats_per_bar(self) -> float:
+        den = max(0.125, float(self.meter_denominator))
+        num = max(0.125, float(self.meter_numerator))
+        return num * (4.0 / den)
+
+    def page_meter(self, page: "RhythmPage | None" = None) -> tuple[float, float]:
+        if page is None:
+            return float(self.meter_numerator), float(self.meter_denominator)
+        num = float(getattr(page, "meter_numerator", 0.0)) or float(self.meter_numerator)
+        den = float(getattr(page, "meter_denominator", 0.0)) or float(self.meter_denominator)
+        return max(0.125, num), max(0.125, den)
+
+    def page_beats_per_bar(self, page: "RhythmPage | None" = None) -> float:
+        num, den = self.page_meter(page)
+        return num * (4.0 / den)
+
+    def bar_duration_s(self) -> float:
+        beat_s = 60.0 / max(float(self.seq_bpm), 1.0)
+        return beat_s * self.beats_per_bar()
+
+    def ensure_dynamics_page(self, key: str) -> "DynamicsProgram":
+        if key == "all":
+            return self.dynamics_program
+        if key not in self.dynamics_pages:
+            self.dynamics_pages[key] = DynamicsProgram.from_dict(self.dynamics_program.to_dict())
+        return self.dynamics_pages[key]
+
+    def ensure_improv_page(self, key: str) -> "ImprovProgram":
+        if key == "all":
+            return self.improv_program
+        if key not in self.improv_pages:
+            self.improv_pages[key] = ImprovProgram.from_dict(self.improv_program.to_dict())
+        return self.improv_pages[key]
+
+    def remove_page(self, register: str) -> None:
+        """Delete a named register page from all three page dicts. No-op for 'all'."""
+        if register == "all":
+            return
+        self.rhythm_pages.pop(register, None)
+        self.dynamics_pages.pop(register, None)
+        self.improv_pages.pop(register, None)
+        # Mark patch dirty for UI refresh
+        self._arrangement_metrics = {}
+
+    def score_page_items_for_voice(self, voice: "AnalyticVoice") -> "list[tuple[str, RhythmPage]]":
+        """Return all score layers that apply to *voice*, ordered least→most specific."""
+        voice_tags = {
+            getattr(voice, "register",   "all"),
+            getattr(voice, "seq_role",   "melody"),
+            getattr(voice, "voice_role", "signal"),
+            getattr(voice, "key", ""),
+        } - {"all", "free", ""}
+
+        stack: list[tuple[int, str, RhythmPage]] = [(0, "all", self._default_page())]
+        for key, pg in self.rhythm_pages.items():
+            key_tags = {t.strip() for t in key.split("+")} - {"all", ""}
+            if not key_tags:
+                continue
+            if key_tags.issubset(voice_tags):
+                stack.append((len(key_tags), key, pg))
+
+        stack.sort(key=lambda x: (x[0], x[1]))
+        return [(key, pg) for _, key, pg in stack]
+
+    def score_stack_for_voice(self, voice: "AnalyticVoice") -> "list[RhythmPage]":
+        """Return all pages that apply to *voice*, ordered least→most specific.
+
+        A page applies when all of its tag tokens (split on '+') are present in
+        the voice's declared tag set (register ∪ seq_role ∪ voice_role).  The
+        global default page ('all'/flat fields) is always the base of the stack.
+        More-specific pages (more tokens in their key) override it per-step.
+
+        Example: voice has register='bass', seq_role='stab', voice_role='transient'.
+          - page key 'bass'              → applies (1 token ⊆ voice tags)
+          - page key 'bass+transient'    → applies (2 tokens ⊆ voice tags)
+          - page key 'stab+mid'          → does NOT apply ('mid' not in voice tags)
+        """
+        return [pg for _, pg in self.score_page_items_for_voice(voice)]
 
     def to_dict(self) -> dict:
         return {
             "name": self.name,
+            "system_audio": self.system_audio.to_dict(),
             "voices":      [v.to_dict() for v in self.voices],
             "lfos":        [l.to_dict() for l in self.lfos],
             "modules":     [m.to_dict() for m in self.modules],
@@ -2007,8 +3216,13 @@ class AnalyticPatch:
             "seq_pattern_idx":     self.seq_pattern_idx,
             "seq_legato":          self.seq_legato,
             "seq_portamento_s":    self.seq_portamento_s,
+            "seq_rubato_shape":    self.seq_rubato_shape,
+            "seq_rubato_scope":    self.seq_rubato_scope,
+            "seq_rubato_amount":   self.seq_rubato_amount,
             "seq_octave_span":     self.seq_octave_span,
             "seq_tonic_hz":        self.seq_tonic_hz,
+            "meter_numerator":     self.meter_numerator,
+            "meter_denominator":   self.meter_denominator,
             "seq_bass_octave":     self.seq_bass_octave,
             "seq_root_octave":     self.seq_root_octave,
             "seq_stab_octave":     self.seq_stab_octave,
@@ -2018,7 +3232,13 @@ class AnalyticPatch:
             "projection_mode":        self.projection_mode,
             "projection_rotation_hz": self.projection_rotation_hz,
             "normalize_output":       self.normalize_output,
+            "performer_phase_mode":   self.performer_phase_mode,
             "routing":                self.routing.to_dict(),
+            # Per-register rhythm pages (excludes "all" — derived from flat fields on load)
+            "rhythm_pages":      {k: v.to_dict() for k, v in self.rhythm_pages.items()
+                                  if k != "all"},
+            # Legacy flat fields — written as mirrors of the "all" page so old
+            # readers can still load the patch without the page system.
             "rhythm_enabled":    self.rhythm_enabled,
             "rhythm_division":   self.rhythm_division,
             "rhythm_patterns":   [rp.to_dict() for rp in self.rhythm_patterns],
@@ -2029,15 +3249,80 @@ class AnalyticPatch:
             "rhythm_gate":       self.rhythm_gate,
             "rhythm_prog_bars":  self.rhythm_prog_bars,
             "rhythm_fit_mode":   self.rhythm_fit_mode,
+            "stress_pattern":    list(self.stress_pattern),
+            "frac_beat_mode":   self.frac_beat_mode,
             "seq_probabilities": self.seq_probabilities.to_dict(),
+            "dynamics_pages":    {k: v.to_dict() for k, v in self.dynamics_pages.items()
+                                  if k != "all"},
             "dynamics_program":  self.dynamics_program.to_dict(),
+            "improv_pages":      {k: v.to_dict() for k, v in self.improv_pages.items()
+                                  if k != "all"},
             "improv_program":    self.improv_program.to_dict(),
+            "rhythm_layer_mode": self.rhythm_layer_mode,
+            "resolved_notes":    [n.to_dict() for n in self.resolved_notes],
+            "placement_resonator": self.placement_resonator.to_dict(),
+            # Placement solver output — persists player counts and hints
+            "placement": [
+                {
+                    "key":          pt.key,
+                    "label":        pt.label,
+                    "register":     pt.register,
+                    "seq_role":     pt.seq_role,
+                    "voice_role":   pt.voice_role,
+                    "voice_keys":   list(pt.voice_keys),
+                    "player_count": pt.player_count,
+                    "solver_hints": dict(pt.solver_hints),
+                    "chairs": [
+                        {
+                            "key": ch.key,
+                            "label": ch.label,
+                            "part_key": ch.part_key,
+                            "chair_index": ch.chair_index,
+                            "specificity_rank": ch.specificity_rank,
+                            "source_voice_keys": list(ch.source_voice_keys),
+                            "source_layer_keys": list(ch.source_layer_keys),
+                            "performer_count": ch.performer_count,
+                            "solver_hints": dict(ch.solver_hints),
+                            "performers": [
+                                {
+                                    "key": pf.key,
+                                    "label": pf.label,
+                                    "chair_key": pf.chair_key,
+                                    "chair_index": pf.chair_index,
+                                    "performer_index": pf.performer_index,
+                                    "source_voice_keys": list(pf.source_voice_keys),
+                                    "source_layer_keys": list(pf.source_layer_keys),
+                                    "assigned_note_keys": list(pf.assigned_note_keys),
+                                    "body_type": pf.body_type,
+                                    "x": pf.x,
+                                    "y": pf.y,
+                                    "z": pf.z,
+                                    "face_x": pf.face_x,
+                                    "face_y": pf.face_y,
+                                    "face_z": pf.face_z,
+                                    "radius": pf.radius,
+                                    "angle_deg": pf.angle_deg,
+                                    "geometric_delay_ms": pf.geometric_delay_ms,
+                                    "humanization_ms": pf.humanization_ms,
+                                    "phase_offset_rad": pf.phase_offset_rad,
+                                    "gain_db": pf.gain_db,
+                                    "pan": pf.pan,
+                                }
+                                for pf in ch.performers
+                            ],
+                        }
+                        for ch in pt.chairs
+                    ],
+                }
+                for pt in self.parts
+            ],
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "AnalyticPatch":
         p = cls()
         p.name       = d.get("name", "untitled")
+        p.system_audio = SystemAudioDevice.from_dict(d.get("system_audio", {}))
         p.voices      = [AnalyticVoice.from_dict(x) for x in d.get("voices", [])]
         p.lfos        = [LFODefinition.from_dict(x) for x in d.get("lfos", [])]
         p.modules     = [AnalyticModule.from_dict(x) for x in d.get("modules", [])]
@@ -2057,8 +3342,17 @@ class AnalyticPatch:
         p.seq_pattern_idx     = int(d.get("seq_pattern_idx", 1))
         p.seq_legato          = float(d.get("seq_legato", 0.85))
         p.seq_portamento_s    = float(d.get("seq_portamento_s", 0.0))
+        p.seq_rubato_shape    = str(d.get("seq_rubato_shape", "off"))
+        if p.seq_rubato_shape not in _SEQ_RUBATO_SHAPES:
+            p.seq_rubato_shape = "off"
+        p.seq_rubato_scope    = str(d.get("seq_rubato_scope", "bar"))
+        if p.seq_rubato_scope not in _SEQ_RUBATO_SCOPES:
+            p.seq_rubato_scope = "bar"
+        p.seq_rubato_amount   = max(0.0, min(0.95, float(d.get("seq_rubato_amount", 0.0))))
         p.seq_octave_span     = int(d.get("seq_octave_span", 2))
         p.seq_tonic_hz        = float(d.get("seq_tonic_hz", p.tuning.root_hz))
+        p.meter_numerator     = max(0.125, float(d.get("meter_numerator", 4.0)))
+        p.meter_denominator   = max(0.125, float(d.get("meter_denominator", 4.0)))
         p.seq_bass_octave     = int(d.get("seq_bass_octave", -1))
         p.seq_root_octave     = int(d.get("seq_root_octave", -2))
         p.seq_stab_octave     = int(d.get("seq_stab_octave",  1))
@@ -2068,6 +3362,9 @@ class AnalyticPatch:
         p.projection_mode        = d.get("projection_mode", "mono")
         p.projection_rotation_hz = float(d.get("projection_rotation_hz", 0.0))
         p.normalize_output       = bool(d.get("normalize_output", True))
+        p.performer_phase_mode   = str(d.get("performer_phase_mode", "coherent"))
+        if p.performer_phase_mode not in ("coherent", "individual"):
+            p.performer_phase_mode = "coherent"
         _raw_rp             = d.get("rhythm_patterns", [])
         p.rhythm_enabled    = bool(d.get("rhythm_enabled", False))
         p.rhythm_division   = int(d.get("rhythm_division", 16))
@@ -2080,6 +3377,10 @@ class AnalyticPatch:
         p.rhythm_gate       = float(d.get("rhythm_gate", 0.5))
         p.rhythm_prog_bars  = int(d.get("rhythm_prog_bars", 1))
         p.rhythm_fit_mode   = str(d.get("rhythm_fit_mode", "drop"))
+        p.stress_pattern    = [int(max(1, int(x))) for x in d.get("stress_pattern", []) if int(x) > 0]
+        p.frac_beat_mode    = str(d.get("frac_beat_mode", "warp"))
+        if p.frac_beat_mode not in ("warp", "grid"):
+            p.frac_beat_mode = "warp"
         # Probabilities — support old flat keys for backward compat with saved patches
         _raw_prob = d.get("seq_probabilities")
         if _raw_prob and isinstance(_raw_prob, dict):
@@ -2094,9 +3395,95 @@ class AnalyticPatch:
         _raw_dyn = d.get("dynamics_program")
         if _raw_dyn and isinstance(_raw_dyn, dict):
             p.dynamics_program = DynamicsProgram.from_dict(_raw_dyn)
+        raw_dyn_pages = d.get("dynamics_pages", {})
+        p.dynamics_pages = {}
+        for pg_key, pg_dict in raw_dyn_pages.items():
+            if pg_key != "all" and isinstance(pg_dict, dict):
+                p.dynamics_pages[pg_key] = DynamicsProgram.from_dict(pg_dict)
         _raw_imp = d.get("improv_program")
         if _raw_imp and isinstance(_raw_imp, dict):
             p.improv_program = ImprovProgram.from_dict(_raw_imp)
+        raw_imp_pages = d.get("improv_pages", {})
+        p.improv_pages = {}
+        for pg_key, pg_dict in raw_imp_pages.items():
+            if pg_key != "all" and isinstance(pg_dict, dict):
+                p.improv_pages[pg_key] = ImprovProgram.from_dict(pg_dict)
+        p.rhythm_layer_mode = str(d.get("rhythm_layer_mode", "union"))
+        if p.rhythm_layer_mode not in {"union", "specific"}:
+            p.rhythm_layer_mode = "union"
+        p.placement_resonator = PlacementResonatorConfig.from_dict(d.get("placement_resonator", {}))
+        p.resolved_notes = [ResolvedNote.from_dict(x)
+                            for x in d.get("resolved_notes", [])
+                            if isinstance(x, dict)]
+        # Placement: restore Part list; drop stale keys not matching saved entry
+        _placement_raw = d.get("placement", [])
+        if _placement_raw:
+            p.parts = [
+                Part(
+                    key=          pr.get("key", ""),
+                    label=        pr.get("label", ""),
+                    register=     pr.get("register", "all"),
+                    seq_role=     pr.get("seq_role", ""),
+                    voice_role=   pr.get("voice_role", ""),
+                    voice_keys=   list(pr.get("voice_keys", [])),
+                    player_count= int(pr.get("player_count", 1)),
+                    solver_hints= dict(pr.get("solver_hints", {})),
+                    chairs=[
+                        Chair(
+                            key=ch.get("key", ""),
+                            label=ch.get("label", ""),
+                            part_key=ch.get("part_key", pr.get("key", "")),
+                            chair_index=int(ch.get("chair_index", 1)),
+                            specificity_rank=int(ch.get("specificity_rank", 0)),
+                            source_voice_keys=list(ch.get("source_voice_keys", [])),
+                            source_layer_keys=list(ch.get("source_layer_keys", [])),
+                            performer_count=max(1, int(ch.get("performer_count", 1))),
+                            solver_hints=dict(ch.get("solver_hints", {})),
+                            performers=[
+                                PerformerPlacement(
+                                    key=pf.get("key", ""),
+                                    label=pf.get("label", ""),
+                                    chair_key=pf.get("chair_key", ch.get("key", "")),
+                                    chair_index=int(pf.get("chair_index", ch.get("chair_index", 1))),
+                                    performer_index=int(pf.get("performer_index", 1)),
+                                    source_voice_keys=list(pf.get("source_voice_keys", [])),
+                                    source_layer_keys=list(pf.get("source_layer_keys", [])),
+                                    assigned_note_keys=list(pf.get("assigned_note_keys", [])),
+                                    body_type=str(pf.get("body_type", "direct") or "direct"),
+                                    x=float(pf.get("x", 0.0)),
+                                    y=float(pf.get("y", 0.0)),
+                                    z=float(pf.get("z", 1.1)),
+                                    face_x=float(pf.get("face_x", 0.0)),
+                                    face_y=float(pf.get("face_y", -1.0)),
+                                    face_z=float(pf.get("face_z", 0.0)),
+                                    radius=float(pf.get("radius", 0.0)),
+                                    angle_deg=float(pf.get("angle_deg", 0.0)),
+                                    geometric_delay_ms=float(pf.get("geometric_delay_ms", 0.0)),
+                                    humanization_ms=float(pf.get("humanization_ms", 0.0)),
+                                    phase_offset_rad=float(pf.get("phase_offset_rad", 0.0)),
+                                    gain_db=float(pf.get("gain_db", 0.0)),
+                                    pan=float(pf.get("pan", 0.0)),
+                                )
+                                for pf in ch.get("performers", [])
+                                if isinstance(pf, dict)
+                            ],
+                        )
+                        for ch in pr.get("chairs", [])
+                        if isinstance(ch, dict)
+                    ],
+                )
+                for pr in _placement_raw
+                if isinstance(pr, dict) and pr.get("key")
+            ]
+            if p.parts:
+                _refresh_part_placement_layout(p)
+        # Rhythm pages — load per-register pages only; "all" is always live from flat fields.
+        raw_pages = d.get("rhythm_pages", {})
+        p.rhythm_pages = {}
+        for pg_key, pg_dict in raw_pages.items():
+            if pg_key != "all" and isinstance(pg_dict, dict):
+                p.rhythm_pages[pg_key] = RhythmPage.from_dict(pg_dict)
+        p.rhythm_active_page = "all"   # always start on the default page
         if "routing" in d:
             p.routing = RoutingGraph.from_dict(d["routing"])
             # H1 fix: prune stale edges whose node keys no longer exist in the patch
@@ -2104,6 +3491,7 @@ class AnalyticPatch:
             p.routing.prune_keys(valid_keys)
         else:
             p.routing = RoutingGraph()
+        p._param_series_cache = {}   # always start fresh on load
         return p
 
     @classmethod
@@ -2112,6 +3500,7 @@ class AnalyticPatch:
         _SR      = [8000.0, 22050.0, 44100.0, 48000.0, 96000.0, 192000.0]
         _PRESETS = list(GLOBAL_TUNING_PRESETS.keys())
         _TEMPS   = GlobalTuning._TEMPERAMENT_CHOICES
+        _PHASE   = ["coherent", "individual"]
         return [
             # Global
             KnobSpec("preview_sr",           "Sample rate", "int",   48000, 8000, 192000, 0, "Hz", [], True,  "Global", ".0f", "", True),
@@ -2120,6 +3509,7 @@ class AnalyticPatch:
             KnobSpec("projection_mode",        "Proj mode",  "choice", "mono", 0, 3, 1, "", _PROJ, False, "Projection", ".0f", "", True),
             KnobSpec("projection_rotation_hz", "Rot Hz",     "float",  0.0, -200.0, 200.0, 0, "Hz", [], False, "Projection", ".2f"),
             KnobSpec("normalize_output",       "Normalize",  "bool",   True, 0, 1, 1, "",  [], False, "Projection", ""),
+            KnobSpec("performer_phase_mode",   "Perf phase", "choice", "coherent", 0, 1, 1, "", _PHASE, False, "Projection"),
             # Tuning
             KnobSpec("tuning.preset_name",   "Preset",      "choice", "a440_12tet", 0,
                      max(0, len(_PRESETS) - 1), 1, "", _PRESETS, False, "Tuning", "", "", True),
@@ -2166,6 +3556,10 @@ class EditorMode(Enum):
     MIX           = auto()   # all voices summed into final mix
     ROUTING       = auto()   # N×N signal routing matrix (knob grid)
     PARAM_ROUTING = auto()   # parametric routing view for ParamNode targets
+    SM_LOG        = auto()   # state-machine plugin output log
+    SCORE         = auto()   # phrase table: all registered parts × full phrase bars
+    PIANO_ROLL    = auto()   # resolved sequence roll with pitch/time editing
+    PLACEMENT     = auto()   # top-down orchestral placement vector diagram
 
 
 @dataclass
@@ -2319,8 +3713,14 @@ def _build_rhythm_schedule(
         degrees: list,
         deg_pattern: list,
         min_dur_s: float = 1.0 / 48000,
+        page: "RhythmPage | None" = None,
+        dynamics_program: "DynamicsProgram | None" = None,
+        improv_program: "ImprovProgram | None" = None,
 ) -> "NoteSchedule":
     """Convert rhythm program + scale degrees into a NoteSchedule.
+
+    *page* selects which RhythmPage to drive the schedule.  When None,
+    the patch's 'all' page (or flat legacy fields) is used.
 
     One *progression cycle* = one full walk through ``deg_pattern`` via a
     ``NoteStream`` that applies ``p.seq_probabilities`` transforms per onset.
@@ -2335,24 +3735,39 @@ def _build_rhythm_schedule(
 
     Swing:   odd-indexed steps pushed back by ``rhythm_swing × step_s``.
     Pocket:  every onset shifted by ``rhythm_pocket × beat_s`` (pos = lay-back).
-    Gate:    note duration = ``rhythm_gate × step_s``.
-
-    After the schedule is built, ``apply_dynamics`` is called with
-    ``p.dynamics_program`` to apply the velocity curve and accent grid.
+    Gate:    note duration = ``rhythm_gate × step_s`` × articulation multiplier.
+    Drone:   gate extends to reach the next onset in the bar (two-pass).
     """
+    # Resolve the page: prefer explicit arg, then voice register page, then legacy flat.
+    pg: "RhythmPage" = page if page is not None else p.page_for("all")
+
     sched      = NoteSchedule()
-    div        = max(1, p.rhythm_division)
-    step_s     = beat_s * 4.0 / div
-    gate_s     = max(min_dur_s, step_s * p.rhythm_gate)
-    pkt_s      = p.rhythm_pocket * beat_s
-    phrase     = p.rhythm_phrase if p.rhythm_phrase else [0]
-    pats       = p.rhythm_patterns if p.rhythm_patterns else [RhythmPattern(name="Pat 1")]
+    div        = max(1, pg.rhythm_division)
+    bar_s      = _bar_duration_s_for_page(p, pg, beat_s)
+    step_s     = bar_s / div
+    base_gate  = step_s * pg.rhythm_gate
+    phrase     = pg.rhythm_phrase if pg.rhythm_phrase else [0]
+    pats       = pg.rhythm_patterns if pg.rhythm_patterns else [RhythmPattern(name="Pat 1")]
     n_pat      = len(deg_pattern)
-    prog_bars  = max(1, getattr(p, "rhythm_prog_bars", 1))
-    fit_mode   = getattr(p, "rhythm_fit_mode", "drop")
+    prog_bars  = max(1, pg.rhythm_prog_bars)
+    fit_mode   = pg.rhythm_fit_mode
     probs      = getattr(p, "seq_probabilities", None) or SequenceProbabilities()
     _rng       = _random.Random()   # local instance — doesn't touch global state
     stream     = NoteStream(degrees, deg_pattern, probs, _rng)
+
+    # ── Warp curve — built once from home-grid params, shared across all bars ─
+    _meter_num, _ = p.page_meter(pg)
+    _warp = build_warp_curve(
+        home_div      = div,
+        swing         = pg.rhythm_swing,
+        pocket        = pg.rhythm_pocket,
+        rubato_shape  = getattr(p, "seq_rubato_shape",  "off"),
+        rubato_amount = getattr(p, "seq_rubato_amount", 0.0),
+        meter_num     = _meter_num,
+        beats_per_bar = p.beats_per_bar(),
+        interpolator  = getattr(pg, "warp_interpolator", "linear"),
+        frac_beat_mode = getattr(pg, "frac_beat_mode", "warp"),
+    )
 
     def _onsets_in_bars(start_bar: int, end_bar: int) -> int:
         total = 0
@@ -2360,8 +3775,11 @@ def _build_rhythm_schedule(
             slot  = b % len(phrase)
             pat_i = phrase[slot]
             pat   = pats[min(pat_i, len(pats) - 1)]
-            pat.ensure_size(div)
-            total += sum(1 for s in pat.steps[:div] if s)
+            if pat.is_tree_mode():
+                total += sum(1 for lf in pat.get_tree(div).flat_leaves() if lf.on)
+            else:
+                pat.ensure_size(div)
+                total += sum(1 for s in pat.steps[:div] if s)
         return total
 
     # Determine cycle length in bars for this render
@@ -2373,53 +3791,1507 @@ def _build_rhythm_schedule(
     else:  # "drop"
         cycle_bars = prog_bars
 
+    # ── First pass: collect all onset times per bar for drone gate lookahead ──
+    # onset_map[abs_bar][leaf_key] = t_final for active leaves.
+    # leaf_key is step_i (flat) or node_id (tree) — used only for drone lookups.
+    onset_map: dict = {}
+    for rep in range(max(1, p.seq_repeats)):
+        for bar_i in range(cycle_bars):
+            slot  = bar_i % len(phrase)
+            pat_i = phrase[slot]
+            pat   = pats[min(pat_i, len(pats) - 1)]
+            abs_bar = rep * cycle_bars + bar_i
+            if pat.is_tree_mode():
+                for leaf, t_onset, _ in iter_leaf_events(pat.get_tree(div), _warp, bar_s, abs_bar):
+                    onset_map.setdefault(abs_bar, {})[leaf.node_id] = t_onset
+            else:
+                pat.ensure_size(div)
+                for step_i in range(div):
+                    if not pat.steps[step_i]:
+                        continue
+                    t_onset = abs_bar * bar_s + _warp.warp_to_seconds(
+                        step_i / div, bar_s)
+                    onset_map.setdefault(abs_bar, {})[step_i] = t_onset
+
+    def _next_onset_t(abs_bar: int, leaf_key: object, t_cur: float) -> float:
+        """Return t of next onset after *leaf_key* in *abs_bar*, for drone gate."""
+        max_bar = abs_bar + cycle_bars
+        for b in range(abs_bar, max_bar + 1):
+            bar_onsets = onset_map.get(b, {})
+            for k in sorted(bar_onsets, key=lambda k: bar_onsets[k]):
+                if b == abs_bar and bar_onsets[k] <= t_cur:
+                    continue
+                return bar_onsets[k]
+        return t_cur + bar_s   # fallback: one bar ahead
+
+    # ── Second pass: build schedule with articulation-aware gate ─────────────
     for rep in range(max(1, p.seq_repeats)):
         stream.reset()   # each repeat restarts the progression identically
         for bar_i in range(cycle_bars):
             slot  = bar_i % len(phrase)
             pat_i = phrase[slot]
             pat   = pats[min(pat_i, len(pats) - 1)]
-            pat.ensure_size(div)
             abs_bar = rep * cycle_bars + bar_i
-            for step_i in range(div):
-                if not pat.steps[step_i]:
-                    continue
-                # Pull next Hz from the stream; None = progression exhausted → rest
-                hz = stream.next_hz()
-                if hz is None:
-                    continue
-                t_grid  = abs_bar * div * step_s + step_i * step_s
-                if step_i % 2 == 1:
-                    t_grid += p.rhythm_swing * step_s
-                t_final = max(0.0, t_grid + pkt_s)
-                vel     = float(pat.vel[step_i]) if step_i < len(pat.vel) else 1.0
-                sched.add(NoteEvent(hz, t_final, gate_s, velocity=vel))
+
+            if pat.is_tree_mode():
+                # ── Tree path (grouped events merge adjacent same-group leaves) ─
+                for leaf, t_onset, dur_s in iter_grouped_events(
+                        pat.get_tree(div), _warp, bar_s, abs_bar):
+                    hz = stream.next_hz()
+                    if hz is None:
+                        continue
+                    art_mul = _ART_GATE.get(int(leaf.art), 1.0)
+                    if leaf.group != 0:
+                        # Grouped: duration already merged, use it directly
+                        gate_s_i = max(min_dur_s, dur_s)
+                    elif art_mul is None:
+                        next_t   = _next_onset_t(abs_bar, leaf.node_id, t_onset)
+                        gate_s_i = max(min_dur_s, next_t - t_onset)
+                    else:
+                        gate_s_i = max(min_dur_s, dur_s * pg.rhythm_gate * art_mul)
+                    sched.add(NoteEvent(hz, t_onset, gate_s_i, velocity=float(leaf.vel)))
+            else:
+                # ── Flat (legacy) path ───────────────────────────────────────
+                pat.ensure_size(div)
+                for step_i in range(div):
+                    if not pat.steps[step_i]:
+                        continue
+                    hz = stream.next_hz()
+                    if hz is None:
+                        continue
+                    t_onset = abs_bar * bar_s + _warp.warp_to_seconds(step_i / div, bar_s)
+                    vel     = float(pat.vel[step_i]) if step_i < len(pat.vel) else 1.0
+                    art_val = int(pat.art[step_i]) if step_i < len(pat.art) else 0
+                    art_mul = _ART_GATE.get(art_val, 1.0)
+                    if art_mul is None:
+                        next_t   = _next_onset_t(abs_bar, step_i, t_onset)
+                        gate_s_i = max(min_dur_s, next_t - t_onset)
+                    else:
+                        gate_s_i = max(min_dur_s, step_s * pg.rhythm_gate * art_mul)
+                    sched.add(NoteEvent(hz, t_onset, gate_s_i, velocity=vel))
 
     # ── Post-process: apply velocity dynamics (curve + accent grid) ──────────
-    dyn_prog = getattr(p, "dynamics_program", None)
+    dyn_prog = dynamics_program if dynamics_program is not None else getattr(p, "dynamics_program", None)
     if dyn_prog is not None and _HAS_DYN_ENG:
-        apply_dynamics(sched.events, dyn_prog, beat_s, div, _rng)
+        # Get accent tree from the active rhythm pattern (if available)
+        _acc_tree = None
+        _act_i = min(pg.rhythm_active_pat, max(0, len(pats) - 1))
+        _act_pat = pats[_act_i] if pats else None
+        if _act_pat is not None:
+            try:
+                _acc_tree = _act_pat.get_accent_tree(div)
+            except Exception:
+                pass
+        apply_dynamics(sched.events, dyn_prog, beat_s, div, _rng,
+                       beats_per_bar=p.beats_per_bar(),
+                       accent_tree=_acc_tree)
 
     # ── Post-process: apply stochastic ornaments (grace / chirp / echo) ──────
-    imp_prog = getattr(p, "improv_program", None)
+    imp_prog = improv_program if improv_program is not None else getattr(p, "improv_program", None)
     if imp_prog is not None and _HAS_IMPROV_ENG and imp_prog.enabled:
-        phrase_ref = p.rhythm_phrase if p.rhythm_phrase else [0]
-        pats_ref   = p.rhythm_patterns if p.rhythm_patterns else []
         extra = apply_improv(
             sched.events,
             imp_prog,
             beat_s,
             div,
-            pats_ref,
-            phrase_ref,
+            pats,
+            phrase,
             cycle_bars,
             _rng,
+            beats_per_bar=p.beats_per_bar(),
         )
         if extra:
             sched.events.extend(extra)
             sched.events.sort(key=lambda e: e.start_time)
 
     return sched
+
+
+def _build_score_schedule_for_voice(
+        p: "AnalyticPatch",
+        voice: "AnalyticVoice",
+        beat_s: float,
+        degrees: list,
+        deg_pattern: list,
+        min_dur_s: float = 1.0 / 48000,
+) -> "NoteSchedule":
+    """Build the rendered schedule for one voice under the patch's layer mode."""
+    layers = p.score_page_items_for_voice(voice)
+    if not layers:
+        return NoteSchedule()
+
+    if getattr(p, "rhythm_layer_mode", "union") == "specific":
+        layer_key, layer_pg = layers[-1]
+        sched = _build_rhythm_schedule(
+            p, beat_s, degrees, deg_pattern,
+            min_dur_s=min_dur_s,
+            page=layer_pg,
+            dynamics_program=p.dynamics_for(layer_key),
+            improv_program=p.improv_for(layer_key),
+        )
+        for ev in sched.events:
+            ev._layer_key = layer_key
+        return sched
+
+    merged = NoteSchedule()
+    for layer_key, layer_pg in layers:
+        layer_sched = _build_rhythm_schedule(
+            p, beat_s, degrees, deg_pattern,
+            min_dur_s=min_dur_s,
+            page=layer_pg,
+            dynamics_program=p.dynamics_for(layer_key),
+            improv_program=p.improv_for(layer_key),
+        )
+        if layer_sched.events:
+            for ev in layer_sched.events:
+                ev._layer_key = layer_key
+            merged.events.extend(layer_sched.events)
+    merged.events.sort(key=lambda e: e.start_time)
+    return merged
+
+
+def _build_sequence_pitch_context(
+        p: "AnalyticPatch",
+) -> "tuple[float, list[float], list[int]] | None":
+    """Return (beat_s, degrees, pattern) for the patch sequence settings."""
+    if not _HAS_SEQ_ENG:
+        return None
+    source_voices = [v for v in p.voices if not v.muted]
+    template = source_voices[0] if source_voices else (p.voices[0] if p.voices else None)
+    if template is None:
+        return None
+    scale = p.seq_scale if p.seq_scale in MODAL_SCALES else "pentatonic_minor"
+    beat_s = 60.0 / max(p.seq_bpm, 1.0)
+    pattern = _SEQ_PATTERN_PRESETS[
+        max(0, min(p.seq_pattern_idx, len(_SEQ_PATTERN_PRESETS) - 1))
+    ][1]
+    if p.seq_custom_semitones.strip():
+        custom_semi = [float(s) for s in p.seq_custom_semitones.split(",") if s.strip()]
+        degrees: list[float] = []
+        for octave in range(p.seq_octave_span):
+            for st in custom_semi:
+                degrees.append(semitones_to_hz(p.seq_tonic_hz, st + 12 * octave))
+    else:
+        base_hz = template.freq_hz if template is not None else p.seq_tonic_hz
+        degrees = scale_degrees_hz(base_hz, scale, octave_span=p.seq_octave_span)
+    return beat_s, degrees, pattern
+
+
+def _build_legacy_sequence_schedule(
+        p: "AnalyticPatch",
+        beat_s: float,
+        degrees: list[float],
+        pattern: list[int],
+) -> "NoteSchedule":
+    """Return the non-rhythm schedule path used by preview/export."""
+    if p.seq_custom_semitones.strip():
+        schedule = NoteSchedule()
+        t = 0.0
+        for _rep in range(p.seq_repeats):
+            for deg_i in pattern:
+                hz = degrees[deg_i % len(degrees)]
+                note_dur = beat_s * 0.5 * p.seq_legato
+                schedule.add(NoteEvent(hz, t, max(note_dur, 1.0 / p.preview_sr)))
+                t += beat_s * 0.5
+        return schedule
+
+    source_voices = [v for v in p.voices if not v.muted]
+    template = source_voices[0] if source_voices else (p.voices[0] if p.voices else None)
+    root_hz = template.freq_hz if template is not None else p.seq_tonic_hz
+    rule = ArpeggioRule(
+        root_hz=root_hz,
+        scale=p.seq_scale if p.seq_scale in MODAL_SCALES else "pentatonic_minor",
+        pattern=pattern,
+        rhythm_beats=[0.5],
+        bpm=p.seq_bpm,
+        legato_fraction=p.seq_legato,
+        octave_span=p.seq_octave_span,
+        repeats=p.seq_repeats,
+    )
+    return rule.generate()
+
+
+def _sync_resolved_notes(
+        p: "AnalyticPatch",
+        preserve_locked: bool = True,
+) -> list[ResolvedNote]:
+    """Refresh patch.resolved_notes from the current union solve."""
+    ctx = _build_sequence_pitch_context(p)
+    if ctx is None:
+        return p.resolved_notes
+    beat_s, degrees, pattern = ctx
+    locked_map: dict[str, ResolvedNote] = {}
+    locked_notes: list[ResolvedNote] = []
+    if preserve_locked:
+        locked_notes = [n for n in p.resolved_notes if getattr(n, "locked", False)]
+        locked_map = {n.note_id: n for n in locked_notes}
+
+    def _masked_by_locked(candidate: ResolvedNote) -> bool:
+        for locked in locked_notes:
+            if locked.voice_key != candidate.voice_key:
+                continue
+            a0 = candidate.start_time
+            a1 = candidate.start_time + candidate.duration_s
+            b0 = locked.start_time
+            b1 = locked.start_time + locked.duration_s
+            if max(a0, b0) < min(a1, b1):
+                return True
+        return False
+
+    notes: list[ResolvedNote] = []
+    source_voices = [v for v in p.voices if not v.muted]
+    for voice in source_voices:
+        if p.rhythm_enabled:
+            sched = _build_score_schedule_for_voice(
+                p, voice, beat_s, degrees, pattern, min_dur_s=1.0 / p.preview_sr)
+        else:
+            sched = _build_legacy_sequence_schedule(p, beat_s, degrees, pattern)
+        for i, ev in enumerate(sched.events):
+            layer_key = str(getattr(ev, "_layer_key", "legacy"))
+            note_id = (
+                f"{voice.key}:{layer_key}:"
+                f"{round(float(ev.start_time), 6)}:"
+                f"{round(float(ev.duration_s), 6)}:"
+                f"{round(float(_resolved_event_hz(p, voice, ev.fundamental_hz)), 4)}"
+            )
+            generated = ResolvedNote(
+                note_id=note_id,
+                voice_key=voice.key,
+                voice_label=getattr(voice, "label", voice.key[:6]),
+                layer_key=layer_key,
+                start_time=float(ev.start_time),
+                duration_s=float(ev.duration_s),
+                fundamental_hz=float(_resolved_event_hz(p, voice, ev.fundamental_hz)),
+                velocity=float(ev.velocity),
+                locked=False,
+            )
+            if note_id in locked_map:
+                keep = locked_map.pop(note_id)
+                keep.voice_key = generated.voice_key
+                keep.voice_label = generated.voice_label
+                keep.layer_key = generated.layer_key
+                keep.velocity = generated.velocity
+                notes.append(keep)
+            elif preserve_locked and _masked_by_locked(generated):
+                continue
+            else:
+                notes.append(generated)
+    if preserve_locked and locked_notes:
+        locked_ids = {n.note_id for n in notes}
+        for locked in locked_notes:
+            if locked.note_id not in locked_ids:
+                notes.append(locked)
+    notes.sort(key=lambda n: (n.start_time, n.fundamental_hz, n.voice_key, n.layer_key))
+    p.resolved_notes = notes
+    return notes
+
+
+_REGISTER_BAND_ORDER = {"bass": 0, "mid": 1, "high": 2, "all": 3}
+_REGISTER_ROW_RADIUS = {"bass": 4.3, "mid": 6.0, "high": 7.8, "all": 5.2}
+
+# ── Stage layout: dome-backed concert stage with realistic orchestral seating ──
+#
+# Real orchestral layout principles encoded here:
+#   • Strings (signal / body voices) occupy the front arcs in register order:
+#       - High melody = 1st violins (front stage-left)
+#       - High non-melody = 2nd violins (front stage-right)
+#       - Mid signal/body = violas (center-left, 2nd row) or cellos (center-right)
+#       - Bass signal/body = cellos (front-right) or double basses (far right, risers)
+#   • Woodwinds (air voices, or mid/high non-body non-transient alternates):
+#       center rear, paired in two rows behind strings
+#   • Brass (body or signal voices in bass/mid with stab or root roles):
+#       right rear on risers, behind woodwinds
+#   • Percussion (transient voices, or stab role in any register):
+#       rear center-to-left, highest risers
+#   • "all" register parts default to center stage (viola territory)
+#   • Body voices sit behind their timbral kin (same section, deeper row)
+#   • Air voices go to woodwind section regardless of register
+#   • First chairs (slot_index 0) get inside seats closest to conductor
+#
+# Section format: (center_angle_deg, base_radius_m, platform_z_m, arc_span_per_chair_deg)
+# Angle: 0° = front-center facing audience, +deg = stage-right (audience-left),
+#         −deg = stage-left (audience-right)
+# Radius: distance from conductor position; deeper rows = larger radius
+# Platform z: height above stage floor (risers for rear sections)
+# Arc span: degrees consumed per chair for natural spacing
+
+_STAGE_SECTIONS: dict[str, tuple[float, float, float, float]] = {
+    # ── Front row: strings ────────────────────────────────────────────────
+    "violin_1":       (-25.0,  3.8, 1.05, 6.0),   # front stage-left arc
+    "violin_2":       (+18.0,  3.8, 1.05, 6.0),   # front stage-right arc
+    # ── Second row: mid strings ──────────────────────────────────────────
+    "viola":          (-12.0,  5.2, 1.08, 7.0),   # center-left, slightly deeper
+    "cello":          (+26.0,  5.0, 1.08, 7.0),   # center-right
+    # ── Third row: low strings, high riser ──────────────────────────────
+    "bass_str":       (+52.0,  6.8, 1.22, 9.0),   # far right, standing riser
+    # ── Fourth row: woodwinds center ─────────────────────────────────────
+    "woodwind_1":     ( -5.0,  6.6, 1.18, 8.0),   # center-left rear (flutes/oboes)
+    "woodwind_2":     ( +8.0,  7.4, 1.24, 8.0),   # center-right, deeper (clarinets/bassoons)
+    # ── Fifth row: brass ─────────────────────────────────────────────────
+    "brass_1":        (+30.0,  8.2, 1.35, 10.0),  # right rear (horns)
+    "brass_2":        (+48.0,  8.8, 1.42, 10.0),  # far right rear (trumpets/trombones)
+    # ── Sixth row: percussion ────────────────────────────────────────────
+    "percussion_1":   (-38.0,  9.2, 1.52, 12.0),  # left rear, high riser (timpani, mallet)
+    "percussion_2":   (  0.0,  9.6, 1.58, 12.0),  # center rear, highest (cymbals, misc)
+    # ── Specialty: soloist / harp / keyboard / body-resonance ────────────
+    "soloist":        (  0.0,  2.6, 1.05, 8.0),   # center-front, beside conductor
+    "harp":           (-55.0,  5.8, 1.10, 10.0),  # far stage-left, behind 1st violins
+    "body_front":     ( -8.0,  4.6, 1.06, 7.0),   # body voices behind front strings
+    "body_rear":      (+15.0,  7.0, 1.20, 8.0),   # body voices behind mid sections
+}
+
+def _stage_section_for_part(register: str, seq_role: str, slot_index: int,
+                            voice_role: str = "signal") -> str:
+    """Map a Part's classification to an orchestral stage section.
+
+    Uses register, seq_role, voice_role, and slot_index (for alternation within
+    the same classification) to produce realistic orchestral seating.
+    """
+    # ── Transient: soloists (melody/root) go center-front near conductor,
+    #    stab/bass transients go to percussion rear ────────────────────────
+    if voice_role == "transient":
+        if seq_role in ("melody", "root"):
+            return "soloist"            # featured performer, center-front
+        return "percussion_1" if slot_index % 2 == 0 else "percussion_2"
+
+    # ── Air voices → woodwinds regardless of register ────────────────────
+    if voice_role == "air":
+        return "woodwind_1" if slot_index % 2 == 0 else "woodwind_2"
+
+    # ── Body voices → behind their timbral kin ───────────────────────────
+    if voice_role == "body":
+        if register == "bass":
+            return "body_rear"      # behind cellos/basses
+        return "body_front"         # behind front-row strings
+
+    # ── Stab (plosive/accent) placement ──────────────────────────────────
+    if seq_role == "stab":
+        if register == "bass":
+            return "percussion_1"   # bass stabs center-back (timpani territory)
+        if register == "high":
+            return "brass_2"        # high stabs out wide (trumpet snaps)
+        return "brass_1"            # mid stabs with horns
+
+    # ── High register: strings front, woodwinds behind ───────────────────
+    if register == "high":
+        if seq_role in ("melody", ""):
+            return "violin_1" if slot_index % 2 == 0 else "violin_2"
+        if seq_role == "root":
+            return "violin_2" if slot_index % 2 == 0 else "woodwind_1"
+        return "woodwind_1" if slot_index % 2 == 0 else "woodwind_2"
+
+    # ── Mid register: violas / cellos / woodwinds ────────────────────────
+    if register == "mid":
+        if seq_role == "melody":
+            return "viola" if slot_index % 2 == 0 else "cello"
+        if seq_role == "root":
+            return "cello" if slot_index % 2 == 0 else "woodwind_2"
+        if seq_role == "bass":
+            return "cello"
+        return "viola" if slot_index % 2 == 0 else "woodwind_1"
+
+    # ── Bass register: cellos / basses / brass ───────────────────────────
+    if register == "bass":
+        if seq_role == "melody":
+            return "cello" if slot_index % 2 == 0 else "bass_str"
+        if seq_role == "bass":
+            return "bass_str" if slot_index % 2 == 0 else "cello"
+        if seq_role == "root":
+            return "brass_1" if slot_index % 2 == 0 else "bass_str"
+        return "cello" if slot_index % 2 == 0 else "brass_1"
+
+    # ── "all" register → center stage (viola/cello territory) ────────────
+    return "viola" if slot_index % 2 == 0 else "cello"
+
+
+def _ordinal_label(index: int) -> str:
+    if 10 <= (index % 100) <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(index % 10, "th")
+    return f"{index}{suffix}"
+
+
+def _page_specificity_score(layer_keys: list[str]) -> int:
+    max_tokens = 0
+    total_tokens = 0
+    for key in layer_keys:
+        toks = [t.strip() for t in str(key).split("+") if t.strip() and t.strip() != "all"]
+        total_tokens += len(toks)
+        max_tokens = max(max_tokens, len(toks))
+    return max_tokens * 100 + total_tokens
+
+
+def _stable_rng(seed: str) -> _random.Random:
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()[:16]
+    return _random.Random(int(digest, 16))
+
+
+def _rotate_list(values: list[str], offset: int) -> list[str]:
+    if not values:
+        return []
+    offset %= len(values)
+    return list(values[offset:]) + list(values[:offset])
+
+
+def _voice_polyphony_capacity(voice: "AnalyticVoice") -> int:
+    return max(1, int(getattr(voice, "polyphony_count", 1)))
+
+
+def _voice_polyphony_mode(voice: "AnalyticVoice") -> str:
+    mode = str(getattr(voice, "polyphony_mode", "sympathetic"))
+    return mode if mode in ("sympathetic", "unsympathetic") else "sympathetic"
+
+
+def _performer_phase_mode(patch: "AnalyticPatch") -> str:
+    mode = str(getattr(patch, "performer_phase_mode", "coherent"))
+    return mode if mode in ("coherent", "individual") else "coherent"
+
+
+def _group_event_note_key(group_key: str, voice_key: str, event: object, layer_key: str) -> str:
+    start = float(getattr(event, "start_time", 0.0))
+    dur = float(getattr(event, "duration_s", 0.0))
+    hz = float(getattr(event, "fundamental_hz", 0.0))
+    return (
+        f"{group_key}:{voice_key}:{layer_key}:"
+        f"{round(start, 6)}:{round(dur, 6)}:{round(hz, 4)}"
+    )
+
+
+def _note_demands_for_group(group_key: str, events: list, voices: list["AnalyticVoice"]) -> list[dict]:
+    demands: list[dict] = []
+    for voice in voices:
+        for event in events:
+            layer_key = str(getattr(event, "_layer_key", "all"))
+            demands.append({
+                "note_key": _group_event_note_key(group_key, getattr(voice, "key", ""), event, layer_key),
+                "voice_key": getattr(voice, "key", ""),
+                "layer_key": layer_key,
+                "start_time": float(getattr(event, "start_time", 0.0)),
+                "end_time": float(getattr(event, "start_time", 0.0)) + float(getattr(event, "duration_s", 0.0)),
+                "duration_s": float(getattr(event, "duration_s", 0.0)),
+                "fundamental_hz": float(getattr(event, "fundamental_hz", 0.0)),
+            })
+    demands.sort(key=lambda d: (d["start_time"], -(d["end_time"] - d["start_time"]), d["voice_key"], d["note_key"]))
+    return demands
+
+
+def _pack_note_demands_by_voice(demands: list[dict], voices: list["AnalyticVoice"]) -> tuple[list[dict], dict]:
+    voice_map = {getattr(v, "key", ""): v for v in voices}
+    bins: list[dict] = []
+    summary = {
+        "required_performers": 0,
+        "sympathetic_bins": 0,
+        "unsympathetic_bins": 0,
+    }
+    for voice in voices:
+        voice_key = getattr(voice, "key", "")
+        voice_demands = [d for d in demands if d["voice_key"] == voice_key]
+        if not voice_demands:
+            continue
+        mode = _voice_polyphony_mode(voice)
+        capacity = _voice_polyphony_capacity(voice) if mode == "sympathetic" else 1
+        voice_bins: list[dict] = []
+        for demand in voice_demands:
+            placed = False
+            for bin_info in voice_bins:
+                active_ends = [et for et in bin_info["active_ends"] if et > demand["start_time"]]
+                bin_info["active_ends"] = active_ends
+                if len(active_ends) < capacity:
+                    bin_info["active_ends"].append(demand["end_time"])
+                    bin_info["note_demands"].append(demand)
+                    placed = True
+                    break
+            if not placed:
+                voice_bins.append({
+                    "voice_key": voice_key,
+                    "polyphony_mode": mode,
+                    "capacity": capacity,
+                    "active_ends": [demand["end_time"]],
+                    "note_demands": [demand],
+                })
+        summary["required_performers"] += len(voice_bins)
+        if mode == "sympathetic":
+            summary["sympathetic_bins"] += len(voice_bins)
+        else:
+            summary["unsympathetic_bins"] += len(voice_bins)
+        bins.extend(voice_bins)
+    return bins, summary
+
+
+def _required_chairs_for_overlap(active_events: int, voices: list["AnalyticVoice"]) -> tuple[int, dict]:
+    active_events = max(0, int(active_events))
+    if active_events <= 0 or not voices:
+        return 0, {
+            "sympathetic_sources": 0,
+            "unsympathetic_sources": 0,
+            "sympathetic_capacity": 0,
+            "unsympathetic_capacity": 0,
+            "interference_units": 0.0,
+        }
+
+    sympathetic = [v for v in voices if _voice_polyphony_mode(v) == "sympathetic"]
+    unsympathetic = [v for v in voices if _voice_polyphony_mode(v) == "unsympathetic"]
+
+    sympathetic_sources = active_events * len(sympathetic)
+    sympathetic_capacity = sum(_voice_polyphony_capacity(v) for v in sympathetic)
+    sympathetic_chairs = (
+        math.ceil(sympathetic_sources / max(1, sympathetic_capacity))
+        if sympathetic_sources > 0 else 0
+    )
+
+    unsympathetic_sources = active_events * len(unsympathetic)
+    unsympathetic_capacity = sum(_voice_polyphony_capacity(v) for v in unsympathetic)
+    unsympathetic_chairs = sum(
+        math.ceil(active_events / _voice_polyphony_capacity(v))
+        for v in unsympathetic
+    )
+
+    interference_units = float(unsympathetic_sources) + (
+        float(sympathetic_sources) / max(1.0, float(sympathetic_capacity))
+    )
+    return sympathetic_chairs + unsympathetic_chairs, {
+        "sympathetic_sources": sympathetic_sources,
+        "unsympathetic_sources": unsympathetic_sources,
+        "sympathetic_capacity": sympathetic_capacity,
+        "unsympathetic_capacity": unsympathetic_capacity,
+        "interference_units": interference_units,
+    }
+
+
+def _schedule_overlap_metrics(events: list, voices: list["AnalyticVoice"]) -> dict:
+    if not events:
+        return {
+            "peak_active_events": 0,
+            "peak_active_sources": 0,
+            "required_chairs": max(1, len(voices)) if voices else 1,
+            "interference_peak": 0.0,
+        }
+
+    times = sorted({
+        float(getattr(ev, "start_time", 0.0))
+        for ev in events
+    } | {
+        float(getattr(ev, "start_time", 0.0)) + float(getattr(ev, "duration_s", 0.0))
+        for ev in events
+    })
+    if len(times) < 2:
+        required, detail = _required_chairs_for_overlap(len(events), voices)
+        return {
+            "peak_active_events": len(events),
+            "peak_active_sources": len(events) * len(voices),
+            "required_chairs": max(1, required),
+            "interference_peak": float(detail["interference_units"]),
+        }
+
+    peak_active_events = 0
+    peak_active_sources = 0
+    peak_required_chairs = 1
+    interference_peak = 0.0
+    for t0, t1 in zip(times[:-1], times[1:]):
+        if t1 <= t0:
+            continue
+        mid_t = 0.5 * (t0 + t1)
+        active_events = [
+            ev for ev in events
+            if float(getattr(ev, "start_time", 0.0)) <= mid_t <
+            float(getattr(ev, "start_time", 0.0)) + float(getattr(ev, "duration_s", 0.0))
+        ]
+        if not active_events:
+            continue
+        active_count = len(active_events)
+        required, detail = _required_chairs_for_overlap(active_count, voices)
+        peak_active_events = max(peak_active_events, active_count)
+        peak_active_sources = max(peak_active_sources, active_count * len(voices))
+        peak_required_chairs = max(peak_required_chairs, required)
+        interference_peak = max(interference_peak, float(detail["interference_units"]))
+
+    return {
+        "peak_active_events": peak_active_events,
+        "peak_active_sources": peak_active_sources,
+        "required_chairs": max(1, peak_required_chairs),
+        "interference_peak": interference_peak,
+    }
+
+
+def _refresh_part_placement_layout(patch: "AnalyticPatch") -> None:
+    metrics = getattr(patch, "_arrangement_metrics", {}) or {}
+    groups = {
+        str(gm.get("group_key", "")): gm
+        for gm in metrics.get("groups", [])
+        if isinstance(gm, dict) and gm.get("group_key")
+    }
+    voice_map = {v.key: v for v in getattr(patch, "voices", [])}
+
+    patch.parts.sort(key=lambda pt: (
+        _REGISTER_BAND_ORDER.get(pt.register, 99),
+        -int(pt.solver_hints.get("page_specificity", 0)),
+        -int(pt.solver_hints.get("stack_depth", 0)),
+        pt.label,
+    ))
+
+    _res_cfg = getattr(patch, "placement_resonator", None)
+    _layout_mode = str(getattr(_res_cfg, "layout_mode", "auto") or "auto")
+
+    by_register: dict[str, list[Part]] = {}
+    for pt in patch.parts:
+        by_register.setdefault(pt.register, []).append(pt)
+
+    for register, reg_parts in by_register.items():
+        slot_count = len(reg_parts)
+        for slot_index, pt in enumerate(reg_parts):
+            gm = groups.get(pt.key, {})
+            voice_keys = list(pt.voice_keys)
+            layer_keys = list(gm.get("layer_keys", pt.solver_hints.get("layer_keys", [])))
+            packed_performers = list(gm.get("packed_performers", []))
+            required_chairs = max(1, len(packed_performers) or int(pt.solver_hints.get("required_chairs", 1)))
+            total_players = max(required_chairs, int(pt.player_count))
+            pt.solver_hints["required_chairs"] = required_chairs
+            pt.solver_hints["section_slot"] = slot_index
+            pt.solver_hints["section_slot_count"] = slot_count
+            pt.solver_hints["layer_keys"] = list(layer_keys)
+
+            # ── Section geometry: stage rows vs. register semicircle ──────────
+            if _layout_mode == "stage":
+                section_key = _stage_section_for_part(register, pt.seq_role, slot_index,
+                                                     voice_role=pt.voice_role)
+                sec_angle, sec_radius, sec_z, sec_arc = _STAGE_SECTIONS.get(
+                    section_key, (0.0, 5.0, 1.1, 8.0))
+                part_span_deg = max(sec_arc, min(sec_arc * required_chairs, 60.0))
+                section_center_angle = sec_angle
+                radius = sec_radius
+                pt.solver_hints["section_shape"] = "semicircle"
+                pt.solver_hints["stage_section"] = section_key
+                pt.solver_hints["stage_z"] = sec_z
+            else:
+                sec_z = 1.1
+                pt.solver_hints["section_shape"] = "line" if register == "all" else "semicircle"
+                section_center = slot_index - 0.5 * (slot_count - 1)
+                radius = _REGISTER_ROW_RADIUS.get(register, _REGISTER_ROW_RADIUS["all"])
+                section_center_angle = section_center * 24.0
+                part_span_deg = max(12.0, min(70.0, 10.0 * required_chairs))
+                if slot_count == 1:
+                    part_span_deg = min(80.0, part_span_deg + 8.0)
+
+            chair_base = total_players // required_chairs
+            chair_extra = total_players % required_chairs
+            chairs: list[Chair] = []
+            for chair_idx in range(required_chairs):
+                chair_num = chair_idx + 1
+                performer_count = chair_base + (1 if chair_idx < chair_extra else 0)
+                packed = (
+                    packed_performers[chair_idx]
+                    if chair_idx < len(packed_performers)
+                    else {}
+                )
+                source_voice_keys = list(packed.get("source_voice_keys", [])) or _rotate_list(voice_keys, chair_idx)
+                source_layer_keys = list(packed.get("source_layer_keys", [])) or _rotate_list(layer_keys, chair_idx)
+                body_types = [
+                    str(getattr(voice_map.get(vk), "body_type", "direct") or "direct")
+                    for vk in source_voice_keys
+                    if vk
+                ]
+                chair_body_type = body_types[0] if body_types and len(set(body_types)) == 1 else "direct"
+                if pt.solver_hints["section_shape"] == "line":
+                    section_center_l = slot_index - 0.5 * (slot_count - 1)
+                    if required_chairs == 1:
+                        chair_x = section_center_l * 1.6
+                    else:
+                        chair_x = section_center_l * 1.6 + (
+                            (chair_idx / (required_chairs - 1)) - 0.5
+                        ) * 2.2
+                    chair_y = radius
+                    chair_angle_deg = 0.0
+                else:
+                    chair_angle_deg = (
+                        section_center_angle if required_chairs == 1 else
+                        section_center_angle + ((chair_idx / (required_chairs - 1)) - 0.5) * part_span_deg
+                    )
+                    ang = math.radians(chair_angle_deg)
+                    chair_x = radius * math.sin(ang)
+                    chair_y = radius * math.cos(ang)
+
+                chair = Chair(
+                    key=f"{pt.key}:chair:{chair_num}",
+                    label=f"{_ordinal_label(chair_num)} chair",
+                    part_key=pt.key,
+                    chair_index=chair_num,
+                    specificity_rank=int(pt.solver_hints.get("page_specificity", 0)),
+                    source_voice_keys=source_voice_keys,
+                    source_layer_keys=source_layer_keys,
+                    performer_count=max(1, performer_count),
+                    solver_hints={
+                        "x": chair_x,
+                        "y": chair_y,
+                        "radius": radius,
+                        "angle_deg": chair_angle_deg,
+                        "section_center_angle": section_center_angle,
+                    },
+                )
+
+                performers: list[PerformerPlacement] = []
+                perf_center = 0.5 * (chair.performer_count - 1)
+                for performer_idx in range(chair.performer_count):
+                    perf_num = performer_idx + 1
+                    rng = _stable_rng(f"{pt.key}:{chair.key}:{perf_num}")
+                    primary_voice_key = (
+                        (
+                            list(packed.get("source_voice_keys", []))
+                            or source_voice_keys
+                        )[performer_idx % max(1, len(list(packed.get("source_voice_keys", [])) or source_voice_keys))]
+                        if source_voice_keys else ""
+                    )
+                    primary_layer_key = (
+                        (
+                            list(packed.get("source_layer_keys", []))
+                            or source_layer_keys
+                        )[performer_idx % max(1, len(list(packed.get("source_layer_keys", [])) or source_layer_keys))]
+                        if source_layer_keys else ""
+                    )
+                    lateral = (performer_idx - perf_center) * 0.22
+                    depth = rng.uniform(-0.10, 0.10) + 0.06 * ((chair_idx % 2) - 0.5)
+                    if pt.solver_hints["section_shape"] == "line":
+                        perf_x = chair_x + lateral
+                        perf_y = chair_y + depth
+                        angle_deg = 0.0
+                    else:
+                        ang = math.radians(chair_angle_deg)
+                        tangent_x = math.cos(ang)
+                        tangent_y = -math.sin(ang)
+                        radial_x = math.sin(ang)
+                        radial_y = math.cos(ang)
+                        perf_x = chair_x + tangent_x * lateral + radial_x * depth
+                        perf_y = chair_y + tangent_y * lateral + radial_y * depth
+                        angle_deg = chair_angle_deg + lateral * 6.0
+                    distance = math.sqrt(perf_x * perf_x + perf_y * perf_y)
+                    geometric_delay_ms = (distance * 0.85 / 343.0) * 1000.0
+                    humanization_ms = rng.uniform(-4.0, 4.0) * (
+                        1.0 + min(2.0, 0.01 * float(chair.specificity_rank))
+                    )
+                    gain_db = rng.uniform(-1.2, 1.2)
+                    pan = max(-1.0, min(1.0, perf_x / 9.0))
+                    phase_offset_rad = (
+                        0.0 if _performer_phase_mode(patch) == "coherent"
+                        else rng.uniform(0.0, 2.0 * math.pi)
+                    )
+                    # Aperture normal: performer faces the conductor at origin
+                    _fdx, _fdy = -perf_x, -perf_y
+                    _fdn = math.sqrt(_fdx * _fdx + _fdy * _fdy) or 1.0
+                    _face_x, _face_y = _fdx / _fdn, _fdy / _fdn
+
+                    performers.append(PerformerPlacement(
+                        key=f"{chair.key}:performer:{perf_num}",
+                        label=f"{chair.label} performer {perf_num}",
+                        chair_key=chair.key,
+                        chair_index=chair_num,
+                        performer_index=perf_num,
+                        source_voice_keys=[primary_voice_key] if primary_voice_key else [],
+                        source_layer_keys=[primary_layer_key] if primary_layer_key else [],
+                        assigned_note_keys=list(packed.get("assigned_note_keys", [])),
+                        body_type=str(getattr(voice_map.get(primary_voice_key), "body_type", chair_body_type) or chair_body_type),
+                        x=perf_x,
+                        y=perf_y,
+                        z=sec_z,
+                        face_x=_face_x,
+                        face_y=_face_y,
+                        face_z=0.0,
+                        radius=distance,
+                        angle_deg=angle_deg,
+                        geometric_delay_ms=geometric_delay_ms,
+                        humanization_ms=humanization_ms,
+                        phase_offset_rad=phase_offset_rad,
+                        gain_db=gain_db,
+                        pan=pan,
+                    ))
+                chair.performers = performers
+                chairs.append(chair)
+            pt.chairs = chairs
+
+    # ── Auto-deploy resonator module when placement_resonator is enabled ──────
+    _res_cfg2 = getattr(patch, "placement_resonator", None)
+    if _res_cfg2 is not None and getattr(_res_cfg2, "enabled", False) and getattr(patch, "parts", []):
+        _dep_key = str(getattr(_res_cfg2, "deployed_module_key", "") or "")
+        _dep_mod = None
+        if _dep_key:
+            _dep_mod = next((m for m in getattr(patch, "modules", []) if m.key == _dep_key), None)
+        if _dep_mod is None:
+            _dep_mod = next(
+                (m for m in getattr(patch, "modules", [])
+                 if m.module_type == "state_machine"
+                 and str(getattr(m, "sm_plugin", "")) == "orchestral_resonance"),
+                None,
+            )
+        if _dep_mod is None:
+            _dep_mod = AnalyticModule(
+                key=f"placement_res_{uuid.uuid4().hex[:6]}",
+                label="Orchestral Resonance",
+                module_type="state_machine",
+            )
+            patch.modules.append(_dep_mod)
+        _sync_placement_resonator_module(patch, _dep_mod)
+
+
+def _performer_map_for_patch(patch: "AnalyticPatch") -> dict[str, list[PerformerPlacement]]:
+    mapping: dict[str, list[PerformerPlacement]] = {}
+    for pt in getattr(patch, "parts", []):
+        for ch in getattr(pt, "chairs", []):
+            for pf in getattr(ch, "performers", []):
+                for vk in getattr(pf, "source_voice_keys", []):
+                    if vk:
+                        mapping.setdefault(vk, []).append(pf)
+    return mapping
+
+
+def _resolve_note_target(voices: list, patch: "AnalyticPatch") -> "NoteTarget":
+    """Return the most holistic NoteTarget available for *voices* in *patch*.
+
+    Dispatch hierarchy (most → least coordinated):
+      1. Performers  — PerformerPlacement entries exist in chairs → apply
+                       per-seat geometric delay, phase, gain, and pan.
+      2. Chairs      — Chair sections exist but no performers yet → instrument-
+                       level grouping without individual spatial transforms.
+      3. Voice       — No Parts/Chairs resolved → synthesis-only direct path.
+
+    The returned target always carries the resolved voice list so downstream
+    synthesis is uniform regardless of which level was matched.
+    """
+    voice_keys = frozenset(getattr(v, "key", "") for v in voices) - {""}
+
+    best_performers: list = []
+    best_chairs: list = []
+    best_part: object = None
+
+    for pt in getattr(patch, "parts", []):
+        pt_voice_keys = frozenset(vk for vk in getattr(pt, "voice_keys", []) if vk)
+        if not pt_voice_keys.intersection(voice_keys):
+            continue
+        chairs = getattr(pt, "chairs", [])
+        if not chairs:
+            continue
+        # Collect performers across all chairs that reference at least one of our voices
+        local_performers: list = []
+        local_chairs: list = []
+        for ch in chairs:
+            ch_voices = frozenset(vk for vk in getattr(ch, "source_voice_keys", []) if vk)
+            if not ch_voices and not getattr(ch, "performers", []):
+                # Chair has no voice filter — treat as matching all part voices
+                ch_voices = pt_voice_keys
+            if ch_voices.intersection(voice_keys) or not ch_voices:
+                local_chairs.append(ch)
+                local_performers.extend(getattr(ch, "performers", []))
+        if local_performers:
+            best_performers = local_performers
+            best_chairs = local_chairs
+            best_part = pt
+            break  # first matching part with performers wins
+        if local_chairs and best_part is None:
+            best_chairs = local_chairs
+            best_part = pt
+
+    if best_performers:
+        return NoteTarget(
+            target_type="performer",
+            voices=list(voices),
+            performers=best_performers,
+            chairs=best_chairs,
+            part=best_part,
+        )
+    if best_chairs:
+        return NoteTarget(
+            target_type="chair",
+            voices=list(voices),
+            performers=[],
+            chairs=best_chairs,
+            part=best_part,
+        )
+    return NoteTarget(
+        target_type="voice",
+        voices=list(voices),
+        performers=[],
+        chairs=[],
+        part=None,
+    )
+
+
+def _apply_performer_transforms_to_src(
+    performer_parent_map: "dict[str, list[PerformerPlacement]]",
+    voice_sigs: "dict[str, np.ndarray]",
+    Src: "np.ndarray",
+    ki: "dict[str, int]",
+    n_ext: int,
+    sr: int,
+) -> None:
+    """Inject performer-transformed voice signals into *Src* in-place.
+
+    For every voice that has PerformerPlacement entries (those excluded from the
+    normal ``Src`` population), synthesize the ensemble contribution:
+
+      1. Take the raw synthesised voice signal.
+      2. For each PerformerPlacement:
+           a. Apply geometric + humanization delay (integer-sample circular shift,
+              zeroing the pre-roll region so causality is preserved).
+           b. Apply phase offset (complex rotation of the analytic signal).
+           c. Apply gain_db (amplitude scale).
+      3. Sum performer copies and average by performer count (preserves loudness
+         regardless of section size).
+      4. Write the result into ``Src[ki[voice_key]]``.
+
+    This implements the "dispatch to performers" step: the solved score (NoteSchedule)
+    was handed to the most holistic available target (PerformerPlacement).  When no
+    performers exist, this function is a no-op and voices reach Src via the normal
+    un-transformed path.
+    """
+    for vk, placements in performer_parent_map.items():
+        if vk not in ki or vk not in voice_sigs:
+            continue
+        raw = np.asarray(voice_sigs[vk], dtype=np.complex128)
+        if len(raw) < n_ext:
+            raw = np.pad(raw, (0, n_ext - len(raw)))
+        else:
+            raw = raw[:n_ext]
+
+        acc = np.zeros(n_ext, dtype=np.complex128)
+        for pf in placements:
+            delay_s = (float(getattr(pf, "geometric_delay_ms", 0.0))
+                       + float(getattr(pf, "humanization_ms", 0.0))) * 1e-3
+            delay_n = int(round(delay_s * sr))
+            sig = raw.copy()
+            if delay_n > 0:
+                sig = np.roll(sig, delay_n)
+                sig[:delay_n] = 0.0
+            phase = float(getattr(pf, "phase_offset_rad", 0.0))
+            if phase:
+                sig = sig * complex(math.cos(phase), math.sin(phase))
+            gain_db = float(getattr(pf, "gain_db", 0.0))
+            if gain_db:
+                sig = sig * (10.0 ** (gain_db / 20.0))
+            acc += sig
+
+        n_pl = len(placements)
+        if n_pl > 1:
+            acc /= n_pl
+        Src[ki[vk]] = acc
+
+
+def _placement_resonator_item_count(patch: "AnalyticPatch") -> int:
+    performer_total = sum(
+        len(getattr(ch, "performers", []))
+        for pt in getattr(patch, "parts", [])
+        for ch in getattr(pt, "chairs", [])
+    )
+    if performer_total > 0:
+        return performer_total
+    voice_total = len(getattr(patch, "voices", []))
+    return max(1, voice_total)
+
+
+def _placement_body_types_for_patch(patch: "AnalyticPatch") -> list[str]:
+    types: list[str] = []
+    for voice in getattr(patch, "voices", []):
+        body_type = str(getattr(voice, "body_type", "direct") or "direct")
+        if body_type not in types:
+            types.append(body_type)
+    return types or ["direct"]
+
+
+def _placement_performer_geometry_json(patch: "AnalyticPatch") -> str:
+    """Serialize all performer positions/directions to JSON for the resonance plugin."""
+    import json as _json
+    entries = []
+    for pt in getattr(patch, "parts", []):
+        for ch in getattr(pt, "chairs", []):
+            for pf in getattr(ch, "performers", []):
+                px, py, pz = float(getattr(pf, "x", 0.0)), float(getattr(pf, "y", 0.0)), float(getattr(pf, "z", 1.1))
+                # Performer faces toward front-center (0, 0, pz): direction = normalize(-px, -py, 0)
+                # In room coords performers face downstage (toward receiver/audience).
+                dx, dy = -px, -py
+                dn = math.sqrt(dx*dx + dy*dy) or 1.0
+                entries.append({
+                    "key": str(getattr(pf, "key", "")),
+                    "x": px,
+                    "y": py,
+                    "z": pz,
+                    "dir_x": round(float(getattr(pf, "face_x", dx / dn)), 4),
+                    "dir_y": round(float(getattr(pf, "face_y", dy / dn)), 4),
+                    "dir_z": round(float(getattr(pf, "face_z", 0.0)), 4),
+                    "body_type": str(getattr(pf, "body_type", "direct")),
+                    "part_key": str(getattr(pt, "key", "")),
+                    "register": str(getattr(pt, "register", "")),
+                })
+    if not entries:
+        return ""
+    return _json.dumps(entries, separators=(",", ":"))
+
+
+def _placement_resonator_module_params(patch: "AnalyticPatch") -> dict[str, object]:
+    cfg = getattr(patch, "placement_resonator", PlacementResonatorConfig())
+    params = {
+        "room_shape": cfg.room_shape,
+        "scene_path": str(cfg.scene_path),
+        "room_radius": float(cfg.room_radius),
+        "room_height": float(cfg.room_height),
+        "feedback_iterations": int(cfg.feedback_iterations),
+        "feedback_gain": float(cfg.feedback_gain),
+        "passive_loss": float(cfg.passive_loss),
+        "band_split_mode": cfg.band_split_mode,
+        "fir_taps": int(cfg.fir_taps),
+        "high_cone_deg": float(cfg.high_cone_deg),
+        "diffuse_strength": float(cfg.diffuse_strength),
+        "air_db_per_m": float(cfg.air_db_per_m),
+        "air_highband_db_per_m": float(cfg.air_highband_db_per_m),
+        "temperature_c": float(cfg.temperature_c),
+        "humidity_rel": float(cfg.humidity_rel),
+        "placement_owner": str(cfg.owner_module_type),
+        "placement_body_types": ",".join(_placement_body_types_for_patch(patch)),
+        "placement_item_count": int(_placement_resonator_item_count(patch)),
+        # Receiver array preset
+        "receiver_array_key": str(cfg.receiver_array_key),
+        "receiver_pos_x": float(cfg.receiver_pos_x),
+        "receiver_pos_y": float(cfg.receiver_pos_y),
+        "receiver_pos_z": float(cfg.receiver_pos_z),
+        "receiver_fwd_x": float(cfg.receiver_fwd_x),
+        "receiver_fwd_y": float(cfg.receiver_fwd_y),
+        "receiver_fwd_z": float(cfg.receiver_fwd_z),
+        # Placement geometry for source positions
+        "performer_geometry_json": _placement_performer_geometry_json(patch),
+    }
+    return params
+
+
+def _sync_placement_resonator_module(patch: "AnalyticPatch", module: "AnalyticModule") -> None:
+    cfg = getattr(patch, "placement_resonator", PlacementResonatorConfig())
+    module.module_type = "state_machine"
+    module.label = module.label or "Orchestral Resonance"
+    module.sm_plugin = "orchestral_resonance"
+    module.sm_n_items = _placement_resonator_item_count(patch)
+    plug = _load_sm_plugin(module.sm_plugin)
+    if plug is not None:
+        module.sm_vars = _sm_plugin_output_vars(plug)
+        module.sm_state_vars = _sm_plugin_state_vars(plug)
+        module.sm_items = _sm_plugin_item_names(plug, module.sm_n_items)
+        defaults = _sm_plugin_default_params(plug)
+    else:
+        defaults = {}
+    module.sm_params = {
+        **defaults,
+        **dict(getattr(module, "sm_params", {}) or {}),
+        **_placement_resonator_module_params(patch),
+    }
+    module.sm_use_torch = True
+    module._sm_state = {}
+    module._sm_out_cache = {}
+    module._sm_aux_state = {}
+    if not cfg.deployed_module_key:
+        cfg.deployed_module_key = module.key
+
+
+def _make_note_temp_patch(
+    parent: "AnalyticPatch",
+    note_voices: "list[AnalyticVoice]",
+    duration_s: float,
+    event_hz: float,
+    note_keys: "list[str]",
+    group_voice_keys: "list[str]",
+    *,
+    shared_modules: "list[AnalyticModule] | None" = None,
+) -> "AnalyticPatch":
+    """Build a lightweight per-note patch that shares read-only structures by reference.
+
+    Only the module *state* needs isolation: ``_sm_state``, ``_sm_out_cache``,
+    ``_sm_aux_state``, and ``_sm_log_text`` are the only fields that
+    ``_synthesize_patch`` mutates on a module.  Everything else (routing, LFOs,
+    controls, mixers, param_nodes, system_audio) is read-only during synthesis
+    and can be shared safely.
+
+    When *shared_modules* is provided those module objects are used directly
+    (their mutable state slots are snapshotted/restored by the caller).
+    Otherwise, fall back to a shallow copy with fresh state dicts.
+    """
+    tp = AnalyticPatch()
+    tp.duration               = duration_s
+    tp.preview_sr             = parent.preview_sr
+    tp.voices                 = note_voices
+    # Read-only — share by reference
+    tp.lfos                   = parent.lfos
+    tp.controls               = parent.controls
+    tp.routing                = parent.routing
+    tp.mixers                 = parent.mixers
+    tp.param_nodes            = parent.param_nodes
+    tp.system_audio           = parent.system_audio
+    tp.tuning                 = parent.tuning
+    tp.projection_mode        = parent.projection_mode
+    tp.projection_rotation_hz = parent.projection_rotation_hz
+    tp.normalize_output       = False
+    tp.performer_phase_mode   = parent.performer_phase_mode
+    tp.seq_tonic_hz           = parent.seq_tonic_hz
+    tp._seq_note_hz           = float(event_hz)
+    # Modules: shallow-copy list, reset mutable state slots so notes don't
+    # cross-contaminate.  Scene caches live inside ``_sm_aux_state`` and are
+    # persisted separately by the caller if desired.
+    if shared_modules is not None:
+        tp.modules = shared_modules
+    else:
+        _fresh: list[AnalyticModule] = []
+        for m in parent.modules:
+            mc = copy.copy(m)           # shallow — shares sm_params, sm_items etc.
+            mc._sm_state     = {}
+            mc._sm_out_cache = {}
+            mc._sm_aux_state = {}
+            mc._sm_log_text  = ""
+            _fresh.append(mc)
+        tp.modules = _fresh
+    tp.parts = _copy_matching_parts_for_voice_keys(
+        parent, group_voice_keys, note_keys)
+    return tp
+
+
+def _copy_matching_parts_for_voice_keys(
+    source_patch: "AnalyticPatch",
+    voice_keys: list[str],
+    note_keys: list[str] | None = None,
+) -> list[Part]:
+    voice_set = frozenset(vk for vk in voice_keys if vk)
+    if not voice_set:
+        return []
+
+    def _shallow_part(pt: Part) -> Part:
+        """Shallow-copy a Part and its Chairs so we can reassign list fields
+        without mutating the source patch.  PerformerPlacement objects are
+        shared by reference (never mutated during synthesis)."""
+        p2 = copy.copy(pt)
+        p2.chairs = [copy.copy(ch) for ch in getattr(pt, "chairs", [])]
+        return p2
+
+    matches = [
+        _shallow_part(pt)
+        for pt in getattr(source_patch, "parts", [])
+        if frozenset(vk for vk in getattr(pt, "voice_keys", []) if vk) == voice_set
+    ]
+    parts = matches if matches else [
+        _shallow_part(pt)
+        for pt in getattr(source_patch, "parts", [])
+        if voice_set.issubset(frozenset(vk for vk in getattr(pt, "voice_keys", []) if vk))
+    ]
+    note_key_set = {nk for nk in (note_keys or []) if nk}
+    if not note_key_set:
+        return parts
+    filtered_parts: list[Part] = []
+    for pt in parts:
+        kept_chairs: list[Chair] = []
+        for ch in getattr(pt, "chairs", []):
+            kept_performers = [
+                pf for pf in getattr(ch, "performers", [])
+                if not getattr(pf, "assigned_note_keys", [])
+                or note_key_set.intersection(set(pf.assigned_note_keys))
+            ]
+            if not kept_performers:
+                continue
+            ch.performers = kept_performers
+            ch.performer_count = len(kept_performers)
+            kept_chairs.append(ch)
+        if kept_chairs:
+            pt.chairs = kept_chairs
+            pt.player_count = sum(ch.performer_count for ch in kept_chairs)
+            filtered_parts.append(pt)
+    return filtered_parts
+
+
+def _compute_arrangement_metrics(play_groups: list[tuple]) -> dict:
+    """Summarize solved score groups for future placement/chair allocation."""
+    all_events = []
+    group_metrics = []
+    voice_event_counts: dict[str, int] = {}
+    for gi, (sched, voices) in enumerate(play_groups):
+        events = list(getattr(sched, "events", []) or [])
+        layer_keys = list(getattr(sched, "_layer_keys", []))
+        group_key = str(getattr(sched, "_group_key", f"group:{gi}"))
+        voice_keys = [getattr(v, "key", "") for v in voices]
+        note_demands = _note_demands_for_group(group_key, events, voices)
+        packed_bins, packed_summary = _pack_note_demands_by_voice(note_demands, voices)
+        for vk in voice_keys:
+            voice_event_counts[vk] = voice_event_counts.get(vk, 0) + len(events)
+        overlap = _schedule_overlap_metrics(events, voices)
+        group_metrics.append({
+            "group_key": group_key,
+            "layer_keys": layer_keys,
+            "voice_keys": voice_keys,
+            "event_count": len(events),
+            "start_time": min((ev.start_time for ev in events), default=0.0),
+            "end_time": max((ev.start_time + ev.duration_s for ev in events), default=0.0),
+            "page_specificity": _page_specificity_score(layer_keys),
+            "stack_depth": len(layer_keys),
+            "note_demands": note_demands,
+            "packed_performers": [
+                {
+                    "voice_key": pb.get("voice_key", ""),
+                    "polyphony_mode": pb.get("polyphony_mode", "sympathetic"),
+                    "capacity": int(pb.get("capacity", 1)),
+                    "assigned_note_keys": [d["note_key"] for d in pb.get("note_demands", [])],
+                    "source_voice_keys": list({
+                        d["voice_key"] for d in pb.get("note_demands", []) if d.get("voice_key")
+                    }),
+                    "source_layer_keys": list({
+                        d["layer_key"] for d in pb.get("note_demands", []) if d.get("layer_key")
+                    }),
+                }
+                for pb in packed_bins
+            ],
+            "voice_profiles": [
+                {
+                    "voice_key": getattr(v, "key", ""),
+                    "polyphony_count": _voice_polyphony_capacity(v),
+                    "polyphony_mode": _voice_polyphony_mode(v),
+                }
+                for v in voices
+            ],
+            **packed_summary,
+            **overlap,
+        })
+        all_events.extend(events)
+
+    timeline = []
+    for ev in all_events:
+        t0 = float(getattr(ev, "start_time", 0.0))
+        t1 = t0 + float(getattr(ev, "duration_s", 0.0))
+        timeline.append((t0, 1))
+        timeline.append((t1, -1))
+    timeline.sort(key=lambda item: (item[0], item[1]))
+
+    active = 0
+    peak = 0
+    peak_times: list[float] = []
+    for t, delta in timeline:
+        active += delta
+        if active > peak:
+            peak = active
+            peak_times = [t]
+        elif active == peak and peak > 0:
+            peak_times.append(t)
+
+    return {
+        "group_count": len(play_groups),
+        "event_count": len(all_events),
+        "peak_simultaneity": peak,
+        "peak_times": peak_times[:32],
+        "groups": group_metrics,
+        "voice_event_counts": voice_event_counts,
+        "peak_required_chairs": max(
+            (max(int(gm.get("required_chairs", 1)), int(gm.get("required_performers", 1))) for gm in group_metrics),
+            default=1,
+        ),
+    }
+
+
+def resolve_parts_from_patch(patch: "AnalyticPatch") -> "list[Part]":
+    """Derive :class:`Part` objects from the patch's arrangement metrics.
+
+    Each group in `_arrangement_metrics` becomes one Part. Parts with
+    identical voice combinations are deduplicated. Player counts and solver
+    hints are preserved from any existing parts already on the patch so that
+    manually-set player counts survive a re-solve.
+
+    Returns a fresh list ready to be stored as ``patch.parts``.
+    """
+    metrics = patch._arrangement_metrics
+    if not metrics:
+        return []
+    groups = metrics.get("groups", [])
+    existing_by_key = {pt.key: pt for pt in patch.parts}
+    parts: list[Part] = []
+    seen_voice_sets: set[frozenset] = set()
+    for gm in groups:
+        group_key: str = gm.get("group_key", "")
+        voice_keys: list = list(gm.get("voice_keys", []))
+        vset = frozenset(voice_keys)
+        if vset in seen_voice_sets:
+            continue
+        seen_voice_sets.add(vset)
+        layer_keys: list = list(gm.get("layer_keys", []))
+        # Infer register and role from group / layer key naming
+        combined = group_key + " ".join(layer_keys)
+        combined_l = combined.lower()
+        if "bass" in combined_l or "sub" in combined_l:
+            register = "bass"
+        elif "high" in combined_l or "treble" in combined_l or "soprano" in combined_l:
+            register = "high"
+        elif "mid" in combined_l or "tenor" in combined_l or "alto" in combined_l:
+            register = "mid"
+        else:
+            register = "all"
+        if "melody" in combined_l:
+            seq_role = "melody"
+        elif "root" in combined_l or "bass" in combined_l:
+            seq_role = "bass"
+        elif "stab" in combined_l or "comp" in combined_l:
+            seq_role = "stab"
+        else:
+            seq_role = ""
+        if "signal" in combined_l:
+            voice_role = "signal"
+        elif "air" in combined_l:
+            voice_role = "air"
+        elif "transient" in combined_l:
+            voice_role = "transient"
+        elif "body" in combined_l:
+            voice_role = "body"
+        else:
+            voice_role = ""
+        part_key = group_key or f"part-{len(parts)}"
+        label_parts = [register, seq_role, voice_role]
+        label = " / ".join(p for p in label_parts if p) or part_key
+        existing = existing_by_key.get(part_key)
+        required_chairs = max(
+            1,
+            int(gm.get("required_performers", gm.get("required_chairs", 1))),
+        )
+        player_count = max(required_chairs, existing.player_count if existing else 1)
+        solver_hints: dict = {
+            "event_count": gm.get("event_count", 0),
+            "start_time": gm.get("start_time", 0.0),
+            "end_time": gm.get("end_time", 0.0),
+            "required_chairs": required_chairs,
+            "required_performers": int(gm.get("required_performers", required_chairs)),
+            "peak_active_events": int(gm.get("peak_active_events", 0)),
+            "peak_active_sources": int(gm.get("peak_active_sources", 0)),
+            "interference_peak": float(gm.get("interference_peak", 0.0)),
+            "page_specificity": int(gm.get("page_specificity", 0)),
+            "stack_depth": int(gm.get("stack_depth", 0)),
+            "layer_keys": list(gm.get("layer_keys", [])),
+            "voice_profiles": list(gm.get("voice_profiles", [])),
+            "packed_performers": list(gm.get("packed_performers", [])),
+        }
+        if existing and existing.solver_hints:
+            solver_hints.update({k: v for k, v in existing.solver_hints.items()
+                                  if k not in solver_hints})
+        parts.append(Part(
+            key=part_key,
+            label=label,
+            register=register,
+            seq_role=seq_role,
+            voice_role=voice_role,
+            voice_keys=voice_keys,
+            player_count=player_count,
+            solver_hints=solver_hints,
+        ))
+    patch.parts = parts
+    _refresh_part_placement_layout(patch)
+    return parts
+
+
+def _build_play_groups_from_resolved_notes(
+        p: "AnalyticPatch",
+) -> "list[tuple[NoteSchedule, list[AnalyticVoice]]]":
+    """Build per-note playback groups from locked/edited resolved notes."""
+    voice_map = {v.key: v for v in p.voices if not getattr(v, "muted", False)}
+    groups: list[tuple[NoteSchedule, list[AnalyticVoice]]] = []
+    for note in sorted(p.resolved_notes, key=lambda n: (n.start_time, n.fundamental_hz, n.voice_key)):
+        if getattr(note, "is_rest", False):
+            continue
+        voice = voice_map.get(note.voice_key)
+        if voice is None:
+            continue
+        sched = NoteSchedule()
+        ev = NoteEvent(
+            fundamental_hz=float(note.fundamental_hz),
+            start_time=float(note.start_time),
+            duration_s=float(note.duration_s),
+            velocity=float(note.velocity),
+        )
+        ev._layer_key = getattr(note, "layer_key", "roll")
+        ev._exact_pitch = True
+        sched.add(ev)
+        sched._group_key = f"roll:{voice.key}:{note.note_id}"
+        sched._layer_keys = [getattr(note, "layer_key", "roll")]
+        sched._note_target = _resolve_note_target([voice], p)
+        groups.append((sched, [voice]))
+    return groups
+
+
+def _prepare_sequence_play_groups(
+        p: "AnalyticPatch",
+        beat_s: float,
+        degrees: list[float],
+        pattern: list[int],
+) -> "list[tuple[NoteSchedule, list[AnalyticVoice]]]":
+    """Return the playback/export groups for the current patch state."""
+    has_locked_roll = any(getattr(n, "locked", False) for n in p.resolved_notes)
+    if has_locked_roll:
+        _sync_resolved_notes(p, preserve_locked=True)
+        groups = _build_play_groups_from_resolved_notes(p)
+        p._arrangement_metrics = _compute_arrangement_metrics(groups)
+        p.parts = resolve_parts_from_patch(p)
+        return groups
+
+    if p.rhythm_enabled:
+        source_voices = [v for v in p.voices if not v.muted]
+        groups = _group_voices_by_page(
+            p, source_voices, beat_s, degrees, pattern,
+            min_dur_s=1.0 / p.preview_sr)
+    else:
+        schedule = _build_legacy_sequence_schedule(p, beat_s, degrees, pattern)
+        source_voices = [v for v in p.voices if not v.muted]
+        if source_voices:
+            schedule._note_target = _resolve_note_target(source_voices, p)
+        groups = [(schedule, source_voices)] if source_voices else []
+    if getattr(p, "seq_rubato_shape", "off") != "off" and getattr(p, "seq_rubato_amount", 0.0) > 1e-9:
+        warped_groups = []
+        phrase_supercycle_s = (
+            _rubato_phrase_lcm_cycle_s(p, groups, beat_s)
+            if getattr(p, "seq_rubato_scope", "bar") == "phrase"
+            else 0.0
+        )
+        for sched, voices in groups:
+            if getattr(p, "seq_rubato_scope", "bar") == "phrase":
+                local_phrase_s = max(1e-6, _rubato_phrase_cycle_s_for_group(p, voices, beat_s))
+                cycle_s = max(local_phrase_s, phrase_supercycle_s)
+                repeats = max(1.0, cycle_s / local_phrase_s)
+                amt_scale = 1.0 / repeats
+            else:
+                cycle_s = _rubato_cycle_s_for_group(p, voices, beat_s)
+                amt_scale = 1.0
+            warped = _apply_rubato_to_schedule(p, sched, cycle_s, amount_scale=amt_scale)
+            # Preserve note-target annotation through rubato warp
+            warped._note_target = getattr(sched, "_note_target",
+                                          _resolve_note_target(voices, p))
+            warped_groups.append((warped, voices))
+        groups = warped_groups
+    p._arrangement_metrics = _compute_arrangement_metrics(groups)
+    p.parts = resolve_parts_from_patch(p)
+    return groups
+
+
+def _group_voices_by_page(
+        p: "AnalyticPatch",
+        source_voices: list,
+        beat_s: float,
+        degrees: list,
+        deg_pattern: list,
+        min_dur_s: float = 1.0 / 48000,
+) -> "list[tuple]":
+    """Return [(NoteSchedule, [voice, ...]), ...] grouped by resolved score stack."""
+    pid_to_layers: dict[str, list[tuple[str, RhythmPage]]] = {}
+    pid_to_voices: dict[str, list] = {}
+    for v in source_voices:
+        layers = p.score_page_items_for_voice(v)
+        if getattr(p, "rhythm_layer_mode", "union") == "specific":
+            stack_key = (layers[-1][0],) if layers else ("all",)
+        else:
+            stack_key = tuple(key for key, _ in layers) if layers else ("all",)
+        pid = "|".join(stack_key)
+        if pid not in pid_to_layers:
+            pid_to_layers[pid] = layers
+            pid_to_voices[pid] = []
+        pid_to_voices[pid].append(v)
+
+    result = []
+    for pid, voices in pid_to_voices.items():
+        sched = _build_score_schedule_for_voice(
+            p, voices[0], beat_s, degrees, deg_pattern, min_dur_s=min_dur_s)
+        sched._group_key = pid
+        sched._layer_keys = [key for key, _ in p.score_page_items_for_voice(voices[0])]
+        sched._note_target = _resolve_note_target(voices, p)
+        result.append((sched, pid_to_voices[pid]))
+    return result
 
 
 # Sentinel: use spec.editor_seed for this synthesis (stable editor default).
@@ -2469,6 +5341,413 @@ def _resolve_voice_hz(
             return tuning.semitone_to_hz(offset)
         played_st = tuning.hz_to_semitones(played_hz)
         return tuning.semitone_to_hz(played_st + offset)
+
+
+def _resolved_event_hz(
+    patch: "AnalyticPatch",
+    voice: "AnalyticVoice",
+    event_hz: float,
+) -> float:
+    """Return the actual rendered pitch for *voice* on a scheduled event."""
+    resolved_hz = _resolve_voice_hz(voice, patch.tuning, event_hz)
+    seq_role = getattr(voice, "seq_role", "melody")
+    if seq_role == "bass":
+        resolved_hz *= (2.0 ** patch.seq_bass_octave)
+    elif seq_role == "root":
+        resolved_hz = patch.seq_tonic_hz * (2.0 ** patch.seq_root_octave)
+    elif seq_role == "stab":
+        resolved_hz *= (2.0 ** patch.seq_stab_octave)
+    return resolved_hz
+
+
+def _hz_to_midi(hz: float) -> float:
+    if hz <= 0.0:
+        return 0.0
+    return 69.0 + 12.0 * math.log2(hz / 440.0)
+
+
+def _midi_to_hz(midi_note: float) -> float:
+    return 440.0 * (2.0 ** ((midi_note - 69.0) / 12.0))
+
+
+def _midi_note_name(midi_note: int) -> str:
+    names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    note = int(midi_note)
+    return f"{names[note % 12]}{(note // 12) - 1}"
+
+
+def _bar_duration_s_for_patch(patch: "AnalyticPatch", beat_s: float | None = None) -> float:
+    beat = (60.0 / max(float(getattr(patch, "seq_bpm", 120.0)), 1.0)
+            if beat_s is None else float(beat_s))
+    return beat * patch.beats_per_bar()
+
+
+def _bar_duration_s_for_page(
+        patch: "AnalyticPatch",
+        page: "RhythmPage | None",
+        beat_s: float | None = None) -> float:
+    beat = (60.0 / max(float(getattr(patch, "seq_bpm", 120.0)), 1.0)
+            if beat_s is None else float(beat_s))
+    return beat * patch.page_beats_per_bar(page)
+
+
+def _page_meter_label(patch: "AnalyticPatch", page: "RhythmPage | None") -> str:
+    num, den = patch.page_meter(page)
+
+    def _fmt(v: float) -> str:
+        if abs(v - round(v)) < 1e-6:
+            return str(int(round(v)))
+        return f"{v:.2f}".rstrip("0").rstrip(".")
+
+    return f"{_fmt(num)}/{_fmt(den)}"
+
+
+def _rubato_phase_map(shape: str, amount: float, u: float) -> float:
+    u = max(0.0, min(1.0, float(u)))
+    amt = max(0.0, min(0.95, float(amount)))
+    if amt <= 1e-9 or shape == "off":
+        return u
+    if shape == "sine":
+        return u + amt * math.sin(2.0 * math.pi * u) / (2.0 * math.pi)
+    if shape == "troughs":
+        return u + amt * math.sin(4.0 * math.pi * u) / (4.0 * math.pi)
+    if shape == "slow_go":
+        eased = u * u
+        return (1.0 - amt) * u + amt * eased
+    if shape == "go_slow":
+        eased = 1.0 - (1.0 - u) * (1.0 - u)
+        return (1.0 - amt) * u + amt * eased
+    return u
+
+
+def _rubato_cycle_s_for_group(
+        patch: "AnalyticPatch",
+        voices: list["AnalyticVoice"],
+        beat_s: float) -> float:
+    if patch.rhythm_enabled and voices:
+        layers = patch.score_page_items_for_voice(voices[0])
+        page = layers[-1][1] if layers else None
+        bar_s = _bar_duration_s_for_page(patch, page, beat_s)
+        if patch.seq_rubato_scope == "phrase":
+            bars = max(1, int(getattr(page, "rhythm_prog_bars", patch.rhythm_prog_bars) if page is not None
+                              else patch.rhythm_prog_bars))
+            return bar_s * bars
+        return bar_s
+    return _bar_duration_s_for_patch(patch, beat_s)
+
+
+def _rubato_phrase_cycle_s_for_group(
+        patch: "AnalyticPatch",
+        voices: list["AnalyticVoice"],
+        beat_s: float) -> float:
+    if patch.rhythm_enabled and voices:
+        layers = patch.score_page_items_for_voice(voices[0])
+        page = layers[-1][1] if layers else None
+        bar_s = _bar_duration_s_for_page(patch, page, beat_s)
+        bars = max(1, int(getattr(page, "rhythm_prog_bars", patch.rhythm_prog_bars) if page is not None
+                          else patch.rhythm_prog_bars))
+        return bar_s * bars
+    return _bar_duration_s_for_patch(patch, beat_s)
+
+
+def _rubato_phrase_lcm_cycle_s(
+        patch: "AnalyticPatch",
+        groups: "list[tuple[NoteSchedule, list[AnalyticVoice]]]",
+        beat_s: float) -> float:
+    durations: list[Fraction] = []
+    for _, voices in groups:
+        phrase_s = max(1e-6, _rubato_phrase_cycle_s_for_group(patch, voices, beat_s))
+        qbeats = Fraction(phrase_s / max(1e-9, beat_s)).limit_denominator(768)
+        durations.append(qbeats)
+    if not durations:
+        return _bar_duration_s_for_patch(patch, beat_s)
+    lcm_num = durations[0].numerator
+    gcd_den = durations[0].denominator
+    for frac in durations[1:]:
+        lcm_num = math.lcm(lcm_num, frac.numerator)
+        gcd_den = math.gcd(gcd_den, frac.denominator)
+    supercycle_qbeats = Fraction(lcm_num, gcd_den)
+    return float(supercycle_qbeats) * beat_s
+
+
+def _apply_rubato_to_schedule(
+        patch: "AnalyticPatch",
+        schedule: "NoteSchedule",
+        cycle_s: float,
+        amount_scale: float = 1.0) -> "NoteSchedule":
+    shape = getattr(patch, "seq_rubato_shape", "off")
+    amount = float(getattr(patch, "seq_rubato_amount", 0.0)) * max(0.0, float(amount_scale))
+    if shape == "off" or amount <= 1e-9 or cycle_s <= 1e-9 or not getattr(schedule, "events", None):
+        return schedule
+    warped = NoteSchedule()
+    for ev in schedule.events:
+        start = float(ev.start_time)
+        end = max(start + 1e-6, float(ev.start_time + ev.duration_s))
+        c0 = math.floor(start / cycle_s)
+        c1 = math.floor(end / cycle_s)
+        if c0 != c1:
+            c1 = c0
+            end = min(end, (c0 + 1.0) * cycle_s)
+        u0 = (start - c0 * cycle_s) / cycle_s
+        u1 = (end - c0 * cycle_s) / cycle_s
+        t0 = c0 * cycle_s + cycle_s * _rubato_phase_map(shape, amount, u0)
+        t1 = c0 * cycle_s + cycle_s * _rubato_phase_map(shape, amount, u1)
+        new_ev = NoteEvent(
+            fundamental_hz=float(ev.fundamental_hz),
+            start_time=float(t0),
+            duration_s=max(1e-6, float(t1 - t0)),
+            velocity=float(getattr(ev, "velocity", 1.0)),
+        )
+        for attr in ("_layer_key", "_exact_pitch"):
+            if hasattr(ev, attr):
+                setattr(new_ev, attr, getattr(ev, attr))
+        warped.add(new_ev)
+    for attr in ("_group_key", "_layer_keys"):
+        if hasattr(schedule, attr):
+            setattr(warped, attr, getattr(schedule, attr))
+    return warped
+
+
+def _meter_beat_units(meter_num: float, frac_beat_mode: str = "warp") -> list[float]:
+    """Return the beat-unit list for *meter_num*.
+
+    frac_beat_mode
+        ``"grid"``  — fractional remainder is a visible beat cell.
+        ``"warp"``  — remainder is absorbed into the warp curve; only full
+                      integer beats are returned.
+    """
+    meter_num = max(0.125, float(meter_num))
+    full_beats = int(math.floor(meter_num + 1e-9))
+    units = [1.0] * max(0, full_beats)
+    frac = meter_num - float(full_beats)
+    if frac > 1e-6 and frac_beat_mode == "grid":
+        units.append(frac)
+    if not units:
+        units = [meter_num]
+    return units
+
+
+def _stress_pattern_options_for_meter(meter_num: float, frac_beat_mode: str = "warp") -> list[list[int]]:
+    beat_units = max(1, len(_meter_beat_units(meter_num, frac_beat_mode)))
+    curated: dict[int, list[list[int]]] = {
+        1: [[1]],
+        2: [[2], [1, 1]],
+        3: [[3], [2, 1], [1, 2]],
+        4: [[2, 2], [3, 1], [1, 3]],
+        5: [[3, 2], [2, 3], [2, 2, 1], [1, 2, 2]],
+        6: [[3, 3], [2, 2, 2], [3, 2, 1], [1, 2, 3]],
+        7: [[2, 2, 3], [3, 2, 2], [2, 3, 2]],
+        8: [[3, 3, 2], [2, 3, 3], [3, 2, 3], [4, 4], [2, 2, 2, 2]],
+        9: [[3, 3, 3], [2, 2, 2, 3], [3, 2, 2, 2]],
+        10: [[3, 3, 2, 2], [2, 3, 3, 2], [3, 2, 3, 2], [2, 2, 3, 3]],
+        11: [[3, 3, 3, 2], [2, 3, 3, 3], [3, 2, 3, 3], [3, 3, 2, 3]],
+    }
+    out: list[list[int]] = []
+    seen: set[tuple[int, ...]] = set()
+
+    def _push(pattern: list[int]) -> None:
+        if sum(pattern) != beat_units:
+            return
+        key = tuple(pattern)
+        if key not in seen:
+            seen.add(key)
+            out.append(pattern)
+
+    for pattern in curated.get(beat_units, []):
+        _push(pattern)
+
+    allowed_primary = (2, 3)
+    allowed_fallback = (1, 2, 3)
+
+    def _build(rem: int, parts: tuple[int, ...], acc: list[int]) -> None:
+        if rem == 0:
+            _push(list(acc))
+            return
+        for part in parts:
+            if part <= rem:
+                acc.append(part)
+                _build(rem - part, parts, acc)
+                acc.pop()
+
+    _build(beat_units, allowed_primary, [])
+    _build(beat_units, allowed_fallback, [])
+    if not out:
+        out.append([beat_units])
+    return out
+
+
+def _page_stress_pattern(patch: "AnalyticPatch", page: Any | None) -> list[int]:
+    _fbm = getattr(page, "frac_beat_mode", "warp") if page is not None else "warp"
+    options = _stress_pattern_options_for_meter(
+        patch.page_meter(page if isinstance(page, RhythmPage) else None)[0]
+        if page is not None else patch.meter_numerator,
+        frac_beat_mode=_fbm)
+    current = [int(max(1, int(x))) for x in getattr(page, "stress_pattern", [])] if page is not None else []
+    if sum(current) == sum(options[0]):
+        return current
+    return options[0]
+
+
+def _stress_step_boundaries(
+        patch: "AnalyticPatch",
+        page: Any,
+        div: int) -> tuple[list[int], list[int], list[int]]:
+    num, _ = patch.page_meter(page if isinstance(page, RhythmPage) else None)
+    _fbm = getattr(page, "frac_beat_mode", "warp") if page is not None else "warp"
+    beat_units = _meter_beat_units(num, _fbm)
+    total_units = max(1e-9, sum(beat_units))
+    beat_edges = [0]
+    acc = 0.0
+    for unit in beat_units:
+        acc += unit
+        beat_edges.append(int(round((acc / total_units) * div)))
+    beat_edges[0] = 0
+    beat_edges[-1] = div
+
+    pattern = _page_stress_pattern(patch, page)
+    group_edges = [0]
+    group_acc = 0
+    for part in pattern:
+        group_acc += int(part)
+        idx = min(len(beat_edges) - 1, group_acc)
+        group_edges.append(beat_edges[idx])
+    if group_edges[-1] != div:
+        group_edges[-1] = div
+    beat_starts = sorted({max(0, min(div - 1, beat_edges[i])) for i in range(len(beat_edges) - 1)})
+    group_starts = sorted({max(0, min(div - 1, group_edges[i])) for i in range(len(group_edges) - 1)})
+    return beat_edges, beat_starts, group_starts
+
+
+def _auto_apply_rhythm_grid(patch: "AnalyticPatch", page: Any) -> None:
+    div = max(1, int(page.rhythm_division))
+    if not page.rhythm_patterns:
+        page.rhythm_patterns = [RhythmPattern(name="Pat 1")]
+    act_i = min(page.rhythm_active_pat, len(page.rhythm_patterns) - 1)
+    pat = page.rhythm_patterns[act_i]
+    pat.ensure_size(div)
+    _, beat_starts, group_starts = _stress_step_boundaries(patch, page, div)
+    pat.steps = [False] * div
+    pat.art = [0] * div
+    for step_i in beat_starts:
+        pat.steps[step_i] = True
+    for step_i in group_starts:
+        pat.steps[step_i] = True
+        pat.art[step_i] = 1
+
+
+def _auto_apply_dynamics_accent(
+        patch: "AnalyticPatch",
+        page: Any,
+        dyn_program: "DynamicsProgram") -> None:
+    """Distribute Western conventional accent hierarchy onto the accent tree.
+
+    Uses the meter and stress grouping to assign accent levels:
+        - Group-start beats  → 2.0  (strong / downbeat)
+        - Other beat starts  → 1.5  (accent)
+        - Off-beat positions  → 0.5  (weak / ghosted)
+
+    For odd meters the grouping (e.g. 7/8 = 2+2+3) is respected so that the
+    '1' of each group pocket gets the strong accent.
+
+    Operates on the accent *tree* of the active rhythm pattern so that it
+    works regardless of how the tree is subdivided.
+    """
+    if page is None:
+        return
+    div = max(1, int(page.rhythm_division))
+    num, _ = patch.page_meter(page if isinstance(page, RhythmPage) else None)
+
+    # Compute beat and group boundaries in [0, div] integer space
+    _fbm = getattr(page, "frac_beat_mode", "warp") if page is not None else "warp"
+    beat_units  = _meter_beat_units(num, _fbm)
+    total_units = max(1e-9, sum(beat_units))
+    beat_frac_edges: list[float] = [0.0]
+    acc = 0.0
+    for unit in beat_units:
+        acc += unit
+        beat_frac_edges.append(acc / total_units)
+    beat_frac_edges[-1] = 1.0
+
+    pattern     = _page_stress_pattern(patch, page)
+    group_frac_edges: list[float] = [0.0]
+    group_acc = 0
+    for part in pattern:
+        group_acc += int(part)
+        idx = min(len(beat_frac_edges) - 1, group_acc)
+        group_frac_edges.append(beat_frac_edges[idx])
+    if group_frac_edges[-1] != 1.0:
+        group_frac_edges[-1] = 1.0
+
+    beat_set  = set(beat_frac_edges[:-1])   # fractional positions that start a beat
+    group_set = set(group_frac_edges[:-1])  # fractional positions that start a group
+
+    # Get the accent tree for the active rhythm pattern
+    rpats = page.rhythm_patterns
+    if not rpats:
+        return
+    act_i   = min(page.rhythm_active_pat, max(0, len(rpats) - 1))
+    act_pat = rpats[act_i]
+    acc_tree = act_pat.get_accent_tree(div)
+
+    # Walk every leaf and assign accent level by positional proximity
+    eps = 0.5 / max(1, div)  # tolerance: half a grid step
+    for leaf in acc_tree.flat_leaves():
+        pos = float(leaf.position)
+        # Check group-start first (strongest)
+        if any(abs(pos - g) < eps for g in group_set):
+            leaf.vel = 2.0
+        elif any(abs(pos - b) < eps for b in beat_set):
+            leaf.vel = 1.5
+        else:
+            leaf.vel = 0.5
+
+
+def _auto_apply_stress_velocity(
+        patch: "AnalyticPatch",
+        page: Any,
+        dyn_program: "DynamicsProgram") -> None:
+    """Map stress rank → per-leaf velocity on the accent tree.
+
+    Strong beats (group_starts) receive velocity 2.0 (strong),
+    normal beat starts receive 1.0 (normal), all others 0.5 (weak).
+    Delegates to the same tree-native logic as Auto Accent.
+    """
+    _auto_apply_dynamics_accent(patch, page, dyn_program)
+
+
+def _apply_loop_tiling(sig: np.ndarray, voice: "AnalyticVoice", n: int) -> np.ndarray:
+    """Tile [loop_start, loop_end] to fill [loop_end, n) using the complex signal.
+
+    Loop endpoints are snapped to integer phase-cycle boundaries by
+    _snap_to_phase_boundary, so exp(i*phase) is continuous at every wrap.
+    A short cosine-squared crossfade at each wrap boundary uses the analytic
+    complex values directly to erase any sub-sample amplitude residual.
+    """
+    ls_n = max(0, min(n - 2, int(round(voice.loop_start * n))))
+    le_n = max(ls_n + 2, min(n, int(round(voice.loop_end * n))))
+    loop_len = le_n - ls_n
+    tail_len = n - le_n
+    if loop_len < 2 or tail_len <= 0:
+        return sig
+    out = sig.copy()
+    body = sig[ls_n:le_n]
+    reps = math.ceil(tail_len / loop_len)
+    out[le_n:] = np.tile(body, reps)[:tail_len]
+    # Complex crossfade at each wrap: blend tail-of-outgoing with head-of-incoming.
+    # Both sides are the same body looped, so this smooths any floating-point seam.
+    xfade_n = min(loop_len // 8, 32)
+    if xfade_n > 1:
+        t_fade   = np.linspace(0.0, math.pi / 2.0, xfade_n, dtype=np.float64)
+        fade_out = np.cos(t_fade) ** 2
+        fade_in  = np.sin(t_fade) ** 2
+        for rep in range(reps):
+            wrap = le_n + rep * loop_len
+            head = wrap
+            tail = wrap - xfade_n
+            if tail < le_n or head + xfade_n > n:
+                continue
+            out[tail:wrap] = out[tail:wrap] * fade_out + out[head:head + xfade_n] * fade_in
+    return out
 
 
 def _synthesize_voice(
@@ -2631,9 +5910,14 @@ def _synthesize_voice(
         # Normalise so amplitude 1 still means peak ~1 for a single harmonic baseline
         norm = sum(1.0 / (k ** bri) if bri > 0 else 1.0 for k in range(1, hc + 1))
         sig /= norm
+        if voice.loop_enabled:
+            sig = _apply_loop_tiling(sig, voice, n)
         out = env * sig
     else:
-        out = env * np.exp(1j * phase)
+        sig = np.exp(1j * phase)
+        if voice.loop_enabled:
+            sig = _apply_loop_tiling(sig, voice, n)
+        out = env * sig
 
     # --- pre-delay: zero-pad the onset ---
     # The pre_delay is always relative to t=0; with a pre-roll (t_offset < 0),
@@ -2763,6 +6047,157 @@ def _synthesize_lfo_channel_csig(ch: dict, n: int, sr: float,
         return (amplitude * shaped).astype(np.complex128)
 
 
+def _sm_plugin_dir() -> str:
+    """Return absolute path to the sm_plugins folder (sibling of this file)."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "sm_plugins")
+
+
+def _load_sm_plugin(plugin_name: str):
+    """Import and return the plugin module for *plugin_name* (stem, no .py).
+
+    Returns None if the plugin cannot be found or imported.
+    """
+    if not plugin_name:
+        return None
+    plugin_path = os.path.join(_sm_plugin_dir(), f"{plugin_name}.py")
+    if not os.path.isfile(plugin_path):
+        return None
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(f"sm_plugin_{plugin_name}", plugin_path)
+    mod  = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception:
+        return None
+    return mod
+
+
+def _sm_plugin_list() -> list:
+    """Return sorted list of plugin name stems available in sm_plugins/."""
+    d = _sm_plugin_dir()
+    if not os.path.isdir(d):
+        return []
+    return sorted(
+        os.path.splitext(f)[0]
+        for f in os.listdir(d)
+        if f.endswith(".py") and not f.startswith("_")
+    )
+
+
+def _sm_plugin_state_vars(plugin) -> list[str]:
+    """Return normalized state/output variable names declared by a plugin."""
+    vars_raw = getattr(plugin, "STATE_VARS", []) if plugin is not None else []
+    vars_out: list[str] = []
+    for v in vars_raw:
+        s = str(v).strip()
+        if s and s not in vars_out:
+            vars_out.append(s)
+    return vars_out
+
+
+def _sm_plugin_output_vars(plugin) -> list[str]:
+    """Return normalized output variable names declared by a plugin."""
+    vars_raw = getattr(plugin, "OUTPUT_VARS", None) if plugin is not None else None
+    if vars_raw is None:
+        return _sm_plugin_state_vars(plugin)
+    vars_out: list[str] = []
+    for v in vars_raw:
+        s = str(v).strip()
+        if s and s not in vars_out:
+            vars_out.append(s)
+    return vars_out
+
+
+def _sm_plugin_item_names(plugin, n_items: int) -> list[str]:
+    """Return item names for a plugin, honoring optional naming helpers."""
+    n = max(1, int(n_items))
+    if plugin is None:
+        return [f"m{i}" for i in range(n)]
+    item_names_fn = getattr(plugin, "item_names", None)
+    if callable(item_names_fn):
+        try:
+            names = [str(x).strip() for x in item_names_fn(n)]
+            names = [x for x in names if x]
+            if len(names) == n and len(set(names)) == n:
+                return names
+        except Exception:
+            pass
+    prefix = str(getattr(plugin, "ITEM_PREFIX", "m")).strip() or "m"
+    return [f"{prefix}{i}" for i in range(n)]
+
+
+def _sm_plugin_param_specs(plugin) -> list[dict]:
+    """Return normalized plugin parameter specs for state-machine modules."""
+    specs = getattr(plugin, "PARAM_SPECS", []) if plugin is not None else []
+    out: list[dict] = []
+    for spec in specs:
+        if not isinstance(spec, dict):
+            continue
+        name = str(spec.get("name", "")).strip()
+        if not name:
+            continue
+        dtype = str(spec.get("dtype", "float")).strip() or "float"
+        out.append({
+            "name": name,
+            "label": str(spec.get("label", name)),
+            "dtype": dtype,
+            "default": spec.get("default", 0.0 if dtype != "choice" else ""),
+            "low": float(spec.get("low", 0.0)),
+            "high": float(spec.get("high", 1.0)),
+            "fmt": str(spec.get("fmt", ".3g")),
+            "is_log": bool(spec.get("is_log", False)),
+            "choices": [str(c) for c in spec.get("choices", [])],
+            "group": str(spec.get("group", "Plugin")),
+        })
+    return out
+
+
+def _sm_plugin_log_text(log_payload: object) -> str:
+    """Normalize optional plugin-provided log payloads into display text."""
+    if log_payload is None:
+        return ""
+    if isinstance(log_payload, str):
+        return log_payload
+    if isinstance(log_payload, (list, tuple)):
+        lines = [str(x) for x in log_payload if x is not None]
+        return "\n".join(lines)
+    return str(log_payload)
+
+
+def _sm_plugin_default_params(plugin) -> dict[str, object]:
+    """Return default parameter values for a state-machine plugin."""
+    return {spec["name"]: spec["default"] for spec in _sm_plugin_param_specs(plugin)}
+
+
+def _sm_to_complex(arr) -> np.ndarray:
+    """Convert a real float64 array (or torch Tensor) to complex128 for routing."""
+    if hasattr(arr, "detach"):          # torch tensor
+        arr = arr.detach().cpu().numpy()
+    return np.asarray(arr, dtype=np.float64).astype(np.complex128)
+
+
+def _sm_wrap(arr, use_torch: bool):
+    """Return arr as a torch Tensor if use_torch and torch is available."""
+    if use_torch:
+        try:
+            import torch
+            if isinstance(arr, np.ndarray):
+                return torch.from_numpy(arr)
+        except ImportError:
+            pass
+    return arr
+
+
+def _sm_unwrap(val) -> np.ndarray:
+    """Convert torch Tensor or ndarray to ndarray preserving complex dtype."""
+    if hasattr(val, "detach"):
+        val = val.detach().cpu().numpy()
+    arr = np.asarray(val)
+    if np.iscomplexobj(arr):
+        return np.asarray(arr, dtype=np.complex128)
+    return np.asarray(arr, dtype=np.float64)
+
+
 def _place_signal(z: np.ndarray, azimuth: np.ndarray, elevation: np.ndarray,
                   distance: np.ndarray, width: np.ndarray,
                   ) -> tuple[np.ndarray, np.ndarray]:
@@ -2837,6 +6272,559 @@ def _apply_projection(csig: np.ndarray, mode: str, rotation_hz: float,
         return re, re.copy()
 
 
+def _auto_mix_signal_keys(patch: "AnalyticPatch") -> list[str]:
+    """Return the signal-producing node keys eligible for legacy auto-mix."""
+    return (
+        [v.key for v in patch.voices] +
+        [l.key for l in patch.lfos] +
+        [m.key for m in patch.modules
+         if m.module_type not in ("interaural",)
+         and not (m.module_type == "lfo" and m.lfo_channels)] +
+        [m.lfo_ch_key(i)
+         for m in patch.modules if m.module_type == "lfo" and m.lfo_channels
+         for i in range(len(m.lfo_channels))]
+    )
+
+
+def _working_routing_graph_for_synthesis(patch: "AnalyticPatch") -> RoutingGraph:
+    """Return a non-mutating routing graph for preview / render solves.
+
+    Legacy patches with an entirely empty signal-routing graph still need a
+    default source->mix path so they remain audible. Once the user has created
+    any explicit signal edges, missing edges stay missing; deleted routes are
+    not silently reintroduced during preview or rendering.
+    """
+    g = RoutingGraph.from_dict(patch.routing.to_dict())
+    mixer_keys = [m.key for m in patch.mixers]
+    default_mix_key = mixer_keys[0] if mixer_keys else "__mix__"
+    auto_signal_keys = _auto_mix_signal_keys(patch)
+    if not g.edges:
+        g.ensure_defaults(auto_signal_keys, mix_key=default_mix_key)
+    _sanitize_system_io_edges(g, patch)
+    return g
+
+
+def _synthesize_voice_sources(
+    patch: "AnalyticPatch",
+    lfo_map: dict,
+    p_map: dict,
+    *,
+    n_samples: int,
+    t_offset_map: dict[str, float] | None = None,
+    voice_param_overrides: dict | None = None,
+    param_series: dict | None = None,
+    file_render: bool = False,
+    granular_seed_offset: int = 0,
+) -> dict[str, np.ndarray]:
+    import torch
+    device = torch.device("cpu")
+    sr = float(patch.preview_sr)
+
+    # Determine muted voice keys (solo exclusion)
+    solo_key = getattr(patch, "solo_key", None)
+    muted_keys: set[str] = set()
+    for v in patch.voices:
+        if v.muted or (solo_key is not None and v.key != solo_key):
+            muted_keys.add(v.key)
+
+    # Flat performer list from placement solver (may be empty)
+    all_performers = [
+        pf
+        for pt in getattr(patch, "parts", [])
+        for ch in getattr(pt, "chairs", [])
+        for pf in getattr(ch, "performers", [])
+    ]
+
+    note_hz = float(patch._seq_note_hz) if getattr(patch, "_seq_note_hz", 0.0) > 0 else float(patch.seq_tonic_hz)
+
+    cfg, performers, driver_list = build_driver_config(
+        patch, all_performers, device, sr,
+        note_hz=note_hz,
+        muted_voice_keys=muted_keys,
+    )
+
+    voices = list(patch.voices)
+    voice_sigs: dict[str, np.ndarray] = {}
+
+    # Zero-fill all voices (muted or absent from driver_list)
+    for v in voices:
+        voice_sigs[v.key] = np.zeros(n_samples, dtype=np.complex128)
+
+    if cfg.D == 0:
+        return voice_sigs
+
+    # Build initial state; apply t_offset (pre-roll) to t_pos per driver
+    state = init_driver_state(cfg)
+    if t_offset_map:
+        for d, (p_idx, v_idx) in enumerate(driver_list):
+            vk = voices[v_idx].key
+            offset_s = float((t_offset_map or {}).get(vk, 0.0))
+            if offset_s != 0.0:
+                state.t_pos[d] = state.t_pos[d] + offset_s
+
+    driver_out, voice_out, _ = multi_level_driver_step(cfg, state, n_samples, sr)
+
+    # voice_out: (V, T) — accumulated per voice across all its drivers
+    for vi, v in enumerate(voices):
+        if v.key not in muted_keys:
+            voice_sigs[v.key] = voice_out[vi].numpy()
+
+    return voice_sigs
+
+
+def _build_sequence_driver_config(
+    patch: "AnalyticPatch",
+    play_groups: "list[tuple]",
+    sr: float,
+    device,
+) -> "tuple[DriverConfig, list, DriverState]":
+    """Build a DriverConfig with one driver slot per (note_event × voice).
+
+    Each driver encodes note start time by initialising ``t_pos = -start_time``
+    so that the envelope phase-zero aligns exactly with the note's onset sample.
+    ``pre_delay_samples`` is left at 0 — the negative ``t_pos`` already gates
+    output via the ``sample_global >= pre_delay_samples`` mask in
+    ``driver_synthesis_step``.
+
+    Returns ``(cfg, patch.voices, initial_state)``.
+    """
+    import copy as _copy
+    from performer_engine import CHIRP_NONE as _CHIRP_NONE_PE
+
+    voices = list(patch.voices)
+    V = len(voices)
+    voice_key_to_idx = {v.key: i for i, v in enumerate(voices)}
+    root_hz = float(patch.seq_tonic_hz)
+
+    # Determine padded H and K across all voices
+    H_max = 1
+    K_max = 5
+    for v in voices:
+        h_r, _ = _build_harmonics(v)
+        H_max = max(H_max, len(h_r))
+        K_max = max(K_max, len(v.active_knots()))
+
+    f0_list, amplitude_list, phase_origin_list = [], [], []
+    pre_delay_samp_list, note_dur_list, active_list = [], [], []
+    chirp_type_list, chirp_fs_list, chirp_fe_list = [], [], []
+    chirp_tau_list, chirp_pow_list = [], []
+    h_ratios_list, h_amps_list, n_harmonics_list = [], [], []
+    env_t_list, env_v_list, env_n_list = [], [], []
+    voice_idx_list, instrument_idx_list = [], []
+    fm_src_list, fm_depth_list = [], []
+    am_src_list, am_depth_list = [], []
+    t_pos_init_list: list[float] = []   # initial t_pos per driver
+
+    perf_idx = 0  # monotone instrument_idx counter across all note×voice slots
+
+    for grp_sched, grp_voices in play_groups:
+        prev_hz: "float | None" = None
+        for event in grp_sched.events:
+            start_time = float(event.start_time)
+            for src_v in grp_voices:
+                vi = voice_key_to_idx.get(src_v.key)
+                if vi is None:
+                    continue
+
+                v = _copy.copy(src_v)
+                v.amplitude = float(src_v.amplitude) * float(event.velocity)
+
+                # Resolve frequency for this note event
+                if getattr(event, "_exact_pitch", False):
+                    resolved_hz = float(event.fundamental_hz)
+                else:
+                    resolved_hz = _resolve_voice_hz(src_v, patch.tuning, event.fundamental_hz)
+                    _role = getattr(src_v, "seq_role", "melody")
+                    if _role == "bass":
+                        resolved_hz *= (2.0 ** patch.seq_bass_octave)
+                    elif _role == "root":
+                        resolved_hz = patch.seq_tonic_hz * (2.0 ** patch.seq_root_octave)
+                    elif _role == "stab":
+                        resolved_hz *= (2.0 ** patch.seq_stab_octave)
+
+                v.freq_hz = resolved_hz
+                v.pre_delay = 0.0
+
+                # Portamento chirp between consecutive notes in the same group
+                if (patch.seq_portamento_s > 0 and prev_hz is not None
+                        and abs(prev_hz - resolved_hz) > 0.5):
+                    v.chirp = ChirpSpec(
+                        chirp_type    = "exponential",
+                        f_delta_start = prev_hz - resolved_hz,
+                        f_delta_end   = 0.0,
+                        tau           = max(patch.seq_portamento_s, 0.001),
+                    )
+                else:
+                    v.chirp = ChirpSpec()
+
+                chirp = getattr(v, "chirp", None)
+                f0 = _resolve_f0(v, resolved_hz, root_hz)
+                h_r, h_a = _build_harmonics(v)
+                n_h = len(h_r)
+                env_t_secs, env_v = _build_env_knots(v, event.duration_s)
+                n_k = len(env_t_secs)
+                last_v = env_v[-1] if env_v else 0.0
+
+                f0_list.append(f0)
+                amplitude_list.append(float(v.amplitude))
+                phase_origin_list.append(float(v.phase_origin))
+                pre_delay_samp_list.append(0)          # gated by t_pos < 0
+                note_dur_list.append(float(event.duration_s))
+                active_list.append(True)
+
+                chirp_code = _CHIRP_CODE.get(
+                    getattr(chirp, "chirp_type", "none"), CHIRP_NONE)
+                chirp_type_list.append(chirp_code)
+                chirp_fs_list.append(float(getattr(chirp, "f_delta_start", 0.0)) if chirp else 0.0)
+                chirp_fe_list.append(float(getattr(chirp, "f_delta_end",   0.0)) if chirp else 0.0)
+                chirp_tau_list.append(float(getattr(chirp, "tau",           0.5)) if chirp else 0.5)
+                chirp_pow_list.append(float(getattr(chirp, "chirp_power",   1.0)) if chirp else 1.0)
+
+                h_ratios_list.append(h_r + [0.0] * (H_max - n_h))
+                h_amps_list.append(h_a   + [0.0] * (H_max - n_h))
+                n_harmonics_list.append(n_h)
+
+                env_t_list.append(env_t_secs + [1e30]   * (K_max - n_k))
+                env_v_list.append(env_v      + [last_v] * (K_max - n_k))
+                env_n_list.append(n_k)
+
+                voice_idx_list.append(vi)
+                instrument_idx_list.append(perf_idx)
+
+                fm = getattr(v, "fm", None)
+                fm_vi = (voice_key_to_idx.get(fm.source_key, -1)
+                         if fm and getattr(fm, "source_key", "") else -1)
+                fm_src_list.append(fm_vi)
+                fm_depth_list.append(float(fm.depth_hz) if fm else 0.0)
+
+                am = getattr(v, "am", None)
+                am_vi = (voice_key_to_idx.get(am.source_key, -1)
+                         if am and getattr(am, "source_key", "") else -1)
+                am_src_list.append(am_vi)
+                am_depth_list.append(float(am.depth_amp) if am else 0.0)
+
+                # Negative t_pos so envelope onset aligns with note start sample
+                t_pos_init_list.append(-start_time)
+                perf_idx += 1
+
+            # Track the last resolved hz for portamento (first voice governs)
+            if grp_voices:
+                if getattr(event, "_exact_pitch", False):
+                    prev_hz = float(event.fundamental_hz)
+                else:
+                    prev_hz = _resolve_voice_hz(
+                        grp_voices[0], patch.tuning, event.fundamental_hz)
+
+    D = len(f0_list)
+    if D == 0:
+        from patch_to_driver import _empty_config as _ec
+        empty = _ec(V, device)
+        return empty, voices, init_driver_state(empty)
+
+    def _ft(lst):  return torch.tensor(lst, dtype=torch.float64, device=device)
+    def _it(lst):  return torch.tensor(lst, dtype=torch.int64,   device=device)
+    def _bt(lst):  return torch.tensor(lst, dtype=torch.bool,    device=device)
+    def _ft2(lst): return torch.tensor(lst, dtype=torch.float64, device=device)
+
+    cfg = DriverConfig(
+        D=D, H=H_max, K=K_max, V=V, device=device,
+        f0                = _ft(f0_list),
+        amplitude         = _ft(amplitude_list),
+        phase_origin      = _ft(phase_origin_list),
+        pre_delay_samples = _it(pre_delay_samp_list),
+        note_duration     = _ft(note_dur_list),
+        active            = _bt(active_list),
+        chirp_type        = _it(chirp_type_list),
+        chirp_f_start     = _ft(chirp_fs_list),
+        chirp_f_end       = _ft(chirp_fe_list),
+        chirp_tau         = _ft(chirp_tau_list),
+        chirp_power       = _ft(chirp_pow_list),
+        h_ratios          = _ft2(h_ratios_list),
+        h_amps            = _ft2(h_amps_list),
+        n_harmonics       = _it(n_harmonics_list),
+        env_t             = _ft2(env_t_list),
+        env_v             = _ft2(env_v_list),
+        env_n             = _it(env_n_list),
+        voice_idx         = _it(voice_idx_list),
+        instrument_idx    = _it(instrument_idx_list),
+        fm_source_voice   = _it(fm_src_list),
+        fm_depth_hz       = _ft(fm_depth_list),
+        am_source_voice   = _it(am_src_list),
+        am_depth          = _ft(am_depth_list),
+    )
+
+    # Seed state: t_pos = -start_time per driver so envelope zero-phase aligns
+    # with note onset. Phase accumulator seeded from phase_origin as usual.
+    state = init_driver_state(cfg)
+    state.t_pos = torch.tensor(t_pos_init_list, dtype=torch.float64, device=device)
+
+    return cfg, voices, state
+
+
+def _synthesize_sequence_full_batch(
+    patch: "AnalyticPatch",
+    play_groups: "list[tuple]",
+    total_n: int,
+    *,
+    file_render: bool = False,
+    out_channels: int = 2,
+    persistent_aux: "dict[str, dict] | None" = None,
+) -> "tuple[np.ndarray, np.ndarray, np.ndarray, dict]":
+    """Sample-wise causal step solver for full-sequence synthesis.
+
+    Signal chain executed once per sample (all D drivers batched):
+
+      1. Advance all D drivers by 1 sample via ``driver_synthesis_step``
+         (FM cross-voice resolved by ``multi_level_driver_step`` topo sort).
+         Atmospheric FM offset from the previous sample is injected here.
+      2. Routing solve: x = M @ src  (M = (I − W)⁻¹ pre-computed once).
+      3. Step all SM modules (room/body physics) on the 1-sample signals.
+         SM state (CavityScene, stream state, body states) persists across
+         samples — IR tails and resonance accumulate correctly.
+      4. Extract ``feedback_pressure`` from each SM item → FM offset for
+         the next sample's driver advance.  This is the sympathetic chirp
+         coupling: atmosphere → driver → voice.
+
+    Stereo projection is applied once, after the loop completes.
+
+    Returns
+    -------
+    (left, right, output_channels, updated_persistent_aux)
+    """
+    import copy as _copy, time as _time, io, contextlib
+
+    sr = float(patch.preview_sr)
+    if persistent_aux is None:
+        persistent_aux = {}
+
+    device = torch.device("cpu")
+
+    # ── 1. Build full-sequence DriverConfig ────────────────────────────────────
+    cfg, voices, drv_state = _build_sequence_driver_config(
+        patch, play_groups, sr, device)
+
+    if cfg.D == 0:
+        z = np.zeros(total_n)
+        return z, z, np.zeros((total_n, out_channels)), dict(persistent_aux)
+
+    f0_base = cfg.f0.clone()   # save nominal per-driver frequencies
+
+    # ── 2. Pre-compute routing matrix M once ──────────────────────────────────
+    g = _working_routing_graph_for_synthesis(patch)
+    node_keys = _patch_node_keys(patch)
+    N = len(node_keys)
+    ki = {k: i for i, k in enumerate(node_keys)}
+    global_decay = float(getattr(patch.routing, "global_decay", 1.0))
+
+    W_inst = np.zeros((N, N), dtype=np.complex128)
+    for e in g.edges:
+        si, di = ki.get(e.src_key), ki.get(e.dst_key)
+        if si is None or di is None:
+            continue
+        if int(round(e.delay_s * sr)) == 0:
+            cw = complex(
+                e.weight * global_decay * math.cos(e.angle_rad),
+                e.weight * global_decay * math.sin(e.angle_rad),
+            )
+            W_inst[di, si] += cw
+    M = _safe_inverse(np.eye(N, dtype=np.complex128) - W_inst)
+
+    # ── 3. Pre-compute LFO signals (deterministic, no feedback) ───────────────
+    lfo_sigs: dict[str, np.ndarray] = {}
+    for lfo in patch.lfos:
+        lfo_sigs[lfo.key] = _synthesize_lfo_csig(lfo, total_n, sr)
+
+    # ── 4. Initialise SM modules, seed room/body caches ───────────────────────
+    sm_mods: list = []
+    sm_plugs: list = []
+    for m in patch.modules:
+        if m.module_type != "state_machine" or m.muted:
+            sm_mods.append(None)
+            sm_plugs.append(None)
+            continue
+        mc = _copy.copy(m)
+        mc._sm_state     = {}
+        mc._sm_out_cache = {}   # {out_key: 1-element complex128 array}
+        mc._sm_log_text  = ""
+        mc._sm_aux_state = dict(persistent_aux.get(m.key, {}))
+        sm_mods.append(mc)
+        plug = _load_sm_plugin(mc.sm_plugin)
+        sm_plugs.append(plug if (plug and callable(getattr(plug, "step", None))) else None)
+
+    # Per-SM-module: list of (src_key, slot) tuples.
+    # slot = edge.item_slot if set, else src_key.  The SM receives each
+    # signal under `slot` so driver/instrument identity is preserved.
+    sm_input_src: list[list[tuple]] = []
+    for mc in sm_mods:
+        if mc is None:
+            sm_input_src.append([])
+            continue
+        sm_input_src.append([
+            (e.src_key, e.item_slot if e.item_slot else e.src_key)
+            for e in g.edges
+            if e.dst_key == mc.key and e.src_key in ki
+        ])
+
+    # Voice index in DriverConfig's V dimension → node key mapping
+    voice_list = voices   # list of VoiceDefinition objects, indexed by v_idx
+
+    # ── 5. Sample-wise step loop ───────────────────────────────────────────────
+    X_full = np.zeros((N, total_n), dtype=np.complex128)
+    # Atmospheric FM offset per driver (Hz); fed back from SM feedback_pressure
+    atm_fm_hz = torch.zeros(cfg.D, dtype=torch.float64, device=device)
+
+    t0_wall = _time.monotonic()
+    log_interval = max(1, total_n // 20)
+
+    for t in range(total_n):
+        # 5a. Inject atmospheric FM and advance all D drivers by 1 sample.
+        #     multi_level_driver_step resolves FM/AM cross-voice topo ordering.
+        cfg.f0 = f0_base + atm_fm_hz
+        _d_out, v_out_t, drv_state = multi_level_driver_step(cfg, drv_state, 1, sr)
+        # v_out_t: (V, 1) complex128 — per-voice signal for this sample
+
+        # 5b. Populate Src vector: voices + LFOs + SM cached outputs
+        Src_vec = np.zeros(N, dtype=np.complex128)
+        for vi, v in enumerate(voice_list):
+            if v.key in ki:
+                Src_vec[ki[v.key]] = v_out_t[vi, 0].item()
+        for lkey, lsig in lfo_sigs.items():
+            if lkey in ki:
+                Src_vec[ki[lkey]] = lsig[t]
+        for mc in sm_mods:
+            if mc is None:
+                continue
+            for ok, cached in mc._sm_out_cache.items():
+                if ok in ki and len(cached) > 0:
+                    Src_vec[ki[ok]] = cached[0]
+
+        # 5c. Routing solve — single matrix-vector multiply (M pre-computed)
+        X_vec = M @ Src_vec
+        X_full[:, t] = X_vec
+
+        # 5d. Step each SM module on this 1-sample X; update atmospheric FM
+        atm_fm_hz.zero_()
+        for idx, (mc, plug) in enumerate(zip(sm_mods, sm_plugs)):
+            if mc is None or plug is None:
+                continue
+            sm_inputs = {
+                slot: _sm_wrap(
+                    np.array([X_vec[ki[src_key]]], dtype=np.complex128),
+                    mc.sm_use_torch)
+                for src_key, slot in sm_input_src[idx]
+            }
+            _sm_stdout = io.StringIO()
+            _sm_stderr = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(_sm_stdout), \
+                     contextlib.redirect_stderr(_sm_stderr):
+                    _sm_traj = plug.step(
+                        sm_inputs, dict(mc._sm_state), 1.0 / sr,
+                        n_items=mc.sm_n_items,
+                        use_torch=mc.sm_use_torch,
+                        params=dict(mc.sm_params),
+                        plugin_state=dict(mc._sm_aux_state or {}),
+                    )
+            except Exception:
+                continue
+
+            if not (isinstance(_sm_traj, dict) and "outputs" in _sm_traj):
+                continue
+
+            sm_out     = _sm_traj.get("outputs", {})
+            mc._sm_state     = _sm_traj.get("state", {})
+            mc._sm_aux_state = dict(_sm_traj.get("plugin_state", {}) or {})
+
+            # Cache 1-sample outputs for the next iteration's Src population
+            new_cache: dict = {}
+            for item in mc.sm_items:
+                for var in mc.sm_vars:
+                    ok = mc.sm_out_key(item, var)
+                    traj_val = sm_out.get(item, {}).get(var)
+                    if traj_val is not None:
+                        arr = np.atleast_1d(
+                            np.asarray(_sm_unwrap(traj_val), dtype=np.complex128))
+                        new_cache[ok] = arr[:1]
+            mc._sm_out_cache = new_cache
+
+            # Extract feedback_pressure per item → FM offset for each driver.
+            # Instantaneous frequency from complex: ω = angle(z) * sr / 2π.
+            # instrument_idx maps each driver slot to the SM item that owns it.
+            for i, item in enumerate(mc.sm_items):
+                fp = sm_out.get(item, {}).get("feedback_pressure")
+                if fp is None:
+                    continue
+                fp_arr = np.atleast_1d(
+                    np.asarray(_sm_unwrap(fp), dtype=np.complex128))
+                if len(fp_arr) == 0:
+                    continue
+                fb_hz = float(np.angle(fp_arr[0])) * (sr / (2.0 * math.pi))
+                mask = cfg.instrument_idx == i
+                if mask.any():
+                    atm_fm_hz[mask] += fb_hz
+
+        if (t + 1) % log_interval == 0 or t == total_n - 1:
+            elapsed = _time.monotonic() - t0_wall
+            rate = (t + 1) / max(elapsed, 1e-6)
+            eta  = (total_n - t - 1) / max(rate, 1e-6)
+            print(f"  Step solver: {t+1}/{total_n} samples "
+                  f"({100*(t+1)/total_n:.0f}%)  "
+                  f"elapsed {elapsed:.1f}s  ETA {eta:.1f}s")
+
+    # ── 6. Stereo projection — once, after the loop ────────────────────────────
+    active_mixer_keys = [m.key for m in patch.mixers if m.projection_active]
+    sys_out_keys = [k for k in _system_output_keys(patch) if k in ki]
+    has_system_routing = bool(sys_out_keys) and any(
+        e.dst_key in set(sys_out_keys) for e in g.edges
+    )
+
+    if has_system_routing:
+        out_bus = np.column_stack([
+            X_full[ki[k], :total_n].real for k in sys_out_keys
+        ])
+        if patch.normalize_output and out_bus.size:
+            peak = float(np.max(np.abs(out_bus)))
+            if peak > 1e-9:
+                out_bus /= peak
+        left  = out_bus[:, 0].astype(np.float64)
+        right = (out_bus[:, 1] if out_bus.shape[1] > 1 else out_bus[:, 0]).astype(np.float64)
+    elif active_mixer_keys:
+        mix = sum(X_full[ki[mk]] for mk in active_mixer_keys if mk in ki)
+        if patch.normalize_output:
+            peak = float(np.max(np.abs(mix)))
+            if peak > 1e-9:
+                mix /= peak
+        left, right = _apply_projection(mix, patch.projection_mode,
+                                        patch.projection_rotation_hz, sr)
+        out_bus = np.column_stack([left, right])
+    else:
+        out_bus = np.zeros((total_n, max(2, out_channels)))
+        left  = out_bus[:, 0]
+        right = out_bus[:, 1]
+
+    if out_bus.ndim == 2 and out_bus.shape[1] < out_channels:
+        out_bus = np.pad(out_bus, ((0, 0), (0, out_channels - out_bus.shape[1])))
+    elif out_bus.ndim == 1:
+        out_bus = np.column_stack([left, right])
+
+    # Harvest updated SM aux state (cavity/room scene caches)
+    updated_aux: dict = dict(persistent_aux)
+    for mc in sm_mods:
+        if mc is not None and mc.key and getattr(mc, "_sm_aux_state", None):
+            updated_aux[mc.key] = dict(mc._sm_aux_state)
+
+    elapsed_total = _time.monotonic() - t0_wall
+    print(f"  Step-solver complete: {total_n} samples, "
+          f"{cfg.D} drivers in {elapsed_total:.1f}s")
+
+    return (
+        np.asarray(left),
+        np.asarray(right),
+        out_bus.astype(np.float64),
+        updated_aux,
+    )
+
+
 def _synthesize_patch(
     patch: AnalyticPatch,
     *,
@@ -2844,6 +6832,8 @@ def _synthesize_patch(
     file_render: bool = False,
     _return_mixer_sigs: bool = False,
     _return_sidecar: bool = False,
+    _return_output_channels: bool = False,
+    _prebuilt_voice_sigs: "dict[str, np.ndarray] | None" = None,
 ) -> tuple:
     """Return (left, right) float32 stereo after routing + projection.
 
@@ -2854,33 +6844,90 @@ def _synthesize_patch(
     When no routing edges exist, falls back to direct voice sum (backward-compat).
     The '__mix__' node output is the stereo output before projection.
 
+    *_prebuilt_voice_sigs*: when provided, skip ``_synthesize_voice_sources`` and
+    use these pre-assembled full-timeline buffers directly.  This is the entry
+    point for the batched-sequence pipeline where all notes have been pre-rendered
+    and accumulated into per-voice complex128 arrays before the routing solve.
+
     When *_return_sidecar=True* the return value gains a trailing SidecarBus:
         (left, right)                           default
+        (left, right, output_channels)          _return_output_channels=True
         (left, right, sidecar)                  _return_sidecar=True
         (left, right, mixer_outs)               _return_mixer_sigs=True
-        (left, right, mixer_outs, sidecar)      both True
+        (left, right, mixer_outs, sidecar)      mixer + sidecar
     """
     lfo_map = {l.key: l for l in patch.lfos}
     p_map   = {p.key: p for p in patch.voices}
     sr      = float(patch.preview_sr)
     n       = int(patch.preview_sr * patch.duration)
 
-    # 1. Synthesize independent sources for each node
-    # voice_sigs is built incrementally so that each voice can use already-synthesized
-    # voices as FM/AM sources via voice_signal_map (C1 fix).
-    voice_sigs: dict[str, np.ndarray] = {}
-    for voice in patch.voices:
-        if _voice_effectively_muted(voice, patch):
-            voice_sigs[voice.key] = np.zeros(n, dtype=np.complex128)
-        else:
-            voice_sigs[voice.key] = _synthesize_voice(
-                voice, patch, lfo_map, p_map, voice_signal_map=voice_sigs,
-                granular_rng_seed=(None if file_render else _GRANULAR_SEED_EDITOR),
-                granular_seed_offset=granular_seed_offset)
+    # 1. Synthesize independent sources for each node.
+    # Build param overrides from the PREVIOUS frame's cached param series so that
+    # voices can be synthesised with modulation in a single solve pass.
+    # One-buffer latency is perceptually invisible at audio buffer sizes.
+    _cached_ps = patch._param_series_cache   # {} on first frame
+    _iau_mod_keys_set: set = {m.key for m in patch.modules if m.module_type == "interaural"}
+    _iau_ch_to_mod_map: dict = {}
+    for _m in patch.modules:
+        if _m.module_type == "interaural":
+            _iau_ch_to_mod_map[_m.ch1_key()] = _m
+            _iau_ch_to_mod_map[_m.ch2_key()] = _m
+            _iau_ch_to_mod_map[_m.key]       = _m
+    _voice_param_ov: dict = {}
+    _module_param_ov: dict = {}
+    _routing_param_ov: dict = {}
+    _mixer_keys = {m.key for m in patch.mixers}
+    if patch.param_nodes and _cached_ps:
+        for _pn in patch.param_nodes:
+            if _pn.key not in _cached_ps:
+                continue
+            for _tgt in _pn.targets:
+                _vk = _tgt.get("voice_key", "")
+                _at = _tgt.get("attr", "")
+                if not (_vk and _at):
+                    continue
+                if _vk in _iau_ch_to_mod_map:
+                    _mm = _iau_ch_to_mod_map[_vk]
+                    _module_param_ov.setdefault(_mm.key, {})[_at] = _cached_ps[_pn.key]
+                elif _vk in _mixer_keys:
+                    _routing_param_ov[_at] = _cached_ps[_pn.key]
+                elif _vk not in _iau_mod_keys_set:
+                    _voice_param_ov.setdefault(_vk, {})[_at] = _cached_ps[_pn.key]
+
+    voice_sigs = (
+        _prebuilt_voice_sigs
+        if _prebuilt_voice_sigs is not None
+        else _synthesize_voice_sources(
+            patch,
+            lfo_map,
+            p_map,
+            n_samples=n,
+            voice_param_overrides=_voice_param_ov,
+            param_series=_cached_ps or None,
+            file_render=file_render,
+            granular_seed_offset=granular_seed_offset,
+        )
+    )
 
     lfo_sigs: dict[str, np.ndarray] = {}
     for lfo in patch.lfos:
         lfo_sigs[lfo.key] = _synthesize_lfo_csig(lfo, n, sr)
+
+    sys_in_sigs: dict[str, np.ndarray] = {}
+    _sys_inputs = _system_input_keys(patch)
+    _sys_bufs = list(getattr(patch.system_audio, "_input_buffers", []))
+    for _i, _k in enumerate(_sys_inputs):
+        if _i < len(_sys_bufs):
+            _buf = np.asarray(_sys_bufs[_i], dtype=np.float32).reshape(-1)
+            if len(_buf) >= n:
+                _arr = _buf[-n:]
+            elif len(_buf) > 0:
+                _arr = np.pad(_buf, (0, n - len(_buf)), mode="constant")
+            else:
+                _arr = np.zeros(n, dtype=np.float32)
+        else:
+            _arr = np.zeros(n, dtype=np.float32)
+        sys_in_sigs[_k] = _arr.astype(np.complex128)
 
     # Module signals — LFO type reuses the LFO synthesiser; passthrough starts
     # at zero (its signal comes entirely from routing edges).
@@ -2902,7 +6949,20 @@ def _synthesize_patch(
                                      rate_hz=mod.rate_hz, shape=mod.shape,
                                      phase_offset=mod.phase_offset, depth=mod.depth)
                 module_sigs[mod.key] = _synthesize_lfo_csig(_tmp, n, sr)
-        else:  # passthrough / pitch_quantizer / interaural — zero independent source
+        elif mod.module_type == "state_machine":
+            module_sigs[mod.key] = np.zeros(n, dtype=np.complex128)
+            # State machine output nodes: seed Src from last-frame cache so that
+            # downstream routing sees these values in the single solve pass.
+            for ok in mod.sm_out_keys():
+                cached_sig = mod._sm_out_cache.get(ok)
+                if cached_sig is not None:
+                    Tpad = n
+                    c = cached_sig[:Tpad] if len(cached_sig) >= Tpad else np.pad(
+                        cached_sig, (0, Tpad - len(cached_sig)), mode="edge")
+                    module_sigs[ok] = c.astype(np.complex128)
+                else:
+                    module_sigs[ok] = np.zeros(n, dtype=np.complex128)
+        else:  # passthrough / pitch_quantizer — zero independent source
             module_sigs[mod.key] = np.zeros(n, dtype=np.complex128)
 
     # Control slider signals — constant DC at the slider's current scaled value.
@@ -2933,6 +6993,9 @@ def _synthesize_patch(
     for lkey, lsig in lfo_sigs.items():
         sidecar.put(lkey, "amplitude", np.abs(lsig))
         sidecar.put(lkey, "phase",     np.angle(lsig))
+    for skey, ssig in sys_in_sigs.items():
+        sidecar.put(skey, "amplitude", np.abs(ssig))
+        sidecar.put(skey, "phase",     np.angle(ssig))
     # Modules: amplitude and phase
     for mkey, msig in module_sigs.items():
         sidecar.put(mkey, "amplitude", np.abs(msig))
@@ -2943,26 +7006,24 @@ def _synthesize_patch(
             sidecar.put(sl.key, "value",
                         np.full(n, sl.scaled_value(), dtype=np.float64))
 
-    g = patch.routing
-    # Auto-route voices, LFOs, and modules to the mix bus by default.
-    # Control slider nodes and virtual patch nodes are excluded -- they target
-    # ParamNodes / pitch_quantizer modules only, never the audio mix bus.
-    mixer_keys = [m.key for m in patch.mixers]
-    default_mix_key = mixer_keys[0] if mixer_keys else "__mix__"
-    auto_signal_keys = (
-        [v.key for v in patch.voices] +
-        [l.key for l in patch.lfos] +
-        [m.key for m in patch.modules
-         if m.module_type not in ("interaural",)
-         and not (m.module_type == "lfo" and m.lfo_channels)] +
-        [m.lfo_ch_key(i)
-         for m in patch.modules if m.module_type == "lfo" and m.lfo_channels
-         for i in range(len(m.lfo_channels))]
-    )
-    g.ensure_defaults(auto_signal_keys, mix_key=default_mix_key)
+    g = _working_routing_graph_for_synthesis(patch)
+    if _routing_param_ov:
+        for _at, _arr in _routing_param_ov.items():
+            _parsed = _parse_routing_edge_attr(_at)
+            if _parsed is None:
+                continue
+            _kind, _src, _dst = _parsed
+            _scalar = float(np.mean(np.asarray(_arr, dtype=np.float64)))
+            if _kind == "mix":
+                g.set_weight(_src, _dst, _scalar)
+            elif _kind == "angle":
+                g.set_angle_rad(_src, _dst, _scalar)
+            elif _kind == "delay":
+                g.set_delay_s(_src, _dst, _scalar)
+        g.prune()
 
     # 2. Build N-node routing system (voices + lfos + modules + ctrl-sliders + mixers + param_nodes)
-    node_keys = _patch_node_keys(patch)   # all nodes including param nodes and controls
+    node_keys = _patch_node_keys(patch)
     N  = len(node_keys)
     ki = {k: i for i, k in enumerate(node_keys)}
 
@@ -2994,21 +7055,17 @@ def _synthesize_patch(
 
     # Re-synthesise with pre-roll if needed
     if max_lead > 0:
-        voice_sigs = {}
-        for voice in patch.voices:
-            if _voice_effectively_muted(voice, patch):
-                voice_sigs[voice.key] = np.zeros(n_ext, dtype=np.complex128)
-            else:
-                lead_n = lead_map.get(voice.key, 0)
-                lead_s = lead_n / sr
-                # Synthesise over [-lead_s, duration) so delayed signal arrives at t=0
-                voice_sigs[voice.key] = _synthesize_voice(
-                    voice, patch, lfo_map, p_map,
-                    t_offset=-lead_s, n_samples=n_ext,
-                    voice_signal_map=voice_sigs,
-                    granular_rng_seed=(None if file_render else _GRANULAR_SEED_EDITOR),
-                    granular_seed_offset=granular_seed_offset,
-                )
+        voice_sigs = _synthesize_voice_sources(
+            patch,
+            lfo_map,
+            p_map,
+            n_samples=n_ext,
+            t_offset_map={k: -(lead_map.get(k, 0) / sr) for k in p_map.keys()},
+            voice_param_overrides=_voice_param_ov,
+            param_series=_cached_ps or None,
+            file_render=file_render,
+            granular_seed_offset=granular_seed_offset,
+        )
         lfo_sigs = {}
         for lfo in patch.lfos:
             lead_n = lead_map.get(lfo.key, 0)
@@ -3045,6 +7102,19 @@ def _synthesize_patch(
         for cs in patch.controls:
             for sl in cs.sliders:
                 ctrl_sigs[sl.key] = np.full(n_ext, sl.scaled_value(), dtype=np.complex128)
+        sys_in_sigs = {}
+        for _i, _k in enumerate(_sys_inputs):
+            if _i < len(_sys_bufs):
+                _buf = np.asarray(_sys_bufs[_i], dtype=np.float32).reshape(-1)
+                if len(_buf) >= n_ext:
+                    _arr = _buf[-n_ext:]
+                elif len(_buf) > 0:
+                    _arr = np.pad(_buf, (0, n_ext - len(_buf)), mode="constant")
+                else:
+                    _arr = np.zeros(n_ext, dtype=np.float32)
+            else:
+                _arr = np.zeros(n_ext, dtype=np.float32)
+            sys_in_sigs[_k] = _arr.astype(np.complex128)
 
     # Source matrix: Src[i, :] = node i's independent signal.
     # Mixer nodes have NO independent source -- driven purely by routing edges.
@@ -3060,6 +7130,9 @@ def _synthesize_patch(
         if key in ki:
             Src[ki[key]] = sig[:n_ext]
     for key, sig in ctrl_sigs.items():
+        if key in ki:
+            Src[ki[key]] = sig[:n_ext]
+    for key, sig in sys_in_sigs.items():
         if key in ki:
             Src[ki[key]] = sig[:n_ext]
     for key, sig in patch_virtual_sigs.items():
@@ -3081,86 +7154,68 @@ def _synthesize_patch(
         def _make_qtransform(_h=_qhandle, _dt=_dt_q):
             def _qtransform(row: "np.ndarray") -> "np.ndarray":
                 # row is complex128: real = Hz input, imag = quadrature (preserved).
-                hz_in  = row.real
-                hz_out = np.empty(hz_in.shape[0], dtype=np.float64)
-                for _qi in range(hz_in.shape[0]):
-                    hz_out[_qi] = _h(
-                        float(hz_in[_qi]), float(hz_in[_qi]),
-                        domain="hz", dt=_dt,
-                    )
+                hz_in = np.asarray(row.real, dtype=np.float64)
+                hz_out = _h.process_series(hz_in, hz_in, domain="hz", dt=_dt)
                 # Only the real (Hz) component is quantized; imaginary stays intact.
                 return hz_out.astype(np.complex128) + 1j * row.imag
             return _qtransform
         _node_transforms[_qmod.key] = _make_qtransform()
 
-    # 3. Solve the routing system via complex per-edge solver
-    # Extends the buffer by a ringdown tail so feedback/echo decays to silence
-    # rather than being hard-truncated at the note boundary.
+    # Build coupled_transforms for interaural modules.
+    # Each module couples its ch1+ch2 rows: both accumulate routed inputs
+    # inside the solve, then _place_signal maps them to spatialized outputs.
+    # In mono (nothing wired to ch2), X[ch2_idx] is naturally zero from the
+    # solve — no copy/doubling needed.
+    def _build_iau_coupled(param_overrides: dict) -> dict:
+        """Return coupled_transforms dict for all active interaural modules.
+
+        param_overrides: {mod.key: {attr: float64 series}} for time-varying params.
+        """
+        _ct: dict = {}
+        for _im in patch.modules:
+            if _im.module_type != "interaural" or _im.muted:
+                continue
+            _c1, _c2 = _im.ch1_key(), _im.ch2_key()
+            if _c1 not in ki or _c2 not in ki:
+                continue
+            _ov = param_overrides.get(_im.key, {})
+            def _make_iau_fn(_m=_im, _ov=_ov, _c1=_c1, _c2=_c2):
+                def _bc(v_scalar, series, T):
+                    if series is not None:
+                        a = np.asarray(series, dtype=np.float64)
+                        return np.pad(a, (0, max(0, T - len(a))), mode="edge")[:T]
+                    return np.full(T, v_scalar, dtype=np.float64)
+                def _iau_fn(rows):
+                    inp1 = rows[_c1]
+                    inp2 = rows[_c2]
+                    T = inp1.shape[0]
+                    az1  = _bc(_m.iau_azimuth,    _ov.get("iau_azimuth"),    T)
+                    el1  = _bc(_m.iau_elevation,  _ov.get("iau_elevation"),  T)
+                    dst1 = _bc(_m.iau_distance,   _ov.get("iau_distance"),   T)
+                    wid1 = _bc(_m.iau_width,      _ov.get("iau_width"),      T)
+                    az2  = _bc(_m.iau_azimuth_ch2,   _ov.get("iau_azimuth_ch2"),   T)
+                    el2  = _bc(_m.iau_elevation_ch2, _ov.get("iau_elevation_ch2"), T)
+                    dst2 = _bc(_m.iau_distance_ch2,  _ov.get("iau_distance_ch2"),  T)
+                    wid2 = _bc(_m.iau_width_ch2,     _ov.get("iau_width_ch2"),     T)
+                    out1_a, out2_a = _place_signal(inp1, az1, el1, dst1, wid1)
+                    out1_b, out2_b = _place_signal(inp2, az2, el2, dst2, wid2)
+                    return {_c1: out1_a + out1_b, _c2: out2_a + out2_b}
+                return _iau_fn
+            _ct[(_c1, _c2)] = _make_iau_fn()
+        return _ct
+
+    _coupled_transforms = _build_iau_coupled(_module_param_ov)
+
+    # 3. Solve the routing system — interaural spatial transforms run inside
+    # the convergence loop, so feedback loops through spatial modules are correct.
     fb = g.feedback
     global_decay = max(0.0, 1.0 - float(fb.decay)) if fb.enabled else 1.0
     X, _ = solve_routing_with_ringdown(
         Src, g.edges, node_keys, sr, global_decay, fb,
         node_transforms=_node_transforms or None,
+        coupled_transforms=_coupled_transforms or None,
     )
 
-    # 3a. Interaural post-solve: apply spatial placement per module.
-    # ch1 and ch2 node rows in X hold the accumulated routed inputs.
-    # We spatialize them and write the outputs back, then delta-update any
-    # downstream node (typically a mixer) that has edges from ch1/ch2.
-    _iau_edge_dst: dict = {}   # dst_key -> list of (src_key, weight, angle_rad)
-    for _e in g.edges:
-        _iau_edge_dst.setdefault(_e.dst_key, []).append(_e)
-    for _imod in patch.modules:
-        if _imod.module_type != "interaural" or _imod.muted:
-            continue
-        _ck1 = _imod.ch1_key()
-        _ck2 = _imod.ch2_key()
-        if _ck1 not in ki or _ck2 not in ki:
-            continue
-        _T    = X.shape[1]
-        _ones = np.ones(_T, dtype=np.float64)
-        # Detect stereo: any edge targets ch2?
-        _ch2_has_input = any(e.dst_key == _ck2 for e in g.edges)
-        # Read accumulated inputs
-        _inp1 = X[ki[_ck1]].copy()
-        _inp2 = X[ki[_ck2]].copy() if _ch2_has_input else _inp1.copy()
-        # Build param arrays (static knob values; param-node overrides added later)
-        _az1  = _ones * _imod.iau_azimuth
-        _el1  = _ones * _imod.iau_elevation
-        _dst1 = _ones * _imod.iau_distance
-        _wid1 = _ones * _imod.iau_width
-        if _ch2_has_input:
-            _az2  = _ones * _imod.iau_azimuth_ch2
-            _el2  = _ones * _imod.iau_elevation_ch2
-            _dst2 = _ones * _imod.iau_distance_ch2
-            _wid2 = _ones * _imod.iau_width_ch2
-        else:
-            _az2, _el2, _dst2, _wid2 = _az1, _el1, _dst1, _wid1
-        # Spatialize: each input produces (ch1_contribution, ch2_contribution)
-        _out1_a, _out2_a = _place_signal(_inp1, _az1, _el1, _dst1, _wid1)
-        _out1_b, _out2_b = _place_signal(_inp2, _az2, _el2, _dst2, _wid2)
-        _new1 = _out1_a + _out1_b
-        _new2 = _out2_a + _out2_b
-        # Delta-update downstream nodes that receive from ch1 or ch2
-        for _src_key, _new_sig, _old_sig in (
-            (_ck1, _new1, _inp1),
-            (_ck2, _new2, _inp2),
-        ):
-            _delta = _new_sig - _old_sig
-            for _e in g.edges:
-                if _e.src_key != _src_key or _e.delay_s != 0.0:
-                    continue
-                _di = ki.get(_e.dst_key)
-                if _di is None:
-                    continue
-                _cw = complex(
-                    _e.weight * global_decay * math.cos(_e.angle_rad),
-                    _e.weight * global_decay * math.sin(_e.angle_rad),
-                )
-                X[_di] += _cw * _delta
-        # Write spatialized signals into the ch1/ch2 rows
-        X[ki[_ck1]] = _new1
-        X[ki[_ck2]] = _new2
 
     # 3a-ii. LFO channel scale post-solve.
     # Each multi-channel LFO channel's Src already holds amplitude*lfo_waveform.
@@ -3206,30 +7261,39 @@ def _synthesize_patch(
         if _k in ki:
             sidecar.put(_k, "routed", X[ki[_k], :_X_n].copy())
 
-    # 3b. Param-routing evaluation pass.
-    # For each ParamNode: extract a float64 time series from the routing output,
-    # then re-synthesise any voice whose attributes are targeted by a param node.
-    # A second routing solve produces the final X used for output.
+    # 3b. Update param-series cache for the NEXT frame.
+    # Extract each param node's output from the just-solved X and store it on
+    # the patch.  Next frame's voice synthesis will consume these values before
+    # the solve, so there is exactly one solve per frame (one-buffer latency).
+    def extract_param_series(csig: np.ndarray, extractor: str) -> np.ndarray:
+        if extractor == "real":
+            return csig.real.astype(np.float64)
+        if extractor == "imag":
+            return csig.imag.astype(np.float64)
+        if extractor == "phase":
+            return np.angle(csig)
+        if extractor == "energy":
+            return (csig.real ** 2 + csig.imag ** 2).astype(np.float64)
+        if extractor == "rms":
+            mag = np.abs(csig)
+            kernel = np.ones(128) / 128.0
+            return np.convolve(mag, kernel, mode="same").astype(np.float64)
+        # default: magnitude
+        return np.abs(csig).astype(np.float64)
+
     if patch.param_nodes:
-        # Extract each param node's float64 time series directly from its own
-        # routing output (X[ki[pn.key]]), which already accumulated all signal
-        # routed into it via RoutingEdges — no separate ParamEdge list needed.
+        _new_cache: dict = {}
         X_cols = X.shape[1]
-        param_series: dict = {}
         for pn in patch.param_nodes:
             if pn.key not in ki:
                 continue
             raw = extract_param_series(X[ki[pn.key], :min(n, X_cols)], pn.extractor)
             lo, hi = float(pn.low), float(pn.high)
             span = hi - lo
-            # L3 fix: when no routing edge targets this ParamNode (graph fact, not
-            # signal fact), use default_value.  A live edge with a zero signal means
-            # the control is genuinely at zero and must map to lo — don't override it.
             is_driven = any(pe.dst_key == pn.key for pe in patch.routing.param_edges)
             if not is_driven:
-                param_series[pn.key] = np.full(len(raw), np.clip(float(pn.default_value), lo, hi))
+                _new_cache[pn.key] = np.full(len(raw), np.clip(float(pn.default_value), lo, hi))
                 continue
-            # Normalise to [0,1] from the observed range, then scale to [low, high]
             if span > 0:
                 rmin, rmax = float(raw.min()), float(raw.max())
                 rspan = rmax - rmin
@@ -3237,137 +7301,162 @@ def _synthesize_patch(
                     raw = (raw - rmin) / rspan * span + lo
                 else:
                     raw = np.full_like(raw, lo + span * 0.5)
-            param_series[pn.key] = np.clip(raw, lo, hi)
-        # Build per-voice and per-module param override dicts
-        _iau_mod_keys: set = {m.key for m in patch.modules if m.module_type == "interaural"}
-        _iau_ch_to_mod: dict = {}
-        for _m in patch.modules:
-            if _m.module_type == "interaural":
-                _iau_ch_to_mod[_m.ch1_key()] = _m
-                _iau_ch_to_mod[_m.ch2_key()] = _m
-                _iau_ch_to_mod[_m.key]       = _m
-        voice_param_overrides: dict = {}
-        module_param_overrides: dict = {}   # mod.key -> {attr: series}
-        for pn in patch.param_nodes:
-            if pn.key not in param_series:
-                continue
-            for tgt in pn.targets:
-                vk = tgt.get("voice_key", "")
-                at = tgt.get("attr", "")
-                if not (vk and at):
-                    continue
-                if vk in _iau_ch_to_mod:
-                    _m = _iau_ch_to_mod[vk]
-                    module_param_overrides.setdefault(_m.key, {})[at] = param_series[pn.key]
-                elif vk not in _iau_mod_keys:
-                    voice_param_overrides.setdefault(vk, {})[at] = param_series[pn.key]
-        # Re-synthesise modulated voices and rebuild Src for final routing solve
-        if voice_param_overrides:
-            Src2 = np.zeros_like(Src)
-            for key, sig in lfo_sigs.items():
-                if key in ki:
-                    Src2[ki[key]] = sig[:Src2.shape[1]]
-            voice_sigs2: dict[str, np.ndarray] = {}
-            for voice in patch.voices:
-                if _voice_effectively_muted(voice, patch):
-                    Src2[ki[voice.key]] = 0.0
-                    voice_sigs2[voice.key] = np.zeros(n_ext, dtype=np.complex128)
-                elif voice.key in voice_param_overrides:
-                    lead_s = lead_map.get(voice.key, 0) / sr if max_lead > 0 else 0.0
-                    n_syn  = n_ext
-                    t_off  = -lead_s if max_lead > 0 else 0.0
-                    sig = _synthesize_voice(
-                        voice, patch, lfo_map, p_map, t_off, n_syn,
-                        param_overrides=voice_param_overrides[voice.key],
-                        voice_signal_map=voice_sigs2,
-                        param_series=param_series,
-                        granular_rng_seed=(None if file_render else _GRANULAR_SEED_EDITOR),
-                        granular_seed_offset=granular_seed_offset,
-                    )[:n_ext]
-                    voice_sigs2[voice.key] = sig
-                    Src2[ki[voice.key]] = sig
-                elif voice.key in ki:
-                    Src2[ki[voice.key]] = voice_sigs[voice.key][:n_ext]
-            X, _ = solve_routing_with_ringdown(
-                Src2, g.edges, node_keys, sr, global_decay, fb,
-                node_transforms=_node_transforms or None)
-            if max_lead > 0:
-                X = X[:, max_lead: max_lead + n + estimate_ringdown_samples(
-                    g.edges, sr, global_decay, fb)]
-            # Re-run interaural post-solve on the updated X
-            for _imod in patch.modules:
-                if _imod.module_type != "interaural" or _imod.muted:
-                    continue
-                _ck1 = _imod.ch1_key()
-                _ck2 = _imod.ch2_key()
-                if _ck1 not in ki or _ck2 not in ki:
-                    continue
-                _T    = X.shape[1]
-                _ones = np.ones(_T, dtype=np.float64)
-                _ch2_has_input = any(e.dst_key == _ck2 for e in g.edges)
-                _inp1 = X[ki[_ck1]].copy()
-                _inp2 = X[ki[_ck2]].copy() if _ch2_has_input else _inp1.copy()
-                _ov   = module_param_overrides.get(_imod.key, {})
-                def _get(attr, default, T=_T):
-                    v = _ov.get(attr)
-                    if v is None:
-                        return _ones * default
-                    a = np.asarray(v, dtype=np.float64)
-                    return np.pad(a, (0, max(0, T - len(a))), mode="edge")[:T]
-                _az1  = _get("iau_azimuth",    _imod.iau_azimuth)
-                _el1  = _get("iau_elevation",  _imod.iau_elevation)
-                _dst1 = _get("iau_distance",   _imod.iau_distance)
-                _wid1 = _get("iau_width",      _imod.iau_width)
-                if _ch2_has_input:
-                    _az2  = _get("iau_azimuth_ch2",   _imod.iau_azimuth_ch2)
-                    _el2  = _get("iau_elevation_ch2", _imod.iau_elevation_ch2)
-                    _dst2 = _get("iau_distance_ch2",  _imod.iau_distance_ch2)
-                    _wid2 = _get("iau_width_ch2",     _imod.iau_width_ch2)
-                else:
-                    _az2, _el2, _dst2, _wid2 = _az1, _el1, _dst1, _wid1
-                _out1_a, _out2_a = _place_signal(_inp1, _az1, _el1, _dst1, _wid1)
-                _out1_b, _out2_b = _place_signal(_inp2, _az2, _el2, _dst2, _wid2)
-                _new1 = _out1_a + _out1_b
-                _new2 = _out2_a + _out2_b
-                for _src_key, _new_sig, _old_sig in (
-                    (_ck1, _new1, _inp1), (_ck2, _new2, _inp2),
-                ):
-                    _delta = _new_sig - _old_sig
-                    for _e in g.edges:
-                        if _e.src_key != _src_key or _e.delay_s != 0.0:
-                            continue
-                        _di = ki.get(_e.dst_key)
-                        if _di is None:
-                            continue
-                        _cw = complex(
-                            _e.weight * global_decay * math.cos(_e.angle_rad),
-                            _e.weight * global_decay * math.sin(_e.angle_rad),
-                        )
-                        X[_di] += _cw * _delta
-                X[ki[_ck1]] = _new1
-                X[ki[_ck2]] = _new2
+            _new_cache[pn.key] = np.clip(raw, lo, hi)
+        patch._param_series_cache = _new_cache
 
-    # 4. Sum all projection-active mixers, optionally normalize, then project.
-    # Meta-mixers (projection_active=False) contribute analytically to other
-    # mixer nodes via routing edges but never reach the PCM bus.
+    # 3c. State machine post-solve step.
+    # Each state_machine module reads its accumulated routing inputs from X,
+    # calls the plugin's step() with those inputs + current state, writes the
+    # output trajectories back to X for its output nodes, and caches them for
+    # the next frame's Src pre-population.  Delta-propagation covers zero-delay
+    # downstream edges.
+    _T_sm = X.shape[1]
+    for _smmod in patch.modules:
+        if _smmod.module_type != "state_machine" or _smmod.muted:
+            continue
+        _smmod._sm_log_text = ""
+        if not _smmod.sm_items or not _smmod.sm_vars or not _smmod.sm_plugin:
+            continue
+        _sm_plug = _load_sm_plugin(_smmod.sm_plugin)
+        if _sm_plug is None or not callable(getattr(_sm_plug, "step", None)):
+            continue
+        # Gather inputs: all signals that have edges targeting the main node.
+        # When an edge has item_slot set, the SM receives the signal under that
+        # name so driver/instrument identity is preserved through the boundary.
+        _sm_inputs: dict = {}
+        for _e in g.edges:
+            if _e.dst_key == _smmod.key and _e.src_key in ki:
+                _slot = _e.item_slot if _e.item_slot else _e.src_key
+                _sm_inputs[_slot] = _sm_wrap(
+                    X[ki[_e.src_key], :_T_sm].copy(), _smmod.sm_use_torch)
+        _sm_dt = 1.0 / max(sr, 1.0)
+        _sm_state_in = dict(_smmod._sm_state)
+        _sm_stdout = io.StringIO()
+        _sm_stderr = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(_sm_stdout), contextlib.redirect_stderr(_sm_stderr):
+                _sm_traj = _sm_plug.step(
+                    _sm_inputs, _sm_state_in, _sm_dt,
+                    n_items=_smmod.sm_n_items,
+                    use_torch=_smmod.sm_use_torch,
+                    params=dict(_smmod.sm_params),
+                    plugin_state=dict(getattr(_smmod, "_sm_aux_state", {}) or {}),
+                )
+        except Exception:
+            _captured = []
+            _stdout_txt = _sm_stdout.getvalue()
+            _stderr_txt = _sm_stderr.getvalue()
+            if _stdout_txt:
+                _captured.append(_stdout_txt.rstrip())
+            if _stderr_txt:
+                _captured.append(_stderr_txt.rstrip())
+            _captured.append(traceback.format_exc().rstrip())
+            _smmod._sm_log_text = "\n".join(x for x in _captured if x)
+            continue
+        if isinstance(_sm_traj, dict) and "outputs" in _sm_traj:
+            _sm_outputs = _sm_traj.get("outputs", {}) or {}
+            _sm_state_out = _sm_traj.get("state", {}) or {}
+            _sm_log_extra = _sm_plugin_log_text(_sm_traj.get("log"))
+            _sm_aux_state_out = _sm_traj.get("plugin_state", {}) or {}
+        else:
+            _sm_outputs = _sm_traj or {}
+            _sm_state_out = {}
+            _sm_log_extra = _sm_plugin_log_text(_sm_traj.get("log")) if isinstance(_sm_traj, dict) else ""
+            _sm_aux_state_out = {}
+        _sm_log_parts = []
+        _stdout_txt = _sm_stdout.getvalue()
+        _stderr_txt = _sm_stderr.getvalue()
+        if _stdout_txt:
+            _sm_log_parts.append(_stdout_txt.rstrip())
+        if _stderr_txt:
+            _sm_log_parts.append(_stderr_txt.rstrip())
+        if _sm_log_extra:
+            _sm_log_parts.append(_sm_log_extra.rstrip())
+        _smmod._sm_log_text = "\n".join(x for x in _sm_log_parts if x)
+        # Write trajectories back to X output nodes + cache + update state
+        _new_sm_state: dict = {}
+        for _item in _smmod.sm_items:
+            _new_sm_state[_item] = {}
+            for _var in _smmod.sm_vars:
+                _ok = _smmod.sm_out_key(_item, _var)
+                if _ok not in ki:
+                    continue
+                _traj_val = _sm_outputs.get(_item, {}).get(_var)
+                if _traj_val is None:
+                    continue
+                _traj_arr = _sm_unwrap(_traj_val)
+                # Pad/trim to match X columns
+                if len(_traj_arr) < _T_sm:
+                    _traj_arr = np.pad(_traj_arr, (0, _T_sm - len(_traj_arr)), mode="edge")
+                _csig = _traj_arr[:_T_sm].astype(np.complex128)
+                _old  = X[ki[_ok]].copy()
+                _delta = _csig - _old
+                # Delta-propagate to zero-delay downstream edges
+                for _e2 in g.edges:
+                    if _e2.src_key != _ok or _e2.delay_s != 0.0:
+                        continue
+                    _di = ki.get(_e2.dst_key)
+                    if _di is None:
+                        continue
+                    _cw2 = complex(
+                        _e2.weight * global_decay * math.cos(_e2.angle_rad),
+                        _e2.weight * global_decay * math.sin(_e2.angle_rad),
+                    )
+                    X[_di] += _cw2 * _delta
+                X[ki[_ok]] = _csig
+                _smmod._sm_out_cache[_ok] = _csig[:n].copy()
+            for _state_var in _smmod.sm_state_vars:
+                _state_val = _sm_state_out.get(_item, {}).get(_state_var, None)
+                if _state_val is not None:
+                    _new_sm_state[_item][_state_var] = float(_state_val)
+                    continue
+                _traj_val = _sm_outputs.get(_item, {}).get(_state_var)
+                if _traj_val is None:
+                    _traj_val = _sm_traj.get(_item, {}).get(_state_var) if isinstance(_sm_traj, dict) else None
+                if _traj_val is None:
+                    _new_sm_state[_item][_state_var] = float(
+                        _sm_state_in.get(_item, {}).get(_state_var, 0.0)
+                    )
+                    continue
+                _traj_arr = _sm_unwrap(_traj_val)
+                if len(_traj_arr) > 0:
+                    _new_sm_state[_item][_state_var] = float(_traj_arr[-1])
+        _smmod._sm_state = _new_sm_state
+        _smmod._sm_aux_state = dict(_sm_aux_state_out)
+
+    # 4. Resolve the main PCM output bus.
+    # If the user has routed signal into the built-in system output channels,
+    # those channels define the main output directly. Otherwise, preserve the
+    # legacy active-mixer projection path.
     active_mixer_keys = [m.key for m in patch.mixers if m.projection_active]
-    if not active_mixer_keys:
-        # No active output mixer — silence
-        _silence = (np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32))
-        if _return_mixer_sigs and _return_sidecar:
-            return (*_silence, {}, sidecar)
-        if _return_mixer_sigs:
-            return (*_silence, {})
-        if _return_sidecar:
-            return (*_silence, sidecar)
-        return _silence
-    mix = sum(X[ki[mk]] for mk in active_mixer_keys if mk in ki)
-    if patch.normalize_output:
-        peak = float(np.max(np.abs(mix)))
-        if peak > 1e-9:
-            mix /= peak
-    out = _apply_projection(mix, patch.projection_mode,
-                            patch.projection_rotation_hz, sr)
+    sys_out_keys = [k for k in _system_output_keys(patch) if k in ki]
+    has_system_routing = bool(sys_out_keys) and any(
+        e.dst_key in set(sys_out_keys) for e in g.edges
+    )
+    if has_system_routing:
+        out_channels = np.column_stack([
+            X[ki[_k], :n].real.astype(np.float32) for _k in sys_out_keys
+        ]).astype(np.float32, copy=False)
+        if patch.normalize_output and out_channels.size:
+            peak = float(np.max(np.abs(out_channels)))
+            if peak > 1e-9:
+                out_channels /= peak
+        left = out_channels[:, 0]
+        right = out_channels[:, 1] if out_channels.shape[1] > 1 else out_channels[:, 0]
+    elif active_mixer_keys:
+        mix = sum(X[ki[mk]] for mk in active_mixer_keys if mk in ki)
+        if patch.normalize_output:
+            peak = float(np.max(np.abs(mix)))
+            if peak > 1e-9:
+                mix /= peak
+        left, right = _apply_projection(mix, patch.projection_mode,
+                                        patch.projection_rotation_hz, sr)
+        out_channels = np.column_stack([left, right]).astype(np.float32, copy=False)
+    else:
+        out_channels = np.zeros((n, max(2, len(sys_out_keys) or 2)), dtype=np.float32)
+        left = out_channels[:, 0]
+        right = out_channels[:, 1]
+    out = (left, right)
     if _return_mixer_sigs:
         _mixer_outs: dict = {}
         for _m in patch.mixers:
@@ -3380,9 +7469,17 @@ def _synthesize_patch(
                 _ml, _mr = _apply_projection(_m_sig, patch.projection_mode,
                                              patch.projection_rotation_hz, sr)
                 _mixer_outs[_m.key] = (_ml, _mr)
+        ret: list = [*out]
+        if _return_output_channels:
+            ret.append(out_channels)
+        ret.append(_mixer_outs)
         if _return_sidecar:
-            return (*out, _mixer_outs, sidecar)
-        return (*out, _mixer_outs)
+            ret.append(sidecar)
+        return tuple(ret)
+    if _return_output_channels and _return_sidecar:
+        return (*out, out_channels, sidecar)
+    if _return_output_channels:
+        return (*out, out_channels)
     if _return_sidecar:
         return (*out, sidecar)
     return out
@@ -3528,6 +7625,12 @@ _ROOT_HZ_SNAPS: tuple[float, ...] = (
     466.16,      # A466 — Chorton (German high baroque)
 )
 _ROOT_HZ_SNAP_TOL = 0.015   # ±1.5 % relative tolerance
+
+# Standard audio sample rates — used for slider snapping / tick marks
+_COMMON_SAMPLE_RATES: tuple[int, ...] = (
+    8000, 11025, 16000, 22050, 32000,
+    44100, 48000, 88200, 96000, 176400, 192000,
+)
 
 # Western chromatic pitch-class names (12-TET / MIDI convention)
 _NOTE_NAMES_12 = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -4302,9 +8405,14 @@ class EditorCanvas:
 
     # Modes available on LFO nodes
     _LFO_NODE_MODES   = [EditorMode.WAVEFORM, EditorMode.LFO_VIEW, EditorMode.COMPLEX_RI]
-    _PARAM_NODE_MODES  = [EditorMode.PARAM_ROUTING]
-    _PARAM_NODE_LABELS = ["Param Routing"]
+    _PARAM_NODE_MODES  = [EditorMode.WAVEFORM, EditorMode.COMPLEX_RI,
+                          EditorMode.COMPLEX_MP, EditorMode.PARAM_ROUTING]
+    _PARAM_NODE_LABELS = ["Wave", "Re/Im", "Mag/Phase", "Param Routing"]
     _LFO_NODE_LABELS = ["Wave", "LFOs", "Re/Im"]
+    _STATE_MACHINE_NODE_MODES = [EditorMode.ROUTING, EditorMode.WAVEFORM,
+                                 EditorMode.COMPLEX_RI, EditorMode.COMPLEX_MP,
+                                 EditorMode.SM_LOG]
+    _STATE_MACHINE_NODE_LABELS = ["Routing", "Wave", "Re/Im", "Mag/Phase", "Log"]
 
     # Modes available on regular voice nodes (everything except ROUTING)
     _VOICE_MODES  = [EditorMode.WAVEFORM, EditorMode.ENVELOPE, EditorMode.CHIRP,
@@ -4314,14 +8422,34 @@ class EditorCanvas:
     _VOICE_LABELS = ["Wave", "Envelope", "Chirp", "Re/Im", "Mag/Phase",
                      "Harmonics", "LFOs", "FM", "Mix"]
 
+    # Modes for the __patch__ pseudo-node (patch-global views)
+    _PATCH_NODE_MODES  = [EditorMode.WAVEFORM, EditorMode.MIX, EditorMode.SCORE, EditorMode.PIANO_ROLL, EditorMode.PLACEMENT]
+    _PATCH_NODE_LABELS = ["Wave", "Mix", "Score", "Roll", "Placement"]
+    _SYSTEM_NODE_MODES  = [EditorMode.WAVEFORM, EditorMode.MIX]
+    _SYSTEM_NODE_LABELS = ["Wave", "Mix"]
+
     def _visible_modes(self, patch: "AnalyticPatch") -> tuple[list, list]:
         """Return (modes, labels) appropriate for the currently active node."""
+        if self.active_key == "__patch__":
+            modes, labels = list(self._PATCH_NODE_MODES), list(self._PATCH_NODE_LABELS)
+            # Hide Placement tab when placement resonator is disabled
+            res_cfg = getattr(patch, "placement_resonator", None)
+            if res_cfg is None or not res_cfg.enabled:
+                pairs = [(m, l) for m, l in zip(modes, labels) if m != EditorMode.PLACEMENT]
+                modes = [p[0] for p in pairs]
+                labels = [p[1] for p in pairs]
+            return modes, labels
+        if self.active_key == "__system__":
+            return self._SYSTEM_NODE_MODES, self._SYSTEM_NODE_LABELS
         if any(m.key == self.active_key for m in patch.mixers):
             return self._MIX_NODE_MODES, self._MIX_NODE_LABELS
         if any(l.key == self.active_key for l in patch.lfos):
             return self._LFO_NODE_MODES, self._LFO_NODE_LABELS
         if any(pn.key == self.active_key for pn in patch.param_nodes):
             return self._PARAM_NODE_MODES, self._PARAM_NODE_LABELS
+        mod = next((m for m in patch.modules if m.key == self.active_key), None)
+        if mod is not None and mod.module_type == "state_machine":
+            return self._STATE_MACHINE_NODE_MODES, self._STATE_MACHINE_NODE_LABELS
         return self._VOICE_MODES, self._VOICE_LABELS
 
     def __init__(self) -> None:
@@ -4348,6 +8476,8 @@ class EditorCanvas:
         self._tail_X:         np.ndarray | None = None
         self._tail_node_keys: list | None       = None
         self._tail_note_n:    int               = 0
+        self._sm_log_text:    str               = ""
+        self._sm_log_scroll:  int               = 0
         # Tail view toggle — when True show the full ringdown tail in plots
         self.show_tail: bool = False
 
@@ -4374,6 +8504,11 @@ class EditorCanvas:
         # Seed offset for granular voices — advanced by viewer when seed_animate is on
         self.granular_seed_offset: int = 0
 
+        # ── Placement viewer state ───────────────────────────────────────────
+        self._placement_perf_rects: list = []   # [{rect, pf_key, part_key}, ...]
+        self._placement_hover_key: str = ""
+        self._placement_zoom: float = 1.0
+
         # Mix-tab per-series visibility toggles and signal cache
         self._mix_series_hidden: set[str] = set()
         self._mix_toggle_rects:  list[dict] = []
@@ -4382,6 +8517,19 @@ class EditorCanvas:
         self._mix_left_cache:    "np.ndarray | None" = None
         self._mix_right_cache:   "np.ndarray | None" = None
         self._mix_t_ax:          "np.ndarray | None" = None
+        self._score_scroll_y:    int = 0
+        self._score_max_scroll:  int = 0
+        self._piano_note_rects:  list[dict] = []
+        self._piano_ctrl_rects:  dict[str, pygame.Rect] = {}
+        self._piano_selected_note_id: str = ""
+        self._piano_dragging: bool = False
+        self._piano_drag_kind: str = ""
+        self._piano_drag_note_id: str = ""
+        self._piano_drag_origin: dict = {}
+        self._piano_pitch_snap: bool = True
+        self._piano_time_snap_idx: int = 2
+        self._piano_len_snap_idx: int = 2
+        self._piano_rest_mode: bool = False
 
         # Hover state
         self._hover_cp: int = -1   # index of hovered knot (-1 = none)
@@ -4445,6 +8593,35 @@ class EditorCanvas:
         tab_w = tab_area_w // max(len(modes), 1)
         return [pygame.Rect(cx + i * tab_w, cy, tab_w, MODEBAR_H)
                 for i in range(len(modes))]
+
+    def _set_plot_y_range_from_arrays(self, *arrays: np.ndarray,
+                                      symmetric: bool = True,
+                                      min_half_span: float = 1e-3) -> None:
+        """Autoscale the plot to contain the given series with a small margin."""
+        vals: list[np.ndarray] = []
+        for arr in arrays:
+            if arr is None:
+                continue
+            a = np.asarray(arr, dtype=np.float64)
+            if a.size == 0:
+                continue
+            vals.append(a)
+        if not vals:
+            self.plot.y_min, self.plot.y_max = -1.05, 1.05
+            self.v_lo, self.v_hi = -1.05, 1.05
+            return
+        merged = np.concatenate(vals)
+        lo = float(np.min(merged))
+        hi = float(np.max(merged))
+        if symmetric:
+            peak = max(abs(lo), abs(hi), min_half_span)
+            pad = max(peak * 0.08, min_half_span * 0.5)
+            self.v_lo, self.v_hi = -(peak + pad), (peak + pad)
+        else:
+            span = max(hi - lo, min_half_span)
+            pad = max(span * 0.08, min_half_span * 0.5)
+            self.v_lo, self.v_hi = lo - pad, hi + pad
+        self.plot.y_min, self.plot.y_max = self.v_lo, self.v_hi
 
     # ---- Data refresh ------------------------------------------------------
 
@@ -4515,6 +8692,16 @@ class EditorCanvas:
 
         # --- find active voice ---
         voice = next((p for p in patch.voices if p.key == active_key), None)
+        is_lfo_node = any(l.key == active_key for l in patch.lfos)
+        is_param_node = any(pn.key == active_key for pn in patch.param_nodes)
+        active_module = next((m for m in patch.modules if m.key == active_key), None)
+        is_module_node = active_module is not None
+        is_control_node = any(
+            sl.key == active_key
+            for cs in patch.controls
+            for sl in cs.sliders
+        )
+        self._sm_log_text = ""
 
         # --- special case: mixer node selected ---
         is_mixer_node = any(m.key == active_key for m in patch.mixers)
@@ -4522,10 +8709,7 @@ class EditorCanvas:
             # Synthesize routing system and expose the raw complex mix signal
             lfo_map = {l.key: l for l in patch.lfos}
             p_map   = {v.key: v for v in patch.voices}
-            _g = patch.routing
-            _mixer_keys_all = [m.key for m in patch.mixers]
-            _default_mix_key = _mixer_keys_all[0] if _mixer_keys_all else active_key
-            _g.ensure_defaults(_patch_node_keys(patch), mix_key=_default_mix_key)
+            _g = _working_routing_graph_for_synthesis(patch)
             _node_keys = _patch_node_keys(patch)
             _ki = {k: i for i, k in enumerate(_node_keys)}
             _N = len(_node_keys)
@@ -4566,6 +8750,34 @@ class EditorCanvas:
                 self.mode = EditorMode.ROUTING
             # Let mode-specific plotting below handle COMPLEX_RI / COMPLEX_MP / MIX
             # but skip voice-specific blocks — fall through with voice=None, sig set
+        elif is_lfo_node or is_param_node or is_module_node or is_control_node:
+            left_out, right_out, _sc = _synthesize_patch(
+                patch,
+                granular_seed_offset=self.granular_seed_offset,
+                _return_sidecar=True,
+            )
+            if cancel.is_set(): return
+            self._last_sidecar = _sc
+            routed = _sc.get(active_key, "routed", n)
+            if routed is None:
+                routed = _sc.get(active_key, "value", n)
+                if routed is not None:
+                    routed = np.asarray(routed, dtype=np.float64).astype(np.complex128)
+            if routed is None:
+                routed = np.zeros(n, dtype=np.complex128)
+            else:
+                routed = np.asarray(routed, dtype=np.complex128)
+            self._complex_sig = routed
+            sig = routed.real.astype(np.float32)
+            self._signal = sig
+            self._env_curve = np.zeros(len(routed), dtype=np.float32)
+            self._chirp_f = np.zeros(len(routed), dtype=np.float32)
+            t_ax = np.linspace(0.0, 1.0, len(routed), endpoint=False, dtype=np.float32)
+            self._chirp_t = t_ax
+            self._phase_cycles = np.zeros(len(routed), dtype=np.float64)
+            if active_module is not None and active_module.module_type == "state_machine":
+                self._sm_log_text = str(getattr(active_module, "_sm_log_text", "") or "")
+                self._sm_log_scroll = max(0, min(self._sm_log_scroll, max(0, len(self._sm_log_text.splitlines()) - 1)))
         else:
             # --- waveform (complex analytic) ---
             lfo_map = {l.key: l for l in patch.lfos}
@@ -4632,9 +8844,11 @@ class EditorCanvas:
         # --- configure PlotWidget ---
         if active_key == "__mix__":
             col = (200, 200, 100)
+            series_label = "Mix"
             env = self._env_curve  # zeros — ENVELOPE mode not valid for __mix__
         else:
-            col = tuple(voice.color[:3]) if voice else (100, 160, 255)
+            col = tuple(voice.color[:3]) if voice else _routing_node_color(active_key, patch)
+            series_label = voice.label if voice else _routing_node_label(active_key, patch)
             env = self._env_curve
 
         self.plot.series.clear()
@@ -4642,12 +8856,11 @@ class EditorCanvas:
 
         if self.mode == EditorMode.WAVEFORM:
             self.plot.add_series(PlotSeries(
-                key="wave", label=voice.label if voice else "wave",
+                key="wave", label=series_label,
                 color=col, line=True, dots=False,
                 data_x=t_ax, data_y=sig,
             ))
-            self.plot.y_min, self.plot.y_max = -1.05, 1.05
-            self.v_lo, self.v_hi = -1.05, 1.05
+            self._set_plot_y_range_from_arrays(sig)
 
         elif self.mode == EditorMode.ENVELOPE:
             self.plot.add_series(PlotSeries(
@@ -4678,8 +8891,7 @@ class EditorCanvas:
             csig = self._complex_sig
             re_data = csig.real.astype(np.float32) if csig is not None else sig
             im_data = csig.imag.astype(np.float32) if csig is not None else np.zeros_like(sig)
-            self.plot.y_min, self.plot.y_max = -1.05, 1.05
-            self.v_lo, self.v_hi = -1.05, 1.05
+            self._set_plot_y_range_from_arrays(re_data, im_data)
             self.plot.add_series(PlotSeries(
                 key="re", label="Re",
                 color=col, line=True, dots=False,
@@ -4860,8 +9072,6 @@ class EditorCanvas:
                                                "color": (60, 255, 60)})
             # Populate plot series (respects per-series visibility toggles)
             self._refresh_mix_series(patch)
-            self.plot.y_min, self.plot.y_max = -1.05, 1.05
-            self.v_lo, self.v_hi = -1.05, 1.05
 
         if cancel.is_set(): return
         self.t_lo, self.t_hi = 0.0, 1.0
@@ -4876,6 +9086,7 @@ class EditorCanvas:
         if t_ax is None:
             return
         self.plot.series.clear()
+        plotted: list[np.ndarray] = []
         for info in self._mix_series_info:
             key = info["key"]
             if key in self._mix_series_hidden:
@@ -4899,6 +9110,8 @@ class EditorCanvas:
                 color=info["color"], line=True, dots=False,
                 data_x=t_ax, data_y=data_y,
             ))
+            plotted.append(np.asarray(data_y, dtype=np.float64))
+        self._set_plot_y_range_from_arrays(*plotted)
 
     # ---- Mix-tab projection controls ---------------------------------------
 
@@ -4940,6 +9153,586 @@ class EditorCanvas:
         x += 70
         rects["sr_inc"] = pygame.Rect(x, y0 + pad, 18, h - 2 * pad)
         return rects
+
+    def _piano_snap_defs(self, bar_s: float) -> tuple[list[tuple[str, float | None]], list[tuple[str, float | None]]]:
+        time_opts = [("Free", None), ("1/1", bar_s), ("1/2", bar_s * 0.5),
+                     ("1/4", bar_s * 0.25), ("1/8", bar_s * 0.125),
+                     ("1/16", bar_s * 0.0625)]
+        len_opts = [("Free", None), ("1/1", bar_s), ("1/2", bar_s * 0.5),
+                    ("1/4", bar_s * 0.25), ("1/8", bar_s * 0.125),
+                    ("1/16", bar_s * 0.0625)]
+        self._piano_time_snap_idx = max(0, min(self._piano_time_snap_idx, len(time_opts) - 1))
+        self._piano_len_snap_idx = max(0, min(self._piano_len_snap_idx, len(len_opts) - 1))
+        return time_opts, len_opts
+
+    def _piano_note_by_id(self, patch: "AnalyticPatch", note_id: str) -> "ResolvedNote | None":
+        return next((n for n in patch.resolved_notes if n.note_id == note_id), None)
+
+    def _render_piano_roll_view(self, surf: pygame.Surface,
+                                patch: "AnalyticPatch",
+                                font: "pygame.font.Font | None") -> None:
+        fb = font or self._font_()
+        fh = fb.get_height()
+        w, h = surf.get_size()
+        _sync_resolved_notes(patch, preserve_locked=True)
+        notes: list[ResolvedNote] = sorted(
+            patch.resolved_notes,
+            key=lambda n: (n.start_time, n.fundamental_hz, n.voice_key, n.layer_key),
+        )
+
+        title = fb.render("Piano Roll  —  resolved union score", True, (190, 205, 230))
+        surf.blit(title, (8, 6))
+        beat_s = 60.0 / max(getattr(patch, "seq_bpm", 120.0), 1.0)
+        beats_per_bar = patch.beats_per_bar()
+        bar_s = _bar_duration_s_for_patch(patch, beat_s)
+        time_opts, len_opts = self._piano_snap_defs(bar_s)
+
+        ctrl_y = fh + 12
+        ctrl_h = fh + 6
+        ctrl_x = 8
+        self._piano_ctrl_rects = {}
+        ctrl_specs = [
+            ("sync", "Sync"),
+            ("rest", f"Rest: {'On' if self._piano_rest_mode else 'Off'}"),
+            ("pitch", f"Pitch: {'Semi' if self._piano_pitch_snap else 'Free'}"),
+            ("time", f"Time: {time_opts[self._piano_time_snap_idx][0]}"),
+            ("length", f"Length: {len_opts[self._piano_len_snap_idx][0]}"),
+        ]
+        for key, label in ctrl_specs:
+            tw = fb.size(label)[0] + 12
+            rect = pygame.Rect(ctrl_x, ctrl_y, tw, ctrl_h)
+            pygame.draw.rect(surf, (46, 52, 72), rect, border_radius=3)
+            pygame.draw.rect(surf, (88, 102, 136), rect, 1, border_radius=3)
+            surf.blit(fb.render(label, True, (215, 225, 245)), (rect.x + 6, rect.y + 3))
+            self._piano_ctrl_rects[key] = rect
+            ctrl_x += tw + 6
+
+        info = f"Locked {sum(1 for n in notes if n.locked)}/{len(notes)}"
+        info_sf = fb.render(info, True, (120, 135, 160))
+        surf.blit(info_sf, (w - info_sf.get_width() - 8, ctrl_y + 3))
+
+        roll_top = ctrl_y + ctrl_h + 8
+        roll_bottom = h - 8
+        guide_w = 72
+        roll_x0 = guide_w + 4
+        roll_w = max(32, w - roll_x0 - 6)
+        roll_h = max(32, roll_bottom - roll_top)
+        roll_rect = pygame.Rect(roll_x0, roll_top, roll_w, roll_h)
+        guide_rect = pygame.Rect(0, roll_top, guide_w, roll_h)
+        self._piano_note_rects = []
+
+        pygame.draw.rect(surf, (12, 16, 22), guide_rect)
+        pygame.draw.rect(surf, (10, 12, 18), roll_rect)
+
+        if not notes:
+            surf.blit(fb.render("No resolved notes. Click Sync after enabling sequence data.",
+                                True, (120, 130, 150)), (8, roll_top + 8))
+            return
+
+        min_midi = int(math.floor(min(_hz_to_midi(n.fundamental_hz) for n in notes))) - 2
+        max_midi = int(math.ceil(max(_hz_to_midi(n.fundamental_hz) for n in notes))) + 2
+        lane_count = max(12, max_midi - min_midi + 1)
+        lane_h = max(10, min(22, roll_h // lane_count if lane_count > 0 else 14))
+        content_h = lane_count * lane_h
+        if content_h < roll_h:
+            roll_top += (roll_h - content_h) // 2
+            guide_rect = pygame.Rect(0, roll_top, guide_w, content_h)
+            roll_rect = pygame.Rect(roll_x0, roll_top, roll_w, content_h)
+            roll_h = content_h
+
+        total_end = max(n.start_time + n.duration_s for n in notes)
+        total_end = max(total_end, _bar_duration_s_for_patch(patch, beat_s))
+        px_per_s = roll_w / max(total_end, 1e-6)
+
+        for lane in range(lane_count):
+            midi_note = max_midi - lane
+            y = roll_top + lane * lane_h
+            is_black = (midi_note % 12) in {1, 3, 6, 8, 10}
+            octave = (midi_note // 12) - 1
+            shade = (22 + (octave % 3) * 8, 24 + (octave % 2) * 8, 30 + (octave % 4) * 6)
+            bg = (shade[0] + 6, shade[1] + 6, shade[2] + 6) if is_black else shade
+            pygame.draw.rect(surf, bg, pygame.Rect(guide_rect.x, y, guide_rect.w, lane_h))
+            pygame.draw.rect(surf, (16, 20, 28) if is_black else (24, 28, 36),
+                             pygame.Rect(roll_rect.x, y, roll_rect.w, lane_h))
+            pygame.draw.line(surf, (36, 42, 54), (roll_rect.x, y), (roll_rect.right, y))
+            if midi_note % 12 == 0 or lane_h >= 16:
+                lbl = _midi_note_name(midi_note)
+                surf.blit(fb.render(lbl, True, (205, 212, 225) if midi_note % 12 == 0 else (120, 126, 138)),
+                          (6, y + 1))
+
+        n_bars = max(1, int(math.ceil(total_end / max(bar_s, 1e-6))))
+        for bi in range(n_bars + 1):
+            x = roll_x0 + int(bi * bar_s * px_per_s)
+            pygame.draw.line(surf, (95, 105, 135), (x, roll_top), (x, roll_top + roll_h), 1)
+            if bi < n_bars:
+                surf.blit(fb.render(f"B{bi + 1}", True, (120, 130, 150)), (x + 3, roll_top + 2))
+            beat_count = max(1, int(round(beats_per_bar * 4.0)) if abs(beats_per_bar - round(beats_per_bar)) > 0.001 else int(round(beats_per_bar)))
+            sub_beat_s = bar_s / max(1, beat_count)
+            for sub in range(1, beat_count):
+                sx = x + int(sub * sub_beat_s * px_per_s)
+                if sx < roll_x0 + roll_w:
+                    pygame.draw.line(surf, (44, 50, 64), (sx, roll_top), (sx, roll_top + roll_h), 1)
+
+        voice_colors = {v.key: tuple(v.color[:3]) for v in patch.voices}
+        for note in notes:
+            midi_f = _hz_to_midi(note.fundamental_hz)
+            lane_pos = max_midi - midi_f
+            nx = roll_x0 + int(note.start_time * px_per_s)
+            nw = max(4, int(note.duration_s * px_per_s))
+            ny = roll_top + int(lane_pos * lane_h)
+            rect = pygame.Rect(nx, ny + 1, nw, max(6, lane_h - 2))
+            base = voice_colors.get(note.voice_key, (130, 170, 220))
+            layer_tint = 22 if note.layer_key == "all" else 0
+            fill = tuple(min(255, c + layer_tint) for c in base)
+            if note.is_rest:
+                fill = (70, 55, 55) if note.locked else (52, 42, 42)
+            if note.locked:
+                fill = tuple(min(255, c + 18) for c in fill)
+            pygame.draw.rect(surf, fill, rect, border_radius=3)
+            border = (245, 230, 130) if note.locked else (24, 24, 28)
+            if note.note_id == self._piano_selected_note_id:
+                border = (255, 255, 255)
+            pygame.draw.rect(surf, border, rect, 2 if note.note_id == self._piano_selected_note_id else 1,
+                             border_radius=3)
+            handle = pygame.Rect(rect.right - 6, rect.y, 6, rect.h)
+            self._piano_note_rects.append({"note_id": note.note_id, "rect": rect, "handle": handle})
+            if rect.w > 30:
+                note_lbl = ("REST" if note.is_rest else f"{note.voice_label}:{note.layer_key}")
+                surf.blit(fb.render(note_lbl, True, (16, 18, 22)), (rect.x + 4, rect.y + 1))
+
+    def _piano_snap_time(self, value: float, bar_s: float, snap_idx: int) -> float:
+        opts, _ = self._piano_snap_defs(bar_s)
+        snap = opts[snap_idx][1]
+        if snap is None or snap <= 0:
+            return max(0.0, value)
+        return max(0.0, round(value / snap) * snap)
+
+    def _piano_snap_length(self, value: float, bar_s: float, snap_idx: int) -> float:
+        _, opts = self._piano_snap_defs(bar_s)
+        snap = opts[snap_idx][1]
+        if snap is None or snap <= 0:
+            return max(1.0 / 48000.0, value)
+        return max(snap, round(value / snap) * snap)
+
+    def _handle_piano_roll_event(self, event: pygame.event.Event,
+                                 patch: "AnalyticPatch",
+                                 win_w: int, win_h: int) -> bool:
+        cx, cy, cw, ch = self._canvas_rect(win_w, win_h)
+        plot_y = cy + MODEBAR_H
+        if event.type == MOUSEBUTTONUP and event.button == 1:
+            self._piano_dragging = False
+            self._piano_drag_kind = ""
+            self._piano_drag_note_id = ""
+            return False
+
+        if event.type == MOUSEMOTION and self._piano_dragging:
+            note = self._piano_note_by_id(patch, self._piano_drag_note_id)
+            if note is None:
+                return False
+            beat_s = 60.0 / max(getattr(patch, "seq_bpm", 120.0), 1.0)
+            bar_s = _bar_duration_s_for_patch(patch, beat_s)
+            lx = event.pos[0] - cx
+            ly = event.pos[1] - plot_y
+            dx = lx - self._piano_drag_origin.get("mouse_x", lx)
+            dy = ly - self._piano_drag_origin.get("mouse_y", ly)
+            px_per_s = self._piano_drag_origin.get("px_per_s", 100.0)
+            lane_h = max(1.0, self._piano_drag_origin.get("lane_h", 14.0))
+            note.locked = True
+            if self._piano_drag_kind == "move":
+                start = self._piano_drag_origin["start_time"] + dx / px_per_s
+                midi = self._piano_drag_origin["midi"] - dy / lane_h
+                note.start_time = self._piano_snap_time(start, bar_s, self._piano_time_snap_idx)
+                if not note.is_rest:
+                    if self._piano_pitch_snap:
+                        midi = round(midi)
+                    note.fundamental_hz = _midi_to_hz(midi)
+            elif self._piano_drag_kind == "resize":
+                dur = self._piano_drag_origin["duration_s"] + dx / px_per_s
+                note.duration_s = self._piano_snap_length(dur, bar_s, self._piano_len_snap_idx)
+            self._surf_dirty = True
+            return True
+
+        if not hasattr(event, "pos"):
+            return False
+        lx = event.pos[0] - cx
+        ly = event.pos[1] - plot_y
+
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            for key, rect in self._piano_ctrl_rects.items():
+                if rect.collidepoint(lx, ly):
+                    if key == "sync":
+                        _sync_resolved_notes(patch, preserve_locked=True)
+                    elif key == "rest":
+                        self._piano_rest_mode = not self._piano_rest_mode
+                    elif key == "pitch":
+                        self._piano_pitch_snap = not self._piano_pitch_snap
+                    elif key == "time":
+                        time_opts, _ = self._piano_snap_defs(
+                            _bar_duration_s_for_patch(patch))
+                        self._piano_time_snap_idx = (self._piano_time_snap_idx + 1) % len(time_opts)
+                    elif key == "length":
+                        _, len_opts = self._piano_snap_defs(
+                            _bar_duration_s_for_patch(patch))
+                        self._piano_len_snap_idx = (self._piano_len_snap_idx + 1) % len(len_opts)
+                    self._surf_dirty = True
+                    return True
+            for info in reversed(self._piano_note_rects):
+                if info["handle"].collidepoint(lx, ly) or info["rect"].collidepoint(lx, ly):
+                    note = self._piano_note_by_id(patch, info["note_id"])
+                    if note is None:
+                        continue
+                    self._piano_selected_note_id = note.note_id
+                    self._piano_dragging = True
+                    self._piano_drag_kind = "resize" if info["handle"].collidepoint(lx, ly) else "move"
+                    self._piano_drag_note_id = note.note_id
+                    rect = info["rect"]
+                    lane_h = max(1.0, rect.h)
+                    px_per_s = rect.w / max(note.duration_s, 1e-6)
+                    self._piano_drag_origin = {
+                        "mouse_x": lx,
+                        "mouse_y": ly,
+                        "start_time": note.start_time,
+                        "duration_s": note.duration_s,
+                        "midi": _hz_to_midi(note.fundamental_hz),
+                        "px_per_s": px_per_s,
+                        "lane_h": lane_h,
+                    }
+                    self._surf_dirty = True
+                    return True
+            if self._piano_rest_mode:
+                beat_s = 60.0 / max(getattr(patch, "seq_bpm", 120.0), 1.0)
+                bar_s = _bar_duration_s_for_patch(patch, beat_s)
+                guide_w = 72
+                roll_x0 = guide_w + 4
+                roll_w = max(32, cw - roll_x0 - 6)
+                total_end = max((n.start_time + n.duration_s for n in patch.resolved_notes), default=bar_s)
+                total_end = max(total_end, bar_s)
+                note_start = self._piano_snap_time(
+                    max(0.0, (lx - roll_x0) / max(1.0, roll_w) * total_end),
+                    bar_s, self._piano_time_snap_idx)
+                note_len = self._piano_snap_length(bar_s * 0.25, bar_s, self._piano_len_snap_idx)
+                voice = next((v for v in patch.voices if not getattr(v, "muted", False)), None)
+                if voice is not None:
+                    rest = ResolvedNote(
+                        note_id=uuid.uuid4().hex[:12],
+                        voice_key=voice.key,
+                        voice_label=getattr(voice, "label", voice.key[:6]),
+                        layer_key="mask",
+                        start_time=note_start,
+                        duration_s=note_len,
+                        fundamental_hz=float(getattr(voice, "freq_hz", 440.0)),
+                        velocity=0.0,
+                        locked=True,
+                        is_rest=True,
+                    )
+                    patch.resolved_notes.append(rest)
+                    self._piano_selected_note_id = rest.note_id
+                    self._surf_dirty = True
+                    return True
+            self._piano_selected_note_id = ""
+            self._surf_dirty = True
+            return False
+
+        if event.type == MOUSEBUTTONDOWN and event.button == 3:
+            for info in reversed(self._piano_note_rects):
+                if info["rect"].collidepoint(lx, ly):
+                    note = self._piano_note_by_id(patch, info["note_id"])
+                    if note is not None:
+                        note.locked = not note.locked
+                        self._piano_selected_note_id = note.note_id
+                        self._surf_dirty = True
+                        return True
+        return False
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  Placement vector diagram
+    # ══════════════════════════════════════════════════════════════════════
+
+    def _render_placement_view(self, surf: pygame.Surface,
+                               patch: "AnalyticPatch",
+                               font: "pygame.font.Font | None") -> None:
+        """Top-down orchestral stage diagram with performer dots, face arrows, room walls and baffles."""
+        fb = font or self._font_()
+        fh = fb.get_height()
+        w, h = surf.get_size()
+
+        # Title
+        title = fb.render("Placement  —  click to clone · right-click to remove", True, (180, 200, 230))
+        surf.blit(title, (8, 6))
+
+        res_cfg = getattr(patch, "placement_resonator", None)
+        if res_cfg is None or not res_cfg.enabled:
+            msg = fb.render("(placement resonator disabled — enable it in the patch panel)", True, (120, 120, 140))
+            surf.blit(msg, (w // 2 - msg.get_width() // 2, h // 2))
+            self._placement_perf_rects = []
+            return
+
+        parts = getattr(patch, "parts", [])
+        if not parts:
+            msg = fb.render("(solve to populate performers)", True, (100, 100, 120))
+            surf.blit(msg, (w // 2 - msg.get_width() // 2, h // 2))
+            self._placement_perf_rects = []
+            return
+
+        # ── Coordinate mapping: world meters → pixel ──
+        room_r = max(1.0, res_cfg.room_radius)
+        margin_top = fh + 20
+        margin = 30
+        view_w = w - 2 * margin
+        view_h = h - margin_top - margin
+        cx_px = margin + view_w // 2
+        cy_px = margin_top + view_h // 2
+        extent = room_r * 1.15  # a bit wider than room radius
+        scale = min(view_w, view_h) / (2.0 * extent) * self._placement_zoom
+
+        def w2px(wx: float, wy: float) -> tuple[int, int]:
+            return int(cx_px + wx * scale), int(cy_px - wy * scale)
+
+        # ── Room boundary ──
+        room_shape = getattr(res_cfg, "room_shape", "polygon")
+        if room_shape == "circular":
+            rpx = int(room_r * scale)
+            pygame.draw.circle(surf, (40, 45, 58), (cx_px, cy_px), rpx, 1)
+        else:
+            # Polygon vertices from the resonance plugin
+            verts_xy = [
+                (-room_r * 0.95, -room_r * 0.70),
+                (room_r, -room_r * 0.62),
+                (room_r * 0.88, room_r * 0.72),
+                (-room_r * 0.84, room_r * 0.64),
+            ]
+            pts = [w2px(vx, vy) for vx, vy in verts_xy]
+            pygame.draw.polygon(surf, (40, 45, 58), pts, 1)
+
+        # ── Center baffle line ──
+        baffle_y_world = res_cfg.room_height * 0.42
+        baffle_len = room_r * 0.5
+        bx0, by0 = w2px(-baffle_len, 0)
+        bx1, by1 = w2px(baffle_len, 0)
+        pygame.draw.line(surf, (65, 55, 85), (bx0, by0), (bx1, by1), 1)
+
+        # ── Conductor marker at origin ──
+        cond = w2px(0.0, 0.0)
+        pygame.draw.circle(surf, (200, 180, 100), cond, 5, 0)
+        cs = fb.render("C", True, (40, 35, 20))
+        surf.blit(cs, (cond[0] - cs.get_width() // 2, cond[1] - cs.get_height() // 2))
+
+        # ── Receiver position ──
+        rx, ry = float(getattr(res_cfg, "receiver_pos_x", 0.0)), float(getattr(res_cfg, "receiver_pos_y", 0.0))
+        rpx_pos = w2px(rx, ry)
+        pygame.draw.circle(surf, (100, 180, 220), rpx_pos, 4, 0)
+        rs = fb.render("R", True, (20, 40, 60))
+        surf.blit(rs, (rpx_pos[0] - rs.get_width() // 2, rpx_pos[1] - rs.get_height() // 2))
+
+        # ── Section arcs (visual guide) ──
+        _sec_col = (30, 35, 48)
+        for sec_name, (sec_angle, sec_radius, _sec_z, sec_arc) in _STAGE_SECTIONS.items():
+            sa_rad = math.radians(sec_angle)
+            arc_half = math.radians(sec_arc * 0.5)
+            a0 = sa_rad - arc_half
+            a1 = sa_rad + arc_half
+            n_seg = 12
+            pts_arc = []
+            for si in range(n_seg + 1):
+                a = a0 + (a1 - a0) * si / n_seg
+                sx = sec_radius * math.sin(a)
+                sy = -sec_radius * math.cos(a)
+                pts_arc.append(w2px(sx, sy))
+            if len(pts_arc) >= 2:
+                pygame.draw.lines(surf, _sec_col, False, pts_arc, 1)
+
+        # ── Register color map ──
+        _REG_PERF_COL: dict[str, tuple[int, int, int]] = {
+            "bass":  (90, 60, 160),
+            "mid":   (60, 120, 160),
+            "high":  (80, 180, 120),
+        }
+
+        # ── Draw performers ──
+        perf_rects: list[dict] = []
+        for pt in parts:
+            reg = getattr(pt, "register", "all")
+            dot_col = _REG_PERF_COL.get(reg, (120, 120, 140))
+            hover_col = tuple(min(255, c + 50) for c in dot_col)
+            for ch in getattr(pt, "chairs", []):
+                for pf in getattr(ch, "performers", []):
+                    px, py = float(pf.x), float(pf.y)
+                    sx, sy = w2px(px, py)
+                    pf_key = str(pf.key)
+                    is_hover = (pf_key == self._placement_hover_key)
+                    r = 6 if is_hover else 4
+                    col = hover_col if is_hover else dot_col
+                    pygame.draw.circle(surf, col, (sx, sy), r, 0)
+
+                    # Face direction arrow (aperture normal)
+                    fx, fy = float(pf.face_x), float(pf.face_y)
+                    arrow_len = 0.35  # meters
+                    ax, ay = w2px(px + fx * arrow_len, py + fy * arrow_len)
+                    pygame.draw.line(surf, col, (sx, sy), (ax, ay), 1)
+
+                    # Store clickable rect
+                    hit_r = pygame.Rect(sx - 8, sy - 8, 16, 16)
+                    perf_rects.append({"rect": hit_r, "pf_key": pf_key,
+                                       "part_key": pt.key, "screen": (sx, sy)})
+
+        self._placement_perf_rects = perf_rects
+
+        # ── Legend ──
+        lx_start = 8
+        ly = h - fh - 8
+        for reg, col in _REG_PERF_COL.items():
+            pygame.draw.rect(surf, col, pygame.Rect(lx_start, ly + 2, 10, fh - 4))
+            lbl = fb.render(reg, True, (160, 170, 190))
+            surf.blit(lbl, (lx_start + 14, ly))
+            lx_start += 14 + lbl.get_width() + 12
+        # Total count
+        total = sum(pt.player_count for pt in parts)
+        ts = fb.render(f"  {total} performers", True, (130, 140, 160))
+        surf.blit(ts, (lx_start, ly))
+
+    def _handle_placement_event(self, event: pygame.event.Event,
+                                patch: "AnalyticPatch",
+                                win_w: int, win_h: int) -> bool:
+        """Handle mouse events in PLACEMENT mode: clone (left) / remove (right) performers."""
+        cx, cy, cw, ch = self._canvas_rect(win_w, win_h)
+        plot_rect = pygame.Rect(cx, cy + MODEBAR_H, cw, ch - MODEBAR_H)
+        mx, my = pygame.mouse.get_pos()
+
+        # ── Scroll-wheel zoom ──
+        if event.type == MOUSEWHEEL and plot_rect.collidepoint(mx, my):
+            factor = 1.1 if event.y > 0 else 0.9
+            self._placement_zoom = max(0.3, min(5.0, self._placement_zoom * factor))
+            self._surf_dirty = True
+            return True
+
+        # ── Hover tracking ──
+        if event.type == MOUSEMOTION and plot_rect.collidepoint(mx, my):
+            # Convert to surface-local coords
+            lx = mx - cx
+            ly = my - cy - MODEBAR_H
+            old_hover = self._placement_hover_key
+            self._placement_hover_key = ""
+            for info in reversed(self._placement_perf_rects):
+                if info["rect"].collidepoint(lx, ly):
+                    self._placement_hover_key = info["pf_key"]
+                    break
+            if self._placement_hover_key != old_hover:
+                self._surf_dirty = True
+            return False  # don't consume motion events
+
+        if not plot_rect.collidepoint(mx, my):
+            return False
+
+        lx = mx - cx
+        ly = my - cy - MODEBAR_H
+
+        # ── Left click: clone performer ──
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            for info in reversed(self._placement_perf_rects):
+                if info["rect"].collidepoint(lx, ly):
+                    pm = PlacementModule(patch)
+                    pm.increment_player_count(info["part_key"], +1)
+                    self._surf_dirty = True
+                    return True
+
+        # ── Right click: remove performer (down to required minimum) ──
+        if event.type == MOUSEBUTTONDOWN and event.button == 3:
+            for info in reversed(self._placement_perf_rects):
+                if info["rect"].collidepoint(lx, ly):
+                    pm = PlacementModule(patch)
+                    pm.increment_player_count(info["part_key"], -1)
+                    self._surf_dirty = True
+                    return True
+
+        return False
+
+    def _render_score_view(self, surf: pygame.Surface,
+                           patch: "AnalyticPatch",
+                           font: "pygame.font.Font | None") -> None:
+        """Draw a phrase table: voices as rows, bars as columns, step cells inside."""
+        fb    = font or self._font_()
+        fh    = fb.get_height()
+        w, h  = surf.get_size()
+
+        # Header
+        title = fb.render("Score  —  phrase × voices", True, (180, 200, 230))
+        surf.blit(title, (8, 6))
+        y = fh + 14
+
+        beat_s  = 60.0 / max(getattr(patch, "seq_bpm", 120), 1)
+        n_bars  = max(1, len(patch.rhythm_phrase))
+        voices  = [v for v in patch.voices if not getattr(v, "muted", False)]
+
+        bar_w   = max(40, (w - 120) // max(1, n_bars))
+        row_h   = fh + 8
+        col_x0  = 120
+
+        # Column headers (bar numbers)
+        for bi in range(n_bars):
+            bx = col_x0 + bi * bar_w
+            surf.blit(fb.render(f"B{bi + 1}", True, (120, 120, 150)), (bx + 4, y))
+        y += fh + 4
+
+        rows_y0 = y
+        legend_y = h - fh - 6
+        viewport_h = max(0, legend_y - rows_y0 - 4)
+        content_h = max(0, len(voices) * (row_h + 2) - 2)
+        self._score_max_scroll = max(0, content_h - viewport_h)
+        self._score_scroll_y = max(0, min(self._score_scroll_y, self._score_max_scroll))
+
+        old_clip = surf.get_clip()
+        surf.set_clip(pygame.Rect(0, rows_y0, w, max(0, legend_y - rows_y0)))
+
+        # One row per voice
+        for vi, voice in enumerate(voices):
+            ry = rows_y0 + vi * (row_h + 2) - self._score_scroll_y
+            if ry + row_h < rows_y0 or ry > legend_y:
+                continue
+            # Row label
+            reg   = getattr(voice, "register", "all")
+            lbl   = f"{getattr(voice, 'label', voice.key[:6])} [{reg}]"
+            surf.blit(fb.render(lbl[:14], True, (180, 160, 220)), (4, ry + 2))
+
+            stack = patch.score_stack_for_voice(voice)
+            pg    = stack[-1]  # most specific page for this voice
+            phrase = pg.rhythm_phrase
+            pats   = pg.rhythm_patterns
+
+            for bi in range(n_bars):
+                bx   = col_x0 + bi * bar_w
+                br   = pygame.Rect(bx, ry, bar_w - 2, row_h)
+                pat_i = phrase[bi % len(phrase)] if phrase else 0
+                pat   = pats[min(pat_i, len(pats) - 1)] if pats else None
+                has_custom = len(stack) > 1
+
+                bg = (28, 20, 44) if not has_custom else (20, 28, 44)
+                pygame.draw.rect(surf, bg, br, border_radius=2)
+                pygame.draw.rect(surf, (52, 40, 78) if not has_custom else (40, 60, 100),
+                                 br, 1, border_radius=2)
+
+                if pat is not None and pg.rhythm_enabled:
+                    div   = max(1, pg.rhythm_division)
+                    cw_s  = max(2, (bar_w - 4) // div)
+                    for si in range(div):
+                        on = pat.steps[si] if si < len(pat.steps) else False
+                        if on:
+                            sx = bx + 2 + si * cw_s
+                            sc = pygame.Rect(sx, ry + 2, max(1, cw_s - 1), row_h - 4)
+                            pygame.draw.rect(surf, (110, 68, 180), sc, border_radius=1)
+                else:
+                    # Rhythm disabled — show a muted bar indicator
+                    surf.blit(fb.render("—", True, (60, 55, 80)), (bx + bar_w // 2 - 4, ry + 2))
+
+        surf.set_clip(old_clip)
+
+        # Legend
+        ly = h - fh - 6
+        surf.blit(fb.render("■ custom page   □ default page   ■ on-step",
+                             True, (80, 80, 100)), (8, ly))
+        if self._score_max_scroll > 0:
+            scroll_lbl = f"Scroll {self._score_scroll_y}/{self._score_max_scroll}"
+            scroll_sf = fb.render(scroll_lbl, True, (95, 105, 125))
+            surf.blit(scroll_sf, (w - scroll_sf.get_width() - 8, ly))
 
     def _render_mix_series_toggles(self, surf: pygame.Surface,
                                     font: pygame.font.Font,
@@ -5057,6 +9850,9 @@ class EditorCanvas:
         # ── Mode-tab background ──
         _gl_rect(cx, cy, cw, MODEBAR_H, win_w, win_h, (0.08, 0.08, 0.11, 1.0))
         vis_modes, vis_labels = self._visible_modes(patch)
+        if self.mode not in vis_modes and vis_modes:
+            self.mode = vis_modes[0]
+            self._surf_dirty = True
         # Reserve the rightmost 44 px of the mode bar for the tail-toggle button
         _TAIL_BTN_W = 44
         tab_rects = self._mode_tab_rects(win_w, win_h, patch)
@@ -5139,6 +9935,55 @@ class EditorCanvas:
                     for line, col in lines:
                         self._surf.blit(fb.render(line, True, col), (12, y))
                         y += fh + 3
+                self._tex = _surface_to_gl_tex(self._surf, self._tex)
+                self._surf_dirty = False
+        elif self.mode == EditorMode.SM_LOG:
+            mod = next((m for m in patch.modules if m.key == self.active_key), None)
+            if self._surf_dirty:
+                self._surf.fill(_PY_BG)
+                fb = font or self._font_()
+                fh = fb.get_height()
+                y = 12
+                title = fb.render("State Machine Log", True, (180, 210, 230))
+                self._surf.blit(title, (12, y))
+                y += fh + 8
+                log_text = self._sm_log_text
+                if mod is not None:
+                    hdr = [
+                        (f"Module: {mod.label}  [{mod.key[:8]}]", (200, 200, 210)),
+                        (f"Plugin: {mod.sm_plugin or '(none)'}", (140, 190, 230)),
+                        ("", (0, 0, 0)),
+                    ]
+                    for line, col in hdr:
+                        self._surf.blit(fb.render(line, True, col), (12, y))
+                        y += fh + 3
+                lines = log_text.splitlines() if log_text else ["(no plugin output captured)"]
+                visible_n = max(1, (plot_h - y - 8) // max(1, fh + 2))
+                max_scroll = max(0, len(lines) - visible_n)
+                self._sm_log_scroll = max(0, min(self._sm_log_scroll, max_scroll))
+                for line in lines[self._sm_log_scroll:self._sm_log_scroll + visible_n]:
+                    if y > plot_h - fh - 4:
+                        break
+                    self._surf.blit(fb.render(line or " ", True, (180, 185, 195)), (12, y))
+                    y += fh + 2
+                self._tex = _surface_to_gl_tex(self._surf, self._tex)
+                self._surf_dirty = False
+        elif self.mode == EditorMode.SCORE:
+            if self._surf_dirty:
+                self._surf.fill(_PY_BG)
+                self._render_score_view(self._surf, patch, font)
+                self._tex = _surface_to_gl_tex(self._surf, self._tex)
+                self._surf_dirty = False
+        elif self.mode == EditorMode.PIANO_ROLL:
+            if self._surf_dirty:
+                self._surf.fill(_PY_BG)
+                self._render_piano_roll_view(self._surf, patch, font)
+                self._tex = _surface_to_gl_tex(self._surf, self._tex)
+                self._surf_dirty = False
+        elif self.mode == EditorMode.PLACEMENT:
+            if self._surf_dirty:
+                self._surf.fill(_PY_BG)
+                self._render_placement_view(self._surf, patch, font)
                 self._tex = _surface_to_gl_tex(self._surf, self._tex)
                 self._surf_dirty = False
         elif self._surf_dirty:
@@ -5313,6 +10158,37 @@ class EditorCanvas:
                 self.routing_view.mark_dirty()
             return consumed
 
+        if self.mode == EditorMode.SM_LOG:
+            if event.type == MOUSEWHEEL:
+                lines = self._sm_log_text.splitlines() if self._sm_log_text else ["(no plugin output captured)"]
+                step = -int(event.y)
+                max_scroll = max(0, len(lines) - 1)
+                new_scroll = max(0, min(self._sm_log_scroll + step, max_scroll))
+                if new_scroll != self._sm_log_scroll:
+                    self._sm_log_scroll = new_scroll
+                    self._surf_dirty = True
+                    return True
+        if self.mode == EditorMode.SCORE and event.type == MOUSEWHEEL:
+            cx, cy, cw, ch = self._canvas_rect(win_w, win_h)
+            plot_rect = pygame.Rect(cx, cy + MODEBAR_H, cw, ch - MODEBAR_H)
+            mx, my = pygame.mouse.get_pos()
+            if plot_rect.collidepoint(mx, my):
+                step = max(24, self._font_().get_height() + 10)
+                new_scroll = max(0, min(self._score_scroll_y - int(event.y) * step,
+                                        self._score_max_scroll))
+                if new_scroll != self._score_scroll_y:
+                    self._score_scroll_y = new_scroll
+                    self._surf_dirty = True
+                    return True
+        if self.mode == EditorMode.PIANO_ROLL:
+            consumed = self._handle_piano_roll_event(event, patch, win_w, win_h)
+            if consumed:
+                return True
+        if self.mode == EditorMode.PLACEMENT:
+            consumed = self._handle_placement_event(event, patch, win_w, win_h)
+            if consumed:
+                return True
+
         if event.type == MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
 
@@ -5484,6 +10360,155 @@ class EditorCanvas:
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PlacementModule — derives seating / performer allocation from the patch's
+# solved Part list (populated by resolve_parts_from_patch after each solve).
+# ---------------------------------------------------------------------------
+
+class PlacementModule:
+    """Manages performer allocation across resolved :class:`Part` objects."""
+
+    def __init__(self, patch: "AnalyticPatch") -> None:
+        self._patch = patch
+
+    # ── Part access ──────────────────────────────────────────────────────────
+
+    @property
+    def parts(self) -> "list[Part]":
+        return self._patch.parts
+
+    def get_part(self, key: str) -> "Part | None":
+        for pt in self._patch.parts:
+            if pt.key == key:
+                return pt
+        return None
+
+    # ── Mutation helpers ─────────────────────────────────────────────────────
+
+    def set_player_count(self, part_key: str, count: int) -> None:
+        """Clamp count to [1, 64] and apply to the matching Part."""
+        count = max(1, min(64, int(count)))
+        pt = self.get_part(part_key)
+        if pt is not None:
+            required = max(1, int(pt.solver_hints.get("required_chairs", 1)))
+            pt.player_count = max(required, count)
+            _refresh_part_placement_layout(self._patch)
+
+    def increment_player_count(self, part_key: str, delta: int = 1) -> None:
+        pt = self.get_part(part_key)
+        if pt is not None:
+            self.set_player_count(part_key, pt.player_count + delta)
+
+    # ── Summary queries ──────────────────────────────────────────────────────
+
+    def total_performers(self) -> int:
+        return sum(pt.player_count for pt in self._patch.parts)
+
+    def placement_summary(self) -> "list[dict]":
+        return [
+            {
+                "key": pt.key,
+                "label": pt.label,
+                "register": pt.register,
+                "seq_role": pt.seq_role,
+                "voice_role": pt.voice_role,
+                "voice_keys": list(pt.voice_keys),
+                "player_count": pt.player_count,
+                "solver_hints": dict(pt.solver_hints),
+                "chairs": [
+                    {
+                        "key": ch.key,
+                        "label": ch.label,
+                        "chair_index": ch.chair_index,
+                        "specificity_rank": ch.specificity_rank,
+                        "source_voice_keys": list(ch.source_voice_keys),
+                        "source_layer_keys": list(ch.source_layer_keys),
+                        "performer_count": ch.performer_count,
+                        "solver_hints": dict(ch.solver_hints),
+                        "performers": [
+                            {
+                                "key": pf.key,
+                                "label": pf.label,
+                                "performer_index": pf.performer_index,
+                                "source_voice_keys": list(pf.source_voice_keys),
+                                "source_layer_keys": list(pf.source_layer_keys),
+                                "assigned_note_keys": list(pf.assigned_note_keys),
+                                "body_type": pf.body_type,
+                                "x": pf.x,
+                                "y": pf.y,
+                                "z": pf.z,
+                                "face_x": pf.face_x,
+                                "face_y": pf.face_y,
+                                "face_z": pf.face_z,
+                                "radius": pf.radius,
+                                "angle_deg": pf.angle_deg,
+                                "geometric_delay_ms": pf.geometric_delay_ms,
+                                "humanization_ms": pf.humanization_ms,
+                                "phase_offset_rad": pf.phase_offset_rad,
+                                "gain_db": pf.gain_db,
+                                "pan": pf.pan,
+                            }
+                            for pf in ch.performers
+                        ],
+                    }
+                    for ch in pt.chairs
+                ],
+            }
+            for pt in self._patch.parts
+        ]
+
+    def resonator_summary(self) -> dict:
+        cfg = getattr(self._patch, "placement_resonator", PlacementResonatorConfig())
+        return {
+            "enabled": bool(cfg.enabled),
+            "deployed_module_key": str(cfg.deployed_module_key),
+            "item_count": int(_placement_resonator_item_count(self._patch)),
+            "body_types": list(_placement_body_types_for_patch(self._patch)),
+            "params": dict(_placement_resonator_module_params(self._patch)),
+        }
+
+    def deployed_resonator_module(self) -> "AnalyticModule | None":
+        cfg = getattr(self._patch, "placement_resonator", PlacementResonatorConfig())
+        preferred = str(cfg.deployed_module_key or "")
+        if preferred:
+            for mod in self._patch.modules:
+                if mod.key == preferred:
+                    return mod
+        for mod in self._patch.modules:
+            if mod.module_type == "state_machine" and str(getattr(mod, "sm_plugin", "")) == "orchestral_resonance":
+                return mod
+        return None
+
+    def ensure_resonator_module(self) -> "AnalyticModule":
+        mod = self.deployed_resonator_module()
+        if mod is None:
+            mod = AnalyticModule(
+                key=f"placement_res_{uuid.uuid4().hex[:6]}",
+                label="Orchestral Resonance",
+                module_type="state_machine",
+            )
+            self._patch.modules.append(mod)
+        self.sync_resonator_module(mod.key)
+        return mod
+
+    def sync_resonator_module(self, module_key: str | None = None) -> "AnalyticModule | None":
+        cfg = getattr(self._patch, "placement_resonator", PlacementResonatorConfig())
+        mod = None
+        if module_key:
+            mod = next((m for m in self._patch.modules if m.key == module_key), None)
+        if mod is None:
+            mod = self.deployed_resonator_module()
+        if mod is None:
+            if not cfg.enabled:
+                return None
+            mod = self.ensure_resonator_module()
+            return mod
+        _sync_placement_resonator_module(self._patch, mod)
+        cfg.deployed_module_key = mod.key
+        return mod
+
+
+# ---------------------------------------------------------------------------
 # PatchPanel — left panel: voice list
 # ---------------------------------------------------------------------------
 
@@ -5542,7 +10567,21 @@ class PatchPanel(Panel):
         self._rhythm_pat_tabs:        list       = []
         self._rhythm_pat_add_rect:    Any        = None
         self._rhythm_pat_del_rect:    Any        = None
+        self._rhythm_page_rects:      list       = []
+        self._rhythm_page_add_r:      Any        = None
+        self._rhythm_page_del_r:      Any        = None
+        self._rhythm_meter_inherit_r: Any        = None
+        self._rhythm_stress_left_rect: Any       = None
+        self._rhythm_stress_right_rect: Any      = None
+        self._rhythm_auto_grid_rect:  Any        = None
+        self._rhythm_stress_vel_rect: Any        = None
+        self._frac_beat_warp_rect:    Any        = None
+        self._frac_beat_grid_rect:    Any        = None
+        self._placement_collapsed: bool          = True
+        self._placement_hdr_rect: Any            = None
+        self._placement_pm_rects: list           = []    # per-Part [(+r, -r, part_key), ...]
         self._rhythm_step_rects:      list       = []
+        self._rhythm_ctx_menu:        dict | None = None  # context menu state
         self._rhythm_phrase_rects:    list       = []
         self._rhythm_phrase_add_rect: Any        = None
         self._rhythm_phrase_del_rect: Any        = None
@@ -5561,13 +10600,20 @@ class PatchPanel(Panel):
         self._dyn_collapsed:       bool       = True
         self._dyn_hdr_rect:        Any        = None
         self._dyn_enable_rect:     Any        = None
+        self._dyn_page_key:        str        = "all"
+        self._dyn_page_rects:      list       = []
         self._dyn_curve_left_rect: Any        = None
         self._dyn_curve_right_rect:Any        = None
         self._dyn_scope_dec_rect:  Any        = None
         self._dyn_scope_inc_rect:  Any        = None
+        self._dyn_auto_accent_rect:Any        = None
         self._dyn_accent_rects:    list       = []
         self._dyn_sliders:         list[dict] = []
         self._dragging_dyn_slider: int        = -1
+        self._accent_layer:        Any        = None
+        self._accent_tree:         Any        = None
+        self._accent_snap_rect:    Any        = None
+        self._accent_snap_pat:     Any        = None
         # Improv section geometry
         self._improv_collapsed:         bool       = True
         self._improv_grace_collapsed:   bool       = True
@@ -5575,6 +10621,8 @@ class PatchPanel(Panel):
         self._improv_echo_collapsed:    bool       = True
         self._improv_hdr_rect:          Any        = None
         self._improv_enable_rect:       Any        = None
+        self._improv_page_key:          str        = "all"
+        self._improv_page_rects:        list       = []
         self._improv_prob_sliders:      list[dict] = []
         self._dragging_improv_prob_sl:  int        = -1
         # Grace sub-section
@@ -5594,6 +10642,12 @@ class PatchPanel(Panel):
         self._dragging_echo_sl:         int        = -1
         # Improv step eligibility grid
         self._improv_step_rects:        list       = []
+        self._improv_layer:             Any        = None
+        self._improv_tree:              Any        = None
+        self._improv_snap_rect:         Any        = None
+        self._improv_snap_pat:          Any        = None
+        # Rhythm tree reference for snap operations
+        self._rhythm_tree:              Any        = None
         # Dropdown state for Module / Control add buttons
         self._open_dropdown:     str        = ""   # "module" | "control" | ""
         self._dropdown_items:    list       = []   # list[dict(label, rect, data)]
@@ -5619,6 +10673,456 @@ class PatchPanel(Panel):
         ))
         return y + 14 + 4 + 14  # slider + pad + label
 
+    def _draw_page_selector_row(self, surf: pygame.Surface,
+                                font: pygame.font.Font,
+                                y: int,
+                                active_key: str,
+                                rhythm_pages: dict,
+                                active_col: tuple[int, int, int],
+                                idle_col: tuple[int, int, int],
+                                active_brd: tuple[int, int, int],
+                                custom_brd: tuple[int, int, int],
+                                idle_brd: tuple[int, int, int],
+                                active_txt: tuple[int, int, int],
+                                custom_txt: tuple[int, int, int],
+                                idle_txt: tuple[int, int, int],
+                                hdr_h: int) -> tuple[int, list]:
+        surf.blit(font.render("Part:", True, _PY_DIM), (8, y + 3))
+        rects: list = []
+        pgx = 44
+        for pg_key, pg_label in self._page_selector_entries(active_key, rhythm_pages):
+            is_active = (active_key == pg_key)
+            has_custom = (pg_key != "all" and pg_key in rhythm_pages)
+            pg_col = active_col if is_active else idle_col
+            pg_brd = active_brd if is_active else (custom_brd if has_custom else idle_brd)
+            pg_txt = active_txt if is_active else (custom_txt if has_custom else idle_txt)
+            pg_w = max(32, min(72, font.size(pg_label)[0] + 8))
+            pg_r = pygame.Rect(pgx, y + 1, pg_w, hdr_h - 2)
+            pygame.draw.rect(surf, pg_col, pg_r, border_radius=3)
+            pygame.draw.rect(surf, pg_brd, pg_r, 1, border_radius=3)
+            surf.blit(font.render(pg_label, True, pg_txt), (pgx + 3, y + 3))
+            rects.append({"rect": pg_r, "key": pg_key})
+            pgx += pg_w + 2
+        return y + hdr_h + 2, rects
+
+    def _page_selector_entries(self, active_key: str, page_dict: dict) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = [("all", "All"), ("bass", "Bass"), ("mid", "Mid"), ("high", "High")]
+        seen = {key for key, _ in entries}
+        if self._patch is not None and any(v.key == self._active for v in self._patch.voices):
+            vk = self._active
+            if vk not in seen:
+                entries.append((vk, vk[:6]))
+                seen.add(vk)
+        if active_key not in seen:
+            entries.append((active_key, active_key[:6] if active_key else "Pg"))
+            seen.add(active_key)
+        for key in sorted(page_dict.keys()):
+            if key not in seen and key not in {"all", ""}:
+                entries.append((key, key[:6]))
+                seen.add(key)
+        return entries
+
+    def _meter_beat_units(self, meter_num: float, frac_beat_mode: str = "warp") -> list[float]:
+        return _meter_beat_units(meter_num, frac_beat_mode)
+
+    def _metric_grid_rows(self, meter_num: float, usable_w: int, beat_min_w: int = 28, frac_beat_mode: str = "warp") -> int:
+        beat_count = len(self._meter_beat_units(meter_num, frac_beat_mode))
+        usable_w = max(1, int(usable_w))
+        beats_per_row = max(1, min(beat_count, usable_w // max(1, beat_min_w)))
+        return max(1, (beat_count + beats_per_row - 1) // beats_per_row)
+
+    def _metric_step_layout(
+            self,
+            y: int,
+            div: int,
+            meter_num: float,
+            panel_w: int,
+            cell_h: int = 16,
+            x0: int = 6,
+            gap: int = 2,
+            beat_min_w: int = 28,
+    ) -> tuple[list[dict], int]:
+        """Lay out step cells grouped by metrical beat opportunities."""
+        div = max(1, int(div))
+        beat_units = self._meter_beat_units(meter_num, "warp")
+        beat_count = len(beat_units)
+        usable_w = max(1, panel_w - (x0 * 2))
+        beats_per_row = max(1, min(beat_count, usable_w // max(1, beat_min_w)))
+        row_count = max(1, (beat_count + beats_per_row - 1) // beats_per_row)
+        row_step = cell_h + gap
+        cells: list[dict] = []
+
+        total_units = max(1e-9, sum(beat_units))
+        unit_edges = [0.0]
+        acc = 0.0
+        for unit in beat_units:
+            acc += unit
+            unit_edges.append(acc)
+        step_bounds = [int(round((edge / total_units) * div)) for edge in unit_edges]
+        step_bounds[0] = 0
+        step_bounds[-1] = div
+
+        for beat_i, beat_unit in enumerate(beat_units):
+            row = beat_i // beats_per_row
+            col = beat_i % beats_per_row
+            row_start = row * beats_per_row
+            row_units = beat_units[row_start:row_start + beats_per_row]
+            beats_in_row = len(row_units)
+            if beats_in_row <= 0:
+                continue
+            row_unit_total = max(1e-9, sum(row_units))
+            row_prefix = sum(row_units[:col])
+            beat_x0 = x0 + int(round((row_prefix / row_unit_total) * usable_w))
+            beat_x1 = x0 + int(round(((row_prefix + beat_unit) / row_unit_total) * usable_w))
+            if col > 0:
+                beat_x0 += gap // 2
+            if col < beats_in_row - 1:
+                beat_x1 -= gap - (gap // 2)
+            beat_y = y + row * row_step
+
+            step_start = max(0, min(div, step_bounds[beat_i]))
+            step_end = max(step_start, min(div, step_bounds[beat_i + 1]))
+            step_count = max(0, step_end - step_start)
+            if step_count <= 0:
+                continue
+
+            beat_span = max(1, beat_x1 - beat_x0)
+            for local_i, step_i in enumerate(range(step_start, step_end)):
+                sx0 = beat_x0 + int(round(local_i * beat_span / float(step_count)))
+                sx1 = beat_x0 + int(round((local_i + 1) * beat_span / float(step_count)))
+                if local_i > 0:
+                    sx0 += 1
+                sx1 = max(sx0 + 6, sx1 - 1)
+                cells.append({
+                    "rect": pygame.Rect(sx0, beat_y, max(6, sx1 - sx0), cell_h),
+                    "step_i": step_i,
+                    "beat_i": beat_i,
+                    "row": row,
+                    "beat_start": (local_i == 0),
+                    "step_count_in_beat": step_count,
+                    "beat_unit": beat_unit,
+                })
+
+        total_h = row_count * row_step
+        return cells, total_h
+
+    def _tree_step_layout(
+            self,
+            y: int,
+            tree: "BeatTree",
+            meter_num: float,
+            panel_w: int,
+            cell_h: int = 16,
+            x0: int = 6,
+            gap: int = 2,
+            beat_min_w: int = 28,
+            frac_beat_mode: str = "warp",
+    ) -> tuple[list[dict], int]:
+        """Lay out tree leaves grouped by metrical beat, with sub-rows for depth."""
+        from fractions import Fraction as _F
+        beat_units = self._meter_beat_units(meter_num, frac_beat_mode)
+        beat_count = len(beat_units)
+        usable_w = max(1, panel_w - (x0 * 2))
+        beats_per_row = max(1, min(beat_count, usable_w // max(1, beat_min_w)))
+        row_count = max(1, (beat_count + beats_per_row - 1) // beats_per_row)
+        row_step = cell_h + gap
+
+        # Build cumulative beat boundaries as Fractions over one bar
+        total_units = sum(beat_units)
+        if total_units < 1e-9:
+            total_units = 1.0
+        cum = 0.0
+        beat_edges_f: list[float] = [0.0]
+        for u in beat_units:
+            cum += u
+            beat_edges_f.append(cum / total_units)
+
+        # Collect all leaves with their depth
+        leaves = tree.flat_leaves()
+        max_depth = max((lf.depth() for n in tree.nodes for lf in n.leaves()), default=0)
+        # Actually depth from root for each leaf:
+        def _leaf_depth(node: "BeatNode", d: int = 0) -> list[tuple["BeatNode", int]]:
+            if node.is_leaf():
+                return [(node, d)]
+            out = []
+            for c in sorted(node.children, key=lambda c: c.position):
+                out.extend(_leaf_depth(c, d + 1))
+            return out
+
+        all_leaf_depths: list[tuple["BeatNode", int]] = []
+        max_d = 0
+        for top_node in tree.nodes:
+            pairs = _leaf_depth(top_node)
+            all_leaf_depths.extend(pairs)
+            for _, d in pairs:
+                if d > max_d:
+                    max_d = d
+
+        # Subdivided cells get a depth indicator bar; for now all leaves on same
+        # row, but we show depth via shading and a small depth marker.
+        cells: list[dict] = []
+        for beat_i, beat_unit in enumerate(beat_units):
+            row = beat_i // beats_per_row
+            col = beat_i % beats_per_row
+            row_start = row * beats_per_row
+            row_units = beat_units[row_start:row_start + beats_per_row]
+            beats_in_row = len(row_units)
+            if beats_in_row <= 0:
+                continue
+            row_unit_total = max(1e-9, sum(row_units))
+            row_prefix = sum(row_units[:col])
+            beat_x0 = x0 + int(round((row_prefix / row_unit_total) * usable_w))
+            beat_x1 = x0 + int(round(((row_prefix + beat_unit) / row_unit_total) * usable_w))
+            if col > 0:
+                beat_x0 += gap // 2
+            if col < beats_in_row - 1:
+                beat_x1 -= gap - (gap // 2)
+            beat_y = y + row * row_step
+            beat_span = max(1, beat_x1 - beat_x0)
+
+            # Leaves whose position falls within this beat
+            b_lo = beat_edges_f[beat_i]
+            b_hi = beat_edges_f[beat_i + 1]
+            beat_leaves = [(lf, d) for lf, d in all_leaf_depths
+                           if b_lo - 1e-12 <= float(lf.position) < b_hi - 1e-12]
+            if not beat_leaves:
+                continue
+
+            # Sort by position
+            beat_leaves.sort(key=lambda x: x[0].position)
+            # Proportional widths by duration
+            total_dur = sum(float(lf.duration) for lf, _ in beat_leaves)
+            if total_dur < 1e-15:
+                total_dur = 1.0
+            px = beat_x0
+            for li, (leaf, depth) in enumerate(beat_leaves):
+                frac_w = float(leaf.duration) / total_dur
+                sx1 = beat_x0 + int(round((px - beat_x0 + frac_w * beat_span)))
+                if li > 0:
+                    px += 1
+                sx1 = max(px + 6, sx1 - 1)
+                cells.append({
+                    "rect": pygame.Rect(px, beat_y, max(6, sx1 - px), cell_h),
+                    "node_id": leaf.node_id,
+                    "leaf": leaf,
+                    "depth": depth,
+                    "beat_i": beat_i,
+                    "row": row,
+                    "beat_start": (li == 0),
+                    "beat_unit": beat_unit,
+                })
+                px = sx1 + 1
+
+        total_h = row_count * row_step
+        return cells, total_h
+
+    def _build_step_context_menu(
+            self, cell: dict, lx: int, ly: int, tree: "BeatTree",
+            div: int,
+    ) -> dict:
+        """Build context menu dict for a step cell at local (lx, ly)."""
+        font = self._font_()
+        item_h = font.get_height() + 6
+        sep_h  = 6
+        menu_w = 120
+        items: list[dict] = []
+
+        leaf = cell["leaf"]
+        is_on = leaf.on
+
+        # Toggle on/off
+        items.append({"label": "Off" if is_on else "On",
+                       "action": "toggle", "color": (180, 255, 180)})
+        # Articulation submenu (only when on)
+        if is_on:
+            cur_art = int(leaf.art)
+            art_names = {0: "Normal", 1: "Staccato", 2: "Legato", 3: "Drone"}
+            for av, aname in art_names.items():
+                marker = " \u2713" if av == cur_art else ""
+                items.append({"label": f"  {aname}{marker}",
+                               "action": "art", "art_val": av,
+                               "color": (240, 220, 120) if av == cur_art else (200, 190, 220)})
+
+        # Separator
+        items.append({"separator": True})
+
+        # Trigger group assignment
+        cur_grp = int(leaf.group)
+        items.append({"label": "Group: None" + (" \u2713" if cur_grp == 0 else ""),
+                       "action": "group", "group_val": 0,
+                       "color": (180, 180, 180) if cur_grp == 0 else (120, 120, 120)})
+        for gi in range(1, len(GROUP_COLORS)):
+            gc = GROUP_COLORS[gi]
+            marker = " \u2713" if gi == cur_grp else ""
+            items.append({"label": f"  Grp {gi}{marker}",
+                           "action": "group", "group_val": gi,
+                           "color": gc if gi == cur_grp else (gc[0] // 2, gc[1] // 2, gc[2] // 2)})
+        items.append({"separator": True})
+
+        # Subdivide options
+        for n in (2, 3, 4, 5, 6, 7, 8, 9):
+            items.append({"label": f"\u00f7{n}",
+                           "action": "subdivide", "n": n,
+                           "color": (160, 220, 255)})
+
+        # Collapse (only if depth > 0)
+        if cell.get("depth", 0) > 0:
+            items.append({"separator": True})
+            items.append({"label": "Collapse",
+                           "action": "collapse",
+                           "color": (255, 180, 160)})
+
+        # Build rects
+        menu_x = min(lx, max(4, (self.panel_rect.w if self.panel_rect else 200) - menu_w - 4))
+        menu_y = ly + 2
+        cy = menu_y + 4
+        for item in items:
+            if item.get("separator"):
+                item["rect"] = pygame.Rect(menu_x, cy, menu_w, sep_h)
+                cy += sep_h
+            else:
+                item["rect"] = pygame.Rect(menu_x + 2, cy, menu_w - 4, item_h)
+                cy += item_h + 1
+
+        menu_rect = pygame.Rect(menu_x, menu_y, menu_w, cy - menu_y + 4)
+        return {"items": items, "menu_rect": menu_rect, "cell": cell,
+                "tree": tree, "div": div}
+
+    # ------------------------------------------------------------------
+    # Shared grid view rendering & click handling
+    # ------------------------------------------------------------------
+
+    def _render_grid_layer(
+        self,
+        surf,
+        font,
+        y: int,
+        layer: "GridViewLayer",
+        tree: "BeatTree",
+        div: int,
+        meter_num: float,
+        pw: int,
+        cell_h: int = 16,
+        extra=None,
+        frac_beat_mode: str = "warp",
+    ) -> tuple[list[dict], int]:
+        """
+        Render one grid layer at vertical offset *y* using *tree*.
+
+        Returns (cell_rects, total_h) where each rect dict contains:
+            rect, node_id, leaf, depth, tree_mode=True, value, layer_name
+        Always uses the tree layout — the caller provides the BeatTree.
+        """
+        cells, total_h = self._tree_step_layout(y, tree, meter_num, pw, cell_h=cell_h,
+                                                 frac_beat_mode=frac_beat_mode)
+
+        rects: list[dict] = []
+        for cell in cells:
+            cr = cell["rect"]
+            leaf    = cell["leaf"]
+            depth   = cell["depth"]
+            group   = leaf.group
+            value   = layer.read_fn(leaf, None, extra)
+
+            is_beat = bool(cell.get("beat_start", False))
+            bg  = layer.bg_fn(value, is_beat, depth, group)
+            brd = layer.brd_fn(value, is_beat, depth, group)
+
+            pygame.draw.rect(surf, bg, cr, border_radius=2)
+            pygame.draw.rect(surf, brd, cr, 1, border_radius=2)
+
+            # Group dot
+            if layer.show_groups and group:
+                gc = GROUP_COLORS[min(group, len(GROUP_COLORS) - 1)]
+                pygame.draw.circle(surf, gc, (cr.x + 5, cr.y + 5), 3)
+
+            # Depth tick marks
+            if layer.show_depth and depth > 0:
+                for di in range(min(depth, 4)):
+                    tx = cr.x + 2 + di * 3
+                    pygame.draw.line(surf, (140, 110, 200),
+                                     (tx, cr.bottom - 3), (tx, cr.bottom - 1))
+
+            # Cell label (left-aligned)
+            if layer.label_fn is not None:
+                lbl_info = layer.label_fn(value)
+                if lbl_info is not None:
+                    lbl_text, lbl_col = lbl_info
+                    ls = font.render(lbl_text, True, lbl_col)
+                    surf.blit(ls, (cr.x + 2, cr.y + 2))
+
+            # Cell label (right-aligned)
+            if layer.label_right_fn is not None:
+                rl_info = layer.label_right_fn(value)
+                if rl_info is not None:
+                    rl_text, rl_col = rl_info
+                    rs = font.render(rl_text, True, rl_col)
+                    surf.blit(rs, (cr.right - rs.get_width() - 2, cr.y + 1))
+
+            rd = {"rect": cr, "tree_mode": True, "value": value,
+                  "layer_name": layer.name,
+                  "node_id": cell["node_id"],
+                  "leaf": leaf, "depth": depth}
+            rects.append(rd)
+
+        # Group merge bars (only when layer shows groups)
+        if layer.show_groups and rects:
+            _grp_runs: list[tuple[int, int, int]] = []
+            for cell_dict in rects:
+                lf  = cell_dict.get("leaf")
+                grp = lf.group if lf else 0
+                if lf and lf.on and grp:
+                    cr = cell_dict["rect"]
+                    if _grp_runs and _grp_runs[-1][0] == grp:
+                        _grp_runs[-1] = (_grp_runs[-1][0], _grp_runs[-1][1], cr.right)
+                    else:
+                        _grp_runs.append((grp, cr.x, cr.right))
+            first_w = rects[0]["rect"].width if rects else 0
+            for grp, x0, x1 in _grp_runs:
+                if x1 - x0 > first_w + 2:
+                    gc3 = GROUP_COLORS[min(grp, len(GROUP_COLORS) - 1)]
+                    bar_y = rects[0]["rect"].y + rects[0]["rect"].height // 2
+                    pygame.draw.line(surf, gc3, (x0 + 2, bar_y), (x1 - 2, bar_y), 2)
+
+        return rects, total_h
+
+    def _handle_grid_layer_click(
+        self,
+        rects: list[dict],
+        lx: int,
+        ly: int,
+        layer: "GridViewLayer",
+        extra=None,
+    ) -> bool:
+        """Test a left-click against stored rects for *layer*.  Returns True if handled."""
+        for rd in rects:
+            if rd["rect"].collidepoint(lx, ly):
+                if layer.click_fn is not None:
+                    leaf = rd.get("leaf")
+                    layer.click_fn(leaf, None, extra)
+                return True
+        return False
+
+    def _handle_grid_layer_right_click(
+        self,
+        rects: list[dict],
+        lx: int,
+        ly: int,
+        layer: "GridViewLayer",
+        tree: "BeatTree",
+        div: int,
+    ) -> bool:
+        """Test right-click; opens context menu via layer callback. Returns True if handled."""
+        if layer.right_click_fn is None:
+            return False
+        for rd in rects:
+            if rd["rect"].collidepoint(lx, ly):
+                result = layer.right_click_fn(rd, lx, ly, tree, div)
+                if result is not None:
+                    self._rhythm_ctx_menu = result
+                return True
+        return False
+
     def _apply_seq_arrow(self, key: str, direction: int) -> None:
         """Cycle a picker field on the patch by +1 or -1 step."""
         p = self._patch
@@ -5635,6 +11139,14 @@ class PatchPanel(Panel):
             names = _SEQ_CHORD_NAMES
             cur   = names.index(p.seq_chord_prog) if p.seq_chord_prog in names else 0
             p.seq_chord_prog = names[(cur + direction) % len(names)]
+        elif key == "seq_rubato_shape":
+            names = _SEQ_RUBATO_SHAPES
+            cur = names.index(p.seq_rubato_shape) if p.seq_rubato_shape in names else 0
+            p.seq_rubato_shape = names[(cur + direction) % len(names)]
+        elif key == "seq_rubato_scope":
+            names = _SEQ_RUBATO_SCOPES
+            cur = names.index(p.seq_rubato_scope) if p.seq_rubato_scope in names else 0
+            p.seq_rubato_scope = names[(cur + direction) % len(names)]
         elif key == "seq_octave_span":
             p.seq_octave_span = max(1, min(5, p.seq_octave_span + direction))
         elif key == "seq_bass_octave":
@@ -5657,6 +11169,9 @@ class PatchPanel(Panel):
         r = sl["rect"]
         frac = max(0.0, min(1.0, (lx - r.x) / max(r.w, 1)))
         val  = sl["lo"] + frac * (sl["hi"] - sl["lo"])
+        _mods = pygame.key.get_mods()
+        _shift_free = bool(_mods & KMOD_SHIFT)
+        _ctrl_irr = bool(_mods & KMOD_CTRL)
         sl["val"] = val
         key = sl["key"]
         if key == "seq_bpm":
@@ -5665,9 +11180,27 @@ class PatchPanel(Panel):
             p.seq_legato = val
         elif key == "seq_portamento_s":
             p.seq_portamento_s = val
+        elif key == "seq_rubato_amount":
+            p.seq_rubato_amount = max(0.0, min(0.95, val))
+        elif key == "meter_numerator":
+            if _ctrl_irr:
+                _opts = [v for v in _METER_IRRATIONAL_SNAPS if sl["lo"] <= v <= sl["hi"] and v < 10.0]
+                _meter_val = min(_opts, key=lambda v: abs(v - val)) if _opts else val
+            else:
+                _meter_val = val if _shift_free else round(val)
+            p.meter_numerator = max(sl["lo"], min(sl["hi"], _meter_val))
+            sl["val"] = p.meter_numerator
+        elif key == "meter_denominator":
+            if _ctrl_irr:
+                _opts = [v for v in _METER_IRRATIONAL_SNAPS if sl["lo"] <= v <= sl["hi"] and v < 10.0]
+                _meter_val = min(_opts, key=lambda v: abs(v - val)) if _opts else val
+            else:
+                _meter_val = val if _shift_free else round(val)
+            p.meter_denominator = max(sl["lo"], min(sl["hi"], _meter_val))
+            sl["val"] = p.meter_denominator
 
     def _apply_rhythm_slider(self, sl: dict, lx: int) -> None:
-        """Write rhythm slider value to the patch."""
+        """Write rhythm slider value to the active page target."""
         p = self._patch
         if p is None:
             return
@@ -5675,13 +11208,44 @@ class PatchPanel(Panel):
         frac = max(0.0, min(1.0, (lx - r.x) / max(r.w, 1)))
         val  = sl["lo"] + frac * (sl["hi"] - sl["lo"])
         sl["val"] = val
+        _rw_key = p.rhythm_active_page
+        _rw = (p.rhythm_pages[_rw_key]
+               if (_rw_key != "all" and _rw_key in p.rhythm_pages)
+               else p)
         key = sl["key"]
         if key == "rhythm_swing":
-            p.rhythm_swing  = val
+            _rw.rhythm_swing  = val
         elif key == "rhythm_pocket":
-            p.rhythm_pocket = val
+            _rw.rhythm_pocket = val
         elif key == "rhythm_gate":
-            p.rhythm_gate   = val
+            _rw.rhythm_gate   = val
+        elif key == "meter_numerator":
+            # Skip write if the page is set to inherit global meter (0.0 = inherit)
+            _rw_key_m = p.rhythm_active_page
+            if (_rw_key_m != "all" and _rw_key_m in p.rhythm_pages
+                    and float(p.rhythm_pages[_rw_key_m].meter_numerator) == 0.0):
+                return
+            _mods = pygame.key.get_mods()
+            _shift_free = bool(_mods & KMOD_SHIFT)
+            _ctrl_irr = bool(_mods & KMOD_CTRL)
+            if _ctrl_irr:
+                _opts = [v for v in _METER_IRRATIONAL_SNAPS if sl["lo"] <= v <= sl["hi"] and v < 10.0]
+                _meter_val = min(_opts, key=lambda v: abs(v - val)) if _opts else val
+            else:
+                _meter_val = val if _shift_free else round(val)
+            _rw.meter_numerator = max(sl["lo"], min(sl["hi"], _meter_val))
+            sl["val"] = _rw.meter_numerator
+        elif key == "meter_denominator":
+            _mods = pygame.key.get_mods()
+            _shift_free = bool(_mods & KMOD_SHIFT)
+            _ctrl_irr = bool(_mods & KMOD_CTRL)
+            if _ctrl_irr:
+                _opts = [v for v in _METER_IRRATIONAL_SNAPS if sl["lo"] <= v <= sl["hi"] and v < 10.0]
+                _meter_val = min(_opts, key=lambda v: abs(v - val)) if _opts else val
+            else:
+                _meter_val = val if _shift_free else round(val)
+            _rw.meter_denominator = max(sl["lo"], min(sl["hi"], _meter_val))
+            sl["val"] = _rw.meter_denominator
 
     def _apply_prob_slider(self, sl: dict, lx: int) -> None:
         """Write a probability slider value (0.0–1.0) to seq_probabilities."""
@@ -5706,7 +11270,7 @@ class PatchPanel(Panel):
         frac = max(0.0, min(1.0, (lx - r.x) / max(r.w, 1)))
         val  = sl["lo"] + frac * (sl["hi"] - sl["lo"])
         sl["val"] = val
-        dp = getattr(p, "dynamics_program", None)
+        dp = p.ensure_dynamics_page(self._dyn_page_key)
         if dp is not None:
             dp.curve.intensity = val
 
@@ -5719,7 +11283,7 @@ class PatchPanel(Panel):
         frac = max(0.0, min(1.0, (lx - r.x) / max(r.w, 1)))
         val  = sl["lo"] + frac * (sl["hi"] - sl["lo"])
         sl["val"] = val
-        ip = getattr(p, "improv_program", None)
+        ip = p.ensure_improv_page(self._improv_page_key)
         if ip is None:
             return
         key = sl["key"]
@@ -5753,6 +11317,7 @@ class PatchPanel(Panel):
         items: list[tuple[str, str, list[int], bool]] = []
         # Pinned Patch entry always first
         items.append(("__patch__", "\u25c6 Patch", [80, 130, 200], False))
+        items.append(("__system__", "\u2699 System Device", [200, 150, 90], False))
         for v in p.voices:
             em_tag = " [G]" if getattr(v, "emission_mode", "single") == "granular" else ""
             items.append((v.key, f"\u25b6 {v.label}{em_tag}  {v.freq_hz:.1f}Hz", v.color, v.muted))
@@ -5798,22 +11363,29 @@ class PatchPanel(Panel):
 
         seq_body_h = 0
         if not self._seq_collapsed and _HAS_SEQ_ENG:
-            seq_body_h = seq_row_h * 5 + 32 * 3 + btn_h + 8  # pickers + sliders + btns
+            seq_body_h = seq_row_h * 11 + 14 + 32 * 6 + btn_h + 8  # pickers + label-clearance + sliders + btns
         seq_sec_h = hdr_h + seq_body_h + 4
 
         prob_body_h = 0
         if not self._prob_collapsed:
-            prob_body_h = 32 * 4 + 8  # 4 probability sliders
+            prob_body_h = 14 + 32 * 4 + 8  # label-clearance + 4 probability sliders
         prob_sec_h = hdr_h + prob_body_h + 4
 
         dyn_body_h = 0
         if not self._dyn_collapsed and _HAS_DYN_ENG:
-            _rdiv_d    = getattr(p, "rhythm_division", 16)
-            _grid_rows_d = max(1, (_rdiv_d + 7) // 8)
+            _dyn_pg     = p.page_for(self._dyn_page_key)
+            _rdiv_d    = getattr(_dyn_pg, "rhythm_division", 16)
             _cell_h_d    = 16
+            _grid_rows_d = self._metric_grid_rows(
+                p.page_meter(_dyn_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_dyn_pg, "frac_beat_mode", "warp"),
+            )
             dyn_body_h = (
-                (hdr_h + 4)                              # curve shape picker
+                (hdr_h + 2)                              # part selector
+                + (hdr_h + 4)                            # curve shape picker
                 + (hdr_h + 4)                            # scope stepper
+                + (hdr_h + 4)                            # auto accent button
                 + (32 + 8)                               # intensity slider
                 + (_grid_rows_d * (_cell_h_d + 2) + 4)  # accent grid
             )
@@ -5821,9 +11393,14 @@ class PatchPanel(Panel):
 
         improv_body_h = 0
         if not self._improv_collapsed and _HAS_IMPROV_ENG:
-            _rdiv_i      = getattr(p, "rhythm_division", 16)
-            _irows       = max(1, (_rdiv_i + 7) // 8)
+            _improv_pg    = p.page_for(self._improv_page_key)
+            _rdiv_i      = getattr(_improv_pg, "rhythm_division", 16)
             _cell_h_i    = 16
+            _irows       = self._metric_grid_rows(
+                p.page_meter(_improv_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_improv_pg, "frac_beat_mode", "warp"),
+            )
             # 3 prob sliders + 3 sub-section headers (collapsed by default)
             # + improv step grid
             _sub_grace_h = 0 if self._improv_grace_collapsed else (
@@ -5847,7 +11424,8 @@ class PatchPanel(Panel):
                 + (hdr_h + 4)  # max_notes stepper
             )
             improv_body_h = (
-                (32 * 3 + 8)                             # 3 prob sliders
+                (hdr_h + 2)                              # part selector
+                + (32 * 3 + 8)                           # 3 prob sliders
                 + hdr_h + _sub_grace_h + 4               # grace sub-section
                 + hdr_h + _sub_chirp_h + 4               # chirp sub-section
                 + hdr_h + _sub_echo_h + 4                # echo sub-section
@@ -5857,20 +11435,34 @@ class PatchPanel(Panel):
 
         rhythm_body_h = 0
         if not self._rhythm_collapsed:
-            _rdiv      = getattr(p, "rhythm_division", 16)
-            _grid_rows = max(1, (_rdiv + 7) // 8)
+            _active_pg = p.page_for(p.rhythm_active_page)
+            _rdiv      = getattr(_active_pg, "rhythm_division", getattr(p, "rhythm_division", 16))
             _cell_h    = 16
+            _grid_rows = self._metric_grid_rows(
+                p.page_meter(_active_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_active_pg, "frac_beat_mode", "warp"),
+            )
             rhythm_body_h = (
                 (hdr_h + 2)                 # division picker row
+                + (hdr_h + 2)               # page selector row
+                + (hdr_h + 4)               # stress row
                 + (hdr_h + 4)               # pattern tabs row
                 + (_grid_rows * (_cell_h + 2) + 4)   # step grid
                 + (hdr_h + 8)               # phrase row
                 + (hdr_h + 6)               # prog-bars + fit-mode row
-                + (32 * 3 + 8)              # 3 sliders (swing/pocket/gate)
+                + 14                         # label-clearance for first slider
+                + (32 * 5 + 8)              # 5 sliders (meter/swing/pocket/gate)
             )
         rhythm_sec_h = hdr_h + rhythm_body_h + 4
 
-        total_h = 4 + voices_sec_h + 8 + seq_sec_h + 8 + prob_sec_h + 8 + dyn_sec_h + 8 + improv_sec_h + 8 + rhythm_sec_h + 8
+        # Placement section: always rendered (collapsed = header only; expanded = header + rows)
+        _plc_n_rows = 0 if self._placement_collapsed else max(1, len(p.parts))
+        plc_sec_h = (hdr_h + 2) + _plc_n_rows * (hdr_h + 2)
+
+        total_h = (4 + voices_sec_h + 8 + seq_sec_h + 8 + prob_sec_h + 8
+                   + dyn_sec_h + 8 + improv_sec_h + 8 + rhythm_sec_h + 8
+                   + plc_sec_h + 8)
         surf = pygame.Surface((pw, max(200, total_h)))
         surf.fill(_PY_BG)
 
@@ -5880,7 +11472,7 @@ class PatchPanel(Panel):
         arrow_v = "\u25bc" if not self._voices_collapsed else "\u25b6"
         pygame.draw.rect(surf, (28, 44, 60), (0, y, pw, hdr_h))
         pygame.draw.line(surf, (60, 100, 140), (0, y), (pw, y))
-        surf.blit(font.render(f"{arrow_v} Voices  [{len(items) - 1}]",
+        surf.blit(font.render(f"{arrow_v} Voices  [{max(0, len(items) - 2)}]",
                               True, (140, 190, 230)), (8, y + 3))
         self._voices_hdr_rect = pygame.Rect(0, y, pw, hdr_h)
         y += hdr_h
@@ -5893,7 +11485,7 @@ class PatchPanel(Panel):
                 is_active = (key == self._active)
                 is_mix    = self._patch is not None and any(m.key == key for m in self._patch.mixers)
                 bg = (40, 60, 80) if is_active else (24, 24, 30)
-                if key == "__patch__":
+                if key in {"__patch__", "__system__"}:
                     bg = (50, 80, 120) if is_active else (28, 40, 60)
                 elif is_mix:
                     bg = (44, 44, 22) if is_active else (30, 28, 18)
@@ -5903,7 +11495,7 @@ class PatchPanel(Panel):
                 txt_col = (200, 200, 210) if not muted else (80, 80, 90)
                 lbl = font.render(label, True, txt_col)
                 surf.blit(lbl, (10, y + (row_h - 2 - fh) // 2))
-                if not is_mix and key != "__patch__":
+                if not is_mix and key not in {"__patch__", "__system__"}:
                     is_param_  = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
                     is_lfo_    = any(l.key == key for l in self._patch.lfos) if self._patch else False
                     is_module_ = any(m.key == key for m in self._patch.modules) if self._patch else False
@@ -5947,15 +11539,16 @@ class PatchPanel(Panel):
             self._btn2_y = y
             self._btn2_h = btn_h
             y += btn_h + 4
-            # Inline dropdown overlays (drawn immediately after buttons so they
-            # cover rows below without requiring a separate pass)
+            # Register dropdown item rects for hit-testing; actual draw happens
+            # at the end of render() as an overlay so it covers sections below.
             if self._open_dropdown in ("module", "control"):
                 drop_x = 4 if self._open_dropdown == "module" else half + 4
                 drop_w = half - 8
                 items_data = (
                     [("LFO",           "lfo"),
                      ("Passthrough",   "passthrough"),
-                     ("Pitch Quant.",  "pitch_quantizer")]
+                     ("Pitch Quant.",  "pitch_quantizer"),
+                     ("Interaural",    "interaural")]
                     if self._open_dropdown == "module"
                     else [("Control Surface", "control_surface")]
                 )
@@ -5963,9 +11556,6 @@ class PatchPanel(Panel):
                 dy = y
                 for dlabel, ddata in items_data:
                     dr = pygame.Rect(drop_x, dy, drop_w, btn_h)
-                    pygame.draw.rect(surf, (50, 50, 66), dr, border_radius=2)
-                    pygame.draw.rect(surf, (90, 90, 120), dr, 1, border_radius=2)
-                    surf.blit(font.render(dlabel, True, (200, 220, 255)), (drop_x + 4, dy + 2))
                     self._dropdown_items.append(dict(label=dlabel, rect=dr, data=ddata))
                     dy += btn_h + 2
 
@@ -6028,6 +11618,22 @@ class PatchPanel(Panel):
             # Repeats picker
             y = _picker_row(surf, y, "Repeats", str(p.seq_repeats), "seq_repeats")
 
+            y = _picker_row(surf, y, "Rubato", p.seq_rubato_shape, "seq_rubato_shape")
+            y = _picker_row(surf, y, "Rubato Scope", p.seq_rubato_scope, "seq_rubato_scope")
+
+            def _fmt_meter(v: float) -> str:
+                if abs(v - round(v)) < 1e-6:
+                    return str(int(round(v)))
+                return f"{v:.2f}".rstrip("0").rstrip(".")
+
+            meter_hint = "Shift=free Ctrl=irr"
+            hint_s = font.render(meter_hint, True, (98, 145, 112))
+            y += 14  # label clearance: ensure first slider label clears the last picker row
+            surf.blit(hint_s, (pw - hint_s.get_width() - 8, y - 13))
+            y = self._add_seq_slider(seq_sliders, y, "Meter Num",
+                                     "meter_numerator", p.meter_numerator, 1.0, 16.0, ".2f")
+            y = self._add_seq_slider(seq_sliders, y, "Meter Den",
+                                     "meter_denominator", p.meter_denominator, 1.0, 16.0, ".2f")
             # BPM slider
             y = self._add_seq_slider(seq_sliders, y, "BPM",
                                      "seq_bpm", p.seq_bpm, 30.0, 240.0, ".1f")
@@ -6037,13 +11643,19 @@ class PatchPanel(Panel):
             # Portamento slider
             y = self._add_seq_slider(seq_sliders, y, "Portamento (s)",
                                      "seq_portamento_s", p.seq_portamento_s, 0.0, 2.0, ".3f")
+            y = self._add_seq_slider(seq_sliders, y, "Rubato Amt",
+                                     "seq_rubato_amount", p.seq_rubato_amount, 0.0, 0.95, ".2f")
 
             # Draw seq sliders
             for sl in seq_sliders:
                 r = sl["rect"]
                 lbl_y = r.y - 14
                 surf.blit(font.render(sl["label"], True, _PY_DIM), (8, lbl_y))
-                vs = font.render(format(sl["val"], sl["fmt"]), True, _PY_TXT)
+                if sl["key"] in {"meter_numerator", "meter_denominator"}:
+                    val_str = _fmt_meter(sl["val"])
+                else:
+                    val_str = format(sl["val"], sl["fmt"])
+                vs = font.render(val_str, True, _PY_TXT)
                 surf.blit(vs, (pw - vs.get_width() - 8, lbl_y))
                 pygame.draw.rect(surf, (40, 40, 50), r, border_radius=3)
                 frac = max(0.0, min(1.0,
@@ -6098,6 +11710,7 @@ class PatchPanel(Panel):
                 ("Modal Color",  "modal",        sp.modal),
             ]
             _PR_ACT = (52, 138, 108)
+            y += 14  # label clearance: ensure first slider label clears the section header
             for lbl, key, val in _PROB_LABELS:
                 y = self._add_seq_slider(prob_sliders, y, lbl, key, val, 0.0, 1.0, ".2f")
             for sl in prob_sliders:
@@ -6120,7 +11733,7 @@ class PatchPanel(Panel):
         y += 8
 
         # ── Dynamics header ──────────────────────────────────────────────────
-        dp          = getattr(p, "dynamics_program", None)
+        dp          = p.dynamics_for(self._dyn_page_key)
         arrow_dy    = "\u25bc" if not self._dyn_collapsed else "\u25b6"
         dy_en_str   = "[ON]" if (dp and dp.enabled) else "[off]"
         pygame.draw.rect(surf, (26, 42, 50), (0, y, pw, hdr_h))
@@ -6137,6 +11750,21 @@ class PatchPanel(Panel):
         dyn_sliders: list[dict] = []
         if not self._dyn_collapsed and _HAS_DYN_ENG and dp is not None:
             _DY_ACT = (40, 130, 170)
+            y, self._dyn_page_rects = self._draw_page_selector_row(
+                surf, font, y, self._dyn_page_key, p.dynamics_pages,
+                active_col=(36, 72, 92),
+                idle_col=(24, 38, 46),
+                active_brd=(110, 185, 220),
+                custom_brd=(78, 132, 160),
+                idle_brd=(52, 74, 86),
+                active_txt=(185, 230, 245),
+                custom_txt=(150, 195, 220),
+                idle_txt=(105, 132, 145),
+                hdr_h=hdr_h,
+            )
+            _dyn_pg = p.page_for(self._dyn_page_key)
+            _dyn_meter_s = font.render(_page_meter_label(p, _dyn_pg), True, (118, 175, 205))
+            surf.blit(_dyn_meter_s, (pw - _dyn_meter_s.get_width() - 8, y + 3))
 
             # ── Curve shape picker ────────────────────────────────────────────
             pygame.draw.rect(surf, (22, 36, 44), (2, y, pw - 4, hdr_h - 2))
@@ -6172,6 +11800,13 @@ class PatchPanel(Panel):
             self._dyn_scope_inc_rect = dy_sc_r
             y += hdr_h + 4
 
+            # ── Auto accent from stress pattern ──────────────────────────────
+            da_r = pygame.Rect(6, y + 1, pw - 12, hdr_h - 2)
+            pygame.draw.rect(surf, (36, 78, 104), da_r, border_radius=3)
+            surf.blit(font.render("Auto Accent from Stress", True, (185, 230, 245)), (12, y + 3))
+            self._dyn_auto_accent_rect = da_r
+            y += hdr_h + 4
+
             # ── Intensity slider ──────────────────────────────────────────────
             y = self._add_seq_slider(dyn_sliders, y, "Intensity",
                                      "dyn_intensity", dp.curve.intensity, 0.0, 1.0, ".2f")
@@ -6191,13 +11826,8 @@ class PatchPanel(Panel):
             y += 4
 
             # ── Accent grid ──────────────────────────────────────────────────
-            div_d   = p.rhythm_division
-            cols_d  = 8
-            rows_d  = max(1, (div_d + cols_d - 1) // cols_d)
-            cw_d    = max(10, (pw - 12) // cols_d)
+            div_d   = _dyn_pg.rhythm_division
             ch_d    = 16
-            dp.accent.ensure_size(div_d)
-            accent_rects: list = []
             _ACCENT_COLS = [
                 (28, 22, 44),    # 0.0  — muted
                 (52, 42, 80),    # 0.5  — soft
@@ -6205,35 +11835,84 @@ class PatchPanel(Panel):
                 (138, 88, 210),  # 1.5  — accent
                 (195, 150, 255), # 2.0  — strong
             ]
-            for ri in range(rows_d):
-                for ci in range(cols_d):
-                    step_i = ri * cols_d + ci
-                    if step_i >= div_d:
-                        break
-                    lv  = dp.accent.level_at(step_i)
-                    # map level to color index
-                    _ci = min(range(5), key=lambda j: abs((j * 0.5) - lv))
-                    bg  = _ACCENT_COLS[_ci]
+            _ACC_LEVELS = [0.0, 0.5, 1.0, 1.5, 2.0]
+
+            # Each pattern owns its own accent tree
+            _dyn_rpats = _dyn_pg.rhythm_patterns
+            _dyn_act_i = min(_dyn_pg.rhythm_active_pat, max(0, len(_dyn_rpats) - 1))
+            _dyn_act_pat = _dyn_rpats[_dyn_act_i] if _dyn_rpats else None
+
+            if _dyn_act_pat is not None:
+                _acc_tree = _dyn_act_pat.get_accent_tree(div_d)
+
+                def _acc_read(leaf, _si, _ex):
+                    return leaf.vel
+
+                def _acc_bg(val, is_beat, depth, group):
+                    _ci = min(range(5), key=lambda j: abs((j * 0.5) - val))
+                    return _ACCENT_COLS[_ci]
+
+                def _acc_brd(val, is_beat, depth, group):
+                    bg = _acc_bg(val, is_beat, depth, group)
                     brd = tuple(min(255, c + 40) for c in bg)
-                    sx  = 6 + ci * cw_d
-                    sy  = y + ri * (ch_d + 2)
-                    cr  = pygame.Rect(sx, sy, cw_d - 2, ch_d)
-                    pygame.draw.rect(surf, bg, cr, border_radius=2)
-                    pygame.draw.rect(surf, brd, cr, 1, border_radius=2)
-                    # show value if != 1.0
-                    if abs(lv - 1.0) > 0.01:
-                        lbl = "×" + (f"{lv:.1f}".rstrip("0").rstrip(".") if lv != 0.0 else "0")
-                        surf.blit(font.render(lbl, True, (210, 190, 255)), (sx + 2, sy + 2))
-                    accent_rects.append({"rect": cr, "step_i": step_i})
+                    if is_beat:
+                        brd = tuple(min(255, c + 24) for c in brd)
+                    return brd
+
+                def _acc_label(val):
+                    if abs(val - 1.0) > 0.01:
+                        lbl = "x" + (f"{val:.1f}".rstrip("0").rstrip(".") if val != 0.0 else "0")
+                        return (lbl, (210, 190, 255))
+                    return None
+
+                def _acc_click(leaf, _si, _ex):
+                    cur = leaf.vel
+                    # Cycle through accent levels
+                    for i, lv in enumerate(_ACC_LEVELS):
+                        if abs(cur - lv) < 0.01:
+                            leaf.vel = _ACC_LEVELS[(i + 1) % len(_ACC_LEVELS)]
+                            return
+                    leaf.vel = 1.0
+
+                _accent_layer = GridViewLayer(
+                    "accent",
+                    read_fn        = _acc_read,
+                    bg_fn          = _acc_bg,
+                    brd_fn         = _acc_brd,
+                    label_fn       = _acc_label,
+                    click_fn       = _acc_click,
+                    right_click_fn = lambda cell, lx, ly, tr, dv: self._build_step_context_menu(cell, lx, ly, tr, dv),
+                    show_depth     = True,
+                )
+
+                accent_rects, accent_h = self._render_grid_layer(
+                    surf, font, y, _accent_layer, _acc_tree, div_d,
+                    p.page_meter(_dyn_pg)[0], pw, cell_h=ch_d,
+                    frac_beat_mode=getattr(_dyn_pg, "frac_beat_mode", "warp"))
+                self._accent_tree = _acc_tree
+            else:
+                accent_rects = []
+                accent_h = ch_d + 2
+                _accent_layer = None
             self._dyn_accent_rects = accent_rects
-            y += rows_d * (ch_d + 2) + 4
+            self._accent_layer     = _accent_layer
+
+            # Snap-to-rhythm button for accent grid
+            snap_acc_r = pygame.Rect(pw - 62, y, 58, 14)
+            pygame.draw.rect(surf, (44, 36, 64), snap_acc_r, border_radius=2)
+            pygame.draw.rect(surf, (90, 70, 130), snap_acc_r, 1, border_radius=2)
+            surf.blit(font.render("\u21bb Snap", True, (180, 160, 220)),
+                      (snap_acc_r.x + 4, snap_acc_r.y + 1))
+            self._accent_snap_rect = snap_acc_r
+            self._accent_snap_pat  = _dyn_act_pat
+            y += accent_h + 18
 
         self._dyn_sliders = dyn_sliders
 
         y += 8
 
         # ── Improv header ────────────────────────────────────────────────────
-        ip          = getattr(p, "improv_program", None)
+        ip          = p.improv_for(self._improv_page_key)
         arrow_im    = "\u25bc" if not self._improv_collapsed else "\u25b6"
         im_en_str   = "[ON]" if (ip and ip.enabled) else "[off]"
         pygame.draw.rect(surf, (48, 38, 22), (0, y, pw, hdr_h))
@@ -6257,6 +11936,19 @@ class PatchPanel(Panel):
         if not self._improv_collapsed and _HAS_IMPROV_ENG and ip is not None:
             _IM_ACT = (165, 125, 45)
             _IM_BG  = (38, 30, 14)
+            y, self._improv_page_rects = self._draw_page_selector_row(
+                surf, font, y, self._improv_page_key, p.improv_pages,
+                active_col=(98, 70, 24),
+                idle_col=(40, 30, 14),
+                active_brd=(232, 185, 92),
+                custom_brd=(168, 126, 46),
+                idle_brd=(82, 60, 24),
+                active_txt=(250, 225, 150),
+                custom_txt=(225, 180, 95),
+                idle_txt=(140, 112, 58),
+                hdr_h=hdr_h,
+            )
+            _improv_pg = p.page_for(self._improv_page_key)
 
             # ── Three top-level probability sliders ───────────────────────────
             y = self._add_seq_slider(improv_prob_sliders, y, "Grace Prob",
@@ -6484,33 +12176,73 @@ class PatchPanel(Panel):
             y += 4
 
             # ── Improv step eligibility grid ──────────────────────────────────
-            # Inherits rhythm_division and rhythm_active_pat from the patch.
-            div_i   = p.rhythm_division
-            act_i   = min(p.rhythm_active_pat, max(0, len(p.rhythm_patterns) - 1))
-            cols_i  = 8
-            rows_i  = max(1, (div_i + cols_i - 1) // cols_i)
-            cw_i    = max(10, (pw - 12) // cols_i)
+            div_i   = _improv_pg.rhythm_division
+            act_i   = min(_improv_pg.rhythm_active_pat, max(0, len(_improv_pg.rhythm_patterns) - 1))
             ch_i    = 16
-            ip.ensure_pattern_size(act_i, div_i)
-            improv_step_rects: list = []
-            for ri in range(rows_i):
-                for ci in range(cols_i):
-                    si = ri * cols_i + ci
-                    if si >= div_i:
-                        break
-                    is_on = ip.eligible(act_i, si)
-                    bg  = (105, 78, 28) if is_on else (32, 26, 12)
-                    brd = (190, 150, 60) if is_on else (70, 55, 22)
-                    sx = 6 + ci * cw_i
-                    sy = y + ri * (ch_i + 2)
-                    cr = pygame.Rect(sx, sy, cw_i - 2, ch_i)
-                    pygame.draw.rect(surf, bg, cr, border_radius=2)
-                    pygame.draw.rect(surf, brd, cr, 1, border_radius=2)
-                    if is_on:
-                        surf.blit(font.render("G", True, (240, 200, 100)), (sx + 2, sy + 2))
-                    improv_step_rects.append({"rect": cr, "step_i": si, "pat_i": act_i})
+            _improv_rpats = _improv_pg.rhythm_patterns
+            _improv_act_pat = _improv_rpats[act_i] if _improv_rpats else None
+
+            if _improv_act_pat is not None:
+                _imp_tree = _improv_act_pat.get_improv_tree(div_i)
+
+                def _imp_read(leaf, _si, _ex):
+                    return leaf.on
+
+                def _imp_bg(val, is_beat, depth, group):
+                    d_shift = min(depth * 8, 30)
+                    if val:
+                        return (105 - d_shift, 78 - d_shift, 28)
+                    return (32 + d_shift // 3, 26 + d_shift // 3, 12)
+
+                def _imp_brd(val, is_beat, depth, group):
+                    if val:
+                        brd = (190, 150, 60)
+                    else:
+                        brd = (70, 55, 22)
+                    if is_beat:
+                        brd = tuple(min(255, c + 18) for c in brd)
+                    return brd
+
+                def _imp_label(val):
+                    if val:
+                        return ("G", (240, 200, 100))
+                    return None
+
+                def _imp_click(leaf, _si, _ex):
+                    leaf.on = not leaf.on
+
+                _improv_layer = GridViewLayer(
+                    "improv",
+                    read_fn        = _imp_read,
+                    bg_fn          = _imp_bg,
+                    brd_fn         = _imp_brd,
+                    label_fn       = _imp_label,
+                    click_fn       = _imp_click,
+                    right_click_fn = lambda cell, lx, ly, tr, dv: self._build_step_context_menu(cell, lx, ly, tr, dv),
+                    show_depth     = True,
+                )
+
+                improv_step_rects, improv_h = self._render_grid_layer(
+                    surf, font, y, _improv_layer, _imp_tree, div_i,
+                    p.page_meter(_improv_pg)[0], pw, cell_h=ch_i,
+                    frac_beat_mode=getattr(_improv_pg, "frac_beat_mode", "warp"))
+                self._improv_tree  = _imp_tree
+                self._improv_layer = _improv_layer
+            else:
+                improv_step_rects = []
+                improv_h = ch_i + 2
+                _improv_layer = None
             self._improv_step_rects = improv_step_rects
-            y += rows_i * (ch_i + 2) + 4
+
+            # Snap-to-rhythm button for improv grid
+            snap_imp_r = pygame.Rect(pw - 62, y, 58, 14)
+            pygame.draw.rect(surf, (44, 36, 20), snap_imp_r, border_radius=2)
+            pygame.draw.rect(surf, (90, 70, 30), snap_imp_r, 1, border_radius=2)
+            surf.blit(font.render("\u21bb Snap", True, (200, 170, 80)),
+                      (snap_imp_r.x + 4, snap_imp_r.y + 1))
+            self._improv_snap_rect = snap_imp_r
+            self._improv_snap_pat  = _improv_act_pat
+            y += improv_h + 18
 
         self._improv_prob_sliders  = improv_prob_sliders
         self._improv_grace_sliders = improv_grace_sliders
@@ -6537,12 +12269,25 @@ class PatchPanel(Panel):
         y += hdr_h
 
         if not self._rhythm_collapsed:
+            # Resolve page data aliases up-front so every section below uses the
+            # correct source (flat patch fields for "all", RhythmPage object otherwise).
+            _active_pg  = p.page_for(p.rhythm_active_page)
+            _rp_pats    = _active_pg.rhythm_patterns
+            _rp_phrase  = _active_pg.rhythm_phrase
+            _rp_act_pat = _active_pg.rhythm_active_pat
+            _rp_div     = _active_pg.rhythm_division
+            _rp_swing   = _active_pg.rhythm_swing
+            _rp_pocket  = _active_pg.rhythm_pocket
+            _rp_gate    = _active_pg.rhythm_gate
+            _rp_pbars   = _active_pg.rhythm_prog_bars
+            _rp_fitmode = _active_pg.rhythm_fit_mode
+
             # ── Division picker ──────────────────────────────────────────────
             surf.blit(font.render("Div:", True, _PY_DIM), (8, y + 3))
             div_rects: list = []
             dx = 40
             for dv in _RHYTHM_DIVISIONS:
-                is_sel = (p.rhythm_division == dv)
+                is_sel = (_rp_div == dv)
                 dc = (85, 52, 136) if is_sel else (42, 36, 58)
                 dr = pygame.Rect(dx, y + 1, 30, hdr_h - 2)
                 pygame.draw.rect(surf, dc, dr, border_radius=3)
@@ -6550,15 +12295,80 @@ class PatchPanel(Panel):
                 surf.blit(font.render(str(dv), True, tc), (dx + 4, y + 3))
                 div_rects.append({"rect": dr, "val": dv})
                 dx += 32
+            meter_lbl = _page_meter_label(p, _active_pg)
+            meter_s = font.render(meter_lbl, True, (150, 132, 196))
+            surf.blit(meter_s, (pw - meter_s.get_width() - 8, y + 3))
             self._rhythm_div_rects = div_rects
             y += hdr_h + 2
+
+            # ── Page selector (register parts) ───────────────────────────────
+            surf.blit(font.render("Part:", True, _PY_DIM), (8, y + 3))
+            page_rects: list = []
+            pgx = 44
+            for pg_key, pg_label in self._page_selector_entries(p.rhythm_active_page, p.rhythm_pages):
+                is_active = (p.rhythm_active_page == pg_key)
+                has_custom = (pg_key != "all" and pg_key in p.rhythm_pages)
+                pg_col = (88, 52, 148) if is_active else (42, 36, 62)
+                pg_brd = (175, 130, 255) if is_active else ((110, 80, 160) if has_custom else (58, 48, 80))
+                pg_w   = max(32, min(72, font.size(pg_label)[0] + 8))
+                pg_r   = pygame.Rect(pgx, y + 1, pg_w, hdr_h - 2)
+                pygame.draw.rect(surf, pg_col, pg_r, border_radius=3)
+                pygame.draw.rect(surf, pg_brd, pg_r, 1, border_radius=3)
+                tc = (220, 195, 255) if is_active else ((165, 130, 210) if has_custom else (110, 92, 148))
+                surf.blit(font.render(pg_label, True, tc), (pgx + 3, y + 3))
+                page_rects.append({"rect": pg_r, "key": pg_key})
+                pgx += pg_w + 2
+            # [+] button to create a new page for the active register slot
+            pg_add_r = pygame.Rect(pgx, y + 1, 16, hdr_h - 2)
+            pygame.draw.rect(surf, (42, 60, 42), pg_add_r, border_radius=3)
+            surf.blit(font.render("+", True, (110, 190, 110)), (pgx + 3, y + 3))
+            pgx += 18
+            # [-] button to delete the currently selected page (not shown for "All")
+            _show_del = (p.rhythm_active_page != "all" and p.rhythm_active_page in p.rhythm_pages)
+            pg_del_r = pygame.Rect(pgx, y + 1, 16, hdr_h - 2) if _show_del else None
+            if _show_del:
+                pygame.draw.rect(surf, (76, 38, 38), pg_del_r, border_radius=3)
+                surf.blit(font.render("\u2212", True, (220, 110, 110)), (pgx + 4, y + 3))
+            self._rhythm_page_rects  = page_rects
+            self._rhythm_page_add_r  = pg_add_r
+            self._rhythm_page_del_r  = pg_del_r
+            y += hdr_h + 2
+
+            # ── Stress pattern row + auto deploy ────────────────────────────
+            stress_opts = _stress_pattern_options_for_meter(
+                p.page_meter(_active_pg)[0],
+                getattr(_active_pg, "frac_beat_mode", "warp"))
+            cur_pattern = _page_stress_pattern(p, _active_pg)
+            cur_idx = stress_opts.index(cur_pattern) if cur_pattern in stress_opts else 0
+            stress_lbl = "+".join(str(v) for v in stress_opts[cur_idx])
+            pygame.draw.rect(surf, (24, 20, 38), (2, y, pw - 4, hdr_h - 2))
+            surf.blit(font.render("Stress:", True, _PY_DIM), (8, y + 2))
+            sw = font.size(stress_lbl)[0]
+            surf.blit(font.render(stress_lbl, True, _PY_TXT), (pw // 2 - sw // 2, y + 2))
+            st_l  = pygame.Rect(pw - 136, y + 1, 19, hdr_h - 4)
+            st_r  = pygame.Rect(pw - 115, y + 1, 19, hdr_h - 4)
+            ag_r  = pygame.Rect(pw - 92,  y + 1, 42, hdr_h - 4)
+            vel_r = pygame.Rect(pw - 48,  y + 1, 42, hdr_h - 4)
+            pygame.draw.rect(surf, (55, 45, 78), st_l, border_radius=2)
+            pygame.draw.rect(surf, (55, 45, 78), st_r, border_radius=2)
+            pygame.draw.rect(surf, (58, 82, 52), ag_r, border_radius=2)
+            pygame.draw.rect(surf, (52, 68, 100), vel_r, border_radius=2)
+            surf.blit(font.render("<", True, (175, 150, 220)), (st_l.x + 4, y + 2))
+            surf.blit(font.render(">", True, (175, 150, 220)), (st_r.x + 4, y + 2))
+            surf.blit(font.render("Deploy", True, (170, 225, 170)), (ag_r.x + 4, y + 2))
+            surf.blit(font.render("Vel\u2192", True, (150, 195, 240)), (vel_r.x + 4, y + 2))
+            self._rhythm_stress_left_rect  = st_l
+            self._rhythm_stress_right_rect = st_r
+            self._rhythm_auto_grid_rect    = ag_r
+            self._rhythm_stress_vel_rect   = vel_r
+            y += hdr_h + 4
 
             # ── Pattern tabs ─────────────────────────────────────────────────
             surf.blit(font.render("Pats:", True, _PY_DIM), (8, y + 3))
             pat_tabs: list = []
             px = 46
-            for pi, _ in enumerate(p.rhythm_patterns):
-                is_sel = (pi == p.rhythm_active_pat)
+            for pi, _ in enumerate(_rp_pats):
+                is_sel = (pi == _rp_act_pat)
                 pc = (85, 52, 136) if is_sel else (42, 36, 58)
                 pr_r = pygame.Rect(px, y + 1, 24, hdr_h - 2)
                 pygame.draw.rect(surf, pc, pr_r, border_radius=3)
@@ -6579,37 +12389,72 @@ class PatchPanel(Panel):
             y += hdr_h + 4
 
             # ── Step grid ────────────────────────────────────────────────────
-            div    = p.rhythm_division
-            cols   = 8
-            rows   = max(1, (div + cols - 1) // cols)
-            cell_w = max(10, (pw - 12) // cols)
+            div    = _rp_div
             cell_h = 16
             step_rects: list = []
-            if p.rhythm_patterns:
-                act_pat = p.rhythm_patterns[
-                    min(p.rhythm_active_pat, len(p.rhythm_patterns) - 1)]
-                act_pat.ensure_size(div)
-                for ri in range(rows):
-                    for ci in range(cols):
-                        step_i = ri * cols + ci
-                        if step_i >= div:
-                            break
-                        on       = act_pat.steps[step_i]
-                        sx       = 6 + ci * cell_w
-                        sy       = y + ri * (cell_h + 2)
-                        is_beat  = (step_i % max(1, div // 4) == 0)
-                        if on:
-                            bg  = (125, 72, 195) if is_beat else (88, 52, 152)
-                            brd = (175, 125, 255)
-                        else:
-                            bg  = (28, 22, 44) if is_beat else (22, 18, 34)
-                            brd = (52, 42, 78)
-                        cr = pygame.Rect(sx, sy, cell_w - 2, cell_h)
-                        pygame.draw.rect(surf, bg, cr, border_radius=2)
-                        pygame.draw.rect(surf, brd, cr, 1, border_radius=2)
-                        step_rects.append({"rect": cr, "step_i": step_i})
+            if _rp_pats:
+                act_pat = _rp_pats[min(_rp_act_pat, len(_rp_pats) - 1)]
+                _meter_for_grid = p.page_meter(_active_pg)[0]
+                _rhy_tree = act_pat.get_tree(div)
+
+                # Rhythm on/off layer definition
+                def _rhy_read(leaf, _si, _ex):
+                    return (leaf.on, int(leaf.art))
+
+                def _rhy_bg(val, is_beat, depth, group):
+                    on, _art = val
+                    d_shift = min(depth * 12, 40)
+                    if group and on:
+                        gc = GROUP_COLORS[min(group, len(GROUP_COLORS) - 1)]
+                        return (max(0, gc[0] - d_shift), max(0, gc[1] - d_shift), max(0, gc[2] - d_shift))
+                    if on:
+                        return (125 - d_shift, 72 + d_shift, 195) if is_beat else (88 - d_shift, 52 + d_shift, 152)
+                    return (28, 22 + d_shift // 3, 44) if is_beat else (22, 18 + d_shift // 3, 34)
+
+                def _rhy_brd(val, is_beat, depth, group):
+                    on, _art = val
+                    d_shift = min(depth * 12, 40)
+                    if group and on:
+                        gc = GROUP_COLORS[min(group, len(GROUP_COLORS) - 1)]
+                        return (min(255, gc[0] + 50), min(255, gc[1] + 50), min(255, gc[2] + 50))
+                    if on:
+                        return (175, 125, 255)
+                    return (52, 42 + d_shift // 2, 78)
+
+                def _rhy_label_right(val):
+                    on, art = val
+                    if on:
+                        lbl = _ART_LABELS.get(art, "")
+                        if lbl:
+                            return (lbl, (240, 220, 120))
+                    return None
+
+                def _rhy_click(leaf, _si, _ex):
+                    leaf.on = not leaf.on
+                    self._rhythm_ctx_menu = None
+
+                _rhythm_layer = GridViewLayer(
+                    "rhythm",
+                    read_fn        = _rhy_read,
+                    bg_fn          = _rhy_bg,
+                    brd_fn         = _rhy_brd,
+                    label_right_fn = _rhy_label_right,
+                    click_fn       = _rhy_click,
+                    right_click_fn = lambda cell, lx, ly, tr, dv: self._build_step_context_menu(cell, lx, ly, tr, dv),
+                    show_groups    = True,
+                    show_depth     = True,
+                )
+
+                step_rects, metric_h = self._render_grid_layer(
+                    surf, font, y, _rhythm_layer, _rhy_tree, div,
+                    _meter_for_grid, pw, cell_h=cell_h,
+                    frac_beat_mode=getattr(_active_pg, "frac_beat_mode", "warp"))
+                self._rhythm_layer = _rhythm_layer
+                self._rhythm_tree  = _rhy_tree
+            else:
+                metric_h = cell_h + 2
             self._rhythm_step_rects = step_rects
-            y += rows * (cell_h + 2) + 4
+            y += metric_h + 4
 
             # ── Phrase builder ────────────────────────────────────────────────
             pygame.draw.rect(surf, (20, 16, 30), (2, y, pw - 4, hdr_h + 4),
@@ -6617,7 +12462,7 @@ class PatchPanel(Panel):
             surf.blit(font.render("Phrase:", True, _PY_DIM), (8, y + 3))
             phrase_rects: list = []
             phx = 58
-            for si, pat_i in enumerate(p.rhythm_phrase):
+            for si, pat_i in enumerate(_rp_phrase):
                 pr_slot = pygame.Rect(phx, y + 2, 20, hdr_h)
                 pygame.draw.rect(surf, (72, 48, 110), pr_slot, border_radius=3)
                 surf.blit(font.render(str(pat_i + 1), True, (195, 165, 240)),
@@ -6647,7 +12492,7 @@ class PatchPanel(Panel):
             pygame.draw.rect(surf, (55, 45, 78), pb_inc_r, border_radius=3)
             surf.blit(font.render("<", True, (175, 150, 220)), (pb_dec_r.x + 4, y + 3))
             surf.blit(font.render(">", True, (175, 150, 220)), (pb_inc_r.x + 4, y + 3))
-            pb_val = str(p.rhythm_prog_bars)
+            pb_val = str(_rp_pbars)
             surf.blit(font.render(pb_val, True, _PY_TXT),
                       (pb_dec_r.right + (pb_inc_r.x - pb_dec_r.right - font.size(pb_val)[0]) // 2,
                        y + 3))
@@ -6656,7 +12501,7 @@ class PatchPanel(Panel):
             # Right cluster: [ Drop ] [ Ext ]
             fm_drop_r = pygame.Rect(pw - 92, y + 1, 40, hdr_h - 2)
             fm_ext_r  = pygame.Rect(pw - 48, y + 1, 44, hdr_h - 2)
-            _is_drop  = (p.rhythm_fit_mode == "drop")
+            _is_drop  = (_rp_fitmode == "drop")
             pygame.draw.rect(surf,
                              (78, 48, 118) if _is_drop else (42, 36, 58), fm_drop_r,
                              border_radius=3)
@@ -6675,28 +12520,171 @@ class PatchPanel(Panel):
 
             # ── Swing / Pocket / Gate sliders ─────────────────────────────────
             rhythm_sliders: list[dict] = []
+            _page_num, _page_den = p.page_meter(_active_pg)
+            # Meter inherit indicator (only for named pages, not "all")
+            _is_named_page = (p.rhythm_active_page != "all")
+            _meter_inherited = _is_named_page and (
+                float(getattr(_active_pg, "meter_numerator", 0.0)) == 0.0)
+            _mih_r = pygame.Rect(pw - 84, y - (hdr_h), 80, hdr_h - 4)
+            if _is_named_page:
+                _mih_col = (38, 64, 38) if not _meter_inherited else (62, 92, 62)
+                _mih_brd = (80, 148, 80) if _meter_inherited else (55, 82, 55)
+                pygame.draw.rect(surf, _mih_col, _mih_r, border_radius=3)
+                pygame.draw.rect(surf, _mih_brd, _mih_r, 1, border_radius=3)
+                _mih_lbl = "\u2713 Global m." if _meter_inherited else "  Global m."
+                surf.blit(font.render(_mih_lbl, True,
+                                      (175, 240, 175) if _meter_inherited else (110, 160, 110)),
+                          (_mih_r.x + 3, _mih_r.y + 2))
+            self._rhythm_meter_inherit_r = _mih_r if _is_named_page else None
+            y += 14  # label clearance: ensure first slider label clears the prog-bars row
+            y = self._add_seq_slider(rhythm_sliders, y, "Page Num",
+                                     "meter_numerator", _page_num, 1.0, 16.0, ".2f")
+            y = self._add_seq_slider(rhythm_sliders, y, "Page Den",
+                                     "meter_denominator", _page_den, 1.0, 16.0, ".2f")
             y = self._add_seq_slider(rhythm_sliders, y, "Swing",
-                                     "rhythm_swing",  p.rhythm_swing,  0.0,  0.67, ".2f")
+                                     "rhythm_swing",  _rp_swing,  0.0,  0.67, ".2f")
             y = self._add_seq_slider(rhythm_sliders, y, "Pocket",
-                                     "rhythm_pocket", p.rhythm_pocket, -0.5, 0.5,  ".2f")
+                                     "rhythm_pocket", _rp_pocket, -0.5, 0.5,  ".2f")
             y = self._add_seq_slider(rhythm_sliders, y, "Gate",
-                                     "rhythm_gate",   p.rhythm_gate,   0.05, 2.0,  ".2f")
+                                     "rhythm_gate",   _rp_gate,   0.05, 2.0,  ".2f")
             _RH_ACT = (98, 68, 158)
             for sl in rhythm_sliders:
                 r = sl["rect"]
                 lbl_y = r.y - 14
-                surf.blit(font.render(sl["label"], True, _PY_DIM), (8, lbl_y))
-                vs = font.render(format(sl["val"], sl["fmt"]), True, _PY_TXT)
+                _is_meter_sl = sl["key"] in {"meter_numerator", "meter_denominator"}
+                _greyed = _is_meter_sl and _meter_inherited
+                surf.blit(font.render(sl["label"], True,
+                                      (75, 68, 85) if _greyed else _PY_DIM), (8, lbl_y))
+                if _is_meter_sl:
+                    val_str = f"{sl['val']:.2f}".rstrip("0").rstrip(".")
+                    if _greyed:
+                        val_str = f"\u21d0 {val_str}"
+                else:
+                    val_str = format(sl["val"], sl["fmt"])
+                vs = font.render(val_str, True, (95, 85, 105) if _greyed else _PY_TXT)
                 surf.blit(vs, (pw - vs.get_width() - 8, lbl_y))
-                pygame.draw.rect(surf, (38, 32, 52), r, border_radius=3)
-                frac = max(0.0, min(1.0,
-                           (sl["val"] - sl["lo"]) / max(sl["hi"] - sl["lo"], 1e-9)))
-                thumb_x = r.x + int(frac * r.w)
-                pygame.draw.rect(surf, _RH_ACT,
-                                 pygame.Rect(r.x, r.y, thumb_x - r.x + 4, r.h),
-                                 border_radius=3)
+                pygame.draw.rect(surf, (28, 24, 36) if _greyed else (38, 32, 52), r, border_radius=3)
+                if not _greyed:
+                    frac = max(0.0, min(1.0,
+                               (sl["val"] - sl["lo"]) / max(sl["hi"] - sl["lo"], 1e-9)))
+                    thumb_x = r.x + int(frac * r.w)
+                    pygame.draw.rect(surf, _RH_ACT,
+                                     pygame.Rect(r.x, r.y, thumb_x - r.x + 4, r.h),
+                                     border_radius=3)
+            hint = font.render("Shift=free Ctrl=irr", True, (110, 96, 152))
+            surf.blit(hint, (pw - hint.get_width() - 8, rhythm_sliders[0]["rect"].y - 28))
             self._rhythm_sliders = rhythm_sliders
             y += 4
+
+            # ── Fractional-beat mode toggle ──────────────────────────────────
+            _fbm = getattr(_active_pg, "frac_beat_mode", "warp")
+            _fbm_is_warp = (_fbm != "grid")
+            fbm_warp_r = pygame.Rect(8, y, 52, hdr_h - 2)
+            fbm_grid_r = pygame.Rect(62, y, 52, hdr_h - 2)
+            _fbm_w_bg = (58, 42, 98) if _fbm_is_warp else (32, 28, 44)
+            _fbm_g_bg = (42, 68, 92) if not _fbm_is_warp else (28, 38, 44)
+            pygame.draw.rect(surf, _fbm_w_bg, fbm_warp_r, border_radius=3)
+            pygame.draw.rect(surf, _fbm_g_bg, fbm_grid_r, border_radius=3)
+            pygame.draw.rect(surf, (95, 68, 158) if _fbm_is_warp else (55, 48, 72),
+                             fbm_warp_r, 1, border_radius=3)
+            pygame.draw.rect(surf, (68, 120, 158) if not _fbm_is_warp else (48, 62, 72),
+                             fbm_grid_r, 1, border_radius=3)
+            surf.blit(font.render("\u223c Warp", True,
+                                  (200, 170, 255) if _fbm_is_warp else (100, 88, 130)),
+                      (fbm_warp_r.x + 3, y + 2))
+            surf.blit(font.render("\u2587 Grid", True,
+                                  (170, 215, 255) if not _fbm_is_warp else (88, 110, 130)),
+                      (fbm_grid_r.x + 3, y + 2))
+            _fbm_hint = font.render(
+                "frac \u2192 warp pockets" if _fbm_is_warp else "frac \u2192 beat cell",
+                True, (90, 82, 115))
+            surf.blit(_fbm_hint, (pw - _fbm_hint.get_width() - 8, y + 2))
+            self._frac_beat_warp_rect = fbm_warp_r
+            self._frac_beat_grid_rect = fbm_grid_r
+            y += hdr_h + 2
+
+        # ── Placement section ────────────────────────────────────────────────
+        _plc_hdr = pygame.Rect(2, y, pw - 4, hdr_h)
+        pygame.draw.rect(surf, (30, 38, 55), _plc_hdr, border_radius=3)
+        _plc_arrow = "\u25b6" if self._placement_collapsed else "\u25bc"
+        surf.blit(font.render(f"{_plc_arrow} Placement", True, (140, 175, 220)),
+                  (8, y + 3))
+        _plc_total = sum(pt.player_count for pt in p.parts)
+        if _plc_total > 0:
+            _tot_s = font.render(f"{_plc_total} performers", True, (110, 155, 190))
+            surf.blit(_tot_s, (pw - _tot_s.get_width() - 8, y + 3))
+        self._placement_hdr_rect = _plc_hdr
+        y += hdr_h + 2
+
+        if not self._placement_collapsed:
+            _pm_rects: list = []
+            if not p.parts:
+                surf.blit(font.render("(solve to populate)", True, (70, 80, 100)), (12, y + 2))
+                y += hdr_h + 2
+            else:
+                for pt in p.parts:
+                    _reg_col: tuple = {
+                        "bass":  (60, 45, 88),
+                        "mid":   (45, 68, 88),
+                        "high":  (48, 88, 68),
+                    }.get(pt.register, (52, 52, 72))
+                    _row_r = pygame.Rect(4, y, pw - 8, hdr_h)
+                    pygame.draw.rect(surf, _reg_col, _row_r, border_radius=2)
+                    # Label (truncated)
+                    lbl_max = pw - 78
+                    _lbl = pt.label
+                    while font.size(_lbl)[0] > lbl_max - 8 and len(_lbl) > 4:
+                        _lbl = _lbl[:-1]
+                    surf.blit(font.render(_lbl, True, (190, 210, 235)), (8, y + 2))
+                    # Player count ± buttons
+                    _dec_r = pygame.Rect(pw - 70, y + 1, 20, hdr_h - 2)
+                    _cnt_r = pygame.Rect(pw - 48, y + 1, 22, hdr_h - 2)
+                    _inc_r = pygame.Rect(pw - 24, y + 1, 20, hdr_h - 2)
+                    pygame.draw.rect(surf, (55, 45, 78), _dec_r, border_radius=2)
+                    pygame.draw.rect(surf, (32, 30, 48), _cnt_r, border_radius=2)
+                    pygame.draw.rect(surf, (45, 68, 55), _inc_r, border_radius=2)
+                    surf.blit(font.render("-", True, (175, 150, 220)),
+                              (_dec_r.x + 6, y + 2))
+                    surf.blit(font.render(str(pt.player_count), True, (200, 200, 230)),
+                              (_cnt_r.x + (22 - font.size(str(pt.player_count))[0]) // 2, y + 2))
+                    surf.blit(font.render("+", True, (140, 210, 160)),
+                              (_inc_r.x + 5, y + 2))
+                    _pm_rects.append({"dec": _dec_r, "inc": _inc_r, "key": pt.key})
+                    y += hdr_h + 2
+            self._placement_pm_rects = _pm_rects
+
+        # Dropdown overlay — drawn last so it paints over every section below it.
+        if self._open_dropdown in ("module", "control") and self._dropdown_items:
+            btn_h = font.get_height() + 6
+            for di in self._dropdown_items:
+                r = di["rect"]
+                pygame.draw.rect(surf, (50, 50, 66), r, border_radius=2)
+                pygame.draw.rect(surf, (90, 90, 120), r, 1, border_radius=2)
+                surf.blit(font.render(di["label"], True, (200, 220, 255)),
+                          (r.x + 4, r.y + 2))
+
+        # ── Context menu overlay (right-click on step cell) ──────────────
+        ctx = self._rhythm_ctx_menu
+        if ctx is not None:
+            _ctx_items = ctx.get("items", [])
+            if _ctx_items:
+                # Background panel
+                menu_r = ctx.get("menu_rect")
+                if menu_r:
+                    pygame.draw.rect(surf, (38, 32, 54), menu_r, border_radius=3)
+                    pygame.draw.rect(surf, (100, 80, 150), menu_r, 1, border_radius=3)
+                for ci in _ctx_items:
+                    r = ci["rect"]
+                    if ci.get("separator"):
+                        pygame.draw.line(surf, (70, 60, 100),
+                                         (r.x + 4, r.y + r.h // 2),
+                                         (r.x + r.w - 4, r.y + r.h // 2))
+                        continue
+                    pygame.draw.rect(surf, (52, 44, 72), r, border_radius=2)
+                    pygame.draw.rect(surf, (85, 70, 120), r, 1, border_radius=2)
+                    lbl_c = ci.get("color", (210, 200, 240))
+                    surf.blit(font.render(ci["label"], True, lbl_c),
+                              (r.x + 4, r.y + 2))
 
         return self._apply_panel_scroll(surf)
 
@@ -6715,6 +12703,45 @@ class PatchPanel(Panel):
             ly = event.pos[1] - rect.y + self._panel_scroll_y
             pw = self.PANEL_W
             p  = self._patch
+
+            # ── Context menu item click (takes priority) ─────────────────────
+            ctx = self._rhythm_ctx_menu
+            if ctx is not None:
+                _ctx_hit = False
+                for ci in ctx.get("items", []):
+                    if ci.get("separator"):
+                        continue
+                    if ci["rect"].collidepoint(lx, ly):
+                        _ctx_hit = True
+                        _ctx_cell = ctx["cell"]
+                        _ctx_tree = ctx["tree"]
+                        _ctx_div  = ctx["div"]
+                        action    = ci["action"]
+
+                        if action == "toggle":
+                            _ctx_cell["leaf"].on = not _ctx_cell["leaf"].on
+
+                        elif action == "art":
+                            _ctx_cell["leaf"].art = ci["art_val"]
+
+                        elif action == "group":
+                            _ctx_cell["leaf"].group = ci["group_val"]
+
+                        elif action == "subdivide":
+                            leaf = _ctx_cell["leaf"]
+                            if leaf.is_leaf():
+                                leaf.subdivide(ci["n"])
+
+                        elif action == "collapse":
+                            leaf = _ctx_cell["leaf"]
+                            _ctx_tree.collapse_at(leaf.position)
+
+                        self._rhythm_ctx_menu = None
+                        return True
+                # Click outside menu items — close it
+                if not _ctx_hit:
+                    self._rhythm_ctx_menu = None
+                    # Don't consume the click — let it fall through
 
             # ── Voices header toggle ─────────────────────────────────────────
             if self._voices_hdr_rect and self._voices_hdr_rect.collidepoint(lx, ly):
@@ -6772,13 +12799,17 @@ class PatchPanel(Panel):
                 self._dyn_collapsed = not self._dyn_collapsed
                 return True
             if self._dyn_enable_rect and self._dyn_enable_rect.collidepoint(lx, ly):
-                dp = getattr(p, "dynamics_program", None)
+                dp = p.ensure_dynamics_page(self._dyn_page_key)
                 if dp is not None:
                     dp.enabled = not dp.enabled
                 return True
 
             if not self._dyn_collapsed and _HAS_DYN_ENG:
-                dp = getattr(p, "dynamics_program", None)
+                dp = p.ensure_dynamics_page(self._dyn_page_key)
+                for pg in self._dyn_page_rects:
+                    if pg["rect"].collidepoint(lx, ly):
+                        self._dyn_page_key = pg["key"]
+                        return True
                 # Curve shape arrows
                 if self._dyn_curve_left_rect and self._dyn_curve_left_rect.collidepoint(lx, ly):
                     if dp is not None:
@@ -6803,31 +12834,44 @@ class PatchPanel(Panel):
                                      key=lambda j: abs(_SCOPE_VALUES[j] - dp.curve.scope_bars))
                         dp.curve.scope_bars = _SCOPE_VALUES[min(len(_SCOPE_VALUES) - 1, sv_idx + 1)]
                     return True
+                if self._dyn_auto_accent_rect and self._dyn_auto_accent_rect.collidepoint(lx, ly):
+                    _dyn_page = p if self._dyn_page_key == "all" else p.page_for(self._dyn_page_key)
+                    if _dyn_page is not None:
+                        _auto_apply_dynamics_accent(p, _dyn_page, dp)
+                    return True
                 # Intensity slider
                 for i, sl in enumerate(self._dyn_sliders):
                     if sl["rect"].collidepoint(lx, ly):
                         self._dragging_dyn_slider = i
                         self._apply_dyn_slider(sl, lx)
                         return True
-                # Accent grid
-                for ar in self._dyn_accent_rects:
-                    if ar["rect"].collidepoint(lx, ly):
-                        if dp is not None:
-                            dp.accent.cycle_level(ar["step_i"])
+                # Accent grid click
+                if self._accent_layer is not None:
+                    if self._handle_grid_layer_click(self._dyn_accent_rects, lx, ly, self._accent_layer):
                         return True
+                # Accent snap-to-rhythm
+                if getattr(self, '_accent_snap_rect', None) and self._accent_snap_rect.collidepoint(lx, ly):
+                    _snap_pat = getattr(self, '_accent_snap_pat', None)
+                    if _snap_pat is not None:
+                        _snap_pat.snap_accent_to_rhythm()
+                    return True
 
             # ── Improv header toggle / enable ─────────────────────────────────
             if self._improv_hdr_rect and self._improv_hdr_rect.collidepoint(lx, ly):
                 self._improv_collapsed = not self._improv_collapsed
                 return True
             if self._improv_enable_rect and self._improv_enable_rect.collidepoint(lx, ly):
-                ip2 = getattr(p, "improv_program", None)
+                ip2 = p.ensure_improv_page(self._improv_page_key)
                 if ip2 is not None:
                     ip2.enabled = not ip2.enabled
                 return True
 
             if not self._improv_collapsed and _HAS_IMPROV_ENG:
-                ip2 = getattr(p, "improv_program", None)
+                ip2 = p.ensure_improv_page(self._improv_page_key)
+                for pg in self._improv_page_rects:
+                    if pg["rect"].collidepoint(lx, ly):
+                        self._improv_page_key = pg["key"]
+                        return True
                 # ── Probability sliders ───────────────────────────────────────
                 for i, sl in enumerate(self._improv_prob_sliders):
                     if sl["rect"].collidepoint(lx, ly):
@@ -6903,10 +12947,15 @@ class PatchPanel(Panel):
                             self._apply_improv_slider(sl, lx)
                             return True
                 # ── Step grid ─────────────────────────────────────────────────
-                for cell in self._improv_step_rects:
-                    if cell["rect"].collidepoint(lx, ly) and ip2 is not None:
-                        ip2.toggle_step(cell["pat_i"], cell["step_i"], p.rhythm_division)
+                if getattr(self, '_improv_layer', None) is not None:
+                    if self._handle_grid_layer_click(self._improv_step_rects, lx, ly, self._improv_layer):
                         return True
+                # Improv snap-to-rhythm
+                if getattr(self, '_improv_snap_rect', None) and self._improv_snap_rect.collidepoint(lx, ly):
+                    _snap_pat = getattr(self, '_improv_snap_pat', None)
+                    if _snap_pat is not None:
+                        _snap_pat.snap_improv_to_rhythm()
+                    return True
 
             # ── Voice rows ───────────────────────────────────────────────────
             if not self._voices_collapsed:
@@ -6918,10 +12967,10 @@ class PatchPanel(Panel):
                     row_top = y0 + i_idx * row_h
                     if row_top <= ly < row_top + row_h:
                         # Pinned Patch row — select only, no delete/mute/solo
-                        if key == "__patch__":
-                            self._active = "__patch__"
+                        if key in {"__patch__", "__system__"}:
+                            self._active = key
                             if self.on_select:
-                                self.on_select("__patch__")
+                                self.on_select(key)
                             return True
                         is_mix     = any(m.key == key for m in self._patch.mixers)  if self._patch else False
                         is_param   = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
@@ -7010,67 +13059,150 @@ class PatchPanel(Panel):
                     p.rhythm_enabled = not p.rhythm_enabled
                     return True
                 if not self._rhythm_collapsed:
+                    # Page selector tabs
+                    for pg in getattr(self, "_rhythm_page_rects", []):
+                        if pg["rect"].collidepoint(lx, ly):
+                            p.rhythm_active_page = pg["key"]
+                            return True
+                    # Page [+] — create a new per-register page for the active slot
+                    if (getattr(self, "_rhythm_page_add_r", None) and
+                            self._rhythm_page_add_r.collidepoint(lx, ly)):
+                        key = p.rhythm_active_page
+                        if key != "all" and key not in p.rhythm_pages:
+                            p.rhythm_pages[key] = p._default_page()
+                        return True
+                    # Page [−] — delete the active per-register page
+                    if (getattr(self, "_rhythm_page_del_r", None) and
+                            self._rhythm_page_del_r is not None and
+                            self._rhythm_page_del_r.collidepoint(lx, ly)):
+                        _del_key = p.rhythm_active_page
+                        if _del_key != "all":
+                            p.remove_page(_del_key)
+                            p.rhythm_active_page = "all"
+                        return True
+                    # Meter inherit toggle (Global meter checkbox)
+                    if (getattr(self, "_rhythm_meter_inherit_r", None) and
+                            self._rhythm_meter_inherit_r is not None and
+                            self._rhythm_meter_inherit_r.collidepoint(lx, ly)):
+                        _rw_key2 = p.rhythm_active_page
+                        if _rw_key2 != "all" and _rw_key2 in p.rhythm_pages:
+                            _pg2 = p.rhythm_pages[_rw_key2]
+                            if float(_pg2.meter_numerator) == 0.0:
+                                # Enable page-local meter: copy global as starting value
+                                _pg2.meter_numerator   = float(p.meter_numerator)
+                                _pg2.meter_denominator = float(p.meter_denominator)
+                            else:
+                                # Revert to inherit (0.0 = inherit from patch)
+                                _pg2.meter_numerator   = 0.0
+                                _pg2.meter_denominator = 0.0
+                        return True
+                    # Resolve write target — "all" page writes to flat patch fields,
+                    # named pages write to the RhythmPage object in rhythm_pages.
+                    _rw_key = p.rhythm_active_page
+                    _rw = (p.rhythm_pages[_rw_key]
+                           if (_rw_key != "all" and _rw_key in p.rhythm_pages)
+                           else p)
+                    _rw_page = p.page_for(_rw_key)
+                    _stress_opts = _stress_pattern_options_for_meter(
+                        p.page_meter(_rw_page)[0],
+                        getattr(_rw_page, "frac_beat_mode", "warp"))
+                    _cur_stress = _page_stress_pattern(p, _rw_page)
+                    _stress_idx = _stress_opts.index(_cur_stress) if _cur_stress in _stress_opts else 0
+                    if self._rhythm_stress_left_rect and self._rhythm_stress_left_rect.collidepoint(lx, ly):
+                        _next = _stress_opts[(_stress_idx - 1) % len(_stress_opts)]
+                        _rw.stress_pattern = list(_next)
+                        return True
+                    if self._rhythm_stress_right_rect and self._rhythm_stress_right_rect.collidepoint(lx, ly):
+                        _next = _stress_opts[(_stress_idx + 1) % len(_stress_opts)]
+                        _rw.stress_pattern = list(_next)
+                        return True
+                    if self._rhythm_auto_grid_rect and self._rhythm_auto_grid_rect.collidepoint(lx, ly):
+                        _auto_apply_rhythm_grid(p, _rw)
+                        return True
+                    if (getattr(self, "_rhythm_stress_vel_rect", None) and
+                            self._rhythm_stress_vel_rect.collidepoint(lx, ly)):
+                        _vel_dyn_key = p.rhythm_active_page
+                        _vel_dp = p.ensure_dynamics_page(_vel_dyn_key)
+                        _vel_page = p if _vel_dyn_key == "all" else p.page_for(_vel_dyn_key)
+                        _auto_apply_stress_velocity(p, _vel_page, _vel_dp)
+                        return True
+                    # Fractional-beat mode toggle
+                    if getattr(self, "_frac_beat_warp_rect", None) and self._frac_beat_warp_rect.collidepoint(lx, ly):
+                        _rw_page.frac_beat_mode = "warp"
+                        if _rw_key == "all":
+                            p.frac_beat_mode = "warp"
+                        return True
+                    if getattr(self, "_frac_beat_grid_rect", None) and self._frac_beat_grid_rect.collidepoint(lx, ly):
+                        _rw_page.frac_beat_mode = "grid"
+                        if _rw_key == "all":
+                            p.frac_beat_mode = "grid"
+                        return True
                     # Division picker
                     for dr in self._rhythm_div_rects:
                         if dr["rect"].collidepoint(lx, ly):
-                            p.rhythm_division = dr["val"]
+                            _rw.rhythm_division = dr["val"]
                             return True
                     # Pattern tabs
                     for pt in self._rhythm_pat_tabs:
                         if pt["rect"].collidepoint(lx, ly):
-                            p.rhythm_active_pat = pt["pat_i"]
+                            _rw.rhythm_active_pat = pt["pat_i"]
                             return True
                     # Add / remove pattern
                     if self._rhythm_pat_add_rect and self._rhythm_pat_add_rect.collidepoint(lx, ly):
-                        if len(p.rhythm_patterns) < 8:
-                            n = len(p.rhythm_patterns)
-                            p.rhythm_patterns.append(RhythmPattern(name=f"Pat {n + 1}"))
-                            p.rhythm_active_pat = n
+                        if len(_rw.rhythm_patterns) < 8:
+                            n = len(_rw.rhythm_patterns)
+                            _rw.rhythm_patterns.append(RhythmPattern(name=f"Pat {n + 1}"))
+                            _rw.rhythm_active_pat = n
                         return True
                     if self._rhythm_pat_del_rect and self._rhythm_pat_del_rect.collidepoint(lx, ly):
-                        if len(p.rhythm_patterns) > 1:
-                            p.rhythm_patterns.pop()
-                            p.rhythm_active_pat = min(p.rhythm_active_pat,
-                                                      len(p.rhythm_patterns) - 1)
+                        if len(_rw.rhythm_patterns) > 1:
+                            _rw.rhythm_patterns.pop()
+                            _rw.rhythm_active_pat = min(_rw.rhythm_active_pat,
+                                                        len(_rw.rhythm_patterns) - 1)
                         return True
-                    # Step grid toggle
+                    # Step grid toggle (left-click)
                     for sr in self._rhythm_step_rects:
                         if sr["rect"].collidepoint(lx, ly):
-                            act_i = min(p.rhythm_active_pat, len(p.rhythm_patterns) - 1)
-                            pat   = p.rhythm_patterns[act_i]
-                            si    = sr["step_i"]
-                            pat.ensure_size(p.rhythm_division)
-                            pat.steps[si] = not pat.steps[si]
+                            act_i = min(_rw.rhythm_active_pat, len(_rw.rhythm_patterns) - 1)
+                            pat   = _rw.rhythm_patterns[act_i]
+                            if sr.get("tree_mode"):
+                                leaf = sr["leaf"]
+                                leaf.on = not leaf.on
+                            else:
+                                si = sr["step_i"]
+                                pat.ensure_size(_rw.rhythm_division)
+                                pat.steps[si] = not pat.steps[si]
+                            self._rhythm_ctx_menu = None
                             return True
                     # Phrase: click a slot to cycle to next pattern index
                     for ph in self._rhythm_phrase_rects:
                         if ph["rect"].collidepoint(lx, ly):
                             si = ph["slot_i"]
-                            if 0 <= si < len(p.rhythm_phrase):
-                                p.rhythm_phrase[si] = (
-                                    (p.rhythm_phrase[si] + 1) % max(1, len(p.rhythm_patterns)))
+                            if 0 <= si < len(_rw.rhythm_phrase):
+                                _rw.rhythm_phrase[si] = (
+                                    (_rw.rhythm_phrase[si] + 1) % max(1, len(_rw.rhythm_patterns)))
                             return True
                     # Phrase add / remove bar
                     if self._rhythm_phrase_add_rect and self._rhythm_phrase_add_rect.collidepoint(lx, ly):
-                        p.rhythm_phrase.append(p.rhythm_active_pat)
+                        _rw.rhythm_phrase.append(_rw.rhythm_active_pat)
                         return True
                     if self._rhythm_phrase_del_rect and self._rhythm_phrase_del_rect.collidepoint(lx, ly):
-                        if len(p.rhythm_phrase) > 1:
-                            p.rhythm_phrase.pop()
+                        if len(_rw.rhythm_phrase) > 1:
+                            _rw.rhythm_phrase.pop()
                         return True
                     # Prog bars stepper
                     if self._rhythm_prog_dec_rect and self._rhythm_prog_dec_rect.collidepoint(lx, ly):
-                        p.rhythm_prog_bars = max(1, p.rhythm_prog_bars - 1)
+                        _rw.rhythm_prog_bars = max(1, _rw.rhythm_prog_bars - 1)
                         return True
                     if self._rhythm_prog_inc_rect and self._rhythm_prog_inc_rect.collidepoint(lx, ly):
-                        p.rhythm_prog_bars = min(32, p.rhythm_prog_bars + 1)
+                        _rw.rhythm_prog_bars = min(32, _rw.rhythm_prog_bars + 1)
                         return True
                     # Fit mode toggle
                     if self._rhythm_fit_drop_rect and self._rhythm_fit_drop_rect.collidepoint(lx, ly):
-                        p.rhythm_fit_mode = "drop"
+                        _rw.rhythm_fit_mode = "drop"
                         return True
                     if self._rhythm_fit_ext_rect and self._rhythm_fit_ext_rect.collidepoint(lx, ly):
-                        p.rhythm_fit_mode = "extend"
+                        _rw.rhythm_fit_mode = "extend"
                         return True
                     # Rhythm sliders
                     for i, sl in enumerate(self._rhythm_sliders):
@@ -7079,7 +13211,44 @@ class PatchPanel(Panel):
                             self._apply_rhythm_slider(sl, lx)
                             return True
 
+            # ── Placement section header ─────────────────────────────────────
+            if (getattr(self, "_placement_hdr_rect", None) and
+                    self._placement_hdr_rect.collidepoint(lx, ly)):
+                self._placement_collapsed = not self._placement_collapsed
+                return True
+
+            # ── Placement player count +/- buttons ───────────────────────────
+            _pm = PlacementModule(p)
+            for row in getattr(self, "_placement_pm_rects", []):
+                if row["dec"].collidepoint(lx, ly):
+                    _pm.increment_player_count(row["key"], -1)
+                    return True
+                if row["inc"].collidepoint(lx, ly):
+                    _pm.increment_player_count(row["key"], +1)
+                    return True
+
             return False
+
+        elif event.type == MOUSEBUTTONDOWN and event.button == 3:
+            # Right-click on step cell: open context menu
+            p = self._patch
+            rect = self.panel_rect
+            if p is not None and rect.collidepoint(event.pos):
+                lx = event.pos[0] - rect.x
+                ly = event.pos[1] - rect.y + self._panel_scroll_y
+                for sr in self._rhythm_step_rects:
+                    if sr["rect"].collidepoint(lx, ly):
+                        _rw_key = p.rhythm_active_page
+                        _rw = (p.rhythm_pages[_rw_key]
+                               if (_rw_key != "all" and _rw_key in p.rhythm_pages)
+                               else p)
+                        act_i = min(_rw.rhythm_active_pat, len(_rw.rhythm_patterns) - 1)
+                        pat   = _rw.rhythm_patterns[act_i]
+                        self._rhythm_ctx_menu = self._build_step_context_menu(
+                            sr, lx, ly, pat, _rw.rhythm_division)
+                        return True
+                # Right-click elsewhere: close context menu
+                self._rhythm_ctx_menu = None
 
         elif event.type == MOUSEBUTTONUP and event.button == 1:
             self._dragging_seq_slider    = -1
@@ -7166,6 +13335,7 @@ class PartialPanel(Panel):
         # Inline text-editing state for str-dtype knobs
         self._text_edit_idx: int = -1     # slider index being edited (-1 = none)
         self._text_edit_buf: str = ""     # current edit buffer
+        self._role_defaults_rect: pygame.Rect | None = None
 
     def set_patch(self, patch: AnalyticPatch, active_key: str) -> None:
         if (patch is not self._patch) or (active_key != self._active_key):
@@ -7183,13 +13353,15 @@ class PartialPanel(Panel):
                     val: float, lo: float, hi: float, fmt: str = ".3g",
                     is_log: bool = False, target: Any = None,
                     dtype: str = "float", choices: list = (),
-                    raw_str: str | None = None) -> int:
+                    raw_str: str | None = None,
+                    on_change=None) -> int:
         sliders.append(dict(
             label=label, key=key, val=val, lo=lo, hi=hi,
             fmt=fmt, is_log=is_log,
             rect=pygame.Rect(8, y, self.PANEL_W - 16, self._SLIDER_H),
             target=target,   # explicit write target; None → resolved in _set_slider_val
             dtype=dtype, choices=list(choices), raw_str=raw_str,
+            on_change=on_change,
         ))
         return y + self._SLIDER_H + self._SLIDER_PAD + 12  # label + slider
 
@@ -7206,7 +13378,8 @@ class PartialPanel(Panel):
         param_node = next((pn for pn in self._patch.param_nodes if pn.key == self._active_key), None)
         module     = next((m  for m  in self._patch.modules     if m.key  == self._active_key), None)
         control    = next((cs for cs in self._patch.controls    if cs.key == self._active_key), None)
-        obj = voice or lfo or mixer or param_node or module or control
+        system_dev = self._patch.system_audio if self._active_key == "__system__" else None
+        obj = voice or lfo or mixer or param_node or module or control or system_dev
 
         # Target: voice/lfo/mixer/module/control if one is active, otherwise patch global knobs
         if obj is not None:
@@ -7216,7 +13389,7 @@ class PartialPanel(Panel):
                 _ensure_granular(voice)
             target     = obj
             knob_list: list[KnobSpec] = type(obj).knobs() if hasattr(type(obj), "knobs") else []
-            header_lbl = getattr(obj, "label", "—")
+            header_lbl = getattr(obj, "label", "System Device" if system_dev is not None else "—")
         else:
             target     = self._patch
             knob_list  = AnalyticPatch.knobs()
@@ -7234,7 +13407,7 @@ class PartialPanel(Panel):
                 val=0, lo=0, hi=1, fmt="", is_log=False,
                 rect=pygame.Rect(0, y, pw, fh + 4), target=None,
             ))
-            y += fh + 8
+            y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
             # Surface-level label knob
             for k in ControlSurface.knobs():
                 raw = _get_nested_attr(control, k.name)
@@ -7250,7 +13423,7 @@ class PartialPanel(Panel):
                     val=0, lo=0, hi=1, fmt="", is_log=False,
                     rect=pygame.Rect(0, y, pw, fh + 4), target=None,
                 ))
-                y += fh + 8
+                y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
                 for k in ControlSlider.knobs():
                     raw = _get_nested_attr(cs_sl, k.name)
                     if k.dtype == "choice":
@@ -7295,7 +13468,7 @@ class PartialPanel(Panel):
                         val=0, lo=0, hi=1, fmt="", is_log=False,
                         rect=pygame.Rect(0, y, pw, fh + 4), target=None,
                     ))
-                    y += fh + 8
+                    y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
                 # Resolve current value → float for slider position
                 raw = _get_nested_attr(target, k.name)
                 if k.dtype == "choice":
@@ -7319,6 +13492,58 @@ class PartialPanel(Panel):
                 if k.choices:
                     sliders[-1]["choices"] = list(k.choices)
 
+        if system_dev is not None:
+            _refresh_system_audio_report(system_dev)
+            sliders.append(dict(
+                label="— Devices —", key="__section__",
+                val=0, lo=0, hi=1, fmt="", is_log=False,
+                rect=pygame.Rect(0, y, pw, fh + 4), target=None,
+            ))
+            y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
+
+            _out_opts = ["(default)"] + list(system_dev._reported_output_devices)
+            _in_opts = ["(none)", "(default)"] + list(system_dev._reported_input_devices)
+            _out_cur = system_dev.output_device_name if system_dev.output_device_name in _out_opts else "(default)"
+            _in_cur = system_dev.input_device_name if system_dev.input_device_name in _in_opts else (
+                "(default)" if system_dev.input_channels > 0 else "(none)"
+            )
+
+            def _make_out_dev_cb(_sys=system_dev, _patch=self._patch, _opts=_out_opts):
+                def _cb(idx):
+                    chosen = _opts[int(round(idx))] if 0 <= int(round(idx)) < len(_opts) else "(default)"
+                    _sys.output_device_name = "" if chosen == "(default)" else chosen
+                    _refresh_system_audio_report(_sys)
+                return _cb
+
+            def _make_in_dev_cb(_sys=system_dev, _patch=self._patch, _opts=_in_opts):
+                def _cb(idx):
+                    chosen = _opts[int(round(idx))] if 0 <= int(round(idx)) < len(_opts) else "(none)"
+                    _sys.input_device_name = "" if chosen in {"(none)", "(default)"} else chosen
+                    _refresh_system_audio_report(_sys)
+                return _cb
+
+            y = self._add_slider(
+                sliders, y, "Output Dev", "__system_output_device__",
+                float(_out_opts.index(_out_cur)), 0.0, float(max(0, len(_out_opts) - 1)), ".0f", False,
+                target=None, dtype="choice", choices=_out_opts, on_change=_make_out_dev_cb())
+            y = self._add_slider(
+                sliders, y, "Input Dev", "__system_input_device__",
+                float(_in_opts.index(_in_cur)), 0.0, float(max(0, len(_in_opts) - 1)), ".0f", False,
+                target=None, dtype="choice", choices=_in_opts, on_change=_make_in_dev_cb())
+
+            for _label, _text in [
+                ("Preview Backend", f"{system_dev._preview_backend} ({system_dev._preview_backend_channels}ch negotiated)"),
+                ("Output Probe", f"cfg {system_dev.output_channels}ch -> {system_dev._reported_output_name or '(missing)'} / {system_dev._reported_output_hw_channels}ch @ {system_dev._reported_output_hw_rate}Hz"),
+                ("Input Probe", f"cfg {system_dev.input_channels}ch -> {system_dev._reported_input_name or '(missing)'} / {system_dev._reported_input_hw_channels}ch @ {system_dev._reported_input_hw_rate}Hz"),
+            ]:
+                sliders.append(dict(
+                    label=_label, key=f"__sys_info_{len(sliders)}__",
+                    val=0.0, lo=0.0, hi=1.0, fmt="", is_log=False,
+                    rect=pygame.Rect(8, y, self.PANEL_W - 16, self._SLIDER_H),
+                    target=None, dtype="str", choices=[], raw_str=_text, str_val=_text,
+                ))
+                y += self._SLIDER_H + self._SLIDER_PAD + 12
+
         # Multi-channel LFO channel list — rendered after the standard knobs.
         if module is not None and module.module_type == "lfo":
             sliders.append(dict(
@@ -7326,7 +13551,7 @@ class PartialPanel(Panel):
                 val=0, lo=0, hi=1, fmt="", is_log=False,
                 rect=pygame.Rect(0, y, pw, fh + 4), target=None,
             ))
-            y += fh + 8
+            y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
             _lfo_shapes = AnalyticModule._LFO_SHAPES
             for _ci, _lch in enumerate(module.lfo_channels):
                 sliders.append(dict(
@@ -7334,7 +13559,7 @@ class PartialPanel(Panel):
                     val=0, lo=0, hi=1, fmt="", is_log=False,
                     rect=pygame.Rect(0, y, pw, fh + 4), target=None,
                 ))
-                y += fh + 8
+                y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
                 for _attr, _lbl, _lo, _hi, _fmt in (
                     ("scale",        "Scale",   0.0,  4.0,  ".3f"),
                     ("amplitude",    "Amp",     0.0,  4.0,  ".3f"),
@@ -7428,65 +13653,196 @@ class PartialPanel(Panel):
             ))
             y += self._SLIDER_H + self._SLIDER_PAD + 8
 
+        # State machine module UI
+        if module is not None and module.module_type == "state_machine":
+            sliders.append(dict(
+                label="— State Machine —", key="__section__",
+                val=0, lo=0, hi=1, fmt="", is_log=False,
+                rect=pygame.Rect(0, y, pw, fh + 4), target=None,
+            ))
+            y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
+
+            # Plugin selector
+            _sm_plugins = _sm_plugin_list()
+            _sm_none_list = ["(none)"] + _sm_plugins
+            _sm_cur = module.sm_plugin if module.sm_plugin in _sm_plugins else ""
+            _sm_idx = float(_sm_none_list.index(module.sm_plugin) if module.sm_plugin in _sm_none_list else 0)
+
+            def _make_sm_plugin_cb(_mod=module, _opts=_sm_none_list):
+                def _cb(idx):
+                    chosen = _opts[int(idx)] if int(idx) < len(_opts) else "(none)"
+                    _mod.sm_plugin = "" if chosen == "(none)" else chosen
+                    # Reload plugin metadata into mod fields
+                    if _mod.sm_plugin:
+                        _plug = _load_sm_plugin(_mod.sm_plugin)
+                        if _plug is not None:
+                            _mod.sm_vars  = _sm_plugin_output_vars(_plug)
+                            _mod.sm_state_vars = _sm_plugin_state_vars(_plug)
+                            _mod.sm_items = _sm_plugin_item_names(_plug, _mod.sm_n_items)
+                            _defaults = _sm_plugin_default_params(_plug)
+                            _mod.sm_params = {**_defaults, **dict(_mod.sm_params)}
+                            for _k in list(_mod.sm_params):
+                                if _k not in _defaults:
+                                    _mod.sm_params.pop(_k)
+                    else:
+                        _mod.sm_vars  = []
+                        _mod.sm_state_vars = []
+                        _mod.sm_items = []
+                        _mod.sm_params = {}
+                    _mod._sm_state     = {}
+                    _mod._sm_out_cache = {}
+                    _mod._sm_aux_state = {}
+                return _cb
+            y = self._add_slider(
+                sliders, y, "Plugin", "__sm_plugin__",
+                _sm_idx, 0.0, float(max(0, len(_sm_none_list) - 1)), ".0f", False,
+                target=None, dtype="choice", choices=_sm_none_list,
+                on_change=_make_sm_plugin_cb())
+
+            # N items slider
+            def _make_sm_nitems_cb(_mod=module):
+                def _cb(v):
+                    n = max(1, int(round(v)))
+                    _mod.sm_n_items = n
+                    _plug = _load_sm_plugin(_mod.sm_plugin) if _mod.sm_plugin else None
+                    _mod.sm_items   = _sm_plugin_item_names(_plug, n)
+                    _mod._sm_state     = {}
+                    _mod._sm_out_cache = {}
+                    _mod._sm_aux_state = {}
+                return _cb
+            y = self._add_slider(
+                sliders, y, "N Items", "__sm_n_items__",
+                float(module.sm_n_items), 1.0, 32.0, ".0f", False,
+                target=None, on_change=_make_sm_nitems_cb())
+
+            # Torch toggle
+            _sm_torch_opts = ["numpy", "torch"]
+            _sm_torch_idx  = float(1 if module.sm_use_torch else 0)
+
+            def _make_sm_torch_cb(_mod=module):
+                def _cb(idx):
+                    _mod.sm_use_torch = (int(idx) == 1)
+                return _cb
+            y = self._add_slider(
+                sliders, y, "Backend", "__sm_torch__",
+                _sm_torch_idx, 0.0, 1.0, ".0f", False,
+                target=None, dtype="choice", choices=_sm_torch_opts,
+                on_change=_make_sm_torch_cb())
+
+            # Read-only: items and vars from loaded plugin
+            if module.sm_plugin:
+                _items_str = ", ".join(module.sm_items) if module.sm_items else "—"
+                _vars_str  = ", ".join(module.sm_vars)  if module.sm_vars  else "—"
+                _state_vars_str = ", ".join(module.sm_state_vars) if module.sm_state_vars else "—"
+                for _lbl, _val_str in (("Items", _items_str),
+                                       ("Outputs", _vars_str),
+                                       ("State", _state_vars_str)):
+                    sliders.append(dict(
+                        label=f"{_lbl}: {_val_str}", key=f"__sm_ro_{_lbl}__",
+                        val=0, lo=0, hi=1, fmt="", is_log=False,
+                        rect=pygame.Rect(0, y, pw, fh + 4), target=None,
+                    ))
+                    y += 2 * fh + 8  # fh+4 row + fh+2 label clearance + 2 gap
+                _plug = _load_sm_plugin(module.sm_plugin)
+                _param_specs = _sm_plugin_param_specs(_plug)
+                _last_sm_group = ""
+                for _spec in _param_specs:
+                    _group = _spec.get("group", "Plugin")
+                    if _group != _last_sm_group:
+                        sliders.append(dict(
+                            label=f"— {_group} —", key="__section__",
+                            val=0, lo=0, hi=1, fmt="", is_log=False,
+                            rect=pygame.Rect(0, y, pw, fh + 4), target=None,
+                        ))
+                        y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
+                        _last_sm_group = _group
+                    _name = _spec["name"]
+                    _dtype = _spec["dtype"]
+                    _cur = module.sm_params.get(_name, _spec["default"])
+                    if _dtype == "choice":
+                        _choices = list(_spec["choices"])
+                        _cur_s = str(_cur)
+                        _ci = _choices.index(_cur_s) if _cur_s in _choices else 0
+                        def _make_sm_param_choice_cb(_mod=module, _nm=_name, _chs=_choices):
+                            def _cb(idx):
+                                if 0 <= int(idx) < len(_chs):
+                                    _mod.sm_params[_nm] = _chs[int(idx)]
+                            return _cb
+                        y = self._add_slider(
+                            sliders, y, _spec["label"], f"__sm_param_{_name}__",
+                            float(_ci), 0.0, float(max(0, len(_choices) - 1)),
+                            ".0f", False, target=None, dtype="choice", choices=_choices,
+                            on_change=_make_sm_param_choice_cb())
+                    else:
+                        _float_val = float(_cur)
+                        def _make_sm_param_float_cb(_mod=module, _nm=_name):
+                            def _cb(v):
+                                _mod.sm_params[_nm] = float(v)
+                            return _cb
+                        y = self._add_slider(
+                            sliders, y, _spec["label"], f"__sm_param_{_name}__",
+                            _float_val, float(_spec["low"]), float(_spec["high"]),
+                            _spec["fmt"], bool(_spec["is_log"]), target=None,
+                            on_change=_make_sm_param_float_cb())
+
+            # Reset state button
+            def _make_sm_reset(_mod=module):
+                def _action():
+                    _mod._sm_state     = {}
+                    _mod._sm_out_cache = {}
+                    _mod._sm_aux_state = {}
+                return _action
+            sliders.append(dict(
+                label="Reset State", key="__sm_reset__",
+                val=0, lo=0, hi=1, fmt="", is_log=False,
+                rect=pygame.Rect(8, y, pw - 16, self._SLIDER_H + 2),
+                target=None, action=_make_sm_reset(),
+            ))
+            y += self._SLIDER_H + self._SLIDER_PAD + 8
+
         # When a param_node is active, append the dynamic Targets section below
         # the static knobs (label / extractor / default / low / high).
         if param_node is not None:
             pn = param_node
-            # Build the live node catalogue: voices + lfos + modules
-            # Interaural modules expose ch1/ch2 as separately addressable param targets.
-            _iau_key_to_mod: dict = {}
-            all_nodes = (
-                [(v.key, f"{v.label}") for v in self._patch.voices] +
-                [(l.key, f"~ {l.label}") for l in self._patch.lfos]
-            )
-            for _m in self._patch.modules:
-                all_nodes.append((_m.key, f"\u2B21 {_m.label}"))
-                if _m.module_type == "interaural":
-                    all_nodes.append((_m.ch1_key(), f"\u2B21 {_m.label} ch1"))
-                    all_nodes.append((_m.ch2_key(), f"\u2B21 {_m.label} ch2"))
-                    _iau_key_to_mod[_m.ch1_key()] = _m
-                    _iau_key_to_mod[_m.ch2_key()] = _m
-                    _iau_key_to_mod[_m.key]       = _m
-            voice_keys   = [""] + [k for k, _ in all_nodes]
-            voice_labels = ["—"] + [lbl for _, lbl in all_nodes]
-            attr_choices = ["—"] + _VOICE_PARAM_ATTRS  # default; overridden per target below
+            node_specs = _param_target_node_specs(self._patch)
+            node_keys = [""] + [k for k, _ in node_specs]
+            node_labels = ["—"] + [lbl for _, lbl in node_specs]
 
             sliders.append(dict(
                 label="— Targets —", key="__section__",
                 val=0, lo=0, hi=1, fmt="", is_log=False,
                 rect=pygame.Rect(0, y, pw, fh + 4), target=None,
             ))
-            y += fh + 8
+            y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
 
             for ti in range(len(pn.targets)):
                 tgt = pn.targets[ti]
 
-                # Voice dropdown
+                # Node dropdown
                 cur_vk  = tgt.get("voice_key", "")
-                cur_vi  = voice_keys.index(cur_vk) if cur_vk in voice_keys else 0
+                cur_vi  = node_keys.index(cur_vk) if cur_vk in node_keys else 0
                 _ti_v = ti  # capture for closure
 
-                def _make_voice_cb(_pn=pn, _ti=_ti_v, _vkeys=voice_keys):
+                def _make_voice_cb(_pn=pn, _ti=_ti_v, _vkeys=node_keys):
                     def _cb(idx):
                         _pn.targets[_ti]["voice_key"] = _vkeys[idx] if idx < len(_vkeys) else ""
                     return _cb
 
                 sliders.append(dict(
-                    label=f"T{ti} voice", key=f"__tgt_voice_{ti}__",
-                    val=float(cur_vi), lo=0.0, hi=float(max(0, len(voice_labels) - 1)),
+                    label=f"T{ti} node", key=f"__tgt_voice_{ti}__",
+                    val=float(cur_vi), lo=0.0, hi=float(max(0, len(node_labels) - 1)),
                     fmt=".0f", is_log=False,
                     rect=pygame.Rect(8, y, pw - 16, self._SLIDER_H),
                     target=None,
-                    dtype="choice", choices=voice_labels, raw_str=None,
+                    dtype="choice", choices=node_labels, raw_str=None,
                     on_change=_make_voice_cb(),
                 ))
                 y += self._SLIDER_H + self._SLIDER_PAD + 12
 
-                # Attr dropdown — choices depend on whether target is a module
-                if cur_vk in _iau_key_to_mod:
-                    _tgt_attrs = ["—"] + _module_param_attrs(_iau_key_to_mod[cur_vk].module_type)
-                else:
-                    _tgt_attrs = ["—"] + _VOICE_PARAM_ATTRS
+                # Attr dropdown — choices depend on the selected target node.
+                _attr_specs = _param_target_attr_specs(self._patch, cur_vk)
+                _tgt_attrs = [""] + [raw for raw, _ in _attr_specs]
+                _tgt_attr_labels = ["—"] + [lbl for _, lbl in _attr_specs]
                 cur_at  = tgt.get("attr", "")
                 cur_ai  = _tgt_attrs.index(cur_at) if cur_at in _tgt_attrs else 0
                 _ti_a = ti  # capture for closure
@@ -7498,11 +13854,11 @@ class PartialPanel(Panel):
 
                 sliders.append(dict(
                     label=f"T{ti} attr", key=f"__tgt_attr_{ti}__",
-                    val=float(cur_ai), lo=0.0, hi=float(max(0, len(_tgt_attrs) - 1)),
+                    val=float(cur_ai), lo=0.0, hi=float(max(0, len(_tgt_attr_labels) - 1)),
                     fmt=".0f", is_log=False,
                     rect=pygame.Rect(8, y, pw - 16, self._SLIDER_H),
                     target=None,
-                    dtype="choice", choices=_tgt_attrs, raw_str=None,
+                    dtype="choice", choices=_tgt_attr_labels, raw_str=None,
                     on_change=_make_attr_cb(),
                 ))
                 y += self._SLIDER_H + self._SLIDER_PAD + 12
@@ -7549,7 +13905,7 @@ class PartialPanel(Panel):
                         val=0, lo=0, hi=1, fmt="", is_log=False,
                         rect=pygame.Rect(0, y, pw, fh + 4), target=None,
                     ))
-                    y += fh + 8
+                    y += 2 * fh + 8  # fh+4 header + fh+2 label clearance + 2 gap
                 raw = _get_nested_attr(routing, k.name)
                 if k.dtype == "choice":
                     raw_s = str(raw) if raw is not None else ""
@@ -7576,6 +13932,18 @@ class PartialPanel(Panel):
         # Header
         pygame.draw.rect(surf, (30, 30, 40), (0, 0, pw, fh + 6))
         surf.blit(font.render(f"  {header_lbl}", True, _PY_TXT), (8, 3))
+        self._role_defaults_rect = None
+        if voice is not None and getattr(voice, "voice_role", "signal") != "signal":
+            btn_lbl = "[ ↺ Role defaults ]"
+            btn_sf = font.render(btn_lbl, True, (215, 225, 245))
+            btn_pad_x = 8
+            btn_w = btn_sf.get_width() + btn_pad_x * 2
+            btn_h = fh + 2
+            btn_r = pygame.Rect(pw - btn_w - 8, 2, btn_w, btn_h)
+            pygame.draw.rect(surf, (55, 70, 108), btn_r, border_radius=3)
+            pygame.draw.rect(surf, (105, 135, 200), btn_r, 1, border_radius=3)
+            surf.blit(btn_sf, (btn_r.x + btn_pad_x, btn_r.y + 1))
+            self._role_defaults_rect = btn_r
 
         # Draw sliders
         for sl in sliders:
@@ -7621,6 +13989,14 @@ class PartialPanel(Panel):
                         _frac_t = math.log(_snap / _lo_t) / math.log(_hi_t / _lo_t)
                         _tx = r.x + int(_frac_t * r.w)
                         pygame.draw.line(surf, (100, 160, 255), (_tx, r.y + 1), (_tx, r.y + r.h - 1))
+            # Snap tick marks for sample-rate sliders
+            if sl.get("key") in ("preview_sr", "export_sample_rate"):
+                _lo_sr, _hi_sr = sl["lo"], sl["hi"]
+                for _snap_sr in _COMMON_SAMPLE_RATES:
+                    if _lo_sr <= _snap_sr <= _hi_sr:
+                        _frac_sr = (_snap_sr - _lo_sr) / max(_hi_sr - _lo_sr, 1)
+                        _tx_sr = r.x + int(_frac_sr * r.w)
+                        pygame.draw.line(surf, (100, 200, 160), (_tx_sr, r.y + 1), (_tx_sr, r.y + r.h - 1))
             # Thumb
             lo, hi, val = sl["lo"], sl["hi"], sl["val"]
             if sl["is_log"] and lo > 0 and hi > 0:
@@ -7648,7 +14024,10 @@ class PartialPanel(Panel):
         if on_change is not None:
             val = max(sl["lo"], min(sl["hi"], val))
             sl["val"] = val
-            on_change(int(round(val)))
+            if sl.get("dtype", "float") == "float":
+                on_change(val)
+            else:
+                on_change(int(round(val)))
             self._dirty = True
             return
 
@@ -7659,6 +14038,10 @@ class PartialPanel(Panel):
                 if abs(val - _snap) / _snap < _ROOT_HZ_SNAP_TOL:
                     val = _snap
                     break
+        # Snap sample-rate sliders to standard rates
+        if key in ("preview_sr", "export_sample_rate"):
+            nearest = min(_COMMON_SAMPLE_RATES, key=lambda s: abs(s - val))
+            val = float(nearest)
         sl["val"] = val
 
         # Use the explicit target stored at render time when available
@@ -7672,7 +14055,8 @@ class PartialPanel(Panel):
             voice = next((p  for p  in self._patch.voices   if p.key == self._active_key), None)
             lfo   = next((l  for l  in self._patch.lfos     if l.key == self._active_key), None)
             mod   = next((m  for m  in self._patch.modules  if m.key == self._active_key), None)
-            obj = voice or lfo or mod
+            sysd  = self._patch.system_audio if self._active_key == "__system__" else None
+            obj = voice or lfo or mod or sysd
             if obj is not None:
                 knob_list = type(obj).knobs() if hasattr(type(obj), "knobs") else []
                 knob = next((k for k in knob_list if k.name == key), None)
@@ -7698,6 +14082,14 @@ class PartialPanel(Panel):
             if voice_obj is not None and getattr(voice_obj, "granular", None) is not None:
                 voice_obj.granular = voice_obj.granular.with_coherence(float(val))
                 self._dirty = True
+        if isinstance(obj, SystemAudioDevice):
+            if key in {"output_channels", "input_channels"}:
+                obj.output_channels = max(1, int(obj.output_channels))
+                obj.input_channels = max(0, int(obj.input_channels))
+                _refresh_system_audio_report(obj)
+                self._patch.routing.prune_keys(_patch_node_keys(self._patch))
+            if key == "export_bit_depth":
+                obj.export_bit_depth = 16 if obj.export_bit_depth < 20 else (24 if obj.export_bit_depth < 28 else 32)
         if knob.rebuild_layout:
             self._dirty = True
 
@@ -7726,6 +14118,14 @@ class PartialPanel(Panel):
                 return False
             lx = event.pos[0] - rect.x
             ly = event.pos[1] - rect.y + self._panel_scroll_y
+            if self._role_defaults_rect is not None and self._role_defaults_rect.collidepoint(lx, ly):
+                if self._text_edit_idx >= 0:
+                    self._commit_text_edit()
+                voice = next((v for v in self._patch.voices if v.key == self._active_key), None)
+                if voice is not None and getattr(voice, "voice_role", "signal") != "signal":
+                    _apply_voice_role_preset(voice, voice.voice_role)
+                    self._dirty = True
+                    return True
             for i, sl in enumerate(sliders):
                 if sl["key"] == "__section__":
                     continue
@@ -7805,7 +14205,8 @@ class PartialPanel(Panel):
             voice = next((v for v in self._patch.voices if v.key == self._active_key), None)
             lfo   = next((l for l in self._patch.lfos   if l.key == self._active_key), None)
             pn    = next((p for p in self._patch.param_nodes if p.key == self._active_key), None)
-            obj = voice or lfo or pn or self._patch
+            sysd  = self._patch.system_audio if self._active_key == "__system__" else None
+            obj = voice or lfo or pn or sysd or self._patch
 
         # Resolve nested path for str attributes
         parts = key.split(".")
@@ -7826,6 +14227,50 @@ class PartialPanel(Panel):
 # AnalyticDriverViewer — main application
 # ---------------------------------------------------------------------------
 
+
+def _cache_sidecar_path(json_path: str) -> str:
+    """Derive the binary cavity-cache sidecar path from a .json patch path."""
+    base, _ = os.path.splitext(json_path)
+    return base + ".cache"
+
+
+def _save_cavity_cache(json_path: str, cache: dict[str, dict]) -> None:
+    """Pickle the per-module cavity cache dict to a binary sidecar file."""
+    import pickle
+    side = _cache_sidecar_path(json_path)
+    if not cache:
+        # Nothing to persist — remove stale sidecar if present.
+        if os.path.isfile(side):
+            try:
+                os.remove(side)
+            except OSError:
+                pass
+        return
+    try:
+        with open(side, "wb") as f:
+            pickle.dump(cache, f, protocol=pickle.HIGHEST_PROTOCOL)
+        print(f"  cavity cache → {side}  ({len(cache)} modules)")
+    except Exception as exc:
+        print(f"  cavity cache write failed: {exc}")
+
+
+def _load_cavity_cache(json_path: str) -> dict[str, dict]:
+    """Load the cavity-cache sidecar if present.  Returns empty dict on miss."""
+    import pickle
+    side = _cache_sidecar_path(json_path)
+    if not os.path.isfile(side):
+        return {}
+    try:
+        with open(side, "rb") as f:
+            data = pickle.load(f)  # noqa: S301  — trusted local file
+        if isinstance(data, dict):
+            print(f"  cavity cache ← {side}  ({len(data)} modules)")
+            return data
+    except Exception as exc:
+        print(f"  cavity cache load skipped: {exc}")
+    return {}
+
+
 class AnalyticDriverViewer:
     """Main GL/Pygame application for the analytic synthesizer voice editor."""
 
@@ -7839,6 +14284,12 @@ class AnalyticDriverViewer:
                 self.patch = AnalyticPatch.from_dict(json.load(f))
         else:
             self.patch = AnalyticPatch.default_patch()
+
+        # Persistent cavity scene/stream caches keyed by module key.
+        # Loaded from the binary sidecar alongside the JSON patch.
+        self._cavity_cache: dict[str, dict] = (
+            _load_cavity_cache(patch_path) if patch_path else {}
+        )
 
         self.active_key: str = (self.patch.voices[0].key
                                 if self.patch.voices else "")
@@ -7863,6 +14314,13 @@ class AnalyticDriverViewer:
         self._preview_sound:   Any = None
         self._preview_channel: Any = None
         self._preview_dirty = True
+        self._output_device: Any = None
+        self._output_backend: str = ""
+        self._output_buffer = bytearray()
+        self._output_lock = threading.Lock()
+        self._output_signature: tuple | None = None
+        self._output_playing: bool = False
+        self._input_capture_device: Any = None
 
         # Rebuild state
         self._needs_rebuild = True
@@ -7890,6 +14348,7 @@ class AnalyticDriverViewer:
     def _on_select(self, key: str) -> None:
         self.active_key = key
         self.canvas.active_key = key
+        self.canvas._score_scroll_y = 0
         # Auto-select an appropriate mode for the new node type
         is_mixer   = any(m.key == key for m in self.patch.mixers)
         is_param   = any(pn.key == key for pn in self.patch.param_nodes)
@@ -7901,6 +14360,7 @@ class AnalyticDriverViewer:
             self.canvas.mode = EditorMode.PARAM_ROUTING
         elif is_module:
             self.canvas.mode = EditorMode.ROUTING
+            self.canvas._sm_log_scroll = 0
         elif is_control:
             # Controls don't have routing-graph edges on the surface itself;
             # stay in WAVEFORM to show the parameter panel cleanly.
@@ -7909,6 +14369,9 @@ class AnalyticDriverViewer:
         else:
             if self.canvas.mode in (EditorMode.ROUTING, EditorMode.PARAM_ROUTING):
                 self.canvas.mode = EditorMode.WAVEFORM
+        modes, _ = self.canvas._visible_modes(self.patch)
+        if self.canvas.mode not in modes and modes:
+            self.canvas.mode = modes[0]
         self._needs_rebuild = True
 
     def _on_add_voice(self) -> None:
@@ -7931,6 +14394,238 @@ class AnalyticDriverViewer:
 
     def _mark_dirty(self) -> None:
         self._needs_rebuild = True
+
+    def _refresh_input_capture(self) -> None:
+        sysdev = self.patch.system_audio
+        if self._input_capture_device is not None:
+            try:
+                if hasattr(self._input_capture_device, "abort"):
+                    self._input_capture_device.abort()
+                self._input_capture_device.close()
+            except Exception:
+                pass
+            self._input_capture_device = None
+        sysdev._input_buffers = [np.zeros(0, dtype=np.float32) for _ in range(max(0, sysdev.input_channels))]
+        if sysdev.input_channels <= 0:
+            return
+        _refresh_system_audio_report(sysdev)
+
+        def _write_capture(_patch, arr: np.ndarray, nch: int) -> None:
+            try:
+                if arr.size < nch:
+                    return
+                arr = arr[: (arr.size // nch) * nch].reshape(-1, nch)
+                syscfg = _patch.system_audio
+                bufs = list(getattr(syscfg, "_input_buffers", []))
+                cfg_n = max(0, int(syscfg.input_channels))
+                if len(bufs) < cfg_n:
+                    bufs.extend(np.zeros(0, dtype=np.float32) for _ in range(cfg_n - len(bufs)))
+                keep_n = max(2048, int(_patch.preview_sr * max(1.0, _patch.duration)))
+                for ci in range(min(cfg_n, nch)):
+                    merged = np.concatenate([bufs[ci], arr[:, ci]])
+                    if len(merged) > keep_n:
+                        merged = merged[-keep_n:]
+                    bufs[ci] = merged.astype(np.float32, copy=False)
+                if len(bufs) > cfg_n:
+                    bufs = bufs[:cfg_n]
+                syscfg._input_buffers = bufs
+            except Exception:
+                pass
+
+        if not str(sysdev.input_device_name or "").strip():
+            try:
+                import sounddevice as sd
+                def _sd_capture_cb(indata, frames, time_info, status, _patch=self.patch):
+                    _write_capture(_patch, np.asarray(indata, dtype=np.float32).reshape(-1), indata.shape[1])
+                self._input_capture_device = sd.InputStream(
+                    samplerate=max(8000, int(self.patch.preview_sr)),
+                    channels=max(1, int(sysdev.input_channels)),
+                    dtype="float32",
+                    blocksize=512,
+                    callback=_sd_capture_cb,
+                )
+                self._input_capture_device.start()
+                sysdev._reported_input_hw_channels = int(getattr(self._input_capture_device, "channels", max(1, sysdev.input_channels)))
+                _in_name, _in_ch, _in_native_rate = _probe_default_sounddevice(True, sysdev.input_channels, self.patch.preview_sr)
+                # Use the device's native (default) sample rate, not the stream's requested rate
+                sysdev._reported_input_hw_rate = _in_native_rate if _in_native_rate > 0 else int(getattr(self._input_capture_device, "samplerate", max(8000, int(self.patch.preview_sr))))
+                sysdev._reported_input_name = _in_name
+                sysdev._input_buffers = [np.zeros(0, dtype=np.float32) for _ in range(max(0, sysdev.input_channels))]
+                return
+            except Exception as exc:
+                print(f"System input capture error: {exc}")
+                self._input_capture_device = None
+                return
+
+        try:
+            from pygame._sdl2.audio import (
+                AudioDevice, AUDIO_F32, AUDIO_ALLOW_ANY_CHANGE,
+            )
+        except Exception:
+            return
+        devname = sysdev.input_device_name or sysdev._reported_input_name
+        if not devname:
+            return
+
+        def _capture_cb(dev, mv, _patch=self.patch):
+            arr = np.frombuffer(mv, dtype=np.float32).copy()
+            nch = max(1, int(getattr(dev, "numchannels", 1)))
+            _write_capture(_patch, arr, nch)
+
+        try:
+            self._input_capture_device = AudioDevice(
+                devicename=devname,
+                iscapture=True,
+                frequency=max(8000, int(self.patch.preview_sr)),
+                audioformat=AUDIO_F32,
+                numchannels=max(1, int(sysdev.input_channels)),
+                chunksize=512,
+                allowed_changes=AUDIO_ALLOW_ANY_CHANGE,
+                callback=_capture_cb,
+            )
+            actual_ch = max(1, int(getattr(self._input_capture_device, "numchannels", max(1, sysdev.input_channels))))
+            sysdev._reported_input_hw_channels = actual_ch
+            sysdev._reported_input_hw_rate = int(getattr(self._input_capture_device, "frequency", max(8000, int(self.patch.preview_sr))))
+            sysdev._reported_input_name = str(getattr(self._input_capture_device, "devicename", devname))
+            sysdev._input_buffers = [np.zeros(0, dtype=np.float32) for _ in range(max(0, sysdev.input_channels))]
+            self._input_capture_device.pause(0)
+        except Exception as exc:
+            print(f"System input capture error: {exc}")
+            self._input_capture_device = None
+
+    def _stop_output_playback(self) -> None:
+        with self._output_lock:
+            self._output_buffer.clear()
+            self._output_playing = False
+
+    def _ensure_output_device(self) -> bool:
+        sysdev = self.patch.system_audio
+        _refresh_system_audio_report(sysdev)
+        devname = sysdev.output_device_name or sysdev._reported_output_name
+        desired = (
+            devname,
+            max(1, int(sysdev.output_channels)),
+            max(8000, int(self.patch.preview_sr)),
+        )
+        if self._output_device is not None and self._output_signature == desired:
+            return True
+        if self._output_device is not None:
+            try:
+                if hasattr(self._output_device, "abort"):
+                    self._output_device.abort()
+                self._output_device.close()
+            except Exception:
+                pass
+            self._output_device = None
+        self._output_backend = ""
+        self._output_signature = None
+        self._stop_output_playback()
+
+        def _fill_output_bytes(n: int, _viewer=self) -> bytes:
+            with _viewer._output_lock:
+                if len(_viewer._output_buffer) >= n:
+                    data = bytes(_viewer._output_buffer[:n])
+                    del _viewer._output_buffer[:n]
+                    _viewer._output_playing = True
+                else:
+                    copied = len(_viewer._output_buffer)
+                    data = bytes(_viewer._output_buffer[:copied]) + (b"\x00" * (n - copied))
+                    del _viewer._output_buffer[:copied]
+                    _viewer._output_playing = False
+                return data
+
+        if not str(sysdev.output_device_name or "").strip():
+            try:
+                import sounddevice as sd
+                def _sd_out_cb(outdata, frames, time_info, status, _viewer=self):
+                    nbytes = outdata.size * outdata.dtype.itemsize
+                    data = _fill_output_bytes(nbytes, _viewer)
+                    arr = np.frombuffer(data, dtype=np.float32)
+                    if arr.size != outdata.size:
+                        arr = np.resize(arr, outdata.size)
+                    outdata[:] = arr.reshape(outdata.shape)
+                self._output_device = sd.OutputStream(
+                    samplerate=desired[2],
+                    channels=desired[1],
+                    dtype="float32",
+                    blocksize=1024,
+                    callback=_sd_out_cb,
+                )
+                self._output_device.start()
+                self._output_signature = desired
+                self._output_backend = "sounddevice"
+                _sd_name, _sd_ch, _sd_rate = _probe_default_sounddevice(False, desired[1], desired[2])
+                if not _sd_name:
+                    try:
+                        devsel = getattr(self._output_device, "device", None)
+                        if isinstance(devsel, (list, tuple)):
+                            dev_idx = int(devsel[1])
+                        else:
+                            dev_idx = int(devsel)
+                        _sd_name = str(sd.query_devices(dev_idx).get("name", ""))
+                    except Exception:
+                        _sd_name = "(default)"
+                sysdev._reported_output_name = _sd_name
+                sysdev._reported_output_hw_channels = int(getattr(self._output_device, "channels", desired[1]))
+                # Use the device's native rate from query_devices, not the stream's
+                # requested rate (sounddevice resamples internally so .samplerate
+                # always echoes back the requested value).
+                sysdev._reported_output_hw_rate = _sd_rate if _sd_rate > 0 else int(getattr(self._output_device, "samplerate", desired[2]))
+                sysdev._preview_backend = "sounddevice default"
+                sysdev._preview_backend_channels = sysdev._reported_output_hw_channels
+                return True
+            except Exception as exc:
+                print(f"System output device error: {exc}")
+                self._output_device = None
+                return False
+
+        try:
+            from pygame._sdl2.audio import (
+                AudioDevice, AUDIO_F32, AUDIO_ALLOW_ANY_CHANGE,
+            )
+        except Exception as exc:
+            print(f"System output backend unavailable: {exc}")
+            return False
+
+        def _output_cb(_dev, mv, _viewer=self):
+            mv[:] = _fill_output_bytes(len(mv), _viewer)
+
+        try:
+            self._output_device = AudioDevice(
+                devicename=devname,
+                iscapture=False,
+                frequency=desired[2],
+                audioformat=AUDIO_F32,
+                numchannels=desired[1],
+                chunksize=1024,
+                allowed_changes=AUDIO_ALLOW_ANY_CHANGE,
+                callback=_output_cb,
+            )
+            self._output_device.pause(0)
+            self._output_signature = desired
+            self._output_backend = "sdl2"
+            sysdev._reported_output_name = str(getattr(self._output_device, "devicename", devname))
+            sysdev._reported_output_hw_channels = int(getattr(self._output_device, "numchannels", desired[1]))
+            sysdev._reported_output_hw_rate = int(getattr(self._output_device, "frequency", desired[2]))
+            sysdev._preview_backend = "SDL2 AudioDevice"
+            sysdev._preview_backend_channels = sysdev._reported_output_hw_channels
+            return True
+        except Exception as exc:
+            print(f"System output device error: {exc}")
+            self._output_device = None
+            return False
+
+    def _play_output_bus(self, out_bus: np.ndarray, src_sr: int) -> bool:
+        if not self._ensure_output_device() or self._output_device is None:
+            return False
+        dst_sr = int(getattr(self._output_device, "frequency", src_sr))
+        dst_ch = int(getattr(self._output_device, "numchannels", max(1, self.patch.system_audio.output_channels)))
+        bus = _prepare_output_bus_for_device(out_bus, src_sr, dst_sr, dst_ch)
+        payload = np.ascontiguousarray(bus, dtype=np.float32).tobytes()
+        with self._output_lock:
+            self._output_buffer = bytearray(payload)
+            self._output_playing = len(payload) > 0
+        return True
 
     def _on_remove_voice(self, key: str) -> None:
         self.patch.voices      = [v  for v  in self.patch.voices      if v.key  != key]
@@ -8053,157 +14748,53 @@ class AnalyticDriverViewer:
             print(f"Scale build error: {exc}")
             return
 
-        # ── Schedule ──────────────────────────────────────────────────────────
-        if p.rhythm_enabled:
-            # Rhythm programmer path — step grid drives onset/duration
-            try:
-                schedule = _build_rhythm_schedule(
-                    p, beat_s, degrees, pattern,
-                    min_dur_s=1.0 / p.preview_sr)
-            except Exception as exc:
-                print(f"Rhythm schedule error: {exc}")
-                return
-        elif p.seq_custom_semitones.strip():
-            # Custom semitone scale, legacy arpeggio timing
-            try:
-                from sequence_engine import NoteSchedule, NoteEvent
-                schedule = NoteSchedule()
-                t = 0.0
-                for rep in range(p.seq_repeats):
-                    for deg_i in pattern:
-                        hz       = degrees[deg_i % len(degrees)]
-                        note_dur = beat_s * 0.5 * p.seq_legato
-                        schedule.add(NoteEvent(hz, t, max(note_dur, 1.0 / p.preview_sr)))
-                        t += beat_s * 0.5
-            except Exception as exc:
-                print(f"Custom scale demo error: {exc}")
-                return
-        else:
-            # Arpeggio engine path (legacy)
-            try:
-                rule = ArpeggioRule(
-                    root_hz         = template.freq_hz,
-                    scale           = scale,
-                    pattern         = pattern,
-                    rhythm_beats    = [0.5],
-                    bpm             = p.seq_bpm,
-                    legato_fraction = p.seq_legato,
-                    octave_span     = p.seq_octave_span,
-                    repeats         = p.seq_repeats,
-                )
-                schedule = rule.generate()
-            except Exception as exc:
-                print(f"Demo schedule error: {exc}")
-                return
-
-        import copy as _copy
-        sr      = p.preview_sr
-        # All non-muted voices are included in every note — ensures granular layers,
-        # secondary oscillators, etc. are synthesised alongside the lead voice.
-        source_voices = [v for v in p.voices if not v.muted]
-        if not source_voices:
+        try:
+            _play_groups = _prepare_sequence_play_groups(p, beat_s, degrees, pattern)
+        except Exception as exc:
+            print(f"Demo schedule error: {exc}")
             return
-        template = source_voices[0]  # used for root pitch / portamento reference only
-        # Compute the ringdown budget from the patch's routing feedback config so
-        # the accumulation buffer is large enough to hold every note's tail.
-        _fb_cfg       = p.routing.feedback
-        _gdecay_est   = max(0.0, 1.0 - float(_fb_cfg.decay)) if _fb_cfg.enabled else 1.0
-        _ringdown_n   = estimate_ringdown_samples(p.routing.edges, sr, _gdecay_est, _fb_cfg)
-        total_n = int((schedule.total_duration + 0.5) * sr) + _ringdown_n
-        mix_L   = np.zeros(total_n, dtype=np.float64)
-        mix_R   = np.zeros(total_n, dtype=np.float64)
-        prev_hz: float | None = None
+        if not _play_groups:
+            return
 
-        for event in schedule.events:
-            # Clone and pitch every non-muted voice so the full patch texture plays.
-            note_voices = []
-            for src_v in source_voices:
-                v = _copy.deepcopy(src_v)
-                v.amplitude = src_v.amplitude * event.velocity
-                # Resolve oscillator pitch from note_tracking + semitone_offset
-                resolved_hz = _resolve_voice_hz(src_v, p.tuning, event.fundamental_hz)
-                # Apply arrangement role octave offset
-                _seq_role = getattr(src_v, "seq_role", "melody")
-                if _seq_role == "bass":
-                    resolved_hz = _resolve_voice_hz(src_v, p.tuning, event.fundamental_hz)
-                    resolved_hz *= (2.0 ** p.seq_bass_octave)
-                elif _seq_role == "root":
-                    resolved_hz = p.seq_tonic_hz * (2.0 ** p.seq_root_octave)
-                elif _seq_role == "stab":
-                    resolved_hz = _resolve_voice_hz(src_v, p.tuning, event.fundamental_hz)
-                    resolved_hz *= (2.0 ** p.seq_stab_octave)
-                # else: "melody" — resolved_hz already set above
-                # Portamento applies to all voices that track pitch
-                if (p.seq_portamento_s > 0 and prev_hz is not None
-                        and abs(prev_hz - resolved_hz) > 0.5):
-                    v.chirp = ChirpSpec(
-                        chirp_type    = "exponential",
-                        f_delta_start = prev_hz - resolved_hz,
-                        f_delta_end   = 0.0,
-                        tau           = max(p.seq_portamento_s, 0.001),
-                    )
-                else:
-                    v.chirp = ChirpSpec()
-                v.freq_hz   = resolved_hz
-                v.pre_delay = 0.0
-                # Sync granular center frequency to the resolved pitch
-                if getattr(v, "emission_mode", "single") == "granular":
-                    _ensure_granular(v)
-                    if v.granular is not None:
-                        import copy as _gcopy
-                        v.granular = _gcopy.copy(v.granular)
-                        v.granular.center_frequency_hz = float(resolved_hz)
-                note_voices.append(v)
-            # Build a full patch so routing, feedback, delays, LFOs and
-            # projection all apply to each note — not just bare voice synthesis.
-            temp_patch = AnalyticPatch()
-            temp_patch.duration               = event.duration_s
-            temp_patch.preview_sr             = sr
-            temp_patch.voices                 = note_voices
-            temp_patch.lfos                   = _copy.deepcopy(p.lfos)
-            temp_patch.modules                = _copy.deepcopy(p.modules)
-            temp_patch.controls               = _copy.deepcopy(p.controls)
-            temp_patch.routing                = _copy.deepcopy(p.routing)
-            temp_patch.mixers                 = _copy.deepcopy(p.mixers)
-            temp_patch.param_nodes            = _copy.deepcopy(p.param_nodes)
-            temp_patch.tuning                 = p.tuning
-            temp_patch.projection_mode        = p.projection_mode
-            temp_patch.projection_rotation_hz = p.projection_rotation_hz
-            temp_patch.normalize_output       = False  # normalize full mix later
-            # __patch_seq__ carries the current note's Hz for this event;
-            # __patch_tonic__ stays at the musical key root (p.seq_tonic_hz).
-            temp_patch.seq_tonic_hz           = p.seq_tonic_hz
-            temp_patch._seq_note_hz           = float(event.fundamental_hz)
-            try:
-                note_L, note_R = _synthesize_patch(temp_patch)
-            except Exception:
-                n_note = max(1, int(event.duration_s * sr))
-                note_L = np.zeros(n_note, dtype=np.float32)
-                note_R = np.zeros(n_note, dtype=np.float32)
-            start_n = int(event.start_time * sr)
-            end_n   = min(start_n + len(note_L), total_n)
-            if start_n < total_n:
-                mix_L[start_n:end_n] += note_L[:end_n - start_n]
-                mix_R[start_n:end_n] += note_R[:end_n - start_n]
-            # Track portamento using the template voice's resolved pitch
-            prev_hz = _resolve_voice_hz(source_voices[0], p.tuning, event.fundamental_hz)
+        import time as _time
+        sr = p.preview_sr
 
+        _fb_cfg     = p.routing.feedback
+        _gdecay_est = max(0.0, 1.0 - float(_fb_cfg.decay)) if _fb_cfg.enabled else 1.0
+        _ringdown_n = estimate_ringdown_samples(p.routing.edges, sr, _gdecay_est, _fb_cfg)
+        _total_dur  = max((s.total_duration for s, _ in _play_groups), default=0.0)
+        total_n = int((_total_dur + 0.5) * sr) + _ringdown_n
+        _total_events = sum(len(s.events) for s, _ in _play_groups)
+
+        _has_sm = any(m.module_type == "state_machine" and not m.muted
+                      and m.sm_plugin for m in p.modules)
+        print(f"Demo: {_total_events} events across {len(_play_groups)} groups "
+              f"| SR {sr} | SM modules {'ON' if _has_sm else 'off'}")
+
+        # Per-module persistent aux state (cavity scenes, stream states) that
+        # survives across notes so room/body geometry is built only once.
+        _persistent_aux: dict[str, dict] = dict(self._cavity_cache)
+
+        _t0 = _time.monotonic()
+        mix_L, mix_R, _out_bus, _persistent_aux = _synthesize_sequence_full_batch(
+            p, _play_groups, total_n,
+            file_render=False,
+            out_channels=2,
+            persistent_aux=_persistent_aux,
+        )
+
+        # Persist cavity caches back to the viewer for future runs / saving.
+        self._cavity_cache.update(_persistent_aux)
+
+        elapsed = _time.monotonic() - _t0
+        print(f"Demo: complete in {elapsed:.1f}s")
         peak = float(np.max(np.abs(np.maximum(np.abs(mix_L), np.abs(mix_R)))))
         if peak > 1e-9:
-            mix_L /= peak
-            mix_R /= peak
-        msr  = getattr(self, '_mixer_sr', sr)
-        fL   = _resample_audio(mix_L.astype(np.float32), sr, msr)
-        fR   = _resample_audio(mix_R.astype(np.float32), sr, msr)
-        iL   = (fL * 32767.0).clip(-32768, 32767).astype(np.int16)
-        iR   = (fR * 32767.0).clip(-32768, 32767).astype(np.int16)
-        stereo = np.ascontiguousarray(np.column_stack([iL, iR]))
+            mix_L = mix_L / peak
+            mix_R = mix_R / peak
         try:
-            sound = pygame.sndarray.make_sound(stereo)
-            if self._preview_channel and self._preview_channel.get_busy():
-                self._preview_channel.stop()
-            self._preview_sound   = sound
-            self._preview_channel = sound.play()
+            if not self._play_output_bus(np.column_stack([mix_L, mix_R]), sr):
+                print("Demo playback error: no output device")
         except Exception as exc:
             print(f"Demo playback error: {exc}")
 
@@ -8214,28 +14805,50 @@ class AnalyticDriverViewer:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(self.patch.to_dict(), f, indent=2)
         print(f"Saved → {path}")
+        _save_cavity_cache(path, self._cavity_cache)
 
     # ---- File export (Render button) ---------------------------------------
 
     def _on_render_to_files(self) -> None:
-        """Synthesize the patch and write a WAV file for each export-marked mixer."""
+        """Synthesize the patch, write the main system bus, and optional mixer stems."""
         import datetime
         export_mixers = [m for m in self.patch.mixers if m.export_to_file]
-        if not export_mixers:
-            print("Render: no mixers marked for export. "
-                  "Enable export in the routing grid's Export tab.")
+        sysdev = self.patch.system_audio
+        if not sysdev.export_to_file and not export_mixers:
+            print("Render: system main render is off and no mixers are marked for export.")
             return
         print(f"Render: synthesising patch '{self.patch.name}' …")
         try:
             result = _synthesize_patch(self.patch, file_render=True,
-                                       _return_mixer_sigs=True)
-            _l, _r, mixer_outs = result
+                                       _return_mixer_sigs=True,
+                                       _return_output_channels=True)
+            _l, _r, main_bus, mixer_outs = result
         except Exception as exc:
             print(f"Render error during synthesis: {exc}")
             return
         stamp   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         src_sr  = self.patch.preview_sr
         out_dir = os.path.dirname(self.patch_path or ".")
+        safe_name = self.patch.name.replace(" ", "_").replace("/", "_")
+        if sysdev.export_to_file:
+            main_bus = np.asarray(main_bus, dtype=np.float32)
+            if main_bus.ndim == 1:
+                main_bus = main_bus[:, None]
+            if sysdev.export_sample_rate != src_sr:
+                cols = []
+                for ci in range(main_bus.shape[1]):
+                    cols.append(_resample_audio(main_bus[:, ci], src_sr, sysdev.export_sample_rate))
+                main_bus = np.column_stack(cols).astype(np.float32, copy=False)
+            main_name = os.path.join(out_dir or ".", f"{safe_name}_main_{stamp}.wav")
+            try:
+                import soundfile as _sf_export
+                subtype = {16: "PCM_16", 24: "PCM_24", 32: "PCM_32"}.get(
+                    sysdev.export_bit_depth, "PCM_24")
+                _sf_export.write(main_name, main_bus, samplerate=sysdev.export_sample_rate,
+                                 subtype=subtype)
+                print(f"  → {main_name}  ({main_bus.shape[1]} ch, {sysdev.export_sample_rate} Hz / {sysdev.export_bit_depth}-bit)")
+            except Exception as exc:
+                print(f"  Render write error for '{main_name}': {exc}")
         for m in export_mixers:
             if m.key not in mixer_outs:
                 print(f"  Render: mixer '{m.label}' has no output signal — skipped.")
@@ -8244,7 +14857,6 @@ class AnalyticDriverViewer:
             if m.export_sample_rate != src_sr:
                 ml = _resample_audio(ml, src_sr, m.export_sample_rate)
                 mr = _resample_audio(mr, src_sr, m.export_sample_rate)
-            safe_name  = self.patch.name.replace(" ", "_").replace("/", "_")
             safe_label = m.label.replace(" ", "_").replace("/", "_")
             fname = os.path.join(out_dir or ".",
                                  f"{safe_name}_{safe_label}_{stamp}.wav")
@@ -8262,10 +14874,13 @@ class AnalyticDriverViewer:
 
     def _on_render_sequence(self) -> None:
         """Synthesize the full demo sequence (rhythm + all modules) and save to WAV."""
-        import datetime, copy as _copy
+        import datetime, copy as _copy, time as _time
         p = self.patch
         if not _HAS_SEQ_ENG:
             print("Render Sequence: sequence_engine not available")
+            return
+        if not p.system_audio.export_to_file:
+            print("Render Sequence: system main render is off.")
             return
         template = next((v for v in p.voices if not v.muted), None)
         if template is None:
@@ -8293,99 +14908,50 @@ class AnalyticDriverViewer:
             print(f"Render Sequence: scale build error: {exc}")
             return
 
-        # ── Build schedule ────────────────────────────────────────────────────
         try:
-            if p.rhythm_enabled:
-                schedule = _build_rhythm_schedule(
-                    p, beat_s, degrees, pattern,
-                    min_dur_s=1.0 / p.preview_sr)
-            elif p.seq_custom_semitones.strip():
-                from sequence_engine import NoteSchedule, NoteEvent
-                schedule = NoteSchedule()
-                t = 0.0
-                for _rep in range(p.seq_repeats):
-                    for deg_i in pattern:
-                        hz       = degrees[deg_i % len(degrees)]
-                        note_dur = beat_s * 0.5 * p.seq_legato
-                        schedule.add(NoteEvent(hz, t, max(note_dur, 1.0 / p.preview_sr)))
-                        t += beat_s * 0.5
-            else:
-                rule = ArpeggioRule(
-                    root_hz         = template.freq_hz,
-                    scale           = scale,
-                    pattern         = pattern,
-                    rhythm_beats    = [0.5],
-                    bpm             = p.seq_bpm,
-                    legato_fraction = p.seq_legato,
-                    octave_span     = p.seq_octave_span,
-                    repeats         = p.seq_repeats,
-                )
-                schedule = rule.generate()
+            _rdr_play_groups = _prepare_sequence_play_groups(p, beat_s, degrees, pattern)
         except Exception as exc:
             print(f"Render Sequence: schedule error: {exc}")
             return
+        if not _rdr_play_groups:
+            print("Render Sequence: no active play groups")
+            return
 
         # ── Synthesize every note with full patch routing ─────────────────────
-        sr            = p.preview_sr
-        source_voices = [v for v in p.voices if not v.muted]
-        _fb_cfg       = p.routing.feedback
-        _gdecay_est   = max(0.0, 1.0 - float(_fb_cfg.decay)) if _fb_cfg.enabled else 1.0
-        _ringdown_n   = estimate_ringdown_samples(p.routing.edges, sr, _gdecay_est, _fb_cfg)
-        total_n       = int((schedule.total_duration + 0.5) * sr) + _ringdown_n
-        mix_L = np.zeros(total_n, dtype=np.float64)
-        mix_R = np.zeros(total_n, dtype=np.float64)
-        prev_hz: float | None = None
-        for event in schedule.events:
-            note_voices = []
-            for src_v in source_voices:
-                v = _copy.deepcopy(src_v)
-                v.amplitude = src_v.amplitude * event.velocity
-                if (p.seq_portamento_s > 0 and prev_hz is not None
-                        and abs(prev_hz - event.fundamental_hz) > 0.5):
-                    v.chirp = ChirpSpec(
-                        chirp_type    = "exponential",
-                        f_delta_start = prev_hz - event.fundamental_hz,
-                        f_delta_end   = 0.0,
-                        tau           = max(p.seq_portamento_s, 0.001),
-                    )
-                else:
-                    v.chirp = ChirpSpec()
-                v.freq_hz   = event.fundamental_hz
-                v.pre_delay = 0.0
-                if getattr(v, "emission_mode", "single") == "granular":
-                    _ensure_granular(v)
-                    if v.granular is not None:
-                        import copy as _gcopy
-                        v.granular = _gcopy.copy(v.granular)
-                        v.granular.center_frequency_hz = float(event.fundamental_hz)
-                note_voices.append(v)
-            temp_patch = AnalyticPatch()
-            temp_patch.duration               = event.duration_s
-            temp_patch.preview_sr             = sr
-            temp_patch.voices                 = note_voices
-            temp_patch.lfos                   = _copy.deepcopy(p.lfos)
-            temp_patch.routing                = _copy.deepcopy(p.routing)
-            temp_patch.mixers                 = _copy.deepcopy(p.mixers)
-            temp_patch.projection_mode        = p.projection_mode
-            temp_patch.projection_rotation_hz = p.projection_rotation_hz
-            temp_patch.normalize_output       = False
-            try:
-                note_L, note_R = _synthesize_patch(temp_patch)
-            except Exception:
-                n_note = max(1, int(event.duration_s * sr))
-                note_L = np.zeros(n_note, dtype=np.float32)
-                note_R = np.zeros(n_note, dtype=np.float32)
-            start_n = int(event.start_time * sr)
-            end_n   = min(start_n + len(note_L), total_n)
-            if start_n < total_n:
-                mix_L[start_n:end_n] += note_L[:end_n - start_n]
-                mix_R[start_n:end_n] += note_R[:end_n - start_n]
-            prev_hz = event.fundamental_hz
+        sr = p.preview_sr
+        _fb_cfg     = p.routing.feedback
+        _gdecay_est = max(0.0, 1.0 - float(_fb_cfg.decay)) if _fb_cfg.enabled else 1.0
+        _ringdown_n = estimate_ringdown_samples(p.routing.edges, sr, _gdecay_est, _fb_cfg)
+        _rdr_dur    = max((s.total_duration for s, _ in _rdr_play_groups), default=0.0)
+        total_n     = int((_rdr_dur + 0.5) * sr) + _ringdown_n
+        out_ch  = max(2, int(getattr(p.system_audio, "output_channels", 2)))
 
-        peak = float(np.max(np.abs(np.maximum(np.abs(mix_L), np.abs(mix_R)))))
+        _total_events = sum(len(s.events) for s, _ in _rdr_play_groups)
+        _has_sm = any(m.module_type == "state_machine" and not m.muted
+                      and m.sm_plugin for m in p.modules)
+        print(f"Render Sequence: {_total_events} events across "
+              f"{len(_rdr_play_groups)} groups | SR {sr} "
+              f"| SM modules {'ON' if _has_sm else 'off'}")
+
+        # Per-module persistent aux state (cavity scenes survive across notes)
+        _persistent_aux: dict[str, dict] = dict(self._cavity_cache)
+        _t0 = _time.monotonic()
+
+        _rdr_L, _rdr_R, mix_bus, _persistent_aux = _synthesize_sequence_full_batch(
+            p, _rdr_play_groups, total_n,
+            file_render=True,
+            out_channels=out_ch,
+            persistent_aux=_persistent_aux,
+        )
+
+        # Persist cavity caches back to the viewer for future runs / saving.
+        self._cavity_cache.update(_persistent_aux)
+
+        elapsed = _time.monotonic() - _t0
+        print(f"Render Sequence: synthesis complete in {elapsed:.1f}s")
+        peak = float(np.max(np.abs(mix_bus))) if mix_bus.size else 0.0
         if peak > 1e-9:
-            mix_L /= peak
-            mix_R /= peak
+            mix_bus /= peak
 
         # ── Write WAV ─────────────────────────────────────────────────────────
         stamp    = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -8394,32 +14960,45 @@ class AnalyticDriverViewer:
         fname    = os.path.join(out_dir, f"{safe_name}_seq_{stamp}.wav")
         try:
             import soundfile as _sf_export
-            data = np.column_stack([mix_L.astype(np.float32),
-                                    mix_R.astype(np.float32)])
-            _sf_export.write(fname, data, samplerate=sr, subtype="PCM_24")
-            print(f"Render Sequence → {fname}")
+            data = mix_bus.astype(np.float32)
+            if p.system_audio.export_sample_rate != sr:
+                cols = []
+                for ci in range(data.shape[1]):
+                    cols.append(_resample_audio(data[:, ci], sr, p.system_audio.export_sample_rate))
+                data = np.column_stack(cols).astype(np.float32, copy=False)
+            subtype = {16: "PCM_16", 24: "PCM_24", 32: "PCM_32"}.get(
+                p.system_audio.export_bit_depth, "PCM_24")
+            _sf_export.write(fname, data, samplerate=p.system_audio.export_sample_rate, subtype=subtype)
+            print(f"Render Sequence → {fname}  ({data.shape[1]} ch)")
         except Exception as exc:
             print(f"Render Sequence write error: {exc}")
 
     # ---- Preview playback --------------------------------------------------
 
     def _play_preview(self) -> None:
-        if self._preview_channel and self._preview_channel.get_busy():
-            self._preview_channel.stop()
+        if self._output_playing:
+            self._stop_output_playback()
             return
+        # Seed module aux state from cavity cache before synthesis.
+        for m in self.patch.modules:
+            if m.key and m.key in self._cavity_cache and not m._sm_aux_state:
+                m._sm_aux_state = dict(self._cavity_cache[m.key])
         try:
-            left, right = _synthesize_patch(self.patch,
-                                             granular_seed_offset=self._seed_anim_tick)
+            _left, _right, out_bus = _synthesize_patch(
+                self.patch,
+                granular_seed_offset=self._seed_anim_tick,
+                _return_output_channels=True,
+            )
+            # Harvest cavity caches produced during synthesis.
+            for m in self.patch.modules:
+                if m.key and getattr(m, "_sm_aux_state", None):
+                    self._cavity_cache[m.key] = dict(m._sm_aux_state)
             src_sr = self.patch.preview_sr
-            msr    = getattr(self, '_mixer_sr', src_sr)
-            left   = _resample_audio(left,  src_sr, msr)
-            right  = _resample_audio(right, src_sr, msr)
-            l16 = np.clip(left  * 32767.0, -32768, 32767).astype(np.int16)
-            r16 = np.clip(right * 32767.0, -32768, 32767).astype(np.int16)
-            stereo = np.ascontiguousarray(np.column_stack([l16, r16]))
-            sound  = pygame.sndarray.make_sound(stereo)
-            self._preview_sound   = sound
-            self._preview_channel = sound.play()
+            out_bus = np.asarray(out_bus, dtype=np.float32)
+            if out_bus.ndim == 1:
+                out_bus = out_bus[:, None]
+            if not self._play_output_bus(out_bus, src_sr):
+                print("Preview error: no output device")
         except Exception as exc:
             print(f"Preview error: {exc}")
 
@@ -8476,10 +15055,9 @@ class AnalyticDriverViewer:
 
     def run(self) -> None:
         pygame.init()
-        pygame.mixer.pre_init(
-            frequency=self.patch.preview_sr, size=-16, channels=2, buffer=2048)
-        pygame.mixer.init()
-        self._mixer_sr = pygame.mixer.get_init()[0]  # actual driver rate (may differ from request)
+        _refresh_system_audio_report(self.patch.system_audio)
+        self._ensure_output_device()
+        self._refresh_input_capture()
         pygame.display.set_mode(
             (self.win_w, self.win_h), DOUBLEBUF | OPENGL | RESIZABLE)
         pygame.display.set_caption("Analytic Driver — Voice Editor")
@@ -8521,8 +15099,8 @@ class AnalyticDriverViewer:
                     elif ctrl and event.key == K_s:
                         self._save_patch()
                     elif event.key == K_TAB:
-                        modes = EditorCanvas.MODES
-                        idx   = modes.index(self.canvas.mode)
+                        modes, _ = self.canvas._visible_modes(self.patch)
+                        idx   = modes.index(self.canvas.mode) if self.canvas.mode in modes else -1
                         self.canvas.mode = modes[(idx + 1) % len(modes)]
                         self._needs_rebuild = True
                     continue
@@ -8613,6 +15191,11 @@ class AnalyticDriverViewer:
             pygame.display.flip()
             clock.tick(60)
 
+        if self._input_capture_device is not None:
+            try:
+                self._input_capture_device.close()
+            except Exception:
+                pass
         pygame.quit()
 
 

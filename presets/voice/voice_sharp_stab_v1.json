@@ -1,0 +1,60 @@
+{
+  "instance_type": "voice",
+  "instance_id": "voice_sharp_stab_v1",
+  "label": "Sharp Stab",
+  "description": "Percussive harmonic stab with very fast attack, no sustain, and instant release. Used for rhythmic punctuation. The exponential downward chirp gives it a plucked quality.",
+  "tags": ["stab", "percussive", "harmonic", "short", "rhythmic"],
+  "summary": {
+    "role": "transient",
+    "seq_role": "stab",
+    "register": "mid",
+    "character": ["sharp", "percussive", "plucked", "bright"],
+    "pitch_behavior": "exponential downward chirp: -80Hz onset, fast decay (tau=0.02s)",
+    "spectral_behavior": "harmonic, 10 partials, moderate brightness (1.2)",
+    "envelope_behavior": "instant attack (2ms), no sustain, very fast release (25ms)"
+  },
+  "engine_version": "score-0.1",
+  "created_at": "2026-04-19T00:00:00",
+  "payload": {
+    "key": "preset04",
+    "label": "Sharp Stab",
+    "freq_hz": 440.0,
+    "semitone_offset": 0.0,
+    "note_tracking": "note",
+    "amplitude": 1.0,
+    "phase_origin": 0.0,
+    "chirp": {
+      "f_delta_start": -80.0,
+      "f_delta_end": 0.0,
+      "chirp_type": "exponential",
+      "tau": 0.02,
+      "chirp_power": 1.0
+    },
+    "fm": null,
+    "am": null,
+    "env_type": "adsr",
+    "adsr": {
+      "attack": 0.002,
+      "decay": 0.025,
+      "sustain": 0.0,
+      "release": 0.025,
+      "peak": 1.0
+    },
+    "env_knots": [[0.0, 0.0], [0.01, 1.0], [0.1, 0.75], [0.85, 0.75], [1.0, 0.0]],
+    "loop_start": 0.1,
+    "loop_end": 0.9,
+    "loop_enabled": false,
+    "muted": false,
+    "color": [255, 120, 60],
+    "pre_delay": 0.0,
+    "manifold_type": "harmonic",
+    "harmonic_count": 10,
+    "harmonic_brightness": 1.2,
+    "harmonic_warp_strength": 0.0,
+    "voice_role": "transient",
+    "seq_role": "stab",
+    "register": "all",
+    "emission_mode": "single",
+    "granular": null
+  }
+}

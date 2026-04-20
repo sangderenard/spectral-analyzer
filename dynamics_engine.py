@@ -2,22 +2,30 @@
 
 Velocity dynamics pipeline for the rhythm sequencer.
 
-Two layers applied together at schedule post-processing time:
+Two independent layers compose multiplicatively at schedule post-processing:
 
-  1. DynamicsCurve  — a shaped velocity envelope spanning ``scope_bars`` bars,
-                      tiled/repeated to cover the full rendered phrase.
-  2. AccentPattern  — per-step accent magnitudes (0.0 … 2.0), aligned to the
-                      rhythm division in use; multiplied on top of the curve.
+  1. DynamicsCurve  — a **song-level** shaped velocity envelope spanning
+                      ``scope_bars`` bars, tiled/repeated to cover the full
+                      phrase.  Controls macro dynamics: crescendo, decrescendo,
+                      swell, dip, etc.  This rides on top of the per-beat accent
+                      grid, preserving rhythmic pulse within volume movements.
+
+  2. Accent tree    — a **per-bar** BeatTree on each RhythmPattern whose
+                      ``leaf.vel`` stores accent magnitudes (0.0 … 2.0).
+                      Manually orchestrated per-beat accent hierarchy.
+                      When an accent tree is provided it replaces the flat
+                      AccentPattern array; otherwise AccentPattern is the
+                      fallback.
 
 The combined velocity multiplier for each NoteEvent:
-    new_vel = original_vel × curve_mult(bar_offset) × accent_level(step_index)
+    new_vel = original_vel × curve_mult(bar_offset) × accent_level(position)
 
 Usage
 -----
     from dynamics_engine import DynamicsProgram, apply_dynamics
     apply_dynamics(schedule.events, patch.dynamics_program,
-                   beat_s, patch.rhythm_division,
-                   patch.rhythm_phrase, patch.rhythm_patterns)
+                   beat_s, patch.rhythm_division, rng,
+                   beats_per_bar=..., accent_tree=pattern.accent_tree)
 """
 from __future__ import annotations
 
@@ -205,9 +213,25 @@ def apply_dynamics(
     beat_s:           float,
     rhythm_division:  int,
     rng:              "_random.Random | None" = None,
+    beats_per_bar:    float = 4.0,
+    accent_tree:      "object | None" = None,
 ) -> None:
     """
-    Apply dynamics (curve × accent) to a list of NoteEvents **in place**.
+    Apply dynamics to a list of NoteEvents **in place**.
+
+    Two independent layers compose multiplicatively:
+
+      1. **DynamicsCurve** — a song-level shaped velocity envelope that tiles
+         over ``scope_bars`` bars (crescendo, decrescendo, swell …).
+         Controlled by ``program.curve``.
+
+      2. **Accent tree** — per-bar accent pattern stored as ``leaf.vel`` on the
+         pattern's accent BeatTree.  If *accent_tree* is provided its leaf
+         velocities are used; otherwise falls back to the flat
+         ``program.accent`` array for backward compatibility.
+
+    Final velocity:
+        ev.velocity *= curve_multiplier(bar_offset) × accent_level(position)
 
     Parameters
     ----------
@@ -216,25 +240,55 @@ def apply_dynamics(
     beat_s          : seconds per beat (60 / bpm)
     rhythm_division : steps per bar (must match the rhythm grid)
     rng             : optional seeded Random; a fresh unseeded one is created if None
+    beats_per_bar   : meter numerator
+    accent_tree     : optional BeatTree whose leaf.vel encodes accent levels
     """
     if not program.enabled or not events:
         return
 
     _rng  = rng if rng is not None else _random.Random()
     div   = max(1, rhythm_division)
-    bar_s = beat_s * 4.0          # one bar = 4 beats
+    bar_s = beat_s * max(1e-6, beats_per_bar)
     step_s = bar_s / div
 
-    accent = program.accent
-    accent.ensure_size(div)
+    # Pre-build accent lookup from tree if available
+    _acc_leaves = None
+    if accent_tree is not None:
+        try:
+            _acc_leaves = accent_tree.flat_leaves()
+        except Exception:
+            _acc_leaves = None
+
+    # Fallback flat accent
+    if _acc_leaves is None:
+        accent = program.accent
+        accent.ensure_size(div)
 
     for ev in events:
         t      = ev.start_time
-        # Bar offset (float bars from t=0)
         bar_f  = t / bar_s
-        # Which step within the bar does this onset fall on?
-        step_i = int(round((t % bar_s) / max(step_s, 1e-12))) % div
 
-        curve_mult  = program.curve.multiplier_at_bar(bar_f, _rng)
-        accent_mult = accent.level_at(step_i)
+        # Song-level curve envelope
+        curve_mult = program.curve.multiplier_at_bar(bar_f, _rng)
+
+        # Per-beat accent from tree or flat array
+        if _acc_leaves is not None:
+            # Find which bar-fraction this onset falls on (float comparison
+            # against Fraction leaf positions — no Rational constructor needed)
+            bar_frac = (t % bar_s) / bar_s  # float ∈ [0, 1)
+            accent_mult = 1.0
+            for leaf in _acc_leaves:
+                lp = float(leaf.position)
+                ld = float(leaf.duration)
+                if lp <= bar_frac < lp + ld:
+                    accent_mult = float(leaf.vel)
+                    break
+            else:
+                # Wrap-around: last leaf covers remainder
+                if _acc_leaves:
+                    accent_mult = float(_acc_leaves[-1].vel)
+        else:
+            step_i = int(round((t % bar_s) / max(step_s, 1e-12))) % div
+            accent_mult = accent.level_at(step_i)
+
         ev.velocity = max(0.0, ev.velocity * curve_mult * accent_mult)

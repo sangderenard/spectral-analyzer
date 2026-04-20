@@ -50,6 +50,7 @@ a global energy-loss control.  When feedback.enabled is False, decay is not appl
 from __future__ import annotations
 
 import math
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -60,26 +61,91 @@ import numpy as np
 # Data structures
 # ---------------------------------------------------------------------------
 
+# Signal layer hierarchy — ordered from source to final output.
+#
+# Exact causal flow:
+#
+#   voice        (ROUTER → driver)
+#     Voice oscillators.  Voice routers converge their outputs onto drivers.
+#
+#   driver       (ROUTER → performer SM)
+#     Driver outputs carry per-note identity (item_slot on the routing edge)
+#     so the performer SM knows which driver belongs to which instrument.
+#
+#   performer    (STATE MACHINE)
+#     Receives driver signals keyed by item_slot.  Internally owns and
+#     maintains all instrument states.  Emits per-instrument outputs
+#     (aperture pressure, body resonance, etc.).
+#
+#   instrument   (SHARED ROUTING — feeds instrument mixer AND room SM)
+#     Instrument outputs participate in two paths simultaneously:
+#       1. instrument mixer — aperture/pickup outputs for DI, electronic
+#          routing, effects chains.
+#       2. room SM — acoustic propagation → mic stream(s).
+#     The routing edges from instrument nodes decide which path(s) are used.
+#
+#   instrument mixer   (MIXER)
+#     Collects instrument aperture/pickup signals for electronic routing
+#     and effects.  Output goes to the master mixer.
+#
+#   room         (STATE MACHINE — not a mixer)
+#     Receives instrument outputs, simulates acoustic propagation, emits
+#     1 or N microphone stream(s).  Mic streams go directly to the master
+#     mixer.  There is no room mixer.
+#
+#   master mixer / mastering level mixer   (MIXER — top level)
+#     Receives room SM mic stream(s) and instrument mixer output.
+#     Final stereo projection is applied here.
+#
+# SM_LAYERS: layers whose nodes are AnalyticModule state machines.
+# MIXER_LAYERS: layers whose nodes are AnalyticMixer instances.
+# An empty string means "unspecified" (valid for backward-compat nodes).
+SIGNAL_LAYERS: tuple = ("voice", "driver", "performer", "instrument", "room", "master")
+SM_LAYERS:     tuple = ("performer", "room")
+MIXER_LAYERS:  tuple = ("voice_router", "instrument", "master")
+
+
 @dataclass
 class RoutingEdge:
-    """Directed edge: applies weight * exp(i*angle_rad) to src, optionally delayed."""
-    src_key:   str   = ""
-    dst_key:   str   = ""
-    weight:    float = 0.0   # amplitude coefficient, typically in [-2, 2]
-    angle_rad: float = 0.0   # phase rotation applied to src before mixing (radians)
-    delay_s:   float = 0.0   # per-edge propagation delay; 0 = synchronous
+    """Directed edge: applies weight * exp(i*angle_rad) to src, optionally delayed.
+
+    router_key
+    ----------
+    Every signal edge is owned by exactly one router instance.  The router
+    that owns the edge is the only one that includes it in its solve.  Empty
+    string means unowned / legacy (included by any solver that encounters it).
+
+    item_slot
+    ---------
+    When an edge feeds a state-machine (SM) module, setting *item_slot* to a
+    non-empty string causes the SM to receive the signal under that name rather
+    than under the opaque src_key.  This preserves performer/instrument identity
+    all the way to the SM boundary without collapsing the signal to an anonymous
+    mix:
+
+        edge.item_slot = "violin_1"   # SM receives inputs["violin_1"]
+        edge.item_slot = ""           # SM receives inputs[src_key]  (legacy)
+    """
+    src_key:          str   = ""
+    dst_key:          str   = ""
+    weight:           float = 0.0   # amplitude coefficient, typically in [-2, 2]
+    angle_rad:        float = 0.0   # phase rotation applied to src before mixing
+    delay_s:          float = 0.0   # per-edge propagation delay; 0 = synchronous
+    item_slot:        str   = ""    # named SM input slot; empty = use src_key
+    router_key:       str   = ""    # owning router instance key; empty = legacy
+    saturation:       str   = ""    # "tanh" | "hardclip" | "softclip" | "" = none
+    saturation_knee:  float = 1.0   # magnitude at which saturation engages
 
 
 @dataclass
 class ParamEdge:
-    """Extraction edge: converts a routed complex signal into a scalar parameter time series.
+    """Control edge: routes a scalar parameter derived from any signal node to
+    any node's sub-parameter (knob).
 
-    After the routing solve, for each param node p:
-
-        float_series(t) = Σ_edges  weight * extract(X[src_key](t), extractor)
-
-    This operates on the *already-solved* signal arrays — the heavy routing math is
-    done by the existing signal solver; ParamEdge only describes the readout.
+    Causality is unconditionally enforced: the value sampled at time t is
+    delivered to the destination parameter at t + delay_samples (minimum 1).
+    This prevents circular instantaneous control dependencies and matches
+    physical reality — a control signal cannot arrive before it is emitted.
 
     Extractors
     ----------
@@ -89,20 +155,41 @@ class ParamEdge:
     phase      arg(z)       — [-π, π]; useful for pitch-tracking
     energy     |z|²         — squared magnitude; heavier weighting of loud parts
     rms        running RMS  — smoothed magnitude (128-sample window)
+
+    param_path
+    ----------
+    Dot-separated path from the destination node key to the target sub-parameter,
+    e.g. "chirp.f_delta_start" or "envelope.attack_s".  Empty = node-level scalar.
     """
-    src_key:   str   = ""
-    dst_key:   str   = ""           # key of the destination ParamNode
-    weight:    float = 1.0
-    extractor: str   = "magnitude"  # see docstring
+    src_key:       str   = ""
+    dst_key:       str   = ""
+    weight:        float = 1.0
+    extractor:     str   = "magnitude"
+    delay_samples: int   = 0          # 0 = instantaneous (acyclic paths only)
+    param_path:    str   = ""         # sub-parameter target within dst node
+
+    def __post_init__(self) -> None:
+        if self.delay_samples < 0:
+            self.delay_samples = 0
 
     def to_dict(self) -> dict:
-        return {"src": self.src_key, "dst": self.dst_key,
-                "w": self.weight, "extractor": self.extractor}
+        d: dict = {"src": self.src_key, "dst": self.dst_key,
+                   "w": self.weight, "extractor": self.extractor,
+                   "delay_samples": self.delay_samples}
+        if self.param_path:
+            d["param_path"] = self.param_path
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> "ParamEdge":
-        return cls(src_key=str(d.get("src", "")), dst_key=str(d.get("dst", "")),
-                   weight=float(d.get("w", 1.0)), extractor=str(d.get("extractor", "magnitude")))
+        return cls(
+            src_key=str(d.get("src", "")),
+            dst_key=str(d.get("dst", "")),
+            weight=float(d.get("w", 1.0)),
+            extractor=str(d.get("extractor", "magnitude")),
+            delay_samples=max(1, int(d.get("delay_samples", 1))),
+            param_path=str(d.get("param_path", "")),
+        )
 
 
 @dataclass
@@ -111,7 +198,7 @@ class FeedbackConfig:
     enabled:        bool  = False
     delay_s:        float = 0.0   # legacy global-delay field (per-edge delay preferred)
     decay:          float = 0.0   # 0–1: global amplitude loss per feedback cycle
-    max_iterations: int   = 8     # Neumann truncation depth for instantaneous fallback
+    max_iterations: int   = 1000  # hard cap for nonlinear fixed-point iteration
     # Ringdown policy — controls how long the routing graph is allowed to run
     # after all source signals have gone silent.
     #   "none"             – no ringdown; buffer ends at note duration
@@ -150,6 +237,21 @@ class RoutingGraph:
     # time (latency / PDC compensation).  Feedback cycles remain causal.
     latency_compensation: bool = False
 
+    # Per-node type annotation — {node_key: type_str}.
+    # Type values from SIGNAL_LAYERS or custom strings.
+    node_types: dict = field(default_factory=dict)
+
+    # Per-node router-type participation — {node_key: [router_type, ...]}.
+    # source_router_types: router types in which this node provides signal (source).
+    # sink_router_types:   router types in which this node receives signal (sink).
+    # A node absent from these dicts participates in all routers it appears in
+    # (legacy / untyped behaviour).
+    node_source_router_types: dict = field(default_factory=dict)
+    node_sink_router_types:   dict = field(default_factory=dict)
+
+    # Backward-compat alias — populated by from_dict for old patches.
+    node_layers: dict = field(default_factory=dict)
+
     # ------------------------------------------------------------------
     # Node management
     # ------------------------------------------------------------------
@@ -184,14 +286,95 @@ class RoutingGraph:
             KnobSpec("feedback.ringdown_threshold", "Ringdown thresh", "float",  1e-4, 1e-6, 0.1, 0, "", [], False, "Routing", ".2e"),
         ]
 
-    def add_node(self, key: str) -> None:
-        """Register a node key if not already present."""
+    def add_node(
+        self,
+        key: str,
+        layer: str = "",
+        node_type: str = "",
+        source_router_types: "list[str] | tuple[str, ...] | None" = None,
+        sink_router_types:   "list[str] | tuple[str, ...] | None" = None,
+    ) -> None:
+        """Register a node.
+
+        node_type            — signal role (from SIGNAL_LAYERS or custom).
+        source_router_types  — router types that may use this node as a source.
+                               None = unrestricted (legacy behaviour).
+        sink_router_types    — router types that may use this node as a sink.
+                               None = unrestricted.
+        layer                — backward-compat alias for node_type; ignored when
+                               node_type is also provided.
+        """
         if key not in self.nodes:
             self.nodes.append(key)
+        nt = node_type or layer
+        if nt:
+            self.node_types[key] = nt
+            self.node_layers[key] = nt          # keep compat alias in sync
+        if source_router_types is not None:
+            self.node_source_router_types[key] = list(source_router_types)
+        if sink_router_types is not None:
+            self.node_sink_router_types[key] = list(sink_router_types)
 
     def node_keys(self) -> list:
         """Return the ordered list of registered node keys."""
         return list(self.nodes)
+
+    def set_node_type(self, key: str, node_type: str) -> None:
+        """Set the type for *key*, registering the node if absent."""
+        self.add_node(key)
+        self.node_types[key] = str(node_type)
+        self.node_layers[key] = str(node_type)
+
+    def get_node_type(self, key: str) -> str:
+        """Return the type for *key*, or empty string."""
+        return self.node_types.get(key, self.node_layers.get(key, ""))
+
+    def set_node_participation(
+        self,
+        key: str,
+        source_router_types: "list[str] | None" = None,
+        sink_router_types:   "list[str] | None" = None,
+    ) -> None:
+        """Explicitly declare which router types this node participates in."""
+        self.add_node(key)
+        if source_router_types is not None:
+            self.node_source_router_types[key] = list(source_router_types)
+        if sink_router_types is not None:
+            self.node_sink_router_types[key] = list(sink_router_types)
+
+    def get_node_source_router_types(self, key: str) -> "list[str]":
+        return list(self.node_source_router_types.get(key, []))
+
+    def get_node_sink_router_types(self, key: str) -> "list[str]":
+        return list(self.node_sink_router_types.get(key, []))
+
+    def is_source_in_router(self, key: str, router_type: str) -> bool:
+        """True if *key* is allowed as a source in *router_type* routers."""
+        allowed = self.node_source_router_types.get(key)
+        return allowed is None or router_type in allowed
+
+    def is_sink_in_router(self, key: str, router_type: str) -> bool:
+        """True if *key* is allowed as a sink in *router_type* routers."""
+        allowed = self.node_sink_router_types.get(key)
+        return allowed is None or router_type in allowed
+
+    # Backward-compat shims for code that used node_layers directly
+    def set_node_layer(self, key: str, layer: str) -> None:
+        self.add_node(key, node_type=layer)
+
+    def get_node_layer(self, key: str) -> str:
+        return self.get_node_type(key)
+
+    def nodes_in_layer(self, layer: str) -> list:
+        return [k for k in self.nodes if self.get_node_type(k) == layer]
+
+    def nodes_for_router_source(self, router_type: str) -> list:
+        """Return all node keys that can act as sources in *router_type* routers."""
+        return [k for k in self.nodes if self.is_source_in_router(k, router_type)]
+
+    def nodes_for_router_sink(self, router_type: str) -> list:
+        """Return all node keys that can act as sinks in *router_type* routers."""
+        return [k for k in self.nodes if self.is_sink_in_router(k, router_type)]
 
     def ensure_defaults(self, keys: list, mix_key: str = "__mix__") -> None:
         """For every key in *keys* that has no edge going to *mix_key*, add one
@@ -276,25 +459,46 @@ class RoutingGraph:
     # ------------------------------------------------------------------
 
     def to_dict(self) -> dict:
-        return {
+        def _edge_dict(e: RoutingEdge) -> dict:
+            d: dict = {"src": e.src_key, "dst": e.dst_key, "w": e.weight,
+                       "angle": e.angle_rad, "delay": e.delay_s}
+            if e.item_slot:
+                d["item_slot"] = e.item_slot
+            if e.router_key:
+                d["router_key"] = e.router_key
+            if e.saturation:
+                d["saturation"] = e.saturation
+                d["saturation_knee"] = e.saturation_knee
+            return d
+        result: dict = {
             "nodes": list(self.nodes),
-            "edges": [
-                {"src": e.src_key, "dst": e.dst_key, "w": e.weight,
-                 "angle": e.angle_rad, "delay": e.delay_s}
-                for e in self.edges
-            ],
+            "edges": [_edge_dict(e) for e in self.edges],
             "param_edges": [e.to_dict() for e in self.param_edges],
             "feedback": {
-                "enabled":           self.feedback.enabled,
-                "delay_s":           self.feedback.delay_s,
-                "decay":             self.feedback.decay,
-                "max_iterations":    self.feedback.max_iterations,
-                "ringdown_mode":     self.feedback.ringdown_mode,
-                "ringdown_max_s":    self.feedback.ringdown_max_s,
+                "enabled":            self.feedback.enabled,
+                "delay_s":            self.feedback.delay_s,
+                "decay":              self.feedback.decay,
+                "max_iterations":     self.feedback.max_iterations,
+                "ringdown_mode":      self.feedback.ringdown_mode,
+                "ringdown_max_s":     self.feedback.ringdown_max_s,
                 "ringdown_threshold": self.feedback.ringdown_threshold,
             },
             "latency_compensation": self.latency_compensation,
         }
+        if self.node_types:
+            result["node_types"] = dict(self.node_types)
+        if self.node_source_router_types:
+            result["node_source_router_types"] = {
+                k: list(v) for k, v in self.node_source_router_types.items()
+            }
+        if self.node_sink_router_types:
+            result["node_sink_router_types"] = {
+                k: list(v) for k, v in self.node_sink_router_types.items()
+            }
+        # Emit node_layers for backward compat with older readers
+        if self.node_layers:
+            result["node_layers"] = dict(self.node_layers)
+        return result
 
     @classmethod
     def from_dict(cls, d: dict) -> "RoutingGraph":
@@ -308,13 +512,29 @@ class RoutingGraph:
                 weight=float(ed.get("w", 0.0)),
                 angle_rad=float(ed.get("angle", 0.0)),
                 delay_s=float(ed.get("delay", 0.0)),
+                item_slot=str(ed.get("item_slot", "")),
+                router_key=str(ed.get("router_key", "")),
+                saturation=str(ed.get("saturation", "")),
+                saturation_knee=float(ed.get("saturation_knee", 1.0)),
             ))
+        # node_types (new) — fall back to legacy node_layers
+        raw_types = d.get("node_types") or d.get("node_layers", {})
+        g.node_types  = {str(k): str(v) for k, v in raw_types.items()}
+        g.node_layers = dict(g.node_types)   # keep compat alias in sync
+        g.node_source_router_types = {
+            str(k): [str(x) for x in v]
+            for k, v in d.get("node_source_router_types", {}).items()
+        }
+        g.node_sink_router_types = {
+            str(k): [str(x) for x in v]
+            for k, v in d.get("node_sink_router_types", {}).items()
+        }
         fb = d.get("feedback", {})
         g.feedback = FeedbackConfig(
             enabled=bool(fb.get("enabled", False)),
             delay_s=float(fb.get("delay_s", 0.0)),
             decay=float(fb.get("decay", 0.0)),
-            max_iterations=int(fb.get("max_iterations", 8)),
+            max_iterations=int(fb.get("max_iterations", 1000)),
             ringdown_mode=str(fb.get("ringdown_mode", "decay_to_silence")),
             ringdown_max_s=float(fb.get("ringdown_max_s", 4.0)),
             ringdown_threshold=float(fb.get("ringdown_threshold", 1e-4)),
@@ -356,6 +576,64 @@ def _softclip_complex(X: np.ndarray) -> np.ndarray:
     return X
 
 
+def _safe_inverse(mat: np.ndarray) -> np.ndarray:
+    """Return a stable inverse, adding a tiny diagonal regularizer on failure."""
+    try:
+        return np.linalg.inv(mat)
+    except np.linalg.LinAlgError:
+        jitter = np.eye(mat.shape[0], dtype=mat.dtype) * 1e-6
+        return np.linalg.inv(mat + jitter)
+
+
+def _find_wccs(node_keys: list, edges: list, coupled_pairs: list) -> list:
+    """Union-find weakly connected components over the routing edge graph.
+
+    coupled_pairs: list of lists of node keys that must land in the same
+    component regardless of whether a routing edge connects them (e.g.
+    interaural ch1/ch2 coupled-transform pairs).
+
+    Returns a list of components; each component is a sorted list of
+    node-key indices into node_keys.
+    """
+    n = len(node_keys)
+    if n == 0:
+        return []
+    ki = {k: i for i, k in enumerate(node_keys)}
+    parent = list(range(n))
+
+    def _find(x: int) -> int:
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    def _union(a: int, b: int) -> None:
+        a, b = _find(a), _find(b)
+        if a != b:
+            parent[b] = a
+
+    for e in edges:
+        si = ki.get(e.src_key)
+        di = ki.get(e.dst_key)
+        if si is not None and di is not None:
+            _union(si, di)
+
+    for pair in coupled_pairs:
+        idxs = [ki[k] for k in pair if k in ki]
+        for j in range(1, len(idxs)):
+            _union(idxs[0], idxs[j])
+
+    groups: dict = {}
+    for i in range(n):
+        r = _find(i)
+        if r not in groups:
+            groups[r] = []
+        groups[r].append(i)
+    return list(groups.values())
+
+
 def solve_routing_complex(
     Src: np.ndarray,        # (N, T) complex128 — independent source signals
     edges: list,            # list[RoutingEdge]
@@ -363,6 +641,7 @@ def solve_routing_complex(
     sr: float,
     global_decay: float = 1.0,
     node_transforms: "dict | None" = None,
+    coupled_transforms: "dict | None" = None,
     max_iterations: int = 1000,
     convergence_eps: float = 1e-12,
 ) -> np.ndarray:            # (N, T) complex128 — solved node outputs
@@ -400,12 +679,16 @@ def solve_routing_complex(
         All edge weights are multiplied by this scalar before the solve.
     node_transforms
         dict mapping node_key → callable(complex128[T]) → complex128[T].
-        The callable receives the node's accumulated input (the sum of all
-        routed contributions plus its independent source), and returns the
-        node's output.  The output is what downstream nodes see.  The
-        callable must preserve the analytic signal — return complex128,
-        modify only the components it is responsible for, leave the rest
-        intact.
+        The callable receives the node's accumulated input and returns its
+        output. Must return complex128 and preserve the analytic signal.
+    coupled_transforms
+        dict mapping tuple[str, ...] → callable(dict[str, complex128[T]])
+                                        → dict[str, complex128[T]].
+        For transforms that couple multiple nodes (e.g. interaural spatial
+        that reads ch1+ch2 inputs and writes back two new complex signals).
+        The callable receives {key: row} for every key in the tuple and must
+        return a dict with the same keys holding the transformed rows.
+        Applied after node_transforms in every convergence iteration.
     max_iterations
         Hard cap on convergence iterations.  Only reached for undamped
         nonlinear feedback.
@@ -423,14 +706,72 @@ def solve_routing_complex(
     """
     ki = {k: i for i, k in enumerate(node_keys)}
     N, T = Src.shape
+
+    # ── WCC partitioning: solve independent subgraphs concurrently ────
+    # coupled_transforms node-pairs must land in the same component even when
+    # no explicit routing edge connects them (e.g. interaural ch1/ch2).
+    _coupled_pairs = [list(kt) for kt in (coupled_transforms or {})]
+    _components = _find_wccs(node_keys, edges, _coupled_pairs)
+    if len(_components) > 1:
+        _transform_keys = set(node_transforms or {})
+        _coupled_keys: set = set()
+        for _kt in (coupled_transforms or {}):
+            _coupled_keys.update(_kt)
+
+        # Nodes that are isolated AND have no transform collapse to X[i] = Src[i].
+        # All others go into the work list for a recursive per-component solve.
+        X = Src.copy()
+        _work: list = []
+        for _comp in _components:
+            if len(_comp) == 1:
+                _key = node_keys[_comp[0]]
+                if _key not in _transform_keys and _key not in _coupled_keys:
+                    continue  # trivially isolated — X[i] = Src[i] already
+            _work.append(_comp)
+
+        def _solve_component(_comp_indices: list) -> tuple:
+            _comp_set = {node_keys[_i] for _i in _comp_indices}
+            _sub_keys  = [node_keys[_i] for _i in _comp_indices]
+            _sub_Src   = Src[_comp_indices]
+            _sub_edges = [_e for _e in edges
+                          if _e.src_key in _comp_set and _e.dst_key in _comp_set]
+            _sub_nt = ({_k: _v for _k, _v in (node_transforms or {}).items()
+                        if _k in _comp_set} or None)
+            _sub_ct = ({_kt: _fn for _kt, _fn in (coupled_transforms or {}).items()
+                        if all(_k in _comp_set for _k in _kt)} or None)
+            return _comp_indices, solve_routing_complex(
+                _sub_Src, _sub_edges, _sub_keys, sr, global_decay,
+                _sub_nt, _sub_ct, max_iterations, convergence_eps,
+            )
+
+        if len(_work) > 1:
+            _n_workers = min(len(_work), 8)
+            with ThreadPoolExecutor(max_workers=_n_workers) as _pool:
+                _futs = [_pool.submit(_solve_component, _comp) for _comp in _work]
+                for _fut in _futs:
+                    _idxs, _result = _fut.result()
+                    X[_idxs] = _result
+        elif _work:
+            _idxs, _result = _solve_component(_work[0])
+            X[_idxs] = _result
+        return X
+    # ── Single component (or empty): fall through to the unified solver ─
+
     transforms = node_transforms or {}
 
-    # Index set of nodes that have a nonlinear transform
+    # Index set of nodes that have a nonlinear single-node transform
     transform_idx: set = set()
     for key in transforms:
         ti = ki.get(key)
         if ti is not None:
             transform_idx.add(ti)
+
+    # Coupled transform groups: list of (keys_tuple, index_list, callable)
+    coupled_groups: list = []
+    for keys_tuple, fn in (coupled_transforms or {}).items():
+        idxs = [ki[k] for k in keys_tuple if k in ki]
+        if len(idxs) == len(keys_tuple):
+            coupled_groups.append((keys_tuple, idxs, fn))
 
     # ── Build weight matrices ──────────────────────────────────────────
     W_inst: np.ndarray = np.zeros((N, N), dtype=np.complex128)
@@ -468,52 +809,109 @@ def solve_routing_complex(
 
     # Pre-invert the instantaneous linear part
     IW = np.eye(N, dtype=np.complex128) - W_inst
-    try:
-        M = np.linalg.inv(IW)
-    except np.linalg.LinAlgError:
-        M = np.linalg.inv(IW + np.eye(N, dtype=np.complex128) * 1e-6)
+    M = _safe_inverse(IW)
 
-    has_transforms = len(transform_idx) > 0
+    has_transforms = len(transform_idx) > 0 or len(coupled_groups) > 0
 
-    # ── Helper: apply all node transforms to X in-place ────────────────
+    # ── Helper: apply all transforms (single-node and coupled) ─────────
     def _apply_transforms(X: np.ndarray) -> np.ndarray:
         for key, fn in transforms.items():
             ti = ki.get(key)
             if ti is not None:
                 X[ti] = fn(X[ti])
+        for keys_tuple, idxs, fn in coupled_groups:
+            rows_in = {k: X[i] for k, i in zip(keys_tuple, idxs)}
+            rows_out = fn(rows_in)
+            for k, i in zip(keys_tuple, idxs):
+                if k in rows_out:
+                    X[i] = rows_out[k]
         return X
 
     # ── No delays, no transforms: exact linear solve ──────────────────
     if not delay_groups and not has_transforms:
         return M @ Src
 
+    nl_idx = sorted(transform_idx | {i for _, idxs, _ in coupled_groups for i in idxs})
+    li_idx = [i for i in range(N) if i not in nl_idx]
+
+    if has_transforms and nl_idx and li_idx:
+        W_ll = W_inst[np.ix_(li_idx, li_idx)]
+        W_ln = W_inst[np.ix_(li_idx, nl_idx)]
+        W_nl = W_inst[np.ix_(nl_idx, li_idx)]
+        W_nn = W_inst[np.ix_(nl_idx, nl_idx)]
+        Ainv = _safe_inverse(np.eye(len(li_idx), dtype=np.complex128) - W_ll)
+        rhs_n_const = W_nl @ Ainv
+        W_eff = W_nn + W_nl @ Ainv @ W_ln
+        local_of_global = {gi: i for i, gi in enumerate(nl_idx)}
+        reduced_transform_idx = [local_of_global[i] for i in sorted(transform_idx)]
+        reduced_single_transforms = {
+            local_of_global[gi]: transforms[node_keys[gi]]
+            for gi in sorted(transform_idx)
+        }
+        reduced_coupled_groups: list = []
+        for keys_tuple, idxs, fn in coupled_groups:
+            reduced_coupled_groups.append(
+                (keys_tuple, [local_of_global[i] for i in idxs], fn)
+            )
+
+        def _apply_reduced_transforms(X_n: np.ndarray) -> np.ndarray:
+            for ti in reduced_transform_idx:
+                X_n[ti] = reduced_single_transforms[ti](X_n[ti])
+            for keys_tuple, idxs, fn in reduced_coupled_groups:
+                rows_in = {k: X_n[i] for k, i in zip(keys_tuple, idxs)}
+                rows_out = fn(rows_in)
+                for k, i in zip(keys_tuple, idxs):
+                    if k in rows_out:
+                        X_n[i] = rows_out[k]
+            return X_n
+
+        def _solve_reduced(rhs: np.ndarray) -> np.ndarray:
+            rhs_l = rhs[li_idx]
+            rhs_n = rhs[nl_idx]
+            rhs_eff = rhs_n + rhs_n_const @ rhs_l
+            M_eff = _safe_inverse(np.eye(len(nl_idx), dtype=np.complex128) - W_eff)
+            X_n = M_eff @ rhs_eff
+            _apply_reduced_transforms(X_n)
+            _softclip_complex(X_n)
+            for _iter in range(max_iterations):
+                X_prev = X_n.copy()
+                X_input_n = rhs_eff + W_eff @ X_n
+                X_n = X_input_n.copy()
+                _apply_reduced_transforms(X_n)
+                _softclip_complex(X_n)
+                if np.max(np.abs(X_n - X_prev)) < convergence_eps:
+                    break
+            X = np.zeros((N, rhs.shape[1]), dtype=np.complex128)
+            X[nl_idx] = X_n
+            X[li_idx] = Ainv @ (rhs_l + W_ln @ X_n)
+            return X
+    else:
+        def _solve_reduced(rhs: np.ndarray) -> np.ndarray:
+            X = M @ rhs
+            _apply_transforms(X)
+            _softclip_complex(X)
+            for _iter in range(max_iterations):
+                X_prev = X.copy()
+                X_input = rhs + W_inst @ X
+                X = X_input.copy()
+                for ti in transform_idx:
+                    X[ti] = transforms[node_keys[ti]](X_input[ti])
+                for keys_tuple, idxs, fn in coupled_groups:
+                    rows_in = {k: X_input[i] for k, i in zip(keys_tuple, idxs)}
+                    rows_out = fn(rows_in)
+                    for k, i in zip(keys_tuple, idxs):
+                        if k in rows_out:
+                            X[i] = rows_out[k]
+                _softclip_complex(X)
+                if np.max(np.abs(X - X_prev)) < convergence_eps:
+                    break
+            return X
+
     # ── No delays, with transforms: iterative fixed-point ─────────────
     if not delay_groups:
-        X = M @ Src                       # initial estimate (linear solve)
-        _apply_transforms(X)
-        _softclip_complex(X)
-
-        for _iter in range(max_iterations):
-            X_prev = X.copy()
-            # Full iterative step: for each node, compute accumulated input
-            # (Src + W @ X_current), then apply transform (identity for linear
-            # nodes, nonlinear callable for transform nodes).
-            X_input = Src + W_inst @ X    # accumulated input for each node
-            X_new = X_input.copy()
-            for ti in transform_idx:
-                X_new[ti] = transforms[node_keys[ti]](X_input[ti])
-            _softclip_complex(X_new)
-
-            delta = np.max(np.abs(X_new - X_prev))
-            X = X_new
-            if delta < convergence_eps:
-                break
-        return X
+        return _solve_reduced(Src)
 
     # ── Delayed edges: causal chunk solver ─────────────────────────────
-    # Chunk size = minimum nonzero delay.  Within each chunk, the
-    # instantaneous system (including nonlinear transforms) is iterated
-    # to convergence.
     d_min = min(delay_groups.keys())
     X = np.zeros((N, T), dtype=np.complex128)
 
@@ -521,7 +919,6 @@ def solve_routing_complex(
         t1 = min(t0 + d_min, T)
         chunk_len = t1 - t0
 
-        # RHS = Src slice + delayed contributions from already-computed chunks
         rhs = Src[:, t0:t1].copy()
         for d, Wd in delay_groups.items():
             t_past = t0 - d
@@ -529,26 +926,9 @@ def solve_routing_complex(
                 rhs += Wd @ X[:, t_past: t_past + chunk_len]
 
         if not has_transforms:
-            # Pure linear chunk: exact solve
             X[:, t0:t1] = M @ rhs
         else:
-            # Iterative solve within this chunk
-            X_chunk = M @ rhs             # initial linear estimate
-            _apply_transforms(X_chunk)
-            _softclip_complex(X_chunk)
-
-            for _iter in range(max_iterations):
-                X_prev = X_chunk.copy()
-                X_input = rhs + W_inst @ X_chunk
-                X_chunk = X_input.copy()
-                for ti in transform_idx:
-                    X_chunk[ti] = transforms[node_keys[ti]](X_input[ti])
-                _softclip_complex(X_chunk)
-
-                delta = np.max(np.abs(X_chunk - X_prev))
-                if delta < convergence_eps:
-                    break
-            X[:, t0:t1] = X_chunk
+            X[:, t0:t1] = _solve_reduced(rhs)
 
     return X
 
@@ -731,6 +1111,7 @@ def solve_routing_with_ringdown(
     global_decay: float,
     fb: "FeedbackConfig",
     node_transforms: "dict | None" = None,
+    coupled_transforms: "dict | None" = None,
 ) -> tuple:                  # (X_full: (N, T+ringdown_n), note_len: int)
     """Run ``solve_routing_complex`` with a zero-padded tail for ringdown.
 
@@ -751,7 +1132,8 @@ def solve_routing_with_ringdown(
     else:
         Src_ext = Src
     X_full = solve_routing_complex(Src_ext, edges, node_keys, sr, global_decay,
-                                   node_transforms=node_transforms)
+                                   node_transforms=node_transforms,
+                                   coupled_transforms=coupled_transforms)
     return X_full, note_len
 
 

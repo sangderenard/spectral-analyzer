@@ -43,9 +43,17 @@ _needed_consts = [
     "K_SPACE", "K_ESCAPE", "K_LEFT", "K_RIGHT", "K_HOME", "K_END", "K_TAB",
     "K_r", "K_f", "K_t", "K_x", "K_y", "K_s", "K_a", "K_d",
     "K_LSHIFT", "K_RSHIFT",
+    # analytic_driver additional keys
+    "K_DELETE", "K_n", "K_o", "K_z", "K_LCTRL", "K_RCTRL",
 ]
 for _c in _needed_consts:
     setattr(_locals, _c, 0)
+
+# KMOD constants live on the pygame module itself (not pygame.locals) in pygame 2.x
+_kmod_consts = [
+    "KMOD_CTRL", "KMOD_SHIFT", "KMOD_ALT", "KMOD_NONE",
+    "KMOD_LSHIFT", "KMOD_RSHIFT", "KMOD_LCTRL", "KMOD_RCTRL",
+]
 
 # pygame itself needs Surface, Rect, etc.
 _pg = sys.modules["pygame"]
@@ -60,6 +68,9 @@ _pg.mixer.Sound = type("Sound", (), {})
 _pg.font = sys.modules["pygame.font"]
 _pg.font.Font = type("Font", (), {})
 _pg.font.SysFont = lambda *a, **kw: None
+# KMOD constants — must live on the pygame module itself
+for _c in _kmod_consts:
+    setattr(_pg, _c, 0)
 
 # ---- OpenGL stubs ----
 for _gl_name in [

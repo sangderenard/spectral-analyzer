@@ -26,14 +26,136 @@ from torch import Tensor
 
 # Re-use the graph dataclasses — no need to redefine them.
 from routing_engine import (
+    MetaEdge,
     FeedbackConfig,
     ParamEdge,
     RoutingEdge,
     RoutingGraph,
+    RouterInstance,
 )
 
 _CDTYPE = torch.complex128
 _FDTYPE = torch.float64
+
+def _meta_endpoint_key(graph: RoutingGraph, owner_key: str, port_key: str) -> str:
+    """Pick a concrete graph node for one metaedge endpoint.
+
+    Authoring may target bundle ports that are not themselves registered graph
+    nodes yet.  The compiled router still needs a node key, so prefer the owner
+    node when present and fall back to the port key only when necessary.
+    """
+    graph_nodes = set(graph.node_keys())
+    if owner_key and owner_key in graph_nodes:
+        return owner_key
+    if port_key and port_key in graph_nodes:
+        return port_key
+    return owner_key or port_key
+
+
+def lower_meta_edges(graph: RoutingGraph) -> list[RoutingEdge]:
+    """Lower authored MetaEdge objects into directed RoutingEdges.
+
+    This preserves graph ideology at authoring time while giving the current
+    torch router a concrete directed-edge approximation it can compile today.
+    """
+    lowered: list[RoutingEdge] = []
+    for me in getattr(graph, "meta_edges", []):
+        if not isinstance(me, MetaEdge):
+            continue
+        a_key = _meta_endpoint_key(graph, me.a_key, me.a_port)
+        b_key = _meta_endpoint_key(graph, me.b_key, me.b_port)
+        if not a_key or not b_key:
+            continue
+        lowered.append(RoutingEdge(
+            src_key=a_key,
+            dst_key=b_key,
+            weight=1.0,
+            angle_rad=0.0,
+            delay_s=float(getattr(me, "delay_s", 0.0)),
+            edge_kind="meta",
+            src_port=me.a_port,
+            dst_port=me.b_port,
+            tensor_contract=me.tensor_contract,
+            transfer_spec=me.a_to_b_transfer,
+        ))
+        lowered.append(RoutingEdge(
+            src_key=b_key,
+            dst_key=a_key,
+            weight=1.0,
+            angle_rad=0.0,
+            delay_s=float(getattr(me, "delay_s", 0.0)),
+            edge_kind="meta",
+            src_port=me.b_port,
+            dst_port=me.a_port,
+            tensor_contract=me.tensor_contract,
+            transfer_spec=me.b_to_a_transfer,
+        ))
+    return lowered
+
+
+def project_tensor_to_scalar_param(
+    x: Tensor,
+    policy: str = "magnitude_mean",
+    time_dim: int | None = None,
+) -> Tensor:
+    """Project a complex tensor onto scalar parameter state values.
+
+    This is a receiver-side policy, not a transport policy.  The input tensor
+    may carry batch or instance structure.  When ``time_dim`` is omitted, the
+    projector preserves leading dimensions and collapses only the final
+    lane/channel dimension when the selected policy requires it.  When
+    ``time_dim`` is provided, every non-time dimension is treated as tensor
+    multiplicity and collapsed according to the policy while the time axis is
+    preserved.
+    """
+    if x.ndim == 0:
+        x = x.reshape(1)
+    p = str(policy or "magnitude_mean")
+    if time_dim is None:
+        reduce_dims = (-1,) if x.ndim > 1 else ()
+        lane_axis = x.ndim - 1
+    else:
+        td = int(time_dim)
+        if td < 0:
+            td += x.ndim
+        reduce_dims = tuple(i for i in range(x.ndim) if i != td)
+        lane_axis = next((i for i in range(x.ndim) if i != td), td)
+
+    def _reduce(y: Tensor, mode: str) -> Tensor:
+        if not reduce_dims:
+            return y
+        if mode == "sum":
+            return y.sum(dim=reduce_dims)
+        return y.mean(dim=reduce_dims)
+
+    if p == "real":
+        return x.real.to(_FDTYPE)
+    if p == "imag":
+        return x.imag.to(_FDTYPE)
+    if p == "magnitude":
+        return x.abs().to(_FDTYPE)
+    if p == "phase":
+        return torch.angle(x).to(_FDTYPE)
+    if p == "real_mean":
+        return _reduce(x.real.to(_FDTYPE), "mean")
+    if p == "real_sum":
+        return _reduce(x.real.to(_FDTYPE), "sum")
+    if p == "imag_mean":
+        return _reduce(x.imag.to(_FDTYPE), "mean")
+    if p == "imag_sum":
+        return _reduce(x.imag.to(_FDTYPE), "sum")
+    if p == "magnitude_sum":
+        return _reduce(x.abs().to(_FDTYPE), "sum")
+    if p == "phase_mean":
+        return _reduce(torch.angle(x).to(_FDTYPE), "mean")
+    if p == "lane0_real":
+        return x.real.to(_FDTYPE).select(lane_axis, 0)
+    if p == "lane0_imag":
+        return x.imag.to(_FDTYPE).select(lane_axis, 0)
+    if p == "lane0_magnitude":
+        return x.abs().to(_FDTYPE).select(lane_axis, 0)
+    return _reduce(x.abs().to(_FDTYPE), "mean")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Soft-clip (overflow guard)
@@ -592,7 +714,7 @@ def solve_param_routing(
 
     Exact port of routing_engine.solve_param_routing.
     """
-    T = max((v.shape[0] for v in signal_map.values()), default=0)
+    T = max((v.shape[-1] for v in signal_map.values()), default=0)
     if T == 0:
         return {
             key: torch.tensor([default], dtype=_FDTYPE)
@@ -610,7 +732,15 @@ def solve_param_routing(
     for e in param_edges:
         if e.src_key not in signal_map:
             continue
-        extracted = extract_param_series(signal_map[e.src_key], e.extractor) * e.weight
+        src = signal_map[e.src_key]
+        if src.ndim > 1:
+            extracted = project_tensor_to_scalar_param(
+                src,
+                getattr(e, "projection_policy", "magnitude_mean"),
+                time_dim=src.ndim - 1,
+            ) * e.weight
+        else:
+            extracted = extract_param_series(src, e.extractor) * e.weight
         dst = e.dst_key
         if dst not in result:
             result[dst] = torch.zeros(T, dtype=_FDTYPE, device=dev)
@@ -1463,11 +1593,14 @@ class CompiledRouter:
         convergence_eps   — |ΔX| threshold for early convergence exit.
         infinity_threshold — |X| threshold that flags saturation and cancels.
         """
+        meta_edges = lower_meta_edges(graph)
+        all_edges = list(graph.edges) + meta_edges
+
         if router_key:
-            edges = [e for e in graph.edges
+            edges = [e for e in all_edges
                      if e.router_key == router_key or e.router_key == ""]
         else:
-            edges = list(graph.edges)
+            edges = list(all_edges)
 
         if router_type:
             edges = [e for e in edges
@@ -1485,6 +1618,36 @@ class CompiledRouter:
         return cls(
             node_keys, edges, sr, device,
             global_decay=decay,
+            batch_size=batch_size,
+            max_iterations=max_iterations,
+            convergence_eps=convergence_eps,
+            infinity_threshold=infinity_threshold,
+        )
+
+    @classmethod
+    def from_router_instance(
+        cls,
+        router: "RouterInstance",
+        sr: float,
+        device: torch.device,
+        *,
+        batch_size: int = 1,
+        max_iterations: int = 64,
+        convergence_eps: float = 1e-10,
+        infinity_threshold: float = 1e6,
+    ) -> "CompiledRouter":
+        """Build a CompiledRouter directly from a RouterInstance.
+
+        Uses the router's own graph, key ownership, and router_type
+        participation rules so the compiled torch solve matches the editor's
+        router-instance semantics.
+        """
+        return cls.from_graph(
+            router.graph,
+            sr,
+            device,
+            router_key=str(getattr(router, "key", "")),
+            router_type=str(getattr(router, "router_type", "")),
             batch_size=batch_size,
             max_iterations=max_iterations,
             convergence_eps=convergence_eps,

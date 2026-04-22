@@ -38,8 +38,8 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Optional
-
+from typing import Any, ClassVar, Optional
+import torch
 import numpy as np
 import pygame
 from scipy.signal import resample_poly as _scipy_resample_poly
@@ -804,39 +804,69 @@ class PlacementResonatorConfig:
 
 @dataclass
 class LFODefinition:
-    key:          str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
-    label:        str   = "LFO"
-    rate_hz:      float = 1.0
-    shape:        str   = "Sine"   # Sine | Triangle | Sawtooth | Square
-    phase_offset: float = 0.0
-    depth:        float = 1.0
+    key:            str       = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    label:          str       = "LFO"
+    # Slot 0 params — stored at top level for UI / knob-system compat.
+    rate_hz:        float     = 1.0
+    shape:          str       = "Sine"   # Sine | Triangle | Sawtooth | Square
+    phase_offset:   float     = 0.0
+    depth:          float     = 1.0
+    # Packing capacity: number of parallel LFO slots this node carries.
+    # Slot 0 uses the top-level scalar fields above; slots 1..capacity-1 are
+    # stored in extra_channels as dicts {rate_hz, shape, phase_offset, depth}.
+    capacity:       int       = 1
+    extra_channels: list      = field(default_factory=list)
     color: list[int] = field(default_factory=lambda: [200, 160, 60])
 
+    _SLOT_DEFAULTS: ClassVar[dict] = {
+        "rate_hz": 1.0, "shape": "Sine", "phase_offset": 0.0, "depth": 1.0,
+    }
+
+    def _all_channels(self) -> list:
+        """Return a list of per-slot param dicts of length ``capacity``.
+
+        Slot 0 reflects the top-level scalar fields.  Slots 1..capacity-1
+        come from ``extra_channels``, padded with defaults if needed.
+        """
+        slot0 = {"rate_hz": self.rate_hz, "shape": self.shape,
+                 "phase_offset": self.phase_offset, "depth": self.depth}
+        extras = list(self.extra_channels)
+        while len(extras) < max(0, self.capacity - 1):
+            extras.append(dict(self._SLOT_DEFAULTS))
+        return [slot0] + extras[:max(0, self.capacity - 1)]
+
     def to_dict(self) -> dict:
-        return {"key": self.key, "label": self.label, "rate_hz": self.rate_hz,
-                "shape": self.shape, "phase_offset": self.phase_offset,
-                "depth": self.depth, "color": self.color}
+        return {"key": self.key, "label": self.label,
+                "rate_hz": self.rate_hz, "shape": self.shape,
+                "phase_offset": self.phase_offset, "depth": self.depth,
+                "capacity": self.capacity,
+                "extra_channels": list(self.extra_channels),
+                "color": self.color}
 
     @classmethod
     def knobs(cls) -> list[KnobSpec]:
         _SHAPES = ["Sine", "Triangle", "Sawtooth", "Square"]
         return [
-            KnobSpec("rate_hz",      "Rate",         "float",  1.0, 0.01, 50.0,     0, "Hz",  [], True,  "LFO", ".3f"),
-            KnobSpec("phase_offset", "Phase offset", "float",  0.0,-math.pi, math.pi,0, "rad", [], False, "LFO", ".3f"),
-            KnobSpec("depth",        "Depth",        "float",  1.0, 0.0,  2.0,      0, "",    [], False, "LFO", ".3f"),
-            KnobSpec("shape",        "Shape",        "choice", "Sine", 0, 3, 1, "", _SHAPES, False, "LFO"),
+            KnobSpec("capacity",     "Capacity",     "int",    1,   1,   64,       1, "",    [], False, "LFO", ".0f",
+                     True),
+            KnobSpec("rate_hz",      "Rate (slot 0)","float",  1.0, 0.01, 50.0,   0, "Hz",  [], True,  "LFO", ".3f"),
+            KnobSpec("phase_offset", "Phase (slot 0)","float", 0.0,-math.pi, math.pi, 0, "rad", [], False, "LFO", ".3f"),
+            KnobSpec("depth",        "Depth (slot 0)","float", 1.0, 0.0, 2.0,     0, "",    [], False, "LFO", ".3f"),
+            KnobSpec("shape",        "Shape (slot 0)","choice","Sine", 0, 3, 1, "", _SHAPES, False, "LFO"),
         ]
 
     @classmethod
     def from_dict(cls, d: dict) -> "LFODefinition":
         o = cls.__new__(cls)
-        o.key          = d.get("key", uuid.uuid4().hex[:8])
-        o.label        = d.get("label", "LFO")
-        o.rate_hz      = float(d.get("rate_hz", 1.0))
-        o.shape        = d.get("shape", "Sine")
-        o.phase_offset = float(d.get("phase_offset", 0.0))
-        o.depth        = float(d.get("depth", 1.0))
-        o.color        = d.get("color", [200, 160, 60])
+        o.key            = d.get("key", uuid.uuid4().hex[:8])
+        o.label          = d.get("label", "LFO")
+        o.rate_hz        = float(d.get("rate_hz", 1.0))
+        o.shape          = d.get("shape", "Sine")
+        o.phase_offset   = float(d.get("phase_offset", 0.0))
+        o.depth          = float(d.get("depth", 1.0))
+        o.capacity       = int(d.get("capacity", 1))
+        o.extra_channels = list(d.get("extra_channels", []))
+        o.color          = d.get("color", [200, 160, 60])
         return o
 
 
@@ -1620,6 +1650,685 @@ class AnalyticMixer:
 
 
 @dataclass
+class PortTensorSpec:
+    """Negotiation metadata for one published port.
+
+    tensor_rank
+        Conceptual rank of the payload.  0 = scalar control, 1 = vector lane,
+        2+ = structured tensor batch.  This is descriptive for now and lets the
+        graph/UI evolve toward massive parallel cables without changing the
+        publishing API again.
+    lane_count
+        Number of parallel lanes exposed by this port when known.  0 means
+        "dynamic / negotiated at compile time".
+    parallel_group
+        Optional symbolic grouping key used to validate wide-bus compatibility
+        across related ports (for example room↔performer state exchange).
+    """
+    tensor_rank: int = 0
+    lane_count: int = 1
+    batch_axes: int = 1
+    parallel_group: str = ""
+    group_validity: str = "strict"   # strict | broadcast | reduce | remap
+    semantic_role: str = ""
+    channel_dims: list = field(default_factory=list)
+    batchable: bool = True
+    dtype: str = "complex128"
+    analytic_only: bool = True
+
+    def to_contract(self) -> "TensorPortContract":
+        return TensorPortContract(
+            dtype=str(self.dtype or "complex128"),
+            analytic_only=bool(self.analytic_only),
+            tensor_rank=max(0, int(self.tensor_rank)),
+            lane_count=max(0, int(self.lane_count)),
+            batch_axes=max(0, int(self.batch_axes)),
+            parallel_group=str(self.parallel_group or ""),
+            group_validity=str(self.group_validity or "strict"),
+            semantic_role=str(self.semantic_role or ""),
+            channel_dims=[int(x) for x in self.channel_dims],
+        )
+
+
+@dataclass
+class PublishedPort:
+    key: str = ""
+    label: str = ""
+    direction: str = "out"      # "in" | "out"
+    domain: str = "control"     # "signal" | "control" | "param_target"
+    owner_key: str = ""
+    group: str = ""
+    param_path: str = ""
+    color: tuple[int, int, int] = (150, 150, 170)
+    tensor: PortTensorSpec = field(default_factory=PortTensorSpec)
+    semantic_role: str = ""
+    projection_policy: str = ""   # only meaningful for scalar / non-complex destinations
+    negotiates_group_validity: bool = False
+
+
+@dataclass
+class RackPortView:
+    port: PublishedPort
+    local_x: int = 0
+    local_y: int = 0
+    radius: int = 3
+
+
+@dataclass
+class RackDeviceView:
+    device_key: str = ""
+    label: str = ""
+    device_kind: str = ""
+    color: tuple[int, int, int] = (90, 110, 140)
+    rack_u: int = 1
+    rack_w: int = 1
+    grid_x: int = 0
+    grid_y: int = 0
+    ports: list = field(default_factory=list)   # list[RackPortView]
+
+
+@dataclass
+class RackConnectionView:
+    src_port_key: str = ""
+    dst_port_key: str = ""
+    edge_kind: str = "control"
+    remove_kind: str = "control"   # control | param | meta
+
+
+def _control_connection_target_port_key(dst_key: str, param_path: str) -> str:
+    return f"{dst_key}:param:{param_path}" if param_path else dst_key
+
+
+def _control_connections_for_patch(patch: "AnalyticPatch") -> list[RackConnectionView]:
+    g = patch.routing
+    conns: list[RackConnectionView] = []
+    for e in g.edges:
+        if getattr(e, "edge_kind", "signal") == "signal":
+            continue
+        conns.append(RackConnectionView(
+            src_port_key=e.src_port or e.src_key,
+            dst_port_key=e.dst_port or e.dst_key,
+            edge_kind=getattr(e, "edge_kind", "control"),
+            remove_kind="control",
+        ))
+    for pe in g.param_edges:
+        conns.append(RackConnectionView(
+            src_port_key=pe.src_port or pe.src_key,
+            dst_port_key=pe.dst_port or _control_connection_target_port_key(pe.dst_key, pe.param_path),
+            edge_kind=getattr(pe, "edge_kind", "control"),
+            remove_kind="param",
+        ))
+    for me in getattr(g, "meta_edges", []):
+        conns.append(RackConnectionView(
+            src_port_key=me.a_port or me.a_key,
+            dst_port_key=me.b_port or me.b_key,
+            edge_kind=getattr(me, "edge_kind", "meta"),
+            remove_kind="meta",
+        ))
+    return conns
+
+
+def _published_port_lookup(patch: "AnalyticPatch") -> dict[str, PublishedPort]:
+    lookup: dict[str, PublishedPort] = {}
+    for ports in _published_ports_for_patch(patch).values():
+        for port in ports:
+            lookup[port.key] = port
+    return lookup
+
+
+def _is_state_machine_owner(patch: "AnalyticPatch", owner_key: str) -> bool:
+    mod = next((m for m in getattr(patch, "modules", []) if m.key == owner_key), None)
+    return mod is not None and getattr(mod, "module_type", "") == "state_machine"
+
+
+def _negotiated_lane_policy(src: PublishedPort, dst: PublishedPort) -> str:
+    src_policy = str(getattr(src.tensor, "group_validity", "strict") or "strict")
+    dst_policy = str(getattr(dst.tensor, "group_validity", "strict") or "strict")
+    if src_policy == "remap" or dst_policy == "remap":
+        return "remap"
+    if src_policy == "reduce" or dst_policy == "reduce":
+        return "reduce"
+    if src_policy == "broadcast" or dst_policy == "broadcast":
+        return "broadcast"
+    return "strict"
+
+
+def _negotiate_edge_transfer(
+    src_port: PublishedPort,
+    dst_port: PublishedPort,
+) -> EdgeTransferSpec | None:
+    if src_port.direction != "out" or dst_port.direction != "in":
+        return None
+    if src_port.tensor.analytic_only is not True or dst_port.tensor.analytic_only is not True:
+        return None
+    if str(src_port.tensor.dtype or "") != "complex128":
+        return None
+    if str(dst_port.tensor.dtype or "") != "complex128":
+        return None
+
+    if dst_port.domain != "param_target":
+        if src_port.domain != dst_port.domain:
+            if src_port.domain not in {"signal", "control"} or dst_port.domain not in {"signal", "control"}:
+                return None
+
+    src_group = str(src_port.tensor.parallel_group or "")
+    dst_group = str(dst_port.tensor.parallel_group or "")
+    lane_policy = _negotiated_lane_policy(src_port, dst_port)
+    if src_group and dst_group and src_group != dst_group:
+        if not (src_port.negotiates_group_validity or dst_port.negotiates_group_validity):
+            return None
+        if lane_policy == "strict":
+            lane_policy = "remap"
+
+    src_lanes = max(1, int(src_port.tensor.lane_count or 1))
+    dst_lanes = max(1, int(dst_port.tensor.lane_count or 1))
+    src_dynamic = int(src_port.tensor.lane_count or 0) == 0
+    dst_dynamic = int(dst_port.tensor.lane_count or 0) == 0
+
+    if src_port.tensor.batch_axes != dst_port.tensor.batch_axes:
+        if not (src_port.tensor.batchable and dst_port.tensor.batchable):
+            return None
+    if src_port.tensor.batch_axes == dst_port.tensor.batch_axes:
+        batch_policy = "strict"
+    elif src_port.tensor.batch_axes < dst_port.tensor.batch_axes:
+        batch_policy = "broadcast"
+    else:
+        batch_policy = "reduce"
+
+    reduction = ""
+    if dst_port.domain == "param_target":
+        transfer_policy = "remap" if lane_policy == "remap" else "identity"
+    elif src_dynamic or dst_dynamic:
+        transfer_policy = "broadcast"
+        if lane_policy == "strict":
+            lane_policy = "broadcast"
+    elif src_lanes == dst_lanes:
+        transfer_policy = "identity"
+    elif src_lanes == 1 and dst_lanes > 1:
+        transfer_policy = "broadcast"
+        if lane_policy == "strict":
+            lane_policy = "broadcast"
+    elif src_lanes > 1 and dst_lanes == 1:
+        transfer_policy = "reduce"
+        if lane_policy == "strict":
+            lane_policy = "reduce"
+        reduction = "mean"
+    else:
+        transfer_policy = "remap"
+        lane_policy = "remap"
+
+    return EdgeTransferSpec(
+        transfer_policy=transfer_policy,
+        cable_count=max(src_lanes, dst_lanes, 1),
+        batch_policy=batch_policy,
+        lane_policy=lane_policy,
+        reduction=reduction,
+        analytic_only=True,
+    )
+
+
+def _negotiate_metaedge_transfer(
+    src_port: PublishedPort,
+    dst_port: PublishedPort,
+) -> tuple[EdgeTransferSpec, EdgeTransferSpec] | None:
+    fwd = _negotiate_edge_transfer(src_port, dst_port)
+    if fwd is None:
+        return None
+
+    rev_policy = "identity"
+    rev_lane = fwd.lane_policy
+    rev_batch = fwd.batch_policy
+    if fwd.transfer_policy == "broadcast":
+        rev_policy = "reduce"
+        if rev_lane == "strict":
+            rev_lane = "reduce"
+    elif fwd.transfer_policy == "reduce":
+        rev_policy = "broadcast"
+        if rev_lane == "strict":
+            rev_lane = "broadcast"
+    elif fwd.transfer_policy == "remap":
+        rev_policy = "remap"
+
+    rev = EdgeTransferSpec(
+        transfer_policy=rev_policy,
+        cable_count=fwd.cable_count,
+        batch_policy=rev_batch,
+        lane_policy=rev_lane,
+        reduction="mean" if rev_policy == "reduce" else "",
+        analytic_only=True,
+    )
+    return fwd, rev
+
+
+def _ports_compatible(src: PublishedPort, dst: PublishedPort) -> bool:
+    return _negotiate_edge_transfer(src, dst) is not None
+
+
+def _control_remove_connections_for_port(patch: "AnalyticPatch", port_key: str) -> None:
+    patch.routing.edges = [
+        e for e in patch.routing.edges
+        if (e.src_port or e.src_key) != port_key
+        and (e.dst_port or e.dst_key) != port_key
+    ]
+    patch.routing.param_edges = [
+        pe for pe in patch.routing.param_edges
+        if (pe.src_port or pe.src_key) != port_key
+        and (pe.dst_port or _control_connection_target_port_key(pe.dst_key, pe.param_path)) != port_key
+    ]
+    patch.routing.meta_edges = [
+        me for me in getattr(patch.routing, "meta_edges", [])
+        if (me.a_port or me.a_key) != port_key
+        and (me.b_port or me.b_key) != port_key
+    ]
+
+
+def _control_add_connection(
+    patch: "AnalyticPatch",
+    src_port: PublishedPort,
+    dst_port: PublishedPort,
+) -> bool:
+    transfer_spec = _negotiate_edge_transfer(src_port, dst_port)
+    if transfer_spec is None:
+        return False
+
+    if (
+        dst_port.domain != "param_target"
+        and _is_state_machine_owner(patch, src_port.owner_key)
+        and _is_state_machine_owner(patch, dst_port.owner_key)
+    ):
+        meta_specs = _negotiate_metaedge_transfer(src_port, dst_port)
+        if meta_specs is None:
+            return False
+        a_to_b, b_to_a = meta_specs
+        patch.routing.meta_edges.append(MetaEdge(
+            a_key=src_port.owner_key,
+            b_key=dst_port.owner_key,
+            a_port=src_port.key,
+            b_port=dst_port.key,
+            edge_kind="meta",
+            semantic_role=src_port.semantic_role or dst_port.semantic_role or src_port.tensor.semantic_role or dst_port.tensor.semantic_role,
+            channel_count=max(1, int(src_port.tensor.lane_count or dst_port.tensor.lane_count or 1)),
+            tensor_contract=src_port.tensor.to_contract(),
+            a_to_b_transfer=a_to_b,
+            b_to_a_transfer=b_to_a,
+        ))
+        return True
+
+    if dst_port.domain == "param_target":
+        patch.routing.param_edges.append(ParamEdge(
+            src_key=src_port.key,
+            dst_key=dst_port.owner_key,
+            weight=1.0,
+            extractor="magnitude",
+            delay_samples=0,
+            param_path=dst_port.param_path,
+            src_port=src_port.key,
+            dst_port=dst_port.key,
+            edge_kind="control",
+            projection_policy=str(getattr(dst_port, "projection_policy", "") or "magnitude_mean"),
+            tensor_contract=src_port.tensor.to_contract(),
+            transfer_spec=transfer_spec,
+        ))
+        return True
+
+    patch.routing.add_node(src_port.key)
+    patch.routing.add_node(dst_port.key)
+    patch.routing.edges.append(RoutingEdge(
+        src_key=src_port.key,
+        dst_key=dst_port.key,
+        weight=1.0,
+        angle_rad=0.0,
+        delay_s=0.0,
+        edge_kind="control",
+        src_port=src_port.key,
+        dst_port=dst_port.key,
+        tensor_contract=src_port.tensor.to_contract(),
+        transfer_spec=transfer_spec,
+    ))
+    return True
+
+
+def _make_param_target_port(
+    owner_key: str,
+    owner_label: str,
+    param_path: str,
+    *,
+    group: str = "Params",
+    color: tuple[int, int, int] = (180, 140, 220),
+    tensor_rank: int = 0,
+    lane_count: int = 1,
+    parallel_group: str = "",
+    semantic_role: str = "param_target",
+    projection_policy: str = "magnitude_mean",
+) -> PublishedPort:
+    return PublishedPort(
+        key=f"{owner_key}:param:{param_path}",
+        label=f"{owner_label}.{param_path}",
+        direction="in",
+        domain="param_target",
+        owner_key=owner_key,
+        group=group,
+        param_path=param_path,
+        color=color,
+        tensor=PortTensorSpec(
+            tensor_rank=tensor_rank,
+            lane_count=lane_count,
+            group_validity="strict",
+            parallel_group=parallel_group,
+            semantic_role=semantic_role,
+            batchable=True,
+        ),
+        semantic_role=semantic_role,
+        projection_policy=projection_policy,
+        negotiates_group_validity=True,
+    )
+
+
+def _published_ports_for_voice(v: "AnalyticVoice") -> list[PublishedPort]:
+    ports: list[PublishedPort] = [
+        PublishedPort(
+            key=v.key,
+            label=v.label,
+            direction="out",
+            domain="signal",
+            owner_key=v.key,
+            group="Signal",
+            color=tuple(v.color[:3]),
+            tensor=PortTensorSpec(tensor_rank=1, lane_count=0, parallel_group="voice_signal"),
+            negotiates_group_validity=True,
+        ),
+    ]
+    for path in (
+        "amplitude",
+        "phase_origin",
+        "chirp.f_delta_start",
+        "chirp.f_delta_end",
+        "chirp.tau",
+        "chirp.chirp_power",
+        "harmonic_brightness",
+        "harmonic_warp_strength",
+    ):
+        ports.append(_make_param_target_port(
+            v.key, v.label, path,
+            color=tuple(v.color[:3]),
+            parallel_group="voice_param_batch",
+        ))
+    return ports
+
+
+def _published_ports_for_mixer(m: "AnalyticMixer") -> list[PublishedPort]:
+    ports: list[PublishedPort] = [
+        PublishedPort(
+            key=m.key,
+            label=m.label,
+            direction="out",
+            domain="signal",
+            owner_key=m.key,
+            group="Signal",
+            color=tuple(m.color[:3]),
+            tensor=PortTensorSpec(tensor_rank=1, lane_count=0, parallel_group="mixer_signal"),
+            negotiates_group_validity=True,
+        ),
+    ]
+    for path in ("projection_active",):
+        ports.append(_make_param_target_port(
+            m.key, m.label, path,
+            group="Mixer",
+            color=tuple(m.color[:3]),
+            parallel_group="mixer_param_batch",
+        ))
+    return ports
+
+
+def _published_ports_for_param_node(pn: "ParamNode") -> list[PublishedPort]:
+    ports: list[PublishedPort] = [
+        PublishedPort(
+            key=pn.key,
+            label=pn.label,
+            direction="in",
+            domain="control",
+            owner_key=pn.key,
+            group="Param Node",
+            color=tuple(pn.color[:3]),
+            tensor=PortTensorSpec(tensor_rank=1, lane_count=0, parallel_group="param_control_in"),
+            negotiates_group_validity=True,
+        ),
+        PublishedPort(
+            key=f"{pn.key}:out",
+            label=f"{pn.label}.out",
+            direction="out",
+            domain="control",
+            owner_key=pn.key,
+            group="Param Node",
+            color=tuple(pn.color[:3]),
+            tensor=PortTensorSpec(tensor_rank=1, lane_count=0, parallel_group="param_control_out"),
+            negotiates_group_validity=True,
+        ),
+    ]
+    for tgt in getattr(pn, "targets", []):
+        path = str(tgt.get("attr", "") or "")
+        if path:
+            ports.append(_make_param_target_port(
+                pn.key,
+                pn.label,
+                path,
+                group="Targets",
+                color=tuple(pn.color[:3]),
+                parallel_group="param_target_batch",
+            ))
+    return ports
+
+
+def _published_ports_for_module(mod: "AnalyticModule") -> list[PublishedPort]:
+    ports: list[PublishedPort] = []
+    base_color = tuple(mod.color[:3])
+    ports.append(PublishedPort(
+        key=mod.key,
+        label=mod.label,
+        direction="out",
+        domain="signal",
+        owner_key=mod.key,
+        group="Signal",
+        color=base_color,
+        tensor=PortTensorSpec(
+            tensor_rank=1,
+            lane_count=0,
+            parallel_group=f"module_signal:{mod.module_type}",
+            semantic_role="signal",
+        ),
+        semantic_role="signal",
+        negotiates_group_validity=True,
+    ))
+    if mod.module_type == "state_machine":
+        for bundle in getattr(mod, "sm_bundle_ports", []):
+            bundle_name = str(bundle.get("name", "") or "").strip()
+            if not bundle_name:
+                continue
+            direction = str(bundle.get("direction", "out") or "out")
+            domain = str(bundle.get("domain", "control") or "control")
+            semantic_role = str(bundle.get("semantic_role", bundle_name) or bundle_name)
+            channel_dims = [int(x) for x in bundle.get("channel_dims", [])]
+            ports.append(PublishedPort(
+                key=f"{mod.key}:{bundle_name}",
+                label=f"{mod.label}.{bundle_name}",
+                direction=direction,
+                domain=domain,
+                owner_key=mod.key,
+                group=str(bundle.get("group", "SM Bundle") or "SM Bundle"),
+                color=base_color,
+                tensor=PortTensorSpec(
+                    tensor_rank=max(0, int(bundle.get("tensor_rank", max(1, len(channel_dims))))),
+                    lane_count=max(0, int(bundle.get("lane_count", 0))),
+                    batch_axes=max(0, int(bundle.get("batch_axes", 1))),
+                    parallel_group=str(bundle.get("parallel_group", f"sm_bundle:{mod.key}:{bundle_name}") or f"sm_bundle:{mod.key}:{bundle_name}"),
+                    group_validity=str(bundle.get("group_validity", "remap") or "remap"),
+                    semantic_role=semantic_role,
+                    channel_dims=channel_dims,
+                ),
+                semantic_role=semantic_role,
+                negotiates_group_validity=True,
+            ))
+        # Primary SM signal outputs
+        for out_key in mod.sm_out_keys():
+            ports.append(PublishedPort(
+                key=out_key,
+                label=out_key,
+                direction="out",
+                domain="signal",
+                owner_key=mod.key,
+                group="SM Signal",
+                color=base_color,
+                tensor=PortTensorSpec(
+                    tensor_rank=1,
+                    lane_count=max(0, int(getattr(mod, "sm_n_items", 1))),
+                    parallel_group=f"sm_signal:{mod.key}",
+                    semantic_role="sm_signal",
+                ),
+                semantic_role="sm_signal",
+                negotiates_group_validity=True,
+            ))
+        # Declared control feedback ports — one per item/var pair to keep them
+        # unique and compatible with the unified graph.
+        for item in getattr(mod, "sm_items", []):
+            for var in getattr(mod, "sm_vars", []):
+                ctrl_key = f"{mod.key}.ctrl.{item}.{var}"
+                ports.append(PublishedPort(
+                    key=ctrl_key,
+                    label=ctrl_key,
+                    direction="out",
+                    domain="control",
+                    owner_key=mod.key,
+                    group="SM Control",
+                    color=base_color,
+                    tensor=PortTensorSpec(
+                        tensor_rank=1,
+                        lane_count=max(0, int(getattr(mod, "sm_n_items", 1))),
+                        parallel_group=f"sm_ctrl:{mod.key}",
+                        semantic_role="sm_control",
+                    ),
+                    semantic_role="sm_control",
+                    negotiates_group_validity=True,
+                ))
+    for path in ("rate_hz", "depth", "phase_offset", "sm_n_items"):
+        if hasattr(mod, path.split(".")[0]):
+            ports.append(_make_param_target_port(
+                mod.key,
+                mod.label,
+                path,
+                group="Module",
+                color=base_color,
+                parallel_group=f"module_param:{mod.module_type}",
+            ))
+    return ports
+
+
+def _published_ports_for_router(router: "RouterInstance") -> list[PublishedPort]:
+    label = f"{router.label} [{router.router_type}]"
+    base_color = {
+        "voice_router": (90, 160, 230),
+        "instrument": (110, 200, 150),
+        "master": (230, 180, 90),
+    }.get(router.router_type, (160, 160, 180))
+    return [
+        _make_param_target_port(
+            router.key, label, "feedback.enabled",
+            group="Router", color=base_color, parallel_group="router_param_batch"),
+        _make_param_target_port(
+            router.key, label, "feedback.decay",
+            group="Router", color=base_color, parallel_group="router_param_batch"),
+        _make_param_target_port(
+            router.key, label, "feedback.max_iterations",
+            group="Router", color=base_color, parallel_group="router_param_batch"),
+    ]
+
+
+def _published_ports_for_patch(patch: "AnalyticPatch") -> dict[str, list[PublishedPort]]:
+    out: dict[str, list[PublishedPort]] = {}
+    for v in patch.voices:
+        out[v.key] = _published_ports_for_voice(v)
+    for m in patch.mixers:
+        out[m.key] = _published_ports_for_mixer(m)
+    for mod in patch.modules:
+        out[mod.key] = _published_ports_for_module(mod)
+    for cs in patch.controls:
+        ports: list[PublishedPort] = []
+        for sl in cs.sliders:
+            ports.append(PublishedPort(
+                key=sl.key,
+                label=f"{cs.label}/{sl.label}",
+                direction="out",
+                domain="control",
+                owner_key=cs.key,
+                group="Controls",
+                color=tuple(cs.color[:3]),
+                tensor=PortTensorSpec(tensor_rank=0, lane_count=1, parallel_group="control_scalar"),
+            ))
+        out[cs.key] = ports
+    for pn in patch.param_nodes:
+        out[pn.key] = _published_ports_for_param_node(pn)
+    for router in getattr(patch, "routers", []):
+        out[_router_ui_key(router.key)] = _published_ports_for_router(router)
+    return out
+
+
+def _rack_device_views_for_patch(patch: "AnalyticPatch") -> list[RackDeviceView]:
+    published = _published_ports_for_patch(patch)
+    device_order: list[tuple[str, str, tuple[int, int, int], str]] = []
+    for v in patch.voices:
+        device_order.append((v.key, v.label, tuple(v.color[:3]), "voice"))
+    for mod in patch.modules:
+        device_order.append((mod.key, mod.label, tuple(mod.color[:3]), f"module:{mod.module_type}"))
+    for cs in patch.controls:
+        device_order.append((cs.key, cs.label, tuple(cs.color[:3]), "control"))
+    for pn in patch.param_nodes:
+        device_order.append((pn.key, pn.label, tuple(pn.color[:3]), "param"))
+    for mix in patch.mixers:
+        device_order.append((mix.key, mix.label, tuple(mix.color[:3]), "mixer"))
+    for router in getattr(patch, "routers", []):
+        device_order.append((_router_ui_key(router.key), router.label,
+                             {
+                                 "voice_router": (90, 160, 230),
+                                 "instrument": (110, 200, 150),
+                                 "master": (230, 180, 90),
+                             }.get(router.router_type, (160, 160, 180)),
+                             f"router:{router.router_type}"))
+
+    rack: list[RackDeviceView] = []
+    x_slot = 0
+    y_u = 0
+    max_cols = 6
+    for device_key, label, color, kind in device_order:
+        ports = list(published.get(device_key, []))
+        width = max(1, min(4, (len(ports) + 7) // 8))
+        height = max(1, min(4, (len(ports) + width * 7) // max(width * 8, 1)))
+        if x_slot + width > max_cols:
+            x_slot = 0
+            y_u += 4
+        port_views: list[RackPortView] = []
+        cols = max(1, width * 4)
+        for pi, port in enumerate(ports):
+            port_views.append(RackPortView(
+                port=port,
+                local_x=8 + (pi % cols) * 8,
+                local_y=12 + (pi // cols) * 10,
+                radius=3,
+            ))
+        rack.append(RackDeviceView(
+            device_key=device_key,
+            label=label,
+            device_kind=kind,
+            color=color,
+            rack_u=height,
+            rack_w=width,
+            grid_x=x_slot,
+            grid_y=y_u,
+            ports=port_views,
+        ))
+        x_slot += width
+    return rack
+
+
+@dataclass
 class SystemAudioDevice:
     output_device_name: str = ""
     output_channels:    int = 2
@@ -1700,12 +2409,14 @@ from routing_engine import (RoutingEdge, FeedbackConfig, RoutingGraph,
                              ParamEdge, solve_routing_complex,
                              solve_routing_with_ringdown, estimate_ringdown_samples,
                              compute_latency_compensation, solve_param_routing,
-                             _safe_inverse)
+                             _safe_inverse, RouterInstance, MIXER_LAYERS,
+                             EdgeTransferSpec, TensorPortContract, MetaEdge)
 from patch_to_driver import (build_driver_config,
                               _resolve_f0, _build_harmonics, _build_env_knots,
                               _CHIRP_CODE, CHIRP_NONE)
 from performer_engine import (init_driver_state, multi_level_driver_step,
                                DriverConfig, DriverState, driver_synthesis_step)
+from routing_solve_torch import CompiledRouter
 
 
 def _list_audio_devices(iscapture: bool) -> list[str]:
@@ -2161,6 +2872,7 @@ class AnalyticModule:
     sm_n_items:     int   = 1      # number of physics items
     sm_items:       list  = field(default_factory=list)  # item names from plugin
     sm_vars:        list  = field(default_factory=list)  # output var names from plugin
+    sm_bundle_ports: list = field(default_factory=list)  # declared wide/bundle ports for graph authoring
     sm_state_vars:  list  = field(default_factory=list)  # persisted scalar state vars from plugin
     sm_params:      dict  = field(default_factory=dict)  # plugin parameter values
     sm_use_torch:   bool  = False  # prefer torch tensors when available
@@ -2274,6 +2986,7 @@ class AnalyticModule:
                 "sm_n_items":              self.sm_n_items,
                 "sm_items":                list(self.sm_items),
                 "sm_vars":                 list(self.sm_vars),
+                "sm_bundle_ports":         [dict(p) for p in self.sm_bundle_ports],
                 "sm_state_vars":           list(self.sm_state_vars),
                 "sm_params":               dict(self.sm_params),
                 "sm_use_torch":            self.sm_use_torch,
@@ -2314,6 +3027,7 @@ class AnalyticModule:
         o.sm_n_items         = int(d.get("sm_n_items",   1))
         o.sm_items           = list(d.get("sm_items",    []))
         o.sm_vars            = list(d.get("sm_vars",     []))
+        o.sm_bundle_ports    = [dict(p) for p in d.get("sm_bundle_ports", [])]
         o.sm_state_vars      = list(d.get("sm_state_vars", d.get("sm_vars", [])))
         o.sm_params          = dict(d.get("sm_params",   {}))
         o.sm_use_torch       = bool(d.get("sm_use_torch", False))
@@ -2523,6 +3237,7 @@ def _resample_audio(arr: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
 # These are constant-Hz DC sources that carry pitch information (real part = Hz)
 # rather than audio — do NOT auto-route to the mix bus.
 _PATCH_VIRTUAL_KEYS: tuple = ("__patch_tonic__", "__patch_seq__")
+_ROUTER_UI_PREFIX: str = "__router__:"
 
 
 def _system_output_keys(patch: "AnalyticPatch") -> list[str]:
@@ -2531,6 +3246,100 @@ def _system_output_keys(patch: "AnalyticPatch") -> list[str]:
 
 def _system_input_keys(patch: "AnalyticPatch") -> list[str]:
     return patch.system_audio.input_keys() if getattr(patch, "system_audio", None) else []
+
+
+def _router_ui_key(router_key: str) -> str:
+    return f"{_ROUTER_UI_PREFIX}{router_key}"
+
+
+def _router_key_from_ui_key(ui_key: str) -> str:
+    return str(ui_key)[len(_ROUTER_UI_PREFIX):] if str(ui_key).startswith(_ROUTER_UI_PREFIX) else ""
+
+
+def _router_instance_for_active_key(
+    patch: "AnalyticPatch",
+    active_key: str,
+) -> "RouterInstance | None":
+    router_key = _router_key_from_ui_key(active_key)
+    if not router_key:
+        return None
+    return next((r for r in getattr(patch, "routers", []) if r.key == router_key), None)
+
+
+def _active_routing_graph_and_instance(
+    patch: "AnalyticPatch",
+    active_key: str = "",
+) -> "tuple[RoutingGraph, RouterInstance | None]":
+    router = _router_instance_for_active_key(patch, active_key)
+    if router is not None:
+        return router.graph, router
+    return patch.routing, None
+
+
+def _filtered_router_edges(
+    graph: RoutingGraph,
+    *,
+    router_key: str = "",
+    router_type: str = "",
+) -> list[RoutingEdge]:
+    edges = list(graph.edges)
+    if router_key:
+        edges = [e for e in edges if e.router_key in {"", router_key}]
+    if router_type:
+        edges = [
+            e for e in edges
+            if graph.is_source_in_router(e.src_key, router_type)
+            and graph.is_sink_in_router(e.dst_key, router_type)
+        ]
+    return edges
+
+
+def _routing_grid_node_keys(
+    patch: "AnalyticPatch",
+    active_key: str = "",
+) -> list[str]:
+    graph, router = _active_routing_graph_and_instance(patch, active_key)
+    if router is None:
+        return _patch_node_keys(patch)
+
+    edges = _filtered_router_edges(
+        graph,
+        router_key=router.key,
+        router_type=router.router_type,
+    )
+    referenced: set[str] = set()
+    for e in edges:
+        referenced.add(e.src_key)
+        referenced.add(e.dst_key)
+
+    canonical = _patch_node_keys(patch)
+    router_type = str(getattr(router, "router_type", "") or "")
+    graph_nodes = set(graph.node_keys())
+    result: list[str] = []
+    for key in canonical:
+        if key not in graph_nodes and key not in referenced:
+            continue
+        if not router_type:
+            if key in referenced or key in graph_nodes:
+                result.append(key)
+            continue
+        if (
+            key in referenced
+            or graph.is_source_in_router(key, router_type)
+            or graph.is_sink_in_router(key, router_type)
+        ):
+            result.append(key)
+    extras = [
+        key for key in graph.node_keys()
+        if key not in result and (
+            key in referenced
+            or not router_type
+            or graph.is_source_in_router(key, router_type)
+            or graph.is_sink_in_router(key, router_type)
+        )
+    ]
+    result.extend(extras)
+    return result
 
 
 def _runtime_performer_keys(patch: "AnalyticPatch") -> list[str]:
@@ -3030,8 +3839,13 @@ class AnalyticPatch:
     projection_rotation_hz: float = 0.0    # rotates analytic projection plane at this rate
     normalize_output:       bool  = True   # peak-normalize the mix before projection
     performer_phase_mode:   str   = "coherent"  # "coherent" | "individual"
-    # Signal routing graph (analytic, pre-projection)
+    # Signal routing graph (analytic, pre-projection) — legacy default voice router.
+    # New code should use patch.routers[i].graph for named router instances.
     routing: RoutingGraph = field(default_factory=RoutingGraph)
+    # Multi-router deployment.  Each RouterInstance owns its own RoutingGraph
+    # and is typed by MIXER_LAYERS ("voice_router", "instrument", "master").
+    # Empty list means only the legacy `routing` graph is active.
+    routers: list = field(default_factory=list)   # list[RouterInstance]
     # UI-only state — not serialized.  When set, only this voice key produces audio.
     solo_key: str | None = None
     resolved_notes: list = field(default_factory=list)  # list[ResolvedNote]
@@ -3234,6 +4048,7 @@ class AnalyticPatch:
             "normalize_output":       self.normalize_output,
             "performer_phase_mode":   self.performer_phase_mode,
             "routing":                self.routing.to_dict(),
+            "routers":                [r.to_dict() for r in self.routers],
             # Per-register rhythm pages (excludes "all" — derived from flat fields on load)
             "rhythm_pages":      {k: v.to_dict() for k, v in self.rhythm_pages.items()
                                   if k != "all"},
@@ -3491,6 +4306,8 @@ class AnalyticPatch:
             p.routing.prune_keys(valid_keys)
         else:
             p.routing = RoutingGraph()
+        # Multi-router instances (new; absent in legacy patches)
+        p.routers = [RouterInstance.from_dict(r) for r in d.get("routers", [])]
         p._param_series_cache = {}   # always start fresh on load
         return p
 
@@ -3555,6 +4372,7 @@ class EditorMode(Enum):
     FM_VIEW       = auto()   # instantaneous frequency including FM deviation
     MIX           = auto()   # all voices summed into final mix
     ROUTING       = auto()   # N×N signal routing matrix (knob grid)
+    CONTROL_ROUTING = auto() # rack/backplane view for analytic control routing
     PARAM_ROUTING = auto()   # parametric routing view for ParamNode targets
     SM_LOG        = auto()   # state-machine plugin output log
     SCORE         = auto()   # phrase table: all registered parts × full phrase bars
@@ -5822,81 +6640,129 @@ def _synthesize_voice(
             out = np.zeros(n, dtype=np.complex128)
             out[:len(result)] = result
             return out
+    import torch
     # t axis: starts at t_offset (negative for pre-roll), advances at 1/sr per sample
-    t = (np.arange(n, dtype=np.float64) / sr) + t_offset
+    t = (torch.arange(n, dtype=torch.float64) / sr) + t_offset
 
     # Apply param_overrides to base frequency/amplitude before chirp/FM
     po = param_overrides or {}
     _po_freq = po.get("freq_hz")
     if _po_freq is not None and len(_po_freq) >= n:
-        f_inst = np.asarray(_po_freq[:n], dtype=np.float64)
+        f_inst = torch.as_tensor(_po_freq[:n], dtype=torch.float64)
     else:
-        f_inst = np.full(n, voice.freq_hz, dtype=np.float64)
+        f_inst = torch.full((n,), voice.freq_hz, dtype=torch.float64)
     ct = voice.chirp.chirp_type
     if ct == "linear":
-        f_inst += np.linspace(voice.chirp.f_delta_start, voice.chirp.f_delta_end, n)
+        f_inst = f_inst + torch.linspace(voice.chirp.f_delta_start, voice.chirp.f_delta_end, n, dtype=torch.float64)
     elif ct == "exponential" and voice.chirp.tau > 0:
-        decay   = np.exp(-t / voice.chirp.tau)
-        f_inst += voice.chirp.f_delta_start * decay + voice.chirp.f_delta_end * (1 - decay)
+        decay   = torch.exp(-t / voice.chirp.tau)
+        f_inst = f_inst + voice.chirp.f_delta_start * decay + voice.chirp.f_delta_end * (1 - decay)
     elif ct == "power" and dur > 0:
         tau_n = (t / dur) ** max(voice.chirp.chirp_power, 1e-3)
-        f_inst += voice.chirp.f_delta_start * (1.0 - tau_n) + voice.chirp.f_delta_end * tau_n
+        f_inst = f_inst + voice.chirp.f_delta_start * (1.0 - tau_n) + voice.chirp.f_delta_end * tau_n
 
     if voice.fm and voice.fm.source_key:
         sk = voice.fm.source_key
         if sk in lfo_map:
-            mod = _lfo_signal(lfo_map[sk], t)
+            lfo = lfo_map[sk]
+            ph = 2.0 * math.pi * lfo.rate_hz * t + lfo.phase_offset
+            if lfo.shape == "Sine":
+                mod = lfo.depth * torch.sin(ph)
+            elif lfo.shape == "Triangle":
+                mod = lfo.depth * (2.0 * torch.abs(2.0 * (ph / (2 * math.pi) % 1.0) - 1.0) - 1.0)
+            elif lfo.shape == "Sawtooth":
+                mod = lfo.depth * (2.0 * (ph / (2 * math.pi) % 1.0) - 1.0)
+            else:  # Square
+                mod = lfo.depth * torch.sign(torch.sin(ph))
         elif voice_signal_map is not None and sk in voice_signal_map:
             # Use the source voice's synthesized complex signal: extract
             # instantaneous frequency (normalised to [-0.5, 0.5] * Nyquist)
             src_csig = voice_signal_map[sk]
-            f_mod = _inst_freq_from_csig(src_csig[:n], float(patch.preview_sr))
-            f_mid = float(p_map[sk].freq_hz) if sk in p_map else float(np.mean(np.abs(f_mod)))
+            src_t = torch.as_tensor(src_csig[:n], dtype=torch.complex128)
+            phase_diff = torch.angle(src_t[1:] * src_t[:-1].conj())
+            f_mod = phase_diff * (float(patch.preview_sr) / (2.0 * math.pi))
+            f_mod = torch.cat([f_mod[:1], f_mod])
+            f_mid = float(p_map[sk].freq_hz) if sk in p_map else float(torch.mean(torch.abs(f_mod)).item())
             mod = f_mod / max(f_mid, 1.0)  # normalise so depth_hz is in sensible units
         elif param_series is not None and sk in param_series:
             # H4 fix: ParamNode output as FM modulator (already a float64 series)
             ps = param_series[sk]
-            mod = np.asarray(ps[:n], dtype=np.float64) if len(ps) >= n else np.pad(ps[:n], (0, n - len(ps)))
+            if len(ps) >= n:
+                mod = torch.as_tensor(ps[:n], dtype=torch.float64)
+            else:
+                mod = torch.nn.functional.pad(torch.as_tensor(ps[:n], dtype=torch.float64), (0, n - len(ps)))
         elif sk in p_map and sk != voice.key:
-            mod = np.cos(2.0 * np.pi * p_map[sk].freq_hz * t)
+            mod = torch.cos(2.0 * math.pi * p_map[sk].freq_hz * t)
         else:
-            mod = np.zeros(n)
-        f_inst += voice.fm.depth_hz * mod
+            mod = torch.zeros(n, dtype=torch.float64)
+        f_inst = f_inst + voice.fm.depth_hz * mod
 
-    phase = np.cumsum(2.0 * np.pi * f_inst / sr) + voice.phase_origin
+    phase = torch.cumsum(2.0 * math.pi * f_inst / sr, dim=0) + voice.phase_origin
 
     _po_amp = po.get("amplitude")
     if _po_amp is not None and len(_po_amp) >= n:
-        amp = np.asarray(_po_amp[:n], dtype=np.float64)
+        amp = torch.as_tensor(_po_amp[:n], dtype=torch.float64)
     else:
-        amp = np.full(n, voice.amplitude, dtype=np.float64)
+        amp = torch.full((n,), voice.amplitude, dtype=torch.float64)
     if voice.am and voice.am.source_key:
         sk = voice.am.source_key
         if sk in lfo_map:
-            mod = _lfo_signal(lfo_map[sk], t)
+            lfo = lfo_map[sk]
+            ph = 2.0 * math.pi * lfo.rate_hz * t + lfo.phase_offset
+            if lfo.shape == "Sine":
+                mod = lfo.depth * torch.sin(ph)
+            elif lfo.shape == "Triangle":
+                mod = lfo.depth * (2.0 * torch.abs(2.0 * (ph / (2 * math.pi) % 1.0) - 1.0) - 1.0)
+            elif lfo.shape == "Sawtooth":
+                mod = lfo.depth * (2.0 * (ph / (2 * math.pi) % 1.0) - 1.0)
+            else:  # Square
+                mod = lfo.depth * torch.sign(torch.sin(ph))
         elif voice_signal_map is not None and sk in voice_signal_map:
             # Use magnitude envelope of the source voice's synthesized signal
             src_csig = voice_signal_map[sk]
-            mod = np.abs(src_csig[:n]).astype(np.float64)
-            peak = float(np.max(mod))
+            src_t = torch.as_tensor(src_csig[:n], dtype=torch.complex128)
+            mod = torch.abs(src_t).to(torch.float64)
+            peak = float(torch.max(mod).item())
             if peak > 1e-12:
-                mod /= peak
+                mod = mod / peak
         elif param_series is not None and sk in param_series:
             # H4 fix: ParamNode output as AM modulator (already a float64 series)
             ps = param_series[sk]
-            mod = np.asarray(ps[:n], dtype=np.float64) if len(ps) >= n else np.pad(ps[:n], (0, n - len(ps)))
+            if len(ps) >= n:
+                mod = torch.as_tensor(ps[:n], dtype=torch.float64)
+            else:
+                mod = torch.nn.functional.pad(torch.as_tensor(ps[:n], dtype=torch.float64), (0, n - len(ps)))
         elif sk in p_map and sk != voice.key:
-            mod = np.cos(2.0 * np.pi * p_map[sk].freq_hz * t)
+            mod = torch.cos(2.0 * math.pi * p_map[sk].freq_hz * t)
         else:
-            mod = np.zeros(n)
-        amp *= (1.0 + voice.am.depth_amp * mod)
+            mod = torch.zeros(n, dtype=torch.float64)
+        amp = amp * (1.0 + voice.am.depth_amp * mod)
 
-    env = amp * _compute_envelope(voice, n, dur)
+    knots = voice.active_knots()
+    ts = torch.tensor([k[0] * dur for k in knots], dtype=torch.float64)
+    vs = torch.tensor([k[1]       for k in knots], dtype=torch.float64)
+    t_ax = torch.linspace(0.0, dur, n, dtype=torch.float64)
+    # Catmull-Rom spline: duplicate endpoints so every segment has 4 neighbours
+    vp = torch.cat([vs[:1], vs, vs[-1:]])  # padded values
+    tp = torch.cat([ts[:1], ts, ts[-1:]])  # padded times
+    idx = torch.searchsorted(ts.contiguous(), t_ax.contiguous(), right=True).clamp(1, len(ts) - 1)
+    # segment neighbours in padded arrays (idx+1 because of leading pad)
+    i1 = idx; i0 = i1 - 1; i2 = i1 + 1; i3 = i1 + 2
+    p0 = vp[i0]; p1 = vp[i1]; p2 = vp[i2]; p3 = vp[i3]
+    seg_len = (tp[i1] - tp[i0]).clamp(min=1e-12)
+    u = (t_ax - tp[i0]) / seg_len
+    env_curve = torch.clamp(
+        0.5 * ((2.0 * p1)
+               + (-p0 + p2) * u
+               + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u
+               + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u * u * u),
+        min=0.0)
+    env = amp * env_curve
 
     # --- manifold synthesis ---
     mt = voice.manifold_type
     if mt in ("harmonic", "harmonic_warp") and voice.harmonic_count > 1:
-        sig = np.zeros(n, dtype=np.complex128)
+        sig = torch.zeros(n, dtype=torch.complex128)
         hc  = max(1, voice.harmonic_count)
         bri = voice.harmonic_brightness
         warp = voice.harmonic_warp_strength
@@ -5905,16 +6771,16 @@ def _synthesize_voice(
             h_amp   = 1.0 / (k ** bri) if bri > 0 else 1.0
             # C2 fix: k-th partial starts at k * phase_origin so all harmonics
             # are constructive at t=0 even when ratios are non-integer (warp > 0).
-            h_phase = np.cumsum(2.0 * np.pi * (f_inst * h_ratio) / sr) + (k * voice.phase_origin) % (2.0 * np.pi)
-            sig    += h_amp * np.exp(1j * h_phase)
+            h_phase = torch.cumsum(2.0 * math.pi * (f_inst * h_ratio) / sr, dim=0) + (k * voice.phase_origin) % (2.0 * math.pi)
+            sig = sig + h_amp * torch.exp(1j * h_phase)
         # Normalise so amplitude 1 still means peak ~1 for a single harmonic baseline
         norm = sum(1.0 / (k ** bri) if bri > 0 else 1.0 for k in range(1, hc + 1))
-        sig /= norm
+        sig = sig / norm
         if voice.loop_enabled:
             sig = _apply_loop_tiling(sig, voice, n)
         out = env * sig
     else:
-        sig = np.exp(1j * phase)
+        sig = torch.exp(1j * phase)
         if voice.loop_enabled:
             sig = _apply_loop_tiling(sig, voice, n)
         out = env * sig
@@ -6294,7 +7160,53 @@ def _working_routing_graph_for_synthesis(patch: "AnalyticPatch") -> RoutingGraph
     any explicit signal edges, missing edges stay missing; deleted routes are
     not silently reintroduced during preview or rendering.
     """
-    g = RoutingGraph.from_dict(patch.routing.to_dict())
+    if getattr(patch, "routers", None):
+        g = RoutingGraph()
+        base = RoutingGraph.from_dict(patch.routing.to_dict())
+        for nk in base.node_keys():
+            g.add_node(
+                nk,
+                node_type=base.get_node_type(nk),
+                source_router_types=(
+                    base.get_node_source_router_types(nk)
+                    if nk in base.node_source_router_types else None
+                ),
+                sink_router_types=(
+                    base.get_node_sink_router_types(nk)
+                    if nk in base.node_sink_router_types else None
+                ),
+            )
+        g.edges.extend(copy.copy(e) for e in base.edges)
+        g.param_edges.extend(copy.copy(pe) for pe in base.param_edges)
+        g.meta_edges.extend(copy.copy(me) for me in getattr(base, "meta_edges", []))
+        g.feedback = copy.deepcopy(base.feedback)
+        g.latency_compensation = bool(getattr(base, "latency_compensation", False))
+        # New-model patches: merge deployed router graphs into one synthesis
+        # graph so the render path can consume the same router instances the
+        # editor exposes.  Feedback policy remains graph-global for now.
+        for ri, router in enumerate(patch.routers):
+            rg = RoutingGraph.from_dict(router.graph.to_dict())
+            if ri == 0 and not base.edges and not base.param_edges:
+                g.feedback = copy.deepcopy(rg.feedback)
+                g.latency_compensation = bool(getattr(rg, "latency_compensation", False))
+            for nk in rg.node_keys():
+                g.add_node(
+                    nk,
+                    node_type=rg.get_node_type(nk),
+                    source_router_types=(
+                        rg.get_node_source_router_types(nk)
+                        if nk in rg.node_source_router_types else None
+                    ),
+                    sink_router_types=(
+                        rg.get_node_sink_router_types(nk)
+                        if nk in rg.node_sink_router_types else None
+                    ),
+                )
+            g.edges.extend(copy.copy(e) for e in rg.edges)
+            g.param_edges.extend(copy.copy(pe) for pe in rg.param_edges)
+            g.meta_edges.extend(copy.copy(me) for me in getattr(rg, "meta_edges", []))
+    else:
+        g = RoutingGraph.from_dict(patch.routing.to_dict())
     mixer_keys = [m.key for m in patch.mixers]
     default_mix_key = mixer_keys[0] if mixer_keys else "__mix__"
     auto_signal_keys = _auto_mix_signal_keys(patch)
@@ -6609,25 +7521,26 @@ def _synthesize_sequence_full_batch(
 
     f0_base = cfg.f0.clone()   # save nominal per-driver frequencies
 
-    # ── 2. Pre-compute routing matrix M once ──────────────────────────────────
+    # ── 2. Compile torch routing solve once ───────────────────────────────────
     g = _working_routing_graph_for_synthesis(patch)
     node_keys = _patch_node_keys(patch)
+    for _k in g.node_keys():
+        if _k not in node_keys:
+            node_keys.append(_k)
     N = len(node_keys)
     ki = {k: i for i, k in enumerate(node_keys)}
     global_decay = float(getattr(patch.routing, "global_decay", 1.0))
-
-    W_inst = np.zeros((N, N), dtype=np.complex128)
-    for e in g.edges:
-        si, di = ki.get(e.src_key), ki.get(e.dst_key)
-        if si is None or di is None:
-            continue
-        if int(round(e.delay_s * sr)) == 0:
-            cw = complex(
-                e.weight * global_decay * math.cos(e.angle_rad),
-                e.weight * global_decay * math.sin(e.angle_rad),
-            )
-            W_inst[di, si] += cw
-    M = _safe_inverse(np.eye(N, dtype=np.complex128) - W_inst)
+    compiled_router = CompiledRouter(
+        node_keys,
+        list(g.edges),
+        sr,
+        device,
+        global_decay=global_decay,
+        batch_size=1,
+        max_iterations=max(1, int(getattr(g.feedback, "max_iterations", 64))),
+        convergence_eps=1e-10,
+        infinity_threshold=1e6,
+    )
 
     # ── 3. Pre-compute LFO signals (deterministic, no feedback) ───────────────
     lfo_sigs: dict[str, np.ndarray] = {}
@@ -6699,7 +7612,10 @@ def _synthesize_sequence_full_batch(
                     Src_vec[ki[ok]] = cached[0]
 
         # 5c. Routing solve — single matrix-vector multiply (M pre-computed)
-        X_vec = M @ Src_vec
+        X_t = compiled_router.step(
+            torch.as_tensor(Src_vec, dtype=torch.complex128, device=device)
+        )
+        X_vec = np.asarray(X_t.detach().cpu().numpy(), dtype=np.complex128)
         X_full[:, t] = X_vec
 
         # 5d. Step each SM module on this 1-sample X; update atmospheric FM
@@ -7826,6 +8742,7 @@ class RoutingGridView:
         self._surf:  pygame.Surface | None = None
         self._dirty: bool = True
         self._font:  pygame.font.Font | None = None
+        self.active_key: str = ""
         # Geometry (filled during render)
         self._cell_size: int = 48
         self._grid_x0:   int = 0
@@ -7887,12 +8804,14 @@ class RoutingGridView:
 
     def _render_grid(self, surf: pygame.Surface, patch: AnalyticPatch,
                      ext_font: pygame.font.Font | None) -> None:
-        keys   = _patch_node_keys(patch)
+        keys   = _routing_grid_node_keys(patch, getattr(self, "active_key", ""))
         labels = [_routing_node_label(k, patch) for k in keys]
         colors = [_routing_node_color(k, patch) for k in keys]
         N      = len(keys)
         self._N = N
-        g      = patch.routing
+        g, active_router = _active_routing_graph_and_instance(
+            patch, getattr(self, "active_key", "")
+        )
         font   = ext_font or self._font_()
         fh     = font.get_height()
         w, h   = surf.get_size()
@@ -7925,6 +8844,13 @@ class RoutingGridView:
                 }.get(self._routing_tab, "")
         hs = font.render(hint, True, (60, 60, 80))
         surf.blit(hs, (tab_pad + len(tab_keys) * (tab_w + 2) + 8, tab_pad + (TAB_H - 2 * tab_pad - fh) // 2))
+        if active_router is not None:
+            r_lbl = font.render(
+                f"router: {active_router.label} [{active_router.router_type}]",
+                True,
+                (120, 165, 210),
+            )
+            surf.blit(r_lbl, (8, TAB_H + 2))
 
         # Export tab — show per-mixer export settings; skip NxN routing grid
         if self._routing_tab == "export":
@@ -7933,7 +8859,7 @@ class RoutingGridView:
 
         # ---- Scrollable grid geometry -----------------------------------------
         # Two header strips on each axis (top+bottom, left+right).
-        status_h = (fh + 4) * 2 + 10
+        status_h = (fh + 4) * (3 if active_router is not None else 2) + 10
         avail_w   = w - 8
         avail_h   = h - TAB_H - status_h - 8
         cs        = max(24, min(48, min(avail_w // 3, max(1, avail_h // 3))))
@@ -8181,8 +9107,8 @@ class RoutingGridView:
                      canvas_x: int, canvas_y: int) -> bool:
         """Returns True if event was consumed (caller should mark rebuild)."""
         from pygame.locals import K_LSHIFT, K_RSHIFT
-        keys_list = _patch_node_keys(patch)
-        g = patch.routing
+        keys_list = _routing_grid_node_keys(patch, self.active_key)
+        g, _active_router = _active_routing_graph_and_instance(patch, self.active_key)
         tab = self._routing_tab
         tab_keys = [t[0] for t in self._ROUTING_TABS]
 
@@ -8399,20 +9325,21 @@ class EditorCanvas:
                    "Harmonics", "LFOs", "FM", "Mix", "Routing"]
 
     # Modes available on the __mix__ node (routing module)
-    _MIX_NODE_MODES  = [EditorMode.ROUTING, EditorMode.MIX,
+    _MIX_NODE_MODES  = [EditorMode.ROUTING, EditorMode.CONTROL_ROUTING, EditorMode.MIX,
                         EditorMode.COMPLEX_RI, EditorMode.COMPLEX_MP]
-    _MIX_NODE_LABELS = ["Routing", "Mix", "Re/Im", "Mag/Phase"]
+    _MIX_NODE_LABELS = ["Routing", "Control", "Mix", "Re/Im", "Mag/Phase"]
 
     # Modes available on LFO nodes
     _LFO_NODE_MODES   = [EditorMode.WAVEFORM, EditorMode.LFO_VIEW, EditorMode.COMPLEX_RI]
     _PARAM_NODE_MODES  = [EditorMode.WAVEFORM, EditorMode.COMPLEX_RI,
-                          EditorMode.COMPLEX_MP, EditorMode.PARAM_ROUTING]
-    _PARAM_NODE_LABELS = ["Wave", "Re/Im", "Mag/Phase", "Param Routing"]
+                          EditorMode.COMPLEX_MP, EditorMode.PARAM_ROUTING,
+                          EditorMode.CONTROL_ROUTING]
+    _PARAM_NODE_LABELS = ["Wave", "Re/Im", "Mag/Phase", "Param Routing", "Control"]
     _LFO_NODE_LABELS = ["Wave", "LFOs", "Re/Im"]
-    _STATE_MACHINE_NODE_MODES = [EditorMode.ROUTING, EditorMode.WAVEFORM,
+    _STATE_MACHINE_NODE_MODES = [EditorMode.ROUTING, EditorMode.CONTROL_ROUTING, EditorMode.WAVEFORM,
                                  EditorMode.COMPLEX_RI, EditorMode.COMPLEX_MP,
                                  EditorMode.SM_LOG]
-    _STATE_MACHINE_NODE_LABELS = ["Routing", "Wave", "Re/Im", "Mag/Phase", "Log"]
+    _STATE_MACHINE_NODE_LABELS = ["Routing", "Control", "Wave", "Re/Im", "Mag/Phase", "Log"]
 
     # Modes available on regular voice nodes (everything except ROUTING)
     _VOICE_MODES  = [EditorMode.WAVEFORM, EditorMode.ENVELOPE, EditorMode.CHIRP,
@@ -8443,6 +9370,8 @@ class EditorCanvas:
             return self._SYSTEM_NODE_MODES, self._SYSTEM_NODE_LABELS
         if any(m.key == self.active_key for m in patch.mixers):
             return self._MIX_NODE_MODES, self._MIX_NODE_LABELS
+        if _router_instance_for_active_key(patch, self.active_key) is not None:
+            return self._MIX_NODE_MODES, self._MIX_NODE_LABELS
         if any(l.key == self.active_key for l in patch.lfos):
             return self._LFO_NODE_MODES, self._LFO_NODE_LABELS
         if any(pn.key == self.active_key for pn in patch.param_nodes):
@@ -8454,9 +9383,11 @@ class EditorCanvas:
 
     def __init__(self) -> None:
         self.mode: EditorMode = EditorMode.WAVEFORM
+        self.active_key: str = ""
         self.plot   = PlotWidget()
         self.plot.grid_lines = 5
         self.routing_view = RoutingGridView()
+        self.routing_view.active_key = self.active_key
         self._canvas_font: pygame.font.Font | None = None
         # Mix ctrl drag state for rotation knob
         self._rot_drag_x0:   int   = 0
@@ -8499,7 +9430,7 @@ class EditorCanvas:
         self._surf_dirty: bool = True
 
         # Cache of active voice key (drives overlay rendering)
-        self.active_key: str = ""
+        # (initialized at top of __init__ before routing_view)
 
         # Seed offset for granular voices — advanced by viewer when seed_animate is on
         self.granular_seed_offset: int = 0
@@ -8508,6 +9439,12 @@ class EditorCanvas:
         self._placement_perf_rects: list = []   # [{rect, pf_key, part_key}, ...]
         self._placement_hover_key: str = ""
         self._placement_zoom: float = 1.0
+        # Control routing rack view state
+        self._control_device_rects: list = []
+        self._control_port_rects: dict[str, dict] = {}
+        self._control_edge_hits: list = []
+        self._control_armed_port: str = ""
+        self._control_hover_port: str = ""
 
         # Mix-tab per-series visibility toggles and signal cache
         self._mix_series_hidden: set[str] = set()
@@ -9646,6 +10583,161 @@ class EditorCanvas:
 
         return False
 
+    def _render_control_routing_view(self, surf: pygame.Surface,
+                                     patch: "AnalyticPatch",
+                                     font: "pygame.font.Font | None") -> None:
+        fb = font or self._font_()
+        fh = fb.get_height()
+        w, h = surf.get_size()
+        surf.fill(_PY_BG)
+
+        title = fb.render("Control Routing  —  click out→in · SM↔SM links author metaedges · right-click deletes", True, (190, 210, 230))
+        surf.blit(title, (8, 6))
+
+        rack = _rack_device_views_for_patch(patch)
+        port_lookup = _published_port_lookup(patch)
+        conns = _control_connections_for_patch(patch)
+        self._control_device_rects = []
+        self._control_port_rects = {}
+        self._control_edge_hits = []
+
+        unit_h = 26
+        slot_w = 108
+        x0 = 16
+        y0 = fh + 20
+
+        for dev in rack:
+            rx = x0 + dev.grid_x * slot_w
+            ry = y0 + dev.grid_y * unit_h
+            rw = max(72, dev.rack_w * slot_w - 8)
+            rh = max(22, dev.rack_u * unit_h - 6)
+            rr = pygame.Rect(rx, ry, rw, rh)
+            pygame.draw.rect(surf, tuple(max(0, c - 40) for c in dev.color), rr, border_radius=4)
+            pygame.draw.rect(surf, dev.color, rr, 1, border_radius=4)
+            self._control_device_rects.append({"rect": rr, "device": dev})
+            hdr = fb.render(dev.label[:18], True, (180, 190, 210))
+            surf.blit(hdr, (rx + 6, ry + 4))
+            for pv in dev.ports:
+                px = rx + pv.local_x
+                py = ry + pv.local_y
+                col = pv.port.color
+                if pv.port.key == self._control_armed_port:
+                    col = tuple(min(255, c + 60) for c in col)
+                pygame.draw.circle(surf, col, (px, py), pv.radius, 0)
+                self._control_port_rects[pv.port.key] = {
+                    "rect": pygame.Rect(px - pv.radius - 2, py - pv.radius - 2, pv.radius * 2 + 4, pv.radius * 2 + 4),
+                    "port": pv.port,
+                    "center": (px, py),
+                }
+
+        # Connections last
+        for conn in conns:
+            s = self._control_port_rects.get(conn.src_port_key)
+            d = self._control_port_rects.get(conn.dst_port_key)
+            if not s or not d:
+                continue
+            p0 = s["center"]
+            p1 = d["center"]
+            if conn.remove_kind == "meta":
+                col = (220, 120, 200)
+            elif conn.edge_kind == "control":
+                col = (120, 180, 240)
+            else:
+                col = (210, 150, 90)
+            pygame.draw.line(surf, col, p0, p1, 1)
+            mx = (p0[0] + p1[0]) // 2
+            my = (p0[1] + p1[1]) // 2
+            self._control_edge_hits.append({
+                "src_port_key": conn.src_port_key,
+                "dst_port_key": conn.dst_port_key,
+                "kind": conn.edge_kind,
+                "remove_kind": conn.remove_kind,
+                "rect": pygame.Rect(mx - 4, my - 4, 8, 8),
+            })
+
+        hover_key = self._control_hover_port or self._control_armed_port
+        if hover_key:
+            port = port_lookup.get(hover_key)
+            if port is not None:
+                msg = (
+                    f"{port.label}  [{port.domain}/{port.direction}]  "
+                    f"rank={port.tensor.tensor_rank} lanes={port.tensor.lane_count} "
+                    f"group={port.tensor.parallel_group or '-'} "
+                    f"role={(port.semantic_role or port.tensor.semantic_role or '-')}"
+                )
+                if port.projection_policy:
+                    msg += f" proj={port.projection_policy}"
+                hs = fb.render(msg, True, (170, 185, 210))
+                surf.blit(hs, (8, h - fh - 8))
+
+    def _handle_control_routing_event(self, event: pygame.event.Event,
+                                      patch: "AnalyticPatch",
+                                      win_w: int, win_h: int) -> bool:
+        cx, cy, cw, ch = self._canvas_rect(win_w, win_h)
+        plot_rect = pygame.Rect(cx, cy + MODEBAR_H, cw, ch - MODEBAR_H)
+        mx, my = pygame.mouse.get_pos()
+        if event.type == MOUSEMOTION and plot_rect.collidepoint(mx, my):
+            lx = mx - cx
+            ly = my - cy - MODEBAR_H
+            self._control_hover_port = ""
+            for key, info in self._control_port_rects.items():
+                if info["rect"].collidepoint(lx, ly):
+                    self._control_hover_port = key
+                    break
+            self._surf_dirty = True
+            return False
+        if not plot_rect.collidepoint(mx, my):
+            return False
+        lx = mx - cx
+        ly = my - cy - MODEBAR_H
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            for key, info in self._control_port_rects.items():
+                if not info["rect"].collidepoint(lx, ly):
+                    continue
+                port = info["port"]
+                if self._control_armed_port:
+                    src = self._control_port_rects.get(self._control_armed_port, {}).get("port")
+                    if src is not None and _control_add_connection(patch, src, port):
+                        self._control_armed_port = ""
+                        self._surf_dirty = True
+                        return True
+                self._control_armed_port = key if port.direction == "out" else ""
+                self._surf_dirty = True
+                return True
+            self._control_armed_port = ""
+            self._surf_dirty = True
+            return False
+        if event.type == MOUSEBUTTONDOWN and event.button == 3:
+            for key, info in self._control_port_rects.items():
+                if info["rect"].collidepoint(lx, ly):
+                    _control_remove_connections_for_port(patch, key)
+                    self._control_armed_port = ""
+                    self._surf_dirty = True
+                    return True
+            for eh in self._control_edge_hits:
+                if eh["rect"].collidepoint(lx, ly):
+                    src_key = eh["src_port_key"]
+                    dst_key = eh["dst_port_key"]
+                    if eh.get("remove_kind") == "meta":
+                        patch.routing.meta_edges = [
+                            me for me in getattr(patch.routing, "meta_edges", [])
+                            if not ((me.a_port or me.a_key) == src_key and (me.b_port or me.b_key) == dst_key)
+                        ]
+                    else:
+                        patch.routing.edges = [
+                            e for e in patch.routing.edges
+                            if not ((e.src_port or e.src_key) == src_key and (e.dst_port or e.dst_key) == dst_key)
+                        ]
+                        patch.routing.param_edges = [
+                            pe for pe in patch.routing.param_edges
+                            if not ((pe.src_port or pe.src_key) == src_key
+                                    and (pe.dst_port or _control_connection_target_port_key(pe.dst_key, pe.param_path)) == dst_key)
+                        ]
+                    self._control_armed_port = ""
+                    self._surf_dirty = True
+                    return True
+        return False
+
     def _render_score_view(self, surf: pygame.Surface,
                            patch: "AnalyticPatch",
                            font: "pygame.font.Font | None") -> None:
@@ -9899,6 +10991,11 @@ class EditorCanvas:
             # Routing view renders its own surface — always delegate
             r_surf = self.routing_view.render_surface(patch, cw, plot_h, font)
             self._tex = _surface_to_gl_tex(r_surf, self._tex)
+        elif self.mode == EditorMode.CONTROL_ROUTING:
+            if self._surf_dirty:
+                self._render_control_routing_view(self._surf, patch, font)
+                self._tex = _surface_to_gl_tex(self._surf, self._tex)
+                self._surf_dirty = False
         elif self.mode == EditorMode.PARAM_ROUTING:
             # Param routing view: informational display for the active ParamNode
             pn = next((p for p in patch.param_nodes if p.key == self.active_key), None)
@@ -10156,6 +11253,12 @@ class EditorCanvas:
                 # Routing graph changed — rebuild audio on next frame
                 self._surf_dirty = True
                 self.routing_view.mark_dirty()
+            return consumed
+
+        if self.mode == EditorMode.CONTROL_ROUTING:
+            consumed = self._handle_control_routing_event(event, patch, win_w, win_h)
+            if consumed:
+                self._surf_dirty = True
             return consumed
 
         if self.mode == EditorMode.SM_LOG:
@@ -10533,6 +11636,7 @@ class PatchPanel(Panel):
         self.on_add_param:     Any = None
         self.on_add_module:    Any = None
         self.on_add_control:   Any = None
+        self.on_add_router:    Any = None
         self.on_toggle_mute:   Any = None
         self.on_remove_voice:  Any = None   # callback(key: str)
         self.on_deploy_chord:  Any = None   # callback()
@@ -11338,6 +12442,24 @@ class PatchPanel(Panel):
             n_sl = len(cs.sliders)
             sl_tag = f"[{n_sl} sl]" if n_sl != 1 else "[1 sl]"
             items.append((cs.key, f"\u229e {cs.label}  {sl_tag}", cs.color, False))
+        # Router instances — selectable editor items for the torch routing model
+        for rt in getattr(p, "routers", []):
+            rt_icon = {
+                "voice_router": "\u21c9",
+                "instrument": "\u266b",
+                "master": "\u25c9",
+            }.get(rt.router_type, "\u25c8")
+            rt_col = {
+                "voice_router": [90, 160, 230],
+                "instrument": [110, 200, 150],
+                "master": [230, 180, 90],
+            }.get(rt.router_type, [160, 160, 180])
+            items.append((
+                _router_ui_key(rt.key),
+                f"{rt_icon} {rt.label}  [{rt.router_type}]",
+                rt_col,
+                False,
+            ))
         # Mixer nodes — ⊕ = projection active (output track), ○ = meta-mixer only
         for m in p.mixers:
             icon = "\u229e" if m.projection_active else "\u25cb"
@@ -11484,18 +12606,21 @@ class PatchPanel(Panel):
             for key, label, col, muted in items:
                 is_active = (key == self._active)
                 is_mix    = self._patch is not None and any(m.key == key for m in self._patch.mixers)
+                is_router = self._patch is not None and _router_instance_for_active_key(self._patch, key) is not None
                 bg = (40, 60, 80) if is_active else (24, 24, 30)
                 if key in {"__patch__", "__system__"}:
                     bg = (50, 80, 120) if is_active else (28, 40, 60)
                 elif is_mix:
                     bg = (44, 44, 22) if is_active else (30, 28, 18)
+                elif is_router:
+                    bg = (26, 46, 64) if is_active else (18, 28, 38)
                 pygame.draw.rect(surf, bg, (2, y, pw - 4, row_h - 2), border_radius=3)
                 c = tuple(col[:3]) if col else (120, 180, 255)
                 pygame.draw.rect(surf, c, (2, y, 4, row_h - 2), border_radius=2)
                 txt_col = (200, 200, 210) if not muted else (80, 80, 90)
                 lbl = font.render(label, True, txt_col)
                 surf.blit(lbl, (10, y + (row_h - 2 - fh) // 2))
-                if not is_mix and key not in {"__patch__", "__system__"}:
+                if not is_mix and not is_router and key not in {"__patch__", "__system__"}:
                     is_param_  = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
                     is_lfo_    = any(l.key == key for l in self._patch.lfos) if self._patch else False
                     is_module_ = any(m.key == key for m in self._patch.modules) if self._patch else False
@@ -11548,9 +12673,15 @@ class PatchPanel(Panel):
                     [("LFO",           "lfo"),
                      ("Passthrough",   "passthrough"),
                      ("Pitch Quant.",  "pitch_quantizer"),
-                     ("Interaural",    "interaural")]
+                     ("Interaural",    "interaural"),
+                     ("Voice Router",  "router:voice_router"),
+                     ("Instrument Router", "router:instrument"),
+                     ("Master Router", "router:master")]
                     if self._open_dropdown == "module"
-                    else [("Control Surface", "control_surface")]
+                    else [("Control Surface", "control_surface"),
+                          ("Voice Router", "router:voice_router"),
+                          ("Instrument Router", "router:instrument"),
+                          ("Master Router", "router:master")]
                 )
                 self._dropdown_items = []
                 dy = y
@@ -12973,15 +14104,16 @@ class PatchPanel(Panel):
                                 self.on_select(key)
                             return True
                         is_mix     = any(m.key == key for m in self._patch.mixers)  if self._patch else False
+                        is_router  = _router_instance_for_active_key(self._patch, key) is not None if self._patch else False
                         is_param   = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
                         is_lfo     = any(l.key == key for l in self._patch.lfos) if self._patch else False
                         is_module  = any(m.key == key for m in self._patch.modules) if self._patch else False
                         is_control = any(cs.key == key for cs in self._patch.controls) if self._patch else False
-                        if not is_mix and lx >= pw - 24:
+                        if not is_mix and not is_router and lx >= pw - 24:
                             # Delete
                             if self.on_remove_voice:
                                 self.on_remove_voice(key)
-                        elif not is_mix and not is_param and not is_control and not is_lfo and lx >= pw - 60:
+                        elif not is_mix and not is_router and not is_param and not is_control and not is_lfo and lx >= pw - 60:
                             if lx >= pw - 42:
                                 # Mute
                                 if is_module:
@@ -13013,10 +14145,18 @@ class PatchPanel(Panel):
                     for di in self._dropdown_items:
                         if di["rect"].collidepoint(lx, ly):
                             if self._open_dropdown == "module":
-                                if self.on_add_module:
-                                    self.on_add_module(di["data"])
+                                _data = str(di["data"])
+                                if _data.startswith("router:"):
+                                    if self.on_add_router:
+                                        self.on_add_router(_data.split(":", 1)[1])
+                                elif self.on_add_module:
+                                    self.on_add_module(_data)
                             else:
-                                if self.on_add_control:
+                                _data = str(di["data"])
+                                if _data.startswith("router:"):
+                                    if self.on_add_router:
+                                        self.on_add_router(_data.split(":", 1)[1])
+                                elif self.on_add_control:
                                     self.on_add_control()
                             self._open_dropdown = ""
                             return True
@@ -13375,6 +14515,7 @@ class PartialPanel(Panel):
         voice      = next((p  for p  in self._patch.voices      if p.key  == self._active_key), None)
         lfo        = next((l  for l  in self._patch.lfos        if l.key  == self._active_key), None)
         mixer      = next((m  for m  in self._patch.mixers      if m.key  == self._active_key), None)
+        router     = _router_instance_for_active_key(self._patch, self._active_key)
         param_node = next((pn for pn in self._patch.param_nodes if pn.key == self._active_key), None)
         module     = next((m  for m  in self._patch.modules     if m.key  == self._active_key), None)
         control    = next((cs for cs in self._patch.controls    if cs.key == self._active_key), None)
@@ -13382,7 +14523,11 @@ class PartialPanel(Panel):
         obj = voice or lfo or mixer or param_node or module or control or system_dev
 
         # Target: voice/lfo/mixer/module/control if one is active, otherwise patch global knobs
-        if obj is not None:
+        if router is not None:
+            target = router
+            knob_list = []
+            header_lbl = f"{router.label} [{router.router_type}]"
+        elif obj is not None:
             # Ensure granular sub-spec exists before building knob list so that
             # visible_when-gated granular knobs read real values, not None.
             if voice is not None and getattr(voice, "emission_mode", "single") == "granular":
@@ -13893,8 +15038,8 @@ class PartialPanel(Panel):
             y += self._SLIDER_H + self._SLIDER_PAD + 8
 
         # When a mixer node is active, append RoutingGraph controls below
-        if mixer is not None:
-            routing = self._patch.routing
+        if mixer is not None or router is not None:
+            routing = router.graph if router is not None else self._patch.routing
             routing_knobs = routing.knobs() if hasattr(routing, 'knobs') else []
             last_group = ""
             for k in routing_knobs:
@@ -14336,6 +15481,7 @@ class AnalyticDriverViewer:
         self.patch_panel.on_add_param    = self._on_add_param
         self.patch_panel.on_add_module   = self._on_add_module
         self.patch_panel.on_add_control  = self._on_add_control
+        self.patch_panel.on_add_router   = self._on_add_router
         self.patch_panel.on_toggle_mute  = lambda _: self._mark_dirty()
         self.patch_panel.on_remove_voice = self._on_remove_voice
         self.patch_panel.on_deploy_chord = self._on_deploy_chord
@@ -14348,13 +15494,16 @@ class AnalyticDriverViewer:
     def _on_select(self, key: str) -> None:
         self.active_key = key
         self.canvas.active_key = key
+        if hasattr(self.canvas, "routing_view"):
+            self.canvas.routing_view.active_key = key
         self.canvas._score_scroll_y = 0
         # Auto-select an appropriate mode for the new node type
         is_mixer   = any(m.key == key for m in self.patch.mixers)
+        is_router  = _router_instance_for_active_key(self.patch, key) is not None
         is_param   = any(pn.key == key for pn in self.patch.param_nodes)
         is_module  = any(m.key == key for m in self.patch.modules)
         is_control = any(cs.key == key for cs in self.patch.controls)
-        if is_mixer:
+        if is_mixer or is_router:
             self.canvas.mode = EditorMode.ROUTING
         elif is_param:
             self.canvas.mode = EditorMode.PARAM_ROUTING
@@ -14628,6 +15777,13 @@ class AnalyticDriverViewer:
         return True
 
     def _on_remove_voice(self, key: str) -> None:
+        router_key = _router_key_from_ui_key(key)
+        if router_key:
+            self.patch.routers = [r for r in self.patch.routers if r.key != router_key]
+            if self.active_key == key:
+                self.active_key = self.patch.voices[0].key if self.patch.voices else "__patch__"
+            self._needs_rebuild = True
+            return
         self.patch.voices      = [v  for v  in self.patch.voices      if v.key  != key]
         self.patch.lfos        = [l  for l  in self.patch.lfos        if l.key  != key]
         self.patch.modules     = [m  for m  in self.patch.modules     if m.key  != key]
@@ -14637,6 +15793,8 @@ class AnalyticDriverViewer:
         # don't show as ghost edges in the routing grid.
         remaining_keys = _patch_node_keys(self.patch)
         self.patch.routing.prune_keys(remaining_keys)
+        for router in self.patch.routers:
+            router.graph.prune_keys(remaining_keys)
         all_keys = remaining_keys  # reuse the already-computed list
         if self.active_key not in all_keys:
             self.active_key = all_keys[0] if all_keys else ""
@@ -14674,6 +15832,22 @@ class AnalyticDriverViewer:
         cs.color = list(colors[len(self.patch.controls) % len(colors)])
         self.patch.controls.append(cs)
         self.active_key = cs.key
+        self._needs_rebuild = True
+
+    def _on_add_router(self, router_type: str = "voice_router") -> None:
+        rt = str(router_type) if router_type in MIXER_LAYERS else "voice_router"
+        idx = 1 + sum(1 for r in self.patch.routers if getattr(r, "router_type", "") == rt)
+        label = {
+            "voice_router": f"Voice Router {idx}",
+            "instrument": f"Instrument Router {idx}",
+            "master": f"Master Router {idx}",
+        }.get(rt, f"Router {idx}")
+        router = RouterInstance(label=label, router_type=rt)
+        self.patch.routers.append(router)
+        self.active_key = _router_ui_key(router.key)
+        self.canvas.active_key = self.active_key
+        self.canvas.routing_view.active_key = self.active_key
+        self.canvas.mode = EditorMode.ROUTING
         self._needs_rebuild = True
 
     def _on_deploy_chord(self) -> None:

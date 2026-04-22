@@ -24,6 +24,7 @@ from routing_solve_torch import (
     solve_routing_complex as solve_torch,
     solve_routing_with_ringdown as solve_ringdown_torch,
     extract_param_series as extract_torch,
+    project_tensor_to_scalar_param,
     solve_param_routing as solve_param_torch,
     compute_latency_compensation as compute_latency_torch,
     synthesize_lfo_csig,
@@ -249,6 +250,49 @@ def test_solve_param_routing():
         diff = np.max(np.abs(r_np[key] - r_t[key].cpu().numpy()))
         assert diff < 1e-12, f"Param {key}: max diff = {diff}"
         print(f"  param '{key}': diff = {diff:.2e}")
+
+
+def test_project_tensor_to_scalar_param_preserves_time_axis():
+    x = torch.tensor(
+        [
+            [1.0 + 1.0j, 2.0 + 0.0j, 0.0 + 1.0j],
+            [3.0 + 4.0j, 0.0 + 2.0j, 2.0 + 0.0j],
+        ],
+        dtype=torch.complex128,
+    )
+    out = project_tensor_to_scalar_param(x, "magnitude_mean", time_dim=1)
+    expected = torch.tensor(
+        [
+            ((2.0 ** 0.5) + 5.0) / 2.0,
+            (2.0 + 2.0) / 2.0,
+            (1.0 + 2.0) / 2.0,
+        ],
+        dtype=torch.float64,
+    )
+    diff = (out - expected).abs().max().item()
+    assert diff < 1e-12, f"scalar projection over batch dims: max diff = {diff}"
+
+
+def test_solve_param_routing_uses_projection_policy_for_wide_tensor_inputs():
+    sig_t = {
+        "v1": torch.tensor(
+            [
+                [1.0 + 0.0j, 2.0 + 0.0j, 3.0 + 0.0j],
+                [3.0 + 0.0j, 5.0 + 0.0j, 7.0 + 0.0j],
+            ],
+            dtype=torch.complex128,
+        ),
+    }
+    param_edges = [
+        ParamEdge("v1", "p1", 1.0, "magnitude", projection_policy="real_mean"),
+    ]
+    param_defaults = {"p1": 0.0}
+    param_bounds = {"p1": (-10.0, 10.0)}
+
+    r_t = solve_param_torch(sig_t, param_edges, param_defaults, param_bounds)
+    expected = torch.tensor([2.0, 3.5, 5.0], dtype=torch.float64)
+    diff = (r_t["p1"] - expected).abs().max().item()
+    assert diff < 1e-12, f"wide param projection: max diff = {diff}"
 
 
 def test_lfo_sine():

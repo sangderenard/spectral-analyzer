@@ -51,7 +51,7 @@ from __future__ import annotations
 
 import math
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Dict, Optional
 
 import numpy as np
@@ -106,6 +106,99 @@ MIXER_LAYERS:  tuple = ("voice_router", "instrument", "master")
 
 
 @dataclass
+class TensorPortContract:
+    """Shape/transport contract for one published port.
+
+    All routing in this system is analytic-only.  Real/DC transport is not a
+    valid runtime signal family; control lanes remain complex128 analytic
+    tensors just like audio/signal lanes.
+    """
+    dtype: str = "complex128"
+    analytic_only: bool = True
+    tensor_rank: int = 1
+    lane_count: int = 1          # 0 = dynamic / negotiated
+    batch_axes: int = 1
+    parallel_group: str = ""
+    group_validity: str = "strict"   # "strict" | "broadcast" | "reduce"
+    semantic_role: str = ""          # score | performer_batch | room_feedback | ...
+    channel_dims: list = field(default_factory=list)  # per-channel tensor axes
+
+
+@dataclass
+class EdgeTransferSpec:
+    """Negotiation/lowering hints for wide tensor cables.
+
+    These fields are descriptive metadata for the unified torch compiler.
+    Existing scalar-style solvers can ignore them safely.
+    """
+    transfer_policy: str = "identity"    # identity | broadcast | gather | scatter | reduce | remap
+    cable_count: int = 1                 # number of parallel cables represented by this edge
+    batch_policy: str = "strict"         # strict | broadcast | reduce
+    lane_policy: str = "strict"          # strict | broadcast | reduce | remap
+    reduction: str = ""                  # sum | mean | max | ...
+    analytic_only: bool = True
+
+
+@dataclass
+class MetaEdge:
+    """Authored bidirectional channel edge between two bundle-capable ports.
+
+    MetaEdges model tightly coupled state-machine communication without forcing
+    the authoring UI to explode into separate explicit directed links.  They are
+    still graph objects and can later be lowered into directional tensor edges
+    for the torch compiler.
+    """
+    a_key: str = ""
+    b_key: str = ""
+    a_port: str = ""
+    b_port: str = ""
+    edge_kind: str = "meta"
+    semantic_role: str = ""
+    channel_count: int = 1         # 0 = dynamic / negotiated
+    delay_s: float = 0.0
+    tensor_contract: TensorPortContract = field(default_factory=TensorPortContract)
+    a_to_b_transfer: EdgeTransferSpec = field(default_factory=EdgeTransferSpec)
+    b_to_a_transfer: EdgeTransferSpec = field(default_factory=EdgeTransferSpec)
+
+    def to_dict(self) -> dict:
+        d = {
+            "a_key": self.a_key,
+            "b_key": self.b_key,
+            "a_port": self.a_port,
+            "b_port": self.b_port,
+            "channel_count": self.channel_count,
+            "delay": self.delay_s,
+        }
+        if self.edge_kind != "meta":
+            d["edge_kind"] = self.edge_kind
+        if self.semantic_role:
+            d["semantic_role"] = self.semantic_role
+        if asdict(self.tensor_contract) != asdict(TensorPortContract()):
+            d["tensor_contract"] = asdict(self.tensor_contract)
+        if asdict(self.a_to_b_transfer) != asdict(EdgeTransferSpec()):
+            d["a_to_b_transfer"] = asdict(self.a_to_b_transfer)
+        if asdict(self.b_to_a_transfer) != asdict(EdgeTransferSpec()):
+            d["b_to_a_transfer"] = asdict(self.b_to_a_transfer)
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "MetaEdge":
+        return cls(
+            a_key=str(d.get("a_key", "")),
+            b_key=str(d.get("b_key", "")),
+            a_port=str(d.get("a_port", "")),
+            b_port=str(d.get("b_port", "")),
+            edge_kind=str(d.get("edge_kind", "meta")),
+            semantic_role=str(d.get("semantic_role", "")),
+            channel_count=max(0, int(d.get("channel_count", 1))),
+            delay_s=float(d.get("delay", 0.0)),
+            tensor_contract=TensorPortContract(**dict(d.get("tensor_contract", {}))),
+            a_to_b_transfer=EdgeTransferSpec(**dict(d.get("a_to_b_transfer", {}))),
+            b_to_a_transfer=EdgeTransferSpec(**dict(d.get("b_to_a_transfer", {}))),
+        )
+
+
+@dataclass
 class RoutingEdge:
     """Directed edge: applies weight * exp(i*angle_rad) to src, optionally delayed.
 
@@ -135,6 +228,11 @@ class RoutingEdge:
     router_key:       str   = ""    # owning router instance key; empty = legacy
     saturation:       str   = ""    # "tanh" | "hardclip" | "softclip" | "" = none
     saturation_knee:  float = 1.0   # magnitude at which saturation engages
+    edge_kind:        str   = "signal"     # signal | control | param_bind
+    src_port:         str   = ""           # optional published-port id
+    dst_port:         str   = ""           # optional published-port id
+    tensor_contract:  TensorPortContract = field(default_factory=TensorPortContract)
+    transfer_spec:    EdgeTransferSpec   = field(default_factory=EdgeTransferSpec)
 
 
 @dataclass
@@ -167,6 +265,12 @@ class ParamEdge:
     extractor:     str   = "magnitude"
     delay_samples: int   = 0          # 0 = instantaneous (acyclic paths only)
     param_path:    str   = ""         # sub-parameter target within dst node
+    src_port:      str   = ""
+    dst_port:      str   = ""
+    edge_kind:     str   = "control"
+    projection_policy: str = "magnitude_mean"  # scalar receiver policy for non-complex destinations
+    tensor_contract: TensorPortContract = field(default_factory=TensorPortContract)
+    transfer_spec:   EdgeTransferSpec   = field(default_factory=EdgeTransferSpec)
 
     def __post_init__(self) -> None:
         if self.delay_samples < 0:
@@ -178,6 +282,18 @@ class ParamEdge:
                    "delay_samples": self.delay_samples}
         if self.param_path:
             d["param_path"] = self.param_path
+        if self.src_port:
+            d["src_port"] = self.src_port
+        if self.dst_port:
+            d["dst_port"] = self.dst_port
+        if self.edge_kind != "control":
+            d["edge_kind"] = self.edge_kind
+        if self.projection_policy != "magnitude_mean":
+            d["projection_policy"] = self.projection_policy
+        if asdict(self.tensor_contract) != asdict(TensorPortContract()):
+            d["tensor_contract"] = asdict(self.tensor_contract)
+        if asdict(self.transfer_spec) != asdict(EdgeTransferSpec()):
+            d["transfer_spec"] = asdict(self.transfer_spec)
         return d
 
     @classmethod
@@ -187,8 +303,14 @@ class ParamEdge:
             dst_key=str(d.get("dst", "")),
             weight=float(d.get("w", 1.0)),
             extractor=str(d.get("extractor", "magnitude")),
-            delay_samples=max(1, int(d.get("delay_samples", 1))),
+            delay_samples=max(0, int(d.get("delay_samples", 0))),
             param_path=str(d.get("param_path", "")),
+            src_port=str(d.get("src_port", "")),
+            dst_port=str(d.get("dst_port", "")),
+            edge_kind=str(d.get("edge_kind", "control")),
+            projection_policy=str(d.get("projection_policy", "magnitude_mean")),
+            tensor_contract=TensorPortContract(**dict(d.get("tensor_contract", {}))),
+            transfer_spec=EdgeTransferSpec(**dict(d.get("transfer_spec", {}))),
         )
 
 
@@ -231,6 +353,7 @@ class RoutingGraph:
     nodes:       list = field(default_factory=list)   # list[str] — ordered node keys
     edges:       list = field(default_factory=list)   # list[RoutingEdge]
     param_edges: list = field(default_factory=list)   # list[ParamEdge] — scalar extraction rules
+    meta_edges:  list = field(default_factory=list)   # list[MetaEdge] — authored bidirectional bundle links
     feedback: FeedbackConfig = field(default_factory=FeedbackConfig)
     # When True, source nodes are pre-synthesised starting before t=0 so that
     # after their routing delays their signal arrives at every destination on
@@ -453,6 +576,10 @@ class RoutingGraph:
             pe for pe in self.param_edges
             if pe.src_key in vk and pe.dst_key in vk
         ]
+        self.meta_edges = [
+            me for me in self.meta_edges
+            if me.a_key in vk and me.b_key in vk
+        ]
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -469,11 +596,22 @@ class RoutingGraph:
             if e.saturation:
                 d["saturation"] = e.saturation
                 d["saturation_knee"] = e.saturation_knee
+            if e.edge_kind != "signal":
+                d["edge_kind"] = e.edge_kind
+            if e.src_port:
+                d["src_port"] = e.src_port
+            if e.dst_port:
+                d["dst_port"] = e.dst_port
+            if asdict(e.tensor_contract) != asdict(TensorPortContract()):
+                d["tensor_contract"] = asdict(e.tensor_contract)
+            if asdict(e.transfer_spec) != asdict(EdgeTransferSpec()):
+                d["transfer_spec"] = asdict(e.transfer_spec)
             return d
         result: dict = {
             "nodes": list(self.nodes),
             "edges": [_edge_dict(e) for e in self.edges],
             "param_edges": [e.to_dict() for e in self.param_edges],
+            "meta_edges": [e.to_dict() for e in self.meta_edges],
             "feedback": {
                 "enabled":            self.feedback.enabled,
                 "delay_s":            self.feedback.delay_s,
@@ -505,6 +643,7 @@ class RoutingGraph:
         g = cls()
         g.nodes = list(d.get("nodes", []))
         g.param_edges = [ParamEdge.from_dict(pe) for pe in d.get("param_edges", [])]
+        g.meta_edges = [MetaEdge.from_dict(me) for me in d.get("meta_edges", [])]
         for ed in d.get("edges", []):
             g.edges.append(RoutingEdge(
                 src_key=str(ed.get("src", "")),
@@ -516,6 +655,11 @@ class RoutingGraph:
                 router_key=str(ed.get("router_key", "")),
                 saturation=str(ed.get("saturation", "")),
                 saturation_knee=float(ed.get("saturation_knee", 1.0)),
+                edge_kind=str(ed.get("edge_kind", "signal")),
+                src_port=str(ed.get("src_port", "")),
+                dst_port=str(ed.get("dst_port", "")),
+                tensor_contract=TensorPortContract(**dict(ed.get("tensor_contract", {}))),
+                transfer_spec=EdgeTransferSpec(**dict(ed.get("transfer_spec", {}))),
             ))
         # node_types (new) — fall back to legacy node_layers
         raw_types = d.get("node_types") or d.get("node_layers", {})
@@ -541,6 +685,49 @@ class RoutingGraph:
         )
         g.latency_compensation = bool(d.get("latency_compensation", False))
         return g
+
+
+# ---------------------------------------------------------------------------
+# RouterInstance — a typed, named routing graph deployment
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RouterInstance:
+    """A deployed router: one RoutingGraph owned by one router type.
+
+    The *router_type* determines what kinds of nodes and edges belong here
+    (from MIXER_LAYERS: "voice_router", "instrument", "master").
+
+    Multiple RouterInstance objects may coexist on a patch — one per mixer
+    the user has deployed.  Each owns its edges exclusively via router_key.
+
+    Serialisation
+    -------------
+    to_dict() / from_dict() give a JSON-compatible round-trip.
+    Legacy patches without a "routers" key load via AnalyticPatch which
+    wraps the existing "routing" graph as the default voice_router.
+    """
+    key:         str          = ""
+    router_type: str          = "voice_router"   # one of MIXER_LAYERS
+    label:       str          = ""
+    graph:       RoutingGraph = field(default_factory=RoutingGraph)
+
+    def to_dict(self) -> dict:
+        return {
+            "key":         self.key,
+            "router_type": self.router_type,
+            "label":       self.label,
+            "graph":       self.graph.to_dict(),
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RouterInstance":
+        return cls(
+            key=str(d.get("key", "")),
+            router_type=str(d.get("router_type", "voice_router")),
+            label=str(d.get("label", "")),
+            graph=RoutingGraph.from_dict(d.get("graph", {})),
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -887,6 +887,7 @@ class TensorEdge:
     dst_port_set: str = ""
     src_port: str = ""
     dst_port: str = ""
+    counts_for_occupancy: bool = True
     contract_key: str = ""
     contract_semantic_role: str = ""
     src_mask: Tensor | complex | float | int = 1.0 + 0.0j
@@ -1257,6 +1258,7 @@ class SCCSpec:
     node_indices: list[int]
     node_keys: list[str]
     is_linear: bool
+    is_cyclic: bool = False
     natural_rate_hz: float = 0.0
 
 
@@ -1578,6 +1580,7 @@ class GraphSolver(nn.Module):
                 e.dst_port_set,
                 e.src_port,
                 e.dst_port,
+                e.counts_for_occupancy,
                 e.contract_key,
                 e.contract_semantic_role,
                 _canonical_complex(e.src_mask).to(device),
@@ -1619,11 +1622,17 @@ class GraphSolver(nn.Module):
         self.meta_edges = [edge for edge in self.edges if edge.activity_contract or edge.src_addresses or edge.dst_addresses]
         self.network_links = tuple(self.edges)
         raw_sccs = _tarjan_sccs(self.node_keys, self.edges, self.sample_rate)
+        zero_delay_edges = [edge for edge in self.edges if edge.delay_steps(self.sample_rate) == 0]
         node_to_scc: dict[int, int] = {}
         sccs: list[SCCSpec] = []
         for scc_id, raw in enumerate(reversed(raw_sccs)):
             keys = [self.node_keys[i] for i in raw]
             is_linear = all(self.node_map[key].transform is None for key in keys)
+            key_set = set(keys)
+            is_cyclic = len(keys) > 1 or any(
+                edge.src_key in key_set and edge.dst_key in key_set
+                for edge in zero_delay_edges
+            )
             natural_rate_hz = max(float(self.node_map[key].natural_rate_hz) for key in keys)
             for ni in raw:
                 node_to_scc[ni] = scc_id
@@ -1632,6 +1641,7 @@ class GraphSolver(nn.Module):
                 node_indices=list(raw),
                 node_keys=keys,
                 is_linear=is_linear,
+                is_cyclic=is_cyclic,
                 natural_rate_hz=natural_rate_hz,
             ))
         tier = 1 if all(scc.is_linear for scc in sccs) else (3 if len(sccs) == 1 else 2)
@@ -1656,13 +1666,11 @@ class GraphSolver(nn.Module):
                 if edge.src_key in scc.node_keys or edge.dst_key in scc.node_keys
             ) or linked_to_patch:
                 self.control_feedback_sccs.append(scc)
-            elif any(self.node_map[key].layer_presence.parameter_inputs or self.node_map[key].layer_presence.parameter_outputs for key in scc.node_keys):
-                self.control_feedback_sccs.append(scc)
             elif not assigned and scc not in self.control_feedback_sccs:
                 self.control_feedback_sccs.append(scc)
 
         self._first_tick: bool = True
-        self.zero_delay_edges = [edge for edge in self.edges if edge.delay_steps(self.sample_rate) == 0]
+        self.zero_delay_edges = zero_delay_edges
         self.delayed_edges_by_steps: dict[int, list[TensorEdge]] = {}
         for edge in self.edges:
             d = edge.delay_steps(self.sample_rate)
@@ -1671,7 +1679,7 @@ class GraphSolver(nn.Module):
 
         self.cyclic_blocks = nn.ModuleDict()
         for scc in self.condensed.sccs:
-            if scc.is_linear:
+            if scc.is_linear or not scc.is_cyclic:
                 continue
             internal_edges = [
                 edge for edge in self.zero_delay_edges
@@ -1842,6 +1850,13 @@ class GraphSolver(nn.Module):
             if str(scc.scc_id) in self.cyclic_blocks:
                 with _T.span(f"solver.scc.cyclic.{node_tag}"):
                     solved = self.cyclic_blocks[str(scc.scc_id)].step(local_src)
+            elif len(scc.node_keys) == 1 and not scc.is_linear:
+                key = scc.node_keys[0]
+                node = self.node_map[key]
+                acc = local_src.get(key, torch.zeros((), dtype=_CDTYPE, device=self.device))
+                with _T.span(f"solver.scc.direct.{node_tag}"):
+                    mapped = _canonical_complex(node.transform(acc) if node.transform is not None else acc).to(self.device)
+                solved = {key: mapped}
             else:
                 with _T.span(f"solver.scc.linear.{node_tag}"):
                     solved = self._solve_linear_region(scc.node_keys, local_src)

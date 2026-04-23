@@ -55,17 +55,31 @@ from OpenGL.GL import (
     GL_LINE_LOOP, GL_LINE_STRIP, GL_LINES, GL_NEAREST, GL_ONE_MINUS_SRC_ALPHA,
     GL_QUADS, GL_RGBA, GL_SRC_ALPHA, GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
     GL_TEXTURE_MIN_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
-    GL_TRIANGLES, GL_UNSIGNED_BYTE,
+    GL_TRIANGLES, GL_UNSIGNED_BYTE, GL_MODELVIEW, GL_PROJECTION, GL_SCISSOR_TEST,
     glBegin, glBindTexture, glBlendFunc, glClear, glClearColor,
     glColor4f, glDeleteTextures, glDisable, glEnable, glEnd,
     glGenTextures, glLineWidth, glTexCoord2f, glTexImage2D,
-    glTexParameteri, glVertex2f, glViewport,
+    glLoadIdentity, glMatrixMode, glOrtho, glScissor, glTexParameteri, glVertex2f, glViewport,
 )
 
 from plot_widget import PlotWidget, PlotSeries, PlotMarker
 from bass_viewer import (GlyphAtlas, Panel, PanelDock,
-                         ScrollableSubpanelList, ModularSubpanelSpec, SubpanelAddOption)
+                         ScrollableSubpanelList, ModularSubpanelSpec, SubpanelAddOption,
+                         FilterBankDecomposition)
 import complex_phase_vocoder as cpv
+from analysis_itinerary import AnalysisInventory
+from parametric_curve import (
+    ParametricCurve,
+    EnvelopeRuleTree,
+    ParametricCurveEngine,
+    default_blank as _pc_default_blank,
+    default_chirp as _pc_default_chirp,
+    default_envelope as _pc_default_envelope,
+    render_piecewise_audio,
+    normalize_channel_complex_signals as _norm_ch_sigs,
+    GateEvent,
+)
+from parametric_curve_editor import ParametricCurveEditor, _TextOverlay
 
 try:
     from signal_generator_v2 import KnobSpec
@@ -90,8 +104,6 @@ try:
         ArpeggioRule, NoteEvent, NoteSchedule,
         scale_degrees_hz, semitones_to_hz,
         adsr_envelope_factory,
-        spline_envelope_factory,
-        monotone_envelope_factory,
         piecewise_envelope_factory,
         SequenceProbabilities,
         NoteStream,
@@ -355,6 +367,43 @@ class ModRouting:
 
 
 @dataclass
+class PiecewiseVoiceEnvelope:
+    curve: ParametricCurve = field(default_factory=lambda: _pc_default_envelope("voice_piecewise_amp"))
+    chirp_curve: ParametricCurve = field(default_factory=lambda: _pc_default_chirp("voice_piecewise_chirp"))
+    signal_curve: ParametricCurve = field(default_factory=lambda: _pc_default_blank("voice_piecewise_signal"))
+    rule_tree: EnvelopeRuleTree = field(default_factory=EnvelopeRuleTree.default)
+    source_path: str = ""
+    detected_envelope_path: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "curve": self.curve.to_dict(),
+            "chirp_curve": self.chirp_curve.to_dict(),
+            "signal_curve": self.signal_curve.to_dict(),
+            "rule_tree": self.rule_tree.to_dict(),
+            "source_path": self.source_path,
+            "detected_envelope_path": self.detected_envelope_path,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict | None) -> "PiecewiseVoiceEnvelope | None":
+        if not d:
+            return None
+        curve = ParametricCurve.from_dict(dict(d.get("curve", {}))) if d.get("curve") else _pc_default_envelope("voice_piecewise_amp")
+        chirp_curve = ParametricCurve.from_dict(dict(d.get("chirp_curve", {}))) if d.get("chirp_curve") else _pc_default_chirp("voice_piecewise_chirp")
+        signal_curve = ParametricCurve.from_dict(dict(d.get("signal_curve", {}))) if d.get("signal_curve") else _pc_default_blank("voice_piecewise_signal")
+        rule_tree = EnvelopeRuleTree.from_dict(dict(d.get("rule_tree", {}))) if d.get("rule_tree") else EnvelopeRuleTree.default()
+        return cls(
+            curve=curve,
+            chirp_curve=chirp_curve,
+            signal_curve=signal_curve,
+            rule_tree=rule_tree,
+            source_path=str(d.get("source_path", "") or ""),
+            detected_envelope_path=str(d.get("detected_envelope_path", "") or ""),
+        )
+
+
+@dataclass
 class AnalyticVoice:
     key:          str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
     label:        str   = "Voice"
@@ -366,11 +415,12 @@ class AnalyticVoice:
     chirp:  ChirpSpec  = field(default_factory=ChirpSpec)
     fm:     Optional[ModRouting] = None
     am:     Optional[ModRouting] = None
-    env_type: str = "adsr"         # "adsr" | "spline" | "monotone" | "linear"
+    env_type: str = "piecewise"
     adsr:     ADSRParams = field(default_factory=ADSRParams)
     env_knots: list[list[float]] = field(default_factory=lambda: [
         [0.0, 0.0], [0.01, 1.0], [0.1, 0.75], [0.85, 0.75], [1.0, 0.0]
     ])
+    piecewise_env: Optional[PiecewiseVoiceEnvelope] = None
     loop_start:   float = 0.1
     loop_end:     float = 0.9
     loop_enabled: bool  = False
@@ -393,6 +443,8 @@ class AnalyticVoice:
     def active_knots(self) -> list[list[float]]:
         if self.env_type == "adsr":
             return self.adsr.to_knots(1.0)
+        if self.piecewise_env is not None:
+            return [[float(p.t), float(p.v)] for p in self.piecewise_env.curve.points]
         return self.env_knots
 
     def to_dict(self) -> dict:
@@ -416,11 +468,12 @@ class AnalyticVoice:
             "am": ({"source_key": self.am.source_key,
                     "depth_hz":   self.am.depth_hz,
                     "depth_amp":  self.am.depth_amp} if self.am else None),
-            "env_type": self.env_type,
+            "env_type": "piecewise",
             "adsr": {"attack": self.adsr.attack, "decay": self.adsr.decay,
                      "sustain": self.adsr.sustain, "release": self.adsr.release,
                      "peak": self.adsr.peak},
             "env_knots": self.env_knots,
+            "piecewise_env": self.piecewise_env.to_dict() if self.piecewise_env is not None else None,
             "loop_start": self.loop_start, "loop_end": self.loop_end,
             "loop_enabled": self.loop_enabled, "muted": self.muted,
             "color": self.color,
@@ -444,7 +497,6 @@ class AnalyticVoice:
     @classmethod
     def knobs(cls) -> list[KnobSpec]:
         _ROLES    = ["signal", "air", "transient", "body"]
-        _ENV      = ["adsr", "spline", "monotone", "linear"]
         _MANIFOLD = ["pure", "harmonic", "harmonic_warp"]
         _POLY_MODES = ["sympathetic", "unsympathetic"]
         _BODY_TYPES = ["direct", "string_plate", "reed_box", "brass_bell", "drum_shell", "pipe_column", "voice_body"]
@@ -467,13 +519,6 @@ class AnalyticVoice:
                      _POLY_MODES, False, "Oscillator"),
             KnobSpec("body_type",       "Body",       "choice", "direct", 0, max(0, len(_BODY_TYPES) - 1), 1, "",
                      _BODY_TYPES, False, "Oscillator"),
-            # Envelope
-            KnobSpec("env_type",     "Env type",   "choice", "adsr", 0, 3,   1, "",   _ENV,   False, "Envelope",   ".0f", "", True),
-            KnobSpec("adsr.attack",  "Attack",     "float",  0.005, 0.001, 2.0,  0, "s", [], True,  "Envelope", ".4f", "ADSREnvelope", False, ("env_type", "adsr")),
-            KnobSpec("adsr.decay",   "Decay",      "float",  0.04,  0.001, 2.0,  0, "s", [], True,  "Envelope", ".4f", "ADSREnvelope", False, ("env_type", "adsr")),
-            KnobSpec("adsr.sustain", "Sustain",    "float",  0.75,  0.0,   1.0,  0, "",  [], False, "Envelope", ".3f", "ADSREnvelope", False, ("env_type", "adsr")),
-            KnobSpec("adsr.release", "Release",    "float",  0.08,  0.001, 4.0,  0, "s", [], True,  "Envelope", ".4f", "ADSREnvelope", False, ("env_type", "adsr")),
-            KnobSpec("adsr.peak",    "Peak",       "float",  1.0,   0.0,   2.0,  0, "",  [], False, "Envelope", ".3f", "ADSREnvelope", False, ("env_type", "adsr")),
             # Chirp — delegate to ChirpSpec's own knob list with path prefix
             KnobSpec("chirp.chirp_type",    "Chirp type", "choice", "none", 0, 3, 1, "", ["none","linear","exponential","power"], False, "Chirp", ".0f", "", True),
             KnobSpec("chirp.f_delta_start", "\u0394f start",   "float",  0.0, -5000.0, 5000.0, 0, "Hz", [], False, "Chirp", ".1f", "LinearChirpPhasePath"),
@@ -547,7 +592,7 @@ class AnalyticVoice:
         p.fm = ModRouting(**fd) if fd else None
         ad = d.get("am")
         p.am = ModRouting(**ad) if ad else None
-        p.env_type    = d.get("env_type", "adsr")
+        p.env_type    = "piecewise"
         ad2 = d.get("adsr", {})
         p.adsr = ADSRParams(
             attack=float(ad2.get("attack",  0.005)),
@@ -557,6 +602,7 @@ class AnalyticVoice:
             peak=float(ad2.get("peak", 1.0)),
         )
         p.env_knots    = d.get("env_knots", [[0,0],[0.01,1],[0.1,.75],[.85,.75],[1,0]])
+        p.piecewise_env = PiecewiseVoiceEnvelope.from_dict(d.get("piecewise_env"))
         p.loop_start   = float(d.get("loop_start", 0.1))
         p.loop_end     = float(d.get("loop_end",   0.9))
         p.loop_enabled = bool(d.get("loop_enabled", False))
@@ -586,7 +632,6 @@ class AnalyticVoice:
         # default rather than loading a typo that would synthesize silence.
         _VALID_EMISSION_MODES  = {"single", "granular"}
         _VALID_MANIFOLD_TYPES  = {"pure", "harmonic", "harmonic_warp"}
-        _VALID_ENV_TYPES       = {"adsr", "custom", "none", "spline", "monotone", "linear"}
         if p.emission_mode not in _VALID_EMISSION_MODES:
             import warnings
             warnings.warn(
@@ -599,12 +644,8 @@ class AnalyticVoice:
                 f"AnalyticVoice.from_dict: unknown manifold_type {p.manifold_type!r}; "
                 f"defaulting to 'pure'.", stacklevel=2)
             p.manifold_type = "pure"
-        if p.env_type not in _VALID_ENV_TYPES:
-            import warnings
-            warnings.warn(
-                f"AnalyticVoice.from_dict: unknown env_type {p.env_type!r}; "
-                f"defaulting to 'adsr'.", stacklevel=2)
-            p.env_type = "adsr"
+        if p.piecewise_env is None:
+            p.piecewise_env = PiecewiseVoiceEnvelope()
         raw_gran              = d.get("granular")
         if raw_gran and _HAS_GRANULAR:
             try:
@@ -4364,6 +4405,7 @@ class AnalyticPatch:
 class EditorMode(Enum):
     WAVEFORM      = auto()
     ENVELOPE      = auto()
+    PIECEWISE_EDITOR = auto()
     CHIRP         = auto()
     COMPLEX_RI    = auto()   # real and imaginary components
     COMPLEX_MP    = auto()   # magnitude and phase
@@ -4490,25 +4532,242 @@ def _lfo_signal(lfo: LFODefinition, t: np.ndarray) -> np.ndarray:
 
 
 def _compute_envelope(voice: AnalyticVoice, n: int, duration: float) -> np.ndarray:
+    if voice.piecewise_env is not None:
+        t_ax = torch.linspace(0.0, 1.0, n, dtype=torch.float64)
+        vals = voice.piecewise_env.curve.evaluate_normalized(t_ax).abs().to(torch.float64)
+        return vals.detach().cpu().numpy().astype(np.float64, copy=False)
     knots = voice.active_knots()
     ts = np.array([k[0] * duration for k in knots], dtype=np.float64)
     vs = np.array([k[1]            for k in knots], dtype=np.float64)
     t_ax = np.linspace(0.0, duration, n, endpoint=False, dtype=np.float64)
-    etype = getattr(voice, "env_type", "adsr")
-    if etype == "spline" and len(knots) >= 4:
-        try:
-            from scipy.interpolate import CubicSpline
-            return np.clip(CubicSpline(ts, vs, bc_type="clamped")(t_ax), 0.0, None)
-        except Exception:
-            pass
-    elif etype == "monotone" and len(knots) >= 2:
-        try:
-            from scipy.interpolate import PchipInterpolator
-            return np.clip(PchipInterpolator(ts, vs)(t_ax), 0.0, None)
-        except Exception:
-            pass
-    # "adsr" and "linear" (and fallback)
     return np.interp(t_ax, ts, vs)
+
+
+def _compute_chirp_deviation_series(
+    voice: AnalyticVoice,
+    n: int,
+    duration: float,
+    *,
+    t_axis_s: "np.ndarray | None" = None,
+) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    if t_axis_s is None:
+        t_axis_s = np.linspace(0.0, duration, n, endpoint=False, dtype=np.float64)
+    else:
+        t_axis_s = np.asarray(t_axis_s, dtype=np.float64)
+    piecewise = getattr(voice, "piecewise_env", None)
+    piecewise_chirp = getattr(piecewise, "chirp_curve", None) if piecewise is not None else None
+    piecewise_delta = np.zeros(len(t_axis_s), dtype=np.float64)
+    if piecewise_chirp is not None:
+        if duration > 0.0:
+            t_norm = np.clip(np.maximum(t_axis_s, 0.0) / duration, 0.0, 1.0)
+        else:
+            t_norm = np.zeros(len(t_axis_s), dtype=np.float64)
+        t_tensor = torch.as_tensor(t_norm, dtype=torch.float64)
+        piecewise_raw = piecewise_chirp.evaluate_normalized(t_tensor).real.clamp(0.0, 1.0)
+        piecewise_delta = (
+            piecewise_chirp.to_physical(piecewise_raw)
+            .detach()
+            .cpu()
+            .numpy()
+            .astype(np.float64, copy=False)
+        )
+    return piecewise_delta + _compute_knob_chirp_deviation_series(
+        voice,
+        n,
+        duration,
+        t_axis_s=t_axis_s,
+    )
+
+
+def _compute_knob_chirp_deviation_series(
+    voice: AnalyticVoice,
+    n: int,
+    duration: float,
+    *,
+    t_axis_s: "np.ndarray | None" = None,
+) -> np.ndarray:
+    if n <= 0:
+        return np.zeros(0, dtype=np.float64)
+    if t_axis_s is None:
+        t_axis_s = np.linspace(0.0, duration, n, endpoint=False, dtype=np.float64)
+    else:
+        t_axis_s = np.asarray(t_axis_s, dtype=np.float64)
+    chirp = getattr(voice, "chirp", None)
+    if chirp is None:
+        return np.zeros(len(t_axis_s), dtype=np.float64)
+    ct = str(getattr(chirp, "chirp_type", "none") or "none")
+    if ct == "linear":
+        if len(t_axis_s) == 1:
+            return np.array([float(getattr(chirp, "f_delta_start", 0.0))], dtype=np.float64)
+        return np.linspace(
+            float(getattr(chirp, "f_delta_start", 0.0)),
+            float(getattr(chirp, "f_delta_end", 0.0)),
+            len(t_axis_s),
+            dtype=np.float64,
+        )
+    if ct == "exponential":
+        tau = max(float(getattr(chirp, "tau", 0.5)), 1e-9)
+        dec = np.exp(-np.maximum(t_axis_s, 0.0) / tau)
+        return (
+            float(getattr(chirp, "f_delta_start", 0.0)) * dec
+            + float(getattr(chirp, "f_delta_end", 0.0)) * (1.0 - dec)
+        ).astype(np.float64, copy=False)
+    if ct == "power" and duration > 0.0:
+        tau_n = (np.maximum(t_axis_s, 0.0) / duration) ** max(float(getattr(chirp, "chirp_power", 1.0)), 1e-3)
+        return (
+            float(getattr(chirp, "f_delta_start", 0.0)) * (1.0 - tau_n)
+            + float(getattr(chirp, "f_delta_end", 0.0)) * tau_n
+        ).astype(np.float64, copy=False)
+    return np.zeros(len(t_axis_s), dtype=np.float64)
+
+
+def _compute_chirp_frequency_series(voice: AnalyticVoice, n: int, duration: float) -> np.ndarray:
+    return float(voice.freq_hz) + _compute_chirp_deviation_series(voice, n, duration)
+
+
+def _sample_curve_from_series(
+    values: np.ndarray,
+    *,
+    name: str,
+    v_lo: float = 0.0,
+    v_hi: float = 1.0,
+    n_points: int = 24,
+) -> ParametricCurve:
+    arr = np.asarray(values, dtype=np.float64).reshape(-1)
+    if arr.size == 0:
+        return _pc_default_blank(name)
+    if arr.size == 1:
+        arr = np.repeat(arr, 2)
+    lo = float(np.min(arr))
+    hi = float(np.max(arr))
+    if hi - lo <= 1e-12:
+        norm = np.zeros_like(arr)
+    else:
+        norm = (arr - lo) / (hi - lo)
+    curve = ParametricCurve(name=name, v_lo=v_lo, v_hi=v_hi)
+    idxs = np.linspace(0, arr.size - 1, max(2, n_points), dtype=int)
+    seen: set[int] = set()
+    for idx in idxs.tolist():
+        if idx in seen:
+            continue
+        seen.add(idx)
+        t = 0.0 if arr.size <= 1 else float(idx) / float(arr.size - 1)
+        curve.add_point(t, float(np.clip(norm[idx], 0.0, 1.0)))
+    return curve
+
+
+def _load_detected_piecewise_envelope(path: str) -> PiecewiseVoiceEnvelope | None:
+    path = os.path.abspath(path)
+    if not os.path.isfile(path):
+        return None
+    lower = path.lower()
+    try:
+        if lower.endswith(".json"):
+            with open(path, "r", encoding="utf-8") as fh:
+                raw = json.load(fh)
+            if isinstance(raw, dict) and raw.get("curve"):
+                pw = PiecewiseVoiceEnvelope.from_dict(raw)
+                if pw is not None:
+                    pw.source_path = path
+                    pw.detected_envelope_path = path
+                    return pw
+            if isinstance(raw, dict) and "curve" in raw and "rule_tree" in raw:
+                curve = ParametricCurve.from_dict(dict(raw.get("curve", {})))
+                chirp_curve = ParametricCurve.from_dict(dict(raw.get("chirp", {}))) if raw.get("chirp") else _pc_default_chirp(f"{curve.name}_chirp")
+                rule_tree = EnvelopeRuleTree.from_dict(dict(raw.get("rule_tree", {}))) if raw.get("rule_tree") else EnvelopeRuleTree.default()
+                return PiecewiseVoiceEnvelope(
+                    curve=curve,
+                    chirp_curve=chirp_curve,
+                    signal_curve=_pc_default_blank(f"{curve.name}_signal"),
+                    rule_tree=rule_tree,
+                    source_path=path,
+                    detected_envelope_path=path,
+                )
+            curve = ParametricCurve.from_dict(raw)
+            return PiecewiseVoiceEnvelope(
+                curve=curve,
+                chirp_curve=_pc_default_chirp(f"{curve.name}_chirp"),
+                signal_curve=_pc_default_blank(f"{curve.name}_signal"),
+                rule_tree=EnvelopeRuleTree.default(),
+                source_path=path,
+                detected_envelope_path=path,
+            )
+        if lower.endswith(".npz"):
+            analysis_dir = os.path.dirname(os.path.dirname(path)) if os.path.basename(path).startswith("fb_envelopes") else os.path.dirname(path)
+            loaded = FilterBankDecomposition.load_envelopes(analysis_dir)
+            if not loaded:
+                return None
+            mags, phases, _hops = loaded
+            mag_stack = [np.asarray(m, dtype=np.float64).reshape(-1) for m in mags if m is not None]
+            if not mag_stack:
+                return None
+            width = max(len(m) for m in mag_stack)
+            t_dst = np.linspace(0.0, 1.0, width, endpoint=True, dtype=np.float64)
+            resampled_mag = []
+            for mag in mag_stack:
+                t_src = np.linspace(0.0, 1.0, len(mag), endpoint=True, dtype=np.float64)
+                resampled_mag.append(np.interp(t_dst, t_src, mag))
+            avg_mag = np.mean(np.stack(resampled_mag, axis=0), axis=0)
+            amp_curve = _sample_curve_from_series(avg_mag, name=os.path.splitext(os.path.basename(path))[0], n_points=32)
+            chirp_curve = _pc_default_chirp(f"{amp_curve.name}_chirp")
+            phase_stack = [np.asarray(p, dtype=np.float64).reshape(-1) for p in phases if p is not None]
+            if phase_stack:
+                resampled_phase = []
+                for phase in phase_stack:
+                    t_src = np.linspace(0.0, 1.0, len(phase), endpoint=True, dtype=np.float64)
+                    resampled_phase.append(np.interp(t_dst, t_src, phase))
+                avg_phase = np.mean(np.stack(resampled_phase, axis=0), axis=0)
+                phase_delta = np.diff(np.unwrap(avg_phase), prepend=avg_phase[:1])
+                chirp_curve = _sample_curve_from_series(phase_delta, name=f"{amp_curve.name}_chirp", v_lo=-200.0, v_hi=200.0, n_points=24)
+            return PiecewiseVoiceEnvelope(
+                curve=amp_curve,
+                chirp_curve=chirp_curve,
+                signal_curve=_pc_default_blank(f"{amp_curve.name}_signal"),
+                rule_tree=EnvelopeRuleTree.default(),
+                source_path=path,
+                detected_envelope_path=path,
+            )
+    except Exception:
+        return None
+    return None
+
+
+def _detected_envelope_artifact_paths(root_dir: str) -> list[str]:
+    root_dir = os.path.abspath(root_dir)
+    found: list[str] = []
+    seen: set[str] = set()
+    for cur_root, _dirs, files in os.walk(root_dir):
+        if len(found) >= 64:
+            break
+        if "analysis_inventory.json" in files:
+            inv_path = os.path.join(cur_root, "analysis_inventory.json")
+            try:
+                with open(inv_path, "r", encoding="utf-8") as fh:
+                    inv = AnalysisInventory.from_dict(json.load(fh))
+                for ds in inv.datasets:
+                    for art in ds.artifacts:
+                        if art.kind != "envelopes":
+                            continue
+                        art_path = art.path
+                        if not os.path.isabs(art_path):
+                            art_path = os.path.join(cur_root, art_path)
+                        art_path = os.path.abspath(art_path)
+                        if art_path not in seen and os.path.isfile(art_path):
+                            seen.add(art_path)
+                            found.append(art_path)
+            except Exception:
+                pass
+        for fn in files:
+            if not (fn.endswith(".json") or fn.endswith(".npz")):
+                continue
+            if fn.startswith("fb_envelopes") or fn.endswith("_envelope.json") or "piecewise" in fn.lower():
+                fp = os.path.abspath(os.path.join(cur_root, fn))
+                if fp not in seen:
+                    seen.add(fp)
+                    found.append(fp)
+    return sorted(found)
 
 
 def _inst_freq_from_csig(csig: np.ndarray, sr: float) -> np.ndarray:
@@ -6585,6 +6844,58 @@ def _synthesize_voice(
     dur = patch.duration
     n   = n_samples if n_samples > 0 else int(sr * dur)
 
+    if voice.piecewise_env is not None:
+        po = param_overrides or {}
+        freq_hz = float(np.mean(po["freq_hz"][:n])) if "freq_hz" in po and len(po["freq_hz"]) >= n else float(voice.freq_hz)
+        gain = float(np.mean(po["amplitude"][:n])) if "amplitude" in po and len(po["amplitude"]) >= n else float(voice.amplitude)
+        gate_history = [GateEvent(t_on=0.0, t_off=float(dur), velocity=1.0)]
+        env_engine = ParametricCurveEngine(
+            voice.piecewise_env.curve,
+            voice.piecewise_env.rule_tree,
+            chirp_curve=voice.piecewise_env.chirp_curve,
+            max_cache=8,
+        )
+        chirp_engine = ParametricCurveEngine(
+            voice.piecewise_env.chirp_curve,
+            voice.piecewise_env.rule_tree,
+            max_cache=8,
+        )
+        env_fn = env_engine.interpret(gate_history, force_rebuild=True)
+        chirp_fn = chirp_engine.interpret(gate_history, force_rebuild=True)
+        def _base_piecewise_chirp(t_abs: "torch.Tensor | np.ndarray | Any") -> np.ndarray:
+            if isinstance(t_abs, torch.Tensor):
+                t_np = t_abs.detach().cpu().numpy().astype(np.float64, copy=False)
+            else:
+                t_np = np.asarray(t_abs, dtype=np.float64)
+            return _compute_chirp_deviation_series(voice, len(t_np), float(dur), t_axis_s=t_np)
+        audio, _amp_env, _chirp_env, _osc = render_piecewise_audio(
+            env_fn=env_fn,
+            chirp_fn=chirp_fn,
+            gate_history=gate_history,
+            amp_curve=voice.piecewise_env.curve,
+            chirp_curve=voice.piecewise_env.chirp_curve,
+            freq_hz=freq_hz,
+            gain=gain,
+            dur=float(dur),
+            sr=int(sr),
+            oversample=4,
+            base_chirp_hz=_base_piecewise_chirp,
+        )
+        if audio is None:
+            raise RuntimeError(
+                f"render_piecewise_audio returned None for voice {voice.key!r}; "
+                "check piecewise_env curve and chirp_curve definitions."
+            )
+        result = np.asarray(audio, dtype=np.complex128).reshape(-1)
+        if voice.pre_delay > 0.0:
+            silence_n = min(len(result), int(round(voice.pre_delay * float(sr))))
+            result[:silence_n] = 0.0
+        if len(result) >= n:
+            return result[:n]
+        out = np.zeros(n, dtype=np.complex128)
+        out[:len(result)] = result
+        return out
+
     # --- Granular emission branch ---
     if voice.emission_mode == "granular" and _HAS_GRANULAR:
         gspec = _ensure_granular(voice)
@@ -6640,7 +6951,6 @@ def _synthesize_voice(
             out = np.zeros(n, dtype=np.complex128)
             out[:len(result)] = result
             return out
-    import torch
     # t axis: starts at t_offset (negative for pre-roll), advances at 1/sr per sample
     t = (torch.arange(n, dtype=torch.float64) / sr) + t_offset
 
@@ -6738,26 +7048,7 @@ def _synthesize_voice(
             mod = torch.zeros(n, dtype=torch.float64)
         amp = amp * (1.0 + voice.am.depth_amp * mod)
 
-    knots = voice.active_knots()
-    ts = torch.tensor([k[0] * dur for k in knots], dtype=torch.float64)
-    vs = torch.tensor([k[1]       for k in knots], dtype=torch.float64)
-    t_ax = torch.linspace(0.0, dur, n, dtype=torch.float64)
-    # Catmull-Rom spline: duplicate endpoints so every segment has 4 neighbours
-    vp = torch.cat([vs[:1], vs, vs[-1:]])  # padded values
-    tp = torch.cat([ts[:1], ts, ts[-1:]])  # padded times
-    idx = torch.searchsorted(ts.contiguous(), t_ax.contiguous(), right=True).clamp(1, len(ts) - 1)
-    # segment neighbours in padded arrays (idx+1 because of leading pad)
-    i1 = idx; i0 = i1 - 1; i2 = i1 + 1; i3 = i1 + 2
-    p0 = vp[i0]; p1 = vp[i1]; p2 = vp[i2]; p3 = vp[i3]
-    seg_len = (tp[i1] - tp[i0]).clamp(min=1e-12)
-    u = (t_ax - tp[i0]) / seg_len
-    env_curve = torch.clamp(
-        0.5 * ((2.0 * p1)
-               + (-p0 + p2) * u
-               + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * u * u
-               + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * u * u * u),
-        min=0.0)
-    env = amp * env_curve
+    env = amp
 
     # --- manifold synthesis ---
     mt = voice.manifold_type
@@ -7213,6 +7504,7 @@ def _working_routing_graph_for_synthesis(patch: "AnalyticPatch") -> RoutingGraph
     if not g.edges:
         g.ensure_defaults(auto_signal_keys, mix_key=default_mix_key)
     _sanitize_system_io_edges(g, patch)
+    g.prune()
     return g
 
 
@@ -9317,11 +9609,11 @@ class RoutingGridView:
 class EditorCanvas:
     """Manages the center waveform / envelope / chirp editor."""
 
-    MODES = [EditorMode.WAVEFORM, EditorMode.ENVELOPE, EditorMode.CHIRP,
+    MODES = [EditorMode.WAVEFORM, EditorMode.ENVELOPE, EditorMode.PIECEWISE_EDITOR, EditorMode.CHIRP,
              EditorMode.COMPLEX_RI, EditorMode.COMPLEX_MP,
              EditorMode.HARMONICS, EditorMode.LFO_VIEW, EditorMode.FM_VIEW,
              EditorMode.MIX, EditorMode.ROUTING]
-    MODE_LABELS = ["Wave", "Envelope", "Chirp", "Re/Im", "Mag/Phase",
+    MODE_LABELS = ["Wave", "Envelope", "Piecewise", "Chirp", "Re/Im", "Mag/Phase",
                    "Harmonics", "LFOs", "FM", "Mix", "Routing"]
 
     # Modes available on the __mix__ node (routing module)
@@ -9341,12 +9633,12 @@ class EditorCanvas:
                                  EditorMode.SM_LOG]
     _STATE_MACHINE_NODE_LABELS = ["Routing", "Control", "Wave", "Re/Im", "Mag/Phase", "Log"]
 
-    # Modes available on regular voice nodes (everything except ROUTING)
-    _VOICE_MODES  = [EditorMode.WAVEFORM, EditorMode.ENVELOPE, EditorMode.CHIRP,
+    # Modes available on regular voice nodes — Piecewise editor is permanent first tab
+    _VOICE_MODES  = [EditorMode.PIECEWISE_EDITOR,
                      EditorMode.COMPLEX_RI, EditorMode.COMPLEX_MP,
                      EditorMode.HARMONICS, EditorMode.LFO_VIEW, EditorMode.FM_VIEW,
                      EditorMode.MIX]
-    _VOICE_LABELS = ["Wave", "Envelope", "Chirp", "Re/Im", "Mag/Phase",
+    _VOICE_LABELS = ["Piecewise", "Re/Im", "Mag/Phase",
                      "Harmonics", "LFOs", "FM", "Mix"]
 
     # Modes for the __patch__ pseudo-node (patch-global views)
@@ -9477,6 +9769,8 @@ class EditorCanvas:
         self._rebuild_result: dict | None = None
         self._rebuild_lock = threading.Lock()
         self._rebuild_hash: str = ""  # fingerprint of last completed rebuild
+        self._piecewise_editor: ParametricCurveEditor | None = None
+        self._piecewise_voice_key: str = ""
 
     # ---- Coordinate mapping ------------------------------------------------
 
@@ -9569,6 +9863,44 @@ class EditorCanvas:
         blob = json.dumps(patch.to_dict(), sort_keys=True, default=str)
         blob += f"|{active_key}|{mode}|{show_tail}|{seed}"
         return hashlib.sha256(blob.encode()).hexdigest()
+
+    def _ensure_piecewise_editor(self, voice: "AnalyticVoice", win_w: int, win_h: int) -> ParametricCurveEditor:
+        piecewise = voice.piecewise_env or PiecewiseVoiceEnvelope()
+        voice.piecewise_env = piecewise
+        cx, cy, cw, ch = self._canvas_rect(win_w, win_h)
+        plot_y = cy + MODEBAR_H
+        plot_h = ch - MODEBAR_H
+        if self._piecewise_editor is None or self._piecewise_voice_key != voice.key:
+            editor = ParametricCurveEditor(
+                piecewise.curve,
+                piecewise.chirp_curve,
+                piecewise.signal_curve,
+                w=max(64, cw),
+                h=max(64, plot_h),
+                library_folder=os.path.join(os.getcwd(), "envelopes"),
+            )
+            editor._overlay = _TextOverlay(editor.w, editor.h)
+            editor._channels["A"] = editor._channel_state("A")
+            editor._channels["A"].rule_tree = piecewise.rule_tree
+            self._piecewise_editor = editor
+            self._piecewise_voice_key = voice.key
+            self._surf_dirty = True
+        else:
+            if self._piecewise_editor.w != max(64, cw) or self._piecewise_editor.h != max(64, plot_h):
+                self._piecewise_editor.resize(max(64, cw), max(64, plot_h))
+                self._surf_dirty = True
+        self._pull_piecewise_editor_state_into_voice(voice)
+        return self._piecewise_editor
+
+    def _pull_piecewise_editor_state_into_voice(self, voice: "AnalyticVoice") -> None:
+        if self._piecewise_editor is None:
+            return
+        if voice.piecewise_env is None:
+            voice.piecewise_env = PiecewiseVoiceEnvelope()
+        voice.piecewise_env.curve = self._piecewise_editor._curves[0]
+        voice.piecewise_env.chirp_curve = self._piecewise_editor._curves[1]
+        voice.piecewise_env.signal_curve = self._piecewise_editor._curves[2]
+        voice.piecewise_env.rule_tree = self._piecewise_editor._channel_state("A").rule_tree or EnvelopeRuleTree.default()
 
     def rebuild(self, patch: AnalyticPatch, active_key: str) -> None:
         """Kick off a background rebuild.  Cancels any in-flight rebuild first.
@@ -9724,6 +10056,9 @@ class EditorCanvas:
                 csig = _synthesize_voice(voice, patch, lfo_map, p_map,
                                          granular_seed_offset=self.granular_seed_offset)
                 if cancel.is_set(): return
+                if hasattr(csig, 'detach'):
+                    csig = csig.detach().cpu().numpy()
+                csig = np.asarray(csig, dtype=np.complex128)
                 sig  = csig.real.astype(np.float32)
                 self._complex_sig = csig
             else:
@@ -9744,30 +10079,7 @@ class EditorCanvas:
 
         # --- chirp frequency evolution ---
         if voice:
-            f_base = voice.freq_hz
-            if voice.chirp.chirp_type == "linear":
-                self._chirp_f = (f_base + np.linspace(
-                    voice.chirp.f_delta_start,
-                    voice.chirp.f_delta_end, n)).astype(np.float32)
-            elif voice.chirp.chirp_type == "exponential":
-                t_sec = np.linspace(0.0, dur, n, endpoint=False, dtype=np.float64)
-                tau = max(voice.chirp.tau, 1e-9)
-                dec = np.exp(-t_sec / tau)
-                self._chirp_f = (
-                    f_base
-                    + voice.chirp.f_delta_start * dec
-                    + voice.chirp.f_delta_end * (1 - dec)
-                ).astype(np.float32)
-            elif voice.chirp.chirp_type == "power" and dur > 0:
-                t_sec = np.linspace(0.0, dur, n, endpoint=False, dtype=np.float64)
-                tau_n = (t_sec / dur) ** max(voice.chirp.chirp_power, 1e-3)
-                self._chirp_f = (
-                    f_base
-                    + voice.chirp.f_delta_start * (1.0 - tau_n)
-                    + voice.chirp.f_delta_end * tau_n
-                ).astype(np.float32)
-            else:
-                self._chirp_f = np.full(n, f_base, dtype=np.float32)
+            self._chirp_f = _compute_chirp_frequency_series(voice, n, dur).astype(np.float32, copy=False)
         else:
             self._chirp_f = np.zeros(n, dtype=np.float32)
         self._chirp_t = t_ax
@@ -10938,6 +11250,7 @@ class EditorCanvas:
                font: pygame.font.Font | None = None) -> None:
         """Full render: PlotWidget surface → GL tex + GL overlay."""
         cx, cy, cw, ch = self._canvas_rect(win_w, win_h)
+        voice = next((p for p in patch.voices if p.key == self.active_key), None)
 
         # ── Mode-tab background ──
         _gl_rect(cx, cy, cw, MODEBAR_H, win_w, win_h, (0.08, 0.08, 0.11, 1.0))
@@ -10991,6 +11304,7 @@ class EditorCanvas:
             # Routing view renders its own surface — always delegate
             r_surf = self.routing_view.render_surface(patch, cw, plot_h, font)
             self._tex = _surface_to_gl_tex(r_surf, self._tex)
+        
         elif self.mode == EditorMode.CONTROL_ROUTING:
             if self._surf_dirty:
                 self._render_control_routing_view(self._surf, patch, font)
@@ -11083,6 +11397,110 @@ class EditorCanvas:
                 self._render_placement_view(self._surf, patch, font)
                 self._tex = _surface_to_gl_tex(self._surf, self._tex)
                 self._surf_dirty = False
+        elif self.mode == EditorMode.PIECEWISE_EDITOR and voice is not None:
+            editor = self._ensure_piecewise_editor(voice, win_w, win_h)
+            # Resize to final target dimensions first so _prect() is correct
+            # when _refresh_render_points computes downsampled point lists.
+            # render_to_surface will see the same size and skip the resize.
+            editor.resize(max(64, cw), max(64, plot_h))
+            self._pull_piecewise_editor_state_into_voice(voice)
+            # Feed the current synthesised signals into the editor's output panel
+            import torch as _torch
+            lfo_map = {l.key: l for l in patch.lfos}
+            p_map   = {p.key: p for p in patch.voices}
+            if voice and not _voice_effectively_muted(voice, patch):
+                _csig = _synthesize_voice(
+                    voice,
+                    patch,
+                    lfo_map,
+                    p_map,
+                    granular_seed_offset=self.granular_seed_offset,
+                )
+                if hasattr(_csig, "detach"):
+                    _csig = _csig.detach().cpu().numpy()
+                _csig = np.asarray(_csig, dtype=np.complex128)
+                self._complex_sig = _csig
+                self._signal = _csig.real.astype(np.float32, copy=False)
+                self._env_curve = _compute_envelope(voice, len(_csig), patch.duration).astype(np.float32, copy=False)
+                self._chirp_f = _compute_chirp_frequency_series(voice, len(_csig), patch.duration).astype(np.float32, copy=False)
+            else:
+                _csig = self._complex_sig
+            _env  = self._env_curve
+            _cf   = self._chirp_f
+            if _csig is not None and len(_csig) > 0:
+                _n_sig = len(_csig)
+                _env_arr = _env.astype(float) if _env is not None else np.zeros(_n_sig)
+                _amp_total = np.abs(np.asarray(_csig, dtype=np.complex128))
+                _amp_peak = float(np.max(_amp_total)) if _amp_total.size > 0 else 0.0
+                if _amp_peak > 1e-9:
+                    _amp_total = _amp_total / _amp_peak
+                else:
+                    _amp_total = np.zeros_like(_amp_total, dtype=np.float64)
+
+                _base_chirp = (
+                    _compute_knob_chirp_deviation_series(voice, _n_sig, patch.duration)
+                    if voice is not None else
+                    np.zeros(_n_sig, dtype=np.float64)
+                )
+                _chirp_env_norm = np.full(_n_sig, 0.5, dtype=np.float64)
+                _chirp_total_norm = _chirp_env_norm.copy()
+                if voice is not None and voice.piecewise_env is not None:
+                    _t_norm = torch.linspace(0.0, 1.0, _n_sig, dtype=torch.float64)
+                    _chirp_curve = editor._curves[1]
+                    _chirp_env_curve = _chirp_curve.evaluate_normalized(_t_norm).real.clamp(0.0, 1.0)
+                    _chirp_env_hz = _chirp_curve.to_physical(
+                        _chirp_env_curve
+                    ).detach().cpu().numpy().astype(np.float64, copy=False)
+                    _chirp_total_hz = _base_chirp + _chirp_env_hz
+                    _v_lo = float(_chirp_curve.v_lo)
+                    _v_hi = float(_chirp_curve.v_hi)
+                    _span = max(_v_hi - _v_lo, 1e-9)
+                    _chirp_total_norm = np.clip((_chirp_total_hz - _v_lo) / _span, 0.0, 1.0)
+                    _chirp_env_norm = np.clip((_chirp_env_hz - _v_lo) / _span, 0.0, 1.0)
+                    _chirp_bias_norm = np.clip((_base_chirp - _v_lo) / _span, 0.0, 1.0)
+                else:
+                    _curve = editor._curves[1]
+                    _v_lo = float(_curve.v_lo)
+                    _v_hi = float(_curve.v_hi)
+                    _span = max(_v_hi - _v_lo, 1e-9)
+                    _chirp_bias_norm = np.clip((_base_chirp - _v_lo) / _span, 0.0, 1.0)
+                    _chirp_total_norm = _chirp_bias_norm.copy()
+                _raw = {
+                    "analytic":  _torch.as_tensor(_csig, dtype=_torch.complex128).reshape(-1),
+                    "amplitude_bias": _torch.zeros(_n_sig, dtype=_torch.complex128),
+                    "amplitude": _torch.as_tensor(_env_arr, dtype=_torch.complex128).reshape(-1),
+                    "amplitude_total": _torch.as_tensor(_amp_total, dtype=_torch.complex128).reshape(-1),
+                    "chirp_bias": _torch.as_tensor(_chirp_bias_norm, dtype=_torch.complex128).reshape(-1),
+                    "chirp":     _torch.as_tensor(_chirp_env_norm, dtype=_torch.complex128).reshape(-1),
+                    "chirp_total": _torch.as_tensor(_chirp_total_norm, dtype=_torch.complex128).reshape(-1),
+                }
+                # amplitude+chirp panels use channel "A"; output panel uses channel "B"
+                _state_a = editor._channel_state("A")
+                _state_a.raw_signals = {
+                    "amplitude_bias": _raw["amplitude_bias"],
+                    "amplitude": _raw["amplitude"],
+                    "amplitude_total": _raw["amplitude_total"],
+                    "chirp_bias": _raw["chirp_bias"],
+                    "chirp": _raw["chirp"],
+                    "chirp_total": _raw["chirp_total"],
+                }
+                _state_a.display_signals = _norm_ch_sigs(_state_a.raw_signals,
+                                                         time_stretch=_state_a.time_stretch)
+                _state_b = editor._channel_state("B")
+                _state_b.raw_signals     = {"analytic": _raw["analytic"]}
+                _state_b.display_signals = _norm_ch_sigs(_state_b.raw_signals,
+                                                         time_stretch=_state_b.time_stretch)
+                # _render_buf drives resize() re-refresh; point it at the analytic signal
+                editor._render_buf = _state_b.display_signals.get("analytic")
+                editor._refresh_render_points("A")
+                editor._refresh_render_points("B")
+                self._surf_dirty = True
+            if self._surf_dirty:
+                editor_surf = editor.render_to_surface(cw, plot_h)
+                self._surf.blit(editor_surf, (0, 0))
+                self._pull_piecewise_editor_state_into_voice(voice)
+                self._tex = _surface_to_gl_tex(self._surf, self._tex)
+                self._surf_dirty = False
         elif self._surf_dirty:
             self._surf.fill(_PY_BG)
             if self.mode == EditorMode.MIX:
@@ -11101,8 +11519,6 @@ class EditorCanvas:
         _draw_tex_quad(self._tex, cx, plot_y, cw, plot_h, win_w, win_h)
 
         # ── GL overlay ──
-        voice = next((p for p in patch.voices if p.key == self.active_key), None)
-
         ix, iy, iw, ih = self._inner_rect(win_w, win_h)
         plot_top = cy + MODEBAR_H
         plot_bot = cy + ch
@@ -11229,6 +11645,58 @@ class EditorCanvas:
             elif event.type == MOUSEMOTION and self._rot_dragging:
                 delta = (event.pos[0] - self._rot_drag_x0) * 0.5  # 0.5 Hz/px
                 patch.projection_rotation_hz = self._rot_drag_val0 + delta
+                self._surf_dirty = True
+                return True
+
+        if self.mode == EditorMode.PIECEWISE_EDITOR and voice is not None:
+            cx, cy, cw, ch = self._canvas_rect(win_w, win_h)
+            plot_y = cy + MODEBAR_H
+            plot_h = ch - MODEBAR_H
+            if event.type == MOUSEBUTTONDOWN and event.button == 1:
+                mx, my = event.pos
+                _vm, _ = self._visible_modes(patch)
+                for mode, rect in zip(_vm, self._mode_tab_rects(win_w, win_h, patch)):
+                    if rect.collidepoint(mx, my):
+                        self.mode = mode
+                        self._surf_dirty = True
+                        return True
+            editor = self._ensure_piecewise_editor(voice, win_w, win_h)
+            local_x = None
+            local_y = None
+            if hasattr(event, "pos"):
+                mx, my = event.pos
+                if not pygame.Rect(cx, plot_y, cw, plot_h).collidepoint(mx, my):
+                    return False
+                local_x = float(mx - cx)
+                local_y = float(plot_h - (my - plot_y))
+            if event.type == MOUSEBUTTONDOWN:
+                editor.on_mouse_down(event.button, local_x or 0.0, local_y or 0.0, pygame.key.get_mods())
+                self._pull_piecewise_editor_state_into_voice(voice)
+                self._surf_dirty = True
+                return True
+            if event.type == MOUSEBUTTONUP:
+                editor.on_mouse_up(event.button)
+                self._pull_piecewise_editor_state_into_voice(voice)
+                self._surf_dirty = True
+                return True
+            if event.type == MOUSEMOTION:
+                editor.on_mouse_move(local_x or 0.0, local_y or 0.0)
+                self._pull_piecewise_editor_state_into_voice(voice)
+                self._surf_dirty = True
+                return True
+            if event.type == KEYDOWN:
+                editor.on_key_down(event.key, event.mod)
+                self._pull_piecewise_editor_state_into_voice(voice)
+                self._surf_dirty = True
+                return True
+            if event.type == pygame.KEYUP:
+                editor.on_key_up(event.key)
+                self._pull_piecewise_editor_state_into_voice(voice)
+                self._surf_dirty = True
+                return True
+            if event.type == pygame.TEXTINPUT:
+                editor.on_text_input(event.text)
+                self._pull_piecewise_editor_state_into_voice(voice)
                 self._surf_dirty = True
                 return True
 
@@ -14476,6 +14944,7 @@ class PartialPanel(Panel):
         self._text_edit_idx: int = -1     # slider index being edited (-1 = none)
         self._text_edit_buf: str = ""     # current edit buffer
         self._role_defaults_rect: pygame.Rect | None = None
+        self.on_open_piecewise_editor = None
 
     def set_patch(self, patch: AnalyticPatch, active_key: str) -> None:
         if (patch is not self._patch) or (active_key != self._active_key):
@@ -15068,6 +15537,11 @@ class PartialPanel(Panel):
                 if k.choices:
                     sliders[-1]["choices"] = list(k.choices)
 
+        if voice is not None:
+            if voice.piecewise_env is None:
+                voice.piecewise_env = PiecewiseVoiceEnvelope()
+            voice.env_type = "piecewise"
+
         self._sliders = sliders
 
         surf_h = max(200, y + 20)
@@ -15488,6 +15962,7 @@ class AnalyticDriverViewer:
         self.patch_panel.on_demo_play    = self._play_demo_sequence
         self.patch_panel.on_render_fund  = self._on_render_to_files
         self.patch_panel.on_render       = self._on_render_sequence
+        self.partial_panel.on_open_piecewise_editor = self._open_piecewise_editor
 
     # ---- Callbacks ---------------------------------------------------------
 
@@ -15542,6 +16017,11 @@ class AnalyticDriverViewer:
         self._needs_rebuild = True
 
     def _mark_dirty(self) -> None:
+        self._needs_rebuild = True
+
+    def _open_piecewise_editor(self, key: str) -> None:
+        self._on_select(key)
+        self.canvas.mode = EditorMode.PIECEWISE_EDITOR
         self._needs_rebuild = True
 
     def _refresh_input_capture(self) -> None:
@@ -16153,6 +16633,9 @@ class AnalyticDriverViewer:
         if self._output_playing:
             self._stop_output_playback()
             return
+        active_voice = next((v for v in self.patch.voices if v.key == self.active_key), None)
+        if active_voice is not None and self.canvas.mode == EditorMode.PIECEWISE_EDITOR:
+            self.canvas._pull_piecewise_editor_state_into_voice(active_voice)
         # Seed module aux state from cavity cache before synthesis.
         for m in self.patch.modules:
             if m.key and m.key in self._cavity_cache and not m._sm_aux_state:

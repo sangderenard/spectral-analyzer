@@ -113,6 +113,85 @@ class _SegCoeffs:
     c3: float
 
 
+@dataclass
+class ComplexContribution:
+    """One synthesis contribution resolved onto amplitude/phase/frequency lanes."""
+
+    amplitude_mul: "torch.Tensor | None" = None
+    phase_add: "torch.Tensor | None" = None
+    frequency_add_hz: "torch.Tensor | None" = None
+
+    @classmethod
+    def from_complex_factor(cls, factor: torch.Tensor) -> "ComplexContribution":
+        z = factor.to(torch.complex128)
+        return cls(
+            amplitude_mul=z.abs().to(torch.float64),
+            phase_add=torch.angle(z).to(torch.float64),
+        )
+
+
+class ComplexSignalAggregator:
+    """Shared primitive-state builder for complex synthesis.
+
+    Aggregation rules:
+    - amplitude contributions combine multiplicatively
+    - phase offsets combine additively
+    - frequency deviations combine additively before phase integration
+    """
+
+    def __init__(self, sample_rate: float, length: int, *, device: "torch.device | None" = None) -> None:
+        self.sample_rate = float(sample_rate)
+        self.length = max(1, int(length))
+        self.device = device
+        self._amp_mul = torch.ones(self.length, dtype=torch.float64, device=device)
+        self._phase_add = torch.zeros(self.length, dtype=torch.float64, device=device)
+        self._freq_add_hz = torch.zeros(self.length, dtype=torch.float64, device=device)
+
+    def _coerce(self, value: "float | torch.Tensor") -> torch.Tensor:
+        t = torch.as_tensor(value, dtype=torch.float64, device=self.device).reshape(-1)
+        if t.numel() == 1:
+            return t.expand(self.length)
+        if t.numel() != self.length:
+            raise ValueError(f"Expected scalar or {self.length} samples, got {t.numel()}")
+        return t
+
+    def multiply_amplitude(self, value: "float | torch.Tensor") -> None:
+        self._amp_mul = self._amp_mul * self._coerce(value)
+
+    def add_phase(self, value: "float | torch.Tensor") -> None:
+        self._phase_add = self._phase_add + self._coerce(value)
+
+    def add_frequency_hz(self, value: "float | torch.Tensor") -> None:
+        self._freq_add_hz = self._freq_add_hz + self._coerce(value)
+
+    def add_contribution(self, contribution: ComplexContribution) -> None:
+        if contribution.amplitude_mul is not None:
+            self.multiply_amplitude(contribution.amplitude_mul)
+        if contribution.phase_add is not None:
+            self.add_phase(contribution.phase_add)
+        if contribution.frequency_add_hz is not None:
+            self.add_frequency_hz(contribution.frequency_add_hz)
+
+    def add_complex_factor(self, factor: torch.Tensor) -> None:
+        self.add_contribution(ComplexContribution.from_complex_factor(factor))
+
+    def frequency_series(self, base_frequency_hz: "float | torch.Tensor") -> torch.Tensor:
+        return self._coerce(base_frequency_hz) + self._freq_add_hz
+
+    def phase_series(self, base_frequency_hz: "float | torch.Tensor", phase_origin: "float | torch.Tensor" = 0.0) -> torch.Tensor:
+        f_inst = self.frequency_series(base_frequency_hz)
+        phase_origin_t = self._coerce(phase_origin)
+        return torch.cumsum(2.0 * math.pi * f_inst / self.sample_rate, dim=0) + phase_origin_t + self._phase_add
+
+    def emit(self, base_frequency_hz: "float | torch.Tensor", *, phase_origin: "float | torch.Tensor" = 0.0) -> torch.Tensor:
+        phase = self.phase_series(base_frequency_hz, phase_origin=phase_origin)
+        return self._amp_mul.to(torch.complex128) * torch.exp(1j * phase.to(torch.complex128))
+
+    @property
+    def amplitude(self) -> torch.Tensor:
+        return self._amp_mul
+
+
 def _build_cr_chain(pts: "List[ControlPoint]") -> "List[_SegCoeffs]":
     """Build Catmull-Rom coefficients for a chain of >= 2 points."""
     n = len(pts)
@@ -204,6 +283,76 @@ def _eval_all_chains(
             continue
         fill_r = segs[-1].c0 + segs[-1].c1 + segs[-1].c2 + segs[-1].c3
         vals = _eval_segs_vectorized(segs, t_norm, segs[0].c0, fill_r)
+        result = torch.where(mask, vals, result)
+    return result
+
+
+def _tensorize_seg_chain(
+    segs: "List[_SegCoeffs]",
+    *,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> "Optional[Dict[str, torch.Tensor]]":
+    """Materialize one segment chain as device/dtype-local tensors."""
+    if not segs:
+        return None
+    t0s = torch.tensor([s.t0 for s in segs], dtype=dtype, device=device)
+    t1s = torch.tensor([s.t1 for s in segs], dtype=dtype, device=device)
+    c0s = torch.tensor([s.c0 for s in segs], dtype=dtype, device=device)
+    c1s = torch.tensor([s.c1 for s in segs], dtype=dtype, device=device)
+    c2s = torch.tensor([s.c2 for s in segs], dtype=dtype, device=device)
+    c3s = torch.tensor([s.c3 for s in segs], dtype=dtype, device=device)
+    return {
+        "t0s": t0s,
+        "t1s": t1s,
+        "c0s": c0s,
+        "c1s": c1s,
+        "c2s": c2s,
+        "c3s": c3s,
+        "fill_left": c0s[0],
+        "fill_right": c0s[-1] + c1s[-1] + c2s[-1] + c3s[-1],
+    }
+
+
+def _eval_tensorized_chain(
+    chain: "Dict[str, torch.Tensor]",
+    t_norm: torch.Tensor,
+) -> torch.Tensor:
+    """Evaluate a tensorized segment chain over flat ``t_norm``."""
+    t0s = chain["t0s"]
+    t1s = chain["t1s"]
+    c0s = chain["c0s"]
+    c1s = chain["c1s"]
+    c2s = chain["c2s"]
+    c3s = chain["c3s"]
+    idx = torch.searchsorted(t0s.contiguous(), t_norm.contiguous(), right=True) - 1
+    idx = idx.clamp(0, t0s.numel() - 1)
+    seg_t0 = t0s[idx]
+    seg_t1 = t1s[idx]
+    span = (seg_t1 - seg_t0).clamp(min=1e-14)
+    u = ((t_norm - seg_t0) / span).clamp(0.0, 1.0)
+    out = c0s[idx] + c1s[idx] * u + c2s[idx] * (u * u) + c3s[idx] * (u * u * u)
+    out = torch.where(t_norm < t0s[0], chain["fill_left"], out)
+    out = torch.where(t_norm > t1s[-1], chain["fill_right"], out)
+    return out
+
+
+def _eval_all_chains_tensorized(
+    chains: "List[Dict[str, torch.Tensor]]",
+    t_norm: torch.Tensor,
+    gap_fill: float = 0.0,
+) -> torch.Tensor:
+    """Evaluate all tensorized chains and composite them; gaps → ``gap_fill``."""
+    if not chains:
+        return torch.full_like(t_norm, gap_fill)
+    result = torch.full_like(t_norm, gap_fill)
+    for chain in chains:
+        t_start = chain["t0s"][0]
+        t_end = chain["t1s"][-1]
+        mask = (t_norm >= t_start) & (t_norm <= t_end)
+        if not mask.any():
+            continue
+        vals = _eval_tensorized_chain(chain, t_norm)
         result = torch.where(mask, vals, result)
     return result
 
@@ -1080,11 +1229,13 @@ class ParametricCurve:
     activation_drive:  float = 1.0
     name:              str   = "curve"
     y_scale:           str   = "linear"   # "linear" | "log" | "tanh"
+    complex_collapse_mode: str = "real"       # "real" | "abs"
     warp_coordinator: "TimeWarpCoordinator | None" = field(
         default=None, repr=False, compare=False)
     _cache_key:    Any = field(default=None, repr=False, compare=False)
     _r_chains:     Any = field(default=None, repr=False, compare=False)
     _theta_chains: Any = field(default=None, repr=False, compare=False)
+    _tensorized_chains: Any = field(default_factory=dict, repr=False, compare=False)
     _seg_db:       Any = field(default=None, repr=False, compare=False)
     rule_tree:     Any = field(default=None, repr=False, compare=False)
 
@@ -1104,6 +1255,7 @@ class ParametricCurve:
         self._cache_key    = None
         self._r_chains     = None
         self._theta_chains = None
+        self._tensorized_chains = {}
         self._seg_db       = None
 
     def _region_label_at(self, t_norm: float) -> str:
@@ -1154,8 +1306,37 @@ class ParametricCurve:
         self._cache_key    = key
         self._r_chains     = r_chains
         self._theta_chains = theta_chains
+        self._tensorized_chains = {}
         self._seg_db       = None
         return r_chains, theta_chains
+
+    def _get_tensorized_chains(
+        self,
+        *,
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> "Tuple[list, list]":
+        """Return cached tensorized segment chains for one dtype/device pair."""
+        r_chains, theta_chains = self._ensure_baked()
+        cache_key = (self._cache_key, dtype, device.type, device.index)
+        cached = self._tensorized_chains.get(cache_key)
+        if cached is not None:
+            return cached
+
+        r_tensorized = [
+            chain
+            for segs in r_chains
+            for chain in [_tensorize_seg_chain(segs, dtype=dtype, device=device)]
+            if chain is not None
+        ]
+        theta_tensorized = [
+            chain
+            for segs in theta_chains
+            for chain in [_tensorize_seg_chain(segs, dtype=dtype, device=device)]
+            if chain is not None
+        ]
+        self._tensorized_chains[cache_key] = (r_tensorized, theta_tensorized)
+        return r_tensorized, theta_tensorized
 
     # ── segment database (t-indexed, no Newton) ───────────────────────────────
 
@@ -1300,18 +1481,22 @@ class ParametricCurve:
 
     # ── evaluation ───────────────────────────────────────────────────────────
 
-    def evaluate_normalized(self, t_norm: torch.Tensor) -> torch.Tensor:
-        """Evaluate the complex polar signal at t_norm ∈ [0,1].
-
-        Returns z(t) = r(t)·exp(i·θ(t)) as complex128.
-        Region effects, activation, and slew are applied.
-        """
+    def _evaluate_curve(
+        self,
+        t_norm: torch.Tensor,
+        *,
+        clamp_r: bool,
+        apply_activation: bool,
+        apply_slew: bool,
+    ) -> torch.Tensor:
         orig_shape = t_norm.shape
         t64 = t_norm.reshape(-1).to(torch.float64)
-        r_chains, theta_chains = self._ensure_baked()
+        r_chains, theta_chains = self._get_tensorized_chains(dtype=t64.dtype, device=t64.device)
 
-        r     = _eval_all_chains(r_chains, t64, gap_fill=0.0).clamp(0.0, 1.0)
-        theta = _eval_all_chains(theta_chains, t64, gap_fill=0.0)
+        r     = _eval_all_chains_tensorized(r_chains, t64, gap_fill=0.0)
+        theta = _eval_all_chains_tensorized(theta_chains, t64, gap_fill=0.0)
+        if clamp_r:
+            r = r.clamp(0.0, 1.0)
 
         sorted_markers = sorted(self.markers, key=lambda m: m.t)
         bounds = [0.0] + [m.t for m in sorted_markers] + [1.0]
@@ -1339,7 +1524,12 @@ class ParametricCurve:
             elif eff.mode == "loop" and eff.sub_curve is not None:
                 reps   = max(eff.loop_count, 1)
                 tile_t = (t_local * reps) % 1.0
-                sub_v  = eff.sub_curve.evaluate_normalized(tile_t).real
+                sub_v  = eff.sub_curve._evaluate_curve(
+                    tile_t,
+                    clamp_r=clamp_r,
+                    apply_activation=apply_activation,
+                    apply_slew=apply_slew,
+                ).real
                 r = torch.where(mask, sub_v, r)
             elif eff.mode == "mirror" and eff.sub_curve is not None:
                 reps    = max(eff.loop_count, 1)
@@ -1347,23 +1537,59 @@ class ParametricCurve:
                 rep_idx = phase.long()
                 tile_t  = phase % 1.0
                 tile_t  = torch.where((rep_idx % 2) == 1, 1.0 - tile_t, tile_t)
-                sub_v   = eff.sub_curve.evaluate_normalized(tile_t).real
+                sub_v   = eff.sub_curve._evaluate_curve(
+                    tile_t,
+                    clamp_r=clamp_r,
+                    apply_activation=apply_activation,
+                    apply_slew=apply_slew,
+                ).real
                 r       = torch.where(mask, sub_v, r)
             elif eff.mode == "sustain":
                 pass  # timing annotation only; shape unchanged
             elif eff.mode == "additive" and eff.sub_curve is not None:
-                sub_v = eff.sub_curve.evaluate_normalized(t_local).real
-                added = (r + sub_v * eff.lfo_depth).clamp(0.0, 1.0)
+                sub_v = eff.sub_curve._evaluate_curve(
+                    t_local,
+                    clamp_r=clamp_r,
+                    apply_activation=apply_activation,
+                    apply_slew=apply_slew,
+                ).real
+                added = r + sub_v * eff.lfo_depth
+                if clamp_r:
+                    added = added.clamp(0.0, 1.0)
                 r = torch.where(mask, added, r)
 
         z = r.to(torch.complex128) * torch.exp(1j * theta.to(torch.complex128))
-        if self.activation != "none":
+        if apply_activation and self.activation != "none":
             mag     = z.abs()
             mag_act = _apply_activation(mag, self.activation, self.activation_drive)
             z = z * (mag_act / mag.clamp(min=1e-30))
-        if self.slew_samples > 0:
+        if apply_slew and self.slew_samples > 0:
             z = _apply_slew(z, self.slew_samples)
         return z.reshape(orig_shape)
+
+    def evaluate_normalized(self, t_norm: torch.Tensor) -> torch.Tensor:
+        """Evaluate the normalized processed complex polar signal at t_norm ∈ [0,1]."""
+        return self._evaluate_curve(
+            t_norm,
+            clamp_r=True,
+            apply_activation=True,
+            apply_slew=True,
+        )
+
+    def evaluate_raw(self, t_norm: torch.Tensor) -> torch.Tensor:
+        """Evaluate the raw curve equation at t_norm ∈ [0,1] with no normalization clamp."""
+        return self._evaluate_curve(
+            t_norm,
+            clamp_r=False,
+            apply_activation=False,
+            apply_slew=False,
+        )
+
+    def evaluate_physical(self, t_norm: torch.Tensor) -> torch.Tensor:
+        """Evaluate the curve at t_norm and map the radial/value output into physical scale."""
+        z_raw = self.evaluate_raw(t_norm)
+        v_phys = _y_to_physical_t(z_raw.real.to(torch.float64), self.v_lo, self.v_hi, self.y_scale)
+        return v_phys.to(torch.complex128)
 
     # ── Y-axis scale conversion ───────────────────────────────────────────────
 
@@ -1518,16 +1744,17 @@ class ParametricCurve:
 
     def to_dict(self) -> dict:
         return {
-            "name":             self.name,
-            "v_lo":             self.v_lo,
-            "v_hi":             self.v_hi,
-            "y_scale":          self.y_scale,
-            "slew_samples":     self.slew_samples,
-            "activation":       self.activation,
-            "activation_drive": self.activation_drive,
-            "points":           [p.to_dict() for p in self.points],
-            "markers":          [m.to_dict() for m in self.markers],
-            "regions":          {str(k): v.to_dict() for k, v in self.regions.items()},
+            "name":                 self.name,
+            "v_lo":                 self.v_lo,
+            "v_hi":                 self.v_hi,
+            "y_scale":              self.y_scale,
+            "complex_collapse_mode": self.complex_collapse_mode,
+            "slew_samples":         self.slew_samples,
+            "activation":           self.activation,
+            "activation_drive":     self.activation_drive,
+            "points":               [p.to_dict() for p in self.points],
+            "markers":              [m.to_dict() for m in self.markers],
+            "regions":              {str(k): v.to_dict() for k, v in self.regions.items()},
         }
 
     @classmethod
@@ -1541,6 +1768,7 @@ class ParametricCurve:
             v_lo=float(d.get("v_lo", 0.0)),
             v_hi=float(d.get("v_hi", 1.0)),
             y_scale=str(d.get("y_scale", "linear")),
+            complex_collapse_mode=str(d.get("complex_collapse_mode", "real")),
             slew_samples=int(d.get("slew_samples", 0)),
             activation=str(d.get("activation", "none")),
             activation_drive=float(d.get("activation_drive", 1.0)),
@@ -1705,7 +1933,7 @@ def render_envelope_audio(
     done = (fracs_t >= 1.0).nonzero(as_tuple=False)
     n_total = int(done[0, 0]) + 1 if done.numel() > 0 else n_max
     fracs_t = fracs_t[:n_total]
-    amp_env = curve.evaluate_normalized(fracs_t).real.clamp(0.0, 1.0).to(torch.float64)
+    amp_z = curve.evaluate_normalized(fracs_t).to(torch.complex128)
 
     # Chirp: evaluate at the same warped t_norm fracs
     if chirp_curve is not None:
@@ -1715,13 +1943,14 @@ def render_envelope_audio(
         chirp_raw = torch.zeros(n_total, dtype=torch.float64)
         chirp_hz  = torch.zeros(n_total, dtype=torch.float64)
 
-    f_inst = torch.full((n_total,), float(freq_hz), dtype=torch.float64) + chirp_hz
-    phase  = torch.cumsum(2.0 * math.pi * f_inst / float(sr), dim=0)
-    sig    = torch.exp(1j * phase.to(torch.complex128))
-
-    out_c  = amp_env.to(torch.complex128) * sig * float(gain)
+    synth = ComplexSignalAggregator(float(sr), n_total, device=fracs_t.device)
+    synth.add_frequency_hz(chirp_hz)
+    synth.add_complex_factor(
+        amp_z.real.clamp(0.0, 1.0).to(torch.complex128) * complex(float(gain), 0.0)
+    )
+    out_c  = synth.emit(float(freq_hz))
     audio  = out_c.real.to(torch.float32).numpy().astype(_np.float32)
-    amp_np = amp_env.numpy().astype(_np.float64)
+    amp_np = synth.amplitude.numpy().astype(_np.float64)
     chr_np = chirp_raw.numpy().astype(_np.float64)
 
     return audio, amp_np, chr_np
@@ -1771,8 +2000,9 @@ def render_voice_audio(
     n = max(1, int(sr * dur))
     t_nrm = torch.linspace(0.0, 1.0, n, dtype=torch.float64)
 
-    # Amplitude envelope: real part of complex polar signal, clamped [0,1]
-    amp_env: torch.Tensor = amp_curve.evaluate_normalized(t_nrm).real.clamp(0.0, 1.0)
+    # Resolve amplitude to a complex factor first, then fold its magnitude and
+    # phase into the primitive oscillator state before final sample emission.
+    amp_z: torch.Tensor = amp_curve.evaluate_normalized(t_nrm).to(torch.complex128)
 
     # Chirp envelope: normalize then map to Hz deviation via the curve's y_scale
     chirp_raw: torch.Tensor = chirp_curve.evaluate_normalized(t_nrm).real.clamp(0.0, 1.0)
@@ -1781,14 +2011,14 @@ def render_voice_audio(
     # Instantaneous frequency — float64 throughout, no dtype coercion
     f_inst = torch.full((n,), float(freq_hz), dtype=torch.float64) + chirp_hz
 
-    # Torch cumsum phase integration — the "new torch design" oscillator
-    phase = torch.cumsum(2.0 * math.pi * f_inst / float(sr), dim=0)
-    sig   = torch.exp(1j * phase.to(torch.complex128))             # complex128
-
-    # Apply amplitude envelope and gain; take real part as the audio output
-    out_c  = amp_env.to(torch.complex128) * sig * float(gain)
+    synth = ComplexSignalAggregator(float(sr), n, device=t_nrm.device)
+    synth.add_frequency_hz(chirp_hz)
+    synth.add_complex_factor(
+        amp_z.real.clamp(0.0, 1.0).to(torch.complex128) * complex(float(gain), 0.0)
+    )
+    out_c  = synth.emit(float(freq_hz))
     audio  = out_c.real.to(torch.float32).numpy().astype(_np.float32)
-    amp_np = amp_env.numpy().astype(_np.float64)
+    amp_np = synth.amplitude.numpy().astype(_np.float64)
     chr_np = chirp_raw.numpy().astype(_np.float64)   # normalized [0,1] for display
 
     return audio, amp_np, chr_np
@@ -2290,7 +2520,7 @@ class PiecewiseEnvelopeBuilder:
         def _curve_eval(t_norm: "Union[float, torch.Tensor]", _c: "ParametricCurve" = curve) -> torch.Tensor:
             if not isinstance(t_norm, torch.Tensor):
                 t_norm = torch.tensor([float(t_norm)], dtype=torch.float64)
-            return _c.evaluate_normalized(t_norm.to(torch.float64))
+            return _c.evaluate_physical(t_norm.to(torch.float64))
 
         builder = cls()
         builder.set_fallback(_curve_eval)
@@ -2884,6 +3114,7 @@ def render_piecewise_audio(
     sr:            int   = 44100,
     oversample:    int   = 4,
     tau_up:        float = 0.38,
+    base_chirp_hz: "Any | None" = None,
 ) -> "tuple[Any, Any, Any]":
     """Render audio sample-by-sample using piecewise complex callables.
 
@@ -2908,6 +3139,9 @@ def render_piecewise_audio(
     sr           : output sample rate
     oversample   : internal oversampling factor (1 = no oversampling)
     tau_up       : sustain-rate recovery time constant (seconds)
+    base_chirp_hz: optional built-in chirp contribution in Hz deviation. May
+                   be None, a scalar, a tensor/array at output rate, or a
+                   callable receiving oversampled absolute-time ``t_abs``.
 
     Returns
     -------
@@ -2970,17 +3204,51 @@ def render_piecewise_audio(
     amp_over  = env_fn(fracs_t)    # complex128, shape (n_total,)
     chrp_over = chirp_fn(fracs_t)  # complex128, shape (n_total,)
 
-    # Convert complex chirp field → complex Hz via curve's physical mapping.
-    # The imaginary component of the chirp encodes frequency-domain phase deviation;
-    # it propagates through to_physical unchanged (linear/log/tanh on complex tensor).
-    chirp_hz = chirp_curve.to_physical(chrp_over)
+    # The piecewise callables already emit physical-scale values. Only the
+    # real component is used so chirp acts as a frequency offset, not a carrier.
+    chirp_hz = chrp_over.real.to(torch.float64)
+    if base_chirp_hz is None:
+        base_hz = torch.zeros_like(chirp_hz)
+    elif callable(base_chirp_hz):
+        base_eval = base_chirp_hz(t_abs)
+        base_hz = torch.as_tensor(base_eval, dtype=torch.float64).reshape(-1)
+        if base_hz.numel() == 1:
+            base_hz = base_hz.expand_as(chirp_hz)
+        elif base_hz.numel() != chirp_hz.numel():
+            raise ValueError(
+                f"base_chirp_hz callable returned {base_hz.numel()} samples; "
+                f"expected {chirp_hz.numel()}"
+            )
+    else:
+        base_hz = torch.as_tensor(base_chirp_hz, dtype=torch.float64).reshape(-1)
+        if base_hz.numel() == 1:
+            base_hz = base_hz.expand_as(chirp_hz)
+        elif base_hz.numel() == (n_total // oversample) and oversample > 1:
+            base_hz = torch.repeat_interleave(base_hz, oversample, dim=0)
+        if base_hz.numel() < chirp_hz.numel():
+            pad = torch.full(
+                (chirp_hz.numel() - base_hz.numel(),),
+                float(base_hz[-1].item()) if base_hz.numel() > 0 else 0.0,
+                dtype=torch.float64,
+            )
+            base_hz = torch.cat((base_hz, pad), dim=0)
+        base_hz = base_hz[:chirp_hz.numel()]
 
-    # Build complex instantaneous frequency and integrate complex phase.
-    # Imaginary part of f_inst acts as per-sample damping/growth (exp(-Im*t) envelope).
-    f_inst = freq_hz + chirp_hz                                         # complex128
-    phase  = torch.cumsum(2.0 * math.pi * f_inst / float(sr_over), dim=0)  # complex128
-    sig    = torch.exp(1j * phase)                                      # complex128 oscillator
-    out_c  = amp_over * sig * float(gain)                               # complex128 output
+    # Amplitude callable already emits physical-scale values. Collapse it once
+    # into a complex factor, then inject its magnitude/phase into the same
+    # primitive state as the oscillator instead of applying a later multiply.
+    if amp_curve.complex_collapse_mode == "abs":
+        amp_factor = torch.abs(amp_over).to(torch.complex128)
+    else:
+        amp_factor = amp_over.real.to(torch.complex128)
+    amp_factor = amp_factor * complex(float(gain), 0.0)
+    synth = ComplexSignalAggregator(float(sr_over), chirp_hz.numel(), device=t_abs.device)
+    synth.add_frequency_hz(base_hz)
+    synth.add_frequency_hz(chirp_hz)
+    synth.add_complex_factor(amp_factor)
+    out_c = synth.emit(float(freq_hz))
+    amp_env = synth.amplitude
+    sig = torch.exp(1j * synth.phase_series(float(freq_hz)).to(torch.complex128))
 
     # Downsample from sr_over back to sr using reshape+mean (box filter).
     # out_c, amp_over, chrp_over remain complex128 through the downsample.

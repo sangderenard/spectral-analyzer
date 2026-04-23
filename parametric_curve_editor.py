@@ -1,6 +1,8 @@
 """parametric_curve_editor.py
 ─────────────────────────────────────────────────────────────────────────────
-Two-panel pygame + OpenGL editor for an amplitude / chirp envelope pair.
+Two-panel pygame editor for an amplitude / chirp envelope pair.
+Fully surface-based — no OpenGL dependency.  Compatible as a subunit panel
+alongside PlotWidget / graph_widget in bass_viewer and analytic_driver.
 
 Architecture
 ─────────────
@@ -23,12 +25,12 @@ Shared structure sync
   panel, is immediately mirrored to the other panel.  The control points
   are never touched during sync.
 
-Synthesis  (SPACE)
+Display (passive)
 ──────────────────
-  render_voice_audio(amp_curve, chirp_curve, ...)
-      torch.cumsum phase integration — "new torch design".
-  The as-rendered amp_env / chirp_env / audio are stored and displayed as
-  the playhead advances.  No sustain-warp in the display path.
+  Channel B is populated externally by analytic_driver with the rendered voice
+  signal.  PCE never synthesises audio or drives playback.  Channel B's
+  display_signals are read in _refresh_render_points("B") to build the
+  overlay pts shown behind the editable curves and in the output panel.
 
 Y-axis scales
 ──────────────
@@ -46,7 +48,6 @@ Keyboard
   A          cycle activation function (focused panel only)
   = / -      activation drive ±0.5
   Tab        toggle focus between panels
-  Space      note-on / note-off (play preview)
   Escape     quit
 """
 from __future__ import annotations
@@ -63,22 +64,13 @@ from scipy.io import wavfile
 
 from parametric_curve import (
     ParametricCurve, ControlPoint, TimeMarker, RegionEffect,
-    GateEvent, TimeWarpCoordinator,
     RuleNode, EnvelopeRuleTree,
-    PiecewiseEnvelopeBuilder,
     default_envelope, default_chirp, default_blank,
-    render_envelope_audio, render_voice_audio, render_piecewise_audio,
     normalize_channel_complex_signals,
     _REGION_MODES, _REGION_COLORS, _ACTIVATION_MODES,
     _split_into_chains,
     _y_from_physical, _y_to_physical,
 )
-
-try:
-    import sounddevice as _sd
-    _HAS_SD = True
-except ImportError:
-    _HAS_SD = False
 
 try:
     import numpy as _np
@@ -89,22 +81,14 @@ except ImportError:
 try:
     import pygame
     from pygame.locals import (
-        DOUBLEBUF, KEYDOWN, MOUSEBUTTONDOWN, MOUSEBUTTONUP,
-        MOUSEMOTION, OPENGL, QUIT, RESIZABLE,
+        KEYDOWN, MOUSEBUTTONDOWN, MOUSEBUTTONUP,
+        MOUSEMOTION, QUIT, RESIZABLE,
         K_ESCAPE, K_TAB, K_d, K_m, K_s, K_l, K_t, K_RETURN,
-        K_BACKSPACE, KMOD_CTRL, K_a, K_EQUALS, K_MINUS, K_SPACE,
+        K_BACKSPACE, KMOD_CTRL, K_a, K_EQUALS, K_MINUS,
     )
-    from OpenGL.GL import (
-        GL_BLEND, GL_COLOR_BUFFER_BIT, GL_LINE_LOOP, GL_LINE_STRIP,
-        GL_LINES, GL_ONE_MINUS_SRC_ALPHA, GL_PROJECTION, GL_MODELVIEW,
-        GL_QUADS, GL_SRC_ALPHA, GL_SCISSOR_TEST,
-        glBegin, glBlendFunc, glClear, glClearColor, glColor4f, glEnd,
-        glLineWidth, glLoadIdentity, glMatrixMode, glOrtho, glVertex2f,
-        glViewport, glEnable, glDisable, glScissor,
-    )
-    _HAS_GL = True
+    _HAS_PYGAME = True
 except ImportError:
-    _HAS_GL = False
+    _HAS_PYGAME = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -165,6 +149,12 @@ _COL_CRTOSC_FILL   = (0.10, 0.42, 0.25, 0.13)   # courtesy oscillator fill (amp 
 _COL_CRTOSC_LINE   = (0.28, 0.80, 0.50, 0.38)   # courtesy oscillator line (amp panel bg)
 _COL_OUT_AMP_FILL  = (0.20, 0.65, 0.38, 0.18)   # amplitude envelope fill (output panel)
 _COL_OUT_AMP_LINE  = (0.30, 0.90, 0.55, 0.60)   # amplitude envelope line (output panel)
+_COL_LAYER_R_FILL  = (0.95, 0.22, 0.22, 0.18)
+_COL_LAYER_R_LINE  = (1.00, 0.40, 0.40, 0.88)
+_COL_LAYER_G_FILL  = (0.20, 0.82, 0.34, 0.18)
+_COL_LAYER_G_LINE  = (0.34, 0.98, 0.52, 0.88)
+_COL_LAYER_B_FILL  = (0.20, 0.48, 1.00, 0.18)
+_COL_LAYER_B_LINE  = (0.46, 0.72, 1.00, 0.88)
 
 # Panel height modes
 _PANEL_HEIGHT_PX: dict[str, int] = {
@@ -244,6 +234,7 @@ def _header_button_rects(panel_idx: int, w: int, h: int, panel_count: int = 2) -
     channel_w = 54.0
     stretch_w = 54.0
     scale_w  = 62.0
+    collapse_w = 36.0
     btn_w    = 44.0
     gap      = 6.0
 
@@ -256,6 +247,8 @@ def _header_button_rects(panel_idx: int, w: int, h: int, panel_count: int = 2) -
     stretch_r = (x, hy + pad, stretch_w, btn_h)
     x += stretch_w + gap
     scale_r  = (x, hy + pad, scale_w, btn_h)
+    x += scale_w + gap
+    collapse_r = (x, hy + pad, collapse_w, btn_h)
 
     save_x = hx + hw - 2 * btn_w - gap - pad
     load_x = hx + hw - btn_w - pad
@@ -267,7 +260,7 @@ def _header_button_rects(panel_idx: int, w: int, h: int, panel_count: int = 2) -
     hmode_r = (hmode_x, hy + pad, hmode_w, btn_h)
 
     return {"title": title_r, "role": role_r, "channel": channel_r,
-            "stretch": stretch_r, "scale": scale_r,
+            "stretch": stretch_r, "scale": scale_r, "collapse": collapse_r,
             "hmode": hmode_r, "save": save_r,   "load": load_r}
 
 
@@ -289,6 +282,7 @@ def _header_button_rects_from_rect(hx: float, hy: float, hw: float, hh: float) -
     channel_w = 54.0
     stretch_w = 54.0
     scale_w   = 62.0
+    collapse_w = 36.0
     btn_w     = 44.0
     gap       = 6.0
 
@@ -296,7 +290,8 @@ def _header_button_rects_from_rect(hx: float, hy: float, hw: float, hh: float) -
     role_r    = (x, hy + pad, role_w,  btn_h); x += role_w + gap
     channel_r = (x, hy + pad, channel_w, btn_h); x += channel_w + gap
     stretch_r = (x, hy + pad, stretch_w, btn_h); x += stretch_w + gap
-    scale_r   = (x, hy + pad, scale_w,  btn_h)
+    scale_r   = (x, hy + pad, scale_w,  btn_h); x += scale_w + gap
+    collapse_r = (x, hy + pad, collapse_w, btn_h)
 
     hmode_w = 28.0
     save_x  = hx + hw - 2 * btn_w - gap - hmode_w - gap - pad
@@ -307,46 +302,115 @@ def _header_button_rects_from_rect(hx: float, hy: float, hw: float, hh: float) -
     hmode_r = (hmode_x, hy + pad, hmode_w, btn_h)
 
     return {"title": title_r, "role": role_r, "channel": channel_r,
-            "stretch": stretch_r, "scale": scale_r,
+            "stretch": stretch_r, "scale": scale_r, "collapse": collapse_r,
             "hmode": hmode_r, "save": save_r, "load": load_r}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Drawing primitives
+# Drawing primitives  (pure pygame — no OpenGL)
 # ─────────────────────────────────────────────────────────────────────────────
 
+class _DrawCtx:
+    """Mutable drawing context set at the start of each frame."""
+    def __init__(self):
+        self.surf = None      # pygame.Surface to draw on
+        self.h    = 0         # surface height (for GL→pygame Y-flip)
+        self.color = (255, 255, 255, 255)
+        self.line_width = 1
+
+_ctx = _DrawCtx()
+
+
+def _py(gl_y: float, rect_h: float = 0.0) -> int:
+    """Convert a GL y-coordinate (y from bottom) to a pygame y-coordinate (y from top)."""
+    return _ctx.h - int(gl_y) - int(rect_h)
+
+
 def _gl_color(c):
-    glColor4f(*c)
+    a = int(c[3] * 255) if len(c) > 3 else 255
+    _ctx.color = (int(c[0] * 255), int(c[1] * 255), int(c[2] * 255), a)
+
+
+def glLineWidth(w: float) -> None:  # noqa: N802 — intentional GL-style name
+    _ctx.line_width = max(1, int(round(w)))
+
 
 def _draw_line(x0, y0, x1, y1):
-    glBegin(GL_LINES)
-    glVertex2f(x0, y0)
-    glVertex2f(x1, y1)
-    glEnd()
+    if _ctx.surf is None:
+        return
+    pygame.draw.line(_ctx.surf, _ctx.color[:3],
+                     (int(x0), _py(y0)), (int(x1), _py(y1)),
+                     _ctx.line_width)
+
 
 def _draw_diamond(cx, cy, r=5.0):
-    glBegin(GL_QUADS)
-    glVertex2f(cx,     cy + r); glVertex2f(cx + r, cy)
-    glVertex2f(cx,     cy - r); glVertex2f(cx - r, cy)
-    glEnd()
+    if _ctx.surf is None:
+        return
+    pts = [
+        (int(cx),       _py(cy + r)),
+        (int(cx + r),   _py(cy)),
+        (int(cx),       _py(cy - r)),
+        (int(cx - r),   _py(cy)),
+    ]
+    pygame.draw.polygon(_ctx.surf, _ctx.color[:3], pts)
+
 
 def _draw_rect_outline(x, y, w, h, col):
+    if _ctx.surf is None:
+        return
     _gl_color(col)
-    glLineWidth(2.0)
-    glBegin(GL_LINE_LOOP)
-    glVertex2f(x, y);     glVertex2f(x + w, y)
-    glVertex2f(x + w, y + h); glVertex2f(x, y + h)
-    glEnd()
+    pygame.draw.rect(_ctx.surf, _ctx.color[:3],
+                     pygame.Rect(int(x), _py(y, h), int(w), int(h)),
+                     _ctx.line_width)
+
 
 def _draw_rect_fill(x, y, w, h):
-    glBegin(GL_QUADS)
-    glVertex2f(x, y);     glVertex2f(x + w, y)
-    glVertex2f(x + w, y + h); glVertex2f(x, y + h)
-    glEnd()
+    if _ctx.surf is None:
+        return
+    pygame.draw.rect(_ctx.surf, _ctx.color,
+                     pygame.Rect(int(x), _py(y, h), int(w), int(h)))
+
 
 def _draw_rect_gl(x, y, w, h, col):
     _gl_color(col)
     _draw_rect_fill(x, y, w, h)
+
+
+def _alpha_blit_rgb(
+    dst: "pygame.Surface",
+    src: "pygame.Surface",
+    dest: tuple[int, int],
+) -> None:
+    dx, dy = int(dest[0]), int(dest[1])
+    sw, sh = src.get_size()
+    dw, dh = dst.get_size()
+    if sw <= 0 or sh <= 0 or dw <= 0 or dh <= 0:
+        return
+    x0 = max(0, dx)
+    y0 = max(0, dy)
+    x1 = min(dw, dx + sw)
+    y1 = min(dh, dy + sh)
+    if x1 <= x0 or y1 <= y0:
+        return
+
+    sx0 = x0 - dx
+    sy0 = y0 - dy
+    sx1 = sx0 + (x1 - x0)
+    sy1 = sy0 + (y1 - y0)
+
+    dst_rgb = pygame.surfarray.pixels3d(dst)
+    src_rgb = pygame.surfarray.pixels3d(src)
+    src_a = pygame.surfarray.pixels_alpha(src)
+    try:
+        dst_view = dst_rgb[x0:x1, y0:y1].astype(_np.float32, copy=False)
+        src_view = src_rgb[sx0:sx1, sy0:sy1].astype(_np.float32, copy=False)
+        alpha = (src_a[sx0:sx1, sy0:sy1].astype(_np.float32, copy=False) / 255.0)[..., None]
+        blended = src_view * alpha + dst_view * (1.0 - alpha)
+        dst_rgb[x0:x1, y0:y1] = blended.clip(0.0, 255.0).astype(_np.uint8)
+    finally:
+        del dst_rgb
+        del src_rgb
+        del src_a
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Text overlay  (pygame surface drawn as a GL pixel buffer)
@@ -426,15 +490,9 @@ class _TextOverlay:
             self.surface.blit(ts, (int(gl_x) + 4,
                                    py_y + max(0, (int(item_h) - ts.get_height()) // 2)))
 
-    def flush_to_gl(self):
-        from OpenGL.GL import (glRasterPos2f, glDrawPixels,
-                               GL_RGBA, GL_UNSIGNED_BYTE)
-        data = pygame.image.tostring(
-            pygame.transform.flip(self.surface, False, True), "RGBA", False)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glRasterPos2f(0.0, 0.0)
-        glDrawPixels(self.w, self.h, GL_RGBA, GL_UNSIGNED_BYTE, data)
+    def blit_to(self, target_surf: "pygame.Surface") -> None:
+        """Blit the overlay surface onto target_surf at (0, 0)."""
+        target_surf.blit(self.surface, (0, 0))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Knob widget
@@ -475,57 +533,9 @@ class _ChannelState:
     key: str
     rule_tree: Optional[EnvelopeRuleTree] = None
     time_stretch: bool = False
-    gate_history: list[GateEvent] = field(default_factory=list)
-    abs_t0: float = 0.0
-    env_frac: float = 0.0
-    sustain_rate: float = 1.0
-    blend_history: list[dict] = field(default_factory=list)
     raw_signals: dict[str, torch.Tensor] = field(default_factory=dict)
     display_signals: dict[str, torch.Tensor] = field(default_factory=dict)
 
-
-def _draw_knob(k, hover=False, ov=None, screen_h=0):
-    from OpenGL.GL import GL_TRIANGLE_FAN
-    rim_col = _COL_KNOB_HOVER if hover else _COL_KNOB_RIM
-    n_seg, r = 32, k.radius
-    _gl_color(_COL_KNOB_BG)
-    glBegin(GL_TRIANGLE_FAN)
-    glVertex2f(k.cx, k.cy)
-    for i in range(n_seg + 1):
-        a = 2.0 * math.pi * i / n_seg
-        glVertex2f(k.cx + r * math.cos(a), k.cy + r * math.sin(a))
-    glEnd()
-    _gl_color(rim_col)
-    glLineWidth(1.5)
-    glBegin(GL_LINE_LOOP)
-    for i in range(n_seg):
-        a = 2.0 * math.pi * i / n_seg
-        glVertex2f(k.cx + r * math.cos(a), k.cy + r * math.sin(a))
-    glEnd()
-    _gl_color(_COL_KNOB_ARC)
-    glLineWidth(3.0)
-    a_start = math.radians(225.0)
-    a_sweep = math.radians(270.0)
-    steps   = max(2, int(n_seg * k.norm()))
-    glBegin(GL_LINE_STRIP)
-    for i in range(steps + 1):
-        a = a_start - (i / max(steps, 1)) * k.norm() * a_sweep
-        glVertex2f(k.cx + (r - 3) * math.cos(a),
-                   k.cy + (r - 3) * math.sin(a))
-    glEnd()
-    glLineWidth(2.0)
-    a_ptr = a_start - k.norm() * a_sweep
-    glBegin(GL_LINES)
-    glVertex2f(k.cx + r * 0.35 * math.cos(a_ptr),
-               k.cy + r * 0.35 * math.sin(a_ptr))
-    glVertex2f(k.cx + r * 0.90 * math.cos(a_ptr),
-               k.cy + r * 0.90 * math.sin(a_ptr))
-    glEnd()
-    if ov is not None:
-        col_t = (180, 220, 160) if hover else (140, 160, 140)
-        ov.text(k.label, k.cx - r, screen_h - (k.cy + r + 14), col=col_t)
-        ov.text(k.fmt.format(k.value), k.cx - r,
-                screen_h - (k.cy - r + 2), col=(210, 230, 210))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Spline polyline builder
@@ -573,6 +583,8 @@ def _downsample_to_pts(arr, w_px: int) -> list:
 def _downsample_env_to_pts(arr, w_px: int) -> list:
     arr_np = arr.detach().cpu().numpy() if isinstance(arr, torch.Tensor) else arr
     arr_np = _np.asarray(arr_np)
+    if _np.iscomplexobj(arr_np):
+        arr_np = arr_np.real
     n = len(arr_np)
     if n == 0:
         return []
@@ -583,7 +595,7 @@ def _downsample_env_to_pts(arr, w_px: int) -> list:
         seg = arr_np[lo:hi]
         if len(seg) == 0:
             continue
-        pts.append(((lo + hi) * 0.5 / n, float(_np.abs(seg).mean())))
+        pts.append(((lo + hi) * 0.5 / n, float(seg.mean())))
     return pts
 
 
@@ -591,8 +603,49 @@ def _downsample_signal_lane_pts(sig: torch.Tensor | Any, w_px: int, lane: int) -
     sig_t = torch.as_tensor(sig, dtype=torch.complex128).reshape(-1)
     if sig_t.numel() <= 0:
         return []
-    lane_t = torch.view_as_real(sig_t)[:, lane].to(torch.float64)
-    return _downsample_env_to_pts(lane_t, w_px)
+    arr_np = torch.view_as_real(sig_t)[:, lane].to(torch.float64).detach().cpu().numpy()
+    n = len(arr_np)
+    if n == 0:
+        return []
+    bucket = max(1, n // max(1, w_px))
+    pts = []
+    for i in range(min(w_px, n)):
+        lo = i * bucket; hi = min(n, lo + bucket)
+        seg = arr_np[lo:hi]
+        if len(seg) == 0:
+            continue
+        idx = int(_np.abs(seg).argmax())
+        pts.append(((lo + hi) * 0.5 / n, float(seg[idx])))  # signed peak preserves oscillation
+    return pts
+
+
+def _downsample_analytic_pts(sig, w_px: int) -> list:
+    """Downsample complex signal to (t_frac, re_norm, im_norm) triples, peak-normalised.
+
+    Used for the 3-D oblique EM-wave projection in the output panel.
+    """
+    sig_t = torch.as_tensor(sig, dtype=torch.complex128).reshape(-1)
+    if sig_t.numel() <= 0:
+        return []
+    peak = float(torch.max(torch.abs(sig_t)).item())
+    if peak < 1e-12:
+        peak = 1.0
+    real_np = torch.view_as_real(sig_t)[:, 0].to(torch.float64).detach().cpu().numpy() / peak
+    imag_np = torch.view_as_real(sig_t)[:, 1].to(torch.float64).detach().cpu().numpy() / peak
+    n = len(real_np)
+    bucket = max(1, n // max(1, w_px))
+    pts = []
+    for i in range(min(w_px, n)):
+        lo = i * bucket
+        hi = min(n, lo + bucket)
+        if hi <= lo:
+            continue
+        seg_re = real_np[lo:hi]
+        seg_im = imag_np[lo:hi]
+        idx = int(_np.abs(seg_re + 1j * seg_im).argmax())
+        pts.append(((lo + hi) * 0.5 / n, float(seg_re[idx]), float(seg_im[idx])))
+    return pts
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Y-axis tick label helper
@@ -680,51 +733,24 @@ class ParametricCurveEditor:
         self._mouse_panel = 0
         self._hover_header_btn: Optional[tuple] = None  # (panel_idx, key)
 
-        # ── knobs: freq Hz, gain, dur (shared) ───────────────────────────────
-        self._knobs = [
-            _Knob("freq Hz", 20.0,  4000.0, 220.0, log=True,  fmt="{:.0f}"),
-            _Knob("gain",    0.01,  2.0,    0.8,   log=False, fmt="{:.2f}"),
-            _Knob("dur s",   0.05,  8.0,    1.0,   log=True,  fmt="{:.2f}"),
-        ]
-        self._drag_knob       = None
-        self._hover_knob      = None
-        self._knob_drag_y0    = 0.0
-        self._knob_drag_norm0 = 0.0
-        self._update_knob_positions()
-
-        # ── stored render data ────────────────────────────────────────────────
-        self._render_buf:       Optional[Any] = None
-        self._render_amp_env:   Optional[Any] = None
-        self._render_chirp_env: Optional[Any] = None
-        self._render_complex_env: Optional[torch.Tensor] = None
-        self._render_dur:       float         = 1.0
-        self._render_n:         int           = 0
+        # ── stored render pts (populated externally via _refresh_render_points)
+        self._render_buf:    Optional[Any] = None
         self._wave_pts:  list = []
+        self._amp_bias_pts: list = []
         self._amp_pts:   list = []
+        self._amp_total_pts: list = []
+        self._chirp_bias_pts: list = []
         self._chirp_pts: list = []
+        self._chirp_total_pts: list = []
         self._sig_re_pts: list = []
         self._sig_im_pts: list = []
+        self._analytic_pts: list = []
 
-        # ── playback ──────────────────────────────────────────────────────────
-        self._play_state     = "idle"
-        self._play_last_wall = 0.0
-        self._play_channel   = self._panel_channels[0]
-        self._note_held      = False
-
-        # Envelope cursor: t_norm position in [0, 1] through the curve.
-        # Advanced per tick by dt/dur, slowed/stalled by sustain logic. These
-        # live on the active channel state rather than globally.
-        self._tau_up:         float = 0.38 # sustain release time-constant (s)
-
-        # ── post-session render state ──────────────────────────────────────────
-        # Audio is produced exactly once, after all notes are released and
-        # _RENDER_TIMEOUT_S has elapsed, by calling render_envelope_audio().
-        # _last_note_off_wall is the wall time of the most recent note-off.
-        # A retrigger resets it, extending the silence window.
-        self._last_note_off_wall:  float = 0.0
-        self._render_play_t0:      float = 0.0
-        self._play_elapsed:        float = 0.0
-        self._silence_timer_wall:  float = 0.0  # wall time of last note-off; 0 = inactive
+        # ── phase-rotation animation for the output/analytic panel ────────────
+        # Angle advances at _phase_rotation_hz full turns per second.
+        self._phase_rotation_angle: float = 0.0
+        self._phase_rotation_hz:    float = 0.2   # ~1 full turn every 5 s
+        self._phase_rotation_last_t: Optional[float] = None
         self._sync_all_channel_structures()
 
     # ── accessors ─────────────────────────────────────────────────────────────
@@ -868,7 +894,6 @@ class ParametricCurveEditor:
             self._chirp_pts           = []
             self._sig_re_pts          = []
             self._sig_im_pts          = []
-            self._last_note_off_wall  = 0.0
 
     # ── shared structure sync ─────────────────────────────────────────────────
 
@@ -906,23 +931,6 @@ class ParametricCurveEditor:
 
     def _clamp(self, t, v):
         return max(0.0, min(1.0, t)), max(0.0, min(1.0, v))
-
-    # ── knob layout ───────────────────────────────────────────────────────────
-
-    def _update_knob_positions(self):
-        r = 20.0; gap = 56.0
-        x = float(self.w) - 44.0
-        top_idx = max(0, self._panel_count - 1)
-        _, y0_top, _, ph_top = self._prect(top_idx)
-        y_start = y0_top + ph_top - r - 4
-        for i, k in enumerate(self._knobs):
-            k.cx = x;  k.cy = y_start - i * gap;  k.radius = r
-
-    def _knob_at(self, px, py):
-        for i, k in enumerate(self._knobs):
-            if k.hit(px, py):
-                return i
-        return None
 
     # ── hit testing ───────────────────────────────────────────────────────────
 
@@ -1027,105 +1035,6 @@ class ParametricCurveEditor:
 
     # ── note / render ─────────────────────────────────────────────────────────
 
-    def _note_on(self):
-        state = self._active_channel_state()
-        self._play_channel = state.key
-        now = _time.monotonic()
-        if not state.gate_history:
-            state.abs_t0 = now
-        t_abs = now - state.abs_t0
-        # Close previous gate if never released (retrigger)
-        if state.gate_history and state.gate_history[-1].t_off is None:
-            prev_gate = state.gate_history[-1]
-            prev_gate.t_off = t_abs
-            print(f"[gate] retrigger: closed gate [{len(state.gate_history)-1}] t_off={t_abs:.4f}s")
-            # Record the actual blend triggered by this retrigger
-            _dur = max(float(self._knobs[2].value), 1e-9)
-            _curve = self._channel_amp_curve(state.key)
-            _tree = state.rule_tree
-            if _curve is not None and _tree is not None:
-                _t_curve = min(1.0, (t_abs - prev_gate.t_on) / _dur)
-                _region = _curve._region_label_at(_t_curve)
-                _rules = _tree.matching_rules("retrigger", _region)
-                if _rules:
-                    _mode = _rules[0].blend_mode
-                    _entries = _tree.instantiate(_curve, _t_curve, "retrigger", _region)
-                    for _e in _entries:
-                        state.blend_history.append({
-                            "note_idx":   len(state.gate_history) - 1,
-                            "trigger":    "retrigger",
-                            "blend_mode": _mode,
-                            "c_lo":       _e.t0,
-                            "c_hi":       _e.t1,
-                            "gate_t_on":  prev_gate.t_on,
-                        })
-                        print(f"[blend] retrigger/{_mode}  curve=[{_e.t0:.4f},{_e.t1:.4f}]  region={_region!r}")
-        state.gate_history.append(GateEvent(t_on=t_abs, velocity=1.0))
-        self._note_held = True
-        state.env_frac = 0.0 if len(state.gate_history) == 1 else state.env_frac
-        self._play_state = "playing"
-        self._play_last_wall = now
-        print(f"[gate] ON  [{len(state.gate_history)-1}]  t_on={t_abs:.4f}s  total_events={len(state.gate_history)}")
-
-    def _note_off(self):
-        self._note_held = False
-        state = self._channel_state(self._play_channel)
-        if not state.gate_history:
-            print("[gate] OFF  (no history)")
-            return
-        now = _time.monotonic()
-        t_abs = now - state.abs_t0
-        if state.gate_history[-1].t_off is None:
-            state.gate_history[-1].t_off = t_abs
-        dur = (state.gate_history[-1].t_off - state.gate_history[-1].t_on)
-        print(f"[gate] OFF [{len(state.gate_history)-1}]  t_off={t_abs:.4f}s  dur={dur:.4f}s")
-        # Record the actual blend triggered by this release
-        _env_dur = max(float(self._knobs[2].value), 1e-9)
-        _curve = self._channel_amp_curve(state.key)
-        _tree = state.rule_tree
-        if _curve is not None and _tree is not None:
-            _t_curve = min(1.0, dur / _env_dur)
-            _region = _curve._region_label_at(_t_curve)
-            _rules = _tree.matching_rules("release", _region)
-            if _rules:
-                _mode = _rules[0].blend_mode
-                _entries = _tree.instantiate(_curve, _t_curve, "release", _region)
-                for _e in _entries:
-                    state.blend_history.append({
-                        "note_idx":   len(state.gate_history) - 1,
-                        "trigger":    "release",
-                        "blend_mode": _mode,
-                        "c_lo":       _e.t0,
-                        "c_hi":       _e.t1,
-                        "gate_t_on":  state.gate_history[-1].t_on,
-                    })
-                    print(f"[blend] release/{_mode}  curve=[{_e.t0:.4f},{_e.t1:.4f}]  region={_region!r}")
-
-    def _do_post_render(self):
-        """Legacy post-render entry point retained for compatibility."""
-        self._do_post_render_piecewise()
-
-    def _tick_play(self):
-        """Per-frame playback tick.
-
-        Tracks elapsed time during post-render audio playback ("hang" state)
-        and transitions to "idle" when the audio finishes.  Gate recording and
-        session history are owned exclusively by _tick_note_report /
-        _do_post_render_piecewise — nothing here touches them.
-        """
-        now = _time.monotonic()
-
-        # ── "hang" state: post-render audio is playing via sounddevice ─────────
-        if self._play_state == "hang":
-            self._play_elapsed = now - self._render_play_t0
-            if self._play_elapsed >= max(self._render_dur, 1e-9):
-                self._play_state   = "idle"
-                self._play_elapsed = 0.0
-            self._play_last_wall = now
-            return
-
-        self._play_last_wall = now
-
     # ── event handlers ────────────────────────────────────────────────────────
 
     def on_mouse_down(self, button, px, py, mods):
@@ -1166,14 +1075,6 @@ class ParametricCurveEditor:
             self._commit_label()
             return
 
-        # Knob drag
-        ki = self._knob_at(px, py)
-        if ki is not None and button == 1:
-            self._drag_knob       = ki
-            self._knob_drag_y0    = py
-            self._knob_drag_norm0 = self._knobs[ki].norm()
-            return
-
         # Header buttons
         hb = self._header_btn_at(px, py)
         if hb is not None and button == 1:
@@ -1197,6 +1098,9 @@ class ParametricCurveEditor:
                 self._open_dropdown = ("channel", pi)
             elif key == "stretch":
                 self._toggle_panel_channel_stretch(pi)
+            elif key == "collapse":
+                cur = self._curves[pi].complex_collapse_mode
+                self._curves[pi].complex_collapse_mode = "abs" if cur == "real" else "real"
             elif key == "hmode":
                 modes = list(_PANEL_HEIGHT_MODES)
                 cur = self._panel_height_modes[pi]
@@ -1248,7 +1152,6 @@ class ParametricCurveEditor:
             for i in range(self._panel_count):
                 self._drag_pt[i] = None
                 self._drag_mk[i] = None
-            self._drag_knob = None
 
     def on_mouse_move(self, px, py):
         panel = self._panel_at_pos(py)
@@ -1263,18 +1166,11 @@ class ParametricCurveEditor:
             self._hover_ri[pi] = self._curves[pi].region_index_at(
                 max(0.0, min(1.0, t)))
 
-        self._hover_knob      = self._knob_at(px, py)
         self._hover_header_btn = self._header_btn_at(px, py)
 
         # Update dropdown hover
         if self._open_dropdown is not None:
             self._dropdown_hover_idx = self._dropdown_item_at(px, py)
-
-        if self._drag_knob is not None:
-            delta = (py - self._knob_drag_y0) / 200.0
-            self._knobs[self._drag_knob].set_norm(self._knob_drag_norm0 + delta)
-            self._render_buf = None
-            return
 
         fp = self.focused_panel
         if not self._panel_is_curve(fp):
@@ -1344,16 +1240,9 @@ class ParametricCurveEditor:
             c.activation_drive = round(min(20.0, c.activation_drive + 0.5), 2)
         elif key == K_MINUS and self._panel_is_curve(fp):
             c.activation_drive = round(max(0.1, c.activation_drive - 0.5), 2)
-        elif key == K_SPACE:
-            self._silence_timer_wall = 0.0  # reset silence timer on every note-on
-            print("[silence_timer] reset to 0.0 (note-on)")
-            self._note_on()
 
     def on_key_up(self, key):
-        if key == K_SPACE:
-            self._note_off()
-            self._silence_timer_wall = _time.monotonic()
-            print(f"[silence_timer] started at wall={self._silence_timer_wall:.4f} (note-off)")
+        pass
 
     def on_text_input(self, char):
         if self._title_editing:
@@ -1386,25 +1275,57 @@ class ParametricCurveEditor:
             self._mark_dirty(pi)
 
     def _refresh_render_points(self, channel_key: str) -> None:
+        """Rebuild display point lists from channel state's display_signals.
+
+        Channel A: expects "amplitude" and/or "chirp" tensors.
+                   Builds _amp_pts, _chirp_pts from those.
+                   _wave_pts is built from channel B's "analytic" (background).
+        Channel B: expects "analytic" tensor.
+                   Builds _sig_re_pts, _sig_im_pts, _render_buf.
+        """
         state = self._channel_state(channel_key)
-        amp_sig = state.display_signals.get("amplitude")
-        chirp_sig = state.display_signals.get("chirp")
-        analytic_sig = state.display_signals.get("analytic")
-        if analytic_sig is None:
-            return
-        self._render_complex_env = analytic_sig
-        self._render_buf = analytic_sig
-        self._render_amp_env = amp_sig
-        self._render_chirp_env = chirp_sig
-        self._render_n = int(analytic_sig.numel())
-        self._render_dur = self._render_n / float(_PREVIEW_SR) if self._render_n > 0 else 0.0
         x0, _, pw, _ = self._prect(0)
         w_px = max(64, int(pw))
-        self._wave_pts = _downsample_to_pts(torch.abs(analytic_sig), w_px)
-        self._amp_pts = _downsample_env_to_pts(amp_sig if amp_sig is not None else torch.zeros(0, dtype=torch.complex128), w_px)
-        self._chirp_pts = _downsample_env_to_pts(chirp_sig if chirp_sig is not None else torch.zeros(0, dtype=torch.complex128), w_px)
-        self._sig_re_pts = _downsample_signal_lane_pts(analytic_sig, w_px, 0)
-        self._sig_im_pts = _downsample_signal_lane_pts(analytic_sig, w_px, 1)
+        _ZERO = torch.zeros(0, dtype=torch.complex128)
+
+        if channel_key == "B":
+            analytic_sig = state.display_signals.get("analytic")
+            if analytic_sig is None:
+                self._sig_re_pts = []
+                self._sig_im_pts = []
+                self._analytic_pts  = []
+                self._render_buf = None
+                return
+            self._render_buf = analytic_sig
+            # ── advance phase-rotation animation ─────────────────────────────
+            now = _time.monotonic()
+            if self._phase_rotation_last_t is not None:
+                dt = now - self._phase_rotation_last_t
+                self._phase_rotation_angle += 2.0 * math.pi * self._phase_rotation_hz * dt
+            self._phase_rotation_last_t = now
+            # Rotate the complex signal for display only; raw data is untouched.
+            rotated = analytic_sig * torch.exp(
+                torch.tensor(1j * self._phase_rotation_angle, dtype=torch.complex128)
+            )
+            self._sig_re_pts = _downsample_signal_lane_pts(rotated, w_px, 0)
+            self._sig_im_pts = _downsample_signal_lane_pts(rotated, w_px, 1)
+            # Build analytic pts from RAW signal — view projection applied at draw time
+            self._analytic_pts  = _downsample_analytic_pts(analytic_sig, w_px)
+            # Also build background wave from analytic envelope magnitude
+            self._wave_pts = _downsample_to_pts(torch.abs(analytic_sig), w_px)
+        else:
+            amp_bias_sig   = state.display_signals.get("amplitude_bias")
+            amp_sig        = state.display_signals.get("amplitude")
+            amp_total_sig  = state.display_signals.get("amplitude_total")
+            chirp_bias_sig = state.display_signals.get("chirp_bias")
+            chirp_sig      = state.display_signals.get("chirp")
+            chirp_total_sig = state.display_signals.get("chirp_total")
+            self._amp_bias_pts   = _downsample_env_to_pts(amp_bias_sig   if amp_bias_sig   is not None else _ZERO, w_px)
+            self._amp_pts        = _downsample_env_to_pts(amp_sig        if amp_sig        is not None else _ZERO, w_px)
+            self._amp_total_pts  = _downsample_env_to_pts(amp_total_sig  if amp_total_sig  is not None else _ZERO, w_px)
+            self._chirp_bias_pts = _downsample_env_to_pts(chirp_bias_sig if chirp_bias_sig is not None else _ZERO, w_px)
+            self._chirp_pts      = _downsample_env_to_pts(chirp_sig      if chirp_sig      is not None else _ZERO, w_px)
+            self._chirp_total_pts = _downsample_env_to_pts(chirp_total_sig if chirp_total_sig is not None else _ZERO, w_px)
 
     def _save_channel_wav(self, channel_key: str) -> Optional[str]:
         if not _HAS_NP:
@@ -1429,14 +1350,12 @@ class ParametricCurveEditor:
 
     def resize(self, w, h):
         self.w, self.h = w, h
-        glViewport(0, 0, w, h)
         if self._overlay:
             self._overlay.resize(w, h)
-        self._update_knob_positions()
         self._dirty = [True] * self._panel_count
         self._clamp_panels_scroll()
         if self._render_buf is not None:
-            self._refresh_render_points(self._play_channel)
+            self._refresh_render_points("B")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # Drawing
@@ -1487,62 +1406,106 @@ class ParametricCurveEditor:
             ov.gl_text(label, x0 - _ML + 2, gy - 1, col=(110, 125, 130))
 
     def _draw_rendered_overlay(self, x0, y0, pw, ph, pi):
+        if _ctx.surf is None:
+            return
         role = self._panel_roles[pi]
+        panel_w = max(1, int(math.ceil(pw)) + 2)
+        panel_h = max(1, int(math.ceil(ph)) + 2)
+        x_base = int(x0)
+        y_base = int(y0)
+        dest_xy = (x_base, self.h - y_base - panel_h)
+
+        def _panel_py(y_abs: float) -> int:
+            return int(round((self.h - 1 - y_abs) - (self.h - 1 - y_base - (panel_h - 1))))
+
+        def _new_layer() -> "pygame.Surface":
+            layer = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+            layer.fill((0, 0, 0, 0))
+            return layer
 
         # ── helper: draw an envelope fill+line from normalized (t, v) pts ──
-        def _draw_env(pts, fill_col, line_col):
+        def _draw_env(dst_layer, pts, fill_col, line_col, *, draw_line: bool = True):
             if len(pts) < 2:
                 return
-            _gl_color(fill_col)
-            glBegin(GL_QUADS)
+            fill_rgba = tuple(int(c * 255) for c in fill_col)
+            line_rgba = tuple(int(c * 255) for c in line_col)
             for i in range(len(pts) - 1):
                 t0_, v0 = pts[i]; t1_, v1 = pts[i + 1]
-                xl = x0 + t0_ * pw; xr = x0 + t1_ * pw
-                glVertex2f(xl, y0);            glVertex2f(xr, y0)
-                glVertex2f(xr, y0 + v1 * ph); glVertex2f(xl, y0 + v0 * ph)
-            glEnd()
-            _gl_color(line_col)
-            glLineWidth(1.5)
-            glBegin(GL_LINE_STRIP)
-            for t_, v in pts:
-                glVertex2f(x0 + t_ * pw, y0 + v * ph)
-            glEnd()
+                v0 = max(0.0, min(1.0, float(v0)))
+                v1 = max(0.0, min(1.0, float(v1)))
+                xl = int(round(t0_ * pw))
+                xr = int(round(t1_ * pw))
+                poly = [
+                    (xl, _panel_py(y0)),
+                    (xr, _panel_py(y0)),
+                    (xr, _panel_py(y0 + v1 * ph)),
+                    (xl, _panel_py(y0 + v0 * ph)),
+                ]
+                pygame.draw.polygon(dst_layer, fill_rgba, poly)
+            if draw_line:
+                line_pts = [
+                    (int(round(t_ * pw)), _panel_py(y0 + max(0.0, min(1.0, float(v))) * ph))
+                    for t_, v in pts
+                ]
+                if len(line_pts) >= 2:
+                    pygame.draw.lines(dst_layer, line_rgba, False, line_pts, 3)
 
-        def _draw_lanes(re_pts, im_pts):
-            """Draw complex128 re and im lanes centred at 0.5*ph."""
-            if len(re_pts) >= 2:
-                _gl_color((0.35, 0.92, 0.58, 0.75))
-                glLineWidth(1.5)
-                glBegin(GL_LINE_STRIP)
-                for t_, v in re_pts:
-                    glVertex2f(x0 + t_ * pw, y0 + (0.5 + 0.45 * v) * ph)
-                glEnd()
-            if len(im_pts) >= 2:
-                _gl_color((0.35, 0.68, 1.00, 0.75))
-                glLineWidth(1.5)
-                glBegin(GL_LINE_STRIP)
-                for t_, v in im_pts:
-                    glVertex2f(x0 + t_ * pw, y0 + (0.5 + 0.45 * v) * ph)
-                glEnd()
+        def _composite_env(pts, fill_col, line_col, *, draw_line: bool = True):
+            layer = _new_layer()
+            _draw_env(layer, pts, fill_col, line_col, draw_line=draw_line)
+            _alpha_blit_rgb(_ctx.surf, layer, dest_xy)
+
+        def _draw_analytic_waves():
+            if len(self._analytic_pts) < 2:
+                return
+            layer = _new_layer()
+            cy = y0 + ph * 0.5
+            scale = ph * 0.42
+            center_py = _panel_py(cy)
+
+            pygame.draw.line(layer, (55, 55, 55, 255),
+                             (0, center_py), (int(round(pw)), center_py), 1)
+
+            c_re = math.cos(self._phase_rotation_angle)
+            c_im = math.sin(self._phase_rotation_angle)
+
+            re_screen = []
+            im_screen = []
+            for t_frac, re, im in self._analytic_pts:
+                sx = int(round(t_frac * pw))
+                re_screen.append((sx, _panel_py(cy - re * c_re * scale)))
+                im_screen.append((sx, _panel_py(cy - im * c_im * scale)))
+
+            step = max(1, len(self._analytic_pts) // 48)
+            for i in range(0, len(self._analytic_pts), step):
+                pygame.draw.line(layer, (40, 100, 55, 255),
+                                 (re_screen[i][0], center_py), re_screen[i], 1)
+                pygame.draw.line(layer, (40, 75, 120, 255),
+                                 (im_screen[i][0], center_py), im_screen[i], 1)
+
+            if len(re_screen) >= 2:
+                pygame.draw.lines(layer, (75, 210, 110, 255), False, re_screen, 2)
+            if len(im_screen) >= 2:
+                pygame.draw.lines(layer, (75, 148, 230, 255), False, im_screen, 2)
+            _alpha_blit_rgb(_ctx.surf, layer, dest_xy)
 
         if role == "analytic":
-            _draw_lanes(self._sig_re_pts, self._sig_im_pts)
+            _draw_analytic_waves()
 
         elif role == "amplitude":
-            # Background: |analytic| — the amplitude envelope traced on the oscillator
-            _draw_env(self._wave_pts, _COL_CRTOSC_FILL, _COL_CRTOSC_LINE)
-            # Foreground: amplitude envelope curve
-            _draw_env(self._amp_pts, _COL_REND_0_FILL, _COL_REND_0_LINE)
+            _composite_env(self._amp_bias_pts, _COL_LAYER_R_FILL, _COL_LAYER_R_LINE)
+            _composite_env(self._amp_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE)
+            _composite_env(self._amp_total_pts or self._wave_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE)
 
         elif role == "chirp":
-            # Background: placeholder until voice node is wired (see analytic_driver)
-            # — chirp-modified oscillator will be provided by the torch engine
-            # Foreground: chirp envelope curve
-            _draw_env(self._chirp_pts, _COL_REND_1_FILL, _COL_REND_1_LINE)
+            _composite_env(self._chirp_bias_pts, _COL_LAYER_R_FILL, _COL_LAYER_R_LINE)
+            _composite_env(self._chirp_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE)
+            _composite_env(self._chirp_total_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE)
 
         elif role == "output":
-            # Complex analytic signal: re and im lanes
-            _draw_lanes(self._sig_re_pts, self._sig_im_pts)
+            _composite_env(self._amp_total_pts or self._wave_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE, draw_line=False)
+            _composite_env(self._chirp_total_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE, draw_line=False)
+            _draw_analytic_waves()
 
     def _draw_spline(self, x0, y0, pw, ph, pi):
         if not self._panel_is_curve(pi):
@@ -1552,13 +1515,11 @@ class ParametricCurveEditor:
             self._display_polys[pi] = _build_display_polylines(c, 512)
             self._dirty[pi] = False
         col = _COL_SPLINE_1 if pi == 1 else _COL_SPLINE_0
-        glLineWidth(2.5)
-        _gl_color(col)
+        rgb = tuple(int(c * 255) for c in col[:3])
         for poly in self._display_polys[pi]:
-            glBegin(GL_LINE_STRIP)
-            for tn, vn in poly:
-                glVertex2f(x0 + tn * pw, y0 + vn * ph)
-            glEnd()
+            pts_py = [(int(x0 + tn * pw), _py(y0 + vn * ph)) for tn, vn in poly]
+            if len(pts_py) >= 2:
+                pygame.draw.lines(_ctx.surf, rgb, False, pts_py, 3)
 
     def _draw_points(self, x0, y0, pw, ph, pi):
         if not self._panel_is_curve(pi):
@@ -1579,16 +1540,7 @@ class ParametricCurveEditor:
             _gl_color(col);                     _draw_diamond(sx, sy, 5.0)
 
     def _draw_playhead(self, x0, y0, pw, ph):
-        if self._play_state == "hang" and self._render_buf is not None:
-            # Post-render audio is playing: track position in the audio buffer
-            # by wall-clock elapsed time — never use _env_frac here.
-            elapsed = _time.monotonic() - self._render_play_t0
-            cx = x0 + min(1.0, elapsed / max(self._render_dur, 1e-9)) * pw
-        else:
-            return
-        _gl_color(_COL_PLAYHEAD)
-        glLineWidth(2.0)
-        _draw_line(cx, y0, cx, y0 + ph)
+        pass  # no playback state in passive display mode
 
     def _draw_markers(self, x0, y0, pw, ph, pi, ov):
         if not self._panel_is_curve(pi):
@@ -1666,6 +1618,15 @@ class ParametricCurveEditor:
                      hover=(hb == (pi, "scale")),
                      active=(self._open_dropdown == ("scale", pi)))
 
+        # Complex-collapse mode toggle  (Re = .real  |  |z| = abs)
+        rx, ry, rw, rh = rects["collapse"]
+        ccm = self._curves[pi].complex_collapse_mode
+        ccm_lbl = "Re" if ccm == "real" else "|z|"
+        ov.gl_button(ccm_lbl, rx, ry, rw, rh,
+                     col_bg=(40, 40, 55) if ccm == "real" else (55, 40, 40),
+                     col_text=(160, 180, 230) if ccm == "real" else (230, 170, 140),
+                     hover=(hb == (pi, "collapse")))
+
         # SAVE / LOAD buttons
         rx, ry, rw, rh = rects["save"]
         ov.gl_button(self._panel_save_label(pi), rx, ry, rw, rh,
@@ -1704,8 +1665,7 @@ class ParametricCurveEditor:
                             bx, by, bw, item_h=16.0)
 
     def _draw_knobs(self, ov):
-        for i, k in enumerate(self._knobs):
-            _draw_knob(k, hover=(i == self._hover_knob), ov=ov, screen_h=self.h)
+        pass  # knobs removed
 
     def _draw_status(self, ov):
         if not ov:
@@ -1720,406 +1680,36 @@ class ParametricCurveEditor:
             f"  [{self._panel_roles[fp]}:{self._panel_channels[fp]}]  t={self._mouse_t:.3f}"
             f"  v={v_phys:.3g}  pts={len(c.points)}{act_tag}",
             4, 4, col=(160, 165, 170))
-        state_tag = ""
-        if self._play_state == "hang" and self._render_n > 0:
-            frac = min(1.0, self._play_elapsed / max(self._render_dur, 1e-9))
-            state_tag = f"  \u25b6 {frac*100:.0f}%"
-        elif self._play_state == "playing":
-            state_tag = "  \u25cf live"
-        if state_tag:
-            ov.text(state_tag, self.w // 2 - 24, 4, col=(200, 200, 70))
         for i, ln in enumerate([
             "LMB=add/drag  RMB=del  Ctrl+LMB=add marker  Tab=focus/cycle",
             "Role/Ch in header  PAD|TS per channel  Analytic save=complex WAV",
         ]):
             ov.text(ln, 4, self.h - 14 * (2 - i) - 2, col=(80, 88, 96))
 
-    def _tick_note_report(self):
-        """Check the silence timer and print a note timing report if 10 s have elapsed."""
-        if self._silence_timer_wall <= 0.0:
-            return
-        elapsed = _time.monotonic() - self._silence_timer_wall
-        if elapsed < 10.0:
-            return
-        print(f"[silence_timer] 10s elapsed ({elapsed:.2f}s) — firing report, reset to 0.0")
-        self._silence_timer_wall = 0.0
-        state = self._channel_state(self._play_channel)
-        if not state.gate_history:
-            return
-        print("=== note timing report ===")
-        for i, g in enumerate(state.gate_history):
-            t_off_str = f"{g.t_off:.4f}" if g.t_off is not None else "held"
-            dur_str = (f"{g.t_off - g.t_on:.4f}" if g.t_off is not None else "?")
-            print(f"  [{i}]  on={g.t_on:.4f}s  off={t_off_str}s"
-                  f"  dur={dur_str}s  vel={g.velocity:.2f}")
-        print(f"  total notes: {len(state.gate_history)}")
-        print("==========================")
-        self._print_segment_sequence_report(self._play_channel)
-        self._print_rules_stitch_report(self._play_channel)
-        self._do_post_render_piecewise(self._play_channel)
-
-    def _print_segment_sequence_report(self, channel_key: str):
-        """Print the ordered sequence of envelope segments traversed across all notes."""
-        state = self._channel_state(channel_key)
-        curve = self._channel_amp_curve(channel_key)
-        if curve is None:
-            print(f"=== segment sequence report [{channel_key}] ===")
-            print("  no amplitude curve on this channel")
-            print("===================================")
-            return
-        dur = max(float(self._knobs[2].value), 1e-9)
-
-        # Build ordered region list from curve markers: [(t_lo, t_hi, phase_label), ...]
-        # Each region is named by stripping boundary-type suffixes from its RIGHT marker
-        # label, so "attack_end" → "attack", "section_2_begin" → "section_2", etc.
-        # Markers with empty/whitespace labels get an ordinal default "seg_N".
-        # The last region (past the final marker) is named after the final marker if one
-        # exists (same stripping logic), otherwise "seg_N".
-        sorted_m = sorted(curve.markers, key=lambda m: m.t)
-        bounds   = [0.0] + [m.t for m in sorted_m] + [1.0]
-
-        _BOUNDARY_SUFFIXES = ("_end", "_start", "_begin", "_out", "_in")
-
-        def _phase_name(raw: str, fallback: str) -> str:
-            label = (raw or "").strip()
-            if not label:
-                return fallback
-            for suffix in _BOUNDARY_SUFFIXES:
-                if label.endswith(suffix):
-                    stem = label[: -len(suffix)].strip()
-                    return stem if stem else fallback
-            return label
-
-        # right-boundary labels: one per region, last region uses the final marker (if
-        # any) with a "_tail" sense, or just the ordinal fallback
-        n_regions = len(bounds) - 1
-        regions = []
-        for i in range(n_regions):
-            fallback = f"seg_{i + 1}"
-            if i < len(sorted_m):
-                # region i is bounded on the right by sorted_m[i]
-                label = _phase_name(sorted_m[i].label, fallback)
-            else:
-                # last region has no right marker — derive from the final marker if present
-                if sorted_m:
-                    stem = _phase_name(sorted_m[-1].label, "")
-                    label = f"{stem}_tail" if stem else fallback
-                else:
-                    label = fallback
-            regions.append((bounds[i], bounds[i + 1], label))
-
-        print("=== segment sequence report ===")
-        all_segs = []
-        for ni, g in enumerate(state.gate_history):
-            # How long was this note held (in wall seconds)
-            if g.t_off is not None:
-                note_wall_dur = g.t_off - g.t_on
-            else:
-                # Still held — treat as if it ran to end of curve
-                note_wall_dur = dur
-            # How far into the curve did this note get [0, 1]
-            curve_end = min(1.0, note_wall_dur / dur)
-
-            for r_lo, r_hi, label in regions:
-                if r_lo >= curve_end:
-                    break
-                seg_c_lo = r_lo
-                seg_c_hi = min(r_hi, curve_end)
-                seg_w_lo = g.t_on + seg_c_lo * dur
-                seg_w_hi = g.t_on + seg_c_hi * dur
-                clipped  = seg_c_hi < r_hi
-                all_segs.append((ni, label, seg_c_lo, seg_c_hi, seg_w_lo, seg_w_hi, clipped))
-
-        # Merge in tracked blend events as first-class transition segments
-        for b in state.blend_history:
-            ni   = b["note_idx"]
-            c_lo = b["c_lo"]
-            c_hi = b["c_hi"]
-            w_lo = b["gate_t_on"] + c_lo * dur
-            w_hi = b["gate_t_on"] + c_hi * dur
-            label = f"{b['trigger']}/{b['blend_mode']}"
-            all_segs.append((ni, label, c_lo, c_hi, w_lo, w_hi, False))
-
-        # Sort by wall start time so the timeline reads chronologically
-        all_segs.sort(key=lambda s: (s[4], s[0]))
-
-        for ni, label, c_lo, c_hi, w_lo, w_hi, clipped in all_segs:
-            clip_tag = "  [clipped]" if clipped else ""
-            print(f"  note[{ni}] {label:<24}  curve=[{c_lo:.4f},{c_hi:.4f}]"
-                  f"  wall=[{w_lo:.4f},{w_hi:.4f}]s{clip_tag}")
-        print(f"  total segments: {len(all_segs)}")
-        print("===============================")
-
-    def _channel_interpreted_builders(
-        self,
-        channel_key: str,
-    ) -> tuple[
-        Optional[PiecewiseEnvelopeBuilder],
-        Optional[PiecewiseEnvelopeBuilder],
-        Optional[Any],
-        Optional[Any],
-        Optional[ParametricCurve],
-        Optional[ParametricCurve],
-    ]:
-        state = self._channel_state(channel_key)
-        amp_curve, chirp_curve = self._channel_render_curves(channel_key)
-        if amp_curve is None or chirp_curve is None:
-            return None, None, None, None, amp_curve, chirp_curve
-        amp_builder = PiecewiseEnvelopeBuilder.from_curve(
-            amp_curve,
-            blend_history=list(state.blend_history),
-        )
-        chirp_builder = PiecewiseEnvelopeBuilder.from_curve(
-            chirp_curve,
-            blend_history=list(state.blend_history),
-        )
-        amp_fn = amp_builder.build()
-        chirp_fn = chirp_builder.build()
-        return (
-            amp_builder,
-            chirp_builder,
-            amp_fn,
-            chirp_fn,
-            amp_curve,
-            chirp_curve,
-        )
-
-    def _print_rules_stitch_report(self, channel_key: str) -> None:
-        """Print the rules-interpretation stitch report for amp and chirp builders.
-
-        Shows every piece produced by PiecewiseEnvelopeBuilder.from_curve for both
-        curves, then verifies that the expected render sample count (based purely on
-        the gate history span + dur) matches what render_piecewise_audio will produce
-        — without trimming.
-        """
-        state = self._channel_state(channel_key)
-        amp_builder, chirp_builder, _amp_fn, _chirp_fn, amp_curve, chirp_curve = (
-            self._channel_interpreted_builders(channel_key)
-        )
-        if amp_builder is None or chirp_builder is None or amp_curve is None or chirp_curve is None:
-            print("=== rules interpretation / stitch report ===")
-            print("  channel is missing amplitude/chirp curves")
-            print("=============================================")
-            return
-        dur = max(float(self._knobs[2].value), 1e-9)
-
-        def _traverse(pieces: list) -> list:
-            """
-            Mirror the exact traversal logic of _print_segment_sequence_report
-            but using builder pieces as the region source instead of raw markers.
-            Returns rows: (ni, label, c_lo, c_hi, w_lo, w_hi, clipped)
-            """
-            rows = []
-            for ni, g in enumerate(state.gate_history):
-                note_wall_dur = (g.t_off - g.t_on) if g.t_off is not None else dur
-                curve_end = min(1.0, note_wall_dur / dur)
-                for p in pieces:
-                    if p.t_lo >= curve_end:
-                        break
-                    seg_c_hi = min(p.t_hi, curve_end)
-                    seg_w_lo = g.t_on + p.t_lo  * dur
-                    seg_w_hi = g.t_on + seg_c_hi * dur
-                    clipped  = seg_c_hi < p.t_hi
-                    rows.append((ni, p.label, p.t_lo, seg_c_hi,
-                                 seg_w_lo, seg_w_hi, clipped))
-            return rows
-
-        def _seg_seq_count(curve) -> int:
-            """Recompute the raw-marker traversal count the same way
-            _print_segment_sequence_report does, so we can compare."""
-            sm = sorted(curve.markers, key=lambda m: m.t)
-            bounds = [0.0] + [m.t for m in sm] + [1.0]
-            n_reg = len(bounds) - 1
-            count = 0
-            for g in state.gate_history:
-                note_dur  = (g.t_off - g.t_on) if g.t_off is not None else dur
-                curve_end = min(1.0, note_dur / dur)
-                for ri in range(n_reg):
-                    if bounds[ri] >= curve_end:
-                        break
-                    count += 1
-            count += len(state.blend_history)
-            return count
-
-        # --- header ---
-        print("=== rules interpretation / stitch report ===")
-        print(f"  (should mirror segment sequence report — mismatch = builder bug)")
-
-        # --- per-curve traversal ---
-        for name, builder, curve in (
-            ("amplitude", amp_builder, amp_curve),
-            ("chirp",     chirp_builder, chirp_curve),
-        ):
-            pieces    = builder.pieces()
-            rows      = _traverse(pieces)
-            seq_count = _seg_seq_count(curve)
-
-            # coverage check
-            covered = 0.0
-            gaps = []
-            for p in pieces:
-                if p.t_lo > covered + 1e-9:
-                    gaps.append((covered, p.t_lo))
-                covered = max(covered, p.t_hi)
-            if covered < 1.0 - 1e-9:
-                gaps.append((covered, 1.0))
-
-            match_tag = "✓" if len(rows) == seq_count else f"!! MISMATCH (rules={len(rows)} seq={seq_count})"
-            print(f"  -- {name}: {len(pieces)} piece(s), "
-                  f"{len(rows)} traversals / {seq_count} seq-expected  {match_tag}")
-
-            if gaps:
-                for g_lo, g_hi in gaps:
-                    print(f"    !! GAP [{g_lo:.4f}, {g_hi:.4f}] — fallback fires here")
-
-            for ni, label, c_lo, c_hi, w_lo, w_hi, clipped in rows:
-                clip_tag = "  [clipped]" if clipped else ""
-                print(f"    note[{ni}] {label:<24}  curve=[{c_lo:.4f},{c_hi:.4f}]"
-                      f"  wall=[{w_lo:.4f},{w_hi:.4f}]s{clip_tag}")
-            print(f"  total segments: {len(rows)}")
-
-        # --- expected render length ---
-        t_offset_abs    = state.gate_history[0].t_on
-        last_g          = state.gate_history[-1]
-        last_t_off_norm = (last_g.t_off - t_offset_abs) if last_g.t_off is not None \
-                          else (last_g.t_on - t_offset_abs)
-        render_end  = last_t_off_norm + dur
-        n_over_exp  = min(int(render_end * _PREVIEW_SR * 4) + 4, _PREVIEW_SR * 4 * 60)
-        n_out_exp   = n_over_exp // 4
-
-        print(f"  notes in session  : {len(state.gate_history)}")
-        print(f"  gate span (norm)  : 0.0 → {last_t_off_norm:.4f}s")
-        print(f"  render_end        : {render_end:.4f}s  (last_t_off + dur {dur:.4f}s)")
-        print(f"  expected n_over   : {n_over_exp}  (at {_PREVIEW_SR * 4} Hz)")
-        print(f"  expected n_out    : {n_out_exp}   (at {_PREVIEW_SR} Hz)")
-        print(f"  expected duration : {n_out_exp / _PREVIEW_SR:.4f}s")
-
-        # --- fidelity: builder callable vs raw curve on dense linspace [0, 1] ---
-        # Both paths must agree at every t_norm — if they don't, the builder is broken.
-        N_PROBE = 4096
-        probe_t = torch.linspace(0.0, 1.0, N_PROBE, dtype=torch.float64)
-
-        for name, builder, curve in (
-            ("amplitude", amp_builder, amp_curve),
-            ("chirp",     chirp_builder, chirp_curve),
-        ):
-            fn_rules    = builder.build()
-            direct_vals = curve.evaluate_normalized(probe_t).abs().to(torch.float64)
-            rules_vals  = fn_rules(probe_t).abs().to(torch.float64)
-            err      = (rules_vals - direct_vals).abs()
-            max_err  = float(err.max())
-            mean_err = float(err.mean())
-            n_bad    = int((err > 1e-6).sum())
-            worst_t  = float(probe_t[int(err.argmax())])
-            ok_tag = "✓" if max_err < 1e-6 else "!! FIDELITY FAILURE"
-            print(f"  fidelity [{name}]: max_err={max_err:.2e}  mean_err={mean_err:.2e}"
-                  f"  n_bad(>1e-6)={n_bad}/{N_PROBE}  worst_t={worst_t:.4f}  {ok_tag}")
-
-        print("=============================================")
-
-    def _do_post_render_piecewise(self, channel_key: Optional[str] = None) -> None:
-        """Render audio using the piecewise callables built from the completed session.
-
-        Called immediately after the segment-sequence report fires (10 s silence
-        timer).  Synthesises at ``_PREVIEW_SR × 4`` oversampling then box-filters
-        back to ``_PREVIEW_SR`` for clean blending across region boundaries.
-        The resulting audio and envelope arrays replace the current overlay buffers
-        and are played back via sounddevice exactly once.
-        """
-        channel_key = channel_key or self._play_channel
-        if not _HAS_SD or not _HAS_NP:
-            return
-        state = self._channel_state(channel_key)
-        if not state.gate_history:
-            return
-        amp_builder, chirp_builder, env_fn, chirp_fn, amp_curve, chirp_curve = (
-            self._channel_interpreted_builders(channel_key)
-        )
-        if env_fn is None or chirp_fn is None or amp_curve is None or chirp_curve is None:
-            print(f"[piecewise] channel {channel_key} is missing amplitude/chirp curves")
-            return
-
-        freq = float(self._knobs[0].value)
-        gain = float(self._knobs[1].value)
-        dur  = float(self._knobs[2].value)
-
-        audio, amp_np, chr_np, osc_np = render_piecewise_audio(
-            env_fn       = env_fn,
-            chirp_fn     = chirp_fn,
-            gate_history = list(state.gate_history),
-            amp_curve    = amp_curve,
-            chirp_curve  = chirp_curve,
-            freq_hz      = freq,
-            gain         = gain,
-            dur          = dur,
-            sr           = _PREVIEW_SR,
-            oversample   = 4,
-            tau_up       = self._tau_up,
-        )
-        if audio is None:
-            return
-        state.raw_signals = {
-            "amplitude": torch.as_tensor(amp_np, dtype=torch.complex128).reshape(-1),
-            "chirp": torch.as_tensor(chr_np, dtype=torch.complex128).reshape(-1),
-            "analytic": torch.as_tensor(audio, dtype=torch.complex128).reshape(-1),
-        }
-        state.display_signals = normalize_channel_complex_signals(
-            state.raw_signals,
-            time_stretch=state.time_stretch,
-        )
-        self._play_channel = channel_key
-        self._refresh_render_points(channel_key)
-
-        print(f"[piecewise] rendered {len(audio)} samples "
-              f"({self._render_dur:.3f}s) at {_PREVIEW_SR} Hz "
-              f"(4× oversample + box filter)")
-
-        # Verify return length equals what the note data demands.
-        # Expected: (last_t_off_norm + dur) rounded to sr, matching the render window
-        # computed in render_piecewise_audio without any early trim.
-        t_off_norm = (state.gate_history[-1].t_off - state.gate_history[0].t_on
-                      if state.gate_history[-1].t_off is not None
-                      else state.gate_history[-1].t_on - state.gate_history[0].t_on)
-        expected_s     = t_off_norm + dur
-        n_over_exp     = min(int(expected_s * _PREVIEW_SR * 4) + 4, _PREVIEW_SR * 4 * 60)
-        expected_n_out = (n_over_exp // 4)
-        actual_n_out   = len(audio)
-        delta          = actual_n_out - expected_n_out
-        ok_tag = "✓" if abs(delta) <= 4 else f"!! MISMATCH delta={delta:+d}"
-        print(f"[piecewise] length check: expected≈{expected_n_out}  actual={actual_n_out}  {ok_tag}")
-        _sd.play(torch.view_as_real(torch.as_tensor(audio, dtype=torch.complex128)).detach().cpu().numpy(),
-                 samplerate=_PREVIEW_SR)
-        self._render_play_t0      = _time.monotonic()
-        self._play_elapsed        = 0.0
-        self._play_state          = "hang"
-        self._last_note_off_wall  = 0.0
-        state.gate_history        = []
-        state.blend_history       = []
-        state.env_frac            = 0.0
-        state.sustain_rate        = 1.0
-
     # ── main draw ─────────────────────────────────────────────────────────────
 
-    def draw(self):
-        self._tick_note_report()
-        self._tick_play()
+    def _draw_frame(self, *, clear_bg: bool, flip: bool,
+                     win_x: int = 0, win_y_bottom: int = 0) -> "pygame.Surface":
+        # Ensure frame surface exists at the current logical size
+        if (not hasattr(self, '_frame_surf')
+                or self._frame_surf.get_size() != (self.w, self.h)):
+            self._frame_surf = pygame.Surface((self.w, self.h))
+        surf = self._frame_surf
 
-        glClearColor(*_COL_BG)
-        glClear(GL_COLOR_BUFFER_BIT)
-        glMatrixMode(GL_PROJECTION); glLoadIdentity()
-        glOrtho(0, self.w, 0, self.h, -1, 1)
-        glMatrixMode(GL_MODELVIEW);  glLoadIdentity()
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        if clear_bg:
+            surf.fill(tuple(int(c * 255) for c in _COL_BG[:3]))
+
+        # Point the module-level drawing context at this surface
+        _ctx.surf = surf
+        _ctx.h    = self.h
 
         if self._overlay:
             self._overlay.begin()
 
-        # Apply GL scissor to clip all panel drawing to the scrollable viewport
+        # Clip drawing to the scrollable panels viewport
         vx, vy, vw, vh = _panels_view_gl_rect(self.w, self.h)
-        if _HAS_GL:
-            glEnable(GL_SCISSOR_TEST)
-            glScissor(int(vx), int(vy), int(vw), int(vh))
+        clip_rect = pygame.Rect(int(vx), self.h - int(vy) - int(vh), int(vw), int(vh))
+        surf.set_clip(clip_rect)
 
         for pi in range(self._panel_count):
             x0, y0, pw, ph = self._prect(pi)
@@ -2138,18 +1728,47 @@ class ParametricCurveEditor:
                 self._draw_y_axis_labels(x0, y0, pw, ph, curve, self._overlay)
                 self._draw_header(pi, self._overlay)
 
-        # Disable scissor so knobs and dropdowns draw outside the panels viewport
-        if _HAS_GL:
-            glDisable(GL_SCISSOR_TEST)
+        # Un-clip for knobs and dropdowns (drawn outside the panels viewport)
+        surf.set_clip(None)
 
         self._draw_knobs(self._overlay)
 
         if self._overlay:
             self._draw_open_dropdown(self._overlay)   # drawn last = on top
             self._draw_status(self._overlay)
-            self._overlay.flush_to_gl()
+            self._overlay.blit_to(surf)
 
-        pygame.display.flip()
+        if flip:
+            win = pygame.display.get_surface()
+            if win is not None:
+                win.blit(surf, (0, 0))
+            pygame.display.flip()
+
+        return surf
+
+    def draw_embedded(self, target_surf: "pygame.Surface" = None,
+                      dest: tuple = (0, 0)) -> "pygame.Surface":
+        """Draw the editor; return the frame surface and optionally blit into target_surf.
+
+        target_surf  — if provided, the frame is blitted at dest (top-left pygame coords)
+        dest         — (x, y) blit destination on target_surf
+        """
+        surf = self._draw_frame(clear_bg=False, flip=False)
+        if target_surf is not None:
+            target_surf.blit(surf, dest)
+        return surf
+
+    def render_to_surface(self, w: int, h: int) -> "pygame.Surface":
+        """Render the editor into a pygame.Surface and return it.
+
+        Compatible with the surface-based centre-display pipeline used by all
+        other EditorCanvas tabs (e.g. bass_viewer, analytic_driver).
+        """
+        self.resize(w, h)
+        return self._draw_frame(clear_bg=True, flip=False)
+
+    def draw(self):
+        self._draw_frame(clear_bg=True, flip=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2163,17 +1782,16 @@ def run(amp_curve:    Optional[ParametricCurve] = None,
         h:             int = 820,
         title:         str = "Parametric Curve Editor",
         library_folder: str = "envelopes"):
-    if not _HAS_GL:
-        raise RuntimeError("pygame and PyOpenGL are required for the editor UI.")
+    if not _HAS_PYGAME:
+        raise RuntimeError("pygame is required for the standalone editor UI.")
 
     if amp_curve   is None: amp_curve   = default_envelope("amplitude")
     if chirp_curve is None: chirp_curve = default_chirp("chirp")
 
     pygame.init()
     pygame.font.init()
-    pygame.display.set_mode((w, h), DOUBLEBUF | OPENGL | RESIZABLE)
+    screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
     pygame.display.set_caption(title)
-    glViewport(0, 0, w, h)
 
     editor = ParametricCurveEditor(amp_curve, chirp_curve, signal_curve,
                                    w=w, h=h, library_folder=library_folder)
@@ -2186,8 +1804,9 @@ def run(amp_curve:    Optional[ParametricCurve] = None,
             if ev.type == QUIT:
                 running = False
             elif ev.type == pygame.VIDEORESIZE:
-                editor.resize(ev.w, ev.h)
                 w, h = ev.w, ev.h
+                screen = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+                editor.resize(w, h)
             elif ev.type == MOUSEBUTTONDOWN:
                 mx, my = ev.pos
                 editor.on_mouse_down(ev.button, float(mx), float(h - my),

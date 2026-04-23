@@ -8,7 +8,7 @@ import numpy as np
 def _stub_analytic_driver_imports() -> None:
     """Augment the lightweight test stubs so analytic_driver can import."""
     locals_mod = sys.modules["pygame.locals"]
-    for name in ["K_LCTRL", "K_RCTRL", "K_z", "K_DELETE", "K_n", "K_o"]:
+    for name in ["K_LCTRL", "K_RCTRL", "K_z", "K_DELETE", "K_n", "K_o", "K_d", "K_m", "K_l", "K_t", "K_RETURN", "K_BACKSPACE", "K_a", "K_EQUALS", "K_MINUS"]:
         setattr(locals_mod, name, 0)
 
     gl_mod = sys.modules["OpenGL.GL"]
@@ -18,14 +18,16 @@ def _stub_analytic_driver_imports() -> None:
         "GL_ONE_MINUS_SRC_ALPHA", "GL_QUADS", "GL_RGBA", "GL_SRC_ALPHA",
         "GL_TEXTURE_2D", "GL_TEXTURE_MAG_FILTER", "GL_TEXTURE_MIN_FILTER",
         "GL_TEXTURE_WRAP_S", "GL_TEXTURE_WRAP_T", "GL_TRIANGLES",
-        "GL_UNSIGNED_BYTE",
+        "GL_UNSIGNED_BYTE", "GL_PROJECTION", "GL_MODELVIEW",
+        "GL_SCISSOR_TEST",
     ]:
         setattr(gl_mod, name, 0)
     for name in [
         "glBegin", "glBindTexture", "glBlendFunc", "glClear", "glClearColor",
         "glColor4f", "glDeleteTextures", "glDisable", "glEnable", "glEnd",
         "glGenTextures", "glLineWidth", "glTexCoord2f", "glTexImage2D",
-        "glTexParameteri", "glVertex2f", "glViewport",
+        "glTexParameteri", "glVertex2f", "glViewport", "glDrawPixels",
+        "glLoadIdentity", "glMatrixMode", "glOrtho", "glScissor",
     ]:
         setattr(gl_mod, name, lambda *args, **kwargs: 0)
 
@@ -39,6 +41,7 @@ from analytic_driver import (  # noqa: E402
     EditorCanvas,
     EditorMode,
     AnalyticVoice,
+    PiecewiseVoiceEnvelope,
     Chair,
     GlobalTuning,
     NoteEvent,
@@ -61,6 +64,7 @@ from analytic_driver import (  # noqa: E402
     _patch_node_keys,
     _prepare_output_bus_for_device,
     _refresh_system_audio_report,
+    _detected_envelope_artifact_paths,
     resolve_parts_from_patch,
     _synthesize_patch,
     _working_routing_graph_for_synthesis,
@@ -466,6 +470,56 @@ def test_analytic_voice_polyphony_roundtrip() -> None:
 
     assert restored.polyphony_count == 3
     assert restored.polyphony_mode == "unsympathetic"
+
+
+def test_piecewise_voice_payload_roundtrips() -> None:
+    voice = AnalyticVoice(
+        key="vpw",
+        label="Piecewise Voice",
+        env_type="piecewise",
+        piecewise_env=PiecewiseVoiceEnvelope(),
+    )
+    voice.piecewise_env.curve.name = "amp_curve"
+    voice.piecewise_env.curve.markers[0].label = "attack_end"
+    voice.piecewise_env.source_path = "C:/tmp/fb_envelopes.npz"
+
+    restored = AnalyticVoice.from_dict(voice.to_dict())
+
+    assert restored.env_type == "piecewise"
+    assert restored.piecewise_env is not None
+    assert restored.piecewise_env.curve.name == "amp_curve"
+    assert restored.piecewise_env.curve.markers[0].label == "attack_end"
+    assert restored.piecewise_env.source_path.endswith("fb_envelopes.npz")
+
+
+def test_detected_envelope_artifacts_include_inventory_paths(tmp_path) -> None:
+    analysis_dir = tmp_path / "analysis_run"
+    filterbank_dir = analysis_dir / "filterbank"
+    filterbank_dir.mkdir(parents=True)
+    env_path = filterbank_dir / "fb_envelopes.npz"
+    env_path.write_bytes(b"placeholder")
+    inv_path = analysis_dir / "analysis_inventory.json"
+    inv_path.write_text(
+        """
+        {
+          "schema": "analysis_inventory_v2",
+          "datasets": [
+            {
+              "dataset_key": "fb:test",
+              "engine": "fb",
+              "artifacts": [
+                {"kind": "envelopes", "path": "filterbank/fb_envelopes.npz"}
+              ]
+            }
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    found = _detected_envelope_artifact_paths(str(tmp_path))
+
+    assert str(env_path.resolve()) in found
 
 
 def test_arrangement_solver_creates_multiple_chairs_from_polyphony() -> None:

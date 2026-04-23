@@ -214,6 +214,20 @@ def routing_edge_to_tensor_edge(e) -> "TensorEdge":
     )
 
 
+def _prune_orphan_tensor_nodes(nodes: list, edges: list) -> "Tuple[List, List]":
+    """Drop nodes that have no explicit edge membership in the emitted graph."""
+    if not edges:
+        return nodes, edges
+    active_keys = {str(e.src_key) for e in edges} | {str(e.dst_key) for e in edges}
+    nodes = [node for node in nodes if node.key in active_keys]
+    valid_keys = {node.key for node in nodes}
+    edges = [
+        edge for edge in edges
+        if edge.src_key in valid_keys and edge.dst_key in valid_keys
+    ]
+    return nodes, edges
+
+
 # ---------------------------------------------------------------------------
 # materialize_network — full torch module assembly
 # ---------------------------------------------------------------------------
@@ -328,4 +342,4 @@ def materialize_network(
             continue
         edges.append(routing_edge_to_tensor_edge(re))
 
-    return nodes, edges
+    return _prune_orphan_tensor_nodes(nodes, edges)

@@ -218,11 +218,7 @@ def _build_linear_solver() -> GraphSolver:
                         icl_meta_sim="master_bus_out",
                     ),
                 ),
-                mixer=MixerNodeSpec(
-                    parameter_matrix_keys=("print_gain", "print_pan"),
-                    icl_model="virtual_console_bus",
-                    physical_presence="master_section",
-                ),
+                mixer=MixerNodeSpec(),
             ),
         ),
     ]

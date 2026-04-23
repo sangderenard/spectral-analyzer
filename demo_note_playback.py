@@ -14,13 +14,24 @@ Network topology
 
 Gate events are fired at quantized sample boundaries by the outer render loop.
 Pitch is injected via the {key}_pitch_in ext port each tick (complex128 scalar).
-Output is mix_out.real, normalised to ±1, sent to sounddevice.
+Output is mix_out.real, written to a short mono WAV by default, and optionally
+played through sounddevice.
 """
 
+from pathlib import Path
 import sys
 import types
+import wave
 import torch
 import sounddevice as sd
+
+import graph_solver as _gs
+
+_gs.PROFILE_TIMING = False
+_gs.PROFILE_REPORT_INTERVAL_S = 0.0
+_gs._T.stop_reporter()
+_gs._T.reset()
+
 from voice_graph_node import build_voice_mixer_network
 
 try:
@@ -30,6 +41,8 @@ except ImportError:
     _has_tqdm = False
 
 _CDTYPE = torch.complex128
+OUTPUT_WAV_PATH = Path("demo_note_playback.wav")
+PLAY_AUDIO = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -84,6 +97,52 @@ def _progress(iterable, total, desc=""):
     return _Simple(iterable, total)
 
 
+def _normalization_reference(waveform: torch.Tensor, top_k: int = 128) -> float:
+    mags = waveform.detach().abs().reshape(-1)
+    if mags.numel() == 0:
+        return 1.0
+    peak = float(mags.max().item())
+    if peak <= 1e-12:
+        return 1.0
+    k = min(max(1, int(top_k)), int(mags.numel()))
+    top = torch.topk(mags, k).values
+    robust = float(top.median().item())
+    return robust if robust > 1e-12 else peak
+
+
+def _prepare_audio_for_output(
+    waveform: torch.Tensor,
+    *,
+    target_peak: float = 0.95,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    wav = waveform.detach().to(torch.float64).cpu()
+    raw_peak = float(wav.abs().max().item()) if wav.numel() else 0.0
+    rms = float(torch.sqrt(torch.mean(wav.square())).item()) if wav.numel() else 0.0
+    scale_ref = _normalization_reference(wav)
+    if scale_ref > 1e-12:
+        wav = wav * (float(target_peak) / scale_ref)
+    wav = torch.clamp(wav, -1.0, 1.0)
+    clipped = int(torch.count_nonzero((wav.abs() >= 0.999999)).item()) if wav.numel() else 0
+    return wav, {
+        "raw_peak": raw_peak,
+        "scale_ref": scale_ref,
+        "rms": rms,
+        "clipped_samples": float(clipped),
+    }
+
+
+def _write_wav_pcm16(path: str | Path, waveform: torch.Tensor, sample_rate: int) -> Path:
+    path = Path(path)
+    audio = waveform.detach().to(torch.float64).cpu().clamp(-1.0, 1.0)
+    pcm = torch.round(audio * 32767.0).to(torch.int16).numpy()
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(int(sample_rate))
+        wf.writeframes(pcm.tobytes())
+    return path
+
+
 def render_note_schedule(
     schedule: list,          # [(pitch_hz, on_s, off_s), ...]
     sample_rate: int = 48_000,
@@ -103,50 +162,52 @@ def render_note_schedule(
     voice_key = "voice"
     voice_obj = _make_voice_obj(voice_key, freq_hz=schedule[0][0])
 
-    solver, vnodes, _ = build_voice_mixer_network(
-        [voice_obj],
-        sample_rate=sr,
-        duration=max_dur,
-        device=torch.device("cpu"),
-    )
-    vnode = vnodes[voice_key]
-    pitch_node_key = f"{voice_key}_pitch_in"
+    with torch.inference_mode():
+        solver, vnodes, _ = build_voice_mixer_network(
+            [voice_obj],
+            sample_rate=sr,
+            duration=max_dur,
+            device=torch.device("cpu"),
+            voice_port_occupancy={voice_key: ("pitch_in",)},
+        )
+        vnode = vnodes[voice_key]
+        pitch_node_key = f"{voice_key}_pitch_in"
 
-    # Pre-quantize gate events.
-    events: list[tuple[int, str, float]] = []
-    for pitch_hz, on_s, off_s in schedule:
-        events.append((int(on_s  * sr), "on",  pitch_hz))
-        events.append((int(off_s * sr), "off", pitch_hz))
-    events.sort(key=lambda e: e[0])
+        # Pre-quantize gate events.
+        events: list[tuple[int, str, float]] = []
+        for pitch_hz, on_s, off_s in schedule:
+            events.append((int(on_s  * sr), "on",  pitch_hz))
+            events.append((int(off_s * sr), "off", pitch_hz))
+        events.sort(key=lambda e: e[0])
 
-    buf: list[torch.Tensor] = []
-    current_pitch: float = schedule[0][0]
-    event_ptr = 0
+        buf: list[torch.Tensor] = []
+        current_pitch: float = schedule[0][0]
+        event_ptr = 0
 
-    bar = _progress(range(total_samples), total=total_samples, desc="Rendering")
-    for i in bar:
-        t = i / sr
+        bar = _progress(range(total_samples), total=total_samples, desc="Rendering")
+        for i in bar:
+            t = i / sr
 
-        while event_ptr < len(events) and events[event_ptr][0] == i:
-            _, kind, ph = events[event_ptr]
-            if kind == "on":
-                current_pitch = ph
-                vnode.gate_on(t, velocity=1.0)
-            else:
-                vnode.gate_off(t)
-            event_ptr += 1
+            while event_ptr < len(events) and events[event_ptr][0] == i:
+                _, kind, ph = events[event_ptr]
+                if kind == "on":
+                    current_pitch = ph
+                    vnode.gate_on(t, velocity=1.0)
+                else:
+                    vnode.gate_off(t)
+                event_ptr += 1
 
-        vnode.set_sample(i)
+            vnode.set_sample(i)
 
-        pitch_c128 = torch.tensor(complex(current_pitch, 0.0), dtype=_CDTYPE)
-        state = solver.step({pitch_node_key: pitch_c128})
-        buf.append(state["mix_out"])
+            pitch_c128 = torch.tensor(complex(current_pitch, 0.0), dtype=_CDTYPE)
+            state = solver.step({pitch_node_key: pitch_c128})
+            buf.append(state["mix_out"])
 
-    if hasattr(bar, "close"):
-        bar.close()
+        if hasattr(bar, "close"):
+            bar.close()
 
-    audio = torch.stack(buf)
-    return audio.real.to(torch.float64)
+        audio = torch.stack(buf)
+        return audio.real.to(torch.float64).detach()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -156,29 +217,29 @@ def render_note_schedule(
 # fmt: off
 NOTE_SCHEDULE = [
     # (pitch_hz,  on_time_s, off_time_s)
-    (261.63,  0.00, 0.30),   # C4
-    (293.66,  0.35, 0.65),   # D4
-    (329.63,  0.70, 1.00),   # E4
-    (349.23,  1.05, 1.35),   # F4
-    (392.00,  1.40, 1.70),   # G4
-    (440.00,  1.75, 2.05),   # A4
-    (493.88,  2.10, 2.40),   # B4
-    (523.25,  2.45, 3.00),   # C5
+    (261.63,  0.00, 0.08),   # C4
 ]
 # fmt: on
 
 SAMPLE_RATE = 48_000
+TAIL_S = 0.04
 
 if __name__ == "__main__":
     print("Rendering…")
-    waveform = render_note_schedule(NOTE_SCHEDULE, sample_rate=SAMPLE_RATE)
+    waveform = render_note_schedule(NOTE_SCHEDULE, sample_rate=SAMPLE_RATE, tail_s=TAIL_S)
+    audio_out, stats = _prepare_audio_for_output(waveform)
+    wav_path = _write_wav_pcm16(OUTPUT_WAV_PATH, audio_out, SAMPLE_RATE)
 
-    peak = waveform.abs().max().item()
-    if peak > 1e-9:
-        waveform = waveform / peak
+    duration_s = len(audio_out) / SAMPLE_RATE
+    print(
+        f"Saved {wav_path}  ({duration_s:.2f}s, raw_peak={stats['raw_peak']:.4f}, "
+        f"scale_ref={stats['scale_ref']:.4f}, rms={stats['rms']:.4f}, "
+        f"clipped={int(stats['clipped_samples'])})"
+    )
 
-    audio_np = waveform.numpy().astype("float32")
-    print(f"Playing {len(audio_np) / SAMPLE_RATE:.2f}s of audio  (peak={peak:.4f})")
-    sd.play(audio_np, samplerate=SAMPLE_RATE)
-    sd.wait()
+    if PLAY_AUDIO:
+        audio_np = audio_out.detach().cpu().numpy().astype("float32")
+        print(f"Playing {duration_s:.2f}s of audio")
+        sd.play(audio_np, samplerate=SAMPLE_RATE)
+        sd.wait()
     print("Done.")

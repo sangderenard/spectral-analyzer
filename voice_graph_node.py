@@ -80,8 +80,9 @@ each tick.  There is no batched-window synthesis path in the trainer.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
-from typing import Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -105,6 +106,7 @@ from graph_solver import (
 )
 
 from parametric_curve import (
+    ComplexSignalAggregator,
     ParametricCurve,
     NoteStateMachine,
     default_envelope,
@@ -285,6 +287,10 @@ def _parametric_from_voice_envelope(voice: object) -> ParametricCurve:
     Tries knot-based envelope first (``voice.active_knots()``), falls back to
     ADSR scalar parameters.  Returns a default envelope if neither is available.
     """
+    piecewise = getattr(voice, "piecewise_env", None)
+    if piecewise is not None and getattr(piecewise, "curve", None) is not None:
+        return piecewise.curve
+
     knots = None
     if hasattr(voice, "active_knots"):
         try:
@@ -322,6 +328,10 @@ def _parametric_from_voice_chirp(voice: object) -> ParametricCurve:
     Maps the ChirpSpec's f_delta_start / f_delta_end into the curve's v_lo/v_hi
     range.  Returns a flat default chirp if no chirp spec is present.
     """
+    piecewise = getattr(voice, "piecewise_env", None)
+    if piecewise is not None and getattr(piecewise, "chirp_curve", None) is not None:
+        return piecewise.chirp_curve
+
     chirp_spec = getattr(voice, "chirp", None)
     if chirp_spec is None:
         return default_chirp(name="voice_chirp")
@@ -367,20 +377,18 @@ class VoiceTorchOscillator(nn.Module):
     machine resolves the rule tree for that single moment — no pre-discretization,
     no look-ahead, no Catmull-Rom knot Parameters.
 
-    Synthesis equation (all terms complex128)
+    Synthesis equation (all terms resolved before final emission)
     -----------------------------------------
-        out = A · carrier_z · env_z · chirp_z
+        out = amp_total · exp(i · phase_total)
 
     where:
-        carrier_z  = exp(i · cumsum(2π · f_base / sr))  — pure oscillator
-        env_z      = envelope_curve.evaluate at t_norm via NoteStateMachine
-        chirp_z    = chirp_curve.evaluate   at t_norm via NoteStateMachine
-        A          = exp(log_amplitude)                  — global scalar gain
+        phase_total = cumsum(2π · (f_base + chirp_hz) / sr) + env_phase + fm_phase
+        amp_total   = exp(log_amplitude) · env_mag · fm_mag
 
-    FM from graph edges is applied as a complex exponential:
-        carrier_z *= exp(i · fm_depth_hz · x)
-
-    env_mod / chirp_mod port signals multiply directly into env_z / chirp_z.
+    The curve outputs are folded into the primitive magnitude/phase state
+    before the final complex sample is emitted. Chirp contributes directly
+    to instantaneous frequency, and the envelope's complex field contributes
+    magnitude/phase at that same depth rather than as a trailing multiply.
 
     Learnable parameters
     --------------------
@@ -525,6 +533,22 @@ class VoiceTorchOscillator(nn.Module):
         self.loop_end:           float = float(loop_end)
         self.emission_mode:      str   = emission_mode
         self.pre_delay:          float = float(pre_delay)
+        # Single-sample runtime cache: reuse work across repeated calls at the
+        # same sample instant (for example redundant fixed-point passes).
+        self._scalar_cache_key: Optional[tuple[float, int]] = None
+        self._scalar_cache_t_norm: Optional[Tensor] = None
+        self._scalar_cache_env: Optional[Tensor] = None
+        self._scalar_cache_chirp: Optional[Tensor] = None
+        self._scalar_cache_amp: Optional[Tensor] = None
+        self._scalar_cache_base_sig: Optional[Tensor] = None
+
+    def _invalidate_scalar_cache(self) -> None:
+        self._scalar_cache_key = None
+        self._scalar_cache_t_norm = None
+        self._scalar_cache_env = None
+        self._scalar_cache_chirp = None
+        self._scalar_cache_amp = None
+        self._scalar_cache_base_sig = None
 
     # ------------------------------------------------------------------
     # Gate control — drives both curve state machines
@@ -532,11 +556,13 @@ class VoiceTorchOscillator(nn.Module):
 
     def gate_on(self, t_abs: float, velocity: float = 1.0) -> None:
         """Fire a note-on into both envelope and chirp state machines."""
+        self._invalidate_scalar_cache()
         self._note_state.gate_on(t_abs, velocity)
         self._chirp_state.gate_on(t_abs, velocity)
 
     def gate_off(self, t_abs: float) -> None:
         """Fire a note-off into both envelope and chirp state machines."""
+        self._invalidate_scalar_cache()
         self._note_state.gate_off(t_abs)
         self._chirp_state.gate_off(t_abs)
 
@@ -591,12 +617,15 @@ class VoiceTorchOscillator(nn.Module):
     # ------------------------------------------------------------------
 
     def tick(self) -> None:
+        self._invalidate_scalar_cache()
         self._sample_idx = self._sample_idx + 1  # type: ignore[assignment]
 
     def set_sample(self, idx: int) -> None:
+        self._invalidate_scalar_cache()
         self._sample_idx.fill_(idx)
 
     def reset(self) -> None:
+        self._invalidate_scalar_cache()
         self._sample_idx.zero_()
         self._running_phase.zero_()
         self._note_state.reset()
@@ -610,6 +639,8 @@ class VoiceTorchOscillator(nn.Module):
         self,
         phase_cumsum: Tensor,  # (N,) float64 cumulative phase of fundamental
         f_base:       Tensor,  # (N,) or () float64 base frequency
+        *,
+        amplitude_scale: Optional[Tensor] = None,
     ) -> Tensor:
         """Harmonic manifold — returns complex128 (N,)."""
         hc   = self.harmonic_count
@@ -624,6 +655,8 @@ class VoiceTorchOscillator(nn.Module):
             k_f     = torch.tensor(float(k), dtype=torch.float64, device=phase_cumsum.device)
             h_ratio = k_f + warp * (k_f - 1.0)
             h_amp   = 1.0 / (k_f ** bri)
+            if amplitude_scale is not None:
+                h_amp = h_amp * amplitude_scale
             h_phase_incr = 2.0 * math.pi * f_base * h_ratio / sr
             h_phase = torch.cumsum(h_phase_incr, dim=0) + k_f * self.phase_origin
             sig      = sig + h_amp.to(_CDTYPE) * torch.exp(1j * h_phase.to(_CDTYPE))
@@ -684,37 +717,55 @@ class VoiceTorchOscillator(nn.Module):
         """
         sr            = self._sample_rate
         dur           = self._duration
-        single_sample = t_abs is None
-
-        if single_sample:
+        if t_abs is None:
             t_abs = (self._sample_idx.to(torch.float64) / sr).unsqueeze(0)
 
-        t_abs  = t_abs.to(torch.float64)
-        N      = t_abs.shape[0]
-        t_norm = (t_abs / dur).clamp(0.0, 1.0)
+        t_abs = t_abs.to(torch.float64)
+        N = t_abs.shape[0]
 
-        # ── envelope and chirp: complex128 per-tick ───────────────────
+        scalar_key: Optional[tuple[float, int]] = None
         if N == 1:
-            # Per-sample path: NoteStateMachine + rule tree
-            env_z   = self._note_state.evaluate(self.envelope_curve, t_norm[0])
-            chirp_z = self._chirp_state.evaluate(self.chirp_curve,   t_norm[0])
+            scalar_t = float(t_abs.reshape(-1)[0].item())
+            scalar_key = (scalar_t, int(self._sample_idx.item()))
+            if self._scalar_cache_key != scalar_key:
+                self._invalidate_scalar_cache()
+                self._scalar_cache_key = scalar_key
+                self._scalar_cache_t_norm = (t_abs / dur).clamp(0.0, 1.0)
+            t_norm = self._scalar_cache_t_norm
+            assert t_norm is not None
+        else:
+            t_norm = (t_abs / dur).clamp(0.0, 1.0)
+
+        # ── envelope and chirp: envelope stays complex, chirp becomes Hz ─────
+        if N == 1:
+            if self._scalar_cache_env is None:
+                self._scalar_cache_env = self._note_state.evaluate(self.envelope_curve, t_norm[0])
+            if self._scalar_cache_chirp is None:
+                self._scalar_cache_chirp = self._chirp_state.evaluate(self.chirp_curve, t_norm[0])
+            env_z = self._scalar_cache_env
+            chirp_z = self._scalar_cache_chirp
         else:
             # Batch path: direct curve evaluation (no state-machine routing)
             env_z   = self.envelope_curve.evaluate_normalized(t_norm)  # (N,) complex128
             chirp_z = self.chirp_curve.evaluate_normalized(t_norm)     # (N,) complex128
 
-        # Port modulators multiply into the curve outputs (all complex128)
+        # Resolve curve/modulator state first so it can be injected into the
+        # primitive magnitude/phase state before sample emission.
         if env_mod is not None:
             env_z = env_z * env_mod.to(torch.complex128)
+        chirp_hz = self.chirp_curve.to_physical(
+            chirp_z.real.to(torch.float64).clamp(0.0, 1.0)
+        ).to(torch.float64)
         if chirp_mod is not None:
-            chirp_z = chirp_z * chirp_mod.to(torch.complex128)
+            chirp_hz = chirp_hz + chirp_mod.real.to(torch.float64)
 
         # ── carrier frequency ─────────────────────────────────────────
         # pitch_in (from upstream port) takes precedence over log_freq.
         # The real part is the control value; we cross complex→real here
         # at the control boundary (not inside synthesis).
         semitone_shift = 2.0 ** (self.semitone_offset / 12.0)
-        if pitch_in is not None and pitch_in.real.abs().max().item() > 0.0:
+        pitch_active = pitch_in is not None and pitch_in.real.abs().max().item() > 0.0
+        if pitch_active:
             p = pitch_in.real.to(torch.float64).reshape(())
             if self.pitch_input_mode == "midi":
                 f_base = self.tuning_ref_hz * torch.pow(
@@ -726,28 +777,43 @@ class VoiceTorchOscillator(nn.Module):
         else:
             f_base = torch.exp(self.log_freq) * semitone_shift
 
-        phase_incr   = 2.0 * math.pi * f_base / sr
-        phase_cumsum = torch.cumsum(phase_incr.expand(N), dim=0) + self.phase_origin
-
-        mt = self.manifold_type
-        if mt in ("harmonic", "harmonic_warp") and self.harmonic_count > 1:
-            sig = self._synthesize_harmonics(phase_cumsum, f_base.expand(N))
-        else:
-            sig = torch.exp(1j * phase_cumsum.to(_CDTYPE))
-
-        # FM from graph edge: complex exponential — no .real extraction
+        # FM from graph edge remains complex; decompose it once into the same
+        # magnitude/phase state instead of stacking a later carrier multiply.
+        fm_factor: Optional[Tensor] = None
         if x is not None:
             x_c = x.to(_CDTYPE)
             if x_c.dim() == 0:
                 x_c = x_c.unsqueeze(0)
             if x_c.shape[0] == N:
-                sig = sig * torch.exp(1j * self.fm_depth_hz.to(_CDTYPE) * x_c)
+                fm_factor = torch.exp(1j * self.fm_depth_hz.to(_CDTYPE) * x_c)
 
         # ── global amplitude ──────────────────────────────────────────
-        A = torch.exp(self.log_amplitude).to(_CDTYPE)
+        if scalar_key is not None and self._scalar_cache_amp is not None:
+            A = self._scalar_cache_amp
+        else:
+            A = torch.exp(self.log_amplitude).to(_CDTYPE)
+            if scalar_key is not None:
+                self._scalar_cache_amp = A
 
-        # ── synthesis: carrier × envelope × chirp (all complex128) ───
-        out = A * sig * env_z.to(_CDTYPE) * chirp_z.to(_CDTYPE)
+        total_factor = A * env_z.to(_CDTYPE)
+        if fm_factor is not None:
+            total_factor = total_factor * fm_factor
+        synth = ComplexSignalAggregator(float(sr.item()), N, device=t_abs.device)
+        synth.add_frequency_hz(chirp_hz.reshape(-1))
+        synth.add_complex_factor(total_factor.reshape(-1))
+        f_inst = synth.frequency_series(f_base).reshape(-1)
+        phase_cumsum = synth.phase_series(f_base, phase_origin=self.phase_origin).reshape(-1)
+        amp_total = synth.amplitude.reshape(-1)
+
+        mt = self.manifold_type
+        if mt in ("harmonic", "harmonic_warp") and self.harmonic_count > 1:
+            out = self._synthesize_harmonics(
+                phase_cumsum,
+                f_inst,
+                amplitude_scale=amp_total,
+            )
+        else:
+            out = amp_total.to(_CDTYPE) * torch.exp(1j * phase_cumsum.to(_CDTYPE))
 
         # ── pre-delay ─────────────────────────────────────────────────
         if self.pre_delay > 0.0:
@@ -756,7 +822,7 @@ class VoiceTorchOscillator(nn.Module):
                 out = out.clone()
                 out[mask] = torch.zeros(1, dtype=_CDTYPE, device=out.device)
 
-        if single_sample:
+        if N == 1:
             return out.squeeze(0)
         return out
 
@@ -764,6 +830,72 @@ class VoiceTorchOscillator(nn.Module):
 # ──────────────────────────────────────────────────────────────────────────────
 # MetaVoiceNode — compound nn.Module that builds TensorNode / TensorEdge entries
 # ──────────────────────────────────────────────────────────────────────────────
+
+_VOICE_SIGNAL_INPUT_PORTS = frozenset({"fm_in", "am_in", "env_mod_in", "chirp_mod_in"})
+_VOICE_PARAMETER_INPUT_PORTS = frozenset({"pitch_in"})
+
+
+@dataclass(frozen=True)
+class VoicePortOccupancy:
+    """Binary occupied-port view for one voice node."""
+
+    signal_inputs: frozenset[str] = frozenset()
+    parameter_inputs: frozenset[str] = frozenset()
+
+    @classmethod
+    def from_ports(cls, ports: Sequence[str] | None = None) -> "VoicePortOccupancy":
+        signal_inputs: set[str] = set()
+        parameter_inputs: set[str] = set()
+        unknown: list[str] = []
+        for raw_port in ports or ():
+            port = str(raw_port or "")
+            if not port:
+                continue
+            if port in _VOICE_SIGNAL_INPUT_PORTS:
+                signal_inputs.add(port)
+            elif port in _VOICE_PARAMETER_INPUT_PORTS:
+                parameter_inputs.add(port)
+            else:
+                unknown.append(port)
+        if unknown:
+            raise KeyError(f"Unknown voice input port(s): {sorted(unknown)}")
+        return cls(
+            signal_inputs=frozenset(signal_inputs),
+            parameter_inputs=frozenset(parameter_inputs),
+        )
+
+    def has_input(self, port_key: str) -> bool:
+        port = str(port_key or "")
+        return port in self.signal_inputs or port in self.parameter_inputs
+
+
+def _coerce_voice_port_occupancy(
+    occupancy: VoicePortOccupancy | Sequence[str] | None,
+) -> VoicePortOccupancy:
+    if isinstance(occupancy, VoicePortOccupancy):
+        return occupancy
+    return VoicePortOccupancy.from_ports(occupancy)
+
+
+def _prune_orphan_tensor_graph(
+    nodes: Sequence[TensorNode],
+    edges: Sequence[TensorEdge],
+    *,
+    keep_keys: Sequence[str] = (),
+) -> Tuple[List[TensorNode], List[TensorEdge]]:
+    keep = {str(key) for key in keep_keys}
+    active_keys = set(keep)
+    for edge in edges:
+        active_keys.add(str(edge.src_key))
+        active_keys.add(str(edge.dst_key))
+    pruned_nodes = [node for node in nodes if node.key in active_keys]
+    valid_keys = {node.key for node in pruned_nodes}
+    pruned_edges = [
+        edge for edge in edges
+        if edge.src_key in valid_keys and edge.dst_key in valid_keys
+    ]
+    return pruned_nodes, pruned_edges
+
 
 class MetaVoiceNode(nn.Module):
     """Compound voice node: owns a ``VoiceTorchOscillator`` and exposes ports.
@@ -891,6 +1023,8 @@ class MetaVoiceNode(nn.Module):
     # ------------------------------------------------------------------
     def build_nodes(
         self,
+        *,
+        occupied_inputs: VoicePortOccupancy | Sequence[str] | None = None,
     ) -> Tuple[List[TensorNode], List[TensorEdge]]:
         """Return ``(nodes, edges)`` to register in a ``GraphSolver``.
 
@@ -910,8 +1044,13 @@ class MetaVoiceNode(nn.Module):
         ``{key}_am``        → ``{key}_out``  (delay=1 if causal_mod_delay; weight=1)
         ``{key}_env_mod``   → ``{key}_out``  (delay=0; weight=0 — ordering only)
         ``{key}_chirp_mod`` → ``{key}_out``  (delay=0; weight=0 — ordering only)
+
+        Only ports listed in ``occupied_inputs`` are materialised. This keeps
+        the emitted subgraph aligned with the actual connectome instead of
+        advertising dormant helper nodes to the solver.
         """
         k = self.key
+        occupancy = _coerce_voice_port_occupancy(occupied_inputs)
         transform = self._make_transform()
 
         archetype = NodeArchetype(
@@ -1033,7 +1172,10 @@ class MetaVoiceNode(nn.Module):
                     ),
                 ),
             ),
-            layer_presence=NodeLayerPresence(input_layers=(self.layer,)),
+            layer_presence=NodeLayerPresence(
+                input_layers=(self.layer,),
+                parameter_outputs=True,
+            ),
         )
 
         delay_samples = 1 if self.causal_mod_delay else 0
@@ -1085,10 +1227,24 @@ class MetaVoiceNode(nn.Module):
             dst_port="signal_out",
         )
 
-        return (
-            [out_node, fm_node, am_node, env_mod_node, chirp_mod_node, pitch_in_node],
-            [fm_edge, am_edge, env_mod_edge, chirp_mod_edge, pitch_in_edge],
-        )
+        nodes: list[TensorNode] = [out_node]
+        edges: list[TensorEdge] = []
+        if occupancy.has_input("fm_in"):
+            nodes.append(fm_node)
+            edges.append(fm_edge)
+        if occupancy.has_input("am_in"):
+            nodes.append(am_node)
+            edges.append(am_edge)
+        if occupancy.has_input("env_mod_in"):
+            nodes.append(env_mod_node)
+            edges.append(env_mod_edge)
+        if occupancy.has_input("chirp_mod_in"):
+            nodes.append(chirp_mod_node)
+            edges.append(chirp_mod_edge)
+        if occupancy.has_input("pitch_in"):
+            nodes.append(pitch_in_node)
+            edges.append(pitch_in_edge)
+        return _prune_orphan_tensor_graph(nodes, edges, keep_keys=(out_node.key,))
 
     # ------------------------------------------------------------------
     @classmethod
@@ -1393,6 +1549,7 @@ def build_voice_mixer_network(
     mixer_key: str = "mix_out",
     causal_mod_delay: bool = True,
     device: torch.device = torch.device("cpu"),
+    voice_port_occupancy: Optional[Mapping[str, VoicePortOccupancy | Sequence[str]]] = None,
 ) -> Tuple["GraphSolver", Dict[str, MetaVoiceNode], MixerSumNode]:
     """Build a ``GraphSolver`` containing one ``MetaVoiceNode`` per voice
     and a single ``MixerSumNode`` that accumulates them.
@@ -1401,6 +1558,10 @@ def build_voice_mixer_network(
     Each voice output is wired to the mixer with unit gain via a plain
     ``TensorEdge``; replace these with ``LevelGrid.to_edges()`` when
     per-voice gain control is needed.
+
+    ``voice_port_occupancy`` optionally declares which helper input ports
+    should be materialised for each voice key. Unlisted ports are omitted,
+    so the solver only sees the occupied voice connectome.
 
     Returns
     -------
@@ -1426,7 +1587,8 @@ def build_voice_mixer_network(
             layer=layer,
             causal_mod_delay=causal_mod_delay,
         )
-        tnodes, tedges = vnode.build_nodes()
+        occupancy = None if voice_port_occupancy is None else voice_port_occupancy.get(vnode.key)
+        tnodes, tedges = vnode.build_nodes(occupied_inputs=occupancy)
         all_tnodes.extend(tnodes)
         all_tedges.extend(tedges)
         voice_nodes[vnode.key] = vnode
@@ -1440,6 +1602,11 @@ def build_voice_mixer_network(
             )
         )
 
+    all_tnodes, all_tedges = _prune_orphan_tensor_graph(
+        all_tnodes,
+        all_tedges,
+        keep_keys=(mixer_key,),
+    )
     solver = GraphSolver(
         all_tnodes,
         all_tedges,

@@ -5,6 +5,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 
 from parametric_curve import (
+    ComplexSignalAggregator,
     EnvelopeRuleTree,
     GateEvent,
     ParametricCurveEngine,
@@ -84,6 +85,26 @@ def test_render_piecewise_audio_returns_complex128_tensors() -> None:
     assert torch.view_as_real(audio).shape[1] == 2
 
 
+def test_complex_signal_aggregator_multiplies_amplitude_and_adds_frequency_phase() -> None:
+    synth = ComplexSignalAggregator(8_000.0, 4)
+    synth.multiply_amplitude(torch.tensor([2.0, 2.0, 2.0, 2.0], dtype=torch.float64))
+    synth.multiply_amplitude(torch.tensor([0.5, 0.25, 1.0, 0.5], dtype=torch.float64))
+    synth.add_frequency_hz(torch.tensor([10.0, 20.0, 30.0, 40.0], dtype=torch.float64))
+    synth.add_phase(torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=torch.float64))
+
+    out = synth.emit(100.0)
+
+    assert torch.allclose(
+        synth.amplitude,
+        torch.tensor([1.0, 0.5, 2.0, 1.0], dtype=torch.float64),
+    )
+    assert torch.allclose(
+        synth.frequency_series(100.0),
+        torch.tensor([110.0, 120.0, 130.0, 140.0], dtype=torch.float64),
+    )
+    assert out.dtype == torch.complex128
+
+
 def test_parametric_curve_engine_interpret_preserves_complex_output() -> None:
     curve = default_envelope("voice")
     engine = ParametricCurveEngine(curve, rule_tree=EnvelopeRuleTree.default())
@@ -95,6 +116,31 @@ def test_parametric_curve_engine_interpret_preserves_complex_output() -> None:
     assert isinstance(vals, torch.Tensor)
     assert vals.dtype == torch.complex128
     assert vals.shape == (32,)
+
+
+def test_parametric_curve_tensorized_coeffs_reuse_until_geometry_changes() -> None:
+    curve = default_envelope("amp")
+    query = torch.tensor([0.25], dtype=torch.float64)
+
+    before = curve.evaluate_normalized(query)
+    r_cached_1, _ = curve._get_tensorized_chains(dtype=torch.float64, device=query.device)
+    coeff_tensor_1 = r_cached_1[0]["c0s"]
+
+    again = curve.evaluate_normalized(query)
+    r_cached_2, _ = curve._get_tensorized_chains(dtype=torch.float64, device=query.device)
+    coeff_tensor_2 = r_cached_2[0]["c0s"]
+
+    assert torch.allclose(before, again)
+    assert coeff_tensor_1 is coeff_tensor_2
+
+    curve.points[1].v *= 0.5
+
+    after = curve.evaluate_normalized(query)
+    r_cached_3, _ = curve._get_tensorized_chains(dtype=torch.float64, device=query.device)
+    coeff_tensor_3 = r_cached_3[0]["c0s"]
+
+    assert coeff_tensor_3 is not coeff_tensor_2
+    assert not torch.allclose(before, after)
 
 
 def test_warp_with_curve_is_invariant_to_query_density() -> None:

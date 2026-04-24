@@ -60,6 +60,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
+from parametric_curve import ParametricCurve
 from performer_engine import (
     DriverConfig,
     CHIRP_NONE,
@@ -172,6 +173,45 @@ def _build_env_knots(voice, note_duration: float) -> tuple[list[float], list[flo
     return t_secs, vals
 
 
+def _build_parametric_driver_batches(
+    voices: list,
+    driver_list: list[tuple[int, int]],
+    device: torch.device,
+) -> tuple[object | None, Tensor, object | None, Tensor]:
+    """Pack per-driver parametric env/chirp curves for the batched driver engine."""
+    env_curves: list[ParametricCurve] = []
+    chirp_curves: list[ParametricCurve] = []
+    env_row: list[int] = []
+    chirp_row: list[int] = []
+
+    for _, vi in driver_list:
+        voice = voices[vi]
+        piecewise = getattr(voice, "piecewise_env", None)
+        if piecewise is not None:
+            env_row.append(len(env_curves))
+            env_curves.append(piecewise.curve)
+            chirp_row.append(len(chirp_curves))
+            chirp_curves.append(piecewise.chirp_curve)
+        else:
+            env_row.append(-1)
+            chirp_row.append(-1)
+
+    packed_env = (
+        ParametricCurve.pack_batch(env_curves, device=device)
+        if env_curves else None
+    )
+    packed_chirp = (
+        ParametricCurve.pack_batch(chirp_curves, device=device)
+        if chirp_curves else None
+    )
+    return (
+        packed_env,
+        torch.tensor(env_row, dtype=torch.int64, device=device),
+        packed_chirp,
+        torch.tensor(chirp_row, dtype=torch.int64, device=device),
+    )
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Public API
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -253,6 +293,10 @@ def build_driver_config(
     D = len(driver_list)
     if D == 0:
         return _empty_config(V, device), [], []
+
+    packed_env, param_env_row, packed_chirp, param_chirp_row = _build_parametric_driver_batches(
+        voices, driver_list, device,
+    )
 
     # ── Determine padded dimensions ──────────────────────────────────────────
     H_per: list[int] = []
@@ -395,6 +439,10 @@ def build_driver_config(
         fm_depth_hz         = _ft(fm_depth_list),
         am_source_voice     = _it(am_src_list),
         am_depth            = _ft(am_depth_list),
+        parametric_env_packed = packed_env,
+        parametric_env_row    = param_env_row,
+        parametric_chirp_packed = packed_chirp,
+        parametric_chirp_row    = param_chirp_row,
     )
 
     return cfg, performers, driver_list
@@ -420,4 +468,6 @@ def _empty_config(V: int, device: torch.device) -> DriverConfig:
         voice_idx=_it(), instrument_idx=_it(),
         fm_source_voice=_it(), fm_depth_hz=_ft(),
         am_source_voice=_it(), am_depth=_ft(),
+        parametric_env_packed=None, parametric_env_row=_it(),
+        parametric_chirp_packed=None, parametric_chirp_row=_it(),
     )

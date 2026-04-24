@@ -8,6 +8,7 @@ from parametric_curve import (
     ComplexSignalAggregator,
     EnvelopeRuleTree,
     GateEvent,
+    ParametricCurve,
     ParametricCurveEngine,
     RegionEffect,
     TimeWarpCoordinator,
@@ -141,6 +142,49 @@ def test_parametric_curve_tensorized_coeffs_reuse_until_geometry_changes() -> No
 
     assert coeff_tensor_3 is not coeff_tensor_2
     assert not torch.allclose(before, after)
+
+
+def test_parametric_curve_pack_batch_matches_single_curve_evaluation() -> None:
+    curve_a = default_envelope("a")
+    curve_b = default_envelope("b")
+    curve_b.points[1].v = 0.8
+    curve_b.points[2].theta = 0.35
+    curve_b.activation = "tanh"
+    curve_b.activation_drive = 1.4
+
+    packed = ParametricCurve.pack_batch([curve_a, curve_b])
+    query = torch.linspace(0.0, 1.0, 64, dtype=torch.float64)
+
+    got = ParametricCurve.evaluate_batched(packed, query)
+    want = torch.stack(
+        [curve_a.evaluate_normalized(query), curve_b.evaluate_normalized(query)],
+        dim=0,
+    )
+
+    assert got.shape == want.shape == (2, 64)
+    assert torch.allclose(got, want, atol=1e-12, rtol=0.0)
+
+
+def test_parametric_curve_batched_transition_compilation_matches_engine_piecewise() -> None:
+    curve = default_envelope("voice")
+    packed = ParametricCurve.pack_batch([curve])
+    gates = [[GateEvent(t_on=0.0, t_off=0.6, velocity=1.0)]]
+    query = torch.linspace(0.0, 1.0, 96, dtype=torch.float64)
+
+    got = ParametricCurve.evaluate_batched(
+        packed,
+        query,
+        gate_history_batch=gates,
+        clamp_r=False,
+        apply_activation=False,
+        apply_slew=False,
+    ).squeeze(0)
+
+    engine = ParametricCurveEngine(curve, rule_tree=EnvelopeRuleTree.default())
+    want = engine.interpret(gates[0], force_rebuild=True)(query)
+
+    assert got.shape == want.shape == (96,)
+    assert torch.allclose(got, want, atol=1e-12, rtol=0.0)
 
 
 def test_warp_with_curve_is_invariant_to_query_density() -> None:

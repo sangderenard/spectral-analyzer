@@ -45,6 +45,7 @@ import pytest
 import torch
 
 from patch_to_driver import build_driver_config, _build_harmonics, _build_env_knots
+from parametric_curve import default_chirp, default_envelope
 
 
 # ── Minimal patch/voice stubs ─────────────────────────────────────────────────
@@ -82,10 +83,19 @@ class _Voice:
         self.chirp                = _Chirp()
         self.fm                   = fm
         self.am                   = am
+        self.piecewise_env        = None
 
     def active_knots(self):
         # default ADSR as normalized fractions (duration=1.0)
         return [[0.0, 0.0], [0.005, 1.0], [0.045, 0.75], [0.92, 0.75], [1.0, 0.0]]
+
+
+class _PiecewiseEnv:
+    def __init__(self):
+        self.curve = default_envelope("piecewise_amp")
+        self.chirp_curve = default_chirp("piecewise_chirp")
+        self.signal_curve = default_envelope("piecewise_signal")
+        self.rule_tree = None
 
 
 class _Patch:
@@ -439,6 +449,18 @@ class TestBuildDriverConfigValues:
         cfg = _build(patch, [])
         assert cfg.active.all()
 
+    def test_piecewise_voice_builds_parametric_batch_rows(self):
+        v = _Voice(key="v0", env_type="piecewise")
+        v.piecewise_env = _PiecewiseEnv()
+        patch = _Patch(voices=[v], duration=1.0)
+
+        cfg = _build(patch, [])
+
+        assert cfg.parametric_env_packed is not None
+        assert cfg.parametric_chirp_packed is not None
+        assert cfg.parametric_env_row.tolist() == [0]
+        assert cfg.parametric_chirp_row.tolist() == [0]
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Round-trip: build_driver_config → driver_synthesis_step produces valid output
@@ -505,3 +527,21 @@ class TestEndToEndSynthStep:
         _, _, new_state = driver_synthesis_step(cfg, state, chunk_T, _SR)
         expected_dt = chunk_T / _SR
         assert new_state.t_pos[0].item() == pytest.approx(expected_dt)
+
+    def test_piecewise_voice_step_uses_parametric_envelope(self):
+        from performer_engine import init_driver_state, driver_synthesis_step
+
+        v = _Voice(key="v0", freq_hz=220.0, amplitude=1.0, env_type="piecewise")
+        v.piecewise_env = _PiecewiseEnv()
+        for pt in v.piecewise_env.curve.points:
+            pt.v = 0.25
+        patch = _Patch(voices=[v], duration=1.0)
+        cfg = _build(patch, [])
+        state = init_driver_state(cfg)
+
+        d_out, _, _ = driver_synthesis_step(cfg, state, 128, _SR)
+        mag = torch.abs(d_out[0, 32:96])
+
+        assert torch.isfinite(d_out).all()
+        assert mag.mean().item() < 0.35
+        assert mag.mean().item() > 0.15

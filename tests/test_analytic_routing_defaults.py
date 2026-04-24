@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import threading
 import numpy as np
+import torch
 
 
 def _stub_analytic_driver_imports() -> None:
@@ -30,6 +31,63 @@ def _stub_analytic_driver_imports() -> None:
         "glLoadIdentity", "glMatrixMode", "glOrtho", "glScissor",
     ]:
         setattr(gl_mod, name, lambda *args, **kwargs: 0)
+
+    scipy_signal_mod = sys.modules["scipy.signal"]
+    if not hasattr(scipy_signal_mod, "resample_poly"):
+        def _resample_poly_stub(x, up, down, *args, **kwargs):
+            arr = np.asarray(x)
+            up_i = max(1, int(up))
+            down_i = max(1, int(down))
+            if up_i == down_i:
+                return arr
+            if up_i > down_i and up_i % down_i == 0:
+                return np.repeat(arr, up_i // down_i, axis=0)
+            idx = np.linspace(0, max(len(arr) - 1, 0), max(1, int(round(len(arr) * up_i / down_i))))
+            idx = np.clip(np.round(idx).astype(int), 0, max(len(arr) - 1, 0))
+            return arr[idx]
+        setattr(scipy_signal_mod, "resample_poly", _resample_poly_stub)
+
+    plot_widget_mod = sys.modules["plot_widget"]
+    if not hasattr(plot_widget_mod, "PlotSeries"):
+        class _PlotSeries:
+            def __init__(self, *args, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+        plot_widget_mod.PlotSeries = _PlotSeries
+    if not hasattr(plot_widget_mod, "PlotMarker"):
+        class _PlotMarker:
+            def __init__(self, *args, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+        plot_widget_mod.PlotMarker = _PlotMarker
+    if not hasattr(plot_widget_mod, "PlotWidget"):
+        class _PlotWidget:
+            def __init__(self, *args, **kwargs):
+                self.series = []
+                self.markers = []
+                self.y_min = -1.0
+                self.y_max = 1.0
+                self.grid_lines = 0
+            def add_series(self, series):
+                self.series.append(series)
+            def render(self, *args, **kwargs):
+                return None
+        plot_widget_mod.PlotWidget = _PlotWidget
+
+    bass_viewer_mod = sys.modules["bass_viewer"]
+    for name in [
+        "GlyphAtlas", "Panel", "PanelDock", "ScrollableSubpanelList",
+        "ModularSubpanelSpec", "SubpanelAddOption", "FilterBankDecomposition",
+    ]:
+        if not hasattr(bass_viewer_mod, name):
+            setattr(bass_viewer_mod, name, type(name, (), {}))
+
+    if "parametric_curve_editor" not in sys.modules:
+        import types
+        editor_mod = types.ModuleType("parametric_curve_editor")
+        editor_mod.ParametricCurveEditor = type("ParametricCurveEditor", (), {})
+        editor_mod._TextOverlay = type("_TextOverlay", (), {})
+        sys.modules["parametric_curve_editor"] = editor_mod
 
 
 _stub_analytic_driver_imports()
@@ -62,6 +120,7 @@ from analytic_driver import (  # noqa: E402
     _param_target_attr_specs,
     _param_target_node_specs,
     _patch_node_keys,
+    _build_sequence_driver_config,
     _prepare_output_bus_for_device,
     _refresh_system_audio_report,
     _detected_envelope_artifact_paths,
@@ -490,6 +549,35 @@ def test_piecewise_voice_payload_roundtrips() -> None:
     assert restored.piecewise_env.curve.name == "amp_curve"
     assert restored.piecewise_env.curve.markers[0].label == "attack_end"
     assert restored.piecewise_env.source_path.endswith("fb_envelopes.npz")
+
+
+def test_sequence_driver_config_batches_piecewise_parametric_curves() -> None:
+    patch = AnalyticPatch()
+    voice = AnalyticVoice(
+        key="vpw",
+        label="Piecewise Voice",
+        env_type="piecewise",
+        piecewise_env=PiecewiseVoiceEnvelope(),
+    )
+    patch.voices = [voice]
+
+    sched = NoteSchedule()
+    sched.add(NoteEvent(220.0, 0.0, 0.5, velocity=0.8))
+
+    cfg, voices, state = _build_sequence_driver_config(
+        patch,
+        [(sched, [voice])],
+        float(patch.preview_sr),
+        torch.device("cpu"),
+    )
+
+    assert len(voices) == 1
+    assert cfg.D == 1
+    assert cfg.parametric_env_packed is not None
+    assert cfg.parametric_chirp_packed is not None
+    assert cfg.parametric_env_row.tolist() == [0]
+    assert cfg.parametric_chirp_row.tolist() == [0]
+    assert state.t_pos.shape == (1,)
 
 
 def test_detected_envelope_artifacts_include_inventory_paths(tmp_path) -> None:

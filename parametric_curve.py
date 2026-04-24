@@ -1660,6 +1660,41 @@ class ParametricCurve:
         v_norm = self.evaluate_normalized(t_norm)
         return self.v_lo + v_norm * (self.v_hi - self.v_lo)
 
+    @classmethod
+    def pack_batch(
+        cls,
+        curves: "List[ParametricCurve]",
+        *,
+        dtype: torch.dtype = torch.float64,
+        device: "torch.device | None" = None,
+    ) -> "PackedParametricCurveBatch":
+        """Pack a list of curves into rectangular tensors for batched evaluation."""
+        return PackedParametricCurveBatch.from_curves(curves, dtype=dtype, device=device)
+
+    @classmethod
+    def evaluate_batched(
+        cls,
+        packed: "PackedParametricCurveBatch",
+        t_batch: torch.Tensor,
+        *,
+        gate_history_batch: "Optional[List[List[GateEvent]]]" = None,
+        transition_events_batch: "Optional[List[List[dict]]]" = None,
+        clamp_r: bool = True,
+        apply_activation: bool = True,
+        apply_slew: bool = True,
+        physical: bool = False,
+    ) -> torch.Tensor:
+        """Evaluate a packed batch of curves against shared or per-curve query times."""
+        return packed.evaluate(
+            t_batch,
+            gate_history_batch=gate_history_batch,
+            transition_events_batch=transition_events_batch,
+            clamp_r=clamp_r,
+            apply_activation=apply_activation,
+            apply_slew=apply_slew,
+            physical=physical,
+        )
+
     # ── point editing helpers ─────────────────────────────────────────────────
 
     def add_point(self, t: float, v: float, tension: float = 0.5) -> int:
@@ -1802,6 +1837,501 @@ class ParametricCurve:
                 except Exception:
                     pass
         return lib
+
+
+@dataclass
+class PackedParametricCurveBatch:
+    """Rectangular tensor view of a list of ParametricCurve objects."""
+
+    curves: "List[ParametricCurve]"
+    dtype: torch.dtype
+    device: torch.device
+    r_coeffs: Dict[str, torch.Tensor]
+    theta_coeffs: Dict[str, torch.Tensor]
+    chain_lengths: torch.Tensor
+    region_bounds: torch.Tensor
+    region_mode_codes: torch.Tensor
+    region_loop_count: torch.Tensor
+    region_lfo_depth: torch.Tensor
+    region_gate_threshold: torch.Tensor
+    region_sub_curves: "List[List[Optional[ParametricCurve]]]"
+    v_lo: torch.Tensor
+    v_hi: torch.Tensor
+    activation_drive: torch.Tensor
+    slew_samples: torch.Tensor
+    activation_modes: List[str]
+    y_scales: List[str]
+
+    _REGION_MODE_TO_CODE = {
+        "normal": 0,
+        "silence": 1,
+        "hold": 2,
+        "sustain": 3,
+        "loop": 4,
+        "mirror": 5,
+        "additive": 6,
+        "gate": 7,
+    }
+
+    _CODE_TO_REGION_MODE = {v: k for k, v in _REGION_MODE_TO_CODE.items()}
+
+    @classmethod
+    def from_curves(
+        cls,
+        curves: "List[ParametricCurve]",
+        *,
+        dtype: torch.dtype = torch.float64,
+        device: "torch.device | None" = None,
+    ) -> "PackedParametricCurveBatch":
+        if not curves:
+            raise ValueError("curves must not be empty")
+
+        dev = device or torch.device("cpu")
+        baked: list[tuple[list, list]] = [curve._ensure_baked() for curve in curves]
+        max_chains = max((len(r_chains) for r_chains, _ in baked), default=0)
+        max_segs = max((len(chain) for r_chains, _ in baked for chain in r_chains), default=0)
+        max_regions = max((len(curve.markers) + 1 for curve in curves), default=1)
+
+        def _empty_coeffs() -> Dict[str, torch.Tensor]:
+            shape = (len(curves), max_chains, max(max_segs, 1))
+            zeros = torch.zeros(shape, dtype=dtype, device=dev)
+            return {
+                "t0s": zeros.clone(),
+                "t1s": zeros.clone(),
+                "c0s": zeros.clone(),
+                "c1s": zeros.clone(),
+                "c2s": zeros.clone(),
+                "c3s": zeros.clone(),
+            }
+
+        r_coeffs = _empty_coeffs()
+        theta_coeffs = _empty_coeffs()
+        chain_lengths = torch.zeros((len(curves), max(max_chains, 1)), dtype=torch.int64, device=dev)
+        region_bounds = torch.ones((len(curves), max(max_regions, 1) + 1), dtype=dtype, device=dev)
+        region_mode_codes = torch.zeros((len(curves), max(max_regions, 1)), dtype=torch.int64, device=dev)
+        region_loop_count = torch.zeros((len(curves), max(max_regions, 1)), dtype=torch.int64, device=dev)
+        region_lfo_depth = torch.zeros((len(curves), max(max_regions, 1)), dtype=dtype, device=dev)
+        region_gate_threshold = torch.zeros((len(curves), max(max_regions, 1)), dtype=dtype, device=dev)
+        region_sub_curves: list[list[Optional[ParametricCurve]]] = [
+            [None for _ in range(max(max_regions, 1))]
+            for _ in curves
+        ]
+
+        for bi, curve in enumerate(curves):
+            r_chains, theta_chains = baked[bi]
+            for ci, (r_chain, theta_chain) in enumerate(zip(r_chains, theta_chains)):
+                seg_count = len(r_chain)
+                chain_lengths[bi, ci] = seg_count
+                if seg_count <= 0:
+                    continue
+                for name, segs in (("r", r_chain), ("theta", theta_chain)):
+                    target = r_coeffs if name == "r" else theta_coeffs
+                    target["t0s"][bi, ci, :seg_count] = torch.tensor([seg.t0 for seg in segs], dtype=dtype, device=dev)
+                    target["t1s"][bi, ci, :seg_count] = torch.tensor([seg.t1 for seg in segs], dtype=dtype, device=dev)
+                    target["c0s"][bi, ci, :seg_count] = torch.tensor([seg.c0 for seg in segs], dtype=dtype, device=dev)
+                    target["c1s"][bi, ci, :seg_count] = torch.tensor([seg.c1 for seg in segs], dtype=dtype, device=dev)
+                    target["c2s"][bi, ci, :seg_count] = torch.tensor([seg.c2 for seg in segs], dtype=dtype, device=dev)
+                    target["c3s"][bi, ci, :seg_count] = torch.tensor([seg.c3 for seg in segs], dtype=dtype, device=dev)
+
+            sorted_markers = sorted(curve.markers, key=lambda m: m.t)
+            bounds = [0.0] + [m.t for m in sorted_markers] + [1.0]
+            region_count = len(bounds) - 1
+            region_bounds[bi, : region_count + 1] = torch.tensor(bounds, dtype=dtype, device=dev)
+            if region_count + 1 < region_bounds.shape[1]:
+                region_bounds[bi, region_count + 1 :] = 1.0
+            for ri in range(region_count):
+                eff = curve.regions.get(ri, RegionEffect())
+                region_mode_codes[bi, ri] = cls._REGION_MODE_TO_CODE.get(eff.mode, 0)
+                region_loop_count[bi, ri] = int(eff.loop_count)
+                region_lfo_depth[bi, ri] = float(eff.lfo_depth)
+                region_gate_threshold[bi, ri] = float(eff.gate_threshold)
+                region_sub_curves[bi][ri] = eff.sub_curve
+
+        return cls(
+            curves=list(curves),
+            dtype=dtype,
+            device=dev,
+            r_coeffs=r_coeffs,
+            theta_coeffs=theta_coeffs,
+            chain_lengths=chain_lengths,
+            region_bounds=region_bounds,
+            region_mode_codes=region_mode_codes,
+            region_loop_count=region_loop_count,
+            region_lfo_depth=region_lfo_depth,
+            region_gate_threshold=region_gate_threshold,
+            region_sub_curves=region_sub_curves,
+            v_lo=torch.tensor([curve.v_lo for curve in curves], dtype=dtype, device=dev),
+            v_hi=torch.tensor([curve.v_hi for curve in curves], dtype=dtype, device=dev),
+            activation_drive=torch.tensor([curve.activation_drive for curve in curves], dtype=dtype, device=dev),
+            slew_samples=torch.tensor([curve.slew_samples for curve in curves], dtype=torch.int64, device=dev),
+            activation_modes=[curve.activation for curve in curves],
+            y_scales=[curve.y_scale for curve in curves],
+        )
+
+    def _coerce_t_batch(self, t_batch: torch.Tensor) -> torch.Tensor:
+        if not isinstance(t_batch, torch.Tensor):
+            t_batch = torch.as_tensor(t_batch, dtype=self.dtype, device=self.device)
+        t = t_batch.to(dtype=self.dtype, device=self.device)
+        if t.ndim == 0:
+            t = t.reshape(1, 1)
+        elif t.ndim == 1:
+            t = t.unsqueeze(0).expand(len(self.curves), -1)
+        elif t.ndim == 2:
+            if t.shape[0] == 1 and len(self.curves) != 1:
+                t = t.expand(len(self.curves), -1)
+            elif t.shape[0] != len(self.curves):
+                raise ValueError(f"Expected first dim {len(self.curves)}, got {t.shape[0]}")
+        else:
+            raise ValueError("t_batch must be scalar, 1-D, or 2-D")
+        return t
+
+    def _eval_packed_coeffs(self, coeffs: Dict[str, torch.Tensor], t: torch.Tensor) -> torch.Tensor:
+        batch, time_len = t.shape
+        max_chains = coeffs["t0s"].shape[1]
+        out = torch.zeros((batch, time_len), dtype=self.dtype, device=self.device)
+        for chain_idx in range(max_chains):
+            seg_count = self.chain_lengths[:, chain_idx]
+            if not bool((seg_count > 0).any()):
+                continue
+            seg_valid = torch.arange(coeffs["t0s"].shape[2], device=self.device).view(1, -1) < seg_count.view(-1, 1)
+            t0s = coeffs["t0s"][:, chain_idx, :]
+            t1s = coeffs["t1s"][:, chain_idx, :]
+            chain_active = (seg_count > 0).unsqueeze(1) & (t >= t0s[:, :1]) & (t <= t1s.gather(1, (seg_count - 1).clamp(min=0).view(-1, 1)))
+            idx = ((t.unsqueeze(-1) >= t0s.unsqueeze(1)) & seg_valid.unsqueeze(1)).sum(dim=-1) - 1
+            idx = idx.clamp(min=0)
+            gather_idx = idx.unsqueeze(-1)
+            seg_t0 = torch.gather(t0s, 1, idx)
+            seg_t1 = torch.gather(t1s, 1, idx)
+            span = (seg_t1 - seg_t0).clamp(min=1e-14)
+            u = ((t - seg_t0) / span).clamp(0.0, 1.0)
+            c0 = torch.gather(coeffs["c0s"][:, chain_idx, :], 1, idx)
+            c1 = torch.gather(coeffs["c1s"][:, chain_idx, :], 1, idx)
+            c2 = torch.gather(coeffs["c2s"][:, chain_idx, :], 1, idx)
+            c3 = torch.gather(coeffs["c3s"][:, chain_idx, :], 1, idx)
+            vals = c0 + c1 * u + c2 * (u * u) + c3 * (u * u * u)
+            fill_left = coeffs["c0s"][:, chain_idx, 0].unsqueeze(1).expand_as(vals)
+            last_idx = (seg_count - 1).clamp(min=0).view(-1, 1)
+            fill_right = (
+                torch.gather(coeffs["c0s"][:, chain_idx, :], 1, last_idx)
+                + torch.gather(coeffs["c1s"][:, chain_idx, :], 1, last_idx)
+                + torch.gather(coeffs["c2s"][:, chain_idx, :], 1, last_idx)
+                + torch.gather(coeffs["c3s"][:, chain_idx, :], 1, last_idx)
+            ).expand_as(vals)
+            vals = torch.where(t < t0s[:, :1], fill_left, vals)
+            vals = torch.where(t > t1s.gather(1, last_idx), fill_right, vals)
+            out = torch.where(chain_active, vals, out)
+        return out
+
+    def _compile_region_dispatch(self, t: torch.Tensor) -> Dict[str, torch.Tensor]:
+        lo = self.region_bounds[:, :-1]
+        hi = self.region_bounds[:, 1:]
+        active = (t.unsqueeze(-1) >= lo.unsqueeze(1)) & (t.unsqueeze(-1) <= hi.unsqueeze(1))
+        active_any = active.any(dim=-1)
+        region_idx = active.to(torch.int64).argmax(dim=-1)
+        row_index = torch.arange(t.shape[0], device=self.device).unsqueeze(1)
+        lo_sel = lo[row_index, region_idx]
+        hi_sel = hi[row_index, region_idx]
+        span = (hi_sel - lo_sel).clamp(min=1e-14)
+        local_u = ((t - lo_sel) / span).clamp(0.0, 1.0)
+        return {
+            "region_idx": region_idx,
+            "region_lo": lo_sel,
+            "region_hi": hi_sel,
+            "local_u": local_u,
+            "active_any": active_any,
+        }
+
+    def _compile_transition_batch(
+        self,
+        *,
+        gate_history_batch: "Optional[List[List[GateEvent]]]" = None,
+        transition_events_batch: "Optional[List[List[dict]]]" = None,
+    ) -> Dict[str, torch.Tensor]:
+        event_rows = transition_events_batch
+        if event_rows is None:
+            event_rows = [[] for _ in self.curves]
+            for bi, gates in enumerate(gate_history_batch or [[] for _ in self.curves]):
+                for gate in gates:
+                    event_rows[bi].append({"t_event": float(gate.t_on), "trigger": "retrigger"})
+                    if gate.t_off is not None:
+                        event_rows[bi].append({"t_event": float(gate.t_off), "trigger": "release"})
+        elif len(event_rows) != len(self.curves):
+            raise ValueError("transition_events_batch must match packed batch size")
+
+        compiled_rows: list[list[dict[str, Any]]] = []
+        max_entries = 0
+        for curve, items in zip(self.curves, event_rows):
+            compiled: list[dict[str, Any]] = []
+            for item in items:
+                trigger = str(item.get("trigger", "retrigger"))
+                t_event = float(item.get("t_event", 0.0))
+                region = str(item.get("region_label") or curve._region_label_at(t_event))
+                rules = curve.rule_tree.matching_rules(trigger, region)
+                if not rules:
+                    continue
+                nodes = [rules[0]]
+                nodes.extend(
+                    child
+                    for child in rules[0].children
+                    if (child.trigger in ("any", trigger) and child.region in ("any", region))
+                )
+                for node in nodes:
+                    mode = node.blend_mode
+                    m = max(node.crossfade_m, 0.0)
+                    if mode == "hard_cut" or m < 1e-12:
+                        t_snap = max(0.0, min(1.0, t_event))
+                        r_in, _, theta_in, _ = curve._eval_polar_with_deriv(t_snap)
+                        compiled.append(
+                            {
+                                "t0": t_snap,
+                                "t1": max(t_snap + 1e-12, t_snap),
+                                "mode": "hard_cut",
+                                "r0": r_in,
+                                "r1": r_in,
+                                "theta0": theta_in,
+                                "theta1": theta_in,
+                            }
+                        )
+                        continue
+
+                    t_a = max(0.0, min(1.0, t_event - m))
+                    t_b = max(0.0, min(1.0, t_event + m))
+                    r0, dr0, theta0, dtheta0 = curve._eval_polar_with_deriv(t_a)
+                    r1, dr1, theta1, dtheta1 = curve._eval_polar_with_deriv(t_b)
+                    entry = {
+                        "t0": t_a,
+                        "t1": t_b,
+                        "mode": mode,
+                        "r0": r0,
+                        "r1": r1,
+                        "theta0": theta0,
+                        "theta1": theta1,
+                    }
+                    if mode == "hermite":
+                        sr = _hermite_seg_coeffs(t_a, t_b, r0, dr0, r1, dr1)
+                        st = _hermite_seg_coeffs(t_a, t_b, theta0, dtheta0, theta1, dtheta1)
+                        entry["r_coeffs"] = (sr.c0, sr.c1, sr.c2, sr.c3)
+                        entry["theta_coeffs"] = (st.c0, st.c1, st.c2, st.c3)
+                    compiled.append(entry)
+
+            compiled_rows.append(compiled)
+            max_entries = max(max_entries, len(compiled))
+
+        max_entries = max(max_entries, 1)
+        valid = torch.zeros((len(self.curves), max_entries), dtype=torch.bool, device=self.device)
+        t0 = torch.zeros((len(self.curves), max_entries), dtype=self.dtype, device=self.device)
+        t1 = torch.zeros((len(self.curves), max_entries), dtype=self.dtype, device=self.device)
+        mode_codes = torch.full((len(self.curves), max_entries), -1, dtype=torch.int64, device=self.device)
+        r0 = torch.zeros((len(self.curves), max_entries), dtype=self.dtype, device=self.device)
+        r1 = torch.zeros((len(self.curves), max_entries), dtype=self.dtype, device=self.device)
+        theta0 = torch.zeros((len(self.curves), max_entries), dtype=self.dtype, device=self.device)
+        theta1 = torch.zeros((len(self.curves), max_entries), dtype=self.dtype, device=self.device)
+        hermite_r = torch.zeros((len(self.curves), max_entries, 4), dtype=self.dtype, device=self.device)
+        hermite_theta = torch.zeros((len(self.curves), max_entries, 4), dtype=self.dtype, device=self.device)
+
+        mode_map = {"hard_cut": 0, "constant_power": 1, "hermite": 2}
+        for bi, compiled in enumerate(compiled_rows):
+            for ei, entry in enumerate(compiled):
+                valid[bi, ei] = True
+                t0[bi, ei] = float(entry["t0"])
+                t1[bi, ei] = float(entry["t1"])
+                mode_codes[bi, ei] = mode_map.get(str(entry["mode"]), 2)
+                r0[bi, ei] = float(entry["r0"])
+                r1[bi, ei] = float(entry["r1"])
+                theta0[bi, ei] = float(entry["theta0"])
+                theta1[bi, ei] = float(entry["theta1"])
+                if "r_coeffs" in entry:
+                    hermite_r[bi, ei] = torch.tensor(entry["r_coeffs"], dtype=self.dtype, device=self.device)
+                    hermite_theta[bi, ei] = torch.tensor(entry["theta_coeffs"], dtype=self.dtype, device=self.device)
+
+        return {
+            "valid": valid,
+            "t0": t0,
+            "t1": t1,
+            "mode_codes": mode_codes,
+            "r0": r0,
+            "r1": r1,
+            "theta0": theta0,
+            "theta1": theta1,
+            "hermite_r": hermite_r,
+            "hermite_theta": hermite_theta,
+        }
+
+    def _apply_region_effects(
+        self,
+        t: torch.Tensor,
+        r: torch.Tensor,
+        theta: torch.Tensor,
+        *,
+        clamp_r: bool,
+        apply_activation: bool,
+        apply_slew: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dispatch = self._compile_region_dispatch(t)
+        region_idx = dispatch["region_idx"]
+        local_u = dispatch["local_u"]
+        active_any = dispatch["active_any"]
+
+        out_r = r.clone()
+        out_theta = theta.clone()
+        for bi, curve in enumerate(self.curves):
+            max_region = self.region_mode_codes.shape[1]
+            for ri in range(max_region):
+                mask = active_any[bi] & (region_idx[bi] == ri)
+                if not bool(mask.any()):
+                    continue
+                mode = self._CODE_TO_REGION_MODE.get(int(self.region_mode_codes[bi, ri].item()), "normal")
+                if mode in ("normal", "sustain"):
+                    continue
+                if mode == "silence":
+                    out_r[bi] = torch.where(mask, torch.zeros_like(out_r[bi]), out_r[bi])
+                    continue
+                if mode == "hold":
+                    idxs = mask.nonzero(as_tuple=False)
+                    if idxs.numel() > 0:
+                        hold_v = out_r[bi, int(idxs[0, 0])]
+                        out_r[bi] = torch.where(mask, hold_v.expand_as(out_r[bi]), out_r[bi])
+                    continue
+                if mode == "gate":
+                    gated = (out_r[bi] > self.region_gate_threshold[bi, ri]).to(self.dtype)
+                    out_r[bi] = torch.where(mask, gated, out_r[bi])
+                    continue
+
+                sub_curve = self.region_sub_curves[bi][ri]
+                if sub_curve is None:
+                    continue
+                local_t = local_u[bi, mask]
+                if mode == "loop":
+                    reps = max(int(self.region_loop_count[bi, ri].item()), 1)
+                    tile_t = torch.remainder(local_t * reps, 1.0)
+                    sub_v = sub_curve._evaluate_curve(tile_t, clamp_r=clamp_r, apply_activation=apply_activation, apply_slew=apply_slew).real
+                    out_r[bi, mask] = sub_v
+                elif mode == "mirror":
+                    reps = max(int(self.region_loop_count[bi, ri].item()), 1)
+                    phase = local_t * reps
+                    rep_idx = phase.long()
+                    tile_t = torch.remainder(phase, 1.0)
+                    tile_t = torch.where((rep_idx % 2) == 1, 1.0 - tile_t, tile_t)
+                    sub_v = sub_curve._evaluate_curve(tile_t, clamp_r=clamp_r, apply_activation=apply_activation, apply_slew=apply_slew).real
+                    out_r[bi, mask] = sub_v
+                elif mode == "additive":
+                    sub_v = sub_curve._evaluate_curve(local_t, clamp_r=clamp_r, apply_activation=apply_activation, apply_slew=apply_slew).real
+                    added = out_r[bi, mask] + sub_v * self.region_lfo_depth[bi, ri]
+                    out_r[bi, mask] = added.clamp(0.0, 1.0) if clamp_r else added
+
+        return out_r, out_theta
+
+    def _apply_curve_postprocess(self, z: torch.Tensor, *, apply_activation: bool, apply_slew: bool) -> torch.Tensor:
+        out = z
+        if apply_activation:
+            for mode in sorted(set(self.activation_modes)):
+                if mode == "none":
+                    continue
+                idxs = [i for i, cur_mode in enumerate(self.activation_modes) if cur_mode == mode]
+                if not idxs:
+                    continue
+                rows = torch.tensor(idxs, dtype=torch.int64, device=self.device)
+                mag = out[rows].abs()
+                drive = self.activation_drive[rows].unsqueeze(1).expand_as(mag)
+                if mode == "tanh":
+                    denom = torch.tanh(drive).clamp(min=1e-30)
+                    mag_act = torch.tanh(drive * mag) / denom
+                elif mode == "sigmoid":
+                    lo = 1.0 / (1.0 + torch.exp(drive * 0.5))
+                    hi = 1.0 / (1.0 + torch.exp(-drive * 0.5))
+                    span = (hi - lo).clamp(min=1e-30)
+                    mag_act = (torch.sigmoid(drive * (mag - 0.5)) - lo) / span
+                elif mode == "softplus":
+                    denom = torch.log1p(torch.exp(drive)).clamp(min=1e-30)
+                    mag_act = torch.log1p(torch.exp(drive * mag)) / denom
+                elif mode == "elu":
+                    scaled = drive * (2.0 * mag - 1.0)
+                    elu_out = torch.where(scaled >= 0, scaled, torch.expm1(scaled))
+                    lo = torch.expm1(-drive)
+                    hi = drive
+                    mag_act = (elu_out - lo) / (hi - lo).clamp(min=1e-30)
+                else:
+                    mag_act = _apply_activation(mag, mode, 1.0)
+                out_rows = out[rows] * (mag_act / mag.clamp(min=1e-30))
+                out[rows] = out_rows
+
+        if apply_slew:
+            for row_idx, slew in enumerate(self.slew_samples.tolist()):
+                if slew > 0:
+                    out[row_idx] = _apply_slew(out[row_idx], int(slew))
+        return out
+
+    def _apply_transition_overrides(self, t: torch.Tensor, base_z: torch.Tensor, dispatch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        out = base_z.clone()
+        for bi in range(len(self.curves)):
+            valid_idx = dispatch["valid"][bi].nonzero(as_tuple=False).reshape(-1)
+            for idx_t in valid_idx.tolist():
+                lo = dispatch["t0"][bi, idx_t]
+                hi = dispatch["t1"][bi, idx_t]
+                mask = (t[bi] >= lo) & (t[bi] <= hi)
+                if not bool(mask.any()):
+                    continue
+                span = float((hi - lo).item())
+                u = ((t[bi, mask] - lo) / max(span, 1e-14)).clamp(0.0, 1.0)
+                mode_code = int(dispatch["mode_codes"][bi, idx_t].item())
+                if mode_code == 0:
+                    r_blend = dispatch["r0"][bi, idx_t].expand_as(u)
+                    theta_blend = dispatch["theta0"][bi, idx_t].expand_as(u)
+                elif mode_code == 1:
+                    angle = u * (math.pi * 0.5)
+                    r_blend = dispatch["r0"][bi, idx_t] * torch.cos(angle) + dispatch["r1"][bi, idx_t] * torch.sin(angle)
+                    theta_blend = dispatch["theta0"][bi, idx_t] + u * (dispatch["theta1"][bi, idx_t] - dispatch["theta0"][bi, idx_t])
+                else:
+                    rc = dispatch["hermite_r"][bi, idx_t]
+                    tc = dispatch["hermite_theta"][bi, idx_t]
+                    r_blend = rc[0] + rc[1] * u + rc[2] * (u * u) + rc[3] * (u * u * u)
+                    theta_blend = tc[0] + tc[1] * u + tc[2] * (u * u) + tc[3] * (u * u * u)
+                out[bi, mask] = r_blend.to(torch.complex128) * torch.exp(1j * theta_blend.to(torch.complex128))
+        return out
+
+    def evaluate(
+        self,
+        t_batch: torch.Tensor,
+        *,
+        gate_history_batch: "Optional[List[List[GateEvent]]]" = None,
+        transition_events_batch: "Optional[List[List[dict]]]" = None,
+        clamp_r: bool = True,
+        apply_activation: bool = True,
+        apply_slew: bool = True,
+        physical: bool = False,
+    ) -> torch.Tensor:
+        t = self._coerce_t_batch(t_batch)
+        if gate_history_batch is not None and len(gate_history_batch) != len(self.curves):
+            raise ValueError("gate_history_batch must match packed batch size")
+
+        r = self._eval_packed_coeffs(self.r_coeffs, t)
+        theta = self._eval_packed_coeffs(self.theta_coeffs, t)
+        if clamp_r:
+            r = r.clamp(0.0, 1.0)
+
+        r, theta = self._apply_region_effects(
+            t,
+            r,
+            theta,
+            clamp_r=clamp_r,
+            apply_activation=apply_activation,
+            apply_slew=apply_slew,
+        )
+
+        z = r.to(torch.complex128) * torch.exp(1j * theta.to(torch.complex128))
+        transition_dispatch = self._compile_transition_batch(
+            gate_history_batch=gate_history_batch,
+            transition_events_batch=transition_events_batch,
+        )
+        z = self._apply_transition_overrides(t, z, transition_dispatch)
+        z = self._apply_curve_postprocess(z, apply_activation=apply_activation, apply_slew=apply_slew)
+
+        if physical:
+            v_phys = []
+            for bi, scale in enumerate(self.y_scales):
+                v_phys.append(_y_to_physical_t(z[bi].real.to(self.dtype), float(self.v_lo[bi].item()), float(self.v_hi[bi].item()), scale))
+            return torch.stack(v_phys, dim=0).to(torch.complex128)
+        return z
 
 
 # ─────────────────────────────────────────────────────────────────────────────

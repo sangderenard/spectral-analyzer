@@ -58,7 +58,7 @@ from OpenGL.GL import (
     GL_TRIANGLES, GL_UNSIGNED_BYTE, GL_MODELVIEW, GL_PROJECTION, GL_SCISSOR_TEST,
     glBegin, glBindTexture, glBlendFunc, glClear, glClearColor,
     glColor4f, glDeleteTextures, glDisable, glEnable, glEnd,
-    glGenTextures, glLineWidth, glTexCoord2f, glTexImage2D,
+    glGenTextures, glLineWidth, glTexCoord2f, glTexImage2D, glTexSubImage2D,
     glLoadIdentity, glMatrixMode, glOrtho, glScissor, glTexParameteri, glVertex2f, glViewport,
 )
 
@@ -80,6 +80,7 @@ from parametric_curve import (
     GateEvent,
 )
 from parametric_curve_editor import ParametricCurveEditor, _TextOverlay
+from graph_solver import _T as _PROF
 
 try:
     from signal_generator_v2 import KnobSpec
@@ -2454,6 +2455,7 @@ from routing_engine import (RoutingEdge, FeedbackConfig, RoutingGraph,
                              EdgeTransferSpec, TensorPortContract, MetaEdge)
 from patch_to_driver import (build_driver_config,
                               _resolve_f0, _build_harmonics, _build_env_knots,
+                              _build_parametric_driver_batches,
                               _CHIRP_CODE, CHIRP_NONE)
 from performer_engine import (init_driver_state, multi_level_driver_step,
                                DriverConfig, DriverState, driver_synthesis_step)
@@ -7090,6 +7092,166 @@ def _synthesize_voice(
     return out
 
 
+def _subbatch(
+    fn: "Callable[[torch.Tensor], torch.Tensor]",
+    items: torch.Tensor,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Run fn on items in chunks of chunk_size along dim 0, cat results along dim 0."""
+    return torch.cat([fn(chunk) for chunk in items.split(chunk_size)], dim=0)
+
+
+def _synthesize_voice_batched(
+    voice: AnalyticVoice,
+    patch:   AnalyticPatch,
+    lfo_map: dict,
+    p_map:   dict,
+    phase_origins: "torch.Tensor",  # (B,) — one phase offset per slot
+    t_offset: float = 0.0,
+    n_samples: int  = 0,
+    param_overrides: "dict | None" = None,
+    voice_signal_map: "dict | None" = None,
+    param_series: "dict | None" = None,
+    granular_seed_offset: int = 0,
+) -> "torch.Tensor":  # (B, n) complex128
+    """Standard-path voice synthesis for B phase origins in one vectorised pass.
+
+    Only handles the standard torch path.  Callers must verify that
+    voice.piecewise_env is None and voice.emission_mode != 'granular' before
+    calling; those paths do not use phase_origin and should use _synthesize_voice
+    with a post-hoc rotation instead.
+    """
+    sr  = patch.preview_sr
+    dur = patch.duration
+    n   = n_samples if n_samples > 0 else int(sr * dur)
+    B   = int(phase_origins.shape[0])
+
+    t = (torch.arange(n, dtype=torch.float64) / sr) + t_offset
+
+    po = param_overrides or {}
+    _po_freq = po.get("freq_hz")
+    if _po_freq is not None and len(_po_freq) >= n:
+        f_inst = torch.as_tensor(_po_freq[:n], dtype=torch.float64)
+    else:
+        f_inst = torch.full((n,), voice.freq_hz, dtype=torch.float64)
+
+    ct = voice.chirp.chirp_type
+    if ct == "linear":
+        f_inst = f_inst + torch.linspace(voice.chirp.f_delta_start, voice.chirp.f_delta_end, n, dtype=torch.float64)
+    elif ct == "exponential" and voice.chirp.tau > 0:
+        decay  = torch.exp(-t / voice.chirp.tau)
+        f_inst = f_inst + voice.chirp.f_delta_start * decay + voice.chirp.f_delta_end * (1 - decay)
+    elif ct == "power" and dur > 0:
+        tau_n  = (t / dur) ** max(voice.chirp.chirp_power, 1e-3)
+        f_inst = f_inst + voice.chirp.f_delta_start * (1.0 - tau_n) + voice.chirp.f_delta_end * tau_n
+
+    if voice.fm and voice.fm.source_key:
+        sk = voice.fm.source_key
+        if sk in lfo_map:
+            lfo = lfo_map[sk]
+            ph = 2.0 * math.pi * lfo.rate_hz * t + lfo.phase_offset
+            if lfo.shape == "Sine":
+                mod = lfo.depth * torch.sin(ph)
+            elif lfo.shape == "Triangle":
+                mod = lfo.depth * (2.0 * torch.abs(2.0 * (ph / (2 * math.pi) % 1.0) - 1.0) - 1.0)
+            elif lfo.shape == "Sawtooth":
+                mod = lfo.depth * (2.0 * (ph / (2 * math.pi) % 1.0) - 1.0)
+            else:
+                mod = lfo.depth * torch.sign(torch.sin(ph))
+        elif voice_signal_map is not None and sk in voice_signal_map:
+            src_csig = voice_signal_map[sk]
+            src_t = torch.as_tensor(src_csig[:n], dtype=torch.complex128)
+            phase_diff = torch.angle(src_t[1:] * src_t[:-1].conj())
+            f_mod = phase_diff * (float(patch.preview_sr) / (2.0 * math.pi))
+            f_mod = torch.cat([f_mod[:1], f_mod])
+            f_mid = float(p_map[sk].freq_hz) if sk in p_map else float(torch.mean(torch.abs(f_mod)).item())
+            mod = f_mod / max(f_mid, 1.0)
+        elif param_series is not None and sk in param_series:
+            ps = param_series[sk]
+            mod = torch.as_tensor(ps[:n], dtype=torch.float64) if len(ps) >= n else \
+                  torch.nn.functional.pad(torch.as_tensor(ps, dtype=torch.float64), (0, n - len(ps)))
+        elif sk in p_map and sk != voice.key:
+            mod = torch.cos(2.0 * math.pi * p_map[sk].freq_hz * t)
+        else:
+            mod = torch.zeros(n, dtype=torch.float64)
+        f_inst = f_inst + voice.fm.depth_hz * mod
+
+    # Cumulative phase — common to all slots  (n,)
+    phase_base = torch.cumsum(2.0 * math.pi * f_inst / sr, dim=0)
+
+    _po_amp = po.get("amplitude")
+    if _po_amp is not None and len(_po_amp) >= n:
+        amp = torch.as_tensor(_po_amp[:n], dtype=torch.float64)
+    else:
+        amp = torch.full((n,), voice.amplitude, dtype=torch.float64)
+
+    if voice.am and voice.am.source_key:
+        sk = voice.am.source_key
+        if sk in lfo_map:
+            lfo = lfo_map[sk]
+            ph = 2.0 * math.pi * lfo.rate_hz * t + lfo.phase_offset
+            if lfo.shape == "Sine":
+                mod = lfo.depth * torch.sin(ph)
+            elif lfo.shape == "Triangle":
+                mod = lfo.depth * (2.0 * torch.abs(2.0 * (ph / (2 * math.pi) % 1.0) - 1.0) - 1.0)
+            elif lfo.shape == "Sawtooth":
+                mod = lfo.depth * (2.0 * (ph / (2 * math.pi) % 1.0) - 1.0)
+            else:
+                mod = lfo.depth * torch.sign(torch.sin(ph))
+        elif voice_signal_map is not None and sk in voice_signal_map:
+            src_csig = voice_signal_map[sk]
+            src_t = torch.as_tensor(src_csig[:n], dtype=torch.complex128)
+            mod = torch.abs(src_t).to(torch.float64)
+            peak = float(torch.max(mod).item())
+            if peak > 1e-12:
+                mod = mod / peak
+        elif param_series is not None and sk in param_series:
+            ps = param_series[sk]
+            mod = torch.as_tensor(ps[:n], dtype=torch.float64) if len(ps) >= n else \
+                  torch.nn.functional.pad(torch.as_tensor(ps, dtype=torch.float64), (0, n - len(ps)))
+        elif sk in p_map and sk != voice.key:
+            mod = torch.cos(2.0 * math.pi * p_map[sk].freq_hz * t)
+        else:
+            mod = torch.zeros(n, dtype=torch.float64)
+        amp = amp * (1.0 + voice.am.depth_amp * mod)
+
+    env = amp  # (n,)
+
+    mt = voice.manifold_type
+    if mt in ("harmonic", "harmonic_warp") and voice.harmonic_count > 1:
+        hc   = max(1, voice.harmonic_count)
+        bri  = voice.harmonic_brightness
+        warp = voice.harmonic_warp_strength
+        norm = sum(1.0 / (k ** bri) if bri > 0 else 1.0 for k in range(1, hc + 1))
+        sig  = torch.zeros(B, n, dtype=torch.complex128)
+        for k in range(1, hc + 1):
+            h_ratio      = k + warp * (k - 1)
+            h_amp        = 1.0 / (k ** bri) if bri > 0 else 1.0
+            h_phase_base = torch.cumsum(2.0 * math.pi * (f_inst * h_ratio) / sr, dim=0)  # (n,)
+            k_origins    = (k * phase_origins) % (2.0 * math.pi)                         # (B,)
+            h_phase      = h_phase_base[None, :] + k_origins[:, None]                    # (B, n)
+            sig = sig + h_amp * torch.exp(1j * h_phase)
+        sig = sig / norm
+    else:
+        phase = phase_base[None, :] + phase_origins[:, None]  # (B, n)
+        sig   = torch.exp(1j * phase)
+
+    if voice.loop_enabled:
+        sig_np = sig.detach().cpu().numpy()  # (B, n)
+        for b in range(B):
+            sig_np[b] = _apply_loop_tiling(sig_np[b], voice, n)
+        sig = torch.as_tensor(sig_np, dtype=torch.complex128)
+
+    out = env[None, :] * sig  # (B, n)
+
+    if voice.pre_delay > 0.0:
+        preroll_n   = max(0, int(round(abs(min(0.0, t_offset)) * sr)))
+        silence_end = preroll_n + min(n, int(round(voice.pre_delay * sr)))
+        out[:, preroll_n:silence_end] = 0.0
+
+    return out  # (B, n) complex128
+
+
 def _synthesize_lfo_csig(
     lfo: LFODefinition,
     n: int,
@@ -7725,6 +7887,12 @@ def _build_sequence_driver_config(
         empty = _ec(V, device)
         return empty, voices, init_driver_state(empty)
 
+    packed_env, param_env_row, packed_chirp, param_chirp_row = _build_parametric_driver_batches(
+        voices,
+        list(zip(instrument_idx_list, voice_idx_list)),
+        device,
+    )
+
     def _ft(lst):  return torch.tensor(lst, dtype=torch.float64, device=device)
     def _it(lst):  return torch.tensor(lst, dtype=torch.int64,   device=device)
     def _bt(lst):  return torch.tensor(lst, dtype=torch.bool,    device=device)
@@ -7755,6 +7923,10 @@ def _build_sequence_driver_config(
         fm_depth_hz       = _ft(fm_depth_list),
         am_source_voice   = _it(am_src_list),
         am_depth          = _ft(am_depth_list),
+        parametric_env_packed = packed_env,
+        parametric_env_row    = param_env_row,
+        parametric_chirp_packed = packed_chirp,
+        parametric_chirp_row    = param_chirp_row,
     )
 
     # Seed state: t_pos = -start_time per driver so envelope zero-phase aligns
@@ -8697,11 +8869,20 @@ def _synthesize_patch(
 # GL helpers
 # ---------------------------------------------------------------------------
 
+# Maps tex_id -> (w, h) so _surface_to_gl_tex can reuse textures via glTexSubImage2D
+_tex_size_cache: dict = {}
+
 def _surface_to_gl_tex(surf: pygame.Surface, old_id: int = 0) -> int:
     raw = pygame.image.tostring(surf, "RGBA", False)
     w, h = surf.get_size()
+    if old_id and _tex_size_cache.get(old_id) == (w, h):
+        # Same size — replace pixel data in-place; no GPU texture re-allocation
+        glBindTexture(GL_TEXTURE_2D, old_id)
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        return old_id
     if old_id:
         glDeleteTextures([old_id])
+        _tex_size_cache.pop(old_id, None)
     tid = int(glGenTextures(1))
     glBindTexture(GL_TEXTURE_2D, tid)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
@@ -8709,7 +8890,49 @@ def _surface_to_gl_tex(surf: pygame.Surface, old_id: int = 0) -> int:
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+    _tex_size_cache[tid] = (w, h)
     return tid
+
+
+def _surface_rects_to_gl_tex(
+    surf: pygame.Surface,
+    rects: list[pygame.Rect] | None,
+    old_id: int = 0,
+) -> int:
+    w, h = surf.get_size()
+    if not old_id or _tex_size_cache.get(old_id) != (w, h):
+        return _surface_to_gl_tex(surf, old_id)
+    if not rects:
+        return old_id
+    viewport = pygame.Rect(0, 0, w, h)
+    clipped: list[pygame.Rect] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for rect in rects:
+        cr = pygame.Rect(rect).clip(viewport)
+        if cr.w <= 0 or cr.h <= 0:
+            continue
+        key = (cr.x, cr.y, cr.w, cr.h)
+        if key in seen:
+            continue
+        seen.add(key)
+        clipped.append(cr)
+    if not clipped:
+        return old_id
+    glBindTexture(GL_TEXTURE_2D, old_id)
+    for rect in clipped:
+        raw = pygame.image.tostring(surf.subsurface(rect), "RGBA", False)
+        glTexSubImage2D(
+            GL_TEXTURE_2D,
+            0,
+            rect.x,
+            rect.y,
+            rect.w,
+            rect.h,
+            GL_RGBA,
+            GL_UNSIGNED_BYTE,
+            raw,
+        )
+    return old_id
 
 
 def _draw_tex_quad(tid: int, x: int, y: int, w: int, h: int, ww: int, wh: int) -> None:
@@ -9720,6 +9943,20 @@ class EditorCanvas:
         self._surf: pygame.Surface | None = None
         self._tex:  int = 0
         self._surf_dirty: bool = True
+        self._piecewise_atom_tex: dict[str, int] = {}
+        self._piecewise_atoms: list[Any] = []
+        self._piecewise_stale_tex_ids: list[int] = []
+        self._piecewise_preview_dirty: bool = True
+        self._piecewise_sync_revision: int = -1
+        self._piecewise_snapshot_revision: int = -1
+        self._piecewise_snapshot: dict[str, Any] | None = None
+        self._piecewise_preview_lock = threading.Lock()
+        self._piecewise_preview_request_key: str = ""
+        self._piecewise_preview_ready_key: str = ""
+        self._piecewise_preview_data: dict[str, Any] | None = None
+        self._piecewise_preview_cancel = threading.Event()
+        self._piecewise_preview_thread: threading.Thread | None = None
+        self._piecewise_preview_debounce: threading.Timer | None = None
 
         # Cache of active voice key (drives overlay rendering)
         # (initialized at top of __init__ before routing_view)
@@ -9766,6 +10003,7 @@ class EditorCanvas:
         # Background rebuild infrastructure
         self._rebuild_thread: threading.Thread | None = None
         self._rebuild_cancel: threading.Event = threading.Event()
+        self._rebuild_debounce: threading.Timer | None = None
         self._rebuild_result: dict | None = None
         self._rebuild_lock = threading.Lock()
         self._rebuild_hash: str = ""  # fingerprint of last completed rebuild
@@ -9871,6 +10109,10 @@ class EditorCanvas:
         plot_y = cy + MODEBAR_H
         plot_h = ch - MODEBAR_H
         if self._piecewise_editor is None or self._piecewise_voice_key != voice.key:
+            if self._piecewise_atom_tex:
+                self._piecewise_stale_tex_ids.extend(self._piecewise_atom_tex.values())
+                self._piecewise_atom_tex.clear()
+                self._piecewise_atoms = []
             editor = ParametricCurveEditor(
                 piecewise.curve,
                 piecewise.chirp_curve,
@@ -9880,16 +10122,23 @@ class EditorCanvas:
                 library_folder=os.path.join(os.getcwd(), "envelopes"),
             )
             editor._overlay = _TextOverlay(editor.w, editor.h)
+            editor.set_async_invalidate_callback(
+                lambda: (
+                    setattr(self, "_piecewise_preview_dirty", True),
+                    setattr(self, "_surf_dirty", True),
+                )
+            )
             editor._channels["A"] = editor._channel_state("A")
             editor._channels["A"].rule_tree = piecewise.rule_tree
             self._piecewise_editor = editor
             self._piecewise_voice_key = voice.key
+            self._piecewise_sync_revision = -1
+            self._piecewise_preview_dirty = True
             self._surf_dirty = True
         else:
             if self._piecewise_editor.w != max(64, cw) or self._piecewise_editor.h != max(64, plot_h):
                 self._piecewise_editor.resize(max(64, cw), max(64, plot_h))
                 self._surf_dirty = True
-        self._pull_piecewise_editor_state_into_voice(voice)
         return self._piecewise_editor
 
     def _pull_piecewise_editor_state_into_voice(self, voice: "AnalyticVoice") -> None:
@@ -9897,10 +10146,198 @@ class EditorCanvas:
             return
         if voice.piecewise_env is None:
             voice.piecewise_env = PiecewiseVoiceEnvelope()
-        voice.piecewise_env.curve = self._piecewise_editor._curves[0]
-        voice.piecewise_env.chirp_curve = self._piecewise_editor._curves[1]
-        voice.piecewise_env.signal_curve = self._piecewise_editor._curves[2]
-        voice.piecewise_env.rule_tree = self._piecewise_editor._channel_state("A").rule_tree or EnvelopeRuleTree.default()
+        snap = self._piecewise_editor.snapshot_state()
+        voice.piecewise_env.curve = snap["curves"][0]
+        voice.piecewise_env.chirp_curve = snap["curves"][1]
+        voice.piecewise_env.signal_curve = snap["curves"][2]
+        voice.piecewise_env.rule_tree = snap["rule_tree"] or EnvelopeRuleTree.default()
+        self._piecewise_sync_revision = int(snap["revision"])
+
+    def _piecewise_preview_key(self, patch: "AnalyticPatch", voice: "AnalyticVoice",
+                               editor: ParametricCurveEditor) -> tuple[str, dict[str, Any]]:
+        editor_rev = editor.get_revision()
+        if self._piecewise_snapshot is None or editor_rev != self._piecewise_snapshot_revision:
+            self._piecewise_snapshot = editor.snapshot_state()
+            self._piecewise_snapshot_revision = editor_rev
+        snap = self._piecewise_snapshot
+        payload = {
+            "voice_key": voice.key,
+            "voice": voice.to_dict(),
+            "duration": float(patch.duration),
+            "preview_sr": int(patch.preview_sr),
+            "granular_seed_offset": int(self.granular_seed_offset),
+            "lfos": [l.to_dict() for l in patch.lfos],
+            "voices": [v.to_dict() for v in patch.voices],
+            "piecewise_curves": [c.to_dict() for c in snap["curves"]],
+            "rule_tree": snap["rule_tree"].to_dict(),
+            "revision": int(snap["revision"]),
+        }
+        key = hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+        return key, snap
+
+    def _request_piecewise_preview(self, patch: "AnalyticPatch", voice: "AnalyticVoice",
+                                   editor: ParametricCurveEditor) -> None:
+        req_key, snap = self._piecewise_preview_key(patch, voice, editor)
+        with self._piecewise_preview_lock:
+            if req_key == self._piecewise_preview_request_key:
+                return
+            self._piecewise_preview_request_key = req_key
+            self._piecewise_preview_cancel.set()
+            self._piecewise_preview_cancel = threading.Event()
+            cancel = self._piecewise_preview_cancel
+        patch_snap = copy.deepcopy(patch)
+        voice_snap = next((v for v in patch_snap.voices if v.key == voice.key), None)
+        if voice_snap is None:
+            return
+        voice_snap.piecewise_env = PiecewiseVoiceEnvelope(
+            curve=snap["curves"][0],
+            chirp_curve=snap["curves"][1],
+            signal_curve=snap["curves"][2],
+            rule_tree=snap["rule_tree"],
+        )
+
+        def _worker() -> None:
+            try:
+                if cancel.is_set():
+                    return
+                lfo_map = {l.key: l for l in patch_snap.lfos}
+                p_map = {p.key: p for p in patch_snap.voices}
+                if voice_snap and not _voice_effectively_muted(voice_snap, patch_snap):
+                    csig = _synthesize_voice(
+                        voice_snap,
+                        patch_snap,
+                        lfo_map,
+                        p_map,
+                        granular_seed_offset=self.granular_seed_offset,
+                    )
+                    if hasattr(csig, "detach"):
+                        csig = csig.detach().cpu().numpy()
+                    csig = np.asarray(csig, dtype=np.complex128)
+                    env_curve = _compute_envelope(voice_snap, len(csig), patch_snap.duration).astype(np.float32, copy=False)
+                    chirp_f = _compute_chirp_frequency_series(voice_snap, len(csig), patch_snap.duration).astype(np.float32, copy=False)
+                else:
+                    csig = np.zeros(0, dtype=np.complex128)
+                    env_curve = np.zeros(0, dtype=np.float32)
+                    chirp_f = np.zeros(0, dtype=np.float32)
+
+                # Batch synthesis for GL display
+                _N_PHASE = 72
+                if (len(csig) > 0
+                        and voice_snap.piecewise_env is None
+                        and voice_snap.emission_mode not in ("granular",)):
+                    if cancel.is_set():
+                        return
+                    _phase_origins = torch.linspace(
+                        0.0, 2.0 * math.pi, _N_PHASE, endpoint=False, dtype=torch.float64
+                    )
+                    csig_batch = _synthesize_voice_batched(
+                        voice_snap, patch_snap, lfo_map, p_map, _phase_origins,
+                        granular_seed_offset=self.granular_seed_offset,
+                    ).detach().cpu().numpy()  # (72, n) complex128
+                elif len(csig) > 0:
+                    # Piecewise/granular: phase_origin doesn't affect output; rotation is exact
+                    _angles    = np.linspace(0.0, 2.0 * np.pi, _N_PHASE, endpoint=False)
+                    csig_batch = csig[np.newaxis, :] * np.exp(1j * _angles)[:, np.newaxis]
+                else:
+                    csig_batch = np.zeros((_N_PHASE, 0), dtype=np.complex128)
+
+                raw: dict[str, torch.Tensor] = {}
+                if len(csig) > 0:
+                    n_sig = len(csig)
+                    env_arr = env_curve.astype(float) if env_curve is not None else np.zeros(n_sig)
+                    amp_total = np.abs(np.asarray(csig, dtype=np.complex128))
+                    amp_peak = float(np.max(amp_total)) if amp_total.size > 0 else 0.0
+                    amp_total = amp_total / amp_peak if amp_peak > 1e-9 else np.zeros_like(amp_total, dtype=np.float64)
+                    base_chirp = _compute_knob_chirp_deviation_series(voice_snap, n_sig, patch_snap.duration)
+                    chirp_curve = snap["curves"][1]
+                    t_norm = torch.linspace(0.0, 1.0, n_sig, dtype=torch.float64)
+                    chirp_env_curve = chirp_curve.evaluate_normalized(t_norm).real.clamp(0.0, 1.0)
+                    chirp_env_hz = chirp_curve.to_physical(chirp_env_curve).detach().cpu().numpy().astype(np.float64, copy=False)
+                    chirp_total_hz = base_chirp + chirp_env_hz
+                    v_lo = float(chirp_curve.v_lo)
+                    v_hi = float(chirp_curve.v_hi)
+                    span = max(v_hi - v_lo, 1e-9)
+                    chirp_bias_norm = np.clip((base_chirp - v_lo) / span, 0.0, 1.0)
+                    chirp_env_norm = np.clip((chirp_env_hz - v_lo) / span, 0.0, 1.0)
+                    chirp_total_norm = np.clip((chirp_total_hz - v_lo) / span, 0.0, 1.0)
+                    raw = {
+                        "analytic": torch.as_tensor(csig, dtype=torch.complex128).reshape(-1),
+                        "amplitude_bias": torch.zeros(n_sig, dtype=torch.complex128),
+                        "amplitude": torch.as_tensor(env_arr, dtype=torch.complex128).reshape(-1),
+                        "amplitude_total": torch.as_tensor(amp_total, dtype=torch.complex128).reshape(-1),
+                        "chirp_bias": torch.as_tensor(chirp_bias_norm, dtype=torch.complex128).reshape(-1),
+                        "chirp": torch.as_tensor(chirp_env_norm, dtype=torch.complex128).reshape(-1),
+                        "chirp_total": torch.as_tensor(chirp_total_norm, dtype=torch.complex128).reshape(-1),
+                    }
+                data = {
+                    "csig":       csig,
+                    "csig_batch": csig_batch,
+                    "env_curve":  env_curve,
+                    "chirp_f":    chirp_f,
+                    "raw":        raw,
+                }
+                if cancel.is_set():
+                    return
+                with self._piecewise_preview_lock:
+                    if req_key != self._piecewise_preview_request_key:
+                        return
+                    self._piecewise_preview_ready_key = req_key
+                    self._piecewise_preview_data = data
+                self._surf_dirty = True
+            except Exception:
+                pass
+
+        with self._piecewise_preview_lock:
+            if self._piecewise_preview_debounce is not None:
+                self._piecewise_preview_debounce.cancel()
+            def _launch():
+                self._piecewise_preview_thread = threading.Thread(target=_worker, daemon=True)
+                self._piecewise_preview_thread.start()
+            t = threading.Timer(0.25, _launch)
+            self._piecewise_preview_debounce = t
+        t.start()
+
+    def _apply_piecewise_preview_if_ready(self, editor: ParametricCurveEditor) -> None:
+        with self._piecewise_preview_lock:
+            if (self._piecewise_preview_ready_key != self._piecewise_preview_request_key
+                    or self._piecewise_preview_data is None):
+                return
+            data = self._piecewise_preview_data
+        self._complex_sig = data["csig"]
+        self._signal = self._complex_sig.real.astype(np.float32, copy=False) if len(self._complex_sig) else np.zeros(0, dtype=np.float32)
+        self._env_curve = data["env_curve"]
+        self._chirp_f = data["chirp_f"]
+        raw = data["raw"]
+        if raw:
+            state_a = editor._channel_state("A")
+            state_a.raw_signals = {
+                "amplitude_bias": raw["amplitude_bias"],
+                "amplitude": raw["amplitude"],
+                "amplitude_total": raw["amplitude_total"],
+                "chirp_bias": raw["chirp_bias"],
+                "chirp": raw["chirp"],
+                "chirp_total": raw["chirp_total"],
+            }
+            state_a.display_signals = _norm_ch_sigs(state_a.raw_signals, time_stretch=state_a.time_stretch)
+            state_b = editor._channel_state("B")
+            state_b.raw_signals = {"analytic": raw["analytic"]}
+            state_b.display_signals = _norm_ch_sigs(state_b.raw_signals, time_stretch=state_b.time_stretch)
+            editor._render_buf = state_b.display_signals.get("analytic")
+            editor._refresh_render_points("A")
+            # Push batch before refreshing B so _refresh_render_points can use it
+            csig_batch = data.get("csig_batch")
+            if csig_batch is not None and csig_batch.shape[1] > 0:
+                editor._csig_batch    = torch.as_tensor(csig_batch, dtype=torch.complex128)
+                editor._csig_batch_np = csig_batch  # stable numpy ref for lazy widget creation
+                if editor._gl_wave_widget is not None:
+                    editor._gl_wave_widget.update_data(csig_batch)
+            else:
+                editor._csig_batch    = None
+                editor._csig_batch_np = None
+            editor._refresh_render_points("B")
+            # Consume the data — prevent re-applying (and re-running torch ops) every frame
+            with self._piecewise_preview_lock:
+                self._piecewise_preview_data = None
 
     def rebuild(self, patch: AnalyticPatch, active_key: str) -> None:
         """Kick off a background rebuild.  Cancels any in-flight rebuild first.
@@ -9918,25 +10355,31 @@ class EditorCanvas:
         if fp == self._rebuild_hash:
             return
 
-        # Cancel any running rebuild
+        # Cancel any running rebuild and any pending debounce
         self._rebuild_cancel.set()
-        # Don't join — daemon thread will bail out on its own
+        if self._rebuild_debounce is not None:
+            self._rebuild_debounce.cancel()
 
-        # Deep-copy the patch so the bg thread doesn't race with UI mutations
-        snap = _rcopy.deepcopy(patch)
-        cancel = threading.Event()
-        self._rebuild_cancel = cancel
+        def _launch():
+            # Re-check fingerprint — something may have changed during the delay
+            cancel = threading.Event()
+            self._rebuild_cancel = cancel
+            snap = _rcopy.deepcopy(patch)
 
-        def _worker():
-            try:
-                self._rebuild_work(snap, active_key, snap_mode, snap_show_tail,
-                                   snap_seed, cancel, fp)
-            except Exception:
-                pass  # silently drop — stale visuals are better than a crash
+            def _worker():
+                try:
+                    self._rebuild_work(snap, active_key, snap_mode, snap_show_tail,
+                                       snap_seed, cancel, fp)
+                except Exception:
+                    pass
 
-        t = threading.Thread(target=_worker, daemon=True)
-        self._rebuild_thread = t
-        t.start()
+            t = threading.Thread(target=_worker, daemon=True)
+            self._rebuild_thread = t
+            t.start()
+
+        db = threading.Timer(0.25, _launch)
+        self._rebuild_debounce = db
+        db.start()
 
     def rebuild_ready(self) -> bool:
         """Return True when the background rebuild thread has finished."""
@@ -11399,107 +11842,51 @@ class EditorCanvas:
                 self._surf_dirty = False
         elif self.mode == EditorMode.PIECEWISE_EDITOR and voice is not None:
             editor = self._ensure_piecewise_editor(voice, win_w, win_h)
-            # Resize to final target dimensions first so _prect() is correct
-            # when _refresh_render_points computes downsampled point lists.
-            # render_to_surface will see the same size and skip the resize.
-            editor.resize(max(64, cw), max(64, plot_h))
-            self._pull_piecewise_editor_state_into_voice(voice)
-            # Feed the current synthesised signals into the editor's output panel
-            import torch as _torch
-            lfo_map = {l.key: l for l in patch.lfos}
-            p_map   = {p.key: p for p in patch.voices}
-            if voice and not _voice_effectively_muted(voice, patch):
-                _csig = _synthesize_voice(
-                    voice,
-                    patch,
-                    lfo_map,
-                    p_map,
-                    granular_seed_offset=self.granular_seed_offset,
-                )
-                if hasattr(_csig, "detach"):
-                    _csig = _csig.detach().cpu().numpy()
-                _csig = np.asarray(_csig, dtype=np.complex128)
-                self._complex_sig = _csig
-                self._signal = _csig.real.astype(np.float32, copy=False)
-                self._env_curve = _compute_envelope(voice, len(_csig), patch.duration).astype(np.float32, copy=False)
-                self._chirp_f = _compute_chirp_frequency_series(voice, len(_csig), patch.duration).astype(np.float32, copy=False)
-            else:
-                _csig = self._complex_sig
-            _env  = self._env_curve
-            _cf   = self._chirp_f
-            if _csig is not None and len(_csig) > 0:
-                _n_sig = len(_csig)
-                _env_arr = _env.astype(float) if _env is not None else np.zeros(_n_sig)
-                _amp_total = np.abs(np.asarray(_csig, dtype=np.complex128))
-                _amp_peak = float(np.max(_amp_total)) if _amp_total.size > 0 else 0.0
-                if _amp_peak > 1e-9:
-                    _amp_total = _amp_total / _amp_peak
-                else:
-                    _amp_total = np.zeros_like(_amp_total, dtype=np.float64)
-
-                _base_chirp = (
-                    _compute_knob_chirp_deviation_series(voice, _n_sig, patch.duration)
-                    if voice is not None else
-                    np.zeros(_n_sig, dtype=np.float64)
-                )
-                _chirp_env_norm = np.full(_n_sig, 0.5, dtype=np.float64)
-                _chirp_total_norm = _chirp_env_norm.copy()
-                if voice is not None and voice.piecewise_env is not None:
-                    _t_norm = torch.linspace(0.0, 1.0, _n_sig, dtype=torch.float64)
-                    _chirp_curve = editor._curves[1]
-                    _chirp_env_curve = _chirp_curve.evaluate_normalized(_t_norm).real.clamp(0.0, 1.0)
-                    _chirp_env_hz = _chirp_curve.to_physical(
-                        _chirp_env_curve
-                    ).detach().cpu().numpy().astype(np.float64, copy=False)
-                    _chirp_total_hz = _base_chirp + _chirp_env_hz
-                    _v_lo = float(_chirp_curve.v_lo)
-                    _v_hi = float(_chirp_curve.v_hi)
-                    _span = max(_v_hi - _v_lo, 1e-9)
-                    _chirp_total_norm = np.clip((_chirp_total_hz - _v_lo) / _span, 0.0, 1.0)
-                    _chirp_env_norm = np.clip((_chirp_env_hz - _v_lo) / _span, 0.0, 1.0)
-                    _chirp_bias_norm = np.clip((_base_chirp - _v_lo) / _span, 0.0, 1.0)
-                else:
-                    _curve = editor._curves[1]
-                    _v_lo = float(_curve.v_lo)
-                    _v_hi = float(_curve.v_hi)
-                    _span = max(_v_hi - _v_lo, 1e-9)
-                    _chirp_bias_norm = np.clip((_base_chirp - _v_lo) / _span, 0.0, 1.0)
-                    _chirp_total_norm = _chirp_bias_norm.copy()
-                _raw = {
-                    "analytic":  _torch.as_tensor(_csig, dtype=_torch.complex128).reshape(-1),
-                    "amplitude_bias": _torch.zeros(_n_sig, dtype=_torch.complex128),
-                    "amplitude": _torch.as_tensor(_env_arr, dtype=_torch.complex128).reshape(-1),
-                    "amplitude_total": _torch.as_tensor(_amp_total, dtype=_torch.complex128).reshape(-1),
-                    "chirp_bias": _torch.as_tensor(_chirp_bias_norm, dtype=_torch.complex128).reshape(-1),
-                    "chirp":     _torch.as_tensor(_chirp_env_norm, dtype=_torch.complex128).reshape(-1),
-                    "chirp_total": _torch.as_tensor(_chirp_total_norm, dtype=_torch.complex128).reshape(-1),
-                }
-                # amplitude+chirp panels use channel "A"; output panel uses channel "B"
-                _state_a = editor._channel_state("A")
-                _state_a.raw_signals = {
-                    "amplitude_bias": _raw["amplitude_bias"],
-                    "amplitude": _raw["amplitude"],
-                    "amplitude_total": _raw["amplitude_total"],
-                    "chirp_bias": _raw["chirp_bias"],
-                    "chirp": _raw["chirp"],
-                    "chirp_total": _raw["chirp_total"],
-                }
-                _state_a.display_signals = _norm_ch_sigs(_state_a.raw_signals,
-                                                         time_stretch=_state_a.time_stretch)
-                _state_b = editor._channel_state("B")
-                _state_b.raw_signals     = {"analytic": _raw["analytic"]}
-                _state_b.display_signals = _norm_ch_sigs(_state_b.raw_signals,
-                                                         time_stretch=_state_b.time_stretch)
-                # _render_buf drives resize() re-refresh; point it at the analytic signal
-                editor._render_buf = _state_b.display_signals.get("analytic")
-                editor._refresh_render_points("A")
-                editor._refresh_render_points("B")
+            if editor.get_revision() != self._piecewise_sync_revision:
+                self._pull_piecewise_editor_state_into_voice(voice)
                 self._surf_dirty = True
             if self._surf_dirty:
-                editor_surf = editor.render_to_surface(cw, plot_h)
-                self._surf.blit(editor_surf, (0, 0))
-                self._pull_piecewise_editor_state_into_voice(voice)
-                self._tex = _surface_to_gl_tex(self._surf, self._tex)
+                if self._piecewise_preview_dirty:
+                    with _PROF.span("gl.canvas.render.piecewise_preview_req"):
+                        self._request_piecewise_preview(patch, voice, editor)
+                    self._piecewise_preview_dirty = False
+                with _PROF.span("gl.canvas.render.piecewise_preview_apply"):
+                    self._apply_piecewise_preview_if_ready(editor)
+                with _PROF.span("gl.canvas.render.piecewise_render_to_surf"):
+                    bg_surf, atom_list = editor.snapshot_gl_atoms()
+                    dirty_rects = editor.consume_gl_dirty_rects()
+                with _PROF.span("gl.canvas.render.piecewise_tex_upload"):
+                    if self._piecewise_stale_tex_ids:
+                        glDeleteTextures([tid for tid in self._piecewise_stale_tex_ids if tid])
+                        for tid in self._piecewise_stale_tex_ids:
+                            _tex_size_cache.pop(tid, None)
+                        self._piecewise_stale_tex_ids.clear()
+                    self._tex = _surface_rects_to_gl_tex(bg_surf, dirty_rects, self._tex)
+                    live_atom_keys: set[str] = set()
+                    for atom in atom_list:
+                        if atom.surface is None:
+                            continue
+                        live_atom_keys.add(atom.key)
+                        old_tex = self._piecewise_atom_tex.get(atom.key, 0)
+                        atom_changed = (
+                            not old_tex
+                            or not dirty_rects
+                            or any(
+                                rect.colliderect(getattr(atom, "motion_rect", getattr(atom, "visible_rect", rect)))
+                                or rect.colliderect(getattr(atom, "visible_rect", rect))
+                                for rect in dirty_rects
+                            )
+                        )
+                        if atom_changed:
+                            self._piecewise_atom_tex[atom.key] = _surface_to_gl_tex(atom.surface, old_tex)
+                    stale_keys = [key for key in self._piecewise_atom_tex if key not in live_atom_keys]
+                    if stale_keys:
+                        glDeleteTextures([self._piecewise_atom_tex[key] for key in stale_keys if self._piecewise_atom_tex[key]])
+                        for key in stale_keys:
+                            tid = self._piecewise_atom_tex.pop(key, 0)
+                            if tid:
+                                _tex_size_cache.pop(tid, None)
+                    self._piecewise_atoms = atom_list
                 self._surf_dirty = False
         elif self._surf_dirty:
             self._surf.fill(_PY_BG)
@@ -11517,6 +11904,16 @@ class EditorCanvas:
             self._surf_dirty = False
 
         _draw_tex_quad(self._tex, cx, plot_y, cw, plot_h, win_w, win_h)
+
+        # ── Direct GL overlays (wave widget bypasses texture path) ──
+        if self.mode == EditorMode.PIECEWISE_EDITOR and voice is not None:
+            editor.draw_gl_overlays(cx, plot_y, win_w, win_h)
+            for atom in self._piecewise_atoms:
+                tex = self._piecewise_atom_tex.get(atom.key, 0)
+                rect = getattr(atom, "visible_rect", getattr(atom, "rect", None))
+                if not tex or rect is None or rect.w <= 0 or rect.h <= 0:
+                    continue
+                _draw_tex_quad(tex, cx + rect.x, plot_y + rect.y, rect.w, rect.h, win_w, win_h)
 
         # ── GL overlay ──
         ix, iy, iw, ih = self._inner_rect(win_w, win_h)
@@ -11671,33 +12068,33 @@ class EditorCanvas:
                 local_y = float(plot_h - (my - plot_y))
             if event.type == MOUSEBUTTONDOWN:
                 editor.on_mouse_down(event.button, local_x or 0.0, local_y or 0.0, pygame.key.get_mods())
-                self._pull_piecewise_editor_state_into_voice(voice)
-                self._surf_dirty = True
+                if editor.is_frame_dirty():
+                    self._surf_dirty = True
                 return True
             if event.type == MOUSEBUTTONUP:
                 editor.on_mouse_up(event.button)
-                self._pull_piecewise_editor_state_into_voice(voice)
-                self._surf_dirty = True
+                if editor.is_frame_dirty():
+                    self._surf_dirty = True
                 return True
             if event.type == MOUSEMOTION:
                 editor.on_mouse_move(local_x or 0.0, local_y or 0.0)
-                self._pull_piecewise_editor_state_into_voice(voice)
-                self._surf_dirty = True
+                if editor.is_frame_dirty():
+                    self._surf_dirty = True
                 return True
             if event.type == KEYDOWN:
                 editor.on_key_down(event.key, event.mod)
-                self._pull_piecewise_editor_state_into_voice(voice)
-                self._surf_dirty = True
+                if editor.is_frame_dirty():
+                    self._surf_dirty = True
                 return True
             if event.type == pygame.KEYUP:
                 editor.on_key_up(event.key)
-                self._pull_piecewise_editor_state_into_voice(voice)
-                self._surf_dirty = True
+                if editor.is_frame_dirty():
+                    self._surf_dirty = True
                 return True
             if event.type == pygame.TEXTINPUT:
                 editor.on_text_input(event.text)
-                self._pull_piecewise_editor_state_into_voice(voice)
-                self._surf_dirty = True
+                if editor.is_frame_dirty():
+                    self._surf_dirty = True
                 return True
 
         # Delegate to routing view when in ROUTING mode
@@ -16684,6 +17081,47 @@ class AnalyticDriverViewer:
             panel_surf = padded
         return _surface_to_gl_tex(panel_surf, old_tex)
 
+    def _panel_worker(self, stop_evt: "threading.Event",
+                      left_slot: list, right_slot: list,
+                      slot_lock: "threading.Lock") -> None:
+        """Background thread: renders pygame panel surfaces and posts raw
+        pixel bytes into left_slot / right_slot for the GL thread to upload.
+        Runs as fast as panels produce dirty output; idles when nothing changed."""
+        import threading as _th
+        _IDLE_S = 1.0 / 30.0  # max 30 panel redraws/sec when idle
+        while not stop_evt.is_set():
+            with _PROF.span("panel_worker.render"):
+                left_surf  = self.patch_panel.render()
+                right_surf = self.partial_panel.render()
+            now_left = now_right = None
+            with _PROF.span("panel_worker.tostring"):
+             if left_surf is not None:
+                pr = self.patch_panel.panel_rect
+                sw, sh = left_surf.get_size()
+                if sw != pr.w or sh != pr.h:
+                    padded = pygame.Surface((pr.w, pr.h))
+                    padded.fill(_PY_BG)
+                    padded.blit(left_surf, (0, 0))
+                    left_surf = padded
+                now_left = (pygame.image.tostring(left_surf, "RGBA", False),
+                            left_surf.get_width(), left_surf.get_height())
+            if right_surf is not None:
+                pr = self.partial_panel.panel_rect
+                sw, sh = right_surf.get_size()
+                if sw != pr.w or sh != pr.h:
+                    padded = pygame.Surface((pr.w, pr.h))
+                    padded.fill(_PY_BG)
+                    padded.blit(right_surf, (0, 0))
+                    right_surf = padded
+                now_right = (pygame.image.tostring(right_surf, "RGBA", False),
+                             right_surf.get_width(), right_surf.get_height())
+            with slot_lock:
+                if now_left  is not None:
+                    left_slot[:]  = [now_left]
+                if now_right is not None:
+                    right_slot[:] = [now_right]
+            stop_evt.wait(timeout=_IDLE_S)
+
     # ---- Render bottom status bar ------------------------------------------
 
     def _render_status(self) -> None:
@@ -16727,12 +17165,31 @@ class AnalyticDriverViewer:
         # Wire Panel._top_offset so panels start below the title bar
         Panel._top_offset = TOPBAR_H
 
-        clock = pygame.time.Clock()
-        running = True
+        # --- Panel worker thread -------------------------------------------
+        # Renders pygame surfaces at ~30 Hz on a background thread and posts
+        # raw pixel bytes into thread-safe slots.  The GL loop uploads them
+        # whenever new data arrives, then reuses the last texture — so the
+        # OpenGL overlay (wave / phase animation) runs fully uncapped.
+        import threading as _th
+        _stop_panels  = _th.Event()
+        _slot_lock    = _th.Lock()
+        _left_slot:  list = []   # each entry: (bytes, w, h)
+        _right_slot: list = []
+        _panel_thread = _th.Thread(
+            target=self._panel_worker,
+            args=(_stop_panels, _left_slot, _right_slot, _slot_lock),
+            daemon=True,
+        )
+        _panel_thread.start()
 
+        running = True
+        _gl_clock = pygame.time.Clock()
+
+        _PROF.start_reporter(interval_s=5.0, title="AnalyticDriver main loop")
         while running:
-            # ---- Events ----
-            for event in pygame.event.get():
+            # ---- Events (must stay on main thread) ----
+            with _PROF.span("events"):
+             for event in pygame.event.get():
                 if event.type == QUIT:
                     running = False
                     continue
@@ -16772,81 +17229,118 @@ class AnalyticDriverViewer:
                     self._needs_rebuild = True
                     continue
 
-            # ---- Sync panel state ----
-            self.patch_panel.set_patch(self.patch, self.active_key)
-            self.partial_panel.set_patch(self.patch, self.active_key)
+            # ---- Sync panel state (cheap; no rendering here) ----
+            with _PROF.span("panel.set_patch"):
+                self.patch_panel.set_patch(self.patch, self.active_key)
+                self.partial_panel.set_patch(self.patch, self.active_key)
 
-            # ---- Granular seed animation (opt-in per-voice, off by default) ----
-            _anim_voices = [
-                v for v in self.patch.voices
-                if v.emission_mode == "granular"
-                and v.granular is not None
-                and getattr(v.granular, "seed_animate", False)
-            ]
-            if _anim_voices:
-                _now = time.monotonic()
-                _period = min(getattr(v.granular, "seed_animate_period_s", 4.0)
-                              for v in _anim_voices)
-                if _now - self._seed_anim_last_time >= _period:
-                    self._seed_anim_tick      += 1
-                    self._seed_anim_last_time  = _now
-                    self.canvas.granular_seed_offset = self._seed_anim_tick
-                    self._needs_rebuild = True
+            # ---- Granular seed animation ----
+            with _PROF.span("granular.seed_anim"):
+                _anim_voices = [
+                    v for v in self.patch.voices
+                    if v.emission_mode == "granular"
+                    and v.granular is not None
+                    and getattr(v.granular, "seed_animate", False)
+                ]
+                if _anim_voices:
+                    _now = time.monotonic()
+                    _period = min(getattr(v.granular, "seed_animate_period_s", 4.0)
+                                  for v in _anim_voices)
+                    if _now - self._seed_anim_last_time >= _period:
+                        self._seed_anim_tick      += 1
+                        self._seed_anim_last_time  = _now
+                        self.canvas.granular_seed_offset = self._seed_anim_tick
+                        self._needs_rebuild = True
 
             # ---- Rebuild waveform data if needed ----
-            if self._needs_rebuild:
-                self.canvas.rebuild(self.patch, self.active_key)
-                self._needs_rebuild = False
-            # Absorb finished background rebuild
-            if self.canvas.rebuild_ready():
-                self.canvas._rebuild_thread = None
-                self.canvas._surf_dirty = True
+            with _PROF.span("rebuild"):
+                if self._needs_rebuild:
+                    self.canvas.rebuild(self.patch, self.active_key)
+                    self._needs_rebuild = False
+                if self.canvas.rebuild_ready():
+                    self.canvas._rebuild_thread = None
+                    self.canvas._surf_dirty = True
 
-            # ---- Render ----
-            glClear(GL_COLOR_BUFFER_BIT)
+            # ---- GL render (uncapped — no clock.tick) ----
+            with _PROF.span("gl.clear"):
+                glClear(GL_COLOR_BUFFER_BIT)
 
-            # Center canvas (PlotWidget surface + GL overlay)
-            self.canvas.render(
-                self.win_w, self.win_h, self.patch, self._atlas, self._font)
+            # Center canvas — GL wave runs at full GL speed
+            with _PROF.span("gl.canvas.render"):
+                self.canvas.render(
+                    self.win_w, self.win_h, self.patch, self._atlas, self._font)
 
-            # Left panel
-            self._left_tex = self._upload_panel(self.patch_panel, self._left_tex)
-            if self._left_tex:
-                lpr = self.patch_panel.panel_rect
-                _draw_tex_quad(
-                    self._left_tex, lpr.x, lpr.y, lpr.w, lpr.h,
-                    self.win_w, self.win_h)
+            # Fold in latest panel textures from worker thread
+            with _PROF.span("gl.panel_tex_upload"):
+                with _slot_lock:
+                    if _left_slot:
+                        raw, w, h = _left_slot.pop()
+                        if self._left_tex:
+                            glDeleteTextures([self._left_tex])
+                        tid = int(glGenTextures(1))
+                        glBindTexture(GL_TEXTURE_2D, tid)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                                     GL_RGBA, GL_UNSIGNED_BYTE, raw)
+                        self._left_tex = tid
+                    if _right_slot:
+                        raw, w, h = _right_slot.pop()
+                        if self._right_tex:
+                            glDeleteTextures([self._right_tex])
+                        tid = int(glGenTextures(1))
+                        glBindTexture(GL_TEXTURE_2D, tid)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+                        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                                     GL_RGBA, GL_UNSIGNED_BYTE, raw)
+                        self._right_tex = tid
 
-            # Right panel
-            self._right_tex = self._upload_panel(self.partial_panel, self._right_tex)
-            if self._right_tex:
-                rpr = self.partial_panel.panel_rect
-                _draw_tex_quad(
-                    self._right_tex, rpr.x, rpr.y, rpr.w, rpr.h,
-                    self.win_w, self.win_h)
+            # Draw last known panel textures (stale is fine — worker updates async)
+            with _PROF.span("gl.panel_tex_draw"):
+                if self._left_tex:
+                    lpr = self.patch_panel.panel_rect
+                    _draw_tex_quad(
+                        self._left_tex, lpr.x, lpr.y, lpr.w, lpr.h,
+                        self.win_w, self.win_h)
+                if self._right_tex:
+                    rpr = self.partial_panel.panel_rect
+                    _draw_tex_quad(
+                        self._right_tex, rpr.x, rpr.y, rpr.w, rpr.h,
+                        self.win_w, self.win_h)
 
             # Title bar
-            _gl_rect(0, 0, self.win_w, TOPBAR_H,
-                     self.win_w, self.win_h, (0.07, 0.07, 0.10, 1.0))
-            _gl_hline(TOPBAR_H - 1, 0, self.win_w,
-                      self.win_w, self.win_h, (0.22, 0.22, 0.30, 1.0))
-            if self._atlas.tex_id:
-                glEnable(GL_TEXTURE_2D)
-                glEnable(GL_BLEND)
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-                self._atlas.draw_string(
-                    f"  Analytic Driver — {self.patch.name}",
-                    4.0, float(TOPBAR_H // 2),
-                    self.win_w, self.win_h,
-                    anchor_x=0.0, anchor_y=0.5,
-                    color=(0.75, 0.80, 0.90, 1.0))
-                glDisable(GL_TEXTURE_2D)
+            with _PROF.span("gl.titlebar"):
+                _gl_rect(0, 0, self.win_w, TOPBAR_H,
+                         self.win_w, self.win_h, (0.07, 0.07, 0.10, 1.0))
+                _gl_hline(TOPBAR_H - 1, 0, self.win_w,
+                          self.win_w, self.win_h, (0.22, 0.22, 0.30, 1.0))
+                if self._atlas.tex_id:
+                    glEnable(GL_TEXTURE_2D)
+                    glEnable(GL_BLEND)
+                    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+                    self._atlas.draw_string(
+                        f"  Analytic Driver — {self.patch.name}",
+                        4.0, float(TOPBAR_H // 2),
+                        self.win_w, self.win_h,
+                        anchor_x=0.0, anchor_y=0.5,
+                        color=(0.75, 0.80, 0.90, 1.0))
+                    glDisable(GL_TEXTURE_2D)
 
             # Bottom status
-            self._render_status()
+            with _PROF.span("gl.status"):
+                self._render_status()
 
-            pygame.display.flip()
-            clock.tick(60)
+            with _PROF.span("gl.flip"):
+                pygame.display.flip()
+            _gl_clock.tick(60)   # cap at 60 FPS — prevents CPU/memory spiral from uncapped loop
+
+        _stop_panels.set()
+        _panel_thread.join(timeout=1.0)
 
         if self._input_capture_device is not None:
             try:

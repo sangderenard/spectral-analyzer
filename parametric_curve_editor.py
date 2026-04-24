@@ -55,6 +55,8 @@ from __future__ import annotations
 import copy
 import math
 import os
+import queue
+import threading
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
@@ -77,6 +79,19 @@ try:
     _HAS_NP = True
 except ImportError:
     _HAS_NP = False
+
+try:
+    from opengl_widget import (
+        GLAnalyticWaveWidget as _GLAnalyticWaveWidget,
+        PERSPECTIVE_MODES as _GL_PERSPECTIVE_MODES,
+        PERSPECTIVE_LABELS as _GL_PERSPECTIVE_LABELS,
+    )
+    _HAS_GL_WAVE = True
+except Exception:
+    _HAS_GL_WAVE = False
+    _GL_PERSPECTIVE_MODES  = ["perspective", "ortho", "top", "re_plane", "lissajous"]
+    _GL_PERSPECTIVE_LABELS = {"perspective": "3D", "ortho": "Orth",
+                              "top": "Top", "re_plane": "Re", "lissajous": "Liss"}
 
 try:
     import pygame
@@ -162,8 +177,9 @@ _PANEL_HEIGHT_PX: dict[str, int] = {
     "small":     110,
     "medium":    200,
     "large":     380,
+    "max":        0,   # dynamic — resolved per-instance via _panel_h_px()
 }
-_PANEL_HEIGHT_MODES = ("collapsed", "small", "medium", "large")
+_PANEL_HEIGHT_MODES = ("collapsed", "small", "medium", "large", "max")
 _PANELS_SCROLL_STEP = 35   # pixels per mouse-wheel tick
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -494,6 +510,9 @@ class _TextOverlay:
         """Blit the overlay surface onto target_surf at (0, 0)."""
         target_surf.blit(self.surface, (0, 0))
 
+    def blit_rect_to(self, target_surf: "pygame.Surface", rect: "pygame.Rect") -> None:
+        target_surf.blit(self.surface, rect.topleft, area=rect)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Knob widget
 # ─────────────────────────────────────────────────────────────────────────────
@@ -526,6 +545,18 @@ class _Knob:
 
     def hit(self, px, py):
         return (px - self.cx) ** 2 + (py - self.cy) ** 2 <= (self.radius + 4) ** 2
+
+
+@dataclass
+class _UIAtom:
+    key: str
+    rect: "pygame.Rect"
+    motion_rect: "pygame.Rect"
+    kind: str = "generic"
+    z_index: int = 0
+    surface: Optional["pygame.Surface"] = None
+    background_surface: Optional["pygame.Surface"] = None
+    visible_rect: "pygame.Rect" = field(default_factory=lambda: pygame.Rect(0, 0, 0, 0))
 
 
 @dataclass
@@ -619,11 +650,8 @@ def _downsample_signal_lane_pts(sig: torch.Tensor | Any, w_px: int, lane: int) -
     return pts
 
 
-def _downsample_analytic_pts(sig, w_px: int) -> list:
-    """Downsample complex signal to (t_frac, re_norm, im_norm) triples, peak-normalised.
-
-    Used for the 3-D oblique EM-wave projection in the output panel.
-    """
+def _downsample_analytic_pts(sig) -> list:
+    """Convert complex signal to (t_frac, re_norm, im_norm) triples, peak-normalised. No reduction."""
     sig_t = torch.as_tensor(sig, dtype=torch.complex128).reshape(-1)
     if sig_t.numel() <= 0:
         return []
@@ -633,18 +661,7 @@ def _downsample_analytic_pts(sig, w_px: int) -> list:
     real_np = torch.view_as_real(sig_t)[:, 0].to(torch.float64).detach().cpu().numpy() / peak
     imag_np = torch.view_as_real(sig_t)[:, 1].to(torch.float64).detach().cpu().numpy() / peak
     n = len(real_np)
-    bucket = max(1, n // max(1, w_px))
-    pts = []
-    for i in range(min(w_px, n)):
-        lo = i * bucket
-        hi = min(n, lo + bucket)
-        if hi <= lo:
-            continue
-        seg_re = real_np[lo:hi]
-        seg_im = imag_np[lo:hi]
-        idx = int(_np.abs(seg_re + 1j * seg_im).argmax())
-        pts.append(((lo + hi) * 0.5 / n, float(seg_re[idx]), float(seg_im[idx])))
-    return pts
+    return [(i / n, float(real_np[i]), float(imag_np[i])) for i in range(n)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -683,7 +700,7 @@ class ParametricCurveEditor:
             chirp_curve,
             signal_curve if signal_curve is not None else default_blank("analytic"),
         ]
-        self.focused_panel = 0
+        self._focused_panel = 0
         self.w, self.h     = w, h
         self.library_folder = library_folder
         self._overlay: Optional[_TextOverlay] = None
@@ -692,8 +709,11 @@ class ParametricCurveEditor:
         # ── per-panel config ──────────────────────────────────────────────────
         self._panel_roles  = ["amplitude", "chirp", "output"]
         self._panel_channels = ["A", "A", "B"]
-        # Height mode per panel: "collapsed" | "small" | "medium" | "large"
+        # Height mode per panel: "collapsed" | "small" | "medium" | "large" | "max"
         self._panel_height_modes: list[str] = ["medium", "medium", "small"]
+        # Stores each panel's mode before it was force-collapsed by another panel entering "max".
+        # None means the panel was not force-collapsed; restore only if not None.
+        self._panel_pre_max_modes: list[Optional[str]] = [None] * self._panel_count
         # Vertical scroll offset for the panels viewport (pixels, clamped ≥ 0)
         self._panels_scroll_y: int = 0
         self._channels: dict[str, _ChannelState] = {
@@ -709,8 +729,20 @@ class ParametricCurveEditor:
         self._hover_pt  = [None] * self._panel_count
         self._hover_mk  = [None] * self._panel_count
         self._hover_ri  = [None] * self._panel_count
-        self._dirty     = [True] * self._panel_count
+        self._dirty     = [True] * self._panel_count   # spline poly rebuild gate
         self._display_polys: list = [[] for _ in range(self._panel_count)]
+
+        # ── layered dirty flags ───────────────────────────────────────────────
+        # _canvas_dirty[pi]: panel-sized cached rendered overlay needs rebuild
+        # _overlay_dirty:    text/header/buttons layer needs re-render
+        # _frame_dirty:      union — any layer needs compositing
+        self._canvas_dirty: list[bool] = [True] * self._panel_count
+        self._overlay_dirty: bool = True
+        self._frame_dirty: bool = True
+        self._render_overlay_cache: list[Optional["pygame.Surface"]] = [None] * self._panel_count
+        self._dirty_rects: list["pygame.Rect"] = [pygame.Rect(0, 0, self.w, self.h)]
+        self._last_repaint_rects: list["pygame.Rect"] = [pygame.Rect(0, 0, self.w, self.h)]
+        self._ui_atoms: dict[str, _UIAtom] = {}
 
         # title in-line editing
         self._title_editing = False
@@ -745,15 +777,55 @@ class ParametricCurveEditor:
         self._sig_re_pts: list = []
         self._sig_im_pts: list = []
         self._analytic_pts: list = []
+        self._csig_batch:    "Optional[torch.Tensor]" = None  # (72, n) complex128 from batch synth
+        self._csig_batch_np: "Optional[Any]"          = None  # same array as numpy, stable reference
+        # Lazy GL wave widget — created on first use when a GL context is active
+        self._gl_wave_widget: Optional["_GLAnalyticWaveWidget"] = None
+        self._gl_analytic_rect: Optional[tuple] = None   # (x, y, w, h) surface-local pygame coords
+        self._gl_perspective_mode: str  = "perspective"
+        self._gl_ctrl_rects:       dict = {}   # key -> pygame.Rect for hit testing
 
         # ── phase-rotation animation for the output/analytic panel ────────────
-        # Angle advances at _phase_rotation_hz full turns per second.
-        self._phase_rotation_angle: float = 0.0
-        self._phase_rotation_hz:    float = 0.2   # ~1 full turn every 5 s
-        self._phase_rotation_last_t: Optional[float] = None
+        # Current slot index (integer 0..steps-1); angle derived as slot*2π/steps.
+        self._phase_slot:           int   = 0
+        self._phase_rotation_steps: int   = 72   # must match GLAnalyticWaveWidget phase_steps
+        self._phase_rotation_fps:   float = 30.0
+        self._state_lock = threading.RLock()
+        self._render_lock = threading.RLock()
+        self._edit_queue: "queue.Queue[tuple[str, tuple[Any, ...]]]" = queue.Queue()
+        self._pending_point_drag: dict[int, Optional[tuple[int, float, float]]] = {
+            i: None for i in range(self._panel_count)
+        }
+        self._pending_marker_drag: dict[int, Optional[tuple[int, float]]] = {
+            i: None for i in range(self._panel_count)
+        }
+        self._shutdown = threading.Event()
+        self._async_invalidate_cb: Optional[callable] = None
+        self._revision: int = 0
+        self._edit_thread = threading.Thread(target=self._edit_worker, daemon=True)
+        self._edit_thread.start()
+        self._anim_thread = threading.Thread(target=self._animation_worker, daemon=True)
+        self._anim_thread.start()
         self._sync_all_channel_structures()
 
     # ── accessors ─────────────────────────────────────────────────────────────
+
+    @property
+    def focused_panel(self) -> int:
+        return self._focused_panel
+
+    @focused_panel.setter
+    def focused_panel(self, value: int) -> None:
+        if self._focused_panel != value:
+            old = self._focused_panel
+            self._focused_panel = value
+            self._queue_header_dirty(old)
+            self._queue_header_dirty(value)
+            self._queue_border_dirty(old)
+            self._queue_border_dirty(value)
+            self._mark_overlay_dirty()
+        else:
+            self._focused_panel = value
 
     @property
     def curve(self) -> ParametricCurve:
@@ -848,9 +920,9 @@ class ParametricCurveEditor:
         _, vy, _, _ = _panels_view_gl_rect(self.w, self.h)
         cum = 0
         for i in range(panel_idx):
-            cum += _HEADER_H + _PANEL_HEIGHT_PX.get(self._panel_height_modes[i], 200) + _PANEL_GAP
+            cum += _HEADER_H + self._panel_h_px(i) + _PANEL_GAP
         y0 = vy + cum - self._panels_scroll_y
-        ph = float(_PANEL_HEIGHT_PX.get(self._panel_height_modes[panel_idx], 200))
+        ph = float(self._panel_h_px(panel_idx))
         return float(_ML), float(y0), float(self.w - _ML - _MR), ph
 
     def _hrect(self, panel_idx: int) -> tuple:
@@ -871,29 +943,500 @@ class ParametricCurveEditor:
         hx, hy, hw, hh = self._hrect(panel_idx)
         return _header_button_rects_from_rect(hx, hy, hw, hh)
 
+    def _panel_h_px(self, i: int) -> int:
+        """Pixel height of panel i, resolving 'max' dynamically."""
+        hm = self._panel_height_modes[i]
+        if hm == "max":
+            _, _, _, vh = _panels_view_gl_rect(self.w, self.h)
+            n = self._panel_count
+            overhead = n * _HEADER_H + max(0, n - 1) * _PANEL_GAP
+            return max(100, int(vh) - overhead)
+        return _PANEL_HEIGHT_PX.get(hm, 200)
+
+    def _set_panel_height_mode(self, pi: int, new_mode: str) -> None:
+        """Set panel pi's height mode, handling 'max' expand/collapse logic.
+
+        When new_mode is 'max': all other panels are force-collapsed and their
+        current modes are saved in _panel_pre_max_modes so they can be restored
+        when the maximised panel leaves 'max'.
+
+        When leaving 'max': any panel whose _panel_pre_max_modes entry is set
+        (meaning it was force-collapsed by this event) is restored.
+        """
+        old_mode = self._panel_height_modes[pi]
+
+        if new_mode == "max":
+            # Force-collapse all other panels, remembering their prior modes.
+            for j in range(self._panel_count):
+                if j == pi:
+                    continue
+                # Only save if not already tracking a prior mode for this panel.
+                if self._panel_pre_max_modes[j] is None:
+                    self._panel_pre_max_modes[j] = self._panel_height_modes[j]
+                self._panel_height_modes[j] = "collapsed"
+            self._panel_height_modes[pi] = "max"
+        else:
+            self._panel_height_modes[pi] = new_mode
+            # If this panel was previously 'max', restore the other panels.
+            if old_mode == "max":
+                for j in range(self._panel_count):
+                    if j == pi:
+                        continue
+                    if self._panel_pre_max_modes[j] is not None:
+                        self._panel_height_modes[j] = self._panel_pre_max_modes[j]
+                        self._panel_pre_max_modes[j] = None
+
     def _panels_max_scroll(self) -> int:
         """Return the maximum allowed scroll offset (pixels)."""
         _, _, _, vh = _panels_view_gl_rect(self.w, self.h)
-        return max(0, _panels_content_h(self._panel_height_modes) - vh)
+        content_h = sum(
+            _HEADER_H + self._panel_h_px(i) + (_PANEL_GAP if i < self._panel_count - 1 else 0)
+            for i in range(self._panel_count)
+        )
+        return max(0, content_h - vh)
 
     def _clamp_panels_scroll(self) -> None:
         self._panels_scroll_y = max(0, min(self._panels_scroll_y, self._panels_max_scroll()))
 
     # ── dirty / invalidate ────────────────────────────────────────────────────
 
+    def _queue_dirty_rect(self, rect: Optional["pygame.Rect"]) -> None:
+        if rect is None:
+            return
+        clipped = rect.clip(pygame.Rect(0, 0, self.w, self.h))
+        if clipped.w <= 0 or clipped.h <= 0:
+            return
+        self._dirty_rects.append(clipped)
+        self._frame_dirty = True
+
+    def _queue_full_dirty(self) -> None:
+        self._dirty_rects = [pygame.Rect(0, 0, self.w, self.h)]
+        self._frame_dirty = True
+
+    def _plot_rect_py(self, panel_idx: int) -> "pygame.Rect":
+        x0, y0, pw, ph = self._prect(panel_idx)
+        return pygame.Rect(int(x0), _py(y0 + ph), max(1, int(math.ceil(pw))), max(1, int(math.ceil(ph))))
+
+    def _header_rect_py(self, panel_idx: int) -> "pygame.Rect":
+        hx, hy, hw, hh = self._hrect(panel_idx)
+        return pygame.Rect(int(hx), _py(hy + hh), max(1, int(math.ceil(hw))), max(1, int(math.ceil(hh))))
+
+    def _header_button_rect_py(self, panel_idx: int, key: str) -> "pygame.Rect":
+        rx, ry, rw, rh = self._hbtns(panel_idx)[key]
+        return pygame.Rect(int(rx), _py(ry + rh), max(1, int(math.ceil(rw))), max(1, int(math.ceil(rh))))
+
+    def _header_extent_rect_py(self, panel_idx: int) -> Optional["pygame.Rect"]:
+        if self._overlay is None:
+            return None
+        hx, hy, hw, _ = self._hrect(panel_idx)
+        curve = self._curves[panel_idx]
+        txt = f"[{curve.v_lo:.0f}…{curve.v_hi:.0f}]"
+        ts = self._overlay.font_sm.render(txt, True, (80, 100, 110))
+        py_y = self.h - int(hy + 4) - ts.get_height() - 1
+        return pygame.Rect(int(hx + hw + 2), py_y, ts.get_width(), ts.get_height())
+
+    def _point_rect_py(self, panel_idx: int, point_idx: Optional[int]) -> Optional["pygame.Rect"]:
+        if not (0 <= panel_idx < self._panel_count):
+            return None
+        if point_idx is None:
+            return None
+        pts = self._curves[panel_idx].points
+        if not (0 <= point_idx < len(pts)):
+            return None
+        x0, y0, pw, ph = self._prect(panel_idx)
+        pt = pts[point_idx]
+        r = 10
+        sx = int(round(x0 + pt.t * pw))
+        sy = _py(y0 + pt.v * ph)
+        return pygame.Rect(sx - r, sy - r, 2 * r + 1, 2 * r + 1)
+
+    def _marker_rect_py(self, panel_idx: int, marker_idx: Optional[int]) -> Optional["pygame.Rect"]:
+        if not (0 <= panel_idx < self._panel_count):
+            return None
+        if marker_idx is None:
+            return None
+        markers = self._curves[panel_idx].markers
+        if not (0 <= marker_idx < len(markers)):
+            return None
+        x0, y0, pw, ph = self._prect(panel_idx)
+        sx = int(round(x0 + markers[marker_idx].t * pw))
+        top = _py(y0 + ph)
+        return pygame.Rect(sx - 24, top - 20, 48, max(1, int(ph) + 48))
+
+    def _status_rects_py(self) -> list["pygame.Rect"]:
+        return [
+            pygame.Rect(0, 0, max(1, self.w), 18),
+            pygame.Rect(0, max(0, self.h - 34), max(1, self.w), 18),
+            pygame.Rect(0, max(0, self.h - 18), max(1, self.w), 18),
+        ]
+
+    def _dropdown_rect_py(self) -> Optional["pygame.Rect"]:
+        if self._open_dropdown is None:
+            return None
+        kind, pi = self._open_dropdown
+        rects = self._hbtns(pi)
+        btn_rect = rects["role"] if kind == "role" else rects["scale"] if kind == "scale" else rects["channel"]
+        bx, by, bw, _ = btn_rect
+        items = list(_PARAM_ROLES) if kind == "role" else list(_SCALE_MODES) if kind == "scale" else list(_CHANNEL_KEYS)
+        item_h = 16.0
+        total_h = item_h * len(items)
+        return pygame.Rect(int(bx), _py(by), max(1, int(math.ceil(bw))), max(1, int(math.ceil(total_h))))
+
+    def _dropdown_item_rects_py(self) -> list["pygame.Rect"]:
+        if self._open_dropdown is None:
+            return []
+        kind, pi = self._open_dropdown
+        rects = self._hbtns(pi)
+        btn_rect = rects["role"] if kind == "role" else rects["scale"] if kind == "scale" else rects["channel"]
+        bx, by, bw, _ = btn_rect
+        items = list(_PARAM_ROLES) if kind == "role" else list(_SCALE_MODES) if kind == "scale" else list(_CHANNEL_KEYS)
+        item_h = 16.0
+        out: list["pygame.Rect"] = []
+        for i in range(len(items)):
+            iy_gl = by - (i + 1) * item_h
+            py_y = int(self.h - iy_gl - item_h)
+            out.append(pygame.Rect(int(bx), py_y, max(1, int(math.ceil(bw))), max(1, int(math.ceil(item_h)))))
+        return out
+
+    def _axis_label_rect_py(self, panel_idx: int, tick_idx: int) -> Optional["pygame.Rect"]:
+        if self._overlay is None or not self._panel_is_curve(panel_idx):
+            return None
+        ticks = [0.0, 0.25, 0.5, 0.75, 1.0]
+        if not (0 <= tick_idx < len(ticks)):
+            return None
+        x0, y0, _, ph = self._prect(panel_idx)
+        curve = self._curves[panel_idx]
+        vn = ticks[tick_idx]
+        gy = y0 + vn * ph
+        txt = _fmt_physical(
+            _y_to_physical(vn, curve.v_lo, curve.v_hi, curve.y_scale),
+            curve.v_lo,
+            curve.v_hi,
+        )
+        ts = self._overlay.font_sm.render(txt, True, (110, 125, 130))
+        py_y = self.h - int(gy - 1) - ts.get_height() - 1
+        return pygame.Rect(int(x0 - _ML + 2), py_y, ts.get_width(), ts.get_height())
+
+    def _queue_status_dirty(self) -> None:
+        for rect in self._status_rects_py():
+            self._queue_dirty_rect(rect)
+
+    def _queue_plot_dirty(self, panel_idx: int) -> None:
+        self._queue_dirty_rect(self._plot_rect_py(panel_idx))
+
+    def _queue_header_dirty(self, panel_idx: int) -> None:
+        self._queue_dirty_rect(self._header_rect_py(panel_idx))
+
+    def _queue_border_dirty(self, panel_idx: int) -> None:
+        rect = self._plot_rect_py(panel_idx)
+        self._queue_dirty_rect(rect.inflate(4, 4))
+
+    def _queue_header_button_dirty(self, panel_idx: int, key: str) -> None:
+        self._queue_dirty_rect(self._header_button_rect_py(panel_idx, key).inflate(2, 2))
+
+    def _mark_overlay_dirty(self) -> None:
+        """Mark only the text/header overlay as needing re-render (no canvas repaint)."""
+        self._overlay_dirty = True
+        self._queue_status_dirty()
+
+    def _set_ui_atom(
+        self,
+        key: str,
+        rect: Optional["pygame.Rect"],
+        *,
+        motion_rect: Optional["pygame.Rect"] = None,
+        kind: str = "generic",
+        z_index: int = 0,
+    ) -> None:
+        if rect is None:
+            return
+        viewport = pygame.Rect(0, 0, self.w, self.h)
+        clipped = pygame.Rect(rect).clip(viewport)
+        if clipped.w <= 0 or clipped.h <= 0:
+            return
+        motion = pygame.Rect(motion_rect or clipped).clip(viewport)
+        if motion.w <= 0 or motion.h <= 0:
+            motion = clipped.copy()
+        atom = self._ui_atoms.get(key)
+        if atom is None:
+            self._ui_atoms[key] = _UIAtom(
+                key=key,
+                rect=clipped,
+                motion_rect=motion,
+                kind=kind,
+                z_index=z_index,
+            )
+            return
+        atom.rect = clipped
+        atom.motion_rect = motion
+        atom.kind = kind
+        atom.z_index = z_index
+
+    def snapshot_gl_atoms(self) -> tuple["pygame.Surface", list["_UIAtom"]]:
+        surf = self._draw_frame(clear_bg=False, flip=False)
+        viewport = pygame.Rect(0, 0, self.w, self.h)
+        self._ui_atoms.clear()
+        with self._state_lock:
+            for pi in range(self._panel_count):
+                plot_rect = self._plot_rect_py(pi)
+                header_rect = self._header_rect_py(pi)
+                for key in ("title", "role", "channel", "stretch", "scale", "collapse", "save", "load", "hmode"):
+                    btn_rect = self._header_button_rect_py(pi, key).inflate(2, 2)
+                    self._set_ui_atom(
+                        f"panel:{pi}:header:{key}",
+                        btn_rect,
+                        motion_rect=btn_rect,
+                        kind=f"header_{key}",
+                        z_index=100,
+                    )
+                self._set_ui_atom(
+                    f"panel:{pi}:header:extents",
+                    self._header_extent_rect_py(pi),
+                    motion_rect=header_rect,
+                    kind="header_extents",
+                    z_index=101,
+                )
+                if self._panel_roles[pi] == "analytic":
+                    for key, rect in self._gl_ctrl_rects.items():
+                        self._set_ui_atom(
+                            f"panel:{pi}:analytic_ctrl:{key}",
+                            rect.inflate(2, 2),
+                            motion_rect=rect.inflate(2, 2),
+                            kind="analytic_ctrl",
+                            z_index=110,
+                        )
+                if not self._panel_is_curve(pi):
+                    continue
+                border_rect = plot_rect.inflate(4, 4)
+                self._set_ui_atom(
+                    f"panel:{pi}:border",
+                    border_rect,
+                    motion_rect=border_rect,
+                    kind="plot_border",
+                    z_index=55,
+                )
+                for tick_idx in range(5):
+                    self._set_ui_atom(
+                        f"panel:{pi}:axis_label:{tick_idx}",
+                        self._axis_label_rect_py(pi, tick_idx),
+                        motion_rect=header_rect,
+                        kind="axis_label",
+                        z_index=90,
+                    )
+                for point_idx in range(len(self._curves[pi].points)):
+                    self._set_ui_atom(
+                        f"panel:{pi}:point:{point_idx}",
+                        self._point_rect_py(pi, point_idx),
+                        motion_rect=plot_rect,
+                        kind="control_point",
+                        z_index=120,
+                    )
+                for marker_idx in range(len(self._curves[pi].markers)):
+                    self._set_ui_atom(
+                        f"panel:{pi}:marker:{marker_idx}",
+                        self._marker_rect_py(pi, marker_idx),
+                        motion_rect=plot_rect.inflate(48, 28),
+                        kind="marker",
+                        z_index=115,
+                    )
+            for idx, rect in enumerate(self._status_rects_py()):
+                self._set_ui_atom(
+                    f"status:{idx}",
+                    rect,
+                    motion_rect=rect,
+                    kind="status_text",
+                    z_index=130,
+                )
+            for idx, rect in enumerate(self._dropdown_item_rects_py()):
+                self._set_ui_atom(
+                    f"dropdown:item:{idx}",
+                    rect,
+                    motion_rect=rect,
+                    kind="dropdown_item",
+                    z_index=140,
+                )
+
+        bg = pygame.Surface(surf.get_size(), pygame.SRCALPHA)
+        bg.blit(surf, (0, 0))
+        atoms: list[_UIAtom] = []
+        for atom in sorted(self._ui_atoms.values(), key=lambda item: (item.z_index, item.key)):
+            clipped = pygame.Rect(atom.rect).clip(viewport)
+            if clipped.w <= 0 or clipped.h <= 0:
+                atom.visible_rect = pygame.Rect(0, 0, 0, 0)
+                continue
+            atom.visible_rect = clipped
+            atom.surface = surf.subsurface(clipped).copy()
+            motion_clip = pygame.Rect(atom.motion_rect).clip(viewport)
+            atom.background_surface = (
+                bg.subsurface(motion_clip).copy()
+                if motion_clip.w > 0 and motion_clip.h > 0
+                else None
+            )
+            bg.fill((0, 0, 0, 0), clipped)
+            atoms.append(atom)
+        return bg, atoms
+
+    def consume_gl_dirty_rects(self) -> list["pygame.Rect"]:
+        rects = [pygame.Rect(r) for r in self._last_repaint_rects]
+        self._last_repaint_rects = []
+        return rects
+
+    def is_frame_dirty(self) -> bool:
+        """True if any visual layer needs redrawing. External callers can skip
+        render_to_surface when this returns False."""
+        return self._frame_dirty
+
     def _mark_dirty(self, panel_idx: Optional[int] = None, clear_render: bool = True):
+        with self._state_lock:
+            self._mark_dirty_locked(panel_idx=panel_idx, clear_render=clear_render)
+
+    def _mark_dirty_locked(self, panel_idx: Optional[int] = None, clear_render: bool = True):
         idx = self.focused_panel if panel_idx is None else panel_idx
         self._dirty[idx] = True
+        self._canvas_dirty[idx] = True
+        self._overlay_dirty = True
         self._curves[idx]._invalidate()
+        self._revision += 1
+        self._queue_full_dirty()
         if clear_render:
             # Invalidate the stale render result; do NOT pre-bake anything.
             # Audio is produced only by _do_post_render() after a session ends.
-            self._render_buf          = None
-            self._wave_pts            = []
-            self._amp_pts             = []
-            self._chirp_pts           = []
-            self._sig_re_pts          = []
-            self._sig_im_pts          = []
+            with self._render_lock:
+                self._render_buf          = None
+                self._wave_pts            = []
+                self._amp_pts             = []
+                self._chirp_pts           = []
+                self._sig_re_pts          = []
+                self._sig_im_pts          = []
+                self._analytic_pts        = []
+                self._csig_batch          = None
+                self._csig_batch_np       = None
+        self._request_async_invalidate()
+
+    def set_async_invalidate_callback(self, cb) -> None:
+        self._async_invalidate_cb = cb
+
+    def get_revision(self) -> int:
+        with self._state_lock:
+            return int(self._revision)
+
+    def snapshot_state(self) -> dict[str, Any]:
+        with self._state_lock:
+            return {
+                "curves": [ParametricCurve.from_dict(c.to_dict()) for c in self._curves],
+                "rule_tree": copy.deepcopy(self._channel_state("A").rule_tree or EnvelopeRuleTree.default()),
+                "revision": int(self._revision),
+            }
+
+    def close(self) -> None:
+        self._shutdown.set()
+        self._edit_queue.put(("__stop__", ()))
+
+    def _request_async_invalidate(self) -> None:
+        cb = self._async_invalidate_cb
+        if cb is not None:
+            try:
+                cb()
+            except Exception:
+                pass
+
+    def _queue_edit(self, op: str, *args: Any) -> None:
+        self._edit_queue.put((op, args))
+
+    def _apply_discrete_edit_locked(self, op: str, args: tuple[Any, ...]) -> None:
+        if op == "__stop__":
+            return
+        if op == "add_marker":
+            panel_idx, t = args
+            self._curves[panel_idx].add_marker(t, "")
+            self._sync_structure(panel_idx)
+            self._mark_dirty_locked(panel_idx)
+        elif op == "remove_marker":
+            panel_idx, marker_idx = args
+            if 0 <= marker_idx < len(self._curves[panel_idx].markers):
+                self._curves[panel_idx].remove_marker(marker_idx)
+                self._sync_structure(panel_idx)
+                self._mark_dirty_locked(panel_idx)
+        elif op == "add_point":
+            panel_idx, t, v = args
+            self._curves[panel_idx].add_point(t, v)
+            self._mark_dirty_locked(panel_idx)
+        elif op == "remove_point":
+            panel_idx, point_idx = args
+            if 0 <= point_idx < len(self._curves[panel_idx].points):
+                self._curves[panel_idx].remove_point(point_idx)
+                self._mark_dirty_locked(panel_idx)
+        elif op == "toggle_break":
+            panel_idx, point_idx = args
+            if 0 <= point_idx < len(self._curves[panel_idx].points):
+                self._curves[panel_idx].toggle_break(point_idx)
+                self._mark_dirty_locked(panel_idx)
+        elif op == "cycle_region_mode":
+            panel_idx, region_idx = args
+            eff = self._curves[panel_idx].regions.get(region_idx, RegionEffect())
+            eff.mode = _REGION_MODES[(_REGION_MODES.index(eff.mode) + 1) % len(_REGION_MODES)]
+            self._curves[panel_idx].regions[region_idx] = eff
+            self._sync_structure(panel_idx)
+            self._mark_dirty_locked(panel_idx)
+        elif op == "commit_label":
+            panel_idx, marker_idx, label = args
+            if 0 <= marker_idx < len(self._curves[panel_idx].markers):
+                self._curves[panel_idx].markers[marker_idx].label = label
+                self._sync_structure(panel_idx)
+                self._mark_dirty_locked(panel_idx, clear_render=False)
+
+    def _apply_pending_drag_locked(self) -> None:
+        changed = False
+        for panel_idx, payload in self._pending_point_drag.items():
+            if payload is None:
+                continue
+            point_idx, t, v = payload
+            pts = self._curves[panel_idx].points
+            if 0 <= point_idx < len(pts):
+                pts[point_idx].t = t
+                pts[point_idx].v = v
+                pts.sort(key=lambda p: p.t)
+                self._mark_dirty_locked(panel_idx)
+                changed = True
+            self._pending_point_drag[panel_idx] = None
+        for panel_idx, payload in self._pending_marker_drag.items():
+            if payload is None:
+                continue
+            marker_idx, t = payload
+            if 0 <= marker_idx < len(self._curves[panel_idx].markers):
+                self._curves[panel_idx].slide_marker(marker_idx, t)
+                self._sync_structure(panel_idx)
+                self._mark_dirty_locked(panel_idx)
+                changed = True
+            self._pending_marker_drag[panel_idx] = None
+        if changed:
+            self._request_async_invalidate()
+
+    def _edit_worker(self) -> None:
+        tick_s = 1.0 / max(30.0, self._phase_rotation_fps * 2.0)
+        while not self._shutdown.is_set():
+            try:
+                op, args = self._edit_queue.get(timeout=tick_s)
+            except queue.Empty:
+                op, args = None, ()
+            with self._state_lock:
+                if op is not None:
+                    self._apply_discrete_edit_locked(op, args)
+                self._apply_pending_drag_locked()
+
+    def _animation_worker(self) -> None:
+        tick_s = 1.0 / max(1.0, self._phase_rotation_fps)
+        while not self._shutdown.is_set():
+            _time.sleep(tick_s)
+            with self._render_lock:
+                has_analytic = bool(self._analytic_pts)
+            if not has_analytic:
+                continue
+            # Advance exactly one integer slot per tick — no float accumulation.
+            self._phase_slot = (self._phase_slot + 1) % max(2, self._phase_rotation_steps)
+            # Phase angle is read directly by draw_gl_overlays() each GL frame;
+            # do NOT dirty the pygame surface — that would force a full repaint
+            # + texture re-upload every tick just to advance a uniform.
 
     # ── shared structure sync ─────────────────────────────────────────────────
 
@@ -915,6 +1458,8 @@ class ParametricCurveEditor:
                 for k, v in src.regions.items()
             }
             self._dirty[tgt_idx] = True
+            self._canvas_dirty[tgt_idx] = True
+            self._frame_dirty = True
             tgt._invalidate()
         if self._panel_is_curve(from_idx):
             state = self._channel_state(channel_key)
@@ -1038,18 +1583,35 @@ class ParametricCurveEditor:
     # ── event handlers ────────────────────────────────────────────────────────
 
     def on_mouse_down(self, button, px, py, mods):
+        # Perspective-mode control strip for the GL analytic viewport.
+        # px is x-from-left (same as pygame surface x).
+        # py is y-from-bottom (GL space); convert to pygame surface y-from-top
+        # before testing against pygame.Rect objects stored by _draw_gl_ctrl_strip.
+        if button == 1 and self._gl_ctrl_rects:
+            screen_py = self.h - int(py)
+            for mode, rect in self._gl_ctrl_rects.items():
+                if rect.collidepoint(int(px), screen_py):
+                    self._gl_perspective_mode = mode
+                    if self._gl_wave_widget is not None:
+                        self._gl_wave_widget.set_perspective_mode(mode)
+                    return
+
         # Mouse-wheel scroll for panels area
         if button in (4, 5):
             _, vy, _, vh = _panels_view_gl_rect(self.w, self.h)
             if vy <= py <= vy + vh:
                 delta = _PANELS_SCROLL_STEP if button == 4 else -_PANELS_SCROLL_STEP
+                old_scroll = self._panels_scroll_y
                 self._panels_scroll_y = max(0, min(
                     self._panels_scroll_y - delta,
                     self._panels_max_scroll()))
+                if self._panels_scroll_y != old_scroll:
+                    self._queue_full_dirty()
             return
 
         # Close any open dropdown on a click elsewhere
         if self._open_dropdown is not None:
+            old_dropdown = self._dropdown_rect_py()
             item = self._dropdown_item_at(px, py)
             if item >= 0:
                 kind, pi = self._open_dropdown
@@ -1065,6 +1627,8 @@ class ParametricCurveEditor:
                 else:
                     self._set_panel_channel(pi, items[item])
             self._open_dropdown = None
+            self._queue_dirty_rect(old_dropdown)
+            self._mark_overlay_dirty()
             return
 
         # Commit any in-progress title/label edit on outside click
@@ -1092,20 +1656,37 @@ class ParametricCurveEditor:
                 self._title_editing = True
                 self._title_panel   = pi
                 self._title_buf     = self._curves[pi].name
+                self._queue_header_button_dirty(pi, "title")
+                self._mark_overlay_dirty()
             elif key == "role":
                 self._open_dropdown = ("role", pi)
+                self._queue_header_button_dirty(pi, "role")
+                self._queue_dirty_rect(self._dropdown_rect_py())
+                self._mark_overlay_dirty()
+            elif key == "scale":
+                self._open_dropdown = ("scale", pi)
+                self._queue_header_button_dirty(pi, "scale")
+                self._queue_dirty_rect(self._dropdown_rect_py())
+                self._mark_overlay_dirty()
             elif key == "channel":
                 self._open_dropdown = ("channel", pi)
+                self._queue_header_button_dirty(pi, "channel")
+                self._queue_dirty_rect(self._dropdown_rect_py())
+                self._mark_overlay_dirty()
             elif key == "stretch":
                 self._toggle_panel_channel_stretch(pi)
             elif key == "collapse":
                 cur = self._curves[pi].complex_collapse_mode
                 self._curves[pi].complex_collapse_mode = "abs" if cur == "real" else "real"
+                self._queue_header_button_dirty(pi, "collapse")
+                self._mark_overlay_dirty()
             elif key == "hmode":
                 modes = list(_PANEL_HEIGHT_MODES)
                 cur = self._panel_height_modes[pi]
-                self._panel_height_modes[pi] = modes[(modes.index(cur) + 1) % len(modes)]
+                next_mode = modes[(modes.index(cur) + 1) % len(modes)]
+                self._set_panel_height_mode(pi, next_mode)
                 self._clamp_panels_scroll()
+                self._queue_full_dirty()
             return
 
         # Plot area
@@ -1120,38 +1701,42 @@ class ParametricCurveEditor:
 
         if button == 1:
             if bool(mods & KMOD_CTRL) and in_plot:
-                self.curve.add_marker(t, "")
-                self._sync_structure(panel)
-                self._mark_dirty()
+                self._queue_edit("add_marker", panel, t)
                 return
-            mi = self._nearest_marker(px, panel)
+            with self._state_lock:
+                mi = self._nearest_marker(px, panel)
             if mi is not None:
                 self._drag_mk[panel] = mi
                 return
-            pi2 = self._nearest_point(px, py, panel)
+            with self._state_lock:
+                pi2 = self._nearest_point(px, py, panel)
             if pi2 is not None:
                 self._drag_pt[panel] = pi2
                 return
             if in_plot:
-                self.curve.add_point(t, v)
-                self._mark_dirty()
+                self._queue_edit("add_point", panel, t, v)
         elif button == 3:
-            mi = self._nearest_marker(px, panel)
+            with self._state_lock:
+                mi = self._nearest_marker(px, panel)
             if mi is not None:
-                self.curve.remove_marker(mi)
-                self._sync_structure(panel)
-                self._mark_dirty()
+                self._queue_edit("remove_marker", panel, mi)
                 return
-            pi2 = self._nearest_point(px, py, panel)
+            with self._state_lock:
+                pi2 = self._nearest_point(px, py, panel)
             if pi2 is not None:
-                self.curve.remove_point(pi2)
-                self._mark_dirty()
+                self._queue_edit("remove_point", panel, pi2)
 
     def on_mouse_up(self, button):
         if button == 1:
             for i in range(self._panel_count):
+                if self._drag_pt[i] is not None or self._drag_mk[i] is not None:
+                    self._queue_plot_dirty(i)
+                    self._frame_dirty = True
+            for i in range(self._panel_count):
                 self._drag_pt[i] = None
                 self._drag_mk[i] = None
+                self._pending_point_drag[i] = None
+                self._pending_marker_drag[i] = None
 
     def on_mouse_move(self, px, py):
         panel = self._panel_at_pos(py)
@@ -1160,11 +1745,18 @@ class ParametricCurveEditor:
         self._mouse_v     = v
         self._mouse_panel = panel
 
-        for pi in range(self._panel_count):
-            self._hover_pt[pi] = self._nearest_point(px, py, pi)
-            self._hover_mk[pi] = self._nearest_marker(px, pi)
-            self._hover_ri[pi] = self._curves[pi].region_index_at(
-                max(0.0, min(1.0, t)))
+        old_hover_pt = self._hover_pt[:]
+        old_hover_mk = self._hover_mk[:]
+        old_hover_ri = self._hover_ri[:]
+        old_hover_hb = self._hover_header_btn
+        old_dd_hover = self._dropdown_hover_idx
+
+        with self._state_lock:
+            for pi in range(self._panel_count):
+                self._hover_pt[pi] = self._nearest_point(px, py, pi)
+                self._hover_mk[pi] = self._nearest_marker(px, pi)
+                self._hover_ri[pi] = self._curves[pi].region_index_at(
+                    max(0.0, min(1.0, t)))
 
         self._hover_header_btn = self._header_btn_at(px, py)
 
@@ -1173,18 +1765,36 @@ class ParametricCurveEditor:
             self._dropdown_hover_idx = self._dropdown_item_at(px, py)
 
         fp = self.focused_panel
-        if not self._panel_is_curve(fp):
-            return
-        if self._drag_pt[fp] is not None:
+        dragging = self._panel_is_curve(fp) and self._drag_pt[fp] is not None
+        if dragging:
             tc, vc = self._clamp(t, v)
-            self._curves[fp].points[self._drag_pt[fp]].t = tc
-            self._curves[fp].points[self._drag_pt[fp]].v = vc
-            self._curves[fp].points.sort(key=lambda p: p.t)
-            self._mark_dirty()
-        elif self._drag_mk[fp] is not None:
-            self._curves[fp].slide_marker(self._drag_mk[fp], t)
-            self._sync_structure(fp)
-            self._mark_dirty()
+            self._queue_plot_dirty(fp)
+            self._pending_point_drag[fp] = (self._drag_pt[fp], tc, vc)
+            self._canvas_dirty[fp] = True
+            self._frame_dirty = True
+        elif self._panel_is_curve(fp) and self._drag_mk[fp] is not None:
+            self._queue_plot_dirty(fp)
+            self._pending_marker_drag[fp] = (self._drag_mk[fp], t)
+            self._canvas_dirty[fp] = True
+            self._frame_dirty = True
+        elif (self._hover_pt != old_hover_pt or
+              self._hover_mk != old_hover_mk or
+              self._hover_ri != old_hover_ri or
+              self._hover_header_btn != old_hover_hb or
+              self._dropdown_hover_idx != old_dd_hover):
+            for pi in range(self._panel_count):
+                if old_hover_pt[pi] != self._hover_pt[pi]:
+                    self._queue_dirty_rect(self._point_rect_py(pi, old_hover_pt[pi]))
+                    self._queue_dirty_rect(self._point_rect_py(pi, self._hover_pt[pi]))
+                if old_hover_mk[pi] != self._hover_mk[pi]:
+                    self._queue_dirty_rect(self._marker_rect_py(pi, old_hover_mk[pi]))
+                    self._queue_dirty_rect(self._marker_rect_py(pi, self._hover_mk[pi]))
+            if old_hover_hb is not None:
+                self._queue_header_button_dirty(old_hover_hb[0], old_hover_hb[1])
+            if self._hover_header_btn is not None:
+                self._queue_header_button_dirty(self._hover_header_btn[0], self._hover_header_btn[1])
+            self._queue_dirty_rect(self._dropdown_rect_py())
+            self._mark_overlay_dirty()
 
     def on_key_down(self, key, mods):
         # Title edit mode
@@ -1193,6 +1803,8 @@ class ParametricCurveEditor:
                 self._commit_title()
             elif key == K_BACKSPACE:
                 self._title_buf = self._title_buf[:-1]
+                self._queue_header_button_dirty(self._title_panel, "title")
+                self._mark_overlay_dirty()
             return
 
         # Marker label edit mode
@@ -1201,6 +1813,8 @@ class ParametricCurveEditor:
                 self._commit_label()
             elif key == K_BACKSPACE:
                 self._edit_buf = self._edit_buf[:-1]
+                self._queue_dirty_rect(self._marker_rect_py(self._edit_panel, self._edit_mk_idx))
+                self._mark_overlay_dirty()
             return
 
         fp = self.focused_panel
@@ -1211,20 +1825,16 @@ class ParametricCurveEditor:
         elif key == K_TAB:
             self.focused_panel = (self.focused_panel + 1) % self._panel_count
         elif key == K_d and self._panel_is_curve(fp) and self._hover_pt[fp] is not None:
-            c.toggle_break(self._hover_pt[fp])
-            self._mark_dirty()
+            self._queue_edit("toggle_break", fp, self._hover_pt[fp])
         elif key == K_m and self._panel_is_curve(fp) and self._hover_ri[fp] is not None:
-            eff = c.regions.get(self._hover_ri[fp], RegionEffect())
-            eff.mode = _REGION_MODES[
-                (_REGION_MODES.index(eff.mode) + 1) % len(_REGION_MODES)]
-            c.regions[self._hover_ri[fp]] = eff
-            self._sync_structure(fp)
-            self._mark_dirty()
+            self._queue_edit("cycle_region_mode", fp, self._hover_ri[fp])
         elif key == K_t and self._panel_is_curve(fp) and self._hover_mk[fp] is not None:
             self._editing_label = True
             self._edit_panel    = fp
             self._edit_mk_idx   = self._hover_mk[fp]
             self._edit_buf      = c.markers[self._hover_mk[fp]].label
+            self._queue_dirty_rect(self._marker_rect_py(fp, self._edit_mk_idx))
+            self._mark_overlay_dirty()
         elif key == K_s:
             if self._panel_roles[fp] in ("analytic", "output"):
                 self._save_channel_wav(self._panel_channels[fp])
@@ -1247,23 +1857,31 @@ class ParametricCurveEditor:
     def on_text_input(self, char):
         if self._title_editing:
             self._title_buf += char
+            self._queue_header_button_dirty(self._title_panel, "title")
+            self._mark_overlay_dirty()
         elif self._editing_label:
             self._edit_buf += char
+            self._queue_dirty_rect(self._marker_rect_py(self._edit_panel, self._edit_mk_idx))
+            self._mark_overlay_dirty()
 
     def _commit_title(self):
         name = self._title_buf.strip() or self._curves[self._title_panel].name
         self._curves[self._title_panel].name = name
         self._title_editing = False
         self._title_buf     = ""
+        self._queue_header_button_dirty(self._title_panel, "title")
+        self._mark_overlay_dirty()
 
     def _commit_label(self):
         fp = self._edit_panel
+        dirty_rect = self._marker_rect_py(fp, self._edit_mk_idx)
         if 0 <= self._edit_mk_idx < len(self._curves[fp].markers):
-            self._curves[fp].markers[self._edit_mk_idx].label = self._edit_buf
-            self._sync_structure(fp)
+            self._queue_edit("commit_label", fp, self._edit_mk_idx, self._edit_buf)
         self._editing_label = False
         self._edit_buf      = ""
         self._edit_mk_idx   = -1
+        self._queue_dirty_rect(dirty_rect)
+        self._mark_overlay_dirty()
 
     def _do_load(self, pi: int) -> None:
         lib = ParametricCurve.load_library(self.library_folder)
@@ -1276,6 +1894,7 @@ class ParametricCurveEditor:
 
     def _refresh_render_points(self, channel_key: str) -> None:
         """Rebuild display point lists from channel state's display_signals.
+        Marks all panels canvas-dirty so the rendered overlay is repainted.
 
         Channel A: expects "amplitude" and/or "chirp" tensors.
                    Builds _amp_pts, _chirp_pts from those.
@@ -1291,28 +1910,30 @@ class ParametricCurveEditor:
         if channel_key == "B":
             analytic_sig = state.display_signals.get("analytic")
             if analytic_sig is None:
-                self._sig_re_pts = []
-                self._sig_im_pts = []
-                self._analytic_pts  = []
-                self._render_buf = None
+                with self._render_lock:
+                    self._sig_re_pts = []
+                    self._sig_im_pts = []
+                    self._analytic_pts = []
+                    self._wave_pts = []
+                    self._render_buf = None
+                for i in range(self._panel_count):
+                    self._canvas_dirty[i] = True
+                self._queue_full_dirty()
                 return
-            self._render_buf = analytic_sig
-            # ── advance phase-rotation animation ─────────────────────────────
-            now = _time.monotonic()
-            if self._phase_rotation_last_t is not None:
-                dt = now - self._phase_rotation_last_t
-                self._phase_rotation_angle += 2.0 * math.pi * self._phase_rotation_hz * dt
-            self._phase_rotation_last_t = now
-            # Rotate the complex signal for display only; raw data is untouched.
-            rotated = analytic_sig * torch.exp(
-                torch.tensor(1j * self._phase_rotation_angle, dtype=torch.complex128)
-            )
-            self._sig_re_pts = _downsample_signal_lane_pts(rotated, w_px, 0)
-            self._sig_im_pts = _downsample_signal_lane_pts(rotated, w_px, 1)
-            # Build analytic pts from RAW signal — view projection applied at draw time
-            self._analytic_pts  = _downsample_analytic_pts(analytic_sig, w_px)
-            # Also build background wave from analytic envelope magnitude
-            self._wave_pts = _downsample_to_pts(torch.abs(analytic_sig), w_px)
+            with self._render_lock:
+                self._render_buf = analytic_sig
+                if (self._csig_batch is not None
+                        and self._phase_slot < self._csig_batch.shape[0]):
+                    slot_sig = self._csig_batch[self._phase_slot]
+                else:
+                    _angle   = self._phase_slot * (2.0 * math.pi / max(2, self._phase_rotation_steps))
+                    slot_sig = analytic_sig * torch.exp(
+                        torch.tensor(1j * _angle, dtype=torch.complex128)
+                    )
+                self._sig_re_pts   = _downsample_signal_lane_pts(slot_sig, w_px, 0)
+                self._sig_im_pts   = _downsample_signal_lane_pts(slot_sig, w_px, 1)
+                self._analytic_pts = _downsample_analytic_pts(slot_sig)
+                self._wave_pts     = _downsample_to_pts(torch.abs(slot_sig), w_px)
         else:
             amp_bias_sig   = state.display_signals.get("amplitude_bias")
             amp_sig        = state.display_signals.get("amplitude")
@@ -1320,12 +1941,17 @@ class ParametricCurveEditor:
             chirp_bias_sig = state.display_signals.get("chirp_bias")
             chirp_sig      = state.display_signals.get("chirp")
             chirp_total_sig = state.display_signals.get("chirp_total")
-            self._amp_bias_pts   = _downsample_env_to_pts(amp_bias_sig   if amp_bias_sig   is not None else _ZERO, w_px)
-            self._amp_pts        = _downsample_env_to_pts(amp_sig        if amp_sig        is not None else _ZERO, w_px)
-            self._amp_total_pts  = _downsample_env_to_pts(amp_total_sig  if amp_total_sig  is not None else _ZERO, w_px)
-            self._chirp_bias_pts = _downsample_env_to_pts(chirp_bias_sig if chirp_bias_sig is not None else _ZERO, w_px)
-            self._chirp_pts      = _downsample_env_to_pts(chirp_sig      if chirp_sig      is not None else _ZERO, w_px)
-            self._chirp_total_pts = _downsample_env_to_pts(chirp_total_sig if chirp_total_sig is not None else _ZERO, w_px)
+            with self._render_lock:
+                self._amp_bias_pts   = _downsample_env_to_pts(amp_bias_sig   if amp_bias_sig   is not None else _ZERO, w_px)
+                self._amp_pts        = _downsample_env_to_pts(amp_sig        if amp_sig        is not None else _ZERO, w_px)
+                self._amp_total_pts  = _downsample_env_to_pts(amp_total_sig  if amp_total_sig  is not None else _ZERO, w_px)
+                self._chirp_bias_pts = _downsample_env_to_pts(chirp_bias_sig if chirp_bias_sig is not None else _ZERO, w_px)
+                self._chirp_pts      = _downsample_env_to_pts(chirp_sig      if chirp_sig      is not None else _ZERO, w_px)
+                self._chirp_total_pts = _downsample_env_to_pts(chirp_total_sig if chirp_total_sig is not None else _ZERO, w_px)
+
+        for i in range(self._panel_count):
+            self._canvas_dirty[i] = True
+        self._queue_full_dirty()
 
     def _save_channel_wav(self, channel_key: str) -> Optional[str]:
         if not _HAS_NP:
@@ -1349,11 +1975,18 @@ class ParametricCurveEditor:
     # ── resize ────────────────────────────────────────────────────────────────
 
     def resize(self, w, h):
+        if self.w == w and self.h == h:
+            return
         self.w, self.h = w, h
         if self._overlay:
             self._overlay.resize(w, h)
         self._dirty = [True] * self._panel_count
+        self._canvas_dirty = [True] * self._panel_count
+        self._render_overlay_cache = [None] * self._panel_count
+        self._overlay_dirty = True
+        self._ui_atoms.clear()
         self._clamp_panels_scroll()
+        self._queue_full_dirty()
         if self._render_buf is not None:
             self._refresh_render_points("B")
 
@@ -1450,62 +2083,166 @@ class ParametricCurveEditor:
                 if len(line_pts) >= 2:
                     pygame.draw.lines(dst_layer, line_rgba, False, line_pts, 3)
 
-        def _composite_env(pts, fill_col, line_col, *, draw_line: bool = True):
-            layer = _new_layer()
-            _draw_env(layer, pts, fill_col, line_col, draw_line=draw_line)
-            _alpha_blit_rgb(_ctx.surf, layer, dest_xy)
+        def _composite_env(dst_layer, pts, fill_col, line_col, *, draw_line: bool = True):
+            _draw_env(dst_layer, pts, fill_col, line_col, draw_line=draw_line)
 
         def _draw_analytic_waves():
-            if len(self._analytic_pts) < 2:
+            with self._render_lock:
+                analytic_pts = self._analytic_pts
+            if len(analytic_pts) < 2:
                 return
+
+            ctrl_h = 28
+            gl_h   = max(1, panel_h - ctrl_h)
+
+            # ── Real OpenGL 3-D rendering — direct to framebuffer ──────────
+            if _HAS_GL_WAVE:
+                if self._gl_wave_widget is None:
+                    self._gl_wave_widget = _GLAnalyticWaveWidget(phase_steps=72)
+                self._gl_wave_widget.set_perspective_mode(self._gl_perspective_mode)
+                _batch_np = self._csig_batch_np
+                if _batch_np is not None and _batch_np is not self._gl_wave_widget._csig_batch:
+                    self._gl_wave_widget.update_data(_batch_np)
+                self._gl_analytic_rect = (dest_xy[0], dest_xy[1], panel_w, gl_h)
+                ctrl_y = dest_xy[1] + gl_h
+                self._draw_gl_ctrl_strip(
+                    _ctx.surf, ctrl_y, dest_xy[0], panel_w, ctrl_h
+                )
+                return
+
+            # ── Fallback: flat 2-D orthographic projection ─────────────────
+            # Real component: Y = re, drawn as a flat horizontal oscillation.
+            # Imaginary component: Y = im, drawn offset upward by 30 % of ph.
+            # Phasor: shows tip magnitude as a line from centre.
+            # No fake perspective — just honest 2-D lane separation.
             layer = _new_layer()
-            cy = y0 + ph * 0.5
-            scale = ph * 0.42
-            center_py = _panel_py(cy)
+            cy_re = y0 + ph * 0.30   # real   lane centre (30 % up from bottom)
+            cy_im = y0 + ph * 0.70   # imag   lane centre (70 % up)
+            scale = ph * 0.22        # amplitude scale per lane
 
-            pygame.draw.line(layer, (55, 55, 55, 255),
-                             (0, center_py), (int(round(pw)), center_py), 1)
-
-            c_re = math.cos(self._phase_rotation_angle)
-            c_im = math.sin(self._phase_rotation_angle)
-
-            re_screen = []
-            im_screen = []
-            for t_frac, re, im in self._analytic_pts:
+            def _flat_pt(t_frac, amp, cy):
                 sx = int(round(t_frac * pw))
-                re_screen.append((sx, _panel_py(cy - re * c_re * scale)))
-                im_screen.append((sx, _panel_py(cy - im * c_im * scale)))
+                sy = _panel_py(cy + amp * scale)
+                return sx, sy
 
-            step = max(1, len(self._analytic_pts) // 48)
-            for i in range(0, len(self._analytic_pts), step):
-                pygame.draw.line(layer, (40, 100, 55, 255),
-                                 (re_screen[i][0], center_py), re_screen[i], 1)
-                pygame.draw.line(layer, (40, 75, 120, 255),
-                                 (im_screen[i][0], center_py), im_screen[i], 1)
+            # lane separator lines
+            pygame.draw.line(layer, (45, 45, 45, 200),
+                             (0, _panel_py(cy_re)), (int(round(pw)), _panel_py(cy_re)), 1)
+            pygame.draw.line(layer, (45, 45, 45, 200),
+                             (0, _panel_py(cy_im)), (int(round(pw)), _panel_py(cy_im)), 1)
+
+            re_screen = [_flat_pt(t, re, cy_re) for t, re, im in analytic_pts]
+            im_screen = [_flat_pt(t, im, cy_im) for t, re, im in analytic_pts]
 
             if len(re_screen) >= 2:
                 pygame.draw.lines(layer, (75, 210, 110, 255), False, re_screen, 2)
             if len(im_screen) >= 2:
                 pygame.draw.lines(layer, (75, 148, 230, 255), False, im_screen, 2)
+
+            # Phasor tip dot at rightmost point
+            if analytic_pts:
+                t_last, re_last, im_last = analytic_pts[-1]
+                mag = math.sqrt(re_last ** 2 + im_last ** 2)
+                hx, hy = _flat_pt(t_last, 0.0, y0 + ph * 0.5)
+                r_px = max(3, int(round(mag * scale)))
+                pygame.draw.circle(layer, (235, 52, 52, 200), (hx, hy), r_px, 2)
             _alpha_blit_rgb(_ctx.surf, layer, dest_xy)
 
         if role == "analytic":
             _draw_analytic_waves()
+            self._canvas_dirty[pi] = False
+            return
 
-        elif role == "amplitude":
-            _composite_env(self._amp_bias_pts, _COL_LAYER_R_FILL, _COL_LAYER_R_LINE)
-            _composite_env(self._amp_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE)
-            _composite_env(self._amp_total_pts or self._wave_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE)
+        cache = self._render_overlay_cache[pi]
+        need_rebuild = (
+            cache is None
+            or cache.get_size() != (panel_w, panel_h)
+            or self._canvas_dirty[pi]
+        )
+        if need_rebuild:
+            cache = _new_layer()
+            if role == "amplitude":
+                _composite_env(cache, self._amp_bias_pts, _COL_LAYER_R_FILL, _COL_LAYER_R_LINE)
+                _composite_env(cache, self._amp_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE)
+                _composite_env(cache, self._amp_total_pts or self._wave_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE)
+            elif role == "chirp":
+                _composite_env(cache, self._chirp_bias_pts, _COL_LAYER_R_FILL, _COL_LAYER_R_LINE)
+                _composite_env(cache, self._chirp_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE)
+                _composite_env(cache, self._chirp_total_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE)
+            elif role == "output":
+                _composite_env(cache, self._amp_total_pts or self._wave_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE, draw_line=False)
+                _composite_env(cache, self._chirp_total_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE, draw_line=False)
+            self._render_overlay_cache[pi] = cache
+            self._canvas_dirty[pi] = False
 
-        elif role == "chirp":
-            _composite_env(self._chirp_bias_pts, _COL_LAYER_R_FILL, _COL_LAYER_R_LINE)
-            _composite_env(self._chirp_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE)
-            _composite_env(self._chirp_total_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE)
-
-        elif role == "output":
-            _composite_env(self._amp_total_pts or self._wave_pts, _COL_LAYER_B_FILL, _COL_LAYER_B_LINE, draw_line=False)
-            _composite_env(self._chirp_total_pts, _COL_LAYER_G_FILL, _COL_LAYER_G_LINE, draw_line=False)
+        _alpha_blit_rgb(_ctx.surf, cache, dest_xy)
+        if role == "output":
             _draw_analytic_waves()
+
+    def draw_gl_overlays(self, canvas_x: int, canvas_y: int,
+                         win_w: int, win_h: int) -> None:
+        """Render GPU-resident GL panels directly into the current framebuffer.
+
+        Call this from the main GL loop AFTER drawing the canvas texture quad.
+        canvas_x/canvas_y is the top-left window position of the editor surface
+        (pygame coords, y from top).
+        """
+        if not _HAS_GL_WAVE or self._gl_wave_widget is None:
+            return
+        rect = self._gl_analytic_rect
+        if rect is None:
+            return
+        sx, sy, sw, sh = rect
+        # sx, sy are surface-local (render_to_surface space) — convert to window
+        wx = canvas_x + sx
+        wy = canvas_y + sy
+        with self._render_lock:
+            self._gl_wave_widget.draw(
+                wx, wy, sw, sh, win_w, win_h,
+                current_slot=self._phase_slot,
+            )
+
+    def _draw_gl_ctrl_strip(self, surf, strip_y: int, strip_x: int,
+                            strip_w: int, strip_h: int) -> None:
+        """Draw the perspective-mode button strip below the GL viewport.
+
+        Stores hit-test rects in self._gl_ctrl_rects keyed by mode name.
+        """
+        if not _HAS_PYGAME:
+            return
+        import pygame as _pg
+        modes  = _GL_PERSPECTIVE_MODES
+        labels = _GL_PERSPECTIVE_LABELS
+        n = len(modes)
+        btn_w = max(1, strip_w // n)
+        pad = 2
+        bg_col   = (20, 20, 28, 220)
+        act_col  = (60, 110, 200, 240)
+        idle_col = (35, 38, 48, 200)
+        txt_col  = (200, 210, 230)
+        act_txt  = (240, 250, 255)
+
+        bg_rect = _pg.Rect(strip_x, strip_y, strip_w, strip_h)
+        _pg.draw.rect(surf, bg_col[:3], bg_rect)
+
+        self._gl_ctrl_rects.clear()
+        font = _pg.font.SysFont("monospace", max(9, strip_h - 8), bold=False)
+
+        for i, mode in enumerate(modes):
+            bx = strip_x + i * btn_w
+            bw = btn_w if i < n - 1 else strip_w - i * btn_w
+            rect = _pg.Rect(bx + pad, strip_y + pad,
+                            bw - 2 * pad, strip_h - 2 * pad)
+            is_active = (mode == self._gl_perspective_mode)
+            fill = act_col[:3] if is_active else idle_col[:3]
+            _pg.draw.rect(surf, fill, rect, border_radius=3)
+            lbl = labels.get(mode, mode)
+            tcol = act_txt if is_active else txt_col
+            ts  = font.render(lbl, True, tcol)
+            tx  = rect.x + (rect.w - ts.get_width())  // 2
+            ty  = rect.y + (rect.h - ts.get_height()) // 2
+            surf.blit(ts, (tx, ty))
+            self._gl_ctrl_rects[mode] = rect
 
     def _draw_spline(self, x0, y0, pw, ph, pi):
         if not self._panel_is_curve(pi):
@@ -1642,7 +2379,7 @@ class ParametricCurveEditor:
         # Height-mode cycle button
         rx, ry, rw, rh = rects["hmode"]
         hm = self._panel_height_modes[pi]
-        hm_lbl = {"collapsed": "C", "small": "S", "medium": "M", "large": "L"}.get(hm, "M")
+        hm_lbl = {"collapsed": "C", "small": "S", "medium": "M", "large": "L", "max": "Z"}.get(hm, "M")
         ov.gl_button(hm_lbl, rx, ry, rw, rh,
                      col_bg=(42, 42, 52), col_text=(180, 200, 180),
                      hover=(hb == (pi, "hmode")))
@@ -1686,57 +2423,91 @@ class ParametricCurveEditor:
         ]):
             ov.text(ln, 4, self.h - 14 * (2 - i) - 2, col=(80, 88, 96))
 
+    def _repaint_rect(self, rect: "pygame.Rect") -> None:
+        surf = self._frame_surf
+        _ctx.surf = surf
+        _ctx.h = self.h
+
+        surf.set_clip(rect)
+        surf.fill(tuple(int(c * 255) for c in _COL_BG[:3]), rect)
+
+        if self._overlay:
+            self._overlay.surface.set_clip(rect)
+            self._overlay.surface.fill((0, 0, 0, 0), rect)
+
+        with self._state_lock:
+            for pi in range(self._panel_count):
+                plot_rect = self._plot_rect_py(pi)
+                header_rect = self._header_rect_py(pi)
+                if not rect.colliderect(plot_rect) and not rect.colliderect(header_rect):
+                    continue
+                x0, y0, pw, ph = self._prect(pi)
+                curve = self._curves[pi]
+                if rect.colliderect(plot_rect):
+                    self._draw_panel_bg_regions(x0, y0, pw, ph, pi)
+                    self._draw_grid(x0, y0, pw, ph, curve)
+                    self._draw_rendered_overlay(x0, y0, pw, ph, pi)
+                    self._draw_spline(x0, y0, pw, ph, pi)
+                    self._draw_points(x0, y0, pw, ph, pi)
+                    self._draw_playhead(x0, y0, pw, ph)
+                    self._draw_panel_border(x0, y0, pw, ph, pi)
+                    if self._overlay:
+                        self._draw_markers(x0, y0, pw, ph, pi, self._overlay)
+                        self._draw_y_axis_labels(x0, y0, pw, ph, curve, self._overlay)
+                if self._overlay and rect.colliderect(header_rect):
+                    self._draw_header(pi, self._overlay)
+
+        if self._overlay:
+            dropdown_rect = self._dropdown_rect_py()
+            if dropdown_rect is not None and rect.colliderect(dropdown_rect):
+                self._draw_open_dropdown(self._overlay)
+            if any(rect.colliderect(r) for r in self._status_rects_py()):
+                self._draw_status(self._overlay)
+            self._overlay.surface.set_clip(None)
+            self._overlay.blit_rect_to(surf, rect)
+
+        surf.set_clip(None)
+
     # ── main draw ─────────────────────────────────────────────────────────────
 
     def _draw_frame(self, *, clear_bg: bool, flip: bool,
                      win_x: int = 0, win_y_bottom: int = 0) -> "pygame.Surface":
-        # Ensure frame surface exists at the current logical size
-        if (not hasattr(self, '_frame_surf')
-                or self._frame_surf.get_size() != (self.w, self.h)):
-            self._frame_surf = pygame.Surface((self.w, self.h))
+        size = (self.w, self.h)
+
+        if not hasattr(self, '_frame_surf') or self._frame_surf.get_size() != size:
+            self._frame_surf = pygame.Surface(size, pygame.SRCALPHA)
+            self._canvas_dirty = [True] * self._panel_count
+            self._render_overlay_cache = [None] * self._panel_count
+            self._overlay_dirty = True
+            self._queue_full_dirty()
         surf = self._frame_surf
 
-        if clear_bg:
-            surf.fill(tuple(int(c * 255) for c in _COL_BG[:3]))
+        if not self._frame_dirty:
+            self._last_repaint_rects = []
+            if flip:
+                win = pygame.display.get_surface()
+                if win is not None:
+                    win.blit(surf, (0, 0))
+                pygame.display.flip()
+            return surf
 
-        # Point the module-level drawing context at this surface
-        _ctx.surf = surf
-        _ctx.h    = self.h
+        # _frame_dirty is True but dirty_rects may be empty when _mark_dirty_locked /
+        # _sync_structure / _refresh_render_points set the flag without queuing rects
+        # (e.g. from the background edit worker).  Fall back to a full repaint.
+        if not self._dirty_rects:
+            self._dirty_rects = [pygame.Rect(0, 0, self.w, self.h)]
 
-        if self._overlay:
-            self._overlay.begin()
+        dirty_rects = [r.copy() for r in self._dirty_rects]
+        self._dirty_rects.clear()
+        if len(dirty_rects) > 64:
+            dirty_rects = [pygame.Rect(0, 0, self.w, self.h)]
+        self._last_repaint_rects = [pygame.Rect(r) for r in dirty_rects]
 
-        # Clip drawing to the scrollable panels viewport
-        vx, vy, vw, vh = _panels_view_gl_rect(self.w, self.h)
-        clip_rect = pygame.Rect(int(vx), self.h - int(vy) - int(vh), int(vw), int(vh))
-        surf.set_clip(clip_rect)
+        for rect in dirty_rects:
+            self._repaint_rect(rect)
 
-        for pi in range(self._panel_count):
-            x0, y0, pw, ph = self._prect(pi)
-            curve = self._curves[pi]
-
-            self._draw_panel_bg_regions(x0, y0, pw, ph, pi)
-            self._draw_grid(x0, y0, pw, ph, curve)
-            self._draw_rendered_overlay(x0, y0, pw, ph, pi)
-            self._draw_spline(x0, y0, pw, ph, pi)
-            self._draw_points(x0, y0, pw, ph, pi)
-            self._draw_playhead(x0, y0, pw, ph)
-            self._draw_panel_border(x0, y0, pw, ph, pi)
-
-            if self._overlay:
-                self._draw_markers(x0, y0, pw, ph, pi, self._overlay)
-                self._draw_y_axis_labels(x0, y0, pw, ph, curve, self._overlay)
-                self._draw_header(pi, self._overlay)
-
-        # Un-clip for knobs and dropdowns (drawn outside the panels viewport)
-        surf.set_clip(None)
-
-        self._draw_knobs(self._overlay)
-
-        if self._overlay:
-            self._draw_open_dropdown(self._overlay)   # drawn last = on top
-            self._draw_status(self._overlay)
-            self._overlay.blit_to(surf)
+        self._frame_dirty = False
+        self._overlay_dirty = False
 
         if flip:
             win = pygame.display.get_surface()
@@ -1764,7 +2535,8 @@ class ParametricCurveEditor:
         Compatible with the surface-based centre-display pipeline used by all
         other EditorCanvas tabs (e.g. bass_viewer, analytic_driver).
         """
-        self.resize(w, h)
+        if self.w != w or self.h != h:
+            self.resize(w, h)
         return self._draw_frame(clear_bg=True, flip=False)
 
     def draw(self):

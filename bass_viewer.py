@@ -79,6 +79,18 @@ from analysis_itinerary import (
 )
 from plot_widget import PlotWidget, PlotSeries, PlotMarker, HeatmapBar
 
+try:
+    from opengl_widget import GLPanel as _GLPanel, GLAnalyticWaveWidget as _GLAnalyticWaveWidget
+    _HAS_GL_WIDGET = True
+except Exception:
+    _HAS_GL_WIDGET = False
+    _GLPanel = None
+    _GLAnalyticWaveWidget = None
+
+# Re-export for callers that want to register a GLPanel in the PanelDock.
+GLPanel = _GLPanel
+GLAnalyticWaveWidget = _GLAnalyticWaveWidget
+
 # Preferred audio backend: soundfile (libsndfile) handles WAV, FLAC, OGG, AIFF, etc.
 # Falls back to scipy.io.wavfile for WAV-only if soundfile is unavailable.
 from scipy.io import wavfile
@@ -6602,6 +6614,236 @@ class SynthJob:
 
 
 # ---------------------------------------------------------------------------
+# Retained Dirty UI primitives
+# ---------------------------------------------------------------------------
+
+@dataclass
+class DirtyUINode:
+    """Leaf-oriented retained UI node.
+
+    Parents are routing/composition nodes. The intended repaint unit is the
+    leaf widget rect, not the panel or page containing it.
+    """
+
+    key: str
+    rect: pygame.Rect = field(default_factory=lambda: pygame.Rect(0, 0, 0, 0))
+    parent: "DirtyUINode | None" = None
+    children: list["DirtyUINode"] = field(default_factory=list)
+    dirty_self: bool = True
+    dirty_descendants: bool = True
+
+    def add_child(self, child: "DirtyUINode") -> None:
+        if child.parent is self:
+            return
+        if child.parent is not None:
+            child.parent.remove_child(child)
+        child.parent = self
+        self.children.append(child)
+        child.mark_dirty()
+
+    def remove_child(self, child: "DirtyUINode") -> None:
+        if child in self.children:
+            self.children.remove(child)
+            child.parent = None
+            self.mark_dirty(child.rect)
+
+    def set_rect(self, rect: pygame.Rect) -> None:
+        nr = pygame.Rect(rect)
+        if nr != self.rect:
+            old = self.rect.copy()
+            self.rect = nr
+            self.mark_dirty(old.union(nr))
+
+    def mark_dirty(self, rect: pygame.Rect | None = None) -> None:
+        if rect is not None:
+            nr = pygame.Rect(rect)
+            self.rect = self.rect.union(nr) if self.rect.w > 0 and self.rect.h > 0 else nr
+        self.dirty_self = True
+        node: DirtyUINode | None = self
+        while node is not None:
+            node.dirty_descendants = True
+            node = node.parent
+
+    def clear_dirty(self) -> None:
+        self.dirty_self = False
+        self.dirty_descendants = any(
+            child.dirty_self or child.dirty_descendants for child in self.children
+        )
+
+    def collect_dirty_leaves(self) -> list["DirtyUINode"]:
+        out: list[DirtyUINode] = []
+        if not self.dirty_self and not self.dirty_descendants:
+            return out
+        if not self.children:
+            if self.dirty_self:
+                out.append(self)
+            return out
+        if self.dirty_self and self.rect.w > 0 and self.rect.h > 0:
+            out.append(self)
+        for child in self.children:
+            out.extend(child.collect_dirty_leaves())
+        return out
+
+
+@dataclass
+class UIAtom:
+    """A render atom that can be handed off to the GL compositor."""
+
+    key: str
+    rect: pygame.Rect
+    motion_rect: pygame.Rect
+    parent_key: str | None = None
+    kind: str = "generic"
+    z_index: int = 0
+    takeover: bool = True
+    surface: pygame.Surface | None = None
+    background_surface: pygame.Surface | None = None
+    texture_id: int = 0
+    texture_size: tuple[int, int] = (0, 0)
+    dirty: bool = True
+    visible_rect: pygame.Rect = field(default_factory=lambda: pygame.Rect(0, 0, 0, 0))
+
+
+class DirtyUITree:
+    """Shared retained-mode dirty tree for viewer and panel primitives."""
+
+    def __init__(self, root_key: str) -> None:
+        self.root = DirtyUINode(root_key)
+        self.nodes: dict[str, DirtyUINode] = {root_key: self.root}
+        self.atoms: dict[str, UIAtom] = {}
+
+    def ensure_node(
+        self,
+        key: str,
+        rect: pygame.Rect | None = None,
+        *,
+        parent_key: str | None = None,
+    ) -> DirtyUINode:
+        node = self.nodes.get(key)
+        if node is None:
+            node = DirtyUINode(key)
+            self.nodes[key] = node
+            parent = self.nodes.get(parent_key) if parent_key else self.root
+            (parent or self.root).add_child(node)
+        elif parent_key:
+            parent = self.nodes.get(parent_key)
+            if parent is not None and node.parent is not parent:
+                parent.add_child(node)
+        if rect is not None:
+            node.set_rect(rect)
+        return node
+
+    def drop_node(self, key: str) -> None:
+        node = self.nodes.get(key)
+        if node is None or node is self.root:
+            return
+        if node.parent is not None:
+            node.parent.remove_child(node)
+        for child in list(node.children):
+            node.remove_child(child)
+        self.nodes.pop(key, None)
+
+    def mark_dirty(self, key: str, rect: pygame.Rect | None = None) -> None:
+        self.ensure_node(key, rect).mark_dirty(rect)
+        atom = self.atoms.get(key)
+        if atom is not None:
+            atom.dirty = True
+
+    def invalidate_all(self, rect: pygame.Rect | None = None) -> None:
+        if rect is not None:
+            self.root.set_rect(rect)
+        self.root.mark_dirty(rect)
+        for atom in self.atoms.values():
+            atom.dirty = True
+
+    def collect_dirty_rects(self) -> list[pygame.Rect]:
+        rects: list[pygame.Rect] = []
+        for node in self.root.collect_dirty_leaves():
+            if node.rect.w > 0 and node.rect.h > 0:
+                rects.append(node.rect.copy())
+            node.clear_dirty()
+        self.root.clear_dirty()
+        return rects
+
+    def ensure_atom(
+        self,
+        key: str,
+        rect: pygame.Rect,
+        *,
+        motion_rect: pygame.Rect | None = None,
+        parent_key: str | None = None,
+        kind: str = "generic",
+        z_index: int = 0,
+        takeover: bool = True,
+    ) -> UIAtom:
+        node = self.ensure_node(key, rect, parent_key=parent_key)
+        atom = self.atoms.get(key)
+        if atom is None:
+            atom = UIAtom(
+                key=key,
+                rect=pygame.Rect(rect),
+                motion_rect=pygame.Rect(motion_rect or rect),
+                parent_key=parent_key,
+                kind=kind,
+                z_index=z_index,
+                takeover=takeover,
+            )
+            self.atoms[key] = atom
+        else:
+            nr = pygame.Rect(rect)
+            if atom.rect != nr:
+                atom.rect = nr
+                atom.dirty = True
+            mr = pygame.Rect(motion_rect or rect)
+            if atom.motion_rect != mr:
+                atom.motion_rect = mr
+                atom.dirty = True
+            atom.parent_key = parent_key
+            atom.kind = kind
+            atom.z_index = z_index
+            atom.takeover = takeover
+        node.set_rect(rect)
+        return atom
+
+    def get_atom(self, key: str) -> UIAtom | None:
+        return self.atoms.get(key)
+
+    def iter_atoms(self) -> list[UIAtom]:
+        return [self.atoms[k] for k in sorted(self.atoms, key=lambda kk: (self.atoms[kk].z_index, kk))]
+
+    def drop_atom(self, key: str) -> None:
+        self.atoms.pop(key, None)
+        self.drop_node(key)
+
+
+class PanelItemMap(dict):
+    """Panel-local item registry that auto-registers UI leaf nodes."""
+
+    def __init__(self, panel: "Panel") -> None:
+        super().__init__()
+        self._panel = panel
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        super().__setitem__(key, value)
+        try:
+            rect = value[0]
+        except Exception:
+            rect = None
+        if isinstance(rect, pygame.Rect):
+            item_key = self._panel._item_node_key(key)
+            self._panel.ensure_ui_node(
+                item_key,
+                rect,
+                parent_key=self._panel._panel_root_node_key(),
+            )
+            self._panel.ensure_ui_atom(
+                item_key,
+                rect,
+                parent_key=self._panel._panel_root_node_key(),
+            )
+
+
+# ---------------------------------------------------------------------------
 # Panel base class — common interface for dockable side panels
 # ---------------------------------------------------------------------------
 
@@ -6622,6 +6864,149 @@ class Panel:
         self.font: pygame.font.Font | None = None
         self._panel_scroll_y: int = 0  # vertical scroll offset for panel content
         self._content_h: int = 0       # total height of last rendered content
+        self._dirty: bool = True       # set by mark_dirty(); cleared after render()
+        self.ui_tree = DirtyUITree(f"panel:{title}:root")
+        self._item_map = PanelItemMap(self)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name == "_item_map" and isinstance(value, dict) and not isinstance(value, PanelItemMap):
+            current_panel = getattr(self, "ui_tree", None)
+            if current_panel is not None:
+                wrapped = PanelItemMap(self)
+                wrapped.update(value)
+                value = wrapped
+        super().__setattr__(name, value)
+
+    def _panel_root_node_key(self) -> str:
+        return f"panel-root:{self.title}"
+
+    def _item_node_key(self, key: str) -> str:
+        return f"{self._panel_root_node_key()}:{key}"
+
+    def mark_dirty(self) -> None:
+        """Signal that this panel's content has changed and needs redrawing."""
+        self._dirty = True
+        surf = pygame.display.get_surface()
+        if surf is not None:
+            self.ui_tree.invalidate_all(self.panel_rect)
+        else:
+            self.ui_tree.invalidate_all()
+
+    def is_dirty(self) -> bool:
+        return self._dirty or bool(self.ui_tree.root.dirty_self or self.ui_tree.root.dirty_descendants)
+
+    def _clear_dirty(self) -> None:
+        self._dirty = False
+        self.ui_tree.root.clear_dirty()
+
+    def ensure_ui_node(
+        self,
+        key: str,
+        rect: pygame.Rect | None = None,
+        *,
+        parent_key: str | None = None,
+    ) -> DirtyUINode:
+        return self.ui_tree.ensure_node(key, rect, parent_key=parent_key)
+
+    def ensure_ui_atom(
+        self,
+        key: str,
+        rect: pygame.Rect,
+        *,
+        motion_rect: pygame.Rect | None = None,
+        parent_key: str | None = None,
+        kind: str = "generic",
+        z_index: int = 0,
+        takeover: bool = True,
+    ) -> UIAtom:
+        return self.ui_tree.ensure_atom(
+            key,
+            rect,
+            motion_rect=motion_rect,
+            parent_key=parent_key,
+            kind=kind,
+            z_index=z_index,
+            takeover=takeover,
+        )
+
+    def mark_ui_node_dirty(self, key: str, rect: pygame.Rect | None = None) -> None:
+        self.ui_tree.mark_dirty(key, rect)
+        self._dirty = True
+
+    def set_item_motion_rect(self, key: str, motion_rect: pygame.Rect) -> None:
+        item = self._item_map.get(key)
+        if item is None:
+            return
+        rect = item[0] if isinstance(item, tuple) and item else None
+        if not isinstance(rect, pygame.Rect):
+            return
+        self.ensure_ui_atom(
+            self._item_node_key(key),
+            rect,
+            motion_rect=motion_rect,
+            parent_key=self._panel_root_node_key(),
+        )
+
+    def mark_item_dirty(self, key: str) -> None:
+        item = self._item_map.get(key)
+        if item is None:
+            return
+        rect = item[0] if isinstance(item, tuple) and item else None
+        self.mark_ui_node_dirty(self._item_node_key(key), rect)
+
+    def mark_item_group_dirty(self, *keys: str) -> None:
+        for key in keys:
+            self.mark_item_dirty(key)
+
+    def mark_slider_dirty(self, key: str) -> None:
+        base_item = self._item_map.get(key)
+        if base_item and isinstance(base_item, tuple) and isinstance(base_item[0], pygame.Rect):
+            self.set_item_motion_rect(f"{key}_thumb", base_item[0])
+        track_item = self._item_map.get(f"{key}_track")
+        if track_item and isinstance(track_item, tuple) and isinstance(track_item[0], pygame.Rect):
+            self.set_item_motion_rect(f"{key}_track", track_item[0])
+        self.mark_item_group_dirty(
+            key,
+            f"{key}_track",
+            f"{key}_thumb",
+            f"{key}_value",
+            f"{key}_minus",
+            f"{key}_plus",
+        )
+
+    def collect_ui_dirty_rects(self) -> list[pygame.Rect]:
+        return self.ui_tree.collect_dirty_rects()
+
+    def invalidate_panel_rect(self) -> None:
+        surf = pygame.display.get_surface()
+        if surf is not None:
+            self.ui_tree.invalidate_all(self.panel_rect)
+        else:
+            self.ui_tree.invalidate_all()
+        self._dirty = True
+
+    def snapshot_gl_atoms(self, panel_surf: pygame.Surface) -> tuple[pygame.Surface, list[UIAtom]]:
+        """Split a panel surface into a background layer plus atom surfaces."""
+        bg = panel_surf.copy()
+        viewport = pygame.Rect(0, 0, panel_surf.get_width(), panel_surf.get_height())
+        visible_atoms: list[UIAtom] = []
+        for atom in self.ui_tree.iter_atoms():
+            if not atom.takeover:
+                continue
+            local_motion = pygame.Rect(atom.motion_rect)
+            local_motion.y -= int(self._panel_scroll_y)
+            clipped = local_motion.clip(viewport)
+            if clipped.w <= 0 or clipped.h <= 0:
+                atom.visible_rect = pygame.Rect(0, 0, 0, 0)
+                continue
+            atom.visible_rect = clipped
+            atom.surface = panel_surf.subsurface(clipped).copy()
+            if atom.background_surface is None or atom.background_surface.get_size() != clipped.size:
+                atom.background_surface = pygame.Surface(clipped.size, pygame.SRCALPHA)
+            atom.background_surface.fill((0, 0, 0, 0))
+            bg.fill((0, 0, 0, 0), clipped)
+            visible_atoms.append(atom)
+        return bg, visible_atoms
 
     def _ensure_font(self) -> None:
         if self.font is None:
@@ -6630,8 +7015,11 @@ class Panel:
 
     @property
     def panel_rect(self) -> pygame.Rect:
-        sw = pygame.display.get_surface().get_width()
-        sh = pygame.display.get_surface().get_height()
+        surf = pygame.display.get_surface()
+        if surf is None:
+            return pygame.Rect(0, self._top_offset, self.PANEL_W, 0)
+        sw = surf.get_width()
+        sh = surf.get_height()
         top = self._top_offset
         if self.side == "left":
             return pygame.Rect(0, top, self.PANEL_W, sh - top)
@@ -7141,8 +7529,8 @@ class FieldTabPanel(Panel):
                 frac = max(0.0, min(1.0, frac))
                 thumb_x = track_x + int(frac * track_w)
                 thc = (70, 80, 100) if greyed else (120, 140, 200)
-                pygame.draw.rect(surf, thc,
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, thc, thumb_r)
 
                 # Plus button
                 plus_r = pygame.Rect(track_end + 2, y + 2, BTN_W,
@@ -7158,11 +7546,17 @@ class FieldTabPanel(Panel):
                 # Value label
                 vc = (100, 100, 100) if greyed else (200, 200, 200)
                 vtxt = font.render(fmt.format(val), True, vc)
-                surf.blit(vtxt, (plus_r.x + BTN_W + 4, y + 2))
+                value_r = pygame.Rect(plus_r.x + BTN_W + 4, y + 2,
+                                      vtxt.get_width(), max(self.ROW_H - 4, vtxt.get_height()))
+                surf.blit(vtxt, value_r.topleft)
 
                 if not greyed:
                     self._item_map[f"{key}_minus"] = (minus_r, None)
                     self._item_map[f"{key}_plus"] = (plus_r, None)
+                    self._item_map[f"{key}_track"] = (
+                        pygame.Rect(track_x, y + 8, track_w, 6), None)
+                    self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                    self._item_map[f"{key}_value"] = (value_r, None)
                     self._item_map[key] = (
                         pygame.Rect(track_x, y, track_w, self.ROW_H),
                         (vmin, vmax))
@@ -7234,6 +7628,7 @@ class FieldTabPanel(Panel):
                         cfg.gamma = gd.gamma
                         cfg.scale = gd.scale
                     cfg.use_global = not cfg.use_global
+                    self.mark_item_dirty("f_custom")
                     return True
 
             if "save_view_png16" in self._item_map:
@@ -7250,6 +7645,7 @@ class FieldTabPanel(Panel):
                             self._status_msg = f"Save error: {exc}"
                     else:
                         self._status_msg = "Save handler missing"
+                    self.mark_item_dirty("save_view_png16")
                     return True
 
             if "export_and_resize" in self._item_map:
@@ -7277,6 +7673,7 @@ class FieldTabPanel(Panel):
                                 self._status_msg = f"Resize error: {exc}"
                         else:
                             self._status_msg = "Resize handler missing"
+                    self.mark_item_dirty("export_and_resize")
                     return True
 
             # Dropdowns
@@ -7286,6 +7683,7 @@ class FieldTabPanel(Panel):
                     rect, opts = self._item_map[key]
                     if rect.collidepoint(lx, ly):
                         self._open_dropdown(key, opts, rect, pr)
+                        self.mark_item_dirty(key)
                         return True
 
             # Slider +/- buttons and track drag — collect all slider keys
@@ -7303,11 +7701,13 @@ class FieldTabPanel(Panel):
                     rect, _ = self._item_map[minus_k]
                     if rect.collidepoint(lx, ly):
                         self._nudge_slider(key, -1)
+                        self.mark_slider_dirty(key)
                         return True
                 if plus_k in self._item_map:
                     rect, _ = self._item_map[plus_k]
                     if rect.collidepoint(lx, ly):
                         self._nudge_slider(key, +1)
+                        self.mark_slider_dirty(key)
                         return True
 
             # Slider track drag
@@ -7317,6 +7717,7 @@ class FieldTabPanel(Panel):
                     if rect.collidepoint(lx, ly):
                         self._dragging = key
                         self._update_slider(key, lx, rect, vmin, vmax)
+                        self.mark_slider_dirty(key)
                         return True
 
             return True  # consumed (in panel area)
@@ -7340,6 +7741,7 @@ class FieldTabPanel(Panel):
                     if key in self._item_map:
                         rect, (vmin, vmax) = self._item_map[key]
                         self._update_slider(key, lx, rect, vmin, vmax)
+                        self.mark_slider_dirty(key)
                 return True
             mx, my = event.pos
             if pr.collidepoint(mx, my):
@@ -7568,8 +7970,12 @@ class HybridViewPanel(Panel):
                 frac = (value - vmin) / max(vmax - vmin, 1e-9)
                 frac = max(0.0, min(1.0, frac))
                 thumb_x = track.x + int(round(frac * track.w))
-                pygame.draw.rect(surf, (120, 140, 200),
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, (120, 140, 200), thumb_r)
+                value_r = pygame.Rect(val_x, y + 3, val_txt.get_width(), max(self.ROW_H - 4, val_txt.get_height()))
+                self._item_map[f"{key}_track"] = (track, None)
+                self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                self._item_map[f"{key}_value"] = (value_r, None)
                 self._item_map[key] = (
                     pygame.Rect(track.x, y, track.w, self.ROW_H),
                     (vmin, vmax),
@@ -7593,10 +7999,12 @@ class HybridViewPanel(Panel):
                     continue
                 if meta is None:
                     setattr(self.config, key, not getattr(self.config, key))
+                    self.mark_item_dirty(key)
                     self.on_change()
                     return True
                 self._dragging = key
                 self._update_slider(key, lx, rect, meta[0], meta[1])
+                self.mark_slider_dirty(key)
                 return True
             return True
 
@@ -7618,6 +8026,7 @@ class HybridViewPanel(Panel):
                 lx = mx - pr.x
                 rect, meta = self._item_map[self._dragging]
                 self._update_slider(self._dragging, lx, rect, meta[0], meta[1])
+                self.mark_slider_dirty(self._dragging)
                 return True
             mx, my = event.pos
             return pr.collidepoint(mx, my)
@@ -7814,8 +8223,12 @@ class TimeScaleViewPanel(Panel):
                 frac = (value - vmin) / max(vmax - vmin, 1e-9)
                 frac = max(0.0, min(1.0, frac))
                 thumb_x = track.x + int(round(frac * track.w))
-                pygame.draw.rect(surf, (120, 140, 200),
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, (120, 140, 200), thumb_r)
+                value_r = pygame.Rect(val_x, y + 3, val_txt.get_width(), max(rh - 4, val_txt.get_height()))
+                self._item_map[f"{key}_track"] = (track, None)
+                self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                self._item_map[f"{key}_value"] = (value_r, None)
                 self._item_map[key] = (
                     pygame.Rect(track.x, y, track.w, rh),
                     (vmin, vmax),
@@ -7856,8 +8269,12 @@ class TimeScaleViewPanel(Panel):
                 thumb_x = track.x + int(round(frac * track.w))
                 thumb_col = (100, 200, 120) if abs(log2_val) < 0.05 \
                             else (120, 140, 200)
-                pygame.draw.rect(surf, thumb_col,
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, thumb_col, thumb_r)
+                value_r = pygame.Rect(val_x, y + 3, val_txt.get_width(), max(rh - 4, val_txt.get_height()))
+                self._item_map[f"{key}_track"] = (track, None)
+                self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                self._item_map[f"{key}_value"] = (value_r, None)
 
                 self._item_map[key] = (
                     pygame.Rect(track.x, y, track.w, rh),
@@ -7880,6 +8297,12 @@ class TimeScaleViewPanel(Panel):
                 surf.blit(ptxt, (play_rect.x + (btn_w - ptxt.get_width()) // 2,
                                  play_rect.y + (rh - ptxt.get_height()) // 2))
                 self._item_map["_play"] = (play_rect, "play")
+                self._item_map["_play_label"] = (
+                    pygame.Rect(play_rect.x + (btn_w - ptxt.get_width()) // 2,
+                                play_rect.y + (rh - ptxt.get_height()) // 2,
+                                ptxt.get_width(), ptxt.get_height()),
+                    None,
+                )
 
                 # Stop button
                 stop_x = self.PAD * 2 + btn_w
@@ -7894,6 +8317,12 @@ class TimeScaleViewPanel(Panel):
                 surf.blit(stxt, (stop_rect.x + (btn_w - stxt.get_width()) // 2,
                                  stop_rect.y + (rh - stxt.get_height()) // 2))
                 self._item_map["_stop"] = (stop_rect, "stop")
+                self._item_map["_stop_label"] = (
+                    pygame.Rect(stop_rect.x + (btn_w - stxt.get_width()) // 2,
+                                stop_rect.y + (rh - stxt.get_height()) // 2,
+                                stxt.get_width(), stxt.get_height()),
+                    None,
+                )
 
             y += rh + 2
 
@@ -7918,17 +8347,21 @@ class TimeScaleViewPanel(Panel):
                 if meta == "play":
                     if self._status not in ("playing", "synthesizing"):
                         self.on_play()
+                    self.mark_item_group_dirty("_play", "_play_label", "_stop", "_stop_label")
                     return True
                 if meta == "stop":
                     self.on_stop()
+                    self.mark_item_group_dirty("_play", "_play_label", "_stop", "_stop_label")
                     return True
                 if meta is None:
                     if self.viewport_widget.handle_toggle(
                         key, self.config.viewport_boundary
                     ):
+                        self.mark_item_dirty(key)
                         return True
                     # Toggle boolean config field
                     setattr(self.config, key, not getattr(self.config, key))
+                    self.mark_item_dirty(key)
                     return True
                 # Log-slider drag
                 self._dragging = key
@@ -7936,6 +8369,7 @@ class TimeScaleViewPanel(Panel):
                     self._update_log_slider(key, lx, rect, meta[0], meta[1])
                 else:
                     self._update_slider(key, lx, rect, meta[0], meta[1])
+                self.mark_slider_dirty(key)
                 return True
             return True
 
@@ -7960,6 +8394,7 @@ class TimeScaleViewPanel(Panel):
                 else:
                     self._update_slider(self._dragging, lx, rect,
                                         meta[0], meta[1])
+                self.mark_slider_dirty(self._dragging)
                 return True
             mx, my = event.pos
             return pr.collidepoint(mx, my)
@@ -8196,8 +8631,12 @@ class FilterbankScalerPanel(Panel):
                 frac = (value - vmin) / max(vmax - vmin, 1e-9)
                 frac = max(0.0, min(1.0, frac))
                 thumb_x = track.x + int(round(frac * track.w))
-                pygame.draw.rect(surf, (120, 140, 200),
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, (120, 140, 200), thumb_r)
+                value_r = pygame.Rect(val_x, y + 3, val_txt.get_width(), max(rh - 4, val_txt.get_height()))
+                self._item_map[f"{key}_track"] = (track, None)
+                self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                self._item_map[f"{key}_value"] = (value_r, None)
                 self._item_map[key] = (
                     pygame.Rect(track.x, y, track.w, rh),
                     (vmin, vmax),
@@ -8228,8 +8667,12 @@ class FilterbankScalerPanel(Panel):
                 frac = max(0.0, min(1.0, frac))
                 thumb_x = track.x + int(round(frac * track.w))
                 thumb_col = (100, 200, 120) if abs(log2_val) < 0.05 else (120, 140, 200)
-                pygame.draw.rect(surf, thumb_col,
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, thumb_col, thumb_r)
+                value_r = pygame.Rect(val_x, y + 3, val_txt.get_width(), max(rh - 4, val_txt.get_height()))
+                self._item_map[f"{key}_track"] = (track, None)
+                self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                self._item_map[f"{key}_value"] = (value_r, None)
                 self._item_map[key] = (
                     pygame.Rect(track.x, y, track.w, rh),
                     (lo, hi),
@@ -8256,6 +8699,14 @@ class FilterbankScalerPanel(Panel):
                                  stop_rect.y + (rh - stxt.get_height()) // 2))
                 self._item_map["_play"] = (play_rect, "play")
                 self._item_map["_stop"] = (stop_rect, "stop")
+                self._item_map["_play_label"] = (
+                    pygame.Rect(play_rect.x + (btn_w - ptxt.get_width()) // 2,
+                                play_rect.y + (rh - ptxt.get_height()) // 2,
+                                ptxt.get_width(), ptxt.get_height()), None)
+                self._item_map["_stop_label"] = (
+                    pygame.Rect(stop_rect.x + (btn_w - stxt.get_width()) // 2,
+                                stop_rect.y + (rh - stxt.get_height()) // 2,
+                                stxt.get_width(), stxt.get_height()), None)
 
             y += rh + 2
 
@@ -8273,6 +8724,7 @@ class FilterbankScalerPanel(Panel):
                     if ir.collidepoint(mx, my):
                         self._select_dropdown(i)
                         return True
+                self.mark_item_group_dirty(self._active_dropdown, f"{self._active_dropdown}_value")
                 self._active_dropdown = None
                 return True
             if not pr.collidepoint(mx, my):
@@ -8285,9 +8737,11 @@ class FilterbankScalerPanel(Panel):
                 if meta == "play":
                     if self._status not in ("playing", "synthesizing"):
                         self.on_play()
+                    self.mark_item_group_dirty("_play", "_play_label", "_stop", "_stop_label")
                     return True
                 if meta == "stop":
                     self.on_stop()
+                    self.mark_item_group_dirty("_play", "_play_label", "_stop", "_stop_label")
                     return True
                 if meta == "dropdown":
                     self._open_dropdown(
@@ -8296,19 +8750,23 @@ class FilterbankScalerPanel(Panel):
                          for m in FILTERBANK_SCALER_METHODS],
                         pygame.Rect(rect.x, rect.y + rect.h, rect.w, 0),
                     )
+                    self.mark_item_dirty(key)
                     return True
                 if meta is None:
                     if self.viewport_widget.handle_toggle(
                         key, self.config.viewport_boundary
                     ):
+                        self.mark_item_dirty(key)
                         return True
                     setattr(self.config, key, not getattr(self.config, key))
+                    self.mark_item_dirty(key)
                     return True
                 self._dragging = key
                 if key == "scale_log2":
                     self._update_log_slider(key, lx, rect, meta[0], meta[1])
                 else:
                     self._update_slider(key, lx, rect, meta[0], meta[1])
+                self.mark_slider_dirty(key)
                 return True
             return True
 
@@ -8331,6 +8789,7 @@ class FilterbankScalerPanel(Panel):
                     self._update_log_slider(self._dragging, lx, rect, meta[0], meta[1])
                 else:
                     self._update_slider(self._dragging, lx, rect, meta[0], meta[1])
+                self.mark_slider_dirty(self._dragging)
                 return True
             mx, my = event.pos
             return pr.collidepoint(mx, my)
@@ -8349,6 +8808,7 @@ class FilterbankScalerPanel(Panel):
                     l2min, l2max = self._log2_range()
                     self.config.scale_log2 = round(
                         max(l2min, min(l2max, cur + step)), 3)
+                    self.mark_slider_dirty("scale_log2")
                     return True
             return self._handle_panel_wheel(event)
 
@@ -8589,8 +9049,12 @@ class FFTScalerPanel(Panel):
                 frac = (value - vmin) / max(vmax - vmin, 1e-9)
                 frac = max(0.0, min(1.0, frac))
                 thumb_x = track.x + int(round(frac * track.w))
-                pygame.draw.rect(surf, (120, 140, 200),
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, (120, 140, 200), thumb_r)
+                value_r = pygame.Rect(val_x, y + 3, val_txt.get_width(), max(rh - 4, val_txt.get_height()))
+                self._item_map[f"{key}_track"] = (track, None)
+                self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                self._item_map[f"{key}_value"] = (value_r, None)
                 self._item_map[key] = (
                     pygame.Rect(track.x, y, track.w, rh),
                     (vmin, vmax),
@@ -8620,8 +9084,12 @@ class FFTScalerPanel(Panel):
                 frac = max(0.0, min(1.0, frac))
                 thumb_x = track.x + int(round(frac * track.w))
                 thumb_col = (100, 200, 120) if abs(log2_val) < 0.05 else (120, 140, 200)
-                pygame.draw.rect(surf, thumb_col,
-                                 pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+                thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+                pygame.draw.rect(surf, thumb_col, thumb_r)
+                value_r = pygame.Rect(val_x, y + 3, val_txt.get_width(), max(rh - 4, val_txt.get_height()))
+                self._item_map[f"{key}_track"] = (track, None)
+                self._item_map[f"{key}_thumb"] = (thumb_r, None)
+                self._item_map[f"{key}_value"] = (value_r, None)
                 self._item_map[key] = (
                     pygame.Rect(track.x, y, track.w, rh),
                     (l2min, l2max),
@@ -8647,6 +9115,14 @@ class FFTScalerPanel(Panel):
                                  stop_rect.y + (rh - stxt.get_height()) // 2))
                 self._item_map["_play"] = (play_rect, "play")
                 self._item_map["_stop"] = (stop_rect, "stop")
+                self._item_map["_play_label"] = (
+                    pygame.Rect(play_rect.x + (btn_w - ptxt.get_width()) // 2,
+                                play_rect.y + (rh - ptxt.get_height()) // 2,
+                                ptxt.get_width(), ptxt.get_height()), None)
+                self._item_map["_stop_label"] = (
+                    pygame.Rect(stop_rect.x + (btn_w - stxt.get_width()) // 2,
+                                stop_rect.y + (rh - stxt.get_height()) // 2,
+                                stxt.get_width(), stxt.get_height()), None)
             y += rh + 2
         return surf
 
@@ -8661,6 +9137,7 @@ class FFTScalerPanel(Panel):
                     if ir.collidepoint(mx, my):
                         self._select_dropdown(i)
                         return True
+                self.mark_item_group_dirty(self._active_dropdown, f"{self._active_dropdown}_value")
                 self._active_dropdown = None
                 return True
             if not pr.collidepoint(mx, my):
@@ -8673,9 +9150,11 @@ class FFTScalerPanel(Panel):
                 if meta == "play":
                     if self._status not in ("playing", "synthesizing"):
                         self.on_play()
+                    self.mark_item_group_dirty("_play", "_play_label", "_stop", "_stop_label")
                     return True
                 if meta == "stop":
                     self.on_stop()
+                    self.mark_item_group_dirty("_play", "_play_label", "_stop", "_stop_label")
                     return True
                 if meta == "dropdown":
                     self._open_dropdown(
@@ -8683,19 +9162,23 @@ class FFTScalerPanel(Panel):
                         [FFT_SCALER_METHOD_LABELS[m] for m in FFT_SCALER_METHODS],
                         pygame.Rect(rect.x, rect.y + rect.h, rect.w, 0),
                     )
+                    self.mark_item_dirty(key)
                     return True
                 if meta is None:
                     if self.viewport_widget.handle_toggle(
                         key, self.config.viewport_boundary
                     ):
+                        self.mark_item_dirty(key)
                         return True
                     setattr(self.config, key, not getattr(self.config, key))
+                    self.mark_item_dirty(key)
                     return True
                 self._dragging = key
                 if key in ("time_scale_log2", "pitch_scale_log2"):
                     self._update_log_slider(key, lx, rect, meta[0], meta[1])
                 else:
                     self._update_slider(key, lx, rect, meta[0], meta[1])
+                self.mark_slider_dirty(key)
                 return True
             return True
 
@@ -8718,6 +9201,7 @@ class FFTScalerPanel(Panel):
                     self._update_log_slider(self._dragging, lx, rect, meta[0], meta[1])
                 else:
                     self._update_slider(self._dragging, lx, rect, meta[0], meta[1])
+                self.mark_slider_dirty(self._dragging)
                 return True
             mx, my = event.pos
             return pr.collidepoint(mx, my)
@@ -8736,6 +9220,7 @@ class FFTScalerPanel(Panel):
                         cur = getattr(self.config, key)
                         setattr(self.config, key, round(
                             max(meta[0], min(meta[1], cur + step)), 3))
+                        self.mark_slider_dirty(key)
                         return True
             return self._handle_panel_wheel(event)
 
@@ -9602,6 +10087,9 @@ class SynthesisPanel(Panel):
                           else "?", True, (220, 220, 220))
         surf.blit(txt, (btn_x + 4, y + 3))
         self._ctrl_rects[key] = btn_rect
+        self._item_map[f"{key}_label"] = (pygame.Rect(self.PAD, y + 2, lbl.get_width(), lbl.get_height()), None)
+        self._item_map[key] = (btn_rect, options)
+        self._item_map[f"{key}_value"] = (pygame.Rect(btn_x + 4, y + 3, txt.get_width(), txt.get_height()), None)
         return y + self.ROW_H + 2
 
     def _render_toggle_btn(self, surf: pygame.Surface, font: Any,
@@ -9615,6 +10103,8 @@ class SynthesisPanel(Panel):
         txt = font.render(mark + label, True, (220, 220, 220))
         surf.blit(txt, (self.PAD + 4, y + 3))
         self._ctrl_rects[key] = btn_rect
+        self._item_map[key] = (btn_rect, None)
+        self._item_map[f"{key}_label"] = (pygame.Rect(self.PAD + 4, y + 3, txt.get_width(), txt.get_height()), None)
         return y + self.ROW_H + 2
 
     def _render_action_btn(self, surf: pygame.Surface, font: Any,
@@ -9629,6 +10119,8 @@ class SynthesisPanel(Panel):
         txt = font.render(label, True, tc)
         surf.blit(txt, (x + 4, y + 3))
         self._ctrl_rects[key] = btn_rect
+        self._item_map[key] = (btn_rect, None)
+        self._item_map[f"{key}_label"] = (pygame.Rect(x + 4, y + 3, txt.get_width(), txt.get_height()), None)
         return x + bw + 4
 
     def render(self) -> pygame.Surface | None:
@@ -9641,6 +10133,7 @@ class SynthesisPanel(Panel):
         self._play_rects.clear()
         self._del_rects.clear()
         self._ctrl_rects.clear()
+        self._item_map.clear()
 
         # --- Controls section ---
         cur_phase = self._get_phase_mode()
@@ -9697,6 +10190,8 @@ class SynthesisPanel(Panel):
                               r.y + 3))
             self._ctrl_rects["txp_f0_minus"] = minus_rect
             self._ctrl_rects["txp_f0_plus"] = plus_rect
+            self._item_map["txp_f0_minus"] = (minus_rect, None)
+            self._item_map["txp_f0_plus"] = (plus_rect, None)
             y += self.ROW_H + 2
 
             # Dst F1
@@ -9715,6 +10210,8 @@ class SynthesisPanel(Panel):
                               r.y + 3))
             self._ctrl_rects["txp_f1_minus"] = minus_rect
             self._ctrl_rects["txp_f1_plus"] = plus_rect
+            self._item_map["txp_f1_minus"] = (minus_rect, None)
+            self._item_map["txp_f1_plus"] = (plus_rect, None)
             y += self.ROW_H + 2
 
         # Section: Synthesize button
@@ -9781,6 +10278,7 @@ class SynthesisPanel(Panel):
                     surf.blit(st, (bx + col_w // 2 - st.get_width() // 2,
                                    y + 3))
                     self._ctrl_rects[btn_key] = br
+                    self._item_map[btn_key] = (br, None)
                     bx += col_w
                 y += self.ROW_H + 2
 
@@ -9815,6 +10313,7 @@ class SynthesisPanel(Panel):
                 lbl = font.render(play_label, True, (255, 255, 255))
                 surf.blit(lbl, (bx + 4, y_cur + 3))
                 self._play_rects[sel_job.job_id] = pr
+                self._item_map[f"job_play_{sel_job.job_id}"] = (pr, None)
                 bx += self.BTN_W + 4
             if sel_job.duration > 0:
                 dur_txt = f"{sel_job.duration:.2f}s"
@@ -9832,6 +10331,7 @@ class SynthesisPanel(Panel):
             xl = font.render("X", True, (255, 255, 255))
             surf.blit(xl, (del_x + 7, y_cur + 3))
             self._del_rects[sel_job.job_id] = dr
+            self._item_map[f"job_del_{sel_job.job_id}"] = (dr, None)
             y_cur += self.ROW_H + 4
 
         # Crop the oversized surface to actual content
@@ -9868,6 +10368,7 @@ class SynthesisPanel(Panel):
                     if ir.collidepoint(mx, my):
                         self._select_dropdown(i)
                         return True
+                self.mark_item_group_dirty(self._active_dropdown, f"{self._active_dropdown}_value")
                 self._active_dropdown = None
                 return True
 
@@ -9942,6 +10443,11 @@ class SynthesisPanel(Panel):
                         if len(parts) == 4:
                             _, audio_ch, role, source = parts
                             self.channel_routing.set(audio_ch, role, source)
+                            self.mark_item_group_dirty(*[
+                                f"rt_{audio_ch}_{role}_{src}" for src in ROUTE_SOURCES
+                            ])
+                    else:
+                        self.mark_item_dirty(key)
 
                     return True
 
@@ -9949,10 +10455,12 @@ class SynthesisPanel(Panel):
             for jid, rect in self._play_rects.items():
                 if rect.collidepoint(lx, ly):
                     self._on_play_click(jid)
+                    self.mark_item_dirty(f"job_play_{jid}")
                     return True
             for jid, rect in self._del_rects.items():
                 if rect.collidepoint(lx, ly):
                     self.remove_job(jid)
+                    self.mark_item_dirty(f"job_del_{jid}")
                     return True
 
             hit = self.job_list.handle_click(lx, ly)
@@ -9980,6 +10488,8 @@ class SynthesisPanel(Panel):
         self._active_dropdown = key
         self._dropdown_opts = options
         self._dropdown_rect = anchor
+        self.mark_item_group_dirty(key, f"{key}_value")
+        self.mark_item_group_dirty(key, f"{key}_value")
 
     def _select_dropdown(self, idx: int) -> None:
         key = self._active_dropdown
@@ -9992,6 +10502,8 @@ class SynthesisPanel(Panel):
             self._set_fb_n_bands(self._FB_BAND_VALUES[idx])
         elif key == "mono_mix" and 0 <= idx < len(MONO_MIX_MODES):
             self.channel_routing.mono_mix_mode = idx
+        if key:
+            self.mark_item_group_dirty(key, f"{key}_value")
 
 
     def render_dropdown_overlay(self) -> pygame.Surface | None:
@@ -10020,6 +10532,10 @@ class SynthesisPanel(Panel):
             pygame.draw.rect(overlay, (60, 60, 80), (0, iy, ow, item_h), 1)
             txt = font.render(label, True, (220, 220, 220))
             overlay.blit(txt, (4, iy + 3))
+            self._item_map[f"{self._active_dropdown}_dd_{i}"] = (
+                pygame.Rect(self._dropdown_rect.x, self._dropdown_rect.y + iy, ow, item_h),
+                None,
+            )
         return overlay
 
     def _on_play_click(self, job_id: int) -> None:
@@ -10028,6 +10544,7 @@ class SynthesisPanel(Panel):
             self._playing_job_id = None
             if self.on_stop:
                 self.on_stop()
+            self.mark_item_dirty(f"job_play_{job_id}")
             return
         with self._lock:
             job = next((j for j in self.jobs if j.job_id == job_id), None)
@@ -10036,6 +10553,7 @@ class SynthesisPanel(Panel):
         self._playing_job_id = job_id
         if self.on_play:
             self.on_play(job)
+        self.mark_item_dirty(f"job_play_{job_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -10240,6 +10758,9 @@ class ImageInputPanel(Panel):
             True, (220, 220, 220))
         surf.blit(ct, (btn_x + 4, y + 3))
         self._ctrl_rects["conv_mode"] = btn_rect
+        self._item_map["conv_mode"] = (btn_rect, _IMG_CONVERT_MODES)
+        self._item_map["conv_mode_label"] = (pygame.Rect(self.PAD, y + 2, lbl.get_width(), lbl.get_height()), None)
+        self._item_map["conv_mode_value"] = (pygame.Rect(btn_x + 4, y + 3, ct.get_width(), ct.get_height()), None)
         y += self.ROW_H + 2
 
         # Section: Interpolation dropdown
@@ -10254,6 +10775,9 @@ class ImageInputPanel(Panel):
                          True, (220, 220, 220))
         surf.blit(it, (btn_x + 4, y + 3))
         self._ctrl_rects["interp"] = btn_rect2
+        self._item_map["interp"] = (btn_rect2, _IMG_INTERP_MODES)
+        self._item_map["interp_label"] = (pygame.Rect(self.PAD, y + 2, lbl2.get_width(), lbl2.get_height()), None)
+        self._item_map["interp_value"] = (pygame.Rect(btn_x + 4, y + 3, it.get_width(), it.get_height()), None)
         y += self.ROW_H + 2
 
         # Section: Sliders for bins, frames, freq, time
@@ -10286,6 +10810,10 @@ class ImageInputPanel(Panel):
             surf.blit(p_lbl, (plus_r.x + 5, y + 3))
             self._ctrl_rects[f"{key}_minus"] = minus_r
             self._ctrl_rects[f"{key}_plus"] = plus_r
+            self._item_map[f"{key}_label"] = (pygame.Rect(self.PAD, y + 3, sl.get_width(), sl.get_height()), None)
+            self._item_map[f"{key}_value"] = (pygame.Rect(self.PAD + 72, y + 3, vt.get_width(), vt.get_height()), None)
+            self._item_map[f"{key}_minus"] = (minus_r, None)
+            self._item_map[f"{key}_plus"] = (plus_r, None)
             y += self.ROW_H + 2
 
         # Convert button
@@ -10296,6 +10824,8 @@ class ImageInputPanel(Panel):
         cl = font.render("Convert Image", True, (220, 220, 220))
         surf.blit(cl, (w // 2 - cl.get_width() // 2, y + 3))
         self._ctrl_rects["convert_go"] = conv_btn
+        self._item_map["convert_go"] = (conv_btn, None)
+        self._item_map["convert_go_label"] = (pygame.Rect(w // 2 - cl.get_width() // 2, y + 3, cl.get_width(), cl.get_height()), None)
         y += self.ROW_H + 4
 
         # Status line
@@ -10353,8 +10883,16 @@ class ImageInputPanel(Panel):
                                             _IMG_INTERP_MODES, rect)
                     elif key == "convert_go":
                         self.convert_selected()
+                        self.mark_item_group_dirty("convert_go", "convert_go_label")
                     elif key.endswith("_minus") or key.endswith("_plus"):
                         self._nudge_slider(key)
+                        base = key.rsplit("_", 1)[0]
+                        self.mark_item_group_dirty(
+                            f"{base}_label",
+                            f"{base}_value",
+                            f"{base}_minus",
+                            f"{base}_plus",
+                        )
                     return True
 
             return True
@@ -10387,6 +10925,8 @@ class ImageInputPanel(Panel):
             self.convert_mode_idx = idx
         elif key == "interp" and 0 <= idx < len(_IMG_INTERP_MODES):
             self.interp_idx = idx
+        if key:
+            self.mark_item_group_dirty(key, f"{key}_value")
 
     def _nudge_slider(self, btn_key: str) -> None:
         """Handle +/- button clicks for value sliders."""
@@ -10435,6 +10975,10 @@ class ImageInputPanel(Panel):
             self._dropdown_item_rects.append(rect)
             txt = font.render(label, True, (220, 220, 220))
             overlay.blit(txt, (4, iy + 3))
+            self._item_map[f"{self._active_dropdown}_dd_{i}"] = (
+                pygame.Rect(self._dropdown_rect.x, self._dropdown_rect.y + self._dropdown_rect.h + iy, ow, item_h),
+                None,
+            )
             if i < len(opts) - 1:
                 pygame.draw.line(overlay, (60, 60, 70),
                                  (0, iy + item_h - 1),
@@ -10878,6 +11422,7 @@ class SignalGeneratorPanel(Panel):
         font = self.font
         w = self.PANEL_W
         self._ctrl_rects.clear()
+        self._item_map.clear()
         mode = _SIG_GEN_MODES[self.gen_mode_idx]
 
         est_h = 1200
@@ -10897,6 +11442,9 @@ class SignalGeneratorPanel(Panel):
         ct = font.render(mode, True, (220, 220, 220))
         surf.blit(ct, (btn_x + 4, y + 3))
         self._ctrl_rects["gen_mode"] = r
+        self._item_map["gen_mode"] = (r, _SIG_GEN_MODES)
+        self._item_map["gen_mode_label"] = (pygame.Rect(self.PAD, y + 2, lbl.get_width(), lbl.get_height()), None)
+        self._item_map["gen_mode_value"] = (pygame.Rect(btn_x + 4, y + 3, ct.get_width(), ct.get_height()), None)
         y += self.ROW_H + 4
 
         # Separator
@@ -10959,6 +11507,8 @@ class SignalGeneratorPanel(Panel):
         gl = font.render(btn_label, True, (220, 220, 220))
         surf.blit(gl, (w // 2 - gl.get_width() // 2, y + 5))
         self._ctrl_rects["go"] = go_btn
+        self._item_map["go"] = (go_btn, None)
+        self._item_map["go_label"] = (pygame.Rect(w // 2 - gl.get_width() // 2, y + 5, gl.get_width(), gl.get_height()), None)
         y += self.ROW_H + 8
 
         # Status
@@ -11029,6 +11579,7 @@ class SignalGeneratorPanel(Panel):
         toggle_r = pygame.Rect(self.PAD, y, w - 2 * self.PAD, self.ROW_H)
         surf.blit(ht, (self.PAD, y + 2))
         self._ctrl_rects["harmonics_toggle"] = toggle_r
+        self._item_map["harmonics_toggle"] = (toggle_r, None)
         y += self.ROW_H
 
         if self._harmonics_expanded:
@@ -11046,6 +11597,7 @@ class SignalGeneratorPanel(Panel):
                 rm_l = font.render("×", True, (200, 180, 180))
                 surf.blit(rm_l, (rm_r.x + 5, y + 3))
                 self._ctrl_rects[f"h_rm_{hi}"] = rm_r
+                self._item_map[f"h_rm_{hi}"] = (rm_r, None)
 
                 # Amplitude +/- buttons
                 a_minus = pygame.Rect(w - self.PAD - 90, y, 20, self.ROW_H)
@@ -11060,6 +11612,8 @@ class SignalGeneratorPanel(Panel):
                           (a_plus.x + 5, y + 3))
                 self._ctrl_rects[f"h_amp_minus_{hi}"] = a_minus
                 self._ctrl_rects[f"h_amp_plus_{hi}"] = a_plus
+                self._item_map[f"h_amp_minus_{hi}"] = (a_minus, None)
+                self._item_map[f"h_amp_plus_{hi}"] = (a_plus, None)
 
                 y += self.ROW_H + 2
 
@@ -11080,6 +11634,8 @@ class SignalGeneratorPanel(Panel):
                           (ph_plus.x + 5, y + 3))
                 self._ctrl_rects[f"h_ph_minus_{hi}"] = ph_minus
                 self._ctrl_rects[f"h_ph_plus_{hi}"] = ph_plus
+                self._item_map[f"h_ph_minus_{hi}"] = (ph_minus, None)
+                self._item_map[f"h_ph_plus_{hi}"] = (ph_plus, None)
                 y += self.ROW_H + 2
 
             # Add harmonic button
@@ -11089,6 +11645,7 @@ class SignalGeneratorPanel(Panel):
             al = font.render("+ Add Harmonic", True, (180, 220, 180))
             surf.blit(al, (self.PAD + 4, y + 3))
             self._ctrl_rects["h_add"] = add_r
+            self._item_map["h_add"] = (add_r, None)
             y += self.ROW_H + 2
 
         return y
@@ -11122,6 +11679,10 @@ class SignalGeneratorPanel(Panel):
                   (plus_r.x + 5, y + 3))
         self._ctrl_rects[f"{key}_minus"] = minus_r
         self._ctrl_rects[f"{key}_plus"] = plus_r
+        self._item_map[f"{key}_label"] = (pygame.Rect(self.PAD, y + 3, sl.get_width(), sl.get_height()), None)
+        self._item_map[f"{key}_value"] = (pygame.Rect(self.PAD + 78, y + 3, vt.get_width(), vt.get_height()), None)
+        self._item_map[f"{key}_minus"] = (minus_r, None)
+        self._item_map[f"{key}_plus"] = (plus_r, None)
         return y + self.ROW_H + 2
 
     def _render_dropdown_row(self, surf: pygame.Surface,
@@ -11141,6 +11702,9 @@ class SignalGeneratorPanel(Panel):
         ct = font.render(current, True, (220, 220, 220))
         surf.blit(ct, (btn_x + 4, y + 3))
         self._ctrl_rects[key] = r
+        self._item_map[key] = (r, None)
+        self._item_map[f"{key}_label"] = (pygame.Rect(self.PAD, y + 2, lbl.get_width(), lbl.get_height()), None)
+        self._item_map[f"{key}_value"] = (pygame.Rect(btn_x + 4, y + 3, ct.get_width(), ct.get_height()), None)
         return y + self.ROW_H + 2
 
     # -- events -------------------------------------------------------------
@@ -11213,24 +11777,36 @@ class SignalGeneratorPanel(Panel):
                                 self._ctrl_rects[key])
         elif key == "go":
             self._do_generate()
+            self.mark_item_group_dirty("go", "go_label")
         elif key == "harmonics_toggle":
             self._harmonics_expanded = not self._harmonics_expanded
+            self.mark_item_dirty("harmonics_toggle")
         elif key == "h_add":
             next_h = max(int(h[0]) for h in self.harmonics) + 1 \
                 if self.harmonics else 1
             self.harmonics.append([float(next_h), 0.5, 0.0])
+            self.mark_item_dirty("h_add")
         elif key.startswith("h_rm_"):
             idx = int(key[5:])
             if 0 <= idx < len(self.harmonics) and len(self.harmonics) > 1:
                 self.harmonics.pop(idx)
+                self.mark_item_dirty(key)
         elif key.endswith("_minus") or key.endswith("_plus"):
             self._nudge(key)
+            base = key.rsplit("_", 1)[0]
+            self.mark_item_group_dirty(
+                f"{base}_label",
+                f"{base}_value",
+                f"{base}_minus",
+                f"{base}_plus",
+            )
 
     def _open_dropdown(self, key: str, options: list[str],
                        anchor: pygame.Rect) -> None:
         self._active_dropdown = key
         self._dropdown_opts = options
         self._dropdown_rect = anchor
+        self.mark_item_group_dirty(key, f"{key}_value")
 
     def _select_dropdown(self, idx: int) -> None:
         key = self._active_dropdown
@@ -11245,6 +11821,8 @@ class SignalGeneratorPanel(Panel):
             self.bit_depth_idx = idx
         elif key == "channels" and 0 <= idx < len(_SIG_CHANNELS):
             self.channels_idx = idx
+        if key:
+            self.mark_item_group_dirty(key, f"{key}_value")
 
     def _nudge(self, btn_key: str) -> None:
         """Handle +/- button clicks."""
@@ -11323,6 +11901,10 @@ class SignalGeneratorPanel(Panel):
             self._dropdown_item_rects.append(rect)
             txt = font.render(label, True, (220, 220, 220))
             overlay.blit(txt, (4, iy + 3))
+            self._item_map[f"{self._active_dropdown}_dd_{i}"] = (
+                pygame.Rect(self._dropdown_rect.x, self._dropdown_rect.y + self._dropdown_rect.h + iy, ow, item_h),
+                None,
+            )
             if i < len(opts) - 1:
                 pygame.draw.line(overlay, (60, 60, 70),
                                  (0, iy + item_h - 1),
@@ -15673,6 +16255,7 @@ class SourcePanel(Panel):
                          (w, y + self.ROW_H - 1))
         surf.blit(txt, (2, y + 3))
         self._item_map[key] = (rect, None)
+        self._item_map[f"{key}_label"] = (pygame.Rect(2, y + 3, txt.get_width(), txt.get_height()), None)
         return y + self.ROW_H
 
     def _render_slider(self, surf: pygame.Surface, font: Any,
@@ -15708,8 +16291,11 @@ class SourcePanel(Panel):
             frac = (val - vmin) / max(vmax - vmin, 1e-9)
         frac = max(0.0, min(1.0, frac))
         thumb_x = track_x + int(frac * track_w)
-        pygame.draw.rect(surf, (120, 140, 200),
-                         pygame.Rect(thumb_x - 5, y + 3, 10, 16))
+        thumb_r = pygame.Rect(thumb_x - 5, y + 3, 10, 16)
+        track_r = pygame.Rect(track_x, y + 8, track_w, 6)
+        pygame.draw.rect(surf, (120, 140, 200), thumb_r)
+        self._item_map[f"{key}_track"] = (track_r, None)
+        self._item_map[f"{key}_thumb"] = (thumb_r, None)
 
         # Plus button
         plus_r = pygame.Rect(track_end + 2, y + 2, BTN_W, self.ROW_H - 4)
@@ -15726,7 +16312,9 @@ class SourcePanel(Panel):
                 True, (200, 200, 200))
         else:
             vtxt = font.render(fmt.format(val), True, (200, 200, 200))
-        surf.blit(vtxt, (plus_r.x + BTN_W + 4, y + 2))
+        value_r = pygame.Rect(plus_r.x + BTN_W + 4, y + 2, vtxt.get_width(), max(self.ROW_H - 4, vtxt.get_height()))
+        surf.blit(vtxt, value_r.topleft)
+        self._item_map[f"{key}_value"] = (value_r, None)
         self._item_map[key] = (
             pygame.Rect(track_x, y, track_w, self.ROW_H),
             (vmin, vmax, log))
@@ -15746,6 +16334,7 @@ class SourcePanel(Panel):
         txt = font.render(options[sel_idx], True, (220, 220, 220))
         surf.blit(txt, (btn_x + 4, y + 3))
         self._item_map[key] = (btn_rect, options)
+        self._item_map[f"{key}_label"] = (pygame.Rect(btn_x + 4, y + 3, txt.get_width(), txt.get_height()), None)
         return y + self.ROW_H + 2
 
     def _render_checkbox(self, surf: pygame.Surface, font: Any,
@@ -15767,6 +16356,8 @@ class SourcePanel(Panel):
         total_w = box_sz + 6 + txt.get_width() + 8
         click_rect = pygame.Rect(x, y, total_w, self.ROW_H)
         self._item_map[key] = (click_rect, None)
+        self._item_map[f"{key}_box"] = (box, None)
+        self._item_map[f"{key}_label"] = (pygame.Rect(x + box_sz + 6, y + 3, txt.get_width(), txt.get_height()), None)
         return x + total_w
 
     # ---- Signal Generator v2 synthesis -----------------------------------
@@ -17295,9 +17886,12 @@ class SourcePanel(Panel):
                         self._select_dropdown(self._active_dropdown,
                                               self._dropdown_opts[i])
                         break
+                if self._active_dropdown:
+                    self.mark_item_group_dirty(self._active_dropdown, f"{self._active_dropdown}_label")
                 self._active_dropdown = None
                 return True
             if self._active_dropdown:
+                self.mark_item_dirty(self._active_dropdown)
                 self._active_dropdown = None
 
             # Module slider drag start: check before handle_click to intercept
@@ -17333,41 +17927,49 @@ class SourcePanel(Panel):
                 rect, _ = self._item_map["wav_sources_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._wav_sources_expanded = not self._wav_sources_expanded
+                    self.mark_item_group_dirty("wav_sources_hdr", "wav_sources_hdr_label")
                     return True
             if "siggen_hdr" in self._item_map:
                 rect, _ = self._item_map["siggen_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._siggen_expanded = not self._siggen_expanded
+                    self.mark_item_group_dirty("siggen_hdr", "siggen_hdr_label")
                     return True
             if "sgv2_witness_hdr" in self._item_map:
                 rect, _ = self._item_map["sgv2_witness_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._sgv2_witness_expanded = not self._sgv2_witness_expanded
+                    self.mark_item_group_dirty("sgv2_witness_hdr", "sgv2_witness_hdr_label")
                     return True
             if "sgv2_density_hdr" in self._item_map:
                 rect, _ = self._item_map["sgv2_density_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._sgv2_density_expanded = not self._sgv2_density_expanded
+                    self.mark_item_group_dirty("sgv2_density_hdr", "sgv2_density_hdr_label")
                     return True
             if "sgv2_proj_hdr" in self._item_map:
                 rect, _ = self._item_map["sgv2_proj_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._sgv2_proj_expanded = not self._sgv2_proj_expanded
+                    self.mark_item_group_dirty("sgv2_proj_hdr", "sgv2_proj_hdr_label")
                     return True
             if "seq_hdr" in self._item_map:
                 rect, _ = self._item_map["seq_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._seq_expanded = not self._seq_expanded
+                    self.mark_item_group_dirty("seq_hdr", "seq_hdr_label")
                     return True
             if "cqt_hdr" in self._item_map:
                 rect, _ = self._item_map["cqt_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._cqt_expanded = not self._cqt_expanded
+                    self.mark_item_group_dirty("cqt_hdr", "cqt_hdr_label")
                     return True
             if "fb_hdr" in self._item_map:
                 rect, _ = self._item_map["fb_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._fb_expanded = not self._fb_expanded
+                    self.mark_item_group_dirty("fb_hdr", "fb_hdr_label")
                     return True
             if "wv_hdr" in self._item_map:
                 rect, _ = self._item_map["wv_hdr"]
@@ -17377,11 +17979,13 @@ class SourcePanel(Panel):
                 rect, _ = self._item_map["rs_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._rs_expanded = not self._rs_expanded
+                    self.mark_item_group_dirty("rs_hdr", "rs_hdr_label")
                     return True
             if "region_hdr" in self._item_map:
                 rect, _ = self._item_map["region_hdr"]
                 if rect.collidepoint(lx, ly):
                     self._region_expanded = not self._region_expanded
+                    self.mark_item_group_dirty("region_hdr", "region_hdr_label")
                     return True
 
             # Source include checkboxes
@@ -17404,6 +18008,7 @@ class SourcePanel(Panel):
                                 "wavelet", not self.include_wavelet)
                         else:
                             setattr(self, attr, not getattr(self, attr))
+                        self.mark_item_group_dirty(ck_key, f"{ck_key}_box", f"{ck_key}_label")
                         return True
 
             # Sequence / Arpeggio checkboxes
@@ -17413,6 +18018,7 @@ class SourcePanel(Panel):
                     rect, _ = self._item_map[ck_key]
                     if rect.collidepoint(lx, ly):
                         setattr(self, attr, not getattr(self, attr))
+                        self.mark_item_group_dirty(ck_key, f"{ck_key}_box", f"{ck_key}_label")
                         return True
 
             # Band list click
@@ -17433,6 +18039,7 @@ class SourcePanel(Panel):
                     rect, opts = self._item_map[key]
                     if rect.collidepoint(lx, ly):
                         self._open_dropdown(key, opts, rect, pr)
+                        self.mark_item_group_dirty(key, f"{key}_label")
                         return True
 
             # Slider +/- buttons and track drag
@@ -17468,17 +18075,20 @@ class SourcePanel(Panel):
                     rect, _ = self._item_map[minus_k]
                     if rect.collidepoint(lx, ly):
                         self._nudge_slider(skey, -1)
+                        self.mark_slider_dirty(skey)
                         return True
                 if plus_k in self._item_map:
                     rect, _ = self._item_map[plus_k]
                     if rect.collidepoint(lx, ly):
                         self._nudge_slider(skey, +1)
+                        self.mark_slider_dirty(skey)
                         return True
                 if skey in self._item_map:
                     rect, (vmin, vmax, is_log) = self._item_map[skey]
                     if rect.collidepoint(lx, ly):
                         self._dragging = skey
                         self._update_slider(skey, lx, rect, vmin, vmax, is_log)
+                        self.mark_slider_dirty(skey)
                         return True
 
             # Signal Generator v2 button
@@ -17486,6 +18096,7 @@ class SourcePanel(Panel):
                 rect, _ = self._item_map["sgv2_gen_btn"]
                 if rect.collidepoint(lx, ly) and not self._sgv2_generating:
                     self._run_siggen_v2()
+                    self.mark_item_dirty("sgv2_gen_btn")
                     return True
 
             # Sequence / Arpeggio generate button
@@ -17493,6 +18104,7 @@ class SourcePanel(Panel):
                 rect, _ = self._item_map["seq_gen_btn"]
                 if rect.collidepoint(lx, ly) and not self._seq_generating:
                     self._run_sequence_v2()
+                    self.mark_item_dirty("seq_gen_btn")
                     return True
 
             # Analyze button
@@ -17500,6 +18112,7 @@ class SourcePanel(Panel):
                 rect, _ = self._item_map["analyze_btn"]
                 if rect.collidepoint(lx, ly) and not self._analyzing:
                     self._run_analysis()
+                    self.mark_item_dirty("analyze_btn")
                     return True
 
             # Add / Remove crossover
@@ -17571,6 +18184,7 @@ class SourcePanel(Panel):
                     if key in self._item_map:
                         rect, (vmin, vmax, is_log) = self._item_map[key]
                         self._update_slider(key, lx, rect, vmin, vmax, is_log)
+                        self.mark_slider_dirty(key)
                 return True
             mx, my = event.pos
             if pr.collidepoint(mx, my):
@@ -18203,9 +18817,11 @@ class PanelDock:
         self.registry: dict[str, Panel] = {}
         self.left_key: str | None = None
         self.right_key: str | None = None
+        self.ui_tree = DirtyUITree("panel-dock:root")
 
     def register(self, key: str, panel: Panel) -> None:
         self.registry[key] = panel
+        self.ui_tree.ensure_node(f"panel:{key}")
 
     @property
     def left(self) -> Panel | None:
@@ -18227,6 +18843,7 @@ class PanelDock:
         self.left_key = key
         if key and key in self.registry:
             self.registry[key].side = "left"
+            self.ui_tree.mark_dirty(f"panel:{key}", self.registry[key].panel_rect)
 
     def set_right(self, key: str | None) -> None:
         if key == self.left_key:
@@ -18234,6 +18851,7 @@ class PanelDock:
         self.right_key = key
         if key and key in self.registry:
             self.registry[key].side = "right"
+            self.ui_tree.mark_dirty(f"panel:{key}", self.registry[key].panel_rect)
 
     @property
     def left_w(self) -> int:
@@ -18257,6 +18875,13 @@ class PanelDock:
             if p and p.visible:
                 out.append(p)
         return out
+
+    def collect_dirty_rects(self) -> list[pygame.Rect]:
+        for key, panel in self.registry.items():
+            self.ui_tree.ensure_node(f"panel:{key}", panel.panel_rect)
+            if panel.is_dirty():
+                self.ui_tree.mark_dirty(f"panel:{key}", panel.panel_rect)
+        return self.ui_tree.collect_dirty_rects()
 
 
 # ---------------------------------------------------------------------------
@@ -19664,6 +20289,9 @@ class SpectrogramViewer:
         self._program = 0
         self._tex_units: dict[str, int] = {}
         self._gui_tex = 0
+        self._panel_bg_tex: dict[str, int] = {}
+        self._ui_atom_tex: dict[str, int] = {}
+        self._ui_tex_sizes: dict[int, tuple[int, int]] = {}
         self._glyph_atlas = GlyphAtlas()
 
         # Double-buffer progressive scan state
@@ -23686,6 +24314,7 @@ class SpectrogramViewer:
         raw = pygame.image.tobytes(surf, "RGBA", True)
         if self._gui_tex:
             glDeleteTextures([self._gui_tex])
+            self._ui_tex_sizes.pop(self._gui_tex, None)
         tex_id = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D, tex_id)
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
@@ -23693,7 +24322,52 @@ class SpectrogramViewer:
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, raw)
         self._gui_tex = tex_id
+        self._ui_tex_sizes[tex_id] = (w, h)
         return tex_id
+
+    def _upload_pygame_surface_reuse(self, surf: pygame.Surface, old_tex: int = 0) -> int:
+        w, h = surf.get_size()
+        raw = pygame.image.tobytes(surf, "RGBA", True)
+        if old_tex and self._ui_tex_sizes.get(old_tex) == (w, h):
+            try:
+                glBindTexture(GL_TEXTURE_2D, old_tex)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, h,
+                                GL_RGBA, GL_UNSIGNED_BYTE, raw)
+                return old_tex
+            except Exception:
+                try:
+                    glDeleteTextures([old_tex])
+                except Exception:
+                    pass
+                self._ui_tex_sizes.pop(old_tex, None)
+        tex_id = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex_id)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        self._ui_tex_sizes[tex_id] = (w, h)
+        return tex_id
+
+    def _draw_ui_surface_tex(self, tex: int, rect: pygame.Rect) -> None:
+        if not tex or rect.w <= 0 or rect.h <= 0:
+            return
+        px0 = 2.0 * rect.x / self.win_w - 1.0
+        px1 = 2.0 * (rect.x + rect.w) / self.win_w - 1.0
+        py1 = 1.0 - 2.0 * rect.y / self.win_h
+        py0 = py1 - 2.0 * rect.h / self.win_h
+        glEnable(GL_TEXTURE_2D)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glColor4f(1, 1, 1, 1)
+        glBegin(GL_QUADS)
+        glTexCoord2f(0, 0); glVertex2f(px0, py0)
+        glTexCoord2f(1, 0); glVertex2f(px1, py0)
+        glTexCoord2f(1, 1); glVertex2f(px1, py1)
+        glTexCoord2f(0, 1); glVertex2f(px0, py1)
+        glEnd()
+        glDisable(GL_TEXTURE_2D)
 
     # ---- Uniform helpers --------------------------------------------------
 
@@ -24458,6 +25132,10 @@ class SpectrogramViewer:
         if self.dock:
             for panel in self.dock.panels_visible():
                 try:
+                    # GL panels render directly — skip surface/texture path
+                    if hasattr(panel, 'draw_gl'):
+                        panel.draw_gl(self.win_w, self.win_h)
+                        continue
                     panel_surf = panel.render()
                     if not panel_surf:
                         continue
@@ -24468,25 +25146,28 @@ class SpectrogramViewer:
 
                     # Clip to available panel height with scroll offset
                     panel_surf = panel._apply_panel_scroll(panel_surf)
-
-                    tex = self._upload_pygame_surface(panel_surf)
                     pw, ph = panel_surf.get_size()
                     pr = panel.panel_rect
-                    px0 = 2.0 * pr.x / self.win_w - 1.0
-                    px1 = 2.0 * (pr.x + pw) / self.win_w - 1.0
-                    py1 = 1.0 - 2.0 * pr.y / self.win_h
-                    py0 = py1 - 2.0 * ph / self.win_h
+                    bg_surf, atoms = panel.snapshot_gl_atoms(panel_surf)
+                    panel_key = f"{panel.title}:{panel.side}"
+                    bg_tex = self._panel_bg_tex.get(panel_key, 0)
+                    bg_tex = self._upload_pygame_surface_reuse(bg_surf, bg_tex)
+                    self._panel_bg_tex[panel_key] = bg_tex
+                    self._draw_ui_surface_tex(bg_tex, pygame.Rect(pr.x, pr.y, pw, ph))
 
-                    glEnable(GL_TEXTURE_2D)
-                    glBindTexture(GL_TEXTURE_2D, tex)
-                    glColor4f(1, 1, 1, 1)
-                    glBegin(GL_QUADS)
-                    glTexCoord2f(0, 0); glVertex2f(px0, py0)
-                    glTexCoord2f(1, 0); glVertex2f(px1, py0)
-                    glTexCoord2f(1, 1); glVertex2f(px1, py1)
-                    glTexCoord2f(0, 1); glVertex2f(px0, py1)
-                    glEnd()
-                    glDisable(GL_TEXTURE_2D)
+                    for atom in atoms:
+                        if atom.surface is None:
+                            continue
+                        atom_tex_key = f"{panel_key}:{atom.key}"
+                        atom_tex = self._ui_atom_tex.get(atom_tex_key, 0)
+                        if atom.dirty or not atom_tex:
+                            atom_tex = self._upload_pygame_surface_reuse(atom.surface, atom_tex)
+                            self._ui_atom_tex[atom_tex_key] = atom_tex
+                            atom.texture_id = atom_tex
+                            atom.texture_size = atom.surface.get_size()
+                            atom.dirty = False
+                        screen_rect = atom.visible_rect.move(pr.x, pr.y)
+                        self._draw_ui_surface_tex(atom_tex, screen_rect)
                 except (pygame.error, MemoryError):
                     pass
 

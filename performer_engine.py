@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 from torch import Tensor
@@ -106,6 +106,12 @@ class DriverConfig:
     fm_depth_hz: Tensor            # (D,) FM depth in Hz
     am_source_voice: Tensor        # (D,) int — AM modulator voice (-1 = none)
     am_depth: Tensor               # (D,) AM modulation depth
+
+    # -- Optional packed parametric curves --
+    parametric_env_packed: Any | None = None
+    parametric_env_row: Tensor | None = None     # (D,) int64 — row in packed batch, -1 = none
+    parametric_chirp_packed: Any | None = None
+    parametric_chirp_row: Tensor | None = None   # (D,) int64 — row in packed batch, -1 = none
 
 
 @dataclass
@@ -205,6 +211,38 @@ def _chirp(cfg: DriverConfig, t_abs: Tensor) -> Tensor:
     return delta
 
 
+def _parametric_curve_series(
+    packed: Any,
+    row_map: Tensor,
+    t_norm: Tensor,
+    *,
+    physical: bool,
+) -> Tensor:
+    """Evaluate selected packed parametric curves for drivers with valid rows."""
+    D, T = t_norm.shape
+    dev = t_norm.device
+    out = torch.zeros(D, T, dtype=torch.float64, device=dev)
+    if packed is None or row_map is None or row_map.numel() == 0:
+        return out
+
+    valid = row_map >= 0
+    if not bool(valid.any()):
+        return out
+
+    t_sel = t_norm[valid]
+    eval_out = packed.evaluate(
+        t_sel,
+        clamp_r=True,
+        apply_activation=True,
+        apply_slew=True,
+        physical=physical,
+    )
+    if eval_out.ndim == 1:
+        eval_out = eval_out.unsqueeze(0)
+    out[valid] = eval_out.real.to(torch.float64)
+    return out
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Core batch synthesis
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -258,6 +296,14 @@ def driver_synthesis_step(
     # ── Instantaneous frequency ───────────────────────────────────────────
     f_inst = cfg.f0.unsqueeze(1).expand(D, T).clone()                     # (D, T)
     f_inst += _chirp(cfg, t_abs)
+    t_norm = (t_abs / cfg.note_duration.unsqueeze(1).clamp(min=1e-15)).clamp(0.0, 1.0)
+    if cfg.parametric_chirp_packed is not None and cfg.parametric_chirp_row is not None:
+        f_inst += _parametric_curve_series(
+            cfg.parametric_chirp_packed,
+            cfg.parametric_chirp_row,
+            t_norm,
+            physical=True,
+        )
     if fm_mod is not None:
         f_inst = f_inst + fm_mod
 
@@ -279,6 +325,16 @@ def driver_synthesis_step(
     if am_mod is not None:
         amp = amp * (1.0 + am_mod)
     env = _envelope(cfg.env_t, cfg.env_v, cfg.K, t_abs.clamp(min=0.0))   # (D, T)
+    if cfg.parametric_env_packed is not None and cfg.parametric_env_row is not None:
+        env_param = _parametric_curve_series(
+            cfg.parametric_env_packed,
+            cfg.parametric_env_row,
+            t_norm,
+            physical=False,
+        ).clamp(min=0.0)
+        param_mask = cfg.parametric_env_row >= 0
+        if bool(param_mask.any()):
+            env[param_mask] = env_param[param_mask]
 
     out = (amp * env).to(cdtype) * sig                                    # (D, T)
 

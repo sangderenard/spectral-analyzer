@@ -23,9 +23,11 @@ Thumbs.db
 .venv/
 venv/
 env/
-
+Release/
 # Distribution
 dist/
 build/
 *.egg-info/
 
+csrc_bin/
+csrc_build/

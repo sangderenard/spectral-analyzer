@@ -89,6 +89,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from graph_solver import (
+    AnalyticArchetype,
     ChannelSpec,
     EncoderNodeSpec,
     GraphSolver,
@@ -511,6 +512,15 @@ class VoiceTorchOscillator(nn.Module):
         )
         self.register_buffer("_sample_idx",    torch.tensor(0, dtype=torch.int64))
         self.register_buffer("_running_phase", torch.tensor(0.0, dtype=torch.float64))
+        self.register_buffer("pre_delay_s", torch.tensor(float(pre_delay), dtype=torch.float64))
+        self.register_buffer("loop_enabled_buffer", torch.tensor(bool(loop_enabled), dtype=torch.bool))
+        self.register_buffer("loop_start_norm", torch.tensor(float(loop_start), dtype=torch.float64))
+        self.register_buffer("loop_end_norm", torch.tensor(float(loop_end), dtype=torch.float64))
+        # Preallocated scratch buffers — reused every forward() to avoid per-call allocation.
+        self.register_buffer("_t_abs_buf", torch.zeros(1, dtype=torch.float64))
+        # f_base cache: invalidated when log_freq or semitone_offset changes value.
+        self._f_base_cache: Optional[Tensor] = None
+        self._f_base_cache_key: tuple = ()
 
         # ── ParametricCurve objects and their state machines ──────────
         # These are plain Python attributes — not Parameters, not buffers.
@@ -533,6 +543,7 @@ class VoiceTorchOscillator(nn.Module):
         self.loop_end:           float = float(loop_end)
         self.emission_mode:      str   = emission_mode
         self.pre_delay:          float = float(pre_delay)
+        self._loop_cache: Dict[int, Tensor] = {}
         # Single-sample runtime cache: reuse work across repeated calls at the
         # same sample instant (for example redundant fixed-point passes).
         self._scalar_cache_key: Optional[tuple[float, int]] = None
@@ -565,6 +576,24 @@ class VoiceTorchOscillator(nn.Module):
         self._invalidate_scalar_cache()
         self._note_state.gate_off(t_abs)
         self._chirp_state.gate_off(t_abs)
+
+    def trigger(
+        self,
+        freq_hz: Optional[float] = None,
+        velocity: float = 1.0,
+        t_abs: Optional[float] = None,
+    ) -> None:
+        """Start a note, optionally retuning the carrier first."""
+        if freq_hz is not None:
+            with torch.no_grad():
+                self.log_freq.copy_(
+                    torch.tensor(math.log(max(float(freq_hz), 1e-3)), dtype=torch.float64)
+                )
+        if t_abs is None:
+            t_abs = float(self._sample_idx.item()) / float(self._sample_rate.item())
+        self._running_phase.zero_()
+        self._loop_cache.clear()
+        self.gate_on(float(t_abs), float(velocity))
 
     # ------------------------------------------------------------------
     # Knobs
@@ -623,11 +652,14 @@ class VoiceTorchOscillator(nn.Module):
     def set_sample(self, idx: int) -> None:
         self._invalidate_scalar_cache()
         self._sample_idx.fill_(idx)
+        if idx == 0:
+            self._loop_cache.clear()
 
     def reset(self) -> None:
         self._invalidate_scalar_cache()
         self._sample_idx.zero_()
         self._running_phase.zero_()
+        self._loop_cache.clear()
         self._note_state.reset()
         self._chirp_state.reset()
 
@@ -648,19 +680,24 @@ class VoiceTorchOscillator(nn.Module):
         warp = self.harmonic_warp_strength
         sr   = self._sample_rate
 
-        sig      = torch.zeros(phase_cumsum.shape, dtype=_CDTYPE, device=phase_cumsum.device)
-        norm_acc = torch.zeros((), dtype=torch.float64, device=phase_cumsum.device)
+        dev = phase_cumsum.device
+        k        = torch.arange(1, hc + 1, dtype=torch.float64, device=dev)  # (H,)
+        h_ratio  = k + warp * (k - 1.0)                                       # (H,)
+        h_amp    = 1.0 / k ** bri                                             # (H,)
 
-        for k in range(1, hc + 1):
-            k_f     = torch.tensor(float(k), dtype=torch.float64, device=phase_cumsum.device)
-            h_ratio = k_f + warp * (k_f - 1.0)
-            h_amp   = 1.0 / (k_f ** bri)
-            if amplitude_scale is not None:
-                h_amp = h_amp * amplitude_scale
-            h_phase_incr = 2.0 * math.pi * f_base * h_ratio / sr
-            h_phase = torch.cumsum(h_phase_incr, dim=0) + k_f * self.phase_origin
-            sig      = sig + h_amp.to(_CDTYPE) * torch.exp(1j * h_phase.to(_CDTYPE))
-            norm_acc = norm_acc + h_amp
+        # Phase increments: (N, H) — one column per harmonic
+        h_phase_incr = 2.0 * math.pi * f_base.unsqueeze(-1) * h_ratio / sr   # (N, H)
+        h_phase      = h_phase_incr.cumsum(0) + k * self.phase_origin         # (N, H)
+        basis        = torch.exp(1j * h_phase.to(_CDTYPE))                    # (N, H)
+
+        if amplitude_scale is not None:
+            # amplitude_scale: (N,) — time-varying envelope
+            h_amp_full = h_amp * amplitude_scale.unsqueeze(-1)                # (N, H)
+            sig      = (h_amp_full.to(_CDTYPE) * basis).sum(-1)              # (N,)
+            norm_acc = h_amp_full.sum(-1)                                     # (N,)
+        else:
+            sig      = (h_amp.to(_CDTYPE) * basis).sum(-1)                   # (N,) via broadcast
+            norm_acc = h_amp.sum()                                            # scalar
 
         return sig / norm_acc.clamp(min=1e-12).to(_CDTYPE)
 
@@ -676,6 +713,7 @@ class VoiceTorchOscillator(nn.Module):
         env_mod:   Optional[Tensor] = None,
         chirp_mod: Optional[Tensor] = None,
         pitch_in:  Optional[Tensor] = None,
+        am_mod:    Optional[Tensor] = None,
     ) -> Tensor:
         """Synthesize the voice for this solver tick.
 
@@ -718,7 +756,8 @@ class VoiceTorchOscillator(nn.Module):
         sr            = self._sample_rate
         dur           = self._duration
         if t_abs is None:
-            t_abs = (self._sample_idx.to(torch.float64) / sr).unsqueeze(0)
+            self._t_abs_buf.fill_(self._sample_idx.item() / sr.item())
+            t_abs = self._t_abs_buf
 
         t_abs = t_abs.to(torch.float64)
         N = t_abs.shape[0]
@@ -775,7 +814,11 @@ class VoiceTorchOscillator(nn.Module):
             else:  # "hz"
                 f_base = p.clamp(min=1e-3) * semitone_shift
         else:
-            f_base = torch.exp(self.log_freq) * semitone_shift
+            fk = (float(self.log_freq.item()), float(self.semitone_offset.item()))
+            if self._f_base_cache is None or self._f_base_cache_key != fk:
+                self._f_base_cache_key = fk
+                self._f_base_cache = torch.exp(self.log_freq) * semitone_shift
+            f_base = self._f_base_cache
 
         # FM from graph edge remains complex; decompose it once into the same
         # magnitude/phase state instead of stacking a later carrier multiply.
@@ -796,6 +839,12 @@ class VoiceTorchOscillator(nn.Module):
                 self._scalar_cache_amp = A
 
         total_factor = A * env_z.to(_CDTYPE)
+        if am_mod is not None:
+            am_c = am_mod.to(_CDTYPE)
+            if am_c.dim() == 0:
+                am_c = am_c.unsqueeze(0)
+            if am_c.shape[0] == N:
+                total_factor = total_factor * (1.0 + self.am_depth_amp.to(_CDTYPE) * am_c.real.to(_CDTYPE))
         if fm_factor is not None:
             total_factor = total_factor * fm_factor
         synth = ComplexSignalAggregator(float(sr.item()), N, device=t_abs.device)
@@ -816,15 +865,90 @@ class VoiceTorchOscillator(nn.Module):
             out = amp_total.to(_CDTYPE) * torch.exp(1j * phase_cumsum.to(_CDTYPE))
 
         # ── pre-delay ─────────────────────────────────────────────────
-        if self.pre_delay > 0.0:
-            mask = t_abs < self.pre_delay
+        if float(self.pre_delay_s.item()) > 0.0:
+            mask = t_abs < self.pre_delay_s
             if mask.any():
                 out = out.clone()
                 out[mask] = torch.zeros(1, dtype=_CDTYPE, device=out.device)
 
+        if bool(self.loop_enabled_buffer.item()) or self.loop_enabled:
+            out = self._apply_loop_tiling(out, t_abs)
+
         if N == 1:
             return out.squeeze(0)
         return out
+
+    def _apply_loop_tiling(self, out: Tensor, t_abs: Tensor) -> Tensor:
+        """Repeat the cached loop region for streaming one-sample graph renders."""
+        sr = float(self._sample_rate.item())
+        dur = float(self._duration.item())
+        start_norm = max(0.0, min(1.0, float(self.loop_start_norm.item())))
+        end_norm = max(start_norm, min(1.0, float(self.loop_end_norm.item())))
+        start_idx = int(round(start_norm * dur * sr))
+        end_idx = int(round(end_norm * dur * sr))
+        loop_len = max(0, end_idx - start_idx)
+        if loop_len <= 0:
+            return out
+
+        flat_out = out.reshape(-1)
+        flat_t = t_abs.reshape(-1)
+        result = flat_out.clone()
+        local_by_idx: Dict[int, Tensor] = {}
+        for pos, t_val in enumerate(flat_t):
+            idx = int(round(float(t_val.item()) * sr))
+            local_by_idx[idx] = flat_out[pos]
+            if start_idx <= idx < end_idx:
+                self._loop_cache[idx] = flat_out[pos]
+
+        for pos, t_val in enumerate(flat_t):
+            idx = int(round(float(t_val.item()) * sr))
+            if idx < end_idx:
+                continue
+            src_idx = start_idx + ((idx - start_idx) % loop_len)
+            if src_idx in local_by_idx:
+                result[pos] = local_by_idx[src_idx]
+            elif src_idx in self._loop_cache:
+                result[pos] = self._loop_cache[src_idx].to(device=out.device)
+        return result.reshape(out.shape)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# VoiceArchetype — shared batched dispatcher for all _out voice nodes
+# ──────────────────────────────────────────────────────────────────────────────
+
+class VoiceArchetype(AnalyticArchetype):
+    """Shared dispatcher for all VoiceTorchOscillator output nodes.
+
+    All MetaVoiceNode instances in a graph share one VoiceArchetype key so the
+    solver stages every voice's _out node into a single archetype wave, then
+    fires them together in one worker thread.  The actual per-voice forward()
+    calls are still sequential within that thread, but they run off the main
+    solve thread — freeing it to handle other archetype types or downstream
+    nodes concurrently.
+
+    ``analytic_module`` on each staged node is the ``MetaVoiceNode`` itself,
+    so ``fire()`` can call ``mod._transform(x)`` with the correct oscillator
+    state for each voice.
+    """
+
+    KEY = "voice.oscillator"
+
+    def __init__(self, device=None) -> None:
+        super().__init__(archetype_key=self.KEY, state_width=0, device=device)
+
+    def fire(self, forward_fn=None) -> None:  # noqa: ARG002
+        if not self._pending:
+            return
+        pending, self._pending = self._pending, []
+        for key, x, mod in pending:
+            if mod is not None:
+                try:
+                    out = mod._transform(x)
+                except Exception:
+                    out = x
+            else:
+                out = x
+            self._results[key] = out.to(_CDTYPE) if isinstance(out, torch.Tensor) else out
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -950,11 +1074,16 @@ class MetaVoiceNode(nn.Module):
         self.layer = layer
         self.causal_mod_delay = bool(causal_mod_delay)
 
+        # Shared archetype for batched dispatch: the solver picks the first
+        # instance found and reuses it for all voice nodes with the same key.
+        self.archetype = VoiceArchetype(device=oscillator._sample_rate.device)
+
         # Per-step time window (set by set_time_window / set_sample before step)
         self._t_window: Optional[Tensor] = None
         # Live driver modulation signals (set by side-effect accumulator nodes)
         self._env_mod:   Optional[Tensor] = None
         self._chirp_mod: Optional[Tensor] = None
+        self._am_mod:    Optional[Tensor] = None
         # Live pitch input from upstream port (set by pitch_in capture node)
         self._pitch_in:  Optional[Tensor] = None
 
@@ -983,6 +1112,7 @@ class MetaVoiceNode(nn.Module):
         self._t_window = None
         self._env_mod = None
         self._chirp_mod = None
+        self._am_mod = None
         self._pitch_in = None
 
     def gate_on(self, t_abs: float, velocity: float = 1.0) -> None:
@@ -1010,12 +1140,14 @@ class MetaVoiceNode(nn.Module):
                     env_mod=node._env_mod,
                     chirp_mod=node._chirp_mod,
                     pitch_in=node._pitch_in,
+                    am_mod=node._am_mod,
                 )
             return node.oscillator.forward(
                 x, t,
                 env_mod=node._env_mod,
                 chirp_mod=node._chirp_mod,
                 pitch_in=node._pitch_in,
+                am_mod=node._am_mod,
             )
 
         return _transform
@@ -1032,7 +1164,7 @@ class MetaVoiceNode(nn.Module):
         -----
         ``{key}_out``      — oscillator output (drives the synthesis transform)
         ``{key}_fm``       — FM signal accumulator (identity passthrough)
-        ``{key}_am``       — AM signal accumulator (identity passthrough)
+        ``{key}_am``       — AM signal capture node
         ``{key}_env_mod``  — envelope modulation input: the active envelope spline
                              carries this incoming signal (spline × signal.real)
         ``{key}_chirp_mod``— chirp modulation input: the chirp spline carries
@@ -1041,7 +1173,7 @@ class MetaVoiceNode(nn.Module):
         Internal edges
         --------------
         ``{key}_fm``        → ``{key}_out``  (delay=1 if causal_mod_delay; weight=1)
-        ``{key}_am``        → ``{key}_out``  (delay=1 if causal_mod_delay; weight=1)
+        ``{key}_am``        → ``{key}_out``  (delay=0; weight=0 — ordering only)
         ``{key}_env_mod``   → ``{key}_out``  (delay=0; weight=0 — ordering only)
         ``{key}_chirp_mod`` → ``{key}_out``  (delay=0; weight=0 — ordering only)
 
@@ -1098,6 +1230,8 @@ class MetaVoiceNode(nn.Module):
             layer=self.layer,
             transform=transform,
             archetype=archetype,
+            analytic_module=self,           # MetaVoiceNode, not oscillator — VoiceArchetype.fire() needs _transform
+            archetype_key=VoiceArchetype.KEY,
             layer_presence=NodeLayerPresence(
                 output_layers=(self.layer,),
                 parameter_inputs=True,
@@ -1112,17 +1246,11 @@ class MetaVoiceNode(nn.Module):
                 input_layers=(self.layer,),
             ),
         )
-        am_node = TensorNode(
-            key=f"{k}_am",
-            layer=self.layer,
-            transform=None,
-            archetype=NodeArchetype(),
-            layer_presence=NodeLayerPresence(
-                input_layers=(self.layer,),
-            ),
-        )
-
         node_self = self
+
+        def _am_mod_capture(x: Tensor) -> Tensor:
+            node_self._am_mod = x if x.abs().max().item() > 0.0 else None
+            return x
 
         def _env_mod_capture(x: Tensor) -> Tensor:
             # x is the solver's accumulated input to this node.  When no driver
@@ -1142,6 +1270,16 @@ class MetaVoiceNode(nn.Module):
             # from "no connection" — that edge case is intentionally elided.
             node_self._pitch_in = x if x.real.abs().max().item() > 0.0 else None
             return x
+
+        am_node = TensorNode(
+            key=f"{k}_am",
+            layer=self.layer,
+            transform=_am_mod_capture,
+            archetype=NodeArchetype(),
+            layer_presence=NodeLayerPresence(
+                input_layers=(self.layer,),
+            ),
+        )
 
         env_mod_node = TensorNode(
             key=f"{k}_env_mod",
@@ -1191,8 +1329,8 @@ class MetaVoiceNode(nn.Module):
         am_edge = TensorEdge(
             src_key=f"{k}_am",
             dst_key=f"{k}_out",
-            weight=complex(1.0, 0.0),
-            delay_samples=delay_samples,
+            weight=complex(0.0, 0.0),
+            delay_samples=0,
             semantic_role="am_modulator",
             src_port="signal_out",
             dst_port="am_in",

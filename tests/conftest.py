@@ -84,3 +84,74 @@ _gl_mod = sys.modules["OpenGL.GL"]
 _gl_mod.__all__ = []
 # Provide the shaders alias
 _gl_mod.shaders = sys.modules["OpenGL.GL.shaders"]
+
+# ---- scipy availability ----
+try:
+    import scipy.signal as _scipy_signal  # type: ignore
+except Exception:
+    for _scipy_name in ["scipy", "scipy.signal"]:
+        _ensure_module_stub(_scipy_name)
+    _scipy_signal = sys.modules["scipy.signal"]
+
+if not hasattr(_scipy_signal, "resample_poly"):
+    def _resample_poly_stub(x, up, down, *_args, **_kwargs):
+        import numpy as _np
+        arr = _np.asarray(x)
+        up_i = max(1, int(up))
+        down_i = max(1, int(down))
+        if up_i == down_i:
+            return arr
+        out_len = max(1, int(round(len(arr) * up_i / down_i)))
+        if len(arr) == 0:
+            return arr
+        idx = _np.linspace(0, len(arr) - 1, out_len)
+        idx = _np.clip(_np.round(idx).astype(int), 0, len(arr) - 1)
+        return arr[idx]
+    _scipy_signal.resample_poly = _resample_poly_stub
+
+# ---- viewer dependency availability used by analytic_driver tests ----
+try:
+    import plot_widget as _plot_widget  # type: ignore
+except Exception:
+    _ensure_module_stub("plot_widget")
+    _plot_widget = sys.modules["plot_widget"]
+
+    class _PlotSeries:
+        def __init__(self, *args, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class _PlotMarker:
+        def __init__(self, *args, **kwargs):
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+    class _PlotWidget:
+        def __init__(self, *args, **kwargs):
+            self.series = []
+            self.markers = []
+            self.y_min = -1.0
+            self.y_max = 1.0
+            self.grid_lines = 0
+
+        def add_series(self, series):
+            self.series.append(series)
+
+        def render(self, *args, **kwargs):
+            return None
+
+    _plot_widget.PlotWidget = _PlotWidget
+    _plot_widget.PlotSeries = _PlotSeries
+    _plot_widget.PlotMarker = _PlotMarker
+
+try:
+    import bass_viewer as _bass_viewer  # type: ignore
+except Exception:
+    _ensure_module_stub("bass_viewer")
+    _bass_viewer = sys.modules["bass_viewer"]
+    for _name in [
+        "GlyphAtlas", "Panel", "PanelDock", "ScrollableSubpanelList",
+        "ModularSubpanelSpec", "SubpanelAddOption", "FilterBankDecomposition",
+    ]:
+        if not hasattr(_bass_viewer, _name):
+            setattr(_bass_viewer, _name, type(_name, (), {}))

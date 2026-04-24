@@ -364,9 +364,9 @@ def _run_metadata_check() -> dict[str, Any]:
         },
         "mixer_nodes": {
             node.key: {
-                "parameter_matrix_keys": list(node.archetype.mixer.parameter_matrix_keys),
-                "icl_model": node.archetype.mixer.icl_model,
-                "physical_presence": node.archetype.mixer.physical_presence,
+                "parameter_matrix_keys": list(getattr(node.archetype.mixer, "parameter_matrix_keys", ())),
+                "icl_model": getattr(node.archetype.mixer, "icl_model", ""),
+                "physical_presence": getattr(node.archetype.mixer, "physical_presence", ""),
             }
             for node in solver.nodes
             if isinstance(node.archetype, MixerArchetype)
@@ -386,14 +386,12 @@ def _run_metadata_check() -> dict[str, Any]:
             "network_link_count": len(solver.network_links),
             "patch_contract_keys": [edge.contract_key for edge in solver.edges if edge.contract_key],
         },
-        "layer_plan": {
-            "signal_layers": list(solver.solve_plan.signal_layers),
-            "parameter_layer": solver.solve_plan.parameter_layer.key,
-            "parameter_any_in": solver.solve_plan.parameter_layer.accepts_from_any_layer,
-            "parameter_any_out": solver.solve_plan.parameter_layer.emits_to_any_layer,
-            "control_feedback_iterations": solver.solve_plan.control_feedback_iterations,
-            "cycle_entire_layer_stack": solver.solve_plan.cycle_entire_layer_stack,
-            "one_network_per_sample": solver.solve_plan.one_network_per_sample,
+        "layer_metadata": {
+            "node_layers": {
+                node.key: str(node.layer or "")
+                for node in solver.nodes
+            },
+            "parameter_layer": solver.parameter_layer_key,
         },
         "node_layer_presence": {
             node.key: {

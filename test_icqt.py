@@ -1,11 +1,16 @@
 """Focused iCQT diagnostic: use actual stored CQT data, test single bin."""
 import numpy as np, math, os, glob
+import pytest
 
 analysis_dirs = glob.glob("input/*_analysis")
+if not analysis_dirs:
+    pytest.skip("requires local *_analysis CQT fixture data", allow_module_level=True)
 adir = analysis_dirs[0]
 npz_files = sorted(glob.glob(os.path.join(adir, "cqt_data_*.npz")),
                    key=os.path.getmtime, reverse=True)
 npz_path = npz_files[0] if npz_files else os.path.join(adir, "cqt_data.npz")
+if not os.path.exists(npz_path):
+    pytest.skip(f"requires local CQT fixture data at {npz_path}", allow_module_level=True)
 npz = np.load(npz_path, mmap_mode="r")
 
 real_l = np.asarray(npz["real_left"], dtype=np.float64)

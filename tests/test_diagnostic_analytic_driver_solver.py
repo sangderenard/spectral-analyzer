@@ -21,11 +21,9 @@ def test_extended_diagnostic_script_runs() -> None:
     assert payload["metadata_check"]["meta_edge_count"] == 1
     assert payload["metadata_check"]["edge_group_count"] == 3
     assert payload["metadata_check"]["edge_group_keys"] == ["voice_bus", "print_bus", "feedback_bus"]
-    assert payload["metadata_check"]["layer_plan"]["signal_layers"] == ["voice", "master"]
-    assert payload["metadata_check"]["layer_plan"]["parameter_layer"] == "param"
-    assert payload["metadata_check"]["layer_plan"]["parameter_any_in"] is True
-    assert payload["metadata_check"]["layer_plan"]["parameter_any_out"] is True
-    assert payload["metadata_check"]["layer_plan"]["one_network_per_sample"] is True
+    assert payload["metadata_check"]["layer_metadata"]["node_layers"]["lin_a"] == "voice"
+    assert payload["metadata_check"]["layer_metadata"]["node_layers"]["lin_c"] == "master"
+    assert payload["metadata_check"]["layer_metadata"]["parameter_layer"] == "param"
     assert payload["metadata_check"]["transport_sides"]["network_link_count"] == (
         payload["metadata_check"]["transport_sides"]["grid_edge_count"]
         + payload["metadata_check"]["transport_sides"]["patch_link_count"]

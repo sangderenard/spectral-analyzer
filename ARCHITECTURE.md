@@ -20,8 +20,9 @@ KnobDrivenModule(analytic_obj)  →  TensorNode(analytic_module=wrapper)
 ```
 
 `KnobDrivenModule` reads `type(analytic_obj).knobs()` and registers every
-`float`/`int` knob as an `nn.Parameter`.  The solver then dispatches all
-nodes of the same archetype concurrently via `AnalyticArchetype.fire()`.
+`float`/`int` knob as an `nn.Parameter`.  The solver then walks the condensed
+SCC list in Tarjan topological order and solves each SCC through the same
+`_solve_scc` path.
 
 **No special-casing by type.  No branching paths.**
 

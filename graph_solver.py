@@ -12,14 +12,15 @@ Core rules:
 """
 from __future__ import annotations
 
-import concurrent.futures
 import cmath
 import contextlib
 import math
 import sys
 import threading
 import time
-from collections import defaultdict
+import atexit
+import os
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Set
 
@@ -30,7 +31,17 @@ PROFILE_TIMING: bool = True
 
 # How often (seconds) the background reporter prints accumulated statistics.
 # Set to 0 to disable the background reporter entirely.
-PROFILE_REPORT_INTERVAL_S: float = 5.0
+PROFILE_REPORT_INTERVAL_S: float = 0.0
+
+# Record individual span events for waterfall visualisation.
+# Has no effect when PROFILE_TIMING is False.
+TRACE_EVENTS: bool = True
+
+# Maximum events kept in the ring buffer.  Oldest events are discarded when
+# the buffer is full.  At ~42 k solver.step calls per second this is ~2.4 s of
+# data at full resolution.  Raise if you want a longer window; lower if RAM is
+# tight.
+TRACE_MAX_EVENTS: int = 100_000
 
 
 @dataclass
@@ -73,6 +84,13 @@ class TimingBank:
         self._lock = threading.Lock()
         self._local = threading.local()   # call-stack per thread
 
+        # Trace event ring buffer — each entry is a tuple:
+        #   (name: str, t_start: float, t_end: float, thread_id: int, depth: int)
+        # t_start / t_end are perf_counter() values (seconds, arbitrary epoch).
+        # The deque's maxlen enforces the ring-buffer cap automatically.
+        self._events: deque = deque(maxlen=TRACE_MAX_EVENTS)
+        self._trace_epoch: float = time.perf_counter()  # reference t=0
+
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
@@ -84,26 +102,34 @@ class TimingBank:
         Thread-safe.  Nests correctly across any call depth.  Child elapsed
         time is accumulated into the parent frame so ``self_ms`` is always
         accurate without a second pass over the records.
+
+        Subtractive overhead: each span measures its own post-yield bookkeeping
+        cost (lock + dict update) and reports it up to the parent frame.  The
+        parent subtracts this accumulated overhead from its ``total_ms`` so
+        that reported totals reflect pure work time, not profiling machinery.
         """
         if not PROFILE_TIMING:
             yield
             return
-        # Thread-local stack: each frame = [children_elapsed_ms_so_far]
+        # Thread-local stack: each frame = [child_elapsed_ms, child_overhead_ms]
         if not hasattr(self._local, "stack"):
             self._local.stack = []
         stack: list = self._local.stack
-        frame: list = [0.0]
+        frame: list = [0.0, 0.0]
         stack.append(frame)
         t_start = time.perf_counter()
         try:
             yield
         finally:
-            elapsed = (time.perf_counter() - t_start) * 1_000.0
+            t_end = time.perf_counter()
+            elapsed        = (t_end - t_start) * 1_000.0
             stack.pop()
-            self_ms = elapsed - frame[0]           # subtract children
-            if stack:
-                stack[-1][0] += elapsed            # tell parent about us
-            depth = len(stack)                     # 0 = top-level
+            child_elapsed  = frame[0]
+            child_overhead = frame[1]
+            depth          = len(stack)
+            adj_total      = elapsed - child_overhead   # strip descendant profiling cost
+            t_stat         = time.perf_counter()
+            tid            = threading.get_ident()
             with self._lock:
                 s = self._stats.get(name)
                 if s is None:
@@ -111,10 +137,16 @@ class TimingBank:
                     self._next_order += 1
                     self._stats[name] = s
                 s.count    += 1
-                s.total_ms += elapsed
-                s.self_ms  += self_ms
-                s.mn_ms     = min(s.mn_ms, elapsed)
-                s.mx_ms     = max(s.mx_ms, elapsed)
+                s.total_ms += adj_total
+                s.self_ms  += elapsed - child_elapsed   # child overhead cancels in self
+                s.mn_ms     = min(s.mn_ms, adj_total)
+                s.mx_ms     = max(s.mx_ms, adj_total)
+                if TRACE_EVENTS:
+                    self._events.append((name, t_start, t_end, tid, depth))
+            our_overhead = (time.perf_counter() - t_stat) * 1_000.0
+            if stack:
+                stack[-1][0] += elapsed                        # parent: raw elapsed for self_ms
+                stack[-1][1] += child_overhead + our_overhead  # parent: total descendant overhead
 
     # ------------------------------------------------------------------
     # Reporting
@@ -128,27 +160,33 @@ class TimingBank:
             snap = {k: _NameStats(v.count, v.total_ms, v.self_ms, v.mn_ms, v.mx_ms, v.depth, v.order)
                     for k, v in self._stats.items()}
         if not snap:
-            print(f"[{title}] — no timing data", file=file)
+            print(f"[{title}] - no timing data", file=file)
             return
         self._format_stats(snap, title=title, file=file)
 
     def reset(self) -> None:
-        """Clear all accumulated statistics."""
+        """Clear all accumulated statistics and the trace event buffer."""
         with self._lock:
             self._stats.clear()
             self._next_order = 0
+            self._events.clear()
+            self._trace_epoch = time.perf_counter()
 
     # ------------------------------------------------------------------
     # Background reporter
     # ------------------------------------------------------------------
 
-    def start_reporter(self, interval_s: float = 5.0, title: str = "GraphSolver profile") -> None:
+    def start_reporter(self, interval_s: float = 5.0, title: str = "GraphSolver profile",
+                       drain: bool = True) -> None:
         """Start a daemon thread that prints statistics every *interval_s* seconds.
 
         All console I/O happens in the daemon — the solve thread is never
-        touched.  Stats are drained after each report so each window covers
-        only the preceding interval.  Safe to call multiple times (no-op if
-        already running).
+        touched.  Safe to call multiple times (no-op if already running).
+
+        drain=True  (default): stats are cleared after each print; each window
+                               covers only the preceding interval.
+        drain=False:           stats accumulate for the full session; each print
+                               shows everything since start_reporter was called.
         """
         if interval_s <= 0:
             return
@@ -158,6 +196,7 @@ class TimingBank:
             self._reporter_running = True
         self._reporter_title    = title
         self._reporter_interval = interval_s
+        self._reporter_drain    = drain
 
         def _loop() -> None:
             import io
@@ -165,12 +204,12 @@ class TimingBank:
                 time.sleep(self._reporter_interval)
                 if not self._reporter_running:
                     break
-                # Drain under lock; do all formatting/I/O outside it.
                 with self._lock:
                     snap = {k: _NameStats(v.count, v.total_ms, v.self_ms, v.mn_ms, v.mx_ms, v.depth, v.order)
                             for k, v in self._stats.items()}
-                    self._stats.clear()
-                    self._next_order = 0
+                    if self._reporter_drain:
+                        self._stats.clear()
+                        self._next_order = 0
                 if not snap:
                     continue
                 buf = io.StringIO()
@@ -186,6 +225,255 @@ class TimingBank:
         self._reporter_running = False
 
     # ------------------------------------------------------------------
+    # Waterfall chart
+    # ------------------------------------------------------------------
+
+    def save_waterfall(
+        self,
+        path: str | None = None,
+        *,
+        title: str = "GraphSolver event waterfall",
+        max_spans: int = 50,
+        min_duration_us: float = 0.0,
+        dpi: int = 150,
+    ) -> str:
+        """Render the trace event buffer as a waterfall / Gantt chart.
+
+        Each unique span name occupies one horizontal lane.  Every recorded
+        invocation is drawn as a semi-transparent bar so overlapping calls
+        (simultaneity / thrashing) are immediately visible as darker regions.
+        Bars are coloured by thread ID so cross-thread activity separates
+        visually.
+
+        Parameters
+        ----------
+        path : str, optional
+            Output file path.  Defaults to ``solver_waterfall_<timestamp>.png``
+            in the same directory as this module.
+        max_spans : int
+            Limit the chart to the *max_spans* busiest lanes (by total event
+            count) to keep very wide call trees readable.
+        min_duration_us : float
+            Skip events shorter than this many microseconds.  Useful to hide
+            near-zero-cost spans that would only appear as hairlines.
+        dpi : int
+            Output PNG resolution.
+
+        Returns
+        -------
+        str
+            Absolute path of the saved PNG.
+        """
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            import matplotlib.patches as mpatches
+            import matplotlib.colors as mcolors
+            import matplotlib.ticker
+        except ImportError:
+            print("[TimingBank] matplotlib not available — waterfall not saved.",
+                  file=sys.stderr)
+            return ""
+
+        # Snapshot the event buffer under the lock
+        with self._lock:
+            events = list(self._events)
+            epoch  = self._trace_epoch
+
+        if not events:
+            print("[TimingBank] no trace events recorded — waterfall skipped.",
+                  file=sys.stderr)
+            return ""
+
+        # Convert to ms relative to the first event's start
+        t0 = min(ev[1] for ev in events)
+        min_dur_s = min_duration_us * 1e-6
+        events = [
+            (name, (ts - t0) * 1e3, (te - t0) * 1e3, tid, depth)
+            for name, ts, te, tid, depth in events
+            if (te - ts) >= min_dur_s
+        ]
+        if not events:
+            return ""
+
+        # Gather unique span names, limited to the busiest max_spans lanes.
+        from collections import Counter
+        name_counts = Counter(ev[0] for ev in events)
+        if len(name_counts) > max_spans:
+            top_names = {n for n, _ in name_counts.most_common(max_spans)}
+            events = [ev for ev in events if ev[0] in top_names]
+            name_counts = Counter(ev[0] for ev in events)
+
+        # Build display order: respect aggregate depth/order if available.
+        with self._lock:
+            stats_snap = {k: (v.depth, v.order) for k, v in self._stats.items()}
+        def _sort_key(n: str):
+            d, o = stats_snap.get(n, (99, 99999))
+            return (d, o)
+        lane_names = sorted(name_counts.keys(), key=_sort_key)
+        lane_index = {n: i for i, n in enumerate(lane_names)}
+        n_lanes    = len(lane_names)
+
+        # Assign a colour to each unique thread ID.
+        # Use the standard matplotlib tab10 colours directly so each thread
+        # gets an exact, maximally-distinct hue.  get_cmap with N<10 resamples
+        # the colormap and can produce visually similar shades; indexing the
+        # named colours directly avoids that.
+        _TAB10 = [
+            "#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd",
+            "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
+        ]
+        all_tids  = sorted({ev[3] for ev in events})
+        tid_color = {tid: _TAB10[i % len(_TAB10)] for i, tid in enumerate(all_tids)}
+
+        # Figure sizing: ~0.38 in per lane, min 4 in
+        fig_h = max(4.0, n_lanes * 0.38 + 1.5)
+        fig_w = max(14.0, (max(ev[2] for ev in events) / 1000.0) * 2 + 2)
+        fig_w = min(fig_w, 40.0)   # cap width so very long runs stay printable
+
+        fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+        ax.set_facecolor("#f8f8f8")
+
+        bar_h = 0.65
+
+        # Draw each thread's events in a separate pass, sorted by start time so
+        # the shortest (most recent on top visually) spans win z-order.
+        # Bars are fully opaque — overlap shows as occlusion, not color mixing.
+        # Thread order is reversed so thread 0 (likely the main solver thread)
+        # sits on top of worker threads.
+        for tid in reversed(all_tids):
+            tid_events = [(n, ts, te, d) for n, ts, te, t, d in events if t == tid]
+            # Sort longest-first so short events land on top of long ones
+            tid_events.sort(key=lambda e: -(e[2] - e[1]))
+            color = tid_color[tid]
+            ys     = [lane_index[n]  for n, ts, te, d in tid_events]
+            widths = [max(te - ts, 0.002) for n, ts, te, d in tid_events]
+            lefts  = [ts             for n, ts, te, d in tid_events]
+            ax.barh(ys, widths, left=lefts, height=bar_h,
+                    color=color, alpha=1.0, linewidth=0)
+
+        # Y-axis labels
+        ax.set_yticks(range(n_lanes))
+        ax.set_yticklabels(lane_names, fontsize=7)
+        ax.invert_yaxis()   # top lane = first in display order
+
+        # X-axis
+        total_ms = max(ev[2] for ev in events)
+        ax.set_xlim(0, total_ms * 1.01)
+        ax.set_xlabel("wall-clock ms (relative to first event)", fontsize=9)
+        ax.xaxis.set_major_formatter(
+            matplotlib.ticker.FuncFormatter(lambda x, _: f"{x:.1f}")
+        )
+
+        # Thread colour legend
+        legend_handles = [
+            mpatches.Patch(color=tid_color[tid], label=f"thread {tid & 0xFFFF:04x}")
+            for tid in all_tids
+        ]
+        ax.legend(handles=legend_handles, loc="upper right",
+                  fontsize=7, framealpha=0.8)
+
+        ax.set_title(
+            f"{title}  —  {len(events):,} events  ·  "
+            f"{len(all_tids)} thread{'s' if len(all_tids) != 1 else ''}  ·  "
+            f"{total_ms:.1f} ms window",
+            fontsize=9,
+        )
+        ax.grid(axis="x", linestyle=":", linewidth=0.4, alpha=0.5)
+        fig.tight_layout()
+
+        if path is None:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                f"solver_waterfall_{ts}.png",
+            )
+        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        plt.close(fig)
+        print(f"[TimingBank] waterfall saved → {path}", file=sys.stderr)
+        return path
+
+    def register_exit_handlers(
+        self,
+        path: str | None = None,
+        *,
+        report: bool = True,
+        waterfall: bool = True,
+        **kwargs,
+    ) -> None:
+        """Register atexit + SIGINT + SIGTERM handlers so the timing report and
+        waterfall are always written, even when the program is force-closed.
+
+        ``atexit`` alone is not enough:
+        - SIGTERM (kill, window close) terminates Python without running atexit.
+        - A KeyboardInterrupt caught inside the pygame event loop can prevent
+          the normal interpreter shutdown path from reaching atexit.
+
+        This method registers a single idempotent flush function on all three
+        paths.  The flush is guaranteed to run at most once regardless of how
+        many handlers fire.
+
+        Signal-handler note: signal handlers can only be registered from the
+        main thread.  If this is called from a worker thread the signal
+        registration is silently skipped; atexit still fires on clean exit.
+
+        Parameters
+        ----------
+        path : str, optional
+            Passed to save_waterfall().
+        report : bool
+            Whether to call self.report() (the text table) on exit.
+        waterfall : bool
+            Whether to call self.save_waterfall() on exit.
+        **kwargs
+            Additional keyword arguments forwarded to save_waterfall().
+        """
+        if getattr(self, "_exit_handlers_registered", False):
+            return
+        self._exit_handlers_registered = True
+
+        _flushed = [False]   # list so the closure can mutate it
+
+        def _flush(signum=None, frame=None):
+            if _flushed[0]:
+                return
+            _flushed[0] = True
+            if report:
+                self.report(title="GraphSolver — final profile", file=sys.stderr)
+            if waterfall:
+                self.save_waterfall(path, **kwargs)
+            if signum is not None:
+                # Exit with conventional signal status so the shell / parent
+                # process sees a non-zero return code.
+                # sys.exit() runs atexit but the flag above prevents re-flushing.
+                import sys as _sys
+                _sys.exit(128 + signum)
+
+        atexit.register(_flush)
+
+        import signal as _signal
+        try:
+            _signal.signal(_signal.SIGINT,  _flush)
+            _signal.signal(_signal.SIGTERM, _flush)
+        except (OSError, ValueError):
+            # ValueError: called from non-main thread — atexit still covers clean exit.
+            pass
+
+    # kept for back-compat; delegates to the unified method
+    def register_exit_waterfall(
+        self,
+        path: str | None = None,
+        **kwargs,
+    ) -> None:
+        """Register an atexit hook that calls save_waterfall() on interpreter shutdown.
+
+        Prefer register_exit_handlers() which also catches SIGTERM and SIGINT.
+        Safe to call multiple times.
+        """
+        self.register_exit_handlers(path, report=False, waterfall=True, **kwargs)
+
+    # ------------------------------------------------------------------
     # Internal formatter
     # ------------------------------------------------------------------
 
@@ -196,7 +484,7 @@ class TimingBank:
         ordered = sorted(snap.keys(), key=lambda k: (snap[k].depth, snap[k].order))
         max_name_w = max(len(n) + snap[n].depth * 2 for n in ordered)
         name_col   = max(max_name_w, 36)
-        sep        = "─" * (name_col + 72)
+        sep        = "-" * (name_col + 72)
         lines = [f"\n{sep}", f" {title}", sep]
         hdr   = "span".ljust(name_col)
         lines.append(
@@ -229,6 +517,10 @@ _T: TimingBank = TimingBank()
 # Auto-start the background reporter if profiling is enabled.
 if PROFILE_TIMING and PROFILE_REPORT_INTERVAL_S > 0:
     _T.start_reporter(interval_s=PROFILE_REPORT_INTERVAL_S, title="GraphSolver live profile")
+
+# Auto-register the report+waterfall on any exit path when trace collection is active.
+if PROFILE_TIMING and TRACE_EVENTS:
+    _T.register_exit_handlers()
 
 import torch
 import torch.nn as nn
@@ -351,11 +643,6 @@ def _tarjan_sccs(node_keys: list[str], edges: Iterable["TensorEdge"], sample_rat
         if index[v] == -1:
             _dfs(v)
     return out
-
-
-def _is_control_role(role: str, roles: Sequence[str]) -> bool:
-    role = str(role or "")
-    return role in set(str(r) for r in roles)
 
 
 @dataclass(frozen=True)
@@ -492,20 +779,20 @@ class RouterArchetype(NodeArchetype):
 
 
 class AnalyticArchetype(nn.Module):
-    """Shared dispatch daemon for TensorNodes of the same analytic type.
+    """Shared batching helper for TensorNodes of the same analytic type.
 
     One instance is created per analytic class (e.g. one for all
     ``LFODefinition`` nodes, one for all ``AnalyticVoice`` nodes).  Every
-    TensorNode of the type registers itself; the solver enqueues their
-    inputs, fires all archetypes concurrently within each topological wave,
-    then scatters results back into the output dict.
+    TensorNode of the type registers itself.  The solver itself walks SCCs in
+    Tarjan topological order; this helper remains available for callers that
+    explicitly stage batched analytic work.
 
     Per-tick protocol
     -----------------
     1. ``register_node(key)`` — once per node at graph build time.
-    2. ``enqueue(key, x, knob_module)`` — solver stages each node's
+    2. ``enqueue(key, x, knob_module)`` — caller stages each node's
        accumulated input alongside a reference to its ``KnobDrivenModule``.
-    3. ``fire(forward_fn)`` — called in a dedicated worker thread.  Gathers
+    3. ``fire(forward_fn)`` — gathers
        inputs, stacks a batch tensor, calls ``forward_fn`` once (or identity
        if ``None``), scatters outputs to ``_results``, updates ``state_bank``.
     4. ``get_result(key)`` / ``clear_results()`` — solver reads then clears.
@@ -575,9 +862,8 @@ class AnalyticArchetype(nn.Module):
     def fire(self, forward_fn: Optional[Callable] = None) -> None:
         """Drain the queue: batch inputs, call forward_fn once, scatter results.
 
-        Runs in a dedicated worker thread — one thread per archetype per
-        topological wave.  Safe because each ``AnalyticArchetype`` owns its
-        own ``_pending``, ``_results``, and ``state_bank``.
+        Safe because each ``AnalyticArchetype`` owns its own ``_pending``,
+        ``_results``, and ``state_bank``.
         """
         if not self._pending:
             return
@@ -803,6 +1089,76 @@ class RouterContract:
 
 
 @dataclass(frozen=True)
+class BlockFaculty:
+    """Declares the block-processing capability of a node or algorithm.
+
+    An algorithm with a BlockFaculty can process T samples in one kernel call
+    provided its ``constant_inputs`` are not receiving live modulation within
+    the block window.  ``tracked_inputs`` may vary, but their full T-sample
+    series must be known before the block fires (i.e., they originate from
+    another block source or a pre-computed series).
+
+    Declaration
+    -----------
+    Analytic objects declare their faculty via a ``block_faculty()``
+    classmethod or staticmethod.  ``KnobDrivenModule`` picks this up
+    automatically and forwards it to the corresponding ``TensorNode``.
+    Nodes with ``transform=None`` (pure accumulators) are automatically
+    granted an unrestricted faculty by the solver — no manual declaration
+    needed.
+
+    Fields
+    ------
+    constant_inputs
+        Named input port keys (matching incoming edge semantic roles or the
+        analytic object's own knob/attribute names) that must be stable over
+        the block window.  If any of these are driven by a live edge that can
+        change mid-buffer, the node falls back to per-sample execution.
+    tracked_inputs
+        Input port keys that may vary, but only if the full T-sample series
+        is already available (e.g., from another block node upstream).
+    max_block
+        Hard cap on block size in samples.  ``None`` means no limit; the
+        solver may use any block size the buffer affords.
+    auto
+        Set by the solver when the faculty was inferred rather than declared
+        by the author.  Informational only — does not affect scheduling.
+    """
+    constant_inputs: frozenset = frozenset()
+    tracked_inputs:  frozenset = frozenset()
+    max_block: Optional[int] = None
+    auto: bool = False
+
+
+@dataclass(frozen=True)
+class ConsumptionPolicy:
+    """How a node consumes the data stream arriving on one input edge.
+
+    This lives on ``TensorEdge`` and describes the relationship between the
+    edge's production rate and the consuming node's expectation.
+
+    Modes
+    -----
+    ``"sample"``
+        One sample per solver step.  Default.  Per-sample causal execution.
+    ``"block"``
+        The consumer expects the full available buffer (T samples) at once.
+        Only valid when the consuming node has a ``BlockFaculty`` and the
+        edge's source is a block source.
+    ``"hold_most_recent"``
+        Use the most recent value in the FIFO for the entire block; older
+        values are discarded.  Correct for slow-moving control signals
+        (e.g., a slider that doesn't need sample-accurate interpolation).
+    ``"ratio"``
+        One input sample per ``ratio`` output samples.  Use for control-rate
+        inputs on audio-rate nodes (e.g., an envelope segment that changes
+        every 64 samples).
+    """
+    mode: str = "sample"
+    ratio: int = 1
+
+
+@dataclass(frozen=True)
 class TensorNode:
     """One node in the solve graph.
 
@@ -865,6 +1221,13 @@ class TensorNode:
     # When set, the solver routes this node through the shared archetype
     # daemon instead of calling node.transform directly.
     archetype_key: str = ""
+    # ── block-processing faculty ───────────────────────────────────────
+    # Declares which inputs, if constant, allow this node to process a
+    # time-series block in one kernel call.  See BlockFaculty for details.
+    # Pure accumulators (transform=None) are granted full faculty by the
+    # solver automatically; all other nodes default to per-sample execution
+    # unless they declare a faculty here.
+    block_faculty: BlockFaculty = field(default_factory=BlockFaculty)
 
 
 @dataclass(frozen=True)
@@ -896,6 +1259,12 @@ class TensorEdge:
     activity_contract: str = ""
     src_addresses: tuple[str, ...] = ()
     dst_addresses: tuple[str, ...] = ()
+    # ── block / FIFO transport policy ─────────────────────────────────
+    # Describes how the consuming node reads data from this edge's FIFO.
+    # Defaults to per-sample ("sample").  Set to "block", "hold_most_recent",
+    # or "ratio" (with ConsumptionPolicy.ratio) when the edge carries
+    # control-rate, block-rate, or hold-last-value data.
+    consumption_policy: ConsumptionPolicy = field(default_factory=ConsumptionPolicy)
 
     def delay_steps(self, sample_rate: float) -> int:
         if int(self.delay_samples) > 0:
@@ -1230,28 +1599,6 @@ class DefaultTerminalRouter(RouterNode):
         )
 
 
-@dataclass(frozen=True)
-class SolveLayer:
-    """Ordered layer entry for the per-dt solve."""
-
-    key: str
-    kind: str = "signal"  # signal | parameter
-    accepts_from_any_layer: bool = False
-    emits_to_any_layer: bool = False
-
-
-@dataclass(frozen=True)
-class LayerSolvePlan:
-    """Minimal sequential layer solve skeleton with a trailing control phase."""
-
-    signal_layers: tuple[str, ...]
-    parameter_layer: SolveLayer
-    control_feedback_roles: tuple[str, ...] = ("control", "param", "parameter", "control_feedback")
-    control_feedback_iterations: int = 1
-    cycle_entire_layer_stack: bool = True
-    one_network_per_sample: bool = True
-
-
 @dataclass
 class SCCSpec:
     scc_id: int
@@ -1310,6 +1657,20 @@ class CyclicTensorBlock(nn.Module):
         self._cache: dict[str, Tensor] = {}
         self._x_prev: dict[str, Tensor] = {}
 
+        # Pre-index internal edges by destination key to avoid O(N×E) scan in _apply_once.
+        self._edges_by_dst: dict[str, list[TensorEdge]] = {}
+        for _e in self.internal_edges:
+            self._edges_by_dst.setdefault(_e.dst_key, []).append(_e)
+
+        # Attempt to compile a C Picard kernel.  Succeeds only when every edge
+        # and node transform in this SCC is in the C registry AND interp_mode is
+        # "none" (the interp path changes src per iteration, which the C kernel
+        # does not support).
+        self._c_picard = None
+        if self.interp_mode == "none":
+            from c_transforms import try_compile_picard as _try_compile
+            self._c_picard = _try_compile(self)
+
     def _infer_payload_shape(self, src_map: Dict[str, Tensor]) -> tuple[int, ...]:
         shapes: list[tuple[int, ...]] = []
         for value in src_map.values():
@@ -1341,9 +1702,7 @@ class CyclicTensorBlock(nn.Module):
         out: dict[str, Tensor] = {}
         for key in self.node_keys:
             acc = _broadcast_to(src_map.get(key, 0.0j), payload_shape, self.device)
-            for edge in self.internal_edges:
-                if edge.dst_key != key:
-                    continue
+            for edge in self._edges_by_dst.get(key, ()):
                 acc = acc + edge.apply(_broadcast_to(z_map.get(edge.src_key, 0.0j), payload_shape, self.device))
             transform = self.node_map[key].transform
             mapped = _canonical_complex(transform(acc) if transform is not None else acc).to(self.device)
@@ -1483,6 +1842,35 @@ class CyclicTensorBlock(nn.Module):
 
     # ------------------------------------------------------------------
 
+    def _c_picard_step(
+        self,
+        src_map: Dict[str, Tensor],
+        z_warm:  Dict[str, Tensor],
+    ) -> Dict[str, Tensor]:
+        """Run one Picard step entirely in C for a scalar (shape=()) payload."""
+        import numpy as np
+        N = len(self.node_keys)
+
+        src_buf  = np.zeros(2 * N, dtype=np.float64)
+        z_buf    = np.zeros(2 * N, dtype=np.float64)
+        for i, key in enumerate(self.node_keys):
+            sv = complex(_canonical_complex(src_map.get(key, 0.0j)).item())
+            src_buf[2*i]   = sv.real
+            src_buf[2*i+1] = sv.imag
+            wv = complex(_canonical_complex(z_warm.get(key, 0.0j)).item())
+            z_buf[2*i]   = wv.real
+            z_buf[2*i+1] = wv.imag
+
+        z_out = self._c_picard.step(src_buf, z_buf)
+
+        result: dict[str, Tensor] = {}
+        for i, key in enumerate(self.node_keys):
+            val = complex(float(z_out[2*i]), float(z_out[2*i+1]))
+            result[key] = torch.tensor(val, dtype=_CDTYPE, device=self.device)
+        return result
+
+    # ------------------------------------------------------------------
+
     def step(self, src_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
         payload_shape = self._infer_payload_shape(src_map)
         if self.use_z_cache and self._cache:
@@ -1492,16 +1880,21 @@ class CyclicTensorBlock(nn.Module):
 
         # ── Picard / sub-dt iteration (always no_grad) ─────────────────
         if self.interp_mode == "none":
-            with torch.no_grad():
-                for _ in range(self.K_max):
-                    z_new = self._apply_once(z_map, src_map, payload_shape)
-                    residual = max(
-                        (z_new[key] - z_map[key]).abs().max().item()
-                        for key in self.node_keys
-                    )
-                    z_map = z_new
-                    if residual < self.tol:
-                        break
+            if self._c_picard is not None and payload_shape == ():
+                # All transforms are C-registered and payload is scalar: run
+                # the full Picard loop in C with no Python per-iteration cost.
+                z_map = self._c_picard_step(src_map, z_map)
+            else:
+                with torch.no_grad():
+                    for _ in range(self.K_max):
+                        z_new = self._apply_once(z_map, src_map, payload_shape)
+                        residual = torch.stack([
+                            (z_new[key] - z_map[key]).abs().max()
+                            for key in self.node_keys
+                        ]).max().item()
+                        z_map = z_new
+                        if residual < self.tol:
+                            break
         else:
             prev_src = {
                 key: _broadcast_to(self._x_prev.get(key, 0.0j), payload_shape, self.device)
@@ -1545,9 +1938,7 @@ class GraphSolver(nn.Module):
         edges: Sequence[TensorEdge],
         *,
         edge_groups: Sequence[EdgeGroup] = (),
-        layer_order: Sequence[str] = (),
         parameter_layer_key: str = "param",
-        control_feedback_iterations: int = 1,
         network_clock: Optional[NetworkClock] = None,
         sample_rate: float = 48_000.0,
         default_k_max: int = 64,
@@ -1589,6 +1980,7 @@ class GraphSolver(nn.Module):
                 e.activity_contract,
                 e.src_addresses,
                 e.dst_addresses,
+                e.consumption_policy,
             )
             for e in edges
         ]
@@ -1602,22 +1994,11 @@ class GraphSolver(nn.Module):
         self.interp_mode = str(interp_mode)
         self.timing_offset = float(timing_offset)
         self.device = device
+        self._zero_scalar: Tensor = torch.zeros((), dtype=_CDTYPE, device=self.device)
 
         self.node_keys = [node.key for node in self.nodes]
         self.node_map = {node.key: node for node in self.nodes}
         self.node_index = {node.key: i for i, node in enumerate(self.nodes)}
-        derived_layers = [str(node.layer or "") for node in self.nodes if str(node.layer or "")]
-        ordered_layers = tuple(str(layer) for layer in layer_order) if layer_order else tuple(dict.fromkeys(derived_layers))
-        self.solve_plan = LayerSolvePlan(
-            signal_layers=ordered_layers,
-            parameter_layer=SolveLayer(
-                key=self.parameter_layer_key,
-                kind="parameter",
-                accepts_from_any_layer=True,
-                emits_to_any_layer=True,
-            ),
-            control_feedback_iterations=max(1, int(control_feedback_iterations)),
-        )
 
         self.meta_edges = [edge for edge in self.edges if edge.activity_contract or edge.src_addresses or edge.dst_addresses]
         self.network_links = tuple(self.edges)
@@ -1646,28 +2027,6 @@ class GraphSolver(nn.Module):
             ))
         tier = 1 if all(scc.is_linear for scc in sccs) else (3 if len(sccs) == 1 else 2)
         self.condensed = CondensedGraph(sccs, node_to_scc, list(self.node_keys), tier)
-        self.sccs_by_layer: dict[str, list[SCCSpec]] = {layer: [] for layer in self.solve_plan.signal_layers}
-        self.control_feedback_sccs: list[SCCSpec] = []
-        for scc in self.condensed.sccs:
-            node_layers = {str(self.node_map[key].layer or "") for key in scc.node_keys}
-            assigned = False
-            for layer in self.solve_plan.signal_layers:
-                if layer in node_layers:
-                    self.sccs_by_layer.setdefault(layer, []).append(scc)
-                    assigned = True
-                    break
-            linked_to_patch = any(
-                edge.contract_key and (edge.src_key in scc.node_keys or edge.dst_key in scc.node_keys)
-                for edge in self.edges
-            )
-            if any(
-                _is_control_role(edge.semantic_role, self.solve_plan.control_feedback_roles)
-                for edge in self.edges
-                if edge.src_key in scc.node_keys or edge.dst_key in scc.node_keys
-            ) or linked_to_patch:
-                self.control_feedback_sccs.append(scc)
-            elif not assigned and scc not in self.control_feedback_sccs:
-                self.control_feedback_sccs.append(scc)
 
         self._first_tick: bool = True
         self.zero_delay_edges = zero_delay_edges
@@ -1698,11 +2057,30 @@ class GraphSolver(nn.Module):
                 device=self.device,
             )
 
+        # Pre-compile C Picard kernels for singleton feedforward non-linear SCCs.
+        # These are nodes with a C-registered transform but no self-loop; each
+        # solves in exactly one pass.
+        from c_transforms import compile_singleton_picard as _csp
+        self._scc_direct_picard: dict[str, object] = {}
+        for _scc in self.condensed.sccs:
+            if str(_scc.scc_id) in self.cyclic_blocks:
+                continue
+            if len(_scc.node_keys) != 1 or _scc.is_linear:
+                continue
+            _p = _csp(self.node_map[_scc.node_keys[0]].transform, tol=self.convergence_eps)
+            if _p is not None:
+                self._scc_direct_picard[str(_scc.scc_id)] = _p
+
         self._delay_buffers: dict[int, list[dict[str, Tensor]]] = {
             d: [{} for _ in range(d)] for d in self.delayed_edges_by_steps
         }
         self._delay_pos: dict[int, int] = {d: 0 for d in self.delayed_edges_by_steps}
         self._last_outputs: dict[str, Tensor] = {}
+
+        # Pre-index zero-delay edges by destination key to avoid O(S×E) scan in _build_local_src.
+        self._zd_edges_by_dst: dict[str, list[TensorEdge]] = {}
+        for _e in self.zero_delay_edges:
+            self._zd_edges_by_dst.setdefault(_e.dst_key, []).append(_e)
 
         # Collect AnalyticArchetype instances from analytic_module fields.
         # The archetype is looked up on each node's KnobDrivenModule (.archetype).
@@ -1722,79 +2100,64 @@ class GraphSolver(nn.Module):
                 if node.archetype_key == ak and node.key not in arch.node_index:
                     arch.register_node(node.key)
 
-    def _fire_pending_archetypes(
-        self,
-        pending: Dict[str, "AnalyticArchetype"],
-        outputs: Dict[str, Tensor],
-    ) -> None:
-        """Fire all pending archetypes concurrently, then scatter results."""
-        if not pending:
-            return
-        with _T.span("solver.fire_archetypes"):
-            with _T.span("solver.fire_archetypes.thread_pool"):
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(pending)) as pool:
-                    def _timed_fire(ak: str, arch) -> None:
-                        with _T.span(f"solver.archetype.{ak.replace('.', '/')}"):
-                            arch.fire()
-                    futures = {pool.submit(_timed_fire, ak, arch): arch for ak, arch in pending.items()}
-                    concurrent.futures.wait(futures)
-            with _T.span("solver.fire_archetypes.scatter"):
-                for arch in pending.values():
-                    outputs.update(arch._results)
-                    arch.clear_results()
+        # ── Lateral archetype group detection ─────────────────────────────
+        # A lateral group is a set of singleton non-cyclic SCCs that share the
+        # same archetype_key and sit at the same topological level in the
+        # condensed DAG (so no member is a dependency of another).  They can be
+        # dispatched to the archetype in one batch rather than visited one by one.
+        _all_sccs = self.condensed.sccs
+        _scc_id_to_pos = {s.scc_id: i for i, s in enumerate(_all_sccs)}
 
-    def _dispatch_layer_sccs(
-        self,
-        layer: str,
-        base_src: Dict[str, Optional[Tensor]],
-        outputs: Dict[str, Tensor],
-    ) -> None:
-        """Walk a layer's SCCs in topological order, dispatching archetype-eligible
-        singleton SCCs concurrently within each causal wave.
+        # Build per-SCC direct dependency sets (in positional index space).
+        _cdep: list[set[int]] = [set() for _ in _all_sccs]
+        for _e in self.zero_delay_edges:
+            _si = self.node_index.get(_e.src_key)
+            _di = self.node_index.get(_e.dst_key)
+            if _si is None or _di is None:
+                continue
+            _src_sid = self.condensed.node_to_scc.get(_si)
+            _dst_sid = self.condensed.node_to_scc.get(_di)
+            if _src_sid is None or _dst_sid is None or _src_sid == _dst_sid:
+                continue
+            _cdep[_scc_id_to_pos[_dst_sid]].add(_scc_id_to_pos[_src_sid])
 
-        A *wave flush* is triggered whenever a pending (staged) node key appears
-        as a zero-delay source for the next SCC.  This preserves topological
-        correctness while maximising concurrency across independent archetypes.
-        """
-        pending: Dict[str, AnalyticArchetype] = {}  # archetype_key -> arch
-        pending_keys: set[str] = set()               # node keys staged but not yet resolved
+        # Topological level: longest path from any root node.
+        _topo_lvl: list[int] = [0] * len(_all_sccs)
+        for _i in range(len(_all_sccs)):
+            for _dep in _cdep[_i]:
+                _topo_lvl[_i] = max(_topo_lvl[_i], _topo_lvl[_dep] + 1)
 
-        def _flush() -> None:
-            with _T.span("solver.dispatch.wave_flush"):
-                self._fire_pending_archetypes(pending, outputs)
-            pending.clear()
-            pending_keys.clear()
+        # Collect singleton non-cyclic archetype-keyed SCCs, grouped by
+        # (archetype_key, topo_level) — same group = lateral = safe to batch.
+        _arch_at_lvl: dict[tuple[str, int], list[int]] = defaultdict(list)
+        for _i, _s in enumerate(_all_sccs):
+            if len(_s.node_keys) != 1 or _s.is_cyclic:
+                continue
+            _ak = self.node_map[_s.node_keys[0]].archetype_key
+            if _ak and _ak in self.archetypes:
+                _arch_at_lvl[(_ak, _topo_lvl[_i])].append(_i)
 
-        for scc in self.sccs_by_layer.get(layer, ()):
-            # Flush if any input to this SCC comes from a still-pending node.
-            if pending_keys and any(
-                edge.src_key in pending_keys
-                for edge in self.zero_delay_edges
-                if edge.dst_key in scc.node_keys
-            ):
-                _flush()
+        # Build the execution plan: an ordered list of ('scc', SCCSpec) or
+        # ('lateral', ak, [SCCSpec, ...]) items that preserves topological order.
+        # Lateral groups with >1 member are batched; singletons fall through to
+        # the normal _solve_scc path (which also dispatches via archetype).
+        _in_group: set[int] = set()
+        _group_emit_at: dict[int, tuple[str, list[int]]] = {}
+        for (_ak, _lvl), _positions in _arch_at_lvl.items():
+            if len(_positions) < 2:
+                continue
+            last = max(_positions)
+            _group_emit_at[last] = (_ak, _positions)
+            _in_group.update(_positions)
 
-            local_src = self._build_local_src(scc, base_src, outputs)
-
-            # Archetype-eligible: singleton SCC with a registered archetype key.
-            if len(scc.node_keys) == 1:
-                key = scc.node_keys[0]
-                ak = self.node_map[key].archetype_key
-                if ak and ak in self.archetypes:
-                    x = local_src.get(key, torch.zeros((), dtype=_CDTYPE, device=self.device))
-                    am = self.node_map[key].analytic_module
-                    self.archetypes[ak].enqueue(key, x, am)
-                    pending[ak] = self.archetypes[ak]
-                    pending_keys.add(key)
-                    continue
-
-            # Not archetype-eligible — solve immediately (blocks).
-            with _T.span("solver.dispatch.solve_scc"):
-                self._solve_scc(scc, base_src, outputs)
-
-        # Final flush for any remaining staged nodes.
-        if pending:
-            _flush()
+        _execution_plan: list = []
+        for _i, _s in enumerate(_all_sccs):
+            if _i in _group_emit_at:
+                _ak, _positions = _group_emit_at[_i]
+                _execution_plan.append(("lateral", _ak, [_all_sccs[_p] for _p in sorted(_positions)]))
+            elif _i not in _in_group:
+                _execution_plan.append(("scc", _s))
+        self._execution_plan: list = _execution_plan
 
     def _solve_linear_region(self, node_keys: Sequence[str], src_map: Dict[str, Tensor]) -> Dict[str, Tensor]:
         m = len(node_keys)
@@ -1831,12 +2194,41 @@ class GraphSolver(nn.Module):
             base = base_src.get(key)
             if base is not None:
                 local_src[key] = _add_broadcast(local_src.get(key), base)
-        for edge in self.zero_delay_edges:
-            if edge.dst_key not in scc.node_keys or edge.src_key not in outputs:
-                continue
-            contrib = edge.apply(outputs[edge.src_key])
-            local_src[edge.dst_key] = _add_broadcast(local_src.get(edge.dst_key), contrib)
+            for edge in self._zd_edges_by_dst.get(key, ()):
+                if edge.src_key not in outputs:
+                    continue
+                contrib = edge.apply(outputs[edge.src_key])
+                local_src[key] = _add_broadcast(local_src.get(key), contrib)
         return local_src
+
+    def _solve_lateral_group(
+        self,
+        ak: str,
+        group: List[SCCSpec],
+        base_src: Dict[str, Optional[Tensor]],
+        outputs: Dict[str, Tensor],
+    ) -> None:
+        """Dispatch a lateral set of same-archetype singleton SCCs as one batch.
+
+        All members share the same archetype_key and sit at the same topological
+        level, so their inputs are fully resolved before this call and they have
+        no dependency on each other.  Enqueue all, fire once, scatter results.
+        """
+        with _T.span(f"solver.lateral.{ak}"):
+            arch = self.archetypes[ak]
+            for scc in group:
+                key = scc.node_keys[0]
+                local_src = self._build_local_src(scc, base_src, outputs)
+                acc = local_src.get(key, self._zero_scalar)
+                arch.enqueue(key, acc, self.node_map[key].analytic_module)
+            arch.fire()
+            for scc in group:
+                key = scc.node_keys[0]
+                _res = arch.get_result(key)
+                outputs[key] = _canonical_complex(
+                    _res if _res is not None else self._zero_scalar
+                ).to(self.device)
+            arch.clear_results()
 
     def _solve_scc(
         self,
@@ -1850,12 +2242,35 @@ class GraphSolver(nn.Module):
             if str(scc.scc_id) in self.cyclic_blocks:
                 with _T.span(f"solver.scc.cyclic.{node_tag}"):
                     solved = self.cyclic_blocks[str(scc.scc_id)].step(local_src)
+            elif len(scc.node_keys) == 1 and scc.is_linear:
+                key = scc.node_keys[0]
+                acc = local_src.get(key, self._zero_scalar)
+                with _T.span(f"solver.scc.linear_singleton.{node_tag}"):
+                    solved = {key: _canonical_complex(acc).to(self.device)}
             elif len(scc.node_keys) == 1 and not scc.is_linear:
                 key = scc.node_keys[0]
-                node = self.node_map[key]
-                acc = local_src.get(key, torch.zeros((), dtype=_CDTYPE, device=self.device))
-                with _T.span(f"solver.scc.direct.{node_tag}"):
-                    mapped = _canonical_complex(node.transform(acc) if node.transform is not None else acc).to(self.device)
+                acc = local_src.get(key, self._zero_scalar)
+                _ak = self.node_map[key].archetype_key
+                if _ak and _ak in self.archetypes:
+                    with _T.span(f"solver.scc.archetype.{node_tag}"):
+                        arch = self.archetypes[_ak]
+                        arch.enqueue(key, acc, self.node_map[key].analytic_module)
+                        arch.fire()
+                        _res = arch.get_result(key)
+                        arch.clear_results()
+                        mapped = _canonical_complex(_res if _res is not None else acc).to(self.device)
+                else:
+                    with _T.span(f"solver.scc.direct.{node_tag}"):
+                        _picard = self._scc_direct_picard.get(str(scc.scc_id))
+                        if _picard is not None:
+                            import numpy as _np
+                            _v = complex(_canonical_complex(acc).item())
+                            _buf = _np.array([_v.real, _v.imag], dtype=_np.float64)
+                            _z = _picard.step(_buf, _buf)
+                            mapped = torch.tensor(complex(float(_z[0]), float(_z[1])), dtype=_CDTYPE, device=self.device)
+                        else:
+                            node = self.node_map[key]
+                            mapped = _canonical_complex(node.transform(acc) if node.transform is not None else acc).to(self.device)
                 solved = {key: mapped}
             else:
                 with _T.span(f"solver.scc.linear.{node_tag}"):
@@ -1902,16 +2317,11 @@ class GraphSolver(nn.Module):
             else:
                 with _T.span("solver.step.solve"):
                     outputs: dict[str, Tensor] = {}
-                    for _ in range(self.solve_plan.control_feedback_iterations):
-                        with _T.span("solver.step.solve.layers"):
-                            for layer in self.solve_plan.signal_layers:
-                                with _T.span("solver.step.solve.layers.dispatch"):
-                                    self._dispatch_layer_sccs(layer, base_src, outputs)
-                        with _T.span("solver.step.solve.control_feedback"):
-                            for scc in self.control_feedback_sccs:
-                                self._solve_scc(scc, base_src, outputs)
-                        if not self.solve_plan.cycle_entire_layer_stack:
-                            break
+                    for _item in self._execution_plan:
+                        if _item[0] == "lateral":
+                            self._solve_lateral_group(_item[1], _item[2], base_src, outputs)
+                        else:
+                            self._solve_scc(_item[1], base_src, outputs)
 
             with _T.span("solver.step.delay_write"):
                 for delay in self.delayed_edges_by_steps:
@@ -1930,6 +2340,9 @@ class GraphSolver(nn.Module):
         for block in self.cyclic_blocks.values():
             block.reset()
         self._last_outputs = {}
+        for arch in self.archetypes.values():
+            arch._pending.clear()
+            arch.clear_results()
 
     # ------------------------------------------------------------------
     # Lifecycle boundary dispatch

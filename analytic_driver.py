@@ -8199,82 +8199,45 @@ class AnalyticDriverViewer:
         self._needs_rebuild = True
 
     def _play_demo_sequence(self) -> None:
-        """Synthesize and play an arpeggiated demo using the patch sequence settings."""
-        if not _HAS_SEQ_ENG:
-            print("sequence_engine not available for demo playback")
-            return
+        """Render the demo through the torch graph solver and play a preview mix."""
         p = self.patch
-        template = next((v for v in p.voices if not v.muted), None)
-        if template is None:
+        if not any(not v.muted for v in p.voices):
             return
-        scale = p.seq_scale if p.seq_scale in MODAL_SCALES else "pentatonic_minor"
-        beat_s  = 60.0 / max(p.seq_bpm, 1.0)
-        pattern = _SEQ_PATTERN_PRESETS[
-            max(0, min(p.seq_pattern_idx, len(_SEQ_PATTERN_PRESETS) - 1))][1]
-
-        # ── Build the pitch list (shared by rhythm and arpeggio paths) ────────
-        try:
-            if p.seq_custom_semitones.strip():
-                custom_semi  = [float(s) for s in p.seq_custom_semitones.split(",")
-                                if s.strip()]
-                degrees: list[float] = []
-                for octave in range(p.seq_octave_span):
-                    for st in custom_semi:
-                        degrees.append(semitones_to_hz(p.seq_tonic_hz,
-                                                       st + 12 * octave))
-            else:
-                degrees = scale_degrees_hz(p.seq_tonic_hz, scale,
-                                           octave_span=p.seq_octave_span)
-        except Exception as exc:
-            print(f"Scale build error: {exc}")
-            return
-
-        try:
-            _play_groups = _prepare_sequence_play_groups(p, beat_s, degrees, pattern)
-        except Exception as exc:
-            print(f"Demo schedule error: {exc}")
-            return
-        if not _play_groups:
-            return
-
         import time as _time
-        sr = p.preview_sr
-
-        _fb_cfg     = p.routing.feedback
-        _gdecay_est = max(0.0, 1.0 - float(_fb_cfg.decay)) if _fb_cfg.enabled else 1.0
-        _ringdown_n = estimate_ringdown_samples(p.routing.edges, sr, _gdecay_est, _fb_cfg)
-        _total_dur  = max((s.total_duration for s, _ in _play_groups), default=0.0)
-        total_n = int((_total_dur + 0.5) * sr) + _ringdown_n
-        _total_events = sum(len(s.events) for s, _ in _play_groups)
-
-        _has_sm = any(m.module_type == "state_machine" and not m.muted
-                      and m.sm_plugin for m in p.modules)
-        print(f"Demo: {_total_events} events across {len(_play_groups)} groups "
-              f"| SR {sr} | SM modules {'ON' if _has_sm else 'off'}")
-
-        # Per-module persistent aux state (cavity scenes, stream states) that
-        # survives across notes so room/body geometry is built only once.
-        _persistent_aux: dict[str, dict] = dict(self._cavity_cache)
+        sr = int(p.preview_sr)
+        n = max(1, int(round(float(getattr(p, "duration", 1.0)) * sr)))
+        demo_batch = max(1, int(getattr(p, "demo_batch_size", 0) or os.environ.get("ANALYTIC_DEMO_BATCH_SIZE", "4")))
+        print(f"Demo graph: batch={demo_batch} samples={n} sr={sr}")
 
         _t0 = _time.monotonic()
-        mix_L, mix_R, _out_bus, _persistent_aux = _synthesize_sequence_full_batch(
-            p, _play_groups, total_n,
-            file_render=False,
-            out_channels=2,
-            persistent_aux=_persistent_aux,
+        render_result = render_patch_graph(
+            p,
+            sample_rate=sr,
+            n_samples=n,
+            demo_batch_size=demo_batch,
+            use_cache=False,
+            profile=bool(ANALYTIC_GRAPH_SHADOW_PROFILE),
         )
-
-        # Persist cavity caches back to the viewer for future runs / saving.
-        self._cavity_cache.update(_persistent_aux)
-
         elapsed = _time.monotonic() - _t0
-        print(f"Demo: complete in {elapsed:.1f}s")
-        peak = float(np.max(np.abs(np.maximum(np.abs(mix_L), np.abs(mix_R)))))
+        timings = render_result.metadata.get("timings", {})
+        print(
+            f"Demo graph: complete in {elapsed:.2f}s "
+            f"schedule_s={timings.get('schedule_s', 0.0):.3f} "
+            f"nodes={timings.get('node_count', 0)} edges={timings.get('edge_count', 0)}"
+        )
+        out_bus = np.asarray(render_result.output_bus(), dtype=np.float32)
+        if out_bus.ndim == 1:
+            out_bus = out_bus[:, None]
+        if out_bus.shape[1] > 2:
+            if out_bus.shape[1] % 2 == 0:
+                out_bus = out_bus.reshape(out_bus.shape[0], -1, 2).mean(axis=1)
+            else:
+                out_bus = out_bus.mean(axis=1, keepdims=True)
+        peak = float(np.max(np.abs(out_bus))) if out_bus.size else 0.0
         if peak > 1e-9:
-            mix_L = mix_L / peak
-            mix_R = mix_R / peak
+            out_bus = out_bus / peak
         try:
-            if not self._play_output_bus(np.column_stack([mix_L, mix_R]), sr):
+            if not self._play_output_bus(out_bus, sr):
                 print("Demo playback error: no output device")
         except Exception as exc:
             print(f"Demo playback error: {exc}")
@@ -8468,41 +8431,30 @@ class AnalyticDriverViewer:
             if m.key and m.key in self._cavity_cache and not m._sm_aux_state:
                 m._sm_aux_state = dict(self._cavity_cache[m.key])
         try:
-            render_result = render_patch_legacy(
+            render_result = render_patch_graph(
                 self.patch,
-                granular_seed_offset=self._seed_anim_tick,
+                sample_rate=self.patch.preview_sr,
+                n_samples=int(self.patch.preview_sr * self.patch.duration),
+                demo_batch_size=1,
+                use_cache=False,
+                profile=bool(ANALYTIC_GRAPH_SHADOW_PROFILE),
             )
-            # Harvest cavity caches produced during synthesis.
-            for m in self.patch.modules:
-                if m.key and getattr(m, "_sm_aux_state", None):
-                    self._cavity_cache[m.key] = dict(m._sm_aux_state)
-            if ANALYTIC_GRAPH_SHADOW:
-                try:
-                    graph_result = render_patch_graph(
-                        self.patch,
-                        sample_rate=self.patch.preview_sr,
-                        n_samples=int(self.patch.preview_sr * self.patch.duration),
-                        use_cache=False,
-                        profile=bool(ANALYTIC_GRAPH_SHADOW_PROFILE),
-                    )
-                    summary = graph_shadow_summary(render_result, graph_result)
-                    timings = graph_result.metadata.get("timings", {})
-                    print(
-                        "Graph shadow: "
-                        f"samples={summary['samples']} channels={summary['channels']} "
-                        f"rms_delta={summary['rms_delta']} peak_delta={summary['peak_delta']} "
-                        f"compile_s={timings.get('compile_s', 0.0):.3f} "
-                        f"step_s={timings.get('step_s', 0.0):.3f} "
-                        f"avg_step_ms={timings.get('avg_step_ms', 0.0):.3f} "
-                        f"nodes={timings.get('node_count', 0)} "
-                        f"edges={timings.get('edge_count', 0)}"
-                    )
-                except Exception as graph_exc:
-                    print(f"Graph shadow error: {graph_exc}")
+            timings = render_result.metadata.get("timings", {})
+            print(
+                "Preview graph: "
+                f"samples={render_result.n_samples} "
+                f"compile_s={timings.get('compile_s', 0.0):.3f} "
+                f"schedule_s={timings.get('schedule_s', 0.0):.3f} "
+                f"nodes={timings.get('node_count', 0)} "
+                f"edges={timings.get('edge_count', 0)} "
+                f"fifo_slots={timings.get('fifo_slots', 0)}"
+            )
             src_sr = self.patch.preview_sr
             out_bus = np.asarray(render_result.output_bus(), dtype=np.float32)
             if out_bus.ndim == 1:
                 out_bus = out_bus[:, None]
+            if out_bus.shape[1] > 2:
+                out_bus = out_bus[:, :2]
             if not self._play_output_bus(out_bus, src_sr):
                 print("Preview error: no output device")
         except Exception as exc:

@@ -23,6 +23,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
+from graph_solver import BlockFaculty
 from signal_generator_v2 import (
     ADSREnvelope,
     AdaptiveSampleBuffer,
@@ -684,6 +685,13 @@ class SequenceProbabilities:
     chromatic:   float = 0.0
     modal:       float = 0.0
 
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"double_back", "subversion", "chromatic", "modal"}),
+            tracked_inputs=frozenset(),
+        )
+
     def to_dict(self) -> dict:
         return {
             "double_back": self.double_back,
@@ -722,6 +730,15 @@ class NoteStream:
                         continue          # progression exhausted — rest
                     sched.add(NoteEvent(hz, ...))
     """
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        # Pitch generation is driven by note-onset events, not sample clock.
+        # All parameters are constant over any block (no live modulation).
+        return BlockFaculty(
+            constant_inputs=frozenset({"_degrees", "_probs"}),
+            tracked_inputs=frozenset(),
+        )
 
     def __init__(
         self,
@@ -832,6 +849,14 @@ class ArpeggioRule:
     partial_count: int = 6
     octave_span: int = 2
     repeats: int = 1
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"root_hz", "scale", "pattern", "bpm",
+                                       "octave_span", "repeats"}),
+            tracked_inputs=frozenset(),
+        )
 
     def generate(self) -> NoteSchedule:
         degrees      = scale_degrees_hz(self.root_hz, self.scale, self.octave_span)

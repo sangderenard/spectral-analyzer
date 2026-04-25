@@ -12,12 +12,16 @@ from analytic_model import (
     ModRouting,
     ParamNode,
 )
-from graph_solver import GraphSolver, TensorEdge, TensorNode, _CDTYPE
+from graph_solver import DebugArchetype, GraphSolver, TensorEdge, TensorNode, _CDTYPE
 from granular_engine import GrainPopulationSpec
 from network_materializer import LFOTorchNode, compile_network, materialize_network
 from parametric_curve import default_chirp, default_envelope
 from routing_engine import RoutingEdge
 from voice_graph_node import VoiceTorchOscillator, build_voice_mixer_network
+
+
+class _ContractModule(torch.nn.Module):
+    pass
 
 
 def _make_voice():
@@ -67,6 +71,147 @@ def test_acyclic_nonlinear_singleton_bypasses_cyclic_block() -> None:
     assert torch.allclose(out["nonlin"], torch.tensor(3.0 + 0.0j, dtype=_CDTYPE))
 
 
+def test_schedule_payload_preserves_batch_time_channel_axes() -> None:
+    def _double(x: torch.Tensor) -> torch.Tensor:
+        return x * 2.0
+
+    solver = GraphSolver(
+        nodes=[
+            TensorNode("src", layer="signal"),
+            TensorNode("dst", layer="signal", transform=_double),
+        ],
+        edges=[TensorEdge("src", "dst", weight=1.0 + 0.0j, delay_samples=1)],
+    )
+
+    src = torch.arange(12, dtype=torch.float64).reshape(2, 3, 2).to(_CDTYPE)
+    out = solver.run_schedule({"src": src}, n_frames=3)
+
+    assert out["src"].shape == (2, 3, 2)
+    assert out["dst"].shape == (2, 3, 2)
+    assert torch.allclose(out["dst"][:, 0, :], torch.zeros(2, 2, dtype=_CDTYPE))
+    assert torch.allclose(out["dst"][:, 1:, :], src[:, :-1, :] * 2.0)
+
+
+def test_lateral_archetype_accounting_persists_and_drives_schedule_batch() -> None:
+    arch = DebugArchetype()
+    solver = GraphSolver(
+        nodes=[
+            TensorNode("a", transform=lambda x: x, archetype_key="debug"),
+            TensorNode("b", transform=lambda x: x, archetype_key="debug"),
+            TensorNode("mix"),
+        ],
+        edges=[
+            TensorEdge("a", "mix", weight=1.0 + 0.0j),
+            TensorEdge("b", "mix", weight=1.0 + 0.0j),
+        ],
+        archetypes={"debug": arch},
+    )
+
+    assert ("debug", 0) in solver.lateral_accounting.archetype_groups
+    assert len(solver.lateral_accounting.grouped_positions) == 2
+
+    out = solver.run_schedule({}, n_frames=4)
+
+    assert out["a"].shape == (1, 4, 1)
+    assert arch.hit_counts.get("a", 0) == 1
+    assert arch.hit_counts.get("b", 0) == 1
+
+
+def test_subscription_contract_edges_do_not_enter_tensor_solve() -> None:
+    consumer_mod = _ContractModule()
+    solver = GraphSolver(
+        nodes=[
+            TensorNode(
+                "score",
+                subscription_ports=("score_out",),
+                subscription_contracts={"score_out": {"kind": "score_producer"}},
+            ),
+            TensorNode(
+                "voice",
+                analytic_module=consumer_mod,
+                subscription_ports=("score_in",),
+                subscription_contracts={
+                    "score_in": {
+                        "kind": "voice_score_consumer",
+                        "groups": ("lead",),
+                        "aggregation": "mask",
+                    }
+                },
+            ),
+        ],
+        edges=[
+            TensorEdge(
+                "score",
+                "voice",
+                weight=0.0 + 0.0j,
+                semantic_role="score_bundle",
+                src_port="score_out",
+                dst_port="score_in",
+            )
+        ],
+    )
+
+    assert len(solver.contract_edges) == 1
+    contract_edge = solver.contract_edges[0]
+    assert contract_edge.src_key == "score"
+    assert contract_edge.dst_key == "voice"
+    assert contract_edge.group_mask == ("lead",)
+    assert contract_edge.contract["dst"]["kind"] == "voice_score_consumer"
+    assert "score_in" in consumer_mod.subscription_ports
+    assert consumer_mod.subscription_ports["score_in"]["contract_edges_in"] == [contract_edge]
+
+    out = solver.run_schedule({}, n_frames=2)
+
+    assert out["score"].shape == (1, 2, 1)
+    assert out["voice"].shape == (1, 2, 1)
+
+
+def test_voice_nodes_publish_score_consumer_curve_contract() -> None:
+    voice = _make_voice()
+    solver, voice_nodes, _ = build_voice_mixer_network([voice], sample_rate=10.0, duration=1.0)
+    vnode = voice_nodes["voice"]
+
+    payload = solver.subscription_ports[("voice_out", "score_in")].payload
+    contract = payload["contract"]
+
+    assert contract["voice_key"] == "voice"
+    assert contract["envelope_curve"] is vnode.oscillator.envelope_curve
+    assert contract["chirp_curve"] is vnode.oscillator.chirp_curve
+    assert contract["aggregation"] == "mask"
+
+
+def test_voice_archetype_batches_same_level_curve_evaluation() -> None:
+    voice = _make_voice()
+    voice_b = _make_voice()
+    voice_b.key = "voice_b"
+    solver, voice_nodes, _ = build_voice_mixer_network(
+        [voice, voice_b],
+        sample_rate=10.0,
+        duration=1.0,
+        voice_port_occupancy={"voice": ("pitch_in",), "voice_b": ("pitch_in",)},
+    )
+
+    seen_shapes: list[tuple[int, ...]] = []
+    for vnode in voice_nodes.values():
+        orig_env = vnode.oscillator.envelope_curve.evaluate_normalized
+
+        def _counted_env(t_norm: torch.Tensor, _orig=orig_env) -> torch.Tensor:
+            seen_shapes.append(tuple(t_norm.shape))
+            return _orig(t_norm)
+
+        vnode.oscillator.envelope_curve.evaluate_normalized = _counted_env  # type: ignore[method-assign]
+
+    solver.run_schedule(
+        {
+            "voice_pitch_in": torch.full((1, 3, 1), 220.0 + 0.0j, dtype=_CDTYPE),
+            "voice_b_pitch_in": torch.full((1, 3, 1), 330.0 + 0.0j, dtype=_CDTYPE),
+        },
+        n_frames=3,
+    )
+
+    assert seen_shapes == [(1, 3, 1), (1, 3, 1)]
+
+
 def test_voice_oscillator_reuses_scalar_curve_evaluations_within_sample() -> None:
     osc = VoiceTorchOscillator(sample_rate=48_000.0, duration=1.0, fm_depth_hz=2.0)
     osc.gate_on(0.0, 1.0)
@@ -107,7 +252,7 @@ def test_voice_oscillator_reuses_scalar_curve_evaluations_within_sample() -> Non
     assert chirp_calls == 2
 
 
-def test_voice_network_solves_voice_out_once_per_step_without_feedback() -> None:
+def test_voice_network_solves_voice_out_through_archetype_without_feedback() -> None:
     voice = _make_voice()
     solver, voice_nodes, _ = build_voice_mixer_network(
         [voice],
@@ -130,7 +275,7 @@ def test_voice_network_solves_voice_out_once_per_step_without_feedback() -> None
     vnode.oscillator.forward = _counted_forward  # type: ignore[method-assign]
     solver.step({"voice_pitch_in": torch.tensor(440.0 + 0.0j, dtype=_CDTYPE)})
 
-    assert calls == 1
+    assert calls == 0
 
 
 def test_voice_network_omits_unoccupied_helper_ports() -> None:

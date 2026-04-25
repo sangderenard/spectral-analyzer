@@ -49,4 +49,25 @@ def test_graph_render_returns_named_complex128_products() -> None:
     assert result.engine == "graph"
     assert set(result.products) == {"v1", "__sys_out_1__"}
     assert result.products["v1"].tensor.dtype == torch.complex128
-    assert result.products["__sys_out_1__"].tensor.shape == (2,)
+    assert result.products["__sys_out_1__"].tensor.shape == (1, 2, 1)
+    assert result.output_bus().shape == (2, 2)
+
+
+def test_graph_render_demo_batch_does_not_create_dense_control_products() -> None:
+    patch = AnalyticPatch()
+    patch.preview_sr = 8
+    patch.duration = 0.25
+    patch.system_audio.output_channels = 1
+    patch.voices = [AnalyticVoice(key="v1", freq_hz=4.0)]
+    patch.routing.edges = [RoutingEdge(src_key="v1", dst_key="__sys_out_1__", weight=1.0)]
+
+    result = render_patch_graph(
+        patch,
+        sample_rate=8,
+        n_samples=2,
+        product_keys=["__sys_out_1__"],
+        demo_batch_size=3,
+        use_cache=False,
+    )
+
+    assert result.products["__sys_out_1__"].tensor.shape == (1, 2, 1)

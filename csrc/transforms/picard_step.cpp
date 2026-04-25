@@ -34,13 +34,33 @@
 #include "serial_kernel.h"
 #include "transforms_api.h"
 
+#include <Eigen/Dense>
 #include <cmath>
 #include <complex>
-#include <cstring>
 #include <memory>
 #include <vector>
 
 using cd = std::complex<double>;
+using VecXcd = Eigen::VectorXcd;
+
+/* ── Eigen interleaved complex helpers ───────────────────────────────────── */
+
+static VecXcd load_interleaved(const double* raw, int N)
+{
+    VecXcd out(N);
+    for (int i = 0; i < N; ++i)
+        out(i) = cd(raw[2 * i], raw[2 * i + 1]);
+    return out;
+}
+
+static void store_interleaved(const VecXcd& value, double* raw, int N)
+{
+    for (int i = 0; i < N; ++i)
+    {
+        raw[2 * i]     = value(i).real();
+        raw[2 * i + 1] = value(i).imag();
+    }
+}
 
 /* ── Transform implementations (definition of ct_apply) ─────────────────── */
 
@@ -176,48 +196,43 @@ int picard_scc_step(
     if (!st) return SK_ERR_NULL_STATE;
     const int N = st->N;
 
-    std::vector<double> z_cur(2 * N);
-    std::vector<double> z_new(2 * N);
-    std::memcpy(z_cur.data(), z_init, 2 * N * sizeof(double));
+    const VecXcd src_vec = load_interleaved(src, N);
+    VecXcd z_cur = load_interleaved(z_init, N);
+    VecXcd z_new(N);
 
     int iter = 0;
     for (; iter < st->max_iter; ++iter)
     {
         /* Seed z_new from external source */
-        std::memcpy(z_new.data(), src, 2 * N * sizeof(double));
+        z_new = src_vec;
 
         /* Accumulate edge contributions */
         for (const auto& e : st->edges)
         {
-            cd z_src(z_cur[2 * e.src_idx], z_cur[2 * e.src_idx + 1]);
-            cd contrib = e.weight * z_src;
+            cd contrib = e.weight * z_cur(e.src_idx);
 
             double buf[2] = { contrib.real(), contrib.imag() };
             ct_apply(e.sat_id, e.knee, buf, 1);
-            z_new[2 * e.dst_idx]     += buf[0];
-            z_new[2 * e.dst_idx + 1] += buf[1];
+            z_new(e.dst_idx) += cd(buf[0], buf[1]);
         }
 
         /* Per-node transform */
         for (int n = 0; n < N; ++n)
-            ct_apply(st->node_tf[n], st->node_knee[n], z_new.data() + 2 * n, 1);
+        {
+            double buf[2] = { z_new(n).real(), z_new(n).imag() };
+            ct_apply(st->node_tf[n], st->node_knee[n], buf, 1);
+            z_new(n) = cd(buf[0], buf[1]);
+        }
 
         /* Convergence: max|z_new - z_cur|_inf */
-        double residual = 0.0;
-        for (int n = 0; n < N; ++n)
-        {
-            double dr = z_new[2*n]   - z_cur[2*n];
-            double di = z_new[2*n+1] - z_cur[2*n+1];
-            double d  = std::sqrt(dr*dr + di*di);
-            if (d > residual) residual = d;
-        }
+        double residual = (z_new - z_cur).cwiseAbs().maxCoeff();
 
         std::swap(z_cur, z_new);
         if (residual < st->tol) { ++iter; break; }
     }
 
     st->last_iters = iter;
-    std::memcpy(z_out, z_cur.data(), 2 * N * sizeof(double));
+    store_interleaved(z_cur, z_out, N);
     return SK_OK;
 }
 

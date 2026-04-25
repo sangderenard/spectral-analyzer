@@ -34,6 +34,8 @@ import random as _random
 from dataclasses import dataclass, field
 from typing import List
 
+from graph_solver import BlockFaculty
+
 
 # ---------------------------------------------------------------------------
 # Curve shapes
@@ -108,6 +110,13 @@ class DynamicsCurve:
     scope_bars: float = 1.0
     intensity:  float = 0.5
 
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"shape", "scope_bars", "intensity"}),
+            tracked_inputs=frozenset(),
+        )
+
     def multiplier_at_bar(self, bar_offset: float, rng: _random.Random) -> float:
         """Velocity multiplier for a note whose onset is *bar_offset* bars from phrase start."""
         scope = max(1e-6, self.scope_bars)
@@ -147,6 +156,13 @@ class AccentPattern:
     name:   str  = "Dyn"
     levels: list = field(default_factory=lambda: [1.0] * 16)
 
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"levels"}),
+            tracked_inputs=frozenset(),
+        )
+
     def ensure_size(self, n: int) -> None:
         while len(self.levels) < n:
             self.levels.append(1.0)
@@ -184,6 +200,13 @@ class DynamicsProgram:
     enabled: bool          = False
     curve:   DynamicsCurve = field(default_factory=DynamicsCurve)
     accent:  AccentPattern = field(default_factory=AccentPattern)
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"enabled"}),
+            tracked_inputs=frozenset(),
+        )
 
     def to_dict(self) -> dict:
         return {

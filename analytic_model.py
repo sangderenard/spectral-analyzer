@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from analytic_shared import *  # noqa: F401,F403
 import analytic_shared as _analytic_shared
+from graph_solver import BlockFaculty
 
 globals().update({
     k: v for k, v in vars(_analytic_shared).items()
@@ -229,6 +230,8 @@ class PiecewiseVoiceEnvelope:
 
 @dataclass
 class AnalyticVoice:
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.voice"
+
     key:          str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
     label:        str   = "Voice"
     freq_hz:      float = 440.0
@@ -263,6 +266,15 @@ class AnalyticVoice:
     body_type:           str   = "direct"  # standard instrument body / resonator type tag
     emission_mode:       str   = "single"  # "single" | "granular"
     granular:            Any   = None      # GrainPopulationSpec when emission_mode=="granular"
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"freq_hz", "amplitude", "semitone_offset",
+                                       "harmonic_count", "harmonic_brightness"}),
+            tracked_inputs=frozenset({"fm_in", "am_in", "env_mod_in",
+                                      "chirp_mod_in", "pitch_in"}),
+        )
 
     def active_knots(self) -> list[list[float]]:
         if self.env_type == "adsr":
@@ -669,6 +681,8 @@ class PlacementResonatorConfig:
 
 @dataclass
 class LFODefinition:
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.lfo"
+
     key:            str       = field(default_factory=lambda: uuid.uuid4().hex[:8])
     label:          str       = "LFO"
     # Slot 0 params — stored at top level for UI / knob-system compat.
@@ -686,6 +700,13 @@ class LFODefinition:
     _SLOT_DEFAULTS: ClassVar[dict] = {
         "rate_hz": 1.0, "shape": "Sine", "phase_offset": 0.0, "depth": 1.0,
     }
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"rate_hz", "depth", "shape", "phase_offset"}),
+            tracked_inputs=frozenset(),
+        )
 
     def _all_channels(self) -> list:
         """Return a list of per-slot param dicts of length ``capacity``.
@@ -1213,6 +1234,15 @@ class QuantizerHandle:
     """
 
     _INTERP_MODES = ["discrete", "portamento", "slew", "slew2", "spline", "legato"]
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.quantizer"
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"portamento_time", "slew_rate", "slew2_accel",
+                                       "spline_tension", "scale_degrees"}),
+            tracked_inputs=frozenset({"pitch_in"}),
+        )
 
     def __init__(
         self,
@@ -1469,6 +1499,8 @@ def make_quantizer_handle(
 # ---------------------------------------------------------------------------
 @dataclass
 class AnalyticMixer:
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.mixer"
+
     key:               str  = field(default_factory=lambda: "__mix__")
     label:             str  = "Mix"
     projection_active: bool = True     # True → output track; False → meta-mixer
@@ -1481,6 +1513,13 @@ class AnalyticMixer:
     # "master" — the single top-level mix bus that receives room SM mic
     # streams and any instrument signals routed directly here.
     mixer_layer: str = "master"
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"projection_active", "mixer_layer"}),
+            tracked_inputs=frozenset({"signal_in"}),
+        )
 
     def to_dict(self) -> dict:
         return {"key": self.key, "label": self.label,
@@ -1685,6 +1724,8 @@ class ParamNode:
     energy     |z|²  · heavier weighting of loud moments
     rms        smoothed magnitude (128-sample window)
     """
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.param_node"
+
     key:           str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
     label:         str   = "Param"
     targets:       list  = field(default_factory=list)   # list[{"voice_key": str, "attr": str}]
@@ -1693,6 +1734,13 @@ class ParamNode:
     low:           float = 0.0     # output is clamped to [low, high]
     high:          float = 1.0
     color: list = field(default_factory=lambda: [180, 140, 220])
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"extractor", "low", "high"}),
+            tracked_inputs=frozenset({"signal_in"}),
+        )
 
     def to_dict(self) -> dict:
         return {"key": self.key, "label": self.label,
@@ -1857,6 +1905,8 @@ class SidecarBus:
 
 @dataclass
 class ControlSlider:
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.control_slider"
+
     key:    str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
     label:  str   = "Ctrl"
     value:  float = 0.5    # normalised position [0, 1]
@@ -1864,6 +1914,14 @@ class ControlSlider:
     high:   float = 1.0    # maps value=1 → high
     is_log: bool  = False
     color:  list  = field(default_factory=lambda: [140, 200, 160])
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        # DC source: constant for any block size, no inputs required.
+        return BlockFaculty(
+            constant_inputs=frozenset(),
+            tracked_inputs=frozenset(),
+        )
 
     def scaled_value(self) -> float:
         """Return the actual value in [low, high] from the normalised position."""
@@ -1908,10 +1966,19 @@ class ControlSurface:
     RoutingEdge from a slider's key to a ParamNode's key lets the slider drive
     any voice attribute continuously.
     """
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.control_surface"
+
     key:     str  = field(default_factory=lambda: uuid.uuid4().hex[:8])
     label:   str  = "Control"
     color:   list = field(default_factory=lambda: [100, 180, 140])
     sliders: list = field(default_factory=list)   # list[ControlSlider]
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset(),
+            tracked_inputs=frozenset(),
+        )
 
     @classmethod
     def knobs(cls) -> list:
@@ -1960,6 +2027,8 @@ class ControlSurface:
 # ---------------------------------------------------------------------------
 @dataclass
 class AnalyticModule:
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.module"
+
     key:         str   = field(default_factory=lambda: uuid.uuid4().hex[:8])
     label:       str   = "Module"
     module_type: str   = "lfo"
@@ -2016,6 +2085,17 @@ class AnalyticModule:
     _MODULE_TYPES = ["lfo", "passthrough", "pitch_quantizer", "interaural", "state_machine"]
     _LFO_SHAPES   = ["Sine", "Triangle", "Sawtooth", "Square"]
     _INTERP_MODES = ["discrete", "portamento", "slew", "slew2", "spline", "legato"]
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        # Conservatively declare only the parameters that are safe to hold
+        # constant across a block for any module type. Mode-specific analysis
+        # happens at graph build time when the actual module_type is known.
+        return BlockFaculty(
+            constant_inputs=frozenset({"rate_hz", "depth", "shape", "phase_offset",
+                                       "iau_azimuth", "iau_elevation", "iau_distance"}),
+            tracked_inputs=frozenset({"signal_in"}),
+        )
 
     @classmethod
     def knobs(cls) -> list:
@@ -2231,6 +2311,8 @@ class RhythmPattern:
     Use get_tree(div) to obtain a live BeatTree regardless of which mode is
     active.  Use ensure_size(n) as before — it is safe to call on either mode.
     """
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.rhythm_pattern"
+
     name:  str  = "Pat"
     steps: list = field(default_factory=lambda: [False] * 16)
     vel:   list = field(default_factory=lambda: [1.0] * 16)
@@ -2240,6 +2322,14 @@ class RhythmPattern:
     # Independent layer trees (created on demand, same spine, own subdivisions)
     accent_tree: "BeatTree | None" = field(default=None, compare=False, repr=False)
     improv_tree: "BeatTree | None" = field(default=None, compare=False, repr=False)
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"steps", "vel", "art", "beat_nodes",
+                                       "accent_tree", "improv_tree"}),
+            tracked_inputs=frozenset(),
+        )
 
     # ------------------------------------------------------------------
     # Tree access
@@ -2390,6 +2480,8 @@ class RhythmPage:
     voices that self-declare a matching register.  Any field left at its
     default inherits from the 'all' page at schedule-build time.
     """
+    ARCHETYPE_KEY: ClassVar[str] = "analytic.rhythm_page"
+
     # Core grid
     rhythm_enabled:   bool  = False
     rhythm_division:  int   = 16
@@ -2413,6 +2505,20 @@ class RhythmPage:
     # Per-module pattern binding: role → pattern index
     # "dynamics" / "improv" / "cadence" → int index into rhythm_patterns
     module_pats: dict = field(default_factory=dict)
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"rhythm_enabled", "rhythm_division",
+                                       "rhythm_patterns", "rhythm_phrase",
+                                       "rhythm_swing", "rhythm_pocket",
+                                       "rhythm_gate", "rhythm_prog_bars",
+                                       "rhythm_fit_mode", "meter_numerator",
+                                       "meter_denominator", "stress_pattern",
+                                       "warp_interpolator", "frac_beat_mode",
+                                       "module_pats"}),
+            tracked_inputs=frozenset(),
+        )
 
     def to_dict(self) -> dict:
         return {

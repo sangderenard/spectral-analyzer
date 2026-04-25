@@ -68,7 +68,15 @@ class PatchRenderResult:
             if key not in self.products:
                 continue
             arr = self.product_numpy(key)
-            cols.append(np.asarray(arr).reshape(-1)[: self.n_samples].real.astype(np.float32, copy=False))
+            arr = np.asarray(arr)
+            if arr.ndim >= 3:
+                series = np.moveaxis(arr, 1, 0).reshape(arr.shape[1], -1)
+                cols.extend(
+                    series[: self.n_samples, ci].real.astype(np.float32, copy=False)
+                    for ci in range(series.shape[1])
+                )
+            else:
+                cols.append(arr.reshape(-1)[: self.n_samples].real.astype(np.float32, copy=False))
         if not cols:
             return np.zeros((self.n_samples, 0), dtype=np.float32)
         return np.column_stack(cols).astype(np.float32, copy=False)
@@ -187,6 +195,7 @@ def render_patch_graph(
     sample_rate: Optional[float] = None,
     n_samples: Optional[int] = None,
     product_keys: Optional[Iterable[str]] = None,
+    demo_batch_size: int = 1,
     use_cache: bool = False,
     profile: bool = False,
 ) -> PatchRenderResult:
@@ -210,44 +219,59 @@ def render_patch_graph(
     compiled = None
     cache_hit = False
     t_compile0 = time.perf_counter()
+    demo_batch_size = max(1, int(demo_batch_size))
     if use_cache:
-        sig = (sr, tuple(product_keys or ()))
+        sig = (sr, tuple(product_keys or ()), demo_batch_size)
         if getattr(patch, "_compiled_signature", None) == sig:
             compiled = getattr(patch, "_compiled", None)
             cache_hit = compiled is not None
         if compiled is None:
-            compiled = compile_network(patch, sr)
+            compiled = compile_network(patch, sr, demo_batch_size=demo_batch_size)
             patch._compiled = compiled
             patch._compiled_signature = sig
     else:
-        compiled = compile_network(patch, sr)
+        compiled = compile_network(patch, sr, demo_batch_size=demo_batch_size)
     timings["compile_s"] = time.perf_counter() - t_compile0
     timings["cache_hit"] = cache_hit
 
     solver = compiled.solver
     t_reset0 = time.perf_counter()
     solver.reset()
+    solver.dispatch_before_start()
     timings["reset_s"] = time.perf_counter() - t_reset0
     t_keys0 = time.perf_counter()
     keys = _resolve_product_keys(compiled, patch, product_keys)
+    timings["fifo_slots"] = len(getattr(getattr(solver, "fifo_bank", None), "_slots", {}))
     buckets: dict[str, list[torch.Tensor]] = {key: [] for key in keys}
     timings["resolve_products_s"] = time.perf_counter() - t_keys0
 
     t_step0 = time.perf_counter()
     with torch.no_grad():
-        for _idx in range(n):
-            outputs = solver.step({})
+        if hasattr(solver, "run_schedule"):
+            outputs = solver.run_schedule({}, n_frames=n)
             for key in keys:
                 value = outputs.get(key)
                 if value is None:
-                    value = torch.zeros((), dtype=_CDTYPE)
-                buckets[key].append(value.detach().to(_CDTYPE).reshape(()))
-    timings["step_s"] = time.perf_counter() - t_step0
+                    value = torch.zeros(1, n, 1, dtype=_CDTYPE)
+                buckets[key].append(value.detach().to(_CDTYPE))
+        else:
+            for _idx in range(n):
+                outputs = solver.step({})
+                for key in keys:
+                    value = outputs.get(key)
+                    if value is None:
+                        value = torch.zeros((), dtype=_CDTYPE)
+                    buckets[key].append(value.detach().to(_CDTYPE).reshape(()))
+    timings["schedule_s"] = time.perf_counter() - t_step0
+    timings["step_s"] = timings["schedule_s"]
 
     t_stack0 = time.perf_counter()
     products: dict[str, RenderProduct] = {}
     for key, values in buckets.items():
-        tensor = torch.stack(values).to(_CDTYPE)
+        if len(values) == 1:
+            tensor = values[0].to(_CDTYPE)
+        else:
+            tensor = torch.stack(values).to(_CDTYPE)
         products[key] = RenderProduct(
             key=key,
             tensor=tensor,
@@ -272,6 +296,7 @@ def render_patch_graph(
         metadata={
             "module_registry_keys": sorted(getattr(compiled, "module_registry", {}).keys()),
             "timings": timings,
+            "demo_batch_size": demo_batch_size,
         },
     )
 

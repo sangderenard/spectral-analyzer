@@ -82,7 +82,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -90,6 +90,7 @@ from torch import Tensor
 
 from graph_solver import (
     AnalyticArchetype,
+    BlockFaculty,
     ChannelSpec,
     EncoderNodeSpec,
     GraphSolver,
@@ -104,6 +105,9 @@ from graph_solver import (
     TensorEdge,
     TensorNode,
     _CDTYPE,
+    _T,
+    _broadcast_shape,
+    _broadcast_to,
 )
 
 from parametric_curve import (
@@ -805,7 +809,11 @@ class VoiceTorchOscillator(nn.Module):
         semitone_shift = 2.0 ** (self.semitone_offset / 12.0)
         pitch_active = pitch_in is not None and pitch_in.real.abs().max().item() > 0.0
         if pitch_active:
-            p = pitch_in.real.to(torch.float64).reshape(())
+            p = pitch_in.real.to(torch.float64).reshape(-1)
+            if p.numel() == 1:
+                p = p.expand(N)
+            elif p.numel() != N:
+                p = p[:1].expand(N)
             if self.pitch_input_mode == "midi":
                 f_base = self.tuning_ref_hz * torch.pow(
                     torch.tensor(2.0, dtype=torch.float64, device=p.device),
@@ -920,15 +928,10 @@ class VoiceArchetype(AnalyticArchetype):
     """Shared dispatcher for all VoiceTorchOscillator output nodes.
 
     All MetaVoiceNode instances in a graph share one VoiceArchetype key so the
-    solver stages every voice's _out node into a single archetype wave, then
-    fires them together in one worker thread.  The actual per-voice forward()
-    calls are still sequential within that thread, but they run off the main
-    solve thread — freeing it to handle other archetype types or downstream
-    nodes concurrently.
-
-    ``analytic_module`` on each staged node is the ``MetaVoiceNode`` itself,
-    so ``fire()`` can call ``mod._transform(x)`` with the correct oscillator
-    state for each voice.
+    solver stages every same-level voice output node into one archetype wave.
+    ``fire()`` gathers every pending voice's oscillator parameters and live
+    inputs into tensors, calls ``forward()`` once, then scatters the batched
+    output back to graph node keys.
     """
 
     KEY = "voice.oscillator"
@@ -936,19 +939,198 @@ class VoiceArchetype(AnalyticArchetype):
     def __init__(self, device=None) -> None:
         super().__init__(archetype_key=self.KEY, state_width=0, device=device)
 
+    @staticmethod
+    def _payload_time_axis(payload_shape: tuple[int, ...]) -> int:
+        return 1 if len(payload_shape) >= 3 else 0
+
+    @staticmethod
+    def _view_for_payload(values: Tensor, payload_shape: tuple[int, ...]) -> Tensor:
+        return values.reshape((int(values.shape[0]),) + (1,) * len(payload_shape))
+
+    @staticmethod
+    def _voice_tensor(values: Sequence[Tensor], payload_shape: tuple[int, ...], device: torch.device) -> Tensor:
+        base = torch.stack([v.to(device=device, dtype=torch.float64).reshape(()) for v in values], dim=0)
+        return VoiceArchetype._view_for_payload(base, payload_shape)
+
+    @staticmethod
+    def _mod_tensor(
+        mods: Sequence["MetaVoiceNode"],
+        attr: str,
+        payload_shape: tuple[int, ...],
+        device: torch.device,
+        *,
+        default: complex,
+    ) -> Tensor:
+        rows: list[Tensor] = []
+        fill = torch.full(payload_shape, default, dtype=_CDTYPE, device=device)
+        for mod in mods:
+            value = getattr(mod, attr, None)
+            if value is None:
+                rows.append(fill)
+            else:
+                rows.append(_broadcast_to(value.to(device=device, dtype=_CDTYPE), payload_shape, device))
+        return torch.stack(rows, dim=0)
+
+    @staticmethod
+    def _harmonic_batch(
+        phase: Tensor,
+        f_base: Tensor,
+        amplitude: Tensor,
+        harmonic_count: int,
+        harmonic_brightness: Tensor,
+        harmonic_warp_strength: Tensor,
+        phase_origin: Tensor,
+        sample_rate: Tensor,
+    ) -> Tensor:
+        device = phase.device
+        h = torch.arange(1, harmonic_count + 1, dtype=torch.float64, device=device)
+        h_shape = (1,) * phase.dim() + (harmonic_count,)
+        h = h.reshape(h_shape)
+        brightness = harmonic_brightness.unsqueeze(-1)
+        warp = harmonic_warp_strength.unsqueeze(-1)
+        ratios = h + warp * (h - 1.0)
+        h_amp = (1.0 / h.pow(brightness)) * amplitude.unsqueeze(-1)
+        time_axis = 1 + VoiceArchetype._payload_time_axis(tuple(phase.shape[1:]))
+        h_phase_incr = 2.0 * math.pi * f_base.unsqueeze(-1) * ratios / sample_rate.unsqueeze(-1)
+        h_phase = torch.cumsum(h_phase_incr, dim=time_axis) + phase_origin.unsqueeze(-1) * h
+        basis = torch.exp(1j * h_phase.to(_CDTYPE))
+        sig = (h_amp.to(_CDTYPE) * basis).sum(-1)
+        norm = h_amp.sum(-1).clamp(min=1e-12)
+        return sig / norm.to(_CDTYPE)
+
+    def forward(self, x_batch: Tensor, mods: Sequence["MetaVoiceNode"], keys: Sequence[str]) -> Tensor:  # noqa: ARG002
+        """Run all pending voice nodes as one torch batch."""
+        if not mods:
+            return x_batch.to(_CDTYPE)
+
+        device = x_batch.device
+        x = x_batch.to(_CDTYPE)
+        payload_shape = tuple(x.shape[1:])
+        time_axis_payload = self._payload_time_axis(payload_shape)
+        time_axis = 1 + time_axis_payload if payload_shape else None
+        n_time = int(payload_shape[time_axis_payload]) if payload_shape else 1
+
+        oscillators = [mod.oscillator for mod in mods]
+        sample_rates = torch.stack([osc._sample_rate.to(device=device, dtype=torch.float64).reshape(()) for osc in oscillators], dim=0)
+        durations = torch.stack([osc._duration.to(device=device, dtype=torch.float64).reshape(()) for osc in oscillators], dim=0)
+        sample_idx = torch.stack([osc._sample_idx.to(device=device, dtype=torch.float64).reshape(()) for osc in oscillators], dim=0)
+
+        if payload_shape:
+            t_index = torch.arange(n_time, dtype=torch.float64, device=device)
+            t_shape = [1] * len(payload_shape)
+            t_shape[time_axis_payload] = n_time
+            t_index = t_index.reshape(t_shape)
+            t_abs = (t_index.unsqueeze(0) + self._view_for_payload(sample_idx, payload_shape)) / self._view_for_payload(sample_rates, payload_shape)
+        else:
+            t_abs = sample_idx / sample_rates
+        t_norm = (t_abs / self._view_for_payload(durations, payload_shape)).clamp(0.0, 1.0)
+
+        env_mod = self._mod_tensor(mods, "_env_mod", payload_shape, device, default=1.0 + 0.0j)
+        chirp_mod = self._mod_tensor(mods, "_chirp_mod", payload_shape, device, default=0.0 + 0.0j)
+        am_mod = self._mod_tensor(mods, "_am_mod", payload_shape, device, default=0.0 + 0.0j)
+        pitch_in = self._mod_tensor(mods, "_pitch_in", payload_shape, device, default=0.0 + 0.0j)
+
+        env_z = torch.stack(
+            [osc.envelope_curve.evaluate_normalized(t_norm[i]).to(device=device, dtype=_CDTYPE) for i, osc in enumerate(oscillators)],
+            dim=0,
+        )
+        chirp_z = torch.stack(
+            [osc.chirp_curve.evaluate_normalized(t_norm[i]).to(device=device, dtype=_CDTYPE) for i, osc in enumerate(oscillators)],
+            dim=0,
+        )
+        env_z = env_z * env_mod
+        chirp_hz = torch.stack(
+            [
+                osc.chirp_curve.to_physical(chirp_z[i].real.to(torch.float64).clamp(0.0, 1.0)).to(device=device, dtype=torch.float64)
+                for i, osc in enumerate(oscillators)
+            ],
+            dim=0,
+        ) + chirp_mod.real.to(torch.float64)
+
+        log_freq = self._voice_tensor([osc.log_freq for osc in oscillators], payload_shape, device)
+        log_amplitude = self._voice_tensor([osc.log_amplitude for osc in oscillators], payload_shape, device)
+        phase_origin = self._voice_tensor([osc.phase_origin for osc in oscillators], payload_shape, device)
+        semitone_offset = self._voice_tensor([osc.semitone_offset for osc in oscillators], payload_shape, device)
+        harmonic_brightness = self._voice_tensor([osc.harmonic_brightness for osc in oscillators], payload_shape, device)
+        harmonic_warp_strength = self._voice_tensor([osc.harmonic_warp_strength for osc in oscillators], payload_shape, device)
+        fm_depth_hz = self._voice_tensor([osc.fm_depth_hz for osc in oscillators], payload_shape, device)
+        am_depth_amp = self._voice_tensor([osc.am_depth_amp for osc in oscillators], payload_shape, device)
+        tuning_ref_hz = self._voice_tensor([osc.tuning_ref_hz for osc in oscillators], payload_shape, device)
+        tuning_ref_note = self._voice_tensor([osc.tuning_ref_note for osc in oscillators], payload_shape, device)
+        pre_delay = self._voice_tensor([osc.pre_delay_s for osc in oscillators], payload_shape, device)
+        sr_t = self._view_for_payload(sample_rates, payload_shape)
+
+        semitone_shift = torch.pow(torch.tensor(2.0, dtype=torch.float64, device=device), semitone_offset / 12.0)
+        p = pitch_in.real.to(torch.float64)
+        f_hz = p.clamp(min=1e-3) * semitone_shift
+        f_midi = tuning_ref_hz * torch.pow(
+            torch.tensor(2.0, dtype=torch.float64, device=device),
+            (p - tuning_ref_note) / 12.0,
+        ) * semitone_shift
+        midi_mask = torch.tensor(
+            [osc.pitch_input_mode == "midi" for osc in oscillators],
+            dtype=torch.bool,
+            device=device,
+        ).reshape((len(oscillators),) + (1,) * len(payload_shape))
+        f_pitch = torch.where(midi_mask, f_midi, f_hz)
+        if pitch_in.dim() > 1:
+            pitch_active = pitch_in.real.abs().amax(dim=tuple(range(1, pitch_in.dim())), keepdim=True) > 0.0
+        else:
+            pitch_active = pitch_in.real.abs() > 0.0
+        f_base = torch.where(pitch_active, f_pitch, torch.exp(log_freq) * semitone_shift)
+
+        total_factor = torch.exp(log_amplitude).to(_CDTYPE) * env_z
+        total_factor = total_factor * (1.0 + am_depth_amp.to(_CDTYPE) * am_mod.real.to(_CDTYPE))
+        total_factor = total_factor * torch.exp(1j * fm_depth_hz.to(_CDTYPE) * x)
+        amp_total = total_factor.abs().to(torch.float64)
+        phase_add = torch.angle(total_factor).to(torch.float64)
+
+        f_inst = f_base + chirp_hz
+        phase_incr = 2.0 * math.pi * f_inst / sr_t
+        if time_axis is None:
+            phase = phase_incr + phase_origin + phase_add
+        else:
+            phase = torch.cumsum(phase_incr, dim=time_axis) + phase_origin + phase_add
+
+        manifold_types = [osc.manifold_type for osc in oscillators]
+        harmonic_counts = [int(osc.harmonic_count) for osc in oscillators]
+        if len(set(manifold_types)) == 1 and manifold_types[0] in ("harmonic", "harmonic_warp") and len(set(harmonic_counts)) == 1 and harmonic_counts[0] > 1:
+            out = self._harmonic_batch(
+                phase,
+                f_base,
+                amp_total,
+                harmonic_counts[0],
+                harmonic_brightness,
+                harmonic_warp_strength,
+                phase_origin,
+                sr_t,
+            )
+        else:
+            out = amp_total.to(_CDTYPE) * torch.exp(1j * phase.to(_CDTYPE))
+
+        out = torch.where(t_abs < pre_delay, torch.zeros((), dtype=_CDTYPE, device=device), out)
+        with torch.no_grad():
+            for osc in oscillators:
+                osc._sample_idx.add_(n_time)
+        return out.to(_CDTYPE)
+
     def fire(self, forward_fn=None) -> None:  # noqa: ARG002
         if not self._pending:
             return
-        pending, self._pending = self._pending, []
-        for key, x, mod in pending:
-            if mod is not None:
-                try:
-                    out = mod._transform(x)
-                except Exception:
-                    out = x
+        with _T.span("voice.oscillator.fire"):
+            pending, self._pending = self._pending, []
+            keys = [key for key, _, _ in pending]
+            xs = [x.to(_CDTYPE) for _, x, _ in pending]
+            mods = [mod for _, _, mod in pending]
+            if any(mod is None for mod in mods):
+                common = _broadcast_shape([tuple(x.shape) for x in xs])
+                y_batch = torch.stack([_broadcast_to(x, common, self.device) for x in xs], dim=0)
             else:
-                out = x
-            self._results[key] = out.to(_CDTYPE) if isinstance(out, torch.Tensor) else out
+                common = _broadcast_shape([tuple(x.shape) for x in xs])
+                x_batch = torch.stack([_broadcast_to(x, common, self.device) for x in xs], dim=0)
+                y_batch = self.forward(x_batch, mods, keys)
+            for i, key in enumerate(keys):
+                self._results[key] = y_batch[i].to(_CDTYPE)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1067,6 +1249,7 @@ class MetaVoiceNode(nn.Module):
         *,
         layer: str = "signal",
         causal_mod_delay: bool = True,
+        score_contract: Optional[Mapping[str, Any]] = None,
     ) -> None:
         super().__init__()
         self.key = key
@@ -1086,6 +1269,7 @@ class MetaVoiceNode(nn.Module):
         self._am_mod:    Optional[Tensor] = None
         # Live pitch input from upstream port (set by pitch_in capture node)
         self._pitch_in:  Optional[Tensor] = None
+        self.score_contract: dict[str, Any] = dict(score_contract or {})
 
     # ------------------------------------------------------------------
     def set_sample(self, idx: int) -> None:
@@ -1184,6 +1368,7 @@ class MetaVoiceNode(nn.Module):
         k = self.key
         occupancy = _coerce_voice_port_occupancy(occupied_inputs)
         transform = self._make_transform()
+        self._transform = transform
 
         archetype = NodeArchetype(
             semantic_ports=(
@@ -1230,12 +1415,20 @@ class MetaVoiceNode(nn.Module):
             layer=self.layer,
             transform=transform,
             archetype=archetype,
-            analytic_module=self,           # MetaVoiceNode, not oscillator — VoiceArchetype.fire() needs _transform
+            analytic_module=self,
             archetype_key=VoiceArchetype.KEY,
+            block_faculty=BlockFaculty(
+                constant_inputs=frozenset({"freq_hz", "amplitude", "semitone_offset",
+                                           "harmonic_count", "harmonic_brightness"}),
+                tracked_inputs=frozenset({"fm_in", "am_in", "env_mod_in",
+                                          "chirp_mod_in", "pitch_in"}),
+            ),
             layer_presence=NodeLayerPresence(
                 output_layers=(self.layer,),
                 parameter_inputs=True,
             ),
+            subscription_ports=("score_in",),
+            subscription_contracts={"score_in": self.score_contract},
         )
         fm_node = TensorNode(
             key=f"{k}_fm",
@@ -1403,7 +1596,53 @@ class MetaVoiceNode(nn.Module):
         """Construct from an ``AnalyticVoice`` dataclass instance."""
         key = str(getattr(voice, "key", "voice"))
         osc = VoiceTorchOscillator.from_voice(voice, sample_rate=sample_rate, duration=duration)
-        return cls(key, osc, layer=layer, causal_mod_delay=causal_mod_delay)
+        def _as_tuple(value: Any) -> tuple[str, ...]:
+            if value is None or value == "":
+                return ()
+            if isinstance(value, str):
+                return (value,)
+            try:
+                return tuple(str(x) for x in value if str(x))
+            except TypeError:
+                return (str(value),)
+
+        groups = tuple(
+            str(x)
+            for x in _as_tuple(
+                getattr(voice, "score_groups", None)
+                or getattr(voice, "score_subtypes", None)
+                or getattr(voice, "score_pages", None)
+                or getattr(voice, "seq_role", "")
+            )
+            if str(x)
+        )
+        pages = tuple(
+            str(x)
+            for x in _as_tuple(
+                getattr(voice, "score_pages", None)
+                or getattr(voice, "page_keys", None)
+                or getattr(voice, "page_key", "")
+            )
+            if str(x)
+        )
+        score_contract = {
+            "kind": "voice_score_consumer",
+            "voice_key": key,
+            "groups": groups,
+            "pages": pages,
+            "aggregation": "mask",
+            "envelope_curve": osc.envelope_curve,
+            "chirp_curve": osc.chirp_curve,
+            "duration_s": float(osc._duration.item()),
+            "release_tail_s": float(getattr(getattr(voice, "adsr", None), "release", 0.08)),
+        }
+        return cls(
+            key,
+            osc,
+            layer=layer,
+            causal_mod_delay=causal_mod_delay,
+            score_contract=score_contract,
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────

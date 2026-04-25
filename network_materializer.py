@@ -65,6 +65,64 @@ if TYPE_CHECKING:
 _CDTYPE = torch.complex128
 
 
+def _block_len(x: Tensor) -> int:
+    """Return how many time samples a tensor-shaped payload represents."""
+    if x.dim() >= 3:
+        return max(1, int(x.shape[1]))
+    return max(1, int(x.numel()))
+
+
+def _shape_like(x: Tensor, value: Tensor) -> Tensor:
+    """Broadcast scalar source output to the payload shape the solver supplied."""
+    return torch.ones_like(x.to(_CDTYPE)) * value.to(_CDTYPE)
+
+
+def _time_series_like(x: Tensor, series: Tensor) -> Tensor:
+    """Broadcast a length-T series across ``x`` while preserving B/data/C axes."""
+    z = x.to(_CDTYPE)
+    t = _block_len(z)
+    y = series.to(device=z.device)
+    if y.dim() == 1:
+        y = y.reshape(1, int(y.shape[0]), 1)
+    elif y.dim() == 2:
+        y = y.unsqueeze(-1)
+    elif y.dim() == 0:
+        y = y.reshape(1, 1, 1)
+    if y.shape[1] < t:
+        pad = y[:, -1:, ...].expand(*y.shape[:1], t - int(y.shape[1]), *y.shape[2:])
+        y = torch.cat([y, pad], dim=1)
+    y = y[:, :t, ...].to(_CDTYPE)
+    if z.dim() >= 3:
+        return torch.broadcast_to(y, torch.broadcast_shapes(tuple(y.shape), tuple(z.shape)))
+    return y.reshape(tuple(z.shape) or ())
+
+
+def _flatten_time_lanes(z: Tensor) -> tuple[Tensor, tuple[int, ...]]:
+    """Return lanes as ``(L, T)`` plus original shape for B,T,...,C tensors."""
+    if z.dim() < 3:
+        return z.reshape(1, -1), tuple(z.shape)
+    moved = z.movedim(1, -1)
+    return moved.reshape(-1, z.shape[1]), tuple(z.shape)
+
+
+def _unflatten_time_lanes(lanes: Tensor, original_shape: tuple[int, ...]) -> Tensor:
+    if len(original_shape) < 3:
+        return lanes.reshape(original_shape)
+    time_n = original_shape[1]
+    outer_shape = original_shape[:1] + original_shape[2:]
+    moved = lanes.reshape(*outer_shape, time_n)
+    return moved.movedim(-1, 1)
+
+
+def _block_faculty_for(analytic_obj):
+    fn = getattr(type(analytic_obj), "block_faculty", None)
+    return fn() if callable(fn) else None
+
+
+def _archetype_key_for(analytic_obj) -> str:
+    return str(getattr(type(analytic_obj), "ARCHETYPE_KEY", "") or "")
+
+
 @dataclass
 class CompiledGraph:
     solver: object
@@ -192,8 +250,8 @@ class LFOTorchNode(nn.Module):
     def reset(self) -> None:
         self._sample_idx.zero_()
 
-    def forward(self, x: Tensor) -> Tensor:  # noqa: ARG002
-        t = self._sample_idx.to(torch.float64) / self._sample_rate
+    def _wave(self, sample_offsets: Tensor) -> Tensor:
+        t = sample_offsets.to(torch.float64) / self._sample_rate
         ph = 2.0 * math.pi * self.rate_hz * t + self.phase_offset
         cycle = torch.remainder(ph / (2.0 * math.pi), 1.0)
         if self.shape == "Triangle":
@@ -204,8 +262,18 @@ class LFOTorchNode(nn.Module):
             val = torch.sign(torch.sin(ph))
         else:
             val = torch.sin(ph)
-        self._sample_idx.add_(1)
         return (self.depth * val).to(_CDTYPE)
+
+    def forward_block(self, n_samples: int, *, device: Optional[torch.device] = None) -> Tensor:
+        n = max(1, int(n_samples))
+        dev = device or self._sample_idx.device
+        start = self._sample_idx.to(device=dev)
+        offsets = start + torch.arange(n, dtype=torch.int64, device=dev)
+        self._sample_idx.add_(n)
+        return self._wave(offsets)
+
+    def forward(self, x: Tensor) -> Tensor:  # noqa: ARG002
+        return _time_series_like(x, self.forward_block(_block_len(x), device=x.device))
 
 
 def materialize_lfo(lfo, sr: float) -> Tuple["object", nn.Module]:
@@ -218,6 +286,8 @@ def materialize_lfo(lfo, sr: float) -> Tuple["object", nn.Module]:
         transform=module.forward,
         natural_rate_hz=float(getattr(lfo, "rate_hz", 1.0)),
         analytic_module=module,
+        archetype_key=_archetype_key_for(lfo),
+        block_faculty=_block_faculty_for(lfo) or _gs.BlockFaculty(),
         fire_at_solve_start=True,
         hook_at_solve_start=module.reset,
     )
@@ -236,8 +306,10 @@ class ParamTorchNode(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         z = x.to(_CDTYPE)
-        if z.abs().max().item() == 0.0:
-            val = self.default_value
+        if z.numel() == 0:
+            return z
+        if bool(torch.all(z.abs() == 0.0).item()):
+            val = torch.ones_like(z.real) * self.default_value
         elif self.extractor == "real":
             val = z.real.to(torch.float64)
         elif self.extractor == "imag":
@@ -269,7 +341,7 @@ class ControlSliderTorchNode(nn.Module):
             out = self.low * torch.pow(self.high / self.low, v)
         else:
             out = self.low + v * (self.high - self.low)
-        return out.to(_CDTYPE)
+        return _shape_like(x, out)
 
 
 class LFOChannelTorchNode(nn.Module):
@@ -287,8 +359,8 @@ class LFOChannelTorchNode(nn.Module):
     def reset(self) -> None:
         self._sample_idx.zero_()
 
-    def forward(self, x: Tensor) -> Tensor:  # noqa: ARG002
-        t = self._sample_idx.to(torch.float64) / self._sample_rate
+    def _wave(self, sample_offsets: Tensor) -> Tensor:
+        t = sample_offsets.to(torch.float64) / self._sample_rate
         ph = 2.0 * math.pi * self.rate_hz * t + self.phase_offset
         cycle = torch.remainder(ph / (2.0 * math.pi), 1.0)
         if self.shape == "Triangle":
@@ -299,8 +371,18 @@ class LFOChannelTorchNode(nn.Module):
             val = torch.sign(torch.sin(ph))
         else:
             val = torch.sin(ph)
-        self._sample_idx.add_(1)
         return (self.amplitude * val).to(_CDTYPE)
+
+    def forward_block(self, n_samples: int, *, device: Optional[torch.device] = None) -> Tensor:
+        n = max(1, int(n_samples))
+        dev = device or self._sample_idx.device
+        start = self._sample_idx.to(device=dev)
+        offsets = start + torch.arange(n, dtype=torch.int64, device=dev)
+        self._sample_idx.add_(n)
+        return self._wave(offsets)
+
+    def forward(self, x: Tensor) -> Tensor:  # noqa: ARG002
+        return _time_series_like(x, self.forward_block(_block_len(x), device=x.device))
 
 
 class PitchQuantizerTorchNode(nn.Module):
@@ -318,9 +400,16 @@ class PitchQuantizerTorchNode(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         z = x.to(_CDTYPE)
-        hz_in = float(z.real.detach().cpu().item())
-        hz_out = self.handle(hz_in, hz_in, domain="hz", dt=self.dt)
-        return torch.tensor(complex(hz_out, float(z.imag.detach().cpu().item())), dtype=_CDTYPE, device=z.device)
+        lanes, original_shape = _flatten_time_lanes(z)
+        outs: list[np.ndarray] = []
+        import copy as _copy
+        for lane_idx, lane in enumerate(lanes):
+            handle = self.handle if lane_idx == 0 else _copy.deepcopy(self.handle)
+            hz_in = lane.real.detach().cpu().numpy()
+            outs.append(handle.process_series(hz_in, hz_in, domain="hz", dt=self.dt))
+        real_lanes = torch.as_tensor(np.stack(outs, axis=0), dtype=torch.float64, device=z.device)
+        real = _unflatten_time_lanes(real_lanes, original_shape)
+        return torch.complex(real, z.imag.to(torch.float64)).to(_CDTYPE)
 
 
 class InterauralTorchNode(nn.Module):
@@ -345,6 +434,57 @@ class InterauralTorchNode(nn.Module):
         el_tilt = el * (math.pi / 8.0)
         theta = theta_c - half_w + el_tilt if self.channel == 1 else theta_c + half_w - el_tilt
         return z * dist_gain.to(_CDTYPE) * torch.exp(1j * theta.to(_CDTYPE))
+
+
+class MixerTorchNode(nn.Module):
+    """Torch identity mixer node.
+
+    The graph solver performs edge accumulation before calling this transform,
+    so the mixer kernel's job is to keep the accumulated complex payload in
+    torch space and preserve scalar or block shape.
+    """
+
+    def __init__(self, mixer) -> None:
+        super().__init__()
+        self.projection_active = bool(getattr(mixer, "projection_active", True))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x.to(_CDTYPE)
+
+
+class PrecomputedSeriesTorchNode(nn.Module):
+    """Torch source backed by a precomputed real-valued control series."""
+
+    def __init__(self, series, *, dtype: torch.dtype = _CDTYPE) -> None:
+        super().__init__()
+        arr = np.asarray(series, dtype=np.float64)
+        if arr.size == 0:
+            arr = np.zeros((1, 1, 1), dtype=np.float64)
+        if arr.ndim == 1:
+            arr = arr.reshape(1, arr.shape[0], 1)
+        elif arr.ndim == 2:
+            arr = arr[:, :, None]
+        tensor = torch.as_tensor(arr, dtype=torch.float64)
+        self.register_buffer("series", tensor)
+        self.register_buffer("_sample_idx", torch.tensor(0, dtype=torch.int64))
+        self.dtype = dtype
+
+    def reset(self) -> None:
+        self._sample_idx.zero_()
+
+    def forward_block(self, n_samples: int, *, device: Optional[torch.device] = None) -> Tensor:
+        n = max(1, int(n_samples))
+        dev = device or self.series.device
+        idx0 = int(self._sample_idx.item())
+        idx = torch.arange(idx0, idx0 + n, dtype=torch.long, device=dev)
+        idx = torch.clamp(idx, 0, int(self.series.shape[1]) - 1)
+        self._sample_idx.add_(n)
+        real = self.series.to(device=dev)[:, idx, ...]
+        return real.to(_CDTYPE if self.dtype.is_complex else self.dtype)
+
+    def forward(self, x: Tensor) -> Tensor:  # noqa: ARG002
+        y = self.forward_block(_block_len(x), device=x.device)
+        return _time_series_like(x, y)
 
 
 class GranularVoiceNode(nn.Module):
@@ -386,10 +526,20 @@ class GranularVoiceNode(nn.Module):
         if self._buffer is None:
             self._buffer = self._render()
         idx = int(self._sample_idx.item())
-        self._sample_idx.add_(1)
+        n = _block_len(x)
+        self._sample_idx.add_(n)
         if idx >= int(self._buffer.numel()):
+            if x.dim() > 0:
+                return torch.zeros(tuple(x.shape), dtype=_CDTYPE, device=x.device)
             return torch.zeros((), dtype=_CDTYPE, device=self._buffer.device)
-        return self._buffer[idx]
+        if n == 1:
+            return _shape_like(x, self._buffer[idx].to(device=x.device))
+        out = torch.zeros(n, dtype=_CDTYPE, device=x.device)
+        stop = min(idx + n, int(self._buffer.numel()))
+        span = max(0, stop - idx)
+        if span:
+            out[:span] = self._buffer[idx:stop].to(device=x.device)
+        return _time_series_like(x, out)
 
 
 def _param_target_voice_port(attr: str) -> str:
@@ -492,6 +642,8 @@ def _prune_orphan_tensor_nodes(nodes: list, edges: list) -> "Tuple[List, List]":
 def materialize_network(
     patch: "AnalyticPatch",
     sr: float,
+    *,
+    demo_batch_size: int = 1,
 ) -> "Tuple[List, List]":
     """Wrap every analytic object in the patch into TensorNodes for GraphSolver."""
     _ad = _import_ad()
@@ -523,7 +675,7 @@ def materialize_network(
     def _dc_transform(hz: float):
         val = torch.tensor(complex(hz, 0.0), dtype=_CDTYPE)
         def _t(x: Tensor) -> Tensor:  # noqa: ARG001
-            return val
+            return _shape_like(x, val.to(device=x.device))
         return _t
 
     _add(_gs.TensorNode(key="__patch_tonic__", layer="virtual",
@@ -551,6 +703,8 @@ def materialize_network(
                 transform=module.forward,
                 natural_rate_hz=float(getattr(v, "freq_hz", 0.0)),
                 analytic_module=module,
+                archetype_key=_archetype_key_for(v),
+                block_faculty=_block_faculty_for(v) or _gs.BlockFaculty(),
                 fire_at_solve_start=True,
                 hook_at_solve_start=module.reset,
             ))
@@ -583,7 +737,6 @@ def materialize_network(
             for target in getattr(pn, "targets", []):
                 if str(target.get("voice_key", "")) == str(v.key):
                     base_occupied.add(_param_target_voice_port(str(target.get("attr", ""))))
-
         for i, runtime_key in enumerate(runtime_keys):
             rv = copy.copy(v)
             rv.key = runtime_key
@@ -608,7 +761,6 @@ def materialize_network(
                     semantic_role="voice_poly_sum" if poly_count > 1 else "voice_alias",
                 )
             )
-
     # ── LFOs ─────────────────────────────────────────────────────────────
     for lfo in patch.lfos:
         node, _module = materialize_lfo(lfo, sr)
@@ -622,17 +774,25 @@ def materialize_network(
             ch1 = InterauralTorchNode(mod, channel=1)
             ch2 = InterauralTorchNode(mod, channel=2)
             _add(_gs.TensorNode(key=mod.ch1_key(), layer=layer,
-                                transform=ch1.forward, analytic_module=ch1))
+                                transform=ch1.forward, analytic_module=ch1,
+                                archetype_key=_archetype_key_for(mod),
+                                block_faculty=_block_faculty_for(mod) or _gs.BlockFaculty()))
             _add(_gs.TensorNode(key=mod.ch2_key(), layer=layer,
-                                transform=ch2.forward, analytic_module=ch2))
+                                transform=ch2.forward, analytic_module=ch2,
+                                archetype_key=_archetype_key_for(mod),
+                                block_faculty=_block_faculty_for(mod) or _gs.BlockFaculty()))
         elif mtype == "state_machine":
             wrapper = KnobDrivenModule(mod)
             sm_layer = str(getattr(mod, "signal_layer", "performer")) or "performer"
             _add(_gs.TensorNode(key=mod.key, layer=sm_layer,
-                                transform=None, analytic_module=wrapper))
+                                transform=None, analytic_module=wrapper,
+                                archetype_key=_archetype_key_for(mod),
+                                block_faculty=wrapper.block_faculty or _gs.BlockFaculty()))
             for out_key in mod.sm_out_keys():
                 _add(_gs.TensorNode(key=out_key, layer=sm_layer,
-                                    transform=None, analytic_module=wrapper))
+                                    transform=None, analytic_module=wrapper,
+                                    archetype_key=_archetype_key_for(mod),
+                                    block_faculty=wrapper.block_faculty or _gs.BlockFaculty()))
         elif mtype == "lfo":
             if getattr(mod, "lfo_channels", None):
                 _add(_gs.TensorNode(key=mod.key, layer=layer, transform=None))
@@ -645,6 +805,8 @@ def materialize_network(
                         transform=lfo_mod.forward,
                         natural_rate_hz=float(ch.get("rate_hz", 1.0)),
                         analytic_module=lfo_mod,
+                        archetype_key=_archetype_key_for(mod),
+                        block_faculty=_block_faculty_for(mod) or _gs.BlockFaculty(),
                         fire_at_solve_start=True,
                         hook_at_solve_start=lfo_mod.reset,
                     ))
@@ -664,6 +826,8 @@ def materialize_network(
                     transform=node.transform,
                     natural_rate_hz=node.natural_rate_hz,
                     analytic_module=node.analytic_module,
+                    archetype_key=_archetype_key_for(mod),
+                    block_faculty=_block_faculty_for(mod) or _gs.BlockFaculty(),
                     fire_at_solve_start=True,
                     hook_at_solve_start=getattr(node.analytic_module, "reset", None),
                 ))
@@ -674,6 +838,8 @@ def materialize_network(
                 layer=layer,
                 transform=qmod.forward,
                 analytic_module=qmod,
+                archetype_key=_archetype_key_for(mod),
+                block_faculty=_block_faculty_for(mod) or _gs.BlockFaculty(),
                 fire_at_solve_start=True,
                 hook_at_solve_start=qmod.reset,
             ))
@@ -689,11 +855,21 @@ def materialize_network(
                 layer="control",
                 transform=cmod.forward,
                 analytic_module=cmod,
+                archetype_key=_archetype_key_for(slider),
+                block_faculty=_block_faculty_for(slider) or _gs.BlockFaculty(),
             ))
 
-    # ── Mixers — pure accumulators ───────────────────────────────────────
+    # ── Mixers — torch identity kernels over the accumulated signal ─────
     for mx in patch.mixers:
-        _add(_gs.TensorNode(key=mx.key, layer="master", transform=None))
+        mmod = MixerTorchNode(mx)
+        _add(_gs.TensorNode(
+            key=mx.key,
+            layer="master",
+            transform=mmod.forward,
+            analytic_module=mmod,
+            archetype_key=_archetype_key_for(mx),
+            block_faculty=_block_faculty_for(mx) or _gs.BlockFaculty(),
+        ))
 
     # ── Param nodes — scalar control extractors ─────────────────────────
     for pn in getattr(patch, "param_nodes", []):
@@ -703,6 +879,8 @@ def materialize_network(
             layer="param",
             transform=module.forward,
             analytic_module=module,
+            archetype_key=_archetype_key_for(pn),
+            block_faculty=_block_faculty_for(pn) or _gs.BlockFaculty(),
         ))
 
     # ── Edges ─────────────────────────────────────────────────────────────
@@ -785,13 +963,29 @@ def materialize_network(
     return _prune_orphan_tensor_nodes(nodes, edges)
 
 
-def compile_network(patch: "AnalyticPatch", sr: Optional[float] = None) -> CompiledGraph:
+def compile_network(
+    patch: "AnalyticPatch",
+    sr: Optional[float] = None,
+    *,
+    demo_batch_size: int = 1,
+) -> CompiledGraph:
     """Materialize *patch* and wrap it in a GraphSolver runtime bundle."""
     _ad = _import_ad()
     _gs = _import_gs()
     sample_rate = float(sr if sr is not None else getattr(patch, "preview_sr", 48_000.0))
-    nodes, edges = materialize_network(patch, sample_rate)
-    solver = _gs.GraphSolver(nodes=nodes, edges=edges, sample_rate=sample_rate)
+    nodes, edges = materialize_network(
+        patch,
+        sample_rate,
+        demo_batch_size=max(1, int(demo_batch_size)),
+    )
+
+    try:
+        from edge_fifo_bank import bank_for_edges
+        fifo_bank = bank_for_edges(edges, sample_rate, stride=1)
+    except Exception:
+        fifo_bank = None
+
+    solver = _gs.GraphSolver(nodes=nodes, edges=edges, sample_rate=sample_rate, fifo_bank=fifo_bank)
     node_keys = {node.key for node in nodes}
     output_keys = [key for key in _ad._system_output_keys(patch) if key in node_keys]
     if not output_keys:

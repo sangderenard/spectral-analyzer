@@ -2307,6 +2307,11 @@ def _synthesize_patch(
         "__patch_tonic__": np.full(n_ext, _patch_tonic_val, dtype=np.complex128),
         "__patch_seq__":   np.full(n_ext, _patch_seq_val, dtype=np.complex128),
     }
+    try:
+        for _dk, _darr in _build_demo_control_series(patch, sr, n_ext).items():
+            patch_virtual_sigs[_dk] = np.asarray(_darr, dtype=np.float64).astype(np.complex128)
+    except Exception:
+        pass
     for _vk, _vsig in patch_virtual_sigs.items():
         sidecar.put(_vk, "value", _vsig.real.astype(np.float64))
 

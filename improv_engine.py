@@ -59,6 +59,8 @@ import random as _random
 from dataclasses import dataclass, field
 from typing import List, Optional, TYPE_CHECKING
 
+from graph_solver import BlockFaculty
+
 if TYPE_CHECKING:
     from sequence_engine import NoteEvent, NoteSchedule  # type: ignore
 
@@ -243,6 +245,15 @@ class ImprovProgram:
     chirp:       ChirpParams = field(default_factory=ChirpParams)
     echo:        EchoParams  = field(default_factory=EchoParams)
     improv_steps: List[List[bool]] = field(default_factory=lambda: [[]])
+
+    @staticmethod
+    def block_faculty() -> "BlockFaculty":
+        return BlockFaculty(
+            constant_inputs=frozenset({"enabled", "prob_grace", "prob_chirp",
+                                       "prob_echo", "grace", "chirp", "echo",
+                                       "improv_steps"}),
+            tracked_inputs=frozenset(),
+        )
 
     def ensure_pattern_size(self, pat_i: int, n_steps: int) -> None:
         """Grow improv_steps so [pat_i][step_i] is always accessible."""

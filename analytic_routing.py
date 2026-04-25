@@ -15,8 +15,21 @@ def _import_all_from(module):
 _import_all_from(_analytic_model)
 _import_all_from(_analytic_shared)
 
-_PATCH_VIRTUAL_KEYS: tuple = ("__patch_tonic__", "__patch_seq__")
+_PATCH_VIRTUAL_KEYS: tuple = (
+    "__patch_tonic__",
+    "__patch_seq__",
+)
 _ROUTER_UI_PREFIX: str = "__router__:"
+
+_DEMO_VIRTUAL_LABELS: dict[str, str] = {
+    "__patch_tonic__": "Tonic",
+    "__patch_seq__": "Seq Pitch",
+}
+
+_DEMO_VIRTUAL_COLORS: dict[str, tuple[int, int, int]] = {
+    "__patch_tonic__": (80, 180, 255),
+    "__patch_seq__": (80, 220, 160),
+}
 
 def _control_connection_target_port_key(dst_key: str, param_path: str) -> str:
     return f"{dst_key}:param:{param_path}" if param_path else dst_key
@@ -525,8 +538,33 @@ def _published_ports_for_router(router: "RouterInstance") -> list[PublishedPort]
     ]
 
 
+def _published_ports_for_patch_virtuals(patch: "AnalyticPatch") -> list[PublishedPort]:
+    ports: list[PublishedPort] = []
+    for key in _PATCH_VIRTUAL_KEYS:
+        color = _DEMO_VIRTUAL_COLORS.get(key, (120, 160, 180))
+        ports.append(PublishedPort(
+            key=key,
+            label=_routing_node_label(key, patch),
+            direction="out",
+            domain="pitch",
+            owner_key="__patch_context__",
+            group="Patch Context",
+            color=color,
+            tensor=PortTensorSpec(
+                tensor_rank=1,
+                lane_count=0,
+                parallel_group="patch_context_stream",
+                semantic_role="patch_context",
+            ),
+            semantic_role="patch_context",
+            negotiates_group_validity=True,
+        ))
+    return ports
+
+
 def _published_ports_for_patch(patch: "AnalyticPatch") -> dict[str, list[PublishedPort]]:
     out: dict[str, list[PublishedPort]] = {}
+    out["__patch_context__"] = _published_ports_for_patch_virtuals(patch)
     for v in patch.voices:
         out[v.key] = _published_ports_for_voice(v)
     for m in patch.mixers:
@@ -557,6 +595,7 @@ def _published_ports_for_patch(patch: "AnalyticPatch") -> dict[str, list[Publish
 def _rack_device_views_for_patch(patch: "AnalyticPatch") -> list[RackDeviceView]:
     published = _published_ports_for_patch(patch)
     device_order: list[tuple[str, str, tuple[int, int, int], str]] = []
+    device_order.append(("__patch_context__", "Patch Context", (90, 170, 190), "patch"))
     for v in patch.voices:
         device_order.append((v.key, v.label, tuple(v.color[:3]), "voice"))
     for mod in patch.modules:
@@ -981,6 +1020,8 @@ def _routing_node_label(key: str, patch: "AnalyticPatch") -> str:
         return f"Tonic ({_hz_to_note_name(patch.seq_tonic_hz, patch.tuning)})"
     if key == "__patch_seq__":
         return "Seq.Pitch"
+    if key in _DEMO_VIRTUAL_LABELS:
+        return _DEMO_VIRTUAL_LABELS[key]
     for i, sys_key in enumerate(_system_input_keys(patch)):
         if sys_key == key:
             return f"System In {i + 1}"
@@ -1026,10 +1067,8 @@ def _routing_node_label(key: str, patch: "AnalyticPatch") -> str:
 
 
 def _routing_node_color(key: str, patch: "AnalyticPatch") -> tuple:
-    if key == "__patch_tonic__":
-        return (80, 180, 255)    # blue  -- tonal centre
-    if key == "__patch_seq__":
-        return (80, 220, 160)    # teal  -- note-plan pitch stream
+    if key in _DEMO_VIRTUAL_COLORS:
+        return _DEMO_VIRTUAL_COLORS[key]
     if key in _system_input_keys(patch):
         return (70, 170, 170)
     if key in _system_output_keys(patch):

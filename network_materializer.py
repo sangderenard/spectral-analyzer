@@ -129,6 +129,59 @@ class CompiledGraph:
     output_node_keys: list[str]
     module_registry: dict[str, nn.Module]
 
+
+def compile_nodes(
+    nodes: "List",
+    edges: "List",
+    sample_rate: float,
+    *,
+    output_node_keys: "Optional[List[str]]" = None,
+) -> CompiledGraph:
+    """Construct a GraphSolver runtime bundle from pre-built nodes and edges.
+
+    This is the permanent entry point for direct node construction — no
+    AnalyticPatch involved.  Callers build TensorNodes and TensorEdges
+    directly and hand them off here.
+
+    The shared EdgeFifoBank is collected from whichever edge carries a
+    ``fifo_bank`` attribute (all edges in a graph must share one bank
+    instance).  If no edge carries one, a fresh bank is created.
+    """
+    _gs = _import_gs()
+
+    try:
+        from edge_fifo_bank import bank_for_edges
+        edge_bank = None
+        for e in edges:
+            b = getattr(e, "fifo_bank", None)
+            if b is not None:
+                edge_bank = b
+                break
+        fifo_bank = bank_for_edges(edges, stride=1, bank=edge_bank)
+    except Exception:
+        fifo_bank = None
+
+    solver = _gs.GraphSolver(nodes=nodes, edges=edges, sample_rate=float(sample_rate), fifo_bank=fifo_bank)
+
+    node_keys = {node.key for node in nodes}
+    if output_node_keys is not None:
+        out_keys = [k for k in output_node_keys if k in node_keys]
+    else:
+        out_keys = [node.key for node in nodes if getattr(node, "layer", "") == "master"]
+        if not out_keys:
+            out_keys = list(node_keys)
+
+    module_registry = {
+        node.key: node.analytic_module
+        for node in nodes
+        if isinstance(getattr(node, "analytic_module", None), nn.Module)
+    }
+    return CompiledGraph(
+        solver=solver,
+        output_node_keys=out_keys,
+        module_registry=module_registry,
+    )
+
 # ---------------------------------------------------------------------------
 # Lazy imports — kept at function scope to avoid hard circular dependencies
 # ---------------------------------------------------------------------------
@@ -587,7 +640,6 @@ def routing_edge_to_tensor_edge(e) -> "TensorEdge":
     src_key             src_key
     dst_key             dst_key
     weight*exp(j*ang)   weight          (folded complex)
-    delay_s             delay_s
     saturation          saturation_policy
     saturation_knee     saturation_knee
     router_key          group
@@ -610,7 +662,6 @@ def routing_edge_to_tensor_edge(e) -> "TensorEdge":
         src_key           = str(e.src_key),
         dst_key           = str(e.dst_key),
         weight            = weight,
-        delay_s           = float(getattr(e, "delay_s", 0.0)),
         saturation_policy = str(getattr(e, "saturation", "")),
         saturation_knee   = float(getattr(e, "saturation_knee", 1.0)),
         group             = str(getattr(e, "router_key", "")),
@@ -968,10 +1019,20 @@ def compile_network(
     sr: Optional[float] = None,
     *,
     demo_batch_size: int = 1,
+    extra_nodes: "Optional[List]" = None,
+    extra_edges: "Optional[List]" = None,
 ) -> CompiledGraph:
-    """Materialize *patch* and wrap it in a GraphSolver runtime bundle."""
+    """DEPRECATED: Use compile_nodes with direct node construction instead.
+
+    Materialize *patch* and wrap it in a GraphSolver runtime bundle.
+
+    ``extra_nodes`` and ``extra_edges`` are appended after materialization so
+    that pre-built TensorNodes (e.g. ScoreSequencerNode, AudioProjectorNode)
+    can participate in the same solver without special-casing in the
+    materializer.  Every node is equal; this is the seam that lets the caller
+    compose arbitrary nodes alongside patch-derived ones.
+    """
     _ad = _import_ad()
-    _gs = _import_gs()
     sample_rate = float(sr if sr is not None else getattr(patch, "preview_sr", 48_000.0))
     nodes, edges = materialize_network(
         patch,
@@ -979,24 +1040,14 @@ def compile_network(
         demo_batch_size=max(1, int(demo_batch_size)),
     )
 
-    try:
-        from edge_fifo_bank import bank_for_edges
-        fifo_bank = bank_for_edges(edges, sample_rate, stride=1)
-    except Exception:
-        fifo_bank = None
+    if extra_nodes:
+        nodes = list(nodes) + list(extra_nodes)
+    if extra_edges:
+        edges = list(edges) + list(extra_edges)
 
-    solver = _gs.GraphSolver(nodes=nodes, edges=edges, sample_rate=sample_rate, fifo_bank=fifo_bank)
     node_keys = {node.key for node in nodes}
     output_keys = [key for key in _ad._system_output_keys(patch) if key in node_keys]
     if not output_keys:
         output_keys = [getattr(mx, "key", "") for mx in getattr(patch, "mixers", []) if getattr(mx, "key", "") in node_keys]
-    module_registry = {
-        node.key: node.analytic_module
-        for node in nodes
-        if isinstance(getattr(node, "analytic_module", None), nn.Module)
-    }
-    return CompiledGraph(
-        solver=solver,
-        output_node_keys=output_keys,
-        module_registry=module_registry,
-    )
+
+    return compile_nodes(nodes, edges, sample_rate, output_node_keys=output_keys or None)

@@ -16,11 +16,123 @@ from __future__ import annotations
 
 import cmath
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 from enum import IntEnum
 from typing import Any, Iterable, Sequence
 
 import torch
+
+
+_COMPOSER_JSON_TYPES: dict[str, type] = {}
+
+
+def _register_json_type(cls: type) -> type:
+    _COMPOSER_JSON_TYPES[cls.__name__] = cls
+    return cls
+
+
+def _jsonable_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return {
+            "__tensor__": True,
+            "dtype": str(value.dtype).replace("torch.", ""),
+            "shape": list(value.shape),
+            "data": value.detach().cpu().tolist(),
+        }
+    if hasattr(value, "to_dict") and callable(getattr(value, "to_dict")):
+        return {
+            "__object_type__": type(value).__name__,
+            "data": _jsonable_value(value.to_dict()),
+        }
+    if is_dataclass(value):
+        if type(value).__name__ in _COMPOSER_JSON_TYPES:
+            return composer_to_jsonable(value)
+        return {
+            "__plain_dataclass__": type(value).__name__,
+            "fields": {
+                f.name: _jsonable_value(getattr(value, f.name))
+                for f in fields(value)
+            },
+        }
+    if isinstance(value, IntEnum):
+        return int(value)
+    if isinstance(value, tuple):
+        return {"__tuple__": [_jsonable_value(v) for v in value]}
+    if isinstance(value, list):
+        return [_jsonable_value(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _jsonable_value(v) for k, v in value.items()}
+    if isinstance(value, complex):
+        return {"__complex__": [float(value.real), float(value.imag)]}
+    return value
+
+
+def _value_from_jsonable(value: Any, *, device: torch.device | str | None = None) -> Any:
+    if isinstance(value, dict):
+        if value.get("__tensor__"):
+            dtype_name = str(value.get("dtype", "float64"))
+            dtype = getattr(torch, dtype_name, torch.float64)
+            return torch.tensor(value.get("data", []), dtype=dtype, device=device).reshape(tuple(value.get("shape", [])))
+        if "__tuple__" in value:
+            return tuple(_value_from_jsonable(v, device=device) for v in value["__tuple__"])
+        if "__complex__" in value:
+            re, im = value["__complex__"]
+            return complex(float(re), float(im))
+        type_name = value.get("__composer_type__")
+        if type_name:
+            return composer_from_jsonable(value, device=device)
+        object_type = value.get("__object_type__")
+        if object_type == "ParametricCurve":
+            from parametric_curve import ParametricCurve
+            return ParametricCurve.from_dict(_value_from_jsonable(value.get("data", {}), device=device))
+        if object_type == "ResolvedNote":
+            from analytic_model import ResolvedNote as _ResolvedNote
+            return _ResolvedNote.from_dict(_value_from_jsonable(value.get("data", {}), device=device))
+        plain_type = value.get("__plain_dataclass__")
+        if plain_type == "GateEvent":
+            from parametric_curve import GateEvent
+            raw = {
+                k: _value_from_jsonable(v, device=device)
+                for k, v in dict(value.get("fields", {})).items()
+            }
+            return GateEvent(**raw)
+        return {k: _value_from_jsonable(v, device=device) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_value_from_jsonable(v, device=device) for v in value]
+    return value
+
+
+def composer_to_jsonable(obj: Any) -> dict[str, Any]:
+    """Serialize torch-composer dataclasses/tensors into JSON-compatible data."""
+    if not is_dataclass(obj):
+        raise TypeError(f"composer_to_jsonable expects a dataclass, got {type(obj).__name__}")
+    payload = {
+        "__composer_type__": type(obj).__name__,
+        "fields": {
+            f.name: _jsonable_value(getattr(obj, f.name))
+            for f in fields(obj)
+        },
+    }
+    return payload
+
+
+def composer_from_jsonable(
+    payload: dict[str, Any],
+    *,
+    device: torch.device | str | None = None,
+) -> Any:
+    """Rebuild a torch-composer dataclass from :func:`composer_to_jsonable` data."""
+    type_name = str(payload.get("__composer_type__", ""))
+    cls = _COMPOSER_JSON_TYPES.get(type_name)
+    if cls is None:
+        raise ValueError(f"Unknown composer JSON type: {type_name!r}")
+    raw_fields = dict(payload.get("fields", {}))
+    kwargs = {
+        f.name: _value_from_jsonable(raw_fields[f.name], device=device)
+        for f in fields(cls)
+        if f.name in raw_fields
+    }
+    return cls(**kwargs)
 
 
 class ScoreEventLabel(IntEnum):
@@ -102,6 +214,7 @@ EVENT_PARAM_NAMES: tuple[str, ...] = (
     "kind",
 )
 
+@_register_json_type
 @dataclass
 class ScoreTensor:
     """Batched symbolic score.
@@ -179,6 +292,55 @@ class ScoreTensor:
         return torch.where(self.mask, end, torch.zeros_like(end)).amax(dim=1)
 
 
+@_register_json_type
+@dataclass
+class ScoreWriteMask:
+    """Per-event composer permissions for module-owned score edits."""
+
+    hz: torch.Tensor
+    start: torch.Tensor
+    duration: torch.Tensor
+    velocity: torch.Tensor
+    module_names: tuple[str, ...] = ("note_stream", "timing", "dynamics")
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.hz = self.hz.to(torch.bool)
+        self.start = self.start.to(torch.bool)
+        self.duration = self.duration.to(torch.bool)
+        self.velocity = self.velocity.to(torch.bool)
+        shape = self.hz.shape
+        if self.start.shape != shape or self.duration.shape != shape or self.velocity.shape != shape:
+            raise ValueError("all ScoreWriteMask fields must have the same shape")
+
+    @staticmethod
+    def like(
+        score: ScoreTensor,
+        *,
+        hz: bool = False,
+        start: bool = False,
+        duration: bool = False,
+        velocity: bool = False,
+        module_names: tuple[str, ...] = ("note_stream", "timing", "dynamics"),
+        metadata: dict[str, Any] | None = None,
+    ) -> "ScoreWriteMask":
+        shape = score.mask.shape
+        dev = score.mask.device
+
+        def _m(enabled: bool) -> torch.Tensor:
+            return torch.full(shape, bool(enabled), dtype=torch.bool, device=dev) & score.mask
+
+        return ScoreWriteMask(
+            hz=_m(hz),
+            start=_m(start),
+            duration=_m(duration),
+            velocity=_m(velocity),
+            module_names=module_names,
+            metadata=dict(metadata or {}),
+        )
+
+
+@_register_json_type
 @dataclass
 class SparseScoreTensor:
     """Page-aware sparse score packet for graph/composer handoff.
@@ -242,6 +404,7 @@ class SparseScoreTensor:
         )
 
 
+@_register_json_type
 @dataclass
 class ScoreEnvelopeJobs:
     """Packed note-event jobs spanning note-on through release tail."""
@@ -265,6 +428,7 @@ class ScoreEnvelopeJobs:
         return int(self.mask.numel())
 
 
+@_register_json_type
 @dataclass
 class PerformanceAtom:
     """One renderable note unit: timing context + live ParametricCurve callables.
@@ -277,6 +441,13 @@ class PerformanceAtom:
     envelope_curve — edited in parallel in the UI.  Its output is normalised
     [0, 1]; to_physical() converts to Hz deviation from fundamental_hz.
     Defaults to default_chirp() until chirp rules are authored.
+
+    note_events carries the full list of NoteEvent objects from the NoteSchedule
+    that generated this atom.  All atoms in the same batch from one schedule run
+    share the same list reference.  Empty by default (legacy atoms or when not
+    needed by the consumer).  A driver that declares ``needs_source_events`` in
+    its score_contract will receive atoms with this field populated so it can
+    re-run the job pipeline under its own rule set for its voices.
     """
     onset_sample:   int
     sample_count:   int
@@ -293,6 +464,8 @@ class PerformanceAtom:
     gate_history:   list      # list[GateEvent]
     envelope_curve: Any       # ParametricCurve
     chirp_curve:    Any       # ParametricCurve
+    note_events:    list  = field(default_factory=list)  # list[NoteEvent] — full source schedule
+    phase_delta:    float = 0.0   # radians added to carrier at onset (separate from phase_offset)
 
 
 def performance_atoms_from_jobs(
@@ -302,16 +475,24 @@ def performance_atoms_from_jobs(
     chirp_curves: "Sequence[Any]",
     voice_key: str,
     sample_rate: float,
+    source_events: "Optional[list]" = None,
 ) -> "list[PerformanceAtom]":
     """Build one PerformanceAtom per job, binding live curve callables.
 
-    ``envelope_curves`` and ``chirp_curves`` must each have length
-    ``jobs.job_count`` (expand a single curve with ``[curve] * n`` before
-    calling).  Curves are bound by reference — not copied.
+    ``envelope_curves`` and ``chirp_curves`` are broadcast: if either list is
+    shorter than ``jobs.job_count`` the last element is repeated.  Curves are
+    bound by reference — not copied.
+
+    ``source_events`` is the full list of NoteEvent objects from the NoteSchedule
+    that produced these jobs.  When provided, every atom in the batch shares the
+    same list reference so a downstream driver can re-run the job pipeline under
+    its own rules without a separate delivery channel.  Pass ``None`` (default)
+    when the consumer does not need source events (voice nodes, legacy callers).
     """
     from parametric_curve import GateEvent
 
     sr = max(1.0, float(sample_rate))
+    events_ref: list = source_events if source_events is not None else []
     atoms: list[PerformanceAtom] = []
     for i in range(jobs.job_count):
         dur_s   = float(jobs.duration_s[i])
@@ -335,12 +516,14 @@ def performance_atoms_from_jobs(
             page_index     = int(jobs.page_index[i]),
             event_index    = int(jobs.event_index[i]),
             gate_history   = [GateEvent(t_on=0.0, t_off=gate_off, velocity=vel)],
-            envelope_curve = envelope_curves[i],
-            chirp_curve    = chirp_curves[i],
+            envelope_curve = envelope_curves[min(i, len(envelope_curves) - 1)],
+            chirp_curve    = chirp_curves[min(i, len(chirp_curves) - 1)],
+            note_events    = events_ref,
         ))
     return atoms
 
 
+@_register_json_type
 @dataclass(frozen=True)
 class ComposerBatchConfig:
     """Batch render configuration for symbolic-to-control conversion."""
@@ -465,6 +648,64 @@ def sparse_score_tensor_from_schedules(
     """Convert schedules directly into the sparse page/event score packet."""
     score = score_tensor_from_schedules(schedules, max_events=max_events, device=device)
     return sparse_score_tensor_from_score(score, max_pages=max_pages)
+
+
+def slice_score_for_consumer(
+    score: SparseScoreTensor,
+    *,
+    wanted_pages: "frozenset[int] | None" = None,
+    wanted_groups: "frozenset[int] | None" = None,
+) -> SparseScoreTensor:
+    """Return a masked view of *score* keeping only events for one subscriber.
+
+    This is the group-subscription kernel: it implements the "who is to play
+    this note" decision.  Events are selected by two orthogonal axes:
+
+    ``wanted_pages``
+        Set of ``PARAM_PAGE`` page-index values to include.  ``None`` means
+        no filter — all pages pass.  A page is excluded entirely when its
+        integer index is not in the set.
+
+    ``wanted_groups``
+        Set of ``PARAM_PATTERN`` group-index values to include.  ``None``
+        means no filter — all groups pass.  Events within a page are
+        excluded when their group tag does not match.
+
+    Both filters are applied as AND: an event must satisfy *both* to survive.
+    When both are ``None`` the original *score* is returned unchanged (zero
+    allocation, zero copy), preserving backward-compatible behaviour for
+    sequencers / voices that do not declare group membership.
+    """
+    if wanted_pages is None and wanted_groups is None:
+        return score
+
+    new_mask = score.mask.clone()
+    B, _, PAGES, EVENTS = new_mask.shape
+
+    for page in range(PAGES):
+        # Entire page excluded by page filter
+        if wanted_pages is not None and page not in wanted_pages:
+            new_mask[:, :, page, :] = False
+            continue
+
+        # Per-event group filter
+        if wanted_groups is not None:
+            for ei in range(EVENTS):
+                if not new_mask[0, 0, page, ei].item():
+                    continue
+                grp_val = int(round(
+                    float(score.data[0, 0, page, ei, SCORE_FIELD_PARAMS, PARAM_PATTERN].item())
+                ))
+                if grp_val not in wanted_groups:
+                    new_mask[:, :, page, ei] = False
+
+    return SparseScoreTensor(
+        data=score.data,
+        mask=new_mask,
+        param_names=score.param_names,
+        label_names=score.label_names,
+        metadata=dict(score.metadata),
+    )
 
 
 def envelope_jobs_from_sparse_score(
@@ -665,6 +906,7 @@ _ART_GATE_MULT = torch.tensor([1.0, 0.5, 0.95, 1.0], dtype=torch.float64)
 # TorchWarpCurve
 # ─────────────────────────────────────────────────────────────────────────────
 
+@_register_json_type
 @dataclass
 class TorchWarpCurve:
     """Batch parametric warp curve.
@@ -899,6 +1141,7 @@ class _FlatLeaf:
         self.group    = group
 
 
+@_register_json_type
 @dataclass
 class TorchBeatTree:
     """Batch beat-tree in tensor form.
@@ -1337,6 +1580,7 @@ def _eval_dynamics_curve(
     )
 
 
+@_register_json_type
 @dataclass
 class TorchDynamicsCurve:
     """Batch shaped velocity envelope — torch counterpart to ``DynamicsCurve``.
@@ -1413,6 +1657,7 @@ class TorchDynamicsCurve:
         )
 
 
+@_register_json_type
 @dataclass
 class TorchAccentPattern:
     """Batch per-step accent grid — torch counterpart to ``AccentPattern``.
@@ -1479,6 +1724,7 @@ class TorchAccentPattern:
         return self.levels.gather(1, eff.unsqueeze(1)).squeeze(1)  # [B]
 
 
+@_register_json_type
 @dataclass
 class TorchDynamicsProgram:
     """Batch dynamics program — torch counterpart to ``DynamicsProgram``.
@@ -1647,6 +1893,7 @@ def apply_dynamics_to_score(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@_register_json_type
 @dataclass
 class TorchNoteStream:
     """Batch stateful note-progression generator — torch counterpart to ``NoteStream``.
@@ -1888,6 +2135,147 @@ def assign_hz_to_score(
     )
 
 
+def assign_hz_to_score_masked(
+    score: ScoreTensor,
+    stream: TorchNoteStream,
+    write_mask: ScoreWriteMask,
+) -> ScoreTensor:
+    """Assign note-stream pitches only where ``write_mask.hz`` grants access."""
+    B, E = score.labels.shape
+    dev = score.params.device
+    hz_buf = score.params[..., PARAM_HZ].clone()
+
+    for e in range(E):
+        active = score.mask[:, e] & write_mask.hz[:, e]
+        old_idx = stream.idx.clone()
+        old_dir = stream.direction.clone()
+        hz_e = stream.next_hz()
+        stream.idx = torch.where(active, stream.idx, old_idx)
+        stream.direction = torch.where(active, stream.direction, old_dir)
+        hz_buf[:, e] = torch.where(active, hz_e.to(device=dev, dtype=torch.float64), hz_buf[:, e])
+
+    new_params = score.params.clone()
+    new_params[..., PARAM_HZ] = hz_buf
+    meta = dict(score.metadata)
+    meta.setdefault("write_masks", {})["hz"] = "note_stream"
+    return ScoreTensor(
+        labels=score.labels,
+        params=new_params,
+        mask=score.mask,
+        param_names=score.param_names,
+        label_names=score.label_names,
+        metadata=meta,
+    )
+
+
+def build_masked_improvised_song(
+    *,
+    device: torch.device | str | None = None,
+) -> tuple[ScoreTensor, ScoreWriteMask, TorchNoteStream, SparseScoreTensor]:
+    """Build a small song sketch with fixed notes and module-writable gaps.
+
+    Slots 0, 2, 4, and 6 are fixed author choices.  Slots 1, 3, 5, and 7 are
+    granted to the note-stream module through ``ScoreWriteMask.hz``.
+    """
+    score = empty_score_tensor(batch_size=1, max_events=8, device=device)
+    starts = [0.0, 0.25, 0.50, 0.75, 1.00, 1.25, 1.50, 1.75]
+    fixed_hz = [261.63, 0.0, 329.63, 0.0, 392.00, 0.0, 523.25, 0.0]
+    module_slots = [False, True, False, True, False, True, False, True]
+    for i, start in enumerate(starts):
+        score.labels[0, i] = EVENT_NOTE
+        score.mask[0, i] = True
+        score.params[0, i, PARAM_START] = start
+        score.params[0, i, PARAM_DURATION] = 0.18
+        score.params[0, i, PARAM_HZ] = fixed_hz[i]
+        score.params[0, i, PARAM_VELOCITY] = 0.82 if not module_slots[i] else 0.68
+        score.params[0, i, PARAM_GATE] = 1.0
+        score.params[0, i, PARAM_STEP] = i
+        score.params[0, i, PARAM_SECTION] = float(ScoreSection.SEQUENCE)
+
+    write_mask = ScoreWriteMask.like(
+        score,
+        module_names=("note_stream",),
+        metadata={
+            "song": "masked_improv_sketch",
+            "hz_true": "note_stream may write pitch",
+            "hz_false": "author-fixed pitch",
+        },
+    )
+    write_mask.hz[0] = torch.tensor(module_slots, dtype=torch.bool, device=score.params.device)
+
+    stream = TorchNoteStream.build(
+        degrees=[[293.66, 349.23, 440.00, 493.88]],
+        deg_pattern=[[0, 1, 2, 3]],
+        p_chromatic=0.0,
+        p_modal=0.0,
+        device=device,
+    )
+    filled = assign_hz_to_score_masked(score, stream, write_mask)
+    filled.metadata.update({
+        "title": "Masked torch composer sketch",
+        "fixed_slots": [i for i, free in enumerate(module_slots) if not free],
+        "module_slots": [i for i, free in enumerate(module_slots) if free],
+    })
+    return filled, write_mask, stream, sparse_score_tensor_from_score(filled)
+
+
+def score_tensor_from_resolved_notes(
+    notes: list,
+    *,
+    voice_key: "str | None" = None,
+    device: "torch.device | str | None" = None,
+) -> "ScoreTensor":
+    """Build a ScoreTensor from piano-roll ResolvedNote objects.
+
+    Filters out rest events.  When *voice_key* is given, only notes matching
+    that voice are included.  Events are ordered by start_time.  Lock state is
+    not encoded here; use :func:`score_write_mask_from_resolved_notes` for that.
+    """
+    filtered = [n for n in notes if not getattr(n, "is_rest", False)]
+    if voice_key is not None:
+        filtered = [n for n in filtered if getattr(n, "voice_key", "") == voice_key]
+    filtered = sorted(filtered, key=lambda n: getattr(n, "start_time", 0.0))
+    n_ev = max(1, len(filtered))
+    score = empty_score_tensor(1, n_ev, device=device)
+    for ei, note in enumerate(filtered):
+        score.labels[0, ei] = EVENT_NOTE
+        score.mask[0, ei] = True
+        score.params[0, ei, PARAM_START] = float(getattr(note, "start_time", 0.0))
+        score.params[0, ei, PARAM_DURATION] = max(0.0, float(getattr(note, "duration_s", 0.25)))
+        score.params[0, ei, PARAM_HZ] = float(getattr(note, "fundamental_hz", 440.0))
+        score.params[0, ei, PARAM_VELOCITY] = float(getattr(note, "velocity", 1.0))
+        score.params[0, ei, PARAM_GATE] = 1.0
+    score.metadata.update({
+        "source": "piano_roll",
+        "voice_key": voice_key or (getattr(filtered[0], "voice_key", "") if filtered else ""),
+        "note_count": len(filtered),
+    })
+    return score
+
+
+def score_write_mask_from_resolved_notes(
+    score: "ScoreTensor",
+    notes: list,
+    *,
+    module_name: str = "note_stream",
+) -> "ScoreWriteMask":
+    """Build ScoreWriteMask from piano roll note lock state.
+
+    Aligns notes to *score* by start_time order.  ``locked=True`` means the
+    author fixed the pitch (write_mask.hz=False).  ``locked=False`` means the
+    module may overwrite it (write_mask.hz=True).  This maps directly to the
+    piano roll's concept of manually-placed vs. algorithmically-generated notes.
+    """
+    filtered = [n for n in notes if not getattr(n, "is_rest", False)]
+    filtered = sorted(filtered, key=lambda n: getattr(n, "start_time", 0.0))
+    write_mask = ScoreWriteMask.like(score, module_names=(module_name,))
+    for ei, note in enumerate(filtered):
+        if ei >= score.max_events:
+            break
+        write_mask.hz[0, ei] = not bool(getattr(note, "locked", True))
+    return write_mask
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Improv: enums, param dataclasses, TorchImprovProgram, apply_improv_to_score
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1923,6 +2311,7 @@ CHIRP_SHAPE_NAMES: tuple[str, ...] = ("up", "down", "bounce", "random")
 CHIRP_MODE_NAMES:  tuple[str, ...] = ("chromatic", "modal")
 
 
+@_register_json_type
 @dataclass
 class TorchGraceParams:
     """Batch grace-note parameters — torch counterpart to ``GraceParams``."""
@@ -2006,6 +2395,7 @@ class TorchGraceParams:
         )
 
 
+@_register_json_type
 @dataclass
 class TorchChirpParams:
     """Batch chirp parameters — torch counterpart to ``ChirpParams``."""
@@ -2081,6 +2471,7 @@ class TorchChirpParams:
         )
 
 
+@_register_json_type
 @dataclass
 class TorchEchoParams:
     """Batch echo parameters — torch counterpart to ``EchoParams``."""
@@ -2135,6 +2526,7 @@ class TorchEchoParams:
         )
 
 
+@_register_json_type
 @dataclass
 class TorchImprovProgram:
     """Batch improv program — torch counterpart to ``ImprovProgram``.

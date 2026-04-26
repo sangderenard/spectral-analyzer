@@ -1,0 +1,744 @@
+{
+  "score": {
+    "__composer_type__": "ScoreTensor",
+    "fields": {
+      "labels": {
+        "__tensor__": true,
+        "dtype": "int64",
+        "shape": [
+          1,
+          8
+        ],
+        "data": [
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        ]
+      },
+      "params": {
+        "__tensor__": true,
+        "dtype": "float64",
+        "shape": [
+          1,
+          8,
+          12
+        ],
+        "data": [
+          [
+            [
+              0.0,
+              0.18,
+              261.63,
+              0.82,
+              1.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              0.25,
+              0.18,
+              293.66,
+              0.68,
+              1.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              0.5,
+              0.18,
+              329.63,
+              0.82,
+              1.0,
+              0.0,
+              0.0,
+              2.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              0.75,
+              0.18,
+              349.23,
+              0.68,
+              1.0,
+              0.0,
+              0.0,
+              3.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              1.0,
+              0.18,
+              392.0,
+              0.82,
+              1.0,
+              0.0,
+              0.0,
+              4.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              1.25,
+              0.18,
+              440.0,
+              0.68,
+              1.0,
+              0.0,
+              0.0,
+              5.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              1.5,
+              0.18,
+              523.25,
+              0.82,
+              1.0,
+              0.0,
+              0.0,
+              6.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ],
+            [
+              1.75,
+              0.18,
+              493.88,
+              0.68,
+              1.0,
+              0.0,
+              0.0,
+              7.0,
+              0.0,
+              0.0,
+              1.0,
+              0.0
+            ]
+          ]
+        ]
+      },
+      "mask": {
+        "__tensor__": true,
+        "dtype": "bool",
+        "shape": [
+          1,
+          8
+        ],
+        "data": [
+          [
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true,
+            true
+          ]
+        ]
+      },
+      "param_names": {
+        "__tuple__": [
+          "start_time",
+          "duration_s",
+          "fundamental_hz",
+          "velocity",
+          "gate",
+          "page",
+          "pattern",
+          "step",
+          "bar",
+          "degree",
+          "section",
+          "kind"
+        ]
+      },
+      "label_names": {
+        "__tuple__": [
+          "rest",
+          "note",
+          "grace",
+          "chirp",
+          "echo"
+        ]
+      },
+      "metadata": {
+        "write_masks": {
+          "hz": "note_stream"
+        },
+        "title": "Masked torch composer sketch",
+        "fixed_slots": [
+          0,
+          2,
+          4,
+          6
+        ],
+        "module_slots": [
+          1,
+          3,
+          5,
+          7
+        ]
+      }
+    }
+  },
+  "write_mask": {
+    "__composer_type__": "ScoreWriteMask",
+    "fields": {
+      "hz": {
+        "__tensor__": true,
+        "dtype": "bool",
+        "shape": [
+          1,
+          8
+        ],
+        "data": [
+          [
+            false,
+            true,
+            false,
+            true,
+            false,
+            true,
+            false,
+            true
+          ]
+        ]
+      },
+      "start": {
+        "__tensor__": true,
+        "dtype": "bool",
+        "shape": [
+          1,
+          8
+        ],
+        "data": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "duration": {
+        "__tensor__": true,
+        "dtype": "bool",
+        "shape": [
+          1,
+          8
+        ],
+        "data": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "velocity": {
+        "__tensor__": true,
+        "dtype": "bool",
+        "shape": [
+          1,
+          8
+        ],
+        "data": [
+          [
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+          ]
+        ]
+      },
+      "module_names": {
+        "__tuple__": [
+          "note_stream"
+        ]
+      },
+      "metadata": {
+        "song": "masked_improv_sketch",
+        "hz_true": "note_stream may write pitch",
+        "hz_false": "author-fixed pitch"
+      }
+    }
+  },
+  "note_stream": {
+    "__composer_type__": "TorchNoteStream",
+    "fields": {
+      "degrees": {
+        "__tensor__": true,
+        "dtype": "float64",
+        "shape": [
+          1,
+          4
+        ],
+        "data": [
+          [
+            293.66,
+            349.23,
+            440.0,
+            493.88
+          ]
+        ]
+      },
+      "deg_pattern": {
+        "__tensor__": true,
+        "dtype": "int64",
+        "shape": [
+          1,
+          4
+        ],
+        "data": [
+          [
+            0,
+            1,
+            2,
+            3
+          ]
+        ]
+      },
+      "n_degs": {
+        "__tensor__": true,
+        "dtype": "int64",
+        "shape": [
+          1
+        ],
+        "data": [
+          4
+        ]
+      },
+      "n_pat": {
+        "__tensor__": true,
+        "dtype": "int64",
+        "shape": [
+          1
+        ],
+        "data": [
+          4
+        ]
+      },
+      "p_double_back": {
+        "__tensor__": true,
+        "dtype": "float64",
+        "shape": [
+          1
+        ],
+        "data": [
+          0.0
+        ]
+      },
+      "p_subversion": {
+        "__tensor__": true,
+        "dtype": "float64",
+        "shape": [
+          1
+        ],
+        "data": [
+          0.0
+        ]
+      },
+      "p_chromatic": {
+        "__tensor__": true,
+        "dtype": "float64",
+        "shape": [
+          1
+        ],
+        "data": [
+          0.0
+        ]
+      },
+      "p_modal": {
+        "__tensor__": true,
+        "dtype": "float64",
+        "shape": [
+          1
+        ],
+        "data": [
+          0.0
+        ]
+      },
+      "idx": {
+        "__tensor__": true,
+        "dtype": "int64",
+        "shape": [
+          1
+        ],
+        "data": [
+          4
+        ]
+      },
+      "direction": {
+        "__tensor__": true,
+        "dtype": "int64",
+        "shape": [
+          1
+        ],
+        "data": [
+          1
+        ]
+      }
+    }
+  },
+  "sparse_score": {
+    "__composer_type__": "SparseScoreTensor",
+    "fields": {
+      "data": {
+        "__tensor__": true,
+        "dtype": "float64",
+        "shape": [
+          1,
+          1,
+          1,
+          8,
+          2,
+          12
+        ],
+        "data": [
+          [
+            [
+              [
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    0.0,
+                    0.18,
+                    261.63,
+                    0.82,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ],
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    0.25,
+                    0.18,
+                    293.66,
+                    0.68,
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ],
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    0.5,
+                    0.18,
+                    329.63,
+                    0.82,
+                    1.0,
+                    0.0,
+                    0.0,
+                    2.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ],
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    0.75,
+                    0.18,
+                    349.23,
+                    0.68,
+                    1.0,
+                    0.0,
+                    0.0,
+                    3.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ],
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.0,
+                    0.18,
+                    392.0,
+                    0.82,
+                    1.0,
+                    0.0,
+                    0.0,
+                    4.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ],
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.25,
+                    0.18,
+                    440.0,
+                    0.68,
+                    1.0,
+                    0.0,
+                    0.0,
+                    5.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ],
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.5,
+                    0.18,
+                    523.25,
+                    0.82,
+                    1.0,
+                    0.0,
+                    0.0,
+                    6.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ],
+                [
+                  [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0
+                  ],
+                  [
+                    1.75,
+                    0.18,
+                    493.88,
+                    0.68,
+                    1.0,
+                    0.0,
+                    0.0,
+                    7.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0
+                  ]
+                ]
+              ]
+            ]
+          ]
+        ]
+      },
+      "mask": {
+        "__tensor__": true,
+        "dtype": "bool",
+        "shape": [
+          1,
+          1,
+          1,
+          8
+        ],
+        "data": [
+          [
+            [
+              [
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true,
+                true
+              ]
+            ]
+          ]
+        ]
+      },
+      "param_names": {
+        "__tuple__": [
+          "start_time",
+          "duration_s",
+          "fundamental_hz",
+          "velocity",
+          "gate",
+          "page",
+          "pattern",
+          "step",
+          "bar",
+          "degree",
+          "section",
+          "kind"
+        ]
+      },
+      "label_names": {
+        "__tuple__": [
+          "rest",
+          "note",
+          "grace",
+          "chirp",
+          "echo"
+        ]
+      },
+      "metadata": {}
+    }
+  }
+}

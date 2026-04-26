@@ -198,9 +198,9 @@ _BODY_PROFILES: dict[str, dict] = {
     },
     "string_plate": {
         "bands": [
-            (0.0, 220.0, 160.0, 0.2, 1.05),   # low: body swell, nearly omni
-            (220.0, 1800.0, 100.0, 1.8, 1.12),  # mid: plate resonance, tighter
-            (1800.0, None, 60.0, 3.2, 1.15),    # high: bridge/bow attack
+            (0.0, 220.0, 160.0, 0.2, 0.85),    # low: body swell, nearly omni
+            (220.0, 1800.0, 100.0, 1.8, 0.90),  # mid: plate resonance, tighter
+            (1800.0, None, 60.0, 3.2, 0.88),    # high: bridge/bow attack
         ],
         "aperture_offset_m": 0.18,
         "capture_power": 0.35,
@@ -422,22 +422,22 @@ def _body_panels_string_plate(jitter_rng: random.Random | None = None) -> list[C
 
     panels = _ring_panels(
         "str_rib", n_rib_segs, body_half_w, 0.0, body_h,
-        reflectivity=0.72, diffusion=0.28, absorption=0.16,
-        normal_reflectivity=0.78, grazing_reflectivity=0.60,
+        reflectivity=0.62, diffusion=0.28, absorption=0.22,
+        normal_reflectivity=0.65, grazing_reflectivity=0.52,
         phase_normal=0.08, phase_grazing=0.30,
     )
     # Top plate (soundboard) — the primary radiator
     panels.append(_cap_panel(
         "str_top_plate", z=body_h, normal_z=-1.0,
-        reflectivity=0.88, diffusion=0.12, absorption=0.06,
-        normal_reflectivity=0.94, grazing_reflectivity=0.75,
+        reflectivity=0.72, diffusion=0.18, absorption=0.14,
+        normal_reflectivity=0.78, grazing_reflectivity=0.62,
         phase_normal=_j(0.35, 0.08), phase_grazing=_j(0.72, 0.10),
     ))
     # Back plate — stiffer, less radiative
     panels.append(_cap_panel(
         "str_back_plate", z=0.0, normal_z=1.0,
-        reflectivity=0.80, diffusion=0.15, absorption=0.12,
-        normal_reflectivity=0.86, grazing_reflectivity=0.68,
+        reflectivity=0.65, diffusion=0.20, absorption=0.20,
+        normal_reflectivity=0.70, grazing_reflectivity=0.55,
         phase_normal=_j(0.18, 0.06), phase_grazing=_j(0.44, 0.08),
     ))
     return panels
@@ -633,8 +633,8 @@ def _build_body_scene(
         position=(0.0, 0.0, ap_offset),
         direction=(0.0, 0.0, 1.0),
         capture_power=float(profile["capture_power"]),
-        feedback_gain=0.12,
-        passive_loss=0.40,
+        feedback_gain=0.06,
+        passive_loss=0.55,
     )
 
     # Tiny internal atmosphere — warm, slightly humid (inside the instrument)
@@ -915,28 +915,6 @@ def step(inputs, state, dt, n_items=1, use_torch=False, **kwargs):
     for bt, members in type_groups.items():
         indices = [m[0] for m in members]
         member_names = [m[1] for m in members]
-        group_scenes = [body_scenes[nm] for nm in member_names]
-        group_states = []
-        for nm in member_names:
-            st = body_states.get(nm)
-            if st is None:
-                st = init_cavity_stream_state(group_scenes[0], sample_rate)
-            group_states.append(st)
-
-        # Stack drive signals: (B, T)
-        group_sigs = torch.from_numpy(
-            np.stack([source_signals[idx] for idx in indices])
-        ).to(torch.complex128)
-
-        chunk_out, new_states = render_batched_body_steps(
-            group_scenes[0], group_scenes, group_sigs, group_states,
-            sample_rate=sample_rate, device="cpu")
-
-        # Write back per-performer
-        for k, (idx, nm) in enumerate(members):
-            body_states[nm] = new_states[k]
-            body_out = chunk_out[k].detach().cpu().numpy()
-            source_signals[idx, :len(body_out)] = body_out[:T]
         group_scenes = [body_scenes[nm] for nm in member_names]
         group_states = []
         for nm in member_names:

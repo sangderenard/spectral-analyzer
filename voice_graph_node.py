@@ -50,11 +50,6 @@ Internal ports:
     {key}_chirp_mod  — instantaneous driver signal carried by the chirp
                        spline this tick
 
-FM and AM nodes carry a one-sample delay edge into the output node by
-default, matching the causal constraint that modulator output is available
-before the carrier computes.  Set ``causal_mod_delay=False`` to remove the
-delay (useful when the solver is Picard-iterating the full SCC).
-
 Knob integration
 ----------------
 ``VoiceTorchOscillator.knobs()`` returns the *exact same* ``KnobSpec`` list
@@ -1010,109 +1005,26 @@ class VoiceArchetype(AnalyticArchetype):
         time_axis = 1 + time_axis_payload if payload_shape else None
         n_time = int(payload_shape[time_axis_payload]) if payload_shape else 1
 
-        oscillators = [mod.oscillator for mod in mods]
-        sample_rates = torch.stack([osc._sample_rate.to(device=device, dtype=torch.float64).reshape(()) for osc in oscillators], dim=0)
-        durations = torch.stack([osc._duration.to(device=device, dtype=torch.float64).reshape(()) for osc in oscillators], dim=0)
-        sample_idx = torch.stack([osc._sample_idx.to(device=device, dtype=torch.float64).reshape(()) for osc in oscillators], dim=0)
+        # ── Drain atom FIFOs ─────────────────────────────────────────────────
+        for mod in mods:
+            if mod is None:
+                continue
+            bank = getattr(mod, "_fifo_bank", None)
+            slot_key = getattr(mod, "_fifo_slot_key", "")
+            if bank is not None and slot_key and bank.has_slot(slot_key):
+                raw = bank.try_read(slot_key)
+                if raw is not None:
+                    mod._pending_atoms = raw if isinstance(raw, list) else [raw]
 
-        if payload_shape:
-            t_index = torch.arange(n_time, dtype=torch.float64, device=device)
-            t_shape = [1] * len(payload_shape)
-            t_shape[time_axis_payload] = n_time
-            t_index = t_index.reshape(t_shape)
-            t_abs = (t_index.unsqueeze(0) + self._view_for_payload(sample_idx, payload_shape)) / self._view_for_payload(sample_rates, payload_shape)
-        else:
-            t_abs = sample_idx / sample_rates
-        t_norm = (t_abs / self._view_for_payload(durations, payload_shape)).clamp(0.0, 1.0)
+        # ── Atom synthesis: synthesize_atoms for atom voices; zeros otherwise ─
+        out = torch.zeros((len(mods),) + payload_shape, dtype=_CDTYPE, device=device)
+        for i, mod in enumerate(mods):
+            if mod is not None and getattr(mod, "_pending_atoms", None):
+                sr_val = float(mod.oscillator._sample_rate.item())
+                audio = synthesize_atoms(mod._pending_atoms, n_time, sr_val)
+                out[i] = audio.to(_CDTYPE).to(device).reshape(payload_shape)
 
-        env_mod = self._mod_tensor(mods, "_env_mod", payload_shape, device, default=1.0 + 0.0j)
-        chirp_mod = self._mod_tensor(mods, "_chirp_mod", payload_shape, device, default=0.0 + 0.0j)
-        am_mod = self._mod_tensor(mods, "_am_mod", payload_shape, device, default=0.0 + 0.0j)
-        pitch_in = self._mod_tensor(mods, "_pitch_in", payload_shape, device, default=0.0 + 0.0j)
-
-        env_z = torch.stack(
-            [osc.envelope_curve.evaluate_normalized(t_norm[i]).to(device=device, dtype=_CDTYPE) for i, osc in enumerate(oscillators)],
-            dim=0,
-        )
-        chirp_z = torch.stack(
-            [osc.chirp_curve.evaluate_normalized(t_norm[i]).to(device=device, dtype=_CDTYPE) for i, osc in enumerate(oscillators)],
-            dim=0,
-        )
-        env_z = env_z * env_mod
-        chirp_hz = torch.stack(
-            [
-                osc.chirp_curve.to_physical(chirp_z[i].real.to(torch.float64).clamp(0.0, 1.0)).to(device=device, dtype=torch.float64)
-                for i, osc in enumerate(oscillators)
-            ],
-            dim=0,
-        ) + chirp_mod.real.to(torch.float64)
-
-        log_freq = self._voice_tensor([osc.log_freq for osc in oscillators], payload_shape, device)
-        log_amplitude = self._voice_tensor([osc.log_amplitude for osc in oscillators], payload_shape, device)
-        phase_origin = self._voice_tensor([osc.phase_origin for osc in oscillators], payload_shape, device)
-        semitone_offset = self._voice_tensor([osc.semitone_offset for osc in oscillators], payload_shape, device)
-        harmonic_brightness = self._voice_tensor([osc.harmonic_brightness for osc in oscillators], payload_shape, device)
-        harmonic_warp_strength = self._voice_tensor([osc.harmonic_warp_strength for osc in oscillators], payload_shape, device)
-        fm_depth_hz = self._voice_tensor([osc.fm_depth_hz for osc in oscillators], payload_shape, device)
-        am_depth_amp = self._voice_tensor([osc.am_depth_amp for osc in oscillators], payload_shape, device)
-        tuning_ref_hz = self._voice_tensor([osc.tuning_ref_hz for osc in oscillators], payload_shape, device)
-        tuning_ref_note = self._voice_tensor([osc.tuning_ref_note for osc in oscillators], payload_shape, device)
-        pre_delay = self._voice_tensor([osc.pre_delay_s for osc in oscillators], payload_shape, device)
-        sr_t = self._view_for_payload(sample_rates, payload_shape)
-
-        semitone_shift = torch.pow(torch.tensor(2.0, dtype=torch.float64, device=device), semitone_offset / 12.0)
-        p = pitch_in.real.to(torch.float64)
-        f_hz = p.clamp(min=1e-3) * semitone_shift
-        f_midi = tuning_ref_hz * torch.pow(
-            torch.tensor(2.0, dtype=torch.float64, device=device),
-            (p - tuning_ref_note) / 12.0,
-        ) * semitone_shift
-        midi_mask = torch.tensor(
-            [osc.pitch_input_mode == "midi" for osc in oscillators],
-            dtype=torch.bool,
-            device=device,
-        ).reshape((len(oscillators),) + (1,) * len(payload_shape))
-        f_pitch = torch.where(midi_mask, f_midi, f_hz)
-        if pitch_in.dim() > 1:
-            pitch_active = pitch_in.real.abs().amax(dim=tuple(range(1, pitch_in.dim())), keepdim=True) > 0.0
-        else:
-            pitch_active = pitch_in.real.abs() > 0.0
-        f_base = torch.where(pitch_active, f_pitch, torch.exp(log_freq) * semitone_shift)
-
-        total_factor = torch.exp(log_amplitude).to(_CDTYPE) * env_z
-        total_factor = total_factor * (1.0 + am_depth_amp.to(_CDTYPE) * am_mod.real.to(_CDTYPE))
-        total_factor = total_factor * torch.exp(1j * fm_depth_hz.to(_CDTYPE) * x)
-        amp_total = total_factor.abs().to(torch.float64)
-        phase_add = torch.angle(total_factor).to(torch.float64)
-
-        f_inst = f_base + chirp_hz
-        phase_incr = 2.0 * math.pi * f_inst / sr_t
-        if time_axis is None:
-            phase = phase_incr + phase_origin + phase_add
-        else:
-            phase = torch.cumsum(phase_incr, dim=time_axis) + phase_origin + phase_add
-
-        manifold_types = [osc.manifold_type for osc in oscillators]
-        harmonic_counts = [int(osc.harmonic_count) for osc in oscillators]
-        if len(set(manifold_types)) == 1 and manifold_types[0] in ("harmonic", "harmonic_warp") and len(set(harmonic_counts)) == 1 and harmonic_counts[0] > 1:
-            out = self._harmonic_batch(
-                phase,
-                f_base,
-                amp_total,
-                harmonic_counts[0],
-                harmonic_brightness,
-                harmonic_warp_strength,
-                phase_origin,
-                sr_t,
-            )
-        else:
-            out = amp_total.to(_CDTYPE) * torch.exp(1j * phase.to(_CDTYPE))
-
-        out = torch.where(t_abs < pre_delay, torch.zeros((), dtype=_CDTYPE, device=device), out)
-        with torch.no_grad():
-            for osc in oscillators:
-                osc._sample_idx.add_(n_time)
-        return out.to(_CDTYPE)
+        return out
 
     def fire(self, forward_fn=None) -> None:  # noqa: ARG002
         if not self._pending:
@@ -1203,6 +1115,99 @@ def _prune_orphan_tensor_graph(
     return pruned_nodes, pruned_edges
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# synthesize_atoms — per-sample atom renderer
+# ──────────────────────────────────────────────────────────────────────────────
+
+import math as _math
+
+
+def synthesize_atoms(
+    atoms: list,
+    n_frames: int,
+    sample_rate: float,
+) -> Tensor:
+    """Synthesize a list of PerformanceAtoms into a complex128 signal.
+
+    Fully vectorized: one torch pass per atom using evaluate_normalized() for
+    batch curve evaluation and torch.cumsum() for phase evolution — matching
+    the VoiceTorchOscillator N>1 batch path. No Python inner loop.
+
+    Returns a complex128 tensor of shape ``(n_frames,)`` on CPU.
+    """
+    import torch as _torch
+    out = _torch.zeros(n_frames, dtype=_torch.complex128)
+    sr = max(1.0, float(sample_rate))
+    # Cache evaluated splines: (curve_id, actual_n, total_samples) → tensor.
+    # Many atoms share the same curve object and the same sample_count, so this
+    # avoids re-running the Catmull-Rom evaluation for every sympathetic copy.
+    _env_cache: dict = {}
+    _chirp_cache: dict = {}
+    for atom in atoms:
+        total_samples = max(1, atom.sample_count)
+        onset = atom.onset_sample
+        end = min(onset + total_samples, n_frames)
+        actual_n = end - onset
+        if actual_n <= 0:
+            continue
+
+        # Normalized time in [0, 1) for this atom's actual span
+        t_norm = _torch.arange(actual_n, dtype=_torch.float64) / float(total_samples)
+
+        # Batch curve evaluation with per-call cache
+        _ekey = (id(atom.envelope_curve), actual_n, total_samples)
+        if _ekey not in _env_cache:
+            _env_cache[_ekey] = atom.envelope_curve.evaluate_normalized(t_norm).to(_torch.complex128)
+        env_z = _env_cache[_ekey]
+
+        _ckey = (id(atom.chirp_curve), actual_n, total_samples)
+        if _ckey not in _chirp_cache:
+            _chirp_cache[_ckey] = atom.chirp_curve.evaluate_normalized(t_norm)
+        chirp_z = _chirp_cache[_ckey]
+
+        # Chirp in Hz via physical unit conversion (tensor path)
+        chirp_hz = atom.chirp_curve.to_physical(
+            chirp_z.real.to(_torch.float64).clamp(0.0, 1.0)
+        ).to(_torch.float64)
+
+        # Velocity from gate history
+        velocity = float(atom.velocity)
+        if atom.gate_history:
+            ev = atom.gate_history[0]
+            velocity = max(0.0, min(1.0, float(getattr(ev, "velocity", velocity))))
+
+        # Phase evolution via cumsum — the KPN phase hot loop, vectorized
+        f_inst = _torch.full((actual_n,), float(atom.fundamental_hz), dtype=_torch.float64) + chirp_hz
+        phase_incr = 2.0 * _math.pi * f_inst / sr
+        running_phase = _torch.cumsum(phase_incr, dim=0)
+
+        # Phase offset: complex scalar broadcast
+        po = atom.phase_offset
+        if isinstance(po, _torch.Tensor):
+            phase_offset_c = po.to(_torch.complex128).reshape(())
+        else:
+            phase_offset_c = _torch.tensor(
+                complex(po), dtype=_torch.complex128,
+            )
+
+        phase_delta = float(getattr(atom, "phase_delta", 0.0))
+        if phase_delta:
+            phase_delta_c = _torch.tensor(
+                complex(_math.cos(phase_delta), _math.sin(phase_delta)),
+                dtype=_torch.complex128,
+            )
+        else:
+            phase_delta_c = _torch.tensor(1.0 + 0j, dtype=_torch.complex128)
+
+        signal = (
+            env_z * float(velocity) * phase_offset_c * phase_delta_c
+            * _torch.exp(1j * running_phase.to(_torch.complex128))
+        )
+        out[onset:end] = out[onset:end] + signal
+
+    return out
+
+
 class MetaVoiceNode(nn.Module):
     """Compound voice node: owns a ``VoiceTorchOscillator`` and exposes ports.
 
@@ -1236,10 +1241,6 @@ class MetaVoiceNode(nn.Module):
         ``VoiceTorchOscillator`` instance owned by this node.
     layer:
         Solver layer tag (e.g. ``"signal"``).
-    causal_mod_delay:
-        If ``True`` (default), FM/AM accumulator → output edges carry a
-        one-sample delay so that the oscillator’s SCC is acyclic.
-        Set ``False`` only when the solver is iterating the cyclic SCC.
     """
 
     def __init__(
@@ -1255,7 +1256,6 @@ class MetaVoiceNode(nn.Module):
         self.key = key
         self.oscillator = oscillator
         self.layer = layer
-        self.causal_mod_delay = bool(causal_mod_delay)
 
         # Shared archetype for batched dispatch: the solver picks the first
         # instance found and reuses it for all voice nodes with the same key.
@@ -1271,7 +1271,17 @@ class MetaVoiceNode(nn.Module):
         self._pitch_in:  Optional[Tensor] = None
         self.score_contract: dict[str, Any] = dict(score_contract or {})
 
+        # ── FIFO atom drain state ──────────────────────────────────────
+        self._pending_atoms: list = []
+        self._fifo_bank: Optional[Any] = None   # EdgeFifoBank, set via attach_fifo
+        self._fifo_slot_key: str = ""
+
     # ------------------------------------------------------------------
+    def attach_fifo(self, bank: Any, slot_key: str) -> None:
+        """Connect this voice node to an ObjectFifoSlot for atom delivery."""
+        self._fifo_bank = bank
+        self._fifo_slot_key = str(slot_key)
+
     def set_sample(self, idx: int) -> None:
         """Point the oscillator at a specific sample index."""
         self.oscillator.set_sample(idx)
@@ -1298,6 +1308,7 @@ class MetaVoiceNode(nn.Module):
         self._chirp_mod = None
         self._am_mod = None
         self._pitch_in = None
+        self._pending_atoms = []
 
     def gate_on(self, t_abs: float, velocity: float = 1.0) -> None:
         """Fire a note-on into the oscillator's state machines."""
@@ -1317,22 +1328,19 @@ class MetaVoiceNode(nn.Module):
         node = self
 
         def _transform(x: Tensor) -> Tensor:
-            t = node._t_window
-            if t is None:
-                return node.oscillator.forward(
-                    x,
-                    env_mod=node._env_mod,
-                    chirp_mod=node._chirp_mod,
-                    pitch_in=node._pitch_in,
-                    am_mod=node._am_mod,
-                )
-            return node.oscillator.forward(
-                x, t,
-                env_mod=node._env_mod,
-                chirp_mod=node._chirp_mod,
-                pitch_in=node._pitch_in,
-                am_mod=node._am_mod,
-            )
+            # ── FIFO atom drain (takes priority over oscillator path) ─────
+            if node._fifo_bank is not None and node._fifo_bank.has_slot(node._fifo_slot_key):
+                raw = node._fifo_bank.try_read(node._fifo_slot_key)
+                if raw is not None:
+                    node._pending_atoms = raw if isinstance(raw, list) else [raw]
+            if node._pending_atoms:
+                sr_val = float(node.oscillator._sample_rate.item())
+                n_frames = int(x.shape[1]) if x.dim() >= 2 else int(x.numel())
+                audio = synthesize_atoms(node._pending_atoms, n_frames, sr_val)
+                return audio.reshape(1, n_frames, 1)
+            # No atoms — return silence
+            n_frames = int(x.shape[1]) if x.dim() >= 2 else int(x.numel())
+            return torch.zeros(1, n_frames, 1, dtype=_CDTYPE, device=x.device)
 
         return _transform
 
@@ -1356,9 +1364,9 @@ class MetaVoiceNode(nn.Module):
 
         Internal edges
         --------------
-        ``{key}_fm``        → ``{key}_out``  (delay=1 if causal_mod_delay; weight=1)
-        ``{key}_am``        → ``{key}_out``  (delay=0; weight=0 — ordering only)
-        ``{key}_env_mod``   → ``{key}_out``  (delay=0; weight=0 — ordering only)
+        ``{key}_fm``        → ``{key}_out``  (weight=1 — FM carrier)
+        ``{key}_am``        → ``{key}_out``  (weight=0 — ordering only)
+        ``{key}_env_mod``   → ``{key}_out``  (weight=0 — ordering only)
         ``{key}_chirp_mod`` → ``{key}_out``  (delay=0; weight=0 — ordering only)
 
         Only ports listed in ``occupied_inputs`` are materialised. This keeps
@@ -1509,12 +1517,10 @@ class MetaVoiceNode(nn.Module):
             ),
         )
 
-        delay_samples = 1 if self.causal_mod_delay else 0
         fm_edge = TensorEdge(
             src_key=f"{k}_fm",
             dst_key=f"{k}_out",
             weight=complex(1.0, 0.0),
-            delay_samples=delay_samples,
             semantic_role="fm_modulator",
             src_port="signal_out",
             dst_port="fm_in",
@@ -1523,7 +1529,6 @@ class MetaVoiceNode(nn.Module):
             src_key=f"{k}_am",
             dst_key=f"{k}_out",
             weight=complex(0.0, 0.0),
-            delay_samples=0,
             semantic_role="am_modulator",
             src_port="signal_out",
             dst_port="am_in",
@@ -1534,7 +1539,6 @@ class MetaVoiceNode(nn.Module):
             src_key=f"{k}_env_mod",
             dst_key=f"{k}_out",
             weight=complex(0.0, 0.0),
-            delay_samples=0,
             semantic_role="envelope_modulator",
             src_port="signal_out",
             dst_port="env_mod_in",
@@ -1543,7 +1547,6 @@ class MetaVoiceNode(nn.Module):
             src_key=f"{k}_chirp_mod",
             dst_key=f"{k}_out",
             weight=complex(0.0, 0.0),
-            delay_samples=0,
             semantic_role="chirp_modulator",
             src_port="signal_out",
             dst_port="chirp_mod_in",
@@ -1552,7 +1555,6 @@ class MetaVoiceNode(nn.Module):
             src_key=f"{k}_pitch_in",
             dst_key=f"{k}_out",
             weight=complex(0.0, 0.0),
-            delay_samples=0,
             semantic_role="pitch_source",
             src_port="pitch_in",
             dst_port="signal_out",

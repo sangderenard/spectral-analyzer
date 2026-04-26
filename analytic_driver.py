@@ -213,6 +213,10 @@ from rhythm_tree import (
     GROUP_COLORS,
 )
 
+# Short display labels for non-default articulations shown in the rhythm grid.
+# Key 0 (Normal) intentionally omitted so the cell stays blank.
+_ART_LABELS: dict[int, str] = {1: "stac", 2: "leg", 3: "drn"}
+
 # ---------------------------------------------------------------------------
 # Sequence / demo UI presets
 # ---------------------------------------------------------------------------
@@ -2283,7 +2287,8 @@ class EditorCanvas:
         fb = font or self._font_()
         fh = fb.get_height()
         w, h = surf.get_size()
-        _sync_resolved_notes(patch, preserve_locked=True)
+        if not getattr(self, "suppress_auto_sync", False):
+            _sync_resolved_notes(patch, preserve_locked=True)
         notes: list[ResolvedNote] = sorted(
             patch.resolved_notes,
             key=lambda n: (n.start_time, n.fundamental_hz, n.voice_key, n.layer_key),
@@ -3894,11 +3899,15 @@ class PlacementModule:
 
 
 # ---------------------------------------------------------------------------
-# PatchPanel — left panel: voice list
+# CompositionPanel — composition controls (seq, prob, dynamics, improv, rhythm)
 # ---------------------------------------------------------------------------
 
-class PatchPanel(Panel):
-    """Left panel: scrollable list of voices + LFOs."""
+class CompositionPanel(Panel):
+    """Composition-controls-only panel: sequence params, probabilities, dynamics, improv, rhythm.
+
+    No voice list, no placement.  Subclass PatchPanel for the full analytic driver panel,
+    or subclass this directly (e.g. TorchComposerPanel) for composition-only UI.
+    """
 
     @property
     def panel_rect(self) -> pygame.Rect:
@@ -3910,35 +3919,19 @@ class PatchPanel(Panel):
 
     def __init__(self, side: str = "left") -> None:
         super().__init__(side=side)
-        self.title = "Voices"
+        self.title = "Composer"
         self._font: pygame.font.Font | None = None
-        self.on_select:        Any = None
-        self.on_add_voice:     Any = None
-        self.on_add_lfo:       Any = None
-        self.on_add_param:     Any = None
-        self.on_add_module:    Any = None
-        self.on_add_control:   Any = None
-        self.on_add_router:    Any = None
-        self.on_toggle_mute:   Any = None
-        self.on_remove_voice:  Any = None   # callback(key: str)
+        self._patch:  AnalyticPatch | None = None
+        self._active: str = ""
         self.on_deploy_chord:  Any = None   # callback()
         self.on_demo_play:     Any = None   # callback()
         self.on_render:        Any = None   # callback() — render sequence to file
         self.on_render_fund:   Any = None   # callback() — render fundamental (like spacebar)
-        self._patch:  AnalyticPatch | None = None
-        self._active: str = ""
+        # Optional label overrides for the 4 action buttons in the sequence section.
+        # Keys: "deploy", "demo", "render_fund", "render".  Empty string = hide button.
+        self._seq_btn_labels: dict = {}
         # Collapsible section state
-        self._voices_collapsed: bool = False
         self._seq_collapsed:    bool = True
-        # Voice list geometry (surface-local coords, filled by render)
-        self._items:             list       = []
-        self._row_h:             int        = 22
-        self._btn_y:             int        = 9999
-        self._btn_h:             int        = 20
-        self._btn2_y:            int        = 9999
-        self._btn2_h:            int        = 20
-        self._voices_hdr_rect:   Any        = None
-        self._voices_row_start_y: int       = 22
         # Sequence section geometry
         self._seq_hdr_rect:      Any        = None
         self._seq_sliders:       list[dict] = []
@@ -3963,9 +3956,6 @@ class PatchPanel(Panel):
         self._rhythm_stress_vel_rect: Any        = None
         self._frac_beat_warp_rect:    Any        = None
         self._frac_beat_grid_rect:    Any        = None
-        self._placement_collapsed: bool          = True
-        self._placement_hdr_rect: Any            = None
-        self._placement_pm_rects: list           = []    # per-Part [(+r, -r, part_key), ...]
         self._rhythm_step_rects:      list       = []
         self._rhythm_ctx_menu:        dict | None = None  # context menu state
         self._rhythm_phrase_rects:    list       = []
@@ -4034,11 +4024,6 @@ class PatchPanel(Panel):
         self._improv_snap_pat:          Any        = None
         # Rhythm tree reference for snap operations
         self._rhythm_tree:              Any        = None
-        # Dropdown state for Module / Control add buttons
-        self._open_dropdown:     str        = ""   # "module" | "control" | ""
-        self._dropdown_items:    list       = []   # list[dict(label, rect, data)]
-        self._btn_module_rect:   Any        = None
-        self._btn_control_rect:  Any        = None
 
     def set_patch(self, patch: AnalyticPatch, active_key: str) -> None:
         self._patch  = patch
@@ -4692,287 +4677,15 @@ class PatchPanel(Panel):
         elif key == "echo_vel_fall":
             ip.echo.vel_falloff = val
 
-    def render(self) -> pygame.Surface | None:
-        if self._patch is None:
-            return None
-        pw   = self.PANEL_W
-        font = self._font_()
-        fh   = font.get_height()
-        p    = self._patch
-
-        items: list[tuple[str, str, list[int], bool]] = []
-        # Pinned Patch entry always first
-        items.append(("__patch__", "\u25c6 Patch", [80, 130, 200], False))
-        items.append(("__system__", "\u2699 System Device", [200, 150, 90], False))
-        for v in p.voices:
-            em_tag = " [G]" if getattr(v, "emission_mode", "single") == "granular" else ""
-            items.append((v.key, f"\u25b6 {v.label}{em_tag}  {v.freq_hz:.1f}Hz", v.color, v.muted))
-        for l in p.lfos:
-            items.append((l.key, f"~ {l.label}  {l.rate_hz:.2f}Hz", l.color, False))
-        # Module nodes — ⬡ icon, mutable
-        for mod in p.modules:
-            mt_tag = f"[{mod.module_type}]"
-            if mod.module_type == "lfo":
-                if mod.lfo_channels:
-                    mt_tag = f"~ {len(mod.lfo_channels)}ch"
-                else:
-                    mt_tag = f"~ {mod.rate_hz:.2f}Hz"
-            mute_tag = " \u25a0" if mod.muted else ""
-            items.append((mod.key, f"\u2B21 {mod.label}  {mt_tag}{mute_tag}", mod.color, mod.muted))
-        # Control surfaces — ⊞ icon, N sliders shown in count
-        for cs in p.controls:
-            n_sl = len(cs.sliders)
-            sl_tag = f"[{n_sl} sl]" if n_sl != 1 else "[1 sl]"
-            items.append((cs.key, f"\u229e {cs.label}  {sl_tag}", cs.color, False))
-        # Router instances — selectable editor items for the torch routing model
-        for rt in getattr(p, "routers", []):
-            rt_icon = {
-                "voice_router": "\u21c9",
-                "instrument": "\u266b",
-                "master": "\u25c9",
-            }.get(rt.router_type, "\u25c8")
-            rt_col = {
-                "voice_router": [90, 160, 230],
-                "instrument": [110, 200, 150],
-                "master": [230, 180, 90],
-            }.get(rt.router_type, [160, 160, 180])
-            items.append((
-                _router_ui_key(rt.key),
-                f"{rt_icon} {rt.label}  [{rt.router_type}]",
-                rt_col,
-                False,
-            ))
-        # Mixer nodes — ⊕ = projection active (output track), ○ = meta-mixer only
-        for m in p.mixers:
-            icon = "\u229e" if m.projection_active else "\u25cb"
-            items.append((m.key, f"{icon} {m.label}", m.color, False))
-        # Param nodes — ★ icon, purple-ish; show count of targets
-        for pn in p.param_nodes:
-            n_tgt = len(pn.targets)
-            first_attr = pn.targets[0].get("attr", "") if pn.targets else ""
-            tgt = f"\u2192{first_attr}" if first_attr else ""
-            if n_tgt > 1:
-                tgt += f"+{n_tgt - 1}"
-            items.append((pn.key, f"\u2605 {pn.label}{tgt}", pn.color, False))
-
-        row_h  = fh + 10
-        btn_h  = fh + 8
-        hdr_h  = fh + 6
-        seq_row_h = fh + 8
-
-        # Heights
-        v_rows_h = 0 if self._voices_collapsed else len(items) * row_h
-        v_btns_h = 0 if self._voices_collapsed else btn_h + 8
-        voices_sec_h = hdr_h + v_rows_h + v_btns_h + 4
-
-        seq_body_h = 0
-        if not self._seq_collapsed and _HAS_SEQ_ENG:
-            seq_body_h = seq_row_h * 11 + 14 + 32 * 6 + btn_h + 8  # pickers + label-clearance + sliders + btns
-        seq_sec_h = hdr_h + seq_body_h + 4
-
-        prob_body_h = 0
-        if not self._prob_collapsed:
-            prob_body_h = 14 + 32 * 4 + 8  # label-clearance + 4 probability sliders
-        prob_sec_h = hdr_h + prob_body_h + 4
-
-        dyn_body_h = 0
-        if not self._dyn_collapsed and _HAS_DYN_ENG:
-            _dyn_pg     = p.page_for(self._dyn_page_key)
-            _rdiv_d    = getattr(_dyn_pg, "rhythm_division", 16)
-            _cell_h_d    = 16
-            _grid_rows_d = self._metric_grid_rows(
-                p.page_meter(_dyn_pg)[0],
-                max(1, pw - 12),
-                frac_beat_mode=getattr(_dyn_pg, "frac_beat_mode", "warp"),
-            )
-            dyn_body_h = (
-                (hdr_h + 2)                              # part selector
-                + (hdr_h + 4)                            # curve shape picker
-                + (hdr_h + 4)                            # scope stepper
-                + (hdr_h + 4)                            # auto accent button
-                + (32 + 8)                               # intensity slider
-                + (_grid_rows_d * (_cell_h_d + 2) + 4)  # accent grid
-            )
-        dyn_sec_h = hdr_h + dyn_body_h + 4
-
-        improv_body_h = 0
-        if not self._improv_collapsed and _HAS_IMPROV_ENG:
-            _improv_pg    = p.page_for(self._improv_page_key)
-            _rdiv_i      = getattr(_improv_pg, "rhythm_division", 16)
-            _cell_h_i    = 16
-            _irows       = self._metric_grid_rows(
-                p.page_meter(_improv_pg)[0],
-                max(1, pw - 12),
-                frac_beat_mode=getattr(_improv_pg, "frac_beat_mode", "warp"),
-            )
-            # 3 prob sliders + 3 sub-section headers (collapsed by default)
-            # + improv step grid
-            _sub_grace_h = 0 if self._improv_grace_collapsed else (
-                (hdr_h + 4)    # mode picker
-                + (hdr_h + 4)  # position picker
-                + (32 + 8)     # duration_frac slider
-                + (32 + 8)     # vel_scale slider
-                + hdr_h        # trim_main toggle row
-            )
-            _sub_chirp_h = 0 if self._improv_chirp_collapsed else (
-                (hdr_h + 4)    # shape picker
-                + (hdr_h + 4)  # mode picker
-                + (hdr_h + 4)  # steps stepper
-                + (32 + 8)     # duration_frac slider
-                + (32 + 8)     # vel_scale slider
-            )
-            _sub_echo_h = 0 if self._improv_echo_collapsed else (
-                (hdr_h + 4)    # lookback stepper
-                + (32 + 8)     # duration_frac slider
-                + (32 + 8)     # vel_falloff slider
-                + (hdr_h + 4)  # max_notes stepper
-            )
-            improv_body_h = (
-                (hdr_h + 2)                              # part selector
-                + (32 * 3 + 8)                           # 3 prob sliders
-                + hdr_h + _sub_grace_h + 4               # grace sub-section
-                + hdr_h + _sub_chirp_h + 4               # chirp sub-section
-                + hdr_h + _sub_echo_h + 4                # echo sub-section
-                + (_irows * (_cell_h_i + 2) + 4)         # step grid
-            )
-        improv_sec_h = hdr_h + improv_body_h + 4
-
-        rhythm_body_h = 0
-        if not self._rhythm_collapsed:
-            _active_pg = p.page_for(p.rhythm_active_page)
-            _rdiv      = getattr(_active_pg, "rhythm_division", getattr(p, "rhythm_division", 16))
-            _cell_h    = 16
-            _grid_rows = self._metric_grid_rows(
-                p.page_meter(_active_pg)[0],
-                max(1, pw - 12),
-                frac_beat_mode=getattr(_active_pg, "frac_beat_mode", "warp"),
-            )
-            rhythm_body_h = (
-                (hdr_h + 2)                 # division picker row
-                + (hdr_h + 2)               # page selector row
-                + (hdr_h + 4)               # stress row
-                + (hdr_h + 4)               # pattern tabs row
-                + (_grid_rows * (_cell_h + 2) + 4)   # step grid
-                + (hdr_h + 8)               # phrase row
-                + (hdr_h + 6)               # prog-bars + fit-mode row
-                + 14                         # label-clearance for first slider
-                + (32 * 5 + 8)              # 5 sliders (meter/swing/pocket/gate)
-            )
-        rhythm_sec_h = hdr_h + rhythm_body_h + 4
-
-        # Placement section: always rendered (collapsed = header only; expanded = header + rows)
-        _plc_n_rows = 0 if self._placement_collapsed else max(1, len(p.parts))
-        plc_sec_h = (hdr_h + 2) + _plc_n_rows * (hdr_h + 2)
-
-        total_h = (4 + voices_sec_h + 8 + seq_sec_h + 8 + prob_sec_h + 8
-                   + dyn_sec_h + 8 + improv_sec_h + 8 + rhythm_sec_h + 8
-                   + plc_sec_h + 8)
-        surf = pygame.Surface((pw, max(200, total_h)))
-        surf.fill(_PY_BG)
-
-        y = 4
-
-        # ── Voices header ────────────────────────────────────────────────────
-        arrow_v = "\u25bc" if not self._voices_collapsed else "\u25b6"
-        pygame.draw.rect(surf, (28, 44, 60), (0, y, pw, hdr_h))
-        pygame.draw.line(surf, (60, 100, 140), (0, y), (pw, y))
-        surf.blit(font.render(f"{arrow_v} Voices  [{max(0, len(items) - 2)}]",
-                              True, (140, 190, 230)), (8, y + 3))
-        self._voices_hdr_rect = pygame.Rect(0, y, pw, hdr_h)
-        y += hdr_h
-        self._voices_row_start_y = y
-        self._items  = items
-        self._row_h  = row_h
-
-        if not self._voices_collapsed:
-            for key, label, col, muted in items:
-                is_active = (key == self._active)
-                is_mix    = self._patch is not None and any(m.key == key for m in self._patch.mixers)
-                is_router = self._patch is not None and _router_instance_for_active_key(self._patch, key) is not None
-                bg = (40, 60, 80) if is_active else (24, 24, 30)
-                if key in {"__patch__", "__system__"}:
-                    bg = (50, 80, 120) if is_active else (28, 40, 60)
-                elif is_mix:
-                    bg = (44, 44, 22) if is_active else (30, 28, 18)
-                elif is_router:
-                    bg = (26, 46, 64) if is_active else (18, 28, 38)
-                pygame.draw.rect(surf, bg, (2, y, pw - 4, row_h - 2), border_radius=3)
-                c = tuple(col[:3]) if col else (120, 180, 255)
-                pygame.draw.rect(surf, c, (2, y, 4, row_h - 2), border_radius=2)
-                txt_col = (200, 200, 210) if not muted else (80, 80, 90)
-                lbl = font.render(label, True, txt_col)
-                surf.blit(lbl, (10, y + (row_h - 2 - fh) // 2))
-                if not is_mix and not is_router and key not in {"__patch__", "__system__"}:
-                    is_param_  = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
-                    is_lfo_    = any(l.key == key for l in self._patch.lfos) if self._patch else False
-                    is_module_ = any(m.key == key for m in self._patch.modules) if self._patch else False
-                    is_ctrl_   = any(cs.key == key for cs in self._patch.controls) if self._patch else False
-                    # Solo button (voices and modules only)
-                    if not is_lfo_ and not is_param_ and not is_ctrl_:
-                        is_solo = (getattr(self._patch, "solo_key", None) == key)
-                        sc = (210, 170, 20) if is_solo else (42, 42, 52)
-                        pygame.draw.rect(surf, sc, (pw - 60, y + 3, 14, row_h - 8), border_radius=2)
-                        stc = (245, 245, 60) if is_solo else (110, 110, 122)
-                        surf.blit(font.render("S", True, stc), (pw - 59, y + 3))
-                    # Mute button (voices, LFOs, modules — not param/ctrl/mixer)
-                    if not is_param_ and not is_ctrl_:
-                        mc = (200, 80, 60) if muted else (50, 50, 60)
-                        pygame.draw.rect(surf, mc, (pw - 42, y + 3, 16, row_h - 8), border_radius=2)
-                        surf.blit(font.render("M", True, (200, 200, 200)), (pw - 40, y + 3))
-                    # Delete button
-                    pygame.draw.rect(surf, (90, 40, 40), (pw - 24, y + 3, 16, row_h - 8), border_radius=2)
-                    surf.blit(font.render("\xd7", True, (220, 120, 100)), (pw - 21, y + 3))
-                y += row_h
-            # Add buttons — row 1: Voice / Param  |  row 2: Module▾ / Control▾
-            y += 4
-            half = pw // 2
-            pygame.draw.rect(surf, (35, 70, 100),  (4,        y, half - 8, btn_h), border_radius=3)
-            surf.blit(font.render("+ Voice",  True, (160, 200, 240)), (8,        y + 2))
-            pygame.draw.rect(surf, (60, 35, 90),   (half + 4, y, half - 8, btn_h), border_radius=3)
-            surf.blit(font.render("+ Param",  True, (210, 170, 255)), (half + 8, y + 2))
-            self._btn_y = y
-            self._btn_h = btn_h
-            y += btn_h + 4
-            mod_lbl  = "+ Module \u25be" + (" [open]" if self._open_dropdown == "module" else "")
-            ctrl_lbl = "+ Control \u25be" + (" [open]" if self._open_dropdown == "control" else "")
-            mod_bg  = (100, 60, 130) if self._open_dropdown == "module"  else (80, 50, 100)
-            ctrl_bg = (30, 120, 95)  if self._open_dropdown == "control" else (30, 100, 80)
-            pygame.draw.rect(surf, mod_bg,   (4,        y, half - 8, btn_h), border_radius=3)
-            surf.blit(font.render(mod_lbl,  True, (220, 160, 255)), (8,        y + 2))
-            pygame.draw.rect(surf, ctrl_bg,  (half + 4, y, half - 8, btn_h), border_radius=3)
-            surf.blit(font.render(ctrl_lbl, True, (140, 230, 180)), (half + 8, y + 2))
-            self._btn_module_rect  = pygame.Rect(4,        y, half - 8, btn_h)
-            self._btn_control_rect = pygame.Rect(half + 4, y, half - 8, btn_h)
-            self._btn2_y = y
-            self._btn2_h = btn_h
-            y += btn_h + 4
-            # Register dropdown item rects for hit-testing; actual draw happens
-            # at the end of render() as an overlay so it covers sections below.
-            if self._open_dropdown in ("module", "control"):
-                drop_x = 4 if self._open_dropdown == "module" else half + 4
-                drop_w = half - 8
-                items_data = (
-                    [("LFO",           "lfo"),
-                     ("Passthrough",   "passthrough"),
-                     ("Pitch Quant.",  "pitch_quantizer"),
-                     ("Interaural",    "interaural"),
-                     ("Voice Router",  "router:voice_router"),
-                     ("Instrument Router", "router:instrument"),
-                     ("Master Router", "router:master")]
-                    if self._open_dropdown == "module"
-                    else [("Control Surface", "control_surface"),
-                          ("Voice Router", "router:voice_router"),
-                          ("Instrument Router", "router:instrument"),
-                          ("Master Router", "router:master")]
-                )
-                self._dropdown_items = []
-                dy = y
-                for dlabel, ddata in items_data:
-                    dr = pygame.Rect(drop_x, dy, drop_w, btn_h)
-                    self._dropdown_items.append(dict(label=dlabel, rect=dr, data=ddata))
-                    dy += btn_h + 2
-
-        y += 8
+    def _render_composition_onto(self, surf: pygame.Surface, y: int,
+                                  font: pygame.font.Font, p: "AnalyticPatch",
+                                  pw: int, fh: int, btn_h: int,
+                                  hdr_h: int, seq_row_h: int) -> int:
+        """Render sequence, probabilities, dynamics, improv, and rhythm sections
+        onto *surf* starting at vertical position *y*.
+        Returns the updated *y* position immediately after the last section.
+        """
+        # (all composition rendering lives here — no voice list, no placement)
 
         # ── Sequence header ──────────────────────────────────────────────────
         arrow_s = "\u25bc" if not self._seq_collapsed else "\u25b6"
@@ -5079,22 +4792,29 @@ class PatchPanel(Panel):
                                  border_radius=3)
 
             y += 4
-            # Action buttons — Deploy / Demo / Rend.Fund / Rend.Seq in equal quarters
-            quarter = max(1, (pw - 18) // 4)
-            dep_r  = pygame.Rect(4,                      y, quarter, btn_h)
-            dem_r  = pygame.Rect(4 + (quarter + 2),      y, quarter, btn_h)
-            rfnd_r = pygame.Rect(4 + 2 * (quarter + 2),  y, quarter, btn_h)
-            rseq_r = pygame.Rect(4 + 3 * (quarter + 2),  y, pw - 6 - 3 * (quarter + 2), btn_h)
-            pygame.draw.rect(surf, (40, 70, 40),  dep_r,  border_radius=3)
-            pygame.draw.rect(surf, (55, 35, 75),  dem_r,  border_radius=3)
-            pygame.draw.rect(surf, (90, 25, 25),  rfnd_r, border_radius=3)
-            pygame.draw.rect(surf, (90, 25, 25),  rseq_r, border_radius=3)
-            surf.blit(font.render("\u266b Chord",   True, (150, 230, 150)), (dep_r.x + 3,  y + 2))
-            surf.blit(font.render("\u25b6 Demo",    True, (190, 150, 240)), (dem_r.x + 3,  y + 2))
-            surf.blit(font.render("\u23fa Fund.",   True, (255, 120, 120)), (rfnd_r.x + 3, y + 2))
-            surf.blit(font.render("\u23fa Seq.",    True, (255, 120, 120)), (rseq_r.x + 3, y + 2))
-            self._seq_btn_rects = {"deploy": dep_r, "demo": dem_r,
-                                   "render_fund": rfnd_r, "render": rseq_r}
+            # Action buttons — labels/visibility from _seq_btn_labels (empty str = hide)
+            _btn_defs = [
+                ("deploy",      "\u266b Chord", (40, 70, 40), (150, 230, 150)),
+                ("demo",        "\u25b6 Demo",  (55, 35, 75), (190, 150, 240)),
+                ("render_fund", "\u23fa Fund.", (90, 25, 25), (255, 120, 120)),
+                ("render",      "\u23fa Seq.",  (90, 25, 25), (255, 120, 120)),
+            ]
+            _visible_btns = [
+                (_key, self._seq_btn_labels.get(_key, _lbl), _bg, _fg)
+                for _key, _lbl, _bg, _fg in _btn_defs
+                if self._seq_btn_labels.get(_key, _lbl) != ""
+            ]
+            self._seq_btn_rects = {}
+            if _visible_btns:
+                _n  = len(_visible_btns)
+                _bw = max(1, (pw - 8 - (_n - 1) * 2) // _n)
+                _bx = 4
+                for _key, _lbl, _bg, _fg in _visible_btns:
+                    _br = pygame.Rect(_bx, y, _bw, btn_h)
+                    pygame.draw.rect(surf, _bg, _br, border_radius=3)
+                    surf.blit(font.render(_lbl, True, _fg), (_br.x + 3, y + 2))
+                    self._seq_btn_rects[_key] = _br
+                    _bx += _bw + 2
             y += btn_h + 4
 
         self._seq_sliders = seq_sliders
@@ -6016,72 +5736,124 @@ class PatchPanel(Panel):
             self._frac_beat_grid_rect = fbm_grid_r
             y += hdr_h + 2
 
-        # ── Placement section ────────────────────────────────────────────────
-        _plc_hdr = pygame.Rect(2, y, pw - 4, hdr_h)
-        pygame.draw.rect(surf, (30, 38, 55), _plc_hdr, border_radius=3)
-        _plc_arrow = "\u25b6" if self._placement_collapsed else "\u25bc"
-        surf.blit(font.render(f"{_plc_arrow} Placement", True, (140, 175, 220)),
-                  (8, y + 3))
-        _plc_total = sum(pt.player_count for pt in p.parts)
-        if _plc_total > 0:
-            _tot_s = font.render(f"{_plc_total} performers", True, (110, 155, 190))
-            surf.blit(_tot_s, (pw - _tot_s.get_width() - 8, y + 3))
-        self._placement_hdr_rect = _plc_hdr
-        y += hdr_h + 2
+        return y
 
-        if not self._placement_collapsed:
-            _pm_rects: list = []
-            if not p.parts:
-                surf.blit(font.render("(solve to populate)", True, (70, 80, 100)), (12, y + 2))
-                y += hdr_h + 2
-            else:
-                for pt in p.parts:
-                    _reg_col: tuple = {
-                        "bass":  (60, 45, 88),
-                        "mid":   (45, 68, 88),
-                        "high":  (48, 88, 68),
-                    }.get(pt.register, (52, 52, 72))
-                    _row_r = pygame.Rect(4, y, pw - 8, hdr_h)
-                    pygame.draw.rect(surf, _reg_col, _row_r, border_radius=2)
-                    # Label (truncated)
-                    lbl_max = pw - 78
-                    _lbl = pt.label
-                    while font.size(_lbl)[0] > lbl_max - 8 and len(_lbl) > 4:
-                        _lbl = _lbl[:-1]
-                    surf.blit(font.render(_lbl, True, (190, 210, 235)), (8, y + 2))
-                    # Player count ± buttons
-                    _dec_r = pygame.Rect(pw - 70, y + 1, 20, hdr_h - 2)
-                    _cnt_r = pygame.Rect(pw - 48, y + 1, 22, hdr_h - 2)
-                    _inc_r = pygame.Rect(pw - 24, y + 1, 20, hdr_h - 2)
-                    pygame.draw.rect(surf, (55, 45, 78), _dec_r, border_radius=2)
-                    pygame.draw.rect(surf, (32, 30, 48), _cnt_r, border_radius=2)
-                    pygame.draw.rect(surf, (45, 68, 55), _inc_r, border_radius=2)
-                    surf.blit(font.render("-", True, (175, 150, 220)),
-                              (_dec_r.x + 6, y + 2))
-                    surf.blit(font.render(str(pt.player_count), True, (200, 200, 230)),
-                              (_cnt_r.x + (22 - font.size(str(pt.player_count))[0]) // 2, y + 2))
-                    surf.blit(font.render("+", True, (140, 210, 160)),
-                              (_inc_r.x + 5, y + 2))
-                    _pm_rects.append({"dec": _dec_r, "inc": _inc_r, "key": pt.key})
-                    y += hdr_h + 2
-            self._placement_pm_rects = _pm_rects
+    def render(self) -> pygame.Surface | None:
+        if self._patch is None:
+            return None
+        pw   = self.PANEL_W
+        font = self._font_()
+        fh   = font.get_height()
+        p    = self._patch
 
-        # Dropdown overlay — drawn last so it paints over every section below it.
-        if self._open_dropdown in ("module", "control") and self._dropdown_items:
-            btn_h = font.get_height() + 6
-            for di in self._dropdown_items:
-                r = di["rect"]
-                pygame.draw.rect(surf, (50, 50, 66), r, border_radius=2)
-                pygame.draw.rect(surf, (90, 90, 120), r, 1, border_radius=2)
-                surf.blit(font.render(di["label"], True, (200, 220, 255)),
-                          (r.x + 4, r.y + 2))
+        btn_h     = fh + 8
+        hdr_h     = fh + 6
+        seq_row_h = fh + 8
 
-        # ── Context menu overlay (right-click on step cell) ──────────────
+        # ── Composition section heights ─────────────────────────────────────
+        seq_body_h = 0
+        if not self._seq_collapsed and _HAS_SEQ_ENG:
+            seq_body_h = seq_row_h * 11 + 14 + 32 * 6 + btn_h + 8
+        seq_sec_h = hdr_h + seq_body_h + 4
+
+        prob_body_h = 0
+        if not self._prob_collapsed:
+            prob_body_h = 14 + 32 * 4 + 8
+        prob_sec_h = hdr_h + prob_body_h + 4
+
+        dyn_body_h = 0
+        if not self._dyn_collapsed and _HAS_DYN_ENG:
+            _dyn_pg     = p.page_for(self._dyn_page_key)
+            _cell_h_d    = 16
+            _grid_rows_d = self._metric_grid_rows(
+                p.page_meter(_dyn_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_dyn_pg, "frac_beat_mode", "warp"),
+            )
+            dyn_body_h = (
+                (hdr_h + 2)                              # part selector
+                + (hdr_h + 4)                            # curve shape picker
+                + (hdr_h + 4)                            # scope stepper
+                + (hdr_h + 4)                            # auto accent button
+                + (32 + 8)                               # intensity slider
+                + (_grid_rows_d * (_cell_h_d + 2) + 4)  # accent grid
+            )
+        dyn_sec_h = hdr_h + dyn_body_h + 4
+
+        improv_body_h = 0
+        if not self._improv_collapsed and _HAS_IMPROV_ENG:
+            _improv_pg    = p.page_for(self._improv_page_key)
+            _cell_h_i    = 16
+            _irows       = self._metric_grid_rows(
+                p.page_meter(_improv_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_improv_pg, "frac_beat_mode", "warp"),
+            )
+            _sub_grace_h = 0 if self._improv_grace_collapsed else (
+                (hdr_h + 4)    # mode picker
+                + (hdr_h + 4)  # position picker
+                + (32 + 8)     # duration_frac slider
+                + (32 + 8)     # vel_scale slider
+                + hdr_h        # trim_main toggle row
+            )
+            _sub_chirp_h = 0 if self._improv_chirp_collapsed else (
+                (hdr_h + 4)    # shape picker
+                + (hdr_h + 4)  # mode picker
+                + (hdr_h + 4)  # steps stepper
+                + (32 + 8)     # duration_frac slider
+                + (32 + 8)     # vel_scale slider
+            )
+            _sub_echo_h = 0 if self._improv_echo_collapsed else (
+                (hdr_h + 4)    # lookback stepper
+                + (32 + 8)     # duration_frac slider
+                + (32 + 8)     # vel_falloff slider
+                + (hdr_h + 4)  # max_notes stepper
+            )
+            improv_body_h = (
+                (hdr_h + 2)                              # part selector
+                + (32 * 3 + 8)                           # 3 prob sliders
+                + hdr_h + _sub_grace_h + 4               # grace sub-section
+                + hdr_h + _sub_chirp_h + 4               # chirp sub-section
+                + hdr_h + _sub_echo_h + 4                # echo sub-section
+                + (_irows * (_cell_h_i + 2) + 4)         # step grid
+            )
+        improv_sec_h = hdr_h + improv_body_h + 4
+
+        rhythm_body_h = 0
+        if not self._rhythm_collapsed:
+            _active_pg = p.page_for(p.rhythm_active_page)
+            _cell_h    = 16
+            _grid_rows = self._metric_grid_rows(
+                p.page_meter(_active_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_active_pg, "frac_beat_mode", "warp"),
+            )
+            rhythm_body_h = (
+                (hdr_h + 2)                 # division picker row
+                + (hdr_h + 2)               # page selector row
+                + (hdr_h + 4)               # stress row
+                + (hdr_h + 4)               # pattern tabs row
+                + (_grid_rows * (_cell_h + 2) + 4)   # step grid
+                + (hdr_h + 8)               # phrase row
+                + (hdr_h + 6)               # prog-bars + fit-mode row
+                + 14                         # label-clearance for first slider
+                + (32 * 5 + 8)              # 5 sliders (meter/swing/pocket/gate)
+            )
+        rhythm_sec_h = hdr_h + rhythm_body_h + 4
+
+        total_h = (4
+                   + seq_sec_h + 8 + prob_sec_h + 8
+                   + dyn_sec_h + 8 + improv_sec_h + 8 + rhythm_sec_h + 8)
+        surf = pygame.Surface((pw, max(200, total_h)))
+        surf.fill(_PY_BG)
+
+        self._render_composition_onto(surf, 4, font, p, pw, fh, btn_h, hdr_h, seq_row_h)
+
+        # ── Context menu overlay ─────────────────────────────────────────────
         ctx = self._rhythm_ctx_menu
         if ctx is not None:
             _ctx_items = ctx.get("items", [])
             if _ctx_items:
-                # Background panel
                 menu_r = ctx.get("menu_rect")
                 if menu_r:
                     pygame.draw.rect(surf, (38, 32, 54), menu_r, border_radius=3)
@@ -6155,11 +5927,6 @@ class PatchPanel(Panel):
                 if not _ctx_hit:
                     self._rhythm_ctx_menu = None
                     # Don't consume the click — let it fall through
-
-            # ── Voices header toggle ─────────────────────────────────────────
-            if self._voices_hdr_rect and self._voices_hdr_rect.collidepoint(lx, ly):
-                self._voices_collapsed = not self._voices_collapsed
-                return True
 
             # ── Sequence header toggle ───────────────────────────────────────
             if self._seq_hdr_rect and self._seq_hdr_rect.collidepoint(lx, ly):
@@ -6370,105 +6137,6 @@ class PatchPanel(Panel):
                         _snap_pat.snap_improv_to_rhythm()
                     return True
 
-            # ── Voice rows ───────────────────────────────────────────────────
-            if not self._voices_collapsed:
-                y0    = self._voices_row_start_y
-                row_h = self._row_h
-                for key, _, _, _ in self._items:
-                    i_idx = self._items.index((key, _, _, _)) if False else None
-                for i_idx, (key, _, _, _) in enumerate(self._items):
-                    row_top = y0 + i_idx * row_h
-                    if row_top <= ly < row_top + row_h:
-                        # Pinned Patch row — select only, no delete/mute/solo
-                        if key in {"__patch__", "__system__"}:
-                            self._active = key
-                            if self.on_select:
-                                self.on_select(key)
-                            return True
-                        is_mix     = any(m.key == key for m in self._patch.mixers)  if self._patch else False
-                        is_router  = _router_instance_for_active_key(self._patch, key) is not None if self._patch else False
-                        is_param   = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
-                        is_lfo     = any(l.key == key for l in self._patch.lfos) if self._patch else False
-                        is_module  = any(m.key == key for m in self._patch.modules) if self._patch else False
-                        is_control = any(cs.key == key for cs in self._patch.controls) if self._patch else False
-                        if not is_mix and not is_router and lx >= pw - 24:
-                            # Delete
-                            if self.on_remove_voice:
-                                self.on_remove_voice(key)
-                        elif not is_mix and not is_router and not is_param and not is_control and not is_lfo and lx >= pw - 60:
-                            if lx >= pw - 42:
-                                # Mute
-                                if is_module:
-                                    for mod in self._patch.modules:
-                                        if mod.key == key:
-                                            mod.muted = not mod.muted
-                                else:
-                                    for v in self._patch.voices:
-                                        if v.key == key:
-                                            v.muted = not v.muted
-                                if self.on_toggle_mute:
-                                    self.on_toggle_mute(key)
-                            else:
-                                # Solo (voices + modules)
-                                if getattr(self._patch, "solo_key", None) == key:
-                                    self._patch.solo_key = None
-                                else:
-                                    self._patch.solo_key = key
-                                if self.on_toggle_mute:
-                                    self.on_toggle_mute(key)
-                        else:
-                            self._active = key
-                            if self.on_select:
-                                self.on_select(key)
-                        return True
-
-                # Open dropdown clicks — handle before button rows
-                if self._open_dropdown:
-                    for di in self._dropdown_items:
-                        if di["rect"].collidepoint(lx, ly):
-                            if self._open_dropdown == "module":
-                                _data = str(di["data"])
-                                if _data.startswith("router:"):
-                                    if self.on_add_router:
-                                        self.on_add_router(_data.split(":", 1)[1])
-                                elif self.on_add_module:
-                                    self.on_add_module(_data)
-                            else:
-                                _data = str(di["data"])
-                                if _data.startswith("router:"):
-                                    if self.on_add_router:
-                                        self.on_add_router(_data.split(":", 1)[1])
-                                elif self.on_add_control:
-                                    self.on_add_control()
-                            self._open_dropdown = ""
-                            return True
-                    # Click outside dropdown — close it
-                    self._open_dropdown = ""
-                    return True
-
-                # Add buttons row 1 — Voice / Param
-                btn_y = self._btn_y
-                btn_h = self._btn_h
-                if btn_y <= ly < btn_y + btn_h:
-                    half = pw // 2
-                    if lx < half:
-                        if self.on_add_voice:
-                            self.on_add_voice()
-                    else:
-                        if self.on_add_param:
-                            self.on_add_param()
-                    return True
-                # Add buttons row 2 — Module▾ / Control▾
-                btn2_y = self._btn2_y
-                btn2_h = self._btn2_h
-                if btn2_y <= ly < btn2_y + btn2_h:
-                    half = pw // 2
-                    if lx < half:
-                        self._open_dropdown = "" if self._open_dropdown == "module" else "module"
-                    else:
-                        self._open_dropdown = "" if self._open_dropdown == "control" else "control"
-                    return True
-
             # ── Rhythm section ───────────────────────────────────────────────────
             p = self._patch
             if p is not None:
@@ -6633,22 +6301,6 @@ class PatchPanel(Panel):
                             self._apply_rhythm_slider(sl, lx)
                             return True
 
-            # ── Placement section header ─────────────────────────────────────
-            if (getattr(self, "_placement_hdr_rect", None) and
-                    self._placement_hdr_rect.collidepoint(lx, ly)):
-                self._placement_collapsed = not self._placement_collapsed
-                return True
-
-            # ── Placement player count +/- buttons ───────────────────────────
-            _pm = PlacementModule(p)
-            for row in getattr(self, "_placement_pm_rects", []):
-                if row["dec"].collidepoint(lx, ly):
-                    _pm.increment_player_count(row["key"], -1)
-                    return True
-                if row["inc"].collidepoint(lx, ly):
-                    _pm.increment_player_count(row["key"], +1)
-                    return True
-
             return False
 
         elif event.type == MOUSEBUTTONDOWN and event.button == 3:
@@ -6725,6 +6377,480 @@ class PatchPanel(Panel):
                 return True
 
         return False
+
+
+# ---------------------------------------------------------------------------
+# PatchPanel — full analytic driver panel: voice list + composition + placement
+# ---------------------------------------------------------------------------
+
+class PatchPanel(CompositionPanel):
+    """Left panel: scrollable list of voices + composition controls + placement."""
+
+    def __init__(self, side: str = "left") -> None:
+        super().__init__(side=side)
+        self.title = "Voices"
+        # Voice management callbacks
+        self.on_select:       Any = None
+        self.on_add_voice:    Any = None
+        self.on_add_lfo:      Any = None
+        self.on_add_param:    Any = None
+        self.on_add_module:   Any = None
+        self.on_add_control:  Any = None
+        self.on_add_router:   Any = None
+        self.on_toggle_mute:  Any = None
+        self.on_remove_voice: Any = None   # callback(key: str)
+        # Voice list geometry (surface-local coords, filled by render)
+        self._voices_collapsed:  bool = False
+        self._items:             list       = []
+        self._row_h:             int        = 22
+        self._btn_y:             int        = 9999
+        self._btn_h:             int        = 20
+        self._btn2_y:            int        = 9999
+        self._btn2_h:            int        = 20
+        self._voices_hdr_rect:   Any        = None
+        self._voices_row_start_y: int       = 22
+        # Placement geometry
+        self._placement_collapsed: bool     = True
+        self._placement_hdr_rect:  Any      = None
+        self._placement_pm_rects:  list     = []   # per-Part [{dec, inc, key}, ...]
+        # Dropdown state for Module / Control add buttons
+        self._open_dropdown:     str        = ""   # "module" | "control" | ""
+        self._dropdown_items:    list       = []   # list[dict(label, rect, data)]
+        self._btn_module_rect:   Any        = None
+        self._btn_control_rect:  Any        = None
+
+    def render(self) -> pygame.Surface | None:
+        if self._patch is None:
+            return None
+        pw   = self.PANEL_W
+        font = self._font_()
+        fh   = font.get_height()
+        p    = self._patch
+
+        # ── Build items list ─────────────────────────────────────────────────
+        items: list[tuple[str, str, list[int], bool]] = []
+        items.append(("__patch__",  "\u25c6 Patch",         [80, 130, 200], False))
+        items.append(("__system__", "\u2699 System Device", [200, 150, 90], False))
+        for v in p.voices:
+            em_tag = " [G]" if getattr(v, "emission_mode", "single") == "granular" else ""
+            items.append((v.key, f"\u25b6 {v.label}{em_tag}  {v.freq_hz:.1f}Hz", v.color, v.muted))
+        for l in p.lfos:
+            items.append((l.key, f"~ {l.label}  {l.rate_hz:.2f}Hz", l.color, False))
+        for mod in p.modules:
+            mt_tag = f"[{mod.module_type}]"
+            if mod.module_type == "lfo":
+                if mod.lfo_channels:
+                    mt_tag = f"~ {len(mod.lfo_channels)}ch"
+                else:
+                    mt_tag = f"~ {mod.rate_hz:.2f}Hz"
+            mute_tag = " \u25a0" if mod.muted else ""
+            items.append((mod.key, f"\u2B21 {mod.label}  {mt_tag}{mute_tag}", mod.color, mod.muted))
+        for cs in p.controls:
+            n_sl = len(cs.sliders)
+            sl_tag = f"[{n_sl} sl]" if n_sl != 1 else "[1 sl]"
+            items.append((cs.key, f"\u229e {cs.label}  {sl_tag}", cs.color, False))
+        for rt in getattr(p, "routers", []):
+            rt_icon = {
+                "voice_router": "\u21c9",
+                "instrument":   "\u266b",
+                "master":       "\u25c9",
+            }.get(rt.router_type, "\u25c8")
+            rt_col = {
+                "voice_router": [90, 160, 230],
+                "instrument":   [110, 200, 150],
+                "master":       [230, 180, 90],
+            }.get(rt.router_type, [160, 160, 180])
+            items.append((_router_ui_key(rt.key), f"{rt_icon} {rt.label}  [{rt.router_type}]", rt_col, False))
+        for m in p.mixers:
+            icon = "\u229e" if m.projection_active else "\u25cb"
+            items.append((m.key, f"{icon} {m.label}", m.color, False))
+        for pn in p.param_nodes:
+            n_tgt = len(pn.targets)
+            first_attr = pn.targets[0].get("attr", "") if pn.targets else ""
+            tgt = f"\u2192{first_attr}" if first_attr else ""
+            if n_tgt > 1:
+                tgt += f"+{n_tgt - 1}"
+            items.append((pn.key, f"\u2605 {pn.label}{tgt}", pn.color, False))
+
+        row_h     = fh + 10
+        btn_h     = fh + 8
+        hdr_h     = fh + 6
+        seq_row_h = fh + 8
+
+        # ── Section heights ──────────────────────────────────────────────────
+        v_rows_h     = 0 if self._voices_collapsed else len(items) * row_h
+        v_btns_h     = 0 if self._voices_collapsed else btn_h * 2 + 16
+        voices_sec_h = hdr_h + v_rows_h + v_btns_h + 4
+
+        seq_body_h = 0
+        if not self._seq_collapsed and _HAS_SEQ_ENG:
+            seq_body_h = seq_row_h * 11 + 14 + 32 * 6 + btn_h + 8
+        seq_sec_h = hdr_h + seq_body_h + 4
+
+        prob_body_h = 0
+        if not self._prob_collapsed:
+            prob_body_h = 14 + 32 * 4 + 8
+        prob_sec_h = hdr_h + prob_body_h + 4
+
+        dyn_body_h = 0
+        if not self._dyn_collapsed and _HAS_DYN_ENG:
+            _dyn_pg      = p.page_for(self._dyn_page_key)
+            _cell_h_d    = 16
+            _grid_rows_d = self._metric_grid_rows(
+                p.page_meter(_dyn_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_dyn_pg, "frac_beat_mode", "warp"),
+            )
+            dyn_body_h = (
+                (hdr_h + 2) + (hdr_h + 4) + (hdr_h + 4) + (hdr_h + 4)
+                + (32 + 8) + (_grid_rows_d * (_cell_h_d + 2) + 4)
+            )
+        dyn_sec_h = hdr_h + dyn_body_h + 4
+
+        improv_body_h = 0
+        if not self._improv_collapsed and _HAS_IMPROV_ENG:
+            _improv_pg = p.page_for(self._improv_page_key)
+            _cell_h_i  = 16
+            _irows     = self._metric_grid_rows(
+                p.page_meter(_improv_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_improv_pg, "frac_beat_mode", "warp"),
+            )
+            _sub_grace_h = 0 if self._improv_grace_collapsed else (
+                (hdr_h + 4) + (hdr_h + 4) + (32 + 8) + (32 + 8) + hdr_h)
+            _sub_chirp_h = 0 if self._improv_chirp_collapsed else (
+                (hdr_h + 4) + (hdr_h + 4) + (hdr_h + 4) + (32 + 8) + (32 + 8))
+            _sub_echo_h  = 0 if self._improv_echo_collapsed else (
+                (hdr_h + 4) + (32 + 8) + (32 + 8) + (hdr_h + 4))
+            improv_body_h = (
+                (hdr_h + 2) + (32 * 3 + 8)
+                + hdr_h + _sub_grace_h + 4
+                + hdr_h + _sub_chirp_h + 4
+                + hdr_h + _sub_echo_h  + 4
+                + (_irows * (_cell_h_i + 2) + 4)
+            )
+        improv_sec_h = hdr_h + improv_body_h + 4
+
+        rhythm_body_h = 0
+        if not self._rhythm_collapsed:
+            _active_pg = p.page_for(p.rhythm_active_page)
+            _cell_h    = 16
+            _grid_rows = self._metric_grid_rows(
+                p.page_meter(_active_pg)[0],
+                max(1, pw - 12),
+                frac_beat_mode=getattr(_active_pg, "frac_beat_mode", "warp"),
+            )
+            rhythm_body_h = (
+                (hdr_h + 2) + (hdr_h + 2) + (hdr_h + 4) + (hdr_h + 4)
+                + (_grid_rows * (_cell_h + 2) + 4)
+                + (hdr_h + 8) + (hdr_h + 6)
+                + 14 + (32 * 5 + 8)
+            )
+        rhythm_sec_h = hdr_h + rhythm_body_h + 4
+
+        _plc_n_rows = 0 if self._placement_collapsed else max(1, len(p.parts))
+        plc_sec_h   = (hdr_h + 2) + _plc_n_rows * (hdr_h + 2)
+
+        total_h = (4 + voices_sec_h + 8
+                   + seq_sec_h + 8 + prob_sec_h + 8
+                   + dyn_sec_h + 8 + improv_sec_h + 8 + rhythm_sec_h + 8
+                   + plc_sec_h + 8)
+        surf = pygame.Surface((pw, max(200, total_h)))
+        surf.fill(_PY_BG)
+
+        y = 4
+
+        # ── Voices header ────────────────────────────────────────────────────
+        arrow_v = "\u25bc" if not self._voices_collapsed else "\u25b6"
+        pygame.draw.rect(surf, (28, 44, 60), (0, y, pw, hdr_h))
+        pygame.draw.line(surf, (60, 100, 140), (0, y), (pw, y))
+        surf.blit(font.render(f"{arrow_v} Voices  [{max(0, len(items) - 2)}]",
+                              True, (140, 190, 230)), (8, y + 3))
+        self._voices_hdr_rect    = pygame.Rect(0, y, pw, hdr_h)
+        y += hdr_h
+        self._voices_row_start_y = y
+        self._items  = items
+        self._row_h  = row_h
+
+        if not self._voices_collapsed:
+            for key, label, col, muted in items:
+                is_active = (key == self._active)
+                is_mix    = self._patch is not None and any(m.key == key for m in self._patch.mixers)
+                is_router = self._patch is not None and _router_instance_for_active_key(self._patch, key) is not None
+                bg = (40, 60, 80) if is_active else (24, 24, 30)
+                if key in {"__patch__", "__system__"}:
+                    bg = (50, 80, 120) if is_active else (28, 40, 60)
+                elif is_mix:
+                    bg = (44, 44, 22) if is_active else (30, 28, 18)
+                elif is_router:
+                    bg = (26, 46, 64) if is_active else (18, 28, 38)
+                pygame.draw.rect(surf, bg, (2, y, pw - 4, row_h - 2), border_radius=3)
+                c = tuple(col[:3]) if col else (120, 180, 255)
+                pygame.draw.rect(surf, c, (2, y, 4, row_h - 2), border_radius=2)
+                txt_col = (200, 200, 210) if not muted else (80, 80, 90)
+                lbl = font.render(label, True, txt_col)
+                surf.blit(lbl, (10, y + (row_h - 2 - fh) // 2))
+                if not is_mix and not is_router and key not in {"__patch__", "__system__"}:
+                    is_param_  = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
+                    is_lfo_    = any(l.key == key for l in self._patch.lfos) if self._patch else False
+                    is_module_ = any(m.key == key for m in self._patch.modules) if self._patch else False
+                    is_ctrl_   = any(cs.key == key for cs in self._patch.controls) if self._patch else False
+                    if not is_lfo_ and not is_param_ and not is_ctrl_:
+                        is_solo = (getattr(self._patch, "solo_key", None) == key)
+                        sc  = (210, 170, 20) if is_solo else (42, 42, 52)
+                        stc = (245, 245, 60) if is_solo else (110, 110, 122)
+                        pygame.draw.rect(surf, sc,  (pw - 60, y + 3, 14, row_h - 8), border_radius=2)
+                        surf.blit(font.render("S", True, stc), (pw - 59, y + 3))
+                    if not is_param_ and not is_ctrl_:
+                        mc = (200, 80, 60) if muted else (50, 50, 60)
+                        pygame.draw.rect(surf, mc, (pw - 42, y + 3, 16, row_h - 8), border_radius=2)
+                        surf.blit(font.render("M", True, (200, 200, 200)), (pw - 40, y + 3))
+                    pygame.draw.rect(surf, (90, 40, 40), (pw - 24, y + 3, 16, row_h - 8), border_radius=2)
+                    surf.blit(font.render("\xd7", True, (220, 120, 100)), (pw - 21, y + 3))
+                y += row_h
+
+            # Add buttons row 1: Voice / Param
+            y += 4
+            half = pw // 2
+            pygame.draw.rect(surf, (35, 70, 100),  (4,        y, half - 8, btn_h), border_radius=3)
+            surf.blit(font.render("+ Voice",  True, (160, 200, 240)), (8,        y + 2))
+            pygame.draw.rect(surf, (60, 35, 90),   (half + 4, y, half - 8, btn_h), border_radius=3)
+            surf.blit(font.render("+ Param",  True, (210, 170, 255)), (half + 8, y + 2))
+            self._btn_y = y
+            self._btn_h = btn_h
+            y += btn_h + 4
+
+            # Add buttons row 2: Module▾ / Control▾
+            mod_lbl  = "+ Module \u25be" + (" [open]" if self._open_dropdown == "module" else "")
+            ctrl_lbl = "+ Control \u25be" + (" [open]" if self._open_dropdown == "control" else "")
+            mod_bg  = (100, 60, 130) if self._open_dropdown == "module"  else (80, 50, 100)
+            ctrl_bg = (30, 120, 95)  if self._open_dropdown == "control" else (30, 100, 80)
+            pygame.draw.rect(surf, mod_bg,  (4,        y, half - 8, btn_h), border_radius=3)
+            surf.blit(font.render(mod_lbl,  True, (220, 160, 255)), (8,        y + 2))
+            pygame.draw.rect(surf, ctrl_bg, (half + 4, y, half - 8, btn_h), border_radius=3)
+            surf.blit(font.render(ctrl_lbl, True, (140, 230, 180)), (half + 8, y + 2))
+            self._btn_module_rect  = pygame.Rect(4,        y, half - 8, btn_h)
+            self._btn_control_rect = pygame.Rect(half + 4, y, half - 8, btn_h)
+            self._btn2_y = y
+            self._btn2_h = btn_h
+            y += btn_h + 4
+
+            # Register dropdown item rects (drawn as overlay at end of render)
+            if self._open_dropdown in ("module", "control"):
+                drop_x = 4 if self._open_dropdown == "module" else half + 4
+                drop_w = half - 8
+                items_data = (
+                    [("LFO",              "lfo"),
+                     ("Passthrough",      "passthrough"),
+                     ("Pitch Quant.",     "pitch_quantizer"),
+                     ("Interaural",       "interaural"),
+                     ("Voice Router",     "router:voice_router"),
+                     ("Instrument Router","router:instrument"),
+                     ("Master Router",    "router:master")]
+                    if self._open_dropdown == "module"
+                    else [("Control Surface",     "control_surface"),
+                           ("Voice Router",        "router:voice_router"),
+                           ("Instrument Router",   "router:instrument"),
+                           ("Master Router",       "router:master")]
+                )
+                self._dropdown_items = []
+                dy = y
+                for dlabel, ddata in items_data:
+                    dr = pygame.Rect(drop_x, dy, drop_w, btn_h)
+                    self._dropdown_items.append(dict(label=dlabel, rect=dr, data=ddata))
+                    dy += btn_h + 2
+
+        y += 8
+
+        # ── Composition sections (seq → rhythm) ──────────────────────────────
+        y = self._render_composition_onto(surf, y, font, p, pw, fh, btn_h, hdr_h, seq_row_h)
+        y += 8
+
+        # ── Placement section ────────────────────────────────────────────────
+        arrow_plc = "\u25bc" if not self._placement_collapsed else "\u25b6"
+        pygame.draw.rect(surf, (28, 44, 60), (0, y, pw, hdr_h))
+        pygame.draw.line(surf, (60, 100, 140), (0, y), (pw, y))
+        surf.blit(font.render(f"{arrow_plc} Placement", True, (140, 190, 230)), (8, y + 3))
+        self._placement_hdr_rect = pygame.Rect(0, y, pw, hdr_h)
+        y += hdr_h + 2
+
+        self._placement_pm_rects = []
+        if not self._placement_collapsed:
+            _pm_mod = PlacementModule(p)
+            for part in p.parts:
+                pk  = part.key
+                cnt = _pm_mod.player_count(pk)
+                pygame.draw.rect(surf, (22, 32, 44), (2, y, pw - 4, hdr_h), border_radius=2)
+                surf.blit(font.render(f"{pk}: {cnt}", True, (180, 200, 220)), (8, y + 3))
+                dec_r = pygame.Rect(pw - 46, y + 2, 18, hdr_h - 4)
+                inc_r = pygame.Rect(pw - 24, y + 2, 18, hdr_h - 4)
+                pygame.draw.rect(surf, (50, 70, 100), dec_r, border_radius=2)
+                pygame.draw.rect(surf, (50, 70, 100), inc_r, border_radius=2)
+                surf.blit(font.render("-", True, (200, 200, 230)), (dec_r.x + 5, dec_r.y + 2))
+                surf.blit(font.render("+", True, (200, 200, 230)), (inc_r.x + 4, inc_r.y + 2))
+                self._placement_pm_rects.append(dict(key=pk, dec=dec_r, inc=inc_r))
+                y += hdr_h + 2
+        y += 8
+
+        # ── Dropdown overlay (drawn on top so it covers sections below) ──────
+        if self._open_dropdown and self._dropdown_items:
+            for di in self._dropdown_items:
+                dr = di["rect"]
+                pygame.draw.rect(surf, (42, 32, 56), dr, border_radius=2)
+                pygame.draw.rect(surf, (90, 70, 120), dr, 1, border_radius=2)
+                surf.blit(font.render(di["label"], True, (210, 200, 240)),
+                          (dr.x + 4, dr.y + 2))
+
+        # ── Context menu overlay ─────────────────────────────────────────────
+        ctx = self._rhythm_ctx_menu
+        if ctx is not None:
+            _ctx_items = ctx.get("items", [])
+            if _ctx_items:
+                menu_r = ctx.get("menu_rect")
+                if menu_r:
+                    pygame.draw.rect(surf, (38, 32, 54), menu_r, border_radius=3)
+                    pygame.draw.rect(surf, (100, 80, 150), menu_r, 1, border_radius=3)
+                for ci in _ctx_items:
+                    r = ci["rect"]
+                    if ci.get("separator"):
+                        pygame.draw.line(surf, (70, 60, 100),
+                                         (r.x + 4, r.y + r.h // 2),
+                                         (r.x + r.w - 4, r.y + r.h // 2))
+                        continue
+                    pygame.draw.rect(surf, (52, 44, 72), r, border_radius=2)
+                    pygame.draw.rect(surf, (85, 70, 120), r, 1, border_radius=2)
+                    lbl_c = ci.get("color", (210, 200, 240))
+                    surf.blit(font.render(ci["label"], True, lbl_c),
+                              (r.x + 4, r.y + 2))
+
+        return self._apply_panel_scroll(surf)
+
+    def handle_event(self, event: pygame.event.Event) -> bool:
+        rect = self.panel_rect
+
+        if event.type == MOUSEBUTTONDOWN and event.button == 1:
+            if not rect.collidepoint(event.pos):
+                return super().handle_event(event)
+            lx = event.pos[0] - rect.x
+            ly = event.pos[1] - rect.y + self._panel_scroll_y
+            pw = self.PANEL_W
+            p  = self._patch
+
+            # ── Voices header toggle ─────────────────────────────────────────
+            if self._voices_hdr_rect and self._voices_hdr_rect.collidepoint(lx, ly):
+                self._voices_collapsed = not self._voices_collapsed
+                return True
+
+            # ── Voice rows ───────────────────────────────────────────────────
+            if not self._voices_collapsed:
+                y0    = self._voices_row_start_y
+                row_h = self._row_h
+                for i_idx, (key, _, _, _) in enumerate(self._items):
+                    row_top = y0 + i_idx * row_h
+                    if row_top <= ly < row_top + row_h:
+                        if key in {"__patch__", "__system__"}:
+                            self._active = key
+                            if self.on_select:
+                                self.on_select(key)
+                            return True
+                        is_mix    = any(m.key == key for m in self._patch.mixers)  if self._patch else False
+                        is_router = _router_instance_for_active_key(self._patch, key) is not None if self._patch else False
+                        is_param  = any(pn.key == key for pn in self._patch.param_nodes) if self._patch else False
+                        is_lfo    = any(l.key == key for l in self._patch.lfos) if self._patch else False
+                        is_module = any(m.key == key for m in self._patch.modules) if self._patch else False
+                        is_control= any(cs.key == key for cs in self._patch.controls) if self._patch else False
+                        if not is_mix and not is_router and lx >= pw - 24:
+                            if self.on_remove_voice:
+                                self.on_remove_voice(key)
+                        elif not is_mix and not is_router and not is_param and not is_control and not is_lfo and lx >= pw - 60:
+                            if lx >= pw - 42:
+                                if is_module:
+                                    for mod in self._patch.modules:
+                                        if mod.key == key:
+                                            mod.muted = not mod.muted
+                                else:
+                                    for v in self._patch.voices:
+                                        if v.key == key:
+                                            v.muted = not v.muted
+                                if self.on_toggle_mute:
+                                    self.on_toggle_mute(key)
+                            else:
+                                if getattr(self._patch, "solo_key", None) == key:
+                                    self._patch.solo_key = None
+                                else:
+                                    self._patch.solo_key = key
+                                if self.on_toggle_mute:
+                                    self.on_toggle_mute(key)
+                        else:
+                            self._active = key
+                            if self.on_select:
+                                self.on_select(key)
+                        return True
+
+                # Open dropdown clicks — handle before button rows
+                if self._open_dropdown:
+                    for di in self._dropdown_items:
+                        if di["rect"].collidepoint(lx, ly):
+                            if self._open_dropdown == "module":
+                                _data = str(di["data"])
+                                if _data.startswith("router:"):
+                                    if self.on_add_router:
+                                        self.on_add_router(_data.split(":", 1)[1])
+                                elif self.on_add_module:
+                                    self.on_add_module(_data)
+                            else:
+                                _data = str(di["data"])
+                                if _data.startswith("router:"):
+                                    if self.on_add_router:
+                                        self.on_add_router(_data.split(":", 1)[1])
+                                elif self.on_add_control:
+                                    self.on_add_control()
+                            self._open_dropdown = ""
+                            return True
+                    self._open_dropdown = ""
+                    return True
+
+                # Add buttons row 1 — Voice / Param
+                btn_y = self._btn_y
+                btn_h = self._btn_h
+                if btn_y <= ly < btn_y + btn_h:
+                    half = pw // 2
+                    if lx < half:
+                        if self.on_add_voice:
+                            self.on_add_voice()
+                    else:
+                        if self.on_add_param:
+                            self.on_add_param()
+                    return True
+                # Add buttons row 2 — Module▾ / Control▾
+                btn2_y = self._btn2_y
+                btn2_h = self._btn2_h
+                if btn2_y <= ly < btn2_y + btn2_h:
+                    half = pw // 2
+                    if lx < half:
+                        self._open_dropdown = "" if self._open_dropdown == "module" else "module"
+                    else:
+                        self._open_dropdown = "" if self._open_dropdown == "control" else "control"
+                    return True
+
+            # ── Placement section header ─────────────────────────────────────
+            if (self._placement_hdr_rect and
+                    self._placement_hdr_rect.collidepoint(lx, ly)):
+                self._placement_collapsed = not self._placement_collapsed
+                return True
+
+            # ── Placement player count +/- buttons ───────────────────────────
+            if p is not None:
+                _pm = PlacementModule(p)
+                for row in self._placement_pm_rects:
+                    if row["dec"].collidepoint(lx, ly):
+                        _pm.increment_player_count(row["key"], -1)
+                        return True
+                    if row["inc"].collidepoint(lx, ly):
+                        _pm.increment_player_count(row["key"], +1)
+                        return True
+
+        return super().handle_event(event)
 
 
 # ---------------------------------------------------------------------------

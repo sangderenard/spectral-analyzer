@@ -17,6 +17,11 @@ _import_all_from(_analytic_model)
 _import_all_from(_analytic_routing)
 _import_all_from(_analytic_shared)
 
+# Articulation → gate-fraction multiplier.
+# None = drone: gate is stretched to reach the next onset.
+# 0=normal  1=staccato  2=legato  3=drone
+_ART_GATE: dict = {0: 1.0, 1: 0.5, 2: 0.95, 3: None}
+
 def _build_rhythm_schedule(
         p: "AnalyticPatch",
         beat_s: float,

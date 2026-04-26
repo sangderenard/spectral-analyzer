@@ -21,13 +21,8 @@ Stride and capacity
 GraphSolver integration
 -----------------------
 Pass an ``EdgeFifoBank`` instance to ``GraphSolver(fifo_bank=bank)``.  The
-solver claims one slot per delayed edge during topology build, then uses the
-bank for delay_read / delay_write instead of the default dict-snapshot ring
-buffer.  Reset is forwarded automatically via ``GraphSolver.reset()``.
-
-Delay semantics: a slot with ``fifo_size = d`` provides exactly d-sample
-delay.  The solver fills the FIFO over the first d ticks (no contribution
-while count < d), then runs in steady-state read-one / write-one.
+solver propagates the bank to all node modules via ``_resolve_fifo_bank``.
+Reset is forwarded automatically via ``GraphSolver.reset()``.
 
 Object slots
 ------------
@@ -39,7 +34,6 @@ slots.  Object slots are addressed by the same key namespace.  Use
 """
 from __future__ import annotations
 
-from collections import deque
 from typing import Any, Dict, Optional
 
 import torch
@@ -162,23 +156,25 @@ class _FifoSlot:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ObjectFifoSlot — one Python-object deque slot
+# ObjectFifoSlot — one Python-object circular-buffer slot
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ObjectFifoSlot:
     """Single-writer/single-reader Python object FIFO with KPN backpressure.
 
-    Unlike _FifoSlot there is no tensor storage — items are arbitrary Python
-    objects stored in a ``collections.deque``.  ``write_batch`` stores an
-    entire list as ONE atomic deque item so that a ``list[PerformanceAtom]``
-    is one write/read pair.
+    Storage is a fixed-size list allocated at claim time.  Writes only replace
+    existing cells in the ring buffer; they do not grow a deque or allocate
+    channel storage inside graph execution.
     """
 
-    __slots__ = ("_buf", "_fifo_size")
+    __slots__ = ("_buf", "_fifo_size", "_write_pos", "_read_pos", "_count")
 
     def __init__(self, fifo_size: int) -> None:
-        self._buf: deque = deque()
         self._fifo_size: int = int(fifo_size)
+        self._buf: list[Any | None] = [None] * self._fifo_size
+        self._write_pos: int = 0
+        self._read_pos: int = 0
+        self._count: int = 0
 
     # ── properties ───────────────────────────────────────────────────────────
 
@@ -188,48 +184,52 @@ class ObjectFifoSlot:
 
     @property
     def count(self) -> int:
-        return len(self._buf)
+        return self._count
 
     def is_empty(self) -> bool:
-        return len(self._buf) == 0
+        return self._count == 0
 
     def is_full(self) -> bool:
-        return len(self._buf) >= self._fifo_size
+        return self._count >= self._fifo_size
 
     # ── write ─────────────────────────────────────────────────────────────────
 
     def write(self, obj: Any) -> None:
         """Write one object.  Raises FifoFull if no space."""
-        if len(self._buf) >= self._fifo_size:
+        if self._count >= self._fifo_size:
             raise FifoFull(f"ObjectFifo full (capacity={self._fifo_size})")
-        self._buf.append(obj)
+        self._buf[self._write_pos] = obj
+        self._write_pos = (self._write_pos + 1) % self._fifo_size
+        self._count += 1
 
     def try_write(self, obj: Any) -> bool:
         """Write one object.  Returns False (no-op) if the slot is full."""
-        if len(self._buf) >= self._fifo_size:
+        if self._count >= self._fifo_size:
             return False
-        self._buf.append(obj)
+        self.write(obj)
         return True
 
     def write_batch(self, items: list) -> None:
-        """Write an entire list as ONE atomic deque item.  Raises FifoFull if no space."""
-        if len(self._buf) >= self._fifo_size:
-            raise FifoFull(f"ObjectFifo full (capacity={self._fifo_size})")
-        self._buf.append(items)
+        """Write an entire list as ONE atomic item.  Raises FifoFull if no space."""
+        self.write(items)
 
     # ── read ──────────────────────────────────────────────────────────────────
 
     def read(self) -> Any:
         """Consume and return the oldest item.  Raises FifoEmpty if empty."""
-        if not self._buf:
+        if self._count == 0:
             raise FifoEmpty(f"ObjectFifo empty (capacity={self._fifo_size})")
-        return self._buf.popleft()
+        obj = self._buf[self._read_pos]
+        self._buf[self._read_pos] = None
+        self._read_pos = (self._read_pos + 1) % self._fifo_size
+        self._count -= 1
+        return obj
 
     def try_read(self) -> Optional[Any]:
         """Consume and return the oldest item, or None if empty."""
-        if not self._buf:
+        if self._count == 0:
             return None
-        return self._buf.popleft()
+        return self.read()
 
     def read_batch(self) -> list:
         """Read one slot item and return as list (unwraps write_batch envelope)."""
@@ -238,15 +238,19 @@ class ObjectFifoSlot:
 
     def peek(self) -> Any:
         """Return the oldest item without consuming it.  Raises FifoEmpty if empty."""
-        if not self._buf:
+        if self._count == 0:
             raise FifoEmpty(f"ObjectFifo empty (capacity={self._fifo_size})")
-        return self._buf[0]
+        return self._buf[self._read_pos]
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def reset(self) -> None:
-        """Clear all items."""
-        self._buf.clear()
+        """Reset heads and count without reallocating storage."""
+        for i in range(self._fifo_size):
+            self._buf[i] = None
+        self._write_pos = 0
+        self._read_pos = 0
+        self._count = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -260,9 +264,9 @@ class EdgeFifoBank:
 
     * **Tensor slots** (default) — preallocated circular buffers for complex128
       signal frames.  Claimed via ``claim(key)`` or ``claim(key, "tensor")``.
-    * **Object slots** — Python-object deques for non-tensor KPN payloads such
-      as ``list[PerformanceAtom]``.  Claimed via ``claim_object(key)`` or
-      ``claim(key, "object")``.
+* **Object slots** — fixed-size Python-object ring buffers for non-tensor KPN
+  payloads such as ``list[PerformanceAtom]``.  Claimed via
+  ``claim_object(key)`` or ``claim(key, "object")``.
 
     All I/O methods dispatch on slot type by key.  ``has_slot`` and ``reset``
     cover both types.  The two namespaces are shared — a key must be unique
@@ -434,51 +438,32 @@ class EdgeFifoBank:
 
 def bank_for_edges(
     edges,
-    sample_rate: float,
     *,
     stride: int = 1,
-    extra_frames: int = 0,
+    fifo_size: int = 8,
     dtype: torch.dtype = _CDTYPE,
     device: Optional[torch.device] = None,
-) -> EdgeFifoBank:
-    """Create and pre-claim an ``EdgeFifoBank`` sized for *edges*.
+    bank: Optional["EdgeFifoBank"] = None,
+) -> "EdgeFifoBank":
+    """Create (or return) an ``EdgeFifoBank`` for the given edge set.
 
-    ``fifo_size`` is set to the maximum delay depth across all delayed edges
-    (plus *extra_frames* for headroom).  Non-delayed edges are ignored.
-
-    Slot keys follow the convention used by ``GraphSolver``:
-    ``"{src_key}>{dst_key}@d{delay_steps}"``.
+    If *bank* is supplied it is returned as-is (allowing callers to pass an
+    existing bank through).  Otherwise a new bank is created with the given
+    parameters.
 
     Parameters
     ----------
-    edges : iterable of TensorEdge
-        The edge list from which delayed edges are extracted.
-    sample_rate : float
-        Used to convert ``delay_s`` to sample counts.
+    edges :
+        Edge list — currently unused; reserved for future per-edge slot claims.
     stride : int
-        Samples per frame (passed to EdgeFifoBank).
-    extra_frames : int
-        Additional buffer frames beyond the required minimum.
+        Samples per tensor frame (passed to EdgeFifoBank).
+    fifo_size : int
+        Default frames/items per slot.
     dtype, device
-        Forwarded to EdgeFifoBank.
+        Forwarded to EdgeFifoBank when creating a new one.
+    bank : EdgeFifoBank, optional
+        Existing bank to return directly.
     """
-    delayed: list[tuple[int, object]] = []
-    for e in edges:
-        d = e.delay_steps(float(sample_rate))
-        if d > 0:
-            delayed.append((d, e))
-
-    if not delayed:
-        return EdgeFifoBank(stride=stride, fifo_size=1, dtype=dtype, device=device)
-
-    max_depth = max(d for d, _ in delayed)
-    bank = EdgeFifoBank(
-        stride=stride,
-        fifo_size=max_depth + extra_frames,
-        dtype=dtype,
-        device=device,
-    )
-    for d, e in delayed:
-        key = f"{e.src_key}>{e.dst_key}@d{d}"
-        bank.claim(key)
-    return bank
+    if bank is not None:
+        return bank
+    return EdgeFifoBank(stride=stride, fifo_size=fifo_size, dtype=dtype, device=device)

@@ -1,4 +1,5 @@
 import types
+import json
 
 import torch
 
@@ -17,10 +18,20 @@ from torch_composer_engine import (
     ScoreEventLabel,
     ScoreParam,
     ScoreSection,
+    ScoreWriteMask,
     ScoreTensor,
+    apply_improv_to_score,
+    assign_hz_to_score_masked,
+    build_masked_improvised_song,
+    composer_from_jsonable,
+    composer_to_jsonable,
     envelope_jobs_from_sparse_score,
     performance_atoms_from_jobs,
     PerformanceAtom,
+    TorchChirpParams,
+    TorchEchoParams,
+    TorchGraceParams,
+    TorchImprovProgram,
     TorchAccentPattern,
     TorchBeatTree,
     TorchDynamicsCurve,
@@ -159,6 +170,123 @@ def test_patch_demo_sparse_score_uses_batch_dimension() -> None:
 
     assert packet.batch_size == 3
     assert packet.data.shape[1] == 1
+
+
+def _json_roundtrip(obj):
+    return composer_from_jsonable(json.loads(json.dumps(composer_to_jsonable(obj))))
+
+
+def test_composer_json_roundtrips_score_objects_and_masks() -> None:
+    score = empty_score_tensor(batch_size=1, max_events=2)
+    score.labels[:] = EVENT_NOTE
+    score.mask[:] = True
+    score.params[0, 0, PARAM_HZ] = 261.63
+    score.params[0, 1, PARAM_HZ] = 329.63
+    score.metadata["name"] = "json_score"
+    mask = ScoreWriteMask.like(score, hz=True, metadata={"owner": "note_stream"})
+    sparse = sparse_score_tensor_from_score(score)
+    jobs = envelope_jobs_from_sparse_score(sparse, sample_rate=1000.0, release_tail_s=0.05)
+
+    score_rt = _json_roundtrip(score)
+    mask_rt = _json_roundtrip(mask)
+    sparse_rt = _json_roundtrip(sparse)
+    jobs_rt = _json_roundtrip(jobs)
+
+    assert isinstance(score_rt, ScoreTensor)
+    assert torch.equal(score_rt.labels, score.labels)
+    assert torch.allclose(score_rt.params, score.params)
+    assert score_rt.metadata["name"] == "json_score"
+    assert isinstance(mask_rt, ScoreWriteMask)
+    assert torch.equal(mask_rt.hz, mask.hz)
+    assert mask_rt.metadata["owner"] == "note_stream"
+    assert torch.equal(sparse_rt.mask, sparse.mask)
+    assert torch.allclose(sparse_rt.data, sparse.data)
+    assert torch.equal(jobs_rt.sample_start, jobs.sample_start)
+
+
+def test_composer_json_roundtrips_performance_atoms_with_curves() -> None:
+    score = empty_score_tensor(batch_size=1, max_events=1)
+    score.labels[0, 0] = EVENT_NOTE
+    score.mask[0, 0] = True
+    score.params[0, 0, PARAM_START] = 0.0
+    score.params[0, 0, PARAM_DURATION] = 0.2
+    score.params[0, 0, PARAM_HZ] = 440.0
+    score.params[0, 0, PARAM_VELOCITY] = 0.75
+    jobs = envelope_jobs_from_sparse_score(
+        sparse_score_tensor_from_score(score),
+        sample_rate=1000.0,
+        release_tail_s=0.05,
+    )
+    atom = performance_atoms_from_jobs(
+        jobs,
+        envelope_curves=[default_envelope("env_json")],
+        chirp_curves=[default_chirp("chirp_json")],
+        voice_key="v1",
+        sample_rate=1000.0,
+    )[0]
+
+    atom_rt = _json_roundtrip(atom)
+
+    assert isinstance(atom_rt, PerformanceAtom)
+    assert atom_rt.voice_key == "v1"
+    assert atom_rt.fundamental_hz == 440.0
+    assert atom_rt.gate_history[0].velocity == 0.75
+    assert atom_rt.envelope_curve.name == "env_json"
+    assert atom_rt.chirp_curve.name == "chirp_json"
+
+
+def test_composer_json_roundtrips_module_data_classes() -> None:
+    beat = TorchBeatTree.from_rhythm_pattern([_make_flat_leaves(4)], home_div=4, with_topology=True)
+    warp = TorchWarpCurve.build(swing=0.2, rubato_shape=WarpShape.SINE, batch_size=1)
+    curve = TorchDynamicsCurve.build(shape="swell", intensity=0.5, batch_size=1)
+    accent = TorchAccentPattern.build(levels=[[1.0, 0.8, 1.2, 0.9]])
+    dynamics = TorchDynamicsProgram.build(batch_size=1)
+    dynamics.enabled[0] = True
+    dynamics.curve = curve
+    dynamics.accent = accent
+    stream = TorchNoteStream.build(degrees=[[220.0, 330.0]], deg_pattern=[[0, 1]])
+    improv = TorchImprovProgram.build(batch_size=1)
+    improv.enabled[0] = True
+    improv.prob_grace[0] = 1.0
+    improv.grace = TorchGraceParams.build(position="pre", batch_size=1)
+    improv.chirp = TorchChirpParams.build(shape="bounce", batch_size=1)
+    improv.echo = TorchEchoParams.build(max_notes=2, batch_size=1)
+    improv.step_mask = torch.ones((1, 1, 4), dtype=torch.bool)
+    improv.n_steps[0] = 4
+
+    for obj in (beat, warp, curve, accent, dynamics, stream, improv):
+        rt = _json_roundtrip(obj)
+        assert type(rt) is type(obj)
+        for name, value in obj.__dict__.items():
+            other = getattr(rt, name)
+            if isinstance(value, torch.Tensor):
+                assert torch.equal(other, value)
+
+
+def test_masked_improvised_song_serializes_and_preserves_fixed_notes() -> None:
+    score, write_mask, stream, sparse = build_masked_improvised_song()
+    fixed_slots = score.metadata["fixed_slots"]
+    module_slots = score.metadata["module_slots"]
+
+    assert fixed_slots == [0, 2, 4, 6]
+    assert module_slots == [1, 3, 5, 7]
+    assert torch.equal(write_mask.hz[0], torch.tensor([False, True, False, True, False, True, False, True]))
+    assert torch.all(score.params[0, module_slots, PARAM_HZ] > 0.0)
+    assert torch.allclose(
+        score.params[0, fixed_slots, PARAM_HZ],
+        torch.tensor([261.63, 329.63, 392.00, 523.25], dtype=torch.float64),
+        atol=1e-6,
+    )
+
+    score_rt = _json_roundtrip(score)
+    mask_rt = _json_roundtrip(write_mask)
+    sparse_rt = _json_roundtrip(sparse)
+    stream_rt = _json_roundtrip(stream)
+
+    assert torch.allclose(score_rt.params, score.params)
+    assert torch.equal(mask_rt.hz, write_mask.hz)
+    assert torch.equal(sparse_rt.mask, sparse.mask)
+    assert torch.equal(stream_rt.deg_pattern, stream.deg_pattern)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -496,3 +624,83 @@ def test_note_stream_from_note_streams_packs_state() -> None:
     stream = TorchNoteStream.from_note_streams([_FakeStream(), _FakeStream()])
     assert stream.batch_size == 2
     assert torch.isclose(stream.p_chromatic[0], torch.tensor(0.3, dtype=torch.float64))
+
+
+def test_performance_atom_envelope_curve_not_discretized_in_json() -> None:
+    """ParametricCurve fields in PerformanceAtom survive JSON as full parametric
+    control-point data — never as a discretized sample array."""
+    from parametric_curve import ControlPoint, ParametricCurve
+
+    curve = ParametricCurve()
+    curve.name = "test_env"
+    curve.points = [
+        ControlPoint(t=0.0, v=0.0),
+        ControlPoint(t=0.08, v=1.0),
+        ControlPoint(t=0.60, v=0.87),
+        ControlPoint(t=0.85, v=0.87),
+        ControlPoint(t=1.0,  v=0.0),
+    ]
+
+    score = empty_score_tensor(batch_size=1, max_events=1)
+    score.labels[0, 0] = EVENT_NOTE
+    score.mask[0, 0] = True
+    score.params[0, 0, PARAM_START] = 0.0
+    score.params[0, 0, PARAM_DURATION] = 0.3
+    score.params[0, 0, PARAM_HZ] = 293.66
+    score.params[0, 0, PARAM_VELOCITY] = 0.8
+    jobs = envelope_jobs_from_sparse_score(
+        sparse_score_tensor_from_score(score), sample_rate=1000.0, release_tail_s=0.05
+    )
+    atom = performance_atoms_from_jobs(
+        jobs,
+        envelope_curves=[curve],
+        chirp_curves=[default_chirp()],
+        voice_key="v1",
+        sample_rate=1000.0,
+    )[0]
+
+    payload = composer_to_jsonable(atom)
+    json_str = json.dumps(payload)
+    restored = composer_from_jsonable(json.loads(json_str))
+
+    # Must come back as a live ParametricCurve, not a sample array or tensor
+    from parametric_curve import ParametricCurve as _PC
+    assert isinstance(restored.envelope_curve, _PC)
+    # Control points must be preserved exactly — no discretisation
+    assert len(restored.envelope_curve.points) == len(curve.points)
+    for orig, rt in zip(curve.points, restored.envelope_curve.points):
+        assert abs(orig.t - rt.t) < 1e-9
+        assert abs(orig.v - rt.v) < 1e-9
+    assert restored.envelope_curve.name == "test_env"
+
+
+def test_score_tensor_from_resolved_notes_bridge() -> None:
+    """Piano roll ResolvedNote objects round-trip through ScoreTensor + ScoreWriteMask."""
+    from analytic_model import ResolvedNote
+    from torch_composer_engine import (
+        score_tensor_from_resolved_notes,
+        score_write_mask_from_resolved_notes,
+    )
+
+    notes = [
+        ResolvedNote(note_id="n0", voice_key="v1", start_time=0.0, duration_s=0.25,
+                     fundamental_hz=293.66, velocity=0.8, locked=True),
+        ResolvedNote(note_id="n1", voice_key="v1", start_time=0.25, duration_s=0.25,
+                     fundamental_hz=349.23, velocity=0.7, locked=False),  # module-free
+        ResolvedNote(note_id="n2", voice_key="v1", start_time=0.5, duration_s=0.25,
+                     fundamental_hz=440.0, velocity=0.9, locked=True),
+        ResolvedNote(note_id="rest", voice_key="v1", start_time=0.75, duration_s=0.25,
+                     fundamental_hz=0.0, locked=False, is_rest=True),  # excluded
+    ]
+
+    score = score_tensor_from_resolved_notes(notes, voice_key="v1")
+    assert score.max_events == 3  # rest excluded
+    assert abs(float(score.params[0, 0, PARAM_HZ]) - 293.66) < 1e-4
+    assert abs(float(score.params[0, 1, PARAM_HZ]) - 349.23) < 1e-4
+    assert abs(float(score.params[0, 2, PARAM_HZ]) - 440.0)  < 1e-4
+
+    wmask = score_write_mask_from_resolved_notes(score, notes)
+    # locked=True → hz NOT writable; locked=False → hz writable
+    assert not bool(wmask.hz[0, 0].item())  # n0 locked → False
+    assert bool(wmask.hz[0, 1].item())      # n1 unlocked → True
+    assert not bool(wmask.hz[0, 2].item())  # n2 locked → False

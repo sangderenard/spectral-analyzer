@@ -1,14 +1,15 @@
 """Complex graph solver over arbitrary node tensors.
 
 Core rules:
-* one step() call resolves one dt sample
+* run_schedule() runs the full KPN batch schedule over n_frames samples
+* step() resolves one dt sample (training path only)
 * all arithmetic is torch.complex128
 * nodes receive whole tensors and may transform them directly
 * edges contribute by ordinary complex multiplication with broadcast semantics
 * zero-delay linear regions solve exactly
 * nonlinear/cyclic SCCs resolve by fixed-point iteration
-* delayed edges carry state across samples
-* mixer-grid flow and patch-panel flow are one network surface per sample
+* time data is a node responsibility — nodes carry, notice, and send timing
+* mixer-grid flow and patch-panel flow are one network surface
 """
 from __future__ import annotations
 
@@ -629,8 +630,6 @@ def _tarjan_sccs(node_keys: list[str], edges: Iterable["TensorEdge"], sample_rat
     ki = {k: i for i, k in enumerate(node_keys)}
     adj: list[list[int]] = [[] for _ in range(n)]
     for edge in edges:
-        if edge.delay_steps(sample_rate) != 0:
-            continue
         si = ki.get(edge.src_key)
         di = ki.get(edge.dst_key)
         if si is None or di is None:
@@ -1296,9 +1295,6 @@ class TensorEdge:
     src_key: str
     dst_key: str
     weight: Tensor | complex | float | int
-    delay_s: float = 0.0
-    delay_samples: int = 0
-    analog_complex_delay: Tensor | complex | float | int = 1.0 + 0.0j
     coefficient_set: str = ""
     coefficient_names: tuple[str, ...] = ()
     crosstalk_weight: Tensor | complex | float | int = 0.0 + 0.0j
@@ -1326,15 +1322,16 @@ class TensorEdge:
     # or "ratio" (with ConsumptionPolicy.ratio) when the edge carries
     # control-rate, block-rate, or hold-last-value data.
     consumption_policy: ConsumptionPolicy = field(default_factory=ConsumptionPolicy)
-
-    def delay_steps(self, sample_rate: float) -> int:
-        if int(self.delay_samples) > 0:
-            return int(self.delay_samples)
-        return max(0, int(round(float(self.delay_s) * float(sample_rate))))
+    # ── FIFO bank ──────────────────────────────────────────────────────
+    # Edges that require a FIFO (object transport) carry the shared bank here.
+    # GraphSolver._resolve_fifo_bank collects it from all edges and propagates
+    # the single unified bank to every node module.
+    # Rule: if an edge is instantiated with a FIFO requirement, it must
+    # supply the bank it draws from.
+    fifo_bank: Optional[Any] = field(default=None, hash=False, compare=False, repr=False)
 
     def apply(self, payload: Tensor) -> Tensor:
         out = _canonical_complex(self.weight).to(payload.device) * payload
-        out = out * _canonical_complex(self.analog_complex_delay).to(payload.device)
         out = out * _canonical_complex(self.src_mask).to(payload.device)
         out = out * _canonical_complex(self.dst_mask).to(payload.device)
         out = out * _canonical_complex(self.activity_mask).to(payload.device)
@@ -2027,9 +2024,6 @@ class GraphSolver(nn.Module):
                 e.src_key,
                 e.dst_key,
                 _canonical_complex(e.weight).to(device),
-                e.delay_s,
-                e.delay_samples,
-                _canonical_complex(e.analog_complex_delay).to(device),
                 e.coefficient_set,
                 e.coefficient_names,
                 _canonical_complex(e.crosstalk_weight).to(device),
@@ -2070,6 +2064,7 @@ class GraphSolver(nn.Module):
         self.node_keys = [node.key for node in self.nodes]
         self.node_map = {node.key: node for node in self.nodes}
         self.node_index = {node.key: i for i, node in enumerate(self.nodes)}
+        self.fifo_bank = self._resolve_fifo_bank(fifo_bank)
         self.subscription_ports: dict[tuple[str, str], SubscriptionPort] = {}
         self.contract_edges: list[ContractEdge] = []
         for node in self.nodes:
@@ -2081,8 +2076,9 @@ class GraphSolver(nn.Module):
         self.meta_edges = [edge for edge in self.edges if edge.activity_contract or edge.src_addresses or edge.dst_addresses]
         self.network_links = tuple(self.edges)
         self._auto_form_contract_edges()
-        raw_sccs = _tarjan_sccs(self.node_keys, self.edges, self.sample_rate)
-        zero_delay_edges = [edge for edge in self.edges if edge.delay_steps(self.sample_rate) == 0]
+        self.solve_edges = [edge for edge in self.edges if not self._is_subscription_contract_edge(edge)]
+        raw_sccs = _tarjan_sccs(self.node_keys, self.solve_edges, self.sample_rate)
+        zero_delay_edges = list(self.solve_edges)
         node_to_scc: dict[int, int] = {}
         sccs: list[SCCSpec] = []
         for scc_id, raw in enumerate(reversed(raw_sccs)):
@@ -2109,11 +2105,6 @@ class GraphSolver(nn.Module):
 
         self._first_tick: bool = True
         self.zero_delay_edges = zero_delay_edges
-        self.delayed_edges_by_steps: dict[int, list[TensorEdge]] = {}
-        for edge in self.edges:
-            d = edge.delay_steps(self.sample_rate)
-            if d > 0:
-                self.delayed_edges_by_steps.setdefault(d, []).append(edge)
 
         self.cyclic_blocks = nn.ModuleDict()
         for scc in self.condensed.sccs:
@@ -2150,28 +2141,9 @@ class GraphSolver(nn.Module):
             if _p is not None:
                 self._scc_direct_picard[str(_scc.scc_id)] = _p
 
-        self._delay_buffers: dict[int, list[dict[str, Tensor]]] = {
-            d: [{} for _ in range(d)] for d in self.delayed_edges_by_steps
-        }
-        self._delay_pos: dict[int, int] = {d: 0 for d in self.delayed_edges_by_steps}
         self._last_outputs: dict[str, Tensor] = {}
 
-        # Optional FIFO bank — replaces the dict-snapshot ring buffer for
-        # delayed edges when present.  One slot per edge, keyed by
-        # "{src}>{dst}@d{delay}".  Edges routed through the bank bypass the
-        # _delay_buffers path entirely.
-        self.fifo_bank = fifo_bank
-        self._fifo_slot_keys: dict[int, list[str]] = {}
-        if fifo_bank is not None:
-            for delay, _edges in self.delayed_edges_by_steps.items():
-                keys: list[str] = []
-                for _e in _edges:
-                    _sk = f"{_e.src_key}>{_e.dst_key}@d{delay}"
-                    fifo_bank.claim(_sk)
-                    keys.append(_sk)
-                self._fifo_slot_keys[delay] = keys
-
-        # Pre-index zero-delay edges by destination key to avoid O(S×E) scan in _build_local_src.
+        # Pre-index edges by destination key to avoid O(S×E) scan in _build_local_src.
         self._zd_edges_by_dst: dict[str, list[TensorEdge]] = {}
         for _e in self.zero_delay_edges:
             self._zd_edges_by_dst.setdefault(_e.dst_key, []).append(_e)
@@ -2204,7 +2176,7 @@ class GraphSolver(nn.Module):
 
         # Build per-SCC direct dependency sets (in positional index space).
         _cdep: list[set[int]] = [set() for _ in _all_sccs]
-        for _e in self.edges:
+        for _e in self.solve_edges:
             _si = self.node_index.get(_e.src_key)
             _di = self.node_index.get(_e.dst_key)
             if _si is None or _di is None:
@@ -2266,6 +2238,44 @@ class GraphSolver(nn.Module):
                 _execution_plan.append(("scc", _s))
         self._execution_plan: list = _execution_plan
 
+    def _resolve_fifo_bank(self, explicit_bank: Optional[Any]) -> Optional[Any]:
+        """Return the one FIFO bank available to this solver, if any.
+
+        Collects from (in priority order):
+          1. explicit_bank passed to GraphSolver.__init__
+          2. edge.fifo_bank on any TensorEdge
+          3. node.analytic_module.fifo_bank on any node module
+
+        All discovered banks must be the same object — one shared bank is
+        required so every node and edge slot lives in the same address space.
+        """
+        banks: list[Any] = []
+        if explicit_bank is not None:
+            banks.append(explicit_bank)
+        for edge in self.edges:
+            bank = getattr(edge, "fifo_bank", None)
+            if bank is not None:
+                banks.append(bank)
+        for node in self.nodes:
+            module = getattr(node, "analytic_module", None)
+            bank = getattr(module, "fifo_bank", None)
+            if bank is not None:
+                banks.append(bank)
+
+        unique: dict[int, Any] = {id(bank): bank for bank in banks}
+        if len(unique) > 1:
+            raise ValueError(
+                "GraphSolver requires one shared EdgeFifoBank for FIFO transports; "
+                f"found {len(unique)} distinct banks"
+            )
+        bank = next(iter(unique.values()), None)
+        if bank is not None:
+            for node in self.nodes:
+                module = getattr(node, "analytic_module", None)
+                if module is not None and hasattr(module, "fifo_bank"):
+                    setattr(module, "fifo_bank", bank)
+        return bank
+
     def ensure_subscription_port(
         self,
         node_key: str,
@@ -2306,42 +2316,76 @@ class GraphSolver(nn.Module):
         payload.setdefault("contract", {}).update(dict(contract))
         return payload
 
-    @staticmethod
-    def _score_contract_port(edge: TensorEdge, *, side: str) -> str:
+    def _edge_contract_port(self, edge: TensorEdge, *, side: str) -> str:
         raw = edge.src_port if side == "src" else edge.dst_port
         if raw:
             return str(raw)
-        return "score_out" if side == "src" else "score_in"
+        node_key = edge.src_key if side == "src" else edge.dst_key
+        node = self.node_map.get(node_key)
+        if node is None:
+            return "default"
+        ports = tuple(node.subscription_ports)
+        contracts = tuple(dict(node.subscription_contracts).keys())
+        declared = tuple(dict.fromkeys(ports + contracts))
+        return str(declared[0]) if len(declared) == 1 else "default"
 
-    @staticmethod
-    def _is_score_contract_edge(edge: TensorEdge) -> bool:
-        text = " ".join(
-            str(x or "")
-            for x in (
-                edge.semantic_role,
-                edge.contract_semantic_role,
-                edge.src_port,
-                edge.dst_port,
-                edge.src_port_set,
-                edge.dst_port_set,
-                edge.contract_key,
-            )
-        ).lower()
-        return "score" in text
+    def _is_subscription_contract_edge(self, edge: TensorEdge) -> bool:
+        """Return True when an edge connects declared non-tensor ports."""
+        if edge.src_key not in self.node_map or edge.dst_key not in self.node_map:
+            return False
+        src_port = self._edge_contract_port(edge, side="src")
+        dst_port = self._edge_contract_port(edge, side="dst")
+        src_node = self.node_map[edge.src_key]
+        dst_node = self.node_map[edge.dst_key]
+        src_declared = set(src_node.subscription_ports) | set(dict(src_node.subscription_contracts))
+        dst_declared = set(dst_node.subscription_ports) | set(dict(dst_node.subscription_contracts))
+        return src_port in src_declared and dst_port in dst_declared
 
     def _auto_form_contract_edges(self) -> None:
-        """Create non-tensor contract deliveries for score producer/consumer links."""
+        """Create non-tensor contract deliveries for subscription-port links."""
         for edge in self.edges:
-            if not self._is_score_contract_edge(edge):
+            if not self._is_subscription_contract_edge(edge):
                 continue
             if edge.src_key not in self.node_map or edge.dst_key not in self.node_map:
                 continue
-            src_port = self._score_contract_port(edge, side="src")
-            dst_port = self._score_contract_port(edge, side="dst")
+            src_port = self._edge_contract_port(edge, side="src")
+            dst_port = self._edge_contract_port(edge, side="dst")
             src_payload = self.ensure_subscription_port(edge.src_key, src_port)
             dst_payload = self.ensure_subscription_port(edge.dst_key, dst_port)
             src_contract = dict(src_payload.get("contract", {}))
             dst_contract = dict(dst_payload.get("contract", {}))
+            transport = str(
+                edge.activity_contract
+                or dst_contract.get("transport")
+                or src_contract.get("transport")
+                or ""
+            )
+            object_fifo_key = ""
+            if transport == "object_fifo":
+                suffix = str(
+                    dst_contract.get("object_fifo_suffix")
+                    or src_contract.get("object_fifo_suffix")
+                    or "objects"
+                )
+                object_fifo_key = str(
+                    dst_contract.get("object_fifo_key")
+                    or src_contract.get("object_fifo_key")
+                    or f"{edge.src_key}_{edge.dst_key}_{suffix}"
+                )
+                dst_contract.setdefault("object_fifo_key", object_fifo_key)
+
+                dst_module = getattr(self.node_map[edge.dst_key], "analytic_module", None)
+                fifo_bank = self.fifo_bank
+                if fifo_bank is None:
+                    raise ValueError(
+                        f"Object FIFO transport {edge.src_key!r}->{edge.dst_key!r} "
+                        "requires a shared EdgeFifoBank"
+                    )
+                if hasattr(fifo_bank, "claim_object") and not fifo_bank.has_slot(object_fifo_key):
+                    fifo_bank.claim_object(object_fifo_key, fifo_size=int(fifo_bank.fifo_size))
+                if dst_module is not None and hasattr(dst_module, "attach_fifo"):
+                    dst_module.attach_fifo(fifo_bank, object_fifo_key)
+
             contract = {
                 "src": src_contract,
                 "dst": dst_contract,
@@ -2353,6 +2397,8 @@ class GraphSolver(nn.Module):
                     "semantic_role": edge.semantic_role,
                     "aggregation": dst_contract.get("aggregation", "mask"),
                     "group_mask": tuple(dst_contract.get("groups", ())),
+                    "transport": transport,
+                    "object_fifo_key": object_fifo_key,
                 },
             }
             ce = ContractEdge(
@@ -2360,7 +2406,7 @@ class GraphSolver(nn.Module):
                 dst_key=edge.dst_key,
                 src_port=src_port,
                 dst_port=dst_port,
-                semantic_role=edge.semantic_role or edge.contract_semantic_role or "score_contract",
+                semantic_role=edge.semantic_role or edge.contract_semantic_role or "subscription_contract",
                 contract=contract,
                 aggregation=str(dst_contract.get("aggregation", "mask")),
                 group_mask=tuple(str(x) for x in dst_contract.get("groups", ())),
@@ -2387,7 +2433,7 @@ class GraphSolver(nn.Module):
         sid_to_scc = {s.scc_id: s for s in sccs}
         indeg: dict[int, int] = {s.scc_id: 0 for s in sccs}
         out: dict[int, set[int]] = {s.scc_id: set() for s in sccs}
-        for edge in self.edges:
+        for edge in self.solve_edges:
             si = self.node_index.get(edge.src_key)
             di = self.node_index.get(edge.dst_key)
             if si is None or di is None:
@@ -2543,55 +2589,12 @@ class GraphSolver(nn.Module):
             return self._zero_scalar
         return torch.zeros(payload_shape, dtype=_CDTYPE, device=self.device)
 
-    def _delayed_stream(self, value: Tensor, delay: int, payload_shape: tuple[int, ...]) -> Tensor:
-        stream = _broadcast_to(_canonical_complex(value).to(self.device), payload_shape, self.device)
-        d = max(0, int(delay))
-        if d <= 0 or not payload_shape:
-            return stream
-        axis = _time_dim(payload_shape)
-        n = int(payload_shape[axis])
-        if n <= 0:
-            return stream
-        if d >= n:
-            return torch.zeros_like(stream)
-        out = torch.zeros_like(stream)
-        dst = [slice(None)] * stream.dim()
-        src = [slice(None)] * stream.dim()
-        dst[axis] = slice(d, None)
-        src[axis] = slice(None, -d)
-        out[tuple(dst)] = stream[tuple(src)]
-        return out
-
-    def _propagate_delayed_streams(
-        self,
-        new_outputs: Dict[str, Tensor],
-        base_src: Dict[str, Optional[Tensor]],
-        payload_shape: tuple[int, ...],
-    ) -> None:
-        """Push already-produced delayed edge streams into downstream inboxes.
-
-        The condensed schedule is still built from zero-delay SCCs. Delayed
-        edges are KPN-style registered channels: when a source stream exists,
-        its edge contribution becomes a shifted stream in the destination's
-        inbox. If the destination has not fired yet in this schedule pass, it
-        will consume the whole available stream in one call.
-        """
-        if not new_outputs:
-            return
-        for delay, edges in self.delayed_edges_by_steps.items():
-            for edge in edges:
-                src_val = new_outputs.get(edge.src_key)
-                if src_val is None:
-                    continue
-                shifted = self._delayed_stream(src_val, delay, payload_shape)
-                contrib = edge.apply(shifted)
-                base_src[edge.dst_key] = _add_broadcast(base_src.get(edge.dst_key), contrib)
-
     def run_schedule(
         self,
         ext: Optional[Dict[str, Tensor]] = None,
         *,
         n_frames: int,
+        on_progress: Optional[Any] = None,
     ) -> Dict[str, Tensor]:
         """Run the condensed graph schedule over a whole KPN tensor series.
 
@@ -2600,6 +2603,17 @@ class GraphSolver(nn.Module):
         schedule window. Linear regions and cyclic SCCs reuse the same
         decomposition as ``step()``, but the payload shape is a series instead
         of a scalar sample.
+
+        Parameters
+        ----------
+        ext:
+            Optional external source tensors keyed by node key.
+        n_frames:
+            Number of frames (samples) in this schedule window.
+        on_progress:
+            Optional ``callable(completed: int, total: int, label: str)``.
+            Called after each SCC/lateral group is solved.  Thread-safe to
+            assign; not called when the graph is tier-1 linear.
         """
         with _T.span("solver.schedule"):
             ext = ext or {}
@@ -2636,19 +2650,22 @@ class GraphSolver(nn.Module):
                 with _T.span("solver.schedule.solve.linear_tier1"):
                     src_map = {key: value for key, value in base_src.items() if value is not None}
                     outputs = self._solve_linear_region(self.node_keys, src_map)
+                if callable(on_progress):
+                    on_progress(1, 1, "linear")
             else:
                 with _T.span("solver.schedule.solve"):
-                    for _item in self._execution_plan:
-                        before_keys = set(outputs)
+                    _plan = self._execution_plan
+                    _total = len(_plan)
+                    for _i, _item in enumerate(_plan):
                         if _item[0] == "lateral":
                             self._solve_lateral_group(_item[1], _item[2], base_src, outputs)
+                            _label = f"lateral:{_item[1]}"
                         else:
                             self._solve_scc(_item[1], base_src, outputs)
-                        new_outputs = {
-                            key: outputs[key]
-                            for key in set(outputs) - before_keys
-                        }
-                        self._propagate_delayed_streams(new_outputs, base_src, payload_shape)
+                            _label = f"scc:{','.join(_item[1].node_keys)}"
+                        if callable(on_progress):
+                            on_progress(_i + 1, _total, _label)
+
 
             for key in self.node_keys:
                 if key not in outputs:
@@ -2674,27 +2691,6 @@ class GraphSolver(nn.Module):
                 for key, value in ext.items():
                     base_src[key] = _add_broadcast(base_src[key], _canonical_complex(value).to(self.device))
 
-            with _T.span("solver.step.delay_read"):
-                for delay, edges in self.delayed_edges_by_steps.items():
-                    fkeys = self._fifo_slot_keys.get(delay)
-                    if fkeys is not None:
-                        bank = self.fifo_bank
-                        for i, edge in enumerate(edges):
-                            sk = fkeys[i]
-                            if bank.count(sk) >= bank.fifo_size:
-                                src_val = bank.read(sk)
-                                base_src[edge.dst_key] = _add_broadcast(
-                                    base_src[edge.dst_key], edge.apply(src_val)
-                                )
-                    else:
-                        snapshot = self._delay_buffers[delay][self._delay_pos[delay]]
-                        for edge in edges:
-                            src_val = snapshot.get(edge.src_key)
-                            if src_val is None:
-                                continue
-                            contrib = edge.apply(src_val)
-                            base_src[edge.dst_key] = _add_broadcast(base_src[edge.dst_key], contrib)
-
             src_map = {key: value for key, value in base_src.items() if value is not None}
             if self.condensed.tier == 1:
                 with _T.span("solver.step.solve"):
@@ -2709,30 +2705,28 @@ class GraphSolver(nn.Module):
                         else:
                             self._solve_scc(_item[1], base_src, outputs)
 
-            with _T.span("solver.step.delay_write"):
-                for delay in self.delayed_edges_by_steps:
-                    fkeys = self._fifo_slot_keys.get(delay)
-                    if fkeys is not None:
-                        bank = self.fifo_bank
-                        for i, edge in enumerate(self.delayed_edges_by_steps[delay]):
-                            src_val = outputs.get(edge.src_key)
-                            if src_val is not None:
-                                bank.write(fkeys[i], src_val.detach())
-                    else:
-                        pos = self._delay_pos[delay]
-                        self._delay_buffers[delay][pos] = {key: value.detach().clone() for key, value in outputs.items()}
-                        self._delay_pos[delay] = (pos + 1) % delay
-
             self._last_outputs = {key: value.detach().clone() for key, value in outputs.items()}
             return outputs
 
     def reset(self) -> None:
         self._first_tick = True
-        for delay in self.delayed_edges_by_steps:
-            self._delay_buffers[delay] = [{} for _ in range(delay)]
-            self._delay_pos[delay] = 0
         if self.fifo_bank is not None:
             self.fifo_bank.reset()
+        for block in self.cyclic_blocks.values():
+            block.reset()
+        self._last_outputs = {}
+        for arch in self.archetypes.values():
+            arch._pending.clear()
+            arch.clear_results()
+
+    def reset_tensors(self) -> None:
+        """Reset solver tensor state without clearing the FIFO bank.
+
+        Use this before re-running run_schedule() when you want to reuse the
+        atoms already written by dispatch_before_start() (e.g. Play/Save after
+        a Recompose).  The FIFO bank retains its slots and contents.
+        """
+        self._first_tick = True
         for block in self.cyclic_blocks.values():
             block.reset()
         self._last_outputs = {}
@@ -2765,3 +2759,23 @@ class GraphSolver(nn.Module):
         for node in self.nodes:
             if node.fire_after_end and node.hook_after_end is not None:
                 node.hook_after_end()
+
+    def graph_stats(self) -> dict:
+        """Return a snapshot of structural graph statistics.
+
+        Suitable for display in a SolverProgressBar or any diagnostic UI.
+        Keys are stable across solver versions.
+        """
+        plan = self._execution_plan
+        scc_items     = [p for p in plan if p[0] != "lateral"]
+        lateral_items = [p for p in plan if p[0] == "lateral"]
+        tier = getattr(self.condensed, "tier", None)
+        return {
+            "nodes":          len(self.nodes),
+            "edges":          len(self.edges),
+            "contract_edges": len(self.contract_edges),
+            "plan_items":     max(len(plan), 1),   # ≥1; tier-1 linear = 1
+            "scc_count":      len(scc_items),
+            "lateral_count":  len(lateral_items),
+            "condensed_tier": tier,
+        }

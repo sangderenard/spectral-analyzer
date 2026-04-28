@@ -331,6 +331,19 @@ class EdgeFifoBank:
             )
         return self._tensor_slots[key]
 
+    def claim_tensor(self, key: str, stride: int, fifo_size: Optional[int] = None) -> "_FifoSlot":
+        """Preallocate a tensor slot with an explicit stride, ignoring the bank default.
+
+        Use this when the frame width differs from the bank's construction-time
+        stride — for example, audio blocks whose size is not known until the first
+        solver tick.  Idempotent: returns the existing slot if already claimed.
+        """
+        if key not in self._tensor_slots:
+            self._tensor_slots[key] = _FifoSlot(
+                fifo_size or self.fifo_size, int(stride), self.dtype, self.device
+            )
+        return self._tensor_slots[key]
+
     def claim_object(self, key: str, fifo_size: int = 8) -> ObjectFifoSlot:
         """Preallocate a Python-object FIFO slot for *key*.  Idempotent."""
         if key not in self._object_slots:

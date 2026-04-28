@@ -26,6 +26,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Literal
 
+import numpy as np
 import torch
 
 
@@ -90,6 +91,15 @@ class CavityPanel:
     diffusion: float = 0.35
     absorption: float = 0.15
     is_baffle: bool = False
+    half_size: float = 1.0
+    half_h: float | None = None   # extent along ax1 (height for ring panels); None → half_size
+    half_w: float | None = None   # extent along ax2 (arc-tangent for ring panels); None → half_size
+    material_mask: np.ndarray | None = field(default=None, repr=False)
+    # float32 (H, W) density map: 1.0 = solid material, 0.0 = open/void.
+    # Cells with mask == 0 generate no triangles in the ray tracer; intermediate
+    # values scale the material properties (reflectivity, diffusion, absorption)
+    # continuously, which handles things like bracing density, grain variation,
+    # and partial openings within a single panel without needing extra panels.
 
 
 @dataclass

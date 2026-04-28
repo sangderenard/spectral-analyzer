@@ -8,7 +8,7 @@ Layout
 ------
   Left  (300 px)  — InstrumentPanel (top half)
                     BodyResonatorPanel (bottom half)
-  Center           — PassiveCurveDisplay (envelope / chirp / pre-mix GL)
+  Center           — ParametricCurveEditor (phasor_cloud / string_waveform / body_volume)
   Right (300 px)  — SympatheticCouplingPanel (full height, scrollable)
   Bottom (72 px)  — SolverProgressBar
 
@@ -40,7 +40,8 @@ from network_materializer import compile_nodes
 from parametric_curve import ControlPoint, ParametricCurve
 from body_resonator_panel import BodyResonatorPanel
 from instrument_panel import InstrumentPanel
-from passive_curve_display import PassiveCurveDisplay
+from parametric_curve_editor import ParametricCurveEditor
+from passive_curve_display import build_cavity_pressure_volume
 from resonator_core import ResonatorString, StringCouplingConfig
 from score_loader_node import ScoreLoaderNode
 from score_persist import VoicePremixCapture
@@ -322,6 +323,43 @@ def _build_solver(score_path: Path, v_mel, v_bass, body_v, shim_v, sub_v):
 
 # ── Audio helpers ─────────────────────────────────────────────────────────────
 
+def _save_full_sidecar(sidecar: dict, path: Path) -> None:
+    """Save a sidecar dict (including all extra keys) to a .npz file."""
+    save_kw: dict = {}
+    for k, v in sidecar.items():
+        if isinstance(v, np.ndarray):
+            save_kw[k] = v
+        elif isinstance(v, (int, float)):
+            save_kw[k] = np.array([v], dtype=np.float64)
+        elif isinstance(v, list):
+            save_kw[k] = np.array(v, dtype=object)
+    try:
+        np.savez_compressed(str(path), **save_kw)
+    except Exception as e:
+        print(f"[sidecar] save error: {e}")
+
+
+def _load_full_sidecar(path: Path) -> Optional[dict]:
+    """Load a full sidecar .npz, restoring scalars and object arrays."""
+    if not path.exists():
+        return None
+    try:
+        data = np.load(str(path), allow_pickle=True)
+    except Exception as e:
+        print(f"[sidecar] load error: {e}")
+        return None
+    out: dict = {}
+    for k in data.files:
+        v = data[k]
+        if v.ndim == 1 and v.shape[0] == 1 and v.dtype.kind == "f":
+            out[k] = float(v[0])
+        elif v.dtype == object:
+            out[k] = list(v)
+        else:
+            out[k] = v
+    return out
+
+
 def _extract_audio(outputs: dict) -> Optional[np.ndarray]:
     from audio_projector_node import _time_series_1d
     raw = outputs.get("audio_out")
@@ -333,9 +371,25 @@ def _extract_audio(outputs: dict) -> Optional[np.ndarray]:
 
 
 def _capture_premix(outputs: dict, voice_keys: List[str],
+                    instrument: Any,
                     sr: float = SR, display_fps: float = 120.0,
-                    gl_fps: float = 4000.0) -> Optional[dict]:
-    """Build a sidecar dict from voice output tensors in the solver outputs."""
+                    gl_fps: float = 4000.0,
+                    progress_cb=None) -> Optional[dict]:
+    """Build a sidecar dict from voice output tensors in the solver outputs.
+
+    progress_cb(panel_id, label, fraction) — optional, called from this thread
+    to report loading state into each visualisation panel.
+
+    Extends the base VoicePremixCapture sidecar with instrument-demo extras:
+      pre_body_gl        — (1, n_gl) complex64, sum of driver outputs (phasor cloud)
+      string_gl          — (3, n_gl) complex64, per-string waveforms (sympathy panel)
+      ray_segments       — (N, 12) float32, ray tracer segment buffer (body volume panel)
+      ray_meta_*         — scalars: max_path_length, n_sources, n_bands
+      body_resonance_gl  — (1, n_gl) complex128→complex64, H(f)-filtered body output
+                           (stored for future use; not routed to any panel yet)
+      resonator_volume   — (n_time, n_spatial, n_spatial) float32, fallback when
+                           C ray tracer extension is not built
+    """
     cap = VoicePremixCapture(sample_rate=sr, display_fps=display_fps, gl_fps=gl_fps)
     for vk in voice_keys:
         out_key = f"{vk}_out"
@@ -346,7 +400,7 @@ def _capture_premix(outputs: dict, voice_keys: List[str],
     tmp = Path("_tmp_sidecar.npz")
     cap.save(tmp)
     try:
-        return VoicePremixCapture.load(tmp)
+        sidecar = VoicePremixCapture.load(tmp)
     except Exception:
         return None
     finally:
@@ -354,6 +408,135 @@ def _capture_premix(outputs: dict, voice_keys: List[str],
             tmp.unlink()
         except Exception:
             pass
+
+    step = max(1, int(sr / gl_fps))
+
+    # ── Per-string waveforms (string_gl) ──────────────────────────────────────
+    if progress_cb: progress_cb("mid", "downsampling string signals…", 0.1)
+    str_arrays = []
+    for key in (STR_1_KEY, STR_2_KEY, STR_3_KEY):
+        if key in outputs:
+            arr = outputs[key].detach().cpu().numpy().squeeze()
+            if arr.ndim > 1:
+                arr = arr[0]
+            str_arrays.append(arr[::step].astype(np.complex64))
+        else:
+            str_arrays.append(None)
+
+    if any(a is not None for a in str_arrays):
+        valid = [a for a in str_arrays if a is not None]
+        min_len = min(len(a) for a in valid)
+        aligned = [
+            (a[:min_len] if a is not None else np.zeros(min_len, dtype=np.complex64))
+            for a in str_arrays
+        ]
+        sidecar["string_gl"] = np.array(aligned, dtype=np.complex64)
+
+    # ── String physical positions + coupling matrix ───────────────────────────
+    if progress_cb: progress_cb("mid", "reading coupling matrix…", 0.45)
+    res_strings = getattr(instrument, "resonator_strings", [])
+    if res_strings:
+        sidecar["string_positions"] = np.array(
+            [[float(s.x), float(s.y)] for s in res_strings], dtype=np.float32
+        )  # (n_strings, 2)
+    coupling_raw = getattr(instrument, "_coupling_matrix", None)
+    if coupling_raw is not None:
+        try:
+            import torch as _torch
+            if isinstance(coupling_raw, _torch.Tensor):
+                coupling_raw = coupling_raw.detach().cpu().numpy()
+        except ImportError:
+            pass
+        sidecar["coupling_matrix"] = np.abs(
+            np.asarray(coupling_raw)
+        ).astype(np.float32)  # (n_strings, n_strings) magnitudes
+
+    if progress_cb: progress_cb("mid", "done", 1.0)
+
+    # ── Pre-body mix (pre_body_gl) + full-rate real signal for H(f) ──────────
+    # DESIGN INTENT (not yet implemented):
+    # pre_body_gl should carry one row per atom that was generated, not just the
+    # summed driver outputs.  Each row is the waveform that atom contributed to
+    # the pre-body mix, time-aligned so that when the phase-cloud widget overlays
+    # them they travel through phase space in perfect lockstep with their position
+    # in the summed signal.  The purpose is to see the near-field driver phase
+    # space: how individual atoms cluster, interfere, and organise before entering
+    # the body resonator — i.e. the complex phase portrait of the source field
+    # rather than the collapsed scalar sum.
+    # Currently this only sums STR_1/STR_2/STR_3 driver outputs into a single
+    # row (shape 1 × n_gl), which gives the phase cloud something to show but
+    # loses all per-atom structure.  Fixing this requires collecting per-atom
+    # complex waveforms from the score replay and stacking them here.
+    if progress_cb: progress_cb("top", "building pre-body mix…", 0.3)
+    pre_body_parts = []
+    pre_body_full_parts = []
+    for key in (STR_1_KEY, STR_2_KEY, STR_3_KEY):
+        if key in outputs:
+            arr = outputs[key].detach().cpu().numpy().squeeze()
+            if arr.ndim > 1:
+                arr = arr[0]
+            pre_body_parts.append(arr.astype(np.complex64))
+            pre_body_full_parts.append(arr.astype(np.complex128))
+    if pre_body_parts:
+        min_len    = min(len(a) for a in pre_body_parts)
+        pre_body   = sum(a[:min_len] for a in pre_body_parts)
+        sidecar["pre_body_gl"] = pre_body[::step].reshape(1, -1).astype(np.complex64)
+    pre_body_full: Optional[np.ndarray] = None
+    if pre_body_full_parts:
+        min_len       = min(len(a) for a in pre_body_full_parts)
+        pre_body_full = sum(a[:min_len] for a in pre_body_full_parts)
+    if progress_cb: progress_cb("top", "done", 1.0)
+
+    # ── Physical body acoustics: ray tracing ─────────────────────────────────
+    if progress_cb: progress_cb("bot", "importing ray tracer…", 0.05)
+    try:
+        from ray_tracer_bridge import (
+            trace_cavity_scene as _trace_scene,
+            extract_scene_geometry as _extract_geo,
+        )
+        from ray_tracer_bridge import _HAS_C_TRACER
+    except Exception as _e:
+        _HAS_C_TRACER = False
+        _extract_geo  = None
+        print(f"[ray_tracer_bridge] import error: {_e}")
+
+    body_scene = getattr(instrument, "_body_scene", None)
+
+    # ── Geometry extraction (always, no C tracer required) ────────────────────
+    if body_scene is not None and _extract_geo is not None:
+        try:
+            _geo_verts, _geo_norms = _extract_geo(body_scene)
+            if len(_geo_verts):
+                sidecar["ray_geo_verts_flat"] = _geo_verts
+                sidecar["ray_geo_normals"]    = _geo_norms
+                sidecar["ray_surface_illum"]  = np.zeros(len(_geo_verts), dtype=np.float32)
+        except Exception as _e:
+            print(f"[ray_tracer] geometry extract error: {_e}")
+
+    # ── Segment buffer for RayAccumulatorWidget visualization ────────────────
+    if _HAS_C_TRACER and body_scene is not None:
+        if progress_cb: progress_cb("bot", "tracing acoustic rays…", 0.15)
+        try:
+            ray_segs, ray_meta = _trace_scene(
+                body_scene,
+                n_rays=256, max_bounces=8, n_bands=12,
+                min_amplitude=0.005, speed_m_s=343.0, seed=42,
+            )
+            sidecar["ray_segments"]       = ray_segs
+            sidecar["ray_meta_max_path"]  = np.array([ray_meta["max_path_length"]])
+            sidecar["ray_meta_n_sources"] = np.array([ray_meta["n_sources"]], dtype=np.int32)
+            sidecar["ray_meta_n_bands"]   = np.array([ray_meta["n_bands"]],   dtype=np.int32)
+            if ray_meta.get("geo_verts_flat") is not None:
+                # Overwrite with illuminated version from the full trace.
+                sidecar["ray_geo_verts_flat"] = ray_meta["geo_verts_flat"]
+                sidecar["ray_geo_normals"]    = ray_meta["geo_normals"]
+                sidecar["ray_surface_illum"]  = ray_meta["surface_illum"]
+        except Exception as _e:
+            print(f"[ray_tracer] trace error: {_e}")
+
+    if progress_cb: progress_cb("bot", "done", 1.0)
+
+    return sidecar
 
 
 # ── Pygame UI ─────────────────────────────────────────────────────────────────
@@ -368,14 +551,34 @@ def main_ui(score_path: Path) -> None:
     WIN_W, WIN_H = 1400, 840
     SIDE_W = 300
     BAR_H  = 72
-    CTR_X  = SIDE_W + 2
-    CTR_W  = WIN_W - SIDE_W * 2 - 4
-    MAIN_H = WIN_H - BAR_H
-    LEFT_TOP_H = MAIN_H // 2      # InstrumentPanel height
-    LEFT_BOT_H = MAIN_H - LEFT_TOP_H  # BodyResonatorPanel height
 
-    screen = pygame.display.set_mode((WIN_W, WIN_H))
+    def _layout(ww, wh):
+        ctr_x      = SIDE_W + 2
+        ctr_w      = max(100, ww - SIDE_W * 2 - 4)
+        main_h     = max(200, wh - BAR_H)
+        left_top_h = main_h // 2
+        left_bot_h = main_h - left_top_h
+        res_x      = ctr_x + ctr_w
+        return ctr_x, ctr_w, main_h, left_top_h, left_bot_h, res_x
+
+    CTR_X, CTR_W, MAIN_H, LEFT_TOP_H, LEFT_BOT_H, RES_X = _layout(WIN_W, WIN_H)
+
+    # Use OpenGL display so GL shader widgets can draw directly into the
+    # framebuffer.  Falls back to a plain surface if PyOpenGL isn't installed.
+    try:
+        from opengl_widget import SurfaceBlitter as _SurfaceBlitter, _HAS_GL as _opengl_ok
+    except Exception:
+        _SurfaceBlitter = None  # type: ignore[assignment,misc]
+        _opengl_ok = False
+
+    _gl_flags = (pygame.OPENGL | pygame.DOUBLEBUF | pygame.RESIZABLE) if _opengl_ok else pygame.RESIZABLE
+    screen = pygame.display.set_mode((WIN_W, WIN_H), _gl_flags)
     pygame.display.set_caption(f"Instrument Demo — {score_path.name}")
+    # In OPENGL mode the screen surface cannot be drawn to directly; use a
+    # separate surface for all 2-D rendering and blit it via SurfaceBlitter.
+    offscreen = pygame.Surface((WIN_W, WIN_H)) if _opengl_ok else screen
+    _blitter  = _SurfaceBlitter() if _opengl_ok else None
+
     clock  = pygame.time.Clock()
     font   = pygame.font.SysFont("monospace", 11)
     font13 = pygame.font.SysFont("monospace", 13)
@@ -392,32 +595,33 @@ def main_ui(score_path: Path) -> None:
     body_panel    = BodyResonatorPanel(instrument)
     coupling_panel = SympatheticCouplingPanel(instrument)
 
-    # Wire rebuild callbacks so panels can clear the cached body scene
+    # Wire rebuild callbacks — panel rebuilds don't invalidate rendered audio;
+    # only R explicitly re-renders.
     def _on_rebuild():
-        _audio_cache["audio"] = None
+        pass
 
     instr_panel.on_rebuild   = _on_rebuild
     body_panel.on_rebuild    = _on_rebuild
 
     # Load sidecar if it exists alongside the score
     sidecar_path = score_path.with_suffix("").with_suffix(".sidecar.npz")
-    initial_sidecar = None
-    if sidecar_path.exists():
-        try:
-            initial_sidecar = VoicePremixCapture.load(sidecar_path)
-        except Exception:
-            pass
+    initial_sidecar = _load_full_sidecar(sidecar_path)
 
     # Load atoms from the score file for display
     from score_persist import load_score
-    loaded_atoms, loaded_meta = load_score(score_path)
+    _loaded_atoms, loaded_meta = load_score(score_path)
 
-    curve_disp = PassiveCurveDisplay(
-        atoms=loaded_atoms,
-        sidecar=initial_sidecar,
-        total_s=float(loaded_meta.get("n_frames", N_FRAMES)) / SR,
-        prefer_voice_keys=["v_mel", "v_bass"],
+    curve_disp = ParametricCurveEditor(
+        w=CTR_W, h=MAIN_H,
+        panels=[
+            {"role": "phasor_cloud"},
+            {"role": "string_waveform"},
+            {"role": "body_volume"},
+        ]
     )
+    curve_disp.set_total_s(float(loaded_meta.get("n_frames", N_FRAMES)) / SR)
+    if initial_sidecar is not None:
+        curve_disp.set_sidecar(initial_sidecar)
 
     fifo_labels: dict = {
         f"{COMPOSER_KEY}_v_mel_out_atoms":  "mel",
@@ -446,6 +650,7 @@ def main_ui(score_path: Path) -> None:
                 on_progress=progress_bar.make_progress_callback(),
             )
         instrument.print_diagnostics()
+
         audio = _extract_audio(outputs)
         if audio is None:
             progress_bar.finish_render(success=False, label="silent or no output")
@@ -453,47 +658,51 @@ def main_ui(score_path: Path) -> None:
         progress_bar.finish_render(success=True)
         _audio_cache["audio"] = audio
 
-        # Capture per-voice premix from solver outputs (at high GL rate)
+        # Capture per-voice premix + ray-trace visualization sidecar
         try:
-            sd = _capture_premix(outputs, all_voice_keys, gl_fps=4000.0)
+            progress_bar.set_status("processing…")
+            sd = _capture_premix(outputs, all_voice_keys, instrument,
+                                 gl_fps=4000.0)
             if sd is not None:
                 _sidecar_cache["data"] = sd
                 curve_disp.set_sidecar(sd)
-                # Persist alongside the score
-                stem = str(score_path.with_suffix("").with_suffix(""))
-                cap  = VoicePremixCapture(sample_rate=SR, display_fps=120.0, gl_fps=4000.0)
-                for vk in all_voice_keys:
-                    out_key = f"{vk}_out"
-                    if out_key in outputs:
-                        arr = outputs[out_key].detach().cpu().numpy().squeeze()
-                        cap.add_voice(vk, arr)
-                cap.save(Path(f"{stem}.sidecar.npz"))
+                _save_full_sidecar(sd, sidecar_path)
+            progress_bar.set_status("ready")
         except Exception as e:
             print(f"[sidecar] capture error: {e}")
+            progress_bar.set_status("ready")
+
         return audio
 
-    def _reload() -> None:
-        """Reset solver with the current score (re-dispatch without recomposing)."""
+    def _trigger_render() -> None:
+        """Clear cache, reset solver, render in background, auto-play when done.
+        This is the only path that triggers audio re-rendering (bound to R key)."""
+        if not _render_lock.acquire(blocking=False):
+            progress_bar.set_status("render already in progress…")
+            return
         _audio_cache["audio"] = None
         solver.reset()
         solver.dispatch_before_start()
-        progress_bar.set_status("reloaded")
-
-    def _play() -> None:
-        cached = _audio_cache["audio"]
-        if cached is not None:
-            _do_play(cached)
-            return
-        if not _render_lock.acquire(blocking=False):
-            return
         def _worker():
             try:
                 audio = _render_audio()
                 if audio is not None:
                     _do_play(audio)
+            except Exception as _e:
+                import traceback
+                print(f"[render] worker error: {_e}")
+                traceback.print_exc()
             finally:
                 _render_lock.release()
         threading.Thread(target=_worker, daemon=True).start()
+
+    def _play() -> None:
+        """Play cached audio only — never triggers a render."""
+        cached = _audio_cache["audio"]
+        if cached is not None:
+            _do_play(cached)
+        else:
+            progress_bar.set_status("no audio — press R to render")
 
     def _do_play(audio: np.ndarray) -> None:
         pcm = (audio * 32767).astype(np.int16)
@@ -514,6 +723,10 @@ def main_ui(score_path: Path) -> None:
                     audio = _render_audio()
                     if audio is not None:
                         _write_wav(audio)
+                except Exception as _e:
+                    import traceback
+                    print(f"[save_wav] worker error: {_e}")
+                    traceback.print_exc()
                 finally:
                     _render_lock.release()
             threading.Thread(target=_w, daemon=True).start()
@@ -529,25 +742,54 @@ def main_ui(score_path: Path) -> None:
         except Exception as e:
             progress_bar.set_status(f"save error: {e}")
 
-    # Initial load
-    _reload()
+    # Initial render: kick off background render immediately so Space works on first press
+    _trigger_render()
 
     RES_X = CTR_X + CTR_W   # x origin of right (coupling) panel
 
+    def _apply_resize(new_w, new_h):
+        nonlocal WIN_W, WIN_H, CTR_X, CTR_W, MAIN_H, LEFT_TOP_H, LEFT_BOT_H, RES_X, offscreen
+        WIN_W, WIN_H = new_w, new_h
+        CTR_X, CTR_W, MAIN_H, LEFT_TOP_H, LEFT_BOT_H, RES_X = _layout(WIN_W, WIN_H)
+        offscreen = pygame.Surface((WIN_W, WIN_H)) if _opengl_ok else screen
+        try:
+            progress_bar.w = CTR_W
+        except Exception:
+            pass
+
     running = True
     while running:
+        # Autoscale: sync layout variables to actual window size each frame.
+        try:
+            _ww, _wh = pygame.display.get_window_size()
+        except Exception:
+            _ww, _wh = screen.get_size()
+
+        if _ww != WIN_W or _wh != WIN_H:
+            _apply_resize(_ww, _wh)
+
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT:
                 running = False
+            elif ev.type in (pygame.WINDOWRESIZED, pygame.VIDEORESIZE):
+                try:
+                    new_w = ev.x if hasattr(ev, 'x') else ev.w
+                    new_h = ev.y if hasattr(ev, 'y') else ev.h
+                except Exception:
+                    new_w, new_h = WIN_W, WIN_H
+                _apply_resize(new_w, new_h)
             elif ev.type == pygame.KEYDOWN:
                 if ev.key == pygame.K_ESCAPE:
                     running = False
                 elif ev.key == pygame.K_r:
-                    _reload()
+                    _trigger_render()
                 elif ev.key == pygame.K_SPACE:
                     _play()
                 elif ev.key == pygame.K_s:
                     _save_wav()
+                elif ev.key == pygame.K_n:
+                    mode = curve_disp.cycle_ray_norm_mode()
+                    progress_bar.set_status(f"ray norm: {mode}")
             elif ev.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = ev.pos
                 if mx < SIDE_W:
@@ -558,48 +800,62 @@ def main_ui(score_path: Path) -> None:
                 elif mx >= RES_X:
                     coupling_panel.on_mouse_down(mx, my)
                 else:
-                    curve_disp.on_mouse_down(ev.button, mx - CTR_X, my)
+                    curve_disp.on_mouse_down(ev.button,
+                                             float(mx - CTR_X),
+                                             float(MAIN_H - my),
+                                             pygame.key.get_mods())
             elif ev.type == pygame.MOUSEBUTTONUP:
                 instr_panel.on_mouse_up()
                 body_panel.on_mouse_up()
                 coupling_panel.on_mouse_up()
+                curve_disp.on_mouse_up(ev.button)
             elif ev.type == pygame.MOUSEMOTION:
                 mx, my = ev.pos
                 instr_panel.on_mouse_move(mx, my)
                 body_panel.on_mouse_move(mx, my)
                 coupling_panel.on_mouse_move(mx, my)
+                curve_disp.on_mouse_move(float(mx - CTR_X), float(MAIN_H - my))
             elif ev.type == pygame.MOUSEWHEEL:
                 mx, my = pygame.mouse.get_pos()
                 coupling_panel.on_scroll(ev.y, mx, my)
+                if CTR_X <= mx < CTR_X + CTR_W:
+                    btn = 4 if ev.y > 0 else 5
+                    curve_disp.on_mouse_down(btn, float(mx - CTR_X),
+                                             float(MAIN_H - my), 0)
 
         # Update playhead from playback clock
         if _play_start["t"] is not None and pygame.mixer.get_busy():
             elapsed = _time.monotonic() - _play_start["t"]
-            curve_disp.playhead_t = min(1.0, elapsed / max(total_s, 1e-3))
+            curve_disp.set_playhead(min(1.0, elapsed / max(total_s, 1e-3)))
 
         # ── Draw ─────────────────────────────────────────────────────────────
-        screen.fill(_C_BG)
+        offscreen.fill(_C_BG)
 
         # Left column: InstrumentPanel (top) + BodyResonatorPanel (bottom)
-        instr_panel.render(screen, 0, 0, SIDE_W, LEFT_TOP_H, font)
-        body_panel.render(screen, 0, LEFT_TOP_H, SIDE_W, LEFT_BOT_H, font)
-        pygame.draw.line(screen, (60, 60, 80), (SIDE_W, 0), (SIDE_W, MAIN_H), 2)
+        instr_panel.render(offscreen, 0, 0, SIDE_W, LEFT_TOP_H, font)
+        body_panel.render(offscreen, 0, LEFT_TOP_H, SIDE_W, LEFT_BOT_H, font)
+        pygame.draw.line(offscreen, (60, 60, 80), (SIDE_W, 0), (SIDE_W, MAIN_H), 2)
 
         # Right column: SympatheticCouplingPanel
-        coupling_panel.render(screen, RES_X, 0, SIDE_W, MAIN_H, font)
-        pygame.draw.line(screen, (60, 60, 80), (RES_X, 0), (RES_X, MAIN_H), 2)
+        coupling_panel.render(offscreen, RES_X, 0, SIDE_W, MAIN_H, font)
+        pygame.draw.line(offscreen, (60, 60, 80), (RES_X, 0), (RES_X, MAIN_H), 2)
 
-        # Center: passive curve display
-        ctr_surf = curve_disp.render(CTR_W, MAIN_H)
-        screen.blit(ctr_surf, (CTR_X, 0))
+        # Center: parametric curve editor (three instrument panels)
+        ctr_surf = curve_disp.render_to_surface(CTR_W, MAIN_H)
+        offscreen.blit(ctr_surf, (CTR_X, 0))
 
         # Progress bar + controls
-        progress_bar.render(screen, x=CTR_X, y=MAIN_H, font=font13)
+        progress_bar.render(offscreen, x=CTR_X, y=MAIN_H, font=font13)
 
         # Hotkey hint at bottom-left
-        hint = "R=reload  Space=play  S=save WAV"
+        hint = "R=render  Space=play  S=save WAV  N=ray norm"
         htxt = font.render(hint, True, (80, 80, 100))
-        screen.blit(htxt, (4, WIN_H - font.get_height() - 2))
+        offscreen.blit(htxt, (4, WIN_H - font.get_height() - 2))
+
+        # GL composite: upload 2-D surface then draw shader panels on top
+        if _blitter is not None:
+            _blitter.blit(offscreen, WIN_W, WIN_H)
+            curve_disp.draw_gl_overlays(CTR_X, 0, WIN_W, WIN_H)
 
         pygame.display.flip()
         clock.tick(30)

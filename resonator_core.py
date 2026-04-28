@@ -1,30 +1,18 @@
-"""Complex-domain resonator core for coupled string/body influence.
+"""Complex-domain resonator core — string definitions and coupling matrix.
 
-The core model keeps every signal in the analytic / complex domain and solves a
-small coupled resonator system:
+Provides:
+- ResonatorString / StringCouplingConfig dataclasses
+- build_string_coupling_matrix(): score-level harmonic + spatial coupling weights
+  used to route sympathetic atom injections between driver FIFOs.
 
-    y_i[n] = decay_i * e^{j*omega_i} * y_i[n-1]
-             + drive_gain_i * x_i[n]
-             + sum_j coupling[i, j] * y_j[n-1]
-
-where each resonator channel can represent a string, tine, bar, or any narrow
-body mode driven by one or more performers.  Coupling coefficients can be
-constructed from:
-
-- harmonic proximity between fundamentals
-- spatial / physical string distance
-- explicit user coefficients
-
-This is intended to become the shared kernel behind:
-- performer-local instrument resonators
-- grouped section resonators
-- room / audience capture stages
+Physical string-body simulation (FDTD, two-way plate coupling, pickup/mic output)
+is handled entirely by the C AcousticCoEvolver (acoustic_coevolver.h).
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -53,15 +41,6 @@ class StringCouplingConfig:
     distance_strength: float = 0.3
     base_strength: float = 0.18
     max_coupling: float = 0.45
-
-
-@dataclass
-class ResonatorSolveResult:
-    """Solved resonator signals plus metadata used to build the coupling."""
-
-    output: np.ndarray
-    coupling_matrix: np.ndarray
-    metadata: dict = field(default_factory=dict)
 
 
 def _safe_decay(decay_s: float, sr: float) -> float:
@@ -122,72 +101,3 @@ def build_string_coupling_matrix(
             phase = 0.15 * harmonic_metric
             mat[i, j] = strength * complex(math.cos(phase), math.sin(phase))
     return mat
-
-
-def solve_coupled_strings(
-    drive: np.ndarray,
-    strings: list[ResonatorString],
-    *,
-    sample_rate: float,
-    coupling_matrix: np.ndarray | None = None,
-    coupling_config: StringCouplingConfig | None = None,
-) -> ResonatorSolveResult:
-    """Solve a coupled string resonator in the complex domain.
-
-    Parameters
-    ----------
-    drive:
-        Complex driver array of shape ``(n_strings, n_samples)``.
-    strings:
-        Resonator definitions corresponding to the first axis of ``drive``.
-    sample_rate:
-        Solve sample rate in Hz.
-    coupling_matrix:
-        Optional precomputed complex coupling matrix.  When omitted, one is
-        estimated from harmonic proximity and string spacing.
-    coupling_config:
-        Used only when ``coupling_matrix`` is omitted.
-    """
-
-    drive = np.asarray(drive, dtype=np.complex128)
-    if drive.ndim != 2:
-        raise ValueError("drive must have shape (n_strings, n_samples)")
-    n_strings, n_samples = drive.shape
-    if len(strings) != n_strings:
-        raise ValueError("len(strings) must match drive.shape[0]")
-
-    coupling = (
-        np.asarray(coupling_matrix, dtype=np.complex128)
-        if coupling_matrix is not None
-        else build_string_coupling_matrix(strings, coupling_config)
-    )
-    if coupling.shape != (n_strings, n_strings):
-        raise ValueError("coupling_matrix must have shape (n_strings, n_strings)")
-
-    out = np.zeros((n_strings, n_samples), dtype=np.complex128)
-    prev = np.zeros(n_strings, dtype=np.complex128)
-    decay_factors = np.array(
-        [
-            _safe_decay(float(s.decay_s), float(sample_rate))
-            * complex(
-                math.cos(2.0 * math.pi * float(s.fundamental_hz) / max(sample_rate, 1.0) + float(s.phase_offset_rad)),
-                math.sin(2.0 * math.pi * float(s.fundamental_hz) / max(sample_rate, 1.0) + float(s.phase_offset_rad)),
-            )
-            for s in strings
-        ],
-        dtype=np.complex128,
-    )
-    drive_gains = np.array([float(s.drive_gain) for s in strings], dtype=np.float64)
-
-    for n in range(n_samples):
-        coupled = coupling @ prev
-        current = decay_factors * prev + drive[:, n] * drive_gains + coupled
-        out[:, n] = current
-        prev = current
-
-    metadata = {
-        "string_keys": [s.key for s in strings],
-        "fundamentals_hz": [float(s.fundamental_hz) for s in strings],
-    }
-    return ResonatorSolveResult(output=out, coupling_matrix=coupling, metadata=metadata)
-

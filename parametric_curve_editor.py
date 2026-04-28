@@ -94,6 +94,23 @@ except Exception:
                               "top": "Top", "re_plane": "Re", "lissajous": "Liss"}
 
 try:
+    from opengl_widget import (
+        ComplexPhaseCloud           as _GLPhasorWidget,
+        VolumetricAccumulatorWidget as _GLAccumWidget,
+        RayAccumulatorWidget        as _GLRayWidget,
+        SurfaceIllumWidget          as _GLSurfWidget,
+        CompositeBodyWidget         as _GLCompositeWidget,
+    )
+    _HAS_GL_ACCUM = True
+except Exception:
+    _GLPhasorWidget    = None
+    _GLAccumWidget     = None
+    _GLRayWidget       = None
+    _GLSurfWidget      = None
+    _GLCompositeWidget = None
+    _HAS_GL_ACCUM      = False
+
+try:
     import pygame
     from pygame.locals import (
         KEYDOWN, MOUSEBUTTONDOWN, MOUSEBUTTONUP,
@@ -116,13 +133,20 @@ _PREVIEW_SR = 44100
 _RENDER_TIMEOUT_S = 0.5   # seconds after last note-off before post-session render fires
 
 # Roles and their default (v_lo, v_hi, y_scale)
-_PARAM_ROLES = ("amplitude", "chirp", "fm_depth", "am_depth", "analytic")
+_PARAM_ROLES = ("amplitude", "chirp", "fm_depth", "am_depth", "analytic",
+                "phasor_cloud", "string_waveform", "body_volume")
+# Roles that show read-only visualisation data — no curve editing controls.
+_DISPLAY_ONLY_ROLES = frozenset(("analytic", "output",
+                                  "phasor_cloud", "string_waveform", "body_volume"))
 _ROLE_DEFAULTS: dict = {
-    "amplitude": (0.0,    1.0,    "linear"),
-    "chirp":     (-200.0, 200.0,  "linear"),
-    "fm_depth":  (0.0,    200.0,  "linear"),
-    "am_depth":  (0.0,    1.0,    "linear"),
-    "analytic":  (-1.0,   1.0,    "linear"),
+    "amplitude":      (0.0,    1.0,    "linear"),
+    "chirp":          (-200.0, 200.0,  "linear"),
+    "fm_depth":       (0.0,    200.0,  "linear"),
+    "am_depth":       (0.0,    1.0,    "linear"),
+    "analytic":       (-1.0,   1.0,    "linear"),
+    "phasor_cloud":   (-1.0,   1.0,    "linear"),
+    "string_waveform":(-1.0,   1.0,    "linear"),
+    "body_volume":    ( 0.0,   1.0,    "linear"),
 }
 _SCALE_MODES = ("linear", "log", "tanh")
 _CHANNEL_KEYS = ("A", "B", "C", "D")
@@ -177,9 +201,10 @@ _PANEL_HEIGHT_PX: dict[str, int] = {
     "small":     110,
     "medium":    200,
     "large":     380,
+    "fill":       0,   # dynamic — equal share of remaining viewport (see _panel_fill_h)
     "max":        0,   # dynamic — resolved per-instance via _panel_h_px()
 }
-_PANEL_HEIGHT_MODES = ("collapsed", "small", "medium", "large", "max")
+_PANEL_HEIGHT_MODES = ("collapsed", "small", "medium", "large", "fill", "max")
 _PANELS_SCROLL_STEP = 35   # pixels per mouse-wheel tick
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -680,6 +705,124 @@ def _fmt_physical(v: float, v_lo: float, v_hi: float) -> str:
         return f"{v:.1f}"
     return f"{v:.3f}"
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Sidecar panel helpers (string_waveform / body_volume software rendering)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DRIVER_COLORS = [(255, 80, 80), (60, 220, 160), (140, 90, 255)]
+_GL_WINDOW_S   = 1.0
+
+def _draw_string_waveform_onto(surf, dest_xy, pw, ph, sidecar, playhead_t, total_s):
+    """Draw per-string waveforms with coupling alpha-blend onto surf at dest_xy."""
+    if not _HAS_PYGAME or not _HAS_NP:
+        return
+    sg = sidecar.get("string_gl")
+    if sg is None or sg.ndim < 2 or sg.shape[0] == 0:
+        return
+    gl_fps  = float(sidecar.get("gl_fps", 4000.0))
+    n_total = sg.shape[1]
+    n_str   = sg.shape[0]
+    t_c     = playhead_t * total_s
+    f_lo    = max(0, int((t_c - _GL_WINDOW_S * 0.5) * gl_fps))
+    f_hi    = min(n_total, int((t_c + _GL_WINDOW_S * 0.5) * gl_fps) + 1)
+    if f_hi <= f_lo:
+        return
+    window   = sg[:, f_lo:f_hi]
+    real_win = window.real if _np.iscomplexobj(window) else window.astype(_np.float32)
+    n_win    = real_win.shape[1]
+    peak     = float(_np.abs(real_win).max())
+    if peak < 1e-9:
+        peak = 1.0
+    positions = sidecar.get("string_positions")
+    coupling  = sidecar.get("coupling_matrix")
+    if positions is not None and len(positions) == n_str:
+        xy   = _np.asarray(positions, dtype=_np.float32)[:, :2]   # (n_str, 2)
+        xy_c = xy - xy.mean(axis=0)
+        if n_str > 1:
+            _, _, Vt = _np.linalg.svd(xy_c, full_matrices=False)
+            pc1 = (xy_c @ Vt[0]).astype(_np.float32)              # (n_str,)
+        else:
+            pc1 = _np.zeros(1, dtype=_np.float32)
+        lo, hi = float(pc1.min()), float(pc1.max())
+        span = hi - lo
+        if span < 1e-6:
+            y_norm = _np.linspace(0.12, 0.88, n_str, dtype=_np.float32)
+        else:
+            y_norm = 0.12 + (pc1 - lo) / span * 0.76
+    else:
+        y_norm = _np.linspace(0.12, 0.88, n_str, dtype=_np.float32)
+    cx0, cy0 = dest_xy
+    centers = [int(cy0 + float(yn) * ph) for yn in y_norm]
+    if n_str > 1:
+        sorted_c = sorted(centers)
+        min_gap  = min(sorted_c[i+1] - sorted_c[i] for i in range(len(sorted_c) - 1))
+        excursion = max(4, min(int(min_gap * 0.42), int(ph * 0.35)))
+    else:
+        excursion = int(ph * 0.35)
+    for c_y in centers:
+        pygame.draw.line(surf, (40, 40, 50), (cx0, c_y), (cx0 + pw, c_y), 1)
+    if coupling is not None and coupling.shape == (n_str, n_str):
+        for di in range(n_str):
+            c_y = centers[di]
+            for src in range(n_str):
+                if src == di:
+                    continue
+                w = float(coupling[di, src])
+                if w < 0.02:
+                    continue
+                contrib = real_win[src] * (w / peak)
+                alpha   = max(30, min(180, int(w * 220)))
+                r, g, b = _DRIVER_COLORS[src % len(_DRIVER_COLORS)]
+                layer = pygame.Surface((pw, ph), pygame.SRCALPHA)
+                pts = [(int(fi * pw / max(n_win - 1, 1)),
+                        int(c_y - cy0 + float(contrib[fi]) * excursion))
+                       for fi in range(n_win)]
+                if len(pts) >= 2:
+                    pygame.draw.lines(layer, (r, g, b, alpha), False, pts, 1)
+                surf.blit(layer, (cx0, cy0))
+    for di in range(n_str):
+        c_y = centers[di]
+        r, g, b = _DRIVER_COLORS[di % len(_DRIVER_COLORS)]
+        layer = pygame.Surface((pw, ph), pygame.SRCALPHA)
+        pts = [(int(fi * pw / max(n_win - 1, 1)),
+                int(c_y - cy0 - float(real_win[di, fi]) / peak * excursion))
+               for fi in range(n_win)]
+        if len(pts) >= 2:
+            pygame.draw.lines(layer, (r, g, b, 210), False, pts, 2)
+        surf.blit(layer, (cx0, cy0))
+    phx = int(cx0 + playhead_t * pw)
+    pygame.draw.line(surf, (255, 178, 50), (phx, cy0), (phx, cy0 + ph), 2)
+
+
+def _draw_body_volume_sw(surf, dest_xy, pw, ph, volume, playhead_t):
+    """Software fallback: max-project volume slice as a thermal colormap blit."""
+    if not _HAS_PYGAME or not _HAS_NP:
+        return
+    n_time, ny, nx = volume.shape
+    t_lo = int(max(0,      (playhead_t - 0.15) * n_time))
+    t_hi = int(min(n_time, (playhead_t + 0.15) * n_time) + 1)
+    proj = volume[t_lo:t_hi].max(axis=0)
+    proj = _np.power(_np.clip(proj * 3.0, 0.0, 1.0), 0.45)
+    stops = _np.array([
+        [  0,   0,   0], [13,   5,  71], [  0,  89, 191],
+        [ 13, 204, 166], [255, 173,  20], [255, 255, 255],
+    ], dtype=_np.float32)
+    t_idx = _np.clip(proj * 5.0, 0.0, 4.999)
+    i_idx = t_idx.astype(_np.int32)
+    f_idx = (t_idx - i_idx.astype(_np.float32))[..., _np.newaxis]
+    rgb   = ((1.0 - f_idx) * stops[i_idx] + f_idx * stops[_np.minimum(i_idx + 1, 5)]).astype(_np.uint8)
+    rgb_t = _np.transpose(rgb, (1, 0, 2))
+    try:
+        small = pygame.surfarray.make_surface(rgb_t)
+        scaled = pygame.transform.smoothscale(small, (pw, ph))
+        surf.blit(scaled, dest_xy)
+    except Exception:
+        pass
+    cx0, cy0 = dest_xy
+    phx = int(cx0 + playhead_t * pw)
+    pygame.draw.line(surf, (255, 178, 50), (phx, cy0), (phx, cy0 + ph - 1), 2)
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # Main editor class
 # ═════════════════════════════════════════════════════════════════════════════
@@ -689,15 +832,16 @@ class ParametricCurveEditor:
     _MK_SNAP = 6
 
     def __init__(self,
-                 amp_curve:    ParametricCurve,
-                 chirp_curve:  ParametricCurve,
+                 amp_curve:    Optional[ParametricCurve] = None,
+                 chirp_curve:  Optional[ParametricCurve] = None,
                  signal_curve: Optional[ParametricCurve] = None,
                  w:             int = 960,
                  h:             int = 1040,
-                 library_folder: str = "envelopes"):
+                 library_folder: str = "envelopes",
+                 panels:        Optional[list] = None):
         self._curves = [
-            amp_curve,
-            chirp_curve,
+            amp_curve    if amp_curve    is not None else default_envelope(),
+            chirp_curve  if chirp_curve  is not None else default_chirp(),
             signal_curve if signal_curve is not None else default_blank("analytic"),
         ]
         self._focused_panel = 0
@@ -709,8 +853,12 @@ class ParametricCurveEditor:
         # ── per-panel config ──────────────────────────────────────────────────
         self._panel_roles  = ["amplitude", "chirp", "output"]
         self._panel_channels = ["A", "A", "B"]
-        # Height mode per panel: "collapsed" | "small" | "medium" | "large" | "max"
-        self._panel_height_modes: list[str] = ["medium", "medium", "small"]
+        # Height mode per panel: "collapsed" | "small" | "medium" | "large" | "fill" | "max"
+        self._panel_height_modes: list[str] = ["fill", "fill", "fill"]
+        # Apply caller-supplied panel config (overrides defaults above).
+        if panels is not None:
+            self._panel_roles        = [p.get("role", "amplitude") for p in panels]
+            self._panel_height_modes = [p.get("height_mode", "fill") for p in panels]
         # Stores each panel's mode before it was force-collapsed by another panel entering "max".
         # None means the panel was not force-collapsed; restore only if not None.
         self._panel_pre_max_modes: list[Optional[str]] = [None] * self._panel_count
@@ -785,6 +933,25 @@ class ParametricCurveEditor:
         self._gl_perspective_mode: str  = "perspective"
         self._gl_ctrl_rects:       dict = {}   # key -> pygame.Rect for hit testing
 
+        # Instrument sidecar widgets (phasor_cloud / string_waveform / body_volume roles)
+        self._sidecar:          Optional[dict] = None
+        self._total_s:          float          = 1.0
+        self._playhead_t:       float          = 0.0
+        self._gl_phasor_widget: Optional[Any]  = None
+        self._gl_phasor_rect:   Optional[tuple] = None
+        self._gl_accum_widget:  Optional[Any]  = None
+        self._gl_accum_rect:    Optional[tuple] = None
+        self._gl_ray_widget:    Optional[Any]  = None   # RayAccumulatorWidget (legacy)
+        self._gl_ray_rect:      Optional[tuple] = None
+        self._gl_ray_segs_id:   int            = -1    # id() of last ray_segments array
+        self._gl_surf_widget:   Optional[Any]  = None   # SurfaceIllumWidget (legacy)
+        self._gl_surf_rect:     Optional[tuple] = None
+        self._gl_surf_illum_id: int            = -1    # id() of last surface_illum array
+        self._gl_composite_widget:   Optional[Any]  = None   # CompositeBodyWidget
+        self._gl_composite_rect:     Optional[tuple] = None
+        self._gl_composite_segs_id:  int            = -1
+        self._gl_composite_illum_id: int            = -1
+
         # ── phase-rotation animation for the output/analytic panel ────────────
         # Current slot index (integer 0..steps-1); angle derived as slot*2π/steps.
         self._phase_slot:           int   = 0
@@ -850,13 +1017,13 @@ class ParametricCurveEditor:
         return self._panel_channel_state(self.focused_panel)
 
     def _panel_is_curve(self, panel_idx: int) -> bool:
-        return self._panel_roles[panel_idx] not in ("analytic", "output")
+        return self._panel_roles[panel_idx] not in _DISPLAY_ONLY_ROLES
 
     def _panel_supports_load(self, panel_idx: int) -> bool:
         return self._panel_is_curve(panel_idx)
 
     def _panel_save_label(self, panel_idx: int) -> str:
-        return "WAV" if self._panel_roles[panel_idx] in ("analytic", "output") else "SAVE"
+        return "WAV" if self._panel_roles[panel_idx] in _DISPLAY_ONLY_ROLES else "SAVE"
 
     def _channel_curve_indices(self, channel_key: str) -> list[int]:
         return [
@@ -943,9 +1110,27 @@ class ParametricCurveEditor:
         hx, hy, hw, hh = self._hrect(panel_idx)
         return _header_button_rects_from_rect(hx, hy, hw, hh)
 
+    def _panel_fill_h(self) -> int:
+        """Equal share of the viewport for all panels currently in 'fill' mode."""
+        _, _, _, vh = _panels_view_gl_rect(self.w, self.h)
+        n = self._panel_count
+        n_fill = sum(1 for j in range(n) if self._panel_height_modes[j] == "fill")
+        if n_fill == 0:
+            return 60
+        header_gap_overhead = n * _HEADER_H + max(0, n - 1) * _PANEL_GAP
+        fixed_content = sum(
+            _PANEL_HEIGHT_PX.get(self._panel_height_modes[j], 200)
+            for j in range(n)
+            if self._panel_height_modes[j] not in ("fill", "max")
+        )
+        remaining = vh - header_gap_overhead - fixed_content
+        return max(60, remaining // n_fill)
+
     def _panel_h_px(self, i: int) -> int:
-        """Pixel height of panel i, resolving 'max' dynamically."""
+        """Pixel height of panel i, resolving dynamic modes."""
         hm = self._panel_height_modes[i]
+        if hm == "fill":
+            return self._panel_fill_h()
         if hm == "max":
             _, _, _, vh = _panels_view_gl_rect(self.w, self.h)
             n = self._panel_count
@@ -1498,11 +1683,20 @@ class ParametricCurveEditor:
                 best_d, best_i = d, i
         return best_i
 
+    def _panel_hidden_btns(self, pi: int) -> frozenset:
+        """Button keys not shown/hit-tested for display-only panels."""
+        if not self._panel_is_curve(pi):
+            return frozenset(("channel", "stretch", "scale", "collapse", "save", "load"))
+        return frozenset()
+
     def _header_btn_at(self, px, py) -> Optional[tuple]:
         """Return (panel_idx, btn_key) if px,py is inside a header button."""
         for pi in range(self._panel_count):
-            rects = self._hbtns(pi)
+            rects  = self._hbtns(pi)
+            hidden = self._panel_hidden_btns(pi)
             for key, rect in rects.items():
+                if key in hidden:
+                    continue
                 if _hit_rect(px, py, rect):
                     return (pi, key)
         return None
@@ -1522,6 +1716,38 @@ class ParametricCurveEditor:
             if _hit_rect(px, py, (bx, iy, bw, item_h)):
                 return i
         return -1
+
+    # ── sidecar / playhead (instrument demo integration) ─────────────────────
+
+    def set_sidecar(self, data: dict) -> None:
+        """Feed instrument render sidecar; redraws phasor_cloud/string_waveform/body_volume panels."""
+        self._sidecar = data
+        self._queue_full_dirty()
+
+    def set_playhead(self, t: float) -> None:
+        """Set playhead 0..1; call every frame so sidecar panels track playback."""
+        self._playhead_t = float(t)
+        # Mark every sidecar display panel dirty so GL widgets update each frame.
+        for pi in range(self._panel_count):
+            if self._panel_roles[pi] in ("phasor_cloud", "string_waveform", "body_volume", "analytic"):
+                self._canvas_dirty[pi] = True
+                self._frame_dirty = True
+
+    def set_total_s(self, total_s: float) -> None:
+        self._total_s = float(total_s)
+
+    _RAY_NORM_CYCLE = ("percentile", "log", "rms", "max", "raw")
+
+    def cycle_ray_norm_mode(self) -> str:
+        """Cycle the ray accumulator normalization mode; return the new mode name."""
+        widget = self._gl_composite_widget or self._gl_ray_widget
+        if widget is None:
+            return "percentile"
+        cur = getattr(widget, '_norm_mode', 'percentile')
+        cycle = self._RAY_NORM_CYCLE
+        nxt = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else cycle[0]
+        widget.set_norm_mode(nxt)
+        return nxt
 
     # ── role / scale change ───────────────────────────────────────────────────
 
@@ -1645,7 +1871,7 @@ class ParametricCurveEditor:
             pi, key = hb
             self.focused_panel = pi
             if key == "save":
-                if self._panel_roles[pi] == "analytic":
+                if self._panel_roles[pi] in _DISPLAY_ONLY_ROLES:
                     self._save_channel_wav(self._panel_channels[pi])
                 else:
                     self._curves[pi].save(self.library_folder)
@@ -1681,8 +1907,13 @@ class ParametricCurveEditor:
                 self._queue_header_button_dirty(pi, "collapse")
                 self._mark_overlay_dirty()
             elif key == "hmode":
-                modes = list(_PANEL_HEIGHT_MODES)
+                if self._panel_is_curve(pi):
+                    modes = list(_PANEL_HEIGHT_MODES)
+                else:
+                    modes = [m for m in _PANEL_HEIGHT_MODES if m != "max"]
                 cur = self._panel_height_modes[pi]
+                if cur not in modes:
+                    cur = modes[0]
                 next_mode = modes[(modes.index(cur) + 1) % len(modes)]
                 self._set_panel_height_mode(pi, next_mode)
                 self._clamp_panels_scroll()
@@ -1836,7 +2067,7 @@ class ParametricCurveEditor:
             self._queue_dirty_rect(self._marker_rect_py(fp, self._edit_mk_idx))
             self._mark_overlay_dirty()
         elif key == K_s:
-            if self._panel_roles[fp] in ("analytic", "output"):
+            if self._panel_roles[fp] in _DISPLAY_ONLY_ROLES:
                 self._save_channel_wav(self._panel_channels[fp])
             else:
                 c.save(self.library_folder)
@@ -2153,6 +2384,139 @@ class ParametricCurveEditor:
             self._canvas_dirty[pi] = False
             return
 
+        if role == "phasor_cloud":
+            if _HAS_GL_ACCUM and _HAS_NP and self._sidecar is not None:
+                gl = self._sidecar.get("pre_body_gl")
+                if gl is not None and gl.ndim >= 2 and gl.shape[0] > 0:
+                    N = 72
+                    gl_fps = float(self._sidecar.get("gl_fps", 4000.0))
+                    t_c  = self._playhead_t * self._total_s
+                    f_lo = max(0, int((t_c - 0.5) * gl_fps))
+                    f_hi = min(gl.shape[1], int((t_c + 0.5) * gl_fps) + 1)
+                    if f_hi > f_lo:
+                        sig    = gl[0, f_lo:f_hi].astype(_np.complex128)
+                        sig_peak = float(_np.max(_np.abs(sig)))
+                        if sig_peak > 1e-12:
+                            sig = sig / sig_peak
+                        phases = _np.exp(2j * _np.pi * _np.arange(N) / N)
+                        batch  = sig[_np.newaxis, :] * phases[:, _np.newaxis]
+                        if self._gl_phasor_widget is None:
+                            self._gl_phasor_widget = _GLPhasorWidget(phase_steps=N)
+                        self._gl_phasor_widget.set_perspective_mode(self._gl_perspective_mode)
+                        self._gl_phasor_widget.update_data(batch)
+                        ctrl_h = 28
+                        gl_h   = max(1, panel_h - ctrl_h)
+                        self._gl_phasor_rect = (dest_xy[0], dest_xy[1], panel_w, gl_h)
+                        ctrl_y = dest_xy[1] + gl_h
+                        self._draw_gl_ctrl_strip(_ctx.surf, ctrl_y, dest_xy[0], panel_w, ctrl_h)
+            self._canvas_dirty[pi] = False
+            return
+
+        if role == "string_waveform":
+            if _HAS_NP and self._sidecar is not None:
+                _draw_string_waveform_onto(_ctx.surf, dest_xy, panel_w, panel_h,
+                                           self._sidecar, self._playhead_t, self._total_s)
+            self._canvas_dirty[pi] = False
+            return
+
+        if role == "body_volume":
+            if _HAS_NP and self._sidecar is not None:
+                ray_segs = self._sidecar.get("ray_segments")
+                if ray_segs is not None and _HAS_GL_ACCUM and _GLRayWidget is not None:
+                    # ── Ray accumulator path (preferred when ray tracing data exists) ──
+                    ray_segs = _np.asarray(ray_segs, dtype=_np.float32)
+                    if ray_segs.ndim == 2 and ray_segs.shape[1] == 12:
+                        def _scalar(key, default):
+                            v = self._sidecar.get(key, default)
+                            return int(_np.atleast_1d(v)[0])
+
+                        geo_verts  = self._sidecar.get("ray_geo_verts_flat")
+                        geo_norms  = self._sidecar.get("ray_geo_normals")
+                        surf_illum = self._sidecar.get("ray_surface_illum")
+
+                        if _GLCompositeWidget is not None:
+                            # ── Composite: wireframe + ray fog in one aligned pass ──────
+                            if self._gl_composite_widget is None:
+                                self._gl_composite_widget = _GLCompositeWidget(
+                                    n_sources=max(1, _scalar("ray_meta_n_sources", 1)),
+                                    n_bands  =max(1, _scalar("ray_meta_n_bands",  12)),
+                                )
+                            segs_id = id(ray_segs)
+                            if segs_id != self._gl_composite_segs_id:
+                                self._gl_composite_widget.update_segments(ray_segs)
+                                self._gl_composite_segs_id = segs_id
+                            _mp      = self._sidecar.get("ray_meta_max_path", 1.0)
+                            max_path = float(_np.atleast_1d(_mp)[0])
+                            t_path   = (self._playhead_t * self._total_s
+                                        * 343.0 / max(max_path, 1e-3))
+                            self._gl_composite_widget.set_playhead(min(1.0, t_path))
+                            self._gl_composite_rect = (dest_xy[0], dest_xy[1],
+                                                       panel_w, panel_h)
+                            if geo_verts is not None and surf_illum is not None:
+                                illum_id = id(surf_illum)
+                                if illum_id != self._gl_composite_illum_id:
+                                    self._gl_composite_widget.update_geometry(
+                                        _np.asarray(geo_verts, dtype=_np.float32),
+                                        _np.asarray(geo_norms, dtype=_np.float32)
+                                        if geo_norms is not None
+                                        else _np.zeros((len(geo_verts), 3),
+                                                       dtype=_np.float32),
+                                        _np.asarray(surf_illum, dtype=_np.float32),
+                                    )
+                                    self._gl_composite_illum_id = illum_id
+                        else:
+                            # ── Legacy split-panel fallback (no CompositeBodyWidget) ────
+                            if self._gl_ray_widget is None:
+                                self._gl_ray_widget = _GLRayWidget(
+                                    n_sources=max(1, _scalar("ray_meta_n_sources", 1)),
+                                    n_bands  =max(1, _scalar("ray_meta_n_bands",  12)),
+                                )
+                            segs_id = id(ray_segs)
+                            if segs_id != self._gl_ray_segs_id:
+                                self._gl_ray_widget.update_segments(ray_segs)
+                                self._gl_ray_segs_id = segs_id
+                            _mp      = self._sidecar.get("ray_meta_max_path", 1.0)
+                            max_path = float(_np.atleast_1d(_mp)[0])
+                            t_path   = (self._playhead_t * self._total_s
+                                        * 343.0 / max(max_path, 1e-3))
+                            self._gl_ray_widget.set_playhead(min(1.0, t_path))
+                            half_w = panel_w // 2
+                            self._gl_ray_rect  = (dest_xy[0], dest_xy[1],
+                                                  half_w, panel_h)
+                            self._gl_surf_rect = (dest_xy[0] + half_w, dest_xy[1],
+                                                  panel_w - half_w, panel_h)
+                            if (geo_verts is not None and surf_illum is not None
+                                    and _GLSurfWidget is not None):
+                                illum_id = id(surf_illum)
+                                if self._gl_surf_widget is None:
+                                    self._gl_surf_widget = _GLSurfWidget()
+                                if illum_id != self._gl_surf_illum_id:
+                                    self._gl_surf_widget.update_geometry(
+                                        _np.asarray(geo_verts,  dtype=_np.float32),
+                                        _np.asarray(geo_norms,  dtype=_np.float32)
+                                        if geo_norms is not None
+                                        else _np.zeros((len(geo_verts), 3),
+                                                       dtype=_np.float32),
+                                        _np.asarray(surf_illum, dtype=_np.float32),
+                                    )
+                                    self._gl_surf_illum_id = illum_id
+                else:
+                    # ── Fallback: volumetric accumulator (image-source baked volume) ──
+                    vol = self._sidecar.get("resonator_volume")
+                    if vol is not None:
+                        vol = _np.asarray(vol, dtype=_np.float32)
+                        if vol.ndim == 3:
+                            if _HAS_GL_ACCUM:
+                                if self._gl_accum_widget is None:
+                                    self._gl_accum_widget = _GLAccumWidget(spatial_mode=True)
+                                self._gl_accum_widget.update_volume(vol)
+                                self._gl_accum_widget.set_playhead(self._playhead_t)
+                                self._gl_accum_rect = (dest_xy[0], dest_xy[1], panel_w, panel_h)
+                            _draw_body_volume_sw(_ctx.surf, dest_xy, panel_w, panel_h,
+                                                 vol, self._playhead_t)
+            self._canvas_dirty[pi] = False
+            return
+
         cache = self._render_overlay_cache[pi]
         need_rebuild = (
             cache is None
@@ -2187,20 +2551,62 @@ class ParametricCurveEditor:
         canvas_x/canvas_y is the top-left window position of the editor surface
         (pygame coords, y from top).
         """
-        if not _HAS_GL_WAVE or self._gl_wave_widget is None:
-            return
-        rect = self._gl_analytic_rect
-        if rect is None:
-            return
-        sx, sy, sw, sh = rect
-        # sx, sy are surface-local (render_to_surface space) — convert to window
-        wx = canvas_x + sx
-        wy = canvas_y + sy
-        with self._render_lock:
-            self._gl_wave_widget.draw(
-                wx, wy, sw, sh, win_w, win_h,
-                current_slot=self._phase_slot,
-            )
+        # analytic/output wave widget
+        if _HAS_GL_WAVE and self._gl_wave_widget is not None:
+            rect = self._gl_analytic_rect
+            if rect is not None:
+                sx, sy, sw, sh = rect
+                wx = canvas_x + sx
+                wy = canvas_y + sy
+                with self._render_lock:
+                    self._gl_wave_widget.draw(
+                        wx, wy, sw, sh, win_w, win_h,
+                        current_slot=self._phase_slot,
+                    )
+
+        # phasor_cloud widget (instrument pre-body mix)
+        if _HAS_GL_ACCUM and self._gl_phasor_widget is not None:
+            rect = self._gl_phasor_rect
+            if rect is not None:
+                sx, sy, sw, sh = rect
+                self._gl_phasor_widget.draw(
+                    canvas_x + sx, canvas_y + sy, sw, sh, win_w, win_h,
+                    current_slot=self._phase_slot,
+                )
+
+        # body_volume accumulator widget
+        if _HAS_GL_ACCUM and self._gl_accum_widget is not None:
+            rect = self._gl_accum_rect
+            if rect is not None:
+                sx, sy, sw, sh = rect
+                self._gl_accum_widget.draw(
+                    canvas_x + sx, canvas_y + sy, sw, sh, win_w, win_h,
+                )
+
+        # body_volume composite widget (geometry wireframe + ray fog, shared camera)
+        if _HAS_GL_ACCUM and self._gl_composite_widget is not None:
+            rect = self._gl_composite_rect
+            if rect is not None:
+                sx, sy, sw, sh = rect
+                self._gl_composite_widget.draw(
+                    canvas_x + sx, canvas_y + sy, sw, sh, win_w, win_h,
+                )
+        else:
+            # Legacy fallback: separate ray accumulator + surface illum widgets
+            if _HAS_GL_ACCUM and self._gl_ray_widget is not None:
+                rect = self._gl_ray_rect
+                if rect is not None:
+                    sx, sy, sw, sh = rect
+                    self._gl_ray_widget.draw(
+                        canvas_x + sx, canvas_y + sy, sw, sh, win_w, win_h,
+                    )
+            if _HAS_GL_ACCUM and self._gl_surf_widget is not None:
+                rect = self._gl_surf_rect
+                if rect is not None:
+                    sx, sy, sw, sh = rect
+                    self._gl_surf_widget.draw(
+                        canvas_x + sx, canvas_y + sy, sw, sh, win_w, win_h,
+                    )
 
     def _draw_gl_ctrl_strip(self, surf, strip_y: int, strip_x: int,
                             strip_w: int, strip_h: int) -> None:
@@ -2312,8 +2718,9 @@ class ParametricCurveEditor:
         _gl_color(bg)
         _draw_rect_fill(hx, hy, hw, hh)
 
-        rects = self._hbtns(pi)
-        hb    = self._hover_header_btn
+        rects  = self._hbtns(pi)
+        hb     = self._hover_header_btn
+        hidden = self._panel_hidden_btns(pi)
 
         # Title
         rx, ry, rw, rh = rects["title"]
@@ -2333,53 +2740,54 @@ class ParametricCurveEditor:
                      hover=(hb == (pi, "role")),
                      active=(self._open_dropdown == ("role", pi)))
 
-        # Channel dropdown button
-        rx, ry, rw, rh = rects["channel"]
-        ch_txt = self._panel_channels[pi]
-        ov.gl_button(ch_txt + " \u25be", rx, ry, rw, rh,
-                     hover=(hb == (pi, "channel")),
-                     active=(self._open_dropdown == ("channel", pi)))
+        if "channel" not in hidden:
+            # Channel dropdown button
+            rx, ry, rw, rh = rects["channel"]
+            ch_txt = self._panel_channels[pi]
+            ov.gl_button(ch_txt + " \u25be", rx, ry, rw, rh,
+                         hover=(hb == (pi, "channel")),
+                         active=(self._open_dropdown == ("channel", pi)))
 
-        # Channel time normalization toggle
-        rx, ry, rw, rh = rects["stretch"]
-        st = self._channel_state(self._panel_channels[pi]).time_stretch
-        ov.gl_button("TS" if st else "PAD", rx, ry, rw, rh,
-                     col_bg=(40, 54, 40) if st else (34, 34, 42),
-                     col_text=(170, 220, 170) if st else (175, 180, 190),
-                     hover=(hb == (pi, "stretch")))
+            # Channel time normalization toggle
+            rx, ry, rw, rh = rects["stretch"]
+            st = self._channel_state(self._panel_channels[pi]).time_stretch
+            ov.gl_button("TS" if st else "PAD", rx, ry, rw, rh,
+                         col_bg=(40, 54, 40) if st else (34, 34, 42),
+                         col_text=(170, 220, 170) if st else (175, 180, 190),
+                         hover=(hb == (pi, "stretch")))
 
-        # Scale dropdown button
-        rx, ry, rw, rh = rects["scale"]
-        scale_txt = self._curves[pi].y_scale
-        ov.gl_button(scale_txt + " \u25be", rx, ry, rw, rh,
-                     hover=(hb == (pi, "scale")),
-                     active=(self._open_dropdown == ("scale", pi)))
+            # Scale dropdown button
+            rx, ry, rw, rh = rects["scale"]
+            scale_txt = self._curves[pi].y_scale
+            ov.gl_button(scale_txt + " \u25be", rx, ry, rw, rh,
+                         hover=(hb == (pi, "scale")),
+                         active=(self._open_dropdown == ("scale", pi)))
 
-        # Complex-collapse mode toggle  (Re = .real  |  |z| = abs)
-        rx, ry, rw, rh = rects["collapse"]
-        ccm = self._curves[pi].complex_collapse_mode
-        ccm_lbl = "Re" if ccm == "real" else "|z|"
-        ov.gl_button(ccm_lbl, rx, ry, rw, rh,
-                     col_bg=(40, 40, 55) if ccm == "real" else (55, 40, 40),
-                     col_text=(160, 180, 230) if ccm == "real" else (230, 170, 140),
-                     hover=(hb == (pi, "collapse")))
+            # Complex-collapse mode toggle  (Re = .real  |  |z| = abs)
+            rx, ry, rw, rh = rects["collapse"]
+            ccm = self._curves[pi].complex_collapse_mode
+            ccm_lbl = "Re" if ccm == "real" else "|z|"
+            ov.gl_button(ccm_lbl, rx, ry, rw, rh,
+                         col_bg=(40, 40, 55) if ccm == "real" else (55, 40, 40),
+                         col_text=(160, 180, 230) if ccm == "real" else (230, 170, 140),
+                         hover=(hb == (pi, "collapse")))
 
-        # SAVE / LOAD buttons
-        rx, ry, rw, rh = rects["save"]
-        ov.gl_button(self._panel_save_label(pi), rx, ry, rw, rh,
-                     col_bg=(30, 50, 35), col_text=(160, 210, 160),
-                     hover=(hb == (pi, "save")))
-        rx, ry, rw, rh = rects["load"]
-        load_col_bg = (30, 40, 55) if self._panel_supports_load(pi) else (28, 28, 34)
-        load_col_txt = (150, 180, 220) if self._panel_supports_load(pi) else (95, 100, 110)
-        ov.gl_button("LOAD", rx, ry, rw, rh,
-                     col_bg=load_col_bg, col_text=load_col_txt,
-                     hover=(hb == (pi, "load")))
+            # SAVE / LOAD buttons
+            rx, ry, rw, rh = rects["save"]
+            ov.gl_button(self._panel_save_label(pi), rx, ry, rw, rh,
+                         col_bg=(30, 50, 35), col_text=(160, 210, 160),
+                         hover=(hb == (pi, "save")))
+            rx, ry, rw, rh = rects["load"]
+            load_col_bg = (30, 40, 55) if self._panel_supports_load(pi) else (28, 28, 34)
+            load_col_txt = (150, 180, 220) if self._panel_supports_load(pi) else (95, 100, 110)
+            ov.gl_button("LOAD", rx, ry, rw, rh,
+                         col_bg=load_col_bg, col_text=load_col_txt,
+                         hover=(hb == (pi, "load")))
 
         # Height-mode cycle button
         rx, ry, rw, rh = rects["hmode"]
         hm = self._panel_height_modes[pi]
-        hm_lbl = {"collapsed": "C", "small": "S", "medium": "M", "large": "L", "max": "Z"}.get(hm, "M")
+        hm_lbl = {"collapsed": "C", "small": "S", "medium": "M", "large": "L", "fill": "F", "max": "Z"}.get(hm, "M")
         ov.gl_button(hm_lbl, rx, ry, rw, rh,
                      col_bg=(42, 42, 52), col_text=(180, 200, 180),
                      hover=(hb == (pi, "hmode")))

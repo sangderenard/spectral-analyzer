@@ -313,9 +313,17 @@ def _ring_panels(
     phase_normal: float = 0.0,
     phase_grazing: float = 0.0,
 ) -> list[CavityPanel]:
-    """Create a cylindrical ring of wall panels (shell staves / tube walls)."""
+    """Create a cylindrical ring of wall panels (shell staves / tube walls).
+
+    half_h (ax1 = Z-axis extent) = half the rib height.
+    half_w (ax2 = ring-tangent extent) = half the arc length per segment.
+    Using correct per-axis extents prevents the default 1 m half_size from
+    producing massively oversized, overlapping panels.
+    """
     panels: list[CavityPanel] = []
-    z_mid = (z_lo + z_hi) * 0.5
+    z_mid   = (z_lo + z_hi) * 0.5
+    half_h  = (z_hi - z_lo) * 0.5                    # half rib height (ax1 = Z)
+    half_w  = math.pi * radius / max(n_segments, 1)  # half arc length (ax2 = tangent)
     for i in range(n_segments):
         ang = 2.0 * math.pi * (i / n_segments)
         nx, ny = -math.cos(ang), -math.sin(ang)
@@ -331,6 +339,8 @@ def _ring_panels(
             diffusion=diffusion,
             absorption=absorption,
             is_baffle=True,
+            half_h=half_h,
+            half_w=half_w,
         ))
     return panels
 
@@ -347,6 +357,8 @@ def _cap_panel(
     grazing_reflectivity: float | None = None,
     phase_normal: float = 0.0,
     phase_grazing: float = 0.0,
+    half_size: float = 1.0,
+    material_mask: "np.ndarray | None" = None,
 ) -> CavityPanel:
     """One flat cap (membrane, soundboard, bell rim, etc.)."""
     return CavityPanel(
@@ -361,6 +373,8 @@ def _cap_panel(
         diffusion=diffusion,
         absorption=absorption,
         is_baffle=True,
+        half_size=half_size,
+        material_mask=material_mask,
     )
 
 
@@ -396,6 +410,7 @@ def _body_panels_drum_shell(jitter_rng: random.Random | None = None) -> list[Cav
         reflectivity=0.92, diffusion=0.08, absorption=0.04,
         normal_reflectivity=0.96, grazing_reflectivity=0.80,
         phase_normal=_j(0.62, 0.10), phase_grazing=_j(1.05, 0.10),
+        half_size=shell_r,
     ))
     # No top cap — open head.  A low-reflectivity "lip" ring around the rim
     # captures edge diffraction.
@@ -403,43 +418,241 @@ def _body_panels_drum_shell(jitter_rng: random.Random | None = None) -> list[Cav
         "drum_rim", z=shell_h, normal_z=-1.0,
         reflectivity=0.25, diffusion=0.55, absorption=0.35,
         phase_normal=0.04, phase_grazing=0.18,
+        half_size=shell_r,
     ))
     return panels
 
 
-def _body_panels_string_plate(jitter_rng: random.Random | None = None) -> list[CavityPanel]:
-    """String instrument body: top plate (soundboard), back plate, ribs.
+def _make_soundhole_mask(
+    res: int,
+    panel_half: float,
+    hole_r: float,
+    cx: float = 0.0,
+    cy: float = 0.0,
+) -> np.ndarray:
+    """Float32 (res, res) material-density mask with a circular soundhole.
 
-    Top plate is the primary radiator — high reflectivity, moderate phase.
-    Back plate is stiffer, higher absorption.  Ribs connect them.
+    Values are 1.0 (solid panel material) everywhere except inside the
+    soundhole circle, which is 0.0 (open — no triangles generated).
+    The mask coordinates span [-panel_half, +panel_half] on both axes.
+    """
+    xs = np.linspace(-panel_half, panel_half, res, dtype=np.float32)
+    ys = np.linspace(-panel_half, panel_half, res, dtype=np.float32)
+    X, Y = np.meshgrid(xs, ys)
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    return np.where(dist < hole_r, np.float32(0.0), np.float32(1.0))
+
+
+def _guitar_outline(
+    n_pts: int = 64,
+    lower_r: float = 0.175,
+    upper_r: float = 0.135,
+    waist_x: float = 0.105,
+    lower_cy: float = -0.090,
+    upper_cy: float = 0.100,
+) -> np.ndarray:
+    """Smooth guitar body outline in the XY plane, centred at origin.
+
+    Returns (n_pts, 2) float32 array of (x, y) contour points in CCW order
+    starting at the bottom-right corner.  Two circular bouts are joined by a
+    smooth Gaussian waist narrowing centred near y = 0.
+
+    Args:
+        lower_r:  radius of lower (large) bout
+        upper_r:  radius of upper (small) bout
+        waist_x:  half-width at the waist (minimum x extent)
+        lower_cy: y-coordinate of lower bout circle centre (negative)
+        upper_cy: y-coordinate of upper bout circle centre (positive)
+    """
+    y_bot  = lower_cy - lower_r
+    y_top  = upper_cy + upper_r
+    y_span = y_top - y_bot
+    n_half = n_pts // 2
+    ys     = np.linspace(y_bot + 1e-6, y_top - 1e-6, n_half)
+
+    xs = np.empty(n_half, dtype=np.float64)
+    for k, y in enumerate(ys):
+        d2_lo = max(0.0, lower_r ** 2 - (y - lower_cy) ** 2)
+        d2_hi = max(0.0, upper_r ** 2 - (y - upper_cy) ** 2)
+        x_env = max(math.sqrt(d2_lo), math.sqrt(d2_hi))
+        # Gaussian waist: narrow toward waist_x around y = 0
+        t         = (y - y_bot) / y_span
+        waist_t   = (0.0 - y_bot) / y_span
+        waist_env = math.exp(-((t - waist_t) / 0.14) ** 2)
+        xs[k]     = x_env * (1.0 - waist_env) + waist_x * waist_env
+
+    right = np.column_stack([ xs,        ys       ])
+    left  = np.column_stack([-xs[::-1],  ys[::-1] ])
+    pts   = np.concatenate([right, left], axis=0).astype(np.float32)
+    return pts[:n_pts]
+
+
+def _guitar_outline_panels(
+    key_prefix: str,
+    outline_pts: np.ndarray,
+    z_lo: float,
+    z_hi: float,
+    reflectivity: float = 0.82,
+    diffusion: float = 0.20,
+    absorption: float = 0.12,
+    *,
+    normal_reflectivity: float | None = None,
+    grazing_reflectivity: float | None = None,
+    phase_normal: float = 0.0,
+    phase_grazing: float = 0.0,
+) -> list[CavityPanel]:
+    """Build rib panels from a 2D guitar outline polygon.
+
+    Each edge of the CCW polygon becomes one CavityPanel.  The inward normal
+    is the left-hand perpendicular of the edge direction, so it always points
+    toward the body interior.  half_h / half_w match the true geometry.
+    """
+    panels: list[CavityPanel] = []
+    z_mid  = (z_lo + z_hi) * 0.5
+    half_h = (z_hi - z_lo) * 0.5
+    n      = len(outline_pts)
+    for i in range(n):
+        p0      = outline_pts[i]
+        p1      = outline_pts[(i + 1) % n]
+        seg     = p1 - p0
+        seg_len = float(np.linalg.norm(seg))
+        if seg_len < 1e-9:
+            continue
+        half_w = seg_len * 0.5
+        mid_x  = float((p0[0] + p1[0]) * 0.5)
+        mid_y  = float((p0[1] + p1[1]) * 0.5)
+        # This outline is clockwise in practice, so left-hand is inward.
+        dx, dy = float(seg[0] / seg_len), float(seg[1] / seg_len)
+        nx, ny = -dy, dx
+        panels.append(CavityPanel(
+            key=f"{key_prefix}_seg{i}",
+            point=(mid_x, mid_y, z_mid),
+            normal=(nx, ny, 0.0),
+            reflectivity=reflectivity,
+            normal_reflectivity=normal_reflectivity,
+            grazing_reflectivity=grazing_reflectivity,
+            normal_phase_rad=phase_normal,
+            grazing_phase_rad=phase_grazing,
+            diffusion=diffusion,
+            absorption=absorption,
+            is_baffle=True,
+            half_h=half_h,
+            half_w=half_w,
+        ))
+    return panels
+
+
+def _make_guitar_plate_mask(
+    res: int,
+    half_size: float,
+    outline_pts: np.ndarray,
+    soundhole_r: float,
+    soundhole_cx: float = 0.0,
+    soundhole_cy: float = 0.0,
+) -> np.ndarray:
+    """Float32 (res, res) mask for a guitar soundboard or back plate.
+
+    1.0 = solid panel material; 0.0 = open cell (outside the guitar outline
+    or inside the soundhole).  Uses vectorised ray-casting for PIP test.
+    """
+    coords = np.linspace(-half_size, half_size, res, dtype=np.float32)
+    X, Y   = np.meshgrid(coords, coords)
+
+    # Vectorised ray-casting point-in-polygon
+    inside = np.zeros(X.shape, dtype=bool)
+    n_poly = len(outline_pts)
+    j      = n_poly - 1
+    for i_edge in range(n_poly):
+        xi, yi = float(outline_pts[i_edge, 0]), float(outline_pts[i_edge, 1])
+        xj, yj = float(outline_pts[j,       0]), float(outline_pts[j,       1])
+        cross = ((yi > Y) != (yj > Y)) & (
+            X < (xj - xi) * (Y - yi) / (yj - yi + 1e-15) + xi
+        )
+        inside ^= cross
+        j = i_edge
+
+    in_hole = (X - soundhole_cx) ** 2 + (Y - soundhole_cy) ** 2 < soundhole_r ** 2
+    return np.where(inside & ~in_hole, np.float32(1.0), np.float32(0.0))
+
+
+def _body_panels_string_plate(jitter_rng: random.Random | None = None) -> list[CavityPanel]:
+    """String instrument body: top plate (soundboard), back plate, guitar-curve ribs.
+
+    Ribs follow a smooth two-radius guitar outline (lower bout / upper bout with
+    a Gaussian waist) instead of a uniform cylinder.  The top plate uses a
+    128×128 material-density mask that matches the guitar outline and carves out
+    the soundhole; this gives 4× finer resolution around the soundhole compared
+    to the old 32-cell circular mask.
+
+    Guitar body proportions (nominal, with jitter):
+        lower bout radius  ≈ 175 mm  (body half-width)
+        upper bout radius  ≈ 135 mm
+        waist half-width   ≈ 105 mm
+        rib depth          ≈  60 mm
+        soundhole diameter ≈  56 mm  (centre ≈ 50 mm above waist)
     """
     def _j(v: float, s: float) -> float:
         return v * (1.0 + jitter_rng.uniform(-s, s)) if jitter_rng else v
 
-    body_half_w = _j(0.17, 0.05)   # ~34 cm wide
-    body_h = _j(0.06, 0.08)        # ~6 cm deep (rib height)
-    n_rib_segs = 10
+    lower_r      = _j(0.175, 0.04)   # lower bout radius
+    upper_r      = _j(0.135, 0.04)   # upper bout radius
+    waist_x      = _j(0.105, 0.04)   # waist half-width
+    lower_cy     = _j(-0.090, 0.04)  # lower bout centre y
+    upper_cy     = _j( 0.100, 0.04)  # upper bout centre y
+    body_h       = _j(0.060, 0.08)   # rib height (z extent)
+    soundhole_r  = _j(0.028, 0.04)   # soundhole radius ≈ 28 mm
+    soundhole_cy = _j(0.050, 0.06)   # soundhole centre: above waist
 
-    panels = _ring_panels(
-        "str_rib", n_rib_segs, body_half_w, 0.0, body_h,
+    # half_size for the square cap panels — must cover the full guitar outline
+    cap_half = max(abs(lower_cy) + lower_r, upper_cy + upper_r,
+                   lower_r, upper_r)
+
+    # Smooth guitar rib outline (64-segment smooth curve)
+    outline = _guitar_outline(
+        n_pts=64,
+        lower_r=lower_r, upper_r=upper_r, waist_x=waist_x,
+        lower_cy=lower_cy, upper_cy=upper_cy,
+    )
+
+    panels = _guitar_outline_panels(
+        "str_rib", outline, 0.0, body_h,
         reflectivity=0.62, diffusion=0.28, absorption=0.22,
         normal_reflectivity=0.65, grazing_reflectivity=0.52,
         phase_normal=0.08, phase_grazing=0.30,
     )
-    # Top plate (soundboard) — the primary radiator
-    panels.append(_cap_panel(
+
+    # Top plate (soundboard): guitar-shaped, 128×128, soundhole open
+    top_mask = _make_guitar_plate_mask(
+        res=128, half_size=cap_half, outline_pts=outline,
+        soundhole_r=soundhole_r, soundhole_cx=0.0, soundhole_cy=soundhole_cy,
+    )
+    top_panel = _cap_panel(
         "str_top_plate", z=body_h, normal_z=-1.0,
         reflectivity=0.72, diffusion=0.18, absorption=0.14,
         normal_reflectivity=0.78, grazing_reflectivity=0.62,
         phase_normal=_j(0.35, 0.08), phase_grazing=_j(0.72, 0.10),
-    ))
-    # Back plate — stiffer, less radiative
-    panels.append(_cap_panel(
+        half_size=cap_half,
+        material_mask=top_mask,
+    )
+    top_panel.outline_pts = outline
+    top_panel.soundhole = (0.0, soundhole_cy, soundhole_r)
+    panels.append(top_panel)
+
+    # Back plate: guitar-shaped, no soundhole
+    back_mask = _make_guitar_plate_mask(
+        res=128, half_size=cap_half, outline_pts=outline,
+        soundhole_r=0.0,  # no hole
+    )
+    back_panel = _cap_panel(
         "str_back_plate", z=0.0, normal_z=1.0,
         reflectivity=0.65, diffusion=0.20, absorption=0.20,
         normal_reflectivity=0.70, grazing_reflectivity=0.55,
         phase_normal=_j(0.18, 0.06), phase_grazing=_j(0.44, 0.08),
-    ))
+        half_size=cap_half,
+        material_mask=back_mask,
+    )
+    back_panel.outline_pts = outline
+    panels.append(back_panel)
     return panels
 
 
@@ -468,12 +681,14 @@ def _body_panels_reed_box(jitter_rng: random.Random | None = None) -> list[Cavit
         reflectivity=0.94, diffusion=0.04, absorption=0.02,
         normal_reflectivity=0.97, grazing_reflectivity=0.88,
         phase_normal=_j(0.48, 0.10), phase_grazing=_j(0.85, 0.12),
+        half_size=bore_r,
     ))
     # Bell end — open, diffracting
     panels.append(_cap_panel(
         "reed_bell", z=0.0, normal_z=1.0,
         reflectivity=0.20, diffusion=0.50, absorption=0.40,
         phase_normal=0.02, phase_grazing=0.10,
+        half_size=bore_r,
     ))
     return panels
 
@@ -510,12 +725,14 @@ def _body_panels_brass_bell(jitter_rng: random.Random | None = None) -> list[Cav
         reflectivity=0.96, diffusion=0.02, absorption=0.02,
         normal_reflectivity=0.98, grazing_reflectivity=0.90,
         phase_normal=_j(0.52, 0.08), phase_grazing=_j(0.90, 0.10),
+        half_size=bore_r,
     ))
     # Bell rim — open radiator
     panels.append(_cap_panel(
         "brass_bell_rim", z=bore_len, normal_z=-1.0,
         reflectivity=0.18, diffusion=0.55, absorption=0.38,
         phase_normal=0.02, phase_grazing=0.08,
+        half_size=bell_r,
     ))
     return panels
 
@@ -538,12 +755,14 @@ def _body_panels_pipe_column(jitter_rng: random.Random | None = None) -> list[Ca
         "pipe_embouchure", z=pipe_len, normal_z=-1.0,
         reflectivity=0.35, diffusion=0.40, absorption=0.30,
         phase_normal=0.06, phase_grazing=0.20,
+        half_size=pipe_r,
     ))
     # Foot end — open
     panels.append(_cap_panel(
         "pipe_foot", z=0.0, normal_z=1.0,
         reflectivity=0.22, diffusion=0.48, absorption=0.38,
         phase_normal=0.03, phase_grazing=0.12,
+        half_size=pipe_r,
     ))
     return panels
 
@@ -567,12 +786,14 @@ def _body_panels_voice_body(jitter_rng: random.Random | None = None) -> list[Cav
         reflectivity=0.92, diffusion=0.05, absorption=0.04,
         normal_reflectivity=0.96, grazing_reflectivity=0.84,
         phase_normal=_j(0.55, 0.10), phase_grazing=_j(0.95, 0.12),
+        half_size=tract_r,
     ))
     # Mouth opening
     panels.append(_cap_panel(
         "mouth", z=tract_len, normal_z=-1.0,
         reflectivity=0.28, diffusion=0.45, absorption=0.35,
         phase_normal=0.04, phase_grazing=0.16,
+        half_size=tract_r,
     ))
     return panels
 
@@ -606,18 +827,43 @@ def _build_body_scene(
     profile = _BODY_PROFILES.get(body_type, _BODY_PROFILES["direct"])
     ap_offset = float(profile["aperture_offset_m"])
 
-    # Source at body centre, radiating along +Z (upward / toward aperture)
-    source = CavitySource(
-        key="body_driver",
-        position=(0.0, 0.0, ap_offset * 0.4),
-        direction=(0.0, 0.0, 1.0),
-        gain=1.0,
-        directivity_power=0.5,
-        band_profiles=[
-            CavitySourceBand(low_hz=0.0, high_hz=None, cone_angle_deg=180.0,
-                             directivity_power=0.0, gain=1.0),
-        ],
-    )
+    # Source(s): for string_plate use spatially-grounded bridge saddle positions
+    # on the top plate; all other body types get a single central source.
+    if body_type == "string_plate":
+        # Bridge saddle sits in the lower bout of the top plate, ~70 mm below
+        # the waist.  Six string saddle points span ±35 mm in X; we model three
+        # groups (bass, mid, treble) for spatial spread without excessive sources.
+        # z is just inside the top plate (nominal body_h ≈ 60 mm).
+        bridge_y  = -0.070    # 70 mm below waist, well inside lower bout
+        bridge_z  = 0.056     # just below the top plate surface
+        bridge_xs = [-0.030, 0.000, 0.030]
+        sources = [
+            CavitySource(
+                key=f"bridge_{lbl}",
+                position=(bx, bridge_y, bridge_z),
+                direction=(0.0, 0.0, -1.0),   # radiate inward (down into body)
+                gain=1.0 / len(bridge_xs),
+                directivity_power=0.4,
+                band_profiles=[
+                    CavitySourceBand(low_hz=0.0, high_hz=None, cone_angle_deg=160.0,
+                                     directivity_power=0.0, gain=1.0),
+                ],
+            )
+            for bx, lbl in zip(bridge_xs, ("bass", "mid", "treble"))
+        ]
+    else:
+        # Source at body centre, radiating along +Z (upward / toward aperture)
+        sources = [CavitySource(
+            key="body_driver",
+            position=(0.0, 0.0, ap_offset * 0.4),
+            direction=(0.0, 0.0, 1.0),
+            gain=1.0,
+            directivity_power=0.5,
+            band_profiles=[
+                CavitySourceBand(low_hz=0.0, high_hz=None, cone_angle_deg=180.0,
+                                 directivity_power=0.0, gain=1.0),
+            ],
+        )]
     # Single receiver at the aperture opening to capture body output
     receiver = CavityReceiver(
         key="body_out",
@@ -627,9 +873,10 @@ def _build_body_scene(
         polar_pattern="omni",
     )
     # Aperture for feedback inside the body
+    _ap_src_key = "bridge_mid" if body_type == "string_plate" else "body_driver"
     aperture = CavityAperture(
         key="body_ap",
-        source_key="body_driver",
+        source_key=_ap_src_key,
         position=(0.0, 0.0, ap_offset),
         direction=(0.0, 0.0, 1.0),
         capture_power=float(profile["capture_power"]),
@@ -660,7 +907,7 @@ def _build_body_scene(
         baffles=panels,
     )
     return CavityScene(
-        sources=[source],
+        sources=sources,
         receivers=[receiver],
         geometry=body_geom,
         apertures=[aperture],

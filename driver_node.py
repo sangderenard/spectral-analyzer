@@ -155,6 +155,10 @@ class DriverNode(nn.Module):
             raw = self._fifo_bank.try_read(self._fifo_slot_key)
             if raw is not None:
                 self._pending_atoms = raw if isinstance(raw, list) else [raw]
+                print(
+                    f"[DriverNode drain] key={self.key}"
+                    f" n_atoms={len(self._pending_atoms)}"
+                )
 
     def reset(self) -> None:
         self._pending_atoms = []
@@ -225,6 +229,11 @@ class DriverNode(nn.Module):
                 for atom in self._pending_atoms:
                     batch.extend(self._explode(atom, spread, ratio))
 
+            print(
+                f"[DriverNode forward] key={self.key}"
+                f" consumer={voice_node_key}"
+                f" n_atoms={len(batch)}"
+            )
             self._fifo_bank.write_batch(slot_key, batch)
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -241,6 +250,24 @@ class DriverNode(nn.Module):
         def _transform(x: Tensor) -> Tensor:
             node._drain_fifo()
             node._forward_atoms_to_consumers()
+            import torch as _torch, numpy as _np
+            x_real = _torch.real(x).float()
+            _sig = x_real.reshape(-1).detach().cpu().numpy()
+            _rms  = float(_np.sqrt(_np.mean(_sig ** 2))) if len(_sig) else 0.0
+            _peak = float(_np.max(_np.abs(_sig)))        if len(_sig) else 0.0
+            print(
+                f"[DriverNode signal] key={node.key}"
+                f" chunk={x.shape[-1] if x.ndim > 0 else 1}"
+                f" rms={_rms:.4e} peak={_peak:.4e}"
+            )
+            # Write this driver's output into its own named KPN tensor FIFO slot so
+            # InstrumentNode can read each driver independently without summing.
+            if node._fifo_bank is not None:
+                _slot_key = f"{node.key}_body_signal"
+                _stride = x.numel()
+                if not node._fifo_bank.has_slot(_slot_key):
+                    node._fifo_bank.claim_tensor(_slot_key, stride=_stride, fifo_size=4)
+                node._fifo_bank.try_write(_slot_key, x.detach().reshape(_stride))
             return x.to(_CDTYPE)
 
         return TensorNode(

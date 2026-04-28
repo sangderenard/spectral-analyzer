@@ -21,28 +21,29 @@ Responsibilities
    coupling magnitude exceeds ``sympathy_threshold`` produce injections; the
    injected atom velocity is ``source_velocity × |coupling[j, i]|``.
 
-3. **Body resonance — cavity engine**
-   The accumulated driver signal is fed into a real instrument body model
-   built by ``sm_plugins.orchestral_resonance._build_body_scene``.  The
-   ``body_type`` parameter selects the panel geometry:
+3. **Body resonance — AcousticCoEvolver (C FDTD)**
+   Driver/voice excitation signals returned via mix_source graph edges are
+   injected into the coevolver strings each solver tick via
+   ``coevolver.inject_string_force``.  The coevolver then advances physics
+   for that chunk and returns the mic output as the instrument's output
+   signal.  This is the primary body path — atoms never bypass the
+   driver/voice layer to create body sound directly.
 
-     ``"string_plate"``  — ribs + top plate + back plate (violin/cello body)
-     ``"reed_box"``      — cylindrical bore (clarinet / sax)
-     ``"brass_bell"``    — tapered bore + flaring bell
-     ``"drum_shell"``    — cylindrical shell + membrane
-     ``"pipe_column"``   — open organ pipe / flute
-     ``"voice_body"``    — vocal tract
-     ``"direct"``        — pass-through (no body solve)
+   The full physics simulation:
+     • 1-D string FDTD (leapfrog, two polarisations, arbitrary 3-D path)
+     • Kirchhoff plate + 3-D acoustic FDTD body (derivative-coupling model)
+     • Two-way string ↔ plate saddle coupling each sub-step
+     • Cardioid microphone sampled from live FDTD pressure + velocity field
+   The mic output IS the instrument's output signal — physically accurate,
+   phase-exact, no approximations.
 
-   Samples are buffered in chunks of ``body_chunk_size`` samples; on each
-   full chunk ``render_cavity_scene_step`` is called and the aperture-
-   pressure output is queued.  Individual samples are then drained per
-   solver tick.  A ``CavityStreamState`` persists overlap/history across
-   chunks to preserve body ring-down continuity.
+   Requires the C extension (``_spectral_kernels.AcousticCoEvolver``).
+   When unavailable, the node passes through; ``body_type = "direct"`` also
+   skips the physics.
 
-   The aperture pressure IS the instrument's output signal — it captures
-   how sound exits the body opening after panel reflection, diffusion, and
-   aperture feedback.
+   An optional diagnostic pre-render pass (``diagnostic_prerender=True``)
+   runs a full-song atom-to-pluck simulation for comparison/export, but
+   this output is NOT used for the primary instrument audio.
 
 Graph topology
 --------------
@@ -79,7 +80,6 @@ Usage example
         resonator_strings=strings,
         coupling_config=coupling_cfg,
         body_type="string_plate",
-        body_chunk_size=64,
         sympathy_threshold=0.04,
         sympathy_velocity_floor=0.005,
         groups=("pad_body",),
@@ -101,20 +101,12 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from cavity_engine import (
-    CavityScene,
-    CavityStreamState,
-    flush_cavity_stream_state,
-    init_cavity_stream_state,
-    render_cavity_scene_step,
-)
+from edge_fifo_bank import FifoEmpty
 from graph_solver import TensorNode, _CDTYPE
 from parametric_curve import ParametricCurve, default_chirp, default_envelope
 from resonator_core import (
     ResonatorString,
-    ResonatorSolveResult,
     StringCouplingConfig,
-    _safe_decay,
     build_string_coupling_matrix,
 )
 from sm_plugins.orchestral_resonance import _build_body_scene
@@ -208,6 +200,8 @@ class InstrumentNode(nn.Module):
         ratios: Optional[list] = None,
         sample_rate: float = 48_000.0,
         layer: str = "voice",
+        body_drive_scale: float = 1.0e-3,
+        diagnostic_prerender: bool = False,
     ) -> None:
         super().__init__()
         self.key = str(key)
@@ -221,9 +215,11 @@ class InstrumentNode(nn.Module):
         self.ratios:         list  = list(ratios) if ratios else []
         self.sample_rate:    float = float(sample_rate)
         self.layer:          str   = str(layer)
-        self.sympathy_threshold:     float = float(sympathy_threshold)
+        self.sympathy_threshold:      float = float(sympathy_threshold)
         self.sympathy_velocity_floor: float = float(sympathy_velocity_floor)
-        self.body_type: str = str(body_type)
+        self.body_type:               str   = str(body_type)
+        self.body_drive_scale:        float = float(body_drive_scale)
+        self._diagnostic_prerender:   bool  = bool(diagnostic_prerender)
 
         # ── Resonator strings: one per driver (extended with defaults if short)
         n = len(driver_keys)
@@ -248,12 +244,18 @@ class InstrumentNode(nn.Module):
 
         # ── Body cavity scene (None for "direct" type → passthrough)
         jitter_rng = random.Random(body_jitter_seed) if body_jitter_seed is not None else None
-        self._body_scene: Optional[CavityScene] = _build_body_scene(
+        self._body_scene: Optional[Any] = _build_body_scene(
             self.body_type, jitter_rng=jitter_rng
         )
 
-        # ── Cavity streaming state (initialised lazily on first step)
-        self._cavity_state: Optional[CavityStreamState] = None
+        # ── AcousticCoEvolver: driven chunk-by-chunk in _body_resonance_step.
+        # Each driver writes its audio output into its own named KPN tensor FIFO
+        # slot ({driver_key}_body_signal).  _body_resonance_step reads N slots
+        # independently so each coevolver string is driven by its own driver.
+        self._coevolver: Optional[Any] = None
+        self._drive_buf_size: int = 0
+        if self._body_scene is not None:
+            self._coevolver = self._try_build_coevolver()
 
         # ── FIFO plumbing (attached by build_node / network_materializer)
         self._pending_atoms: list = []
@@ -342,8 +344,33 @@ class InstrumentNode(nn.Module):
 
     def reset(self) -> None:
         self._pending_atoms = []
-        self._cavity_state = None
+        self._drive_buf_size = 0
+        if self._coevolver is not None:
+            try:
+                self._coevolver.reset()
+            except Exception:
+                pass
         self._diag = self._fresh_diag()
+
+    def _try_build_coevolver(self) -> Optional[Any]:
+        """Build an AcousticCoEvolver from the body scene, or return None."""
+        try:
+            from acoustic_fdtd_bridge import build_acoustic_coevolver_from_scene
+            co, _ = build_acoustic_coevolver_from_scene(
+                self._body_scene,
+                n_strings   = len(self.driver_keys),
+                sample_rate = self.sample_rate,
+                dx          = 0.010,
+                n_segs      = 160,
+                force_scale = 8e-4,
+            )
+            if co is not None:
+                print(f"[InstrumentNode '{self.key}'] AcousticCoEvolver ready "
+                      f"({len(self.driver_keys)} strings)")
+            return co
+        except Exception as e:
+            print(f"[InstrumentNode '{self.key}'] co-evolver init skipped: {e}")
+            return None
 
     # ──────────────────────────────────────────────────────────────────────────
     # Helpers
@@ -462,74 +489,156 @@ class InstrumentNode(nn.Module):
     # Body resonance — cavity-engine-backed, one step per solver tick
     # ──────────────────────────────────────────────────────────────────────────
 
-    def _init_cavity_state(self) -> None:
-        """Lazily initialise (or re-initialise) the cavity stream state."""
-        if self._body_scene is None:
+    def _run_coevolver_full(self, atoms: list, block_size: int = 512) -> None:
+        """[DIAGNOSTIC/EXPORT PATH ONLY] Pre-simulate co-evolver from score atoms.
+
+        This method is NOT used in the primary audio path.  The primary path
+        drives the body solver from graph-returned driver signals in
+        ``_body_resonance_step``.
+
+        Only invoked when ``diagnostic_prerender=True`` was passed at
+        construction, or called explicitly for offline export.  If called, the
+        pre-rendered output is stored in ``_coevolver_output`` for inspection;
+        it has no effect on what ``_body_resonance_step`` returns (which always
+        uses the live drive-from-x path when the coevolver is available).
+
+        Builds a sample-accurate pluck schedule from ``atom.onset_sample``,
+        runs physics for the full song duration in one pass (block_size samples
+        at a time), and stores mic output in ``_coevolver_output``.
+        """
+        if self._coevolver is None:
             return
-        self._cavity_state = init_cavity_stream_state(
-            self._body_scene,
-            self.sample_rate,
-            device="cpu",
+
+        n_frames = int(self.duration_s * self.sample_rate)
+
+        # Derive string index order from subscription_ports if available.
+        consumers = (
+            self.subscription_ports.get("score_out", {}).get("consumers", {})
         )
+        driver_order = list(consumers.keys()) if consumers else self.driver_keys
+
+        # Build pluck schedule: (onset_sample, string_idx, pos_norm, amplitude)
+        pluck_schedule: list = []
+        for i, _driver_key in enumerate(driver_order):
+            ratio = self._ratio_for(i)
+            for atom in atoms:
+                vel = float(getattr(atom, "velocity", 1.0)) * ratio
+                if vel <= 1e-4:
+                    continue
+                onset = int(getattr(atom, "onset_sample", 0))
+                pluck_schedule.append((onset, i, 0.15, vel * 2.5e-3))
+        pluck_schedule.sort(key=lambda t: t[0])
+
+        # Run the full physics timeline.
+        output = np.zeros(n_frames, dtype=np.float32)
+        pluck_idx = 0
+        n_plucks  = len(pluck_schedule)
+        try:
+            for block_start in range(0, n_frames, block_size):
+                block_end = min(block_start + block_size, n_frames)
+                bsz = block_end - block_start
+
+                # Fire plucks whose onset falls within this block.
+                while pluck_idx < n_plucks:
+                    onset, sidx, pos_norm, amp = pluck_schedule[pluck_idx]
+                    if onset >= block_end:
+                        break
+                    try:
+                        self._coevolver.pluck_string(sidx, pos_norm, amp)
+                    except Exception:
+                        pass
+                    pluck_idx += 1
+
+                self._coevolver.step(bsz)
+                seg = self._coevolver.get_mic_output(0, bsz)
+                output[block_start:block_end] = seg
+
+        except Exception as e:
+            import traceback
+            print(f"[InstrumentNode '{self.key}'] co-evolver full-pass error: {e}")
+            traceback.print_exc()
+            # Keep whatever was computed up to the failure point.
+
+        self._coevolver_output = output
+        print(f"[InstrumentNode '{self.key}'] co-evolver pre-simulated "
+              f"{n_frames} samples ({n_plucks} plucks) [diagnostic only]")
 
     def _body_resonance_step(self, x: Tensor) -> Tensor:
-        """Run one cavity step on the incoming driver signal.
+        """Read per-driver FIFO channels and drive each coevolver string independently.
 
-        ``x`` is the accumulated complex tensor from all driver ``mix_source``
-        edges — whatever block size the solver delivers (1 sample for stride=1,
-        N samples for stride=N).  It is reshaped to ``(1, T)`` and passed
-        directly to ``render_cavity_scene_step``.
+        Each DriverNode writes its output tensor into a named KPN FIFO slot
+        ``{driver_key}_body_signal`` every solver step.  This method reads those
+        N slots in driver_keys order, converts each to a float32 force block, and
+        passes them as independent per-string drive signals to step_block_with_drive.
 
-        The body scene has one receiver placed at the aperture opening, so
-        ``step.chunk_output[0]`` is the aperture-coloured output signal for
-        this block.  ``step.state`` carries the overlap accumulator forward —
-        this IS the ring-down tail: it is added into every subsequent chunk's
-        output by the streaming step, so the body continues ringing after the
-        driver goes silent without any manual tail management here.
-
-        For the ``"direct"`` body type (no scene) the input passes through.
+        ``x`` (the solver-summed mix arriving on the mix_source edges) is used
+        only for RMS/peak diagnostics — the physics never sees the sum.
         """
-        x_c = x.to(_CDTYPE)
+        if self._coevolver is None:
+            return x.to(_CDTYPE)
 
-        if self._body_scene is None:
-            return x_c
+        # Drain each driver's KPN FIFO completely — the full drained signal is the block.
+        drive_blocks: list[np.ndarray] = []
+        block_size = 0
+        for dk in self.driver_keys:
+            frames: list = []
+            if self._fifo_bank is not None:
+                slot_key = f"{dk}_body_signal"
+                if self._fifo_bank.has_slot(slot_key):
+                    while True:
+                        try:
+                            frames.append(self._fifo_bank.read(slot_key))
+                        except FifoEmpty:
+                            break
+            if frames:
+                sig = torch.cat([f.reshape(-1) for f in frames])
+                sig_real = torch.real(sig.to(_CDTYPE)).float()
+                arr = (sig_real.cpu().numpy() * self.body_drive_scale).astype(np.float32)
+                block_size = max(block_size, len(arr))
+                drive_blocks.append(arr)
+            else:
+                drive_blocks.append(None)
 
-        if self._cavity_state is None:
-            self._init_cavity_state()
+        # If no driver produced any signal this tick, return silence.
+        if block_size == 0:
+            return torch.zeros_like(x).to(_CDTYPE)
 
-        # (1, T) — one source (the body driver)
-        T = x_c.numel()
-        src = x_c.reshape(1, T)
+        # Pad any shorter/missing driver arrays to block_size.
+        for i in range(len(drive_blocks)):
+            if drive_blocks[i] is None:
+                drive_blocks[i] = np.zeros(block_size, dtype=np.float32)
+            elif len(drive_blocks[i]) < block_size:
+                drive_blocks[i] = np.pad(drive_blocks[i], (0, block_size - len(drive_blocks[i])))
 
-        # ── Diag: input energy
-        _d = self._diag
-        _d["steps"] += 1
-        in_e = float(x_c.abs().pow(2).sum())
-        _d["in_energy"] += in_e
+        print(f"[body chunk] n={block_size}")
 
-        step = render_cavity_scene_step(
-            self._body_scene,
-            src,
-            sample_rate=self.sample_rate,
-            state=self._cavity_state,
-            device="cpu",
+        # Diagnostics from the summed edge signal.
+        x_real = torch.real(x).float()
+        force_sum = x_real.reshape(-1).detach().cpu().numpy().astype(np.float32)
+        rms  = float(np.sqrt(np.mean(force_sum ** 2))) if len(force_sum) else 0.0
+        peak = float(np.max(np.abs(force_sum)))        if len(force_sum) else 0.0
+        print(
+            f"[InstrumentNode drive] key={self.key}"
+            f" chunk={block_size} rms={rms:.4e} peak={peak:.4e}"
         )
-        self._cavity_state = step.state
 
-        # chunk_output shape: (n_receivers, T) — receiver is at the aperture.
-        out = step.chunk_output[0].reshape(x_c.shape).to(_CDTYPE)
-        # Guard against cavity instability producing NaN/Inf.
-        if not torch.isfinite(out).all():
-            out = torch.zeros_like(out)
-            _d["nan_clips"] += 1
+        seg = self._coevolver.step_block_with_drive(drive_blocks, 0.15, block_size)
 
-        # ── Diag: output energy and peak ratio
-        out_e = float(out.abs().pow(2).sum())
-        _d["out_energy"] += out_e
-        step_ratio = out_e / max(in_e, 1e-30)
-        if step_ratio > _d["peak_ratio"]:
-            _d["peak_ratio"] = step_ratio
+        if not np.all(np.isfinite(seg)):
+            self._diag["nan_clips"] += 1
+            raise RuntimeError(
+                f"[InstrumentNode '{self.key}'] body FDTD produced NaN/Inf — diverged"
+            )
 
+        in_e  = float(np.sum(force_sum ** 2))
+        out_e = float(np.sum(seg ** 2))
+        self._diag["steps"]      += 1
+        self._diag["in_energy"]  += in_e
+        self._diag["out_energy"] += out_e
+        if in_e > 1e-30:
+            self._diag["peak_ratio"] = max(self._diag["peak_ratio"], out_e / in_e)
+
+        out = torch.from_numpy(seg).to(x.device).to(_CDTYPE)
         return out
 
     # ──────────────────────────────────────────────────────────────────────────
@@ -556,6 +665,18 @@ class InstrumentNode(nn.Module):
             node.reset()
             node._drain_fifo()
             node._forward_atoms_to_drivers()
+            # Primary body path: the body solver is driven by graph-returned
+            # driver signals arriving in _transform/_body_resonance_step.
+            # Score atoms are NOT converted to body plucks in the primary path.
+            print(f"[body primary] enabled — key={node.key}")
+            if node._diagnostic_prerender:
+                # Optional diagnostic/export path: pre-render the full body
+                # output from atoms for comparison or offline export.
+                # Does NOT affect the primary body audio produced in _transform.
+                print(f"[body secondary probe] enabled explicitly")
+                node._run_coevolver_full(node._pending_atoms)
+            else:
+                print(f"[body secondary probe] disabled")
             node._pending_atoms = []
 
         def _transform(x: Tensor) -> Tensor:

@@ -15,6 +15,7 @@
 
 #define _USE_MATH_DEFINES
 #include "acoustic_coevolver.h"
+#include "acoustic_pressure_backend.h"
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
@@ -41,6 +42,7 @@ typedef struct {
     int   string_idx;
     float position_norm;
     float amplitude;
+    int   n_duration_samples;  /* 0 = use default ~20 ms draw */
 } PluckEvent;
 
 /* ── Internal string state ────────────────────────────────────────────────── */
@@ -283,6 +285,11 @@ struct AcousticCoEvolverState {
 
     /* Precomputed: 1 if any mic has polar_b != 0 (needs velocity sampling)     */
     int         any_mic_needs_velocity;
+
+    /* AMR pressure backend — set when created via coevolver_create_amr.
+     * Exactly one of {fdtd, pressure_backend} is non-NULL per instance.
+     * All acoustic dispatch goes through pressure_backend when it is set. */
+    IPressureBackend* pressure_backend;
 
     /* Async worker — heap-allocated separately (C++ construction required) */
     ThreadState* thread_state;
@@ -1361,12 +1368,362 @@ fail:
     return NULL;
 }
 
+/* ── coevolver_create_amr ────────────────────────────────────────────────── */
+
+SK_API AcousticCoEvolverState* coevolver_create_amr(
+    int                           n_strings,
+    const CoEvolverStringDef*     string_defs,
+    int                           n_pickups,
+    const CoEvolverPickupDef*     pickup_defs,
+    int                           n_mics,
+    const CoEvolverMicDef*        mic_defs,
+    const AMRCoevolverDescriptor* amr_desc,
+    float                         sample_rate,
+    int                           modal_stride)
+{
+    if (!string_defs || !pickup_defs || !mic_defs || !amr_desc) return NULL;
+    if (n_strings < 0 || n_pickups < 0 || n_mics < 0) return NULL;
+    if (sample_rate <= 0 || modal_stride <= 0) return NULL;
+
+    AcousticCoEvolverState* st =
+        (AcousticCoEvolverState*)calloc(1, sizeof(AcousticCoEvolverState));
+    if (!st) return NULL;
+
+    st->thread_state = new (std::nothrow) ThreadState{};
+    if (!st->thread_state) { free(st); return NULL; }
+
+    /* ── Create AMR pressure backend (fails loudly on invalid descriptor) ── */
+    st->pressure_backend = amr_pressure_backend_create(amr_desc);
+    if (!st->pressure_backend) goto fail;
+
+    /* Mirror plate grid dims into the coevolver's grid fields so that the
+     * saddle bilinear indexing and bridge kernel use the plate coordinate
+     * system.  st->Nz=1 signals "no uniform 3-D grid". */
+    st->Nx       = amr_desc->plate_Nx;
+    st->Ny       = amr_desc->plate_Ny;
+    st->Nz       = 1;
+    st->dx       = amr_desc->plate_dx;
+    st->origin[0] = amr_desc->plate_origin[0];
+    st->origin[1] = amr_desc->plate_origin[1];
+    st->origin[2] = amr_desc->plate_origin[2];
+    st->rho_air  = (float)amr_desc->rho_air;
+    st->c_sound  = (float)amr_desc->c;
+
+    st->sample_rate  = sample_rate;
+    st->dt_audio     = 1.0f / sample_rate;
+    st->dt_fdtd      = (float)st->pressure_backend->get_dt();
+    if (st->dt_fdtd <= 0.0f) goto fail;
+    st->force_scale  = 1.0f;
+    st->gamma_scale  = 1.0f;
+    st->modal_stride = modal_stride;
+
+    {
+        float ratio   = st->dt_audio / st->dt_fdtd;
+        st->substeps  = (int)ceilf(ratio);
+        if (st->substeps < 1)           st->substeps = 1;
+        if (st->substeps > MAX_SUBSTEPS) st->substeps = MAX_SUBSTEPS;
+    }
+
+    /* ── Bridge plate sources ── *
+     *                             *
+     * Copy bridge plate indices    *
+     * and weights for the bridge   *
+     * kernel builder below.        */
+    if (amr_desc->n_bridge_plate > 0) {
+        int nb = amr_desc->n_bridge_plate;
+        st->bridge_cell_idx = alloc_i(nb);
+        st->bridge_cell_wgt = alloc_f(nb);
+        if (!st->bridge_cell_idx || !st->bridge_cell_wgt) goto fail;
+        memcpy(st->bridge_cell_idx, amr_desc->bridge_plate_idx, nb * sizeof(int));
+        memcpy(st->bridge_cell_wgt, amr_desc->bridge_plate_wgt, nb * sizeof(float));
+        st->n_bridge_cells = nb;
+    }
+
+    /* ── Neck plate sources (optional) ── */
+    if (amr_desc->n_neck_plate > 0 && amr_desc->neck_plate_idx && amr_desc->neck_plate_wgt) {
+        int nn = amr_desc->n_neck_plate;
+        st->neck_plate_idx = alloc_i(nn);
+        st->neck_plate_wgt = alloc_f(nn);
+        if (!st->neck_plate_idx || !st->neck_plate_wgt) goto fail;
+        memcpy(st->neck_plate_idx, amr_desc->neck_plate_idx, nn * sizeof(int));
+        memcpy(st->neck_plate_wgt, amr_desc->neck_plate_wgt, nn * sizeof(float));
+        st->n_neck_plate_cells = nn;
+    }
+
+    /* ── Strings ── */
+    st->n_strings = n_strings;
+    st->strings   = (StringState*)calloc(n_strings > 0 ? n_strings : 1,
+                                          sizeof(StringState));
+    if (!st->strings) goto fail;
+
+    for (int si = 0; si < n_strings; ++si) {
+        StringState* ss = string_create(&string_defs[si], st->dt_fdtd);
+        if (!ss) goto fail;
+        st->strings[si] = *ss;
+        free(ss);
+    }
+
+    /* Neck mass/stiffness from first string def that has them */
+    for (int si = 0; si < n_strings; ++si) {
+        if (string_defs[si].neck_freq_hz > 0.0f &&
+            string_defs[si].neck_mass_kg > 0.0f) {
+            st->neck_mass_eff = string_defs[si].neck_mass_kg;
+            float omega_n = 2.0f * (float)M_PI * string_defs[si].neck_freq_hz;
+            st->neck_stiff_eff = st->neck_mass_eff * omega_n * omega_n;
+            float Q = (string_defs[si].neck_Q > 0.0f) ? string_defs[si].neck_Q : 30.0f;
+            st->neck_damp_eff = st->neck_mass_eff * omega_n / Q;
+            const float joint_freq_hz = 95.0f;
+            const float joint_Q = 2.0f;
+            float omega_j = 2.0f * (float)M_PI * joint_freq_hz;
+            st->neck_body_stiff_eff = st->neck_mass_eff * omega_j * omega_j;
+            st->neck_body_damp_eff  = st->neck_mass_eff * omega_j / joint_Q;
+            break;
+        }
+    }
+    /* If no neck nodes provided, disable neck coupling for AMR */
+    if (st->neck_mass_eff > 0.0f && st->n_neck_plate_cells == 0)
+        st->neck_mass_eff = 0.0f;
+
+    /* ── Pickups ── */
+    st->n_pickups = n_pickups;
+    st->pickups   = (PickupState*)calloc(n_pickups > 0 ? n_pickups : 1,
+                                          sizeof(PickupState));
+    if (!st->pickups) goto fail;
+
+    for (int pi = 0; pi < n_pickups; ++pi) {
+        PickupState* pk = &st->pickups[pi];
+        pk->type        = pickup_defs[pi].type;
+        pk->string_mask = pickup_defs[pi].string_mask;
+        pk->sensitivity = pickup_defs[pi].sensitivity;
+        pk->axis[0]     = pickup_defs[pi].axis[0];
+        pk->axis[1]     = pickup_defs[pi].axis[1];
+        pk->axis[2]     = pickup_defs[pi].axis[2];
+        pk->n_strings   = n_strings;
+
+        pk->n_segs_per_string = alloc_i(n_strings > 0 ? n_strings : 1);
+        pk->Bn_kernel = (float**)calloc(n_strings > 0 ? n_strings : 1, sizeof(float*));
+        pk->Bb_kernel = (float**)calloc(n_strings > 0 ? n_strings : 1, sizeof(float*));
+        if (!pk->n_segs_per_string || !pk->Bn_kernel || !pk->Bb_kernel) goto fail;
+
+        for (int si = 0; si < n_strings; ++si) {
+            pk->n_segs_per_string[si] = st->strings[si].n_segs;
+            if (pickup_defs[pi].type != PICKUP_PIEZO) {
+                if (build_bn_bb_kernels(&pickup_defs[pi], &st->strings[si],
+                                        &pk->Bn_kernel[si], &pk->Bb_kernel[si]) < 0)
+                    goto fail;
+            }
+        }
+    }
+
+    /* ── Mics ── */
+    st->n_mics = n_mics;
+    st->mics   = (MicState*)calloc(n_mics > 0 ? n_mics : 1, sizeof(MicState));
+    if (!st->mics) goto fail;
+
+    for (int mi = 0; mi < n_mics; ++mi) {
+        st->mics[mi].gain    = mic_defs[mi].gain;
+        st->mics[mi].polar_a = mic_defs[mi].polar_a;
+        st->mics[mi].polar_b = mic_defs[mi].polar_b;
+        st->mics[mi].axis[0] = mic_defs[mi].axis[0];
+        st->mics[mi].axis[1] = mic_defs[mi].axis[1];
+        st->mics[mi].axis[2] = mic_defs[mi].axis[2];
+        /* grid_xyz not used in AMR path */
+    }
+
+    /* ── Output ring buffers ── */
+    st->pickup_out = (float**)calloc(n_pickups > 0 ? n_pickups : 1, sizeof(float*));
+    st->mic_out    = (float**)calloc(n_mics    > 0 ? n_mics    : 1, sizeof(float*));
+    if (!st->pickup_out || !st->mic_out) goto fail;
+
+    for (int pi = 0; pi < n_pickups; ++pi) {
+        st->pickup_out[pi] = alloc_f(OUTPUT_BUF);
+        if (!st->pickup_out[pi]) goto fail;
+    }
+    for (int mi = 0; mi < n_mics; ++mi) {
+        st->mic_out[mi] = alloc_f(OUTPUT_BUF);
+        if (!st->mic_out[mi]) goto fail;
+    }
+
+    st->pickup_accum = alloc_f(n_pickups > 0 ? n_pickups : 1);
+    if (!st->pickup_accum) goto fail;
+
+    /* ── Saddle bilinear indices (into AMR plate grid) ── *
+     *                                                      *
+     * The AMR plate is a regular 2-D grid plate_Nx × plate_Ny.
+     * Flat index = j + plate_Ny * i, identical to the FDTD   *
+     * plate layout.  Reuse st->Nx/Ny set above.              */
+    if (n_strings > 0) {
+        st->saddle_idx4    = alloc_i(n_strings * 4);
+        st->saddle_wgt4    = alloc_f(n_strings * 4);
+        st->saddle_w_batch = alloc_f(n_strings);
+        if (!st->saddle_idx4 || !st->saddle_wgt4 || !st->saddle_w_batch) goto fail;
+
+        int Nx_ = st->Nx, Ny_ = st->Ny;
+        for (int si = 0; si < n_strings; ++si) {
+            const StringState* ss = &st->strings[si];
+            int Nn = ss->n_nodes;
+            float sx = ss->seg_xyz[(Nn-1)*3+0];
+            float sy = ss->seg_xyz[(Nn-1)*3+1];
+            float gi = (sx - st->origin[0]) / st->dx;
+            float gj = (sy - st->origin[1]) / st->dx;
+            if (gi < 0.0f) gi = 0.0f;  if (gi > (float)(Nx_-1)) gi = (float)(Nx_-1);
+            if (gj < 0.0f) gj = 0.0f;  if (gj > (float)(Ny_-1)) gj = (float)(Ny_-1);
+            int i0 = (int)gi, i1 = (i0 < Nx_-1) ? i0+1 : i0;
+            int j0 = (int)gj, j1 = (j0 < Ny_-1) ? j0+1 : j0;
+            float fi = gi - (float)i0;
+            float fj = gj - (float)j0;
+            st->saddle_idx4[si*4+0] = j0 + Ny_*i0;
+            st->saddle_idx4[si*4+1] = j0 + Ny_*i1;
+            st->saddle_idx4[si*4+2] = j1 + Ny_*i0;
+            st->saddle_idx4[si*4+3] = j1 + Ny_*i1;
+            st->saddle_wgt4[si*4+0] = (1.0f-fi)*(1.0f-fj);
+            st->saddle_wgt4[si*4+1] = fi        *(1.0f-fj);
+            st->saddle_wgt4[si*4+2] = (1.0f-fi)*fj;
+            st->saddle_wgt4[si*4+3] = fi        *fj;
+        }
+    }
+
+    /* ── Precompute mic samplers via AMR backend ── */
+    st->any_mic_needs_velocity = 0;
+    for (int mi = 0; mi < n_mics; ++mi) {
+        if (mic_defs[mi].polar_b != 0.0f) { st->any_mic_needs_velocity = 1; break; }
+    }
+
+    if (n_mics > 0) {
+        st->mic_P  = alloc_f(n_mics);
+        st->mic_vx = alloc_f(n_mics);
+        st->mic_vy = alloc_f(n_mics);
+        st->mic_vz = alloc_f(n_mics);
+        if (!st->mic_P || !st->mic_vx || !st->mic_vy || !st->mic_vz) goto fail;
+
+        /* Pack world-space mic positions and axes for the backend */
+        float* mic_pos_xyz  = alloc_f(n_mics * 3);
+        float* mic_axis_xyz = alloc_f(n_mics * 3);
+        if (!mic_pos_xyz || !mic_axis_xyz) {
+            free(mic_pos_xyz); free(mic_axis_xyz); goto fail;
+        }
+        for (int mi = 0; mi < n_mics; ++mi) {
+            mic_pos_xyz [mi*3+0] = mic_defs[mi].pos [0];
+            mic_pos_xyz [mi*3+1] = mic_defs[mi].pos [1];
+            mic_pos_xyz [mi*3+2] = mic_defs[mi].pos [2];
+            mic_axis_xyz[mi*3+0] = mic_defs[mi].axis[0];
+            mic_axis_xyz[mi*3+1] = mic_defs[mi].axis[1];
+            mic_axis_xyz[mi*3+2] = mic_defs[mi].axis[2];
+        }
+        int rc_mic = st->pressure_backend->setup_mic_samplers(
+            n_mics, mic_pos_xyz, mic_axis_xyz, st->any_mic_needs_velocity);
+        free(mic_pos_xyz);
+        free(mic_axis_xyz);
+        if (rc_mic != SK_OK) goto fail;
+    }
+
+    /* ── Pickup GEMV matrices ── */
+    {
+        st->string_seg_offsets = alloc_i(n_strings + 1);
+        if (!st->string_seg_offsets) goto fail;
+        st->string_seg_offsets[0] = 0;
+        for (int si = 0; si < n_strings; ++si)
+            st->string_seg_offsets[si+1] =
+                st->string_seg_offsets[si] + st->strings[si].n_segs;
+        st->total_seg_flat = (n_strings > 0) ? st->string_seg_offsets[n_strings] : 0;
+
+        int n_mag = 0;
+        for (int pi = 0; pi < n_pickups; ++pi)
+            if (pickup_defs[pi].type != PICKUP_PIEZO) ++n_mag;
+        st->n_mag_pickups = n_mag;
+
+        if (n_mag > 0 && st->total_seg_flat > 0) {
+            st->mag_pickup_map = alloc_i(n_mag);
+            st->pickup_K0      = alloc_f(n_mag * st->total_seg_flat);
+            st->pickup_K1      = alloc_f(n_mag * st->total_seg_flat);
+            st->string_v0_flat = alloc_f(st->total_seg_flat);
+            st->string_v1_flat = alloc_f(st->total_seg_flat);
+            if (!st->mag_pickup_map || !st->pickup_K0 || !st->pickup_K1 ||
+                !st->string_v0_flat || !st->string_v1_flat) goto fail;
+
+            int mi3 = 0;
+            for (int pi = 0; pi < n_pickups; ++pi) {
+                if (pickup_defs[pi].type == PICKUP_PIEZO) continue;
+                st->mag_pickup_map[mi3] = pi;
+                float* K0_row = st->pickup_K0 + mi3 * st->total_seg_flat;
+                float* K1_row = st->pickup_K1 + mi3 * st->total_seg_flat;
+                const PickupState* pk = &st->pickups[pi];
+                for (int si = 0; si < n_strings; ++si) {
+                    if (!(pk->string_mask & (1u << (unsigned)si))) continue;
+                    if (!pk->Bn_kernel[si] || !pk->Bb_kernel[si]) continue;
+                    int   off = st->string_seg_offsets[si];
+                    float ds  = st->strings[si].ds;
+                    int   N   = st->strings[si].n_segs;
+                    for (int s = 0; s < N; ++s) {
+                        K0_row[off + s] = pk->Bn_kernel[si][s] * ds;
+                        K1_row[off + s] = pk->Bb_kernel[si][s] * ds;
+                    }
+                }
+                ++mi3;
+            }
+        }
+    }
+
+    if (st->n_mag_pickups > 0) {
+        st->mag_pickup_tmp = alloc_f(st->n_mag_pickups);
+        if (!st->mag_pickup_tmp) goto fail;
+    }
+
+    /* ── Per-string bridge injection kernels ── *
+     *                                            *
+     * Maps each string saddle XY to its nearest   *
+     * bridge plate nodes (Gaussian weighting by   *
+     * distance in plate 2-D space).               */
+    if (n_strings > 0 && st->n_bridge_cells > 0) {
+        int nb = st->n_bridge_cells;
+        st->string_bridge_kernel = alloc_f(n_strings * nb);
+        st->bridge_drive         = alloc_f(nb);
+        if (!st->string_bridge_kernel || !st->bridge_drive) goto fail;
+
+        float sigma   = (amr_desc->plate_dx > 0.0f)
+                        ? 2.0f * amr_desc->plate_dx : 0.005f;
+        float inv_2s2 = 0.5f / (sigma * sigma);
+
+        for (int si = 0; si < n_strings; ++si) {
+            const StringState* ss = &st->strings[si];
+            int Nn = ss->n_nodes;
+            float saddle_x = ss->seg_xyz[(Nn-1)*3+0];
+            float saddle_y = ss->seg_xyz[(Nn-1)*3+1];
+
+            float* row  = st->string_bridge_kernel + si * nb;
+            float  wsum = 0.0f;
+            for (int c = 0; c < nb; ++c) {
+                /* Recover XY world position from flat plate index:
+                 * flat = j + plate_Ny * i  → i = flat/Ny, j = flat%Ny */
+                int flat = st->bridge_cell_idx[c];
+                int i = flat / st->Ny;
+                int j = flat % st->Ny;
+                float cx = st->origin[0] + (float)i * st->dx;
+                float cy = st->origin[1] + (float)j * st->dx;
+                float dx2 = saddle_x - cx;
+                float dy2 = saddle_y - cy;
+                row[c] = expf(-(dx2*dx2 + dy2*dy2) * inv_2s2);
+                wsum  += row[c];
+            }
+            if (wsum > 1e-12f)
+                for (int c = 0; c < nb; ++c) row[c] /= wsum;
+        }
+    }
+
+    return st;
+
+fail:
+    coevolver_destroy(st);
+    return NULL;
+}
+
 /* ── coevolver_schedule_pluck / coevolver_clear_pluck_schedule ────────────── */
 
 SK_API int coevolver_schedule_pluck(
     AcousticCoEvolverState* st,
     int onset_sample, int string_idx,
-    float position_norm, float amplitude)
+    float position_norm, float amplitude,
+    int n_duration_samples)
 {
     if (!st) return CE_ERR_NULL;
     if (coevolver_busy(st)) return CE_ERR_BUSY;
@@ -1388,7 +1745,9 @@ SK_API int coevolver_schedule_pluck(
         st->pluck_events[idx] = st->pluck_events[idx - 1];
         --idx;
     }
-    st->pluck_events[idx] = { onset_sample, string_idx, position_norm, amplitude };
+    st->pluck_events[idx] = {
+        onset_sample, string_idx, position_norm, amplitude, n_duration_samples
+    };
     return CE_OK;
 }
 
@@ -1416,6 +1775,10 @@ SK_API void coevolver_destroy(AcousticCoEvolverState* st)
     }
 
     fdtd_destroy(st->fdtd);
+    if (st->pressure_backend) {
+        delete st->pressure_backend;
+        st->pressure_backend = nullptr;
+    }
     free(st->bridge_cell_idx);
     free(st->bridge_cell_wgt);
     free(st->neck_plate_idx);
@@ -1539,12 +1902,20 @@ static int _step_one_sample(AcousticCoEvolverState* st, int sample_abs)
         float neck_plate_force = 0.0f;
         if (st->neck_mass_eff > 0.0f && st->n_neck_plate_cells > 0) {
             float plate_w = 0.0f;
-            fdtd_sample_plate_weighted(
-                st->fdtd,
-                st->n_neck_plate_cells,
-                st->neck_plate_idx,
-                st->neck_plate_wgt,
-                &plate_w);
+            if (st->pressure_backend) {
+                st->pressure_backend->sample_plate_weighted(
+                    st->n_neck_plate_cells,
+                    st->neck_plate_idx,
+                    st->neck_plate_wgt,
+                    &plate_w);
+            } else {
+                fdtd_sample_plate_weighted(
+                    st->fdtd,
+                    st->n_neck_plate_cells,
+                    st->neck_plate_idx,
+                    st->neck_plate_wgt,
+                    &plate_w);
+            }
 
             float f_strings = 0.0f;
             for (int si = 0; si < st->n_strings; ++si) {
@@ -1656,34 +2027,66 @@ static int _step_one_sample(AcousticCoEvolverState* st, int sample_abs)
             bd.noalias() = Kmat.topRows(n_force_strings).transpose() * fs;
         }
 
-        /* Inject per-cell bridge drives into FDTD */
+        /* Inject per-cell bridge drives into acoustic backend */
         if (nb > 0 && st->bridge_drive) {
-            int rc_bdg = fdtd_inject_bridge_drive(
-                st->fdtd, st->bridge_drive, 1.0f);
-            if (rc_bdg != FDTD_OK) return CE_ERR_FDTD_BRIDGE;
+            int rc_bdg;
+            if (st->pressure_backend) {
+                rc_bdg = st->pressure_backend->inject_bridge_drive(
+                    st->bridge_drive, nb, 1.0f);
+                if (rc_bdg != SK_OK) return CE_ERR_FDTD_BRIDGE;
+            } else {
+                rc_bdg = fdtd_inject_bridge_drive(
+                    st->fdtd, st->bridge_drive, 1.0f);
+                if (rc_bdg != FDTD_OK) return CE_ERR_FDTD_BRIDGE;
+            }
         }
 
         if (neck_plate_force != 0.0f && st->n_neck_plate_cells > 0) {
-            int rc_neck = fdtd_inject_plate_force(
-                st->fdtd,
-                st->n_neck_plate_cells,
-                st->neck_plate_idx,
-                st->neck_plate_wgt,
-                neck_plate_force);
-            if (rc_neck != FDTD_OK) return CE_ERR_FDTD_BRIDGE;
+            int rc_neck;
+            if (st->pressure_backend) {
+                rc_neck = st->pressure_backend->inject_plate_force(
+                    st->n_neck_plate_cells,
+                    st->neck_plate_idx,
+                    st->neck_plate_wgt,
+                    neck_plate_force);
+                if (rc_neck != SK_OK) return CE_ERR_FDTD_BRIDGE;
+            } else {
+                rc_neck = fdtd_inject_plate_force(
+                    st->fdtd,
+                    st->n_neck_plate_cells,
+                    st->neck_plate_idx,
+                    st->neck_plate_wgt,
+                    neck_plate_force);
+                if (rc_neck != FDTD_OK) return CE_ERR_FDTD_BRIDGE;
+            }
         }
 
-        int rc = fdtd_step(st->fdtd, 1);
-        if (rc == FDTD_ERR_UNSTABLE) return CE_ERR_UNSTABLE;
-        if (rc != FDTD_OK)           return CE_ERR_FDTD_STEP;
+        int rc;
+        if (st->pressure_backend) {
+            rc = st->pressure_backend->step(1);
+            if (rc == FDTD_ERR_UNSTABLE) return CE_ERR_UNSTABLE;
+            if (rc != SK_OK)             return CE_ERR_FDTD_STEP;
+        } else {
+            rc = fdtd_step(st->fdtd, 1);
+            if (rc == FDTD_ERR_UNSTABLE) return CE_ERR_UNSTABLE;
+            if (rc != FDTD_OK)           return CE_ERR_FDTD_STEP;
+        }
 
         /* Plate → saddle BC: batch gather-dot, no full-plate memcpy. */
-        fdtd_sample_plate_displacement_batch(
-            st->fdtd,
-            st->n_strings,
-            st->saddle_idx4,
-            st->saddle_wgt4,
-            st->saddle_w_batch);
+        if (st->pressure_backend) {
+            st->pressure_backend->sample_plate_displacement_batch(
+                st->n_strings,
+                st->saddle_idx4,
+                st->saddle_wgt4,
+                st->saddle_w_batch);
+        } else {
+            fdtd_sample_plate_displacement_batch(
+                st->fdtd,
+                st->n_strings,
+                st->saddle_idx4,
+                st->saddle_wgt4,
+                st->saddle_w_batch);
+        }
         for (int si = 0; si < st->n_strings; ++si)
             st->strings[si].saddle_w = st->saddle_w_batch[si];
 
@@ -1746,20 +2149,26 @@ static int _step_one_sample(AcousticCoEvolverState* st, int sample_abs)
     /* ── Mic sampling — precomputed 8-tap gather (Issue 7) ── */
     int out_pos = st->out_write_pos;
     if (st->n_mics > 0) {
-        int rc_p = fdtd_sample_pressure_precomputed(
-            st->fdtd, st->n_mics,
-            st->mic_P_idx8, st->mic_P_wgt8,
-            st->mic_P);
-        if (rc_p != FDTD_OK) return CE_ERR_FDTD_MIC_P;
-
-        if (st->any_mic_needs_velocity) {
-            int rc_v = fdtd_sample_velocity_precomputed(
+        if (st->pressure_backend) {
+            int rc_m = st->pressure_backend->sample_mics(
+                st->n_mics, st->mic_P, st->mic_vx, st->mic_vy, st->mic_vz);
+            if (rc_m != SK_OK) return CE_ERR_FDTD_MIC_P;
+        } else {
+            int rc_p = fdtd_sample_pressure_precomputed(
                 st->fdtd, st->n_mics,
-                st->mic_Vx_idx8, st->mic_Vx_wgt8,
-                st->mic_Vy_idx8, st->mic_Vy_wgt8,
-                st->mic_Vz_idx8, st->mic_Vz_wgt8,
-                st->mic_vx, st->mic_vy, st->mic_vz);
-            if (rc_v != FDTD_OK) return CE_ERR_FDTD_MIC_V;
+                st->mic_P_idx8, st->mic_P_wgt8,
+                st->mic_P);
+            if (rc_p != FDTD_OK) return CE_ERR_FDTD_MIC_P;
+
+            if (st->any_mic_needs_velocity) {
+                int rc_v = fdtd_sample_velocity_precomputed(
+                    st->fdtd, st->n_mics,
+                    st->mic_Vx_idx8, st->mic_Vx_wgt8,
+                    st->mic_Vy_idx8, st->mic_Vy_wgt8,
+                    st->mic_Vz_idx8, st->mic_Vz_wgt8,
+                    st->mic_vx, st->mic_vy, st->mic_vz);
+                if (rc_v != FDTD_OK) return CE_ERR_FDTD_MIC_V;
+            }
         }
 
         for (int mi = 0; mi < st->n_mics; ++mi) {
@@ -1796,7 +2205,8 @@ SK_API int coevolver_step(AcousticCoEvolverState* st, int n_samples)
         while (st->pluck_cursor < st->n_pluck_events &&
                st->pluck_events[st->pluck_cursor].onset_sample <= sample_idx) {
             PluckEvent* ev = &st->pluck_events[st->pluck_cursor++];
-            coevolver_pluck_string(st, ev->string_idx, ev->position_norm, ev->amplitude);
+            coevolver_pluck_string(st, ev->string_idx, ev->position_norm,
+                                   ev->amplitude, ev->n_duration_samples);
         }
         int rc = _step_one_sample(st, sample_idx);
         if (rc != CE_OK) return rc;
@@ -1848,7 +2258,8 @@ SK_API int coevolver_step_block_with_drive(
                st->pluck_events[st->pluck_cursor].onset_sample <= sample_idx) {
             PluckEvent* ev = &st->pluck_events[st->pluck_cursor++];
             coevolver_pluck_string(st, ev->string_idx,
-                                   ev->position_norm, ev->amplitude);
+                                   ev->position_norm, ev->amplitude,
+                                   ev->n_duration_samples);
         }
 
         /* Direct drive: write scaled force straight into ext_force. */
@@ -1892,7 +2303,8 @@ static void _worker_fn(AcousticCoEvolverState* st)
         while (st->pluck_cursor < st->n_pluck_events &&
                st->pluck_events[st->pluck_cursor].onset_sample <= sample_idx) {
             PluckEvent* ev = &st->pluck_events[st->pluck_cursor++];
-            coevolver_pluck_string(st, ev->string_idx, ev->position_norm, ev->amplitude);
+            coevolver_pluck_string(st, ev->string_idx, ev->position_norm,
+                                   ev->amplitude, ev->n_duration_samples);
         }
         int rc = _step_one_sample(st, s);
         ts->progress_samples.fetch_add(1, std::memory_order_relaxed);
@@ -1968,7 +2380,8 @@ SK_API int coevolver_pluck_string(
     AcousticCoEvolverState* st,
     int   string_idx,
     float position_norm,
-    float amplitude)
+    float amplitude,
+    int   n_duration_samples)
 {
     if (!st) return CE_ERR_NULL;
     if (coevolver_busy(st)) return CE_ERR_BUSY;
@@ -1991,10 +2404,11 @@ SK_API int coevolver_pluck_string(
     float F_peak    = ss->tension_N * fabsf(amp) * (1.0f / left_len + 1.0f / right_len);
     if (amp < 0.0f) F_peak = -F_peak;
 
-    /* Continuous draw: half-cosine force ramp 0 → F_peak over ~20 ms.
-     * The sudden removal after draw_samples is the pluck release.
-     * pre-scale each sample by dt_s²/(mu·ds) for direct leapfrog injection. */
-    int draw_samples = (int)roundf(0.020f * st->sample_rate);
+    /* Draw-phase length: caller may specify an explicit sample count for
+     * stability tests or slow strum draws; 0 → default ~20 ms. */
+    int draw_samples = (n_duration_samples > 0)
+        ? n_duration_samples
+        : (int)roundf(0.020f * st->sample_rate);
     if (draw_samples < 4) draw_samples = 4;
 
     float* fbuf = (float*)malloc(draw_samples * sizeof(float));
@@ -2091,13 +2505,41 @@ SK_API int coevolver_get_pressure_field(
     const AcousticCoEvolverState* st, float* out, int out_len)
 {
     if (!st) return CE_ERR_NULL;
+    if (st->pressure_backend)
+        return st->pressure_backend->get_pressure_field_flat(out, out_len);
     return fdtd_get_pressure_field(st->fdtd, out, out_len);
+}
+
+SK_API int coevolver_get_pressure_field_uniform(
+    const AcousticCoEvolverState* st,
+    int Nx, int Ny, int Nz,
+    const double bmin[3], const double bmax[3],
+    float* out, int out_len)
+{
+    if (!st || !out || !bmin || !bmax) return CE_ERR_NULL;
+    if (out_len != Nx * Ny * Nz) return CE_ERR_DIM;
+    if (st->pressure_backend)
+        return st->pressure_backend->get_pressure_field_uniform(
+            Nx, Ny, Nz, bmin, bmax, out, out_len);
+    /* Legacy uniform FDTD path — bmin/bmax ignored, dims must match exactly */
+    return fdtd_get_pressure_field(st->fdtd, out, out_len);
+}
+
+SK_API int coevolver_get_amr_cell_centers(
+    const AcousticCoEvolverState* st,
+    float* out_xyz, int n_cells_3)
+{
+    if (!st || !out_xyz) return CE_ERR_NULL;
+    if (!st->pressure_backend) return CE_ERR_PARAM;
+    return st->pressure_backend->get_cell_centers(out_xyz, n_cells_3);
 }
 
 SK_API int coevolver_get_plate_displacement(
     const AcousticCoEvolverState* st, float* out, int out_len)
 {
     if (!st) return CE_ERR_NULL;
+    if (st->pressure_backend)
+        return st->pressure_backend->get_plate_displacement(out, out_len);
     return fdtd_get_plate_displacement(st->fdtd, out, out_len);
 }
 
@@ -2121,6 +2563,10 @@ SK_API int coevolver_sample_pressure(
     int n_rec, const float* rec_xyz, float* out_p)
 {
     if (!st || !rec_xyz || !out_p) return CE_ERR_NULL;
+    /* AMR backend does not expose a uniform grid; world-space sampling is
+     * unsupported through this legacy interface.  Use get_pressure_field()
+     * to retrieve the flat cell-indexed field and sample externally. */
+    if (st->pressure_backend) return CE_ERR_PARAM;
     /* Convert world coords to grid coords */
     float* grid_coords = (float*)malloc(n_rec * 3 * sizeof(float));
     if (!grid_coords) return CE_ERR_NULL;

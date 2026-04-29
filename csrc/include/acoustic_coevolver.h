@@ -124,6 +124,9 @@ extern "C" {
 #define CE_ERR_FDTD_STEP    (-9)  /**< fdtd_step returned a non-unstable error.                     */
 #define CE_ERR_FDTD_MIC_P  (-10)  /**< fdtd_sample_pressure_precomputed failed.                     */
 #define CE_ERR_FDTD_MIC_V  (-11)  /**< fdtd_sample_velocity_precomputed failed.                     */
+#define CE_ERR_AMR_MAPPING  (-12) /**< AMR plate/face mapping is invalid or incomplete.             */
+#define CE_ERR_AMR_TOPOLOGY (-13) /**< AMR grid topology check failed (disconnected / bad levels).  */
+#define CE_ERR_AMR_TIMESTEP (-14) /**< AMR CFL dt is out of range for the requested sample rate.   */
 
 /* ── Async worker status ──────────────────────────────────────────────────── */
 
@@ -316,6 +319,114 @@ SK_API AcousticCoEvolverState* coevolver_create(
 /** Free all resources.  Safe to call with NULL. */
 SK_API void coevolver_destroy(AcousticCoEvolverState* st);
 
+/* ── AMR co-evolver constructor ───────────────────────────────────────────── */
+
+/**
+ * AMR descriptor passed to coevolver_create_amr.
+ *
+ * Plain-C struct so Python/ctypes callers can fill it directly.
+ * All pointer arrays are owned by the caller and must remain valid for the
+ * duration of the call only; the backend copies all data internally.
+ */
+typedef struct AMRCoevolverDescriptor {
+    /* ── AMR grid ─────────────────────────────────────────────────────── */
+    int            n_cells;
+    const double*  cell_centers;       /* (n_cells, 3) */
+    const double*  cell_volumes;       /* (n_cells,) */
+    const double*  open_volume_frac;   /* (n_cells,) */
+    const uint8_t* cell_types;         /* (n_cells,) — 0 AIR, 1 WALL, 2 PLATE, 3 PML */
+    const int16_t* cell_levels;        /* (n_cells,) — refinement levels */
+
+    int            n_faces;
+    const int32_t* face_cell_neg;      /* (n_faces,) */
+    const int32_t* face_cell_pos;      /* (n_faces,) */
+    const double*  face_area;          /* (n_faces,) */
+    const double*  face_open_frac;     /* (n_faces,) */
+    const double*  face_distance;      /* (n_faces,) */
+
+    double c;
+    double rho_air;
+    double min_dx;
+
+    double bounds_min[3];
+    double bounds_max[3];
+
+    /* ── Kirchhoff plate ──────────────────────────────────────────────── */
+    int            plate_Nx;
+    int            plate_Ny;
+    float          plate_dx;
+    float          plate_origin[3];
+    const uint8_t* plate_active;      /* (plate_Nx * plate_Ny) */
+    float          plate_mass_density;
+    float          plate_stiffness_D;
+    float          plate_alpha_M;
+    float          plate_beta_K;
+
+    /* ── Plate-to-AMR face mappings (ragged CSR) ─────────────────────── */
+    int            n_active_plate;
+    const int32_t* plate_active_flat_idx;   /* [n_active_plate] */
+    const int32_t* plate_face_above_starts; /* [n_active_plate + 1] */
+    const int32_t* plate_face_above_idx;
+    const float*   plate_face_above_wgt;
+    const int32_t* plate_face_below_starts; /* [n_active_plate + 1] */
+    const int32_t* plate_face_below_idx;
+    const float*   plate_face_below_wgt;
+    const int32_t* plate_cell_above;        /* [n_active_plate] */
+    const int32_t* plate_cell_below;        /* [n_active_plate] */
+
+    /* ── Bridge sources ───────────────────────────────────────────────── */
+    int            n_bridge_plate;
+    const int32_t* bridge_plate_idx;   /* [n_bridge_plate] flat plate indices */
+    const float*   bridge_plate_wgt;   /* [n_bridge_plate] normalized weights */
+
+    /* ── Neck/body sources (optional) ────────────────────────────────── */
+    int            n_neck_plate;       /* 0 = no neck coupling */
+    const int32_t* neck_plate_idx;     /* [n_neck_plate] */
+    const float*   neck_plate_wgt;     /* [n_neck_plate] */
+
+    /* ── Aperture metadata ────────────────────────────────────────────── */
+    double soundhole_cx;
+    double soundhole_cy;
+    double soundhole_radius;
+    /* ── Border / PML condition ───────────────────────────────────────────────── */
+    int   border_mode;           /* 0=ANECHOIC, 1=ROOM_PANEL, 2=TRANSMISSION */
+    float border_sigma_order;    /* polynomial grading exponent, 0 → default 3.0 */
+    float border_R_reflection;   /* ROOM_PANEL: residual reflected fraction [0,1] */
+    float border_Z_match;        /* TRANSMISSION: 0 = auto (ρc) */
+    int   n_pml;                 /* PML thickness in min_dx cells; 0 = no PML */} AMRCoevolverDescriptor;
+
+/**
+ * Create a co-evolver backed by a strict AMR FDTD pressure domain.
+ *
+ * All string, pickup, mic, scheduling, pluck, and public coevolver behaviour
+ * is identical to the uniform coevolver_create path.  The only difference is
+ * that the acoustic pressure / velocity / plate is solved on the AMR unstructured
+ * topology provided in amr_desc instead of a regular voxel grid.
+ *
+ * Strict no-fallback: construction fails and returns NULL if any of the
+ * following conditions are violated:
+ *   - amr_desc is NULL.
+ *   - AMR grid topology is invalid (disconnected, non-positive volumes/areas,
+ *     out-of-range cell indices, n_bridge_plate == 0).
+ *   - AMR CFL timestep would require fewer than 1 sub-step at sample_rate.
+ *   - Plate-to-AMR face mappings do not cover all active plate nodes.
+ *   - Any mic position is more than one cell-diameter outside the AMR domain.
+ *
+ * @param amr_desc     Complete AMR descriptor; all pointer fields must be valid
+ *                     for the lifetime of this call (data is copied internally).
+ */
+SK_API AcousticCoEvolverState* coevolver_create_amr(
+    int                           n_strings,
+    const CoEvolverStringDef*     string_defs,
+    int                           n_pickups,
+    const CoEvolverPickupDef*     pickup_defs,
+    int                           n_mics,
+    const CoEvolverMicDef*        mic_defs,
+    const AMRCoevolverDescriptor* amr_desc,
+    float                         sample_rate,
+    int                           modal_stride
+);
+
 /* ── Excitation ───────────────────────────────────────────────────────────── */
 
 /**
@@ -327,17 +438,22 @@ SK_API void coevolver_destroy(AcousticCoEvolverState* st);
  * limited internally and later time steps fail if the resulting shape exceeds
  * the solver's slope/stretch validity checks.
  *
- * @param string_idx    Index of the string (0 = bass E, 5 = treble E for guitar).
- * @param position_norm Fractional position along string (0=nut, 1=saddle).
- * @param amplitude     Requested draw displacement in metres. Typical:
- *                      1e-3 – 5e-3; internally limited to +/-6e-3.
- * @return              CE_OK or CE_ERR_STRING_IDX.
+ * @param string_idx        Index of the string (0 = bass E, 5 = treble E for guitar).
+ * @param position_norm     Fractional position along string (0=nut, 1=saddle).
+ * @param amplitude         Requested draw displacement in metres. Typical:
+ *                          1e-3 – 5e-3; internally limited to +/-6e-3.
+ * @param n_duration_samples Draw-phase length in audio samples.  0 = use the
+ *                          default (~20 ms at the current sample rate).  Use a
+ *                          smaller value for stability tests that need early
+ *                          termination; use a larger value for a slow strum draw.
+ * @return                  CE_OK or CE_ERR_STRING_IDX.
  */
 SK_API int coevolver_pluck_string(
     AcousticCoEvolverState* st,
     int   string_idx,
     float position_norm,
-    float amplitude
+    float amplitude,
+    int   n_duration_samples
 );
 
 /**
@@ -377,18 +493,20 @@ SK_API int coevolver_inject_string_force(
  *
  * Thread-safety: do NOT call while an async job is running.
  *
- * @param onset_sample  Sample index (0 … n_samples−1) at which to pluck.
- * @param string_idx    String to pluck.
- * @param position_norm Fractional position along string (0=nut, 1=saddle).
- * @param amplitude     Peak displacement in metres.
- * @return              CE_OK or CE_ERR_NULL / CE_ERR_PARAM (bad string_idx).
+ * @param onset_sample       Sample index (0 … n_samples−1) at which to pluck.
+ * @param string_idx         String to pluck.
+ * @param position_norm      Fractional position along string (0=nut, 1=saddle).
+ * @param amplitude          Peak displacement in metres.
+ * @param n_duration_samples Draw length in audio samples (0 = default ~20 ms).
+ * @return                   CE_OK or CE_ERR_NULL / CE_ERR_PARAM.
  */
 SK_API int coevolver_schedule_pluck(
     AcousticCoEvolverState* st,
     int   onset_sample,
     int   string_idx,
     float position_norm,
-    float amplitude
+    float amplitude,
+    int   n_duration_samples
 );
 
 /**
@@ -536,6 +654,41 @@ SK_API int coevolver_get_pressure_field(
     const AcousticCoEvolverState* st,
     float* out,
     int    out_len
+);
+
+/**
+ * Scatter the pressure field onto a caller-specified uniform (Nx×Ny×Nz)
+ * voxel grid, defined by the bounding box [bmin, bmax].
+ *
+ * For the uniform (FDTD) path: Nx/Ny/Nz must match the grid; bmin/bmax are
+ * ignored.  For the AMR path: nearest-voxel scatter is performed.
+ *
+ * @param out      (Nx·Ny·Nz,) float32, index ix*(Ny*Nz)+iy*Nz+iz.
+ * @param out_len  Must equal Nx*Ny*Nz.
+ * @return         CE_OK or CE_ERR_DIM.
+ */
+SK_API int coevolver_get_pressure_field_uniform(
+    const AcousticCoEvolverState* st,
+    int    Nx, int Ny, int Nz,
+    const double bmin[3], const double bmax[3],
+    float* out,
+    int    out_len
+);
+
+/**
+ * Copy AMR cell centres into a (n_cells*3) float buffer.
+ *
+ * Only valid when the coevolver was created with an AMR backend; returns
+ * CE_ERR_PARAM for the uniform-FDTD path.
+ *
+ * @param out_xyz  (n_cells*3,) float32 — (cx,cy,cz) per cell in row-major order.
+ * @param n_cells_3  Must be >= n_cells * 3.
+ * @return CE_OK, CE_ERR_NULL, or CE_ERR_PARAM.
+ */
+SK_API int coevolver_get_amr_cell_centers(
+    const AcousticCoEvolverState* st,
+    float* out_xyz,
+    int    n_cells_3
 );
 
 /**

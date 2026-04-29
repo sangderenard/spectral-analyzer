@@ -15,6 +15,7 @@
 #include "transforms_api.h"
 #include "ray_tracer.h"
 #include "rt_field_solver.h"
+#include "acoustic_amr.h"
 #include "acoustic_fdtd.h"
 #include "acoustic_coevolver.h"
 #include <pybind11/pybind11.h>
@@ -1181,6 +1182,12 @@ struct PyAcousticCoEvolver
     int _n_pickups  = 0;
     int _n_mics     = 0;
     int _Nx = 0, _Ny = 0, _Nz = 0;
+    /* AMR viz scatter grid (set only for from_amr_desc path) */
+    int    _n_cells_amr = 0;
+    double _bmin[3]     = {};
+    double _bmax[3]     = {};
+
+    PyAcousticCoEvolver() = default;  /* for from_amr_desc factory */
 
     /**
      * Constructor — accepts plain Python dicts/lists so the caller does not
@@ -1341,8 +1348,210 @@ struct PyAcousticCoEvolver
 
     ~PyAcousticCoEvolver() { coevolver_destroy(handle); handle = nullptr; }
 
-    /* step(n_samples) → CE_OK=0 or raises on instability.
-     * GIL is released for the duration of the C++ physics call. */
+    /**
+     * from_amr_desc(amr_desc, string_defs, pickup_defs, mic_defs,
+     *               sample_rate, modal_stride) → PyAcousticCoEvolver
+     *
+     * AMR-backed constructor.  amr_desc is the dict returned by
+     * build_amr_coevolver_descriptor() in acoustic_amr.py.
+     * string/pickup/mic_defs use the same schema as the uniform constructor.
+     */
+    static PyAcousticCoEvolver* from_amr_desc(
+        py::dict   amr_dict,
+        py::list   string_defs_list,
+        py::list   pickup_defs_list,
+        py::list   mic_defs_list,
+        float      sample_rate,
+        int        modal_stride = 16)
+    {
+        /* ── Strings ── */
+        int n_strings = (int)py::len(string_defs_list);
+        std::vector<CoEvolverStringDef>    sdefs(n_strings);
+        std::vector<std::vector<float>>    path_bufs(n_strings);
+        for (int si = 0; si < n_strings; ++si) {
+            py::dict d = string_defs_list[si].cast<py::dict>();
+            auto path_arr = d["path_xyz"].cast<py::array_t<float>>();
+            auto pi = path_arr.request();
+            path_bufs[si].assign(
+                static_cast<const float*>(pi.ptr),
+                static_cast<const float*>(pi.ptr) + pi.size);
+            sdefs[si].path_xyz           = path_bufs[si].data();
+            sdefs[si].n_segs             = (int)(pi.size / 3) - 1;
+            sdefs[si].tension_N          = d["tension_N"].cast<float>();
+            sdefs[si].linear_mass_kgm    = d["linear_mass_kgm"].cast<float>();
+            sdefs[si].damping            = d["damping"].cast<float>();
+            sdefs[si].stiffness_EI       = d.contains("stiffness_EI")       ? d["stiffness_EI"].cast<float>()       : 0.0f;
+            sdefs[si].axial_stiffness_N  = d.contains("axial_stiffness_N")  ? d["axial_stiffness_N"].cast<float>()  : 0.0f;
+            sdefs[si].neck_freq_hz       = d.contains("neck_freq_hz")       ? d["neck_freq_hz"].cast<float>()       : 0.0f;
+            sdefs[si].neck_mass_kg       = d.contains("neck_mass_kg")       ? d["neck_mass_kg"].cast<float>()       : 0.0f;
+            sdefs[si].neck_Q             = d.contains("neck_Q")             ? d["neck_Q"].cast<float>()             : 0.0f;
+        }
+
+        /* ── Pickups ── */
+        int n_pickups = (int)py::len(pickup_defs_list);
+        std::vector<CoEvolverPickupDef> pdefs(n_pickups);
+        auto copy3f = [](py::dict& d, const char* key, float* dst) {
+            auto arr  = d[key].cast<py::array_t<float>>();
+            auto info = arr.request();
+            auto* src = static_cast<const float*>(info.ptr);
+            dst[0]=src[0]; dst[1]=src[1]; dst[2]=src[2];
+        };
+        for (int pi2 = 0; pi2 < n_pickups; ++pi2) {
+            py::dict d = pickup_defs_list[pi2].cast<py::dict>();
+            pdefs[pi2].type         = d["type"].cast<int>();
+            pdefs[pi2].pole_sigma   = d["pole_sigma"].cast<float>();
+            pdefs[pi2].coil_spacing = d.contains("coil_spacing") ? d["coil_spacing"].cast<float>() : 0.018f;
+            pdefs[pi2].sensitivity  = d.contains("sensitivity")  ? d["sensitivity"].cast<float>()  : 1.0f;
+            pdefs[pi2].string_mask  = d.contains("string_mask")  ? (uint32_t)d["string_mask"].cast<int>() : 0xFFFFFFFFu;
+            copy3f(d, "pos",  pdefs[pi2].pos);
+            copy3f(d, "axis", pdefs[pi2].axis);
+        }
+
+        /* ── Mics ── */
+        int n_mics = (int)py::len(mic_defs_list);
+        std::vector<CoEvolverMicDef> mdefs(n_mics);
+        for (int mi = 0; mi < n_mics; ++mi) {
+            py::dict d = mic_defs_list[mi].cast<py::dict>();
+            auto arr  = d["pos"].cast<py::array_t<float>>();
+            auto info = arr.request();
+            auto* src = static_cast<const float*>(info.ptr);
+            mdefs[mi].pos[0]=src[0]; mdefs[mi].pos[1]=src[1]; mdefs[mi].pos[2]=src[2];
+            mdefs[mi].gain    = d.contains("gain")    ? d["gain"].cast<float>()    : 1.0f;
+            mdefs[mi].polar_a = d.contains("polar_a") ? d["polar_a"].cast<float>() : 1.0f;
+            mdefs[mi].polar_b = d.contains("polar_b") ? d["polar_b"].cast<float>() : 0.0f;
+            if (d.contains("axis")) {
+                auto aa = d["axis"].cast<py::array_t<float>>();
+                auto ai = aa.request();
+                auto* ap = static_cast<const float*>(ai.ptr);
+                mdefs[mi].axis[0]=ap[0]; mdefs[mi].axis[1]=ap[1]; mdefs[mi].axis[2]=ap[2];
+            } else {
+                mdefs[mi].axis[0]=0.0f; mdefs[mi].axis[1]=0.0f; mdefs[mi].axis[2]=1.0f;
+            }
+        }
+
+        /* ── AMR descriptor ── */
+        /* Keep numpy arrays alive for the duration of the call via py::array_t refs. */
+        auto cc_arr   = amr_dict["cell_centers"]          .cast<py::array_t<double>>();
+        auto cv_arr   = amr_dict["cell_volumes"]           .cast<py::array_t<double>>();
+        auto ov_arr   = amr_dict["open_volume_frac"]       .cast<py::array_t<double>>();
+        auto ct_arr   = amr_dict["cell_types"]             .cast<py::array_t<uint8_t>>();
+        auto cl_arr   = amr_dict["cell_levels"]            .cast<py::array_t<int16_t>>();
+        auto fn_arr   = amr_dict["face_cell_neg"]          .cast<py::array_t<int32_t>>();
+        auto fp_arr   = amr_dict["face_cell_pos"]          .cast<py::array_t<int32_t>>();
+        auto fa_arr   = amr_dict["face_area"]              .cast<py::array_t<double>>();
+        auto fo_arr   = amr_dict["face_open_frac"]         .cast<py::array_t<double>>();
+        auto fd_arr   = amr_dict["face_distance"]          .cast<py::array_t<double>>();
+        auto pa_arr   = amr_dict["plate_active"]           .cast<py::array_t<uint8_t>>();
+        auto pafi_arr = amr_dict["plate_active_flat_idx"]  .cast<py::array_t<int32_t>>();
+        auto fas_arr  = amr_dict["plate_face_above_starts"].cast<py::array_t<int32_t>>();
+        auto fai_arr  = amr_dict["plate_face_above_idx"]   .cast<py::array_t<int32_t>>();
+        auto faw_arr  = amr_dict["plate_face_above_wgt"]   .cast<py::array_t<float>>();
+        auto fbs_arr  = amr_dict["plate_face_below_starts"].cast<py::array_t<int32_t>>();
+        auto fbi_arr  = amr_dict["plate_face_below_idx"]   .cast<py::array_t<int32_t>>();
+        auto fbw_arr  = amr_dict["plate_face_below_wgt"]   .cast<py::array_t<float>>();
+        auto pca_arr  = amr_dict["plate_cell_above"]       .cast<py::array_t<int32_t>>();
+        auto pcb_arr  = amr_dict["plate_cell_below"]       .cast<py::array_t<int32_t>>();
+        auto bpi_arr  = amr_dict["bridge_plate_idx"]       .cast<py::array_t<int32_t>>();
+        auto bpw_arr  = amr_dict["bridge_plate_wgt"]       .cast<py::array_t<float>>();
+        auto npi_arr  = amr_dict["neck_plate_idx"]         .cast<py::array_t<int32_t>>();
+        auto npw_arr  = amr_dict["neck_plate_wgt"]         .cast<py::array_t<float>>();
+
+        auto bmin_arr = amr_dict["bounds_min"].cast<py::array_t<double>>();
+        auto bmax_arr = amr_dict["bounds_max"].cast<py::array_t<double>>();
+        auto porg_arr = amr_dict["plate_origin"].cast<py::array_t<float>>();
+        auto bmin_p   = static_cast<const double*>(bmin_arr.request().ptr);
+        auto bmax_p   = static_cast<const double*>(bmax_arr.request().ptr);
+        auto porg_p   = static_cast<const float*>(porg_arr.request().ptr);
+
+        AMRCoevolverDescriptor desc{};
+        desc.n_cells           = amr_dict["n_cells"].cast<int>();
+        desc.cell_centers      = static_cast<const double*>(cc_arr.request().ptr);
+        desc.cell_volumes      = static_cast<const double*>(cv_arr.request().ptr);
+        desc.open_volume_frac  = static_cast<const double*>(ov_arr.request().ptr);
+        desc.cell_types        = static_cast<const uint8_t*>(ct_arr.request().ptr);
+        desc.cell_levels       = static_cast<const int16_t*>(cl_arr.request().ptr);
+        desc.n_faces           = amr_dict["n_faces"].cast<int>();
+        desc.face_cell_neg     = static_cast<const int32_t*>(fn_arr.request().ptr);
+        desc.face_cell_pos     = static_cast<const int32_t*>(fp_arr.request().ptr);
+        desc.face_area         = static_cast<const double*>(fa_arr.request().ptr);
+        desc.face_open_frac    = static_cast<const double*>(fo_arr.request().ptr);
+        desc.face_distance     = static_cast<const double*>(fd_arr.request().ptr);
+        desc.c                 = amr_dict["c"].cast<double>();
+        desc.rho_air           = amr_dict["rho_air"].cast<double>();
+        desc.min_dx            = amr_dict["min_dx"].cast<double>();
+        desc.bounds_min[0] = bmin_p[0]; desc.bounds_min[1] = bmin_p[1]; desc.bounds_min[2] = bmin_p[2];
+        desc.bounds_max[0] = bmax_p[0]; desc.bounds_max[1] = bmax_p[1]; desc.bounds_max[2] = bmax_p[2];
+        desc.plate_Nx              = amr_dict["plate_Nx"].cast<int>();
+        desc.plate_Ny              = amr_dict["plate_Ny"].cast<int>();
+        desc.plate_dx              = amr_dict["plate_dx"].cast<float>();
+        desc.plate_origin[0] = porg_p[0]; desc.plate_origin[1] = porg_p[1]; desc.plate_origin[2] = porg_p[2];
+        desc.plate_active          = static_cast<const uint8_t*>(pa_arr.request().ptr);
+        desc.plate_mass_density    = amr_dict["plate_mass_density"].cast<float>();
+        desc.plate_stiffness_D     = amr_dict["plate_stiffness_D"].cast<float>();
+        desc.plate_alpha_M         = amr_dict["plate_alpha_M"].cast<float>();
+        desc.plate_beta_K          = amr_dict["plate_beta_K"].cast<float>();
+        desc.n_active_plate        = amr_dict["n_active_plate"].cast<int>();
+        desc.plate_active_flat_idx  = static_cast<const int32_t*>(pafi_arr.request().ptr);
+        desc.plate_face_above_starts= static_cast<const int32_t*>(fas_arr.request().ptr);
+        desc.plate_face_above_idx   = static_cast<const int32_t*>(fai_arr.request().ptr);
+        desc.plate_face_above_wgt   = static_cast<const float*>(faw_arr.request().ptr);
+        desc.plate_face_below_starts= static_cast<const int32_t*>(fbs_arr.request().ptr);
+        desc.plate_face_below_idx   = static_cast<const int32_t*>(fbi_arr.request().ptr);
+        desc.plate_face_below_wgt   = static_cast<const float*>(fbw_arr.request().ptr);
+        desc.plate_cell_above       = static_cast<const int32_t*>(pca_arr.request().ptr);
+        desc.plate_cell_below       = static_cast<const int32_t*>(pcb_arr.request().ptr);
+        desc.n_bridge_plate         = amr_dict["n_bridge_plate"].cast<int>();
+        desc.bridge_plate_idx       = static_cast<const int32_t*>(bpi_arr.request().ptr);
+        desc.bridge_plate_wgt       = static_cast<const float*>(bpw_arr.request().ptr);
+        desc.n_neck_plate           = amr_dict["n_neck_plate"].cast<int>();
+        desc.neck_plate_idx         = static_cast<const int32_t*>(npi_arr.request().ptr);
+        desc.neck_plate_wgt         = static_cast<const float*>(npw_arr.request().ptr);
+        desc.soundhole_cx           = amr_dict["soundhole_cx"].cast<double>();
+        desc.soundhole_cy           = amr_dict["soundhole_cy"].cast<double>();
+        desc.soundhole_radius       = amr_dict["soundhole_radius"].cast<double>();
+        desc.border_mode            = amr_dict.contains("border_mode")         ? amr_dict["border_mode"].cast<int>()           : 0;
+        desc.border_sigma_order     = amr_dict.contains("border_sigma_order")  ? amr_dict["border_sigma_order"].cast<float>()  : 3.0f;
+        desc.border_R_reflection    = amr_dict.contains("border_R_reflection") ? amr_dict["border_R_reflection"].cast<float>() : 0.0f;
+        desc.border_Z_match         = amr_dict.contains("border_Z_match")      ? amr_dict["border_Z_match"].cast<float>()      : 0.0f;
+        desc.n_pml                  = amr_dict.contains("n_pml")               ? amr_dict["n_pml"].cast<int>()                 : 0;
+
+        auto* self = new PyAcousticCoEvolver();
+        self->_n_strings = n_strings;
+        self->_n_pickups = n_pickups;
+        self->_n_mics    = n_mics;
+        {
+            py::gil_scoped_release release;
+            self->handle = coevolver_create_amr(
+                n_strings, sdefs.empty()  ? nullptr : sdefs.data(),
+                n_pickups, pdefs.empty()  ? nullptr : pdefs.data(),
+                n_mics,    mdefs.empty()  ? nullptr : mdefs.data(),
+                &desc,
+                sample_rate, modal_stride);
+        }
+        if (!self->handle) {
+            delete self;
+            throw std::runtime_error("coevolver_create_amr: allocation failed");
+        }
+        /* Compute visualization grid for the AMR pressure scatter path.
+         * viz_dx = max(min_dx * 4, 0.005) keeps the texture small (< 256³). */
+        {
+            double viz_dx = std::max(desc.min_dx * 4.0, 0.005);
+            auto clamp256 = [](int v) { return std::max(1, std::min(v, 256)); };
+            self->_Nx = clamp256((int)std::round((desc.bounds_max[0] - desc.bounds_min[0]) / viz_dx) + 1);
+            self->_Ny = clamp256((int)std::round((desc.bounds_max[1] - desc.bounds_min[1]) / viz_dx) + 1);
+            self->_Nz = clamp256((int)std::round((desc.bounds_max[2] - desc.bounds_min[2]) / viz_dx) + 1);
+            self->_n_cells_amr = desc.n_cells;
+            self->_bmin[0] = desc.bounds_min[0];
+            self->_bmin[1] = desc.bounds_min[1];
+            self->_bmin[2] = desc.bounds_min[2];
+            self->_bmax[0] = desc.bounds_max[0];
+            self->_bmax[1] = desc.bounds_max[1];
+            self->_bmax[2] = desc.bounds_max[2];
+        }
+        return self;
+    }
+
+
     int step(int n_samples)
     {
         int rc;
@@ -1405,18 +1614,22 @@ struct PyAcousticCoEvolver
         return out;
     }
 
-    void pluck_string(int string_idx, float position_norm, float amplitude)
+    void pluck_string(int string_idx, float position_norm, float amplitude,
+                      int n_duration_samples = 0)
     {
-        int rc = coevolver_pluck_string(handle, string_idx, position_norm, amplitude);
+        int rc = coevolver_pluck_string(handle, string_idx, position_norm,
+                                        amplitude, n_duration_samples);
         if (rc != CE_OK)
             throw std::runtime_error("coevolver_pluck_string error: " + std::to_string(rc));
     }
 
     void schedule_pluck(int onset_sample, int string_idx,
-                        float position_norm, float amplitude)
+                        float position_norm, float amplitude,
+                        int n_duration_samples = 0)
     {
         int rc = coevolver_schedule_pluck(handle, onset_sample, string_idx,
-                                          position_norm, amplitude);
+                                          position_norm, amplitude,
+                                          n_duration_samples);
         if (rc != CE_OK)
             throw std::runtime_error("coevolver_schedule_pluck error: " + std::to_string(rc));
     }
@@ -1462,12 +1675,39 @@ struct PyAcousticCoEvolver
 
     py::array_t<float> get_pressure_field()
     {
-        py::array_t<float> out({_Nx, _Ny, _Nz});
-        int rc = coevolver_get_pressure_field(handle,
-            out.mutable_unchecked<3>().mutable_data(0,0,0),
-            _Nx * _Ny * _Nz);
+        int rc;
+        if (_n_cells_amr > 0) {
+            /* AMR path: return raw flat (n_cells,) pressures for GPU TBO upload */
+            py::array_t<float> out({_n_cells_amr});
+            rc = coevolver_get_pressure_field(
+                handle,
+                out.mutable_unchecked<1>().mutable_data(0),
+                _n_cells_amr);
+            if (rc != CE_OK)
+                throw std::runtime_error("get_pressure_field error: " + std::to_string(rc));
+            return out;
+        } else {
+            py::array_t<float> out({_Nx, _Ny, _Nz});
+            rc = coevolver_get_pressure_field(handle,
+                out.mutable_unchecked<3>().mutable_data(0, 0, 0),
+                _Nx * _Ny * _Nz);
+            if (rc != CE_OK)
+                throw std::runtime_error("get_pressure_field error: " + std::to_string(rc));
+            return out;
+        }
+    }
+
+    py::array_t<float> get_amr_cell_centers()
+    {
+        if (_n_cells_amr <= 0)
+            throw std::runtime_error("get_amr_cell_centers: not an AMR coevolver");
+        py::array_t<float> out({_n_cells_amr, 3});
+        int rc = coevolver_get_amr_cell_centers(
+            handle,
+            out.mutable_unchecked<2>().mutable_data(0, 0),
+            _n_cells_amr * 3);
         if (rc != CE_OK)
-            throw std::runtime_error("get_pressure_field error: " + std::to_string(rc));
+            throw std::runtime_error("get_amr_cell_centers error: " + std::to_string(rc));
         return out;
     }
 
@@ -1689,6 +1929,108 @@ struct PyAcousticCoEvolver
     int   n_mics()     const { return coevolver_get_n_mics   (handle); }
     float dt_audio()   const { return coevolver_get_dt_audio (handle); }
     float dt_fdtd()    const { return coevolver_get_dt_fdtd  (handle); }
+};
+
+/* ── Python wrapper for AcousticAMR ─────────────────────────────────────── */
+
+struct PyAcousticAMR
+{
+    AcousticAMRState* handle = nullptr;
+    int n_cells = 0;
+    int n_faces = 0;
+
+    PyAcousticAMR(py::array_t<double>  cell_centers_arr,
+                  py::array_t<double>  cell_volumes_arr,
+                  py::array_t<double>  open_volume_frac_arr,
+                  py::array_t<uint8_t> cell_types_arr,
+                  py::array_t<int32_t> face_cell_neg_arr,
+                  py::array_t<int32_t> face_cell_pos_arr,
+                  py::array_t<double>  face_area_arr,
+                  py::array_t<double>  face_open_frac_arr,
+                  py::array_t<double>  face_distance_arr,
+                  double c,
+                  double rho_air,
+                  double min_dx)
+    {
+        auto cc = cell_centers_arr.request();
+        auto cv = cell_volumes_arr.request();
+        auto ov = open_volume_frac_arr.request();
+        auto ct = cell_types_arr.request();
+        auto fn = face_cell_neg_arr.request();
+        auto fp = face_cell_pos_arr.request();
+        auto fa = face_area_arr.request();
+        auto fo = face_open_frac_arr.request();
+        auto fd = face_distance_arr.request();
+
+        if (cc.ndim != 2 || cc.shape[1] != 3)
+            throw std::runtime_error("cell_centers must have shape (n_cells, 3)");
+        n_cells = static_cast<int>(cc.shape[0]);
+        if (cv.size != n_cells || ov.size != n_cells || ct.size != n_cells)
+            throw std::runtime_error("cell arrays must have n_cells elements");
+        n_faces = static_cast<int>(fn.size);
+        if (fp.size != n_faces || fa.size != n_faces || fo.size != n_faces || fd.size != n_faces)
+            throw std::runtime_error("face arrays must have n_faces elements");
+
+        handle = amr_create(
+            n_cells,
+            static_cast<const double*>(cc.ptr),
+            static_cast<const double*>(cv.ptr),
+            static_cast<const double*>(ov.ptr),
+            static_cast<const uint8_t*>(ct.ptr),
+            n_faces,
+            static_cast<const int32_t*>(fn.ptr),
+            static_cast<const int32_t*>(fp.ptr),
+            static_cast<const double*>(fa.ptr),
+            static_cast<const double*>(fo.ptr),
+            static_cast<const double*>(fd.ptr),
+            c, rho_air, min_dx);
+        if (!handle)
+            throw std::runtime_error("amr_create failed: invalid AMR topology or allocation failure");
+    }
+
+    ~PyAcousticAMR() { amr_destroy(handle); handle = nullptr; }
+
+    int step(int n_steps = 1)
+    {
+        int rc = amr_step(handle, n_steps);
+        if (rc != SK_OK) throw std::runtime_error("amr_step failed: rc=" + std::to_string(rc));
+        return rc;
+    }
+
+    void reset()
+    {
+        int rc = amr_reset(handle);
+        if (rc != SK_OK) throw std::runtime_error("amr_reset failed: rc=" + std::to_string(rc));
+    }
+
+    void inject_pressure_nearest(py::array_t<double> xyz_arr, float value)
+    {
+        auto xi = xyz_arr.request();
+        if (xi.size != 3) throw std::runtime_error("xyz must have 3 elements");
+        int rc = amr_inject_pressure_nearest(
+            handle, static_cast<const double*>(xi.ptr), value);
+        if (rc != SK_OK)
+            throw std::runtime_error("amr_inject_pressure_nearest failed: rc=" + std::to_string(rc));
+    }
+
+    py::array_t<float> get_pressure() const
+    {
+        py::array_t<float> out({n_cells});
+        int rc = amr_get_pressure(handle, out.mutable_data(), n_cells);
+        if (rc != SK_OK) throw std::runtime_error("amr_get_pressure failed: rc=" + std::to_string(rc));
+        return out;
+    }
+
+    py::array_t<float> get_velocity() const
+    {
+        py::array_t<float> out({n_faces});
+        int rc = amr_get_velocity(handle, out.mutable_data(), n_faces);
+        if (rc != SK_OK) throw std::runtime_error("amr_get_velocity failed: rc=" + std::to_string(rc));
+        return out;
+    }
+
+    double get_dt() const { return amr_get_dt(handle); }
+    int get_step_count() const { return amr_get_step_count(handle); }
 };
 
 /* ── Module definition ───────────────────────────────────────────────────── */
@@ -2061,6 +2403,51 @@ np.ndarray, complex128, shape (n_src, n_rec, n_bands, 2, 2)
         .def_property_readonly("n_receivers", &PyFieldSolver::n_receivers)
         .def_property_readonly("mode",        &PyFieldSolver::mode);
 
+    /* ── AcousticAMR ──────────────────────────────────────────────────────── */
+
+    py::class_<PyAcousticAMR>(m, "AcousticAMR",
+        R"doc(
+Topology-driven AMR acoustic pressure stepper.
+
+The grid is supplied as explicit pressure cells and connecting velocity faces.
+Numerical stepping is performed in C++/Eigen; Python is only responsible for
+constructing and validating the AMR descriptor.
+)doc")
+        .def(py::init<py::array_t<double>,
+                      py::array_t<double>,
+                      py::array_t<double>,
+                      py::array_t<uint8_t>,
+                      py::array_t<int32_t>,
+                      py::array_t<int32_t>,
+                      py::array_t<double>,
+                      py::array_t<double>,
+                      py::array_t<double>,
+                      double,
+                      double,
+                      double>(),
+             py::arg("cell_centers"),
+             py::arg("cell_volumes"),
+             py::arg("open_volume_fraction"),
+             py::arg("cell_types"),
+             py::arg("face_cell_neg"),
+             py::arg("face_cell_pos"),
+             py::arg("face_area"),
+             py::arg("face_open_fraction"),
+             py::arg("face_distance"),
+             py::arg("c"),
+             py::arg("rho_air"),
+             py::arg("min_dx"))
+        .def("step", &PyAcousticAMR::step, py::arg("n_steps") = 1)
+        .def("reset", &PyAcousticAMR::reset)
+        .def("inject_pressure_nearest", &PyAcousticAMR::inject_pressure_nearest,
+             py::arg("xyz"), py::arg("value"))
+        .def("get_pressure", &PyAcousticAMR::get_pressure)
+        .def("get_velocity", &PyAcousticAMR::get_velocity)
+        .def_property_readonly("dt", &PyAcousticAMR::get_dt)
+        .def_property_readonly("step_count", &PyAcousticAMR::get_step_count)
+        .def_property_readonly("n_cells", [](const PyAcousticAMR& o){ return o.n_cells; })
+        .def_property_readonly("n_faces", [](const PyAcousticAMR& o){ return o.n_faces; });
+
     /* ── AcousticFDTD ──────────────────────────────────────────────────────── */
 
     py::class_<PyAcousticFDTD>(m, "AcousticFDTD",
@@ -2209,6 +2596,21 @@ force_scale   : float — deprecated compatibility parameter; physical coupling 
              py::arg("sample_rate"),
              py::arg("modal_stride") = 16,
              py::arg("force_scale")  = 1.0f)
+        .def_static("from_amr_desc",
+             &PyAcousticCoEvolver::from_amr_desc,
+             py::arg("amr_desc"),
+             py::arg("string_defs"),
+             py::arg("pickup_defs"),
+             py::arg("mic_defs"),
+             py::arg("sample_rate"),
+             py::arg("modal_stride") = 16,
+             R"doc(
+Create an AcousticCoEvolver backed by an AMR FDTD pressure domain.
+
+amr_desc is the dict returned by ``build_amr_coevolver_descriptor()`` from
+acoustic_amr.py.  string/pickup/mic_defs use the same schema as the
+uniform constructor.  GIL is released during the C++ allocation.
+)doc")
         .def("step", &PyAcousticCoEvolver::step,
              py::arg("n_samples") = 1,
              "Advance the co-evolver by n_samples audio samples. GIL is released during C++ work.")
@@ -2237,10 +2639,13 @@ np.ndarray, float32, shape (n_samples,) — mic 0 output for this block.
 )doc")
         .def("pluck_string", &PyAcousticCoEvolver::pluck_string,
              py::arg("string_idx"), py::arg("position_norm"), py::arg("amplitude"),
-             "Excite a string with a raised-cosine pluck at position_norm (0=nut, 1=saddle).")
+             py::arg("n_duration_samples") = 0,
+             "Excite a string with a raised-cosine pluck at position_norm (0=nut, 1=saddle). "
+             "n_duration_samples controls the draw length (0 = default ~20 ms).")
         .def("schedule_pluck", &PyAcousticCoEvolver::schedule_pluck,
              py::arg("onset_sample"), py::arg("string_idx"),
              py::arg("position_norm"), py::arg("amplitude"),
+             py::arg("n_duration_samples") = 0,
              "Pre-register a pluck for the next step_async call; onset_sample is relative to "
              "the start of that call.  Calls must be in non-decreasing onset order.")
         .def("clear_pluck_schedule", &PyAcousticCoEvolver::clear_pluck_schedule,
@@ -2255,7 +2660,9 @@ np.ndarray, float32, shape (n_samples,) — mic 0 output for this block.
              py::arg("mic_idx"), py::arg("n_samples"),
              "Return the last n_samples from mic mic_idx as float32 array.")
         .def("get_pressure_field", &PyAcousticCoEvolver::get_pressure_field,
-             "Return full 3-D pressure field, float32 shape (Nx,Ny,Nz).")
+             "AMR: float32 (n_cells,). FDTD: float32 (Nx,Ny,Nz).")
+        .def("get_amr_cell_centers", &PyAcousticCoEvolver::get_amr_cell_centers,
+             "Return AMR cell centres as float32 (n_cells,3). Raises if not AMR.")
         .def("get_plate_displacement", &PyAcousticCoEvolver::get_plate_displacement,
              "Return 2-D plate displacement w(x,y), float32 shape (Nx,Ny).")
         .def("get_modal_amplitudes", &PyAcousticCoEvolver::get_modal_amplitudes,

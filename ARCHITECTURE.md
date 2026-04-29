@@ -11,6 +11,53 @@ graph.  The solver does not care which level a node belongs to.
 
 ---
 
+## Microphone High-Band Ray Transfer
+
+The microphone path is split by frequency:
+
+- Low and low-mid response stays in the coupled string/plate/acoustic FDTD
+  path. The co-evolver samples microphone pressure and particle velocity from
+  the live FDTD field, so body modes, plate motion, cavity pressure, and
+  near-field phase remain wave-domain.
+- Upper-frequency response can be added through
+  `ray_tracer_bridge.solve_highband_mic_transfer()`. This builds microphone
+  receivers from co-evolver-style mic definitions, solves a coherent acoustic
+  transfer matrix with the C `FieldSolver`, then applies a smooth high-pass
+  crossover around the requested crossover frequency.
+
+This is the mic-specific bidirectional transport layer. The current estimator
+traces source subpaths through the triangulated guitar/room geometry and
+connects every bounce to each microphone sample with an occlusion-tested
+shadow ray. The microphone is therefore an active receiver in the transport
+solve: its position, axis, polar pattern, and aperture radius determine which
+upper-frequency paths contribute.
+
+The exact ray-mic polar presets match the co-evolver first-order mic mixes:
+
+- omni: `polar_a=1.0`, `polar_b=0.0`
+- cardioid: `polar_a=0.5`, `polar_b=0.5`
+- figure-8: `polar_a=0.0`, `polar_b=1.0`
+- hypercardioid: `polar_a=0.25`, `polar_b=0.75`
+
+Arbitrary pressure/velocity mixes are rejected at the bridge layer until the C
+receiver model accepts explicit `(polar_a, polar_b)` coefficients. Aperture
+mics use the solver's sampled disc receiver, which gives spatial averaging and
+natural high-frequency aperture rolloff.
+
+The intended audio composition is:
+
+1. Run the normal co-evolver and keep its microphone output as the baseline.
+2. Solve `H_high[source, mic, band]` with `solve_highband_mic_transfer()`.
+3. Apply the transfer to source/plate high-band driver signals with
+   `apply_mic_transfer_frequency_domain()`.
+4. Add the calibrated high-band ray result to the FDTD microphone output.
+
+Pickup transport is intentionally separate: magnetic and piezo pickups are not
+ordinary acoustic microphones and need receiver kernels tied to string velocity
+or saddle force rather than acoustic pressure rays.
+
+---
+
 ## Materializer Pattern
 
 Every analytic object, regardless of type, is wrapped identically:

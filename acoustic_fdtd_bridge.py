@@ -57,6 +57,23 @@ from typing import Optional, Tuple
 
 import numpy as np
 
+from acoustic_amr import (
+    AcousticAMRGrid,
+    build_guitar_amr_grid,
+    build_amr_coevolver_descriptor,
+    BorderConditionSpec,
+    border_anechoic,
+)
+
+try:
+    from ray_tracer_bridge import (
+        solve_highband_mic_transfer as _solve_highband,
+        apply_mic_transfer_frequency_domain as _apply_highband,
+    )
+    _HAS_HIGHBAND = True
+except ImportError:
+    _HAS_HIGHBAND = False
+
 try:
     from _spectral_kernels import AcousticFDTD as _CAcousticFDTD
     _HAS_FDTD = True
@@ -79,6 +96,148 @@ FDTD_PML   = np.uint8(3)
 
 
 # ---------------------------------------------------------------------------
+# F: Aperture-averaged microphone sampler
+# ---------------------------------------------------------------------------
+
+def _aperture_ring_positions(
+    center: np.ndarray,
+    axis:   np.ndarray,
+    aperture_r: float,
+    n: int,
+) -> list[np.ndarray]:
+    """Return N positions on a disc of radius aperture_r centred at center, perpendicular to axis."""
+    ax = np.asarray(axis, dtype=np.float64)
+    ax = ax / max(float(np.linalg.norm(ax)), 1e-12)
+    ref = np.array([1.0, 0.0, 0.0]) if abs(ax[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    u = np.cross(ax, ref);  u /= max(float(np.linalg.norm(u)), 1e-12)
+    v = np.cross(ax, u)
+    return [
+        (np.asarray(center, dtype=np.float32)
+         + float(aperture_r) * (math.cos(2 * math.pi * k / n) * u
+                                + math.sin(2 * math.pi * k / n) * v).astype(np.float32))
+        for k in range(n)
+    ]
+
+
+class ApertureAveragedMicSampler:
+    """Average a centre mic + ring of mics into one output block.
+
+    Registered as info['aperture_mic'] by build_acoustic_coevolver_from_scene.
+    Usage::
+
+        mic_out = aperture_mic.get_output(co, n_samples)
+    """
+
+    def __init__(self, center_idx: int, ring_indices: list[int]) -> None:
+        self._center = center_idx
+        self._ring   = ring_indices
+
+    def get_output(self, co, n_samples: int) -> np.ndarray:
+        """Return aperture-averaged mic signal (float32, length n_samples)."""
+        acc = co.get_mic_output(self._center, n_samples).astype(np.float64)
+        for i in self._ring:
+            acc += co.get_mic_output(i, n_samples)
+        return (acc / (1 + len(self._ring))).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# G: Float64 accumulation for long decays and reciprocity tests
+# ---------------------------------------------------------------------------
+
+class Float64MicAccumulator:
+    """Collects mic output blocks in float64 to prevent precision loss in long decays.
+
+    Usage::
+
+        acc = Float64MicAccumulator()
+        for block in ...:
+            co.step(...)
+            acc.push(co.get_mic_output(0, block_size))
+        signal = acc.get()   # float64 concatenated signal
+    """
+
+    def __init__(self) -> None:
+        self._chunks: list[np.ndarray] = []
+
+    def push(self, block) -> None:
+        self._chunks.append(np.asarray(block, dtype=np.float64))
+
+    def get(self) -> np.ndarray:
+        if not self._chunks:
+            return np.array([], dtype=np.float64)
+        return np.concatenate(self._chunks)
+
+    def reset(self) -> None:
+        self._chunks = []
+
+    def __len__(self) -> int:
+        return sum(c.size for c in self._chunks)
+
+
+# ---------------------------------------------------------------------------
+# 3: High-band mic transfer (ray path above crossover)
+# ---------------------------------------------------------------------------
+
+class HighbandMicPath:
+    """Precomputed high-frequency source-to-mic ray transfer.
+
+    Build once via build_acoustic_coevolver_from_scene (stored as
+    info['highband_mic']), then call apply() each block to get the
+    geometric high-band contribution to add to the FDTD mic output.
+
+    Usage::
+
+        highband = info.get('highband_mic')
+        if highband:
+            hb_out = highband.apply(string_drive_block)  # (1, n_samples) float32
+            mic_out = fdtd_mic_out + hb_out[0]
+    """
+
+    def __init__(
+        self,
+        H_high:       np.ndarray,   # (n_sources, n_mics, n_bands) complex128
+        freq_hz:      np.ndarray,   # (n_bands,) float64
+        crossover_hz: float,
+        sample_rate:  float,
+    ) -> None:
+        self.H_high       = np.asarray(H_high,  dtype=np.complex128)
+        self.freq_hz      = np.asarray(freq_hz, dtype=np.float64)
+        self.crossover_hz = float(crossover_hz)
+        self.sample_rate  = float(sample_rate)
+
+    def apply(self, source_signals, n_out: int | None = None) -> np.ndarray:
+        """Apply the high-band transfer to source signals.
+
+        Parameters
+        ----------
+        source_signals : (n_sources, n_samples) or (n_samples,) float32/64
+        n_out          : output length; defaults to input length
+
+        Returns
+        -------
+        (n_mics, n_out) float32 — add to FDTD mic output (same sign, same units)
+        """
+        x = np.asarray(source_signals)
+        if x.ndim == 1:
+            x = x[None, :]
+        n   = int(n_out or x.shape[1])
+        fft_n = max(n, x.shape[1])
+        bins  = np.fft.rfftfreq(fft_n, d=1.0 / self.sample_rate)
+        X     = np.fft.rfft(x, n=fft_n, axis=1)
+        n_mics = self.H_high.shape[1]
+        Y     = np.zeros((n_mics, len(bins)), dtype=np.complex128)
+        for si in range(self.H_high.shape[0]):
+            for mi in range(n_mics):
+                h_re = np.interp(bins, self.freq_hz, self.H_high[si, mi].real,
+                                 left=0.0, right=0.0)
+                h_im = np.interp(bins, self.freq_hz, self.H_high[si, mi].imag,
+                                 left=0.0, right=0.0)
+                Y[mi] += X[si] * (h_re + 1j * h_im)
+        y = np.fft.irfft(Y, n=fft_n, axis=1)[:, :n]
+        return y.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Guitar body voxeliser
 # ---------------------------------------------------------------------------
 
@@ -88,7 +247,13 @@ def voxelise_guitar_body(
     dx:              float = 0.008,
     pad_cells:       int   = 64,   # free-air + PML cells around body each side
     n_pml:           int   = 28,   # PML cells at grid edge (innermost pad_cells-n_pml are free air)
-) -> Tuple[np.ndarray, np.ndarray, dict]:
+    *,
+    amr_enabled: bool = False,
+    max_refinement_level: int = 3,
+    importance_policy: dict[str, int] | None = None,
+    balance_refinement: bool = True,
+    soundhole: tuple[float, float, float] | None = None,
+) -> Tuple[np.ndarray, np.ndarray, dict] | AcousticAMRGrid:
     """Voxelise the guitar outline into a 3-D FDTD cell-type grid.
 
     Returns
@@ -97,6 +262,19 @@ def voxelise_guitar_body(
     plate_active : (Nx, Ny)     uint8 array — 1 inside guitar outline
     info         : dict with grid dimensions and coordinate offsets
     """
+    if amr_enabled:
+        return build_guitar_amr_grid(
+            outline_pts,
+            body_h,
+            dx=dx,
+            pad_cells=pad_cells,
+            n_pml=n_pml,
+            soundhole=soundhole,
+            max_refinement_level=max_refinement_level,
+            importance_policy=importance_policy,
+            balance_refinement=balance_refinement,
+        )
+
     # Bounding box of the outline
     ox = outline_pts[:, 0]
     oy = outline_pts[:, 1]
@@ -166,6 +344,38 @@ def voxelise_guitar_body(
         'exterior_mask': exterior_mask,   # (Nx, Ny, Nz) bool — True outside guitar cavity
     }
     return cell_type, plate_active, info
+
+
+def voxelise_guitar_body_amr(
+    outline_pts: np.ndarray,
+    body_h: float,
+    dx: float = 0.008,
+    pad_cells: int = 64,
+    n_pml: int = 28,
+    *,
+    soundhole: tuple[float, float, float],
+    max_refinement_level: int = 3,
+    importance_policy: dict[str, int] | None = None,
+    balance_refinement: bool = True,
+) -> AcousticAMRGrid:
+    """Build the strict AMR pressure grid.
+
+    In AMR mode ``dx`` is the base/coarsest cell size. Unsupported geometry,
+    missing soundhole data, unstable refinement policy, or invalid topology
+    raises during construction; this function never falls back to the dense
+    uniform grid.
+    """
+    return build_guitar_amr_grid(
+        outline_pts,
+        body_h,
+        dx=dx,
+        pad_cells=pad_cells,
+        n_pml=n_pml,
+        soundhole=soundhole,
+        max_refinement_level=max_refinement_level,
+        importance_policy=importance_policy,
+        balance_refinement=balance_refinement,
+    )
 
 
 def _scene_soundhole(scene):
@@ -825,6 +1035,11 @@ def build_acoustic_coevolver_from_scene(
     scale_length_m: float = GUITAR_SCALE_LENGTH_M,
     fretless: bool = False,
     fret_number: int = 0,
+    max_refinement_level: int = 3,
+    border_spec: BorderConditionSpec | None = None,
+    mic_aperture_r: float = 0.012,
+    n_mic_ring:     int   = 8,
+    enable_highband: bool = True,
 ):
     """Build an AcousticCoEvolver from a CavityScene body geometry.
 
@@ -856,26 +1071,55 @@ def build_acoustic_coevolver_from_scene(
         return None, {}
 
     outline_pts, body_h, bridge_positions = _extract_guitar_geometry(scene)
+    soundhole = _scene_soundhole(scene)
 
-    cell_type, plate_active, info = voxelise_guitar_body(
-        outline_pts, body_h, dx=dx, pad_cells=pad_cells, n_pml=n_pml,
+    # ── AMR grid ──────────────────────────────────────────────────────────────
+    amr_grid = voxelise_guitar_body_amr(
+        outline_pts, body_h,
+        dx=dx, pad_cells=pad_cells, n_pml=n_pml,
+        soundhole=soundhole or (0.0, 0.0, 0.03),
+        max_refinement_level=max_refinement_level,
     )
-    _apply_soundhole_cutout(cell_type, plate_active, info, _scene_soundhole(scene))
-    Nx, Ny, Nz = info['Nx'], info['Ny'], info['Nz']
-    plate_iz   = info['plate_iz']
+    # Compute visualization grid dimensions (must match pybind from_amr_desc formula)
+    _viz_dx = max(float(amr_grid.min_dx) * 4.0, 0.005)
+    _bmin = amr_grid.bounds_min
+    _bmax = amr_grid.bounds_max
+    def _clamp256(v: int) -> int:
+        return max(1, min(v, 256))
+    _viz_Nx = _clamp256(round((_bmax[0] - _bmin[0]) / _viz_dx) + 1)
+    _viz_Ny = _clamp256(round((_bmax[1] - _bmin[1]) / _viz_dx) + 1)
+    _viz_Nz = _clamp256(round((_bmax[2] - _bmin[2]) / _viz_dx) + 1)
+
+    info = {
+        'n_cells':   amr_grid.n_cells,
+        'n_faces':   amr_grid.n_faces,
+        'bounds_min': _bmin.astype(np.float32),
+        'bounds_max': _bmax.astype(np.float32),
+        'min_dx':    float(amr_grid.min_dx),
+        # Visualization uniform grid — consumed by Renderer / GL 3-D texture.
+        # 'dx' must equal the viz grid spacing so that all renderer helpers
+        # (_soundhole_cutout, z-clip uniforms, plate_active_2d) use the same
+        # coordinate system as Nx/Ny/Nz.
+        'Nx': _viz_Nx,
+        'Ny': _viz_Ny,
+        'Nz': _viz_Nz,
+        'dx': _viz_dx,
+        'gx_min': float(_bmin[0]),
+        'gy_min': float(_bmin[1]),
+        'gz_min': float(_bmin[2]),
+    }
+
+    bridge_z = body_h
 
     # ── String descriptors ────────────────────────────────────────────────────
     # Spread n_strings bridge saddle positions across the body width.
-    # String paths run from nut (top of body) to saddle (bridge) in Y.
-    # y_saddle: end at the bridge position (matches scene source positions)
     if bridge_positions:
         y_saddle = float(np.mean([by for _, by in bridge_positions]))
     else:
         y_saddle = -0.070  # fallback: nominal bridge y
-    y_nut = y_saddle + float(scale_length_m)
-    x_span   = 0.0088 * max(0, n_strings - 1)   # ~8.8 mm per gap → 44 mm for 6 strings
-    string_z = body_h + 0.010            # strings sit above the soundboard
-    bridge_z = body_h                    # bridge force couples at the plate
+    y_nut    = y_saddle + float(scale_length_m)
+    x_span   = 0.0088 * max(0, n_strings - 1)
+    string_z = body_h + 0.010
 
     # Select string parameters: take evenly-spaced subset from _GUITAR_STRING_PARAMS
     param_indices = np.linspace(0, 5, n_strings, dtype=int)
@@ -934,56 +1178,97 @@ def build_acoustic_coevolver_from_scene(
     }]
 
     # ── Microphone: cardioid at soundhole (~75mm from top plate, aimed down) ─
-    mic_defs = [{
-        'pos':     np.array([0.0, 0.0, body_h + 0.075], dtype=np.float32),
-        'axis':    np.array([0.0, 0.0, -1.0], dtype=np.float32),
-        'polar_a': 0.5,
-        'polar_b': 0.5,
-        'gain':    1.0,
-    }]
+    _mic_center = np.array([0.0, 0.0, body_h + 0.075], dtype=np.float32)
+    _mic_axis   = np.array([0.0, 0.0, -1.0],           dtype=np.float32)
+    _mic_base   = {'axis': _mic_axis, 'polar_a': 0.5, 'polar_b': 0.5, 'gain': 1.0}
+    mic_defs = [{'pos': _mic_center, **_mic_base}]
 
-    # ── Body dict ─────────────────────────────────────────────────────────────
-    # Bridge saddle injection points: world-space XYZ at top-plate level.
+    # F: aperture disc — register N ring positions as additional mics
+    _aperture_sampler = None
+    if mic_aperture_r > 0 and n_mic_ring > 0:
+        _ring_pos = _aperture_ring_positions(_mic_center, _mic_axis, mic_aperture_r, n_mic_ring)
+        _ring_indices = list(range(1, 1 + len(_ring_pos)))
+        for rp in _ring_pos:
+            mic_defs.append({'pos': rp, **_mic_base})
+        _aperture_sampler = ApertureAveragedMicSampler(0, _ring_indices)
+
+    # ── Bridge saddle positions ───────────────────────────────────────────────
     bridge_xyz = np.array(
         [[bx, by, bridge_z] for bx, by in bridge_positions],
         dtype=np.float32,
     )
 
-    body_dict = {
-        'Nx':                 Nx,
-        'Ny':                 Ny,
-        'Nz':                 Nz,
-        'dx':                 dx,
-        'gx_min':             info['gx_min'],
-        'gy_min':             info['gy_min'],
-        'gz_min':             info['gz_min'],
-        'c':                  c,
-        'rho_air':            rho_air,
-        'cell_type':          cell_type.ravel().astype(np.uint8),
-        'plate_iz':           plate_iz,
-        'plate_active':       plate_active.ravel().astype(np.uint8),
-        'plate_mass_density': plate_mass,
-        'plate_stiffness_D':  plate_stiff,
-        'plate_alpha_M':      plate_alpha_M,
-        'plate_beta_K':       plate_beta_K,
-        'n_pml':              n_pml,
-        'bridge_src_xyz':     bridge_xyz,
-        'bridge_sigma':       0.012,
-    }
+    # ── Plate geometry: infer from grid bounding box + body_h ─────────────────
+    bmin = amr_grid.bounds_min
+    bmax = amr_grid.bounds_max
+    plate_origin = np.array([bmin[0], bmin[1], body_h], dtype=np.float32)
+    # Use the finest AMR cell size as the plate grid spacing.
+    plate_dx_   = float(amr_grid.min_dx)
+    plate_Nx_   = max(1, int(round((bmax[0] - bmin[0]) / plate_dx_)))
+    plate_Ny_   = max(1, int(round((bmax[1] - bmin[1]) / plate_dx_)))
 
-    co = _CAcousticCoEvolver(
+    if border_spec is None:
+        border_spec = border_anechoic(sigma_order=3.0)
+
+    amr_desc = build_amr_coevolver_descriptor(
+        grid               = amr_grid,
+        plate_Nx           = plate_Nx_,
+        plate_Ny           = plate_Ny_,
+        plate_dx           = plate_dx_,
+        plate_origin       = plate_origin,
+        body_h             = body_h,
+        plate_mass_density = plate_mass,
+        plate_stiffness_D  = plate_stiff,
+        plate_alpha_M      = plate_alpha_M,
+        plate_beta_K       = plate_beta_K,
+        bridge_src_xyz     = bridge_xyz,
+        bridge_sigma       = 0.012,
+        c                  = c,
+        rho_air            = rho_air,
+        border_spec        = border_spec,
+        n_pml              = n_pml,
+    )
+
+    co = _CAcousticCoEvolver.from_amr_desc(
+        amr_desc     = amr_desc,
         string_defs  = string_defs,
         pickup_defs  = pickup_defs,
         mic_defs     = mic_defs,
-        body         = body_dict,
         sample_rate  = float(sample_rate),
         modal_stride = modal_stride,
-        force_scale  = force_scale,
     )
 
-    # Cut-cell body boundary: compute sub-cell face fractions and apply.
-    vx_f, vy_f, vz_f = compute_cut_cell_fractions(
-        cell_type, plate_active, outline_pts, info)
-    co.set_face_fractions(vx_f, vy_f, vz_f)
+    # Upload AMR cell centres once; the renderer uses them to build a GPU TBO
+    # for fragment-shader IDW interpolation (no CPU scatter grid needed).
+    info['n_cells_amr']      = amr_grid.n_cells
+    info['amr_cell_centers'] = co.get_amr_cell_centers()  # float32 (n_cells, 3)
+    info['amr_min_dx']       = float(amr_grid.min_dx)
+
+    # F: aperture-averaged mic sampler
+    if _aperture_sampler is not None:
+        info['aperture_mic'] = _aperture_sampler
+
+    # 3: high-band mic path (ray geometric detail above crossover)
+    if enable_highband and _HAS_HIGHBAND and getattr(scene, 'sources', None):
+        try:
+            _hb_freq = np.geomspace(20.0, float(sample_rate) / 2.0, 32)
+            H_high, _hb_meta = _solve_highband(
+                scene,
+                mic_defs=[{
+                    'pos':     _mic_center,
+                    'axis':    _mic_axis,
+                    'polar_a': 0.5,
+                    'polar_b': 0.5,
+                    'aperture_r': float(mic_aperture_r) if mic_aperture_r > 0 else 0.012,
+                }],
+                crossover_hz=1500.0,
+                freq_hz=_hb_freq,
+            )
+            info['highband_mic'] = HighbandMicPath(
+                H_high, _hb_meta['freq_hz'], 1500.0, sample_rate)
+        except Exception as _hb_exc:
+            import traceback as _tb
+            print(f"[highband] build failed: {_hb_exc}", flush=True)
+            _tb.print_exc()
 
     return co, info

@@ -1147,6 +1147,264 @@ def make_em_receiver(pos, axis, pol_s, pol_p) -> dict:
     }
 
 
+def _normalised_vec3(v, *, name: str = "vector") -> np.ndarray:
+    arr = np.asarray(v, dtype=np.float64).reshape(3)
+    nm = float(np.linalg.norm(arr))
+    if nm > 1e-9:
+        return arr / nm
+    raise ValueError(f"{name} must be a non-zero 3-vector")
+
+
+def _mic_pattern_to_receiver_type(pattern: str, aperture_r: float) -> int:
+    p = str(pattern or "cardioid").strip().lower().replace("-", "_")
+    if aperture_r > 0.0:
+        return RTS_APERTURE
+    if p in ("omni", "omnidirectional"):
+        return RTS_OMNI
+    if p in ("cardioid", "cardioid_pressure_velocity"):
+        return RTS_CARDIOID
+    if p in ("figure8", "figure_8", "bidirectional"):
+        return RTS_FIGURE8
+    if p in ("hypercardioid", "hyper"):
+        return RTS_HYPERCARDIOID
+    raise ValueError(
+        "Unsupported mic pattern "
+        f"{pattern!r}; expected omni, cardioid, figure8, hypercardioid, or aperture"
+    )
+
+
+def mic_pattern_from_pressure_velocity(polar_a: float, polar_b: float) -> str:
+    """Map a pressure/velocity mic mix to the nearest ray-solver pattern.
+
+    The co-evolver mic model stores first-order microphone response as
+    ``polar_a * P + polar_b * rho*c*v_n``.  The ray solver has named polar
+    patterns, so this helper accepts only the exact presets we can represent
+    without inventing a response that the C solver cannot honour.
+    """
+    a = float(polar_a)
+    b = float(polar_b)
+    if abs(a - 1.0) < 1e-6 and abs(b) < 1e-6:
+        return "omni"
+    if abs(a - 0.5) < 1e-6 and abs(b - 0.5) < 1e-6:
+        return "cardioid"
+    if abs(a) < 1e-6 and abs(b - 1.0) < 1e-6:
+        return "figure8"
+    if abs(a - 0.25) < 1e-6 and abs(b - 0.75) < 1e-6:
+        return "hypercardioid"
+    raise ValueError(
+        "Mic polar mix cannot be represented exactly by the ray solver: "
+        f"polar_a={a}, polar_b={b}. Use one of omni (1,0), cardioid (0.5,0.5), "
+        "figure8 (0,1), or hypercardioid (0.25,0.75)."
+    )
+
+
+def make_microphone_receiver(
+        mic_def: dict | None = None,
+        *,
+        pos=None,
+        axis=None,
+        pattern: str | None = None,
+        aperture_r: float = 0.0,
+) -> dict:
+    """Build a receiver dict for the high-frequency microphone ray path.
+
+    This is the microphone-side half of the bidirectional high-band plan:
+    the receiver has an orientation, polar pattern, and optional aperture
+    radius, and ``solve_highband_mic_transfer`` connects source ray subpaths
+    to this receiver coherently with shadow rays.
+
+    ``mic_def`` may be a co-evolver mic descriptor with ``pos``, ``axis``,
+    ``polar_a`` and ``polar_b``.  Exact co-evolver presets map to the matching
+    ray-solver pattern.  Required fields are not defaulted: malformed mic
+    descriptors fail immediately.
+    """
+    if mic_def is not None:
+        if pos is None:
+            if "pos" not in mic_def:
+                raise ValueError("mic_def must contain 'pos'")
+            pos = mic_def["pos"]
+        if axis is None:
+            if "axis" not in mic_def:
+                raise ValueError("mic_def must contain 'axis'")
+            axis = mic_def["axis"]
+        if pattern is None:
+            if "polar_a" not in mic_def or "polar_b" not in mic_def:
+                raise ValueError("mic_def must contain exact 'polar_a' and 'polar_b'")
+            pattern = mic_pattern_from_pressure_velocity(
+                float(mic_def["polar_a"]),
+                float(mic_def["polar_b"]),
+            )
+        if aperture_r == 0.0:
+            aperture_r = float(mic_def.get("aperture_r", 0.0))
+
+    if pos is None:
+        raise ValueError("make_microphone_receiver requires pos or mic_def['pos']")
+    if axis is None:
+        raise ValueError("make_microphone_receiver requires axis or mic_def['axis']")
+    if pattern is None:
+        raise ValueError("make_microphone_receiver requires pattern or mic_def polar coefficients")
+
+    rec = {
+        'pos':        np.asarray(pos, dtype=np.float64).reshape(3),
+        'axis':       _normalised_vec3(axis, name="microphone axis"),
+        'polar_type': _mic_pattern_to_receiver_type(pattern, float(aperture_r)),
+        'aperture_r': float(aperture_r),
+        'pol_s':      np.zeros(3, dtype=np.float64),
+        'pol_p':      np.zeros(3, dtype=np.float64),
+        'kind':       'microphone',
+        'pattern':    str(pattern),
+    }
+    return rec
+
+
+def _highband_weight(freq_hz: np.ndarray, crossover_hz: float, order: int = 4) -> np.ndarray:
+    f = np.asarray(freq_hz, dtype=np.float64)
+    fc = max(float(crossover_hz), 1e-9)
+    p = max(1, int(order))
+    r = (np.maximum(f, 0.0) / fc) ** p
+    return r / (1.0 + r)
+
+
+def solve_highband_mic_transfer(
+        scene,
+        mic_defs:       list[dict] | None = None,
+        receivers:      list[dict] | None = None,
+        *,
+        n_rays:         int   = 2048,
+        max_bounces:    int   = 10,
+        n_bands:        int   = 16,
+        min_amplitude:  float = 0.0005,
+        speed_m_s:      float = 343.0,
+        seed:           int   = 42,
+        crossover_hz:   float = 1500.0,
+        crossover_order:int   = 4,
+        aperture_r:     float = 0.012,
+        freq_hz:        np.ndarray | None = None,
+) -> tuple[np.ndarray, dict]:
+    """Solve the upper-frequency microphone transfer matrix.
+
+    This function intentionally targets the mic path, not pickups.  Low and
+    low-mid pressure still come from the co-evolved FDTD microphone.  Above
+    ``crossover_hz``, this ray transfer adds source-to-mic geometric detail:
+    source directivity, specular/diffuse bounces, occlusion, per-band phase,
+    atmospheric loss, microphone polar response, and aperture averaging.
+
+    Implementation note: the current C ``FieldSolver`` uses a bidirectional
+    estimator in the practical acoustic-rendering sense: source subpaths are
+    traced through the scene, and every bounce is coherently connected to each
+    microphone sample by an occlusion-tested shadow ray.  That gives the mic
+    its own directional/area acceptance instead of treating it as a passive
+    afterthought of source broadcasting.
+
+    Returns
+    -------
+    H_high : complex128 ndarray, shape (n_sources, n_mics, n_bands)
+        High-pass-weighted transfer.  Multiply/convolve source spectra through
+        this and add it to the low-band FDTD mic signal.
+    meta : dict
+        Includes ``freq_hz``, ``highband_weight`` and the receiver descriptors.
+    """
+    if receivers is None:
+        mic_defs = list(mic_defs or [])
+        if not mic_defs:
+            raise ValueError("solve_highband_mic_transfer requires mic_defs or receivers")
+        receivers = [
+            make_microphone_receiver(m, aperture_r=float(m.get("aperture_r", aperture_r)))
+            for m in mic_defs
+        ]
+    else:
+        receivers = list(receivers)
+
+    sources = getattr(scene, 'sources', None)
+    if not sources:
+        raise ValueError(
+            "solve_highband_mic_transfer requires explicit scene.sources; "
+            "implicit centroid sources are not valid for the mic high-band path"
+        )
+    if not receivers:
+        raise ValueError("solve_highband_mic_transfer requires at least one microphone receiver")
+
+    H, meta = solve_transfer_matrix(
+        scene,
+        receivers=receivers,
+        mode='acoustic',
+        n_rays=n_rays,
+        max_bounces=max_bounces,
+        n_bands=n_bands,
+        min_amplitude=min_amplitude,
+        speed_m_s=speed_m_s,
+        seed=seed,
+        schroeder_hz=0.0,
+        freq_hz=freq_hz,
+    )
+
+    weight = _highband_weight(meta['freq_hz'], crossover_hz, crossover_order)
+    H_high = H * weight.reshape(1, 1, -1)
+    meta = dict(meta)
+    meta.update({
+        'path':              'mic_highband_bidirectional',
+        'crossover_hz':      float(crossover_hz),
+        'crossover_order':   int(crossover_order),
+        'highband_weight':   weight.astype(np.float64),
+        'receivers':         receivers,
+        'estimator':         'source_subpaths_with_receiver_shadow_connections',
+    })
+    return H_high, meta
+
+
+def apply_mic_transfer_frequency_domain(
+        source_signals: np.ndarray,
+        H_mic:          np.ndarray,
+        freq_hz:        np.ndarray,
+        sample_rate:    float,
+        n_out:          int | None = None,
+) -> np.ndarray:
+    """Apply a band-sampled mic transfer matrix to source signals.
+
+    ``H_mic`` is interpolated over FFT bins and summed across sources.  This is
+    meant for the high-band ray add-on; the returned signal can be added to the
+    co-evolver/FDTD mic output after level calibration.
+    """
+    x = np.asarray(source_signals)
+    if x.ndim == 1:
+        x = x[None, :]
+    if x.ndim != 2:
+        raise ValueError("source_signals must have shape (n_sources, n_samples)")
+
+    H = np.asarray(H_mic, dtype=np.complex128)
+    if H.ndim != 3:
+        raise ValueError("H_mic must have shape (n_sources, n_mics, n_bands)")
+    if H.shape[0] != x.shape[0]:
+        raise ValueError(
+            f"H_mic source count {H.shape[0]} does not match source_signals {x.shape[0]}"
+        )
+
+    n = int(n_out or x.shape[1])
+    fft_n = max(n, x.shape[1])
+    bins = np.fft.rfftfreq(fft_n, d=1.0 / float(sample_rate))
+    band_f = np.asarray(freq_hz, dtype=np.float64).reshape(-1)
+    if len(band_f) != H.shape[2]:
+        raise ValueError("freq_hz length must match H_mic band count")
+    if np.any(np.diff(band_f) <= 0.0):
+        raise ValueError("freq_hz must be strictly increasing")
+    if band_f[0] > bins[0] or band_f[-1] < bins[-1]:
+        raise ValueError(
+            "freq_hz must cover the full FFT range [0, Nyquist] for deterministic "
+            "mic transfer application; no extrapolation is performed"
+        )
+
+    X = np.fft.rfft(x, n=fft_n, axis=1)
+    Y = np.zeros((H.shape[1], len(bins)), dtype=np.complex128)
+    for si in range(H.shape[0]):
+        for mi in range(H.shape[1]):
+            h_re = np.interp(bins, band_f, H[si, mi].real)
+            h_im = np.interp(bins, band_f, H[si, mi].imag)
+            Y[mi] += X[si] * (h_re + 1j * h_im)
+
+    y = np.fft.irfft(Y, n=fft_n, axis=1)[:, :n]
+    return y.astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Integrators: bulk IR accumulation and image rendering
 # ---------------------------------------------------------------------------

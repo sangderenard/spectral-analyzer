@@ -130,6 +130,7 @@ try:
         glGetShaderiv, glGetProgramiv, glGetError,
         GL_WRITE_ONLY, GL_READ_WRITE, glBindBufferBase, glBindImageTexture, glClearTexImage,
         glDispatchCompute, glMemoryBarrier, glGetBufferSubData,
+        GL_TEXTURE_BUFFER, GL_RGBA32F, glTexBuffer,
     )
 except ImportError:
     print("PyOpenGL not available"); sys.exit(1)
@@ -270,6 +271,88 @@ RAY_BOUNCE_RGBA = np.array([
     [0.90, 0.10, 0.10, 0.50],
     [0.70, 0.20, 0.90, 0.40],
 ], dtype=np.float32)
+
+
+@dataclass(frozen=True)
+class SurfaceMaterialSpec:
+    color: tuple[float, float, float]
+    inner_color: tuple[float, float, float]
+    ambient: float
+    spec_strength: float
+    shininess: float
+    grain: float
+    opaque_alpha: float = 1.0
+    alpha_alpha: float = 0.42
+
+
+@dataclass(frozen=True)
+class PlateMaterialSpec:
+    opaque_alpha: float
+    alpha_alpha: float
+    color_mix: float
+
+
+_MAT_BACK = SurfaceMaterialSpec(
+    color=(0.16, 0.035, 0.018),
+    inner_color=(0.64, 0.38, 0.18),
+    ambient=0.24,
+    spec_strength=0.42,
+    shininess=96.0,
+    grain=0.25,
+    opaque_alpha=0.98,
+    alpha_alpha=0.48,
+)
+_MAT_SIDES = SurfaceMaterialSpec(
+    color=(0.18, 0.035, 0.018),
+    inner_color=(0.72, 0.44, 0.21),
+    ambient=0.22,
+    spec_strength=0.55,
+    shininess=128.0,
+    grain=0.65,
+    opaque_alpha=1.0,
+    alpha_alpha=0.36,
+)
+_MAT_STAGE = SurfaceMaterialSpec(
+    color=(0.46, 0.45, 0.42),
+    inner_color=(0.46, 0.45, 0.42),
+    ambient=0.22,
+    spec_strength=0.02,
+    shininess=12.0,
+    grain=0.08,
+    opaque_alpha=0.82,
+    alpha_alpha=0.44,
+)
+_MAT_NECK = SurfaceMaterialSpec(
+    color=(0.20, 0.085, 0.035),
+    inner_color=(0.50, 0.28, 0.12),
+    ambient=0.26,
+    spec_strength=0.36,
+    shininess=88.0,
+    grain=0.55,
+    opaque_alpha=0.95,
+    alpha_alpha=0.52,
+)
+_MAT_PLATE = PlateMaterialSpec(
+    opaque_alpha=1.0,
+    alpha_alpha=0.42,
+    color_mix=1.0,
+)
+
+
+def _layer_material_alpha(layer_mode: int, *, opaque_alpha: float, alpha_alpha: float) -> float:
+    if layer_mode == LAYER_HIDDEN:
+        return 0.0
+    if layer_mode == LAYER_OPAQUE:
+        return float(opaque_alpha)
+    return float(alpha_alpha)
+
+
+def _format_hud_time(samples: int, sample_rate: int = SAMPLE_RATE) -> str:
+    samples = max(0, int(samples))
+    seconds = samples / float(sample_rate)
+    minutes = int(seconds // 60.0)
+    rem = seconds - minutes * 60.0
+    return f"{minutes}:{rem:05.2f}"
 
 
 # ── Disk cache ────────────────────────────────────────────────────────────────
@@ -464,6 +547,19 @@ def _electroacoustic_fixtures(body_h: float, y_saddle: float = -0.070) -> tuple[
     return pickup, mic
 
 
+def _pip_grid_demo(X: np.ndarray, Y: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    inside = np.zeros(X.shape, dtype=bool)
+    j = len(poly) - 1
+    for i in range(len(poly)):
+        xi, yi = float(poly[i, 0]), float(poly[i, 1])
+        xj, yj = float(poly[j, 0]), float(poly[j, 1])
+        inside ^= ((yi > Y) != (yj > Y)) & (
+            X < (xj - xi) * (Y - yi) / (yj - yi + 1e-15) + xi
+        )
+        j = i
+    return inside
+
+
 def _soundhole_cutout(plate_active: np.ndarray, info: dict) -> np.ndarray:
     dx = float(info.get('dx', DX))
     xs = info['gx_min'] + np.arange(info['Nx']) * dx
@@ -514,13 +610,23 @@ def _build_physics(n_strings=6, *, dx=DX, pad_cells=PAD_CELLS, n_pml=N_PML,
     _, body_h, _ = _extract_guitar_geometry(scene)
     body_h = body_h or BODY_H
 
-    # Get plate_active for rendering mesh (re-voxelise with same params)
+    # Get plate_active for rendering mesh.
+    # Build it on the same grid as info (Nx×Ny at info['dx']) so that
+    # _soundhole_cutout's boolean indexing is always shape-safe.  This matters
+    # especially in AMR mode where 'dx' is _viz_dx, not the physics dx.
     outline_for_vox, _, _ = _extract_guitar_geometry(scene)
     if outline_for_vox is None or len(outline_for_vox) < 8:
         outline_for_vox = _guitar_outline()
 
-    _, plate_active, _ = voxelise_guitar_body(
-        outline_for_vox, body_h, dx=dx, pad_cells=pad_cells, n_pml=n_pml)
+    _pdx  = float(info.get('dx', DX))
+    _pNx  = int(info['Nx'])
+    _pNy  = int(info['Ny'])
+    _pxs  = info['gx_min'] + (np.arange(_pNx) + 0.5) * _pdx
+    _pys  = info['gy_min'] + (np.arange(_pNy) + 0.5) * _pdx
+    _pX, _pY = np.meshgrid(_pxs, _pys, indexing='ij')
+    plate_active = _pip_grid_demo(_pX, _pY,
+                                  np.asarray(outline_for_vox, dtype=np.float64)
+                                  ).astype(np.uint8)
     info['plate_active_2d'] = _soundhole_cutout(plate_active, info)
 
     return scene, ce, info, body_h
@@ -569,6 +675,7 @@ class Frame:
     strings:  List[np.ndarray] # [n_strings] each (N_RENDER_SEGS+1, 3) absolute positions
     mic:      Optional[np.ndarray] = None
     pickup:   Optional[np.ndarray] = None
+    frame_index: int = -1
 
 
 def physics_frame(ce, n_strings: int, n_render_segs: int = N_RENDER_SEGS) -> Frame:
@@ -1467,6 +1574,21 @@ uniform int        uUseBodyMask;
 // Use to restrict pressure to inside the guitar cavity, ray field to its box.
 uniform float      uZClipMin;
 uniform float      uZClipMax;
+// ── AMR TBO path (uAMRMode != 0) ─────────────────────────────────────────────
+// uAMRData packs (cx, cy, cz, pressure) per AMR cell as RGBA32F.
+// The shader computes inverse-distance-squared weighted pressure at each
+// ray-march sample point directly from the raw AMR data, giving full mesh
+// resolution where cells are fine and smooth interpolation where they are coarse.
+uniform samplerBuffer uAMRData;    // RGBA32F: (cx, cy, cz, pressure) per cell
+uniform int           uAMRNCells;  // number of AMR cells in the TBO
+uniform int           uAMRMode;    // 0 = use uPressure 3D texture; 1 = TBO IDW
+uniform float         uAMREps2;    // IDW denominator floor = (half_min_spacing)^2
+// uAMRHalfPow = p/2 where p is the IDW distance power.
+//   p=2 (default) → uAMRHalfPow=1.0  → w = 1/r²   (no sqrt, cheapest)
+//   p=3 (3-D natural) → uAMRHalfPow=1.5  → w = 1/r³
+//   p=4            → uAMRHalfPow=2.0  → w = 1/r⁴  (also sqrt-free)
+// Any float value works; the shader uses pow(r², -uAMRHalfPow).
+uniform float         uAMRHalfPow; // default 1.0
 
 vec3 diverge(float v) {
     float t = clamp(v * 0.5 + 0.5, 0.0, 1.0);
@@ -1484,6 +1606,27 @@ vec3 diverge(float v) {
 // ACES filmic tone mapping
 vec3 aces(vec3 x) {
     return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+}
+
+// Inverse-distance-squared IDW from raw AMR cell TBO.
+// Naturally tracks AMR resolution: fine-cell regions give high interpolation
+// precision; coarse-cell regions give smooth transitions.
+float sampleAMRPressure(vec3 pos) {
+    float sum_w = 0.0;
+    float sum_wp = 0.0;
+    for (int i = 0; i < uAMRNCells; i++) {
+        vec4 cell = texelFetch(uAMRData, i);  // (cx, cy, cz, pressure)
+        vec3 d = pos - cell.xyz;
+        float r2 = dot(d, d);
+        // w = r^(-p) = (r²)^(-p/2).  Using pow() keeps the formula exact for
+        // any p, including odd powers like p=3 (uAMRHalfPow=1.5), while even
+        // powers (p=2,4,6 → uAMRHalfPow=1,2,3) compile to multiply chains when
+        // the driver constant-folds the exponent.
+        float w = pow(max(r2, uAMREps2), -uAMRHalfPow);
+        sum_w  += w;
+        sum_wp += w * cell.w;
+    }
+    return (sum_w > 0.0) ? sum_wp / sum_w : 0.0;
 }
 
 void main() {
@@ -1561,7 +1704,9 @@ void main() {
             float sat = clamp(p * 3.5, 0.0, 1.0);
             spectral_color = mix(vec3(1.0), clamp(raw * WB, 0.0, 2.0), sat * 0.90);
         } else {
-            float raw = texture(uPressure, uvc).r;
+            float raw = (uAMRMode != 0)
+                        ? sampleAMRPressure(pos)
+                        : texture(uPressure, uvc).r;
             float v   = raw * uPressureScale;
             p = sign(v) * pow(clamp(abs(v), 0.0, 1.0), max(uPressureGamma, 0.05));
             // Interior cavity (ext≈0) → full diverge colormap.
@@ -2720,6 +2865,8 @@ class Renderer:
         self._baseline_light_total_rays = int(baseline_light_total_rays or 0)
         self._gpu_seg_vbo = gpu_seg_vbo
         self._gpu_seg_cap = int(gpu_seg_cap or 0)
+        self._ray_exposure = 1.0
+        self._ray_gamma = float(GPU_RAY_FIELD_GAMMA)
         self._ray_lighting: Optional[RayLightingState] = None   # set after init via set_ray_lighting()
         self._init_gl()
 
@@ -2920,6 +3067,58 @@ class Renderer:
                      (GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)]:
             glTexParameteri(GL_TEXTURE_3D, p, v)
         glBindTexture(GL_TEXTURE_3D, 0)
+        # AMR mode: also create a Texture Buffer Object for cell-centre IDW.
+        self._amr_tbo_buf = None
+        self._amr_tbo_tex = None
+        self._amr_n_cells = 0
+        self._amr_eps2    = 1e-6
+        self._amr_cell_data = None  # (n, 4) RGBA32F: (cx,cy,cz,pressure)
+        self._mk_amr_tbo()
+
+    def _mk_amr_tbo(self):
+        """Create a GL_TEXTURE_BUFFER holding (cx,cy,cz,pressure) per AMR cell.
+
+        Cell centres are uploaded once here (they never move).  Only the
+        pressure component (w) is updated each frame by _up_amr_pressure().
+        When info has no 'amr_cell_centers' key this is a no-op.
+        """
+        centers = self.info.get('amr_cell_centers', None)
+        n = int(self.info.get('n_cells_amr', 0))
+        if centers is None or n == 0:
+            return
+        centers_f32 = np.asarray(centers, np.float32).reshape(n, 3)
+        data = np.zeros((n, 4), dtype=np.float32)
+        data[:, :3] = centers_f32
+        self._amr_cell_data = data           # kept for per-frame pressure writes
+        self._amr_n_cells   = n
+        min_dx = float(self.info.get('amr_min_dx', self.info.get('min_dx', 0.005)))
+        self._amr_eps2      = float((min_dx * 0.5) ** 2)
+        # IDW distance power p.  p/2 is what the shader receives so it can use
+        # pow(r², -p/2) without a sqrt.  Default p=2 (classic IDW, cheapest).
+        # Set p=3 for the 3-D Shepard optimum; p=4 for sharper local detail.
+        p = float(self.info.get('amr_idw_power', 2.0))
+        self._amr_half_pow  = p * 0.5
+
+        self._amr_tbo_buf = glGenBuffers(1)
+        glBindBuffer(GL_TEXTURE_BUFFER, self._amr_tbo_buf)
+        glBufferData(GL_TEXTURE_BUFFER, data.nbytes, data, GL_DYNAMIC_DRAW)
+        glBindBuffer(GL_TEXTURE_BUFFER, 0)
+
+        self._amr_tbo_tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_BUFFER, self._amr_tbo_tex)
+        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, self._amr_tbo_buf)
+        glBindTexture(GL_TEXTURE_BUFFER, 0)
+
+    def _up_amr_pressure(self, P_flat):
+        """Write new per-cell pressures into the TBO (only the w component)."""
+        if self._amr_tbo_buf is None or self._amr_cell_data is None:
+            return
+        n = self._amr_n_cells
+        self._amr_cell_data[:n, 3] = np.asarray(P_flat[:n], np.float32)
+        glBindBuffer(GL_TEXTURE_BUFFER, self._amr_tbo_buf)
+        glBufferSubData(GL_TEXTURE_BUFFER, 0,
+                        self._amr_cell_data.nbytes, self._amr_cell_data)
+        glBindBuffer(GL_TEXTURE_BUFFER, 0)
 
     def _mk_exterior_mask_tex(self):
         """Upload the exterior_mask bool volume as a GL_R8 texture.
@@ -3009,11 +3208,19 @@ class Renderer:
 
     def _ray_scale_for_display(self) -> float:
         rays = max(1, int(self._ray_field_total_rays or GPU_RAY_FIELD_REFERENCE_RAYS))
-        return float(GPU_RAY_FIELD_SCALE) * (float(GPU_RAY_FIELD_REFERENCE_RAYS) / float(rays))
+        return (float(GPU_RAY_FIELD_SCALE)
+                * self._ray_exposure
+                * (float(GPU_RAY_FIELD_REFERENCE_RAYS) / float(rays)))
 
     def _baseline_scale_for_display(self) -> float:
         rays = max(1, int(self._baseline_light_total_rays or STAGE_LIGHT_RAYS))
-        return 1.8 * (float(STAGE_LIGHT_RAYS) / float(rays))
+        return 1.8 * self._ray_exposure * (float(STAGE_LIGHT_RAYS) / float(rays))
+
+    def set_ray_tonemap(self, *, exposure: float | None = None, gamma: float | None = None) -> None:
+        if exposure is not None:
+            self._ray_exposure = float(np.clip(exposure, 0.1, 8.0))
+        if gamma is not None:
+            self._ray_gamma = float(np.clip(gamma, 0.1, 2.5))
 
     def replace_ray_field(self, ray_field_bands, ray_field_bounds, gpu_seg_vbo, gpu_seg_cap, gpu_counter=None, total_rays=0):
         _ray_diag_update(
@@ -3090,9 +3297,15 @@ class Renderer:
         s = self._layers[i]
         return 0.0 if s == LAYER_HIDDEN else (1.0 if s == LAYER_OPAQUE else 0.40)
 
+    def current_frame(self) -> Optional[Frame]:
+        return self._cur()
+
     # ── Dynamic updates ───────────────────────────────────────────────────────
 
     def _up_pressure(self, P):
+        if self._amr_tbo_buf is not None and np.ndim(P) == 1:
+            self._up_amr_pressure(P)
+            return
         Nx, Ny, Nz = self.info['Nx'], self.info['Ny'], self.info['Nz']
         data = np.ascontiguousarray(P[:Nx,:Ny,:Nz], np.float32)
         glBindTexture(GL_TEXTURE_3D, self._tex)
@@ -3174,7 +3387,7 @@ class Renderer:
             )
         )
 
-        def _bind_body(prog, color4, inner3, ambient, spec_str, shininess, grain,
+        def _bind_body(prog, material: SurfaceMaterialSpec, alpha,
                        mvp_mat=MVP_guitar, mv_mat=MV_guitar, model_mat=None):
             """Bind a body-shader program with standard material uniforms.
             For _p_ray_surface also binds band textures."""
@@ -3183,12 +3396,13 @@ class Renderer:
             glUseProgram(prog)
             _mvp(prog, mvp_mat, mv_mat, model_mat)
             glUniform3f(glGetUniformLocation(prog, b'uLightV'), *light_v)
-            glUniform4f(glGetUniformLocation(prog, b'uColor'), *color4)
-            glUniform3f(glGetUniformLocation(prog, b'uInnerColor'), *inner3)
-            glUniform1f(glGetUniformLocation(prog, b'uAmbient'), ambient)
-            glUniform1f(glGetUniformLocation(prog, b'uSpecStrength'), spec_str)
-            glUniform1f(glGetUniformLocation(prog, b'uShininess'), shininess)
-            glUniform1f(glGetUniformLocation(prog, b'uGrain'), grain)
+            glUniform4f(glGetUniformLocation(prog, b'uColor'),
+                        material.color[0], material.color[1], material.color[2], alpha)
+            glUniform3f(glGetUniformLocation(prog, b'uInnerColor'), *material.inner_color)
+            glUniform1f(glGetUniformLocation(prog, b'uAmbient'), material.ambient)
+            glUniform1f(glGetUniformLocation(prog, b'uSpecStrength'), material.spec_strength)
+            glUniform1f(glGetUniformLocation(prog, b'uShininess'), material.shininess)
+            glUniform1f(glGetUniformLocation(prog, b'uGrain'), material.grain)
             if prog == self._p_ray_surface:
                 use_dyn = self._ray_field_bands is not None and len(self._ray_field_bands) >= 4
                 use_base = self._baseline_light_bands is not None and len(self._baseline_light_bands) >= 4
@@ -3206,7 +3420,7 @@ class Renderer:
                 glUniform1f(glGetUniformLocation(prog, b'uBaseExposure'),
                             self._baseline_scale_for_display())
                 glUniform1f(glGetUniformLocation(prog, b'uRayGamma'),
-                            GPU_RAY_FIELD_GAMMA)
+                            self._ray_gamma)
                 band_names = [b'uBand0', b'uBand1', b'uBand2', b'uBand3']
                 for bi, (bname, btex) in enumerate(zip(band_names, self._ray_field_bands or [])):
                     glUniform1i(glGetUniformLocation(prog, bname), 2 + bi)
@@ -3231,23 +3445,28 @@ class Renderer:
                 glActiveTexture(GL_TEXTURE0)
 
         _body_prog = self._p_ray_surface if _use_ray_surf else self._p_body
+        body_mode = self._layers[0]
+        body_back_alpha = _layer_material_alpha(
+            body_mode,
+            opaque_alpha=_MAT_BACK.opaque_alpha,
+            alpha_alpha=_MAT_BACK.alpha_alpha)
+        body_side_alpha = _layer_material_alpha(
+            body_mode,
+            opaque_alpha=_MAT_SIDES.opaque_alpha,
+            alpha_alpha=_MAT_SIDES.alpha_alpha)
 
         # ── 1. Back plate (opaque dark wood) ─────────────────────────────────
         a_body = self._a(0)
-        if a_body > 0:
-            _bind_body(_body_prog,
-                       (0.16, 0.035, 0.018, a_body * 0.96),
-                       (0.64, 0.38, 0.18), 0.24, 0.42, 96.0, 0.25)
+        if body_back_alpha > 0:
+            _bind_body(_body_prog, _MAT_BACK, body_back_alpha)
             glBindVertexArray(self._back_vao)
             glDrawArrays(GL_TRIANGLE_FAN, 0, self._back_n)
 
         # ── 2. Side walls (semi-transparent mahogany, both faces) ─────────────
-        if a_body > 0:
+        if body_side_alpha > 0:
             glDisable(GL_CULL_FACE)
-            glDepthMask(GL_FALSE)
-            _bind_body(_body_prog,
-                       (0.18, 0.035, 0.018, a_body * 0.72),
-                       (0.72, 0.44, 0.21), 0.22, 0.55, 128.0, 0.65)
+            glDepthMask(GL_FALSE if body_mode == LAYER_ALPHA else GL_TRUE)
+            _bind_body(_body_prog, _MAT_SIDES, body_side_alpha)
             glBindVertexArray(self._wall_vao)
             glDrawElements(GL_TRIANGLES, self._wall_n_idx, GL_UNSIGNED_INT, None)
             glBindVertexArray(0)
@@ -3289,7 +3508,7 @@ class Renderer:
             glUniform1f(glGetUniformLocation(self._p_march, b'uRayFieldScale'),
                         GPU_RAY_FIELD_SCALE)
             glUniform1f(glGetUniformLocation(self._p_march, b'uRayFieldGamma'),
-                        GPU_RAY_FIELD_GAMMA)
+                        self._ray_gamma)
             glUniform1f(glGetUniformLocation(self._p_march, b'uAlpha'), a_pres)
             glUniform1i(glGetUniformLocation(self._p_march, b'uLogScale'), 0)
             glUniform1i(glGetUniformLocation(self._p_march, b'uFieldMode'), 0)
@@ -3308,6 +3527,17 @@ class Renderer:
             Nz     = int(self.info['Nz'])
             glUniform1f(glGetUniformLocation(self._p_march, b'uZClipMin'), gz_min)
             glUniform1f(glGetUniformLocation(self._p_march, b'uZClipMax'), gz_min + Nz * dx_val)
+            # AMR TBO IDW path: bind cell data to unit 3 and set mode uniforms.
+            # Falls back to the legacy 3D uPressure texture when not in AMR mode.
+            _amr_mode = 1 if self._amr_tbo_tex is not None else 0
+            glUniform1i(glGetUniformLocation(self._p_march, b'uAMRMode'), _amr_mode)
+            if _amr_mode:
+                glUniform1i(glGetUniformLocation(self._p_march, b'uAMRNCells'), self._amr_n_cells)
+                glUniform1f(glGetUniformLocation(self._p_march, b'uAMREps2'),   self._amr_eps2)
+                glUniform1f(glGetUniformLocation(self._p_march, b'uAMRHalfPow'), self._amr_half_pow)
+                glUniform1i(glGetUniformLocation(self._p_march, b'uAMRData'),   3)
+            else:
+                glUniform1i(glGetUniformLocation(self._p_march, b'uAMRMode'), 0)
             glActiveTexture(GL_TEXTURE0)
             glBindTexture(GL_TEXTURE_3D, self._tex)
             glActiveTexture(GL_TEXTURE1)
@@ -3315,6 +3545,9 @@ class Renderer:
             glUniform1i(glGetUniformLocation(self._p_march, b'uExteriorMask'), 2)
             glActiveTexture(GL_TEXTURE2)
             glBindTexture(GL_TEXTURE_3D, self._ext_mask_tex)
+            if _amr_mode:
+                glActiveTexture(GL_TEXTURE3)
+                glBindTexture(GL_TEXTURE_BUFFER, self._amr_tbo_tex)
             glActiveTexture(GL_TEXTURE0)
             glBindVertexArray(self._quad_vao)
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4)
@@ -3323,6 +3556,9 @@ class Renderer:
             glBindTexture(GL_TEXTURE_2D, 0)
             glActiveTexture(GL_TEXTURE2)
             glBindTexture(GL_TEXTURE_3D, 0)
+            if _amr_mode:
+                glActiveTexture(GL_TEXTURE3)
+                glBindTexture(GL_TEXTURE_BUFFER, 0)
             glActiveTexture(GL_TEXTURE0)
             glEnable(GL_DEPTH_TEST)
             glDepthMask(GL_TRUE)
@@ -3332,8 +3568,8 @@ class Renderer:
         if a_stage > 0:
             glEnable(GL_CULL_FACE)
             _bind_body(_body_prog,
-                       (0.46, 0.45, 0.42, a_stage * 0.72),
-                       (0.46, 0.45, 0.42), 0.22, 0.02, 12.0, 0.08,
+                       _MAT_STAGE,
+                       a_stage * _MAT_STAGE.alpha_alpha,
                        mvp_mat=MVP, mv_mat=MV,
                        model_mat=np.eye(4, dtype=np.float32))
             glBindVertexArray(self._stage_vao)
@@ -3358,7 +3594,7 @@ class Renderer:
             glUniform1f(glGetUniformLocation(self._p_march, b'uPressureGamma'), 1.0)
             glUniform1f(glGetUniformLocation(self._p_march, b'uRayFieldScale'),
                         self._baseline_scale_for_display())
-            glUniform1f(glGetUniformLocation(self._p_march, b'uRayFieldGamma'), GPU_RAY_FIELD_GAMMA)
+            glUniform1f(glGetUniformLocation(self._p_march, b'uRayFieldGamma'), self._ray_gamma)
             glUniform1f(glGetUniformLocation(self._p_march, b'uAlpha'), 0.22)
             glUniform1i(glGetUniformLocation(self._p_march, b'uLogScale'), 1 if GPU_RAY_LOG_SCALE else 0)
             glUniform1i(glGetUniformLocation(self._p_march, b'uFieldMode'), 1)
@@ -3405,7 +3641,7 @@ class Renderer:
             glUniform1f(glGetUniformLocation(self._p_march, b'uRayFieldScale'),
                         self._ray_scale_for_display())
             glUniform1f(glGetUniformLocation(self._p_march, b'uRayFieldGamma'),
-                        GPU_RAY_FIELD_GAMMA)
+                        self._ray_gamma)
             glUniform1f(glGetUniformLocation(self._p_march, b'uAlpha'), 0.55)
             glUniform1i(glGetUniformLocation(self._p_march, b'uLogScale'),
                         1 if GPU_RAY_LOG_SCALE else 0)
@@ -3448,9 +3684,14 @@ class Renderer:
             _mvp(self._p_plate, MVP_guitar, MV_guitar)
             glUniform3f(glGetUniformLocation(self._p_plate, b'uLightV'),
                         *light_v)
-            glUniform1f(glGetUniformLocation(self._p_plate, b'uAlpha'), a_plate)
+            glUniform1f(
+                glGetUniformLocation(self._p_plate, b'uAlpha'),
+                _layer_material_alpha(
+                    self._layers[1],
+                    opaque_alpha=_MAT_PLATE.opaque_alpha,
+                    alpha_alpha=_MAT_PLATE.alpha_alpha))
             glUniform1f(glGetUniformLocation(self._p_plate, b'uColorMix'),
-                        1.0 if self._plate_mode in (0, 2) else 0.0)
+                        _MAT_PLATE.color_mix if self._plate_mode in (0, 2) else 0.0)
             glBindVertexArray(self._plate_vao)
             glDrawElements(GL_TRIANGLES, self._plate_n, GL_UNSIGNED_INT, None)
             glBindVertexArray(0)
@@ -3467,17 +3708,7 @@ class Renderer:
         # ── 7. Strings ────────────────────────────────────────────────────────
         a_str = self._a(3)
         if a_str > 0:
-            glUseProgram(self._p_body)
-            _mvp(self._p_body, MVP_guitar, MV_guitar)
-            glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
-            glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
-                        0.20, 0.085, 0.035, a_str * 0.95)
-            glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
-                        0.50, 0.28, 0.12)
-            glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.26)
-            glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.36)
-            glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 88.0)
-            glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.55)
+            _bind_body(self._p_body, _MAT_NECK, a_str * _MAT_NECK.opaque_alpha)
             glBindVertexArray(self._neck_vao)
             glDrawArrays(GL_TRIANGLES, 0, self._neck_n)
 
@@ -3585,6 +3816,8 @@ class _SliderPanel:
         ('segs',     'Str segs',     30,       240,    60, False, False),
         ('plate_th', 'Board res',    64,     1_024,   128, False, True ),
         ('dx',       'Press dx',  0.016,     0.004, 0.010, False, False),
+        ('ray_exposure', 'Exposure', 0.25,    6.0,    1.0, False, True ),
+        ('ray_gamma', 'Gamma',      0.20,    1.60, float(GPU_RAY_FIELD_GAMMA), False, True ),
         ('mic_gain', 'Mic',        0.0,       1.0,   1.0, False, True ),
         ('pickup_gain', 'Pickup',  0.0,       1.0,   1.0, False, True ),
     ]
@@ -3638,6 +3871,8 @@ class _SliderPanel:
         # Bake label textures: white text on black → brightness-as-alpha in shader
         pygame.font.init()
         font = pygame.font.SysFont("monospace", 13)
+        self._font = font
+        self._text_cache: dict[str, tuple[int, tuple[int, int]]] = {}
         self._ltex = []
         self._ldim = []
         for label_str in [d[1] for d in self._DEFS]:
@@ -3726,12 +3961,34 @@ class _SliderPanel:
         elif key == 'segs':     raw = int(np.clip(round(raw), 30, 240))
         elif key == 'plate_th': raw = int(np.clip(round(raw), 64, 1024))
         elif key == 'dx':       raw = float(np.clip(raw, 0.004, 0.016))
+        elif key == 'ray_exposure':
+            raw = float(np.clip(raw, 0.25, 6.0))
+        elif key == 'ray_gamma':
+            raw = float(np.clip(raw, 0.20, 1.60))
         elif key in ('mic_gain', 'pickup_gain'):
             raw = float(np.clip(raw, 0.0, 1.0))
         old = self.values[key]
         self.values[key] = raw
         if raw != old and not self._live[idx]:
             self._pend[key] = True
+
+    def _get_text_texture(self, text: str) -> tuple[int, tuple[int, int]]:
+        cached = self._text_cache.get(text)
+        if cached is not None:
+            return cached
+        surf = self._font.render(text, True, (255, 255, 255))
+        w, h = surf.get_size()
+        raw = pygame.image.tobytes(surf, "RGBA")
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        cached = (tex, (w, h))
+        self._text_cache[text] = cached
+        return cached
 
     # ── query helpers called by main() ────────────────────────────────────────
 
@@ -3759,6 +4016,9 @@ class _SliderPanel:
     def _draw_label(self, idx: int, x, y, rw, rh):
         tex = self._ltex[idx]
         tw, th = self._ldim[idx]
+        self._draw_textured(tex, tw, th, x, y, rw, rh)
+
+    def _draw_textured(self, tex: int, tw: int, th: int, x, y, rw, rh):
         v = np.array([
             x,    y,    0., 0.,
             x+tw, y,    1., 0.,
@@ -3775,6 +4035,42 @@ class _SliderPanel:
         glUniform1i(glGetUniformLocation(self._p_tex, b'uTex'), 0)
         glBindVertexArray(self._tvao)
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+
+    def draw_progress(self, win_w: int, win_h: int, *, recorded_samples: int,
+                      total_samples: int, replaying: bool, paused: bool,
+                      pending_rebuild: bool, cached_frames: int):
+        total_samples = max(1, int(total_samples))
+        recorded_samples = int(np.clip(recorded_samples, 0, total_samples))
+        frac = recorded_samples / float(total_samples)
+        remaining = max(0, total_samples - recorded_samples)
+        if pending_rebuild:
+            state = "BUILD"
+        elif replaying:
+            state = "REPLAY"
+        elif paused:
+            state = "PAUSE"
+        else:
+            state = "REC"
+        text = (
+            f"{state} {_format_hud_time(recorded_samples)} / {_format_hud_time(total_samples)}"
+            f"  left {_format_hud_time(remaining)}  cache {cached_frames:03d}"
+        )
+        tex, (tw, th) = self._get_text_texture(text)
+        pad = 10
+        panel_w = max(240, tw + pad * 2)
+        panel_h = th + 18
+        x = win_w - panel_w - 14
+        y = win_h - panel_h - 14
+        bar_x = x + pad
+        bar_y = y + 5
+        bar_w = panel_w - pad * 2
+        fill_w = int(round(bar_w * frac))
+        accent = (0.28, 0.82, 0.62, 0.95) if not pending_rebuild else self._C_PEND
+        self._draw_quad(x, y, panel_w, panel_h, (0.03, 0.03, 0.06, 0.74), win_w, win_h)
+        self._draw_quad(bar_x, bar_y, bar_w, 4, self._C_TRACK, win_w, win_h)
+        if fill_w > 0:
+            self._draw_quad(bar_x, bar_y, fill_w, 4, accent, win_w, win_h)
+        self._draw_textured(tex, tw, th, x + pad, y + 10, win_w, win_h)
 
     def draw(self, win_w: int, win_h: int):
         glDisable(GL_DEPTH_TEST)
@@ -4194,9 +4490,14 @@ def main():
     panel.values['segs']     = int(args.render_segs)
     panel.values['plate_th'] = int(args.plate_theta)
     panel.values['dx']       = float(args.dx)
+    panel.values['ray_exposure'] = 1.0
+    panel.values['ray_gamma'] = float(GPU_RAY_FIELD_GAMMA)
     panel.values['mic_gain'] = 1.0 if args.mic else 0.0
     panel.values['pickup_gain'] = 1.0 if args.pickup else 0.0
     panel._prev = dict(panel.values)
+    R.set_ray_tonemap(
+        exposure=float(panel.values['ray_exposure']),
+        gamma=float(panel.values['ray_gamma']))
 
     print(f"Physics worker is streaming frames ({physics.mode}); "
           "UI will keep cached frames while rebuilds run.", flush=True)
@@ -4207,6 +4508,7 @@ def main():
     clock       = pygame.time.Clock()
     running     = True
     fi          = 0
+    recorded_samples = 0
     replaying   = False
     dragging    = False
     last_mouse  = (0, 0)
@@ -4214,6 +4516,8 @@ def main():
     refresh_rays = int(args.gpu_refresh_rays or args.gpu_field_rays)
     force_ray_refresh = False
     pending_rebuild = False
+    active_ray_frame_index = None
+    last_displayed_frame_index = None
     equilibrium_report_every = max(0, int(args.equilibrium_report_every))
     rest_stats0 = None
     capture = None
@@ -4222,6 +4526,46 @@ def main():
 
     print("1-7 toggle layers | P plate mode | SPACE pause | R restart | "
           f"Q quit | drag=orbit wheel=zoom | excitation={args.excitation}", flush=True)
+
+    def _refresh_ray_field_from_frame(frame: Frame | None, frame_index: int, reason: str) -> bool:
+        nonlocal active_ray_frame_index, force_ray_refresh
+        if frame is None or scene is None or not args.gpu_rays or refresh_every <= 0:
+            return False
+        if frame_index < 0:
+            return False
+        if not force_ray_refresh and (frame_index % refresh_every) != 0:
+            return False
+        dyn_sources = _instant_soundboard_sources(
+            frame.plate, info['plate_active_2d'], outline, body_h,
+            total_rays=refresh_rays, stride=4)
+        dyn_sources += _string_emission_sources(
+            paths, body_h,
+            total_rays_per_string=max(64, refresh_rays // max(1, n_str) // 16),
+            active_strings=active_strings)
+        if not dyn_sources:
+            force_ray_refresh = False
+            return False
+        print(f"Refreshing GPU ray field from cached frame {frame_index} [{reason}] "
+              f"({sum(s[2] for s in dyn_sources)} rays)", flush=True)
+        try:
+            rbands, rb0, rb1, rvbo, rcap, rcounter, dyn_total_rays = _gpu_ray_field(
+                scene, outline, body_h,
+                sources=dyn_sources,
+                max_bounces=args.max_bounces,
+                segment_cap=args.gpu_segment_cap,
+                dispatch_batch=args.gpu_dispatch_batch)
+        except BaseException as exc:
+            _report_exception(f"dynamic GPU ray field frame {frame_index}", exc)
+            raise
+        try:
+            R.replace_ray_field(rbands, (rb0, rb1), rvbo, rcap, rcounter,
+                                total_rays=dyn_total_rays)
+        except BaseException as exc:
+            _report_exception(f"dynamic GPU ray field replace frame {frame_index}", exc)
+            raise
+        active_ray_frame_index = frame_index
+        force_ray_refresh = False
+        return True
 
     try:
       while running:
@@ -4248,9 +4592,12 @@ def main():
                     else:
                         physics.send({"type": "restart"})
                     R._frames.clear(); R._cursor = 0; fi = 0
+                    recorded_samples = 0
                     for env in R._str_env: env[:] = 0.0
                     replaying = False
                     force_ray_refresh = refresh_every > 0
+                    active_ray_frame_index = None
+                    last_displayed_frame_index = None
                     print("Restart requested")
                 elif ev.key == K_p:
                     print(f"Plate mode: {R.cycle_plate_mode()}")
@@ -4300,6 +4647,9 @@ def main():
                 replaying = False
                 rest_stats0 = None
                 fi = 0
+                recorded_samples = 0
+                active_ray_frame_index = None
+                last_displayed_frame_index = None
                 print(f"  Worker ready: Grid {info['Nx']}×{info['Ny']}×{info['Nz']}",
                       flush=True)
                 continue
@@ -4307,14 +4657,19 @@ def main():
                 if not replaying:
                     R._cursor = 0
                     replaying = True
+                    recorded_samples = total
+                    active_ray_frame_index = None
+                    last_displayed_frame_index = None
                     print(f"Cached {len(R._frames)} frames for repeatable replay", flush=True)
                 continue
             if mtype != "frame":
                 continue
             frame = msg["frame"]
             fi = int(msg.get("index", fi))
+            frame.frame_index = fi
             _record_diag(frame, fi)
             R.push(frame)
+            recorded_samples = min(total, max(recorded_samples, (fi + 1) * BLOCK_SAMPLES))
             if args.excitation == "rest":
                 stats = _frame_equilibrium_stats(frame)
                 if rest_stats0 is None:
@@ -4338,33 +4693,7 @@ def main():
             if scene is not None and args.gpu_rays and refresh_every > 0:
                 do_refresh = force_ray_refresh or (fi % refresh_every == 0)
                 if do_refresh:
-                    dyn_sources = _instant_soundboard_sources(
-                        frame.plate, info['plate_active_2d'], outline, body_h,
-                        total_rays=refresh_rays, stride=4)
-                    dyn_sources += _string_emission_sources(
-                        paths, body_h,
-                        total_rays_per_string=max(64, refresh_rays // max(1, n_str) // 16),
-                        active_strings=active_strings)
-                    if dyn_sources:
-                        print(f"Refreshing GPU ray field from frame {fi} "
-                              f"({sum(s[2] for s in dyn_sources)} rays)", flush=True)
-                        try:
-                            rbands, rb0, rb1, rvbo, rcap, rcounter, dyn_total_rays = _gpu_ray_field(
-                                scene, outline, body_h,
-                                sources=dyn_sources,
-                                max_bounces=args.max_bounces,
-                                segment_cap=args.gpu_segment_cap,
-                                dispatch_batch=args.gpu_dispatch_batch)
-                        except BaseException as exc:
-                            _report_exception(f"dynamic GPU ray field frame {fi}", exc)
-                            raise
-                        try:
-                            R.replace_ray_field(rbands, (rb0, rb1), rvbo, rcap, rcounter,
-                                                total_rays=dyn_total_rays)
-                        except BaseException as exc:
-                            _report_exception(f"dynamic GPU ray field replace frame {fi}", exc)
-                            raise
-                    force_ray_refresh = False
+                    _refresh_ray_field_from_frame(frame, fi, "stream")
             fi += 1
 
         # ── Apply live slider changes ──────────────────────────────────────────
@@ -4376,6 +4705,10 @@ def main():
         if 'plate_th' in changed:
             R.rebuild_plate(int(panel.values['plate_th']), R._plate_radial)
             panel.mark_applied('plate_th')
+        if 'ray_exposure' in changed or 'ray_gamma' in changed:
+            R.set_ray_tonemap(
+                exposure=float(panel.values['ray_exposure']),
+                gamma=float(panel.values['ray_gamma']))
         if 'mic_gain' in changed:
             R.show_mic = panel.values['mic_gain'] > 0.0
         if 'pickup_gain' in changed:
@@ -4392,8 +4725,31 @@ def main():
                 cached_frames=int(len(R._frames)),
             )
             R.tick()
+            cur_frame = R.current_frame()
+            cur_frame_index = int(getattr(cur_frame, 'frame_index', -1)) if cur_frame is not None else -1
+            if (replaying or R._paused) and cur_frame_index != last_displayed_frame_index:
+                target_ray_frame_index = cur_frame_index
+                if target_ray_frame_index >= 0 and refresh_every > 0:
+                    target_ray_frame_index = (target_ray_frame_index // refresh_every) * refresh_every
+                if target_ray_frame_index != active_ray_frame_index:
+                    refresh_frame = cur_frame
+                    if target_ray_frame_index != cur_frame_index:
+                        refresh_frame = next(
+                            (cached for cached in reversed(R._frames)
+                             if int(getattr(cached, 'frame_index', -1)) == target_ray_frame_index),
+                            None)
+                    _refresh_ray_field_from_frame(refresh_frame, target_ray_frame_index, "replay")
+                last_displayed_frame_index = cur_frame_index
             R.render()
             panel.draw(WIN_W, WIN_H)
+            panel.draw_progress(
+                WIN_W, WIN_H,
+                recorded_samples=max(recorded_samples, min(total, len(R._frames) * BLOCK_SAMPLES)),
+                total_samples=total,
+                replaying=replaying,
+                paused=R._paused,
+                pending_rebuild=pending_rebuild,
+                cached_frames=len(R._frames))
             pygame.display.flip()
         except BaseException as exc:
             _report_exception(f"render frame {fi}", exc)

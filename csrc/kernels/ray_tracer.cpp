@@ -316,6 +316,7 @@ struct RayTracerState {
     std::vector<Triangle> tris;
     std::vector<BVHNode>  bvh_nodes;
     std::vector<int>      bvh_tri_ids;
+    std::vector<double>   tri_areas;   /* area of each triangle (m²) */
     int                   n_bands = 0;
     Eigen::VectorXd       k_real;      /* 2π f_n / c  (wavenumber) */
     Eigen::VectorXd       atmo_abs;    /* Np/m per band */
@@ -447,6 +448,134 @@ static void trace_rays(
     }
 }
 
+/* ── Extended inner ray loop (v2) ──────────────────────────────────────────── */
+
+/* Like trace_rays but passes hit_tri, incoming_dir, surface_normal, and the
+ * full per-band amplitude vector (AFTER propagation, BEFORE reflection) to the
+ * callback.  This allows callers to accumulate per-triangle irradiance.
+ *
+ * HitFn signature:
+ *   bool hit_fn(int src_id, int bounce,
+ *               int hit_tri,
+ *               const V3d& incoming_dir,   // unit ray direction before hit
+ *               const V3d& surface_normal, // outward-facing normal (corrected)
+ *               const VXcd& amp_prop,      // amplitude vector after propagation, before reflection
+ *               const V3d& p0,             // segment start
+ *               const V3d& p1,             // hit point
+ *               double total_path)         // cumulative path length to p1 (m)
+ */
+template<typename HitFn>
+static void trace_rays_v2(
+    const RayTracerState& st,
+    int n_sources, const double* src_pos,
+    const double* src_dir, const double* src_directivity,
+    int n_rays, int max_bounces, double min_amplitude,
+    std::mt19937_64& rng,
+    bool& abort,
+    HitFn&& hit_fn)
+{
+    const int  n_bands = st.n_bands;
+    const bool has_bvh = !st.bvh_nodes.empty();
+
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    VXcd amp(n_bands);
+    VXcd amp_prop(n_bands);
+
+    for (int si = 0; si < n_sources && !abort; ++si) {
+        const double* sp = src_pos + si * 3;
+        const double* sd = src_dir + si * 3;
+        V3d src_p(sp[0], sp[1], sp[2]);
+        V3d src_d = V3d(sd[0], sd[1], sd[2]).normalized();
+        double dirpow = src_directivity[si];
+
+        for (int ri = 0; ri < n_rays && !abort; ++ri) {
+            V3d dir = fibonacci_sphere_dir(ri, n_rays, src_d);
+
+            double cos_a      = dir.dot(src_d);
+            double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
+            if (dir_weight < 0.01) continue;
+
+            for (int b = 0; b < n_bands; ++b)
+                amp[b] = cd(dir_weight, 0.0);
+
+            V3d    pos      = src_p;
+            double path_len = 0.0;
+            V3d    cur_dir  = dir;
+
+            for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                double t_min   = 1e18;
+                int    hit_tri = -1;
+
+                if (has_bvh) {
+                    V3d inv_dir = cur_dir.cwiseInverse();
+                    bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
+                              pos, cur_dir, inv_dir, t_min, hit_tri);
+                } else {
+                    for (size_t ti = 0; ti < st.tris.size(); ++ti) {
+                        double t;
+                        if (ray_triangle_hit(pos, cur_dir, st.tris[ti], t)
+                            && t < t_min)
+                        {
+                            t_min   = t;
+                            hit_tri = static_cast<int>(ti);
+                        }
+                    }
+                }
+
+                if (hit_tri < 0) break;
+
+                V3d    hit_pos    = pos + t_min * cur_dir;
+                double total_path = path_len + t_min;
+                double spread     = 1.0 / (1.0 + path_len + t_min * 0.5);
+
+                const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
+
+                /* Surface normal corrected to face the incoming ray. */
+                V3d hit_n = tri.normal;
+                if (cur_dir.dot(hit_n) > 0.0)
+                    hit_n = -hit_n;
+
+                /* Propagate amplitude (no reflection yet). */
+                double max_abs = 0.0;
+                for (int b = 0; b < n_bands; ++b) {
+                    double kt    = st.k_real[b] * t_min;
+                    double decay = std::exp(-st.atmo_abs[b] * t_min) * spread;
+                    cd prop(decay * std::cos(kt), decay * std::sin(kt));
+                    amp_prop[b] = amp[b] * prop;
+                    double a    = std::abs(amp_prop[b]);
+                    if (a > max_abs) max_abs = a;
+                }
+
+                /* Deliver to caller with full context. */
+                if (!hit_fn(si, bounce, hit_tri, cur_dir, hit_n, amp_prop,
+                            pos, hit_pos, total_path)) {
+                    abort = true;
+                    goto v2_next_ray;
+                }
+
+                /* Apply reflection. */
+                for (int b = 0; b < n_bands; ++b)
+                    amp[b] = amp_prop[b] * tri.refl[b];
+
+                if (max_abs < min_amplitude) break;
+
+                /* Scatter / reflect direction. */
+                if (U(rng) < tri.diffusion) {
+                    cur_dir = cosine_hemisphere(hit_n, rng);
+                } else {
+                    cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                    if (cur_dir.dot(hit_n) < 0.0)
+                        cur_dir = cosine_hemisphere(hit_n, rng);
+                }
+
+                pos = hit_pos + cur_dir * (EPS * 100.0);
+                path_len += t_min;
+            }
+            v2_next_ray:;
+        }
+    }
+}
+
 /* ── C API ──────────────────────────────────────────────────────────────────── */
 
 RayTracerState* ray_tracer_create(
@@ -505,6 +634,13 @@ RayTracerState* ray_tracer_create(
         tri_aabbs[static_cast<size_t>(i)].expand(v2);
     }
 
+    /* Triangle areas — used by trace_surface for irradiance normalisation. */
+    st->tri_areas.resize(static_cast<size_t>(n_tri));
+    for (int i = 0; i < n_tri; ++i) {
+        const Triangle& t = st->tris[static_cast<size_t>(i)];
+        st->tri_areas[static_cast<size_t>(i)] = 0.5 * t.edge1.cross(t.edge2).norm();
+    }
+
     /* Build BVH */
     if (n_tri > 0) {
         st->bvh_tri_ids.resize(static_cast<size_t>(n_tri));
@@ -561,6 +697,87 @@ int ray_tracer_trace(
         });
 
     *out_count = count;
+    return SK_OK;
+}
+
+int ray_tracer_trace_surface(
+    RayTracerState* st,
+    int             n_sources,
+    const double*   src_pos,
+    const double*   src_dir,
+    const double*   src_directivity,
+    int             n_rays,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    float*          out_segs,
+    int             out_cap,
+    int*            out_count,
+    float*          out_direct,    /* n_tri * n_bands, row-major [tri][band] */
+    float*          out_indirect)  /* n_tri * n_bands, row-major [tri][band] */
+{
+    if (!st) return SK_ERR_NULL_STATE;
+
+    const int n_bands = st->n_bands;
+    const int n_tri   = static_cast<int>(st->tris.size());
+    static constexpr double AREA_EPS = 1e-12;
+
+    int  count = 0;
+    bool abort = false;
+
+    if (out_count) *out_count = 0;
+
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+
+    trace_rays_v2(
+        *st,
+        n_sources, src_pos, src_dir, src_directivity,
+        n_rays, max_bounces, min_amplitude,
+        rng, abort,
+        [&](int si, int bounce, int hit_tri,
+            const V3d& incoming_dir, const V3d& surface_normal,
+            const VXcd& amp_prop,
+            const V3d& p0, const V3d& p1, double total_path) -> bool
+        {
+            /* Write segment record (vis buffer). */
+            if (out_segs && out_cap > 0) {
+                for (int b = 0; b < n_bands; ++b) {
+                    write_segment(out_segs, count, out_cap,
+                                  p0, p1, si, bounce, b,
+                                  amp_prop[b],
+                                  total_path - (p1 - p0).norm());
+                }
+            }
+
+            /* Irradiance contribution to triangle surface.
+             *
+             * energy = |A|² * cos(θ) / area
+             *
+             * cos(θ) is the angle between the incoming direction and the
+             * surface normal.  We already corrected surface_normal to face
+             * the incoming ray, so:
+             *   cos_in = -dot(incoming_dir, surface_normal)
+             * (incoming_dir points AWAY from the source, normal points TOWARD it).
+             */
+            if (hit_tri >= 0 && hit_tri < n_tri) {
+                double area    = st->tri_areas[static_cast<size_t>(hit_tri)];
+                double cos_in  = std::max(0.0, -incoming_dir.dot(surface_normal));
+                double inv_area = cos_in / std::max(area, AREA_EPS);
+
+                size_t base = static_cast<size_t>(hit_tri) * n_bands;
+
+                float* dest = (bounce == 0 && out_direct) ? out_direct : out_indirect;
+                if (dest) {
+                    for (int b = 0; b < n_bands; ++b) {
+                        double e = std::norm(amp_prop[b]) * inv_area;
+                        dest[base + b] += static_cast<float>(e);
+                    }
+                }
+            }
+            return true;
+        });
+
+    if (out_count) *out_count = count;
     return SK_OK;
 }
 

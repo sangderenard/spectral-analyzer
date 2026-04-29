@@ -257,6 +257,55 @@ SK_API int ray_tracer_trace_integrate_image(
     int*            out_count
 );
 
+/**
+ * Trace rays and accumulate per-triangle irradiance.
+ *
+ * This combines the segment capture of ray_tracer_trace with direct
+ * accumulation of ray energy into per-triangle flux buffers:
+ *
+ *   out_direct[tri * n_bands + b]   — irradiance from bounce 0 (direct illumination)
+ *   out_indirect[tri * n_bands + b] — irradiance from bounce > 0 (reflected)
+ *
+ * Energy is defined as |A|² * cos(θ_in) / area, giving units of W/m² per
+ * source unit power.  Caller must zero both flux buffers before calling.
+ *
+ * out_segs and out_cap may be 0/NULL to skip segment capture.
+ * out_direct and out_indirect may each be NULL individually to skip that
+ * flux accumulation (e.g. pass NULL for out_indirect to get direct only).
+ *
+ * @param st               Tracer handle from ray_tracer_create.
+ * @param n_sources        Number of sources.
+ * @param src_pos          (n_sources, 3) float64.
+ * @param src_dir          (n_sources, 3) float64.
+ * @param src_directivity  (n_sources,)   float64.
+ * @param n_rays           Rays per source.
+ * @param max_bounces      Maximum reflection bounces.
+ * @param min_amplitude    Amplitude cutoff.
+ * @param seed             RNG seed.
+ * @param out_segs         Segment buffer (may be NULL).
+ * @param out_cap          Segment buffer capacity (may be 0).
+ * @param out_count        [out] Segments written (may be NULL).
+ * @param out_direct       float32 (n_tri, n_bands) — direct irradiance (may be NULL).
+ * @param out_indirect     float32 (n_tri, n_bands) — indirect irradiance (may be NULL).
+ * @return                 SK_OK or SK_ERR_NULL_STATE if st is NULL.
+ */
+SK_API int ray_tracer_trace_surface(
+    RayTracerState* st,
+    int             n_sources,
+    const double*   src_pos,
+    const double*   src_dir,
+    const double*   src_directivity,
+    int             n_rays,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    float*          out_segs,
+    int             out_cap,
+    int*            out_count,
+    float*          out_direct,
+    float*          out_indirect
+);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

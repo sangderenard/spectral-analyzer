@@ -10,6 +10,12 @@
 #include <math.h>
 #include <float.h>
 #include <Eigen/Core>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+#include <vector>
+#include <algorithm>
 
 /* ── Grid index helper ────────────────────────────────────────────────────── */
 
@@ -68,6 +74,12 @@ struct AcousticFDTDState
     float plate_dt2_rho_h;   /* dt² / plate_rho_h     */
     float plate_biharm;      /* dt²·D / (plate_rho_h · dx⁴) */
 
+    /* Rayleigh structural damping */
+    float plate_alpha_M;     /* mass-proportional damping rate (s⁻¹)           */
+    float plate_beta_K;      /* stiffness-proportional damping time (s)         */
+    float plate_vel_damp;    /* 1 − α_M·dt : velocity-proxy multiplier          */
+    float plate_bk_coeff;    /* β_K/dt · plate_biharm : stiffness damp per biharm step */
+
     /* Bridge source cells */
     int*   src_idx;      /* flat cell indices (n_src,) */
     float* src_wgt;      /* spatial kernel weights, normalised (n_src,) */
@@ -90,12 +102,26 @@ struct AcousticFDTDState
     float* P_prev_mul;  /* (1 − α·dt) / (1 + α·dt) */
     float* P_curr_mul;  /* 2           / (1 + α·dt) */
     float* P_lap_mul;   /* C2          / (1 + α·dt) */
+    float* P_damp;      /* 1           / (1 + α·dt) — precomputed to eliminate per-cell division in pressure loop */
 
     /* Precomputed velocity face damping:  1 − 0.5·(α_L + α_R)·dt  per face.
      * Eliminates per-face pml_alpha lookup and multiply in the velocity loops. */
     float* Vx_damp;  /* [(Nx-1)*Ny*Nz] */
     float* Vy_damp;  /* [Nx*(Ny-1)*Nz] */
     float* Vz_damp;  /* [Nx*Ny*(Nz-1)] */
+
+    /* Cut-cell open-area fractions.  Each value ∈ [0, 1]:
+     *   0.0 — fully closed (solid wall; velocity zeroed in BC pass)
+     *   1.0 — fully open  (interior or fully unoccluded face; default)
+     *   (0,1) — partial opening at guitar body boundary
+     * Applied in the pressure continuity update as a flux weight and in the
+     * velocity BC pass to allow partial flux through cut faces.
+     * Populated by fdtd_set_face_fractions() after create.  Defaults to 1.0
+     * everywhere so the solver behaves identically to the staircase case when
+     * fractions are not set. */
+    float* Vx_frac;  /* [(Nx-1)*Ny*Nz] */
+    float* Vy_frac;  /* [Nx*(Ny-1)*Nz] */
+    float* Vz_frac;  /* [Nx*Ny*(Nz-1)] */
 
     /* Fast-interior mask: 1 for cells where all 6 neighbours are non-wall,
      * cell is not at domain boundary, and not plate-adjacent.  These cells
@@ -142,6 +168,29 @@ struct AcousticFDTDState
     int8_t* plate_adj_sign;  /* [n_plate_adj] +1 = above plate, -1 = below      */
     int*    plate_adj_fast;  /* [n_plate_adj] 1 = direct stencil, 0 = Neumann   */
     int     n_plate_adj;
+
+    /* Persistent thread pool for parallel FDTD passes.
+     * NULL on single-core hardware.  Owned by this state; freed by fdtd_destroy. */
+    void*   pool;
+
+    /* Precomputed Vz flat indices for plate velocity injection.
+     * Eliminates per-cell integer division + IDX3 + solid-check in the hot BC loop.
+     * plate_vz_below_vidx[n] == -1 when no valid Vz face below; same for above. */
+    int*    plate_vz_below_vidx;   /* [N_active_plate] */
+    int*    plate_vz_above_vidx;   /* [N_active_plate] */
+
+    /* Compact closed-face worklists — replace O(Nvx+Nvy+Nvz) BC scan with
+     * O(n_closed_*) unconditional zeroing writes.  Rebuilt by
+     * build_closed_face_lists() whenever Vx_frac/Vy_frac/Vz_frac changes. */
+    int*    closed_vx;  int n_closed_vx;
+    int*    closed_vy;  int n_closed_vy;
+    int*    closed_vz;  int n_closed_vz;
+
+    /* Set to true by fdtd_set_face_fractions() when cut-cell fractions with
+     * values other than 0 or 1 are present.  False at create time (all fracs
+     * are exactly 1.0 for open faces; closed faces are already zeroed by the
+     * BC worklist pass, so multiplying by their 0.0 frac is redundant). */
+    bool    has_frac;
 };
 
 /* ── Allocation helpers ───────────────────────────────────────────────────── */
@@ -171,6 +220,107 @@ static float pml_sigma(int d, int n_pml, float dt)
     return sigma_max * frac * frac * frac;  /* cubic grading */
 }
 
+/* ── Persistent thread pool ──────────────────────────────────────────────── *
+ *
+ * Generation-counter design: each dispatch() increments gen; workers wake
+ * only when gen advances, execute their slice, then signal done.  The main
+ * thread blocks in dispatch() until all workers have signalled.
+ *
+ * Workers are created once (in fdtd_create) and destroyed once (in
+ * fdtd_destroy).  No threads are created per step or per sample.
+ */
+struct FDTDPool {
+    int                          n;
+    std::vector<std::thread>     workers;
+    std::mutex                   mtx;
+    std::condition_variable      cv_work;
+    std::condition_variable      cv_done;
+    std::function<void(int,int)> task;
+    int total, chunk, done, gen;
+    bool exiting;
+
+    explicit FDTDPool(int nw)
+        : n(nw), total(0), chunk(0), done(0), gen(-1), exiting(false)
+    {
+        workers.reserve(nw);
+        for (int id = 0; id < nw; ++id)
+            workers.emplace_back(&FDTDPool::loop, this, id);
+    }
+
+    ~FDTDPool() {
+        { std::lock_guard<std::mutex> g(mtx); exiting = true; }
+        cv_work.notify_all();
+        for (auto& t : workers) t.join();
+    }
+
+    void dispatch(int items, std::function<void(int,int)> fn) {
+        {
+            std::lock_guard<std::mutex> g(mtx);
+            task  = std::move(fn);
+            total = items;
+            chunk = (items + n - 1) / n;
+            done  = 0;
+            ++gen;
+        }
+        cv_work.notify_all();
+        std::unique_lock<std::mutex> g(mtx);
+        cv_done.wait(g, [this]{ return done == n; });
+    }
+
+private:
+    void loop(int id) {
+        int seen = -1;
+        for (;;) {
+            std::function<void(int,int)> fn;
+            int s, e;
+            {
+                std::unique_lock<std::mutex> g(mtx);
+                cv_work.wait(g, [&]{ return exiting || gen != seen; });
+                if (exiting) return;
+                seen = gen;
+                fn   = task;
+                s    = id * chunk;
+                e    = std::min(s + chunk, total);
+            }
+            if (s < e) fn(s, e);
+            { std::lock_guard<std::mutex> g(mtx); ++done; }
+            cv_done.notify_one();
+        }
+    }
+};
+
+/* ── Closed-face worklist builder ────────────────────────────────────────── *
+ * Scans Vx/Vy/Vz_frac once and records the indices of every fully-closed face
+ * (frac == 0).  Called from fdtd_create and from fdtd_set_face_fractions so
+ * the worklist is always consistent with the current frac arrays. */
+static void build_closed_face_lists(AcousticFDTDState* st)
+{
+    free(st->closed_vx); free(st->closed_vy); free(st->closed_vz);
+    st->closed_vx = st->closed_vy = st->closed_vz = NULL;
+    st->n_closed_vx = st->n_closed_vy = st->n_closed_vz = 0;
+
+    int ncvx = 0, ncvy = 0, ncvz = 0;
+    for (int i = 0; i < st->Nvx; ++i) if (st->Vx_frac[i] == 0.0f) ++ncvx;
+    for (int i = 0; i < st->Nvy; ++i) if (st->Vy_frac[i] == 0.0f) ++ncvy;
+    for (int i = 0; i < st->Nvz; ++i) if (st->Vz_frac[i] == 0.0f) ++ncvz;
+
+    st->closed_vx = (int*)malloc((ncvx > 0 ? ncvx : 1) * sizeof(int));
+    st->closed_vy = (int*)malloc((ncvy > 0 ? ncvy : 1) * sizeof(int));
+    st->closed_vz = (int*)malloc((ncvz > 0 ? ncvz : 1) * sizeof(int));
+    if (!st->closed_vx || !st->closed_vy || !st->closed_vz) return;
+
+    st->n_closed_vx = ncvx;
+    st->n_closed_vy = ncvy;
+    st->n_closed_vz = ncvz;
+
+    int ci = 0;
+    for (int i = 0; i < st->Nvx; ++i) if (st->Vx_frac[i] == 0.0f) st->closed_vx[ci++] = i;
+    ci = 0;
+    for (int i = 0; i < st->Nvy; ++i) if (st->Vy_frac[i] == 0.0f) st->closed_vy[ci++] = i;
+    ci = 0;
+    for (int i = 0; i < st->Nvz; ++i) if (st->Vz_frac[i] == 0.0f) st->closed_vz[ci++] = i;
+}
+
 /* ── Construction ─────────────────────────────────────────────────────────── */
 
 SK_API AcousticFDTDState* fdtd_create(
@@ -183,14 +333,18 @@ SK_API AcousticFDTDState* fdtd_create(
     const uint8_t* plate_active,
     float   plate_mass_density,
     float   plate_stiffness_D,
+    float   plate_alpha_M,
+    float   plate_beta_K,
     int     n_pml)
 {
     if (Nx <= 0 || Ny <= 0 || Nz <= 0 || dx <= 0.0f || c <= 0.0f
             || cell_type == NULL || plate_active == NULL)
         return NULL;
 
-    /* CFL-stable time step: dt = 0.95 / (c/dx * sqrt(3)) */
-    float dt = 0.95f * dx / (c * 1.732050808f);
+    /* CFL-stable time step for 4th-order stencil in 3D.
+     * 3D stability limit: CFL_1D ≤ 6/(7·√3) ≈ 0.495.
+     * Safety factor 0.77 keeps us below that: 0.77/√3 ≈ 0.445. */
+    float dt = 0.77f * dx / (c * 1.732050808f);
     float C2 = (c * dt / dx) * (c * dt / dx);
 
     int N       = Nx * Ny * Nz;
@@ -285,6 +439,12 @@ SK_API AcousticFDTDState* fdtd_create(
         st->plate_biharm = plate_stiffness_D * (dt * dt) / (plate_mass_density * dx4);
     }
 
+    /* Rayleigh damping derived quantities */
+    st->plate_alpha_M  = plate_alpha_M;
+    st->plate_beta_K   = plate_beta_K;
+    st->plate_vel_damp = 1.0f - plate_alpha_M * dt;
+    st->plate_bk_coeff = (dt > 0.0f) ? (plate_beta_K / dt * st->plate_biharm) : 0.0f;
+
     /* Staggered velocity fields */
     st->Nvx = (Nx-1)*Ny*Nz;
     st->Nvy = Nx*(Ny-1)*Nz;
@@ -302,12 +462,16 @@ SK_API AcousticFDTDState* fdtd_create(
     st->P_lap_mul  = alloc_float(N);
     if (!st->P_prev_mul || !st->P_curr_mul || !st->P_lap_mul) goto fail;
 
+    st->P_damp = alloc_float(N);
+    if (!st->P_damp) goto fail;
+
     for (int idx = 0; idx < N; ++idx) {
         float alpha = st->pml_alpha[idx];
         float denom = 1.0f + alpha * dt;
         st->P_prev_mul[idx] = (1.0f - alpha * dt) / denom;
         st->P_curr_mul[idx] = 2.0f / denom;
         st->P_lap_mul [idx] = C2   / denom;
+        st->P_damp    [idx] = 1.0f / denom;
     }
 
     /* ── Precompute velocity face damping arrays ── */
@@ -315,6 +479,58 @@ SK_API AcousticFDTDState* fdtd_create(
     st->Vy_damp = alloc_float(st->Nvy);
     st->Vz_damp = alloc_float(st->Nvz);
     if (!st->Vx_damp || !st->Vy_damp || !st->Vz_damp) goto fail;
+
+    /* Cut-cell face fractions.
+     * Default: 0.0 for faces adjacent to solid (WALL/PLATE) cells — these get
+     * zeroed in the BC pass.  Exceptions:
+     *   - Plate-layer Vz faces (k == plate_iz-1 or plate_iz) are kept at 1.0:
+     *     plate injection sets them each step so fracs must not suppress them.
+     *   - Interior air-air faces: 1.0 (no solid neighbour).
+     * fdtd_set_face_fractions() overrides these for cut-cell body boundaries,
+     * setting (0,1) for faces partially covered by the guitar outline. */
+    st->Vx_frac = alloc_float(st->Nvx);
+    st->Vy_frac = alloc_float(st->Nvy);
+    st->Vz_frac = alloc_float(st->Nvz);
+    if (!st->Vx_frac || !st->Vy_frac || !st->Vz_frac) goto fail;
+
+    for (int i = 0; i < Nx-1; ++i)
+        for (int j = 0; j < Ny; ++j)
+            for (int k = 0; k < Nz; ++k) {
+                int vidx = k + Nz*(j + Ny*i);
+                int L = IDX3(Ny, Nz, i,   j, k);
+                int R = IDX3(Ny, Nz, i+1, j, k);
+                st->Vx_frac[vidx] = (cell_is_pressure_solid(st->cell_type[L]) ||
+                                     cell_is_pressure_solid(st->cell_type[R])) ? 0.0f : 1.0f;
+            }
+
+    for (int i = 0; i < Nx; ++i)
+        for (int j = 0; j < Ny-1; ++j)
+            for (int k = 0; k < Nz; ++k) {
+                int vidx = k + Nz*(j + (Ny-1)*i);
+                int L = IDX3(Ny, Nz, i, j,   k);
+                int R = IDX3(Ny, Nz, i, j+1, k);
+                st->Vy_frac[vidx] = (cell_is_pressure_solid(st->cell_type[L]) ||
+                                     cell_is_pressure_solid(st->cell_type[R])) ? 0.0f : 1.0f;
+            }
+
+    {
+        const int piz = st->plate_iz;
+        for (int i = 0; i < Nx; ++i)
+            for (int j = 0; j < Ny; ++j)
+                for (int k = 0; k < Nz-1; ++k) {
+                    int vidx = k + (Nz-1)*(j + Ny*i);
+                    int L = IDX3(Ny, Nz, i, j, k);
+                    int R = IDX3(Ny, Nz, i, j, k+1);
+                    /* Plate-layer Vz faces: plate injection drives these each step;
+                     * keep frac=1.0 so the divergence uses the full plate velocity. */
+                    if (k == piz-1 || k == piz) {
+                        st->Vz_frac[vidx] = 1.0f;
+                    } else {
+                        st->Vz_frac[vidx] = (cell_is_pressure_solid(st->cell_type[L]) ||
+                                             cell_is_pressure_solid(st->cell_type[R])) ? 0.0f : 1.0f;
+                    }
+                }
+    }
 
     for (int i = 0; i < Nx-1; ++i)
         for (int j = 0; j < Ny; ++j)
@@ -505,6 +721,44 @@ SK_API AcousticFDTDState* fdtd_create(
         }
     }
 
+    /* ── Precompute plate Vz injection indices ── *
+     * Eliminates pidx/Ny, IDX3, and cell_is_pressure_solid from the hot BC pass. */
+    {
+        int N_act = st->N_active_plate;
+        st->plate_vz_below_vidx = (int*)malloc((N_act > 0 ? N_act : 1) * sizeof(int));
+        st->plate_vz_above_vidx = (int*)malloc((N_act > 0 ? N_act : 1) * sizeof(int));
+        if (!st->plate_vz_below_vidx || !st->plate_vz_above_vidx) goto fail;
+        const int piz = st->plate_iz;
+        for (int n = 0; n < N_act; ++n) {
+            int pidx = st->plate_active_idx[n];
+            int ii   = pidx / Ny;
+            int jj   = pidx % Ny;
+            if (piz > 0) {
+                int b = IDX3(Ny, Nz, ii, jj, piz-1);
+                st->plate_vz_below_vidx[n] = cell_is_pressure_solid(st->cell_type[b])
+                                              ? -1 : (piz-1) + (Nz-1)*(jj + Ny*ii);
+            } else {
+                st->plate_vz_below_vidx[n] = -1;
+            }
+            if (piz < Nz-1) {
+                int a = IDX3(Ny, Nz, ii, jj, piz+1);
+                st->plate_vz_above_vidx[n] = cell_is_pressure_solid(st->cell_type[a])
+                                              ? -1 : piz + (Nz-1)*(jj + Ny*ii);
+            } else {
+                st->plate_vz_above_vidx[n] = -1;
+            }
+        }
+    }
+
+    /* ── Precompute closed-face BC worklists ── */
+    build_closed_face_lists(st);
+    if (!st->closed_vx || !st->closed_vy || !st->closed_vz) goto fail;
+
+    {
+        int nw = (int)std::thread::hardware_concurrency();
+        st->pool = (nw > 1) ? new FDTDPool(nw) : NULL;
+    }
+
     return st;
 
 fail:
@@ -518,11 +772,13 @@ SK_API void fdtd_destroy(AcousticFDTDState* st)
     free(st->P_curr);     free(st->P_prev);     free(st->P_tmp);
     free(st->cell_type);  free(st->pml_alpha);
     free(st->P_prev_mul); free(st->P_curr_mul); free(st->P_lap_mul);
+    free(st->P_damp);
     free(st->w_curr);     free(st->w_prev);     free(st->w_tmp);
     free(st->plate_active); free(st->plate_ext_force);
     free(st->src_idx);    free(st->src_wgt);
     free(st->Vx);         free(st->Vy);         free(st->Vz);
     free(st->Vx_damp);    free(st->Vy_damp);    free(st->Vz_damp);
+    free(st->Vx_frac);    free(st->Vy_frac);    free(st->Vz_frac);
     free(st->fast_interior);
     free(st->plate_active_idx); free(st->plate_above_idx); free(st->plate_below_idx);
     free(st->plate_biharm_idx13);
@@ -530,6 +786,9 @@ SK_API void fdtd_destroy(AcousticFDTDState* st)
     free(st->slow_idx);
     free(st->plate_adj_idx); free(st->plate_adj_pidx);
     free(st->plate_adj_sign); free(st->plate_adj_fast);
+    free(st->plate_vz_below_vidx); free(st->plate_vz_above_vidx);
+    free(st->closed_vx); free(st->closed_vy); free(st->closed_vz);
+    if (st->pool) { delete static_cast<FDTDPool*>(st->pool); st->pool = NULL; }
     free(st);
 }
 
@@ -617,30 +876,78 @@ SK_API int fdtd_inject_bridge(
     float signal_ddt,
     float force_scale)
 {
-    if (!st) return FDTD_ERR_NULL;
-    if (!st->src_idx || st->n_src == 0) return FDTD_OK;  /* no bridge sources — silent no-op */
+    (void)st;
+    (void)signal_val;
+    (void)signal_ddt;
+    (void)force_scale;
+    return FDTD_ERR_UNSTABLE;
+}
 
-    /* signal_val couples low-frequency pressure (compression/rarefaction).
-     * signal_ddt drives the plate velocity (physically more correct for bridge).
-     * Together they model the bridge rocking (asymmetric, driven by ddt)
-     * and translation (symmetric, driven by val). */
-    float dt  = st->dt;
-    float dx  = st->dx;
+/* ── 4th-order staggered gradient coefficients (Fornberg) ────────────────── *
+ * grad_h(P) at face (i+1/2) = O4_C1*(P[i+1]-P[i]) + O4_C2*(P[i+2]-P[i-1]) */
+static const float O4_C1 =  9.0f / 8.0f;
+static const float O4_C2 = -1.0f / 24.0f;
 
-    /* Distributed pressure source amplitude injected into P_tmp.
-     * Units: Pa.  The factor (rho * c² * dt / dx) converts velocity → pressure. */
-    float vel_amp  = signal_ddt * force_scale * st->rho_air * st->c * st->c * dt / dx;
-    float pres_amp = signal_val * force_scale * st->rho_air * st->c * st->c * dt * dt;
+/* Per-cell 4th-order divergence of the staggered velocity field.
+ * Used by both fast-run and slow worklist paths in pressure_step. */
+static inline float compute_div_v(
+    const float* Vx, const float* Vy, const float* Vz,
+    const float* Vxf, const float* Vyf, const float* Vzf,
+    int Nx, int Ny, int Nz,
+    int i, int j, int k)
+{
+#define VXF(ii) (Vx[k + Nz*(j + Ny*(ii))] * Vxf[k + Nz*(j + Ny*(ii))])
+#define VYF(jj) (Vy[k + Nz*((jj) + (Ny-1)*i)] * Vyf[k + Nz*((jj) + (Ny-1)*i)])
+#define VZF(kk) (Vz[(kk) + (Nz-1)*(j + Ny*i)] * Vzf[(kk) + (Nz-1)*(j + Ny*i)])
 
-    /* Inject into bridge cells — both the current and prev fields so the
-     * leapfrog sees the source as a continuous-time drive. */
-    for (int i = 0; i < st->n_src; ++i) {
-        int   idx = st->src_idx[i];
-        float w   = st->src_wgt[i];
-        float amp = (vel_amp + pres_amp) * w;
-        deposit_pressure_open(st, idx, amp);
-    }
-    return FDTD_OK;
+    float vxp  = (i < Nx-1) ? VXF(i)   : 0.0f;
+    float vxm  = (i > 0)    ? VXF(i-1) : 0.0f;
+    float vxpp = (i < Nx-2) ? VXF(i+1) : 0.0f;
+    float vxmm = (i > 1)    ? VXF(i-2) : 0.0f;
+
+    float vyp  = (j < Ny-1) ? VYF(j)   : 0.0f;
+    float vym  = (j > 0)    ? VYF(j-1) : 0.0f;
+    float vypp = (j < Ny-2) ? VYF(j+1) : 0.0f;
+    float vymm = (j > 1)    ? VYF(j-2) : 0.0f;
+
+    float vzp  = (k < Nz-1) ? VZF(k)   : 0.0f;
+    float vzm  = (k > 0)    ? VZF(k-1) : 0.0f;
+    float vzpp = (k < Nz-2) ? VZF(k+1) : 0.0f;
+    float vzmm = (k > 1)    ? VZF(k-2) : 0.0f;
+
+#undef VXF
+#undef VYF
+#undef VZF
+
+    return O4_C1 * ((vxp-vxm) + (vyp-vym) + (vzp-vzm))
+         + O4_C2 * ((vxpp-vxmm) + (vypp-vymm) + (vzpp-vzmm));
+}
+
+/* Frac-free variant: called when has_frac==false (all open-face fracs are 1.0;
+ * closed faces were already zeroed by the BC worklist pass).
+ * Removes 12 float multiplications per cell relative to compute_div_v. */
+static inline float compute_div_v_nofrac(
+    const float* Vx, const float* Vy, const float* Vz,
+    int Nx, int Ny, int Nz,
+    int i, int j, int k)
+{
+    float vxp  = (i < Nx-1) ? Vx[k + Nz*(j + Ny* i      )] : 0.0f;
+    float vxm  = (i > 0)    ? Vx[k + Nz*(j + Ny*(i-1)   )] : 0.0f;
+    float vxpp = (i < Nx-2) ? Vx[k + Nz*(j + Ny*(i+1)   )] : 0.0f;
+    float vxmm = (i > 1)    ? Vx[k + Nz*(j + Ny*(i-2)   )] : 0.0f;
+
+    float vyp  = (j < Ny-1) ? Vy[k + Nz*( j    + (Ny-1)*i)] : 0.0f;
+    float vym  = (j > 0)    ? Vy[k + Nz*((j-1) + (Ny-1)*i)] : 0.0f;
+    float vypp = (j < Ny-2) ? Vy[k + Nz*((j+1) + (Ny-1)*i)] : 0.0f;
+    float vymm = (j > 1)    ? Vy[k + Nz*((j-2) + (Ny-1)*i)] : 0.0f;
+
+    float vzp  = (k < Nz-1) ? Vz[ k    + (Nz-1)*(j + Ny*i)] : 0.0f;
+    float vzm  = (k > 0)    ? Vz[(k-1) + (Nz-1)*(j + Ny*i)] : 0.0f;
+    float vzpp = (k < Nz-2) ? Vz[(k+1) + (Nz-1)*(j + Ny*i)] : 0.0f;
+    float vzmm = (k > 1)    ? Vz[(k-2) + (Nz-1)*(j + Ny*i)] : 0.0f;
+
+    return O4_C1 * ((vxp-vxm) + (vyp-vym) + (vzp-vzm))
+         + O4_C2 * ((vxpp-vxmm) + (vypp-vymm) + (vzpp-vzmm));
 }
 
 /* ── Kirchhoff plate update ───────────────────────────────────────────────── */
@@ -673,7 +980,7 @@ static float biharmonic(const float* w, int Nx, int Ny, int i, int j)
     return val;
 }
 
-static void plate_step(AcousticFDTDState* st)
+static int plate_step(AcousticFDTDState* st)
 {
     static const float W13[13] = {20,-8,-8,-8,-8, 2, 2, 2, 2, 1, 1, 1, 1};
 
@@ -683,8 +990,9 @@ static void plate_step(AcousticFDTDState* st)
     const float* wp = st->w_prev;
     float*       wt = st->w_tmp;
 
-    /* Zero the entire plate scratch; only active cells will be updated. */
-    memset(wt, 0, st->N_plate * sizeof(float));
+    /* Active cells are all written below; inactive positions in wt come from
+     * the old w_prev and are never read in any stencil (precomputed stencil
+     * redirects inactive neighbours to self), so no clear is needed. */
 
     for (int n = 0; n < st->N_active_plate; ++n) {
         int pidx = st->plate_active_idx[n];
@@ -706,15 +1014,22 @@ static void plate_step(AcousticFDTDState* st)
          * bridge string drives the plate, not the acoustic field directly. */
         float f_bridge = st->plate_ext_force ? st->plate_ext_force[pidx] : 0.0f;
 
-        /* Small physical loss keeps the explicitly coupled plate/air update
-         * passive enough for high-resolution prewarming without hiding real
-         * resonant motion. */
-        const float plate_vel_loss = 0.9990f;
-        float w_new = w[pidx] + plate_vel_loss * (w[pidx] - wp[pidx])
-                    + a  * (P_below - P_above + f_bridge)
-                    - bh * biharm;
+        /* Rayleigh structural damping.
+         * vel_damp = 1 − α_M·dt  replaces the old frequency-independent 0.9990 constant.
+         * bk_coeff * (biharm − biharm_prev) adds stiffness-proportional loss:
+         *   −β_K/dt · (dt²·D/ρh·dx⁴) · ∇⁴(w − wp)  ≈  −β_K/dt · bh · Δbiharm */
+        float biharm_prev = 0.0f;
+        for (int t = 0; t < 13; ++t)
+            biharm_prev += W13[t] * wp[nbrs[t]];
 
-        if (fabsf(w_new) > 1e-1f) w_new = 0.0f;
+        float vel_proxy = w[pidx] - wp[pidx];
+        float w_new = w[pidx] + st->plate_vel_damp * vel_proxy
+                    + a  * ((P_below - P_above) + f_bridge)
+                    - bh * biharm
+                    - st->plate_bk_coeff * (biharm - biharm_prev);
+
+        if (!isfinite(w_new) || fabsf(w_new) > 0.02f)
+            return FDTD_ERR_UNSTABLE;
         wt[pidx] = w_new;
     }
 
@@ -726,6 +1041,31 @@ static void plate_step(AcousticFDTDState* st)
     st->w_prev = st->w_curr;
     st->w_curr = st->w_tmp;
     st->w_tmp  = tmp;
+    return FDTD_OK;
+}
+
+/* ── Cut-cell face-fraction injection ────────────────────────────────────────
+ *
+ * Sets the per-face open-area fractions used by the pressure continuity update
+ * and the velocity BC pass.  Call once after fdtd_create; safe to call again
+ * to update geometry without rebuilding the full solver.
+ *
+ * Arrays must have exactly (Nx-1)*Ny*Nz, Nx*(Ny-1)*Nz, Nx*Ny*(Nz-1) elements.
+ * Pass NULL for any component to leave it unchanged.
+ */
+SK_API int fdtd_set_face_fractions(
+    AcousticFDTDState* st,
+    const float* vx_frac,
+    const float* vy_frac,
+    const float* vz_frac)
+{
+    if (!st) return FDTD_ERR_NULL;
+    if (vx_frac) memcpy(st->Vx_frac, vx_frac, st->Nvx * sizeof(float));
+    if (vy_frac) memcpy(st->Vy_frac, vy_frac, st->Nvy * sizeof(float));
+    if (vz_frac) memcpy(st->Vz_frac, vz_frac, st->Nvz * sizeof(float));
+    if (vx_frac || vy_frac || vz_frac) st->has_frac = true;
+    build_closed_face_lists(st);
+    return FDTD_OK;
 }
 
 /* ── Main FDTD pressure update ───────────────────────────────────────────── */
@@ -734,195 +1074,161 @@ static int pressure_step(AcousticFDTDState* st)
 {
     int Nx = st->Nx, Ny = st->Ny, Nz = st->Nz;
     float dt = st->dt;
-    int Nzy = Nz * Ny;
-
-    float plate_src_coef = st->rho_air * st->c * st->c * dt / st->dx;
-
-    const float* P_curr = st->P_curr;
-    const float* P_prev = st->P_prev;
-    float*       P_tmp  = st->P_tmp;
-    const float* P_pm   = st->P_prev_mul;
-    const float* P_cm   = st->P_curr_mul;
-    const float* P_lm   = st->P_lap_mul;
+    const float inv_dx = 1.0f / st->dx;
     const uint8_t* ct   = st->cell_type;
 
-    /* Initialize P_tmp from P_curr.  Wall cells are not visited below, so this
-     * copy handles them (wall BC: P_tmp = P_curr).  Non-wall cells are
-     * overwritten by the three loops that follow. */
-    memcpy(P_tmp, P_curr, st->N * sizeof(float));
-    /* Solid pressure cells are barriers, not state reservoirs.  Keep them zero
-     * so accidental deposits or stale values cannot be carried forever. */
-    for (int idx = 0; idx < st->N; ++idx) {
-        if (cell_is_pressure_solid(ct[idx])) P_tmp[idx] = 0.0f;
+    const float* Pn = st->P_curr;
+    const float vel_coeff = dt / (st->rho_air * st->dx);
+
+    /* Fornberg 4th-order staggered gradient coefficients — defined at file scope. */
+
+    /* Momentum update on staggered faces.  Vx, Vy, Vz write to disjoint arrays
+     * and read only from the shared Pn snapshot, so each component is fully
+     * independent.  All three are folded into a single pool dispatch that
+     * divides the outer i-loop across workers. */
+    FDTDPool* pool = static_cast<FDTDPool*>(st->pool);
+
+    auto run_velocity = [&](int i0, int i1) {
+        /* Vx: face (i+1/2, j, k), i ∈ [0, Nx-2] */
+        for (int i = i0; i < std::min(i1, Nx-1); ++i)
+            for (int j = 0; j < Ny; ++j)
+                for (int k = 0; k < Nz; ++k) {
+                    int vidx = k + Nz*(j + Ny*i);
+                    int L = IDX3(Ny,Nz,i,j,k), R = IDX3(Ny,Nz,i+1,j,k);
+                    float grad;
+                    if (i > 0 && i < Nx-2) {
+                        grad = O4_C1*(Pn[R] - Pn[L])
+                             + O4_C2*(Pn[IDX3(Ny,Nz,i+2,j,k)] - Pn[IDX3(Ny,Nz,i-1,j,k)]);
+                    } else {
+                        grad = Pn[R] - Pn[L];
+                    }
+                    st->Vx[vidx] = (st->Vx[vidx] - vel_coeff * grad) * st->Vx_damp[vidx];
+                }
+        /* Vy: face (i, j+1/2, k), j ∈ [0, Ny-2] */
+        for (int i = i0; i < i1; ++i)
+            for (int j = 0; j < Ny-1; ++j)
+                for (int k = 0; k < Nz; ++k) {
+                    int vidx = k + Nz*(j + (Ny-1)*i);
+                    int L = IDX3(Ny,Nz,i,j,k), R = IDX3(Ny,Nz,i,j+1,k);
+                    float grad;
+                    if (j > 0 && j < Ny-2) {
+                        grad = O4_C1*(Pn[R] - Pn[L])
+                             + O4_C2*(Pn[IDX3(Ny,Nz,i,j+2,k)] - Pn[IDX3(Ny,Nz,i,j-1,k)]);
+                    } else {
+                        grad = Pn[R] - Pn[L];
+                    }
+                    st->Vy[vidx] = (st->Vy[vidx] - vel_coeff * grad) * st->Vy_damp[vidx];
+                }
+        /* Vz: face (i, j, k+1/2), k ∈ [0, Nz-2] */
+        for (int i = i0; i < i1; ++i)
+            for (int j = 0; j < Ny; ++j)
+                for (int k = 0; k < Nz-1; ++k) {
+                    int vidx = k + (Nz-1)*(j + Ny*i);
+                    int L = IDX3(Ny,Nz,i,j,k), R = IDX3(Ny,Nz,i,j,k+1);
+                    float grad;
+                    if (k > 0 && k < Nz-2) {
+                        grad = O4_C1*(Pn[R] - Pn[L])
+                             + O4_C2*(Pn[IDX3(Ny,Nz,i,j,k+2)] - Pn[IDX3(Ny,Nz,i,j,k-1)]);
+                    } else {
+                        grad = Pn[R] - Pn[L];
+                    }
+                    st->Vz[vidx] = (st->Vz[vidx] - vel_coeff * grad) * st->Vz_damp[vidx];
+                }
+    };
+
+    if (pool) pool->dispatch(Nx, run_velocity);
+    else      run_velocity(0, Nx);
+
+    /* Face BCs: zero all fully-closed faces using precomputed worklist.
+     * Replaces a full O(Nvx+Nvy+Nvz) scan with O(n_closed) unconditional writes. */
+    for (int r = 0; r < st->n_closed_vx; ++r) st->Vx[st->closed_vx[r]] = 0.0f;
+    for (int r = 0; r < st->n_closed_vy; ++r) st->Vy[st->closed_vy[r]] = 0.0f;
+    for (int r = 0; r < st->n_closed_vz; ++r) st->Vz[st->closed_vz[r]] = 0.0f;
+
+    /* Plate velocity injection via precomputed Vz indices.
+     * Eliminates per-cell integer division, IDX3, and solid-cell checks. */
+    for (int n = 0; n < st->N_active_plate; ++n) {
+        int pidx   = st->plate_active_idx[n];
+        float v_pl = (st->w_curr[pidx] - st->w_prev[pidx]) * (1.0f / dt);
+        if (st->plate_vz_below_vidx[n] >= 0) st->Vz[st->plate_vz_below_vidx[n]] = v_pl;
+        if (st->plate_vz_above_vidx[n] >= 0) st->Vz[st->plate_vz_above_vidx[n]] = v_pl;
     }
 
-    /* ── Fast interior: Eigen vectorized contiguous k-runs ── */
-    {
-        using Eigen::Map;
-        using Eigen::ArrayXf;
-        for (int r = 0; r < st->n_fast_runs; ++r) {
+    /* Continuity update: three worklist passes eliminate per-cell solid-cell
+     * branching and skip the full-grid memset (solid positions stay zero by
+     * invariant; inactive positions are never read).
+     *
+     * Pass 1 — fast interior runs: contiguous k-sequences where all 6 neighbours
+     *   are guaranteed non-wall and in-bounds.  Compiler can hoist the x/y
+     *   4th-order guards out of the k loop since i,j are fixed per run.
+     * Pass 2 — slow cells: near-boundary or near-wall, individual cells.
+     * Pass 3 — plate-adjacent cells: same divergence formula; plate velocity is
+     *   already injected into Vz above, so no special treatment is needed here.
+     */
+    const float bulk_coeff = st->rho_air * st->c * st->c * dt * inv_dx;
+    const float* pdamp = st->P_damp;
+    float*       Ptmp  = st->P_tmp;
+    const float* Vx  = st->Vx,  *Vy  = st->Vy,  *Vz  = st->Vz;
+    const float* Vxf = st->Vx_frac, *Vyf = st->Vy_frac, *Vzf = st->Vz_frac;
+    const bool   hf  = st->has_frac;
+
+    /* Fast-run loop: branch on hf outside the k-offset loop so the compiler
+     * sees a uniform inner loop without a per-cell predicate. */
+    auto run_fast_pressure = [&](int r0, int r1) {
+        for (int r = r0; r < r1; ++r) {
             int base = st->run_base[r];
             int len  = st->run_len[r];
-            Map<const ArrayXf> C  (P_curr + base,        len);
-            Map<const ArrayXf> Zp (P_curr + base + 1,    len);
-            Map<const ArrayXf> Zm (P_curr + base - 1,    len);
-            Map<const ArrayXf> Yp (P_curr + base + Nz,   len);
-            Map<const ArrayXf> Ym (P_curr + base - Nz,   len);
-            Map<const ArrayXf> Xp (P_curr + base + Nzy,  len);
-            Map<const ArrayXf> Xm (P_curr + base - Nzy,  len);
-            Map<const ArrayXf> Pp (P_prev + base,         len);
-            Map<const ArrayXf> Pcm(P_cm   + base,         len);
-            Map<const ArrayXf> Ppm(P_pm   + base,         len);
-            Map<const ArrayXf> Plm(P_lm   + base,         len);
-            Map<ArrayXf> O(P_tmp + base, len);
-            O = Pcm * C - Ppm * Pp
-              + Plm * (Zp + Zm + Yp + Ym + Xp + Xm - 6.0f * C);
+            int ij   = base / Nz;
+            int i    = ij / Ny;
+            int j    = ij % Ny;
+            int k0   = base % Nz;
+            if (hf) {
+                for (int ofs = 0; ofs < len; ++ofs) {
+                    int idx = base + ofs;
+                    int k   = k0 + ofs;
+                    float dv = compute_div_v(Vx,Vy,Vz,Vxf,Vyf,Vzf,Nx,Ny,Nz,i,j,k);
+                    Ptmp[idx] = (Pn[idx] - bulk_coeff * dv) * pdamp[idx];
+                }
+            } else {
+                for (int ofs = 0; ofs < len; ++ofs) {
+                    int idx = base + ofs;
+                    int k   = k0 + ofs;
+                    float dv = compute_div_v_nofrac(Vx,Vy,Vz,Nx,Ny,Nz,i,j,k);
+                    Ptmp[idx] = (Pn[idx] - bulk_coeff * dv) * pdamp[idx];
+                }
+            }
         }
-    }
+    };
 
-    /* ── Slow boundary cells: Neumann ghost stencil ── */
-    for (int n = 0; n < st->n_slow; ++n) {
-        int idx = st->slow_idx[n];
+    if (pool) pool->dispatch(st->n_fast_runs, run_fast_pressure);
+    else      run_fast_pressure(0, st->n_fast_runs);
+
+    for (int s = 0; s < st->n_slow; ++s) {
+        int idx = st->slow_idx[s];
         int k   = idx % Nz;
-        int tmp = idx / Nz;
-        int j   = tmp % Ny;
-        int i   = tmp / Ny;
-        float Pc  = P_curr[idx];
-        float Pp2 = P_prev[idx];
-        auto nb_v = [&](int ii, int jj, int kk) -> float {
-            if (ii<0||ii>=Nx||jj<0||jj>=Ny||kk<0||kk>=Nz) return Pc;
-            int nidx = IDX3(Ny, Nz, ii, jj, kk);
-            return cell_is_pressure_solid(ct[nidx]) ? Pc : P_curr[nidx];
-        };
-        float lap = nb_v(i+1,j,k) + nb_v(i-1,j,k)
-                  + nb_v(i,j+1,k) + nb_v(i,j-1,k)
-                  + nb_v(i,j,k+1) + nb_v(i,j,k-1)
-                  - 6.0f * Pc;
-        P_tmp[idx] = P_cm[idx]*Pc - P_pm[idx]*Pp2 + P_lm[idx]*lap;
+        int ij  = idx / Nz;
+        int i   = ij / Ny;
+        int j   = ij % Ny;
+        float dv = hf ? compute_div_v(Vx,Vy,Vz,Vxf,Vyf,Vzf,Nx,Ny,Nz,i,j,k)
+                      : compute_div_v_nofrac(Vx,Vy,Vz,Nx,Ny,Nz,i,j,k);
+        Ptmp[idx] = (Pn[idx] - bulk_coeff * dv) * pdamp[idx];
     }
 
-    /* ── Plate-adjacent cells: stencil + plate-velocity soft source ── */
-    for (int n = 0; n < st->n_plate_adj; ++n) {
-        int   idx  = st->plate_adj_idx[n];
-        int   pidx = st->plate_adj_pidx[n];
-        float sign = (float)st->plate_adj_sign[n];
-        float Pc   = P_curr[idx];
-        float Pp2  = P_prev[idx];
-        float lap;
-        if (st->plate_adj_fast[n]) {
-            lap = P_curr[idx+1]   + P_curr[idx-1]
-                + P_curr[idx+Nz]  + P_curr[idx-Nz]
-                + P_curr[idx+Nzy] + P_curr[idx-Nzy]
-                - 6.0f * Pc;
-        } else {
-            int k   = idx % Nz;
-            int tmp = idx / Nz;
-            int j   = tmp % Ny;
-            int i   = tmp / Ny;
-            auto nb_v = [&](int ii, int jj, int kk) -> float {
-                if (ii<0||ii>=Nx||jj<0||jj>=Ny||kk<0||kk>=Nz) return Pc;
-                int nidx = IDX3(Ny, Nz, ii, jj, kk);
-                return cell_is_pressure_solid(ct[nidx]) ? Pc : P_curr[nidx];
-            };
-            lap = nb_v(i+1,j,k) + nb_v(i-1,j,k)
-                + nb_v(i,j+1,k) + nb_v(i,j-1,k)
-                + nb_v(i,j,k+1) + nb_v(i,j,k-1)
-                - 6.0f * Pc;
-        }
-        float P_new = P_cm[idx]*Pc - P_pm[idx]*Pp2 + P_lm[idx]*lap;
-        if (pidx < st->N_plate && st->plate_active[pidx]) {
-            float v_plate = (st->w_curr[pidx] - st->w_prev[pidx]) / dt;
-            P_new += sign * plate_src_coef * v_plate;
-        }
-        P_tmp[idx] = P_new;
+    for (int p = 0; p < st->n_plate_adj; ++p) {
+        int idx = st->plate_adj_idx[p];
+        int k   = idx % Nz;
+        int ij  = idx / Nz;
+        int i   = ij / Ny;
+        int j   = ij % Ny;
+        float dv = hf ? compute_div_v(Vx,Vy,Vz,Vxf,Vyf,Vzf,Nx,Ny,Nz,i,j,k)
+                      : compute_div_v_nofrac(Vx,Vy,Vz,Nx,Ny,Nz,i,j,k);
+        Ptmp[idx] = (Pn[idx] - bulk_coeff * dv) * pdamp[idx];
     }
 
-    /* Swap pressure buffers. */
     float* tmp = st->P_prev;
     st->P_prev = st->P_curr;
     st->P_curr = st->P_tmp;
     st->P_tmp  = tmp;
-
-    /* ── Vectorised velocity leapfrog ──────────────────────────────────────── */
-    {
-        using Eigen::Map;
-        using Eigen::ArrayXf;
-
-        const float vel_coeff = st->dt / (st->rho_air * st->dx);
-        const int   Nx_ = st->Nx, Ny_ = st->Ny, Nz_ = st->Nz;
-        const float* Pn = st->P_prev;  /* P^n (just swapped above) */
-
-        /* Vx: face (i+1/2, j, k) — k contiguous, length Nz */
-        for (int i = 0; i < Nx_-1; ++i) {
-            for (int j = 0; j < Ny_; ++j) {
-                int vbase = Nz_*(j + Ny_*i);
-                int Lbase = Nz_*(j + Ny_*i);
-                int Rbase = Nz_*(j + Ny_*(i+1));
-                Map<ArrayXf>       V (st->Vx      + vbase, Nz_);
-                Map<const ArrayXf> D (st->Vx_damp + vbase, Nz_);
-                Map<const ArrayXf> PL(Pn + Lbase,          Nz_);
-                Map<const ArrayXf> PR(Pn + Rbase,          Nz_);
-                V = V * D - vel_coeff * (PR - PL);
-            }
-        }
-
-        /* Vy: face (i, j+1/2, k) — k contiguous, length Nz */
-        for (int i = 0; i < Nx_; ++i) {
-            for (int j = 0; j < Ny_-1; ++j) {
-                int vbase = Nz_*(j + (Ny_-1)*i);
-                int Lbase = Nz_*(j     + Ny_*i);
-                int Rbase = Nz_*(j + 1 + Ny_*i);
-                Map<ArrayXf>       V (st->Vy      + vbase, Nz_);
-                Map<const ArrayXf> D (st->Vy_damp + vbase, Nz_);
-                Map<const ArrayXf> PL(Pn + Lbase,          Nz_);
-                Map<const ArrayXf> PR(Pn + Rbase,          Nz_);
-                V = V * D - vel_coeff * (PR - PL);
-            }
-        }
-
-        /* Vz: face (i, j, k+1/2) — k contiguous, length Nz-1 */
-        for (int i = 0; i < Nx_; ++i) {
-            for (int j = 0; j < Ny_; ++j) {
-                int vbase = (Nz_-1)*(j + Ny_*i);
-                int Lbase =  Nz_  *(j + Ny_*i);
-                Map<ArrayXf>       V (st->Vz      + vbase,     Nz_-1);
-                Map<const ArrayXf> D (st->Vz_damp + vbase,     Nz_-1);
-                Map<const ArrayXf> PL(Pn + Lbase,              Nz_-1);
-                Map<const ArrayXf> PR(Pn + Lbase + 1,          Nz_-1);
-                V = V * D - vel_coeff * (PR - PL);
-            }
-        }
-    }
-
-    /* Enforce no-through-flow velocity at every solid/air face.  The pressure
-     * update already uses Neumann ghosts at walls and active plate cells; this
-     * keeps sampled velocity and polar microphones from reporting impossible
-     * wall-normal motion through the soundboard or side walls. */
-    for (int i = 0; i < Nx-1; ++i)
-        for (int j = 0; j < Ny; ++j)
-            for (int k = 0; k < Nz; ++k) {
-                int L = IDX3(Ny, Nz, i,   j, k);
-                int R = IDX3(Ny, Nz, i+1, j, k);
-                if (cell_is_pressure_solid(ct[L]) || cell_is_pressure_solid(ct[R]))
-                    st->Vx[k + Nz*(j + Ny*i)] = 0.0f;
-            }
-    for (int i = 0; i < Nx; ++i)
-        for (int j = 0; j < Ny-1; ++j)
-            for (int k = 0; k < Nz; ++k) {
-                int L = IDX3(Ny, Nz, i, j,   k);
-                int R = IDX3(Ny, Nz, i, j+1, k);
-                if (cell_is_pressure_solid(ct[L]) || cell_is_pressure_solid(ct[R]))
-                    st->Vy[k + Nz*(j + (Ny-1)*i)] = 0.0f;
-            }
-    for (int i = 0; i < Nx; ++i)
-        for (int j = 0; j < Ny; ++j)
-            for (int k = 0; k < Nz-1; ++k) {
-                int L = IDX3(Ny, Nz, i, j, k);
-                int R = IDX3(Ny, Nz, i, j, k+1);
-                if (cell_is_pressure_solid(ct[L]) || cell_is_pressure_solid(ct[R]))
-                    st->Vz[k + (Nz-1)*(j + Ny*i)] = 0.0f;
-            }
-
     return FDTD_OK;
 }
 
@@ -938,7 +1244,7 @@ static int check_stable(AcousticFDTDState* st)
     st->stability_stride_phase = (start + 1) % SAMPLE_STRIDE;
     for (int i = start; i < st->N; i += SAMPLE_STRIDE) {
         float p = st->P_curr[i];
-        if (p != p || p > 1e6f || p < -1e6f)
+        if (!isfinite(p) || p > 2e3f || p < -2e3f)
             return FDTD_ERR_UNSTABLE;
     }
     return FDTD_OK;
@@ -952,7 +1258,8 @@ SK_API int fdtd_step(AcousticFDTDState* st, int n_steps)
     if (n_steps <= 0) return FDTD_OK;
 
     for (int s = 0; s < n_steps; ++s) {
-        plate_step(st);
+        int rc_plate = plate_step(st);
+        if (rc_plate != FDTD_OK) return rc_plate;
         int rc = pressure_step(st);
         if (rc != FDTD_OK) return rc;
         ++st->step_count;
@@ -1393,5 +1700,44 @@ SK_API int fdtd_inject_bridge_drive(
         int pidx = st->src_idx[i] / st->Nz;
         st->plate_ext_force[pidx] += force_scale * cell_drives[i] * inv_dx2;
     }
+    return FDTD_OK;
+}
+
+SK_API int fdtd_inject_plate_force(
+    AcousticFDTDState* st,
+    int          n_plate,
+    const int*   plate_indices,
+    const float* weights,
+    float        total_force_N)
+{
+    if (!st || !plate_indices || !weights) return FDTD_ERR_NULL;
+    if (!st->plate_ext_force) return FDTD_ERR_NULL;
+    if (n_plate <= 0 || total_force_N == 0.0f) return FDTD_OK;
+
+    float inv_dx2 = 1.0f / (st->dx * st->dx);
+    for (int i = 0; i < n_plate; ++i) {
+        int pidx = plate_indices[i];
+        if (pidx < 0 || pidx >= st->N_plate) continue;
+        if (!st->plate_active[pidx]) continue;
+        st->plate_ext_force[pidx] += total_force_N * weights[i] * inv_dx2;
+    }
+    return FDTD_OK;
+}
+
+SK_API int fdtd_sample_plate_weighted(
+    const AcousticFDTDState* st,
+    int          n_plate,
+    const int*   plate_indices,
+    const float* weights,
+    float*       out_w)
+{
+    if (!st || !plate_indices || !weights || !out_w) return FDTD_ERR_NULL;
+    float w = 0.0f;
+    for (int i = 0; i < n_plate; ++i) {
+        int pidx = plate_indices[i];
+        if (pidx < 0 || pidx >= st->N_plate) continue;
+        w += st->w_curr[pidx] * weights[i];
+    }
+    *out_w = w;
     return FDTD_OK;
 }

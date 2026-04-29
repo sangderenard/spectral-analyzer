@@ -1,19 +1,16 @@
 """acoustic_fdtd_bridge.py
 ========================
 Python bridge between the guitar geometry, the C AcousticFDTD solver, and the
-existing geometric ray tracer — implementing the derivative-coupling bridge
-excitation model and running both acoustic engines in co-evolution.
+existing geometric ray tracer and the structural AcousticCoEvolver.
 
 Three questions answered here
 ------------------------------
-1.  Derivative-coupling excitation
-    The physically correct way to drive the soundboard is not to inject the raw
-    string signals as pressure sources but to inject their *velocity* — the time
-    derivative of the summed driver signal — across the soundboard via a
-    Gaussian kernel centred on the bridge saddle.  This excites the plate's
-    translational (monopole) and rocking (dipole) modes in the right ratio and
-    naturally produces the antisymmetric plate modes that characterise guitar
-    tone.  The bridge ``inject_bridge(val, ddt)`` call does exactly this.
+1.  Structural excitation
+    The active guitar path uses ``AcousticCoEvolver``: string endpoint tension
+    forces drive a bridge/top impedance, the equal reaction loads the plate,
+    and only plate motion couples energy into the pressure field.  The older
+    ``AcousticFDTD.inject_bridge(val, ddt)`` pressure shortcut is disabled in
+    the C extension because it bypassed plate impedance.
 
 2.  Smooth volumetric field
     The FDTD maintains a continuous 3-D pressure field P(x,y,z,t) sampled at
@@ -89,8 +86,8 @@ def voxelise_guitar_body(
     outline_pts:     np.ndarray,   # (N, 2) float32, XY contour (CCW)
     body_h:          float,        # rib height (Z extent) in metres
     dx:              float = 0.008,
-    pad_cells:       int   = 12,   # air + PML padding around body
-    n_pml:           int   = 10,
+    pad_cells:       int   = 64,   # free-air + PML cells around body each side
+    n_pml:           int   = 28,   # PML cells at grid edge (innermost pad_cells-n_pml are free air)
 ) -> Tuple[np.ndarray, np.ndarray, dict]:
     """Voxelise the guitar outline into a 3-D FDTD cell-type grid.
 
@@ -150,13 +147,23 @@ def voxelise_guitar_body(
     # Plate active mask: cells inside the guitar outline at the top plate layer
     plate_active = inside_outline.astype(np.uint8)   # (Nx, Ny)
 
+    # exterior_mask: True for cells OUTSIDE the guitar body cavity.
+    # Interior cavity = inside XY outline + between back plate and top plate in Z.
+    # Exterior encompasses the free-air buffer, PML zone, and rib walls.
+    interior = np.zeros((Nx, Ny, Nz), dtype=bool)
+    for k in range(iz_back + 1, iz_top):
+        interior[:, :, k] = inside_outline
+    exterior_mask = ~interior   # (Nx, Ny, Nz) bool
+
     info = {
         'Nx': Nx, 'Ny': Ny, 'Nz': Nz,
         'dx': dx,
         'gx_min': gx_min, 'gy_min': gy_min, 'gz_min': gz_min,
         'plate_iz': iz_top,
+        'iz_back':  iz_back,
         'xs': xs, 'ys': ys, 'zs': zs,
         'n_pml': n_pml,
+        'exterior_mask': exterior_mask,   # (Nx, Ny, Nz) bool — True outside guitar cavity
     }
     return cell_type, plate_active, info
 
@@ -197,6 +204,121 @@ def _pip_grid(X: np.ndarray, Y: np.ndarray, poly: np.ndarray) -> np.ndarray:
         inside ^= cross
         j = i
     return inside
+
+
+def _pip_points(xs: np.ndarray, ys: np.ndarray, poly: np.ndarray) -> np.ndarray:
+    """Ray-casting point-in-polygon for flat arrays of (x, y) pairs."""
+    inside = np.zeros(len(xs), dtype=bool)
+    n = len(poly)
+    j = n - 1
+    for i in range(n):
+        xi, yi = float(poly[i, 0]), float(poly[i, 1])
+        xj, yj = float(poly[j, 0]), float(poly[j, 1])
+        cross = ((yi > ys) != (yj > ys)) & (
+            xs < (xj - xi) * (ys - yi) / (yj - yi + 1e-15) + xi
+        )
+        inside ^= cross
+        j = i
+    return inside
+
+
+def compute_cut_cell_fractions(
+    cell_type:   np.ndarray,   # (Nx, Ny, Nz) uint8
+    plate_active: np.ndarray,  # (Nx, Ny) uint8
+    outline_pts: np.ndarray,   # (N, 2) float32 — guitar outline polygon
+    info:        dict,
+) -> tuple:
+    """Compute per-face open-area fractions for cut-cell body boundary modelling.
+
+    Uses 2×2 sub-cell sampling on each boundary face (one solid, one air
+    neighbour) to estimate the fraction of the face area actually inside the
+    guitar body.  Interior faces stay 1.0; fully-solid faces stay 0.0.
+
+    Returns
+    -------
+    vx_frac : float32 flat array, length (Nx-1)*Ny*Nz
+    vy_frac : float32 flat array, length Nx*(Ny-1)*Nz
+    vz_frac : float32 flat array, length Nx*Ny*(Nz-1)
+    """
+    Nx, Ny, Nz = info['Nx'], info['Ny'], info['Nz']
+    dx        = float(info['dx'])
+    gx_min    = float(info['gx_min'])
+    gy_min    = float(info['gy_min'])
+    gz_min    = float(info['gz_min'])
+    plate_iz  = int(info['plate_iz'])
+    iz_back   = int(info.get('iz_back', 0))
+
+    # Body Z extent for the sub-point inside test
+    z_body_min = gz_min + iz_back * dx
+    z_body_max = gz_min + (plate_iz + 0.5) * dx   # includes plate-layer Vz faces
+
+    solid = (cell_type == FDTD_WALL) | (cell_type == FDTD_PLATE)  # (Nx, Ny, Nz)
+
+    # ── Vx fracs: (Nx-1, Ny, Nz) ──────────────────────────────────────────────
+    solid_L = solid[:-1, :, :]   # left  cell of each Vx face
+    solid_R = solid[1:,  :, :]   # right cell
+    vx_frac = np.where(solid_L | solid_R, 0.0, 1.0).astype(np.float32)
+    # Boundary faces: exactly one solid neighbour — compute partial fraction
+    bdry = solid_L ^ solid_R     # (Nx-1, Ny, Nz) bool
+    if np.any(bdry):
+        iis, jjs, kks = np.where(bdry)
+        x_face = gx_min + (iis + 1) * dx
+        fsum = np.zeros(len(iis), dtype=np.float32)
+        for dy in (0.25, 0.75):
+            for dz in (0.25, 0.75):
+                y_sub = gy_min + (jjs + dy) * dx
+                z_sub = gz_min + (kks + dz) * dx
+                in_xy = _pip_points(x_face, y_sub, outline_pts)
+                in_z  = (z_sub >= z_body_min) & (z_sub <= z_body_max)
+                fsum += (in_xy & in_z).astype(np.float32)
+        vx_frac[iis, jjs, kks] = fsum / 4.0
+
+    # ── Vy fracs: (Nx, Ny-1, Nz) ──────────────────────────────────────────────
+    solid_L = solid[:, :-1, :]
+    solid_R = solid[:, 1:,  :]
+    vy_frac = np.where(solid_L | solid_R, 0.0, 1.0).astype(np.float32)
+    bdry = solid_L ^ solid_R
+    if np.any(bdry):
+        iis, jjs, kks = np.where(bdry)
+        y_face = gy_min + (jjs + 1) * dx
+        fsum = np.zeros(len(iis), dtype=np.float32)
+        for dx_ in (0.25, 0.75):
+            for dz in (0.25, 0.75):
+                x_sub = gx_min + (iis + dx_) * dx
+                z_sub = gz_min + (kks + dz)  * dx
+                in_xy = _pip_points(x_sub, y_face, outline_pts)
+                in_z  = (z_sub >= z_body_min) & (z_sub <= z_body_max)
+                fsum += (in_xy & in_z).astype(np.float32)
+        vy_frac[iis, jjs, kks] = fsum / 4.0
+
+    # ── Vz fracs: (Nx, Ny, Nz-1) ──────────────────────────────────────────────
+    solid_L = solid[:, :, :-1]
+    solid_R = solid[:, :, 1:]
+    vz_frac = np.where(solid_L | solid_R, 0.0, 1.0).astype(np.float32)
+    # Plate-layer Vz faces: plate injection drives these — always 1.0 where active
+    if 0 < plate_iz < Nz - 1:
+        pa = plate_active.astype(bool)
+        vz_frac[:, :, plate_iz - 1][pa] = 1.0
+        vz_frac[:, :, plate_iz    ][pa] = 1.0
+    # Boundary faces excluding plate-layer (those are handled above)
+    bdry = solid_L ^ solid_R
+    if 0 < plate_iz < Nz - 1:
+        bdry[:, :, plate_iz - 1] = False
+        bdry[:, :, plate_iz    ] = False
+    if np.any(bdry):
+        iis, jjs, kks = np.where(bdry)
+        z_face = gz_min + (kks + 1) * dx
+        fsum = np.zeros(len(iis), dtype=np.float32)
+        for dx_ in (0.25, 0.75):
+            for dy in (0.25, 0.75):
+                x_sub = gx_min + (iis + dx_) * dx
+                y_sub = gy_min + (jjs + dy)  * dx
+                in_xy = _pip_points(x_sub, y_sub, outline_pts)
+                in_z  = (z_face >= z_body_min) & (z_face <= z_body_max)
+                fsum += (in_xy & in_z).astype(np.float32)
+        vz_frac[iis, jjs, kks] = fsum / 4.0
+
+    return (vx_frac.ravel(), vy_frac.ravel(), vz_frac.ravel())
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +390,7 @@ class FDTDCoEvolver:
                  bridge_positions: list,
                  crossover_hz:    float = 1500.0,
                  sample_rate:     int   = 44100,
-                 force_scale:     float = 5e-3):
+                 force_scale:     float = 1.0):
         if not _HAS_FDTD:
             raise RuntimeError(
                 "_spectral_kernels.AcousticFDTD not available — rebuild the C extension:\n"
@@ -278,7 +400,7 @@ class FDTDCoEvolver:
         self.info            = info
         self.crossover_hz    = crossover_hz
         self._sample_rate    = sample_rate
-        self._force_scale    = force_scale
+        self._force_scale    = 1.0
         self._sig_prev       = 0.0
         self._steps_per_sample = max(1, int(math.ceil(
             (1.0 / sample_rate) / fdtd.dt
@@ -300,11 +422,13 @@ class FDTDCoEvolver:
         n_pml:          int   = 10,
         crossover_hz:   float = 1500.0,
         sample_rate:    int   = 44100,
-        force_scale:    float = 5e-3,
+        force_scale:    float = 1.0,
         c:              float = 343.0,
         rho_air:        float = 1.21,
         plate_mass:     float = 7.0,
         plate_stiff:    float = 0.45,
+        plate_alpha_M:  float = 2.0,
+        plate_beta_K:   float = 1e-5,
     ) -> "FDTDCoEvolver":
         """Build a FDTDCoEvolver directly from a CavityScene (string_plate body).
 
@@ -328,8 +452,15 @@ class FDTDCoEvolver:
             plate_active=plate_active.ravel(),
             plate_mass_density=plate_mass,
             plate_stiffness_D=plate_stiff,
+            plate_alpha_M=plate_alpha_M,
+            plate_beta_K=plate_beta_K,
             n_pml=n_pml,
         )
+
+        # Cut-cell body boundary: compute sub-cell face fractions and apply.
+        vx_f, vy_f, vz_f = compute_cut_cell_fractions(
+            cell_type, plate_active, outline_pts, info)
+        fdtd.set_face_fractions(vx_f, vy_f, vz_f)
 
         return cls(fdtd, info, bridge_positions,
                    crossover_hz=crossover_hz,
@@ -339,22 +470,12 @@ class FDTDCoEvolver:
     # ── Signal injection ─────────────────────────────────────────────────────
 
     def push_driver_sample(self, signal_sum: float) -> None:
-        """Inject one audio sample.
-
-        Computes the time derivative (bridge velocity) and injects both
-        the signal and its derivative into the FDTD via the bridge kernel.
-        The derivative coupling is the physically correct model: it drives
-        the plate translational + rocking modes proportional to bridge velocity
-        (≈ d/dt ΣᵢSᵢ(t)), producing the characteristic guitar tone shaping.
-        """
-        signal_ddt = (signal_sum - self._sig_prev) * self._sample_rate
-        self._sig_prev = signal_sum
-        self.fdtd.inject_bridge(
-            float(signal_sum),
-            float(signal_ddt),
-            self._force_scale,
+        """Legacy direct-pressure injection is intentionally disabled."""
+        raise RuntimeError(
+            "FDTDCoEvolver.push_driver_sample is disabled: it used direct "
+            "pressure bridge injection. Use build_acoustic_coevolver_from_scene "
+            "and AcousticCoEvolver for structural string-bridge-plate coupling."
         )
-        self.fdtd.step(self._steps_per_sample)
 
     def push_driver_block(self, signal_block: np.ndarray) -> None:
         """Inject a block of audio samples and advance the FDTD.
@@ -672,14 +793,17 @@ _GUITAR_STRING_PARAMS = [
 ]
 
 
-def _string_physical_params(index: int, scale_length_m: float) -> tuple[float, float, float, float, float, float]:
-    """Return (frequency_hz, gauge_in, tension_N, linear_mass_kgm, damping, stiffness_EI)."""
+def _string_physical_params(index: int, scale_length_m: float) -> tuple[float, float, float, float, float, float, float]:
+    """Return (frequency_hz, gauge_in, tension_N, linear_mass_kgm, damping, stiffness_EI, axial_stiffness_N)."""
     base = _GUITAR_STRING_PARAMS[index]
     _tension_ref, mu, damping, stiffness_EI = base
     f0 = GUITAR_TUNING_HZ[index]
     gauge = GUITAR_GAUGE_IN[index]
     tension = (2.0 * scale_length_m * f0) ** 2 * mu
-    return float(f0), float(gauge), float(tension), float(mu), float(damping), float(stiffness_EI)
+    diameter_m = gauge * 0.0254
+    area_m2 = math.pi * 0.25 * diameter_m * diameter_m
+    axial_stiffness = 2.0e11 * area_m2
+    return float(f0), float(gauge), float(tension), float(mu), float(damping), float(stiffness_EI), float(axial_stiffness)
 
 
 def build_acoustic_coevolver_from_scene(
@@ -691,12 +815,16 @@ def build_acoustic_coevolver_from_scene(
     n_pml:        int   = 10,
     n_segs:       int   = 240,
     modal_stride: int   = 16,
-    force_scale:  float = 8e-4,
+    force_scale:  float = 1.0,
     c:            float = 343.0,
     rho_air:      float = 1.21,
     plate_mass:   float = 7.0,
     plate_stiff:  float = 0.45,
+    plate_alpha_M: float = 2.0,
+    plate_beta_K:  float = 1e-5,
     scale_length_m: float = GUITAR_SCALE_LENGTH_M,
+    fretless: bool = False,
+    fret_number: int = 0,
 ):
     """Build an AcousticCoEvolver from a CavityScene body geometry.
 
@@ -711,7 +839,8 @@ def build_acoustic_coevolver_from_scene(
     sample_rate : audio sample rate (Hz)
     dx          : FDTD cell size (m).  0.010 m keeps grid under ~50^3 cells.
     n_segs      : FDTD segments per string
-    force_scale : bridge force injection scale
+    force_scale : deprecated compatibility parameter; structural coupling uses
+                  explicit bridge/body impedances
 
     Returns
     -------
@@ -754,23 +883,31 @@ def build_acoustic_coevolver_from_scene(
     string_defs = []
     for si in range(n_strings):
         x_str = -x_span / 2.0 + si * (x_span / max(1, n_strings - 1))
-        # Path: n_segs+1 nodes from nut to saddle (straight line in Y).
+        x_nut = x_str * 0.72
+        # Path: n_segs+1 nodes from nut to saddle with a small lateral fan.
         # The pybind binding derives n_segs from len(path_xyz) - 1.
         ys_path = np.linspace(y_nut, y_saddle, n_segs + 1, dtype=np.float32)
+        xs_path = np.linspace(x_nut, x_str, n_segs + 1, dtype=np.float32)
         path = np.column_stack([
-            np.full(n_segs + 1, x_str,   dtype=np.float32),
+            xs_path,
             ys_path,
             np.full(n_segs + 1, string_z, dtype=np.float32),
         ])  # (n_segs+1, 3) float32
         pix = param_indices[si]
-        f0, gauge, tension, lin_mass, damping, stiffness_EI = _string_physical_params(
+        f0, gauge, tension, lin_mass, damping, stiffness_EI, axial_stiffness = _string_physical_params(
             int(pix), float(scale_length_m))
+        if int(fret_number) > 0:
+            # A stopped note damps the non-speaking string length behind the
+            # contact point.  The current C solver models the speaking length;
+            # fold the behind-fret/finger loss into the distributed damping.
+            damping *= 1.18 if fretless else 1.08
         string_defs.append({
             'path_xyz':         path,       # n_segs derived from shape
             'tension_N':        float(tension),
             'linear_mass_kgm':  float(lin_mass),
             'damping':          float(damping),
             'stiffness_EI':     float(stiffness_EI),
+            'axial_stiffness_N': float(axial_stiffness),
             'fundamental_hz':    float(f0),
             'gauge_in':          float(gauge),
             'scale_length_m':    float(scale_length_m),
@@ -827,6 +964,8 @@ def build_acoustic_coevolver_from_scene(
         'plate_active':       plate_active.ravel().astype(np.uint8),
         'plate_mass_density': plate_mass,
         'plate_stiffness_D':  plate_stiff,
+        'plate_alpha_M':      plate_alpha_M,
+        'plate_beta_K':       plate_beta_K,
         'n_pml':              n_pml,
         'bridge_src_xyz':     bridge_xyz,
         'bridge_sigma':       0.012,
@@ -841,4 +980,10 @@ def build_acoustic_coevolver_from_scene(
         modal_stride = modal_stride,
         force_scale  = force_scale,
     )
+
+    # Cut-cell body boundary: compute sub-cell face fractions and apply.
+    vx_f, vy_f, vz_f = compute_cut_cell_fractions(
+        cell_type, plate_active, outline_pts, info)
+    co.set_face_fractions(vx_f, vy_f, vz_f)
+
     return co, info

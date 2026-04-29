@@ -1,7 +1,7 @@
 /**
  * acoustic_fdtd.h — C ABI for the 3-D acoustic FDTD solver.
  *
- * Implements a damped-wave second-order leapfrog pressure field on a
+ * Implements a staggered pressure/particle-velocity acoustic FDTD field on a
  * rectilinear Cartesian grid, coupled to a 2-D Kirchhoff plate model for
  * the instrument soundboard.  Designed to co-evolve with the geometric ray
  * tracer: the FDTD handles wave-domain physics below the Schroeder frequency
@@ -10,13 +10,16 @@
  *
  * Physics
  * -------
- * Pressure field P(x,y,z,t) on a uniform grid with cell size dx:
+ * Pressure field P(x,y,z,t) and staggered face velocities v are advanced on a
+ * uniform grid with cell size dx:
  *
- *   P^{n+1} = (2 P^n − P^{n−1}·(1−α·dt) + C2·∇²P^n·dt² + S^n) / (1+α·dt)
+ *   v^{n+1/2} = damp_v · (v^{n−1/2} − dt/rho · grad(P^n))
+ *   P^{n+1}   = damp_p · (P^n − rho*c²*dt · div(v^{n+1/2}))
  *
- * where C2 = (c·dt/dx)²,  S^n is the injected source pressure, and α is a
- * per-cell damping coefficient (zero in the interior, increasing polynomially
- * in the PML absorbing layer at the domain boundary).
+ * where alpha is zero in the interior and increases polynomially in the PML.
+ * Solid baffle faces enforce v_n = 0. Moving soundboard faces enforce
+ * v_n = plate_velocity, so the acoustic field is driven by actual volume
+ * displacement rather than by an arbitrary pressure source.
  *
  * Rigid-wall cells use a Neumann ghost: the Laplacian contribution from any
  * solid-wall face direction is zero (pressure gradient = 0 at rigid wall).
@@ -31,21 +34,16 @@
  * F_bridge is the force from bridge saddle injection, and D = E·h³/12(1−ν²)
  * is the bending stiffness.  Discretised with a standard 13-point biharmonic
  * stencil (5th-order accurate), simply-supported boundary at the guitar
- * outline.  Plate velocity dw/dt is fed back into the FDTD as a soft monopole
- * source in the two cells adjacent to the plate.
+ * outline.  Plate velocity dw/dt is imposed as the normal velocity boundary
+ * condition on the two air faces adjacent to each active plate cell.
  *
- * Bridge excitation — derivative coupling (signal derivative model)
- * -----------------------------------------------------------------
- * The physically correct excitation is not a static force but the *velocity*
- * of the bridge saddle, which is proportional to d/dt ΣᵢSᵢ(t) (the time
- * derivative of the summed string driver signals).  Injecting this derivative
- * drives the plate's translational and rocking modes in the correct ratio,
- * exciting both symmetric (breathing) and antisymmetric plate modes.
- *
- * The caller supplies signal_val and signal_ddt each block; the FDTD injects:
- *   F_bridge[x,y] = signal_ddt · weight[x,y]  (force/area)
- * where weight[x,y] is a Gaussian kernel centred on the bridge saddle and
- * tapered to zero outside the guitar outline.
+ * Bridge excitation
+ * -----------------
+ * Bridge excitation is expected to enter through fdtd_inject_bridge_drive():
+ * a per-cell structural force in Newtons is converted to a plate load and only
+ * the moving Kirchhoff plate couples that energy into the acoustic field.  The
+ * older fdtd_inject_bridge(signal, derivative, scale) direct-pressure shortcut
+ * is disabled because it bypasses the plate impedance and is not conservative.
  *
  * Volumetric pressure field
  * -------------------------
@@ -128,6 +126,10 @@ typedef struct AcousticFDTDState AcousticFDTDState;
  * @param plate_mass_density   ρ_s · h  (kg/m²).  Typical spruce top: 7.0.
  * @param plate_stiffness_D    Bending stiffness D = E·h³/12(1−ν²) (N·m).
  *                             Typical 3 mm spruce: 0.45.
+ * @param plate_alpha_M        Rayleigh mass-proportional damping rate (s⁻¹).
+ *                             Controls low-frequency modal decay. Spruce: 1–3.
+ * @param plate_beta_K         Rayleigh stiffness-proportional damping time (s).
+ *                             Controls high-frequency modal decay. Spruce: ~1e-5.
  * @param n_pml                Thickness of the PML absorbing layer (cells).
  *                             Typical: 10.  Set 0 to disable PML.
  * @return                     Opaque handle, NULL on failure.
@@ -142,6 +144,8 @@ SK_API AcousticFDTDState* fdtd_create(
     const uint8_t* plate_active,
     float   plate_mass_density,
     float   plate_stiffness_D,
+    float   plate_alpha_M,
+    float   plate_beta_K,
     int     n_pml
 );
 
@@ -171,20 +175,11 @@ SK_API int fdtd_set_bridge_sources(
 );
 
 /**
- * Inject one signal sample into the bridge source cells.
- *
- * To implement the derivative coupling model (physically correct), call this
- * each audio sample with:
- *   signal_val = Σᵢ sᵢ(t)             (sum of string driver signals)
- *   signal_ddt = d/dt Σᵢ sᵢ(t)        (first derivative — bridge velocity)
- *
- * signal_val provides the low-frequency pressure coupling.
- * signal_ddt drives the Kirchhoff plate (bridge rocking / translational mode).
- *
- * @param signal_val   Current summed signal value.
- * @param signal_ddt   First time derivative of the summed signal.
- * @param force_scale  Global force scale factor (tunes acoustic output level).
- * @return             FDTD_OK or error code.
+ * Disabled legacy direct-pressure bridge injection.  This API used to convert
+ * a waveform and derivative directly into acoustic pressure near the bridge,
+ * bypassing the structural plate impedance.  It now returns
+ * FDTD_ERR_UNSTABLE so stale callers fail loudly instead of creating
+ * non-conservative pressure.
  */
 SK_API int fdtd_inject_bridge(
     AcousticFDTDState* st,
@@ -204,16 +199,67 @@ SK_API int fdtd_inject_bridge(
  * sources that bypass the plate's finite impedance.
  *
  * @param cell_drives  (n_src,) float32 — per-cell bridge force in Newtons.
- * @param force_scale  Global force scale (tunes output level; was previously
- *                     calibrated for direct pressure injection — rescale by
- *                     approximately dx² * plate_rho_h / dt_fdtd after this
- *                     change to maintain equivalent SPL).
+ * @param force_scale  Compatibility parameter. Use 1.0 for physical units;
+ *                     callers should tune the coupled impedances instead of
+ *                     using an output gain here.
  * @return             FDTD_OK or FDTD_ERR_NULL.
  */
 SK_API int fdtd_inject_bridge_drive(
     AcousticFDTDState* st,
     const float* cell_drives,
     float        force_scale);
+
+/**
+ * Inject a weighted structural force directly into arbitrary plate nodes.
+ *
+ * total_force_N is distributed by weights over plate_indices (flat j + Ny*i).
+ * The implementation converts force to pressure-equivalent surface load by
+ * dividing by dx², then plate_step consumes and zeroes it.  This is intended
+ * for non-bridge structural couplings such as neck/body joint reactions.
+ */
+SK_API int fdtd_inject_plate_force(
+    AcousticFDTDState* st,
+    int          n_plate,
+    const int*   plate_indices,
+    const float* weights,
+    float        total_force_N);
+
+/**
+ * Set per-face open-area fractions for cut-cell body boundary modelling.
+ *
+ * Replaces the staircase wall approximation with sub-cell accuracy at the
+ * guitar body boundary.  Each fraction ∈ [0, 1]:
+ *   0.0 — fully closed (velocity zeroed in BC pass; default for solid-adjacent)
+ *   1.0 — fully open   (interior or fully unoccluded; default for air-air)
+ *   (0,1) — partial opening at a cut-cell body boundary
+ *
+ * The BC pass zeros faces where frac == 0; the pressure divergence scales
+ * each V contribution by its face fraction to compute partial flux.
+ *
+ * Call once after fdtd_create to enable smooth staircase-free body walls.
+ * Safe to call again to update geometry without rebuilding the solver.
+ * Pass NULL for any component to leave it unchanged.
+ *
+ * Array sizes: vx_frac (Nx-1)*Ny*Nz, vy_frac Nx*(Ny-1)*Nz, vz_frac Nx*Ny*(Nz-1).
+ * Use fdtd_get_velocity_dims() to query these sizes.
+ *
+ * @return FDTD_OK or FDTD_ERR_NULL.
+ */
+SK_API int fdtd_set_face_fractions(
+    AcousticFDTDState* st,
+    const float* vx_frac,
+    const float* vy_frac,
+    const float* vz_frac);
+
+/**
+ * Sample a weighted average of plate displacement at arbitrary plate nodes.
+ */
+SK_API int fdtd_sample_plate_weighted(
+    const AcousticFDTDState* st,
+    int          n_plate,
+    const int*   plate_indices,
+    const float* weights,
+    float*       out_w);
 
 /* ── Time stepping ────────────────────────────────────────────────────────── */
 
@@ -283,10 +329,10 @@ SK_API int fdtd_sample_velocity_precomputed(
  *
  * One step performs:
  *   1. Kirchhoff plate update — structural dynamics + air loading.
- *   2. Pressure update for all air / PML cells — leapfrog with damping.
- *   3. Plate → air radiation injection — plate velocity as soft source.
- *   4. PML absorption — exponential decay in boundary layers.
- *   5. Wall BC enforcement — rigid Neumann at solid boundaries.
+ *   2. Face velocity update from pressure gradients.
+ *   3. Solid and moving-plate face boundary conditions.
+ *   4. Pressure update from velocity divergence.
+ *   5. PML absorption through pressure/velocity damping factors.
  *
  * @return FDTD_OK on success, FDTD_ERR_UNSTABLE if pressure diverges.
  */

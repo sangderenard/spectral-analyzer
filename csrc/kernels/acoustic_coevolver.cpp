@@ -4,7 +4,7 @@
  * Implements the full per-sample loop:
  *   string FDTD (1-D leapfrog, two polarisations, arbitrary 3-D procession)
  *   → modal projection (lazy, every modal_stride steps)
- *   → bridge velocity sum → body FDTD inject (derivative coupling)
+ *   → string endpoint forces → bridge/top impedance → plate load
  *   → Kirchhoff plate + 3-D acoustic FDTD sub-steps
  *   → saddle BC update (two-way plate → string coupling)
  *   → pickup integration (single-coil / humbucker / piezo)
@@ -31,6 +31,8 @@
 #define N_MODES       32      /* Modal harmonics tracked per string              */
 #define MAX_SUBSTEPS  16      /* Safety cap on FDTD sub-steps per audio sample   */
 #define OUTPUT_BUF    4096    /* Ring buffer length for pickup/mic output (samples) */
+#define STRING_MAX_SEGMENT_SLOPE 0.25f   /* Small-deflection validity limit. */
+#define STRING_MAX_STRETCH_FRAC  0.0015f /* Added arc length / open length.  */
 
 /* ── Pluck event ──────────────────────────────────────────────────────────── */
 
@@ -56,6 +58,8 @@ typedef struct {
 
     /* Wave parameters */
     float   tension_N;
+    float   tension_eff;      /* Tension including geometric stretch (N)        */
+    float   axial_stiffness_N;/* Axial EA used for geometric tension (N)        */
     float   linear_mass;
     float   wave_speed;       /* c_s = sqrt(T / mu)                             */
     float   cfl2;             /* (wave_speed * dt_s / ds)^2  ≤ 0.9025           */
@@ -71,12 +75,18 @@ typedef struct {
     /* External force injection */
     float*  ext_force[2];     /* (n_nodes,) per-node force accumulator          */
 
-    /* Saddle BC (set by body plate each step) */
+    /* Saddle/bridge coupling */
     float   saddle_w;         /* plate displacement at saddle (m)               */
+    float   saddle_w_prev;    /* previous plate displacement at saddle (m)      */
+    float   bridge_w;         /* bridge/saddle DOF displacement (m)             */
+    float   bridge_w_prev;    /* previous bridge/saddle DOF displacement (m)    */
+    float   bridge_mass_eff;  /* per-string effective bridge mass (kg)          */
+    float   bridge_stiff_eff; /* bridge-to-plate stiffness (N/m)                */
+    float   bridge_damp_eff;  /* bridge-to-plate damping (N*s/m)                */
 
-    /* Neck dynamics at nut end (pol=0 only).
-     * When has_neck_model != 0, replaces rigid u[0]=0 with a driven 1-DOF
-     * spring-mass-damper representing the neck's fundamental bending mode. */
+    /* Legacy per-string neck descriptor fields.  The active model is shared
+     * at AcousticCoEvolverState level; these are retained for construction
+     * compatibility and reset hygiene. */
     int     has_neck_model;
     float   nut_w;            /* current nut displacement (m)                   */
     float   nut_w_prev;       /* previous nut displacement (m)                  */
@@ -174,13 +184,28 @@ struct AcousticCoEvolverState {
     float* bridge_cell_wgt;
     int   n_bridge_cells;
 
+    /* Shared neck/body structural coupling.  All string nut forces drive one
+     * neck bending DOF; the equal/opposite joint reaction is distributed into
+     * an upper-bout/neck-block plate kernel. */
+    int*   neck_plate_idx;       /* Flat plate indices j + Ny*i                */
+    float* neck_plate_wgt;       /* Normalized joint kernel weights            */
+    int    n_neck_plate_cells;
+    float  neck_w;
+    float  neck_w_prev;
+    float  neck_plate_w_prev;
+    float  neck_mass_eff;
+    float  neck_stiff_eff;
+    float  neck_damp_eff;
+    float  neck_body_stiff_eff;
+    float  neck_body_damp_eff;
+
     /* Timing */
     float sample_rate;
     float dt_audio;              /* 1/sample_rate                              */
     float dt_fdtd;               /* From fdtd_get_dt()                         */
     int   substeps;              /* ceil(dt_audio / dt_fdtd), capped           */
 
-    /* Force scale */
+    /* Deprecated compatibility field; kept at 1.0. */
     float force_scale;
 
     /* Global damping multiplier — applied to all string γ each step.
@@ -197,7 +222,7 @@ struct AcousticCoEvolverState {
     int     out_write_pos;       /* Write cursor into ring                     */
     int     samples_written;     /* Total samples produced                     */
 
-    /* Bridge derivative coupling — track previous bridge velocity sum        */
+    /* Deprecated legacy direct-pressure state. */
     float   bridge_vel_prev;
 
     /* Scratch: per-sample pickup accumulator */
@@ -377,9 +402,28 @@ static StringState* string_create(const CoEvolverStringDef* def, float dt_fdtd)
     memcpy(ss->seg_xyz, def->path_xyz, (N+1)*3*sizeof(float));
 
     ss->tension_N    = def->tension_N;
+    ss->tension_eff  = def->tension_N;
     ss->linear_mass  = def->linear_mass_kgm;
     ss->gamma        = def->damping;
     ss->gamma_eff    = def->damping;
+    ss->axial_stiffness_N = def->axial_stiffness_N;
+    if (ss->axial_stiffness_N <= 0.0f && ss->linear_mass > 0.0f) {
+        const float steel_E_over_rho = 2.0e11f / 7850.0f;
+        ss->axial_stiffness_N = steel_E_over_rho * ss->linear_mass;
+    }
+
+    /* Per-string bridge/top impedance.  The string endpoint is the bridge DOF;
+     * the soundboard receives the equal spring/damper reaction from that DOF.
+     * These conservative defaults put the bridge/top coupling in the low kHz
+     * band with moderate loss, avoiding a rigid, energy-injecting saddle. */
+    ss->bridge_mass_eff = 0.00035f;
+    {
+        const float bridge_freq_hz = 450.0f;
+        const float bridge_Q       = 2.5f;
+        float omega_b = 2.0f * (float)M_PI * bridge_freq_hz;
+        ss->bridge_stiff_eff = ss->bridge_mass_eff * omega_b * omega_b;
+        ss->bridge_damp_eff  = ss->bridge_mass_eff * omega_b / bridge_Q;
+    }
 
     /* Neck bending model at nut — optional driven BC */
     if (def->neck_freq_hz > 0.0f && def->neck_mass_kg > 0.0f) {
@@ -476,10 +520,64 @@ static void string_destroy(StringState* ss)
 
 /* ── 1-D string FDTD step ─────────────────────────────────────────────────── */
 
-static void string_step_pol(StringState* ss, int pol)
+static int string_validate_shape(const StringState* ss)
+{
+    if (!ss || ss->n_nodes < 2 || ss->ds <= 0.0f || ss->total_length <= 0.0f)
+        return CE_ERR_UNSTABLE;
+
+    float arc = 0.0f;
+    for (int i = 0; i < ss->n_nodes - 1; ++i) {
+        float du0 = ss->u[0][i + 1] - ss->u[0][i];
+        float du1 = ss->u[1][i + 1] - ss->u[1][i];
+        if (!isfinite(du0) || !isfinite(du1)) return CE_ERR_UNSTABLE;
+
+        float slope = sqrtf(du0 * du0 + du1 * du1) / ss->ds;
+        if (!isfinite(slope) || slope > STRING_MAX_SEGMENT_SLOPE)
+            return CE_ERR_UNSTABLE;
+
+        arc += sqrtf(ss->ds * ss->ds + du0 * du0 + du1 * du1);
+    }
+
+    float stretch_frac = (arc - ss->total_length) / ss->total_length;
+    if (!isfinite(stretch_frac) || stretch_frac > STRING_MAX_STRETCH_FRAC)
+        return CE_ERR_UNSTABLE;
+
+    return CE_OK;
+}
+
+static int string_update_geometric_tension(StringState* ss)
+{
+    if (!ss || ss->n_nodes < 2 || ss->ds <= 0.0f || ss->total_length <= 0.0f)
+        return CE_ERR_UNSTABLE;
+
+    float arc = 0.0f;
+    for (int i = 0; i < ss->n_nodes - 1; ++i) {
+        float du0 = ss->u[0][i + 1] - ss->u[0][i];
+        float du1 = ss->u[1][i + 1] - ss->u[1][i];
+        if (!isfinite(du0) || !isfinite(du1)) return CE_ERR_UNSTABLE;
+        arc += sqrtf(ss->ds * ss->ds + du0 * du0 + du1 * du1);
+    }
+
+    float strain = (arc - ss->total_length) / ss->total_length;
+    if (!isfinite(strain)) return CE_ERR_UNSTABLE;
+    if (strain < 0.0f) strain = 0.0f;
+
+    ss->tension_eff = ss->tension_N + ss->axial_stiffness_N * strain;
+    if (!isfinite(ss->tension_eff) || ss->tension_eff <= 0.0f)
+        return CE_ERR_UNSTABLE;
+
+    float cfl = sqrtf(ss->tension_eff / ss->linear_mass) * ss->dt_s / ss->ds;
+    if (!isfinite(cfl) || cfl * cfl > 0.9025f)
+        return CE_ERR_UNSTABLE;
+
+    return CE_OK;
+}
+
+static int string_step_pol(StringState* ss, int pol, float nut_bc_w)
 {
     int   N    = ss->n_nodes;
-    float c2   = ss->cfl2;
+    float cfl  = sqrtf(ss->tension_eff / ss->linear_mass) * ss->dt_s / ss->ds;
+    float c2   = cfl * cfl;
 
     /* Centered damped leapfrog (Crank–Nicolson velocity):
      *   (1 + γdt/2) u^{n+1} = 2u^n − (1 − γdt/2) u^{n-1} + c²Δt²∇²u + dt²F/μ
@@ -495,27 +593,13 @@ static void string_step_pol(StringState* ss, int pol)
     Arr fe(ss->ext_force[pol], N);
 
     /* Boundary conditions */
-    ut[N-1] = (pol == 0) ? ss->saddle_w : 0.0f;
+    ut[N-1] = (pol == 0) ? ss->bridge_w : 0.0f;
 
     /* Nut BC: rigid (0) or driven by neck bending oscillator (pol=0 only).
      * The neck model is a 1-DOF spring-mass-damper driven by the string's
      * nut slope force: F = T·(u[1] − nut_w)/ds.  Centered leapfrog for neck:
      *   (m/dt² + c/2dt)·w_new = (2m/dt² − k)·w − (m/dt² − c/2dt)·w_prev + F */
-    if (ss->has_neck_model && pol == 0) {
-        float F_nut = ss->tension_N * (u[1] - ss->nut_w) / ss->ds;
-        float dt2   = ss->dt_s * ss->dt_s;
-        float a_inv = 1.0f / (ss->neck_mass_eff / dt2
-                             + ss->neck_damp_eff / (2.0f * ss->dt_s));
-        float w_new = a_inv * (
-              (2.0f * ss->neck_mass_eff / dt2 - ss->neck_stiff_eff) * ss->nut_w
-            + (-ss->neck_mass_eff / dt2 + ss->neck_damp_eff / (2.0f * ss->dt_s)) * ss->nut_w_prev
-            + F_nut);
-        ss->nut_w_prev = ss->nut_w;
-        ss->nut_w = w_new;
-        ut[0] = w_new;
-    } else {
-        ut[0] = 0.0f;
-    }
+    ut[0] = (pol == 0) ? nut_bc_w : 0.0f;
 
     /* Interior nodes [1 .. N-2]: fully vectorised 3-point wave stencil. */
     if (N > 2) {
@@ -542,8 +626,7 @@ static void string_step_pol(StringState* ss, int pol)
         /* Divide numerator by (1 + γdt/2) to complete the centered update. */
         new_u *= inv_1pg;
 
-        /* Clamp any numerically-exploded nodes. */
-        new_u = (new_u.abs() > 0.1f).select(Eigen::ArrayXf::Zero(M), new_u);
+        if (!new_u.isFinite().all()) return CE_ERR_UNSTABLE;
         ut.segment(1, M) = new_u;
     }
 
@@ -555,6 +638,7 @@ static void string_step_pol(StringState* ss, int pol)
 
     /* ext_force[pol] is not part of the swap — zero it for next step */
     fe.setZero();
+    return CE_OK;
 }
 
 /* ── Modal projection ─────────────────────────────────────────────────────── */
@@ -758,6 +842,79 @@ static int build_bridge_kernel(AcousticCoEvolverState* st,
     return CE_OK;
 }
 
+/* Neck/body joint kernel: distribute heel reaction over the upper-bout/top-block
+ * region instead of pinning one plate cell.  The centre is inferred from the
+ * active plate mask's highest-Y cells, which corresponds to the neck joint side
+ * for the generated guitar body. */
+static int build_neck_plate_kernel(AcousticCoEvolverState* st,
+                                   const uint8_t* plate_active,
+                                   float sigma)
+{
+    if (!st || !plate_active || st->Nx <= 0 || st->Ny <= 0) return CE_ERR_NULL;
+    if (sigma <= 0.0f) sigma = 0.030f;
+
+    float y_max = -FLT_MAX;
+    for (int i = 0; i < st->Nx; ++i) {
+        for (int j = 0; j < st->Ny; ++j) {
+            int p = j + st->Ny * i;
+            if (!plate_active[p]) continue;
+            float y = (float)j * st->dx + st->origin[1];
+            if (y > y_max) y_max = y;
+        }
+    }
+    if (y_max == -FLT_MAX) return CE_ERR_PARAM;
+
+    float cx = 0.0f;
+    float cy = y_max - 0.012f;
+    int radius_cells = (int)ceilf(3.0f * sigma / st->dx) + 1;
+    int ci = (int)floorf((cx - st->origin[0]) / st->dx);
+    int cj = (int)floorf((cy - st->origin[1]) / st->dx);
+
+    int cap = (2 * radius_cells + 1) * (2 * radius_cells + 1);
+    int* idx = alloc_i(cap);
+    float* wgt = alloc_f(cap);
+    if (!idx || !wgt) {
+        free(idx);
+        free(wgt);
+        return CE_ERR_NULL;
+    }
+
+    float inv_2s2 = 0.5f / (sigma * sigma);
+    int count = 0;
+    float wsum = 0.0f;
+    for (int di = -radius_cells; di <= radius_cells; ++di) {
+        int i = ci + di;
+        if (i < 0 || i >= st->Nx) continue;
+        for (int dj = -radius_cells; dj <= radius_cells; ++dj) {
+            int j = cj + dj;
+            if (j < 0 || j >= st->Ny) continue;
+            int p = j + st->Ny * i;
+            if (!plate_active[p]) continue;
+            float x = (float)i * st->dx + st->origin[0];
+            float y = (float)j * st->dx + st->origin[1];
+            float dx = x - cx;
+            float dy = y - cy;
+            float ww = expf(-(dx*dx + dy*dy) * inv_2s2);
+            if (ww <= 1e-12f) continue;
+            idx[count] = p;
+            wgt[count] = ww;
+            wsum += ww;
+            ++count;
+        }
+    }
+    if (count <= 0 || wsum <= 1e-12f) {
+        free(idx);
+        free(wgt);
+        return CE_ERR_PARAM;
+    }
+    for (int n = 0; n < count; ++n) wgt[n] /= wsum;
+
+    st->neck_plate_idx = idx;
+    st->neck_plate_wgt = wgt;
+    st->n_neck_plate_cells = count;
+    return CE_OK;
+}
+
 
 /* ── Guitar plate aperture mask ────────────────────────────────────────────── */
 
@@ -844,6 +1001,8 @@ SK_API AcousticCoEvolverState* coevolver_create(
         plate_active_for_fdtd ? plate_active_for_fdtd : body->plate_active,
         body->plate_mass_density,
         body->plate_stiffness_D,
+        body->plate_alpha_M,
+        body->plate_beta_K,
         body->n_pml
     );
     free(plate_active_for_fdtd);
@@ -863,7 +1022,8 @@ SK_API AcousticCoEvolverState* coevolver_create(
     st->sample_rate  = sample_rate;
     st->dt_audio     = 1.0f / sample_rate;
     st->dt_fdtd      = fdtd_get_dt(st->fdtd);
-    st->force_scale  = force_scale;
+    (void)force_scale;
+    st->force_scale  = 1.0f;
     st->gamma_scale  = 1.0f;
     st->modal_stride = modal_stride;
 
@@ -896,6 +1056,34 @@ SK_API AcousticCoEvolverState* coevolver_create(
         if (!ss) goto fail;
         st->strings[si] = *ss;
         free(ss);   /* struct copied; interior pointers now owned by array entry */
+    }
+
+    /* Shared neck mode.  Use the first provided neck descriptor as the physical
+     * neck, not one independent oscillator per string.  All strings feed this
+     * one DOF through their nut slopes. */
+    for (int si = 0; si < n_strings; ++si) {
+        if (string_defs[si].neck_freq_hz > 0.0f &&
+            string_defs[si].neck_mass_kg > 0.0f) {
+            st->neck_mass_eff = string_defs[si].neck_mass_kg;
+            float omega_n = 2.0f * (float)M_PI * string_defs[si].neck_freq_hz;
+            st->neck_stiff_eff = st->neck_mass_eff * omega_n * omega_n;
+            float Q = (string_defs[si].neck_Q > 0.0f) ? string_defs[si].neck_Q : 30.0f;
+            st->neck_damp_eff = st->neck_mass_eff * omega_n / Q;
+
+            /* Neck heel/body joint impedance: intentionally stiffer and more
+             * damped than the free neck bend so energy returns through the
+             * body with realistic loss instead of becoming a rigid clamp. */
+            const float joint_freq_hz = 95.0f;
+            const float joint_Q = 2.0f;
+            float omega_j = 2.0f * (float)M_PI * joint_freq_hz;
+            st->neck_body_stiff_eff = st->neck_mass_eff * omega_j * omega_j;
+            st->neck_body_damp_eff = st->neck_mass_eff * omega_j / joint_Q;
+            break;
+        }
+    }
+    if (st->neck_mass_eff > 0.0f) {
+        int rc_neck = build_neck_plate_kernel(st, body->plate_active, 0.030f);
+        if (rc_neck != CE_OK) goto fail;
     }
 
     /* ── Build pickups ── */
@@ -1230,6 +1418,8 @@ SK_API void coevolver_destroy(AcousticCoEvolverState* st)
     fdtd_destroy(st->fdtd);
     free(st->bridge_cell_idx);
     free(st->bridge_cell_wgt);
+    free(st->neck_plate_idx);
+    free(st->neck_plate_wgt);
 
     if (st->strings) {
         for (int si = 0; si < st->n_strings; ++si) {
@@ -1312,7 +1502,7 @@ static float pickup_piezo_signal(const PickupState* pk,
     float slope0 = (ss->u[0][N-1] - ss->u[0][N-2]) / ss->ds;
     float slope1 = (ss->u[1][N-1] - ss->u[1][N-2]) / ss->ds;
     float slope_mag = sqrtf(slope0*slope0 + slope1*slope1);
-    return pk->sensitivity * ss->tension_N * slope_mag;
+    return pk->sensitivity * ss->tension_eff * slope_mag;
 }
 
 /* ── coevolver_step ───────────────────────────────────────────────────────── */
@@ -1346,36 +1536,113 @@ static int _step_one_sample(AcousticCoEvolverState* st, int sample_abs)
 
     for (int sub = 0; sub < K; ++sub) {
 
+        float neck_plate_force = 0.0f;
+        if (st->neck_mass_eff > 0.0f && st->n_neck_plate_cells > 0) {
+            float plate_w = 0.0f;
+            fdtd_sample_plate_weighted(
+                st->fdtd,
+                st->n_neck_plate_cells,
+                st->neck_plate_idx,
+                st->neck_plate_wgt,
+                &plate_w);
+
+            float f_strings = 0.0f;
+            for (int si = 0; si < st->n_strings; ++si) {
+                StringState* ss = &st->strings[si];
+                if (ss->n_nodes > 1)
+                    f_strings += ss->tension_eff * (ss->u[0][1] - st->neck_w) / ss->ds;
+            }
+
+            float dt_n = st->dt_fdtd;
+            if (dt_n <= 0.0f) dt_n = st->dt_audio;
+            float inv_dt = 1.0f / dt_n;
+            float inv_dt2 = inv_dt * inv_dt;
+            float plate_v = (plate_w - st->neck_plate_w_prev) * inv_dt;
+
+            float m = st->neck_mass_eff;
+            float c = st->neck_damp_eff + st->neck_body_damp_eff;
+            float k = st->neck_stiff_eff + st->neck_body_stiff_eff;
+            float denom = m * inv_dt2 + 0.5f * c * inv_dt;
+            float rhs = f_strings
+                      + st->neck_body_stiff_eff * plate_w
+                      + st->neck_body_damp_eff * plate_v
+                      + (2.0f * m * inv_dt2 - k) * st->neck_w
+                      + (-m * inv_dt2 + 0.5f * c * inv_dt) * st->neck_w_prev;
+            float neck_new = (denom > 1e-12f) ? rhs / denom : plate_w;
+            if (!isfinite(neck_new) || fabsf(neck_new) > 0.05f)
+                return CE_ERR_UNSTABLE;
+
+            st->neck_w_prev = st->neck_w;
+            st->neck_w = neck_new;
+            float neck_v = (st->neck_w - st->neck_w_prev) * inv_dt;
+            neck_plate_force = st->neck_body_stiff_eff * (st->neck_w - plate_w)
+                             + st->neck_body_damp_eff * (neck_v - plate_v);
+            if (!isfinite(neck_plate_force)) return CE_ERR_UNSTABLE;
+            st->neck_plate_w_prev = plate_w;
+        }
+
         /* Step all strings, injecting the sub-dt share of this sample's force
          * immediately before each string substep so every step gets equal drive. */
         for (int si = 0; si < st->n_strings; ++si) {
             StringState* ss = &st->strings[si];
             for (int ss_sub = 0; ss_sub < ss->n_substeps; ++ss_sub) {
+                int rc_ten = string_update_geometric_tension(ss);
+                if (rc_ten != CE_OK) return rc_ten;
                 if (per_sub[si] != 0.0f)
                     ss->ext_force[0][ss->force_node] += per_sub[si];
-                string_step_pol(ss, 0);
-                string_step_pol(ss, 1);
+                float nut_bc = (st->neck_mass_eff > 0.0f) ? st->neck_w : 0.0f;
+                int rc_s0 = string_step_pol(ss, 0, nut_bc);
+                if (rc_s0 != CE_OK) return rc_s0;
+                int rc_s1 = string_step_pol(ss, 1, 0.0f);
+                if (rc_s1 != CE_OK) return rc_s1;
+                int rc_shape = string_validate_shape(ss);
+                if (rc_shape != CE_OK) return rc_shape;
             }
         }
 
-        /* Bridge drive: K^T * F_saddle — direct linear combination.
-         * The saddle node is constrained to the plate displacement, so its
-         * velocity is zero from rest and cannot be used to start the body.
-         * Drive the bridge from the string tension times saddle slope instead. */
+        /* Bridge drive: update a per-string bridge DOF, then distribute the
+         * equal spring/damper reaction into the plate.  This keeps coupling
+         * symmetric: string slope force drives the bridge, the bridge endpoint
+         * drives the string, and the plate sees only the bridge reaction. */
         if (nb > 0 && st->bridge_drive && st->string_bridge_kernel) {
-            float saddle_force_arr[16]; /* stack; n_strings ≤ 16 in practice */
-            for (int si = 0; si < st->n_strings; ++si) {
+            float plate_force_arr[64]; /* stack; guarded by n_strings <= 64 */
+            float dt_b = st->dt_fdtd;
+            if (dt_b <= 0.0f) dt_b = st->dt_audio;
+            int n_force_strings = st->n_strings < 64 ? st->n_strings : 64;
+            for (int si = 0; si < n_force_strings; ++si) {
                 StringState* ss = &st->strings[si];
                 int Nn = ss->n_nodes;
-                float slope0 = (ss->u[0][Nn-1] - ss->u[0][Nn-2]) / ss->ds;
-                /* Numerical passivity guard: a bridge slope outside ±1 rad is
-                 * already beyond the small-deflection plate model.  Clamp only
-                 * that nonphysical tail so the coupled FDTD cannot be driven by
-                 * an impossible string tangent after a bad excitation. */
-                if (!isfinite(slope0)) slope0 = 0.0f;
-                if (slope0 >  1.0f) slope0 =  1.0f;
-                if (slope0 < -1.0f) slope0 = -1.0f;
-                saddle_force_arr[si] = ss->tension_N * slope0;
+                float slope0 = (ss->u[0][Nn-2] - ss->bridge_w) / ss->ds;
+                if (!isfinite(slope0) || fabsf(slope0) > 1.0f)
+                    return CE_ERR_UNSTABLE;
+                float f_string = ss->tension_eff * slope0;
+
+                float m = ss->bridge_mass_eff;
+                float c = ss->bridge_damp_eff;
+                float k = ss->bridge_stiff_eff;
+                float inv_dt = 1.0f / dt_b;
+                float inv_dt2 = inv_dt * inv_dt;
+                float plate_v = (ss->saddle_w - ss->saddle_w_prev) * inv_dt;
+
+                float denom = m * inv_dt2 + 0.5f * c * inv_dt;
+                float rhs = f_string
+                          + k * ss->saddle_w
+                          + c * plate_v
+                          + (2.0f * m * inv_dt2 - k) * ss->bridge_w
+                          + (-m * inv_dt2 + 0.5f * c * inv_dt) * ss->bridge_w_prev;
+                float bridge_new = (denom > 1e-12f) ? rhs / denom : ss->saddle_w;
+                if (!isfinite(bridge_new) || fabsf(bridge_new) > 0.05f)
+                    return CE_ERR_UNSTABLE;
+
+                ss->bridge_w_prev = ss->bridge_w;
+                ss->bridge_w = bridge_new;
+
+                float bridge_v = (ss->bridge_w - ss->bridge_w_prev) * inv_dt;
+                float f_plate = k * (ss->bridge_w - ss->saddle_w)
+                              + c * (bridge_v - plate_v);
+                if (!isfinite(f_plate)) return CE_ERR_UNSTABLE;
+                plate_force_arr[si] = f_plate;
+                ss->saddle_w_prev = ss->saddle_w;
             }
             using Eigen::Map;
             using Eigen::Matrix;
@@ -1384,16 +1651,26 @@ static int _step_one_sample(AcousticCoEvolverState* st, int sample_abs)
             using Eigen::VectorXf;
             Map<const Matrix<float,Dynamic,Dynamic,RowMajor>> Kmat(
                 st->string_bridge_kernel, st->n_strings, nb);
-            Map<const VectorXf> fs(saddle_force_arr, st->n_strings);
+            Map<const VectorXf> fs(plate_force_arr, n_force_strings);
             Map<VectorXf> bd(st->bridge_drive, nb);
-            bd.noalias() = Kmat.transpose() * fs;
+            bd.noalias() = Kmat.topRows(n_force_strings).transpose() * fs;
         }
 
         /* Inject per-cell bridge drives into FDTD */
         if (nb > 0 && st->bridge_drive) {
             int rc_bdg = fdtd_inject_bridge_drive(
-                st->fdtd, st->bridge_drive, st->force_scale);
+                st->fdtd, st->bridge_drive, 1.0f);
             if (rc_bdg != FDTD_OK) return CE_ERR_FDTD_BRIDGE;
+        }
+
+        if (neck_plate_force != 0.0f && st->n_neck_plate_cells > 0) {
+            int rc_neck = fdtd_inject_plate_force(
+                st->fdtd,
+                st->n_neck_plate_cells,
+                st->neck_plate_idx,
+                st->neck_plate_wgt,
+                neck_plate_force);
+            if (rc_neck != FDTD_OK) return CE_ERR_FDTD_BRIDGE;
         }
 
         int rc = fdtd_step(st->fdtd, 1);
@@ -1700,7 +1977,7 @@ SK_API int coevolver_pluck_string(
     StringState* ss = &st->strings[string_idx];
     int N = ss->n_nodes;
     float pos = fmaxf(1e-3f, fminf(1.0f - 1e-3f, position_norm));
-    float amp = fmaxf(-0.020f, fminf(0.020f, amplitude));
+    float amp = fmaxf(-0.006f, fminf(0.006f, amplitude));
 
     int i_p = (int)roundf(pos * (float)(N - 1));
     if (i_p <= 0)   i_p = 1;
@@ -1895,6 +2172,28 @@ SK_API int coevolver_get_string_displacement(
     return CE_OK;
 }
 
+SK_API int coevolver_get_string_position(
+    const AcousticCoEvolverState* st,
+    int string_idx, float* out_xyz, int out_len)
+{
+    if (!st || !out_xyz) return CE_ERR_NULL;
+    if (string_idx < 0 || string_idx >= st->n_strings) return CE_ERR_STRING_IDX;
+    const StringState* ss = &st->strings[string_idx];
+    if (out_len != ss->n_nodes * 3) return CE_ERR_DIM;
+    for (int nidx = 0; nidx < ss->n_nodes; ++nidx) {
+        int s = (nidx < ss->n_segs) ? nidx : ss->n_segs - 1;
+        float d0 = ss->u[0][nidx];
+        float d1 = ss->u[1][nidx];
+        const float* base = ss->seg_xyz + nidx * 3;
+        const float* n = ss->seg_normal + s * 3;
+        const float* b = ss->seg_binormal + s * 3;
+        out_xyz[nidx*3+0] = base[0] + d0*n[0] + d1*b[0];
+        out_xyz[nidx*3+1] = base[1] + d0*n[1] + d1*b[1];
+        out_xyz[nidx*3+2] = base[2] + d0*n[2] + d1*b[2];
+    }
+    return CE_OK;
+}
+
 /* ── Simple queries ───────────────────────────────────────────────────────── */
 
 SK_API int   coevolver_get_n_strings (const AcousticCoEvolverState* st) { return st ? st->n_strings  : 0; }
@@ -1918,6 +2217,9 @@ SK_API int coevolver_reset(AcousticCoEvolverState* st)
         memset(ss->modal_re, 0, N_MODES * sizeof(float));
         memset(ss->modal_im, 0, N_MODES * sizeof(float));
         ss->saddle_w    = 0.0f;
+        ss->saddle_w_prev = 0.0f;
+        ss->bridge_w    = 0.0f;
+        ss->bridge_w_prev = 0.0f;
         ss->nut_w       = 0.0f;
         ss->nut_w_prev  = 0.0f;
         ss->gamma_eff   = ss->gamma;
@@ -1932,9 +2234,24 @@ SK_API int coevolver_reset(AcousticCoEvolverState* st)
     st->out_write_pos   = 0;
     st->samples_written = 0;
     st->bridge_vel_prev = 0.0f;
+    st->neck_w = 0.0f;
+    st->neck_w_prev = 0.0f;
+    st->neck_plate_w_prev = 0.0f;
     st->modal_counter   = 0;
     st->pluck_cursor    = 0;
     return CE_OK;
+}
+
+/* ── Cut-cell face fractions passthrough ─────────────────────────────────── */
+
+SK_API int coevolver_set_face_fractions(
+    AcousticCoEvolverState* st,
+    const float* vx_frac,
+    const float* vy_frac,
+    const float* vz_frac)
+{
+    if (!st || !st->fdtd) return CE_ERR_NULL;
+    return fdtd_set_face_fractions(st->fdtd, vx_frac, vy_frac, vz_frac);
 }
 
 /* ── Damping scale (warm-up overdamping) ─────────────────────────────────── */

@@ -360,7 +360,7 @@ class InstrumentNode(nn.Module):
                 self._body_scene,
                 n_strings   = len(self.driver_keys),
                 sample_rate = self.sample_rate,
-                dx          = 0.010,
+                dx          = 0.008,
                 n_segs      = 160,
                 force_scale = 8e-4,
             )

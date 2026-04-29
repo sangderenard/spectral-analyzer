@@ -7,7 +7,7 @@
  *   for each sample:
  *     1. 1D string FDTD for every string   (arbitrary 3-D path, both polarisations)
  *     2. Modal projection (every N_stride steps, lazy update)
- *     3. Bridge velocity sum → FDTD body inject (derivative-coupling model)
+ *     3. String endpoint forces → bridge/top impedance → plate load
  *     4. Kirchhoff plate + 3-D acoustic FDTD sub-steps
  *     5. Pickup integration (single-coil / humbucker / piezo)
  *     6. Mic sampling from FDTD pressure field
@@ -23,7 +23,10 @@
  *   (1 + γdt/2)·u^{n+1}[i] = 2u^n[i] − (1 − γdt/2)·u^{n-1}[i]
  *                            + cfl2·(u^n[i+1] − 2u^n[i] + u^n[i-1]) + dt²F/μ
  *
- * where cfl2 = (wave_speed · dt / ds)², γ = damping coefficient (s⁻¹).
+ * where cfl2 is recomputed from T_eff = T0 + EA·strain each substep and
+ * γ is the damping coefficient (s⁻¹).  The two transverse polarisations share
+ * the same geometric stretch, so large visible deflections increase tension
+ * instead of getting free length from the renderer.
  *
  * BCs: saddle end u[N-1] = body plate displacement (two-way structural coupling).
  *      nut end: rigid (u[0] = 0) by default; or a driven 1-DOF neck-bending
@@ -163,7 +166,8 @@ typedef struct {
  *           n_nodes = n_segs + 1.  n_segs is the number of FDTD segments.
  *
  * The segment spacing ds is computed as total arc-length / n_segs; the wave
- * speed c_s = sqrt(tension_N / linear_mass_kgm).
+ * base wave speed c_s = sqrt(tension_N / linear_mass_kgm); runtime geometric
+ * stretch raises the effective tension before each string update.
  */
 typedef struct {
     int    n_segs;           /**< Number of FDTD segments (interior DOF = n_segs−1). */
@@ -174,13 +178,15 @@ typedef struct {
     float  stiffness_EI;    /**< Bending stiffness EI (N·m²). 0 = ideal flexible string.
                                  Typical guitar values (wound): 1e-5 – 2e-4 N·m².
                                  Produces physically correct inharmonicity (sharp overtones). */
+    float  axial_stiffness_N; /**< Axial stiffness EA in Newtons. 0 = infer from
+                                  linear mass using steel E/rho. Geometric
+                                  transverse stretch raises tension by EA*strain. */
 
-    /* Neck dynamics at nut end.  Set neck_freq_hz > 0 to enable the 1-DOF
-     * neck-bending model; leave at 0 for a rigid nut (legacy behaviour).
-     * The model replaces u[0]=0 with a driven spring-mass-damper BC:
-     *   m·ẅ_nut + c·ẇ_nut + k·w_nut = T·(u[1]−w_nut)/ds
-     * producing compliance and frequency-dependent damping at the nut that
-     * matches the neck's fundamental bending mode behaviour. */
+    /* Shared neck dynamics.  The co-evolver uses the first nonzero neck
+     * descriptor as one global neck bending mode.  All string nut forces are
+     * summed into that mode, the mode supplies the nut boundary displacement
+     * for every string, and the equal/opposite heel reaction is distributed
+     * into the body plate through a damped neck-block impedance. */
     float  neck_freq_hz;    /**< Neck fundamental bending frequency (Hz). 0 = rigid nut.
                                  Typical acoustic guitar: 50–80 Hz. */
     float  neck_mass_kg;    /**< Effective modal mass of neck at nut (kg).
@@ -202,7 +208,7 @@ typedef struct {
  *
  * For piezo (PIEZO):
  *   sensitivity   — piezo sensitivity (V·m/N).  The slope-force product is
- *                   multiplied by tension_N to get the equivalent force.
+ *                   multiplied by the current effective tension.
  *   string_mask   — bitmask of which strings contribute (bit k = string k).
  */
 typedef struct {
@@ -263,6 +269,8 @@ typedef struct {
     const uint8_t* plate_active;  /**< (Nx·Ny,) — copied internally. */
     float  plate_mass_density;    /**< ρ_s·h (kg/m²).  Typical acoustic: 7.0. */
     float  plate_stiffness_D;     /**< Bending stiffness D (N·m).  Typical: 0.45. */
+    float  plate_alpha_M;         /**< Rayleigh mass damping (s⁻¹). Spruce: 1–3. Default: 2.0. */
+    float  plate_beta_K;          /**< Rayleigh stiffness damping (s). Spruce: ~1e-5. Default: 1e-5. */
     int    n_pml;                 /**< PML layer thickness in cells.  Typical: 10. */
     /* Bridge injection sites */
     int    n_bridge_src;          /**< Number of bridge saddle points. */
@@ -288,7 +296,8 @@ typedef struct AcousticCoEvolverState AcousticCoEvolverState;
  * @param body         Body FDTD descriptor.  All fields must be filled.
  * @param sample_rate  Audio sample rate (Hz).  Determines FDTD sub-step count.
  * @param modal_stride Steps between modal projection updates.  Typical: 8–32.
- * @param force_scale  Global bridge force scale (tunes body acoustic level).
+ * @param force_scale  Deprecated compatibility parameter; physical coupling
+ *                     uses explicit bridge/body impedances in SI units.
  * @return             Opaque handle, NULL on failure.
  */
 SK_API AcousticCoEvolverState* coevolver_create(
@@ -310,15 +319,18 @@ SK_API void coevolver_destroy(AcousticCoEvolverState* st);
 /* ── Excitation ───────────────────────────────────────────────────────────── */
 
 /**
- * Apply an initial pluck displacement to a string.
+ * Apply a physical draw/release pluck to a string.
  *
- * Adds a raised-cosine displacement pulse centred at position_norm (0–1 along
- * string length) to both string displacement fields (u_curr and u_prev), so
- * the leapfrog starts propagating on the next step.
+ * Schedules a short quasi-static transverse force ramp whose peak corresponds
+ * to the requested draw displacement.  The solver remains a small-deflection
+ * transverse string model; requests outside the valid guitar-pluck range are
+ * limited internally and later time steps fail if the resulting shape exceeds
+ * the solver's slope/stretch validity checks.
  *
  * @param string_idx    Index of the string (0 = bass E, 5 = treble E for guitar).
  * @param position_norm Fractional position along string (0=nut, 1=saddle).
- * @param amplitude     Peak displacement in metres.  Typical: 1e-3 – 5e-3.
+ * @param amplitude     Requested draw displacement in metres. Typical:
+ *                      1e-3 – 5e-3; internally limited to +/-6e-3.
  * @return              CE_OK or CE_ERR_STRING_IDX.
  */
 SK_API int coevolver_pluck_string(
@@ -395,8 +407,8 @@ SK_API void coevolver_clear_pluck_schedule(AcousticCoEvolverState* st);
  *   1. Compute number of FDTD sub-steps k = ceil(dt_audio / dt_fdtd).
  *   2. For each sub-step:
  *      a. Step all string FDTDs (1-D leapfrog, both polarisations).
- *      b. Accumulate bridge velocity sum from all strings.
- *      c. Inject into body FDTD (derivative coupling model).
+ *      b. Solve bridge/top and neck/body structural impedance couplings.
+ *      c. Inject equal/opposite structural reactions into the body plate.
  *      d. Step body plate + pressure FDTD.
  *      e. Read plate displacement at saddle → update string saddle BC.
  *   3. After all sub-steps for this audio sample:
@@ -613,6 +625,20 @@ SK_API int coevolver_get_string_displacement(
     int    out_len
 );
 
+/**
+ * Get the current absolute world-space string node positions.
+ *
+ * out_xyz must have length (n_segs + 1) * 3.  Unlike displacement-only
+ * rendering helpers, this includes the actual nut and bridge endpoint nodes
+ * from the coupled mechanical system.
+ */
+SK_API int coevolver_get_string_position(
+    const AcousticCoEvolverState* st,
+    int    string_idx,
+    float* out_xyz,
+    int    out_len
+);
+
 /* ── Queries ──────────────────────────────────────────────────────────────── */
 
 SK_API int   coevolver_get_n_strings (const AcousticCoEvolverState* st);
@@ -635,6 +661,21 @@ SK_API void coevolver_set_damping_scale(AcousticCoEvolverState* st, float scale)
 
 /** Reset all string, plate, and pressure fields to zero. */
 SK_API int coevolver_reset(AcousticCoEvolverState* st);
+
+/**
+ * Set per-face open-area fractions for cut-cell body boundary modelling.
+ *
+ * Delegates directly to fdtd_set_face_fractions on the internal FDTD state.
+ * Call once after coevolver_create to enable smooth staircase-free body walls.
+ * See fdtd_set_face_fractions in acoustic_fdtd.h for full documentation.
+ *
+ * @return CE_OK, CE_ERR_NULL, or FDTD error code.
+ */
+SK_API int coevolver_set_face_fractions(
+    AcousticCoEvolverState* st,
+    const float* vx_frac,
+    const float* vy_frac,
+    const float* vz_frac);
 
 /* ── Air envelope / room simulation coupling ──────────────────────────────── */
 

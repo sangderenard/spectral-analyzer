@@ -657,6 +657,60 @@ def build_complex_reflectances(
 # Main entry point
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+# Approximate CIE 1931 spectral locus colours for acoustic/spectral bands.
+# Maps a log-frequency range to perceptual hue (red→violet over 20–20k Hz),
+# then tone-maps magnitude with exposure/gamma.
+def spectral_bands_to_rgb(
+        flux:    np.ndarray,   # (n_tri, n_bands) float32 irradiance
+        freq_hz: np.ndarray,   # (n_bands,) float64 centre frequencies
+        exposure: float = 3.0,
+        gamma:    float = 0.45,
+) -> np.ndarray:
+    """Convert per-triangle per-band irradiance into a linear RGB array.
+
+    Each frequency band is mapped to a perceptual colour using a simple
+    spectral→RGB approximation (visible-light analogy for audio bands):
+      20 Hz → 20 kHz spans red → violet over log frequency.
+
+    Returns
+    -------
+    rgb : float32 (n_tri, 3) in [0, 1], gamma-corrected
+    """
+    n_tri, n_bands = flux.shape
+    # Log-frequency position in [0, 1].
+    f0, f1 = 20.0, 20000.0
+    t = np.clip((np.log10(freq_hz) - np.log10(f0)) /
+                (np.log10(f1) - np.log10(f0)), 0.0, 1.0).astype(np.float32)  # (n_bands,)
+
+    # Simple spectral locus hue wheel (red=0, green=0.33, blue=0.67, violet=1.0).
+    # Uses a piecewise sinusoidal approximation.
+    hue = t  # 0 → 1 from red to violet
+    r_band = np.clip(np.cos(np.pi * (hue - 0.0)) * 1.5, 0.0, 1.0)
+    g_band = np.clip(np.sin(np.pi * hue) * 1.2, 0.0, 1.0)
+    b_band = np.clip(np.cos(np.pi * (hue - 1.0)) * 1.5, 0.0, 1.0)
+    # shape: (n_bands,)
+
+    # Weighted sum of spectral colour by irradiance.
+    w = flux  # (n_tri, n_bands)
+    rgb = np.stack([
+        (w * r_band).sum(axis=1),
+        (w * g_band).sum(axis=1),
+        (w * b_band).sum(axis=1),
+    ], axis=1).astype(np.float32)  # (n_tri, 3)
+
+    # Exposure + gamma tone-map.
+    rgb = rgb * float(exposure)
+    peak = rgb.max()
+    if peak > 1e-9:
+        rgb /= peak
+    rgb = np.clip(rgb ** float(gamma), 0.0, 1.0)
+    return rgb
+
+
 def trace_cavity_scene(
         scene,
         n_rays:        int   = 256,
@@ -762,16 +816,35 @@ def trace_cavity_scene(
         atmo_abs  = atmo_abs,
     )
 
-    segs = tracer.trace(
-        src_pos          = src_pos,
-        src_dir          = src_dir,
-        src_directivity  = src_dexp,
-        n_rays           = n_rays,
-        max_bounces      = max_bounces,
-        min_amplitude    = min_amplitude,
-        seed             = seed,
-        out_cap          = out_cap,
-    )
+    # Use trace_surface (preferred) if available — returns segs + per-triangle flux.
+    _has_surface = hasattr(tracer, 'trace_surface')
+    if _has_surface:
+        result = tracer.trace_surface(
+            src_pos          = src_pos,
+            src_dir          = src_dir,
+            src_directivity  = src_dexp,
+            n_rays           = n_rays,
+            max_bounces      = max_bounces,
+            min_amplitude    = min_amplitude,
+            seed             = seed,
+            out_cap          = out_cap,
+        )
+        segs             = result['segs']          # (N_segs, 12) float32
+        surface_direct   = result['direct']        # (n_tri, n_bands) float32
+        surface_indirect = result['indirect']      # (n_tri, n_bands) float32
+    else:
+        segs = tracer.trace(
+            src_pos          = src_pos,
+            src_dir          = src_dir,
+            src_directivity  = src_dexp,
+            n_rays           = n_rays,
+            max_bounces      = max_bounces,
+            min_amplitude    = min_amplitude,
+            seed             = seed,
+            out_cap          = out_cap,
+        )
+        surface_direct   = np.zeros((n_tri, n_bands), dtype=np.float32)
+        surface_indirect = np.zeros((n_tri, n_bands), dtype=np.float32)
 
     # Metadata.
     if len(segs) > 0:
@@ -783,49 +856,76 @@ def trace_cavity_scene(
         bbox_min = bbox_max = np.zeros(3, dtype=np.float32)
         max_path = 1.0
 
-    # Per-triangle surface illumination: accumulate segment amplitude at hit endpoints.
-    surface_illum  = np.zeros(n_tri, dtype=np.float32)
-    if len(segs) > 0 and n_tri > 0:
-        tri_centroids = verts.reshape(n_tri, 3, 3).mean(axis=1).astype(np.float32)
-        p1  = segs[:, 3:6].astype(np.float32)   # hit endpoints
-        amp = segs[:, 9].astype(np.float32)
-        # Nearest-centroid assignment in batches to keep peak memory low.
-        BATCH = 4096
-        for start in range(0, len(p1), BATCH):
-            end  = min(start + BATCH, len(p1))
-            diff = p1[start:end, None, :] - tri_centroids[None, :, :]  # (B, N_tri, 3)
-            nearest = (diff * diff).sum(axis=2).argmin(axis=1)          # (B,)
-            np.add.at(surface_illum, nearest, amp[start:end])
-        peak = surface_illum.max()
-        if peak > 1e-9:
-            surface_illum /= peak
+    # Per-triangle surface illumination.
+    # Prefer tracer-owned flux (trace_surface); fall back to nearest-centroid.
+    if _has_surface:
+        surface_flux = surface_direct + surface_indirect  # (n_tri, n_bands)
+    else:
+        # Legacy nearest-centroid fallback.
+        surface_flux = np.zeros((n_tri, n_bands), dtype=np.float32)
+        if len(segs) > 0 and n_tri > 0:
+            tri_centroids = verts.reshape(n_tri, 3, 3).mean(axis=1).astype(np.float32)
+            p1  = segs[:, 3:6].astype(np.float32)
+            amp = segs[:, 9].astype(np.float32)
+            BATCH = 4096
+            for start in range(0, len(p1), BATCH):
+                end     = min(start + BATCH, len(p1))
+                diff    = p1[start:end, None, :] - tri_centroids[None, :, :]
+                nearest = (diff * diff).sum(axis=2).argmin(axis=1)
+                np.add.at(surface_flux[:, 0], nearest, amp[start:end])
+            surface_direct   = surface_flux
+            surface_indirect = np.zeros_like(surface_flux)
+
+    # Scalar (per-triangle, band-summed, normalised to [0,1]).
+    surface_scalar = surface_flux.sum(axis=1).astype(np.float32)
+    peak = surface_scalar.max()
+    if peak > 1e-9:
+        surface_scalar /= peak
+
+    # Spectral RGB for surface colour.
+    surface_rgb = spectral_bands_to_rgb(surface_flux, freq_hz)
 
     # For the visual display, show only baffle panels (the instrument body) when
     # they exist.  The absorptive enclosure box is irrelevant for visualisation
     # and its 1 m scale would swamp the camera framing of the tiny instrument.
     if n_room_tris > 0 and n_room_tris < n_tri:
-        disp_verts  = verts[n_room_tris:]
-        disp_norms  = normals[n_room_tris:]
-        disp_illum  = surface_illum[n_room_tris:]
+        disp_verts    = verts[n_room_tris:]
+        disp_norms    = normals[n_room_tris:]
+        disp_scalar   = surface_scalar[n_room_tris:]
+        disp_direct   = surface_direct[n_room_tris:]
+        disp_indirect = surface_indirect[n_room_tris:]
+        disp_flux     = surface_flux[n_room_tris:]
+        disp_rgb      = surface_rgb[n_room_tris:]
     else:
-        disp_verts  = verts
-        disp_norms  = normals
-        disp_illum  = surface_illum
+        disp_verts    = verts
+        disp_norms    = normals
+        disp_scalar   = surface_scalar
+        disp_direct   = surface_direct
+        disp_indirect = surface_indirect
+        disp_flux     = surface_flux
+        disp_rgb      = surface_rgb
 
     n_disp = len(disp_verts)
     geo_verts_flat = disp_verts.reshape(n_disp, 9).astype(np.float32) if n_disp else np.zeros((0, 9), dtype=np.float32)
     geo_normals    = disp_norms.astype(np.float32) if n_disp else np.zeros((0, 3), dtype=np.float32)
 
     meta = {
-        'n_sources':       n_sources,
-        'n_bands':         n_bands,
-        'freq_hz':         freq_hz,
-        'max_path_length': max_path,
-        'bbox_min':        bbox_min,
-        'bbox_max':        bbox_max,
-        'geo_verts_flat':  geo_verts_flat,
-        'geo_normals':     geo_normals,
-        'surface_illum':   disp_illum,
+        'n_sources':        n_sources,
+        'n_bands':          n_bands,
+        'freq_hz':          freq_hz,
+        'max_path_length':  max_path,
+        'bbox_min':         bbox_min,
+        'bbox_max':         bbox_max,
+        'geo_verts_flat':   geo_verts_flat,
+        'geo_normals':      geo_normals,
+        # Ray-traced surface illumination (tracer-owned, preferred):
+        'surface_flux':     disp_flux,     # (n_disp_tri, n_bands) float32
+        'surface_direct':   disp_direct,   # (n_disp_tri, n_bands) float32
+        'surface_indirect': disp_indirect, # (n_disp_tri, n_bands) float32
+        'surface_rgb':      disp_rgb,      # (n_disp_tri, 3)       float32
+        'surface_scalar':   disp_scalar,   # (n_disp_tri,)         float32
+        # Legacy alias:
+        'surface_illum':    disp_scalar,
     }
 
     return segs.astype(np.float32), meta

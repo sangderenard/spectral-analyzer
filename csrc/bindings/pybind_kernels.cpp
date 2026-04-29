@@ -263,6 +263,7 @@ struct PyRayTracer
 {
     RayTracerState* handle  = nullptr;
     int             _n_bands = 0;
+    int             _n_tris  = 0;
 
     PyRayTracer(int                     n_tri,
                 py::array_t<double>     verts,
@@ -283,6 +284,7 @@ struct PyRayTracer
         auto iaa = atmo_abs .request();
 
         _n_bands = static_cast<int>(ifh.size);
+        _n_tris  = n_tri;
 
         handle = ray_tracer_create(
             n_tri,
@@ -356,6 +358,92 @@ struct PyRayTracer
     }
 
     int n_bands() const { return _n_bands; }
+    int n_tris()  const {
+        /* The handle carries the geometry; expose triangle count so Python can
+         * pre-allocate flux buffers of the right size. */
+        if (!handle) return 0;
+        /* RayTracerState is opaque — query via the tri_areas size.
+         * We cache it at construction time. */
+        return _n_tris;
+    }
+
+    /**
+     * trace_surface(src_pos, src_dir, src_directivity,
+     *               n_rays, max_bounces, min_amplitude, seed, out_cap)
+     *   -> dict with keys:
+     *       'segs'     : float32 (N_segs, 12) — same layout as trace()
+     *       'direct'   : float32 (n_tri, n_bands) — direct irradiance
+     *       'indirect' : float32 (n_tri, n_bands) — indirect irradiance
+     *
+     * Runs a full ray trace and simultaneously accumulates per-triangle
+     * irradiance (|A|² * cos_in / area) split by bounce depth.
+     * Caller should zero-initialise if accumulating across multiple calls.
+     */
+    py::dict trace_surface(
+        py::array_t<double> src_pos,
+        py::array_t<double> src_dir,
+        py::array_t<double> src_directivity,
+        int      n_rays        = 256,
+        int      max_bounces   = 8,
+        double   min_amplitude = 0.005,
+        uint32_t seed          = 42,
+        int      out_cap       = -1)
+    {
+        auto ip  = src_pos        .request();
+        auto id_ = src_dir        .request();
+        auto idv = src_directivity.request();
+
+        int n_sources = static_cast<int>(idv.size);
+
+        if (out_cap <= 0)
+            out_cap = 2'000'000;
+
+        /* Segment buffer. */
+        py::array_t<float> segs(
+            static_cast<py::ssize_t>(out_cap) * RT_FLOATS_PER_SEG);
+
+        /* Per-triangle flux buffers. */
+        py::array_t<float> direct(
+            {static_cast<py::ssize_t>(_n_tris),
+             static_cast<py::ssize_t>(_n_bands)});
+        py::array_t<float> indirect(
+            {static_cast<py::ssize_t>(_n_tris),
+             static_cast<py::ssize_t>(_n_bands)});
+
+        std::fill(direct  .mutable_data(),
+                  direct  .mutable_data() + direct  .size(), 0.0f);
+        std::fill(indirect.mutable_data(),
+                  indirect.mutable_data() + indirect.size(), 0.0f);
+
+        int n_written = 0;
+        int rc;
+        {
+            py::gil_scoped_release release;
+            rc = ray_tracer_trace_surface(
+                handle,
+                n_sources,
+                static_cast<const double*>(ip .ptr),
+                static_cast<const double*>(id_.ptr),
+                static_cast<const double*>(idv.ptr),
+                n_rays, max_bounces, min_amplitude, seed,
+                segs.mutable_data(), out_cap, &n_written,
+                direct  .mutable_data(),
+                indirect.mutable_data());
+        }
+
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "ray_tracer_trace_surface failed: rc=" + std::to_string(rc));
+
+        segs.resize({static_cast<py::ssize_t>(n_written),
+                     static_cast<py::ssize_t>(RT_FLOATS_PER_SEG)});
+
+        py::dict result;
+        result["segs"]     = segs;
+        result["direct"]   = direct;
+        result["indirect"] = indirect;
+        return result;
+    }
 
     /**
      * integrate_ir(src_pos, src_dir, src_directivity,
@@ -865,6 +953,8 @@ struct PyAcousticFDTD
                    py::array_t<uint8_t> plate_active_arr,
                    float plate_mass_density,
                    float plate_stiffness_D,
+                   float plate_alpha_M,
+                   float plate_beta_K,
                    int n_pml)
         : Nx(Nx), Ny(Ny), Nz(Nz)
     {
@@ -880,7 +970,8 @@ struct PyAcousticFDTD
             static_cast<const uint8_t*>(cti.ptr),
             plate_iz,
             static_cast<const uint8_t*>(pai.ptr),
-            plate_mass_density, plate_stiffness_D, n_pml);
+            plate_mass_density, plate_stiffness_D,
+            plate_alpha_M, plate_beta_K, n_pml);
         if (!handle)
             throw std::runtime_error("fdtd_create: allocation failed");
     }
@@ -903,11 +994,29 @@ struct PyAcousticFDTD
             throw std::runtime_error("fdtd_set_bridge_sources error: " + std::to_string(rc));
     }
 
+    void set_face_fractions(py::array_t<float> vx_frac,
+                            py::array_t<float> vy_frac,
+                            py::array_t<float> vz_frac)
+    {
+        auto vx = vx_frac.request();
+        auto vy = vy_frac.request();
+        auto vz = vz_frac.request();
+        int rc = fdtd_set_face_fractions(
+            handle,
+            static_cast<const float*>(vx.ptr),
+            static_cast<const float*>(vy.ptr),
+            static_cast<const float*>(vz.ptr));
+        if (rc != FDTD_OK)
+            throw std::runtime_error("fdtd_set_face_fractions error: " + std::to_string(rc));
+    }
+
     void inject_bridge(float signal_val, float signal_ddt, float force_scale)
     {
         int rc = fdtd_inject_bridge(handle, signal_val, signal_ddt, force_scale);
         if (rc != FDTD_OK)
-            throw std::runtime_error("fdtd_inject_bridge error: " + std::to_string(rc));
+            throw std::runtime_error(
+                "fdtd_inject_bridge is disabled: direct pressure bridge injection "
+                "bypasses plate impedance; use AcousticCoEvolver structural coupling");
     }
 
     int step(int n_steps)
@@ -1082,6 +1191,8 @@ struct PyAcousticCoEvolver
      *   tension_N      : float
      *   linear_mass_kgm: float
      *   damping        : float
+     *   stiffness_EI   : float, optional
+     *   axial_stiffness_N : float, optional EA axial stiffness
      *
      * pickup_defs : list of dicts, each with:
      *   type           : int (0=SINGLE_COIL, 1=HUMBUCKER, 2=PIEZO)
@@ -1133,6 +1244,8 @@ struct PyAcousticCoEvolver
             sdefs[si].linear_mass_kgm = d["linear_mass_kgm"].cast<float>();
             sdefs[si].damping         = d["damping"].cast<float>();
             sdefs[si].stiffness_EI    = d.contains("stiffness_EI")   ? d["stiffness_EI"].cast<float>()   : 0.0f;
+            sdefs[si].axial_stiffness_N =
+                d.contains("axial_stiffness_N") ? d["axial_stiffness_N"].cast<float>() : 0.0f;
             sdefs[si].neck_freq_hz    = d.contains("neck_freq_hz")    ? d["neck_freq_hz"].cast<float>()    : 0.0f;
             sdefs[si].neck_mass_kg    = d.contains("neck_mass_kg")    ? d["neck_mass_kg"].cast<float>()    : 0.0f;
             sdefs[si].neck_Q          = d.contains("neck_Q")          ? d["neck_Q"].cast<float>()          : 0.0f;
@@ -1208,6 +1321,8 @@ struct PyAcousticCoEvolver
         body.plate_active       = static_cast<const uint8_t*>(pai.ptr);
         body.plate_mass_density = body_dict.contains("plate_mass_density") ? body_dict["plate_mass_density"].cast<float>() : 7.0f;
         body.plate_stiffness_D  = body_dict.contains("plate_stiffness_D")  ? body_dict["plate_stiffness_D"] .cast<float>() : 0.45f;
+        body.plate_alpha_M      = body_dict.contains("plate_alpha_M")       ? body_dict["plate_alpha_M"]      .cast<float>() : 2.0f;
+        body.plate_beta_K       = body_dict.contains("plate_beta_K")        ? body_dict["plate_beta_K"]       .cast<float>() : 1e-5f;
         body.n_pml              = body_dict.contains("n_pml")               ? body_dict["n_pml"]             .cast<int>()   : 10;
         body.n_bridge_src       = n_bridge_src;
         body.bridge_src_xyz     = static_cast<const float*>(bsi.ptr);
@@ -1438,6 +1553,17 @@ struct PyAcousticCoEvolver
         return out;
     }
 
+    py::array_t<float> get_string_position_n(int string_idx, int n_nodes)
+    {
+        py::array_t<float> out({n_nodes, 3});
+        int rc = coevolver_get_string_position(handle, string_idx,
+            out.mutable_unchecked<2>().mutable_data(0,0),
+            n_nodes * 3);
+        if (rc != CE_OK)
+            throw std::runtime_error("get_string_position error: " + std::to_string(rc));
+        return out;
+    }
+
     /** get_surface_emission(xyz, normals) → (P, vn) tuple of float32 (n_surf,) */
     py::tuple get_surface_emission(py::array_t<float> xyz_arr,
                                    py::array_t<float> normals_arr)
@@ -1473,6 +1599,22 @@ struct PyAcousticCoEvolver
     }
 
     void reset() { coevolver_reset(handle); }
+
+    void set_face_fractions(py::array_t<float> vx_frac,
+                            py::array_t<float> vy_frac,
+                            py::array_t<float> vz_frac)
+    {
+        auto vx = vx_frac.request();
+        auto vy = vy_frac.request();
+        auto vz = vz_frac.request();
+        int rc = coevolver_set_face_fractions(
+            handle,
+            static_cast<const float*>(vx.ptr),
+            static_cast<const float*>(vy.ptr),
+            static_cast<const float*>(vz.ptr));
+        if (rc != CE_OK)
+            throw std::runtime_error("coevolver_set_face_fractions error: " + std::to_string(rc));
+    }
 
     void set_damping_scale(float scale)
     {
@@ -1818,7 +1960,26 @@ out_image is accumulated in place. out_segs is a reusable float32
 (capacity, 12) segment buffer; if it fills, integration continues and the
 return value reports how many segment records were written.
 )doc")
-        .def_property_readonly("n_bands", &PyRayTracer::n_bands);
+        .def_property_readonly("n_bands", &PyRayTracer::n_bands)
+        .def_property_readonly("n_tris",  &PyRayTracer::n_tris,
+             "Number of triangles in the scene.")
+        .def("trace_surface", &PyRayTracer::trace_surface,
+             py::arg("src_pos"),
+             py::arg("src_dir"),
+             py::arg("src_directivity"),
+             py::arg("n_rays")         = 256,
+             py::arg("max_bounces")    = 8,
+             py::arg("min_amplitude")  = 0.005,
+             py::arg("seed")           = 42,
+             py::arg("out_cap")        = -1,
+R"doc(
+Trace rays and accumulate per-triangle irradiance.
+
+Returns a dict with:
+  'segs'     : float32 (N_segs, 12) — segment records (same layout as trace())
+  'direct'   : float32 (n_tri, n_bands) — direct-illumination irradiance per triangle
+  'indirect' : float32 (n_tri, n_bands) — reflected irradiance per triangle
+)doc");
 
     py::class_<PyFieldSolver>(m, "FieldSolver",
         R"doc(
@@ -1906,11 +2067,10 @@ np.ndarray, complex128, shape (n_src, n_rec, n_bands, 2, 2)
         R"doc(
 3-D acoustic FDTD solver with coupled Kirchhoff plate and PML absorbing boundaries.
 
-Implements the derivative-coupling bridge excitation model: inject
-signal_val (summed string signal) and signal_ddt (its time derivative)
-each audio sample.  The derivative term physically drives the plate via
-bridge velocity, exciting symmetric and antisymmetric plate modes in the
-correct ratio.
+Bridge excitation must be supplied as structural plate load through
+AcousticCoEvolver or fdtd_inject_bridge_drive.  The older direct pressure
+inject_bridge(signal, derivative, scale) path is disabled because it bypasses
+the plate impedance.
 
 The full 3-D pressure field is returned by get_pressure_field() for
 volumetric GL rendering, replacing the coarse nearest-centroid surface
@@ -1933,7 +2093,7 @@ n_pml              : int — PML absorbing layer thickness in cells
                       py::array_t<uint8_t>,
                       int,
                       py::array_t<uint8_t>,
-                      float,float,int>(),
+                      float,float,float,float,int>(),
              py::arg("Nx"), py::arg("Ny"), py::arg("Nz"),
              py::arg("dx"),
              py::arg("c")       = 343.0f,
@@ -1943,14 +2103,20 @@ n_pml              : int — PML absorbing layer thickness in cells
              py::arg("plate_active"),
              py::arg("plate_mass_density") = 7.0f,
              py::arg("plate_stiffness_D")  = 0.45f,
+             py::arg("plate_alpha_M")      = 2.0f,
+             py::arg("plate_beta_K")       = 1e-5f,
              py::arg("n_pml")              = 10)
         .def("set_bridge_sources", &PyAcousticFDTD::set_bridge_sources,
              py::arg("cell_indices"), py::arg("weights"),
              "Register bridge source cells and their Gaussian kernel weights.")
+        .def("set_face_fractions", &PyAcousticFDTD::set_face_fractions,
+             py::arg("vx_frac"), py::arg("vy_frac"), py::arg("vz_frac"),
+             "Set per-face open-area fractions (float32 arrays) for cut-cell body boundary. "
+             "Sizes: vx (Nx-1)*Ny*Nz, vy Nx*(Ny-1)*Nz, vz Nx*Ny*(Nz-1).")
         .def("inject_bridge", &PyAcousticFDTD::inject_bridge,
              py::arg("signal_val"), py::arg("signal_ddt"),
              py::arg("force_scale") = 1.0f,
-             "Inject one sample: signal_val (pressure) + signal_ddt (velocity/derivative).")
+             "Disabled legacy direct-pressure bridge injection; use AcousticCoEvolver.")
         .def("step", &PyAcousticFDTD::step,
              py::arg("n_steps") = 1,
              "Advance FDTD by n_steps time steps.  Returns FDTD_OK=0 or error code.")
@@ -2019,7 +2185,8 @@ while pickup output captures string velocity via B-kernel integration).
 Parameters (constructor)
 ------------------------
 string_defs : list of dicts
-    Each dict: path_xyz (float32 (n_segs+1,3)), tension_N, linear_mass_kgm, damping
+    Each dict: path_xyz (float32 (n_segs+1,3)), tension_N, linear_mass_kgm,
+    damping, optional stiffness_EI and axial_stiffness_N
 pickup_defs : list of dicts
     Each dict: type (0=SINGLE_COIL,1=HUMBUCKER,2=PIEZO), pos (3,), axis (3,),
     pole_sigma, coil_spacing, sensitivity, string_mask (int bitmask)
@@ -2032,7 +2199,7 @@ body : dict
     bridge_src_xyz (float32 (n_bridge,3)), bridge_sigma
 sample_rate   : float — audio sample rate (Hz)
 modal_stride  : int   — steps between modal projection updates (default 16)
-force_scale   : float — global bridge→body force scale (default 1.0)
+force_scale   : float — deprecated compatibility parameter; physical coupling uses explicit impedances
 )doc")
         .def(py::init<py::list, py::list, py::list, py::dict, float, int, float>(),
              py::arg("string_defs"),
@@ -2106,6 +2273,9 @@ np.ndarray, float32, shape (n_samples,) — mic 0 output for this block.
         .def("get_string_displacement_n", &PyAcousticCoEvolver::get_string_displacement_n,
              py::arg("string_idx"), py::arg("n_segs"),
              "Return world-space transverse displacement (n_segs, 3) in metres, explicit n_segs.")
+        .def("get_string_position_n", &PyAcousticCoEvolver::get_string_position_n,
+             py::arg("string_idx"), py::arg("n_nodes"),
+             "Return absolute world-space string node positions (n_nodes, 3), explicit n_nodes.")
         .def("get_surface_emission", &PyAcousticCoEvolver::get_surface_emission,
              py::arg("xyz"), py::arg("normals"),
              R"doc(Sample Kirchhoff-Helmholtz boundary data for room simulation coupling.
@@ -2131,6 +2301,10 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
 )doc")
         .def("reset", &PyAcousticCoEvolver::reset,
              "Reset all string, plate, pressure, and output ring fields to zero.")
+        .def("set_face_fractions", &PyAcousticCoEvolver::set_face_fractions,
+             py::arg("vx_frac"), py::arg("vy_frac"), py::arg("vz_frac"),
+             "Set per-face open-area fractions for cut-cell body boundary. "
+             "Delegates to fdtd_set_face_fractions on the internal FDTD.")
         .def("set_damping_scale", &PyAcousticCoEvolver::set_damping_scale,
              py::arg("scale"),
              "Set global string damping multiplier (>1.0 overdamps for warm-up; 1.0 = physical).")

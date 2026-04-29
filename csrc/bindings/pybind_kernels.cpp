@@ -1132,7 +1132,10 @@ struct PyAcousticCoEvolver
             sdefs[si].tension_N       = d["tension_N"].cast<float>();
             sdefs[si].linear_mass_kgm = d["linear_mass_kgm"].cast<float>();
             sdefs[si].damping         = d["damping"].cast<float>();
-            sdefs[si].stiffness_EI    = d.contains("stiffness_EI") ? d["stiffness_EI"].cast<float>() : 0.0f;
+            sdefs[si].stiffness_EI    = d.contains("stiffness_EI")   ? d["stiffness_EI"].cast<float>()   : 0.0f;
+            sdefs[si].neck_freq_hz    = d.contains("neck_freq_hz")    ? d["neck_freq_hz"].cast<float>()    : 0.0f;
+            sdefs[si].neck_mass_kg    = d.contains("neck_mass_kg")    ? d["neck_mass_kg"].cast<float>()    : 0.0f;
+            sdefs[si].neck_Q          = d.contains("neck_Q")          ? d["neck_Q"].cast<float>()          : 0.0f;
         }
 
         /* ── Pickups ── */
@@ -1470,6 +1473,11 @@ struct PyAcousticCoEvolver
     }
 
     void reset() { coevolver_reset(handle); }
+
+    void set_damping_scale(float scale)
+    {
+        coevolver_set_damping_scale(handle, scale);
+    }
 
     /* ── Async step ─────────────────────────────────────────────────────── */
 
@@ -2123,6 +2131,9 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
 )doc")
         .def("reset", &PyAcousticCoEvolver::reset,
              "Reset all string, plate, pressure, and output ring fields to zero.")
+        .def("set_damping_scale", &PyAcousticCoEvolver::set_damping_scale,
+             py::arg("scale"),
+             "Set global string damping multiplier (>1.0 overdamps for warm-up; 1.0 = physical).")
         .def("step_async", &PyAcousticCoEvolver::step_async,
              py::arg("n_samples"),
              "Launch a background thread to advance by n_samples. Returns immediately.")

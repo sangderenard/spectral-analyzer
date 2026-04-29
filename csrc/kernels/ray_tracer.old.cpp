@@ -422,23 +422,17 @@ static void trace_rays(
 
                 if (max_abs < min_amplitude) break;
 
-                /* Orient the boundary normal against the incoming ray.  Meshes
-                 * extracted from scene builders are not guaranteed to have inward
-                 * normals for a cavity, and using the raw normal here can offset the
-                 * next origin through the wall and kill the ray set after one hit. */
-                V3d hit_n = tri.normal;
-                if (cur_dir.dot(hit_n) > 0.0)
-                    hit_n = -hit_n;
+                pos = hit_pos + tri.normal * (EPS * 100.0);
 
                 if (U(rng) < tri.diffusion) {
-                    cur_dir = cosine_hemisphere(hit_n, rng);
+                    cur_dir = cosine_hemisphere(tri.normal, rng);
                 } else {
-                    cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
-                    if (cur_dir.dot(hit_n) < 0.0)
-                        cur_dir = cosine_hemisphere(hit_n, rng);
+                    cur_dir = (cur_dir
+                               - 2.0 * cur_dir.dot(tri.normal) * tri.normal)
+                              .normalized();
+                    if (cur_dir.dot(tri.normal) < 0.0)
+                        cur_dir = cosine_hemisphere(tri.normal, rng);
                 }
-
-                pos = hit_pos + cur_dir * (EPS * 100.0);
 
                 path_len += t_min;
             }

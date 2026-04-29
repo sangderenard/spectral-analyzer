@@ -774,6 +774,13 @@ def build_acoustic_coevolver_from_scene(
             'fundamental_hz':    float(f0),
             'gauge_in':          float(gauge),
             'scale_length_m':    float(scale_length_m),
+            # Neck bending model: replaces rigid nut BC (u[0]=0) with a
+            # spring-mass-damper representing the neck's fundamental bending mode.
+            # The compliance and damping at the nut from neck flex increases
+            # effective string length slightly and adds frequency-dependent loss.
+            'neck_freq_hz':     65.0,   # ~65 Hz fundamental neck bend (acoustic guitar)
+            'neck_mass_kg':     0.18,   # ~180 g effective modal mass
+            'neck_Q':           35.0,   # Q~35 for a well-finished wood neck
         })
 
     # ── Pickup descriptor: bridge single-coil, centred on string spread ──────

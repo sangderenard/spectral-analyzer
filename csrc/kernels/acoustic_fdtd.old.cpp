@@ -25,14 +25,6 @@ static inline int IDX2(int Ny, int i, int j)
     return j + Ny * i;
 }
 
-/* Pressure-domain solidity.  FDTD_PLATE is a real acoustic barrier;
- * inactive plate-mask cells remain air and therefore form apertures
- * such as the soundhole. */
-static inline int cell_is_pressure_solid(uint8_t c)
-{
-    return c == FDTD_WALL || c == FDTD_PLATE;
-}
-
 /* ── State structure ──────────────────────────────────────────────────────── */
 
 struct AcousticFDTDState
@@ -109,10 +101,6 @@ struct AcousticFDTDState
     int*     plate_below_idx;    /* [N_active_plate] flat 3-D idx below plate   */
     int*     plate_biharm_idx13; /* [N_active_plate * 13] stencil flat indices  */
     int      N_active_plate;
-
-    /* External body-force buffer for the plate equation.
-     * Written by fdtd_inject_bridge_drive (N/m²), consumed and zeroed by plate_step. */
-    float*   plate_ext_force;    /* [N_plate] force per unit area (N/m²)        */
 
     /* Stability check stride phase — rotated each check to cover all residues */
     int      stability_stride_phase;
@@ -241,40 +229,13 @@ SK_API AcousticFDTDState* fdtd_create(
     }
 
     /* Plate fields */
-    st->w_curr          = alloc_float(N_plate);
-    st->w_prev          = alloc_float(N_plate);
-    st->w_tmp           = alloc_float(N_plate);
-    st->plate_active    = alloc_u8(N_plate);
-    st->plate_ext_force = alloc_float(N_plate);
-    if (!st->w_curr || !st->w_prev || !st->w_tmp || !st->plate_active
-            || !st->plate_ext_force) goto fail;
+    st->w_curr      = alloc_float(N_plate);
+    st->w_prev      = alloc_float(N_plate);
+    st->w_tmp       = alloc_float(N_plate);
+    st->plate_active = alloc_u8(N_plate);
+    if (!st->w_curr || !st->w_prev || !st->w_tmp || !st->plate_active) goto fail;
 
     memcpy(st->plate_active, plate_active, N_plate * sizeof(uint8_t));
-
-    /* Enforce the 2-D active-plate mask on the 3-D pressure grid.
-     * Active soundboard cells are acoustic barriers at plate_iz; inactive
-     * cells are air if the caller marked them as plate, which turns the
-     * soundhole into an actual aperture instead of a masked render artifact. */
-    for (int i = 0; i < Nx; ++i) {
-        for (int j = 0; j < Ny; ++j) {
-            int pidx = IDX2(Ny, i, j);
-            int gidx = IDX3(Ny, Nz, i, j, st->plate_iz);
-            if (st->plate_active[pidx]) {
-                if (st->cell_type[gidx] == FDTD_AIR || st->cell_type[gidx] == FDTD_PML)
-                    st->cell_type[gidx] = FDTD_PLATE;
-            } else if (st->cell_type[gidx] == FDTD_PLATE) {
-                st->cell_type[gidx] = FDTD_AIR;
-            }
-        }
-    }
-
-    for (int idx = 0; idx < N; ++idx) {
-        if (cell_is_pressure_solid(st->cell_type[idx])) {
-            st->P_curr[idx] = 0.0f;
-            st->P_prev[idx] = 0.0f;
-            st->P_tmp [idx] = 0.0f;
-        }
-    }
 
     /* Plate stability constants */
     st->plate_rho_h     = plate_mass_density;
@@ -356,7 +317,7 @@ SK_API AcousticFDTDState* fdtd_create(
         for (int j = 0; j < Ny; ++j)
         for (int k = 0; k < Nz; ++k) {
             int idx = IDX3(Ny, Nz, i, j, k);
-            if (cell_is_pressure_solid(st->cell_type[idx])) continue;
+            if (st->cell_type[idx] == FDTD_WALL) continue;
             if (i == 0 || i == Nx-1 || j == 0 || j == Ny-1
                        || k == 0 || k == Nz-1) continue;
             if (k == plate_iz+1 || k == plate_iz-1) continue;
@@ -367,7 +328,7 @@ SK_API AcousticFDTDState* fdtd_create(
             };
             int ok = 1;
             for (int n = 0; n < 6; ++n)
-                if (cell_is_pressure_solid(st->cell_type[nb6[n]])) { ok = 0; break; }
+                if (st->cell_type[nb6[n]] == FDTD_WALL) { ok = 0; break; }
             if (ok) st->fast_interior[idx] = 1;
         }
     }
@@ -386,7 +347,7 @@ SK_API AcousticFDTDState* fdtd_create(
             int prev_fast = 0;
             for (int k = 0; k < Nz; ++k) {
                 int idx = IDX3(Ny, Nz, i, j, k);
-                if (cell_is_pressure_solid(ct[idx])) { prev_fast = 0; continue; }
+                if (ct[idx] == FDTD_WALL) { prev_fast = 0; continue; }
                 int is_pa = (k == piz+1 || k == piz-1);
                 if (is_pa)                    { ++npa; prev_fast = 0; continue; }
                 if (st->fast_interior[idx])   { if (!prev_fast) ++nr; prev_fast = 1; }
@@ -415,7 +376,7 @@ SK_API AcousticFDTDState* fdtd_create(
             int in_run = 0, rlen = 0;
             for (int k = 0; k < Nz; ++k) {
                 int idx = IDX3(Ny, Nz, i, j, k);
-                if (cell_is_pressure_solid(ct[idx])) {
+                if (ct[idx] == FDTD_WALL) {
                     if (in_run) { st->run_len[ri-1] = rlen; in_run = 0; rlen = 0; }
                     continue;
                 }
@@ -432,7 +393,7 @@ SK_API AcousticFDTDState* fdtd_create(
                                        IDX3(Ny,Nz,i,j+1,k), IDX3(Ny,Nz,i,j-1,k),
                                        IDX3(Ny,Nz,i,j,k+1), IDX3(Ny,Nz,i,j,k-1) };
                         for (int n = 0; n < 6; ++n)
-                            if (cell_is_pressure_solid(ct[nb6[n]])) { fpa = 0; break; }
+                            if (ct[nb6[n]] == FDTD_WALL) { fpa = 0; break; }
                     }
                     st->plate_adj_fast[pai] = fpa;
                     ++pai;
@@ -482,22 +443,18 @@ SK_API AcousticFDTDState* fdtd_create(
                 st->plate_below_idx[n] = (st->plate_iz - 1 >= 0)
                                          ? IDX3(Ny, Nz, i, j, st->plate_iz - 1) : -1;
 
-                /* 13-tap biharmonic stencil on the *active plate graph*.
-                 * Samples that would leave the guitar outline or enter the soundhole
-                 * are reflected to the current cell.  That gives a local zero-slope
-                 * free-edge approximation at irregular boundaries instead of imposing
-                 * a rectangular-grid ghost reflection unrelated to the actual body. */
+                /* 13-tap biharmonic stencil with odd-reflection at boundaries */
                 for (int t = 0; t < 13; ++t) {
                     int ii = i + DI13[t];
                     int jj = j + DJ13[t];
-                    int use_self = 0;
-                    if (ii < 0 || ii >= Nx || jj < 0 || jj >= Ny) {
-                        use_self = 1;
-                    } else {
-                        int qidx = IDX2(Ny, ii, jj);
-                        if (!plate_active[qidx]) use_self = 1;
-                    }
-                    if (use_self) { ii = i; jj = j; }
+                    /* Odd reflection: W[-1] = -W[1] → for SSE BC gives zero at boundary.
+                     * After one reflection, clamp any remaining OOB. */
+                    if (ii < 0)   ii = -ii - 1;
+                    if (ii >= Nx) ii = 2*Nx - 1 - ii;
+                    if (jj < 0)   jj = -jj - 1;
+                    if (jj >= Ny) jj = 2*Ny - 1 - jj;
+                    if (ii < 0) ii = 0; if (ii >= Nx) ii = Nx-1;
+                    if (jj < 0) jj = 0; if (jj >= Ny) jj = Ny-1;
                     st->plate_biharm_idx13[n*13 + t] = IDX2(Ny, ii, jj);
                 }
                 ++n;
@@ -519,7 +476,7 @@ SK_API void fdtd_destroy(AcousticFDTDState* st)
     free(st->cell_type);  free(st->pml_alpha);
     free(st->P_prev_mul); free(st->P_curr_mul); free(st->P_lap_mul);
     free(st->w_curr);     free(st->w_prev);     free(st->w_tmp);
-    free(st->plate_active); free(st->plate_ext_force);
+    free(st->plate_active);
     free(st->src_idx);    free(st->src_wgt);
     free(st->Vx);         free(st->Vy);         free(st->Vz);
     free(st->Vx_damp);    free(st->Vy_damp);    free(st->Vz_damp);
@@ -571,46 +528,6 @@ SK_API int fdtd_set_bridge_sources(
 
 /* ── Source injection ─────────────────────────────────────────────────────── */
 
-/* Robust bridge pressure deposition.  Bridge source kernels may be built on
- * the geometric soundboard plane.  After FDTD_PLATE is treated as a real
- * pressure barrier, those geometric cells can be solid.  Never deposit pressure
- * into a solid cell: it will be copied forward by the leapfrog boundary rule and
- * can accumulate until the stability guard trips.  Instead, deposit into the
- * coincident air cell, or split to the nearest face-adjacent air cells. */
-static inline int deposit_pressure_open(AcousticFDTDState* st, int idx, float amp)
-{
-    if (!st || idx < 0 || idx >= st->N || amp == 0.0f) return 0;
-    if (!cell_is_pressure_solid(st->cell_type[idx])) {
-        st->P_curr[idx] += amp;
-        return 1;
-    }
-
-    int k   = idx % st->Nz;
-    int tmp = idx / st->Nz;
-    int j   = tmp % st->Ny;
-    int i   = tmp / st->Ny;
-
-    int nb[6];
-    int n = 0;
-    if (i + 1 < st->Nx) nb[n++] = IDX3(st->Ny, st->Nz, i+1, j,   k);
-    if (i - 1 >= 0)     nb[n++] = IDX3(st->Ny, st->Nz, i-1, j,   k);
-    if (j + 1 < st->Ny) nb[n++] = IDX3(st->Ny, st->Nz, i,   j+1, k);
-    if (j - 1 >= 0)     nb[n++] = IDX3(st->Ny, st->Nz, i,   j-1, k);
-    if (k + 1 < st->Nz) nb[n++] = IDX3(st->Ny, st->Nz, i,   j,   k+1);
-    if (k - 1 >= 0)     nb[n++] = IDX3(st->Ny, st->Nz, i,   j,   k-1);
-
-    int open_count = 0;
-    for (int q = 0; q < n; ++q)
-        if (!cell_is_pressure_solid(st->cell_type[nb[q]])) ++open_count;
-    if (open_count <= 0) return 0;
-
-    float share = amp / (float)open_count;
-    for (int q = 0; q < n; ++q)
-        if (!cell_is_pressure_solid(st->cell_type[nb[q]]))
-            st->P_curr[nb[q]] += share;
-    return open_count;
-}
-
 SK_API int fdtd_inject_bridge(
     AcousticFDTDState* st,
     float signal_val,
@@ -637,8 +554,9 @@ SK_API int fdtd_inject_bridge(
     for (int i = 0; i < st->n_src; ++i) {
         int   idx = st->src_idx[i];
         float w   = st->src_wgt[i];
+        if (idx < 0 || idx >= st->N) continue;
         float amp = (vel_amp + pres_amp) * w;
-        deposit_pressure_open(st, idx, amp);
+        st->P_curr[idx] += amp;
     }
     return FDTD_OK;
 }
@@ -701,26 +619,13 @@ static void plate_step(AcousticFDTDState* st)
         float P_below = (st->plate_below_idx[n] >= 0)
                         ? st->P_curr[st->plate_below_idx[n]] : 0.0f;
 
-        /* Bridge body force (N/m²) written by fdtd_inject_bridge_drive.
-         * Treated identically to a net pressure load on the plate face — the
-         * bridge string drives the plate, not the acoustic field directly. */
-        float f_bridge = st->plate_ext_force ? st->plate_ext_force[pidx] : 0.0f;
-
-        /* Small physical loss keeps the explicitly coupled plate/air update
-         * passive enough for high-resolution prewarming without hiding real
-         * resonant motion. */
-        const float plate_vel_loss = 0.9990f;
-        float w_new = w[pidx] + plate_vel_loss * (w[pidx] - wp[pidx])
-                    + a  * (P_below - P_above + f_bridge)
+        float w_new = 2.0f * w[pidx] - wp[pidx]
+                    + a  * (P_below - P_above)
                     - bh * biharm;
 
         if (fabsf(w_new) > 1e-1f) w_new = 0.0f;
         wt[pidx] = w_new;
     }
-
-    /* Consume the bridge force buffer so it doesn't accumulate across steps. */
-    if (st->plate_ext_force)
-        memset(st->plate_ext_force, 0, st->N_plate * sizeof(float));
 
     float* tmp = st->w_prev;
     st->w_prev = st->w_curr;
@@ -750,11 +655,6 @@ static int pressure_step(AcousticFDTDState* st)
      * copy handles them (wall BC: P_tmp = P_curr).  Non-wall cells are
      * overwritten by the three loops that follow. */
     memcpy(P_tmp, P_curr, st->N * sizeof(float));
-    /* Solid pressure cells are barriers, not state reservoirs.  Keep them zero
-     * so accidental deposits or stale values cannot be carried forever. */
-    for (int idx = 0; idx < st->N; ++idx) {
-        if (cell_is_pressure_solid(ct[idx])) P_tmp[idx] = 0.0f;
-    }
 
     /* ── Fast interior: Eigen vectorized contiguous k-runs ── */
     {
@@ -792,7 +692,7 @@ static int pressure_step(AcousticFDTDState* st)
         auto nb_v = [&](int ii, int jj, int kk) -> float {
             if (ii<0||ii>=Nx||jj<0||jj>=Ny||kk<0||kk>=Nz) return Pc;
             int nidx = IDX3(Ny, Nz, ii, jj, kk);
-            return cell_is_pressure_solid(ct[nidx]) ? Pc : P_curr[nidx];
+            return (ct[nidx] == FDTD_WALL) ? Pc : P_curr[nidx];
         };
         float lap = nb_v(i+1,j,k) + nb_v(i-1,j,k)
                   + nb_v(i,j+1,k) + nb_v(i,j-1,k)
@@ -822,7 +722,7 @@ static int pressure_step(AcousticFDTDState* st)
             auto nb_v = [&](int ii, int jj, int kk) -> float {
                 if (ii<0||ii>=Nx||jj<0||jj>=Ny||kk<0||kk>=Nz) return Pc;
                 int nidx = IDX3(Ny, Nz, ii, jj, kk);
-                return cell_is_pressure_solid(ct[nidx]) ? Pc : P_curr[nidx];
+                return (ct[nidx] == FDTD_WALL) ? Pc : P_curr[nidx];
             };
             lap = nb_v(i+1,j,k) + nb_v(i-1,j,k)
                 + nb_v(i,j+1,k) + nb_v(i,j-1,k)
@@ -894,35 +794,6 @@ static int pressure_step(AcousticFDTDState* st)
         }
     }
 
-    /* Enforce no-through-flow velocity at every solid/air face.  The pressure
-     * update already uses Neumann ghosts at walls and active plate cells; this
-     * keeps sampled velocity and polar microphones from reporting impossible
-     * wall-normal motion through the soundboard or side walls. */
-    for (int i = 0; i < Nx-1; ++i)
-        for (int j = 0; j < Ny; ++j)
-            for (int k = 0; k < Nz; ++k) {
-                int L = IDX3(Ny, Nz, i,   j, k);
-                int R = IDX3(Ny, Nz, i+1, j, k);
-                if (cell_is_pressure_solid(ct[L]) || cell_is_pressure_solid(ct[R]))
-                    st->Vx[k + Nz*(j + Ny*i)] = 0.0f;
-            }
-    for (int i = 0; i < Nx; ++i)
-        for (int j = 0; j < Ny-1; ++j)
-            for (int k = 0; k < Nz; ++k) {
-                int L = IDX3(Ny, Nz, i, j,   k);
-                int R = IDX3(Ny, Nz, i, j+1, k);
-                if (cell_is_pressure_solid(ct[L]) || cell_is_pressure_solid(ct[R]))
-                    st->Vy[k + Nz*(j + (Ny-1)*i)] = 0.0f;
-            }
-    for (int i = 0; i < Nx; ++i)
-        for (int j = 0; j < Ny; ++j)
-            for (int k = 0; k < Nz-1; ++k) {
-                int L = IDX3(Ny, Nz, i, j, k);
-                int R = IDX3(Ny, Nz, i, j, k+1);
-                if (cell_is_pressure_solid(ct[L]) || cell_is_pressure_solid(ct[R]))
-                    st->Vz[k + (Nz-1)*(j + Ny*i)] = 0.0f;
-            }
-
     return FDTD_OK;
 }
 
@@ -975,9 +846,8 @@ SK_API int fdtd_reset(AcousticFDTDState* st)
     if (!st) return FDTD_ERR_NULL;
     memset(st->P_curr,  0, st->N       * sizeof(float));
     memset(st->P_prev,  0, st->N       * sizeof(float));
-    memset(st->w_curr,        0, st->N_plate * sizeof(float));
-    memset(st->w_prev,        0, st->N_plate * sizeof(float));
-    memset(st->plate_ext_force, 0, st->N_plate * sizeof(float));
+    memset(st->w_curr,  0, st->N_plate * sizeof(float));
+    memset(st->w_prev,  0, st->N_plate * sizeof(float));
     memset(st->Vx,      0, st->Nvx     * sizeof(float));
     memset(st->Vy,      0, st->Nvy     * sizeof(float));
     memset(st->Vz,      0, st->Nvz     * sizeof(float));
@@ -1380,18 +1250,17 @@ SK_API int fdtd_inject_bridge_drive(
     if (!st) return FDTD_ERR_NULL;
     if (!st->src_idx || st->n_src == 0) return FDTD_OK;  /* no bridge — no-op */
     if (!cell_drives) return FDTD_ERR_NULL;
-    if (!st->plate_ext_force) return FDTD_ERR_NULL;
 
-    /* Convert per-bridge-cell force (N) to force-per-area (N/m²) and accumulate
-     * into the plate equation's external forcing buffer.  plate_step reads this
-     * buffer as an additional pressure-equivalent load and zeroes it afterward,
-     * keeping the bridge→plate→air coupling chain strictly causal and passive.
-     *
-     * src_idx[i] = k + Nz*(j + Ny*i) so src_idx[i]/Nz = j + Ny*i = plate pidx. */
-    float inv_dx2 = 1.0f / (st->dx * st->dx);
+    float dt  = st->dt;
+    float dx  = st->dx;
+    /* Convert bridge-velocity drive amplitude → pressure increment.
+     * Same physics as fdtd_inject_bridge's vel_amp path, but per-cell. */
+    float coef = force_scale * st->rho_air * st->c * st->c * dt / dx;
+
     for (int i = 0; i < st->n_src; ++i) {
-        int pidx = st->src_idx[i] / st->Nz;
-        st->plate_ext_force[pidx] += force_scale * cell_drives[i] * inv_dx2;
+        int idx = st->src_idx[i];
+        if (idx < 0 || idx >= st->N) continue;
+        st->P_curr[idx] += coef * cell_drives[i];
     }
     return FDTD_OK;
 }

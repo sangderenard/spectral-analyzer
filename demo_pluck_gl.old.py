@@ -458,46 +458,6 @@ def physics_frame(ce, n_strings: int, n_render_segs: int = N_RENDER_SEGS) -> Fra
     )
 
 
-# ── Divergence diagnostics ─────────────────────────────────────────────────────
-# Rolling window of per-frame field statistics; consulted when step() throws.
-
-_DIAG_HISTORY: collections.deque = collections.deque(maxlen=20)
-
-
-def _record_diag(frame: Frame, fi: int) -> None:
-    p_max  = float(np.abs(frame.pressure).max())
-    pl_max = float(np.abs(frame.plate).max())
-    s_max  = (max(float(np.abs(s).max()) for s in frame.strings)
-              if frame.strings else 0.0)
-    _DIAG_HISTORY.append((fi, p_max, pl_max, s_max))
-
-
-def _dump_diag() -> None:
-    print("\n[divergence] Field statistics before explosion:", flush=True)
-    if not _DIAG_HISTORY:
-        print("  (no history — diverged on first step)", flush=True)
-        return
-    print(f"  {'frame':>6}  {'pressure_max':>14}  {'plate_max':>12}  {'string_max':>12}",
-          flush=True)
-    prev_p = None
-    for (fi, p, pl, s) in _DIAG_HISTORY:
-        growth = f"  ×{p/prev_p:.2f}" if (prev_p and prev_p > 0) else ""
-        print(f"  {fi:>6}  {p:>14.6g}  {pl:>12.6g}  {s:>12.6g}{growth}", flush=True)
-        prev_p = p
-    print(flush=True)
-
-
-def _print_diag_summary(label: str, start_index: int = 0) -> None:
-    rows = list(_DIAG_HISTORY)[start_index:]
-    if not rows:
-        return
-    p_max = max(row[1] for row in rows)
-    pl_max = max(row[2] for row in rows)
-    s_max = max(row[3] for row in rows)
-    print(f"{label}: pressure_max={p_max:.6g} "
-          f"plate_max={pl_max:.6g} string_max={s_max:.6g}", flush=True)
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Ray-segment buffer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1239,9 +1199,6 @@ void main() {
             rd = cosine_dir(rand01(rng), rand01(rng), n);
         } else {
             rd = normalize(reflect(rd, n));
-            if (dot(rd, n) < 0.0) {
-                rd = cosine_dir(rand01(rng), rand01(rng), n);
-            }
         }
         ro = hp + rd * 1e-5;
         // Frequency-dependent absorption: wood attenuates high bands more than low.
@@ -1454,24 +1411,24 @@ def _sample_soundboard_sources(
     where spec_f32 is a (4,) array of normalised per-band fractions.
     Sorted strongest-first.
     """
-    N_BANDS, Nx, Ny = band_maps.shape
+    N_BANDS, Nh, Nw = band_maps.shape
     min_xy = outline.min(axis=0).astype(np.float32)
     max_xy = outline.max(axis=0).astype(np.float32)
-    xs = np.linspace(float(min_xy[0]), float(max_xy[0]), Nx)
-    ys = np.linspace(float(min_xy[1]), float(max_xy[1]), Ny)
+    xs = np.linspace(float(min_xy[0]), float(max_xy[0]), Nw)
+    ys = np.linspace(float(min_xy[1]), float(max_xy[1]), Nh)
     _z  = float(body_h) - 0.001
     _dn = np.array([0.0, 0.0, -1.0], np.float32)
 
     pts, weights, spectra = [], [], []
-    for ix in range(0, Nx, stride):
-        for iy in range(0, Ny, stride):
-            if not plate_active[ix, iy]:
+    for j in range(0, Nh, stride):
+        for i in range(0, Nw, stride):
+            if not plate_active[j, i]:
                 continue
-            spec = band_maps[:, ix, iy]
+            spec = band_maps[:, j, i]
             total_e = float(spec.sum())
             if total_e <= 0.0:
                 continue
-            pts.append(np.array([xs[ix], ys[iy], _z], np.float32))
+            pts.append(np.array([xs[i], ys[j], _z], np.float32))
             weights.append(total_e)
             spectra.append((spec / total_e).astype(np.float32))
 
@@ -1528,25 +1485,25 @@ def _instant_soundboard_sources(
     stride: int = 4,
 ) -> list:
     """Current-frame plate sources for dynamic ray-field refresh."""
-    Nx, Ny = disp.shape
+    Nh, Nw = disp.shape
     min_xy = outline.min(axis=0).astype(np.float32)
     max_xy = outline.max(axis=0).astype(np.float32)
-    xs = np.linspace(float(min_xy[0]), float(max_xy[0]), Nx)
-    ys = np.linspace(float(min_xy[1]), float(max_xy[1]), Ny)
+    xs = np.linspace(float(min_xy[0]), float(max_xy[0]), Nw)
+    ys = np.linspace(float(min_xy[1]), float(max_xy[1]), Nh)
     energy = np.abs(disp).astype(np.float32)
     peak = float(energy.max())
     if peak <= 1e-12:
         return []
     spec = np.array([0.22, 0.34, 0.30, 0.14], np.float32)
     pts, weights = [], []
-    for ix in range(0, Nx, stride):
-        for iy in range(0, Ny, stride):
-            if not plate_active[ix, iy]:
+    for j in range(0, Nh, stride):
+        for i in range(0, Nw, stride):
+            if not plate_active[j, i]:
                 continue
-            w = float(energy[ix, iy])
+            w = float(energy[j, i])
             if w <= peak * 0.01:
                 continue
-            pts.append(np.array([xs[ix], ys[iy], float(body_h) - 0.001], np.float32))
+            pts.append(np.array([xs[i], ys[j], float(body_h) - 0.001], np.float32))
             weights.append(w)
     if not pts:
         return []
@@ -1556,6 +1513,7 @@ def _instant_soundboard_sources(
     dn = np.array([0.0, 0.0, -1.0], np.float32)
     order = np.argsort(n_each)[::-1]
     return [(pts[k], dn.copy(), int(n_each[k]), spec.copy()) for k in order]
+
 
 def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
                    dims=GPU_RAY_FIELD_DIMS, segment_cap=GPU_RAY_SEGMENT_CAP,
@@ -1643,14 +1601,6 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo[4])
 
     prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
-    if not glGetProgramiv(prog, GL_LINK_STATUS):
-        print("  [gpu_ray_field] compute shader did not link; ray volume disabled", flush=True)
-        glDeleteProgram(prog)
-        for tex in tex_bands:
-            glDeleteTextures([tex])
-        for buf in ssbo:
-            glDeleteBuffers(1, [buf])
-        return None, None, None, None, 0, None, 0
     glUseProgram(prog)
     # imageAtomicAdd on all 4 band textures — must be GL_READ_WRITE
     for band_idx, tex in enumerate(tex_bands):
@@ -2861,6 +2811,7 @@ def main():
         n_pml=N_PML,
         n_segs=args.render_segs)
     body_h = bh if bh is not None else BODY_H
+    _schedule_excitation(ce, args.excitation, n_strings=6)
     print(f"  Grid {info['Nx']}×{info['Ny']}×{info['Nz']}  "
           f"body_h={body_h:.3f}m", flush=True)
 
@@ -2885,13 +2836,8 @@ def main():
         _bm_path  = _band_maps_cache_path(args.dx, args.render_segs)
         band_maps = _try_load_band_maps(_bm_path)
         if band_maps is None:
-            ce.reset()
-            _schedule_excitation(ce, args.excitation, n_strings=n_str)
             band_maps = _compute_spectral_emission_map(ce)
             _save_band_maps(band_maps, _bm_path)
-            ce.reset()
-            if hasattr(ce, "clear_pluck_schedule"):
-                ce.clear_pluck_schedule()
         else:
             print("  [cache] spectral map hit — skipping 8192-step prepass", flush=True)
         soundboard_sources = _sample_soundboard_sources(
@@ -2989,28 +2935,9 @@ def main():
     panel.values['dx']       = float(args.dx)
     panel._prev = dict(panel.values)
 
-    # Pre-warm with exponentially decaying overdamping: suppresses any initial
-    # transient (neck-model startup, PML settling) before the first pluck.
-    _N_PREWARM = 16
-    print(f"Pre-warming ({_N_PREWARM} frames, overdamped) ...", flush=True)
-    if hasattr(ce, "clear_pluck_schedule"):
-        ce.clear_pluck_schedule()
-    ce.reset()
-    for _pi in range(_N_PREWARM):
-        # Decay from 40× to 1× over the warm-up frames (geometric ramp)
-        _damp_scale = 40.0 * (1.0 / 40.0) ** (_pi / max(1, _N_PREWARM - 1))
-        if hasattr(ce, 'set_damping_scale'):
-            ce.set_damping_scale(_damp_scale)
-        try:
-            _wf = physics_frame(ce, n_str, args.render_segs)
-        except RuntimeError:
-            _dump_diag()
-            raise
-        _record_diag(_wf, _pi)
-        R.push(_wf)
-    if hasattr(ce, 'set_damping_scale'):
-        ce.set_damping_scale(1.0)
-    _print_diag_summary("[prewarm]", max(0, len(_DIAG_HISTORY) - _N_PREWARM))
+    print("Pre-warming ...", flush=True)
+    for _ in range(8):
+        R.push(physics_frame(ce, n_str, args.render_segs))
     ce.reset()
     _schedule_excitation(ce, args.excitation, n_str)
     R._frames.clear()
@@ -3099,12 +3026,7 @@ def main():
                 R.cam.zoom(-ev.y * 0.04)
 
         if not replaying and fi * BLOCK_SAMPLES < total:
-            try:
-                frame = physics_frame(ce, n_str, args.render_segs)
-            except RuntimeError:
-                _dump_diag()
-                raise
-            _record_diag(frame, fi)
+            frame = physics_frame(ce, n_str, args.render_segs)
             R.push(frame)
             if scene is not None and args.gpu_rays and refresh_every > 0:
                 do_refresh = force_ray_refresh or (fi % refresh_every == 0)

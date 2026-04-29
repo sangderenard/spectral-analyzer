@@ -74,19 +74,6 @@ typedef struct {
     /* Saddle BC (set by body plate each step) */
     float   saddle_w;         /* plate displacement at saddle (m)               */
 
-    /* Neck dynamics at nut end (pol=0 only).
-     * When has_neck_model != 0, replaces rigid u[0]=0 with a driven 1-DOF
-     * spring-mass-damper representing the neck's fundamental bending mode. */
-    int     has_neck_model;
-    float   nut_w;            /* current nut displacement (m)                   */
-    float   nut_w_prev;       /* previous nut displacement (m)                  */
-    float   neck_mass_eff;    /* effective modal mass (kg)                       */
-    float   neck_stiff_eff;   /* effective modal stiffness (N/m)                 */
-    float   neck_damp_eff;    /* effective modal damping (N·s/m)                 */
-
-    /* Per-step effective damping — set by _step_one_sample from gamma*gamma_scale */
-    float   gamma_eff;
-
     /* Modal state */
     float   modal_re[N_MODES];   /* Real amplitudes A_k                        */
     float   modal_im[N_MODES];   /* Imaginary amplitudes B_k (quadrature)      */
@@ -98,14 +85,13 @@ typedef struct {
      * 0 when stiffness_EI == 0 (ideal flexible string) */
     float   biharm_coef;
 
-    /* Time-resolved external force.
-     * Filled by coevolver_inject_string_force or coevolver_pluck_string.
-     * timed_force_buf[s] is pre-scaled by dt_s²/(mu·ds); distributed evenly
-     * across all string substeps within each audio sample by _step_one_sample. */
-    float*  timed_force_buf;      /* [n_force_buf] heap, may be NULL             */
-    int     n_force_buf;          /* number of valid samples                     */
-    int     force_node;           /* injection node index (1..n_nodes-2)        */
-    int     force_onset_sample;   /* absolute sample index when buf[0] applies  */
+    /* Time-resolved external force (Issue 12).
+     * Filled by coevolver_inject_string_force; consumed one sample per
+     * _step_one_sample call — avoids lumping an entire block into one impulse.
+     * timed_force_buf[s] is already scaled by dt_s²/(mu·ds). */
+    float*  timed_force_buf;    /* [n_force_buf] heap, may be NULL               */
+    int     n_force_buf;        /* valid samples remaining in timed_force_buf    */
+    int     force_node;         /* injection node index                          */
 } StringState;
 
 /* ── Internal pickup state ────────────────────────────────────────────────── */
@@ -183,10 +169,6 @@ struct AcousticCoEvolverState {
     /* Force scale */
     float force_scale;
 
-    /* Global damping multiplier — applied to all string γ each step.
-     * 1.0 = physical; >1.0 for warm-up overdamping. */
-    float gamma_scale;
-
     /* Modal */
     int   modal_stride;
     int   modal_counter;
@@ -251,10 +233,6 @@ struct AcousticCoEvolverState {
     int         n_pluck_events;
     int         pluck_capacity;
     int         pluck_cursor;   /* index of next event to fire (reset each step)   */
-
-    /* Current absolute sample index during coevolver_step — read by
-     * coevolver_pluck_string to set force_onset_sample on the string. */
-    int         current_sample_idx;
 
     /* Precomputed: 1 if any mic has polar_b != 0 (needs velocity sampling)     */
     int         any_mic_needs_velocity;
@@ -379,17 +357,6 @@ static StringState* string_create(const CoEvolverStringDef* def, float dt_fdtd)
     ss->tension_N    = def->tension_N;
     ss->linear_mass  = def->linear_mass_kgm;
     ss->gamma        = def->damping;
-    ss->gamma_eff    = def->damping;
-
-    /* Neck bending model at nut — optional driven BC */
-    if (def->neck_freq_hz > 0.0f && def->neck_mass_kg > 0.0f) {
-        ss->has_neck_model = 1;
-        ss->neck_mass_eff  = def->neck_mass_kg;
-        float omega_n = 2.0f * (float)M_PI * def->neck_freq_hz;
-        ss->neck_stiff_eff = def->neck_mass_kg * omega_n * omega_n;
-        float Q = (def->neck_Q > 0.0f) ? def->neck_Q : 30.0f;
-        ss->neck_damp_eff  = def->neck_mass_kg * omega_n / Q;
-    }
 
     build_string_frame(ss);
 
@@ -480,12 +447,7 @@ static void string_step_pol(StringState* ss, int pol)
 {
     int   N    = ss->n_nodes;
     float c2   = ss->cfl2;
-
-    /* Centered damped leapfrog (Crank–Nicolson velocity):
-     *   (1 + γdt/2) u^{n+1} = 2u^n − (1 − γdt/2) u^{n-1} + c²Δt²∇²u + dt²F/μ
-     * gamma_eff is set by _step_one_sample from gamma * gamma_scale each step. */
-    float half_gdt = 0.5f * ss->gamma_eff * ss->dt_s;
-    float inv_1pg  = 1.0f / (1.0f + half_gdt);
+    float damp = 1.0f - ss->gamma * ss->dt_s;
 
     using Arr = Eigen::Map<Eigen::ArrayXf>;
 
@@ -495,54 +457,38 @@ static void string_step_pol(StringState* ss, int pol)
     Arr fe(ss->ext_force[pol], N);
 
     /* Boundary conditions */
+    ut[0]   = 0.0f;
     ut[N-1] = (pol == 0) ? ss->saddle_w : 0.0f;
 
-    /* Nut BC: rigid (0) or driven by neck bending oscillator (pol=0 only).
-     * The neck model is a 1-DOF spring-mass-damper driven by the string's
-     * nut slope force: F = T·(u[1] − nut_w)/ds.  Centered leapfrog for neck:
-     *   (m/dt² + c/2dt)·w_new = (2m/dt² − k)·w − (m/dt² − c/2dt)·w_prev + F */
-    if (ss->has_neck_model && pol == 0) {
-        float F_nut = ss->tension_N * (u[1] - ss->nut_w) / ss->ds;
-        float dt2   = ss->dt_s * ss->dt_s;
-        float a_inv = 1.0f / (ss->neck_mass_eff / dt2
-                             + ss->neck_damp_eff / (2.0f * ss->dt_s));
-        float w_new = a_inv * (
-              (2.0f * ss->neck_mass_eff / dt2 - ss->neck_stiff_eff) * ss->nut_w
-            + (-ss->neck_mass_eff / dt2 + ss->neck_damp_eff / (2.0f * ss->dt_s)) * ss->nut_w_prev
-            + F_nut);
-        ss->nut_w_prev = ss->nut_w;
-        ss->nut_w = w_new;
-        ut[0] = w_new;
-    } else {
-        ut[0] = 0.0f;
-    }
-
-    /* Interior nodes [1 .. N-2]: fully vectorised 3-point wave stencil. */
+    /* Interior nodes [1 .. N-2]: fully vectorised 3-point wave stencil.
+     * Eigen maps u, up, ut onto the same raw buffers — all ops use SIMD. */
     if (N > 2) {
         const int M = N - 2;
-        /* Numerator: 2u − (1−γdt/2)u_prev + c²·lap + fe */
+        /* Laplacian as shifted-segment expression — no temporaries until eval */
         Eigen::ArrayXf new_u =
               2.0f * u.segment(1, M)
-            - (1.0f - half_gdt) * up.segment(1, M)
-            + c2 * (u.segment(2, M) - 2.0f * u.segment(1, M) + u.segment(0, M))
+            - damp  * up.segment(1, M)
+            + c2    * (u.segment(2, M) - 2.0f * u.segment(1, M) + u.segment(0, M))
             + fe.segment(1, M);
 
-        /* Biharmonic stiffness correction — nodes [2..N-3] (5-point stencil). */
+        /* Biharmonic stiffness correction — nodes [2..N-3] (5-point stencil).
+         * u_xxxx ≈ (u[i-2] - 4u[i-1] + 6u[i] - 4u[i+1] + u[i+2]) / ds⁴
+         * Requires N > 4 (at least one interior node not adjacent to BCs).
+         * u[0]=0 and u[N-1]=saddle_w are already set in the u array from
+         * the previous step's ut→u swap, so segment indexing is exact. */
         if (N > 4 && ss->biharm_coef > 0.0f) {
             const int M2 = N - 4;   /* nodes 2..N-3 */
             Eigen::ArrayXf biharm =
-                  u.segment(0, M2)
-                - 4.0f * u.segment(1, M2)
-                + 6.0f * u.segment(2, M2)
-                - 4.0f * u.segment(3, M2)
-                + u.segment(4, M2);
+                  u.segment(0, M2)          /* u[i-2] */
+                - 4.0f * u.segment(1, M2)  /* u[i-1] */
+                + 6.0f * u.segment(2, M2)  /* u[i  ] */
+                - 4.0f * u.segment(3, M2)  /* u[i+1] */
+                + u.segment(4, M2);        /* u[i+2] */
+            /* new_u index 0 = node 1; biharmonic starts at new_u index 1 = node 2 */
             new_u.segment(1, M2) -= ss->biharm_coef * biharm;
         }
 
-        /* Divide numerator by (1 + γdt/2) to complete the centered update. */
-        new_u *= inv_1pg;
-
-        /* Clamp any numerically-exploded nodes. */
+        /* Zero any numerically-exploded nodes */
         new_u = (new_u.abs() > 0.1f).select(Eigen::ArrayXf::Zero(M), new_u);
         ut.segment(1, M) = new_u;
     }
@@ -758,54 +704,6 @@ static int build_bridge_kernel(AcousticCoEvolverState* st,
     return CE_OK;
 }
 
-
-/* ── Guitar plate aperture mask ────────────────────────────────────────────── */
-
-/* The Python visualiser and scene builder use the canonical acoustic-guitar
- * soundhole centered at (0, 0.050)m with radius 0.028m.  Some bridge paths
- * deliver a full-outline plate mask to C and only cut the hole for rendering.
- * Carve it here before fdtd_create so the pressure solver sees an aperture,
- * not an invisible display-only disc.  If the body grid does not contain that
- * circle, the copy is unchanged. */
-static uint8_t* copy_plate_active_with_canonical_soundhole(const CoEvolverBodyDef* body)
-{
-    if (!body || !body->plate_active || body->Nx <= 0 || body->Ny <= 0 || body->dx <= 0.0f)
-        return NULL;
-
-    const int Np = body->Nx * body->Ny;
-    uint8_t* out = alloc_u8(Np);
-    if (!out) return NULL;
-    memcpy(out, body->plate_active, (size_t)Np * sizeof(uint8_t));
-
-    const float cx = 0.0f;
-    const float cy = 0.050f;
-    const float r  = 0.028f;
-    const float r2 = r * r;
-    const float x0 = body->origin[0];
-    const float y0 = body->origin[1];
-    const float x1 = x0 + (float)(body->Nx - 1) * body->dx;
-    const float y1 = y0 + (float)(body->Ny - 1) * body->dx;
-
-    if (cx + r < x0 || cx - r > x1 || cy + r < y0 || cy - r > y1)
-        return out;
-
-    int carved = 0;
-    for (int i = 0; i < body->Nx; ++i) {
-        float x = body->origin[0] + (float)i * body->dx;
-        for (int j = 0; j < body->Ny; ++j) {
-            float y = body->origin[1] + (float)j * body->dx;
-            float dx = x - cx;
-            float dy = y - cy;
-            if (dx*dx + dy*dy < r2) {
-                int pidx = j + body->Ny * i;
-                if (out[pidx]) { out[pidx] = 0; ++carved; }
-            }
-        }
-    }
-    (void)carved;
-    return out;
-}
-
 /* ── coevolver_create ─────────────────────────────────────────────────────── */
 
 SK_API AcousticCoEvolverState* coevolver_create(
@@ -834,19 +732,15 @@ SK_API AcousticCoEvolverState* coevolver_create(
     if (!st->thread_state) { free(st); return NULL; }
 
     /* ── Build body FDTD first (gives us dt_fdtd) ── */
-    uint8_t* plate_active_for_fdtd =
-        copy_plate_active_with_canonical_soundhole(body);
     st->fdtd = fdtd_create(
         body->Nx, body->Ny, body->Nz,
         body->dx, body->c, body->rho_air,
         body->cell_type,
-        body->plate_iz,
-        plate_active_for_fdtd ? plate_active_for_fdtd : body->plate_active,
+        body->plate_iz, body->plate_active,
         body->plate_mass_density,
         body->plate_stiffness_D,
         body->n_pml
     );
-    free(plate_active_for_fdtd);
     if (!st->fdtd) goto fail;
 
     st->Nx       = body->Nx;
@@ -864,7 +758,6 @@ SK_API AcousticCoEvolverState* coevolver_create(
     st->dt_audio     = 1.0f / sample_rate;
     st->dt_fdtd      = fdtd_get_dt(st->fdtd);
     st->force_scale  = force_scale;
-    st->gamma_scale  = 1.0f;
     st->modal_stride = modal_stride;
 
     /* How many FDTD sub-steps per audio sample */
@@ -1318,41 +1211,30 @@ static float pickup_piezo_signal(const PickupState* pk,
 /* ── coevolver_step ───────────────────────────────────────────────────────── */
 
 /* Advance the co-evolver by exactly one audio sample.
- * sample_abs is the absolute sample counter (st->samples_written + block offset);
- * pass -1 to skip timed-force-buffer injection (used by block_with_drive path). */
-static int _step_one_sample(AcousticCoEvolverState* st, int sample_abs)
+ * audio_sample_idx is the 0-based index within the current coevolver_step call;
+ * used to index into per-string timed force buffers. */
+static int _step_one_sample(AcousticCoEvolverState* st, int audio_sample_idx)
 {
     int K  = st->substeps;
     int nb = st->n_bridge_cells;
 
     memset(st->pickup_accum, 0, st->n_pickups * sizeof(float));
 
-    /* Apply global damping scale and pre-compute per-substep force for each string.
-     * timed_force_buf is indexed by (sample_abs − force_onset_sample) so it
-     * aligns correctly regardless of when within a block the pluck was scheduled.
-     * Dividing by (K × n_substeps) distributes the audio-sample force evenly
-     * across all string substeps, eliminating the impulsive first-substep spike. */
-    float per_sub[64] = {};
-    for (int si = 0; si < st->n_strings && si < 64; ++si) {
+    /* Apply time-resolved external forces for this audio sample (Issue 12).
+     * Must happen before the first string substep so the force is consumed
+     * within the correct audio-sample window. */
+    for (int si = 0; si < st->n_strings; ++si) {
         StringState* ss = &st->strings[si];
-        ss->gamma_eff = ss->gamma * st->gamma_scale;
-        int buf_idx = sample_abs - ss->force_onset_sample;
-        float f_total = (buf_idx >= 0 && buf_idx < ss->n_force_buf)
-                        ? ss->timed_force_buf[buf_idx] : 0.0f;
-        int total_str_steps = K * ss->n_substeps;
-        per_sub[si] = (total_str_steps > 0 && f_total != 0.0f)
-                      ? f_total / (float)total_str_steps : 0.0f;
+        if (audio_sample_idx >= 0 && audio_sample_idx < ss->n_force_buf)
+            ss->ext_force[0][ss->force_node] += ss->timed_force_buf[audio_sample_idx];
     }
 
     for (int sub = 0; sub < K; ++sub) {
 
-        /* Step all strings, injecting the sub-dt share of this sample's force
-         * immediately before each string substep so every step gets equal drive. */
+        /* Step all strings */
         for (int si = 0; si < st->n_strings; ++si) {
             StringState* ss = &st->strings[si];
             for (int ss_sub = 0; ss_sub < ss->n_substeps; ++ss_sub) {
-                if (per_sub[si] != 0.0f)
-                    ss->ext_force[0][ss->force_node] += per_sub[si];
                 string_step_pol(ss, 0);
                 string_step_pol(ss, 1);
             }
@@ -1368,13 +1250,6 @@ static int _step_one_sample(AcousticCoEvolverState* st, int sample_abs)
                 StringState* ss = &st->strings[si];
                 int Nn = ss->n_nodes;
                 float slope0 = (ss->u[0][Nn-1] - ss->u[0][Nn-2]) / ss->ds;
-                /* Numerical passivity guard: a bridge slope outside ±1 rad is
-                 * already beyond the small-deflection plate model.  Clamp only
-                 * that nonphysical tail so the coupled FDTD cannot be driven by
-                 * an impossible string tangent after a bad excitation. */
-                if (!isfinite(slope0)) slope0 = 0.0f;
-                if (slope0 >  1.0f) slope0 =  1.0f;
-                if (slope0 < -1.0f) slope0 = -1.0f;
                 saddle_force_arr[si] = ss->tension_N * slope0;
             }
             using Eigen::Map;
@@ -1515,13 +1390,12 @@ SK_API int coevolver_step(AcousticCoEvolverState* st, int n_samples)
     int base_sample = st->samples_written;
     for (int s = 0; s < n_samples; ++s) {
         int sample_idx = base_sample + s;
-        st->current_sample_idx = sample_idx;
         while (st->pluck_cursor < st->n_pluck_events &&
                st->pluck_events[st->pluck_cursor].onset_sample <= sample_idx) {
             PluckEvent* ev = &st->pluck_events[st->pluck_cursor++];
             coevolver_pluck_string(st, ev->string_idx, ev->position_norm, ev->amplitude);
         }
-        int rc = _step_one_sample(st, sample_idx);
+        int rc = _step_one_sample(st, s);
         if (rc != CE_OK) return rc;
     }
     return CE_OK;
@@ -1699,46 +1573,21 @@ SK_API int coevolver_pluck_string(
 
     StringState* ss = &st->strings[string_idx];
     int N = ss->n_nodes;
-    float pos = fmaxf(1e-3f, fminf(1.0f - 1e-3f, position_norm));
+    float pos = fmaxf(0.0f, fminf(1.0f, position_norm));
+
     float amp = fmaxf(-0.020f, fminf(0.020f, amplitude));
-
-    int i_p = (int)roundf(pos * (float)(N - 1));
-    if (i_p <= 0)   i_p = 1;
-    if (i_p >= N-1) i_p = N - 2;
-
-    /* Quasi-static transverse force to achieve triangular displacement 'amp':
-     *   F = T * |amp| * (1/left_length + 1/right_length)
-     * where left_length and right_length are the arc lengths on each side. */
-    float left_len  = fmaxf((float)i_p * ss->ds,       ss->ds);
-    float right_len = fmaxf((float)(N-1-i_p) * ss->ds, ss->ds);
-    float F_peak    = ss->tension_N * fabsf(amp) * (1.0f / left_len + 1.0f / right_len);
-    if (amp < 0.0f) F_peak = -F_peak;
-
-    /* Continuous draw: half-cosine force ramp 0 → F_peak over ~20 ms.
-     * The sudden removal after draw_samples is the pluck release.
-     * pre-scale each sample by dt_s²/(mu·ds) for direct leapfrog injection. */
-    int draw_samples = (int)roundf(0.020f * st->sample_rate);
-    if (draw_samples < 4) draw_samples = 4;
-
-    float* fbuf = (float*)malloc(draw_samples * sizeof(float));
-    if (!fbuf) return CE_ERR_NULL;
-
-    float scale = ss->dt_s * ss->dt_s / (ss->linear_mass * ss->ds);
-    for (int s = 0; s < draw_samples; ++s) {
-        float t = (float)s / (float)(draw_samples - 1);
-        float env = 0.5f * (1.0f - cosf((float)M_PI * t));   /* 0 → 1 */
-        fbuf[s] = F_peak * env * scale;
+    for (int i = 1; i < N-1; ++i) {
+        float x = (float)i / (float)(N-1);
+        float envelope;
+        if (x <= pos) {
+            envelope = (pos > 1e-6f) ? amp * (x / pos) : 0.0f;
+        } else {
+            float tail = 1.0f - pos;
+            envelope = (tail > 1e-6f) ? amp * ((1.0f - x) / tail) : 0.0f;
+        }
+        ss->u[0][i]      += envelope;
+        ss->u_prev[0][i] += envelope;   /* both levels: starts at rest velocity */
     }
-
-    float* nb = (float*)realloc(ss->timed_force_buf, draw_samples * sizeof(float));
-    if (!nb) { free(fbuf); return CE_ERR_NULL; }
-    ss->timed_force_buf    = nb;
-    memcpy(ss->timed_force_buf, fbuf, draw_samples * sizeof(float));
-    free(fbuf);
-
-    ss->n_force_buf        = draw_samples;
-    ss->force_node         = i_p;
-    ss->force_onset_sample = st->current_sample_idx;
     return CE_OK;
 }
 
@@ -1774,9 +1623,8 @@ SK_API int coevolver_inject_string_force(
     for (int s = 0; s < n_samples; ++s)
         ss->timed_force_buf[s] = force_buf[s] * scale;
 
-    ss->n_force_buf        = n_samples;
-    ss->force_node         = i0;
-    ss->force_onset_sample = st->samples_written;  /* starts at next coevolver_step block */
+    ss->n_force_buf = n_samples;
+    ss->force_node  = i0;
     return CE_OK;
 }
 
@@ -1918,12 +1766,8 @@ SK_API int coevolver_reset(AcousticCoEvolverState* st)
         memset(ss->modal_re, 0, N_MODES * sizeof(float));
         memset(ss->modal_im, 0, N_MODES * sizeof(float));
         ss->saddle_w    = 0.0f;
-        ss->nut_w       = 0.0f;
-        ss->nut_w_prev  = 0.0f;
-        ss->gamma_eff   = ss->gamma;
         ss->n_force_buf = 0;   /* discard any pending timed force */
     }
-    st->gamma_scale = 1.0f;
     for (int pi = 0; pi < st->n_pickups; ++pi)
         memset(st->pickup_out[pi], 0, OUTPUT_BUF * sizeof(float));
     for (int mi = 0; mi < st->n_mics; ++mi)
@@ -1935,14 +1779,6 @@ SK_API int coevolver_reset(AcousticCoEvolverState* st)
     st->modal_counter   = 0;
     st->pluck_cursor    = 0;
     return CE_OK;
-}
-
-/* ── Damping scale (warm-up overdamping) ─────────────────────────────────── */
-
-SK_API void coevolver_set_damping_scale(AcousticCoEvolverState* st, float scale)
-{
-    if (!st || coevolver_busy(st)) return;
-    st->gamma_scale = (scale > 0.0f) ? scale : 1.0f;
 }
 
 /* ── Air envelope / emission surface ─────────────────────────────────────── */

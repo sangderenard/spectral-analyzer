@@ -194,16 +194,20 @@ SK_API int fdtd_inject_bridge(
 );
 
 /**
- * Per-cell bridge drive injection (multi-string version of fdtd_inject_bridge).
+ * Per-cell bridge drive injection — routes string tension force through the
+ * Kirchhoff plate equation rather than directly into the pressure field.
  *
- * Accepts one drive amplitude per bridge source cell, already blended from all
- * string saddle velocities by the caller.  Injects using the stored src_wgt as
- * a passthrough scale (or, if cell_drives is already weighted, set force_scale
- * only).
+ * cell_drives[i] (Newtons) is accumulated into plate_ext_force at the
+ * plate node corresponding to src_idx[i].  plate_step reads and zeros this
+ * buffer, so only the moving plate couples to the acoustic field.  This
+ * keeps the bridge→plate→air chain passive and free of non-physical pressure
+ * sources that bypass the plate's finite impedance.
  *
- * @param cell_drives  (n_src,) float32 — per-cell amplitude.  Caller provides
- *                     the Gaussian-weighted sum of per-string contributions.
- * @param force_scale  Global force scale (same as fdtd_inject_bridge).
+ * @param cell_drives  (n_src,) float32 — per-cell bridge force in Newtons.
+ * @param force_scale  Global force scale (tunes output level; was previously
+ *                     calibrated for direct pressure injection — rescale by
+ *                     approximately dx² * plate_rho_h / dt_fdtd after this
+ *                     change to maintain equivalent SPL).
  * @return             FDTD_OK or FDTD_ERR_NULL.
  */
 SK_API int fdtd_inject_bridge_drive(

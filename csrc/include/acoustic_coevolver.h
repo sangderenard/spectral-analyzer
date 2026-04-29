@@ -17,14 +17,20 @@
  * ------------
  * Each string is a 1-D transverse wave along its world-space path (arbitrary
  * 3-D procession), with two polarisations (vertical/lateral) treated
- * independently.  The wave equation per polarisation:
+ * independently.  The wave equation per polarisation uses a centered-velocity
+ * (Crank–Nicolson damping) leapfrog for unconditional damping stability:
  *
- *   u^{n+1}[i] = 2u^n[i] − u^{n-1}[i]·(1−γ·dt)
- *               + cfl2·(u^n[i+1] − 2u^n[i] + u^n[i-1])
+ *   (1 + γdt/2)·u^{n+1}[i] = 2u^n[i] − (1 − γdt/2)·u^{n-1}[i]
+ *                            + cfl2·(u^n[i+1] − 2u^n[i] + u^n[i-1]) + dt²F/μ
  *
  * where cfl2 = (wave_speed · dt / ds)², γ = damping coefficient (s⁻¹).
- * BCs: nut end u[0] = 0; saddle end u[N-1] = body plate displacement
- * (two-way structural coupling).
+ *
+ * BCs: saddle end u[N-1] = body plate displacement (two-way structural coupling).
+ *      nut end: rigid (u[0] = 0) by default; or a driven 1-DOF neck-bending
+ *      oscillator when neck parameters are supplied in CoEvolverStringDef
+ *      (see neck_freq_hz / neck_mass_kg / neck_Q).  The neck model increases
+ *      effective compliance and damping at the nut, producing the characteristic
+ *      spectral broadening of acoustic guitar fundamentals.
  *
  * 3-D procession
  * --------------
@@ -168,6 +174,19 @@ typedef struct {
     float  stiffness_EI;    /**< Bending stiffness EI (N·m²). 0 = ideal flexible string.
                                  Typical guitar values (wound): 1e-5 – 2e-4 N·m².
                                  Produces physically correct inharmonicity (sharp overtones). */
+
+    /* Neck dynamics at nut end.  Set neck_freq_hz > 0 to enable the 1-DOF
+     * neck-bending model; leave at 0 for a rigid nut (legacy behaviour).
+     * The model replaces u[0]=0 with a driven spring-mass-damper BC:
+     *   m·ẅ_nut + c·ẇ_nut + k·w_nut = T·(u[1]−w_nut)/ds
+     * producing compliance and frequency-dependent damping at the nut that
+     * matches the neck's fundamental bending mode behaviour. */
+    float  neck_freq_hz;    /**< Neck fundamental bending frequency (Hz). 0 = rigid nut.
+                                 Typical acoustic guitar: 50–80 Hz. */
+    float  neck_mass_kg;    /**< Effective modal mass of neck at nut (kg).
+                                 Typical: 0.10–0.25 kg. */
+    float  neck_Q;          /**< Neck quality factor. 0 uses default of 30.
+                                 Typical wood: 20–60. */
 } CoEvolverStringDef;
 
 /**
@@ -601,6 +620,18 @@ SK_API int   coevolver_get_n_pickups (const AcousticCoEvolverState* st);
 SK_API int   coevolver_get_n_mics    (const AcousticCoEvolverState* st);
 SK_API float coevolver_get_dt_audio  (const AcousticCoEvolverState* st);
 SK_API float coevolver_get_dt_fdtd   (const AcousticCoEvolverState* st);
+
+/**
+ * Set a global damping multiplier applied to all string γ values on the next
+ * step.  Values > 1.0 overdamp the strings for warm-up transient suppression;
+ * 1.0 (the default after create/reset) gives physical behaviour.
+ *
+ * Typical usage: ramp from 20–50 down to 1.0 over the pre-warm frames so the
+ * system reaches thermal equilibrium before the first pluck event fires.
+ *
+ * Thread-safety: do NOT call while an async job is running.
+ */
+SK_API void coevolver_set_damping_scale(AcousticCoEvolverState* st, float scale);
 
 /** Reset all string, plate, and pressure fields to zero. */
 SK_API int coevolver_reset(AcousticCoEvolverState* st);

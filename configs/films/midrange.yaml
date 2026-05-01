@@ -1,0 +1,48 @@
+# Film layer: midrange
+# Mid-band presence emulsion — body and projection of the instrument.
+# Green-teal hue; highlights glow emerald where midrange is densest.
+
+name: midrange
+domain: acoustic
+iso: 1.5
+gamma: 2.2
+negative: false
+rotate180: true
+opacity: 1.0
+blend_mode: add
+hue: 112.0         # emerald green
+saturation: 1.1
+sensitivity: 1.0
+is_acoustic: true
+is_em: false
+
+spectral_bands:
+  - center_hz: 110.0
+    q: 1.5
+    gain: 0.2
+    label: "B0 55-220 Hz"
+  - center_hz: 330.0
+    q: 2.5
+    gain: 1.6
+    label: "B1 220-440 Hz"
+  - center_hz: 700.0
+    q: 2.5
+    gain: 1.6
+    label: "B2 440-880 Hz"
+  - center_hz: 1600.0
+    q: 1.5
+    gain: 0.2
+    label: "B3 880+ Hz"
+
+activation: sqrt
+activation_params:
+  gain: 1.5
+
+tone_shadows:    [0.00, 0.02, 0.01]
+tone_highlights: [0.36, 0.90, 0.54]   # bright green
+shadow_point:    0.10   # balanced body range — symmetrical tonal response
+highlight_point: 0.90
+
+grain_sigma: 0.012
+grain_size: 1.4
+grain_colorimetry: luminance

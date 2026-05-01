@@ -24,6 +24,7 @@ from __future__ import annotations
 import ctypes
 import faulthandler
 import hashlib
+import io
 import math
 import os
 import sys
@@ -34,11 +35,19 @@ import traceback
 import multiprocessing as mp
 import threading
 import queue
+import time
 import wave
 from dataclasses import dataclass
 from typing import List, Optional
 
 import numpy as np
+
+try:
+    import yaml as _yaml
+    _HAS_YAML = True
+except ImportError:
+    _yaml = None  # type: ignore[assignment]
+    _HAS_YAML = False
 
 # ── optional physics ──────────────────────────────────────────────────────────
 try:
@@ -85,7 +94,7 @@ try:
         DOUBLEBUF, OPENGL, QUIT, KEYDOWN, MOUSEBUTTONDOWN,
         MOUSEMOTION, MOUSEWHEEL,
         K_SPACE, K_r, K_q, K_p, K_w,
-        K_1, K_2, K_3, K_4, K_5, K_6, K_7, K_8,
+        K_1, K_2, K_3, K_4, K_5, K_6, K_7, K_8, K_9,
     )
 except ImportError:
     print("pygame not available"); sys.exit(1)
@@ -195,9 +204,9 @@ BLOCK_SAMPLES = 512
 MAX_FRAMES    = 240
 
 LAYER_OPAQUE, LAYER_ALPHA, LAYER_HIDDEN = 0, 1, 2
-N_LAYERS    = 8
-LAYER_KEYS  = [K_1, K_2, K_3, K_4, K_5, K_6, K_7, K_8]
-LAYER_NAMES = ['body', 'plate', 'pressure', 'strings', 'markers', 'ray-segs', 'stage', 'illum']
+N_LAYERS    = 9
+LAYER_KEYS  = [K_1, K_2, K_3, K_4, K_5, K_6, K_7, K_8, K_9]
+LAYER_NAMES = ['body', 'plate', 'pressure', 'strings', 'markers', 'ray-segs', 'stage', 'illum', 'sensor']
 
 DX             = 0.006   # 6 mm cells — tractable with the generous domain below
 N_PML          = 28      # 168 mm PML on each face — effective down to ~80 Hz
@@ -210,21 +219,701 @@ STAGE_H_M      = 3.0    # stage height (world Z)
 N_RENDER_SEGS = 240    # string segments for rendering; passed to get_string_displacement_n
 PLATE_THETA_SEGS = 1024
 PLATE_RADIAL_SEGS = 96
+
+
+@dataclass
+class FilmLayer:
+    """One reactive emulsion layer in a FilmStack.
+
+    Each layer has a single Gaussian spectral response centred at
+    response_center_hz with log2-octave sigma response_width_oct.  The GPU
+    accumulator allocates one 3-D texture per layer and routes ray energy
+    into it based on the ray's instantaneous frequency vs. this Gaussian.
+
+    blend_mode: how this layer combines with layers below it in the stack.
+        'add'      — opacity-weighted additive (overlaid sensor, EM + acoustic)
+        'multiply' — not used in per-layer accumulator; kept for compat
+    """
+    name:           str   = 'default'
+    domain:         str   = 'acoustic'  # 'acoustic' | 'em' | 'custom'
+    iso:            float = 1.4
+    gamma:          float = 2.2
+    negative:       bool  = False
+    rotate180:      bool  = True
+    response_center_hz: float = 440.0     # Gaussian centre for this layer's spectral response
+    response_width_oct: float = 0.55      # log2-octave sigma
+    opacity:        float = 1.0
+    blend_mode:     str   = 'add'       # 'add' | 'multiply'
+    channel_labels: tuple = ('B0 55-220Hz', 'B1 220-440Hz', 'B2 440-880Hz', 'B3 880Hz+')
+    positive_tone:  tuple | None = None
+    # HSL colorisation: when hue is not None the blit shader forces that hue
+    # and scales saturation, overriding the default spectral colour mix.
+    hue:            float | None = None  # degrees [0, 360); None = keep spectral colours
+    saturation:     float        = 1.0   # HSL saturation scale [0, 1]
+    shadow_hue:          float | None = None   # degrees; None → hue + 180° complement
+    shadow_saturation:   float        = 0.6    # shadow endpoint HSL saturation
+    shadow_lightness:    float        = 0.15   # shadow endpoint HSL lightness [0,1]
+    highlight_lightness: float        = 0.65   # highlight endpoint HSL lightness [0,1]
+    shadow_point:        float        = 0.12   # gc at which shadow colour is fully saturated; below → ramps to black
+    highlight_point:     float        = 0.88   # gc at which highlight colour begins washing to white
+    # Temporal decay: how quickly this layer fades back to black when the
+    # source is silent.  0.0 = stable (no decay, default).  Any positive
+    # value is the half-life in seconds: display is at 50% brightness after
+    # that many seconds with no active source emitting into the accumulator.
+    half_life:      float        = 0.0   # seconds; 0.0 = stable
+
+    def positive_tone_rgb(self) -> tuple:
+        """Display-positive colour for this layer, derived from hue or white."""
+        if self.positive_tone is not None:
+            return tuple(float(v) for v in self.positive_tone[:3])
+        if self.hue is not None:
+            return _hsl_to_rgb(float(self.hue) % 360.0,
+                               min(float(self.saturation), 1.0),
+                               float(self.highlight_lightness))
+        return (1.0, 1.0, 1.0)
+
+    def duotone_pair(self) -> tuple:
+        """Return (shadow_rgb, highlight_rgb) duotone endpoints for this layer.
+
+        Neither endpoint is forced to black or white.  As band intensity goes
+        0→1 the shader lerps from shadow_rgb to highlight_rgb, giving a full
+        hue-to-hue duotone gradient.
+        """
+        if self.hue is None:
+            hi = self.positive_tone_rgb()
+            sh = tuple(max(float(v) * 0.07, 0.0) for v in hi)
+            return sh, hi
+        h_hi = float(self.hue) % 360.0
+        h_sh = (float(self.shadow_hue) % 360.0) if self.shadow_hue is not None \
+               else (h_hi + 180.0) % 360.0
+        highlight = _hsl_to_rgb(h_hi, min(float(self.saturation),        1.0), float(self.highlight_lightness))
+        shadow    = _hsl_to_rgb(h_sh, min(float(self.shadow_saturation),  1.0), float(self.shadow_lightness))
+        return shadow, highlight
+
+
+def _hsl_to_rgb(h_deg: float, s: float, l: float) -> tuple:
+    """Convert HSL (h in degrees, s and l in [0,1]) to an sRGB triple."""
+    h = (float(h_deg) % 360.0) / 360.0
+    s, l = float(s), float(l)
+    if s < 1e-7:
+        return (l, l, l)
+    q = l * (1.0 + s) if l < 0.5 else l + s - l * s
+    p = 2.0 * l - q
+    def _c(t: float) -> float:
+        if t < 0.0: t += 1.0
+        if t > 1.0: t -= 1.0
+        if t < 1.0/6.0: return p + (q - p) * 6.0 * t
+        if t < 0.5:     return q
+        if t < 2.0/3.0: return p + (q - p) * (2.0/3.0 - t) * 6.0
+        return p
+    return (_c(h + 1.0/3.0), _c(h), _c(h - 1.0/3.0))
+
+
+# Backward-compat alias.
+FilmParams = FilmLayer
+
+
+class FilmStack:
+    """Ordered dict of FilmLayers with an active selection.
+
+    Active layer   → drives display parameters (iso, gamma, negative, rotate180)
+                     sent to the blit shader each frame.
+    layer_specs()  → per-layer (center_hz, width_oct, gain, dark_rgb, light_rgb)
+                     used to upload per-layer GPU uniforms and allocate one 3-D
+                     accumulation texture per layer.
+    """
+
+    def __init__(self,
+                 layers: 'dict[str, FilmLayer] | None' = None,
+                 active: 'str | None' = None) -> None:
+        self.layers: dict[str, FilmLayer] = dict(layers or {})
+        if active is not None and active in self.layers:
+            self._active = active
+        else:
+            self._active = next(iter(self.layers), '')
+
+    # ------------------------------------------------------------------
+    # Active layer selection
+    # ------------------------------------------------------------------
+
+    @property
+    def active(self) -> str:
+        return self._active
+
+    @active.setter
+    def active(self, name: str) -> None:
+        if name not in self.layers:
+            raise KeyError(f'No film layer {name!r}')
+        self._active = name
+
+    @property
+    def active_layer(self) -> 'FilmLayer':
+        if self._active and self._active in self.layers:
+            return self.layers[self._active]
+        return FilmLayer()
+
+    # ------------------------------------------------------------------
+    # Layer management
+    # ------------------------------------------------------------------
+
+    def add(self, layer: 'FilmLayer', *, set_active: bool = False) -> 'FilmStack':
+        self.layers[layer.name] = layer
+        if set_active or not self._active:
+            self._active = layer.name
+        return self
+
+    def remove(self, name: str) -> None:
+        del self.layers[name]
+        if self._active == name:
+            self._active = next(iter(self.layers), '')
+
+    def layer_specs(self) -> list:
+        """Return per-layer spectral + duotone spec, in insertion order.
+
+        Each dict has: center_hz, width_oct, gain, dark_rgb, light_rgb.
+        Used to upload uLayerCount, uLayerCentersHz[i], etc. to GPU shaders
+        and to build the per-layer 3-D accumulation textures.
+        """
+        specs = []
+        for layer in self.layers.values():
+            dark, light = layer.duotone_pair()
+            specs.append({
+                'center_hz':      float(layer.response_center_hz),
+                'width_oct':      float(layer.response_width_oct),
+                'gain':           max(0.0, float(layer.opacity)),
+                'dark_rgb':       tuple(float(v) for v in dark),
+                'light_rgb':      tuple(float(v) for v in light),
+                'shadow_point':   float(getattr(layer, 'shadow_point',   0.12)),
+                'highlight_point': float(getattr(layer, 'highlight_point', 0.88)),
+            })
+        return specs
+
+    # ------------------------------------------------------------------
+    # Compositor
+    # ------------------------------------------------------------------
+
+    def composite_hsl(self) -> tuple:
+        """Opacity-weighted circular mean of all layer hues.
+
+        Returns (hue_deg: float, saturation: float, has_hue: bool).
+        has_hue is False if no layer defines a hue, meaning the blit shader
+        should fall back to the spectral positive_tone colour mix.
+        """
+        import math as _m
+        sin_sum = cos_sum = sat_sum = weight_sum = 0.0
+        for layer in self.layers.values():
+            if layer.hue is None:
+                continue
+            op = max(0.0, float(layer.opacity))
+            w = op
+            if w <= 0.0:
+                continue
+            h_rad = _m.radians(float(layer.hue))
+            sin_sum += _m.sin(h_rad) * w
+            cos_sum += _m.cos(h_rad) * w
+            sat_sum += float(layer.saturation) * w
+            weight_sum += w
+        if weight_sum <= 0.0:
+            return (0.0, 1.0, False)
+        hue_deg = _m.degrees(_m.atan2(sin_sum, cos_sum)) % 360.0
+        sat     = sat_sum / weight_sum
+        return (hue_deg, sat, True)
+
+    def __repr__(self) -> str:
+        return (f'FilmStack(active={self._active!r}, '
+                f'layers={list(self.layers.keys())})')
+
+
+# ---------------------------------------------------------------------------
+# Film layer presets — individual emulsions (mix and match in a FilmStack).
+# ---------------------------------------------------------------------------
+
+# Acoustic domain — B0-B3 map to 55-220 / 220-440 / 440-880 / 880+ Hz.
+_ACL = ('B0 55-220Hz', 'B1 220-440Hz', 'B2 440-880Hz', 'B3 880Hz+')
+# EM domain     — same 4 slots re-labelled as R / G / B / UV-NIR.
+
+# EM response centre frequencies in Hz and log2-octave sigma widths.
+# Band layout: B0=Red 620-750nm, B1=Green 495-620nm, B2=Blue 380-495nm, B3=NIR>750nm.
+#   Red   centre 685 nm  → c/685e-9 ≈ 4.38e14 Hz
+#   Green centre 557 nm  → c/557e-9 ≈ 5.38e14 Hz
+#   Blue  centre 437 nm  → c/437e-9 ≈ 6.86e14 Hz
+#   NIR   centre 850 nm  → c/850e-9 ≈ 3.53e14 Hz
+_EM_CENTERS = (4.38e14, 5.38e14, 6.86e14, 3.53e14)
+_EM_WIDTHS  = (0.28,    0.30,    0.36,    0.50)
+_EML = ('Red 620-750nm', 'Green 495-620nm', 'Blue 380-495nm', 'UV/NIR 750nm+')
+
+FILM_LAYER_PRESETS: dict[str, FilmLayer] = {
+    # --- Acoustic ---
+    'acoustic_pan':    FilmLayer('acoustic_pan',    'acoustic',
+                                 response_center_hz=440.0,  response_width_oct=3.0,
+                                 channel_labels=_ACL),
+    'bass_heavy':      FilmLayer('bass_heavy',      'acoustic',
+                                 response_center_hz=110.0,  response_width_oct=1.5,
+                                 channel_labels=_ACL,
+                                 hue=28.0,  saturation=1.3),
+    'treble_heavy':    FilmLayer('treble_heavy',    'acoustic',
+                                 response_center_hz=1760.0, response_width_oct=1.5,
+                                 channel_labels=_ACL,
+                                 hue=262.0, saturation=1.2),
+    'midrange':        FilmLayer('midrange',        'acoustic',
+                                 response_center_hz=440.0,  response_width_oct=0.9,
+                                 channel_labels=_ACL,
+                                 hue=112.0, saturation=1.1),
+    'ortho':           FilmLayer('ortho',           'acoustic',
+                                 response_center_hz=330.0,  response_width_oct=1.2,
+                                 blend_mode='multiply', channel_labels=_ACL,
+                                 hue=185.0, saturation=0.9),
+    'negative_pan':    FilmLayer('negative_pan',    'acoustic',
+                                 response_center_hz=440.0,  response_width_oct=3.0,
+                                 negative=True, channel_labels=_ACL),
+    # --- EM (optical) ---
+    'em_red':          FilmLayer('em_red',          'em', iso=1.0,
+                                 response_center_hz=4.38e14, response_width_oct=0.28,
+                                 channel_labels=_EML,
+                                 hue=0.0,   saturation=1.4,
+                                 shadow_hue=215.0, shadow_saturation=0.85, shadow_lightness=0.30, highlight_lightness=0.72),
+    'em_green':        FilmLayer('em_green',        'em', iso=1.0,
+                                 response_center_hz=5.38e14, response_width_oct=0.30,
+                                 channel_labels=_EML,
+                                 hue=120.0, saturation=1.4,
+                                 shadow_hue=285.0, shadow_saturation=0.80, shadow_lightness=0.28, highlight_lightness=0.70),
+    'em_blue':         FilmLayer('em_blue',         'em', iso=1.0,
+                                 response_center_hz=6.86e14, response_width_oct=0.36,
+                                 channel_labels=_EML,
+                                 hue=240.0, saturation=1.4,
+                                 shadow_hue=30.0,  shadow_saturation=0.80, shadow_lightness=0.28, highlight_lightness=0.70),
+    'em_nir':          FilmLayer('em_nir',          'em', iso=1.8,
+                                 response_center_hz=3.53e14, response_width_oct=0.50,
+                                 channel_labels=_EML,
+                                 hue=320.0, saturation=1.2),
+    'em_panchromatic': FilmLayer('em_panchromatic', 'em', iso=1.4,
+                                 response_center_hz=5.38e14, response_width_oct=2.0,
+                                 channel_labels=_EML),
+    'em_negative':     FilmLayer('em_negative',     'em', iso=1.4,
+                                 response_center_hz=5.38e14, response_width_oct=2.0,
+                                 negative=True, channel_labels=_EML),
+}
+
+# Backward-compat alias (old code: FILM_PRESETS['panchromatic']).
+FILM_PRESETS: dict[str, FilmLayer] = {
+    'panchromatic': FILM_LAYER_PRESETS['acoustic_pan'],
+    'bass_heavy':   FILM_LAYER_PRESETS['bass_heavy'],
+    'treble_heavy': FILM_LAYER_PRESETS['treble_heavy'],
+    'midrange':     FILM_LAYER_PRESETS['midrange'],
+    'ortho':        FILM_LAYER_PRESETS['ortho'],
+    'negative_pan': FILM_LAYER_PRESETS['negative_pan'],
+}
+
+# ---------------------------------------------------------------------------
+# FilmStack presets — named multi-layer configurations.
+# ---------------------------------------------------------------------------
+
+def _default_stack() -> FilmStack:
+    # Three EM emulsion layers — red, green, blue — with correct optical
+    # response centres in Hz.  The stage light emits a continuous distribution
+    # of wavelengths that integrates to white over time; these three layers
+    # split that into R / G / B channels and reconstruct full colour.
+    return FilmStack({
+        'R': FILM_LAYER_PRESETS['em_red'],
+        'G': FILM_LAYER_PRESETS['em_green'],
+        'B': FILM_LAYER_PRESETS['em_blue'],
+    }, active='R')
+
+
+FILM_STACKS: dict[str, FilmStack] = {
+    # Single-layer acoustic
+    'default':           _default_stack(),
+    'acoustic_bass':     FilmStack({'bass':   FilmLayer('bass',   'acoustic', response_center_hz=110.0,  response_width_oct=1.5)},  active='bass'),
+    'acoustic_treble':   FilmStack({'treble': FilmLayer('treble', 'acoustic', response_center_hz=1760.0, response_width_oct=1.5)},  active='treble'),
+    'acoustic_negative': FilmStack({'neg': FilmLayer('neg', 'acoustic', negative=True)}, active='neg'),
+    # Layered acoustic: additive pan then separate ortho layer
+    'acoustic_ortho': FilmStack({
+        'pan':  FilmLayer('pan',  'acoustic', response_center_hz=440.0,  response_width_oct=3.0),
+        'ortho': FilmLayer('ortho', 'acoustic', response_center_hz=330.0, response_width_oct=1.2),
+    }, active='pan'),
+    # Three-band acoustic split (useful for audio-reactive visualisation)
+    'tri_spectrum': FilmStack({
+        'bass':   FilmLayer('bass',   'acoustic', response_center_hz=110.0,  response_width_oct=1.5, opacity=0.6),
+        'mid':    FilmLayer('mid',    'acoustic', response_center_hz=440.0,  response_width_oct=0.9, opacity=0.6),
+        'treble': FilmLayer('treble', 'acoustic', response_center_hz=1760.0, response_width_oct=1.5, opacity=0.6),
+    }, active='bass'),
+    # Single-layer EM
+    'em_rgb': FilmStack({
+        'R': FILM_LAYER_PRESETS['em_red'],
+        'G': FILM_LAYER_PRESETS['em_green'],
+        'B': FILM_LAYER_PRESETS['em_blue'],
+    }, active='R'),
+    'em_nir': FilmStack({'nir': FILM_LAYER_PRESETS['em_nir']}, active='nir'),
+    # Dual-domain: acoustic + EM NIR
+    'acoustic_em_dual': FilmStack({
+        'acoustic': FilmLayer('acoustic', 'acoustic',
+                              response_center_hz=440.0,  response_width_oct=3.0, opacity=0.7,
+                              channel_labels=_ACL),
+        'em_nir':   FilmLayer('em_nir',   'em',
+                              response_center_hz=3.53e14, response_width_oct=0.50, opacity=0.5,
+                              channel_labels=_EML),
+    }, active='acoustic'),
+    # Full-spectrum: acoustic tri-band + EM NIR, all additive
+    'full_spectrum': FilmStack({
+        'bass':   FilmLayer('bass',   'acoustic', response_center_hz=110.0,  response_width_oct=1.5, opacity=0.55, channel_labels=_ACL),
+        'mid':    FilmLayer('mid',    'acoustic', response_center_hz=440.0,  response_width_oct=0.9, opacity=0.55, channel_labels=_ACL),
+        'treble': FilmLayer('treble', 'acoustic', response_center_hz=1760.0, response_width_oct=1.5, opacity=0.55, channel_labels=_ACL),
+        'em_nir': FilmLayer('em_nir', 'em',       response_center_hz=3.53e14, response_width_oct=0.50, opacity=0.4, channel_labels=_EML),
+    }, active='bass'),
+}
 USE_GPU_RAY_FIELD = True
 GPU_RAY_FIELD_DIMS = (512, 640, 160)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sensor / Lens / Light spec dataclasses + YAML loaders
+# ─────────────────────────────────────────────────────────────────────────────
+
+_CONFIGS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+
+
+def _load_yaml_file(path: str) -> dict:
+    """Load a YAML file.  Requires PyYAML; returns empty dict on failure."""
+    if not _HAS_YAML:
+        print(f"[config] PyYAML not available — cannot load {path}", flush=True)
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return _yaml.safe_load(fh) or {}
+    except FileNotFoundError:
+        print(f"[config] not found: {path}", flush=True)
+        return {}
+    except Exception as exc:
+        print(f"[config] failed to load {path}: {exc}", flush=True)
+        return {}
+
+
+def _config_path(*parts: str) -> str:
+    return os.path.join(_CONFIGS_DIR, *parts)
+
+
+def _load_material_yaml(name: str) -> np.ndarray:
+    """Load a material YAML from configs/materials/<name>.yaml and return an
+    11-float32 array in the BVH mat11 layout:
+        [refl_in, diff_in, abso_in,
+         refl_out, diff_out, abso_out,
+         albedo_r, albedo_g, albedo_b,
+         ior, opacity]
+    Falls back to a neutral diffuse grey on any error.
+    """
+    _FALLBACK = np.array([0.5, 0.5, 0.0,  0.5, 0.5, 0.0,  0.5, 0.5, 0.5,  1.5, 1.0], np.float32)
+    d = _load_yaml_file(_config_path("materials", f"{name}.yaml"))
+    if not d:
+        return _FALLBACK
+    refl  = float(d.get("reflectivity", 0.5))
+    diff  = float(d.get("diffusion",    0.0))
+    abso  = float(d.get("absorption",   0.0))
+    alb   = d.get("albedo_rgb", [0.5, 0.5, 0.5])
+    ior   = float(d.get("ior",     1.5))
+    opac  = float(d.get("opacity", 1.0))
+    return np.array([refl, diff, abso,  refl, diff, abso,
+                     float(alb[0]), float(alb[1]), float(alb[2]),
+                     ior, opac], np.float32)
+
+
+@dataclass
+class SensorSpec:
+    """Physical imaging sensor dimensions, used for accurate FOV calculation."""
+    name:                str   = "full_frame_35mm"
+    width_mm:            float = 36.0
+    height_mm:           float = 24.0
+    pixel_pitch_um:      float = 8.4
+    max_iso:             int   = 12800
+    dynamic_range_stops: float = 14.0
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "SensorSpec":
+        return cls(
+            name=str(d.get("name", "sensor")),
+            width_mm=float(d.get("width_mm", 36.0)),
+            height_mm=float(d.get("height_mm", 24.0)),
+            pixel_pitch_um=float(d.get("pixel_pitch_um", 8.4)),
+            max_iso=int(d.get("max_iso", 12800)),
+            dynamic_range_stops=float(d.get("dynamic_range_stops", 14.0)),
+        )
+
+    @classmethod
+    def load(cls, name: str) -> "SensorSpec":
+        d = _load_yaml_file(_config_path("sensors", f"{name}.yaml"))
+        return cls.from_dict(d) if d else cls()
+
+
+@dataclass
+class LensSpec:
+    """Optical lens parameters for FOV, focus range, and aberration."""
+    name:                 str   = "standard_35mm"
+    focal_mm:             float = 35.0
+    min_focal_mm:         float = 35.0
+    max_focal_mm:         float = 35.0
+    is_zoom:              bool  = False
+    min_focus_m:          float = 0.45
+    max_aperture_fstop:   float = 1.4
+    distortion_k1:        float = 0.001
+    distortion_k2:        float = 0.0
+    vignetting:           float = 0.15
+    # Optical transmission spectrum (4 bands) — mostly flat for modern glass
+    transmission:         tuple = (0.98, 0.97, 0.95, 0.85)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LensSpec":
+        tx = tuple(float(v) for v in d.get("transmission", [0.98, 0.97, 0.95, 0.85]))
+        return cls(
+            name=str(d.get("name", "lens")),
+            focal_mm=float(d.get("focal_mm", 35.0)),
+            min_focal_mm=float(d.get("min_focal_mm", d.get("focal_mm", 35.0))),
+            max_focal_mm=float(d.get("max_focal_mm", d.get("focal_mm", 35.0))),
+            is_zoom=bool(d.get("is_zoom", False)),
+            min_focus_m=float(d.get("min_focus_m", 0.45)),
+            max_aperture_fstop=float(d.get("max_aperture_fstop", 1.4)),
+            distortion_k1=float(d.get("distortion_k1", 0.001)),
+            distortion_k2=float(d.get("distortion_k2", 0.0)),
+            vignetting=float(d.get("vignetting", 0.15)),
+            transmission=tx,
+        )
+
+    @classmethod
+    def load(cls, name: str) -> "LensSpec":
+        d = _load_yaml_file(_config_path("lenses", f"{name}.yaml"))
+        return cls.from_dict(d) if d else cls()
+
+
+def _sample_planck_hz(T: float, rng) -> float:
+    """Sample a photon frequency from B(ν,T) restricted to 380–750 nm visible range.
+
+    Uses a precomputed 512-point CDF over the visible band so every call is O(log N).
+    """
+    _C = 2.998e8
+    _H = 6.626e-34
+    _K = 1.381e-23
+    N   = 512
+    lo  = _C / 750e-9
+    hi  = _C / 380e-9
+    freqs = np.linspace(lo, hi, N, dtype=np.float64)
+    x     = np.clip(_H * freqs / (_K * max(float(T), 100.0)), 1e-10, 700.0)
+    bnu   = freqs ** 3 / (np.exp(x) - 1.0)
+    cdf   = np.cumsum(bnu)
+    cdf  /= cdf[-1]
+    u     = float(rng.uniform(0.0, 1.0))
+    idx   = min(int(np.searchsorted(cdf, u)), N - 1)
+    return float(freqs[idx])
+
+
+@dataclass
+class LightSpec:
+    """Spectral description of a physical light source.
+
+    ``spectrum_def`` is parsed from the YAML ``spectrum:`` block and drives
+    ``sample_freq_hz()``.  Supported types:
+
+      planck          — Planckian blackbody, parameterised by color_temperature_k
+      lines           — discrete emission lines [{nm, weight}, ...]
+      gaussian_peaks  — LED-style gaussian peaks [{nm, fwhm_nm, weight}, ...]
+      uniform         — flat log-uniform across 380–750 nm (true white)
+    """
+    name:                str   = "stage_warm_white"
+    description:         str   = "Warm white stage lamp"
+    color_temperature_k: float = 3200.0
+    beam_angle_deg:      float = 60.0
+    n_emitters:          int   = 9
+    spectrum_def:        dict  = None   # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.spectrum_def is None:
+            self.spectrum_def = {'type': 'planck',
+                                 'color_temperature_k': self.color_temperature_k}
+
+    def sample_freq_hz(self, rng) -> float:
+        """Draw one photon frequency (Hz) from this source's continuous spectrum."""
+        _C  = 2.998e8
+        VIS_LO = _C / 750e-9   # ~3.99e14 Hz
+        VIS_HI = _C / 380e-9   # ~7.89e14 Hz
+        sdef  = self.spectrum_def or {}
+        stype = str(sdef.get('type', 'planck'))
+
+        if stype == 'planck':
+            T = float(sdef.get('color_temperature_k', self.color_temperature_k))
+            return _sample_planck_hz(T, rng)
+
+        elif stype == 'lines':
+            lines   = sdef.get('lines', [])
+            nms     = [float(l['nm']) for l in lines]
+            weights = np.array([float(l.get('weight', 1.0)) for l in lines], np.float64)
+            weights /= weights.sum()
+            nm = float(rng.choice(nms, p=weights))
+            nm += float(rng.normal(0.0, 1.5))          # ~1.5 nm thermal broadening
+            nm = float(np.clip(nm, 380.0, 750.0))
+            return _C / (nm * 1e-9)
+
+        elif stype == 'gaussian_peaks':
+            peaks   = sdef.get('peaks', [])
+            weights = np.array([float(p.get('weight', 1.0)) for p in peaks], np.float64)
+            weights /= weights.sum()
+            idx     = int(rng.choice(len(peaks), p=weights))
+            p       = peaks[idx]
+            nm_c    = float(p['nm'])
+            sigma   = float(p.get('fwhm_nm', 20.0)) / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+            nm      = float(np.clip(rng.normal(nm_c, sigma), 380.0, 750.0))
+            return _C / (nm * 1e-9)
+
+        else:   # 'uniform' or unknown — log-uniform white
+            return math.exp(float(rng.uniform(math.log(VIS_LO), math.log(VIS_HI))))
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LightSpec":
+        sdef = d.get('spectrum')
+        cct  = float(d.get('color_temperature_k', 3200.0))
+        if sdef is None:
+            sdef = {'type': 'planck', 'color_temperature_k': cct}
+        elif isinstance(sdef, dict) and 'color_temperature_k' not in sdef:
+            sdef = dict(sdef)
+            sdef.setdefault('color_temperature_k', cct)
+        return cls(
+            name=str(d.get('name', 'light')),
+            description=str(d.get('description', '')),
+            color_temperature_k=cct,
+            beam_angle_deg=float(d.get('beam_angle_deg', 60.0)),
+            n_emitters=int(d.get('n_emitters', 9)),
+            spectrum_def=sdef,
+        )
+
+    @classmethod
+    def load(cls, name: str) -> "LightSpec":
+        d = _load_yaml_file(_config_path("lights", f"{name}.yaml"))
+        return cls.from_dict(d) if d else cls()
+
+
+def load_film_layer_yaml(path: str) -> FilmLayer:
+    """Load a FilmLayer from a YAML file.
+
+    The YAML may include the full parametric spec (spectral_bands with
+    center_hz / q / gain per band, activation, grain, tone endpoints).
+    The band_filters tuple is computed from the spectral_bands gain values.
+    """
+    d = _load_yaml_file(path)
+    if not d:
+        return FilmLayer()
+
+    # Read per-layer spectral response (new format)
+    response_center_hz = float(d.get("response_center_hz", 440.0))
+    response_width_oct  = float(d.get("response_width_oct",  0.55))
+
+    # Support legacy spectral_bands list: use first band's center_hz/q
+    if "spectral_bands" in d:
+        sb = d["spectral_bands"]
+        if isinstance(sb, list) and len(sb) > 0:
+            first = sb[0]
+            if isinstance(first, dict):
+                response_center_hz = float(first.get("center_hz", response_center_hz))
+                q = float(first.get("q", 2.0))
+                response_width_oct = min(2.0, 1.0 / max(q * 0.5, 0.1))
+        elif isinstance(sb, dict):
+            vals = list(sb.values())
+            if vals and isinstance(vals[0], dict):
+                response_center_hz = float(vals[0].get("center_hz", response_center_hz))
+                q = float(vals[0].get("q", 2.0))
+                response_width_oct = min(2.0, 1.0 / max(q * 0.5, 0.1))
+
+    # Tone endpoints → positive_tone (highlight colour)
+    positive_tone = None
+    if "tone_highlights" in d:
+        positive_tone = tuple(float(v) for v in d["tone_highlights"][:3])
+
+    # Grain → stored as extra attributes on the FilmLayer instance
+    grain_sigma       = float(d.get("grain_sigma", 0.0))
+    grain_size        = float(d.get("grain_size", 1.0))
+    grain_colorimetry = str(d.get("grain_colorimetry", "luminance"))
+    sensitivity       = float(d.get("sensitivity", 1.0))
+    activation        = str(d.get("activation", "linear"))
+    activation_params = dict(d.get("activation_params") or {})
+
+    channel_labels_raw = d.get("channel_labels")
+    if isinstance(channel_labels_raw, list):
+        channel_labels = tuple(str(v) for v in channel_labels_raw)
+        # Pad to length 4
+        while len(channel_labels) < 4:
+            channel_labels += (f"B{len(channel_labels)}",)
+    else:
+        is_em = bool(d.get("is_em", False))
+        channel_labels = _EML if is_em else _ACL
+
+    layer = FilmLayer(
+        name=str(d.get("name", os.path.splitext(os.path.basename(path))[0])),
+        domain=str(d.get("domain", "acoustic")),
+        iso=float(d.get("iso", 1.4)) * sensitivity,
+        gamma=float(d.get("gamma", 2.2)),
+        negative=bool(d.get("negative", False)),
+        rotate180=bool(d.get("rotate180", True)),
+        response_center_hz=response_center_hz,
+        response_width_oct=response_width_oct,
+        opacity=float(d.get("opacity", 1.0)),
+        blend_mode=str(d.get("blend_mode", "add")),
+        channel_labels=channel_labels,
+        positive_tone=positive_tone,
+        hue=d.get("hue"),   # None if absent
+        saturation=float(d.get("saturation", 1.0)),
+        half_life=float(d.get("half_life", 0.0)),
+        shadow_point=float(d.get("shadow_point", 0.12)),
+        highlight_point=float(d.get("highlight_point", 0.88)),
+    )
+    # Attach extra attrs not on the dataclass (for downstream use)
+    layer.__dict__.update(
+        grain_sigma=grain_sigma,
+        grain_size=grain_size,
+        grain_colorimetry=grain_colorimetry,
+        activation=activation,
+        activation_params=activation_params,
+    )
+    return layer
+
+
+def load_film_stack_yaml(path: str) -> FilmStack:
+    """Load a FilmStack from a YAML file that defines multiple layers."""
+    d = _load_yaml_file(path)
+    if not d:
+        return _default_stack()
+    layers_raw = d.get("layers", [])
+    active = d.get("active")
+    stack = FilmStack()
+    for ld in layers_raw:
+        # Each entry may be an inline dict or a reference to a film layer file
+        if "file" in ld:
+            layer_path = _config_path("films", ld["file"])
+            layer = load_film_layer_yaml(layer_path)
+            # Allow overrides inline
+            if "opacity" in ld:
+                layer.opacity = float(ld["opacity"])
+        else:
+            # Inline — write a temp YAML dict and reuse the loader logic
+            import tempfile, json as _json
+            tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False,
+                                              encoding="utf-8")
+            if _HAS_YAML:
+                _yaml.dump(ld, tmp)
+            tmp.close()
+            layer = load_film_layer_yaml(tmp.name)
+            os.unlink(tmp.name)
+        stack.add(layer, set_active=(layer.name == active))
+    if active and active in stack.layers:
+        stack.active = active
+    return stack
+
 GPU_RAY_FIELD_SCALE = 4.0
 GPU_RAY_FIELD_REFERENCE_RAYS = 100_000
 GPU_PRESSURE_SCALE  = 4.0   # FDTD signed Pa → normalised; same scale worked pre-rename
 GPU_RAY_LOG_SCALE = True
 GPU_RAY_FIELD_GAMMA = 0.62
-GPU_RAY_SEGMENT_CAP = 200000
+GPU_RAY_SEGMENT_CAP = 2_000_000
 STAGE_LIGHT_RAYS = 200_000
 STAGE_LIGHT_DIMS = (384, 384, 256)
 # Maximum rays dispatched per glDispatchCompute call.  Keeping batches small
 # prevents the GPU TDR watchdog (Windows: ~2 s) from killing the process when
 # running high ray counts (e.g. 10 M).  The field texture accumulates correctly
 # across batches because splat() uses imageAtomicAdd.
-GPU_DISPATCH_BATCH = 65_536
+GPU_DISPATCH_BATCH = 8_192
 RAY_TRACE_RAYS = 512
 RAY_MAX_BOUNCES = 8
 
@@ -587,7 +1276,10 @@ def _build_physics(n_strings=6, *, dx=DX, pad_cells=PAD_CELLS, n_pml=N_PML,
                    n_segs=N_RENDER_SEGS,
                    force_scale=BRIDGE_FORCE_SCALE,
                    fret: int = 0,
-                   fretless: bool = False):
+                   fretless: bool = False,
+                   amr_backend: str = "cpu",
+                   amr_cache_grid: bool = True,
+                   progress_cb=None):
     """Returns (scene, ce, info, body_h) or (None, None, fallback_info, BODY_H)."""
     if not (_HAS_PHYSICS and _HAS_BRIDGE and _HAS_SCENE):
         return None, None, None, None
@@ -596,13 +1288,19 @@ def _build_physics(n_strings=6, *, dx=DX, pad_cells=PAD_CELLS, n_pml=N_PML,
     if scene is None:
         return None, None, None, None
 
-    ce, info = build_acoustic_coevolver_from_scene(
-        scene, n_strings=n_strings, sample_rate=float(SAMPLE_RATE),
-        dx=dx, pad_cells=pad_cells, n_pml=n_pml, n_segs=n_segs,
-        force_scale=force_scale,
-        scale_length_m=_effective_scale_length(fret),
-        fretless=bool(fretless),
-        fret_number=int(fret))
+    from graph_solver import _T as _PROF
+    with _PROF.span("demo.physics.build_acoustic_coevolver_from_scene"):
+        ce, info = build_acoustic_coevolver_from_scene(
+            scene, n_strings=n_strings, sample_rate=float(SAMPLE_RATE),
+            dx=dx, pad_cells=pad_cells, n_pml=n_pml, n_segs=n_segs,
+            force_scale=force_scale,
+            scale_length_m=_effective_scale_length(fret),
+            fretless=bool(fretless),
+            fret_number=int(fret),
+            amr_backend=amr_backend,
+            amr_cache_grid=bool(amr_cache_grid),
+            amr_gradient_order=2,
+            progress_cb=progress_cb)
     if ce is None:
         return scene, None, info, None
 
@@ -618,16 +1316,17 @@ def _build_physics(n_strings=6, *, dx=DX, pad_cells=PAD_CELLS, n_pml=N_PML,
     if outline_for_vox is None or len(outline_for_vox) < 8:
         outline_for_vox = _guitar_outline()
 
-    _pdx  = float(info.get('dx', DX))
-    _pNx  = int(info['Nx'])
-    _pNy  = int(info['Ny'])
-    _pxs  = info['gx_min'] + (np.arange(_pNx) + 0.5) * _pdx
-    _pys  = info['gy_min'] + (np.arange(_pNy) + 0.5) * _pdx
-    _pX, _pY = np.meshgrid(_pxs, _pys, indexing='ij')
-    plate_active = _pip_grid_demo(_pX, _pY,
-                                  np.asarray(outline_for_vox, dtype=np.float64)
-                                  ).astype(np.uint8)
-    info['plate_active_2d'] = _soundhole_cutout(plate_active, info)
+    with _PROF.span("demo.physics.plate_active_2d"):
+        _pdx  = float(info.get('dx', DX))
+        _pNx  = int(info['Nx'])
+        _pNy  = int(info['Ny'])
+        _pxs  = info['gx_min'] + (np.arange(_pNx) + 0.5) * _pdx
+        _pys  = info['gy_min'] + (np.arange(_pNy) + 0.5) * _pdx
+        _pX, _pY = np.meshgrid(_pxs, _pys, indexing='ij')
+        plate_active = _pip_grid_demo(_pX, _pY,
+                                      np.asarray(outline_for_vox, dtype=np.float64)
+                                      ).astype(np.uint8)
+        info['plate_active_2d'] = _soundhole_cutout(plate_active, info)
 
     return scene, ce, info, body_h
 
@@ -765,13 +1464,79 @@ def _pack_ready(scene, ce, info, body_h, config: dict) -> dict:
     }
 
 
-def _physics_worker(cmd_q, out_q, initial_config: dict) -> None:
+def _ensure_worker_gl_context() -> None:
+    """Create the OpenGL context required by AMR topology compute in the worker."""
+    if getattr(_ensure_worker_gl_context, "_ready", False):
+        return
+    pygame.init()
+    pygame.display.init()
+    try:
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 4)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+        pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK,
+                                        pygame.GL_CONTEXT_PROFILE_CORE)
+    except Exception:
+        pass
+    flags = OPENGL | DOUBLEBUF | getattr(pygame, "HIDDEN", 0)
+    pygame.display.set_mode((64, 64), flags)
+    pygame.display.set_caption("spectral-analyzer physics GL context")
+    if not bool(glCreateShader):
+        raise RuntimeError("physics worker OpenGL context does not expose glCreateShader")
+    if not bool(glDispatchCompute):
+        raise RuntimeError("physics worker OpenGL context does not expose glDispatchCompute")
+    _ensure_worker_gl_context._ready = True
+
+
+def _progress_put(progress_q, msg: dict) -> None:
+    """Best-effort progress path. Progress is disposable; control messages are not."""
+    try:
+        progress_q.put_nowait(msg)
+    except Exception:
+        return
+
+
+def _worker_profile_text(title: str = "GraphSolver — worker profile") -> str:
+    from graph_solver import _T as _PROF
+    buf = io.StringIO()
+    _PROF.report(title=title, file=buf)
+    return buf.getvalue()
+
+
+def _physics_worker(cmd_q, out_q, progress_q, initial_config: dict) -> None:
     """Own the coevolver in a separate process and stream renderable frames."""
     config = dict(initial_config)
     ce = scene = info = None
     body_h = BODY_H
     n_str = int(config.get("n_strings", 6))
     fi = 0
+    progress_state = {
+        "frac": 0.0,
+        "label": "worker starting",
+        "updated": time.monotonic(),
+        "stop": False,
+    }
+
+    def heartbeat_loop() -> None:
+        while not progress_state["stop"]:
+            time.sleep(2.0)
+            age = time.monotonic() - float(progress_state["updated"])
+            if age < 2.0:
+                continue
+            _progress_put(progress_q, {
+                "type": "progress",
+                "frac": float(progress_state["frac"]),
+                "label": f"still running: {progress_state['label']} ({age:.0f}s)",
+            })
+
+    def worker_progress(frac: float, label: str) -> None:
+        progress_state["frac"] = float(frac)
+        progress_state["label"] = str(label)
+        progress_state["updated"] = time.monotonic()
+        _progress_put(progress_q, {
+            "type": "progress",
+            "frac": float(frac),
+            "label": str(label),
+        })
 
     def rebuild() -> bool:
         nonlocal ce, scene, info, body_h, n_str, fi
@@ -785,7 +1550,11 @@ def _physics_worker(cmd_q, out_q, initial_config: dict) -> None:
             n_segs=int(config["render_segs"]),
             force_scale=float(config["bridge_force_scale"]),
             fret=int(config.get("fret", 0)),
-            fretless=bool(config.get("fretless", False)))
+            fretless=bool(config.get("fretless", False)),
+            amr_backend=str(config.get("amr_backend", "cpu")),
+            amr_cache_grid=bool(config.get("amr_cache_grid", True)),
+            progress_cb=worker_progress)
+
         if ce is None:
             out_q.put({"type": "error", "message": "Physics build failed"})
             return False
@@ -800,6 +1569,9 @@ def _physics_worker(cmd_q, out_q, initial_config: dict) -> None:
         return True
 
     try:
+        hb = threading.Thread(target=heartbeat_loop, daemon=True)
+        hb.start()
+        _ensure_worker_gl_context()
         if not rebuild():
             return
         while True:
@@ -810,7 +1582,17 @@ def _physics_worker(cmd_q, out_q, initial_config: dict) -> None:
             if cmd:
                 ctype = cmd.get("type")
                 if ctype == "quit":
+                    out_q.put({
+                        "type": "profile",
+                        "text": _worker_profile_text(),
+                    })
                     return
+                if ctype == "profile":
+                    out_q.put({
+                        "type": "profile",
+                        "text": _worker_profile_text(),
+                    })
+                    continue
                 if ctype == "restart":
                     ce.reset()
                     _schedule_excitation(ce, str(config["excitation"]), n_str)
@@ -833,7 +1615,17 @@ def _physics_worker(cmd_q, out_q, initial_config: dict) -> None:
                 except queue.Empty:
                     continue
                 if cmd.get("type") == "quit":
+                    out_q.put({
+                        "type": "profile",
+                        "text": _worker_profile_text(),
+                    })
                     return
+                if cmd.get("type") == "profile":
+                    out_q.put({
+                        "type": "profile",
+                        "text": _worker_profile_text(),
+                    })
+                    continue
                 if cmd.get("type") == "restart":
                     ce.reset()
                     _schedule_excitation(ce, str(config["excitation"]), n_str)
@@ -855,6 +1647,29 @@ def _physics_worker(cmd_q, out_q, initial_config: dict) -> None:
             "message": f"{type(exc).__name__}: {exc}",
             "traceback": traceback.format_exc(),
         })
+    finally:
+        progress_state["stop"] = True
+        try:
+            text = _worker_profile_text()
+            sys.stderr.write(text)
+            sys.stderr.flush()
+            out_q.put({"type": "profile", "text": text})
+        except Exception:
+            pass
+
+
+def _worker_error_message(msg: dict) -> str:
+    base = msg.get("message", "physics worker failed")
+    tb = msg.get("traceback")
+    return f"{base}\n\nWorker traceback:\n{tb}" if tb else base
+
+
+def _make_tqdm(*args, **kwargs):
+    try:
+        from tqdm.auto import tqdm
+    except Exception:
+        return None
+    return tqdm(*args, **kwargs)
 
 
 class _PhysicsProcess:
@@ -863,20 +1678,24 @@ class _PhysicsProcess:
         self._thread = None
         try:
             self.cmd_q = ctx.Queue()
-            self.out_q = ctx.Queue(maxsize=3)
-            self.proc = ctx.Process(target=_physics_worker, args=(self.cmd_q, self.out_q, dict(config)))
-            self.proc.daemon = True
+            self.out_q = ctx.Queue(maxsize=8)
+            self.progress_q = ctx.Queue(maxsize=64)
+            self.proc = ctx.Process(
+                target=_physics_worker,
+                args=(self.cmd_q, self.out_q, self.progress_q, dict(config)),
+            )
             self.proc.start()
             self.mode = "process"
         except PermissionError as exc:
             print(f"  multiprocessing unavailable ({exc}); using worker thread fallback",
                   flush=True)
             self.cmd_q = queue.Queue()
-            self.out_q = queue.Queue(maxsize=3)
+            self.out_q = queue.Queue(maxsize=8)
+            self.progress_q = queue.Queue(maxsize=64)
             self.proc = None
             self._thread = threading.Thread(
                 target=_physics_worker,
-                args=(self.cmd_q, self.out_q, dict(config)),
+                args=(self.cmd_q, self.out_q, self.progress_q, dict(config)),
                 daemon=True)
             self._thread.start()
             self.mode = "thread"
@@ -888,23 +1707,54 @@ class _PhysicsProcess:
         out = []
         while True:
             try:
+                out.append(self.progress_q.get_nowait())
+            except queue.Empty:
+                break
+            except Exception:
+                break
+        while True:
+            try:
                 out.append(self.out_q.get_nowait())
             except queue.Empty:
+                break
+            except Exception:
                 break
         return out
 
     def close(self) -> None:
         try:
+            self.cmd_q.put({"type": "profile"})
             self.cmd_q.put({"type": "quit"})
         except Exception:
             pass
+        deadline = pygame.time.get_ticks() + 5000 if pygame.get_init() else None
+        while True:
+            for msg in self.poll():
+                if msg.get("type") == "profile":
+                    text = msg.get("text", "")
+                    if text:
+                        sys.stderr.write(text)
+                        sys.stderr.flush()
+                elif msg.get("type") == "progress":
+                    print(f"[physics worker] {float(msg.get('frac', 0.0)) * 100.0:6.2f}%  "
+                          f"{msg.get('label', '')}", flush=True)
+            if deadline is None or pygame.time.get_ticks() >= deadline:
+                break
+            alive = self.proc.is_alive() if self.proc is not None else (
+                self._thread.is_alive() if self._thread is not None else False
+            )
+            if not alive:
+                break
+            pygame.time.wait(50)
         if self.proc is not None:
-            self.proc.join(timeout=1.0)
+            self.proc.join(timeout=2.0)
             if self.proc.is_alive():
+                print("[physics worker] still busy during shutdown; terminating after profile request",
+                      flush=True)
                 self.proc.terminate()
                 self.proc.join(timeout=1.0)
         elif self._thread is not None:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=2.0)
 
 
 class _WavCapture:
@@ -1113,11 +1963,22 @@ def _outline_mask(outline: np.ndarray, info: dict, *, cut_soundhole: bool = True
 def _guitar_model_matrix(outline: np.ndarray, stand_height: float = STAND_HEIGHT_M):
     """4×4 model matrix: guitar-frame → world-frame (column-vector convention).
 
-    Guitar frame: X=lateral, Y=longitudinal (neck→+Y), Z=depth (back=0, soundboard=body_h)
-    World frame:  X=lateral, Y=stage-depth (+Y toward audience), Z=up (+Z = up)
+    DISPLAY-ONLY TRANSFORM — all acoustic physics systems (FDTD, ray tracer,
+    GPU sensor/BVH) operate exclusively in guitar-frame.  This matrix is applied
+    only by the OpenGL renderer to display the guitar upright on its stand.
+
+    Guitar frame (canonical physics frame):
+        X = lateral
+        Y = longitudinal (nut → +Y, body bottom near Y=0)
+        Z = body depth   (back plate Z=0, soundboard Z=body_h ≈ 0.06 m)
+
+    World frame (OpenGL display frame, Z-up):
+        X = lateral
+        Y = stage depth  (+Y toward audience; guitar soundboard faces +Y)
+        Z = up           (neck points +Z, lifted by stand_height)
 
     The swap Y↔Z makes the neck point skyward and the soundboard face the audience.
-    The Z-translation lifts the bottom of the body to `stand_height` above the floor.
+    The Z-translation lifts the body bottom to `stand_height` above the stage floor.
     """
     y_bot = float(outline[:, 1].min())
     tz = stand_height - y_bot   # lifts outline y_bot → world Z = stand_height
@@ -1165,13 +2026,14 @@ def _stage_mesh(outline: np.ndarray, body_h: float):
         mats.extend([mat, mat])
 
     # ── Floor (faces up, Z-normal = +Z) ──────────────────────────────────────
-    diff_floor = [0.30, 0.22, 0.16,  0.30, 0.22, 0.16]   # dark hardwood
+    # mat_in/out: (reflectivity, diffusion, absorption); albedo: RGB surface color
+    diff_floor = [0.52, 0.80, 0.10,  0.52, 0.80, 0.10,  0.30, 0.22, 0.16]   # dark hardwood
     quad([-hw, y_back, 0.], [ hw, y_back, 0.],
          [ hw, y_front, 0.], [-hw, y_front, 0.],
          [0., 0., 1.], diff_floor)
 
     # ── Back wall (faces audience, +Y normal) ─────────────────────────────────
-    diff_wall = [0.22, 0.20, 0.18,  0.22, 0.20, 0.18]   # grey concrete
+    diff_wall = [0.40, 0.90, 0.05,  0.40, 0.90, 0.05,  0.30, 0.28, 0.25]   # grey concrete
     quad([-hw, y_back, 0.], [ hw, y_back, 0.],
          [ hw, y_back, sh], [-hw, y_back, sh],
          [0., 1., 0.], diff_wall)
@@ -1191,7 +2053,7 @@ def _stage_mesh(outline: np.ndarray, body_h: float):
     # to four floor contacts (world Z=0).
     gx, gy, gz = 0., body_h * 0.5, STAND_HEIGHT_M
     leg_spread_x, leg_spread_y, leg_h = 0.16, 0.06, 0.02
-    diff_stand = [0.12, 0.10, 0.08,  0.12, 0.10, 0.08]
+    diff_stand = [0.55, 0.60, 0.15,  0.55, 0.60, 0.15,  0.12, 0.10, 0.08]
     contacts = [
         (-leg_spread_x, gy - leg_spread_y, 0.),
         ( leg_spread_x, gy - leg_spread_y, 0.),
@@ -1228,6 +2090,191 @@ def _back_fan(outline: np.ndarray) -> np.ndarray:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Glass bell-jar and opaque skirt — AMR simulation boundary visualisation
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GLASS_THICKNESS_M = 0.02   # 2 cm glass wall thickness
+
+
+def _build_sim_belljar_world(wb_min: np.ndarray, wb_max: np.ndarray,
+                             thickness: float = _GLASS_THICKNESS_M,
+                             bevel_segs: int = 6) -> np.ndarray:
+    """Square glass bell-jar (4 side walls + top cap, open at bottom) with
+    rounded vertical corners in world space.
+
+    Each outer vertical edge is replaced by a quarter-cylinder arc of
+    *bevel_segs* segments, radius = *thickness*.  The flat walls are trimmed
+    to meet the arcs at their tangent points.  The top cap is a fan-tessellated
+    rounded rectangle.
+
+    Returns an interleaved float32 array shaped (-1, 6) with columns
+    [x, y, z, nx, ny, nz], suitable for a VAO with
+    ``[(0, 3, 24, 0), (1, 3, 24, 12)]`` attributes (stride 24 bytes).
+    """
+    t  = float(thickness)
+    r  = t                               # bevel radius = wall thickness
+    xi, xa = float(wb_min[0]), float(wb_max[0])
+    yi, ya = float(wb_min[1]), float(wb_max[1])
+    zi, za = float(wb_min[2]), float(wb_max[2])
+    xo0, xo1 = xi - t, xa + t
+    yo0, yo1 = yi - t, ya + t
+    zt = za + t
+
+    rows: list = []
+
+    def qf(a, b, c, d, n):
+        n3 = list(n)
+        for tri in ((a, b, c), (a, c, d)):
+            for v in tri:
+                rows.append(list(v) + n3)
+
+    def tf(a, b, c, n):
+        n3 = list(n)
+        for v in (a, b, c):
+            rows.append(list(v) + n3)
+
+    # ── Corner arc centres and angle ranges ──────────────────────────────────
+    #  SW: (xo0+r, yo0+r)  π → 3π/2
+    #  SE: (xo1-r, yo0+r)  3π/2 → 2π
+    #  NE: (xo1-r, yo1-r)  0 → π/2
+    #  NW: (xo0+r, yo1-r)  π/2 → π
+    corners = [
+        (xo0 + r, yo0 + r, math.pi,      3 * math.pi / 2),
+        (xo1 - r, yo0 + r, 3 * math.pi / 2, 2 * math.pi),
+        (xo1 - r, yo1 - r, 0.0,          math.pi / 2),
+        (xo0 + r, yo1 - r, math.pi / 2,  math.pi),
+    ]
+
+    def arc_pts_2d(cx, cy, a0, a1, n):
+        """Return (n+1) XY points along the arc, including endpoints."""
+        return [(cx + r * math.cos(a0 + (a1 - a0) * i / n),
+                 cy + r * math.sin(a0 + (a1 - a0) * i / n))
+                for i in range(n + 1)]
+
+    # ── Outer side walls — flat sections between arc tangent points ───────────
+    qf([xo0, yo0 + r, zi], [xo0, yo1 - r, zi], [xo0, yo1 - r, zt], [xo0, yo0 + r, zt], [-1, 0, 0])
+    qf([xo1, yo1 - r, zi], [xo1, yo0 + r, zi], [xo1, yo0 + r, zt], [xo1, yo1 - r, zt], [+1, 0, 0])
+    qf([xo1 - r, yo0, zi], [xo0 + r, yo0, zi], [xo0 + r, yo0, zt], [xo1 - r, yo0, zt], [0, -1, 0])
+    qf([xo0 + r, yo1, zi], [xo1 - r, yo1, zi], [xo1 - r, yo1, zt], [xo0 + r, yo1, zt], [0, +1, 0])
+
+    # ── Outer corner arc columns ──────────────────────────────────────────────
+    for cx, cy, a0, a1 in corners:
+        pts = arc_pts_2d(cx, cy, a0, a1, bevel_segs)
+        for i in range(bevel_segs):
+            px0, py0 = pts[i]
+            px1, py1 = pts[i + 1]
+            amid = a0 + (a1 - a0) * (i + 0.5) / bevel_segs
+            nx, ny = math.cos(amid), math.sin(amid)
+            qf([px0, py0, zi], [px1, py1, zi], [px1, py1, zt], [px0, py0, zt], [nx, ny, 0])
+
+    # ── Top cap — fan-tessellated rounded rectangle ────────────────────────────
+    # Build the full outer boundary polygon (CCW from above) then fan from centre.
+    # Arc order gives proper winding for +Z normal when read CCW.
+    boundary_xy: list = []
+    for cx, cy, a0, a1 in corners:
+        pts = arc_pts_2d(cx, cy, a0, a1, bevel_segs)
+        boundary_xy.extend(pts[:-1])   # skip last to avoid duplicating shared vertex
+    n_b = len(boundary_xy)
+    cx_cap = (xo0 + xo1) * 0.5
+    cy_cap = (yo0 + yo1) * 0.5
+    cap_n = [0, 0, 1]
+    for i in range(n_b):
+        px0, py0 = boundary_xy[i]
+        px1, py1 = boundary_xy[(i + 1) % n_b]
+        tf([cx_cap, cy_cap, zt], [px0, py0, zt], [px1, py1, zt], cap_n)
+
+    # ── Inner side faces (visible from inside the jar) ────────────────────────
+    qf([xi, ya, zi], [xi, yi, zi], [xi, yi, za], [xi, ya, za], [+1., 0., 0.])
+    qf([xa, yi, zi], [xa, ya, zi], [xa, ya, za], [xa, yi, za], [-1., 0., 0.])
+    qf([xa, yi, zi], [xi, yi, zi], [xi, yi, za], [xa, yi, za], [0., +1., 0.])
+    qf([xi, ya, zi], [xa, ya, zi], [xa, ya, za], [xi, ya, za], [0., -1., 0.])
+    qf([xi, ya, za], [xa, ya, za], [xa, yi, za], [xi, yi, za], [0., 0., -1.])
+
+    return np.ascontiguousarray(np.asarray(rows, np.float32).reshape(-1, 6))
+
+
+def _build_sim_skirt_world(wb_min: np.ndarray, wb_max: np.ndarray,
+                           thickness: float = _GLASS_THICKNESS_M,
+                           bevel_segs: int = 6) -> np.ndarray:
+    """Opaque skirt: four outer walls from the floor (Z = 0) up to the open
+    bottom of the bell jar (Z = *wb_min*[2]), with rounded vertical corners.
+
+    No centre floor panel is added, so the guitar base inside is never clipped.
+    Returns the same interleaved (pos3|norm3) format as
+    :func:`_build_sim_belljar_world`, or an empty array when the sim region
+    already starts at or below the stage floor.
+    """
+    floor_z = 0.0
+    z_top   = float(wb_min[2])
+    if z_top <= floor_z + 1e-4:
+        return np.zeros((0, 6), np.float32)
+
+    t  = float(thickness)
+    r  = t
+    xi, xa = float(wb_min[0]), float(wb_max[0])
+    yi, ya = float(wb_min[1]), float(wb_max[1])
+    xo0, xo1 = xi - t, xa + t
+    yo0, yo1 = yi - t, ya + t
+
+    rows: list = []
+
+    def qf(a, b, c, d, n):
+        n3 = list(n)
+        for tri in ((a, b, c), (a, c, d)):
+            for v in tri:
+                rows.append(list(v) + n3)
+
+    corners = [
+        (xo0 + r, yo0 + r, math.pi,      3 * math.pi / 2),
+        (xo1 - r, yo0 + r, 3 * math.pi / 2, 2 * math.pi),
+        (xo1 - r, yo1 - r, 0.0,          math.pi / 2),
+        (xo0 + r, yo1 - r, math.pi / 2,  math.pi),
+    ]
+
+    def arc_pts_2d(cx, cy, a0, a1, n):
+        return [(cx + r * math.cos(a0 + (a1 - a0) * i / n),
+                 cy + r * math.sin(a0 + (a1 - a0) * i / n))
+                for i in range(n + 1)]
+
+    # Flat wall sections
+    qf([xo0, yo0 + r, floor_z], [xo0, yo1 - r, floor_z], [xo0, yo1 - r, z_top], [xo0, yo0 + r, z_top], [-1, 0, 0])
+    qf([xo1, yo1 - r, floor_z], [xo1, yo0 + r, floor_z], [xo1, yo0 + r, z_top], [xo1, yo1 - r, z_top], [+1, 0, 0])
+    qf([xo1 - r, yo0, floor_z], [xo0 + r, yo0, floor_z], [xo0 + r, yo0, z_top], [xo1 - r, yo0, z_top], [0, -1, 0])
+    qf([xo0 + r, yo1, floor_z], [xo1 - r, yo1, floor_z], [xo1 - r, yo1, z_top], [xo0 + r, yo1, z_top], [0, +1, 0])
+
+    # Corner arc columns
+    for cx, cy, a0, a1 in corners:
+        pts = arc_pts_2d(cx, cy, a0, a1, bevel_segs)
+        for i in range(bevel_segs):
+            px0, py0 = pts[i]
+            px1, py1 = pts[i + 1]
+            amid = a0 + (a1 - a0) * (i + 0.5) / bevel_segs
+            nx, ny = math.cos(amid), math.sin(amid)
+            qf([px0, py0, floor_z], [px1, py1, floor_z], [px1, py1, z_top], [px0, py0, z_top], [nx, ny, 0])
+
+    return np.ascontiguousarray(np.asarray(rows, np.float32).reshape(-1, 6))
+
+
+def _sim_box_wireframe_world(wb_min: np.ndarray, wb_max: np.ndarray) -> np.ndarray:
+    """24 position-only vertices (12 GL_LINES edges) tracing the inner sim box.
+
+    Draws the exact inner boundary of the bell jar as a crisp wire overlay.
+    Returns a flat float32 array shaped (-1, 3).
+    """
+    x0, y0, z0 = float(wb_min[0]), float(wb_min[1]), float(wb_min[2])
+    x1, y1, z1 = float(wb_max[0]), float(wb_max[1]), float(wb_max[2])
+    edges = [
+        [x0, y0, z0], [x1, y0, z0],   [x1, y0, z0], [x1, y1, z0],
+        [x1, y1, z0], [x0, y1, z0],   [x0, y1, z0], [x0, y0, z0],
+        [x0, y0, z1], [x1, y0, z1],   [x1, y0, z1], [x1, y1, z1],
+        [x1, y1, z1], [x0, y1, z1],   [x0, y1, z1], [x0, y0, z1],
+        [x0, y0, z0], [x0, y0, z1],   [x1, y0, z0], [x1, y0, z1],
+        [x1, y1, z0], [x1, y1, z1],   [x0, y1, z0], [x0, y1, z1],
+    ]
+    return np.asarray(edges, np.float32).reshape(-1, 3)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # GLSL shaders — version 330 core throughout
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1246,7 +2293,7 @@ def _back_fan(outline: np.ndarray) -> np.ndarray:
 # and uses it as the diffuse term.  A small ambient Phong contribution is kept
 # so the surface is never fully black in shadowed areas.
 #
-# The band textures use the same uBand0-uBand3, uBoxMin/Max, uWorldToGrid
+# The layer textures use the same uLayer0-uLayer7, uBoxMin/Max, uWorldToGrid
 # uniforms as _MARCH_FS so the same infrastructure is reused.
 _RAY_SURFACE_VS = """
 #version 330 core
@@ -1285,15 +2332,24 @@ uniform float uSpecStrength;
 uniform float uShininess;
 uniform float uGrain;
 
-// Band textures (GL_R32UI 3D)
-uniform usampler3D uBand0;
-uniform usampler3D uBand1;
-uniform usampler3D uBand2;
-uniform usampler3D uBand3;
-uniform usampler3D uBaseBand0;
-uniform usampler3D uBaseBand1;
-uniform usampler3D uBaseBand2;
-uniform usampler3D uBaseBand3;
+// Per-layer spectral band textures (GL_R32UI 3D)
+uniform usampler3D uLayer0;
+uniform usampler3D uLayer1;
+uniform usampler3D uLayer2;
+uniform usampler3D uLayer3;
+uniform usampler3D uLayer4;
+uniform usampler3D uLayer5;
+uniform usampler3D uLayer6;
+uniform usampler3D uLayer7;
+uniform usampler3D uBaseLayer0;
+uniform usampler3D uBaseLayer1;
+uniform usampler3D uBaseLayer2;
+uniform usampler3D uBaseLayer3;
+uniform usampler3D uBaseLayer4;
+uniform usampler3D uBaseLayer5;
+uniform usampler3D uBaseLayer6;
+uniform usampler3D uBaseLayer7;
+uniform int   uLayerCount;
 uniform vec3  uBoxMin;
 uniform vec3  uBoxMax;
 uniform mat4  uWorldToGrid;   // maps world pos → normalised [0,1] voxel UVW
@@ -1325,15 +2381,25 @@ void main() {
     bool in_volume = all(greaterThanEqual(uvw, vec3(0.0))) &&
                      all(lessThanEqual(uvw, vec3(1.0)));
 
-    float dyn_irradiance = 0.0;
+    // Sum all active layers; use layer index to pseudo-assign R/G/B channels
+    vec3 dyn_rgb = vec3(0.0);
     if (uUseRayField != 0 && in_volume) {
-        float b0 = sampleBand(uBand0, uvw);
-        float b1 = sampleBand(uBand1, uvw);
-        float b2 = sampleBand(uBand2, uvw);
-        float b3 = sampleBand(uBand3, uvw);
-        dyn_irradiance = (b0 + b1 + b2 + b3) * 0.25;
-        // Beer-Lambert exposure + gamma
-        dyn_irradiance = pow(clamp(dyn_irradiance * uRayExposure, 0.0, 1.0), uRayGamma);
+        int n = clamp(uLayerCount, 1, 8);
+        float total = 0.0;
+        for (int i = 0; i < n; i++) {
+            float bv = 0.0;
+            if      (i == 0) bv = sampleBand(uLayer0, uvw);
+            else if (i == 1) bv = sampleBand(uLayer1, uvw);
+            else if (i == 2) bv = sampleBand(uLayer2, uvw);
+            else if (i == 3) bv = sampleBand(uLayer3, uvw);
+            else if (i == 4) bv = sampleBand(uLayer4, uvw);
+            else if (i == 5) bv = sampleBand(uLayer5, uvw);
+            else if (i == 6) bv = sampleBand(uLayer6, uvw);
+            else if (i == 7) bv = sampleBand(uLayer7, uvw);
+            total += bv;
+        }
+        dyn_rgb = vec3(total) * uRayExposure;
+        dyn_rgb = pow(clamp(dyn_rgb, vec3(0.0), vec3(1.0)), vec3(uRayGamma));
     }
 
     vec4 bfield4 = uBaseWorldToGrid * vec4(vPosW, 1.0);
@@ -1341,33 +2407,35 @@ void main() {
     vec3 buvw = (bfield_pos - uBaseBoxMin) / max(uBaseBoxMax - uBaseBoxMin, vec3(1e-6));
     bool in_base = all(greaterThanEqual(buvw, vec3(0.0))) &&
                    all(lessThanEqual(buvw, vec3(1.0)));
-    float base_irradiance = 0.0;
+    vec3 base_rgb = vec3(0.0);
     if (uUseBaseField != 0 && in_base) {
-        float b0 = sampleBand(uBaseBand0, buvw);
-        float b1 = sampleBand(uBaseBand1, buvw);
-        float b2 = sampleBand(uBaseBand2, buvw);
-        float b3 = sampleBand(uBaseBand3, buvw);
-        base_irradiance = (b0 + b1 + b2 + b3) * 0.25;
-        base_irradiance = pow(clamp(base_irradiance * uBaseExposure, 0.0, 1.0), uRayGamma);
+        int n = clamp(uLayerCount, 1, 8);
+        float total = 0.0;
+        for (int i = 0; i < n; i++) {
+            float bv = 0.0;
+            if      (i == 0) bv = sampleBand(uBaseLayer0, buvw);
+            else if (i == 1) bv = sampleBand(uBaseLayer1, buvw);
+            else if (i == 2) bv = sampleBand(uBaseLayer2, buvw);
+            else if (i == 3) bv = sampleBand(uBaseLayer3, buvw);
+            else if (i == 4) bv = sampleBand(uBaseLayer4, buvw);
+            else if (i == 5) bv = sampleBand(uBaseLayer5, buvw);
+            else if (i == 6) bv = sampleBand(uBaseLayer6, buvw);
+            else if (i == 7) bv = sampleBand(uBaseLayer7, buvw);
+            total += bv;
+        }
+        base_rgb = vec3(total) * uBaseExposure;
+        base_rgb = pow(clamp(base_rgb, vec3(0.0), vec3(1.0)), vec3(uRayGamma));
     }
-
-    // Phong ambient fallback (still in view space)
-    float phong_diff = max(dot(N, L), 0.0);
-    float spec       = pow(max(dot(N, H), 0.0), max(uShininess, 1.0));
 
     vec3  base = gl_FrontFacing ? uColor.rgb : uInnerColor;
     float grain = 0.5 + 0.5 * sin(vPosV.x * 80.0 + vPosV.y * 31.0 + vPosV.z * 17.0);
     base *= mix(1.0, 0.82 + 0.28 * grain, uGrain);
 
-    // Cached room light is the baseline; guitar emissions add on top.
-    float cached = clamp(base_irradiance + dyn_irradiance, 0.0, 1.2);
-    bool have_cached = (uUseBaseField != 0 && in_base) || (uUseRayField != 0 && in_volume);
-    float diff = mix(uAmbient + 0.78 * phong_diff,
-                     uAmbient + cached,
-                     have_cached ? 1.0 : 0.0);
-    vec3  col  = base * diff + vec3(1.0, 0.88, 0.62) * (uSpecStrength * spec);
-    float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    col += base * rim * 0.16;
+    // Spectral illumination × material reflectance + ambient lift.
+    // Each band independently colours the surface; the material base colour
+    // acts as a per-channel reflectance filter.
+    vec3 spectral = clamp(base_rgb + dyn_rgb, vec3(0.0), vec3(1.2));
+    vec3  col  = base * (uAmbient + spectral);
     FragColor  = vec4(col, uColor.a);
 }
 """
@@ -1547,14 +2615,16 @@ uniform mat4       uInvMVP;
 uniform sampler3D  uPressure;
 uniform sampler2D  uBodyMask;
 uniform sampler3D  uExteriorMask;   // 1.0 = outside guitar cavity, 0.0 = inside
-// ── RAY FIELD PATH (uFieldMode == 1): 4 spectral band textures ───────────────
-// Band 0: 55–220 Hz  (warm amber)   Band 1: 220–440 Hz (warm white)
-// Band 2: 440–880 Hz (cool white)   Band 3: 880+ Hz    (cool violet)
-// All-equal bands → white.  Imbalance → warm or cool tint.
-uniform usampler3D uBand0;
-uniform usampler3D uBand1;
-uniform usampler3D uBand2;
-uniform usampler3D uBand3;
+// ── RAY FIELD PATH (uFieldMode == 1): N per-layer spectral textures ──────────
+uniform usampler3D uLayer0;
+uniform usampler3D uLayer1;
+uniform usampler3D uLayer2;
+uniform usampler3D uLayer3;
+uniform usampler3D uLayer4;
+uniform usampler3D uLayer5;
+uniform usampler3D uLayer6;
+uniform usampler3D uLayer7;
+uniform int        uLayerCount;
 uniform vec3       uBoxMin;
 uniform vec3       uBoxMax;
 uniform mat4       uWorldToGrid;   // inverse guitar model matrix: world → guitar/grid frame
@@ -1574,6 +2644,15 @@ uniform int        uUseBodyMask;
 // Use to restrict pressure to inside the guitar cavity, ray field to its box.
 uniform float      uZClipMin;
 uniform float      uZClipMax;
+// ── Duotone band colours: shadow→highlight lerp per band slot ───────────────────────
+uniform vec3  uLayerDark0;  uniform vec3  uLayerLight0;
+uniform vec3  uLayerDark1;  uniform vec3  uLayerLight1;
+uniform vec3  uLayerDark2;  uniform vec3  uLayerLight2;
+uniform vec3  uLayerDark3;  uniform vec3  uLayerLight3;
+uniform vec3  uLayerDark4;  uniform vec3  uLayerLight4;
+uniform vec3  uLayerDark5;  uniform vec3  uLayerLight5;
+uniform vec3  uLayerDark6;  uniform vec3  uLayerLight6;
+uniform vec3  uLayerDark7;  uniform vec3  uLayerLight7;
 // ── AMR TBO path (uAMRMode != 0) ─────────────────────────────────────────────
 // uAMRData packs (cx, cy, cz, pressure) per AMR cell as RGBA32F.
 // The shader computes inverse-distance-squared weighted pressure at each
@@ -1589,6 +2668,42 @@ uniform float         uAMREps2;    // IDW denominator floor = (half_min_spacing)
 //   p=4            → uAMRHalfPow=2.0  → w = 1/r⁴  (also sqrt-free)
 // Any float value works; the shader uses pow(r², -uAMRHalfPow).
 uniform float         uAMRHalfPow; // default 1.0
+
+float sample_layer_val(int i, ivec3 q) {
+    if      (i == 0) return float(texelFetch(uLayer0, q, 0).r);
+    else if (i == 1) return float(texelFetch(uLayer1, q, 0).r);
+    else if (i == 2) return float(texelFetch(uLayer2, q, 0).r);
+    else if (i == 3) return float(texelFetch(uLayer3, q, 0).r);
+    else if (i == 4) return float(texelFetch(uLayer4, q, 0).r);
+    else if (i == 5) return float(texelFetch(uLayer5, q, 0).r);
+    else if (i == 6) return float(texelFetch(uLayer6, q, 0).r);
+    else if (i == 7) return float(texelFetch(uLayer7, q, 0).r);
+    return 0.0;
+}
+
+vec3 layer_dark(int i) {
+    if      (i == 0) return uLayerDark0;
+    else if (i == 1) return uLayerDark1;
+    else if (i == 2) return uLayerDark2;
+    else if (i == 3) return uLayerDark3;
+    else if (i == 4) return uLayerDark4;
+    else if (i == 5) return uLayerDark5;
+    else if (i == 6) return uLayerDark6;
+    else if (i == 7) return uLayerDark7;
+    return vec3(0.0);
+}
+
+vec3 layer_light(int i) {
+    if      (i == 0) return uLayerLight0;
+    else if (i == 1) return uLayerLight1;
+    else if (i == 2) return uLayerLight2;
+    else if (i == 3) return uLayerLight3;
+    else if (i == 4) return uLayerLight4;
+    else if (i == 5) return uLayerLight5;
+    else if (i == 6) return uLayerLight6;
+    else if (i == 7) return uLayerLight7;
+    return vec3(1.0);
+}
 
 vec3 diverge(float v) {
     float t = clamp(v * 0.5 + 0.5, 0.0, 1.0);
@@ -1657,17 +2772,6 @@ void main() {
     float dt     = (t_out - t_in) / float(STEPS);
     float step_a = 0.018 * uAlpha;
 
-    // Vivid spectral band colours — white-balanced so equal-energy → white
-    // WB scale: reciprocal of equal-mix avg so sum → (1,1,1)
-    // Band 0: amber (55–220 Hz)   Band 1: warm white (220–440 Hz)
-    // Band 2: cool white (440–880 Hz)  Band 3: violet (880+ Hz)
-    const vec3 C0 = vec3(1.000, 0.620, 0.080);  // amber
-    const vec3 C1 = vec3(1.000, 0.920, 0.740);  // warm white
-    const vec3 C2 = vec3(0.760, 0.900, 1.000);  // cool white
-    const vec3 C3 = vec3(0.560, 0.380, 1.000);  // violet
-    // White-balance: scale so C0+C1+C2+C3 averages to (1,1,1)
-    const vec3 WB = vec3(1.176, 1.370, 1.303);
-
     vec4 acc = vec4(0.0);
     for (int i = 0; i < STEPS; i++) {
         float fi  = float(i) + jitter;
@@ -1681,28 +2785,23 @@ void main() {
         vec3  spectral_color;
 
         if (uFieldMode == 1) {
-            ivec3 dims = textureSize(uBand0, 0);
+            ivec3 dims = textureSize(uLayer0, 0);
             ivec3 q = clamp(ivec3(floor(uvc * vec3(dims))), ivec3(0), dims - ivec3(1));
             float sc = uRayFieldScale / 65535.0;
-            float b0 = float(texelFetch(uBand0, q, 0).r) * sc;
-            float b1 = float(texelFetch(uBand1, q, 0).r) * sc;
-            float b2 = float(texelFetch(uBand2, q, 0).r) * sc;
-            float b3 = float(texelFetch(uBand3, q, 0).r) * sc;
-            if (uLogScale != 0) {
-                float ls = log(1.0 + uRayFieldScale);
-                b0 = log(1.0 + b0) / ls;
-                b1 = log(1.0 + b1) / ls;
-                b2 = log(1.0 + b2) / ls;
-                b3 = log(1.0 + b3) / ls;
+            float ls = (uLogScale != 0) ? log(1.0 + uRayFieldScale) : 1.0;
+            int n = clamp(uLayerCount, 1, 8);
+            float total = 0.0;
+            vec3  col_sum = vec3(0.0);
+            for (int i = 0; i < n; i++) {
+                float bv = sample_layer_val(i, q) * sc;
+                if (uLogScale != 0) bv = log(1.0 + bv) / ls;
+                float t = smoothstep(0.0, 0.12, bv);
+                col_sum += mix(layer_dark(i), layer_light(i), t) * bv;
+                total += bv;
             }
-            float total = b0 + b1 + b2 + b3 + 1e-6;
+            total += 1e-6;
             p = pow(clamp(total, 0.0, 1.0), max(uRayFieldGamma, 0.05));
-
-            // Raw spectral mix from 4 vivid band colours
-            vec3 raw = (b0 * C0 + b1 * C1 + b2 * C2 + b3 * C3) / total;
-            // Energy-adaptive saturation: sparse voxels → white, dense → vivid
-            float sat = clamp(p * 3.5, 0.0, 1.0);
-            spectral_color = mix(vec3(1.0), clamp(raw * WB, 0.0, 2.0), sat * 0.90);
+            spectral_color = col_sum / total;
         } else {
             float raw = (uAMRMode != 0)
                         ? sampleAMRPressure(pos)
@@ -1745,6 +2844,7 @@ struct Tri {
     vec4 normal;
     vec4 mat_in;
     vec4 mat_out;
+    vec4 albedo;    // surface RGB color (.w unused)
 };
 
 struct Node {
@@ -1763,15 +2863,26 @@ layout(std430, binding = 4) buffer CounterBuf {
     uint hit_count;
     uint record_count;
 };
-layout(r32ui, binding = 0) uniform uimage3D uBand0;
-layout(r32ui, binding = 1) uniform uimage3D uBand1;
-layout(r32ui, binding = 2) uniform uimage3D uBand2;
-layout(r32ui, binding = 3) uniform uimage3D uBand3;
+struct SourceRec {
+    vec4 pos_weight; // xyz=position, w=ray-budget weight
+    vec4 dir_kind;   // xyz=emission axis, w=reserved
+    vec4 packet;     // x=freq/coord, y=phase, z=energy, w=coherence/sigma
+};
+layout(std430, binding = 5) readonly buffer SourceBuf { SourceRec bdpt_sources[]; };
+layout(r32ui, binding = 0) uniform uimage3D uLayer0;
+layout(r32ui, binding = 1) uniform uimage3D uLayer1;
+layout(r32ui, binding = 2) uniform uimage3D uLayer2;
+layout(r32ui, binding = 3) uniform uimage3D uLayer3;
+layout(r32ui, binding = 4) uniform uimage3D uLayer4;
+layout(r32ui, binding = 5) uniform uimage3D uLayer5;
+layout(r32ui, binding = 6) uniform uimage3D uLayer6;
+layout(r32ui, binding = 7) uniform uimage3D uLayer7;
 
 uniform int   uTriCount;
 uniform int   uNodeCount;
 uniform int   uSegmentCap;
 uniform int   uSegmentStride;
+uniform int   uSourceCount;
 // Batched dispatch: uBatchSize rays in this call, uBatchOffset = first global ray index.
 // uTotalRaysPerSource controls the append_segment thinning ratio.
 uniform int   uBatchSize;
@@ -1779,28 +2890,64 @@ uniform int   uBatchOffset;
 uniform int   uTotalRaysPerSource;
 uniform int   uMaxBounces;
 uniform int   uSeed;
+// Diagnostics: set 0 in production to eliminate ray/hit atomic overhead.
+// SegmentCapture: set 0 to skip all segment writes (production accumulation only).
+uniform int   uDiagnosticsEnabled;
+uniform int   uSegmentCapture;
 uniform vec3  uSrcPos;
 uniform vec3  uSrcDir;
+// Area-source parameters.  uSrcRadius > 0 jitters the origin uniformly over a
+// disk of that radius lying in the plane perpendicular to uSrcDir.  uSrcConeCos
+// is the cosine of the half-angle of the emission cone; -1.0 = full hemisphere,
+// 0.0 = 90° half-angle, cos(30°)≈0.866 = narrow spotlight.
+uniform float uSrcRadius;
+uniform float uSrcConeCos;
 uniform vec3  uBoxMin;
 uniform vec3  uBoxMax;
 uniform ivec3 uDims;
-// Per-source spectral distribution: normalised fractions summing to ~1.0
-// x=band0(55-220Hz) y=band1(220-440Hz) z=band2(440-880Hz) w=band3(880Hz+)
+// Per-packet spectral sample.  The CPU expands source spectra stochastically:
+// x=frequency/spectral coordinate, y=phase radians, z=packet energy, w=coherence.
 uniform vec4  uSrcSpectrum;
+uniform int   uLayerCount;
+uniform float uLayerCentersHz[8];
+uniform float uLayerWidthsOct[8];
+uniform float uLayerGains[8];
 // Beer-Lambert participating medium uniforms
 uniform float uVolumeStepMeters;  // sample step size in metres (default 0.003)
 uniform float uMediumScattering;  // scattering coefficient (default 1.0)
 uniform float uMediumExtinction;  // extinction coefficient (default 0.5)
-uniform vec4  uBandExtinction;    // per-band extinction scaling (default all 1.0)
+uniform float uAirDiffuseScatter;
+uniform float uAirSpecularScatter;
+uniform float uAirAnisotropy;
+// Bidirectional sensor pass uniforms
+// uMode 0 = forward source emission (default); 1 = backward sensor visibility.
+// In mode 1, uSrcPos/uSrcDir are the sensor (camera) position and look direction.
+// uFwdLayer[0-7] are the completed forward accumulation textures read as integer
+// samplers — texelFetch returns raw uint counts.  uSensorNorm normalises them
+// back to per-ray energy.  uSensorGain amplifies surface contributions so they
+// emerge as bright shells in the volume march.
+uniform int   uMode;
+uniform float uSensorNorm;
+uniform float uSensorGain;
+uniform float uSensorConeCos;
+uniform float uSensorMisWeight;
+layout(binding =  8) uniform usampler3D uFwdLayer0;
+layout(binding =  9) uniform usampler3D uFwdLayer1;
+layout(binding = 10) uniform usampler3D uFwdLayer2;
+layout(binding = 11) uniform usampler3D uFwdLayer3;
+layout(binding = 12) uniform usampler3D uFwdLayer4;
+layout(binding = 13) uniform usampler3D uFwdLayer5;
+layout(binding = 14) uniform usampler3D uFwdLayer6;
+layout(binding = 15) uniform usampler3D uFwdLayer7;
 
 const float EPS = 1e-7;
 const float PI = 3.14159265358979323846;
 
 uint hash_u(uint x) {
-    x ^= x >> 16;
-    x *= 0x7feb352du;
-    x ^= x >> 15;
-    x *= 0x846ca68bu;
+    x = x * 747796405u + 2891336453u;
+    uint word = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    x = (word >> 22u) ^ word;
+    x ^= x * 0x9e3779b9u;
     x ^= x >> 16;
     return x;
 }
@@ -1808,6 +2955,12 @@ uint hash_u(uint x) {
 float rand01(inout uint s) {
     s = hash_u(s);
     return float(s & 0x00ffffffu) / 16777215.0;
+}
+
+float randn(inout uint s) {
+    float u0 = max(rand01(s), 1e-6);
+    float u1 = rand01(s);
+    return sqrt(-2.0 * log(u0)) * cos(2.0 * PI * u1);
 }
 
 vec3 basis_dir(float u, float v, vec3 axis) {
@@ -1827,6 +2980,18 @@ vec3 cosine_dir(float u, float v, vec3 normal) {
     float a = 2.0 * PI * v;
     vec3 local = vec3(r * cos(a), r * sin(a), sqrt(max(0.0, 1.0 - u)));
     vec3 w = normalize(normal);
+    vec3 up = abs(w.z) < 0.9 ? vec3(0,0,1) : vec3(0,1,0);
+    vec3 x = normalize(cross(up, w));
+    vec3 y = cross(w, x);
+    return normalize(x * local.x + y * local.y + w * local.z);
+}
+
+vec3 cone_dir(float u, float v, vec3 axis, float cos_theta_max) {
+    float z = mix(1.0, clamp(cos_theta_max, -1.0, 1.0), u);
+    float r = sqrt(max(0.0, 1.0 - z * z));
+    float a = 2.0 * PI * v;
+    vec3 local = vec3(r * cos(a), r * sin(a), z);
+    vec3 w = normalize(axis);
     vec3 up = abs(w.z) < 0.9 ? vec3(0,0,1) : vec3(0,1,0);
     vec3 x = normalize(cross(up, w));
     vec3 y = cross(w, x);
@@ -1909,21 +3074,150 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
     return best_tri;
 }
 
-void splat_spectral(vec3 p, vec4 spectrum) {
+vec4 film_activation(float freq_hz, float phase, float energy) {
+    float coherence = 0.75 + 0.25 * cos(phase);
+    float total = 0.0;
+    int n = clamp(uLayerCount, 0, 8);
+    for (int i = 0; i < n; i++) {
+        float ctr = max(uLayerCentersHz[i], 1e-3);
+        float wid = max(uLayerWidthsOct[i], 1e-3);
+        float oct = log(max(freq_hz, 1e-3) / ctr) / log(2.0);
+        float w = exp(-0.5 * oct * oct / (wid * wid));
+        total += uLayerGains[i] * w;
+    }
+    total *= energy * coherence;
+    float per = total / max(float(max(uLayerCount, 1)), 1.0);
+    return vec4(per);
+}
+
+void layer_splat(int i, ivec3 q, uint val) {
+    if      (i == 0) imageAtomicAdd(uLayer0, q, val);
+    else if (i == 1) imageAtomicAdd(uLayer1, q, val);
+    else if (i == 2) imageAtomicAdd(uLayer2, q, val);
+    else if (i == 3) imageAtomicAdd(uLayer3, q, val);
+    else if (i == 4) imageAtomicAdd(uLayer4, q, val);
+    else if (i == 5) imageAtomicAdd(uLayer5, q, val);
+    else if (i == 6) imageAtomicAdd(uLayer6, q, val);
+    else if (i == 7) imageAtomicAdd(uLayer7, q, val);
+}
+
+void splat_spectral(vec3 p, vec4 packet) {
     vec3 uvw = (p - uBoxMin) / max(uBoxMax - uBoxMin, vec3(1e-6));
     ivec3 q = ivec3(floor(uvw * vec3(uDims)));
     if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, uDims))) return;
-    uint u0 = uint(clamp(spectrum.x * 65535.0, 0.0, 1e6));
-    uint u1 = uint(clamp(spectrum.y * 65535.0, 0.0, 1e6));
-    uint u2 = uint(clamp(spectrum.z * 65535.0, 0.0, 1e6));
-    uint u3 = uint(clamp(spectrum.w * 65535.0, 0.0, 1e6));
-    if (u0 > 0u) imageAtomicAdd(uBand0, q, u0);
-    if (u1 > 0u) imageAtomicAdd(uBand1, q, u1);
-    if (u2 > 0u) imageAtomicAdd(uBand2, q, u2);
-    if (u3 > 0u) imageAtomicAdd(uBand3, q, u3);
+    float freq   = packet.x;
+    float energy = packet.z;
+    float coherence = 0.75 + 0.25 * cos(packet.y);
+    int n = clamp(uLayerCount, 0, 8);
+    for (int i = 0; i < n; i++) {
+        float ctr = max(uLayerCentersHz[i], 1e-3);
+        float wid = max(uLayerWidthsOct[i], 1e-3);
+        float oct = log(max(freq, 1e-3) / ctr) / log(2.0);
+        float w = exp(-0.5 * oct * oct / (wid * wid));
+        float activation = uLayerGains[i] * energy * coherence * w;
+        uint val = uint(clamp(activation * 65535.0, 0.0, 1e6));
+        if (val > 0u) layer_splat(i, q, val);
+    }
 }
 
-void splat_segment_spectral(vec3 a, vec3 b, vec4 spectrum) {
+void splat_activation(vec3 p, vec4 response) {
+    vec3 uvw = (p - uBoxMin) / max(uBoxMax - uBoxMin, vec3(1e-6));
+    ivec3 q = ivec3(floor(uvw * vec3(uDims)));
+    if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, uDims))) return;
+    float total = max(response.x + response.y + response.z + response.w, 0.0);
+    int n = clamp(uLayerCount, 1, 8);
+    float per_layer = total / float(n);
+    uint val = uint(clamp(per_layer * 65535.0, 0.0, 1e6));
+    if (val == 0u) return;
+    for (int i = 0; i < n; i++) {
+        layer_splat(i, q, val);
+    }
+}
+
+float fwd_sample_layer(int i, ivec3 q) {
+    if      (i == 0) return float(texelFetch(uFwdLayer0, q, 0).r);
+    else if (i == 1) return float(texelFetch(uFwdLayer1, q, 0).r);
+    else if (i == 2) return float(texelFetch(uFwdLayer2, q, 0).r);
+    else if (i == 3) return float(texelFetch(uFwdLayer3, q, 0).r);
+    else if (i == 4) return float(texelFetch(uFwdLayer4, q, 0).r);
+    else if (i == 5) return float(texelFetch(uFwdLayer5, q, 0).r);
+    else if (i == 6) return float(texelFetch(uFwdLayer6, q, 0).r);
+    else if (i == 7) return float(texelFetch(uFwdLayer7, q, 0).r);
+    return 0.0;
+}
+
+vec4 sample_activation_field(vec3 p) {
+    vec3 uvw = (p - uBoxMin) / max(uBoxMax - uBoxMin, vec3(1e-6));
+    ivec3 q  = ivec3(floor(uvw * vec3(uDims)));
+    if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, uDims))) {
+        return vec4(0.0);
+    }
+    float norm = max(1.0, uSensorNorm) * 65535.0;
+    float total = 0.0;
+    int n = clamp(uLayerCount, 1, 8);
+    for (int i = 0; i < n; i++) {
+        total += fwd_sample_layer(i, q);
+    }
+    float avg = total / (norm * float(n));
+    return vec4(avg);
+}
+
+float balance_weight(vec4 fwd, float camera_pdf) {
+    float source_pdf = max(dot(fwd, vec4(0.25)), 1e-6);
+    float cp = max(camera_pdf * max(uSensorMisWeight, 1e-6), 1e-6);
+    return cp / (cp + source_pdf);
+}
+
+SourceRec sample_bdpt_source(inout uint rng, out float source_pdf) {
+    int count = max(1, uSourceCount);
+    int si = int(floor(rand01(rng) * float(count)));
+    si = clamp(si, 0, count - 1);
+    source_pdf = 1.0 / float(count);
+    SourceRec src = bdpt_sources[si];
+    src.packet.x *= exp2(randn(rng) * max(src.packet.w, 1e-4));
+    src.packet.y += randn(rng) * PI;
+    return src;
+}
+
+bool visible_segment(vec3 a, vec3 b) {
+    vec3 d = b - a;
+    float max_t = length(d);
+    if (max_t <= 1e-5) return false;
+    d /= max_t;
+    float hit_t;
+    int hit = nearest_hit(a + d * 1e-4, d, hit_t);
+    return hit < 0 || hit_t >= max_t - 3e-4;
+}
+
+vec4 connect_emitter(vec3 p, vec3 normal, vec3 view_dir, float path_pdf,
+                     float bsdf_weight, inout uint rng) {
+    if (uSourceCount <= 0) return vec4(0.0);
+    float src_pdf;
+    SourceRec src = sample_bdpt_source(rng, src_pdf);
+    vec3 to_src = src.pos_weight.xyz - p;
+    float dist2 = max(dot(to_src, to_src), 1e-6);
+    float dist = sqrt(dist2);
+    vec3 wi = to_src / dist;
+    if (!visible_segment(p, src.pos_weight.xyz)) return vec4(0.0);
+
+    vec3 n = normalize(normal);
+    float cos_surf = max(0.0, dot(n, wi));
+    float cam_cos = max(0.0, dot(n, -view_dir));
+    vec3 src_axis = normalize(src.dir_kind.xyz);
+    float src_lobe = max(0.08, dot(-wi, src_axis));
+    float geom = cos_surf * max(0.15, cam_cos) * src_lobe / (1.0 + dist2);
+    vec4 emitted = film_activation(src.packet.x, src.packet.y,
+                                   src.packet.z * max(src.pos_weight.w, 1e-9));
+
+    // Power heuristic between sampled emitter connection and camera path scatter.
+    float connect_pdf = max(src_pdf * dist2 / max(cos_surf, 1e-4), 1e-6);
+    float cp = max(path_pdf, 1e-6);
+    float mis = (connect_pdf * connect_pdf) /
+                (connect_pdf * connect_pdf + cp * cp);
+    return emitted * geom * bsdf_weight * mis * float(max(1, uSourceCount));
+}
+
+void splat_segment_spectral(vec3 a, vec3 b, vec4 packet) {
     float len = length(b - a);
     int steps = max(1, int(len / uVolumeStepMeters));
     vec3 dir = (b - a) / max(len, 1e-6);
@@ -1931,15 +3225,18 @@ void splat_segment_spectral(vec3 a, vec3 b, vec4 spectrum) {
         float s    = float(i) / float(steps);
         float dist = s * len;
         vec3  p    = a + dir * dist;
-        // Beer-Lambert transmittance: per-band extinction along path
-        vec4 transmit = exp(-uMediumExtinction * dist * uBandExtinction);
-        vec4 scatter  = spectrum * transmit * uMediumScattering * uVolumeStepMeters;
+        float freq_factor = clamp(packet.x / 440.0, 0.25, 8.0);
+        float transmit = exp(-uMediumExtinction * dist * freq_factor);
+        vec4 scatter  = vec4(packet.x, packet.y,
+                             packet.z * transmit * uMediumScattering * uVolumeStepMeters,
+                             packet.w);
         splat_spectral(p, scatter);
     }
 }
 
 void append_segment(vec3 p0, vec3 p1, float energy) {
-    if (uSegmentCap <= 0) return;
+    // Skip all segment buffer writes unless capture is explicitly enabled.
+    if (uSegmentCapture == 0 || uSegmentCap <= 0) return;
     uint idx = atomicAdd(seg_count, 1u);
     if (idx >= uint(uSegmentCap)) return;
     int base = int(idx) * uSegmentStride;
@@ -1951,31 +3248,170 @@ void append_segment(vec3 p0, vec3 p1, float energy) {
     segs[base + 3] = vec4(1.0, 1.0, 1.0, a);
 }
 
+// ─── Sensor (camera-view) pass ──────────────────────────────────────────────
+// Shoots rays from the camera eye into the scene.  At each surface hit it
+// reads the already-accumulated forward light field and deposits a Lambert-
+// weighted surface contribution back into the same band images.  This makes
+// every illuminated surface visible as a bright voxel shell in the volume
+// march, giving correct camera-POV surface radiance at essentially zero extra
+// geometry overhead.
+void sensor_main(uint ray_id, inout uint rng) {
+    // Camera/sensor cone path.  This is the reverse half of the bidirectional
+    // estimator: it samples source-built film activation in air and on
+    // surfaces, then writes a MIS-weighted camera-correlated contribution.
+    vec3 ro = uSrcPos;
+    vec3 rd = cone_dir(rand01(rng), rand01(rng), uSrcDir, uSensorConeCos);
+    float cone_pdf = 1.0 / max(2.0 * PI * (1.0 - clamp(uSensorConeCos, -1.0, 1.0)), 1e-6);
+    float path_weight = 1.0;
+
+    for (int bounce = 0; bounce < uMaxBounces; ++bounce) {
+        float best = 1e30;
+        int hit = nearest_hit(ro, rd, best);
+
+        float march_len = (hit >= 0) ? best : length(uBoxMax - uBoxMin);
+        int air_steps = max(1, int(march_len / max(uVolumeStepMeters * 6.0, 1e-4)));
+        float jitter = rand01(rng);
+        for (int i = 0; i < air_steps; ++i) {
+            float t = (float(i) + jitter) / float(air_steps);
+            vec3 ap = ro + rd * (t * march_len);
+            vec4 air_fwd = sample_activation_field(ap);
+            if (dot(air_fwd, vec4(1.0)) > 0.0) {
+                float forward_lobe = pow(max(0.0, dot(rd, normalize(uSrcDir))), max(1.0, uAirAnisotropy));
+                float air_phase = uAirDiffuseScatter + uAirSpecularScatter * forward_lobe;
+                float mis = balance_weight(air_fwd, cone_pdf);
+                float trans = exp(-uMediumExtinction * t * march_len);
+                splat_activation(ap, air_fwd * air_phase * trans * mis * uSensorGain * uVolumeStepMeters);
+            }
+            vec4 air_conn = connect_emitter(ap, -rd, rd, cone_pdf,
+                                            path_weight * uVolumeStepMeters *
+                                            (uAirDiffuseScatter + uAirSpecularScatter),
+                                            rng);
+            if (dot(air_conn, vec4(1.0)) > 0.0) {
+                splat_activation(ap, air_conn * uSensorGain);
+            }
+        }
+
+        if (hit < 0) break;
+        vec3 hp = ro + rd * best;
+        vec4 fwd = sample_activation_field(hp);
+
+        Tri  tri      = tris[hit];
+        vec3 geom_n   = normalize(tri.normal.xyz);
+        bool interior = dot(rd, geom_n) > 0.0;
+        vec3 n        = interior ? -geom_n : geom_n;
+        vec4 mat      = interior ? tri.mat_in : tri.mat_out;
+        float reflectivity = clamp(mat.x, 0.02, 0.98);
+        float diffusion    = clamp(mat.y, 0.0,  1.0);
+        float ior          = max(tri.mat_in.w, 1.0);
+        float opacity      = clamp(tri.mat_out.w, 0.0, 1.0);
+        float cos_theta    = max(0.0, dot(-rd, n));
+
+        if (opacity < 0.999) {
+            // ── Refractive surface: forward rays bend through glass ───────────
+            // Energy splats at the surface entry; ray continues refracted.
+            float eta      = interior ? ior : (1.0 / ior);
+            float cos_t_sq = 1.0 - eta * eta * (1.0 - cos_theta * cos_theta);
+            float fresnel_r;
+            vec3  refr_dir;
+            if (cos_t_sq <= 0.0) {
+                fresnel_r = 1.0;
+                refr_dir  = rd;
+            } else {
+                float cos_t = sqrt(cos_t_sq);
+                float rs = (cos_theta - ior * cos_t) / max(cos_theta + ior * cos_t, 1e-6);
+                float rp = (ior * cos_theta - cos_t) / max(ior * cos_theta + cos_t, 1e-6);
+                fresnel_r = clamp(0.5 * (rs * rs + rp * rp), 0.0, 1.0);
+                refr_dir  = normalize(refract(rd, n, eta));
+            }
+            float p_reflect = mix(fresnel_r, 1.0, opacity);
+            if (rand01(rng) < p_reflect) {
+                rd = normalize(reflect(rd, n));
+                if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+            } else {
+                rd = refr_dir;
+                cone_pdf *= (1.0 - fresnel_r);
+            }
+            ro = hp + rd * 1e-5;
+        } else {
+            // ── Opaque surface ─────────────────────────────────────────────────
+            float mis = balance_weight(fwd, cone_pdf);
+            float dist_falloff = 1.0 / (1.0 + best * best);
+            vec4 contribution = fwd * reflectivity * cos_theta * dist_falloff * mis * uSensorGain;
+            splat_activation(hp, contribution);
+
+            vec4 direct = connect_emitter(hp, n, rd, cone_pdf,
+                                          path_weight * reflectivity * max(0.05, diffusion),
+                                          rng);
+            if (dot(direct, vec4(1.0)) > 0.0) {
+                splat_activation(hp, direct * uSensorGain);
+            }
+
+            if (dot(contribution + direct, vec4(1.0)) < 0.001) break;
+            float survival = clamp(reflectivity, 0.05, 0.98);
+            if (rand01(rng) > survival) break;
+            path_weight *= reflectivity / survival;
+            if (rand01(rng) < diffusion) {
+                rd = cosine_dir(rand01(rng), rand01(rng), n);
+                cone_pdf *= max(0.05, 1.0 / PI);
+            } else {
+                rd = normalize(reflect(rd, n));
+                if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+                cone_pdf *= max(0.05, 1.0 - diffusion);
+            }
+            ro = hp + rd * 1e-5;
+        }
+    }
+}
+
 void main() {
     uint groups_x = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
     uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * groups_x;
     if (gid >= uint(uBatchSize)) return;
     // Global ray index stays unique across batches for RNG independence.
     uint ray_id = gid + uint(uBatchOffset);
-    atomicAdd(ray_count, 1u);
+    if (uDiagnosticsEnabled != 0) atomicAdd(ray_count, 1u);
     uint rng = hash_u(ray_id ^ uint(uSeed));
-    vec3 ro = uSrcPos;
-    vec3 rd = basis_dir(rand01(rng), rand01(rng), uSrcDir);
-    // Each ray carries spectral energy per band (initialised from source spectrum).
-    vec4 spectrum = uSrcSpectrum;
+
+    // ── Dispatch to sensor pass if requested ────────────────────────────────
+    if (uMode == 1) {
+        sensor_main(ray_id, rng);
+        return;
+    }
+
+    // Area source: jitter origin uniformly over disk of radius uSrcRadius
+    // lying perpendicular to uSrcDir.
+    vec3 _src_w  = normalize(uSrcDir);
+    vec3 _src_up = abs(_src_w.z) < 0.9 ? vec3(0.0,0.0,1.0) : vec3(0.0,1.0,0.0);
+    vec3 _src_tx = normalize(cross(_src_up, _src_w));
+    vec3 _src_ty = cross(_src_w, _src_tx);
+    float _disk_r = sqrt(rand01(rng)) * max(uSrcRadius, 0.0);
+    float _disk_a = 2.0 * PI * rand01(rng);
+    vec3 ro = uSrcPos
+            + _src_tx * (_disk_r * cos(_disk_a))
+            + _src_ty * (_disk_r * sin(_disk_a));
+    // Angular probability distribution: cone sampled uniformly in solid angle.
+    vec3 rd = cone_dir(rand01(rng), rand01(rng), uSrcDir, uSrcConeCos);
+    // Each dispatch packet is a local distribution; every ray samples its own
+    // wavelength/frequency and phase from it.
+    vec4 packet = uSrcSpectrum;
+    packet.x *= exp2(randn(rng) * max(packet.w, 1e-4));
+    packet.y += randn(rng) * PI;
 
     for (int bounce = 0; bounce < uMaxBounces; ++bounce) {
         float best = 1e30;
         int hit = nearest_hit(ro, rd, best);
         if (hit < 0) break;
-        atomicAdd(hit_count, 1u);
+        if (uDiagnosticsEnabled != 0) atomicAdd(hit_count, 1u);
         vec3 hp = ro + rd * best;
-        splat_segment_spectral(ro, hp, spectrum);
-        // Thin the segment overlay proportionally to total ray count.
-        uint thin = max(1u, uint(uTotalRaysPerSource) / 16384u);
-        if ((ray_id % thin) == 0u) {
-            atomicAdd(record_count, 1u);
-            append_segment(ro, hp, dot(spectrum, vec4(0.25)));
+        splat_segment_spectral(ro, hp, packet);
+        // Segment capture: thin proportionally to total ray count.
+        // Only fires when uSegmentCapture != 0 (production disables this path).
+        if (uSegmentCapture != 0) {
+            uint thin = max(1u, uint(uTotalRaysPerSource) / 16384u);
+            if ((ray_id % thin) == 0u) {
+                if (uDiagnosticsEnabled != 0) atomicAdd(record_count, 1u);
+                append_segment(ro, hp, packet.z);
+            }
         }
         Tri tri = tris[hit];
         vec3 geom_n = normalize(tri.normal.xyz);
@@ -1984,24 +3420,647 @@ void main() {
         float reflectivity = clamp(mat.x, 0.02, 0.98);
         float diffusion    = clamp(mat.y, 0.0, 1.0);
         float absorption   = clamp(mat.z, 0.0, 2.0);
-        vec3 n = interior_face ? -geom_n : geom_n;
-        if (rand01(rng) < diffusion) {
-            rd = cosine_dir(rand01(rng), rand01(rng), n);
-        } else {
-            rd = normalize(reflect(rd, n));
-            if (dot(rd, n) < 0.0) {
-                rd = cosine_dir(rand01(rng), rand01(rng), n);
+        float ior          = max(tri.mat_in.w, 1.0);
+        float opacity      = clamp(tri.mat_out.w, 0.0, 1.0);
+        vec3  n = interior_face ? -geom_n : geom_n;
+        float cos_i = max(0.0, dot(-rd, n));
+
+        if (opacity < 0.999) {
+            // Refractive: bend the forward ray through the medium
+            float eta      = interior_face ? ior : (1.0 / ior);
+            float cos_t_sq = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+            if (cos_t_sq <= 0.0) {
+                rd = normalize(reflect(rd, n));
+                if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+            } else {
+                float cos_t = sqrt(cos_t_sq);
+                float rs = (cos_i - ior * cos_t) / max(cos_i + ior * cos_t, 1e-6);
+                float rp = (ior * cos_i - cos_t) / max(ior * cos_i + cos_t, 1e-6);
+                float fr  = clamp(0.5 * (rs*rs + rp*rp), 0.0, 1.0);
+                float p_r = mix(fr, 1.0, opacity);
+                if (rand01(rng) < p_r) {
+                    rd = normalize(reflect(rd, n));
+                    if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+                } else {
+                    rd = normalize(refract(rd, n, eta));
+                    packet.z *= (1.0 - fr);
+                }
             }
+        } else {
+            // Opaque: diffuse or specular bounce
+            if (rand01(rng) < diffusion) {
+                rd = cosine_dir(rand01(rng), rand01(rng), n);
+            } else {
+                rd = normalize(reflect(rd, n));
+                if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+            }
+            float band_decay = exp(-absorption * best * clamp(packet.x / 440.0, 0.25, 8.0));
+            float dist_falloff = 1.0 / (1.0 + 0.08 * best);
+            packet.z *= reflectivity * band_decay * dist_falloff;
         }
         ro = hp + rd * 1e-5;
-        // Frequency-dependent absorption: wood attenuates high bands more than low.
-        // band_decay[b] = exp(-absorption * distance * freq_factor[b])
-        // freq_factors: 0.70 (sub-220 Hz) → 1.30 (880 Hz+)
-        vec4 band_decay = exp(-absorption * best * vec4(0.70, 0.85, 1.00, 1.30));
-        float dist_falloff = 1.0 / (1.0 + 0.08 * best);
-        spectrum *= reflectivity * band_decay * dist_falloff;
-        if (dot(spectrum, vec4(1.0)) < 0.002) break;
+        packet.y += best * packet.x * 0.000021;
+        if (packet.z < 0.002) break;
     }
+}
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2-D camera sensor compute shader
+# Fires one thread per pixel; each thread shoots uSamplesPerPixel primary rays
+# through the pixel (stratified AA), traces the BVH, reads the already-complete
+# forward irradiance bands via integer samplers, applies Lambert BRDF and
+# accumulates an RGBA32F pixel radiance into uSensorOut.
+# ─────────────────────────────────────────────────────────────────────────────
+_GPU_SENSOR_CS = """
+#version 430 core
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// ─── BVH geometry (identical layout to the forward pass) ────────────────────
+struct Tri  { vec4 v0; vec4 e1; vec4 e2; vec4 normal; vec4 mat_in; vec4 mat_out; vec4 albedo; };
+struct Node { vec4 lo_left; vec4 hi_right; vec4 start_count; };
+layout(std430, binding = 0) readonly buffer TriBuf   { Tri  tris[];    };
+layout(std430, binding = 1) readonly buffer NodeBuf  { Node nodes[];   };
+layout(std430, binding = 2) readonly buffer TriIdBuf { int  tri_ids[]; };
+
+// ─── Forward film-layer activation fields (uint, same storage as _MARCH_FS) ──
+layout(binding = 0) uniform usampler3D uFwdLayer0;
+layout(binding = 1) uniform usampler3D uFwdLayer1;
+layout(binding = 2) uniform usampler3D uFwdLayer2;
+layout(binding = 3) uniform usampler3D uFwdLayer3;
+layout(binding = 4) uniform usampler3D uFwdLayer4;
+layout(binding = 5) uniform usampler3D uFwdLayer5;
+layout(binding = 6) uniform usampler3D uFwdLayer6;
+layout(binding = 7) uniform usampler3D uFwdLayer7;
+
+// ─── Per-layer output textures (one per film layer, up to 8, retained in memory)
+// Image bindings are a separate namespace from the sampler bindings above.
+layout(rgba32f, binding = 0) uniform image2D uSensorOut0;
+layout(rgba32f, binding = 1) uniform image2D uSensorOut1;
+layout(rgba32f, binding = 2) uniform image2D uSensorOut2;
+layout(rgba32f, binding = 3) uniform image2D uSensorOut3;
+layout(rgba32f, binding = 4) uniform image2D uSensorOut4;
+layout(rgba32f, binding = 5) uniform image2D uSensorOut5;
+layout(rgba32f, binding = 6) uniform image2D uSensorOut6;
+layout(rgba32f, binding = 7) uniform image2D uSensorOut7;
+
+// ─── Uniforms ─────────────────────────────────────────────────────────────────
+uniform ivec2 uSensorSize;
+uniform int   uRowOffset;
+uniform int   uRandomPixels;
+uniform int   uDispatchPixelCount;
+uniform int   uSamplesPerPixel;
+uniform int   uMaxBounces;
+uniform int   uTriCount;
+uniform int   uNodeCount;
+uniform int   uSeed;
+uniform float uRayFieldScale;
+uniform float uRayFieldGamma;
+uniform float uVolAlpha;
+uniform int   uVolSteps;
+uniform int   uLayerCount;
+uniform vec3  uLayerDark0;  uniform vec3  uLayerDark1;
+uniform vec3  uLayerDark2;  uniform vec3  uLayerDark3;
+uniform vec3  uLayerDark4;  uniform vec3  uLayerDark5;
+uniform vec3  uLayerDark6;  uniform vec3  uLayerDark7;
+uniform vec3  uLayerLight0; uniform vec3  uLayerLight1;
+uniform vec3  uLayerLight2; uniform vec3  uLayerLight3;
+uniform vec3  uLayerLight4; uniform vec3  uLayerLight5;
+uniform vec3  uLayerLight6; uniform vec3  uLayerLight7;
+uniform vec3  uCamEye;
+uniform vec3  uCamRight;
+uniform vec3  uCamUp;
+uniform vec3  uCamFwd;
+uniform float uCamFovTan;
+uniform float uCamAspect;
+uniform float uApertureRadius;
+uniform float uFocusDist;
+uniform float uCAFactor;
+uniform vec2  uTiltShift;
+uniform vec3  uBoxMin;
+uniform vec3  uBoxMax;
+uniform ivec3 uDims;
+uniform float uAirDiffuseScatter;
+uniform float uAirSpecularScatter;
+uniform float uAirAnisotropy;
+uniform float uMediumExtinction;
+
+vec3 get_layer_dark(int i) {
+    if      (i == 0) return uLayerDark0;  else if (i == 1) return uLayerDark1;
+    else if (i == 2) return uLayerDark2;  else if (i == 3) return uLayerDark3;
+    else if (i == 4) return uLayerDark4;  else if (i == 5) return uLayerDark5;
+    else if (i == 6) return uLayerDark6;  else if (i == 7) return uLayerDark7;
+    return vec3(0.0);
+}
+vec3 get_layer_light(int i) {
+    if      (i == 0) return uLayerLight0; else if (i == 1) return uLayerLight1;
+    else if (i == 2) return uLayerLight2; else if (i == 3) return uLayerLight3;
+    else if (i == 4) return uLayerLight4; else if (i == 5) return uLayerLight5;
+    else if (i == 6) return uLayerLight6; else if (i == 7) return uLayerLight7;
+    return vec3(1.0);
+}
+
+const float EPS = 1e-7;
+const float PI  = 3.14159265358979323846;
+
+// ─── RNG ──────────────────────────────────────────────────────────────────────
+uint hash_u(uint x) {
+    x = x * 747796405u + 2891336453u;
+    uint word = ((x >> ((x >> 28u) + 4u)) ^ x) * 277803737u;
+    x = (word >> 22u) ^ word;
+    x ^= x * 0x9e3779b9u;
+    x ^= x >> 16;
+    return x;
+}
+float rand01(inout uint s) {
+    s = hash_u(s); return float(s & 0x00ffffffu) / 16777215.0;
+}
+float randn(inout uint s) {
+    float u0 = max(rand01(s), 1e-7);
+    float u1 = rand01(s);
+    return sqrt(-2.0 * log(u0)) * cos(2.0 * PI * u1);
+}
+
+// ─── Cosine-weighted hemisphere sample ───────────────────────────────────────
+vec3 cosine_dir(float u, float v, vec3 normal) {
+    float r = sqrt(max(u, 0.0)); float a = 2.0 * PI * v;
+    vec3 local = vec3(r * cos(a), r * sin(a), sqrt(max(0.0, 1.0 - u)));
+    vec3 w = normalize(normal);
+    vec3 wup = abs(w.z) < 0.9 ? vec3(0,0,1) : vec3(0,1,0);
+    vec3 bx = normalize(cross(wup, w)); vec3 by = cross(w, bx);
+    return normalize(bx*local.x + by*local.y + w*local.z);
+}
+
+// ─── Möller-Trumbore triangle intersection ────────────────────────────────────
+bool hit_tri(vec3 ro, vec3 rd, Tri t, out float hit_t) {
+    vec3 h = cross(rd, t.e2.xyz); float a = dot(t.e1.xyz, h);
+    if (abs(a) < 1e-8) return false;
+    float f = 1.0 / a; vec3 s = ro - t.v0.xyz;
+    float u = f * dot(s, h);
+    if (u < -1e-5 || u > 1.00001) return false;
+    vec3 q = cross(s, t.e1.xyz); float v = f * dot(rd, q);
+    if (v < -1e-5 || u + v > 1.00001) return false;
+    float tt = f * dot(t.e2.xyz, q);
+    if (tt <= 1e-6) return false;
+    hit_t = tt; return true;
+}
+
+// ─── Slab / AABB test ─────────────────────────────────────────────────────────
+bool slab_axis(float ro, float rd, float lo, float hi,
+               inout float nt, inout float ft) {
+    if (abs(rd) < 1e-9) return ro >= lo && ro <= hi;
+    float inv = 1.0/rd; float a = (lo-ro)*inv; float b = (hi-ro)*inv;
+    nt = max(nt, min(a,b)); ft = min(ft, max(a,b)); return nt <= ft;
+}
+bool hit_aabb(vec3 ro, vec3 rd, vec3 lo, vec3 hi, float best) {
+    float nt = EPS, ft = best;
+    if (!slab_axis(ro.x,rd.x,lo.x,hi.x,nt,ft)) return false;
+    if (!slab_axis(ro.y,rd.y,lo.y,hi.y,nt,ft)) return false;
+    if (!slab_axis(ro.z,rd.z,lo.z,hi.z,nt,ft)) return false;
+    return nt <= ft;
+}
+
+// ─── BVH nearest-hit traversal ───────────────────────────────────────────────
+int nearest_hit(vec3 ro, vec3 rd, out float best) {
+    best = 1e30; int best_tri = -1;
+    int stack[96]; int sp = 0; stack[sp++] = 0;
+    while (sp > 0) {
+        int ni = stack[--sp];
+        if (ni < 0 || ni >= uNodeCount) continue;
+        Node node = nodes[ni];
+        if (!hit_aabb(ro, rd, node.lo_left.xyz, node.hi_right.xyz, best)) continue;
+        int left  = int(node.lo_left.w);
+        int right = int(node.hi_right.w);
+        int start = int(node.start_count.x);
+        int count = int(node.start_count.y);
+        if (left < 0) {
+            for (int k = 0; k < count; ++k) {
+                int ti = tri_ids[start+k]; float ht;
+                if (hit_tri(ro, rd, tris[ti], ht) && ht < best) {
+                    best = ht; best_tri = ti;
+                }
+            }
+        } else {
+            if (sp < 94) { stack[sp++] = left; stack[sp++] = right; }
+        }
+    }
+    return best_tri;
+}
+
+// ─── Read one film layer's accumulated irradiance from the forward volume ──────
+float fwd_layer(int i, ivec3 q) {
+    if      (i == 0) return float(texelFetch(uFwdLayer0, q, 0).r);
+    else if (i == 1) return float(texelFetch(uFwdLayer1, q, 0).r);
+    else if (i == 2) return float(texelFetch(uFwdLayer2, q, 0).r);
+    else if (i == 3) return float(texelFetch(uFwdLayer3, q, 0).r);
+    else if (i == 4) return float(texelFetch(uFwdLayer4, q, 0).r);
+    else if (i == 5) return float(texelFetch(uFwdLayer5, q, 0).r);
+    else if (i == 6) return float(texelFetch(uFwdLayer6, q, 0).r);
+    else if (i == 7) return float(texelFetch(uFwdLayer7, q, 0).r);
+    return 0.0;
+}
+
+// ─── Scalar irradiance for one layer at world pos p ───────────────────────────
+float sample_layer_energy(vec3 p, int i) {
+    vec3  uvw = (p - uBoxMin) / max(uBoxMax - uBoxMin, vec3(1e-6));
+    ivec3 q   = ivec3(floor(uvw * vec3(uDims)));
+    if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, uDims))) return 0.0;
+    return fwd_layer(i, q) * (uRayFieldScale / 65535.0);
+}
+
+// ─── Total irradiance across all layers at p (for alpha compositing) ──────────
+float sample_total_energy(vec3 p) {
+    vec3  uvw = (p - uBoxMin) / max(uBoxMax - uBoxMin, vec3(1e-6));
+    ivec3 q   = ivec3(floor(uvw * vec3(uDims)));
+    if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, uDims))) return 0.0;
+    float sc = uRayFieldScale / 65535.0;
+    int n = clamp(uLayerCount, 1, 8);
+    float tot = 0.0;
+    for (int i = 0; i < n; i++) tot += fwd_layer(i, q) * sc;
+    return tot;
+}
+
+// ─── Volume march: one alpha pass shared across layers; per-layer scalar out ───
+void march_volume_layers(vec3 ro, vec3 rd, float t_near, float t_far,
+                         int steps, float jitter, int n,
+                         out float out_lum[8], out float out_alpha) {
+    for (int i = 0; i < 8; i++) out_lum[i] = 0.0;
+    out_alpha = 0.0;
+    if (t_near >= t_far) return;
+    float dt = (t_far - t_near) / float(steps);
+    float sc = uRayFieldScale / 65535.0;
+    // Air phase function: Henyey-Greenstein-like forward-scatter lobe blended
+    // with isotropic.  uAirAnisotropy controls forward-lobe sharpness;
+    // uAirDiffuseScatter / uAirSpecularScatter weight isotropic vs. forward.
+    // uMediumExtinction is the Beer-Lambert attenuation over distance.
+    // uVolAlpha is the master opacity dial — 0 = invisible, 1 = full density.
+    vec3 box_size = max(uBoxMax - uBoxMin, vec3(1e-6));
+    float diag = length(box_size);
+    for (int step = 0; step < steps; ++step) {
+        float t_step = t_near + (float(step) + jitter) * dt;
+        vec3  pos = ro + t_step * rd;
+        vec3  uvw = (pos - uBoxMin) / box_size;
+        ivec3 q   = ivec3(floor(uvw * vec3(uDims)));
+        if (any(lessThan(q, ivec3(0))) || any(greaterThanEqual(q, uDims))) continue;
+        float tot = 0.0;
+        float bv[8];
+        for (int i = 0; i < n; i++) { bv[i] = fwd_layer(i, q) * sc; tot += bv[i]; }
+        float mag = pow(clamp(tot, 0.0, 1.0), max(uRayFieldGamma, 0.05));
+        if (mag > 0.0001) {
+            // Beer-Lambert transmittance from ray origin to this step
+            float beer = exp(-uMediumExtinction * t_step);
+            // Phase: how much of the stored energy density is visible from
+            // this view direction.  Forward-scattered energy concentrates
+            // along the propagation axis; diffuse spreads isotropically.
+            // We have no per-voxel flow direction, so use a simplified
+            // anisotropy that weights magnitude: forward lobes get phase>1,
+            // sideways views get phase≈uAirDiffuseScatter.
+            float phase = uAirDiffuseScatter
+                        + uAirSpecularScatter
+                          * pow(mag, 1.0 / max(uAirAnisotropy, 0.5));
+            // Differential opacity: energy density × phase × master dial × dt
+            float sa = uVolAlpha * phase * dt / max(diag, 1e-4);
+            float a  = sa * smoothstep(0.0001, 0.08, mag) * beer;
+            float transmit = 1.0 - out_alpha;
+            for (int i = 0; i < n; i++) out_lum[i] += transmit * a * bv[i];
+            out_alpha += transmit * a;
+            if (out_alpha > 0.97) break;
+        }
+    }
+}
+
+// ─── Write scalar luminance into layer i's output image ───────────────────────
+void sensor_store(int i, ivec2 px, float lum, float cnt) {
+    vec4 v = vec4(lum, lum, lum, cnt);
+    if      (i==0){vec4 p=imageLoad(uSensorOut0,px); imageStore(uSensorOut0,px,p+v);}
+    else if (i==1){vec4 p=imageLoad(uSensorOut1,px); imageStore(uSensorOut1,px,p+v);}
+    else if (i==2){vec4 p=imageLoad(uSensorOut2,px); imageStore(uSensorOut2,px,p+v);}
+    else if (i==3){vec4 p=imageLoad(uSensorOut3,px); imageStore(uSensorOut3,px,p+v);}
+    else if (i==4){vec4 p=imageLoad(uSensorOut4,px); imageStore(uSensorOut4,px,p+v);}
+    else if (i==5){vec4 p=imageLoad(uSensorOut5,px); imageStore(uSensorOut5,px,p+v);}
+    else if (i==6){vec4 p=imageLoad(uSensorOut6,px); imageStore(uSensorOut6,px,p+v);}
+    else if (i==7){vec4 p=imageLoad(uSensorOut7,px); imageStore(uSensorOut7,px,p+v);}
+}
+
+// ─── AABB entry/exit along ray (returns false if no intersection) ─────────────
+bool box_intersect(vec3 ro, vec3 rd, vec3 bmin, vec3 bmax,
+                   out float t_in, out float t_out) {
+    vec3 inv = 1.0 / rd;
+    vec3 t0  = (bmin - ro) * inv;
+    vec3 t1  = (bmax - ro) * inv;
+    vec3 tmi = min(t0, t1), tma = max(t0, t1);
+    t_in  = max(max(tmi.x, tmi.y), tmi.z);
+    t_out = min(min(tma.x, tma.y), tma.z);
+    t_in  = max(t_in, 0.0);
+    return t_out > t_in;
+}
+
+void main() {
+    ivec2 tile_xy = ivec2(gl_GlobalInvocationID.xy);
+    uint dispatch_w = uint(gl_NumWorkGroups.x) * uint(gl_WorkGroupSize.x);
+    uint linear_id  = uint(gl_GlobalInvocationID.x) + uint(gl_GlobalInvocationID.y) * dispatch_w;
+    ivec2 px;
+    if (uRandomPixels != 0) {
+        if (linear_id >= uint(max(0, uDispatchPixelCount))) return;
+        uint s0 = hash_u(linear_id ^ uint(uSeed));
+        uint s1 = hash_u(s0 + 0x9e3779b9u);
+        uint s2 = hash_u(s1 + 0x85ebca6bu);
+        uint s3 = hash_u(s2 + 0xc2b2ae35u);
+        float u0 = max(float(s0 & 0x00ffffffu) / 16777215.0, 1e-6);
+        float u1 = float(s1 & 0x00ffffffu) / 16777215.0;
+        float u2 = max(float(s2 & 0x00ffffffu) / 16777215.0, 1e-6);
+        float u3 = float(s3 & 0x00ffffffu) / 16777215.0;
+        float r0 = sqrt(-2.0 * log(u0));
+        float r1 = sqrt(-2.0 * log(u2));
+        float gx = 0.5 + 0.22 * r0 * cos(2.0 * PI * u1);
+        float gy = 0.5 + 0.22 * r1 * sin(2.0 * PI * u3);
+        if (rand01(s3) < 0.18) {
+            gx = rand01(s3);
+            gy = rand01(s3);
+        }
+        px = ivec2(int(clamp(gx, 0.0, 0.999999) * float(uSensorSize.x)),
+                   int(clamp(gy, 0.0, 0.999999) * float(uSensorSize.y)));
+    } else {
+        px = ivec2(tile_xy.x, tile_xy.y + uRowOffset);
+    }
+    if (any(greaterThanEqual(px, uSensorSize))) return;
+
+    float W  = float(uSensorSize.x);
+    float H  = float(uSensorSize.y);
+    int   nl = clamp(uLayerCount, 1, 8);
+    float layer_acc[8];
+    for (int i = 0; i < 8; i++) layer_acc[i] = 0.0;
+
+    for (int s = 0; s < uSamplesPerPixel; ++s) {
+        uint rng = hash_u(
+            (uint(px.x) + uint(px.y) * uint(uSensorSize.x)) * 104729u
+            + uint(s) * 1013u + uint(uSeed) + linear_id * 9176u);
+
+        float pu  = (float(px.x) + rand01(rng)) / W;
+        float pv  = (float(px.y) + rand01(rng)) / H;
+        float fu  = ((0.5 - pu) * 2.0 + uTiltShift.x) * uCamFovTan * uCamAspect;
+        float fv  = ((0.5 - pv) * 2.0 + uTiltShift.y) * uCamFovTan;
+        vec3 ro   = uCamEye;
+        vec3 rd0  = normalize(uCamFwd + uCamRight * fu + uCamUp * fv);
+        vec3 focus_pt = ro + rd0 * max(uFocusDist, 0.01);
+        float ap = max(uApertureRadius, 0.0);
+        if (ap > 1e-7) {
+            float lr = ap * sqrt(rand01(rng));
+            float la = 2.0 * PI * rand01(rng);
+            ro += uCamRight * (lr * cos(la)) + uCamUp * (lr * sin(la));
+        }
+        vec3  rd         = normalize(focus_pt - ro);
+        float lum[8];
+        for (int i = 0; i < 8; i++) lum[i] = 0.0;
+        float throughput = 1.0;
+
+        for (int bounce = 0; bounce <= uMaxBounces; ++bounce) {
+            float surf_t;
+            int   hit_id = nearest_hit(ro, rd, surf_t);
+
+            float vol_in, vol_out;
+            bool in_box = box_intersect(ro, rd, uBoxMin, uBoxMax, vol_in, vol_out);
+            if (in_box) {
+                float march_end = (hit_id >= 0) ? min(surf_t, vol_out) : vol_out;
+                float step_jitter = fract(
+                    sin(float(px.x)*127.1 + float(px.y)*311.7 + float(s)*7.3) * 43758.5453);
+                float vol_lum[8]; float vol_alpha;
+                march_volume_layers(ro, rd, vol_in, march_end, uVolSteps,
+                                    step_jitter, nl, vol_lum, vol_alpha);
+                for (int i = 0; i < nl; i++) lum[i] += throughput * vol_lum[i];
+                throughput *= (1.0 - vol_alpha);
+            }
+
+            if (hit_id < 0 || throughput < 0.003) break;
+
+            vec3  hp       = ro + rd * surf_t;
+            Tri   tri      = tris[hit_id];
+            vec3  geom_n   = normalize(tri.normal.xyz);
+            bool  interior = dot(rd, geom_n) > 0.0;
+            vec3  n        = interior ? -geom_n : geom_n;
+            vec4  mat      = interior ? tri.mat_in : tri.mat_out;
+            float refl     = clamp(mat.x, 0.02, 0.98);
+            float diff     = clamp(mat.y, 0.0, 1.0);
+            float abso     = clamp(mat.z, 0.0, 2.0);
+            float ior      = max(tri.mat_in.w, 1.0);
+            float opacity  = clamp(tri.mat_out.w, 0.0, 1.0);
+            float cos_in   = max(0.0, dot(-rd, n));
+            vec3  surf_albedo = tri.albedo.rgb;
+
+            // Accumulate field energy at surface — only opaque/semi-opaque surfaces scatter
+            // Transparent surfaces (opacity≈0) transmit, not scatter; skip accumulation.
+            if (opacity > 0.001) {
+                for (int i = 0; i < nl; i++) {
+                    vec3  lc = get_layer_light(i);
+                    float aw = dot(surf_albedo, lc) / max(dot(lc, lc), 1e-6);
+                    lum[i] += throughput * sample_layer_energy(hp, i) * refl * cos_in
+                              * clamp(aw, 0.0, 1.0) * opacity;
+                }
+            }
+
+            if (opacity < 0.999) {
+                // ── Transparent / refractive surface ─────────────────────────
+                float eta = interior ? ior : (1.0 / ior);
+                float cos_i = cos_in;
+                float cos_t_sq = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+
+                float fresnel_r;
+                vec3  refr_dir;
+                if (cos_t_sq <= 0.0) {
+                    fresnel_r = 1.0;  // total internal reflection
+                    refr_dir  = rd;   // unused
+                } else {
+                    float cos_t = sqrt(cos_t_sq);
+                    float rs = (cos_i - ior * cos_t) / max(cos_i + ior * cos_t, 1e-6);
+                    float rp = (ior * cos_i - cos_t) / max(ior * cos_i + cos_t, 1e-6);
+                    fresnel_r = clamp(0.5 * (rs * rs + rp * rp), 0.0, 1.0);
+                    refr_dir  = normalize(refract(rd, n, eta));
+                }
+
+                float p_reflect = mix(fresnel_r, 1.0, opacity);
+                if (rand01(rng) < p_reflect) {
+                    rd = normalize(reflect(rd, n));
+                    if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+                } else {
+                    rd = refr_dir;
+                }
+                ro = hp + rd * 1e-5;
+            } else {
+                // ── Opaque surface ────────────────────────────────────────────
+                float survival = max(refl * (1.0 - abso * 0.5), 0.05);
+                if (rand01(rng) > survival) break;
+                throughput *= refl / survival;
+                if (throughput < 0.005) break;
+
+                if (rand01(rng) < diff)
+                    rd = cosine_dir(rand01(rng), rand01(rng), n);
+                else {
+                    rd = normalize(reflect(rd, n));
+                    if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+                }
+                ro = hp + rd * 1e-5;
+            }
+        }
+        for (int i = 0; i < nl; i++) layer_acc[i] += max(lum[i], 0.0);
+    }
+
+    for (int i = 0; i < nl; i++)
+        sensor_store(i, px, layer_acc[i], float(uSamplesPerPixel));
+}
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sensor image fullscreen blit shaders
+# Reads the RGBA32F sensor texture, divides by sample count (.a), tonemaps.
+# ─────────────────────────────────────────────────────────────────────────────
+_SENSOR_BLIT_VS = """
+#version 330 core
+out vec2 vUV;
+void main() {
+    // Full-screen triangle trick: gl_VertexID 0,1,2 covers [-1,3] x [-1,3]
+    vUV         = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+    gl_Position = vec4(vUV * 2.0 - 1.0, 0.0, 1.0);
+}
+"""
+# ─────────────────────────────────────────────────────────────────────────────
+# Sensor accumulator decay compute shader
+# Multiplies every texel (rgb AND alpha) by uDecayFactor each frame.
+# Dispatched once per display frame when half-life decay is enabled.
+# Running both channels through the same factor keeps the stored mean
+# (rgb/alpha) valid while shrinking total accumulated weight — when
+# combined with the _decay_total multiplier in the blit shader, the
+# display fades at the user-specified half-life rate during silence,
+# and new source samples quickly displace the decayed state on restart.
+# ─────────────────────────────────────────────────────────────────────────────
+_GPU_DECAY_CS = """
+#version 430 core
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(rgba32f, binding = 0) uniform image2D uAccum;
+uniform float uDecayFactor;   // per-frame multiplier: exp(-ln2 * dt / half_life)
+
+void main() {
+    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 sz    = imageSize(uAccum);
+    if (coord.x >= sz.x || coord.y >= sz.y) return;
+    vec4 v = imageLoad(uAccum, coord);
+    v     *= uDecayFactor;
+    imageStore(uAccum, coord, v);
+}
+"""
+
+
+_SENSOR_BLIT_FS = """
+#version 330 core
+in  vec2 vUV;
+out vec4 FragColor;
+
+uniform sampler2D uSensorLayer0;
+uniform sampler2D uSensorLayer1;
+uniform sampler2D uSensorLayer2;
+uniform sampler2D uSensorLayer3;
+uniform sampler2D uSensorLayer4;
+uniform sampler2D uSensorLayer5;
+uniform sampler2D uSensorLayer6;
+uniform sampler2D uSensorLayer7;
+
+uniform int   uLayerCount;
+uniform vec3  uLayerDark0;  uniform vec3  uLayerDark1;
+uniform vec3  uLayerDark2;  uniform vec3  uLayerDark3;
+uniform vec3  uLayerDark4;  uniform vec3  uLayerDark5;
+uniform vec3  uLayerDark6;  uniform vec3  uLayerDark7;
+uniform vec3  uLayerLight0; uniform vec3  uLayerLight1;
+uniform vec3  uLayerLight2; uniform vec3  uLayerLight3;
+uniform vec3  uLayerLight4; uniform vec3  uLayerLight5;
+uniform vec3  uLayerLight6; uniform vec3  uLayerLight7;
+uniform vec2  uLayerTone0;  uniform vec2  uLayerTone1;
+uniform vec2  uLayerTone2;  uniform vec2  uLayerTone3;
+uniform vec2  uLayerTone4;  uniform vec2  uLayerTone5;
+uniform vec2  uLayerTone6;  uniform vec2  uLayerTone7;
+
+uniform float uExposure;
+uniform float uGamma;
+uniform float uAlpha;
+uniform float uDecayTotal;
+uniform int   uRotate180;
+uniform int   uNegative;
+
+vec4 sample_layer(int i, vec2 uv) {
+    if (i == 0) return texture(uSensorLayer0, uv);
+    if (i == 1) return texture(uSensorLayer1, uv);
+    if (i == 2) return texture(uSensorLayer2, uv);
+    if (i == 3) return texture(uSensorLayer3, uv);
+    if (i == 4) return texture(uSensorLayer4, uv);
+    if (i == 5) return texture(uSensorLayer5, uv);
+    if (i == 6) return texture(uSensorLayer6, uv);
+    return texture(uSensorLayer7, uv);
+}
+vec3 layer_dark(int i) {
+    if (i == 0) return uLayerDark0;
+    if (i == 1) return uLayerDark1;
+    if (i == 2) return uLayerDark2;
+    if (i == 3) return uLayerDark3;
+    if (i == 4) return uLayerDark4;
+    if (i == 5) return uLayerDark5;
+    if (i == 6) return uLayerDark6;
+    return uLayerDark7;
+}
+vec3 layer_light(int i) {
+    if (i == 0) return uLayerLight0;
+    if (i == 1) return uLayerLight1;
+    if (i == 2) return uLayerLight2;
+    if (i == 3) return uLayerLight3;
+    if (i == 4) return uLayerLight4;
+    if (i == 5) return uLayerLight5;
+    if (i == 6) return uLayerLight6;
+    return uLayerLight7;
+}
+vec2 layer_tone(int i) {
+    if (i == 0) return uLayerTone0;
+    if (i == 1) return uLayerTone1;
+    if (i == 2) return uLayerTone2;
+    if (i == 3) return uLayerTone3;
+    if (i == 4) return uLayerTone4;
+    if (i == 5) return uLayerTone5;
+    if (i == 6) return uLayerTone6;
+    return uLayerTone7;
+}
+
+void main() {
+    vec2 uv = (uRotate180 != 0) ? vec2(1.0 - vUV.x, 1.0 - vUV.y) : vUV;
+    int  nl = clamp(uLayerCount, 1, 8);
+
+    vec3 col = vec3(0.0);
+    for (int i = 0; i < nl; i++) {
+        vec4  raw    = sample_layer(i, uv);
+        float n_samp = max(1.0, raw.a);
+        float lum    = raw.r / n_samp * uExposure * uDecayTotal;
+        float mapped = lum / (1.0 + lum);
+        float gc     = pow(max(mapped, 0.0), 1.0 / uGamma);
+        if (gc < 0.001) continue;
+        vec2  tone = layer_tone(i);
+        float sp   = tone.x;
+        float hp   = tone.y;
+        vec3  dark = layer_dark(i);
+        vec3  lit  = layer_light(i);
+        vec3  duotone;
+        if (gc < sp) {
+            // Ramp from true black up to shadow colour
+            duotone = dark * (gc / max(sp, 0.001));
+        } else if (gc < hp) {
+            // Core duotone range — shadow colour to highlight colour
+            duotone = mix(dark, lit, (gc - sp) / max(hp - sp, 0.001));
+        } else {
+            // Wash highlight colour out to true white
+            duotone = mix(lit, vec3(1.0), (gc - hp) / max(1.0 - hp, 0.001));
+        }
+        col += duotone;
+    }
+
+    col = clamp(col, 0.0, 1.0);
+    if (uNegative != 0) col = vec3(1.0) - col;
+    FragColor = vec4(col, uAlpha);
 }
 """
 
@@ -2046,12 +4105,9 @@ _HUD2D_TEX_FS = """
 #version 330 core
 in vec2 vUV;
 uniform sampler2D uTex;
-uniform vec4 uColor;
 out vec4 FragColor;
 void main() {
-    vec4 t = texture(uTex, vUV);
-    float bright = (t.r + t.g + t.b) * 0.333;
-    FragColor = vec4(uColor.rgb, bright * uColor.a);
+    FragColor = vec4(texture(uTex, vUV).rgb, 1.0);
 }
 """
 
@@ -2169,25 +4225,85 @@ def _compute_spectral_emission_map(
     return band_maps
 
 
-def _string_spectral_weights(
-    fundamental_hz: float,
-    band_edges=SPEC_BAND_EDGES,
-    n_harmonics: int = 12,
-) -> np.ndarray:
+def _geometry_soundboard_sources(
+    outline: np.ndarray,
+    body_h: float,
+    total_rays: int,
+    stride: int = 6,
+) -> list:
     """
-    Compute normalised per-band energy fractions for a string with the given
-    fundamental, assuming 1/h amplitude decay for harmonic h.
+    Soundboard emission sources derived purely from body geometry — no physics
+    frame required.  Samples the interior of the guitar outline on a uniform
+    grid and emits downward with source spectra weighted by the BRDF emission
+    characteristic of a Sitka spruce top.
+
+    BRDF emission spectrum per band (4 spectral bands):
+      The soundboard is modelled as a diffuse emitter whose output is the
+      product of assumed internal energy distribution and band-dependent
+      transmission through the wood.  Spruce has ~20-30% higher stiffness
+      along the grain than across it, giving stronger radiation in the low
+      and lower-mid bands.  The per-band emission weights here encode that
+      directional acoustic transmission:
+        Band 0 (<220 Hz):   0.44  — strong fundamental, low absorption
+        Band 1 (220-880):   0.32  — mid-range, moderate absorption
+        Band 2 (880-3500):  0.17  — upper-mid, noticeable wood absorption
+        Band 3 (>3500 Hz):  0.07  — high freq, heavily absorbed by wood grain
     """
-    N_BANDS = len(band_edges) - 1
-    w = np.zeros(N_BANDS, np.float32)
-    for h in range(1, n_harmonics + 1):
-        f = fundamental_hz * h
-        for b in range(N_BANDS):
-            if band_edges[b] <= f < band_edges[b + 1]:
-                w[b] += 1.0 / h
-                break
-    total = w.sum()
-    return (w / total).astype(np.float32) if total > 0 else w
+    try:
+        from matplotlib.path import Path as _MplPath  # type: ignore
+        _have_mpl = True
+    except ImportError:
+        _have_mpl = False
+
+    # Spruce top T1 resonance ~220 Hz, broad 2.5-oct spread covers 28–1700 Hz.
+    # Packet layout: (freq_hz, phase, energy, coherence_oct)
+    _spruce_packet = np.array([220.0, 0.0, 1.0, 2.5], np.float32)
+
+    min_xy = outline.min(axis=0).astype(np.float32)
+    max_xy = outline.max(axis=0).astype(np.float32)
+    span_x = float(max_xy[0] - min_xy[0])
+    span_y = float(max_xy[1] - min_xy[1])
+    _z  = float(body_h) - 0.001
+    _dn = np.array([0.0, 0.0, -1.0], np.float32)
+
+    # Random (non-grid) sampling inside the outline so emission centres are
+    # spatially fluid rather than a visible rectangular lattice.
+    rng = np.random.default_rng(42)
+    n_target  = max(32, int(span_x * span_y * 10000.0 / max(stride, 1) ** 2))
+    n_attempt = n_target * 6
+    candidates = rng.uniform(
+        [float(min_xy[0]), float(min_xy[1])],
+        [float(max_xy[0]), float(max_xy[1])],
+        size=(n_attempt, 2),
+    ).astype(np.float64)
+
+    if _have_mpl:
+        try:
+            poly = _MplPath(outline.astype(np.float64))
+            inside_mask = poly.contains_points(candidates)
+            pts_inside  = candidates[inside_mask]
+        except Exception:
+            pts_inside = candidates
+    else:
+        pts_inside = candidates
+
+    if len(pts_inside) == 0:
+        return []
+    if len(pts_inside) > n_target:
+        idx = rng.choice(len(pts_inside), n_target, replace=False)
+        pts_inside = pts_inside[idx]
+
+    pts = [np.array([float(p[0]), float(p[1]), _z], np.float32) for p in pts_inside]
+    if not pts:
+        return []
+
+    rays_each = max(1, total_rays // len(pts))
+    remainder = total_rays - rays_each * len(pts)
+    sources = [(p, _dn.copy(), rays_each, _spruce_packet.copy()) for p in pts]
+    if remainder > 0:
+        p, d, n, s = sources[0]
+        sources[0] = (p, d, n + remainder, s)
+    return sources
 
 
 def _sample_soundboard_sources(
@@ -2242,14 +4358,13 @@ def _string_emission_sources(
     str_paths: list,
     body_h: float,
     total_rays_per_string: int = 4096,
-    band_edges=SPEC_BAND_EDGES,
     fundamentals=STRING_FUNDAMENTALS_HZ,
     active_strings: Optional[set[int]] = None,
 ) -> list:
     """
-    Emit from each string's physical 3-D positions with a spectrum derived from
-    the string's harmonic series.  Direction: straight down into the cavity.
-    Returns list of (pos_f32, dir_f32, n_rays, spec_f32).
+    Emit from each string's physical 3-D positions at the string's own
+    fundamental frequency.  Packet: (freq_hz, phase=0, energy=1, coherence=2.0 oct).
+    Direction: straight down into the cavity.
     """
     sources = []
     _dn = np.array([0.0, 0.0, -1.0], np.float32)
@@ -2258,7 +4373,7 @@ def _string_emission_sources(
             continue
         if si >= len(fundamentals):
             break
-        spec = _string_spectral_weights(fundamentals[si], band_edges)
+        spec = np.array([float(fundamentals[si]), 0.0, 1.0, 2.0], np.float32)
         path_arr = np.asarray(path, np.float32)
         n_pts = max(1, len(path_arr))
         rays_per_pt = max(1, total_rays_per_string // n_pts)
@@ -2266,6 +4381,120 @@ def _string_emission_sources(
             # Emit from the string's world position downward into the cavity
             pos = pt.copy()
             sources.append((pos, _dn.copy(), rays_per_pt, spec.copy()))
+    return sources
+
+
+def _instant_string_sources(
+    str_paths_current: list,
+    str_paths_equilibrium: list,
+    total_rays_per_string: int = 4096,
+    fundamentals=STRING_FUNDAMENTALS_HZ,
+    active_strings=None,
+    tube_radius: float = 0.003,
+) -> list:
+    """Emit from each string's *actual displaced* positions this frame.
+
+    Unlike the static ``_string_emission_sources`` (which emits from every path
+    point equally), this function:
+
+    1. Computes per-point transverse displacement (deviation from the straight
+       chord connecting the string endpoints).
+    2. Importance-samples emission positions proportional to |displacement|, so
+       emission concentrates at vibration anti-nodes and is absent at nodes.
+    3. Derives per-source spectral content from the spatial mode decomposition
+       (spatial FFT of the displacement profile), mapping each mode number to
+       its harmonic frequency to assign the correct frequency band.
+    4. Offsets each emitter a small random distance perpendicular to the string
+       axis so emission is distributed across the string tube, not on the
+       geometric centreline.
+
+    Strings with sub-threshold peak displacement (|disp| < 1e-12 m) are
+    silently skipped — they are not vibrating and should not emit.
+    """
+    sources = []
+    seed = int(abs(time.monotonic_ns()) & 0xFFFF_FFFF)
+    rng = np.random.default_rng(seed)
+
+    for si, (path_now, path_eq) in enumerate(
+            zip(str_paths_current, str_paths_equilibrium)):
+        if active_strings is not None and si not in active_strings:
+            continue
+        if si >= len(fundamentals):
+            break
+
+        path_now = np.asarray(path_now, np.float32)
+        path_eq  = np.asarray(path_eq,  np.float32)
+        N = min(len(path_now), len(path_eq))
+        if N < 4:
+            continue
+        path_now = path_now[:N]
+        path_eq  = path_eq[:N]
+
+        # Transverse displacement = deviation from chord (endpoint–endpoint line)
+        t    = np.linspace(0.0, 1.0, N, dtype=np.float32)[:, None]
+        chord = path_now[0:1] * (1.0 - t) + path_now[-1:] * t
+        delta    = path_now - chord          # (N, 3) — purely transverse
+        disp_mag = np.linalg.norm(delta, axis=1).astype(np.float64)  # (N,)
+
+        peak = float(disp_mag.max())
+        if peak < 1e-12:
+            continue   # string is silent — no emission this frame
+
+        disp_mag[disp_mag < peak * 0.01] = 0.0  # threshold at 1% of peak
+        total_disp = float(disp_mag.sum())
+        if total_disp < 1e-15:
+            continue
+
+        # ── Spectral content via spatial mode decomposition ───────────────────
+        # The spatial FFT of the displacement profile gives modal power.
+        # Mode k has spatial frequency k/(2*L) → acoustic frequency = k * f0.
+        # Compute energy-weighted mean frequency and octave spread directly.
+        fft_amp    = np.fft.rfft(disp_mag)
+        mode_power = (np.abs(fft_amp) ** 2).astype(np.float64)
+        f0         = float(fundamentals[si]) if si < len(fundamentals) else 110.0
+        mode_freqs = np.array([(k + 1) * f0 for k in range(len(mode_power))], np.float64)
+        total_mp   = float(mode_power.sum())
+        if total_mp > 1e-12:
+            mean_freq  = float(np.sum(mode_freqs * mode_power) / total_mp)
+            log_modes  = np.log2(np.maximum(mode_freqs / max(f0, 1.0), 1.001))
+            mean_log   = float(np.sum(log_modes * mode_power) / total_mp)
+            var_log    = float(np.sum((log_modes - mean_log) ** 2 * mode_power) / total_mp)
+            spread_oct = float(np.sqrt(max(var_log, 0.04)))
+        else:
+            mean_freq  = f0
+            spread_oct = 2.0
+
+        # ── Importance sampling: positions proportional to |displacement| ─────
+        probs    = disp_mag / total_disp
+        n_pts    = min(max(8, total_rays_per_string // 64), N)
+        flat_idx = rng.choice(N, size=n_pts, p=probs)
+        w_arr    = probs[flat_idx].astype(np.float32)
+        w_sum    = float(w_arr.sum())
+        if w_sum < 1e-12:
+            continue
+        w_arr  /= w_sum
+        n_each  = np.maximum(1, (w_arr * total_rays_per_string).astype(np.int32))
+
+        # String local tangent for cross-section spread
+        tangent  = np.gradient(path_eq, axis=0).astype(np.float32)
+        t_norms  = np.linalg.norm(tangent, axis=1, keepdims=True)
+        tangent /= np.maximum(t_norms, 1e-9)
+
+        spec_f32 = np.array([mean_freq, 0.0, 1.0, spread_oct], np.float32)
+        dn       = np.array([0.0, 0.0, -1.0], np.float32)
+
+        for k, i in enumerate(flat_idx):
+            pos  = path_now[i].copy()
+            tang = tangent[min(i, len(tangent) - 1)]
+            # Perpendicular offset within tube cross-section
+            perp = rng.standard_normal(3).astype(np.float32)
+            perp -= np.dot(perp, tang) * tang
+            pn = float(np.linalg.norm(perp))
+            if pn > 1e-9:
+                r   = float(rng.uniform(0.0, tube_radius))
+                pos = pos + (perp / pn) * r
+            sources.append((pos, dn.copy(), int(n_each[k]), spec_f32.copy()))
+
     return sources
 
 
@@ -2277,41 +4506,98 @@ def _instant_soundboard_sources(
     total_rays: int,
     stride: int = 4,
 ) -> list:
-    """Current-frame plate sources for dynamic ray-field refresh."""
+    """Current-frame plate sources — importance-sampled by displacement magnitude.
+
+    Positions are drawn proportional to |displacement| so emission naturally
+    clusters at vibration antinodes and is sparse at nodes.  Per-sample jitter
+    within each grid cell gives a fluid, continuous spatial distribution instead
+    of a regular rectangular grid of emission centres.
+    """
     Nx, Ny = disp.shape
     min_xy = outline.min(axis=0).astype(np.float32)
     max_xy = outline.max(axis=0).astype(np.float32)
-    xs = np.linspace(float(min_xy[0]), float(max_xy[0]), Nx)
-    ys = np.linspace(float(min_xy[1]), float(max_xy[1]), Ny)
-    energy = np.abs(disp).astype(np.float32)
+    xs = np.linspace(float(min_xy[0]), float(max_xy[0]), Nx, dtype=np.float32)
+    ys = np.linspace(float(min_xy[1]), float(max_xy[1]), Ny, dtype=np.float32)
+    dx_step = (float(max_xy[0]) - float(min_xy[0])) / max(Nx - 1, 1)
+    dy_step = (float(max_xy[1]) - float(min_xy[1])) / max(Ny - 1, 1)
+
+    energy = np.abs(disp).astype(np.float64)
+    energy[~plate_active] = 0.0
     peak = float(energy.max())
     if peak <= 1e-12:
         return []
-    spec = np.array([0.22, 0.34, 0.30, 0.14], np.float32)
-    pts, weights = [], []
-    for ix in range(0, Nx, stride):
-        for iy in range(0, Ny, stride):
-            if not plate_active[ix, iy]:
-                continue
-            w = float(energy[ix, iy])
-            if w <= peak * 0.01:
-                continue
-            pts.append(np.array([xs[ix], ys[iy], float(body_h) - 0.001], np.float32))
-            weights.append(w)
-    if not pts:
+    energy[energy < peak * 0.01] = 0.0
+    total_e = float(energy.sum())
+    if total_e <= 0.0:
         return []
-    w_arr = np.asarray(weights, np.float32)
+
+    # Spruce top T1 resonance ~220 Hz, 2.5-oct spread: (freq_hz, phase, energy, coherence_oct)
+    spec = np.array([220.0, 0.0, 1.0, 2.5], np.float32)
+    dn   = np.array([0.0, 0.0, -1.0], np.float32)
+    _z   = float(body_h) - 0.001
+
+    # Importance-sample positions proportional to |displacement| so the
+    # emission density tracks the actual vibration mode shape.
+    probs    = energy.ravel() / total_e
+    n_sources = min(max(16, total_rays // 128), 8192)
+    seed = int(peak * 1e9) & 0xFFFF_FFFF
+    rng  = np.random.default_rng(seed)
+    flat_idx = rng.choice(len(probs), size=n_sources, p=probs)
+    ix_s = (flat_idx // Ny).astype(np.intp)
+    iy_s = (flat_idx %  Ny).astype(np.intp)
+
+    # Jitter each sample within its grid cell for a smooth, fluid appearance.
+    jx = rng.uniform(-dx_step * 0.5, dx_step * 0.5, size=n_sources).astype(np.float32)
+    jy = rng.uniform(-dy_step * 0.5, dy_step * 0.5, size=n_sources).astype(np.float32)
+    pos_x = np.clip(xs[ix_s] + jx, float(min_xy[0]), float(max_xy[0]))
+    pos_y = np.clip(ys[iy_s] + jy, float(min_xy[1]), float(max_xy[1]))
+
+    # Rays proportional to sampled displacement weight.
+    w_arr = probs[flat_idx].astype(np.float32)
     w_arr /= max(float(w_arr.sum()), 1e-12)
     n_each = np.maximum(1, (w_arr * int(total_rays)).astype(np.int32))
-    dn = np.array([0.0, 0.0, -1.0], np.float32)
-    order = np.argsort(n_each)[::-1]
-    return [(pts[k], dn.copy(), int(n_each[k]), spec.copy()) for k in order]
+    order  = np.argsort(n_each)[::-1]
+    return [
+        (np.array([float(pos_x[k]), float(pos_y[k]), _z], np.float32),
+         dn.copy(), int(n_each[k]), spec.copy())
+        for k in order
+    ]
 
 
-def _stage_light_sources(total_rays: int, n_emitters: int = 9) -> list:
-    """Diffuse area source above/front of the stage in world coordinates."""
+def _stage_light_sources(total_rays: int, n_emitters: int = 9,
+                         light_spec: "LightSpec | None" = None) -> list:
+    """Diffuse area source above/front of the stage in world coordinates.
+
+    Each emitter fires rays whose frequency is selected independently per ray
+    by the forward CS: `freq = packet.x * exp2(randn() * packet.w)`.
+    For white light set packet.x to the geometric mean of the visible spectrum
+    (~548 nm → 5.48e14 Hz) and packet.w to 1.0 oct, which gives a log-uniform
+    distribution spanning ~380–760 nm.  Integrated over many rays this is
+    flat across the visible spectrum → white illumination.
+    The R/G/B EM film layers then filter that distribution via their gaussian
+    `film_activation()` response centred at optical band frequencies.
+
+    If *light_spec* is supplied its spectral_array is used directly as the
+    packet (freq_hz, phase, energy, coherence_oct) and n_emitters overrides.
+    """
+    # Geometric mean of visible range as placeholder center — actual per-ray
+    # frequencies are drawn by _stochastic_spectral_packets via LightSpec.sample_freq_hz.
+    _C_LIGHT = 2.998e8
+    _WHITE_CENTER_HZ = float((_C_LIGHT / 380e-9 * _C_LIGHT / 750e-9) ** 0.5)  # ~5.48e14
+
     total_rays = max(1, int(total_rays))
     n_emitters = max(1, int(n_emitters))
+
+    if light_spec is not None:
+        n_emitters = max(1, light_spec.n_emitters)
+        # Placeholder packet; actual freq drawn per-ray from light_spec.sample_freq_hz.
+        packet = np.array([_WHITE_CENTER_HZ, 0.0, 1.0, 0.02], np.float32)
+        lspec  = light_spec
+    else:
+        # Default: uniform white — sample_freq_hz will draw from log-uniform visible.
+        packet = np.array([_WHITE_CENTER_HZ, 0.0, 1.0, 0.02], np.float32)
+        lspec  = LightSpec()  # planck 3200 K by default
+
     cols = int(math.ceil(math.sqrt(n_emitters)))
     rows = int(math.ceil(n_emitters / cols))
     lx0, lx1 = -0.65, 0.65
@@ -2320,9 +4606,10 @@ def _stage_light_sources(total_rays: int, n_emitters: int = 9) -> list:
     xs = np.linspace(lx0, lx1, cols, dtype=np.float32)
     zs = np.linspace(lz - 0.10, lz + 0.10, rows, dtype=np.float32)
     src = []
-    warm_white = np.array([0.30, 0.32, 0.23, 0.15], np.float32)
     axis = np.array([0.0, -0.42, -0.91], np.float32)
     axis /= max(float(np.linalg.norm(axis)), 1e-9)
+    _EMITTER_RADIUS   = np.float32(0.12)
+    _EMITTER_CONE_COS = np.float32(0.766)
     rays_each = max(1, total_rays // n_emitters)
     count = 0
     for z in zs:
@@ -2330,13 +4617,101 @@ def _stage_light_sources(total_rays: int, n_emitters: int = 9) -> list:
             if count >= n_emitters:
                 break
             src.append((np.array([float(x), float(ly), float(z)], np.float32),
-                        axis.copy(), rays_each, warm_white.copy()))
+                        axis.copy(), rays_each, packet.copy(),
+                        _EMITTER_RADIUS, _EMITTER_CONE_COS, lspec))
             count += 1
     remainder = total_rays - rays_each * len(src)
     if remainder > 0 and src:
-        p, d, n, s = src[0]
-        src[0] = (p, d, n + remainder, s)
+        p, d, n, s = src[0][0], src[0][1], src[0][2], src[0][3]
+        src[0] = (p, d, n + remainder, s) + src[0][4:]
     return src
+
+def _transform_sources(sources: list, matrix: np.ndarray) -> list:
+    if not sources:
+        return []
+    M = np.asarray(matrix, np.float32)
+    out = []
+    for entry in sources:
+        pos, direction, n_rays, spectrum = entry[0], entry[1], entry[2], entry[3]
+        radius    = float(entry[4]) if len(entry) > 4 else 0.0
+        cone_cos  = float(entry[5]) if len(entry) > 5 else -1.0
+        light_spec = entry[6] if len(entry) > 6 else None
+        p = _transform_points(np.asarray(pos, np.float32).reshape(1, 3), M)[0]
+        d = _transform_normals(np.asarray(direction, np.float32).reshape(1, 3), M)[0]
+        scale = float(np.linalg.norm(M[:3, :3], ord='fro') / np.sqrt(3.0))
+        out.append((p, d, int(n_rays), np.asarray(spectrum, np.float32).copy(),
+                    radius * scale, cone_cos, light_spec))
+    return out
+
+
+def _stage_light_sources_guitar_frame(outline: np.ndarray,
+                                      total_rays: int,
+                                      n_emitters: int = 9) -> list:
+    _, Minv = _guitar_model_matrix(outline)
+    return _transform_sources(_stage_light_sources(total_rays, n_emitters), Minv)
+
+
+def _sensor_scene_sources(outline: np.ndarray,
+                          acoustic_sources: list,
+                          *,
+                          light_rays: int,
+                          light_emitters: int) -> list:
+    """One source list for the sensor scene: acoustic + EM/stage light."""
+    sources = list(acoustic_sources or [])
+    if int(light_rays) > 0:
+        sources.extend(_stage_light_sources_guitar_frame(
+            outline, int(light_rays), int(light_emitters)))
+    return sources
+
+
+def _stochastic_spectral_packets(sources: list,
+                                 *,
+                                 packets_per_source: int = 32,
+                                 seed: int = 1337) -> list:
+    """Expand sources into individually mono-spectral ray packets.
+
+    Each source tuple may carry a ``LightSpec`` at index [6].  When present,
+    every sub-ray calls ``light_spec.sample_freq_hz(rng)`` to draw its own
+    independent frequency from the source's continuous spectrum — Planckian,
+    emission lines, gaussian peaks, or log-uniform white, as defined in the
+    YAML.  This is the only correct way to represent broadband light: every
+    single ray is monochromatic at its own wavelength, and the ensemble
+    integrates to the source spectrum.
+
+    Sources without a LightSpec (acoustic strings, soundboard) use log-normal
+    jitter around their physical freq_hz centre with sigma = coherence_oct.
+    """
+    if not sources:
+        return []
+    rng = np.random.default_rng(int(seed))
+    out = []
+    for _src in sources:
+        pos, direction, n_rays, spectrum = _src[0], _src[1], _src[2], _src[3]
+        n_rays     = max(1, int(n_rays))
+        light_spec = _src[6] if len(_src) > 6 else None
+
+        spec_arr    = np.asarray(spectrum, np.float64).ravel()
+        energy      = float(spec_arr[2]) if spec_arr.size > 2 else 1.0
+        coherence   = max(float(spec_arr[3]) if spec_arr.size > 3 else 0.5, 1e-3)
+
+        n_packets = max(1, min(int(packets_per_source), n_rays))
+        counts = rng.multinomial(n_rays, np.full(n_packets, 1.0 / n_packets))
+        for count in counts:
+            if count <= 0:
+                continue
+            if light_spec is not None:
+                # Each ray independently samples the source's continuous spectrum.
+                freq          = light_spec.sample_freq_hz(rng)
+                pkt_coherence = 0.02   # monochromatic ray — narrow
+            else:
+                freq_center   = float(spec_arr[0]) if spec_arr.size > 0 else 440.0
+                freq          = freq_center * (2.0 ** float(rng.normal(0.0, coherence)))
+                pkt_coherence = coherence
+            phase  = float(rng.uniform(-math.pi, math.pi))
+            packet = np.array([freq, phase, energy, pkt_coherence], np.float32)
+            out.append((np.asarray(pos, np.float32), np.asarray(direction, np.float32),
+                        int(count), packet) + tuple(_src[4:6]))
+    return out
 
 
 def _stage_light_bounds() -> tuple[np.ndarray, np.ndarray]:
@@ -2346,7 +4721,205 @@ def _stage_light_bounds() -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _transform_points(points: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    pts = np.asarray(points, np.float32).reshape(-1, 3)
+    M = np.asarray(matrix, np.float32)
+    pts_h = np.column_stack([pts, np.ones(len(pts), dtype=np.float32)])
+    return (pts_h @ M.T)[:, :3].astype(np.float32)
+
+
+def _transform_normals(normals: np.ndarray, matrix: np.ndarray) -> np.ndarray:
+    nrm = np.asarray(normals, np.float32).reshape(-1, 3)
+    Rm = np.asarray(matrix, np.float32)[:3, :3]
+    out = (nrm @ Rm.T).astype(np.float32)
+    nl = np.linalg.norm(out, axis=1, keepdims=True)
+    return (out / np.maximum(nl, 1e-9)).astype(np.float32)
+
+
+def _transform_bounds(bounds: tuple[np.ndarray, np.ndarray],
+                      matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    b0, b1 = (np.asarray(bounds[0], np.float32), np.asarray(bounds[1], np.float32))
+    corners = np.array([
+        [b0[0], b0[1], b0[2]], [b1[0], b0[1], b0[2]],
+        [b0[0], b1[1], b0[2]], [b1[0], b1[1], b0[2]],
+        [b0[0], b0[1], b1[2]], [b1[0], b0[1], b1[2]],
+        [b0[0], b1[1], b1[2]], [b1[0], b1[1], b1[2]],
+    ], np.float32)
+    tc = _transform_points(corners, matrix)
+    return tc.min(axis=0).astype(np.float32), tc.max(axis=0).astype(np.float32)
+
+
+def _stage_bounds_guitar_frame(outline: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    _, Minv = _guitar_model_matrix(outline)
+    return _transform_bounds(_stage_light_bounds(), Minv)
+
+
+def _gpu_sensor_render(ssbo_tris, ssbo_nodes, ssbo_ids,
+                       n_tris, n_bvh_nodes,
+                       tex_bands, bmin, bmax, dims,
+                       camera_eye, camera_target,
+                       sensor_w, sensor_h,
+                       spp, max_bounces,
+                       total_fwd_rays, dispatch_batch,
+                       fov_deg=52.0,
+                       ray_field_scale=6.0, ray_field_gamma=0.55,
+                       vol_alpha=1.0, vol_steps=128,
+                       air_diffuse_scatter=0.35,
+                       air_specular_scatter=0.65,
+                       air_anisotropy=12.0,
+                       medium_extinction=0.5):
+    """Render a 2-D sensor image from camera_eye toward camera_target.
+
+    Each pixel integrates BOTH:
+      - Volumetric emission: march through the forward irradiance 3D band
+        textures (same spectral colormap as _MARCH_FS) from the ray entry to
+        the nearest surface hit.
+      - Surface radiance: BVH-hit surface shaded from the forward irradiance
+        sampled at the hit point, BRDF-weighted, composited behind the volume
+        with the remaining transmittance.
+
+    Returns a GL_RGBA32F texture handle (sensor_w × sensor_h).
+    .a accumulates the sample count for running-average normalisation.
+    """
+    from OpenGL.GL import (
+        GL_COMPUTE_SHADER, GL_TEXTURE_2D, GL_RGBA32F,
+        GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_NEAREST,
+        GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE,
+        GL_READ_WRITE, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+        GL_TEXTURE_FETCH_BARRIER_BIT,
+    )
+    from OpenGL.GL import glFinish
+
+    eye    = np.asarray(camera_eye,    np.float32).ravel()[:3]
+    target = np.asarray(camera_target, np.float32).ravel()[:3]
+    fwd    = target - eye;  fwd_l = float(np.linalg.norm(fwd))
+    if fwd_l < 1e-6:
+        fwd = np.array([0.0, 0.0, 1.0], np.float32)
+    else:
+        fwd = (fwd / fwd_l).astype(np.float32)
+    # Guitar-frame Y (neck direction) is the natural "up" for sensor views.
+    # Fallback to Z if fwd is nearly parallel to Y (camera looking along the neck).
+    world_up = np.array([0.0, 1.0, 0.0], np.float32)
+    if abs(float(np.dot(fwd, world_up))) > 0.97:
+        world_up = np.array([0.0, 0.0, 1.0], np.float32)
+    right = np.cross(fwd, world_up); right /= max(np.linalg.norm(right), 1e-9)
+    up    = np.cross(right, fwd);    up    /= max(np.linalg.norm(up),    1e-9)
+    right = right.astype(np.float32)
+    up    = up.astype(np.float32)
+    fov_tan = float(math.tan(math.radians(fov_deg) * 0.5))
+    aspect  = float(sensor_w) / float(max(1, sensor_h))
+
+    # One RGBA32F output texture per film layer
+    from OpenGL.GL import glClearTexImage
+    _n_layers = max(1, len(tex_bands))
+    sensor_textures: list[int] = [int(t) for t in glGenTextures(_n_layers)]
+    for _st in sensor_textures:
+        glBindTexture(GL_TEXTURE_2D, _st)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, sensor_w, sensor_h, 0,
+                     GL_RGBA, GL_FLOAT, None)
+        for param, val in [(GL_TEXTURE_MIN_FILTER, GL_NEAREST),
+                           (GL_TEXTURE_MAG_FILTER, GL_NEAREST),
+                           (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE),
+                           (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)]:
+            glTexParameteri(GL_TEXTURE_2D, param, val)
+        glClearTexImage(_st, 0, GL_RGBA, GL_FLOAT, np.zeros(4, np.float32))
+    glBindTexture(GL_TEXTURE_2D, 0)
+    sensor_tex = sensor_textures[0]
+
+    prog = _prog((_GPU_SENSOR_CS, GL_COMPUTE_SHADER))
+    if not glGetProgramiv(prog, GL_LINK_STATUS):
+        print("  [sensor] compute shader failed to link", flush=True)
+        glDeleteProgram(prog)
+        return sensor_textures
+
+    glUseProgram(prog)
+
+    # Bind BVH SSBOs
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_tris)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_nodes)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_ids)
+
+    # Bind forward film-layer volumes as samplers at texture units 0..N-1
+    for _i, _tex in enumerate(tex_bands):
+        glActiveTexture(GL_TEXTURE0 + _i)
+        glBindTexture(GL_TEXTURE_3D, _tex)
+    glActiveTexture(GL_TEXTURE0)
+    for _i in range(len(tex_bands)):
+        glUniform1i(glGetUniformLocation(prog, f'uFwdLayer{_i}'.encode()), _i)
+    for _i, _st in enumerate(sensor_textures):
+        glBindImageTexture(_i, _st, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F)
+
+    def _u1i(n, v): glUniform1i(glGetUniformLocation(prog, n), int(v))
+    def _u1f(n, v): glUniform1f(glGetUniformLocation(prog, n), float(v))
+    def _u3f(n, x, y, z): glUniform3f(glGetUniformLocation(prog, n), float(x), float(y), float(z))
+    def _u2i(n, x, y): glUniform2i(glGetUniformLocation(prog, n), int(x), int(y))
+    def _u3i(n, x, y, z): glUniform3i(glGetUniformLocation(prog, n), int(x), int(y), int(z))
+    glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), _n_layers)
+    for _li in range(_n_layers):
+        glUniform3f(glGetUniformLocation(prog, f'uLayerDark{_li}'.encode()),  0.0, 0.0, 0.0)
+        glUniform3f(glGetUniformLocation(prog, f'uLayerLight{_li}'.encode()), 1.0, 1.0, 1.0)
+
+    _u1i(b'uTriCount',        n_tris)
+    _u1i(b'uNodeCount',       n_bvh_nodes)
+    _u1i(b'uSamplesPerPixel', max(1, spp))
+    _u1i(b'uMaxBounces',      max(1, max_bounces))
+    _u2i(b'uSensorSize',      sensor_w, sensor_h)
+    _u1f(b'uRayFieldScale',   float(ray_field_scale))
+    _u1f(b'uRayFieldGamma',   float(ray_field_gamma))
+    _u1f(b'uVolAlpha',        float(vol_alpha))
+    _u1i(b'uVolSteps',        int(vol_steps))
+    _u1f(b'uAirDiffuseScatter',  float(air_diffuse_scatter))
+    _u1f(b'uAirSpecularScatter', float(air_specular_scatter))
+    _u1f(b'uAirAnisotropy',      float(air_anisotropy))
+    _u1f(b'uMediumExtinction',   float(medium_extinction))
+    _u3f(b'uCamEye',          *eye)
+    _u3f(b'uCamRight',        *right)
+    _u3f(b'uCamUp',           *up)
+    _u3f(b'uCamFwd',          *fwd)
+    _u1f(b'uCamFovTan',       fov_tan)
+    _u1f(b'uCamAspect',       aspect)
+    _u3f(b'uBoxMin',          *bmin.astype(np.float32))
+    _u3f(b'uBoxMax',          *bmax.astype(np.float32))
+    _u3i(b'uDims',            int(dims[0]), int(dims[1]), int(dims[2]))
+
+    gx = max(1, int(math.ceil(sensor_w / 16.0)))
+    # Dispatch in horizontal strips to stay well under TDR
+    # Budget: ~500k pixels per strip × vol_steps work per pixel
+    strip_rows = max(16, int(math.ceil(
+        500_000 / max(1, sensor_w * max(1, vol_steps) * max(1, spp) // 256))))
+    _finish_step = max(1, 500_000 // max(1, dispatch_batch))
+    _tile = 0
+    print(f"  [sensor] {sensor_w}×{sensor_h} × {spp} spp × {vol_steps} vol-steps  "
+          f"(strips of {strip_rows} rows)", flush=True)
+
+    from OpenGL.GL import glUniform1i as _u1i_raw
+    row_off = 0
+    while row_off < sensor_h:
+        rows_this = min(strip_rows, sensor_h - row_off)
+        cur_gy    = max(1, int(math.ceil(rows_this / 16.0)))
+        # uSeed encodes the strip so each strip has unique per-pixel RNG
+        glUniform1i(glGetUniformLocation(prog, b'uSeed'),      314159 + row_off)
+        glUniform1i(glGetUniformLocation(prog, b'uRowOffset'), row_off)
+        glDispatchCompute(gx, cur_gy, 1)
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+        _tile += 1
+        if _tile % _finish_step == 0:
+            glFinish()
+        row_off += rows_this
+
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                    GL_TEXTURE_FETCH_BARRIER_BIT)
+    glUseProgram(0)
+    for _i in range(_n_layers):
+        glActiveTexture(GL_TEXTURE0 + _i)
+        glBindTexture(GL_TEXTURE_3D, 0)
+    glActiveTexture(GL_TEXTURE0)
+    glDeleteProgram(prog)
+    return sensor_textures
+
+
 def _normalise_materials(materials: np.ndarray, n_tris: int) -> np.ndarray:
+    """Return (n_tris, 11): mat_in[3] | mat_out[3] | albedo_rgb[3] | ior | opacity."""
     mat = np.asarray(materials, dtype=np.float32)
     if mat.ndim != 2 or len(mat) != n_tris:
         mat = np.zeros((n_tris, 0), dtype=np.float32)
@@ -2358,7 +4931,14 @@ def _normalise_materials(materials: np.ndarray, n_tris: int) -> np.ndarray:
         mat_out = np.tile(np.array([0.88, 0.10, 0.055], dtype=np.float32), (n_tris, 1))
     else:
         mat_out = mat[:, 3:6]
-    return np.ascontiguousarray(np.column_stack([mat_in, mat_out]), dtype=np.float32)
+    if mat.shape[1] < 9:
+        albedo = np.tile(np.array([0.50, 0.28, 0.12], dtype=np.float32), (n_tris, 1))
+    else:
+        albedo = mat[:, 6:9]
+    ior     = mat[:, 9:10]  if mat.shape[1] >= 10 else np.ones((n_tris, 1), np.float32)
+    opacity = mat[:, 10:11] if mat.shape[1] >= 11 else np.ones((n_tris, 1), np.float32)
+    return np.ascontiguousarray(
+        np.column_stack([mat_in, mat_out, albedo, ior, opacity]), dtype=np.float32)
 
 
 def _stage_light_cache_key(scene, outline, body_h, total_rays: int, emitters: int,
@@ -2402,11 +4982,183 @@ def _stage_light_cache_key(scene, outline, body_h, total_rays: int, emitters: in
 def _stage_light_cache_path(cache_dir: str, key: str) -> str:
     return os.path.join(cache_dir, f"stage_light_{key}.npz")
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _SourceWorker — background thread for CPU-side source computation
+#
+# Computes emission source lists from physics frames (pure NumPy, no GL).
+# Results are posted to a deque(maxlen=1) so the GL thread always gets the
+# freshest data without stalling.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _SourceWorker(threading.Thread):
+    """Daemon thread: receives physics frame notifications and computes the
+    next source list asynchronously.  All work is pure NumPy — no GL calls.
+
+    The GL thread calls notify() to post a new job, then drains result_q
+    (a deque(maxlen=1)) each display frame to check if new source data is
+    ready.  If multiple frames arrive before the worker finishes, the stale
+    jobs are discarded and only the latest is processed.
+    """
+
+    def __init__(self):
+        super().__init__(daemon=True, name="SourceWorker")
+        self._event   = threading.Event()
+        self._lock    = threading.Lock()
+        self._stop    = False
+        self._pending: dict | None = None          # latest unprocessed job
+        self.result_q: collections.deque = collections.deque(maxlen=1)
+
+    # ── Public API (called from GL thread) ────────────────────────────────
+
+    def notify(self, *,
+               frame,
+               info: dict,
+               outline: np.ndarray,
+               body_h: float,
+               paths: list,
+               active_strings,
+               refresh_rays: int,
+               sensor_light_rays: int,
+               stage_light_emitters: int,
+               n_sources_target: int = 0):
+        """Post a new job.  Drops any previously queued but unstarted job."""
+        job = dict(
+            frame=frame,
+            info=dict(info),
+            outline=np.asarray(outline, dtype=np.float32),
+            body_h=float(body_h),
+            paths=list(paths),
+            active_strings=active_strings,
+            refresh_rays=int(refresh_rays),
+            sensor_light_rays=int(sensor_light_rays),
+            stage_light_emitters=int(stage_light_emitters),
+            n_sources_target=int(n_sources_target),
+        )
+        with self._lock:
+            self._pending = job
+        self._event.set()
+
+    def stop(self):
+        self._stop = True
+        self._event.set()
+
+    # ── Internal ──────────────────────────────────────────────────────────
+
+    def run(self):
+        while not self._stop:
+            self._event.wait()
+            self._event.clear()
+            if self._stop:
+                break
+            with self._lock:
+                job = self._pending
+                self._pending = None
+            if job is None:
+                continue
+            try:
+                result = self._compute(job)
+                if result is not None:
+                    self.result_q.append(result)
+            except Exception as exc:
+                import traceback
+                print(f"[SourceWorker] ERROR: {exc}\n{traceback.format_exc()}",
+                      flush=True)
+
+    @staticmethod
+    def _compute(job: dict):
+        frame               = job["frame"]
+        info                = job["info"]
+        outline             = job["outline"]
+        body_h              = job["body_h"]
+        paths               = job["paths"]
+        active_strings      = job["active_strings"]
+        refresh_rays        = job["refresh_rays"]
+        sensor_light_rays   = job["sensor_light_rays"]
+        stage_light_emitters= job["stage_light_emitters"]
+
+        n_str = max(1, len(paths))
+        if frame is not None and "plate_active_2d" in info:
+            board_sources = _instant_soundboard_sources(
+                frame.plate, info["plate_active_2d"], outline, body_h,
+                total_rays=refresh_rays, stride=4)
+        else:
+            board_sources = _geometry_soundboard_sources(
+                outline, body_h,
+                total_rays=refresh_rays * 3 // 4,
+                stride=6)
+
+        # String emission: when physics is running use actual displaced positions
+        # so emission follows the real vibration pattern (anti-nodes glow, nodes
+        # are silent).  Fall back to the static geometry path when no frame.
+        str_rays = max(64, refresh_rays // n_str // 16)
+        if frame is not None and hasattr(frame, "strings") and frame.strings:
+            str_sources = _instant_string_sources(
+                str_paths_current=frame.strings,
+                str_paths_equilibrium=paths,
+                total_rays_per_string=str_rays,
+                active_strings=active_strings)
+            # If the string has zero displacement this frame fall back gracefully
+            if not str_sources:
+                str_sources = _string_emission_sources(
+                    paths, body_h,
+                    total_rays_per_string=str_rays,
+                    active_strings=active_strings)
+        else:
+            str_sources = _string_emission_sources(
+                paths, body_h,
+                total_rays_per_string=str_rays,
+                active_strings=active_strings)
+        sources = _sensor_scene_sources(
+            outline, board_sources + str_sources,
+            light_rays=sensor_light_rays,
+            light_emitters=stage_light_emitters)
+        if not sources:
+            return None
+
+        # Expand into mono-spectral stochastic packets
+        sources = _stochastic_spectral_packets(
+            sources, packets_per_source=32,
+            seed=1776 + len(sources))
+
+        # Pack source records SSBO layout (N × 12 float32)
+        n = max(1, len(sources))
+        total_rays = max(1, sum(int(s[2]) for s in sources))
+        rec = np.zeros((n, 12), np.float32)
+        for i, _s in enumerate(sources):
+            sp, sd, nr, spec = _s[0], _s[1], _s[2], _s[3]
+            _d = np.asarray(sd, np.float32).ravel()[:3]
+            _dl = float(np.linalg.norm(_d))
+            _d = (_d / _dl if _dl > 1e-9 else np.array([0., 0., 1.], np.float32))
+            rec[i, 0:3]  = np.asarray(sp, np.float32).ravel()[:3]
+            rec[i, 3]    = float(max(1, int(nr))) / float(total_rays)
+            rec[i, 4:7]  = _d
+            rec[i, 7]    = 0.0
+            rec[i, 8:12] = np.asarray(spec, np.float32).ravel()[:4]
+        rec = np.ascontiguousarray(rec, np.float32)
+
+        return {"sources_list": sources, "source_records_np": rec}
+
+
 def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
                    dims=GPU_RAY_FIELD_DIMS, segment_cap=GPU_RAY_SEGMENT_CAP,
-                   dispatch_batch=GPU_DISPATCH_BATCH, include_stage=True,
+                   dispatch_batch=GPU_DISPATCH_BATCH, include_stage=False,
                    model_matrix: Optional[np.ndarray] = None,
-                   bounds: Optional[tuple[np.ndarray, np.ndarray]] = None):
+                   bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
+                   sim_bounds: Optional[tuple[np.ndarray, np.ndarray]] = None,
+                   diagnostics: bool = True,
+                   segment_capture: bool = True,
+                   time_queries: bool = False,
+                   sensor_pos: Optional[np.ndarray] = None,
+                   sensor_pos_space: str = "guitar",
+                   sensor_rays: int = 0,
+                   sensor_gain: float = 8.0,
+                   sensor_w: int = 0,
+                   sensor_h: int = 0,
+                   film: Optional[FilmStack] = None,
+                   air_diffuse_scatter: float = 0.35,
+                   air_specular_scatter: float = 0.65,
+                   air_anisotropy: float = 12.0):
     _ray_diag_update(
         "gpu_ray_field:start",
         n_sources=len(sources) if sources is not None else 0,
@@ -2416,7 +5168,12 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         dispatch_batch=int(dispatch_batch),
     )
     if scene is None or _extract_scene_geometry_fn is None:
-        return None, None, None, None, 0, None, 0
+        return None, None, None, None, 0, None, 0, 0
+    sources = _stochastic_spectral_packets(
+        list(sources or []),
+        packets_per_source=32,
+        seed=1776 + len(sources or []))
+    film_stack = film if film is not None else _default_stack()
     if _extract_scene_geometry_materials_fn is not None:
         verts_flat, normals, materials = _extract_scene_geometry_materials_fn(scene)
     else:
@@ -2427,39 +5184,159 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     normals = np.asarray(normals, dtype=np.float32).reshape(-1, 3)
     if model_matrix is not None and len(verts_flat):
         M = np.asarray(model_matrix, dtype=np.float32)
-        Rm = M[:3, :3]
-        vf_h = np.column_stack([verts_flat, np.ones(len(verts_flat), dtype=np.float32)])
-        verts_flat = (vf_h @ M.T)[:, :3].astype(np.float32)
-        normals = (normals @ Rm.T)
-        nl = np.linalg.norm(normals, axis=1, keepdims=True)
-        normals = (normals / np.maximum(nl, 1e-9)).astype(np.float32)
+        verts_flat = _transform_points(verts_flat, M)
+        normals = _transform_normals(normals, M)
+    def _pad_mat11(m: np.ndarray,
+                   default_albedo=(0.50, 0.28, 0.12),
+                   default_ior=1.52, default_opacity=1.0) -> np.ndarray:
+        """Ensure material array is (N, 11): pad missing cols with physical defaults."""
+        m = np.asarray(m, np.float32)
+        if m.ndim == 1:
+            m = m.reshape(1, -1)
+        defaults = [*default_albedo, default_ior, default_opacity]
+        while m.shape[1] < 11:
+            col = np.full((len(m), 1), defaults[m.shape[1] - 6], np.float32) \
+                  if m.shape[1] >= 6 else np.full((len(m), 1), 0.0, np.float32)
+            m = np.hstack([m, col])
+        return m
+
+    materials = _pad_mat11(materials)
     if include_stage:
         st_v, st_n, st_m = _stage_mesh(outline, body_h)
+        if model_matrix is None:
+            # Stage/room shell is authored in world coordinates.  The acoustic
+            # band textures and guitar geometry are in guitar-frame, so bring
+            # the room into that same frame for the sensor BVH.
+            _, Minv = _guitar_model_matrix(outline)
+            st_v = _transform_points(st_v.reshape(-1, 3), Minv).reshape(-1, 9)
+            st_n = _transform_normals(st_n, Minv)
         verts_flat = np.vstack([np.asarray(verts_flat, np.float32),
                                 np.asarray(st_v, np.float32).reshape(-1, 3)])
         normals = np.vstack([np.asarray(normals, np.float32), st_n])
-        materials = np.vstack([np.asarray(materials, np.float32), st_m])
+        materials = np.vstack([materials, _pad_mat11(st_m)])
+
+    # ── Neck wood and steel strings as BVH geometry ─────────────────────────────
+    _y_nut_bvh  = BRIDGE_POS[1][1] + SCALE_LENGTH_M
+    _y_head_bvh = _y_nut_bvh + 0.13
+    _y_body_bvh = float(outline[:, 1].max()) * 0.85
+    _nk_z       = body_h + 0.003
+    _nk_mat6    = np.array([0.72, 0.38, 0.08, 0.72, 0.38, 0.08, 0.42, 0.22, 0.09, 1.52, 1.0], np.float32)
+    _bvh_ev, _bvh_en, _bvh_em = [], [], []
+
+    def _bvh_quad(corners, mat6):
+        a, b, c, d = corners
+        for tri in [(a, b, c), (a, c, d)]:
+            e1 = tri[1] - tri[0]; e2 = tri[2] - tri[0]
+            nm = np.cross(e1, e2); nl = np.linalg.norm(nm)
+            if nl < 1e-12:
+                continue
+            nm /= nl
+            _bvh_ev.extend(tri);       _bvh_en.append(nm);  _bvh_em.append(mat6)
+            _bvh_ev.extend(tri[::-1]); _bvh_en.append(-nm); _bvh_em.append(mat6)
+
+    _nw0, _nw1, _hw = 0.056, 0.044, 0.092
+    _bvh_quad([
+        np.array([-_nw0 * 0.5, _y_body_bvh, _nk_z], np.float32),
+        np.array([ _nw0 * 0.5, _y_body_bvh, _nk_z], np.float32),
+        np.array([ _nw1 * 0.5, _y_nut_bvh,  _nk_z], np.float32),
+        np.array([-_nw1 * 0.5, _y_nut_bvh,  _nk_z], np.float32),
+    ], _nk_mat6)
+    _bvh_quad([
+        np.array([-_hw * 0.42, _y_nut_bvh,  _nk_z],         np.float32),
+        np.array([ _hw * 0.42, _y_nut_bvh,  _nk_z],         np.float32),
+        np.array([ _hw * 0.58, _y_head_bvh, _nk_z + 0.002], np.float32),
+        np.array([-_hw * 0.58, _y_head_bvh, _nk_z + 0.002], np.float32),
+    ], _nk_mat6)
+
+    _str_z_bvh = body_h + STRING_CLEARANCE
+    # Plain steel strings (treble, unwound): bright silver, IOR 2.95
+    _steel_plain = np.array([0.91, 0.04, 0.02, 0.91, 0.04, 0.02,
+                              0.82, 0.82, 0.80, 2.95, 1.0], np.float32)
+    # Wound strings (bass, phosphor-bronze wrap): warm gold-bronze, IOR 1.85
+    _steel_wound = np.array([0.88, 0.06, 0.03, 0.88, 0.06, 0.03,
+                              0.82, 0.62, 0.35, 1.85, 1.0], np.float32)
+    _z_up      = np.array([0.0, 0.0, 1.0], np.float32)
+    _x_span_bvh = 0.0088 * 5.0
+    for _si in range(6):
+        _xs_bvh = -_x_span_bvh * 0.5 + _si * (_x_span_bvh / 5.0)
+        _xn_bvh = _xs_bvh * 0.72
+        _gm = max(float(STRING_GAUGES_IN[_si] if _si < len(STRING_GAUGES_IN) else 0.012) * 0.0254, 0.0005)
+        # Strings with gauge ≥ 0.024" are wound (bass); thinner are plain steel
+        _str_mat = _steel_wound if (STRING_GAUGES_IN[_si] if _si < len(STRING_GAUGES_IN) else 0.010) >= 0.024 else _steel_plain
+        _ys  = np.linspace(_y_nut_bvh, -0.070, 31, dtype=np.float32)
+        _xs2 = np.linspace(_xn_bvh, _xs_bvh, 31, dtype=np.float32)
+        for _k in range(30):
+            _p0 = np.array([_xs2[_k],   _ys[_k],   _str_z_bvh], np.float32)
+            _p1 = np.array([_xs2[_k+1], _ys[_k+1], _str_z_bvh], np.float32)
+            _dv = _p1 - _p0; _dl = float(np.linalg.norm(_dv))
+            if _dl < 1e-9:
+                continue
+            _perp = np.cross(_dv / _dl, _z_up)
+            _pl = float(np.linalg.norm(_perp))
+            if _pl < 1e-9:
+                continue
+            _perp = (_perp / _pl) * (_gm * 0.5)
+            _a = _p0 + _perp; _b = _p0 - _perp
+            _c = _p1 + _perp; _e = _p1 - _perp
+            for _tri, _nm in [((_a, _b, _e), _z_up),  ((_a, _e, _c), _z_up),
+                               ((_e, _b, _a), -_z_up), ((_c, _e, _a), -_z_up)]:
+                _bvh_ev.extend(_tri); _bvh_en.append(_nm); _bvh_em.append(_str_mat)
+
+    if _bvh_ev:
+        verts_flat = np.vstack([verts_flat, np.array(_bvh_ev, np.float32)])
+        normals    = np.vstack([normals,    np.array(_bvh_en, np.float32)])
+        materials  = np.vstack([materials,  np.array(_bvh_em, np.float32)])
+
+    # ── Glass bell jar in guitar-frame for the BVH (refraction in sensor render) ─
+    if sim_bounds is not None:
+        _gb_min = np.asarray(sim_bounds[0], np.float32)
+        _gb_max = np.asarray(sim_bounds[1], np.float32)
+        _glass_mat = _load_material_yaml("borosilicate_glass")
+        _gbell = _build_sim_belljar_world(_gb_min, _gb_max)
+        _gv = _gbell[:, :3].reshape(-1, 3)
+        _gn = _gbell[:, 3:]
+        _gm_rep = np.tile(_glass_mat, (len(_gv) // 3, 1))
+        verts_flat = np.vstack([verts_flat, _gv])
+        normals    = np.vstack([normals,    _gn[::3]])   # one normal per tri vertex 0
+        materials  = np.vstack([materials,  _gm_rep])
+        # Opaque skirt below the bell jar (floor → sim bottom)
+        _gskirt = _build_sim_skirt_world(_gb_min, _gb_max)
+        if len(_gskirt) > 0:
+            _skirt_mat = _load_material_yaml("stage_floor")
+            _sv = _gskirt[:, :3].reshape(-1, 3)
+            _sn = _gskirt[:, 3:]
+            _sm_rep = np.tile(_skirt_mat, (len(_sv) // 3, 1))
+            verts_flat = np.vstack([verts_flat, _sv])
+            normals    = np.vstack([normals,    _sn[::3]])
+            materials  = np.vstack([materials,  _sm_rep])
+
     if len(verts_flat) == 0:
-        return None, None, None, None, 0, None, 0
+        return None, None, None, None, 0, None, 0, 0
 
     tris = verts_flat.reshape(-1, 3, 3).astype(np.float32)
     nrm = normals.astype(np.float32)
-    mat6 = _normalise_materials(materials, len(tris))
-    mat_in = mat6[:, 0:3]
-    mat_out = mat6[:, 3:6]
-    packed = np.zeros((len(tris), 24), np.float32)
-    packed[:, 0:3] = tris[:, 0, :]
-    packed[:, 4:7] = tris[:, 1, :] - tris[:, 0, :]
-    packed[:, 8:11] = tris[:, 2, :] - tris[:, 0, :]
+    mat11    = _normalise_materials(materials, len(tris))
+    mat_in   = mat11[:, 0:3]
+    mat_out  = mat11[:, 3:6]
+    albedo   = mat11[:, 6:9]
+    ior_col  = mat11[:, 9]
+    opac_col = mat11[:, 10]
+    packed = np.zeros((len(tris), 28), np.float32)
+    packed[:, 0:3]   = tris[:, 0, :]
+    packed[:, 4:7]   = tris[:, 1, :] - tris[:, 0, :]
+    packed[:, 8:11]  = tris[:, 2, :] - tris[:, 0, :]
     packed[:, 12:15] = nrm
     packed[:, 16:19] = mat_in
+    packed[:, 19]    = ior_col          # mat_in.w  = IOR
     packed[:, 20:23] = mat_out
+    packed[:, 23]    = opac_col         # mat_out.w = opacity (1=opaque, 0=transparent)
+    packed[:, 24:27] = albedo
     packed = np.ascontiguousarray(packed)
     bvh_nodes, bvh_ids = _build_gpu_bvh(tris)
     _ray_diag_update(
         "gpu_ray_field:geometry",
         n_sources=len(sources),
-        total_source_rays=sum(int(n) for _, _, n, _ in sources),
+        total_source_rays=sum(int(s[2]) for s in sources),
         n_tris=len(tris),
         n_bvh_nodes=len(bvh_nodes),
         packed_bytes=int(packed.nbytes),
@@ -2471,11 +5348,28 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     if bounds is not None:
         bmin = np.asarray(bounds[0], dtype=np.float32)
         bmax = np.asarray(bounds[1], dtype=np.float32)
+    elif include_stage and model_matrix is None:
+        bmin, bmax = _stage_bounds_guitar_frame(outline)
     else:
         min_xy = outline.min(axis=0).astype(np.float32)
         max_xy = outline.max(axis=0).astype(np.float32)
         bmin = np.array([min_xy[0] - 0.012, min_xy[1] - 0.012, -0.002], np.float32)
         bmax = np.array([max_xy[0] + 0.012, max_xy[1] + 0.012, body_h + 0.004], np.float32)
+
+    _bplate_cx = float(bmin[0] + bmax[0]) * 0.5
+    _bplate_cy = float(bmin[1] + bmax[1]) * 0.5
+    _bplate_z  = float(bmin[2])
+    _sc = np.array([_bplate_cx, _bplate_cy, _bplate_z], np.float32)
+    if sensor_pos is not None:
+        _sp = np.asarray(sensor_pos, np.float32).ravel()[:3]
+        if str(sensor_pos_space).lower() == "world":
+            _, Minv = _guitar_model_matrix(outline)
+            _sp = _transform_points(_sp.reshape(1, 3), Minv)[0]
+    else:
+        _standoff = max(0.30, float(bmax[2] - bmin[2]) * 5.0)
+        _sp = np.array([_bplate_cx, _bplate_cy, _bplate_z - _standoff], np.float32)
+    _sensor_dir = _sc - _sp
+    _sensor_dir = (_sensor_dir / max(float(np.linalg.norm(_sensor_dir)), 1e-9)).astype(np.float32)
 
     # ── Create 4 spectral band accumulation textures (one per frequency band) ─
     zero = np.array([0], dtype=np.uint32)
@@ -2497,17 +5391,34 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     seg_stride = 4
     seg_bytes = max(1, seg_cap * seg_stride * 4 * 4)
     counter = np.zeros(4, dtype=np.uint32)
+    total_source_rays = max(1, sum(int(s[2]) for s in sources))
+    source_records = np.zeros((max(1, len(sources)), 12), np.float32)
+    for _i, _src_rec in enumerate(sources):
+        _sp_src, _sd_src, _nr_src, _spec_src = _src_rec[0], _src_rec[1], _src_rec[2], _src_rec[3]
+        _sd_arr = np.asarray(_sd_src, np.float32).ravel()[:3]
+        _sd_len = float(np.linalg.norm(_sd_arr))
+        if _sd_len > 1e-9:
+            _sd_arr = _sd_arr / _sd_len
+        else:
+            _sd_arr = np.array([0.0, 0.0, 1.0], np.float32)
+        source_records[_i, 0:3] = np.asarray(_sp_src, np.float32).ravel()[:3]
+        source_records[_i, 3] = float(max(1, int(_nr_src))) / float(total_source_rays)
+        source_records[_i, 4:7] = _sd_arr
+        source_records[_i, 7] = 0.0
+        source_records[_i, 8:12] = np.asarray(_spec_src, np.float32).ravel()[:4]
+    source_records = np.ascontiguousarray(source_records, np.float32)
 
-    ssbo = glGenBuffers(5)
+    ssbo = glGenBuffers(6)
     _ray_diag_update(
         "gpu_ray_field:alloc_buffers",
         n_sources=len(sources),
-        total_source_rays=sum(int(n) for _, _, n, _ in sources),
+        total_source_rays=sum(int(s[2]) for s in sources),
         n_tris=len(tris),
         n_bvh_nodes=len(bvh_nodes),
         tex_bands=tuple(int(t) for t in tex_bands),
         ssbo=tuple(int(b) for b in ssbo),
         seg_bytes=int(seg_bytes),
+        source_record_bytes=int(source_records.nbytes),
     )
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[0])
     glBufferData(GL_SHADER_STORAGE_BUFFER, packed.nbytes, packed, GL_STATIC_DRAW)
@@ -2524,6 +5435,9 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[4])
     glBufferData(GL_SHADER_STORAGE_BUFFER, counter.nbytes, counter, GL_DYNAMIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo[4])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[5])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, source_records.nbytes, source_records, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo[5])
 
     prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
     if not glGetProgramiv(prog, GL_LINK_STATUS):
@@ -2533,7 +5447,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
             glDeleteTextures([tex])
         for buf in ssbo:
             glDeleteBuffers(1, [buf])
-        return None, None, None, None, 0, None, 0
+        return None, None, None, None, 0, None, 0, 0
     glUseProgram(prog)
     # imageAtomicAdd on all 4 band textures — must be GL_READ_WRITE
     for band_idx, tex in enumerate(tex_bands):
@@ -2542,6 +5456,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glUniform1i(glGetUniformLocation(prog, b'uNodeCount'), len(bvh_nodes))
     glUniform1i(glGetUniformLocation(prog, b'uSegmentCap'), seg_cap)
     glUniform1i(glGetUniformLocation(prog, b'uSegmentStride'), seg_stride)
+    glUniform1i(glGetUniformLocation(prog, b'uSourceCount'), len(sources))
     glUniform1i(glGetUniformLocation(prog, b'uMaxBounces'), int(max_bounces))
     glUniform3f(glGetUniformLocation(prog, b'uBoxMin'), *bmin)
     glUniform3f(glGetUniformLocation(prog, b'uBoxMax'), *bmax)
@@ -2550,8 +5465,17 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glUniform1f(glGetUniformLocation(prog, b'uVolumeStepMeters'), 0.003)
     glUniform1f(glGetUniformLocation(prog, b'uMediumScattering'),  1.0)
     glUniform1f(glGetUniformLocation(prog, b'uMediumExtinction'),  0.5)
-    glUniform4f(glGetUniformLocation(prog, b'uBandExtinction'),    1.0, 1.15, 1.30, 1.50)
+    glUniform1f(glGetUniformLocation(prog, b'uAirDiffuseScatter'),  float(air_diffuse_scatter))
+    glUniform1f(glGetUniformLocation(prog, b'uAirSpecularScatter'), float(air_specular_scatter))
+    glUniform1f(glGetUniformLocation(prog, b'uAirAnisotropy'),      float(air_anisotropy))
+    _specs = film_stack.layer_specs()
+    glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), len(_specs))
+    for _i, _sp_layer in enumerate(_specs):
+        glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), _sp_layer['center_hz'])
+        glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), _sp_layer['width_oct'])
+        glUniform1f(glGetUniformLocation(prog, f'uLayerGains[{_i}]'.encode()),     _sp_layer['gain'])
 
+    loc_mode        = glGetUniformLocation(prog, b'uMode')
     loc_seed        = glGetUniformLocation(prog, b'uSeed')
     loc_src_pos     = glGetUniformLocation(prog, b'uSrcPos')
     loc_src_dir     = glGetUniformLocation(prog, b'uSrcDir')
@@ -2559,9 +5483,12 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     loc_batch_off   = glGetUniformLocation(prog, b'uBatchOffset')
     loc_total_rays  = glGetUniformLocation(prog, b'uTotalRaysPerSource')
     loc_src_spec    = glGetUniformLocation(prog, b'uSrcSpectrum')
+    glUniform1i(glGetUniformLocation(prog, b'uDiagnosticsEnabled'), 1 if diagnostics else 0)
+    glUniform1i(glGetUniformLocation(prog, b'uSegmentCapture'),     1 if segment_capture else 0)
+    glUniform1i(loc_mode, 0)
 
     dispatch_batch = max(128, int(dispatch_batch))
-    total_rays = sum(n for _, _, n, _ in sources)
+    total_rays = sum(s[2] for s in sources)
     print(f"  [gpu_ray_field] {len(sources)} sources, "
           f"{total_rays} total rays, "
           f"dispatch_batch={dispatch_batch}, "
@@ -2570,7 +5497,8 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
 
     rays_done = 0
     next_report = max(dispatch_batch, total_rays // 20) if total_rays > 0 else dispatch_batch
-    for si, (sp, sd, n_rays, spectrum) in enumerate(sources):
+    for si, _src_entry in enumerate(sources):
+        sp, sd, n_rays, spectrum = _src_entry[0], _src_entry[1], _src_entry[2], _src_entry[3]
         _ray_diag_update(
             "gpu_ray_field:dispatch_source",
             source_index=int(si),
@@ -2588,6 +5516,23 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
                                   float(spectrum[2]), float(spectrum[3]))
 
         offset = 0
+        _q_elapsed_ns = 0
+        if time_queries:
+            from OpenGL.GL import (
+                glGenQueries, glBeginQuery, glEndQuery,
+                glGetQueryObjectuiv, glDeleteQueries,
+                GL_TIME_ELAPSED, GL_QUERY_RESULT,
+            )
+            _tq = glGenQueries(1)[0]
+            glBeginQuery(GL_TIME_ELAPSED, _tq)
+        from OpenGL.GL import glFinish
+        # How often to call glFinish() to reset the Windows TDR watchdog.
+        # Each glFinish() lets the OS confirm the GPU is alive; without this,
+        # a long sequence of dispatches with only glMemoryBarrier between them
+        # can exceed the ~2s TDR timeout and silently kill the GL context.
+        # At dispatch_batch=8192 a finish every 32 batches ≈ every 262k rays.
+        _finish_every = max(1, 500_000 // max(1, dispatch_batch))
+        _batch_count  = 0
         while offset < n_rays:
             batch = min(dispatch_batch, n_rays - offset)
             glUniform1i(loc_batch_size, batch)
@@ -2596,16 +5541,85 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
             gx = min(n_groups, 65535)
             gy = max(1, int(math.ceil(n_groups / gx)))
             glDispatchCompute(gx, gy, 1)
-            # Barrier between batches: forces the GPU to drain each batch
-            # before the next begins, preventing TDR timeout on 10 M+ rays.
             glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
                             GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            _batch_count += 1
+            if _batch_count % _finish_every == 0:
+                # Full CPU/GPU sync: lets the TDR watchdog timer reset.
+                glFinish()
             offset += batch
             rays_done += batch
             if total_rays >= 1_000_000 and rays_done >= next_report:
                 print(f"  [gpu_ray_field] streamed {rays_done}/{total_rays} rays",
                       flush=True)
                 next_report += max(dispatch_batch, total_rays // 20)
+        if time_queries:
+            glEndQuery(GL_TIME_ELAPSED)
+            _q_elapsed_ns = int(glGetQueryObjectuiv(_tq, GL_QUERY_RESULT))
+            glDeleteQueries([_tq])
+            print(f"  [gpu_ray_field] source {si}: {n_rays} rays  "
+                  f"{_q_elapsed_ns / 1e6:.2f} ms  "
+                  f"{n_rays / max(_q_elapsed_ns / 1e9, 1e-9) / 1e6:.1f} Mrays/s",
+                  flush=True)
+
+    if int(sensor_rays) > 0:
+        from OpenGL.GL import glCopyImageSubData, glDeleteTextures
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT)
+        fwd_snapshot = list(glGenTextures(n_layers))
+        for _dst, _src in zip(fwd_snapshot, tex_bands):
+            glBindTexture(GL_TEXTURE_3D, _dst)
+            glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI, dims[0], dims[1], dims[2], 0,
+                         GL_RED_INTEGER, GL_UNSIGNED_INT, None)
+            for param, val in [(GL_TEXTURE_MIN_FILTER, GL_NEAREST),
+                               (GL_TEXTURE_MAG_FILTER, GL_NEAREST),
+                               (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE),
+                               (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE),
+                               (GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)]:
+                glTexParameteri(GL_TEXTURE_3D, param, val)
+            glCopyImageSubData(_src, GL_TEXTURE_3D, 0, 0, 0, 0,
+                               _dst, GL_TEXTURE_3D, 0, 0, 0, 0,
+                               int(dims[0]), int(dims[1]), int(dims[2]))
+        glBindTexture(GL_TEXTURE_3D, 0)
+        glUniform1i(loc_mode, 1)
+        glUniform1i(loc_total_rays, max(1, int(sensor_rays)))
+        glUniform3f(loc_src_pos, *_sp)
+        glUniform3f(loc_src_dir, *_sensor_dir)
+        glUniform4f(loc_src_spec, 440.0, 0.0, 1.0, 1.0)
+        glUniform1f(glGetUniformLocation(prog, b'uSensorNorm'), max(1.0, float(total_rays)))
+        glUniform1f(glGetUniformLocation(prog, b'uSensorGain'), float(sensor_gain))
+        glUniform1f(glGetUniformLocation(prog, b'uSensorConeCos'), float(math.cos(math.radians(32.0))))
+        glUniform1f(glGetUniformLocation(prog, b'uSensorMisWeight'), 0.55)
+        for _i, _tex in enumerate(fwd_snapshot):
+            glActiveTexture(GL_TEXTURE0 + 8 + _i)
+            glBindTexture(GL_TEXTURE_3D, _tex)
+            glUniform1i(glGetUniformLocation(prog, f'uFwdLayer{_i}'.encode()), 8 + _i)
+        glActiveTexture(GL_TEXTURE0)
+        _srays_done = 0
+        _sensor_finish_every = max(1, 500_000 // max(1, dispatch_batch))
+        _sensor_batch_count = 0
+        while _srays_done < int(sensor_rays):
+            batch = min(dispatch_batch, int(sensor_rays) - _srays_done)
+            glUniform1i(loc_seed, 8675309 + _srays_done)
+            glUniform1i(loc_batch_size, batch)
+            glUniform1i(loc_batch_off, _srays_done)
+            n_groups = max(1, int(math.ceil(batch / 128.0)))
+            gx = min(n_groups, 65535)
+            gy = max(1, int(math.ceil(n_groups / gx)))
+            glDispatchCompute(gx, gy, 1)
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_FETCH_BARRIER_BIT)
+            _sensor_batch_count += 1
+            if _sensor_batch_count % _sensor_finish_every == 0:
+                glFinish()
+            _srays_done += batch
+        for _i in range(4):
+            glActiveTexture(GL_TEXTURE0 + 4 + _i)
+            glBindTexture(GL_TEXTURE_3D, 0)
+        glActiveTexture(GL_TEXTURE0)
+        for _tex in fwd_snapshot:
+            glDeleteTextures([_tex])
+        glUniform1i(loc_mode, 0)
 
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
                     GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT)
@@ -2628,16 +5642,22 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         rays_seen=int(rays_seen),
         hit_count=int(hit_count),
         record_count=int(record_count),
+        sensor_rays=int(max(0, int(sensor_rays))),
+        expected_diag_rays=int(int(total_rays) + max(0, int(sensor_rays))),
         segment_counter=int(counter_readback[0]),
         actual_seg_count=int(actual_seg_count),
         segment_cap=int(seg_cap),
         ssbo=tuple(int(b) for b in ssbo),
         tex_bands=tuple(int(t) for t in tex_bands),
     )
-    if total_rays > 0 and rays_seen > int(total_rays):
-        raise RuntimeError(
-            f"GPU ray dispatch counter overflow: reported {rays_seen} "
-            f"rays with max {int(total_rays)}")
+    expected_diag_rays = int(total_rays) + max(0, int(sensor_rays))
+    if expected_diag_rays > 0 and rays_seen > expected_diag_rays:
+        print(
+            f"  [gpu_ray_field] diagnostic ray counter exceeded expected budget: "
+            f"reported {rays_seen}, expected {expected_diag_rays} "
+            f"({int(total_rays)} source + {max(0, int(sensor_rays))} sensor); "
+            f"continuing with completed ray field",
+            flush=True)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
     glUseProgram(0)
     if actual_seg_count == 0 and seg_cap > 0:
@@ -2656,10 +5676,62 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     print(f"  GPU ray field {dims[0]}x{dims[1]}x{dims[2]}, "
           f"{len(sources)} sources / {total_rays} total rays, {len(tris)} tris, "
           f"{len(bvh_nodes)} BVH nodes, {actual_seg_count} segments emitted", flush=True)
-    for buf in ssbo[:3]:
+    for buf in [ssbo[0], ssbo[1], ssbo[2], ssbo[5]]:
         glDeleteBuffers(1, [buf])
     glDeleteProgram(prog)
-    return tex_bands, bmin, bmax, ssbo[3], actual_seg_count, ssbo[4], int(total_rays)
+
+    # ── 2-D camera sensor accumulator (progressive, volume + surface) ─────────
+    # Operates in guitar-frame (canonical physics frame).
+    # Camera looks at the back plate (Z=bmin face) from behind (Z < bmin).
+    # BVH SSBOs (packed tris, nodes, ids) are re-uploaded here so the
+    # accumulator owns persistent copies for its lifetime.
+    _bplate_cx = float(bmin[0] + bmax[0]) * 0.5
+    _bplate_cy = float(bmin[1] + bmax[1]) * 0.5
+    _bplate_z  = float(bmin[2])  # back plate sits at Z=bmin (≈0 in guitar-frame)
+    _standoff  = max(0.30, float(bmax[2] - bmin[2]) * 5.0)  # ≥5× body depth
+    _sc = np.array([_bplate_cx, _bplate_cy, _bplate_z], np.float32)
+    if sensor_pos is not None:
+        _sp = np.asarray(sensor_pos, np.float32).ravel()[:3]
+        if str(sensor_pos_space).lower() == "world":
+            _, Minv = _guitar_model_matrix(outline)
+            _sp = _transform_points(_sp.reshape(1, 3), Minv)[0]
+    else:
+        # Default: position sensor directly behind the back plate centre.
+        _sp = np.array([_bplate_cx, _bplate_cy, _bplate_z - _standoff], np.float32)
+    _sw  = max(1, sensor_w) if sensor_w and sensor_w > 0 else WIN_W
+    _sh  = max(1, sensor_h) if sensor_h and sensor_h > 0 else WIN_H
+    # Persistent SSBOs owned by the accumulator (not freed here)
+    _s_ssbo = list(glGenBuffers(3))
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[0])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, packed.nbytes, packed, GL_STATIC_DRAW)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[1])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_nodes.nbytes, bvh_nodes, GL_STATIC_DRAW)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[2])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_ids.nbytes, bvh_ids, GL_STATIC_DRAW)
+    print(f"  [sensor] starting progressive accumulator  {_sw}x{_sh}  "
+          f"{len(tris)} tris  {len(bvh_nodes)} BVH nodes", flush=True)
+    sensor_acc = SensorAccumulator(
+        ssbo_tris=_s_ssbo[0], ssbo_nodes=_s_ssbo[1], ssbo_ids=_s_ssbo[2],
+        n_tris=len(tris), n_bvh_nodes=len(bvh_nodes),
+        tex_bands=tex_bands, bmin=bmin, bmax=bmax, dims=dims,
+        camera_eye=_sp, camera_target=_sc,
+        sensor_w=_sw, sensor_h=_sh,
+        rows_per_frame=16,
+        max_bounces=max(1, int(max_bounces)),
+        ray_field_scale=float(sensor_gain), ray_field_gamma=0.55,
+        vol_alpha=1.0, vol_steps=64)
+    # Hand the accumulator the source list so it can re-emit forward rays
+    # every sensor-frame cadence tick (full per-frame BDPT).
+    sensor_acc.update_sources(
+        sources_list=sources,
+        source_records_np=source_records,
+        dispatch_batch=int(dispatch_batch),
+        air_diffuse_scatter=float(air_diffuse_scatter),
+        air_specular_scatter=float(air_specular_scatter),
+        air_anisotropy=float(air_anisotropy))
+    # Note: _s_ssbo ownership is transferred to sensor_acc; do NOT free here.
+
+    return tex_bands, bmin, bmax, ssbo[3], actual_seg_count, ssbo[4], int(total_rays), sensor_acc
 
 
 def _read_uint_ray_textures(tex_bands: list[int], dims: tuple[int, int, int]) -> np.ndarray:
@@ -2674,9 +5746,8 @@ def _read_uint_ray_textures(tex_bands: list[int], dims: tuple[int, int, int]) ->
 
 
 def _upload_uint_ray_textures(data: np.ndarray) -> list[int]:
-    tex_bands = list(glGenTextures(4))
+    tex_bands = list(glGenTextures(len(data)))
     for tex, arr in zip(tex_bands, data):
-        # npz stores as (z, y, x); OpenGL expects width, height, depth bytes.
         arr = np.ascontiguousarray(arr, dtype=np.uint32)
         depth, height, width = arr.shape
         glBindTexture(GL_TEXTURE_3D, tex)
@@ -2701,7 +5772,7 @@ def _load_stage_light_cache(path: str):
             bounds = (z["bounds_min"].astype(np.float32),
                       z["bounds_max"].astype(np.float32))
             total_rays = int(z["total_rays"])
-        if data.shape[0] != 4:
+        if data.shape[0] < 1:
             return None
         return _upload_uint_ray_textures(data), bounds, total_rays
     except Exception as exc:
@@ -2755,12 +5826,24 @@ def _vao(data: np.ndarray, attribs: list, usage=GL_DYNAMIC_DRAW):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Camera:
-    def __init__(self, target=(0.0, 0.4, 0.65), dist=1.6, elev=14.0, az=22.0):
+    def __init__(self, target=(0.0, 0.4, 0.65), dist=1.6, elev=14.0, az=22.0,
+                 sensor: "SensorSpec | None" = None,
+                 lens: "LensSpec | None" = None):
         self.target  = np.array(target, np.float64)
         self.dist    = dist
         self.elev    = elev
         self.az      = az
         self._auto   = 0.18
+        self.focal_mm = 35.0
+        self.focus_m = 1.6
+        self.aperture = 0.0
+        self.ca = 0.0
+        self.tilt_shift = np.zeros(2, np.float64)
+        # Sensor and lens specs (may be loaded from YAML)
+        self.sensor: SensorSpec = sensor or SensorSpec()
+        self.lens:   LensSpec   = lens   or LensSpec()
+        # Sync focal_mm from lens spec
+        self.focal_mm = self.lens.focal_mm
 
     def orbit(self, daz, delev):
         self.az   = (self.az + daz) % 360.0
@@ -2768,6 +5851,32 @@ class Camera:
 
     def zoom(self, d):
         self.dist = float(np.clip(self.dist + d, 0.12, 3.0))
+
+    def fov_y_rad(self) -> float:
+        # fov_y = 2 * atan(sensor_height_mm/2 / focal_mm)
+        # Uses sensor spec so swapping to MF, APS-C etc. changes the field of view.
+        h_mm = max(1.0, self.sensor.height_mm)
+        return 2.0 * math.atan(h_mm * 0.5 / max(1.0, self.focal_mm))
+
+    def pan(self, right_m: float = 0.0, forward_m: float = 0.0, up_m: float = 0.0):
+        fwd = _norm(self.target - self.eye)
+        world_up = np.array([0.0, 0.0, 1.0], np.float64)
+        right = _norm(np.cross(fwd, world_up))
+        if np.linalg.norm(right) < 1e-9:
+            right = np.array([1.0, 0.0, 0.0], np.float64)
+        flat_fwd = fwd.copy()
+        flat_fwd[2] = 0.0
+        flat_fwd = _norm(flat_fwd)
+        if np.linalg.norm(flat_fwd) < 1e-9:
+            flat_fwd = np.array([0.0, 1.0, 0.0], np.float64)
+        self.target += right * right_m + flat_fwd * forward_m + world_up * up_m
+
+    def set_lens(self, *, focal_delta: float = 0.0, focus_delta: float = 0.0,
+                 aperture_scale: float = 1.0, ca_delta: float = 0.0):
+        self.focal_mm = float(np.clip(self.focal_mm + focal_delta, 12.0, 180.0))
+        self.focus_m = float(np.clip(self.focus_m + focus_delta, 0.05, 20.0))
+        self.aperture = float(np.clip(self.aperture * aperture_scale, 0.0, 0.08))
+        self.ca = float(np.clip(self.ca + ca_delta, 0.0, 0.02))
 
     def tick(self):
         self.az = (self.az + self._auto) % 360.0
@@ -2789,7 +5898,7 @@ class Camera:
         return _lookat(eye, self.target, up)
 
     def mvp(self, aspect):
-        P = _persp(math.radians(52.0), aspect, 0.005, 10.0)
+        P = _persp(self.fov_y_rad(), aspect, 0.005, 10.0)
         return (P @ self._view()).astype(np.float32)
 
     def mv(self):
@@ -2838,9 +5947,12 @@ class Renderer:
             maxlen=max(1, int(max_cached_frames)))
         self._cursor  = 0
         self._paused  = False
+        self._frame_step = 1
         self._layers  = [LAYER_OPAQUE, LAYER_ALPHA, LAYER_HIDDEN,
                          LAYER_HIDDEN, LAYER_HIDDEN, LAYER_ALPHA, LAYER_ALPHA,
-                         LAYER_ALPHA]   # 7=illum (ray field volume + spotlight cone)
+                         LAYER_ALPHA,   # 7=illum (ray field volume + spotlight cone)
+                         LAYER_HIDDEN]  # 8=sensor (path-traced overlay, key-9)
+        self.film = _default_stack()  # layered film stack; active_layer drives display
         self.cam = Camera()
 
         # Guitar model matrix: guitar-frame → world-frame (upright on stand)
@@ -2888,6 +6000,104 @@ class Renderer:
             surface_scalar   = meta['surface_scalar'],
         )
 
+    def set_sensor_image(self, tex: int, w: int, h: int) -> None:
+        """Register a RGBA32F 2-D sensor render texture for overlay display.
+
+        tex=0 disables the overlay.  Old texture is deleted if replaced.
+        """
+        if self._sensor_tex and self._sensor_tex != tex:
+            glDeleteTextures([self._sensor_tex])
+        self._sensor_tex = int(tex)
+        self._sensor_w   = int(w)
+        self._sensor_h   = int(h)
+
+    def attach_sensor_accumulator(self, acc: 'SensorAccumulator') -> None:
+        """Hand the Renderer a SensorAccumulator for progressive rendering.
+
+        The accumulator's texture is used as the sensor overlay; the
+        Renderer calls acc.tick() every frame via tick_sensor().
+        """
+        if self._sensor_acc is not None:
+            self._sensor_acc.destroy()
+        self._sensor_acc = acc
+        self._sensor_tex = acc.tex
+        self._sensor_w   = acc._w
+        self._sensor_h   = acc._h
+        acc.film = self.film   # keep film params in sync
+        self._sensor_last_tick = 0.0
+        self.sync_sensor_camera(reset=False)
+
+    def tick_sensor(self) -> None:
+        """Call once per frame to advance the sensor camera exposure.
+        Only dispatches while layer 9 is visible (ALPHA or OPAQUE).
+
+        Sen FPS is the camera frame cadence: each accepted cadence tick clears
+        the previous sensor image, then dispatches the configured rays for the
+        new frame.  Set FPS to 0 for one fresh sensor frame per display tick.
+        """
+        if (self._sensor_acc is None or self._layers[8] == LAYER_HIDDEN
+                or not self._sensor_acc._auto_advance):
+            return
+        fps = float(getattr(self, "_sensor_fps", 30.0))
+        on_cadence = False
+        if fps > 0.0:
+            now = time.monotonic()
+            if self._sensor_last_tick <= 0.0 or now - self._sensor_last_tick >= 1.0 / fps:
+                self._sensor_last_tick = now
+                on_cadence = True
+        # fps=0: continuous integration — never reset
+        if on_cadence:
+            # Cadence reset: new exposure — clear forward field and sensor image.
+            self._sensor_acc.clear_field()
+            self._sensor_acc.clear()
+        # Every display frame: stream forward rays (time-budgeted) + sensor backward pass.
+        self._sensor_acc.pump_forward(budget_ms=float(getattr(self, "_ray_budget_ms", 5.0)))
+        self._sensor_acc.tick()
+        self._sensor_tex = self._sensor_acc.tex
+        # Apply temporal decay after every tick so _decay_total is current for
+        # the blit uniforms uploaded in render().  dt_s is derived here via
+        # time.monotonic() so tick_sensor() remains the single owner of frame timing.
+        now_decay = time.monotonic()
+        _dt_decay = now_decay - getattr(self, '_decay_last_t', now_decay)
+        self._decay_last_t = now_decay
+        self._sensor_acc.apply_decay(_dt_decay)
+
+    def sync_sensor_camera(self, reset: bool = False) -> None:
+        if self._sensor_acc is None:
+            return
+        # The sensor accumulator operates in guitar-frame (physics frame:
+        # guitar on its back, Z = soundboard normal).  The Camera orbits in
+        # world-frame (Z-up, guitar upright on stand).  Apply the inverse
+        # model matrix so the sensor receives guitar-frame coordinates and
+        # the orbit controls map correctly to what the user sees on screen.
+        eye_gf = _transform_points(
+            np.asarray(self.cam.eye,    np.float32).reshape(1, 3),
+            self._guitar_Minv)[0]
+        target_gf = _transform_points(
+            np.asarray(self.cam.target, np.float32).reshape(1, 3),
+            self._guitar_Minv)[0]
+        self._sensor_acc.set_camera(
+            eye_gf, target_gf,
+            fov_deg=math.degrees(self.cam.fov_y_rad()),
+            aperture_radius=float(self.cam.aperture),
+            focus_dist=float(self.cam.focus_m),
+            ca_factor=float(self.cam.ca),
+            tilt_shift=tuple(float(v) for v in self.cam.tilt_shift))
+        if reset:
+            self.reset_sensor()
+
+    def camera_hud(self) -> str:
+        acc = self._sensor_acc
+        rays = 0
+        if acc is not None and acc._active:
+            rays = int(acc._w) * int(acc._rows_per_frame) * int(acc._samples_per_pixel)
+        return (
+            f"CAM {self.cam.focal_mm:05.1f}mm  focus {self.cam.focus_m:04.2f}m  "
+            f"ap {self.cam.aperture*1000.0:04.1f}mm  CA {self.cam.ca:0.4f}  "
+            f"shift {self.cam.tilt_shift[0]:+.2f},{self.cam.tilt_shift[1]:+.2f}  "
+            f"{rays} rays/frame"
+        )
+
     def _init_gl(self):
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -2907,6 +6117,14 @@ class Renderer:
                                (_VCOL_FS, GL_FRAGMENT_SHADER))
         self._p_march = _prog((_MARCH_VS, GL_VERTEX_SHADER),
                                (_MARCH_FS, GL_FRAGMENT_SHADER))
+        self._p_sensor_blit = _prog((_SENSOR_BLIT_VS, GL_VERTEX_SHADER),
+                                    (_SENSOR_BLIT_FS, GL_FRAGMENT_SHADER))
+        self._sensor_tex = 0
+        self._sensor_w   = 0
+        self._sensor_h   = 0
+        self._sensor_acc: 'SensorAccumulator | None' = None
+        self._sensor_fps = 30.0
+        self._sensor_last_tick = 0.0
 
         self._mk_body()
         self._mk_plate()
@@ -3043,6 +6261,25 @@ class Renderer:
         ], np.float32)
         self._lamp_vao, _, self._lamp_n = _vao(lamp, [(0,3,12,0)], GL_STATIC_DRAW)
 
+        # ── Glass bell jar + opaque skirt marking the AMR sim boundary ────────
+        # Transform guitar-frame sim bounds into world space for display.
+        _wb_min, _wb_max = _transform_bounds((self._bmin, self._bmax), self._guitar_M)
+        print(f"[belljar] guitar bmin={self._bmin} bmax={self._bmax}", flush=True)
+        print(f"[belljar] world  wb_min={_wb_min} wb_max={_wb_max}", flush=True)
+        _bell = _build_sim_belljar_world(_wb_min, _wb_max)
+        print(f"[belljar] bell verts={len(_bell)}  skirt check z_top={_wb_min[2]:.4f}", flush=True)
+        self._glass_vao, _, self._glass_n = _vao(_bell, [(0,3,24,0),(1,3,24,12)], GL_STATIC_DRAW)
+        _skirt = _build_sim_skirt_world(_wb_min, _wb_max)
+        print(f"[belljar] skirt verts={len(_skirt)}", flush=True)
+        if len(_skirt) > 0:
+            self._skirt_vao, _, self._skirt_n = _vao(_skirt, [(0,3,24,0),(1,3,24,12)], GL_STATIC_DRAW)
+        else:
+            self._skirt_vao, self._skirt_n = None, 0
+        _wire = _sim_box_wireframe_world(_wb_min, _wb_max)
+        self._simbox_edge_vao, _, self._simbox_edge_n = _vao(
+            _wire.reshape(-1, 3), [(0,3,12,0)], GL_STATIC_DRAW)
+        print(f"[belljar] glass_n={self._glass_n} skirt_n={self._skirt_n} edge_n={self._simbox_edge_n}", flush=True)
+
     def _mk_markers(self):
         R = 0.007
         lines = []
@@ -3076,38 +6313,24 @@ class Renderer:
         self._mk_amr_tbo()
 
     def _mk_amr_tbo(self):
-        """Create a GL_TEXTURE_BUFFER holding (cx,cy,cz,pressure) per AMR cell.
+        """Prepare AMR rendering metadata.
 
-        Cell centres are uploaded once here (they never move).  Only the
-        pressure component (w) is updated each frame by _up_amr_pressure().
-        When info has no 'amr_cell_centers' key this is a no-op.
+        Formerly built a GPU TBO for brute-force per-fragment IDW, but that
+        path scales as O(n_cells × fragments × march_steps) and is not viable.
+        Pressure is now scattered to the viz 3-D texture via
+        coevolver_get_pressure_field_uniform() (O(n_cells)) before each
+        frame upload, so _amr_tbo_tex stays None and the shader uses the
+        existing 3-D texture ray-march (uAMRMode=0).
         """
-        centers = self.info.get('amr_cell_centers', None)
         n = int(self.info.get('n_cells_amr', 0))
-        if centers is None or n == 0:
+        if n == 0:
             return
-        centers_f32 = np.asarray(centers, np.float32).reshape(n, 3)
-        data = np.zeros((n, 4), dtype=np.float32)
-        data[:, :3] = centers_f32
-        self._amr_cell_data = data           # kept for per-frame pressure writes
-        self._amr_n_cells   = n
+        self._amr_n_cells = n
         min_dx = float(self.info.get('amr_min_dx', self.info.get('min_dx', 0.005)))
-        self._amr_eps2      = float((min_dx * 0.5) ** 2)
-        # IDW distance power p.  p/2 is what the shader receives so it can use
-        # pow(r², -p/2) without a sqrt.  Default p=2 (classic IDW, cheapest).
-        # Set p=3 for the 3-D Shepard optimum; p=4 for sharper local detail.
+        self._amr_eps2     = float((min_dx * 0.5) ** 2)
         p = float(self.info.get('amr_idw_power', 2.0))
-        self._amr_half_pow  = p * 0.5
-
-        self._amr_tbo_buf = glGenBuffers(1)
-        glBindBuffer(GL_TEXTURE_BUFFER, self._amr_tbo_buf)
-        glBufferData(GL_TEXTURE_BUFFER, data.nbytes, data, GL_DYNAMIC_DRAW)
-        glBindBuffer(GL_TEXTURE_BUFFER, 0)
-
-        self._amr_tbo_tex = glGenTextures(1)
-        glBindTexture(GL_TEXTURE_BUFFER, self._amr_tbo_tex)
-        glTexBuffer(GL_TEXTURE_BUFFER, GL_RGBA32F, self._amr_tbo_buf)
-        glBindTexture(GL_TEXTURE_BUFFER, 0)
+        self._amr_half_pow = p * 0.5
+        # _amr_tbo_tex left None → _up_pressure uses 3-D texture path
 
     def _up_amr_pressure(self, P_flat):
         """Write new per-cell pressures into the TBO (only the w component)."""
@@ -3195,8 +6418,24 @@ class Renderer:
 
     def tick(self):
         if not self._paused and self._frames:
-            self._cursor = (self._cursor + 1) % max(1, len(self._frames))
-        self.cam.tick()
+            step = max(0, int(self._frame_step))
+            if step > 0:
+                self._cursor = (self._cursor + step) % max(1, len(self._frames))
+
+    def advance_frame(self, step: int = 1) -> None:
+        if self._frames:
+            self._cursor = (self._cursor + max(1, int(step))) % max(1, len(self._frames))
+
+    def advance_sensor(self, strips: int = 1) -> None:
+        if self._sensor_acc is not None and self._layers[8] != LAYER_HIDDEN:
+            self._sensor_acc.tick(max(1, int(strips)))
+            self._sensor_tex = self._sensor_acc.tex
+
+    def reset_sensor(self) -> None:
+        if self._sensor_acc is not None:
+            self._sensor_acc.clear()
+            self._sensor_tex = self._sensor_acc.tex
+            self._sensor_last_tick = 0.0
 
     def toggle(self, i):
         if 0 <= i < N_LAYERS:
@@ -3313,23 +6552,36 @@ class Renderer:
         glBindTexture(GL_TEXTURE_3D, 0)
 
     def _up_plate(self, disp):
-        Nx, Ny = self.info['Nx'], self.info['Ny']
-        d = disp[:Nx, :Ny]
+        d = np.asarray(disp, dtype=np.float32)
+        if d.ndim != 2:
+            d = np.reshape(d, (int(d.shape[0]), -1))
+        Nx, Ny = d.shape
+        if Nx <= 0 or Ny <= 0:
+            return
         mx = float(np.abs(d).max()) + 1e-9
-        dx = float(self.info.get('dx', DX))
-        gx_min = float(self.info['gx_min'])
-        gy_min = float(self.info['gy_min'])
-        gx = np.clip((self._plate_vxy[:, 0] - gx_min) / dx - 0.5, 0.0, Nx - 1.001)
-        gy = np.clip((self._plate_vxy[:, 1] - gy_min) / dx - 0.5, 0.0, Ny - 1.001)
-        i0 = gx.astype(np.int32); j0 = gy.astype(np.int32)
-        i1 = np.minimum(i0 + 1, Nx - 1); j1 = np.minimum(j0 + 1, Ny - 1)
-        fx = gx - i0; fy = gy - j0
-        vals = (
-            (1.0 - fx) * (1.0 - fy) * d[i0, j0]
-          + fx * (1.0 - fy) * d[i1, j0]
-          + (1.0 - fx) * fy * d[i0, j1]
-          + fx * fy * d[i1, j1]
-        ).astype(np.float32)
+        plate_origin = self.info.get('plate_origin')
+        dx = float(self.info.get('plate_dx', self.info.get('dx', DX)))
+        gx_min = float(plate_origin[0]) if plate_origin is not None else float(self.info['gx_min'])
+        gy_min = float(plate_origin[1]) if plate_origin is not None else float(self.info['gy_min'])
+        gx = np.clip((self._plate_vxy[:, 0] - gx_min) / dx - 0.5, 0.0, float(Nx - 1))
+        gy = np.clip((self._plate_vxy[:, 1] - gy_min) / dx - 0.5, 0.0, float(Ny - 1))
+        if Nx < 2 or Ny < 2:
+            i0 = np.clip(np.rint(gx).astype(np.int32), 0, Nx - 1)
+            j0 = np.clip(np.rint(gy).astype(np.int32), 0, Ny - 1)
+            vals = d[i0, j0].astype(np.float32)
+        else:
+            i0 = np.clip(np.floor(gx).astype(np.int32), 0, Nx - 2)
+            j0 = np.clip(np.floor(gy).astype(np.int32), 0, Ny - 2)
+            i1 = i0 + 1
+            j1 = j0 + 1
+            fx = gx - i0
+            fy = gy - j0
+            vals = (
+                (1.0 - fx) * (1.0 - fy) * d[i0, j0]
+              + fx * (1.0 - fy) * d[i1, j0]
+              + (1.0 - fx) * fy * d[i0, j1]
+              + fx * fy * d[i1, j1]
+            ).astype(np.float32)
         height_on = self._plate_mode in (1, 2)
         color_on = self._plate_mode in (0, 2)
         self._plate_dyn[:, 2] = self.body_h + (vals * PLATE_SCALE if height_on else 0.0)
@@ -3354,8 +6606,45 @@ class Renderer:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glViewport(0, 0, self.win_w, self.win_h)
 
+        # ── Layer 9 OPAQUE: full-screen sensor render only, no scene ──────────
+        if self._layers[8] == LAYER_OPAQUE:
+            if self._sensor_tex:
+                glDisable(GL_DEPTH_TEST)
+                glDepthMask(GL_FALSE)
+                glDisable(GL_BLEND)
+                glUseProgram(self._p_sensor_blit)
+                _blit_texs = self._sensor_acc._textures if self._sensor_acc else [self._sensor_tex]
+                for _i, _t in enumerate(_blit_texs):
+                    glActiveTexture(GL_TEXTURE0 + _i)
+                    glBindTexture(GL_TEXTURE_2D, _t)
+                    glUniform1i(glGetUniformLocation(self._p_sensor_blit, f'uSensorLayer{_i}'.encode()), _i)
+                _specs = self.film.layer_specs()
+                for _i, _sp in enumerate(_specs[:len(_blit_texs)]):
+                    glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerDark{_i}'.encode()),  *_sp['dark_rgb'])
+                    glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerLight{_i}'.encode()), *_sp['light_rgb'])
+                    glUniform2f(glGetUniformLocation(self._p_sensor_blit, f'uLayerTone{_i}'.encode()),
+                                float(_sp['shadow_point']), float(_sp['highlight_point']))
+                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uLayerCount'), len(_blit_texs))
+                _fl = self.film.active_layer
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uAlpha'),     1.0)
+                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_fl.rotate180))
+                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_fl.negative))
+                _dt = float(self._sensor_acc._decay_total) if self._sensor_acc else 1.0
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uDecayTotal'), _dt)
+                glDrawArrays(GL_TRIANGLES, 0, 3)
+                for _i in range(len(_blit_texs)):
+                    glActiveTexture(GL_TEXTURE0 + _i)
+                    glBindTexture(GL_TEXTURE_2D, 0)
+                glActiveTexture(GL_TEXTURE0)
+                glEnable(GL_DEPTH_TEST)
+                glDepthMask(GL_TRUE)
+                glEnable(GL_BLEND)
+            # Always suppress scene in OPAQUE mode regardless of sensor tex
+            return
+
         frame = self._cur()
-        if frame is None: return
 
         aspect  = self.win_w / self.win_h
         MVP     = self.cam.mvp(aspect)
@@ -3371,108 +6660,51 @@ class Renderer:
         light_w /= np.linalg.norm(light_w)
         light_v = (MV[:3,:3].T @ light_w).astype(np.float32)
 
-        self._up_pressure(frame.pressure)
-        self._up_plate(frame.plate)
-        for si, disp in enumerate(frame.strings):
-            if disp is not None and len(disp) >= 2:
-                self._up_string(si, disp)
+        if frame is not None:
+            self._up_pressure(frame.pressure)
+            self._up_plate(frame.plate)
+            for si, disp in enumerate(frame.strings):
+                if disp is not None and len(disp) >= 2:
+                    self._up_string(si, disp)
 
-        # Whether to use ray-lit surface shader for body geometry.
-        # Active when ILLUM layer (7) is not hidden and band textures exist.
-        _use_ray_surf = (
-            self._a(7) > 0.0
-            and (
-                (self._ray_field_bands is not None and len(self._ray_field_bands) >= 4)
-                or (self._baseline_light_bands is not None and len(self._baseline_light_bands) >= 4)
-            )
-        )
-
-        def _bind_body(prog, material: SurfaceMaterialSpec, alpha,
-                       mvp_mat=MVP_guitar, mv_mat=MV_guitar, model_mat=None):
-            """Bind a body-shader program with standard material uniforms.
-            For _p_ray_surface also binds band textures."""
-            if model_mat is None:
-                model_mat = self._guitar_M.astype(np.float32)
-            glUseProgram(prog)
-            _mvp(prog, mvp_mat, mv_mat, model_mat)
-            glUniform3f(glGetUniformLocation(prog, b'uLightV'), *light_v)
-            glUniform4f(glGetUniformLocation(prog, b'uColor'),
-                        material.color[0], material.color[1], material.color[2], alpha)
-            glUniform3f(glGetUniformLocation(prog, b'uInnerColor'), *material.inner_color)
-            glUniform1f(glGetUniformLocation(prog, b'uAmbient'), material.ambient)
-            glUniform1f(glGetUniformLocation(prog, b'uSpecStrength'), material.spec_strength)
-            glUniform1f(glGetUniformLocation(prog, b'uShininess'), material.shininess)
-            glUniform1f(glGetUniformLocation(prog, b'uGrain'), material.grain)
-            if prog == self._p_ray_surface:
-                use_dyn = self._ray_field_bands is not None and len(self._ray_field_bands) >= 4
-                use_base = self._baseline_light_bands is not None and len(self._baseline_light_bands) >= 4
-                glUniform1i(glGetUniformLocation(prog, b'uUseRayField'), 1 if use_dyn else 0)
-                glUniform1i(glGetUniformLocation(prog, b'uUseBaseField'), 1 if use_base else 0)
-                rf_min = self._ray_field_bounds[0] if self._ray_field_bounds is not None else self._bmin
-                rf_max = self._ray_field_bounds[1] if self._ray_field_bounds is not None else self._bmax
-                glUniform3f(glGetUniformLocation(prog, b'uBoxMin'), *rf_min)
-                glUniform3f(glGetUniformLocation(prog, b'uBoxMax'), *rf_max)
-                glUniformMatrix4fv(
-                    glGetUniformLocation(prog, b'uWorldToGrid'),
-                    1, GL_TRUE, self._guitar_Minv)
-                glUniform1f(glGetUniformLocation(prog, b'uRayExposure'),
-                            self._ray_scale_for_display())
-                glUniform1f(glGetUniformLocation(prog, b'uBaseExposure'),
-                            self._baseline_scale_for_display())
-                glUniform1f(glGetUniformLocation(prog, b'uRayGamma'),
-                            self._ray_gamma)
-                band_names = [b'uBand0', b'uBand1', b'uBand2', b'uBand3']
-                for bi, (bname, btex) in enumerate(zip(band_names, self._ray_field_bands or [])):
-                    glUniform1i(glGetUniformLocation(prog, bname), 2 + bi)
-                    glActiveTexture(GL_TEXTURE2 + bi)
-                    glBindTexture(GL_TEXTURE_3D, btex)
-                base_min = (self._baseline_light_bounds[0]
-                            if self._baseline_light_bounds is not None
-                            else _stage_light_bounds()[0])
-                base_max = (self._baseline_light_bounds[1]
-                            if self._baseline_light_bounds is not None
-                            else _stage_light_bounds()[1])
-                glUniform3f(glGetUniformLocation(prog, b'uBaseBoxMin'), *base_min)
-                glUniform3f(glGetUniformLocation(prog, b'uBaseBoxMax'), *base_max)
-                glUniformMatrix4fv(
-                    glGetUniformLocation(prog, b'uBaseWorldToGrid'),
-                    1, GL_TRUE, np.eye(4, dtype=np.float32))
-                base_names = [b'uBaseBand0', b'uBaseBand1', b'uBaseBand2', b'uBaseBand3']
-                for bi, (bname, btex) in enumerate(zip(base_names, self._baseline_light_bands or [])):
-                    glUniform1i(glGetUniformLocation(prog, bname), 6 + bi)
-                    glActiveTexture(GL_TEXTURE0 + 6 + bi)
-                    glBindTexture(GL_TEXTURE_3D, btex)
-                glActiveTexture(GL_TEXTURE0)
-
-        _body_prog = self._p_ray_surface if _use_ray_surf else self._p_body
-        body_mode = self._layers[0]
-        body_back_alpha = _layer_material_alpha(
-            body_mode,
-            opaque_alpha=_MAT_BACK.opaque_alpha,
-            alpha_alpha=_MAT_BACK.alpha_alpha)
-        body_side_alpha = _layer_material_alpha(
-            body_mode,
-            opaque_alpha=_MAT_SIDES.opaque_alpha,
-            alpha_alpha=_MAT_SIDES.alpha_alpha)
-
-        # ── 1. Back plate (opaque dark wood) ─────────────────────────────────
+        # ── 1. Back plate (opaque dark wood) ──────────────────────────────────
         a_body = self._a(0)
-        if body_back_alpha > 0:
-            _bind_body(_body_prog, _MAT_BACK, body_back_alpha)
+        if a_body > 0:
+            glUseProgram(self._p_body)
+            _mvp(self._p_body, MVP_guitar, MV_guitar)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
+            glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
+                        0.16, 0.035, 0.018, a_body * 0.96)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
+                        0.64, 0.38, 0.18)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.24)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.42)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 96.0)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.25)
             glBindVertexArray(self._back_vao)
             glDrawArrays(GL_TRIANGLE_FAN, 0, self._back_n)
 
-        # ── 2. Side walls (semi-transparent mahogany, both faces) ─────────────
-        if body_side_alpha > 0:
+        # ── 2. Side walls (semi-transparent mahogany, both faces) ──────────────
+        if a_body > 0:
             glDisable(GL_CULL_FACE)
-            glDepthMask(GL_FALSE if body_mode == LAYER_ALPHA else GL_TRUE)
-            _bind_body(_body_prog, _MAT_SIDES, body_side_alpha)
+            glDepthMask(GL_FALSE)
+            glUseProgram(self._p_body)
+            _mvp(self._p_body, MVP_guitar, MV_guitar)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
+            glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
+                        0.18, 0.035, 0.018, a_body * 0.72)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
+                        0.72, 0.44, 0.21)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.22)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.55)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 128.0)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.65)
             glBindVertexArray(self._wall_vao)
             glDrawElements(GL_TRIANGLES, self._wall_n_idx, GL_UNSIGNED_INT, None)
             glBindVertexArray(0)
             glDepthMask(GL_TRUE)
 
-        # ── 3. Outline rings (crisp wire guide) ───────────────────────────────
+        # ── 3. Outline rings ───────────────────────────────────────────────────
         if a_body > 0:
             glUseProgram(self._p_line)
             _mvp(self._p_line, MVP_guitar)
@@ -3563,21 +6795,76 @@ class Renderer:
             glEnable(GL_DEPTH_TEST)
             glDepthMask(GL_TRUE)
 
-        # ── 4a. Neutral diffusive room / stage ───────────────────────────────
+        # ── 4a. Stage ─────────────────────────────────────────────────────────
         a_stage = self._a(6)
         if a_stage > 0:
-            glEnable(GL_CULL_FACE)
-            _bind_body(_body_prog,
-                       _MAT_STAGE,
-                       a_stage * _MAT_STAGE.alpha_alpha,
-                       mvp_mat=MVP, mv_mat=MV,
-                       model_mat=np.eye(4, dtype=np.float32))
+            glUseProgram(self._p_body)
+            _mvp(self._p_body, MVP, MV)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
+            glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
+                        0.46, 0.45, 0.42, a_stage * 0.72)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
+                        0.46, 0.45, 0.42)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.34)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.04)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 12.0)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.08)
             glBindVertexArray(self._stage_vao)
             glDrawArrays(GL_TRIANGLES, 0, self._stage_n)
-            glDisable(GL_CULL_FACE)
+            glUseProgram(self._p_line)
+            _mvp(self._p_line, MVP)
+            glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
+                        1.0, 0.90, 0.62, a_stage * 0.55)
+            glBindVertexArray(self._lamp_vao)
+            glDrawArrays(GL_TRIANGLE_FAN, 0, self._lamp_n)
 
-        # ── 4b. Cached room light volume (ILLUM layer — key 8) ─────────────────
-        if self._baseline_light_bands is not None and self._a(7) > 0.0:
+        # ── 4a-skirt. Opaque base skirt below the sim boundary ────────────────
+        if self._skirt_vao is not None and self._skirt_n > 0:
+            glUseProgram(self._p_body)
+            _mvp(self._p_body, MVP, MV)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
+            glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
+                        0.22, 0.20, 0.18, 0.88)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
+                        0.22, 0.20, 0.18)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.30)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.02)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 8.0)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.12)
+            glBindVertexArray(self._skirt_vao)
+            glDrawArrays(GL_TRIANGLES, 0, self._skirt_n)
+
+        # ── 4a-glass. Semi-transparent bell jar (exact sim boundary) ──────────
+        glDepthMask(GL_FALSE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glUseProgram(self._p_body)
+        _mvp(self._p_body, MVP, MV)
+        glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
+        glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
+                    0.86, 0.92, 0.96, 0.11)
+        glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
+                    0.86, 0.92, 0.96)
+        glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.14)
+        glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.92)
+        glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 200.0)
+        glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.0)
+        glBindVertexArray(self._glass_vao)
+        glDrawArrays(GL_TRIANGLES, 0, self._glass_n)
+        # Crisp wireframe tracing the exact inner sim boundary
+        glBlendFunc(GL_ONE, GL_ONE)
+        glUseProgram(self._p_line)
+        _mvp(self._p_line, MVP)
+        glLineWidth(1.0)
+        glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
+                    0.68, 0.86, 1.00, 0.55)
+        glBindVertexArray(self._simbox_edge_vao)
+        glDrawArrays(GL_LINES, 0, self._simbox_edge_n)
+        glDepthMask(GL_TRUE)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # ── 4b. Cached room light volume ─────────────────────────────────────
+        if self._baseline_light_bands is not None:
             lb_min = self._baseline_light_bounds[0] if self._baseline_light_bounds is not None else _stage_light_bounds()[0]
             lb_max = self._baseline_light_bounds[1] if self._baseline_light_bounds is not None else _stage_light_bounds()[1]
             glDepthMask(GL_FALSE)
@@ -3601,15 +6888,19 @@ class Renderer:
             glUniform1i(glGetUniformLocation(self._p_march, b'uUseBodyMask'), 0)
             glUniform1f(glGetUniformLocation(self._p_march, b'uZClipMin'), float(lb_min[2]))
             glUniform1f(glGetUniformLocation(self._p_march, b'uZClipMax'), float(lb_max[2]))
-            for bi, (bname, btex) in enumerate(zip([b'uBand0', b'uBand1', b'uBand2', b'uBand3'],
-                                                   self._baseline_light_bands)):
-                glUniform1i(glGetUniformLocation(self._p_march, bname), 2 + bi)
+            _lspecs = self.film.layer_specs()
+            glUniform1i(glGetUniformLocation(self._p_march, b'uLayerCount'), len(_lspecs))
+            for _bi, _sp in enumerate(_lspecs):
+                glUniform3f(glGetUniformLocation(self._p_march, f'uLayerDark{_bi}'.encode()),  *_sp['dark_rgb'])
+                glUniform3f(glGetUniformLocation(self._p_march, f'uLayerLight{_bi}'.encode()), *_sp['light_rgb'])
+            for bi, btex in enumerate(self._baseline_light_bands):
+                glUniform1i(glGetUniformLocation(self._p_march, f'uLayer{bi}'.encode()), 2 + bi)
                 glActiveTexture(GL_TEXTURE2 + bi)
                 glBindTexture(GL_TEXTURE_3D, btex)
             glActiveTexture(GL_TEXTURE0)
             glBindVertexArray(self._quad_vao)
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4)
-            for bi in range(4):
+            for bi in range(len(self._baseline_light_bands)):
                 glActiveTexture(GL_TEXTURE2 + bi)
                 glBindTexture(GL_TEXTURE_3D, 0)
             glActiveTexture(GL_TEXTURE0)
@@ -3617,7 +6908,7 @@ class Renderer:
             glDepthMask(GL_TRUE)
 
         # ── 4c. Guitar-added ray field volume (ILLUM layer — key 8) ───────────
-        if self._ray_field_bands is not None and self._a(7) > 0.0:
+        if self._a(7) > 0 and self._ray_field_bands is not None:
             rf_min = self._ray_field_bounds[0] if self._ray_field_bounds is not None else self._bmin
             rf_max = self._ray_field_bounds[1] if self._ray_field_bounds is not None else self._bmax
             glDepthMask(GL_FALSE)
@@ -3656,19 +6947,23 @@ class Renderer:
                         float(rf_min[2]))
             glUniform1f(glGetUniformLocation(self._p_march, b'uZClipMax'),
                         float(rf_max[2]))
+            _lspecs = self.film.layer_specs()
+            glUniform1i(glGetUniformLocation(self._p_march, b'uLayerCount'), len(_lspecs))
+            for _bi, _sp in enumerate(_lspecs):
+                glUniform3f(glGetUniformLocation(self._p_march, f'uLayerDark{_bi}'.encode()),  *_sp['dark_rgb'])
+                glUniform3f(glGetUniformLocation(self._p_march, f'uLayerLight{_bi}'.encode()), *_sp['light_rgb'])
             glActiveTexture(GL_TEXTURE1)
             glBindTexture(GL_TEXTURE_2D, self._mask_tex)
-            # Bind 4 spectral band textures to units 2-5
-            band_names = [b'uBand0', b'uBand1', b'uBand2', b'uBand3']
-            for bi, (bname, btex) in enumerate(zip(band_names, self._ray_field_bands)):
-                glUniform1i(glGetUniformLocation(self._p_march, bname), 2 + bi)
+            # Bind N spectral layer textures to units 2+
+            for bi, btex in enumerate(self._ray_field_bands):
+                glUniform1i(glGetUniformLocation(self._p_march, f'uLayer{bi}'.encode()), 2 + bi)
                 glActiveTexture(GL_TEXTURE2 + bi)
                 glBindTexture(GL_TEXTURE_3D, btex)
             glActiveTexture(GL_TEXTURE0)
             glBindVertexArray(self._quad_vao)
             glDrawArrays(GL_TRIANGLE_FAN, 0, 4)
-            # Unbind all 4 band textures
-            for bi in range(4):
+            # Unbind all layer textures
+            for bi in range(len(self._ray_field_bands)):
                 glActiveTexture(GL_TEXTURE2 + bi)
                 glBindTexture(GL_TEXTURE_3D, 0)
             glActiveTexture(GL_TEXTURE1)
@@ -3682,16 +6977,10 @@ class Renderer:
         if a_plate > 0 and self._plate_n > 0:
             glUseProgram(self._p_plate)
             _mvp(self._p_plate, MVP_guitar, MV_guitar)
-            glUniform3f(glGetUniformLocation(self._p_plate, b'uLightV'),
-                        *light_v)
-            glUniform1f(
-                glGetUniformLocation(self._p_plate, b'uAlpha'),
-                _layer_material_alpha(
-                    self._layers[1],
-                    opaque_alpha=_MAT_PLATE.opaque_alpha,
-                    alpha_alpha=_MAT_PLATE.alpha_alpha))
+            glUniform3f(glGetUniformLocation(self._p_plate, b'uLightV'), *light_v)
+            glUniform1f(glGetUniformLocation(self._p_plate, b'uAlpha'), a_plate)
             glUniform1f(glGetUniformLocation(self._p_plate, b'uColorMix'),
-                        _MAT_PLATE.color_mix if self._plate_mode in (0, 2) else 0.0)
+                        1.0 if self._plate_mode in (0, 2) else 0.0)
             glBindVertexArray(self._plate_vao)
             glDrawElements(GL_TRIANGLES, self._plate_n, GL_UNSIGNED_INT, None)
             glBindVertexArray(0)
@@ -3705,15 +6994,25 @@ class Renderer:
             glBindVertexArray(self._hole_vao)
             glDrawArrays(GL_TRIANGLE_FAN, 0, self._hole_n)
 
-        # ── 7. Strings ────────────────────────────────────────────────────────
+        # ── 7. Strings ─────────────────────────────────────────────────────────
         a_str = self._a(3)
         if a_str > 0:
-            _bind_body(self._p_body, _MAT_NECK, a_str * _MAT_NECK.opaque_alpha)
+            glUseProgram(self._p_body)
+            _mvp(self._p_body, MVP_guitar, MV_guitar)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
+            glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
+                        0.20, 0.085, 0.035, a_str * 0.95)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
+                        0.50, 0.28, 0.12)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.26)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.36)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 88.0)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.55)
             glBindVertexArray(self._neck_vao)
             glDrawArrays(GL_TRIANGLES, 0, self._neck_n)
 
             glEnable(GL_BLEND)
-            glBlendFunc(GL_ONE, GL_ONE)          # additive — strings glow into scene
+            glBlendFunc(GL_ONE, GL_ONE)
             glUseProgram(self._p_line)
             _mvp(self._p_line, MVP_guitar)
             glLineWidth(1.2)
@@ -3721,12 +7020,6 @@ class Renderer:
                         0.95, 0.82, 0.52, a_str * 0.50)
             glBindVertexArray(self._fret_vao)
             glDrawArrays(GL_LINES, 0, self._fret_n)
-            if self.active_fret > 0:
-                glLineWidth(3.0 if self.fretless else 2.4)
-                glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
-                            0.40, 0.85, 1.0, a_str * (0.65 if self.fretless else 0.85))
-                glBindVertexArray(self._anchor_vao)
-                glDrawArrays(GL_LINES, 0, self._anchor_n)
             glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
                         0.88, 0.74, 0.46, a_str * 0.70)
             glBindVertexArray(self._pin_vao)
@@ -3742,12 +7035,18 @@ class Renderer:
                 if si < len(self._ext_str_vaos):
                     glBindVertexArray(self._ext_str_vaos[si])
                     glDrawArrays(GL_LINE_STRIP, 0, self._ext_str_n[si])
-                glBindVertexArray(self._str_vaos[si])
-                glDrawArrays(GL_LINE_STRIP, 0, self._str_n[si])
+                if self._str_physical_mode:
+                    glBindVertexArray(self._str_env_hi_vaos[si])
+                    glDrawArrays(GL_LINE_STRIP, 0, self._str_n[si])
+                    glBindVertexArray(self._str_env_lo_vaos[si])
+                    glDrawArrays(GL_LINE_STRIP, 0, self._str_n[si])
+                else:
+                    glBindVertexArray(self._str_vaos[si])
+                    glDrawArrays(GL_LINE_STRIP, 0, self._str_n[si])
             glBindVertexArray(0)
-            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)  # restore
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        # ── 8. Bridge / pickup / mic markers ─────────────────────────────────
+        # ── 8. Bridge markers ──────────────────────────────────────────────────
         a_mk = self._a(4)
         if a_mk > 0 and self._mk_n > 0:
             glUseProgram(self._p_line)
@@ -3757,18 +7056,6 @@ class Renderer:
                         1.0, 1.0, 0.5, a_mk * 0.85)
             glBindVertexArray(self._mk_vao)
             glDrawArrays(GL_LINES, 0, self._mk_n)
-            if self.show_pickup:
-                glLineWidth(2.6)
-                glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
-                            0.2, 0.9, 1.0, a_mk * 0.80)
-                glBindVertexArray(self._pickup_vao)
-                glDrawArrays(GL_LINE_LOOP, 0, self._pickup_n)
-            if self.show_mic:
-                glLineWidth(1.8)
-                glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
-                            1.0, 0.45, 0.85, a_mk * 0.85)
-                glBindVertexArray(self._mic_vao)
-                glDrawArrays(GL_LINES, 0, self._mic_n)
             glBindVertexArray(0)
 
         # ── 9. Ray-tracer segments ─────────────────────────────────────────────
@@ -3776,17 +7063,893 @@ class Renderer:
         if a_ray > 0 and self._ray_vao is not None:
             glDepthMask(GL_FALSE)
             glUseProgram(self._p_vcol)
-            _mvp(self._p_vcol, MVP_guitar)
+            _mvp(self._p_vcol, MVP)
             glLineWidth(1.0)
             glBindVertexArray(self._ray_vao)
             glDrawArrays(GL_LINES, 0, self._ray_n)
             glBindVertexArray(0)
             glDepthMask(GL_TRUE)
 
+        # ── Layer 9 (index 8): sensor render overlay ──────────────────────────
+        # Composites the path-traced RGBA32F image on top of the 3-D scene.
+        # OPAQUE → full opacity (α=1); ALPHA → semi-transparent (α=0.72).
+        if self._sensor_tex and self._layers[8] != LAYER_HIDDEN:
+            sensor_alpha = 1.0 if self._layers[8] == LAYER_OPAQUE else 0.72
+            glDisable(GL_DEPTH_TEST)
+            glDepthMask(GL_FALSE)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glUseProgram(self._p_sensor_blit)
+            _blit_texs = self._sensor_acc._textures if self._sensor_acc else [self._sensor_tex]
+            for _i, _t in enumerate(_blit_texs):
+                glActiveTexture(GL_TEXTURE0 + _i)
+                glBindTexture(GL_TEXTURE_2D, _t)
+                glUniform1i(glGetUniformLocation(self._p_sensor_blit, f'uSensorLayer{_i}'.encode()), _i)
+            _specs = self.film.layer_specs()
+            for _i, _sp in enumerate(_specs[:len(_blit_texs)]):
+                glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerDark{_i}'.encode()),  *_sp['dark_rgb'])
+                glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerLight{_i}'.encode()), *_sp['light_rgb'])
+                glUniform2f(glGetUniformLocation(self._p_sensor_blit, f'uLayerTone{_i}'.encode()),
+                            float(_sp['shadow_point']), float(_sp['highlight_point']))
+            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uLayerCount'), len(_blit_texs))
+            _fl = self.film.active_layer
+            glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
+            glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
+            glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uAlpha'),     sensor_alpha)
+            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_fl.rotate180))
+            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_fl.negative))
+            _dt = float(self._sensor_acc._decay_total) if self._sensor_acc else 1.0
+            glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uDecayTotal'), _dt)
+            glDrawArrays(GL_TRIANGLES, 0, 3)
+            for _i in range(len(_blit_texs)):
+                glActiveTexture(GL_TEXTURE0 + _i)
+                glBindTexture(GL_TEXTURE_2D, 0)
+            glActiveTexture(GL_TEXTURE0)
+            glEnable(GL_DEPTH_TEST)
+            glDepthMask(GL_TRUE)
+
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Quality slider HUD
+# Sensor accumulator — progressive per-frame path-tracing
 # ─────────────────────────────────────────────────────────────────────────────
+
+class SensorAccumulator:
+    """Owns the persistent RGBA32F sensor texture and dispatches a few rows of
+    the GPU sensor compute shader each frame, accumulating indefinitely.
+
+    The blit shader divides .rgb / .a to get the running per-pixel mean, so
+    quality improves continuously without re-clearing.
+
+    Usage:
+        acc = SensorAccumulator(ssbo_tris, ssbo_nodes, ssbo_ids, n_tris,
+                                n_bvh_nodes, tex_bands, bmin, bmax, dims,
+                                camera_eye, camera_target,
+                                sensor_w, sensor_h,
+                                rows_per_frame=16, fov_deg=52.0,
+                                max_bounces=RAY_MAX_BOUNCES,
+                                ray_field_scale=6.0, ray_field_gamma=0.55,
+                                vol_alpha=1.0, vol_steps=64)
+        acc.tick()          # call once per frame; returns immediately
+        tex = acc.tex       # current RGBA32F texture
+        acc.destroy()       # free GL resources when done
+    """
+
+    def __init__(self, ssbo_tris, ssbo_nodes, ssbo_ids, n_tris, n_bvh_nodes,
+                 tex_bands, bmin, bmax, dims,
+                 camera_eye, camera_target,
+                 sensor_w: int, sensor_h: int,
+                 rows_per_frame: int = 16,
+                 fov_deg: float = 52.0,
+                 max_bounces: int = RAY_MAX_BOUNCES,
+                 aperture_radius: float = 0.0,
+                 focus_dist: float = 1.6,
+                 ca_factor: float = 0.0,
+                 tilt_shift: tuple[float, float] = (0.0, 0.0),
+                 ray_field_scale: float = 6.0,
+                 ray_field_gamma: float = 0.55,
+                 vol_alpha: float = 1.0,
+                 vol_steps: int = 64):
+        import math
+        from OpenGL.GL import (glGenTextures, glBindTexture, glTexImage2D,
+                               glTexParameteri, GL_TEXTURE_2D, GL_RGBA32F,
+                               GL_RGBA, GL_FLOAT, GL_TEXTURE_MIN_FILTER,
+                               GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S,
+                               GL_TEXTURE_WRAP_T, GL_NEAREST, GL_CLAMP_TO_EDGE,
+                               glClearTexImage, glDeleteTextures, glDeleteProgram)
+        from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
+
+        self._w = int(sensor_w)
+        self._h = int(sensor_h)
+        self._rows_per_frame = max(1, int(rows_per_frame))
+        self._row_off = 0
+        self._pass   = 0   # how many full image passes completed
+        self._frame  = 0   # total tick() calls
+        self._active = True
+        self._auto_advance = True
+        self._samples_per_pixel = 1
+        self._sprinkle = True
+
+        self._eye = np.zeros(3, np.float32)
+        self._right = np.array([1,0,0], np.float32)
+        self._up = np.array([0,1,0], np.float32)
+        self._fwd = np.array([0,0,1], np.float32)
+        self._fov_tan = 1.0
+        self._aspect  = float(self._w) / float(max(1, self._h))
+        self._aperture_radius = max(0.0, float(aperture_radius))
+        self._focus_dist = max(0.01, float(focus_dist))
+        self._ca_factor = max(0.0, float(ca_factor))
+        self._tilt_shift = np.asarray(tilt_shift, np.float32).ravel()[:2]
+        if self._tilt_shift.size < 2:
+            self._tilt_shift = np.zeros(2, np.float32)
+        self.set_camera(camera_eye, camera_target, fov_deg=fov_deg)
+        self._bmin    = np.asarray(bmin, np.float32)
+        self._bmax    = np.asarray(bmax, np.float32)
+        self._dims    = dims
+        self._tex_bands   = tex_bands
+        self._ssbo_tris   = int(ssbo_tris)
+        self._ssbo_nodes  = int(ssbo_nodes)
+        self._ssbo_ids    = int(ssbo_ids)
+        self._n_tris      = int(n_tris)
+        self._n_bvh_nodes = int(n_bvh_nodes)
+        self._rfs  = float(ray_field_scale)
+        self._rfg  = float(ray_field_gamma)
+        self._va   = float(vol_alpha)
+        self._vs   = int(vol_steps)
+        self._max_bounces = max(1, int(max_bounces))
+        # Forward emission state — populated by update_sources() after construction
+        self._fwd_prog = 0
+        self._ssbo_sources_fwd = 0
+        self._ssbo_seg_dummy = 0
+        self._ssbo_counter_fwd = 0
+        self._sources_list: list = []        # [(pos, dir, n_rays, spectrum), ...]
+        self._source_records_np: np.ndarray | None = None
+        self._n_sources = 0
+        self._dispatch_batch_fwd = 512
+        self._air_ds = 0.35
+        self._air_ss = 0.65
+        self._air_an = 12.0
+        self._medium_extinction = 0.5
+        self._fwd_frame = 0
+        # ── Streaming source worker ──────────────────────────────────────────
+        self._source_worker: _SourceWorker | None = None
+        self._dispatch_ring: list = []    # list of (si, batch_offset, batch_size)
+        self._ring_cursor: int = 0        # rotating position in dispatch_ring
+        self.film: FilmStack = _default_stack()
+
+        # ── Temporal decay state ──────────────────────────────────────────────
+        # half_life: 0.0 = stable (no decay); >0 = seconds for display to reach
+        # 50% brightness after source goes silent.
+        self.half_life: float = 0.0
+        # Accumulated product of per-frame decay factors applied during silence.
+        # Reset to 1.0 when a source dispatch occurs.  Sent to the blit shader
+        # as uDecayTotal so the display fades at the correct half-life rate
+        # without any per-pixel time tracking on the GPU.
+        self._decay_total: float = 1.0
+        # Flag set by pump_forward() when at least one forward-ray batch is
+        # dispatched; consumed (and cleared) by apply_decay().
+        self._source_dispatched: bool = False
+        self._decay_prog: int = 0
+        _decay_compiled = _prog((_GPU_DECAY_CS, GL_COMPUTE_SHADER))
+        from OpenGL.GL import glGetProgramInfoLog
+        if glGetProgramiv(_decay_compiled, GL_LINK_STATUS):
+            self._decay_prog = _decay_compiled
+        else:
+            log = glGetProgramInfoLog(_decay_compiled)
+            print(f"  [SensorAccumulator] decay shader LINK FAILED:\n{log}", flush=True)
+            glDeleteProgram(_decay_compiled)
+
+        # One RGBA32F accumulation texture per film layer — held independently in memory
+        _n_out = max(1, len(tex_bands))
+        self._textures: list[int] = [int(t) for t in glGenTextures(_n_out)]
+        for _t in self._textures:
+            glBindTexture(GL_TEXTURE_2D, _t)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, self._w, self._h, 0,
+                         GL_RGBA, GL_FLOAT, None)
+            for _p, _v in [(GL_TEXTURE_MIN_FILTER, GL_NEAREST),
+                           (GL_TEXTURE_MAG_FILTER, GL_NEAREST),
+                           (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE),
+                           (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)]:
+                glTexParameteri(GL_TEXTURE_2D, _p, _v)
+            glClearTexImage(_t, 0, GL_RGBA, GL_FLOAT, np.zeros(4, np.float32))
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+        # Compile compute shader once
+        from OpenGL.GL import glGetProgramInfoLog
+        self._prog = _prog((_GPU_SENSOR_CS, GL_COMPUTE_SHADER))
+        if not glGetProgramiv(self._prog, GL_LINK_STATUS):
+            log = glGetProgramInfoLog(self._prog)
+            print(f"  [SensorAccumulator] compute shader LINK FAILED:\n{log}", flush=True)
+            glDeleteProgram(self._prog)
+            self._prog = 0
+            self._active = False
+        else:
+            print(f"  [SensorAccumulator] compute shader linked OK  {self._w}x{self._h}  rows_per_frame={self._rows_per_frame}", flush=True)
+        self._gx = max(1, int(math.ceil(self._w / 16.0)))
+
+    @property
+    def tex(self) -> int:
+        """Return the output texture for the currently active film layer."""
+        if not self._textures:
+            return 0
+        names = list(self.film.layers.keys())
+        try:
+            idx = names.index(self.film.active)
+        except ValueError:
+            idx = 0
+        return self._textures[min(idx, len(self._textures) - 1)]
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    def update_sources(self, sources_list: list, source_records_np: np.ndarray,
+                       dispatch_batch: int = 512,
+                       air_diffuse_scatter: float = 0.35,
+                       air_specular_scatter: float = 0.65,
+                       air_anisotropy: float = 12.0,
+                       medium_extinction: float = 0.5) -> None:
+        """Store source data for per-frame forward re-emission.
+
+        sources_list  — list of (pos, dir, n_rays, spectrum) tuples
+        source_records_np — shape (N,12) float32 SSBO data for BDPT connections
+        """
+        from OpenGL.GL import (glGenBuffers, glBindBuffer, glBufferData,
+                               glBufferSubData, glDeleteBuffers,
+                               GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, GL_DYNAMIC_DRAW)
+        self._sources_list = list(sources_list)
+        self._source_records_np = np.ascontiguousarray(source_records_np, np.float32)
+        self._n_sources = len(self._sources_list)
+        self._dispatch_batch_fwd = max(128, int(dispatch_batch))
+        self._air_ds = float(air_diffuse_scatter)
+        self._air_ss = float(air_specular_scatter)
+        self._air_an = float(air_anisotropy)
+        self._medium_extinction = float(medium_extinction)
+        # (Re-)upload source records SSBO
+        if self._ssbo_sources_fwd:
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_sources_fwd)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, self._source_records_np.nbytes,
+                         self._source_records_np, GL_STATIC_DRAW)
+        else:
+            self._ssbo_sources_fwd = int(glGenBuffers(1))
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_sources_fwd)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, self._source_records_np.nbytes,
+                         self._source_records_np, GL_STATIC_DRAW)
+        # Dummy segment SSBO (segment capture disabled during live re-emit)
+        if not self._ssbo_seg_dummy:
+            self._ssbo_seg_dummy = int(glGenBuffers(1))
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_seg_dummy)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, 64, None, GL_DYNAMIC_DRAW)
+        # Counter SSBO
+        if not self._ssbo_counter_fwd:
+            self._ssbo_counter_fwd = int(glGenBuffers(1))
+            counter = np.zeros(4, np.uint32)
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_counter_fwd)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, counter.nbytes, counter, GL_DYNAMIC_DRAW)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+        # Compile forward shader if not already done
+        if not self._fwd_prog:
+            from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
+            self._fwd_prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
+            if not glGetProgramiv(self._fwd_prog, GL_LINK_STATUS):
+                from OpenGL.GL import glDeleteProgram
+                glDeleteProgram(self._fwd_prog)
+                self._fwd_prog = 0
+                print("  [SensorAccumulator] forward shader LINK FAILED", flush=True)
+            else:
+                print(f"  [SensorAccumulator] forward shader linked OK  "
+                      f"{self._n_sources} sources", flush=True)
+
+    # ------------------------------------------------------------------
+    def tick_forward(self) -> None:
+        """Clear band textures and re-emit forward rays from all sources
+        with fresh random seeds.  Called every sensor-frame cadence tick
+        so the field is never stale."""
+        if not self._fwd_prog or not self._sources_list:
+            return
+        from OpenGL.GL import (
+            glUseProgram, glBindBufferBase, glBindBuffer, glBufferSubData,
+            GL_SHADER_STORAGE_BUFFER,
+            glBindImageTexture, GL_READ_WRITE, GL_R32UI,
+            glUniform1i, glUniform1f, glUniform3f, glUniform4f,
+            glGetUniformLocation, glUniform3i,
+            glDispatchCompute, glMemoryBarrier,
+            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+            GL_SHADER_STORAGE_BARRIER_BIT,
+            GL_TEXTURE_FETCH_BARRIER_BIT,
+            glClearTexImage, glBindTexture, GL_TEXTURE_3D,
+            GL_RED_INTEGER, GL_UNSIGNED_INT,
+        )
+        import math
+        prog = self._fwd_prog
+        # Just emit — never clear here.  Band textures accumulate forever until
+        # an explicit clear_field() call on cadence reset.
+        glUseProgram(prog)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, self._ssbo_nodes)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, self._ssbo_ids)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, self._ssbo_seg_dummy)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, self._ssbo_counter_fwd)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, self._ssbo_sources_fwd)
+        # Bind band images for atomic-add streaming accumulation
+        for band_idx, tex in enumerate(self._tex_bands):
+            glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
+
+        def _u1i(n, v): glUniform1i(glGetUniformLocation(prog, n), int(v))
+        def _u1f(n, v): glUniform1f(glGetUniformLocation(prog, n), float(v))
+        def _u3f(n, x, y, z): glUniform3f(glGetUniformLocation(prog, n), float(x), float(y), float(z))
+        def _u4f(n, x, y, z, w): glUniform4f(glGetUniformLocation(prog, n), float(x), float(y), float(z), float(w))
+
+        _u1i(b'uTriCount',          self._n_tris)
+        _u1i(b'uNodeCount',         self._n_bvh_nodes)
+        _u1i(b'uSegmentCap',        0)
+        _u1i(b'uSegmentStride',     4)
+        _u1i(b'uSourceCount',       self._n_sources)
+        _u1i(b'uMaxBounces',        self._max_bounces)
+        _u1i(b'uMode',              0)
+        _u1i(b'uDiagnosticsEnabled',0)
+        _u1i(b'uSegmentCapture',    0)
+        _u3f(b'uBoxMin',            *self._bmin)
+        _u3f(b'uBoxMax',            *self._bmax)
+        glUniform3i(glGetUniformLocation(prog, b'uDims'),
+                    int(self._dims[0]), int(self._dims[1]), int(self._dims[2]))
+        _u1f(b'uVolumeStepMeters',  0.003)
+        _u1f(b'uMediumScattering',  1.0)
+        _u1f(b'uMediumExtinction',  0.5)
+        _u1f(b'uAirDiffuseScatter', self._air_ds)
+        _u1f(b'uAirSpecularScatter',self._air_ss)
+        _u1f(b'uAirAnisotropy',     self._air_an)
+        _specs = self.film.layer_specs()
+        glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), len(_specs))
+        for _i, _sp_layer in enumerate(_specs):
+            glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), _sp_layer['center_hz'])
+            glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), _sp_layer['width_oct'])
+            glUniform1f(glGetUniformLocation(prog, f'uLayerGains[{_i}]'.encode()),     _sp_layer['gain'])
+        # 4. Dispatch one batch per source with fresh per-frame seed
+        base_seed = self._fwd_frame * 6271 + 1337
+        batch = self._dispatch_batch_fwd
+        for si, _src_entry in enumerate(self._sources_list):
+            sp, sd, n_rays, spectrum = _src_entry[0], _src_entry[1], _src_entry[2], _src_entry[3]
+            _src_radius   = float(_src_entry[4]) if len(_src_entry) > 4 else 0.0
+            _src_cone_cos = float(_src_entry[5]) if len(_src_entry) > 5 else -1.0
+            seed = base_seed + si * 104729
+            _u1i(b'uSeed',              seed & 0x7FFFFFFF)
+            _u1i(b'uTotalRaysPerSource',max(1, int(n_rays)))
+            _u3f(b'uSrcPos',            *np.asarray(sp, np.float32).ravel()[:3])
+            _u3f(b'uSrcDir',            *np.asarray(sd, np.float32).ravel()[:3])
+            spec = np.asarray(spectrum, np.float32).ravel()
+            _u4f(b'uSrcSpectrum',       float(spec[0]), float(spec[1]),
+                                        float(spec[2]), float(spec[3]))
+            glUniform1f(glGetUniformLocation(prog, b'uSrcRadius'),  _src_radius)
+            glUniform1f(glGetUniformLocation(prog, b'uSrcConeCos'), _src_cone_cos)
+            offset = 0
+            while offset < n_rays:
+                b_ = min(batch, n_rays - offset)
+                _u1i(b'uBatchSize',   b_)
+                _u1i(b'uBatchOffset', offset)
+                n_groups = max(1, int(math.ceil(b_ / 128.0)))
+                gx = min(n_groups, 65535)
+                gy = max(1, int(math.ceil(n_groups / gx)))
+                glDispatchCompute(gx, gy, 1)
+                glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                                GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                                GL_TEXTURE_FETCH_BARRIER_BIT)
+                offset += b_
+        glUseProgram(0)
+        self._fwd_frame += 1
+
+    def set_camera(self, camera_eye, camera_target, *, fov_deg: float,
+                   aperture_radius: float | None = None,
+                   focus_dist: float | None = None,
+                   ca_factor: float | None = None,
+                   tilt_shift=None) -> None:
+        eye    = np.asarray(camera_eye,    np.float32).ravel()[:3]
+        target = np.asarray(camera_target, np.float32).ravel()[:3]
+        fwd    = target - eye
+        fwd_l  = float(np.linalg.norm(fwd))
+        fwd    = (fwd / fwd_l if fwd_l > 1e-6 else np.array([0,0,1], np.float32)).astype(np.float32)
+        world_up = np.array([0,1,0], np.float32)
+        if abs(float(np.dot(fwd, world_up))) > 0.97:
+            world_up = np.array([0,0,1], np.float32)
+        right = np.cross(fwd, world_up); right /= max(float(np.linalg.norm(right)), 1e-9)
+        up    = np.cross(right, fwd);    up    /= max(float(np.linalg.norm(up)),    1e-9)
+        self._eye   = eye
+        self._right = right.astype(np.float32)
+        self._up    = up.astype(np.float32)
+        self._fwd   = fwd
+        self._fov_tan = float(math.tan(math.radians(float(fov_deg)) * 0.5))
+        if aperture_radius is not None:
+            self._aperture_radius = max(0.0, float(aperture_radius))
+        if focus_dist is not None:
+            self._focus_dist = max(0.01, float(focus_dist))
+        if ca_factor is not None:
+            self._ca_factor = max(0.0, float(ca_factor))
+        if tilt_shift is not None:
+            ts = np.asarray(tilt_shift, np.float32).ravel()[:2]
+            if ts.size >= 2:
+                self._tilt_shift = ts.astype(np.float32)
+
+    def set_lens(self, *, aperture_radius: float | None = None,
+                 focus_dist: float | None = None,
+                 ca_factor: float | None = None,
+                 tilt_shift=None) -> None:
+        if aperture_radius is not None:
+            self._aperture_radius = max(0.0, float(aperture_radius))
+        if focus_dist is not None:
+            self._focus_dist = max(0.01, float(focus_dist))
+        if ca_factor is not None:
+            self._ca_factor = max(0.0, float(ca_factor))
+        if tilt_shift is not None:
+            ts = np.asarray(tilt_shift, np.float32).ravel()[:2]
+            if ts.size >= 2:
+                self._tilt_shift = ts.astype(np.float32)
+
+    def tick(self, strips: int = 1):
+        """Dispatch one strip of rows into the accumulation texture.
+
+        Safe to call every frame — each call does at most `rows_per_frame`
+        rows of 16-pixel workgroups (a small fraction of the full image).
+        """
+        if not self._active or not self._prog:
+            return
+        from OpenGL.GL import (glUseProgram, glBindBufferBase,
+                               GL_SHADER_STORAGE_BUFFER,
+                               glActiveTexture, glBindTexture,
+                               GL_TEXTURE_2D, GL_TEXTURE_3D,
+                               GL_TEXTURE0, glUniform1i, glUniform1f, glUniform4f,
+                               glUniform2i, glUniform3i, glUniform3f,
+                               glBindImageTexture, GL_READ_WRITE, GL_RGBA32F,
+                               glDispatchCompute, glMemoryBarrier,
+                               GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                               glGetUniformLocation)
+        import math
+
+        strips = max(1, int(strips))
+        for _strip in range(strips):
+            self._dispatch_once()
+
+    def _dispatch_once(self):
+        from OpenGL.GL import (glUseProgram, glBindBufferBase,
+                               GL_SHADER_STORAGE_BUFFER,
+                               glActiveTexture, glBindTexture,
+                               GL_TEXTURE_2D, GL_TEXTURE_3D,
+                               GL_TEXTURE0, glUniform1i, glUniform1f, glUniform2f, glUniform4f,
+                               glUniform2i, glUniform3i, glUniform3f,
+                               glBindImageTexture, GL_READ_WRITE, GL_RGBA32F,
+                               glDispatchCompute, glMemoryBarrier,
+                               GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                               glGetUniformLocation)
+        import math
+
+        glUseProgram(self._prog)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, self._ssbo_nodes)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, self._ssbo_ids)
+        for _i, _t in enumerate(self._tex_bands):
+            glActiveTexture(GL_TEXTURE0 + _i)
+            glBindTexture(GL_TEXTURE_3D, _t)
+        glActiveTexture(GL_TEXTURE0)
+        for _i in range(len(self._tex_bands)):
+            glUniform1i(glGetUniformLocation(self._prog, f'uFwdLayer{_i}'.encode()), _i)
+        for _i, _t in enumerate(self._textures):
+            glBindImageTexture(_i, _t, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F)
+
+        def _u1i(n, v): glUniform1i(glGetUniformLocation(self._prog, n), int(v))
+        def _u1f(n, v): glUniform1f(glGetUniformLocation(self._prog, n), float(v))
+        def _u3f(n, x,y,z): glUniform3f(glGetUniformLocation(self._prog, n), float(x),float(y),float(z))
+        def _u4f(n, x,y,z,w): glUniform4f(glGetUniformLocation(self._prog, n), float(x),float(y),float(z),float(w))
+
+        _u1i(b'uTriCount',        self._n_tris)
+        _u1i(b'uNodeCount',       self._n_bvh_nodes)
+        _u1i(b'uSamplesPerPixel', max(1, int(self._samples_per_pixel)))
+        _u1i(b'uMaxBounces',      self._max_bounces)
+        _u1i(b'uVolSteps',        self._vs)
+        _u1f(b'uRayFieldScale',   self._rfs)
+        _u1f(b'uRayFieldGamma',   self._rfg)
+        _u1f(b'uVolAlpha',        self._va)
+        _u1f(b'uAirDiffuseScatter',  self._air_ds)
+        _u1f(b'uAirSpecularScatter', self._air_ss)
+        _u1f(b'uAirAnisotropy',      self._air_an)
+        _u1f(b'uMediumExtinction',   getattr(self, '_medium_extinction', 0.5))
+        _sensor_specs = self.film.layer_specs()
+        glUniform1i(glGetUniformLocation(self._prog, b'uLayerCount'), len(_sensor_specs))
+        for _i, _sp in enumerate(_sensor_specs):
+            glUniform3f(glGetUniformLocation(self._prog, f'uLayerDark{_i}'.encode()),  *_sp['dark_rgb'])
+            glUniform3f(glGetUniformLocation(self._prog, f'uLayerLight{_i}'.encode()), *_sp['light_rgb'])
+        _u3f(b'uCamEye',          *self._eye)
+        _u3f(b'uCamRight',        *self._right)
+        _u3f(b'uCamUp',           *self._up)
+        _u3f(b'uCamFwd',          *self._fwd)
+        _u1f(b'uCamFovTan',       self._fov_tan)
+        _u1f(b'uCamAspect',       self._aspect)
+        _u1f(b'uApertureRadius',  self._aperture_radius)
+        _u1f(b'uFocusDist',       self._focus_dist)
+        _u1f(b'uCAFactor',        self._ca_factor)
+        glUniform2f(glGetUniformLocation(self._prog, b'uTiltShift'),
+                    float(self._tilt_shift[0]), float(self._tilt_shift[1]))
+        _u3f(b'uBoxMin',          *self._bmin)
+        _u3f(b'uBoxMax',          *self._bmax)
+        glUniform3i(glGetUniformLocation(self._prog, b'uDims'),
+                    int(self._dims[0]), int(self._dims[1]), int(self._dims[2]))
+        glUniform2i(glGetUniformLocation(self._prog, b'uSensorSize'),
+                    self._w, self._h)
+
+        # Unique seed per strip per pass to avoid correlation
+        seed = 314159 + self._row_off * 1009 + self._pass * 65537 + self._frame * 1000003
+        _u1i(b'uSeed',      seed & 0x7FFFFFFF)
+        _u1i(b'uRowOffset', self._row_off)
+
+        rows_this = min(self._rows_per_frame, self._h - self._row_off)
+        random_mode = bool(getattr(self, "_sprinkle", True))
+        dispatch_px = max(1, min(self._w * self._h,
+                                 int(self._w * max(1, self._rows_per_frame))))
+        _u1i(b'uRandomPixels', 1 if random_mode else 0)
+        _u1i(b'uDispatchPixelCount', dispatch_px if random_mode else self._w * rows_this)
+        if random_mode:
+            groups = max(1, int(math.ceil(dispatch_px / 256.0)))
+            gx = min(groups, 65535)
+            gy = max(1, int(math.ceil(groups / gx)))
+        else:
+            gx = self._gx
+            gy = max(1, int(math.ceil(rows_this / 16.0)))
+        glDispatchCompute(gx, gy, 1)
+        glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+
+        if self._frame == 0:
+            mode = "sprinkle" if random_mode else "rows"
+            print(f"  [SensorAccumulator] first dispatch: mode={mode} gx={gx} gy={gy} pixels={dispatch_px} rows={rows_this}", flush=True)
+
+        if random_mode:
+            self._pass += dispatch_px // max(1, self._w * self._h)
+        else:
+            self._row_off += rows_this
+        if not random_mode and self._row_off >= self._h:
+            self._row_off = 0
+            self._pass   += 1
+
+        for _i in range(len(self._tex_bands)):
+            glActiveTexture(GL_TEXTURE0 + _i)
+            glBindTexture(GL_TEXTURE_3D, 0)
+        glActiveTexture(GL_TEXTURE0)
+        glUseProgram(0)
+        self._frame += 1
+
+    # ------------------------------------------------------------------
+    def apply_decay(self, dt_s: float) -> None:
+        """Advance the temporal decay by *dt_s* seconds.
+
+        Must be called once per display frame (regardless of whether sources
+        are active) BEFORE the blit shader reads ``_decay_total``.
+
+        Behaviour:
+        - When ``half_life <= 0`` (stable): no-op except reset ``_decay_total``
+          to 1.0 if a source was dispatched (keeps display bright).
+        - When ``half_life > 0`` AND a forward-ray batch was dispatched this
+          frame: reset ``_decay_total = 1.0`` (source is active → full brightness).
+        - When ``half_life > 0`` AND no sources dispatched: dispatch the decay
+          compute shader (scales the entire accumulator texture by ``f``) and
+          multiply ``_decay_total`` by the same ``f``.
+
+        The compute shader and the CPU multiplier together guarantee:
+        - Texture mean (rgb/a) converges toward zero during silence because
+          both channels shrink; the GPU never tracks per-pixel time.
+        - ``_decay_total`` gives the blit shader a single per-frame brightness
+          scale derived purely from wall-clock time, so the display fade follows
+          a true exponential with the configured half-life.
+        - When the source restarts, ``_decay_total`` jumps back to 1.0 and the
+          texture (now near-zero after extended silence) accepts new samples
+          immediately instead of being masked by stale accumulated weight.
+        """
+        import math as _math
+        if self._source_dispatched:
+            # Source was active this frame: display stays at full brightness.
+            self._decay_total = 1.0
+            self._source_dispatched = False
+            return   # skip texture decay — source is writing fresh energy
+
+        if self.half_life <= 0.0:
+            return   # stable mode: nothing to do
+
+        f = _math.exp(-_math.log(2.0) * max(dt_s, 0.0) / max(self.half_life, 1e-6))
+        f = float(max(0.0, min(1.0, f)))
+
+        # Dispatch decay compute shader once per output layer texture.
+        if self._decay_prog and self._textures and self._active:
+            from OpenGL.GL import (glUseProgram, glBindImageTexture, GL_READ_WRITE,
+                                   GL_RGBA32F, glDispatchCompute, glMemoryBarrier,
+                                   GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+                                   glGetUniformLocation, glUniform1f, GL_FALSE)
+            gx = max(1, int(_math.ceil(self._w / 16.0)))
+            gy = max(1, int(_math.ceil(self._h / 16.0)))
+            glUseProgram(self._decay_prog)
+            glUniform1f(glGetUniformLocation(self._decay_prog, b'uDecayFactor'), f)
+            for _t in self._textures:
+                glBindImageTexture(0, _t, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F)
+                glDispatchCompute(gx, gy, 1)
+                glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            glUseProgram(0)
+
+        self._decay_total = max(0.0, self._decay_total * f)
+
+    def destroy(self):
+        from OpenGL.GL import glDeleteTextures, glDeleteProgram, glDeleteBuffers
+        if self._source_worker is not None:
+            self._source_worker.stop()
+            self._source_worker.join(timeout=1.0)
+            self._source_worker = None
+        if self._textures:
+            glDeleteTextures(self._textures)
+            self._textures = []
+        if self._prog:
+            glDeleteProgram(self._prog)
+            self._prog = 0
+        if self._fwd_prog:
+            glDeleteProgram(self._fwd_prog)
+            self._fwd_prog = 0
+        if self._decay_prog:
+            glDeleteProgram(self._decay_prog)
+            self._decay_prog = 0
+        for _b in [self._ssbo_sources_fwd, self._ssbo_seg_dummy, self._ssbo_counter_fwd]:
+            if _b:
+                glDeleteBuffers(1, [_b])
+        self._ssbo_sources_fwd = self._ssbo_seg_dummy = self._ssbo_counter_fwd = 0
+        self._active = False
+
+    def clear(self):
+        """Clear all per-layer RGBA32F sensor accumulation images."""
+        from OpenGL.GL import glBindTexture, glClearTexImage, GL_TEXTURE_2D, GL_RGBA, GL_FLOAT
+        if not self._textures:
+            return
+        for _t in self._textures:
+            glBindTexture(GL_TEXTURE_2D, _t)
+            glClearTexImage(_t, 0, GL_RGBA, GL_FLOAT, np.zeros(4, np.float32))
+        glBindTexture(GL_TEXTURE_2D, 0)
+        self._row_off = 0
+        self._pass = 0
+        # Reset decay accumulator so the freshly cleared display starts bright.
+        self._decay_total = 1.0
+        # _frame is intentionally NOT reset — keeps the seed unique across every
+        # display dispatch regardless of cadence resets
+
+    def clear_field(self):
+        """Clear the forward band textures — call only on cadence reset."""
+        from OpenGL.GL import (glBindTexture, glClearTexImage, GL_TEXTURE_3D,
+                               GL_RED_INTEGER, GL_UNSIGNED_INT)
+        zero = np.array([0], dtype=np.uint32)
+        for tex in self._tex_bands:
+            glBindTexture(GL_TEXTURE_3D, tex)
+            glClearTexImage(tex, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero)
+        glBindTexture(GL_TEXTURE_3D, 0)
+        # _fwd_frame is intentionally NOT reset — seeds must stay unique across resets
+
+    # ------------------------------------------------------------------
+    # Streaming source pipeline
+    # ------------------------------------------------------------------
+
+    def notify_frame(self, frame, info: dict, outline: np.ndarray,
+                     body_h: float, paths: list, active_strings,
+                     refresh_rays: int, sensor_light_rays: int,
+                     stage_light_emitters: int) -> None:
+        """Post a scene-change job to the background source worker.
+        Returns immediately — no GL calls, no blocking."""
+        if self._source_worker is None:
+            self._source_worker = _SourceWorker()
+            self._source_worker.start()
+        self._source_worker.notify(
+            frame=frame,
+            info=info,
+            outline=outline,
+            body_h=body_h,
+            paths=paths,
+            active_strings=active_strings,
+            refresh_rays=refresh_rays,
+            sensor_light_rays=sensor_light_rays,
+            stage_light_emitters=stage_light_emitters,
+        )
+
+    def _drain_source_upload(self) -> bool:
+        """Check if the source worker has new data ready; if so, upload to GPU.
+        Called at the start of pump_forward().  Returns True if sources changed."""
+        if self._source_worker is None:
+            return False
+        try:
+            result = self._source_worker.result_q.pop()
+        except IndexError:
+            return False
+        self._update_sources_gl(result["sources_list"], result["source_records_np"])
+        return True
+
+    def _update_sources_gl(self, sources_list: list,
+                            source_records_np: np.ndarray) -> None:
+        """Upload new source data to the GPU SSBO and rebuild the dispatch ring.
+        All GL calls — must run on the GL thread.  Fast: only glBufferData."""
+        from OpenGL.GL import (glGenBuffers, glBindBuffer, glBufferData,
+                               GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, GL_DYNAMIC_DRAW)
+        self._sources_list = list(sources_list)
+        self._source_records_np = np.ascontiguousarray(source_records_np, np.float32)
+        self._n_sources = len(self._sources_list)
+
+        if self._ssbo_sources_fwd:
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_sources_fwd)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, self._source_records_np.nbytes,
+                         self._source_records_np, GL_STATIC_DRAW)
+        else:
+            self._ssbo_sources_fwd = int(glGenBuffers(1))
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_sources_fwd)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, self._source_records_np.nbytes,
+                         self._source_records_np, GL_STATIC_DRAW)
+        if not self._ssbo_seg_dummy:
+            self._ssbo_seg_dummy = int(glGenBuffers(1))
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_seg_dummy)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, 64, None, GL_DYNAMIC_DRAW)
+        if not self._ssbo_counter_fwd:
+            self._ssbo_counter_fwd = int(glGenBuffers(1))
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, self._ssbo_counter_fwd)
+            glBufferData(GL_SHADER_STORAGE_BUFFER, 16, None, GL_DYNAMIC_DRAW)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+
+        # Compile forward shader once; never again.
+        if not self._fwd_prog:
+            from OpenGL.GL import glGetProgramiv, GL_LINK_STATUS
+            self._fwd_prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
+            if not glGetProgramiv(self._fwd_prog, GL_LINK_STATUS):
+                from OpenGL.GL import glDeleteProgram
+                glDeleteProgram(self._fwd_prog)
+                self._fwd_prog = 0
+                print("  [SensorAccumulator] forward shader LINK FAILED", flush=True)
+
+        self._rebuild_dispatch_ring()
+
+    def _rebuild_dispatch_ring(self) -> None:
+        """Build the rotating dispatch token list from current sources.
+        Token = (source_index, batch_offset, batch_size).
+        The ring is traversed continuously across frames — no per-call rebuild."""
+        batch = self._dispatch_batch_fwd
+        ring = []
+        for si, _s in enumerate(self._sources_list):
+            n_rays = int(_s[2])
+            off = 0
+            while off < n_rays:
+                b = min(batch, n_rays - off)
+                ring.append((si, off, b))
+                off += b
+        self._dispatch_ring = ring
+        self._ring_cursor = 0
+
+    def pump_forward(self, budget_ms: float = 5.0) -> int:
+        """Fire forward ray dispatches for up to budget_ms wall-clock time.
+
+        Drains the source-worker upload queue first (fast SSBO swap), then
+        fires dispatch tokens from the rotating ring.  A single glMemoryBarrier
+        is issued after all dispatches, not between them — the GPU executes
+        each CS kernel as soon as its predecessor vacates the hardware queue.
+
+        Returns the number of ray batches dispatched.
+        """
+        # 1. Absorb any freshly computed source data (non-blocking deque pop).
+        self._drain_source_upload()
+
+        if not self._fwd_prog or not self._sources_list or not self._dispatch_ring:
+            return 0
+
+        from OpenGL.GL import (
+            glUseProgram, glBindBufferBase, GL_SHADER_STORAGE_BUFFER,
+            glBindImageTexture, GL_READ_WRITE, GL_R32UI,
+            glUniform1i, glUniform1f, glUniform3f, glUniform4f,
+            glGetUniformLocation, glUniform3i,
+            glDispatchCompute, glMemoryBarrier,
+            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+            GL_SHADER_STORAGE_BARRIER_BIT,
+            GL_TEXTURE_FETCH_BARRIER_BIT,
+        )
+        import math as _math
+
+        prog = self._fwd_prog
+        glUseProgram(prog)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, self._ssbo_nodes)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, self._ssbo_ids)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, self._ssbo_seg_dummy)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, self._ssbo_counter_fwd)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, self._ssbo_sources_fwd)
+        for band_idx, tex in enumerate(self._tex_bands):
+            glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
+
+        def _u1i(n, v): glUniform1i(glGetUniformLocation(prog, n), int(v))
+        def _u1f(n, v): glUniform1f(glGetUniformLocation(prog, n), float(v))
+        def _u3f(n, x, y, z): glUniform3f(glGetUniformLocation(prog, n), float(x), float(y), float(z))
+        def _u4f(n, x, y, z, w): glUniform4f(glGetUniformLocation(prog, n), float(x), float(y), float(z), float(w))
+
+        # Uniform state that doesn't change within a pump call
+        _u1i(b'uTriCount',           self._n_tris)
+        _u1i(b'uNodeCount',          self._n_bvh_nodes)
+        _u1i(b'uSegmentCap',         0)
+        _u1i(b'uSegmentStride',      4)
+        _u1i(b'uSourceCount',        self._n_sources)
+        _u1i(b'uMaxBounces',         self._max_bounces)
+        _u1i(b'uMode',               0)
+        _u1i(b'uDiagnosticsEnabled', 0)
+        _u1i(b'uSegmentCapture',     0)
+        _u3f(b'uBoxMin',             *self._bmin)
+        _u3f(b'uBoxMax',             *self._bmax)
+        glUniform3i(glGetUniformLocation(prog, b'uDims'),
+                    int(self._dims[0]), int(self._dims[1]), int(self._dims[2]))
+        _u1f(b'uVolumeStepMeters',   0.003)
+        _u1f(b'uMediumScattering',   1.0)
+        _u1f(b'uMediumExtinction',   0.5)
+        _u1f(b'uAirDiffuseScatter',  self._air_ds)
+        _u1f(b'uAirSpecularScatter', self._air_ss)
+        _u1f(b'uAirAnisotropy',      self._air_an)
+        _specs = self.film.layer_specs()
+        glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), len(_specs))
+        for _i, _sp_layer in enumerate(_specs):
+            glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), _sp_layer['center_hz'])
+            glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), _sp_layer['width_oct'])
+            glUniform1f(glGetUniformLocation(prog, f'uLayerGains[{_i}]'.encode()),     _sp_layer['gain'])
+
+        # 2. Fire tokens from the rotating ring until budget exceeded.
+        ring      = self._dispatch_ring
+        n_tokens  = len(ring)
+        cursor    = self._ring_cursor
+        seed_base = self._fwd_frame * 6271 + 1337
+        dispatched = 0
+        t0 = time.perf_counter()
+
+        # Cache per-source uniforms so we only re-upload when the source changes.
+        last_si = -1
+        while True:
+            si, batch_off, batch_size = ring[cursor]
+            # Update per-source uniforms only when source index changes.
+            if si != last_si:
+                _src_entry = self._sources_list[si]
+                sp, sd, n_rays, spectrum = _src_entry[0], _src_entry[1], _src_entry[2], _src_entry[3]
+                seed = seed_base + si * 104729 + batch_off
+                _u1i(b'uSeed',               seed & 0x7FFFFFFF)
+                _u1i(b'uTotalRaysPerSource',  max(1, int(n_rays)))
+                _u3f(b'uSrcPos',             *np.asarray(sp, np.float32).ravel()[:3])
+                _u3f(b'uSrcDir',             *np.asarray(sd, np.float32).ravel()[:3])
+                spec = np.asarray(spectrum, np.float32).ravel()
+                _u4f(b'uSrcSpectrum', float(spec[0]), float(spec[1]),
+                                      float(spec[2]), float(spec[3]))
+                _src_radius   = float(_src_entry[4]) if len(_src_entry) > 4 else 0.0
+                _src_cone_cos = float(_src_entry[5]) if len(_src_entry) > 5 else -1.0
+                glUniform1f(glGetUniformLocation(prog, b'uSrcRadius'),  _src_radius)
+                glUniform1f(glGetUniformLocation(prog, b'uSrcConeCos'), _src_cone_cos)
+                last_si = si
+            else:
+                # Same source, different offset — just update seed + offset.
+                seed = seed_base + si * 104729 + batch_off
+                _u1i(b'uSeed',       seed & 0x7FFFFFFF)
+
+            _u1i(b'uBatchSize',   batch_size)
+            _u1i(b'uBatchOffset', batch_off)
+            n_groups = max(1, int(_math.ceil(batch_size / 128.0)))
+            gx = min(n_groups, 65535)
+            gy = max(1, int(_math.ceil(n_groups / gx)))
+            glDispatchCompute(gx, gy, 1)
+            dispatched += 1
+
+            cursor = (cursor + 1) % n_tokens
+            if (time.perf_counter() - t0) * 1000.0 >= budget_ms:
+                break
+            # Wrap-around: stop after one full ring to avoid infinite spin
+            # when budget_ms is very large.
+            if cursor == self._ring_cursor:
+                break
+
+        # One barrier after all dispatches — GPU queues them all then stalls
+        # only once per pump call.
+        if dispatched > 0:
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                            GL_TEXTURE_FETCH_BARRIER_BIT)
+            # Mark that a source was active this frame so apply_decay() can
+            # reset the display brightness multiplier.
+            self._source_dispatched = True
+        glUseProgram(0)
+        self._ring_cursor = cursor
+        self._fwd_frame += 1
+        return dispatched
+
 
 class _SliderPanel:
     """Top-left quality-level sliders rendered as a 2-D OpenGL 330 overlay.
@@ -3808,11 +7971,12 @@ class _SliderPanel:
     TX     = 86     # track left edge within panel
     TW     = 162    # track width
     TH     = 6      # track height
+    BTN_H  = 24     # height of the "New Frame" action button
 
     # (key, label, lo, hi, default, log_scale, live)
     # lo = left-end value (low quality), hi = right-end value (high quality)
     _DEFS = [
-        ('rays',     'Img rays',    256,    50_000, 1_000, True,  True ),
+        ('ray_density', 'Ray dens', 0.1,       8.0,   1.0, False, True ),
         ('segs',     'Str segs',     30,       240,    60, False, False),
         ('plate_th', 'Board res',    64,     1_024,   128, False, True ),
         ('dx',       'Press dx',  0.016,     0.004, 0.010, False, False),
@@ -3820,15 +7984,32 @@ class _SliderPanel:
         ('ray_gamma', 'Gamma',      0.20,    1.60, float(GPU_RAY_FIELD_GAMMA), False, True ),
         ('mic_gain', 'Mic',        0.0,       1.0,   1.0, False, True ),
         ('pickup_gain', 'Pickup',  0.0,       1.0,   1.0, False, True ),
+        ('sensor_iso',  'Sen ISO', 0.25,     12.0,   1.4, False, True ),
+        ('sensor_rate', 'Sen rows',1.0,     512.0,  16.0, False, True ),
+        ('sensor_spp',  'Sen spp', 1.0,       8.0,   1.0, False, True ),
+        ('sensor_fps',  'Sen FPS', 0.0,      60.0,  30.0, False, True ),
+        ('frame_step',  'Frm step',0.0,       8.0,   1.0, False, True ),
+        ('lens_aperture', 'Aperture', 0.0,  0.080,  0.0, False, True ),
+        ('lens_ca',     'CA',       0.0,    0.020,  0.0, False, True ),
+        ('film_hue',    'Film hue', 0.0,  360.0, 180.0, False, True ),
+        ('film_sat',    'Film sat', 0.0,    2.0,   1.0, False, True ),
+        # Decay half-life: 0 = stable; >0 = seconds for display to reach 50%
+        # brightness after the source goes silent.  Controlled globally and
+        # applied to the accumulator via the GPU decay compute shader.
+        ('film_decay',  'Decay \u00bdlife', 0.0, 30.0,  0.0, False, True ),
+        # Volumetric atmosphere \u2014 soft diffuse glow and sharp specular sparkle
+        ('air_diff',    'Air glow',  0.0,  1.0,  0.35, False, False),
+        ('air_spec',    'Air spark', 0.0,  1.0,  0.65, False, False),
+        ('air_aniso',   'Air lobe',  1.0, 32.0, 12.0,  False, True ),
     ]
 
-    _C_BG    = (0.04, 0.04, 0.07, 0.82)
+    _C_BG    = (0.04, 0.04, 0.07, 0.97)   # near-opaque so scene doesn't bleed through
     _C_TRACK = (0.22, 0.22, 0.27, 1.00)
     _C_LIVE  = (0.18, 0.78, 0.28, 1.00)   # green  — live
     _C_BUILD = (0.22, 0.46, 0.96, 1.00)   # blue   — needs rebuild (no pending change)
     _C_PEND  = (1.00, 0.62, 0.10, 1.00)   # amber  — pending rebuild change
     _C_KNOB  = (0.90, 0.90, 0.90, 1.00)
-    _C_TEXT  = (0.82, 0.82, 0.82, 1.00)
+    _C_TEXT  = (1.00, 1.00, 1.00, 1.00)   # pure white for maximum contrast
 
     def __init__(self):
         self.keys   = [d[0] for d in self._DEFS]
@@ -3840,6 +8021,8 @@ class _SliderPanel:
         self._pend  = {d[0]: False for d in self._DEFS}
         self._prev  = dict(self.values)
         self._drag  = -1
+        self._btn_callback = None  # called (no args) on "New Frame [C]" click
+        self._btn_hover    = False
 
         self._p_col = _prog((_HUD2D_VS, GL_VERTEX_SHADER),
                              (_HUD2D_FS, GL_FRAGMENT_SHADER))
@@ -3876,7 +8059,7 @@ class _SliderPanel:
         self._ltex = []
         self._ldim = []
         for label_str in [d[1] for d in self._DEFS]:
-            surf = font.render(label_str, True, (255, 255, 255))
+            surf = font.render(label_str, True, (0, 0, 0), (220, 220, 220))
             w, h = surf.get_size()
             raw  = pygame.image.tobytes(surf, "RGBA")
             tex  = glGenTextures(1)
@@ -3921,7 +8104,12 @@ class _SliderPanel:
                 self.TW, self.TH)
 
     def _panel_h(self) -> int:
-        return 5 + len(self.keys) * self.ROW + 4
+        return 5 + len(self.keys) * self.ROW + 4 + self.BTN_H + 6
+
+    def _btn_rect(self) -> tuple:
+        """Pixel rect (x, y, w, h) of the 'New Frame [C]' button."""
+        y = self.PY + 5 + len(self.keys) * self.ROW + 4 + 3
+        return (self.PX + 4, y, self.PW - 8, self.BTN_H)
 
     def _in_panel(self, mx: int, my: int) -> bool:
         return (self.PX <= mx <= self.PX + self.PW and
@@ -3941,14 +8129,21 @@ class _SliderPanel:
                     self._drag = i
                     self._apply_mouse(i, mx)
                     return True
+            bx, by, bw, bh = self._btn_rect()
+            if bx <= mx <= bx + bw and by <= my <= by + bh:
+                if self._btn_callback is not None:
+                    self._btn_callback()
             return True   # click in panel but not on a track — absorb it
         elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
             if self._drag >= 0:
                 self._drag = -1
                 return True
         elif ev.type == MOUSEMOTION:
+            mx2, my2 = ev.pos
+            bx, by, bw, bh = self._btn_rect()
+            self._btn_hover = bx <= mx2 <= bx + bw and by <= my2 <= by + bh
             if self._drag >= 0:
-                self._apply_mouse(self._drag, ev.pos[0])
+                self._apply_mouse(self._drag, mx2)
                 return True
         return False
 
@@ -3957,7 +8152,7 @@ class _SliderPanel:
         t   = (mx - tx) / max(tw, 1)
         raw = self._v(idx, t)
         key = self.keys[idx]
-        if   key == 'rays':     raw = int(np.clip(round(raw), 256, 50_000))
+        if   key == 'ray_density': raw = float(np.clip(raw, 0.1, 16.0))
         elif key == 'segs':     raw = int(np.clip(round(raw), 30, 240))
         elif key == 'plate_th': raw = int(np.clip(round(raw), 64, 1024))
         elif key == 'dx':       raw = float(np.clip(raw, 0.004, 0.016))
@@ -3967,6 +8162,16 @@ class _SliderPanel:
             raw = float(np.clip(raw, 0.20, 1.60))
         elif key in ('mic_gain', 'pickup_gain'):
             raw = float(np.clip(raw, 0.0, 1.0))
+        elif key == 'sensor_iso':
+            raw = float(np.clip(raw, 0.25, 12.0))
+        elif key == 'sensor_rate':
+            raw = int(np.clip(round(raw), 1, 1024))
+        elif key == 'sensor_spp':
+            raw = int(np.clip(round(raw), 1, 16))
+        elif key == 'sensor_fps':
+            raw = int(np.clip(round(raw), 0, 120))
+        elif key == 'frame_step':
+            raw = int(np.clip(round(raw), 0, 16))
         old = self.values[key]
         self.values[key] = raw
         if raw != old and not self._live[idx]:
@@ -3976,7 +8181,7 @@ class _SliderPanel:
         cached = self._text_cache.get(text)
         if cached is not None:
             return cached
-        surf = self._font.render(text, True, (255, 255, 255))
+        surf = self._font.render(text, True, (0, 0, 0), (220, 220, 220))
         w, h = surf.get_size()
         raw = pygame.image.tobytes(surf, "RGBA")
         tex = glGenTextures(1)
@@ -3989,6 +8194,19 @@ class _SliderPanel:
         cached = (tex, (w, h))
         self._text_cache[text] = cached
         return cached
+
+    def _draw_hud_text(self, text: str, x: int, y: int, rw: int, rh: int, center: bool = False):
+        """Draw an arbitrary text string as a HUD overlay at pixel position (x, y)."""
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        tex, (tw, th) = self._get_text_texture(text)
+        px = x - tw // 2 if center else x
+        # dark pill behind the text
+        pad = 5
+        self._draw_quad(px - pad, y - pad, tw + pad * 2, th + pad * 2,
+                        (0.02, 0.02, 0.04, 0.88), rw, rh)
+        self._draw_textured(tex, tw, th, px, y, rw, rh)
 
     # ── query helpers called by main() ────────────────────────────────────────
 
@@ -4029,7 +8247,6 @@ class _SliderPanel:
         glBufferSubData(GL_ARRAY_BUFFER, 0, v.nbytes, v)
         glUseProgram(self._p_tex)
         glUniform2f(glGetUniformLocation(self._p_tex, b'uRes'), rw, rh)
-        glUniform4f(glGetUniformLocation(self._p_tex, b'uColor'), *self._C_TEXT)
         glActiveTexture(GL_TEXTURE0)
         glBindTexture(GL_TEXTURE_2D, tex)
         glUniform1i(glGetUniformLocation(self._p_tex, b'uTex'), 0)
@@ -4074,11 +8291,12 @@ class _SliderPanel:
 
     def draw(self, win_w: int, win_h: int):
         glDisable(GL_DEPTH_TEST)
+        # Draw solid background first with no blending so scene never bleeds through
+        glDisable(GL_BLEND)
+        self._draw_quad(self.PX, self.PY, self.PW, self._panel_h(),
+                        (0.04, 0.04, 0.08, 1.0), win_w, win_h)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-        self._draw_quad(self.PX, self.PY, self.PW, self._panel_h(),
-                        self._C_BG, win_w, win_h)
 
         for i, key in enumerate(self.keys):
             ry = self._row_y(i)
@@ -4104,6 +8322,14 @@ class _SliderPanel:
             self._draw_label(i, self.PX + 2, ry + (self.ROW - lh) // 2,
                              win_w, win_h)
 
+        # "New Frame [C]" button at the bottom of the panel
+        bx, by, bw, bh = self._btn_rect()
+        btn_bg = (0.28, 0.52, 0.96, 1.0) if self._btn_hover else (0.14, 0.26, 0.56, 1.0)
+        self._draw_quad(bx, by, bw, bh, btn_bg, win_w, win_h)
+        btn_tex, (btw, bth) = self._get_text_texture("New Frame  [C]")
+        self._draw_textured(btn_tex, btw, bth,
+                            bx + (bw - btw) // 2, by + (bh - bth) // 2, win_w, win_h)
+
         glEnable(GL_DEPTH_TEST)
         glBindVertexArray(0)
         glUseProgram(0)
@@ -4119,10 +8345,29 @@ def _parse_args():
         description="3-D acoustic pluck visualizer",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--trace-rays", type=int, default=RAY_TRACE_RAYS,
-                   help="Rays/source for the line-segment overlay")
+    p.add_argument("--ray-density", type=float, default=1.0,
+                   help="Scene-wide ray density. Scales acoustic, EM, sensor, refresh, and debug ray budgets together")
+    p.add_argument("--sound-energy-rays", type=int, default=1000,
+                   help="Acoustic energy-to-ray conversion at ray-density=1")
+    p.add_argument("--em-energy-rays", type=int, default=20000,
+                   help="EM/light energy-to-ray conversion at ray-density=1")
+    p.add_argument("--trace-rays", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--max-bounces", type=int, default=RAY_MAX_BOUNCES,
                    help="Maximum ray bounces")
+    p.add_argument("--sensor-rays", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--sensor-gain", type=float, default=8.0,
+                   help="Amplification factor for sensor-pass surface contributions (default 8.0).")
+    p.add_argument("--ray-program-only", "--ray-trace-only", dest="ray_program_only",
+                   action="store_true",
+                   help="Skip the FDTD/plate physics worker and run only the static scene ray-trace/camera program")
+    p.add_argument("--lens-focal-mm", type=float, default=35.0,
+                   help="Camera focal length in millimetres")
+    p.add_argument("--lens-focus-m", type=float, default=1.6,
+                   help="Camera focus distance in metres")
+    p.add_argument("--lens-aperture", type=float, default=0.0,
+                   help="Thin-lens aperture radius in metres; 0 is pinhole")
+    p.add_argument("--lens-ca", type=float, default=0.0,
+                   help="Chromatic aberration factor for the sensor camera")
     p.add_argument("--gpu-rays", action=argparse.BooleanOptionalAction,
                    default=USE_GPU_RAY_FIELD,
                    help="Use OpenGL compute shader to build a rotatable 3-D ray field")
@@ -4134,6 +8379,19 @@ def _parse_args():
     p.add_argument("--pressure-pml-cells", "--pml-cells", dest="pressure_pml_cells",
                    type=int, default=N_PML,
                    help="Pressure FDTD PML thickness in cells at the outer grid boundary")
+    p.add_argument("--amr-build-backend", dest="amr_build_backend",
+                   choices=["cpu", "gl"], default="cpu",
+                   help="AMR grid build backend: cpu (default, stable) or gl (GPU compute, experimental)")
+    p.add_argument("--gradient-order", dest="gradient_order", type=int, default=2,
+                   choices=[2, 8],
+                   help="AMR GL velocity gradient order: 2 (fast, default) or 8 (high-accuracy Fornberg)")
+    p.add_argument("--headless-batch", dest="headless_batch", action="store_true",
+                   help="Suppress per-step progress spans and tqdm bars for maximum throughput")
+    p.add_argument("--benchmark-steps", dest="benchmark_steps", type=int, default=0,
+                   help="If > 0, run a standalone AMR GL throughput benchmark for this many steps and exit")
+    p.add_argument("--amr-cache-grid", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="Enable disk cache for deterministic AMR topology builds")
     p.add_argument("--render-segs", type=int, default=60,
                    help="String FDTD/render segments per string")
     p.add_argument("--bridge-force-scale", type=float, default=BRIDGE_FORCE_SCALE,
@@ -4142,31 +8400,26 @@ def _parse_args():
                    help="Angular subdivisions for the rendered soundboard mesh")
     p.add_argument("--plate-radial", type=int, default=PLATE_RADIAL_SEGS,
                    help="Radial subdivisions for the rendered soundboard mesh")
-    p.add_argument("--gpu-field-rays", type=int, default=1000,
-                   help="GPU rays/source for the 3-D ray field")
+    p.add_argument("--gpu-field-rays", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--gpu-segment-cap", type=int, default=GPU_RAY_SEGMENT_CAP,
-                   help="Maximum GPU ray line segments kept for the overlay")
+                   help=argparse.SUPPRESS)
     p.add_argument("--gpu-dispatch-batch", type=int, default=GPU_DISPATCH_BATCH,
-                   help="Rays per GPU compute dispatch; lower values avoid driver-side transient allocation/TDR")
+                   help=argparse.SUPPRESS)
     p.add_argument("--gpu-refresh-every", type=int, default=1,
-                   help="Recompute GPU ray field every N rendered physics frames from current plate state; 0 keeps the initial static field")
-    p.add_argument("--gpu-refresh-rays", type=int, default=0,
-                   help="Rays used for each dynamic refresh; 0 reuses --gpu-field-rays")
+                   help=argparse.SUPPRESS)
+    p.add_argument("--gpu-refresh-rays", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--stage-light-field", action=argparse.BooleanOptionalAction,
-                   default=True,
-                   help="Build a cached diffuse room/stage light field before rendering")
-    p.add_argument("--stage-light-rays", type=int, default=STAGE_LIGHT_RAYS,
-                   help="Rays for the cached diffuse stage light field")
+                   default=False, help=argparse.SUPPRESS)
+    p.add_argument("--stage-light-rays", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--stage-light-emitters", type=int, default=9,
                    help="Emitter samples across the diffuse stage light area")
+    p.add_argument("--sensor-light-rays", type=int, default=None, help=argparse.SUPPRESS)
     p.add_argument("--stage-light-cache-dir", default=".cache",
-                   help="Directory for cached room/stage light fields")
+                   help=argparse.SUPPRESS)
     p.add_argument("--rebuild-stage-light", action="store_true",
-                   help="Ignore any cached room/stage light field and recompute it")
-    p.add_argument("--initial-ray-field", action="store_true",
-                   help="Build the old static spectral ray field before the render loop")
-    p.add_argument("--cpu-ray-overlay", action="store_true",
-                   help="Use CPU ray tracing for the line overlay instead of GPU segments")
+                   help=argparse.SUPPRESS)
+    p.add_argument("--initial-ray-field", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--cpu-ray-overlay", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--ray-only-view", action=argparse.BooleanOptionalAction,
                    default=False,
                    help="Start with only ray field and ray lines visible")
@@ -4203,7 +8456,103 @@ def _parse_args():
         args.excitation = "rest"
     if args.diagnostic_frames < 1:
         p.error("--diagnostic-frames must be positive")
+    if args.ray_density < 0.0:
+        p.error("--ray-density must be non-negative")
+    _density = float(args.ray_density)
+    if args.trace_rays is None:
+        args.trace_rays = max(64, int(round(RAY_TRACE_RAYS * max(_density, 0.05))))
+    if args.gpu_field_rays is None:
+        args.gpu_field_rays = max(1, int(round(float(args.sound_energy_rays) * _density)))
+    if args.gpu_refresh_rays is None:
+        args.gpu_refresh_rays = args.gpu_field_rays
+    if args.stage_light_rays is None:
+        args.stage_light_rays = max(1, int(round(float(args.em_energy_rays) * _density)))
+    if args.sensor_light_rays is None:
+        args.sensor_light_rays = args.stage_light_rays
+    if args.sensor_rays is None:
+        args.sensor_rays = max(1, int(round((float(args.sound_energy_rays) + float(args.em_energy_rays)) * 0.5 * _density)))
     return args
+
+
+def _run_benchmark(args) -> None:
+    """Standalone AMR GL throughput benchmark.
+
+    Builds a minimal uniform acoustic grid (no instrument geometry), runs
+    ``args.benchmark_steps`` GPU steps, and prints a concise metrics table.
+    Requires an OpenGL 4.3 context — call after pygame/GL initialisation.
+    """
+    import time
+    import os
+    import numpy as np
+
+    # Set headless env var before importing acoustic_amr so the bypass flag is set.
+    if args.headless_batch:
+        os.environ["SPECTRAL_HEADLESS_BATCH"] = "1"
+
+    from acoustic_amr import AcousticAMRGrid, AMRGLComputeBackend
+
+    steps   = max(1, int(args.benchmark_steps))
+    order   = int(args.gradient_order)
+
+    # ── Build a small uniform test grid ──────────────────────────────────────
+    dx = 0.02   # 20 mm cells → ~17 kHz bandwidth at 343 m/s
+    side = 0.5  # half-metre cube
+    t0_grid = time.perf_counter()
+    grid = AcousticAMRGrid.build_uniform_box(
+        x_min=-side, x_max=side,
+        y_min=-side, y_max=side,
+        z_min=-side, z_max=side,
+        dx=dx,
+    )
+    t_grid = time.perf_counter() - t0_grid
+
+    n_cells = grid.n_cells
+    n_faces = grid.n_faces
+    print(f"[benchmark] Grid: {n_cells} cells, {n_faces} faces  ({t_grid*1e3:.1f} ms build)")
+
+    # ── Create GL backend ─────────────────────────────────────────────────────
+    t0_init = time.perf_counter()
+    backend = AMRGLComputeBackend(grid, gradient_order=order)
+    t_init  = time.perf_counter() - t0_init
+
+    t_stencil = 0.0
+    if order == 8:
+        # Stencil build is embedded in __init__ for order 8;
+        # we report it as part of init time.
+        t_stencil = t_init  # approximate: stencil dominates init for large grids
+
+    print(f"[benchmark] Backend init: {t_init*1e3:.1f} ms  (gradient_order={order})")
+
+    # ── Warm-up: 4 steps to trigger shader JIT and driver caching ─────────────
+    backend.step(4)
+
+    # ── Timed run ─────────────────────────────────────────────────────────────
+    from OpenGL.GL import glFinish
+    glFinish()
+    t0 = time.perf_counter()
+    backend.step(steps)
+    glFinish()
+    t_steps = time.perf_counter() - t0
+
+    t_per_step  = t_steps / steps
+    steps_per_s = steps / t_steps
+    cells_per_s = n_cells * steps_per_s
+
+    print()
+    print("=" * 62)
+    print(f"  AMR GL Throughput Benchmark")
+    print("=" * 62)
+    print(f"  Grid cells           : {n_cells:>12,}")
+    print(f"  Grid faces           : {n_faces:>12,}")
+    print(f"  Gradient order       : {order:>12}")
+    print(f"  Steps                : {steps:>12,}")
+    print(f"  Grid build time      : {t_grid*1e3:>10.2f} ms")
+    print(f"  Backend init time    : {t_init*1e3:>10.2f} ms")
+    print(f"  Total step time      : {t_steps*1e3:>10.2f} ms")
+    print(f"  Per-step time        : {t_per_step*1e6:>10.1f} µs")
+    print(f"  Steps/sec            : {steps_per_s:>10.1f}")
+    print(f"  Cell·steps/sec       : {cells_per_s/1e6:>10.2f} M")
+    print("=" * 62)
 
 
 def _scene_outline_or_default(scene) -> tuple[np.ndarray, float]:
@@ -4223,6 +8572,11 @@ def main():
     pygame.display.set_mode((WIN_W, WIN_H), DOUBLEBUF | OPENGL)
     pygame.display.set_caption("Guitar — FDTD 3-D Visualiser")
 
+    if args.benchmark_steps > 0:
+        _run_benchmark(args)
+        pygame.quit()
+        return
+
     config = {
         "n_strings": 6,
         "dx": float(args.dx),
@@ -4234,35 +8588,50 @@ def main():
         "diagnostic_frames": int(args.diagnostic_frames),
         "fret": max(0, int(args.fret)),
         "fretless": bool(args.fretless),
+        "amr_backend": str(args.amr_build_backend),
+        "amr_cache_grid": bool(args.amr_cache_grid),
     }
 
-    # ── Build physics in a worker process ────────────────────────────────────
-    print("Starting physics worker ...", flush=True)
-    physics = _PhysicsProcess(config)
-    ready = None
-    while ready is None:
-        for msg in physics.poll():
-            if msg.get("type") == "ready":
-                ready = msg
-                break
-            if msg.get("type") == "error":
-                raise RuntimeError(msg.get("message", "physics worker failed"))
-        pygame.event.pump()
-        clock_wait = pygame.time.Clock()
-        clock_wait.tick(30)
-
-    info = ready["info"]
-    body_h = float(ready["body_h"])
-    n_str = int(ready["n_strings"])
-    outline = np.asarray(ready["outline"], dtype=np.float32)
-    print(f"  Grid {info['Nx']}×{info['Ny']}×{info['Nz']}  "
-          f"body_h={body_h:.3f}m", flush=True)
+    # ── Phase 1: Build scene + geometry (fast, no physics) ───────────────────
+    # Do this FIRST so the guitar is visible while the AMR grid builds.
+    _t0_scene = time.monotonic()
+    print("Building scene ...", flush=True)
     scene = _build_body_scene_fn("string_plate") if _HAS_SCENE else None
 
+    if scene is not None and _HAS_BRIDGE:
+        outline, body_h, _early_bridge = _extract_guitar_geometry(scene)
+        outline = np.asarray(outline, dtype=np.float32)
+    else:
+        try:
+            from acoustic_fdtd_bridge import _default_guitar_outline
+            outline = np.asarray(_default_guitar_outline(), dtype=np.float32)
+        except Exception:
+            outline = np.zeros((64, 2), dtype=np.float32)
+        body_h = BODY_H
+    n_str = int(config["n_strings"])
     paths = _string_paths(outline, body_h, n_strings=n_str,
                           n_segs=args.render_segs,
                           fret=config["fret"])
+    print(f"  Scene ready in {(time.monotonic()-_t0_scene)*1000:.0f}ms", flush=True)
 
+    # ── Phase 2: CPU ray trace (fast, needs only scene) ──────────────────────
+    ray_segs = None
+    meta: dict = {}
+    if scene is not None and _HAS_RAY and args.cpu_ray_overlay:
+        print("Tracing geometry ...", flush=True)
+        try:
+            _ray_diag_update("cpu_ray_overlay:trace:start",
+                             n_rays=int(args.trace_rays), max_bounces=int(args.max_bounces))
+            ray_segs, meta = _trace_fn(scene, n_rays=args.trace_rays, max_bounces=args.max_bounces)
+            _ray_diag_update("cpu_ray_overlay:trace:done",
+                             n_segments=int(len(ray_segs)),
+                             meta={k: str(v) for k, v in list(meta.items())[:8]})
+        except BaseException as exc:
+            _report_exception("CPU ray overlay trace", exc)
+            raise
+        print(f"  {len(ray_segs)} segments", flush=True)
+
+    # ── Phase 3: Stage light field (GPU, uses outline from scene — no physics needed) ──
     ray_field_bands = None
     ray_field_bounds = None
     ray_field_total_rays = 0
@@ -4277,7 +8646,7 @@ def main():
         active_strings = {min(A_STRING_INDEX, max(0, n_str - 1))}
     else:
         active_strings = None
-    total       = _excitation_total_samples(args.excitation, args.diagnostic_frames)
+    total        = _excitation_total_samples(args.excitation, args.diagnostic_frames)
     total_frames = int(math.ceil(total / float(BLOCK_SAMPLES)))
     if scene is not None and args.gpu_rays and args.stage_light_field:
         try:
@@ -4298,7 +8667,7 @@ def main():
             lb0, lb1 = _stage_light_bounds()
             if cached is None:
                 (baseline_light_bands, b_lb0, b_lb1, base_vbo, base_cap,
-                 base_counter, baseline_light_total_rays) = _gpu_ray_field(
+                 base_counter, baseline_light_total_rays, _bsl_stex) = _gpu_ray_field(
                     scene, outline, body_h,
                     sources=_stage_light_sources(args.stage_light_rays, args.stage_light_emitters),
                     max_bounces=max(1, args.max_bounces),
@@ -4354,7 +8723,11 @@ def main():
             paths, body_h,
             total_rays_per_string=max(256, args.gpu_field_rays // max(1, n_str) // 8),
             active_strings=active_strings)
-        all_sources = soundboard_sources + string_sources
+        all_sources = _sensor_scene_sources(
+            outline,
+            soundboard_sources + string_sources,
+            light_rays=int(args.sensor_light_rays),
+            light_emitters=int(args.stage_light_emitters))
         print(f"  {len(soundboard_sources)} soundboard + "
               f"{len(string_sources)} string emission sources", flush=True)
 
@@ -4363,12 +8736,19 @@ def main():
 
         print("GPU ray field integration ...", flush=True)
         try:
-            ray_field_bands, rb0, rb1, gpu_seg_vbo, gpu_seg_cap, _gpu_counter, ray_field_total_rays = _gpu_ray_field(
+            ray_field_bands, rb0, rb1, gpu_seg_vbo, gpu_seg_cap, _gpu_counter, ray_field_total_rays, _init_sensor_tex = _gpu_ray_field(
                 scene, outline, body_h,
                 sources=all_sources,
                 max_bounces=args.max_bounces,
                 segment_cap=args.gpu_segment_cap,
-                dispatch_batch=args.gpu_dispatch_batch)
+                dispatch_batch=args.gpu_dispatch_batch,
+                sensor_pos=np.asarray(Camera().eye, np.float32),
+                sensor_pos_space="world",
+                include_stage=True,
+                sensor_rays=int(args.sensor_rays),
+                sensor_gain=float(args.sensor_gain),
+                sensor_w=WIN_W, sensor_h=WIN_H,
+                film=R.film)
         except BaseException as exc:
             _report_exception("initial GPU ray field", exc)
             raise
@@ -4379,82 +8759,43 @@ def main():
     elif args.initial_ray_field:
         print("GPU ray field prepass skipped: scene/GPU ray field unavailable.", flush=True)
 
-    if args.gpu_smoke_exit:
-        if scene is not None and args.gpu_rays:
-            print("GPU dynamic ray field smoke frame ...", flush=True)
-            frame = None
-            while frame is None:
-                for msg in physics.poll():
-                    if msg.get("type") == "frame":
-                        frame = msg["frame"]
-                        break
-                    if msg.get("type") == "error":
-                        raise RuntimeError(msg.get("message", "physics worker failed"))
-                pygame.event.pump()
-            if args.excitation == "rest":
-                stats = _frame_equilibrium_stats(frame)
-                print(
-                    f"[equilibrium smoke] "
-                    f"p_rms={stats[0]:.3e} p_max={stats[1]:.3e} "
-                    f"plate_rms={stats[2]:.3e} plate_max={stats[3]:.3e} "
-                    f"string_max={stats[4]:.3e}",
-                    flush=True)
-            dyn_sources = _instant_soundboard_sources(
-                frame.plate, info['plate_active_2d'], outline, body_h,
-                total_rays=int(args.gpu_refresh_rays or args.gpu_field_rays),
-                stride=4)
-            dyn_sources += _string_emission_sources(
-                paths, body_h,
-                total_rays_per_string=max(
-                    64,
-                    int(args.gpu_refresh_rays or args.gpu_field_rays) // max(1, n_str) // 16),
-                active_strings=active_strings)
-            if dyn_sources:
-                try:
-                    rbands, rb0, rb1, rvbo, rcap, rcounter, _rtotal = _gpu_ray_field(
-                        scene, outline, body_h,
-                        sources=dyn_sources,
-                        max_bounces=args.max_bounces,
-                        segment_cap=args.gpu_segment_cap,
-                        dispatch_batch=args.gpu_dispatch_batch)
-                except BaseException as exc:
-                    _report_exception("GPU smoke ray field", exc)
-                    raise
-                for tex in rbands or []:
-                    glDeleteTextures([tex])
-                if rvbo is not None:
-                    glDeleteBuffers(1, [rvbo])
-                if rcounter is not None:
-                    glDeleteBuffers(1, [rcounter])
-            else:
-                print("GPU dynamic ray field smoke frame produced no sources.", flush=True)
-        physics.close()
-        _quit_pygame_with_diag("dynamic-gpu-smoke-exit")
-        return
+    # ── Phase 4: Stub info — geometry only, no AMR physics ───────────────────
+    # Build minimal info from the scene outline so the Renderer can show the
+    # guitar body, stage, and strings immediately before physics is ready.
+    _dx_early = float(config["dx"])
+    _pad_early = int(args.pressure_margin_cells)
+    _ox, _oy = outline[:, 0], outline[:, 1]
+    _gx_min_e = float(_ox.min()) - _pad_early * _dx_early
+    _gx_max_e = float(_ox.max()) + _pad_early * _dx_early
+    _gy_min_e = float(_oy.min()) - _pad_early * _dx_early
+    # Extend Y to cover the full neck + headstock (nut at ~0.578 m, headstock ~0.708 m)
+    _y_headstock_tip = BRIDGE_POS[1][1] + SCALE_LENGTH_M + 0.14
+    _gy_max_e = max(float(_oy.max()), _y_headstock_tip) + _pad_early * _dx_early
+    _gz_min_e = -_pad_early * _dx_early
+    _gz_max_e = body_h + _pad_early * _dx_early
+    info: dict = {
+        'Nx': max(4, math.ceil((_gx_max_e - _gx_min_e) / _dx_early)),
+        'Ny': max(4, math.ceil((_gy_max_e - _gy_min_e) / _dx_early)),
+        'Nz': max(4, math.ceil((_gz_max_e - _gz_min_e) / _dx_early)),
+        'dx': _dx_early,
+        'gx_min': _gx_min_e, 'gy_min': _gy_min_e, 'gz_min': _gz_min_e,
+        'n_pml': int(args.pressure_pml_cells),
+    }
 
-    # ── Ray trace (once, explicit opt-in only) ────────────────────────────────
-    ray_segs = None
-    if scene is not None and _HAS_RAY and args.cpu_ray_overlay:
-        print("Tracing geometry ...", flush=True)
-        try:
-            _ray_diag_update(
-                "cpu_ray_overlay:trace:start",
-                n_rays=int(args.trace_rays),
-                max_bounces=int(args.max_bounces),
-            )
-            ray_segs, meta = _trace_fn(
-                scene, n_rays=args.trace_rays, max_bounces=args.max_bounces)
-            _ray_diag_update(
-                "cpu_ray_overlay:trace:done",
-                n_segments=int(len(ray_segs)),
-                meta={k: str(v) for k, v in list(meta.items())[:8]},
-            )
-        except BaseException as exc:
-            _report_exception("CPU ray overlay trace", exc)
-            raise
-        print(f"  {len(ray_segs)} segments", flush=True)
+    # ── Phase 5: Start physics worker in background unless ray-program-only ──
+    physics = None
+    build_bar = None
+    build_bar_value = 0
+    physics_ready = bool(args.ray_program_only)
+    if args.ray_program_only:
+        print("Ray-program-only mode: skipping FDTD/plate physics worker.", flush=True)
+        args.capture_wav = ""
+    else:
+        print("Starting physics worker ...", flush=True)
+        physics = _PhysicsProcess(config)
+        build_bar = _make_tqdm(total=1000, desc="physics worker build", unit="permil", leave=True)
 
-    # ── Renderer ──────────────────────────────────────────────────────────────
+    # ── Phase 6: Renderer — visible immediately while physics builds ──────────
     R = Renderer(WIN_W, WIN_H, outline=outline, info=info, body_h=body_h,
                  bridge_pos=BRIDGE_POS, str_paths=paths,
                  ray_segs=ray_segs,
@@ -4473,20 +8814,145 @@ def main():
                  fretless=config["fretless"],
                  show_pickup=args.pickup,
                  show_mic=args.mic)
+    R.cam.focal_mm = float(np.clip(args.lens_focal_mm, 12.0, 180.0))
+    R.cam.focus_m = float(np.clip(args.lens_focus_m, 0.05, 20.0))
+    R.cam.aperture = float(np.clip(args.lens_aperture, 0.0, 0.08))
+    R.cam.ca = float(np.clip(args.lens_ca, 0.0, 0.02))
     if not args.ray_only_view:
         R._layers = [LAYER_ALPHA, LAYER_OPAQUE, LAYER_OPAQUE,
                      LAYER_OPAQUE, LAYER_OPAQUE, LAYER_ALPHA, LAYER_ALPHA,
-                     LAYER_ALPHA]   # 8th = illum
+                     LAYER_ALPHA,    # 8=illum
+                     LAYER_HIDDEN]   # 9=sensor
+    if args.ray_program_only:
+        R._layers = [LAYER_ALPHA, LAYER_HIDDEN, LAYER_HIDDEN,
+                     LAYER_ALPHA, LAYER_OPAQUE, LAYER_ALPHA, LAYER_ALPHA,
+                     LAYER_ALPHA, LAYER_OPAQUE]
 
-    # Transfer per-triangle ray-lit illumination if a CPU ray trace was run.
     try:
         R.set_ray_lighting(meta)
-    except NameError:
-        pass  # meta not defined (no CPU ray overlay was run)
+    except (NameError, KeyError):
+        pass
+
+    # ── Phase 6b: Initial GPU ray field + sensor accumulator (no physics needed) ─
+    # Build BVH geometry and sensor accumulator only — no blocking initial ray dispatch.
+    # The streaming pump (notify_frame / pump_forward) fires rays progressively per frame.
+    if scene is not None and args.gpu_rays:
+        print("Building sensor accumulator from geometry (streaming mode) ...", flush=True)
+        try:
+            (ray_field_bands, _rb0, _rb1,
+             gpu_seg_vbo, gpu_seg_cap, _gpu_counter,
+             ray_field_total_rays, _init_sensor_acc) = _gpu_ray_field(
+                scene, outline, body_h,
+                sources=[],
+                max_bounces=args.max_bounces,
+                segment_cap=args.gpu_segment_cap,
+                dispatch_batch=args.gpu_dispatch_batch,
+                sensor_pos=np.asarray(R.cam.eye, np.float32),
+                sensor_pos_space="world",
+                include_stage=True,
+                sensor_rays=0,
+                sensor_gain=float(args.sensor_gain),
+                sensor_w=WIN_W, sensor_h=WIN_H,
+                sim_bounds=(R._bmin, R._bmax))
+            ray_field_bounds = (_rb0, _rb1)
+            R.replace_ray_field(ray_field_bands, ray_field_bounds,
+                                gpu_seg_vbo, gpu_seg_cap, _gpu_counter,
+                                total_rays=ray_field_total_rays)
+            if _init_sensor_acc is not None:
+                R.attach_sensor_accumulator(_init_sensor_acc)
+                # Seed the streaming source worker with the initial geometry
+                # so pump_forward() has a dispatch ring ready on the first frame.
+                _init_sensor_acc.notify_frame(
+                    frame=None,
+                    info=info,
+                    outline=outline,
+                    body_h=body_h,
+                    paths=paths,
+                    active_strings=active_strings,
+                    refresh_rays=int(args.gpu_field_rays),
+                    sensor_light_rays=int(args.sensor_light_rays),
+                    stage_light_emitters=int(args.stage_light_emitters),
+                )
+        except BaseException as exc:
+            _report_exception("initial geometry GPU ray field", exc)
+            raise
+
+    # gpu_smoke_exit: needs a physics frame; poll until one arrives then exit.
+    if args.gpu_smoke_exit:
+        if physics is None:
+            _quit_pygame_with_diag("ray-program-only-gpu-smoke-exit")
+            return
+        if scene is not None and args.gpu_rays:
+            print("GPU dynamic ray field smoke frame ...", flush=True)
+            frame = None
+            while frame is None:
+                for msg in physics.poll():
+                    if msg.get("type") == "frame":
+                        frame = msg["frame"]
+                        break
+                    if msg.get("type") == "ready":
+                        info = msg["info"]
+                        body_h = float(msg["body_h"])
+                        outline = np.asarray(msg["outline"], dtype=np.float32)
+                        paths = _string_paths(outline, body_h, n_strings=n_str,
+                                              n_segs=args.render_segs,
+                                              fret=int(msg["config"].get("fret", 0)))
+                        R.rebuild_physics(None, info, paths, body_h)
+                        physics_ready = True
+                    if msg.get("type") == "error":
+                        raise RuntimeError(_worker_error_message(msg))
+                pygame.event.pump()
+            if physics_ready and 'plate_active_2d' in info:
+                dyn_sources = _instant_soundboard_sources(
+                    frame.plate, info['plate_active_2d'], outline, body_h,
+                    total_rays=int(args.gpu_refresh_rays or args.gpu_field_rays),
+                    stride=4)
+            else:
+                dyn_sources = []
+            dyn_sources += _string_emission_sources(
+                paths, body_h,
+                total_rays_per_string=max(
+                    64,
+                    int(args.gpu_refresh_rays or args.gpu_field_rays) // max(1, n_str) // 16),
+                active_strings=active_strings)
+            dyn_sources = _sensor_scene_sources(
+                outline, dyn_sources,
+                light_rays=int(args.sensor_light_rays),
+                light_emitters=int(args.stage_light_emitters))
+            if dyn_sources:
+                try:
+                    rbands, rb0, rb1, rvbo, rcap, rcounter, _rtotal, _smoke_stex = _gpu_ray_field(
+                        scene, outline, body_h,
+                        sources=dyn_sources,
+                        max_bounces=args.max_bounces,
+                        segment_cap=args.gpu_segment_cap,
+                        dispatch_batch=args.gpu_dispatch_batch,
+                        sensor_pos=np.asarray(Camera().eye, np.float32),
+                        sensor_pos_space="world",
+                        include_stage=True,
+                        sensor_rays=int(args.sensor_rays),
+                        sensor_gain=float(args.sensor_gain),
+                        film=R.film)
+                except BaseException as exc:
+                    _report_exception("GPU smoke ray field", exc)
+                    raise
+                for tex in rbands or []:
+                    glDeleteTextures([tex])
+                if rvbo is not None:
+                    glDeleteBuffers(1, [rvbo])
+                if rcounter is not None:
+                    glDeleteBuffers(1, [rcounter])
+            else:
+                print("GPU dynamic ray field smoke frame produced no sources.", flush=True)
+        if physics is not None:
+            physics.close()
+        _quit_pygame_with_diag("dynamic-gpu-smoke-exit")
+        return
 
     panel = _SliderPanel()
+    panel._btn_callback = R.reset_sensor  # "New Frame [C]" button
     # Sync panel default values with whatever args resolved to
-    panel.values['rays']     = int(args.gpu_field_rays or 1000)
+    panel.values['ray_density'] = float(args.ray_density)
     panel.values['segs']     = int(args.render_segs)
     panel.values['plate_th'] = int(args.plate_theta)
     panel.values['dx']       = float(args.dx)
@@ -4494,13 +8960,19 @@ def main():
     panel.values['ray_gamma'] = float(GPU_RAY_FIELD_GAMMA)
     panel.values['mic_gain'] = 1.0 if args.mic else 0.0
     panel.values['pickup_gain'] = 1.0 if args.pickup else 0.0
+    panel.values['lens_aperture'] = float(R.cam.aperture)
+    panel.values['lens_ca'] = float(R.cam.ca)
     panel._prev = dict(panel.values)
     R.set_ray_tonemap(
         exposure=float(panel.values['ray_exposure']),
         gamma=float(panel.values['ray_gamma']))
 
-    print(f"Physics worker is streaming frames ({physics.mode}); "
-          "UI will keep cached frames while rebuilds run.", flush=True)
+    if physics is not None:
+        print(f"Physics worker is streaming frames ({physics.mode}); "
+              "UI will keep cached frames while rebuilds run.", flush=True)
+    else:
+        print("Ray camera mode: static scene ray tracer only; physics streaming disabled.",
+              flush=True)
     if args.excitation == "rest":
         print("Diagnostic rest mode: no plucks are scheduled; reporting equilibrium drift.",
               flush=True)
@@ -4514,6 +8986,7 @@ def main():
     last_mouse  = (0, 0)
     refresh_every = max(0, int(args.gpu_refresh_every))
     refresh_rays = int(args.gpu_refresh_rays or args.gpu_field_rays)
+    sensor_light_rays = int(args.sensor_light_rays)
     force_ray_refresh = False
     pending_rebuild = False
     active_ray_frame_index = None
@@ -4524,45 +8997,34 @@ def main():
     if args.capture_wav:
         capture = _CaptureSet(args.capture_wav, args.capture_source)
 
-    print("1-7 toggle layers | P plate mode | SPACE pause | R restart | "
-          f"Q quit | drag=orbit wheel=zoom | excitation={args.excitation}", flush=True)
+    print("1-9 layers | WASD pan | Q/Z height | drag look | arrows tilt-shift | "
+          "+/- focal | [] focus | ,/. aperture | F step | C reset sensor | Esc quit | "
+          f"excitation={args.excitation}", flush=True)
 
     def _refresh_ray_field_from_frame(frame: Frame | None, frame_index: int, reason: str) -> bool:
+        """Non-blocking: posts a source-computation job to the background worker.
+        The source worker computes new sources asynchronously; the GL thread
+        drains the result via pump_forward() on subsequent display frames.
+        No GL calls here — returns immediately."""
         nonlocal active_ray_frame_index, force_ray_refresh
-        if frame is None or scene is None or not args.gpu_rays or refresh_every <= 0:
+        acc = R._sensor_acc
+        if acc is None or scene is None or not args.gpu_rays:
             return False
-        if frame_index < 0:
+        if frame_index < 0 and frame is None:
             return False
-        if not force_ray_refresh and (frame_index % refresh_every) != 0:
+        if not force_ray_refresh and refresh_every > 0 and frame_index >= 0 and (frame_index % refresh_every) != 0:
             return False
-        dyn_sources = _instant_soundboard_sources(
-            frame.plate, info['plate_active_2d'], outline, body_h,
-            total_rays=refresh_rays, stride=4)
-        dyn_sources += _string_emission_sources(
-            paths, body_h,
-            total_rays_per_string=max(64, refresh_rays // max(1, n_str) // 16),
-            active_strings=active_strings)
-        if not dyn_sources:
-            force_ray_refresh = False
-            return False
-        print(f"Refreshing GPU ray field from cached frame {frame_index} [{reason}] "
-              f"({sum(s[2] for s in dyn_sources)} rays)", flush=True)
-        try:
-            rbands, rb0, rb1, rvbo, rcap, rcounter, dyn_total_rays = _gpu_ray_field(
-                scene, outline, body_h,
-                sources=dyn_sources,
-                max_bounces=args.max_bounces,
-                segment_cap=args.gpu_segment_cap,
-                dispatch_batch=args.gpu_dispatch_batch)
-        except BaseException as exc:
-            _report_exception(f"dynamic GPU ray field frame {frame_index}", exc)
-            raise
-        try:
-            R.replace_ray_field(rbands, (rb0, rb1), rvbo, rcap, rcounter,
-                                total_rays=dyn_total_rays)
-        except BaseException as exc:
-            _report_exception(f"dynamic GPU ray field replace frame {frame_index}", exc)
-            raise
+        acc.notify_frame(
+            frame=frame,
+            info=info,
+            outline=outline,
+            body_h=body_h,
+            paths=paths,
+            active_strings=active_strings,
+            refresh_rays=refresh_rays,
+            sensor_light_rays=sensor_light_rays,
+            stage_light_emitters=int(args.stage_light_emitters),
+        )
         active_ray_frame_index = frame_index
         force_ray_refresh = False
         return True
@@ -4575,30 +9037,77 @@ def main():
             if ev.type == QUIT:
                 running = False
             elif ev.type == KEYDOWN:
-                if ev.key == K_q:
+                camera_dirty = False
+                if ev.key == pygame.K_ESCAPE:
                     running = False
                 elif ev.key == K_SPACE:
                     R._paused = not R._paused
+                elif ev.key == pygame.K_f:
+                    R.advance_frame(1)
+                    R.advance_sensor(1)
+                    replaying = True if R._frames else replaying
+                elif ev.key == pygame.K_c:
+                    R.reset_sensor()
+                elif ev.key == pygame.K_w:
+                    R.cam.pan(forward_m=0.04); R.cam._auto = 0.0; camera_dirty = True
+                elif ev.key == pygame.K_s:
+                    R.cam.pan(forward_m=-0.04); R.cam._auto = 0.0; camera_dirty = True
+                elif ev.key == pygame.K_a:
+                    R.cam.pan(right_m=-0.04); R.cam._auto = 0.0; camera_dirty = True
+                elif ev.key == pygame.K_d:
+                    R.cam.pan(right_m=0.04); R.cam._auto = 0.0; camera_dirty = True
+                elif ev.key == pygame.K_q:
+                    R.cam.pan(up_m=0.04); R.cam._auto = 0.0; camera_dirty = True
+                elif ev.key == pygame.K_z:
+                    R.cam.pan(up_m=-0.04); R.cam._auto = 0.0; camera_dirty = True
+                elif ev.key == pygame.K_LEFT:
+                    R.cam.tilt_shift[0] = float(np.clip(R.cam.tilt_shift[0] - 0.03, -1.0, 1.0)); camera_dirty = True
+                elif ev.key == pygame.K_RIGHT:
+                    R.cam.tilt_shift[0] = float(np.clip(R.cam.tilt_shift[0] + 0.03, -1.0, 1.0)); camera_dirty = True
+                elif ev.key == pygame.K_UP:
+                    R.cam.tilt_shift[1] = float(np.clip(R.cam.tilt_shift[1] + 0.03, -1.0, 1.0)); camera_dirty = True
+                elif ev.key == pygame.K_DOWN:
+                    R.cam.tilt_shift[1] = float(np.clip(R.cam.tilt_shift[1] - 0.03, -1.0, 1.0)); camera_dirty = True
+                elif ev.key in (pygame.K_EQUALS, getattr(pygame, "K_PLUS", pygame.K_EQUALS), pygame.K_KP_PLUS):
+                    R.cam.set_lens(focal_delta=5.0); camera_dirty = True
+                elif ev.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                    R.cam.set_lens(focal_delta=-5.0); camera_dirty = True
+                elif ev.key == pygame.K_LEFTBRACKET:
+                    R.cam.set_lens(focus_delta=-0.10); camera_dirty = True
+                elif ev.key == pygame.K_RIGHTBRACKET:
+                    R.cam.set_lens(focus_delta=0.10); camera_dirty = True
+                elif ev.key == pygame.K_COMMA:
+                    R.cam.aperture = 0.0 if R.cam.aperture <= 0.001 else float(np.clip(R.cam.aperture / 1.25, 0.0, 0.08))
+                    panel.values['lens_aperture'] = R.cam.aperture
+                    camera_dirty = True
+                elif ev.key == pygame.K_PERIOD:
+                    R.cam.aperture = float(np.clip(max(0.002, R.cam.aperture * 1.25), 0.0, 0.08))
+                    panel.values['lens_aperture'] = R.cam.aperture
+                    camera_dirty = True
                 elif ev.key == K_r:
-                    new_segs = int(panel.values['segs'])
-                    new_dx   = float(panel.values['dx'])
-                    if new_segs != args.render_segs or abs(new_dx - args.dx) > 1e-6:
-                        print(f"Queueing physics rebuild (segs={new_segs}, "
-                              f"dx={new_dx:.4f}, margin={args.pressure_margin_cells} cells, "
-                              f"pml={args.pressure_pml_cells} cells) ...", flush=True)
-                        config.update({"render_segs": new_segs, "dx": new_dx})
-                        physics.send({"type": "reconfigure", "config": dict(config)})
-                        pending_rebuild = True
+                    if physics is None:
+                        R.reset_sensor()
+                        force_ray_refresh = refresh_every > 0
                     else:
-                        physics.send({"type": "restart"})
-                    R._frames.clear(); R._cursor = 0; fi = 0
-                    recorded_samples = 0
-                    for env in R._str_env: env[:] = 0.0
-                    replaying = False
-                    force_ray_refresh = refresh_every > 0
-                    active_ray_frame_index = None
-                    last_displayed_frame_index = None
-                    print("Restart requested")
+                        new_segs = int(panel.values['segs'])
+                        new_dx   = float(panel.values['dx'])
+                        if new_segs != args.render_segs or abs(new_dx - args.dx) > 1e-6:
+                            print(f"Queueing physics rebuild (segs={new_segs}, "
+                                  f"dx={new_dx:.4f}, margin={args.pressure_margin_cells} cells, "
+                                  f"pml={args.pressure_pml_cells} cells) ...", flush=True)
+                            config.update({"render_segs": new_segs, "dx": new_dx})
+                            physics.send({"type": "reconfigure", "config": dict(config)})
+                            pending_rebuild = True
+                        else:
+                            physics.send({"type": "restart"})
+                        R._frames.clear(); R._cursor = 0; fi = 0
+                        recorded_samples = 0
+                        for env in R._str_env: env[:] = 0.0
+                        replaying = False
+                        force_ray_refresh = refresh_every > 0
+                        active_ray_frame_index = None
+                        last_displayed_frame_index = None
+                        print("Restart requested")
                 elif ev.key == K_p:
                     print(f"Plate mode: {R.cycle_plate_mode()}")
                 else:
@@ -4607,21 +9116,45 @@ def main():
                             R.toggle(ki)
                             s = ['OPAQUE','ALPHA','HIDDEN'][R._layers[ki]]
                             print(f"Layer {ki+1} ({LAYER_NAMES[ki]}): {s}")
+                if camera_dirty:
+                    R.sync_sensor_camera(reset=False)
             elif ev.type == MOUSEBUTTONDOWN and ev.button == 1:
                 dragging = True; last_mouse = ev.pos
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                 dragging = False
             elif ev.type == MOUSEMOTION and dragging:
                 dx, dy = ev.pos[0]-last_mouse[0], ev.pos[1]-last_mouse[1]
-                R.cam.orbit(dx*0.35, dy*0.25); R.cam._auto = 0.0
+                R.cam.orbit(dx*0.35, -dy*0.25); R.cam._auto = 0.0
+                R.sync_sensor_camera(reset=False)
                 last_mouse = ev.pos
             elif ev.type == MOUSEWHEEL:
                 R.cam.zoom(-ev.y * 0.04)
+                R.sync_sensor_camera(reset=False)
 
-        for msg in physics.poll():
+        for msg in (physics.poll() if physics is not None else []):
             mtype = msg.get("type")
             if mtype == "error":
-                raise RuntimeError(msg.get("message", "physics worker failed"))
+                if build_bar is not None and not physics_ready:
+                    build_bar.close()
+                raise RuntimeError(_worker_error_message(msg))
+            if mtype == "progress" and not physics_ready:
+                frac = max(0.0, min(1.0, float(msg.get("frac", 0.0))))
+                label = str(msg.get("label", ""))
+                if build_bar is not None:
+                    target = int(round(frac * 1000.0))
+                    if target > build_bar_value:
+                        build_bar.update(target - build_bar_value)
+                        build_bar_value = target
+                    build_bar.set_postfix_str(label[-80:])
+                else:
+                    print(f"[physics] {frac*100:.1f}%  {label}", flush=True)
+                continue
+            if mtype == "profile":
+                text = msg.get("text", "")
+                if text:
+                    sys.stderr.write(text)
+                    sys.stderr.flush()
+                continue
             if mtype == "rebuilding":
                 pending_rebuild = True
                 continue
@@ -4650,6 +9183,13 @@ def main():
                 recorded_samples = 0
                 active_ray_frame_index = None
                 last_displayed_frame_index = None
+                if not physics_ready:
+                    physics_ready = True
+                    if build_bar is not None:
+                        if build_bar_value < 1000:
+                            build_bar.update(1000 - build_bar_value)
+                        build_bar.close()
+                        build_bar = None
                 print(f"  Worker ready: Grid {info['Nx']}×{info['Ny']}×{info['Nz']}",
                       flush=True)
                 continue
@@ -4690,16 +9230,17 @@ def main():
                 mic *= float(panel.values.get("mic_gain", 1.0))
                 pickup *= float(panel.values.get("pickup_gain", 1.0))
                 capture.write(mic, pickup)
-            if scene is not None and args.gpu_rays and refresh_every > 0:
-                do_refresh = force_ray_refresh or (fi % refresh_every == 0)
-                if do_refresh:
-                    _refresh_ray_field_from_frame(frame, fi, "stream")
+            if scene is not None and args.gpu_rays and R._sensor_acc is not None:
+                # Non-blocking: posts to source worker; pump_forward() drains it.
+                _refresh_ray_field_from_frame(frame, fi, "stream")
             fi += 1
 
         # ── Apply live slider changes ──────────────────────────────────────────
         changed = panel.changed()
-        if 'rays' in changed:
-            refresh_rays = int(panel.values['rays'])
+        if 'ray_density' in changed:
+            _density = float(panel.values['ray_density'])
+            refresh_rays = max(1, int(round(float(args.sound_energy_rays) * _density)))
+            sensor_light_rays = max(1, int(round(float(args.em_energy_rays) * _density)))
             if refresh_every > 0:
                 force_ray_refresh = True
         if 'plate_th' in changed:
@@ -4713,6 +9254,38 @@ def main():
             R.show_mic = panel.values['mic_gain'] > 0.0
         if 'pickup_gain' in changed:
             R.show_pickup = panel.values['pickup_gain'] > 0.0
+        if 'sensor_iso' in changed:
+            R.film.active_layer.iso = float(panel.values['sensor_iso'])
+        if 'sensor_rate' in changed and R._sensor_acc is not None:
+            R._sensor_acc._rows_per_frame = max(1, int(round(panel.values['sensor_rate'])))
+        if 'sensor_spp' in changed and R._sensor_acc is not None:
+            R._sensor_acc._samples_per_pixel = max(1, int(round(panel.values['sensor_spp'])))
+        if 'sensor_fps' in changed:
+            R._sensor_fps = max(0.0, float(panel.values['sensor_fps']))
+        if 'frame_step' in changed:
+            R._frame_step = max(0, int(round(panel.values['frame_step'])))
+        if 'lens_aperture' in changed:
+            R.cam.aperture = float(np.clip(panel.values['lens_aperture'], 0.0, 0.08))
+            R.sync_sensor_camera(reset=False)
+        if 'lens_ca' in changed:
+            R.cam.ca = float(np.clip(panel.values['lens_ca'], 0.0, 0.02))
+            R.sync_sensor_camera(reset=False)
+        if 'film_hue' in changed or 'film_sat' in changed:
+            # Write directly onto the active film layer so composite_hsl() picks
+            # it up at the next blit — no accumulator reset required.
+            _al = R.film.active_layer
+            _al.hue        = float(panel.values['film_hue'])
+            _al.saturation = float(np.clip(panel.values['film_sat'], 0.0, 2.0))
+
+        if 'film_decay' in changed and R._sensor_acc is not None:
+            # Update the accumulator's half-life; takes effect on next apply_decay().
+            R._sensor_acc.half_life = max(0.0, float(panel.values['film_decay']))
+        if 'air_diff' in changed and R._sensor_acc is not None:
+            R._sensor_acc._air_ds = float(panel.values['air_diff'])
+        if 'air_spec' in changed and R._sensor_acc is not None:
+            R._sensor_acc._air_ss = float(panel.values['air_spec'])
+        if 'air_aniso' in changed and R._sensor_acc is not None:
+            R._sensor_acc._air_an = float(panel.values['air_aniso'])
 
         try:
             _ray_diag_update(
@@ -4740,8 +9313,21 @@ def main():
                             None)
                     _refresh_ray_field_from_frame(refresh_frame, target_ray_frame_index, "replay")
                 last_displayed_frame_index = cur_frame_index
+            R.tick_sensor()
             R.render()
             panel.draw(WIN_W, WIN_H)
+            panel._draw_hud_text(R.camera_hud(), WIN_W // 2, 14, WIN_W, WIN_H, center=True)
+            # Sensor status overlay — shown whenever layer 9 is ALPHA or OPAQUE
+            if R._layers[8] != LAYER_HIDDEN:
+                acc = R._sensor_acc
+                if acc is not None and acc._active:
+                    _rpf = acc._w * int(acc._rows_per_frame) * int(acc._samples_per_pixel)
+                    _sstat = (f"SENSOR  pass {acc._pass}  frame {acc._frame}  "
+                              f"{acc._w}x{acc._h}  +{_rpf} rays/frame  "
+                              f"{R._sensor_fps:.0f} fps reset")
+                else:
+                    _sstat = "SENSOR: no accumulator (needs --gpu-rays)"
+                panel._draw_hud_text(_sstat, WIN_W // 2, WIN_H - 28, WIN_W, WIN_H, center=True)
             panel.draw_progress(
                 WIN_W, WIN_H,
                 recorded_samples=max(recorded_samples, min(total, len(R._frames) * BLOCK_SAMPLES)),
@@ -4759,7 +9345,8 @@ def main():
         if capture is not None:
             capture.close()
             print(f"Wrote capture: {', '.join(capture.paths)}", flush=True)
-        physics.close()
+        if physics is not None:
+            physics.close()
 
     _quit_pygame_with_diag("main-exit")
 

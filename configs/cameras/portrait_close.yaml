@@ -1,0 +1,17 @@
+# Camera preset: portrait_close
+# Close-in portrait angle — 85 mm telephoto; slightly from the side.
+# Good for showing string vibration close-up with background compression.
+
+name: portrait_close
+sensor: full_frame_35mm
+lens: portrait_85mm
+
+target: [0.0, 0.55, 0.72]
+dist: 1.1
+elev: 8.0
+az: 38.0
+
+aperture_mm: 0.0
+focus_m: 1.1
+ca: 0.0
+tilt_shift: [0.0, 0.0]

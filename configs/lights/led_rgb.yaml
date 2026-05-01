@@ -1,0 +1,19 @@
+# Light: led_rgb
+# RGB LED studio fixture (programmable full-spectrum wash).
+# Default: white balanced (equal R/G/B contribution).  Can be dialled
+# by adjusting the band weights manually.
+
+name: led_rgb
+description: "RGB LED wash light — programmable, default white"
+
+spectrum:
+  type: gaussian_peaks
+  peaks:
+    - {nm: 455, fwhm_nm: 25, weight: 0.28}  # blue LED
+    - {nm: 525, fwhm_nm: 35, weight: 0.38}  # green LED
+    - {nm: 635, fwhm_nm: 20, weight: 0.28}  # red LED
+    - {nm: 700, fwhm_nm: 30, weight: 0.06}  # deep-red / NIR edge
+
+color_temperature_k: 5600.0
+beam_angle_deg: 40.0
+n_emitters: 6

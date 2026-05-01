@@ -1,0 +1,80 @@
+# Film type: Fujifilm Velvia 100
+# E-6 reversal (slide) film — extremely high saturation, deep blacks,
+# exaggerated colour contrast.  Greens and blues are vivid; reds are punchy.
+# Acoustic analogue: maximum saturation, high-contrast response, fine grain.
+
+name: fuji_velvia_100
+description: "Fujifilm Velvia 100 — E-6 reversal slide film (high saturation)"
+
+active: cyan_layer
+
+layers:
+  - name: cyan_layer
+    domain: acoustic
+    iso: 0.9
+    gamma: 2.55
+    negative: false
+    rotate180: true
+    opacity: 1.0
+    blend_mode: add
+    hue: 185.0       # rich cyan-teal
+    saturation: 1.7
+    spectral_bands:
+      - center_hz: 100.0
+        q: 3.0
+        gain: 0.8
+        label: "B0"
+      - center_hz: 330.0
+        q: 3.0
+        gain: 1.8
+        label: "B1"
+      - center_hz: 680.0
+        q: 3.0
+        gain: 2.2
+        label: "B2"
+      - center_hz: 1800.0
+        q: 2.5
+        gain: 1.0
+        label: "B3"
+    activation: power
+    activation_params: {gain: 1.4, exponent: 0.75}
+    tone_shadows:    [0.00, 0.01, 0.04]
+    tone_highlights: [0.22, 0.88, 1.00]
+    grain_sigma: 0.006
+    grain_size: 0.7
+    grain_colorimetry: chromatic
+
+  - name: magenta_layer
+    domain: acoustic
+    iso: 0.9
+    gamma: 2.55
+    negative: false
+    rotate180: true
+    opacity: 0.65
+    blend_mode: add
+    hue: 305.0       # vivid magenta
+    saturation: 1.6
+    spectral_bands:
+      - center_hz: 110.0
+        q: 3.0
+        gain: 1.8
+        label: "B0"
+      - center_hz: 300.0
+        q: 3.0
+        gain: 0.6
+        label: "B1"
+      - center_hz: 620.0
+        q: 3.0
+        gain: 0.3
+        label: "B2"
+      - center_hz: 2200.0
+        q: 2.5
+        gain: 2.0
+        label: "B3"
+    activation: power
+    activation_params: {gain: 1.4, exponent: 0.75}
+    tone_shadows:    [0.02, 0.00, 0.02]
+    tone_highlights: [1.00, 0.18, 0.82]
+    grain_sigma: 0.006
+    grain_size: 0.7
+    grain_colorimetry: chromatic

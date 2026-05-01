@@ -1,0 +1,19 @@
+# Material: mahogany_body
+# Acoustic guitar body — mahogany back and sides (Honduras / African mahogany).
+# Warm reddish-brown open-grain hardwood, typically clear-coated with nitrocellulose lacquer.
+
+name: mahogany_body
+description: Guitar body back and sides — mahogany hardwood
+
+albedo_rgb: [0.50, 0.28, 0.12]       # linear sRGB — warm reddish-brown
+reflectivity: 0.72                     # total fraction of energy reflected
+diffusion: 0.35                        # diffuse share of reflection (vs specular)
+absorption: 0.08                       # per-bounce loss
+
+smoothness: 0.62                       # microsurface smoothness [0=matte, 1=mirror]
+ior: 1.52                              # index of refraction (lacquered wood)
+
+notes: >
+  Lacquer finish shifts the surface toward specular.  The albedo is measured
+  under neutral illumination at ~45°/0° geometry.  Darker billets (e.g. old-growth
+  or stained) should reduce albedo_rgb by 15–25%.

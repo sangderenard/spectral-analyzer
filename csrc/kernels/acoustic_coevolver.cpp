@@ -20,11 +20,19 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
+#include <string>
 
 #include <Eigen/Core>
 
 #include <atomic>
 #include <thread>
+
+namespace {
+thread_local std::string g_coevolver_amr_create_error;
+static void coevolver_amr_set_error(const char* stage) {
+    g_coevolver_amr_create_error = stage ? stage : "";
+}
+} // namespace
 
 
 /* ── Constants ────────────────────────────────────────────────────────────── */
@@ -557,13 +565,17 @@ static int string_update_geometric_tension(StringState* ss)
     if (!ss || ss->n_nodes < 2 || ss->ds <= 0.0f || ss->total_length <= 0.0f)
         return CE_ERR_UNSTABLE;
 
-    float arc = 0.0f;
-    for (int i = 0; i < ss->n_nodes - 1; ++i) {
-        float du0 = ss->u[0][i + 1] - ss->u[0][i];
-        float du1 = ss->u[1][i + 1] - ss->u[1][i];
-        if (!isfinite(du0) || !isfinite(du1)) return CE_ERR_UNSTABLE;
-        arc += sqrtf(ss->ds * ss->ds + du0 * du0 + du1 * du1);
-    }
+    using CArr = Eigen::Map<const Eigen::ArrayXf>;
+    const int Nseg = ss->n_nodes - 1;
+    CArr u0(ss->u[0], ss->n_nodes);
+    CArr u1(ss->u[1], ss->n_nodes);
+
+    Eigen::ArrayXf du0 = u0.tail(Nseg) - u0.head(Nseg);
+    Eigen::ArrayXf du1 = u1.tail(Nseg) - u1.head(Nseg);
+    if (!du0.isFinite().all() || !du1.isFinite().all()) return CE_ERR_UNSTABLE;
+
+    const float ds2 = ss->ds * ss->ds;
+    const float arc = (ds2 + du0.square() + du1.square()).sqrt().sum();
 
     float strain = (arc - ss->total_length) / ss->total_length;
     if (!isfinite(strain)) return CE_ERR_UNSTABLE;
@@ -611,8 +623,10 @@ static int string_step_pol(StringState* ss, int pol, float nut_bc_w)
     /* Interior nodes [1 .. N-2]: fully vectorised 3-point wave stencil. */
     if (N > 2) {
         const int M = N - 2;
+        auto dst = ut.segment(1, M);
+
         /* Numerator: 2u − (1−γdt/2)u_prev + c²·lap + fe */
-        Eigen::ArrayXf new_u =
+        dst =
               2.0f * u.segment(1, M)
             - (1.0f - half_gdt) * up.segment(1, M)
             + c2 * (u.segment(2, M) - 2.0f * u.segment(1, M) + u.segment(0, M))
@@ -621,20 +635,18 @@ static int string_step_pol(StringState* ss, int pol, float nut_bc_w)
         /* Biharmonic stiffness correction — nodes [2..N-3] (5-point stencil). */
         if (N > 4 && ss->biharm_coef > 0.0f) {
             const int M2 = N - 4;   /* nodes 2..N-3 */
-            Eigen::ArrayXf biharm =
+            dst.segment(1, M2) -= ss->biharm_coef * (
                   u.segment(0, M2)
                 - 4.0f * u.segment(1, M2)
                 + 6.0f * u.segment(2, M2)
                 - 4.0f * u.segment(3, M2)
-                + u.segment(4, M2);
-            new_u.segment(1, M2) -= ss->biharm_coef * biharm;
+                + u.segment(4, M2));
         }
 
         /* Divide numerator by (1 + γdt/2) to complete the centered update. */
-        new_u *= inv_1pg;
+        dst *= inv_1pg;
 
-        if (!new_u.isFinite().all()) return CE_ERR_UNSTABLE;
-        ut.segment(1, M) = new_u;
+        if (!dst.isFinite().all()) return CE_ERR_UNSTABLE;
     }
 
     /* Pointer swap — Maps above are stack-local, buffers stay valid */
@@ -1370,6 +1382,8 @@ fail:
 
 /* ── coevolver_create_amr ────────────────────────────────────────────────── */
 
+#define AMR_FAIL(stage) do { coevolver_amr_set_error(stage); goto fail; } while(0)
+
 SK_API AcousticCoEvolverState* coevolver_create_amr(
     int                           n_strings,
     const CoEvolverStringDef*     string_defs,
@@ -1381,9 +1395,22 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
     float                         sample_rate,
     int                           modal_stride)
 {
-    if (!string_defs || !pickup_defs || !mic_defs || !amr_desc) return NULL;
-    if (n_strings < 0 || n_pickups < 0 || n_mics < 0) return NULL;
-    if (sample_rate <= 0 || modal_stride <= 0) return NULL;
+    coevolver_amr_set_error("");
+    if (n_strings < 0 || n_pickups < 0 || n_mics < 0) {
+        coevolver_amr_set_error("invalid_counts");
+        return NULL;
+    }
+    if ((n_strings > 0 && !string_defs) ||
+        (n_pickups > 0 && !pickup_defs) ||
+        (n_mics    > 0 && !mic_defs) ||
+        !amr_desc) {
+        coevolver_amr_set_error("invalid_null_args");
+        return NULL;
+    }
+    if (sample_rate <= 0 || modal_stride <= 0) {
+        coevolver_amr_set_error("invalid_timing_args");
+        return NULL;
+    }
 
     AcousticCoEvolverState* st =
         (AcousticCoEvolverState*)calloc(1, sizeof(AcousticCoEvolverState));
@@ -1394,7 +1421,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
 
     /* ── Create AMR pressure backend (fails loudly on invalid descriptor) ── */
     st->pressure_backend = amr_pressure_backend_create(amr_desc);
-    if (!st->pressure_backend) goto fail;
+    if (!st->pressure_backend) AMR_FAIL("pressure_backend_create");
 
     /* Mirror plate grid dims into the coevolver's grid fields so that the
      * saddle bilinear indexing and bridge kernel use the plate coordinate
@@ -1412,7 +1439,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
     st->sample_rate  = sample_rate;
     st->dt_audio     = 1.0f / sample_rate;
     st->dt_fdtd      = (float)st->pressure_backend->get_dt();
-    if (st->dt_fdtd <= 0.0f) goto fail;
+    if (st->dt_fdtd <= 0.0f) AMR_FAIL("dt_fdtd_invalid");
     st->force_scale  = 1.0f;
     st->gamma_scale  = 1.0f;
     st->modal_stride = modal_stride;
@@ -1433,7 +1460,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
         int nb = amr_desc->n_bridge_plate;
         st->bridge_cell_idx = alloc_i(nb);
         st->bridge_cell_wgt = alloc_f(nb);
-        if (!st->bridge_cell_idx || !st->bridge_cell_wgt) goto fail;
+        if (!st->bridge_cell_idx || !st->bridge_cell_wgt) AMR_FAIL("bridge_cells_alloc");
         memcpy(st->bridge_cell_idx, amr_desc->bridge_plate_idx, nb * sizeof(int));
         memcpy(st->bridge_cell_wgt, amr_desc->bridge_plate_wgt, nb * sizeof(float));
         st->n_bridge_cells = nb;
@@ -1444,7 +1471,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
         int nn = amr_desc->n_neck_plate;
         st->neck_plate_idx = alloc_i(nn);
         st->neck_plate_wgt = alloc_f(nn);
-        if (!st->neck_plate_idx || !st->neck_plate_wgt) goto fail;
+        if (!st->neck_plate_idx || !st->neck_plate_wgt) AMR_FAIL("neck_cells_alloc");
         memcpy(st->neck_plate_idx, amr_desc->neck_plate_idx, nn * sizeof(int));
         memcpy(st->neck_plate_wgt, amr_desc->neck_plate_wgt, nn * sizeof(float));
         st->n_neck_plate_cells = nn;
@@ -1454,11 +1481,11 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
     st->n_strings = n_strings;
     st->strings   = (StringState*)calloc(n_strings > 0 ? n_strings : 1,
                                           sizeof(StringState));
-    if (!st->strings) goto fail;
+    if (!st->strings) AMR_FAIL("strings_alloc");
 
     for (int si = 0; si < n_strings; ++si) {
         StringState* ss = string_create(&string_defs[si], st->dt_fdtd);
-        if (!ss) goto fail;
+        if (!ss) AMR_FAIL("string_create");
         st->strings[si] = *ss;
         free(ss);
     }
@@ -1488,7 +1515,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
     st->n_pickups = n_pickups;
     st->pickups   = (PickupState*)calloc(n_pickups > 0 ? n_pickups : 1,
                                           sizeof(PickupState));
-    if (!st->pickups) goto fail;
+    if (!st->pickups) AMR_FAIL("pickups_alloc");
 
     for (int pi = 0; pi < n_pickups; ++pi) {
         PickupState* pk = &st->pickups[pi];
@@ -1503,14 +1530,14 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
         pk->n_segs_per_string = alloc_i(n_strings > 0 ? n_strings : 1);
         pk->Bn_kernel = (float**)calloc(n_strings > 0 ? n_strings : 1, sizeof(float*));
         pk->Bb_kernel = (float**)calloc(n_strings > 0 ? n_strings : 1, sizeof(float*));
-        if (!pk->n_segs_per_string || !pk->Bn_kernel || !pk->Bb_kernel) goto fail;
+        if (!pk->n_segs_per_string || !pk->Bn_kernel || !pk->Bb_kernel) AMR_FAIL("pickup_arrays_alloc");
 
         for (int si = 0; si < n_strings; ++si) {
             pk->n_segs_per_string[si] = st->strings[si].n_segs;
             if (pickup_defs[pi].type != PICKUP_PIEZO) {
                 if (build_bn_bb_kernels(&pickup_defs[pi], &st->strings[si],
                                         &pk->Bn_kernel[si], &pk->Bb_kernel[si]) < 0)
-                    goto fail;
+                    AMR_FAIL("pickup_kernel_build");
             }
         }
     }
@@ -1518,7 +1545,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
     /* ── Mics ── */
     st->n_mics = n_mics;
     st->mics   = (MicState*)calloc(n_mics > 0 ? n_mics : 1, sizeof(MicState));
-    if (!st->mics) goto fail;
+    if (!st->mics) AMR_FAIL("mics_alloc");
 
     for (int mi = 0; mi < n_mics; ++mi) {
         st->mics[mi].gain    = mic_defs[mi].gain;
@@ -1533,19 +1560,19 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
     /* ── Output ring buffers ── */
     st->pickup_out = (float**)calloc(n_pickups > 0 ? n_pickups : 1, sizeof(float*));
     st->mic_out    = (float**)calloc(n_mics    > 0 ? n_mics    : 1, sizeof(float*));
-    if (!st->pickup_out || !st->mic_out) goto fail;
+    if (!st->pickup_out || !st->mic_out) AMR_FAIL("output_bufs_alloc");
 
     for (int pi = 0; pi < n_pickups; ++pi) {
         st->pickup_out[pi] = alloc_f(OUTPUT_BUF);
-        if (!st->pickup_out[pi]) goto fail;
+        if (!st->pickup_out[pi]) AMR_FAIL("pickup_out_alloc");
     }
     for (int mi = 0; mi < n_mics; ++mi) {
         st->mic_out[mi] = alloc_f(OUTPUT_BUF);
-        if (!st->mic_out[mi]) goto fail;
+        if (!st->mic_out[mi]) AMR_FAIL("mic_out_alloc");
     }
 
     st->pickup_accum = alloc_f(n_pickups > 0 ? n_pickups : 1);
-    if (!st->pickup_accum) goto fail;
+    if (!st->pickup_accum) AMR_FAIL("pickup_accum_alloc");
 
     /* ── Saddle bilinear indices (into AMR plate grid) ── *
      *                                                      *
@@ -1556,7 +1583,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
         st->saddle_idx4    = alloc_i(n_strings * 4);
         st->saddle_wgt4    = alloc_f(n_strings * 4);
         st->saddle_w_batch = alloc_f(n_strings);
-        if (!st->saddle_idx4 || !st->saddle_wgt4 || !st->saddle_w_batch) goto fail;
+        if (!st->saddle_idx4 || !st->saddle_wgt4 || !st->saddle_w_batch) AMR_FAIL("saddle_alloc");
 
         int Nx_ = st->Nx, Ny_ = st->Ny;
         for (int si = 0; si < n_strings; ++si) {
@@ -1594,13 +1621,14 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
         st->mic_vx = alloc_f(n_mics);
         st->mic_vy = alloc_f(n_mics);
         st->mic_vz = alloc_f(n_mics);
-        if (!st->mic_P || !st->mic_vx || !st->mic_vy || !st->mic_vz) goto fail;
+        if (!st->mic_P || !st->mic_vx || !st->mic_vy || !st->mic_vz) AMR_FAIL("mic_arrays_alloc");
 
         /* Pack world-space mic positions and axes for the backend */
         float* mic_pos_xyz  = alloc_f(n_mics * 3);
         float* mic_axis_xyz = alloc_f(n_mics * 3);
         if (!mic_pos_xyz || !mic_axis_xyz) {
-            free(mic_pos_xyz); free(mic_axis_xyz); goto fail;
+            free(mic_pos_xyz); free(mic_axis_xyz);
+            AMR_FAIL("mic_pos_axis_alloc");
         }
         for (int mi = 0; mi < n_mics; ++mi) {
             mic_pos_xyz [mi*3+0] = mic_defs[mi].pos [0];
@@ -1614,13 +1642,13 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
             n_mics, mic_pos_xyz, mic_axis_xyz, st->any_mic_needs_velocity);
         free(mic_pos_xyz);
         free(mic_axis_xyz);
-        if (rc_mic != SK_OK) goto fail;
+        if (rc_mic != SK_OK) AMR_FAIL("setup_mic_samplers");
     }
 
     /* ── Pickup GEMV matrices ── */
     {
         st->string_seg_offsets = alloc_i(n_strings + 1);
-        if (!st->string_seg_offsets) goto fail;
+        if (!st->string_seg_offsets) AMR_FAIL("seg_offsets_alloc");
         st->string_seg_offsets[0] = 0;
         for (int si = 0; si < n_strings; ++si)
             st->string_seg_offsets[si+1] =
@@ -1639,7 +1667,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
             st->string_v0_flat = alloc_f(st->total_seg_flat);
             st->string_v1_flat = alloc_f(st->total_seg_flat);
             if (!st->mag_pickup_map || !st->pickup_K0 || !st->pickup_K1 ||
-                !st->string_v0_flat || !st->string_v1_flat) goto fail;
+                !st->string_v0_flat || !st->string_v1_flat) AMR_FAIL("gemv_alloc");
 
             int mi3 = 0;
             for (int pi = 0; pi < n_pickups; ++pi) {
@@ -1666,7 +1694,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
 
     if (st->n_mag_pickups > 0) {
         st->mag_pickup_tmp = alloc_f(st->n_mag_pickups);
-        if (!st->mag_pickup_tmp) goto fail;
+        if (!st->mag_pickup_tmp) AMR_FAIL("mag_pickup_tmp_alloc");
     }
 
     /* ── Per-string bridge injection kernels ── *
@@ -1678,7 +1706,7 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
         int nb = st->n_bridge_cells;
         st->string_bridge_kernel = alloc_f(n_strings * nb);
         st->bridge_drive         = alloc_f(nb);
-        if (!st->string_bridge_kernel || !st->bridge_drive) goto fail;
+        if (!st->string_bridge_kernel || !st->bridge_drive) AMR_FAIL("bridge_kernel_alloc");
 
         float sigma   = (amr_desc->plate_dx > 0.0f)
                         ? 2.0f * amr_desc->plate_dx : 0.005f;
@@ -1715,6 +1743,12 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
 fail:
     coevolver_destroy(st);
     return NULL;
+}
+#undef AMR_FAIL
+
+SK_API const char* coevolver_create_amr_last_error(void)
+{
+    return g_coevolver_amr_create_error.c_str();
 }
 
 /* ── coevolver_schedule_pluck / coevolver_clear_pluck_schedule ────────────── */
@@ -2541,6 +2575,19 @@ SK_API int coevolver_get_plate_displacement(
     if (st->pressure_backend)
         return st->pressure_backend->get_plate_displacement(out, out_len);
     return fdtd_get_plate_displacement(st->fdtd, out, out_len);
+}
+
+SK_API int coevolver_get_plate_dims(
+    const AcousticCoEvolverState* st,
+    int* out_Nx, int* out_Ny, int* out_count)
+{
+    if (!st || !out_Nx || !out_Ny || !out_count) return CE_ERR_NULL;
+    if (st->pressure_backend)
+        return st->pressure_backend->get_plate_dims(out_Nx, out_Ny, out_count);
+    *out_Nx = st->Nx;
+    *out_Ny = st->Ny;
+    *out_count = st->Nx * st->Ny;
+    return CE_OK;
 }
 
 SK_API int coevolver_get_modal_amplitudes(

@@ -1,0 +1,26 @@
+# Material: acrylic_pmma
+# Acrylic / PMMA (Plexiglas, Perspex) — cast clear sheet.
+# Slightly warmer and more flexible appearance than glass.
+# Commonly used for diffusion panels, protective covers, studio baffles.
+
+name: acrylic_pmma
+description: Cast acrylic / PMMA sheet — clear
+
+albedo_rgb: [0.95, 0.95, 0.93]       # very faint warm tint
+reflectivity: 0.040
+diffusion: 0.06                        # slight surface scatter (minor hazing)
+absorption: 0.012                      # mild UV absorption, visible only in thick pieces
+
+ior: 1.490
+opacity: 0.0
+
+transmission_rgb: [0.98, 0.98, 0.96]  # negligible colour shift for thin sheets
+abbe_number: 57.2
+cauchy_b: 0.00600
+
+smoothness: 0.90                       # slightly lower than polished glass (tool marks)
+notes: >
+  IOR 1.49 is meaningfully lower than glass — total internal reflection angle
+  is wider (~42° vs ~42° for glass but changes refraction geometry noticeably).
+  Used for stage baffles or test panels in the acoustic scene.
+  Frosted PMMA: increase diffusion to 0.85, smoothness to 0.30.

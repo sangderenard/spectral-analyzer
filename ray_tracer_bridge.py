@@ -28,6 +28,7 @@ The returned segment buffer has shape (N_seg, 12), float32:
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
 
 import numpy as np
@@ -506,6 +507,19 @@ def _watertight_guitar_body_from_baffles(room):
             _push(a, d, c, np.array([0.0, 0.0, 1.0]), unfinished_softwood)
             _push(a, c, b, np.array([0.0, 0.0, 1.0]), unfinished_softwood)
 
+    # Inner face of soundboard (3 mm plate thickness) — normals point into body cavity.
+    _plate_thick = 0.003
+    for ri in range(n_radial):
+        row = radial_rows[ri]
+        nxt = radial_rows[ri + 1]
+        for ai in range(n_theta):
+            _a = np.array([row[ai][0],               row[ai][1],               body_h - _plate_thick], dtype=np.float64)
+            _b = np.array([row[(ai+1)%n_theta][0],   row[(ai+1)%n_theta][1],   body_h - _plate_thick], dtype=np.float64)
+            _c = np.array([nxt[(ai+1)%n_theta][0],   nxt[(ai+1)%n_theta][1],   body_h - _plate_thick], dtype=np.float64)
+            _d = np.array([nxt[ai][0],               nxt[ai][1],               body_h - _plate_thick], dtype=np.float64)
+            _push(_a, _c, _d, np.array([0.0, 0.0, -1.0]), unfinished_softwood)
+            _push(_a, _b, _c, np.array([0.0, 0.0, -1.0]), unfinished_softwood)
+
     # Side walls using the exact same outer ring as the top/back caps.
     cen2 = np.array([float(outline[:, 0].mean()), float(outline[:, 1].mean())])
     for ai in range(n_theta):
@@ -577,6 +591,253 @@ def _triangulate_mesh_room(room) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return (np.array(verts_list,   dtype=np.float64),
             np.array(normals_list,  dtype=np.float64),
             np.array(mat_props_list, dtype=np.float64))
+
+
+# ---------------------------------------------------------------------------
+# Source emission spectrum model
+# ---------------------------------------------------------------------------
+#
+# Analogous to the 4-parameter surface material system, every acoustic source
+# can carry an EmissionSpectrum made of one or more EmissionBands.
+#
+# GPU pipeline integration
+# ------------------------
+# Source tuples fed to the forward ray shader have the form:
+#     (pos_f32, dir_f32, n_rays, spec_f32)
+# where spec_f32 is a 4-element float32 array of per-band energy fractions
+# mapping to hardware bands B0–B3 (55-220 / 220-440 / 440-880 / 880+ Hz).
+#
+# EmissionSpectrum.band_weights(band_edges_hz) returns a normalised 4-element
+# array suitable for spec_f32.  EmissionSpectrum.allocate_rays(n_total) splits
+# n_total rays across the four hardware bands in proportion to their weights.
+#
+# Film interaction
+# ----------------
+# Recorded signal per band:
+#     recorded[b] = emission_weight[b] * film_filter[b]
+# EmissionSpectrum drives the numerator; FilmParams.band_filters drives the
+# denominator.  Together they model source chromaticity × detector sensitivity.
+
+# Hardware band edges shared with the GPU forward shader.
+_GPU_BAND_EDGES_HZ = (55.0, 220.0, 440.0, 880.0, float('inf'))
+
+
+@dataclass
+class EmissionBand:
+    """One Gaussian lobe in frequency space — 4 parameters, like a surface material.
+
+    center_hz    : peak frequency of the emission lobe
+    bandwidth_hz : standard deviation of the Gaussian (determines spread)
+    amplitude    : peak weight of this lobe relative to others
+    phase_sigma  : std-dev of random phase offsets drawn per ray (radians);
+                   0 = all rays coherent, π = fully incoherent
+    """
+    center_hz:    float
+    bandwidth_hz: float
+    amplitude:    float = 1.0
+    phase_sigma:  float = 0.0
+
+    def power_at(self, freq_hz: float) -> float:
+        """Gaussian power spectral density at freq_hz."""
+        x = (freq_hz - self.center_hz) / max(self.bandwidth_hz, 1e-6)
+        return self.amplitude * math.exp(-0.5 * x * x)
+
+
+@dataclass
+class EmissionSpectrum:
+    """Composite emission spectrum for an acoustic source.
+
+    A collection of EmissionBands whose combined power spectral density is
+    evaluated by summing each band's Gaussian lobe.
+
+    ray_allocation : 'proportional' — split n_rays proportionally to band power
+                     'uniform'      — equal rays across non-zero bands
+    """
+    bands:          list = field(default_factory=list)   # list[EmissionBand]
+    ray_allocation: str  = 'proportional'
+
+    # ------------------------------------------------------------------
+    # Core spectral queries
+    # ------------------------------------------------------------------
+
+    def power_at(self, freq_hz: float) -> float:
+        """Total power spectral density at a given frequency."""
+        return sum(b.power_at(freq_hz) for b in self.bands)
+
+    def band_weights(
+            self,
+            band_edges_hz: tuple = _GPU_BAND_EDGES_HZ,
+            n_sample: int = 32,
+    ) -> np.ndarray:
+        """Integrate power into hardware bands via Gaussian quadrature (mid-point rule).
+
+        Returns a normalised float32 array of length len(band_edges_hz)-1 whose
+        elements sum to 1.0.  This array maps directly onto the spec_f32 slot of
+        a GPU source tuple and onto uSrcSpectrum in the forward ray shader.
+
+        band_edges_hz : monotone increasing sequence of n+1 bin edges (Hz).
+                        Defaults to the four GPU hardware band boundaries.
+        n_sample      : number of log-spaced sample points per band for
+                        numerical integration.
+        """
+        n_bands = len(band_edges_hz) - 1
+        weights = np.zeros(n_bands, dtype=np.float64)
+
+        for i in range(n_bands):
+            lo = band_edges_hz[i]
+            hi = min(band_edges_hz[i + 1], 20000.0)
+            if hi <= lo:
+                continue
+            # log-spaced sample points inside the band
+            f_samples = np.geomspace(lo, hi, n_sample)
+            psd = np.array([self.power_at(f) for f in f_samples])
+            # trapezoidal integration in log-frequency
+            log_f = np.log(f_samples)
+            weights[i] = float(np.trapz(psd, log_f))
+
+        total = weights.sum()
+        if total > 0.0:
+            weights /= total
+        else:
+            weights[:] = 1.0 / n_bands   # flat fallback for silent spectrum
+
+        return weights.astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Ray distribution
+    # ------------------------------------------------------------------
+
+    def allocate_rays(self, n_total: int) -> np.ndarray:
+        """Distribute n_total rays across hardware bands.
+
+        Returns an int32 array of length 4 (for the default GPU bands) that
+        sums to n_total.  Used when building (pos, dir, n_rays, spec_f32)
+        tuples — the caller may split one logical source into four per-band
+        sub-sources or use the fractions directly via spec_f32.
+
+        ray_allocation=='proportional' : multinomial draw from band_weights.
+        ray_allocation=='uniform'      : equal share among bands with weight>0.
+        """
+        w = self.band_weights()
+        n = len(w)
+
+        if self.ray_allocation == 'uniform':
+            active = (w > 0).sum()
+            base   = n_total // max(active, 1)
+            counts = np.where(w > 0, base, 0).astype(np.int32)
+        else:
+            counts = np.zeros(n, dtype=np.int32)
+            for i in range(n - 1):
+                counts[i] = int(round(float(w[i]) * n_total))
+
+        # Assign remainder to the dominant band.
+        counts[-1] = n_total - int(counts[:-1].sum())
+        counts[-1] = max(0, counts[-1])
+        return counts
+
+    def sample_phases(self, n_rays: int, rng: Optional[np.random.Generator] = None) -> np.ndarray:
+        """Draw n_rays initial phase offsets (radians) from the emission model.
+
+        Phase spread is the amplitude-weighted mean phase_sigma across bands.
+        Returns float32 array of shape (n_rays,) in [−π, π].
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+
+        total_amp = sum(b.amplitude for b in self.bands) or 1.0
+        sigma = sum(b.phase_sigma * b.amplitude for b in self.bands) / total_amp
+
+        if sigma <= 0.0:
+            return np.zeros(n_rays, dtype=np.float32)
+
+        phases = rng.normal(0.0, sigma, size=n_rays).astype(np.float32)
+        phases = (phases + math.pi) % (2.0 * math.pi) - math.pi
+        return phases
+
+    # ------------------------------------------------------------------
+    # Named constructors
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def white(cls) -> 'EmissionSpectrum':
+        """Flat power across all GPU hardware bands."""
+        edges = _GPU_BAND_EDGES_HZ
+        bands = []
+        for i in range(len(edges) - 1):
+            lo = edges[i]
+            hi = min(edges[i + 1], 20000.0)
+            center = math.sqrt(lo * hi)           # geometric mean
+            bw     = (hi - lo) * 0.5
+            bands.append(EmissionBand(center_hz=center, bandwidth_hz=bw, amplitude=1.0))
+        return cls(bands=bands)
+
+    @classmethod
+    def tonal(cls, center_hz: float, q_factor: float = 8.0,
+              phase_sigma: float = 0.1) -> 'EmissionSpectrum':
+        """Narrow Gaussian centred on center_hz with quality factor Q."""
+        bw = center_hz / max(q_factor, 0.1)
+        return cls(bands=[EmissionBand(
+            center_hz=center_hz, bandwidth_hz=bw,
+            amplitude=1.0, phase_sigma=phase_sigma,
+        )])
+
+    @classmethod
+    def harmonic_series(
+            cls,
+            fundamental_hz: float,
+            n_harmonics:    int   = 6,
+            rolloff:        float = 0.7,
+            q_factor:       float = 12.0,
+            phase_sigma:    float = 0.3,
+    ) -> 'EmissionSpectrum':
+        """Stack of n_harmonics tonal bands at integer multiples of fundamental_hz.
+
+        amplitude rolls off as rolloff**k for the k-th harmonic.
+        """
+        bands = []
+        for k in range(1, n_harmonics + 1):
+            f  = fundamental_hz * k
+            bw = f / max(q_factor, 0.1)
+            bands.append(EmissionBand(
+                center_hz=f, bandwidth_hz=bw,
+                amplitude=rolloff ** (k - 1),
+                phase_sigma=phase_sigma,
+            ))
+        return cls(bands=bands)
+
+    @classmethod
+    def noise_band(cls, center_hz: float, octave_width: float = 1.0,
+                   phase_sigma: float = math.pi) -> 'EmissionSpectrum':
+        """Broad noise emission centred at center_hz spanning ±octave_width octaves.
+
+        phase_sigma = π → fully incoherent (white noise character).
+        """
+        bw = center_hz * (2.0 ** (octave_width * 0.5) - 2.0 ** (-octave_width * 0.5))
+        return cls(bands=[EmissionBand(
+            center_hz=center_hz, bandwidth_hz=bw,
+            amplitude=1.0, phase_sigma=phase_sigma,
+        )])
+
+
+# Named emission presets — drop-in replacements for the spec_f32 slot.
+EMISSION_PRESETS: dict[str, EmissionSpectrum] = {
+    'white':           EmissionSpectrum.white(),
+    'low_fundamental': EmissionSpectrum.harmonic_series(110.0,  n_harmonics=4, rolloff=0.6),
+    'mid_fundamental': EmissionSpectrum.harmonic_series(220.0,  n_harmonics=6, rolloff=0.7),
+    'high_fundamental':EmissionSpectrum.harmonic_series(440.0,  n_harmonics=8, rolloff=0.75),
+    'bass_noise':      EmissionSpectrum.noise_band(80.0,   octave_width=2.0),
+    'mid_noise':       EmissionSpectrum.noise_band(440.0,  octave_width=2.0),
+    'treble_noise':    EmissionSpectrum.noise_band(3500.0, octave_width=2.0),
+    'open_a_string':   EmissionSpectrum.harmonic_series(110.0,  n_harmonics=12, rolloff=0.65, q_factor=20.0),
+    'open_e_string':   EmissionSpectrum.harmonic_series(82.4,   n_harmonics=12, rolloff=0.60, q_factor=20.0),
+    'open_g_string':   EmissionSpectrum.harmonic_series(196.0,  n_harmonics=10, rolloff=0.70, q_factor=18.0),
+    'open_b_string':   EmissionSpectrum.harmonic_series(246.9,  n_harmonics=10, rolloff=0.72, q_factor=18.0),
+    'incoherent_full': EmissionSpectrum(
+        bands=[EmissionBand(c, c * 0.5, 1.0, math.pi)
+               for c in (110.0, 330.0, 660.0, 1320.0)],
+        ray_allocation='uniform',
+    ),
+}
 
 
 # ---------------------------------------------------------------------------

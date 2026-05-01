@@ -1,0 +1,15 @@
+# Lens: fisheye_15mm
+# Full-frame circular fisheye — ~180° diagonal field of view.
+# Strong barrel distortion is intentional and characteristic of the design.
+
+name: fisheye_15mm
+focal_mm: 15.0
+min_focal_mm: 15.0
+max_focal_mm: 15.0
+is_zoom: false
+min_focus_m: 0.20
+max_aperture_fstop: 2.8
+distortion_k1: -0.35   # strong intentional barrel
+distortion_k2: 0.04
+vignetting: 0.35
+transmission: [0.94, 0.93, 0.90, 0.78]

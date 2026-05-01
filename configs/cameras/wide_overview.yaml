@@ -1,0 +1,17 @@
+# Camera preset: wide_overview
+# Wide-angle elevated overview — shows full guitar in scene context.
+# 24 mm wide prime; APS-C sensor for extra crop / reach.
+
+name: wide_overview
+sensor: aps_c
+lens: wide_24mm
+
+target: [0.0, 0.35, 0.50]
+dist: 2.4
+elev: 30.0
+az: 0.0
+
+aperture_mm: 0.0
+focus_m: 2.4
+ca: 0.0
+tilt_shift: [0.0, 0.0]

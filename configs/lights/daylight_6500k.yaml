@@ -1,0 +1,14 @@
+# Light: daylight_6500k
+# Overcast skylight / D65 standard illuminant.
+# Balanced across visible spectrum; slight UV contribution.
+
+name: daylight_6500k
+description: "Overcast daylight / D65 standard illuminant (6 500 K)"
+
+spectrum:
+  type: planck
+  color_temperature_k: 6500.0
+
+color_temperature_k: 6500.0
+beam_angle_deg: 180.0   # skylight — omnidirectional hemisphere
+n_emitters: 16

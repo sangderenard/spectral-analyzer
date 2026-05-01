@@ -1,0 +1,11 @@
+# Sensor: acoustic_array
+# Pseudo-sensor modelling a large-aperture acoustic array (e.g. 64-element
+# MEMS microphone array).  The "sensor size" sets the synthetic aperture extent
+# in the scene.  Pixel pitch ~ half-wavelength of 1 800 Hz in air (≈ 9.5 cm).
+
+name: acoustic_array
+width_mm: 300.0     # 30 cm aperture
+height_mm: 200.0
+pixel_pitch_um: 95000.0   # 9.5 cm — λ/2 at 1 800 Hz
+max_iso: 512
+dynamic_range_stops: 60.0   # acoustic sensors have very wide DR (dB headroom)

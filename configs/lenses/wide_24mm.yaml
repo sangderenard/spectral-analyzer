@@ -1,0 +1,14 @@
+# Lens: wide_24mm
+# Wide-angle prime — useful for full-guitar overview shots.
+
+name: wide_24mm
+focal_mm: 24.0
+min_focal_mm: 24.0
+max_focal_mm: 24.0
+is_zoom: false
+min_focus_m: 0.25
+max_aperture_fstop: 2.8
+distortion_k1: -0.012   # barrel distortion
+distortion_k2: 0.0
+vignetting: 0.22
+transmission: [0.97, 0.96, 0.94, 0.82]

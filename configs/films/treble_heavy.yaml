@@ -1,0 +1,49 @@
+# Film layer: treble_heavy
+# High-frequency biased emulsion — presence, air, and upper harmonics.
+# Cool violet hue; highlights appear blue-violet at high-frequency peaks.
+
+name: treble_heavy
+domain: acoustic
+iso: 1.6
+gamma: 2.3
+negative: false
+rotate180: true
+opacity: 1.0
+blend_mode: add
+hue: 262.0         # blue-violet
+saturation: 1.2
+sensitivity: 0.9
+is_acoustic: true
+is_em: false
+
+spectral_bands:
+  - center_hz: 110.0
+    q: 1.5
+    gain: 0.05
+    label: "B0 55-220 Hz"
+  - center_hz: 350.0
+    q: 1.8
+    gain: 0.4
+    label: "B1 220-440 Hz"
+  - center_hz: 700.0
+    q: 2.0
+    gain: 1.2
+    label: "B2 440-880 Hz"
+  - center_hz: 2200.0
+    q: 2.5
+    gain: 2.0
+    label: "B3 880+ Hz"
+
+activation: tanh
+activation_params:
+  knee: 0.6
+  gain: 1.8
+
+tone_shadows:    [0.01, 0.00, 0.03]
+tone_highlights: [0.56, 0.38, 1.00]   # cool violet
+shadow_point:    0.08   # hard contrast — air-band film drops fast into black
+highlight_point: 0.88   # long violet highlight tail before washing to white
+
+grain_sigma: 0.010
+grain_size: 0.9
+grain_colorimetry: chromatic

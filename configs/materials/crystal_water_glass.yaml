@@ -1,0 +1,26 @@
+# Material: crystal_water_glass
+# Lead-free crystal glass (drinking glass / goblet).
+# High clarity, negligible tint.  Produces clean caustics when placed near guitar.
+
+name: crystal_water_glass
+description: Lead-free crystal drinking glass
+
+albedo_rgb: [0.97, 0.97, 0.97]       # essentially colourless
+reflectivity: 0.045
+diffusion: 0.015
+absorption: 0.001                      # nearly zero bulk absorption
+
+ior: 1.545
+opacity: 0.0
+
+transmission_rgb: [0.995, 0.995, 0.995]
+abbe_number: 55.0
+cauchy_b: 0.00820
+
+smoothness: 0.98
+notes: >
+  A crystal glass sitting on the stage floor beside the guitar is an ideal
+  caustic test object: its curved walls focus acoustic radiation just as
+  they focus light, creating crescent-shaped caustic arcs on the floor.
+  Thin-walled glasses (0.5–1 mm) can be modelled without interior geometry;
+  for thick bases use a separate triangulated solid mesh.

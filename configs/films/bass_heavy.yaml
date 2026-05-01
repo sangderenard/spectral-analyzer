@@ -1,0 +1,49 @@
+# Film layer: bass_heavy
+# Bass-biased emulsion — emphasis on fundamentals and low harmonics.
+# Warm amber hue tint; highlights glow orange-gold where low frequencies are loud.
+
+name: bass_heavy
+domain: acoustic
+iso: 1.8
+gamma: 2.1
+negative: false
+rotate180: true
+opacity: 1.0
+blend_mode: add
+hue: 28.0          # warm amber-orange
+saturation: 1.3
+sensitivity: 1.2
+is_acoustic: true
+is_em: false
+
+spectral_bands:
+  - center_hz: 100.0
+    q: 2.5
+    gain: 2.0
+    label: "B0 55-220 Hz"
+  - center_hz: 280.0
+    q: 2.0
+    gain: 1.2
+    label: "B1 220-440 Hz"
+  - center_hz: 600.0
+    q: 1.8
+    gain: 0.4
+    label: "B2 440-880 Hz"
+  - center_hz: 1600.0
+    q: 1.5
+    gain: 0.05
+    label: "B3 880+ Hz"
+
+activation: sigmoid
+activation_params:
+  knee: 0.45
+  gain: 2.2
+
+tone_shadows:    [0.03, 0.01, 0.00]
+tone_highlights: [1.00, 0.62, 0.10]   # deep amber
+shadow_point:    0.15   # bass blooms into colour early; compressed shadow toe
+highlight_point: 0.82   # highlights shoulder in — natural low-end compression feel
+
+grain_sigma: 0.018
+grain_size: 2.0
+grain_colorimetry: chromatic

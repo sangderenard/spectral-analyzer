@@ -18,6 +18,45 @@
 #include <cstring>
 #include <cmath>
 #include <new>
+#include <string>
+
+namespace {
+thread_local AmrPressureBackendCreateError g_amr_backend_last_code = AMR_BACKEND_CREATE_OK;
+thread_local std::string g_amr_backend_last_msg;
+
+static const char* amr_backend_code_name(AmrPressureBackendCreateError code)
+{
+    switch (code) {
+    case AMR_BACKEND_CREATE_OK: return "OK";
+    case AMR_BACKEND_DESC_NULL: return "DESC_NULL";
+    case AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD: return "DESC_INVALID_REQUIRED_FIELD";
+    case AMR_BACKEND_DESC_INVALID_PLATE: return "DESC_INVALID_PLATE";
+    case AMR_BACKEND_AMR_CREATE_FAILED: return "AMR_CREATE_FAILED";
+    case AMR_BACKEND_AMR_SETUP_PLATE_FAILED: return "AMR_SETUP_PLATE_FAILED";
+    case AMR_BACKEND_BRIDGE_SOURCE_FAILED: return "BRIDGE_SOURCE_FAILED";
+    case AMR_BACKEND_NECK_SOURCE_FAILED: return "NECK_SOURCE_FAILED";
+    case AMR_BACKEND_BORDER_SETUP_FAILED: return "BORDER_SETUP_FAILED";
+    case AMR_BACKEND_NEW_FAILED: return "BACKEND_NEW_FAILED";
+    default: return "UNKNOWN";
+    }
+}
+
+static void set_amr_backend_error(AmrPressureBackendCreateError code, const std::string& msg)
+{
+    g_amr_backend_last_code = code;
+    g_amr_backend_last_msg = msg;
+}
+} // namespace
+
+const char* amr_pressure_backend_last_error_code(void)
+{
+    return amr_backend_code_name(g_amr_backend_last_code);
+}
+
+const char* amr_pressure_backend_last_error_message(void)
+{
+    return g_amr_backend_last_msg.c_str();
+}
 
 /* ============================================================
  * UniformPressureBackend
@@ -203,6 +242,15 @@ int UniformPressureBackend::get_plate_displacement_size() const
     return Nx_ * Ny_;
 }
 
+int UniformPressureBackend::get_plate_dims(int* out_Nx, int* out_Ny, int* out_count) const
+{
+    if (!out_Nx || !out_Ny || !out_count) return SK_ERR_NULL_STATE;
+    *out_Nx = Nx_;
+    *out_Ny = Ny_;
+    *out_count = Nx_ * Ny_;
+    return SK_OK;
+}
+
 int UniformPressureBackend::get_plate_displacement(float* out, int out_len)
 {
     if (!fdtd_ || !out) return SK_ERR_NULL_STATE;
@@ -310,6 +358,15 @@ public:
         return plate_Nx_ * plate_Ny_;
     }
 
+    int get_plate_dims(int* out_Nx, int* out_Ny, int* out_count) const override
+    {
+        if (!out_Nx || !out_Ny || !out_count) return SK_ERR_NULL_STATE;
+        *out_Nx = plate_Nx_;
+        *out_Ny = plate_Ny_;
+        *out_count = plate_Nx_ * plate_Ny_;
+        return SK_OK;
+    }
+
     int get_plate_displacement(float* out, int out_len) override
     {
         return amr_get_plate_displacement(amr_, out, out_len);
@@ -330,28 +387,76 @@ private:
 
 IPressureBackend* amr_pressure_backend_create(const AMRCoevolverDescriptor* desc)
 {
-    if (!desc) return nullptr;
+    set_amr_backend_error(AMR_BACKEND_CREATE_OK, "");
+    if (!desc) {
+        set_amr_backend_error(AMR_BACKEND_DESC_NULL, "AMRCoevolverDescriptor is null");
+        return nullptr;
+    }
 
     /* ── Validate required fields ── */
-    if (desc->n_cells <= 0 || desc->n_faces <= 0) return nullptr;
+    if (desc->n_cells <= 0 || desc->n_faces <= 0) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD,
+                              "n_cells and n_faces must be > 0");
+        return nullptr;
+    }
     if (!desc->cell_centers || !desc->cell_volumes || !desc->open_volume_frac
-        || !desc->cell_types || !desc->cell_levels) return nullptr;
+        || !desc->cell_types || !desc->cell_levels) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD,
+                              "missing one or more required cell arrays");
+        return nullptr;
+    }
     if (!desc->face_cell_neg || !desc->face_cell_pos || !desc->face_area
-        || !desc->face_open_frac || !desc->face_distance) return nullptr;
+        || !desc->face_open_frac || !desc->face_distance) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD,
+                              "missing one or more required face arrays");
+        return nullptr;
+    }
     if (desc->c <= 0.0 || desc->rho_air <= 0.0 || desc->min_dx <= 0.0)
+    {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD,
+                              "c, rho_air, and min_dx must be > 0");
         return nullptr;
+    }
     if (desc->n_bridge_plate <= 0 || !desc->bridge_plate_idx || !desc->bridge_plate_wgt)
+    {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD,
+                              "bridge plate mapping is missing or empty");
         return nullptr;
+    }
     if (desc->plate_Nx <= 0 || desc->plate_Ny <= 0 || desc->plate_dx <= 0.0f)
+    {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_PLATE,
+                              "plate_Nx/plate_Ny/plate_dx must be valid");
         return nullptr;
-    if (!desc->plate_active || !desc->plate_active_flat_idx) return nullptr;
-    if (!desc->plate_face_above_starts || !desc->plate_face_below_starts) return nullptr;
-    if (!desc->plate_cell_above || !desc->plate_cell_below) return nullptr;
-    if (desc->plate_mass_density <= 0.0f || desc->plate_stiffness_D <= 0.0f) return nullptr;
+    }
+    if (!desc->plate_active || !desc->plate_active_flat_idx) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_PLATE,
+                              "plate_active or plate_active_flat_idx is missing");
+        return nullptr;
+    }
+    if (!desc->plate_face_above_starts || !desc->plate_face_below_starts) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_PLATE,
+                              "plate face start arrays are missing");
+        return nullptr;
+    }
+    if (!desc->plate_cell_above || !desc->plate_cell_below) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_PLATE,
+                              "plate cell mapping arrays are missing");
+        return nullptr;
+    }
+    if (desc->plate_mass_density <= 0.0f || desc->plate_stiffness_D <= 0.0f) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_PLATE,
+                              "plate mass density and stiffness must be > 0");
+        return nullptr;
+    }
 
     /* Validate CFL timestep sanity (at least the grid is not degenerate) */
     double dt = 0.77 * desc->min_dx / (desc->c * std::sqrt(3.0));
-    if (!(dt > 0.0) || !(dt < 0.1)) return nullptr; /* 100 ms upper sanity */
+    if (!(dt > 0.0) || !(dt < 0.1)) {
+        set_amr_backend_error(AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD,
+                              "derived dt failed sanity bounds (0, 0.1)");
+        return nullptr;
+    }
 
     /* ── Create base AMR state ── */
     AcousticAMRState* amr = amr_create(
@@ -368,8 +473,23 @@ IPressureBackend* amr_pressure_backend_create(const AMRCoevolverDescriptor* desc
         desc->face_distance,
         desc->c,
         desc->rho_air,
-        desc->min_dx);
-    if (!amr) return nullptr;
+        desc->min_dx,
+        desc->gradient_order);
+    if (!amr) {
+        std::string msg = "amr_create returned null";
+        const char* stage = amr_get_last_create_error_stage();
+        const char* detail = amr_get_last_create_error_message();
+        if (stage && stage[0]) {
+            msg += " at stage ";
+            msg += stage;
+        }
+        if (detail && detail[0]) {
+            msg += ": ";
+            msg += detail;
+        }
+        set_amr_backend_error(AMR_BACKEND_AMR_CREATE_FAILED, msg);
+        return nullptr;
+    }
 
     /* ── Attach Kirchhoff plate ── */
     if (amr_setup_plate(
@@ -389,6 +509,8 @@ IPressureBackend* amr_pressure_backend_create(const AMRCoevolverDescriptor* desc
             desc->plate_face_below_wgt,
             desc->plate_cell_above,
             desc->plate_cell_below) != SK_OK) {
+        set_amr_backend_error(AMR_BACKEND_AMR_SETUP_PLATE_FAILED,
+                              "amr_setup_plate failed");
         amr_destroy(amr);
         return nullptr;
     }
@@ -397,6 +519,8 @@ IPressureBackend* amr_pressure_backend_create(const AMRCoevolverDescriptor* desc
     if (amr_set_bridge_plate_sources(amr, desc->n_bridge_plate,
                                       desc->bridge_plate_idx,
                                       desc->bridge_plate_wgt) != SK_OK) {
+        set_amr_backend_error(AMR_BACKEND_BRIDGE_SOURCE_FAILED,
+                              "amr_set_bridge_plate_sources failed");
         amr_destroy(amr);
         return nullptr;
     }
@@ -406,6 +530,8 @@ IPressureBackend* amr_pressure_backend_create(const AMRCoevolverDescriptor* desc
         if (amr_set_neck_plate_sources(amr, desc->n_neck_plate,
                                         desc->neck_plate_idx,
                                         desc->neck_plate_wgt) != SK_OK) {
+            set_amr_backend_error(AMR_BACKEND_NECK_SOURCE_FAILED,
+                                  "amr_set_neck_plate_sources failed");
             amr_destroy(amr);
             return nullptr;
         }
@@ -422,6 +548,8 @@ IPressureBackend* amr_pressure_backend_create(const AMRCoevolverDescriptor* desc
                 desc->n_pml,
                 desc->bounds_min,
                 desc->bounds_max) != SK_OK) {
+            set_amr_backend_error(AMR_BACKEND_BORDER_SETUP_FAILED,
+                                  "amr_set_border_condition failed");
             amr_destroy(amr);
             return nullptr;
         }
@@ -430,6 +558,12 @@ IPressureBackend* amr_pressure_backend_create(const AMRCoevolverDescriptor* desc
     auto* backend = new (std::nothrow) AMRPressureBackend(
         amr, desc->n_cells, desc->plate_Nx, desc->plate_Ny,
         desc->bounds_min, desc->bounds_max);
-    if (!backend) { amr_destroy(amr); return nullptr; }
+    if (!backend) {
+        set_amr_backend_error(AMR_BACKEND_NEW_FAILED,
+                              "AMRPressureBackend allocation failed");
+        amr_destroy(amr);
+        return nullptr;
+    }
+    set_amr_backend_error(AMR_BACKEND_CREATE_OK, "");
     return backend;
 }

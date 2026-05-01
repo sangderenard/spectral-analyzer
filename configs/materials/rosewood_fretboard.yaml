@@ -1,0 +1,20 @@
+# Material: rosewood_fretboard
+# Guitar neck — Indian rosewood fretboard (Dalbergia latifolia).
+# Very dense, oily hardwood; dark chocolate-brown to near-black with purple tones.
+# Typically left unfinished (natural oil), giving a matte surface.
+
+name: rosewood_fretboard
+description: Guitar fretboard and bridge — Indian rosewood
+
+albedo_rgb: [0.22, 0.10, 0.06]       # linear sRGB — very dark reddish-brown
+reflectivity: 0.45                     # lower — oily surface scatters rather than reflects
+diffusion: 0.88                        # highly diffuse (no lacquer)
+absorption: 0.18
+
+smoothness: 0.28
+ior: 1.48
+
+notes: >
+  The oily surface of rosewood diffuses specular highlights strongly.
+  Some boards have purple/violet undertones — increase albedo_rgb[2] slightly.
+  Ebony substitute: reduce albedo_rgb to [0.08, 0.06, 0.05].

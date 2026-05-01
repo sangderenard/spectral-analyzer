@@ -1,0 +1,44 @@
+# Film type: Kodak T-MAX 400
+# Fine-grain tabular-grain B&W negative.  The T-grain technology gives
+# exceptionally fine grain for ISO 400 — much crisper than HP5 at the same speed.
+
+name: kodak_tmax_400
+description: "Kodak T-MAX 400 — tabular-grain B&W negative (fine grain)"
+
+active: pan
+
+layers:
+  - name: pan
+    domain: acoustic
+    iso: 2.0
+    gamma: 2.20
+    negative: false
+    rotate180: true
+    opacity: 1.0
+    blend_mode: add
+    hue: null
+    saturation: 0.0
+    spectral_bands:
+      - center_hz: 110.0
+        q: 1.5
+        gain: 1.0
+        label: "B0"
+      - center_hz: 330.0
+        q: 1.7
+        gain: 1.0
+        label: "B1"
+      - center_hz: 660.0
+        q: 1.7
+        gain: 1.0
+        label: "B2"
+      - center_hz: 1800.0
+        q: 1.5
+        gain: 0.92
+        label: "B3"
+    activation: sigmoid
+    activation_params: {knee: 0.55, gain: 1.8}
+    tone_shadows:    [0.01, 0.01, 0.01]
+    tone_highlights: [0.98, 0.98, 0.98]
+    grain_sigma: 0.014    # fine T-grain
+    grain_size: 1.1
+    grain_colorimetry: luminance

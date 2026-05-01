@@ -1,0 +1,44 @@
+# Film type: Orthochromatic Contact Print
+# Blue/green sensitive only; insensitive to red (high-frequency acoustic).
+# High contrast; used historically for title cards and contact prints.
+
+name: ortho_contact
+description: "Orthochromatic contact print — no high-frequency (red) sensitivity"
+
+active: ortho
+
+layers:
+  - name: ortho
+    domain: acoustic
+    iso: 0.7
+    gamma: 2.6     # hard, high-contrast gamma
+    negative: false
+    rotate180: true
+    opacity: 1.0
+    blend_mode: add
+    hue: null
+    saturation: 0.0
+    spectral_bands:
+      - center_hz: 110.0
+        q: 2.0
+        gain: 1.6
+        label: "B0 — analogue UV-blue"
+      - center_hz: 330.0
+        q: 2.2
+        gain: 1.4
+        label: "B1 — analogue green"
+      - center_hz: 660.0
+        q: 2.0
+        gain: 0.3
+        label: "B2 — partial red cross-over"
+      - center_hz: 1800.0
+        q: 1.5
+        gain: 0.0
+        label: "B3 — orthochromatic cutoff"
+    activation: power
+    activation_params: {gain: 1.0, exponent: 0.6}
+    tone_shadows:    [0.01, 0.01, 0.01]
+    tone_highlights: [0.95, 0.95, 0.95]
+    grain_sigma: 0.042    # large grain — slow contact emulsion
+    grain_size: 4.5
+    grain_colorimetry: luminance

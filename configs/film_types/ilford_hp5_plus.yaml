@@ -1,0 +1,45 @@
+# Film type: Ilford HP5 Plus 400
+# Classic panchromatic black-and-white negative — wide latitude, classic grain,
+# faithful tonal reproduction.  Acoustic analogue: neutral greyscale with
+# characteristic clumped silver-halide grain.
+
+name: ilford_hp5_plus
+description: "Ilford HP5 Plus 400 — panchromatic B&W negative (ISO 400)"
+
+active: pan
+
+layers:
+  - name: pan
+    domain: acoustic
+    iso: 2.0
+    gamma: 2.15
+    negative: false
+    rotate180: true
+    opacity: 1.0
+    blend_mode: add
+    hue: null          # pure greyscale — no hue
+    saturation: 0.0
+    spectral_bands:
+      - center_hz: 110.0
+        q: 1.4
+        gain: 1.0
+        label: "B0 55-220 Hz"
+      - center_hz: 330.0
+        q: 1.6
+        gain: 1.05
+        label: "B1 220-440 Hz"
+      - center_hz: 660.0
+        q: 1.6
+        gain: 0.98
+        label: "B2 440-880 Hz"
+      - center_hz: 1800.0
+        q: 1.4
+        gain: 0.95
+        label: "B3 880+ Hz"
+    activation: linear
+    activation_params: {}
+    tone_shadows:    [0.02, 0.02, 0.02]
+    tone_highlights: [0.96, 0.96, 0.96]
+    grain_sigma: 0.032    # coarse, clumped grain
+    grain_size: 3.5
+    grain_colorimetry: luminance

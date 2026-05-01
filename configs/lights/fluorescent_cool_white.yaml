@@ -1,0 +1,18 @@
+# Light: fluorescent_cool_white
+# Triphosphor cool-white fluorescent tube (CCT ~4 100 K).
+# Office/studio standard.  Green-biased (camera sensors have elevated green response here).
+
+name: fluorescent_cool_white
+description: "Cool-white triphosphor fluorescent tube (4 100 K)"
+
+spectrum:
+  type: gaussian_peaks
+  peaks:
+    - {nm: 435.8, fwhm_nm: 8,  weight: 0.18}  # blue mercury line
+    - {nm: 546.1, fwhm_nm: 8,  weight: 0.38}  # green mercury line
+    - {nm: 611.0, fwhm_nm: 30, weight: 0.28}  # red phosphor band
+    - {nm: 488.0, fwhm_nm: 20, weight: 0.16}  # cyan phosphor band
+
+color_temperature_k: 4100.0
+beam_angle_deg: 180.0   # bare tube — omnidirectional
+n_emitters: 12

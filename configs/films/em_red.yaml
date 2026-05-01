@@ -1,0 +1,47 @@
+# Film layer: em_red
+# EM red-channel emulsion — responds to the 620-750 nm band analogue.
+# Saturated crimson hue; models the red-sensitive layer of a colour negative.
+
+name: em_red
+domain: em
+iso: 1.0
+gamma: 2.2
+negative: false
+rotate180: true
+opacity: 1.0
+blend_mode: add
+hue: 0.0           # red
+saturation: 1.4
+sensitivity: 1.0
+is_acoustic: false
+is_em: true
+
+spectral_bands:
+  - center_hz: 110.0     # used as EM proxy channel 0 (UV/blue)
+    q: 2.0
+    gain: 2.0
+    label: "Red 620-750 nm"
+  - center_hz: 330.0
+    q: 2.0
+    gain: 0.3
+    label: "Green 495-620 nm"
+  - center_hz: 660.0
+    q: 2.0
+    gain: 0.05
+    label: "Blue 380-495 nm"
+  - center_hz: 1800.0
+    q: 2.0
+    gain: 0.01
+    label: "UV/NIR 750 nm+"
+
+activation: linear
+activation_params: {}
+
+tone_shadows:    [0.02, 0.00, 0.00]
+tone_highlights: [1.00, 0.10, 0.05]
+shadow_point:    0.06   # colour film precision — wide faithful zone, early transition from black
+highlight_point: 0.94
+
+grain_sigma: 0.012
+grain_size: 1.5
+grain_colorimetry: chromatic

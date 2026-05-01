@@ -195,6 +195,7 @@ struct IPressureBackend {
      *
      * @param out_len Must equal plate_Nx * plate_Ny.
      */
+    virtual int get_plate_dims(int* out_Nx, int* out_Ny, int* out_count) const = 0;
     virtual int get_plate_displacement_size() const = 0;
     virtual int get_plate_displacement(float* out, int out_len) = 0;
 };
@@ -243,6 +244,7 @@ public:
     int get_pressure_field_uniform(int Nx, int Ny, int Nz,
                                    const double bmin[3], const double bmax[3],
                                    float* out, int out_len) override;
+    int get_plate_dims(int* out_Nx, int* out_Ny, int* out_count) const override;
     int get_plate_displacement_size() const override;
     int get_plate_displacement(float* out, int out_len) override;
 
@@ -279,6 +281,22 @@ private:
 /* ── AMRPressureBackend ──────────────────────────────────────────────────── */
 
 /* AMRCoevolverDescriptor is defined in acoustic_coevolver.h (included above). */
+
+enum AmrPressureBackendCreateError {
+    AMR_BACKEND_CREATE_OK = 0,
+    AMR_BACKEND_DESC_NULL,
+    AMR_BACKEND_DESC_INVALID_REQUIRED_FIELD,
+    AMR_BACKEND_DESC_INVALID_PLATE,
+    AMR_BACKEND_AMR_CREATE_FAILED,
+    AMR_BACKEND_AMR_SETUP_PLATE_FAILED,
+    AMR_BACKEND_BRIDGE_SOURCE_FAILED,
+    AMR_BACKEND_NECK_SOURCE_FAILED,
+    AMR_BACKEND_BORDER_SETUP_FAILED,
+    AMR_BACKEND_NEW_FAILED,
+};
+
+const char* amr_pressure_backend_last_error_code(void);
+const char* amr_pressure_backend_last_error_message(void);
 
 /**
  * Create an AMRPressureBackend from the given descriptor.

@@ -1,0 +1,49 @@
+# Film layer: orthochromatic
+# Multiplicative dye-mask layer; suppresses the highest frequency band while
+# emphasising the lower three.  Models classic orthochromatic film response:
+# insensitive to red/orange (high-frequency acoustic analogue).
+# Cyan-teal hue; used as a multiply layer over panchromatic base.
+
+name: ortho
+domain: acoustic
+iso: 1.2
+gamma: 2.0
+negative: false
+rotate180: true
+opacity: 0.85
+blend_mode: multiply   # masks the underlying panchromatic layer
+hue: 185.0             # cyan-teal
+saturation: 0.9
+sensitivity: 0.85
+is_acoustic: true
+is_em: false
+
+spectral_bands:
+  - center_hz: 110.0
+    q: 1.8
+    gain: 1.0
+    label: "B0 55-220 Hz"
+  - center_hz: 330.0
+    q: 2.0
+    gain: 1.4
+    label: "B1 220-440 Hz"
+  - center_hz: 660.0
+    q: 2.0
+    gain: 0.8
+    label: "B2 440-880 Hz"
+  - center_hz: 1800.0
+    q: 1.5
+    gain: 0.0
+    label: "B3 880+ Hz — orthochromatic cutoff"
+
+activation: linear
+activation_params: {}
+
+tone_shadows:    [0.00, 0.02, 0.03]
+tone_highlights: [0.44, 0.82, 0.92]   # cyan
+shadow_point:    0.18   # orthochromatic character — compressed shadows and highlights
+highlight_point: 0.78   # narrow sweet spot gives the classic ortho punch
+
+grain_sigma: 0.022
+grain_size: 2.5
+grain_colorimetry: luminance

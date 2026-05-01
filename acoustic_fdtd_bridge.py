@@ -53,9 +53,13 @@ Usage
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+import hashlib
+import threading
+import time
+from typing import Any, Optional, Tuple
 
 import numpy as np
+from graph_solver import _T as _PROF
 
 from acoustic_amr import (
     AcousticAMRGrid,
@@ -83,9 +87,11 @@ except ImportError:
 
 try:
     from _spectral_kernels import AcousticCoEvolver as _CAcousticCoEvolver
+    from _spectral_kernels import amr_create_progress as _amr_create_progress
     _HAS_COEVOLVER = True
 except ImportError:
     _CAcousticCoEvolver = None
+    _amr_create_progress = None
     _HAS_COEVOLVER = False
 
 # Cell type constants matching acoustic_fdtd.h
@@ -93,6 +99,11 @@ FDTD_AIR   = np.uint8(0)
 FDTD_WALL  = np.uint8(1)
 FDTD_PLATE = np.uint8(2)
 FDTD_PML   = np.uint8(3)
+
+
+def _bridge_progress(progress_cb: Any, frac: float, label: str) -> None:
+    if progress_cb is not None:
+        progress_cb(max(0.0, min(1.0, float(frac))), label)
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +264,7 @@ def voxelise_guitar_body(
     importance_policy: dict[str, int] | None = None,
     balance_refinement: bool = True,
     soundhole: tuple[float, float, float] | None = None,
+    progress_cb=None,
 ) -> Tuple[np.ndarray, np.ndarray, dict] | AcousticAMRGrid:
     """Voxelise the guitar outline into a 3-D FDTD cell-type grid.
 
@@ -273,6 +285,7 @@ def voxelise_guitar_body(
             max_refinement_level=max_refinement_level,
             importance_policy=importance_policy,
             balance_refinement=balance_refinement,
+            progress_cb=progress_cb,
         )
 
     # Bounding box of the outline
@@ -357,6 +370,10 @@ def voxelise_guitar_body_amr(
     max_refinement_level: int = 3,
     importance_policy: dict[str, int] | None = None,
     balance_refinement: bool = True,
+    progress_cb=None,
+    amr_backend: str = "cpu",
+    cache_grid: bool = False,
+    outline_hash: int | None = None,
 ) -> AcousticAMRGrid:
     """Build the strict AMR pressure grid.
 
@@ -375,6 +392,10 @@ def voxelise_guitar_body_amr(
         max_refinement_level=max_refinement_level,
         importance_policy=importance_policy,
         balance_refinement=balance_refinement,
+        progress_cb=progress_cb,
+        amr_backend=amr_backend,
+        cache_grid=cache_grid,
+        outline_hash=outline_hash,
     )
 
 
@@ -1016,6 +1037,71 @@ def _string_physical_params(index: int, scale_length_m: float) -> tuple[float, f
     return float(f0), float(gauge), float(tension), float(mu), float(damping), float(stiffness_EI), float(axial_stiffness)
 
 
+def _check_amr_budget(
+    n_cells: int,
+    n_faces: int,
+    plate_nodes: int,
+    gradient_order: int = 2,
+    max_cells: int = 5_000_000,
+    max_faces: int = 15_000_000,
+    max_plate: int = 500_000,
+    verbose: bool = True,
+) -> bool:
+    """Check AMR budget and warn if approaching caps. Optimization 6.
+
+    Estimates total byte allocation and warns if approaching limits.
+
+    Parameters
+    ----------
+    n_cells, n_faces : int — AMR grid topology counts
+    plate_nodes : int — total plate nodes (Nx*Ny)
+    gradient_order : int — 2 or 8; 8-order uses ~168 MB additional stencil arrays
+    max_cells, max_faces, max_plate : int — capacity caps
+    verbose : bool — whether to print warnings
+
+    Returns
+    -------
+    bool : True if budget OK, False if exceeding limits
+    """
+    ok = True
+
+    # Estimate stencil overhead for 8th order
+    stencil_bytes = 0
+    if gradient_order == 8:
+        stencil_bytes = n_faces * (4 + 4) * 8  # face_s_cells (int32*8) + face_s_coeff (float32*8)
+
+    # Core arrays
+    pressure_bytes = n_cells * 4
+    velocity_bytes = n_faces * 4
+    geometry_bytes = (n_cells * 24) + (n_faces * 16)  # centers, volumes, face area, etc.
+
+    total_bytes = pressure_bytes + velocity_bytes + geometry_bytes + stencil_bytes
+    total_mb = total_bytes / (1024 * 1024)
+
+    if verbose:
+        print(f"[AMR Budget] n_cells={n_cells:,d} n_faces={n_faces:,d} plate_nodes={plate_nodes:,d} "
+              f"gradient_order={gradient_order} total_MB~{total_mb:.1f}")
+
+    if n_cells > max_cells:
+        if verbose:
+            print(f"  WARNING: n_cells {n_cells:,d} exceeds cap {max_cells:,d}")
+        ok = False
+    if n_faces > max_faces:
+        if verbose:
+            print(f"  WARNING: n_faces {n_faces:,d} exceeds cap {max_faces:,d}")
+        ok = False
+    if plate_nodes > max_plate:
+        if verbose:
+            print(f"  WARNING: plate_nodes {plate_nodes:,d} exceeds cap {max_plate:,d}")
+        ok = False
+    if total_mb > 2048:
+        if verbose:
+            print(f"  WARNING: estimated total allocation {total_mb:.1f} MB exceeds 2 GB soft cap")
+        ok = False
+
+    return ok
+
+
 def build_acoustic_coevolver_from_scene(
     scene,
     n_strings:    int   = 3,
@@ -1032,14 +1118,19 @@ def build_acoustic_coevolver_from_scene(
     plate_stiff:  float = 0.45,
     plate_alpha_M: float = 2.0,
     plate_beta_K:  float = 1e-5,
+    plate_dx:     float | None = None,
     scale_length_m: float = GUITAR_SCALE_LENGTH_M,
     fretless: bool = False,
     fret_number: int = 0,
     max_refinement_level: int = 3,
+    amr_gradient_order: int = 2,
+    amr_cache_grid: bool = False,
     border_spec: BorderConditionSpec | None = None,
     mic_aperture_r: float = 0.012,
     n_mic_ring:     int   = 8,
     enable_highband: bool = True,
+    progress_cb=None,
+    amr_backend: str = "cpu",
 ):
     """Build an AcousticCoEvolver from a CavityScene body geometry.
 
@@ -1072,14 +1163,26 @@ def build_acoustic_coevolver_from_scene(
 
     outline_pts, body_h, bridge_positions = _extract_guitar_geometry(scene)
     soundhole = _scene_soundhole(scene)
+    outline_min = np.min(outline_pts, axis=0)
+    outline_max = np.max(outline_pts, axis=0)
+    outline_hash64 = int.from_bytes(
+        hashlib.blake2b(np.ascontiguousarray(outline_pts, dtype=np.float64).tobytes(), digest_size=8).digest(),
+        byteorder="little",
+        signed=False,
+    )
 
     # ── AMR grid ──────────────────────────────────────────────────────────────
-    amr_grid = voxelise_guitar_body_amr(
-        outline_pts, body_h,
-        dx=dx, pad_cells=pad_cells, n_pml=n_pml,
-        soundhole=soundhole or (0.0, 0.0, 0.03),
-        max_refinement_level=max_refinement_level,
-    )
+    with _PROF.span("bridge.amr.voxelise_guitar_body_amr"):
+        amr_grid = voxelise_guitar_body_amr(
+            outline_pts, body_h,
+            dx=dx, pad_cells=pad_cells, n_pml=n_pml,
+            soundhole=soundhole or (0.0, 0.0, 0.03),
+            max_refinement_level=max_refinement_level,
+            progress_cb=progress_cb,
+            amr_backend=amr_backend,
+            cache_grid=bool(amr_cache_grid),
+            outline_hash=outline_hash64,
+        )
     # Compute visualization grid dimensions (must match pybind from_amr_desc formula)
     _viz_dx = max(float(amr_grid.min_dx) * 4.0, 0.005)
     _bmin = amr_grid.bounds_min
@@ -1198,51 +1301,159 @@ def build_acoustic_coevolver_from_scene(
         dtype=np.float32,
     )
 
-    # ── Plate geometry: infer from grid bounding box + body_h ─────────────────
-    bmin = amr_grid.bounds_min
-    bmax = amr_grid.bounds_max
-    plate_origin = np.array([bmin[0], bmin[1], body_h], dtype=np.float32)
-    # Use the finest AMR cell size as the plate grid spacing.
-    plate_dx_   = float(amr_grid.min_dx)
-    plate_Nx_   = max(1, int(round((bmax[0] - bmin[0]) / plate_dx_)))
-    plate_Ny_   = max(1, int(round((bmax[1] - bmin[1]) / plate_dx_)))
+    # ── Plate geometry: decouple from AMR finest resolution ─────────────────────
+    # Decouple plate resolution from AMR min_dx to reduce descriptor/allocation pressure.
+    # Physical justification: Kirchhoff plate structural grid need not match pressure aperture refinement.
+    if plate_dx is None:
+        # Default: use coarser structural grid (4 mm) or half the base AMR spacing, whichever is larger
+        plate_dx_   = max(float(amr_grid.base_dx * 0.5), 0.004)
+    else:
+        plate_dx_   = float(plate_dx)
+
+    # Restrict plate grid to guitar outline bounding box + margin, not full AMR padded bounds.
+    # This avoids creating unnecessary plate nodes in free-air and PML regions.
+    margin = 2.0 * plate_dx_
+    plate_min_x = float(outline_min[0]) - margin
+    plate_max_x = float(outline_max[0]) + margin
+    plate_min_y = float(outline_min[1]) - margin
+    plate_max_y = float(outline_max[1]) + margin
+
+    plate_origin = np.array([plate_min_x, plate_min_y, body_h], dtype=np.float32)
+    import math
+    plate_Nx_   = max(1, math.ceil((plate_max_x - plate_min_x) / plate_dx_))
+    plate_Ny_   = max(1, math.ceil((plate_max_y - plate_min_y) / plate_dx_))
+    info['plate_Nx'] = int(plate_Nx_)
+    info['plate_Ny'] = int(plate_Ny_)
+    info['plate_dx'] = float(plate_dx_)
+    info['plate_origin'] = plate_origin.copy()
 
     if border_spec is None:
         border_spec = border_anechoic(sigma_order=3.0)
 
-    amr_desc = build_amr_coevolver_descriptor(
-        grid               = amr_grid,
-        plate_Nx           = plate_Nx_,
-        plate_Ny           = plate_Ny_,
-        plate_dx           = plate_dx_,
-        plate_origin       = plate_origin,
-        body_h             = body_h,
-        plate_mass_density = plate_mass,
-        plate_stiffness_D  = plate_stiff,
-        plate_alpha_M      = plate_alpha_M,
-        plate_beta_K       = plate_beta_K,
-        bridge_src_xyz     = bridge_xyz,
-        bridge_sigma       = 0.012,
-        c                  = c,
-        rho_air            = rho_air,
-        border_spec        = border_spec,
-        n_pml              = n_pml,
+    _bridge_progress(progress_cb, 0.985, "start AMR budget preflight")
+    # Preflight AMR budget check (optimization 6: auto-downshift)
+    _budget_ok = _check_amr_budget(
+        n_cells=amr_grid.n_cells,
+        n_faces=amr_grid.n_faces,
+        plate_nodes=plate_Nx_ * plate_Ny_,
+        gradient_order=amr_gradient_order,
     )
+    _bridge_progress(progress_cb, 0.987, "done AMR budget preflight")
 
-    co = _CAcousticCoEvolver.from_amr_desc(
-        amr_desc     = amr_desc,
-        string_defs  = string_defs,
-        pickup_defs  = pickup_defs,
-        mic_defs     = mic_defs,
-        sample_rate  = float(sample_rate),
-        modal_stride = modal_stride,
-    )
+    _bridge_progress(progress_cb, 0.990, "start build AMR descriptor")
+    with _PROF.span("bridge.amr.build_descriptor"):
+        desc_result: dict[str, Any] = {"desc": None, "error": None}
+
+        def _build_desc_job() -> None:
+            try:
+                desc_result["desc"] = build_amr_coevolver_descriptor(
+                    grid               = amr_grid,
+                    plate_Nx           = plate_Nx_,
+                    plate_Ny           = plate_Ny_,
+                    plate_dx           = plate_dx_,
+                    plate_origin       = plate_origin,
+                    body_h             = body_h,
+                    plate_mass_density = plate_mass,
+                    plate_stiffness_D  = plate_stiff,
+                    plate_alpha_M      = plate_alpha_M,
+                    plate_beta_K       = plate_beta_K,
+                    bridge_src_xyz     = bridge_xyz,
+                    bridge_sigma       = 0.012,
+                    c                  = c,
+                    rho_air            = rho_air,
+                    gradient_order     = amr_gradient_order,
+                    border_spec        = border_spec,
+                    n_pml              = n_pml,
+                )
+            except Exception as exc:
+                desc_result["error"] = exc
+
+        t0_desc = time.perf_counter()
+        desc_thread = threading.Thread(target=_build_desc_job, daemon=True)
+        desc_thread.start()
+
+        while desc_thread.is_alive():
+            desc_thread.join(timeout=0.25)
+            if not desc_thread.is_alive():
+                break
+            elapsed = time.perf_counter() - t0_desc
+            _bridge_progress(
+                progress_cb,
+                0.990,
+                f"still running: build AMR descriptor elapsed={elapsed:.1f}s",
+            )
+
+        if desc_result["error"] is not None:
+            raise desc_result["error"]
+        amr_desc = desc_result["desc"]
+    _bridge_progress(progress_cb, 0.994, "done build AMR descriptor")
+
+    _bridge_progress(progress_cb, 0.996, "start create C coevolver")
+    with _PROF.span("bridge.amr.create_c_coevolver"):
+        create_result: dict[str, Any] = {"co": None, "error": None}
+
+        def _create_job() -> None:
+            try:
+                create_result["co"] = _CAcousticCoEvolver.from_amr_desc(
+                    amr_desc     = amr_desc,
+                    string_defs  = string_defs,
+                    pickup_defs  = pickup_defs,
+                    mic_defs     = mic_defs,
+                    sample_rate  = float(sample_rate),
+                    modal_stride = modal_stride,
+                )
+            except Exception as exc:
+                create_result["error"] = exc
+
+        t0_create = time.perf_counter()
+        create_thread = threading.Thread(target=_create_job, daemon=True)
+        create_thread.start()
+
+        while create_thread.is_alive():
+            create_thread.join(timeout=0.25)
+            if not create_thread.is_alive():
+                break
+
+            elapsed = time.perf_counter() - t0_create
+            done_faces = 0
+            total_faces = 0
+            if _amr_create_progress is not None:
+                try:
+                    snap = _amr_create_progress()
+                    done_faces = int(snap.get("done_faces", 0))
+                    total_faces = int(snap.get("total_faces", 0))
+                except Exception:
+                    done_faces = 0
+                    total_faces = 0
+
+            if total_faces > 0:
+                pct = 100.0 * float(done_faces) / float(total_faces)
+                frac = 0.996 + 0.002 * max(0.0, min(1.0, float(done_faces) / float(total_faces)))
+                _bridge_progress(
+                    progress_cb,
+                    frac,
+                    "still running: create C coevolver "
+                    f"stencil={done_faces}/{total_faces} ({pct:.1f}%) elapsed={elapsed:.1f}s",
+                )
+            else:
+                _bridge_progress(
+                    progress_cb,
+                    0.996,
+                    f"still running: create C coevolver elapsed={elapsed:.1f}s",
+                )
+
+        if create_result["error"] is not None:
+            raise create_result["error"]
+        co = create_result["co"]
+    _bridge_progress(progress_cb, 0.998, "done create C coevolver")
 
     # Upload AMR cell centres once; the renderer uses them to build a GPU TBO
     # for fragment-shader IDW interpolation (no CPU scatter grid needed).
-    info['n_cells_amr']      = amr_grid.n_cells
-    info['amr_cell_centers'] = co.get_amr_cell_centers()  # float32 (n_cells, 3)
-    info['amr_min_dx']       = float(amr_grid.min_dx)
+    with _PROF.span("bridge.amr.export_cell_centers"):
+        info['n_cells_amr']      = amr_grid.n_cells
+        info['amr_cell_centers'] = co.get_amr_cell_centers()  # float32 (n_cells, 3)
+        info['amr_min_dx']       = float(amr_grid.min_dx)
+    _bridge_progress(progress_cb, 1.000, "complete coevolver setup")
 
     # F: aperture-averaged mic sampler
     if _aperture_sampler is not None:

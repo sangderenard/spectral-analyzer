@@ -1,0 +1,24 @@
+# Material: steel_strings
+# Acoustic guitar strings — phosphor-bronze wound (bass) and plain steel (treble).
+# Bright metallic surface with very high reflectivity and near-zero diffusion.
+
+name: steel_strings
+description: Steel-core acoustic guitar strings — phosphor-bronze wound
+
+albedo_rgb: [0.72, 0.70, 0.65]       # linear sRGB — neutral steel silver (slight warm)
+reflectivity: 0.91                     # near-mirror metallic
+diffusion: 0.04                        # nearly all specular
+absorption: 0.02
+
+smoothness: 0.92
+ior: 2.95                              # conductor IOR approximation
+
+phosphor_bronze_albedo: [0.82, 0.62, 0.35]   # wound strings: warmer amber-gold
+plain_steel_albedo:     [0.72, 0.70, 0.65]   # plain treble strings: cool silver
+
+notes: >
+  Wound strings (strings 3–6) have a phosphor-bronze wrap that is noticeably
+  warmer and more golden than plain strings (1–2).  The sensor BVH uses a
+  single material per string; for per-string differentiation apply
+  phosphor_bronze_albedo to strings 3–6 and plain_steel_albedo to 1–2.
+  String gauge affects geometry radius only, not material.

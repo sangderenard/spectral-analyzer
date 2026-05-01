@@ -18,11 +18,17 @@
 #include "acoustic_amr.h"
 #include "acoustic_fdtd.h"
 #include "acoustic_coevolver.h"
+#include "acoustic_pressure_backend.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
+#include <array>
+#include <cmath>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <unordered_map>
 #include <vector>
 
 namespace py = pybind11;
@@ -78,6 +84,188 @@ static double* rw_ptr(py::buffer b, const char* name)
         throw std::runtime_error(
             std::string(name) + ": expected float64 buffer");
     return static_cast<double*>(info.ptr);
+}
+
+struct FaceRecordKey
+{
+    int64_t lo0 = 0;
+    int64_t hi0 = 0;
+    int64_t lo1 = 0;
+    int64_t hi1 = 0;
+    int32_t cell = 0;
+};
+
+static bool operator<(const FaceRecordKey& a, const FaceRecordKey& b)
+{
+    return std::tie(a.lo0, a.hi0, a.lo1, a.hi1, a.cell)
+         < std::tie(b.lo0, b.hi0, b.lo1, b.hi1, b.cell);
+}
+
+static py::dict build_amr_faces_sorted_cpp(
+    py::array_t<double, py::array::c_style | py::array::forcecast> centers_arr,
+    py::array_t<double, py::array::c_style | py::array::forcecast> half_arr,
+    py::array_t<uint8_t, py::array::c_style | py::array::forcecast> types_arr)
+{
+    auto centers = centers_arr.request();
+    auto half = half_arr.request();
+    auto types = types_arr.request();
+    if (centers.ndim != 2 || centers.shape[1] != 3)
+        throw std::runtime_error("build_amr_faces_sorted_cpp: centers must have shape (N,3)");
+    if (half.ndim != 2 || half.shape[0] != centers.shape[0] || half.shape[1] != 3)
+        throw std::runtime_error("build_amr_faces_sorted_cpp: half_sizes must have shape (N,3)");
+    if (types.ndim != 1 || types.shape[0] != centers.shape[0])
+        throw std::runtime_error("build_amr_faces_sorted_cpp: types must have shape (N,)");
+
+    const int64_t N64 = centers.shape[0];
+    if (N64 > std::numeric_limits<int32_t>::max())
+        throw std::runtime_error("build_amr_faces_sorted_cpp: too many cells for int32 face indices");
+    const int N = static_cast<int>(N64);
+    const double* C = static_cast<const double*>(centers.ptr);
+    const double* H = static_cast<const double*>(half.ptr);
+    const uint8_t* T = static_cast<const uint8_t*>(types.ptr);
+
+    std::vector<int32_t> neg;
+    std::vector<int32_t> pos;
+    std::vector<uint8_t> axis;
+    std::vector<double> area;
+    std::vector<double> open_fraction;
+    std::vector<double> distance;
+    std::vector<std::array<int64_t, 3>> lo_key(N);
+    std::vector<std::array<int64_t, 3>> hi_key(N);
+
+    {
+        py::gil_scoped_release release;
+
+        double key_scale = std::numeric_limits<double>::infinity();
+        for (int i = 0; i < N; ++i) {
+            for (int ax = 0; ax < 3; ++ax) {
+                const double w = 2.0 * H[i * 3 + ax];
+                if (std::isfinite(w) && w > 0.0 && w < key_scale)
+                    key_scale = w;
+            }
+        }
+        if (!std::isfinite(key_scale) || key_scale <= 0.0)
+            throw std::runtime_error("build_amr_faces_sorted_cpp: positive cell sizes required");
+
+        for (int i = 0; i < N; ++i) {
+            for (int ax = 0; ax < 3; ++ax) {
+                lo_key[i][ax] = static_cast<int64_t>(
+                    std::llround((C[i * 3 + ax] - H[i * 3 + ax]) / key_scale));
+                hi_key[i][ax] = static_cast<int64_t>(
+                    std::llround((C[i * 3 + ax] + H[i * 3 + ax]) / key_scale));
+            }
+        }
+
+        neg.reserve(static_cast<size_t>(N) * 3);
+        pos.reserve(static_cast<size_t>(N) * 3);
+        axis.reserve(static_cast<size_t>(N) * 3);
+        area.reserve(static_cast<size_t>(N) * 3);
+        open_fraction.reserve(static_cast<size_t>(N) * 3);
+        distance.reserve(static_cast<size_t>(N) * 3);
+
+        for (int ax = 0; ax < 3; ++ax) {
+            const int ax1 = (ax + 1) % 3;
+            const int ax2 = (ax + 2) % 3;
+            std::unordered_map<int64_t, std::vector<FaceRecordKey>> hi_planes;
+            std::unordered_map<int64_t, std::vector<FaceRecordKey>> lo_planes;
+            hi_planes.reserve(static_cast<size_t>(N));
+            lo_planes.reserve(static_cast<size_t>(N));
+
+            for (int i = 0; i < N; ++i) {
+                FaceRecordKey rec{
+                    lo_key[i][ax1], hi_key[i][ax1],
+                    lo_key[i][ax2], hi_key[i][ax2],
+                    static_cast<int32_t>(i)
+                };
+                hi_planes[hi_key[i][ax]].push_back(rec);
+                lo_planes[lo_key[i][ax]].push_back(rec);
+            }
+
+            for (auto& plane_pair : hi_planes) {
+                auto lo_it = lo_planes.find(plane_pair.first);
+                if (lo_it == lo_planes.end())
+                    continue;
+
+                auto& hi_records = plane_pair.second;
+                auto& lo_records = lo_it->second;
+                std::sort(hi_records.begin(), hi_records.end(),
+                          [](const FaceRecordKey& a, const FaceRecordKey& b) {
+                              return std::tie(a.lo0, a.hi0, a.lo1, a.hi1, a.cell)
+                                   < std::tie(b.lo0, b.hi0, b.lo1, b.hi1, b.cell);
+                          });
+                std::vector<FaceRecordKey> lo_start_sorted = lo_records;
+                std::vector<FaceRecordKey> lo_end_sorted = lo_records;
+                std::sort(lo_start_sorted.begin(), lo_start_sorted.end(),
+                          [](const FaceRecordKey& a, const FaceRecordKey& b) {
+                              return std::tie(a.lo0, a.hi0, a.lo1, a.hi1, a.cell)
+                                   < std::tie(b.lo0, b.hi0, b.lo1, b.hi1, b.cell);
+                          });
+                std::sort(lo_end_sorted.begin(), lo_end_sorted.end(),
+                          [](const FaceRecordKey& a, const FaceRecordKey& b) {
+                              return std::tie(a.hi0, a.lo0, a.lo1, a.hi1, a.cell)
+                                   < std::tie(b.hi0, b.lo0, b.lo1, b.hi1, b.cell);
+                          });
+
+                std::set<FaceRecordKey> active;
+                size_t start_ptr = 0;
+                size_t end_ptr = 0;
+                const size_t n_lo = lo_records.size();
+
+                for (const auto& h : hi_records) {
+                    if (h.hi0 <= h.lo0 || h.hi1 <= h.lo1)
+                        continue;
+                    while (end_ptr < n_lo && lo_end_sorted[end_ptr].hi0 <= h.lo0) {
+                        active.erase(lo_end_sorted[end_ptr]);
+                        ++end_ptr;
+                    }
+                    while (start_ptr < n_lo && lo_start_sorted[start_ptr].lo0 < h.hi0) {
+                        const auto& rec = lo_start_sorted[start_ptr];
+                        if (rec.hi0 > h.lo0)
+                            active.insert(rec);
+                        ++start_ptr;
+                    }
+
+                    for (const auto& l : active) {
+                        if (h.cell == l.cell)
+                            continue;
+                        if (l.hi0 <= h.lo0 || l.lo0 >= h.hi0)
+                            continue;
+                        const int64_t ov1_lo = std::max(h.lo1, l.lo1);
+                        const int64_t ov1_hi = std::min(h.hi1, l.hi1);
+                        if (ov1_hi <= ov1_lo)
+                            continue;
+                        const int64_t ov0_lo = std::max(h.lo0, l.lo0);
+                        const int64_t ov0_hi = std::min(h.hi0, l.hi0);
+                        if (ov0_hi <= ov0_lo)
+                            continue;
+
+                        const double a = static_cast<double>(ov0_hi - ov0_lo)
+                                       * static_cast<double>(ov1_hi - ov1_lo)
+                                       * key_scale * key_scale;
+                        const double d = std::abs(C[l.cell * 3 + ax] - C[h.cell * 3 + ax]);
+                        if (!(a > 0.0 && d > 0.0))
+                            continue;
+                        const double op = (T[h.cell] == 1 || T[l.cell] == 1) ? 0.0 : 1.0;
+                        neg.push_back(h.cell);
+                        pos.push_back(l.cell);
+                        axis.push_back(static_cast<uint8_t>(ax));
+                        area.push_back(a);
+                        open_fraction.push_back(op);
+                        distance.push_back(d);
+                    }
+                }
+            }
+        }
+    }
+
+    py::dict out;
+    out["neg"] = py::array_t<int32_t>(neg.size(), neg.data());
+    out["pos"] = py::array_t<int32_t>(pos.size(), pos.data());
+    out["axis"] = py::array_t<uint8_t>(axis.size(), axis.data());
+    out["area"] = py::array_t<double>(area.size(), area.data());
+    out["open_fraction"] = py::array_t<double>(open_fraction.size(), open_fraction.data());
+    out["distance"] = py::array_t<double>(distance.size(), distance.data());
+    return out;
 }
 
 /* ── Python class wrapping RouterStepState ──────────────────────────────── */
@@ -1514,6 +1702,7 @@ struct PyAcousticCoEvolver
         desc.border_R_reflection    = amr_dict.contains("border_R_reflection") ? amr_dict["border_R_reflection"].cast<float>() : 0.0f;
         desc.border_Z_match         = amr_dict.contains("border_Z_match")      ? amr_dict["border_Z_match"].cast<float>()      : 0.0f;
         desc.n_pml                  = amr_dict.contains("n_pml")               ? amr_dict["n_pml"].cast<int>()                 : 0;
+        desc.gradient_order         = amr_dict["gradient_order"].cast<int>();
 
         auto* self = new PyAcousticCoEvolver();
         self->_n_strings = n_strings;
@@ -1529,8 +1718,26 @@ struct PyAcousticCoEvolver
                 sample_rate, modal_stride);
         }
         if (!self->handle) {
+            const char* err_code  = amr_pressure_backend_last_error_code();
+            const char* err_msg   = amr_pressure_backend_last_error_message();
+            const char* amr_stage = coevolver_create_amr_last_error();
+            std::string detail = "coevolver_create_amr failed";
+            if (err_code && err_code[0]) {
+                detail += " [";
+                detail += err_code;
+                detail += "]";
+            }
+            if (err_msg && err_msg[0]) {
+                detail += ": ";
+                detail += err_msg;
+            }
+            if (amr_stage && amr_stage[0]) {
+                detail += " (stage: ";
+                detail += amr_stage;
+                detail += ")";
+            }
             delete self;
-            throw std::runtime_error("coevolver_create_amr: allocation failed");
+            throw std::runtime_error(detail);
         }
         /* Compute visualization grid for the AMR pressure scatter path.
          * viz_dx = max(min_dx * 4, 0.005) keeps the texture small (< 256³). */
@@ -1676,25 +1883,25 @@ struct PyAcousticCoEvolver
     py::array_t<float> get_pressure_field()
     {
         int rc;
+        py::array_t<float> out({_Nx, _Ny, _Nz});
         if (_n_cells_amr > 0) {
-            /* AMR path: return raw flat (n_cells,) pressures for GPU TBO upload */
-            py::array_t<float> out({_n_cells_amr});
-            rc = coevolver_get_pressure_field(
+            /* AMR path: scatter cell pressures onto the viz uniform grid.
+             * Cost is O(n_cells) here vs O(n_cells × fragments × steps) in the
+             * brute-force TBO shader — always use the scatter route. */
+            rc = coevolver_get_pressure_field_uniform(
                 handle,
-                out.mutable_unchecked<1>().mutable_data(0),
-                _n_cells_amr);
-            if (rc != CE_OK)
-                throw std::runtime_error("get_pressure_field error: " + std::to_string(rc));
-            return out;
+                _Nx, _Ny, _Nz,
+                _bmin, _bmax,
+                out.mutable_unchecked<3>().mutable_data(0, 0, 0),
+                _Nx * _Ny * _Nz);
         } else {
-            py::array_t<float> out({_Nx, _Ny, _Nz});
             rc = coevolver_get_pressure_field(handle,
                 out.mutable_unchecked<3>().mutable_data(0, 0, 0),
                 _Nx * _Ny * _Nz);
-            if (rc != CE_OK)
-                throw std::runtime_error("get_pressure_field error: " + std::to_string(rc));
-            return out;
         }
+        if (rc != CE_OK)
+            throw std::runtime_error("get_pressure_field error: " + std::to_string(rc));
+        return out;
     }
 
     py::array_t<float> get_amr_cell_centers()
@@ -1711,12 +1918,35 @@ struct PyAcousticCoEvolver
         return out;
     }
 
+    py::tuple get_plate_dims()
+    {
+        int plate_Nx = 0;
+        int plate_Ny = 0;
+        int plate_count = 0;
+        int rc = coevolver_get_plate_dims(handle, &plate_Nx, &plate_Ny, &plate_count);
+        if (rc != CE_OK)
+            throw std::runtime_error("get_plate_dims error: " + std::to_string(rc));
+        return py::make_tuple(plate_Nx, plate_Ny, plate_count);
+    }
+
     py::array_t<float> get_plate_displacement()
     {
-        py::array_t<float> out({_Nx, _Ny});
-        int rc = coevolver_get_plate_displacement(handle,
+        int plate_Nx = 0;
+        int plate_Ny = 0;
+        int plate_count = 0;
+        int rc = coevolver_get_plate_dims(handle, &plate_Nx, &plate_Ny, &plate_count);
+        if (rc != CE_OK)
+            throw std::runtime_error("get_plate_dims error: " + std::to_string(rc));
+        if (plate_Nx <= 0 || plate_Ny <= 0 || plate_count != plate_Nx * plate_Ny)
+            throw std::runtime_error(
+                "get_plate_dims returned invalid dimensions: " +
+                std::to_string(plate_Nx) + "x" + std::to_string(plate_Ny) +
+                " count=" + std::to_string(plate_count));
+
+        py::array_t<float> out({plate_Nx, plate_Ny});
+        rc = coevolver_get_plate_displacement(handle,
             out.mutable_unchecked<2>().mutable_data(0,0),
-            _Nx * _Ny);
+            plate_count);
         if (rc != CE_OK)
             throw std::runtime_error("get_plate_displacement error: " + std::to_string(rc));
         return out;
@@ -1950,7 +2180,8 @@ struct PyAcousticAMR
                   py::array_t<double>  face_distance_arr,
                   double c,
                   double rho_air,
-                  double min_dx)
+                  double min_dx,
+                  int gradient_order)
     {
         auto cc = cell_centers_arr.request();
         auto cv = cell_volumes_arr.request();
@@ -1983,7 +2214,7 @@ struct PyAcousticAMR
             static_cast<const double*>(fa.ptr),
             static_cast<const double*>(fo.ptr),
             static_cast<const double*>(fd.ptr),
-            c, rho_air, min_dx);
+            c, rho_air, min_dx, gradient_order);
         if (!handle)
             throw std::runtime_error("amr_create failed: invalid AMR topology or allocation failure");
     }
@@ -2424,7 +2655,8 @@ constructing and validating the AMR descriptor.
                       py::array_t<double>,
                       double,
                       double,
-                      double>(),
+                      double,
+                      int>(),
              py::arg("cell_centers"),
              py::arg("cell_volumes"),
              py::arg("open_volume_fraction"),
@@ -2436,7 +2668,8 @@ constructing and validating the AMR descriptor.
              py::arg("face_distance"),
              py::arg("c"),
              py::arg("rho_air"),
-             py::arg("min_dx"))
+             py::arg("min_dx"),
+             py::arg("gradient_order"))
         .def("step", &PyAcousticAMR::step, py::arg("n_steps") = 1)
         .def("reset", &PyAcousticAMR::reset)
         .def("inject_pressure_nearest", &PyAcousticAMR::inject_pressure_nearest,
@@ -2663,8 +2896,10 @@ np.ndarray, float32, shape (n_samples,) — mic 0 output for this block.
              "AMR: float32 (n_cells,). FDTD: float32 (Nx,Ny,Nz).")
         .def("get_amr_cell_centers", &PyAcousticCoEvolver::get_amr_cell_centers,
              "Return AMR cell centres as float32 (n_cells,3). Raises if not AMR.")
+        .def("get_plate_dims", &PyAcousticCoEvolver::get_plate_dims,
+             "Return (plate_Nx, plate_Ny, plate_count) for the active pressure backend.")
         .def("get_plate_displacement", &PyAcousticCoEvolver::get_plate_displacement,
-             "Return 2-D plate displacement w(x,y), float32 shape (Nx,Ny).")
+             "Return 2-D plate displacement w(x,y), float32 shape (plate_Nx,plate_Ny).")
         .def("get_modal_amplitudes", &PyAcousticCoEvolver::get_modal_amplitudes,
              py::arg("string_idx"), py::arg("n_modes") = 32,
              "Return (re, im) tuple of float32 arrays, each (n_modes,).")
@@ -2747,4 +2982,19 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("CE_STATUS_DONE")      = CE_STATUS_DONE;
     m.attr("CE_STATUS_CANCELLED") = CE_STATUS_CANCELLED;
     m.attr("CE_STATUS_ERROR")     = CE_STATUS_ERROR;
+
+    m.def("amr_create_progress", []() {
+        py::dict d;
+        d["active"] = amr_get_create_progress_active();
+        d["done_faces"] = amr_get_create_progress_done_faces();
+        d["total_faces"] = amr_get_create_progress_total_faces();
+        return d;
+    }, "Return AMR create-time stencil progress counters.");
+
+    m.def("build_amr_faces_sorted",
+          &build_amr_faces_sorted_cpp,
+          py::arg("centers"),
+          py::arg("half_sizes"),
+          py::arg("types"),
+          "Build AMR face topology with the sorted lattice sweep in C++.");
 }

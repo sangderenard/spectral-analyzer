@@ -1,0 +1,20 @@
+# Material: concrete_wall
+# Stage back and side walls — painted or bare concrete block.
+# Neutral diffuse surface; slightly warm from mineral content and paint.
+
+name: concrete_wall
+description: Stage walls — painted concrete
+
+albedo_rgb: [0.30, 0.28, 0.25]       # linear sRGB — warm medium grey
+reflectivity: 0.40
+diffusion: 0.90
+absorption: 0.05
+
+smoothness: 0.18
+ior: 1.55
+
+notes: >
+  Bare concrete: decrease albedo to [0.22, 0.20, 0.18] and increase absorption to 0.08.
+  White-painted walls: [0.82, 0.80, 0.76].
+  The wall material affects how much acoustic energy reflects back toward the guitar
+  in the forward ray pass.

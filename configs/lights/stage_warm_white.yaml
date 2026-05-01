@@ -1,0 +1,14 @@
+# Light: stage_warm_white
+# Warm-white theatrical parcan / Fresnel — typical rock/pop stage wash.
+# Tungsten-halogen / warm-LED equivalent.  Gentle spectral rolloff toward UV.
+
+name: stage_warm_white
+description: "Warm-white stage lamp — rock/pop concert wash (3 200 K)"
+
+spectrum:
+  type: planck
+  color_temperature_k: 3200.0
+
+color_temperature_k: 3200.0
+beam_angle_deg: 60.0
+n_emitters: 9

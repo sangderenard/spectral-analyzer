@@ -1,0 +1,31 @@
+# Material: borosilicate_glass
+# Borosilicate glass (Pyrex / Schott BK7 equivalent).
+# Very low dispersion, high transmission across visible spectrum.
+# Suitable for lenses, scientific apparatus, neutral test objects.
+
+name: borosilicate_glass
+description: Borosilicate glass — low-dispersion optical glass
+
+# BVH NOTE: albedo_rgb is the *surface scatter* albedo used by the ray-tracer
+# to weight how much energy scatters diffusely off the surface.  For optically
+# clear polished glass this is essentially zero — the surface only reflects
+# (Fresnel) or transmits (refraction); it does NOT diffusely scatter.
+# [0.96, 0.97, 0.98] was WRONG — that was the transmission tint, not scatter.
+albedo_rgb: [0.01, 0.01, 0.01]        # near-zero: polished glass does not scatter
+reflectivity: 0.04                     # Fresnel reflection at normal incidence (~4%)
+diffusion: 0.001                       # polished surface: essentially zero diffuse component
+absorption: 0.002                      # extremely low bulk absorption
+
+ior: 1.517                             # n_d (sodium D line)
+opacity: 0.0                           # fully transparent
+
+transmission_rgb: [0.99, 0.99, 0.98]  # flat transmission — negligible colour shift
+abbe_number: 64.2                      # low dispersion (high V-number)
+cauchy_b: 0.00420                      # dispersion coefficient (nm²) for dn/dλ
+
+smoothness: 0.98
+notes: >
+  IOR 1.517 at 589 nm (D-line).  Use for neutral test spheres, resonator covers,
+  or any object where you want clean caustic arcs without chromatic aberration.
+  Very low Cauchy B means dispersion is negligible across the visible/NIR range.
+  albedo_rgb must stay near zero — it controls surface scatter, not transmission tint.

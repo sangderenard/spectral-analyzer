@@ -1,0 +1,48 @@
+# Film layer: acoustic_pan
+# Panchromatic acoustic emulsion — equal response across all four frequency bands.
+# No hue override; the spectral colour mix from the forward path (amber/warm-white/
+# cool-white/violet palette) is preserved in the blit shader.
+
+name: acoustic_pan
+domain: acoustic
+iso: 1.4
+gamma: 2.2
+negative: false
+rotate180: true
+opacity: 1.0
+blend_mode: add
+hue: null          # null = use spectral positive_tone colour mix
+saturation: 1.0
+sensitivity: 1.0   # overall layer sensitivity multiplier (multiplied into iso)
+is_acoustic: true
+is_em: false
+
+spectral_bands:
+  - center_hz: 110.0
+    q: 1.5
+    gain: 1.0
+    label: "B0 55-220 Hz"
+  - center_hz: 330.0
+    q: 1.8
+    gain: 1.0
+    label: "B1 220-440 Hz"
+  - center_hz: 660.0
+    q: 1.8
+    gain: 1.0
+    label: "B2 440-880 Hz"
+  - center_hz: 1800.0
+    q: 1.5
+    gain: 1.0
+    label: "B3 880+ Hz"
+
+activation: linear
+activation_params: {}
+
+tone_shadows:    [0.02, 0.02, 0.02]
+tone_highlights: [1.00, 0.92, 0.74]   # warm white highlight
+shadow_point:    0.10   # wide faithful zone — neutral reference emulsion
+highlight_point: 0.90
+
+grain_sigma: 0.008
+grain_size: 1.2
+grain_colorimetry: luminance

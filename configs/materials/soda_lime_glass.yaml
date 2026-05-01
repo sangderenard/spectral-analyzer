@@ -1,0 +1,25 @@
+# Material: soda_lime_glass
+# Soda-lime glass — the most common glass type (windows, bottles, drinking glasses).
+# Slightly greenish tint from iron oxide impurities.  Higher IOR than borosilicate.
+
+name: soda_lime_glass
+description: Soda-lime glass — common window and bottle glass
+
+albedo_rgb: [0.88, 0.93, 0.88]       # faint green tint from iron oxide
+reflectivity: 0.043
+diffusion: 0.04
+absorption: 0.008                      # mild bulk absorption (green-absorbing)
+
+ior: 1.523
+opacity: 0.0
+
+transmission_rgb: [0.92, 0.97, 0.90]  # slight green transmission, weak red/blue
+abbe_number: 58.9
+cauchy_b: 0.00680
+
+smoothness: 0.95
+notes: >
+  A glass bottle sitting on a stage floor would use this material.
+  The greenish tint and slightly higher absorption make it visually distinct
+  from borosilicate.  Edge-on, thick pieces will appear notably green.
+  For float glass (modern window panes) reduce absorption to 0.003.

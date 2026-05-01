@@ -1,0 +1,13 @@
+# Light: candle_1900k
+# Candlelight / flame (1 900 K).  Extremely warm; almost all energy in red/NIR.
+
+name: candle_1900k
+description: "Candle / flame (1 900 K) — near-infrared dominated"
+
+spectrum:
+  type: planck
+  color_temperature_k: 1900.0
+
+color_temperature_k: 1900.0
+beam_angle_deg: 360.0   # isotropic
+n_emitters: 1

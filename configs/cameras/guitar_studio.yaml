@@ -1,0 +1,19 @@
+# Camera preset: guitar_studio
+# Default 3/4 portrait shot of the guitar — 35 mm lens, full-frame sensor.
+# Slightly elevated front angle; matches the hard-coded default in demo_pluck_gl.py.
+
+name: guitar_studio
+sensor: full_frame_35mm
+lens: standard_35mm
+
+# Camera rig
+target: [0.0, 0.40, 0.65]   # look-at point (guitar mid-body, world coords)
+dist: 1.6                    # metres from target
+elev: 14.0                   # elevation angle degrees above horizontal
+az: 22.0                     # azimuth degrees (yaw)
+
+# Exposure / optics
+aperture_mm: 0.0   # 0 = pinhole (no depth-of-field blur)
+focus_m: 1.6
+ca: 0.0            # chromatic aberration amount
+tilt_shift: [0.0, 0.0]

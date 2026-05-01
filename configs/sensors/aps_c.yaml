@@ -1,0 +1,10 @@
+# Sensor: aps_c
+# APS-C crop sensor (1.5× crop factor).
+# Equivalent to Fujifilm X-T5 / Sony APS-C class.
+
+name: aps_c
+width_mm: 23.6
+height_mm: 15.7
+pixel_pitch_um: 5.2
+max_iso: 6400
+dynamic_range_stops: 13.0

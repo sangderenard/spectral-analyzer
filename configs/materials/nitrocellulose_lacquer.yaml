@@ -1,0 +1,22 @@
+# Material: nitrocellulose_lacquer
+# Thin-film nitrocellulose finish over wood.
+# Used on the outer surface of the guitar body and neck.  Highly transparent;
+# the underlying wood albedo dominates — this material describes the thin
+# specular coating layer that sits above it.
+
+name: nitrocellulose_lacquer
+description: Nitrocellulose lacquer finish (thin-film, over wood)
+
+albedo_rgb: [0.96, 0.94, 0.88]       # near-white with faint amber tint
+reflectivity: 0.88                     # high specular peak at Fresnel angle
+diffusion: 0.06                        # almost entirely specular
+absorption: 0.02
+
+smoothness: 0.88
+ior: 1.50
+
+notes: >
+  In the BVH this material applies to the outermost surface of the body.
+  The wood albedo underneath is best blended at a ratio of ~0.85 wood + 0.15 lacquer
+  to represent a lightly worn instrument.  Heavy relicing: increase absorption slightly.
+  Polyurethane alternative (modern guitars) has smoothness 0.95, slightly cooler albedo.

@@ -1,0 +1,18 @@
+# Light: fluorescent_warm_white
+# Warm-white fluorescent tube (CCT ~2 900 K).
+# Warmer, more incandescent appearance than cool-white.
+
+name: fluorescent_warm_white
+description: "Warm-white fluorescent tube (2 900 K)"
+
+spectrum:
+  type: gaussian_peaks
+  peaks:
+    - {nm: 435.8, fwhm_nm: 8,  weight: 0.10}  # blue mercury line
+    - {nm: 546.1, fwhm_nm: 8,  weight: 0.32}  # green mercury line
+    - {nm: 615.0, fwhm_nm: 40, weight: 0.38}  # warm red-orange phosphor
+    - {nm: 580.0, fwhm_nm: 25, weight: 0.20}  # yellow-amber phosphor
+
+color_temperature_k: 2900.0
+beam_angle_deg: 180.0
+n_emitters: 12

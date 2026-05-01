@@ -1,0 +1,14 @@
+# Light: metal_halide
+# Metal-halide arc (HMI / MSR) — daylight-balanced discharge used in film and TV.
+# Green-biased relative to true daylight; strong NIR from arc.
+
+name: metal_halide
+description: "Metal-halide HMI arc lamp — daylight balanced, 5 600 K"
+
+spectrum:
+  type: planck
+  color_temperature_k: 5600.0
+
+color_temperature_k: 5600.0
+beam_angle_deg: 50.0
+n_emitters: 4

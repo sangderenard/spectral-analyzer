@@ -1,0 +1,10 @@
+# Sensor: full_frame_35mm
+# Standard 35 mm full-frame imaging sensor.
+# Equivalent to Canon EOS 5D Mk IV / Sony A7 III class.
+
+name: full_frame_35mm
+width_mm: 36.0
+height_mm: 24.0
+pixel_pitch_um: 8.4
+max_iso: 12800
+dynamic_range_stops: 14.0

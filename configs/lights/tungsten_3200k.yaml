@@ -1,0 +1,14 @@
+# Light: tungsten_3200k
+# Incandescent / tungsten-halogen lamp (3 200 K, photoflood / studio standard).
+# Smooth Planckian spectrum; heavy toward red and NIR.
+
+name: tungsten_3200k
+description: "Tungsten-halogen photoflood (3 200 K) — continuous Planckian"
+
+spectrum:
+  type: planck
+  color_temperature_k: 3200.0
+
+color_temperature_k: 3200.0
+beam_angle_deg: 75.0
+n_emitters: 4

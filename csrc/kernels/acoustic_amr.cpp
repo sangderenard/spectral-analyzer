@@ -6,9 +6,140 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdio>
+#include <exception>
+#include <functional>
+#include <limits>
+#include <mutex>
 #include <new>
+#include <string>
+#include <thread>
 #include <vector>
+
+/* ── Static thread pool ──────────────────────────────────────────────────────
+ * Persists for the process lifetime to avoid per-step thread creation cost.
+ * Workers spin-wait on a condition variable and execute a range functor.
+ * All std::, no external dependencies.                                       */
+namespace {
+
+struct AcousticThreadPool {
+    int n;
+    std::vector<std::thread> workers;
+    std::mutex               mx;
+    std::condition_variable  cv_wake, cv_done;
+    std::function<void(int,int)> job;
+    int  job_n   = 0;
+    int  next    = 0;
+    int  active  = 0;
+    bool quit    = false;
+
+    explicit AcousticThreadPool(int n_threads) : n(n_threads) {
+        workers.reserve(n_threads);
+        for (int i = 0; i < n_threads; ++i)
+            workers.emplace_back(&AcousticThreadPool::worker_loop, this);
+    }
+
+    ~AcousticThreadPool() {
+        { std::unique_lock<std::mutex> lk(mx); quit = true; }
+        cv_wake.notify_all();
+        for (auto& t : workers) t.join();
+    }
+
+    void worker_loop() {
+        for (;;) {
+            std::function<void(int,int)> fn;
+            int s, e;
+            {
+                std::unique_lock<std::mutex> lk(mx);
+                cv_wake.wait(lk, [this]{ return quit || next < job_n; });
+                if (quit) return;
+                int chunk = std::max(1, (job_n + n - 1) / n);
+                s = next; next = std::min(next + chunk, job_n); e = next;
+                ++active;
+                fn = job;
+            }
+            if (s < e) fn(s, e);
+            {
+                std::lock_guard<std::mutex> lk(mx);
+                --active;
+                if (next >= job_n && active == 0) cv_done.notify_one();
+            }
+        }
+    }
+
+    void run(int total, std::function<void(int,int)> fn) {
+        if (total <= 0) return;
+        {
+            std::unique_lock<std::mutex> lk(mx);
+            job = std::move(fn); job_n = total; next = 0; active = 0;
+        }
+        cv_wake.notify_all();
+        std::unique_lock<std::mutex> lk(mx);
+        cv_done.wait(lk, [this]{ return next >= job_n && active == 0; });
+    }
+};
+
+static AcousticThreadPool* g_pool = nullptr;
+static std::once_flag       g_pool_once;
+
+static AcousticThreadPool& pool() {
+    std::call_once(g_pool_once, [] {
+        int nt = static_cast<int>(std::thread::hardware_concurrency());
+        if (nt < 1) nt = 1;
+        g_pool = new AcousticThreadPool(nt);
+        std::fprintf(stderr, "[amr_pool] static thread pool: %d threads\n", nt);
+        std::fflush(stderr);
+    });
+    return *g_pool;
+}
+
+/* Convenience: parallel_for(n, [](int s, int e){ for (int i=s; i<e; ++i) ... }) */
+template<typename F>
+static void parallel_for(int n, F&& fn) {
+    if (n <= 0) return;
+    pool().run(n, [&](int s, int e) { fn(s, e); });
+}
+
+} // namespace (thread pool)
+
+namespace {
+thread_local std::string g_amr_create_last_stage = "ok";
+thread_local std::string g_amr_create_last_msg;
+std::atomic<int> g_amr_create_progress_active{0};
+std::atomic<int> g_amr_create_progress_done_faces{0};
+std::atomic<int> g_amr_create_progress_total_faces{0};
+
+static void amr_set_create_ok()
+{
+    g_amr_create_last_stage = "ok";
+    g_amr_create_last_msg.clear();
+    g_amr_create_progress_active.store(0, std::memory_order_relaxed);
+    g_amr_create_progress_done_faces.store(0, std::memory_order_relaxed);
+    g_amr_create_progress_total_faces.store(0, std::memory_order_relaxed);
+}
+
+static void amr_set_create_stage(const char* stage)
+{
+    g_amr_create_last_stage = stage ? stage : "unknown";
+}
+
+static void amr_set_create_error(const char* stage, const std::string& msg)
+{
+    g_amr_create_last_stage = stage ? stage : "unknown";
+    g_amr_create_last_msg = msg;
+}
+
+static void amr_log_bytes(const char* label, size_t bytes)
+{
+    std::fprintf(stderr, "[amr_create] estimate %-28s %10zu bytes (%8.2f MiB)\n",
+                 label ? label : "unknown", bytes,
+                 static_cast<double>(bytes) / (1024.0 * 1024.0));
+}
+} // namespace
 
 /* Per-active-plate-node mapping to AMR faces above and below. */
 struct PlateAMRNodeMap {
@@ -49,6 +180,7 @@ struct AcousticAMRState {
     double rho_air = 1.21;
     double dt = 0.0;
     int step_count = 0;
+    int gradient_order = 2;
 
     Eigen::Matrix<double, Eigen::Dynamic, 3, Eigen::RowMajor> centers;
     Eigen::VectorXd volumes;
@@ -71,9 +203,9 @@ struct AcousticAMRState {
     /* Per-cell face CSR for divergence accumulation (scatter-free, cell-centric) */
     std::vector<int>   csr_cell_starts;  /* [n_cells+1]                           */
     std::vector<int>   csr_face_idx;     /* face index list                       */
-    std::vector<float> csr_face_sign;    /* +1 (cell is neg side) / -1 (pos side) */
-    /* Reusable step scratch — avoids per-step heap allocation */
-    Eigen::VectorXf div_flux_buf;      /* [n_cells] reused each amr_step        */
+    /* csr_face_weight = ±face_flux_coef[face]: sign folded in at setup so the
+     * hot loop only needs one multiply instead of sign*velocity*flux.           */
+    std::vector<float> csr_face_weight;  /* +face_flux_coef (neg side) / -face_flux_coef (pos) */
 
     /* ── Border condition (PML / absorbing layer) ─────────────────── */
     int   border_mode = 0;             /* AMR_BORDER_* constant                 */
@@ -90,6 +222,15 @@ struct AcousticAMRState {
     static constexpr int STENCIL_SW = 4;  /* half-width: 4 cells each side    */
     std::vector<int32_t> face_s_cells;    /* [n_faces * 2 * STENCIL_SW]        */
     std::vector<float>   face_s_coeff;    /* [n_faces * 2 * STENCIL_SW] (Pa/m) */
+
+    /* Directional neighbor table: for each axis a∈{0,1,2} and each cell c,
+     * dir_neighbor_pos[a][c] = the cell index in the +a direction (or -1 if
+     * boundary/no face, -2 if ambiguous / coarse-fine conflict).
+     * dir_neighbor_neg[a][c] = same for the −a direction.
+     * Built once in amr_create; used by amr_walk_stencil to replace the
+     * O(faces/cell) CSR search with an O(1) table lookup on axis-aligned faces. */
+    std::vector<int32_t> dir_neighbor_pos[3];
+    std::vector<int32_t> dir_neighbor_neg[3];
 
     /* ── Kirchhoff plate (optional; present if plate_active is set) ── */
     bool plate_active_flag = false; /* true after amr_setup_plate */
@@ -173,6 +314,78 @@ static int validate_inputs(
  * ============================================================ */
 
 /**
+ * Build per-cell directional neighbor tables for the three axis directions.
+ *
+ * For each axis a∈{0,1,2}:
+ *   dir_neighbor_pos[a][cell] = neighbor cell in the +a direction,
+ *   dir_neighbor_neg[a][cell] = neighbor cell in the −a direction.
+ *
+ * A face is considered axis-aligned when its neg→pos unit normal has one
+ * component > 0.9.  Cells that have more than one qualifying face on the
+ * same (axis, sign) side are ambiguous (coarse-fine interface or irregular
+ * topology); their entry is set to -1 so amr_walk_stencil falls back to the
+ * CSR search.  Boundary cells (no qualifying face on a side) also get -1.
+ */
+static void amr_build_dir_neighbors(AcousticAMRState* st)
+{
+    const int nc = st->n_cells;
+    const int nf = st->n_faces;
+
+    /* 0=unvisited, 1=set-once, 2=conflict */
+    uint8_t state_pos[3][1] = {};   /* placeholder — real allocs below */
+    (void)state_pos;
+
+    std::vector<uint8_t> cstate_pos[3], cstate_neg[3];
+    for (int a = 0; a < 3; ++a) {
+        st->dir_neighbor_pos[a].assign(nc, -1);
+        st->dir_neighbor_neg[a].assign(nc, -1);
+        cstate_pos[a].assign(nc, 0);
+        cstate_neg[a].assign(nc, 0);
+    }
+
+    for (int f = 0; f < nf; ++f) {
+        const int cn = st->face_neg[f], cp = st->face_pos[f];
+        float dx = (float)(st->centers(cp, 0) - st->centers(cn, 0));
+        float dy = (float)(st->centers(cp, 1) - st->centers(cn, 1));
+        float dz = (float)(st->centers(cp, 2) - st->centers(cn, 2));
+        float len = std::sqrt(dx*dx + dy*dy + dz*dz);
+        if (len < 1e-15f) continue;
+        float adx = std::abs(dx / len), ady = std::abs(dy / len), adz = std::abs(dz / len);
+        float best = std::max({adx, ady, adz});
+        if (best <= 0.9f) continue;   /* not clearly axis-aligned */
+
+        int axis;
+        if      (adx >= ady && adx >= adz) axis = 0;
+        else if (ady >= adx && ady >= adz) axis = 1;
+        else                               axis = 2;
+
+        /* Use the actual sign of the center delta to determine axis direction.
+         * face_neg/face_pos are topological labels, not guaranteed to be in
+         * positive coordinate order — ignoring the sign produces a neighbor
+         * table that lies about direction, corrupting the Fornberg stencil. */
+        float signed_delta = (axis == 0) ? dx : (axis == 1) ? dy : dz;
+
+        if (signed_delta > 0.0f) {
+            /* cn is on the −axis side, cp is on the +axis side */
+            { auto& nb = st->dir_neighbor_pos[axis][cn]; auto& cst = cstate_pos[axis][cn];
+              if      (cst == 0) { nb = cp; cst = 1; }
+              else if (cst == 1 && nb != cp) { nb = -1; cst = 2; } }
+            { auto& nb = st->dir_neighbor_neg[axis][cp]; auto& cst = cstate_neg[axis][cp];
+              if      (cst == 0) { nb = cn; cst = 1; }
+              else if (cst == 1 && nb != cn) { nb = -1; cst = 2; } }
+        } else {
+            /* cn is on the +axis side, cp is on the −axis side */
+            { auto& nb = st->dir_neighbor_neg[axis][cn]; auto& cst = cstate_neg[axis][cn];
+              if      (cst == 0) { nb = cp; cst = 1; }
+              else if (cst == 1 && nb != cp) { nb = -1; cst = 2; } }
+            { auto& nb = st->dir_neighbor_pos[axis][cp]; auto& cst = cstate_pos[axis][cp];
+              if      (cst == 0) { nb = cn; cst = 1; }
+              else if (cst == 1 && nb != cn) { nb = -1; cst = 2; } }
+        }
+    }
+}
+
+/**
  * Fornberg (1988) SIAM Rev. algorithm for 1st-derivative finite-difference
  * weights at arbitrary non-uniform node positions.
  *
@@ -184,9 +397,11 @@ static int validate_inputs(
  */
 static void fornberg_d1(const float* x, int N, float xi, float* w)
 {
-    /* c[k*2 + m] = weight for point k, derivative order m (m∈{0,1}). */
-    std::vector<float> c((size_t)N * 2, 0.0f);
-    auto C = [&](int k, int m) -> float& { return c[(size_t)k * 2 + m]; };
+    /* c[k*2 + m] = weight for point k, derivative order m (m∈{0,1}).
+     * N ≤ 8 → at most 16 entries; use a stack array to avoid heap allocation
+     * in the parallel stencil build loop. */
+    float c[16] = {};
+    auto C = [&](int k, int m) -> float& { return c[k * 2 + m]; };
 
     float c1 = 1.0f;
     C(0, 0) = 1.0f;
@@ -229,49 +444,79 @@ static void fornberg_d1(const float* x, int N, float xi, float* w)
 static int amr_walk_stencil(
     const AcousticAMRState* st,
     int seed_cell, float face_proj,
-    const Eigen::Vector3f& dir, int max_depth,
+    const Eigen::Vector3f& coord_dir,
+    const Eigen::Vector3f& walk_dir, int max_depth,
     int32_t* out_cells, float* out_x)
 {
     auto proj3 = [&](int ci) -> float {
-        return (float)(st->centers(ci,0)*dir[0]
-                     + st->centers(ci,1)*dir[1]
-                     + st->centers(ci,2)*dir[2]);
+        return (float)(st->centers(ci,0)*coord_dir[0]
+                     + st->centers(ci,1)*coord_dir[1]
+                     + st->centers(ci,2)*coord_dir[2]);
     };
     out_cells[0] = seed_cell;
     out_x[0]     = proj3(seed_cell) - face_proj;
     int found = 1, cur = seed_cell;
 
-    while (found < max_depth) {
-        int   best_next = -1;
-        float best_dot  = 0.5f;   /* require > 45° alignment */
+    /* Fast path: if dir is axis-aligned and the neighbor table is populated,
+     * walk with O(1) table lookup per step instead of O(CSR-degree) search. */
+    int  axis        = -1;
+    bool use_pos_tbl = false;
+    if (!st->dir_neighbor_pos[0].empty()) {
+        float adx = std::abs(walk_dir[0]), ady = std::abs(walk_dir[1]), adz = std::abs(walk_dir[2]);
+        float best = std::max({adx, ady, adz});
+        if (best > 0.9f) {
+            if      (adx >= ady && adx >= adz) { axis = 0; use_pos_tbl = (walk_dir[0] > 0.f); }
+            else if (ady >= adx && ady >= adz) { axis = 1; use_pos_tbl = (walk_dir[1] > 0.f); }
+            else                               { axis = 2; use_pos_tbl = (walk_dir[2] > 0.f); }
+        }
+    }
 
-        const int k0 = st->csr_cell_starts[cur];
-        const int k1 = st->csr_cell_starts[cur + 1];
-        for (int k = k0; k < k1; ++k) {
-            int   fk = st->csr_face_idx[k];
-            float sg = st->csr_face_sign[k];
-            int   fneg = st->face_neg[fk], fpos = st->face_pos[fk];
-            /* Outward-from-cur normal = sg * (centers[pos] - centers[neg]).norm */
-            float dx_ = (float)(st->centers(fpos,0) - st->centers(fneg,0));
-            float dy_ = (float)(st->centers(fpos,1) - st->centers(fneg,1));
-            float dz_ = (float)(st->centers(fpos,2) - st->centers(fneg,2));
-            float len  = std::sqrt(dx_*dx_ + dy_*dy_ + dz_*dz_);
-            if (len < 1e-15f) continue;
-            float dot = sg * (dx_*dir[0] + dy_*dir[1] + dz_*dir[2]) / len;
-            if (dot > best_dot) {
-                int nb = (sg > 0.f) ? fpos : fneg;
-                if (nb >= 0 && nb < st->n_cells
-                    && st->cell_type[nb] != 1 && st->cell_type[nb] != 2) {
-                    best_dot = dot;
-                    best_next = nb;
+    if (axis >= 0) {
+        const auto& tbl = use_pos_tbl ? st->dir_neighbor_pos[axis]
+                                      : st->dir_neighbor_neg[axis];
+        while (found < max_depth) {
+            int nb = tbl[cur];
+            if (nb < 0 || nb >= st->n_cells) break;
+            if (st->cell_type[nb] == 1 || st->cell_type[nb] == 2) break;
+            out_cells[found] = nb;
+            out_x[found]     = proj3(nb) - face_proj;
+            ++found;
+            cur = nb;
+        }
+    } else {
+        /* Fallback: CSR adjacency search (non-axis-aligned or table absent) */
+        while (found < max_depth) {
+            int   best_next = -1;
+            float best_dot  = 0.5f;   /* require > 45° alignment */
+
+            const int k0 = st->csr_cell_starts[cur];
+            const int k1 = st->csr_cell_starts[cur + 1];
+            for (int k = k0; k < k1; ++k) {
+                int   fk = st->csr_face_idx[k];
+                /* Sign is encoded in csr_face_weight: positive = cell is on neg side. */
+                float sg = (st->csr_face_weight[k] > 0.f) ? +1.f : -1.f;
+                int   fneg = st->face_neg[fk], fpos = st->face_pos[fk];
+                float dx_ = (float)(st->centers(fpos,0) - st->centers(fneg,0));
+                float dy_ = (float)(st->centers(fpos,1) - st->centers(fneg,1));
+                float dz_ = (float)(st->centers(fpos,2) - st->centers(fneg,2));
+                float len  = std::sqrt(dx_*dx_ + dy_*dy_ + dz_*dz_);
+                if (len < 1e-15f) continue;
+                float dot = sg * (dx_*walk_dir[0] + dy_*walk_dir[1] + dz_*walk_dir[2]) / len;
+                if (dot > best_dot) {
+                    int nb = (sg > 0.f) ? fpos : fneg;
+                    if (nb >= 0 && nb < st->n_cells
+                        && st->cell_type[nb] != 1 && st->cell_type[nb] != 2) {
+                        best_dot = dot;
+                        best_next = nb;
+                    }
                 }
             }
+            if (best_next < 0) break;
+            out_cells[found] = best_next;
+            out_x[found]     = proj3(best_next) - face_proj;
+            ++found;
+            cur = best_next;
         }
-        if (best_next < 0) break;
-        out_cells[found] = best_next;
-        out_x[found]     = proj3(best_next) - face_proj;
-        ++found;
-        cur = best_next;
     }
     return found;
 }
@@ -282,7 +527,8 @@ static int amr_walk_stencil(
  * For each face f the function:
  *   1. Computes the face-normal direction from neg→pos cell centres.
  *   2. Walks up to STENCIL_SW cells in each direction (neg, pos) following
- *      the AMR adjacency graph.
+ *      the AMR adjacency graph (O(1) fast-path via dir_neighbor tables for
+ *      axis-aligned faces; CSR fallback for irregular faces).
  *   3. Applies Fornberg's algorithm to all available points to compute
  *      exact 1st-derivative weights at the face centre (ξ=0).
  *   4. Stores cell indices and weights in face_s_cells / face_s_coeff.
@@ -291,76 +537,144 @@ static int amr_walk_stencil(
  * than 8 neighbours are available, Fornberg computes the best possible order
  * (7th, 6th, …, 1st) from the available points — no special-case needed.
  *
- * At coarse-fine AMR interfaces the actual non-uniform spacing is used
- * directly, so the weights are physically correct and mass-conservative in
- * the sense that the velocity update is consistent with the pressure gradient
- * to high order.
+ * The face loop is split into static chunks and run across
+ * std::thread::hardware_concurrency() threads.  Each thread writes only to
+ * its own disjoint face rows, so no synchronisation is needed.
+ * Progress is reported from inside each worker's face loop.
  */
-static void amr_build_stencil(AcousticAMRState* st)
+/* Each worker processes its face range and prints its own progress at every
+ * 10% milestone of its chunk directly from inside the loop.  No polling
+ * thread; no external observer.  `tid` is the 0-based thread index printed
+ * in the tag so multi-thread output is distinguishable. */
+static void amr_build_stencil_range(
+    AcousticAMRState* st, int f0, int f1, int tid,
+    std::atomic<int>* global_done, int nf_total)
 {
     const int SW  = AcousticAMRState::STENCIL_SW;
     const int SW2 = SW * 2;
-    const int nf  = st->n_faces;
-
-    st->face_s_cells.assign((size_t)nf * SW2, -1);
-    st->face_s_coeff.assign((size_t)nf * SW2, 0.0f);
 
     int32_t neg_cells[4], pos_cells[4];
     float   neg_x[4],    pos_x[4];
+    float   xs[8];
+    int32_t cs[8];
+    float   w[8];
 
-    for (int f = 0; f < nf; ++f) {
+    const int chunk   = f1 - f0;
+    const int step    = std::max(1, chunk / 10);   /* print at every ~10% of this chunk */
+    int       next_print = f0 + step;
+
+    for (int f = f0; f < f1; ++f) {
         const int cn = st->face_neg[f], cp = st->face_pos[f];
         float dxf = (float)(st->centers(cp,0) - st->centers(cn,0));
         float dyf = (float)(st->centers(cp,1) - st->centers(cn,1));
         float dzf = (float)(st->centers(cp,2) - st->centers(cn,2));
         float len = std::sqrt(dxf*dxf + dyf*dyf + dzf*dzf);
-        if (len < 1e-15f) continue;
-        Eigen::Vector3f dir(dxf/len, dyf/len, dzf/len);
+        if (len >= 1e-15f) {
+            Eigen::Vector3f dir(dxf/len, dyf/len, dzf/len);
 
-        auto proj3 = [&](int ci) -> float {
-            return (float)(st->centers(ci,0)*dir[0]
-                         + st->centers(ci,1)*dir[1]
-                         + st->centers(ci,2)*dir[2]);
-        };
-        float face_proj = 0.5f * (proj3(cn) + proj3(cp));
+            auto proj3 = [&](int ci) -> float {
+                return (float)(st->centers(ci,0)*dir[0]
+                             + st->centers(ci,1)*dir[1]
+                             + st->centers(ci,2)*dir[2]);
+            };
+            float face_proj = 0.5f * (proj3(cn) + proj3(cp));
 
-        int n_neg = amr_walk_stencil(st, cn, face_proj, -dir, SW, neg_cells, neg_x);
-        int n_pos = amr_walk_stencil(st, cp, face_proj,  dir, SW, pos_cells, pos_x);
+            int n_neg = amr_walk_stencil(st, cn, face_proj, dir, -dir, SW, neg_cells, neg_x);
+            int n_pos = amr_walk_stencil(st, cp, face_proj, dir,  dir, SW, pos_cells, pos_x);
 
-        int total = n_neg + n_pos;
-        if (total < 2) continue;   /* degenerate: can't approximate gradient */
-
-        /* Merge into one sorted array: farthest-neg → nearest-neg → nearest-pos → farthest-pos */
-        std::vector<float>   xs(total);
-        std::vector<int32_t> cs(total);
-        for (int k = 0; k < n_neg; ++k) {
-            xs[k] = neg_x[n_neg - 1 - k];    /* most-negative first  */
-            cs[k] = neg_cells[n_neg - 1 - k];
+            int total = n_neg + n_pos;
+            if (n_neg == SW && n_pos == SW) {
+                for (int k = 0; k < n_neg; ++k) {
+                    cs[k] = neg_cells[n_neg - 1 - k];
+                    xs[k] = neg_x[n_neg - 1 - k];
+                }
+                for (int k = 0; k < n_pos; ++k) {
+                    cs[n_neg + k] = pos_cells[k];
+                    xs[n_neg + k] = pos_x[k];
+                }
+                fornberg_d1(xs, total, 0.0f, w);
+                for (int k = 0; k < n_neg; ++k) {
+                    int slot = f * SW2 + (n_neg - 1 - k);
+                    st->face_s_cells[slot] = cs[k];
+                    st->face_s_coeff[slot] = w[k];
+                }
+                for (int k = 0; k < n_pos; ++k) {
+                    int slot = f * SW2 + SW + k;
+                    st->face_s_cells[slot] = cs[n_neg + k];
+                    st->face_s_coeff[slot] = w[n_neg + k];
+                }
+            } else if (total >= 2) {
+                const float inv_d = (st->face_distance[f] > 0.0)
+                    ? 1.0f / (float)st->face_distance[f] : 0.0f;
+                st->face_s_cells[f * SW2 + 0]      = cn;
+                st->face_s_coeff[f * SW2 + 0]      = -inv_d;
+                st->face_s_cells[f * SW2 + SW + 0] = cp;
+                st->face_s_coeff[f * SW2 + SW + 0] =  inv_d;
+            }
         }
-        for (int k = 0; k < n_pos; ++k) {
-            xs[n_neg + k] = pos_x[k];
-            cs[n_neg + k] = pos_cells[k];
-        }
 
-        std::vector<float> w(total);
-        fornberg_d1(xs.data(), total, 0.0f, w.data());
+        int done = global_done->fetch_add(1, std::memory_order_relaxed) + 1;
+        g_amr_create_progress_done_faces.store(done, std::memory_order_relaxed);
 
-        /* Store: neg slots [f*SW2 .. f*SW2+n_neg-1] hold neg cells
-         *         (index 0 = nearest-neg = original face_neg),
-         *        pos slots [f*SW2+SW .. f*SW2+SW+n_pos-1] hold pos cells
-         *         (index 0 = nearest-pos = original face_pos).
-         * We reverse the neg side back to nearest-first for the hot loop. */
-        for (int k = 0; k < n_neg; ++k) {
-            int slot = f * SW2 + (n_neg - 1 - k);   /* slot 0 = nearest neg */
-            st->face_s_cells[slot] = cs[k];
-            st->face_s_coeff[slot] = w[k];
-        }
-        for (int k = 0; k < n_pos; ++k) {
-            int slot = f * SW2 + SW + k;             /* slot SW = nearest pos */
-            st->face_s_cells[slot] = cs[n_neg + k];
-            st->face_s_coeff[slot] = w[n_neg + k];
+        if (f >= next_print) {
+            next_print += step;
+            double pct_global = (nf_total > 0) ? 100.0 * done / nf_total : 100.0;
+            double pct_local  = (chunk > 0) ? 100.0 * (f - f0 + 1) / chunk : 100.0;
+            std::fprintf(stderr,
+                "[amr_stencil t%d] local %.0f%% (%d/%d)  global %.1f%% (%d/%d)\n",
+                tid, pct_local, f - f0 + 1, chunk, pct_global, done, nf_total);
+            std::fflush(stderr);
         }
     }
+}
+
+static void amr_build_stencil(AcousticAMRState* st)
+{
+    const int SW2 = AcousticAMRState::STENCIL_SW * 2;
+    const int nf  = st->n_faces;
+
+    amr_set_create_stage("face_s_cells.assign");
+    /* Use 0 (not -1) as the padding index so the gather is branchless:
+     * coefficients for unused stencil slots are 0.0f, so pressure[0] is
+     * read but multiplied by zero — no conditional required. */
+    st->face_s_cells.assign((size_t)nf * SW2, 0);
+    amr_set_create_stage("face_s_coeff.assign");
+    st->face_s_coeff.assign((size_t)nf * SW2, 0.0f);
+
+    unsigned nt = std::max(1u, std::thread::hardware_concurrency());
+    if (nf < 256) nt = 1;
+
+    std::fprintf(stderr,
+                 "[amr_stencil] starting: n_faces=%d n_threads=%u\n", nf, nt);
+    std::fflush(stderr);
+
+    g_amr_create_progress_active.store(1, std::memory_order_relaxed);
+    g_amr_create_progress_total_faces.store(nf, std::memory_order_relaxed);
+    g_amr_create_progress_done_faces.store(0, std::memory_order_relaxed);
+
+    std::atomic<int> global_done{0};
+    auto t0 = std::chrono::steady_clock::now();
+
+    std::vector<std::thread> workers;
+    workers.reserve(nt);
+    for (unsigned t = 0; t < nt; ++t) {
+        int f0 = (int)((int64_t)nf * t / nt);
+        int f1 = (int)((int64_t)nf * (t + 1) / nt);
+        workers.emplace_back([=, &global_done]() {
+            amr_build_stencil_range(st, f0, f1, (int)t, &global_done, nf);
+        });
+    }
+    for (auto& th : workers) th.join();
+
+    double elapsed_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - t0).count();
+    std::fprintf(stderr,
+                 "[amr_stencil] done: n_faces=%d n_threads=%u elapsed=%.1f ms\n",
+                 nf, nt, elapsed_ms);
+    std::fflush(stderr);
+
+    g_amr_create_progress_done_faces.store(nf, std::memory_order_relaxed);
+    g_amr_create_progress_active.store(0, std::memory_order_relaxed);
 }
 
 AcousticAMRState* amr_create(
@@ -377,113 +691,232 @@ AcousticAMRState* amr_create(
     const double*  face_distance,
     double         c,
     double         rho_air,
-    double         min_dx)
+    double         min_dx,
+    int            gradient_order)
 {
+    amr_set_create_ok();
+    amr_set_create_stage("validate_inputs");
     if (validate_inputs(n_cells, cell_centers, cell_volumes, open_volume_frac,
                         cell_types, n_faces, face_cell_neg, face_cell_pos,
                         face_area, face_open_frac, face_distance,
                         c, rho_air, min_dx) != SK_OK) {
+        amr_set_create_error("validate_inputs", "input validation failed");
+        return nullptr;
+    }
+    if (gradient_order != 2 && gradient_order != 8) {
+        amr_set_create_error("validate_inputs", "gradient_order must be 2 or 8");
         return nullptr;
     }
 
+    std::fprintf(stderr,
+                 "[amr_create] n_cells=%d n_faces=%d n_active_plate=%d\n",
+                 n_cells, n_faces, 0);
+    amr_log_bytes("centers.resize", (size_t)n_cells * 3 * sizeof(double));
+    amr_log_bytes("volumes.resize", (size_t)n_cells * sizeof(double));
+    amr_log_bytes("open_vol.resize", (size_t)n_cells * sizeof(double));
+    amr_log_bytes("face arrays resize", (size_t)n_faces *
+                  (2 * sizeof(int) + 3 * sizeof(double)));
+    amr_log_bytes("pressure.setZero", (size_t)n_cells * sizeof(float));
+    amr_log_bytes("velocity.setZero", (size_t)n_faces * sizeof(float));
+    amr_log_bytes("face_inv_dist.resize", (size_t)n_faces * sizeof(float));
+    amr_log_bytes("face_flux_coef.resize", (size_t)n_faces * sizeof(float));
+    amr_log_bytes("cell_inv_denom.setZero", (size_t)n_cells * sizeof(float));
+    amr_log_bytes("CSR arrays", (size_t)(n_cells + 1) * sizeof(int)
+                  + (size_t)(2 * n_faces) * (sizeof(int) + sizeof(float)));
+    amr_log_bytes("face_s_cells", (size_t)n_faces * 2
+                  * AcousticAMRState::STENCIL_SW * sizeof(int32_t));
+    amr_log_bytes("face_s_coeff", (size_t)n_faces * 2
+                  * AcousticAMRState::STENCIL_SW * sizeof(float));
+
     auto* st = new (std::nothrow) AcousticAMRState();
-    if (!st) return nullptr;
-
-    st->n_cells = n_cells;
-    st->n_faces = n_faces;
-    st->c = c;
-    st->rho_air = rho_air;
-    st->dt = 0.77 * min_dx / (c * std::sqrt(3.0));
-
-    st->centers.resize(n_cells, 3);
-    st->volumes.resize(n_cells);
-    st->open_vol.resize(n_cells);
-    st->cell_type.resize(n_cells);
-    st->face_neg.resize(n_faces);
-    st->face_pos.resize(n_faces);
-    st->face_area.resize(n_faces);
-    st->face_open.resize(n_faces);
-    st->face_distance.resize(n_faces);
-    st->pressure.setZero(n_cells);
-    st->velocity.setZero(n_faces);
-
-    for (int i = 0; i < n_cells; ++i) {
-        st->centers(i, 0) = cell_centers[i * 3 + 0];
-        st->centers(i, 1) = cell_centers[i * 3 + 1];
-        st->centers(i, 2) = cell_centers[i * 3 + 2];
-        st->volumes[i] = cell_volumes[i];
-        st->open_vol[i] = open_volume_frac[i];
-        st->cell_type[i] = static_cast<int>(cell_types[i]);
-        if ((cell_types[i] == 0 || cell_types[i] == 3) && open_volume_frac[i] > 0.0)
-            st->acoustic_cells.push_back(i);
+    if (!st) {
+        amr_set_create_error("AcousticAMRState.new", "AcousticAMRState allocation failed");
+        return nullptr;
     }
-    for (int f = 0; f < n_faces; ++f) {
-        st->face_neg[f] = face_cell_neg[f];
-        st->face_pos[f] = face_cell_pos[f];
-        st->face_area[f] = face_area[f];
-        st->face_open[f] = face_open_frac[f];
-        st->face_distance[f] = face_distance[f];
-    }
-    if (st->acoustic_cells.empty()) {
+
+    try {
+        amr_set_create_stage("state.init");
+        st->n_cells = n_cells;
+        st->n_faces = n_faces;
+        st->c = c;
+        st->rho_air = rho_air;
+        st->gradient_order = gradient_order;
+        const double cfl = (st->gradient_order == 8) ? 0.10 : 0.77;
+        st->dt = cfl * min_dx / (c * std::sqrt(3.0));
+
+        amr_set_create_stage("centers.resize");
+        st->centers.resize(n_cells, 3);
+        amr_set_create_stage("volumes.resize");
+        st->volumes.resize(n_cells);
+        amr_set_create_stage("open_vol.resize");
+        st->open_vol.resize(n_cells);
+        amr_set_create_stage("cell_type.resize");
+        st->cell_type.resize(n_cells);
+        amr_set_create_stage("face_neg.resize");
+        st->face_neg.resize(n_faces);
+        amr_set_create_stage("face_pos.resize");
+        st->face_pos.resize(n_faces);
+        amr_set_create_stage("face_area.resize");
+        st->face_area.resize(n_faces);
+        amr_set_create_stage("face_open.resize");
+        st->face_open.resize(n_faces);
+        amr_set_create_stage("face_distance.resize");
+        st->face_distance.resize(n_faces);
+        amr_set_create_stage("pressure.setZero");
+        st->pressure.setZero(n_cells);
+        amr_set_create_stage("velocity.setZero");
+        st->velocity.setZero(n_faces);
+
+        amr_set_create_stage("copy.cells");
+        for (int i = 0; i < n_cells; ++i) {
+            st->centers(i, 0) = cell_centers[i * 3 + 0];
+            st->centers(i, 1) = cell_centers[i * 3 + 1];
+            st->centers(i, 2) = cell_centers[i * 3 + 2];
+            st->volumes[i] = cell_volumes[i];
+            st->open_vol[i] = open_volume_frac[i];
+            st->cell_type[i] = static_cast<int>(cell_types[i]);
+            if ((cell_types[i] == 0 || cell_types[i] == 3) && open_volume_frac[i] > 0.0)
+                st->acoustic_cells.push_back(i);
+        }
+        amr_set_create_stage("copy.faces");
+        for (int f = 0; f < n_faces; ++f) {
+            st->face_neg[f] = face_cell_neg[f];
+            st->face_pos[f] = face_cell_pos[f];
+            st->face_area[f] = face_area[f];
+            st->face_open[f] = face_open_frac[f];
+            st->face_distance[f] = face_distance[f];
+        }
+        if (st->acoustic_cells.empty()) {
+            delete st;
+            amr_set_create_error("acoustic_cells", "no active acoustic cells after filtering");
+            return nullptr;
+        }
+
+        /* ── Precompute hot-loop buffers ─────────────────────────────────── */
+        amr_set_create_stage("face_inv_dist.resize");
+        st->face_inv_dist.resize(n_faces);
+        amr_set_create_stage("face_flux_coef.resize");
+        st->face_flux_coef.resize(n_faces);
+        amr_set_create_stage("face.precompute");
+        for (int f = 0; f < n_faces; ++f) {
+            st->face_inv_dist[f]  = 1.0f / static_cast<float>(face_distance[f]);
+            st->face_flux_coef[f] = static_cast<float>(face_area[f] * face_open_frac[f]);
+        }
+
+        amr_set_create_stage("cell_inv_denom.setZero");
+        st->cell_inv_denom.setZero(n_cells);
+        amr_set_create_stage("cell_inv_denom.fill");
+        for (int idx : st->acoustic_cells) {
+            double denom = cell_volumes[idx] * std::max(open_volume_frac[idx], 1e-12);
+            st->cell_inv_denom[idx] = static_cast<float>(1.0 / denom);
+        }
+
+        amr_set_create_stage("wall_plate_cells.build");
+        for (int i = 0; i < n_cells; ++i)
+            if (cell_types[i] == 1 || cell_types[i] == 2)
+                st->wall_plate_cells.push_back(i);
+
+        /* Per-cell CSR for divergence — each face contributes to exactly 2 cells */
+        amr_set_create_stage("csr_cell_starts.assign");
+        st->csr_cell_starts.assign(n_cells + 1, 0);
+        amr_set_create_stage("csr_cell_starts.count");
+        for (int f = 0; f < n_faces; ++f) {
+            st->csr_cell_starts[face_cell_neg[f] + 1]++;
+            st->csr_cell_starts[face_cell_pos[f] + 1]++;
+        }
+        amr_set_create_stage("csr_cell_starts.prefix");
+        for (int i = 1; i <= n_cells; ++i)
+            st->csr_cell_starts[i] += st->csr_cell_starts[i - 1];
+
+        int total_entries = st->csr_cell_starts[n_cells];
+        amr_set_create_stage("csr_face_idx.resize");
+        st->csr_face_idx.resize(total_entries);
+        amr_set_create_stage("csr_face_weight.resize");
+        st->csr_face_weight.resize(total_entries);
+        {
+            amr_set_create_stage("csr.fill.temp");
+            std::vector<int> fill(n_cells, 0);
+            amr_set_create_stage("csr.fill");
+            for (int f = 0; f < n_faces; ++f) {
+                const float ffc = st->face_flux_coef[f];
+                int a = face_cell_neg[f], b = face_cell_pos[f];
+                int ka = st->csr_cell_starts[a] + fill[a]++;
+                st->csr_face_idx[ka]    = f;
+                st->csr_face_weight[ka] = +ffc;
+                int kb = st->csr_cell_starts[b] + fill[b]++;
+                st->csr_face_idx[kb]    = f;
+                st->csr_face_weight[kb] = -ffc;
+            }
+        }
+
+        /* Border damping — identity (no absorption) until amr_set_border_condition called */
+        amr_set_create_stage("border_alpha.setZero");
+        st->border_alpha.setZero(n_cells);
+        amr_set_create_stage("face_V_damp.setOnes");
+        st->face_V_damp.setOnes(n_faces);
+        amr_set_create_stage("P_damp.setOnes");
+        st->P_damp.setOnes(n_cells);
+        amr_set_create_stage("P_src_coeff.setOnes");
+        st->P_src_coeff.setOnes(n_cells);
+
+        if (st->gradient_order == 8) {
+            /* Build directional neighbor tables (accelerates amr_walk_stencil) */
+            amr_set_create_stage("dir_neighbors.build");
+            amr_build_dir_neighbors(st);
+
+            /* Build 8th-order Fornberg gradient stencil for every face */
+            amr_set_create_stage("stencil.build");
+            amr_build_stencil(st);
+        }
+    } catch (const std::bad_alloc&) {
+        std::string msg = "std::bad_alloc at stage: ";
+        msg += g_amr_create_last_stage;
+        amr_set_create_error(g_amr_create_last_stage.c_str(), msg);
+        delete st;
+        return nullptr;
+    } catch (const std::exception& e) {
+        std::string msg = "exception at stage ";
+        msg += g_amr_create_last_stage;
+        msg += ": ";
+        msg += e.what();
+        amr_set_create_error(g_amr_create_last_stage.c_str(), msg);
+        delete st;
+        return nullptr;
+    } catch (...) {
+        std::string msg = "unknown exception at stage: ";
+        msg += g_amr_create_last_stage;
+        amr_set_create_error(g_amr_create_last_stage.c_str(), msg);
         delete st;
         return nullptr;
     }
-
-    /* ── Precompute hot-loop buffers ─────────────────────────────────── */
-    st->face_inv_dist.resize(n_faces);
-    st->face_flux_coef.resize(n_faces);
-    for (int f = 0; f < n_faces; ++f) {
-        st->face_inv_dist[f]  = 1.0f / static_cast<float>(face_distance[f]);
-        st->face_flux_coef[f] = static_cast<float>(face_area[f] * face_open_frac[f]);
-    }
-
-    st->cell_inv_denom.setZero(n_cells);
-    for (int idx : st->acoustic_cells) {
-        double denom = cell_volumes[idx] * std::max(open_volume_frac[idx], 1e-12);
-        st->cell_inv_denom[idx] = static_cast<float>(1.0 / denom);
-    }
-
-    for (int i = 0; i < n_cells; ++i)
-        if (cell_types[i] == 1 || cell_types[i] == 2)
-            st->wall_plate_cells.push_back(i);
-
-    /* Per-cell CSR for divergence — each face contributes to exactly 2 cells */
-    st->csr_cell_starts.assign(n_cells + 1, 0);
-    for (int f = 0; f < n_faces; ++f) {
-        st->csr_cell_starts[face_cell_neg[f] + 1]++;
-        st->csr_cell_starts[face_cell_pos[f] + 1]++;
-    }
-    for (int i = 1; i <= n_cells; ++i)
-        st->csr_cell_starts[i] += st->csr_cell_starts[i - 1];
-
-    int total_entries = st->csr_cell_starts[n_cells];
-    st->csr_face_idx.resize(total_entries);
-    st->csr_face_sign.resize(total_entries);
-    {
-        std::vector<int> fill(n_cells, 0);
-        for (int f = 0; f < n_faces; ++f) {
-            int a = face_cell_neg[f], b = face_cell_pos[f];
-            int ka = st->csr_cell_starts[a] + fill[a]++;
-            st->csr_face_idx[ka]  = f;
-            st->csr_face_sign[ka] = +1.0f;
-            int kb = st->csr_cell_starts[b] + fill[b]++;
-            st->csr_face_idx[kb]  = f;
-            st->csr_face_sign[kb] = -1.0f;
-        }
-    }
-
-    st->div_flux_buf.setZero(n_cells);
-
-    /* Border damping — identity (no absorption) until amr_set_border_condition called */
-    st->border_alpha.setZero(n_cells);
-    st->face_V_damp.setOnes(n_faces);
-    st->P_damp.setOnes(n_cells);
-    st->P_src_coeff.setOnes(n_cells);
-
-    /* Build 8th-order Fornberg gradient stencil for every face */
-    amr_build_stencil(st);
+    amr_set_create_ok();
 
     return st;
+}
+
+const char* amr_get_last_create_error_stage(void)
+{
+    return g_amr_create_last_stage.c_str();
+}
+
+int amr_get_create_progress_active(void)
+{
+    return g_amr_create_progress_active.load(std::memory_order_relaxed);
+}
+
+int amr_get_create_progress_done_faces(void)
+{
+    return g_amr_create_progress_done_faces.load(std::memory_order_relaxed);
+}
+
+int amr_get_create_progress_total_faces(void)
+{
+    return g_amr_create_progress_total_faces.load(std::memory_order_relaxed);
+}
+
+const char* amr_get_last_create_error_message(void)
+{
+    return g_amr_create_last_msg.c_str();
 }
 
 void amr_destroy(AcousticAMRState* st) { delete st; }
@@ -638,78 +1071,156 @@ static void amr_apply_plate_bc(AcousticAMRState* st, float dt)
     }
 }
 
+static void amr_report_diverged(const AcousticAMRState* st)
+{
+    int   worst_i  = 0;
+    float worst_p  = 0.0f;
+    int   n_nonfinite = 0;
+    for (int i = 0; i < (int)st->pressure.size(); ++i) {
+        float p = st->pressure[i];
+        if (!std::isfinite(p)) ++n_nonfinite;
+        if (std::abs(p) > std::abs(worst_p)) { worst_p = p; worst_i = i; }
+    }
+    std::fprintf(stderr,
+        "[amr_step] UNSTABLE step=%d p_max=%.3g Pa worst_cell=%d "
+        "pos=(%.4f, %.4f, %.4f) n_nonfinite=%d\n",
+        st->step_count, worst_p, worst_i,
+        (float)st->centers(worst_i, 0),
+        (float)st->centers(worst_i, 1),
+        (float)st->centers(worst_i, 2),
+        n_nonfinite);
+    std::fflush(stderr);
+}
+
+/* Profiling state: tracks wall-clock time across amr_step calls for periodic reporting. */
+static std::atomic<long long> g_amr_step_total_ns{0};
+static std::atomic<int>       g_amr_step_total_steps{0};
+static std::atomic<int>       g_amr_step_total_cells{0};  /* in millions, *1e6 */
+
 int amr_step(AcousticAMRState* st, int n_steps)
 {
     if (!st) return SK_ERR_NULL_STATE;
     if (n_steps < 0) return SK_ERR_DIM_MISMATCH;
     if (n_steps == 0) return SK_OK;
 
+    const auto t_start = std::chrono::steady_clock::now();
+
     const float dt   = static_cast<float>(st->dt);
     const float rho  = static_cast<float>(st->rho_air);
-    /* Bulk modulus prefactor: rho * c^2 * dt */
     const float bulk = static_cast<float>(st->rho_air * st->c * st->c * st->dt);
     const float dt_over_rho = dt / rho;
 
-    Eigen::VectorXf& div = st->div_flux_buf;  /* reuse preallocated buffer */
+    float*       pressure      = st->pressure.data();
+    float*       velocity      = st->velocity.data();
+    const float* P_damp        = st->P_damp.data();
+    const float* P_src_coeff   = st->P_src_coeff.data();
+    const float* cell_inv_den  = st->cell_inv_denom.data();
+    const float* face_V_damp   = st->face_V_damp.data();
+    const float* face_inv_d    = st->face_inv_dist.data();
+    const int*   face_neg_ptr  = st->face_neg.data();
+    const int*   face_pos_ptr  = st->face_pos.data();
+    const int*   csr_starts    = st->csr_cell_starts.data();
+    const int*   csr_faces     = st->csr_face_idx.data();
+    const float* csr_weight    = st->csr_face_weight.data();
+
+    const int n_faces = st->n_faces;
+    const int n_cells = st->n_cells;
 
     for (int s = 0; s < n_steps; ++s) {
-        /* ── 1. Velocity update: 8th-order Fornberg gradient ───────────────── */
-        /* grad_p at face f = Σ_k face_s_coeff[f*SW2+k] * p[face_s_cells[f*SW2+k]] *
-         * Fornberg weights are precomputed for actual cell-centre positions      *
-         * (non-uniform spacing handled exactly, not assumed uniform).            *
-         * face_s_cells entries of −1 are padding — skipped (coeff is 0).         */
-        constexpr int SW2 = AcousticAMRState::STENCIL_SW * 2;
-        const auto* sc = st->face_s_cells.data();
-        const auto* sw = st->face_s_coeff.data();
-        for (int f = 0; f < st->n_faces; ++f) {
-            const int base = f * SW2;
-            float grad_p = 0.0f;
-            for (int k = 0; k < SW2; ++k) {
-                const int ci = sc[base + k];
-                if (ci >= 0) grad_p += sw[base + k] * st->pressure[ci];
-            }
-            st->velocity[f] = (st->velocity[f] - dt_over_rho * grad_p)
-                               * st->face_V_damp[f];
+        /* ── 1. Velocity update ─────────────────────────────────────────────── */
+        if (st->gradient_order == 8) {
+            constexpr int SW2 = AcousticAMRState::STENCIL_SW * 2;
+            const int32_t* sc = st->face_s_cells.data();
+            const float*   sw = st->face_s_coeff.data();
+            parallel_for(n_faces, [=](int lo, int hi) {
+                for (int f = lo; f < hi; ++f) {
+                    const int base = f * SW2;
+                    float grad_p = 0.0f;
+                    /* Branchless: padding slots have index 0 and coeff 0.0f,
+                     * so pressure[0] is read but contributes nothing. */
+                    for (int k = 0; k < SW2; ++k)
+                        grad_p += sw[base + k] * pressure[sc[base + k]];
+                    velocity[f] = (velocity[f] - dt_over_rho * grad_p) * face_V_damp[f];
+                }
+            });
+        } else {
+            parallel_for(n_faces, [=](int lo, int hi) {
+                for (int f = lo; f < hi; ++f) {
+                    const float grad_p = (pressure[face_pos_ptr[f]] - pressure[face_neg_ptr[f]])
+                                         * face_inv_d[f];
+                    velocity[f] = (velocity[f] - dt_over_rho * grad_p) * face_V_damp[f];
+                }
+            });
         }
 
         /* ── 2. Plate velocity BC (overrides faces adjacent to plate) ── */
         amr_apply_plate_bc(st, dt);
 
-        /* ── 3. Divergence accumulation: cell-centric CSR (no scatter race) ── */
-        div.setZero();
-        const int n_cells = st->n_cells;
-        for (int c = 0; c < n_cells; ++c) {
-            float d = 0.0f;
-            const int k0 = st->csr_cell_starts[c];
-            const int k1 = st->csr_cell_starts[c + 1];
-            for (int k = k0; k < k1; ++k) {
-                const int f = st->csr_face_idx[k];
-                d += st->csr_face_sign[k] * st->velocity[f] * st->face_flux_coef[f];
+        /* ── 3+4. Fused divergence + pressure update (single pass, no div scratch buf) ──
+         * p_new[c] = p[c]*P_damp[c] - bulk * (Σ csr_weight[k]*v[face[k]]) * inv_denom[c] * P_src_coeff[c]
+         * csr_face_weight already has sign and face_flux_coef folded in.            */
+        parallel_for(n_cells, [=](int lo, int hi) {
+            for (int c = lo; c < hi; ++c) {
+                float d = 0.0f;
+                const int k0 = csr_starts[c];
+                const int k1 = csr_starts[c + 1];
+                for (int k = k0; k < k1; ++k)
+                    d += csr_weight[k] * velocity[csr_faces[k]];
+                pressure[c] = pressure[c] * P_damp[c]
+                            - bulk * d * cell_inv_den[c] * P_src_coeff[c];
             }
-            div[c] = d;
-        }
-
-        /* ── 4. Pressure update: exact CPML integrating factor ─────────── */
-        /* p_new[i] = p[i] * exp(-σ·dt)                                         *
-         *          - ρc²·dt · div[i]/V_eff[i] · (1-exp(-σ·dt))/(σ·dt)         *
-         * = p * P_damp - (bulk*div*cell_inv_denom) * P_src_coeff              *
-         * For non-PML cells: P_damp=1, P_src_coeff=1 → standard leapfrog.    */
-        st->pressure = st->pressure.cwiseProduct(st->P_damp)
-                     - (bulk * div).cwiseProduct(st->cell_inv_denom)
-                                   .cwiseProduct(st->P_src_coeff);
+        });
 
         /* ── 5. Zero wall and plate cells (rigid / structural) ── */
         for (int idx : st->wall_plate_cells)
-            st->pressure[idx] = 0.0f;
+            pressure[idx] = 0.0f;
 
         /* ── 6. Kirchhoff plate step ── */
         amr_plate_step(st, dt);
 
         /* ── 7. Stability check ── */
-        if (!st->pressure.allFinite())
+        if (!st->pressure.allFinite()) {
+            amr_report_diverged(st);
             return SK_ERR_DIVERGED;
+        }
+        if ((st->step_count & 0xFF) == 0) {
+            float p_max = st->pressure.cwiseAbs().maxCoeff();
+            if (p_max > 2e3f) {
+                amr_report_diverged(st);
+                return SK_ERR_DIVERGED;
+            }
+        }
         ++st->step_count;
     }
+
+    /* ── Profiling: accumulate and report every ~512 steps ── */
+    const auto t_end = std::chrono::steady_clock::now();
+    const long long elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t_end - t_start).count();
+
+    const int prev_steps = g_amr_step_total_steps.fetch_add(n_steps);
+    g_amr_step_total_ns.fetch_add(elapsed_ns);
+
+    constexpr int REPORT_EVERY = 512;
+    const int new_steps = prev_steps + n_steps;
+    /* report when we cross a multiple of REPORT_EVERY */
+    if ((prev_steps / REPORT_EVERY) != (new_steps / REPORT_EVERY)) {
+        const long long total_ns    = g_amr_step_total_ns.load();
+        const int       total_steps = g_amr_step_total_steps.load();
+        if (total_ns > 0 && total_steps > 0) {
+            const double steps_per_s  = static_cast<double>(total_steps) /
+                                        (static_cast<double>(total_ns) * 1e-9);
+            const double mcell_per_s  = steps_per_s * n_cells / 1e6;
+            const int n_threads = pool().n;
+            std::fprintf(stderr,
+                "[amr_prof] step=%7d  %.0f steps/s  %.1f Mcell-updates/s"
+                "  n_cells=%d  n_faces=%d  threads=%d\n",
+                total_steps, steps_per_s, mcell_per_s,
+                n_cells, n_faces, n_threads);
+            std::fflush(stderr);
+        }
+    }
+
     return SK_OK;
 }
 
@@ -1144,10 +1655,22 @@ int amr_setup_mic_samplers(AcousticAMRState* st, int n_mics,
     st->mic_p_samplers.resize(n_mics);
     st->mic_v_samplers.resize(n_mics);
 
-    /* Search radius: use 2× the mean cell spacing */
+    /* Search radius + acoustic AABB, computed in a single pass over acoustic cells */
     double mean_vol = 0.0;
-    for (int idx : st->acoustic_cells)
+    float aabb_min[3] = { std::numeric_limits<float>::max(),
+                          std::numeric_limits<float>::max(),
+                          std::numeric_limits<float>::max() };
+    float aabb_max[3] = { std::numeric_limits<float>::lowest(),
+                          std::numeric_limits<float>::lowest(),
+                          std::numeric_limits<float>::lowest() };
+    for (int idx : st->acoustic_cells) {
         mean_vol += st->volumes[idx];
+        for (int d = 0; d < 3; ++d) {
+            float c = (float)st->centers(idx, d);
+            if (c < aabb_min[d]) aabb_min[d] = c;
+            if (c > aabb_max[d]) aabb_max[d] = c;
+        }
+    }
     if (!st->acoustic_cells.empty())
         mean_vol /= (double)st->acoustic_cells.size();
     float search_r = 2.0f * (float)std::cbrt(mean_vol);
@@ -1156,6 +1679,25 @@ int amr_setup_mic_samplers(AcousticAMRState* st, int n_mics,
         float mx = pos_xyz[mi * 3 + 0];
         float my = pos_xyz[mi * 3 + 1];
         float mz = pos_xyz[mi * 3 + 2];
+
+        /* Clamp mic to the acoustic envelope so external positions (e.g. an overhead
+         * mic above the body) land on the nearest boundary cell rather than failing. */
+        float cmx = std::max(aabb_min[0], std::min(aabb_max[0], mx));
+        float cmy = std::max(aabb_min[1], std::min(aabb_max[1], my));
+        float cmz = std::max(aabb_min[2], std::min(aabb_max[2], mz));
+        if (cmx != mx || cmy != my || cmz != mz) {
+            std::fprintf(stderr,
+                "[amr_mic] WARNING mic %d at (%.4f, %.4f, %.4f) is outside acoustic "
+                "envelope [%.4f..%.4f, %.4f..%.4f, %.4f..%.4f]; clamped to "
+                "(%.4f, %.4f, %.4f)\n",
+                mi, mx, my, mz,
+                aabb_min[0], aabb_max[0],
+                aabb_min[1], aabb_max[1],
+                aabb_min[2], aabb_max[2],
+                cmx, cmy, cmz);
+            std::fflush(stderr);
+            mx = cmx; my = cmy; mz = cmz;
+        }
 
         /* ── Pressure sampler: inverse-distance weighted acoustic cells ── */
         MicPressureSampler& ps = st->mic_p_samplers[mi];

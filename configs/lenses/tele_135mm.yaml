@@ -1,0 +1,14 @@
+# Lens: tele_135mm
+# Medium telephoto prime — dramatic compression, very low distortion.
+
+name: tele_135mm
+focal_mm: 135.0
+min_focal_mm: 135.0
+max_focal_mm: 135.0
+is_zoom: false
+min_focus_m: 1.10
+max_aperture_fstop: 1.8
+distortion_k1: 0.0002
+distortion_k2: 0.0
+vignetting: 0.10
+transmission: [0.98, 0.975, 0.965, 0.860]

@@ -393,7 +393,8 @@ typedef struct AMRCoevolverDescriptor {
     float border_sigma_order;    /* polynomial grading exponent, 0 → default 3.0 */
     float border_R_reflection;   /* ROOM_PANEL: residual reflected fraction [0,1] */
     float border_Z_match;        /* TRANSMISSION: 0 = auto (ρc) */
-    int   n_pml;                 /* PML thickness in min_dx cells; 0 = no PML */} AMRCoevolverDescriptor;
+    int   n_pml;                 /* PML thickness in min_dx cells; 0 = no PML */
+    int   gradient_order;        /* 2 = face-pair gradient, 8 = Fornberg stencil */} AMRCoevolverDescriptor;
 
 /**
  * Create a co-evolver backed by a strict AMR FDTD pressure domain.
@@ -426,6 +427,9 @@ SK_API AcousticCoEvolverState* coevolver_create_amr(
     float                         sample_rate,
     int                           modal_stride
 );
+
+/** Returns the stage label set at the last coevolver_create_amr failure, or "" on success. */
+SK_API const char* coevolver_create_amr_last_error(void);
 
 /* ── Excitation ───────────────────────────────────────────────────────────── */
 
@@ -702,6 +706,19 @@ SK_API int coevolver_get_plate_displacement(
     const AcousticCoEvolverState* st,
     float* out,
     int    out_len
+);
+
+/**
+ * Query the 2-D Kirchhoff plate displacement dimensions for the active backend.
+ *
+ * Uniform FDTD returns Nx, Ny, Nx*Ny. AMR returns plate_Nx, plate_Ny,
+ * plate_Nx*plate_Ny, which can differ from the visualization/acoustic grid.
+ */
+SK_API int coevolver_get_plate_dims(
+    const AcousticCoEvolverState* st,
+    int* out_Nx,
+    int* out_Ny,
+    int* out_count
 );
 
 /**

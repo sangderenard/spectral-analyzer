@@ -1,0 +1,47 @@
+# Film layer: em_nir  (near-infrared / false-colour)
+# Models a false-colour NIR emulsion: NIR energy maps to a magenta channel.
+# Classic false-colour IR effect: high NIR → vivid magenta.
+
+name: em_nir
+domain: em
+iso: 1.8
+gamma: 2.1
+negative: false
+rotate180: true
+opacity: 1.0
+blend_mode: add
+hue: 320.0         # magenta-pink
+saturation: 1.2
+sensitivity: 1.3
+is_acoustic: false
+is_em: true
+
+spectral_bands:
+  - center_hz: 110.0
+    q: 2.0
+    gain: 0.3
+    label: "Red 620-750 nm"
+  - center_hz: 330.0
+    q: 2.0
+    gain: 0.1
+    label: "Green 495-620 nm"
+  - center_hz: 660.0
+    q: 2.0
+    gain: 0.05
+    label: "Blue 380-495 nm"
+  - center_hz: 1800.0
+    q: 2.5
+    gain: 3.0
+    label: "UV/NIR 750 nm+ — primary NIR channel"
+
+activation: log
+activation_params:
+  gain: 2.0
+
+tone_shadows:    [0.02, 0.00, 0.02]
+tone_highlights: [1.00, 0.22, 0.80]   # magenta
+shadow_point:    0.08   # false-colour IR — moderate toe for dramatic effect
+highlight_point: 0.88   # compressed shoulder accentuates NIR bloom
+grain_sigma: 0.016
+grain_size: 1.8
+grain_colorimetry: chromatic

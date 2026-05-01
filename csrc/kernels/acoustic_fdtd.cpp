@@ -9,6 +9,7 @@
 #include <string.h>
 #include <math.h>
 #include <float.h>
+#include <stdio.h>
 #include <Eigen/Core>
 #include <thread>
 #include <mutex>
@@ -1028,8 +1029,15 @@ static int plate_step(AcousticFDTDState* st)
                     - bh * biharm
                     - st->plate_bk_coeff * (biharm - biharm_prev);
 
-        if (!isfinite(w_new) || fabsf(w_new) > 0.02f)
+        if (!isfinite(w_new) || fabsf(w_new) > 0.02f) {
+            int pi = pidx / st->Ny, pj = pidx % st->Ny;
+            fprintf(stderr,
+                "[fdtd_plate] UNSTABLE step=%d plate_node=%d (%d,%d) "
+                "w_new=%.3g m (limit 0.02 m)\n",
+                st->step_count, pidx, pi, pj, w_new);
+            fflush(stderr);
             return FDTD_ERR_UNSTABLE;
+        }
         wt[pidx] = w_new;
     }
 
@@ -1244,8 +1252,17 @@ static int check_stable(AcousticFDTDState* st)
     st->stability_stride_phase = (start + 1) % SAMPLE_STRIDE;
     for (int i = start; i < st->N; i += SAMPLE_STRIDE) {
         float p = st->P_curr[i];
-        if (!isfinite(p) || p > 2e3f || p < -2e3f)
+        if (!isfinite(p) || p > 2e3f || p < -2e3f) {
+            int Ny = st->Ny, Nz = st->Nz;
+            int ci = i / (Ny * Nz);
+            int cj = (i / Nz) % Ny;
+            int ck = i % Nz;
+            fprintf(stderr,
+                "[fdtd_pressure] UNSTABLE step=%d cell=%d (%d,%d,%d) p=%.3g Pa\n",
+                st->step_count, i, ci, cj, ck, p);
+            fflush(stderr);
             return FDTD_ERR_UNSTABLE;
+        }
     }
     return FDTD_OK;
 }

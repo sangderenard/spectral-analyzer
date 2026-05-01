@@ -1,0 +1,19 @@
+# Material: stage_floor
+# Concert stage floor — dark stained hardwood planks.
+# Low-gloss surface with visible grain; typical of studio or live performance stages.
+
+name: stage_floor
+description: Stage floor — dark stained hardwood
+
+albedo_rgb: [0.30, 0.22, 0.16]       # linear sRGB — dark warm brown
+reflectivity: 0.52
+diffusion: 0.80
+absorption: 0.10
+
+smoothness: 0.35
+ior: 1.52
+
+notes: >
+  Stage floor acts as a large reflective plane below the guitar.  The albedo
+  should be kept dark to avoid over-brightening the sensor output from
+  floor-bounce contributions.  For a light oak floor: [0.62, 0.52, 0.36].

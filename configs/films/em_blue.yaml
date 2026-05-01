@@ -1,0 +1,42 @@
+# Film layer: em_blue
+name: em_blue
+domain: em
+iso: 1.0
+gamma: 2.2
+negative: false
+rotate180: true
+opacity: 1.0
+blend_mode: add
+hue: 240.0
+saturation: 1.4
+sensitivity: 1.0
+is_acoustic: false
+is_em: true
+
+spectral_bands:
+  - center_hz: 110.0
+    q: 2.0
+    gain: 0.05
+    label: "Red 620-750 nm"
+  - center_hz: 330.0
+    q: 2.0
+    gain: 0.40
+    label: "Green 495-620 nm"
+  - center_hz: 660.0
+    q: 2.0
+    gain: 2.0
+    label: "Blue 380-495 nm"
+  - center_hz: 1800.0
+    q: 2.0
+    gain: 0.5
+    label: "UV/NIR 750 nm+"
+
+activation: linear
+activation_params: {}
+tone_shadows:    [0.00, 0.00, 0.03]
+tone_highlights: [0.10, 0.30, 1.00]
+shadow_point:    0.08   # blue layer historically grainier — slightly earlier shadow toe
+highlight_point: 0.92
+grain_sigma: 0.014
+grain_size: 1.6
+grain_colorimetry: chromatic

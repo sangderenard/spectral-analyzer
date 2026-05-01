@@ -1,0 +1,14 @@
+# Lens: portrait_85mm
+# Short telephoto portrait prime — slight compression, low distortion.
+
+name: portrait_85mm
+focal_mm: 85.0
+min_focal_mm: 85.0
+max_focal_mm: 85.0
+is_zoom: false
+min_focus_m: 0.85
+max_aperture_fstop: 1.2
+distortion_k1: 0.0004
+distortion_k2: 0.0
+vignetting: 0.12
+transmission: [0.99, 0.98, 0.97, 0.88]

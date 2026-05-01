@@ -1,0 +1,10 @@
+# Sensor: medium_format_645
+# 645-format digital medium format (Fujifilm GFX / Phase One IQ class).
+# Very large photosites; extremely wide dynamic range; low native ISO noise.
+
+name: medium_format_645
+width_mm: 53.7
+height_mm: 40.2
+pixel_pitch_um: 5.3
+max_iso: 12800
+dynamic_range_stops: 15.5

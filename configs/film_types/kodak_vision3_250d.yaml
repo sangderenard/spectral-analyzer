@@ -1,0 +1,80 @@
+# Film type: Kodak Vision3 250D (5207)
+# Motion picture colour negative — wide exposure latitude, fine grain,
+# warm colour balance.  Acoustic analogue: rich bass and mid with gentle
+# high-frequency rolloff and warm amber-orange highlights.
+#
+# Stack: additive bass + mid layers with a multiply ortho dye-mask.
+
+name: kodak_vision3_250d
+description: "Kodak Vision3 250D 5207 — motion picture colour negative"
+
+active: bass
+
+layers:
+  - name: bass
+    domain: acoustic
+    iso: 1.6
+    gamma: 2.10
+    negative: false
+    rotate180: true
+    opacity: 0.85
+    blend_mode: add
+    hue: 32.0
+    saturation: 1.2
+    spectral_bands:
+      - center_hz: 100.0
+        q: 2.5
+        gain: 1.8
+        label: "B0 55-220 Hz"
+      - center_hz: 300.0
+        q: 2.0
+        gain: 1.3
+        label: "B1 220-440 Hz"
+      - center_hz: 620.0
+        q: 1.8
+        gain: 0.6
+        label: "B2 440-880 Hz"
+      - center_hz: 1800.0
+        q: 1.5
+        gain: 0.12
+        label: "B3 880+ Hz"
+    activation: sigmoid
+    activation_params: {knee: 0.50, gain: 2.0}
+    tone_shadows:    [0.04, 0.02, 0.01]
+    tone_highlights: [1.00, 0.72, 0.28]
+    grain_sigma: 0.011
+    grain_size: 1.4
+    grain_colorimetry: chromatic
+
+  - name: dye_mask
+    domain: acoustic
+    iso: 1.0
+    gamma: 2.10
+    negative: false
+    rotate180: true
+    opacity: 0.35
+    blend_mode: multiply
+    hue: null
+    saturation: 1.0
+    spectral_bands:
+      - center_hz: 110.0
+        q: 1.5
+        gain: 0.95
+        label: "B0 55-220 Hz"
+      - center_hz: 330.0
+        q: 1.8
+        gain: 1.10
+        label: "B1 220-440 Hz"
+      - center_hz: 660.0
+        q: 1.8
+        gain: 0.80
+        label: "B2 440-880 Hz"
+      - center_hz: 1800.0
+        q: 1.5
+        gain: 0.15
+        label: "B3 880+ Hz — integral dye mask"
+    activation: linear
+    activation_params: {}
+    grain_sigma: 0.006
+    grain_size: 1.0
+    grain_colorimetry: luminance

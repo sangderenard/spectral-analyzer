@@ -1,0 +1,21 @@
+# Light: neon_sign
+# Gas-discharge neon sign (red-orange neon + blue argon mix).
+# Very narrow spectral lines; no significant NIR.
+
+name: neon_sign
+description: "Neon/argon gas discharge sign — red-orange + blue-violet lines"
+
+spectrum:
+  type: lines
+  lines:
+    - {nm: 415.9,  weight: 0.10}  # argon violet
+    - {nm: 476.5,  weight: 0.12}  # argon blue
+    - {nm: 501.7,  weight: 0.08}  # argon blue-green
+    - {nm: 616.4,  weight: 0.25}  # neon orange-red
+    - {nm: 626.6,  weight: 0.22}  # neon red
+    - {nm: 638.3,  weight: 0.15}  # neon red
+    - {nm: 650.6,  weight: 0.08}  # neon deep red
+
+color_temperature_k: 2500.0   # approximate equivalent
+beam_angle_deg: 360.0
+n_emitters: 3

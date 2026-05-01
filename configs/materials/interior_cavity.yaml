@@ -1,0 +1,22 @@
+# Material: interior_cavity
+# Guitar body interior — raw unfinished spruce bracing and kerfing.
+# The acoustic cavity is the primary reverberant space; surfaces are rough and
+# highly absorptive relative to the exterior lacquered faces.
+
+name: interior_cavity
+description: Guitar body interior — raw wood bracing and kerfing
+
+albedo_rgb: [0.55, 0.45, 0.30]       # raw unfinished spruce — warmer, less saturated
+reflectivity: 0.42                     # lower than finished exterior
+diffusion: 0.92                        # nearly Lambertian — no finish
+absorption: 0.22                       # higher loss per bounce (rough grain, glue joints)
+
+smoothness: 0.12
+ior: 1.48
+
+notes: >
+  Interior surfaces are the mat_in faces of the guitar body triangles.
+  High diffusion and absorption is physically correct — the cavity's
+  acoustic properties are dominated by bracing geometry and air volume,
+  not surface specularity.  The soundhole opening appears black from outside
+  because interior reflections are weak relative to the bright exterior.

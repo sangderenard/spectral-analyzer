@@ -31,8 +31,28 @@ SK_API AcousticAMRState* amr_create(
     const double*  face_distance,     /* (n_faces,) */
     double         c,
     double         rho_air,
-    double         min_dx
+    double         min_dx,
+    int            gradient_order      /* 2 = face-pair gradient, 8 = Fornberg stencil */
 );
+
+/**
+ * Last amr_create() failure diagnostics for the current thread.
+ *
+ * Returns a short stage label and message set when amr_create returns NULL.
+ * On success, stage is "ok" and message is empty.
+ */
+SK_API const char* amr_get_last_create_error_stage(void);
+SK_API const char* amr_get_last_create_error_message(void);
+
+/**
+ * Cross-thread AMR create progress snapshot.
+ *
+ * These counters are global (not thread-local) and are intended for UI
+ * progress reporting while amr_create() is running in another thread.
+ */
+SK_API int amr_get_create_progress_active(void);      /* 1 while create is running, else 0 */
+SK_API int amr_get_create_progress_done_faces(void);  /* completed stencil faces */
+SK_API int amr_get_create_progress_total_faces(void); /* total stencil faces */
 
 SK_API void amr_destroy(AcousticAMRState* st);
 

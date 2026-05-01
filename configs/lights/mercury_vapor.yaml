@@ -1,0 +1,21 @@
+# Light: mercury_vapor
+# Low-pressure mercury arc — strong UV and blue-green lines, pink-white appearance.
+# Used in UV photography, scientific imaging, older street lamps.
+
+name: mercury_vapor
+description: "Mercury vapor arc lamp — blue-green dominant with UV component"
+
+spectrum:
+  type: lines
+  lines:
+    - {nm: 404.7,  weight: 0.12}  # violet
+    - {nm: 435.8,  weight: 0.20}  # blue
+    - {nm: 546.1,  weight: 0.36}  # green (strongest)
+    - {nm: 577.0,  weight: 0.05}  # yellow doublet
+    - {nm: 579.1,  weight: 0.05}  # yellow doublet
+    - {nm: 690.0,  weight: 0.10}  # red continuum
+    - {nm: 623.0,  weight: 0.12}  # orange
+
+color_temperature_k: 6000.0
+beam_angle_deg: 55.0
+n_emitters: 6

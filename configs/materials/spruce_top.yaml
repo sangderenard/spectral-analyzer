@@ -1,0 +1,19 @@
+# Material: spruce_top
+# Guitar soundboard — Sitka or Engelmann spruce top plate.
+# Light cream-to-amber tone with tight grain lines.  The primary vibrating surface.
+
+name: spruce_top
+description: Guitar soundboard — spruce top plate
+
+albedo_rgb: [0.78, 0.68, 0.48]       # linear sRGB — pale warm amber
+reflectivity: 0.68                     # slightly lower than mahogany (softer wood)
+diffusion: 0.72                        # more diffuse — straighter grain, lighter lacquer
+absorption: 0.06
+
+smoothness: 0.55
+ior: 1.50
+
+notes: >
+  Aged tops darken considerably toward [0.62, 0.50, 0.30].  The lacquer on a
+  vintage instrument can be nearly translucent, exposing the raw grain albedo.
+  Top plate deflects ~0.5 mm under string tension; geometry is planar for BVH.

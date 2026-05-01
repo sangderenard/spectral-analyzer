@@ -972,6 +972,139 @@ def spectral_bands_to_rgb(
     return rgb
 
 
+# ---------------------------------------------------------------------------
+# Global scene field integration  (sensor-independent, GL shader seed data)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class SceneFieldIntegration:
+    """Area-weighted spectral integrals of the ray-traced light/surface field.
+
+    These values are independent of sensor or camera placement; they describe
+    the total energy state of the scene and are intended as seed data for
+    OpenGL shaders (upload via glUniform1fv / glUniform3fv).
+
+    Attributes
+    ----------
+    n_bands          : int
+    freq_hz          : (n_bands,)  float64 — band centre frequencies
+    surface_power    : (n_bands,)  float32 — Σ(flux_i × area_i) per band
+    surface_direct   : (n_bands,)  float32 — direct-illumination component
+    surface_indirect : (n_bands,)  float32 — reflected/bounced component
+    transport_power  : (n_bands,)  float32 — total in-flight amplitude per band
+    total_power      : (n_bands,)  float32 — surface_power + transport_power
+    rgb              : (3,)        float32 — spectral-weighted scene tint
+    peak_band        : int         — index of the dominant band in surface_power
+    """
+    n_bands:          int
+    freq_hz:          np.ndarray   # (n_bands,) float64
+    surface_power:    np.ndarray   # (n_bands,) float32
+    surface_direct:   np.ndarray   # (n_bands,) float32
+    surface_indirect: np.ndarray   # (n_bands,) float32
+    transport_power:  np.ndarray   # (n_bands,) float32
+    total_power:      np.ndarray   # (n_bands,) float32
+    rgb:              np.ndarray   # (3,)       float32
+    peak_band:        int
+
+    def as_uniform_vec(self) -> np.ndarray:
+        """Flat float32 array for a single contiguous GL uniform upload.
+
+        Layout (total length = 4 * n_bands + 4):
+            surface_power    [0          : n_bands  ]
+            surface_direct   [n_bands    : 2*n_bands]
+            surface_indirect [2*n_bands  : 3*n_bands]
+            transport_power  [3*n_bands  : 4*n_bands]
+            rgb              [4*n_bands  : 4*n_bands+3]
+            peak_band        [4*n_bands+3]            (as float)
+        """
+        return np.concatenate([
+            self.surface_power,
+            self.surface_direct,
+            self.surface_indirect,
+            self.transport_power,
+            self.rgb,
+            np.array([float(self.peak_band)], dtype=np.float32),
+        ])
+
+
+def integrate_scene_fields(
+        segs:             np.ndarray,   # (N_seg, 12) float32
+        surface_flux:     np.ndarray,   # (n_tri, n_bands) float32
+        surface_direct:   np.ndarray,   # (n_tri, n_bands) float32
+        surface_indirect: np.ndarray,   # (n_tri, n_bands) float32
+        tri_verts:        np.ndarray,   # (n_tri, 3, 3) or (n_tri, 9) float32/64
+        freq_hz:          np.ndarray,   # (n_bands,) float64
+) -> SceneFieldIntegration:
+    """Build a sensor-independent SceneFieldIntegration from ray trace outputs.
+
+    Computes area-weighted spectral power integrals across *all* surfaces
+    (not just the display subset) and accumulates in-flight ray amplitude per
+    band from the segment buffer.  The result is independent of camera/sensor
+    placement and is suitable for seeding OpenGL lighting shaders.
+
+    Parameters
+    ----------
+    segs             : full segment buffer from trace_cavity_scene
+    surface_flux     : (n_tri, n_bands) total per-triangle irradiance
+    surface_direct   : (n_tri, n_bands) direct-illumination irradiance
+    surface_indirect : (n_tri, n_bands) reflected irradiance
+    tri_verts        : (n_tri, 3, 3) or (n_tri, 9) triangle vertex coords
+    freq_hz          : (n_bands,) band centre frequencies
+    """
+    n_tri, n_bands = surface_flux.shape
+
+    # Triangle areas via cross-product.
+    verts3 = tri_verts.reshape(n_tri, 3, 3).astype(np.float64)
+    e1     = verts3[:, 1] - verts3[:, 0]
+    e2     = verts3[:, 2] - verts3[:, 0]
+    areas  = (0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)).astype(np.float32)  # (n_tri,)
+
+    # Area-weighted integrals across all surface triangles.
+    sp = (surface_flux     * areas[:, None]).sum(axis=0).astype(np.float32)
+    sd = (surface_direct   * areas[:, None]).sum(axis=0).astype(np.float32)
+    si = (surface_indirect * areas[:, None]).sum(axis=0).astype(np.float32)
+
+    # In-flight energy: accumulate segment amplitudes into per-band bins.
+    # Segment column layout: x0,y0,z0, x1,y1,z1, src_id, bounce, band, amp, phase, path_len
+    tp = np.zeros(n_bands, dtype=np.float32)
+    if len(segs) > 0:
+        band_idx = np.clip(segs[:, 8].astype(np.int32), 0, n_bands - 1)
+        amps     = np.abs(segs[:, 9]).astype(np.float32)
+        np.add.at(tp, band_idx, amps)
+
+    total = sp + tp
+
+    # Spectral-weighted RGB tint (same hue mapping as spectral_bands_to_rgb).
+    f0, f1 = 20.0, 20000.0
+    t  = np.clip((np.log10(freq_hz) - np.log10(f0)) /
+                 (np.log10(f1) - np.log10(f0)), 0.0, 1.0).astype(np.float32)
+    r_b = np.clip(np.cos(np.pi * t) * 1.5,         0.0, 1.0)
+    g_b = np.clip(np.sin(np.pi * t) * 1.2,         0.0, 1.0)
+    b_b = np.clip(np.cos(np.pi * (t - 1.0)) * 1.5, 0.0, 1.0)
+
+    sp_n  = sp / (sp.max() + 1e-12)
+    rgb   = np.array([(sp_n * r_b).sum(),
+                      (sp_n * g_b).sum(),
+                      (sp_n * b_b).sum()], dtype=np.float32)
+    peak_rgb = rgb.max()
+    if peak_rgb > 1e-9:
+        rgb /= peak_rgb
+
+    peak_band = int(sp.argmax()) if sp.max() > 1e-12 else 0
+
+    return SceneFieldIntegration(
+        n_bands          = n_bands,
+        freq_hz          = freq_hz,
+        surface_power    = sp,
+        surface_direct   = sd,
+        surface_indirect = si,
+        transport_power  = tp,
+        total_power      = total,
+        rgb              = rgb,
+        peak_band        = peak_band,
+    )
+
+
 def trace_cavity_scene(
         scene,
         n_rays:        int   = 256,
@@ -1170,6 +1303,18 @@ def trace_cavity_scene(
     geo_verts_flat = disp_verts.reshape(n_disp, 9).astype(np.float32) if n_disp else np.zeros((0, 9), dtype=np.float32)
     geo_normals    = disp_norms.astype(np.float32) if n_disp else np.zeros((0, 3), dtype=np.float32)
 
+    # Global scene field integration — sensor-independent, covers ALL triangles
+    # (room shell + baffles) so the energy budget is complete.  Suitable as
+    # seed data for OpenGL shaders via meta['scene_field'].as_uniform_vec().
+    scene_field = integrate_scene_fields(
+        segs             = segs,
+        surface_flux     = surface_flux,      # full n_tri, not display subset
+        surface_direct   = surface_direct,
+        surface_indirect = surface_indirect,
+        tri_verts        = verts,             # (n_tri, 3, 3) float64
+        freq_hz          = freq_hz,
+    )
+
     meta = {
         'n_sources':        n_sources,
         'n_bands':          n_bands,
@@ -1187,6 +1332,8 @@ def trace_cavity_scene(
         'surface_scalar':   disp_scalar,   # (n_disp_tri,)         float32
         # Legacy alias:
         'surface_illum':    disp_scalar,
+        # Global field integration (sensor-independent, GL shader seed):
+        'scene_field':      scene_field,   # SceneFieldIntegration
     }
 
     return segs.astype(np.float32), meta

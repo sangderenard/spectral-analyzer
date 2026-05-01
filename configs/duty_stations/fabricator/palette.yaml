@@ -1,0 +1,53 @@
+# Fabricator solid palette
+# Each entry defines a platonic (or derived) solid available in the picker panel.
+# color_rgb: face highlight color shown in the panel icon and when the piece is
+#            selected / ghosted in the workspace.
+
+solids:
+  - id: tetrahedron
+    label: Tetrahedron
+    subtitle: "4F · 6E · 4V"
+    color_rgb: [0.95, 0.35, 0.20]   # warm red
+
+  - id: cube
+    label: Cube
+    subtitle: "6F · 12E · 8V"
+    color_rgb: [0.25, 0.55, 0.95]   # cobalt blue
+
+  - id: octahedron
+    label: Octahedron
+    subtitle: "8F · 12E · 6V"
+    color_rgb: [0.20, 0.85, 0.60]   # mint green
+
+  - id: icosahedron
+    label: Icosahedron
+    subtitle: "20F · 30E · 12V"
+    color_rgb: [0.90, 0.75, 0.10]   # amber
+
+  - id: dodecahedron
+    label: Dodecahedron
+    subtitle: "12F · 30E · 20V"
+    color_rgb: [0.70, 0.30, 0.90]   # violet
+
+  - id: triangular_prism
+    label: Tri Prism
+    subtitle: "5F · 9E · 6V"
+    color_rgb: [0.10, 0.75, 0.90]   # cyan
+
+  - id: square_pyramid
+    label: Sq Pyramid
+    subtitle: "5F · 8E · 5V"
+    color_rgb: [0.90, 0.50, 0.10]   # orange
+
+  - id: triangular_bipyramid
+    label: Tri Bipyramid
+    subtitle: "6F · 9E · 5V"
+    color_rgb: [0.55, 0.90, 0.20]   # lime
+
+# Panel display options
+panel:
+  item_height:   56        # pixels per solid entry
+  icon_size:     40        # icon square size (px)
+  font_size:     13
+  subtitle_font: 11
+  scroll_speed:  24        # pixels per wheel tick

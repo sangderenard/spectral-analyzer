@@ -1,0 +1,37 @@
+# Player controller configuration
+# Drives the PlayerController state machine that owns the OpenGL camera.
+
+initial_state: orbit   # orbit | walk | interact
+
+# ── Orbit state ───────────────────────────────────────────────────────────────
+# Classic orbit camera: mouse drag = rotate, wheel = zoom, WASD = pan target.
+orbit:
+  target:   [0.0, 0.40, 0.65]   # look-at point (guitar mid-body)
+  dist:     1.6                  # metres from target
+  elev:     14.0                 # elevation degrees above horizontal
+  az:       22.0                 # azimuth degrees (yaw)
+  auto_rotate_speed: 0.0        # degrees/frame; 0 = static
+  mouse_sensitivity: 0.35        # degrees per pixel
+  zoom_rate: 0.04                # metres per wheel tick
+  transition_to_walk_key: tab    # key that switches to walk mode
+
+# ── Walk state ────────────────────────────────────────────────────────────────
+# First-person: WASD move, mouse look, E near a station = interact.
+walk:
+  start_pos:  [0.0, -1.0, 0.0]  # initial player position in world coords
+  start_yaw:  90.0               # initial horizontal look angle (degrees)
+  eye_height: 1.65               # metres above pos.z
+  move_speed: 2.5                # metres/second base movement
+  run_multiplier: 2.2            # multiplier when Shift held
+  mouse_sensitivity: 0.15        # degrees per pixel (captured relative mouse)
+  pitch_limit_deg: 75.0          # max pitch up/down
+  transition_to_orbit_key: tab   # key that returns to orbit
+
+# ── Interact state ────────────────────────────────────────────────────────────
+# Camera smoothly moves to station console view; mouse freed; sidebar appears.
+interact:
+  lerp_speed: 5.0               # camera approach speed (world units / second)
+  trigger_key: e                # key pressed near station to enter
+  exit_key: escape              # key to return to walk
+  hud_hint: "[ E ]  Interact"  # text shown when in proximity
+  hint_proximity_fade: 0.4      # distance at which hint starts fading (0..1 of radius)

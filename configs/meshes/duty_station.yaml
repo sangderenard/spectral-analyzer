@@ -1,0 +1,64 @@
+# Duty station — Star Trek-style LCARS console with viewscreen
+# Procedural mesh: no external geometry file required.
+# Local coordinate origin: front-centre-bottom of the console.
+# World transform applied by DutyStation at render time.
+
+name: duty_station
+
+# ── World transform ───────────────────────────────────────────────────────────
+position: [0.0, 2.4, 0.0]   # world XYZ; Z-up, Y-forward
+yaw_deg:  180.0              # rotation around Z (180 = faces -Y, toward guitar)
+
+# ── Console body (the desk / podium) ─────────────────────────────────────────
+console:
+  width:         1.40   # X extent
+  depth:         0.62   # Y extent (front to back in local space)
+  height:        0.88   # Z of front-edge of top surface
+  top_tilt_deg:  14.0   # back edge raised by depth * tan(tilt) — tilts toward operator
+  bevel:         0.10   # front-bottom chamfer (purely visual; not yet meshed)
+
+# ── Viewscreen panel ──────────────────────────────────────────────────────────
+screen:
+  width:          1.10
+  height:         0.72
+  tilt_back_deg:  7.0    # lean back from vertical (0 = perfectly upright)
+  # screen bottom Z is computed from console back-edge height
+
+# ── Side wing panels ─────────────────────────────────────────────────────────
+side_wings:
+  enabled: true
+  width:   0.14          # X extent of each wing (added to each side)
+  height:  0.52          # Z extent (from floor up)
+
+# ── Interaction ───────────────────────────────────────────────────────────────
+interaction_radius: 1.80   # metres; proximity threshold for E-key hint
+
+# Camera pose when interacting (world coords; overrides player walk camera)
+interact_camera:
+  eye:    [0.0, 0.70, 1.30]    # player eye position at the console
+  target: [0.0, 2.40, 1.28]   # look-at point (centre of screen)
+
+# ── Materials ─────────────────────────────────────────────────────────────────
+materials:
+  body:
+    albedo_rgb:    [0.07, 0.09, 0.13]
+    reflectivity:  0.50
+    diffusion:     0.28
+    absorption:    0.06
+    smoothness:    0.78
+    ambient:       0.18
+    spec_strength: 0.55
+    shininess:     112.0
+    grain:         0.05          # very slight surface grain
+
+  trim:
+    albedo_rgb:    [0.04, 0.22, 0.52]
+    emissive:      [0.00, 0.36, 0.92]   # LCARS blue glow
+
+  screen_active:
+    albedo_rgb:    [0.02, 0.04, 0.08]
+    emissive:      [0.06, 0.32, 0.88]   # soft blue-white display glow
+
+  screen_inactive:
+    albedo_rgb:    [0.01, 0.01, 0.02]
+    emissive:      [0.00, 0.00, 0.00]

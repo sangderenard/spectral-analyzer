@@ -87,6 +87,22 @@ except ImportError:
     _extract_scene_geometry_materials_fn = None
     _HAS_RAY = False
 
+# ── player controller + duty station ─────────────────────────────────────────
+try:
+    from player_controller import PlayerController as _PlayerController
+    _HAS_PLAYER_CTRL = True
+except ImportError:
+    _PlayerController = None  # type: ignore[assignment,misc]
+    _HAS_PLAYER_CTRL = False
+
+try:
+    from duty_station import DutyStation as _DutyStation, camera_pure_matrices as _cam_pure_matrices
+    _HAS_DUTY_STATION = True
+except ImportError:
+    _DutyStation = None  # type: ignore[assignment,misc]
+    _cam_pure_matrices = None  # type: ignore[assignment]
+    _HAS_DUTY_STATION = False
+
 # ── pygame + OpenGL ───────────────────────────────────────────────────────────
 try:
     import pygame
@@ -119,7 +135,8 @@ try:
         glBlendFunc, glBufferData, glBufferSubData, glClear,
         glClearColor, glCompileShader, glCreateProgram, glCreateShader,
         glDeleteBuffers, glDeleteProgram, glDeleteShader,
-        glDeleteTextures, glDeleteVertexArrays, glDepthMask,
+        glDeleteTextures, glDeleteVertexArrays, glDepthFunc, glDepthMask,
+        GL_LEQUAL, GL_LESS,
         glDisable, glDrawArrays, glDrawElements,
         glEnable, glEnableVertexAttribArray, glGenBuffers, glGenTextures,
         glGenVertexArrays, glGetShaderInfoLog, glGetUniformLocation,
@@ -2370,6 +2387,10 @@ uniform float uRayExposure;   // default 1.0
 uniform float uBaseExposure;  // default 1.0
 uniform float uRayGamma;      // default 0.45
 
+// Scene field seed — same values as in _BODY_FS, uploaded once per frame.
+uniform vec3  uSceneRgb;
+uniform float uSceneIndirectRatio;
+
 float sampleBand(usampler3D tex, vec3 uvw) {
     return float(texture(tex, uvw).r) / 65535.0;
 }
@@ -2440,9 +2461,15 @@ void main() {
     // Spectral illumination × material reflectance + ambient lift.
     // Each band independently colours the surface; the material base colour
     // acts as a per-channel reflectance filter.
+    // Scene field tints the ambient colour and brightens spectral highlights
+    // in proportion to the environment's indirect (bounce) fraction.
     vec3 spectral = clamp(base_rgb + dyn_rgb, vec3(0.0), vec3(1.2));
-    vec3  col  = base * (uAmbient + spectral);
-    FragColor  = vec4(col, uColor.a);
+    // Tint the spectral overlay toward the scene field colour for coherence.
+    spectral = mix(spectral, spectral * uSceneRgb * 1.4, 0.25 * uSceneIndirectRatio);
+    // Output only the spectral irradiance delta (material reflectance × band irradiance).
+    // This is additively blended onto the Phong surface drawn earlier so the two
+    // lighting models combine rather than one overwriting the other.
+    FragColor = vec4(base * spectral, uColor.a);
 }
 """
 
@@ -2454,6 +2481,7 @@ class RayLightingState:
     surface_indirect: np.ndarray   # (n_tri, n_bands) float32
     surface_rgb:      np.ndarray   # (n_tri, 3)       float32
     surface_scalar:   np.ndarray   # (n_tri,)          float32
+    scene_field:      object       = None  # SceneFieldIntegration | None
 
 
 _BODY_VS = """
@@ -2489,6 +2517,13 @@ uniform float uSpecStrength;
 uniform float uShininess;
 uniform float uGrain;
 
+// Scene field seed — from SceneFieldIntegration; uploaded once per frame.
+// uSceneRgb: spectral colour of the ambient environment (unit range).
+// uSceneIndirectRatio: fraction of scene power that is reflected/bounced;
+//   0 = all direct (hard shadows), 1 = fully diffuse (soft fill light).
+uniform vec3  uSceneRgb;
+uniform float uSceneIndirectRatio;
+
 void main() {
     vec3 N    = normalize(gl_FrontFacing ? vNormV : -vNormV);
     vec3 L    = normalize(uLightV);
@@ -2499,9 +2534,14 @@ void main() {
     vec3  base = gl_FrontFacing ? uColor.rgb : uInnerColor;
     float grain = 0.5 + 0.5 * sin(vPosV.x * 80.0 + vPosV.y * 31.0 + vPosV.z * 17.0);
     base *= mix(1.0, 0.82 + 0.28 * grain, uGrain);
-    vec3  col  = base * (uAmbient + 0.78 * diff) + vec3(1.0, 0.88, 0.62) * (uSpecStrength * spec);
+    // Ambient tinted by scene spectral colour; indirect ratio adds fill light
+    // in shadowed regions (simulates the environment's bounced-light term).
+    vec3  ambLight   = uAmbient * mix(vec3(1.0), uSceneRgb, 0.55);
+    float shadowFill = uSceneIndirectRatio * 0.28 * (1.0 - diff);
+    vec3  col  = base * (ambLight + (0.78 + shadowFill) * diff)
+               + mix(vec3(1.0, 0.88, 0.62), uSceneRgb, 0.30) * (uSpecStrength * spec);
     float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    col += base * rim * 0.16;
+    col += base * rim * mix(0.16, 0.22, uSceneIndirectRatio);
     FragColor  = vec4(col, uColor.a);
 }
 """
@@ -4034,7 +4074,7 @@ vec2 layer_tone(int i) {
 }
 
 void main() {
-    vec2 uv = (uRotate180 != 0) ? vUV : vec2(1.0 - vUV.x, vUV.y);
+    vec2 uv = (uRotate180 != 0) ? vec2(vUV.x, 1.0 - vUV.y) : vec2(1.0 - vUV.x, vUV.y);
     int  nl = clamp(uLayerCount, 1, 8);
 
     vec3 col = vec3(0.0);
@@ -5854,6 +5894,8 @@ class Camera:
         self.aperture = 0.0
         self.ca = 0.0
         self.tilt_shift = np.zeros(2, np.float64)
+        # PlayerController sets this to override the orbit eye calculation
+        self._forced_eye: "np.ndarray | None" = None
         # Sensor and lens specs (may be loaded from YAML)
         self.sensor: SensorSpec = sensor or SensorSpec()
         self.lens:   LensSpec   = lens   or LensSpec()
@@ -5898,6 +5940,8 @@ class Camera:
 
     @property
     def eye(self):
+        if self._forced_eye is not None:
+            return self._forced_eye
         az = math.radians(self.az);  el = math.radians(self.elev)
         return self.target + self.dist * np.array([
             math.cos(el)*math.cos(az),
@@ -6023,6 +6067,7 @@ class Renderer:
             surface_indirect = meta['surface_indirect'],
             surface_rgb      = meta['surface_rgb'],
             surface_scalar   = meta['surface_scalar'],
+            scene_field      = meta.get('scene_field'),
         )
 
     def set_sensor_image(self, tex: int, w: int, h: int) -> None:
@@ -6054,14 +6099,25 @@ class Renderer:
 
     def tick_sensor(self) -> None:
         """Call once per frame to advance the sensor camera exposure.
-        Only dispatches while layer 9 is visible (ALPHA or OPAQUE).
 
-        Sen FPS is the camera frame cadence: each accepted cadence tick clears
-        the previous sensor image, then dispatches the configured rays for the
-        new frame.  Set FPS to 0 for one fresh sensor frame per display tick.
+        Forward ray pump (lightfield bands for ILLUM) fires whenever layer 8
+        (ILLUM, key-8) OR layer 9 (SENSOR, key-9) is visible — the band
+        textures are shared between both modes.
+
+        The sensor-specific backward pass (cadence reset, tick, tex update,
+        temporal decay) only runs while layer 9 is visible.
         """
-        if (self._sensor_acc is None or self._layers[8] == LAYER_HIDDEN
-                or not self._sensor_acc._auto_advance):
+        if self._sensor_acc is None:
+            return
+        illum_on  = self._layers[7] != LAYER_HIDDEN
+        sensor_on = self._layers[8] != LAYER_HIDDEN
+
+        # ── Forward ray pump: feeds _ray_field_bands used by ILLUM and SENSOR ──
+        if (illum_on or sensor_on) and self._sensor_acc._auto_advance:
+            self._sensor_acc.pump_forward(budget_ms=float(getattr(self, "_ray_budget_ms", 5.0)))
+
+        # ── Sensor-specific: backward pass, exposure cadence, temporal decay ──
+        if not sensor_on or not self._sensor_acc._auto_advance:
             return
         fps = float(getattr(self, "_sensor_fps", 30.0))
         on_cadence = False
@@ -6075,8 +6131,7 @@ class Renderer:
             # Cadence reset: new exposure — clear forward field and sensor image.
             self._sensor_acc.clear_field()
             self._sensor_acc.clear()
-        # Every display frame: stream forward rays (time-budgeted) + sensor backward pass.
-        self._sensor_acc.pump_forward(budget_ms=float(getattr(self, "_ray_budget_ms", 5.0)))
+        # Sensor backward pass.
         self._sensor_acc.tick()
         self._sensor_tex = self._sensor_acc.tex
         # Apply temporal decay after every tick so _decay_total is current for
@@ -6693,6 +6748,25 @@ class Renderer:
         light_w /= np.linalg.norm(light_w)
         light_v = (MV[:3,:3].T @ light_w).astype(np.float32)
 
+        # ── Scene field uniforms (sensor-independent, ray-traced, static) ─────
+        # Derived once from SceneFieldIntegration; uploaded to every shading
+        # program that accepts uSceneRgb / uSceneIndirectRatio.  Defaults to
+        # neutral (pure white ambient, zero indirect) when not yet computed.
+        _sf = (self._ray_lighting.scene_field
+               if self._ray_lighting is not None else None)
+        if _sf is not None:
+            _sf_rgb = _sf.rgb.tolist()                              # [r,g,b] float32
+            _total  = float(_sf.total_power.sum()) + 1e-9
+            _sf_ir  = float(_sf.surface_indirect.sum()) / _total   # [0, 1]
+        else:
+            _sf_rgb = [1.0, 1.0, 1.0]
+            _sf_ir  = 0.0
+        for _sf_prog in (self._p_body, self._p_ray_surface):
+            glUseProgram(_sf_prog)
+            glUniform3f(glGetUniformLocation(_sf_prog, b'uSceneRgb'), *_sf_rgb)
+            glUniform1f(glGetUniformLocation(_sf_prog, b'uSceneIndirectRatio'), _sf_ir)
+        glUseProgram(0)
+
         if frame is not None:
             self._up_pressure(frame.pressure)
             self._up_plate(frame.plate)
@@ -6856,7 +6930,7 @@ class Renderer:
             glDrawArrays(GL_TRIANGLE_FAN, 0, self._lamp_n)
 
         # ── 4a-skirt. Opaque base skirt below the sim boundary ────────────────
-        if self._skirt_vao is not None and self._skirt_n > 0:
+        if a_stage > 0 and self._skirt_vao is not None and self._skirt_n > 0:
             glUseProgram(self._p_body)
             _mvp(self._p_body, MVP, MV)
             glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
@@ -6872,33 +6946,34 @@ class Renderer:
             glDrawArrays(GL_TRIANGLES, 0, self._skirt_n)
 
         # ── 4a-glass. Semi-transparent bell jar (exact sim boundary) ──────────
-        glDepthMask(GL_FALSE)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        glUseProgram(self._p_body)
-        _mvp(self._p_body, MVP, MV)
-        glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
-        glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
-                    0.86, 0.92, 0.96, 0.11)
-        glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
-                    0.86, 0.92, 0.96)
-        glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.14)
-        glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.92)
-        glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 200.0)
-        glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.0)
-        glBindVertexArray(self._glass_vao)
-        glDrawArrays(GL_TRIANGLES, 0, self._glass_n)
-        # Crisp wireframe tracing the exact inner sim boundary
-        glBlendFunc(GL_ONE, GL_ONE)
-        glUseProgram(self._p_line)
-        _mvp(self._p_line, MVP)
-        glLineWidth(1.0)
-        glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
-                    0.68, 0.86, 1.00, 0.55)
-        glBindVertexArray(self._simbox_edge_vao)
-        glDrawArrays(GL_LINES, 0, self._simbox_edge_n)
-        glDepthMask(GL_TRUE)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        if a_stage > 0:
+            glDepthMask(GL_FALSE)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glUseProgram(self._p_body)
+            _mvp(self._p_body, MVP, MV)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uLightV'), *light_v)
+            glUniform4f(glGetUniformLocation(self._p_body, b'uColor'),
+                        0.86, 0.92, 0.96, 0.11)
+            glUniform3f(glGetUniformLocation(self._p_body, b'uInnerColor'),
+                        0.86, 0.92, 0.96)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uAmbient'), 0.14)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.92)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 200.0)
+            glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.0)
+            glBindVertexArray(self._glass_vao)
+            glDrawArrays(GL_TRIANGLES, 0, self._glass_n)
+            # Crisp wireframe tracing the exact inner sim boundary
+            glBlendFunc(GL_ONE, GL_ONE)
+            glUseProgram(self._p_line)
+            _mvp(self._p_line, MVP)
+            glLineWidth(1.0)
+            glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
+                        0.68, 0.86, 1.00, 0.55)
+            glBindVertexArray(self._simbox_edge_vao)
+            glDrawArrays(GL_LINES, 0, self._simbox_edge_n)
+            glDepthMask(GL_TRUE)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         # ── 4b. Cached room light volume ─────────────────────────────────────
         if self._baseline_light_bands is not None:
@@ -7008,6 +7083,119 @@ class Renderer:
             glActiveTexture(GL_TEXTURE0)
             glEnable(GL_DEPTH_TEST)
             glDepthMask(GL_TRUE)
+
+        # ── 4d. Ray-lit surface pass (ILLUM layer — body geometry with band textures) ──
+        # Draws back plate + side walls through _p_ray_surface so fragment positions
+        # are looked up in the spectral band volumes to get per-fragment irradiance.
+        # Requires at least one of dyn or base band textures to be available.
+        _has_dyn  = self._a(7) > 0 and self._ray_field_bands is not None and len(self._ray_field_bands) > 0
+        _has_base = self._baseline_light_bands is not None and len(self._baseline_light_bands) > 0
+        if _has_dyn or _has_base:
+            a_illum = self._a(7) if _has_dyn else 0.72  # use layer alpha when dyn; fixed when base only
+            _dyn_bands  = self._ray_field_bands        if _has_dyn  else []
+            _base_bands = self._baseline_light_bands   if _has_base else []
+            _n_dyn  = len(_dyn_bands)
+            _n_base = len(_base_bands)
+            # Dynamic field bounds / world-to-grid
+            if _has_dyn and self._ray_field_bounds is not None:
+                _drf_min = self._ray_field_bounds[0]
+                _drf_max = self._ray_field_bounds[1]
+            else:
+                _drf_min = self._bmin
+                _drf_max = self._bmax
+            # Baseline field bounds
+            if _has_base and self._baseline_light_bounds is not None:
+                _blb_min = self._baseline_light_bounds[0]
+                _blb_max = self._baseline_light_bounds[1]
+            else:
+                _blb_min, _blb_max = _stage_light_bounds()
+            # Texture unit layout:
+            #   units 2 .. 8   : dynamic band layers  (uLayer0..6, up to 7)
+            #   units 9 .. 15  : baseline band layers (uBaseLayer0..6, up to 7)
+            # GL 3.3 guarantees >= 16 fragment texture units (0-15); units 0,1
+            # may be used by other passes so we stay within [2-15].
+            _MAX_BANDS_PER_FIELD = 7
+            _BASE_UNIT_OFFSET = 9  # first unit for baseline bands
+
+            # Blend the spectral delta additively on top of the Phong surface.
+            # GL_LEQUAL lets us re-draw at identical depth values that _p_body already wrote.
+            # GL_DEPTH_MASK(GL_FALSE) ensures we don't clobber the existing depth buffer.
+            # GL_SRC_ALPHA / GL_ONE: destination keeps full brightness, source alpha
+            # controls the irradiance contribution strength.
+            glDepthFunc(GL_LEQUAL)
+            glDepthMask(GL_FALSE)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+
+            glUseProgram(self._p_ray_surface)
+            # Matrices — guitar body lives in guitar-frame
+            _mvp(self._p_ray_surface, MVP_guitar, MV_guitar, self._guitar_M)
+            glUniform3f(glGetUniformLocation(self._p_ray_surface, b'uLightV'), *light_v)
+
+            # Band texture unit bindings
+            for _bi, _btex in enumerate(_dyn_bands[:_MAX_BANDS_PER_FIELD]):
+                glUniform1i(glGetUniformLocation(self._p_ray_surface, f'uLayer{_bi}'.encode()), 2 + _bi)
+                glActiveTexture(GL_TEXTURE2 + _bi)
+                glBindTexture(GL_TEXTURE_3D, _btex)
+            for _bi, _btex in enumerate(_base_bands[:_MAX_BANDS_PER_FIELD]):
+                glUniform1i(glGetUniformLocation(self._p_ray_surface, f'uBaseLayer{_bi}'.encode()), _BASE_UNIT_OFFSET + _bi)
+                glActiveTexture(GL_TEXTURE0 + _BASE_UNIT_OFFSET + _bi)
+                glBindTexture(GL_TEXTURE_3D, _btex)
+
+            glUniform1i(glGetUniformLocation(self._p_ray_surface, b'uLayerCount'),
+                        max(min(_n_dyn, _MAX_BANDS_PER_FIELD), min(_n_base, _MAX_BANDS_PER_FIELD), 1))
+            # Dynamic volume bounds + identity world-to-grid (volumes are in world space)
+            glUniformMatrix4fv(glGetUniformLocation(self._p_ray_surface, b'uWorldToGrid'),
+                               1, GL_TRUE, np.eye(4, dtype=np.float32))
+            glUniform3f(glGetUniformLocation(self._p_ray_surface, b'uBoxMin'), *_drf_min)
+            glUniform3f(glGetUniformLocation(self._p_ray_surface, b'uBoxMax'), *_drf_max)
+            # Baseline volume bounds
+            glUniformMatrix4fv(glGetUniformLocation(self._p_ray_surface, b'uBaseWorldToGrid'),
+                               1, GL_TRUE, np.eye(4, dtype=np.float32))
+            glUniform3f(glGetUniformLocation(self._p_ray_surface, b'uBaseBoxMin'), *_blb_min)
+            glUniform3f(glGetUniformLocation(self._p_ray_surface, b'uBaseBoxMax'), *_blb_max)
+
+            glUniform1i(glGetUniformLocation(self._p_ray_surface, b'uUseRayField'),  int(_has_dyn))
+            glUniform1i(glGetUniformLocation(self._p_ray_surface, b'uUseBaseField'), int(_has_base))
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uRayExposure'),  self._ray_exposure)
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uBaseExposure'),
+                        self._baseline_scale_for_display() if _has_base else 1.0)
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uRayGamma'), self._ray_gamma)
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uAmbient'), 0.0)   # unused in delta mode
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uSpecStrength'), 0.0)
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uShininess'), 1.0)
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uGrain'), 0.25)
+
+            # Back plate — alpha governs irradiance contribution weight
+            glUniform4f(glGetUniformLocation(self._p_ray_surface, b'uColor'),
+                        0.16, 0.035, 0.018, a_illum * 0.82)
+            glUniform3f(glGetUniformLocation(self._p_ray_surface, b'uInnerColor'),
+                        0.64, 0.38, 0.18)
+            glBindVertexArray(self._back_vao)
+            glDrawArrays(GL_TRIANGLE_FAN, 0, self._back_n)
+
+            # Side walls
+            glUniform4f(glGetUniformLocation(self._p_ray_surface, b'uColor'),
+                        0.18, 0.035, 0.018, a_illum * 0.65)
+            glUniform3f(glGetUniformLocation(self._p_ray_surface, b'uInnerColor'),
+                        0.72, 0.44, 0.21)
+            glUniform1f(glGetUniformLocation(self._p_ray_surface, b'uGrain'), 0.65)
+            glBindVertexArray(self._wall_vao)
+            glDrawElements(GL_TRIANGLES, self._wall_n_idx, GL_UNSIGNED_INT, None)
+
+            # Unbind all band textures
+            for _bi in range(min(_n_dyn, _MAX_BANDS_PER_FIELD)):
+                glActiveTexture(GL_TEXTURE2 + _bi)
+                glBindTexture(GL_TEXTURE_3D, 0)
+            for _bi in range(min(_n_base, _MAX_BANDS_PER_FIELD)):
+                glActiveTexture(GL_TEXTURE0 + _BASE_UNIT_OFFSET + _bi)
+                glBindTexture(GL_TEXTURE_3D, 0)
+            glActiveTexture(GL_TEXTURE0)
+            glUseProgram(0)
+
+            # Restore default depth/blend state
+            glDepthFunc(GL_LESS)
+            glDepthMask(GL_TRUE)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         # ── 5. Top plate surface (displaced, heatmap) ─────────────────────────
         a_plate = self._a(1)
@@ -9004,6 +9192,22 @@ def main():
         exposure=float(panel.values['ray_exposure']),
         gamma=float(panel.values['ray_gamma']))
 
+    # ── Player controller ─────────────────────────────────────────────────────
+    _player_cfg_path = _config_path("player", "default.yaml")
+    _player_cfg = _load_yaml_file(_player_cfg_path)
+    player_ctrl = (_PlayerController(R.cam, _player_cfg)
+                   if _HAS_PLAYER_CTRL and _player_cfg else None)
+
+    # ── Duty station(s) ───────────────────────────────────────────────────────
+    duty_stations: list = []
+    if _HAS_DUTY_STATION:
+        _ds_path = _config_path("meshes", "duty_station.yaml")
+        _ds = _DutyStation.from_yaml_safe(_ds_path)
+        if _ds is not None:
+            _ds.build_gl()
+            duty_stations.append(_ds)
+    # ─────────────────────────────────────────────────────────────────────────
+
     if physics is not None:
         print(f"Physics worker is streaming frames ({physics.mode}); "
               "UI will keep cached frames while rebuilds run.", flush=True)
@@ -9042,10 +9246,14 @@ def main():
         """Non-blocking: posts a source-computation job to the background worker.
         The source worker computes new sources asynchronously; the GL thread
         drains the result via pump_forward() on subsequent display frames.
-        No GL calls here — returns immediately."""
+        No GL calls here — returns immediately.
+        Fires whenever ILLUM (layer 8, key-8) or SENSOR (layer 9, key-9) is on."""
         nonlocal active_ray_frame_index, force_ray_refresh
         acc = R._sensor_acc
         if acc is None or scene is None or not args.gpu_rays:
+            return False
+        # Only post new sources when a layer actually consumes the lightfield.
+        if R._layers[7] == LAYER_HIDDEN and R._layers[8] == LAYER_HIDDEN:
             return False
         if frame_index < 0 and frame is None:
             return False
@@ -9068,8 +9276,21 @@ def main():
 
     try:
       while running:
+        _dt = clock.tick(60) / 1000.0
+        _keys_held = pygame.key.get_pressed()
+        if player_ctrl is not None:
+            player_ctrl.tick(_dt, _keys_held, duty_stations)
+
         for ev in pygame.event.get():
-            if panel.handle_event(ev):
+            # Route through player controller first; it may absorb movement events
+            if player_ctrl is not None:
+                if player_ctrl.handle_event(ev, duty_stations):
+                    continue
+            # Slider panel only visible / interactive when not in a walk state
+            # (or always when player_ctrl is None / orbit mode)
+            _panel_active = (player_ctrl is None or player_ctrl.sidebar_visible
+                             or player_ctrl.state.value == "orbit")
+            if _panel_active and panel.handle_event(ev):
                 continue
             if ev.type == QUIT:
                 running = False
@@ -9353,7 +9574,30 @@ def main():
                 last_displayed_frame_index = cur_frame_index
             R.tick_sensor()
             R.render()
-            panel.draw(WIN_W, WIN_H)
+
+            # ── Duty station render pass ──────────────────────────────────────
+            if duty_stations and _HAS_DUTY_STATION:
+                _P, _V = _cam_pure_matrices(R.cam)
+                _light_v = np.array([0.6, 0.8, 0.5], np.float32)
+                for _ds in duty_stations:
+                    _ds.draw((_P @ _V).astype(np.float32),
+                             _V.astype(np.float32),
+                             _light_v)
+
+            # ── Panel: only visible in orbit or interact state ─────────────────
+            _show_panel = (player_ctrl is None
+                           or player_ctrl.state.value == "orbit"
+                           or player_ctrl.sidebar_visible)
+            if _show_panel:
+                panel.draw(WIN_W, WIN_H)
+            else:
+                # Walk mode: show proximity hint if near a station
+                if player_ctrl is not None and player_ctrl.proximity_frac > 0.0:
+                    _alpha = int(min(255, player_ctrl.proximity_frac * 510))
+                    _hint  = player_ctrl.hud_hint
+                    panel._draw_hud_text(_hint, WIN_W // 2, WIN_H - 56,
+                                         WIN_W, WIN_H, center=True)
+
             panel._draw_hud_text(R.camera_hud(), WIN_W // 2, 14, WIN_W, WIN_H, center=True)
             # Sensor status overlay — shown whenever layer 9 is ALPHA or OPAQUE
             if R._layers[8] != LAYER_HIDDEN:
@@ -9378,7 +9622,6 @@ def main():
         except BaseException as exc:
             _report_exception(f"render frame {fi}", exc)
             raise
-        clock.tick(60)
     finally:
         if capture is not None:
             capture.close()

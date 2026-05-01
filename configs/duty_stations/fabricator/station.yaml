@@ -1,0 +1,55 @@
+# Fabricator duty station — mesh / world-transform config
+# Inherits the base duty_station mesh shape with fabricator-specific position.
+# The workspace UI (palette, symmetry, build area) is defined in workspace.yaml.
+
+name: fabricator
+
+position: [-2.0, 2.4, 0.0]    # left of centre, behind the guitar position
+yaw_deg:   160.0               # angled slightly toward the player start
+
+console:
+  width:         1.50
+  depth:         0.70
+  height:        0.90
+  top_tilt_deg:  12.0
+  bevel:         0.08
+
+screen:
+  width:          1.30
+  height:         0.80
+  tilt_back_deg:  6.0
+
+side_wings:
+  enabled: true
+  width:   0.16
+  height:  0.58
+
+interaction_radius: 2.0
+
+interact_camera:
+  eye:    [-2.0, 0.80, 1.35]
+  target: [-2.0, 2.40, 1.30]
+
+materials:
+  body:
+    albedo_rgb:    [0.06, 0.10, 0.16]
+    reflectivity:  0.48
+    diffusion:     0.22
+    absorption:    0.07
+    smoothness:    0.82
+    ambient:       0.16
+    spec_strength: 0.60
+    shininess:     96.0
+    grain:         0.04
+
+  trim:
+    albedo_rgb:    [0.04, 0.28, 0.18]
+    emissive:      [0.00, 0.60, 0.35]   # LCARS green glow (fabricator variant)
+
+  screen_active:
+    albedo_rgb:    [0.02, 0.05, 0.04]
+    emissive:      [0.04, 0.80, 0.45]   # green-white fabricator display
+
+  screen_inactive:
+    albedo_rgb:    [0.01, 0.01, 0.01]
+    emissive:      [0.00, 0.00, 0.00]

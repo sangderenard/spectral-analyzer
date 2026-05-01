@@ -1,0 +1,36 @@
+# Fabricator workspace defaults
+# Controls the 3D workspace viewport, default base solid, and symmetry settings.
+
+# Initial base solid loaded when fabricator is first opened
+base_solid: icosahedron
+
+# Workspace orbit camera (for rotating the DEC mesh build)
+camera:
+  az:        35.0    # azimuth degrees
+  elev:      22.0    # elevation degrees
+  dist:      2.8     # distance from mesh centre
+  fov_deg:   50.0
+  auto_spin: 0.25    # degrees/frame when idle; 0 = static
+
+# Symmetry defaults
+symmetry:
+  mode:  none          # none | bilateral | radial
+  axis:  z             # x | y | z | normal (attachment normal)
+  count: 4             # for radial: number of copies (2-8)
+  show_ghost_copies: true
+
+# Visual options
+display:
+  solid_alpha:        0.80    # base solid face transparency
+  wireframe:          true    # show edge wireframe
+  wireframe_width:    1.4
+  face_color:         [0.15, 0.20, 0.30]     # default face base color
+  edge_color:         [0.20, 0.85, 0.65]     # wireframe edge color
+  selected_face_color:[0.10, 0.70, 0.90]     # hovered/selected face
+  ghost_alpha:        0.42    # transparency of the pending-attachment piece
+  bg_color:           [0.02, 0.03, 0.06]     # workspace background
+
+# Panel layout (proportions of the interact-mode window)
+layout:
+  left_panel_width:  210     # solid picker panel (px)
+  right_panel_width: 220     # symmetry + actions panel (px)

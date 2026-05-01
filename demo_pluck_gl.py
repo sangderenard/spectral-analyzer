@@ -470,18 +470,21 @@ FILM_LAYER_PRESETS: dict[str, FilmLayer] = {
     'em_red':          FilmLayer('em_red',          'em', iso=1.0,
                                  response_center_hz=4.38e14, response_width_oct=0.28,
                                  channel_labels=_EML,
-                                 hue=0.0,   saturation=1.4,
-                                 shadow_hue=215.0, shadow_saturation=0.85, shadow_lightness=0.30, highlight_lightness=0.72),
+                                 hue=0.0,   saturation=1.0,
+                                 shadow_hue=0.0,   shadow_saturation=0.0, shadow_lightness=0.0, highlight_lightness=0.5,
+                                 shadow_point=0.0, highlight_point=1.0),
     'em_green':        FilmLayer('em_green',        'em', iso=1.0,
                                  response_center_hz=5.38e14, response_width_oct=0.30,
                                  channel_labels=_EML,
-                                 hue=120.0, saturation=1.4,
-                                 shadow_hue=285.0, shadow_saturation=0.80, shadow_lightness=0.28, highlight_lightness=0.70),
+                                 hue=120.0, saturation=1.0,
+                                 shadow_hue=120.0, shadow_saturation=0.0, shadow_lightness=0.0, highlight_lightness=0.5,
+                                 shadow_point=0.0, highlight_point=1.0),
     'em_blue':         FilmLayer('em_blue',         'em', iso=1.0,
                                  response_center_hz=6.86e14, response_width_oct=0.36,
                                  channel_labels=_EML,
-                                 hue=240.0, saturation=1.4,
-                                 shadow_hue=30.0,  shadow_saturation=0.80, shadow_lightness=0.28, highlight_lightness=0.70),
+                                 hue=240.0, saturation=1.0,
+                                 shadow_hue=240.0, shadow_saturation=0.0, shadow_lightness=0.0, highlight_lightness=0.5,
+                                 shadow_point=0.0, highlight_point=1.0),
     'em_nir':          FilmLayer('em_nir',          'em', iso=1.8,
                                  response_center_hz=3.53e14, response_width_oct=0.50,
                                  channel_labels=_EML,
@@ -2241,6 +2244,9 @@ def _build_sim_skirt_world(wb_min: np.ndarray, wb_max: np.ndarray,
     qf([xo1, yo1 - r, floor_z], [xo1, yo0 + r, floor_z], [xo1, yo0 + r, z_top], [xo1, yo1 - r, z_top], [+1, 0, 0])
     qf([xo1 - r, yo0, floor_z], [xo0 + r, yo0, floor_z], [xo0 + r, yo0, z_top], [xo1 - r, yo0, z_top], [0, -1, 0])
     qf([xo0 + r, yo1, floor_z], [xo1 - r, yo1, floor_z], [xo1 - r, yo1, z_top], [xo0 + r, yo1, z_top], [0, +1, 0])
+
+    # Floor cap — solid bottom panel at Z=0 facing downward
+    qf([xo0 + r, yo0, floor_z], [xo1 - r, yo0, floor_z], [xo1 - r, yo1, floor_z], [xo0 + r, yo1, floor_z], [0, 0, -1])
 
     # Corner arc columns
     for cx, cy, a0, a1 in corners:
@@ -4028,7 +4034,7 @@ vec2 layer_tone(int i) {
 }
 
 void main() {
-    vec2 uv = (uRotate180 != 0) ? vec2(1.0 - vUV.x, 1.0 - vUV.y) : vUV;
+    vec2 uv = (uRotate180 != 0) ? vUV : vec2(1.0 - vUV.x, vUV.y);
     int  nl = clamp(uLayerCount, 1, 8);
 
     vec3 col = vec3(0.0);
@@ -5287,24 +5293,33 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         normals    = np.vstack([normals,    np.array(_bvh_en, np.float32)])
         materials  = np.vstack([materials,  np.array(_bvh_em, np.float32)])
 
-    # ── Glass bell jar in guitar-frame for the BVH (refraction in sensor render) ─
+    # ── Glass bell jar for the BVH (refraction in sensor render) ────────────────
+    # sim_bounds are in guitar-frame.  The builders expect world-frame (Z = up).
+    # Build in world-frame then apply the inverse guitar matrix so the verts land
+    # in the same guitar-frame space as the rest of the BVH geometry.
     if sim_bounds is not None:
-        _gb_min = np.asarray(sim_bounds[0], np.float32)
-        _gb_max = np.asarray(sim_bounds[1], np.float32)
+        _gm_for_bj, _gm_inv_for_bj = _guitar_model_matrix(outline)
+        _wb_min_bj, _wb_max_bj = _transform_bounds(sim_bounds, _gm_for_bj)
+        _wb_min_bj = _wb_min_bj.astype(np.float32)
+        _wb_max_bj = _wb_max_bj.astype(np.float32)
         _glass_mat = _load_material_yaml("borosilicate_glass")
-        _gbell = _build_sim_belljar_world(_gb_min, _gb_max)
-        _gv = _gbell[:, :3].reshape(-1, 3)
-        _gn = _gbell[:, 3:]
+        _gbell_w = _build_sim_belljar_world(_wb_min_bj, _wb_max_bj)
+        _gv_w = _gbell_w[:, :3].reshape(-1, 3)
+        _gn_w = _gbell_w[:, 3:].reshape(-1, 3)
+        _gv = _transform_points(_gv_w, _gm_inv_for_bj)
+        _gn = _transform_normals(_gn_w, _gm_inv_for_bj)
         _gm_rep = np.tile(_glass_mat, (len(_gv) // 3, 1))
         verts_flat = np.vstack([verts_flat, _gv])
         normals    = np.vstack([normals,    _gn[::3]])   # one normal per tri vertex 0
         materials  = np.vstack([materials,  _gm_rep])
         # Opaque skirt below the bell jar (floor → sim bottom)
-        _gskirt = _build_sim_skirt_world(_gb_min, _gb_max)
-        if len(_gskirt) > 0:
+        _gskirt_w = _build_sim_skirt_world(_wb_min_bj, _wb_max_bj)
+        if len(_gskirt_w) > 0:
             _skirt_mat = _load_material_yaml("stage_floor")
-            _sv = _gskirt[:, :3].reshape(-1, 3)
-            _sn = _gskirt[:, 3:]
+            _sv_w = _gskirt_w[:, :3].reshape(-1, 3)
+            _sn_w = _gskirt_w[:, 3:].reshape(-1, 3)
+            _sv = _transform_points(_sv_w, _gm_inv_for_bj)
+            _sn = _transform_normals(_sn_w, _gm_inv_for_bj)
             _sm_rep = np.tile(_skirt_mat, (len(_sv) // 3, 1))
             verts_flat = np.vstack([verts_flat, _sv])
             normals    = np.vstack([normals,    _sn[::3]])
@@ -5954,6 +5969,16 @@ class Renderer:
                          LAYER_HIDDEN]  # 8=sensor (path-traced overlay, key-9)
         self.film = _default_stack()  # layered film stack; active_layer drives display
         self.cam = Camera()
+        # ── Camera simulator state ─────────────────────────────────────────────
+        # _film_negative : the sensor accumulator is a chemical negative
+        #                  (bright scene → dark record).  Toggle with N.
+        # _enlarger_mode : a second projection through an enlarger lens
+        #                  re-inverts the optical flip AND the tone.
+        #                  Toggle with E.
+        # Optical inversion (rotate180) is always present — it is the physics
+        # of the aperture, not a display choice.  The enlarger lens cancels it.
+        self._film_negative: bool = True
+        self._enlarger_mode: bool = False
 
         # Guitar model matrix: guitar-frame → world-frame (upright on stand)
         self._guitar_M, self._guitar_Minv = _guitar_model_matrix(outline)
@@ -6629,8 +6654,16 @@ class Renderer:
                 glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
                 glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
                 glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uAlpha'),     1.0)
-                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_fl.rotate180))
-                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_fl.negative))
+                # Camera simulator — three orthogonal physical stages:
+                #   Optical inversion: the aperture inverts the image; the raw sensor
+                #     texture is naturally upside-down (no correction applied by default).
+                #     The enlarger adds a corrective second lens that cancels the flip.
+                #   Tone: negative film records bright-as-dark.
+                #     Enlarger re-exposes onto positive paper, cancelling the inversion.
+                _disp_rotate180 = self._enlarger_mode              # enlarger corrects the optical flip
+                _disp_negative  = self._film_negative ^ self._enlarger_mode
+                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_disp_rotate180))
+                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_disp_negative))
                 _dt = float(self._sensor_acc._decay_total) if self._sensor_acc else 1.0
                 glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uDecayTotal'), _dt)
                 glDrawArrays(GL_TRIANGLES, 0, 3)
@@ -6686,7 +6719,6 @@ class Renderer:
 
         # ── 2. Side walls (semi-transparent mahogany, both faces) ──────────────
         if a_body > 0:
-            glDisable(GL_CULL_FACE)
             glDepthMask(GL_FALSE)
             glUseProgram(self._p_body)
             _mvp(self._p_body, MVP_guitar, MV_guitar)
@@ -6809,8 +6841,13 @@ class Renderer:
             glUniform1f(glGetUniformLocation(self._p_body, b'uSpecStrength'), 0.04)
             glUniform1f(glGetUniformLocation(self._p_body, b'uShininess'), 12.0)
             glUniform1f(glGetUniformLocation(self._p_body, b'uGrain'), 0.08)
+            # Cull back-faces only for the outer stage walls so the camera
+            # can move outside the room without seeing inside faces.
+            # All other geometry (skirt, bell jar, guitar) is drawn two-sided.
+            glEnable(GL_CULL_FACE)
             glBindVertexArray(self._stage_vao)
             glDrawArrays(GL_TRIANGLES, 0, self._stage_n)
+            glDisable(GL_CULL_FACE)
             glUseProgram(self._p_line)
             _mvp(self._p_line, MVP)
             glUniform4f(glGetUniformLocation(self._p_line, b'uColor'),
@@ -7096,8 +7133,10 @@ class Renderer:
             glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
             glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
             glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uAlpha'),     sensor_alpha)
-            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_fl.rotate180))
-            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_fl.negative))
+            _disp_rotate180 = self._enlarger_mode              # enlarger corrects the optical flip
+            _disp_negative  = self._film_negative ^ self._enlarger_mode
+            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_disp_rotate180))
+            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_disp_negative))
             _dt = float(self._sensor_acc._decay_total) if self._sensor_acc else 1.0
             glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uDecayTotal'), _dt)
             glDrawArrays(GL_TRIANGLES, 0, 3)
@@ -7991,8 +8030,6 @@ class _SliderPanel:
         ('frame_step',  'Frm step',0.0,       8.0,   1.0, False, True ),
         ('lens_aperture', 'Aperture', 0.0,  0.080,  0.0, False, True ),
         ('lens_ca',     'CA',       0.0,    0.020,  0.0, False, True ),
-        ('film_hue',    'Film hue', 0.0,  360.0, 180.0, False, True ),
-        ('film_sat',    'Film sat', 0.0,    2.0,   1.0, False, True ),
         # Decay half-life: 0 = stable; >0 = seconds for display to reach 50%
         # brightness after the source goes silent.  Controlled globally and
         # applied to the accumulator via the GPU decay compute shader.
@@ -9110,6 +9147,14 @@ def main():
                         print("Restart requested")
                 elif ev.key == K_p:
                     print(f"Plate mode: {R.cycle_plate_mode()}")
+                elif ev.key == pygame.K_n:
+                    R._film_negative = not R._film_negative
+                    print(f"Film: {'negative' if R._film_negative else 'positive'}")
+                elif ev.key == pygame.K_e:
+                    R._enlarger_mode = not R._enlarger_mode
+                    _tone = 'negative' if (R._film_negative ^ R._enlarger_mode) else 'positive'
+                    _orient = 'inverted (plate back)' if not R._enlarger_mode else 'upright (enlarger)'
+                    print(f"Enlarger: {'ON' if R._enlarger_mode else 'OFF'}  →  {_orient}, {_tone}")
                 else:
                     for ki, kv in enumerate(LAYER_KEYS):
                         if ev.key == kv:
@@ -9270,13 +9315,6 @@ def main():
         if 'lens_ca' in changed:
             R.cam.ca = float(np.clip(panel.values['lens_ca'], 0.0, 0.02))
             R.sync_sensor_camera(reset=False)
-        if 'film_hue' in changed or 'film_sat' in changed:
-            # Write directly onto the active film layer so composite_hsl() picks
-            # it up at the next blit — no accumulator reset required.
-            _al = R.film.active_layer
-            _al.hue        = float(panel.values['film_hue'])
-            _al.saturation = float(np.clip(panel.values['film_sat'], 0.0, 2.0))
-
         if 'film_decay' in changed and R._sensor_acc is not None:
             # Update the accumulator's half-life; takes effect on next apply_decay().
             R._sensor_acc.half_life = max(0.0, float(panel.values['film_decay']))

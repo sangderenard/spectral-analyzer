@@ -36,11 +36,52 @@ from typing import Optional
 import numpy as np
 
 try:
+    from depth_mesh import DepthMesh as _DepthMesh
+    _HAS_DEPTH_MESH = True
+except ImportError:
+    _DepthMesh = None
+    _HAS_DEPTH_MESH = False
+
+try:
+    from spectral_material import (
+        Material              as _SpectralMaterial,
+        EnamelCoating         as _EnamelCoating,
+        RadianceProfile       as _RadianceProfile,
+        LightSource           as _LightSource,
+        LightDistributionPolicy as _LightDistributionPolicy,
+        set_spectral_uniforms as _set_spectral_uniforms,
+        SPECTRAL_PBR_BODY_FS  as _SPECTRAL_PBR_BODY_FS,
+        parse_wall_bands      as _parse_wall_bands,
+        MATERIAL_PRESETS      as _MATERIAL_PRESETS,
+        ENAMEL_PRESETS        as _ENAMEL_PRESETS,
+    )
+    _HAS_SPECTRAL = True
+except ImportError:
+    _SpectralMaterial        = None
+    _EnamelCoating           = None
+    _RadianceProfile         = None
+    _LightSource             = None
+    _LightDistributionPolicy = None
+    _set_spectral_uniforms   = None
+    _SPECTRAL_PBR_BODY_FS    = None
+    _parse_wall_bands        = None
+    _MATERIAL_PRESETS        = {}
+    _ENAMEL_PRESETS          = {}
+    _HAS_SPECTRAL            = False
+
+try:
     import yaml as _yaml
     _HAS_YAML = True
 except ImportError:
     _yaml = None
     _HAS_YAML = False
+
+try:
+    from material_db import MaterialDatabase as _MaterialDatabase
+    _HAS_MAT_DB = True
+except ImportError:
+    _MaterialDatabase = None  # type: ignore[assignment,misc]
+    _HAS_MAT_DB = False
 
 try:
     from OpenGL.GL import (
@@ -208,6 +249,32 @@ def _build_screen_verts(cons_cfg: dict, scr_cfg: dict) -> np.ndarray:
     return np.array(verts, np.float32).reshape(-1, 6)
 
 
+def _build_back_wall_verts(cons_cfg: dict, scr_cfg: dict,
+                           wing_cfg: dict, wall_cfg: dict) -> np.ndarray:
+    """Wall behind the screen, floor-to-ceiling, full console+wing width."""
+    w   = float(cons_cfg.get('width',        1.40))
+    d   = float(cons_cfg.get('depth',        0.62))
+    tlt = math.radians(float(cons_cfg.get('top_tilt_deg', 14.0)))
+    sh  = float(scr_cfg.get('height',         0.72))
+    ts  = math.radians(float(scr_cfg.get('tilt_back_deg', 7.0)))
+    ww  = float(wing_cfg.get('width',  0.14)) if wing_cfg.get('enabled', True) else 0.0
+    wall_h = float(wall_cfg.get('height', 4.0))
+    wall_t = float(wall_cfg.get('thickness', 0.05))
+
+    hw   = w / 2.0 + ww
+    y_back = d + sh * math.sin(ts) + wall_t   # just behind screen top edge
+
+    bl = np.array([-hw, y_back, 0.0])
+    br = np.array([ hw, y_back, 0.0])
+    tl = np.array([-hw, y_back, wall_h])
+    tr = np.array([ hw, y_back, wall_h])
+
+    n = [0.0, -1.0, 0.0]   # faces toward player
+    verts  = _quad_tris(bl, br, tr, tl, n)
+    verts += _quad_tris(br, bl, tl, tr, [0.0, 1.0, 0.0])  # back face
+    return np.array(verts, np.float32).reshape(-1, 6)
+
+
 def _build_wing_verts(cons_cfg: dict, wing_cfg: dict) -> np.ndarray:
     """Left + right side wing panels in local coords.  Returns (N, 6) float32."""
     w  = float(cons_cfg.get('width', 1.40))
@@ -261,6 +328,133 @@ def _translation(xyz) -> np.ndarray:
     M[1, 3] = xyz[1]
     M[2, 3] = xyz[2]
     return M
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-specific geometry builders
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _pbr_to_phong(mat: dict) -> dict:
+    """Approximate conversion from a PBR material dict to Phong rasteriser params.
+
+    Accepts both old-style (albedo_rgb, ambient, …) and new PBR-style
+    (albedo, roughness, metallic, …) dicts and returns a unified dict with
+    the keys expected by the Phong shader uniforms.
+    """
+    # Colour — accept 'albedo' (new) or 'albedo_rgb' (legacy)
+    albedo = mat.get('albedo', mat.get('albedo_rgb', [0.5, 0.5, 0.5]))
+    rough  = float(mat.get('roughness', 0.5))
+    metal  = float(mat.get('metallic',  0.0))
+    # If the mat already has explicit Phong keys, honour them
+    ambient  = mat.get('ambient',       0.15 + (1.0 - rough) * 0.05)
+    specstr  = mat.get('spec_strength', metal * 0.85 + (1.0 - metal) * 0.04 * (1.0 - rough))
+    shiny    = mat.get('shininess',     max(4.0, 2.0 / max(rough ** 2, 0.01)))
+    grain    = mat.get('grain',         rough * 0.06)
+    return {
+        'albedo_rgb':    albedo,
+        'ambient':       float(ambient),
+        'spec_strength': float(specstr),
+        'shininess':     float(shiny),
+        'grain':         float(grain),
+    }
+
+
+def _build_cornerstone_wall_mesh(cfg: dict) -> Optional["_DepthMesh"]:
+    """Build a DepthMesh for the cornerstone wall behind the screen.
+
+    Uses DepthMesh.wall() so the caller can select flat / arc / vertical_arc
+    / spherical via the YAML shape_type key.  The DepthMesh origin is
+    bottom_left so callers can position by translating.
+    """
+    if not _HAS_DEPTH_MESH:
+        return None
+    cons_cfg = cfg.get('console', {})
+    wing_cfg = cfg.get('side_wings', {})
+    cw_cfg   = cfg.get('cornerstone_wall', {})
+
+    if not cw_cfg.get('enabled', True):
+        return None
+
+    w  = float(cons_cfg.get('width', 1.40))
+    ww = float(wing_cfg.get('width', 0.14)) if wing_cfg.get('enabled', True) else 0.0
+
+    wall_w      = float(cw_cfg.get('width',  w + 2 * ww))
+    wall_h      = float(cw_cfg.get('height', 3.20))
+    gu          = int(cw_cfg.get('grid_u', 16))
+    gv          = int(cw_cfg.get('grid_v', 24))
+    dscale      = float(cw_cfg.get('depth_scale', 0.08))
+    origin      = cw_cfg.get('origin', 'bottom_left')
+    shape_type  = cw_cfg.get('shape_type', 'flat')
+
+    # Radius — select the key matching shape_type, fall back to generic arc_radius
+    _radius_key = {
+        'arc':          'arc_radius',
+        'vertical_arc': 'vertical_arc_radius',
+        'spherical':    'spherical_radius',
+    }.get(shape_type, 'arc_radius')
+    arc_radius = float(cw_cfg.get(_radius_key, cw_cfg.get('arc_radius', 8.0)))
+
+    dm = None
+    dm_path = cw_cfg.get('depth_map_path')
+    if dm_path:
+        try:
+            from depth_mesh import _load_depth_map
+            dm = _load_depth_map(dm_path)
+        except Exception as exc:
+            print(f'[duty_station] cornerstone_wall depth_map load failed: {exc}')
+
+    return _DepthMesh.wall(
+        shape_type=shape_type,
+        width=wall_w,
+        height=wall_h,
+        grid_u=gu,
+        grid_v=gv,
+        depth_map=dm,
+        depth_scale=dscale,
+        origin=origin,
+        arc_radius=arc_radius,
+    )
+
+
+def _build_floor_tile_mesh(cfg: dict) -> Optional["_DepthMesh"]:
+    """Build a DepthMesh for the floor tile under the console.
+
+    Horizontal tile: axis_u = +X, axis_v = +Y (depth into room), normal = +Z.
+    Origin = bottom_left (front-left corner at console front edge).
+    """
+    if not _HAS_DEPTH_MESH:
+        return None
+    ft_cfg = cfg.get('floor_tile', {})
+    if not ft_cfg.get('enabled', True):
+        return None
+
+    tile_w = float(ft_cfg.get('width', 2.00))
+    tile_d = float(ft_cfg.get('depth', 2.20))
+    gu     = int(ft_cfg.get('grid_u', 8))
+    gv     = int(ft_cfg.get('grid_v', 8))
+    dscale = float(ft_cfg.get('depth_scale', 0.02))
+    origin = ft_cfg.get('origin', 'bottom_left')
+    dm_path = ft_cfg.get('depth_map_path')
+
+    dm = None
+    if dm_path:
+        try:
+            from depth_mesh import _load_depth_map
+            dm = _load_depth_map(dm_path)
+        except Exception as exc:
+            print(f'[duty_station] floor_tile depth_map load failed: {exc}')
+
+    # Horizontal floor: axis_u = +X, axis_v = +Y, normal = +Z
+    return _DepthMesh(
+        shape='rect',
+        size=(tile_w, tile_d),
+        grid_u=gu, grid_v=gv,
+        depth_map=dm,
+        depth_scale=dscale,
+        origin=origin,
+        axis_u=(1.0, 0.0, 0.0),
+        axis_v=(0.0, 1.0, 0.0),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,6 +515,10 @@ class DutyStation:
             'target': [0.0, 2.40, 1.28],
         })
         self._screen_active = True   # toggleable
+        self.menu           = None   # attach any object with show_hud/render_hud/handle_event
+
+        # Module type — optional, controls extra geometry and menu class
+        self.module_type: Optional[str] = cfg.get('module_type')
 
         # Generate mesh data (CPU side; GL upload deferred to build_gl)
         cons_cfg = cfg.get('console', {})
@@ -333,17 +531,127 @@ class DutyStation:
             _build_wing_verts(cons_cfg, wing_cfg)
             if wing_cfg.get('enabled', True) else np.zeros((0, 6), np.float32)
         )
+        wall_cfg = cfg.get('back_wall', {})
+        self._wall_data   = _build_back_wall_verts(cons_cfg, scr_cfg, wing_cfg, wall_cfg)
 
-        # Material dicts
-        mats = cfg.get('materials', {})
-        self._mat_body   = mats.get('body',          {})
-        self._mat_screen = mats.get('screen_active',  {})
-        self._mat_scr_off= mats.get('screen_inactive',{})
+        # ── Module-specific geometry ──────────────────────────────────────────
+        self._cornerstone_wall: Optional[_DepthMesh] = None
+        self._floor_tile:       Optional[_DepthMesh] = None
+        if self.module_type == 'room_control' and _HAS_DEPTH_MESH:
+            self._cornerstone_wall = _build_cornerstone_wall_mesh(cfg)
+            self._floor_tile       = _build_floor_tile_mesh(cfg)
+
+        # Material dicts — support both old-style 'materials' and new 'gl_materials' key
+        gl_mats  = cfg.get('gl_materials', cfg.get('materials', {}))
+        self._mat_body    = _pbr_to_phong(gl_mats.get('body',           {}))
+        self._mat_screen  = _pbr_to_phong(gl_mats.get('screen_active',  {}))
+        self._mat_scr_off = _pbr_to_phong(gl_mats.get('screen_inactive',{}))
+        self._mat_wall    = _pbr_to_phong(gl_mats.get('back_wall', gl_mats.get('wall', {
+            'albedo_rgb': [0.12, 0.12, 0.16],
+            'ambient': 0.2, 'spec_strength': 0.1, 'shininess': 8.0})))
+
+        # Per-piece PBR materials (for ray tracing / future deferred pass)
+        self._piece_materials: dict = cfg.get('piece_materials', {})
+
+        # Parse piece_materials into SpectralMaterial objects for shader upload
+        self._spectral_materials: dict = {}
+        if _HAS_SPECTRAL:
+            for piece, mdict in self._piece_materials.items():
+                try:
+                    self._spectral_materials[piece] = _SpectralMaterial.from_dict(
+                        mdict, name=piece)
+                except Exception:
+                    pass
+
+        # Apply default thin clear-coat enamel to all settable surfaces, and
+        # ensure the monitor is always emissive blue.
+        if _HAS_SPECTRAL:
+            _default_enamel = _EnamelCoating(
+                thickness_m=80e-9, ior_real=1.52, ior_imag=0.0,
+                color_rgb=[1.0, 1.0, 1.0], roughness=0.06)
+            for piece, mat in self._spectral_materials.items():
+                if mat.enamel is None:
+                    mat.enamel = _default_enamel
+            # Monitor: force emissive blue if not already emissive
+            mon = self._spectral_materials.get('monitor')
+            if mon is not None:
+                if max(mon.emission_rgb) < 0.05:
+                    mon.emission_rgb = [0.05, 0.28, 0.82]
+                # Blue enamel on screen surface
+                if mon.enamel is None or mon.enamel.color_rgb == [1.0, 1.0, 1.0]:
+                    mon.enamel = _EnamelCoating(
+                        thickness_m=120e-9, ior_real=1.52, ior_imag=0.0,
+                        color_rgb=[0.20, 0.55, 1.0], roughness=0.03)
+
+        # Module geometry materials — derive Phong params from wall bands / floor PBR
+        cw_cfg = cfg.get('cornerstone_wall', {})
+        ft_cfg = cfg.get('floor_tile', {})
+
+        # Wall bands (PBR per zone, stored raw for ray-tracing consumers)
+        self._wall_bands: list = cw_cfg.get('bands', [])
+        # Parse into WallBand objects for spectral system
+        self._wall_bands_spectral: list = []
+        if _HAS_SPECTRAL and self._wall_bands:
+            try:
+                self._wall_bands_spectral = _parse_wall_bands(self._wall_bands)
+            except Exception:
+                pass
+        # GL fast-path: use the mid-wall band albedo; fall back to old 'material' key
+        _cw_mid_mat = {}
+        if self._wall_bands:
+            mid_idx = len(self._wall_bands) // 2
+            _cw_mid_mat = self._wall_bands[mid_idx].get('material', {})
+        elif 'material' in cw_cfg:
+            _cw_mid_mat = cw_cfg['material']
+        self._mat_cornerstone = _pbr_to_phong(_cw_mid_mat or {
+            'albedo': [0.10, 0.11, 0.15], 'roughness': 0.77, 'metallic': 0.03})
+
+        # Floor tile material
+        _ft_mat = ft_cfg.get('material', {})
+        self._mat_floor_tile = _pbr_to_phong(_ft_mat or {
+            'albedo': [0.10, 0.12, 0.16], 'roughness': 0.85, 'metallic': 0.05})
+        self._spectral_floor: Optional[object] = None
+        if _HAS_SPECTRAL and _ft_mat:
+            try:
+                self._spectral_floor = _SpectralMaterial.from_dict(_ft_mat, name="floor_tile")
+            except Exception:
+                pass
+        # Cornerstone mid-wall spectral material (for GL uniform upload)
+        self._spectral_cornerstone: Optional[object] = None
+        if _HAS_SPECTRAL and self._wall_bands_spectral:
+            mid = len(self._wall_bands_spectral) // 2
+            self._spectral_cornerstone = self._wall_bands_spectral[mid].material
+
+        # ── Register all materials with the global database ───────────────────
+        if _HAS_MAT_DB:
+            _db = _MaterialDatabase.instance()
+            _prefix = f"duty_station.{id(self)}"
+            # Per-piece spectral materials (richest path)
+            for _pname, _mat in self._spectral_materials.items():
+                _db.register(f"{_prefix}.{_pname}", _mat)
+            # Phong-derived materials for pieces without spectral objects
+            for _pname, _phong in [
+                ('body',            self._mat_body),
+                ('screen_active',   self._mat_screen),
+                ('screen_inactive', self._mat_scr_off),
+                ('back_wall',       self._mat_wall),
+                ('cornerstone',     self._mat_cornerstone),
+                ('floor_tile',      self._mat_floor_tile),
+            ]:
+                _full = f"{_prefix}.{_pname}"
+                if _full not in _db:
+                    _db.register(_full, _phong)
+            # Floor and cornerstone spectral materials if available
+            if self._spectral_floor is not None:
+                _db.register(f"{_prefix}.floor_tile", self._spectral_floor)
+            if self._spectral_cornerstone is not None:
+                _db.register(f"{_prefix}.cornerstone", self._spectral_cornerstone)
 
         # GL handles (populated by build_gl)
         self._body_vao    = self._body_vbo    = self._body_n    = None
         self._screen_vao  = self._screen_vbo  = self._screen_n  = None
         self._wing_vao    = self._wing_vbo    = self._wing_n    = None
+        self._wall_vao    = self._wall_vbo    = self._wall_n    = None
         self._prog_body   = self._prog_screen = None
 
     # ── Class-method constructors ─────────────────────────────────────────────
@@ -370,8 +678,12 @@ class DutyStation:
         """Upload mesh to GPU and compile shaders.  Call after GL context ready."""
         if not _HAS_GL:
             return
-        self._prog_body   = _compile_prog(_STATION_VS, _STATION_BODY_FS)
+        # Prefer spectral-PBR shader when spectral_material is available;
+        # fall back to legacy Phong shader otherwise.
+        body_fs = _SPECTRAL_PBR_BODY_FS if _HAS_SPECTRAL else _STATION_BODY_FS
+        self._prog_body   = _compile_prog(_STATION_VS, body_fs)
         self._prog_screen = _compile_prog(_STATION_VS, _STATION_SCREEN_FS)
+        self._use_spectral_shader = _HAS_SPECTRAL
 
         self._body_vao,   self._body_vbo,   self._body_n   = _make_vao(self._body_data)
         self._screen_vao, self._screen_vbo, self._screen_n = _make_vao(self._screen_data)
@@ -379,16 +691,57 @@ class DutyStation:
             self._wing_vao, self._wing_vbo, self._wing_n = _make_vao(self._wing_data)
         else:
             self._wing_n = 0
+        self._wall_vao, self._wall_vbo, self._wall_n = _make_vao(self._wall_data)
+
+        # Module geometry
+        if self._cornerstone_wall is not None:
+            self._cornerstone_wall.build_gl()
+        if self._floor_tile is not None:
+            self._floor_tile.build_gl()
+
+        # Auto-attach RoomControlStation menu if not already set
+        if self.module_type == 'room_control' and self.menu is None:
+            self._try_attach_room_control_menu()
+        if self.menu is not None and hasattr(self.menu, 'build_gl'):
+            self.menu.build_gl()
 
         self._gl_ready = True
+
+    def _try_attach_room_control_menu(self):
+        """Load and attach a RoomControlStation from the module YAML folder."""
+        try:
+            from room_control_station import RoomControlStation
+            # Resolve the station YAML path relative to configs/duty_stations/room_control/
+            candidates = [
+                os.path.join(os.path.dirname(__file__),
+                             'configs', 'duty_stations', 'room_control', 'station.yaml'),
+                'configs/duty_stations/room_control/station.yaml',
+            ]
+            for path in candidates:
+                if os.path.isfile(path):
+                    self.menu = RoomControlStation.from_yaml_safe(path)
+                    return
+            print('[duty_station] room_control: station.yaml not found; no menu attached')
+        except Exception as exc:
+            print(f'[duty_station] room_control menu attach failed: {exc}')
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
     def draw(self, cam_mvp: np.ndarray, cam_mv: np.ndarray,
-             light_v: np.ndarray, alpha: float = 1.0):
+             light_v: np.ndarray, alpha: float = 1.0,
+             body_prog: Optional[int] = None):
         """Draw console body + wings (Phong shaded) and screen (emissive).
         cam_mvp / cam_mv should already incorporate the camera but NOT the
-        station model matrix — this method applies the model transform."""
+        station model matrix — this method applies the model transform.
+
+        body_prog: when provided, the station uses this external OpenGL program
+        handle (e.g. the main renderer's _p_body) instead of its own private
+        shader.  This makes it participate in the same lighting model as all
+        other scene objects.  The program must accept the same uniforms as
+        _BODY_FS / _BODY_VS (uMVP, uMV, uColor, uInnerColor, uLightV,
+        uAmbient, uSpecStrength, uShininess, uGrain, uSceneRgb,
+        uSceneIndirectRatio).
+        """
         if not self._gl_ready:
             return
 
@@ -396,31 +749,120 @@ class DutyStation:
         MVP = (cam_mvp @ M).astype(np.float32)
         MV  = (cam_mv  @ M).astype(np.float32)
 
-        self._draw_body(MVP, MV, light_v, alpha)
+        prog = body_prog if body_prog is not None else self._prog_body
+        self._draw_body(MVP, MV, light_v, alpha, prog)
+        self._draw_wall(MVP, MV, light_v, alpha, prog)
         self._draw_screen(MVP, MV, alpha)
+        self._draw_module_geometry(MVP, MV, light_v, alpha, prog)
 
-    def _draw_body(self, MVP, MV, light_v, alpha):
+    def _draw_body(self, MVP, MV, light_v, alpha, prog: Optional[int] = None):
         m = self._mat_body
         r, g, b = m.get('albedo_rgb', [0.07, 0.09, 0.13])
+        if prog is None:
+            prog = self._prog_body
 
-        glUseProgram(self._prog_body)
-        _set_mvp(self._prog_body, MVP, MV)
-        glUniform3f(glGetUniformLocation(self._prog_body, b'uLightV'),    *light_v)
-        glUniform4f(glGetUniformLocation(self._prog_body, b'uColor'),     r, g, b, alpha)
-        glUniform1f(glGetUniformLocation(self._prog_body, b'uAmbient'),   m.get('ambient',       0.18))
-        glUniform1f(glGetUniformLocation(self._prog_body, b'uSpecStrength'), m.get('spec_strength', 0.55))
-        glUniform1f(glGetUniformLocation(self._prog_body, b'uShininess'), m.get('shininess',     112.0))
-        glUniform1f(glGetUniformLocation(self._prog_body, b'uGrain'),     m.get('grain',          0.05))
+        glUseProgram(prog)
+        _set_mvp(prog, MVP, MV)
+        glUniform3f(glGetUniformLocation(prog, b'uLightV'),    *light_v)
+        glUniform4f(glGetUniformLocation(prog, b'uColor'),     r, g, b, alpha)
+        glUniform3f(glGetUniformLocation(prog, b'uInnerColor'), r, g, b)
+        glUniform1f(glGetUniformLocation(prog, b'uAmbient'),   m.get('ambient',       0.18))
+        glUniform1f(glGetUniformLocation(prog, b'uSpecStrength'), m.get('spec_strength', 0.55))
+        glUniform1f(glGetUniformLocation(prog, b'uShininess'), m.get('shininess',     112.0))
+        glUniform1f(glGetUniformLocation(prog, b'uGrain'),     m.get('grain',          0.05))
+        if getattr(self, '_use_spectral_shader', False) and prog == self._prog_body:
+            spec_mat = self._spectral_materials.get('panels',
+                       self._spectral_materials.get('main_surface', None))
+            if spec_mat is not None:
+                _set_spectral_uniforms(prog, spec_mat,
+                                       probe_freq_norm=0.5, spec_tint_strength=0.12)
 
         glBindVertexArray(self._body_vao)
         glDrawArrays(GL_TRIANGLES, 0, self._body_n)
 
         if self._wing_n:
+            wing_mat = (self._spectral_materials.get('left_wing', None)
+                        if getattr(self, '_use_spectral_shader', False) and prog == self._prog_body
+                        else None)
+            if wing_mat is not None:
+                _set_spectral_uniforms(prog, wing_mat,
+                                       probe_freq_norm=0.5, spec_tint_strength=0.10)
             glBindVertexArray(self._wing_vao)
             glDrawArrays(GL_TRIANGLES, 0, self._wing_n)
 
         glBindVertexArray(0)
         glUseProgram(0)
+
+    def _draw_wall(self, MVP, MV, light_v, alpha, prog: Optional[int] = None):
+        if not self._wall_n:
+            return
+        if prog is None:
+            prog = self._prog_body
+        m = self._mat_wall
+        r, g, b = m.get('albedo_rgb', [0.12, 0.12, 0.16])
+        glUseProgram(prog)
+        _set_mvp(prog, MVP, MV)
+        glUniform3f(glGetUniformLocation(prog, b'uLightV'),       *light_v)
+        glUniform4f(glGetUniformLocation(prog, b'uColor'),        r, g, b, alpha)
+        glUniform3f(glGetUniformLocation(prog, b'uInnerColor'),   r, g, b)
+        glUniform1f(glGetUniformLocation(prog, b'uAmbient'),      m.get('ambient',       0.20))
+        glUniform1f(glGetUniformLocation(prog, b'uSpecStrength'), m.get('spec_strength', 0.10))
+        glUniform1f(glGetUniformLocation(prog, b'uShininess'),    m.get('shininess',     8.0))
+        glUniform1f(glGetUniformLocation(prog, b'uGrain'),        m.get('grain',         0.02))
+        if getattr(self, '_use_spectral_shader', False) and prog == self._prog_body and self._spectral_cornerstone:
+            _set_spectral_uniforms(prog, self._spectral_cornerstone,
+                                   probe_freq_norm=0.3, spec_tint_strength=0.08)
+        glBindVertexArray(self._wall_vao)
+        glDrawArrays(GL_TRIANGLES, 0, self._wall_n)
+        glBindVertexArray(0)
+        glUseProgram(0)
+
+    def _draw_module_geometry(self, MVP, MV, light_v, alpha, prog: Optional[int] = None):
+        """Draw cornerstone wall + floor tile when module_type == 'room_control'."""
+        _body_prog = prog if prog is not None else self._prog_body
+        if self._cornerstone_wall is not None and self._cornerstone_wall._gl_ready:
+            m = self._mat_cornerstone
+            r, g, b = m.get('albedo_rgb', [0.10, 0.11, 0.15])
+            _spec_cw = (self._spectral_cornerstone
+                        if getattr(self, '_use_spectral_shader', False) and prog is None
+                        else None)
+
+            def _cw_uniforms(_p):
+                from OpenGL.GL import glUniform3f, glUniform4f, glUniform1f, glGetUniformLocation
+                glUniform3f(glGetUniformLocation(_p, b'uLightV'),       *light_v)
+                glUniform4f(glGetUniformLocation(_p, b'uColor'),        r, g, b, alpha)
+                glUniform3f(glGetUniformLocation(_p, b'uInnerColor'),   r, g, b)
+                glUniform1f(glGetUniformLocation(_p, b'uAmbient'),      m.get('ambient',       0.22))
+                glUniform1f(glGetUniformLocation(_p, b'uSpecStrength'), m.get('spec_strength', 0.12))
+                glUniform1f(glGetUniformLocation(_p, b'uShininess'),    m.get('shininess',     12.0))
+                glUniform1f(glGetUniformLocation(_p, b'uGrain'),        m.get('grain',          0.04))
+                if _spec_cw is not None:
+                    _set_spectral_uniforms(_p, _spec_cw,
+                                           probe_freq_norm=0.4, spec_tint_strength=0.08)
+
+            self._cornerstone_wall.draw(MVP, MV, _body_prog, _cw_uniforms)
+
+        if self._floor_tile is not None and self._floor_tile._gl_ready:
+            m = self._mat_floor_tile
+            r, g, b = m.get('albedo_rgb', [0.08, 0.10, 0.14])
+            _spec_ft = (self._spectral_floor
+                        if getattr(self, '_use_spectral_shader', False) and prog is None
+                        else None)
+
+            def _ft_uniforms(_p):
+                from OpenGL.GL import glUniform3f, glUniform4f, glUniform1f, glGetUniformLocation
+                glUniform3f(glGetUniformLocation(_p, b'uLightV'),       *light_v)
+                glUniform4f(glGetUniformLocation(_p, b'uColor'),        r, g, b, alpha)
+                glUniform3f(glGetUniformLocation(_p, b'uInnerColor'),   r, g, b)
+                glUniform1f(glGetUniformLocation(_p, b'uAmbient'),      m.get('ambient',       0.20))
+                glUniform1f(glGetUniformLocation(_p, b'uSpecStrength'), m.get('spec_strength', 0.35))
+                glUniform1f(glGetUniformLocation(_p, b'uShininess'),    m.get('shininess',     40.0))
+                glUniform1f(glGetUniformLocation(_p, b'uGrain'),        m.get('grain',          0.08))
+                if _spec_ft is not None:
+                    _set_spectral_uniforms(_p, _spec_ft,
+                                           probe_freq_norm=0.2, spec_tint_strength=0.06)
+
+            self._floor_tile.draw(MVP, MV, _body_prog, _ft_uniforms)
 
     def _draw_screen(self, MVP, MV, alpha):
         mat = self._mat_screen if self._screen_active else self._mat_scr_off
@@ -449,6 +891,27 @@ class DutyStation:
     def toggle_screen(self):
         self._screen_active = not self._screen_active
 
+    # ── Menu slot ─────────────────────────────────────────────────────────────
+    # Any object with show_hud(bool), render_hud(w,h), handle_event(ev)->bool
+    # can be attached here.  The room-station HUD is one example.
+
+    def open_menu(self):
+        if self.menu is not None:
+            self.menu.show_hud(True)
+
+    def close_menu(self):
+        if self.menu is not None:
+            self.menu.show_hud(False)
+
+    def render_menu(self, win_w: int, win_h: int):
+        if self.menu is not None:
+            self.menu.render_hud(win_w, win_h)
+
+    def handle_menu_event(self, ev) -> bool:
+        if self.menu is not None and getattr(self.menu, '_hud_visible', False):
+            return self.menu.handle_event(ev)
+        return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience: build a camera pure-view matrix (no model) for use in draw()
@@ -465,7 +928,7 @@ def camera_pure_matrices(camera) -> tuple[np.ndarray, np.ndarray]:
     w, h = __import__('pygame').display.get_surface().get_size()
     aspect = w / max(1, h)
     fov    = camera.fov_y_rad()
-    near, far = 0.005, 10.0
+    near, far = 0.05, 500.0
 
     f  = 1.0 / math.tan(fov / 2.0)
     P  = np.zeros((4, 4), np.float64)

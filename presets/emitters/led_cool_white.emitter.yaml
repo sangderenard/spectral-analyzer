@@ -1,0 +1,135 @@
+name: led_cool_white
+spectral:
+  model: led_phosphor
+  temperature_K: 6500.0
+  center_um: 0.55
+  sigma_um: 0.03
+  fwhm_um: 0.002
+  wavelengths_um: []
+  weights: []
+  radiant_exitance: 1.0
+phase:
+  model: incoherent
+  coherence_length_um: 0.0
+  phase_offset_rad: 0.0
+  temporal_coherence_s: 0.0
+directional:
+  model: lambertian
+  beam_waist_um: 50.0
+  divergence_half_angle_rad: 0.0
+  center_wavelength_um: 0.55
+  numerical_aperture: 0.5
+  half_angle_rad: 0.5235987755982988
+  hg_g: 0.0
+  dipole_axis:
+  - 0.0
+  - 0.0
+  - 1.0
+polarization:
+  mode: unpolarized
+  angle_deg: 0.0
+  handedness: 1
+  jones:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  degree_of_polarization: 1.0
+display_tint:
+- 0.92
+- 0.95
+- 1.0
+label: LED cool white (~6000 K phosphor-converted)
+notes: 'Composite: GaN die direct (30 %) + YAG:Ce phosphor (70 %). Die: Gaussian 450
+  nm σ=18 nm, L_c=5 µm partial coherence. Phosphor: Gaussian 545 nm σ=60 nm, fully
+  incoherent L_c=0.05 µm.'
+components:
+- - 0.3
+  - name: led_cool_white.gan_die
+    spectral:
+      model: gaussian
+      temperature_K: 6500.0
+      center_um: 0.45
+      sigma_um: 0.018
+      fwhm_um: 0.002
+      wavelengths_um: []
+      weights: []
+      radiant_exitance: 1.0
+    phase:
+      model: partial
+      coherence_length_um: 5.0
+      phase_offset_rad: 0.0
+      temporal_coherence_s: 1.67e-14
+    directional:
+      model: dipole_inplane_mixed
+      beam_waist_um: 50.0
+      divergence_half_angle_rad: 0.0
+      center_wavelength_um: 0.55
+      numerical_aperture: 0.5
+      half_angle_rad: 0.5235987755982988
+      hg_g: 0.0
+      dipole_axis:
+      - 0.0
+      - 0.0
+      - 1.0
+    polarization:
+      mode: unpolarized
+      angle_deg: 0.0
+      handedness: 1
+      jones:
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      degree_of_polarization: 1.0
+    display_tint:
+    - 0.45
+    - 0.45
+    - 1.0
+    label: GaN die direct (cool white)
+    notes: Blue InGaN QW die. In-plane mixed electric dipole emission I(θ)∝(1+cos²θ)/2.
+      Partial coherence L_c=5µm.
+- - 0.7
+  - name: led_cool_white.phosphor
+    spectral:
+      model: gaussian
+      temperature_K: 6500.0
+      center_um: 0.545
+      sigma_um: 0.06
+      fwhm_um: 0.002
+      wavelengths_um: []
+      weights: []
+      radiant_exitance: 1.0
+    phase:
+      model: incoherent
+      coherence_length_um: 0.05
+      phase_offset_rad: 0.0
+      temporal_coherence_s: 1.67e-16
+    directional:
+      model: lambertian
+      beam_waist_um: 50.0
+      divergence_half_angle_rad: 0.0
+      center_wavelength_um: 0.55
+      numerical_aperture: 0.5
+      half_angle_rad: 0.5235987755982988
+      hg_g: 0.0
+      dipole_axis:
+      - 0.0
+      - 0.0
+      - 1.0
+    polarization:
+      mode: unpolarized
+      angle_deg: 0.0
+      handedness: 1
+      jones:
+      - 1.0
+      - 0.0
+      - 0.0
+      - 0.0
+      degree_of_polarization: 1.0
+    display_tint:
+    - 0.85
+    - 1.0
+    - 0.65
+    label: YAG:Ce phosphor (cool white)
+    notes: YAG:Ce phosphor layer, cooler CCT. Fully incoherent, true Lambertian diffuser.

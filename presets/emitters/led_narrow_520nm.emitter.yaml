@@ -1,0 +1,39 @@
+name: led_narrow_520nm
+spectral:
+  model: gaussian
+  temperature_K: 6500.0
+  center_um: 0.52
+  sigma_um: 0.012
+  fwhm_um: 0.002
+  wavelengths_um: []
+  weights: []
+  radiant_exitance: 1.0
+phase:
+  model: incoherent
+  coherence_length_um: 0.0
+  phase_offset_rad: 0.0
+  temporal_coherence_s: 0.0
+directional:
+  model: lambertian
+  beam_waist_um: 50.0
+  divergence_half_angle_rad: 0.0
+  center_wavelength_um: 0.55
+  numerical_aperture: 0.5
+  half_angle_rad: 0.5235987755982988
+  hg_g: 0.0
+polarization:
+  mode: unpolarized
+  angle_deg: 0.0
+  handedness: 1
+  jones:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  degree_of_polarization: 1.0
+display_tint:
+- 0.2
+- 1.0
+- 0.2
+label: Narrow-band green LED 520 nm
+notes: High-brightness narrow-band green LED. ~12 nm sigma.

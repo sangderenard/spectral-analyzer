@@ -1,0 +1,327 @@
+"""room_workspace.py
+====================
+RoomWorkspace — pure state machine for the room environment.
+
+Responsibilities
+----------------
+* Load and hold the room config (dimensions, physics, station position).
+* Own the placed-object registry (PlacedLight, PlacedEnclosure, …).
+* Provide ``physics_config()`` → dict for PlayerController initialisation.
+* Provide ``apply_physics(player_ctrl)`` for live in-game edits.
+* Serialise / deserialise the full scene to/from YAML-compatible dicts.
+* Build the live station objects from the registry when requested.
+
+No GL, no pygame.
+"""
+from __future__ import annotations
+
+import os
+from typing import Any, Dict, List, Optional
+
+import numpy as np
+
+from placed_object import (
+    PlacedObject,
+    PlacedLight, PlacedCamera, PlacedEnclosure,
+    PlacedDutyStation, PlacedPortalFrame,
+    placed_object_from_dict,
+)
+
+# YAML is optional — workspace degrades gracefully without it
+try:
+    import yaml as _yaml
+    _HAS_YAML = True
+except ImportError:
+    _HAS_YAML = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _load_yaml(path: str) -> dict:
+    if not _HAS_YAML:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            return _yaml.safe_load(fh) or {}
+    except Exception as exc:
+        print(f"[RoomWorkspace] cannot load {path}: {exc}", flush=True)
+        return {}
+
+
+def _dump_yaml(data: dict, path: str) -> bool:
+    if not _HAS_YAML:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            _yaml.safe_dump(data, fh, default_flow_style=False, sort_keys=False)
+        return True
+    except Exception as exc:
+        print(f"[RoomWorkspace] cannot write {path}: {exc}", flush=True)
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main class
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RoomWorkspace:
+    """Owns all scene state for the room environment.  No GL.
+
+    Parameters
+    ----------
+    config_dir : str
+        Directory that contains ``room.yaml``, ``physics.yaml``,
+        ``station.yaml``, and ``scene.yaml``.
+    """
+
+    def __init__(self, config_dir: str = "configs/room_station"):
+        self._config_dir = config_dir
+
+        # ── load config files ────────────────────────────────────────────────
+        self.room_cfg    = _load_yaml(os.path.join(config_dir, "room.yaml"))
+        self.physics_cfg = _load_yaml(os.path.join(config_dir, "physics.yaml"))
+        self.station_cfg = _load_yaml(os.path.join(config_dir, "station.yaml"))
+        scene_cfg        = _load_yaml(os.path.join(config_dir, "scene.yaml"))
+
+        # ── object registry ──────────────────────────────────────────────────
+        self._objects: Dict[str, PlacedObject] = {}
+        for obj_dict in scene_cfg.get("objects", []):
+            try:
+                obj = placed_object_from_dict(obj_dict)
+                self._objects[obj.obj_id] = obj
+            except Exception as exc:
+                print(f"[RoomWorkspace] skip bad object: {exc}", flush=True)
+
+        # ── selection state ───────────────────────────────────────────────────
+        self.selected_id: Optional[str] = None
+
+        # ── dirty flag for save ───────────────────────────────────────────────
+        self._dirty = False
+
+    # ── Class factory ─────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_yaml(cls, config_dir: str = "configs/room_station") -> "RoomWorkspace":
+        return cls(config_dir)
+
+    # ── Object registry ───────────────────────────────────────────────────────
+
+    @property
+    def objects(self) -> Dict[str, PlacedObject]:
+        return self._objects
+
+    def add_object(self, obj: PlacedObject) -> bool:
+        if obj.obj_id in self._objects:
+            return False
+        self._objects[obj.obj_id] = obj
+        self._dirty = True
+        return True
+
+    def remove_object(self, obj_id: str) -> bool:
+        if obj_id not in self._objects:
+            return False
+        del self._objects[obj_id]
+        if self.selected_id == obj_id:
+            self.selected_id = None
+        self._dirty = True
+        return True
+
+    def move_object(self, obj_id: str, new_pos: np.ndarray) -> bool:
+        obj = self._objects.get(obj_id)
+        if obj is None:
+            return False
+        obj.pos = np.asarray(new_pos, np.float64)
+        self._dirty = True
+        return True
+
+    def rotate_object(self, obj_id: str, yaw_deg: float) -> bool:
+        obj = self._objects.get(obj_id)
+        if obj is None:
+            return False
+        obj.yaw_deg = float(yaw_deg)
+        self._dirty = True
+        return True
+
+    def select(self, obj_id: Optional[str]) -> bool:
+        if obj_id is not None and obj_id not in self._objects:
+            return False
+        self.selected_id = obj_id
+        return True
+
+    @property
+    def selected(self) -> Optional[PlacedObject]:
+        return self._objects.get(self.selected_id) if self.selected_id else None
+
+    # ── Typed views ───────────────────────────────────────────────────────────
+
+    def lights(self) -> List[PlacedLight]:
+        return [o for o in self._objects.values() if isinstance(o, PlacedLight)]
+
+    def enclosures(self) -> List[PlacedEnclosure]:
+        return [o for o in self._objects.values() if isinstance(o, PlacedEnclosure)]
+
+    def duty_stations(self) -> List[PlacedDutyStation]:
+        return [o for o in self._objects.values() if isinstance(o, PlacedDutyStation)]
+
+    def cameras(self) -> List[PlacedCamera]:
+        return [o for o in self._objects.values() if isinstance(o, PlacedCamera)]
+
+    def portals(self) -> List[PlacedPortalFrame]:
+        return [o for o in self._objects.values() if isinstance(o, PlacedPortalFrame)]
+
+    # ── Physics ───────────────────────────────────────────────────────────────
+
+    def physics_config(self) -> dict:
+        """Return a PlayerController-compatible config dict."""
+        return dict(self.physics_cfg)
+
+    def apply_physics(self, player_ctrl) -> None:
+        """Push current physics values into a live PlayerController."""
+        w = self.physics_cfg.get("walk", {})
+        if hasattr(player_ctrl, "_move_speed"):
+            player_ctrl._move_speed = float(w.get("move_speed", 3.0))
+        if hasattr(player_ctrl, "_run_mult"):
+            player_ctrl._run_mult   = float(w.get("run_multiplier", 2.2))
+        if hasattr(player_ctrl, "_eye_height"):
+            player_ctrl._eye_height = float(w.get("eye_height", 1.65))
+
+    # ── Room geometry data ────────────────────────────────────────────────────
+
+    def room_dims(self) -> dict:
+        return dict(self.room_cfg.get("dimensions", {}))
+
+    def station_pos(self) -> np.ndarray:
+        p = self.station_cfg.get("position", [0.0, 0.0, 0.5])
+        return np.array(p, np.float64)
+
+    def station_yaw_deg(self) -> float:
+        return float(self.station_cfg.get("yaw_deg", 180.0))
+
+    def interact_radius(self) -> float:
+        return float(self.station_cfg.get("interact_radius_m", 2.0))
+
+    def console_camera(self) -> dict:
+        return dict(self.station_cfg.get("console_camera", {}))
+
+    def layout(self) -> dict:
+        return dict(self.station_cfg.get("layout", {}))
+
+    # ── Scene build ───────────────────────────────────────────────────────────
+
+    def build_scene_objects(self, win_w: int = 1400, win_h: int = 900) -> list:
+        """Instantiate all placeable duty-station objects from the registry.
+
+        Returns a list of station objects that have:
+          - ``init_gl()``       already called
+          - ``draw(MVP,MV,lv)`` for 3-D render
+          - ``handle_event(ev)``
+
+        Enclosures that wrap a simulator are also instantiated here.
+        Lights and portals are NOT instantiated as station objects.
+        """
+        stations = []
+        for obj in self._objects.values():
+            station = self._try_build_station(obj, win_w, win_h)
+            if station is not None:
+                stations.append(station)
+        return stations
+
+    def _try_build_station(self, obj: PlacedObject,
+                           win_w: int, win_h: int):
+        """Attempt to build a live station from a placed object."""
+        if isinstance(obj, PlacedDutyStation):
+            if obj.station_type == "fabricator":
+                return self._build_fabricator(obj, win_w, win_h)
+            if obj.station_type == "simulator":
+                return self._build_simulator(obj, win_w, win_h)
+
+        if isinstance(obj, PlacedEnclosure) and obj.simulator is not None:
+            return self._build_enclosure_simulator(obj, win_w, win_h)
+
+        return None
+
+    def _build_fabricator(self, obj: PlacedDutyStation,
+                           win_w: int, win_h: int):
+        try:
+            from fabricator_workspace import FabricatorWorkspace
+            from fabricator_station   import FabricatorStation
+            cfg_dir = obj.config_dir
+            ws_cfg  = _load_yaml(os.path.join(cfg_dir, "workspace.yaml"))
+            st_cfg  = _load_yaml(os.path.join(cfg_dir, "station.yaml"))
+            ws = FabricatorWorkspace(ws_cfg)
+            st = FabricatorStation(ws, st_cfg, win_w, win_h)
+            st.init_gl()
+            return st
+        except Exception as exc:
+            print(f"[RoomWorkspace] fabricator build failed: {exc}", flush=True)
+            return None
+
+    def _build_simulator(self, obj: PlacedDutyStation,
+                          win_w: int, win_h: int):
+        try:
+            from simulator_station   import SimulatorStation
+            cfg_dir  = obj.config_dir
+            pal_cfg  = _load_yaml(os.path.join(cfg_dir, "simulator_palette.yaml"))
+            coevo_cfg = _load_yaml(os.path.join(cfg_dir, "coevolution.yaml"))
+            glass_cfg = _load_yaml(os.path.join(cfg_dir, "glass_room.yaml"))
+            st_cfg    = _load_yaml(os.path.join(cfg_dir, "station.yaml"))
+            lay = st_cfg.get("layout", {})
+            lw  = int(lay.get("left_panel_width",  210))
+            rw  = int(lay.get("right_panel_width", 240))
+            wb_min = np.array([-0.20, -0.05, 0.02])
+            wb_max = np.array([ 0.20,  0.35, 0.38])
+            st = SimulatorStation(pal_cfg, coevo_cfg, glass_cfg,
+                                  wb_min, wb_max, win_w, win_h, lw, rw)
+            st.init_gl()
+            return st
+        except Exception as exc:
+            print(f"[RoomWorkspace] simulator build failed: {exc}", flush=True)
+            return None
+
+    def _build_enclosure_simulator(self, obj: PlacedEnclosure,
+                                    win_w: int, win_h: int):
+        """Build a SimulatorWorkspace (no GL) for an enclosure that has a
+        ``simulator`` config block.  Returns a lightweight wrapper that just
+        holds the workspace — the enclosure geometry is rendered by RoomStation."""
+        try:
+            from simulator_workspace import SimulatorWorkspace
+            from coevolution_scheduler import CoevolutionScheduler
+
+            sim_cfg = obj.simulator or {}
+            coevo_path = "configs/duty_stations/simulator/coevolution.yaml"
+            pal_path   = "configs/duty_stations/simulator/simulator_palette.yaml"
+            coevo_cfg  = _load_yaml(coevo_path)
+            pal_cfg    = _load_yaml(pal_path)
+            n_items    = int(sim_cfg.get("n_items", 4))
+            ws = SimulatorWorkspace(pal_cfg, coevo_cfg, n_items=n_items)
+            plugin_id = sim_cfg.get("plugin_id")
+            if plugin_id:
+                ws.select_plugin(plugin_id)
+            # Attach workspace to placed object so RoomStation can draw stats
+            obj._simulator_ws = ws  # type: ignore[attr-defined]
+            return None  # no GL station object; rendered inline by RoomStation
+        except Exception as exc:
+            print(f"[RoomWorkspace] enclosure sim build failed: {exc}", flush=True)
+            return None
+
+    # ── Serialisation ─────────────────────────────────────────────────────────
+
+    def to_dict(self) -> dict:
+        return {
+            "objects": [obj.to_dict() for obj in self._objects.values()]
+        }
+
+    def save_scene(self, path: str = None) -> bool:
+        if path is None:
+            path = os.path.join(self._config_dir, "scene.yaml")
+        return _dump_yaml(self.to_dict(), path)
+
+    @property
+    def dirty(self) -> bool:
+        return self._dirty
+
+    def mark_clean(self):
+        self._dirty = False

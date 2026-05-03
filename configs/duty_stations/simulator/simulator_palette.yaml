@@ -1,0 +1,26 @@
+# Simulator plugin palette
+# Each entry maps to a .py file in sm_plugins/.
+
+plugins:
+  - id: spring_mass
+    label: Spring Mass
+    subtitle: "N-body spring-mass oscillator"
+    color_rgb: [0.95, 0.60, 0.20]
+
+  - id: orchestral_resonance
+    label: Orchestral Resonance
+    subtitle: "Cavity + room resonator"
+    color_rgb: [0.20, 0.75, 0.95]
+
+  - id: bound_particle_circle
+    label: Bound Particle Circle
+    subtitle: "Spring cage + resonator"
+    color_rgb: [0.55, 0.90, 0.30]
+
+# ── Panel display options ────────────────────────────────────────────────────
+panel:
+  item_height:   60
+  icon_size:     44
+  font_size:     13
+  subtitle_font: 11
+  scroll_speed:  24

@@ -1,0 +1,29 @@
+# configs/room_station/room.yaml
+# Geometry and material settings for the room itself.
+
+dimensions:
+  width_m:  12.0    # x-axis (−6 .. +6 from centre)
+  height_m:  4.0    # z-axis (floor at z=0, ceiling at z=4)
+  depth_m:  10.0    # y-axis (entrance at y=0, back wall at y=10)
+  wall_thickness_m: 0.25
+
+# Surface materials (RGBA — alpha used for roughness hints in shaders)
+floor_color:   [0.18, 0.18, 0.22, 1.0]
+ceiling_color: [0.12, 0.12, 0.15, 1.0]
+wall_color:    [0.15, 0.16, 0.20, 1.0]
+
+# Trim accent colour (used on skirting, door frames, etc.)
+trim_color:    [0.08, 0.28, 0.55, 1.0]
+
+# Ambient light contribution for room surfaces
+ambient: 0.18
+
+# Simple Phong params for walls/floor/ceiling
+spec_strength: 0.15
+shininess:     32.0
+
+# Grid lines painted on the floor (purely decorative)
+floor_grid:
+  enabled:   true
+  spacing_m: 1.0
+  color:     [0.30, 0.30, 0.40, 0.45]

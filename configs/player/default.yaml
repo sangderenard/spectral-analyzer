@@ -1,7 +1,7 @@
 # Player controller configuration
 # Drives the PlayerController state machine that owns the OpenGL camera.
 
-initial_state: orbit   # orbit | walk | interact
+initial_state: walk    # orbit | walk | interact
 
 # ── Orbit state ───────────────────────────────────────────────────────────────
 # Classic orbit camera: mouse drag = rotate, wheel = zoom, WASD = pan target.
@@ -26,6 +26,8 @@ walk:
   mouse_sensitivity: 0.15        # degrees per pixel (captured relative mouse)
   pitch_limit_deg: 75.0          # max pitch up/down
   transition_to_orbit_key: tab   # key that returns to orbit
+  gravity: 9.81                  # m/s² downward acceleration
+  floor_z: 0.0                   # world Z of the floor surface
 
 # ── Interact state ────────────────────────────────────────────────────────────
 # Camera smoothly moves to station console view; mouse freed; sidebar appears.
@@ -35,3 +37,14 @@ interact:
   exit_key: escape              # key to return to walk
   hud_hint: "[ E ]  Interact"  # text shown when in proximity
   hint_proximity_fade: 0.4      # distance at which hint starts fading (0..1 of radius)
+
+# ── IN_CAMERA state ───────────────────────────────────────────────────────────
+# Mechanical armature camera control: held key = continuous rate.
+# Left/Right arrows = pan.  Up/Down = tilt.  +/- = focal length (zoom lenses only).
+# E or Escape = exit.  GL camera is subservient to lens focal_mm via fov_y_rad().
+camera_operate:
+  pan_rate_deg_s:   45.0    # degrees per second (arrow key held)
+  tilt_rate_deg_s:  30.0
+  focal_rate_mm_s:  20.0    # mm per second (zoom lens only; prime = no effect)
+  tilt_min_deg:    -80.0
+  tilt_max_deg:     80.0

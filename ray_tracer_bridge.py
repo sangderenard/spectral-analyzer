@@ -47,6 +47,23 @@ except ImportError:
     _HAS_C_TRACER = False
     _HAS_FIELD_SOLVER = False
 
+try:
+    from spectral_material import (
+        Material            as _SpectralMaterial,
+        WallBand            as _WallBand,
+        parse_wall_bands    as _parse_wall_bands,
+        wall_band_at        as _wall_band_at,
+        materials_to_tracer_mat_props as _materials_to_tracer_mat_props,
+    )
+    _HAS_SPECTRAL_MAT = True
+except ImportError:
+    _SpectralMaterial        = None
+    _WallBand                = None
+    _parse_wall_bands        = None
+    _wall_band_at            = None
+    _materials_to_tracer_mat_props = None
+    _HAS_SPECTRAL_MAT = False
+
 
 # ---------------------------------------------------------------------------
 # Room triangulation
@@ -914,6 +931,80 @@ def build_complex_reflectances(
     return refl_re, refl_im
 
 
+def build_complex_reflectances_spectral(
+        materials: list,         # list[_SpectralMaterial], one per triangle
+        freq_hz:   np.ndarray,   # (n_bands,) float64
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute per-band complex reflectances from per-triangle SpectralMaterial objects.
+
+    This is the spectral-aware replacement for ``build_complex_reflectances``.
+    Each triangle has a full ``spectral_material.Material`` object whose
+    ``SpectralBand`` entries supply Gaussian-lobe reflectance, diffusion,
+    emission, and re-emission curves that are already physically motivated
+    and Kramers–Kronig consistent.
+
+    Parameters
+    ----------
+    materials : list[Material]  — one Material per triangle (len == n_tri)
+    freq_hz   : (n_bands,) float64
+
+    Returns
+    -------
+    refl_re   : (n_tri, n_bands) float64
+    refl_im   : (n_tri, n_bands) float64
+    diffusion : (n_tri, n_bands) float64  — Lambertian fraction per band
+    emission  : (n_tri, n_bands) float64  — self-emission power per band
+    reemission: (n_tri, n_bands) float64  — re-emission coefficient per band
+    """
+    if not _HAS_SPECTRAL_MAT:
+        raise RuntimeError(
+            "spectral_material module is required for build_complex_reflectances_spectral"
+        )
+    return _materials_to_tracer_mat_props(materials, np.asarray(freq_hz, dtype=np.float64))
+
+
+def assign_wall_band_materials(
+        verts:    np.ndarray,   # (n_tri, 3, 3) float64 triangle vertices
+        wall_bands: list,       # list[WallBand] (sorted by top, from station.yaml)
+        wall_z_min: float = 0.0,
+        wall_z_max: float = 1.0,
+        fallback_material: Optional[object] = None,
+) -> list:
+    """Assign a SpectralMaterial to each triangle based on its Z-centroid height.
+
+    Maps triangle centroids' Z coordinate to a normalised wall height, then
+    looks up the appropriate WallBand material.  Non-wall triangles (those
+    outside [wall_z_min, wall_z_max]) receive ``fallback_material`` or the
+    first/last band material.
+
+    Parameters
+    ----------
+    verts           : (n_tri, 3, 3) float64 — triangle vertices
+    wall_bands      : list[WallBand]         — sorted by WallBand.top
+    wall_z_min      : float — Z of the bottom of the first wall band
+    wall_z_max      : float — Z of the top of the last wall band
+    fallback_material : Material | None      — used for out-of-range triangles
+
+    Returns
+    -------
+    materials : list[Material], length n_tri
+    """
+    if not _HAS_SPECTRAL_MAT or not wall_bands:
+        return []
+    n_tri = len(verts)
+    # Triangle Z-centroids
+    centroids_z = verts.reshape(n_tri, 3, 3)[:, :, 2].mean(axis=1)   # (n_tri,)
+    z_range = max(wall_z_max - wall_z_min, 1e-6)
+    materials = []
+    for z in centroids_z:
+        t = float(z - wall_z_min) / z_range
+        mat = _wall_band_at(wall_bands, t)
+        if mat is None:
+            mat = fallback_material or wall_bands[-1].material
+        materials.append(mat)
+    return materials
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -1168,7 +1259,20 @@ def trace_cavity_scene(
     freq_hz = build_frequency_bands(scene, n_bands)
 
     # Complex reflectances.
-    refl_re, refl_im = build_complex_reflectances(mat_props, freq_hz)
+    # Use per-triangle SpectralMaterial objects when the room or scene
+    # carries a 'spectral_materials' list (one Material per triangle).
+    # This replaces the scalar-reflectance fallback with physically-based
+    # per-band Gaussian curves that support emission and re-emission.
+    _spec_mats = getattr(scene, 'spectral_materials', None) \
+              or getattr(room, 'spectral_materials', None)
+    if _HAS_SPECTRAL_MAT and _spec_mats is not None and len(_spec_mats) == n_tri:
+        refl_re, refl_im, diffusion_bands, emission_bands, reemission_bands = \
+            build_complex_reflectances_spectral(_spec_mats, freq_hz)
+    else:
+        refl_re, refl_im = build_complex_reflectances(mat_props, freq_hz)
+        diffusion_bands  = np.tile(mat_props[:, 1:2], (1, n_bands))
+        emission_bands   = np.zeros((n_tri, n_bands), dtype=np.float64)
+        reemission_bands = np.zeros((n_tri, n_bands), dtype=np.float64)
 
     # Atmospheric absorption: ~0.01 Np/m at 1 kHz, f^1.5 scaling.
     atmo_abs = 0.01 * (freq_hz / 1000.0) ** 1.5
@@ -1198,13 +1302,18 @@ def trace_cavity_scene(
         out_cap = 2_000_000
 
     # Build tracer and run.
+    # Pass diffusion as the dominant per-band diffuse fraction (mean across bands
+    # for tracers that only accept a 1-D diffusion array; full per-band array
+    # is stored in meta for consumers that can use it).
+    diffusion_1d = diffusion_bands.mean(axis=1) if diffusion_bands.ndim == 2 \
+                   else mat_props[:, 1]
     tracer = _CRayTracer(
         n_tri     = n_tri,
         verts     = verts.reshape(n_tri, 9),          # (n_tri, 9) ≡ (n_tri, 3, 3)
         normals   = normals,
         refl_re   = refl_re,
         refl_im   = refl_im,
-        diffusion = mat_props[:, 1],
+        diffusion = diffusion_1d,
         freq_hz   = freq_hz,
         speed_m_s = speed_m_s,
         atmo_abs  = atmo_abs,
@@ -1332,6 +1441,10 @@ def trace_cavity_scene(
         'surface_scalar':   disp_scalar,   # (n_disp_tri,)         float32
         # Legacy alias:
         'surface_illum':    disp_scalar,
+        # Spectral material emission / re-emission (full n_tri, not just display):
+        'emission_bands':   emission_bands.astype(np.float32),   # (n_tri, n_bands)
+        'reemission_bands': reemission_bands.astype(np.float32), # (n_tri, n_bands)
+        'diffusion_bands':  diffusion_bands.astype(np.float32),  # (n_tri, n_bands)
         # Global field integration (sensor-independent, GL shader seed):
         'scene_field':      scene_field,   # SceneFieldIntegration
     }

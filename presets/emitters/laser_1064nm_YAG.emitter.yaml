@@ -1,0 +1,39 @@
+name: laser_1064nm_YAG
+spectral:
+  model: gaussian
+  temperature_K: 6500.0
+  center_um: 1.064
+  sigma_um: 5.0e-05
+  fwhm_um: 0.002
+  wavelengths_um: []
+  weights: []
+  radiant_exitance: 1.0
+phase:
+  model: coherent
+  coherence_length_um: 200000000.0
+  phase_offset_rad: 0.0
+  temporal_coherence_s: 0.0
+directional:
+  model: gaussian_beam
+  beam_waist_um: 800.0
+  divergence_half_angle_rad: 0.0
+  center_wavelength_um: 1.064
+  numerical_aperture: 0.5
+  half_angle_rad: 0.5235987755982988
+  hg_g: 0.0
+polarization:
+  mode: linear
+  angle_deg: 0.0
+  handedness: 1
+  jones:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  degree_of_polarization: 1.0
+display_tint:
+- 0.7
+- 0.2
+- 0.0
+label: Nd:YAG 1064 nm fundamental CW
+notes: Nd:YAG 1064 nm fundamental. Near-IR, invisible.

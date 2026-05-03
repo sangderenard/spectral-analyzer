@@ -1,0 +1,188 @@
+# configs/room_station/scene.yaml
+# Initial placement of all objects in the room.
+# RoomWorkspace reads this and populates its object registry.
+#
+# pos: [x, y, z]  — world space; floor = z=0, +Y forward (depth into room), +Z up
+# yaw_deg: rotation around +Z axis
+
+objects:
+
+  # ── Rectangular enclosure (small 2×2 simulator) ───────────────────────────
+  - id: enc_rect_small
+    type: enclosure
+    label: "Sim — Rect (small)"
+    pos: [-3.5, 2.5, 0.0]
+    yaw_deg: 0.0
+    shape: rect
+    dims:
+      width_m:  1.0
+      depth_m:  1.0
+      height_m: 1.2
+      glass_thickness_m: 0.018
+      bevel_segs: 6
+    glass_color:  [0.15, 0.55, 0.90, 0.28]
+    skirt_color:  [0.10, 0.12, 0.16, 0.85]
+    wireframe_color: [0.20, 0.80, 1.00, 0.60]
+    simulator:
+      n_items: 4
+      plugin_id: spring_mass
+
+  # ── Cylindrical enclosure (medium 3×3 simulator) ─────────────────────────
+  - id: enc_cyl_medium
+    type: enclosure
+    label: "Sim — Cylinder (medium)"
+    pos: [0.0, 3.5, 0.0]
+    yaw_deg: 0.0
+    shape: cyl
+    dims:
+      radius_m: 0.85
+      height_m: 1.60
+      glass_thickness_m: 0.018
+      lon_segs: 28
+    glass_color:  [0.20, 0.65, 0.40, 0.28]
+    skirt_color:  [0.08, 0.14, 0.10, 0.85]
+    wireframe_color: [0.40, 1.00, 0.60, 0.60]
+    simulator:
+      n_items: 9
+      plugin_id: orchestral_resonance
+
+  # ── Spherical enclosure (large 4×4 simulator on pedestal) ─────────────────
+  - id: enc_sphere_large
+    type: enclosure
+    label: "Sim — Sphere (large)"
+    pos: [3.5, 3.0, 0.0]
+    yaw_deg: 0.0
+    shape: sphere
+    dims:
+      radius_m: 1.10
+      glass_thickness_m: 0.020
+      lat_segs: 18
+      lon_segs: 28
+      pedestal_radius_m: 0.30
+      pedestal_height_m: 0.90
+    glass_color:  [0.70, 0.30, 0.90, 0.25]
+    wireframe_color: [0.90, 0.50, 1.00, 0.55]
+    simulator:
+      n_items: 16
+      plugin_id: bound_particle_circle
+
+  # ── Rectangular glass tablet (floating panel) ─────────────────────────────
+  - id: tablet_rect_1
+    type: enclosure
+    label: "Tablet — Rect"
+    pos: [-3.5, 5.0, 2.0]
+    yaw_deg: 30.0
+    shape: tablet_rect
+    dims:
+      width_m:  1.80
+      height_m: 1.00
+      gap_m:    0.012
+      glass_thickness_m: 0.006
+    glass_color: [0.30, 0.70, 1.00, 0.38]
+    wireframe_color: [0.50, 0.90, 1.00, 0.70]
+
+  # ── Polar glass tablet (floating disk pair) ───────────────────────────────
+  - id: tablet_polar_1
+    type: enclosure
+    label: "Tablet — Polar"
+    pos: [3.5, 5.0, 2.0]
+    yaw_deg: -20.0
+    shape: tablet_polar
+    dims:
+      radius_m: 0.75
+      gap_m:    0.010
+      glass_thickness_m: 0.005
+      segs: 32
+    glass_color: [0.90, 0.55, 0.20, 0.35]
+    wireframe_color: [1.00, 0.80, 0.40, 0.65]
+
+  # ── Fabricator station ────────────────────────────────────────────────────
+  - id: fabricator_1
+    type: duty_station
+    label: "Fabricator"
+    pos: [-2.5, 7.5, 0.0]
+    yaw_deg: 160.0
+    station_type: fabricator
+    config_dir: configs/duty_stations/fabricator
+    interaction_radius: 2.0
+
+  # ── Room configuration station ────────────────────────────────────────────
+  # Mounted flush against the north wall.  Lets the player adjust per-quadrant
+  # room geometry (rectangular / cylindrical / spherical) on a meter grid.
+  - id: room_station_1
+    type: duty_station
+    label: "Room Config"
+    pos: [0.0, 9.0, 0.0]
+    yaw_deg: 180.0
+    station_type: room
+    config_dir: configs/room_station
+    interaction_radius: 2.0
+
+  # ── Camera items ──────────────────────────────────────────────────────────
+  # Physical cameras on armatures.  Player walks up and presses E to operate.
+
+  - id: camera_sw
+    type: camera
+    label: "Camera SW"
+    pos: [-4.5, 1.0, 0.0]
+    yaw_deg: 45.0
+    mesh_id: camera_35mm
+    sensor_name: full_frame_35mm
+    lens_name: standard_35mm
+    focal_min_mm: 35.0
+    focal_max_mm: 35.0      # prime lens — +/- has no effect
+    focal_mm: 35.0
+    interaction_radius: 1.5
+    pan_deg: 0.0
+    tilt_deg: 0.0
+
+  - id: camera_se
+    type: camera
+    label: "Camera SE"
+    pos: [4.5, 1.0, 0.0]
+    yaw_deg: 135.0
+    mesh_id: camera_video
+    sensor_name: aps_c
+    lens_name: zoom_24_70
+    focal_min_mm: 24.0
+    focal_max_mm: 70.0      # zoom lens — +/- sweeps 24–70 mm
+    focal_mm: 35.0
+    interaction_radius: 1.5
+    pan_deg: 0.0
+    tilt_deg: 0.0
+
+  # ── Ceiling lights ────────────────────────────────────────────────────────
+  - id: light_a
+    type: light
+    label: "Ceiling Light A"
+    pos: [-3.0, 3.0, 3.8]
+    kind: point
+    color:     [1.00, 0.95, 0.88]
+    intensity: 1.2
+    radius_m:  8.0
+
+  - id: light_b
+    type: light
+    label: "Ceiling Light B"
+    pos: [0.0, 5.0, 3.8]
+    kind: point
+    color:     [1.00, 0.95, 0.88]
+    intensity: 1.2
+    radius_m:  8.0
+
+  - id: light_c
+    type: light
+    label: "Ceiling Light C"
+    pos: [3.0, 3.0, 3.8]
+    kind: point
+    color:     [1.00, 0.95, 0.88]
+    intensity: 1.2
+    radius_m:  8.0
+
+  # ── Portal frame (stub — not yet functional) ──────────────────────────────
+  - id: portal_exit
+    type: portal
+    label: "Portal (stub)"
+    pos: [0.0, 9.5, 0.0]
+    yaw_deg: 180.0
+    target_room_id: ""

@@ -74,6 +74,10 @@ struct Triangle {
     V3d normal;  /* outward unit normal */
     double diffusion;
     VXcd refl;   /* complex reflectance per band */
+    /* Physical optics fields (defaults = opaque mirror / air-air boundary) */
+    double n_in  = 1.0;  /* IOR of the medium the outward normal points toward   */
+    double n_out = 1.0;  /* IOR of the medium on the other side (inside solid)   */
+    int    flags = 0;    /* RT_TRI_FLAG_TRANSMISSIVE | RT_TRI_FLAG_APERTURE_STOP */
 };
 
 /* ── Möller-Trumbore ray-triangle intersection ─────────────────────────────── */
@@ -313,13 +317,30 @@ static inline void write_segment(
 /* ── RayTracerState ─────────────────────────────────────────────────────────── */
 
 struct RayTracerState {
-    std::vector<Triangle> tris;
-    std::vector<BVHNode>  bvh_nodes;
-    std::vector<int>      bvh_tri_ids;
-    std::vector<double>   tri_areas;   /* area of each triangle (m²) */
-    int                   n_bands = 0;
-    Eigen::VectorXd       k_real;      /* 2π f_n / c  (wavenumber) */
-    Eigen::VectorXd       atmo_abs;    /* Np/m per band */
+    std::vector<Triangle>       tris;
+    std::vector<BVHNode>        bvh_nodes;
+    std::vector<int>            bvh_tri_ids;
+    std::vector<double>         tri_areas;   /* area of each triangle (m²) */
+    int                         n_bands = 0;
+    Eigen::VectorXd             k_real;      /* 2π f_n / c  (wavenumber, ambient) */
+    Eigen::VectorXd             atmo_abs;    /* Np/m per band */
+    std::vector<RtScaleContext> scale_contexts; /* multi-scale zones, smallest-radius-first */
+    double                      speed_m_s = 343.0; /* cached for context k scaling */
+    Eigen::VectorXd             freq_hz_vec; /* cached for context k scaling */
+
+    /* ── Stateful ray scheduler ─────────────────────────────────────────────
+     * ray_pool[i]        : persistent state for live ray i
+     * ray_amp_pool[i*nb + b] : complex amplitude for ray i band b
+     * geo_queue          : ray indices currently in the coarse geometric stage
+     * ctx_queues[ci]     : ray indices currently inside scale_contexts[ci]
+     * live_max_bounces   : set by ray_tracer_spawn, kills ray after N bounces
+     * live_min_amplitude : set by ray_tracer_spawn, kills ray when |A| < this */
+    std::vector<RtRayState>           ray_pool;
+    std::vector<cd>                   ray_amp_pool;   /* [ray_id * n_bands + b] */
+    std::vector<int>                  geo_queue;
+    std::vector<std::vector<int>>     ctx_queues;     /* one per scale context  */
+    int                               live_max_bounces   = 8;
+    double                            live_min_amplitude = 0.005;
 };
 
 /* ── Generic inner ray loop ─────────────────────────────────────────────────── */
@@ -596,6 +617,8 @@ RayTracerState* ray_tracer_create(
     st->n_bands  = n_bands;
     st->k_real   = Eigen::VectorXd(n_bands);
     st->atmo_abs = Eigen::VectorXd::Map(atmo_abs, n_bands);
+    st->speed_m_s   = speed_m_s;
+    st->freq_hz_vec = Eigen::VectorXd::Map(freq_hz, n_bands);
 
     for (int b = 0; b < n_bands; ++b)
         st->k_real[b] = TWO_PI * freq_hz[b] / speed_m_s;
@@ -1012,3 +1035,1282 @@ int ray_tracer_trace_integrate_image(
     *out_count = count;
     return SK_OK;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Multi-scale context system
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Physical optics surface helpers ────────────────────────────────────── */
+
+/**
+ * Exact Snell's law refraction in 3-D.
+ *
+ * dir        : incident direction (normalised, pointing TOWARD the surface)
+ * surf_normal: outward surface normal (pointing INTO the incident medium, n1)
+ * n1         : IOR of the incident medium
+ * n2         : IOR of the transmitted medium
+ * refracted  : [out] refracted direction (normalised) — valid only when true
+ *
+ * Returns false on total internal reflection (sin²θt > 1).
+ */
+static bool snell_refract(
+    const V3d& dir, const V3d& surf_normal,
+    double n1, double n2,
+    V3d& refracted)
+{
+    /* cos_i > 0 when the normal opposes the incident ray (standard convention). */
+    double cos_i   = -dir.dot(surf_normal);
+    double n_ratio = n1 / n2;
+    double sin2_t  = n_ratio * n_ratio * (1.0 - cos_i * cos_i);
+    if (sin2_t > 1.0) return false;      /* TIR */
+    double cos_t  = std::sqrt(1.0 - sin2_t);
+    refracted = (n_ratio * dir + (n_ratio * cos_i - cos_t) * surf_normal).normalized();
+    return true;
+}
+
+/**
+ * Fresnel power reflectance for unpolarised light (average of s and p).
+ *
+ * cos_i : cosine of angle of incidence  (≥ 0)
+ * cos_t : cosine of angle of refraction (≥ 0, 0 on TIR → returns 1)
+ * n1/n2 : IOR of incident / transmitted media
+ *
+ * Returns R ∈ [0, 1].  T = 1 − R by energy conservation.
+ */
+static double fresnel_R(
+    double cos_i, double cos_t,
+    double n1,    double n2)
+{
+    if (cos_i < EPS || cos_t < EPS) return 1.0;   /* grazing or TIR */
+    double rs = (n1 * cos_i - n2 * cos_t) / (n1 * cos_i + n2 * cos_t);
+    double rp = (n2 * cos_i - n1 * cos_t) / (n2 * cos_i + n1 * cos_t);
+    return 0.5 * (rs * rs + rp * rp);
+}
+
+
+/* Returns false when no intersection. */
+static bool ray_sphere_intersect(
+    const V3d& orig, const V3d& dir,
+    const V3d& center, double radius,
+    double& t_enter, double& t_exit)
+{
+    V3d oc = orig - center;
+    double b    = oc.dot(dir);
+    double c    = oc.squaredNorm() - radius * radius;
+    double disc = b * b - c;
+    if (disc < 0.0) return false;
+    double sq = std::sqrt(disc);
+    t_enter = -b - sq;
+    t_exit  = -b + sq;
+    return t_exit > EPS;
+}
+
+/* Write one multiscale segment record (RT_FLOATS_PER_SEG_MS = 14 floats). */
+static inline void write_seg_ms(
+    float* buf, int& count, int cap,
+    const V3d& p0, const V3d& p1,
+    int src_id, int bounce, int band,
+    cd amp, double path_len,
+    int context_id, int scale_type)
+{
+    if (count >= cap) return;
+    float* s = buf + static_cast<size_t>(count) * RT_FLOATS_PER_SEG_MS;
+    s[0]  = static_cast<float>(p0.x());
+    s[1]  = static_cast<float>(p0.y());
+    s[2]  = static_cast<float>(p0.z());
+    s[3]  = static_cast<float>(p1.x());
+    s[4]  = static_cast<float>(p1.y());
+    s[5]  = static_cast<float>(p1.z());
+    s[6]  = static_cast<float>(src_id);
+    s[7]  = static_cast<float>(bounce);
+    s[8]  = static_cast<float>(band);
+    s[9]  = static_cast<float>(std::abs(amp));
+    s[10] = static_cast<float>(std::arg(amp));
+    s[11] = static_cast<float>(path_len);
+    s[12] = static_cast<float>(context_id);
+    s[13] = static_cast<float>(scale_type);
+    ++count;
+}
+
+/* Propagate 'amp' in-place through 'dist' metres in 'ctx' (NULL = ambient),
+ * then write one segment record per band. */
+static inline void propagate_ms(
+    VXcd& amp,
+    const RayTracerState& st,
+    const RtScaleContext* ctx,
+    double dist,
+    double path_len_start,
+    const V3d& p0, const V3d& p1,
+    int si, int bounce,
+    float* out_segs, int& seg_count, int seg_cap,
+    int context_id)
+{
+    const int    n_bands = st.n_bands;
+    const int    scale_t = (ctx && ctx->scale_type == RT_SCALE_WAVE)
+                             ? RT_SCALE_WAVE : RT_SCALE_GEOMETRIC;
+    const double n_re    = ctx ? ctx->n_real : 1.0;
+    const double n_im    = ctx ? ctx->n_imag : 0.0;
+    const double c       = st.speed_m_s;
+
+    for (int b = 0; b < n_bands; ++b) {
+        double f_hz  = st.freq_hz_vec[b];
+        double k_ctx = TWO_PI * f_hz * n_re / c;
+        double alpha = TWO_PI * f_hz * n_im / c + st.atmo_abs[b];
+
+        double kt     = k_ctx * dist;
+        double decay  = std::exp(-alpha * dist);
+        double spread;
+        if (scale_t == RT_SCALE_WAVE) {
+            double r_tot = path_len_start + dist;
+            spread = 1.0 / (1.0 + r_tot * r_tot);
+        } else {
+            spread = 1.0 / (1.0 + path_len_start + dist * 0.5);
+        }
+        cd prop(decay * spread * std::cos(kt),
+                decay * spread * std::sin(kt));
+        amp[b] *= prop;
+        write_seg_ms(out_segs, seg_count, seg_cap,
+                     p0, p1, si, bounce, b, amp[b],
+                     path_len_start, context_id, scale_t);
+    }
+}
+
+/* Core multiscale inner loop.
+ * HitFn2: (si, bounce, hit_tri, incoming_dir, surface_normal,
+ *           amp_at_surface, p0, hit_pos, total_path) -> bool */
+template<typename HitFn2>
+static void trace_rays_multiscale(
+    const RayTracerState& st,
+    int n_sources, const double* src_pos,
+    const double* src_dir, const double* src_directivity,
+    int n_rays, int max_bounces, double min_amplitude,
+    std::mt19937_64& rng,
+    float* out_segs, int seg_cap, int& seg_count,
+    HitFn2&& hit_fn)
+{
+    const int  n_bands = st.n_bands;
+    const bool has_bvh = !st.bvh_nodes.empty();
+    const int  n_ctx   = static_cast<int>(st.scale_contexts.size());
+
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    VXcd amp(n_bands);
+    VXcd amp_surf(n_bands);
+
+    struct Interval { double t0, t1; int ci; };
+    std::vector<Interval> intervals;
+    intervals.reserve(static_cast<size_t>(std::max(n_ctx, 1)));
+
+    for (int si = 0; si < n_sources; ++si) {
+        V3d src_p(src_pos[si*3], src_pos[si*3+1], src_pos[si*3+2]);
+        V3d src_d = V3d(src_dir[si*3], src_dir[si*3+1], src_dir[si*3+2]).normalized();
+        double dirpow = src_directivity[si];
+
+        for (int ri = 0; ri < n_rays; ++ri) {
+            V3d  dir  = fibonacci_sphere_dir(ri, n_rays, src_d);
+            double cos_a      = dir.dot(src_d);
+            double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
+            if (dir_weight < 0.01) continue;
+
+            for (int b = 0; b < n_bands; ++b)
+                amp[b] = cd(dir_weight, 0.0);
+
+            V3d    pos      = src_p;
+            double path_len = 0.0;
+            V3d    cur_dir  = dir;
+
+            for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                double t_hit   = 1e18;
+                int    hit_tri = -1;
+
+                if (has_bvh) {
+                    V3d inv_dir = cur_dir.cwiseInverse();
+                    bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
+                              pos, cur_dir, inv_dir, t_hit, hit_tri);
+                } else {
+                    for (size_t ti = 0; ti < st.tris.size(); ++ti) {
+                        double t;
+                        if (ray_triangle_hit(pos, cur_dir, st.tris[ti], t) && t < t_hit) {
+                            t_hit   = t;
+                            hit_tri = static_cast<int>(ti);
+                        }
+                    }
+                }
+                if (hit_tri < 0) break;
+
+                V3d hit_pos = pos + t_hit * cur_dir;
+
+                /* Build context intervals for this segment [0, t_hit]. */
+                intervals.clear();
+                for (int ci = 0; ci < n_ctx; ++ci) {
+                    const RtScaleContext& ctx = st.scale_contexts[static_cast<size_t>(ci)];
+                    V3d ctr(ctx.center[0], ctx.center[1], ctx.center[2]);
+                    double te, tx;
+                    if (ray_sphere_intersect(pos, cur_dir, ctr, ctx.radius, te, tx)) {
+                        te = std::max(te, 0.0);
+                        tx = std::min(tx, t_hit);
+                        if (te < tx - EPS)
+                            intervals.push_back({te, tx, ci});
+                    }
+                }
+                std::sort(intervals.begin(), intervals.end(),
+                          [](const Interval& a, const Interval& b){ return a.t0 < b.t0; });
+
+                /* Walk segment sub-regions. */
+                amp_surf = amp;
+                double t_walk    = 0.0;
+                double path_here = path_len;
+
+                auto coarse_sub = [&](double ta, double tb) {
+                    if (tb - ta < EPS) return;
+                    V3d p0s = pos + ta * cur_dir;
+                    V3d p1s = pos + tb * cur_dir;
+                    propagate_ms(amp_surf, st, nullptr, tb - ta,
+                                 path_here, p0s, p1s,
+                                 si, bounce, out_segs, seg_count, seg_cap, -1);
+                    path_here += tb - ta;
+                };
+                auto wave_sub = [&](double ta, double tb, int ci) {
+                    if (tb - ta < EPS) return;
+                    const RtScaleContext& ctx = st.scale_contexts[static_cast<size_t>(ci)];
+                    double remaining = tb - ta;
+                    double dt_m      = (ctx.dt_m > EPS) ? ctx.dt_m : remaining;
+                    int sub_steps = std::max(1,
+                        std::min(ctx.n_substeps, static_cast<int>(std::ceil(remaining / dt_m))));
+                    double t_sub = ta;
+                    for (int ss = 0; ss < sub_steps && remaining > EPS; ++ss) {
+                        double step = std::min(dt_m, remaining);
+                        V3d p0s = pos + t_sub * cur_dir;
+                        V3d p1s = p0s + step * cur_dir;
+                        propagate_ms(amp_surf, st, &ctx, step,
+                                     path_here, p0s, p1s,
+                                     si, bounce, out_segs, seg_count, seg_cap, ci);
+                        path_here += step;
+                        t_sub     += step;
+                        remaining -= step;
+                    }
+                };
+
+                for (const Interval& iv : intervals) {
+                    if (iv.t0 > t_walk + EPS) coarse_sub(t_walk, iv.t0);
+                    const RtScaleContext& ctx = st.scale_contexts[static_cast<size_t>(iv.ci)];
+                    if (ctx.scale_type == RT_SCALE_WAVE)
+                        wave_sub(iv.t0, iv.t1, iv.ci);
+                    else
+                        coarse_sub(iv.t0, iv.t1);
+                    t_walk = iv.t1;
+                }
+                coarse_sub(t_walk, t_hit);
+
+                double total_path = path_len + t_hit;
+
+                V3d hit_n = st.tris[static_cast<size_t>(hit_tri)].normal;
+                if (cur_dir.dot(hit_n) > 0.0) hit_n = -hit_n;
+
+                double max_abs = 0.0;
+                for (int b = 0; b < n_bands; ++b) {
+                    double a = std::abs(amp_surf[b]);
+                    if (a > max_abs) max_abs = a;
+                }
+
+                bool cont = hit_fn(si, bounce, hit_tri, cur_dir, hit_n,
+                                   amp_surf, pos, hit_pos, total_path);
+                if (!cont) goto ms_done;
+
+                const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
+                if (max_abs < min_amplitude) break;
+
+                /* ── Surface interaction ──────────────────────────────────── */
+                if (tri.flags & RT_TRI_FLAG_APERTURE_STOP) {
+                    /* Blade material: absorb.  Diffraction is handled
+                     * physically — the dense coherent ray field that passes
+                     * through the blade gaps is accumulated by project_coherent
+                     * and propagated to the sensor by rs_propagate (exact
+                     * Rayleigh-Sommerfeld).  No secondary wavelets needed. */
+                    break;
+
+                } else if ((tri.flags & RT_TRI_FLAG_TRANSMISSIVE)
+                           && tri.n_in > EPS && tri.n_out > EPS
+                           && std::abs(tri.n_out - tri.n_in) > 1e-6)
+                {
+                    /* Exact Snell's law refraction with angle-dependent Fresnel.
+                     * n_in  = IOR of the medium the outward normal points toward.
+                     * n_out = IOR of the medium on the other side.
+                     * entering: ray going AGAINST the outward normal → ray enters
+                     *           the glass body (air→glass for a front surface). */
+                    bool entering = (cur_dir.dot(tri.normal) < 0.0);
+                    double n1 = entering ? tri.n_in  : tri.n_out;
+                    double n2 = entering ? tri.n_out : tri.n_in;
+
+                    /* hit_n is already flipped to oppose cur_dir. */
+                    double cos_i = std::max(0.0, -cur_dir.dot(hit_n));
+                    V3d refracted;
+                    bool can_refract = snell_refract(cur_dir, hit_n, n1, n2, refracted);
+
+                    if (!can_refract) {
+                        /* TIR: perfect specular reflection, apply surface refl. */
+                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                        for (int b = 0; b < n_bands; ++b)
+                            amp[b] = amp_surf[b] * tri.refl[b];
+                    } else {
+                        double sin2_t = (n1/n2) * (n1/n2) * (1.0 - cos_i * cos_i);
+                        double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
+                        double R      = fresnel_R(cos_i, cos_t, n1, n2);
+                        if (U(rng) < R) {
+                            /* Probabilistic reflection (Russian roulette, unbiased). */
+                            cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                            for (int b = 0; b < n_bands; ++b)
+                                amp[b] = amp_surf[b] * tri.refl[b];
+                        } else {
+                            /* Transmission: exact Snell direction, no refl scaling.
+                             * MC probability (1-R) handles energy balance. */
+                            cur_dir = refracted;
+                            for (int b = 0; b < n_bands; ++b)
+                                amp[b] = amp_surf[b];
+                        }
+                    }
+
+                } else {
+                    /* Opaque surface: Lambertian or specular reflection. */
+                    for (int b = 0; b < n_bands; ++b)
+                        amp[b] = amp_surf[b] * tri.refl[b];
+                    if (U(rng) < tri.diffusion) {
+                        cur_dir = cosine_hemisphere(hit_n, rng);
+                    } else {
+                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                        if (cur_dir.dot(hit_n) < 0.0)
+                            cur_dir = cosine_hemisphere(hit_n, rng);
+                    }
+                }
+
+                pos       = hit_pos + cur_dir * (EPS * 200.0);
+                path_len += t_hit;
+            }
+            continue;
+ms_done:
+            break;
+        }
+    }
+}
+
+/* ── Scale context C API ─────────────────────────────────────────────────── */
+
+int ray_tracer_add_scale_context(RayTracerState* st, RtScaleContext* ctx)
+{
+    if (!st || !ctx) return SK_ERR_NULL_STATE;
+    ctx->context_id = static_cast<int>(st->scale_contexts.size());
+    st->scale_contexts.push_back(*ctx);
+    /* Keep sorted smallest-radius-first so inner zones take priority. */
+    std::sort(st->scale_contexts.begin(), st->scale_contexts.end(),
+              [](const RtScaleContext& a, const RtScaleContext& b){
+                  return a.radius < b.radius;
+              });
+    return ctx->context_id;
+}
+
+int ray_tracer_clear_scale_contexts(RayTracerState* st)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    st->scale_contexts.clear();
+    return SK_OK;
+}
+
+int ray_tracer_trace_multiscale(
+    RayTracerState* st,
+    int             n_sources,
+    const double*   src_pos,
+    const double*   src_dir,
+    const double*   src_directivity,
+    int             n_rays,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    float*          out_segs,
+    int             out_cap,
+    int*            out_count)
+{
+    if (!st || !out_segs || !out_count) return SK_ERR_NULL_STATE;
+    *out_count = 0;
+    int count = 0;
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+
+    trace_rays_multiscale(
+        *st,
+        n_sources, src_pos, src_dir, src_directivity,
+        n_rays, max_bounces, min_amplitude, rng,
+        out_segs, out_cap, count,
+        [](int, int, int, const V3d&, const V3d&,
+           const VXcd&, const V3d&, const V3d&, double) -> bool {
+            return true;
+        });
+
+    *out_count = count;
+    return SK_OK;
+}
+
+int ray_tracer_trace_multiscale_surface(
+    RayTracerState* st,
+    int             n_sources,
+    const double*   src_pos,
+    const double*   src_dir,
+    const double*   src_directivity,
+    int             n_rays,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    float*          out_segs,
+    int             out_cap,
+    int*            out_count,
+    float*          out_direct,
+    float*          out_indirect)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    if (out_count) *out_count = 0;
+
+    const int    n_bands = st->n_bands;
+    const int    n_tri   = static_cast<int>(st->tris.size());
+    static constexpr double AREA_EPS = 1e-12;
+
+    int count = 0;
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+
+    trace_rays_multiscale(
+        *st,
+        n_sources, src_pos, src_dir, src_directivity,
+        n_rays, max_bounces, min_amplitude, rng,
+        out_segs, out_cap, count,
+        [&](int, int bounce, int hit_tri,
+            const V3d& incoming_dir, const V3d& surface_normal,
+            const VXcd& amp_prop,
+            const V3d&, const V3d&, double) -> bool
+        {
+            if (hit_tri >= 0 && hit_tri < n_tri) {
+                double area     = st->tri_areas[static_cast<size_t>(hit_tri)];
+                double cos_in   = std::max(0.0, -incoming_dir.dot(surface_normal));
+                double inv_area = cos_in / std::max(area, AREA_EPS);
+                size_t base     = static_cast<size_t>(hit_tri) * n_bands;
+                float* dest     = (bounce == 0 && out_direct) ? out_direct : out_indirect;
+                if (dest) {
+                    for (int b = 0; b < n_bands; ++b)
+                        dest[base + b] += static_cast<float>(std::norm(amp_prop[b]) * inv_area);
+                }
+            }
+            return true;
+        });
+
+    if (out_count) *out_count = count;
+    return SK_OK;
+}
+
+/* ── Physical optics extension API ───────────────────────────────────────── */
+
+int ray_tracer_set_tri_ior(
+    RayTracerState* st,
+    int             tri_start,
+    int             n_tris,
+    double          n_in,
+    double          n_out,
+    int             flags)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    int n_total = static_cast<int>(st->tris.size());
+    int end     = std::min(tri_start + n_tris, n_total);
+    for (int i = tri_start; i < end; ++i) {
+        st->tris[static_cast<size_t>(i)].n_in  = n_in;
+        st->tris[static_cast<size_t>(i)].n_out = n_out;
+        st->tris[static_cast<size_t>(i)].flags = flags;
+    }
+    return SK_OK;
+}
+
+/**
+ * Project multiscale segments onto a coherent complex sensor image.
+ *
+ * Finds every segment that straddles z = sensor_z, maps it to a pixel, and
+ * accumulates E = amp · exp(i·phase) into out_re / out_im:
+ *   out_re[b][py][px] += amp · cos(phase)
+ *   out_im[b][py][px] += amp · sin(phase)
+ *
+ * Squared modulus out_re² + out_im² is the coherent intensity including
+ * interference fringes, Airy rings, speckle, etc.
+ *
+ * Pixel mapping:
+ *   sx ∈ [−sensor_r, +sensor_r]  →  px ∈ [0, sensor_w)
+ *   sy ∈ [−sensor_r, +sensor_r]  →  py ∈ [0, sensor_h)
+ *   pixel_pitch = 2·sensor_r / max(sensor_w, sensor_h)
+ */
+int ray_tracer_project_coherent(
+    int             n_segs,
+    const float*    segs,
+    int             n_bands,
+    int             sensor_w,
+    int             sensor_h,
+    double          sensor_z,
+    double          sensor_r,
+    float*          out_re,
+    float*          out_im)
+{
+    if (!segs || !out_re || !out_im || n_segs <= 0) return SK_ERR_NULL_STATE;
+    double pixel_pitch = (2.0 * sensor_r)
+                         / static_cast<double>(std::max(sensor_w, sensor_h));
+
+    for (int i = 0; i < n_segs; ++i) {
+        const float* s = segs + static_cast<size_t>(i) * RT_FLOATS_PER_SEG_MS;
+        double x0 = s[0], y0 = s[1], z0 = s[2];
+        double x1 = s[3], y1 = s[4], z1 = s[5];
+        int    b   = static_cast<int>(s[8]);
+        double amp = s[9], phase = s[10];
+
+        if (b < 0 || b >= n_bands) continue;
+
+        double dz = z1 - z0;
+        if (std::abs(dz) < 1e-12) continue;
+        double t = (sensor_z - z0) / dz;
+        if (t < 0.0 || t > 1.0) continue;
+
+        double sx = x0 + t * (x1 - x0);
+        double sy = y0 + t * (y1 - y0);
+
+        int px = static_cast<int>((sx + sensor_r) / pixel_pitch);
+        int py = static_cast<int>((sy + sensor_r) / pixel_pitch);
+        if (px < 0 || px >= sensor_w) continue;
+        if (py < 0 || py >= sensor_h) continue;
+
+        int idx = (b * sensor_h + py) * sensor_w + px;
+        out_re[idx] += static_cast<float>(amp * std::cos(phase));
+        out_im[idx] += static_cast<float>(amp * std::sin(phase));
+    }
+    return SK_OK;
+}
+
+/* ── Near-field physical aperture simulation ─────────────────────────────── */
+
+/**
+ * Point-in-polygon test using the crossing number algorithm.
+ * Returns true if (px, py) is inside the polygon defined by n_verts pairs
+ * of (x,y) coordinates stored interleaved in poly_xy[i*2], poly_xy[i*2+1].
+ */
+static bool _point_in_polygon(double px, double py,
+                               int n_verts, const float* poly_xy)
+{
+    if (n_verts < 3) return false;
+    int crossings = 0;
+    for (int i = 0, j = n_verts - 1; i < n_verts; j = i++) {
+        double xi = poly_xy[i * 2],     yi = poly_xy[i * 2 + 1];
+        double xj = poly_xy[j * 2],     yj = poly_xy[j * 2 + 1];
+        /* Check if the horizontal ray from (px, py) rightward crosses edge j→i. */
+        bool straddles = ((yi > py) != (yj > py));
+        if (straddles) {
+            double x_cross = (xj - xi) * (py - yi) / (yj - yi) + xi;
+            if (px < x_cross) ++crossings;
+        }
+    }
+    return (crossings & 1) != 0;
+}
+
+int ray_tracer_apply_aperture_mask(
+    int             n_bands,
+    int             w,
+    int             h,
+    double          field_r,
+    int             n_verts,
+    const float*    poly_xy,
+    float*          re_buf,
+    float*          im_buf)
+{
+    if (!re_buf || !im_buf) return SK_ERR_NULL_STATE;
+    if (n_verts < 3 || !poly_xy) return SK_ERR_NULL_STATE;
+
+    double pixel_pitch = (2.0 * field_r) / static_cast<double>(std::max(w, h));
+
+    for (int b = 0; b < n_bands; ++b) {
+        size_t band_off = static_cast<size_t>(b) * h * w;
+        for (int row = 0; row < h; ++row) {
+            /* pixel centre in world space */
+            double py_w = -field_r + (row + 0.5) * pixel_pitch;
+            for (int col = 0; col < w; ++col) {
+                double px_w = -field_r + (col + 0.5) * pixel_pitch;
+                if (!_point_in_polygon(px_w, py_w, n_verts, poly_xy)) {
+                    size_t idx = band_off + static_cast<size_t>(row) * w + col;
+                    re_buf[idx] = 0.0f;
+                    im_buf[idx] = 0.0f;
+                }
+            }
+        }
+    }
+    return SK_OK;
+}
+
+/**
+ * Exact scalar Rayleigh-Sommerfeld diffraction integral of the first kind.
+ *
+ * For each output pixel (ox, oy) on the observation plane at distance z_dist
+ * from the aperture plane:
+ *
+ *   U_out(ox, oy) = (dx²/2π) Σ_{ix,iy} U_in(ix, iy)
+ *                    × (z_dist / r²) × (ik − 1/r) × exp(ikr)
+ *
+ * where r = sqrt((ox−ix)² + (oy−iy)² + z_dist²).
+ * The dx² factor accounts for the area element dA of each input pixel.
+ *
+ * This direct-summation form is embarrassingly parallel: each output pixel
+ * is independent.  Use the companion GLSL compute shader for GPU execution.
+ */
+int ray_tracer_rs_propagate(
+    int             n_bands,
+    int             w,
+    int             h,
+    double          dx,
+    double          z_dist,
+    const double*   wavelengths_m,
+    const float*    in_re,
+    const float*    in_im,
+    float*          out_re,
+    float*          out_im)
+{
+    if (!in_re || !in_im || !out_re || !out_im || !wavelengths_m)
+        return SK_ERR_NULL_STATE;
+    if (z_dist <= 0.0 || dx <= 0.0 || w <= 0 || h <= 0 || n_bands <= 0)
+        return SK_ERR_NULL_STATE;
+
+    const size_t npix = static_cast<size_t>(w) * h;
+    const double dA   = dx * dx;
+    const double inv2pi = 1.0 / (2.0 * M_PI);
+
+    /* Clear output */
+    std::memset(out_re, 0, n_bands * npix * sizeof(float));
+    std::memset(out_im, 0, n_bands * npix * sizeof(float));
+
+    /* Pixel-centre coordinate arrays (flat x = col, y = row convention) */
+    std::vector<double> px_coords(static_cast<size_t>(w));
+    std::vector<double> py_coords(static_cast<size_t>(h));
+    /* Centre the grid symmetrically: x ∈ [-(w-1)/2, +(w-1)/2] × dx */
+    for (int c = 0; c < w; ++c) px_coords[c] = (c - 0.5 * (w - 1)) * dx;
+    for (int r = 0; r < h; ++r) py_coords[r] = (r - 0.5 * (h - 1)) * dx;
+
+    const double z2 = z_dist * z_dist;
+
+    for (int b = 0; b < n_bands; ++b) {
+        const double k      = 2.0 * M_PI / wavelengths_m[b];
+        const size_t boff   = static_cast<size_t>(b) * h * w;
+        const float* ire    = in_re  + boff;
+        const float* iim    = in_im  + boff;
+        float*       ore    = out_re + boff;
+        float*       oim    = out_im + boff;
+
+        /* For each output pixel */
+        for (int oy = 0; oy < h; ++oy) {
+            const double yo = py_coords[static_cast<size_t>(oy)];
+            for (int ox = 0; ox < w; ++ox) {
+                const double xo = px_coords[static_cast<size_t>(ox)];
+
+                double sum_re = 0.0, sum_im = 0.0;
+
+                /* Integrate over all input pixels */
+                for (int iy = 0; iy < h; ++iy) {
+                    const double dy = yo - py_coords[static_cast<size_t>(iy)];
+                    const double dy2 = dy * dy;
+                    for (int ix = 0; ix < w; ++ix) {
+                        const float u_re = ire[static_cast<size_t>(iy) * w + ix];
+                        const float u_im = iim[static_cast<size_t>(iy) * w + ix];
+                        if (u_re == 0.0f && u_im == 0.0f) continue; /* aperture mask zero */
+
+                        const double dx_  = xo - px_coords[static_cast<size_t>(ix)];
+                        const double r2   = dx_ * dx_ + dy2 + z2;
+                        const double r    = std::sqrt(r2);
+                        const double r3   = r2 * r;
+                        const double kr   = k * r;
+
+                        /* RS kernel: (z/r²) × (ik − 1/r) × exp(ikr) / (2π)
+                         * = (z / r²) × exp(ikr) × (ik − 1/r) / (2π)
+                         *
+                         * Split into real/imag:
+                         *   exp(ikr) = cos(kr) + i·sin(kr)
+                         *   (ik − 1/r) = -1/r + ik
+                         *   product = (-cos(kr)/r − k·sin(kr)) + i(−sin(kr)/r + k·cos(kr))
+                         */
+                        const double cos_kr = std::cos(kr);
+                        const double sin_kr = std::sin(kr);
+                        const double zfac   = z_dist * inv2pi / r2;  /* z/(2π r²) */
+
+                        /* kernel real and imag parts */
+                        const double ker_re = zfac * (-cos_kr / r - k * sin_kr);
+                        const double ker_im = zfac * (-sin_kr / r + k * cos_kr);
+
+                        /* Multiply kernel by input field (complex × complex):
+                         *   (a + ib)(c + id) = (ac − bd) + i(ad + bc)
+                         */
+                        const double a = u_re, b_v = u_im;
+                        const double c = ker_re, d = ker_im;
+                        sum_re += dA * (a * c - b_v * d);
+                        sum_im += dA * (a * d + b_v * c);
+                    }
+                }
+
+                ore[static_cast<size_t>(oy) * w + ox] = static_cast<float>(sum_re);
+                oim[static_cast<size_t>(oy) * w + ox] = static_cast<float>(sum_im);
+            }
+        }
+    }
+
+    return SK_OK;
+}
+
+/* ── Beam Propagation Method — batchwise PDE z-stepper ──────────────────────
+ *
+ * Solves ∂U/∂z = (i/2k) ∇_T² U  (paraxial Helmholtz PDE) using ADI
+ * Crank-Nicolson dimensional splitting.  Steps all n_bands simultaneously.
+ *
+ * Each call:
+ *   1.  Apply carrier phase   U *= exp(ik·dz)   (global z-advance of carrier)
+ *   2a. x-sweep (implicit x, explicit done in previous step):
+ *         (I − β Lx) U* = (I + β Lx) U
+ *       where β = i·dz/(4k·dx²), Lx = 1D 2nd-difference operator
+ *   2b. y-sweep (implicit y, explicit x already propagated):
+ *         (I − β Ly) U^{n+1} = (I + β Ly) U*
+ *
+ * Both sweeps use the Thomas algorithm (O(N) tridiagonal solve per row/col).
+ * Total cost: O(n_bands × w × h) per call.
+ *
+ * Boundary: Dirichlet U=0 at all four edges (absorbing frame).
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+int ray_tracer_wave_bpm_step(
+    int             n_bands,
+    int             w,
+    int             h,
+    double          dx,
+    double          dz,
+    const double*   wavelengths_m,
+    float*          re_buf,
+    float*          im_buf)
+{
+    if (!re_buf || !im_buf || !wavelengths_m)  return SK_ERR_NULL_STATE;
+    if (w < 2 || h < 2 || n_bands < 1 || dx <= 0.0 || dz == 0.0)
+        return SK_ERR_NULL_STATE;
+
+    const size_t npix = static_cast<size_t>(w) * h;
+    const double dx2  = dx * dx;
+    const int    maxn = std::max(w, h);
+
+    /* Working field: double-precision complex for accuracy */
+    std::vector<cd> field(npix);
+    std::vector<cd> tmp(npix);
+    /* Thomas algorithm scratch — one row or column at a time */
+    std::vector<cd> rhs(maxn);
+    std::vector<cd> c_prime(maxn);   /* upper-diagonal sweep coefficients  */
+    std::vector<cd> d_prime(maxn);   /* RHS sweep values                   */
+
+    /* Thomas algorithm for the uniform tridiagonal system:
+     *   -beta · x[i-1] + (1 + 2·beta) · x[i] - beta · x[i+1] = rhs[i]
+     * with Dirichlet x[0] = x[n-1] = 0.
+     * Solution is written back into rhs[0..n-1]. */
+    auto thomas = [&](int n, const cd& beta) {
+        const cd diag = cd(1.0, 0.0) + 2.0 * beta;
+        const cd off  = -beta;
+        rhs[0]     = cd(0.0, 0.0);   /* absorbing left/top boundary  */
+        rhs[n - 1] = cd(0.0, 0.0);   /* absorbing right/bottom boundary */
+        /* Forward sweep */
+        c_prime[0] = off / diag;
+        d_prime[0] = rhs[0] / diag;
+        for (int i = 1; i < n; ++i) {
+            const cd denom = diag - off * c_prime[i - 1];
+            c_prime[i]     = off / denom;
+            d_prime[i]     = (rhs[i] - off * d_prime[i - 1]) / denom;
+        }
+        /* Back substitution */
+        rhs[n - 1] = d_prime[n - 1];
+        for (int i = n - 2; i >= 0; --i)
+            rhs[i] = d_prime[i] - c_prime[i] * rhs[i + 1];
+    };
+
+    for (int b = 0; b < n_bands; ++b) {
+        const size_t boff = static_cast<size_t>(b) * npix;
+        const double lam  = wavelengths_m[b];
+        if (lam <= 0.0) continue;
+        const double k = 2.0 * M_PI / lam;
+
+        /* Load field (float32 → double complex) */
+        for (size_t i = 0; i < npix; ++i)
+            field[i] = cd(static_cast<double>(re_buf[boff + i]),
+                          static_cast<double>(im_buf[boff + i]));
+
+        /* ── Step 1: carrier phase advance  U *= exp(i k dz) ───────────── */
+        const double cos_kdz = std::cos(k * dz);
+        const double sin_kdz = std::sin(k * dz);
+        for (size_t i = 0; i < npix; ++i) {
+            const double re = field[i].real(), im = field[i].imag();
+            field[i] = cd(re * cos_kdz - im * sin_kdz,
+                          re * sin_kdz + im * cos_kdz);
+        }
+
+        /* ── Step 2: ADI diffraction  exp(i dz ∇_T² / 2k) ─────────────── *
+         * β = i dz / (4k dx²)  — ADI coupling coefficient                 */
+        const cd beta = cd(0.0, dz / (4.0 * k * dx2));
+
+        /* Half-step 2a: implicit in x, row by row ─────────────────────── */
+        for (int row = 0; row < h; ++row) {
+            const size_t rbase = static_cast<size_t>(row) * w;
+            for (int col = 0; col < w; ++col) {
+                const cd u  = field[rbase + col];
+                const cd uw = (col > 0)     ? field[rbase + col - 1] : cd(0.0, 0.0);
+                const cd ue = (col < w - 1) ? field[rbase + col + 1] : cd(0.0, 0.0);
+                /* RHS = (I + β Lx) u = u + β(uw + ue − 2u) */
+                rhs[col] = u + beta * (uw + ue - 2.0 * u);
+            }
+            thomas(w, beta);
+            for (int col = 0; col < w; ++col)
+                tmp[rbase + col] = rhs[col];
+        }
+
+        /* Half-step 2b: implicit in y, column by column ────────────────── */
+        for (int col = 0; col < w; ++col) {
+            for (int row = 0; row < h; ++row) {
+                const size_t idx = static_cast<size_t>(row) * w + col;
+                const cd u  = tmp[idx];
+                const cd un = (row > 0)     ? tmp[idx - w] : cd(0.0, 0.0);
+                const cd us = (row < h - 1) ? tmp[idx + w] : cd(0.0, 0.0);
+                rhs[row] = u + beta * (un + us - 2.0 * u);
+            }
+            thomas(h, beta);
+            for (int row = 0; row < h; ++row)
+                field[static_cast<size_t>(row) * w + col] = rhs[row];
+        }
+
+        /* Write back (double complex → float32) */
+        for (size_t i = 0; i < npix; ++i) {
+            re_buf[boff + i] = static_cast<float>(field[i].real());
+            im_buf[boff + i] = static_cast<float>(field[i].imag());
+        }
+    }
+
+    return SK_OK;
+}
+
+/* ── Stateful ray scheduler ──────────────────────────────────────────────────
+ *
+ * API: ray_tracer_spawn / ray_tracer_step / ray_tracer_clear_rays /
+ *      ray_tracer_live_ray_count
+ *
+ * Design: rays are persistent objects in ray_pool[], identified by integer
+ * index.  Their complex amplitudes live in ray_amp_pool[ray_id * n_bands + b].
+ * Queues are plain std::vector<int> holding ray indices:
+ *   geo_queue       — coarse geometric stage (BVH intersection jumps)
+ *   ctx_queues[ci]  — fine context ci (wave sub-stepping or geometric within
+ *                     the context sphere)
+ *
+ * Each call to ray_tracer_step() ticks every non-empty queue once, from
+ * coarsest (geo_queue, then largest-radius contexts) to finest (smallest-
+ * radius contexts last).  Rays move between queues as they enter or exit
+ * context spheres or bounce off surfaces.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/* Return the finest context index (smallest radius) that contains pos,
+ * or -1 if pos is outside all registered context spheres.
+ * scale_contexts is sorted smallest-radius-first, so the first match
+ * is already the finest. */
+static int ctx_for_pos(const RayTracerState& st, const V3d& pos)
+{
+    const int n = static_cast<int>(st.scale_contexts.size());
+    for (int ci = 0; ci < n; ++ci) {
+        const RtScaleContext& ctx = st.scale_contexts[static_cast<size_t>(ci)];
+        V3d ctr(ctx.center[0], ctx.center[1], ctx.center[2]);
+        if ((pos - ctr).squaredNorm() <= ctx.radius * ctx.radius)
+            return ci;
+    }
+    return -1;
+}
+
+/* Along the ray (pos, dir), find the nearest context-sphere *entry* in
+ * [EPS, t_max).  Skips the context the ray is already inside (current_ci).
+ * Sets t_enter_out and returns the context index, or -1 if none. */
+static int ctx_nearest_entry(
+    const RayTracerState& st,
+    const V3d& pos, const V3d& dir,
+    int current_ci, double t_max,
+    double& t_enter_out)
+{
+    double best_t  = t_max;
+    int    best_ci = -1;
+    const int n    = static_cast<int>(st.scale_contexts.size());
+    for (int ci = 0; ci < n; ++ci) {
+        if (ci == current_ci) continue;
+        const RtScaleContext& ctx = st.scale_contexts[static_cast<size_t>(ci)];
+        V3d ctr(ctx.center[0], ctx.center[1], ctx.center[2]);
+        double te, tx;
+        if (ray_sphere_intersect(pos, dir, ctr, ctx.radius, te, tx)) {
+            /* te > EPS means we are entering from outside this sphere */
+            if (te > EPS && te < best_t) {
+                best_t  = te;
+                best_ci = ci;
+            }
+        }
+    }
+    t_enter_out = best_t;
+    return best_ci;
+}
+
+/* Apply surface interaction to amp[]/dir, updating both in-place.
+ * Returns false if the ray is absorbed (aperture stop or bounce limit). */
+static bool apply_surface(
+    RayTracerState& st,
+    VXcd& amp, V3d& dir,
+    int hit_tri, int& bounce,
+    std::mt19937_64& rng,
+    std::uniform_real_distribution<double>& U)
+{
+    if (bounce >= st.live_max_bounces) return false;
+
+    const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
+    V3d hit_n = tri.normal;
+    if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
+
+    if (tri.flags & RT_TRI_FLAG_APERTURE_STOP) {
+        return false;  /* absorbed */
+    }
+
+    if ((tri.flags & RT_TRI_FLAG_TRANSMISSIVE)
+        && tri.n_in > EPS && tri.n_out > EPS
+        && std::abs(tri.n_out - tri.n_in) > 1e-6)
+    {
+        bool entering  = (dir.dot(tri.normal) < 0.0);
+        double n1      = entering ? tri.n_in  : tri.n_out;
+        double n2      = entering ? tri.n_out : tri.n_in;
+        double cos_i   = std::max(0.0, -dir.dot(hit_n));
+        V3d refracted;
+        bool ok        = snell_refract(dir, hit_n, n1, n2, refracted);
+        if (!ok) {
+            dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+        } else {
+            double s2t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
+            double ct  = std::sqrt(std::max(0.0, 1.0 - s2t));
+            double R   = fresnel_R(cos_i, ct, n1, n2);
+            dir = (U(rng) < R)
+                ? (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized()
+                : refracted;
+        }
+        for (int b = 0; b < st.n_bands; ++b) amp[b] *= tri.refl[b];
+    } else {
+        for (int b = 0; b < st.n_bands; ++b) amp[b] *= tri.refl[b];
+        if (U(rng) < tri.diffusion) {
+            dir = cosine_hemisphere(hit_n, rng);
+        } else {
+            dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+            if (dir.dot(hit_n) < 0.0)
+                dir = cosine_hemisphere(hit_n, rng);
+        }
+    }
+    ++bounce;
+    return true;
+}
+
+/* Advance a single ray one step using the given context (NULL = geometric).
+ * Updates rs and ray_amp_pool in st.  Writes segments.
+ * Returns the context_id to re-queue the ray in (-1 = geo, -2 = dead). */
+static int scheduler_advance_ray(
+    RayTracerState& st,
+    int ray_id, int current_ci,
+    std::mt19937_64& rng,
+    std::uniform_real_distribution<double>& U,
+    float* out_segs, int& seg_count, int seg_cap)
+{
+    RtRayState& rs = st.ray_pool[static_cast<size_t>(ray_id)];
+    if (!rs.alive) return -2;
+
+    const int n_bands = st.n_bands;
+    V3d pos(rs.pos[0], rs.pos[1], rs.pos[2]);
+    V3d dir(rs.dir[0], rs.dir[1], rs.dir[2]);
+
+    VXcd amp(n_bands);
+    const size_t amp_base = static_cast<size_t>(ray_id) * static_cast<size_t>(n_bands);
+    for (int b = 0; b < n_bands; ++b)
+        amp[b] = st.ray_amp_pool[amp_base + b];
+
+    /* ── Determine step distance ─────────────────────────────────────────── */
+    const RtScaleContext* ctx_ptr  = (current_ci >= 0)
+        ? &st.scale_contexts[static_cast<size_t>(current_ci)]
+        : nullptr;
+
+    /* Maximum step from context physics */
+    double dt_max = (ctx_ptr && ctx_ptr->scale_type == RT_SCALE_WAVE
+                     && ctx_ptr->dt_m > EPS)
+                    ? ctx_ptr->dt_m : 1e18;
+
+    /* Distance to exit the current context sphere (if in one) */
+    double t_ctx_exit = 1e18;
+    if (current_ci >= 0 && ctx_ptr) {
+        V3d ctr(ctx_ptr->center[0], ctx_ptr->center[1], ctx_ptr->center[2]);
+        double te, tx;
+        if (ray_sphere_intersect(pos, dir, ctr, ctx_ptr->radius, te, tx) && tx > EPS)
+            t_ctx_exit = tx;
+    }
+
+    /* BVH: nearest surface intersection */
+    double t_hit   = 1e18;
+    int    hit_tri = -1;
+    if (!st.bvh_nodes.empty()) {
+        V3d inv_dir = dir.cwiseInverse();
+        bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
+                  pos, dir, inv_dir, t_hit, hit_tri);
+    } else {
+        for (size_t ti = 0; ti < st.tris.size(); ++ti) {
+            double t;
+            if (ray_triangle_hit(pos, dir, st.tris[ti], t) && t < t_hit) {
+                t_hit   = t;
+                hit_tri = static_cast<int>(ti);
+            }
+        }
+    }
+
+    /* Nearest finer context-sphere entry within the current step cap */
+    double step_cap = std::min({dt_max, t_ctx_exit, t_hit < 1e17 ? t_hit : 1e18});
+    double t_enter;
+    int    enter_ci = ctx_nearest_entry(st, pos, dir, current_ci, step_cap, t_enter);
+
+    /* ── Choose what happens this step ──────────────────────────────────── */
+    enum { ACT_ENTER_CTX, ACT_HIT_SURFACE, ACT_EXIT_CTX, ACT_CONTINUE } act;
+    double step;
+
+    if (enter_ci >= 0 && t_enter < step_cap - EPS) {
+        act  = ACT_ENTER_CTX;
+        step = t_enter;
+    } else if (hit_tri >= 0 && t_hit < std::min(dt_max, t_ctx_exit) - EPS) {
+        act  = ACT_HIT_SURFACE;
+        step = t_hit;
+    } else if (t_ctx_exit < dt_max - EPS) {
+        act  = ACT_EXIT_CTX;
+        step = t_ctx_exit;
+    } else {
+        act  = ACT_CONTINUE;
+        step = std::min(dt_max, t_ctx_exit);
+    }
+
+    if (step < EPS) step = EPS * 10.0;
+    if (step > 1e17) {
+        /* Ray escaped without hitting anything */
+        rs.alive = 0;
+        return -2;
+    }
+
+    /* ── Propagate amplitude and emit segment ────────────────────────────── */
+    V3d p1 = pos + step * dir;
+    propagate_ms(amp, st, ctx_ptr, step, rs.path_len,
+                 pos, p1, rs.src_id, rs.bounce,
+                 out_segs, seg_count, seg_cap, current_ci);
+    rs.path_len += step;
+
+    /* Check amplitude floor */
+    double max_abs = 0.0;
+    for (int b = 0; b < n_bands; ++b) {
+        double a = std::abs(amp[b]);
+        if (a > max_abs) max_abs = a;
+    }
+    if (max_abs < st.live_min_amplitude) {
+        rs.alive = 0;
+        for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+        return -2;
+    }
+
+    /* ── Handle the outcome ──────────────────────────────────────────────── */
+    if (act == ACT_ENTER_CTX) {
+        /* Transfer to finer context */
+        rs.pos[0] = p1.x(); rs.pos[1] = p1.y(); rs.pos[2] = p1.z();
+        rs.context_id = enter_ci;
+        for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+        return enter_ci;
+    }
+
+    if (act == ACT_HIT_SURFACE) {
+        bool alive = apply_surface(st, amp, dir, hit_tri, rs.bounce, rng, U);
+        if (!alive) {
+            rs.alive = 0;
+            for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+            return -2;
+        }
+        V3d npos = p1 + dir * (EPS * 200.0);
+        rs.pos[0] = npos.x(); rs.pos[1] = npos.y(); rs.pos[2] = npos.z();
+        rs.dir[0] = dir.x();  rs.dir[1] = dir.y();  rs.dir[2] = dir.z();
+        for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+        int new_ci   = ctx_for_pos(st, npos);
+        rs.context_id = new_ci;
+        return new_ci;
+    }
+
+    if (act == ACT_EXIT_CTX) {
+        /* Nudge just past the sphere boundary */
+        V3d npos = p1 + dir * (EPS * 10.0);
+        rs.pos[0] = npos.x(); rs.pos[1] = npos.y(); rs.pos[2] = npos.z();
+        rs.dir[0] = dir.x();  rs.dir[1] = dir.y();  rs.dir[2] = dir.z();
+        for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+        int new_ci   = ctx_for_pos(st, npos);
+        rs.context_id = new_ci;
+        return new_ci;
+    }
+
+    /* ACT_CONTINUE — stays in the same context, advances by step */
+    rs.pos[0] = p1.x(); rs.pos[1] = p1.y(); rs.pos[2] = p1.z();
+    rs.dir[0] = dir.x(); rs.dir[1] = dir.y(); rs.dir[2] = dir.z();
+    for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+    rs.context_id = current_ci;
+    return current_ci;
+}
+
+/* ── Public scheduler API ─────────────────────────────────────────────────── */
+
+int ray_tracer_spawn(
+    RayTracerState* st,
+    int             n_sources,
+    const double*   src_pos,
+    const double*   src_dir,
+    const double*   src_directivity,
+    int             n_rays,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    st->live_max_bounces   = max_bounces;
+    st->live_min_amplitude = min_amplitude;
+
+    /* Ensure ctx_queues has an entry per registered context */
+    st->ctx_queues.resize(st->scale_contexts.size());
+
+    const int n_bands = st->n_bands;
+    std::mt19937_64 rng(static_cast<uint64_t>(seed) ^ 0xdeadbeef8badf00dULL);
+
+    for (int si = 0; si < n_sources; ++si) {
+        const double* sp = src_pos + si * 3;
+        const double* sd = src_dir + si * 3;
+        V3d src_p(sp[0], sp[1], sp[2]);
+        V3d src_d = V3d(sd[0], sd[1], sd[2]).normalized();
+        double dirpow = src_directivity[si];
+
+        for (int ri = 0; ri < n_rays; ++ri) {
+            V3d fib_dir    = fibonacci_sphere_dir(ri, n_rays, src_d);
+            double cos_a   = fib_dir.dot(src_d);
+            double weight  = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
+            if (weight < 0.01) continue;
+
+            int ray_id = static_cast<int>(st->ray_pool.size());
+
+            RtRayState rs{};
+            rs.pos[0] = src_p.x(); rs.pos[1] = src_p.y(); rs.pos[2] = src_p.z();
+            rs.dir[0] = fib_dir.x(); rs.dir[1] = fib_dir.y(); rs.dir[2] = fib_dir.z();
+            rs.path_len   = 0.0;
+            rs.bounce     = 0;
+            rs.src_id     = si;
+            rs.alive      = 1;
+            rs.rng_state  = rng();
+
+            /* Determine initial context (spawn point may already be in a fine zone) */
+            int init_ci   = ctx_for_pos(*st, src_p);
+            rs.context_id = init_ci;
+
+            st->ray_pool.push_back(rs);
+
+            /* Allocate amplitude: initial magnitude = directivity weight */
+            for (int b = 0; b < n_bands; ++b)
+                st->ray_amp_pool.push_back(cd(weight, 0.0));
+
+            if (init_ci >= 0)
+                st->ctx_queues[static_cast<size_t>(init_ci)].push_back(ray_id);
+            else
+                st->geo_queue.push_back(ray_id);
+        }
+    }
+    return SK_OK;
+}
+
+int ray_tracer_step(
+    RayTracerState* st,
+    float*          out_segs,
+    int             out_cap,
+    int*            out_count,
+    int*            n_live_out)
+{
+    if (!st || !out_segs || !out_count) return SK_ERR_NULL_STATE;
+    *out_count = 0;
+
+    const int n_ctx = static_cast<int>(st->scale_contexts.size());
+    st->ctx_queues.resize(static_cast<size_t>(n_ctx));
+
+    int seg_count = 0;
+    /* Per-step RNG: seed from ray_pool size + seg_count for unpredictability */
+    std::mt19937_64 rng(static_cast<uint64_t>(st->ray_pool.size()) * 6364136223846793005ULL
+                        + 1442695040888963407ULL);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+
+    /* Helper: re-queue a ray into the appropriate queue based on its context_id.
+     * ctx_queue additions go into a temporary buffer to avoid processing a ray
+     * twice in the same step if it moves between context queues. */
+    std::vector<std::vector<int>> new_ctx(static_cast<size_t>(n_ctx));
+
+    /* ── 1. Geometric (coarsest) queue ──────────────────────────────────── */
+    {
+        std::vector<int> snapshot;
+        snapshot.swap(st->geo_queue);
+        for (int ray_id : snapshot) {
+            if (!st->ray_pool[static_cast<size_t>(ray_id)].alive) continue;
+            int dest = scheduler_advance_ray(*st, ray_id, -1, rng, U,
+                                             out_segs, seg_count, out_cap);
+            if (dest == -2) continue;          /* dead */
+            if (dest == -1)
+                st->geo_queue.push_back(ray_id); /* stays in geo */
+            else
+                new_ctx[static_cast<size_t>(dest)].push_back(ray_id);
+        }
+    }
+
+    /* ── 2. Fine context queues, coarsest-first (largest radius first) ───── */
+    /* scale_contexts is sorted smallest-radius-first, so iterate in reverse */
+    for (int ci = n_ctx - 1; ci >= 0; --ci) {
+        std::vector<int> snapshot;
+        snapshot.swap(st->ctx_queues[static_cast<size_t>(ci)]);
+        /* Prepend any rays that arrived in this context from the geo step */
+        for (int id : new_ctx[static_cast<size_t>(ci)]) snapshot.push_back(id);
+        new_ctx[static_cast<size_t>(ci)].clear();
+
+        for (int ray_id : snapshot) {
+            if (!st->ray_pool[static_cast<size_t>(ray_id)].alive) continue;
+            int dest = scheduler_advance_ray(*st, ray_id, ci, rng, U,
+                                             out_segs, seg_count, out_cap);
+            if (dest == -2) continue;          /* dead */
+            if (dest == -1)
+                st->geo_queue.push_back(ray_id);
+            else if (dest == ci)
+                st->ctx_queues[static_cast<size_t>(ci)].push_back(ray_id); /* stays */
+            else
+                new_ctx[static_cast<size_t>(dest)].push_back(ray_id);
+        }
+    }
+
+    /* Flush any remaining new_ctx entries (rays that entered a finer context
+     * during the finest context's own processing — deferred to next step) */
+    for (int ci = 0; ci < n_ctx; ++ci) {
+        for (int id : new_ctx[static_cast<size_t>(ci)])
+            st->ctx_queues[static_cast<size_t>(ci)].push_back(id);
+    }
+
+    *out_count = seg_count;
+    if (n_live_out) *n_live_out = ray_tracer_live_ray_count(st);
+    return SK_OK;
+}
+
+int ray_tracer_clear_rays(RayTracerState* st)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    st->ray_pool.clear();
+    st->ray_amp_pool.clear();
+    st->geo_queue.clear();
+    for (auto& q : st->ctx_queues) q.clear();
+    return SK_OK;
+}
+
+int ray_tracer_live_ray_count(const RayTracerState* st)
+{
+    if (!st) return 0;
+    int n = static_cast<int>(st->geo_queue.size());
+    for (const auto& q : st->ctx_queues)
+        n += static_cast<int>(q.size());
+    return n;
+}
+

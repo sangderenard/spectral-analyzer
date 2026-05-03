@@ -15,3 +15,6 @@ aperture_mm: 0.0
 focus_m: 1.1
 ca: 0.0
 tilt_shift: [0.0, 0.0]
+
+# Glow display options (camera_designer_station)
+sensor_log_scale: false

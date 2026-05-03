@@ -9,3 +9,4 @@ height_mm: 200.0
 pixel_pitch_um: 95000.0   # 9.5 cm — λ/2 at 1 800 Hz
 max_iso: 512
 dynamic_range_stops: 60.0   # acoustic sensors have very wide DR (dB headroom)
+log_scale: true     # acoustic: log scale compresses the 60-stop DR naturally

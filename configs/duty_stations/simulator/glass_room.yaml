@@ -1,0 +1,23 @@
+# Glass room (bell jar + skirt) — geometry and render settings
+
+# ── Physical geometry ───────────────────────────────────────────────────────
+glass_thickness_m: 0.020      # wall thickness; also equals bevel radius
+bevel_segs:        6          # segments per rounded vertical corner
+
+# ── Visual materials ────────────────────────────────────────────────────────
+glass_color:     [0.15, 0.55, 0.90, 0.28]   # RGBA — translucent blue tint
+skirt_color:     [0.10, 0.12, 0.16, 0.85]   # RGBA — opaque dark base skirt
+wireframe_color: [0.20, 0.80, 1.00, 0.60]   # RGBA — inner box wireframe
+
+show_wireframe:  true
+wireframe_width: 1.4
+
+ambient:        0.22
+spec_strength:  0.65
+shininess:     128.0
+grain:          0.06
+
+# ── Render order flags (set to false to disable individual elements) ────────
+render_belljar:  true
+render_skirt:    true
+render_wireframe: true

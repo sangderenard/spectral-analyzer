@@ -1,0 +1,40 @@
+name: laser_532nm_green
+spectral:
+  model: gaussian
+  temperature_K: 6500.0
+  center_um: 0.532
+  sigma_um: 0.0001
+  fwhm_um: 0.002
+  wavelengths_um: []
+  weights: []
+  radiant_exitance: 1.0
+phase:
+  model: coherent
+  coherence_length_um: 100000000.0
+  phase_offset_rad: 0.0
+  temporal_coherence_s: 0.0
+directional:
+  model: gaussian_beam
+  beam_waist_um: 500.0
+  divergence_half_angle_rad: 0.0
+  center_wavelength_um: 0.532
+  numerical_aperture: 0.5
+  half_angle_rad: 0.5235987755982988
+  hg_g: 0.0
+polarization:
+  mode: linear
+  angle_deg: 0.0
+  handedness: 1
+  jones:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  degree_of_polarization: 1.0
+display_tint:
+- 0.2
+- 1.0
+- 0.2
+label: Nd:YAG 532 nm CW laser (TEM₀₀, linear H)
+notes: 532 nm DPSS laser, TEM00, linearly polarised horizontal. ~100 μm coherence
+  length.

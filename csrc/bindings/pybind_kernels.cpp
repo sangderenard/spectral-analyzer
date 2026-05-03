@@ -868,6 +868,308 @@ struct PyRayTracer
                 "ray_tracer_trace_integrate_image failed: rc=" + std::to_string(rc));
         return n_written;
     }
+
+    /* ── Scale context API ───────────────────────────────────────────────── */
+
+    int add_scale_context(
+        py::array_t<double, py::array::c_style> pos,
+        double radius, int scale_type, double dt_m, int n_substeps,
+        double n_real, double n_imag)
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        auto cp = pos.request();
+        if (cp.ndim != 1 || cp.shape[0] != 3)
+            throw std::invalid_argument("pos must be shape (3,)");
+        const double* pd = static_cast<const double*>(cp.ptr);
+
+        RtScaleContext ctx{};
+        ctx.center[0]  = pd[0];
+        ctx.center[1]  = pd[1];
+        ctx.center[2]  = pd[2];
+        ctx.radius     = radius;
+        ctx.scale_type = scale_type;
+        ctx.dt_m       = dt_m;
+        ctx.n_substeps = n_substeps;
+        ctx.n_real     = n_real;
+        ctx.n_imag     = n_imag;
+
+        int rc = ray_tracer_add_scale_context(handle, &ctx);
+        if (rc < 0)
+            throw std::runtime_error("ray_tracer_add_scale_context failed: rc=" + std::to_string(rc));
+        return rc; /* returns context_id */
+    }
+
+    void clear_scale_contexts()
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        ray_tracer_clear_scale_contexts(handle);
+    }
+
+    /* Trace multiscale, write into caller-owned (capacity, 14) float32 buffer.
+     * Returns n_written. */
+    int trace_multiscale_into(
+        py::array_t<double, py::array::c_style> src_pos_arr,
+        py::array_t<double, py::array::c_style> src_dir_arr,
+        py::array_t<double, py::array::c_style> src_directivity_arr,
+        py::array_t<float,  py::array::c_style> out_segs_arr,
+        int    n_rays        = 512,
+        int    max_bounces   = 12,
+        double min_amplitude = 0.001,
+        uint32_t seed        = 42)
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        auto isp  = src_pos_arr.request();
+        auto isd  = src_dir_arr.request();
+        auto isdi = src_directivity_arr.request();
+        auto os   = out_segs_arr.request();
+        if (isp.ndim != 2 || isp.shape[1] != 3)
+            throw std::invalid_argument("src_pos must be shape (N, 3)");
+        int n_sources = static_cast<int>(isp.shape[0]);
+        if (os.ndim != 2 || os.shape[1] != RT_FLOATS_PER_SEG_MS)
+            throw std::invalid_argument("out_segs must be shape (capacity, 14)");
+        int out_cap = static_cast<int>(os.shape[0]);
+        int n_written = 0;
+        int rc = ray_tracer_trace_multiscale(
+            handle, n_sources,
+            static_cast<const double*>(isp.ptr),
+            static_cast<const double*>(isd.ptr),
+            static_cast<const double*>(isdi.ptr),
+            n_rays, max_bounces, min_amplitude, seed,
+            static_cast<float*>(os.ptr), out_cap, &n_written);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_trace_multiscale failed: rc=" + std::to_string(rc));
+        return n_written;
+    }
+
+    /* Allocate segment buffer, trace, return ndarray (N, 14) float32. */
+    py::array_t<float> trace_multiscale(
+        py::array_t<double, py::array::c_style> src_pos_arr,
+        py::array_t<double, py::array::c_style> src_dir_arr,
+        py::array_t<double, py::array::c_style> src_directivity_arr,
+        int    n_rays        = 512,
+        int    max_bounces   = 12,
+        double min_amplitude = 0.001,
+        uint32_t seed        = 42,
+        int    out_cap       = 65536)
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        auto isp  = src_pos_arr.request();
+        auto isd  = src_dir_arr.request();
+        auto isdi = src_directivity_arr.request();
+        if (isp.ndim != 2 || isp.shape[1] != 3)
+            throw std::invalid_argument("src_pos must be shape (N, 3)");
+        int n_sources = static_cast<int>(isp.shape[0]);
+
+        std::vector<float> buf(static_cast<size_t>(out_cap) * RT_FLOATS_PER_SEG_MS);
+        int n_written = 0;
+        int rc = ray_tracer_trace_multiscale(
+            handle, n_sources,
+            static_cast<const double*>(isp.ptr),
+            static_cast<const double*>(isd.ptr),
+            static_cast<const double*>(isdi.ptr),
+            n_rays, max_bounces, min_amplitude, seed,
+            buf.data(), out_cap, &n_written);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_trace_multiscale failed: rc=" + std::to_string(rc));
+
+        py::array_t<float> result({n_written, RT_FLOATS_PER_SEG_MS});
+        std::memcpy(result.mutable_data(), buf.data(),
+                    static_cast<size_t>(n_written) * RT_FLOATS_PER_SEG_MS * sizeof(float));
+        return result;
+    }
+
+    /* ── Physical optics extension methods ──────────────────────────────── */
+
+    /** Mark a range of triangles as transmissive (glass) with given IORs.
+     *  tri_start : index of first triangle in the range
+     *  n_tris    : number of triangles
+     *  n_in      : IOR where the outward normal points (usually air = 1.0)
+     *  n_out     : IOR on the other side (glass)
+     *  flags     : RT_TRI_FLAG_TRANSMISSIVE | RT_TRI_FLAG_APERTURE_STOP etc.
+     */
+    void set_tri_ior(int tri_start, int n_tris,
+                     double n_in, double n_out, int flags)
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        int rc = ray_tracer_set_tri_ior(handle, tri_start, n_tris,
+                                         n_in, n_out, flags);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_set_tri_ior failed: rc=" + std::to_string(rc));
+    }
+
+    /** Project a (N, 14) float32 multiscale segment array onto a coherent
+     *  complex sensor image.  Returns (out_re, out_im) each shape
+     *  (n_bands, sensor_h, sensor_w) float32, accumulative (NOT zeroed here).
+     *
+     *  segs_arr  : (N, 14) float32 multiscale segment buffer
+     *  n_bands   : number of frequency bands
+     *  sensor_w/h: sensor resolution in pixels
+     *  sensor_z  : z-coordinate of sensor plane (metres)
+     *  sensor_r  : half-width of sensor square in metres
+     *  out_re/im : (n_bands, sensor_h, sensor_w) float32 — MUST be provided
+     *              by caller and are accumulated into (not cleared).
+     */
+    void project_coherent(
+        py::array_t<float, py::array::c_style> segs_arr,
+        int    n_bands,
+        int    sensor_w,
+        int    sensor_h,
+        double sensor_z,
+        double sensor_r,
+        py::array_t<float, py::array::c_style> out_re_arr,
+        py::array_t<float, py::array::c_style> out_im_arr)
+    {
+        auto si  = segs_arr.request();
+        auto rei = out_re_arr.request();
+        auto imi = out_im_arr.request();
+        if (si.ndim != 2 || si.shape[1] != RT_FLOATS_PER_SEG_MS)
+            throw std::invalid_argument("segs must be shape (N, 14)");
+        int n_segs = static_cast<int>(si.shape[0]);
+        int rc = ray_tracer_project_coherent(
+            n_segs,
+            static_cast<const float*>(si.ptr),
+            n_bands, sensor_w, sensor_h,
+            sensor_z, sensor_r,
+            static_cast<float*>(rei.ptr),
+            static_cast<float*>(imi.ptr));
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_project_coherent failed: rc=" + std::to_string(rc));
+    }
+
+    /* ── Near-field aperture mask ───────────────────────────────────────── */
+
+    void apply_aperture_mask(
+        int n_bands,
+        int w,
+        int h,
+        double field_r,
+        py::array_t<float, py::array::c_style> poly_xy_arr,
+        py::array_t<float, py::array::c_style> re_arr,
+        py::array_t<float, py::array::c_style> im_arr)
+    {
+        auto pi  = poly_xy_arr.request();
+        auto rei = re_arr.request();
+        auto imi = im_arr.request();
+        int n_verts = static_cast<int>(pi.size / 2);
+        int rc = ray_tracer_apply_aperture_mask(
+            n_bands, w, h, field_r,
+            n_verts,
+            static_cast<const float*>(pi.ptr),
+            static_cast<float*>(rei.ptr),
+            static_cast<float*>(imi.ptr));
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_apply_aperture_mask failed: rc=" + std::to_string(rc));
+    }
+
+    /* ── Rayleigh-Sommerfeld propagator ─────────────────────────────────── */
+
+    py::tuple rs_propagate(
+        int n_bands,
+        int w,
+        int h,
+        double dx,
+        double z_dist,
+        py::array_t<double, py::array::c_style> wavelengths_arr,
+        py::array_t<float,  py::array::c_style> in_re_arr,
+        py::array_t<float,  py::array::c_style> in_im_arr)
+    {
+        auto wi  = wavelengths_arr.request();
+        auto iri = in_re_arr.request();
+        auto iii = in_im_arr.request();
+        const size_t npix = static_cast<size_t>(n_bands) * w * h;
+        py::array_t<float> out_re(npix);
+        py::array_t<float> out_im(npix);
+        int rc = ray_tracer_rs_propagate(
+            n_bands, w, h, dx, z_dist,
+            static_cast<const double*>(wi .ptr),
+            static_cast<const float* >(iri.ptr),
+            static_cast<const float* >(iii.ptr),
+            static_cast<float*>(out_re.mutable_data()),
+            static_cast<float*>(out_im.mutable_data()));
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_rs_propagate failed: rc=" + std::to_string(rc));
+        /* Reshape to (n_bands, h, w) */
+        out_re.resize({n_bands, h, w});
+        out_im.resize({n_bands, h, w});
+        return py::make_tuple(out_re, out_im);
+    }
+
+    /* ── BPM wave-PDE z-stepper (in-place, batchwise) ──────────────────── */
+
+    void wave_bpm_step(
+        int n_bands,
+        int w,
+        int h,
+        double dx,
+        double dz,
+        py::array_t<double, py::array::c_style> wavelengths_arr,
+        py::array_t<float,  py::array::c_style> re_arr,
+        py::array_t<float,  py::array::c_style> im_arr)
+    {
+        auto wi  = wavelengths_arr.request();
+        auto rei = re_arr.request();
+        auto imi = im_arr.request();
+        int rc = ray_tracer_wave_bpm_step(
+            n_bands, w, h, dx, dz,
+            static_cast<const double*>(wi.ptr),
+            static_cast<float*>(rei.ptr),
+            static_cast<float*>(imi.ptr));
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_wave_bpm_step failed: rc=" + std::to_string(rc));
+    }
+
+    /* ── Stateful scheduler ─────────────────────────────────────────────── */
+
+    void spawn(
+        py::array_t<double, py::array::c_style> src_pos_arr,
+        py::array_t<double, py::array::c_style> src_dir_arr,
+        py::array_t<double, py::array::c_style> src_dir_power_arr,
+        int     n_rays,
+        int     max_bounces   = 8,
+        double  min_amplitude = 0.005,
+        uint32_t seed         = 0)
+    {
+        auto pp = src_pos_arr.request();
+        auto dp = src_dir_arr.request();
+        auto ep = src_dir_power_arr.request();
+        int n_sources = static_cast<int>(pp.shape[0]);
+        int rc = ray_tracer_spawn(
+            handle,
+            n_sources,
+            static_cast<const double*>(pp.ptr),
+            static_cast<const double*>(dp.ptr),
+            static_cast<const double*>(ep.ptr),
+            n_rays, max_bounces, min_amplitude, seed);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_spawn failed: rc=" + std::to_string(rc));
+    }
+
+    py::tuple step(
+        py::array_t<float, py::array::c_style> seg_buf_arr)
+    {
+        auto si   = seg_buf_arr.request();
+        int  cap  = static_cast<int>(si.size / RT_FLOATS_PER_SEG_MS);
+        int  n_written = 0;
+        int  n_live    = 0;
+        int rc = ray_tracer_step(
+            handle,
+            static_cast<float*>(si.ptr),
+            cap, &n_written, &n_live);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_step failed: rc=" + std::to_string(rc));
+        return py::make_tuple(n_written, n_live);
+    }
+
+    void clear_rays()
+    {
+        if (ray_tracer_clear_rays(handle) != SK_OK)
+            throw std::runtime_error("ray_tracer_clear_rays failed");
+    }
+
+    int live_ray_count() const
+    {
+        return ray_tracer_live_ray_count(handle);
+    }
 };
 
 /* ── FieldSolver wrapper ─────────────────────────────────────────────────── */
@@ -2552,7 +2854,236 @@ Returns a dict with:
   'segs'     : float32 (N_segs, 12) — segment records (same layout as trace())
   'direct'   : float32 (n_tri, n_bands) — direct-illumination irradiance per triangle
   'indirect' : float32 (n_tri, n_bands) — reflected irradiance per triangle
-)doc");
+)doc")
+        .def("add_scale_context", &PyRayTracer::add_scale_context,
+             py::arg("pos"),
+             py::arg("radius"),
+             py::arg("scale_type")  = 0,
+             py::arg("dt_m")        = 1e-6,
+             py::arg("n_substeps")  = 1000,
+             py::arg("n_real")      = 1.5,
+             py::arg("n_imag")      = 0.0,
+             R"doc(
+Register a scale-context sphere in the scene.
+
+pos        : (3,) float64 world-space centre (metres)
+radius     : trigger radius (metres)
+scale_type : 0 = RT_SCALE_GEOMETRIC (coarse), 1 = RT_SCALE_WAVE (fine/wave)
+dt_m       : wave sub-step size (metres); only used when scale_type=1
+n_substeps : safety cap on sub-step count per context crossing
+n_real     : real part of medium refractive index inside sphere
+n_imag     : imaginary part (extinction coefficient; >0 = absorbing)
+
+Returns the assigned context_id integer.
+)doc")
+        .def("clear_scale_contexts", &PyRayTracer::clear_scale_contexts,
+             "Remove all registered scale-context spheres.")
+        .def("trace_multiscale_into", &PyRayTracer::trace_multiscale_into,
+             py::arg("src_pos"),
+             py::arg("src_dir"),
+             py::arg("src_directivity"),
+             py::arg("out_segs"),
+             py::arg("n_rays")        = 512,
+             py::arg("max_bounces")   = 12,
+             py::arg("min_amplitude") = 0.001,
+             py::arg("seed")          = 42,
+             R"doc(
+Trace rays using the multiscale kernel, writing into a caller-owned buffer.
+
+out_segs must be a float32 array of shape (capacity, 14).  The first 12
+columns match the standard segment layout; columns 12 and 13 carry
+context_id and scale_type (0=geometric, 1=wave).
+
+Returns n_written (the number of segment records filled in).  Reuse the
+same buffer across trickle iterations; clear with out_segs[:] = 0 when
+needed.
+)doc")
+        .def("trace_multiscale", &PyRayTracer::trace_multiscale,
+             py::arg("src_pos"),
+             py::arg("src_dir"),
+             py::arg("src_directivity"),
+             py::arg("n_rays")        = 512,
+             py::arg("max_bounces")   = 12,
+             py::arg("min_amplitude") = 0.001,
+             py::arg("seed")          = 42,
+             py::arg("out_cap")       = 65536,
+             R"doc(
+Trace rays using the multiscale kernel, returning a new float32 array.
+
+Returns ndarray of shape (N, 14) where N <= out_cap.  Columns 0-11 match
+the standard 12-float segment layout; columns 12-13 are context_id and
+scale_type.
+)doc")
+        .def("set_tri_ior", &PyRayTracer::set_tri_ior,
+             py::arg("tri_start"),
+             py::arg("n_tris"),
+             py::arg("n_in"),
+             py::arg("n_out"),
+             py::arg("flags") = RT_TRI_FLAG_TRANSMISSIVE,
+             R"doc(
+Mark a range of triangles as transmissive (glass / refractive surface).
+
+tri_start : index of the first triangle to mark
+n_tris    : number of triangles in the range
+n_in      : IOR of the medium the outward normal points toward (usually air=1.0)
+n_out     : IOR on the opposite side (glass body)
+flags     : RT_TRI_FLAG_TRANSMISSIVE (1) | RT_TRI_FLAG_APERTURE_STOP (2)
+
+When RT_TRI_FLAG_TRANSMISSIVE is set the tracer applies exact Snell's law
+refraction with angle-dependent Fresnel power split (both s and p
+polarisations, unpolarised average).  TIR is handled automatically.
+Russian-roulette Monte Carlo selects reflect or transmit probabilistically.
+
+When RT_TRI_FLAG_APERTURE_STOP is set the surface absorbs the ray.
+Diffraction is handled by the near-field pipeline: the dense coherent ray
+field that passes through the blade gaps is accumulated by project_coherent
+and propagated to the sensor by rs_propagate (exact Rayleigh-Sommerfeld) or
+advanced step-by-step by wave_bpm_step (paraxial Helmholtz PDE).
+)doc")
+        .def("project_coherent", &PyRayTracer::project_coherent,
+             py::arg("segs"),
+             py::arg("n_bands"),
+             py::arg("sensor_w"),
+             py::arg("sensor_h"),
+             py::arg("sensor_z"),
+             py::arg("sensor_r"),
+             py::arg("out_re"),
+             py::arg("out_im"),
+             R"doc(
+Project a multiscale segment buffer onto a coherent complex sensor image.
+
+For every segment that crosses the plane z = sensor_z the intersection point
+is mapped to a pixel and the complex amplitude is accumulated additively:
+  out_re[b, py, px] += amp * cos(phase)
+  out_im[b, py, px] += amp * sin(phase)
+
+After accumulating many trickle batches, out_re**2 + out_im**2 is the
+coherent diffraction-correct intensity image: Airy rings, interference
+fringes, speckle, and all other wave effects emerge naturally.
+
+segs      : float32 (N, 14) — multiscale segment buffer from trace_multiscale_into
+n_bands   : number of frequency bands
+sensor_w/h: sensor resolution in pixels
+sensor_z  : z position of sensor plane in world space (metres)
+sensor_r  : half-width of sensor (metres); pixels cover [-r, +r]
+out_re/im : float32 (n_bands, sensor_h, sensor_w) — caller-allocated,
+            caller-zeroed; this method ACCUMULATES into them.
+)doc")
+        .def("apply_aperture_mask", &PyRayTracer::apply_aperture_mask,
+             py::arg("n_bands"),
+             py::arg("w"),
+             py::arg("h"),
+             py::arg("field_r"),
+             py::arg("poly_xy"),
+             py::arg("re"),
+             py::arg("im"),
+             R"doc(
+Zero field pixels outside a polygon aperture (in-place).
+
+poly_xy : float32 (n_verts, 2) — aperture opening polygon in field coordinates
+          where ±field_r maps to ±1 in pixel space.
+re, im  : float32 (n_bands, h, w) — complex field, modified in-place.
+          Pixels whose centre falls outside the polygon are zeroed in all bands.
+)doc")
+        .def("rs_propagate", &PyRayTracer::rs_propagate,
+             py::arg("n_bands"),
+             py::arg("w"),
+             py::arg("h"),
+             py::arg("dx"),
+             py::arg("z_dist"),
+             py::arg("wavelengths_m"),
+             py::arg("in_re"),
+             py::arg("in_im"),
+             R"doc(
+Exact Rayleigh-Sommerfeld diffraction integral (O(N² × M²) CPU).
+
+Propagates a complex aperture field forward by z_dist in a single integral
+step.  Every output pixel receives contributions from every input pixel via
+the exact non-paraxial RS kernel:
+
+    K(r) = (z / r²) × (ik − 1/r) × exp(ikr) / (2π)
+
+Returns (out_re, out_im) as float32 arrays of shape (n_bands, h, w).
+
+Use wave_bpm_step for multi-step volume propagation; use rs_propagate for a
+single exact jump (e.g. aperture → sensor in one call).
+)doc")
+        .def("wave_bpm_step", &PyRayTracer::wave_bpm_step,
+             py::arg("n_bands"),
+             py::arg("w"),
+             py::arg("h"),
+             py::arg("dx"),
+             py::arg("dz"),
+             py::arg("wavelengths_m"),
+             py::arg("re"),
+             py::arg("im"),
+             R"doc(
+Beam Propagation Method — batchwise PDE z-stepper (in-place).
+
+Advances the complex field U[band][y][x] by one step dz by solving the
+paraxial Helmholtz PDE:
+
+    ∂U/∂z = (i/2k) ∇_T² U
+
+using an ADI Crank-Nicolson finite-difference scheme (unconditionally stable,
+second-order in dz and dx).  The carrier phase exp(ik dz) is also applied so
+both the optical path length and the transverse spreading are correct.
+
+Call repeatedly to build a coherent 3-D near-field volume step-by-step:
+each call is one z-slice of the true wave PDE solution.  Bokeh, diffraction
+rings, Airy patterns, near-field evanescent tails, and all other wave effects
+emerge from the field evolution — no approximations or post-processes.
+
+re, im        : float32 (n_bands, h, w) — field modified in-place.
+dx            : pixel pitch in metres (same in x and y).
+dz            : propagation step in metres (positive = forward along z).
+wavelengths_m : float64 (n_bands,) — wavelength per band in metres.
+)doc")
+        .def("spawn", &PyRayTracer::spawn,
+             py::arg("src_pos"),
+             py::arg("src_dir"),
+             py::arg("src_dir_power"),
+             py::arg("n_rays"),
+             py::arg("max_bounces")   = 8,
+             py::arg("min_amplitude") = 0.005,
+             py::arg("seed")          = 0u,
+             R"doc(
+Spawn rays from sources into the scheduler's coarse geometric queue.
+
+Rays are sampled by Fibonacci sphere with directivity weighting.  They
+persist as live stateful objects until absorbed, escaped, or cleared with
+clear_rays().  Calling spawn() again adds more rays without clearing.
+
+src_pos       : float64 (n_sources, 3) — source world positions
+src_dir       : float64 (n_sources, 3) — dominant emit directions
+src_dir_power : float64 (n_sources,)   — directivity exponent (0 = omni)
+n_rays        : rays per source
+max_bounces   : kill ray after this many surface reflections
+min_amplitude : kill ray when max|A| across all bands falls below this
+seed          : RNG seed for directivity sampling
+)doc")
+        .def("step", &PyRayTracer::step,
+             py::arg("seg_buf"),
+             R"doc(
+Advance all live rays one scheduler step.
+
+Each context queue is ticked once, ordered coarsest-to-finest:
+  geometric queue : BVH intersection jump, capped at context-sphere entry
+  RT_SCALE_GEOMETRIC contexts : same, confined to context sphere
+  RT_SCALE_WAVE contexts : min(dt_m, sphere boundary, surface) step with
+                           wave-accurate phase and near-field spreading
+
+Rays that enter a finer context sphere are transferred to that queue.
+Rays that exit their context sphere move to the next-coarser queue.
+Dead rays are removed.  Segments are written in the 14-float MS format.
+
+seg_buf : float32 (N, 14) pre-allocated output buffer (modified in-place)
+Returns : (n_written, n_live) — segments written and rays still alive
+)doc")
+        .def("clear_rays", &PyRayTracer::clear_rays,
+             R"doc(Remove all live rays and free the internal ray pool.)doc")
+        .def("live_ray_count", &PyRayTracer::live_ray_count,
+             R"doc(Return the number of live rays across all context queues.)doc");
 
     py::class_<PyFieldSolver>(m, "FieldSolver",
         R"doc(
@@ -2982,6 +3513,12 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("CE_STATUS_DONE")      = CE_STATUS_DONE;
     m.attr("CE_STATUS_CANCELLED") = CE_STATUS_CANCELLED;
     m.attr("CE_STATUS_ERROR")     = CE_STATUS_ERROR;
+    /* Ray-tracer triangle surface flags */
+    m.attr("RT_TRI_FLAG_TRANSMISSIVE")  = (int)RT_TRI_FLAG_TRANSMISSIVE;
+    m.attr("RT_TRI_FLAG_APERTURE_STOP") = (int)RT_TRI_FLAG_APERTURE_STOP;
+    /* Multiscale scale-type constants */
+    m.attr("RT_SCALE_GEOMETRIC") = (int)RT_SCALE_GEOMETRIC;
+    m.attr("RT_SCALE_WAVE")      = (int)RT_SCALE_WAVE;
 
     m.def("amr_create_progress", []() {
         py::dict d;

@@ -7,7 +7,7 @@ name: duty_station
 
 # ── World transform ───────────────────────────────────────────────────────────
 position: [0.0, 2.4, 0.0]   # world XYZ; Z-up, Y-forward
-yaw_deg:  180.0              # rotation around Z (180 = faces -Y, toward guitar)
+yaw_deg:  0.0                # rotation around Z (0 = faces +Y, into room)
 
 # ── Console body (the desk / podium) ─────────────────────────────────────────
 console:

@@ -17,3 +17,6 @@ aperture_mm: 0.0   # 0 = pinhole (no depth-of-field blur)
 focus_m: 1.6
 ca: 0.0            # chromatic aberration amount
 tilt_shift: [0.0, 0.0]
+
+# Glow display options (camera_designer_station)
+sensor_log_scale: false  # set true for log(1+bv) tonemap on glow overlays

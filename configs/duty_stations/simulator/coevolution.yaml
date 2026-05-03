@@ -1,0 +1,25 @@
+# Coevolution scheduler settings
+# Controls the evolutionary algorithm that tunes plugin parameters over time.
+
+population_size:  8         # individuals per generation
+n_generations:    32        # max generations before stopping
+
+# ── Genetic operators ───────────────────────────────────────────────────────
+mutation_rate:     0.12     # probability a given param gene is mutated
+mutation_sigma:    0.15     # perturbation std dev as fraction of param range
+crossover_rate:    0.55     # probability of single-point crossover per pair
+param_clamp:       true     # clamp mutated values to [min, max] from PARAM_SPECS
+
+# ── Selection ───────────────────────────────────────────────────────────────
+selection:        tournament    # tournament | roulette | elitist
+tournament_k:     3             # tournament group size
+elite_frac:       0.25          # fraction of top individuals carried forward unchanged
+
+# ── Fitness ─────────────────────────────────────────────────────────────────
+fitness_window:   8         # number of frames to average when scoring an individual
+
+# ── Timing ──────────────────────────────────────────────────────────────────
+schedule:
+  epoch_frames:    64       # simulation frames per generation epoch
+  warmup_frames:   16       # initial settling frames (no evolution)
+  cooldown_frames:  8       # frames between selection and next mutation round

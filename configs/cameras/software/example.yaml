@@ -1,0 +1,19 @@
+# configs/cameras/software/example.yaml
+#
+# Declares what CameraSoftware modules a camera runs.
+# Load this with camera_software and attach instances to CameraItem.software.
+#
+# Each entry must have at least a 'module' key matching a CameraSoftware
+# subclass registered in the camera_software package.  Extra keys are passed
+# as constructor keyword arguments.
+#
+# Example:
+#
+# software:
+#   - module: AutoExposure
+#     target_ev: 0.0
+#     speed: 2.0
+#   - module: AutoFocus
+#     speed: 4.0
+
+software: []

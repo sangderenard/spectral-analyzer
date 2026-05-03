@@ -1,0 +1,504 @@
+# Room Control duty station — master config
+# ─────────────────────────────────────────────────────────────────────────────
+# Coordinate convention: +X right, +Y depth, +Z up.  All dimensions in metres.
+# Console origin is front-centre-bottom of the console box.
+
+name: room_control
+module_type: room_control
+
+# ── World transform ───────────────────────────────────────────────────────────
+position: [0.0, 0.0, 0.0]   # override per scene placement
+yaw_deg:  180.0              # faces toward positive-Y (into room by default)
+
+# ── Console body ──────────────────────────────────────────────────────────────
+console:
+  width:         1.40
+  depth:         0.62
+  height:        0.88
+  top_tilt_deg:  14.0
+  bevel:         0.10
+
+# ── Viewscreen ────────────────────────────────────────────────────────────────
+screen:
+  width:          1.10
+  height:         0.72
+  tilt_back_deg:  7.0
+
+# ── Side wings ────────────────────────────────────────────────────────────────
+side_wings:
+  enabled: true
+  width:   0.14
+  height:  0.52
+
+# ── Interaction ───────────────────────────────────────────────────────────────
+interaction_radius: 1.80
+
+interact_camera:
+  eye:    [0.0, 0.70, 1.30]
+  target: [0.0, 2.40, 1.28]
+
+# ── Per-piece PBR materials ───────────────────────────────────────────────────
+# Used by ray-tracing, deferred shading, and baked-lighting pipelines.
+#
+# Fields
+# ------
+# albedo          [r, g, b]  Base colour in linear sRGB (0..1).
+# roughness       float      0 = mirror-smooth, 1 = fully Lambertian.
+# metallic        float      0 = dielectric, 1 = metallic conductor.
+# emission        [r, g, b]  Self-emitted radiance (0 = no emission).
+# ior             float      Index of refraction; used when transmission > 0.
+# transmission    float      0 = opaque, 1 = fully transparent.
+# normal_map      str|null   Tangent-space normal map texture path.
+# albedo_texture  str|null   Albedo texture path (multiplied with albedo).
+
+piece_materials:
+
+  left_wing:
+    domain:         acoustic
+    albedo:         [0.07, 0.07, 0.09]
+    roughness:      0.55
+    metallic:       0.45
+    emission:       [0.0, 0.0, 0.0]
+    ior:            1.50
+    transmission:   0.0
+    normal_map:     null
+    albedo_texture: null
+    spectral_bands:
+      # Brushed composite — reflectance falls slightly at high frequencies
+      - center_hz:    80.0
+        bandwidth_hz: 60.0
+        reflectance:  0.65
+        diffuse_frac: 0.55
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.0
+        ior_imag:     1.8
+      - center_hz:    250.0
+        bandwidth_hz: 180.0
+        reflectance:  0.62
+        diffuse_frac: 0.52
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.0
+        ior_imag:     1.8
+      - center_hz:    800.0
+        bandwidth_hz: 600.0
+        reflectance:  0.58
+        diffuse_frac: 0.48
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.0
+        ior_imag:     1.8
+      - center_hz:    2500.0
+        bandwidth_hz: 2000.0
+        reflectance:  0.52
+        diffuse_frac: 0.45
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.0
+        ior_imag:     1.8
+
+  right_wing:
+    domain:         acoustic
+    albedo:         [0.07, 0.07, 0.09]
+    roughness:      0.55
+    metallic:       0.45
+    emission:       [0.0, 0.0, 0.0]
+    ior:            1.50
+    transmission:   0.0
+    normal_map:     null
+    albedo_texture: null
+    spectral_bands:  []
+    # (right_wing shares left_wing spectral character — use preset alias or copy bands)
+
+  main_surface:           # console top and angled panel face
+    domain:         acoustic
+    albedo:         [0.05, 0.05, 0.07]
+    roughness:      0.30
+    metallic:       0.70
+    emission:       [0.0, 0.0, 0.0]
+    ior:            1.50
+    transmission:   0.0
+    normal_map:     null
+    albedo_texture: null
+    spectral_bands:
+      # Semi-specular metal composite — highly reflective, modest HF absorption
+      - center_hz:    80.0
+        bandwidth_hz: 60.0
+        reflectance:  0.80
+        diffuse_frac: 0.30
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.4
+        ior_imag:     3.0
+      - center_hz:    800.0
+        bandwidth_hz: 600.0
+        reflectance:  0.75
+        diffuse_frac: 0.28
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.4
+        ior_imag:     3.0
+      - center_hz:    4000.0
+        bandwidth_hz: 3000.0
+        reflectance:  0.70
+        diffuse_frac: 0.25
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.4
+        ior_imag:     3.0
+
+  monitor_outline:        # bezel / frame around the screen
+    domain:         acoustic
+    albedo:         [0.03, 0.03, 0.04]
+    roughness:      0.15
+    metallic:       0.90
+    emission:       [0.0, 0.0, 0.0]
+    ior:            1.50
+    transmission:   0.0
+    normal_map:     null
+    albedo_texture: null
+    spectral_bands:
+      # High-gloss metal bezel — near-specular, low acoustic absorption
+      - center_hz:    1000.0
+        bandwidth_hz: {type: q_factor, q: 6.0}
+        reflectance:  0.88
+        diffuse_frac: 0.12
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     2.8
+        ior_imag:     4.5
+
+  monitor:                # screen face (emissive when active)
+    domain:         em_optical
+    albedo:         [0.01, 0.01, 0.02]
+    roughness:      0.04
+    metallic:       0.0
+    emission:       [0.05, 0.28, 0.82]   # LCARS blue glow
+    ior:            1.52
+    transmission:   0.0
+    normal_map:     null
+    albedo_texture: null
+    spectral_bands:
+      # EM optical — LCARS blue (~470 nm) primary, faint cyan secondary
+      - center_hz:    637.0e12   # ~470 nm  (blue primary)
+        bandwidth_hz: 50.0e12
+        reflectance:  0.05
+        transmittance: 0.0
+        diffuse_frac: 0.02
+        emission:     1.00        # strong self-emission
+        reemission:   0.0
+        ior_real:     1.52
+        ior_imag:     0.0
+      - center_hz:    600.0e12   # ~500 nm  (cyan fringe)
+        bandwidth_hz: 30.0e12
+        reflectance:  0.04
+        transmittance: 0.0
+        diffuse_frac: 0.02
+        emission:     0.35
+        reemission:   0.0
+        ior_real:     1.52
+        ior_imag:     0.0
+
+  panels:                 # remaining sub-panels (front face, lower body, etc.)
+    domain:         acoustic
+    albedo:         [0.08, 0.08, 0.10]
+    roughness:      0.50
+    metallic:       0.50
+    emission:       [0.0, 0.01, 0.02]   # faint ambient readout glow
+    ior:            1.50
+    transmission:   0.0
+    normal_map:     null
+    albedo_texture: null
+    spectral_bands:
+      # Mixed panel surface — moderate diffuse broadband
+      - center_hz:    160.0
+        bandwidth_hz: {type: octaves, octaves: 2.0}
+        reflectance:  0.55
+        diffuse_frac: 0.50
+        emission:     0.005
+        reemission:   0.0
+        ior_real:     1.8
+        ior_imag:     1.2
+      - center_hz:    1600.0
+        bandwidth_hz: {type: octaves, octaves: 2.0}
+        reflectance:  0.50
+        diffuse_frac: 0.48
+        emission:     0.002
+        reemission:   0.0
+        ior_real:     1.8
+        ior_imag:     1.2
+
+# ── Cornerstone wall ──────────────────────────────────────────────────────────
+# Built as a DepthMesh so it can carry a depth/height map for 3D relief.
+# shape_type controls which analytical surface is used for the mesh,
+# ray-tracing intersections, and collision geometry.
+#
+# shape_type options
+# ------------------
+# flat          Rectangular flat panel (default).  axis_u=+X, axis_v=+Z,
+#               outward normal=−Y, faces the operator.
+# arc           Concave horizontal cylinder (axis +Z).  Curves left/right
+#               around the operator — like a planetarium screen.
+#               arc_radius = distance from operator to wall surface.
+# vertical_arc  Concave vertical cylinder (axis +X, along station width).
+#               Wall arches up and over — a barrel-vault or cove shape.
+# spherical     Concave sphere cap centred at the operator position,
+#               covering the back wall and the overhead area.
+#
+# Radius constraint: min safe radius = sqrt((width/2)² + (depth+0.5)²).
+# Values below the minimum are clamped silently at build time.
+#
+# Material bands
+# --------------
+# bands is an ordered list of PBR material zones stacked vertically.
+# top is a normalised wall height (0 = floor, 1 = wall top).
+# Each band covers the wall from the previous band's top to this band's top.
+# The last band must reach top: 1.0 (auto-extended if omitted).
+
+cornerstone_wall:
+  enabled:     true
+  width:       1.80        # X extent
+  height:      3.20        # Z extent (floor to top)
+  thickness:   0.05        # visual only; front face placed at y=y_back
+  grid_u:      16          # horizontal subdivisions
+  grid_v:      24          # vertical subdivisions
+  depth_scale: 0.08        # metres of displacement per depth-map unit
+  origin:      bottom_left
+  depth_map_path: null     # .npy / .png heightmap, or null = flat relief
+
+  # Wall shape
+  shape_type:          flat    # flat | arc | vertical_arc | spherical
+  arc_radius:          8.0     # metres — for shape_type: arc
+  vertical_arc_radius: 6.0     # metres — for shape_type: vertical_arc
+  spherical_radius:    7.0     # metres — for shape_type: spherical
+
+  # Material bands (bottom → top, top is normalised wall height 0..1)
+  bands:
+    - top: 0.10
+      material:
+        domain:       acoustic
+        albedo:       [0.12, 0.10, 0.08]   # baseboard / skirting
+        roughness:    0.92
+        metallic:     0.02
+        emission:     [0.0, 0.0, 0.0]
+        ior:          1.50
+        transmission: 0.0
+        spectral_bands:
+          # Dense baseboard — high LF reflection, rising HF absorption
+          - center_hz:    63.0
+            bandwidth_hz: 40.0
+            reflectance:  0.90
+            diffuse_frac: 0.10
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     3.5
+            ior_imag:     0.1
+          - center_hz:    500.0
+            bandwidth_hz: 350.0
+            reflectance:  0.82
+            diffuse_frac: 0.18
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     3.5
+            ior_imag:     0.1
+          - center_hz:    4000.0
+            bandwidth_hz: 3000.0
+            reflectance:  0.70
+            diffuse_frac: 0.30
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     3.5
+            ior_imag:     0.1
+
+    - top: 0.35
+      material:
+        domain:       acoustic
+        albedo:       [0.14, 0.14, 0.17]   # lower panel
+        roughness:    0.80
+        metallic:     0.06
+        emission:     [0.0, 0.0, 0.0]
+        ior:          1.50
+        transmission: 0.0
+        spectral_bands:
+          # Lower composite wall panel — mid-frequency absorber
+          - center_hz:    125.0
+            bandwidth_hz: 90.0
+            reflectance:  0.78
+            diffuse_frac: 0.22
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     2.2
+            ior_imag:     0.2
+          - center_hz:    1000.0
+            bandwidth_hz: 700.0
+            reflectance:  0.65
+            diffuse_frac: 0.35
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     2.2
+            ior_imag:     0.2
+          - center_hz:    8000.0
+            bandwidth_hz: 5000.0
+            reflectance:  0.50
+            diffuse_frac: 0.45
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     2.2
+            ior_imag:     0.2
+
+    - top: 0.65
+      material:
+        domain:       acoustic
+        albedo:       [0.10, 0.10, 0.13]   # mid wall
+        roughness:    0.75
+        metallic:     0.04
+        emission:     [0.0, 0.0, 0.0]
+        ior:          1.50
+        transmission: 0.0
+        spectral_bands:
+          # Mid-wall composite — moderate broadband absorption
+          - center_hz:    250.0
+            bandwidth_hz: 180.0
+            reflectance:  0.72
+            diffuse_frac: 0.28
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     2.0
+            ior_imag:     0.15
+          - center_hz:    2000.0
+            bandwidth_hz: 1400.0
+            reflectance:  0.62
+            diffuse_frac: 0.35
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     2.0
+            ior_imag:     0.15
+          - center_hz:    12000.0
+            bandwidth_hz: 6000.0
+            reflectance:  0.50
+            diffuse_frac: 0.45
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     2.0
+            ior_imag:     0.15
+
+    - top: 1.0
+      material:
+        domain:       acoustic
+        albedo:       [0.08, 0.08, 0.11]   # upper wall / ceiling transition
+        roughness:    0.72
+        metallic:     0.03
+        emission:     [0.0, 0.0, 0.0]
+        ior:          1.50
+        transmission: 0.0
+        spectral_bands:
+          # Upper wall — slight HF diffuser treatment (scattering panels)
+          - center_hz:    500.0
+            bandwidth_hz: {type: octaves, octaves: 1.5}
+            reflectance:  0.68
+            diffuse_frac: 0.40
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     1.9
+            ior_imag:     0.1
+          - center_hz:    4000.0
+            bandwidth_hz: {type: octaves, octaves: 1.5}
+            reflectance:  0.55
+            diffuse_frac: 0.50
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     1.9
+            ior_imag:     0.1
+          - center_hz:    16000.0
+            bandwidth_hz: {type: octaves, octaves: 1.5}
+            reflectance:  0.42
+            diffuse_frac: 0.58
+            emission:     0.0
+            reemission:   0.0
+            ior_real:     1.9
+            ior_imag:     0.1
+
+# ── Floor tile ────────────────────────────────────────────────────────────────
+floor_tile:
+  enabled:        true
+  width:          2.00     # X extent centred on console
+  depth:          2.20     # Y extent (front-to-back)
+  grid_u:         8
+  grid_v:         8
+  depth_scale:    0.02     # subtle tile relief
+  origin:         bottom_left
+  depth_map_path: null
+
+  material:
+    domain:         acoustic
+    albedo:         [0.10, 0.12, 0.16]
+    roughness:      0.85
+    metallic:       0.05
+    emission:       [0.0, 0.0, 0.0]
+    ior:            1.50
+    transmission:   0.0
+    normal_map:     null
+    albedo_texture: null
+    spectral_bands:
+      # Hard floor tile — high reflectance across most of the spectrum,
+      # small HF absorption from grout and surface texture
+      - center_hz:    80.0
+        bandwidth_hz: 60.0
+        reflectance:  0.95
+        diffuse_frac: 0.08
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     4.0
+        ior_imag:     0.05
+      - center_hz:    1000.0
+        bandwidth_hz: 700.0
+        reflectance:  0.92
+        diffuse_frac: 0.12
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     4.0
+        ior_imag:     0.05
+      - center_hz:    8000.0
+        bandwidth_hz: 5000.0
+        reflectance:  0.85
+        diffuse_frac: 0.18
+        emission:     0.0
+        reemission:   0.0
+        ior_real:     4.0
+        ior_imag:     0.05
+
+# ── Panels (left / center / right) ───────────────────────────────────────────
+panels:
+  left:    left_controls.yaml
+  center:  center_controls.yaml
+  right:   right_controls.yaml
+
+  layout:
+    left_width:   280      # px
+    right_width:  280      # px
+    # center fills remaining space
+
+# ── OpenGL Phong override ─────────────────────────────────────────────────────
+# Fast-path material params for the existing Phong rasteriser.
+# Ray-tracing consumers should use piece_materials / cornerstone_wall.bands
+# and floor_tile.material instead.
+gl_materials:
+  body:
+    albedo_rgb:    [0.07, 0.09, 0.13]
+    ambient:       0.18
+    spec_strength: 0.55
+    shininess:     112.0
+    grain:         0.05
+
+  trim:
+    albedo_rgb:    [0.02, 0.18, 0.42]
+    emissive:      [0.00, 0.28, 0.78]
+
+  screen_active:
+    albedo_rgb:    [0.02, 0.04, 0.08]
+    emissive:      [0.05, 0.28, 0.82]
+
+  screen_inactive:
+    albedo_rgb:    [0.01, 0.01, 0.02]
+    emissive:      [0.00, 0.00, 0.00]

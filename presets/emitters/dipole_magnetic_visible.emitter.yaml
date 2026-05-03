@@ -1,0 +1,39 @@
+name: dipole_magnetic_visible
+spectral:
+  model: flat
+  temperature_K: 6500.0
+  center_um: 0.55
+  sigma_um: 0.03
+  fwhm_um: 0.002
+  wavelengths_um: []
+  weights: []
+  radiant_exitance: 1.0
+phase:
+  model: incoherent
+  coherence_length_um: 0.0
+  phase_offset_rad: 0.0
+  temporal_coherence_s: 0.0
+directional:
+  model: dipole_magnetic
+  beam_waist_um: 50.0
+  divergence_half_angle_rad: 0.0
+  center_wavelength_um: 0.55
+  numerical_aperture: 0.5
+  half_angle_rad: 0.5235987755982988
+  hg_g: 0.0
+polarization:
+  mode: linear
+  angle_deg: 90.0
+  handedness: 1
+  jones:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  degree_of_polarization: 1.0
+display_tint:
+- 0.7
+- 0.9
+- 0.9
+label: Oscillating magnetic dipole (visible broadband)
+notes: Oscillating magnetic dipole. Same geometry as electric dipole, rotated 90°.

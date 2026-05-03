@@ -1,0 +1,107 @@
+# Room Control — LEFT panel controls
+# ─────────────────────────────────────────────────────────────────────────────
+# Lighting and scene-ambient controls presented on the left side panel.
+# Each knob maps to a logical room parameter that RoomControlStation exposes.
+
+panel:
+  title: LIGHTING
+  accent_rgb: [0.00, 0.28, 0.78]   # LCARS blue
+
+sections:
+  - id: scene_light
+    label: Scene Light
+    knobs:
+      - name: ambient_intensity
+        label: Ambient
+        dtype: float
+        default: 0.35
+        low: 0.00
+        high: 1.00
+        step: 0.01
+        unit: ""
+        fmt: ".2f"
+        group: scene_light
+
+      - name: diffuse_intensity
+        label: Diffuse
+        dtype: float
+        default: 0.70
+        low: 0.00
+        high: 1.50
+        step: 0.01
+        unit: ""
+        fmt: ".2f"
+        group: scene_light
+
+      - name: specular_intensity
+        label: Specular
+        dtype: float
+        default: 0.40
+        low: 0.00
+        high: 2.00
+        step: 0.01
+        unit: ""
+        fmt: ".2f"
+        group: scene_light
+
+  - id: color_temperature
+    label: Color Temperature
+    knobs:
+      - name: color_temp_k
+        label: Temp (K)
+        dtype: float
+        default: 4500.0
+        low: 2700.0
+        high: 6500.0
+        step: 50.0
+        unit: K
+        fmt: ".0f"
+        group: color_temperature
+        is_log: false
+
+      - name: tint_green
+        label: Tint G
+        dtype: float
+        default: 0.0
+        low: -0.15
+        high: 0.15
+        step: 0.005
+        unit: ""
+        fmt: ".3f"
+        group: color_temperature
+
+  - id: zones
+    label: Zones
+    knobs:
+      - name: active_zone
+        label: Zone
+        dtype: choice
+        default: all
+        choices: [all, front, rear, left, right, ceiling]
+        group: zones
+
+      - name: zone_intensity
+        label: Zone Level
+        dtype: float
+        default: 1.00
+        low: 0.00
+        high: 1.00
+        step: 0.01
+        unit: ""
+        fmt: ".2f"
+        group: zones
+
+  - id: override
+    label: Override
+    knobs:
+      - name: lights_on
+        label: Lights On
+        dtype: bool
+        default: true
+        group: override
+
+      - name: emergency_override
+        label: Emergency
+        dtype: bool
+        default: false
+        group: override

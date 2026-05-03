@@ -1,0 +1,122 @@
+# Room Control — RIGHT panel controls
+# ─────────────────────────────────────────────────────────────────────────────
+# Environmental, security, and access controls.
+
+panel:
+  title: ENVIRONMENT
+  accent_rgb: [0.00, 0.28, 0.78]
+
+sections:
+  - id: climate
+    label: Climate
+    knobs:
+      - name: temp_setpoint
+        label: Temp Set
+        dtype: float
+        default: 21.0
+        low: 15.0
+        high: 32.0
+        step: 0.5
+        unit: "°C"
+        fmt: ".1f"
+        group: climate
+
+      - name: humidity_setpoint
+        label: Humidity
+        dtype: float
+        default: 45.0
+        low: 20.0
+        high: 80.0
+        step: 1.0
+        unit: "%"
+        fmt: ".0f"
+        group: climate
+
+      - name: airflow_rate
+        label: Airflow
+        dtype: float
+        default: 0.50
+        low: 0.00
+        high: 1.00
+        step: 0.05
+        unit: ""
+        fmt: ".2f"
+        group: climate
+
+  - id: acoustics
+    label: Acoustics
+    knobs:
+      - name: room_reverb
+        label: Reverb
+        dtype: float
+        default: 0.30
+        low: 0.00
+        high: 1.00
+        step: 0.01
+        unit: ""
+        fmt: ".2f"
+        group: acoustics
+
+      - name: noise_floor
+        label: Noise Floor
+        dtype: float
+        default: 0.02
+        low: 0.00
+        high: 0.20
+        step: 0.005
+        unit: ""
+        fmt: ".3f"
+        group: acoustics
+
+  - id: access
+    label: Access
+    knobs:
+      - name: door_lock
+        label: Door Lock
+        dtype: bool
+        default: false
+        group: access
+
+      - name: visitor_mode
+        label: Visitor Mode
+        dtype: bool
+        default: false
+        group: access
+
+  - id: alerts
+    label: Alerts
+    knobs:
+      - name: alert_level
+        label: Alert Level
+        dtype: choice
+        default: none
+        choices: [none, low, medium, high, critical]
+        group: alerts
+
+      - name: alert_audio
+        label: Audio Alert
+        dtype: bool
+        default: true
+        group: alerts
+
+      - name: alert_visual
+        label: Visual Alert
+        dtype: bool
+        default: true
+        group: alerts
+
+  - id: cameras
+    label: Cameras
+    knobs:
+      - name: camera_feed
+        label: Camera Feed
+        dtype: choice
+        default: off
+        choices: [off, overview, front, rear, perimeter]
+        group: cameras
+
+      - name: recording
+        label: Recording
+        dtype: bool
+        default: false
+        group: cameras

@@ -1,0 +1,39 @@
+name: laser_633nm_HeNe
+spectral:
+  model: gaussian
+  temperature_K: 6500.0
+  center_um: 0.6328
+  sigma_um: 5.0e-05
+  fwhm_um: 0.002
+  wavelengths_um: []
+  weights: []
+  radiant_exitance: 1.0
+phase:
+  model: coherent
+  coherence_length_um: 300000000.0
+  phase_offset_rad: 0.0
+  temporal_coherence_s: 0.0
+directional:
+  model: gaussian_beam
+  beam_waist_um: 350.0
+  divergence_half_angle_rad: 0.0
+  center_wavelength_um: 0.6328
+  numerical_aperture: 0.5
+  half_angle_rad: 0.5235987755982988
+  hg_g: 0.0
+polarization:
+  mode: linear
+  angle_deg: 0.0
+  handedness: 1
+  jones:
+  - 1.0
+  - 0.0
+  - 0.0
+  - 0.0
+  degree_of_polarization: 1.0
+display_tint:
+- 1.0
+- 0.1
+- 0.05
+label: He-Ne 632.8 nm laser (TEM₀₀)
+notes: He-Ne 632.8 nm CW laser. Excellent coherence (lcoh ~300 m).

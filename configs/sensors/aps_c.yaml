@@ -8,3 +8,4 @@ height_mm: 15.7
 pixel_pitch_um: 5.2
 max_iso: 6400
 dynamic_range_stops: 13.0
+log_scale: false    # true → log(1+bv) tonemap in glow display

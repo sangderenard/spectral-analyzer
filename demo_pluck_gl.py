@@ -37,8 +37,22 @@ import threading
 import queue
 import time
 import wave
+import enum
 from dataclasses import dataclass
 from typing import List, Optional
+
+
+class RenderMode(enum.Enum):
+    """Player-experience render modes.
+
+    GL      — pure OpenGL rasterisation (default).
+    HYBRID  — OpenGL rasterisation augmented with a baked radiant /
+              irradiant / volumetric light field uploaded as textures.
+    RAYTRACE — full ray-trace pass replaces rasterised 3-D rendering.
+    """
+    GL       = "gl"
+    HYBRID   = "hybrid"
+    RAYTRACE = "raytrace"
 
 import numpy as np
 
@@ -103,13 +117,62 @@ except ImportError:
     _cam_pure_matrices = None  # type: ignore[assignment]
     _HAS_DUTY_STATION = False
 
+try:
+    from simulator_station import SimulatorStation as _SimulatorStation
+    _HAS_SIMULATOR_STATION = True
+except ImportError:
+    _SimulatorStation = None  # type: ignore[assignment,misc]
+    _HAS_SIMULATOR_STATION = False
+
+try:
+    from room_workspace import RoomWorkspace as _RoomWorkspace
+    from room_station  import RoomStation   as _RoomStation
+    _HAS_ROOM_STATION = True
+except ImportError:
+    _RoomWorkspace = None  # type: ignore[assignment,misc]
+    _RoomStation   = None  # type: ignore[assignment,misc]
+    _HAS_ROOM_STATION = False
+
+try:
+    from camera_designer_station import CameraDesignerStation as _CameraDesignerStation
+    _HAS_CAMERA_DESIGNER_STATION = True
+except ImportError:
+    _CameraDesignerStation = None  # type: ignore[assignment,misc]
+    _HAS_CAMERA_DESIGNER_STATION = False
+
+try:
+    from camera_item import CameraItem as _CameraItem, build_camera_items as _build_camera_items
+    _HAS_CAMERA_ITEM = True
+except ImportError:
+    _CameraItem = None                  # type: ignore[assignment,misc]
+    _build_camera_items = None          # type: ignore[assignment]
+    _HAS_CAMERA_ITEM = False
+
+try:
+    from camera_panel import CameraHudPanel as _CameraHudPanel
+    _HAS_CAMERA_PANEL = True
+except ImportError:
+    _CameraHudPanel = None              # type: ignore[assignment,misc]
+    _HAS_CAMERA_PANEL = False
+
+try:
+    from material_db import MaterialDatabase as _MaterialDatabase
+    _HAS_MAT_DB = True
+except ImportError:
+    _MaterialDatabase = None  # type: ignore[assignment,misc]
+    _HAS_MAT_DB = False
+
+# Process-global material registry — populated by _load_material_yaml and
+# by any DutyStation / scene-object __init__ that registers its materials.
+_MAT_DB: object = _MaterialDatabase.instance() if _HAS_MAT_DB else None
+
 # ── pygame + OpenGL ───────────────────────────────────────────────────────────
 try:
     import pygame
     from pygame.locals import (
         DOUBLEBUF, OPENGL, QUIT, KEYDOWN, MOUSEBUTTONDOWN,
         MOUSEMOTION, MOUSEWHEEL,
-        K_SPACE, K_r, K_q, K_p, K_w,
+        K_SPACE, K_r, K_q, K_p, K_w, K_e,
         K_1, K_2, K_3, K_4, K_5, K_6, K_7, K_8, K_9,
     )
 except ImportError:
@@ -222,7 +285,7 @@ MAX_FRAMES    = 240
 
 LAYER_OPAQUE, LAYER_ALPHA, LAYER_HIDDEN = 0, 1, 2
 N_LAYERS    = 9
-LAYER_KEYS  = [K_1, K_2, K_3, K_4, K_5, K_6, K_7, K_8, K_9]
+LAYER_KEYS  = [K_1, K_2, K_3, K_4, K_5, K_6, K_7]          # 8/9 (illum/sensor) live in camera panel
 LAYER_NAMES = ['body', 'plate', 'pressure', 'strings', 'markers', 'ray-segs', 'stage', 'illum', 'sensor']
 
 DX             = 0.006   # 6 mm cells — tractable with the generous domain below
@@ -612,17 +675,26 @@ def _config_path(*parts: str) -> str:
 
 
 def _load_material_yaml(name: str) -> np.ndarray:
-    """Load a material YAML from configs/materials/<name>.yaml and return an
-    11-float32 array in the BVH mat11 layout:
-        [refl_in, diff_in, abso_in,
-         refl_out, diff_out, abso_out,
-         albedo_r, albedo_g, albedo_b,
-         ior, opacity]
-    Falls back to a neutral diffuse grey on any error.
+    """Load a material YAML from configs/materials/<name>.yaml and return a
+    16-float32 array in the BVH mat16 layout:
+        [ 0] refl_in,   diff_in,  abso_in,   # mat_in  .xyz
+        [ 3] refl_out,  diff_out, abso_out,  # mat_out .xyz
+        [ 6] albedo_r,  albedo_g, albedo_b,  # albedo  .xyz
+        [ 9] ior,                             # mat_in  .w
+        [10] opacity,                         # mat_out .w
+        [11] mat_flags,  (uint bits as float, 0 = no flags)
+        [12] emit_profile_idx,  (float(int), -1 = none)
+        [13] remit_profile_idx, (float(int), -1 = none)
+        [14] _pad
+        [15] reactive_shift_hz               # Stokes shift; 0 = non-reactive
+    Falls back to a neutral diffuse grey (all profile/flag fields zeroed).
     """
-    _FALLBACK = np.array([0.5, 0.5, 0.0,  0.5, 0.5, 0.0,  0.5, 0.5, 0.5,  1.5, 1.0], np.float32)
+    _FALLBACK = np.zeros(16, np.float32)
+    _FALLBACK[:11] = [0.5, 0.5, 0.0,  0.5, 0.5, 0.0,  0.5, 0.5, 0.5,  1.5, 1.0]
     d = _load_yaml_file(_config_path("materials", f"{name}.yaml"))
     if not d:
+        if _MAT_DB is not None:
+            _MAT_DB.register_mat11(name, _FALLBACK[:11])
         return _FALLBACK
     refl  = float(d.get("reflectivity", 0.5))
     diff  = float(d.get("diffusion",    0.0))
@@ -630,9 +702,27 @@ def _load_material_yaml(name: str) -> np.ndarray:
     alb   = d.get("albedo_rgb", [0.5, 0.5, 0.5])
     ior   = float(d.get("ior",     1.5))
     opac  = float(d.get("opacity", 1.0))
-    return np.array([refl, diff, abso,  refl, diff, abso,
-                     float(alb[0]), float(alb[1]), float(alb[2]),
-                     ior, opac], np.float32)
+    # Optional emission profile indices
+    emit_idx  = int(d.get("emit_profile_idx",  -1))
+    remit_idx = int(d.get("remit_profile_idx", -1))
+    react = float(d.get("reactive_shift_hz", 0.0))
+    # Derive mat_flags
+    _flags = np.uint32(0)
+    if emit_idx >= 0:
+        _flags |= np.uint32(1)   # MAT_FLAG_EMISSIVE = 1u
+    if react != 0.0:
+        _flags |= np.uint32(2)   # MAT_FLAG_REACTIVE = 2u
+    arr = np.zeros(16, np.float32)
+    arr[:11] = [refl, diff, abso,  refl, diff, abso,
+                float(alb[0]), float(alb[1]), float(alb[2]), ior, opac]
+    arr[11]  = np.frombuffer(np.array([_flags], np.uint32).tobytes(), np.float32)[0]
+    arr[12]  = float(emit_idx)
+    arr[13]  = float(remit_idx)
+    arr[14]  = 0.0  # _pad
+    arr[15]  = react
+    if _MAT_DB is not None:
+        _MAT_DB.register_mat11(name, arr)   # full mat16 — DB extracts emissive/flag cols
+    return arr
 
 
 @dataclass
@@ -2883,15 +2973,50 @@ _GPU_RAY_FIELD_CS = """
 #version 430 core
 layout(local_size_x = 128) in;
 
+// ─── Triangle geometry + material in a single 8×vec4 (128-byte) record ──────
+// normal.w  : mat_flags, stored as uint bits via floatBitsToUint / uintBitsToFloat
+// albedo.w  : 1.0 if an emission profile is assigned, 0.0 otherwise
+// emissive  : .x = emit_profile_idx (float->int, index into EmissionProfileBuf)
+//             .y = remit_profile_idx (float->int, index into EmissionProfileBuf)
+//             .z = _pad
+//             .w = reactive Stokes shift (Hz)
 struct Tri {
-    vec4 v0;
-    vec4 e1;
-    vec4 e2;
-    vec4 normal;
-    vec4 mat_in;
-    vec4 mat_out;
-    vec4 albedo;    // surface RGB color (.w unused)
+    vec4 v0;        // .xyz = vertex 0,          .w unused
+    vec4 e1;        // .xyz = edge 1,             .w unused
+    vec4 e2;        // .xyz = edge 2,             .w unused
+    vec4 normal;    // .xyz = face normal,        .w = mat_flags (uint bits)
+    vec4 mat_in;    // .xyz = refl/diff/abso,     .w = IOR
+    vec4 mat_out;   // .xyz = refl/diff/abso,     .w = opacity
+    vec4 albedo;    // .xyz = surface albedo,     .w = 1.0 if emission profile assigned
+    vec4 emissive;  // .x  = emit_profile_idx,   .y = remit_profile_idx,  .z = _pad,  .w = reactive shift Hz
 };
+
+// ─── Material flag bits (packed into Tri.normal.w as uint) ──────────────────
+// Test with: (floatBitsToUint(tri.normal.w) & MAT_FLAG_*) != 0u
+#define MAT_FLAG_EMISSIVE    1u  // surface adds energy to field on every hit
+#define MAT_FLAG_REACTIVE    2u  // post-impact re-emitter: enqueues PendingRay
+#define MAT_FLAG_ABSORBER    4u  // terminates ray without bounce
+#define MAT_FLAG_NO_SHADOW   8u  // shadow/visibility rays pass through
+#define MAT_FLAG_MANIFOLD      16u  // lens manifold surface: transform ray direction
+                                    // emissive.y holds the manifold slot index
+#define MAT_FLAG_TRANSMISSIVE  64u  // explicit glass surface (opacity→0 set by scene builder)
+
+// ─── PendingRay: mid-bounce secondary emission queued for the reactive pass ─
+// origin_flags.w holds pending-ray-specific pass flags (uint bits).
+// dir_bounces.w  holds remaining bounce budget (uint bits).
+#define PRAY_NO_REACTIVE    1u  // this ray won't spawn further reactive emissions
+#define PRAY_DIRECT_ONLY    2u  // only volume-splat; skip geometry bounce
+struct PendingRay {
+    vec4 origin_flags;   // .xyz = world origin, .w = pray_flags (uint bits)
+    vec4 dir_bounces;    // .xyz = direction,    .w = bounces remaining (uint bits)
+    vec4 packet;         // .x=freq_hz, .y=phase, .z=energy, .w=coherence
+    vec4 normal_triid;   // .xyz = hit normal at spawn, .w = source tri index
+};
+
+// ─── Pass-mode constants ─────────────────────────────────────────────────────
+#define PASS_FORWARD  0   // forward emission from bdpt_sources + emissive tris
+#define PASS_SENSOR   1   // backward camera/sensor visibility pass
+#define PASS_REACTIVE 2   // reactive re-emission pass (processes PendingRayBuf)
 
 struct Node {
     vec4 lo_left;
@@ -2899,22 +3024,51 @@ struct Node {
     vec4 start_count;
 };
 
-layout(std430, binding = 0) readonly buffer TriBuf { Tri tris[]; };
-layout(std430, binding = 1) readonly buffer NodeBuf { Node nodes[]; };
-layout(std430, binding = 2) readonly buffer TriIdBuf { int tri_ids[]; };
-layout(std430, binding = 3) buffer SegmentBuf { vec4 segs[]; };
-layout(std430, binding = 4) buffer CounterBuf {
+layout(std430, binding = 0) readonly buffer TriBuf      { Tri        tris[];          };
+layout(std430, binding = 1) readonly buffer NodeBuf     { Node       nodes[];          };
+layout(std430, binding = 2) readonly buffer TriIdBuf    { int        tri_ids[];        };
+layout(std430, binding = 3) buffer         SegmentBuf   { vec4       segs[];           };
+layout(std430, binding = 4) buffer         CounterBuf   {
     uint seg_count;
     uint ray_count;
     uint hit_count;
     uint record_count;
+    uint pending_count;  // reactive queue depth — written by forward pass
 };
 struct SourceRec {
     vec4 pos_weight; // xyz=position, w=ray-budget weight
     vec4 dir_kind;   // xyz=emission axis, w=reserved
     vec4 packet;     // x=freq/coord, y=phase, z=energy, w=coherence/sigma
 };
-layout(std430, binding = 5) readonly buffer SourceBuf { SourceRec bdpt_sources[]; };
+layout(std430, binding = 5) readonly buffer SourceBuf     { SourceRec  bdpt_sources[]; };
+layout(std430, binding = 6) buffer         PendingRayBuf  { PendingRay pending_rays[]; };
+
+// Emission / remission / color profile data — flat float buffer at binding 7.
+// Each profile header occupies exactly 20 consecutive floats (5 vec4s stride):
+//   [0]  profile_type  0=EmissionProfile 1=RemissionProfile(spread)
+//                      2=ColorProfile    3=PROFILE_MANIFOLD (remit+noodles)
+//   [1]  noodle_start  — float index from buffer start where noodle rows begin
+//                        (0 if not manifold)
+//   [2]  noodle_count  — number of noodle rows in this manifold (0 if not manifold)
+//   [3]  _pad
+//   [4-7]  angular spread  (type, amp, center, q)
+//   [8-11] phase spread
+//   [12-15] frequency spread
+//   [16-19] amplitude spread
+// After all N headers, noodle rows follow (stride 12 floats each):
+//   [0,1] u,v  [2,3] fu,fv  [4,5,6] in_dir  [7,8,9] out_dir  [10] opl  [11] _pad
+#define PROFILE_MANIFOLD 3
+layout(std430, binding = 7) readonly buffer EmissionProfileBuf { float ep_data[]; };
+// ─── Wave-physics scale context spheres (binding 8) ──────────────────────────
+// Each sphere names a medium region where wave-accurate propagation applies:
+// in-medium phase shift k_n×Δr, evanescent decay exp(−k_im×Δr), and
+// near-field 1/(1+r²) spreading vs geometric 1/(1+r) outside contexts.
+// Binding 8 is in the SSBO namespace — safe alongside sampler bindings 8-15.
+struct ScaleContext {
+    vec4 center_radius;      // .xyz = sphere center  .w = sphere radius
+    vec4 dtm_nre_nim_type;   // .x = dt_m  .y = n_real  .z = n_imag  .w = scale_type (1=wave)
+};
+layout(std430, binding = 8) readonly buffer ScaleContextBuf { ScaleContext scale_ctxs[]; };
 layout(r32ui, binding = 0) uniform uimage3D uLayer0;
 layout(r32ui, binding = 1) uniform uimage3D uLayer1;
 layout(r32ui, binding = 2) uniform uimage3D uLayer2;
@@ -2948,6 +3102,11 @@ uniform vec3  uSrcDir;
 // 0.0 = 90° half-angle, cos(30°)≈0.866 = narrow spotlight.
 uniform float uSrcRadius;
 uniform float uSrcConeCos;
+// EmitterProfile directional model for per-source exact importance sampling.
+// 0=LAMBERTIAN 1=DIPOLE_INPLANE_MIXED 2=GAUSSIAN_BEAM 3=ETENDUE_LIMITED
+// 4=PROJECTIVE 5=HENYEY_GREENSTEIN 6=ISOTROPIC
+uniform int   uSrcDirModel;
+uniform float uSrcDirParam;  // theta_d_rad / cos_theta_max / hg_g / unused
 uniform vec3  uBoxMin;
 uniform vec3  uBoxMax;
 uniform ivec3 uDims;
@@ -2965,14 +3124,19 @@ uniform float uMediumExtinction;  // extinction coefficient (default 0.5)
 uniform float uAirDiffuseScatter;
 uniform float uAirSpecularScatter;
 uniform float uAirAnisotropy;
+// Wave-physics context uniforms
+uniform int   uScaleContextCount;   // entries in ScaleContextBuf (0 = none, disables context loops)
+uniform float uSpeedOfMedium;       // propagation speed m/s (343 acoustic, 3e8 optical)
 // Bidirectional sensor pass uniforms
-// uMode 0 = forward source emission (default); 1 = backward sensor visibility.
-// In mode 1, uSrcPos/uSrcDir are the sensor (camera) position and look direction.
+// uMode PASS_FORWARD(0) = forward source emission (default).
+// uMode PASS_SENSOR(1)  = backward sensor visibility; uSrcPos/uSrcDir are camera eye/dir.
+// uMode PASS_REACTIVE(2)= reactive re-emission; processes pending_rays[0..pending_count-1].
 // uFwdLayer[0-7] are the completed forward accumulation textures read as integer
 // samplers — texelFetch returns raw uint counts.  uSensorNorm normalises them
 // back to per-ray energy.  uSensorGain amplifies surface contributions so they
 // emerge as bright shells in the volume march.
 uniform int   uMode;
+uniform int   uPendingCap;   // capacity of PendingRayBuf; 0 disables reactive queuing
 uniform float uSensorNorm;
 uniform float uSensorGain;
 uniform float uSensorConeCos;
@@ -3044,6 +3208,102 @@ vec3 cone_dir(float u, float v, vec3 axis, float cos_theta_max) {
     return normalize(x * local.x + y * local.y + w * local.z);
 }
 
+// ─── EmitterProfile analytic importance samplers ────────────────────────────────────
+#define DIRMODEL_LAMBERTIAN     0
+#define DIRMODEL_DIPOLE_INPLANE 1
+#define DIRMODEL_GAUSSIAN_BEAM  2
+#define DIRMODEL_ETENDUE        3
+// DIRMODEL_PROJECTIVE: ideal flat-top cone — BACKTRACE / SENSOR PASS ONLY.
+// This is a programmatic ray-bundle model (e.g. structured-light sensor frustum).
+// It is NOT a physical forward-emission model and MUST NOT be assigned to any
+// real emitter (stage lights, LEDs, lasers).  Real etendue-limited sources use
+// DIRMODEL_ETENDUE (model_int=3).  Using PROJECTIVE on a forward source produces
+// physically meaningless energy distributions.
+#define DIRMODEL_PROJECTIVE     4
+#define DIRMODEL_HG             5
+#define DIRMODEL_ISOTROPIC      6
+
+// Build a world-space direction from a local frame aligned to `axis`.
+vec3 _to_world_axis(vec3 local, vec3 axis) {
+    vec3 w  = normalize(axis);
+    vec3 up = abs(w.z) < 0.9 ? vec3(0,0,1) : vec3(0,1,0);
+    vec3 x  = normalize(cross(up, w));
+    vec3 y  = cross(w, x);
+    return normalize(x * local.x + y * local.y + w * local.z);
+}
+
+// DIPOLE_INPLANE_MIXED: I(θ) = (1 + cos²θ) / 2  on the full sphere.
+// Exact CDF inversion via Cardano's formula:
+//   F(θ) = (c³ + 3c + 4) / 8  where c = cosθ
+//   ⇒  c³ + 3c + (4 - 8ξ) = 0
+float _sample_dipole_inplane(float xi) {
+    float k = 4.0 - 8.0 * xi;
+    float M = sqrt(k * k * 0.25 + 1.0);
+    return pow(M - k * 0.5, 1.0 / 3.0) - pow(M + k * 0.5, 1.0 / 3.0);
+}
+
+// GAUSSIAN_BEAM: paraxial Rayleigh importance sampler.
+// Exact for small divergence beams: θ ~ Rayleigh(θ_d)  ⇒  θ = θ_d * sqrt(-ln u)
+vec3 _sample_gaussian_beam(float u, float v, vec3 axis, float theta_d) {
+    float theta = theta_d * sqrt(max(0.0, -log(max(u, 1e-7))));
+    theta = min(theta, PI);
+    float sinT = sin(theta);
+    float cosT = cos(theta);
+    return _to_world_axis(vec3(sinT * cos(2.0*PI*v), sinT * sin(2.0*PI*v), cosT), axis);
+}
+
+// HENYEY_GREENSTEIN: exact analytic CDF inversion.
+float _sample_hg_cos(float xi, float g) {
+    if (abs(g) < 1e-3) return 2.0 * xi - 1.0;
+    float s = (1.0 - g*g) / (1.0 - g + 2.0*g*xi);
+    return clamp((1.0 + g*g - s*s) / (2.0*g), -1.0, 1.0);
+}
+
+// Master emission direction sampler -- dispatches on uSrcDirModel.
+// u1, u2 are independent uniform [0,1) samples.
+vec3 _emit_dir(float u1, float u2, vec3 axis) {
+    int   model = uSrcDirModel;
+    float param = uSrcDirParam;
+
+    if (model == DIRMODEL_DIPOLE_INPLANE) {
+        float cosT = _sample_dipole_inplane(u1);
+        float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+        float phi  = 2.0 * PI * u2;
+        return _to_world_axis(vec3(sinT*cos(phi), sinT*sin(phi), cosT), axis);
+    }
+    if (model == DIRMODEL_GAUSSIAN_BEAM) {
+        return _sample_gaussian_beam(u1, u2, axis, param);
+    }
+    if (model == DIRMODEL_ETENDUE) {
+        // param = cos(theta_max).  ETENDUE_LIMITED is the correct model for any real
+        // optical system with a defined numerical aperture (spotlight, LED+lens, fibre).
+        // It is forward-emission safe.  param = cos(asin(NA)).
+        return cone_dir(u1, u2, axis, param);
+    }
+    if (model == DIRMODEL_PROJECTIVE) {
+        // BACKTRACE / SENSOR PASS ONLY.  param = cos(theta_max).
+        // Do not assign this model to any physical forward source.  It is used
+        // exclusively for the sensor visibility backward pass where rays are
+        // confined to a measurement frustum, NOT sampled from a real emitter.
+        return cone_dir(u1, u2, axis, param);
+    }
+    if (model == DIRMODEL_HG) {
+        float cosT = _sample_hg_cos(u1, param);
+        float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+        float phi  = 2.0 * PI * u2;
+        return _to_world_axis(vec3(sinT*cos(phi), sinT*sin(phi), cosT), axis);
+    }
+    if (model == DIRMODEL_ISOTROPIC) {
+        // Full-sphere uniform
+        float cosT = 2.0 * u1 - 1.0;
+        float sinT = sqrt(max(0.0, 1.0 - cosT * cosT));
+        float phi  = 2.0 * PI * u2;
+        return vec3(sinT*cos(phi), sinT*sin(phi), cosT);
+    }
+    // Default: LAMBERTIAN cosine-weighted hemisphere (exact)
+    return cosine_dir(u1, u2, axis);
+}
+
 bool hit_tri(vec3 ro, vec3 rd, Tri t, out float hit_t) {
     vec3 h = cross(rd, t.e2.xyz);
     float a = dot(t.e1.xyz, h);
@@ -3059,6 +3319,20 @@ bool hit_tri(vec3 ro, vec3 rd, Tri t, out float hit_t) {
     if (tt <= 1e-6) return false;
     hit_t = tt;
     return true;
+}
+
+// Recompute Möller-Trumbore barycentric (u,v) for a known-hit triangle.
+// Returns the same u,v produced during intersection — direct surface params.
+vec2 bary_uv(vec3 ro, vec3 rd, Tri t) {
+    vec3 h = cross(rd, t.e2.xyz);
+    float a = dot(t.e1.xyz, h);
+    if (abs(a) < 1e-10) return vec2(0.0);
+    float f = 1.0 / a;
+    vec3 s = ro - t.v0.xyz;
+    float u = f * dot(s, h);
+    vec3 q = cross(s, t.e1.xyz);
+    float v = f * dot(rd, q);
+    return vec2(u, v);
 }
 
 bool slab_axis(float ro, float rd, float lo, float hi, inout float near_t, inout float far_t) {
@@ -3280,6 +3554,194 @@ void splat_segment_spectral(vec3 a, vec3 b, vec4 packet) {
     }
 }
 
+// ─── Ray-sphere interval ─────────────────────────────────────────────────────
+// Returns (t_enter, t_exit) along the ray ro+t*rd.
+// Returns (1e30, -1.0) if the ray misses or exits behind the origin.
+vec2 ray_sphere_t(vec3 ro, vec3 rd, vec3 center, float radius) {
+    vec3  oc   = ro - center;
+    float b    = dot(oc, rd);
+    float c    = dot(oc, oc) - radius * radius;
+    float disc = b * b - c;
+    if (disc < 0.0) return vec2(1e30, -1.0);
+    float sq = sqrt(disc);
+    return vec2(-b - sq, -b + sq);
+}
+
+// ─── Multiscale segment splat ─────────────────────────────────────────────────
+// Walks [a, b] through registered ScaleContext spheres.  Inside each wave-type
+// sphere the sub-samples use: phase k_n×step (via display proportionality),
+// evanescent exp(−k_im×step), and 1/(1+r²) near-field spreading.
+// Outside contexts the existing Beer-Lambert geometric splat is used.
+// path_start: accumulated ray path length at point `a` (for near-field spreading).
+// Does NOT modify the caller's packet — only writes to the 3D accumulation images.
+void splat_segment_multiscale(vec3 a, vec3 b, vec4 packet, float path_start) {
+    float seg_len = length(b - a);
+    if (seg_len < EPS) return;
+    // Fast path: no contexts registered
+    if (uScaleContextCount == 0) {
+        splat_segment_spectral(a, b, packet);
+        return;
+    }
+    vec3 seg_dir = (b - a) / seg_len;
+    // Collect context-sphere intervals intersecting [0, seg_len], sorted by t_enter
+    float iv_te[8]; float iv_tx[8]; int iv_ci[8]; int n_iv = 0;
+    int n_ctx = min(uScaleContextCount, 16);
+    for (int ci = 0; ci < n_ctx; ci++) {
+        vec2 tt = ray_sphere_t(a, seg_dir,
+                               scale_ctxs[ci].center_radius.xyz,
+                               scale_ctxs[ci].center_radius.w);
+        if (tt.y <= EPS) continue;
+        float te = max(tt.x, 0.0);
+        float tx = min(tt.y, seg_len);
+        if (te >= tx - EPS) continue;
+        int ins = n_iv;
+        for (int j = 0; j < n_iv; j++) { if (te < iv_te[j]) { ins = j; break; } }
+        for (int j = min(n_iv, 7); j > ins; j--) {
+            iv_te[j] = iv_te[j-1]; iv_tx[j] = iv_tx[j-1]; iv_ci[j] = iv_ci[j-1];
+        }
+        if (n_iv < 8) { iv_te[ins] = te; iv_tx[ins] = tx; iv_ci[ins] = ci; n_iv++; }
+    }
+    if (n_iv == 0) {
+        splat_segment_spectral(a, b, packet);
+        return;
+    }
+    // Walk sub-regions
+    float t_walk    = 0.0;
+    float cur_phase = packet.y;
+    for (int ii = 0; ii <= n_iv; ii++) {
+        float t_end = (ii < n_iv) ? iv_te[ii] : seg_len;
+        // Geometric sub-span [t_walk, t_end]
+        if (t_end - t_walk > EPS) {
+            float span = t_end - t_walk;
+            vec3  p0s  = a + t_walk * seg_dir;
+            vec3  p1s  = a + t_end  * seg_dir;
+            int steps  = max(1, int(span / uVolumeStepMeters));
+            for (int k = 0; k <= steps; k++) {
+                float s    = float(k) / float(steps);
+                float dist = s * span;
+                vec3  p    = p0s + (p1s - p0s) * s;
+                float freq_f   = clamp(packet.x / 440.0, 0.25, 8.0);
+                float transmit = exp(-uMediumExtinction * dist * freq_f);
+                vec4 geo_pkt = vec4(packet.x,
+                                    cur_phase + dist * packet.x * 0.000021,
+                                    packet.z * transmit * uMediumScattering * uVolumeStepMeters,
+                                    packet.w);
+                splat_spectral(p, geo_pkt);
+            }
+            cur_phase += span * packet.x * 0.000021;
+        }
+        t_walk = t_end;
+        if (ii >= n_iv) break;
+        // Wave-context sub-span [iv_te[ii], iv_tx[ii]]
+        float ctx_t0   = iv_te[ii];
+        float ctx_t1   = iv_tx[ii];
+        float ctx_span = ctx_t1 - ctx_t0;
+        int   ci       = iv_ci[ii];
+        float n_re     = scale_ctxs[ci].dtm_nre_nim_type.y;
+        float n_im     = scale_ctxs[ci].dtm_nre_nim_type.z;
+        float dt_m     = max(scale_ctxs[ci].dtm_nre_nim_type.x, ctx_span * 0.03125);
+        // Cap sub-steps at 32 for GPU budget; wave phase is exact per-step
+        int n_sub = clamp(int(ctx_span / dt_m), 1, 32);
+        for (int ss = 0; ss < n_sub; ss++) {
+            float t0_ss  = ctx_t0 + float(ss)     / float(n_sub) * ctx_span;
+            float step   = ctx_span / float(n_sub);
+            vec3  p_mid  = a + (t0_ss + step * 0.5) * seg_dir;
+            // Phase: k_n × step = 2π f n_re / c × step → via display proportionality n_re × legacy
+            float phase_step = step * packet.x * 0.000021 * n_re;
+            // Evanescent decay: exp(−k_im × step) via same proportionality
+            float amp_decay  = exp(-step * packet.x * 0.000021 * n_im);
+            // Near-field spreading: 1/(1+r²) where r = total path to midpoint
+            float r_mid    = path_start + t0_ss + step * 0.5;
+            float spread_w = 1.0 / (1.0 + r_mid * r_mid);
+            float freq_f   = clamp(packet.x / 440.0, 0.25, 8.0);
+            float transmit = exp(-uMediumExtinction * float(ss) / float(n_sub) * ctx_span * freq_f);
+            vec4 wave_pkt = vec4(packet.x,
+                                 cur_phase + phase_step * 0.5,
+                                 packet.z * amp_decay * spread_w *
+                                     uMediumScattering * step * transmit,
+                                 packet.w);
+            splat_spectral(p_mid, wave_pkt);
+            cur_phase += phase_step;
+        }
+        t_walk = ctx_t1;
+    }
+}
+
+// ─── Wave-context physics: correct master packet for in-medium phase & decay ──
+// Call once per segment AFTER splatting.  Returns packet with:
+//   phase  += k_display × (n_re - 1) × ctx_span  (extra phase in dense medium)
+//   energy ×= exp(−k_display × n_im × ctx_span)   (evanescent decay)
+// Only wave-type contexts (scale_type == 1) are applied.
+vec4 apply_wave_context_physics(vec3 ro, vec3 rd, float best, vec4 packet) {
+    int n_ctx = min(uScaleContextCount, 16);
+    for (int ci = 0; ci < n_ctx; ci++) {
+        if (int(round(scale_ctxs[ci].dtm_nre_nim_type.w)) != 1) continue;
+        vec2 tt  = ray_sphere_t(ro, rd,
+                                scale_ctxs[ci].center_radius.xyz,
+                                scale_ctxs[ci].center_radius.w);
+        if (tt.y <= EPS) continue;
+        float te       = max(tt.x, 0.0);
+        float tx       = min(tt.y, best);
+        float ctx_span = tx - te;
+        if (ctx_span < EPS) continue;
+        float n_re = scale_ctxs[ci].dtm_nre_nim_type.y;
+        float n_im = scale_ctxs[ci].dtm_nre_nim_type.z;
+        // Extra phase beyond ambient (medium denser than vacuum/air)
+        packet.y += ctx_span * packet.x * 0.000021 * (n_re - 1.0);
+        // Evanescent amplitude decay through absorptive medium
+        packet.z *= exp(-ctx_span * packet.x * 0.000021 * n_im);
+    }
+    return packet;
+}
+
+// ─── Forward declaration (definition follows spawn_edge_diffraction) ────────
+void append_pending_ray(vec3 origin, vec3 dir, vec4 packet,
+                        int bounces_rem, uint pray_flags,
+                        vec3 hit_normal, int tri_id);
+
+// ─── Keller GTD edge diffraction ─────────────────────────────────────────────
+// Spawns one Huygens secondary into PendingRayBuf when hp is within ~2λ of
+// edge [vA, vB].  Amplitude = packet.z × sqrt(λ/dist_edge) (cylindrical).
+// Direction = random on the Keller diffraction cone (preserves angle with edge).
+// Phase = packet.y + π/2 (Huygens secondary wavelet).
+void spawn_edge_diffraction(
+        vec3 hp, vec3 rd, vec4 packet, int bounce,
+        vec3 vA, vec3 vB, vec3 face_normal, int hit_tri,
+        inout uint rng)
+{
+    vec3  edge_v   = vB - vA;
+    float edge_len = length(edge_v);
+    if (edge_len < EPS) return;
+    vec3  te     = edge_v / edge_len;
+    float t_near = clamp(dot(hp - vA, te), 0.0, edge_len);
+    vec3  edge_pt = vA + t_near * te;
+    float dist_to_edge = length(hp - edge_pt);
+    // λ in display-scale units: 1 / (freq × 0.000021)
+    float k_scale  = max(packet.x * 0.000021, 1e-9);
+    float lambda_d = 1.0 / k_scale;
+    if (dist_to_edge > lambda_d * 2.0) return;
+    int bounces_rem = uMaxBounces - bounce - 1;
+    if (bounces_rem <= 0) return;
+    // Keller cylindrical-wave amplitude: 0.3 × sqrt(λ / r_edge)
+    float r_edge = max(dist_to_edge, lambda_d * 0.1);
+    float keller = min(packet.z * sqrt(lambda_d / r_edge) * 0.3, packet.z * 0.5);
+    if (keller < 0.002) return;
+    // Keller diffraction-cone direction (random azimuth, same polar angle as rd)
+    float cos_e = dot(-normalize(rd), te);
+    float sin_e = sqrt(max(0.0, 1.0 - cos_e * cos_e));
+    vec3  w     = te;
+    vec3  up    = abs(w.z) < 0.9 ? vec3(0, 0, 1) : vec3(0, 1, 0);
+    vec3  ex    = normalize(cross(w, up));
+    vec3  ey    = cross(w, ex);
+    float phi   = 2.0 * PI * rand01(rng);
+    vec3  d_raw = w * cos_e + (ex * cos(phi) + ey * sin(phi)) * sin_e;
+    if (dot(d_raw, face_normal) < 0.0) d_raw = reflect(d_raw, face_normal);
+    vec3  diffr_dir = normalize(d_raw);
+    vec4 diffr_pkt = vec4(packet.x, packet.y + PI * 0.5, keller, packet.w);
+    append_pending_ray(edge_pt + diffr_dir * 1e-5, diffr_dir, diffr_pkt,
+                       bounces_rem, PRAY_NO_REACTIVE, face_normal, hit_tri);
+}
+
 void append_segment(vec3 p0, vec3 p1, float energy) {
     // Skip all segment buffer writes unless capture is explicitly enabled.
     if (uSegmentCapture == 0 || uSegmentCap <= 0) return;
@@ -3292,6 +3754,21 @@ void append_segment(vec3 p0, vec3 p1, float energy) {
     segs[base + 1] = vec4(1.0, 1.0, 1.0, a);
     segs[base + 2] = vec4(p1, 1.0);
     segs[base + 3] = vec4(1.0, 1.0, 1.0, a);
+}
+
+// ─── Reactive ray queue ──────────────────────────────────────────────────────
+// Called during PASS_FORWARD when a MAT_FLAG_REACTIVE surface is hit.
+// The secondary re-emission ray is enqueued for processing in PASS_REACTIVE.
+// dir must already be normalised; bounces_rem is the budget after this hit.
+void append_pending_ray(vec3 origin, vec3 dir, vec4 packet,
+                        int bounces_rem, uint pray_flags, vec3 hit_normal, int tri_id) {
+    if (uPendingCap <= 0) return;
+    uint idx = atomicAdd(pending_count, 1u);
+    if (idx >= uint(uPendingCap)) return;
+    pending_rays[idx].origin_flags = vec4(origin, uintBitsToFloat(pray_flags));
+    pending_rays[idx].dir_bounces  = vec4(dir,    uintBitsToFloat(uint(max(bounces_rem, 0))));
+    pending_rays[idx].packet       = packet;
+    pending_rays[idx].normal_triid = vec4(hit_normal, uintBitsToFloat(uint(tri_id)));
 }
 
 // ─── Sensor (camera-view) pass ──────────────────────────────────────────────
@@ -3409,6 +3886,9 @@ void sensor_main(uint ray_id, inout uint rng) {
     }
 }
 
+// Forward declaration — definition follows void main().
+void reactive_main(uint gid, inout uint rng);
+
 void main() {
     uint groups_x = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
     uint gid = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * groups_x;
@@ -3418,38 +3898,37 @@ void main() {
     if (uDiagnosticsEnabled != 0) atomicAdd(ray_count, 1u);
     uint rng = hash_u(ray_id ^ uint(uSeed));
 
-    // ── Dispatch to sensor pass if requested ────────────────────────────────
-    if (uMode == 1) {
+    // ── Pass dispatch ────────────────────────────────────────────────────────
+    if (uMode == PASS_SENSOR) {
         sensor_main(ray_id, rng);
         return;
     }
+    if (uMode == PASS_REACTIVE) {
+        // gid indexes directly into PendingRayBuf; no source-based ray gen.
+        reactive_main(gid, rng);
+        return;
+    }
 
-    // Area source: jitter origin uniformly over disk of radius uSrcRadius
-    // lying perpendicular to uSrcDir.
-    vec3 _src_w  = normalize(uSrcDir);
-    vec3 _src_up = abs(_src_w.z) < 0.9 ? vec3(0.0,0.0,1.0) : vec3(0.0,1.0,0.0);
-    vec3 _src_tx = normalize(cross(_src_up, _src_w));
-    vec3 _src_ty = cross(_src_w, _src_tx);
-    float _disk_r = sqrt(rand01(rng)) * max(uSrcRadius, 0.0);
-    float _disk_a = 2.0 * PI * rand01(rng);
-    vec3 ro = uSrcPos
-            + _src_tx * (_disk_r * cos(_disk_a))
-            + _src_ty * (_disk_r * sin(_disk_a));
-    // Angular probability distribution: cone sampled uniformly in solid angle.
-    vec3 rd = cone_dir(rand01(rng), rand01(rng), uSrcDir, uSrcConeCos);
-    // Each dispatch packet is a local distribution; every ray samples its own
-    // wavelength/frequency and phase from it.
-    vec4 packet = uSrcSpectrum;
-    packet.x *= exp2(randn(rng) * max(packet.w, 1e-4));
-    packet.y += randn(rng) * PI;
+    // ── Pre-baked ray: read pos/dir/phase/freq directly from SSBO ───────────
+    // bdpt_sources[ray_idx] was fully sampled CPU-side from RayOrder.bake_rays()
+    // using the source's EmitterProfile (directional model + PhaseState).
+    // The GPU does NOT generate directions or phases — it only traces what it
+    // is handed.
+    int _ray_idx = int(ray_id % uint(max(uSourceCount, 1)));
+    SourceRec _prebaked = bdpt_sources[_ray_idx];
+    vec3 ro = _prebaked.pos_weight.xyz;
+    vec3 rd = normalize(_prebaked.dir_kind.xyz);
+    vec4 packet = _prebaked.packet;   // .x=freq_hz, .y=phase(pre-baked), .z=energy, .w=0
 
+    float path_len = 0.0;   // accumulated path length for near-field and context spreading
     for (int bounce = 0; bounce < uMaxBounces; ++bounce) {
         float best = 1e30;
         int hit = nearest_hit(ro, rd, best);
         if (hit < 0) break;
         if (uDiagnosticsEnabled != 0) atomicAdd(hit_count, 1u);
         vec3 hp = ro + rd * best;
-        splat_segment_spectral(ro, hp, packet);
+        splat_segment_multiscale(ro, hp, packet, path_len);
+        packet = apply_wave_context_physics(ro, rd, best, packet);
         // Segment capture: thin proportionally to total ray count.
         // Only fires when uSegmentCapture != 0 (production disables this path).
         if (uSegmentCapture != 0) {
@@ -3460,16 +3939,124 @@ void main() {
             }
         }
         Tri tri = tris[hit];
-        vec3 geom_n = normalize(tri.normal.xyz);
-        bool interior_face = dot(rd, geom_n) > 0.0;
-        vec4 mat = interior_face ? tri.mat_in : tri.mat_out;
-        float reflectivity = clamp(mat.x, 0.02, 0.98);
-        float diffusion    = clamp(mat.y, 0.0, 1.0);
-        float absorption   = clamp(mat.z, 0.0, 2.0);
-        float ior          = max(tri.mat_in.w, 1.0);
-        float opacity      = clamp(tri.mat_out.w, 0.0, 1.0);
-        vec3  n = interior_face ? -geom_n : geom_n;
-        float cos_i = max(0.0, dot(-rd, n));
+        uint  mat_flags_bits = floatBitsToUint(tri.normal.w);
+        vec3  geom_n         = normalize(tri.normal.xyz);
+        bool  interior_face  = dot(rd, geom_n) > 0.0;
+        vec4  mat            = interior_face ? tri.mat_in : tri.mat_out;
+        float reflectivity   = clamp(mat.x, 0.02, 0.98);
+        float diffusion      = clamp(mat.y, 0.0, 1.0);
+        float absorption     = clamp(mat.z, 0.0, 2.0);
+        float ior            = max(tri.mat_in.w, 1.0);
+        float opacity        = clamp(tri.mat_out.w, 0.0, 1.0);
+        vec3  n              = interior_face ? -geom_n : geom_n;
+        float cos_i          = max(0.0, dot(-rd, n));
+
+        // ── Emissive surface: deposit radiance into the volume field ──────────
+        // Independent of bounce direction — any ray that grazes an emissive
+        // surface sees its energy contribution.
+        if ((mat_flags_bits & MAT_FLAG_EMISSIVE) != 0u && tri.albedo.w > 0.001) {
+            float emit_scale = tri.albedo.w * cos_i;
+            vec4  emit_pkt   = vec4(packet.x, packet.y,
+                                    emit_scale * max(tri.emissive.x,
+                                                 max(tri.emissive.y, tri.emissive.z)),
+                                    packet.w);
+            splat_spectral(hp, emit_pkt);
+        }
+
+        // ── Edge diffraction at every triangle hit ─────────────────────────
+        // Fires unconditionally — before any break — so absorbers (iris blades,
+        // walls, stops) produce real Huygens secondaries from their physical
+        // edges.  Keller amplitude threshold culls negligible contributions.
+        {
+            vec3 v0_e = tri.v0.xyz;
+            vec3 v1_e = v0_e + tri.e1.xyz;
+            vec3 v2_e = v0_e + tri.e2.xyz;
+            spawn_edge_diffraction(hp, rd, packet, bounce, v0_e, v1_e, n, hit, rng);
+            spawn_edge_diffraction(hp, rd, packet, bounce, v1_e, v2_e, n, hit, rng);
+            spawn_edge_diffraction(hp, rd, packet, bounce, v2_e, v0_e, n, hit, rng);
+        }
+
+        // ── Pure absorber (including iris blades): terminate after edge work ──
+        if ((mat_flags_bits & MAT_FLAG_ABSORBER) != 0u) break;
+
+        // ── Reactive (fluorescent/re-emitting) surface ────────────────────────
+        // Enqueue a Stokes-shifted secondary ray into the pending queue.
+        // The current ray still bounces normally so the primary interaction is
+        // captured; the secondary channel is handled by PASS_REACTIVE.
+        if ((mat_flags_bits & MAT_FLAG_REACTIVE) != 0u) {
+            float stokes_shift = tri.emissive.w;   // Hz, positive = red-shift
+            float react_freq   = max(packet.x - stokes_shift, 20.0);
+            vec3  react_dir    = cosine_dir(rand01(rng), rand01(rng), n);
+            vec4  react_pkt    = vec4(react_freq,
+                                      packet.y + PI * 0.5,
+                                      packet.z * clamp(reflectivity, 0.0, 1.0),
+                                      packet.w);
+            int bounces_rem = uMaxBounces - bounce - 1;
+            if (bounces_rem > 0 && react_pkt.z > 0.002) {
+                append_pending_ray(hp + react_dir * 1e-5, react_dir, react_pkt,
+                                   bounces_rem, PRAY_NO_REACTIVE, n, hit);
+            }
+        }
+
+        // ── Transform LUT (manifold remission profile) — forward pass ─────────
+        // Mirror of reactive_main: if the struck triangle carries a
+        // PROFILE_MANIFOLD remission entry, redirect via IDW lookup and continue.
+        {
+            int remit_idx_f = int(round(tri.emissive.y));
+            if (remit_idx_f >= 0) {
+                int pbase_f = remit_idx_f * 20;
+                if (int(ep_data[pbase_f]) == PROFILE_MANIFOLD) {
+                    int noodle_start_f = int(ep_data[pbase_f + 1]);
+                    int noodle_count_f = int(ep_data[pbase_f + 2]);
+                    if (noodle_count_f > 0) {
+                        vec2 buv_f = bary_uv(ro, rd, tri);
+                        float uf = buv_f.x;
+                        float vf = buv_f.y;
+                        const int KF = 8;
+                        int   best_idx_f[KF];
+                        float best_d2_f[KF];
+                        for (int ki = 0; ki < KF; ki++) {
+                            best_idx_f[ki] = -1;
+                            best_d2_f[ki]  = 1e30;
+                        }
+                        for (int ni = 0; ni < noodle_count_f; ni++) {
+                            int nb_f  = noodle_start_f + ni * 12;
+                            float du = ep_data[nb_f+0] - uf;
+                            float dv = ep_data[nb_f+1] - vf;
+                            float dx = ep_data[nb_f+4] - rd.x;
+                            float dy = ep_data[nb_f+5] - rd.y;
+                            float dz = ep_data[nb_f+6] - rd.z;
+                            float d2 = du*du + dv*dv + dx*dx + dy*dy + dz*dz;
+                            if (d2 < best_d2_f[KF-1]) {
+                                best_d2_f[KF-1]  = d2;
+                                best_idx_f[KF-1] = ni;
+                                for (int j = KF-2; j >= 0; j--) {
+                                    if (best_d2_f[j+1] < best_d2_f[j]) {
+                                        float td = best_d2_f[j];   best_d2_f[j]  = best_d2_f[j+1]; best_d2_f[j+1] = td;
+                                        int   ti = best_idx_f[j];  best_idx_f[j] = best_idx_f[j+1]; best_idx_f[j+1] = ti;
+                                    }
+                                }
+                            }
+                        }
+                        vec3  blended_f = vec3(0.0);
+                        float w_sum_f   = 0.0;
+                        for (int ki = 0; ki < KF; ki++) {
+                            if (best_idx_f[ki] < 0) continue;
+                            float w_f  = 1.0 / max(best_d2_f[ki], 1e-12);
+                            int   nb_f = noodle_start_f + best_idx_f[ki] * 12;
+                            blended_f += w_f * vec3(ep_data[nb_f+7], ep_data[nb_f+8], ep_data[nb_f+9]);
+                            w_sum_f   += w_f;
+                        }
+                        rd = normalize(blended_f / max(w_sum_f, 1e-12));
+                        ro = hp + rd * 1e-5;
+                        path_len += best;
+                        packet.y += best * packet.x * 0.000021;
+                        if (packet.z < 0.002) break;
+                        continue;
+                    }
+                }
+            }
+        }
 
         if (opacity < 0.999) {
             // Refractive: bend the forward ray through the medium
@@ -3505,6 +4092,153 @@ void main() {
             packet.z *= reflectivity * band_decay * dist_falloff;
         }
         ro = hp + rd * 1e-5;
+        path_len += best;
+        packet.y += best * packet.x * 0.000021;
+        if (packet.z < 0.002) break;
+    }
+}
+
+// ─── Reactive re-emission pass (PASS_REACTIVE) ───────────────────────────────
+// Each invocation processes one PendingRay enqueued by PASS_FORWARD.
+// PRAY_NO_REACTIVE is always set, so no further pending rays are created —
+// this is a single-generation secondary pass preventing cascade explosions.
+void reactive_main(uint gid, inout uint rng) {
+    uint count = pending_count;   // written by forward pass; read here
+    if (gid >= count) return;
+
+    PendingRay pr      = pending_rays[gid];
+    uint  pray_flags   = floatBitsToUint(pr.origin_flags.w);
+    vec3  ro           = pr.origin_flags.xyz;
+    vec3  rd           = normalize(pr.dir_bounces.xyz);
+    int   bounces_rem  = int(floatBitsToUint(pr.dir_bounces.w));
+    vec4  packet       = pr.packet;
+
+    for (int bounce = 0; bounce < min(bounces_rem, uMaxBounces); ++bounce) {
+        float best;
+        int hit = nearest_hit(ro, rd, best);
+        if (hit < 0) break;
+
+        vec3 hp = ro + rd * best;
+        splat_segment_spectral(ro, hp, packet);
+
+        Tri   tri            = tris[hit];
+        uint  flags          = floatBitsToUint(tri.normal.w);
+        vec3  geom_n         = normalize(tri.normal.xyz);
+        bool  interior_face  = dot(rd, geom_n) > 0.0;
+        vec4  mat            = interior_face ? tri.mat_in : tri.mat_out;
+        float reflectivity   = clamp(mat.x, 0.02, 0.98);
+        float diffusion      = clamp(mat.y, 0.0, 1.0);
+        float absorption     = clamp(mat.z, 0.0, 2.0);
+        float ior            = max(tri.mat_in.w, 1.0);
+        float opacity        = clamp(tri.mat_out.w, 0.0, 1.0);
+        vec3  n              = interior_face ? -geom_n : geom_n;
+        float cos_i          = max(0.0, dot(-rd, n));
+
+        // Emissive secondary hit: deposit; no further queuing
+        if ((flags & MAT_FLAG_EMISSIVE) != 0u && tri.albedo.w > 0.001) {
+            vec4 emit_pkt = vec4(packet.x, packet.y,
+                                 tri.albedo.w * cos_i *
+                                 max(tri.emissive.x, max(tri.emissive.y, tri.emissive.z)),
+                                 packet.w);
+            splat_spectral(hp, emit_pkt);
+        }
+
+        if ((flags & MAT_FLAG_ABSORBER) != 0u) break;
+
+        // ── Transform LUT (manifold remission profile) ────────────────────
+        // Any material can reference a PROFILE_MANIFOLD entry via remit_profile_idx.
+        // The noodle is a trained LUT: 5D key (barycentric u,v at hit + incident rd)
+        // maps to exit rd via IDW. Bidirectional: dot(rd, normal) selects side.
+        int remit_idx = int(round(tri.emissive.y));
+        if (remit_idx >= 0) {
+            int pbase = remit_idx * 20;
+            if (int(ep_data[pbase]) == PROFILE_MANIFOLD) {
+                int noodle_start = int(ep_data[pbase + 1]);
+                int noodle_count = int(ep_data[pbase + 2]);
+                if (noodle_count > 0) {
+                    // Barycentric (u,v) at the struck triangle — same coords the
+                    // noodle was trained on. Recomputed cheaply from ro and rd.
+                    vec2 buv = bary_uv(ro, rd, tri);
+                    float u = buv.x;
+                    float v = buv.y;
+                    // 5D key: (u, v, rd.x, rd.y, rd.z) — brute-force k=8 nearest
+                    const int K = 8;
+                    int   best_idx[K];
+                    float best_d2[K];
+                    for (int ki = 0; ki < K; ki++) {
+                        best_idx[ki] = -1;
+                        best_d2[ki]  = 1e30;
+                    }
+                    for (int ni = 0; ni < noodle_count; ni++) {
+                        int nb  = noodle_start + ni * 12;
+                        float du = ep_data[nb+0] - u;
+                        float dv = ep_data[nb+1] - v;
+                        float dx = ep_data[nb+4] - rd.x;
+                        float dy = ep_data[nb+5] - rd.y;
+                        float dz = ep_data[nb+6] - rd.z;
+                        float d2 = du*du + dv*dv + dx*dx + dy*dy + dz*dz;
+                        if (d2 < best_d2[K-1]) {
+                            best_d2[K-1]  = d2;
+                            best_idx[K-1] = ni;
+                            for (int j = K-2; j >= 0; j--) {
+                                if (best_d2[j+1] < best_d2[j]) {
+                                    float td = best_d2[j];   best_d2[j]  = best_d2[j+1]; best_d2[j+1]  = td;
+                                    int   ti = best_idx[j];  best_idx[j] = best_idx[j+1]; best_idx[j+1] = ti;
+                                }
+                            }
+                        }
+                    }
+                    // IDW blend out_dir (cols 7-9)
+                    vec3  blended = vec3(0.0);
+                    float w_sum   = 0.0;
+                    for (int ki = 0; ki < K; ki++) {
+                        if (best_idx[ki] < 0) continue;
+                        float w  = 1.0 / max(best_d2[ki], 1e-12);
+                        int   nb = noodle_start + best_idx[ki] * 12;
+                        blended += w * vec3(ep_data[nb+7], ep_data[nb+8], ep_data[nb+9]);
+                        w_sum   += w;
+                    }
+                    rd = normalize(blended / max(w_sum, 1e-12));
+                    ro = hp + rd * 1e-5;
+                    packet.y += best * packet.x * 0.000021;
+                    if (packet.z < 0.002) break;
+                    continue;
+                }
+            }
+        }
+
+        // Bounce (no reactive queuing from reactive pass — PRAY_NO_REACTIVE)
+        if (opacity < 0.999) {
+            float eta      = interior_face ? ior : (1.0 / ior);
+            float cos_t_sq = 1.0 - eta * eta * (1.0 - cos_i * cos_i);
+            if (cos_t_sq <= 0.0) {
+                rd = normalize(reflect(rd, n));
+                if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+            } else {
+                float cos_t = sqrt(cos_t_sq);
+                float rs = (cos_i - ior * cos_t) / max(cos_i + ior * cos_t, 1e-6);
+                float rp = (ior * cos_i - cos_t) / max(ior * cos_i + cos_t, 1e-6);
+                float fr  = clamp(0.5 * (rs*rs + rp*rp), 0.0, 1.0);
+                if (rand01(rng) < mix(fr, 1.0, opacity)) {
+                    rd = normalize(reflect(rd, n));
+                    if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+                } else {
+                    rd = normalize(refract(rd, n, eta));
+                    packet.z *= (1.0 - fr);
+                }
+            }
+        } else {
+            if (rand01(rng) < diffusion) {
+                rd = cosine_dir(rand01(rng), rand01(rng), n);
+            } else {
+                rd = normalize(reflect(rd, n));
+                if (dot(rd, n) < 0.0) rd = cosine_dir(rand01(rng), rand01(rng), n);
+            }
+            float band_decay   = exp(-absorption * best * clamp(packet.x / 440.0, 0.25, 8.0));
+            float dist_falloff = 1.0 / (1.0 + 0.08 * best);
+            packet.z *= reflectivity * band_decay * dist_falloff;
+        }
+        ro = hp + rd * 1e-5;
         packet.y += best * packet.x * 0.000021;
         if (packet.z < 0.002) break;
     }
@@ -3523,12 +4257,15 @@ _GPU_SENSOR_CS = """
 #version 430 core
 layout(local_size_x = 16, local_size_y = 16) in;
 
-// ─── BVH geometry (identical layout to the forward pass) ────────────────────
-struct Tri  { vec4 v0; vec4 e1; vec4 e2; vec4 normal; vec4 mat_in; vec4 mat_out; vec4 albedo; };
+// ─── BVH geometry (identical 8×vec4 layout to the forward pass) ─────────────
+struct Tri  { vec4 v0; vec4 e1; vec4 e2; vec4 normal; vec4 mat_in; vec4 mat_out; vec4 albedo; vec4 emissive; };
 struct Node { vec4 lo_left; vec4 hi_right; vec4 start_count; };
-layout(std430, binding = 0) readonly buffer TriBuf   { Tri  tris[];    };
-layout(std430, binding = 1) readonly buffer NodeBuf  { Node nodes[];   };
-layout(std430, binding = 2) readonly buffer TriIdBuf { int  tri_ids[]; };
+layout(std430, binding = 0) readonly buffer TriBuf    { Tri   tris[];    };
+layout(std430, binding = 1) readonly buffer NodeBuf   { Node  nodes[];   };
+layout(std430, binding = 2) readonly buffer TriIdBuf  { int   tri_ids[]; };
+// Bindings 3-4: reserved (previously used for per-pixel manifold ray dirs/OPLs).
+layout(std430, binding = 3) readonly buffer RayDirBuf { float ray_dirs[]; };
+layout(std430, binding = 4) readonly buffer RayOplBuf { float ray_opls[]; };
 
 // ─── Forward film-layer activation fields (uint, same storage as _MARCH_FS) ──
 layout(binding = 0) uniform usampler3D uFwdLayer0;
@@ -3584,6 +4321,10 @@ uniform float uApertureRadius;
 uniform float uFocusDist;
 uniform float uCAFactor;
 uniform vec2  uTiltShift;
+uniform int   uNBlades;       // 0 = circle; >=3 = regular N-gon
+uniform float uApertureRot;   // first blade edge angle, radians
+uniform vec2  uLensTilt;      // Scheimpflug (x=nod, y=pan) radians — per-ray focus dist modulation
+uniform int   uUseManifold;   // 0 = analytical thin-lens; 1 = read precomputed ray dirs from SSBO
 uniform vec3  uBoxMin;
 uniform vec3  uBoxMax;
 uniform ivec3 uDims;
@@ -3778,15 +4519,16 @@ void march_volume_layers(vec3 ro, vec3 rd, float t_near, float t_far,
 
 // ─── Write scalar luminance into layer i's output image ───────────────────────
 void sensor_store(int i, ivec2 px, float lum, float cnt) {
-    vec4 v = vec4(lum, lum, lum, cnt);
-    if      (i==0){vec4 p=imageLoad(uSensorOut0,px); imageStore(uSensorOut0,px,p+v);}
-    else if (i==1){vec4 p=imageLoad(uSensorOut1,px); imageStore(uSensorOut1,px,p+v);}
-    else if (i==2){vec4 p=imageLoad(uSensorOut2,px); imageStore(uSensorOut2,px,p+v);}
-    else if (i==3){vec4 p=imageLoad(uSensorOut3,px); imageStore(uSensorOut3,px,p+v);}
-    else if (i==4){vec4 p=imageLoad(uSensorOut4,px); imageStore(uSensorOut4,px,p+v);}
-    else if (i==5){vec4 p=imageLoad(uSensorOut5,px); imageStore(uSensorOut5,px,p+v);}
-    else if (i==6){vec4 p=imageLoad(uSensorOut6,px); imageStore(uSensorOut6,px,p+v);}
-    else if (i==7){vec4 p=imageLoad(uSensorOut7,px); imageStore(uSensorOut7,px,p+v);}
+    // alpha is a presence mask: any ray strike sets it to 1.0 so decayed
+    // weight is immediately replaced and re-exposure is instant.
+    if      (i==0){vec4 p=imageLoad(uSensorOut0,px); imageStore(uSensorOut0,px,vec4(p.rgb+lum, 1.0));}
+    else if (i==1){vec4 p=imageLoad(uSensorOut1,px); imageStore(uSensorOut1,px,vec4(p.rgb+lum, 1.0));}
+    else if (i==2){vec4 p=imageLoad(uSensorOut2,px); imageStore(uSensorOut2,px,vec4(p.rgb+lum, 1.0));}
+    else if (i==3){vec4 p=imageLoad(uSensorOut3,px); imageStore(uSensorOut3,px,vec4(p.rgb+lum, 1.0));}
+    else if (i==4){vec4 p=imageLoad(uSensorOut4,px); imageStore(uSensorOut4,px,vec4(p.rgb+lum, 1.0));}
+    else if (i==5){vec4 p=imageLoad(uSensorOut5,px); imageStore(uSensorOut5,px,vec4(p.rgb+lum, 1.0));}
+    else if (i==6){vec4 p=imageLoad(uSensorOut6,px); imageStore(uSensorOut6,px,vec4(p.rgb+lum, 1.0));}
+    else if (i==7){vec4 p=imageLoad(uSensorOut7,px); imageStore(uSensorOut7,px,vec4(p.rgb+lum, 1.0));}
 }
 
 // ─── AABB entry/exit along ray (returns false if no intersection) ─────────────
@@ -3845,18 +4587,50 @@ void main() {
 
         float pu  = (float(px.x) + rand01(rng)) / W;
         float pv  = (float(px.y) + rand01(rng)) / H;
-        float fu  = ((0.5 - pu) * 2.0 + uTiltShift.x) * uCamFovTan * uCamAspect;
-        float fv  = ((0.5 - pv) * 2.0 + uTiltShift.y) * uCamFovTan;
         vec3 ro   = uCamEye;
-        vec3 rd0  = normalize(uCamFwd + uCamRight * fu + uCamUp * fv);
-        vec3 focus_pt = ro + rd0 * max(uFocusDist, 0.01);
-        float ap = max(uApertureRadius, 0.0);
-        if (ap > 1e-7) {
-            float lr = ap * sqrt(rand01(rng));
-            float la = 2.0 * PI * rand01(rng);
-            ro += uCamRight * (lr * cos(la)) + uCamUp * (lr * sin(la));
+        vec3 rd;
+        if (uUseManifold != 0) {
+            // Manifold path: precomputed world ray direction for this pixel.
+            // The CPU batch-interpolated all pixels; we just index into the result.
+            int px_idx = px.x + px.y * uSensorSize.x;
+            rd = normalize(vec3(ray_dirs[px_idx * 3],
+                                ray_dirs[px_idx * 3 + 1],
+                                ray_dirs[px_idx * 3 + 2]));
+        } else {
+            // Analytical thin-lens path.
+            float fu  = ((pu - 0.5) * 2.0 + uTiltShift.x) * uCamFovTan * uCamAspect;
+            float fv  = ((0.5 - pv) * 2.0 + uTiltShift.y) * uCamFovTan;
+            vec3 rd0  = normalize(uCamFwd + uCamRight * fu + uCamUp * fv);
+            // Scheimpflug: per-ray effective focus distance.
+            float _lt_denom = 1.0
+                            - fu * tan(uLensTilt.y)
+                            - fv * tan(uLensTilt.x);
+            float fd_eff  = uFocusDist / max(0.005, _lt_denom);
+            vec3 focus_pt = ro + rd0 * max(fd_eff, 0.01);
+            float ap = max(uApertureRadius, 0.0);
+            if (ap > 1e-7) {
+                vec2 apt_off;
+                int nb = uNBlades;
+                if (nb < 3) {
+                    float lr = ap * sqrt(rand01(rng));
+                    float la = 2.0 * PI * rand01(rng);
+                    apt_off = vec2(cos(la), sin(la)) * lr;
+                } else {
+                    float sector = floor(rand01(rng) * float(nb));
+                    float inv_n  = 2.0 * PI / float(nb);
+                    float a0 = sector * inv_n + uApertureRot;
+                    float a1 = a0 + inv_n;
+                    float u = rand01(rng);
+                    float v = rand01(rng);
+                    if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+                    vec2 p1 = ap * vec2(cos(a0), sin(a0));
+                    vec2 p2 = ap * vec2(cos(a1), sin(a1));
+                    apt_off = u * p1 + v * p2;
+                }
+                ro += uCamRight * apt_off.x + uCamUp * apt_off.y;
+            }
+            rd = normalize(focus_pt - ro);
         }
-        vec3  rd         = normalize(focus_pt - ro);
         float lum[8];
         for (int i = 0; i < 8; i++) lum[i] = 0.0;
         float throughput = 1.0;
@@ -3991,7 +4765,7 @@ void main() {
     ivec2 sz    = imageSize(uAccum);
     if (coord.x >= sz.x || coord.y >= sz.y) return;
     vec4 v = imageLoad(uAccum, coord);
-    v     *= uDecayFactor;
+    v *= uDecayFactor;   // decay rgb and alpha together — ratio preserved, weights shrink
     imageStore(uAccum, coord, v);
 }
 """
@@ -4031,6 +4805,8 @@ uniform float uAlpha;
 uniform float uDecayTotal;
 uniform int   uRotate180;
 uniform int   uNegative;
+uniform int   uDigitalPositive;  // 1 = digital positive sensor mode
+uniform vec3  uDigitalRGB;       // CFA white-balance weights (neutral = 1,1,1)
 
 vec4 sample_layer(int i, vec2 uv) {
     if (i == 0) return texture(uSensorLayer0, uv);
@@ -4074,7 +4850,18 @@ vec2 layer_tone(int i) {
 }
 
 void main() {
-    vec2 uv = (uRotate180 != 0) ? vec2(vUV.x, 1.0 - vUV.y) : vec2(1.0 - vUV.x, vUV.y);
+    // UV orientation:
+    //   digital positive — full 180° rotation undoes aperture optical inversion
+    //   rotate180 — full 180° rotation (both axes)
+    //   default — raw, no flip
+    vec2 uv;
+    if (uDigitalPositive != 0) {
+        uv = vec2(1.0 - vUV.x, 1.0 - vUV.y);
+    } else if (uRotate180 != 0) {
+        uv = vec2(1.0 - vUV.x, 1.0 - vUV.y);
+    } else {
+        uv = vUV;
+    }
     int  nl = clamp(uLayerCount, 1, 8);
 
     vec3 col = vec3(0.0);
@@ -4106,6 +4893,11 @@ void main() {
 
     col = clamp(col, 0.0, 1.0);
     if (uNegative != 0) col = vec3(1.0) - col;
+    // Digital positive: apply CFA spectral white-balance tint.
+    // uDigitalRGB is (R_w, G_w, B_w) normalised so peak == 1.0.
+    // For neutral output pass (1,1,1); for D65-balanced Bayer RGGB
+    // the renderer supplies the computed weights from DigitalPositiveSensor.
+    if (uDigitalPositive != 0) col = clamp(col * uDigitalRGB, 0.0, 1.0);
     FragColor = vec4(col, uAlpha);
 }
 """
@@ -4654,17 +5446,52 @@ def _stage_light_sources(total_rays: int, n_emitters: int = 9,
     src = []
     axis = np.array([0.0, -0.42, -0.91], np.float32)
     axis /= max(float(np.linalg.norm(axis)), 1e-9)
-    _EMITTER_RADIUS   = np.float32(0.12)
-    _EMITTER_CONE_COS = np.float32(0.766)
+    _EMITTER_RADIUS = np.float32(0.12)
+
+    # Build an explicit EmitterSpec asking for a bare Lambertian thermal body.
+    # profile_name="thermal_3200K" is a tungsten-halogen Planckian blackbody
+    # with DirectionalModel.LAMBERTIAN — no lens, no reflector, no aperture stop.
+    from camera_designer.camera_preset   import EmitterSpec   as _EmitterSpec
+    from camera_designer.emitter_profile import DirectionalModel as _DM
+
+    # Integer codes must match the GLSL #define table in this file:
+    #   DIRMODEL_LAMBERTIAN 0, DIRMODEL_DIPOLE_INPLANE 1, DIRMODEL_GAUSSIAN_BEAM 2,
+    #   DIRMODEL_ETENDUE 3, DIRMODEL_PROJECTIVE 4, DIRMODEL_HG 5, DIRMODEL_ISOTROPIC 6
+    _DIRMODEL_INT = {
+        _DM.LAMBERTIAN:           0,
+        _DM.DIPOLE_INPLANE_MIXED: 1,
+        _DM.GAUSSIAN_BEAM:        2,
+        _DM.ETENDUE_LIMITED:      3,
+        _DM.PROJECTIVE:           4,
+        _DM.HENYEY_GREENSTEIN:    5,
+    }
+
+    _stage_spec = _EmitterSpec(
+        pos=(0.0, 0.0, 0.0),                 # overridden per-emitter below
+        normal=(0.0, -0.42, -0.91),          # pointing direction (normalised below)
+        radius=float(_EMITTER_RADIUS),
+        profile_name="thermal_3200K",        # bare Lambertian blackbody, 3200 K Planckian
+        label="stage_lamp",
+    )
+    _stage_profile   = _stage_spec.resolve_profile()
+    _stage_dir_model = _stage_profile.directional.model  # must be LAMBERTIAN
+    if _stage_dir_model != _DM.LAMBERTIAN:
+        raise RuntimeError(
+            f"_stage_light_sources: profile resolved to {_stage_dir_model!r}, "
+            f"expected LAMBERTIAN.  Only bare thermal emission is permitted here."
+        )
+    _STAGE_MODEL_INT   = _DIRMODEL_INT[_stage_dir_model]   # 0 — LAMBERTIAN
+    _STAGE_MODEL_PARAM = 0.0                                # unused for Lambertian
     rays_each = max(1, total_rays // n_emitters)
     count = 0
     for z in zs:
         for x in xs:
             if count >= n_emitters:
                 break
+            # Tuple layout: (pos, dir, n_rays, spectrum, radius, model_int, model_param, light_spec)
             src.append((np.array([float(x), float(ly), float(z)], np.float32),
                         axis.copy(), rays_each, packet.copy(),
-                        _EMITTER_RADIUS, _EMITTER_CONE_COS, lspec))
+                        _EMITTER_RADIUS, _STAGE_MODEL_INT, _STAGE_MODEL_PARAM, lspec))
             count += 1
     remainder = total_rays - rays_each * len(src)
     if remainder > 0 and src:
@@ -4679,14 +5506,18 @@ def _transform_sources(sources: list, matrix: np.ndarray) -> list:
     out = []
     for entry in sources:
         pos, direction, n_rays, spectrum = entry[0], entry[1], entry[2], entry[3]
-        radius    = float(entry[4]) if len(entry) > 4 else 0.0
-        cone_cos  = float(entry[5]) if len(entry) > 5 else -1.0
-        light_spec = entry[6] if len(entry) > 6 else None
+        radius      = float(entry[4]) if len(entry) > 4 else 0.0
+        # New tuple layout: [5]=model_int (int), [6]=model_param (float), [7]=light_spec
+        # model_int and model_param are scale-invariant (angular model doesn't change
+        # under rigid / uniform-scale transforms; PROJECTIVE half-angle is geometry-agnostic).
+        model_int   = int(entry[5])   if len(entry) > 5 else 0
+        model_param = float(entry[6]) if len(entry) > 6 else 0.0
+        light_spec  = entry[7]        if len(entry) > 7 else None
         p = _transform_points(np.asarray(pos, np.float32).reshape(1, 3), M)[0]
         d = _transform_normals(np.asarray(direction, np.float32).reshape(1, 3), M)[0]
         scale = float(np.linalg.norm(M[:3, :3], ord='fro') / np.sqrt(3.0))
         out.append((p, d, int(n_rays), np.asarray(spectrum, np.float32).copy(),
-                    radius * scale, cone_cos, light_spec))
+                    radius * scale, model_int, model_param, light_spec))
     return out
 
 
@@ -4716,7 +5547,25 @@ def _stochastic_spectral_packets(sources: list,
                                  seed: int = 1337) -> list:
     """Expand sources into individually mono-spectral ray packets.
 
-    Each source tuple may carry a ``LightSpec`` at index [6].  When present,
+    Source tuple layout (indices 4-7 are optional):
+      [0] pos          (3,) float32
+      [1] dir          (3,) float32
+      [2] n_rays       int
+      [3] spectrum     (4,) float32  [freq_hz, phase, energy, coherence_oct]
+      [4] radius       float         emitter disc radius in metres
+      [5] model_int    int           DirectionalModel integer code:
+                                       0=LAMBERTIAN  1=DIPOLE_INPLANE_MIXED
+                                       2=GAUSSIAN_BEAM  3=ETENDUE_LIMITED
+                                       4=PROJECTIVE  5=HENYEY_GREENSTEIN  6=ISOTROPIC
+      [6] model_param  float         angular parameter for the model
+                                       PROJECTIVE  → half_angle_rad
+                                       GAUSSIAN_BEAM → divergence_half_angle_rad
+                                       ETENDUE_LIMITED → cos(asin(NA))
+                                       HENYEY_GREENSTEIN → hg_g
+                                       all others → 0.0
+      [7] light_spec   LightSpec|None  per-ray spectral sampling object
+
+    Each source tuple may carry a ``LightSpec`` at index [7].  When present,
     every sub-ray calls ``light_spec.sample_freq_hz(rng)`` to draw its own
     independent frequency from the source's continuous spectrum — Planckian,
     emission lines, gaussian peaks, or log-uniform white, as defined in the
@@ -4734,12 +5583,13 @@ def _stochastic_spectral_packets(sources: list,
     for _src in sources:
         pos, direction, n_rays, spectrum = _src[0], _src[1], _src[2], _src[3]
         n_rays     = max(1, int(n_rays))
-        light_spec = _src[6] if len(_src) > 6 else None
+        # light_spec now lives at index [7]; [4]=radius [5]=model_int [6]=model_param
 
         spec_arr    = np.asarray(spectrum, np.float64).ravel()
         energy      = float(spec_arr[2]) if spec_arr.size > 2 else 1.0
         coherence   = max(float(spec_arr[3]) if spec_arr.size > 3 else 0.5, 1e-3)
 
+        light_spec = _src[7] if len(_src) > 7 else None
         n_packets = max(1, min(int(packets_per_source), n_rays))
         counts = rng.multinomial(n_rays, np.full(n_packets, 1.0 / n_packets))
         for count in counts:
@@ -4755,8 +5605,11 @@ def _stochastic_spectral_packets(sources: list,
                 pkt_coherence = coherence
             phase  = float(rng.uniform(-math.pi, math.pi))
             packet = np.array([freq, phase, energy, pkt_coherence], np.float32)
+            # Pass radius, model_int, model_param (indices 4-6) through unchanged.
+            # light_spec (index 7) is consumed above and not forwarded — the
+            # expanded mono-spectral packets carry their own drawn frequency.
             out.append((np.asarray(pos, np.float32), np.asarray(direction, np.float32),
-                        int(count), packet) + tuple(_src[4:6]))
+                        int(count), packet) + tuple(_src[4:7]))
     return out
 
 
@@ -5176,11 +6029,15 @@ class _SourceWorker(threading.Thread):
             _d = np.asarray(sd, np.float32).ravel()[:3]
             _dl = float(np.linalg.norm(_d))
             _d = (_d / _dl if _dl > 1e-9 else np.array([0., 0., 1.], np.float32))
+            # model_int and model_param encoded directly at source-construction time.
+            _model_int   = int(_s[5])   if len(_s) > 5 else 0
+            _model_param = float(_s[6]) if len(_s) > 6 else 0.0
             rec[i, 0:3]  = np.asarray(sp, np.float32).ravel()[:3]
             rec[i, 3]    = float(max(1, int(nr))) / float(total_rays)
             rec[i, 4:7]  = _d
-            rec[i, 7]    = 0.0
+            rec[i, 7]    = float(_model_int)
             rec[i, 8:12] = np.asarray(spec, np.float32).ravel()[:4]
+            rec[i, 11]   = _model_param
         rec = np.ascontiguousarray(rec, np.float32)
 
         return {"sources_list": sources, "source_records_np": rec}
@@ -5232,10 +6089,11 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         M = np.asarray(model_matrix, dtype=np.float32)
         verts_flat = _transform_points(verts_flat, M)
         normals = _transform_normals(normals, M)
-    def _pad_mat11(m: np.ndarray,
+    def _pad_mat16(m: np.ndarray,
                    default_albedo=(0.50, 0.28, 0.12),
                    default_ior=1.52, default_opacity=1.0) -> np.ndarray:
-        """Ensure material array is (N, 11): pad missing cols with physical defaults."""
+        """Ensure material array is (N, 16): first 11 cols are mat11 with physical
+        defaults; cols 11-15 are flags/emissive/reactive defaulting to zero."""
         m = np.asarray(m, np.float32)
         if m.ndim == 1:
             m = m.reshape(1, -1)
@@ -5244,9 +6102,11 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
             col = np.full((len(m), 1), defaults[m.shape[1] - 6], np.float32) \
                   if m.shape[1] >= 6 else np.full((len(m), 1), 0.0, np.float32)
             m = np.hstack([m, col])
+        while m.shape[1] < 16:
+            m = np.hstack([m, np.zeros((len(m), 1), np.float32)])
         return m
 
-    materials = _pad_mat11(materials)
+    materials = _pad_mat16(materials)
     if include_stage:
         st_v, st_n, st_m = _stage_mesh(outline, body_h)
         if model_matrix is None:
@@ -5259,7 +6119,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         verts_flat = np.vstack([np.asarray(verts_flat, np.float32),
                                 np.asarray(st_v, np.float32).reshape(-1, 3)])
         normals = np.vstack([np.asarray(normals, np.float32), st_n])
-        materials = np.vstack([materials, _pad_mat11(st_m)])
+        materials = np.vstack([materials, _pad_mat16(st_m)])
 
     # ── Neck wood and steel strings as BVH geometry ─────────────────────────────
     _y_nut_bvh  = BRIDGE_POS[1][1] + SCALE_LENGTH_M
@@ -5331,7 +6191,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     if _bvh_ev:
         verts_flat = np.vstack([verts_flat, np.array(_bvh_ev, np.float32)])
         normals    = np.vstack([normals,    np.array(_bvh_en, np.float32)])
-        materials  = np.vstack([materials,  np.array(_bvh_em, np.float32)])
+        materials  = np.vstack([materials,  _pad_mat16(np.array(_bvh_em, np.float32))])
 
     # ── Glass bell jar for the BVH (refraction in sensor render) ────────────────
     # sim_bounds are in guitar-frame.  The builders expect world-frame (Z = up).
@@ -5370,22 +6230,51 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
 
     tris = verts_flat.reshape(-1, 3, 3).astype(np.float32)
     nrm = normals.astype(np.float32)
+    # _normalise_materials yields (N,11); pull emissive/flag cols from raw input
     mat11    = _normalise_materials(materials, len(tris))
     mat_in   = mat11[:, 0:3]
     mat_out  = mat11[:, 3:6]
     albedo   = mat11[:, 6:9]
     ior_col  = mat11[:, 9]
     opac_col = mat11[:, 10]
-    packed = np.zeros((len(tris), 28), np.float32)
+    _raw16  = np.asarray(materials, np.float32)
+    # mat16 extension cols: [11]=flags, [12]=emit_profile_idx, [13]=remit_profile_idx, [15]=reactive_shift
+    n_tris = len(tris)
+    mat_flags_col     = _raw16[:, 11] if _raw16.shape[1] > 11 else np.zeros(n_tris, np.float32)
+    emit_profile_idx  = _raw16[:, 12] if _raw16.shape[1] > 12 else np.full(n_tris, -1.0, np.float32)
+    remit_profile_idx = _raw16[:, 13] if _raw16.shape[1] > 13 else np.full(n_tris, -1.0, np.float32)
+    reactive_shift    = _raw16[:, 15] if _raw16.shape[1] > 15 else np.zeros(n_tris, np.float32)
+    emit_has_profile  = (emit_profile_idx >= 0).astype(np.uint32)
+    _react_mask = (np.abs(reactive_shift) > 0.01).astype(np.uint32)
+    _flags_u32 = (np.frombuffer(mat_flags_col.tobytes(), np.uint32)
+                  | (emit_has_profile * np.uint32(1))
+                  | (_react_mask * np.uint32(2)))
+    mat_flags_col = np.frombuffer(_flags_u32.tobytes(), np.float32)
+    # 8×vec4 packed layout (32 floats per tri):
+    #  [0-2]  v0.xyz          [3]    unused
+    #  [4-6]  e1.xyz          [7]    unused
+    #  [8-10] e2.xyz          [11]   unused
+    #  [12-14] normal.xyz     [15]   mat_flags (uint bits as float)
+    #  [16-18] mat_in.xyz     [19]   IOR
+    #  [20-22] mat_out.xyz    [23]   opacity
+    #  [24-26] albedo.xyz     [27]   emissive intensity (1.0 if profile assigned, else 0)
+    #  [28]    emit_profile_idx       [29]  remit_profile_idx  [30] _pad  [31] reactive_shift_hz
+    packed = np.zeros((n_tris, 32), np.float32)
     packed[:, 0:3]   = tris[:, 0, :]
     packed[:, 4:7]   = tris[:, 1, :] - tris[:, 0, :]
     packed[:, 8:11]  = tris[:, 2, :] - tris[:, 0, :]
     packed[:, 12:15] = nrm
+    packed[:, 15]    = mat_flags_col    # normal.w  = mat_flags
     packed[:, 16:19] = mat_in
     packed[:, 19]    = ior_col          # mat_in.w  = IOR
     packed[:, 20:23] = mat_out
-    packed[:, 23]    = opac_col         # mat_out.w = opacity (1=opaque, 0=transparent)
+    packed[:, 23]    = opac_col         # mat_out.w = opacity
     packed[:, 24:27] = albedo
+    packed[:, 27]    = emit_has_profile.astype(np.float32)  # albedo.w = 1 if emission profile assigned
+    packed[:, 28]    = emit_profile_idx   # emissive.x = emit profile index
+    packed[:, 29]    = remit_profile_idx  # emissive.y = remit profile index
+    packed[:, 30]    = 0.0               # emissive.z = _pad
+    packed[:, 31]    = reactive_shift    # emissive.w = reactive Stokes shift Hz
     packed = np.ascontiguousarray(packed)
     bvh_nodes, bvh_ids = _build_gpu_bvh(tris)
     _ray_diag_update(
@@ -5445,7 +6334,11 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     seg_cap = max(0, int(segment_cap))
     seg_stride = 4
     seg_bytes = max(1, seg_cap * seg_stride * 4 * 4)
-    counter = np.zeros(4, dtype=np.uint32)
+    counter = np.zeros(5, dtype=np.uint32)   # [seg, ray, hit, record, pending]
+    # PendingRayBuf: capacity = fraction of forward ray budget (emissive hits rare)
+    _pending_cap = max(0, min(int(dispatch_batch * 4), 1 << 18))  # max 256K pending rays
+    _pending_stride = 16  # 4×vec4 per PendingRay = 16 floats = 64 bytes
+    _pending_bytes = max(64, _pending_cap * _pending_stride * 4)
     total_source_rays = max(1, sum(int(s[2]) for s in sources))
     source_records = np.zeros((max(1, len(sources)), 12), np.float32)
     for _i, _src_rec in enumerate(sources):
@@ -5456,14 +6349,18 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
             _sd_arr = _sd_arr / _sd_len
         else:
             _sd_arr = np.array([0.0, 0.0, 1.0], np.float32)
+        # model_int and model_param encoded directly at source-construction time.
+        _model_int_src   = int(_src_rec[5])   if len(_src_rec) > 5 else 0
+        _model_param_src = float(_src_rec[6]) if len(_src_rec) > 6 else 0.0
         source_records[_i, 0:3] = np.asarray(_sp_src, np.float32).ravel()[:3]
         source_records[_i, 3] = float(max(1, int(_nr_src))) / float(total_source_rays)
         source_records[_i, 4:7] = _sd_arr
-        source_records[_i, 7] = 0.0
+        source_records[_i, 7] = float(_model_int_src)
         source_records[_i, 8:12] = np.asarray(_spec_src, np.float32).ravel()[:4]
+        source_records[_i, 11]   = _model_param_src
     source_records = np.ascontiguousarray(source_records, np.float32)
 
-    ssbo = glGenBuffers(6)
+    ssbo = list(glGenBuffers(9))   # 0=Tri 1=Node 2=TriId 3=Seg 4=Counter 5=Source 6=PendingRay 7=EmitProfiles 8=ScaleCtx
     _ray_diag_update(
         "gpu_ray_field:alloc_buffers",
         n_sources=len(sources),
@@ -5493,15 +6390,34 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[5])
     glBufferData(GL_SHADER_STORAGE_BUFFER, source_records.nbytes, source_records, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo[5])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[6])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _pending_bytes, None, GL_DYNAMIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo[6])
+    # Emission profile table — built from the module-level EmissionProfileDatabase singleton.
+    try:
+        from material_db import _EMISSION_DB as _ep_db
+        _ep_tensor = _ep_db.build_gpu_tensor()
+    except Exception:
+        _ep_tensor = np.zeros((1, 20), np.float32)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[7])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _ep_tensor.nbytes, _ep_tensor, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo[7])
+    # ScaleContext SSBO at binding 8 — empty placeholder; count=0 disables context loops.
+    # Populated externally when GPU scene with wave contexts is used.
+    _scale_ctx_placeholder = np.zeros((1, 8), np.float32)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[8])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _scale_ctx_placeholder.nbytes, _scale_ctx_placeholder, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, ssbo[8])
 
     prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
     if not glGetProgramiv(prog, GL_LINK_STATUS):
         print("  [gpu_ray_field] compute shader did not link; ray volume disabled", flush=True)
         glDeleteProgram(prog)
+        from OpenGL.GL import glDeleteTextures as _glDelTex, glDeleteBuffers as _glDelBuf
         for tex in tex_bands:
-            glDeleteTextures([tex])
+            _glDelTex([tex])
         for buf in ssbo:
-            glDeleteBuffers(1, [buf])
+            _glDelBuf(1, [buf])
         return None, None, None, None, 0, None, 0, 0
     glUseProgram(prog)
     # imageAtomicAdd on all 4 band textures — must be GL_READ_WRITE
@@ -5523,6 +6439,8 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glUniform1f(glGetUniformLocation(prog, b'uAirDiffuseScatter'),  float(air_diffuse_scatter))
     glUniform1f(glGetUniformLocation(prog, b'uAirSpecularScatter'), float(air_specular_scatter))
     glUniform1f(glGetUniformLocation(prog, b'uAirAnisotropy'),      float(air_anisotropy))
+    glUniform1i(glGetUniformLocation(prog, b'uScaleContextCount'), 0)   # default: no wave contexts
+    glUniform1f(glGetUniformLocation(prog, b'uSpeedOfMedium'), 343.0)   # acoustic default; optical callers override
     _specs = film_stack.layer_specs()
     glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), len(_specs))
     for _i, _sp_layer in enumerate(_specs):
@@ -5540,7 +6458,8 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     loc_src_spec    = glGetUniformLocation(prog, b'uSrcSpectrum')
     glUniform1i(glGetUniformLocation(prog, b'uDiagnosticsEnabled'), 1 if diagnostics else 0)
     glUniform1i(glGetUniformLocation(prog, b'uSegmentCapture'),     1 if segment_capture else 0)
-    glUniform1i(loc_mode, 0)
+    glUniform1i(glGetUniformLocation(prog, b'uPendingCap'), _pending_cap)
+    glUniform1i(loc_mode, 0)   # PASS_FORWARD
 
     dispatch_batch = max(128, int(dispatch_batch))
     total_rays = sum(s[2] for s in sources)
@@ -5674,7 +6593,29 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         glActiveTexture(GL_TEXTURE0)
         for _tex in fwd_snapshot:
             glDeleteTextures([_tex])
-        glUniform1i(loc_mode, 0)
+        glUniform1i(loc_mode, 0)   # reset to PASS_FORWARD
+
+    # ── Reactive re-emission pass (PASS_REACTIVE) ─────────────────────────────
+    # Read back pending_count (counter[4]) to decide if the pass is worth running.
+    if _pending_cap > 0:
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT)
+        glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[4])
+        _ctr_raw = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 5 * 4)
+        _pending_count_fwd = int(np.frombuffer(_ctr_raw, np.uint32)[4])
+        if _pending_count_fwd > 0:
+            _react_rays = min(_pending_count_fwd, _pending_cap)
+            glUniform1i(loc_mode, 2)   # PASS_REACTIVE
+            glUniform1i(loc_seed, 31415926)
+            glUniform1i(loc_batch_size, _react_rays)
+            glUniform1i(loc_batch_off, 0)
+            n_groups = max(1, int(math.ceil(_react_rays / 128.0)))
+            gx = min(n_groups, 65535)
+            gy = max(1, int(math.ceil(n_groups / gx)))
+            glDispatchCompute(gx, gy, 1)
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                            GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+            glUniform1i(loc_mode, 0)   # reset to PASS_FORWARD
+            print(f"  [gpu_ray_field] reactive pass: {_react_rays} pending rays", flush=True)
 
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT |
                     GL_VERTEX_ATTRIB_ARRAY_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT)
@@ -5683,10 +6624,10 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     if gl_err != GL_NO_ERROR:
         print(f"  [gpu_ray_field] GL error after dispatch: 0x{gl_err:04x}", flush=True)
 
-    # Read back shader diagnostics: [segments, rays, hits, selected-for-recording].
+    # Read back shader diagnostics: [segments, rays, hits, selected-for-recording, pending].
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[4])
-    counter_raw = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 4 * 4)
-    counter_readback = np.frombuffer(counter_raw, dtype=np.uint32, count=4).copy()
+    counter_raw = glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 5 * 4)
+    counter_readback = np.frombuffer(counter_raw, dtype=np.uint32, count=5).copy()
     actual_seg_count = int(min(int(counter_readback[0]), seg_cap))
     rays_seen = int(counter_readback[1])
     hit_count = int(counter_readback[2])
@@ -5731,7 +6672,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     print(f"  GPU ray field {dims[0]}x{dims[1]}x{dims[2]}, "
           f"{len(sources)} sources / {total_rays} total rays, {len(tris)} tris, "
           f"{len(bvh_nodes)} BVH nodes, {actual_seg_count} segments emitted", flush=True)
-    for buf in [ssbo[0], ssbo[1], ssbo[2], ssbo[5]]:
+    for buf in [ssbo[0], ssbo[1], ssbo[2], ssbo[5], ssbo[7], ssbo[8]]:
         glDeleteBuffers(1, [buf])
     glDeleteProgram(prog)
 
@@ -5818,6 +6759,327 @@ def _upload_uint_ray_textures(data: np.ndarray) -> list[int]:
     return tex_bands
 
 
+# ─── Pre-packed GPU pipeline (optical / camera-designer scenes) ───────────────
+# These functions accept already-packed SSBO arrays (from build_gpu_scene())
+# and keep all GL objects alive for per-frame pumping.  Unlike _gpu_ray_field(),
+# they do NOT free prog/SSBOs on return — the caller owns them.
+
+# Compact grid for optical scenes: 128 transverse × 128 transverse × 256 axial.
+GPU_OPTICAL_FIELD_DIMS = (128, 128, 256)
+
+def _gpu_ray_field_prebuilt(
+    packed,          # (N, 32) float32  — pre-packed triangle SSBO
+    bvh_nodes,       # float32 from _build_gpu_bvh
+    bvh_ids,         # uint32  from _build_gpu_bvh
+    context_buf,     # (M, 8)  float32  — ScaleContext SSBO rows
+    source_buf,      # (N, 12) float32  — pre-baked rays from RayOrder.bake_rays()
+                     #   [pos_xyz, amp_w, dir_xyz, 0, freq_hz, phase, energy, 0]
+    bounds,          # (bmin, bmax) each float32 (3,)
+    dims=GPU_OPTICAL_FIELD_DIMS,
+    dispatch_batch=8192,
+    max_bounces=8,
+    initial_rays=32768,
+    speed_of_medium=2.998e8,   # optical vacuum
+    film_stack=None,           # FilmStack | None — drives layer uniforms & tex count
+):
+    """Compile the canonical _GPU_RAY_FIELD_CS with pre-packed scene SSBOs.
+
+    Returns a state dict with all GL handles + cached uniform locations.
+    The caller owns every GL object and must call _destroy_prebuilt(state)
+    when the scene changes.  Returns None on shader link failure.
+    """
+    from OpenGL.GL import (
+        GL_COMPUTE_SHADER, GL_LINK_STATUS, GL_READ_WRITE, GL_R32UI,
+        GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
+        GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R,
+        GL_NEAREST, GL_CLAMP_TO_EDGE, GL_RED_INTEGER, GL_UNSIGNED_INT,
+        GL_SHADER_STORAGE_BUFFER, GL_STATIC_DRAW, GL_DYNAMIC_DRAW,
+        GL_SHADER_STORAGE_BARRIER_BIT, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+        glGenTextures, glBindTexture, glTexImage3D, glTexParameteri,
+        glClearTexImage, glBindImageTexture,
+        glGenBuffers, glBindBuffer, glBufferData, glBindBufferBase,
+        glGetProgramiv, glDeleteProgram, glDeleteTextures, glDeleteBuffers,
+        glUseProgram, glGetUniformLocation,
+        glUniform1i, glUniform1f, glUniform3f, glUniform4f, glUniform3i,
+        glDispatchCompute, glMemoryBarrier, glFinish,
+    )
+
+    bmin = np.asarray(bounds[0], np.float32)
+    bmax = np.asarray(bounds[1], np.float32)
+    n_tris = len(packed)
+
+    # ── Resolve film layers ───────────────────────────────────────────────
+    if film_stack is not None and hasattr(film_stack, 'layer_specs'):
+        _layer_specs = film_stack.layer_specs()
+    else:
+        # Broadband luminance fallback — one layer that passes every frequency
+        _layer_specs = [{'center_hz': 1.0, 'width_oct': 100.0, 'gain': 1.0,
+                         'dark_rgb': (0.0, 0.0, 0.0), 'light_rgb': (1.0, 1.0, 1.0)}]
+    n_layers = min(len(_layer_specs), 8)
+
+    # ── Source records: pre-baked rays from RayOrder.bake_rays() ─────────
+    # source_buf is already (N, 12) float32 in SourceRec layout — no expansion.
+    # Phase and direction are fully baked CPU-side; the GPU just traces them.
+    n_src          = max(1, len(source_buf))
+    source_records = np.ascontiguousarray(source_buf, np.float32)
+
+    seg_cap    = 0   # camera station doesn't use CPU segment readback
+    seg_stride = 4
+    seg_bytes  = 64  # minimum valid allocation
+    counter    = np.zeros(5, np.uint32)
+    _pending_cap   = max(0, min(int(dispatch_batch * 4), 1 << 18))
+    _pending_bytes = max(64, _pending_cap * 16 * 4)
+
+    # ── n_layers spectral accumulation textures (one per film layer) ─────
+    zero = np.array([0], np.uint32)
+    tex_bands = list(glGenTextures(n_layers))
+    for tex in tex_bands:
+        glBindTexture(GL_TEXTURE_3D, tex)
+        glTexImage3D(GL_TEXTURE_3D, 0, GL_R32UI,
+                     dims[0], dims[1], dims[2], 0,
+                     GL_RED_INTEGER, GL_UNSIGNED_INT, None)
+        for param, val in [(GL_TEXTURE_MIN_FILTER, GL_NEAREST),
+                           (GL_TEXTURE_MAG_FILTER, GL_NEAREST),
+                           (GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE),
+                           (GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE),
+                           (GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE)]:
+            glTexParameteri(GL_TEXTURE_3D, param, val)
+        glClearTexImage(tex, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero)
+    glBindTexture(GL_TEXTURE_3D, 0)
+
+    # ── 9 SSBOs ───────────────────────────────────────────────────────────
+    ssbo = list(glGenBuffers(9))
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[0])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, packed.nbytes, packed, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo[0])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[1])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_nodes.nbytes, bvh_nodes, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo[1])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[2])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_ids.nbytes, bvh_ids, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo[2])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[3])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, seg_bytes, None, GL_DYNAMIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, ssbo[3])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[4])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, counter.nbytes, counter, GL_DYNAMIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, ssbo[4])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[5])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, source_records.nbytes, source_records, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, ssbo[5])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[6])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _pending_bytes, None, GL_DYNAMIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo[6])
+    try:
+        from material_db import _EMISSION_DB as _ep_db
+        _ep_tensor = _ep_db.build_gpu_tensor()
+    except Exception:
+        _ep_tensor = np.zeros((1, 20), np.float32)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[7])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _ep_tensor.nbytes, _ep_tensor, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo[7])
+    _ctx = np.ascontiguousarray(context_buf, np.float32) if len(context_buf) > 0 \
+           else np.zeros((1, 8), np.float32)
+    n_ctx = len(_ctx)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[8])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _ctx.nbytes, _ctx, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, ssbo[8])
+
+    # ── Compile shader ────────────────────────────────────────────────────
+    prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
+    if not glGetProgramiv(prog, GL_LINK_STATUS):
+        print("  [gpu_ray_field_prebuilt] compute shader did not link", flush=True)
+        glDeleteProgram(prog)
+        for tex in tex_bands:
+            glDeleteTextures([tex])
+        for buf in ssbo:
+            glDeleteBuffers(1, [buf])
+        return None
+
+    glUseProgram(prog)
+    for band_idx, tex in enumerate(tex_bands):
+        glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
+
+    # Static uniforms (don't change between pumps)
+    glUniform1i(glGetUniformLocation(prog, b'uTriCount'),        n_tris)
+    glUniform1i(glGetUniformLocation(prog, b'uNodeCount'),       len(bvh_nodes))
+    glUniform1i(glGetUniformLocation(prog, b'uSegmentCap'),      seg_cap)
+    glUniform1i(glGetUniformLocation(prog, b'uSegmentStride'),   seg_stride)
+    glUniform1i(glGetUniformLocation(prog, b'uSourceCount'),     n_src)
+    glUniform1i(glGetUniformLocation(prog, b'uMaxBounces'),      int(max_bounces))
+    glUniform3f(glGetUniformLocation(prog, b'uBoxMin'),          *bmin)
+    glUniform3f(glGetUniformLocation(prog, b'uBoxMax'),          *bmax)
+    glUniform3i(glGetUniformLocation(prog, b'uDims'),
+                int(dims[0]), int(dims[1]), int(dims[2]))
+    # Same participating-medium values as _gpu_ray_field for full volumetric accumulation
+    glUniform1f(glGetUniformLocation(prog, b'uVolumeStepMeters'), 0.003)
+    glUniform1f(glGetUniformLocation(prog, b'uMediumScattering'),  1.0)
+    glUniform1f(glGetUniformLocation(prog, b'uMediumExtinction'),  0.5)
+    glUniform1f(glGetUniformLocation(prog, b'uAirDiffuseScatter'),  0.35)
+    glUniform1f(glGetUniformLocation(prog, b'uAirSpecularScatter'), 0.65)
+    glUniform1f(glGetUniformLocation(prog, b'uAirAnisotropy'),      12.0)
+    glUniform1i(glGetUniformLocation(prog, b'uScaleContextCount'),
+                int(n_ctx) if n_ctx > 1 else 0)
+    glUniform1f(glGetUniformLocation(prog, b'uSpeedOfMedium'),   float(speed_of_medium))
+    # Film layer spectral uniforms — driven by FilmStack.layer_specs()
+    glUniform1i(glGetUniformLocation(prog, b'uLayerCount'), n_layers)
+    for _i, _sp in enumerate(_layer_specs[:n_layers]):
+        glUniform1f(glGetUniformLocation(prog, f'uLayerCentersHz[{_i}]'.encode()), float(_sp['center_hz']))
+        glUniform1f(glGetUniformLocation(prog, f'uLayerWidthsOct[{_i}]'.encode()), float(_sp['width_oct']))
+        glUniform1f(glGetUniformLocation(prog, f'uLayerGains[{_i}]'.encode()),     float(_sp['gain']))
+    glUniform1i(glGetUniformLocation(prog, b'uDiagnosticsEnabled'), 0)
+    glUniform1i(glGetUniformLocation(prog, b'uSegmentCapture'),     0)
+    glUniform1i(glGetUniformLocation(prog, b'uPendingCap'),      _pending_cap)
+    glUniform1i(glGetUniformLocation(prog, b'uMode'),            0)  # PASS_FORWARD
+
+    # Cache per-pump uniform locations (source params removed — rays are pre-baked)
+    locs = {
+        'mode':       glGetUniformLocation(prog, b'uMode'),
+        'seed':       glGetUniformLocation(prog, b'uSeed'),
+        'batch_size': glGetUniformLocation(prog, b'uBatchSize'),
+        'batch_off':  glGetUniformLocation(prog, b'uBatchOffset'),
+        'total_rays': glGetUniformLocation(prog, b'uTotalRaysPerSource'),
+    }
+
+    # ── Initial dispatch ──────────────────────────────────────────────────
+    _n_init = max(128, int(initial_rays))
+    glUniform1i(locs['seed'],       1337)
+    glUniform1i(locs['total_rays'], _n_init)
+    _off = 0
+    while _off < _n_init:
+        _b  = min(int(dispatch_batch), _n_init - _off)
+        _ng = max(1, int(math.ceil(_b / 128.0)))
+        glUniform1i(locs['batch_size'], _b)
+        glUniform1i(locs['batch_off'],  _off)
+        glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                        GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+        _off += _b
+    glFinish()
+    glUseProgram(0)
+
+    print(f"  [gpu_ray_field_prebuilt] {n_tris} tris  {n_src} src  "
+          f"dims={dims}  initial={_n_init} rays  "
+          f"n_ctx={n_ctx if n_ctx > 1 else 0}", flush=True)
+    return {
+        'tex_bands':      tex_bands,
+        'ssbo':           ssbo,
+        'prog':           prog,
+        'bmin':           bmin,
+        'bmax':           bmax,
+        'dims':           tuple(int(d) for d in dims),
+        'locs':           locs,
+        'n_sources':      n_src,
+        'source_buf':     source_records,   # pre-baked (N_rays, 12)
+        'dispatch_batch': int(dispatch_batch),
+        '_pending_cap':   _pending_cap,
+        '_pump_seed':     0,
+        'layer_specs':    list(_layer_specs[:n_layers]),
+        'n_layers':       n_layers,
+    }
+
+
+def _gpu_pump_prebuilt(state: dict, n_rays: int = 8192) -> None:
+    """Dispatch n_rays PASS_FORWARD rays into an existing prebuilt GPU state.
+
+    Rays accumulate additively into state['tex_bands'].
+    Call _clear_prebuilt(state) before starting a fresh solve cycle.
+    """
+    if state is None:
+        return
+    from OpenGL.GL import (
+        GL_SHADER_STORAGE_BARRIER_BIT, GL_SHADER_IMAGE_ACCESS_BARRIER_BIT,
+        GL_SHADER_STORAGE_BUFFER, GL_R32UI, GL_READ_WRITE, GL_TEXTURE_3D,
+        glUseProgram, glBindBufferBase, glBindImageTexture,
+        glUniform1i, glDispatchCompute, glMemoryBarrier,
+    )
+    prog  = state['prog']
+    locs  = state['locs']
+    batch = state['dispatch_batch']
+
+    glUseProgram(prog)
+    for band_idx, tex in enumerate(state['tex_bands']):
+        glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
+    for bi, buf in enumerate(state['ssbo']):
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, bi, buf)
+
+    glUniform1i(locs['mode'], 0)  # PASS_FORWARD
+    seed_base = state['_pump_seed']
+    state['_pump_seed'] = (seed_base + 7) & 0x7FFFFFFF
+
+    # Pre-baked rays: dispatch n_rays round-robin over the baked buffer.
+    # No per-source loop — the CS reads bdpt_sources[ray_id % uSourceCount].
+    glUniform1i(locs['seed'],       seed_base)
+    glUniform1i(locs['total_rays'], n_rays)
+    offset = 0
+    while offset < n_rays:
+        _b  = min(batch, n_rays - offset)
+        _ng = max(1, int(math.ceil(_b / 128.0)))
+        glUniform1i(locs['batch_size'], _b)
+        glUniform1i(locs['batch_off'],  offset)
+        glDispatchCompute(min(_ng, 65535), max(1, int(math.ceil(_ng / 65535))), 1)
+        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT |
+                        GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
+        offset += _b
+    glUseProgram(0)
+
+
+def _clear_prebuilt(state: dict) -> None:
+    """Zero all 4 accumulation textures in a prebuilt GPU state."""
+    if state is None:
+        return
+    from OpenGL.GL import (
+        GL_TEXTURE_3D, GL_RED_INTEGER, GL_UNSIGNED_INT,
+        glBindTexture, glClearTexImage,
+    )
+    zero = np.array([0], np.uint32)
+    for tex in state['tex_bands']:
+        glBindTexture(GL_TEXTURE_3D, tex)
+        glClearTexImage(tex, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero)
+    glBindTexture(GL_TEXTURE_3D, 0)
+    state['_pump_seed'] = 0
+
+
+def _destroy_prebuilt(state: dict) -> None:
+    """Release all GL objects owned by a prebuilt GPU state dict."""
+    if state is None:
+        return
+    from OpenGL.GL import (
+        glDeleteProgram, glDeleteTextures, glDeleteBuffers,
+    )
+    glDeleteProgram(state['prog'])
+    for tex in state['tex_bands']:
+        glDeleteTextures([tex])
+    for buf in state['ssbo']:
+        glDeleteBuffers(1, [buf])
+    state.clear()
+
+
+def _gpu_readback_prebuilt(tex_bands: list, dims: tuple) -> "np.ndarray":
+    """Read all spectral accumulation textures back to CPU and return as float32.
+
+    Returns an (n_bands, dz, dy, dx) float32 array with raw uint32 counts
+    cast to float32.  Primarily a diagnostic hook — called at most once per
+    N frames from the debug pump loop.
+    """
+    from OpenGL.GL import (
+        GL_TEXTURE_3D, GL_RED_INTEGER, GL_UNSIGNED_INT,
+        glBindTexture, glGetTexImage,
+    )
+    dx, dy, dz = int(dims[0]), int(dims[1]), int(dims[2])
+    bands = []
+    for tex in tex_bands:
+        buf = np.empty((dz, dy, dx), dtype=np.uint32)
+        glBindTexture(GL_TEXTURE_3D, tex)
+        glGetTexImage(GL_TEXTURE_3D, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, buf)
+        bands.append(buf.astype(np.float32))
+    glBindTexture(GL_TEXTURE_3D, 0)
+    return np.stack(bands, axis=0)  # (n_bands, dz, dy, dx)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 def _load_stage_light_cache(path: str):
     if not os.path.exists(path):
         return None
@@ -5901,6 +7163,64 @@ class Camera:
         self.lens:   LensSpec   = lens   or LensSpec()
         # Sync focal_mm from lens spec
         self.focal_mm = self.lens.focal_mm
+        # Aperture shape: 0 = circle, >=3 = regular N-gon (e.g. 6 for hexagonal bokeh)
+        self.n_blades: int = 0
+        self.aperture_rot: float = 0.0   # first-blade angle in radians
+        # Full lens transform parameters (compiled by LensTransform.compile())
+        self.lens_tilt    = np.zeros(2, np.float64)  # Scheimpflug (x=nod, y=pan) radians
+        self.extension_mm: float = 0.0               # barrel extension in mm
+        self.gimbal       = np.zeros(2, np.float64)  # (pan, tilt) lens-axis rotation radians
+        # Generic optical back — parametric surface for ray→UV projection.
+        # Assign a CameraBack instance (FlatBack, SphericalBack, ManifoldBack, …).
+        # None = renderer uses the standard perspective projection path.
+        self.camera_back: "Optional[object]" = None
+        # Generic lens manifold — routes aperture × scene-dir → sensor-dir.
+        # Assign a LensManifold instance (e.g. bake_eye_manifold(HUMAN_EYE)).
+        # None = standard thin-lens model.
+        self.lens_manifold: "Optional[object]" = None
+        # Camera software modules (DigitalPositiveSensor etc.)
+        # Each entry must implement tick(dt, ctx) with a CameraContext-like interface.
+        # The Camera builds a minimal _CamProxy shim so software can write back to it.
+        self.software: list = []
+
+        # ── Eye manifold: load from cache or bake on first run ─────────────────
+        # The human eye is the player camera — not a special mode, just this camera.
+        # The manifold is baked once to disk; subsequent launches load it in ~50 ms.
+        import pathlib as _pl
+        _eye_cache = _pl.Path.home() / ".spectral_analyzer" / "eye_manifold_v1.npz"
+        try:
+            from camera_software import (HUMAN_EYE as _EYE,
+                                         bake_eye_manifold as _bake,
+                                         LensManifold as _LM)
+            if _eye_cache.exists():
+                self.lens_manifold = _LM.load(str(_eye_cache))
+            else:
+                print("[Camera] baking eye manifold — first run, one time (~10 s)...",
+                      flush=True)
+                _eye_cache.parent.mkdir(parents=True, exist_ok=True)
+                self.lens_manifold = _bake(_EYE)
+                self.lens_manifold.save(str(_eye_cache))
+                print(f"[Camera] eye manifold cached → {_eye_cache}", flush=True)
+            self.camera_back = _EYE.make_manifold_back(
+                self.lens_manifold, res_w=512, res_h=512)
+            # Register a PROFILE_MANIFOLD remission entry so the GPU shader
+            # can do the transform LUT lookup at binding 7.
+            from material_db import RemissionProfile as _RP, _EMISSION_DB as _epdb
+            _eye_rp = _RP()
+            _eye_rp.set_manifold(self.lens_manifold)
+            self._eye_remit_idx = _epdb.register("eye_lens_manifold", _eye_rp)
+        except Exception as _eye_err:
+            self._eye_remit_idx = -1
+            pass   # camera_software absent or bake failed; manifold stays None
+        # Digital positive display state (read by Renderer for blit uniforms).
+        # Set True by default; DigitalPositiveSensor.tick() refreshes _digital_rgb.
+        self._digital_positive: bool = True
+        self._digital_rgb: tuple = (1.0, 1.0, 1.0)
+        # Active film back chosen by camera software (DigitalPositiveSensor).
+        # None = renderer uses its own self.film.  When set, this is a list of
+        # layer-spec dicts (same format as FilmStack.layer_specs()) of up to 8
+        # entries batched from all registered backs.
+        self.digital_film: Optional[list] = None
 
     def orbit(self, daz, delev):
         self.az   = (self.az + daz) % 360.0
@@ -5935,8 +7255,115 @@ class Camera:
         self.aperture = float(np.clip(self.aperture * aperture_scale, 0.0, 0.08))
         self.ca = float(np.clip(self.ca + ca_delta, 0.0, 0.02))
 
-    def tick(self):
+    def tick(self, dt: float = 0.0):
         self.az = (self.az + self._auto) % 360.0
+        if self.software:
+            # Build a lightweight proxy so software can read/write Camera attrs.
+            # We pass self as both item and camera; CameraContext properties
+            # fall back to getattr(cam, ...) which resolves to Camera fields.
+            try:
+                from camera_software import CameraContext
+                ctx = CameraContext(self, self)  # type: ignore[arg-type]
+            except Exception:
+                ctx = self  # type: ignore[assignment]
+            for sw in self.software:
+                try:
+                    sw.tick(dt, ctx)
+                except Exception:
+                    pass
+            # Pull digital display state from the context.
+            ds = getattr(ctx, 'digital_sensor', None)
+            if ds is not None and getattr(ds, 'enabled', False):
+                self._digital_positive = bool(getattr(ds, 'positive', True))
+                self._digital_rgb      = (1.0, 1.0, 1.0)
+            # Build a single batched spec list of ≤ 8 layers from ALL software
+            # modules that expose any film — digital backs, chemical film stacks,
+            # acoustic layers, etc.  Every module is a peer; they all work with
+            # spectral responses and can share the accumulator slots equally.
+            # Resolution priority per module (first match wins):
+            #   1. sw.effective_layer_specs()  — multi-back modules (e.g. DigitalPositiveSensor)
+            #   2. sw.active_back.layer_specs() — single active-back modules
+            #   3. sw.film.layer_specs()        — module with a .film attribute
+            #   4. sw.layer_specs()             — module that is itself film-like
+            _all_specs: list = []
+            for sw in self.software:
+                if len(_all_specs) >= 8:
+                    break
+                if hasattr(sw, 'effective_layer_specs'):
+                    _sw_specs = sw.effective_layer_specs()
+                elif hasattr(sw, 'active_back') and sw.active_back is not None:
+                    _sw_specs = sw.active_back.layer_specs()
+                elif hasattr(sw, 'film') and sw.film is not None:
+                    _sw_specs = sw.film.layer_specs()
+                elif hasattr(sw, 'layer_specs') and callable(sw.layer_specs):
+                    _sw_specs = sw.layer_specs()
+                else:
+                    continue
+                for _sp in _sw_specs:
+                    if len(_all_specs) >= 8:
+                        break
+                    _all_specs.append(_sp)
+            self.digital_film = _all_specs if _all_specs else None
+
+    # ── Construction from presets ─────────────────────────────────────────────
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Camera":
+        """Build a Camera from a camera-preset dict (configs/cameras/*.yaml).
+
+        Loads the referenced sensor and lens by name via their own YAML loaders
+        so all physical parameters are fully resolved before the Camera is used.
+        """
+        sensor_name = str(d.get("sensor", "full_frame_35mm"))
+        lens_name   = str(d.get("lens",   "standard_35mm"))
+        sensor = SensorSpec.load(sensor_name)
+        lens   = LensSpec.load(lens_name)
+        ts_raw = d.get("tilt_shift", [0.0, 0.0])
+        cam = cls(
+            target = list(d.get("target", [0.0, 0.40, 0.65])),
+            dist   = float(d.get("dist",  1.6)),
+            elev   = float(d.get("elev",  14.0)),
+            az     = float(d.get("az",    22.0)),
+            sensor = sensor,
+            lens   = lens,
+        )
+        cam.focus_m    = float(d.get("focus_m",      1.6))
+        cam.aperture   = float(d.get("aperture_mm",  0.0))
+        cam.ca         = float(d.get("ca",           0.0))
+        cam.tilt_shift = np.array([float(ts_raw[0]), float(ts_raw[1])], np.float64)
+        lt_raw = d.get("lens_tilt", [0.0, 0.0])
+        cam.lens_tilt    = np.array([float(lt_raw[0]), float(lt_raw[1])], np.float64)
+        cam.extension_mm = float(d.get("extension_mm", 0.0))
+        gim_raw = d.get("gimbal", [0.0, 0.0])
+        cam.gimbal = np.array([float(gim_raw[0]), float(gim_raw[1])], np.float64)
+        return cam
+
+    @classmethod
+    def load_preset(cls, name: str) -> "Camera":
+        """Load a Camera from configs/cameras/<name>.yaml."""
+        d = _load_yaml_file(_config_path("cameras", f"{name}.yaml"))
+        if not d:
+            raise FileNotFoundError(f"Camera preset not found: configs/cameras/{name}.yaml")
+        return cls.from_dict(d)
+
+    def copy_optics_from(self, other: "Camera") -> None:
+        """Copy all physical optical properties from *other* into self.
+
+        Used by PlayerController when entering IN_CAMERA mode: R.cam inherits
+        the placed camera's full physical configuration so that fov_y_rad()
+        and any ray-tracing parameters reflect the actual camera being operated.
+        Eye position and target are NOT touched — those come from the armature.
+        """
+        self.sensor     = other.sensor
+        self.lens       = other.lens
+        self.focal_mm   = other.focal_mm
+        self.focus_m    = other.focus_m
+        self.aperture   = other.aperture
+        self.ca         = other.ca
+        self.tilt_shift = other.tilt_shift.copy()
+        self.lens_tilt    = getattr(other, 'lens_tilt',    np.zeros(2, np.float64)).copy()
+        self.extension_mm = float(getattr(other, 'extension_mm', 0.0))
+        self.gimbal       = getattr(other, 'gimbal',       np.zeros(2, np.float64)).copy()
 
     @property
     def eye(self):
@@ -6023,6 +7450,17 @@ class Renderer:
         # of the aperture, not a display choice.  The enlarger lens cancels it.
         self._film_negative: bool = True
         self._enlarger_mode: bool = False
+        # Digital positive display — true by default for the player camera.
+        # When True the blit pipeline outputs a colour-correct, right-way-up
+        # positive using CFA spectral white-balance weights (_digital_rgb).
+        # _digital_rgb is refreshed each frame from the camera's
+        # DigitalPositiveSensor software module via CameraItem.tick() and
+        # is passed to the blit shader as the uDigitalRGB uniform.
+        self._digital_positive: bool = True
+        self._digital_rgb: tuple = (1.0, 1.0, 1.0)  # neutral default; updated by sensor SW
+        # Batched layer-spec list built by Camera.tick() from DigitalPositiveSensor backs.
+        # None means fall back to self.film.layer_specs() at blit time.
+        self.digital_film: Optional[list] = None
 
         # Guitar model matrix: guitar-frame → world-frame (upright on stand)
         self._guitar_M, self._guitar_Minv = _guitar_model_matrix(outline)
@@ -6089,6 +7527,8 @@ class Renderer:
         """
         if self._sensor_acc is not None:
             self._sensor_acc.destroy()
+        if acc is None or not hasattr(acc, 'tex'):
+            return
         self._sensor_acc = acc
         self._sensor_tex = acc.tex
         self._sensor_w   = acc._w
@@ -6134,13 +7574,7 @@ class Renderer:
         # Sensor backward pass.
         self._sensor_acc.tick()
         self._sensor_tex = self._sensor_acc.tex
-        # Apply temporal decay after every tick so _decay_total is current for
-        # the blit uniforms uploaded in render().  dt_s is derived here via
-        # time.monotonic() so tick_sensor() remains the single owner of frame timing.
-        now_decay = time.monotonic()
-        _dt_decay = now_decay - getattr(self, '_decay_last_t', now_decay)
-        self._decay_last_t = now_decay
-        self._sensor_acc.apply_decay(_dt_decay)
+        self._sensor_acc.apply_decay()
 
     def sync_sensor_camera(self, reset: bool = False) -> None:
         if self._sensor_acc is None:
@@ -6156,13 +7590,87 @@ class Renderer:
         target_gf = _transform_points(
             np.asarray(self.cam.target, np.float32).reshape(1, 3),
             self._guitar_Minv)[0]
+
+        # Compute initial camera-space basis (guitar frame)
+        _fwd = target_gf - eye_gf
+        _fwd_l = float(np.linalg.norm(_fwd))
+        _fwd = (_fwd / _fwd_l if _fwd_l > 1e-6
+                else np.array([0, 0, 1], np.float32)).astype(np.float32)
+        _wup = np.array([0, 1, 0], np.float32)
+        if abs(float(np.dot(_fwd, _wup))) > 0.97:
+            _wup = np.array([0, 0, 1], np.float32)
+        _right = np.cross(_fwd, _wup);  _right /= max(float(np.linalg.norm(_right)), 1e-9)
+        _up    = np.cross(_right, _fwd); _up    /= max(float(np.linalg.norm(_up)),    1e-9)
+
+        # Build and compile the full lens transform
+        try:
+            from camera_software import LensTransform as _LT
+            _lt = _LT()
+            _lt.shift[:]     = self.cam.tilt_shift
+            _lt.lens_tilt[:] = getattr(self.cam, 'lens_tilt',    np.zeros(2))
+            _lt.extension_mm = float(getattr(self.cam, 'extension_mm', 0.0))
+            _lt.gimbal[:]    = getattr(self.cam, 'gimbal',       np.zeros(2))
+            payload = _lt.compile(
+                focal_mm    = self.cam.focal_mm,
+                focus_m     = self.cam.focus_m,
+                sensor_h_mm = self.cam.sensor.height_mm,
+                right       = _right,
+                up          = _up,
+                fwd         = _fwd,
+            )
+            _fov_deg   = math.degrees(2.0 * math.atan(payload['fov_tan']))
+            _tilt_sh   = payload['tilt_shift']
+            _lens_tilt = payload['lens_tilt']
+            _b_right   = payload['right']
+            _b_up      = payload['up']
+            _b_fwd     = payload['fwd']
+        except Exception:
+            _fov_deg   = math.degrees(self.cam.fov_y_rad())
+            _tilt_sh   = tuple(float(v) for v in self.cam.tilt_shift)
+            _lens_tilt = (0.0, 0.0)
+            _b_right = _b_up = _b_fwd = None
+
         self._sensor_acc.set_camera(
             eye_gf, target_gf,
-            fov_deg=math.degrees(self.cam.fov_y_rad()),
-            aperture_radius=float(self.cam.aperture),
-            focus_dist=float(self.cam.focus_m),
-            ca_factor=float(self.cam.ca),
-            tilt_shift=tuple(float(v) for v in self.cam.tilt_shift))
+            fov_deg          = _fov_deg,
+            aperture_radius  = float(self.cam.aperture),
+            focus_dist       = float(self.cam.focus_m),
+            ca_factor        = float(self.cam.ca),
+            tilt_shift       = _tilt_sh,
+            lens_tilt        = _lens_tilt,
+            n_blades         = int(getattr(self.cam, 'n_blades', 0)),
+            aperture_rot     = float(getattr(self.cam, 'aperture_rot', 0.0)),
+            basis_right      = _b_right,
+            basis_up         = _b_up,
+            basis_fwd        = _b_fwd,
+        )
+        # ── Eye manifold: ep_tensor carries all data; no set_manifold call needed ─
+        _mf = getattr(self.cam, 'lens_manifold', None)
+        if _mf is not None:
+            try:
+                _cb = getattr(self.cam, 'camera_back', None)
+                _sphere_back = _cb.back if hasattr(_cb, 'back') else None
+                if _sphere_back is not None:
+                    _half_fov = float(getattr(_sphere_back, 'max_field_angle',
+                                              math.pi / 2.0))
+                    _eye_fov_deg = math.degrees(_half_fov) * 2.0
+                    _pupil_r = float(getattr(_sphere_back, 'pupil_radius', 0.003))
+                    self._sensor_acc.set_camera(
+                        eye_gf, target_gf,
+                        fov_deg         = _eye_fov_deg,
+                        aperture_radius = _pupil_r,
+                        focus_dist      = float(self.cam.focus_m),
+                        ca_factor       = float(self.cam.ca),
+                        tilt_shift      = _tilt_sh,
+                        lens_tilt       = _lens_tilt,
+                        n_blades        = int(getattr(self.cam, 'n_blades', 0)),
+                        aperture_rot    = float(getattr(self.cam, 'aperture_rot', 0.0)),
+                        basis_right     = _b_right,
+                        basis_up        = _b_up,
+                        basis_fwd       = _b_fwd,
+                    )
+            except Exception:
+                pass
         if reset:
             self.reset_sensor()
 
@@ -6203,7 +7711,7 @@ class Renderer:
         self._sensor_w   = 0
         self._sensor_h   = 0
         self._sensor_acc: 'SensorAccumulator | None' = None
-        self._sensor_fps = 30.0
+        self._sensor_fps = 0.0
         self._sensor_last_tick = 0.0
 
         self._mk_body()
@@ -6698,16 +8206,24 @@ class Renderer:
                     glActiveTexture(GL_TEXTURE0 + _i)
                     glBindTexture(GL_TEXTURE_2D, _t)
                     glUniform1i(glGetUniformLocation(self._p_sensor_blit, f'uSensorLayer{_i}'.encode()), _i)
-                _specs = self.film.layer_specs()
+                # Use digital back spec list when in digital positive mode,
+                # otherwise fall through to the default film stack.
+                _dig_specs = self.digital_film if (self._digital_positive and self.digital_film) else None
+                _specs = _dig_specs if _dig_specs is not None else self.film.layer_specs()
                 for _i, _sp in enumerate(_specs[:len(_blit_texs)]):
                     glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerDark{_i}'.encode()),  *_sp['dark_rgb'])
                     glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerLight{_i}'.encode()), *_sp['light_rgb'])
                     glUniform2f(glGetUniformLocation(self._p_sensor_blit, f'uLayerTone{_i}'.encode()),
                                 float(_sp['shadow_point']), float(_sp['highlight_point']))
                 glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uLayerCount'), len(_blit_texs))
-                _fl = self.film.active_layer
-                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
-                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
+                if _dig_specs is not None:
+                    # Digital back: use neutral ISO 1.0 / gamma 2.2; active_layer not meaningful here
+                    glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'), 1.0)
+                    glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),    2.2)
+                else:
+                    _fl = self.film.active_layer
+                    glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
+                    glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
                 glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uAlpha'),     1.0)
                 # Camera simulator — three orthogonal physical stages:
                 #   Optical inversion: the aperture inverts the image; the raw sensor
@@ -6715,10 +8231,18 @@ class Renderer:
                 #     The enlarger adds a corrective second lens that cancels the flip.
                 #   Tone: negative film records bright-as-dark.
                 #     Enlarger re-exposes onto positive paper, cancelling the inversion.
-                _disp_rotate180 = self._enlarger_mode              # enlarger corrects the optical flip
-                _disp_negative  = self._film_negative ^ self._enlarger_mode
+                #   Digital positive: bypasses both film stages; always outputs a
+                #     correctly-oriented colour positive using CFA spectral weights.
+                if self._digital_positive:
+                    _disp_rotate180 = False  # handled by uDigitalPositive path in shader
+                    _disp_negative  = False
+                else:
+                    _disp_rotate180 = self._enlarger_mode
+                    _disp_negative  = self._film_negative ^ self._enlarger_mode
                 glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_disp_rotate180))
                 glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_disp_negative))
+                glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uDigitalPositive'), int(self._digital_positive))
+                glUniform3f(glGetUniformLocation(self._p_sensor_blit, b'uDigitalRGB'), *self._digital_rgb)
                 _dt = float(self._sensor_acc._decay_total) if self._sensor_acc else 1.0
                 glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uDecayTotal'), _dt)
                 glDrawArrays(GL_TRIANGLES, 0, 3)
@@ -7310,21 +8834,32 @@ class Renderer:
                 glActiveTexture(GL_TEXTURE0 + _i)
                 glBindTexture(GL_TEXTURE_2D, _t)
                 glUniform1i(glGetUniformLocation(self._p_sensor_blit, f'uSensorLayer{_i}'.encode()), _i)
-            _specs = self.film.layer_specs()
+            _dig_specs = self.digital_film if (self._digital_positive and self.digital_film) else None
+            _specs = _dig_specs if _dig_specs is not None else self.film.layer_specs()
             for _i, _sp in enumerate(_specs[:len(_blit_texs)]):
                 glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerDark{_i}'.encode()),  *_sp['dark_rgb'])
                 glUniform3f(glGetUniformLocation(self._p_sensor_blit, f'uLayerLight{_i}'.encode()), *_sp['light_rgb'])
                 glUniform2f(glGetUniformLocation(self._p_sensor_blit, f'uLayerTone{_i}'.encode()),
                             float(_sp['shadow_point']), float(_sp['highlight_point']))
             glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uLayerCount'), len(_blit_texs))
-            _fl = self.film.active_layer
-            glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
-            glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
+            if _dig_specs is not None:
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'), 1.0)
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),    2.2)
+            else:
+                _fl = self.film.active_layer
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uExposure'),  float(_fl.iso))
+                glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uGamma'),     float(_fl.gamma))
             glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uAlpha'),     sensor_alpha)
-            _disp_rotate180 = self._enlarger_mode              # enlarger corrects the optical flip
-            _disp_negative  = self._film_negative ^ self._enlarger_mode
+            if self._digital_positive:
+                _disp_rotate180 = False  # uDigitalPositive path handles full 180° in shader
+                _disp_negative  = False
+            else:
+                _disp_rotate180 = self._enlarger_mode
+                _disp_negative  = self._film_negative ^ self._enlarger_mode
             glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uRotate180'), int(_disp_rotate180))
             glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uNegative'),  int(_disp_negative))
+            glUniform1i(glGetUniformLocation(self._p_sensor_blit, b'uDigitalPositive'), int(self._digital_positive))
+            glUniform3f(glGetUniformLocation(self._p_sensor_blit, b'uDigitalRGB'), *self._digital_rgb)
             _dt = float(self._sensor_acc._decay_total) if self._sensor_acc else 1.0
             glUniform1f(glGetUniformLocation(self._p_sensor_blit, b'uDecayTotal'), _dt)
             glDrawArrays(GL_TRIANGLES, 0, 3)
@@ -7374,6 +8909,8 @@ class SensorAccumulator:
                  focus_dist: float = 1.6,
                  ca_factor: float = 0.0,
                  tilt_shift: tuple[float, float] = (0.0, 0.0),
+                 n_blades: int = 0,
+                 aperture_rot: float = 0.0,
                  ray_field_scale: float = 6.0,
                  ray_field_gamma: float = 0.55,
                  vol_alpha: float = 1.0,
@@ -7410,6 +8947,9 @@ class SensorAccumulator:
         self._tilt_shift = np.asarray(tilt_shift, np.float32).ravel()[:2]
         if self._tilt_shift.size < 2:
             self._tilt_shift = np.zeros(2, np.float32)
+        self._lens_tilt  = np.zeros(2, np.float32)   # Scheimpflug tilt (x=nod, y=pan)
+        self._n_blades = max(0, int(n_blades))
+        self._aperture_rot = float(aperture_rot)
         self.set_camera(camera_eye, camera_target, fov_deg=fov_deg)
         self._bmin    = np.asarray(bmin, np.float32)
         self._bmax    = np.asarray(bmax, np.float32)
@@ -7448,7 +8988,7 @@ class SensorAccumulator:
         # ── Temporal decay state ──────────────────────────────────────────────
         # half_life: 0.0 = stable (no decay); >0 = seconds for display to reach
         # 50% brightness after source goes silent.
-        self.half_life: float = 0.0
+        self.half_life: float = 5.0
         # Accumulated product of per-frame decay factors applied during silence.
         # Reset to 1.0 when a source dispatch occurs.  Sent to the blit shader
         # as uDecayTotal so the display fades at the correct half-life rate
@@ -7636,8 +9176,10 @@ class SensorAccumulator:
         batch = self._dispatch_batch_fwd
         for si, _src_entry in enumerate(self._sources_list):
             sp, sd, n_rays, spectrum = _src_entry[0], _src_entry[1], _src_entry[2], _src_entry[3]
-            _src_radius   = float(_src_entry[4]) if len(_src_entry) > 4 else 0.0
-            _src_cone_cos = float(_src_entry[5]) if len(_src_entry) > 5 else -1.0
+            _src_radius  = float(_src_entry[4]) if len(_src_entry) > 4 else 0.0
+            _sr_row      = self._source_records_np[min(si, len(self._source_records_np) - 1)]
+            _dir_model   = int(round(float(_sr_row[7])))
+            _dir_param   = float(_sr_row[11])
             seed = base_seed + si * 104729
             _u1i(b'uSeed',              seed & 0x7FFFFFFF)
             _u1i(b'uTotalRaysPerSource',max(1, int(n_rays)))
@@ -7646,8 +9188,9 @@ class SensorAccumulator:
             spec = np.asarray(spectrum, np.float32).ravel()
             _u4f(b'uSrcSpectrum',       float(spec[0]), float(spec[1]),
                                         float(spec[2]), float(spec[3]))
-            glUniform1f(glGetUniformLocation(prog, b'uSrcRadius'),  _src_radius)
-            glUniform1f(glGetUniformLocation(prog, b'uSrcConeCos'), _src_cone_cos)
+            glUniform1f(glGetUniformLocation(prog, b'uSrcRadius'),   _src_radius)
+            glUniform1i(glGetUniformLocation(prog, b'uSrcDirModel'), _dir_model)
+            glUniform1f(glGetUniformLocation(prog, b'uSrcDirParam'), _dir_param)
             offset = 0
             while offset < n_rays:
                 b_ = min(batch, n_rays - offset)
@@ -7664,21 +9207,37 @@ class SensorAccumulator:
         glUseProgram(0)
         self._fwd_frame += 1
 
+    def set_manifold(self, manifold) -> None:
+        """No-op: manifold data is packed into EmissionProfileBuf by build_gpu_tensor()."""
+        self._has_manifold = True
+
     def set_camera(self, camera_eye, camera_target, *, fov_deg: float,
                    aperture_radius: float | None = None,
                    focus_dist: float | None = None,
                    ca_factor: float | None = None,
-                   tilt_shift=None) -> None:
+                   tilt_shift=None,
+                   lens_tilt=None,
+                   n_blades: int | None = None,
+                   aperture_rot: float | None = None,
+                   basis_right=None,
+                   basis_up=None,
+                   basis_fwd=None) -> None:
         eye    = np.asarray(camera_eye,    np.float32).ravel()[:3]
         target = np.asarray(camera_target, np.float32).ravel()[:3]
-        fwd    = target - eye
-        fwd_l  = float(np.linalg.norm(fwd))
-        fwd    = (fwd / fwd_l if fwd_l > 1e-6 else np.array([0,0,1], np.float32)).astype(np.float32)
-        world_up = np.array([0,1,0], np.float32)
-        if abs(float(np.dot(fwd, world_up))) > 0.97:
-            world_up = np.array([0,0,1], np.float32)
-        right = np.cross(fwd, world_up); right /= max(float(np.linalg.norm(right)), 1e-9)
-        up    = np.cross(right, fwd);    up    /= max(float(np.linalg.norm(up)),    1e-9)
+        if basis_right is not None and basis_up is not None and basis_fwd is not None:
+            # Accept pre-compiled gimbal-rotated basis (from LensTransform.compile)
+            right = np.asarray(basis_right, np.float32).ravel()[:3]
+            up    = np.asarray(basis_up,    np.float32).ravel()[:3]
+            fwd   = np.asarray(basis_fwd,   np.float32).ravel()[:3]
+        else:
+            fwd    = target - eye
+            fwd_l  = float(np.linalg.norm(fwd))
+            fwd    = (fwd / fwd_l if fwd_l > 1e-6 else np.array([0,0,1], np.float32)).astype(np.float32)
+            world_up = np.array([0,1,0], np.float32)
+            if abs(float(np.dot(fwd, world_up))) > 0.97:
+                world_up = np.array([0,0,1], np.float32)
+            right = np.cross(fwd, world_up); right /= max(float(np.linalg.norm(right)), 1e-9)
+            up    = np.cross(right, fwd);    up    /= max(float(np.linalg.norm(up)),    1e-9)
         self._eye   = eye
         self._right = right.astype(np.float32)
         self._up    = up.astype(np.float32)
@@ -7694,11 +9253,22 @@ class SensorAccumulator:
             ts = np.asarray(tilt_shift, np.float32).ravel()[:2]
             if ts.size >= 2:
                 self._tilt_shift = ts.astype(np.float32)
+        if lens_tilt is not None:
+            lt = np.asarray(lens_tilt, np.float32).ravel()[:2]
+            if lt.size >= 2:
+                self._lens_tilt = lt.astype(np.float32)
+        if n_blades is not None:
+            self._n_blades = max(0, int(n_blades))
+        if aperture_rot is not None:
+            self._aperture_rot = float(aperture_rot)
 
     def set_lens(self, *, aperture_radius: float | None = None,
                  focus_dist: float | None = None,
                  ca_factor: float | None = None,
-                 tilt_shift=None) -> None:
+                 tilt_shift=None,
+                 lens_tilt=None,
+                 n_blades: int | None = None,
+                 aperture_rot: float | None = None) -> None:
         if aperture_radius is not None:
             self._aperture_radius = max(0.0, float(aperture_radius))
         if focus_dist is not None:
@@ -7709,6 +9279,14 @@ class SensorAccumulator:
             ts = np.asarray(tilt_shift, np.float32).ravel()[:2]
             if ts.size >= 2:
                 self._tilt_shift = ts.astype(np.float32)
+        if lens_tilt is not None:
+            lt = np.asarray(lens_tilt, np.float32).ravel()[:2]
+            if lt.size >= 2:
+                self._lens_tilt = lt.astype(np.float32)
+        if n_blades is not None:
+            self._n_blades = max(0, int(n_blades))
+        if aperture_rot is not None:
+            self._aperture_rot = float(aperture_rot)
 
     def tick(self, strips: int = 1):
         """Dispatch one strip of rows into the accumulation texture.
@@ -7793,6 +9371,14 @@ class SensorAccumulator:
         _u1f(b'uCAFactor',        self._ca_factor)
         glUniform2f(glGetUniformLocation(self._prog, b'uTiltShift'),
                     float(self._tilt_shift[0]), float(self._tilt_shift[1]))
+        _u1i(b'uNBlades',     getattr(self, '_n_blades', 0))
+        _u1f(b'uApertureRot', getattr(self, '_aperture_rot', 0.0))
+        _lt = getattr(self, '_lens_tilt', None)
+        if _lt is not None and len(_lt) >= 2:
+            glUniform2f(glGetUniformLocation(self._prog, b'uLensTilt'),
+                        float(_lt[0]), float(_lt[1]))
+        else:
+            glUniform2f(glGetUniformLocation(self._prog, b'uLensTilt'), 0.0, 0.0)
         _u3f(b'uBoxMin',          *self._bmin)
         _u3f(b'uBoxMax',          *self._bmax)
         glUniform3i(glGetUniformLocation(self._prog, b'uDims'),
@@ -7841,45 +9427,25 @@ class SensorAccumulator:
         self._frame += 1
 
     # ------------------------------------------------------------------
-    def apply_decay(self, dt_s: float) -> None:
-        """Advance the temporal decay by *dt_s* seconds.
+    def apply_decay(self) -> None:
+        import math as _math, time as _time
+        now = _time.monotonic()
+        if not hasattr(self, '_decay_last_wall') or self._decay_last_wall <= 0.0:
+            self._decay_last_wall = now
+            return
+        dt_s = now - self._decay_last_wall
+        self._decay_last_wall = now
 
-        Must be called once per display frame (regardless of whether sources
-        are active) BEFORE the blit shader reads ``_decay_total``.
-
-        Behaviour:
-        - When ``half_life <= 0`` (stable): no-op except reset ``_decay_total``
-          to 1.0 if a source was dispatched (keeps display bright).
-        - When ``half_life > 0`` AND a forward-ray batch was dispatched this
-          frame: reset ``_decay_total = 1.0`` (source is active → full brightness).
-        - When ``half_life > 0`` AND no sources dispatched: dispatch the decay
-          compute shader (scales the entire accumulator texture by ``f``) and
-          multiply ``_decay_total`` by the same ``f``.
-
-        The compute shader and the CPU multiplier together guarantee:
-        - Texture mean (rgb/a) converges toward zero during silence because
-          both channels shrink; the GPU never tracks per-pixel time.
-        - ``_decay_total`` gives the blit shader a single per-frame brightness
-          scale derived purely from wall-clock time, so the display fade follows
-          a true exponential with the configured half-life.
-        - When the source restarts, ``_decay_total`` jumps back to 1.0 and the
-          texture (now near-zero after extended silence) accepts new samples
-          immediately instead of being masked by stale accumulated weight.
-        """
-        import math as _math
-        if self._source_dispatched:
-            # Source was active this frame: display stays at full brightness.
-            self._decay_total = 1.0
-            self._source_dispatched = False
-            return   # skip texture decay — source is writing fresh energy
+        self._source_dispatched = False
 
         if self.half_life <= 0.0:
-            return   # stable mode: nothing to do
+            self._decay_total = 1.0
+            return
 
-        f = _math.exp(-_math.log(2.0) * max(dt_s, 0.0) / max(self.half_life, 1e-6))
+        f = _math.exp(-_math.log(2.0) * dt_s / max(self.half_life, 1e-6))
         f = float(max(0.0, min(1.0, f)))
 
-        # Dispatch decay compute shader once per output layer texture.
+        # Decay the GPU texture every frame, wall-clock timed.
         if self._decay_prog and self._textures and self._active:
             from OpenGL.GL import (glUseProgram, glBindImageTexture, GL_READ_WRITE,
                                    GL_RGBA32F, glDispatchCompute, glMemoryBarrier,
@@ -7895,7 +9461,9 @@ class SensorAccumulator:
                 glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT)
             glUseProgram(0)
 
-        self._decay_total = max(0.0, self._decay_total * f)
+        # _decay_total is kept at 1.0 — the texture itself carries the decayed
+        # state, so the blit must not double-multiply by a compounded factor.
+        self._decay_total = 1.0
 
     def destroy(self):
         from OpenGL.GL import glDeleteTextures, glDeleteProgram, glDeleteBuffers
@@ -8137,10 +9705,13 @@ class SensorAccumulator:
                 spec = np.asarray(spectrum, np.float32).ravel()
                 _u4f(b'uSrcSpectrum', float(spec[0]), float(spec[1]),
                                       float(spec[2]), float(spec[3]))
-                _src_radius   = float(_src_entry[4]) if len(_src_entry) > 4 else 0.0
-                _src_cone_cos = float(_src_entry[5]) if len(_src_entry) > 5 else -1.0
-                glUniform1f(glGetUniformLocation(prog, b'uSrcRadius'),  _src_radius)
-                glUniform1f(glGetUniformLocation(prog, b'uSrcConeCos'), _src_cone_cos)
+                _src_radius  = float(_src_entry[4]) if len(_src_entry) > 4 else 0.0
+                _sr_row      = self._source_records_np[min(si, len(self._source_records_np) - 1)]
+                _dir_model   = int(round(float(_sr_row[7])))
+                _dir_param   = float(_sr_row[11])
+                glUniform1f(glGetUniformLocation(prog, b'uSrcRadius'),   _src_radius)
+                glUniform1i(glGetUniformLocation(prog, b'uSrcDirModel'), _dir_model)
+                glUniform1f(glGetUniformLocation(prog, b'uSrcDirParam'), _dir_param)
                 last_si = si
             else:
                 # Same source, different offset — just update seed + offset.
@@ -8214,14 +9785,14 @@ class _SliderPanel:
         ('sensor_iso',  'Sen ISO', 0.25,     12.0,   1.4, False, True ),
         ('sensor_rate', 'Sen rows',1.0,     512.0,  16.0, False, True ),
         ('sensor_spp',  'Sen spp', 1.0,       8.0,   1.0, False, True ),
-        ('sensor_fps',  'Sen FPS', 0.0,      60.0,  30.0, False, True ),
+        ('sensor_fps',  'Sen FPS', 0.0,      60.0,   0.0, False, True ),
         ('frame_step',  'Frm step',0.0,       8.0,   1.0, False, True ),
         ('lens_aperture', 'Aperture', 0.0,  0.080,  0.0, False, True ),
         ('lens_ca',     'CA',       0.0,    0.020,  0.0, False, True ),
         # Decay half-life: 0 = stable; >0 = seconds for display to reach 50%
         # brightness after the source goes silent.  Controlled globally and
         # applied to the accumulator via the GPU decay compute shader.
-        ('film_decay',  'Decay \u00bdlife', 0.0, 30.0,  0.0, False, True ),
+        ('film_decay',  'Decay \u00bdlife', 0.0, 30.0,  5.0, False, True ),
         # Volumetric atmosphere \u2014 soft diffuse glow and sharp specular sparkle
         ('air_diff',    'Air glow',  0.0,  1.0,  0.35, False, False),
         ('air_spec',    'Air spark', 0.0,  1.0,  0.65, False, False),
@@ -8562,6 +10133,1210 @@ class _SliderPanel:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Player camera settings panel
+# Opened by E in walk mode when no interactable is nearby.
+# Non-blocking overlay — the main loop continues running while it is visible.
+# Writes go directly to Camera attributes; sensor_iso/decay sync to _SliderPanel.
+# Auto-* checkboxes are wired for display only (no logic yet).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Camera optics schematic — three-view line diagram shown left of camera panel
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _CameraOpticsView:
+    """Three-view cross-section diagram of the camera's optical geometry.
+
+    Drawn with GL_LINES using the same colour-quad shader as the camera panel.
+    Sub-views (stacked vertically inside the panel):
+      1. Side / meridional  (Y = optical axis, Z = vertical)
+         Shows: sensor plane, lens plane, aperture half-extent, focal plane,
+                marginal rays (cone from aperture edge to focal point),
+                tilt/shift offset arrow, N-gon blade tick marks.
+      2. Front / sagittal   (X horizontal, Z vertical)
+         Shows: aperture shape projected face-on (circle or N-gon outline).
+      3. Tilt-shift / top   (X horizontal, Y depth)
+         Shows: sensor rectangle + tilt/shift crosshair displacement.
+
+    The view auto-scales so the sensor-to-focal-plane range always fits.
+    No textures are needed; labels are rendered via the shared text helper.
+    """
+
+    PW     = 260          # panel width (pixels)
+    PAD    = 10           # inner padding
+    V_GAP  = 8            # gap between sub-view frames
+    TITLE  = 24           # title bar height
+    LABEL  = 16           # label strip below each sub-view
+
+    # colour palette (r,g,b,a)
+    _C_BG       = (0.03, 0.03, 0.07, 1.00)
+    _C_TITLE    = (0.06, 0.16, 0.36, 1.00)
+    _C_FRAME    = (0.18, 0.25, 0.38, 1.00)
+    _C_AXIS     = (0.22, 0.32, 0.52, 0.90)
+    _C_SENSOR   = (0.25, 0.75, 1.00, 1.00)
+    _C_LENS     = (0.85, 0.85, 0.30, 0.95)
+    _C_APERTURE = (1.00, 0.55, 0.20, 1.00)
+    _C_FOCAL    = (0.30, 0.90, 0.55, 0.85)
+    _C_MARGINAL = (0.55, 0.55, 0.75, 0.60)
+    _C_TILT     = (1.00, 0.40, 0.70, 0.90)
+
+    def __init__(self):
+        self._cam          = None   # Camera object (set by attach)
+        self._cam_panel    = None   # _PlayerCameraPanel (for open state)
+        self._p_col        = None
+        self._p_tex        = None
+        self._lvao         = None
+        self._lvbo         = None
+        self._qvao         = None
+        self._qvbo         = None
+        self._tvao         = None
+        self._tvbo         = None
+        self._text_cache: dict = {}
+        self._line_buf     = []     # list of (x0,y0,x1,y1,color)
+
+    # ── GL init ───────────────────────────────────────────────────────────────
+
+    def init_gl(self):
+        import ctypes
+        from OpenGL.GL import (
+            GL_ARRAY_BUFFER, GL_DYNAMIC_DRAW, GL_FLOAT, GL_FALSE,
+            GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
+            glGenVertexArrays, glGenBuffers, glBindVertexArray,
+            glBindBuffer, glBufferData, glEnableVertexAttribArray,
+            glVertexAttribPointer,
+        )
+        self._p_col = _prog((_HUD2D_VS, GL_VERTEX_SHADER),
+                            (_HUD2D_FS, GL_FRAGMENT_SHADER))
+        self._p_tex = _prog((_HUD2D_TEX_VS, GL_VERTEX_SHADER),
+                            (_HUD2D_TEX_FS, GL_FRAGMENT_SHADER))
+        # Quad VAO — 4 vertices × 2 floats = 32 bytes
+        self._qvao = glGenVertexArrays(1)
+        self._qvbo = glGenBuffers(1)
+        glBindVertexArray(self._qvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._qvbo)
+        glBufferData(GL_ARRAY_BUFFER, 32, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, ctypes.c_void_p(0))
+        glBindVertexArray(0)
+        # Text quad VAO — 4 vertices × 4 floats (pos+uv) = 64 bytes
+        self._tvao = glGenVertexArrays(1)
+        self._tvbo = glGenBuffers(1)
+        glBindVertexArray(self._tvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._tvbo)
+        glBufferData(GL_ARRAY_BUFFER, 64, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(8))
+        glBindVertexArray(0)
+        # Line VAO — resized dynamically; start with room for 512 segments
+        self._lvao = glGenVertexArrays(1)
+        self._lvbo = glGenBuffers(1)
+        glBindVertexArray(self._lvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._lvbo)
+        glBufferData(GL_ARRAY_BUFFER, 512 * 2 * 8, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, ctypes.c_void_p(0))
+        glBindVertexArray(0)
+        self._lvbo_cap = 512   # segments allocated
+
+    # ── Attach ────────────────────────────────────────────────────────────────
+
+    def attach(self, cam, cam_panel) -> None:
+        self._cam       = cam
+        self._cam_panel = cam_panel
+
+    # ── GL primitives ─────────────────────────────────────────────────────────
+
+    def _draw_quad(self, x, y, w, h, color, win_w, win_h):
+        import ctypes, struct
+        from OpenGL.GL import (
+            glUseProgram, glGetUniformLocation, glUniform2f, glUniform4f,
+            glBindVertexArray, glBindBuffer, glBufferSubData, glDrawArrays,
+            GL_ARRAY_BUFFER, GL_TRIANGLE_STRIP,
+        )
+        glUseProgram(self._p_col)
+        glUniform2f(glGetUniformLocation(self._p_col, b'uRes'),
+                    float(win_w), float(win_h))
+        glUniform4f(glGetUniformLocation(self._p_col, b'uColor'), *color)
+        v = struct.pack('8f',
+                        float(x),   float(y),
+                        float(x+w), float(y),
+                        float(x),   float(y+h),
+                        float(x+w), float(y+h))
+        glBindVertexArray(self._qvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._qvbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, len(v), v)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        glBindVertexArray(0)
+
+    def _flush_lines(self, win_w, win_h):
+        """Batch-draw all accumulated line segments by colour group."""
+        if not self._line_buf:
+            return
+        import struct, ctypes
+        from OpenGL.GL import (
+            glUseProgram, glGetUniformLocation, glUniform2f, glUniform4f,
+            glBindVertexArray, glBindBuffer, glBufferData, glBufferSubData,
+            glDrawArrays, GL_ARRAY_BUFFER, GL_LINES, GL_DYNAMIC_DRAW,
+        )
+        # Group by colour so we minimise uniform changes
+        from collections import defaultdict
+        by_col = defaultdict(list)
+        for x0, y0, x1, y1, col in self._line_buf:
+            by_col[col].append((x0, y0, x1, y1))
+        glUseProgram(self._p_col)
+        glUniform2f(glGetUniformLocation(self._p_col, b'uRes'),
+                    float(win_w), float(win_h))
+        glBindVertexArray(self._lvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._lvbo)
+        for col, segs in by_col.items():
+            n = len(segs)
+            # Grow buffer if needed
+            if n > self._lvbo_cap:
+                glBufferData(GL_ARRAY_BUFFER, n * 2 * 8, None, GL_DYNAMIC_DRAW)
+                self._lvbo_cap = n
+            data = struct.pack(f'{n*4}f',
+                               *[v for (x0,y0,x1,y1) in segs for v in (x0,y0,x1,y1)])
+            glBufferSubData(GL_ARRAY_BUFFER, 0, len(data), data)
+            glUniform4f(glGetUniformLocation(self._p_col, b'uColor'), *col)
+            glDrawArrays(GL_LINES, 0, n * 2)
+        glBindVertexArray(0)
+        self._line_buf.clear()
+
+    def _line(self, x0, y0, x1, y1, color):
+        self._line_buf.append((float(x0), float(y0), float(x1), float(y1), color))
+
+    def _get_tex(self, text: str):
+        if text in self._text_cache:
+            return self._text_cache[text]
+        from OpenGL.GL import (
+            glGenTextures, glBindTexture, glTexParameteri, glTexImage2D,
+            GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
+            GL_LINEAR, GL_RGBA, GL_UNSIGNED_BYTE,
+        )
+        pygame.font.init()
+        f = pygame.font.SysFont("consolas,monospace", 12)
+        s = f.render(str(text), True, (180, 200, 230), (8, 8, 18))
+        w, h = s.get_size()
+        raw = pygame.image.tobytes(s, "RGBA")
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        r = (tex, (w, h))
+        self._text_cache[text] = r
+        return r
+
+    def _draw_text(self, text: str, x: int, y: int, win_w: int, win_h: int):
+        import struct
+        from OpenGL.GL import (
+            glUseProgram, glGetUniformLocation, glUniform2f, glUniform1i,
+            glActiveTexture, glBindTexture, glBindVertexArray, glBindBuffer,
+            glBufferSubData, glDrawArrays,
+            GL_ARRAY_BUFFER, GL_TRIANGLE_STRIP, GL_TEXTURE0, GL_TEXTURE_2D,
+        )
+        tex, (tw, th) = self._get_tex(text)
+        glUseProgram(self._p_tex)
+        glUniform2f(glGetUniformLocation(self._p_tex, b'uRes'),
+                    float(win_w), float(win_h))
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glUniform1i(glGetUniformLocation(self._p_tex, b'uTex'), 0)
+        v = struct.pack('16f',
+                        float(x),    float(y),    0.0, 0.0,
+                        float(x+tw), float(y),    1.0, 0.0,
+                        float(x),    float(y+th), 0.0, 1.0,
+                        float(x+tw), float(y+th), 1.0, 1.0)
+        glBindVertexArray(self._tvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._tvbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, len(v), v)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        glBindVertexArray(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+    # ── Geometry helpers ──────────────────────────────────────────────────────
+
+    @staticmethod
+    def _ngon_pts(cx, cy, rx, ry, n, rot=0.0, steps_circle=64):
+        """Return list of (x,y) vertices for a regular N-gon (or circle if n<3)."""
+        if n < 3:
+            pts = []
+            for i in range(steps_circle):
+                a = 2.0 * math.pi * i / steps_circle + rot
+                pts.append((cx + rx * math.cos(a), cy + ry * math.sin(a)))
+            return pts
+        pts = []
+        for k in range(n):
+            a = 2.0 * math.pi * k / n + rot
+            pts.append((cx + rx * math.cos(a), cy + ry * math.sin(a)))
+        return pts
+
+    def _draw_polygon_lines(self, pts, color, close=True):
+        """Draw pts as a closed or open polyline."""
+        for i in range(len(pts)):
+            if not close and i == len(pts) - 1:
+                break
+            x0, y0 = pts[i]
+            x1, y1 = pts[(i + 1) % len(pts)]
+            self._line(x0, y0, x1, y1, color)
+
+    # ── Sub-view renderers ────────────────────────────────────────────────────
+
+    def _draw_side_view(self, fx, fy, fw, fh, cam):
+        """Meridional (side) cross section.
+
+        Shows effective lens position (nominal + extension), biconvex arcs,
+        aperture ticks, N-gon blade marks, marginal rays, and focal plane
+        (tilted when Scheimpflug is non-zero).
+        """
+        PAD = self.PAD
+        focal_mm      = float(getattr(cam, 'focal_mm', 35.0))
+        extension_mm  = float(getattr(cam, 'extension_mm', 0.0))
+        eff_focal_mm  = max(1.0, focal_mm + extension_mm)
+        focus_m       = float(getattr(cam, 'focus_m',  1.6))
+        ap_r          = float(getattr(cam, 'aperture', 0.0))
+        tilt_y        = float(getattr(cam, 'tilt_shift', [0, 0])[1])
+        lens_tilt     = getattr(cam, 'lens_tilt', [0.0, 0.0])
+        scheimpflug_x = float(lens_tilt[0])
+        n_blades      = int(getattr(cam, 'n_blades', 0))
+        ap_rot        = float(getattr(cam, 'aperture_rot', 0.0))
+        focal_m       = eff_focal_mm * 1e-3
+
+        scene_depth = focus_m
+        total_depth = focal_m + scene_depth
+        scale       = (fw - 2*PAD) / max(total_depth, 1e-3)
+
+        cz = fy + fh // 2
+        x_sensor        = fx + PAD
+        x_lens_nominal  = x_sensor + int(focal_mm * 1e-3 * scale)
+        x_lens          = x_sensor + int(focal_m * scale)
+        x_focal         = min(x_lens + int(scene_depth * scale), fx + fw - PAD)
+
+        if ap_r > 1e-7:
+            ap_px = min(int(ap_r * scale * 200), fh // 2 - 4)
+        else:
+            ap_px = max(4, fh // 8)
+
+        # Optical axis
+        self._line(x_sensor, cz, x_focal + 8, cz, self._C_AXIS)
+
+        # Sensor plane shifted by tilt_y
+        sh = fh // 2 - 4
+        ts_px = int(tilt_y * scale * 0.5 * fh)
+        self._line(x_sensor, cz - sh + ts_px, x_sensor, cz + sh + ts_px, self._C_SENSOR)
+        if abs(ts_px) > 2:
+            ax0, ay0 = x_sensor - 6, cz + ts_px
+            self._line(ax0, cz, ax0, ay0, self._C_TILT)
+            arr = 3 if ts_px < 0 else -3
+            self._line(ax0, ay0, ax0 - 3, ay0 + arr, self._C_TILT)
+            self._line(ax0, ay0, ax0 + 3, ay0 + arr, self._C_TILT)
+
+        # Extension bracket: nominal → effective lens position
+        if abs(extension_mm) > 0.5 and x_lens != x_lens_nominal:
+            bk_y = cz - fh // 2 + 6
+            self._line(x_lens_nominal, bk_y,     x_lens, bk_y,     self._C_FOCAL)
+            self._line(x_lens_nominal, bk_y - 3, x_lens_nominal, bk_y + 3, self._C_FOCAL)
+            self._line(x_lens,         bk_y - 3, x_lens,         bk_y + 3, self._C_FOCAL)
+
+        # Lens plane (biconvex arcs) at effective position
+        lh = fh // 2 - 2
+        self._line(x_lens, cz - lh, x_lens, cz + lh, self._C_LENS)
+        arc_bow = max(3, min(10, int(ap_px * 0.3)))
+        for sign in (-1, 1):
+            prev = None
+            for i in range(13):
+                t  = i / 12
+                za = (t - 0.5) * 2.0 * lh
+                xa = x_lens + sign * arc_bow * (1.0 - (za / lh) ** 2)
+                pt = (xa, cz + za)
+                if prev:
+                    self._line(prev[0], prev[1], pt[0], pt[1], self._C_LENS)
+                prev = pt
+
+        # Aperture extent ticks
+        self._line(x_lens - 5, cz - ap_px, x_lens + 5, cz - ap_px, self._C_APERTURE)
+        self._line(x_lens - 5, cz + ap_px, x_lens + 5, cz + ap_px, self._C_APERTURE)
+        self._line(x_lens - 5, cz - ap_px, x_lens - 5, cz + ap_px, self._C_APERTURE)
+        if n_blades >= 3:
+            for k in range(n_blades):
+                a   = 2.0 * math.pi * k / n_blades + ap_rot
+                py_ = cz + int(ap_px * math.sin(a))
+                self._line(x_lens - 8, py_, x_lens - 3, py_, self._C_APERTURE)
+
+        # Marginal ray cone
+        for sign in (-1, 1):
+            ey = cz + sign * ap_px
+            self._line(x_sensor, cz + sign * (sh // 2) + ts_px, x_lens, ey, self._C_MARGINAL)
+            self._line(x_lens, ey, x_focal, cz, self._C_MARGINAL)
+
+        # Focal plane — tilted if Scheimpflug active
+        dash, gap = 5, 4
+        if abs(scheimpflug_x) < 0.02:
+            y_cur = fy + PAD
+            while y_cur < fy + fh - PAD:
+                self._line(x_focal, y_cur, x_focal,
+                           min(y_cur + dash, fy + fh - PAD), self._C_FOCAL)
+                y_cur += dash + gap
+        else:
+            # Tilted line across the frame at x_focal, slope = tan(scheimpflug_x)
+            tilt_slope = math.tan(scheimpflug_x)
+            half = fh // 2 - PAD
+            sign_t = 1.0 if scheimpflug_x > 0 else -1.0
+            y_top = cz - half;  x_top = x_focal + int(half * abs(tilt_slope) * sign_t)
+            y_bot = cz + half;  x_bot = x_focal - int(half * abs(tilt_slope) * sign_t)
+            length = max(1, math.hypot(x_bot - x_top, y_bot - y_top))
+            n_steps = max(1, int(length / (dash + gap)))
+            for i in range(n_steps):
+                t0 = i / n_steps
+                t1 = min(1.0, t0 + dash / length)
+                self._line(x_top + (x_bot - x_top) * t0, y_top + (y_bot - y_top) * t0,
+                           x_top + (x_bot - x_top) * t1, y_top + (y_bot - y_top) * t1,
+                           self._C_FOCAL)
+
+    def _draw_front_view(self, fx, fy, fw, fh, cam):
+        """Sagittal (front-on) view of the aperture: X horizontal, Z vertical.
+
+        For a circle: draws the full circular outline.
+        For an N-gon: draws the exact polygon outline, rotated by aperture_rot.
+        Also draws the sensor rectangle outline behind the aperture.
+        """
+        cx = fx + fw // 2
+        cy = fy + fh // 2
+        n_blades = int(getattr(cam, 'n_blades', 0))
+        ap_rot   = float(getattr(cam, 'aperture_rot', 0.0))
+        ap_r     = float(getattr(cam, 'aperture', 0.0))
+
+        # Scale aperture to fit: if ap_r > 0 use it, else draw placeholder
+        ap_px = fh // 2 - self.PAD
+        if ap_r < 1e-8:
+            ap_px = max(8, ap_px // 3)   # pinhole symbol
+
+        # Sensor outline (thin grey rectangle behind aperture)
+        sw = int(fw * 0.72)
+        sh = int(fh * 0.55)
+        self._draw_polygon_lines([
+            (cx - sw//2, cy - sh//2), (cx + sw//2, cy - sh//2),
+            (cx + sw//2, cy + sh//2), (cx - sw//2, cy + sh//2),
+        ], self._C_SENSOR)
+
+        # Aperture outline
+        pts = self._ngon_pts(cx, cy, ap_px, ap_px, n_blades, ap_rot)
+        self._draw_polygon_lines(pts, self._C_APERTURE)
+
+        # Axis crosshair
+        self._line(cx - 6, cy, cx + 6, cy, self._C_AXIS)
+        self._line(cx, cy - 6, cx, cy + 6, self._C_AXIS)
+
+    def _draw_tilt_view(self, fx, fy, fw, fh, cam):
+        """Tilt/shift/gimbal view: sensor face with all in-plane transforms.
+
+        Shows:
+          • Sensor rectangle
+          • Principal-point shift (tilt_shift arrow)
+          • Gimbal lens-axis rotation (arc + pointer showing gimbal pan/tilt)
+          • Extension bar (depth indicator along the optical axis edge)
+        """
+        cx = fx + fw // 2
+        cy = fy + fh // 2
+        tilt_x       = float(getattr(cam, 'tilt_shift', [0, 0])[0])
+        tilt_y       = float(getattr(cam, 'tilt_shift', [0, 0])[1])
+        gimbal       = getattr(cam, 'gimbal', [0.0, 0.0])
+        gimbal_pan   = float(gimbal[0])
+        gimbal_tilt  = float(gimbal[1])
+        extension_mm = float(getattr(cam, 'extension_mm', 0.0))
+        focal_mm     = float(getattr(cam, 'focal_mm', 35.0))
+
+        sw = int(fw * 0.72)
+        sh = int(fh * 0.55)
+
+        # Sensor rectangle
+        self._draw_polygon_lines([
+            (cx - sw//2, cy - sh//2), (cx + sw//2, cy - sh//2),
+            (cx + sw//2, cy + sh//2), (cx - sw//2, cy + sh//2),
+        ], self._C_SENSOR)
+
+        # Centre cross
+        self._line(cx - 4, cy, cx + 4, cy, self._C_AXIS)
+        self._line(cx, cy - 4, cx, cy + 4, self._C_AXIS)
+
+        # Principal-point shift arrow
+        max_shift = 0.5
+        ox = int(tilt_x / max_shift * (sw // 2 - 6))
+        oy = int(tilt_y / max_shift * (sh // 2 - 6))
+        if abs(ox) > 1 or abs(oy) > 1:
+            self._line(cx, cy, cx + ox, cy - oy, self._C_TILT)
+            px_, py_ = cx + ox, cy - oy
+            self._line(px_ - 4, py_, px_ + 4, py_, self._C_TILT)
+            self._line(px_, py_ - 4, px_, py_ + 4, self._C_TILT)
+
+        # Gimbal indicator: arc showing pan (horizontal) and tilt (vertical)
+        # radius of the gimbal arc symbol
+        gr = min(sw, sh) // 2 - 4
+        # Gimbal pan: arc in horizontal plane — draw as small arc at bottom of sensor
+        if abs(gimbal_pan) > 0.005 or abs(gimbal_tilt) > 0.005:
+            # Draw a small compass-rose style pointer at centre showing lens direction
+            max_g = math.pi / 4   # ±45° max display range
+            gx = int(gr * 0.5 * math.sin(gimbal_pan)  / (math.pi / 4))
+            gy = int(gr * 0.5 * math.sin(gimbal_tilt) / (math.pi / 4))
+            # Arrow from centre to gimbal-displaced axis point
+            self._line(cx, cy, cx + gx, cy + gy, self._C_LENS)
+            self._line(cx + gx - 3, cy + gy - 3, cx + gx + 3, cy + gy + 3, self._C_LENS)
+            self._line(cx + gx - 3, cy + gy + 3, cx + gx + 3, cy + gy - 3, self._C_LENS)
+            # Outer gimbal circle arc (partial, ±gimbal extent)
+            arc_r = gr // 2
+            arc_pts = self._ngon_pts(cx, cy, arc_r, arc_r, 0, 0.0, steps_circle=32)
+            self._draw_polygon_lines(arc_pts, self._C_AXIS, close=True)
+
+        # Extension bar along the right edge of the sensor
+        if abs(extension_mm) > 0.1:
+            max_ext  = 50.0   # mm — full bar
+            ext_frac = min(1.0, abs(extension_mm) / max_ext)
+            bar_x    = cx + sw // 2 + 4
+            bar_top  = cy - sh // 2
+            bar_bot  = cy + sh // 2
+            bar_fill = int((bar_bot - bar_top) * ext_frac)
+            # Background track
+            self._line(bar_x, bar_top, bar_x, bar_bot, self._C_FRAME)
+            # Filled portion
+            self._line(bar_x, bar_bot, bar_x, bar_bot - bar_fill, self._C_FOCAL)
+            # Tick at current fill level
+            self._line(bar_x - 2, bar_bot - bar_fill,
+                       bar_x + 2, bar_bot - bar_fill, self._C_FOCAL)
+
+
+    # ── Main draw ─────────────────────────────────────────────────────────────
+
+    def draw(self, win_w: int, win_h: int):
+        """Draw the three-view optics schematic left of the camera settings panel."""
+        if self._cam_panel is None or not getattr(self._cam_panel, '_open', False):
+            return
+        if self._p_col is None:
+            return
+        cam = self._cam
+        if cam is None:
+            return
+
+        from OpenGL.GL import (
+            glEnable, glDisable, glBlendFunc, glLineWidth,
+            GL_BLEND, GL_DEPTH_TEST, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+            glBindVertexArray, glUseProgram, glBindTexture, GL_TEXTURE_2D,
+        )
+
+        # Position: directly left of the camera panel
+        cam_px   = self._cam_panel._px(win_w)
+        cam_py   = self._cam_panel._py(win_h)
+        cam_ph   = self._cam_panel._panel_h()
+        panel_w  = self.PW
+        panel_h  = cam_ph
+        px       = cam_px - panel_w - 6
+        py       = cam_py
+        if px < 0:
+            return   # not enough room
+
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        self._draw_quad(px, py, panel_w, panel_h, self._C_BG, win_w, win_h)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # Title bar
+        self._draw_quad(px, py, panel_w, self.TITLE - 2, self._C_TITLE, win_w, win_h)
+        self._draw_text("OPTICS  side · front · shift", px + 6, py + 5, win_w, win_h)
+
+        # Partition the remaining height into three equal sub-view slots
+        inner_h = panel_h - self.TITLE
+        slot_h  = (inner_h - 2 * self.V_GAP) // 3
+        slot_w  = panel_w - 2 * self.PAD
+
+        views = [
+            ("side",  self._draw_side_view),
+            ("front", self._draw_front_view),
+            ("shift", self._draw_tilt_view),
+        ]
+        for vi, (label, draw_fn) in enumerate(views):
+            vy = py + self.TITLE + vi * (slot_h + self.V_GAP)
+            vx = px + self.PAD
+            # Sub-view frame
+            self._draw_quad(vx - 1, vy - 1, slot_w + 2, slot_h + 2,
+                            self._C_FRAME, win_w, win_h)
+            self._draw_quad(vx, vy, slot_w, slot_h, self._C_BG, win_w, win_h)
+            # Draw content into the frame
+            draw_fn(vx, vy, slot_w, slot_h, cam)
+            # Flush all queued line segments for this sub-view
+            glLineWidth(1.2)
+            self._flush_lines(win_w, win_h)
+            glLineWidth(1.0)
+            # Label
+            self._draw_text(label, vx + 3, vy + slot_h - self.LABEL + 2, win_w, win_h)
+
+        glEnable(GL_DEPTH_TEST)
+        glBindVertexArray(0)
+        glUseProgram(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class _PlayerCameraPanel:
+    """Full-parameter camera HUD for the player's head camera.
+
+    Covers every optical parameter on the Camera object plus sensor ISO,
+    sensor gain, and decay half-life.  Auto-* checkboxes are present for
+    future logic but perform no action yet.
+    """
+
+    PW      = 320
+    ROW     = 26
+    TX      = 130   # track left edge within panel
+    TW      = 160   # track width
+    TH      = 6     # track height
+    PAD_TOP = 34    # title bar height
+
+    # (key, label, lo, hi, default, is_log, fmt_spec)
+    _SLIDERS = [
+        # ── Optics ──────────────────────────────────────────────────────────
+        ('focal_mm',    'Focal mm',      12.0,   180.0, 35.0,  False, '.1f'),
+        ('focus_m',     'Focus m',        0.05,   20.0,  1.6,  False, '.2f'),
+        ('aperture',    'Aperture r',     0.0,     0.08, 0.0,  False, '.4f'),
+        ('ca',          'Chrom. Ab.',     0.0,     0.02, 0.0,  False, '.4f'),
+        ('tilt_x',      'Tilt/Shift X',  -0.5,     0.5,  0.0, False, '.3f'),
+        ('tilt_y',      'Tilt/Shift Y',  -0.5,     0.5,  0.0, False, '.3f'),
+        # ── Sensor / exposure ────────────────────────────────────────────────
+        ('sensor_iso',  'ISO',            0.25,   12.0,  1.4,  False, '.2f'),
+        ('sensor_gain', 'Sensor Gain',    0.5,    32.0,  8.0,  False, '.1f'),
+        ('decay',       'Decay \u00bdlife',0.0,   30.0,  5.0,  False, '.1f'),
+        # ── Ray-camera config ────────────────────────────────────────────────
+        ('ray_density',  'Ray Density',   0.1,    8.0,   1.0,  False, '.2f'),
+        ('ray_exposure', 'Ray Exposure',  0.25,   6.0,   1.0,  False, '.2f'),
+        ('ray_gamma',    'Ray Gamma',     0.20,   1.60,  GPU_RAY_FIELD_GAMMA, False, '.3f'),
+        ('sensor_rate',  'Sen Rows',      1.0,  512.0,  16.0,  False, '.0f'),
+        ('sensor_spp',   'Sen SPP',       1.0,    8.0,   1.0,  False, '.0f'),
+        ('sensor_fps',   'Sen FPS',       0.0,   60.0,   0.0,  False, '.0f'),
+        ('frame_step',   'Frame Step',    0.0,    8.0,   1.0,  False, '.0f'),
+        ('mic_gain',     'Mic Gain',      0.0,    1.0,   1.0,  False, '.3f'),
+        ('pickup_gain',  'Pickup Gain',   0.0,    1.0,   1.0,  False, '.3f'),
+        # ── Rebuild params ───────────────────────────────────────────────────
+        ('segs',         'Str Segs',     30.0,  240.0,  60.0,  False, '.0f'),
+        ('plate_th',     'Board Res',    64.0, 1024.0, 128.0,  False, '.0f'),
+        ('dx',           'Press dx',    0.004,  0.016, 0.010,  False, '.4f'),
+        # ── Atmosphere ───────────────────────────────────────────────────────
+        ('air_diff',     'Air Glow',     0.0,    1.0,   0.35,  False, '.3f'),
+        ('air_spec',     'Air Spark',    0.0,    1.0,   0.65,  False, '.3f'),
+        ('air_aniso',    'Air Lobe',     1.0,   32.0,  12.0,   False, '.1f'),
+    ]
+
+    # Auto checkboxes — display-only; no logic yet
+    _AUTOS = [
+        ('auto_focus',    'Auto Focus'),
+        ('auto_aperture', 'Auto Aperture'),
+        ('auto_iso',      'Auto ISO'),
+        ('auto_decay',    'Auto Decay'),
+    ]
+
+    _C_BG      = (0.04, 0.04, 0.09, 1.00)
+    _C_TITLE   = (0.08, 0.20, 0.42, 1.00)
+    _C_TRACK   = (0.20, 0.20, 0.26, 1.00)
+    _C_FILL    = (0.25, 0.65, 1.00, 1.00)
+    _C_KNOB    = (0.90, 0.90, 0.90, 1.00)
+    _C_CHECK   = (0.22, 0.80, 0.38, 1.00)
+    _C_UNCHECK = (0.28, 0.28, 0.35, 1.00)
+    _C_SEP     = (0.18, 0.28, 0.44, 1.00)
+
+    def __init__(self):
+        self._open   = False
+        self._drag   = -1
+        self._values = {d[0]: d[4] for d in self._SLIDERS}
+        self._lo     = {d[0]: d[2] for d in self._SLIDERS}
+        self._hi     = {d[0]: d[3] for d in self._SLIDERS}
+        self._log    = {d[0]: d[5] for d in self._SLIDERS}
+        self._fmt    = {d[0]: d[6] for d in self._SLIDERS}
+        self._auto   = {d[0]: False for d in self._AUTOS}
+        self._cam_render_mode: 'RenderMode' = RenderMode.GL
+        # Layer / display toggles driven by the panel
+        self._show_illum:   bool = False
+        self._show_sensor:  bool = False
+        self._enlarger:     bool = False
+        # Bound live objects — set by attach()
+        self._cam:          object = None
+        self._slider_panel: object = None
+        self._renderer:     object = None
+        self._on_change:    dict   = {}   # key → callable(value)
+        # GL resources
+        self._p_col  = None
+        self._p_tex  = None
+        self._qvao = self._qvbo = None
+        self._tvao = self._tvbo = None
+        self._text_cache: dict = {}
+
+    # ── GL init ───────────────────────────────────────────────────────────────
+
+    def init_gl(self):
+        import ctypes
+        from OpenGL.GL import (
+            GL_ARRAY_BUFFER, GL_DYNAMIC_DRAW, GL_FLOAT, GL_FALSE,
+            GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
+            glGenVertexArrays, glGenBuffers, glBindVertexArray,
+            glBindBuffer, glBufferData, glEnableVertexAttribArray,
+            glVertexAttribPointer,
+        )
+        self._p_col = _prog((_HUD2D_VS, GL_VERTEX_SHADER),
+                            (_HUD2D_FS, GL_FRAGMENT_SHADER))
+        self._p_tex = _prog((_HUD2D_TEX_VS, GL_VERTEX_SHADER),
+                            (_HUD2D_TEX_FS, GL_FRAGMENT_SHADER))
+        self._qvao = glGenVertexArrays(1)
+        self._qvbo = glGenBuffers(1)
+        glBindVertexArray(self._qvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._qvbo)
+        glBufferData(GL_ARRAY_BUFFER, 32, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 8, ctypes.c_void_p(0))
+        glBindVertexArray(0)
+        self._tvao = glGenVertexArrays(1)
+        self._tvbo = glGenBuffers(1)
+        glBindVertexArray(self._tvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._tvbo)
+        glBufferData(GL_ARRAY_BUFFER, 64, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 16, ctypes.c_void_p(8))
+        glBindVertexArray(0)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    @property
+    def open(self) -> bool:
+        return self._open
+
+    def toggle(self):
+        self._open = not self._open
+        self._drag = -1
+
+    def close(self):
+        self._open = False
+        self._drag = -1
+
+    # ── Binding ───────────────────────────────────────────────────────────────
+
+    def attach(self, cam, slider_panel, renderer) -> None:
+        """Bind live objects and build per-knob on_change callbacks.
+
+        Each callback closes over the live objects so handle_event() needs no
+        external context — it simply fires self._on_change[key](value).
+        Re-call whenever the bound camera or renderer changes.
+        """
+        self._cam          = cam
+        self._slider_panel = slider_panel
+        self._renderer     = renderer
+
+        c = cam
+        p = slider_panel
+
+        r = renderer  # direct renderer reference for immediate application
+
+        def _cam_set(attr):
+            return lambda v: setattr(c, attr, float(v))
+
+        def _panel_set(pkey):
+            # Write to both panel.values (for panel.changed() tracking) AND
+            # apply directly to R so there is no one-frame lag.
+            def _set(v):
+                p.values[pkey] = v
+                _apply_direct(pkey, v)
+            return _set
+
+        def _apply_direct(key, v):
+            """Apply a panel key directly to the renderer/accumulator."""
+            if r is None:
+                return
+            acc = getattr(r, '_sensor_acc', None)
+            if key == 'ray_density':
+                pass  # refresh_rays recalculated in main loop via panel.changed
+            elif key == 'ray_exposure' or key == 'ray_gamma':
+                r.set_ray_tonemap(
+                    exposure=float(p.values.get('ray_exposure', 1.0)),
+                    gamma=float(p.values.get('ray_gamma', 1.0)))
+            elif key == 'sensor_rate' and acc is not None:
+                acc._rows_per_frame = max(1, int(round(float(v))))
+            elif key == 'sensor_spp' and acc is not None:
+                acc._samples_per_pixel = max(1, int(round(float(v))))
+            elif key == 'sensor_fps':
+                r._sensor_fps = max(0.0, float(v))
+            elif key == 'mic_gain':
+                r.show_mic = float(v) > 0.0
+            elif key == 'pickup_gain':
+                r.show_pickup = float(v) > 0.0
+            elif key == 'air_diff' and acc is not None:
+                acc._air_ds = float(v)
+            elif key == 'air_spec' and acc is not None:
+                acc._air_ss = float(v)
+            elif key == 'air_aniso' and acc is not None:
+                acc._air_an = float(v)
+
+        def _aperture_set(v):
+            v = float(np.clip(v, 0.0, 0.08))
+            c.aperture = v
+            p.values['lens_aperture'] = v
+
+        def _ca_set(v):
+            v = float(np.clip(v, 0.0, 0.02))
+            c.ca = v
+            p.values['lens_ca'] = v
+
+        def _iso_set(v):
+            p.values['sensor_iso'] = float(v)
+            if r is not None:
+                r.film.active_layer.iso = float(v)
+
+        def _decay_set(v):
+            v = max(0.0, float(v))
+            p.values['film_decay'] = v
+            acc = getattr(r, '_sensor_acc', None)
+            if acc is not None:
+                acc.half_life = v
+
+        self._on_change = {
+            'focal_mm':    _cam_set('focal_mm'),
+            'focus_m':     _cam_set('focus_m'),
+            'aperture':    _aperture_set,
+            'ca':          _ca_set,
+            'tilt_x':      lambda v: c.tilt_shift.__setitem__(0, float(v)),
+            'tilt_y':      lambda v: c.tilt_shift.__setitem__(1, float(v)),
+            'sensor_iso':  _iso_set,
+            'sensor_gain': lambda v: None,
+            'decay':       _decay_set,
+        }
+        for key in ('ray_density', 'ray_exposure', 'ray_gamma',
+                    'sensor_rate', 'sensor_spp', 'sensor_fps', 'frame_step',
+                    'mic_gain', 'pickup_gain',
+                    'segs', 'plate_th', 'dx',
+                    'air_diff', 'air_spec', 'air_aniso'):
+            if key in p.values:
+                self._on_change[key] = _panel_set(key)
+
+        self._pull()
+        self._sync_render_mode()
+
+        # Ensure a CameraComputer is present in cam.software so auto modes
+        # have somewhere to write.  Create one if absent.
+        try:
+            from camera_software import CameraComputer as _CC
+            if not any(isinstance(sw, _CC) for sw in cam.software):
+                cam.software.append(_CC())
+        except Exception:
+            pass
+
+    def _get_computer(self):
+        """Return the first CameraComputer in the bound camera's software list, or None."""
+        if self._cam is None:
+            return None
+        try:
+            from camera_software import CameraComputer as _CC
+            for sw in self._cam.software:
+                if isinstance(sw, _CC):
+                    return sw
+        except Exception:
+            pass
+        return None
+
+    def _pull(self) -> None:
+        """Read current values from bound cam + slider_panel + renderer into _values."""
+        if self._cam is None:
+            return
+        c, p, r = self._cam, self._slider_panel, self._renderer
+        self._values['focal_mm'] = float(c.focal_mm)
+        self._values['focus_m']  = float(c.focus_m)
+        self._values['aperture'] = float(c.aperture)
+        self._values['ca']       = float(c.ca)
+        self._values['tilt_x']   = float(c.tilt_shift[0])
+        self._values['tilt_y']   = float(c.tilt_shift[1])
+        if r is not None:
+            acc = getattr(r, '_sensor_acc', None)
+            self._values['sensor_fps']  = float(getattr(r, '_sensor_fps', self._values['sensor_fps']))
+            self._values['sensor_iso']  = float(getattr(r.film.active_layer, 'iso', self._values['sensor_iso']))
+            if acc is not None:
+                self._values['decay']       = float(acc.half_life)
+                self._values['sensor_rate'] = float(acc._rows_per_frame)
+                self._values['sensor_spp']  = float(acc._samples_per_pixel)
+                self._values['air_diff']    = float(acc._air_ds)
+                self._values['air_spec']    = float(acc._air_ss)
+                self._values['air_aniso']   = float(acc._air_an)
+        if p is not None:
+            for key in ('ray_density', 'ray_exposure', 'ray_gamma',
+                        'frame_step', 'mic_gain', 'pickup_gain',
+                        'segs', 'plate_th', 'dx'):
+                if key in p.values:
+                    self._values[key] = p.values[key]
+        if r is not None:
+            self._show_illum  = (r._layers[7] != LAYER_HIDDEN)
+            self._show_sensor = (r._layers[8] != LAYER_HIDDEN)
+            self._enlarger    = bool(getattr(self._renderer, '_enlarger_mode', False))
+
+    def _apply_value(self, key: str, value) -> None:
+        """Store value and fire its on_change callback."""
+        self._values[key] = value
+        cb = self._on_change.get(key)
+        if cb is not None:
+            cb(value)
+
+    def apply_render_mode(self) -> None:
+        """Push current render-mode selection onto the bound renderer."""
+        if self._renderer is None:
+            return
+        m = self._cam_render_mode
+        if m is RenderMode.GL:
+            self._renderer._layers[7] = LAYER_HIDDEN
+            self._renderer._layers[8] = LAYER_HIDDEN
+        elif m is RenderMode.HYBRID:
+            self._renderer._layers[7] = LAYER_OPAQUE
+            self._renderer._layers[8] = LAYER_HIDDEN
+        else:  # RAYTRACE
+            self._renderer._layers[7] = LAYER_HIDDEN
+            self._renderer._layers[8] = LAYER_OPAQUE
+        # Sync toggle buttons to match what the preset just set
+        self._show_illum  = (self._renderer._layers[7] != LAYER_HIDDEN)
+        self._show_sensor = (self._renderer._layers[8] != LAYER_HIDDEN)
+
+    def _sync_render_mode(self) -> None:
+        """Read bound renderer layer flags and set the matching render mode."""
+        if self._renderer is None:
+            return
+        l8 = self._renderer._layers[7]
+        l9 = self._renderer._layers[8]
+        if l9 != LAYER_HIDDEN:
+            self._cam_render_mode = RenderMode.RAYTRACE
+        elif l8 != LAYER_HIDDEN:
+            self._cam_render_mode = RenderMode.HYBRID
+        else:
+            self._cam_render_mode = RenderMode.GL
+
+    # ── Layout helpers ────────────────────────────────────────────────────────
+
+    @property
+    def render_mode(self) -> 'RenderMode':
+        return self._cam_render_mode
+
+    def _panel_h(self) -> int:
+        return (self.PAD_TOP
+                + len(self._SLIDERS) * self.ROW
+                + 10
+                + len(self._AUTOS) * self.ROW
+                + 10           # sep before render mode
+                + self.ROW     # label row
+                + self.ROW     # render-mode button row
+                + self.ROW     # layer-toggle row (enlarger / illum / sensor)
+                + 8)
+
+    def _px(self, win_w: int) -> int:
+        return win_w - self.PW - 20
+
+    def _py(self, win_h: int) -> int:
+        return (win_h - self._panel_h()) // 2
+
+    def _slider_y(self, i: int, py: int) -> int:
+        return py + self.PAD_TOP + i * self.ROW
+
+    def _auto_y(self, i: int, py: int) -> int:
+        return py + self.PAD_TOP + len(self._SLIDERS) * self.ROW + 10 + i * self.ROW
+
+    def _render_mode_y(self, py: int) -> int:
+        """Top of the render-mode section (label row)."""
+        return (py + self.PAD_TOP
+                + len(self._SLIDERS) * self.ROW + 10
+                + len(self._AUTOS) * self.ROW + 10)
+
+    def _track_rect(self, i: int, px: int, py: int):
+        ry = self._slider_y(i, py)
+        return (px + self.TX, ry + (self.ROW - self.TH) // 2, self.TW, self.TH)
+
+    def _t(self, key: str) -> float:
+        v, lo, hi = self._values[key], self._lo[key], self._hi[key]
+        if self._log[key]:
+            denom = math.log(max(hi, 1e-12)) - math.log(max(lo, 1e-12))
+            t = ((math.log(max(v, 1e-12)) - math.log(max(lo, 1e-12))) / denom
+                 if denom else 0.0)
+        else:
+            t = (v - lo) / (hi - lo) if hi != lo else 0.0
+        return float(np.clip(t, 0.0, 1.0))
+
+    def _v_from_t(self, key: str, t: float) -> float:
+        lo, hi = self._lo[key], self._hi[key]
+        t = float(np.clip(t, 0.0, 1.0))
+        if self._log[key]:
+            return math.exp(math.log(max(lo, 1e-12))
+                            + t * (math.log(max(hi, 1e-12))
+                                   - math.log(max(lo, 1e-12))))
+        return lo + t * (hi - lo)
+
+    # ── GL drawing primitives ─────────────────────────────────────────────────
+
+    def _draw_quad(self, x, y, w, h, color, win_w, win_h):
+        import ctypes, struct
+        from OpenGL.GL import (
+            glUseProgram, glGetUniformLocation, glUniform2f, glUniform4f,
+            glBindVertexArray, glBindBuffer, glBufferSubData, glDrawArrays,
+            GL_ARRAY_BUFFER, GL_TRIANGLE_STRIP,
+        )
+        glUseProgram(self._p_col)
+        glUniform2f(glGetUniformLocation(self._p_col, b'uRes'),
+                    float(win_w), float(win_h))
+        glUniform4f(glGetUniformLocation(self._p_col, b'uColor'), *color)
+        v = struct.pack('8f',
+                        float(x),   float(y),
+                        float(x+w), float(y),
+                        float(x),   float(y+h),
+                        float(x+w), float(y+h))
+        glBindVertexArray(self._qvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._qvbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, len(v), v)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        glBindVertexArray(0)
+
+    def _get_tex(self, text: str):
+        if text in self._text_cache:
+            return self._text_cache[text]
+        from OpenGL.GL import (
+            glGenTextures, glBindTexture, glTexParameteri, glTexImage2D,
+            GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
+            GL_LINEAR, GL_RGBA, GL_UNSIGNED_BYTE,
+        )
+        pygame.font.init()
+        f = pygame.font.SysFont("consolas,monospace", 13)
+        s = f.render(str(text), True, (215, 225, 240), (10, 10, 22))
+        w, h = s.get_size()
+        raw = pygame.image.tobytes(s, "RGBA")
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, raw)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        r = (tex, (w, h))
+        self._text_cache[text] = r
+        return r
+
+    def _draw_text(self, text: str, x: int, y: int, win_w: int, win_h: int):
+        import struct
+        from OpenGL.GL import (
+            glUseProgram, glGetUniformLocation, glUniform2f, glUniform1i,
+            glActiveTexture, glBindTexture, glBindVertexArray, glBindBuffer,
+            glBufferSubData, glDrawArrays,
+            GL_ARRAY_BUFFER, GL_TRIANGLE_STRIP, GL_TEXTURE0, GL_TEXTURE_2D,
+        )
+        tex, (tw, th) = self._get_tex(text)
+        glUseProgram(self._p_tex)
+        glUniform2f(glGetUniformLocation(self._p_tex, b'uRes'),
+                    float(win_w), float(win_h))
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D, tex)
+        glUniform1i(glGetUniformLocation(self._p_tex, b'uTex'), 0)
+        v = struct.pack('16f',
+                        float(x),    float(y),    0.0, 0.0,
+                        float(x+tw), float(y),    1.0, 0.0,
+                        float(x),    float(y+th), 0.0, 1.0,
+                        float(x+tw), float(y+th), 1.0, 1.0)
+        glBindVertexArray(self._tvao)
+        glBindBuffer(GL_ARRAY_BUFFER, self._tvbo)
+        glBufferSubData(GL_ARRAY_BUFFER, 0, len(v), v)
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4)
+        glBindVertexArray(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+    # ── Event handling ────────────────────────────────────────────────────────
+
+    def handle_event(self, ev) -> bool:
+        """Return True if the event was consumed.
+
+        Requires attach() to have been called first.  No external context
+        (cam / slider_panel) is needed — each knob fires its own callback.
+        """
+        if not self._open or self._cam is None:
+            return False
+        import pygame
+        win_w, win_h = pygame.display.get_surface().get_size()
+        px = self._px(win_w)
+        py = self._py(win_h)
+        ph = self._panel_h()
+
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            mx, my = ev.pos
+            if not (px <= mx <= px + self.PW and py <= my <= py + ph):
+                return False
+            for i, (key, *_) in enumerate(self._SLIDERS):
+                ry = self._slider_y(i, py)
+                if ry <= my <= ry + self.ROW:
+                    tx, ty, tw, th = self._track_rect(i, px, py)
+                    t = float(np.clip((mx - tx) / max(tw, 1), 0.0, 1.0))
+                    self._apply_value(key, self._v_from_t(key, t))
+                    self._drag = i
+                    return True
+            for i, (key, _) in enumerate(self._AUTOS):
+                ry = self._auto_y(i, py)
+                if ry <= my <= ry + self.ROW:
+                    self._auto[key] = not self._auto[key]
+                    cmp = self._get_computer()
+                    if cmp is not None:
+                        cmp.sync_flags(self._auto)
+                    return True
+            # Render mode buttons
+            btn_y = self._render_mode_y(py) + self.ROW
+            if btn_y <= my <= btn_y + self.ROW:
+                _modes = [RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE]
+                bw = (self.PW - 16) // 3
+                for bi, m in enumerate(_modes):
+                    bx = px + 8 + bi * (bw + 4)
+                    if bx <= mx <= bx + bw:
+                        self._cam_render_mode = m
+                        self.apply_render_mode()   # dispatch immediately
+                        return True
+            # Layer / display toggle buttons (Enlarger / Illum / Sensor)
+            ltgl_y = self._render_mode_y(py) + 2 * self.ROW
+            if ltgl_y <= my <= ltgl_y + self.ROW:
+                bw3 = (self.PW - 16) // 3
+                bxE = px + 8
+                bxI = px + 8 + (bw3 + 4)
+                bxS = px + 8 + 2 * (bw3 + 4)
+                if bxE <= mx <= bxE + bw3:
+                    self._enlarger = not self._enlarger
+                    if self._renderer is not None:
+                        self._renderer._enlarger_mode = self._enlarger
+                    return True
+                if bxI <= mx <= bxI + bw3:
+                    self._show_illum = not self._show_illum
+                    if self._renderer is not None:
+                        self._renderer._layers[7] = (LAYER_OPAQUE
+                                                     if self._show_illum
+                                                     else LAYER_HIDDEN)
+                    return True
+                if bxS <= mx <= bxS + bw3:
+                    self._show_sensor = not self._show_sensor
+                    if self._renderer is not None:
+                        self._renderer._layers[8] = (LAYER_OPAQUE
+                                                     if self._show_sensor
+                                                     else LAYER_HIDDEN)
+                    return True
+            return True  # absorb any click inside panel
+
+        if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            if self._drag >= 0:
+                self._drag = -1
+                return True
+            return False
+
+        if ev.type == pygame.MOUSEMOTION and self._drag >= 0:
+            mx, _ = ev.pos
+            key = self._SLIDERS[self._drag][0]
+            tx, _, tw, _ = self._track_rect(self._drag, px, py)
+            t = float(np.clip((mx - tx) / max(tw, 1), 0.0, 1.0))
+            self._apply_value(key, self._v_from_t(key, t))
+            return True
+
+        return False
+
+    # ── Render ────────────────────────────────────────────────────────────────
+
+    def draw(self, win_w: int, win_h: int):
+        if not self._open or self._p_col is None:
+            return
+        # Pull current live values from cam/renderer every frame so the sliders
+        # always reflect the actual state, not just what they were at attach time.
+        self._pull()
+        from OpenGL.GL import (
+            glEnable, glDisable, glBlendFunc,
+            GL_BLEND, GL_DEPTH_TEST, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+            glBindVertexArray, glUseProgram, glBindTexture, GL_TEXTURE_2D,
+        )
+        px = self._px(win_w)
+        py = self._py(win_h)
+        ph = self._panel_h()
+
+        glDisable(GL_DEPTH_TEST)
+        glDisable(GL_BLEND)
+        self._draw_quad(px, py, self.PW, ph, self._C_BG, win_w, win_h)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        # Title bar
+        self._draw_quad(px, py, self.PW, self.PAD_TOP - 2,
+                        self._C_TITLE, win_w, win_h)
+        self._draw_text("CAMERA SETTINGS  [ E ] close",
+                        px + 8, py + 9, win_w, win_h)
+
+        # Slider rows
+        for i, (key, label, *_) in enumerate(self._SLIDERS):
+            ry  = self._slider_y(i, py)
+            tx, tty, tw, th = self._track_rect(i, px, py)
+            # Track rail
+            self._draw_quad(tx, tty, tw, th, self._C_TRACK, win_w, win_h)
+            # Fill
+            t  = self._t(key)
+            fw = max(2, int(t * tw))
+            self._draw_quad(tx, tty, fw, th, self._C_FILL, win_w, win_h)
+            # Knob
+            kx = tx + int(t * tw) - 4
+            ky = tty + th // 2 - 6
+            self._draw_quad(kx, ky, 8, 12, self._C_KNOB, win_w, win_h)
+            # Label
+            self._draw_text(label, px + 4, ry + 6, win_w, win_h)
+            # Value readout
+            val_str = f"{self._values[key]:{self._fmt[key]}}"
+            self._draw_text(val_str, px + self.TX + self.TW + 6, ry + 6,
+                            win_w, win_h)
+
+        # Separator
+        sep_y = py + self.PAD_TOP + len(self._SLIDERS) * self.ROW + 3
+        self._draw_quad(px + 4, sep_y, self.PW - 8, 2,
+                        self._C_SEP, win_w, win_h)
+
+        # Auto checkboxes
+        for i, (key, label) in enumerate(self._AUTOS):
+            ry = self._auto_y(i, py)
+            checked = self._auto[key]
+            self._draw_quad(px + 8, ry + 6, 14, 14,
+                            self._C_CHECK if checked else self._C_UNCHECK,
+                            win_w, win_h)
+            mark = "\u2713 " if checked else "  "
+            self._draw_text(f"{mark} {label}", px + 28, ry + 6, win_w, win_h)
+
+        # Render mode selector ─────────────────────────────────────────────
+        rmy = self._render_mode_y(py)
+        # Thin separator
+        self._draw_quad(px + 4, rmy - 4, self.PW - 8, 2, self._C_SEP, win_w, win_h)
+        self._draw_text("Render Mode", px + 8, rmy + 6, win_w, win_h)
+        _modes  = [RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE]
+        _labels = ['OpenGL', 'Hybrid', 'Ray']
+        bw = (self.PW - 16) // 3
+        btn_y = rmy + self.ROW
+        for bi, (m, lbl) in enumerate(zip(_modes, _labels)):
+            bx = px + 8 + bi * (bw + 4)
+            active = (self._cam_render_mode is m)
+            self._draw_quad(bx, btn_y + 2, bw, self.ROW - 4,
+                            self._C_FILL if active else self._C_TRACK,
+                            win_w, win_h)
+            self._draw_text(lbl, bx + 6, btn_y + 6, win_w, win_h)
+
+        # Layer / display toggles: Enlarger · Illum · Sensor
+        ltgl_y = rmy + 2 * self.ROW
+        bw3 = (self.PW - 16) // 3
+        _ltgls = [('Enlarger', self._enlarger),
+                  ('Illum',    self._show_illum),
+                  ('Sensor',   self._show_sensor)]
+        for bi, (lbl, active) in enumerate(_ltgls):
+            bx = px + 8 + bi * (bw3 + 4)
+            self._draw_quad(bx, ltgl_y + 2, bw3, self.ROW - 4,
+                            self._C_FILL if active else self._C_TRACK,
+                            win_w, win_h)
+            self._draw_text(lbl, bx + 6, ltgl_y + 6, win_w, win_h)
+
+        glEnable(GL_DEPTH_TEST)
+        glBindVertexArray(0)
+        glUseProgram(0)
+        glBindTexture(GL_TEXTURE_2D, 0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -8585,6 +11360,14 @@ def _parse_args():
     p.add_argument("--ray-program-only", "--ray-trace-only", dest="ray_program_only",
                    action="store_true",
                    help="Skip the FDTD/plate physics worker and run only the static scene ray-trace/camera program")
+    p.add_argument("--no-auto-sim", dest="no_auto_sim",
+                   action="store_true", default=True,
+                   help="Do not automatically start the FDTD/audio physics worker on launch; "
+                        "physics can be started later via UI or key binding")
+    p.add_argument("--render-mode", dest="render_mode",
+                   choices=[m.value for m in RenderMode], default=RenderMode.GL.value,
+                   help="Player-experience render mode: gl (default), hybrid (GL + baked light field), "
+                        "or raytrace (implies --ray-program-only)")
     p.add_argument("--lens-focal-mm", type=float, default=35.0,
                    help="Camera focal length in millimetres")
     p.add_argument("--lens-focus-m", type=float, default=1.6,
@@ -8672,6 +11455,9 @@ def _parse_args():
                    help="Stopped fret number. 0 leaves the open scale length")
     p.add_argument("--fretless", action=argparse.BooleanOptionalAction, default=False,
                    help="Use a damped fretless/finger stop for --fret instead of a hard fret")
+    p.add_argument("--station", default=None,
+                   choices=["camera_designer"],
+                   help="Open a specific design station instead of the full world render")
     args = p.parse_args()
     if args.pressure_margin_cells < 0:
         p.error("--pressure-margin-cells must be non-negative")
@@ -9011,10 +11797,17 @@ def main():
     physics = None
     build_bar = None
     build_bar_value = 0
-    physics_ready = bool(args.ray_program_only)
+    # Resolve render mode; --render-mode=raytrace implies --ray-program-only
+    _render_mode = RenderMode(args.render_mode)
+    if _render_mode is RenderMode.RAYTRACE:
+        args.ray_program_only = True
+
+    physics_ready = bool(args.ray_program_only) or bool(args.no_auto_sim)
     if args.ray_program_only:
         print("Ray-program-only mode: skipping FDTD/plate physics worker.", flush=True)
         args.capture_wav = ""
+    elif args.no_auto_sim:
+        print("[no-auto-sim] Physics worker deferred — will not start automatically.", flush=True)
     else:
         print("Starting physics worker ...", flush=True)
         physics = _PhysicsProcess(config)
@@ -9083,7 +11876,7 @@ def main():
             R.replace_ray_field(ray_field_bands, ray_field_bounds,
                                 gpu_seg_vbo, gpu_seg_cap, _gpu_counter,
                                 total_rays=ray_field_total_rays)
-            if _init_sensor_acc is not None:
+            if _init_sensor_acc is not None and hasattr(_init_sensor_acc, 'notify_frame'):
                 R.attach_sensor_accumulator(_init_sensor_acc)
                 # Seed the streaming source worker with the initial geometry
                 # so pump_forward() has a dispatch ring ready on the first frame.
@@ -9195,8 +11988,50 @@ def main():
     # ── Player controller ─────────────────────────────────────────────────────
     _player_cfg_path = _config_path("player", "default.yaml")
     _player_cfg = _load_yaml_file(_player_cfg_path)
-    player_ctrl = (_PlayerController(R.cam, _player_cfg)
+    player_ctrl = (_PlayerController(R.cam, _player_cfg,
+                                     lens_loader   = LensSpec.load,
+                                     sensor_loader = SensorSpec.load)
                    if _HAS_PLAYER_CTRL and _player_cfg else None)
+
+    # ── Camera HUD panel ──────────────────────────────────────────────────────
+    _camera_panel = None
+    if _HAS_CAMERA_PANEL:
+        _camera_panel = _CameraHudPanel()
+        _camera_panel.init_gl()
+
+    # ── Player camera settings panel ─────────────────────────────────────────
+    _player_cam_panel = _PlayerCameraPanel()
+    _player_cam_panel.init_gl()
+    _player_cam_panel.attach(R.cam, panel, R)
+
+    # ── Camera optics schematic (three-view line diagram) ────────────────────
+    _cam_optics_view = _CameraOpticsView()
+    _cam_optics_view.init_gl()
+    _cam_optics_view.attach(R.cam, _player_cam_panel)
+
+    # ── Attach default digital positive sensor to player camera ──────────────
+    # 35mm full-frame digital sensor, Bayer RGGB CFA, auto white balance.
+    # Backs registered at startup; cycle with _dps.next_back() / prev_back().
+    try:
+        from camera_software import DigitalPositiveSensor
+        _primary_back = FILM_STACKS.get('em_rgb') or _default_stack()
+        _dps = DigitalPositiveSensor(
+            backs=[_primary_back],
+            wb_mode='auto',           # tracks ctx.scene_color_temp_K when set
+            color_temp_K=6504.0,      # starting estimate: CIE D65
+            sensor_spec=R.cam.sensor, # 35mm full-frame physical spec
+        )
+        # Register additional preset backs for cycling (silently skip if absent)
+        for _back_key in ('full_spectrum', 'acoustic_ortho', 'tri_spectrum'):
+            _b = FILM_STACKS.get(_back_key)
+            if _b is not None:
+                _dps.add_back(_b)
+        R.cam.software.append(_dps)
+        # Pre-compute initial white-balance weights immediately
+        _dps._run_encoding()
+        R.cam._digital_rgb = _dps._ds.rgb_weights
+    except Exception:
+        pass  # package unavailable; renderer keeps its (1,1,1) default
 
     # ── Duty station(s) ───────────────────────────────────────────────────────
     duty_stations: list = []
@@ -9206,6 +12041,74 @@ def main():
         if _ds is not None:
             _ds.build_gl()
             duty_stations.append(_ds)
+
+    # ── Room station ──────────────────────────────────────────────────────────
+    _room_station = None
+    _room_ws      = None
+    if _HAS_ROOM_STATION:
+        try:
+            _room_ws = _RoomWorkspace.from_yaml("configs/room_station")
+            _room_station = _RoomStation(_room_ws, WIN_W, WIN_H)
+            _room_station.init_gl()
+            print("[room_station] initialised", flush=True)
+        except Exception as _e:
+            print(f"[room_station] init failed: {_e}", flush=True)
+            _room_station = None
+
+    # Attach room_station as the menu for each duty station in the room
+    if _room_station is not None:
+        for _ds in duty_stations:
+            _ds.menu = _room_station
+
+    # ── Camera items (physical cameras placed in the scene) ───────────────────
+    cameras: list = []
+    if _HAS_CAMERA_ITEM and _room_ws is not None:
+        try:
+            cameras = _build_camera_items(_room_ws)
+            print(f"[camera_items] {len(cameras)} camera(s) initialised", flush=True)
+        except Exception as _e:
+            print(f"[camera_items] init failed: {_e}", flush=True)
+
+    # ── Camera designer station ──────────────────────────────────────────────
+    _cam_designer_station = None
+    if _HAS_CAMERA_DESIGNER_STATION and getattr(args, "station", None) == "camera_designer":
+        try:
+            _cam_designer_station = _CameraDesignerStation(win_w=WIN_W, win_h=WIN_H)
+            _cam_designer_station.init_gl()
+            print("[camera_designer_station] ready", flush=True)
+        except Exception as _e:
+            print(f"[camera_designer_station] init failed: {_e}", flush=True)
+            _cam_designer_station = None
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # ── Simulator station ─────────────────────────────────────────────────────
+    _sim_station = None
+    _sim_station_open = False   # toggled by Tab — station is closed by default
+    if _HAS_SIMULATOR_STATION:
+        try:
+            _palette_cfg  = _load_yaml_file(_config_path("duty_stations", "simulator", "simulator_palette.yaml")) or {}
+            _coevo_cfg    = _load_yaml_file(_config_path("duty_stations", "simulator", "coevolution.yaml")) or {}
+            _glass_cfg    = _load_yaml_file(_config_path("duty_stations", "simulator", "glass_room.yaml")) or {}
+            _sim_station_cfg = _load_yaml_file(_config_path("duty_stations", "simulator", "station.yaml")) or {}
+            _sim_lw  = int((_sim_station_cfg.get("layout") or {}).get("left_panel_width",  210))
+            _sim_rw  = int((_sim_station_cfg.get("layout") or {}).get("right_panel_width", 240))
+            # Default world bounds — updated later if physics provides sim_bounds
+            _sim_wb_min = np.array([-0.20, -0.05, 0.02], np.float64)
+            _sim_wb_max = np.array([ 0.20,  0.35, 0.38], np.float64)
+            _sim_station = _SimulatorStation(
+                palette_cfg=_palette_cfg,
+                coevo_cfg=_coevo_cfg,
+                glass_cfg=_glass_cfg,
+                wb_min=_sim_wb_min,
+                wb_max=_sim_wb_max,
+                win_w=WIN_W, win_h=WIN_H,
+                left_panel_w=_sim_lw,
+                right_panel_w=_sim_rw,
+            )
+            _sim_station.init_gl()
+        except Exception as _e:
+            print(f"[simulator_station] init failed: {_e}", flush=True)
+            _sim_station = None
     # ─────────────────────────────────────────────────────────────────────────
 
     if physics is not None:
@@ -9239,7 +12142,7 @@ def main():
         capture = _CaptureSet(args.capture_wav, args.capture_source)
 
     print("1-9 layers | WASD pan | Q/Z height | drag look | arrows tilt-shift | "
-          "+/- focal | [] focus | ,/. aperture | F step | C reset sensor | Esc quit | "
+          "+/- focal | [] focus | ,/. aperture | F step | C reset sensor | Tab sim-station | Esc quit | "
           f"excitation={args.excitation}", flush=True)
 
     def _refresh_ray_field_from_frame(frame: Frame | None, frame_index: int, reason: str) -> bool:
@@ -9278,26 +12181,92 @@ def main():
       while running:
         _dt = clock.tick(60) / 1000.0
         _keys_held = pygame.key.get_pressed()
+        # Camera designer station owns the mouse — always keep it free.
+        if _cam_designer_station is not None:
+            if not pygame.mouse.get_visible():
+                pygame.mouse.set_visible(True)
+            if pygame.event.get_grab():
+                pygame.event.set_grab(False)
         if player_ctrl is not None:
-            player_ctrl.tick(_dt, _keys_held, duty_stations)
+            player_ctrl.tick(_dt, _keys_held, duty_stations, cameras=cameras)
+        # Drive each station's menu visibility from player state — no blocking calls
+        if player_ctrl is not None:
+            _active_st = getattr(player_ctrl, '_active_station', None)
+            _in_interact = player_ctrl.state.value == "interact"
+            for _ds in duty_stations:
+                _m = getattr(_ds, 'menu', None)
+                if _m is not None and hasattr(_m, 'show_hud'):
+                    _m.show_hud(_in_interact and _active_st is _ds)
+
+        # Close player cam panel if player has left walk/in_camera states
+        if (_player_cam_panel.open
+                and player_ctrl is not None
+                and player_ctrl.state.value not in ("walk", "in_camera")):
+            _player_cam_panel.close()
+
+        # Auto-open player cam panel when entering in_camera mode
+        if (player_ctrl is not None
+                and player_ctrl.state.value == "in_camera"
+                and not _player_cam_panel.open):
+            _player_cam_panel.attach(R.cam, panel, R)
+            _cam_optics_view.attach(R.cam, _player_cam_panel)
+            _player_cam_panel.toggle()
+            pygame.mouse.set_visible(True)
+            pygame.event.set_grab(False)
 
         for ev in pygame.event.get():
+            # Camera designer station owns the full screen — it gets events
+            # before everything else so its mouse-interactive ortho views are
+            # never shadowed by the orbit camera handler.
+            if _cam_designer_station is not None:
+                if _cam_designer_station.handle_event(ev):
+                    continue
+                # Designer is active: skip player_ctrl entirely (orbit/walk
+                # mouse handling must not fire while the designer is open).
+                if ev.type == QUIT:
+                    running = False
+                elif ev.type == KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    running = False
+                continue
+            # Camera panel consumes mouse events when in IN_CAMERA mode
+            if (_camera_panel is not None
+                    and player_ctrl is not None
+                    and player_ctrl.state.value == "in_camera"):
+                if _camera_panel.handle_event(ev, R.cam):
+                    continue
+            # Player camera settings panel (walk mode, non-blocking)
+            if _player_cam_panel.handle_event(ev):
+                continue
             # Route through player controller first; it may absorb movement events
             if player_ctrl is not None:
-                if player_ctrl.handle_event(ev, duty_stations):
+                if player_ctrl.handle_event(ev, duty_stations, cameras=cameras):
                     continue
             # Slider panel only visible / interactive when not in a walk state
             # (or always when player_ctrl is None / orbit mode)
             _panel_active = (player_ctrl is None or player_ctrl.sidebar_visible
                              or player_ctrl.state.value == "orbit")
+            _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
+            if _active_st is not None and _active_st.handle_menu_event(ev):
+                continue
+            if _sim_station is not None and _sim_station_open and _sim_station.handle_event(ev):
+                continue
             if _panel_active and panel.handle_event(ev):
                 continue
             if ev.type == QUIT:
                 running = False
             elif ev.type == KEYDOWN:
                 camera_dirty = False
-                if ev.key == pygame.K_ESCAPE:
-                    running = False
+                if ev.key == pygame.K_TAB:
+                    if _sim_station is not None:
+                        _sim_station_open = not _sim_station_open
+                        print(f"[sim_station] {'opened' if _sim_station_open else 'closed'}",
+                              flush=True)
+                elif ev.key == pygame.K_ESCAPE:
+                    if _sim_station is not None and _sim_station_open:
+                        _sim_station_open = False
+                        print("[sim_station] closed", flush=True)
+                    else:
+                        running = False
                 elif ev.key == K_SPACE:
                     R._paused = not R._paused
                 elif ev.key == pygame.K_f:
@@ -9372,10 +12341,23 @@ def main():
                     R._film_negative = not R._film_negative
                     print(f"Film: {'negative' if R._film_negative else 'positive'}")
                 elif ev.key == pygame.K_e:
-                    R._enlarger_mode = not R._enlarger_mode
-                    _tone = 'negative' if (R._film_negative ^ R._enlarger_mode) else 'positive'
-                    _orient = 'inverted (plate back)' if not R._enlarger_mode else 'upright (enlarger)'
-                    print(f"Enlarger: {'ON' if R._enlarger_mode else 'OFF'}  →  {_orient}, {_tone}")
+                    # E always toggles the camera settings panel regardless of state
+                    if not _player_cam_panel.open:
+                        _player_cam_panel.attach(R.cam, panel, R)
+                        _cam_optics_view.attach(R.cam, _player_cam_panel)
+                    _player_cam_panel.toggle()
+                    if _player_cam_panel.open:
+                        pygame.mouse.set_visible(True)
+                        pygame.event.set_grab(False)
+                    else:
+                        _wants_grab = (
+                            (player_ctrl is not None
+                             and player_ctrl.state.value == "walk")
+                            or _player_cam_panel._cam_render_mode is RenderMode.RAYTRACE
+                        )
+                        if _wants_grab:
+                            pygame.mouse.set_visible(False)
+                            pygame.event.set_grab(True)
                 else:
                     for ki, kv in enumerate(LAYER_KEYS):
                         if ev.key == kv:
@@ -9388,11 +12370,23 @@ def main():
                 dragging = True; last_mouse = ev.pos
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                 dragging = False
-            elif ev.type == MOUSEMOTION and dragging:
-                dx, dy = ev.pos[0]-last_mouse[0], ev.pos[1]-last_mouse[1]
-                R.cam.orbit(dx*0.35, -dy*0.25); R.cam._auto = 0.0
-                R.sync_sensor_camera(reset=False)
-                last_mouse = ev.pos
+            elif ev.type == MOUSEMOTION:
+                _in_ray_fps = (
+                    _player_cam_panel._cam_render_mode is RenderMode.RAYTRACE
+                    and not _player_cam_panel.open
+                    and pygame.event.get_grab()
+                    and (player_ctrl is None or player_ctrl.state.value != "walk")
+                )
+                if _in_ray_fps:
+                    dx, dy = ev.rel
+                    R.cam.orbit(dx * 0.35, -dy * 0.25)
+                    R.cam._auto = 0.0
+                    R.sync_sensor_camera(reset=False)
+                elif dragging:
+                    dx, dy = ev.pos[0]-last_mouse[0], ev.pos[1]-last_mouse[1]
+                    R.cam.orbit(dx*0.35, -dy*0.25); R.cam._auto = 0.0
+                    R.sync_sensor_camera(reset=False)
+                    last_mouse = ev.pos
             elif ev.type == MOUSEWHEEL:
                 R.cam.zoom(-ev.y * 0.04)
                 R.sync_sensor_camera(reset=False)
@@ -9572,17 +12566,96 @@ def main():
                             None)
                     _refresh_ray_field_from_frame(refresh_frame, target_ray_frame_index, "replay")
                 last_displayed_frame_index = cur_frame_index
+            # ── Camera software tick (DigitalPositiveSensor etc.) ─────────────
+            # Drives R.cam.software modules and refreshes _digital_positive /
+            # _digital_rgb from the result before the sensor blit.
+            _cam_dt = clock.get_time() * 1e-3  # ms → s
+            R.cam.tick(_cam_dt)
+            R._digital_positive = R.cam._digital_positive
+            R._digital_rgb      = R.cam._digital_rgb
+            # Sync the batched digital-back spec list from the camera software.
+            # None means the renderer uses its own self.film at blit time.
+            if R.cam.digital_film is not None:
+                R.digital_film = R.cam.digital_film
+            else:
+                R.digital_film = None
+            # Unconditional every-frame sync: the player controller, auto-orbit,
+            # and camera software can all move R.cam each frame.  The sensor
+            # accumulator must receive the updated eye/target/FOV before tick_sensor()
+            # fires so the ray camera always matches the OpenGL camera exactly.
+            R.sync_sensor_camera(reset=False)
             R.tick_sensor()
+
+            # ── Active station menu overlay ───────────────────────────────────
+            _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
+            if _active_st is not None and hasattr(_active_st, 'render_menu'):
+                _active_st.render_menu(WIN_W, WIN_H)
+
+            # ── Room station 3-D render (environment shell + enclosures) ─────
+            if _room_station is not None and _cam_pure_matrices is not None:
+                _rs_P, _rs_V = _cam_pure_matrices(R.cam)
+                _rs_MVP = (_rs_P @ _rs_V).astype(np.float32)
+                _rs_MV  = _rs_V.astype(np.float32)
+                # Primary light direction: first PlacedLight in room, else fallback
+                _rs_lights = (_room_station._ws.lights()
+                              if _room_station is not None else [])
+                if _rs_lights:
+                    _lp = np.array(_rs_lights[0].pos, np.float32)
+                    _ld = _lp / (np.linalg.norm(_lp) + 1e-7)
+                    _rs_lv = (_rs_MV[:3, :3] @ _ld).astype(np.float32)
+                    _rs_lv /= (np.linalg.norm(_rs_lv) + 1e-7)
+                else:
+                    _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
+                    _rs_lv /= np.linalg.norm(_rs_lv)
+                _room_station.render_room(WIN_W, WIN_H, _rs_MVP, _rs_MV, _rs_lv)
+
             R.render()
 
             # ── Duty station render pass ──────────────────────────────────────
+            # Render the duty station console using the same _p_body shader as
+            # the main scene so scene field uniforms, depth state, and shading
+            # model are identical to all other Phong-lit objects.
             if duty_stations and _HAS_DUTY_STATION:
                 _P, _V = _cam_pure_matrices(R.cam)
                 _light_v = np.array([0.6, 0.8, 0.5], np.float32)
                 for _ds in duty_stations:
                     _ds.draw((_P @ _V).astype(np.float32),
                              _V.astype(np.float32),
-                             _light_v)
+                             _light_v,
+                             body_prog=R._p_body)
+
+            # ── Camera item render pass ───────────────────────────────────────
+            if cameras and _cam_pure_matrices is not None:
+                _P, _V = _cam_pure_matrices(R.cam)
+                _MVP   = (_P @ _V).astype(np.float32)
+                _MV    = _V.astype(np.float32)
+                _lv    = (_rs_lv if '_rs_lv' in dir() else
+                          np.array([0.5, 1.0, 0.6], np.float32))
+                for _ci in cameras:
+                    _ci.draw(_MVP, _MV, _lv)
+
+            # ── Camera designer station render pass ──────────────────────────
+            if _cam_designer_station is not None:
+                _cam_designer_station.draw(WIN_W, WIN_H)
+
+            # ── Simulator station render pass ────────────────────────────────
+            if _sim_station is not None and _sim_station_open:
+                _sim_station.render(WIN_W, WIN_H)
+
+            # ── Camera HUD panel (IN_CAMERA mode) ────────────────────────────
+            if (_camera_panel is not None
+                    and player_ctrl is not None
+                    and player_ctrl.state.value == "in_camera"):
+                if player_ctrl._active_camera is not None:
+                    _camera_panel.set_title(
+                        getattr(getattr(player_ctrl._active_camera, 'placed',
+                                        player_ctrl._active_camera),
+                                'name', 'camera'))
+                _camera_panel.render(WIN_W, WIN_H, R.cam)
+
+            # ── Player camera settings panel (walk mode overlay) ────────────────
+            _player_cam_panel.draw(WIN_W, WIN_H)
+            _cam_optics_view.draw(WIN_W, WIN_H)
 
             # ── Panel: only visible in orbit or interact state ─────────────────
             _show_panel = (player_ctrl is None

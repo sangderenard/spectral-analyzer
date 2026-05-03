@@ -1,0 +1,25 @@
+# configs/room_station/station.yaml
+# Room-station console: position + camera + UI layout.
+
+# World-space position of the console (the "station" the player interacts with)
+position: [0.0, 0.5, 0.0]   # x, y_depth, z_height (on floor)
+yaw_deg:  0.0               # console faces toward entrance (+Y direction)
+
+# Console camera (used when player enters INTERACT state at this station)
+console_camera:
+  eye_offset: [0.0, -0.65, 1.55]    # relative to console pos; z=height, y=depth offset
+  target_offset: [0.0, 0.20, 1.10]  # look target relative to console pos
+  fov_deg: 55.0
+
+# Proximity trigger radius
+interact_radius_m: 2.0
+
+# HUD layout when in interact mode (fractions of window width)
+layout:
+  left_panel_width:  180    # px — scene tree
+  right_panel_width: 220    # px — properties
+  # Centre remainder is the minimap viewport
+
+# Visual style for the console mesh (uses duty_station standard mesh)
+emissive_color: [0.00, 0.40, 0.70]
+trim_color:     [0.10, 0.30, 0.60]

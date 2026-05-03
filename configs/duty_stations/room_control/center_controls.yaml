@@ -1,0 +1,12 @@
+# Room Control — CENTER panel controls  (STUB — not yet implemented)
+# ─────────────────────────────────────────────────────────────────────────────
+# The center panel is reserved for the room floor-plan map and interactive
+# object placement overlay.  Controls will be added after appearance,
+# interaction, and programmatic abstraction are complete.
+
+panel:
+  title: ROOM MAP
+  accent_rgb: [0.00, 0.28, 0.78]
+  status: stub     # renderer will show a placeholder / "Coming Soon" overlay
+
+sections: []

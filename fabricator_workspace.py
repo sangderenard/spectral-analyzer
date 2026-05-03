@@ -99,8 +99,9 @@ class FabricatorWorkspace:
         self.review_mesh:Optional[DECMesh] = None
 
         # Palette selection
-        self.picked_id:   Optional[str] = None
-        self.picked_piece:Optional[DECMesh] = None
+        self.picked_id:      Optional[str] = None
+        self.picked_piece:   Optional[DECMesh] = None
+        self.picked_special: bool = False   # True when picked item is a special catalog entry
 
         # Face under cursor (for PLACING highlight)
         self.hover_face: int = -1
@@ -146,11 +147,12 @@ class FabricatorWorkspace:
         return True
 
     def cancel_pick(self):
-        self.picked_id    = None
-        self.picked_piece = None
-        self.placement    = None
-        self.hover_face   = -1
-        self.mode         = WorkspaceMode.IDLE
+        self.picked_id      = None
+        self.picked_piece   = None
+        self.picked_special = False
+        self.placement      = None
+        self.hover_face     = -1
+        self.mode           = WorkspaceMode.IDLE
 
     # ── Hover / face selection ─────────────────────────────────────────────────
 
@@ -255,6 +257,105 @@ class FabricatorWorkspace:
         self.placement   = None
         self.review_mesh = None
         self._history.clear()
-        self.mode        = WorkspaceMode.IDLE
-        self.picked_id   = None
-        self.picked_piece= None
+        self.mode           = WorkspaceMode.IDLE
+        self.picked_id      = None
+        self.picked_piece   = None
+        self.picked_special = False
+
+    # ── Catalog (solids + special items) ─────────────────────────────────────
+
+    #: Special items that the fabricator can place directly into a room.
+    SPECIAL_CATALOG: "list[dict]" = [
+        {
+            "id":    "light_point",
+            "label": "Point Light",
+            "kind":  "light",
+            "icon":  "💡",
+            "defaults": {
+                "intensity": 1.0,
+                "radius_m":  8.0,
+                "color":     [1.0, 0.95, 0.88],
+            },
+        },
+        {
+            "id":    "light_spot",
+            "label": "Spot Light",
+            "kind":  "light",
+            "icon":  "🔦",
+            "defaults": {
+                "intensity":      1.2,
+                "spot_angle_deg": 35.0,
+                "color":          [1.0, 0.92, 0.75],
+            },
+        },
+        {
+            "id":    "portal_frame",
+            "label": "Portal Frame",
+            "kind":  "portal",
+            "icon":  "🚪",
+            "defaults": {
+                "target_room_id": "",
+            },
+        },
+        {
+            "id":    "guitar_acoustic",
+            "label": "Acoustic Guitar",
+            "kind":  "instrument",
+            "icon":  "🎸",
+            "description": (
+                "6-string steel-string acoustic. "
+                "FDTD Kirchhoff-plate body resonance."
+            ),
+            "thumbnail_color": [0.56, 0.30, 0.12],
+            "preset_module":   "guitar_fabricator_preset",
+            "preset_class":    "GuitarFabricatorPreset",
+            "defaults": {
+                "excitation":  "strum",
+                "fret":        0,
+                "fretless":    False,
+                "amr_backend": "cpu",
+            },
+        },
+    ]
+
+    def catalog_items(self) -> "list[dict]":
+        """Return all palette items: platonic solids then special items.
+
+        Each entry is a dict with keys ``id``, ``label``, ``kind``, and
+        (for special items) ``icon`` and ``defaults``.
+        """
+        solids = [
+            {"id": s, "label": s.title(), "kind": "solid", "icon": "⬡"}
+            for s in platonic_solids.available()
+        ]
+        return solids + list(self.SPECIAL_CATALOG)
+
+    def pick_catalog_item(self, item_id: str) -> bool:
+        """Pick a solid or special item from the catalog by its ``id``.
+
+        * Solid items delegate to the existing :meth:`pick_solid` method.
+        * Special items set ``picked_id`` and ``picked_special`` and move
+          the workspace to ``PICKED`` mode (no mesh preview is generated).
+
+        Returns ``True`` on success.
+        """
+        if item_id in platonic_solids.available():
+            self.picked_special = False
+            return self.pick_solid(item_id)
+
+        for entry in self.SPECIAL_CATALOG:
+            if entry["id"] == item_id:
+                self.picked_id      = item_id
+                self.picked_piece   = None
+                self.picked_special = True
+                self.mode           = WorkspaceMode.PICKED
+                self.placement      = None
+                self.hover_face     = -1
+                return True
+
+        return False
+
+    @property
+    def full_palette(self) -> "list[dict]":
+        """Alias for :meth:`catalog_items`; kept for convenient access."""
+        return self.catalog_items()

@@ -1,0 +1,60 @@
+# Simulator duty station — GL station / console config
+# Mirror of the fabricator position but on the right side, with blue trim.
+
+name: simulator
+
+position: [2.0, 2.4, 0.0]      # right of centre, behind guitar
+yaw_deg:  -160.0                # angled toward the player start
+
+console:
+  width:         1.50
+  depth:         0.70
+  height:        0.90
+  top_tilt_deg:  12.0
+  bevel:         0.08
+
+screen:
+  width:          1.30
+  height:         0.80
+  tilt_back_deg:  6.0
+
+side_wings:
+  enabled: true
+  width:   0.16
+  height:  0.58
+
+interaction_radius: 2.0
+
+interact_camera:
+  eye:    [2.0, 0.80, 1.35]
+  target: [2.0, 2.40, 1.30]
+
+# ── Panel layout (proportions at interact-mode resolution) ──────────────────
+layout:
+  left_panel_width:   210     # plugin picker (px)
+  right_panel_width:  240     # controls + evolution stats (px)
+
+# ── Material definitions ────────────────────────────────────────────────────
+materials:
+  body:
+    albedo_rgb:    [0.08, 0.10, 0.14]
+    reflectivity:  0.48
+    diffusion:     0.22
+    absorption:    0.07
+    smoothness:    0.82
+    ambient:       0.16
+    spec_strength: 0.60
+    shininess:     96.0
+    grain:         0.04
+
+  trim:
+    albedo_rgb:    [0.02, 0.18, 0.35]
+    emissive:      [0.00, 0.35, 0.80]   # LCARS blue glow (simulator variant)
+
+  screen_active:
+    albedo_rgb:    [0.02, 0.04, 0.08]
+    emissive:      [0.04, 0.45, 0.90]   # blue-white simulator display
+
+  screen_inactive:
+    albedo_rgb:    [0.01, 0.01, 0.01]
+    emissive:      [0.00, 0.00, 0.00]

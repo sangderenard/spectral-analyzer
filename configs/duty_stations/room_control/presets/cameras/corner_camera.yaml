@@ -1,0 +1,10 @@
+id: corner_camera
+label: Corner Camera
+category: cameras
+kind: hardware
+mesh_type: marker_box
+surfaces: [ceiling, north, east]
+footprint_xy: [1, 1]
+level_span: 1
+color_rgb: [0.68, 0.52, 0.24]
+summary: Ceiling-corner camera mount.

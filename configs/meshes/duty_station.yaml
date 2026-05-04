@@ -4,6 +4,7 @@
 # World transform applied by DutyStation at render time.
 
 name: duty_station
+module_type: room_control
 
 # ── World transform ───────────────────────────────────────────────────────────
 position: [0.0, 2.4, 0.0]   # world XYZ; Z-up, Y-forward
@@ -29,6 +30,10 @@ side_wings:
   enabled: true
   width:   0.14          # X extent of each wing (added to each side)
   height:  0.52          # Z extent (from floor up)
+
+# Legacy mesh back wall is disabled; room control walls are tile-driven.
+back_wall:
+  enabled: false
 
 # ── Interaction ───────────────────────────────────────────────────────────────
 interaction_radius: 1.80   # metres; proximity threshold for E-key hint

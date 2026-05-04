@@ -1,0 +1,14 @@
+id: camera_designer_station
+label: Camera Designer Station
+category: duty_stations
+kind: camera_designer_station
+mesh_type: duty_station_blueprint
+blueprint_id: duty_station_gestalt
+programmatic_blueprint_id: duty_station_parametric_connector
+requires_custom_confirm: false
+prefab_available: true
+surfaces: [floor]
+footprint_xy: [2, 4]
+level_span: 2
+color_rgb: [0.30, 0.60, 0.78]
+summary: Camera designer station with front standing floor and rear test-rig depth.

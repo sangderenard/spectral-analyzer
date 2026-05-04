@@ -1,0 +1,14 @@
+id: room_control_station
+label: Room Control Duty Station
+category: duty_stations
+kind: room_control_station
+mesh_type: duty_station_blueprint
+blueprint_id: duty_station_gestalt
+programmatic_blueprint_id: duty_station_parametric_connector
+requires_custom_confirm: false
+prefab_available: true
+surfaces: [floor, north]
+footprint_xy: [2, 2]
+level_span: 2
+color_rgb: [0.26, 0.66, 0.84]
+summary: Deployed room control station tile with two front user-standing floor tiles.

@@ -107,6 +107,33 @@ class RoomWorkspace:
     def from_yaml(cls, config_dir: str = "configs/room_station") -> "RoomWorkspace":
         return cls(config_dir)
 
+    @classmethod
+    def blank(cls, config_dir: str = "configs/room_station") -> "RoomWorkspace":
+        """Return a workspace with an empty object registry (ignores scene.yaml)."""
+        ws = cls.__new__(cls)
+        ws._config_dir = config_dir
+        ws.room_cfg    = _load_yaml(os.path.join(config_dir, "room.yaml"))
+        ws.physics_cfg = _load_yaml(os.path.join(config_dir, "physics.yaml"))
+        ws.station_cfg = _load_yaml(os.path.join(config_dir, "station.yaml"))
+        ws._objects    = {}
+        ws.selected_id = None
+        ws._dirty      = False
+        return ws
+
+    @classmethod
+    def from_scene_file(cls, path: str,
+                        config_dir: str = "configs/room_station") -> "RoomWorkspace":
+        """Load a workspace from an explicit scene YAML file (not config_dir/scene.yaml)."""
+        ws = cls.blank(config_dir)
+        scene_data = _load_yaml(path)
+        for obj_dict in scene_data.get("objects", []):
+            try:
+                obj = placed_object_from_dict(obj_dict)
+                ws._objects[obj.obj_id] = obj
+            except Exception as exc:
+                print(f"[RoomWorkspace] skip bad object in {path}: {exc}", flush=True)
+        return ws
+
     # ── Object registry ───────────────────────────────────────────────────────
 
     @property
@@ -233,53 +260,66 @@ class RoomWorkspace:
                            win_w: int, win_h: int):
         """Attempt to build a live station from a placed object."""
         if isinstance(obj, PlacedDutyStation):
-            if obj.station_type == "fabricator":
-                return self._build_fabricator(obj, win_w, win_h)
-            if obj.station_type == "simulator":
-                return self._build_simulator(obj, win_w, win_h)
+            return self._build_duty_station(obj, win_w, win_h)
 
         if isinstance(obj, PlacedEnclosure) and obj.simulator is not None:
             return self._build_enclosure_simulator(obj, win_w, win_h)
 
         return None
 
-    def _build_fabricator(self, obj: PlacedDutyStation,
-                           win_w: int, win_h: int):
+    def _build_duty_station(self, obj: PlacedDutyStation,
+                            win_w: int, win_h: int):
+        """Build a unified DutyStation world object with an optional HUD menu.
+
+        Tile specificity lives in ``station_type`` + ``config_dir`` on the
+        placed object. The world object is always ``DutyStation``.
+        """
         try:
-            from fabricator_workspace import FabricatorWorkspace
-            from fabricator_station   import FabricatorStation
+            from duty_station import DutyStation
+
             cfg_dir = obj.config_dir
-            ws_cfg  = _load_yaml(os.path.join(cfg_dir, "workspace.yaml"))
-            st_cfg  = _load_yaml(os.path.join(cfg_dir, "station.yaml"))
-            ws = FabricatorWorkspace(ws_cfg)
-            st = FabricatorStation(ws, st_cfg, win_w, win_h)
-            st.init_gl()
+            st_cfg = _load_yaml(os.path.join(cfg_dir, "station.yaml"))
+            st_cfg["position"] = np.asarray(obj.pos, np.float64).tolist()
+            st_cfg["yaw_deg"] = float(obj.yaw_deg)
+            st_cfg["interaction_radius"] = float(obj.interaction_radius)
+            if "module_type" not in st_cfg:
+                st_cfg["module_type"] = str(obj.station_type)
+
+            st = DutyStation(st_cfg)
+            st.build_gl()
+
+            menu = None
+            if obj.station_type == "fabricator":
+                from fabricator_station import FabricatorStation
+                ws_path = os.path.join(cfg_dir, "workspace.yaml")
+                pal_path = os.path.join(cfg_dir, "palette.yaml")
+                menu = FabricatorStation.from_yaml(ws_path, pal_path)
+            elif obj.station_type == "simulator":
+                from simulator_station import SimulatorStation
+                pal_cfg = _load_yaml(os.path.join(cfg_dir, "simulator_palette.yaml"))
+                coevo_cfg = _load_yaml(os.path.join(cfg_dir, "coevolution.yaml"))
+                glass_cfg = _load_yaml(os.path.join(cfg_dir, "glass_room.yaml"))
+                wb_min = np.array([-0.20, -0.05, 0.02])
+                wb_max = np.array([0.20, 0.35, 0.38])
+                menu = SimulatorStation(pal_cfg, coevo_cfg, glass_cfg,
+                                       wb_min, wb_max, win_w, win_h)
+                menu.init_gl()
+
+            if menu is not None:
+                st.menu = menu
+
             return st
         except Exception as exc:
-            print(f"[RoomWorkspace] fabricator build failed: {exc}", flush=True)
+            print(f"[RoomWorkspace] duty station build failed: {exc}", flush=True)
             return None
+
+    def _build_fabricator(self, obj: PlacedDutyStation,
+                           win_w: int, win_h: int):
+        return self._build_duty_station(obj, win_w, win_h)
 
     def _build_simulator(self, obj: PlacedDutyStation,
                           win_w: int, win_h: int):
-        try:
-            from simulator_station   import SimulatorStation
-            cfg_dir  = obj.config_dir
-            pal_cfg  = _load_yaml(os.path.join(cfg_dir, "simulator_palette.yaml"))
-            coevo_cfg = _load_yaml(os.path.join(cfg_dir, "coevolution.yaml"))
-            glass_cfg = _load_yaml(os.path.join(cfg_dir, "glass_room.yaml"))
-            st_cfg    = _load_yaml(os.path.join(cfg_dir, "station.yaml"))
-            lay = st_cfg.get("layout", {})
-            lw  = int(lay.get("left_panel_width",  210))
-            rw  = int(lay.get("right_panel_width", 240))
-            wb_min = np.array([-0.20, -0.05, 0.02])
-            wb_max = np.array([ 0.20,  0.35, 0.38])
-            st = SimulatorStation(pal_cfg, coevo_cfg, glass_cfg,
-                                  wb_min, wb_max, win_w, win_h, lw, rw)
-            st.init_gl()
-            return st
-        except Exception as exc:
-            print(f"[RoomWorkspace] simulator build failed: {exc}", flush=True)
-            return None
+        return self._build_duty_station(obj, win_w, win_h)
 
     def _build_enclosure_simulator(self, obj: PlacedEnclosure,
                                     win_w: int, win_h: int):

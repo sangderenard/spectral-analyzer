@@ -1,0 +1,1188 @@
+version: 2
+save_type: fabrication_blueprint
+id: tabbed_blueprint_library_test_2
+label: tabbed_blueprint_library_test_2
+created_utc: '2026-05-04T04:29:02.901697+00:00'
+workspace:
+  base_solid: icosahedron
+  process_tab: assembling
+  gimbal_deg:
+  - 0.0
+  - 0.0
+  snap:
+    enabled: true
+    angle_deg: 15.0
+    distance_m: 0.08
+  symmetry:
+    mode: none
+    axis: z
+    count: 4
+relationships: []
+process_itinerary: []
+polygon_primitives:
+- primitive_id: poly_face_0000
+  polygon_face_index: 0
+  vertex_indices_ccw:
+  - 0
+  - 1
+  - 9
+  vertex_indices_cw:
+  - 9
+  - 1
+  - 0
+  triangle_indices:
+  - 0
+- primitive_id: poly_face_0001
+  polygon_face_index: 1
+  vertex_indices_ccw:
+  - 0
+  - 9
+  - 5
+  vertex_indices_cw:
+  - 5
+  - 9
+  - 0
+  triangle_indices:
+  - 1
+- primitive_id: poly_face_0002
+  polygon_face_index: 2
+  vertex_indices_ccw:
+  - 0
+  - 5
+  - 4
+  vertex_indices_cw:
+  - 4
+  - 5
+  - 0
+  triangle_indices:
+  - 2
+- primitive_id: poly_face_0003
+  polygon_face_index: 3
+  vertex_indices_ccw:
+  - 0
+  - 4
+  - 8
+  vertex_indices_cw:
+  - 8
+  - 4
+  - 0
+  triangle_indices:
+  - 3
+- primitive_id: poly_face_0004
+  polygon_face_index: 4
+  vertex_indices_ccw:
+  - 0
+  - 8
+  - 1
+  vertex_indices_cw:
+  - 1
+  - 8
+  - 0
+  triangle_indices:
+  - 4
+- primitive_id: poly_face_0005
+  polygon_face_index: 5
+  vertex_indices_ccw:
+  - 1
+  - 6
+  - 9
+  vertex_indices_cw:
+  - 9
+  - 6
+  - 1
+  triangle_indices:
+  - 5
+- primitive_id: poly_face_0006
+  polygon_face_index: 6
+  vertex_indices_ccw:
+  - 9
+  - 6
+  - 7
+  vertex_indices_cw:
+  - 7
+  - 6
+  - 9
+  triangle_indices:
+  - 6
+- primitive_id: poly_face_0007
+  polygon_face_index: 7
+  vertex_indices_ccw:
+  - 9
+  - 7
+  - 11
+  vertex_indices_cw:
+  - 11
+  - 7
+  - 9
+  triangle_indices:
+  - 7
+- primitive_id: poly_face_0008
+  polygon_face_index: 8
+  vertex_indices_ccw:
+  - 9
+  - 11
+  - 5
+  vertex_indices_cw:
+  - 5
+  - 11
+  - 9
+  triangle_indices:
+  - 8
+- primitive_id: poly_face_0009
+  polygon_face_index: 9
+  vertex_indices_ccw:
+  - 5
+  - 11
+  - 4
+  vertex_indices_cw:
+  - 4
+  - 11
+  - 5
+  triangle_indices:
+  - 9
+- primitive_id: poly_face_0010
+  polygon_face_index: 10
+  vertex_indices_ccw:
+  - 4
+  - 11
+  - 10
+  vertex_indices_cw:
+  - 10
+  - 11
+  - 4
+  triangle_indices:
+  - 10
+- primitive_id: poly_face_0011
+  polygon_face_index: 11
+  vertex_indices_ccw:
+  - 4
+  - 10
+  - 8
+  vertex_indices_cw:
+  - 8
+  - 10
+  - 4
+  triangle_indices:
+  - 11
+- primitive_id: poly_face_0012
+  polygon_face_index: 12
+  vertex_indices_ccw:
+  - 8
+  - 10
+  - 6
+  vertex_indices_cw:
+  - 6
+  - 10
+  - 8
+  triangle_indices:
+  - 12
+- primitive_id: poly_face_0013
+  polygon_face_index: 13
+  vertex_indices_ccw:
+  - 8
+  - 6
+  - 1
+  vertex_indices_cw:
+  - 1
+  - 6
+  - 8
+  triangle_indices:
+  - 13
+- primitive_id: poly_face_0014
+  polygon_face_index: 14
+  vertex_indices_ccw:
+  - 6
+  - 7
+  - 1
+  vertex_indices_cw:
+  - 1
+  - 7
+  - 6
+  triangle_indices:
+  - 14
+- primitive_id: poly_face_0015
+  polygon_face_index: 15
+  vertex_indices_ccw:
+  - 11
+  - 3
+  - 2
+  vertex_indices_cw:
+  - 2
+  - 3
+  - 11
+  triangle_indices:
+  - 15
+- primitive_id: poly_face_0016
+  polygon_face_index: 16
+  vertex_indices_ccw:
+  - 2
+  - 11
+  - 10
+  vertex_indices_cw:
+  - 10
+  - 11
+  - 2
+  triangle_indices:
+  - 16
+- primitive_id: poly_face_0017
+  polygon_face_index: 17
+  vertex_indices_ccw:
+  - 3
+  - 10
+  - 2
+  vertex_indices_cw:
+  - 2
+  - 10
+  - 3
+  triangle_indices:
+  - 17
+- primitive_id: poly_face_0018
+  polygon_face_index: 18
+  vertex_indices_ccw:
+  - 6
+  - 10
+  - 3
+  vertex_indices_cw:
+  - 3
+  - 10
+  - 6
+  triangle_indices:
+  - 18
+- primitive_id: poly_face_0019
+  polygon_face_index: 19
+  vertex_indices_ccw:
+  - 7
+  - 6
+  - 3
+  vertex_indices_cw:
+  - 3
+  - 6
+  - 7
+  triangle_indices:
+  - 19
+optimized_object:
+  vertex_count: 12
+  edge_count: 31
+  face_count: 20
+  triangle_count: 20
+  vertices:
+  - - 0.0
+    - -0.5257311121191336
+    - -0.85065080835204
+  - - 0.0
+    - 0.5257311121191336
+    - -0.85065080835204
+  - - 0.0
+    - -0.5257311121191336
+    - 0.85065080835204
+  - - 0.0
+    - 0.5257311121191336
+    - 0.85065080835204
+  - - -0.5257311121191336
+    - -0.85065080835204
+    - 0.0
+  - - 0.5257311121191336
+    - -0.85065080835204
+    - 0.0
+  - - -0.5257311121191336
+    - 0.85065080835204
+    - 0.0
+  - - 0.5257311121191336
+    - 0.85065080835204
+    - 0.0
+  - - -0.85065080835204
+    - 0.0
+    - -0.5257311121191336
+  - - 0.85065080835204
+    - 0.0
+    - -0.5257311121191336
+  - - -0.85065080835204
+    - 0.0
+    - 0.5257311121191336
+  - - 0.85065080835204
+    - 0.0
+    - 0.5257311121191336
+  edges:
+  - - 0
+    - 1
+  - - 1
+    - 9
+  - - 0
+    - 9
+  - - 5
+    - 9
+  - - 0
+    - 5
+  - - 4
+    - 5
+  - - 0
+    - 4
+  - - 4
+    - 8
+  - - 0
+    - 8
+  - - 1
+    - 8
+  - - 1
+    - 6
+  - - 6
+    - 9
+  - - 6
+    - 7
+  - - 7
+    - 9
+  - - 7
+    - 11
+  - - 9
+    - 11
+  - - 5
+    - 11
+  - - 4
+    - 11
+  - - 10
+    - 11
+  - - 4
+    - 10
+  - - 8
+    - 10
+  - - 6
+    - 10
+  - - 6
+    - 8
+  - - 1
+    - 7
+  - - 3
+    - 11
+  - - 2
+    - 3
+  - - 2
+    - 11
+  - - 2
+    - 10
+  - - 3
+    - 10
+  - - 3
+    - 6
+  - - 3
+    - 7
+  faces_ccw:
+  - - 0
+    - 1
+    - 9
+  - - 0
+    - 9
+    - 5
+  - - 0
+    - 5
+    - 4
+  - - 0
+    - 4
+    - 8
+  - - 0
+    - 8
+    - 1
+  - - 1
+    - 6
+    - 9
+  - - 9
+    - 6
+    - 7
+  - - 9
+    - 7
+    - 11
+  - - 9
+    - 11
+    - 5
+  - - 5
+    - 11
+    - 4
+  - - 4
+    - 11
+    - 10
+  - - 4
+    - 10
+    - 8
+  - - 8
+    - 10
+    - 6
+  - - 8
+    - 6
+    - 1
+  - - 6
+    - 7
+    - 1
+  - - 11
+    - 3
+    - 2
+  - - 2
+    - 11
+    - 10
+  - - 3
+    - 10
+    - 2
+  - - 6
+    - 10
+    - 3
+  - - 7
+    - 6
+    - 3
+  faces_cw:
+  - - 9
+    - 1
+    - 0
+  - - 5
+    - 9
+    - 0
+  - - 4
+    - 5
+    - 0
+  - - 8
+    - 4
+    - 0
+  - - 1
+    - 8
+    - 0
+  - - 9
+    - 6
+    - 1
+  - - 7
+    - 6
+    - 9
+  - - 11
+    - 7
+    - 9
+  - - 5
+    - 11
+    - 9
+  - - 4
+    - 11
+    - 5
+  - - 10
+    - 11
+    - 4
+  - - 8
+    - 10
+    - 4
+  - - 6
+    - 10
+    - 8
+  - - 1
+    - 6
+    - 8
+  - - 1
+    - 7
+    - 6
+  - - 2
+    - 3
+    - 11
+  - - 10
+    - 11
+    - 2
+  - - 2
+    - 10
+    - 3
+  - - 3
+    - 10
+    - 6
+  - - 3
+    - 6
+    - 7
+  triangles_ccw:
+  - - 0
+    - 1
+    - 9
+  - - 0
+    - 9
+    - 5
+  - - 0
+    - 5
+    - 4
+  - - 0
+    - 4
+    - 8
+  - - 0
+    - 8
+    - 1
+  - - 1
+    - 6
+    - 9
+  - - 9
+    - 6
+    - 7
+  - - 9
+    - 7
+    - 11
+  - - 9
+    - 11
+    - 5
+  - - 5
+    - 11
+    - 4
+  - - 4
+    - 11
+    - 10
+  - - 4
+    - 10
+    - 8
+  - - 8
+    - 10
+    - 6
+  - - 8
+    - 6
+    - 1
+  - - 6
+    - 7
+    - 1
+  - - 11
+    - 3
+    - 2
+  - - 2
+    - 11
+    - 10
+  - - 3
+    - 10
+    - 2
+  - - 6
+    - 10
+    - 3
+  - - 7
+    - 6
+    - 3
+  triangles_cw:
+  - - 0
+    - 9
+    - 1
+  - - 0
+    - 5
+    - 9
+  - - 0
+    - 4
+    - 5
+  - - 0
+    - 8
+    - 4
+  - - 0
+    - 1
+    - 8
+  - - 1
+    - 9
+    - 6
+  - - 9
+    - 7
+    - 6
+  - - 9
+    - 11
+    - 7
+  - - 9
+    - 5
+    - 11
+  - - 5
+    - 4
+    - 11
+  - - 4
+    - 10
+    - 11
+  - - 4
+    - 8
+    - 10
+  - - 8
+    - 6
+    - 10
+  - - 8
+    - 1
+    - 6
+  - - 6
+    - 1
+    - 7
+  - - 11
+    - 2
+    - 3
+  - - 2
+    - 10
+    - 11
+  - - 3
+    - 2
+    - 10
+  - - 6
+    - 3
+    - 10
+  - - 7
+    - 3
+    - 6
+  accepted_face_winding:
+  - cw
+  - ccw
+  triangle_groups:
+    by_polygon:
+    - polygon_face_index: 0
+      triangle_indices:
+      - 0
+    - polygon_face_index: 1
+      triangle_indices:
+      - 1
+    - polygon_face_index: 2
+      triangle_indices:
+      - 2
+    - polygon_face_index: 3
+      triangle_indices:
+      - 3
+    - polygon_face_index: 4
+      triangle_indices:
+      - 4
+    - polygon_face_index: 5
+      triangle_indices:
+      - 5
+    - polygon_face_index: 6
+      triangle_indices:
+      - 6
+    - polygon_face_index: 7
+      triangle_indices:
+      - 7
+    - polygon_face_index: 8
+      triangle_indices:
+      - 8
+    - polygon_face_index: 9
+      triangle_indices:
+      - 9
+    - polygon_face_index: 10
+      triangle_indices:
+      - 10
+    - polygon_face_index: 11
+      triangle_indices:
+      - 11
+    - polygon_face_index: 12
+      triangle_indices:
+      - 12
+    - polygon_face_index: 13
+      triangle_indices:
+      - 13
+    - polygon_face_index: 14
+      triangle_indices:
+      - 14
+    - polygon_face_index: 15
+      triangle_indices:
+      - 15
+    - polygon_face_index: 16
+      triangle_indices:
+      - 16
+    - polygon_face_index: 17
+      triangle_indices:
+      - 17
+    - polygon_face_index: 18
+      triangle_indices:
+      - 18
+    - polygon_face_index: 19
+      triangle_indices:
+      - 19
+    work_edges: []
+  bounds:
+    min:
+    - -0.85065080835204
+    - -0.85065080835204
+    - -0.85065080835204
+    max:
+    - 0.85065080835204
+    - 0.85065080835204
+    - 0.85065080835204
+material_assignment:
+  polygon_groups:
+  - group_id: poly_0001
+    polygon_face_index: 0
+    triangle_indices:
+    - 0
+    material_slot: default
+  - group_id: poly_0002
+    polygon_face_index: 1
+    triangle_indices:
+    - 1
+    material_slot: default
+  - group_id: poly_0003
+    polygon_face_index: 2
+    triangle_indices:
+    - 2
+    material_slot: default
+  - group_id: poly_0004
+    polygon_face_index: 3
+    triangle_indices:
+    - 3
+    material_slot: default
+  - group_id: poly_0005
+    polygon_face_index: 4
+    triangle_indices:
+    - 4
+    material_slot: default
+  - group_id: poly_0006
+    polygon_face_index: 5
+    triangle_indices:
+    - 5
+    material_slot: default
+  - group_id: poly_0007
+    polygon_face_index: 6
+    triangle_indices:
+    - 6
+    material_slot: default
+  - group_id: poly_0008
+    polygon_face_index: 7
+    triangle_indices:
+    - 7
+    material_slot: default
+  - group_id: poly_0009
+    polygon_face_index: 8
+    triangle_indices:
+    - 8
+    material_slot: default
+  - group_id: poly_0010
+    polygon_face_index: 9
+    triangle_indices:
+    - 9
+    material_slot: default
+  - group_id: poly_0011
+    polygon_face_index: 10
+    triangle_indices:
+    - 10
+    material_slot: default
+  - group_id: poly_0012
+    polygon_face_index: 11
+    triangle_indices:
+    - 11
+    material_slot: default
+  - group_id: poly_0013
+    polygon_face_index: 12
+    triangle_indices:
+    - 12
+    material_slot: default
+  - group_id: poly_0014
+    polygon_face_index: 13
+    triangle_indices:
+    - 13
+    material_slot: default
+  - group_id: poly_0015
+    polygon_face_index: 14
+    triangle_indices:
+    - 14
+    material_slot: default
+  - group_id: poly_0016
+    polygon_face_index: 15
+    triangle_indices:
+    - 15
+    material_slot: default
+  - group_id: poly_0017
+    polygon_face_index: 16
+    triangle_indices:
+    - 16
+    material_slot: default
+  - group_id: poly_0018
+    polygon_face_index: 17
+    triangle_indices:
+    - 17
+    material_slot: default
+  - group_id: poly_0019
+    polygon_face_index: 18
+    triangle_indices:
+    - 18
+    material_slot: default
+  - group_id: poly_0020
+    polygon_face_index: 19
+    triangle_indices:
+    - 19
+    material_slot: default
+  work_edge_groups: []
+placeable_entry:
+  id: tabbed_blueprint_library_test_2
+  label: tabbed_blueprint_library_test_2
+  category: fabricated_objects
+  kind: fabricated_mesh
+  mesh_type: marker_box
+  surfaces:
+  - floor
+  footprint_xy:
+  - 2
+  - 2
+  level_span: 2
+  summary: Fabricator-exported placeable object
+  scene_object:
+    id: tabbed_blueprint_library_test_2
+    type: mesh
+    label: tabbed_blueprint_library_test_2
+    verts:
+    - - 0.0
+      - -0.525731086730957
+      - -0.8506507873535156
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - 0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - 0.0
+      - -0.525731086730957
+      - -0.8506507873535156
+    - - 0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - 0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - 0.0
+      - -0.525731086730957
+      - -0.8506507873535156
+    - - 0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - -0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - 0.0
+      - -0.525731086730957
+      - -0.8506507873535156
+    - - -0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - -0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - 0.0
+      - -0.525731086730957
+      - -0.8506507873535156
+    - - -0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - -0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - 0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - -0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - 0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - 0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - 0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - 0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - 0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - 0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - -0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - -0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - 0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - -0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - -0.525731086730957
+      - -0.8506507873535156
+      - 0.0
+    - - -0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - -0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - -0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - -0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - -0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - -0.8506507873535156
+      - 0.0
+      - -0.525731086730957
+    - - -0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - -0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - 0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - 0.0
+      - 0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - 0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - -0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - 0.0
+      - 0.525731086730957
+      - 0.8506507873535156
+    - - -0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - -0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - -0.8506507873535156
+      - 0.0
+      - 0.525731086730957
+    - - 0.0
+      - 0.525731086730957
+      - 0.8506507873535156
+    - - 0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - -0.525731086730957
+      - 0.8506507873535156
+      - 0.0
+    - - 0.0
+      - 0.525731086730957
+      - 0.8506507873535156
+    normals:
+    - - 0.35682210326194763
+      - 0.0
+      - -0.9341723322868347
+    - - 0.35682210326194763
+      - 0.0
+      - -0.9341723322868347
+    - - 0.35682210326194763
+      - 0.0
+      - -0.9341723322868347
+    - - 0.5773502588272095
+      - -0.5773502588272095
+      - -0.5773502588272095
+    - - 0.5773502588272095
+      - -0.5773502588272095
+      - -0.5773502588272095
+    - - 0.5773502588272095
+      - -0.5773502588272095
+      - -0.5773502588272095
+    - - 0.0
+      - -0.9341723322868347
+      - -0.35682210326194763
+    - - 0.0
+      - -0.9341723322868347
+      - -0.35682210326194763
+    - - 0.0
+      - -0.9341723322868347
+      - -0.35682210326194763
+    - - -0.5773502588272095
+      - -0.5773502588272095
+      - -0.5773502588272095
+    - - -0.5773502588272095
+      - -0.5773502588272095
+      - -0.5773502588272095
+    - - -0.5773502588272095
+      - -0.5773502588272095
+      - -0.5773502588272095
+    - - -0.35682210326194763
+      - 0.0
+      - -0.9341723322868347
+    - - -0.35682210326194763
+      - 0.0
+      - -0.9341723322868347
+    - - -0.35682210326194763
+      - 0.0
+      - -0.9341723322868347
+    - - 0.525731086730957
+      - 0.8506507873535156
+      - -1.0558848684420581e-16
+    - - 0.525731086730957
+      - 0.8506507873535156
+      - -1.0558848684420581e-16
+    - - 0.525731086730957
+      - 0.8506507873535156
+      - -1.0558848684420581e-16
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - 0.0
+      - 0.525731086730957
+      - -0.8506507873535156
+    - - 0.9341723322868347
+      - 0.35682210326194763
+      - -0.0
+    - - 0.9341723322868347
+      - 0.35682210326194763
+      - -0.0
+    - - 0.9341723322868347
+      - 0.35682210326194763
+      - -0.0
+    - - 0.9341723322868347
+      - -0.35682210326194763
+      - 0.0
+    - - 0.9341723322868347
+      - -0.35682210326194763
+      - 0.0
+    - - 0.9341723322868347
+      - -0.35682210326194763
+      - 0.0
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - -0.525731086730957
+      - 0.8506507873535156
+    - - -0.9341723322868347
+      - -0.35682210326194763
+      - 0.0
+    - - -0.9341723322868347
+      - -0.35682210326194763
+      - 0.0
+    - - -0.9341723322868347
+      - -0.35682210326194763
+      - 0.0
+    - - -0.9341723322868347
+      - 0.35682210326194763
+      - 0.0
+    - - -0.9341723322868347
+      - 0.35682210326194763
+      - 0.0
+    - - -0.9341723322868347
+      - 0.35682210326194763
+      - 0.0
+    - - -0.5773502588272095
+      - 0.5773502588272095
+      - -0.5773502588272095
+    - - -0.5773502588272095
+      - 0.5773502588272095
+      - -0.5773502588272095
+    - - -0.5773502588272095
+      - 0.5773502588272095
+      - -0.5773502588272095
+    - - 0.0
+      - 0.9341723322868347
+      - -0.35682210326194763
+    - - 0.0
+      - 0.9341723322868347
+      - -0.35682210326194763
+    - - 0.0
+      - 0.9341723322868347
+      - -0.35682210326194763
+    - - 0.35682210326194763
+      - 0.0
+      - 0.9341723322868347
+    - - 0.35682210326194763
+      - 0.0
+      - 0.9341723322868347
+    - - 0.35682210326194763
+      - 0.0
+      - 0.9341723322868347
+    - - 0.0
+      - 0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - 0.525731086730957
+      - 0.8506507873535156
+    - - 0.0
+      - 0.525731086730957
+      - 0.8506507873535156
+    - - -0.35682210326194763
+      - 0.0
+      - 0.9341723322868347
+    - - -0.35682210326194763
+      - 0.0
+      - 0.9341723322868347
+    - - -0.35682210326194763
+      - 0.0
+      - 0.9341723322868347
+    - - -0.5773502588272095
+      - 0.5773502588272095
+      - 0.5773502588272095
+    - - -0.5773502588272095
+      - 0.5773502588272095
+      - 0.5773502588272095
+    - - -0.5773502588272095
+      - 0.5773502588272095
+      - 0.5773502588272095
+    - - 0.0
+      - 0.9341723322868347
+      - 0.35682210326194763
+    - - 0.0
+      - 0.9341723322868347
+      - 0.35682210326194763
+    - - 0.0
+      - 0.9341723322868347
+      - 0.35682210326194763
+    bounds:
+      min:
+      - -0.8506507873535156
+      - -0.8506507873535156
+      - -0.8506507873535156
+      max:
+      - 0.8506507873535156
+      - 0.8506507873535156
+      - 0.8506507873535156
+    fabrication:
+      tab: assembling
+      gimbal_deg:
+      - 0.0
+      - 0.0
+      snap_enabled: true
+      symmetry:
+        mode: none
+        axis: z
+        count: 4
+      operations: []

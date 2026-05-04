@@ -44,6 +44,11 @@ solids:
     subtitle: "6F · 9E · 5V"
     color_rgb: [0.55, 0.90, 0.20]   # lime
 
+  - id: wedge
+    label: Wedge
+    subtitle: "6F · 12E · 8V"
+    color_rgb: [0.92, 0.58, 0.22]   # amber orange
+
 # Panel display options
 panel:
   item_height:   56        # pixels per solid entry

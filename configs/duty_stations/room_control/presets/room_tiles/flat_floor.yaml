@@ -1,0 +1,10 @@
+id: flat_floor
+label: Flat Floor Tile
+category: room_tiles
+kind: room_tile
+mesh_type: flat
+surfaces: [floor]
+footprint_xy: [1, 1]
+level_span: 1
+color_rgb: [0.16, 0.21, 0.28]
+summary: Basic inward-facing floor square.

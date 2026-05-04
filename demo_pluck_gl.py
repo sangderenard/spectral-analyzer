@@ -27,6 +27,7 @@ import hashlib
 import io
 import math
 import os
+import glob
 import sys
 import collections
 import argparse
@@ -132,6 +133,40 @@ except ImportError:
     _RoomWorkspace = None  # type: ignore[assignment,misc]
     _RoomStation   = None  # type: ignore[assignment,misc]
     _HAS_ROOM_STATION = False
+
+
+def _build_default_scene(config_dir: str = "configs/room_station"):
+    """Build the canonical default entry-point scene programmatically.
+
+    Returns a blank RoomWorkspace containing exactly two stations:
+      - a room control duty station (origin, yaw 0)
+      - a fabricator duty station (2 m to the right in X)
+
+    Does NOT read or write scene.yaml.  scene.yaml is a dev reference only.
+    """
+    if _RoomWorkspace is None:
+        return None
+    from placed_object import PlacedDutyStation, _make_id  # local import: not a top-level dep
+    ws = _RoomWorkspace.blank(config_dir)
+    room_ctrl = PlacedDutyStation(
+        obj_id=_make_id("room_station"),
+        label="Room Control",
+        pos=np.array([0.0, 0.0, 0.0], np.float64),
+        yaw_deg=0.0,
+            station_type="room_control",
+            config_dir="configs/duty_stations/room_control",
+    )
+    ws.add_object(room_ctrl)
+    fabricator = PlacedDutyStation(
+        obj_id=_make_id("fabricator"),
+        label="Fabricator",
+        pos=np.array([2.0, 0.0, 0.0], np.float64),
+        yaw_deg=0.0,
+        station_type="fabricator",
+        config_dir="configs/duty_stations/fabricator",
+    )
+    ws.add_object(fabricator)
+    return ws
 
 try:
     from camera_designer_station import CameraDesignerStation as _CameraDesignerStation
@@ -690,7 +725,8 @@ def _load_material_yaml(name: str) -> np.ndarray:
     Falls back to a neutral diffuse grey (all profile/flag fields zeroed).
     """
     _FALLBACK = np.zeros(16, np.float32)
-    _FALLBACK[:11] = [0.5, 0.5, 0.0,  0.5, 0.5, 0.0,  0.5, 0.5, 0.5,  1.5, 1.0]
+    # Neutral matte "brutalist gray" fallback so missing materials never read as glass.
+    _FALLBACK[:11] = [0.40, 0.90, 0.05,  0.40, 0.90, 0.05,  0.30, 0.29, 0.27,  1.55, 1.0]
     d = _load_yaml_file(_config_path("materials", f"{name}.yaml"))
     if not d:
         if _MAT_DB is not None:
@@ -5823,15 +5859,15 @@ def _normalise_materials(materials: np.ndarray, n_tris: int) -> np.ndarray:
     if mat.ndim != 2 or len(mat) != n_tris:
         mat = np.zeros((n_tris, 0), dtype=np.float32)
     if mat.shape[1] < 3:
-        mat_in = np.tile(np.array([0.58, 0.62, 0.28], dtype=np.float32), (n_tris, 1))
+        mat_in = np.tile(np.array([0.40, 0.90, 0.05], dtype=np.float32), (n_tris, 1))
     else:
         mat_in = mat[:, 0:3]
     if mat.shape[1] < 6:
-        mat_out = np.tile(np.array([0.88, 0.10, 0.055], dtype=np.float32), (n_tris, 1))
+        mat_out = np.tile(np.array([0.40, 0.90, 0.05], dtype=np.float32), (n_tris, 1))
     else:
         mat_out = mat[:, 3:6]
     if mat.shape[1] < 9:
-        albedo = np.tile(np.array([0.50, 0.28, 0.12], dtype=np.float32), (n_tris, 1))
+        albedo = np.tile(np.array([0.30, 0.29, 0.27], dtype=np.float32), (n_tris, 1))
     else:
         albedo = mat[:, 6:9]
     ior     = mat[:, 9:10]  if mat.shape[1] >= 10 else np.ones((n_tris, 1), np.float32)
@@ -5859,7 +5895,7 @@ def _stage_light_cache_key(scene, outline, body_h, total_rays: int, emitters: in
             verts, normals, mats = _extract_scene_geometry_materials_fn(scene)
         else:
             verts, normals = _extract_scene_geometry_fn(scene)
-            mats = np.tile(np.array([0.58, 0.62, 0.28, 0.88, 0.10, 0.055],
+            mats = np.tile(np.array([0.40, 0.90, 0.05, 0.40, 0.90, 0.05],
                                     dtype=np.float32), (len(verts), 1))
         gm, _ = _guitar_model_matrix(outline)
         M = np.asarray(gm, np.float32)
@@ -6081,7 +6117,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         verts_flat, normals, materials = _extract_scene_geometry_materials_fn(scene)
     else:
         verts_flat, normals = _extract_scene_geometry_fn(scene)
-        materials = np.tile(np.array([0.58, 0.62, 0.28, 0.88, 0.10, 0.055],
+        materials = np.tile(np.array([0.40, 0.90, 0.05, 0.40, 0.90, 0.05],
                                      dtype=np.float32), (len(verts_flat), 1))
     verts_flat = np.asarray(verts_flat, dtype=np.float32).reshape(-1, 3)
     normals = np.asarray(normals, dtype=np.float32).reshape(-1, 3)
@@ -6090,17 +6126,23 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         verts_flat = _transform_points(verts_flat, M)
         normals = _transform_normals(normals, M)
     def _pad_mat16(m: np.ndarray,
-                   default_albedo=(0.50, 0.28, 0.12),
-                   default_ior=1.52, default_opacity=1.0) -> np.ndarray:
+                   default_in=(0.40, 0.90, 0.05),
+                   default_out=(0.40, 0.90, 0.05),
+                   default_albedo=(0.30, 0.29, 0.27),
+                   default_ior=1.55, default_opacity=1.0) -> np.ndarray:
         """Ensure material array is (N, 16): first 11 cols are mat11 with physical
         defaults; cols 11-15 are flags/emissive/reactive defaulting to zero."""
         m = np.asarray(m, np.float32)
         if m.ndim == 1:
             m = m.reshape(1, -1)
-        defaults = [*default_albedo, default_ior, default_opacity]
+        defaults11 = [
+            float(default_in[0]), float(default_in[1]), float(default_in[2]),
+            float(default_out[0]), float(default_out[1]), float(default_out[2]),
+            float(default_albedo[0]), float(default_albedo[1]), float(default_albedo[2]),
+            float(default_ior), float(default_opacity),
+        ]
         while m.shape[1] < 11:
-            col = np.full((len(m), 1), defaults[m.shape[1] - 6], np.float32) \
-                  if m.shape[1] >= 6 else np.full((len(m), 1), 0.0, np.float32)
+            col = np.full((len(m), 1), defaults11[m.shape[1]], np.float32)
             m = np.hstack([m, col])
         while m.shape[1] < 16:
             m = np.hstack([m, np.zeros((len(m), 1), np.float32)])
@@ -7412,7 +7454,8 @@ class Renderer:
                  active_fret: int = 0,
                  fretless: bool = False,
                  show_pickup: bool = True,
-                 show_mic: bool = True):
+                 show_mic: bool = True,
+                 no_stage: bool = False):
         self.win_w   = win_w
         self.win_h   = win_h
         self.outline = outline
@@ -7487,6 +7530,7 @@ class Renderer:
         self._ray_exposure = 1.0
         self._ray_gamma = float(GPU_RAY_FIELD_GAMMA)
         self._ray_lighting: Optional[RayLightingState] = None   # set after init via set_ray_lighting()
+        self._no_stage = bool(no_stage)
         self._init_gl()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -7835,10 +7879,17 @@ class Renderer:
         self._mic_vao, _, self._mic_n = _vao(mic, [(0,3,12,0)], GL_STATIC_DRAW)
 
     def _mk_stage(self):
-        sv, sn, _ = _stage_mesh(self.outline, self.body_h)
-        verts = sv.reshape(-1, 3)
-        comb = np.ascontiguousarray(np.column_stack([verts, np.repeat(sn, 3, axis=0)]), np.float32)
-        self._stage_vao, _, self._stage_n = _vao(comb, [(0,3,24,0),(1,3,24,12)], GL_STATIC_DRAW)
+        if self._no_stage:
+            # Blank / room-mode startup: create empty stage geometry.
+            # _stage_mesh() is preserved but not called here; call sites in
+            # cache-key hashing and _gpu_ray_field are also guarded.
+            empty6 = np.zeros((0, 6), np.float32)
+            self._stage_vao, _, self._stage_n = _vao(empty6, [(0,3,24,0),(1,3,24,12)], GL_STATIC_DRAW)
+        else:
+            sv, sn, _ = _stage_mesh(self.outline, self.body_h)
+            verts = sv.reshape(-1, 3)
+            comb = np.ascontiguousarray(np.column_stack([verts, np.repeat(sn, 3, axis=0)]), np.float32)
+            self._stage_vao, _, self._stage_n = _vao(comb, [(0,3,24,0),(1,3,24,12)], GL_STATIC_DRAW)
         # Spotlight: above and in front of the guitar in world space.
         # Guitar body centre ≈ (0, body_h/2, STAND_HEIGHT_M+0.25); lamp hangs above-front.
         lx, ly, lz = 0.25, STAGE_D_M * 0.35, STAGE_H_M * 0.88
@@ -9807,6 +9858,35 @@ class _SliderPanel:
     _C_KNOB  = (0.90, 0.90, 0.90, 1.00)
     _C_TEXT  = (1.00, 1.00, 1.00, 1.00)   # pure white for maximum contrast
 
+    @classmethod
+    def knobspec(cls):
+        """Return KnobSpec descriptors mapped from legacy slider tuples.
+
+        This is a migration bridge that keeps existing HUD behavior while
+        exposing the same controls through the shared KnobSpec system.
+        """
+        try:
+            from ray_tracer.demo_pluck_controls_adapter import slider_defs_to_knobs
+            return slider_defs_to_knobs(
+                cls._DEFS,
+                group="Demo Pluck Slider",
+                source_class="_SliderPanel",
+            )
+        except Exception:
+            return []
+
+    def hierarchy_nodes(self):
+        """Return station hierarchy nodes for legacy slider definitions."""
+        try:
+            from ray_tracer.demo_pluck_controls_adapter import knobs_to_station_nodes
+            return knobs_to_station_nodes(
+                self.knobspec(),
+                parent_key="demo_pluck.slider_panel",
+                raised_material="control_raised",
+            )
+        except Exception:
+            return []
+
     def __init__(self):
         self.keys   = [d[0] for d in self._DEFS]
         self._lo    = [d[2] for d in self._DEFS]
@@ -10743,6 +10823,141 @@ class _PlayerCameraPanel:
     _C_CHECK   = (0.22, 0.80, 0.38, 1.00)
     _C_UNCHECK = (0.28, 0.28, 0.35, 1.00)
     _C_SEP     = (0.18, 0.28, 0.44, 1.00)
+    _DUTY_DEFAULTS = None
+
+    @classmethod
+    def knobspec(cls):
+        """Return KnobSpec descriptors mapped from camera panel sliders."""
+        try:
+            from ray_tracer.demo_pluck_controls_adapter import slider_defs_to_knobs
+            return slider_defs_to_knobs(
+                cls._SLIDERS,
+                group="Demo Pluck Camera",
+                source_class="_PlayerCameraPanel",
+            )
+        except Exception:
+            return []
+
+    @classmethod
+    def duty_station_defaults(cls):
+        """Return shared duty-station defaults for camera-panel migration."""
+        if cls._DUTY_DEFAULTS is not None:
+            return cls._DUTY_DEFAULTS
+        try:
+            from ray_tracer.station_specs import default_station_material_slots
+            cls._DUTY_DEFAULTS = default_station_material_slots()
+        except Exception:
+            cls._DUTY_DEFAULTS = {}
+        return cls._DUTY_DEFAULTS
+
+    @classmethod
+    def camera_hud_sections(cls):
+        """Return (left_sections, center_tabs, right_sections) for the duty HUD.
+
+        Converts the flat ``_SLIDERS`` list into the three-panel section format
+        consumed by ``CameraDutyStationHUD.from_sections``.
+        """
+        _groups: dict[str, list] = {
+            "computer": [],
+            "sensors": [],
+            "film": [],
+            "rebuild": [],
+            "lights": [],
+            "right_misc": [],
+        }
+
+        _group_map = {
+            "focal_mm": "computer",
+            "focus_m": "computer",
+            "aperture": "computer",
+            "ca": "computer",
+            "tilt_x": "computer",
+            "tilt_y": "computer",
+            "ray_density": "computer",
+            "ray_exposure": "computer",
+
+            "sensor_iso": "sensors",
+            "sensor_gain": "sensors",
+            "decay": "sensors",
+            "sensor_rate": "sensors",
+            "sensor_spp": "sensors",
+            "sensor_fps": "sensors",
+            "frame_step": "sensors",
+
+            "air_diff": "film",
+            "air_spec": "film",
+            "air_aniso": "film",
+            "ray_gamma": "film",
+
+            "segs": "rebuild",
+            "plate_th": "rebuild",
+            "dx": "rebuild",
+
+            "mic_gain": "lights",
+            "pickup_gain": "lights",
+        }
+
+        for key, label, lo, hi, default, is_log, fmt_spec in cls._SLIDERS:
+            step = max(1e-6, (hi - lo) / 200.0)
+            # Round step to 1 significant figure
+            import math as _math
+            mag = 10 ** _math.floor(_math.log10(step)) if step > 0 else 1e-4
+            step = round(step / mag) * mag
+
+            knob = {
+                "name": key,
+                "label": label,
+                "dtype": "float",
+                "low": lo,
+                "high": hi,
+                "default": default,
+                "step": step,
+                "fmt": fmt_spec.lstrip('.') and fmt_spec or ".3f",
+                "unit": "",
+            }
+            _groups[_group_map.get(key, "right_misc")].append(knob)
+
+        left_sections: list = []
+        right_sections = [
+            {"id": "status", "label": "Status",
+             "knobs": _groups["right_misc"]},
+        ]
+
+        center_tabs = [
+            {"key": "views", "label": "VIEWS", "sections": [], "title": "VIEWS"},
+            {"key": "sensors", "label": "SENSORS", "sections": [
+                {"id": "sensors", "label": "Sensor", "knobs": _groups["sensors"]}
+            ], "title": "SENSORS", "accent_rgb": (70, 120, 190)},
+            {"key": "film", "label": "FILM", "sections": [
+                {"id": "film", "label": "Film / Emulsion", "knobs": _groups["film"]}
+            ], "title": "FILM", "accent_rgb": (90, 120, 90)},
+            {"key": "computer", "label": "COMPUTER", "sections": [
+                {"id": "computer", "label": "Camera Computer", "knobs": _groups["computer"]}
+            ], "title": "COMPUTER", "accent_rgb": (120, 105, 165)},
+            {"key": "lights", "label": "LIGHTS", "sections": [
+                {"id": "lights", "label": "Lights", "knobs": _groups["lights"]}
+            ], "title": "LIGHTS", "accent_rgb": (145, 110, 70)},
+            {"key": "rebuild", "label": "REBUILD", "sections": [
+                {"id": "rebuild", "label": "Rebuild", "knobs": _groups["rebuild"]}
+            ], "title": "REBUILD", "accent_rgb": (60, 100, 160)},
+        ]
+        return left_sections, center_tabs, right_sections
+
+    def hierarchy_nodes(self):
+        """Return hierarchy nodes for camera panel controls.
+
+        Current rendering path remains 2D HUD; this method provides the data
+        bridge for staged migration into hierarchical station rendering.
+        """
+        try:
+            from ray_tracer.demo_pluck_controls_adapter import knobs_to_station_nodes
+            return knobs_to_station_nodes(
+                self.knobspec(),
+                parent_key="demo_pluck.camera_panel",
+                raised_material="control_raised",
+            )
+        except Exception:
+            return []
 
     def __init__(self):
         self._open   = False
@@ -11458,6 +11673,9 @@ def _parse_args():
     p.add_argument("--station", default=None,
                    choices=["camera_designer"],
                    help="Open a specific design station instead of the full world render")
+    p.add_argument("--level", default=None, metavar="PATH",
+                   help="Scene save file (.yaml) to load on startup. "
+                        "If omitted, starts in a blank space with room control + fabricator stations.")
     args = p.parse_args()
     if args.pressure_margin_cells < 0:
         p.error("--pressure-margin-cells must be non-negative")
@@ -11606,8 +11824,8 @@ def main():
     # ── Phase 1: Build scene + geometry (fast, no physics) ───────────────────
     # Do this FIRST so the guitar is visible while the AMR grid builds.
     _t0_scene = time.monotonic()
-    print("Building scene ...", flush=True)
-    scene = _build_body_scene_fn("string_plate") if _HAS_SCENE else None
+    scene = None
+    print("Room-only startup: guitar scene disabled.", flush=True)
 
     if scene is not None and _HAS_BRIDGE:
         outline, body_h, _early_bridge = _extract_guitar_geometry(scene)
@@ -11802,16 +12020,13 @@ def main():
     if _render_mode is RenderMode.RAYTRACE:
         args.ray_program_only = True
 
-    physics_ready = bool(args.ray_program_only) or bool(args.no_auto_sim)
+    physics_ready = True
+    print("Room-only startup: guitar physics worker skipped.", flush=True)
     if args.ray_program_only:
         print("Ray-program-only mode: skipping FDTD/plate physics worker.", flush=True)
         args.capture_wav = ""
     elif args.no_auto_sim:
         print("[no-auto-sim] Physics worker deferred — will not start automatically.", flush=True)
-    else:
-        print("Starting physics worker ...", flush=True)
-        physics = _PhysicsProcess(config)
-        build_bar = _make_tqdm(total=1000, desc="physics worker build", unit="permil", leave=True)
 
     # ── Phase 6: Renderer — visible immediately while physics builds ──────────
     R = Renderer(WIN_W, WIN_H, outline=outline, info=info, body_h=body_h,
@@ -11831,16 +12046,12 @@ def main():
                  active_fret=config["fret"],
                  fretless=config["fretless"],
                  show_pickup=args.pickup,
-                 show_mic=args.mic)
+                 show_mic=args.mic,
+                 no_stage=True)
     R.cam.focal_mm = float(np.clip(args.lens_focal_mm, 12.0, 180.0))
     R.cam.focus_m = float(np.clip(args.lens_focus_m, 0.05, 20.0))
     R.cam.aperture = float(np.clip(args.lens_aperture, 0.0, 0.08))
     R.cam.ca = float(np.clip(args.lens_ca, 0.0, 0.02))
-    if not args.ray_only_view:
-        R._layers = [LAYER_ALPHA, LAYER_OPAQUE, LAYER_OPAQUE,
-                     LAYER_OPAQUE, LAYER_OPAQUE, LAYER_ALPHA, LAYER_ALPHA,
-                     LAYER_ALPHA,    # 8=illum
-                     LAYER_HIDDEN]   # 9=sensor
     if args.ray_program_only:
         R._layers = [LAYER_ALPHA, LAYER_HIDDEN, LAYER_HIDDEN,
                      LAYER_ALPHA, LAYER_OPAQUE, LAYER_ALPHA, LAYER_ALPHA,
@@ -11985,6 +12196,11 @@ def main():
         exposure=float(panel.values['ray_exposure']),
         gamma=float(panel.values['ray_gamma']))
 
+    # Declare room workspace early so later code (player spawn, camera items, etc.)
+    # can reference it regardless of whether _HAS_ROOM_STATION is True.
+    _room_ws      = None
+    _room_station = None
+
     # ── Player controller ─────────────────────────────────────────────────────
     _player_cfg_path = _config_path("player", "default.yaml")
     _player_cfg = _load_yaml_file(_player_cfg_path)
@@ -12033,32 +12249,36 @@ def main():
     except Exception:
         pass  # package unavailable; renderer keeps its (1,1,1) default
 
-    # ── Duty station(s) ───────────────────────────────────────────────────────
     duty_stations: list = []
-    if _HAS_DUTY_STATION:
-        _ds_path = _config_path("meshes", "duty_station.yaml")
-        _ds = _DutyStation.from_yaml_safe(_ds_path)
-        if _ds is not None:
-            _ds.build_gl()
-            duty_stations.append(_ds)
 
     # ── Room station ──────────────────────────────────────────────────────────
-    _room_station = None
-    _room_ws      = None
     if _HAS_ROOM_STATION:
         try:
-            _room_ws = _RoomWorkspace.from_yaml("configs/room_station")
+            _room_ws = _build_default_scene()
+            if _room_ws is None:
+                _room_ws = _RoomWorkspace.from_yaml("configs/room_station")
             _room_station = _RoomStation(_room_ws, WIN_W, WIN_H)
             _room_station.init_gl()
             print("[room_station] initialised", flush=True)
+            # Build all placed duty-station objects (fabricator, simulator, …)
+            # from the workspace registry and add them to the duty_stations list
+            # that player_ctrl.tick() and the render loop already consume.
+            _scene_stations = _room_ws.build_scene_objects(WIN_W, WIN_H)
+            duty_stations.extend(_scene_stations)
+            print(f"[room_station] {len(_scene_stations)} scene station(s) built",
+                  flush=True)
         except Exception as _e:
             print(f"[room_station] init failed: {_e}", flush=True)
             _room_station = None
 
-    # Attach room_station as the menu for each duty station in the room
-    if _room_station is not None:
-        for _ds in duty_stations:
-            _ds.menu = _room_station
+    # Spawn player on the room control floor panel, facing the station.
+    # station_pos() / station_yaw_deg() come from configs/room_station/station.yaml.
+    if player_ctrl is not None and _room_ws is not None:
+        try:
+            player_ctrl._walk_pos = np.array(_room_ws.station_pos(), np.float64)
+            player_ctrl._walk_yaw = float(_room_ws.station_yaw_deg())
+        except Exception as _spawn_err:
+            print(f"[player_ctrl] spawn from station_pos failed: {_spawn_err}", flush=True)
 
     # ── Camera items (physical cameras placed in the scene) ───────────────────
     cameras: list = []
@@ -12079,36 +12299,6 @@ def main():
         except Exception as _e:
             print(f"[camera_designer_station] init failed: {_e}", flush=True)
             _cam_designer_station = None
-    # ─────────────────────────────────────────────────────────────────────────
-
-    # ── Simulator station ─────────────────────────────────────────────────────
-    _sim_station = None
-    _sim_station_open = False   # toggled by Tab — station is closed by default
-    if _HAS_SIMULATOR_STATION:
-        try:
-            _palette_cfg  = _load_yaml_file(_config_path("duty_stations", "simulator", "simulator_palette.yaml")) or {}
-            _coevo_cfg    = _load_yaml_file(_config_path("duty_stations", "simulator", "coevolution.yaml")) or {}
-            _glass_cfg    = _load_yaml_file(_config_path("duty_stations", "simulator", "glass_room.yaml")) or {}
-            _sim_station_cfg = _load_yaml_file(_config_path("duty_stations", "simulator", "station.yaml")) or {}
-            _sim_lw  = int((_sim_station_cfg.get("layout") or {}).get("left_panel_width",  210))
-            _sim_rw  = int((_sim_station_cfg.get("layout") or {}).get("right_panel_width", 240))
-            # Default world bounds — updated later if physics provides sim_bounds
-            _sim_wb_min = np.array([-0.20, -0.05, 0.02], np.float64)
-            _sim_wb_max = np.array([ 0.20,  0.35, 0.38], np.float64)
-            _sim_station = _SimulatorStation(
-                palette_cfg=_palette_cfg,
-                coevo_cfg=_coevo_cfg,
-                glass_cfg=_glass_cfg,
-                wb_min=_sim_wb_min,
-                wb_max=_sim_wb_max,
-                win_w=WIN_W, win_h=WIN_H,
-                left_panel_w=_sim_lw,
-                right_panel_w=_sim_rw,
-            )
-            _sim_station.init_gl()
-        except Exception as _e:
-            print(f"[simulator_station] init failed: {_e}", flush=True)
-            _sim_station = None
     # ─────────────────────────────────────────────────────────────────────────
 
     if physics is not None:
@@ -12136,29 +12326,13 @@ def main():
     active_ray_frame_index = None
     last_displayed_frame_index = None
     equilibrium_report_every = max(0, int(args.equilibrium_report_every))
-    rest_stats0 = None
-    capture = None
-    if args.capture_wav:
-        capture = _CaptureSet(args.capture_wav, args.capture_source)
 
-    print("1-9 layers | WASD pan | Q/Z height | drag look | arrows tilt-shift | "
-          "+/- focal | [] focus | ,/. aperture | F step | C reset sensor | Tab sim-station | Esc quit | "
-          f"excitation={args.excitation}", flush=True)
-
-    def _refresh_ray_field_from_frame(frame: Frame | None, frame_index: int, reason: str) -> bool:
-        """Non-blocking: posts a source-computation job to the background worker.
-        The source worker computes new sources asynchronously; the GL thread
-        drains the result via pump_forward() on subsequent display frames.
-        No GL calls here — returns immediately.
-        Fires whenever ILLUM (layer 8, key-8) or SENSOR (layer 9, key-9) is on."""
+    def _refresh_ray_field_from_frame(frame, frame_index: int, _reason: str) -> bool:
         nonlocal active_ray_frame_index, force_ray_refresh
+        if scene is None or not args.gpu_rays:
+            return False
         acc = R._sensor_acc
-        if acc is None or scene is None or not args.gpu_rays:
-            return False
-        # Only post new sources when a layer actually consumes the lightfield.
-        if R._layers[7] == LAYER_HIDDEN and R._layers[8] == LAYER_HIDDEN:
-            return False
-        if frame_index < 0 and frame is None:
+        if acc is None or frame is None:
             return False
         if not force_ray_refresh and refresh_every > 0 and frame_index >= 0 and (frame_index % refresh_every) != 0:
             return False
@@ -12248,25 +12422,14 @@ def main():
             _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
             if _active_st is not None and _active_st.handle_menu_event(ev):
                 continue
-            if _sim_station is not None and _sim_station_open and _sim_station.handle_event(ev):
-                continue
             if _panel_active and panel.handle_event(ev):
                 continue
             if ev.type == QUIT:
                 running = False
             elif ev.type == KEYDOWN:
                 camera_dirty = False
-                if ev.key == pygame.K_TAB:
-                    if _sim_station is not None:
-                        _sim_station_open = not _sim_station_open
-                        print(f"[sim_station] {'opened' if _sim_station_open else 'closed'}",
-                              flush=True)
-                elif ev.key == pygame.K_ESCAPE:
-                    if _sim_station is not None and _sim_station_open:
-                        _sim_station_open = False
-                        print("[sim_station] closed", flush=True)
-                    else:
-                        running = False
+                if ev.key == pygame.K_ESCAPE:
+                    running = False
                 elif ev.key == K_SPACE:
                     R._paused = not R._paused
                 elif ev.key == pygame.K_f:
@@ -12550,79 +12713,31 @@ def main():
                 ray_draw_vertices=int(getattr(R, "_ray_n", 0)),
                 cached_frames=int(len(R._frames)),
             )
-            R.tick()
-            cur_frame = R.current_frame()
-            cur_frame_index = int(getattr(cur_frame, 'frame_index', -1)) if cur_frame is not None else -1
-            if (replaying or R._paused) and cur_frame_index != last_displayed_frame_index:
-                target_ray_frame_index = cur_frame_index
-                if target_ray_frame_index >= 0 and refresh_every > 0:
-                    target_ray_frame_index = (target_ray_frame_index // refresh_every) * refresh_every
-                if target_ray_frame_index != active_ray_frame_index:
-                    refresh_frame = cur_frame
-                    if target_ray_frame_index != cur_frame_index:
-                        refresh_frame = next(
-                            (cached for cached in reversed(R._frames)
-                             if int(getattr(cached, 'frame_index', -1)) == target_ray_frame_index),
-                            None)
-                    _refresh_ray_field_from_frame(refresh_frame, target_ray_frame_index, "replay")
-                last_displayed_frame_index = cur_frame_index
-            # ── Camera software tick (DigitalPositiveSensor etc.) ─────────────
-            # Drives R.cam.software modules and refreshes _digital_positive /
-            # _digital_rgb from the result before the sensor blit.
             _cam_dt = clock.get_time() * 1e-3  # ms → s
             R.cam.tick(_cam_dt)
-            R._digital_positive = R.cam._digital_positive
-            R._digital_rgb      = R.cam._digital_rgb
-            # Sync the batched digital-back spec list from the camera software.
-            # None means the renderer uses its own self.film at blit time.
-            if R.cam.digital_film is not None:
-                R.digital_film = R.cam.digital_film
-            else:
-                R.digital_film = None
-            # Unconditional every-frame sync: the player controller, auto-orbit,
-            # and camera software can all move R.cam each frame.  The sensor
-            # accumulator must receive the updated eye/target/FOV before tick_sensor()
-            # fires so the ray camera always matches the OpenGL camera exactly.
-            R.sync_sensor_camera(reset=False)
-            R.tick_sensor()
 
             # ── Active station menu overlay ───────────────────────────────────
             _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
             if _active_st is not None and hasattr(_active_st, 'render_menu'):
                 _active_st.render_menu(WIN_W, WIN_H)
 
-            # ── Room station 3-D render (environment shell + enclosures) ─────
-            if _room_station is not None and _cam_pure_matrices is not None:
-                _rs_P, _rs_V = _cam_pure_matrices(R.cam)
-                _rs_MVP = (_rs_P @ _rs_V).astype(np.float32)
-                _rs_MV  = _rs_V.astype(np.float32)
-                # Primary light direction: first PlacedLight in room, else fallback
-                _rs_lights = (_room_station._ws.lights()
-                              if _room_station is not None else [])
-                if _rs_lights:
-                    _lp = np.array(_rs_lights[0].pos, np.float32)
-                    _ld = _lp / (np.linalg.norm(_lp) + 1e-7)
-                    _rs_lv = (_rs_MV[:3, :3] @ _ld).astype(np.float32)
-                    _rs_lv /= (np.linalg.norm(_rs_lv) + 1e-7)
-                else:
-                    _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
-                    _rs_lv /= np.linalg.norm(_rs_lv)
-                _room_station.render_room(WIN_W, WIN_H, _rs_MVP, _rs_MV, _rs_lv)
-
-            R.render()
+            glClearColor(0.015, 0.010, 0.040, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
+            _rs_lv /= np.linalg.norm(_rs_lv)
 
             # ── Duty station render pass ──────────────────────────────────────
             # Render the duty station console using the same _p_body shader as
             # the main scene so scene field uniforms, depth state, and shading
             # model are identical to all other Phong-lit objects.
-            if duty_stations and _HAS_DUTY_STATION:
+            if duty_stations and _cam_pure_matrices is not None:
                 _P, _V = _cam_pure_matrices(R.cam)
                 _light_v = np.array([0.6, 0.8, 0.5], np.float32)
                 for _ds in duty_stations:
                     _ds.draw((_P @ _V).astype(np.float32),
                              _V.astype(np.float32),
                              _light_v,
-                             body_prog=R._p_body)
+                             body_prog=None)
 
             # ── Camera item render pass ───────────────────────────────────────
             if cameras and _cam_pure_matrices is not None:
@@ -12635,12 +12750,6 @@ def main():
                     _ci.draw(_MVP, _MV, _lv)
 
             # ── Camera designer station render pass ──────────────────────────
-            if _cam_designer_station is not None:
-                _cam_designer_station.draw(WIN_W, WIN_H)
-
-            # ── Simulator station render pass ────────────────────────────────
-            if _sim_station is not None and _sim_station_open:
-                _sim_station.render(WIN_W, WIN_H)
 
             # ── Camera HUD panel (IN_CAMERA mode) ────────────────────────────
             if (_camera_panel is not None
@@ -12657,10 +12766,21 @@ def main():
             _player_cam_panel.draw(WIN_W, WIN_H)
             _cam_optics_view.draw(WIN_W, WIN_H)
 
-            # ── Panel: only visible in orbit or interact state ─────────────────
+            for _ds in duty_stations:
+                _m = getattr(_ds, 'menu', None)
+                if _m is not None and hasattr(_m, 'render_hud'):
+                    _m.render_hud(WIN_W, WIN_H)
+
+            _station_hud_active = (
+                player_ctrl is not None
+                and player_ctrl.state.value == "interact"
+                and _active_st is not None
+            )
+
+            # ── Global renderer panel: keep hidden during duty-station/camera
+            # interaction so station-specific HUDs own the screen overlays.
             _show_panel = (player_ctrl is None
-                           or player_ctrl.state.value == "orbit"
-                           or player_ctrl.sidebar_visible)
+                           or player_ctrl.state.value == "orbit")
             if _show_panel:
                 panel.draw(WIN_W, WIN_H)
             else:
@@ -12671,26 +12791,27 @@ def main():
                     panel._draw_hud_text(_hint, WIN_W // 2, WIN_H - 56,
                                          WIN_W, WIN_H, center=True)
 
-            panel._draw_hud_text(R.camera_hud(), WIN_W // 2, 14, WIN_W, WIN_H, center=True)
-            # Sensor status overlay — shown whenever layer 9 is ALPHA or OPAQUE
-            if R._layers[8] != LAYER_HIDDEN:
-                acc = R._sensor_acc
-                if acc is not None and acc._active:
-                    _rpf = acc._w * int(acc._rows_per_frame) * int(acc._samples_per_pixel)
-                    _sstat = (f"SENSOR  pass {acc._pass}  frame {acc._frame}  "
-                              f"{acc._w}x{acc._h}  +{_rpf} rays/frame  "
-                              f"{R._sensor_fps:.0f} fps reset")
-                else:
-                    _sstat = "SENSOR: no accumulator (needs --gpu-rays)"
-                panel._draw_hud_text(_sstat, WIN_W // 2, WIN_H - 28, WIN_W, WIN_H, center=True)
-            panel.draw_progress(
-                WIN_W, WIN_H,
-                recorded_samples=max(recorded_samples, min(total, len(R._frames) * BLOCK_SAMPLES)),
-                total_samples=total,
-                replaying=replaying,
-                paused=R._paused,
-                pending_rebuild=pending_rebuild,
-                cached_frames=len(R._frames))
+            if not _station_hud_active:
+                panel._draw_hud_text(R.camera_hud(), WIN_W // 2, 14, WIN_W, WIN_H, center=True)
+                # Sensor status overlay — shown whenever layer 9 is ALPHA or OPAQUE
+                if R._layers[8] != LAYER_HIDDEN:
+                    acc = R._sensor_acc
+                    if acc is not None and acc._active:
+                        _rpf = acc._w * int(acc._rows_per_frame) * int(acc._samples_per_pixel)
+                        _sstat = (f"SENSOR  pass {acc._pass}  frame {acc._frame}  "
+                                  f"{acc._w}x{acc._h}  +{_rpf} rays/frame  "
+                                  f"{R._sensor_fps:.0f} fps reset")
+                    else:
+                        _sstat = "SENSOR: no accumulator (needs --gpu-rays)"
+                    panel._draw_hud_text(_sstat, WIN_W // 2, WIN_H - 28, WIN_W, WIN_H, center=True)
+                panel.draw_progress(
+                    WIN_W, WIN_H,
+                    recorded_samples=max(recorded_samples, min(total, len(R._frames) * BLOCK_SAMPLES)),
+                    total_samples=total,
+                    replaying=replaying,
+                    paused=R._paused,
+                    pending_rebuild=pending_rebuild,
+                    cached_frames=len(R._frames))
             pygame.display.flip()
         except BaseException as exc:
             _report_exception(f"render frame {fi}", exc)

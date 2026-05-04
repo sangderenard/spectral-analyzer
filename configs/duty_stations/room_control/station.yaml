@@ -479,6 +479,11 @@ panels:
     right_width:  280      # px
     # center fills remaining space
 
+room_editor:
+  preset_library: presets
+  grid_size: [8, 8]
+  station_anchor: [4, 0]
+
 # ── OpenGL Phong override ─────────────────────────────────────────────────────
 # Fast-path material params for the existing Phong rasteriser.
 # Ray-tracing consumers should use piece_materials / cornerstone_wall.bands

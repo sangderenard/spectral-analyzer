@@ -1,0 +1,10 @@
+id: sliding_door
+label: Sliding Door
+category: doors
+kind: opening
+mesh_type: marker_box
+surfaces: [north]
+footprint_xy: [2, 1]
+level_span: 2
+color_rgb: [0.52, 0.34, 0.22]
+summary: Two-wide door footprint occupying two levels.

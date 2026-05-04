@@ -436,7 +436,16 @@ class PlayerController:
         """Smoothly lerp camera to station console view."""
         if self._active_station is None:
             return
-        cfg = self._active_station.interact_camera
+        cfg = getattr(self._active_station, 'interact_camera', None)
+        if not isinstance(cfg, dict) or 'eye' not in cfg or 'target' not in cfg:
+            pos = np.array(getattr(self._active_station,
+                                   'world_position',
+                                   getattr(self._active_station, 'pos', [0.0, 0.0, 0.0])),
+                           np.float64)
+            cfg = {
+                'eye': (pos + np.array([0.0, -1.2, 1.4], np.float64)).tolist(),
+                'target': (pos + np.array([0.0, 0.0, 1.0], np.float64)).tolist(),
+            }
         t   = min(1.0, self._lerp_speed * dt)
 
         cur_eye = (self.camera._forced_eye if self.camera._forced_eye is not None
@@ -504,8 +513,11 @@ class PlayerController:
         eye = self.player_eye()
         best, best_d = None, float('inf')
         for st in duty_stations:
-            d = float(np.linalg.norm(eye - np.array(st.world_position)))
-            if d < st.interaction_radius and d < best_d:
+            pos = np.array(getattr(st, 'world_position',
+                                   getattr(st, 'pos', [0.0, 0.0, 0.0])), np.float64)
+            r = float(getattr(st, 'interaction_radius', 1.0))
+            d = float(np.linalg.norm(eye - pos))
+            if d < r and d < best_d:
                 best, best_d = st, d
         return best
 

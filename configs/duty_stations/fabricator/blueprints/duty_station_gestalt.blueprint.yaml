@@ -1,0 +1,48 @@
+version: 2
+save_type: fabrication_blueprint
+id: duty_station_gestalt
+label: Duty Station Gestalt
+created_utc: '2026-05-04T00:00:00+00:00'
+workspace:
+  base_solid: icosahedron
+  process_tab: assembling
+  gimbal_deg: [0.0, 0.0]
+  snap:
+    enabled: true
+    angle_deg: 15.0
+    distance_m: 0.08
+  symmetry:
+    mode: none
+    axis: z
+    count: 4
+relationships:
+  - relation: contains
+    items: [console_body, screen_panel, left_wing, right_wing, floor_tile, under_wing_plugs, left_hollow_pipes, right_solid_rods]
+process_itinerary:
+  - step: assemble_console
+    tab: assembling
+  - step: mount_screen
+    tab: assembling
+  - step: attach_wings
+    tab: assembling
+  - step: install_connectors
+    tab: assembling
+polygon_primitives: []
+optimized_object:
+  source: duty_station_gestalt
+  notes: Blueprint-level gestalt object for room-control tile placement.
+programmatic_blueprint_id: duty_station_parametric_connector
+requires_custom_confirm: true
+placeable_entry:
+  id: fabricated::duty_station_gestalt
+  label: Duty Station Gestalt (Fabricated)
+  category: duty_stations
+  kind: fabricated_duty_station
+  mesh_type: duty_station_blueprint
+  blueprint_id: duty_station_gestalt
+  programmatic_blueprint_id: duty_station_parametric_connector
+  requires_custom_confirm: true
+  surfaces: [floor]
+  footprint_xy: [2, 2]
+  level_span: 2
+  summary: Fabricator-assembled duty station gestalt export.

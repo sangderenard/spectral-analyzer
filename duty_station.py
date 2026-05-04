@@ -252,6 +252,8 @@ def _build_screen_verts(cons_cfg: dict, scr_cfg: dict) -> np.ndarray:
 def _build_back_wall_verts(cons_cfg: dict, scr_cfg: dict,
                            wing_cfg: dict, wall_cfg: dict) -> np.ndarray:
     """Wall behind the screen, floor-to-ceiling, full console+wing width."""
+    if not wall_cfg.get('enabled', False):
+        return np.zeros((0, 6), np.float32)
     w   = float(cons_cfg.get('width',        1.40))
     d   = float(cons_cfg.get('depth',        0.62))
     tlt = math.radians(float(cons_cfg.get('top_tilt_deg', 14.0)))
@@ -372,7 +374,7 @@ def _build_cornerstone_wall_mesh(cfg: dict) -> Optional["_DepthMesh"]:
     wing_cfg = cfg.get('side_wings', {})
     cw_cfg   = cfg.get('cornerstone_wall', {})
 
-    if not cw_cfg.get('enabled', True):
+    if not cw_cfg.get('enabled', False):
         return None
 
     w  = float(cons_cfg.get('width', 1.40))
@@ -425,7 +427,7 @@ def _build_floor_tile_mesh(cfg: dict) -> Optional["_DepthMesh"]:
     if not _HAS_DEPTH_MESH:
         return None
     ft_cfg = cfg.get('floor_tile', {})
-    if not ft_cfg.get('enabled', True):
+    if not ft_cfg.get('enabled', False):
         return None
 
     tile_w = float(ft_cfg.get('width', 2.00))
@@ -506,6 +508,7 @@ class DutyStation:
         # World transform
         pos = cfg.get('position', [0.0, 2.4, 0.0])
         yaw = float(cfg.get('yaw_deg', 180.0))
+        self._yaw_deg = yaw
         self.world_position = np.array(pos, np.float64)
         self._model_matrix  = _translation(pos) @ _rotation_z(yaw)
 
@@ -720,10 +723,28 @@ class DutyStation:
             for path in candidates:
                 if os.path.isfile(path):
                     self.menu = RoomControlStation.from_yaml_safe(path)
+                    if self.menu is not None and hasattr(self.menu, 'bind_host_station'):
+                        self.menu.bind_host_station(self)
                     return
             print('[duty_station] room_control: station.yaml not found; no menu attached')
         except Exception as exc:
             print(f'[duty_station] room_control menu attach failed: {exc}')
+
+    def set_world_position(self, new_pos: np.ndarray, update_interact_camera: bool = True):
+        """Update station world position and dependent transforms at runtime."""
+        new_pos = np.asarray(new_pos, np.float64).reshape(3)
+        delta = new_pos - self.world_position
+        if float(np.linalg.norm(delta)) <= 1e-12:
+            return
+        self.world_position = new_pos
+        self._model_matrix = _translation(self.world_position.tolist()) @ _rotation_z(self._yaw_deg)
+        self._cfg['position'] = self.world_position.tolist()
+
+        if update_interact_camera:
+            for key in ('eye', 'target'):
+                v = self.interact_camera.get(key)
+                if isinstance(v, (list, tuple)) and len(v) == 3:
+                    self.interact_camera[key] = (np.asarray(v, np.float64) + delta).tolist()
 
     # ── Rendering ─────────────────────────────────────────────────────────────
 
@@ -753,7 +774,8 @@ class DutyStation:
         self._draw_body(MVP, MV, light_v, alpha, prog)
         self._draw_wall(MVP, MV, light_v, alpha, prog)
         self._draw_screen(MVP, MV, alpha)
-        self._draw_module_geometry(MVP, MV, light_v, alpha, prog)
+        if self.menu is not None and hasattr(self.menu, 'draw_world'):
+            self.menu.draw_world(MVP, MV, light_v, prog)
 
     def _draw_body(self, MVP, MV, light_v, alpha, prog: Optional[int] = None):
         m = self._mat_body

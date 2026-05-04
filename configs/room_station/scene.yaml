@@ -100,8 +100,8 @@ objects:
   - id: fabricator_1
     type: duty_station
     label: "Fabricator"
-    pos: [-2.5, 7.5, 0.0]
-    yaw_deg: 160.0
+    pos: [-1.8, 9.0, 0.0]
+    yaw_deg: 180.0
     station_type: fabricator
     config_dir: configs/duty_stations/fabricator
     interaction_radius: 2.0

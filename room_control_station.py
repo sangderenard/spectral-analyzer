@@ -48,6 +48,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pygame
 
+from room_tile_editor import (
+    _CELL_SIZE_M,
+    RoomTileLibraryPanel,
+    RoomTileWorkspace,
+    load_room_tile_presets,
+)
+
 try:
     import yaml as _yaml
     _HAS_YAML = True
@@ -406,54 +413,256 @@ class _KnobPanel:
         return False
 
 
+class _LibraryPalettePanel:
+    """Specialized panel: filesystem-backed parts list + tool selector row.
+
+    Uses shared HUD state keys:
+      - ``palette_tool``     : one of ``create``, ``move``, ``delete``
+      - ``palette_selected`` : currently selected item id
+    """
+
+    PAD = 6
+    HDR_H = 24
+    ROW_H = 20
+    TOOL_H = 24
+
+    def __init__(self, state: dict,
+                 title: str = "PARTS",
+                 accent_rgb: Tuple[int, int, int] = (60, 110, 200),
+                 library_items: list | None = None):
+        pygame.font.init()
+        self.state = state
+        self._title = title
+        self._accent = tuple(int(c * 255) if isinstance(c, float) else int(c)
+                             for c in accent_rgb)
+        self._font = pygame.font.SysFont("monospace", 13)
+        self._font_s = pygame.font.SysFont("monospace", 11)
+        self._scroll = 0
+        self._items = list(library_items or [])
+        self._tool_rects: dict[str, pygame.Rect] = {}
+        self._item_rects: dict[str, pygame.Rect] = {}
+        self._content_h = 0
+
+        if "palette_tool" not in self.state:
+            self.state["palette_tool"] = "create"
+        if "palette_selected" not in self.state and self._items:
+            self.state["palette_selected"] = str(self._items[0].get("id", ""))
+
+    def render(self, w: int, h: int) -> pygame.Surface:
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill(_BG)
+        self._tool_rects = {}
+        self._item_rects = {}
+
+        pygame.draw.rect(surf, self._accent, pygame.Rect(0, 0, w, self.HDR_H))
+        t = self._font.render(f"  {self._title}", True, _TEXT)
+        surf.blit(t, (self.PAD, 4))
+
+        y = self.HDR_H + 4
+        tool_w = max(30, (w - self.PAD * 2 - 4) // 3)
+        for i, tool in enumerate(("create", "move", "delete")):
+            tr = pygame.Rect(self.PAD + i * (tool_w + 2), y, tool_w, self.TOOL_H)
+            self._tool_rects[tool] = tr
+            active = (self.state.get("palette_tool") == tool)
+            bg = self._accent if active else (28, 32, 44)
+            pygame.draw.rect(surf, bg, tr, border_radius=3)
+            pygame.draw.rect(surf, (70, 80, 100), tr, 1, border_radius=3)
+            lbl = self._font_s.render(tool.upper(), True, _TEXT)
+            surf.blit(lbl, (tr.x + (tr.w - lbl.get_width()) // 2,
+                            tr.y + (tr.h - lbl.get_height()) // 2))
+        y += self.TOOL_H + 6
+
+        list_top = y
+        cur_y = list_top - self._scroll
+        selected = str(self.state.get("palette_selected", ""))
+        for it in self._items:
+            iid = str(it.get("id", ""))
+            cat = str(it.get("category", "misc"))
+            lbl = str(it.get("label", iid))
+            r = pygame.Rect(0, cur_y, w, self.ROW_H)
+            if cur_y + self.ROW_H >= list_top and cur_y < h:
+                bg = _SEL_BG if iid == selected else _ITEM_BG
+                pygame.draw.rect(surf, bg, r)
+                s = self._font_s.render(f"{cat}: {lbl}", True, _TEXT)
+                surf.blit(s, (self.PAD, cur_y + 3))
+                self._item_rects[iid] = r
+            cur_y += self.ROW_H
+
+        self._content_h = max(0, len(self._items) * self.ROW_H)
+        list_h = max(1, h - list_top)
+        max_scroll = max(0, self._content_h - list_h)
+        self._scroll = int(np.clip(self._scroll, 0, max_scroll))
+
+        if self._content_h > list_h:
+            bar_h = max(20, int(list_h * list_h / self._content_h))
+            bar_y = list_top + int(self._scroll * (list_h - bar_h) / max(max_scroll, 1))
+            pygame.draw.rect(surf, (50, 55, 70), pygame.Rect(w - 6, list_top, 6, list_h))
+            pygame.draw.rect(surf, self._accent, pygame.Rect(w - 6, bar_y, 6, bar_h))
+
+        return surf
+
+    def handle_event(self, ev, x_off: int = 0, y_off: int = 0) -> bool:
+        if ev.type == pygame.MOUSEWHEEL:
+            mx, my = pygame.mouse.get_pos()
+            lx, ly = mx - x_off, my - y_off
+            if lx < 0 or ly < self.HDR_H + self.TOOL_H + 4:
+                return False
+            list_h = max(1, pygame.display.get_surface().get_height() - (self.HDR_H + self.TOOL_H + 10))
+            max_scroll = max(0, self._content_h - list_h)
+            self._scroll = int(np.clip(self._scroll - ev.y * self.ROW_H, 0, max_scroll))
+            return True
+
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            mx, my = ev.pos
+            lx, ly = mx - x_off, my - y_off
+            for tool, r in self._tool_rects.items():
+                if r.collidepoint(lx, ly):
+                    self.state["palette_tool"] = tool
+                    return True
+            for iid, r in self._item_rects.items():
+                if r.collidepoint(lx, ly):
+                    self.state["palette_selected"] = iid
+                    return True
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Center panel (stub)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class _CenterStubPanel:
-    def render(self, w: int, h: int) -> pygame.Surface:
+class _CenterTabPanel:
+    """Center panel with a tab bar (RoutingGridView pattern) and a _KnobPanel
+    per tab.  Each tab entry is a dict::
+
+        {"key": str, "label": str, "sections": list,
+         "title": str (opt), "accent_rgb": tuple (opt)}
+
+    ``active_tab`` exposes the current tab key so ``DutyStationHUD.render_hud``
+    can gate special behaviour (e.g. delegating GL rendering for a "views" tab).
+    """
+
+    _TAB_H   = 22
+    _TAB_W   = 72
+    _TAB_PAD = 4
+
+    def __init__(self, tabs: list, state: dict):
         pygame.font.init()
+        self._tabs   = tabs or [{"key": "main", "label": "MAIN", "sections": []}]
+        self._keys   = [t["key"]   for t in self._tabs]
+        self._active = self._keys[0] if self._keys else ""
+        self._tab_rects: list = []
+        self._font   = pygame.font.SysFont("monospace", 12)
+        self._w = self._h = 0
+
+        # One _KnobPanel per tab — shares the same state dict
+        self._panels: Dict[str, _KnobPanel] = {}
+        for t in self._tabs:
+            secs   = t.get("sections", [])
+            accent = t.get("accent_rgb", (60, 110, 200))
+            title  = t.get("title", t["label"])
+            self._panels[t["key"]] = _KnobPanel(
+                secs, state, title=title, accent_rgb=accent)
+
+    # ── Public ────────────────────────────────────────────────────────────────
+
+    @property
+    def active_tab(self) -> str:
+        return self._active
+
+    # ── Render ────────────────────────────────────────────────────────────────
+
+    def render(self, w: int, h: int) -> pygame.Surface:
+        self._w, self._h = w, h
         surf = pygame.Surface((w, h), pygame.SRCALPHA)
-        surf.fill((14, 16, 22, 240))
-        font = pygame.font.SysFont("monospace", 16)
-        font_s = pygame.font.SysFont("monospace", 12)
+        surf.fill(_BG)
 
-        # Title bar
-        pygame.draw.rect(surf, (28, 32, 44), pygame.Rect(0, 0, w, 28))
-        t = font.render("  ROOM MAP", True, (210, 220, 230))
-        surf.blit(t, (8, 6))
+        # Tab bar — identical colours / geometry to RoutingGridView
+        self._tab_rects = []
+        fh = self._font.get_height()
+        for ti, t in enumerate(self._tabs):
+            tr = pygame.Rect(
+                self._TAB_PAD + ti * (self._TAB_W + 2),
+                self._TAB_PAD,
+                self._TAB_W,
+                self._TAB_H - 2 * self._TAB_PAD,
+            )
+            self._tab_rects.append(tr)
+            active = (t["key"] == self._active)
+            bg = (40, 90, 160) if active else (28, 28, 38)
+            pygame.draw.rect(surf, bg, tr, border_radius=3)
+            pygame.draw.rect(surf, (60, 60, 85), tr, 1, border_radius=3)
+            tc = (220, 235, 255) if active else (100, 100, 120)
+            ts = self._font.render(t["label"], True, tc)
+            surf.blit(ts, (tr.x + (tr.w - ts.get_width()) // 2,
+                           tr.y + (tr.h - fh) // 2))
 
-        # Stub notice
-        msg_lines = [
-            "[ MAP VIEW ]",
-            "",
-            "Coming soon — interactive room",
-            "floor-plan and object placement",
-            "overlay will appear here.",
-            "",
-            "Left panel:  Lighting controls",
-            "Right panel: Environment controls",
-        ]
-        y = h // 3
-        for line in msg_lines:
-            t = font_s.render(line, True, (80, 100, 130))
-            surf.blit(t, ((w - t.get_width()) // 2, y))
-            y += font_s.get_height() + 4
+        # Active tab body — delegate to its _KnobPanel
+        panel = self._panels.get(self._active)
+        body_h = h - self._TAB_H
+        if panel is not None and body_h > 0:
+            psuf = panel.render(w, body_h)
+            surf.blit(psuf, (0, self._TAB_H))
 
-        # Decorative border
-        pygame.draw.rect(surf, (40, 50, 70), pygame.Rect(0, 0, w, h), 1)
         return surf
 
+    def render_tab_bar_only(self, w: int, h: int) -> pygame.Surface:
+        """Return a surface with only the tab strip (rest fully transparent).
+
+        Used by ``DutyStationHUD.render_hud`` when a tab delegates GL rendering
+        to an external widget (e.g. the camera designer viewports).
+        """
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill((0, 0, 0, 0))
+        fh = self._font.get_height()
+        self._tab_rects = []
+        for ti, t in enumerate(self._tabs):
+            tr = pygame.Rect(
+                self._TAB_PAD + ti * (self._TAB_W + 2),
+                self._TAB_PAD,
+                self._TAB_W,
+                self._TAB_H - 2 * self._TAB_PAD,
+            )
+            self._tab_rects.append(tr)
+            active = (t["key"] == self._active)
+            bg = (40, 90, 160) if active else (28, 28, 38)
+            pygame.draw.rect(surf, bg, tr, border_radius=3)
+            pygame.draw.rect(surf, (60, 60, 85), tr, 1, border_radius=3)
+            tc = (220, 235, 255) if active else (100, 100, 120)
+            ts = self._font.render(t["label"], True, tc)
+            surf.blit(ts, (tr.x + (tr.w - ts.get_width()) // 2,
+                           tr.y + (tr.h - fh) // 2))
+        return surf
+
+    # ── Events ────────────────────────────────────────────────────────────────
+
+    def handle_event(self, ev, x_off: int = 0, y_off: int = 0) -> bool:
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            mx, my = ev.pos
+            lx, ly = mx - x_off, my - y_off
+            if 0 <= ly < self._TAB_H:
+                for ti, tr in enumerate(self._tab_rects):
+                    if tr.collidepoint(lx, ly):
+                        self._active = self._keys[ti]
+                        return True
+
+        # Route all other events to the active tab's _KnobPanel
+        panel = self._panels.get(self._active)
+        if panel is not None:
+            return panel.handle_event(ev, x_off=x_off,
+                                      y_off=y_off + self._TAB_H)
+        return False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RoomControlStation
+# DutyStationHUD  (generic base)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class RoomControlStation:
-    """HUD for the room_control duty-station module.
+class DutyStationHUD:
+    """Generic 3-panel HUD for any duty-station module.
 
     Exposes the ``show_hud`` / ``render_hud`` / ``handle_event`` interface
-    expected by ``DutyStation.menu``.
+    expected by ``DutyStation.menu``.  Build via ``from_sections`` for
+    programmatic section dicts, or a subclass for YAML/config-driven loading.
     """
 
     LEFT_W  = 280
@@ -470,27 +679,57 @@ class RoomControlStation:
         self.LEFT_W  = int(lay.get("left_width",  self.LEFT_W))
         self.RIGHT_W = int(lay.get("right_width", self.RIGHT_W))
 
-        # Build initial knob state from defaults
+        # Build initial knob state from defaults (all three panels contribute)
         left_secs  = left_cfg.get("sections",  [])
         right_secs = right_cfg.get("sections", [])
         self.state: Dict[str, Any] = {}
         self.state.update(_default_state(left_secs))
         self.state.update(_default_state(right_secs))
+        # Center state: collect from all tabs or from legacy sections key
+        _center_tabs = center_cfg.get("tabs") if isinstance(center_cfg, dict) else None
+        if _center_tabs is not None:
+            for _t in _center_tabs:
+                self.state.update(_default_state(_t.get("sections", [])))
+        else:
+            self.state.update(_default_state(
+                center_cfg.get("sections", []) if isinstance(center_cfg, dict) else []))
 
         # Accent colour (from left panel config by default)
         def _accent(cfg):
             c = cfg.get("panel", {}).get("accent_rgb", [0.0, 0.28, 0.78])
             return tuple(int(x * 255) for x in c)
 
-        self._left_panel   = _KnobPanel(
-            left_secs, self.state,
-            title=left_cfg.get("panel", {}).get("title", "LEFT"),
-            accent_rgb=_accent(left_cfg))
-        self._right_panel  = _KnobPanel(
+        _left_panel_cfg = left_cfg.get("panel", {})
+        if _left_panel_cfg.get("panel_type") == "library_palette":
+            self._left_panel = _LibraryPalettePanel(
+                self.state,
+                title=_left_panel_cfg.get("title", "PARTS"),
+                accent_rgb=_accent(left_cfg),
+                library_items=_left_panel_cfg.get("library_items", []),
+            )
+        else:
+            self._left_panel = _KnobPanel(
+                left_secs, self.state,
+                title=_left_panel_cfg.get("title", "LEFT"),
+                accent_rgb=_accent(left_cfg))
+        self._right_panel = _KnobPanel(
             right_secs, self.state,
             title=right_cfg.get("panel", {}).get("title", "RIGHT"),
             accent_rgb=_accent(right_cfg))
-        self._center_panel = _CenterStubPanel()
+
+        # Center panel: tab-based if "tabs" key present, else wrap sections in one tab
+        if _center_tabs is not None:
+            self._center_panel = _CenterTabPanel(_center_tabs, self.state)
+        else:
+            _fallback_secs = (center_cfg.get("sections", [])
+                              if isinstance(center_cfg, dict) else [])
+            self._center_panel = _CenterTabPanel(
+                [{"key": "main", "label": "MAIN", "sections": _fallback_secs,
+                  "title": "CENTER"}],
+                self.state)
+
+        # Optional GL designer widget — set externally to delegate "views" tab rendering
+        self._designer: Optional[object] = None
 
         # HUD visibility
         self._hud_visible = False
@@ -509,35 +748,65 @@ class RoomControlStation:
     # ── Class-method constructors ─────────────────────────────────────────────
 
     @classmethod
-    def from_yaml(cls, station_yaml_path: str) -> "RoomControlStation":
-        """Load from station.yaml; sibling panel YAMLs resolved relative to it."""
-        station_cfg = _load_yaml(station_yaml_path)
-        base_dir    = os.path.dirname(os.path.abspath(station_yaml_path))
-        panels_cfg  = station_cfg.get("panels", {})
+    def from_sections(
+        cls,
+        left_sections: list,
+        right_sections: list,
+        *,
+        center_tabs: list | None = None,
+        center_sections: list | None = None,
+        left_panel: dict | None = None,
+        left_title: str = "LEFT",
+        right_title: str = "RIGHT",
+        left_accent: tuple = (0.0, 0.28, 0.78),
+        right_accent: tuple = (0.0, 0.50, 0.35),
+        left_width: int = 280,
+        right_width: int = 280,
+        station_cfg: dict | None = None,
+    ) -> "DutyStationHUD":
+        """Construct a HUD directly from section dicts — no YAML required.
 
-        def _load_panel(key: str, fallback_name: str) -> dict:
-            rel = panels_cfg.get(key, fallback_name)
-            path = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
-            try:
-                return _load_yaml(path)
-            except Exception as exc:
-                print(f"[RoomControlStation] could not load {path}: {exc}")
-                return {}
+        ``center_tabs`` is a list of tab dicts::
 
-        left_cfg   = _load_panel("left",   "left_controls.yaml")
-        center_cfg = _load_panel("center", "center_controls.yaml")
-        right_cfg  = _load_panel("right",  "right_controls.yaml")
-        return cls(station_cfg, left_cfg, center_cfg, right_cfg)
+            [{"key": str, "label": str, "sections": list,
+              "title": str (opt), "accent_rgb": tuple (opt)}, ...]
 
-    @classmethod
-    def from_yaml_safe(cls, path: str) -> Optional["RoomControlStation"]:
-        try:
-            return cls.from_yaml(path)
-        except Exception as exc:
-            print(f"[RoomControlStation] load failed: {exc}")
-            return None
+        ``center_sections`` is a legacy shorthand: it is wrapped in a single
+        "MAIN" tab when ``center_tabs`` is not provided.
+        """
+        def _make_panel_cfg(sections, title, accent_rgb, panel_extra=None):
+            panel = {"title": title, "accent_rgb": list(accent_rgb)}
+            if isinstance(panel_extra, dict):
+                panel.update(panel_extra)
+            return {
+                "panel": panel,
+                "sections": sections,
+            }
+
+        _station_cfg = station_cfg or {
+            "panels": {"layout": {"left_width": left_width, "right_width": right_width}}
+        }
+        _left_cfg  = _make_panel_cfg(left_sections,  left_title,  left_accent,
+                         panel_extra=left_panel)
+        _right_cfg = _make_panel_cfg(right_sections, right_title, right_accent)
+
+        if center_tabs is not None:
+            _center_cfg = {"tabs": center_tabs}
+        else:
+            _center_cfg = {"sections": center_sections or []}
+
+        return cls(_station_cfg, _left_cfg, _center_cfg, _right_cfg)
 
     # ── GL lifecycle ──────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_yaml_safe(cls, path: str) -> Optional["DutyStationHUD"]:
+        """Call ``cls.from_yaml(path)`` and return None on any error."""
+        try:
+            return cls.from_yaml(path)  # type: ignore[attr-defined]
+        except Exception as exc:
+            print(f"[{cls.__name__}] load failed: {exc}")
+            return None
 
     def build_gl(self):
         if not _HAS_GL:
@@ -565,16 +834,31 @@ class RoomControlStation:
         center_w = win_w - self.LEFT_W - self.RIGHT_W
         h        = win_h
 
+        # Detect "views" tab with an attached GL designer: let the designer own
+        # the center GL area and render only the tab bar strip as overlay.
+        _views_active = (
+            self._designer is not None
+            and getattr(self._center_panel, "active_tab", None) == "views"
+        )
+
         # Render pygame surfaces → textures
         surf_l = self._left_panel.render(self.LEFT_W, h)
-        surf_c = self._center_panel.render(center_w, h)
         surf_r = self._right_panel.render(self.RIGHT_W, h)
+        if _views_active:
+            surf_c = self._center_panel.render_tab_bar_only(center_w, h)
+        else:
+            surf_c = self._center_panel.render(center_w, h)
 
         self._tex_left   = _surface_to_tex(surf_l, self._tex_left)
         self._tex_center = _surface_to_tex(surf_c, self._tex_center)
         self._tex_right  = _surface_to_tex(surf_r, self._tex_right)
 
-        # Draw
+        # When views tab is active the designer draws its GL scene first so
+        # the HUD quads (drawn with blending) composite on top.
+        if _views_active:
+            self._designer.draw(win_w, win_h)  # type: ignore[union-attr]
+
+        # Draw HUD quads
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glUseProgram(self._prog)
@@ -653,7 +937,15 @@ class RoomControlStation:
         if _in_panel(x_right, self.RIGHT_W):
             return self._right_panel.handle_event(ev, x_off=x_right)
         if _in_panel(x_center, center_w):
-            # center panel is stub — absorb but don't process
+            if self._center_panel.handle_event(ev, x_off=x_center, y_off=0):
+                return True
+            _views_active = (
+                self._designer is not None
+                and getattr(self._center_panel, "active_tab", None) == "views"
+                and hasattr(self._designer, "handle_event")
+            )
+            if _views_active and self._designer.handle_event(ev):  # type: ignore[union-attr]
+                return True
             if ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP):
                 return True
 
@@ -668,8 +960,9 @@ class RoomControlStation:
     def set_value(self, name: str, value: Any):
         """Programmatically set a knob value."""
         if name in self.state:
-            k = self._left_panel._knobs.get(name) \
-                or self._right_panel._knobs.get(name)
+            left_knobs = getattr(self._left_panel, "_knobs", {})
+            right_knobs = getattr(self._right_panel, "_knobs", {})
+            k = left_knobs.get(name) or right_knobs.get(name)
             if k and k.get("dtype") == "float":
                 value = _clamp_float(float(value), k)
             self.state[name] = value
@@ -678,4 +971,110 @@ class RoomControlStation:
 
     def __repr__(self) -> str:
         vis = "visible" if self._hud_visible else "hidden"
-        return f"RoomControlStation(hud={vis}, state_keys={list(self.state)})"
+        return f"{self.__class__.__name__}(hud={vis}, state_keys={list(self.state)})"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RoomControlStation  (YAML-driven room duty-station HUD)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RoomControlStation(DutyStationHUD):
+    """Room-control duty-station HUD.  Loads knob layout from YAML files."""
+
+    def __init__(self, station_cfg: dict, left_cfg: dict,
+                 center_cfg: dict, right_cfg: dict):
+        super().__init__(station_cfg, left_cfg, center_cfg, right_cfg)
+        self._host_station = None
+
+        room_cfg = station_cfg.get("room_editor", {})
+        library_dir = str(room_cfg.get("preset_library_dir", ""))
+        presets = load_room_tile_presets(library_dir)
+        self._room_workspace = RoomTileWorkspace(
+            self.state,
+            presets,
+            station_cfg,
+            on_station_anchor_changed=self._on_station_anchor_changed,
+        )
+
+        def _accent(cfg):
+            c = cfg.get("panel", {}).get("accent_rgb", [0.0, 0.28, 0.78])
+            return tuple(int(x * 255) for x in c)
+
+        self._left_panel = RoomTileLibraryPanel(
+            self.state,
+            presets,
+            title="ROOM LIBRARY",
+            accent_rgb=_accent(left_cfg),
+            on_rotate_left=self._room_workspace.rotate_selection_left,
+            on_rotate_right=self._room_workspace.rotate_selection_right,
+            on_import_mesh=self._room_workspace.import_mesh_dialog,
+        )
+        self._center_panel = self._room_workspace
+
+    def bind_host_station(self, station):
+        """Attach the live DutyStation instance driven by this HUD."""
+        self._host_station = station
+
+    def _on_station_anchor_changed(self, old_x: int, old_y: int,
+                                   new_x: int, new_y: int):
+        """Propagate tile-anchor moves into the live station world transform."""
+        if self._host_station is None:
+            return
+        dx_cells = int(new_x - old_x)
+        dy_cells = int(new_y - old_y)
+        if dx_cells == 0 and dy_cells == 0:
+            return
+        delta = np.array([
+            float(dx_cells) * float(_CELL_SIZE_M),
+            float(dy_cells) * float(_CELL_SIZE_M),
+            0.0,
+        ], np.float64)
+        cur = np.array(getattr(self._host_station, "world_position", [0.0, 0.0, 0.0]), np.float64)
+        if hasattr(self._host_station, "set_world_position"):
+            self._host_station.set_world_position(cur + delta, update_interact_camera=True)
+
+    def build_gl(self):
+        super().build_gl()
+        self._room_workspace.build_gl()
+
+    def draw_world(self, mvp: np.ndarray, mv: np.ndarray,
+                   light_v: np.ndarray, prog: Optional[int]):
+        self._room_workspace.draw_world(mvp, mv, light_v, prog)
+
+    @classmethod
+    def from_yaml(cls, station_yaml_path: str) -> "RoomControlStation":
+        """Load from station.yaml; sibling panel YAMLs resolved relative to it."""
+        station_cfg = _load_yaml(station_yaml_path)
+        base_dir    = os.path.dirname(os.path.abspath(station_yaml_path))
+        room_cfg = station_cfg.setdefault("room_editor", {})
+        library_rel = room_cfg.get("preset_library", "presets")
+        room_cfg["preset_library_dir"] = (
+            library_rel if os.path.isabs(library_rel)
+            else os.path.join(base_dir, library_rel)
+        )
+        panels_cfg  = station_cfg.get("panels", {})
+
+        def _load_panel(key: str, fallback_name: str) -> dict:
+            rel = panels_cfg.get(key, fallback_name)
+            path = rel if os.path.isabs(rel) else os.path.join(base_dir, rel)
+            try:
+                return _load_yaml(path)
+            except Exception as exc:
+                print(f"[RoomControlStation] could not load {path}: {exc}")
+                return {}
+
+        left_cfg   = _load_panel("left",   "left_controls.yaml")
+        center_cfg = _load_panel("center", "center_controls.yaml")
+        right_cfg  = _load_panel("right",  "right_controls.yaml")
+        return cls(station_cfg, left_cfg, center_cfg, right_cfg)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CameraDutyStationHUD  (camera duty-station HUD built from section dicts)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CameraDutyStationHUD(DutyStationHUD):
+    """Camera duty-station HUD.  Sections are supplied programmatically
+    (e.g. from ``_PlayerCameraPanel.camera_hud_sections()``).
+    No YAML loading — call ``from_sections`` inherited from ``DutyStationHUD``.
+    """

@@ -28,7 +28,9 @@ Panels follow the same pattern as SimulatorStation:
 from __future__ import annotations
 
 import ctypes
+import glob
 import math
+import os
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -543,9 +545,9 @@ class _ComponentTreePanel:
                 sl = f"  L{i} ({p[0]*1e3:.1f},{p[1]*1e3:.1f},{p[2]*1e3:.1f}) mm"
                 y = self._lbl(vs, y, sl, (255, 220, 100))
         else:
-            y = self._lbl(vs, y, "  (no lights -- right-click pane)",
+            y = self._lbl(vs, y, "  (no lights in scene)",
                           (70, 80, 90))
-        y = self._lbl(vs, y, "  SPACE=build  C=clr  L=rm all", (60, 70, 80))
+        y = self._lbl(vs, y, "  SPACE=build  C=clr", (60, 70, 80))
         y = self._lbl(vs, y, "  G=brightness", (60, 70, 80))
         if self.bake_msg:
             vs.blit(self._font_s.render(f"  {self.bake_msg}", True, (140, 180, 140)),
@@ -792,8 +794,8 @@ class _ElementPropsPanel:
 
     _BR_VIEWS    = ('gpu_field', 'sensor', 'plate')
     _BR_LABELS   = {'gpu_field': 'GPU field', 'sensor': 'sensor', 'plate': 'plate'}
-    _PLACE_MODES = ('light', 'mesh')
-    _PLACE_LABELS = {'light': 'light', 'mesh': 'mesh'}
+    _PLACE_MODES = ('mesh',)
+    _PLACE_LABELS = {'mesh': 'mesh'}
 
     def __init__(self):
         pygame.font.init()
@@ -807,7 +809,7 @@ class _ElementPropsPanel:
         self.glow_segs_total: int  = 0
         # Interactive state
         self.bottom_right_view: str = 'gpu_field'
-        self.place_mode: str = 'light'
+        self.place_mode: str = 'mesh'
         self._knob_rects: dict = {}
         # Sim parameters (control the GPU ray pipeline)
         self.sim_rays_per_frame: int   = 16384
@@ -870,12 +872,9 @@ class _ElementPropsPanel:
         y += 14
 
         y = self._section(vs, y + 4, "RIGHT-CLICK PLACE", w)
-        y = self._choice_knob(vs, y, w, "place_mode",
-                              "  place type", self.place_mode,
-                              self._PLACE_MODES, self._PLACE_LABELS)
-        vs.blit(self._font_s.render("  left/right click to cycle", True,
-                (60, 75, 90)), (self.PAD, y + 2))
-        y += 14
+        vs.blit(self._font_s.render("  meshes only (light spawn removed)", True,
+            (60, 75, 90)), (self.PAD, y + 2))
+        y += 18
 
         # ── SIM PARAMS ────────────────────────────────────────────────────
         _RAYS_OPTS   = ['1024', '2048', '4096', '8192',
@@ -1220,6 +1219,8 @@ class CameraDesignerStation:
 
     LEFT_W  = 230
     RIGHT_W = 230
+    _CENTER_TABS  = [("views", "VIEWS"), ("lights", "LIGHTS"), ("rebuild", "REBUILD")]
+    _CENTER_TAB_H = 22
 
     def __init__(
         self,
@@ -1334,6 +1335,70 @@ class CameraDesignerStation:
         self._auto_cam_gl   = None   # SimpleNamespace with .iso / .sensor_iso
         self._auto_computer = None   # CameraComputer | None
         self._auto_last_t: float = time.perf_counter()
+
+        # Center tab bar state (follows RoutingGridView pattern in analytic_driver.py)
+        self._center_tab: str = "views"
+        self._center_tab_rects: list = []
+        self._center_tab_tex:   Optional[int] = None
+        self._center_panel_tex: Optional[int] = None
+        self._lights_remove_rects: list = []
+        self._view_layers = {
+            "texture": True,
+            "pictographic": True,
+        }
+
+    def set_view_layer_config(self, *, texture: Optional[bool] = None,
+                              pictographic: Optional[bool] = None) -> None:
+        """Configure layered rendering in viewports.
+
+        ``texture`` toggles the volumetric texture layer.
+        ``pictographic`` toggles line/pictograph overlays.
+        """
+        if texture is not None:
+            self._view_layers["texture"] = bool(texture)
+        if pictographic is not None:
+            self._view_layers["pictographic"] = bool(pictographic)
+
+    # ── Parts catalog ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def parts_catalog_items() -> list:
+        """Return filesystem-backed camera parts catalog entries for the left panel.
+
+        Scans the YAML preset library folders and returns a flat list of dicts::
+
+            {"id": "thin_lenses:planar_50mm", "label": "planar_50mm",
+             "category": "thin_lenses", "path": "/abs/path/to/file.yaml"}
+
+        This belongs here — not on the player camera panel — because this
+        station is where parts are placed, moved, and deleted.
+        """
+        root = os.path.dirname(os.path.abspath(__file__))
+        buckets = [
+            ("thin_lenses", os.path.join(root, "configs", "lenses"),     "*.yaml"),
+            ("bodies",      os.path.join(root, "configs", "cameras"),    "*.yaml"),
+            ("tubes",       os.path.join(root, "configs", "tubes"),      "*.yaml"),
+            ("port_holes",  os.path.join(root, "configs", "ports"),      "*.yaml"),
+            ("lights",      os.path.join(root, "configs", "lights"),     "*.yaml"),
+            ("materials",   os.path.join(root, "configs", "materials"),  "*.yaml"),
+            ("sensors",     os.path.join(root, "configs", "sensors"),    "*.yaml"),
+            ("film",        os.path.join(root, "configs", "films"),      "*.yaml"),
+            ("film",        os.path.join(root, "configs", "film_types"), "*.yaml"),
+            ("lights",      os.path.join(root, "presets", "emitters"),   "*.yaml"),
+        ]
+        items: list = []
+        for cat, base, pat in buckets:
+            if not os.path.isdir(base):
+                continue
+            for fp in sorted(glob.glob(os.path.join(base, pat))):
+                stem = os.path.splitext(os.path.basename(fp))[0]
+                items.append({
+                    "id":       f"{cat}:{stem}",
+                    "label":    stem,
+                    "category": cat,
+                    "path":     fp,
+                })
+        return items
 
     # ── Geometry builder ──────────────────────────────────────────────────────
 
@@ -1691,6 +1756,126 @@ class CameraDesignerStation:
 
     # ── Per-frame render ──────────────────────────────────────────────────────
 
+    def _render_center_tab_bar(self, vp_w: int) -> "pygame.Surface":
+        """Render the center tab bar strip — exact RoutingGridView pattern."""
+        TAB_H  = self._CENTER_TAB_H
+        surf   = pygame.Surface((vp_w, TAB_H))
+        surf.fill((14, 14, 18))
+        pygame.font.init()
+        font      = pygame.font.SysFont("consolas", 11)
+        fh        = font.get_height()
+        tab_keys  = [t[0] for t in self._CENTER_TABS]
+        tab_labels = [t[1] for t in self._CENTER_TABS]
+        tab_w     = 72
+        tab_pad   = 4
+        self._center_tab_rects = []
+        for ti, (tk, tl) in enumerate(zip(tab_keys, tab_labels)):
+            tr = pygame.Rect(tab_pad + ti * (tab_w + 2), tab_pad,
+                             tab_w, TAB_H - 2 * tab_pad)
+            self._center_tab_rects.append(tr)
+            active = (self._center_tab == tk)
+            bg = (40, 90, 160) if active else (28, 28, 38)
+            pygame.draw.rect(surf, bg, tr, border_radius=3)
+            pygame.draw.rect(surf, (60, 60, 85), tr, 1, border_radius=3)
+            tc = (220, 235, 255) if active else (100, 100, 120)
+            ts = font.render(tl, True, tc)
+            surf.blit(ts, (tr.x + (tr.w - ts.get_width()) // 2,
+                           tr.y + (tr.h - fh) // 2))
+        return surf
+
+    def _render_lights_panel(self, vp_w: int, vp_h: int) -> "pygame.Surface":
+        """Render the scene lights list panel for the LIGHTS center tab."""
+        TAB_H  = self._CENTER_TAB_H
+        surf   = pygame.Surface((vp_w, vp_h))
+        surf.fill((14, 14, 18))
+        pygame.font.init()
+        font  = pygame.font.SysFont("consolas", 11)
+        fh    = font.get_height()
+        ROW_H = fh + 10
+        PAD   = 8
+        y     = TAB_H + PAD
+        hdr   = font.render(
+            "Scene Lights  (right-click in VIEWS to place)", True, (160, 180, 220))
+        surf.blit(hdr, (PAD, y))
+        y += fh + 6
+        self._lights_remove_rects = []
+        if not self._scene_lights:
+            surf.blit(
+                font.render("(no lights placed)", True, (60, 60, 80)), (PAD, y))
+        else:
+            for i, lt in enumerate(self._scene_lights):
+                if y + ROW_H > vp_h:
+                    break
+                pos  = lt.get("pos",   [0., 0., 0.])
+                pwr  = lt.get("power", 1.0)
+                col3 = lt.get("color", [1., 1., 1.])
+                row_r = pygame.Rect(PAD, y, vp_w - 2 * PAD, ROW_H)
+                pygame.draw.rect(surf, (22, 22, 30), row_r, border_radius=3)
+                col_dot = (int(col3[0] * 200 + 55),
+                           int(col3[1] * 200 + 55),
+                           int(col3[2] * 200 + 55))
+                pygame.draw.circle(surf, col_dot,
+                                   (PAD + ROW_H // 2, y + ROW_H // 2), 5)
+                lbl = font.render(
+                    f"#{i}  x={pos[0]:.3f} y={pos[1]:.3f} z={pos[2]:.3f}"
+                    f"  pwr={pwr:.2f}",
+                    True, (190, 195, 210))
+                surf.blit(lbl, (PAD + 16, y + (ROW_H - fh) // 2))
+                btn_w = 40
+                btn_r = pygame.Rect(
+                    vp_w - PAD - btn_w, y + 2, btn_w, ROW_H - 4)
+                pygame.draw.rect(surf, (80, 28, 28), btn_r, border_radius=3)
+                surf.blit(
+                    font.render("del", True, (220, 100, 100)),
+                    (btn_r.x + (btn_w - font.size("del")[0]) // 2,
+                     btn_r.y + (btn_r.h - fh) // 2))
+                self._lights_remove_rects.append(btn_r)
+                y += ROW_H + 4
+        return surf
+
+    def _render_rebuild_panel(self, vp_w: int, vp_h: int) -> "pygame.Surface":
+        """Render the rebuild / GPU scene status panel for the REBUILD center tab."""
+        TAB_H = self._CENTER_TAB_H
+        surf  = pygame.Surface((vp_w, vp_h))
+        surf.fill((14, 14, 18))
+        pygame.font.init()
+        font  = pygame.font.SysFont("consolas", 11)
+        fh    = font.get_height()
+        PAD   = 8
+        y     = TAB_H + PAD
+        hdr   = font.render("Rebuild / GPU Scene Controls", True, (160, 180, 220))
+        surf.blit(hdr, (PAD, y))
+        y += fh + 8
+        rp    = self._right_panel
+        rows  = [
+            ("Rays / frame",  getattr(rp, "sim_rays_per_frame", 0)),
+            ("Max bounces",   getattr(rp, "sim_max_bounces",    4)),
+            ("Norm mode",     getattr(rp, "sim_norm_mode",      "none")),
+            ("Activation",    getattr(rp, "sim_activation",     "log")),
+            ("Slice mode",    "ON" if self._slice_mode else "off"),
+            ("Slice thick",   f"{self._slice_thickness * 1e3:.2f} mm"),
+            ("Scene lights",  len(self._scene_lights)),
+            ("Scene meshes",  len(self._scene_meshes)),
+            ("GPU ready",     "yes" if self._gpu_scene_ready else "no"),
+            ("Frame count",   self._gpu_frame_count),
+        ]
+        for label, value in rows:
+            if y + fh > vp_h:
+                break
+            surf.blit(
+                font.render(f"{label:<18}  {value}", True, (190, 195, 210)),
+                (PAD, y))
+            y += fh + 4
+        y += 8
+        if y + fh <= vp_h:
+            surf.blit(
+                font.render(
+                    "[SPACE] rebuild GPU dispatch   "
+                    "[S] toggle slice   [ / ] slab thickness",
+                    True, (60, 65, 85)),
+                (PAD, y))
+        return surf
+
     def draw(self, win_w: int, win_h: int) -> None:
         """Render the full camera designer UI into the current GL context."""
         if not _HAS_GL or not self._gl_ready:
@@ -1741,68 +1926,98 @@ class CameraDesignerStation:
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
-        # Four equal quadrant viewports
+        # Center tab: VIEWS → GL quadrant viewports; LIGHTS/REBUILD → pygame panel
         half_vp_w = vp_w // 2
         half_vp_h = vp_h // 2
 
-        _sm = self._slice_mode
-        _sb = (1.0, 0.65, 0.1, 0.85) if _sm else None   # amber border = slice mode
+        if self._center_tab == "views":
+            _sm = self._slice_mode
+            _sb = (1.0, 0.65, 0.1, 0.85) if _sm else None   # amber border = slice mode
 
-        # Top-left: XZ sagittal
-        self._draw_cross_section(
-            vp_x,             half_vp_h,
-            half_vp_w,        half_vp_h,
-            self._xz_lines,   self._view_xz,
-            win_w, win_h,
-            title="XZ sagittal",
-            border_rgba=_sb,
-        )
-        self._draw_march_volume(vp_x, half_vp_h, half_vp_w, half_vp_h, 'xz')
+            # Top-left: XZ sagittal
+            self._draw_view_layers(
+                vp_x,             half_vp_h,
+                half_vp_w,        half_vp_h,
+                self._xz_lines,   self._view_xz,
+                win_w, win_h,
+                axis="xz",
+                title="XZ sagittal",
+                border_rgba=_sb,
+            )
 
-        # Top-right: YZ tangential
-        self._draw_cross_section(
-            vp_x + half_vp_w, half_vp_h,
-            half_vp_w,        half_vp_h,
-            self._yz_lines,   self._view_yz,
-            win_w, win_h,
-            title="YZ tangential",
-            border_rgba=_sb,
-        )
-        self._draw_march_volume(vp_x + half_vp_w, half_vp_h, half_vp_w, half_vp_h, 'yz')
+            # Top-right: YZ tangential
+            self._draw_view_layers(
+                vp_x + half_vp_w, half_vp_h,
+                half_vp_w,        half_vp_h,
+                self._yz_lines,   self._view_yz,
+                win_w, win_h,
+                axis="yz",
+                title="YZ tangential",
+                border_rgba=_sb,
+            )
 
-        # Bottom-left: XY aperture plane
-        self._draw_cross_section(
-            vp_x,             0,
-            half_vp_w,        half_vp_h,
-            self._xy_lines,   self._view_xy,
-            win_w, win_h,
-            title="XY aperture plane",
-            border_rgba=_sb,
-        )
-        self._draw_march_volume(vp_x, 0, half_vp_w, half_vp_h, 'xy')
+            # Bottom-left: XY aperture plane
+            self._draw_view_layers(
+                vp_x,             0,
+                half_vp_w,        half_vp_h,
+                self._xy_lines,   self._view_xy,
+                win_w, win_h,
+                axis="xy",
+                title="XY aperture plane",
+                border_rgba=_sb,
+            )
 
-        # Bottom-right: controlled by right-panel bottom_right_view knob
-        _br_view = self._right_panel.bottom_right_view
-        _br_title = {'gpu_field': 'Sensor plane (GPU)',
-                     'sensor':    'Sensor accumulation',
-                     'plate':     'Plate accumulation'}.get(_br_view, _br_view)
-        self._draw_cross_section(
-            vp_x + half_vp_w, 0,
-            half_vp_w,        half_vp_h,
-            self._xy_lines,   self._view_xy,
-            win_w, win_h,
-            title=_br_title,
-            border_rgba=_sb,
-        )
-        if _br_view == 'gpu_field':
-            self._draw_march_volume(vp_x + half_vp_w, 0,
-                                    half_vp_w, half_vp_h, 'sensor')
-        elif _br_view == 'sensor':
-            self._draw_back_image(vp_x + half_vp_w, 0,
-                                  half_vp_w, half_vp_h, self._sensor_back)
-        elif _br_view == 'plate':
-            self._draw_back_image(vp_x + half_vp_w, 0,
-                                  half_vp_w, half_vp_h, self._plate_back)
+            # Bottom-right: controlled by right-panel bottom_right_view knob
+            _br_view = self._right_panel.bottom_right_view
+            _br_title = {'gpu_field': 'Sensor plane (GPU)',
+                         'sensor':    'Sensor accumulation',
+                         'plate':     'Plate accumulation'}.get(_br_view, _br_view)
+            if _br_view == 'gpu_field':
+                self._draw_view_layers(
+                    vp_x + half_vp_w, 0,
+                    half_vp_w,        half_vp_h,
+                    self._xy_lines,   self._view_xy,
+                    win_w, win_h,
+                    axis="sensor",
+                    title=_br_title,
+                    border_rgba=_sb,
+                )
+            elif _br_view == 'sensor':
+                self._draw_cross_section(
+                    vp_x + half_vp_w, 0,
+                    half_vp_w,        half_vp_h,
+                    self._xy_lines,   self._view_xy,
+                    win_w, win_h,
+                    title=_br_title,
+                    border_rgba=_sb,
+                )
+                self._draw_back_image(vp_x + half_vp_w, 0,
+                                      half_vp_w, half_vp_h, self._sensor_back)
+            elif _br_view == 'plate':
+                self._draw_cross_section(
+                    vp_x + half_vp_w, 0,
+                    half_vp_w,        half_vp_h,
+                    self._xy_lines,   self._view_xy,
+                    win_w, win_h,
+                    title=_br_title,
+                    border_rgba=_sb,
+                )
+                self._draw_back_image(vp_x + half_vp_w, 0,
+                                      half_vp_w, half_vp_h, self._plate_back)
+        else:
+            # Non-VIEWS tab: fill the center area with a pygame content panel
+            glDisable(GL_SCISSOR_TEST)
+            glViewport(0, 0, win_w, win_h)
+            if self._center_tab == "lights":
+                csurf = self._render_lights_panel(vp_w, win_h)
+            else:
+                csurf = self._render_rebuild_panel(vp_w, win_h)
+            if self._center_panel_tex is None:
+                self._center_panel_tex = _make_tex(csurf)
+            else:
+                _update_tex(self._center_panel_tex, csurf)
+            self._blit_panel(vp_x, 0, vp_w, win_h,
+                             self._center_panel_tex, win_w, win_h)
 
         # HUD panels
         glDisable(GL_SCISSOR_TEST)
@@ -1817,7 +2032,37 @@ class CameraDesignerStation:
         self._blit_panel(0,          0, lw,  win_h, self._left_tex,  win_w, win_h)
         self._blit_panel(win_w - rw, 0, rw,  win_h, self._right_tex, win_w, win_h)
 
+        # Center tab bar overlay — always on top of the center area
+        tab_surf = self._render_center_tab_bar(vp_w)
+        if self._center_tab_tex is None:
+            self._center_tab_tex = _make_tex(tab_surf)
+        else:
+            _update_tex(self._center_tab_tex, tab_surf)
+        self._blit_panel(vp_x, 0, vp_w, self._CENTER_TAB_H,
+                         self._center_tab_tex, win_w, win_h)
+
     # ── Internal draw helpers ─────────────────────────────────────────────────
+
+    def _draw_view_layers(
+        self,
+        vp_x: int, vp_y: int, vp_w: int, vp_h: int,
+        lines: list,
+        view: _OrthoView,
+        win_w: int, win_h: int,
+        axis: str,
+        title: str,
+        border_rgba: Optional[tuple] = None,
+    ) -> None:
+        """Compose viewport layers: texture background, then pictographic lines."""
+        if self._view_layers.get("texture", True):
+            self._draw_march_volume(vp_x, vp_y, vp_w, vp_h, axis)
+        if self._view_layers.get("pictographic", True):
+            self._draw_cross_section(
+                vp_x, vp_y, vp_w, vp_h,
+                lines, view, win_w, win_h,
+                title=title,
+                border_rgba=border_rgba,
+            )
 
     def _draw_march_volume(
         self,
@@ -2146,37 +2391,19 @@ class CameraDesignerStation:
                     lx_m = self._view_xy.offset[0] + (2.0 * pix_x / max(vp_w, 1) - 1.0) * self._view_xy.scale
                     ly_m = self._view_xy.offset[1] + (1.0 - 2.0 * pix_y / max(hh, 1)) * (self._view_xy.scale * hh / max(vp_w, 1))
                     pos3 = [lx_m, ly_m, 0.0]
-                if self._right_panel.place_mode == 'mesh':
-                    import random as _rnd
-                    _shapes = ('cube', 'sphere', 'tetrahedron', 'octahedron', 'icosahedron')
-                    _mats   = ('diffuse', 'reflective', 'emissive', 'translucent')
-                    self._scene_meshes.append({
-                        'pos':    [float(v) for v in pos3],
-                        'shape':  _rnd.choice(_shapes),
-                        'mat':    _rnd.choice(_mats),
-                        'color':  [_rnd.uniform(0.25, 1.0) for _ in range(3)],
-                        'radius': _rnd.uniform(0.005, 0.025),
-                    })
-                    # NOTE: scene_meshes appear as markers in cross-sections;
-                    # GPU geometry integration requires extending build_gpu_scene.
-                    self._rebuild_lines()
-                    self._panels_dirty = True
-                    return True
-
-                _led = EmitterSpec(
-                    profile_name="led_cool_white",
-                    label="placed_light",
-                    pos=tuple(float(v) for v in pos3),
-                    normal=(0.0, 0.0, -1.0),
-                )
-                self._scene_lights.append({
-                    "pos":   pos3,
-                    "dir":   [0.0, 0.0, -1.0],
-                    "color": list(_led.color),
-                    "power": float(_led.power),
-                    "_spec": _led,
+                import random as _rnd
+                _shapes = ('cube', 'sphere', 'tetrahedron', 'octahedron', 'icosahedron')
+                _mats   = ('diffuse', 'reflective', 'emissive', 'translucent')
+                self._scene_meshes.append({
+                    'pos':    [float(v) for v in pos3],
+                    'shape':  _rnd.choice(_shapes),
+                    'mat':    _rnd.choice(_mats),
+                    'color':  [_rnd.uniform(0.25, 1.0) for _ in range(3)],
+                    'radius': _rnd.uniform(0.005, 0.025),
                 })
-                self._build_gpu_dispatch()
+                # NOTE: scene_meshes appear as markers in cross-sections;
+                # GPU geometry integration requires extending build_gpu_scene.
+                self._rebuild_lines()
                 self._panels_dirty = True
                 return True
 
@@ -2217,9 +2444,35 @@ class CameraDesignerStation:
                       flush=True)
                 return True
 
-        # Cross-section pane mouse events
+        # Center tab bar click — checked before viewport pan/zoom routing
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            mx0, my0 = getattr(ev, "pos", (0, 0))
+            if vp_x <= mx0 < vp_x + vp_w and 0 <= my0 < self._CENTER_TAB_H:
+                lx_tab   = mx0 - vp_x
+                tab_keys = [t[0] for t in self._CENTER_TABS]
+                for ti, tr in enumerate(self._center_tab_rects):
+                    if tr.collidepoint(lx_tab, my0):
+                        self._center_tab = tab_keys[ti]
+                        return True
+
+        # LIGHTS tab: del-button clicks in the lights list panel
+        if (self._center_tab == "lights"
+                and ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1):
+            mx0, my0 = getattr(ev, "pos", (0, 0))
+            if vp_x <= mx0 < vp_x + vp_w:
+                lx_tab = mx0 - vp_x
+                for i, btn_r in enumerate(self._lights_remove_rects):
+                    if btn_r.collidepoint(lx_tab, my0):
+                        del self._scene_lights[i]
+                        self._lights_remove_rects = []
+                        self._rebuild_lines()
+                        self._build_gpu_dispatch()
+                        return True
+
+        # Cross-section pane mouse events (VIEWS tab only)
         mx, my = (getattr(ev, "pos", (0, 0)))
-        if ev.type in (pygame.MOUSEBUTTONDOWN, pygame.MOUSEMOTION,
+        if self._center_tab == "views" and ev.type in (pygame.MOUSEBUTTONDOWN,
+                       pygame.MOUSEMOTION,
                        pygame.MOUSEBUTTONUP, pygame.MOUSEWHEEL):
             if vp_x <= mx < vp_x + vp_w:
                 # Determine which pane

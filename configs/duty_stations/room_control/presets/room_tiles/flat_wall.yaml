@@ -1,0 +1,10 @@
+id: flat_wall
+label: Flat Wall Tile
+category: room_tiles
+kind: room_tile
+mesh_type: flat
+surfaces: [north]
+footprint_xy: [1, 1]
+level_span: 1
+color_rgb: [0.20, 0.18, 0.16]
+summary: Single inward-facing wall panel.

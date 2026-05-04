@@ -1,0 +1,10 @@
+id: ceiling_strip_light
+label: Ceiling Strip Light
+category: lights
+kind: fixture
+mesh_type: flat
+surfaces: [ceiling]
+footprint_xy: [2, 1]
+level_span: 1
+color_rgb: [0.80, 0.74, 0.40]
+summary: Two-meter ceiling light strip.

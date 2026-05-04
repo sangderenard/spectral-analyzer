@@ -571,6 +571,15 @@ class SimulatorStation:
 
         # Mouse drag state
         self._drag: Optional[tuple[int, int]] = None
+        self._hud_visible = False
+
+    def show_hud(self, visible: bool) -> None:
+        self._hud_visible = bool(visible)
+
+    def render_hud(self, win_w: int, win_h: int) -> None:
+        if not self._hud_visible:
+            return
+        self.render(win_w, win_h)
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -680,6 +689,8 @@ class SimulatorStation:
 
     def handle_event(self, ev) -> bool:
         """Route a pygame event.  Returns True if consumed."""
+        if not self._hud_visible:
+            return False
         lw = self.left_panel_w
         rw = self.right_panel_w
         vp_x = lw

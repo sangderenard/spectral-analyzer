@@ -1,0 +1,123 @@
+# Fabricator save recipe for reconstructing the duty station from primitive parts.
+# The sequence mirrors manual station building using face attach + confirm actions.
+
+version: 1
+save_type: fabricator_recipe
+id: duty_station_manual_build
+label: Duty Station Manual Build
+
+source:
+  mesh_config: configs/meshes/duty_station.yaml
+  generated_from: duty_station composite polygon groups
+
+workspace:
+  base_solid: cube
+  process_tab: assembling
+  gimbal_deg: [0.0, 0.0]
+  snap:
+    enabled: true
+    angle_deg: 15.0
+    distance_m: 0.05
+  symmetry:
+    mode: none
+    axis: z
+    count: 4
+
+primitives:
+  - id: duty_console_body
+    label: Duty Console Body
+    dims_xyz_m: [1.40, 0.62, 0.88]
+  - id: duty_screen_panel
+    label: Duty Screen Panel
+    dims_xyz_m: [1.10, 0.05, 0.72]
+  - id: duty_left_wing
+    label: Duty Left Wing
+    dims_xyz_m: [0.14, 0.56, 0.52]
+  - id: duty_right_wing
+    label: Duty Right Wing
+    dims_xyz_m: [0.14, 0.56, 0.52]
+  - id: duty_floor_tile
+    label: Duty Floor Tile
+    dims_xyz_m: [1.88, 0.80, 0.10]
+
+operations:
+  - step: 1
+    action: pick_primitive
+    primitive_id: duty_floor_tile
+    tab: assembling
+  - step: 2
+    action: attach_to_base_face
+    self_face: 1
+    piece_face: 0
+    align_edge: 0
+    offset_m: 0.00
+  - step: 3
+    action: confirm_placement
+
+  - step: 4
+    action: pick_primitive
+    primitive_id: duty_console_body
+    tab: assembling
+  - step: 5
+    action: attach_to_base_face
+    self_face: 1
+    piece_face: 0
+    align_edge: 0
+    offset_m: 0.05
+  - step: 6
+    action: confirm_placement
+
+  - step: 7
+    action: pick_primitive
+    primitive_id: duty_left_wing
+    tab: assembling
+  - step: 8
+    action: attach_to_base_face
+    self_face: 4
+    piece_face: 3
+    align_edge: 0
+    offset_m: 0.00
+  - step: 9
+    action: confirm_placement
+
+  - step: 10
+    action: pick_primitive
+    primitive_id: duty_right_wing
+    tab: assembling
+  - step: 11
+    action: attach_to_base_face
+    self_face: 5
+    piece_face: 2
+    align_edge: 0
+    offset_m: 0.00
+  - step: 12
+    action: confirm_placement
+
+  - step: 13
+    action: pick_primitive
+    primitive_id: duty_screen_panel
+    tab: assembling
+  - step: 14
+    action: set_gimbal
+    pan_deg: 0.0
+    tilt_deg: -7.0
+  - step: 15
+    action: attach_to_base_face
+    self_face: 3
+    piece_face: 2
+    align_edge: 1
+    offset_m: 0.04
+  - step: 16
+    action: confirm_placement
+
+export:
+  placeable:
+    id: duty_station_fabricated
+    label: Duty Station (Fabricated)
+    category: fabricated_objects
+    kind: fabricated_mesh
+    mesh_type: marker_box
+    surfaces: [floor]
+    footprint_xy: [2, 1]
+    level_span: 2
+    summary: Fabricator-exported placeable object for duty station

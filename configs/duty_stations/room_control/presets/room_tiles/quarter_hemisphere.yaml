@@ -1,0 +1,11 @@
+id: quarter_hemisphere
+label: Quarter Hemisphere
+category: room_tiles
+kind: room_tile
+mesh_type: quarter_hemisphere
+surfaces: [north, east, ceiling]
+footprint_xy: [1, 1]
+level_span: 1
+radius_cells: 1
+color_rgb: [0.18, 0.22, 0.30]
+summary: Curved corner blending two walls into the ceiling.

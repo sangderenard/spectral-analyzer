@@ -1,0 +1,14 @@
+id: fabricator_station
+label: Fabricator Duty Station
+category: duty_stations
+kind: fabricator_station
+mesh_type: duty_station_blueprint
+blueprint_id: duty_station_gestalt
+programmatic_blueprint_id: duty_station_parametric_connector
+requires_custom_confirm: false
+prefab_available: true
+surfaces: [floor]
+footprint_xy: [2, 2]
+level_span: 2
+color_rgb: [0.36, 0.68, 0.84]
+summary: Fabricator station tile used for adjacency-aware auto-fabrication.

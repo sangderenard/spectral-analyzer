@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import ctypes
 import math
-from typing import Optional
+import os
+from typing import Any, Optional
 
 import numpy as np
 import pygame
@@ -55,6 +56,13 @@ except ImportError:
 
 from fabricator_workspace import FabricatorWorkspace, WorkspaceMode
 from dec_mesh import DECMesh
+from fabricator_programmatic_blueprints import (
+    ProgrammaticBlueprint,
+    ProgrammaticKnobSpec,
+    build_mesh as _build_programmatic_mesh,
+    default_knob_values as _default_programmatic_knob_values,
+    load_programmatic_blueprints,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,23 +283,73 @@ class _SolidPickerPanel(_FabPanel):
     ITEM_H   = 56
     ICON_SZ  = 38
 
-    def __init__(self, palette: list, selected_id: Optional[str] = None):
+    def __init__(self, palette: list, selected_id: Optional[str] = None,
+                 blueprint_dir: str = "configs/duty_stations/fabricator/blueprints"):
         super().__init__()
         self.palette    = palette       # list of dict from palette.yaml
         self.selected   = selected_id
         self._hover     = -1
         self.PANEL_W    = 210
+        self.blueprint_dir = str(blueprint_dir)
+        self.tab = "shape_primitives"
+        self._blueprints: list[dict] = []
+
+    def _refresh_blueprints(self):
+        self._blueprints = []
+        if not os.path.isdir(self.blueprint_dir):
+            return
+        files = []
+        for nm in os.listdir(self.blueprint_dir):
+            low = str(nm).lower()
+            if low.endswith(".blueprint.yaml") or low.endswith(".blueprint.yml") or low.endswith(".blueprint.json"):
+                files.append(os.path.join(self.blueprint_dir, nm))
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        for fp in files:
+            base = os.path.basename(fp)
+            label = base
+            for suf in (".blueprint.yaml", ".blueprint.yml", ".blueprint.json"):
+                if label.lower().endswith(suf):
+                    label = label[: -len(suf)]
+                    break
+            self._blueprints.append({
+                "id": f"blueprint::{fp}",
+                "label": label,
+                "subtitle": "Blueprint",
+                "kind": "blueprint",
+                "path": fp,
+                "color_rgb": [0.22, 0.64, 0.78],
+            })
+
+    def _shape_entries(self) -> list[dict]:
+        out = []
+        for e in self.palette:
+            if str(e.get("kind", "")) == "solid":
+                out.append(e)
+        return out
+
+    def _active_entries(self) -> list[dict]:
+        if self.tab == "blueprints":
+            return list(self._blueprints)
+        return self._shape_entries()
 
     def render(self, w: int, h: int) -> pygame.Surface:
+        self._refresh_blueprints()
         surf = pygame.Surface((w, h), pygame.SRCALPHA)
         surf.fill((18, 20, 28, 240))
 
         # Header
         y = self._section(surf, 0, "  COMPONENTS", (28, 32, 44))
+        y = self._toggle_row(
+            surf,
+            y,
+            [("tab_shapes", "Shapes"), ("tab_blueprints", "Blueprints")],
+            "tab_shapes" if self.tab == "shape_primitives" else "tab_blueprints",
+        )
 
         # Items
         self._ctrl = {}
-        for idx, entry in enumerate(self.palette):
+        items = self._active_entries()
+        for idx, entry in enumerate(items):
             iy = y + idx * self.ITEM_H - self._scroll
             if iy + self.ITEM_H < 0 or iy > h:
                 continue
@@ -317,14 +375,18 @@ class _SolidPickerPanel(_FabPanel):
             surf.blit(sub, (8 + self.ICON_SZ + 6, iy + 12 + lbl.get_height() + 2))
 
             # Hit rect (in panel-local coords)
-            self._ctrl[f"solid_{entry['id']}"] = pygame.Rect(0, iy, w, self.ITEM_H)
+            self._ctrl[f"item_{idx}"] = pygame.Rect(0, iy, w, self.ITEM_H)
+
+        if self.tab == "blueprints" and not items:
+            t = self._font_s.render("No blueprints found", True, (120, 130, 145))
+            surf.blit(t, (self.PAD, y + 8))
 
         # Divider at bottom
         pygame.draw.line(surf, (40, 44, 58), (0, h-1), (w, h-1))
         return surf
 
-    def handle_event(self, ev, x_off=0, y_off=0) -> tuple[bool, Optional[str]]:
-        """Returns (consumed, selected_id_or_None)."""
+    def handle_event(self, ev, x_off=0, y_off=0) -> tuple[bool, Optional[dict]]:
+        """Returns (consumed, selection_event_or_None)."""
         if ev.type == pygame.MOUSEWHEEL:
             mx, my = pygame.mouse.get_pos()
             if x_off <= mx < x_off + self.PANEL_W:
@@ -334,8 +396,8 @@ class _SolidPickerPanel(_FabPanel):
             mx, my = ev.pos
             lx, ly = mx - x_off, my - y_off
             self._hover = -1
-            for idx, entry in enumerate(self.palette):
-                iy = 20 + idx * self.ITEM_H - self._scroll
+            for idx, _entry in enumerate(self._active_entries()):
+                iy = 42 + idx * self.ITEM_H - self._scroll
                 r  = pygame.Rect(0, iy, self.PANEL_W, self.ITEM_H)
                 if r.collidepoint(lx, ly):
                     self._hover = idx
@@ -344,11 +406,24 @@ class _SolidPickerPanel(_FabPanel):
             mx, my = ev.pos
             lx, ly = mx - x_off, my - y_off
             if 0 <= lx < self.PANEL_W:
-                for entry in self.palette:
-                    r = self._ctrl.get(f"solid_{entry['id']}")
+                if (self._ctrl.get("tab_shapes") and self._ctrl["tab_shapes"].collidepoint(lx, ly)):
+                    self.tab = "shape_primitives"
+                    self._scroll = 0
+                    return True, None
+                if (self._ctrl.get("tab_blueprints") and self._ctrl["tab_blueprints"].collidepoint(lx, ly)):
+                    self.tab = "blueprints"
+                    self._scroll = 0
+                    return True, None
+                items = self._active_entries()
+                for idx, entry in enumerate(items):
+                    r = self._ctrl.get(f"item_{idx}")
                     if r and r.collidepoint(lx, ly):
                         self.selected = entry['id']
-                        return True, entry['id']
+                        return True, {
+                            "id": entry.get("id"),
+                            "kind": entry.get("kind", "solid"),
+                            "path": entry.get("path", ""),
+                        }
                 return True, None
         return False, None
 
@@ -372,6 +447,34 @@ class _SymmetryPanel(_FabPanel):
         sym  = ws.symmetry
         y    = 0
 
+        # ── Process tabs ─────────────────────────────────────────────────────
+        y = self._section(surf, y, "  FABRICATION")
+        y = self._toggle_row(surf, y,
+            [
+                ("tab_milling", "Mill"),
+                ("tab_drilling", "Drill"),
+                ("tab_subtractive", "Cut"),
+            ],
+            f"tab_{ws.process_tab}" if ws.process_tab in ("milling", "drilling", "subtractive") else "")
+        y = self._toggle_row(surf, y,
+            [
+                ("tab_additive", "Add"),
+                ("tab_beveling", "Bevel"),
+                ("tab_assembling", "Assemble"),
+            ],
+            f"tab_{ws.process_tab}" if ws.process_tab in ("additive", "beveling", "assembling") else "")
+
+        y = self._label(surf, y, f"Gimbal pan/tilt: {ws.gimbal[0]:+.0f} / {ws.gimbal[1]:+.0f} deg")
+        y = self._toggle_row(surf, y,
+            [("g_pan_l", "Pan-"), ("g_pan_r", "Pan+"), ("g_tilt_l", "Tilt-"), ("g_tilt_r", "Tilt+")],
+            "")
+        y = self._button(surf, y, "g_reset", "Reset Gimbal")
+
+        y = self._label(surf, y, f"Snap: {'ON' if ws.snap_enabled else 'OFF'}  step {ws.snap_angle_deg:.0f} deg")
+        y = self._toggle_row(surf, y,
+            [("snap_toggle", "Toggle"), ("snap_5", "5"), ("snap_15", "15"), ("snap_30", "30")],
+            "")
+
         # ── Symmetry section ──────────────────────────────────────────────────
         y = self._section(surf, y, "  SYMMETRY")
         y = self._label(surf, y, "Mode")
@@ -394,6 +497,15 @@ class _SymmetryPanel(_FabPanel):
         # ── Actions ───────────────────────────────────────────────────────────
         y = self._section(surf, y, "  BUILD")
 
+        if ws.process_tab in ("drilling", "subtractive"):
+            y = self._button(surf, y, "op_drill", "Drill Cut (face)")
+        if ws.process_tab in ("milling", "subtractive"):
+            y = self._button(surf, y, "op_mill", "Mill Plane Cut")
+        if ws.process_tab == "beveling":
+            y = self._button(surf, y, "op_bevel", "Tag Bevel Step")
+        if ws.process_tab == "assembling":
+            y = self._button(surf, y, "op_assemble", "Assemble Preview")
+
         if mode == WorkspaceMode.PLACED:
             y = self._button(surf, y, "confirm", "[ OK ] Confirm")
             y = self._button(surf, y, "cancel_place", "[  X ] Cancel")
@@ -406,12 +518,22 @@ class _SymmetryPanel(_FabPanel):
 
         y += 10
         y = self._section(surf, y, "  STORE")
+        y = self._button(surf, y, "import_blueprint", "Import Latest Blueprint")
+        y = self._button(surf, y, "replay_blueprint", "Replay Blueprint")
         if mode == WorkspaceMode.IDLE and ws.built_mesh is not None:
             y = self._button(surf, y, "review", "Review Build")
         if mode == WorkspaceMode.REVIEW:
             y = self._button(surf, y, "store",  "[+] Store to Inventory")
+            y = self._button(surf, y, "export_blueprint", "Export Blueprint")
             y = self._button(surf, y, "clear",  "[x] Clear Build")
             y = self._button(surf, y, "exit_review", "< Back")
+
+        if ws.last_export_path:
+            y = self._label(surf, y, "Exported:")
+            y = self._label(surf, y, f" {ws.last_export_path}")
+        if ws.last_import_path:
+            y = self._label(surf, y, "Imported:")
+            y = self._label(surf, y, f" {ws.last_import_path}")
 
         # ── Inventory ─────────────────────────────────────────────────────────
         if ws.inventory:
@@ -440,6 +562,43 @@ class _SymmetryPanel(_FabPanel):
             r = self._ctrl.get(key)
             return r is not None and r.collidepoint(lx, ly)
 
+        for tab in ("milling", "drilling", "subtractive", "additive", "beveling", "assembling"):
+            if _hit(f"tab_{tab}"):
+                ws.set_process_tab(tab)
+                return True
+
+        if _hit("g_pan_l"): ws.adjust_gimbal(-ws.snap_angle_deg, 0.0); return True
+        if _hit("g_pan_r"): ws.adjust_gimbal(+ws.snap_angle_deg, 0.0); return True
+        if _hit("g_tilt_l"): ws.adjust_gimbal(0.0, -ws.snap_angle_deg); return True
+        if _hit("g_tilt_r"): ws.adjust_gimbal(0.0, +ws.snap_angle_deg); return True
+        if _hit("g_reset"): ws.reset_gimbal(); return True
+
+        if _hit("snap_toggle"): ws.set_snap(enabled=(not ws.snap_enabled)); return True
+        if _hit("snap_5"): ws.set_snap(angle_deg=5.0); return True
+        if _hit("snap_15"): ws.set_snap(angle_deg=15.0); return True
+        if _hit("snap_30"): ws.set_snap(angle_deg=30.0); return True
+
+        if _hit("op_drill"):
+            if ws.hover_face >= 0:
+                c = ws.active_mesh.face_center(ws.hover_face)
+            else:
+                c = ws.active_mesh.verts.mean(axis=0)
+            ws.apply_subtractive_sphere_cut(c, max(0.08, ws.snap_distance_m * 1.5))
+            return True
+
+        if _hit("op_mill"):
+            z_mid = float(np.median(ws.active_mesh.verts[:, 2]))
+            ws.apply_subtractive_plane_cut(axis="z", offset=z_mid, keep_negative=True)
+            return True
+
+        if _hit("op_bevel"):
+            ws.mark_bevel(amount_m=max(0.002, ws.snap_distance_m * 0.5))
+            return True
+
+        if _hit("op_assemble"):
+            ws.enter_review()
+            return True
+
         if _hit("sym_none"):      ws.set_symmetry("none");      return True
         if _hit("sym_bilateral"): ws.set_symmetry("bilateral"); return True
         if _hit("sym_radial"):    ws.set_symmetry("radial");    return True
@@ -452,8 +611,17 @@ class _SymmetryPanel(_FabPanel):
         if _hit("confirm"):      ws.confirm_placement(); return True
         if _hit("cancel_place"): ws.cancel_placement(); return True
         if _hit("undo"):         ws.undo(); return True
+        if _hit("import_blueprint"):
+            ws.import_latest_blueprint()
+            return True
+        if _hit("replay_blueprint"):
+            ws.replay_blueprint()
+            return True
         if _hit("review"):       ws.enter_review(); return True
         if _hit("store"):        ws.store_to_inventory(); return True
+        if _hit("export_blueprint"):
+            ws.export_fabrication_blueprint()
+            return True
         if _hit("clear"):        ws.clear_build(); return True
         if _hit("exit_review"):  ws.exit_review(); return True
 
@@ -510,7 +678,16 @@ class FabricatorStation:
 
     def __init__(self, ws_cfg: dict, palette: list):
         self.workspace = FabricatorWorkspace(ws_cfg)
-        self._palette  = palette
+        base_palette = self.workspace.catalog_items()
+        if palette:
+            by_id = {str(it.get("id", "")): dict(it) for it in base_palette}
+            for it in palette:
+                iid = str(it.get("id", ""))
+                if iid:
+                    by_id[iid] = dict(it)
+            self._palette = list(by_id.values())
+        else:
+            self._palette = base_palette
         self._layout   = ws_cfg.get("layout", {})
         self.LEFT_W    = int(self._layout.get("left_panel_width",  210))
         self.RIGHT_W   = int(self._layout.get("right_panel_width", 220))
@@ -523,11 +700,29 @@ class FabricatorStation:
         self._solid_a  = float(display_cfg.get("solid_alpha",  0.80))
         self._bg       = display_cfg.get("bg_color",           [0.02, 0.03, 0.06])
         self._wf_w     = float(display_cfg.get("wireframe_width", 1.4))
+        self._blueprint_dir = ws_cfg.get(
+            "blueprint_library_dir",
+            "configs/duty_stations/fabricator/blueprints",
+        )
+        self._programmatic_dir = ws_cfg.get(
+            "programmatic_blueprint_dir",
+            "configs/duty_stations/fabricator/programmatic_blueprints",
+        )
 
         self.ws_cam = _WsCam(ws_cfg.get("camera", {}))
 
-        self._left_panel  = _SolidPickerPanel(palette)
+        self._left_panel  = _SolidPickerPanel(self._palette, blueprint_dir=self._blueprint_dir)
         self._right_panel = _SymmetryPanel(self.workspace)
+
+        # Center-region mode tabs and programmatic blueprint state.
+        self._center_mode = "workspace"  # workspace | programmatic
+        self._center_tab_rects: dict[str, pygame.Rect] = {}
+        self._prog_blueprints: list[ProgrammaticBlueprint] = []
+        self._prog_selected_id: str = ""
+        self._prog_values_by_id: dict[str, dict[str, Any]] = {}
+        self._prog_library_rects: dict[str, pygame.Rect] = {}
+        self._prog_knob_rects: dict[str, dict[str, pygame.Rect]] = {}
+        self._refresh_programmatic_library()
 
         # GL state
         self._gl_ready = False
@@ -536,9 +731,13 @@ class FabricatorStation:
         self._edge_vao = self._edge_vbo = self._edge_n = None
         self._hud_vao  = self._hud_vbo  = None
         self._ltex = self._rtex = 0   # panel GL textures
+        self._ctab_tex = self._cprog_l_tex = self._cprog_r_tex = 0
         self._mesh_dirty = True
         self._dragging   = False
         self._last_mouse = (0, 0)
+        self._hud_visible = False
+        self._last_win_w = 1280
+        self._last_win_h = 720
 
     @classmethod
     def from_yaml(cls, ws_path: str, palette_path: str) -> "FabricatorStation":
@@ -546,6 +745,164 @@ class FabricatorStation:
         with open(ws_path,      encoding='utf-8') as f: ws  = _y.safe_load(f) or {}
         with open(palette_path, encoding='utf-8') as f: pal = _y.safe_load(f) or {}
         return cls(ws, pal.get("solids", []))
+
+    def _refresh_programmatic_library(self):
+        self._prog_blueprints = load_programmatic_blueprints(self._programmatic_dir)
+        if self._prog_blueprints and (self._prog_selected_id not in {bp.id for bp in self._prog_blueprints}):
+            self._prog_selected_id = self._prog_blueprints[0].id
+        for bp in self._prog_blueprints:
+            if bp.id not in self._prog_values_by_id:
+                self._prog_values_by_id[bp.id] = _default_programmatic_knob_values(bp)
+
+    def _selected_programmatic_blueprint(self) -> Optional[ProgrammaticBlueprint]:
+        for bp in self._prog_blueprints:
+            if bp.id == self._prog_selected_id:
+                return bp
+        return None
+
+    def _center_layout(self, win_w: int, win_h: int) -> dict[str, int]:
+        cw = win_w - self.LEFT_W - self.RIGHT_W
+        tab_h = 24
+        prog_lw = 0
+        prog_rw = 0
+        if self._center_mode == "programmatic":
+            prog_lw = max(180, min(260, cw // 3))
+            prog_rw = max(200, min(300, cw // 3))
+            if prog_lw + prog_rw > max(0, cw - 140):
+                over = prog_lw + prog_rw - (cw - 140)
+                cut_l = min(prog_lw - 120, over // 2)
+                cut_r = min(prog_rw - 140, over - cut_l)
+                prog_lw -= max(0, cut_l)
+                prog_rw -= max(0, cut_r)
+        view_x = self.LEFT_W + prog_lw
+        view_w = max(120, cw - prog_lw - prog_rw)
+        return {
+            "cw": cw,
+            "tab_h": tab_h,
+            "prog_lw": prog_lw,
+            "prog_rw": prog_rw,
+            "view_x": view_x,
+            "view_w": view_w,
+            "view_h": max(1, win_h),
+        }
+
+    def _render_center_tabs(self, cw: int, ch: int) -> pygame.Surface:
+        surf = pygame.Surface((cw, ch), pygame.SRCALPHA)
+        self._center_tab_rects = {}
+        tab_h = 24
+        pygame.draw.rect(surf, (22, 25, 34, 230), pygame.Rect(0, 0, cw, tab_h))
+        tabs = [("workspace", "WORKSPACE"), ("programmatic", "PROGRAMMATIC")]
+        x = 8
+        for key, label in tabs:
+            tw = 136 if key == "programmatic" else 104
+            r = pygame.Rect(x, 3, tw, tab_h - 6)
+            self._center_tab_rects[key] = r
+            active = (self._center_mode == key)
+            bg = (40, 90, 160) if active else (30, 34, 48)
+            pygame.draw.rect(surf, bg, r, border_radius=3)
+            pygame.draw.rect(surf, (70, 80, 100), r, 1, border_radius=3)
+            t = self._left_panel._font_s.render(label, True, (220, 230, 245) if active else (150, 160, 180))
+            surf.blit(t, (r.x + (r.w - t.get_width()) // 2, r.y + (r.h - t.get_height()) // 2))
+            x += tw + 6
+        return surf
+
+    def _render_programmatic_library_panel(self, w: int, h: int) -> pygame.Surface:
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill((18, 20, 28, 230))
+        self._prog_library_rects = {}
+        y = 0
+        y = self._left_panel._section(surf, y, "  PROGRAMMATIC LIBRARY", (28, 32, 44))
+        y = self._left_panel._button(surf, y, "prog_refresh", "Refresh", w=max(80, w - 12))
+        for bp in self._prog_blueprints:
+            iy = y
+            r = pygame.Rect(0, iy, w, 44)
+            sel = (bp.id == self._prog_selected_id)
+            bg = (38, 55, 90) if sel else (22, 25, 35)
+            pygame.draw.rect(surf, bg, r)
+            if sel:
+                pygame.draw.rect(surf, (80, 130, 220), pygame.Rect(0, iy, 3, 44))
+            t1 = self._left_panel._font.render(bp.label, True, (210, 220, 230))
+            t2 = self._left_panel._font_s.render(bp.id, True, (120, 130, 145))
+            surf.blit(t1, (8, iy + 6))
+            surf.blit(t2, (8, iy + 24))
+            self._prog_library_rects[bp.id] = r
+            y += 44
+            if y > h - 12:
+                break
+        if not self._prog_blueprints:
+            t = self._left_panel._font_s.render("No programmatic blueprints", True, (120, 130, 145))
+            surf.blit(t, (8, y + 4))
+        return surf
+
+    def _knob_value_text(self, spec: ProgrammaticKnobSpec, value: Any) -> str:
+        if spec.dtype == "bool":
+            return "ON" if bool(value) else "OFF"
+        if spec.dtype == "choice":
+            return str(value)
+        if spec.dtype == "int":
+            return f"{int(round(float(value)))}"
+        try:
+            fv = float(value)
+            if "%" in spec.fmt:
+                return spec.fmt % fv
+            return f"{fv:{spec.fmt}}"
+        except Exception:
+            try:
+                return f"{float(value):.3f}"
+            except Exception:
+                return str(value)
+
+    def _render_programmatic_knob_panel(self, w: int, h: int) -> pygame.Surface:
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        surf.fill((18, 20, 28, 230))
+        self._prog_knob_rects = {}
+        y = 0
+        y = self._left_panel._section(surf, y, "  PARAMETERS", (28, 32, 44))
+        bp = self._selected_programmatic_blueprint()
+        if bp is None:
+            t = self._left_panel._font_s.render("Select a blueprint", True, (140, 150, 160))
+            surf.blit(t, (8, y + 8))
+            return surf
+
+        vals = self._prog_values_by_id.setdefault(bp.id, _default_programmatic_knob_values(bp))
+        for spec in bp.knobspec:
+            if y > h - 32:
+                break
+            row = pygame.Rect(0, y, w, 34)
+            pygame.draw.rect(surf, (22, 25, 35), row)
+            label = self._left_panel._font_s.render(spec.label, True, (205, 215, 225))
+            value = self._left_panel._font_s.render(self._knob_value_text(spec, vals.get(spec.name, spec.default)), True, (140, 170, 200))
+            surf.blit(label, (8, y + 5))
+            surf.blit(value, (8, y + 18))
+
+            ctrl: dict[str, pygame.Rect] = {}
+            if spec.dtype in ("float", "int"):
+                r_minus = pygame.Rect(w - 64, y + 7, 26, 20)
+                r_plus = pygame.Rect(w - 34, y + 7, 26, 20)
+                pygame.draw.rect(surf, (45, 50, 65), r_minus); pygame.draw.rect(surf, (100, 110, 130), r_minus, 1)
+                pygame.draw.rect(surf, (45, 50, 65), r_plus); pygame.draw.rect(surf, (100, 110, 130), r_plus, 1)
+                tm = self._left_panel._font.render("-", True, (210, 220, 230))
+                tp = self._left_panel._font.render("+", True, (210, 220, 230))
+                surf.blit(tm, (r_minus.x + (r_minus.w - tm.get_width()) // 2, r_minus.y + (r_minus.h - tm.get_height()) // 2 - 1))
+                surf.blit(tp, (r_plus.x + (r_plus.w - tp.get_width()) // 2, r_plus.y + (r_plus.h - tp.get_height()) // 2 - 1))
+                ctrl["minus"] = r_minus
+                ctrl["plus"] = r_plus
+            else:
+                r_cycle = pygame.Rect(w - 88, y + 7, 80, 20)
+                pygame.draw.rect(surf, (45, 50, 65), r_cycle); pygame.draw.rect(surf, (100, 110, 130), r_cycle, 1)
+                tc = self._left_panel._font_s.render("Cycle", True, (210, 220, 230))
+                surf.blit(tc, (r_cycle.x + (r_cycle.w - tc.get_width()) // 2, r_cycle.y + (r_cycle.h - tc.get_height()) // 2))
+                ctrl["cycle"] = r_cycle
+            self._prog_knob_rects[spec.name] = ctrl
+            y += 34
+
+        y += 6
+        r_print = pygame.Rect(8, y, max(90, w - 16), 24)
+        pygame.draw.rect(surf, (70, 100, 150), r_print); pygame.draw.rect(surf, (100, 120, 160), r_print, 1)
+        tprint = self._left_panel._font.render("Print Item", True, (220, 230, 240))
+        surf.blit(tprint, (r_print.x + (r_print.w - tprint.get_width()) // 2, r_print.y + (r_print.h - tprint.get_height()) // 2))
+        self._prog_knob_rects["__print__"] = {"click": r_print}
+        return surf
 
     # ── GL lifecycle ──────────────────────────────────────────────────────────
 
@@ -579,6 +936,17 @@ class FabricatorStation:
 
     # ── Per-frame ─────────────────────────────────────────────────────────────
 
+    def show_hud(self, visible: bool) -> None:
+        self._hud_visible = bool(visible)
+
+    def render_hud(self, win_w: int, win_h: int) -> None:
+        if not self._hud_visible:
+            return
+        self._last_win_w = int(win_w)
+        self._last_win_h = int(win_h)
+        self.tick(0.0)
+        self.draw(win_w, win_h)
+
     def tick(self, dt: float):
         self.ws_cam.tick()
         if self._mesh_dirty and self._gl_ready:
@@ -588,18 +956,25 @@ class FabricatorStation:
 
     def draw(self, win_w: int, win_h: int):
         if not self._gl_ready: return
-        cw = win_w - self.LEFT_W - self.RIGHT_W
+        lay = self._center_layout(win_w, win_h)
+        cw = lay["cw"]
+        tab_h = lay["tab_h"]
+        prog_lw = lay["prog_lw"]
+        prog_rw = lay["prog_rw"]
+        view_x = lay["view_x"]
+        view_w = lay["view_w"]
+        view_h = lay["view_h"]
 
         # ── 3D workspace viewport ─────────────────────────────────────────────
         glEnable(GL_SCISSOR_TEST)
-        glScissor(self.LEFT_W, 0, cw, win_h)
+        glScissor(view_x, 0, view_w, view_h)
         bg = self._bg
         glClearColor(bg[0], bg[1], bg[2], 1.0)
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         glDisable(GL_SCISSOR_TEST)
-        glViewport(self.LEFT_W, 0, cw, win_h)
+        glViewport(view_x, 0, view_w, view_h)
 
-        aspect = cw / max(1, win_h)
+        aspect = view_w / max(1, view_h)
         MVP = self.ws_cam.mvp(aspect)
         MV  = self.ws_cam.mv()
         lv  = np.array([0.6, 0.8, 0.5], np.float32)
@@ -663,6 +1038,25 @@ class FabricatorStation:
         self._draw_panel_tex(self._rtex, win_w - self.RIGHT_W, 0,
                              self.RIGHT_W, win_h, win_w, win_h)
 
+        # ── Center tab bar and programmatic side panels ─────────────────────
+        ctab = self._render_center_tabs(cw, tab_h)
+        if self._ctab_tex:
+            glDeleteTextures([self._ctab_tex])
+        self._ctab_tex = _surface_to_tex(ctab)
+        self._draw_panel_tex(self._ctab_tex, self.LEFT_W, 0, cw, tab_h, win_w, win_h)
+
+        if self._center_mode == "programmatic":
+            lp = self._render_programmatic_library_panel(prog_lw, win_h - tab_h)
+            rp = self._render_programmatic_knob_panel(prog_rw, win_h - tab_h)
+            if self._cprog_l_tex:
+                glDeleteTextures([self._cprog_l_tex])
+            if self._cprog_r_tex:
+                glDeleteTextures([self._cprog_r_tex])
+            self._cprog_l_tex = _surface_to_tex(lp)
+            self._cprog_r_tex = _surface_to_tex(rp)
+            self._draw_panel_tex(self._cprog_l_tex, self.LEFT_W, tab_h, prog_lw, win_h - tab_h, win_w, win_h)
+            self._draw_panel_tex(self._cprog_r_tex, self.LEFT_W + cw - prog_rw, tab_h, prog_rw, win_h - tab_h, win_w, win_h)
+
     def _set_mvp(self, prog, mvp, mv):
         loc = glGetUniformLocation(prog, b'uMVP')
         if loc >= 0: glUniformMatrix4fv(loc, 1, GL_TRUE, mvp)
@@ -696,17 +1090,98 @@ class FabricatorStation:
         glBindVertexArray(0)
         glUseProgram(0)
 
+    def _adjust_programmatic_knob(self, spec: ProgrammaticKnobSpec, direction: int):
+        bp = self._selected_programmatic_blueprint()
+        if bp is None:
+            return
+        vals = self._prog_values_by_id.setdefault(bp.id, _default_programmatic_knob_values(bp))
+        cur = vals.get(spec.name, spec.default)
+        step = spec.step
+        if spec.dtype == "int":
+            try:
+                nv = int(round(float(cur))) + int(round(float(step))) * int(direction)
+            except Exception:
+                nv = int(spec.default)
+            if spec.low is not None:
+                nv = max(int(round(float(spec.low))), nv)
+            if spec.high is not None:
+                nv = min(int(round(float(spec.high))), nv)
+            vals[spec.name] = nv
+            return
+        try:
+            nv = float(cur) + float(step) * float(direction)
+        except Exception:
+            nv = float(spec.default)
+        if spec.low is not None:
+            nv = max(float(spec.low), nv)
+        if spec.high is not None:
+            nv = min(float(spec.high), nv)
+        vals[spec.name] = nv
+
+    def _cycle_programmatic_knob(self, spec: ProgrammaticKnobSpec):
+        bp = self._selected_programmatic_blueprint()
+        if bp is None:
+            return
+        vals = self._prog_values_by_id.setdefault(bp.id, _default_programmatic_knob_values(bp))
+        cur = vals.get(spec.name, spec.default)
+        if spec.dtype == "bool":
+            vals[spec.name] = not bool(cur)
+            return
+        if spec.dtype == "choice" and spec.choices:
+            choices = list(spec.choices)
+            try:
+                i = choices.index(cur)
+                vals[spec.name] = choices[(i + 1) % len(choices)]
+            except Exception:
+                vals[spec.name] = choices[0]
+
+    def _print_selected_programmatic_blueprint(self):
+        bp = self._selected_programmatic_blueprint()
+        if bp is None:
+            return
+        vals = dict(self._prog_values_by_id.get(bp.id, _default_programmatic_knob_values(bp)))
+        mesh = _build_programmatic_mesh(bp, vals)
+        if mesh is None:
+            return
+        self.workspace.pick_generated_mesh(bp.id, mesh)
+        self._center_mode = "workspace"
+        self._mesh_dirty = True
+
     # ── Event handling ────────────────────────────────────────────────────────
 
-    def handle_event(self, ev, win_w: int, win_h: int) -> bool:
+    def handle_event(self, ev, win_w: int | None = None,
+                     win_h: int | None = None) -> bool:
+        if not self._hud_visible:
+            return False
+        if win_w is None:
+            win_w = self._last_win_w
+        if win_h is None:
+            win_h = self._last_win_h
+        self._last_win_w = int(win_w)
+        self._last_win_h = int(win_h)
         ws  = self.workspace
-        cw  = win_w - self.LEFT_W - self.RIGHT_W
+        lay = self._center_layout(win_w, win_h)
+        cw = lay["cw"]
+        tab_h = lay["tab_h"]
+        prog_lw = lay["prog_lw"]
+        prog_rw = lay["prog_rw"]
+        view_x = lay["view_x"]
+        view_w = lay["view_w"]
 
         # Left panel
-        consumed, picked_id = self._left_panel.handle_event(ev, x_off=0)
-        if picked_id is not None:
-            ws.pick_solid(picked_id)
-            self._mesh_dirty = True
+        consumed, picked = self._left_panel.handle_event(ev, x_off=0)
+        if picked is not None:
+            kind = str(picked.get("kind", "solid")) if isinstance(picked, dict) else "solid"
+            if kind == "blueprint":
+                path = str(picked.get("path", "")) if isinstance(picked, dict) else ""
+                if path:
+                    ws.replay_blueprint(path)
+                    self._mesh_dirty = True
+            else:
+                item_id = str(picked.get("id", "")) if isinstance(picked, dict) else ""
+                if item_id:
+                    ws.pick_catalog_item(item_id)
+                    self._mesh_dirty = True
         if consumed:
             return True
 
@@ -715,9 +1190,64 @@ class FabricatorStation:
             self._mesh_dirty = True
             return True
 
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and hasattr(ev, "pos"):
+            mx, my = ev.pos
+            # Center tab bar
+            if self.LEFT_W <= mx < self.LEFT_W + cw and 0 <= my < tab_h:
+                lx = mx - self.LEFT_W
+                for key, rect in self._center_tab_rects.items():
+                    if rect.collidepoint(lx, my):
+                        self._center_mode = key
+                        if key == "programmatic":
+                            self._refresh_programmatic_library()
+                        self._mesh_dirty = True
+                        return True
+
+            if self._center_mode == "programmatic":
+                # Center-left programmatic library panel
+                if self.LEFT_W <= mx < self.LEFT_W + prog_lw and tab_h <= my < win_h:
+                    lx = mx - self.LEFT_W
+                    ly = my - tab_h
+                    if self._left_panel._buttons.get("prog_refresh", pygame.Rect(0,0,0,0)).collidepoint(lx, ly):
+                        self._refresh_programmatic_library()
+                        self._mesh_dirty = True
+                        return True
+                    for bp_id, rect in self._prog_library_rects.items():
+                        if rect.collidepoint(lx, ly):
+                            self._prog_selected_id = bp_id
+                            bp = self._selected_programmatic_blueprint()
+                            if bp is not None and bp.id not in self._prog_values_by_id:
+                                self._prog_values_by_id[bp.id] = _default_programmatic_knob_values(bp)
+                            self._mesh_dirty = True
+                            return True
+
+                # Center-right knobs panel
+                right_x = self.LEFT_W + cw - prog_rw
+                if right_x <= mx < self.LEFT_W + cw and tab_h <= my < win_h:
+                    lx = mx - right_x
+                    ly = my - tab_h
+                    bp = self._selected_programmatic_blueprint()
+                    if bp is not None:
+                        for spec in bp.knobspec:
+                            ctrl = self._prog_knob_rects.get(spec.name, {})
+                            if spec.dtype in ("float", "int"):
+                                if "minus" in ctrl and ctrl["minus"].collidepoint(lx, ly):
+                                    self._adjust_programmatic_knob(spec, -1)
+                                    return True
+                                if "plus" in ctrl and ctrl["plus"].collidepoint(lx, ly):
+                                    self._adjust_programmatic_knob(spec, +1)
+                                    return True
+                            else:
+                                if "cycle" in ctrl and ctrl["cycle"].collidepoint(lx, ly):
+                                    self._cycle_programmatic_knob(spec)
+                                    return True
+                        if self._prog_knob_rects.get("__print__", {}).get("click", pygame.Rect(0,0,0,0)).collidepoint(lx, ly):
+                            self._print_selected_programmatic_blueprint()
+                            return True
+
         # Workspace events (middle region)
         mx = getattr(ev, 'pos', (0,0))[0] if hasattr(ev, 'pos') else 0
-        if not (self.LEFT_W <= mx < self.LEFT_W + cw):
+        if not (view_x <= mx < view_x + view_w):
             return False
 
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
@@ -732,7 +1262,7 @@ class FabricatorStation:
             lx, ly = ev.pos
             dx = lx - self._last_mouse[0]; dy = ly - self._last_mouse[1]
             if abs(dx) < 4 and abs(dy) < 4:
-                self._pick_face(lx - self.LEFT_W, ly, cw, win_h)
+                self._pick_face(lx - view_x, ly, view_w, win_h)
             self._dragging = False
             return True
 
@@ -740,13 +1270,17 @@ class FabricatorStation:
             if self._dragging:
                 dx = ev.pos[0] - self._last_mouse[0]
                 dy = ev.pos[1] - self._last_mouse[1]
-                self.ws_cam.orbit(dx * 0.35, -dy * 0.28)
+                mods = pygame.key.get_mods()
+                if mods & pygame.KMOD_SHIFT:
+                    ws.adjust_gimbal(dx * 0.2, -dy * 0.2)
+                else:
+                    self.ws_cam.orbit(dx * 0.35, -dy * 0.28)
                 self._last_mouse = ev.pos
                 return True
             # Hover face detection
             lx, ly = ev.pos
-            if self.LEFT_W <= lx < self.LEFT_W + cw:
-                fi = self._hit_face(lx - self.LEFT_W, ly, cw, win_h)
+            if view_x <= lx < view_x + view_w:
+                fi = self._hit_face(lx - view_x, ly, view_w, win_h)
                 prev = ws.hover_face
                 ws.hover_over_face(fi)
                 if fi != prev:

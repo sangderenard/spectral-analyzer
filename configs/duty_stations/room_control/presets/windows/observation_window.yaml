@@ -1,0 +1,10 @@
+id: observation_window
+label: Observation Window
+category: windows
+kind: opening
+mesh_type: marker_box
+surfaces: [north]
+footprint_xy: [2, 1]
+level_span: 2
+color_rgb: [0.34, 0.52, 0.66]
+summary: Two-wide observation window inset.

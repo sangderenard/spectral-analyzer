@@ -16,6 +16,7 @@ Available
   triangular_prism()
   square_pyramid()
   triangular_bipyramid()
+    wedge()
 """
 from __future__ import annotations
 
@@ -218,6 +219,34 @@ def triangular_bipyramid() -> DECMesh:
     return _build(verts, faces)
 
 
+def wedge() -> DECMesh:
+    """Right wedge (triangular prism) with rectangular footprint and sloped top."""
+    x0, x1 = -1.0, 1.0
+    y0, y1 = -1.0, 1.0
+    z0 = -1.0
+    z_top_front = -0.2
+    z_top_back = 1.0
+    verts = np.array([
+        (x0, y0, z0),
+        (x1, y0, z0),
+        (x1, y1, z0),
+        (x0, y1, z0),
+        (x0, y0, z_top_front),
+        (x1, y0, z_top_front),
+        (x1, y1, z_top_back),
+        (x0, y1, z_top_back),
+    ], np.float64)
+    faces = [
+        [0, 1, 2, 3],
+        [4, 7, 6, 5],
+        [0, 4, 5, 1],
+        [1, 5, 6, 2],
+        [2, 6, 7, 3],
+        [3, 7, 4, 0],
+    ]
+    return _build(verts, faces)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Registry
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,6 +260,7 @@ _REGISTRY: dict[str, callable] = {
     "triangular_prism":   triangular_prism,
     "square_pyramid":     square_pyramid,
     "triangular_bipyramid": triangular_bipyramid,
+    "wedge":              wedge,
 }
 
 

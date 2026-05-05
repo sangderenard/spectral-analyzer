@@ -861,15 +861,34 @@ def _load_material_yaml(name: str) -> np.ndarray:
         [13] remit_profile_idx, (float(int), -1 = none)
         [14] _pad
         [15] reactive_shift_hz               # Stokes shift; 0 = non-reactive
-    Falls back to a neutral diffuse grey (all profile/flag fields zeroed).
+    Falls back to a hazard-yellow mildly emissive material so missing/failed
+    material registrations are immediately visible in both C and GL paths.
     """
     _FALLBACK = np.zeros(16, np.float32)
-    # Neutral matte "brutalist gray" fallback so missing materials never read as glass.
-    _FALLBACK[:11] = [0.40, 0.90, 0.05,  0.40, 0.90, 0.05,  0.30, 0.29, 0.27,  1.55, 1.0]
+    # Hazard fallback: high-visibility yellow with matte response.
+    _FALLBACK[:11] = [0.34, 0.86, 0.10,  0.34, 0.86, 0.10,  0.95, 0.82, 0.08,  1.52, 1.0]
+    # Profile-index slots: -1 means "no profile bound" (sentinel).  The bake
+    # in MaterialDatabase.build_tensors() skips rows whose profile_idx < 0.
+    _FALLBACK[12] = -1.0   # emit_profile_idx
+    _FALLBACK[13] = -1.0   # remit_profile_idx
+    _FALLBACK[14] = -1.0   # color_profile_idx
     d = _load_yaml_file(_config_path("materials", f"{name}.yaml"))
     if not d:
         if _MAT_DB is not None:
-            _MAT_DB.register_mat11(name, _FALLBACK[:11])
+            try:
+                from material_db import EmissionProfileDatabase as _EPDB
+                _ep = _EPDB.instance()
+                _emit_idx = int(_ep.index_of("missing_material_hazard"))
+                _flags = np.uint32(1)  # MAT_FLAG_EMISSIVE
+                _fb = _FALLBACK.copy()
+                _fb[11] = np.frombuffer(np.array([_flags], np.uint32).tobytes(), np.float32)[0]
+                _fb[12] = float(_emit_idx)
+                _fb[13] = -1.0
+                _fb[14] = -1.0  # color_profile_idx (sentinel: none)
+                _fb[15] = 0.0
+                _MAT_DB.register_from_mat16(name, _fb)
+            except Exception:
+                _MAT_DB.register_from_mat16(name, _FALLBACK)
         return _FALLBACK
     refl  = float(d.get("reflectivity", 0.5))
     diff  = float(d.get("diffusion",    0.0))
@@ -878,8 +897,45 @@ def _load_material_yaml(name: str) -> np.ndarray:
     ior   = float(d.get("ior",     1.5))
     opac  = float(d.get("opacity", 1.0))
     # Optional emission profile indices
-    emit_idx  = int(d.get("emit_profile_idx",  -1))
-    remit_idx = int(d.get("remit_profile_idx", -1))
+    # Prefer emit_profile_name (resolved to integer via EmissionProfileDatabase)
+    # over a raw emit_profile_idx so YAML authors never hard-code integers.
+    _ep_name = d.get("emit_profile_name", None)
+    if _ep_name is not None:
+        from material_db import EmissionProfileDatabase as _EPDB
+        _ep_db_inst = _EPDB.instance()
+        if _ep_name in _ep_db_inst:
+            emit_idx = _ep_db_inst.index_of(_ep_name)
+        else:
+            emit_idx = -1
+    else:
+        emit_idx  = int(d.get("emit_profile_idx",  -1))
+    # Optional re-emission profile (frame-delayed feedback).  Resolved against
+    # the same EmissionProfileDatabase; the referenced profile is expected to
+    # be a RemissionProfile (carrying spread + response_envelope).
+    _rp_name = d.get("remit_profile_name", None)
+    if _rp_name is not None:
+        from material_db import EmissionProfileDatabase as _EPDB
+        _ep_db_inst = _EPDB.instance()
+        if _rp_name in _ep_db_inst:
+            remit_idx = _ep_db_inst.index_of(_rp_name)
+        else:
+            remit_idx = -1
+    else:
+        remit_idx = int(d.get("remit_profile_idx", -1))
+    # Optional spectral color profile (overrides albedo_rgb at bake time).
+    # Resolved exactly like emit_profile_name — looked up in the same
+    # EmissionProfileDatabase, since that DB stores all profile types and
+    # holds the prebaked (N, 3) sRGB tensor that build_tensors() reads.
+    _cp_name = d.get("color_profile_name", None)
+    if _cp_name is not None:
+        from material_db import EmissionProfileDatabase as _EPDB
+        _ep_db_inst = _EPDB.instance()
+        if _cp_name in _ep_db_inst:
+            color_idx = _ep_db_inst.index_of(_cp_name)
+        else:
+            color_idx = -1
+    else:
+        color_idx = int(d.get("color_profile_idx", -1))
     react = float(d.get("reactive_shift_hz", 0.0))
     # Derive mat_flags
     _flags = np.uint32(0)
@@ -893,10 +949,10 @@ def _load_material_yaml(name: str) -> np.ndarray:
     arr[11]  = np.frombuffer(np.array([_flags], np.uint32).tobytes(), np.float32)[0]
     arr[12]  = float(emit_idx)
     arr[13]  = float(remit_idx)
-    arr[14]  = 0.0  # _pad
+    arr[14]  = float(color_idx)   # spectral color profile (overwrites albedo at bake)
     arr[15]  = react
     if _MAT_DB is not None:
-        _MAT_DB.register_mat11(name, arr)   # full mat16 — DB extracts emissive/flag cols
+        _MAT_DB.register_from_mat16(name, arr)   # full mat16 — DB extracts emissive/flag cols
     return arr
 
 
@@ -2809,14 +2865,17 @@ void main() {
     vec3  base = gl_FrontFacing ? uColor.rgb : uInnerColor;
     float grain = 0.5 + 0.5 * sin(vPosV.x * 80.0 + vPosV.y * 31.0 + vPosV.z * 17.0);
     base *= mix(1.0, 0.82 + 0.28 * grain, uGrain);
-    // Ambient tinted by scene spectral colour; indirect ratio adds fill light
-    // in shadowed regions (simulates the environment's bounced-light term).
-    vec3  ambLight   = uAmbient * mix(vec3(1.0), uSceneRgb, 0.55);
-    float shadowFill = uSceneIndirectRatio * 0.28 * (1.0 - diff);
-    vec3  col  = base * (ambLight + (0.78 + shadowFill) * diff)
+    vec3  col  = base * (0.78 * diff)
                + mix(vec3(1.0, 0.88, 0.62), uSceneRgb, 0.30) * (uSpecStrength * spec);
-    float rim  = pow(1.0 - max(dot(N, V), 0.0), 3.0);
-    col += base * rim * mix(0.16, 0.22, uSceneIndirectRatio);
+
+    // Optional fast emissive-light proxy pass (same idea as C/base-material).
+    // uSceneIndirectRatio is the strength knob; zero disables the pass.
+    float emissivePass = clamp(uSceneIndirectRatio, 0.0, 1.0);
+    if (emissivePass > 0.0) {
+        float emissiveWrap = clamp(0.25 + 0.75 * diff, 0.0, 1.0);
+        col += base * uSceneRgb * emissivePass * (0.10 + 0.30 * emissiveWrap);
+    }
+
     FragColor  = vec4(col, uColor.a);
 }
 """
@@ -12858,14 +12917,44 @@ def main():
         # 3D-C geometry packer: pull world-space triangle soups out of the
         # leftover scene.geometry/<owner> payloads, transform to view
         # space using the active camera, compute per-tri face normals,
-        # and pack into the (verts_view, mat_ids, proj_colmajor, light_v)
-        # tuple the BaseRasterizer pybind binding expects.
+        # and pack into the (verts_view, mat_ids, proj_colmajor) tuple
+        # the BaseRasterizer pybind binding expects.
+        #
+        # No light data is produced or forwarded.  The C engine derives
+        # all illumination internally from the EMISSIVE MATERIALS attached
+        # to the rendered triangles — see base_rasterizer.cpp::br_render.
         def _pack_3d_c_geometry(_leftovers):
             try:
                 if not _leftovers or _cam_pure_matrices is None:
                     return None
                 tri_chunks = []
                 mat_chunks = []
+
+                def _resolve_mat_id(_payload: dict) -> int:
+                    # Fast integer path only: payload must carry mat_id/mat_ids.
+                    if "mat_id" in _payload:
+                        try:
+                            return int(_payload.get("mat_id", 0))
+                        except Exception:
+                            pass
+                    return 0
+
+                def _resolve_mat_ids(_payload: dict, _n_tris: int) -> np.ndarray:
+                    _mid = _payload.get("mat_ids", None)
+                    if _mid is None:
+                        return np.full((_n_tris,), _resolve_mat_id(_payload), dtype=np.int32)
+                    try:
+                        _arr = np.asarray(_mid, dtype=np.int32).reshape(-1)
+                    except Exception:
+                        return np.full((_n_tris,), _resolve_mat_id(_payload), dtype=np.int32)
+                    if _arr.shape[0] == _n_tris:
+                        return _arr.astype(np.int32, copy=False)
+                    if _arr.shape[0] > _n_tris:
+                        return _arr[:_n_tris].astype(np.int32, copy=False)
+                    _out = np.full((_n_tris,), _resolve_mat_id(_payload), dtype=np.int32)
+                    _out[:_arr.shape[0]] = _arr
+                    return _out
+
                 for _payload in _leftovers.values():
                     if not isinstance(_payload, dict):
                         continue
@@ -12878,8 +12967,8 @@ def main():
                     if _tris.ndim != 3 or _tris.shape[1:] != (3, 3) or _tris.shape[0] == 0:
                         continue
                     tri_chunks.append(_tris)
-                    _mat_id = int(_payload.get("mat_id", 0))
-                    mat_chunks.append(np.full((_tris.shape[0],), _mat_id, dtype=np.int32))
+                    _mat_ids_local = _resolve_mat_ids(_payload, int(_tris.shape[0]))
+                    mat_chunks.append(_mat_ids_local)
                 if not tri_chunks:
                     return None
                 tris_world = np.concatenate(tri_chunks, axis=0)        # (Nt, 3, 3)
@@ -12902,10 +12991,10 @@ def main():
                 tris_v = pts_v.reshape(Nt, 3, 3)
                 e1 = tris_v[:, 1, :] - tris_v[:, 0, :]
                 e2 = tris_v[:, 2, :] - tris_v[:, 0, :]
-                fn = np.cross(e1, e2).astype(np.float32)
-                fn_len = np.linalg.norm(fn, axis=1, keepdims=True)
+                fn_raw = np.cross(e1, e2).astype(np.float32)
+                fn_len = np.linalg.norm(fn_raw, axis=1, keepdims=True)
                 fn_len = np.where(fn_len > 1e-8, fn_len, 1.0)
-                fn = fn / fn_len
+                fn = fn_raw / fn_len
                 # Broadcast face normal to all 3 vertices.
                 nrm_v = np.repeat(fn, 3, axis=0).astype(np.float32)     # (Nt*3, 3)
 
@@ -12919,11 +13008,7 @@ def main():
                 # br_render parses mvp as a column-major 4x4: proj(r,c) = mvp[c*4+r]
                 proj = np.ascontiguousarray(_P.T.reshape(-1), dtype=np.float32)
 
-                # Light direction in view space (matches the GL pass).
-                light_v = np.array([0.5, 1.0, 0.6], dtype=np.float32)
-                light_v /= max(float(np.linalg.norm(light_v)), 1e-8)
-
-                return (verts_view, mat_ids, proj, light_v)
+                return (verts_view, mat_ids, proj)
             except Exception:
                 return None
 
@@ -12976,6 +13061,30 @@ def main():
 
     duty_stations: list = []
     material_piles: list = []
+
+    # Startup integer material-id cache (never computed inside frame loop).
+    _MAT_ID_MISSING = 0
+    _MAT_ID_BASIC_PANELING = 0
+    _MAT_ID_BASIC_LED_DISPLAY = 0
+    _MAT_ID_BY_NAME: dict[str, int] = {}
+
+    # ── Preload required default materials once (no lazy load in frame loop) ─
+    if _MAT_DB is not None:
+        for _mat_name in ("basic_paneling", "basic_led_display", "__missing_material__"):
+            try:
+                _load_material_yaml(_mat_name)
+            except Exception:
+                pass
+        # Build chunk caches once after preload; later render loops consume
+        # integer-indexed prebaked buffers only.
+        try:
+            _t0 = _MAT_DB.build_tensors()
+            _MAT_ID_BY_NAME = {str(k): int(v) for k, v in dict(_t0.get("index", {})).items()}
+            _MAT_ID_MISSING = int(_MAT_ID_BY_NAME.get("__missing_material__", 0))
+            _MAT_ID_BASIC_PANELING = int(_MAT_ID_BY_NAME.get("basic_paneling", _MAT_ID_MISSING))
+            _MAT_ID_BASIC_LED_DISPLAY = int(_MAT_ID_BY_NAME.get("basic_led_display", _MAT_ID_MISSING))
+        except Exception:
+            pass
 
     # ── Room station ──────────────────────────────────────────────────────────
     if _HAS_ROOM_STATION:
@@ -13421,6 +13530,15 @@ def main():
           # owner flip-buffer API (no shader registration required).
           # Submission is dirty-aware via change_key, so unchanged objects
           # keep prior geometry in the end-state buffer without re-flipping.
+          def _resolve_material_id(_name: object) -> int:
+              # Integer lookup against startup-baked dictionary only.
+              # No YAML load, no database index scan in frame loop.
+              if isinstance(_name, (int, np.integer)):
+                  return int(_name)
+              if _name is None:
+                  return _MAT_ID_MISSING
+              return int(_MAT_ID_BY_NAME.get(str(_name), _MAT_ID_MISSING))
+
           for _i, _ds in enumerate(duty_stations):
               if not hasattr(_ds, 'interaction_triangles_world'):
                   continue
@@ -13437,6 +13555,37 @@ def main():
                   _yaw,
                   int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0,
               )
+              _mat_name = getattr(_ds, "material_slot", None)
+              _ntri = int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0
+
+              # Cache per-object default material id once.
+              _mat_id_default = getattr(_ds, "_material_slot_id", None)
+              if _mat_id_default is None:
+                  _mat_id_default = _resolve_material_id(_mat_name)
+                  try:
+                      setattr(_ds, "_material_slot_id", int(_mat_id_default))
+                  except Exception:
+                      pass
+
+              # Default one-material assignment (legacy path).
+              _mat_ids = np.full((_ntri,), int(_mat_id_default), dtype=np.int32)
+
+              # Fine-grained split for DutyStation geometry: body / screen / wings / wall.
+              # interaction_triangles_world() concatenates these in this exact order.
+              if hasattr(_ds, '_body_data') and hasattr(_ds, '_screen_data'):
+                  _c_body = int(max(0, len(getattr(_ds, '_body_data', [])) // 3))
+                  _c_scr  = int(max(0, len(getattr(_ds, '_screen_data', [])) // 3))
+                  _c_wing = int(max(0, len(getattr(_ds, '_wing_data', [])) // 3))
+                  _c_wall = int(max(0, len(getattr(_ds, '_wall_data', [])) // 3))
+                  _exp = _c_body + _c_scr + _c_wing + _c_wall
+                  if _exp > 0 and _ntri > 0:
+                      _ids = np.full((_ntri,), _MAT_ID_BASIC_PANELING, dtype=np.int32)
+                      _a = min(_ntri, _c_body)
+                      _b = min(_ntri, _a + _c_scr)
+                      if _b > _a:
+                          _ids[_a:_b] = _MAT_ID_BASIC_LED_DISPLAY
+                      _mat_ids = _ids
+
               _shader_walker.publish_owner_target(
                   owner_id=_owner,
                   target_id=f"scene.geometry/{_owner}",
@@ -13444,7 +13593,9 @@ def main():
                       "owner_id": _owner,
                       "kind": "triangles",
                       "triangles": _tris,
-                      "mat_id": 1 if str(getattr(_ds, "material_slot", "")) == "basic_led_display" else 0,
+                      "material_slot": _mat_name,
+                      "mat_ids": _mat_ids,
+                      "mat_id": int(_mat_id_default),
                   },
                   flip_slots=2,
                   change_key=_sig,
@@ -13469,6 +13620,16 @@ def main():
                   str(getattr(_placed, 'mesh_id', 'camera_35mm')),
                   int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0,
               )
+              _cam_mat_name = getattr(_ci, "material_slot", None)
+              if _cam_mat_name is None:
+                  _cam_mat_name = getattr(_ci, "material_name", None)
+              _cam_mat_id = getattr(_ci, "_material_slot_id", None)
+              if _cam_mat_id is None:
+                  _cam_mat_id = _resolve_material_id(_cam_mat_name)
+                  try:
+                      setattr(_ci, "_material_slot_id", int(_cam_mat_id))
+                  except Exception:
+                      pass
               _shader_walker.publish_owner_target(
                   owner_id=_owner,
                   target_id=f"scene.geometry/{_owner}",
@@ -13476,6 +13637,8 @@ def main():
                       "owner_id": _owner,
                       "kind": "triangles",
                       "triangles": _tris,
+                      "material_slot": _cam_mat_name,
+                      "mat_id": int(_cam_mat_id),
                   },
                   flip_slots=2,
                   change_key=_sig,

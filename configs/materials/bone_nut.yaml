@@ -5,7 +5,7 @@
 name: bone_nut
 description: Guitar nut — bleached bone or synthetic TUSQ
 
-albedo_rgb: [0.90, 0.87, 0.78]       # linear sRGB — warm off-white / ivory
+color_profile_name: bone_nut
 reflectivity: 0.60
 diffusion: 0.70
 absorption: 0.04

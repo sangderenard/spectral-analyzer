@@ -4,7 +4,7 @@
 name: silica_sand
 description: Sorted glassy grains and crushed scrap glass for simple substrates.
 
-albedo_rgb: [0.76, 0.74, 0.66]
+color_profile_name: silica_sand
 reflectivity: 0.24
 diffusion: 0.78
 absorption: 0.03

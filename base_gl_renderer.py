@@ -18,7 +18,7 @@ Usage
 >>> rdr.register()     # installs into the ShaderFrameWalker
 
 Each frame the walker calls ``_run()``, which iterates ``_mesh_list`` and
-draws every (VAO, n_verts, mvp, mv, light_v, scene_rgb, scene_indirect) tuple
+draws every (VAO, n_verts, mvp, mv, light_dirs, light_colors, light_intens) tuple
 that was enqueued via ``enqueue_mesh()``.  Callers must drain the list each
 frame by calling ``clear_mesh_list()`` **after** ``_run`` fires, or just let
 ``_run`` drain it automatically (see ``auto_drain`` parameter in ``__init__``).
@@ -41,12 +41,18 @@ try:
         glGetShaderInfoLog, glCreateProgram, glAttachShader, glLinkProgram,
         glGetProgramiv, glGetProgramInfoLog, glUseProgram, glDeleteShader,
         glGenBuffers, glBindBuffer, glBufferData, glBindBufferBase,
-        glUniformMatrix4fv, glUniform3f, glUniform1f,
+        glUniformMatrix4fv, glUniform3f, glUniform1f, glUniform1i,
+        glUniform3fv, glUniform1fv,
         glGetUniformLocation, glEnable, glDisable, glBlendFunc,
+        glGenTextures, glBindTexture, glTexParameteri, glTexImage3D,
+        glActiveTexture,
         GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, GL_COMPILE_STATUS, GL_LINK_STATUS,
         GL_SHADER_STORAGE_BUFFER, GL_DYNAMIC_DRAW, GL_STATIC_DRAW,
         GL_FLOAT, GL_TRUE, GL_FALSE, GL_BLEND,
         GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+        GL_TEXTURE_2D_ARRAY, GL_TEXTURE0, GL_TEXTURE_MIN_FILTER,
+        GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+        GL_LINEAR, GL_CLAMP_TO_EDGE, GL_RGBA, GL_RGBA8, GL_UNSIGNED_BYTE,
     )
     _GL_OK = True
 except ImportError:
@@ -125,18 +131,33 @@ class BaseGLRenderer:
         # Cached uniform locations (populated in init_gl)
         self._u_mvp             = -1
         self._u_mv              = -1
-        self._u_light_v         = -1
-        self._u_scene_rgb       = -1
-        self._u_scene_indirect  = -1
+        self._u_num_lights      = -1
+        self._u_light_dir       = -1
+        self._u_light_color     = -1
+        self._u_light_intensity = -1
 
-        # Mesh draw queue: list of tuples (vao, n_verts, mvp, mv, light_v,
-        #                                  scene_rgb, scene_indirect)
+        # ── UV texture-pack stack (Stage 2 wired) ───────────────────
+        # Default 1×1×1 identity texel `(R=0, G=255, B=128, A=255)` =
+        # (R=0    → no direct/specular-coupled emission gain,
+        #  G=1.0  → full diffuse-lobe emission gain (passes mat.emit through),
+        #  B=0.5  → saturation identity (mix factor 1.0 = unchanged chroma),
+        #  A=1.0  → no per-texel dim).
+        # With this texel the Stage 2 fragment math collapses to the
+        # pre-Stage-2 behaviour `col += emission` exactly, so any caller
+        # that has not yet authored an emission UV texture sees no change.
+        self._tex_emit_uv: Optional[int] = None
+        self._uv_tex_unit_emit = 0
+        self._u_emit_uv = -1
+
+        # Mesh draw queue: list of tuples (vao, n_verts, mvp, mv,
+        #                                  light_dirs, light_colors, light_intens)
         # Types: vao=int, n_verts=int, mvp=np.ndarray(16,f32),
-        #        mv=np.ndarray(16,f32), light_v=np.ndarray(3,f32),
-        #        scene_rgb=np.ndarray(3,f32), scene_indirect=float
+        #        mv=np.ndarray(16,f32), light_dirs=np.ndarray(N,3,f32),
+        #        light_colors=np.ndarray(N,3,f32), light_intens=np.ndarray(N,f32)
         self._mesh_list: List[Tuple] = []
 
         self._registered = False
+        self._mat_tensors_ref = None
 
     # ── GL initialisation ─────────────────────────────────────────────────────
 
@@ -146,6 +167,32 @@ class BaseGLRenderer:
             raise RuntimeError("[BaseGLRenderer] PyOpenGL not available")
         self._build_program()
         self._build_ssbos()
+        self._build_default_uv_textures()
+
+    def _build_default_uv_textures(self) -> None:
+        """Allocate the 1×1×1 default `emit_uv` texture array.
+
+        Identity texel for the Stage 2 fragment math — see UV_EMISSION_STACK_PLAN.md.
+        Any mesh that does not bind a real emission texture array samples this
+        single texel and gets pre-Stage-2 behaviour (`col += emission`) exactly.
+        """
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex)
+        # Identity texel: R=0 (no direct gain), G=255 (full diffuse pass-through),
+        # B=128 (≈0.5 saturation identity), A=255 (no dim).
+        default_texel = np.array([0, 255, 128, 255], dtype=np.uint8)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            1, 1, 1,                      # width, height, layers
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            default_texel.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+        self._tex_emit_uv = int(tex)
 
     def _build_program(self) -> None:
         vert_src = _read_glsl(_VERT_PATH)
@@ -154,17 +201,23 @@ class BaseGLRenderer:
         frag     = _compile_shader(frag_src, GL_FRAGMENT_SHADER)
         self._prog = _link_program(vert, frag)
 
-        self._u_mvp            = glGetUniformLocation(self._prog, "uMVP")
-        self._u_mv             = glGetUniformLocation(self._prog, "uMV")
-        self._u_light_v        = glGetUniformLocation(self._prog, "uLightV")
-        self._u_scene_rgb      = glGetUniformLocation(self._prog, "uSceneRgb")
-        self._u_scene_indirect = glGetUniformLocation(self._prog, "uSceneIndirectRatio")
+        self._u_mvp             = glGetUniformLocation(self._prog, "uMVP")
+        self._u_mv              = glGetUniformLocation(self._prog, "uMV")
+        self._u_num_lights      = glGetUniformLocation(self._prog, "uNumLights")
+        self._u_light_dir       = glGetUniformLocation(self._prog, "uLightDir")
+        self._u_light_color     = glGetUniformLocation(self._prog, "uLightColor")
+        self._u_light_intensity = glGetUniformLocation(self._prog, "uLightIntensity")
+        self._u_emit_uv         = glGetUniformLocation(self._prog, "uEmitUv")
 
     def _build_ssbos(self) -> None:
         """Create and populate the three material SSBOs from the current database state."""
-        pbr_chunk    = self._db.pbr_chunk()    # (N,16) float32
-        phong_chunk  = self._db.phong_chunk()  # (N, 8) float32
-        enamel_chunk = self._db.enamel_chunk() # (N, 8) float32
+        t = self._db.build_tensors()
+        if t is self._mat_tensors_ref:
+            return
+
+        pbr_chunk    = t.get('pbr', np.zeros((0, 16), np.float32))
+        phong_chunk  = t.get('phong_compat', np.zeros((0, 8), np.float32))
+        enamel_chunk = t.get('enamel', np.zeros((0, 8), np.float32))
 
         for binding, data in (
             (_BINDING_PBR,    pbr_chunk),
@@ -189,6 +242,7 @@ class BaseGLRenderer:
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buf_id)
 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0)
+        self._mat_tensors_ref = t
 
     def update_material_ssbo(self) -> None:
         """Re-upload SSBO data after the material database has changed."""
@@ -202,39 +256,20 @@ class BaseGLRenderer:
         n_verts: int,
         mvp: "np.ndarray",
         mv: "np.ndarray",
-        light_v: "np.ndarray",
-        scene_rgb: "np.ndarray",
-        scene_indirect: float,
     ) -> None:
         """Schedule one mesh for drawing in the next _run() call.
 
-        Parameters
-        ----------
-        vao:
-            OpenGL VAO name. The VAO must bind:
-              attrib 0 → vec3 position  (offset 0, stride 24 bytes)
-              attrib 1 → vec3 normal    (offset 12, stride 24 bytes)
-              attrib 2 → int  mat_id    (separate integer attrib, or packed)
-        n_verts:
-            Vertex count to pass to glDrawArrays(GL_TRIANGLES, 0, n_verts).
-        mvp:
-            4×4 float32 ndarray (column-major, shape (4,4) or (16,)).
-        mv:
-            4×4 float32 ndarray (column-major, shape (4,4) or (16,)).
-        light_v:
-            View-space light direction, shape (3,), float32.
-        scene_rgb:
-            Environment spectral tint, shape (3,), float32.
-        scene_indirect:
-            Indirect fill fraction [0, 1], scalar float.
+        Lights are not a parameter.  The engine derives illumination from
+        emissive materials inside the draw — there is no host-side light
+        path.  (Stage 1: emission-only via SSBO `pbr.emission`; Stage 2
+        will mirror per-tri positions + mat_ids in this renderer to enable
+        the same per-material cluster-light derivation the C rasterizer
+        already performs.)
         """
         self._mesh_list.append((
             vao, n_verts,
             np.ascontiguousarray(mvp, dtype=np.float32).ravel(),
             np.ascontiguousarray(mv,  dtype=np.float32).ravel(),
-            np.ascontiguousarray(light_v,   dtype=np.float32).ravel(),
-            np.ascontiguousarray(scene_rgb, dtype=np.float32).ravel(),
-            float(scene_indirect),
         ))
 
     def clear_mesh_list(self) -> None:
@@ -248,9 +283,6 @@ class BaseGLRenderer:
         n_verts: int,
         mvp: "np.ndarray",
         mv: "np.ndarray",
-        light_v: "np.ndarray",
-        scene_rgb: "np.ndarray",
-        scene_indirect: float,
     ) -> None:
         """Draw a single mesh immediately (requires active GL context + program)."""
         from OpenGL.GL import glBindVertexArray, glDrawArrays, GL_TRIANGLES
@@ -261,19 +293,28 @@ class BaseGLRenderer:
         for binding, buf_id in self._ssbo.items():
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buf_id)
 
+        # Bind default UV texture array on its dedicated texture unit and
+        # point the sampler uniform at that unit.  With the identity texel
+        # this is a no-op for current callers; once a caller uploads a real
+        # emission UV array the Stage 2 fragment math activates.
+        if self._tex_emit_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_emit)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_emit_uv)
+            if self._u_emit_uv != -1:
+                glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
+
         # Upload uniforms
         if self._u_mvp != -1:
             glUniformMatrix4fv(self._u_mvp, 1, GL_FALSE, mvp.ctypes.data_as(ctypes.c_void_p))
         if self._u_mv != -1:
             glUniformMatrix4fv(self._u_mv, 1, GL_FALSE, mv.ctypes.data_as(ctypes.c_void_p))
-        if self._u_light_v != -1:
-            glUniform3f(self._u_light_v, float(light_v[0]), float(light_v[1]), float(light_v[2]))
-        if self._u_scene_rgb != -1:
-            glUniform3f(self._u_scene_rgb, float(scene_rgb[0]), float(scene_rgb[1]), float(scene_rgb[2]))
-        if self._u_scene_indirect != -1:
-            glUniform1f(self._u_scene_indirect, float(scene_indirect))
 
-        # Draw
+        # No host-side lights.  Until the CPU geometry mirror lands here,
+        # the GL path renders self-emission only (uNumLights=0).  That is
+        # an honest under-shading, not fake fill.
+        if self._u_num_lights != -1:
+            glUniform1i(self._u_num_lights, 0)
+
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glBindVertexArray(vao)
@@ -286,10 +327,54 @@ class BaseGLRenderer:
     # ── ShaderFrameWalker callback ────────────────────────────────────────────
 
     def _run(self, spec, node, fifos, frame_index: int, dt: float, **extra) -> None:
-        """Called by ShaderFrameWalker each frame.  Draws all enqueued meshes."""
+        """Called by ShaderFrameWalker each frame.  Draws all enqueued meshes.
+
+        Invariant state (program, SSBO bindings, sampler, blend) is bound
+        ONCE per frame; the inner loop does only uniform updates + draw.
+        """
+        if not self._mesh_list:
+            return
+
+        from OpenGL.GL import (
+            glBindVertexArray, glDrawArrays, GL_TRIANGLES,
+            glEnable, glDisable, glBlendFunc, GL_BLEND,
+            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+        )
+
+        glUseProgram(self._prog)
+
+        # Bind invariant per-frame state.
+        for binding, buf_id in self._ssbo.items():
+            glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buf_id)
+
+        if self._tex_emit_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_emit)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_emit_uv)
+            if self._u_emit_uv != -1:
+                glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
+
+        if self._u_num_lights != -1:
+            glUniform1i(self._u_num_lights, 0)
+
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+        u_mvp = self._u_mvp
+        u_mv  = self._u_mv
+        c_void_p = ctypes.c_void_p
         for entry in self._mesh_list:
-            vao, n_verts, mvp, mv, lv, sr, si = entry
-            self.draw_mesh(vao, n_verts, mvp, mv, lv, sr, si)
+            vao, n_verts, mvp, mv = entry
+            if u_mvp != -1:
+                glUniformMatrix4fv(u_mvp, 1, GL_FALSE, mvp.ctypes.data_as(c_void_p))
+            if u_mv != -1:
+                glUniformMatrix4fv(u_mv, 1, GL_FALSE, mv.ctypes.data_as(c_void_p))
+            glBindVertexArray(vao)
+            glDrawArrays(GL_TRIANGLES, 0, n_verts)
+
+        glBindVertexArray(0)
+        glDisable(GL_BLEND)
+        glUseProgram(0)
+
         if self._auto_drain:
             self._mesh_list.clear()
 

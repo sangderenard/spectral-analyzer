@@ -6,7 +6,7 @@
 name: acrylic_pmma
 description: Cast acrylic / PMMA sheet — clear
 
-albedo_rgb: [0.95, 0.95, 0.93]       # very faint warm tint
+color_profile_name: acrylic
 reflectivity: 0.040
 diffusion: 0.06                        # slight surface scatter (minor hazing)
 absorption: 0.012                      # mild UV absorption, visible only in thick pieces
@@ -14,7 +14,6 @@ absorption: 0.012                      # mild UV absorption, visible only in thi
 ior: 1.490
 opacity: 0.0
 
-transmission_rgb: [0.98, 0.98, 0.96]  # negligible colour shift for thin sheets
 abbe_number: 57.2
 cauchy_b: 0.00600
 

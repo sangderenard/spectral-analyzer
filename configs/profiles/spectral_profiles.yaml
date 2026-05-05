@@ -1,0 +1,204 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Central spectral profile library
+# ─────────────────────────────────────────────────────────────────────────────
+# Every named ColorProfile / EmissionProfile / RemissionProfile referenced by
+# a material YAML is defined here.  Loaded once at engine startup by
+# `spectral_library.load_default_library()`, which registers each entry into
+# the global EmissionProfileDatabase and bakes the spectral→sRGB tensor before
+# any material is registered.  The hot loop never reads this file.
+#
+# Authoring conventions
+# ─────────────────────
+# • Each spread is a list of additive parametric terms whose centres are
+#   wavelengths in nanometres (380–780 nm, the visible band).  `q` is a
+#   width-shape parameter; larger q ⇒ narrower lobe.
+# • EmissionProfile entries carry an absolute `total_power_W` that scales the
+#   output sRGB at bake time.  ColorProfile / RemissionProfile entries carry
+#   no explicit power — they encode reflectance and rely on per-frame stimulus
+#   for amplitude.
+# • RemissionProfile entries optionally carry `response_envelope` which makes
+#   the material a frame-delayed re-emitter.  If `curve` is omitted, a default
+#   exponential decay over `decay_frames` frames is used.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Reflective body colors (ColorProfile) ────────────────────────────────────
+color:
+  satin_gold:
+    frequency:
+      - {amp: 1.00, center: 600.0, q: 2.5}
+      - {amp: 0.55, center: 560.0, q: 2.0}
+  chrome:
+    frequency:
+      - {amp: 0.95, center: 560.0, q: 0.6}
+  ruby_body:
+    frequency:
+      - {amp: 1.40, center: 680.0, q: 4.0}
+      - {amp: 0.10, center: 440.0, q: 8.0}
+  emerald_body:
+    frequency:
+      - {amp: 1.30, center: 535.0, q: 5.0}
+  sapphire_body:
+    frequency:
+      - {amp: 1.40, center: 465.0, q: 6.0}
+  obsidian_body:
+    frequency:
+      - {amp: 0.030, center: 480.0, q: 1.0}
+  slate_body:
+    frequency:
+      - {amp: 0.22, center: 485.0, q: 1.5}
+
+  # Pre-existing material library — physically-motivated single-lobe spreads
+  # that approximately reproduce each material's prior `albedo_rgb` literal.
+  # Refine as needed; this gets things off the RGB literal and onto a
+  # spectrum that the bake will integrate against the CIE 1931 CMFs.
+  mahogany:
+    frequency:
+      - {amp: 0.95, center: 615.0, q: 3.0}    # warm reddish brown dominant
+      - {amp: 0.30, center: 575.0, q: 2.0}
+  spruce:
+    frequency:
+      - {amp: 0.85, center: 580.0, q: 2.0}    # warm pale yellow-tan
+      - {amp: 0.40, center: 545.0, q: 2.5}
+  rosewood:
+    frequency:
+      - {amp: 0.55, center: 625.0, q: 3.5}    # darker brown
+      - {amp: 0.18, center: 575.0, q: 2.0}
+  bone_nut:
+    frequency:
+      - {amp: 0.94, center: 580.0, q: 1.0}    # warm off-white
+  steel:
+    frequency:
+      - {amp: 0.78, center: 560.0, q: 0.8}    # neutral light grey
+  copper:
+    frequency:
+      - {amp: 1.05, center: 620.0, q: 3.0}
+      - {amp: 0.28, center: 555.0, q: 2.0}
+  acrylic:
+    frequency:
+      - {amp: 0.92, center: 555.0, q: 0.6}    # near-white clear
+  borosilicate:
+    frequency:
+      - {amp: 0.96, center: 555.0, q: 0.6}
+  flint_glass:
+    frequency:
+      - {amp: 0.94, center: 560.0, q: 0.7}
+      - {amp: 0.06, center: 480.0, q: 4.0}    # very faint cool tint
+  soda_lime_glass:
+    frequency:
+      - {amp: 0.94, center: 555.0, q: 0.6}
+  crystal_water_glass:
+    frequency:
+      - {amp: 0.97, center: 555.0, q: 0.5}
+  silica_sand:
+    frequency:
+      - {amp: 0.85, center: 580.0, q: 1.5}    # warm pale tan
+  raw_regolith:
+    frequency:
+      - {amp: 0.45, center: 570.0, q: 1.8}    # dim warm grey
+  concrete:
+    frequency:
+      - {amp: 0.65, center: 570.0, q: 1.0}    # warm light grey
+  stage_floor:
+    frequency:
+      - {amp: 0.30, center: 565.0, q: 1.0}    # neutral mid-grey
+  basic_paneling:
+    frequency:
+      - {amp: 0.65, center: 595.0, q: 1.8}    # warm tan
+  surface_coat:
+    frequency:
+      - {amp: 0.94, center: 555.0, q: 0.8}
+  binder_resin:
+    frequency:
+      - {amp: 0.84, center: 555.0, q: 0.8}
+  nitrocellulose_lacquer:
+    frequency:
+      - {amp: 0.96, center: 555.0, q: 0.5}    # nearly clear
+  fiber_mesh:
+    frequency:
+      - {amp: 0.55, center: 560.0, q: 1.0}
+  polymer_film:
+    frequency:
+      - {amp: 0.92, center: 555.0, q: 0.6}
+  control_chip:
+    frequency:
+      - {amp: 0.18, center: 510.0, q: 2.5}    # dark cool greenish PCB
+      - {amp: 0.06, center: 580.0, q: 2.0}
+  emitter_dust:
+    frequency:
+      - {amp: 0.95, center: 525.0, q: 4.0}    # cyan-green powder
+      - {amp: 0.45, center: 555.0, q: 2.0}
+  interior_cavity:
+    frequency:
+      - {amp: 0.10, center: 555.0, q: 1.0}    # very dark neutral
+  led_screen_face:
+    frequency:
+      - {amp: 0.18, center: 480.0, q: 3.0}    # dark glossy blue-tinted screen
+
+
+# ── Emissive light sources (EmissionProfile) ────────────────────────────────
+emission:
+  basic_led_display:
+    spd:
+      - {amp: 1.00, center: 450.0, q: 18.0}   # narrow blue pump
+      - {amp: 0.30, center: 510.0, q: 5.0}    # cyan phosphor shoulder
+    peak_wavelength_nm: 450.0
+    fwhm_nm:           25.0
+    total_power_W:     0.35
+
+  missing_material_hazard:
+    spd:
+      - {amp: 1.00, center: 590.0, q: 12.0}
+      - {amp: 0.25, center: 620.0, q: 10.0}
+    peak_wavelength_nm: 590.0
+    fwhm_nm:           49.0
+    total_power_W:     0.22
+
+  emerald_internal:
+    spd:
+      - {amp: 1.00, center: 525.0, q: 14.0}   # narrow green pump
+      - {amp: 0.45, center: 560.0, q: 8.0}    # warm shoulder
+    peak_wavelength_nm: 525.0
+    fwhm_nm:           30.0
+    total_power_W:     1.4
+
+  sapphire_internal:
+    spd:
+      - {amp: 1.00, center: 465.0, q: 16.0}
+      - {amp: 0.30, center: 495.0, q: 8.0}
+    peak_wavelength_nm: 465.0
+    fwhm_nm:           28.0
+    total_power_W:     1.6
+
+  ruby_internal:
+    spd:
+      - {amp: 1.00, center: 695.0, q: 18.0}
+    peak_wavelength_nm: 695.0
+    fwhm_nm:           20.0
+    total_power_W:     0.05
+
+
+# ── Frame-delayed re-emitters (RemissionProfile + response envelope) ────────
+# Each entry's `frequency` defines the spectral shape of the re-emitted light;
+# `response_envelope` defines how that light builds up and decays over the
+# frames following an absorbed-stimulus event.
+remission:
+  # Ruby fluorescence-style afterglow: the body itself doesn't emit, but
+  # under stimulus it re-emits a deep red along the same band as the body
+  # color, with a thermal-style 12-frame exponential tail.
+  ruby_afterglow:
+    frequency:
+      - {amp: 1.0, center: 690.0, q: 6.0}
+    response_envelope:
+      decay_frames: 12
+      gain:         0.85
+      # Default exponential decay (curve omitted)
+
+  # Slate (saddle backdrop): cool, slow re-emission — picks up scene light
+  # and quietly glows back over a long tail.  Useful as a "the room
+  # remembered the gem" effect.
+  slate_afterglow:
+    frequency:
+      - {amp: 0.6, center: 480.0, q: 3.0}
+    response_envelope:
+      decay_frames: 24
+      gain:         0.30

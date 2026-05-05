@@ -5,7 +5,7 @@
 name: spruce_top
 description: Guitar soundboard — spruce top plate
 
-albedo_rgb: [0.78, 0.68, 0.48]       # linear sRGB — pale warm amber
+color_profile_name: spruce
 reflectivity: 0.68                     # slightly lower than mahogany (softer wood)
 diffusion: 0.72                        # more diffuse — straighter grain, lighter lacquer
 absorption: 0.06

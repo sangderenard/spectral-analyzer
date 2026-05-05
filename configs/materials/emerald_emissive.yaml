@@ -1,0 +1,41 @@
+# Material: emerald_emissive
+# Faceted-look emerald with an HDR emissive core.  Acts as one of the two
+# light sources that the test harness's scene-light derivation reads from.
+
+name: emerald_emissive
+description: Emerald-green crystal with internal HDR self-emission
+
+# Spectral color (registered by test harness; baked into pbr[:,0:3]).
+color_profile_name: emerald_body
+reflectivity:  0.22
+diffusion:     0.18
+absorption:    0.42
+ior:           1.58                    # beryl
+opacity:       1.0
+smoothness:    0.88
+
+roughness:     0.18
+metallic:      0.0
+transmission:  0.0
+# Spectral emission profile — RGB is derived from the SPD via profile_to_rgb
+# at registration time and written into pbr[:, 8:11] by build_tensors().
+# The profile itself is registered by test_basic_shader.py at startup.
+emit_profile_name: emerald_internal
+
+ambient:       0.14
+spec_strength: 0.42
+shininess:     96.0
+inner_color:   [0.06, 0.34, 0.16]
+
+enamel:
+  thickness_nm: 220.0                  # green-cyan iridescence
+  ior_real:     1.55
+  ior_imag:     0.0
+  roughness:    0.05
+  color_rgb:    [0.94, 1.00, 0.96]
+
+notes: >
+  The HDR emission_rgb (>1.0) is intentional — the rasterizer clamps on
+  readback (sRGB), so the high green channel will saturate and read as a
+  bright lime glow, plus it dominates the scene_rgb derivation that drives
+  the directional light for non-emissive surfaces.

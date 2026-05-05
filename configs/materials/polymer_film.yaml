@@ -4,7 +4,7 @@
 name: polymer_film
 description: Clear flexible encapsulation film for displays and seals.
 
-albedo_rgb: [0.68, 0.76, 0.78]
+color_profile_name: polymer_film
 reflectivity: 0.32
 diffusion: 0.24
 absorption: 0.02

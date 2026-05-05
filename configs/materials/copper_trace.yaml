@@ -4,7 +4,7 @@
 name: copper_trace
 description: Fine conductive ribbon used for low-power circuit routing.
 
-albedo_rgb: [0.78, 0.42, 0.22]
+color_profile_name: copper
 reflectivity: 0.58
 diffusion: 0.22
 absorption: 0.03

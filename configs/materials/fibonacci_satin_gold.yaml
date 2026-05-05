@@ -1,0 +1,47 @@
+# Material: fibonacci_satin_gold
+# Showcase material for the central Fibonacci-distributed sphere in the
+# rasterizer stress test.  Satin-finish 24k gold with a thin lacquer enamel
+# coat — picks up rim-light fresnel and a soft anisotropic-feeling specular
+# highlight from the hyperbolic backdrop's distant lighting.
+
+name: fibonacci_satin_gold
+description: Satin-finish 24k gold with thin protective lacquer enamel
+
+# ── Spectral color authoring (the only authoritative form).  The named
+#    profile is registered into EmissionProfileDatabase by the test harness
+#    BEFORE this YAML is loaded; MaterialDatabase.build_tensors() bakes the
+#    profile's SPD → linear sRGB and writes it into pbr[:, 0:3], overwriting
+#    any albedo_rgb literal.  No RGB color values appear in this file.
+color_profile_name: satin_gold
+reflectivity:  0.78
+diffusion:     0.18
+absorption:    0.04
+ior:           0.27                    # gold n at 550nm (real component)
+opacity:       1.0
+smoothness:    0.86
+
+# ── PBR block (consumed by MaterialDatabase.register dict path → _fill_pbr).
+roughness:     0.22
+metallic:      0.95
+transmission:  0.0
+
+# ── Phong overrides (consumed by _pbr_to_phong_record dict overrides).
+ambient:       0.06
+spec_strength: 0.92
+shininess:     128.0
+inner_color:   [0.62, 0.46, 0.18]      # warm gold backside
+
+# ── Thin-film enamel coat (consumed by _fill_enamel via dict path).
+enamel:
+  thickness_nm: 320.0                  # ~1/4 wave at green light → faint blue/peach iridescence
+  ior_real:     1.49                   # acrylic lacquer
+  ior_imag:     0.0
+  roughness:    0.04
+  color_rgb:    [1.00, 0.97, 0.92]
+
+notes: >
+  Central showcase sphere.  The high metallic + low roughness pushes the
+  Fresnel term to dominate, so this material reads as obviously metal even
+  with the simple directional-only scene lighting used by the test harness.
+  The enamel layer adds a subtle iridescent tint that helps the sphere read
+  as a "real object" rather than a shaded primitive.

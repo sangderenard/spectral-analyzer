@@ -285,12 +285,19 @@ class GlobalChannelDispatcher:
         self._c_raster = None                 # _spectral_kernels.BaseRasterizer
         self._last_2d_c_rgba = None
 
-        # Geometry packer for 3D-C: host-supplied callable
-        #   packer(leftovers_3d) -> (verts_view (Nt*3,6) f32,
-        #                            mat_ids (Nt,) i32,
-        #                            proj (16,) f32 column-major,
-        #                            light_v (3,) f32) | None
+        # Geometry packer for 3D-C: host-supplied callable.  Returns a
+        # 3-tuple (verts_view, mat_ids, proj) describing the scene.
+        # Lighting is NOT a host responsibility — the C rasterizer derives
+        # all illumination internally from the EMISSIVE MATERIALS attached
+        # to the rendered triangles (see base_rasterizer.cpp::br_render).
+        # No global "scene_rgb" / "scene_indirect" tints are accepted;
+        # every photon must trace back to a real emitter cluster.
         self._geometry_packer = geometry_packer
+
+        # Cached material bundle references for CPU/GPU sync. The material DB
+        # already keeps a prebaked tensor dictionary; we only re-upload when
+        # that dictionary object changes.
+        self._mat_tensors_ref_c = None
 
         # Per-channel cadence gates.
         self.gate_2d = _ChannelGate(cadence=int(cadence_2d),
@@ -441,22 +448,46 @@ class GlobalChannelDispatcher:
 
     # -- 3D channel -----------------------------------------------------------
 
+    def _sync_c_material_bundle(self, rdr: Any) -> None:
+        """Upload prebaked material tensors only when the DB reference changes."""
+        try:
+            import numpy as _np
+            from material_db import MaterialDatabase as _MaterialDatabase
+
+            _db = _MaterialDatabase.instance()
+            _t = _db.build_tensors()
+            if _t is self._mat_tensors_ref_c:
+                return
+            _pbr = _t.get("pbr", None)
+            _ph = _t.get("phong_compat", None)
+            _en = _t.get("enamel", None)
+            if _pbr is not None and len(_pbr):
+                rdr.set_pbr_chunk(_np.ascontiguousarray(_pbr, dtype=_np.float32))
+            if _ph is not None and len(_ph):
+                rdr.set_phong_chunk(_np.ascontiguousarray(_ph, dtype=_np.float32))
+            if _en is not None and len(_en):
+                rdr.set_enamel_chunk(_np.ascontiguousarray(_en, dtype=_np.float32))
+            self._mat_tensors_ref_c = _t
+        except Exception:
+            pass
+
     def _job_3d_c(self, packed: Any, leftovers: Mapping[Any, Any]) -> Optional[Any]:
         """Worker-thread body: clear + render + features + readback."""
         rdr = self._ensure_c_raster()
         if not rdr:
             return None
+        self._sync_c_material_bundle(rdr)
         if packed is None:
             rdr.clear(0.0, 0.0, 0.0, 0.0)
             return rdr.readback_u8()
-        verts_view, mat_ids, proj, light_v = packed
+
         try:
-            import numpy as _np
-            scene_rgb = _np.asarray([1.0, 1.0, 1.0], dtype=_np.float32)
-            rdr.set_scene(_np.asarray(light_v, dtype=_np.float32),
-                          scene_rgb, 0.2)
+            verts_view = mat_ids = proj = None
+            if isinstance(packed, (tuple, list)) and len(packed) >= 3:
+                verts_view, mat_ids, proj = packed[:3]
         except Exception:
             pass
+
         rdr.clear(0.0, 0.0, 0.0, 0.0)
         try:
             rdr.render(verts_view, mat_ids, proj)

@@ -23,6 +23,7 @@
 
 #include <Eigen/Dense>
 #include <algorithm>
+#include <unordered_map>
 #include <atomic>
 #include <cassert>
 #include <cmath>
@@ -51,11 +52,11 @@ struct RastThreadPool {
     std::vector<std::thread> workers;
     std::mutex               mx;
     std::condition_variable  cv_wake, cv_done;
-    std::function<void(int,int)> job;
-    int  job_n  = 0;
-    int  next   = 0;
-    int  active = 0;
-    bool quit   = false;
+    std::function<void(int)> job;       // single-tile callback
+    int              job_n  = 0;
+    int              active = 0;
+    bool             quit   = false;
+    std::atomic<int> next_tile{0};      // dynamic tile-stealing counter
 
     explicit RastThreadPool(int n_threads) : n(n_threads) {
         workers.reserve(n_threads);
@@ -71,35 +72,43 @@ struct RastThreadPool {
 
     void loop() {
         for (;;) {
-            std::function<void(int,int)> fn;
-            int s, e;
+            std::function<void(int)> fn;
+            int local_job_n;
             {
                 std::unique_lock<std::mutex> lk(mx);
-                cv_wake.wait(lk, [this]{ return quit || next < job_n; });
+                cv_wake.wait(lk, [this]{ return quit || next_tile.load() < job_n; });
                 if (quit) return;
-                int chunk = std::max(1, (job_n + n - 1) / n);
-                s = next; next = std::min(next + chunk, job_n); e = next;
                 ++active;
                 fn = job;
+                local_job_n = job_n;
             }
-            if (s < e) fn(s, e);
+            // Each thread steals one tile at a time until the queue is drained.
+            int tile_id;
+            while ((tile_id = next_tile.fetch_add(1, std::memory_order_relaxed))
+                   < local_job_n) {
+                fn(tile_id);
+            }
             {
                 std::lock_guard<std::mutex> lk(mx);
                 --active;
-                if (next >= job_n && active == 0) cv_done.notify_one();
+                if (next_tile.load() >= job_n && active == 0)
+                    cv_done.notify_one();
             }
         }
     }
 
-    void run(int total, std::function<void(int,int)> fn) {
+    void run(int total, std::function<void(int)> fn) {
         if (total <= 0) return;
         {
             std::unique_lock<std::mutex> lk(mx);
-            job = std::move(fn); job_n = total; next = 0; active = 0;
+            job = std::move(fn); job_n = total; active = 0;
+            next_tile.store(0, std::memory_order_relaxed);
         }
         cv_wake.notify_all();
         std::unique_lock<std::mutex> lk(mx);
-        cv_done.wait(lk, [this]{ return next >= job_n && active == 0; });
+        cv_done.wait(lk, [this]{
+            return next_tile.load() >= job_n && active == 0;
+        });
     }
 };
 
@@ -120,7 +129,7 @@ static RastThreadPool& rast_pool() {
 template<typename F>
 static void parallel_for(int n, F&& fn) {
     if (n <= 0) return;
-    rast_pool().run(n, [&](int s, int e){ fn(s, e); });
+    rast_pool().run(n, [&](int tile_id){ fn(tile_id); });
 }
 
 } // namespace thread pool
@@ -162,9 +171,54 @@ static inline Vector3f en_color  (const float* en, int id)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 struct SceneParams {
-    Vector3f light_v       = {0.45f, 0.78f, 0.44f};
-    Vector3f scene_rgb     = {1.0f, 1.0f, 1.0f};
-    float    scene_indirect = 0.0f;
+    // ── Multi-light array (real per-emitter colour & direction) ─────────
+    // Lights are *directional* (parallel rays, intensity is unitless gain).
+    // Each cluster of co-located emitters in the calling Python becomes one
+    // entry: e.g. emerald cluster → (dir = normalised mean orbit-position,
+    // colour = emerald's prebaked sRGB, intensity = 1.0).  The rasterizer
+    // never averages colours — each light contributes independently.
+    //
+    // There are NO other light sources.  No ambient.  No proxy bounce.  No
+    // hardcoded sun.  A non-emissive surface in a scene with zero lights
+    // renders pure black — that is physically correct.
+    // Compile-time ceiling for the fixed-size scene arrays.  The runtime
+    // cap is BaseRasterizerState::max_lights and may be set lower (or up
+    // to this ceiling) via br_set_max_lights().
+    static constexpr int MAX_LIGHTS = 32;
+    int      n_lights = 0;
+    Vector3f light_positions[MAX_LIGHTS]; // view-space positions (point lights)
+    Vector3f light_colors   [MAX_LIGHTS]; // linear RGB, no clamp
+    float    light_intensities[MAX_LIGHTS] = {0};
+};
+
+struct MaterialSample {
+    Vector3f albedo;
+    float    roughness;
+    float    metallic;
+    float    ior;
+    float    opacity;
+    Vector3f emission;
+
+    float    ambient;
+    float    spec_strength;
+    float    shininess;
+    Vector3f inner_color;
+
+    float    enamel_thickness;
+    float    enamel_ior;
+    Vector3f enamel_color;
+};
+
+struct GeomTerms {
+    Vector3f N;
+    Vector3f V;
+    Vector3f base;
+    float    NdotV;
+};
+
+struct FresnelTerms {
+    Vector3f F0;
+    Vector3f F;
 };
 
 /* Three-cosine thin-film iridescence (period 550 nm in OPD space). */
@@ -185,6 +239,152 @@ static inline float schlick(float f0, float cos_theta) {
     return f0 + (1.0f - f0) * (t2 * t2 * t);
 }
 
+static inline MaterialSample kernel_sample_material(
+    int mat_id,
+    const float* pbr_data,
+    const float* phong_data,
+    const float* enamel_data)
+{
+    MaterialSample m;
+    m.albedo           = pbr_data   ? pbr_albedo    (pbr_data,   mat_id) : Vector3f(0.5f,0.5f,0.5f);
+    m.roughness        = pbr_data   ? pbr_roughness (pbr_data,   mat_id) : 0.5f;
+    m.metallic         = pbr_data   ? pbr_metallic  (pbr_data,   mat_id) : 0.0f;
+    m.ior              = pbr_data   ? pbr_ior       (pbr_data,   mat_id) : 1.5f;
+    m.opacity          = pbr_data   ? pbr_opacity   (pbr_data,   mat_id) : 1.0f;
+    m.emission         = pbr_data   ? pbr_emission  (pbr_data,   mat_id) : Vector3f(0.0f,0.0f,0.0f);
+
+    m.ambient          = phong_data ? ph_ambient    (phong_data, mat_id) : 0.18f;
+    m.spec_strength    = phong_data ? ph_specstr    (phong_data, mat_id) : 0.05f;
+    m.shininess        = phong_data ? ph_shininess  (phong_data, mat_id) : 32.0f;
+    m.inner_color      = phong_data ? ph_inner      (phong_data, mat_id) : m.albedo * 0.55f;
+
+    m.enamel_thickness = enamel_data ? en_thick(enamel_data, mat_id) : 0.0f;
+    m.enamel_ior       = enamel_data ? en_ior  (enamel_data, mat_id) : 1.52f;
+    m.enamel_color     = enamel_data ? en_color(enamel_data, mat_id) : Vector3f(1.0f,1.0f,1.0f);
+    return m;
+}
+
+static inline GeomTerms kernel_geometry_terms(
+    const Vector3f& pos_v,
+    const Vector3f& norm_v,
+    bool front_facing,
+    const MaterialSample& m,
+    const SceneParams& /*sc*/)
+{
+    GeomTerms g;
+    g.N = front_facing ? norm_v : (-norm_v);
+    {
+        float n2 = g.N.squaredNorm();
+        if (n2 > 1e-12f) g.N *= 1.0f / std::sqrt(n2);
+    }
+    {
+        float v2 = pos_v.squaredNorm();
+        g.V = (v2 > 1e-12f) ? Vector3f(-pos_v * (1.0f / std::sqrt(v2)))
+                            : Vector3f::Zero();
+    }
+    g.NdotV = std::max(0.0f, g.N.dot(g.V));
+    g.base  = front_facing ? m.albedo : m.inner_color;
+    return g;
+}
+
+static inline FresnelTerms kernel_fresnel_terms(
+    const MaterialSample& m,
+    float NdotV)
+{
+    FresnelTerms f;
+    float ior_f0 = (m.ior - 1.0f) / (m.ior + 1.0f);
+    ior_f0 *= ior_f0;
+    f.F0 = (1.0f - m.metallic) * Vector3f(ior_f0, ior_f0, ior_f0)
+         +  m.metallic        * m.albedo;
+    float x  = 1.0f - NdotV;
+    float x2 = x * x;
+    float x5 = x2 * x2 * x;  // pow(x, 5) without log/exp
+    f.F  = f.F0 + (Vector3f::Ones() - f.F0) * x5;
+    return f;
+}
+
+/* Direct illumination from real emitters only.
+ *
+ * For each emitter-derived light: add Lambertian diffuse + Phong specular,
+ * both tinted by the emitter's true colour.  After the loop add the
+ * surface's own emission (self-light).  Nothing else.  No ambient.  No
+ * proxy bounce.  No hardcoded sun.  No metallic albedo substitution.
+ *
+ * If n_lights == 0 the surface contributes only its own emission.  A
+ * non-emissive surface in a dark scene renders black — correct physics.
+ */
+static inline Vector3f kernel_shade_lights(
+    const MaterialSample& m,
+    const Vector3f& pos_v,        // fragment position in view space
+    const GeomTerms& g,
+    const FresnelTerms& f,
+    const SceneParams& sc,
+    Vector3f* spec_color_out,
+    float* spec_strength_out)
+{
+    Vector3f col = Vector3f::Zero();
+    Vector3f spec_color_acc = Vector3f::Zero();
+    float    spec_strength_acc = 0.0f;
+
+    for (int i = 0; i < sc.n_lights; ++i) {
+        // Per-fragment L from positional light.  This is what makes the
+        // illumination track the emitter mesh in space — directional-only
+        // lights collapse the geometry to a single point at the camera and
+        // produce axis-flipped shading on receivers far from the origin.
+        Vector3f Lvec = sc.light_positions[i] - pos_v;
+        float    Lr2  = std::max(1e-8f, Lvec.squaredNorm());
+        float    inv_Lr = 1.0f / std::sqrt(Lr2);
+        Vector3f L    = Lvec * inv_Lr;
+        // Inverse-square falloff (intensity already carries emitter area).
+        Vector3f Lcol = sc.light_colors[i] * (sc.light_intensities[i] / Lr2);
+        Vector3f LV = L + g.V;
+        float lv2 = LV.squaredNorm();
+        Vector3f H = (lv2 > 1e-12f) ? Vector3f(LV * (1.0f / std::sqrt(lv2))) : g.V;
+        float NdotL = std::max(0.0f, g.N.dot(L));
+        float NdotH = std::max(0.0f, g.N.dot(H));
+        float spec  = std::pow(NdotH, std::max(1.0f, m.shininess));
+
+        // Lambertian diffuse: surface albedo * incoming radiance * cos(theta)
+        col += g.base.cwiseProduct(Lcol) * NdotL;
+
+        // Phong specular: emitter colour modulated by Fresnel reflectance.
+        col += Lcol.cwiseProduct(f.F) * (m.spec_strength * spec);
+
+        spec_color_acc    += Lcol * spec;
+        spec_strength_acc += spec;
+    }
+
+    if (spec_color_out)    *spec_color_out    = spec_color_acc;
+    if (spec_strength_out) *spec_strength_out = spec_strength_acc;
+
+    // Surface's own emission (real — the material radiates).
+    col += m.emission;
+    return col;
+}
+
+static inline Vector3f kernel_enamel_coat(
+    const Vector3f& in_col,
+    const MaterialSample& m,
+    const GeomTerms& g,
+    const Vector3f& spec_col,
+    float spec)
+{
+    if (m.enamel_thickness <= 0.0f) {
+        return in_col;
+    }
+    float opd_nm = 2.0f * m.enamel_ior * m.enamel_thickness * g.NdotV;
+    Vector3f fringe = thin_film_fringe(opd_nm);
+    float fringe_w  = std::min(0.45f, m.enamel_thickness / 800.0f);
+    Vector3f tinted = in_col.cwiseProduct(m.enamel_color).cwiseProduct(
+        Vector3f::Ones() + fringe * fringe_w);
+
+    float eF0 = (m.enamel_ior - 1.0f) / (m.enamel_ior + 1.0f);
+    eF0 *= eF0;
+    float eF = schlick(eF0, g.NdotV);
+    tinted += Vector3f(spec_col) * (eF * 0.28f * spec);
+    return tinted * 0.35f + in_col * 0.65f;
+}
+
 /**
  * Evaluate Phong BRDF for one fragment.
  *
@@ -202,89 +402,16 @@ static Vector3f shade(
     const SceneParams& sc,
     float*          alpha_out)
 {
-    // Material fetch
-    Vector3f albedo   = pbr_data   ? pbr_albedo   (pbr_data,   mat_id) : Vector3f(0.5f,0.5f,0.5f);
-    float    rough    = pbr_data   ? pbr_roughness (pbr_data,   mat_id) : 0.5f;
-    float    metallic = pbr_data   ? pbr_metallic  (pbr_data,   mat_id) : 0.0f;
-    float    ior      = pbr_data   ? pbr_ior       (pbr_data,   mat_id) : 1.5f;
-    float    opacity  = pbr_data   ? pbr_opacity   (pbr_data,   mat_id) : 1.0f;
-    Vector3f emission = pbr_data   ? pbr_emission  (pbr_data,   mat_id) : Vector3f(0.0f,0.0f,0.0f);
+    MaterialSample m = kernel_sample_material(mat_id, pbr_data, phong_data, enamel_data);
+    *alpha_out = m.opacity;
 
-    float    ambient  = phong_data ? ph_ambient    (phong_data, mat_id) : 0.18f;
-    float    specstr  = phong_data ? ph_specstr    (phong_data, mat_id) : 0.05f;
-    float    shini    = phong_data ? ph_shininess  (phong_data, mat_id) : 32.0f;
-    Vector3f inner    = phong_data ? ph_inner      (phong_data, mat_id) : albedo * 0.55f;
+    GeomTerms g = kernel_geometry_terms(pos_v, norm_v, front_facing, m, sc);
+    FresnelTerms f = kernel_fresnel_terms(m, g.NdotV);
 
-    float enam_thick  = enamel_data ? en_thick(enamel_data, mat_id) : 0.0f;
-
-    *alpha_out = opacity;
-
-    // Geometry
-    Vector3f N = front_facing ? norm_v : (-norm_v);
-    N.normalize();
-    Vector3f L = sc.light_v.normalized();
-    Vector3f V = (-pos_v).normalized();
-    Vector3f H = (L + V).normalized();
-
-    float NdotL = std::max(0.0f, N.dot(L));
-    float NdotH = std::max(0.0f, N.dot(H));
-    float NdotV = std::max(0.0f, N.dot(V));
-
-    // Base colour (front / back face)
-    Vector3f base = front_facing ? albedo : inner;
-
-    // Schlick Fresnel — Fresnel F0 from IOR and metallic
-    float ior_f0 = (ior - 1.0f) / (ior + 1.0f);
-    ior_f0 *= ior_f0;
-    Vector3f F0  = (1.0f - metallic) * Vector3f(ior_f0, ior_f0, ior_f0)
-                 + metallic          * albedo;
-    float F_scal = schlick(ior_f0, NdotV);
-    Vector3f F   = F0 + (Vector3f(1.0f,1.0f,1.0f) - F0) * std::pow(1.0f - NdotV, 5.0f);
-
-    // Phong diffuse + specular
-    float diff = NdotL;
-    float spec = std::pow(NdotH, std::max(1.0f, shini));
-
-    // Scene-tinted ambient (indirect fill in shadowed regions)
-    Vector3f scene_rgb_v = sc.scene_rgb;
-    Vector3f amb_light   = ambient * (Vector3f(1.0f,1.0f,1.0f) * 0.45f
-                                    + scene_rgb_v * 0.55f);
-    float shadow_fill    = sc.scene_indirect * 0.28f * (1.0f - diff);
-
-    // Specular colour: warm tint blended with scene
-    Vector3f spec_col = Vector3f(1.0f,0.93f,0.70f) * 0.65f + scene_rgb_v * 0.35f;
-
-    Vector3f col = base.cwiseProduct(amb_light + (0.78f + shadow_fill) * Vector3f::Ones() * diff)
-                 + spec_col.cwiseProduct(F) * (specstr * spec);
-
-    // Rim
-    float rim = std::pow(1.0f - NdotV, 3.0f);
-    col += base * rim * (0.14f + 0.08f * sc.scene_indirect);
-
-    // Emission
-    col += emission;
-
-    // Enamel coat
-    if (enam_thick > 0.0f) {
-        float enam_ior_v = enamel_data ? en_ior  (enamel_data, mat_id) : 1.52f;
-        Vector3f enam_c  = enamel_data ? en_color(enamel_data, mat_id) : Vector3f(1.0f,1.0f,1.0f);
-
-        // Thin-film OPD (nm): 2 * n * d * cos(theta_t), simplified as 2*n*d*cosV
-        float opd_nm = 2.0f * enam_ior_v * enam_thick * NdotV;
-        Vector3f fringe = thin_film_fringe(opd_nm);
-        float fringe_w  = std::min(0.45f, enam_thick / 800.0f);
-        Vector3f tinted = col.cwiseProduct(enam_c).cwiseProduct(
-            Vector3f::Ones() + fringe * fringe_w);
-
-        // Enamel Fresnel gloss bump
-        float eF0 = (enam_ior_v - 1.0f) / (enam_ior_v + 1.0f);
-        eF0 *= eF0;
-        float eF  = schlick(eF0, NdotV);
-        tinted   += Vector3f(spec_col) * (eF * 0.28f * spec);
-
-        col = tinted * 0.35f + col * 0.65f;
-    }
-
+    Vector3f spec_col(0.0f, 0.0f, 0.0f);
+    float spec = 0.0f;
+    Vector3f col = kernel_shade_lights(m, pos_v, g, f, sc, &spec_col, &spec);
+    col = kernel_enamel_coat(col, m, g, spec_col, spec);
     return col;
 }
 
@@ -327,6 +454,32 @@ struct BaseRasterizerState {
     int n_materials           = 0;
 
     SceneParams scene;
+    // Runtime cap on the number of cluster-lights emitted per frame.
+    // Defaults to SceneParams::MAX_LIGHTS; clamped to [1, MAX_LIGHTS].
+    int max_lights = SceneParams::MAX_LIGHTS;
+
+    // ── Object-group cache for emissive cluster lights ────────────────
+    //
+    // One entry per host-declared group.  Centroid is stored in the
+    // view-space frame established by `last_mv`; on a BR_DIRTY_MV-only
+    // update we transport the centroid via `mv_new * last_mv.inverse()`,
+    // skipping any per-triangle work.  On BR_DIRTY_GEOM we recompute
+    // centroid + area_sum from the group's slice of the current
+    // verts_view buffer.  Clean groups consume zero work per frame.
+    struct GroupCache {
+        int      mat_id     = -1;
+        int      tri_offset = 0;
+        int      tri_count  = 0;
+        Vector3f centroid_v = Vector3f::Zero();
+        float    area_sum   = 0.0f;
+        Matrix4f last_mv    = Matrix4f::Identity();
+        bool     have_geom  = false;   // false until first DIRTY_GEOM resolved
+    };
+    std::unordered_map<int, GroupCache> group_cache;
+
+    // Per-frame group descriptor list (caller-owned copy).  Empty list ⇒
+    // no lights at all (legacy "draw whatever, no illumination" path).
+    std::vector<BRGroup> groups;
 
     // Per-tile triangle lists (rebuilt each render call)
     std::vector<std::vector<int>> tile_tris;
@@ -358,11 +511,12 @@ BaseRasterizerState* br_create(int width, int height, int tile_size) {
 void br_destroy(BaseRasterizerState* st) { delete st; }
 
 void br_clear(BaseRasterizerState* st, float r, float g, float b, float a) {
-    float* c = st->cbuf.data();
-    int n = st->width * st->height;
-    for (int i = 0; i < n; ++i) {
-        c[4*i+0] = r; c[4*i+1] = g; c[4*i+2] = b; c[4*i+3] = a;
-    }
+    const int n = st->width * st->height;
+    // Vectorized fill: map the framebuffer as a 4 x N matrix and broadcast
+    // the clear color across all columns in one expression.
+    Eigen::Map<Eigen::Matrix<float, 4, Eigen::Dynamic>> cmap(
+        st->cbuf.data(), 4, n);
+    cmap.colwise() = Vector4f(r, g, b, a);
     std::fill(st->zbuf.begin(), st->zbuf.end(), 1.0f);
 }
 
@@ -379,60 +533,59 @@ void br_set_enamel_chunk(BaseRasterizerState* st, const float* data, int n_mater
     (void)n_materials;
 }
 
-void br_set_scene(BaseRasterizerState* st,
-                  const float* light_v,
-                  const float* scene_rgb,
-                  float        scene_indirect) {
-    if (light_v)   st->scene.light_v   = Vector3f(light_v[0],   light_v[1],   light_v[2]).normalized();
-    if (scene_rgb) st->scene.scene_rgb = Vector3f(scene_rgb[0], scene_rgb[1], scene_rgb[2]);
-    st->scene.scene_indirect = scene_indirect;
+void br_set_scene(BaseRasterizerState* /*st*/,
+                  const float* /*light_v*/,
+                  const float* /*scene_rgb*/,
+                  float        /*scene_indirect*/) {
+    // No-op.  This entry point survived only as an ABI shim; it accepted
+    // an artificial scene tint and indirect-fill knob that this engine
+    // refuses on principle.  All illumination is now configured exclusively
+    // via br_set_lights() with real emitter colours and directions.
+}
+
+void br_set_lights(BaseRasterizerState* /*st*/,
+                   int          /*n_lights*/,
+                   const float* /*dirs*/,
+                   const float* /*colors*/,
+                   const float* /*intens*/) {
+    // No-op.  Light state is no longer carried in the rasterizer; every
+    // frame, br_render() rebuilds the active light set from the EMISSIVE
+    // MATERIALS attached to the rendered triangles.  Materials emit;
+    // nothing else does.  This entry point survives only as an ABI shim
+    // for ctypes/pybind callers that may still invoke it.
+}
+
+/* ── Object groups ──────────────────────────────────────────────────────── */
+//
+// The host's scene graph already has the partition we need: every triangle
+// belongs to one object, every object has one material and one model-view
+// transform.  We accept that partition verbatim and never re-discover it.
+//
+// A frame consists of (a) br_set_groups() with the full group list, then
+// (b) br_render() with the matching triangle soup.  Cached per-group
+// (centroid, area_sum) entries persist across frames.  A clean group does
+// no work; a BR_DIRTY_MV-only group does one 4×4 transform of its cached
+// centroid; only BR_DIRTY_GEOM walks triangles.
+void br_set_groups(BaseRasterizerState* st,
+                   int             n_groups,
+                   const BRGroup*  groups)
+{
+    if (!st) return;
+    st->groups.assign(groups, groups + std::max(0, n_groups));
+}
+
+void br_set_max_lights(BaseRasterizerState* st, int max_lights)
+{
+    if (!st) return;
+    if (max_lights < 1) max_lights = 1;
+    if (max_lights > SceneParams::MAX_LIGHTS) max_lights = SceneParams::MAX_LIGHTS;
+    st->max_lights = max_lights;
 }
 
 /* ── Project helpers ─────────────────────────────────────────────────────── */
 
-extern "C++" {
-
-static ProjVertex project_vertex(
-    const float* vv,        /* view-space [x,y,z,nx,ny,nz] */
-    const Matrix4f& proj,   /* projection-only matrix (clip = proj * view) */
-    float half_w, float half_h)
-{
-    ProjVertex pv;
-    // View-space position and normal
-    pv.pos_v = Vector3f(vv[0], vv[1], vv[2]);
-    pv.nrm_v = Vector3f(vv[3], vv[4], vv[5]);
-    pv.inv_w = 0.0f;
-    pv.ndc_z = 1.0f;
-    pv.valid = false;
-
-    // Project: clip = proj * view_pos (w=1 for affine input)
-    Vector4f clip = proj * Vector4f(vv[0], vv[1], vv[2], 1.0f);
-
-    if (!std::isfinite(clip.x()) || !std::isfinite(clip.y()) ||
-        !std::isfinite(clip.z()) || !std::isfinite(clip.w()) ||
-        clip.w() <= 1e-6f) {
-        pv.sx = pv.sy = -1e9f;
-        return pv;
-    }
-    float inv_w = 1.0f / clip.w();
-    float ndcx  = clip.x() * inv_w;
-    float ndcy  = clip.y() * inv_w;
-    float ndcz  = clip.z() * inv_w;
-    if (!std::isfinite(ndcx) || !std::isfinite(ndcy) || !std::isfinite(ndcz)) {
-        pv.sx = pv.sy = -1e9f;
-        return pv;
-    }
-
-    // NDC → screen pixels (y flipped: NDC +1 = top row)
-    pv.sx    = (ndcx + 1.0f) * half_w;
-    pv.sy    = (1.0f - ndcy) * half_h;   // flip Y
-    pv.inv_w = inv_w;
-    pv.ndc_z = ndcz;
-    pv.valid = true;
-    return pv;
-}
-
-} // extern "C++"
+// Vertex projection is performed in bulk inside br_render() as a single
+// proj(4×4) * positions(4 × 3N) GEMM — see the projection block there.
 
 /* ── Render ──────────────────────────────────────────────────────────────── */
 
@@ -457,14 +610,59 @@ void br_render(BaseRasterizerState* st,
         for (int r = 0; r < 4; ++r)
             proj(r, c) = mvp[c*4 + r];
 
-    // Project all vertices
+    // Project all vertices in one GEMM: clip(4 × 3N) = proj(4×4) * pos(4 × 3N).
+    // Building the homogeneous position matrix in a contiguous buffer lets
+    // Eigen's vectorized matmul amortize the projection cost across all
+    // vertices instead of doing 3N separate 4×1 matvecs.
+    const int n_verts = 3 * n_tris;
+    Eigen::Matrix<float, 4, Eigen::Dynamic> positions(4, n_verts);
+    for (int i = 0; i < n_tris; ++i) {
+        const float* base = verts_view + i * 18;
+        positions(0, 3*i+0) = base[0];   positions(1, 3*i+0) = base[1];
+        positions(2, 3*i+0) = base[2];   positions(3, 3*i+0) = 1.0f;
+        positions(0, 3*i+1) = base[6];   positions(1, 3*i+1) = base[7];
+        positions(2, 3*i+1) = base[8];   positions(3, 3*i+1) = 1.0f;
+        positions(0, 3*i+2) = base[12];  positions(1, 3*i+2) = base[13];
+        positions(2, 3*i+2) = base[14];  positions(3, 3*i+2) = 1.0f;
+    }
+    Eigen::Matrix<float, 4, Eigen::Dynamic> clip_all = proj * positions;
+
     st->screen_tris.resize(static_cast<size_t>(n_tris));
     for (int i = 0; i < n_tris; ++i) {
         ScreenTri& st_tri = st->screen_tris[i];
         const float* base = verts_view + i * 18;  // 3 verts × 6 floats
-        st_tri.v[0] = project_vertex(base +  0, proj, half_w, half_h);
-        st_tri.v[1] = project_vertex(base +  6, proj, half_w, half_h);
-        st_tri.v[2] = project_vertex(base + 12, proj, half_w, half_h);
+        for (int k = 0; k < 3; ++k) {
+            ProjVertex& pv = st_tri.v[k];
+            const float* vv = base + k * 6;
+            pv.pos_v = Vector3f(vv[0], vv[1], vv[2]);
+            pv.nrm_v = Vector3f(vv[3], vv[4], vv[5]);
+            pv.inv_w = 0.0f;
+            pv.ndc_z = 1.0f;
+            pv.valid = false;
+
+            const float cx = clip_all(0, 3*i+k);
+            const float cy = clip_all(1, 3*i+k);
+            const float cz = clip_all(2, 3*i+k);
+            const float cw = clip_all(3, 3*i+k);
+            if (!std::isfinite(cx) || !std::isfinite(cy) ||
+                !std::isfinite(cz) || !std::isfinite(cw) || cw <= 1e-6f) {
+                pv.sx = pv.sy = -1e9f;
+                continue;
+            }
+            const float inv_w = 1.0f / cw;
+            const float ndcx  = cx * inv_w;
+            const float ndcy  = cy * inv_w;
+            const float ndcz  = cz * inv_w;
+            if (!std::isfinite(ndcx) || !std::isfinite(ndcy) || !std::isfinite(ndcz)) {
+                pv.sx = pv.sy = -1e9f;
+                continue;
+            }
+            pv.sx    = (ndcx + 1.0f) * half_w;
+            pv.sy    = (1.0f - ndcy) * half_h;  // flip Y
+            pv.inv_w = inv_w;
+            pv.ndc_z = ndcz;
+            pv.valid = true;
+        }
         st_tri.mat_id = mat_ids[i];
 
         if (!st_tri.v[0].valid || !st_tri.v[1].valid || !st_tri.v[2].valid) {
@@ -532,12 +730,161 @@ void br_render(BaseRasterizerState* st,
     const float* pbr_data    = st->pbr_data;
     const float* phong_data  = st->phong_data;
     const float* enamel_data = st->enamel_data;
-    const SceneParams scene  = st->scene;
 
-    parallel_for(n_tiles, [&](int s, int e) {
-        for (int tile_id = s; tile_id < e; ++tile_id) {
+    // ── Update emissive-group cache, then derive scene lights ──────────
+    //
+    // The host has declared the partition via br_set_groups().  We never
+    // cluster by mat_id, never walk all triangles, never average across
+    // materials.  For each declared group we touch only the work that its
+    // dirty bitmask demands:
+    //
+    //   BR_DIRTY_GEOM → parallel reduction over the group's tri slice in
+    //                   verts_view to compute (centroid_v, area_sum) using
+    //                   Eigen's vectorised cross-product.
+    //   BR_DIRTY_MV   → one Matrix4f * Vector4f to transport the cached
+    //                   centroid into the new view frame.
+    //   BR_DIRTY_EMIT → no geometry work; emission is re-fetched at the
+    //                   light-emission step below.
+    //   0             → nothing.
+    //
+    // The cache lives in `st->group_cache` and persists across renders.
+    // Groups absent from the current st->groups list are dropped.
+    SceneParams scene;
+    {
+        // Drop stale cache entries (groups no longer declared).
+        {
+            std::unordered_map<int, BaseRasterizerState::GroupCache> kept;
+            kept.reserve(st->groups.size());
+            for (const BRGroup& g : st->groups) {
+                auto it = st->group_cache.find(g.group_id);
+                if (it != st->group_cache.end())
+                    kept.emplace(g.group_id, std::move(it->second));
+            }
+            st->group_cache.swap(kept);
+        }
+
+        // Update each declared group according to its dirty flags.
+        for (const BRGroup& g : st->groups) {
+            BaseRasterizerState::GroupCache& c = st->group_cache[g.group_id];
+            c.mat_id     = g.mat_id;
+            c.tri_offset = g.tri_offset;
+            c.tri_count  = g.tri_count;
+
+            // Parse mv (column-major).
+            Matrix4f mv;
+            for (int col = 0; col < 4; ++col)
+                for (int row = 0; row < 4; ++row)
+                    mv(row, col) = g.mv[col*4 + row];
+
+            const bool need_geom = (g.dirty & BR_DIRTY_GEOM) || !c.have_geom;
+            const bool need_mv   = (g.dirty & BR_DIRTY_MV) && !need_geom;
+
+            if (need_geom) {
+                // Parallel area-weighted centroid reduction over the group's
+                // triangle slice using Eigen Map for vectorised arithmetic.
+                int t0 = std::max(0, g.tri_offset);
+                int t1 = std::min(n_tris, g.tri_offset + g.tri_count);
+                int tn = std::max(0, t1 - t0);
+
+                if (tn > 0) {
+                    // Each thread accumulates its own (wpos, wsum) then we
+                    // reduce.  parallel_for splits over chunks of triangles.
+                    const int n_threads = std::max(1, (int)std::thread::hardware_concurrency());
+                    std::vector<Vector3f> wpos_acc(n_threads, Vector3f::Zero());
+                    std::vector<float>    wsum_acc(n_threads, 0.0f);
+
+                    parallel_for(n_threads, [&](int tid) {
+                        int chunk = (tn + n_threads - 1) / n_threads;
+                        int s = t0 + tid * chunk;
+                        int e = std::min(t0 + (tid + 1) * chunk, t1);
+                        Vector3f wp = Vector3f::Zero();
+                        float    ws = 0.0f;
+                        for (int i = s; i < e; ++i) {
+                            const float* base = verts_view + i * 18;
+                            // Eigen::Map for SIMD-friendly vec3 loads.
+                            Eigen::Map<const Vector3f> p0(base + 0);
+                            Eigen::Map<const Vector3f> p1(base + 6);
+                            Eigen::Map<const Vector3f> p2(base + 12);
+                            Vector3f e1 = p1 - p0;
+                            Vector3f e2 = p2 - p0;
+                            float area = 0.5f * e1.cross(e2).norm();
+                            if (area <= 0.0f) continue;
+                            Vector3f cc = (p0 + p1 + p2) * (1.0f / 3.0f);
+                            wp += cc * area;
+                            ws += area;
+                        }
+                        wpos_acc[tid] = wp;
+                        wsum_acc[tid] = ws;
+                    });
+
+                    Vector3f wp_total = Vector3f::Zero();
+                    float    ws_total = 0.0f;
+                    for (int t = 0; t < n_threads; ++t) {
+                        wp_total += wpos_acc[t];
+                        ws_total += wsum_acc[t];
+                    }
+                    if (ws_total > 1e-8f) {
+                        c.centroid_v = wp_total / ws_total;
+                        c.area_sum   = ws_total;
+                        c.last_mv    = mv;
+                        c.have_geom  = true;
+                    } else {
+                        c.area_sum  = 0.0f;
+                        c.have_geom = false;
+                    }
+                } else {
+                    c.area_sum  = 0.0f;
+                    c.have_geom = false;
+                }
+            } else if (need_mv) {
+                // Cheap path: re-transport cached centroid via mv_new * mv_old.inverse().
+                if (c.have_geom) {
+                    Matrix4f delta = mv * c.last_mv.inverse();
+                    Eigen::Vector4f c4(c.centroid_v.x(), c.centroid_v.y(), c.centroid_v.z(), 1.0f);
+                    Eigen::Vector4f cn = delta * c4;
+                    c.centroid_v = cn.head<3>();
+                    c.last_mv    = mv;
+                }
+            }
+        }
+
+        // Emit lights from the cache.  Up to MAX_LIGHTS strongest entries.
+        struct Cand { Vector3f pos; Vector3f col; float inten; };
+        std::vector<Cand> cands;
+        cands.reserve(st->group_cache.size());
+
+        const int n_mat = st->n_materials;
+        for (auto& kv : st->group_cache) {
+            const auto& c = kv.second;
+            if (!c.have_geom || c.area_sum <= 1e-8f) continue;
+            if (!pbr_data || c.mat_id < 0 || c.mat_id >= n_mat) continue;
+
+            Vector3f col = pbr_emission(pbr_data, c.mat_id);
+            float col_mag = col.norm();
+            if (col_mag < 1e-6f) continue;     // non-emissive group → no light
+
+            // Emit POSITIONAL light: store the cluster centroid in view
+            // space and let the per-fragment shader compute L = normalize(
+            // centroid - pos_v).  Directional approximation produced an
+            // apparent axis flip on receivers far from the camera origin.
+            cands.push_back({c.centroid_v, col, c.area_sum});
+        }
+        std::sort(cands.begin(), cands.end(),
+                  [](const Cand& a, const Cand& b){ return a.inten > b.inten; });
+        int nl = std::min((int)cands.size(),
+                          std::min(st->max_lights, SceneParams::MAX_LIGHTS));
+        scene.n_lights = nl;
+        for (int i = 0; i < nl; ++i) {
+            scene.light_positions[i]   = cands[i].pos;
+            scene.light_colors[i]      = cands[i].col;
+            scene.light_intensities[i] = cands[i].inten;
+        }
+    }
+
+    parallel_for(n_tiles, [&](int tile_id) {
+        {
             const auto& tlist = tile_tris[tile_id];
-            if (tlist.empty()) continue;
+            if (tlist.empty()) return;
 
             int ttx = tile_id % TX;
             int tty = tile_id / TX;
@@ -566,18 +913,28 @@ void br_render(BaseRasterizerState* st,
                 // area_inv will carry the sign; barycentric coords stay positive
 
                 for (int py = py0; py < py1; ++py) {
-                    for (int px = px0; px < px1; ++px) {
+                    float cy = py + 0.5f;
+                    // Bail out early if this row is entirely outside the bbox.
+                    if (cy < tri.bbox_y0 || cy > tri.bbox_y1) continue;
+
+                    // Row-start edge values: compute once, then step by ax[k] per pixel.
+                    float row_e0 = ax[0] * (px0 + 0.5f) + ay[0] * cy + ac[0];
+                    float row_e1 = ax[1] * (px0 + 0.5f) + ay[1] * cy + ac[1];
+                    float row_e2 = ax[2] * (px0 + 0.5f) + ay[2] * cy + ac[2];
+
+                    for (int px = px0; px < px1; ++px,
+                                                  row_e0 += ax[0],
+                                                  row_e1 += ax[1],
+                                                  row_e2 += ax[2]) {
                         float cx = px + 0.5f;
-                        float cy = py + 0.5f;
 
-                        // Quick bbox reject
-                        if (cx < tri.bbox_x0 || cx > tri.bbox_x1 ||
-                            cy < tri.bbox_y0 || cy > tri.bbox_y1) continue;
+                        // Quick bbox reject (x-axis only; y already checked)
+                        if (cx < tri.bbox_x0 || cx > tri.bbox_x1) continue;
 
-                        // Edge function test
-                        float e0 = ax[0] * cx + ay[0] * cy + ac[0];
-                        float e1 = ax[1] * cx + ay[1] * cy + ac[1];
-                        float e2 = ax[2] * cx + ay[2] * cy + ac[2];
+                        // Edge function test (values maintained incrementally)
+                        float e0 = row_e0;
+                        float e1 = row_e1;
+                        float e2 = row_e2;
                         // All must have the same sign as area
                         // area_inv < 0 (back-face culled), so we want e0,e1,e2 < 0
                         if (e0 > 0.0f || e1 > 0.0f || e2 > 0.0f) continue;
@@ -615,10 +972,13 @@ void br_render(BaseRasterizerState* st,
                             (tri.v[0].nrm_v * (lam0 * tri.v[0].inv_w)
                            + tri.v[1].nrm_v * (lam1 * tri.v[1].inv_w)
                            + tri.v[2].nrm_v * (lam2 * tri.v[2].inv_w)) * w;
-                        nrm_v.normalize();
+                        // Skip per-pixel normalize() of nrm_v and pos_v:
+                        // kernel_geometry_terms() renormalizes N, and the
+                        // sign of dot(nrm_v, -pos_v) is invariant under any
+                        // positive scaling — saving two sqrts per fragment.
 
                         // Shade
-                        bool front = nrm_v.dot(-pos_v.normalized()) >= 0.0f;
+                        bool front = nrm_v.dot(-pos_v) >= 0.0f;
                         float alpha;
                         Vector3f col = shade(pos_v, nrm_v, front,
                                              tri.mat_id,

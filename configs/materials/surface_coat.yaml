@@ -4,7 +4,7 @@
 name: surface_coat
 description: Protective finish that seals panels against grime and abrasion.
 
-albedo_rgb: [0.72, 0.70, 0.62]
+color_profile_name: surface_coat
 reflectivity: 0.42
 diffusion: 0.38
 absorption: 0.04

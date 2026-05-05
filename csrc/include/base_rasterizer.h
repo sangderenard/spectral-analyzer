@@ -84,6 +84,73 @@ void br_set_scene(BaseRasterizerState* st,
                   const float* scene_rgb,
                   float        scene_indirect);
 
+/**
+ * Push an explicit array of N directional lights.  Each light has its OWN
+ * colour and direction — the rasterizer does NOT average them.  This is the
+ * preferred path for multi-emitter scenes (the legacy `br_set_scene` builds
+ * a single mixed light, which destroys per-emitter colour identity).
+ *
+ * dirs   : (n_lights * 3) float32 — view-space unit direction per light.
+ * colors : (n_lights * 3) float32 — linear sRGB per light (no clamp).
+ * intens : (n_lights,)    float32 — scalar gain per light.
+ *
+ * Pass n_lights = 0 to clear the multi-light array and fall back to the
+ * legacy single-light synthesised from `br_set_scene` fields.
+ * Maximum supported lights: 8 (excess silently truncated).
+ */
+void br_set_lights(BaseRasterizerState* st,
+                   int          n_lights,
+                   const float* dirs,
+                   const float* colors,
+                   const float* intens);
+
+/* ── Object groups (the ONLY way to declare what emits light) ────────────── */
+/*
+ * The host application already knows what an "object" is.  Every triangle in
+ * a draw call belongs to exactly one such object, has exactly one material,
+ * and has a known model-view transform.  The renderer learns about objects
+ * via this API and caches one cluster-light per emissive object internally.
+ *
+ * Per-frame protocol:
+ *   The host calls `br_set_groups()` with the ENTIRE current partition of
+ *   triangles into groups (the n_groups groups must cover all n_tris in the
+ *   subsequent br_render() call).  Each group carries a `dirty` bitmask:
+ *
+ *     BR_DIRTY_GEOM (1) — triangles in this group changed (positions/topology
+ *                          or this group is brand-new).  Engine does a full
+ *                          recompute of the cached centroid+area for it.
+ *     BR_DIRTY_MV   (2) — only the model-view transform changed.  Engine
+ *                          re-transforms the cached centroid via
+ *                          mv_new * mv_old.inverse() — a single 4×4 mul.
+ *     BR_DIRTY_EMIT (4) — emission of this group's material changed.  Engine
+ *                          re-reads pbr.emission for the cached entry.
+ *     0             — no recompute.  Cache is reused verbatim.
+ *
+ *   The cache persists across br_render() calls.  Groups omitted from a
+ *   subsequent call are dropped from the cache.
+ */
+
+#define BR_DIRTY_GEOM 1
+#define BR_DIRTY_MV   2
+#define BR_DIRTY_EMIT 4
+
+typedef struct BRGroup {
+    int   group_id;        /* host-stable identity                          */
+    int   mat_id;          /* material index (PBR/phong/enamel chunks)      */
+    int   tri_offset;      /* first triangle in verts_view that is ours     */
+    int   tri_count;       /* number of triangles owned                     */
+    float mv[16];          /* column-major view transform of group's frame  */
+    int   dirty;           /* bitmask of BR_DIRTY_*                         */
+} BRGroup;
+
+void br_set_groups(BaseRasterizerState* st,
+                   int             n_groups,
+                   const BRGroup*  groups);
+
+/* Cap the number of cluster-lights emitted per frame from the group cache.
+   Clamped internally to [1, SceneParams::MAX_LIGHTS]. */
+void br_set_max_lights(BaseRasterizerState* st, int max_lights);
+
 /* ── Render ──────────────────────────────────────────────────────────────── */
 
 /**

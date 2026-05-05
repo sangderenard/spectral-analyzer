@@ -7,7 +7,7 @@
 name: nitrocellulose_lacquer
 description: Nitrocellulose lacquer finish (thin-film, over wood)
 
-albedo_rgb: [0.96, 0.94, 0.88]       # near-white with faint amber tint
+color_profile_name: nitrocellulose_lacquer
 reflectivity: 0.88                     # high specular peak at Fresnel angle
 diffusion: 0.06                        # almost entirely specular
 absorption: 0.02

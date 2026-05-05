@@ -4,7 +4,7 @@
 name: emitter_dust
 description: Phosphor and diode emitter powder for simple luminous pixels.
 
-albedo_rgb: [0.30, 0.72, 0.58]
+color_profile_name: emitter_dust
 reflectivity: 0.34
 diffusion: 0.68
 absorption: 0.05

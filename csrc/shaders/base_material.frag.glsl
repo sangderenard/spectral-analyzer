@@ -27,9 +27,15 @@
  *     enamel.color_rgb    → tint
  *
  * Scene uniforms (uploaded once per frame by base_gl_renderer.py):
- *   uLightV           — light direction in VIEW space (unit vec3)
- *   uSceneRgb         — environment spectral tint (vec3)
- *   uSceneIndirectRatio — indirect fill fraction [0,1]
+ *   uNumLights        — active light count (0..MAX_LIGHTS)
+ *   uLightDir [N]     — view-space unit direction per light
+ *   uLightColor[N]    — linear sRGB colour per light (no clamp)
+ *   uLightIntensity[N]— scalar gain per light
+ *
+ * There is NO ambient, NO scene tint, NO proxy bounce, NO hardcoded sun.
+ * Every photon comes from a real emitter pushed in by the host.  A non-
+ * emissive surface in a scene with zero lights renders pure black — that
+ * is physically correct for this engine.
  */
 
 /* ── Material SSBOs ───────────────────────────────────────────────────────── */
@@ -83,12 +89,27 @@ vec3  en_color (int id) { int b=id*ENAM_STRIDE+4; return vec3(enamel[b],enamel[b
 in  vec3     vNormV;
 in  vec3     vPosV;
 flat in int  vMatId;
+in  vec2     vUv;
 
 out vec4 FragColor;
 
-uniform vec3  uLightV;
-uniform vec3  uSceneRgb;
-uniform float uSceneIndirectRatio;
+// Multi-light array — every light is a real emitter.
+#define MAX_LIGHTS 8
+uniform int   uNumLights;
+uniform vec3  uLightDir      [MAX_LIGHTS];   // unit, view space
+uniform vec3  uLightColor    [MAX_LIGHTS];   // linear sRGB
+uniform float uLightIntensity[MAX_LIGHTS];
+
+// ── UV emission/depth/remit texture stack (Stage 2 of the action plan) ─────
+// Channel layout per UV_EMISSION_STACK_PLAN.md:
+//   R = direct gain    G = diffusion gain    B = saturation_adj    A = dim
+// Default 1×1×1 texel (0, 1, 0.5, 1) makes this an exact identity for any
+// caller that does not bind aUv / does not author an emission map: the
+// 'diffuse' branch passes the raw mat.emission through unchanged, the
+// 'direct' branch contributes nothing, and the saturation mix is identity.
+// Per-material emit_uv layer dispatch is deferred to a later mat-stride
+// expansion; for now everyone samples layer 0 (the default texel).
+uniform sampler2DArray uEmitUv;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -117,23 +138,16 @@ void main() {
 
     // Geometry
     vec3 N = normalize(gl_FrontFacing ? vNormV : -vNormV);
-    vec3 L = normalize(uLightV);
     vec3 V = normalize(-vPosV);
-    vec3 H = normalize(L + V);
-
-    float NdotL = max(dot(N, L), 0.0);
-    float NdotH = max(dot(N, H), 0.0);
     float NdotV = max(dot(N, V), 0.0);
 
     // Material parameters
     vec3  albedo   = mat_albedo   (id);
-    float rough    = mat_roughness(id);
     float metallic = mat_metallic (id);
     float ior      = mat_ior      (id);
     float opacity  = mat_opacity  (id);
     vec3  emission = mat_emission (id);
 
-    float ambient  = ph_ambient  (id);
     float specstr  = ph_specstr  (id);
     float shini    = ph_shininess(id);
     vec3  inner    = ph_inner    (id);
@@ -145,30 +159,51 @@ void main() {
     float ior_f0 = (ior - 1.0) / (ior + 1.0);
     ior_f0 *= ior_f0;
     vec3 F0 = mix(vec3(ior_f0), albedo, metallic);
-    // Fresnel at view angle
-    float F_scal = schlick(ior_f0, NdotV);
     vec3  F_vec  = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
 
-    // Diffuse + specular
-    float diff = NdotL;
-    float spec = pow(NdotH, max(shini, 1.0));
+    // Direct illumination from real emitters only.
+    vec3 col = vec3(0.0);
+    vec3 spec_col_acc = vec3(0.0);
+    float spec_acc = 0.0;
+    int n = min(uNumLights, MAX_LIGHTS);
+    for (int i = 0; i < n; ++i) {
+        vec3  L     = uLightDir[i];
+        vec3  Lcol  = uLightColor[i] * uLightIntensity[i];
+        vec3  H     = normalize(L + V);
+        float NdotL = max(dot(N, L), 0.0);
+        float NdotH = max(dot(N, H), 0.0);
+        float spec  = pow(NdotH, max(shini, 1.0));
 
-    // Scene-tinted ambient (indirect fill in shadowed regions)
-    vec3  amb_light  = ambient * mix(vec3(1.0), uSceneRgb, 0.55);
-    float shadowFill = uSceneIndirectRatio * 0.28 * (1.0 - diff);
+        // Lambertian diffuse: surface albedo × emitter radiance × cos(theta)
+        col += base * Lcol * NdotL;
 
-    // Specular colour: neutral warm tint blended with scene
-    vec3 spec_col = mix(vec3(1.0, 0.93, 0.70), uSceneRgb, 0.35);
+        // Phong specular: emitter colour modulated by Fresnel reflectance.
+        col += Lcol * F_vec * (specstr * spec);
 
-    vec3 col = base * (amb_light + (0.78 + shadowFill) * diff)
-             + spec_col * F_vec * (specstr * spec);
+        spec_col_acc += Lcol * spec;
+        spec_acc     += spec;
+    }
 
-    // Rim lighting driven by indirect fill ratio
-    float rim = pow(1.0 - NdotV, 3.0);
-    col += base * rim * mix(0.14, 0.22, uSceneIndirectRatio);
+    // ── Self-emission via UV texture-pack ────────────────────────────────
+    // Five-line hot-loop math from UV_EMISSION_STACK_PLAN.md.  With the
+    // default 1×1×1 identity texel this collapses to `col += emission`,
+    // matching the pre-Stage-2 behaviour for any caller that hasn't yet
+    // bound a real emission texture array.
+    vec4  e_uv     = texture(uEmitUv, vec3(vUv, 0.0));
+    vec3  emit_dim = emission * e_uv.a;                       // dim
+    // 'direct' couples self-emission into the specular lobe of the
+    // dominant light direction.  With no lights the term is zero.
+    vec3  spec_dir = (spec_acc > 0.0) ? (spec_col_acc / spec_acc) : vec3(0.0);
+    vec3  emit_dir = emit_dim * e_uv.r * spec_dir;
+    vec3  emit_dif = emit_dim * e_uv.g;                       // lambertian
+    vec3  emit_mix = emit_dir + emit_dif;
+    float emit_lum = dot(emit_mix, vec3(0.2126, 0.7152, 0.0722));
+    vec3  emit_out = mix(vec3(emit_lum), emit_mix, 0.5 + e_uv.b);
+    col += emit_out;
 
-    // Self-emission
-    col += emission;
+    // Enamel layer below uses these representative spec terms.
+    vec3  spec_col = spec_col_acc;
+    float spec     = spec_acc;
 
     // ── Enamel thin-film coating ──────────────────────────────────────────
     // Skipped entirely if thickness_nm == 0 (most materials).

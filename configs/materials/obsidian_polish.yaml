@@ -1,0 +1,32 @@
+# Material: obsidian_polish
+# Black volcanic glass — very dark albedo, dielectric (not metallic), but
+# polished to a mirror smoothness so the specular highlight tells you the
+# surface curvature.  Useful contrast against the gold central sphere.
+
+name: obsidian_polish
+description: Polished black volcanic glass (obsidian)
+
+# Spectral color (registered by test harness; baked into pbr[:,0:3]).
+color_profile_name: obsidian_body
+reflectivity:  0.06
+diffusion:     0.04
+absorption:    0.90
+ior:           1.49                    # obsidian
+opacity:       1.0
+smoothness:    0.96
+
+roughness:     0.06
+metallic:      0.0
+transmission:  0.0
+
+ambient:       0.04
+spec_strength: 0.32
+shininess:     200.0
+inner_color:   [0.012, 0.010, 0.014]
+
+notes: >
+  Looks black across most of the surface; the only readable signal is the
+  Phong/Fresnel highlight where the camera-to-surface angle drives the
+  specular term.  Confirms that the rasterizer's view-space normal
+  interpolation is producing a continuous specular sweep rather than
+  faceted bands.

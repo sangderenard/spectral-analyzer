@@ -6,7 +6,7 @@
 name: interior_cavity
 description: Guitar body interior — raw wood bracing and kerfing
 
-albedo_rgb: [0.55, 0.45, 0.30]       # raw unfinished spruce — warmer, less saturated
+color_profile_name: interior_cavity
 reflectivity: 0.42                     # lower than finished exterior
 diffusion: 0.92                        # nearly Lambertian — no finish
 absorption: 0.22                       # higher loss per bounce (rough grain, glue joints)

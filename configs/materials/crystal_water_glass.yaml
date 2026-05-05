@@ -5,7 +5,7 @@
 name: crystal_water_glass
 description: Lead-free crystal drinking glass
 
-albedo_rgb: [0.97, 0.97, 0.97]       # essentially colourless
+color_profile_name: crystal_water_glass
 reflectivity: 0.045
 diffusion: 0.015
 absorption: 0.001                      # nearly zero bulk absorption
@@ -13,7 +13,6 @@ absorption: 0.001                      # nearly zero bulk absorption
 ior: 1.545
 opacity: 0.0
 
-transmission_rgb: [0.995, 0.995, 0.995]
 abbe_number: 55.0
 cauchy_b: 0.00820
 

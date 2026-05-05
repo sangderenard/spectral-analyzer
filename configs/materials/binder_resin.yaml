@@ -4,7 +4,7 @@
 name: binder_resin
 description: Plant-derived binder resin for pressed panels.
 
-albedo_rgb: [0.62, 0.48, 0.30]
+color_profile_name: binder_resin
 reflectivity: 0.28
 diffusion: 0.55
 absorption: 0.08

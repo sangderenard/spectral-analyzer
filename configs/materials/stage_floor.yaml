@@ -5,7 +5,7 @@
 name: stage_floor
 description: Stage floor — dark stained hardwood
 
-albedo_rgb: [0.30, 0.22, 0.16]       # linear sRGB — dark warm brown
+color_profile_name: stage_floor
 reflectivity: 0.52
 diffusion: 0.80
 absorption: 0.10

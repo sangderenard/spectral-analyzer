@@ -5,7 +5,7 @@
 name: soda_lime_glass
 description: Soda-lime glass — common window and bottle glass
 
-albedo_rgb: [0.88, 0.93, 0.88]       # faint green tint from iron oxide
+color_profile_name: soda_lime_glass
 reflectivity: 0.043
 diffusion: 0.04
 absorption: 0.008                      # mild bulk absorption (green-absorbing)
@@ -13,7 +13,6 @@ absorption: 0.008                      # mild bulk absorption (green-absorbing)
 ior: 1.523
 opacity: 0.0
 
-transmission_rgb: [0.92, 0.97, 0.90]  # slight green transmission, weak red/blue
 abbe_number: 58.9
 cauchy_b: 0.00680
 

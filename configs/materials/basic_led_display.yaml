@@ -5,7 +5,7 @@
 name: basic_led_display
 description: Basic LED display tile - low-resolution luminous screen stock
 
-albedo_rgb: [0.08, 0.13, 0.16]
+color_profile_name: led_screen_face
 reflectivity: 0.22
 diffusion: 0.32
 absorption: 0.18
@@ -13,7 +13,9 @@ absorption: 0.18
 smoothness: 0.68
 ior: 1.55
 opacity: 1.0
-emit_profile_idx: -1
+# Named reference — resolved to integer index by _load_material_yaml via
+# EmissionProfileDatabase.  Index 0 = "basic_led_display" (cool-white ~6500K).
+emit_profile_name: basic_led_display
 
 gameplay:
   label: Basic LED Display

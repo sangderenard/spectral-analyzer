@@ -6,7 +6,7 @@
 name: rosewood_fretboard
 description: Guitar fretboard and bridge — Indian rosewood
 
-albedo_rgb: [0.22, 0.10, 0.06]       # linear sRGB — very dark reddish-brown
+color_profile_name: rosewood
 reflectivity: 0.45                     # lower — oily surface scatters rather than reflects
 diffusion: 0.88                        # highly diffuse (no lacquer)
 absorption: 0.18

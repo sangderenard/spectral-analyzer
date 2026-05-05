@@ -5,7 +5,7 @@
 name: steel_strings
 description: Steel-core acoustic guitar strings — phosphor-bronze wound
 
-albedo_rgb: [0.72, 0.70, 0.65]       # linear sRGB — neutral steel silver (slight warm)
+color_profile_name: steel
 reflectivity: 0.91                     # near-mirror metallic
 diffusion: 0.04                        # nearly all specular
 absorption: 0.02

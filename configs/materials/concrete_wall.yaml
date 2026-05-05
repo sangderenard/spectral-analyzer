@@ -5,7 +5,7 @@
 name: concrete_wall
 description: Stage walls — painted concrete
 
-albedo_rgb: [0.30, 0.28, 0.25]       # linear sRGB — warm medium grey
+color_profile_name: concrete
 reflectivity: 0.40
 diffusion: 0.90
 absorption: 0.05

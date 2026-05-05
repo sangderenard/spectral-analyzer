@@ -1,0 +1,40 @@
+# Material: sapphire_emissive
+# Faceted sapphire-blue gem with HDR emissive core — paired with the emerald
+# orb so the emissive set spans more than one chromatic axis.  Used as the
+# second light source in the test harness's scene-light derivation.
+
+name: sapphire_emissive
+description: Sapphire-blue crystal with internal HDR self-emission
+
+# Spectral color (registered by test harness; baked into pbr[:,0:3]).
+color_profile_name: sapphire_body
+reflectivity:  0.24
+diffusion:     0.18
+absorption:    0.42
+ior:           1.77                    # sapphire (corundum)
+opacity:       1.0
+smoothness:    0.90
+
+roughness:     0.16
+metallic:      0.0
+transmission:  0.0
+# Spectral emission profile — registered by test_basic_shader.py at startup.
+emit_profile_name: sapphire_internal
+
+ambient:       0.12
+spec_strength: 0.50
+shininess:     140.0
+inner_color:   [0.06, 0.12, 0.42]
+
+enamel:
+  thickness_nm: 260.0                  # cyan-magenta iridescence
+  ior_real:     1.62
+  ior_imag:     0.0
+  roughness:    0.04
+  color_rgb:    [0.96, 0.98, 1.00]
+
+notes: >
+  Counterweight to test_emerald_emissive on the colour wheel — having two
+  HDR emitters at different chromatic axes makes the scene_rgb derivation
+  produce a non-degenerate light vector, which exercises the rasterizer's
+  Phong specular term across both warm and cool reflectance regimes.

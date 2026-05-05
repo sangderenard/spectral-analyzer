@@ -1,0 +1,45 @@
+# Material: ruby_glass
+# Deep-red translucent gem.  Phong shows up as a bright pinpoint highlight on
+# a dark cherry-red body.  Opaque in this raster path (no transmission), but
+# the high IOR drives a strong Fresnel rim.
+
+name: ruby_glass
+description: Deep cherry-red translucent ruby-style gemstone
+
+# Spectral color (registered by test harness; baked into pbr[:,0:3]).
+color_profile_name: ruby_body
+reflectivity:  0.18
+diffusion:     0.12
+absorption:    0.70
+ior:           1.77                    # ruby/sapphire (corundum)
+opacity:       1.0
+smoothness:    0.92
+
+roughness:     0.10
+metallic:      0.0
+transmission:  0.0
+# Spectral emission profile — registered by test_basic_shader.py at startup.
+emit_profile_name: ruby_internal
+# Frame-delayed re-emission: under stimulus the body re-emits a deep red lobe
+# over a 12-frame exponential tail (default envelope curve).  This is the
+# physical demonstration of "remission as a one-frame-lagged FIR" — there is
+# no feedback solve; the engine simply convolves stimulus history × envelope
+# and writes the result into next frame's emission slot.
+remit_profile_name: ruby_afterglow
+
+ambient:       0.10
+spec_strength: 0.55
+shininess:     180.0
+inner_color:   [0.32, 0.02, 0.03]      # darker cherry inside
+
+enamel:
+  thickness_nm: 140.0                  # subtle violet iridescence
+  ior_real:     1.62
+  ior_imag:     0.0
+  roughness:    0.03
+  color_rgb:    [1.00, 0.95, 0.96]
+
+notes: >
+  Acts as the "warm-coloured Fresnel test" — dielectric, no metal, but very
+  high IOR.  The Phong specular should stay bright while the Lambertian body
+  stays dark and richly red.

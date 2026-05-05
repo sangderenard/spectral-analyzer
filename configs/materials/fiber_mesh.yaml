@@ -4,7 +4,7 @@
 name: fiber_mesh
 description: Woven reinforcement from reclaimed strands and cultured cellulose.
 
-albedo_rgb: [0.58, 0.56, 0.50]
+color_profile_name: fiber_mesh
 reflectivity: 0.20
 diffusion: 0.82
 absorption: 0.06

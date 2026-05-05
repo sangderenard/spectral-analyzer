@@ -1,0 +1,33 @@
+# Material: hyperbolic_slate
+# Background material for the hyperbolic-saddle ground plane in the
+# rasterizer stress test.  Cool dark slate with mild grain so the saddle
+# curvature shows up via shading rather than texture.
+
+name: hyperbolic_slate
+description: Cool dark slate, matte finish — backdrop saddle plane
+
+# Spectral color (registered by test harness; baked into pbr[:,0:3]).
+color_profile_name: slate_body
+reflectivity:  0.22
+diffusion:     0.78
+absorption:    0.18
+ior:           1.55                    # slate
+opacity:       1.0
+smoothness:    0.30
+
+roughness:     0.78
+metallic:      0.0
+transmission:  0.0
+
+ambient:       0.20
+spec_strength: 0.06
+shininess:     12.0
+inner_color:   [0.10, 0.11, 0.13]
+
+notes: >
+  The saddle is sampled as a regular (x, y) grid with z = (x² − y²)/k, which
+  produces a hyperbolic-paraboloid surface.  A high-roughness, low-spec
+  material here lets the geometry's Gaussian curvature read clearly: the
+  saddle's two principal directions will manifest as opposing brightness
+  gradients across the patch.  Keep the albedo cool so the warm-tinted
+  emissive orbs dominate the colour contribution to scene_rgb.

@@ -4,22 +4,35 @@ Central material registry with chunked tensor export.
 
 Architecture
 ------------
-Every material in the scene is registered by name.  The database renders all
-registered materials into **chunked** (property-group-major) float32 tensors
-suitable for broadcast CPU processing or direct upload to GPU SSBOs.
+Every material in the scene is registered by name once at startup.  At the
+end of registration the database renders all materials into **chunked**
+(property-group-major) float32 tensors.  These tensors are the ONE source
+of truth consulted by the hot graphics loop — they are plain row-indexable
+arrays, NOT keyed lookups, NOT runtime profile resolutions.
+
+    pbr_chunk[mat_ids, 8:11]     # ← what a hot loop actually does
+
+All spectral profile resolution (SPD → linear sRGB), all enamel packing,
+all derived-shader downsamples are performed once inside build_tensors()
+before the first frame.  Nothing in the draw loop ever queries the
+EmissionProfileDatabase or any other auxiliary store.
 
 Chunked layout (NOT interleaved / AoS)
 ---------------------------------------
 For N registered materials each tensor is shape (N, stride_floats):
 
-    pbr_chunk      (N, 16)            — PBR base parameters
-    phong_chunk    (N,  8)            — derived Phong rasteriser parameters
-    ray_chunk      (N, 16)            — ray-tracer mat (successor to mat11)
-    spectral_chunk (N, MAX_BANDS, 12) — per-frequency-band properties
-    enamel_chunk   (N,  8)            — thin-film enamel coating
+    pbr_chunk         (N, 16)            — full authored PBR record
+    phong_compat      (N,  8)            — DOWNSTREAM-ONLY Phong sink
+    raymat_compat     (N, 16)            — DOWNSTREAM-ONLY raytracer sink
+    spectral_chunk    (N, MAX_BANDS, 12) — per-frequency-band properties
+    enamel_chunk      (N,  8)            — thin-film enamel coating
 
-A shader that only needs IOR reads ray_chunk[:, 12]; it does not touch the
-other chunks at all.  Each chunk can be a separate SSBO binding.
+The `_compat` chunks are NOT alternative authoring formats; they are
+strictly post-conversion prebakes for shader paths that cannot consume the
+full PBR record.  Authors never write to them, never consult them, and
+never name their fields in YAML.  A shader that only knows Phong samples
+phong_compat; a shader that only knows mat11 samples raymat_compat.  Both
+were derived from the same PBR + spectral records at startup.
 
 ctypes structures
 -----------------
@@ -32,9 +45,9 @@ GLSL binding sketch (std430)
 ----------------------------
     // binding = 10
     layout(std430, binding=10) readonly buffer PBRChunk   { float pbr[];      };
-    // binding = 11
+    // binding = 11  (phong_compat — downstream-only)
     layout(std430, binding=11) readonly buffer PhongChunk { float phong[];    };
-    // binding = 12
+    // binding = 12  (raymat_compat — downstream-only)
     layout(std430, binding=12) readonly buffer RayChunk   { float ray[];      };
     // binding = 13
     layout(std430, binding=13) readonly buffer SpecChunk  { float spectral[]; };
@@ -47,11 +60,11 @@ GLSL binding sketch (std430)
         return vec3(pbr[base], pbr[base+1], pbr[base+2]);
     }
 
-Legacy compatibility
---------------------
-    db.as_mat11(name)      → 11-float32 legacy array (for _normalise_materials)
-    db.as_phong_dict(name) → dict for _pbr_to_phong callers
-    db.mat11_tensor()      → (N, 11) float32 for all materials
+Compatibility extraction (post-bake, for legacy callers only)
+-------------------------------------------------------------
+    db.as_compat_mat11(name)     → 11-float32 array (legacy raytracer feed)
+    db.as_compat_phong(name)     → dict with Phong uniform keys
+    db.compat_mat11_tensor()     → (N, 11) float32 for all materials
 """
 from __future__ import annotations
 
@@ -385,8 +398,19 @@ def _fill_spectral(rec: SpectralRecord, mat: Any) -> None:
 
 
 def _fill_enamel(rec: EnamelRecord, mat: Any) -> None:
-    """Fill EnamelRecord from Material.enamel or leave as null coating."""
-    enamel = getattr(mat, 'enamel', None)
+    """Fill EnamelRecord from Material.enamel or a dict's 'enamel' key.
+
+    Accepts either:
+      * an object with `.enamel` attribute (spectral_material.Material)
+      * a dict with an `enamel` sub-dict carrying thickness_nm/thickness_m,
+        ior_real, ior_imag, roughness, color_rgb
+    Returns a null coating (thickness_nm = 0) when no enamel is declared.
+    """
+    enamel = None
+    if isinstance(mat, dict):
+        enamel = mat.get('enamel', None)
+    if enamel is None:
+        enamel = getattr(mat, 'enamel', None)
     if enamel is None:
         # Null coating — thickness_nm = 0 signals the shader to skip
         rec.thickness_nm = 0.0
@@ -395,11 +419,21 @@ def _fill_enamel(rec: EnamelRecord, mat: Any) -> None:
         rec.roughness    = 0.5
         rec.color[0] = rec.color[1] = rec.color[2] = 1.0
         return
-    rec.thickness_nm = float(getattr(enamel, 'thickness_m', 0.0)) * 1.0e9
-    rec.ior_real     = float(getattr(enamel, 'ior_real', 1.52))
-    rec.ior_imag     = float(getattr(enamel, 'ior_imag', 0.0))
-    rec.roughness    = float(getattr(enamel, 'roughness', 0.05))
-    c = getattr(enamel, 'color_rgb', [1.0, 1.0, 1.0])
+    if isinstance(enamel, dict):
+        if 'thickness_nm' in enamel:
+            rec.thickness_nm = float(enamel['thickness_nm'])
+        else:
+            rec.thickness_nm = float(enamel.get('thickness_m', 0.0)) * 1.0e9
+        rec.ior_real  = float(enamel.get('ior_real', 1.52))
+        rec.ior_imag  = float(enamel.get('ior_imag', 0.0))
+        rec.roughness = float(enamel.get('roughness', 0.05))
+        c = enamel.get('color_rgb', [1.0, 1.0, 1.0])
+    else:
+        rec.thickness_nm = float(getattr(enamel, 'thickness_m', 0.0)) * 1.0e9
+        rec.ior_real     = float(getattr(enamel, 'ior_real', 1.52))
+        rec.ior_imag     = float(getattr(enamel, 'ior_imag', 0.0))
+        rec.roughness    = float(getattr(enamel, 'roughness', 0.05))
+        c = getattr(enamel, 'color_rgb', [1.0, 1.0, 1.0])
     rec.color[0], rec.color[1], rec.color[2] = float(c[0]), float(c[1]), float(c[2])
 
 
@@ -480,6 +514,83 @@ class EmissionProfile:
 
 
 @dataclass
+class RemissionResponseEnvelope:
+    """Time-domain impulse response for **frame-delayed** re-emission.
+
+    The remission system is intentionally not a self-consistent solve.  When a
+    surface is irradiated at frame ``F``, the resulting re-emission appears in
+    frames ``F+1, F+2, ..., F+N`` shaped by this envelope — never in frame
+    ``F`` itself.  This avoids any feedback loop: the renderer reads the
+    previous frame's stimulus, multiplies by the impulse response coefficients,
+    and writes the result into next frame's emission slot.
+
+    Shape source
+    ────────────
+    The envelope is authored as either:
+
+    * a ``parametric_curve.ParametricCurve`` (or any ``Callable[[float],float]``)
+      sampled over normalised t ∈ [0, 1] — yields ``decay_frames`` impulse
+      coefficients via :py:meth:`bake`, OR
+
+    * ``curve=None`` ⇒ default exponential decay  ``exp(-3·k/N)``  over
+      ``decay_frames`` samples (a clean, physically plausible thermal-style
+      relaxation that finishes ≈5% by the last frame).
+
+    All coefficients are baked **once** at registration time and uploaded
+    alongside the spectral RGB tensor.  The hot loop only does an FIR
+    convolution against a small ring buffer of past stimuli — never a
+    callable evaluation.
+
+    Coefficient layout
+    ──────────────────
+    ``_ir`` (shape ``(decay_frames,)`` float32) is the discrete impulse
+    response.  ``_ir[k]`` multiplies the stimulus from ``k+1`` frames ago;
+    ``_ir[0]`` is the strongest contribution (most recent stimulus).
+    """
+    curve:        object  = None      # parametric_curve.ParametricCurve | Callable | None
+    decay_frames: int     = 8         # length of the impulse response
+    gain:         float   = 1.0       # global scalar applied after sampling
+    _ir:          "np.ndarray" = field(default=None, repr=False, compare=False)
+
+    def bake(self) -> "np.ndarray":
+        """Sample the curve at ``decay_frames`` evenly-spaced normalised
+        t-values and store the result as ``self._ir``.  Returns the impulse
+        response (shape ``(decay_frames,)`` float32)."""
+        n = max(1, int(self.decay_frames))
+        if self.curve is None:
+            # Default thermal-style exponential decay
+            ks = np.arange(n, dtype=np.float32)
+            ir = np.exp(-3.0 * ks / float(n)).astype(np.float32)
+        else:
+            ts = np.linspace(0.0, 1.0, n, dtype=np.float64)
+            try:
+                # parametric_curve.ParametricCurve callable interface:
+                # accepts a tensor / scalar in [0,1], returns tensor.
+                import torch as _t
+                t_t = _t.from_numpy(ts)
+                vals = self.curve(t_t)
+                if hasattr(vals, "detach"):
+                    vals = vals.detach().cpu().numpy()
+                ir = np.asarray(vals, dtype=np.float32).reshape(-1)
+            except Exception:
+                # Plain Python callable fallback
+                ir = np.asarray([float(self.curve(t)) for t in ts],
+                                dtype=np.float32)
+            if ir.size != n:
+                ir = np.resize(ir, n).astype(np.float32)
+        ir = ir.astype(np.float32) * float(self.gain)
+        self._ir = ir
+        return ir
+
+    @property
+    def ir(self) -> "np.ndarray":
+        """Cached impulse response.  Bakes lazily on first access."""
+        if self._ir is None:
+            return self.bake()
+        return self._ir
+
+
+@dataclass
 class RemissionProfile:
     """Profile for re-emission; carries batch transform lambdas for structural color.
 
@@ -497,10 +608,17 @@ class RemissionProfile:
     the transformed out_dir (cols 7-9) for the whole batch in one vectorised call.
     Setting this field automatically prepends the manifold's batch callable to
     ``transforms`` via :py:meth:`set_manifold`.
+
+    ``response_envelope`` (optional) makes this a *frame-delayed re-emitter*:
+    the engine reads previous-frame stimulus per material, convolves with the
+    envelope's impulse response, multiplies by ``spread.frequency``-derived
+    sRGB, and writes the result into next frame's ``pbr[mat_id, 8:11]``.  See
+    :class:`RemissionFeedbackEngine`.
     """
     spread:               SpreadProfile  = field(default_factory=SpreadProfile)
     transforms:           List[Callable] = field(default_factory=list)
     manifold:             object         = field(default=None)   # LensManifold | None
+    response_envelope:    "RemissionResponseEnvelope | None" = None
 
     def set_manifold(self, manifold) -> None:
         def _manifold_transform(batch: "np.ndarray") -> "np.ndarray":
@@ -549,18 +667,72 @@ class EmissionProfileDatabase:
     def __init__(self) -> None:
         self._profiles: Dict[str, Any] = {}
         self._order:    List[str]      = []
+        self._rgb_tensor: np.ndarray   = np.zeros((1, 3), np.float32)
+
+    def _rebake_rgb_tensor(self) -> None:
+        """Precompute linear-sRGB for all profiles once (outside render loop).
+
+        This is the only place where profile_to_rgb is evaluated.
+        """
+        N = max(1, len(self._order))
+        out = np.zeros((N, 3), np.float32)
+        for i, name in enumerate(self._order):
+            out[i] = profile_to_rgb(self._profiles[name])
+        self._rgb_tensor = out
 
     @classmethod
     def instance(cls) -> "EmissionProfileDatabase":
         if cls._instance is None:
             cls._instance = cls()
+            cls._instance._register_builtins()
         return cls._instance
+
+    def _register_builtins(self) -> None:
+        """Register standard emission profiles that are available at startup.
+
+        These represent the physical light sources used by built-in materials.
+        Indices are assigned in registration order and must stay stable across
+        runs — append only, never reorder.  Each entry gets a permanent integer
+        index; never reorder, only append.
+        """
+        # Index 0: basic_led_display
+        # Cool monitor backlight, modeled as two additive spectral terms:
+        #   1) narrow blue pump around 450 nm,
+        #   2) broader cyan phosphor shoulder around 510 nm.
+        # This yields a dim blue-tinted output (B > G > R) suitable for
+        # non-directional ambient-like screen glow in raster paths.
+        self.register("basic_led_display", EmissionProfile(
+            spd=[
+                ParametricSpread(amp=1.0, center=450.0, q=18.0),
+                ParametricSpread(amp=0.30, center=510.0, q=5.0),
+            ],
+            peak_wavelength_nm=450.0,
+            fwhm_nm=25.0,
+            total_power_W=0.35,
+        ))
+
+        # Index 1: missing_material_hazard
+        # Warm amber warning glow used by fallback materials when a requested
+        # YAML/material registration fails.  This should be noticeable but not
+        # scene-dominating, so keep total_power moderate.
+        self.register("missing_material_hazard", EmissionProfile(
+            spd=[
+                ParametricSpread(amp=1.0, center=590.0, q=12.0),
+                ParametricSpread(amp=0.25, center=620.0, q=10.0),
+            ],
+            peak_wavelength_nm=590.0,
+            fwhm_nm=49.0,
+            total_power_W=0.22,
+        ))
+        self._rebake_rgb_tensor()
 
     def register(self, name: str, profile: Any) -> int:
         """Register a profile object.  Returns its integer index (0-based)."""
         if name not in self._profiles:
             self._order.append(name)
         self._profiles[name] = profile
+        # Eager prebake: profile->RGB conversion happens here, never in draw loop.
+        self._rebake_rgb_tensor()
         return self._order.index(name)
 
     def index_of(self, name: str) -> int:
@@ -578,6 +750,14 @@ class EmissionProfileDatabase:
         return name in self._profiles
 
     # ── Tensor export ─────────────────────────────────────────────────────────
+
+    def build_rgb_tensor(self) -> np.ndarray:
+        """Return prebaked (max(1,N), 3) float32 linear sRGB profile table.
+
+        No profile conversion is performed here; values are baked at
+        registration time via _rebake_rgb_tensor().
+        """
+        return self._rgb_tensor
 
     def build_gpu_tensor(self) -> np.ndarray:
         """Return flat float32 array for SSBO upload at binding 7.
@@ -695,25 +875,352 @@ def _pack_spread_profile(spread: "SpreadProfile", dst: np.ndarray) -> None:
     _pack_spread_to_row(spread.amplitude, dst[12:16])
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Emission-profile → linear sRGB conversion (first principles)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Wavelength grid 380–780 nm, 5 nm steps (81 samples).
+_WL_NM: np.ndarray = np.arange(380.0, 785.0, 5.0, dtype=np.float64)
+
+def _cie_cmf() -> "tuple[np.ndarray, np.ndarray, np.ndarray]":
+    """CIE 1931 2° colour-matching functions via Wyman et al. (2013) Gaussians.
+
+    Returns (x̄, ȳ, z̄) each of length 81, sampled on _WL_NM (380..780 nm).
+    Negative lobes in x̄ are retained so the chromaticity is physically correct;
+    they are clipped only when computing SPD integrals (where a negative CMF
+    contribution from the x̄ sub-lobe can produce out-of-gamut values for
+    monochromatic primaries near 500 nm, which is physical — sRGB is not convex).
+    """
+    l = _WL_NM
+    def _g(mu: float, sigma: float, amp: float = 1.0) -> np.ndarray:
+        return amp * np.exp(-0.5 * ((l - mu) / sigma) ** 2)
+
+    xbar = _g(599.8, 37.9, 1.056) + _g(442.0, 16.0, 0.362) + _g(501.1, 20.4, -0.065)
+    ybar = _g(568.8, 46.9, 0.821) + _g(530.9, 16.3, 0.286)
+    zbar = _g(437.0, 20.0, 1.217) + _g(459.0, 11.18, 0.681)
+    return xbar, ybar, zbar
+
+
+# Pre-compute once at import time.
+_CMF_X, _CMF_Y, _CMF_Z = _cie_cmf()
+
+# Normalisation constant: ∫ ȳ(λ) dλ over 380–780 nm (5 nm step).
+# A flat equal-energy illuminant with power = 1 W will produce Y = 1.0.
+_CMF_Y_NORM: float = float(np.sum(_CMF_Y) * 5.0)
+
+
+def _spd_term_to_array(term: Any) -> np.ndarray:
+    """Convert one spectral term into an SPD sampled on _WL_NM.
+
+    Supported term forms:
+      - ParametricSpread
+      - HistogramSpread
+      - dict with either:
+          {"kind": "parametric", "amp", "center", "q"}
+          {"kind": "histogram", "edges", "values"}
+        Optional field: "weight" (default 1.0)
+    """
+    weight = 1.0
+    spread = term
+
+    if isinstance(term, dict):
+        weight = float(term.get("weight", 1.0))
+        kind = str(term.get("kind", "parametric")).lower()
+        if kind == "histogram":
+            spread = HistogramSpread(
+                edges=np.asarray(term.get("edges", []), np.float64),
+                values=np.asarray(term.get("values", []), np.float64),
+            )
+        else:
+            spread = ParametricSpread(
+                amp=float(term.get("amp", 1.0)),
+                center=float(term.get("center", 550.0)),
+                q=float(term.get("q", 20.0)),
+            )
+
+    if isinstance(spread, ParametricSpread):
+        if spread.q > 0.0:
+            sigma_nm = max(spread.center, 1.0) / (spread.q * 2.3548)
+        else:
+            sigma_nm = 500.0
+        spd = spread.amp * np.exp(-0.5 * ((_WL_NM - spread.center) / sigma_nm) ** 2)
+    elif isinstance(spread, HistogramSpread):
+        edges = np.asarray(spread.edges, np.float64)
+        vals = np.asarray(spread.values, np.float64)
+        if edges.size == vals.size:
+            centres = edges
+        elif edges.size == vals.size + 1:
+            centres = 0.5 * (edges[:-1] + edges[1:])
+        else:
+            return np.zeros(len(_WL_NM), np.float64)
+        spd = np.interp(_WL_NM, centres, vals, left=0.0, right=0.0)
+    elif isinstance(spread, TextureSpread):
+        spd = np.ones(len(_WL_NM), np.float64)
+    else:
+        spd = np.ones(len(_WL_NM), np.float64)
+
+    return np.maximum(0.0, spd * weight)
+
+
+def _spd_from_spread(spread: Any) -> np.ndarray:
+    """Build SPD on _WL_NM from a spread or a list of spread contributions.
+
+    This accepts:
+      - single ParametricSpread / HistogramSpread / TextureSpread
+      - list/tuple of those terms (summed additively)
+      - list/tuple of dict terms accepted by _spd_term_to_array
+    """
+    if isinstance(spread, (list, tuple)):
+        acc = np.zeros(len(_WL_NM), np.float64)
+        for term in spread:
+            acc += _spd_term_to_array(term)
+        return np.maximum(0.0, acc)
+    return _spd_term_to_array(spread)
+
+
+def profile_to_rgb(profile: Any) -> np.ndarray:
+    """Convert an EmissionProfile (or any registered profile object) to a
+    linear sRGB float32 3-vector via CIE 1931 XYZ numerical integration.
+
+        Steps:
+            1. Build SPD(λ) from profile.spd (single spread, histogram, or arbitrary
+                 additive term list).
+      2. Integrate  X = ∫ SPD(λ) x̄(λ) dλ,  Y = ∫ SPD(λ) ȳ(λ) dλ,  etc.
+      3. Normalise so that a unit-power equal-energy illuminant gives Y = 1.
+      4. Scale by profile.total_power_W.
+      5. Apply XYZ → linear sRGB matrix (D65 white point, IEC 61966-2-1).
+
+    The result is HDR-legal (values > 1 for bright emitters) and uses the
+    native float32 dtype.  It is NOT gamma-corrected.
+
+    Reflective profile types (RemissionProfile, ColorProfile) are also
+    accepted: their ``spread.frequency`` field — which may be a single
+    SpreadData or a list of additive contributions — is interpreted as
+    the spectral reflectance/transmittance, and integrated against the
+    same CMFs with unit total_power.  No HDR scaling is applied; the
+    resulting RGB is bounded by what the SPD itself encodes.
+    """
+    if isinstance(profile, EmissionProfile):
+        spd   = _spd_from_spread(profile.spd)
+        power = float(profile.total_power_W)
+    elif isinstance(profile, (RemissionProfile, ColorProfile)):
+        # Reflective: the frequency-axis spread (parametric, histogram, or
+        # additive list of either) IS the spectral reflectance.  Integrate
+        # under unit illuminant — the user authors the amplitudes to match
+        # the desired baked sRGB triple.
+        spd   = _spd_from_spread(profile.spread.frequency)
+        power = 1.0
+    else:
+        # Opaque object → flat white, 1 W
+        spd   = np.ones(len(_WL_NM), np.float64)
+        power = 1.0
+
+    dl = 5.0  # nm per step
+    X = float(np.sum(spd * _CMF_X) * dl)
+    Y = float(np.sum(spd * _CMF_Y) * dl)
+    Z = float(np.sum(spd * _CMF_Z) * dl)
+
+    # Normalise so equal-energy illuminant at power=1 gives (X,Y,Z) scaled by
+    # power.  _CMF_Y_NORM = ∫ ȳ dλ so normalised Y = 1 for flat unit-power SPD.
+    if _CMF_Y_NORM > 0.0:
+        scale = power / _CMF_Y_NORM
+    else:
+        scale = 0.0
+    X *= scale;  Y *= scale;  Z *= scale
+
+    # XYZ → linear sRGB (D65 primaries, IEC 61966-2-1 / sRGB spec matrix).
+    R =  3.2406 * X - 1.5372 * Y - 0.4986 * Z
+    G = -0.9689 * X + 1.8758 * Y + 0.0415 * Z
+    B =  0.0557 * X - 0.2040 * Y + 1.0570 * Z
+
+    # Clamp only negative values — positive HDR is valid for emissives.
+    return np.array([max(0.0, R), max(0.0, G), max(0.0, B)], dtype=np.float32)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RemissionFeedbackEngine — frame-delayed re-emission
+# ─────────────────────────────────────────────────────────────────────────────
+
+class RemissionFeedbackEngine:
+    """Frame-delayed remission driver.
+
+    The engine implements re-emission as a **pure FIR convolution** against
+    a per-material stimulus history.  At each frame ``F``:
+
+    1. The renderer (or test harness) computes a scalar "stimulus" per
+       remissive material — typically that material's recent screen
+       luminance, integrated incident scene power, or any other physically
+       motivated proxy for "how much energy did I just absorb".
+    2. The engine pushes that stimulus into a ring buffer of length
+       ``decay_frames`` for that material (the buffer length is dictated
+       by the material's :class:`RemissionResponseEnvelope`).
+    3. The engine convolves history × envelope ⇒ a scalar amplitude for
+       frame ``F+1``.
+    4. That amplitude is multiplied by the material's prebaked
+       ``frequency``-derived sRGB triple (already in
+       ``EmissionProfileDatabase._rgb_tensor``) ⇒ next-frame emission RGB.
+    5. :py:meth:`apply_to_pbr` overwrites ``pbr[mat_id, 8:11]`` for every
+       remissive material before the next render call.
+
+    There is **no recursion** and **no solve** — frame ``F+1``'s emission is a
+    deterministic linear function of frames ``F-K+1 .. F``'s stimuli, where
+    ``K = decay_frames``.  Frame ``F``'s emission can never depend on its own
+    irradiance; the one-frame delay is the explicit physical price for
+    avoiding the feedback loop.
+
+    This Python implementation is a reference: it is correct and vectorised
+    over materials but is not the long-term hot path.  The eventual GLSL/C
+    LUT will compute the same FIR per fragment, batched.
+    """
+
+    def __init__(self, mat_db: "MaterialDatabase", ep_db: "EmissionProfileDatabase"):
+        self._mat_db: "MaterialDatabase" = mat_db
+        self._ep_db:  "EmissionProfileDatabase" = ep_db
+        # mat_id → impulse response (K_m,) float32
+        self._ir:        Dict[int, np.ndarray] = {}
+        # mat_id → ring buffer (K_m,) float32 ; idx 0 = most-recent stimulus
+        self._hist:      Dict[int, np.ndarray] = {}
+        # mat_id → baked sRGB triple (3,) float32  (from ColorProfile derived
+        # from the material's RemissionProfile.spread.frequency)
+        self._color_rgb: Dict[int, np.ndarray] = {}
+        # mat_id → resolved remit_profile_idx into ep_db
+        self._mat_to_remit_idx: Dict[int, int] = {}
+
+    # ── configuration ────────────────────────────────────────────────────────
+
+    def configure(self) -> None:
+        """Scan the material DB; pick up every material whose dict carries a
+        ``remit_profile_idx >= 0`` AND whose referenced ``RemissionProfile``
+        has a non-None ``response_envelope``.
+
+        Bakes each impulse response and zeros the stimulus history.  Safe to
+        call again after re-registration (state for materials that disappear
+        is dropped; new materials get fresh zero buffers).
+        """
+        t = self._mat_db.build_tensors()
+        index = dict(t.get("index", {}))
+        ep_rgb = self._ep_db.build_rgb_tensor()                  # (P, 3) float32
+
+        new_ir:        Dict[int, np.ndarray] = {}
+        new_hist:      Dict[int, np.ndarray] = {}
+        new_color_rgb: Dict[int, np.ndarray] = {}
+        new_mat_remit: Dict[int, int]        = {}
+
+        for _name, mat_id in index.items():
+            mat = self._mat_db._materials.get(_name)
+            if mat is None:
+                continue
+            # Resolve remit_profile_idx from the underlying material record.
+            raw = -1.0
+            if isinstance(mat, dict):
+                raw = mat.get("remit_profile_idx", -1.0)
+            elif hasattr(mat, "remit_profile_idx"):
+                raw = getattr(mat, "remit_profile_idx", -1.0)
+            try:
+                remit_idx = int(float(raw))
+            except (TypeError, ValueError):
+                remit_idx = -1
+            if remit_idx < 0 or remit_idx >= len(self._ep_db):
+                continue
+            prof = self._ep_db.get(remit_idx)
+            if not isinstance(prof, RemissionProfile):
+                continue
+            env = prof.response_envelope
+            if env is None:
+                continue
+            ir = np.asarray(env.ir, dtype=np.float32).reshape(-1)
+            if ir.size == 0:
+                continue
+            new_ir[mat_id]        = ir
+            # Preserve any existing history if buffer length matches; else fresh.
+            old_h = self._hist.get(mat_id)
+            if old_h is not None and old_h.size == ir.size:
+                new_hist[mat_id] = old_h
+            else:
+                new_hist[mat_id] = np.zeros(ir.size, dtype=np.float32)
+            new_color_rgb[mat_id] = np.asarray(ep_rgb[remit_idx], dtype=np.float32)
+            new_mat_remit[mat_id] = remit_idx
+
+        self._ir              = new_ir
+        self._hist            = new_hist
+        self._color_rgb       = new_color_rgb
+        self._mat_to_remit_idx= new_mat_remit
+
+    # ── runtime ──────────────────────────────────────────────────────────────
+
+    def remissive_mat_ids(self) -> List[int]:
+        """Materials currently driven by this engine, in arbitrary order."""
+        return list(self._ir.keys())
+
+    def push_stimulus(self, stimulus_per_mat: Dict[int, float]) -> None:
+        """Advance every history buffer one frame and inject new stimuli.
+
+        Materials not present in ``stimulus_per_mat`` get a 0.0 push.
+        Materials present but unknown to the engine are silently ignored
+        (they have no envelope configured).
+        """
+        for mat_id, hist in self._hist.items():
+            # Right-shift: drop oldest, prepend new (idx 0 = most recent).
+            hist[1:] = hist[:-1]
+            hist[0]  = float(stimulus_per_mat.get(mat_id, 0.0))
+
+    def next_frame_emission(self) -> Dict[int, np.ndarray]:
+        """Return ``{mat_id: rgb (3,) float32}`` to be written into the next
+        frame's pbr emission slot.  Computed as ``Σ_k ir[k] * hist[k]``
+        scaled by the material's baked sRGB."""
+        out: Dict[int, np.ndarray] = {}
+        for mat_id, ir in self._ir.items():
+            hist = self._hist[mat_id]
+            amp  = float(np.dot(ir, hist))
+            if amp <= 0.0:
+                # Negative or zero amplitude ⇒ nothing to emit; we still
+                # write zero so a previously hot material cools down on time.
+                out[mat_id] = np.zeros(3, dtype=np.float32)
+            else:
+                out[mat_id] = (self._color_rgb[mat_id] * amp).astype(np.float32)
+        return out
+
+    def apply_to_pbr(self, pbr_chunk: np.ndarray) -> None:
+        """In-place: write next-frame emission into ``pbr_chunk[mat_id, 8:11]``
+        for every remissive material currently tracked.
+
+        Caller is responsible for re-uploading the modified chunk to the GPU
+        SSBO before the next render."""
+        for mat_id, rgb in self.next_frame_emission().items():
+            if 0 <= mat_id < len(pbr_chunk):
+                pbr_chunk[mat_id, 8:11] = rgb
+
+
 class MaterialDatabase:
     """Central registry of materials.
 
-    Registration
-    ------------
+    Registration  (authoring entry points)
+    ---------------------------------------
         db = MaterialDatabase.instance()
-        db.register("steel_panel", material_object_or_dict)  # → integer index
-        db.register_mat11("wood_top", mat11_array)            # legacy 11-float
+        db.register("steel_panel", material_object_or_dict)  # → int index
+        db.register_from_mat16("wood_top", mat16_array)       # mat16 ingest
 
-    Tensor export
-    -------------
+    Both paths produce the SAME post-bake tensors.  The mat16 path exists
+    for the YAML loader, which composes a 16-float record from the YAML
+    fields and hands it in for ingest — it is NOT a "smaller / alternative"
+    registration form, despite the historical name.
+
+    Tensor export  (the only thing the hot loop ever reads)
+    --------------------------------------------------------
         tensors = db.build_tensors()
-        # tensors['pbr']      : (N, 16) float32
-        # tensors['phong']    : (N,  8) float32
-        # tensors['ray']      : (N, 16) float32  ← feeds legacy _normalise_materials
-        # tensors['spectral'] : (N, MAX_SPECTRAL_BANDS, 12) float32
-        # tensors['enamel']   : (N,  8) float32
-        # tensors['n_bands']  : (N,)    int32
-        # tensors['index']    : dict[name → int]
+        # tensors['pbr']            : (N, 16)             float32  authoritative
+        # tensors['phong_compat']   : (N,  8)             float32  ← downstream-only
+        # tensors['raymat_compat']  : (N, 16)             float32  ← downstream-only
+        # tensors['spectral']       : (N, MAX_BANDS, 12)  float32
+        # tensors['enamel']         : (N,  8)             float32
+        # tensors['n_bands']        : (N,)                int32
+        # tensors['index']          : dict[name → int]
+
+    The `*_compat` chunks are tiny speed-improving prebakes for shader
+    paths that cannot consume the full PBR record (basic Phong rasteriser,
+    legacy mat11 raytracer feed).  They are derivatives, not authoring
+    surfaces.  They are computed once at build_tensors() and frozen until
+    the next material registration.
 
     GPU upload (example)
     --------------------
@@ -722,11 +1229,11 @@ class MaterialDatabase:
         glBufferData(GL_SHADER_STORAGE_BUFFER,
                      t['pbr'].nbytes, t['pbr'], GL_STATIC_DRAW)
 
-    Legacy helpers
-    --------------
-        db.as_mat11(name)        → np.ndarray shape (11,) float32
-        db.as_phong_dict(name)   → dict with Phong uniform keys
-        db.mat11_tensor()        → np.ndarray shape (N, 11) float32
+    Compatibility extraction (legacy callers only — not the hot path)
+    -----------------------------------------------------------------
+        db.as_compat_mat11(name)     → np.ndarray shape (11,) float32
+        db.as_compat_phong(name)     → dict with Phong uniform keys
+        db.compat_mat11_tensor()     → np.ndarray shape (N, 11) float32
     """
 
     _instance: Optional["MaterialDatabase"] = None
@@ -758,15 +1265,25 @@ class MaterialDatabase:
         self._dirty = True
         return self._order.index(name)
 
-    def register_mat11(self, name: str, mat11: np.ndarray) -> int:
-        """Register from a legacy mat11 or extended mat16 array.
+    def register_from_mat16(self, name: str, mat16: np.ndarray) -> int:
+        """Register from a 16-float authored material vector.
 
-        If mat11 has ≥16 elements the extra cols are interpreted as:
-            [11] = mat_flags (uint bits as float)
-            [12:15] = emissive_rgb
-            [15] = reactive_shift_hz
+        Despite the historical association with "mat11", this is the
+        canonical YAML→DB ingest path — the YAML loader composes a full
+        16-float record (refl/diff/abso, albedo, ior, opacity, mat_flags,
+        emit_profile_idx, remit_profile_idx, color_profile_idx,
+        reactive_shift_hz) and hands it in here.  Shorter input arrays
+        are accepted for legacy callers; missing slots default to safe
+        sentinels.
+
+        Slot layout when len(mat16) >= 16:
+            [11] = mat_flags          (uint bits as float)
+            [12] = emit_profile_idx   (-1 = none)
+            [13] = remit_profile_idx  (-1 = none)
+            [14] = color_profile_idx  (-1 = none)
+            [15] = reactive_shift_hz  (Hz)
         """
-        m = np.asarray(mat11, np.float32).ravel()
+        m = np.asarray(mat16, np.float32).ravel()
         d: Dict[str, Any] = {
             '_source':   'mat11',
             'refl_in':   m[0:3].tolist()  if len(m) >= 3  else [0.5, 0.0, 0.5],
@@ -781,6 +1298,8 @@ class MaterialDatabase:
             d['emit_profile_idx'] = float(m[12])
         if len(m) >= 14:
             d['remit_profile_idx'] = float(m[13])
+        if len(m) >= 15:
+            d['color_profile_idx'] = float(m[14])
         if len(m) >= 16:
             d['reactive_shift_hz'] = float(m[15])
         return self.register(name, d)
@@ -808,13 +1327,13 @@ class MaterialDatabase:
         N = len(self._order)
         if N == 0:
             self._tensors = {
-                'pbr':      np.zeros((0, PBR_FLOATS),    np.float32),
-                'phong':    np.zeros((0, PHONG_FLOATS),  np.float32),
-                'ray':      np.zeros((0, RAYMAT_FLOATS), np.float32),
-                'spectral': np.zeros((0, MAX_SPECTRAL_BANDS, 12), np.float32),
-                'enamel':   np.zeros((0, ENAMEL_FLOATS), np.float32),
-                'n_bands':  np.zeros(0, np.int32),
-                'index':    {},
+                'pbr':            np.zeros((0, PBR_FLOATS),    np.float32),
+                'phong_compat':   np.zeros((0, PHONG_FLOATS),  np.float32),
+                'raymat_compat':  np.zeros((0, RAYMAT_FLOATS), np.float32),
+                'spectral':       np.zeros((0, MAX_SPECTRAL_BANDS, 12), np.float32),
+                'enamel':         np.zeros((0, ENAMEL_FLOATS), np.float32),
+                'n_bands':        np.zeros(0, np.int32),
+                'index':          {},
             }
             self._dirty = False
             return self._tensors
@@ -864,6 +1383,54 @@ class MaterialDatabase:
         ray_np  = np.frombuffer(ray_arr,  dtype=np.float32).reshape(N, RAYMAT_FLOATS).copy()
         enam_np = np.frombuffer(enam_arr, dtype=np.float32).reshape(N, ENAMEL_FLOATS).copy()
 
+        # ── Resolve emit_profile_idx → PBR emission RGB (vectorized) ──────────
+        # Build an integer index vector — one entry per material row — then
+        # apply ep_rgb via fancy indexing.  No string operations at runtime.
+        ep_db = EmissionProfileDatabase.instance()
+        if len(ep_db) > 0:
+            ep_rgb = ep_db.build_rgb_tensor()   # (M, 3) float32
+            M = len(ep_rgb)
+
+            # Extract emit_profile_idx as int32 array, shape (N,), default -1.
+            ep_idxs = np.full(N, -1, dtype=np.int32)
+            for i, mat in enumerate(self._materials[n] for n in self._order):
+                raw = -1.0
+                if isinstance(mat, dict):
+                    raw = mat.get('emit_profile_idx', -1.0)
+                elif hasattr(mat, 'emit_profile_idx'):
+                    raw = mat.emit_profile_idx
+                try:
+                    ep_idxs[i] = int(float(raw))
+                except (TypeError, ValueError):
+                    ep_idxs[i] = -1
+
+            # Boolean mask of rows that have a valid profile index.
+            valid = (ep_idxs >= 0) & (ep_idxs < M)
+            if valid.any():
+                pbr_np[valid, 8:11] = ep_rgb[ep_idxs[valid]]
+
+            # ── Resolve color_profile_idx → PBR albedo RGB (vectorised) ──
+            # Same lookup table as emission (EPDB stores all profile types);
+            # the integer simply selects which prebaked sRGB triple replaces
+            # the authored albedo.  This is the "spectral as the only truth"
+            # path: any material that names a color profile has its albedo
+            # column overwritten with the spectrally-baked value, regardless
+            # of what (if anything) was in the YAML's albedo_rgb field.
+            cp_idxs = np.full(N, -1, dtype=np.int32)
+            for i, mat in enumerate(self._materials[n] for n in self._order):
+                raw = -1.0
+                if isinstance(mat, dict):
+                    raw = mat.get('color_profile_idx', -1.0)
+                elif hasattr(mat, 'color_profile_idx'):
+                    raw = mat.color_profile_idx
+                try:
+                    cp_idxs[i] = int(float(raw))
+                except (TypeError, ValueError):
+                    cp_idxs[i] = -1
+            cvalid = (cp_idxs >= 0) & (cp_idxs < M)
+            if cvalid.any():
+                pbr_np[cvalid, 0:3] = ep_rgb[cp_idxs[cvalid]]
+
         # SpectralRecord contains mixed int32/float32 — extract in two steps:
         #   first 8×12 floats = band data; n_bands read directly from struct
         spec_raw     = np.frombuffer(spec_arr, dtype=np.float32)
@@ -875,27 +1442,28 @@ class MaterialDatabase:
             n_bands_np[i] = spec_arr[i].n_bands
 
         self._tensors = {
-            'pbr':      pbr_np,
-            'phong':    phon_np,
-            'ray':      ray_np,
-            'spectral': spec_np,
-            'enamel':   enam_np,
-            'n_bands':  n_bands_np,
-            'index':    {name: i for i, name in enumerate(self._order)},
+            'pbr':            pbr_np,
+            'phong_compat':   phon_np,   # downstream-only Phong sink
+            'raymat_compat':  ray_np,    # downstream-only raytracer sink
+            'spectral':       spec_np,
+            'enamel':         enam_np,
+            'n_bands':        n_bands_np,
+            'index':          {name: i for i, name in enumerate(self._order)},
         }
         self._dirty = False
         return self._tensors
 
-    # ── Legacy extraction helpers ─────────────────────────────────────────────
+    # ── Compatibility extraction helpers (post-bake; not the hot path) ──────
 
-    def as_mat11(self, name: str) -> np.ndarray:
+    def as_compat_mat11(self, name: str) -> np.ndarray:
         """Return legacy 11-float32 array for one named material.
 
+        Reads the prebaked raymat_compat chunk — NOT a re-derivation.
         Column mapping:  refl_in[3] | refl_out[3] | albedo[3] | ior | opacity
         """
         t = self.build_tensors()
         idx = t['index'][name]
-        r   = t['ray'][idx]
+        r   = t['raymat_compat'][idx]
         # Indices into the 16-float RayMatRecord row (pads are at 3, 7, 11, 14, 15)
         return np.array([
             r[0], r[1], r[2],    # refl_in
@@ -905,12 +1473,15 @@ class MaterialDatabase:
             r[13],               # opacity
         ], np.float32)
 
-    def as_phong_dict(self, name: str) -> dict:
-        """Return Phong uniform dict for one named material."""
+    def as_compat_phong(self, name: str) -> dict:
+        """Return Phong uniform dict for one named material.
+
+        Reads the prebaked phong_compat chunk — NOT a re-derivation.
+        """
         t   = self.build_tensors()
         idx = t['index'][name]
         pbr = t['pbr'][idx]
-        ph  = t['phong'][idx]
+        ph  = t['phong_compat'][idx]
         return {
             'albedo_rgb':    pbr[0:3].tolist(),
             'ambient':       float(ph[0]),
@@ -919,14 +1490,14 @@ class MaterialDatabase:
             'grain':         float(ph[3]),
         }
 
-    def mat11_tensor(self) -> np.ndarray:
+    def compat_mat11_tensor(self) -> np.ndarray:
         """Return (N, 11) float32 legacy tensor for ALL registered materials.
 
         Compatible with the existing _normalise_materials() input format.
         Column order:  refl_in[3] | refl_out[3] | albedo[3] | ior | opacity
         """
         t = self.build_tensors()
-        r = t['ray']    # (N, 16)
+        r = t['raymat_compat']    # (N, 16)
         return np.ascontiguousarray(np.column_stack([
             r[:, 0:3],    # refl_in
             r[:, 4:7],    # refl_out

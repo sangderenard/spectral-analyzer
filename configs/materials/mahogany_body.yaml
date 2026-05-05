@@ -5,7 +5,7 @@
 name: mahogany_body
 description: Guitar body back and sides — mahogany hardwood
 
-albedo_rgb: [0.50, 0.28, 0.12]       # linear sRGB — warm reddish-brown
+color_profile_name: mahogany
 reflectivity: 0.72                     # total fraction of energy reflected
 diffusion: 0.35                        # diffuse share of reflection (vs specular)
 absorption: 0.08                       # per-bounce loss

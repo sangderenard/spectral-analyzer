@@ -6,7 +6,7 @@
 name: flint_glass
 description: Dense flint glass — high IOR, high chromatic dispersion
 
-albedo_rgb: [0.94, 0.94, 0.96]       # very faint cool tint
+color_profile_name: flint_glass
 reflectivity: 0.062                    # higher Fresnel from higher IOR
 diffusion: 0.02
 absorption: 0.004
@@ -14,7 +14,6 @@ absorption: 0.004
 ior: 1.720                             # SF11 dense flint
 opacity: 0.0
 
-transmission_rgb: [0.97, 0.97, 0.98]
 abbe_number: 29.5                      # high dispersion (low V-number)
 cauchy_b: 0.01380                      # strong dn/dλ — pronounced spectral splitting
 

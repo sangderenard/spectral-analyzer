@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -3763,6 +3764,85 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
             py::arg("light_v"), py::arg("scene_rgb"),
             py::arg("scene_indirect") = 0.2f,
             "Set scene illumination (vec3 light dir in view space, vec3 tint, indirect ratio).")
+        .def("set_lights",
+            [](PyBaseRasterizer& self,
+               py::array_t<float, py::array::c_style | py::array::forcecast> dirs,
+               py::array_t<float, py::array::c_style | py::array::forcecast> colors,
+               py::array_t<float, py::array::c_style | py::array::forcecast> intens) {
+                auto d = dirs.request();
+                auto c = colors.request();
+                auto in = intens.request();
+                if (d.ndim != 2 || d.shape[1] != 3)
+                    throw std::runtime_error("set_lights: dirs must be (N, 3) float32");
+                if (c.ndim != 2 || c.shape[1] != 3 || c.shape[0] != d.shape[0])
+                    throw std::runtime_error("set_lights: colors must be (N, 3) float32 with same N as dirs");
+                if (in.ndim != 1 || in.shape[0] != d.shape[0])
+                    throw std::runtime_error("set_lights: intens must be (N,) float32 with same N as dirs");
+                br_set_lights(self.st,
+                              (int)d.shape[0],
+                              static_cast<const float*>(d.ptr),
+                              static_cast<const float*>(c.ptr),
+                              static_cast<const float*>(in.ptr));
+            },
+            py::arg("dirs"), py::arg("colors"), py::arg("intens"),
+            "Push N directional lights as parallel arrays (no averaging).")
+        .def("set_groups",
+            [](PyBaseRasterizer& self,
+               py::array_t<int,   py::array::c_style | py::array::forcecast> group_ids,
+               py::array_t<int,   py::array::c_style | py::array::forcecast> mat_ids,
+               py::array_t<int,   py::array::c_style | py::array::forcecast> tri_offsets,
+               py::array_t<int,   py::array::c_style | py::array::forcecast> tri_counts,
+               py::array_t<float, py::array::c_style | py::array::forcecast> mvs,
+               py::array_t<int,   py::array::c_style | py::array::forcecast> dirty) {
+                // Parallel-array form to keep numpy on the host side; the
+                // engine assembles BRGroup records and forwards.  Centroid
+                // caching, dirty-aware refresh, and emitter→light derivation
+                // all happen inside the kernel — the host owns no light
+                // state of its own.
+                auto gi = group_ids.request();
+                auto mi = mat_ids.request();
+                auto to = tri_offsets.request();
+                auto tc = tri_counts.request();
+                auto mv = mvs.request();
+                auto dy = dirty.request();
+                int n = (int)gi.shape[0];
+                if (mi.shape[0] != n || to.shape[0] != n ||
+                    tc.shape[0] != n || dy.shape[0] != n)
+                    throw std::runtime_error("set_groups: scalar arrays must share length");
+                if (mv.ndim != 2 || mv.shape[0] != n || mv.shape[1] != 16)
+                    throw std::runtime_error("set_groups: mvs must be (N, 16) float32 column-major");
+
+                std::vector<BRGroup> groups((size_t)n);
+                const int* gip = static_cast<const int*>(gi.ptr);
+                const int* mip = static_cast<const int*>(mi.ptr);
+                const int* top = static_cast<const int*>(to.ptr);
+                const int* tcp = static_cast<const int*>(tc.ptr);
+                const int* dyp = static_cast<const int*>(dy.ptr);
+                const float* mvp_ = static_cast<const float*>(mv.ptr);
+                for (int i = 0; i < n; ++i) {
+                    BRGroup& g = groups[(size_t)i];
+                    g.group_id   = gip[i];
+                    g.mat_id     = mip[i];
+                    g.tri_offset = top[i];
+                    g.tri_count  = tcp[i];
+                    g.dirty      = dyp[i];
+                    std::memcpy(g.mv, mvp_ + i * 16, sizeof(float) * 16);
+                }
+                br_set_groups(self.st, n, groups.data());
+            },
+            py::arg("group_ids"), py::arg("mat_ids"),
+            py::arg("tri_offsets"), py::arg("tri_counts"),
+            py::arg("mvs"), py::arg("dirty"),
+            "Declare object groups for the next render.  See base_rasterizer.h "
+            "for the BR_DIRTY_* bitmask semantics.  Cache lives in the kernel "
+            "and persists across render() calls.")
+        .def("set_max_lights",
+            [](PyBaseRasterizer& self, int max_lights) {
+                br_set_max_lights(self.st, max_lights);
+            },
+            py::arg("max_lights"),
+            "Cap the number of cluster-lights emitted per frame from the "
+            "group cache.  Clamped to [1, MAX_LIGHTS=32].")
         .def("render",
             [](PyBaseRasterizer& self,
                py::array_t<float, py::array::c_style | py::array::forcecast> verts_view,

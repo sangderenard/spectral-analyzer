@@ -4,7 +4,7 @@
 name: raw_regolith
 description: Reclaimed mineral fines collected from cleanup residue.
 
-albedo_rgb: [0.45, 0.42, 0.36]
+color_profile_name: raw_regolith
 reflectivity: 0.18
 diffusion: 0.88
 absorption: 0.10

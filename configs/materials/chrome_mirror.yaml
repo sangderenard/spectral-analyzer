@@ -1,0 +1,30 @@
+# Material: chrome_mirror
+# Polished chrome — used for one of the orbiter spheres around the central
+# Fibonacci sphere.  Pure dielectric-coated metal: very low roughness, near-
+# unity metallic, strong rim Fresnel.
+
+name: chrome_mirror
+description: Polished chrome with mirror-grade specular response
+
+# Spectral color (registered by test harness; baked into pbr[:,0:3]).
+color_profile_name: chrome
+reflectivity:  0.88
+diffusion:     0.06
+absorption:    0.06
+ior:           3.20                    # chrome n at 550nm
+opacity:       1.0
+smoothness:    0.97
+
+roughness:     0.05
+metallic:      1.00
+transmission:  0.0
+
+ambient:       0.04
+spec_strength: 0.95
+shininess:     220.0
+inner_color:   [0.50, 0.50, 0.52]
+
+notes: >
+  Reads as a tiny chromed ball-bearing.  Near-mirror response means the
+  visible colour comes almost entirely from the scene_rgb derived light
+  contribution and the Fresnel boost at grazing pixels.

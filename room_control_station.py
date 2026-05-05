@@ -985,35 +985,64 @@ class RoomControlStation(DutyStationHUD):
                  center_cfg: dict, right_cfg: dict):
         super().__init__(station_cfg, left_cfg, center_cfg, right_cfg)
         self._host_station = None
+        self._room_workspace = None
+        self._room_station_cfg = station_cfg
+        self._room_left_cfg = left_cfg
 
         room_cfg = station_cfg.get("room_editor", {})
         library_dir = str(room_cfg.get("preset_library_dir", ""))
-        presets = load_room_tile_presets(library_dir)
-        self._room_workspace = RoomTileWorkspace(
-            self.state,
-            presets,
-            station_cfg,
-            on_station_anchor_changed=self._on_station_anchor_changed,
-        )
+        self._room_presets = load_room_tile_presets(library_dir)
 
         def _accent(cfg):
             c = cfg.get("panel", {}).get("accent_rgb", [0.0, 0.28, 0.78])
             return tuple(int(x * 255) for x in c)
 
+        self._room_accent = _accent(left_cfg)
+        self._left_panel = _KnobPanel(
+            [],
+            self.state,
+            title="ROOM LIBRARY (LOCKED)",
+            accent_rgb=self._room_accent,
+        )
+        self._center_panel = _CenterTabPanel(
+            [{"key": "locked", "label": "LOCKED", "sections": [],
+              "title": "BUILD ROOM STATION"}],
+            self.state,
+        )
+
+    def _ensure_room_workspace(self) -> bool:
+        if self._room_workspace is not None:
+            return True
+        if self._host_station is None:
+            return False
+        if bool(getattr(self._host_station, "is_unfinished", False)):
+            return False
+
+        self._room_workspace = RoomTileWorkspace(
+            self.state,
+            self._room_presets,
+            self._room_station_cfg,
+            on_station_anchor_changed=self._on_station_anchor_changed,
+        )
         self._left_panel = RoomTileLibraryPanel(
             self.state,
-            presets,
+            self._room_presets,
             title="ROOM LIBRARY",
-            accent_rgb=_accent(left_cfg),
+            accent_rgb=self._room_accent,
             on_rotate_left=self._room_workspace.rotate_selection_left,
             on_rotate_right=self._room_workspace.rotate_selection_right,
             on_import_mesh=self._room_workspace.import_mesh_dialog,
         )
         self._center_panel = self._room_workspace
+        if self._gl_ready:
+            self._room_workspace.build_gl()
+            self._last_size = (0, 0)
+        return True
 
     def bind_host_station(self, station):
         """Attach the live DutyStation instance driven by this HUD."""
         self._host_station = station
+        self._ensure_room_workspace()
 
     def _on_station_anchor_changed(self, old_x: int, old_y: int,
                                    new_x: int, new_y: int):
@@ -1035,11 +1064,13 @@ class RoomControlStation(DutyStationHUD):
 
     def build_gl(self):
         super().build_gl()
-        self._room_workspace.build_gl()
+        if self._ensure_room_workspace() and self._room_workspace is not None:
+            self._room_workspace.build_gl()
 
     def draw_world(self, mvp: np.ndarray, mv: np.ndarray,
                    light_v: np.ndarray, prog: Optional[int]):
-        self._room_workspace.draw_world(mvp, mv, light_v, prog)
+        if self._ensure_room_workspace() and self._room_workspace is not None:
+            self._room_workspace.draw_world(mvp, mv, light_v, prog)
 
     @classmethod
     def from_yaml(cls, station_yaml_path: str) -> "RoomControlStation":

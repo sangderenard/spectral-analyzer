@@ -265,6 +265,7 @@ class PlacedDutyStation(PlacedObject):
     station_type:       str   = "fabricator"
     config_dir:         str   = "configs/duty_stations/fabricator"
     interaction_radius: float = 2.0
+    build_state:        Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = self._base_dict()
@@ -272,6 +273,8 @@ class PlacedDutyStation(PlacedObject):
                  station_type=self.station_type,
                  config_dir=self.config_dir,
                  interaction_radius=self.interaction_radius)
+        if self.build_state:
+            d["build_state"] = dict(self.build_state)
         return d
 
     @classmethod
@@ -281,6 +284,7 @@ class PlacedDutyStation(PlacedObject):
             station_type       = str(d.get("station_type", "fabricator")),
             config_dir         = str(d.get("config_dir",  "")),
             interaction_radius = float(d.get("interaction_radius", 2.0)),
+            build_state        = dict(d.get("build_state", {})),
         )
 
 

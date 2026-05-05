@@ -473,6 +473,34 @@ class CameraItem:
     def world_position(self) -> np.ndarray:
         return self.placed.pos
 
+    def interaction_triangles_world(self) -> np.ndarray:
+        """Return camera interaction triangle soup in world-space, shape (N,3,3)."""
+        body, tube, glass = _build_mesh_parts(self.placed.mesh_id)
+        all_v = np.concatenate([body, tube, glass], axis=0)
+        n = int(len(all_v) // 3)
+        if n <= 0:
+            return np.zeros((0, 3, 3), np.float64)
+        tri_local = np.asarray(all_v[: n * 3, :3], np.float64).reshape(n, 3, 3)
+        M = np.asarray(self._model_matrix(), np.float64)
+        pts = tri_local.reshape(-1, 3)
+        pts_h = np.concatenate([pts, np.ones((len(pts), 1), np.float64)], axis=1)
+        pts_w = (M @ pts_h.T).T[:, :3]
+        return pts_w.reshape(n, 3, 3)
+
+    def interaction_wireframe_world(self) -> np.ndarray:
+        """Return camera wireframe line segments in world-space, shape (N,2,3)."""
+        tris = self.interaction_triangles_world()
+        if len(tris) == 0:
+            return np.zeros((0, 2, 3), np.float64)
+        segs = np.empty((len(tris) * 3, 2, 3), np.float64)
+        segs[0::3, 0, :] = tris[:, 0, :]
+        segs[0::3, 1, :] = tris[:, 1, :]
+        segs[1::3, 0, :] = tris[:, 1, :]
+        segs[1::3, 1, :] = tris[:, 2, :]
+        segs[2::3, 0, :] = tris[:, 2, :]
+        segs[2::3, 1, :] = tris[:, 0, :]
+        return segs
+
     # ── Emitter face management ───────────────────────────────────────────────
 
     def add_emitter(self, face: EmitterFace) -> None:

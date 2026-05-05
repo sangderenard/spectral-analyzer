@@ -57,6 +57,7 @@ except ImportError:
 from fabricator_workspace import FabricatorWorkspace, WorkspaceMode
 from dec_mesh import DECMesh
 from fabricator_programmatic_blueprints import (
+    ProgrammaticBuildResult,
     ProgrammaticBlueprint,
     ProgrammaticKnobSpec,
     build_mesh as _build_programmatic_mesh,
@@ -722,6 +723,8 @@ class FabricatorStation:
         self._prog_values_by_id: dict[str, dict[str, Any]] = {}
         self._prog_library_rects: dict[str, pygame.Rect] = {}
         self._prog_knob_rects: dict[str, dict[str, pygame.Rect]] = {}
+        self._prog_group_rects: dict[str, pygame.Rect] = {}
+        self._prog_group_open_by_bp: dict[str, dict[str, bool]] = {}
         self._refresh_programmatic_library()
 
         # GL state
@@ -753,6 +756,30 @@ class FabricatorStation:
         for bp in self._prog_blueprints:
             if bp.id not in self._prog_values_by_id:
                 self._prog_values_by_id[bp.id] = _default_programmatic_knob_values(bp)
+            self._ensure_prog_group_state(bp)
+
+    def _ensure_prog_group_state(self, bp: ProgrammaticBlueprint):
+        state = self._prog_group_open_by_bp.setdefault(bp.id, {})
+        for spec in bp.knobspec:
+            grp = str(spec.group or "").strip()
+            if not grp:
+                continue
+            if grp not in state:
+                state[grp] = bool(spec.group_default_expanded)
+
+    @staticmethod
+    def _grouped_knobs(bp: ProgrammaticBlueprint) -> list[tuple[str, list[ProgrammaticKnobSpec]]]:
+        groups: list[tuple[str, list[ProgrammaticKnobSpec]]] = []
+        idx: dict[str, int] = {}
+        for spec in bp.knobspec:
+            grp = str(spec.group or "").strip() or "Main"
+            gi = idx.get(grp)
+            if gi is None:
+                idx[grp] = len(groups)
+                groups.append((grp, [spec]))
+            else:
+                groups[gi][1].append(spec)
+        return groups
 
     def _selected_programmatic_blueprint(self) -> Optional[ProgrammaticBlueprint]:
         for bp in self._prog_blueprints:
@@ -856,6 +883,7 @@ class FabricatorStation:
         surf = pygame.Surface((w, h), pygame.SRCALPHA)
         surf.fill((18, 20, 28, 230))
         self._prog_knob_rects = {}
+        self._prog_group_rects = {}
         y = 0
         y = self._left_panel._section(surf, y, "  PARAMETERS", (28, 32, 44))
         bp = self._selected_programmatic_blueprint()
@@ -865,36 +893,55 @@ class FabricatorStation:
             return surf
 
         vals = self._prog_values_by_id.setdefault(bp.id, _default_programmatic_knob_values(bp))
-        for spec in bp.knobspec:
-            if y > h - 32:
+        self._ensure_prog_group_state(bp)
+        group_state = self._prog_group_open_by_bp.setdefault(bp.id, {})
+        for grp_name, grp_specs in self._grouped_knobs(bp):
+            if y > h - 28:
                 break
-            row = pygame.Rect(0, y, w, 34)
-            pygame.draw.rect(surf, (22, 25, 35), row)
-            label = self._left_panel._font_s.render(spec.label, True, (205, 215, 225))
-            value = self._left_panel._font_s.render(self._knob_value_text(spec, vals.get(spec.name, spec.default)), True, (140, 170, 200))
-            surf.blit(label, (8, y + 5))
-            surf.blit(value, (8, y + 18))
+            collapsible = any(bool(s.group_collapsible) for s in grp_specs)
+            if collapsible:
+                row = pygame.Rect(0, y, w, 24)
+                pygame.draw.rect(surf, (24, 30, 42), row)
+                pygame.draw.rect(surf, (52, 64, 86), row, 1)
+                open_state = bool(group_state.get(grp_name, True))
+                chevron = "v" if open_state else ">"
+                gt = self._left_panel._font_s.render(f"{chevron} {grp_name}", True, (180, 196, 220))
+                surf.blit(gt, (8, y + 5))
+                self._prog_group_rects[grp_name] = row
+                y += 24
+            if collapsible and not bool(group_state.get(grp_name, True)):
+                continue
 
-            ctrl: dict[str, pygame.Rect] = {}
-            if spec.dtype in ("float", "int"):
-                r_minus = pygame.Rect(w - 64, y + 7, 26, 20)
-                r_plus = pygame.Rect(w - 34, y + 7, 26, 20)
-                pygame.draw.rect(surf, (45, 50, 65), r_minus); pygame.draw.rect(surf, (100, 110, 130), r_minus, 1)
-                pygame.draw.rect(surf, (45, 50, 65), r_plus); pygame.draw.rect(surf, (100, 110, 130), r_plus, 1)
-                tm = self._left_panel._font.render("-", True, (210, 220, 230))
-                tp = self._left_panel._font.render("+", True, (210, 220, 230))
-                surf.blit(tm, (r_minus.x + (r_minus.w - tm.get_width()) // 2, r_minus.y + (r_minus.h - tm.get_height()) // 2 - 1))
-                surf.blit(tp, (r_plus.x + (r_plus.w - tp.get_width()) // 2, r_plus.y + (r_plus.h - tp.get_height()) // 2 - 1))
-                ctrl["minus"] = r_minus
-                ctrl["plus"] = r_plus
-            else:
-                r_cycle = pygame.Rect(w - 88, y + 7, 80, 20)
-                pygame.draw.rect(surf, (45, 50, 65), r_cycle); pygame.draw.rect(surf, (100, 110, 130), r_cycle, 1)
-                tc = self._left_panel._font_s.render("Cycle", True, (210, 220, 230))
-                surf.blit(tc, (r_cycle.x + (r_cycle.w - tc.get_width()) // 2, r_cycle.y + (r_cycle.h - tc.get_height()) // 2))
-                ctrl["cycle"] = r_cycle
-            self._prog_knob_rects[spec.name] = ctrl
-            y += 34
+            for spec in grp_specs:
+                if y > h - 32:
+                    break
+                row = pygame.Rect(0, y, w, 34)
+                pygame.draw.rect(surf, (22, 25, 35), row)
+                label = self._left_panel._font_s.render(spec.label, True, (205, 215, 225))
+                value = self._left_panel._font_s.render(self._knob_value_text(spec, vals.get(spec.name, spec.default)), True, (140, 170, 200))
+                surf.blit(label, (8, y + 5))
+                surf.blit(value, (8, y + 18))
+
+                ctrl: dict[str, pygame.Rect] = {}
+                if spec.dtype in ("float", "int"):
+                    r_minus = pygame.Rect(w - 64, y + 7, 26, 20)
+                    r_plus = pygame.Rect(w - 34, y + 7, 26, 20)
+                    pygame.draw.rect(surf, (45, 50, 65), r_minus); pygame.draw.rect(surf, (100, 110, 130), r_minus, 1)
+                    pygame.draw.rect(surf, (45, 50, 65), r_plus); pygame.draw.rect(surf, (100, 110, 130), r_plus, 1)
+                    tm = self._left_panel._font.render("-", True, (210, 220, 230))
+                    tp = self._left_panel._font.render("+", True, (210, 220, 230))
+                    surf.blit(tm, (r_minus.x + (r_minus.w - tm.get_width()) // 2, r_minus.y + (r_minus.h - tm.get_height()) // 2 - 1))
+                    surf.blit(tp, (r_plus.x + (r_plus.w - tp.get_width()) // 2, r_plus.y + (r_plus.h - tp.get_height()) // 2 - 1))
+                    ctrl["minus"] = r_minus
+                    ctrl["plus"] = r_plus
+                else:
+                    r_cycle = pygame.Rect(w - 88, y + 7, 80, 20)
+                    pygame.draw.rect(surf, (45, 50, 65), r_cycle); pygame.draw.rect(surf, (100, 110, 130), r_cycle, 1)
+                    tc = self._left_panel._font_s.render("Cycle", True, (210, 220, 230))
+                    surf.blit(tc, (r_cycle.x + (r_cycle.w - tc.get_width()) // 2, r_cycle.y + (r_cycle.h - tc.get_height()) // 2))
+                    ctrl["cycle"] = r_cycle
+                self._prog_knob_rects[spec.name] = ctrl
+                y += 34
 
         y += 6
         r_print = pygame.Rect(8, y, max(90, w - 16), 24)
@@ -1140,10 +1187,17 @@ class FabricatorStation:
         if bp is None:
             return
         vals = dict(self._prog_values_by_id.get(bp.id, _default_programmatic_knob_values(bp)))
-        mesh = _build_programmatic_mesh(bp, vals)
-        if mesh is None:
+        build = _build_programmatic_mesh(bp, vals)
+        if not isinstance(build, ProgrammaticBuildResult) or build.mesh is None:
             return
-        self.workspace.pick_generated_mesh(bp.id, mesh)
+        self.workspace.pick_generated_mesh(
+            bp.id,
+            build.mesh,
+            metadata={
+                "face_normals": build.face_normals,
+                "side_policy": build.side_policy,
+            },
+        )
         self._center_mode = "workspace"
         self._mesh_dirty = True
 
@@ -1228,6 +1282,11 @@ class FabricatorStation:
                     ly = my - tab_h
                     bp = self._selected_programmatic_blueprint()
                     if bp is not None:
+                        group_state = self._prog_group_open_by_bp.setdefault(bp.id, {})
+                        for grp_name, rect in self._prog_group_rects.items():
+                            if rect.collidepoint(lx, ly):
+                                group_state[grp_name] = not bool(group_state.get(grp_name, True))
+                                return True
                         for spec in bp.knobspec:
                             ctrl = self._prog_knob_rects.get(spec.name, {})
                             if spec.dtype in ("float", "int"):

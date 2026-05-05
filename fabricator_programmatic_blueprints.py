@@ -5,6 +5,7 @@ import importlib.util
 import os
 from types import ModuleType
 from typing import Any, Callable, Optional
+import numpy as np
 
 from dec_mesh import DECMesh
 
@@ -20,6 +21,9 @@ class ProgrammaticKnobSpec:
     step: float = 0.1
     choices: list[str] | None = None
     fmt: str = ".3f"
+    group: str = ""
+    group_collapsible: bool = False
+    group_default_expanded: bool = True
 
 
 @dataclass
@@ -29,6 +33,13 @@ class ProgrammaticBlueprint:
     knobspec: list[ProgrammaticKnobSpec]
     factory: Callable[[dict[str, Any]], DECMesh]
     source_path: str
+
+
+@dataclass
+class ProgrammaticBuildResult:
+    mesh: DECMesh
+    face_normals: Optional[np.ndarray] = None
+    side_policy: Optional[list[str]] = None
 
 
 def _safe_module_name(path: str) -> str:
@@ -75,6 +86,9 @@ def _coerce_knobspec(raw: Any) -> list[ProgrammaticKnobSpec]:
                 step=float(item.get("step", 0.1)),
                 choices=[str(v) for v in item.get("choices", [])] if isinstance(item.get("choices", []), list) else None,
                 fmt=str(item.get("fmt", ".3f")),
+                group=str(item.get("group", "")),
+                group_collapsible=bool(item.get("group_collapsible", False)),
+                group_default_expanded=bool(item.get("group_default_expanded", True)),
             ))
     return [k for k in out if k.name]
 
@@ -145,5 +159,32 @@ def default_knob_values(bp: ProgrammaticBlueprint) -> dict[str, Any]:
     return vals
 
 
-def build_mesh(bp: ProgrammaticBlueprint, values: dict[str, Any]) -> DECMesh:
-    return bp.factory(dict(values))
+def build_mesh(bp: ProgrammaticBlueprint, values: dict[str, Any]) -> ProgrammaticBuildResult:
+    raw = bp.factory(dict(values))
+    if isinstance(raw, ProgrammaticBuildResult):
+        return raw
+    if isinstance(raw, DECMesh):
+        return ProgrammaticBuildResult(mesh=raw)
+    if isinstance(raw, dict):
+        mesh = raw.get("mesh")
+        if not isinstance(mesh, DECMesh):
+            verts = raw.get("verts")
+            faces = raw.get("faces")
+            if verts is not None and faces is not None:
+                mesh = DECMesh.from_raw(np.asarray(verts, np.float64), faces)
+        if not isinstance(mesh, DECMesh):
+            raise TypeError("Programmatic blueprint factory must return DECMesh or ProgrammaticBuildResult")
+        face_normals = raw.get("face_normals")
+        if face_normals is not None:
+            face_normals = np.asarray(face_normals, np.float64)
+        side_policy = raw.get("side_policy")
+        if isinstance(side_policy, list):
+            side_policy = [str(v) for v in side_policy]
+        else:
+            side_policy = None
+        return ProgrammaticBuildResult(
+            mesh=mesh,
+            face_normals=face_normals,
+            side_policy=side_policy,
+        )
+    raise TypeError("Programmatic blueprint factory must return DECMesh or ProgrammaticBuildResult")

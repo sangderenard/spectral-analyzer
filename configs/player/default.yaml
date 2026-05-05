@@ -37,6 +37,10 @@ interact:
   exit_key: escape              # key to return to walk
   hud_hint: "[ E ]  Interact"  # text shown when in proximity
   hint_proximity_fade: 0.4      # distance at which hint starts fading (0..1 of radius)
+  focus_ray_engine: bridge      # bridge | analytic
+  ray_pick_max_dist_m: 6.0      # max center-view interaction distance in metres
+  focus_cone_angle_deg: 0.0     # 0 = exact single-ray pick, >0 enables cone voting
+  focus_cone_rays: 1            # number of no-bounce rays in the focus cone
 
 # ── IN_CAMERA state ───────────────────────────────────────────────────────────
 # Mechanical armature camera control: held key = continuous rate.

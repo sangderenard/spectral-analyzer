@@ -16,6 +16,7 @@ No GL, no pygame.
 from __future__ import annotations
 
 import os
+import math
 from typing import Any, Dict, List, Optional
 
 import numpy as np
@@ -286,7 +287,37 @@ class RoomWorkspace:
                 st_cfg["module_type"] = str(obj.station_type)
 
             st = DutyStation(st_cfg)
-            st.build_gl()
+
+            # Unfinished-intent build state is authoritative on each object instance.
+            # Keep identity stable: same station object transitions from unfinished to built.
+            cons = st_cfg.get("console", {}) if isinstance(st_cfg, dict) else {}
+            scr = st_cfg.get("screen", {}) if isinstance(st_cfg, dict) else {}
+            cons_w = max(0.6, float(cons.get("width", 1.4)))
+            cons_d = max(0.4, float(cons.get("depth", 0.62)))
+            base_area = float(cons_w * cons_d)
+            req_grey = max(2, int(math.ceil(base_area * 3.0)))
+            req_screen = 1 if float(scr.get("height", 0.72)) > 0.0 else 0
+            default_state = {
+                "unfinished": bool(obj.station_type in ("room_control", "fabricator")),
+                "job_order_id": f"job::{obj.obj_id}",
+                "required_materials": {
+                    "grey_block": int(req_grey),
+                    "screen_block": int(req_screen),
+                },
+                "delivered_materials": {
+                    "grey_block": 0,
+                    "screen_block": 0,
+                },
+            }
+            state = dict(default_state)
+            state.update(dict(getattr(obj, "build_state", {}) or {}))
+            st.set_unfinished_state(
+                unfinished=bool(state.get("unfinished", False)),
+                required=dict(state.get("required_materials", {})),
+                delivered=dict(state.get("delivered_materials", {})),
+                job_order_id=str(state.get("job_order_id", f"job::{obj.obj_id}")),
+            )
+            st._placed_ref = obj  # runtime persistence hook
 
             menu = None
             if obj.station_type == "fabricator":
@@ -307,6 +338,8 @@ class RoomWorkspace:
 
             if menu is not None:
                 st.menu = menu
+
+            st.build_gl()
 
             return st
         except Exception as exc:

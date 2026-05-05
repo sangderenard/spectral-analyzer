@@ -48,10 +48,17 @@ from __future__ import annotations
 
 import math
 from enum import Enum
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import pygame
+
+try:
+    from ray_tracer_bridge import trace_cone_rays as _trace_focus_cone_rays
+    from ray_tracer_bridge import trace_single_ray as _trace_focus_single_ray
+except Exception:
+    _trace_focus_cone_rays = None
+    _trace_focus_single_ray = None
 
 if TYPE_CHECKING:
     pass   # avoid circular imports; Camera is passed by value
@@ -137,6 +144,10 @@ class PlayerController:
         self._trigger_key     = _parse_key(str(i.get("trigger_key", "e")))
         self._exit_key        = _parse_key(str(i.get("exit_key", "escape")))
         self.hud_hint         = str(i.get("hud_hint", "[ E ]  Interact"))
+        self._ray_pick_max_dist = float(i.get("ray_pick_max_dist_m", 6.0))
+        self._focus_ray_engine = str(i.get("focus_ray_engine", "bridge")).strip().lower() or "bridge"
+        self._focus_cone_angle_deg = float(i.get("focus_cone_angle_deg", 0.0))
+        self._focus_cone_rays = max(1, int(i.get("focus_cone_rays", 1)))
 
         # Camera-operate mode config
         c = config.get("camera_operate", {})
@@ -155,6 +166,8 @@ class PlayerController:
         self._active_station = None   # DutyStation being interacted with
         self._active_camera  = None   # CameraItem being operated
         self._proximity_frac = 0.0   # 0..1 closeness to nearest interactable
+        self._focus_target   = None   # interactable centered in player view while disambiguating
+        self._backpack: dict[str, int] = {}
 
         # Camera forced-eye override (set by PlayerController in walk/interact)
         if not hasattr(camera, '_forced_eye'):
@@ -177,6 +190,46 @@ class PlayerController:
     def proximity_frac(self) -> float:
         """0 = far, 1 = at the station threshold.  Used to fade HUD hint."""
         return self._proximity_frac
+
+    @property
+    def focus_target(self):
+        """Interactable currently under the center-view focus ray, if any."""
+        return self._focus_target
+
+    @property
+    def backpack(self) -> dict:
+        return dict(self._backpack)
+
+    @property
+    def focus_ray_engine(self) -> str:
+        return self._focus_ray_engine
+
+    def set_focus_ray_engine(self, engine: str) -> None:
+        eng = str(engine or "bridge").strip().lower()
+        if eng not in {"bridge", "analytic"}:
+            eng = "bridge"
+        self._focus_ray_engine = eng
+
+    @property
+    def focus_pick_max_dist(self) -> float:
+        return self._ray_pick_max_dist
+
+    def set_focus_pick_max_dist(self, value: float) -> None:
+        self._ray_pick_max_dist = max(0.10, float(value))
+
+    @property
+    def focus_cone_angle_deg(self) -> float:
+        return self._focus_cone_angle_deg
+
+    def set_focus_cone_angle_deg(self, value: float) -> None:
+        self._focus_cone_angle_deg = max(0.0, float(value))
+
+    @property
+    def focus_cone_rays(self) -> int:
+        return self._focus_cone_rays
+
+    def set_focus_cone_rays(self, value: float) -> None:
+        self._focus_cone_rays = max(1, int(round(float(value))))
 
     def player_eye(self) -> np.ndarray:
         """World-space eye position (works in all states)."""
@@ -207,6 +260,7 @@ class PlayerController:
         self._walk_yaw   = float(self.camera.az)
         self._walk_pitch = 0.0
         self._active_station = None
+        self._focus_target = None
         self._update_walk_camera()
         pygame.mouse.set_visible(False)
         pygame.event.set_grab(True)
@@ -214,6 +268,7 @@ class PlayerController:
     def _enter_interact(self, station):
         self.state = PlayerState.INTERACT
         self._active_station = station
+        self._focus_target = None
         self._dragging = False
         pygame.mouse.set_visible(True)
         pygame.event.set_grab(False)
@@ -230,6 +285,7 @@ class PlayerController:
         """
         self.state = PlayerState.IN_CAMERA
         self._active_camera = camera_item
+        self._focus_target = None
         self._dragging = False
         pygame.mouse.set_visible(True)
         pygame.event.set_grab(False)
@@ -289,6 +345,7 @@ class PlayerController:
         self._saved_lens   = None
         self._saved_sensor = None
         self._active_camera = None
+        self._focus_target = None
         self._enter_walk()
 
     # ── Event handling ────────────────────────────────────────────────────────
@@ -342,14 +399,35 @@ class PlayerController:
             if ev.key == self._to_orbit_key:
                 self._enter_orbit()
                 return True
+            if ev.key == pygame.K_g:
+                self._backpack["grey_block"] = int(self._backpack.get("grey_block", 0) + 1)
+                return True
+            if ev.key == pygame.K_h:
+                self._backpack["screen_block"] = int(self._backpack.get("screen_block", 0) + 1)
+                return True
             if ev.key == self._trigger_key:
-                # Check cameras first (they are interactable items in the room)
+                hit = self._center_view_interactable(duty_stations, cameras)
+                if hit is not None:
+                    if hit in cameras:
+                        self._enter_camera(hit)
+                    else:
+                        if bool(getattr(hit, "is_unfinished", False)):
+                            self._try_deliver_to_station(hit)
+                        if bool(getattr(hit, "is_unfinished", False)):
+                            return True
+                        self._enter_interact(hit)
+                    return True
+                # Fallback to proximity when center ray does not hit anything actionable.
                 near_cam = self._nearest_camera(cameras)
                 if near_cam is not None:
                     self._enter_camera(near_cam)
                     return True
                 near = self._nearest_station(duty_stations)
                 if near is not None:
+                    if bool(getattr(near, "is_unfinished", False)):
+                        self._try_deliver_to_station(near)
+                        if bool(getattr(near, "is_unfinished", False)):
+                            return True
                     self._enter_interact(near)
                     return True
         if ev.type == pygame.MOUSEMOTION:
@@ -365,6 +443,30 @@ class PlayerController:
         if ev.type == pygame.MOUSEWHEEL:
             return True
         return False
+
+    def _try_deliver_to_station(self, station) -> None:
+        if station is None or not hasattr(station, "try_deliver_materials"):
+            return
+        try:
+            station.try_deliver_materials(self._backpack, actor_id="player")
+        except Exception:
+            return
+        self._persist_station_build_state(station)
+
+    @staticmethod
+    def _persist_station_build_state(station) -> None:
+        ref = getattr(station, "_placed_ref", None)
+        if ref is None:
+            return
+        try:
+            ref.build_state = {
+                "unfinished": bool(getattr(station, "is_unfinished", False)),
+                "job_order_id": str(getattr(station, "job_order_id", "")),
+                "required_materials": dict(getattr(station, "required_materials", {})),
+                "delivered_materials": dict(getattr(station, "delivered_materials", {})),
+            }
+        except Exception:
+            pass
 
     def _interact_event(self, ev) -> bool:
         if ev.type == pygame.KEYDOWN:
@@ -430,6 +532,7 @@ class PlayerController:
             self._walk_vel_z  = 0.0
 
         self._update_walk_camera()
+        self._update_focus_target(keys, duty_stations, cameras)
         self._update_proximity(duty_stations, cameras)
 
     def _tick_interact(self, dt: float):
@@ -533,6 +636,251 @@ class PlayerController:
             if d < r and d < best_d:
                 best, best_d = c, d
         return best
+
+    def _view_ray(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return (origin, direction) for the player's center-view ray."""
+        origin = self.player_eye().astype(np.float64)
+        tgt = np.asarray(getattr(self.camera, 'target', origin + np.array([1.0, 0.0, 0.0])), np.float64)
+        d = tgt - origin
+        n = float(np.linalg.norm(d))
+        if n <= 1e-9:
+            yaw_r = math.radians(self._walk_yaw)
+            pitch_r = math.radians(self._walk_pitch)
+            d = np.array([
+                math.cos(pitch_r) * math.cos(yaw_r),
+                math.cos(pitch_r) * math.sin(yaw_r),
+                math.sin(pitch_r),
+            ], np.float64)
+            n = float(np.linalg.norm(d))
+        return origin, (d / max(n, 1e-12))
+
+    @staticmethod
+    def _ray_triangle_t(ro: np.ndarray, rd: np.ndarray,
+                        v0: np.ndarray, v1: np.ndarray, v2: np.ndarray,
+                        eps: float = 1e-8) -> float:
+        """Moller-Trumbore intersection distance, or +inf when no hit."""
+        e1 = v1 - v0
+        e2 = v2 - v0
+        pvec = np.cross(rd, e2)
+        det = float(np.dot(e1, pvec))
+        if abs(det) < eps:
+            return float('inf')
+        inv_det = 1.0 / det
+        tvec = ro - v0
+        u = float(np.dot(tvec, pvec) * inv_det)
+        if u < 0.0 or u > 1.0:
+            return float('inf')
+        qvec = np.cross(tvec, e1)
+        v = float(np.dot(rd, qvec) * inv_det)
+        if v < 0.0 or (u + v) > 1.0:
+            return float('inf')
+        t = float(np.dot(e2, qvec) * inv_det)
+        if t <= eps:
+            return float('inf')
+        return t
+
+    @staticmethod
+    def _ray_sphere_t(ro: np.ndarray, rd: np.ndarray, center: np.ndarray, radius: float) -> float:
+        """Ray/sphere nearest positive hit distance, or +inf."""
+        oc = ro - center
+        b = float(np.dot(oc, rd))
+        c = float(np.dot(oc, oc) - radius * radius)
+        disc = b * b - c
+        if disc < 0.0:
+            return float('inf')
+        s = math.sqrt(disc)
+        t0 = -b - s
+        t1 = -b + s
+        if t0 > 1e-8:
+            return t0
+        if t1 > 1e-8:
+            return t1
+        return float('inf')
+
+    @staticmethod
+    def _interaction_triangles(item) -> Optional[np.ndarray]:
+        """Return world-space triangle soup (N,3,3) for an interactable, if available."""
+        fn = getattr(item, 'interaction_triangles_world', None)
+        if not callable(fn):
+            return None
+        try:
+            tris = np.asarray(fn(), np.float64)
+        except Exception:
+            return None
+        if tris.ndim != 3 or tris.shape[1:] != (3, 3) or len(tris) == 0:
+            return None
+        return tris
+
+    def _build_interaction_pick_soup(self, duty_stations: list, cameras: list):
+        """Owner-tagged pick primitives for center-ray interaction."""
+        owners = list(cameras) + list(duty_stations)
+        soup = []
+        for owner in owners:
+            tris = self._interaction_triangles(owner)
+            soup.append((owner, tris))
+        return soup
+
+    def _build_interaction_trace_arrays(self, duty_stations: list, cameras: list):
+        owners = []
+        tri_batches = []
+        normal_batches = []
+        owner_tags = []
+        for owner_idx, (owner, tris) in enumerate(self._build_interaction_pick_soup(duty_stations, cameras)):
+            if tris is None or len(tris) == 0:
+                continue
+            owners.append(owner)
+            tri_batches.append(tris)
+            e1 = tris[:, 1, :] - tris[:, 0, :]
+            e2 = tris[:, 2, :] - tris[:, 0, :]
+            norms = np.cross(e1, e2)
+            nm = np.linalg.norm(norms, axis=1, keepdims=True)
+            norms = norms / np.where(nm > 1e-12, nm, 1.0)
+            normal_batches.append(norms)
+            owner_tags.append(np.full(len(tris), len(owners) - 1, dtype=np.int32))
+        if not tri_batches:
+            return None, None, None, owners
+        return (
+            np.concatenate(tri_batches, axis=0),
+            np.concatenate(normal_batches, axis=0),
+            np.concatenate(owner_tags, axis=0),
+            owners,
+        )
+
+    def _center_view_interactable_bridge(self, duty_stations: list, cameras: list):
+        """Bridge-backed focus path using owner-tagged no-bounce bridge ray entry points."""
+        ro, rd = self._view_ray()
+        owner, _hit_t = self._pick_interactable_with_ray_bridge(ro, rd, duty_stations, cameras)
+        return owner
+
+    def _pick_interactable_with_ray_bridge(
+        self,
+        ro: np.ndarray,
+        rd: np.ndarray,
+        duty_stations: list,
+        cameras: list,
+    ) -> tuple[object | None, float]:
+        """Bridge-backed owner pick for an arbitrary ray direction."""
+        if _trace_focus_single_ray is None:
+            return self._pick_interactable_with_ray_analytic(ro, rd, duty_stations, cameras)
+
+        verts, normals, owner_tags, owners = self._build_interaction_trace_arrays(duty_stations, cameras)
+        if verts is None or owner_tags is None or not owners:
+            return self._pick_interactable_with_ray_analytic(ro, rd, duty_stations, cameras)
+
+        max_t = max(0.10, float(self._ray_pick_max_dist))
+        cone_rays = max(1, int(self._focus_cone_rays))
+        cone_angle_rad = math.radians(max(0.0, float(self._focus_cone_angle_deg)))
+
+        if cone_rays <= 1 or cone_angle_rad <= 1e-12 or _trace_focus_cone_rays is None:
+            hit = _trace_focus_single_ray(
+                None,
+                ro,
+                rd,
+                max_distance=max_t,
+                verts=verts,
+                normals=normals,
+                owner_tags=owner_tags,
+            )
+            owner_idx = hit.get('owner_tag', -1)
+            if owner_idx is None or int(owner_idx) < 0:
+                return None, float('inf')
+            return owners[int(owner_idx)], float(hit.get('distance', float('inf')))
+
+        hits = _trace_focus_cone_rays(
+            None,
+            ro,
+            rd,
+            cone_angle_rad=cone_angle_rad,
+            n_rays=cone_rays,
+            max_distance=max_t,
+            verts=verts,
+            normals=normals,
+            owner_tags=owner_tags,
+        )
+        owner_hit_counts = {}
+        owner_best_t = {}
+        owner_id_arr = np.asarray(hits.get('owner_tag', []))
+        distance_arr = np.asarray(hits.get('distance', []), np.float64)
+        hit_mask = np.asarray(hits.get('hit', []), dtype=bool)
+        for idx, did_hit in enumerate(hit_mask):
+            if not did_hit:
+                continue
+            owner_idx = int(owner_id_arr[idx])
+            if owner_idx < 0 or owner_idx >= len(owners):
+                continue
+            owner_hit_counts[owner_idx] = owner_hit_counts.get(owner_idx, 0) + 1
+            owner_best_t[owner_idx] = min(owner_best_t.get(owner_idx, float('inf')), float(distance_arr[idx]))
+        if not owner_hit_counts:
+            return None, float('inf')
+        best_owner_idx = min(owner_hit_counts, key=lambda idx: (-owner_hit_counts[idx], owner_best_t.get(idx, float('inf'))))
+        return owners[best_owner_idx], float(owner_best_t.get(best_owner_idx, float('inf')))
+
+    def _center_view_interactable_analytic(self, duty_stations: list, cameras: list):
+        """Analytic center-ray intersection against owner-tagged triangle soup."""
+        ro, rd = self._view_ray()
+        owner, _hit_t = self._pick_interactable_with_ray_analytic(ro, rd, duty_stations, cameras)
+        return owner
+
+    def _pick_interactable_with_ray_analytic(
+        self,
+        ro: np.ndarray,
+        rd: np.ndarray,
+        duty_stations: list,
+        cameras: list,
+    ) -> tuple[object | None, float]:
+        """Analytic owner pick for an arbitrary ray direction."""
+        max_t = max(0.10, float(self._ray_pick_max_dist))
+        best_owner = None
+        best_t = float('inf')
+
+        for owner, tris in self._build_interaction_pick_soup(duty_stations, cameras):
+            hit_t = float('inf')
+            if tris is not None:
+                for tri in tris:
+                    t = self._ray_triangle_t(ro, rd, tri[0], tri[1], tri[2])
+                    if t < hit_t:
+                        hit_t = t
+            else:
+                pos = np.array(getattr(owner, 'world_position', getattr(owner, 'pos', [0.0, 0.0, 0.0])), np.float64)
+                r = float(getattr(owner, 'interaction_radius', 1.0))
+                hit_t = self._ray_sphere_t(ro, rd, pos, r)
+
+            if hit_t < best_t and hit_t <= max_t:
+                best_t = hit_t
+                best_owner = owner
+
+        return best_owner, float(best_t)
+
+    def pick_interactable_with_ray(
+        self,
+        ray_origin: np.ndarray,
+        ray_dir: np.ndarray,
+        duty_stations: list,
+        cameras: list,
+    ) -> tuple[object | None, float]:
+        """Public owner-pick API for arbitrary rays (e.g. HUD mouse hover rays)."""
+        ro = np.asarray(ray_origin, np.float64)
+        rd = np.asarray(ray_dir, np.float64)
+        n = float(np.linalg.norm(rd))
+        if n <= 1e-12:
+            return None, float('inf')
+        rd = rd / n
+        if self._focus_ray_engine == "analytic":
+            return self._pick_interactable_with_ray_analytic(ro, rd, duty_stations, cameras)
+        return self._pick_interactable_with_ray_bridge(ro, rd, duty_stations, cameras)
+
+    def _center_view_interactable(self, duty_stations: list, cameras: list):
+        """Ray-pick interactable dead-center in view; None when no actionable hit."""
+        if self._focus_ray_engine == "analytic":
+            return self._center_view_interactable_analytic(duty_stations, cameras)
+        return self._center_view_interactable_bridge(duty_stations, cameras)
+
+    def _update_focus_target(self, keys, duty_stations: list, cameras: list) -> None:
+        """When Shift is held, cache the centered interactable for wireframe disambiguation."""
+        if not (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]):
+            self._focus_target = None
+            return
+        self._focus_target = self._center_view_interactable(duty_stations, cameras)
 
     def _update_camera_view(self, cam) -> None:
         """Push the camera item's physical orientation into the GL camera.

@@ -425,6 +425,362 @@ def extract_scene_geometry(scene) -> tuple[np.ndarray, np.ndarray]:
     return geo_verts_flat, geo_normals
 
 
+def _scene_trace_geometry(scene) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Triangulate a scene into trace-ready world-space triangles and normals."""
+    room = getattr(scene, 'room', None) or getattr(scene, 'geometry', None)
+    if room is None:
+        raise TypeError(f"Scene {type(scene).__name__} has neither 'room' nor 'geometry'")
+
+    n_room_tris = 0
+    if hasattr(room, 'vertices_xy'):
+        verts, normals, mat_props, n_room_tris = _triangulate_polygonal_room(room)
+    elif hasattr(room, 'radius'):
+        verts, normals, mat_props, n_room_tris = _triangulate_polygonal_room(
+            _circular_room_to_polygon(room))
+    elif hasattr(room, 'triangles'):
+        verts, normals, mat_props = _triangulate_mesh_room(room)
+    else:
+        raise TypeError(f"Unsupported room type: {type(room).__name__}")
+
+    verts, normals, mat_props = _drop_absorptive_helper_shell(
+        room, verts, normals, mat_props, n_room_tris)
+    if len(verts) == 0:
+        raise ValueError("Room triangulated to zero triangles")
+    return (
+        np.asarray(verts, dtype=np.float64),
+        np.asarray(normals, dtype=np.float64),
+        np.asarray(mat_props, dtype=np.float64),
+    )
+
+
+def _coerce_trace_geometry(
+        scene=None,
+        verts: Optional[np.ndarray] = None,
+        normals: Optional[np.ndarray] = None,
+):
+    if verts is None:
+        return _scene_trace_geometry(scene)
+    tri_verts = np.asarray(verts, dtype=np.float64)
+    if tri_verts.ndim != 3 or tri_verts.shape[1:] != (3, 3):
+        raise ValueError("verts must have shape (N, 3, 3)")
+    if normals is None:
+        e1 = tri_verts[:, 1, :] - tri_verts[:, 0, :]
+        e2 = tri_verts[:, 2, :] - tri_verts[:, 0, :]
+        tri_normals = np.cross(e1, e2)
+        nm = np.linalg.norm(tri_normals, axis=1, keepdims=True)
+        tri_normals = tri_normals / np.where(nm > 1e-12, nm, 1.0)
+    else:
+        tri_normals = np.asarray(normals, dtype=np.float64)
+        if tri_normals.shape != (len(tri_verts), 3):
+            raise ValueError("normals must have shape (N, 3)")
+    return tri_verts, tri_normals, None
+
+
+def _trace_float_dtype(*values) -> np.dtype:
+    dtype = None
+    for value in values:
+        arr = np.asarray(value)
+        if arr.dtype.kind == 'f':
+            dtype = arr.dtype if dtype is None else np.result_type(dtype, arr.dtype)
+    return np.dtype(np.float64 if dtype is None else dtype)
+
+
+def _normalize_vec(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
+    n = np.linalg.norm(v)
+    if n <= eps:
+        raise ValueError("Zero-length vector is not a valid ray direction")
+    return v / n
+
+
+def _camera_basis(forward, up, dtype: np.dtype) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    fwd = _normalize_vec(np.asarray(forward, dtype=dtype))
+    upv = np.asarray(up, dtype=dtype)
+    upv = upv - fwd * float(np.dot(upv, fwd))
+    if np.linalg.norm(upv) <= 1e-12:
+        fallback = np.array([0.0, 1.0, 0.0], dtype=dtype)
+        if abs(float(np.dot(fwd, fallback))) > 0.95:
+            fallback = np.array([1.0, 0.0, 0.0], dtype=dtype)
+        upv = fallback - fwd * float(np.dot(fallback, fwd))
+    upv = _normalize_vec(upv)
+    right = _normalize_vec(np.cross(fwd, upv))
+    upv = _normalize_vec(np.cross(right, fwd))
+    return fwd, right, upv
+
+
+def _raycast_triangles(
+        verts: np.ndarray,
+        normals: np.ndarray,
+        origins,
+        directions,
+    owner_tags=None,
+        max_distance: float = math.inf,
+        eps: float = 1e-9,
+        batch_size: int = 128,
+) -> dict:
+    """Intersect one or more rays against triangle soup with Moller-Trumbore."""
+    dtype = _trace_float_dtype(origins, directions, verts)
+    tris = np.asarray(verts, dtype=dtype)
+    if tris.ndim != 3 or tris.shape[1:] != (3, 3):
+        raise ValueError("verts must have shape (N, 3, 3)")
+    norms = np.asarray(normals, dtype=dtype)
+    if norms.shape != (len(tris), 3):
+        raise ValueError("normals must have shape (N, 3)")
+    tags = None
+    if owner_tags is not None:
+        tags = np.asarray(owner_tags)
+        if len(tags) != len(tris):
+            raise ValueError("owner_tags must have length N")
+
+    ray_o = np.asarray(origins, dtype=dtype)
+    ray_d = np.asarray(directions, dtype=dtype)
+    single = ray_o.ndim == 1
+    if single:
+        ray_o = ray_o[None, :]
+    if ray_d.ndim == 1:
+        ray_d = ray_d[None, :]
+    if ray_o.shape != ray_d.shape or ray_o.shape[1] != 3:
+        raise ValueError("origins and directions must both have shape (R, 3) or (3,)")
+
+    for i in range(len(ray_d)):
+        ray_d[i] = _normalize_vec(ray_d[i], eps=eps)
+
+    v0 = tris[:, 0, :]
+    e1 = tris[:, 1, :] - v0
+    e2 = tris[:, 2, :] - v0
+    max_dist = float(max_distance)
+
+    n_rays = len(ray_o)
+    hit_t = np.full(n_rays, np.inf, dtype=dtype)
+    hit_idx = np.full(n_rays, -1, dtype=np.int32)
+
+    for start in range(0, n_rays, max(1, int(batch_size))):
+        end = min(start + max(1, int(batch_size)), n_rays)
+        ro = ray_o[start:end]
+        rd = ray_d[start:end]
+        pvec = np.cross(rd[:, None, :], e2[None, :, :])
+        det = np.sum(e1[None, :, :] * pvec, axis=2)
+        det_ok = np.abs(det) > eps
+        inv_det = np.zeros_like(det)
+        inv_det[det_ok] = 1.0 / det[det_ok]
+
+        tvec = ro[:, None, :] - v0[None, :, :]
+        u = np.sum(tvec * pvec, axis=2) * inv_det
+        qvec = np.cross(tvec, e1[None, :, :])
+        v = np.sum(rd[:, None, :] * qvec, axis=2) * inv_det
+        t = np.sum(e2[None, :, :] * qvec, axis=2) * inv_det
+
+        valid = det_ok
+        valid &= u >= -eps
+        valid &= v >= -eps
+        valid &= (u + v) <= (1.0 + eps)
+        valid &= t > eps
+        if math.isfinite(max_dist):
+            valid &= t <= max_dist
+
+        t_valid = np.where(valid, t, np.inf)
+        batch_hit_idx = np.argmin(t_valid, axis=1)
+        batch_hit_t = t_valid[np.arange(end - start), batch_hit_idx]
+        miss = ~np.isfinite(batch_hit_t)
+        batch_hit_idx = batch_hit_idx.astype(np.int32, copy=False)
+        batch_hit_idx[miss] = -1
+        hit_t[start:end] = batch_hit_t
+        hit_idx[start:end] = batch_hit_idx
+
+    hit_mask = hit_idx >= 0
+    hit_pos = np.full((n_rays, 3), np.nan, dtype=dtype)
+    hit_normals = np.full((n_rays, 3), np.nan, dtype=dtype)
+    if np.any(hit_mask):
+        hit_pos[hit_mask] = ray_o[hit_mask] + ray_d[hit_mask] * hit_t[hit_mask, None]
+        hit_normals[hit_mask] = norms[hit_idx[hit_mask]]
+
+    if tags is None:
+        hit_owner = None
+    else:
+        if tags.dtype == object:
+            hit_owner = np.empty(n_rays, dtype=object)
+            hit_owner[:] = None
+            if np.any(hit_mask):
+                hit_owner[hit_mask] = tags[hit_idx[hit_mask]]
+        else:
+            hit_owner = np.full(n_rays, -1, dtype=tags.dtype)
+            if np.any(hit_mask):
+                hit_owner[hit_mask] = tags[hit_idx[hit_mask]]
+
+    result = {
+        'origin': ray_o[0] if single else ray_o,
+        'direction': ray_d[0] if single else ray_d,
+        'hit': bool(hit_mask[0]) if single else hit_mask,
+        'distance': (float(hit_t[0]) if hit_mask[0] else None) if single else hit_t,
+        'position': hit_pos[0] if single else hit_pos,
+        'normal': hit_normals[0] if single else hit_normals,
+        'triangle_index': (int(hit_idx[0]) if hit_mask[0] else -1) if single else hit_idx,
+    }
+    if hit_owner is not None:
+        result['owner_tag'] = hit_owner[0] if single else hit_owner
+    return result
+
+
+def _sample_cone_directions(
+        direction,
+        cone_angle_rad: float,
+        n_rays: int,
+        up=(0.0, 1.0, 0.0),
+        seed: int = 42,
+) -> np.ndarray:
+    dtype = _trace_float_dtype(direction, up)
+    if n_rays <= 0:
+        raise ValueError("n_rays must be >= 1")
+    fwd, right, upv = _camera_basis(direction, up, dtype)
+    half_angle = max(0.0, float(cone_angle_rad))
+    dirs = np.empty((n_rays, 3), dtype=dtype)
+    dirs[0] = fwd
+    if n_rays == 1 or half_angle <= 1e-12:
+        if n_rays > 1:
+            dirs[1:] = fwd
+        return dirs
+
+    rng = np.random.default_rng(seed)
+    cos_max = math.cos(half_angle)
+    for i in range(1, n_rays):
+        u1 = float(rng.random())
+        u2 = float(rng.random())
+        cos_theta = 1.0 - u1 * (1.0 - cos_max)
+        sin_theta = math.sqrt(max(0.0, 1.0 - cos_theta * cos_theta))
+        phi = 2.0 * math.pi * u2
+        dirs[i] = _normalize_vec(
+            fwd * cos_theta
+            + right * (math.cos(phi) * sin_theta)
+            + upv * (math.sin(phi) * sin_theta)
+        )
+    return dirs
+
+
+def trace_single_ray(
+        scene,
+        origin,
+        direction,
+        max_distance: float = math.inf,
+        verts: Optional[np.ndarray] = None,
+        normals: Optional[np.ndarray] = None,
+        owner_tags=None,
+) -> dict:
+    """Trace one no-bounce ray into the scene and return the nearest hit."""
+    tri_verts, tri_normals, _ = _coerce_trace_geometry(scene, verts=verts, normals=normals)
+    return _raycast_triangles(
+        tri_verts,
+        tri_normals,
+        origin,
+        direction,
+        owner_tags=owner_tags,
+        max_distance=max_distance,
+    )
+
+
+def trace_cone_rays(
+        scene,
+        origin,
+        direction,
+        cone_angle_rad: float = 0.02,
+        n_rays: int = 7,
+        up=(0.0, 1.0, 0.0),
+        seed: int = 42,
+        max_distance: float = math.inf,
+        verts: Optional[np.ndarray] = None,
+        normals: Optional[np.ndarray] = None,
+        owner_tags=None,
+) -> dict:
+    """Trace a small no-bounce ray cone and return per-ray hits plus summary stats."""
+    tri_verts, tri_normals, _ = _coerce_trace_geometry(scene, verts=verts, normals=normals)
+    dirs = _sample_cone_directions(direction, cone_angle_rad, n_rays, up=up, seed=seed)
+    dtype = _trace_float_dtype(origin, dirs)
+    origins = np.broadcast_to(np.asarray(origin, dtype=dtype), dirs.shape).copy()
+    hits = _raycast_triangles(
+        tri_verts,
+        tri_normals,
+        origins,
+        dirs,
+        owner_tags=owner_tags,
+        max_distance=max_distance,
+    )
+    hit_mask = np.asarray(hits['hit'], dtype=bool)
+    distances = np.asarray(hits['distance'])
+    finite = distances[np.isfinite(distances)]
+    hits['n_rays'] = int(n_rays)
+    hits['n_hits'] = int(hit_mask.sum())
+    hits['hit_ratio'] = float(hit_mask.mean())
+    hits['nearest_distance'] = float(finite.min()) if len(finite) else None
+    hits['farthest_distance'] = float(finite.max()) if len(finite) else None
+    return hits
+
+
+def trace_depth_map(
+        scene,
+        cam_pos,
+        cam_fwd,
+        cam_up=(0.0, 1.0, 0.0),
+        fov_rad: float = 1.0,
+        width: int = 512,
+        height: int = 384,
+        max_distance: float = math.inf,
+        batch_size: int = 256,
+        verts: Optional[np.ndarray] = None,
+        normals: Optional[np.ndarray] = None,
+        owner_tags=None,
+) -> tuple[np.ndarray, dict]:
+    """Trace a no-bounce pinhole depth map from a camera pose."""
+    if width <= 0 or height <= 0:
+        raise ValueError("width and height must be positive")
+
+    tri_verts, tri_normals, _ = _coerce_trace_geometry(scene, verts=verts, normals=normals)
+    dtype = _trace_float_dtype(cam_pos, cam_fwd, cam_up)
+    cam_pos_arr = np.asarray(cam_pos, dtype=dtype)
+    fwd, right, upv = _camera_basis(cam_fwd, cam_up, dtype)
+
+    aspect = float(width) / float(height)
+    tan_half = math.tan(0.5 * float(fov_rad))
+    xs = ((np.arange(width, dtype=dtype) + 0.5) / float(width) * 2.0 - 1.0) * aspect * tan_half
+    ys = (1.0 - (np.arange(height, dtype=dtype) + 0.5) / float(height) * 2.0) * tan_half
+    grid_x, grid_y = np.meshgrid(xs, ys)
+    dirs = (
+        fwd[None, None, :]
+        + grid_x[:, :, None] * right[None, None, :]
+        + grid_y[:, :, None] * upv[None, None, :]
+    )
+    dirs = dirs.reshape(-1, 3)
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+    origins = np.broadcast_to(cam_pos_arr, dirs.shape).copy()
+
+    hits = _raycast_triangles(
+        tri_verts,
+        tri_normals,
+        origins,
+        dirs,
+        owner_tags=owner_tags,
+        max_distance=max_distance,
+        batch_size=batch_size,
+    )
+    hit_mask = np.asarray(hits['hit'], dtype=bool).reshape(height, width)
+    distances = np.asarray(hits['distance'], dtype=dtype).reshape(height, width)
+    triangle_index = np.asarray(hits['triangle_index'], dtype=np.int32).reshape(height, width)
+    position = np.asarray(hits['position'], dtype=dtype).reshape(height, width, 3)
+    normal = np.asarray(hits['normal'], dtype=dtype).reshape(height, width, 3)
+    depth_map = distances.copy()
+    depth_map[~hit_mask] = np.inf
+
+    meta = {
+        'hit_mask': hit_mask,
+        'triangle_index': triangle_index,
+        'position_map': position,
+        'normal_map': normal,
+        'camera_forward': fwd,
+        'camera_right': right,
+        'camera_up': upv,
+    }
+    if 'owner_tag' in hits:
+        meta['owner_tag_map'] = np.asarray(hits['owner_tag'], dtype=object).reshape(height, width)
+    return depth_map, meta
+
+
 def _drop_absorptive_helper_shell(room, verts, normals, mat_props, n_room_tris):
     """For standalone body scenes, remove the dummy enclosing PolygonalRoom."""
     unified = _watertight_guitar_body_from_baffles(room)

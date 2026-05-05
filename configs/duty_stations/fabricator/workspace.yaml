@@ -26,7 +26,7 @@ display:
   wireframe_width:    1.4
   face_color:         [0.15, 0.20, 0.30]     # default face base color
   edge_color:         [0.20, 0.85, 0.65]     # wireframe edge color
-  selected_face_color:[0.10, 0.70, 0.90]     # hovered/selected face
+  selected_face_color: [0.10, 0.70, 0.90]     # hovered/selected face
   ghost_alpha:        0.42    # transparency of the pending-attachment piece
   bg_color:           [0.02, 0.03, 0.06]     # workspace background
 

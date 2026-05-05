@@ -12,7 +12,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from .demo_pluck_controls_adapter import knobs_to_station_nodes
 from .scene_io import SceneCoordinator, SceneDocument
 from .station_specs import (
     StationControlNode,
@@ -218,7 +217,21 @@ class RayTracerStationCoordinator:
 
         nodes: list[StationControlNode] = []
         for key, label, knobs, material_slot in sections:
-            children = knobs_to_station_nodes(knobs, parent_key=key, raised_material=material_slot)
+            children = [
+                StationControlNode(
+                    key=f"{key}.{getattr(k, 'name', i)}",
+                    label=str(getattr(k, 'label', getattr(k, 'name', ''))),
+                    knob=k,
+                    children=[],
+                    depth_mode="raise",
+                    material_slot=material_slot,
+                    payload={
+                        "knob_name": getattr(k, 'name', ''),
+                        "parent_key": key,
+                    },
+                )
+                for i, k in enumerate(knobs)
+            ]
             depth_mode = "raise" if material_slot != "center_screen" else "engrave"
             nodes.append(
                 StationControlNode(

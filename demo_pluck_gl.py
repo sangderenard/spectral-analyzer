@@ -153,8 +153,14 @@ def _build_default_scene(config_dir: str = "configs/room_station"):
         label="Room Control",
         pos=np.array([0.0, 0.0, 0.0], np.float64),
         yaw_deg=0.0,
-            station_type="room_control",
-            config_dir="configs/duty_stations/room_control",
+        station_type="room_control",
+        config_dir="configs/duty_stations/room_control",
+        build_state={
+            "unfinished": True,
+            "job_order_id": "job::room_control_bootstrap",
+            "required_materials": {"grey_block": 6, "screen_block": 1},
+            "delivered_materials": {"grey_block": 0, "screen_block": 0},
+        },
     )
     ws.add_object(room_ctrl)
     fabricator = PlacedDutyStation(
@@ -164,6 +170,12 @@ def _build_default_scene(config_dir: str = "configs/room_station"):
         yaw_deg=0.0,
         station_type="fabricator",
         config_dir="configs/duty_stations/fabricator",
+        build_state={
+            "unfinished": True,
+            "job_order_id": "job::fabricator_bootstrap",
+            "required_materials": {"grey_block": 5, "screen_block": 1},
+            "delivered_materials": {"grey_block": 0, "screen_block": 0},
+        },
     )
     ws.add_object(fabricator)
     return ws
@@ -2006,6 +2018,16 @@ def _ray_vbo(segs: Optional[np.ndarray]) -> np.ndarray:
     out = np.empty((2 * n, 7), np.float32)
     out[0::2] = v0; out[1::2] = v1
     return out
+
+
+def _line_segments_pos(lines: Optional[np.ndarray]) -> np.ndarray:
+    """(N,2,3) segments -> (2N,3) float32 positions for GL_LINES."""
+    if lines is None:
+        return np.zeros((0, 3), dtype=np.float32)
+    arr = np.asarray(lines)
+    if arr.ndim != 3 or arr.shape[1:] != (2, 3) or len(arr) == 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    return arr.reshape(-1, 3).astype(np.float32, copy=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -9866,7 +9888,7 @@ class _SliderPanel:
         exposing the same controls through the shared KnobSpec system.
         """
         try:
-            from ray_tracer.demo_pluck_controls_adapter import slider_defs_to_knobs
+            from controls import slider_defs_to_knobs
             return slider_defs_to_knobs(
                 cls._DEFS,
                 group="Demo Pluck Slider",
@@ -9876,13 +9898,13 @@ class _SliderPanel:
             return []
 
     def hierarchy_nodes(self):
-        """Return station hierarchy nodes for legacy slider definitions."""
+        """Return control-graph nodes for legacy slider definitions."""
         try:
-            from ray_tracer.demo_pluck_controls_adapter import knobs_to_station_nodes
-            return knobs_to_station_nodes(
+            from controls import knobs_to_object_nodes
+            return knobs_to_object_nodes(
                 self.knobspec(),
-                parent_key="demo_pluck.slider_panel",
-                raised_material="control_raised",
+                object_id="demo_pluck.slider_panel",
+                parent_key="slider_panel",
             )
         except Exception:
             return []
@@ -10247,6 +10269,7 @@ class _CameraOpticsView:
     V_GAP  = 8            # gap between sub-view frames
     TITLE  = 24           # title bar height
     LABEL  = 16           # label strip below each sub-view
+    BTN_H  = 28           # render button height
 
     # colour palette (r,g,b,a)
     _C_BG       = (0.03, 0.03, 0.07, 1.00)
@@ -10273,6 +10296,7 @@ class _CameraOpticsView:
         self._tvbo         = None
         self._text_cache: dict = {}
         self._line_buf     = []     # list of (x0,y0,x1,y1,color)
+        self._render_btn_rect: tuple[int, int, int, int] | None = None
 
     # ── GL init ───────────────────────────────────────────────────────────────
 
@@ -10325,6 +10349,21 @@ class _CameraOpticsView:
     def attach(self, cam, cam_panel) -> None:
         self._cam       = cam
         self._cam_panel = cam_panel
+
+    def handle_event(self, ev, win_w: int, win_h: int) -> bool:
+        if self._cam_panel is None or not getattr(self._cam_panel, '_open', False):
+            return False
+        if ev.type != pygame.MOUSEBUTTONDOWN or ev.button != 1:
+            return False
+        if self._render_btn_rect is None:
+            return False
+        mx, my = ev.pos
+        bx, by, bw, bh = self._render_btn_rect
+        if bx <= mx <= bx + bw and by <= my <= by + bh:
+            if hasattr(self._cam_panel, 'request_raytrace_render'):
+                self._cam_panel.request_raytrace_render()
+            return True
+        return False
 
     # ── GL primitives ─────────────────────────────────────────────────────────
 
@@ -10727,7 +10766,7 @@ class _CameraOpticsView:
         self._draw_text("OPTICS  side · front · shift", px + 6, py + 5, win_w, win_h)
 
         # Partition the remaining height into three equal sub-view slots
-        inner_h = panel_h - self.TITLE
+        inner_h = panel_h - self.TITLE - self.BTN_H - self.V_GAP
         slot_h  = (inner_h - 2 * self.V_GAP) // 3
         slot_w  = panel_w - 2 * self.PAD
 
@@ -10751,6 +10790,28 @@ class _CameraOpticsView:
             glLineWidth(1.0)
             # Label
             self._draw_text(label, vx + 3, vy + slot_h - self.LABEL + 2, win_w, win_h)
+
+        btn_x = px + self.PAD
+        btn_w = panel_w - 2 * self.PAD
+        btn_y = py + panel_h - self.BTN_H
+        self._render_btn_rect = (btn_x, btn_y, btn_w, self.BTN_H - 2)
+        _armed = bool(getattr(self._cam_panel, '_raytrace_inspect_active', False))
+        self._draw_quad(
+            btn_x,
+            btn_y,
+            btn_w,
+            self.BTN_H - 2,
+            (0.20, 0.58, 0.34, 0.95) if _armed else (0.12, 0.34, 0.58, 0.95),
+            win_w,
+            win_h,
+        )
+        self._draw_text(
+            "RENDER (raytrace)" if not _armed else "RENDER LOCKED",
+            btn_x + 8,
+            btn_y + 7,
+            win_w,
+            win_h,
+        )
 
         glEnable(GL_DEPTH_TEST)
         glBindVertexArray(0)
@@ -10791,6 +10852,9 @@ class _PlayerCameraPanel:
         ('ray_density',  'Ray Density',   0.1,    8.0,   1.0,  False, '.2f'),
         ('ray_exposure', 'Ray Exposure',  0.25,   6.0,   1.0,  False, '.2f'),
         ('ray_gamma',    'Ray Gamma',     0.20,   1.60,  GPU_RAY_FIELD_GAMMA, False, '.3f'),
+        ('focus_pick_dist', 'Focus Dist',  0.10,  20.0,   6.0,  False, '.2f'),
+        ('focus_cone_deg',  'Focus Cone',  0.0,   10.0,   0.0,  False, '.2f'),
+        ('focus_cone_rays', 'Focus Rays',  1.0,   32.0,   1.0,  False, '.0f'),
         ('sensor_rate',  'Sen Rows',      1.0,  512.0,  16.0,  False, '.0f'),
         ('sensor_spp',   'Sen SPP',       1.0,    8.0,   1.0,  False, '.0f'),
         ('sensor_fps',   'Sen FPS',       0.0,   60.0,   0.0,  False, '.0f'),
@@ -10814,6 +10878,13 @@ class _PlayerCameraPanel:
         ('auto_iso',      'Auto ISO'),
         ('auto_decay',    'Auto Decay'),
     ]
+    _FOCUS_ENGINES = [
+        ('bridge', 'Bridge'),
+        ('analytic', 'Local'),
+    ]
+    HUD_FULL = "full"
+    HUD_INFO = "info"
+    HUD_OFF = "off"
 
     _C_BG      = (0.04, 0.04, 0.09, 1.00)
     _C_TITLE   = (0.08, 0.20, 0.42, 1.00)
@@ -10829,7 +10900,7 @@ class _PlayerCameraPanel:
     def knobspec(cls):
         """Return KnobSpec descriptors mapped from camera panel sliders."""
         try:
-            from ray_tracer.demo_pluck_controls_adapter import slider_defs_to_knobs
+            from controls import slider_defs_to_knobs
             return slider_defs_to_knobs(
                 cls._SLIDERS,
                 group="Demo Pluck Camera",
@@ -10875,6 +10946,9 @@ class _PlayerCameraPanel:
             "tilt_y": "computer",
             "ray_density": "computer",
             "ray_exposure": "computer",
+            "focus_pick_dist": "computer",
+            "focus_cone_deg": "computer",
+            "focus_cone_rays": "computer",
 
             "sensor_iso": "sensors",
             "sensor_gain": "sensors",
@@ -10950,16 +11024,17 @@ class _PlayerCameraPanel:
         bridge for staged migration into hierarchical station rendering.
         """
         try:
-            from ray_tracer.demo_pluck_controls_adapter import knobs_to_station_nodes
-            return knobs_to_station_nodes(
+            from controls import knobs_to_object_nodes
+            return knobs_to_object_nodes(
                 self.knobspec(),
-                parent_key="demo_pluck.camera_panel",
-                raised_material="control_raised",
+                object_id="demo_pluck.camera_panel",
+                parent_key="camera_panel",
             )
         except Exception:
             return []
 
     def __init__(self):
+        self._hud_mode = self.HUD_OFF
         self._open   = False
         self._drag   = -1
         self._values = {d[0]: d[4] for d in self._SLIDERS}
@@ -10973,10 +11048,12 @@ class _PlayerCameraPanel:
         self._show_illum:   bool = False
         self._show_sensor:  bool = False
         self._enlarger:     bool = False
+        self._focus_ray_engine: str = 'bridge'
         # Bound live objects — set by attach()
         self._cam:          object = None
         self._slider_panel: object = None
         self._renderer:     object = None
+        self._player_ctrl:  object = None
         self._on_change:    dict   = {}   # key → callable(value)
         # GL resources
         self._p_col  = None
@@ -10984,6 +11061,32 @@ class _PlayerCameraPanel:
         self._qvao = self._qvbo = None
         self._tvao = self._tvbo = None
         self._text_cache: dict = {}
+        # HUD shell state: no center panel, only top/left/bottom chrome.
+        self._library_tabs = ["backpack", "ecosystem"]
+        self._library_active_tab = 0
+        self._library_items_inventory = []
+        self._library_items_ecosystem = [
+            "room_control_station", "fabricator_station", "simulator_station", "camera_item",
+            "duty_module_tile", "network_contact_module", "portal_frame", "light_emitter",
+            "material_slot", "wall_tile", "floor_tile", "acoustic_panel",
+        ]
+        self._hotbar_slots = [
+            "select", "inspect", "render", "pan", "focus", "aperture", "material", "attach", "place",
+        ]
+        self._hotbar_index = 0
+        self._raytrace_inspect_active = False
+        self._raytrace_anchor_eye = None
+        self._raytrace_anchor_target = None
+        self._menu_anchor_eye = None
+        self._menu_anchor_target = None
+        self._hover_owner_label = "none"
+        self._hover_owner_obj = None
+        self._hover_material_label = "unknown"
+        self._hover_dist_m = float('inf')
+        self._inspect_poll_hz = 4.0
+        self._inspect_last_poll_s = 0.0
+        self._inspect_last_eye = None
+        self._inspect_last_target = None
 
     # ── GL init ───────────────────────────────────────────────────────────────
 
@@ -11025,17 +11128,59 @@ class _PlayerCameraPanel:
     def open(self) -> bool:
         return self._open
 
-    def toggle(self):
-        self._open = not self._open
+    @property
+    def hud_mode(self) -> str:
+        return self._hud_mode
+
+    def _set_hud_mode(self, mode: str) -> None:
+        if mode not in (self.HUD_FULL, self.HUD_INFO, self.HUD_OFF):
+            return
+        self._hud_mode = str(mode)
+        self._open = (self._hud_mode == self.HUD_FULL)
         self._drag = -1
+        if self._open and self._cam is not None:
+            self._menu_anchor_eye = np.array(self._cam.eye, np.float64)
+            self._menu_anchor_target = np.array(self._cam.target, np.float64)
+            if hasattr(self._cam, '_forced_eye'):
+                self._cam._forced_eye = np.array(self._menu_anchor_eye, np.float64)
+        else:
+            self._menu_anchor_eye = None
+            self._menu_anchor_target = None
+            if self._cam is not None and hasattr(self._cam, '_forced_eye'):
+                self._cam._forced_eye = None
+
+    def cycle_hud_mode(self) -> str:
+        if self._hud_mode == self.HUD_FULL:
+            self._set_hud_mode(self.HUD_INFO)
+        elif self._hud_mode == self.HUD_INFO:
+            self._set_hud_mode(self.HUD_OFF)
+        else:
+            self._set_hud_mode(self.HUD_FULL)
+        return self._hud_mode
+
+    def toggle(self):
+        if self._open:
+            self._set_hud_mode(self.HUD_OFF)
+        else:
+            self._set_hud_mode(self.HUD_FULL)
 
     def close(self):
-        self._open = False
-        self._drag = -1
+        self._set_hud_mode(self.HUD_OFF)
+
+    def enforce_menu_camera_lock(self) -> None:
+        if not self._open or self._cam is None:
+            return
+        if self._menu_anchor_eye is None or self._menu_anchor_target is None:
+            self._menu_anchor_eye = np.array(self._cam.eye, np.float64)
+            self._menu_anchor_target = np.array(self._cam.target, np.float64)
+            return
+        if hasattr(self._cam, '_forced_eye'):
+            self._cam._forced_eye = np.array(self._menu_anchor_eye, np.float64)
+        self._cam.target = np.array(self._menu_anchor_target, np.float64)
 
     # ── Binding ───────────────────────────────────────────────────────────────
 
-    def attach(self, cam, slider_panel, renderer) -> None:
+    def attach(self, cam, slider_panel, renderer, player_ctrl=None) -> None:
         """Bind live objects and build per-knob on_change callbacks.
 
         Each callback closes over the live objects so handle_event() needs no
@@ -11045,6 +11190,7 @@ class _PlayerCameraPanel:
         self._cam          = cam
         self._slider_panel = slider_panel
         self._renderer     = renderer
+        self._player_ctrl  = player_ctrl
 
         c = cam
         p = slider_panel
@@ -11123,6 +11269,10 @@ class _PlayerCameraPanel:
             'sensor_gain': lambda v: None,
             'decay':       _decay_set,
         }
+        if self._player_ctrl is not None:
+            self._on_change['focus_pick_dist'] = self._player_ctrl.set_focus_pick_max_dist
+            self._on_change['focus_cone_deg'] = self._player_ctrl.set_focus_cone_angle_deg
+            self._on_change['focus_cone_rays'] = self._player_ctrl.set_focus_cone_rays
         for key in ('ray_density', 'ray_exposure', 'ray_gamma',
                     'sensor_rate', 'sensor_spp', 'sensor_fps', 'frame_step',
                     'mic_gain', 'pickup_gain',
@@ -11133,6 +11283,14 @@ class _PlayerCameraPanel:
 
         self._pull()
         self._sync_render_mode()
+        if player_ctrl is not None and hasattr(player_ctrl, 'focus_ray_engine'):
+            self._focus_ray_engine = str(player_ctrl.focus_ray_engine)
+            if hasattr(player_ctrl, 'focus_pick_max_dist'):
+                self._values['focus_pick_dist'] = float(player_ctrl.focus_pick_max_dist)
+            if hasattr(player_ctrl, 'focus_cone_angle_deg'):
+                self._values['focus_cone_deg'] = float(player_ctrl.focus_cone_angle_deg)
+            if hasattr(player_ctrl, 'focus_cone_rays'):
+                self._values['focus_cone_rays'] = float(player_ctrl.focus_cone_rays)
 
         # Ensure a CameraComputer is present in cam.software so auto modes
         # have somewhere to write.  Create one if absent.
@@ -11142,6 +11300,171 @@ class _PlayerCameraPanel:
                 cam.software.append(_CC())
         except Exception:
             pass
+        # Keep the controls discoverable by the global action manager.
+        try:
+            _ = self.hierarchy_nodes()
+        except Exception:
+            pass
+
+    @property
+    def freeze_player_motion(self) -> bool:
+        return bool(self._open)
+
+    def request_raytrace_render(self) -> None:
+        self._cam_render_mode = RenderMode.RAYTRACE
+        self.apply_render_mode()
+        self._raytrace_inspect_active = True
+        if self._cam is not None:
+            self._raytrace_anchor_eye = np.array(self._cam.eye, np.float64)
+            self._raytrace_anchor_target = np.array(self._cam.target, np.float64)
+        if self._renderer is not None and hasattr(self._renderer, 'reset_sensor'):
+            self._renderer.reset_sensor()
+
+    def _clear_render_if_moved(self, eps_m: float = 0.55) -> None:
+        if not self._raytrace_inspect_active or self._cam is None:
+            return
+        if self._raytrace_anchor_eye is None or self._raytrace_anchor_target is None:
+            return
+        eye_now = np.array(self._cam.eye, np.float64)
+        tgt_now = np.array(self._cam.target, np.float64)
+        if (float(np.linalg.norm(eye_now - self._raytrace_anchor_eye)) > float(eps_m)
+                or float(np.linalg.norm(tgt_now - self._raytrace_anchor_target)) > float(eps_m)):
+            self._raytrace_inspect_active = False
+            if self._renderer is not None and hasattr(self._renderer, 'reset_sensor'):
+                self._renderer.reset_sensor()
+
+    def update_hover_pick(self, mouse_pos: tuple[int, int], win_w: int, win_h: int,
+                          duty_stations: list, cameras: list) -> None:
+        if (not self._raytrace_inspect_active
+                or self._cam is None
+                or self._player_ctrl is None
+                or not hasattr(self._player_ctrl, 'pick_interactable_with_ray')):
+            return
+        _now_s = float(time.perf_counter())
+        _min_dt = 1.0 / max(0.5, float(self._inspect_poll_hz))
+        if (_now_s - float(self._inspect_last_poll_s)) < _min_dt:
+            return
+        self._inspect_last_poll_s = _now_s
+
+        mx, my = int(mouse_pos[0]), int(mouse_pos[1])
+        eye = np.array(self._cam.eye, np.float64)
+        target = np.array(self._cam.target, np.float64)
+        if self._inspect_last_eye is not None and self._inspect_last_target is not None:
+            _eye_d = float(np.linalg.norm(eye - self._inspect_last_eye))
+            _tgt_d = float(np.linalg.norm(target - self._inspect_last_target))
+            if _eye_d <= 1e-4 and _tgt_d <= 1e-4:
+                return
+        self._inspect_last_eye = eye.copy()
+        self._inspect_last_target = target.copy()
+        fwd = target - eye
+        nf = float(np.linalg.norm(fwd))
+        if nf <= 1e-9:
+            return
+        fwd /= nf
+        up = np.array([0.0, 0.0, 1.0], np.float64)
+        if abs(float(np.dot(fwd, up))) > 0.97:
+            up = np.array([0.0, 1.0, 0.0], np.float64)
+        right = np.cross(fwd, up)
+        nr = float(np.linalg.norm(right))
+        if nr <= 1e-9:
+            return
+        right /= nr
+        up = np.cross(right, fwd)
+        up /= max(float(np.linalg.norm(up)), 1e-9)
+        nx = (2.0 * ((float(mx) + 0.5) / max(1.0, float(win_w)))) - 1.0
+        ny = 1.0 - (2.0 * ((float(my) + 0.5) / max(1.0, float(win_h))))
+        tan_half = math.tan(float(self._cam.fov_y_rad()) * 0.5)
+        aspect = float(win_w) / max(1.0, float(win_h))
+        rd = fwd + (nx * aspect * tan_half) * right + (ny * tan_half) * up
+        nd = float(np.linalg.norm(rd))
+        if nd <= 1e-9:
+            return
+        rd /= nd
+        owner, dist = self._player_ctrl.pick_interactable_with_ray(
+            eye,
+            rd,
+            duty_stations,
+            cameras,
+        )
+        if owner is None:
+            self._hover_owner_obj = None
+            self._hover_owner_label = "none"
+            self._hover_material_label = "unknown"
+            self._hover_dist_m = float('inf')
+            return
+        self._hover_owner_obj = owner
+        self._hover_owner_label = str(
+            getattr(owner, 'label', getattr(owner, 'name', owner.__class__.__name__))
+        )
+        _mat = getattr(owner, 'material_slot', None)
+        if _mat is None:
+            _mat = getattr(owner, 'material', None)
+        if _mat is None:
+            _mat = getattr(owner, 'material_name', None)
+        self._hover_material_label = str(_mat) if _mat is not None else "unknown"
+        self._hover_dist_m = float(dist)
+
+    def _draw_hud_shell(self, win_w: int, win_h: int, full_shell: bool = True) -> None:
+        if full_shell:
+            # Full HUD backdrop so there is explicit structure under the controls.
+            self._draw_quad(0, 0, win_w, win_h, (0.01, 0.02, 0.05, 0.52), win_w, win_h)
+
+        # Top multiline status bar.
+        top_h = 70
+        self._draw_quad(0, 0, win_w, top_h,
+                (0.05, 0.10, 0.16, 0.94) if full_shell else (0.03, 0.06, 0.10, 0.72),
+                win_w, win_h)
+        active_tool = self._hotbar_slots[self._hotbar_index]
+        self._draw_text(f"tool: {active_tool}", 14, 8, win_w, win_h)
+        self._draw_text(f"object: {self._hover_owner_label}", 14, 28, win_w, win_h)
+        _dist_txt = "n/a" if not np.isfinite(self._hover_dist_m) else f"{self._hover_dist_m:.2f}m"
+        self._draw_text(f"material: {self._hover_material_label}   ray: {_dist_txt}", 14, 48, win_w, win_h)
+        _owner = self._hover_owner_obj
+        if _owner is not None and hasattr(_owner, "unfinished_tooltip_lines"):
+            _tips = list(_owner.unfinished_tooltip_lines())
+            for i, line in enumerate(_tips[:2]):
+                self._draw_text(str(line), 340, 8 + i * 20, win_w, win_h)
+
+        if full_shell:
+            # Left library palette with tabs.
+            lp_x, lp_y, lp_w = 12, top_h + 10, 360
+            lp_h = max(220, win_h - top_h - 120)
+            self._draw_quad(lp_x, lp_y, lp_w, lp_h, (0.06, 0.09, 0.12, 0.92), win_w, win_h)
+            tab_w = (lp_w - 16) // 2
+            for ti, name in enumerate(self._library_tabs):
+                tx = lp_x + 8 + ti * (tab_w + 4)
+                active = (ti == self._library_active_tab)
+                self._draw_quad(tx, lp_y + 6, tab_w, 26,
+                                (0.24, 0.42, 0.60, 0.95) if active else (0.15, 0.18, 0.23, 0.95),
+                                win_w, win_h)
+                self._draw_text(name.upper(), tx + 7, lp_y + 11, win_w, win_h)
+            if self._library_active_tab == 0 and self._player_ctrl is not None and hasattr(self._player_ctrl, 'backpack'):
+                _bp = dict(self._player_ctrl.backpack)
+                items = [f"{k} x{int(v)}" for k, v in sorted(_bp.items()) if int(v) > 0]
+            else:
+                items = self._library_items_ecosystem
+            iy = lp_y + 42
+            max_rows = max(1, (lp_h - 52) // 20)
+            if items:
+                for idx, name in enumerate(items[:max_rows]):
+                    self._draw_text(f"- {name}", lp_x + 10, iy + idx * 20, win_w, win_h)
+            elif self._library_active_tab == 0:
+                self._draw_text("- empty backpack", lp_x + 10, iy, win_w, win_h)
+
+        # Bottom hotbar, centered.
+        hb_w = 9 * 62 + 8 * 6
+        hb_h = 52
+        hb_x = (win_w - hb_w) // 2
+        hb_y = win_h - hb_h - 10
+        self._draw_quad(hb_x - 8, hb_y - 6, hb_w + 16, hb_h + 12, (0.05, 0.08, 0.12, 0.92), win_w, win_h)
+        for i, name in enumerate(self._hotbar_slots):
+            bx = hb_x + i * 68
+            active = (i == self._hotbar_index)
+            self._draw_quad(bx, hb_y, 62, hb_h,
+                            (0.23, 0.52, 0.30, 0.98) if active else (0.15, 0.20, 0.27, 0.95),
+                            win_w, win_h)
+            self._draw_text(str(i + 1), bx + 4, hb_y + 3, win_w, win_h)
+            self._draw_text(name[:7], bx + 8, hb_y + 22, win_w, win_h)
 
     def _get_computer(self):
         """Return the first CameraComputer in the bound camera's software list, or None."""
@@ -11184,6 +11507,14 @@ class _PlayerCameraPanel:
                         'segs', 'plate_th', 'dx'):
                 if key in p.values:
                     self._values[key] = p.values[key]
+        if self._player_ctrl is not None and hasattr(self._player_ctrl, 'focus_ray_engine'):
+            self._focus_ray_engine = str(self._player_ctrl.focus_ray_engine)
+            if hasattr(self._player_ctrl, 'focus_pick_max_dist'):
+                self._values['focus_pick_dist'] = float(self._player_ctrl.focus_pick_max_dist)
+            if hasattr(self._player_ctrl, 'focus_cone_angle_deg'):
+                self._values['focus_cone_deg'] = float(self._player_ctrl.focus_cone_angle_deg)
+            if hasattr(self._player_ctrl, 'focus_cone_rays'):
+                self._values['focus_cone_rays'] = float(self._player_ctrl.focus_cone_rays)
         if r is not None:
             self._show_illum  = (r._layers[7] != LAYER_HIDDEN)
             self._show_sensor = (r._layers[8] != LAYER_HIDDEN)
@@ -11242,6 +11573,7 @@ class _PlayerCameraPanel:
                 + self.ROW     # label row
                 + self.ROW     # render-mode button row
                 + self.ROW     # layer-toggle row (enlarger / illum / sensor)
+                + self.ROW     # focus-ray engine row
                 + 8)
 
     def _px(self, win_w: int) -> int:
@@ -11375,8 +11707,22 @@ class _PlayerCameraPanel:
         py = self._py(win_h)
         ph = self._panel_h()
 
+        if ev.type == pygame.KEYDOWN:
+            if pygame.K_1 <= ev.key <= pygame.K_9:
+                self._hotbar_index = int(ev.key - pygame.K_1)
+                return True
+
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             mx, my = ev.pos
+            top_h = 70
+            lp_x, lp_y, lp_w = 12, top_h + 10, 360
+            tab_w = (lp_w - 16) // 2
+            if lp_x <= mx <= lp_x + lp_w and lp_y <= my <= lp_y + 34:
+                for ti in range(2):
+                    tx = lp_x + 8 + ti * (tab_w + 4)
+                    if tx <= mx <= tx + tab_w:
+                        self._library_active_tab = ti
+                        return True
             if not (px <= mx <= px + self.PW and py <= my <= py + ph):
                 return False
             for i, (key, *_) in enumerate(self._SLIDERS):
@@ -11432,6 +11778,16 @@ class _PlayerCameraPanel:
                                                      if self._show_sensor
                                                      else LAYER_HIDDEN)
                     return True
+            focus_y = self._render_mode_y(py) + 3 * self.ROW
+            if focus_y <= my <= focus_y + self.ROW:
+                bwf = (self.PW - 16) // max(1, len(self._FOCUS_ENGINES))
+                for bi, (eng_key, _eng_label) in enumerate(self._FOCUS_ENGINES):
+                    bx = px + 8 + bi * (bwf + 4)
+                    if bx <= mx <= bx + bwf:
+                        self._focus_ray_engine = eng_key
+                        if self._player_ctrl is not None and hasattr(self._player_ctrl, 'set_focus_ray_engine'):
+                            self._player_ctrl.set_focus_ray_engine(eng_key)
+                        return True
             return True  # absorb any click inside panel
 
         if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
@@ -11453,7 +11809,7 @@ class _PlayerCameraPanel:
     # ── Render ────────────────────────────────────────────────────────────────
 
     def draw(self, win_w: int, win_h: int):
-        if not self._open or self._p_col is None:
+        if self._hud_mode == self.HUD_OFF or self._p_col is None:
             return
         # Pull current live values from cam/renderer every frame so the sliders
         # always reflect the actual state, not just what they were at attach time.
@@ -11469,6 +11825,16 @@ class _PlayerCameraPanel:
 
         glDisable(GL_DEPTH_TEST)
         glDisable(GL_BLEND)
+        if self._hud_mode == self.HUD_INFO:
+            self._draw_hud_shell(win_w, win_h, full_shell=False)
+            self._clear_render_if_moved()
+            glEnable(GL_DEPTH_TEST)
+            glBindVertexArray(0)
+            glUseProgram(0)
+            glBindTexture(GL_TEXTURE_2D, 0)
+            return
+
+        self._draw_hud_shell(win_w, win_h, full_shell=True)
         self._draw_quad(px, py, self.PW, ph, self._C_BG, win_w, win_h)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -11476,7 +11842,7 @@ class _PlayerCameraPanel:
         # Title bar
         self._draw_quad(px, py, self.PW, self.PAD_TOP - 2,
                         self._C_TITLE, win_w, win_h)
-        self._draw_text("CAMERA SETTINGS  [ E ] close",
+        self._draw_text("CAMERA SETTINGS  [ E ] cycle HUD",
                         px + 8, py + 9, win_w, win_h)
 
         # Slider rows
@@ -11544,6 +11910,19 @@ class _PlayerCameraPanel:
                             self._C_FILL if active else self._C_TRACK,
                             win_w, win_h)
             self._draw_text(lbl, bx + 6, ltgl_y + 6, win_w, win_h)
+
+        focus_y = rmy + 3 * self.ROW
+        self._draw_text("Focus Ray", px + 8, focus_y + 6, win_w, win_h)
+        bwf = (self.PW - 16) // max(1, len(self._FOCUS_ENGINES))
+        for bi, (eng_key, eng_label) in enumerate(self._FOCUS_ENGINES):
+            bx = px + 8 + bi * (bwf + 4)
+            active = (self._focus_ray_engine == eng_key)
+            self._draw_quad(bx, focus_y + 2, bwf, self.ROW - 4,
+                            self._C_FILL if active else self._C_TRACK,
+                            win_w, win_h)
+            self._draw_text(eng_label, bx + 6, focus_y + 6, win_w, win_h)
+
+        self._clear_render_if_moved()
 
         glEnable(GL_DEPTH_TEST)
         glBindVertexArray(0)
@@ -12028,6 +12407,14 @@ def main():
     elif args.no_auto_sim:
         print("[no-auto-sim] Physics worker deferred — will not start automatically.", flush=True)
 
+    capture = None
+    if args.capture_wav:
+        try:
+            capture = _CaptureSet(str(args.capture_wav), str(args.capture_source))
+        except Exception as _cap_err:
+            print(f"[capture] disabled: {_cap_err}", flush=True)
+            capture = None
+
     # ── Phase 6: Renderer — visible immediately while physics builds ──────────
     R = Renderer(WIN_W, WIN_H, outline=outline, info=info, body_h=body_h,
                  bridge_pos=BRIDGE_POS, str_paths=paths,
@@ -12218,7 +12605,7 @@ def main():
     # ── Player camera settings panel ─────────────────────────────────────────
     _player_cam_panel = _PlayerCameraPanel()
     _player_cam_panel.init_gl()
-    _player_cam_panel.attach(R.cam, panel, R)
+    _player_cam_panel.attach(R.cam, panel, R, player_ctrl=player_ctrl)
 
     # ── Camera optics schematic (three-view line diagram) ────────────────────
     _cam_optics_view = _CameraOpticsView()
@@ -12313,6 +12700,7 @@ def main():
 
     clock       = pygame.time.Clock()
     running     = True
+    _exit_confirm_open = False
     fi          = 0
     recorded_samples = 0
     replaying   = False
@@ -12326,6 +12714,36 @@ def main():
     active_ray_frame_index = None
     last_displayed_frame_index = None
     equilibrium_report_every = max(0, int(args.equilibrium_report_every))
+
+    def _open_exit_confirm(source: str = "") -> None:
+        nonlocal _exit_confirm_open
+        if _exit_confirm_open:
+            return
+        _exit_confirm_open = True
+        _src = f" ({source})" if source else ""
+        print(f"[exit] confirm quit{_src}: Y/Enter=yes, N/Esc=no", flush=True)
+
+    def _exit_confirm_layout(win_w: int, win_h: int) -> dict:
+        panel_w = 520
+        panel_h = 220
+        panel_x = (win_w - panel_w) // 2
+        panel_y = (win_h - panel_h) // 2
+        btn_w = 170
+        btn_h = 46
+        gap = 20
+        row_y = panel_y + panel_h - btn_h - 26
+        no_x = panel_x + (panel_w - (btn_w * 2 + gap)) // 2
+        yes_x = no_x + btn_w + gap
+        return {
+            "panel": (panel_x, panel_y, panel_w, panel_h),
+            "no": (no_x, row_y, btn_w, btn_h),
+            "yes": (yes_x, row_y, btn_w, btn_h),
+        }
+
+    def _pt_in_rect(pt: tuple[int, int], rect: tuple[int, int, int, int]) -> bool:
+        px, py = pt
+        rx, ry, rw, rh = rect
+        return (rx <= px <= rx + rw) and (ry <= py <= ry + rh)
 
     def _refresh_ray_field_from_frame(frame, frame_index: int, _reason: str) -> bool:
         nonlocal active_ray_frame_index, force_ray_refresh
@@ -12352,7 +12770,52 @@ def main():
         return True
 
     try:
+      from controls import (
+          start_action_dispatcher as _start_action_dispatcher,
+          stop_action_dispatcher as _stop_action_dispatcher,
+          get_shader_walker as _get_shader_walker,
+      )
+      _start_action_dispatcher()
+      _shader_walker = _get_shader_walker()
+      _shader_frame_result = None
+      # ---- Naive star network bootstrap --------------------------------
+      # Auto-wire every existing owner into a default star, spin up the
+      # singleton gateway, and pre-create one duty station the player can
+      # find in the world.  The controller is ticked once per frame below.
+      try:
+          from naive_graph import (
+              auto_wire_naive_network as _auto_wire_naive_network,
+              get_naive_graph_controller as _get_naive_graph_controller,
+              NaiveStarDutyStation as _NaiveStarDutyStation,
+          )
+          from gateway_object import get_gateway as _get_gateway
+          _naive_ctrl = _get_naive_graph_controller()
+          _auto_wire_naive_network("global", priority=0)
+          _player_duty_station = _NaiveStarDutyStation(
+              "global", owner_id="_duty_station.global",
+              priority=0, breakout_count=8,
+          )
+          _gateway = _get_gateway(world_pos=(0.0, 0.0, -5.0))
+          print(f"[naive] bootstrap OK: {len(_naive_ctrl.stars)} star(s), "
+                f"DS={_player_duty_station.owner_id}, gateway={_gateway.owner_id}",
+                flush=True)
+      except Exception as _naive_exc:
+          import traceback as _tb
+          print(f"[naive] bootstrap failed: {_naive_exc}", flush=True)
+          _tb.print_exc()
+          _naive_ctrl = None
+          _player_duty_station = None
+          _gateway = None
       while running:
+        # Tick the naive star network once per frame.
+        if _naive_ctrl is not None:
+            try:
+                _naive_ctrl.tick()
+                if _gateway is not None:
+                    _gateway.pump()
+            except Exception as _ng_exc:
+                # Never let routing kill the render loop.
+                print(f"[naive] tick error: {_ng_exc}", flush=True)
         _dt = clock.tick(60) / 1000.0
         _keys_held = pygame.key.get_pressed()
         # Camera designer station owns the mouse — always keep it free.
@@ -12361,7 +12824,7 @@ def main():
                 pygame.mouse.set_visible(True)
             if pygame.event.get_grab():
                 pygame.event.set_grab(False)
-        if player_ctrl is not None:
+        if player_ctrl is not None and not _player_cam_panel.freeze_player_motion:
             player_ctrl.tick(_dt, _keys_held, duty_stations, cameras=cameras)
         # Drive each station's menu visibility from player state — no blocking calls
         if player_ctrl is not None:
@@ -12378,17 +12841,31 @@ def main():
                 and player_ctrl.state.value not in ("walk", "in_camera")):
             _player_cam_panel.close()
 
-        # Auto-open player cam panel when entering in_camera mode
-        if (player_ctrl is not None
-                and player_ctrl.state.value == "in_camera"
-                and not _player_cam_panel.open):
-            _player_cam_panel.attach(R.cam, panel, R)
-            _cam_optics_view.attach(R.cam, _player_cam_panel)
-            _player_cam_panel.toggle()
-            pygame.mouse.set_visible(True)
-            pygame.event.set_grab(False)
-
         for ev in pygame.event.get():
+            if _exit_confirm_open:
+                if ev.type == KEYDOWN:
+                    if ev.key in (pygame.K_y, pygame.K_RETURN, pygame.K_KP_ENTER):
+                        running = False
+                        continue
+                    if ev.key in (pygame.K_n, pygame.K_ESCAPE):
+                        _exit_confirm_open = False
+                        print("[exit] cancelled", flush=True)
+                        continue
+                elif ev.type == MOUSEBUTTONDOWN and ev.button == 1:
+                    _layout = _exit_confirm_layout(WIN_W, WIN_H)
+                    if _pt_in_rect(ev.pos, _layout["yes"]):
+                        running = False
+                        continue
+                    if _pt_in_rect(ev.pos, _layout["no"]):
+                        _exit_confirm_open = False
+                        print("[exit] cancelled", flush=True)
+                        continue
+                elif ev.type == QUIT:
+                    continue
+                continue
+            if ev.type == KEYDOWN and ev.key == pygame.K_ESCAPE:
+                _open_exit_confirm("Esc")
+                continue
             # Camera designer station owns the full screen — it gets events
             # before everything else so its mouse-interactive ortho views are
             # never shadowed by the orbit camera handler.
@@ -12398,9 +12875,7 @@ def main():
                 # Designer is active: skip player_ctrl entirely (orbit/walk
                 # mouse handling must not fire while the designer is open).
                 if ev.type == QUIT:
-                    running = False
-                elif ev.type == KEYDOWN and ev.key == pygame.K_ESCAPE:
-                    running = False
+                    _open_exit_confirm("window close")
                 continue
             # Camera panel consumes mouse events when in IN_CAMERA mode
             if (_camera_panel is not None
@@ -12408,13 +12883,19 @@ def main():
                     and player_ctrl.state.value == "in_camera"):
                 if _camera_panel.handle_event(ev, R.cam):
                     continue
+            if _player_cam_panel.open and _cam_optics_view.handle_event(ev, WIN_W, WIN_H):
+                pygame.mouse.set_visible(True)
+                pygame.event.set_grab(False)
+                pygame.mouse.get_rel()
+                continue
             # Player camera settings panel (walk mode, non-blocking)
             if _player_cam_panel.handle_event(ev):
                 continue
             # Route through player controller first; it may absorb movement events
             if player_ctrl is not None:
-                if player_ctrl.handle_event(ev, duty_stations, cameras=cameras):
-                    continue
+                if not _player_cam_panel.open:
+                    if player_ctrl.handle_event(ev, duty_stations, cameras=cameras):
+                        continue
             # Slider panel only visible / interactive when not in a walk state
             # (or always when player_ctrl is None / orbit mode)
             _panel_active = (player_ctrl is None or player_ctrl.sidebar_visible
@@ -12425,11 +12906,11 @@ def main():
             if _panel_active and panel.handle_event(ev):
                 continue
             if ev.type == QUIT:
-                running = False
+                _open_exit_confirm("window close")
             elif ev.type == KEYDOWN:
                 camera_dirty = False
                 if ev.key == pygame.K_ESCAPE:
-                    running = False
+                    _open_exit_confirm("Esc")
                 elif ev.key == K_SPACE:
                     R._paused = not R._paused
                 elif ev.key == pygame.K_f:
@@ -12504,14 +12985,14 @@ def main():
                     R._film_negative = not R._film_negative
                     print(f"Film: {'negative' if R._film_negative else 'positive'}")
                 elif ev.key == pygame.K_e:
-                    # E always toggles the camera settings panel regardless of state
-                    if not _player_cam_panel.open:
-                        _player_cam_panel.attach(R.cam, panel, R)
-                        _cam_optics_view.attach(R.cam, _player_cam_panel)
-                    _player_cam_panel.toggle()
+                    # E cycles HUD modes: full -> status+hotbar -> off -> full.
+                    _player_cam_panel.attach(R.cam, panel, R, player_ctrl=player_ctrl)
+                    _cam_optics_view.attach(R.cam, _player_cam_panel)
+                    _player_cam_panel.cycle_hud_mode()
                     if _player_cam_panel.open:
                         pygame.mouse.set_visible(True)
                         pygame.event.set_grab(False)
+                        pygame.mouse.get_rel()
                     else:
                         _wants_grab = (
                             (player_ctrl is not None
@@ -12521,6 +13002,7 @@ def main():
                         if _wants_grab:
                             pygame.mouse.set_visible(False)
                             pygame.event.set_grab(True)
+                            pygame.mouse.get_rel()
                 else:
                     for ki, kv in enumerate(LAYER_KEYS):
                         if ev.key == kv:
@@ -12534,6 +13016,9 @@ def main():
             elif ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
                 dragging = False
             elif ev.type == MOUSEMOTION:
+                if _player_cam_panel.open and _player_cam_panel.freeze_player_motion:
+                    _player_cam_panel.update_hover_pick(ev.pos, WIN_W, WIN_H, duty_stations, cameras)
+                    continue
                 _in_ray_fps = (
                     _player_cam_panel._cam_render_mode is RenderMode.RAYTRACE
                     and not _player_cam_panel.open
@@ -12551,6 +13036,8 @@ def main():
                     R.sync_sensor_camera(reset=False)
                     last_mouse = ev.pos
             elif ev.type == MOUSEWHEEL:
+                if _player_cam_panel.open:
+                    continue
                 R.cam.zoom(-ev.y * 0.04)
                 R.sync_sensor_camera(reset=False)
 
@@ -12714,30 +13201,33 @@ def main():
                 cached_frames=int(len(R._frames)),
             )
             _cam_dt = clock.get_time() * 1e-3  # ms → s
-            R.cam.tick(_cam_dt)
+            if not _player_cam_panel.open:
+                R.cam.tick(_cam_dt)
+            _player_cam_panel.enforce_menu_camera_lock()
 
             # ── Active station menu overlay ───────────────────────────────────
             _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
             if _active_st is not None and hasattr(_active_st, 'render_menu'):
                 _active_st.render_menu(WIN_W, WIN_H)
 
+            # ── Bottom-up shader walk ────────────────────────────────────────
+            # Visit every SHADERS-axis node in the control hierarchy in
+            # post-order. Each due shader runs on the main thread (so it
+            # may touch the GL context), publishes its payload into its
+            # flip buffer, and stamps its claimed targets as finalized so
+            # the final draw below can gate fragments accordingly.
+            try:
+                _shader_frame_result = _shader_walker.tick(
+                    frame_index=int(frame_index),
+                    dt=float(_dt),
+                )
+            except Exception:
+                _shader_frame_result = None
+
             glClearColor(0.015, 0.010, 0.040, 1.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
             _rs_lv /= np.linalg.norm(_rs_lv)
-
-            # ── Duty station render pass ──────────────────────────────────────
-            # Render the duty station console using the same _p_body shader as
-            # the main scene so scene field uniforms, depth state, and shading
-            # model are identical to all other Phong-lit objects.
-            if duty_stations and _cam_pure_matrices is not None:
-                _P, _V = _cam_pure_matrices(R.cam)
-                _light_v = np.array([0.6, 0.8, 0.5], np.float32)
-                for _ds in duty_stations:
-                    _ds.draw((_P @ _V).astype(np.float32),
-                             _V.astype(np.float32),
-                             _light_v,
-                             body_prog=None)
 
             # ── Camera item render pass ───────────────────────────────────────
             if cameras and _cam_pure_matrices is not None:
@@ -12748,6 +13238,42 @@ def main():
                           np.array([0.5, 1.0, 0.6], np.float32))
                 for _ci in cameras:
                     _ci.draw(_MVP, _MV, _lv)
+
+            _focus_owner = getattr(player_ctrl, 'focus_target', None) if player_ctrl is not None else None
+            if _focus_owner is not None and _cam_pure_matrices is not None:
+                _focus_lines = None
+                if hasattr(_focus_owner, 'interaction_wireframe_world'):
+                    _focus_lines = _focus_owner.interaction_wireframe_world()
+                elif hasattr(_focus_owner, 'interaction_triangles_world'):
+                    _focus_tris = _focus_owner.interaction_triangles_world()
+                    if _focus_tris is not None and len(_focus_tris) > 0:
+                        _focus_lines = np.empty((len(_focus_tris) * 3, 2, 3), np.float64)
+                        _focus_lines[0::3, 0, :] = _focus_tris[:, 0, :]
+                        _focus_lines[0::3, 1, :] = _focus_tris[:, 1, :]
+                        _focus_lines[1::3, 0, :] = _focus_tris[:, 1, :]
+                        _focus_lines[1::3, 1, :] = _focus_tris[:, 2, :]
+                        _focus_lines[2::3, 0, :] = _focus_tris[:, 2, :]
+                        _focus_lines[2::3, 1, :] = _focus_tris[:, 0, :]
+                _focus_v = _line_segments_pos(_focus_lines)
+                if len(_focus_v) > 0:
+                    _focus_vao, _focus_vbo, _focus_n = _vao(
+                        _focus_v, [(0, 3, 12, 0)], GL_DYNAMIC_DRAW)
+                    try:
+                        glDisable(GL_DEPTH_TEST)
+                        glDepthMask(GL_FALSE)
+                        glUseProgram(R._p_line)
+                        _mvp(R._p_line, (_P @ _V).astype(np.float32))
+                        glLineWidth(1.8)
+                        glUniform4f(glGetUniformLocation(R._p_line, b'uColor'),
+                                    1.0, 0.92, 0.20, 0.95)
+                        glBindVertexArray(_focus_vao)
+                        glDrawArrays(GL_LINES, 0, _focus_n)
+                        glBindVertexArray(0)
+                    finally:
+                        glDepthMask(GL_TRUE)
+                        glEnable(GL_DEPTH_TEST)
+                        glDeleteBuffers(1, [_focus_vbo])
+                        glDeleteVertexArrays(1, [_focus_vao])
 
             # ── Camera designer station render pass ──────────────────────────
 
@@ -12764,7 +13290,8 @@ def main():
 
             # ── Player camera settings panel (walk mode overlay) ────────────────
             _player_cam_panel.draw(WIN_W, WIN_H)
-            _cam_optics_view.draw(WIN_W, WIN_H)
+            if _player_cam_panel.open:
+                _cam_optics_view.draw(WIN_W, WIN_H)
 
             for _ds in duty_stations:
                 _m = getattr(_ds, 'menu', None)
@@ -12812,11 +13339,48 @@ def main():
                     paused=R._paused,
                     pending_rebuild=pending_rebuild,
                     cached_frames=len(R._frames))
+
+            if _exit_confirm_open and _player_cam_panel is not None and getattr(_player_cam_panel, '_p_col', None) is not None:
+                _layout = _exit_confirm_layout(WIN_W, WIN_H)
+                _mx, _my = pygame.mouse.get_pos()
+                _hov_yes = _pt_in_rect((_mx, _my), _layout["yes"])
+                _hov_no = _pt_in_rect((_mx, _my), _layout["no"])
+
+                glDisable(GL_DEPTH_TEST)
+                glEnable(GL_BLEND)
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+
+                _player_cam_panel._draw_quad(0, 0, WIN_W, WIN_H,
+                                             (0.01, 0.01, 0.02, 0.70), WIN_W, WIN_H)
+                _px, _py, _pw, _ph = _layout["panel"]
+                _player_cam_panel._draw_quad(_px, _py, _pw, _ph,
+                                             (0.06, 0.08, 0.12, 0.95), WIN_W, WIN_H)
+                _player_cam_panel._draw_quad(_px, _py, _pw, 40,
+                                             (0.18, 0.28, 0.46, 0.98), WIN_W, WIN_H)
+                _player_cam_panel._draw_text("EXIT GAME", _px + 16, _py + 11, WIN_W, WIN_H)
+                _player_cam_panel._draw_text("Leave current session?", _px + 16, _py + 66, WIN_W, WIN_H)
+                _player_cam_panel._draw_text("ESC or N: cancel    ENTER or Y: confirm", _px + 16, _py + 94, WIN_W, WIN_H)
+
+                _nx, _ny, _nw, _nh = _layout["no"]
+                _yx, _yy, _yw, _yh = _layout["yes"]
+                _player_cam_panel._draw_quad(_nx, _ny, _nw, _nh,
+                                             (0.34, 0.22, 0.22, 0.98) if _hov_no else (0.24, 0.16, 0.16, 0.96),
+                                             WIN_W, WIN_H)
+                _player_cam_panel._draw_quad(_yx, _yy, _yw, _yh,
+                                             (0.22, 0.44, 0.26, 0.98) if _hov_yes else (0.16, 0.30, 0.18, 0.96),
+                                             WIN_W, WIN_H)
+                _player_cam_panel._draw_text("NO", _nx + (_nw // 2) - 10, _ny + 14, WIN_W, WIN_H)
+                _player_cam_panel._draw_text("YES", _yx + (_yw // 2) - 12, _yy + 14, WIN_W, WIN_H)
+
             pygame.display.flip()
         except BaseException as exc:
             _report_exception(f"render frame {fi}", exc)
             raise
     finally:
+        try:
+            _stop_action_dispatcher()
+        except Exception:
+            pass
         if capture is not None:
             capture.close()
             print(f"Wrote capture: {', '.join(capture.paths)}", flush=True)

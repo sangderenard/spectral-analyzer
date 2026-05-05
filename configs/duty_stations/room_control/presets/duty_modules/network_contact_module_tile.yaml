@@ -1,0 +1,19 @@
+id: network_contact_module_tile
+label: Network Contact Module Tile
+category: duty_modules
+kind: network_duty_module_tile
+mesh_type: duty_module_quad
+programmatic_blueprint_id: network_contact_module_auto
+requires_custom_confirm: false
+prefab_available: true
+surfaces: [floor]
+footprint_xy: [1, 1]
+level_span: 1
+color_rgb: [0.26, 0.56, 0.62]
+network_port_count: 4
+network_port_side: north
+network_strict_snap: true
+action_script: actions/network_module_actions.py
+action_hook: on_tile_object_action
+control_action: activate
+summary: 1x1 duty module tile with four contact-network modules aligned along the back edge.

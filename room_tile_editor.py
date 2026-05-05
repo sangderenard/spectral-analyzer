@@ -12,6 +12,11 @@ import numpy as np
 import pygame
 
 try:
+    from controls import register_triangle_group_action as _register_triangle_group_action
+except Exception:
+    _register_triangle_group_action = None
+
+try:
     import yaml as _yaml
     _HAS_YAML = True
 except ImportError:
@@ -65,6 +70,10 @@ class TileMeshItem:
     blueprint_id: str = ""
     programmatic_blueprint_id: str = ""
     requires_custom_confirm: bool = False
+    action_script: str = ""
+    action_hook: str = ""
+    control_action: str = "activate"
+    triangle_group: str = ""
 
 
 def _parse_obj_vertices(path: str) -> Optional[np.ndarray]:
@@ -151,6 +160,12 @@ class RoomTilePreset:
     programmatic_blueprint_id: str = ""
     requires_custom_confirm: bool = False
     prefab_available: bool = False
+    network_port_count: int = 0
+    network_strict_snap: bool = False
+    network_port_side: str = "north"
+    action_script: str = ""
+    action_hook: str = ""
+    control_action: str = "activate"
 
     @classmethod
     def from_dict(cls, data: dict) -> "RoomTilePreset":
@@ -173,6 +188,12 @@ class RoomTilePreset:
             programmatic_blueprint_id=str(data.get("programmatic_blueprint_id", "")),
             requires_custom_confirm=bool(data.get("requires_custom_confirm", False)),
             prefab_available=bool(data.get("prefab_available", False)),
+            network_port_count=max(0, int(data.get("network_port_count", 0))),
+            network_strict_snap=bool(data.get("network_strict_snap", False)),
+            network_port_side=str(data.get("network_port_side", "north")),
+            action_script=str(data.get("action_script", "")),
+            action_hook=str(data.get("action_hook", "")),
+            control_action=str(data.get("control_action", "activate")),
         )
 
 
@@ -232,7 +253,7 @@ class RoomTileLibraryPanel:
         self._on_rotate_right = on_rotate_right
         self._on_import_mesh = on_import_mesh
         self._categories = [
-            "room_tiles", "lights", "doors", "windows", "cameras", "duty_stations"
+            "room_tiles", "lights", "doors", "windows", "cameras", "duty_stations", "duty_modules"
         ]
         self.state.setdefault("palette_tool", "create")
         self.state.setdefault("palette_category", self._categories[0])
@@ -507,6 +528,7 @@ class RoomTileWorkspace:
         self.instances: List[RoomTileInstance] = []
         self.tile_mesh_items_by_tile: Dict[str, List[TileMeshItem]] = {}
         self.tile_mesh_items_by_instance: Dict[str, List[TileMeshItem]] = {}
+        self.tile_action_manifest_by_instance: Dict[str, Dict[str, Any]] = {}
         self.fabrication_orders_by_instance: Dict[str, Dict[str, Any]] = {}
         self._next_instance = 1
         self._seed_default_instances()
@@ -515,9 +537,12 @@ class RoomTileWorkspace:
         self._button_rects: Dict[str, pygame.Rect] = {}
         self._minus_plus_rects: Dict[str, pygame.Rect] = {}
         self._grid_rect = pygame.Rect(0, 0, 0, 0)
-        self._vao = None
-        self._vbo = None
-        self._vert_count = 0
+        self._vao_plan = None
+        self._vbo_plan = None
+        self._vert_count_plan = 0
+        self._vao_built = None
+        self._vbo_built = None
+        self._vert_count_built = 0
         self._gl_dirty = True
         self._font = pygame.font.SysFont("consolas", 13)
         self._font_s = pygame.font.SysFont("consolas", 11)
@@ -547,27 +572,8 @@ class RoomTileWorkspace:
         return self.presets.get(preset_id)
 
     def _seed_default_instances(self):
-        """Place the default room layout: fabricator station adjacent to the room-control anchor."""
-        if self.instances:
-            return  # already populated (e.g. loaded from saved state)
-        fab_preset = self.presets.get("fabricator_station")
-        if fab_preset is None:
-            return
-        anchor_x = int(self.state.get("room_station_x", 0))
-        anchor_y = int(self.state.get("room_station_y", 0))
-        sp = self._station_preset()
-        anchor_w = int(sp.footprint_xy[0]) if sp is not None else 2
-        fab_x = anchor_x + anchor_w  # immediately to the right of the anchor
-        fab_y = anchor_y
-        fab_instance = RoomTileInstance(
-            instance_id=f"tile_{self._next_instance:04d}",
-            preset_id="fabricator_station",
-            grid_x=fab_x,
-            grid_y=fab_y,
-            level=0,
-        )
-        self._next_instance += 1
-        self.instances.append(fab_instance)
+        """Startup stays empty; instances are user-placed or loaded from saved state."""
+        return
 
     def _clamp_station(self):
         width = int(self.state.get("room_width_cells", 8))
@@ -787,6 +793,11 @@ class RoomTileWorkspace:
         preset = self.selected_preset()
         if preset is None:
             return
+        if bool(getattr(preset, "network_strict_snap", False)):
+            snapped = self._snap_network_module_anchor(grid_x, grid_y, level, preset)
+            if snapped is None:
+                return
+            grid_x, grid_y, level = snapped
         width = int(self.state.get("room_width_cells", 8))
         depth = int(self.state.get("room_depth_cells", 8))
         if grid_x < 0 or grid_y < 0:
@@ -838,6 +849,11 @@ class RoomTileWorkspace:
                 nx = int(np.clip(grid_x, 0, width - preset.footprint_xy[0]))
                 ny = int(np.clip(grid_y, 0, depth - preset.footprint_xy[1]))
                 nz = int(np.clip(level, -99, 99))
+                if bool(getattr(preset, "network_strict_snap", False)):
+                    snapped = self._snap_network_module_anchor(nx, ny, nz, preset)
+                    if snapped is None:
+                        return
+                    nx, ny, nz = snapped
                 if preset.category != "duty_stations":
                     if self._overlaps_station(nx, ny, nz,
                                              int(preset.footprint_xy[0]),
@@ -855,6 +871,9 @@ class RoomTileWorkspace:
         instance = self.instance_at(grid_x, grid_y, level)
         if instance is None:
             return
+        self.tile_mesh_items_by_instance.pop(f"inst:{instance.instance_id}", None)
+        self.tile_action_manifest_by_instance.pop(instance.instance_id, None)
+        self.fabrication_orders_by_instance.pop(instance.instance_id, None)
         self.instances = [item for item in self.instances if item.instance_id != instance.instance_id]
         if self.state.get("room_selected_instance") == instance.instance_id:
             self.state["room_selected_instance"] = ""
@@ -1009,6 +1028,26 @@ class RoomTileWorkspace:
         if selected:
             pygame.draw.rect(surface, _HILITE_MARKER, rect.inflate(-2, -2), 2, border_radius=4)
 
+        ports = int(getattr(preset, "network_port_count", 0))
+        if ports > 0:
+            side = str(getattr(preset, "network_port_side", "north"))
+            pcol = (80, 230, 210)
+            for i in range(ports):
+                t = (i + 1) / float(ports + 1)
+                if side == "south":
+                    px = int(rect.x + t * rect.w)
+                    py = int(rect.bottom - 3)
+                elif side == "west":
+                    px = int(rect.x + 3)
+                    py = int(rect.y + t * rect.h)
+                elif side == "east":
+                    px = int(rect.right - 3)
+                    py = int(rect.y + t * rect.h)
+                else:
+                    px = int(rect.x + t * rect.w)
+                    py = int(rect.y + 3)
+                pygame.draw.circle(surface, pcol, (px, py), 2)
+
     def _draw_projection_cell(self, surface: pygame.Surface, rect: pygame.Rect,
                               preset: RoomTilePreset, selected: bool = False):
         mid_y = rect.y + rect.h // 2
@@ -1025,6 +1064,135 @@ class RoomTileWorkspace:
     def _projection_levels(self) -> List[int]:
         center = int(self.state.get("room_level", 0))
         return [center + offset for offset in range(4, -5, -1)]
+
+    @staticmethod
+    def _is_duty_station_preset(preset: Optional[RoomTilePreset]) -> bool:
+        if preset is None:
+            return False
+        if str(getattr(preset, "category", "")) == "duty_stations":
+            return True
+        kind = str(getattr(preset, "kind", "")).lower()
+        pid = str(getattr(preset, "preset_id", "")).lower()
+        return ("station" in kind) or ("station" in pid)
+
+    @staticmethod
+    def _is_network_module_preset(preset: Optional[RoomTilePreset]) -> bool:
+        if preset is None:
+            return False
+        if str(getattr(preset, "kind", "")) == "network_duty_module_tile":
+            return True
+        if str(getattr(preset, "category", "")) == "duty_modules":
+            return True
+        return bool(getattr(preset, "network_strict_snap", False))
+
+    @staticmethod
+    def _rotation_cardinal_index(step: int) -> int:
+        # 12-step dial -> nearest quarter-turn (0:N, 1:E, 2:S, 3:W)
+        return int(round(float(step % _ROT_STEPS) / float(_ROT_STEPS / 4.0))) % 4
+
+    def _iter_duty_station_placements(self) -> List[Tuple[int, int, int, int, int, int]]:
+        out: List[Tuple[int, int, int, int, int, int]] = []
+
+        sp = self._station_preset()
+        if sp is not None:
+            sx = int(self.state.get("room_station_x", 0))
+            sy = int(self.state.get("room_station_y", 0))
+            out.append((sx, sy, int(sp.footprint_xy[0]), int(sp.footprint_xy[1]), 0, 0))
+
+        for inst in self.instances:
+            p = self.presets.get(inst.preset_id)
+            if not self._is_duty_station_preset(p):
+                continue
+            if p is None:
+                continue
+            out.append((
+                int(inst.grid_x),
+                int(inst.grid_y),
+                int(p.footprint_xy[0]),
+                int(p.footprint_xy[1]),
+                int(inst.level),
+                self._rotation_cardinal_index(int(getattr(inst, "rotation", 0))),
+            ))
+        return out
+
+    def _station_back_contact_cells(self, sx: int, sy: int, fw: int, fd: int,
+                                   level: int, cardinal: int) -> List[Tuple[int, int, int]]:
+        # cardinal orientation: 0=N(+y), 1=E(+x), 2=S(-y), 3=W(-x)
+        cells: List[Tuple[int, int, int]] = []
+        if cardinal == 0:
+            y = sy - 1
+            for x in range(sx, sx + fw):
+                cells.append((x, y, level))
+        elif cardinal == 1:
+            x = sx - 1
+            for y in range(sy, sy + fd):
+                cells.append((x, y, level))
+        elif cardinal == 2:
+            y = sy + fd
+            for x in range(sx, sx + fw):
+                cells.append((x, y, level))
+        else:
+            x = sx + fw
+            for y in range(sy, sy + fd):
+                cells.append((x, y, level))
+        return cells
+
+    def _station_contact_cell_candidates(self, sx: int, sy: int, fw: int, fd: int,
+                                         level: int, cardinal: int) -> List[Tuple[int, int, int]]:
+        order = [int(cardinal) % 4, (int(cardinal) + 2) % 4, (int(cardinal) + 1) % 4, (int(cardinal) + 3) % 4]
+        out: List[Tuple[int, int, int]] = []
+        seen: set[Tuple[int, int, int]] = set()
+        for side in order:
+            for cell in self._station_back_contact_cells(sx, sy, fw, fd, level, side):
+                if cell in seen:
+                    continue
+                seen.add(cell)
+                out.append(cell)
+        return out
+
+    def _network_contact_candidates(self, level: int, preset: RoomTilePreset) -> List[Tuple[int, int, int]]:
+        width = int(self.state.get("room_width_cells", 8))
+        depth = int(self.state.get("room_depth_cells", 8))
+        fw = int(preset.footprint_xy[0])
+        fd = int(preset.footprint_xy[1])
+        out: List[Tuple[int, int, int]] = []
+        seen: set[Tuple[int, int, int]] = set()
+
+        for sx, sy, sw, sd, slv, cardinal in self._iter_duty_station_placements():
+            if int(slv) != int(level):
+                continue
+            for cx, cy, cz in self._station_contact_cell_candidates(sx, sy, sw, sd, slv, cardinal):
+                if cx < 0 or cy < 0:
+                    continue
+                if cx + fw > width or cy + fd > depth:
+                    continue
+                if self._overlaps_station(cx, cy, level, fw, fd, int(preset.level_span)):
+                    continue
+                key = (cx, cy, cz)
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(key)
+        return out
+
+    def _snap_network_module_anchor(self, gx: int, gy: int, level: int,
+                                    preset: RoomTilePreset) -> Optional[Tuple[int, int, int]]:
+        cands = self._network_contact_candidates(level, preset)
+        if not cands:
+            return None
+        best = min(cands, key=lambda c: (c[0] - gx) * (c[0] - gx) + (c[1] - gy) * (c[1] - gy))
+        return int(best[0]), int(best[1]), int(best[2])
+
+    def _draw_network_snap_hints(self, surface: pygame.Surface, left: int, top: int,
+                                 cell_size: int, level: int, preset: RoomTilePreset):
+        cands = self._network_contact_candidates(level, preset)
+        if not cands:
+            return
+        col = (70, 210, 190)
+        for x, y, _ in cands:
+            rect = pygame.Rect(left + x * cell_size, top + y * cell_size, cell_size, cell_size)
+            pygame.draw.rect(surface, col, rect.inflate(-8, -8), 1, border_radius=3)
+            pygame.draw.circle(surface, col, rect.center, 2)
 
     @staticmethod
     def _is_room_control_station_preset(preset: Optional[RoomTilePreset]) -> bool:
@@ -1101,6 +1269,7 @@ class RoomTileWorkspace:
                 pos_xy=np.array([tile_w * 0.5, y_console_center], np.float64),
                 z_min=0.0,
                 yaw_step=0,
+                triangle_group="console/body",
             ),
             TileMeshItem(
                 mesh_id="mesh_002",
@@ -1109,6 +1278,7 @@ class RoomTileWorkspace:
                 pos_xy=np.array([tile_w * 0.5, y_screen], np.float64),
                 z_min=max(0.0, cons_h - scr_h * 0.35),
                 yaw_step=0,
+                triangle_group="console/screen",
             ),
             TileMeshItem(
                 mesh_id="mesh_003",
@@ -1117,6 +1287,7 @@ class RoomTileWorkspace:
                 pos_xy=np.array([tile_w * 0.5, y_wall], np.float64),
                 z_min=0.0,
                 yaw_step=0,
+                triangle_group="architecture/wall",
             ),
             TileMeshItem(
                 mesh_id="mesh_004",
@@ -1125,6 +1296,7 @@ class RoomTileWorkspace:
                 pos_xy=np.array([tile_w * 0.5, tile_d * 0.5], np.float64),
                 z_min=0.0,
                 yaw_step=0,
+                triangle_group="architecture/floor",
             ),
         ])
 
@@ -1138,6 +1310,7 @@ class RoomTileWorkspace:
                     pos_xy=np.array([tile_w * 0.5 - wing_x_off, y_console_center], np.float64),
                     z_min=0.0,
                     yaw_step=0,
+                    triangle_group="console/left_wing",
                 ),
                 TileMeshItem(
                     mesh_id="mesh_006",
@@ -1146,8 +1319,49 @@ class RoomTileWorkspace:
                     pos_xy=np.array([tile_w * 0.5 + wing_x_off, y_console_center], np.float64),
                     z_min=0.0,
                     yaw_step=0,
+                    triangle_group="console/right_wing",
                 ),
             ])
+
+    def _seed_network_duty_module_components(
+        self,
+        active_items: List[TileMeshItem],
+        fx: int,
+        fy: int,
+        fz: int,
+        scope: str,
+    ):
+        tile_w = float(fx) * float(_CELL_SIZE_M)
+        tile_d = float(fy) * float(_CELL_SIZE_M)
+        tile_h = float(fz) * float(_LEVEL_HEIGHT_M)
+        label_prefix = "Placed " if scope == "placed" else ""
+
+        obj_w = min(0.24, tile_w * 0.24)
+        obj_d = min(0.24, tile_d * 0.24)
+        table_h = min(0.26, tile_h * 0.26)
+        bell_h = max(0.10, tile_h - table_h)
+        y_center = tile_d - (0.5 * obj_d) - 0.03
+
+        for i in range(4):
+            x_center = (i + 0.5) * (tile_w / 4.0)
+            active_items.append(TileMeshItem(
+                mesh_id=f"mesh_{i * 2 + 1:03d}",
+                label=f"{label_prefix}Network Module {i + 1} Table",
+                bbox_size=np.array([obj_w, obj_d, table_h], np.float64),
+                pos_xy=np.array([x_center, y_center], np.float64),
+                z_min=0.0,
+                yaw_step=0,
+                triangle_group=f"module_{i + 1}/table",
+            ))
+            active_items.append(TileMeshItem(
+                mesh_id=f"mesh_{i * 2 + 2:03d}",
+                label=f"{label_prefix}Network Module {i + 1} Belljar",
+                bbox_size=np.array([obj_w, obj_d, bell_h], np.float64),
+                pos_xy=np.array([x_center, y_center], np.float64),
+                z_min=table_h,
+                yaw_step=0,
+                triangle_group=f"module_{i + 1}/belljar",
+            ))
 
     def _seed_camera_designer_station_components(
         self,
@@ -1187,6 +1401,7 @@ class RoomTileWorkspace:
                 pos_xy=np.array([tile_w * 0.5, table_y], np.float64),
                 z_min=0.0,
                 yaw_step=0,
+                triangle_group="rig/table",
             ),
             TileMeshItem(
                 mesh_id="mesh_008",
@@ -1195,6 +1410,7 @@ class RoomTileWorkspace:
                 pos_xy=np.array([tile_w * 0.5, table_y], np.float64),
                 z_min=table_h,
                 yaw_step=0,
+                triangle_group="rig/belljar",
             ),
             TileMeshItem(
                 mesh_id="mesh_009",
@@ -1203,6 +1419,7 @@ class RoomTileWorkspace:
                 pos_xy=np.array([tile_w * 0.5, table_y], np.float64),
                 z_min=table_h + 0.05,
                 yaw_step=0,
+                triangle_group="rig/mini_scene",
             ),
         ])
 
@@ -1233,6 +1450,8 @@ class RoomTileWorkspace:
             scope = str(self.state.get("tile_editor_scope", "archetype"))
             if preset is not None and preset.category == "duty_stations":
                 self._seed_duty_station_gestalt_item(active_items, fx, fy, fz, preset, scope)
+            elif self._is_network_module_preset(preset):
+                self._seed_network_duty_module_components(active_items, fx, fy, fz, scope)
             elif self._is_room_control_station_preset(preset):
                 self._seed_room_control_station_components(active_items, fx, fy, fz, scope)
             elif self._is_camera_designer_station_preset(preset):
@@ -1424,6 +1643,17 @@ class RoomTileWorkspace:
                             cell_size,
                         )
                         self._draw_plan_cell(surface, rect, preset, selected=instance.instance_id == selected_id)
+
+            sel_preset = self.selected_preset()
+            if sel_preset is not None and bool(getattr(sel_preset, "network_strict_snap", False)):
+                self._draw_network_snap_hints(
+                    surface,
+                    left,
+                    top,
+                    cell_size,
+                    int(self.state.get("room_level", 0)),
+                    sel_preset,
+                )
             if int(self.state.get("room_level", 0)) == 0:
                 sp = self._station_preset()
                 if sp is not None:
@@ -1555,7 +1785,7 @@ class RoomTileWorkspace:
             return
         if self._gl_dirty:
             self._rebuild_gl()
-        if self._vao is None or not self._vert_count:
+        if (self._vert_count_plan <= 0) and (self._vert_count_built <= 0):
             return
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -1567,14 +1797,29 @@ class RoomTileWorkspace:
         if loc >= 0:
             glUniformMatrix4fv(loc, 1, GL_TRUE, mv.astype(np.float32))
         glUniform3f(glGetUniformLocation(prog, b"uLightV"), *light_v)
-        glUniform4f(glGetUniformLocation(prog, b"uColor"), 0.20, 0.26, 0.34, 0.92)
-        glUniform3f(glGetUniformLocation(prog, b"uInnerColor"), 0.20, 0.26, 0.34)
-        glUniform1f(glGetUniformLocation(prog, b"uAmbient"), 0.22)
-        glUniform1f(glGetUniformLocation(prog, b"uSpecStrength"), 0.18)
-        glUniform1f(glGetUniformLocation(prog, b"uShininess"), 48.0)
-        glUniform1f(glGetUniformLocation(prog, b"uGrain"), 0.04)
-        glBindVertexArray(self._vao)
-        glDrawArrays(GL_TRIANGLES, 0, self._vert_count)
+
+        # Planning pass: preserve translucent blue-glass proxy while not fully fabricated.
+        if self._vao_plan is not None and self._vert_count_plan > 0:
+            glUniform4f(glGetUniformLocation(prog, b"uColor"), 0.22, 0.55, 0.84, 0.44)
+            glUniform3f(glGetUniformLocation(prog, b"uInnerColor"), 0.18, 0.44, 0.72)
+            glUniform1f(glGetUniformLocation(prog, b"uAmbient"), 0.11)
+            glUniform1f(glGetUniformLocation(prog, b"uSpecStrength"), 0.62)
+            glUniform1f(glGetUniformLocation(prog, b"uShininess"), 120.0)
+            glUniform1f(glGetUniformLocation(prog, b"uGrain"), 0.01)
+            glBindVertexArray(self._vao_plan)
+            glDrawArrays(GL_TRIANGLES, 0, self._vert_count_plan)
+
+        # Built pass: fabricated output uses non-glass neutral shell (real material path).
+        if self._vao_built is not None and self._vert_count_built > 0:
+            glUniform4f(glGetUniformLocation(prog, b"uColor"), 0.42, 0.44, 0.47, 0.95)
+            glUniform3f(glGetUniformLocation(prog, b"uInnerColor"), 0.40, 0.42, 0.45)
+            glUniform1f(glGetUniformLocation(prog, b"uAmbient"), 0.28)
+            glUniform1f(glGetUniformLocation(prog, b"uSpecStrength"), 0.14)
+            glUniform1f(glGetUniformLocation(prog, b"uShininess"), 44.0)
+            glUniform1f(glGetUniformLocation(prog, b"uGrain"), 0.06)
+            glBindVertexArray(self._vao_built)
+            glDrawArrays(GL_TRIANGLES, 0, self._vert_count_built)
+
         glBindVertexArray(0)
         glUseProgram(0)
 
@@ -1582,29 +1827,57 @@ class RoomTileWorkspace:
         self._gl_dirty = False
         if not _HAS_GL:
             return
-        vertices = np.asarray(self._build_world_vertices(), dtype=np.float32).reshape(-1, 6)
-        self._vert_count = len(vertices)
-        if self._vao is not None:
-            glDeleteVertexArrays(1, [self._vao])
-            glDeleteBuffers(1, [self._vbo])
-            self._vao = None
-            self._vbo = None
-        if not self._vert_count:
-            return
-        self._vao = glGenVertexArrays(1)
-        self._vbo = glGenBuffers(1)
-        glBindVertexArray(self._vao)
-        glBindBuffer(GL_ARRAY_BUFFER, self._vbo)
-        glBufferData(GL_ARRAY_BUFFER, vertices.nbytes, vertices.tobytes(), GL_STATIC_DRAW)
-        stride = 24
-        glEnableVertexAttribArray(0)
-        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
-        glEnableVertexAttribArray(1)
-        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+        vertices_plan, vertices_built = self._build_world_vertices()
+
+        for vao, vbo in ((self._vao_plan, self._vbo_plan), (self._vao_built, self._vbo_built)):
+            if vao is not None:
+                glDeleteVertexArrays(1, [vao])
+            if vbo is not None:
+                glDeleteBuffers(1, [vbo])
+
+        self._vao_plan = None
+        self._vbo_plan = None
+        self._vert_count_plan = 0
+        self._vao_built = None
+        self._vbo_built = None
+        self._vert_count_built = 0
+
+        if vertices_plan:
+            plan_np = np.asarray(vertices_plan, dtype=np.float32).reshape(-1, 6)
+            self._vert_count_plan = int(len(plan_np))
+            self._vao_plan = glGenVertexArrays(1)
+            self._vbo_plan = glGenBuffers(1)
+            glBindVertexArray(self._vao_plan)
+            glBindBuffer(GL_ARRAY_BUFFER, self._vbo_plan)
+            glBufferData(GL_ARRAY_BUFFER, plan_np.nbytes, plan_np.tobytes(), GL_STATIC_DRAW)
+            stride = 24
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+            glEnableVertexAttribArray(1)
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+
+        if vertices_built:
+            built_np = np.asarray(vertices_built, dtype=np.float32).reshape(-1, 6)
+            self._vert_count_built = int(len(built_np))
+            self._vao_built = glGenVertexArrays(1)
+            self._vbo_built = glGenBuffers(1)
+            glBindVertexArray(self._vao_built)
+            glBindBuffer(GL_ARRAY_BUFFER, self._vbo_built)
+            glBufferData(GL_ARRAY_BUFFER, built_np.nbytes, built_np.tobytes(), GL_STATIC_DRAW)
+            stride = 24
+            glEnableVertexAttribArray(0)
+            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(0))
+            glEnableVertexAttribArray(1)
+            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride, ctypes.c_void_p(12))
+
         glBindVertexArray(0)
 
-    def _build_world_vertices(self) -> List[Tuple[float, float, float, float, float, float]]:
-        vertices: List[Tuple[float, float, float, float, float, float]] = []
+    def _build_world_vertices(self) -> Tuple[
+        List[Tuple[float, float, float, float, float, float]],
+        List[Tuple[float, float, float, float, float, float]],
+    ]:
+        vertices_plan: List[Tuple[float, float, float, float, float, float]] = []
+        vertices_built: List[Tuple[float, float, float, float, float, float]] = []
         anchor_x = int(self.state.get("room_station_x", 0))
         anchor_y = int(self.state.get("room_station_y", 0))
         station_nodes: List[Tuple[RoomTileInstance, RoomTilePreset, float, float, float, bool]] = []
@@ -1639,13 +1912,13 @@ class RoomTileWorkspace:
                     g_verts = self._build_gestalt_station_vertices(
                         cx, cy, 0.0, sx, sy, sz, is_fully_built=anchor_is_built,
                     )
-                    vertices.extend(g_verts)
+                    vertices_built.extend(g_verts)
                 else:
                     half_x = 0.5 * sx
                     half_y = 0.5 * sy
                     z_min = float(item.z_min)
                     z_max = z_min + sz
-                    vertices.extend(self._box(
+                    vertices_built.extend(self._box(
                         (cx - half_x, cy - half_y, z_min),
                         (cx + half_x, cy + half_y, z_max),
                     ))
@@ -1660,9 +1933,12 @@ class RoomTileWorkspace:
 
             # Prefer explicit tile mesh contents (placed/archetype) when available.
             # Fallback to procedural preset proxy geometry only if no tile items exist.
-            item_vertices = self._build_item_vertices(instance, preset, base_x, base_y, z0)
-            if item_vertices:
-                vertices.extend(item_vertices)
+            item_vertices_plan, item_vertices_built = self._build_item_vertices(
+                instance, preset, base_x, base_y, z0
+            )
+            if item_vertices_plan or item_vertices_built:
+                vertices_plan.extend(item_vertices_plan)
+                vertices_built.extend(item_vertices_built)
                 if preset.category == "duty_stations":
                     cx = base_x + 0.5 * preset.footprint_xy[0] * _CELL_SIZE_M
                     cy = base_y + 0.5 * preset.footprint_xy[1] * _CELL_SIZE_M
@@ -1698,10 +1974,10 @@ class RoomTileWorkspace:
                     base_y + 0.5 * preset.footprint_xy[1] * _CELL_SIZE_M,
                     step,
                 )
-            vertices.extend(instance_vertices)
+            vertices_built.extend(instance_vertices)
 
-        vertices.extend(self._build_station_network_vertices(station_nodes))
-        return vertices
+        vertices_built.extend(self._build_station_network_vertices(station_nodes))
+        return vertices_plan, vertices_built
 
     def _build_item_vertices(
         self,
@@ -1710,12 +1986,16 @@ class RoomTileWorkspace:
         base_x: float,
         base_y: float,
         z0: float,
-    ) -> List[Tuple[float, float, float, float, float, float]]:
+    ) -> Tuple[
+        List[Tuple[float, float, float, float, float, float]],
+        List[Tuple[float, float, float, float, float, float]],
+    ]:
         items = self._items_for_instance(instance, preset)
         if not items:
-            return []
+            return [], []
 
-        verts: List[Tuple[float, float, float, float, float, float]] = []
+        verts_plan: List[Tuple[float, float, float, float, float, float]] = []
+        verts_built: List[Tuple[float, float, float, float, float, float]] = []
         fab = self._fabrication_state(instance, preset)
         is_fully_built = bool(fab.get("fully_built", False))
         for item in items:
@@ -1745,7 +2025,10 @@ class RoomTileWorkspace:
                 step = int(getattr(item, "yaw_step", 0)) % _ROT_STEPS
                 if step:
                     g_verts = self._rotate_instance_vertices(g_verts, cx, cy, step)
-                verts.extend(g_verts)
+                if is_fully_built:
+                    verts_built.extend(g_verts)
+                else:
+                    verts_plan.extend(g_verts)
                 continue
 
             box_verts = self._box(
@@ -1755,17 +2038,23 @@ class RoomTileWorkspace:
             step = int(getattr(item, "yaw_step", 0)) % _ROT_STEPS
             if step:
                 box_verts = self._rotate_instance_vertices(box_verts, cx, cy, step)
-            verts.extend(box_verts)
+            verts_built.extend(box_verts)
 
         inst_step = int(getattr(instance, "rotation", 0)) % _ROT_STEPS
         if inst_step:
-            verts = self._rotate_instance_vertices(
-                verts,
+            verts_plan = self._rotate_instance_vertices(
+                verts_plan,
                 base_x + 0.5 * preset.footprint_xy[0] * _CELL_SIZE_M,
                 base_y + 0.5 * preset.footprint_xy[1] * _CELL_SIZE_M,
                 inst_step,
             )
-        return verts
+            verts_built = self._rotate_instance_vertices(
+                verts_built,
+                base_x + 0.5 * preset.footprint_xy[0] * _CELL_SIZE_M,
+                base_y + 0.5 * preset.footprint_xy[1] * _CELL_SIZE_M,
+                inst_step,
+            )
+        return verts_plan, verts_built
 
     def _build_station_network_vertices(
         self,
@@ -1807,15 +2096,10 @@ class RoomTileWorkspace:
         *,
         is_fully_built: bool,
     ) -> List[Tuple[float, float, float, float, float, float]]:
-        # Not fabricated yet: show the reservation block only.
-        if not is_fully_built:
-            return self._box(
-                (cx - 0.5 * sx, cy - 0.5 * sy, z0),
-                (cx + 0.5 * sx, cy + 0.5 * sy, z0 + sz),
-            )
-
         out: List[Tuple[float, float, float, float, float, float]] = []
 
+        wedge_tilt_deg = 14.0
+        wedge_tilt = math.radians(wedge_tilt_deg)
         cons_w = max(0.45, min(sx * 0.88, 1.40))
         cons_d = max(0.35, min(sy * 0.56, 0.64))
         cons_h = max(0.45, min(sz * 0.56, 0.92))
@@ -1826,17 +2110,30 @@ class RoomTileWorkspace:
             cons_w,
             cons_d,
             cons_h,
-            tilt_deg=14.0,
+            tilt_deg=wedge_tilt_deg,
         ))
 
         scr_w = max(0.30, min(cons_w * 0.90, 1.10))
-        scr_t = 0.06
+        scr_t = 0.05
         scr_h = max(0.24, min(sz * 0.40, 0.74))
-        scr_y = cy + 0.5 * cons_d - 0.08
-        scr_z0 = z0 + max(0.22, cons_h - 0.25)
-        out.extend(self._box(
-            (cx - 0.5 * scr_w, scr_y - 0.5 * scr_t, scr_z0),
-            (cx + 0.5 * scr_w, scr_y + 0.5 * scr_t, scr_z0 + scr_h),
+        monitor_lean_deg = 12.0
+        monitor_lean = math.radians(monitor_lean_deg)
+
+        # Anchor the monitor hinge at the top of the wedge, then lean it back slightly.
+        y_back = cy + 0.5 * cons_d - 0.01
+        y_hinge = y_back - scr_h * math.sin(monitor_lean)
+        y_front = cy - 0.5 * cons_d
+        y_hinge = float(np.clip(y_hinge, y_front + 0.02, y_back - 0.02))
+        z_top_front = z0 + cons_h
+        z_hinge = z_top_front + (y_hinge - y_front) * math.tan(wedge_tilt) + 0.02
+        out.extend(self._tilted_screen_panel(
+            cx,
+            y_hinge,
+            z_hinge,
+            scr_w,
+            scr_h,
+            scr_t,
+            lean_back_deg=monitor_lean_deg,
         ))
 
         wing_w = max(0.08, min(sx * 0.10, 0.16))
@@ -1897,6 +2194,71 @@ class RoomTileWorkspace:
 
         return out
 
+    @staticmethod
+    def _tilted_screen_panel(
+        cx: float,
+        hinge_y: float,
+        hinge_z: float,
+        width: float,
+        height: float,
+        thickness: float,
+        *,
+        lean_back_deg: float,
+    ) -> List[Tuple[float, float, float, float, float, float]]:
+        hw = 0.5 * float(width)
+        ht = 0.5 * float(thickness)
+        lean = math.radians(float(lean_back_deg))
+
+        # Panel extends up from its lower hinge edge while drifting slightly toward +Y.
+        up = np.array([0.0, math.sin(lean), math.cos(lean)], np.float64)
+        x_axis = np.array([1.0, 0.0, 0.0], np.float64)
+        normal = np.cross(x_axis, up)
+        nrm = float(np.linalg.norm(normal))
+        if nrm <= 1e-8:
+            normal = np.array([0.0, -1.0, 0.0], np.float64)
+        else:
+            normal = normal / nrm
+        if normal[1] > 0.0:
+            normal = -normal
+
+        bc = np.array([cx, hinge_y, hinge_z], np.float64)
+        tc = bc + up * float(height)
+        b_l = bc - x_axis * hw
+        b_r = bc + x_axis * hw
+        t_l = tc - x_axis * hw
+        t_r = tc + x_axis * hw
+
+        f_off = normal * ht
+        f_bl = b_l + f_off
+        f_br = b_r + f_off
+        f_tl = t_l + f_off
+        f_tr = t_r + f_off
+        b_bl = b_l - f_off
+        b_br = b_r - f_off
+        b_tl = t_l - f_off
+        b_tr = t_r - f_off
+
+        out: List[Tuple[float, float, float, float, float, float]] = []
+        out.extend(RoomTileWorkspace._quad(tuple(f_tl), tuple(f_tr), tuple(f_br), tuple(f_bl), tuple(normal)))
+        out.extend(RoomTileWorkspace._quad(tuple(b_tr), tuple(b_tl), tuple(b_bl), tuple(b_br), tuple(-normal)))
+
+        n_left = np.cross((f_tl - b_tl), (b_bl - b_tl))
+        n_left = n_left / max(1e-8, float(np.linalg.norm(n_left)))
+        out.extend(RoomTileWorkspace._quad(tuple(b_tl), tuple(f_tl), tuple(f_bl), tuple(b_bl), tuple(n_left)))
+
+        n_right = np.cross((b_tr - f_tr), (f_br - f_tr))
+        n_right = n_right / max(1e-8, float(np.linalg.norm(n_right)))
+        out.extend(RoomTileWorkspace._quad(tuple(f_tr), tuple(b_tr), tuple(b_br), tuple(f_br), tuple(n_right)))
+
+        n_top = np.cross((b_tr - b_tl), (f_tl - b_tl))
+        n_top = n_top / max(1e-8, float(np.linalg.norm(n_top)))
+        out.extend(RoomTileWorkspace._quad(tuple(b_tl), tuple(b_tr), tuple(f_tr), tuple(f_tl), tuple(n_top)))
+
+        n_bot = np.cross((f_br - f_bl), (b_bl - f_bl))
+        n_bot = n_bot / max(1e-8, float(np.linalg.norm(n_bot)))
+        out.extend(RoomTileWorkspace._quad(tuple(f_bl), tuple(f_br), tuple(b_br), tuple(b_bl), tuple(n_bot)))
+        return out
+
     def _items_for_instance(
         self,
         instance: RoomTileInstance,
@@ -1905,10 +2267,14 @@ class RoomTileWorkspace:
         placed_key = f"inst:{instance.instance_id}"
         placed_items = self.tile_mesh_items_by_instance.get(placed_key)
         if placed_items:
+            self._apply_action_defaults_to_items(placed_items, preset)
+            self._prebake_tile_action_manifest(instance, preset, placed_items)
             return placed_items
 
         arche_items = self.tile_mesh_items_by_tile.get(str(preset.preset_id), [])
         if arche_items:
+            self._apply_action_defaults_to_items(arche_items, preset)
+            self._prebake_tile_action_manifest(instance, preset, arche_items)
             return arche_items
 
         # Seed known duty-station presets when no explicit mesh items exist yet.
@@ -1918,15 +2284,119 @@ class RoomTileWorkspace:
         fz = max(1, int(preset.level_span))
         if preset.category == "duty_stations":
             self._seed_duty_station_gestalt_item(seeded, fx, fy, fz, preset, scope="placed")
+        elif self._is_network_module_preset(preset):
+            self._seed_network_duty_module_components(seeded, fx, fy, fz, "placed")
         elif self._is_room_control_station_preset(preset):
             self._seed_room_control_station_components(seeded, fx, fy, fz, "placed")
         elif self._is_camera_designer_station_preset(preset):
             self._seed_camera_designer_station_components(seeded, fx, fy, fz, "placed")
 
         if seeded:
+            self._apply_action_defaults_to_items(seeded, preset)
             self.tile_mesh_items_by_instance[placed_key] = seeded
+            self._prebake_tile_action_manifest(instance, preset, seeded)
             return seeded
         return []
+
+    def _apply_action_defaults_to_items(
+        self,
+        items: List[TileMeshItem],
+        preset: RoomTilePreset,
+    ) -> None:
+        script = str(getattr(preset, "action_script", "") or "")
+        hook = str(getattr(preset, "action_hook", "") or "")
+        control_action = str(getattr(preset, "control_action", "activate") or "activate")
+        for item in items:
+            if not str(getattr(item, "action_script", "")) and script:
+                item.action_script = script
+            if not str(getattr(item, "action_hook", "")) and hook:
+                item.action_hook = hook
+            if not str(getattr(item, "control_action", "")):
+                item.control_action = control_action
+
+    def get_tile_action_manifest(self, instance_id: str) -> Dict[str, Any]:
+        return dict(self.tile_action_manifest_by_instance.get(str(instance_id), {}))
+
+    def _prebake_tile_action_manifest(
+        self,
+        instance: RoomTileInstance,
+        preset: RoomTilePreset,
+        items: List[TileMeshItem],
+    ) -> None:
+        action_entries: list[dict[str, Any]] = []
+        tri_start = 0
+        for item in items:
+            if str(getattr(item, "render_style", "box")) == "duty_station_gestalt":
+                sx = float(item.bbox_size[0])
+                sy = float(item.bbox_size[1])
+                sz = float(item.bbox_size[2])
+                tri_count = len(
+                    self._build_gestalt_station_vertices(
+                        0.0,
+                        0.0,
+                        0.0,
+                        sx,
+                        sy,
+                        sz,
+                        is_fully_built=True,
+                    )
+                ) // 3
+            else:
+                tri_count = 12
+
+            tri_end = tri_start + tri_count
+            group_name = str(getattr(item, "triangle_group", "") or "")
+            if not group_name:
+                group_name = f"item/{item.mesh_id}"
+            full_group_name = f"tile/{instance.instance_id}/{group_name}"
+
+            action_key = f"tile_action/{instance.instance_id}/{group_name}"
+            control_action = str(getattr(item, "control_action", "activate") or "activate")
+            script = str(getattr(item, "action_script", "") or "")
+            hook = str(getattr(item, "action_hook", "") or "")
+
+            action_entries.append(
+                {
+                    "mesh_id": item.mesh_id,
+                    "label": item.label,
+                    "triangle_group": full_group_name,
+                    "triangle_start": tri_start,
+                    "triangle_end": tri_end,
+                    "action_key": action_key,
+                    "control_action": control_action,
+                    "action_script": script,
+                    "action_hook": hook,
+                }
+            )
+
+            if _register_triangle_group_action is not None and script and hook:
+                try:
+                    _register_triangle_group_action(
+                        object_id=instance.instance_id,
+                        triangle_group=full_group_name,
+                        action_key=action_key,
+                        script_path=script,
+                        hook_name=hook,
+                        control_action=control_action,
+                        label=str(item.label),
+                        metadata={
+                            "origin": "tile_object",
+                            "instance_id": instance.instance_id,
+                            "preset_id": preset.preset_id,
+                            "mesh_id": item.mesh_id,
+                            "triangle_group": full_group_name,
+                        },
+                    )
+                except Exception:
+                    pass
+
+            tri_start = tri_end
+
+        self.tile_action_manifest_by_instance[instance.instance_id] = {
+            "instance_id": instance.instance_id,
+            "preset_id": preset.preset_id,
+            "entries": action_entries,
+        }
 
     def _seed_duty_station_gestalt_item(
         self,
@@ -1956,6 +2426,10 @@ class RoomTileWorkspace:
             blueprint_id=str(getattr(preset, "blueprint_id", "") or "duty_station_gestalt"),
             programmatic_blueprint_id=str(getattr(preset, "programmatic_blueprint_id", "")),
             requires_custom_confirm=bool(getattr(preset, "requires_custom_confirm", False)),
+            action_script=str(getattr(preset, "action_script", "") or ""),
+            action_hook=str(getattr(preset, "action_hook", "") or ""),
+            control_action=str(getattr(preset, "control_action", "activate") or "activate"),
+            triangle_group="station/gestalt",
         ))
 
     def _fabrication_state(self, instance: RoomTileInstance, preset: RoomTilePreset) -> Dict[str, Any]:

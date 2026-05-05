@@ -95,10 +95,9 @@ from .station_specs import (
     default_station_material_slots,
     make_prebake_plan,
 )
-from .demo_pluck_controls_adapter import (
-    knobs_to_station_nodes,
-    slider_defs_to_knobs,
-)
+# Removed in favor of the root-level `controls` module, which is now the
+# exclusive home for KnobSpec/Panel-based control hierarchy and the action
+# registry/dispatcher. Import from `controls` directly.
 
 __all__ = [
     "BackendCaps",
@@ -137,6 +136,4 @@ __all__ = [
     "build_station_hierarchy",
     "default_station_material_slots",
     "make_prebake_plan",
-    "knobs_to_station_nodes",
-    "slider_defs_to_knobs",
 ]

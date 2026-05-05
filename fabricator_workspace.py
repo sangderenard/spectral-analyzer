@@ -144,6 +144,7 @@ class FabricatorWorkspace:
         self.picked_id:      Optional[str] = None
         self.picked_piece:   Optional[DECMesh] = None
         self.picked_special: bool = False   # True when picked item is a special catalog entry
+        self.picked_metadata: dict[str, Any] = {}
 
         # Face under cursor (for PLACING highlight)
         self.hover_face: int = -1
@@ -154,6 +155,7 @@ class FabricatorWorkspace:
         self.last_export_path: str = ""
         self.last_import_path: str = ""
         self.last_blueprint: Optional[dict] = None
+        self._last_mesh_metadata: dict[str, Any] = {}
 
         # History stack for undo
         self._history: list[DECMesh] = []
@@ -196,14 +198,19 @@ class FabricatorWorkspace:
         self.picked_id = str(mesh_id)
         self.picked_piece = mesh
         self.picked_special = False
+        self.picked_metadata = {}
         self.mode = WorkspaceMode.PICKED
         self.placement = None
         self.hover_face = -1
         return True
 
-    def pick_generated_mesh(self, mesh_id: str, mesh: DECMesh) -> bool:
+    def pick_generated_mesh(self, mesh_id: str, mesh: DECMesh,
+                            metadata: Optional[dict[str, Any]] = None) -> bool:
         """Pick a programmatically generated mesh as the current piece."""
-        return self._pick_mesh(mesh_id, mesh)
+        ok = self._pick_mesh(mesh_id, mesh)
+        self.picked_metadata = dict(metadata or {})
+        self._last_mesh_metadata = dict(metadata or {})
+        return ok
 
     def set_process_tab(self, tab: str):
         self.process_tab = str(tab)
@@ -254,6 +261,7 @@ class FabricatorWorkspace:
         self.picked_id      = None
         self.picked_piece   = None
         self.picked_special = False
+        self.picked_metadata = {}
         self.placement      = None
         self.hover_face     = -1
         self.mode           = WorkspaceMode.IDLE
@@ -408,6 +416,55 @@ class FabricatorWorkspace:
             },
         }
 
+    @staticmethod
+    def _face_orientation_report(mesh: DECMesh) -> tuple[list[str], list[str]]:
+        """Return (per-face side policy, mesh-level orientation tags).
+
+        side policy values:
+        - front_only: outward-facing surface
+        - back_only: inward-facing surface
+        - double_sided: ambiguous/open boundary surface
+        """
+        verts = np.asarray(mesh.verts, np.float64)
+        if len(verts) == 0 or not mesh.faces:
+            return [], []
+
+        edge_count: dict[tuple[int, int], int] = {}
+        for face in mesh.faces:
+            n = len(face)
+            if n < 3:
+                continue
+            for i in range(n):
+                a = int(face[i])
+                b = int(face[(i + 1) % n])
+                e = (a, b) if a < b else (b, a)
+                edge_count[e] = int(edge_count.get(e, 0)) + 1
+        open_boundary = any(c != 2 for c in edge_count.values())
+
+        normals = np.asarray(mesh.face_normals(), np.float64)
+        centers = np.asarray(mesh.face_centers(), np.float64)
+        mesh_c = verts.mean(axis=0)
+        side_policy: list[str] = []
+        orient_tags: set[str] = set()
+        eps = 1e-8
+        for fi in range(len(mesh.faces)):
+            n = normals[fi]
+            c = centers[fi]
+            sign = float(np.dot(n, c - mesh_c))
+            if open_boundary or abs(sign) <= eps:
+                side_policy.append("double_sided")
+                orient_tags.add("ambiguous")
+            elif sign > 0.0:
+                side_policy.append("front_only")
+                orient_tags.add("exterior")
+            else:
+                side_policy.append("back_only")
+                orient_tags.add("interior")
+
+        if open_boundary:
+            orient_tags.add("open_boundary")
+        return side_policy, sorted(orient_tags)
+
     def build_fabrication_blueprint(self, label: Optional[str] = None) -> dict:
         mesh = self.review_mesh if self.review_mesh is not None else self._current_base()
         export_id = str(label or f"fabricated_{len(self.fabricated_objects)+1}")
@@ -433,6 +490,21 @@ class FabricatorWorkspace:
                 })
 
         minimized = self._build_minimized_object_payload(mesh)
+        side_policy, orient_tags = self._face_orientation_report(mesh)
+        face_normals = np.asarray(mesh.face_normals(), np.float64)
+
+        supplied_normals = self._last_mesh_metadata.get("face_normals")
+        if isinstance(supplied_normals, np.ndarray) and supplied_normals.shape == face_normals.shape:
+            face_normals_export = supplied_normals
+        else:
+            face_normals_export = face_normals
+
+        supplied_side = self._last_mesh_metadata.get("side_policy")
+        if isinstance(supplied_side, list) and len(supplied_side) == len(mesh.faces):
+            side_policy_export = [str(v) for v in supplied_side]
+        else:
+            side_policy_export = side_policy
+
         material_assignment = {
             "polygon_groups": [
                 {
@@ -440,6 +512,9 @@ class FabricatorWorkspace:
                     "polygon_face_index": int(g["polygon_face_index"]),
                     "triangle_indices": list(g["triangle_indices"]),
                     "material_slot": "default",
+                    "side_policy": (side_policy_export[i]
+                                     if i < len(side_policy_export)
+                                     else "double_sided"),
                 }
                 for i, g in enumerate(minimized["triangle_groups"]["by_polygon"])
             ],
@@ -491,6 +566,20 @@ class FabricatorWorkspace:
             "process_itinerary": process_itinerary,
             "polygon_primitives": polygon_primitives,
             "optimized_object": minimized,
+            "normals": {
+                "face_normals": [[float(n[0]), float(n[1]), float(n[2])] for n in face_normals_export],
+                "source": ("blueprint_supplied"
+                           if isinstance(supplied_normals, np.ndarray) and supplied_normals.shape == face_normals.shape
+                           else "computed_from_faces"),
+            },
+            "orientation_analysis": {
+                "tags": orient_tags,
+                "mesh_side_policy": (
+                    "double_sided"
+                    if "open_boundary" in orient_tags or "ambiguous" in orient_tags
+                    else ("mixed" if len(set(side_policy_export)) > 1 else (side_policy_export[0] if side_policy_export else "double_sided"))
+                ),
+            },
             "material_assignment": material_assignment,
             "placeable_entry": self.export_placeable_entry(label=label),
         }
@@ -635,6 +724,22 @@ class FabricatorWorkspace:
         self.mode = WorkspaceMode.IDLE
         self.last_import_path = str(file_path)
         self.last_blueprint = bp
+        _face_normals = None
+        _normals_obj = bp.get("normals", {}) if isinstance(bp, dict) else {}
+        if isinstance(_normals_obj, dict):
+            _face_normals = _normals_obj.get("face_normals")
+        _side_policy = []
+        _mat = bp.get("material_assignment", {}) if isinstance(bp, dict) else {}
+        if isinstance(_mat, dict):
+            _pg = _mat.get("polygon_groups", [])
+            if isinstance(_pg, list):
+                _side_policy = [str(g.get("side_policy", "double_sided"))
+                                for g in _pg if isinstance(g, dict)]
+        self._last_mesh_metadata = {
+            "face_normals": (np.asarray(_face_normals, np.float64)
+                              if _face_normals is not None else None),
+            "side_policy": _side_policy,
+        }
         return True
 
     def import_latest_blueprint(self) -> bool:
@@ -673,6 +778,7 @@ class FabricatorWorkspace:
             return False
         self._history.append(mesh)
         self.built_mesh = DECMesh.from_raw(mesh.verts.copy(), kept_faces)
+        self._last_mesh_metadata = {}
         self.mode = WorkspaceMode.IDLE
         self.placement = None
         self._record_operation("subtractive_sphere_cut", {
@@ -699,6 +805,7 @@ class FabricatorWorkspace:
             return False
         self._history.append(mesh)
         self.built_mesh = DECMesh.from_raw(mesh.verts.copy(), kept_faces)
+        self._last_mesh_metadata = {}
         self.mode = WorkspaceMode.IDLE
         self.placement = None
         self._record_operation("subtractive_plane_cut", {
@@ -810,6 +917,7 @@ class FabricatorWorkspace:
             "gimbal_deg": [float(self.gimbal[0]), float(self.gimbal[1])],
         })
         self.built_mesh = new_mesh
+        self._last_mesh_metadata = {}
         self.placement  = None
         self.mode       = WorkspaceMode.IDLE
         self.picked_id  = None
@@ -825,6 +933,7 @@ class FabricatorWorkspace:
         if not self._history:
             return False
         self.built_mesh = self._history.pop()
+        self._last_mesh_metadata = {}
         self.mode       = WorkspaceMode.IDLE
         self.placement  = None
         return True
@@ -859,6 +968,8 @@ class FabricatorWorkspace:
         self.picked_id      = None
         self.picked_piece   = None
         self.picked_special = False
+        self.picked_metadata = {}
+        self._last_mesh_metadata = {}
         self.operations.clear()
 
     # ── Catalog (solids + special items) ─────────────────────────────────────

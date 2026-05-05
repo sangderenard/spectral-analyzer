@@ -811,6 +811,38 @@ class DutyStation:
         if self.menu is not None:
             self.menu.render_hud(win_w, win_h)
 
+    def submit_doc_channel(self, doc_rdr, win_w: int, win_h: int) -> None:
+        """Submit this station's menu content to a DocRenderer second channel.
+
+        Requires ``self.menu`` to expose a ``panel_spec`` attribute
+        (a ``controls.Panel`` instance) and optionally a ``knob_values`` dict.
+        Raises ``RuntimeError`` if ``panel_spec`` is missing — update the menu
+        class to declare one and remove any direct ``render_hud`` GL calls.
+        """
+        if self.menu is None:
+            return
+        panel_spec = getattr(self.menu, 'panel_spec', None)
+        if panel_spec is None:
+            raise RuntimeError(
+                f"{type(self.menu).__name__!r} has no panel_spec. "
+                "Add a controls.Panel descriptor as self.panel_spec and remove "
+                "any direct render_hud / render_menu GL calls."
+            )
+        knob_values = getattr(self.menu, 'knob_values', {}) or {}
+        # Position: right-aligned panel in the lower half of the screen.
+        pw, ph = 320, min(win_h - 40, 30 + 42 * len(getattr(panel_spec, 'knobs', [])))
+        px = win_w - pw - 10
+        py = win_h - ph - 10
+        # Stable ID map stored on the menu object itself to survive across frames.
+        if not hasattr(self.menu, '_doc_id_map'):
+            self.menu._doc_id_map = {}
+        doc_rdr.submit_panel(
+            panel_spec,
+            (px, py, pw, ph),
+            node_id_map=self.menu._doc_id_map,
+            knob_values=knob_values,
+        )
+
     def handle_menu_event(self, ev) -> bool:
         if self.menu is not None and getattr(self.menu, '_hud_visible', False):
             return self.menu.handle_event(ev)

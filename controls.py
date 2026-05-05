@@ -283,6 +283,10 @@ class ControlGraph:
             label="Global",
             scope=OwnerScope.GLOBAL,
             owner_id="global",
+            payload={
+                "flip_buffers": {},
+                "dirty_targets": set(),
+            },
         )
         self._index_by_key: dict[str, ControlNode] = {self.root.key: self.root}
         self._index_by_action: dict[str, ControlNode] = {}
@@ -345,6 +349,10 @@ class ControlGraph:
                 label=label or object_id,
                 scope=OwnerScope.OBJECT,
                 owner_id=object_id,
+                payload={
+                    "flip_buffers": {},
+                    "dirty_targets": set(),
+                },
             )
             parent.add(obj)
             self._index_by_key[obj.key] = obj
@@ -505,6 +513,132 @@ class ControlGraph:
                     seen.add(oid)
                     deduped.append(oid)
             return deduped
+
+    def shader_ids(self) -> list[str]:
+        """Return all currently registered shader ids."""
+        with self._lock:
+            return list(self._index_by_shader.keys())
+
+    def has_registered_shaders(self) -> bool:
+        """True when at least one shader node is registered in the graph."""
+        with self._lock:
+            return bool(self._index_by_shader)
+
+    def snapshot_latest_targets(self) -> dict[str, Any]:
+        """Return latest payload per target across the entire graph.
+
+        Includes both owner-level flip buffers (universal path) and
+        registered shader-node flip buffers.
+
+        Last writer wins for duplicate target ids, matching the frame walker
+        semantics used when composing ``ShaderFrameResult.flip_buffers``.
+
+        Ordering is specificity-first: deeper node keys (more specific owners)
+        are visited before shallower ones so generalized/global owners can
+        intentionally override only what remains unresolved.
+        """
+        def _iter_post_order(node: ControlNode) -> Iterable[ControlNode]:
+            for child in node.children:
+                yield from _iter_post_order(child)
+            yield node
+
+        with self._lock:
+            snap: dict[str, Any] = {}
+
+            owners = sorted(
+                (
+                    n for n in self._index_by_key.values()
+                    if n.scope in (OwnerScope.OBJECT, OwnerScope.GLOBAL)
+                ),
+                key=lambda n: str(getattr(n, "key", "")).count("/"),
+                reverse=True,
+            )
+
+            for owner in owners:
+                owner_payload = owner.payload if isinstance(owner.payload, dict) else {}
+                owner_fbs = owner_payload.get("flip_buffers", {})
+                if isinstance(owner_fbs, dict):
+                    for tid, fb in owner_fbs.items():
+                        if isinstance(fb, ShaderFlipBuffer):
+                            snap[str(tid)] = fb.latest()
+
+                shaders_axis = None
+                for ch in owner.children:
+                    if ch.scope is OwnerScope.SHADERS:
+                        shaders_axis = ch
+                        break
+                if shaders_axis is None:
+                    continue
+                for node in _iter_post_order(shaders_axis):
+                    if node is shaders_axis:
+                        continue
+                    payload = node.payload if isinstance(node.payload, dict) else {}
+                    fbs = payload.get("flip_buffers", {})
+                    if not isinstance(fbs, dict):
+                        continue
+                    for tid, fb in fbs.items():
+                        if isinstance(fb, ShaderFlipBuffer):
+                            snap[str(tid)] = fb.latest()
+
+            return snap
+
+    def publish_owner_target(
+        self,
+        owner_id: str,
+        target_id: str,
+        payload: Any,
+        *,
+        flip_slots: int = 2,
+        change_key: Any = None,
+    ) -> ShaderFlipBuffer:
+        """Publish a target payload into an owner's universal flip buffer.
+
+        This path does not require a registered shader node. The target is
+        marked dirty for this frame and will be surfaced by the frame walker
+        and ``snapshot_latest_targets``.
+        """
+        with self._lock:
+            if owner_id != "global":
+                self.attach_object(owner_id)
+                owner_key = f"object/{owner_id}"
+            else:
+                owner_key = "global"
+
+            owner = self._index_by_key.get(owner_key)
+            if owner is None:
+                raise KeyError(f"owner not found: {owner_id}")
+
+            owner_payload = owner.payload if isinstance(owner.payload, dict) else {}
+            fbs = owner_payload.get("flip_buffers")
+            if not isinstance(fbs, dict):
+                fbs = {}
+                owner_payload["flip_buffers"] = fbs
+
+            fb = fbs.get(str(target_id))
+            if not isinstance(fb, ShaderFlipBuffer):
+                fb = ShaderFlipBuffer(target_id=str(target_id), slots=max(1, int(flip_slots)))
+                fbs[str(target_id)] = fb
+
+            changed = True
+            if change_key is not None and fb.metadata.get("last_change_key", None) == change_key:
+                changed = False
+
+            if changed:
+                fb.write(payload)
+                if change_key is not None:
+                    fb.metadata["last_change_key"] = change_key
+
+            dirty_targets = owner_payload.get("dirty_targets")
+            if not isinstance(dirty_targets, set):
+                dirty_targets = set()
+                owner_payload["dirty_targets"] = dirty_targets
+            if changed:
+                dirty_targets.add(str(target_id))
+
+            fb.metadata["last_publish_changed"] = bool(changed)
+
+            owner.payload = owner_payload
+            return fb
 
 
 _GRAPH: Optional[ControlGraph] = None
@@ -1128,9 +1262,13 @@ class ShaderSpec:
 
     Cadence/targets:
 
-    - ``min_period_s`` is the minimum wall-clock interval between
-      ``run`` invocations (0.0 means "every frame"). It does not gate
-      ``compute_tick`` -- the coordinator owns that cadence.
+    - ``cadence`` is the frame-skip divisor: the shader runs only on
+      frames where ``frame_index % cadence == 0``.  1 means every frame,
+      2 means every other frame, etc.
+    - ``min_period_s`` is an additional wall-clock floor: even if the
+      cadence condition is met, the shader will not run again until at
+      least this many seconds have elapsed since the last run
+      (0.0 disables the floor).  It does not gate ``compute_tick``.
     - ``targets`` enumerates global buffer ids this shader claims
       partial responsibility for. After a successful ``run``, those ids
       are added to the frame's ``finalized_targets`` set so the final
@@ -1140,6 +1278,7 @@ class ShaderSpec:
     shader_id: str
     targets: tuple[str, ...] = ()
     flip_slots: int = 2
+    cadence: int = 1
     min_period_s: float = 0.0
     run: Optional[Callable[..., Any]] = None
     pre_hook: Optional[Callable[..., Any]] = None
@@ -1158,6 +1297,7 @@ def register_shader_node(
     compute_tick: Optional[Callable[..., Any]] = None,
     targets: Iterable[str] = (),
     min_period_s: float = 0.0,
+    cadence: int = 1,
     flip_slots: int = 2,
     metadata: Optional[dict[str, Any]] = None,
     label: str = "",
@@ -1178,6 +1318,7 @@ def register_shader_node(
         shader_id=str(shader_id),
         targets=targets_t,
         flip_slots=int(flip_slots),
+        cadence=max(1, int(cadence)),
         min_period_s=float(min_period_s),
         run=run,
         pre_hook=pre_hook,
@@ -1201,6 +1342,7 @@ def register_shader_node(
             "shader_id": str(shader_id),
             "spec": spec,
             "flip_buffers": flip_buffers,
+            "dirty": True,
             "last_run_time": 0.0,
             "last_run_frame": -1,
             "run_count": 0,
@@ -1305,7 +1447,7 @@ class ShaderFrameWalker:
     Each frame the main thread calls :meth:`tick`. The walker traverses
     every ``SHADERS`` subtree in post-order (children first, then the
     subtree root, then its owner's siblings, then its parent's level...).
-    For every shader node it inspects the cadence (``min_period_s``); if
+    For every shader node it inspects the cadence (``cadence``, ``min_period_s``); if
     the shader is rested, ``ShaderSpec.run`` is invoked, the returned
     payloads are written into the matching flip buffers, and each target
     id the shader claims is added to ``finalized_targets``. Regardless of
@@ -1323,11 +1465,81 @@ class ShaderFrameWalker:
         self._graph = graph or get_control_graph()
         self._monotonic: Callable[[], float] = __import__("time").monotonic
 
+    def publish_owner_target(
+        self,
+        *,
+        owner_id: str,
+        target_id: str,
+        payload: Any,
+        flip_slots: int = 2,
+        change_key: Any = None,
+    ) -> ShaderFlipBuffer:
+        """Publish owner-scoped payload into universal flip buffers.
+
+        This path does not require a registered shader node.
+        """
+        return self._graph.publish_owner_target(
+            owner_id=owner_id,
+            target_id=target_id,
+            payload=payload,
+            flip_slots=flip_slots,
+            change_key=change_key,
+        )
+
+    def mark_owner_dirty(self, owner_id: str, *, target_id: str = "") -> None:
+        """Mark owner (and optional target) dirty for dirty-pruned traversal."""
+        if owner_id != "global":
+            owner = self._graph.attach_object(owner_id)
+        else:
+            owner = self._graph.root
+        payload = owner.payload if isinstance(owner.payload, dict) else {}
+        payload["dirty"] = True
+        if target_id:
+            dirty_targets = payload.get("dirty_targets")
+            if not isinstance(dirty_targets, set):
+                dirty_targets = set()
+                payload["dirty_targets"] = dirty_targets
+            dirty_targets.add(str(target_id))
+        owner.payload = payload
+
+    def mark_shader_dirty(self, shader_id: str) -> None:
+        """Mark a registered shader node dirty so it runs on next eligible tick."""
+        node = self._graph.find_by_shader_id(shader_id)
+        if node is None:
+            return
+        payload = node.payload if isinstance(node.payload, dict) else {}
+        payload["dirty"] = True
+        node.payload = payload
+
     def tick(self, *, frame_index: int, dt: float = 0.0) -> ShaderFrameResult:
         result = ShaderFrameResult(frame_index=int(frame_index))
         now = self._monotonic()
 
-        for shader_node in self._iter_shaders_post_order():
+        # Universal owner-level flip buffers are always visible to the frame.
+        # NOTE: owner-published payloads do NOT auto-finalize.  Only a
+        # registered shader that claims a target (via ``spec.targets``)
+        # marks it finalized.  Anything left unclaimed flows through to
+        # the four-way global default dispatcher (leftover-mask), which
+        # is the entire point of "globals are defaults on leftover-mask".
+        for owner in self._iter_owners_post_order(self._graph.root):
+            owner_payload = owner.payload if isinstance(owner.payload, dict) else {}
+            owner_fbs = owner_payload.get("flip_buffers", {})
+            if isinstance(owner_fbs, dict):
+                for tid, fb in owner_fbs.items():
+                    if isinstance(fb, ShaderFlipBuffer):
+                        result.flip_buffers[str(tid)] = fb
+
+            # Clear per-owner dirty bits so the dirty-pruned shader walk
+            # doesn't keep re-walking idle subtrees.  Dirty publishes have
+            # already updated the flip buffers above; the dirty bookkeeping
+            # exists only to gate traversal, not to declare resolution.
+            dirty = owner_payload.get("dirty_targets")
+            if isinstance(dirty, set):
+                dirty.clear()
+            owner_payload["dirty"] = False
+            owner.payload = owner_payload
+
+        for shader_node in self._iter_shaders_post_order_dirty():
             payload = shader_node.payload
             spec: ShaderSpec | None = payload.get("spec")
             if spec is None:
@@ -1341,9 +1553,11 @@ class ShaderFrameWalker:
 
             last_run = float(payload.get("last_run_time", 0.0))
             elapsed = now - last_run
-            should_run = spec.run is not None and (
-                spec.min_period_s <= 0.0 or elapsed >= spec.min_period_s
-            )
+            is_dirty = bool(payload.get("dirty", False))
+            always_run = bool(getattr(spec, "metadata", {}).get("always_run", False))
+            cadence_ok = (int(frame_index) % max(1, int(spec.cadence))) == 0
+            period_ok  = spec.min_period_s <= 0.0 or elapsed >= spec.min_period_s
+            should_run = spec.run is not None and cadence_ok and period_ok and (is_dirty or always_run)
             if not should_run:
                 result.skipped.append(spec.shader_id)
                 continue
@@ -1385,6 +1599,7 @@ class ShaderFrameWalker:
             payload["last_run_time"] = now
             payload["last_run_frame"] = int(frame_index)
             payload["run_count"] = int(payload.get("run_count", 0)) + 1
+            payload["dirty"] = False
             result.ran.append(spec.shader_id)
 
             if isinstance(produced, dict):
@@ -1416,19 +1631,70 @@ class ShaderFrameWalker:
         return result
 
     def _iter_shaders_post_order(self) -> Iterable[ControlNode]:
-        """Yield every SHADERS leaf in bottom-up order.
-
-        Owner traversal is post-order (deepest objects first, then their
-        rooms, then global). Within each owner, the SHADERS subtree is
-        yielded in post-order so child shader nodes are seen before any
-        sibling parent shader nodes.
-        """
+        """Yield every SHADERS leaf in bottom-up order (full traversal)."""
         root = self._graph.root
         for owner in self._iter_owners_post_order(root):
             shaders_axis = self._find_axis_child(owner, OwnerScope.SHADERS)
             if shaders_axis is None:
                 continue
             yield from self._iter_subtree_post_order(shaders_axis, skip_root=True)
+
+    def _iter_shaders_post_order_dirty(self) -> Iterable[ControlNode]:
+        """Yield SHADERS leaves only under dirty owner branches.
+
+        DFS prunes clean branches early. Once a dirty owner branch is hit,
+        traversal continues down that branch in post-order.
+        """
+        root = self._graph.root
+        for owner in self._iter_owners_post_order_dirty(root):
+            shaders_axis = self._find_axis_child(owner, OwnerScope.SHADERS)
+            if shaders_axis is None:
+                continue
+            yield from self._iter_subtree_post_order(shaders_axis, skip_root=True)
+
+    def _owner_node_is_dirty(self, owner: ControlNode) -> bool:
+        payload = owner.payload if isinstance(owner.payload, dict) else {}
+        if bool(payload.get("dirty", False)):
+            return True
+        dirty_targets = payload.get("dirty_targets")
+        if isinstance(dirty_targets, set) and len(dirty_targets) > 0:
+            return True
+        shaders_axis = self._find_axis_child(owner, OwnerScope.SHADERS)
+        if shaders_axis is None:
+            return False
+        for node in self._iter_subtree_post_order(shaders_axis, skip_root=True):
+            sp = node.payload if isinstance(node.payload, dict) else {}
+            if bool(sp.get("dirty", False)):
+                return True
+            spec: ShaderSpec | None = sp.get("spec")
+            if spec is not None and bool(getattr(spec, "metadata", {}).get("always_run", False)):
+                return True
+        return False
+
+    def _iter_owners_post_order_dirty(self, root: ControlNode) -> Iterable[ControlNode]:
+        """Yield owners in post-order, pruning clean DFS branches."""
+
+        out: list[ControlNode] = []
+
+        def walk(node: ControlNode) -> bool:
+            child_dirty = False
+            for child in node.children:
+                if child.scope in (OwnerScope.ROOM, OwnerScope.OBJECT):
+                    if walk(child):
+                        child_dirty = True
+
+            self_dirty = False
+            if node.scope in (OwnerScope.OBJECT, OwnerScope.GLOBAL):
+                self_dirty = self._owner_node_is_dirty(node)
+
+            subtree_dirty = child_dirty or self_dirty
+            if subtree_dirty and node.scope in (OwnerScope.OBJECT, OwnerScope.GLOBAL):
+                out.append(node)
+            return subtree_dirty
+
+        walk(root)
+        for node in out:
+            yield node
 
     def _iter_owners_post_order(self, root: ControlNode) -> Iterable[ControlNode]:
         # Owners are: GLOBAL (the root itself) and OBJECT nodes. ROOM is
@@ -1533,5 +1799,25 @@ __all__ = [
     "Fifo",
     "FifoContext",
     "dispatch_compute_tick",
+    "publish_owner_target",
     # iter_owner_ids is a method on ControlGraph; re-exported for convenience
 ]
+
+
+def publish_owner_target(
+    *,
+    owner_id: str,
+    target_id: str,
+    payload: Any,
+    flip_slots: int = 2,
+    change_key: Any = None,
+) -> ShaderFlipBuffer:
+    """Convenience wrapper for universal owner-level target publication."""
+    graph = get_control_graph()
+    return graph.publish_owner_target(
+        owner_id=owner_id,
+        target_id=target_id,
+        payload=payload,
+        flip_slots=flip_slots,
+        change_key=change_key,
+    )

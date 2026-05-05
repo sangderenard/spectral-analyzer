@@ -46,11 +46,13 @@ from typing import List, Optional
 class RenderMode(enum.Enum):
     """Player-experience render modes.
 
-    GL      — pure OpenGL rasterisation (default).
+    C       — C/software pipeline (default startup path; driven by shader walk).
+    GL      — pure OpenGL rasterisation.
     HYBRID  — OpenGL rasterisation augmented with a baked radiant /
               irradiant / volumetric light field uploaded as textures.
     RAYTRACE — full ray-trace pass replaces rasterised 3-D rendering.
     """
+    C        = "c"
     GL       = "gl"
     HYBRID   = "hybrid"
     RAYTRACE = "raytrace"
@@ -7553,6 +7555,14 @@ class Renderer:
         self._ray_gamma = float(GPU_RAY_FIELD_GAMMA)
         self._ray_lighting: Optional[RayLightingState] = None   # set after init via set_ray_lighting()
         self._no_stage = bool(no_stage)
+        # ── Per-channel global default selection ─────────────────────────
+        # 2D and 3D each pick their own backend (C or GL).  The walker
+        # fires registered shaders unconditionally; whatever is left
+        # over goes to the global default for each channel selected
+        # below.  Defaults: both channels run the C backend.
+        self._mode_2d: 'RenderMode' = RenderMode.C
+        self._mode_3d: 'RenderMode' = RenderMode.C
+        self._global_dispatcher = None  # built by the demo at startup
         self._init_gl()
 
     # ── Setup ─────────────────────────────────────────────────────────────────
@@ -11043,7 +11053,7 @@ class _PlayerCameraPanel:
         self._log    = {d[0]: d[5] for d in self._SLIDERS}
         self._fmt    = {d[0]: d[6] for d in self._SLIDERS}
         self._auto   = {d[0]: False for d in self._AUTOS}
-        self._cam_render_mode: 'RenderMode' = RenderMode.GL
+        self._cam_render_mode: 'RenderMode' = RenderMode.C
         # Layer / display toggles driven by the panel
         self._show_illum:   bool = False
         self._show_sensor:  bool = False
@@ -11532,7 +11542,10 @@ class _PlayerCameraPanel:
         if self._renderer is None:
             return
         m = self._cam_render_mode
-        if m is RenderMode.GL:
+        if m is RenderMode.C:
+            self._renderer._layers[7] = LAYER_HIDDEN
+            self._renderer._layers[8] = LAYER_HIDDEN
+        elif m is RenderMode.GL:
             self._renderer._layers[7] = LAYER_HIDDEN
             self._renderer._layers[8] = LAYER_HIDDEN
         elif m is RenderMode.HYBRID:
@@ -11544,10 +11557,15 @@ class _PlayerCameraPanel:
         # Sync toggle buttons to match what the preset just set
         self._show_illum  = (self._renderer._layers[7] != LAYER_HIDDEN)
         self._show_sensor = (self._renderer._layers[8] != LAYER_HIDDEN)
+        self._renderer._render_mode = m.value
 
     def _sync_render_mode(self) -> None:
         """Read bound renderer layer flags and set the matching render mode."""
         if self._renderer is None:
+            return
+        _stored = getattr(self._renderer, '_render_mode', None)
+        if _stored in tuple(m.value for m in RenderMode):
+            self._cam_render_mode = RenderMode(_stored)
             return
         l8 = self._renderer._layers[7]
         l9 = self._renderer._layers[8]
@@ -11556,7 +11574,7 @@ class _PlayerCameraPanel:
         elif l8 != LAYER_HIDDEN:
             self._cam_render_mode = RenderMode.HYBRID
         else:
-            self._cam_render_mode = RenderMode.GL
+            self._cam_render_mode = RenderMode.C
 
     # ── Layout helpers ────────────────────────────────────────────────────────
 
@@ -11744,8 +11762,8 @@ class _PlayerCameraPanel:
             # Render mode buttons
             btn_y = self._render_mode_y(py) + self.ROW
             if btn_y <= my <= btn_y + self.ROW:
-                _modes = [RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE]
-                bw = (self.PW - 16) // 3
+                _modes = [RenderMode.C, RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE]
+                bw = (self.PW - 20) // 4
                 for bi, m in enumerate(_modes):
                     bx = px + 8 + bi * (bw + 4)
                     if bx <= mx <= bx + bw:
@@ -11886,9 +11904,9 @@ class _PlayerCameraPanel:
         # Thin separator
         self._draw_quad(px + 4, rmy - 4, self.PW - 8, 2, self._C_SEP, win_w, win_h)
         self._draw_text("Render Mode", px + 8, rmy + 6, win_w, win_h)
-        _modes  = [RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE]
-        _labels = ['OpenGL', 'Hybrid', 'Ray']
-        bw = (self.PW - 16) // 3
+        _modes  = [RenderMode.C, RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE]
+        _labels = ['C', 'OpenGL', 'Hybrid', 'Ray']
+        bw = (self.PW - 20) // 4
         btn_y = rmy + self.ROW
         for bi, (m, lbl) in enumerate(zip(_modes, _labels)):
             bx = px + 8 + bi * (bw + 4)
@@ -11959,8 +11977,8 @@ def _parse_args():
                    help="Do not automatically start the FDTD/audio physics worker on launch; "
                         "physics can be started later via UI or key binding")
     p.add_argument("--render-mode", dest="render_mode",
-                   choices=[m.value for m in RenderMode], default=RenderMode.GL.value,
-                   help="Player-experience render mode: gl (default), hybrid (GL + baked light field), "
+                    choices=[m.value for m in RenderMode], default=RenderMode.C.value,
+                    help="Player-experience render mode: c (default startup), gl, hybrid (GL + baked light field), "
                         "or raytrace (implies --ray-program-only)")
     p.add_argument("--lens-focal-mm", type=float, default=35.0,
                    help="Camera focal length in millimetres")
@@ -12439,6 +12457,7 @@ def main():
     R.cam.focus_m = float(np.clip(args.lens_focus_m, 0.05, 20.0))
     R.cam.aperture = float(np.clip(args.lens_aperture, 0.0, 0.08))
     R.cam.ca = float(np.clip(args.lens_ca, 0.0, 0.02))
+    R._render_mode = _render_mode.value
     if args.ray_program_only:
         R._layers = [LAYER_ALPHA, LAYER_HIDDEN, LAYER_HIDDEN,
                      LAYER_ALPHA, LAYER_OPAQUE, LAYER_ALPHA, LAYER_ALPHA,
@@ -12606,6 +12625,139 @@ def main():
     _player_cam_panel = _PlayerCameraPanel()
     _player_cam_panel.init_gl()
     _player_cam_panel.attach(R.cam, panel, R, player_ctrl=player_ctrl)
+    _player_cam_panel._cam_render_mode = _render_mode
+    _player_cam_panel.apply_render_mode()
+
+    # ── Doc renderer — HUD second channel ────────────────────────────────────
+    # Registered into the ShaderFrameWalker as "doc_composite" so every HUD
+    # panel is just another channel in the same pipeline (no special shader).
+    _doc_rdr = None
+    _doc_init_err: Exception | None = None
+    _doc_slider_ids  = {}   # stable node-id maps, persist across frames
+    _doc_camera_ids  = {}
+    try:
+        from doc_renderer import DocRenderer as _DocRenderer
+        from controls import Panel as _DocPanel
+        _doc_rdr = _DocRenderer(WIN_W, WIN_H)
+        _doc_rdr.init_gl()
+        # Best-effort glyph atlas from pygame monospace font via PIL shim
+        try:
+            from PIL import ImageFont as _PILFont
+            _pil_font = _PILFont.load_default()
+            _doc_rdr.load_glyph_atlas_from_pil(_pil_font)
+        except Exception:
+            pass  # layout-only mode; no text glyphs
+        # Build persistent Panel specs from HUD class descriptors
+        _doc_slider_spec = _DocPanel(
+            name="slider_panel",
+            label="Render Controls",
+            knobs=list(_SliderPanel.knobspec()),
+        )
+        _doc_camera_spec = _DocPanel(
+            name="camera_panel",
+            label="Camera",
+            knobs=list(_PlayerCameraPanel.knobspec()),
+        )
+        # The doc renderer is a *global default* 2D composer; it is not a
+        # shader-node and is not registered.  The unified resolve below
+        # invokes it on whatever leftover document items the registered
+        # shaders (currently none in the global case) did not finalise.
+        print("[doc_renderer] init OK (global 2D default; runs on leftovers)", flush=True)
+    except Exception as _exc:
+        _doc_init_err = _exc
+        print(f"[doc_renderer] init failed: {_exc}", flush=True)
+        _doc_rdr = None
+
+    # ── Build the four-way global default dispatcher ─────────────────────────
+    # The dispatcher owns the four globals (2D-C, 2D-GL, 3D-C, 3D-GL) and
+    # per-channel cadence/min-period gates.  It is selected each frame by
+    # R._mode_2d / R._mode_3d (independent), and only fires the leftovers
+    # each channel's registered shaders did not finalise.
+    try:
+        from globals_renderer import GlobalChannelDispatcher as _GlobalChannelDispatcher
+        # 3D-C geometry packer: pull world-space triangle soups out of the
+        # leftover scene.geometry/<owner> payloads, transform to view
+        # space using the active camera, compute per-tri face normals,
+        # and pack into the (verts_view, mat_ids, proj_colmajor, light_v)
+        # tuple the BaseRasterizer pybind binding expects.
+        def _pack_3d_c_geometry(_leftovers):
+            try:
+                if not _leftovers or _cam_pure_matrices is None:
+                    return None
+                tri_chunks = []
+                for _payload in _leftovers.values():
+                    if not isinstance(_payload, dict):
+                        continue
+                    if _payload.get('kind') != 'triangles':
+                        continue
+                    _tris = _payload.get('triangles')
+                    if _tris is None:
+                        continue
+                    _tris = np.asarray(_tris, dtype=np.float32)
+                    if _tris.ndim != 3 or _tris.shape[1:] != (3, 3) or _tris.shape[0] == 0:
+                        continue
+                    tri_chunks.append(_tris)
+                if not tri_chunks:
+                    return None
+                tris_world = np.concatenate(tri_chunks, axis=0)        # (Nt, 3, 3)
+                Nt = int(tris_world.shape[0])
+
+                # Build P (projection only) and V from the active camera.
+                _P64, _V64 = _cam_pure_matrices(R.cam)
+                _V = np.asarray(_V64, dtype=np.float32)
+                _P = np.asarray(_P64, dtype=np.float32)
+
+                # World -> view transform on every triangle vertex.
+                pts_w = tris_world.reshape(-1, 3)                       # (Nt*3, 3)
+                pts_h = np.concatenate(
+                    [pts_w, np.ones((pts_w.shape[0], 1), dtype=np.float32)],
+                    axis=1,
+                )
+                pts_v = (_V @ pts_h.T).T[:, :3].astype(np.float32)      # (Nt*3, 3)
+
+                # Per-triangle face normal in view space.
+                tris_v = pts_v.reshape(Nt, 3, 3)
+                e1 = tris_v[:, 1, :] - tris_v[:, 0, :]
+                e2 = tris_v[:, 2, :] - tris_v[:, 0, :]
+                fn = np.cross(e1, e2).astype(np.float32)
+                fn_len = np.linalg.norm(fn, axis=1, keepdims=True)
+                fn_len = np.where(fn_len > 1e-8, fn_len, 1.0)
+                fn = fn / fn_len
+                # Broadcast face normal to all 3 vertices.
+                nrm_v = np.repeat(fn, 3, axis=0).astype(np.float32)     # (Nt*3, 3)
+
+                verts_view = np.concatenate([pts_v, nrm_v], axis=1)     # (Nt*3, 6)
+                verts_view = np.ascontiguousarray(verts_view, dtype=np.float32)
+                mat_ids = np.zeros((Nt,), dtype=np.int32)
+
+                # br_render parses mvp as a column-major 4x4: proj(r,c) = mvp[c*4+r]
+                proj = np.ascontiguousarray(_P.T.reshape(-1), dtype=np.float32)
+
+                # Light direction in view space (matches the GL pass).
+                light_v = np.array([0.5, 1.0, 0.6], dtype=np.float32)
+                light_v /= max(float(np.linalg.norm(light_v)), 1e-8)
+
+                return (verts_view, mat_ids, proj, light_v)
+            except Exception:
+                return None
+
+        R._global_dispatcher = _GlobalChannelDispatcher(
+            width=WIN_W,
+            height=WIN_H,
+            gl_doc_renderer=_doc_rdr,
+            gl_render_callback=R.render,
+            c_doc_backend=getattr(_doc_rdr, "_backend", None),
+            geometry_packer=_pack_3d_c_geometry,
+            cadence_2d=1,
+            cadence_3d=1,
+            min_period_2d_s=0.0,
+            min_period_3d_s=0.0,
+        )
+        print("[globals] dispatcher ready (2D mode={}, 3D mode={})".format(
+            R._mode_2d.value, R._mode_3d.value), flush=True)
+    except Exception as _exc:
+        print(f"[globals] dispatcher init failed: {_exc}", flush=True)
+        R._global_dispatcher = None
 
     # ── Camera optics schematic (three-view line diagram) ────────────────────
     _cam_optics_view = _CameraOpticsView()
@@ -12774,10 +12926,79 @@ def main():
           start_action_dispatcher as _start_action_dispatcher,
           stop_action_dispatcher as _stop_action_dispatcher,
           get_shader_walker as _get_shader_walker,
+          get_control_graph as _get_control_graph,
       )
       _start_action_dispatcher()
+      _shader_graph = _get_control_graph()
       _shader_walker = _get_shader_walker()
       _shader_frame_result = None
+
+      def _submit_scene_object_buffers() -> None:
+          # Submit routine scene geometry through the walker's universal
+          # owner flip-buffer API (no shader registration required).
+          # Submission is dirty-aware via change_key, so unchanged objects
+          # keep prior geometry in the end-state buffer without re-flipping.
+          for _i, _ds in enumerate(duty_stations):
+              if not hasattr(_ds, 'interaction_triangles_world'):
+                  continue
+              try:
+                  _tris = _ds.interaction_triangles_world()
+              except Exception:
+                  continue
+              _pref = getattr(_ds, '_placed_ref', None)
+              _owner = str(getattr(_pref, 'obj_id', f'duty_station_{_i}'))
+              _wp = np.asarray(getattr(_ds, 'world_position', np.zeros(3, np.float64)), np.float64).reshape(3)
+              _yaw = float(getattr(_ds, '_yaw_deg', 0.0))
+              _sig = (
+                  float(_wp[0]), float(_wp[1]), float(_wp[2]),
+                  _yaw,
+                  int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0,
+              )
+              _shader_walker.publish_owner_target(
+                  owner_id=_owner,
+                  target_id=f"scene.geometry/{_owner}",
+                  payload={
+                      "owner_id": _owner,
+                      "kind": "triangles",
+                      "triangles": _tris,
+                  },
+                  flip_slots=2,
+                  change_key=_sig,
+              )
+
+          for _i, _ci in enumerate(cameras):
+              if not hasattr(_ci, 'interaction_triangles_world'):
+                  continue
+              try:
+                  _tris = _ci.interaction_triangles_world()
+              except Exception:
+                  continue
+              _placed = getattr(_ci, 'placed', None)
+              _owner = str(getattr(_placed, 'obj_id', f'camera_{_i}'))
+              _pos = np.asarray(getattr(_placed, 'pos', np.zeros(3, np.float64)), np.float64).reshape(3)
+              _sig = (
+                  float(_pos[0]), float(_pos[1]), float(_pos[2]),
+                  float(getattr(_placed, 'yaw_deg', 0.0)),
+                  float(getattr(_placed, 'pan_deg', 0.0)),
+                  float(getattr(_placed, 'tilt_deg', 0.0)),
+                  float(getattr(_placed, 'focal_mm', 0.0)),
+                  str(getattr(_placed, 'mesh_id', 'camera_35mm')),
+                  int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0,
+              )
+              _shader_walker.publish_owner_target(
+                  owner_id=_owner,
+                  target_id=f"scene.geometry/{_owner}",
+                  payload={
+                      "owner_id": _owner,
+                      "kind": "triangles",
+                      "triangles": _tris,
+                  },
+                  flip_slots=2,
+                  change_key=_sig,
+              )
+
+      _warned_no_c_present_target = False
+
       # ---- Naive star network bootstrap --------------------------------
       # Auto-wire every existing owner into a default star, spin up the
       # singleton gateway, and pre-create one duty station the player can
@@ -13191,6 +13412,12 @@ def main():
             R._sensor_acc._air_an = float(panel.values['air_aniso'])
 
         try:
+            # Per-frame framebuffer clear. R.render() (GL 3D path) used
+            # to do this; with 3D=C it's never called, so do it here
+            # unconditionally so leftover GL state can't bleed through.
+            glClearColor(0.015, 0.010, 0.040, 1.0)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            glViewport(0, 0, WIN_W, WIN_H)
             _ray_diag_update(
                 "render:frame",
                 frame_index=int(fi),
@@ -13205,10 +13432,45 @@ def main():
                 R.cam.tick(_cam_dt)
             _player_cam_panel.enforce_menu_camera_lock()
 
-            # ── Active station menu overlay ───────────────────────────────────
+            # ── HUD second channel — submit all panels to doc renderer ────────
+            # Each HUD object is a channel in the same pipeline; the walker's
+            # "doc_composite" node composites them into the "doc.layer" target
+            # which the global final-pass resolves alongside the world render.
+            if _doc_rdr is None:
+                raise RuntimeError(
+                    f"HUD second channel unavailable: DocRenderer failed to "
+                    f"initialise (init error: {_doc_init_err!r}). "
+                    f"Check _spectral_kernels build — run: "
+                    f"cmake --build csrc_build --config Release"
+                )
+            # Slider panel — always visible
+            _doc_rdr.submit_panel(
+                _doc_slider_spec,
+                (10, 10, 264, 30 + 42 * len(_doc_slider_spec.knobs)),
+                node_id_map=_doc_slider_ids,
+                knob_values=panel.values,
+            )
+            # Camera panel — only when open
+            if _player_cam_panel.open:
+                _doc_rdr.submit_panel(
+                    _doc_camera_spec,
+                    (WIN_W - 340, 10, 330, 30 + 42 * len(_doc_camera_spec.knobs)),
+                    node_id_map=_doc_camera_ids,
+                    knob_values={k: getattr(R.cam, k, None) for k in
+                                 [s[0] for s in _PlayerCameraPanel._SLIDERS]},
+                )
+            # Active station — must expose submit_doc_channel; no GL fallback.
             _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
-            if _active_st is not None and hasattr(_active_st, 'render_menu'):
-                _active_st.render_menu(WIN_W, WIN_H)
+            if _active_st is not None:
+                if not hasattr(_active_st, 'submit_doc_channel'):
+                    raise RuntimeError(
+                        f"Station {type(_active_st).__name__!r} has no submit_doc_channel(). "
+                        "Update the station class to expose a panel_spec on its menu "
+                        "and remove any direct render_hud/render_menu GL calls."
+                    )
+                _active_st.submit_doc_channel(_doc_rdr, WIN_W, WIN_H)
+
+            _submit_scene_object_buffers()
 
             # ── Bottom-up shader walk ────────────────────────────────────────
             # Visit every SHADERS-axis node in the control hierarchy in
@@ -13218,159 +13480,166 @@ def main():
             # the final draw below can gate fragments accordingly.
             try:
                 _shader_frame_result = _shader_walker.tick(
-                    frame_index=int(frame_index),
+                    frame_index=int(fi),
                     dt=float(_dt),
                 )
             except Exception:
                 _shader_frame_result = None
 
-            glClearColor(0.015, 0.010, 0.040, 1.0)
-            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            # Final arena resolve: only run global cleanup for unresolved
+            # target ranges after specific/local shader writes are accounted for.
+            _latest_targets = _shader_graph.snapshot_latest_targets()
+            _finalized = (
+                set(_shader_frame_result.finalized_targets)
+                if _shader_frame_result is not None else set()
+            )
+            _leftover_targets = {
+                _tid: _payload
+                for _tid, _payload in _latest_targets.items()
+                if _tid not in _finalized
+            }
+            # ── Unified two-channel resolve ───────────────────────────────────
+            #
+            # Channel 3D (geometry):
+            #   Owner flip targets under "scene.geometry/<owner>" are the
+            #   contiguous geometry stream produced by the dirty walk.
+            #   Anything that wants to contribute meshes publishes there;
+            #   the final 3D pass consumes the merged set with a mask of
+            #   regions already covered by earlier shader writes.
+            #
+            # Channel 2D (textures):
+            #   Owner flip targets under "doc.layer/<owner>" plus the
+            #   document composite are the hierarchically sorted texture
+            #   set. Pre-run textures (from registered shaders) have already
+            #   been written; the 2D composer fills in any leftover
+            #   document-hierarchy items as textures.
+            #
+            # Both channels are produced every frame regardless of which
+            # backend (C or OpenGL) executes the final stages.
+            _geom_channel: dict = {}
+            _tex_channel: dict = {}
+            for _tid, _payload in _latest_targets.items():
+                _key = str(_tid)
+                if _key.startswith("scene.geometry/"):
+                    _geom_channel[_key] = _payload
+                elif _key.startswith("doc.layer/") or _key.startswith("doc.composite"):
+                    _tex_channel[_key] = _payload
+
+            setattr(R, "_geometry_channel", _geom_channel)
+            setattr(R, "_texture_channel", _tex_channel)
+            setattr(R, "_final_targets", _latest_targets)
+            setattr(R, "_final_leftovers", _leftover_targets)
+            setattr(R, "_finalized_targets", _finalized)
+
+            # ── Global default fillers (run on leftovers only) ────────────
+            #
+            # Globals are NOT registered shader-nodes.  After the walker
+            # has fired every registered shader (currently none in the
+            # global case, so everything is leftover), the four-way
+            # dispatcher selects one global per channel based on
+            # R._mode_2d / R._mode_3d (each independently C or GL) and
+            # fires it on the leftover items not covered by the
+            # finalised mask.  The 2D and 3D channels obey independent
+            # cadence and min-period gates and are not lock-step.
+            _tex_leftovers = {
+                _tid: _payload for _tid, _payload in _tex_channel.items()
+                if _tid not in _finalized
+            }
+            _geom_leftovers = {
+                _tid: _payload for _tid, _payload in _geom_channel.items()
+                if _tid not in _finalized
+            }
+            setattr(R, "_geometry_leftovers", _geom_leftovers)
+            setattr(R, "_texture_leftovers", _tex_leftovers)
+
+            _global_result = None
+            if getattr(R, "_global_dispatcher", None) is not None:
+                try:
+                    from globals_renderer import ChannelBackend as _ChannelBackend
+                    _global_result = R._global_dispatcher.dispatch(
+                        leftovers_2d=_tex_leftovers,
+                        leftovers_3d=_geom_leftovers,
+                        mode_2d=_ChannelBackend.from_render_mode(R._mode_2d),
+                        mode_3d=_ChannelBackend.from_render_mode(R._mode_3d),
+                        frame_index=int(fi),
+                        dt=float(_dt),
+                    )
+                    _diag_n = getattr(R, "_diag_render_count", 0)
+                    if _diag_n < 5:
+                        _o3 = getattr(_global_result, "out_3d_rgba", None)
+                        _o2 = getattr(_global_result, "out_2d_rgba", None)
+                        _u3 = getattr(_global_result, "used_3d", None)
+                        _u2 = getattr(_global_result, "used_2d", None)
+                        _s3 = getattr(_global_result, "skipped_3d_reason", "")
+                        _s2 = getattr(_global_result, "skipped_2d_reason", "")
+                        # Quantify 3D-C output: lit-pixel count & alpha range
+                        _o3_stats = "-"
+                        if _o3 is not None:
+                            try:
+                                _arr = np.asarray(_o3)
+                                _lit = int((_arr[..., 3] > 0).sum())
+                                _amx = int(_arr[..., 3].max())
+                                _rmx = int(_arr[..., :3].max())
+                                _o3_stats = f"lit={_lit} amax={_amx} rgbmax={_rmx} shape={_arr.shape}"
+                            except Exception as _e:
+                                _o3_stats = f"stats-err:{_e}"
+                        # Show first geom payload for sanity
+                        _gsamp = "-"
+                        try:
+                            _kk = next(iter(_geom_leftovers))
+                            _pp = _geom_leftovers[_kk]
+                            _tt = _pp.get("triangles")
+                            _gsamp = f"{_kk}: tris.shape={getattr(_tt,'shape',None)}"
+                        except Exception:
+                            pass
+                        print(
+                            f"[diag #{_diag_n} fi={fi}] geom_left={len(_geom_leftovers)} "
+                            f"tex_left={len(_tex_leftovers)} fin={len(_finalized)} "
+                            f"u2d={_u2}({_s2!r}) u3d={_u3}({_s3!r}) "
+                            f"o3=[{_o3_stats}] sample={_gsamp}",
+                            flush=True,
+                        )
+                        setattr(R, "_diag_render_count", _diag_n + 1)
+                except Exception as _exc:
+                    _report_exception("global dispatcher", _exc)
+
+            setattr(R, "_global_dispatch_result", _global_result)
+
+            # ── Blit policy ────────────────────────────────────────────────
+            # The C globals produce CPU RGBA buffers.  Deposit them into
+            # the active GL framebuffer (which the OPENGL pygame surface
+            # is presenting) through the doc renderer's fullscreen-quad
+            # blit pipeline.  Order: 3D-C first (it forms the background),
+            # then 2D-C on top.  When a channel ran on its GL backend
+            # there is nothing to blit here — its output is already in
+            # the framebuffer (3D-GL) or was deposited inline (2D-GL).
+            if _global_result is not None and _doc_rdr is not None:
+                try:
+                    _out_3d = getattr(_global_result, "out_3d_rgba", None)
+                    if _out_3d is not None:
+                        _doc_rdr.blit_rgba(_out_3d, alpha=1.0)
+                except Exception as _exc:
+                    _report_exception("blit 3D-C", _exc)
+                try:
+                    _out_2d = getattr(_global_result, "out_2d_rgba", None)
+                    if _out_2d is not None:
+                        _doc_rdr.blit_rgba(_out_2d, alpha=1.0)
+                except Exception as _exc:
+                    _report_exception("blit 2D-C", _exc)
+
+            # Camera-item draw is part of the 3D channel: cameras publish
+            # their geometry through publish_owner_target; their direct
+            # GL draw remains here only as a transitional convenience until
+            # the base material renderer consumes the geometry channel.
             _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
             _rs_lv /= np.linalg.norm(_rs_lv)
-
-            # ── Camera item render pass ───────────────────────────────────────
             if cameras and _cam_pure_matrices is not None:
                 _P, _V = _cam_pure_matrices(R.cam)
-                _MVP   = (_P @ _V).astype(np.float32)
-                _MV    = _V.astype(np.float32)
-                _lv    = (_rs_lv if '_rs_lv' in dir() else
-                          np.array([0.5, 1.0, 0.6], np.float32))
+                _MVP = (_P @ _V).astype(np.float32)
+                _MV  = _V.astype(np.float32)
+                _lv  = _rs_lv
                 for _ci in cameras:
                     _ci.draw(_MVP, _MV, _lv)
-
-            _focus_owner = getattr(player_ctrl, 'focus_target', None) if player_ctrl is not None else None
-            if _focus_owner is not None and _cam_pure_matrices is not None:
-                _focus_lines = None
-                if hasattr(_focus_owner, 'interaction_wireframe_world'):
-                    _focus_lines = _focus_owner.interaction_wireframe_world()
-                elif hasattr(_focus_owner, 'interaction_triangles_world'):
-                    _focus_tris = _focus_owner.interaction_triangles_world()
-                    if _focus_tris is not None and len(_focus_tris) > 0:
-                        _focus_lines = np.empty((len(_focus_tris) * 3, 2, 3), np.float64)
-                        _focus_lines[0::3, 0, :] = _focus_tris[:, 0, :]
-                        _focus_lines[0::3, 1, :] = _focus_tris[:, 1, :]
-                        _focus_lines[1::3, 0, :] = _focus_tris[:, 1, :]
-                        _focus_lines[1::3, 1, :] = _focus_tris[:, 2, :]
-                        _focus_lines[2::3, 0, :] = _focus_tris[:, 2, :]
-                        _focus_lines[2::3, 1, :] = _focus_tris[:, 0, :]
-                _focus_v = _line_segments_pos(_focus_lines)
-                if len(_focus_v) > 0:
-                    _focus_vao, _focus_vbo, _focus_n = _vao(
-                        _focus_v, [(0, 3, 12, 0)], GL_DYNAMIC_DRAW)
-                    try:
-                        glDisable(GL_DEPTH_TEST)
-                        glDepthMask(GL_FALSE)
-                        glUseProgram(R._p_line)
-                        _mvp(R._p_line, (_P @ _V).astype(np.float32))
-                        glLineWidth(1.8)
-                        glUniform4f(glGetUniformLocation(R._p_line, b'uColor'),
-                                    1.0, 0.92, 0.20, 0.95)
-                        glBindVertexArray(_focus_vao)
-                        glDrawArrays(GL_LINES, 0, _focus_n)
-                        glBindVertexArray(0)
-                    finally:
-                        glDepthMask(GL_TRUE)
-                        glEnable(GL_DEPTH_TEST)
-                        glDeleteBuffers(1, [_focus_vbo])
-                        glDeleteVertexArrays(1, [_focus_vao])
-
-            # ── Camera designer station render pass ──────────────────────────
-
-            # ── Camera HUD panel (IN_CAMERA mode) ────────────────────────────
-            if (_camera_panel is not None
-                    and player_ctrl is not None
-                    and player_ctrl.state.value == "in_camera"):
-                if player_ctrl._active_camera is not None:
-                    _camera_panel.set_title(
-                        getattr(getattr(player_ctrl._active_camera, 'placed',
-                                        player_ctrl._active_camera),
-                                'name', 'camera'))
-                _camera_panel.render(WIN_W, WIN_H, R.cam)
-
-            # ── Player camera settings panel (walk mode overlay) ────────────────
-            _player_cam_panel.draw(WIN_W, WIN_H)
-            if _player_cam_panel.open:
-                _cam_optics_view.draw(WIN_W, WIN_H)
-
-            for _ds in duty_stations:
-                _m = getattr(_ds, 'menu', None)
-                if _m is not None and hasattr(_m, 'render_hud'):
-                    _m.render_hud(WIN_W, WIN_H)
-
-            _station_hud_active = (
-                player_ctrl is not None
-                and player_ctrl.state.value == "interact"
-                and _active_st is not None
-            )
-
-            # ── Global renderer panel: keep hidden during duty-station/camera
-            # interaction so station-specific HUDs own the screen overlays.
-            _show_panel = (player_ctrl is None
-                           or player_ctrl.state.value == "orbit")
-            if _show_panel:
-                panel.draw(WIN_W, WIN_H)
-            else:
-                # Walk mode: show proximity hint if near a station
-                if player_ctrl is not None and player_ctrl.proximity_frac > 0.0:
-                    _alpha = int(min(255, player_ctrl.proximity_frac * 510))
-                    _hint  = player_ctrl.hud_hint
-                    panel._draw_hud_text(_hint, WIN_W // 2, WIN_H - 56,
-                                         WIN_W, WIN_H, center=True)
-
-            if not _station_hud_active:
-                panel._draw_hud_text(R.camera_hud(), WIN_W // 2, 14, WIN_W, WIN_H, center=True)
-                # Sensor status overlay — shown whenever layer 9 is ALPHA or OPAQUE
-                if R._layers[8] != LAYER_HIDDEN:
-                    acc = R._sensor_acc
-                    if acc is not None and acc._active:
-                        _rpf = acc._w * int(acc._rows_per_frame) * int(acc._samples_per_pixel)
-                        _sstat = (f"SENSOR  pass {acc._pass}  frame {acc._frame}  "
-                                  f"{acc._w}x{acc._h}  +{_rpf} rays/frame  "
-                                  f"{R._sensor_fps:.0f} fps reset")
-                    else:
-                        _sstat = "SENSOR: no accumulator (needs --gpu-rays)"
-                    panel._draw_hud_text(_sstat, WIN_W // 2, WIN_H - 28, WIN_W, WIN_H, center=True)
-                panel.draw_progress(
-                    WIN_W, WIN_H,
-                    recorded_samples=max(recorded_samples, min(total, len(R._frames) * BLOCK_SAMPLES)),
-                    total_samples=total,
-                    replaying=replaying,
-                    paused=R._paused,
-                    pending_rebuild=pending_rebuild,
-                    cached_frames=len(R._frames))
-
-            if _exit_confirm_open and _player_cam_panel is not None and getattr(_player_cam_panel, '_p_col', None) is not None:
-                _layout = _exit_confirm_layout(WIN_W, WIN_H)
-                _mx, _my = pygame.mouse.get_pos()
-                _hov_yes = _pt_in_rect((_mx, _my), _layout["yes"])
-                _hov_no = _pt_in_rect((_mx, _my), _layout["no"])
-
-                glDisable(GL_DEPTH_TEST)
-                glEnable(GL_BLEND)
-                glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-
-                _player_cam_panel._draw_quad(0, 0, WIN_W, WIN_H,
-                                             (0.01, 0.01, 0.02, 0.70), WIN_W, WIN_H)
-                _px, _py, _pw, _ph = _layout["panel"]
-                _player_cam_panel._draw_quad(_px, _py, _pw, _ph,
-                                             (0.06, 0.08, 0.12, 0.95), WIN_W, WIN_H)
-                _player_cam_panel._draw_quad(_px, _py, _pw, 40,
-                                             (0.18, 0.28, 0.46, 0.98), WIN_W, WIN_H)
-                _player_cam_panel._draw_text("EXIT GAME", _px + 16, _py + 11, WIN_W, WIN_H)
-                _player_cam_panel._draw_text("Leave current session?", _px + 16, _py + 66, WIN_W, WIN_H)
-                _player_cam_panel._draw_text("ESC or N: cancel    ENTER or Y: confirm", _px + 16, _py + 94, WIN_W, WIN_H)
-
-                _nx, _ny, _nw, _nh = _layout["no"]
-                _yx, _yy, _yw, _yh = _layout["yes"]
-                _player_cam_panel._draw_quad(_nx, _ny, _nw, _nh,
-                                             (0.34, 0.22, 0.22, 0.98) if _hov_no else (0.24, 0.16, 0.16, 0.96),
-                                             WIN_W, WIN_H)
-                _player_cam_panel._draw_quad(_yx, _yy, _yw, _yh,
-                                             (0.22, 0.44, 0.26, 0.98) if _hov_yes else (0.16, 0.30, 0.18, 0.96),
-                                             WIN_W, WIN_H)
-                _player_cam_panel._draw_text("NO", _nx + (_nw // 2) - 10, _ny + 14, WIN_W, WIN_H)
-                _player_cam_panel._draw_text("YES", _yx + (_yw // 2) - 12, _yy + 14, WIN_W, WIN_H)
 
             pygame.display.flip()
         except BaseException as exc:

@@ -19,6 +19,8 @@
 #include "acoustic_fdtd.h"
 #include "acoustic_coevolver.h"
 #include "acoustic_pressure_backend.h"
+#include "doc_renderer.h"
+#include "base_rasterizer.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
@@ -3534,4 +3536,270 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
           py::arg("half_sizes"),
           py::arg("types"),
           "Build AMR face topology with the sorted lattice sweep in C++.");
+
+    /* ── DocRenderer ────────────────────────────────────────────────────────── */
+
+    struct PyDocRenderer {
+        DocRendererState* st;
+        PyDocRenderer(int w, int h) : st(dr_create(w, h)) {
+            if (!st) throw std::runtime_error("dr_create failed");
+        }
+        ~PyDocRenderer() { if (st) { dr_destroy(st); st = nullptr; } }
+    };
+
+    py::class_<PyDocRenderer>(m, "DocRenderer",
+        R"doc(
+Document-hierarchy texture renderer.
+
+Background worker thread + thread-safe FIFO + pointlessness filter.
+Producers call submit_node() each frame; composite() blends all live tiles
+into a flat RGBA8 numpy array sized (height, width, 4).
+)doc")
+        .def(py::init<int, int>(),
+            py::arg("width"), py::arg("height"),
+            "Create a renderer of the given pixel dimensions.")
+        .def("load_glyph_atlas",
+            [](PyDocRenderer& self,
+               py::array_t<uint8_t> rgba,
+               int glyph_w, int glyph_h) {
+                auto info = rgba.request();
+                if (info.ndim != 3 || info.shape[2] != 4)
+                    throw std::runtime_error("load_glyph_atlas: expected (H, W, 4) uint8 array");
+                dr_load_glyph_atlas_rgba(self.st,
+                    static_cast<const uint8_t*>(info.ptr),
+                    (int)info.shape[1], (int)info.shape[0],
+                    glyph_w, glyph_h);
+            },
+            py::arg("rgba"), py::arg("glyph_w") = 8, py::arg("glyph_h") = 12,
+            "Upload a pre-rendered (H, W, 4) uint8 glyph atlas.")
+        .def("load_primitive_atlas",
+            [](PyDocRenderer& self,
+               py::array_t<uint8_t> rgba,
+               int prim_w, int prim_h, int prim_cols) {
+                auto info = rgba.request();
+                if (info.ndim != 3 || info.shape[2] != 4)
+                    throw std::runtime_error("load_primitive_atlas: expected (H, W, 4) uint8 array");
+                dr_load_primitive_atlas_rgba(self.st,
+                    static_cast<const uint8_t*>(info.ptr),
+                    (int)info.shape[1], (int)info.shape[0],
+                    prim_w, prim_h, prim_cols);
+            },
+            py::arg("rgba"), py::arg("prim_w"), py::arg("prim_h"), py::arg("prim_cols"),
+            "Upload a pre-rendered (H, W, 4) uint8 primitive atlas.")
+        .def("submit_node",
+            [](PyDocRenderer& self,
+               uint64_t node_id,
+               int x, int y, int w, int h,
+               int type,
+               const std::string& label,
+               const std::string& value_str,
+               py::array_t<float> bg_rgba,
+               py::array_t<float> fg_rgba,
+               py::array_t<float> border_rgba,
+               py::array_t<float> accent_rgba,
+               float corner_radius,
+               float font_scale,
+               float value_norm,
+               int icon_id,
+               int border_px) {
+                DocNodeRect rect{x, y, w, h};
+                DocNodePayload p{};
+                p.type = static_cast<DocNodeType>(type);
+                std::snprintf(p.label,     DR_LABEL_MAX, "%s", label.c_str());
+                std::snprintf(p.value_str, DR_VALUE_MAX, "%s", value_str.c_str());
+                auto fill4 = [](float* dst, py::array_t<float>& arr) {
+                    auto buf = arr.request();
+                    auto* data = static_cast<const float*>(buf.ptr);
+                    py::ssize_t n = (buf.ndim > 0) ? buf.shape[0] : 0;
+                    for (int i = 0; i < 4; ++i) dst[i] = (i < (int)n) ? data[i] : 0.f;
+                };
+                fill4(p.bg_rgba,     bg_rgba);
+                fill4(p.fg_rgba,     fg_rgba);
+                fill4(p.border_rgba, border_rgba);
+                fill4(p.accent_rgba, accent_rgba);
+                p.corner_radius = corner_radius;
+                p.font_scale    = font_scale;
+                p.value_norm    = value_norm;
+                p.icon_id       = icon_id;
+                p.border_px     = border_px;
+                dr_submit_node(self.st, node_id, rect, &p);
+            },
+            py::arg("node_id"),
+            py::arg("x"), py::arg("y"), py::arg("w"), py::arg("h"),
+            py::arg("type"),
+            py::arg("label")        = "",
+            py::arg("value_str")    = "",
+            py::arg("bg_rgba"),
+            py::arg("fg_rgba"),
+            py::arg("border_rgba"),
+            py::arg("accent_rgba"),
+            py::arg("corner_radius") = 2.0f,
+            py::arg("font_scale")    = 1.0f,
+            py::arg("value_norm")    = 0.0f,
+            py::arg("icon_id")       = -1,
+            py::arg("border_px")     = 1,
+            "Drop one node payload into the render FIFO.")
+        .def("remove_node",
+            [](PyDocRenderer& self, uint64_t node_id) {
+                DocNodeRect r{0, 0, 0, 0};
+                dr_submit_node(self.st, node_id, r, nullptr);
+            }, py::arg("node_id"), "Remove a node from the live set.")
+        .def("mark_dirty",
+            [](PyDocRenderer& self, uint64_t node_id) {
+                dr_mark_dirty(self.st, node_id);
+            }, py::arg("node_id"), "Force a node to re-render next flush.")
+        .def("clear",
+            [](PyDocRenderer& self) { dr_clear(self.st); },
+            "Remove all nodes and clear the composite buffer.")
+        .def("flush",
+            [](PyDocRenderer& self) { dr_flush(self.st); },
+            "Block until the FIFO is empty and all tiles are rendered.")
+        .def("composite",
+            [](PyDocRenderer& self) -> py::array_t<uint8_t> {
+                int w = dr_width(self.st), h = dr_height(self.st);
+                py::array_t<uint8_t> out({h, w, 4});
+                dr_composite(self.st, out.mutable_data());
+                return out;
+            },
+            "Composite all live tiles; returns (H, W, 4) uint8 RGBA array.")
+        .def_property_readonly("composite_dirty",
+            [](PyDocRenderer& self) -> bool {
+                return dr_composite_dirty(self.st) != 0;
+            },
+            "True if composite output has changed since last composite() call.")
+        .def_property_readonly("width",
+            [](PyDocRenderer& self){ return dr_width(self.st); })
+        .def_property_readonly("height",
+            [](PyDocRenderer& self){ return dr_height(self.st); })
+        .def_property_readonly("node_count",
+            [](PyDocRenderer& self){ return dr_node_count(self.st); })
+        .def_property_readonly("queue_depth",
+            [](PyDocRenderer& self){ return dr_queue_depth(self.st); });
+
+    /* ── BaseRasterizer (software 3D global) ───────────────────────────── */
+
+    struct PyBaseRasterizer {
+        BaseRasterizerState* st;
+        // Hold material chunks alive for the lifetime of the rasterizer.
+        std::vector<float> pbr, phong, enamel;
+        PyBaseRasterizer(int w, int h, int tile)
+            : st(br_create(w, h, tile)) {
+            if (!st) throw std::runtime_error("br_create failed");
+        }
+        ~PyBaseRasterizer() { if (st) { br_destroy(st); st = nullptr; } }
+    };
+
+    py::class_<PyBaseRasterizer>(m, "BaseRasterizer",
+        R"doc(
+Tile-parallel software rasterizer (3D-C global default).
+
+Deposits triangles directly into a CPU RGBA framebuffer; readback returns
+a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
+)doc")
+        .def(py::init<int, int, int>(),
+            py::arg("width"), py::arg("height"), py::arg("tile_size") = 16,
+            "Create a software rasterizer of the given pixel dimensions.")
+        .def("clear",
+            [](PyBaseRasterizer& self, float r, float g, float b, float a) {
+                br_clear(self.st, r, g, b, a);
+            },
+            py::arg("r") = 0.0f, py::arg("g") = 0.0f,
+            py::arg("b") = 0.0f, py::arg("a") = 0.0f,
+            "Clear the colour buffer (and depth) to the given RGBA.")
+        .def("set_pbr_chunk",
+            [](PyBaseRasterizer& self, py::array_t<float> data) {
+                auto info = data.request();
+                if (info.ndim != 2 || info.shape[1] != 16)
+                    throw std::runtime_error("set_pbr_chunk: expected (N, 16) float32 array");
+                int n = (int)info.shape[0];
+                self.pbr.assign(static_cast<const float*>(info.ptr),
+                                static_cast<const float*>(info.ptr) + (size_t)n * 16);
+                br_set_pbr_chunk(self.st, self.pbr.data(), n);
+            },
+            py::arg("data"),
+            "Upload (N, 16) float32 PBR material records.")
+        .def("set_phong_chunk",
+            [](PyBaseRasterizer& self, py::array_t<float> data) {
+                auto info = data.request();
+                if (info.ndim != 2 || info.shape[1] != 8)
+                    throw std::runtime_error("set_phong_chunk: expected (N, 8) float32 array");
+                int n = (int)info.shape[0];
+                self.phong.assign(static_cast<const float*>(info.ptr),
+                                  static_cast<const float*>(info.ptr) + (size_t)n * 8);
+                br_set_phong_chunk(self.st, self.phong.data(), n);
+            },
+            py::arg("data"),
+            "Upload (N, 8) float32 Phong material records.")
+        .def("set_enamel_chunk",
+            [](PyBaseRasterizer& self, py::array_t<float> data) {
+                auto info = data.request();
+                if (info.ndim != 2 || info.shape[1] != 8)
+                    throw std::runtime_error("set_enamel_chunk: expected (N, 8) float32 array");
+                int n = (int)info.shape[0];
+                self.enamel.assign(static_cast<const float*>(info.ptr),
+                                   static_cast<const float*>(info.ptr) + (size_t)n * 8);
+                br_set_enamel_chunk(self.st, self.enamel.data(), n);
+            },
+            py::arg("data"),
+            "Upload (N, 8) float32 enamel material records.")
+        .def("set_scene",
+            [](PyBaseRasterizer& self,
+               py::array_t<float> light_v,
+               py::array_t<float> scene_rgb,
+               float scene_indirect) {
+                auto lv = light_v.request();
+                auto sr = scene_rgb.request();
+                if (lv.size < 3 || sr.size < 3)
+                    throw std::runtime_error("set_scene: light_v and scene_rgb must have 3 floats");
+                br_set_scene(self.st,
+                             static_cast<const float*>(lv.ptr),
+                             static_cast<const float*>(sr.ptr),
+                             scene_indirect);
+            },
+            py::arg("light_v"), py::arg("scene_rgb"),
+            py::arg("scene_indirect") = 0.2f,
+            "Set scene illumination (vec3 light dir in view space, vec3 tint, indirect ratio).")
+        .def("render",
+            [](PyBaseRasterizer& self,
+               py::array_t<float, py::array::c_style | py::array::forcecast> verts_view,
+               py::array_t<int,   py::array::c_style | py::array::forcecast> mat_ids,
+               py::array_t<float, py::array::c_style | py::array::forcecast> mvp) {
+                auto vv = verts_view.request();
+                auto mi = mat_ids.request();
+                auto mp = mvp.request();
+                if (vv.ndim != 2 || vv.shape[1] != 6)
+                    throw std::runtime_error("render: verts_view must be (n_tris*3, 6) float32");
+                if (mp.size != 16)
+                    throw std::runtime_error("render: mvp must have 16 float32 elements");
+                int n_tris = (int)mi.shape[0];
+                if (vv.shape[0] != (py::ssize_t)n_tris * 3)
+                    throw std::runtime_error("render: verts_view rows must equal n_tris*3");
+                br_render(self.st,
+                          static_cast<const float*>(vv.ptr),
+                          static_cast<const int*>(mi.ptr),
+                          n_tris,
+                          static_cast<const float*>(mp.ptr));
+            },
+            py::arg("verts_view"), py::arg("mat_ids"), py::arg("mvp"),
+            "Project, bin, and shade n_tris triangles into the framebuffer.")
+        .def("readback_u8",
+            [](PyBaseRasterizer& self) -> py::array_t<uint8_t> {
+                int w = br_width(self.st), h = br_height(self.st);
+                py::array_t<uint8_t> out({h, w, 4});
+                br_readback_u8(self.st, out.mutable_data());
+                return out;
+            },
+            "sRGB-corrected (H, W, 4) uint8 RGBA readback.")
+        .def("readback_f32",
+            [](PyBaseRasterizer& self) -> py::array_t<float> {
+                int w = br_width(self.st), h = br_height(self.st);
+                py::array_t<float> out({h, w, 4});
+                br_readback_f32(self.st, out.mutable_data());
+                return out;
+            },
+            "Linear (H, W, 4) float32 RGBA readback.")
+        .def_property_readonly("width",
+            [](PyBaseRasterizer& self){ return br_width(self.st); })
+        .def_property_readonly("height",
+            [](PyBaseRasterizer& self){ return br_height(self.st); });
 }

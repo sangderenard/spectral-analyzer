@@ -283,6 +283,7 @@ class GlobalChannelDispatcher:
 
         # Lazily-built C 3D global.
         self._c_raster = None                 # _spectral_kernels.BaseRasterizer
+        self._last_2d_c_rgba = None
 
         # Geometry packer for 3D-C: host-supplied callable
         #   packer(leftovers_3d) -> (verts_view (Nt*3,6) f32,
@@ -417,7 +418,11 @@ class GlobalChannelDispatcher:
         if not rdr:
             return None
         rdr.flush()
-        out = rdr.composite() if rdr.composite_dirty else None
+        if rdr.composite_dirty or self._last_2d_c_rgba is None:
+            out = rdr.composite()
+            self._last_2d_c_rgba = out
+        else:
+            out = self._last_2d_c_rgba
         # Run optional 2D features (capped by budget).  These touch the
         # SAME backend instance and only run on this worker thread, so
         # serial use is safe.

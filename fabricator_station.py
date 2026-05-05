@@ -64,6 +64,7 @@ from fabricator_programmatic_blueprints import (
     default_knob_values as _default_programmatic_knob_values,
     load_programmatic_blueprints,
 )
+from controls import KnobSpec, Panel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -741,6 +742,146 @@ class FabricatorStation:
         self._hud_visible = False
         self._last_win_w = 1280
         self._last_win_h = 720
+
+    @staticmethod
+    def _choice_index(value: Any, choices: list[str]) -> int:
+        try:
+            return choices.index(str(value))
+        except ValueError:
+            return 0
+
+    @staticmethod
+    def _programmatic_knob_to_knobspec(prefix: str, spec: ProgrammaticKnobSpec) -> KnobSpec:
+        dtype = "choice" if spec.dtype == "choice" else spec.dtype
+        choices = list(spec.choices or []) if dtype == "choice" else []
+        return KnobSpec(
+            f"{prefix}{spec.name}",
+            spec.label,
+            dtype,
+            spec.default,
+            float(spec.low or 0.0),
+            float(spec.high or 1.0),
+            float(spec.step or 0.0),
+            "",
+            choices,
+            False,
+            spec.group or "Parameters",
+            spec.fmt or ".3f",
+        )
+
+    @property
+    def panel_spec(self) -> Panel:
+        """Hierarchical document descriptor for the station controls."""
+        ws = self.workspace
+        process_tabs = ["milling", "drilling", "subtractive", "additive", "beveling", "assembling"]
+        mode_choices = [m.value for m in WorkspaceMode]
+        active_bp = self._selected_programmatic_blueprint()
+
+        panels = [
+            Panel(
+                "fabricator_library",
+                "Library",
+                knobs=[
+                    KnobSpec("library_tab", "Catalog tab", "choice", 0, 0, 1, 1, "", ["shapes", "blueprints"], False, "Library"),
+                    KnobSpec("selected_item", "Selected item", "str", "", 0, 0, 0, "", [], False, "Library"),
+                    KnobSpec("center_mode", "Center mode", "choice", 0, 0, 1, 1, "", ["workspace", "programmatic"], False, "Library"),
+                    KnobSpec("programmatic_blueprint", "Programmatic BP", "str", "", 0, 0, 0, "", [], False, "Library"),
+                ],
+            ),
+            Panel(
+                "fabricator_workspace",
+                "Workspace",
+                knobs=[
+                    KnobSpec("workspace_mode", "Mode", "choice", 0, 0, max(0, len(mode_choices) - 1), 1, "", mode_choices, False, "Workspace"),
+                    KnobSpec("process_tab", "Process", "choice", 0, 0, len(process_tabs) - 1, 1, "", process_tabs, False, "Workspace"),
+                    KnobSpec("picked_id", "Picked", "str", "", 0, 0, 0, "", [], False, "Workspace"),
+                    KnobSpec("hover_face", "Hover face", "int", -1, -1, 100000, 1, "", [], False, "Workspace", ".0f"),
+                    KnobSpec("operation_count", "Operations", "int", 0, 0, 100000, 1, "", [], False, "Workspace", ".0f"),
+                ],
+            ),
+            Panel(
+                "fabricator_snap_gimbal",
+                "Snap / Gimbal",
+                knobs=[
+                    KnobSpec("gimbal_pan_deg", "Pan", "float", 0.0, -360.0, 360.0, 0, "deg", [], False, "Gimbal", ".1f"),
+                    KnobSpec("gimbal_tilt_deg", "Tilt", "float", 0.0, -85.0, 85.0, 0, "deg", [], False, "Gimbal", ".1f"),
+                    KnobSpec("snap_enabled", "Snap", "bool", True, 0, 1, 1, "", [], False, "Snap"),
+                    KnobSpec("snap_angle_deg", "Snap angle", "float", 15.0, 1.0, 90.0, 0, "deg", [], False, "Snap", ".1f"),
+                    KnobSpec("snap_distance_m", "Snap dist", "float", 0.08, 0.001, 1.0, 0, "m", [], False, "Snap", ".3f"),
+                ],
+            ),
+            Panel(
+                "fabricator_symmetry",
+                "Symmetry",
+                knobs=[
+                    KnobSpec("symmetry_mode", "Mode", "choice", 0, 0, 2, 1, "", ["none", "bilateral", "radial"], False, "Symmetry"),
+                    KnobSpec("symmetry_axis", "Axis", "choice", 2, 0, 2, 1, "", ["x", "y", "z"], False, "Symmetry"),
+                    KnobSpec("symmetry_count", "Count", "int", 4, 2, 16, 1, "", [], False, "Symmetry", ".0f"),
+                ],
+            ),
+            Panel(
+                "fabricator_store",
+                "Store",
+                knobs=[
+                    KnobSpec("inventory_count", "Inventory", "int", 0, 0, 100000, 1, "", [], False, "Store", ".0f"),
+                    KnobSpec("last_export_path", "Last export", "str", "", 0, 0, 0, "", [], False, "Store"),
+                    KnobSpec("last_import_path", "Last import", "str", "", 0, 0, 0, "", [], False, "Store"),
+                ],
+            ),
+        ]
+
+        if active_bp is not None:
+            panels.append(Panel(
+                "fabricator_programmatic_params",
+                f"Programmatic: {active_bp.label}",
+                knobs=[
+                    self._programmatic_knob_to_knobspec("programmatic.", spec)
+                    for spec in active_bp.knobspec
+                ],
+            ))
+
+        return Panel("fabricator_station", "Fabricator", panels=panels)
+
+    @property
+    def knob_values(self) -> dict[str, Any]:
+        ws = self.workspace
+        process_tabs = ["milling", "drilling", "subtractive", "additive", "beveling", "assembling"]
+        mode_choices = [m.value for m in WorkspaceMode]
+        sym_modes = ["none", "bilateral", "radial"]
+        axes = ["x", "y", "z"]
+        active_bp = self._selected_programmatic_blueprint()
+        vals: dict[str, Any] = {
+            "library_tab": 1 if self._left_panel.tab == "blueprints" else 0,
+            "selected_item": self._left_panel.selected or "",
+            "center_mode": 1 if self._center_mode == "programmatic" else 0,
+            "programmatic_blueprint": self._prog_selected_id,
+            "workspace_mode": self._choice_index(getattr(ws.mode, "value", ws.mode), mode_choices),
+            "process_tab": self._choice_index(ws.process_tab, process_tabs),
+            "picked_id": ws.picked_id or "",
+            "hover_face": int(ws.hover_face),
+            "operation_count": len(ws.operations),
+            "gimbal_pan_deg": float(ws.gimbal[0]),
+            "gimbal_tilt_deg": float(ws.gimbal[1]),
+            "snap_enabled": bool(ws.snap_enabled),
+            "snap_angle_deg": float(ws.snap_angle_deg),
+            "snap_distance_m": float(ws.snap_distance_m),
+            "symmetry_mode": self._choice_index(ws.symmetry.mode, sym_modes),
+            "symmetry_axis": self._choice_index(ws.symmetry.axis, axes),
+            "symmetry_count": int(ws.symmetry.count),
+            "inventory_count": len(ws.inventory),
+            "last_export_path": ws.last_export_path,
+            "last_import_path": ws.last_import_path,
+        }
+        if active_bp is not None:
+            bp_vals = self._prog_values_by_id.setdefault(active_bp.id, _default_programmatic_knob_values(active_bp))
+            for spec in active_bp.knobspec:
+                key = f"programmatic.{spec.name}"
+                value = bp_vals.get(spec.name, spec.default)
+                if spec.dtype == "choice":
+                    vals[key] = self._choice_index(value, list(spec.choices or []))
+                else:
+                    vals[key] = value
+        return vals
 
     @classmethod
     def from_yaml(cls, ws_path: str, palette_path: str) -> "FabricatorStation":

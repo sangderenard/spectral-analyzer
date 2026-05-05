@@ -1,0 +1,25 @@
+# Material: fiber_mesh
+# Reclaimed/cultured reinforcement mesh.
+
+name: fiber_mesh
+description: Woven reinforcement from reclaimed strands and cultured cellulose.
+
+albedo_rgb: [0.58, 0.56, 0.50]
+reflectivity: 0.20
+diffusion: 0.82
+absorption: 0.06
+smoothness: 0.24
+ior: 1.46
+opacity: 1.0
+
+gameplay:
+  label: Fiber Mesh
+  category: structural_feedstock
+  tier: common
+  role: primitive_feedstock
+  acquisition_tags: [salvage, cultivate, repair_loop]
+  stewardship_note: Rewards repair and reuse of torn cloth, packaging, and plant fiber.
+
+notes: >
+  Structural gameplay feedstock. Values are cloth-like: mostly diffuse with low
+  specular response.

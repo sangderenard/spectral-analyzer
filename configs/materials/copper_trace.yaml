@@ -1,0 +1,25 @@
+# Material: copper_trace
+# Recovered conductive routing ribbon.
+
+name: copper_trace
+description: Fine conductive ribbon used for low-power circuit routing.
+
+albedo_rgb: [0.78, 0.42, 0.22]
+reflectivity: 0.58
+diffusion: 0.22
+absorption: 0.03
+smoothness: 0.72
+ior: 0.65
+opacity: 1.0
+
+gameplay:
+  label: Copper Trace
+  category: conductor_feedstock
+  tier: uncommon
+  role: primitive_feedstock
+  acquisition_tags: [e_waste_recovery, repair_loop, exchange]
+  stewardship_note: Recovered from dead devices and trimmed circuit offcuts.
+
+notes: >
+  Conductive gameplay feedstock. Uses warm albedo and higher reflectivity so
+  trace piles read as metal without requiring a full conductor model.

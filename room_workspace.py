@@ -301,12 +301,12 @@ class RoomWorkspace:
                 "unfinished": bool(obj.station_type in ("room_control", "fabricator")),
                 "job_order_id": f"job::{obj.obj_id}",
                 "required_materials": {
-                    "grey_block": int(req_grey),
-                    "screen_block": int(req_screen),
+                    "basic_paneling": int(req_grey),
+                    "basic_led_display": int(req_screen),
                 },
                 "delivered_materials": {
-                    "grey_block": 0,
-                    "screen_block": 0,
+                    "basic_paneling": 0,
+                    "basic_led_display": 0,
                 },
             }
             state = dict(default_state)

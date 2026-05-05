@@ -1,0 +1,75 @@
+version: 1
+principles:
+  - Materials come from care loops: cleanup, repair, cultivation, exchange, and station byproducts.
+  - Living environments should become healthier after gathering, not visibly depleted.
+  - Scarcity should come from logistics, refinement, knowledge, and cooperation instead of destruction.
+
+activities:
+  sweep:
+    label: Sweep and Sort
+    loop: Clean dusty work areas and sort useful residue.
+    yields: [raw_regolith, silica_sand]
+    feel: The room gets cleaner as the player gathers.
+
+  filter_recovery:
+    label: Filter Recovery
+    loop: Empty air and water filters into sorted feedstock bins.
+    yields: [raw_regolith]
+    feel: Maintenance produces useful material.
+
+  compost_refine:
+    label: Compost Refining
+    loop: Convert food scraps and plant trimmings into binders and finishes.
+    yields: [binder_resin, surface_coat]
+    feel: Waste becomes station care.
+
+  cultivate:
+    label: Grow Tray
+    loop: Tend small renewable trays for resin, cellulose, and biopolymer precursors.
+    yields: [binder_resin, fiber_mesh, polymer_film]
+    feel: Patient cultivation replaces strip extraction.
+
+  packaging_recovery:
+    label: Packaging Recovery
+    loop: Break down clean packaging loops into reusable films.
+    yields: [polymer_film]
+    feel: Tidying supply chains feeds crafting.
+
+  glass_recovery:
+    label: Glass Recovery
+    loop: Crush and sort broken lenses, bottles, and panels.
+    yields: [silica_sand]
+    feel: Accidents and scrap become substrate.
+
+  e_waste_recovery:
+    label: Electronics Recovery
+    loop: Disassemble failed modules into conductors and reusable chips.
+    yields: [copper_trace, control_chip]
+    feel: Repair skill beats raw extraction.
+
+  lamp_recovery:
+    label: Lamp Recovery
+    loop: Recover emitters from spent lamps and failed display tiles.
+    yields: [emitter_dust]
+    feel: Old light sources seed new displays.
+
+  lab_culture:
+    label: Lab Culture
+    loop: Grow small batches of emitter material with time and clean substrate.
+    yields: [emitter_dust]
+    feel: High-tech materials come from care and process.
+
+  exchange:
+    label: Neighbor Exchange
+    loop: Trade surplus cleanup and repair outputs with nearby stations.
+    yields:
+      - raw_regolith
+      - binder_resin
+      - fiber_mesh
+      - surface_coat
+      - silica_sand
+      - copper_trace
+      - emitter_dust
+      - polymer_film
+      - control_chip
+    feel: Social logistics creates variety without depletion.

@@ -295,6 +295,8 @@ static Vector3f shade(
 struct ProjVertex {
     float sx, sy;   // screen-space x, y (pixel coordinates)
     float inv_w;    // 1 / clip_w  (for perspective-correct interp)
+    float ndc_z;    // clip-space z / w, OpenGL convention [-1, +1]
+    bool  valid;    // finite and in front of the eye plane
     Vector3f pos_v; // view-space position
     Vector3f nrm_v; // view-space normal
 };
@@ -316,7 +318,7 @@ struct BaseRasterizerState {
 
     // Framebuffer: linear float RGBA
     std::vector<float> cbuf;  // width * height * 4
-    std::vector<float> zbuf;  // width * height (depth, larger = farther)
+    std::vector<float> zbuf;  // width * height (NDC depth, smaller = closer)
 
     // Material chunk pointers (owned by the caller — no copy)
     const float* pbr_data    = nullptr;
@@ -388,6 +390,8 @@ void br_set_scene(BaseRasterizerState* st,
 
 /* ── Project helpers ─────────────────────────────────────────────────────── */
 
+extern "C++" {
+
 static ProjVertex project_vertex(
     const float* vv,        /* view-space [x,y,z,nx,ny,nz] */
     const Matrix4f& proj,   /* projection-only matrix (clip = proj * view) */
@@ -397,21 +401,38 @@ static ProjVertex project_vertex(
     // View-space position and normal
     pv.pos_v = Vector3f(vv[0], vv[1], vv[2]);
     pv.nrm_v = Vector3f(vv[3], vv[4], vv[5]);
+    pv.inv_w = 0.0f;
+    pv.ndc_z = 1.0f;
+    pv.valid = false;
 
     // Project: clip = proj * view_pos (w=1 for affine input)
     Vector4f clip = proj * Vector4f(vv[0], vv[1], vv[2], 1.0f);
 
-    if (clip.w() <= 1e-6f) { pv.inv_w = 0.0f; pv.sx = pv.sy = -1e9f; return pv; }
+    if (!std::isfinite(clip.x()) || !std::isfinite(clip.y()) ||
+        !std::isfinite(clip.z()) || !std::isfinite(clip.w()) ||
+        clip.w() <= 1e-6f) {
+        pv.sx = pv.sy = -1e9f;
+        return pv;
+    }
     float inv_w = 1.0f / clip.w();
     float ndcx  = clip.x() * inv_w;
     float ndcy  = clip.y() * inv_w;
+    float ndcz  = clip.z() * inv_w;
+    if (!std::isfinite(ndcx) || !std::isfinite(ndcy) || !std::isfinite(ndcz)) {
+        pv.sx = pv.sy = -1e9f;
+        return pv;
+    }
 
     // NDC → screen pixels (y flipped: NDC +1 = top row)
     pv.sx    = (ndcx + 1.0f) * half_w;
     pv.sy    = (1.0f - ndcy) * half_h;   // flip Y
     pv.inv_w = inv_w;
+    pv.ndc_z = ndcz;
+    pv.valid = true;
     return pv;
 }
+
+} // extern "C++"
 
 /* ── Render ──────────────────────────────────────────────────────────────── */
 
@@ -445,6 +466,22 @@ void br_render(BaseRasterizerState* st,
         st_tri.v[1] = project_vertex(base +  6, proj, half_w, half_h);
         st_tri.v[2] = project_vertex(base + 12, proj, half_w, half_h);
         st_tri.mat_id = mat_ids[i];
+
+        if (!st_tri.v[0].valid || !st_tri.v[1].valid || !st_tri.v[2].valid) {
+            st_tri.valid = false;
+            continue;
+        }
+
+        // Cheap homogeneous frustum reject after projection.  This rasterizer
+        // does not clip triangles against the near/far planes yet, so reject
+        // triangles that would require clipping; otherwise one vertex near
+        // w=0 can stretch a primitive across the whole frame.
+        float min_z = std::min({st_tri.v[0].ndc_z, st_tri.v[1].ndc_z, st_tri.v[2].ndc_z});
+        float max_z = std::max({st_tri.v[0].ndc_z, st_tri.v[1].ndc_z, st_tri.v[2].ndc_z});
+        if (min_z < -1.0f || max_z > 1.0f) {
+            st_tri.valid = false;
+            continue;
+        }
 
         // Back-face cull in screen space
         float ex0 = st_tri.v[1].sx - st_tri.v[0].sx;
@@ -556,12 +593,17 @@ void br_render(BaseRasterizerState* st,
                                  + lam2 * tri.v[2].inv_w;
                         float w  = (iw > 1e-8f) ? 1.0f / iw : 1.0f;
 
-                        // NDC depth as Z test proxy
-                        // Use clip-space z/w ≈ inv_w for a monotone depth estimate
-                        float depth = iw;  // larger iw = closer = smaller NDC z
+                        // Window depth is linearly interpolated after
+                        // perspective division.  OpenGL convention: -1 is
+                        // the near plane and +1 is the far plane.
+                        float depth = lam0 * tri.v[0].ndc_z
+                                    + lam1 * tri.v[1].ndc_z
+                                    + lam2 * tri.v[2].ndc_z;
+                        if (!std::isfinite(depth)) continue;
 
                         int idx = py * W + px;
-                        if (depth < zbuf[idx]) continue;  // depth test (larger = closer)
+                        if (depth < -1.0f || depth > 1.0f) continue;
+                        if (depth >= zbuf[idx]) continue;  // depth test (smaller = closer)
                         zbuf[idx] = depth;
 
                         // Interpolate view-space position and normal

@@ -1,0 +1,25 @@
+# Material: control_chip
+# Reusable low-power display logic component.
+
+name: control_chip
+description: Simple reusable driver logic for displays and smart panels.
+
+albedo_rgb: [0.05, 0.07, 0.06]
+reflectivity: 0.30
+diffusion: 0.28
+absorption: 0.16
+smoothness: 0.58
+ior: 1.52
+opacity: 1.0
+
+gameplay:
+  label: Control Chip
+  category: logic_component
+  tier: uncommon
+  role: primitive_feedstock
+  acquisition_tags: [repair_loop, e_waste_recovery, exchange]
+  stewardship_note: Reused intact whenever possible; broken boards become recovery tasks.
+
+notes: >
+  Electronics gameplay component. Dark green-black albedo keeps it distinct
+  from copper_trace while still rendering as a small manufactured part.

@@ -1,0 +1,30 @@
+version: 1
+recipes:
+  basic_paneling:
+    label: Basic Paneling
+    output:
+      material: basic_paneling
+      quantity: 1
+    seconds: 3.0
+    workbench: personal_synth
+    inputs:
+      raw_regolith: 3
+      binder_resin: 1
+      fiber_mesh: 1
+      surface_coat: 1
+    tutorial_role: starter_station_shell
+
+  basic_led_display:
+    label: Basic LED Display
+    output:
+      material: basic_led_display
+      quantity: 1
+    seconds: 6.0
+    workbench: personal_synth
+    inputs:
+      silica_sand: 2
+      copper_trace: 1
+      emitter_dust: 1
+      polymer_film: 1
+      control_chip: 1
+    tutorial_role: starter_station_screen

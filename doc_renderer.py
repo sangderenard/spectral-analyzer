@@ -55,14 +55,14 @@ try:
         glGenVertexArrays, glBindVertexArray,
         glGetUniformLocation, glUniform1i, glUniform1f,
         glEnable, glDisable, glBlendFuncSeparate,
-        glBlendEquation, glDrawArrays,
+        glBlendEquation, glDrawArrays, glDepthMask, glIsEnabled, glGetBooleanv,
         GL_TEXTURE_2D, GL_RGBA, GL_RGBA8, GL_UNSIGNED_BYTE,
         GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER, GL_LINEAR,
         GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE,
         GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
         GL_COMPILE_STATUS, GL_LINK_STATUS,
         GL_BLEND, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
-        GL_FUNC_ADD, GL_TRIANGLES,
+        GL_FUNC_ADD, GL_TRIANGLES, GL_DEPTH_TEST, GL_DEPTH_WRITEMASK,
     )
     _GL_OK = True
 except ImportError:
@@ -148,6 +148,23 @@ class DocRenderer:
 
         self._next_id = 1
 
+    @staticmethod
+    def _begin_overlay_blit() -> tuple[bool, bool]:
+        depth_was_enabled = bool(glIsEnabled(GL_DEPTH_TEST))
+        depth_write_was_enabled = bool(glGetBooleanv(GL_DEPTH_WRITEMASK))
+        glDisable(GL_DEPTH_TEST)
+        glDepthMask(False)
+        return depth_was_enabled, depth_write_was_enabled
+
+    @staticmethod
+    def _end_overlay_blit(state: tuple[bool, bool]) -> None:
+        depth_was_enabled, depth_write_was_enabled = state
+        glDepthMask(bool(depth_write_was_enabled))
+        if depth_was_enabled:
+            glEnable(GL_DEPTH_TEST)
+        else:
+            glDisable(GL_DEPTH_TEST)
+
     # -- ID allocation --------------------------------------------------------
 
     def _alloc_id(self) -> int:
@@ -203,7 +220,9 @@ class DocRenderer:
                    font_scale: float = 1.0,
                    value_norm: float = 0.0,
                    icon_id: int = -1,
-                   border_px: int = 1) -> None:
+                   border_px: int = 1,
+                   parent_id: int = 0,
+                   sibling_order: int = -1) -> None:
         self._backend.submit_node(
             node_id,
             rect[0], rect[1], rect[2], rect[3],
@@ -219,11 +238,15 @@ class DocRenderer:
             value_norm,
             icon_id,
             border_px,
+            int(parent_id),
+            int(sibling_order),
         )
 
     def submit_knobspec(self, knob: Any, rect: tuple,
                         current_value: Any = None,
-                        node_id: int | None = None) -> int:
+                        node_id: int | None = None,
+                        parent_id: int = 0,
+                        sibling_order: int = -1) -> int:
         if node_id is None:
             node_id = self._alloc_id()
 
@@ -263,12 +286,16 @@ class DocRenderer:
 
         self.submit_raw(node_id, rect, ntype,
                         label=label, value_str=val_str,
-                        value_norm=_knob_value_norm(knob, current_value))
+                        value_norm=_knob_value_norm(knob, current_value),
+                        parent_id=parent_id,
+                        sibling_order=sibling_order)
         return node_id
 
     def submit_panel(self, panel: Any, rect: tuple,
                      node_id_map: dict | None = None,
-                     knob_values: dict | None = None) -> dict:
+                     knob_values: dict | None = None,
+                     parent_id: int = 0,
+                     sibling_order: int = -1) -> dict:
         if node_id_map is None:
             node_id_map = {}
         if knob_values is None:
@@ -279,8 +306,11 @@ class DocRenderer:
         body_key = f"__body__{panel.name}"
         if body_key not in node_id_map:
             node_id_map[body_key] = self._alloc_id()
+        body_id = node_id_map[body_key]
         self.submit_raw(node_id_map[body_key], (x, y, w, h),
-                        DR_NODE_PANEL_BODY, bg=_THEME["bg"], border_px=1)
+                        DR_NODE_PANEL_BODY, bg=_THEME["bg"], border_px=1,
+                        parent_id=parent_id,
+                        sibling_order=sibling_order)
 
         HDR_H   = 20
         hdr_key = f"__hdr__{panel.name}"
@@ -289,13 +319,15 @@ class DocRenderer:
         lbl = getattr(panel, "label", None) or panel.name
         self.submit_raw(node_id_map[hdr_key], (x, y, w, HDR_H),
                         DR_NODE_PANEL_HEADER, label=lbl,
-                        bg=_THEME["header_bg"], border_px=0)
+                        bg=_THEME["header_bg"], border_px=0,
+                        parent_id=body_id,
+                        sibling_order=0)
 
         cursor_y = y + HDR_H + 2
         KNOB_H   = 40
         PAD      = 2
 
-        for knob in (getattr(panel, "knobs", []) or []):
+        for knob_i, knob in enumerate(getattr(panel, "knobs", []) or []):
             kname = getattr(knob, "name", str(id(knob)))
             if kname not in node_id_map:
                 node_id_map[kname] = self._alloc_id()
@@ -304,13 +336,17 @@ class DocRenderer:
                 (x + PAD, cursor_y, w - PAD * 2, KNOB_H),
                 current_value=knob_values.get(kname),
                 node_id=node_id_map[kname],
+                parent_id=body_id,
+                sibling_order=10 + knob_i,
             )
             cursor_y += KNOB_H + PAD
 
-        for sub in (getattr(panel, "panels", []) or []):
+        for sub_i, sub in enumerate(getattr(panel, "panels", []) or []):
             sub_h    = max(60, h - (cursor_y - y) - PAD)
             sub_rect = (x + PAD, cursor_y, w - PAD * 2, sub_h)
-            self.submit_panel(sub, sub_rect, node_id_map, knob_values)
+            self.submit_panel(sub, sub_rect, node_id_map, knob_values,
+                              parent_id=body_id,
+                              sibling_order=100 + sub_i)
             cursor_y += sub_h + PAD
 
         return node_id_map
@@ -395,23 +431,27 @@ class DocRenderer:
             )
             glBindTexture(GL_TEXTURE_2D, 0)
 
-        glEnable(GL_BLEND)
-        glBlendEquation(GL_FUNC_ADD)
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                            GL_ONE,       GL_ONE_MINUS_SRC_ALPHA)
+        _depth_state = self._begin_overlay_blit()
+        try:
+            glEnable(GL_BLEND)
+            glBlendEquation(GL_FUNC_ADD)
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                GL_ONE,       GL_ONE_MINUS_SRC_ALPHA)
 
-        glUseProgram(self._prog)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, self._tex_id)
-        glUniform1i(self._u_atlas, 0)
-        glUniform1f(self._u_alpha, 1.0)
+            glUseProgram(self._prog)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, self._tex_id)
+            glUniform1i(self._u_atlas, 0)
+            glUniform1f(self._u_alpha, 1.0)
 
-        glBindVertexArray(self._vao)
-        glDrawArrays(GL_TRIANGLES, 0, 3)
-        glBindVertexArray(0)
+            glBindVertexArray(self._vao)
+            glDrawArrays(GL_TRIANGLES, 0, 3)
+            glBindVertexArray(0)
 
-        glUseProgram(0)
-        glDisable(GL_BLEND)
+            glUseProgram(0)
+            glDisable(GL_BLEND)
+        finally:
+            self._end_overlay_blit(_depth_state)
 
     # -- External RGBA blit (used by the global dispatcher) -------------------
 
@@ -447,23 +487,27 @@ class DocRenderer:
             self._height = h
         glBindTexture(GL_TEXTURE_2D, 0)
 
-        glEnable(GL_BLEND)
-        glBlendEquation(GL_FUNC_ADD)
-        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-                            GL_ONE,       GL_ONE_MINUS_SRC_ALPHA)
+        _depth_state = self._begin_overlay_blit()
+        try:
+            glEnable(GL_BLEND)
+            glBlendEquation(GL_FUNC_ADD)
+            glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+                                GL_ONE,       GL_ONE_MINUS_SRC_ALPHA)
 
-        glUseProgram(self._prog)
-        GL.glActiveTexture(GL.GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D, self._tex_id)
-        glUniform1i(self._u_atlas, 0)
-        glUniform1f(self._u_alpha, float(alpha))
+            glUseProgram(self._prog)
+            GL.glActiveTexture(GL.GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D, self._tex_id)
+            glUniform1i(self._u_atlas, 0)
+            glUniform1f(self._u_alpha, float(alpha))
 
-        glBindVertexArray(self._vao)
-        glDrawArrays(GL_TRIANGLES, 0, 3)
-        glBindVertexArray(0)
+            glBindVertexArray(self._vao)
+            glDrawArrays(GL_TRIANGLES, 0, 3)
+            glBindVertexArray(0)
 
-        glUseProgram(0)
-        glDisable(GL_BLEND)
+            glUseProgram(0)
+            glDisable(GL_BLEND)
+        finally:
+            self._end_overlay_blit(_depth_state)
 
     # -- ShaderFrameWalker registration ---------------------------------------
 

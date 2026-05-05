@@ -1,0 +1,25 @@
+# Material: polymer_film
+# Clear flexible encapsulation film.
+
+name: polymer_film
+description: Clear flexible encapsulation film for displays and seals.
+
+albedo_rgb: [0.68, 0.76, 0.78]
+reflectivity: 0.32
+diffusion: 0.24
+absorption: 0.02
+smoothness: 0.70
+ior: 1.49
+opacity: 0.82
+
+gameplay:
+  label: Polymer Film
+  category: polymer_feedstock
+  tier: common
+  role: primitive_feedstock
+  acquisition_tags: [packaging_recovery, cultivate, exchange]
+  stewardship_note: Recovered from packaging loops or made from renewable feedstock.
+
+notes: >
+  Thin-film gameplay feedstock. Opacity is kept mostly opaque for inventory pile
+  readability; finished transparent optics should use acrylic_pmma or glass materials.

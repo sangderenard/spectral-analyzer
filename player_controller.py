@@ -47,11 +47,18 @@ Usage
 from __future__ import annotations
 
 import math
+import os
+import time
 from enum import Enum
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import pygame
+
+try:
+    import yaml as _yaml
+except Exception:
+    _yaml = None
 
 try:
     from ray_tracer_bridge import trace_cone_rays as _trace_focus_cone_rays
@@ -62,6 +69,74 @@ except Exception:
 
 if TYPE_CHECKING:
     pass   # avoid circular imports; Camera is passed by value
+
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_yaml(path: str) -> dict:
+    if _yaml is None:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return _yaml.safe_load(handle) or {}
+    except Exception:
+        return {}
+
+
+def _default_synthesis_recipes() -> dict:
+    return {
+        "basic_paneling": {
+            "label": "Basic Paneling",
+            "seconds": 3.0,
+            "output": {"material": "basic_paneling", "quantity": 1},
+            "inputs": {
+                "raw_regolith": 3,
+                "binder_resin": 1,
+                "fiber_mesh": 1,
+                "surface_coat": 1,
+            },
+        },
+        "basic_led_display": {
+            "label": "Basic LED Display",
+            "seconds": 6.0,
+            "output": {"material": "basic_led_display", "quantity": 1},
+            "inputs": {
+                "silica_sand": 2,
+                "copper_trace": 1,
+                "emitter_dust": 1,
+                "polymer_film": 1,
+                "control_chip": 1,
+            },
+        },
+    }
+
+
+def _load_synthesis_recipes() -> dict:
+    data = _load_yaml(os.path.join(_HERE, "configs", "crafting", "recipes.yaml"))
+    recipes = data.get("recipes", {}) if isinstance(data, dict) else {}
+    if not isinstance(recipes, dict) or not recipes:
+        return _default_synthesis_recipes()
+    out = {}
+    for key, raw in recipes.items():
+        if not isinstance(raw, dict):
+            continue
+        output = dict(raw.get("output", {}) or {})
+        material = str(output.get("material", key))
+        qty = max(1, int(output.get("quantity", 1)))
+        inputs = {
+            str(k): max(0, int(v))
+            for k, v in dict(raw.get("inputs", {}) or {}).items()
+            if int(v) > 0
+        }
+        out[str(key)] = {
+            "label": str(raw.get("label", material)),
+            "seconds": max(0.1, float(raw.get("seconds", 1.0))),
+            "output": {"material": material, "quantity": qty},
+            "inputs": inputs,
+            "workbench": str(raw.get("workbench", "personal_synth")),
+        }
+    return out or _default_synthesis_recipes()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -148,6 +223,8 @@ class PlayerController:
         self._focus_ray_engine = str(i.get("focus_ray_engine", "bridge")).strip().lower() or "bridge"
         self._focus_cone_angle_deg = float(i.get("focus_cone_angle_deg", 0.0))
         self._focus_cone_rays = max(1, int(i.get("focus_cone_rays", 1)))
+        self._synthesis_recipes = _load_synthesis_recipes()
+        self._synthesis_job: dict | None = None
 
         # Camera-operate mode config
         c = config.get("camera_operate", {})
@@ -199,6 +276,97 @@ class PlayerController:
     @property
     def backpack(self) -> dict:
         return dict(self._backpack)
+
+    @property
+    def synthesis_recipes(self) -> dict:
+        return {k: dict(v) for k, v in self._synthesis_recipes.items()}
+
+    def recipe_availability(self, recipe_key: str) -> dict:
+        key = str(recipe_key)
+        recipe = self._synthesis_recipes.get(key)
+        if recipe is None:
+            return {"known": False, "craftable": False, "needs": []}
+        needs = []
+        craftable = True
+        for mat, qty in dict(recipe.get("inputs", {}) or {}).items():
+            need = max(0, int(qty))
+            have = max(0, int(self._backpack.get(mat, 0)))
+            ok = have >= need
+            craftable = craftable and ok
+            needs.append({
+                "material": str(mat),
+                "need": need,
+                "have": have,
+                "missing": max(0, need - have),
+                "ok": ok,
+            })
+        return {
+            "known": True,
+            "craftable": craftable,
+            "needs": needs,
+        }
+
+    def synthesis_status(self) -> dict:
+        job = self._synthesis_job
+        if not isinstance(job, dict):
+            return {"active": False}
+        now = time.perf_counter()
+        start = float(job.get("start_s", now))
+        end = float(job.get("end_s", now))
+        total = max(1e-6, end - start)
+        remaining = max(0.0, end - now)
+        return {
+            "active": True,
+            "material": str(job.get("material", "")),
+            "label": str(job.get("label", job.get("material", ""))),
+            "reserved": dict(job.get("reserved", {}) or {}),
+            "progress": float(max(0.0, min(1.0, (now - start) / total))),
+            "remaining_s": remaining,
+            "duration_s": total,
+        }
+
+    def begin_synthesis(self, material_key: str) -> bool:
+        key = str(material_key)
+        if self._synthesis_job is not None:
+            return False
+        recipe = self._synthesis_recipes.get(key)
+        if recipe is None:
+            return False
+        availability = self.recipe_availability(key)
+        if not bool(availability.get("craftable", False)):
+            return False
+        now = time.perf_counter()
+        delay = max(0.1, float(recipe.get("seconds", 1.0)))
+        reserved = {}
+        for mat, qty in dict(recipe.get("inputs", {}) or {}).items():
+            take = max(0, int(qty))
+            if take <= 0:
+                continue
+            self._backpack[mat] = int(self._backpack.get(mat, 0)) - take
+            reserved[str(mat)] = take
+        output = dict(recipe.get("output", {}) or {})
+        self._synthesis_job = {
+            "recipe": key,
+            "material": str(output.get("material", key)),
+            "label": str(recipe.get("label", key)),
+            "quantity": max(1, int(output.get("quantity", 1))),
+            "reserved": reserved,
+            "start_s": now,
+            "end_s": now + delay,
+        }
+        return True
+
+    def cancel_synthesis(self) -> bool:
+        job = self._synthesis_job
+        if not isinstance(job, dict):
+            return False
+        for mat, qty in dict(job.get("reserved", {}) or {}).items():
+            self._backpack[str(mat)] = int(self._backpack.get(str(mat), 0)) + max(0, int(qty))
+        self._synthesis_job = None
+        return True
+
+    def update_synthesis(self) -> None:
+        self._tick_synthesis()
 
     @property
     def focus_ray_engine(self) -> str:
@@ -399,18 +567,15 @@ class PlayerController:
             if ev.key == self._to_orbit_key:
                 self._enter_orbit()
                 return True
-            if ev.key == pygame.K_g:
-                self._backpack["grey_block"] = int(self._backpack.get("grey_block", 0) + 1)
-                return True
-            if ev.key == pygame.K_h:
-                self._backpack["screen_block"] = int(self._backpack.get("screen_block", 0) + 1)
-                return True
             if ev.key == self._trigger_key:
                 hit = self._center_view_interactable(duty_stations, cameras)
                 if hit is not None:
                     if hit in cameras:
                         self._enter_camera(hit)
                     else:
+                        if hasattr(hit, "try_pickup_material"):
+                            self._try_pickup_material(hit)
+                            return True
                         if bool(getattr(hit, "is_unfinished", False)):
                             self._try_deliver_to_station(hit)
                         if bool(getattr(hit, "is_unfinished", False)):
@@ -424,6 +589,9 @@ class PlayerController:
                     return True
                 near = self._nearest_station(duty_stations)
                 if near is not None:
+                    if hasattr(near, "try_pickup_material"):
+                        self._try_pickup_material(near)
+                        return True
                     if bool(getattr(near, "is_unfinished", False)):
                         self._try_deliver_to_station(near)
                         if bool(getattr(near, "is_unfinished", False)):
@@ -443,6 +611,14 @@ class PlayerController:
         if ev.type == pygame.MOUSEWHEEL:
             return True
         return False
+
+    def _try_pickup_material(self, pile) -> None:
+        if pile is None or not hasattr(pile, "try_pickup_material"):
+            return
+        try:
+            pile.try_pickup_material(self._backpack, actor_id="player")
+        except Exception:
+            return
 
     def _try_deliver_to_station(self, station) -> None:
         if station is None or not hasattr(station, "try_deliver_materials"):
@@ -492,6 +668,7 @@ class PlayerController:
     def tick(self, dt: float, keys,
              duty_stations: list,
              cameras: Optional[list] = None):
+        self.update_synthesis()
         if self.state == PlayerState.ORBIT:
             self._tick_orbit(dt, keys)
         elif self.state == PlayerState.WALK:
@@ -503,6 +680,18 @@ class PlayerController:
 
     def _tick_orbit(self, dt: float, keys):
         pass   # auto-rotate handled by Camera.tick() in the main loop
+
+    def _tick_synthesis(self) -> None:
+        job = self._synthesis_job
+        if not isinstance(job, dict):
+            return
+        if time.perf_counter() < float(job.get("end_s", 0.0)):
+            return
+        material = str(job.get("material", ""))
+        qty = max(1, int(job.get("quantity", 1)))
+        if material:
+            self._backpack[material] = int(self._backpack.get(material, 0)) + qty
+        self._synthesis_job = None
 
     def _tick_walk(self, dt: float, keys, duty_stations: list,
                    cameras: list):

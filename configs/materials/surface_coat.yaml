@@ -1,0 +1,25 @@
+# Material: surface_coat
+# Protective finish feedstock.
+
+name: surface_coat
+description: Protective finish that seals panels against grime and abrasion.
+
+albedo_rgb: [0.72, 0.70, 0.62]
+reflectivity: 0.42
+diffusion: 0.38
+absorption: 0.04
+smoothness: 0.64
+ior: 1.50
+opacity: 1.0
+
+gameplay:
+  label: Surface Coat
+  category: finish_feedstock
+  tier: common
+  role: primitive_feedstock
+  acquisition_tags: [compost_refine, exchange, station_byproduct]
+  stewardship_note: Produced from benign waxes and recovered finish overspray.
+
+notes: >
+  A game feedstock for finishes. The material is smoother than panel stock but
+  not glassy; use as a visible reagent or inventory item, not as a final clear coat.

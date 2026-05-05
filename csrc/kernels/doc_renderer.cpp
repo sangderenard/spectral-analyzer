@@ -9,7 +9,7 @@
  *     filter").
  *   - Worker renders tiles into per-node RGBA8 buffers.
  *   - dr_composite() alpha-blends all live tiles into the output buffer using
- *     the painter's algorithm (submission order).
+ *     hierarchical painter order (ancestor chain + sibling order).
  *   - Glyph atlas and primitive atlas are plain RGBA8 sheets loaded at
  *     runtime by the Python wrapper.
  */
@@ -28,6 +28,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 /* ── Helpers ─────────────────────────────────────────────────────────────── */
@@ -57,7 +58,8 @@ struct DocNode {
     DocNodePayload   payload     = {};
     uint64_t         payload_hash = 0;     /* hash of last-rendered payload */
     std::vector<uint8_t> tile;             /* RGBA8, rect.w × rect.h × 4    */
-    uint32_t         submit_order = 0;     /* for painter's algorithm        */
+    uint64_t         parent_id    = 0;     /* 0 = root-level node            */
+    int              sibling_order = -1;   /* order inside parent; <0 = 0    */
     bool             rendered    = false;
     bool             dirty       = false;
 };
@@ -66,6 +68,8 @@ struct DocNode {
 
 struct DocWorkItem {
     uint64_t       node_id;
+    uint64_t       parent_id;
+    int            sibling_order;
     uint64_t       expected_hash; /* hash at submission time; stale = skip  */
     DocNodeRect    rect;
     DocNodePayload payload;
@@ -129,7 +133,7 @@ struct DocRendererState {
 
     /* Node map: id → DocNode  (access under nodes_mtx) */
     std::unordered_map<uint64_t, DocNode> nodes;
-    std::vector<uint64_t> order;   /* submission order for compositing       */
+    std::vector<uint64_t> order;   /* live node ids for compositing          */
     std::mutex nodes_mtx;
 
     /* Atlases (access under atlas_mtx) */
@@ -148,9 +152,6 @@ struct DocRendererState {
 
     /* Worker thread */
     std::thread worker;
-
-    /* Global submission counter */
-    std::atomic<uint32_t> submit_counter{0};
 
     DocRendererState(int w, int h) : width(w), height(h) {
         worker = std::thread([this]{ _worker_loop(); });
@@ -422,6 +423,8 @@ struct DocRendererState {
                 /* Copy payload into node and render */
                 node.rect    = item.rect;
                 node.payload = item.payload;
+                node.parent_id = item.parent_id;
+                node.sibling_order = item.sibling_order;
                 node.dirty   = false;
 
                 _render_tile(node);
@@ -474,6 +477,15 @@ void dr_submit_node(DocRendererState* st,
                     uint64_t          node_id,
                     DocNodeRect       rect,
                     const DocNodePayload* payload) {
+    dr_submit_node_ex(st, node_id, 0, -1, rect, payload);
+}
+
+void dr_submit_node_ex(DocRendererState* st,
+                       uint64_t          node_id,
+                       uint64_t          parent_id,
+                       int               sibling_order,
+                       DocNodeRect       rect,
+                       const DocNodePayload* payload) {
     if (!payload) {
         /* Removal request */
         std::lock_guard<std::mutex> lk(st->nodes_mtx);
@@ -493,6 +505,8 @@ void dr_submit_node(DocRendererState* st,
 
     DocWorkItem item;
     item.node_id       = node_id;
+    item.parent_id     = parent_id;
+    item.sibling_order = sibling_order;
     item.expected_hash = h;
     item.rect          = rect;
     item.payload       = *payload;
@@ -501,11 +515,12 @@ void dr_submit_node(DocRendererState* st,
         std::lock_guard<std::mutex> lk(st->nodes_mtx);
         auto& node = st->nodes[node_id];
         if (node.id == 0) {
-            /* New node: register in order */
-            node.id           = node_id;
-            node.submit_order = st->submit_counter.fetch_add(1);
+            /* New node: register in the live set. */
+            node.id = node_id;
             st->order.push_back(node_id);
         }
+        node.parent_id = parent_id;
+        node.sibling_order = sibling_order;
 
         /* Pointlessness filter: same payload + already rendered → skip */
         if (node.rendered && !node.dirty && node.payload_hash == h) return;
@@ -559,11 +574,39 @@ void dr_composite(DocRendererState* st, uint8_t* out_rgba) {
 
     std::lock_guard<std::mutex> lk(st->nodes_mtx);
 
-    /* Sort order by submit_order (stable painter's algorithm) */
+    /* Hierarchical painter's algorithm.  A node paints after its ancestors,
+       and sibling_order controls order inside each parent.  Submission
+       sequence is not part of the draw order. */
     std::vector<uint64_t> sorted = st->order;
+    auto build_key = [&](uint64_t id) {
+        std::vector<uint64_t> chain;
+        std::unordered_set<uint64_t> seen;
+        uint64_t cur = id;
+        while (cur != 0 && seen.insert(cur).second) {
+            auto it = st->nodes.find(cur);
+            if (it == st->nodes.end()) break;
+            chain.push_back(cur);
+            uint64_t parent = it->second.parent_id;
+            if (parent == 0 || st->nodes.find(parent) == st->nodes.end())
+                break;
+            cur = parent;
+        }
+        std::reverse(chain.begin(), chain.end());
+        std::vector<uint64_t> key;
+        key.reserve(chain.size() * 2);
+        for (uint64_t nid : chain) {
+            const DocNode& n = st->nodes.at(nid);
+            uint64_t local = (n.sibling_order >= 0)
+                ? static_cast<uint64_t>(n.sibling_order)
+                : static_cast<uint64_t>(0);
+            key.push_back(local);
+            key.push_back(nid);
+        }
+        return key;
+    };
     std::stable_sort(sorted.begin(), sorted.end(),
         [&](uint64_t a, uint64_t b){
-            return st->nodes.at(a).submit_order < st->nodes.at(b).submit_order;
+            return build_key(a) < build_key(b);
         });
 
     for (uint64_t id : sorted) {

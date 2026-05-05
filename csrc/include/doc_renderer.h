@@ -28,7 +28,8 @@
  *   Each KnobSpec / Panel node the Python side wants to render becomes a
  *   DocNodePayload with an appropriate DocNodeType.  Parent panels submit
  *   themselves first (lower id), then recurse into children (higher ids).
- *   The compositor respects submission order (painter's algorithm).
+ *   The compositor respects hierarchy order: ancestors first, then siblings
+ *   by explicit sibling order.
  *
  * API surface: extern "C" for ctypes loading from Python.
  */
@@ -138,6 +139,16 @@ void dr_submit_node(DocRendererState* st,
                     DocNodeRect       rect,
                     const DocNodePayload* payload);
 
+/* Parent-aware submission.  parent_id=0 means root-level.  sibling_order
+   controls order within the parent.  Negative sibling_order is treated as 0;
+   ties are resolved by node_id for deterministic hierarchy order. */
+void dr_submit_node_ex(DocRendererState* st,
+                       uint64_t          node_id,
+                       uint64_t          parent_id,
+                       int               sibling_order,
+                       DocNodeRect       rect,
+                       const DocNodePayload* payload);
+
 /* Force a node dirty (next submission will re-render regardless of payload). */
 void dr_mark_dirty(DocRendererState* st, uint64_t node_id);
 
@@ -153,7 +164,7 @@ void dr_flush(DocRendererState* st);
 /* ── Composite ───────────────────────────────────────────────────────────── */
 
 /* Write the composited RGBA8 image into out_rgba (must be width*height*4 bytes).
-   Blends all rendered tiles in submission order (painter's algorithm).
+   Blends all rendered tiles in hierarchy order (ancestor chain + sibling order).
    Does NOT call dr_flush(); caller decides when to flush. */
 void dr_composite(DocRendererState* st, uint8_t* out_rgba);
 

@@ -1,0 +1,25 @@
+# Material: emitter_dust
+# Recovered or cultured emitter/phosphor feedstock.
+
+name: emitter_dust
+description: Phosphor and diode emitter powder for simple luminous pixels.
+
+albedo_rgb: [0.30, 0.72, 0.58]
+reflectivity: 0.34
+diffusion: 0.68
+absorption: 0.05
+smoothness: 0.36
+ior: 1.62
+opacity: 1.0
+
+gameplay:
+  label: Emitter Dust
+  category: optical_feedstock
+  tier: uncommon
+  role: primitive_feedstock
+  acquisition_tags: [lamp_recovery, lab_culture, exchange]
+  stewardship_note: Harvested from spent lamps or grown as small lab batches.
+
+notes: >
+  Optical gameplay feedstock. It is not self-emissive until incorporated into a
+  powered display recipe.

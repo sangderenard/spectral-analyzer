@@ -1,0 +1,25 @@
+# Material: raw_regolith
+# Reclaimed mineral fines from cleanup loops.
+
+name: raw_regolith
+description: Reclaimed mineral fines collected from cleanup residue.
+
+albedo_rgb: [0.45, 0.42, 0.36]
+reflectivity: 0.18
+diffusion: 0.88
+absorption: 0.10
+smoothness: 0.18
+ior: 1.50
+opacity: 1.0
+
+gameplay:
+  label: Reclaimed Mineral Fines
+  category: mineral_feedstock
+  tier: common
+  role: primitive_feedstock
+  acquisition_tags: [sweep, filter_recovery, exchange]
+  stewardship_note: Collected as cleanup residue, not mined from living terrain.
+
+notes: >
+  Game feedstock material. Its shader values are intentionally dusty and
+  diffuse so any world pile reads as sorted mineral residue.

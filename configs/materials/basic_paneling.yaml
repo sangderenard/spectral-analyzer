@@ -1,0 +1,27 @@
+# Material: basic_paneling
+# Starter modular station panel stock.
+# Gameplay component plus shader-visible matte composite panel.
+
+name: basic_paneling
+description: Basic paneling - durable modular wall and console panel stock
+
+albedo_rgb: [0.42, 0.43, 0.40]
+reflectivity: 0.36
+diffusion: 0.72
+absorption: 0.08
+
+smoothness: 0.42
+ior: 1.48
+opacity: 1.0
+
+gameplay:
+  label: Basic Paneling
+  category: building_component
+  tier: starter
+  role: craftable_output
+  acquisition_tags: [crafted, salvaged]
+  stewardship_note: Built from reclaimed mineral fines and plant-derived binders.
+
+notes: >
+  Gameplay starter wall/console material. Visually reads as a matte recycled
+  composite panel: moderately diffuse, lightly reflective, and fully opaque.

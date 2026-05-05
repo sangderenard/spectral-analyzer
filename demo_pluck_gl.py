@@ -160,8 +160,8 @@ def _build_default_scene(config_dir: str = "configs/room_station"):
         build_state={
             "unfinished": True,
             "job_order_id": "job::room_control_bootstrap",
-            "required_materials": {"grey_block": 6, "screen_block": 1},
-            "delivered_materials": {"grey_block": 0, "screen_block": 0},
+            "required_materials": {"basic_paneling": 6, "basic_led_display": 1},
+            "delivered_materials": {"basic_paneling": 0, "basic_led_display": 0},
         },
     )
     ws.add_object(room_ctrl)
@@ -175,12 +175,137 @@ def _build_default_scene(config_dir: str = "configs/room_station"):
         build_state={
             "unfinished": True,
             "job_order_id": "job::fabricator_bootstrap",
-            "required_materials": {"grey_block": 5, "screen_block": 1},
-            "delivered_materials": {"grey_block": 0, "screen_block": 0},
+            "required_materials": {"basic_paneling": 5, "basic_led_display": 1},
+            "delivered_materials": {"basic_paneling": 0, "basic_led_display": 0},
         },
     )
     ws.add_object(fabricator)
     return ws
+
+
+class _MaterialPile:
+    """Small floor pile that contributes materials to the player's backpack."""
+
+    def __init__(
+        self,
+        *,
+        obj_id: str,
+        label: str,
+        material_key: str,
+        quantity: int,
+        pos: list[float],
+        color_tag: str,
+    ):
+        self.obj_id = str(obj_id)
+        self.label = str(label)
+        self.material_slot = str(material_key)
+        self.material_name = str(material_key)
+        self.world_position = np.asarray(pos, np.float64).reshape(3)
+        self.pos = self.world_position
+        self.interaction_radius = 1.25
+        self.quantity = max(0, int(quantity))
+        self._color_tag = str(color_tag)
+        self._triangles_local = self._build_pile_triangles(self._color_tag)
+
+    @staticmethod
+    def _box_triangles(x0: float, y0: float, z0: float,
+                       x1: float, y1: float, z1: float) -> np.ndarray:
+        v000 = np.array([x0, y0, z0], np.float64)
+        v001 = np.array([x0, y0, z1], np.float64)
+        v010 = np.array([x0, y1, z0], np.float64)
+        v011 = np.array([x0, y1, z1], np.float64)
+        v100 = np.array([x1, y0, z0], np.float64)
+        v101 = np.array([x1, y0, z1], np.float64)
+        v110 = np.array([x1, y1, z0], np.float64)
+        v111 = np.array([x1, y1, z1], np.float64)
+        tris = [
+            (v000, v010, v110), (v000, v110, v100),
+            (v001, v101, v111), (v001, v111, v011),
+            (v000, v100, v101), (v000, v101, v001),
+            (v010, v011, v111), (v010, v111, v110),
+            (v000, v001, v011), (v000, v011, v010),
+            (v100, v110, v111), (v100, v111, v101),
+        ]
+        return np.asarray(tris, np.float64)
+
+    @classmethod
+    def _build_pile_triangles(cls, color_tag: str) -> np.ndarray:
+        if color_tag == "screen":
+            boxes = [
+                (-0.22, -0.11, 0.00, 0.22, 0.11, 0.09),
+                (-0.16, -0.08, 0.09, 0.16, 0.08, 0.18),
+                (-0.10, -0.05, 0.18, 0.10, 0.05, 0.27),
+            ]
+        else:
+            boxes = [
+                (-0.25, -0.18, 0.00, -0.03, 0.04, 0.16),
+                (0.02, -0.16, 0.00, 0.25, 0.07, 0.16),
+                (-0.11, 0.03, 0.00, 0.12, 0.24, 0.16),
+                (-0.12, -0.06, 0.16, 0.12, 0.16, 0.31),
+            ]
+        return np.concatenate([cls._box_triangles(*b) for b in boxes], axis=0)
+
+    def interaction_triangles_world(self) -> np.ndarray:
+        if self.quantity <= 0:
+            return np.zeros((0, 3, 3), np.float64)
+        return self._triangles_local + self.world_position.reshape(1, 1, 3)
+
+    def try_pickup_material(self, backpack: dict, *, actor_id: str = "player") -> dict[str, int]:
+        if self.quantity <= 0:
+            return {}
+        picked = int(self.quantity)
+        backpack[self.material_slot] = int(backpack.get(self.material_slot, 0)) + picked
+        self.quantity = 0
+        self.interaction_radius = 0.0
+        return {self.material_slot: picked}
+
+    def unfinished_tooltip_lines(self) -> list[str]:
+        if self.quantity <= 0:
+            return []
+        return [
+            f"{self.label}: {self.material_slot} x{self.quantity}",
+            "pickup materials [E]",
+        ]
+
+    def handle_menu_event(self, ev) -> bool:
+        return False
+
+
+def _build_default_material_piles() -> list[_MaterialPile]:
+    return [
+        _MaterialPile(
+            obj_id="pile_room_grey",
+            label="Room Control Paneling",
+            material_key="basic_paneling",
+            quantity=6,
+            pos=[-0.46, -1.05, 0.0],
+            color_tag="grey",
+        ),
+        _MaterialPile(
+            obj_id="pile_room_screen",
+            label="Room Control LED Display",
+            material_key="basic_led_display",
+            quantity=1,
+            pos=[0.46, -1.05, 0.0],
+            color_tag="screen",
+        ),
+        _MaterialPile(
+            obj_id="pile_fabricator_grey",
+            label="Fabricator Paneling",
+            material_key="basic_paneling",
+            quantity=5,
+            pos=[1.54, -1.05, 0.0],
+            color_tag="grey",
+        ),
+        _MaterialPile(
+            obj_id="pile_fabricator_screen",
+            label="Fabricator LED Display",
+            material_key="basic_led_display",
+            quantity=1,
+            pos=[2.46, -1.05, 0.0],
+            color_tag="screen",
+        ),
+    ]
 
 try:
     from camera_designer_station import CameraDesignerStation as _CameraDesignerStation
@@ -11071,7 +11196,7 @@ class _PlayerCameraPanel:
         self._qvao = self._qvbo = None
         self._tvao = self._tvbo = None
         self._text_cache: dict = {}
-        # HUD shell state: no center panel, only top/left/bottom chrome.
+        # HUD shell state.
         self._library_tabs = ["backpack", "ecosystem"]
         self._library_active_tab = 0
         self._library_items_inventory = []
@@ -11081,9 +11206,11 @@ class _PlayerCameraPanel:
             "material_slot", "wall_tile", "floor_tile", "acoustic_panel",
         ]
         self._hotbar_slots = [
-            "select", "inspect", "render", "pan", "focus", "aperture", "material", "attach", "place",
+            "select", "inspect", "render", "pan", "focus", "aperture", "synth", "attach", "place",
         ]
         self._hotbar_index = 0
+        self._synthesis_open = False
+        self._synthesis_selected = "basic_paneling"
         self._raytrace_inspect_active = False
         self._raytrace_anchor_eye = None
         self._raytrace_anchor_target = None
@@ -11142,12 +11269,27 @@ class _PlayerCameraPanel:
     def hud_mode(self) -> str:
         return self._hud_mode
 
+    @property
+    def synthesis_open(self) -> bool:
+        return bool(self._synthesis_open)
+
+    @property
+    def synthesis_selected(self) -> str:
+        return str(self._synthesis_selected)
+
+    def toggle_synthesis_panel(self) -> None:
+        self._synthesis_open = not self._synthesis_open
+        if self._synthesis_open and self._hud_mode != self.HUD_FULL:
+            self._set_hud_mode(self.HUD_FULL)
+
     def _set_hud_mode(self, mode: str) -> None:
         if mode not in (self.HUD_FULL, self.HUD_INFO, self.HUD_OFF):
             return
         self._hud_mode = str(mode)
         self._open = (self._hud_mode == self.HUD_FULL)
         self._drag = -1
+        if not self._open:
+            self._synthesis_open = False
         if self._open and self._cam is not None:
             self._menu_anchor_eye = np.array(self._cam.eye, np.float64)
             self._menu_anchor_target = np.array(self._cam.target, np.float64)
@@ -11160,12 +11302,12 @@ class _PlayerCameraPanel:
                 self._cam._forced_eye = None
 
     def cycle_hud_mode(self) -> str:
-        if self._hud_mode == self.HUD_FULL:
+        if self._hud_mode == self.HUD_OFF:
             self._set_hud_mode(self.HUD_INFO)
         elif self._hud_mode == self.HUD_INFO:
-            self._set_hud_mode(self.HUD_OFF)
-        else:
             self._set_hud_mode(self.HUD_FULL)
+        else:
+            self._set_hud_mode(self.HUD_OFF)
         return self._hud_mode
 
     def toggle(self):
@@ -11728,6 +11870,8 @@ class _PlayerCameraPanel:
         if ev.type == pygame.KEYDOWN:
             if pygame.K_1 <= ev.key <= pygame.K_9:
                 self._hotbar_index = int(ev.key - pygame.K_1)
+                if self._hotbar_slots[self._hotbar_index] == "synth":
+                    self._synthesis_open = True
                 return True
 
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
@@ -11741,6 +11885,42 @@ class _PlayerCameraPanel:
                     if tx <= mx <= tx + tab_w:
                         self._library_active_tab = ti
                         return True
+            hb_w = 9 * 62 + 8 * 6
+            hb_h = 52
+            hb_x = (win_w - hb_w) // 2
+            hb_y = win_h - hb_h - 10
+            if hb_x - 8 <= mx <= hb_x + hb_w + 8 and hb_y - 6 <= my <= hb_y + hb_h + 6:
+                for hi, name in enumerate(self._hotbar_slots):
+                    bx = hb_x + hi * 68
+                    if bx <= mx <= bx + 62 and hb_y <= my <= hb_y + hb_h:
+                        self._hotbar_index = hi
+                        if name == "synth":
+                            self.toggle_synthesis_panel()
+                        return True
+            if self._synthesis_open:
+                cp_w = min(460, max(340, win_w - 420))
+                cp_h = 270
+                cp_x = (win_w - cp_w) // 2
+                cp_y = max(96, (win_h - cp_h) // 2)
+                if cp_x <= mx <= cp_x + cp_w and cp_y <= my <= cp_y + cp_h:
+                    recipes = {}
+                    if self._player_ctrl is not None and hasattr(self._player_ctrl, "synthesis_recipes"):
+                        recipes = dict(self._player_ctrl.synthesis_recipes)
+                    keys = list(recipes.keys()) or ["basic_paneling", "basic_led_display"]
+                    for ri, key in enumerate(keys[:4]):
+                        ry = cp_y + 70 + ri * 42
+                        if cp_x + 18 <= mx <= cp_x + cp_w - 18 and ry <= my <= ry + 34:
+                            self._synthesis_selected = str(key)
+                            return True
+                    if cp_x + 18 <= mx <= cp_x + 150 and cp_y + cp_h - 54 <= my <= cp_y + cp_h - 18:
+                        if self._player_ctrl is not None and hasattr(self._player_ctrl, "cancel_synthesis"):
+                            self._player_ctrl.cancel_synthesis()
+                        return True
+                    if cp_x + cp_w - 150 <= mx <= cp_x + cp_w - 18 and cp_y + cp_h - 54 <= my <= cp_y + cp_h - 18:
+                        if self._player_ctrl is not None and hasattr(self._player_ctrl, "begin_synthesis"):
+                            self._player_ctrl.begin_synthesis(self._synthesis_selected)
+                        return True
+                    return True
             if not (px <= mx <= px + self.PW and py <= my <= py + ph):
                 return False
             for i, (key, *_) in enumerate(self._SLIDERS):
@@ -12685,6 +12865,7 @@ def main():
                 if not _leftovers or _cam_pure_matrices is None:
                     return None
                 tri_chunks = []
+                mat_chunks = []
                 for _payload in _leftovers.values():
                     if not isinstance(_payload, dict):
                         continue
@@ -12697,6 +12878,8 @@ def main():
                     if _tris.ndim != 3 or _tris.shape[1:] != (3, 3) or _tris.shape[0] == 0:
                         continue
                     tri_chunks.append(_tris)
+                    _mat_id = int(_payload.get("mat_id", 0))
+                    mat_chunks.append(np.full((_tris.shape[0],), _mat_id, dtype=np.int32))
                 if not tri_chunks:
                     return None
                 tris_world = np.concatenate(tri_chunks, axis=0)        # (Nt, 3, 3)
@@ -12728,7 +12911,10 @@ def main():
 
                 verts_view = np.concatenate([pts_v, nrm_v], axis=1)     # (Nt*3, 6)
                 verts_view = np.ascontiguousarray(verts_view, dtype=np.float32)
-                mat_ids = np.zeros((Nt,), dtype=np.int32)
+                mat_ids = np.ascontiguousarray(
+                    np.concatenate(mat_chunks, axis=0) if mat_chunks else np.zeros((Nt,), dtype=np.int32),
+                    dtype=np.int32,
+                )
 
                 # br_render parses mvp as a column-major 4x4: proj(r,c) = mvp[c*4+r]
                 proj = np.ascontiguousarray(_P.T.reshape(-1), dtype=np.float32)
@@ -12789,6 +12975,7 @@ def main():
         pass  # package unavailable; renderer keeps its (1,1,1) default
 
     duty_stations: list = []
+    material_piles: list = []
 
     # ── Room station ──────────────────────────────────────────────────────────
     if _HAS_ROOM_STATION:
@@ -12804,6 +12991,11 @@ def main():
             # that player_ctrl.tick() and the render loop already consume.
             _scene_stations = _room_ws.build_scene_objects(WIN_W, WIN_H)
             duty_stations.extend(_scene_stations)
+            if not getattr(args, "level", None):
+                material_piles = _build_default_material_piles()
+                duty_stations.extend(material_piles)
+                print(f"[room_station] {len(material_piles)} material pile(s) spawned",
+                      flush=True)
             print(f"[room_station] {len(_scene_stations)} scene station(s) built",
                   flush=True)
         except Exception as _e:
@@ -12853,6 +13045,7 @@ def main():
     clock       = pygame.time.Clock()
     running     = True
     _exit_confirm_open = False
+    _doc_misc_ids: dict[str, int] = {}
     fi          = 0
     recorded_samples = 0
     replaying   = False
@@ -12896,6 +13089,296 @@ def main():
         px, py = pt
         rx, ry, rw, rh = rect
         return (rx <= px <= rx + rw) and (ry <= py <= ry + rh)
+
+    def _doc_id(key: str) -> int:
+        if key not in _doc_misc_ids:
+            _doc_misc_ids[key] = 100000 + len(_doc_misc_ids)
+        return _doc_misc_ids[key]
+
+    def _doc_rect(doc_rdr, key: str, rect: tuple[int, int, int, int],
+                  color: tuple[float, float, float, float],
+                  *, border: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+                  border_px: int = 0,
+                  parent_id: int = 0,
+                  sibling_order: int = -1) -> int:
+        node_id = _doc_id(key)
+        doc_rdr.submit_raw(
+            node_id, rect, 7,
+            bg=(0.0, 0.0, 0.0, 0.0),
+            border=border,
+            accent=color,
+            border_px=border_px,
+            parent_id=parent_id,
+            sibling_order=sibling_order,
+        )
+        return node_id
+
+    def _doc_text(doc_rdr, key: str, x: int, y: int, text: str,
+                  *, w: int | None = None,
+                  color: tuple[float, float, float, float] = (0.82, 0.88, 0.96, 1.0),
+                  bg: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0),
+                  font_scale: float = 1.0,
+                  parent_id: int = 0,
+                  sibling_order: int = -1) -> int:
+        text_s = str(text)
+        tw = int(w if w is not None else max(24, len(text_s) * 9 + 8))
+        th = max(16, int(15 * font_scale + 6))
+        node_id = _doc_id(key)
+        doc_rdr.submit_raw(
+            node_id, (int(x), int(y), tw, th), 6,
+            label=text_s,
+            bg=bg,
+            fg=color,
+            border=(0.0, 0.0, 0.0, 0.0),
+            accent=(0.0, 0.0, 0.0, 0.0),
+            border_px=0,
+            font_scale=font_scale,
+            parent_id=parent_id,
+            sibling_order=sibling_order,
+        )
+        return node_id
+
+    def _submit_player_hud_doc(doc_rdr, win_w: int, win_h: int) -> None:
+        if _player_cam_panel.hud_mode == _PlayerCameraPanel.HUD_OFF:
+            return
+        full_shell = _player_cam_panel.hud_mode == _PlayerCameraPanel.HUD_FULL
+        try:
+            _player_cam_panel._pull()
+            _player_cam_panel._clear_render_if_moved()
+        except Exception:
+            pass
+
+        top_h = 70
+        if full_shell:
+            _doc_rect(doc_rdr, "player.backdrop", (0, 0, win_w, win_h),
+                      (0.01, 0.02, 0.05, 0.52), sibling_order=0)
+        top_id = _doc_rect(
+            doc_rdr, "player.topbar", (0, 0, win_w, top_h),
+            (0.05, 0.10, 0.16, 0.94) if full_shell else (0.03, 0.06, 0.10, 0.72),
+            sibling_order=10,
+        )
+        active_tool = _player_cam_panel._hotbar_slots[_player_cam_panel._hotbar_index]
+        _doc_text(doc_rdr, "player.tool", 14, 8, f"tool: {active_tool}", w=300,
+                  parent_id=top_id, sibling_order=0)
+        _doc_text(doc_rdr, "player.object", 14, 28,
+                  f"object: {_player_cam_panel._hover_owner_label}", w=300,
+                  parent_id=top_id, sibling_order=1)
+        dist = _player_cam_panel._hover_dist_m
+        dist_txt = "n/a" if not np.isfinite(dist) else f"{dist:.2f}m"
+        _doc_text(doc_rdr, "player.material", 14, 48,
+                  f"material: {_player_cam_panel._hover_material_label}   ray: {dist_txt}",
+                  w=470, parent_id=top_id, sibling_order=2)
+
+        owner = _player_cam_panel._hover_owner_obj
+        if owner is not None and hasattr(owner, "unfinished_tooltip_lines"):
+            try:
+                for i, line in enumerate(list(owner.unfinished_tooltip_lines())[:2]):
+                    _doc_text(doc_rdr, f"player.tip.{i}", 340, 8 + i * 20, str(line), w=420,
+                              parent_id=top_id, sibling_order=10 + i)
+            except Exception:
+                pass
+
+        if full_shell:
+            lp_x, lp_y, lp_w = 12, top_h + 10, 360
+            lp_h = max(220, win_h - top_h - 120)
+            lib_id = _doc_rect(doc_rdr, "player.library.bg", (lp_x, lp_y, lp_w, lp_h),
+                               (0.06, 0.09, 0.12, 0.92), sibling_order=20)
+            tab_w = (lp_w - 16) // 2
+            for ti, name in enumerate(_player_cam_panel._library_tabs):
+                tx = lp_x + 8 + ti * (tab_w + 4)
+                active = ti == _player_cam_panel._library_active_tab
+                _doc_rect(doc_rdr, f"player.library.tab.{ti}",
+                          (tx, lp_y + 6, tab_w, 26),
+                          (0.24, 0.42, 0.60, 0.95) if active else (0.15, 0.18, 0.23, 0.95),
+                          parent_id=lib_id, sibling_order=ti * 2)
+                _doc_text(doc_rdr, f"player.library.tab.text.{ti}",
+                          tx + 7, lp_y + 11, name.upper(), w=tab_w - 12,
+                          parent_id=lib_id, sibling_order=ti * 2 + 1)
+            if (_player_cam_panel._library_active_tab == 0
+                    and _player_cam_panel._player_ctrl is not None
+                    and hasattr(_player_cam_panel._player_ctrl, 'backpack')):
+                bp = dict(_player_cam_panel._player_ctrl.backpack)
+                items = [f"{k} x{int(v)}" for k, v in sorted(bp.items()) if int(v) > 0]
+            else:
+                items = _player_cam_panel._library_items_ecosystem
+            if not items and _player_cam_panel._library_active_tab == 0:
+                items = ["empty backpack"]
+            max_rows = max(1, (lp_h - 52) // 20)
+            for idx, name in enumerate(items[:max_rows]):
+                _doc_text(doc_rdr, f"player.library.item.{idx}",
+                          lp_x + 10, lp_y + 42 + idx * 20, f"- {name}", w=lp_w - 20,
+                          parent_id=lib_id, sibling_order=20 + idx)
+
+            if _player_cam_panel.synthesis_open:
+                cp_w = min(460, max(340, win_w - 420))
+                cp_h = 270
+                cp_x = (win_w - cp_w) // 2
+                cp_y = max(96, (win_h - cp_h) // 2)
+                synth_id = _doc_rect(
+                    doc_rdr, "player.synth.bg", (cp_x, cp_y, cp_w, cp_h),
+                    (0.07, 0.10, 0.13, 0.96),
+                    border=(0.28, 0.42, 0.46, 1.0),
+                    border_px=1,
+                    sibling_order=25,
+                )
+                _doc_text(doc_rdr, "player.synth.title",
+                          cp_x + 18, cp_y + 16, "Material Synthesis", w=cp_w - 36,
+                          color=(0.90, 0.96, 0.94, 1.0), font_scale=1.25,
+                          parent_id=synth_id, sibling_order=0)
+                _doc_text(doc_rdr, "player.synth.subtitle",
+                          cp_x + 18, cp_y + 42, "Recipe inputs reserve from backpack; cancel refunds them.",
+                          w=cp_w - 36, color=(0.66, 0.75, 0.78, 1.0),
+                          parent_id=synth_id, sibling_order=1)
+                recipes = {}
+                status = {"active": False}
+                if (_player_cam_panel._player_ctrl is not None
+                        and hasattr(_player_cam_panel._player_ctrl, "synthesis_recipes")):
+                    recipes = dict(_player_cam_panel._player_ctrl.synthesis_recipes)
+                if (_player_cam_panel._player_ctrl is not None
+                        and hasattr(_player_cam_panel._player_ctrl, "synthesis_status")):
+                    status = dict(_player_cam_panel._player_ctrl.synthesis_status())
+                keys = list(recipes.keys()) or ["basic_paneling", "basic_led_display"]
+                selected = _player_cam_panel.synthesis_selected
+                for ri, key in enumerate(keys[:4]):
+                    recipe = dict(recipes.get(key, {}))
+                    label = str(recipe.get("label", key))
+                    sec = float(recipe.get("seconds", 1.0))
+                    availability = {"craftable": False, "needs": []}
+                    if (_player_cam_panel._player_ctrl is not None
+                            and hasattr(_player_cam_panel._player_ctrl, "recipe_availability")):
+                        availability = dict(_player_cam_panel._player_ctrl.recipe_availability(key))
+                    needs = list(availability.get("needs", []))
+                    missing = sum(int(n.get("missing", 0)) for n in needs if isinstance(n, dict))
+                    ok = bool(availability.get("craftable", False))
+                    ry = cp_y + 70 + ri * 42
+                    active = str(key) == selected
+                    _doc_rect(doc_rdr, f"player.synth.recipe.{ri}",
+                              (cp_x + 18, ry, cp_w - 36, 34),
+                              (0.18, 0.36, 0.34, 0.96) if active else (0.12, 0.16, 0.19, 0.96),
+                              border=(0.34, 0.60, 0.54, 1.0) if active else ((0.30, 0.50, 0.38, 1.0) if ok else (0.42, 0.24, 0.22, 1.0)),
+                              border_px=1, parent_id=synth_id, sibling_order=10 + ri * 2)
+                    state_txt = "ready" if ok else f"missing {missing}"
+                    _doc_text(doc_rdr, f"player.synth.recipe.text.{ri}",
+                              cp_x + 30, ry + 8, f"{label}   {sec:.1f}s   {state_txt}", w=cp_w - 60,
+                              parent_id=synth_id, sibling_order=11 + ri * 2)
+                selected_recipe = dict(recipes.get(selected, {}))
+                selected_needs = []
+                selected_ready = False
+                if (_player_cam_panel._player_ctrl is not None
+                        and hasattr(_player_cam_panel._player_ctrl, "recipe_availability")):
+                    sel_avail = dict(_player_cam_panel._player_ctrl.recipe_availability(selected))
+                    selected_needs = list(sel_avail.get("needs", []))
+                    selected_ready = bool(sel_avail.get("craftable", False))
+                req_y = cp_y + 70 + min(4, len(keys)) * 42 + 4
+                need_texts = []
+                for need in selected_needs[:3]:
+                    if not isinstance(need, dict):
+                        continue
+                    mark = "ok" if bool(need.get("ok", False)) else "need"
+                    need_texts.append(
+                        f"{mark}:{need.get('material')} {int(need.get('have', 0))}/{int(need.get('need', 0))}"
+                    )
+                if need_texts:
+                    _doc_text(doc_rdr, "player.synth.needs",
+                              cp_x + 18, req_y, "  ".join(need_texts), w=cp_w - 36,
+                              color=(0.70, 0.80, 0.78, 1.0),
+                              parent_id=synth_id, sibling_order=26)
+                stat_y = cp_y + cp_h - 88
+                if bool(status.get("active", False)):
+                    prog = float(max(0.0, min(1.0, status.get("progress", 0.0))))
+                    label = str(status.get("label", status.get("material", "")))
+                    remain = float(status.get("remaining_s", 0.0))
+                    _doc_text(doc_rdr, "player.synth.status",
+                              cp_x + 18, stat_y, f"synthesizing: {label}  {remain:.1f}s",
+                              w=cp_w - 36, color=(0.78, 0.86, 0.84, 1.0),
+                              parent_id=synth_id, sibling_order=30)
+                    _doc_rect(doc_rdr, "player.synth.progress.bg",
+                              (cp_x + 18, stat_y + 24, cp_w - 36, 10),
+                              (0.06, 0.08, 0.10, 1.0),
+                              parent_id=synth_id, sibling_order=31)
+                    _doc_rect(doc_rdr, "player.synth.progress.fill",
+                              (cp_x + 18, stat_y + 24, int((cp_w - 36) * prog), 10),
+                              (0.34, 0.72, 0.58, 1.0),
+                              parent_id=synth_id, sibling_order=32)
+                else:
+                    _doc_text(doc_rdr, "player.synth.status",
+                              cp_x + 18, stat_y, "fabricator idle", w=cp_w - 190,
+                              color=(0.66, 0.75, 0.78, 1.0),
+                              parent_id=synth_id, sibling_order=30)
+                can_start = (not bool(status.get("active", False))) and selected_ready
+                can_cancel = bool(status.get("active", False))
+                _doc_rect(doc_rdr, "player.synth.cancel",
+                          (cp_x + 18, cp_y + cp_h - 54, 132, 36),
+                          (0.34, 0.25, 0.18, 1.0) if can_cancel else (0.12, 0.14, 0.16, 1.0),
+                          border=(0.70, 0.48, 0.30, 1.0) if can_cancel else (0.22, 0.25, 0.28, 1.0),
+                          border_px=1, parent_id=synth_id, sibling_order=38)
+                _doc_text(doc_rdr, "player.synth.cancel.text",
+                          cp_x + 54, cp_y + cp_h - 44,
+                          "CANCEL", w=80, parent_id=synth_id, sibling_order=39)
+                _doc_rect(doc_rdr, "player.synth.start",
+                          (cp_x + cp_w - 150, cp_y + cp_h - 54, 132, 36),
+                          (0.22, 0.48, 0.38, 1.0) if can_start else (0.15, 0.17, 0.19, 1.0),
+                          border=(0.42, 0.78, 0.64, 1.0) if can_start else (0.24, 0.28, 0.30, 1.0),
+                          border_px=1, parent_id=synth_id, sibling_order=40)
+                _doc_text(doc_rdr, "player.synth.start.text",
+                          cp_x + cp_w - 120, cp_y + cp_h - 44,
+                          "START" if can_start else "BUSY", w=80,
+                          parent_id=synth_id, sibling_order=41)
+
+        hb_w = 9 * 62 + 8 * 6
+        hb_h = 52
+        hb_x = (win_w - hb_w) // 2
+        hb_y = win_h - hb_h - 10
+        hotbar_id = _doc_rect(doc_rdr, "player.hotbar.bg",
+                              (hb_x - 8, hb_y - 6, hb_w + 16, hb_h + 12),
+                              (0.05, 0.08, 0.12, 0.92), sibling_order=30)
+        for i, name in enumerate(_player_cam_panel._hotbar_slots):
+            bx = hb_x + i * 68
+            active = i == _player_cam_panel._hotbar_index
+            _doc_rect(doc_rdr, f"player.hotbar.slot.{i}",
+                      (bx, hb_y, 62, hb_h),
+                      (0.23, 0.52, 0.30, 0.98) if active else (0.15, 0.20, 0.27, 0.95),
+                      parent_id=hotbar_id, sibling_order=i * 3)
+            _doc_text(doc_rdr, f"player.hotbar.num.{i}", bx + 4, hb_y + 3, str(i + 1), w=18,
+                      parent_id=hotbar_id, sibling_order=i * 3 + 1)
+            _doc_text(doc_rdr, f"player.hotbar.label.{i}", bx + 8, hb_y + 22, name[:7], w=52,
+                      parent_id=hotbar_id, sibling_order=i * 3 + 2)
+
+    def _submit_exit_confirm_doc(doc_rdr, win_w: int, win_h: int) -> None:
+        if not _exit_confirm_open:
+            return
+        layout = _exit_confirm_layout(win_w, win_h)
+        panel_r = layout["panel"]
+        no_r = layout["no"]
+        yes_r = layout["yes"]
+        _doc_rect(doc_rdr, "exit.scrim", (0, 0, win_w, win_h), (0.0, 0.0, 0.0, 0.55),
+                  sibling_order=1000)
+        panel_id = _doc_rect(doc_rdr, "exit.panel", panel_r, (0.05, 0.06, 0.09, 0.98),
+                             border=(0.22, 0.32, 0.48, 1.0), border_px=1,
+                             sibling_order=1001)
+        px, py, pw, _ph = panel_r
+        _doc_text(doc_rdr, "exit.title", px + 32, py + 30, "Quit simulation?", w=pw - 64,
+                  color=(0.92, 0.95, 1.0, 1.0), font_scale=1.3,
+                  parent_id=panel_id, sibling_order=0)
+        _doc_text(doc_rdr, "exit.body", px + 32, py + 72,
+                  "Unsaved generated state and transient render buffers will be discarded.",
+                  w=pw - 64, color=(0.72, 0.78, 0.86, 1.0),
+                  parent_id=panel_id, sibling_order=1)
+        _doc_rect(doc_rdr, "exit.no", no_r, (0.15, 0.20, 0.28, 1.0),
+                  border=(0.36, 0.46, 0.62, 1.0), border_px=1,
+                  parent_id=panel_id, sibling_order=2)
+        _doc_rect(doc_rdr, "exit.yes", yes_r, (0.42, 0.16, 0.14, 1.0),
+                  border=(0.82, 0.36, 0.30, 1.0), border_px=1,
+                  parent_id=panel_id, sibling_order=4)
+        _doc_text(doc_rdr, "exit.no.text", no_r[0] + 42, no_r[1] + 15, "No / Esc", w=100,
+                  parent_id=panel_id, sibling_order=3)
+        _doc_text(doc_rdr, "exit.yes.text", yes_r[0] + 38, yes_r[1] + 15, "Yes / Enter", w=120,
+                  parent_id=panel_id, sibling_order=5)
+
+    def _render_settings_visible() -> bool:
+        if player_ctrl is None:
+            return True
+        return bool(player_ctrl.sidebar_visible or player_ctrl.state.value == "orbit")
 
     def _refresh_ray_field_from_frame(frame, frame_index: int, _reason: str) -> bool:
         nonlocal active_ray_frame_index, force_ray_refresh
@@ -12946,7 +13429,7 @@ def main():
               except Exception:
                   continue
               _pref = getattr(_ds, '_placed_ref', None)
-              _owner = str(getattr(_pref, 'obj_id', f'duty_station_{_i}'))
+              _owner = str(getattr(_ds, 'obj_id', getattr(_pref, 'obj_id', f'duty_station_{_i}')))
               _wp = np.asarray(getattr(_ds, 'world_position', np.zeros(3, np.float64)), np.float64).reshape(3)
               _yaw = float(getattr(_ds, '_yaw_deg', 0.0))
               _sig = (
@@ -12961,6 +13444,7 @@ def main():
                       "owner_id": _owner,
                       "kind": "triangles",
                       "triangles": _tris,
+                      "mat_id": 1 if str(getattr(_ds, "material_slot", "")) == "basic_led_display" else 0,
                   },
                   flip_slots=2,
                   change_key=_sig,
@@ -13045,6 +13529,8 @@ def main():
                 pygame.mouse.set_visible(True)
             if pygame.event.get_grab():
                 pygame.event.set_grab(False)
+        if player_ctrl is not None and hasattr(player_ctrl, "update_synthesis"):
+            player_ctrl.update_synthesis()
         if player_ctrl is not None and not _player_cam_panel.freeze_player_motion:
             player_ctrl.tick(_dt, _keys_held, duty_stations, cameras=cameras)
         # Drive each station's menu visibility from player state — no blocking calls
@@ -13117,10 +13603,9 @@ def main():
                 if not _player_cam_panel.open:
                     if player_ctrl.handle_event(ev, duty_stations, cameras=cameras):
                         continue
-            # Slider panel only visible / interactive when not in a walk state
-            # (or always when player_ctrl is None / orbit mode)
-            _panel_active = (player_ctrl is None or player_ctrl.sidebar_visible
-                             or player_ctrl.state.value == "orbit")
+            # Render settings panel is only interactive when it has an
+            # explicit legacy home; it is hidden in the default player HUD.
+            _panel_active = _render_settings_visible()
             _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
             if _active_st is not None and _active_st.handle_menu_event(ev):
                 continue
@@ -13206,15 +13691,17 @@ def main():
                     R._film_negative = not R._film_negative
                     print(f"Film: {'negative' if R._film_negative else 'positive'}")
                 elif ev.key == pygame.K_e:
-                    # E cycles HUD modes: full -> status+hotbar -> off -> full.
+                    # E cycles HUD modes: off -> status+hotbar -> full -> off.
+                    # Status mode deliberately leaves mouse capture unchanged:
+                    # the player can still walk and look while the bars render.
                     _player_cam_panel.attach(R.cam, panel, R, player_ctrl=player_ctrl)
                     _cam_optics_view.attach(R.cam, _player_cam_panel)
-                    _player_cam_panel.cycle_hud_mode()
-                    if _player_cam_panel.open:
+                    _hud_mode = _player_cam_panel.cycle_hud_mode()
+                    if _hud_mode == _PlayerCameraPanel.HUD_FULL:
                         pygame.mouse.set_visible(True)
                         pygame.event.set_grab(False)
                         pygame.mouse.get_rel()
-                    else:
+                    elif _hud_mode == _PlayerCameraPanel.HUD_OFF:
                         _wants_grab = (
                             (player_ctrl is not None
                              and player_ctrl.state.value == "walk")
@@ -13443,13 +13930,17 @@ def main():
                     f"Check _spectral_kernels build — run: "
                     f"cmake --build csrc_build --config Release"
                 )
-            # Slider panel — always visible
-            _doc_rdr.submit_panel(
-                _doc_slider_spec,
-                (10, 10, 264, 30 + 42 * len(_doc_slider_spec.knobs)),
-                node_id_map=_doc_slider_ids,
-                knob_values=panel.values,
-            )
+            _doc_rdr.clear()
+            # Render settings panel is still live, but it no longer has a
+            # default on-screen home. Keep it hidden during normal player HUD.
+            if _render_settings_visible():
+                _doc_rdr.submit_panel(
+                    _doc_slider_spec,
+                    (10, 10, 264, 30 + 42 * len(_doc_slider_spec.knobs)),
+                    node_id_map=_doc_slider_ids,
+                    knob_values=panel.values,
+                )
+            _submit_player_hud_doc(_doc_rdr, WIN_W, WIN_H)
             # Camera panel — only when open
             if _player_cam_panel.open:
                 _doc_rdr.submit_panel(
@@ -13467,8 +13958,26 @@ def main():
                         f"Station {type(_active_st).__name__!r} has no submit_doc_channel(). "
                         "Update the station class to expose a panel_spec on its menu "
                         "and remove any direct render_hud/render_menu GL calls."
-                    )
+                )
                 _active_st.submit_doc_channel(_doc_rdr, WIN_W, WIN_H)
+            _submit_exit_confirm_doc(_doc_rdr, WIN_W, WIN_H)
+            _shader_walker.publish_owner_target(
+                owner_id="doc_hierarchy",
+                target_id="doc.composite",
+                payload={
+                    "owner_id": "doc_hierarchy",
+                    "kind": "doc_composite",
+                    "frame_index": int(fi),
+                    "node_count": int(getattr(_doc_rdr, "node_count", 0)),
+                },
+                flip_slots=2,
+                change_key=(
+                    int(fi),
+                    int(getattr(_doc_rdr, "node_count", 0)),
+                    str(_player_cam_panel.hud_mode),
+                    bool(_exit_confirm_open),
+                ),
+            )
 
             _submit_scene_object_buffers()
 
@@ -13605,6 +14114,20 @@ def main():
 
             setattr(R, "_global_dispatch_result", _global_result)
 
+            # Camera-item draw is part of the 3D channel: cameras publish
+            # their geometry through publish_owner_target; their direct
+            # GL draw remains here only as a transitional convenience until
+            # the base material renderer consumes the geometry channel.
+            _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
+            _rs_lv /= np.linalg.norm(_rs_lv)
+            if cameras and _cam_pure_matrices is not None:
+                _P, _V = _cam_pure_matrices(R.cam)
+                _MVP = (_P @ _V).astype(np.float32)
+                _MV  = _V.astype(np.float32)
+                _lv  = _rs_lv
+                for _ci in cameras:
+                    _ci.draw(_MVP, _MV, _lv)
+
             # ── Blit policy ────────────────────────────────────────────────
             # The C globals produce CPU RGBA buffers.  Deposit them into
             # the active GL framebuffer (which the OPENGL pygame surface
@@ -13626,20 +14149,6 @@ def main():
                         _doc_rdr.blit_rgba(_out_2d, alpha=1.0)
                 except Exception as _exc:
                     _report_exception("blit 2D-C", _exc)
-
-            # Camera-item draw is part of the 3D channel: cameras publish
-            # their geometry through publish_owner_target; their direct
-            # GL draw remains here only as a transitional convenience until
-            # the base material renderer consumes the geometry channel.
-            _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
-            _rs_lv /= np.linalg.norm(_rs_lv)
-            if cameras and _cam_pure_matrices is not None:
-                _P, _V = _cam_pure_matrices(R.cam)
-                _MVP = (_P @ _V).astype(np.float32)
-                _MV  = _V.astype(np.float32)
-                _lv  = _rs_lv
-                for _ci in cameras:
-                    _ci.draw(_MVP, _MV, _lv)
 
             pygame.display.flip()
         except BaseException as exc:

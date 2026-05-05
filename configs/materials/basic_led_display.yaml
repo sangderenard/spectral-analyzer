@@ -1,0 +1,29 @@
+# Material: basic_led_display
+# Starter low-resolution luminous display tile.
+# Gameplay component plus shader-visible dark glossy screen face.
+
+name: basic_led_display
+description: Basic LED display tile - low-resolution luminous screen stock
+
+albedo_rgb: [0.08, 0.13, 0.16]
+reflectivity: 0.22
+diffusion: 0.32
+absorption: 0.18
+
+smoothness: 0.68
+ior: 1.55
+opacity: 1.0
+emit_profile_idx: -1
+
+gameplay:
+  label: Basic LED Display
+  category: electronics_component
+  tier: starter
+  role: craftable_output
+  acquisition_tags: [crafted, repaired, salvaged]
+  stewardship_note: Repairable display stock assembled from recovered conductors and cultured emitters.
+
+notes: >
+  Represents a finished display tile rather than the emissive pixel shader
+  itself. Keep emit_profile_idx disabled until a real display-light profile is
+  assigned by the station or UI layer.

@@ -3601,7 +3601,9 @@ into a flat RGBA8 numpy array sized (height, width, 4).
                float font_scale,
                float value_norm,
                int icon_id,
-               int border_px) {
+               int border_px,
+               uint64_t parent_id,
+               int sibling_order) {
                 DocNodeRect rect{x, y, w, h};
                 DocNodePayload p{};
                 p.type = static_cast<DocNodeType>(type);
@@ -3622,7 +3624,7 @@ into a flat RGBA8 numpy array sized (height, width, 4).
                 p.value_norm    = value_norm;
                 p.icon_id       = icon_id;
                 p.border_px     = border_px;
-                dr_submit_node(self.st, node_id, rect, &p);
+                dr_submit_node_ex(self.st, node_id, parent_id, sibling_order, rect, &p);
             },
             py::arg("node_id"),
             py::arg("x"), py::arg("y"), py::arg("w"), py::arg("h"),
@@ -3638,6 +3640,8 @@ into a flat RGBA8 numpy array sized (height, width, 4).
             py::arg("value_norm")    = 0.0f,
             py::arg("icon_id")       = -1,
             py::arg("border_px")     = 1,
+            py::arg("parent_id")     = 0,
+            py::arg("sibling_order") = -1,
             "Drop one node payload into the render FIFO.")
         .def("remove_node",
             [](PyDocRenderer& self, uint64_t node_id) {

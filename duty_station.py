@@ -679,7 +679,7 @@ class DutyStation:
         return [
             f"unfinished job: {self.job_order_id or 'station_build'}",
             f"deliver materials [E] ({req})",
-            "pickup blocks [G]=grey [H]=screen",
+            "gather piles or craft from the synthesis HUD",
         ]
 
     # ── Class-method constructors ─────────────────────────────────────────────
@@ -829,8 +829,15 @@ class DutyStation:
                 "any direct render_hud / render_menu GL calls."
             )
         knob_values = getattr(self.menu, 'knob_values', {}) or {}
+        def _panel_doc_height(panel) -> int:
+            knobs = len(getattr(panel, 'knobs', []) or [])
+            panels = list(getattr(panel, 'panels', []) or [])
+            # Mirrors DocRenderer's header/body spacing closely enough for
+            # hierarchical panel specs while preserving a screen clamp.
+            return 24 + knobs * 42 + sum(max(60, _panel_doc_height(p)) + 2 for p in panels)
+
         # Position: right-aligned panel in the lower half of the screen.
-        pw, ph = 320, min(win_h - 40, 30 + 42 * len(getattr(panel_spec, 'knobs', [])))
+        pw, ph = 320, min(win_h - 40, max(80, _panel_doc_height(panel_spec)))
         px = win_w - pw - 10
         py = win_h - ph - 10
         # Stable ID map stored on the menu object itself to survive across frames.

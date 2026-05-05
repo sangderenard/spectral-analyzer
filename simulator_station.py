@@ -56,6 +56,7 @@ except ImportError:
 
 from glass_room import GlassRoom
 from simulator_workspace import SimulatorWorkspace, SimulatorMode
+from controls import KnobSpec, Panel
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -572,6 +573,99 @@ class SimulatorStation:
         # Mouse drag state
         self._drag: Optional[tuple[int, int]] = None
         self._hud_visible = False
+
+    @staticmethod
+    def _choice_index(value: object, choices: list[str]) -> int:
+        try:
+            return choices.index(str(value))
+        except ValueError:
+            return 0
+
+    def _plugin_choices(self) -> list[str]:
+        return [str(p.get("id", "")) for p in self.workspace.plugin_list() if str(p.get("id", ""))]
+
+    @property
+    def panel_spec(self) -> Panel:
+        """Hierarchical document descriptor for simulator controls."""
+        mode_choices = [m.value for m in SimulatorMode]
+        plugin_choices = self._plugin_choices()
+        param_knobs = []
+        for spec in self.workspace.param_specs:
+            name = str(spec.get("name", ""))
+            if not name:
+                continue
+            dtype = str(spec.get("dtype", "float"))
+            choices = [str(v) for v in spec.get("choices", [])] if isinstance(spec.get("choices", []), list) else []
+            if choices:
+                dtype = "choice"
+            param_knobs.append(KnobSpec(
+                f"param.{name}",
+                str(spec.get("label", name)),
+                dtype,
+                spec.get("default", 0.0),
+                float(spec.get("min", spec.get("low", 0.0))),
+                float(spec.get("max", spec.get("high", 1.0))),
+                float(spec.get("step", 0.0)),
+                str(spec.get("unit", "")),
+                choices,
+                bool(spec.get("is_log", False)),
+                str(spec.get("group", "Parameters")),
+                str(spec.get("fmt", ".3f")),
+            ))
+
+        return Panel(
+            "simulator_station",
+            "Simulator",
+            panels=[
+                Panel(
+                    "simulator_plugin",
+                    "Plugin",
+                    knobs=[
+                        KnobSpec("active_plugin", "Active plugin", "choice", 0, 0, max(0, len(plugin_choices) - 1), 1, "", plugin_choices, False, "Plugin"),
+                        KnobSpec("plugin_loaded", "Loaded", "bool", False, 0, 1, 1, "", [], False, "Plugin"),
+                    ],
+                ),
+                Panel(
+                    "simulator_transport",
+                    "Transport",
+                    knobs=[
+                        KnobSpec("mode", "Mode", "choice", 0, 0, max(0, len(mode_choices) - 1), 1, "", mode_choices, False, "Transport"),
+                        KnobSpec("generation", "Generation", "int", 0, 0, 100000, 1, "", [], False, "Evolution", ".0f"),
+                        KnobSpec("generation_count", "Gen count", "int", 32, 1, 100000, 1, "", [], False, "Evolution", ".0f"),
+                        KnobSpec("population_size", "Population", "int", 8, 1, 100000, 1, "", [], False, "Evolution", ".0f"),
+                        KnobSpec("mean_fitness", "Mean fit", "float", 0.0, 0.0, 1.0, 0, "", [], False, "Evolution", ".4f"),
+                        KnobSpec("best_fitness", "Best fit", "float", 0.0, 0.0, 1.0, 0, "", [], False, "Evolution", ".4f"),
+                    ],
+                ),
+                Panel("simulator_params", "Parameters", knobs=param_knobs),
+            ],
+        )
+
+    @property
+    def knob_values(self) -> dict[str, object]:
+        ws = self.workspace
+        self._sync_right_panel()
+        mode_choices = [m.value for m in SimulatorMode]
+        plugin_choices = self._plugin_choices()
+        vals: dict[str, object] = {
+            "active_plugin": self._choice_index(ws.active_plugin_id or "", plugin_choices),
+            "plugin_loaded": ws.active_plugin is not None,
+            "mode": self._choice_index(ws.mode.value, mode_choices),
+            "generation": int(self._right_panel.gen),
+            "generation_count": int(self._right_panel.n_gen),
+            "population_size": int(self._right_panel.pop_size),
+            "mean_fitness": float(self._right_panel.mean_fit),
+            "best_fitness": float(self._right_panel.best_fit),
+        }
+        for spec in ws.param_specs:
+            name = str(spec.get("name", ""))
+            if not name:
+                continue
+            key = f"param.{name}"
+            value = ws.current_params.get(name, spec.get("default", 0.0))
+            choices = [str(v) for v in spec.get("choices", [])] if isinstance(spec.get("choices", []), list) else []
+            vals[key] = self._choice_index(value, choices) if choices else value
+        return vals
 
     def show_hud(self, visible: bool) -> None:
         self._hud_visible = bool(visible)

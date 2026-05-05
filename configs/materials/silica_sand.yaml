@@ -1,0 +1,25 @@
+# Material: silica_sand
+# Recovered glass/mineral substrate feedstock.
+
+name: silica_sand
+description: Sorted glassy grains and crushed scrap glass for simple substrates.
+
+albedo_rgb: [0.76, 0.74, 0.66]
+reflectivity: 0.24
+diffusion: 0.78
+absorption: 0.03
+smoothness: 0.26
+ior: 1.46
+opacity: 1.0
+
+gameplay:
+  label: Silica Sand
+  category: glass_feedstock
+  tier: common
+  role: primitive_feedstock
+  acquisition_tags: [glass_recovery, sweep, exchange]
+  stewardship_note: Comes from broken glass recovery and cleaning systems.
+
+notes: >
+  Feedstock form of silica, not finished glass. Diffuse and opaque because it
+  represents grains or crushed substrate in inventory piles.

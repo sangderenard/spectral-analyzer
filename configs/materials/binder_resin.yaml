@@ -1,0 +1,25 @@
+# Material: binder_resin
+# Renewable binder for composite panels.
+
+name: binder_resin
+description: Plant-derived binder resin for pressed panels.
+
+albedo_rgb: [0.62, 0.48, 0.30]
+reflectivity: 0.28
+diffusion: 0.55
+absorption: 0.08
+smoothness: 0.46
+ior: 1.47
+opacity: 1.0
+
+gameplay:
+  label: Binder Resin
+  category: polymer_feedstock
+  tier: common
+  role: primitive_feedstock
+  acquisition_tags: [cultivate, compost_refine, exchange]
+  stewardship_note: Grown in renewable trays and refined from compostable surplus.
+
+notes: >
+  A starter polymer feedstock. Slightly glossy and warm so loose stock differs
+  visually from dry mineral powders.

@@ -331,6 +331,7 @@ class GlobalChannelDispatcher:
         self.feature_budget_3d = int(feature_budget_3d)
         self._features_2d: list[tuple[int, str, Callable[[Any, Mapping[Any, Any]], None]]] = []
         self._features_3d: list[tuple[int, str, Callable[[Any, Mapping[Any, Any]], None]]] = []
+        self._diag_3d_c_sync_failures = 0
 
     # -- Late-binding hookups -------------------------------------------------
 
@@ -471,8 +472,10 @@ class GlobalChannelDispatcher:
             if _tx is not None and len(_tx) and hasattr(rdr, "set_texture_stack_chunk"):
                 rdr.set_texture_stack_chunk(_np.ascontiguousarray(_tx, dtype=_np.float32))
             self._mat_tensors_ref_c = _t
-        except Exception:
-            pass
+        except Exception as _exc:
+            if self._diag_3d_c_sync_failures < 3:
+                print(f"[3d-c] material sync failed: {_exc}", flush=True)
+                self._diag_3d_c_sync_failures += 1
 
     def _job_3d_c(self, packed: Any, leftovers: Mapping[Any, Any]) -> Optional[Any]:
         """Worker-thread body: clear + render + features + readback."""
@@ -485,14 +488,29 @@ class GlobalChannelDispatcher:
             return rdr.readback_u8()
 
         try:
-            verts_view = mat_ids = proj = None
+            verts_view = mat_ids = proj = groups = None
             if isinstance(packed, (tuple, list)) and len(packed) >= 3:
                 verts_view, mat_ids, proj = packed[:3]
+                if len(packed) >= 4:
+                    groups = packed[3]
         except Exception:
             pass
 
         rdr.clear(0.0, 0.0, 0.0, 0.0)
         try:
+            if hasattr(rdr, "set_groups"):
+                import numpy as _np
+                if groups is not None:
+                    rdr.set_groups(*groups)
+                else:
+                    rdr.set_groups(
+                        _np.zeros((0,), dtype=_np.int32),
+                        _np.zeros((0,), dtype=_np.int32),
+                        _np.zeros((0,), dtype=_np.int32),
+                        _np.zeros((0,), dtype=_np.int32),
+                        _np.zeros((0, 16), dtype=_np.float32),
+                        _np.zeros((0,), dtype=_np.int32),
+                    )
             rdr.render(verts_view, mat_ids, proj)
         except Exception:
             return None

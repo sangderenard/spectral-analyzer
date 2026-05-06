@@ -429,7 +429,10 @@ def _fill_spectral(rec: SpectralRecord, mat: Any) -> None:
     for i, b in enumerate(bands):
         br = rec.bands[i]
         br.center_hz     = float(b.center_hz)
-        br.bandwidth_hz  = float(b.bandwidth_hz)
+        if hasattr(b, 'resolve_bandwidth'):
+            br.bandwidth_hz = float(b.resolve_bandwidth())
+        else:
+            br.bandwidth_hz = float(b.bandwidth_hz)
         br.reflectance   = float(b.reflectance)
         br.transmittance = float(b.transmittance)
         br.diffuse_frac  = float(b.diffuse_frac)

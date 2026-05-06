@@ -48,6 +48,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pygame
 
+from controls import KnobSpec, Panel
 from room_tile_editor import (
     _CELL_SIZE_M,
     RoomTileLibraryPanel,
@@ -179,6 +180,123 @@ def _default_state(sections: list) -> Dict[str, Any]:
         for k in sec.get("knobs", []):
             state[k["name"]] = k.get("default")
     return state
+
+
+def _knobspec_from_yaml_sections(sections: list) -> list[KnobSpec]:
+    knobs: list[KnobSpec] = []
+    for sec in sections or []:
+        group = str(sec.get("label", sec.get("id", "")))
+        for raw in sec.get("knobs", []) or []:
+            name = str(raw.get("name", ""))
+            if not name:
+                continue
+            dtype = str(raw.get("dtype", "float"))
+            choices = [str(choice) for choice in raw.get("choices", []) or []]
+            default = raw.get("default")
+            if dtype == "choice":
+                default = choices.index(default) if default in choices else 0
+            knobs.append(KnobSpec(
+                name,
+                str(raw.get("label", name)),
+                dtype,
+                default,
+                float(raw.get("low", 0.0) or 0.0),
+                float(raw.get("high", max(0, len(choices) - 1)) or 0.0),
+                float(raw.get("step", 1.0 if dtype == "choice" else 0.0) or 0.0),
+                str(raw.get("unit", "")),
+                choices,
+                bool(raw.get("is_log", False)),
+                str(raw.get("group", group)),
+                str(raw.get("fmt", ".3g")),
+            ))
+    return knobs
+
+
+def _title_from_yaml_cfg(cfg: dict, fallback: str) -> str:
+    if not isinstance(cfg, dict):
+        return fallback
+    return str(cfg.get("panel", {}).get("title", fallback))
+
+
+def _panel_from_yaml_cfg(name: str, cfg: dict, fallback_label: str) -> Panel:
+    return Panel(
+        name,
+        _title_from_yaml_cfg(cfg, fallback_label),
+        knobs=_knobspec_from_yaml_sections(cfg.get("sections", [])),
+    )
+
+
+def _doc_knob_values_for_specs(panel: Panel, state: dict) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+
+    def visit(node: Panel) -> None:
+        for knob in node.knobs:
+            name = getattr(knob, "name", "")
+            value = state.get(name, getattr(knob, "default", None))
+            choices = list(getattr(knob, "choices", []) or [])
+            if choices:
+                try:
+                    value = choices.index(str(value))
+                except ValueError:
+                    try:
+                        value = int(value)
+                    except Exception:
+                        value = int(getattr(knob, "default", 0) or 0)
+            values[name] = value
+        for sub in node.panels:
+            visit(sub)
+
+    visit(panel)
+    return values
+
+
+_ROOM_PALETTE_TOOLS = ["create", "move", "delete"]
+_ROOM_PALETTE_CATEGORIES = [
+    "room_tiles",
+    "lights",
+    "doors",
+    "windows",
+    "cameras",
+    "duty_stations",
+    "duty_modules",
+]
+_ROOM_VIEWS = ["plan", "front", "side", "tile_editor"]
+_ROOM_EDIT_SCOPES = ["archetype", "placed"]
+
+
+def _choice_knob(
+    name: str,
+    label: str,
+    choices: list[str],
+    *,
+    default: int = 0,
+    group: str = "",
+) -> KnobSpec:
+    return KnobSpec(
+        name,
+        label,
+        "choice",
+        int(default),
+        0.0,
+        float(max(0, len(choices) - 1)),
+        1.0,
+        "",
+        choices,
+        False,
+        group,
+        ".0f",
+    )
+
+
+def _choice_index(value: Any, choices: list[str]) -> int:
+    try:
+        return choices.index(str(value))
+    except ValueError:
+        try:
+            idx = int(value)
+            return int(np.clip(idx, 0, max(0, len(choices) - 1)))
+        except Exception:
+            return 0
 
 
 def _clamp_float(val: float, k: dict) -> float:
@@ -1009,6 +1127,70 @@ class RoomControlStation(DutyStationHUD):
               "title": "BUILD ROOM STATION"}],
             self.state,
         )
+
+    @property
+    def panel_spec(self) -> Panel:
+        """Controls hierarchy for the live room-control HUD widgets."""
+        self._ensure_room_workspace()
+        selected_items: list[str] = []
+        if isinstance(self._left_panel, RoomTileLibraryPanel):
+            selected_items = [preset.preset_id for preset in self._left_panel.filtered_items()]
+
+        return Panel(
+            "room_control_station",
+            "Room Control",
+            panels=[
+                Panel(
+                    "room_tile_library",
+                    "ROOM LIBRARY",
+                    knobs=[
+                        _choice_knob("palette_tool", "Tool", _ROOM_PALETTE_TOOLS, group="Palette"),
+                        _choice_knob("palette_category", "Category", _ROOM_PALETTE_CATEGORIES, group="Palette"),
+                        _choice_knob("palette_selected", "Preset", selected_items, group="Palette"),
+                        KnobSpec("tile_import_scale", "Import Scale", "float", 1.0, 0.1, 20.0, 0.1, "", [], False, "Tile Editor", ".2f"),
+                        _choice_knob("tile_editor_scope", "Edit Scope", _ROOM_EDIT_SCOPES, group="Tile Editor"),
+                        KnobSpec("tile_editor_selected_mesh", "Selected Mesh", "str", "", 0, 0, 0, "", [], False, "Tile Editor"),
+                    ],
+                    payload={
+                        "source_panel": "RoomTileLibraryPanel",
+                        "actions": [
+                            {"key": "rotate_left", "label": "ROT L"},
+                            {"key": "rotate_right", "label": "ROT R"},
+                            {"key": "import_mesh", "label": "IMPORT"},
+                        ],
+                    },
+                ),
+                Panel(
+                    "room_tile_workspace",
+                    "ROOM MAP",
+                    knobs=[
+                        _choice_knob("room_view", "View", _ROOM_VIEWS, group="Map"),
+                        KnobSpec("room_level", "Level", "int", 0, -64, 64, 1, "", [], False, "Map", ".0f"),
+                        KnobSpec("room_width_cells", "Width", "int", 8, 2, 128, 1, "cells", [], False, "Room", ".0f"),
+                        KnobSpec("room_depth_cells", "Depth", "int", 8, 2, 128, 1, "cells", [], False, "Room", ".0f"),
+                        KnobSpec("room_station_x", "Station X", "int", 0, 0, 128, 1, "cells", [], False, "Station Anchor", ".0f"),
+                        KnobSpec("room_station_y", "Station Y", "int", 0, 0, 128, 1, "cells", [], False, "Station Anchor", ".0f"),
+                        KnobSpec("room_selected_instance", "Selected Instance", "str", "", 0, 0, 0, "", [], False, "Selection"),
+                    ],
+                    payload={
+                        "source_panel": "RoomTileWorkspace",
+                        "actions": [
+                            {"key": "level:-", "label": "Level -"},
+                            {"key": "level:+", "label": "Level +"},
+                            {"key": "dimx:-", "label": "Room X -"},
+                            {"key": "dimx:+", "label": "Room X +"},
+                            {"key": "dimy:-", "label": "Room Y -"},
+                            {"key": "dimy:+", "label": "Room Y +"},
+                        ],
+                    },
+                ),
+                _panel_from_yaml_cfg("room_environment", self._right_cfg, "ENVIRONMENT"),
+            ],
+        )
+
+    @property
+    def knob_values(self) -> dict[str, Any]:
+        return _doc_knob_values_for_specs(self.panel_spec, self.state)
 
     def _ensure_room_workspace(self) -> bool:
         if self._room_workspace is not None:

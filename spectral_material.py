@@ -145,6 +145,13 @@ class SpectralBand:
         bw = self.bandwidth_hz
         if isinstance(bw, (int, float)):
             return max(float(bw), 1e-6)
+        if isinstance(bw, str):
+            try:
+                return max(float(bw), 1e-6)
+            except ValueError:
+                return 1.0
+        if not isinstance(bw, dict):
+            return 1.0
         t = bw.get("type", "")
         if t == "q_factor":
             q = float(bw.get("q", 8.0))

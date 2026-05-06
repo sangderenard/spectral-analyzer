@@ -12437,6 +12437,14 @@ def main():
     pygame.display.set_mode((WIN_W, WIN_H), DOUBLEBUF | OPENGL)
     pygame.display.set_caption("Guitar — FDTD 3-D Visualiser")
 
+    # Load named spectral profiles before any material YAML resolves
+    # emit_profile_name / color_profile_name into database indices.
+    try:
+        import spectral_library
+        spectral_library.load_default_library()
+    except Exception as _exc:
+        print(f"[material_db] spectral library load failed: {_exc}", flush=True)
+
     if args.benchmark_steps > 0:
         _run_benchmark(args)
         pygame.quit()
@@ -12929,6 +12937,12 @@ def main():
                     return None
                 tri_chunks = []
                 mat_chunks = []
+                group_ids = []
+                group_mats = []
+                group_offsets = []
+                group_counts = []
+                group_mvs = []
+                group_dirty = []
 
                 def _resolve_mat_id(_payload: dict) -> int:
                     # Fast integer path only: payload must carry mat_id/mat_ids.
@@ -12955,7 +12969,11 @@ def main():
                     _out[:_arr.shape[0]] = _arr
                     return _out
 
-                for _payload in _leftovers.values():
+                def _stable_group_id(_key: str, _run_idx: int) -> int:
+                    _raw = f"{_key}:{int(_run_idx)}".encode("utf-8", "ignore")
+                    return int.from_bytes(hashlib.blake2s(_raw, digest_size=4).digest(), "little") & 0x7fffffff
+
+                for _key, _payload in _leftovers.items():
                     if not isinstance(_payload, dict):
                         continue
                     if _payload.get('kind') != 'triangles':
@@ -12966,9 +12984,32 @@ def main():
                     _tris = np.asarray(_tris, dtype=np.float32)
                     if _tris.ndim != 3 or _tris.shape[1:] != (3, 3) or _tris.shape[0] == 0:
                         continue
+                    _tri_base = sum(int(_c.shape[0]) for _c in tri_chunks)
                     tri_chunks.append(_tris)
                     _mat_ids_local = _resolve_mat_ids(_payload, int(_tris.shape[0]))
                     mat_chunks.append(_mat_ids_local)
+
+                    # The C rasterizer derives emitter lights from declared
+                    # object groups.  Split each payload into contiguous
+                    # material runs so screen triangles can emit independently
+                    # from non-emissive station body triangles.
+                    _run_start = 0
+                    _run_idx = 0
+                    _identity_mv = np.eye(4, dtype=np.float32).reshape(16)
+                    while _run_start < int(_mat_ids_local.shape[0]):
+                        _mat = int(_mat_ids_local[_run_start])
+                        _run_end = _run_start + 1
+                        while (_run_end < int(_mat_ids_local.shape[0])
+                               and int(_mat_ids_local[_run_end]) == _mat):
+                            _run_end += 1
+                        group_ids.append(_stable_group_id(str(_key), _run_idx))
+                        group_mats.append(_mat)
+                        group_offsets.append(_tri_base + _run_start)
+                        group_counts.append(_run_end - _run_start)
+                        group_mvs.append(_identity_mv)
+                        group_dirty.append(1)  # BR_DIRTY_GEOM
+                        _run_start = _run_end
+                        _run_idx += 1
                 if not tri_chunks:
                     return None
                 tris_world = np.concatenate(tri_chunks, axis=0)        # (Nt, 3, 3)
@@ -13008,15 +13049,30 @@ def main():
                 # br_render parses mvp as a column-major 4x4: proj(r,c) = mvp[c*4+r]
                 proj = np.ascontiguousarray(_P.T.reshape(-1), dtype=np.float32)
 
-                return (verts_view, mat_ids, proj)
+                groups = (
+                    np.ascontiguousarray(group_ids, dtype=np.int32),
+                    np.ascontiguousarray(group_mats, dtype=np.int32),
+                    np.ascontiguousarray(group_offsets, dtype=np.int32),
+                    np.ascontiguousarray(group_counts, dtype=np.int32),
+                    np.ascontiguousarray(group_mvs, dtype=np.float32).reshape(-1, 16),
+                    np.ascontiguousarray(group_dirty, dtype=np.int32),
+                )
+
+                return (verts_view, mat_ids, proj, groups)
             except Exception:
                 return None
+
+        def _legacy_3d_gl_disabled():
+            # Old Renderer shader stack is intentionally bypassed here; keep
+            # the code parked for later renderer separation instead of running
+            # it underneath the C material rasterizer.
+            return None
 
         R._global_dispatcher = _GlobalChannelDispatcher(
             width=WIN_W,
             height=WIN_H,
             gl_doc_renderer=_doc_rdr,
-            gl_render_callback=R.render,
+            gl_render_callback=_legacy_3d_gl_disabled,
             c_doc_backend=getattr(_doc_rdr, "_backend", None),
             geometry_packer=_pack_3d_c_geometry,
             cadence_2d=1,

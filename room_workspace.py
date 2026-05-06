@@ -287,6 +287,7 @@ class RoomWorkspace:
                 st_cfg["module_type"] = str(obj.station_type)
 
             st = DutyStation(st_cfg)
+            st._room_workspace_ref = self
 
             # Unfinished-intent build state is authoritative on each object instance.
             # Keep identity stable: same station object transitions from unfinished to built.
@@ -338,6 +339,8 @@ class RoomWorkspace:
 
             if menu is not None:
                 st.menu = menu
+                if hasattr(menu, "bind_scene_workspace"):
+                    menu.bind_scene_workspace(self)
 
             st.build_gl()
 

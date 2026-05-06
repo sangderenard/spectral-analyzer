@@ -58,6 +58,16 @@ _LEVEL_HEIGHT_M = 1.0
 _ROT_STEPS = 12
 
 
+def _load_yaml_file(path: str) -> dict:
+    if not _HAS_YAML or not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return _yaml.safe_load(handle) or {}
+    except Exception:
+        return {}
+
+
 @dataclass
 class TileMeshItem:
     mesh_id: str
@@ -506,6 +516,13 @@ class RoomTileWorkspace:
         self.cfg = cfg or {}
         editor_cfg = self.cfg.get("room_editor", {})
         grid_size = editor_cfg.get("grid_size", [8, 8])
+        scene_room_cfg = _load_yaml_file(os.path.join("configs", "room_station", "room.yaml"))
+        scene_dims = scene_room_cfg.get("dimensions", {}) if isinstance(scene_room_cfg, dict) else {}
+        if scene_dims:
+            grid_size = [
+                max(int(grid_size[0]), int(math.ceil(float(scene_dims.get("width_m", grid_size[0]))))),
+                max(int(grid_size[1]), int(math.ceil(float(scene_dims.get("depth_m", grid_size[1]))))),
+            ]
         anchor = editor_cfg.get("station_anchor", [max(0, int(grid_size[0] // 2)), 0])
         self.state.setdefault("room_view", "plan")
         self.state.setdefault("room_level", 0)
@@ -513,6 +530,7 @@ class RoomTileWorkspace:
         self.state.setdefault("room_depth_cells", max(2, int(grid_size[1])))
         self.state.setdefault("room_station_x", int(anchor[0]))
         self.state.setdefault("room_station_y", int(anchor[1]))
+        self.state.setdefault("room_snap_policy", "gentle")
         # The deployed map anchor is always the room-control station.
         if "room_control_station" in self.presets:
             self.state["room_station_preset_id"] = "room_control_station"
@@ -530,6 +548,8 @@ class RoomTileWorkspace:
         self.tile_mesh_items_by_instance: Dict[str, List[TileMeshItem]] = {}
         self.tile_action_manifest_by_instance: Dict[str, Dict[str, Any]] = {}
         self.fabrication_orders_by_instance: Dict[str, Dict[str, Any]] = {}
+        self.scene_tile_objects: List[Dict[str, Any]] = self._load_scene_tile_objects(scene_room_cfg)
+        self._sync_station_anchor_from_scene_objects()
         self._next_instance = 1
         self._seed_default_instances()
         self._move_payload: Optional[Tuple[str, str]] = None
@@ -574,6 +594,208 @@ class RoomTileWorkspace:
     def _seed_default_instances(self):
         """Startup stays empty; instances are user-placed or loaded from saved state."""
         return
+
+    def _scene_grid_origin(self, scene_room_cfg: Optional[dict] = None) -> Tuple[float, float]:
+        cfg = scene_room_cfg or _load_yaml_file(os.path.join("configs", "room_station", "room.yaml"))
+        dims = cfg.get("dimensions", {}) if isinstance(cfg, dict) else {}
+        width_m = float(dims.get("width_m", self.state.get("room_width_cells", 8)))
+        return width_m * 0.5, 0.0
+
+    def _world_bounds_to_grid_cells(
+        self,
+        center_xy: np.ndarray,
+        size_xy: np.ndarray,
+        yaw_deg: float,
+        scene_room_cfg: Optional[dict] = None,
+    ) -> Tuple[int, int, int, int, set[Tuple[int, int]]]:
+        half = np.maximum(np.asarray(size_xy, dtype=np.float64) * 0.5, 1e-6)
+        corners = np.array([
+            [-half[0], -half[1]],
+            [ half[0], -half[1]],
+            [ half[0],  half[1]],
+            [-half[0],  half[1]],
+        ], np.float64)
+        theta = math.radians(float(yaw_deg))
+        c = math.cos(theta)
+        s = math.sin(theta)
+        rot = np.empty_like(corners)
+        rot[:, 0] = corners[:, 0] * c - corners[:, 1] * s
+        rot[:, 1] = corners[:, 0] * s + corners[:, 1] * c
+        pts = rot + np.asarray(center_xy, dtype=np.float64).reshape(1, 2)
+        ox, oy = self._scene_grid_origin(scene_room_cfg)
+        pts[:, 0] += ox
+        pts[:, 1] += oy
+        room_width = int(self.state.get("room_width_cells", 8))
+        room_depth = int(self.state.get("room_depth_cells", 8))
+        cells = self._cells_for_bounds(
+            float(pts[:, 0].min()),
+            float(pts[:, 1].min()),
+            float(pts[:, 0].max()),
+            float(pts[:, 1].max()),
+            room_width,
+            room_depth,
+        )
+        if not cells:
+            gx = int(math.floor(float(center_xy[0]) + ox))
+            gy = int(math.floor(float(center_xy[1]) + oy))
+            gx = int(np.clip(gx, 0, max(0, room_width - 1)))
+            gy = int(np.clip(gy, 0, max(0, room_depth - 1)))
+            cells = {(gx, gy)}
+        min_x = min(x for x, _ in cells)
+        min_y = min(y for _, y in cells)
+        max_x = max(x for x, _ in cells)
+        max_y = max(y for _, y in cells)
+        return min_x, min_y, max_x - min_x + 1, max_y - min_y + 1, cells
+
+    @staticmethod
+    def _scene_station_size(obj: dict) -> np.ndarray:
+        cfg_dir = str(obj.get("config_dir", ""))
+        st_cfg = _load_yaml_file(os.path.join(cfg_dir, "station.yaml")) if cfg_dir else {}
+        floor = st_cfg.get("floor_tile", {}) if isinstance(st_cfg, dict) else {}
+        if bool(floor.get("enabled", False)):
+            return np.array([
+                max(0.1, float(floor.get("width", 1.0))),
+                max(0.1, float(floor.get("depth", 1.0))),
+            ], np.float64)
+        cons = st_cfg.get("console", {}) if isinstance(st_cfg, dict) else {}
+        wings = st_cfg.get("side_wings", {}) if isinstance(st_cfg, dict) else {}
+        wing_w = float(wings.get("width", 0.0)) if bool(wings.get("enabled", True)) else 0.0
+        return np.array([
+            max(1.0, float(cons.get("width", 1.2)) + wing_w * 2.0),
+            max(1.0, float(cons.get("depth", 0.8))),
+        ], np.float64)
+
+    @staticmethod
+    def _scene_object_size(obj: dict) -> np.ndarray:
+        kind = str(obj.get("type", "object"))
+        if kind == "duty_station":
+            return RoomTileWorkspace._scene_station_size(obj)
+        if kind == "camera":
+            return np.array([0.55, 0.55], np.float64)
+        if kind == "portal":
+            return np.array([1.0, 0.35], np.float64)
+        if kind == "light":
+            return np.array([0.35, 0.35], np.float64)
+        if kind == "enclosure":
+            dims = obj.get("dims", {}) if isinstance(obj.get("dims", {}), dict) else {}
+            shape = str(obj.get("shape", "rect"))
+            if shape in ("cyl", "tablet_polar"):
+                radius = float(dims.get("radius_m", 0.5))
+                return np.array([radius * 2.0, radius * 2.0], np.float64)
+            if shape == "sphere":
+                radius = float(dims.get("radius_m", 0.5))
+                pedestal = float(dims.get("pedestal_radius_m", radius))
+                r = max(radius, pedestal)
+                return np.array([r * 2.0, r * 2.0], np.float64)
+            if shape == "tablet_rect":
+                return np.array([
+                    max(0.1, float(dims.get("width_m", 1.0))),
+                    max(0.1, float(dims.get("gap_m", 0.08)) + float(dims.get("glass_thickness_m", 0.02)) * 2.0),
+                ], np.float64)
+            return np.array([
+                max(0.1, float(dims.get("width_m", 1.0))),
+                max(0.1, float(dims.get("depth_m", 1.0))),
+            ], np.float64)
+        return np.array([1.0, 1.0], np.float64)
+
+    def _raw_scene_objects_to_tile_objects(
+        self,
+        raw_objects: List[dict],
+        scene_room_cfg: Optional[dict] = None,
+    ) -> List[Dict[str, Any]]:
+        if not raw_objects:
+            raw_objects = [
+                {
+                    "id": "room_control_bootstrap",
+                    "type": "duty_station",
+                    "label": "Room Control",
+                    "pos": [0.0, 0.0, 0.0],
+                    "yaw_deg": 0.0,
+                    "station_type": "room_control",
+                    "config_dir": "configs/duty_stations/room_control",
+                },
+                {
+                    "id": "fabricator_bootstrap",
+                    "type": "duty_station",
+                    "label": "Fabricator",
+                    "pos": [2.0, 0.0, 0.0],
+                    "yaw_deg": 0.0,
+                    "station_type": "fabricator",
+                    "config_dir": "configs/duty_stations/fabricator",
+                },
+            ]
+
+        out: List[Dict[str, Any]] = []
+        for raw in raw_objects:
+            if not isinstance(raw, dict):
+                continue
+            pos = np.asarray(raw.get("pos", [0.0, 0.0, 0.0]), dtype=np.float64).reshape(3)
+            if str(raw.get("type", "")) == "light" and float(pos[2]) > _LEVEL_HEIGHT_M * 1.5:
+                continue
+            size = self._scene_object_size(raw)
+            gx, gy, fw, fd, cells = self._world_bounds_to_grid_cells(
+                pos[:2],
+                size,
+                float(raw.get("yaw_deg", 0.0)),
+                scene_room_cfg,
+            )
+            out.append({
+                "object_id": str(raw.get("id", "")),
+                "label": str(raw.get("label", raw.get("id", "object"))),
+                "type": str(raw.get("type", "object")),
+                "station_type": str(raw.get("station_type", "")),
+                "grid_x": gx,
+                "grid_y": gy,
+                "level": int(math.floor(float(pos[2]) / _LEVEL_HEIGHT_M)),
+                "cardinal": int(round(float(raw.get("yaw_deg", 0.0)) / 90.0)) % 4,
+                "footprint_xy": (max(1, int(fw)), max(1, int(fd))),
+                "cells": cells,
+                "raw": dict(raw),
+            })
+        return out
+
+    def _load_scene_tile_objects(self, scene_room_cfg: Optional[dict] = None) -> List[Dict[str, Any]]:
+        scene = _load_yaml_file(os.path.join("configs", "room_station", "scene.yaml"))
+        raw_objects = list(scene.get("objects", []) or []) if isinstance(scene, dict) else []
+        return self._raw_scene_objects_to_tile_objects(raw_objects, scene_room_cfg)
+
+    def set_scene_objects_from_workspace(self, room_workspace: Any) -> None:
+        objects = getattr(room_workspace, "objects", {})
+        raw_objects: List[dict] = []
+        if isinstance(objects, dict):
+            iterable = objects.values()
+        else:
+            iterable = list(objects or [])
+        for obj in iterable:
+            if hasattr(obj, "to_dict"):
+                try:
+                    raw_objects.append(dict(obj.to_dict()))
+                    continue
+                except Exception:
+                    pass
+            oid = str(getattr(obj, "obj_id", getattr(obj, "id", "")))
+            pos = getattr(obj, "pos", getattr(obj, "world_position", [0.0, 0.0, 0.0]))
+            raw_objects.append({
+                "id": oid,
+                "type": str(getattr(obj, "type", obj.__class__.__name__)).lower(),
+                "label": str(getattr(obj, "label", oid)),
+                "pos": np.asarray(pos, dtype=np.float64).reshape(3).tolist(),
+                "yaw_deg": float(getattr(obj, "yaw_deg", 0.0)),
+            })
+        self.scene_tile_objects = self._raw_scene_objects_to_tile_objects(raw_objects)
+        self._sync_station_anchor_from_scene_objects()
+
+    def _sync_station_anchor_from_scene_objects(self) -> None:
+        for obj in getattr(self, "scene_tile_objects", []) or []:
+            if str(obj.get("type", "")) != "duty_station":
+                continue
+            stype = str(obj.get("station_type", ""))
+            oid = str(obj.get("object_id", "")).lower()
+            if stype not in ("room_control", "room") and "room" not in oid:
+                continue
+            self.state["room_station_x"] = int(obj.get("grid_x", self.state.get("room_station_x", 0)))
+            self.state["room_station_y"] = int(obj.get("grid_y", self.state.get("room_station_y", 0)))
+            return
 
     def _clamp_station(self):
         width = int(self.state.get("room_width_cells", 8))
@@ -789,17 +1011,63 @@ class RoomTileWorkspace:
     def _station_hit(self, grid_x: int, grid_y: int, level: int) -> bool:
         return (grid_x, grid_y, level) in set(self._station_cells())
 
+    def _active_plan_grid_size(self) -> Tuple[int, int]:
+        floor_type = self.state.get("floor_type", "rect")
+        try:
+            idx = int(floor_type)
+            floor_type = ("rect", "polar", "polar_rect_center")[idx] if 0 <= idx < 3 else "rect"
+        except Exception:
+            floor_type = str(floor_type)
+        if floor_type == "polar":
+            radius = max(1.0, float(self.state.get("floor_radius", 8.0)))
+            rings = max(1, int(self.state.get("floor_radial_segments", math.ceil(radius)) or math.ceil(radius)))
+            arcs = max(4, int(self.state.get("floor_angular_segments", max(8, math.ceil(2.0 * math.pi * radius / 2.0))) or 8))
+            return arcs, rings
+        if floor_type == "polar_rect_center":
+            radius = max(1.0, float(self.state.get("floor_radius", 8.0)))
+            rings = max(1, int(self.state.get("floor_radial_segments", math.ceil(radius)) or math.ceil(radius)))
+            arcs = max(4, int(self.state.get("floor_angular_segments", max(8, math.ceil(2.0 * math.pi * radius / 2.0))) or 8))
+            cw = max(2, int(self.state.get("floor_center_w", 4)))
+            cd = max(2, int(self.state.get("floor_center_d", 4)))
+            return max(cw, arcs), cd + rings
+        return max(2, int(self.state.get("room_width_cells", 8))), max(2, int(self.state.get("room_depth_cells", 8)))
+
+    def _auto_rotation_step_for_cell(self, grid_x: int, grid_y: int) -> int:
+        floor_type = self.state.get("floor_type", "rect")
+        try:
+            idx = int(floor_type)
+            floor_type = ("rect", "polar", "polar_rect_center")[idx] if 0 <= idx < 3 else "rect"
+        except Exception:
+            floor_type = str(floor_type)
+        if floor_type == "polar":
+            arcs = max(4, int(self.state.get("floor_angular_segments", 16) or 16))
+            yaw = 360.0 * (int(grid_x) + 0.5) / float(arcs)
+            return int(round(yaw / (360.0 / _ROT_STEPS))) % _ROT_STEPS
+        if floor_type == "polar_rect_center":
+            cd = max(2, int(self.state.get("floor_center_d", 4)))
+            if int(grid_y) < cd:
+                return 0
+            arcs = max(4, int(self.state.get("floor_angular_segments", 16) or 16))
+            cw = max(2, int(self.state.get("floor_center_w", 4)))
+            grid_w = max(cw, arcs)
+            segment = int(grid_x) - (grid_w - arcs) // 2
+            if not (0 <= segment < arcs):
+                return 0
+            yaw = 360.0 * (segment + 0.5) / float(arcs)
+            return int(round(yaw / (360.0 / _ROT_STEPS))) % _ROT_STEPS
+        return 0
+
     def _place_instance(self, grid_x: int, grid_y: int, level: int):
         preset = self.selected_preset()
         if preset is None:
             return
-        if bool(getattr(preset, "network_strict_snap", False)):
+        no_snap = str(self.state.get("room_snap_policy", "gentle")) == "no_snap"
+        if bool(getattr(preset, "network_strict_snap", False)) and not no_snap:
             snapped = self._snap_network_module_anchor(grid_x, grid_y, level, preset)
             if snapped is None:
                 return
             grid_x, grid_y, level = snapped
-        width = int(self.state.get("room_width_cells", 8))
-        depth = int(self.state.get("room_depth_cells", 8))
+        width, depth = self._active_plan_grid_size()
         if grid_x < 0 or grid_y < 0:
             return
         if grid_x + preset.footprint_xy[0] > width or grid_y + preset.footprint_xy[1] > depth:
@@ -820,6 +1088,7 @@ class RoomTileWorkspace:
             grid_x=grid_x,
             grid_y=grid_y,
             level=level,
+            rotation=self._auto_rotation_step_for_cell(grid_x, grid_y),
         )
         self._next_instance += 1
         self.instances.append(instance)
@@ -844,12 +1113,12 @@ class RoomTileWorkspace:
                 preset = self.presets.get(instance.preset_id)
                 if preset is None:
                     return
-                width = int(self.state.get("room_width_cells", 8))
-                depth = int(self.state.get("room_depth_cells", 8))
+                width, depth = self._active_plan_grid_size()
                 nx = int(np.clip(grid_x, 0, width - preset.footprint_xy[0]))
                 ny = int(np.clip(grid_y, 0, depth - preset.footprint_xy[1]))
                 nz = int(np.clip(level, -99, 99))
-                if bool(getattr(preset, "network_strict_snap", False)):
+                no_snap = str(self.state.get("room_snap_policy", "gentle")) == "no_snap"
+                if bool(getattr(preset, "network_strict_snap", False)) and not no_snap:
                     snapped = self._snap_network_module_anchor(nx, ny, nz, preset)
                     if snapped is None:
                         return
@@ -863,6 +1132,7 @@ class RoomTileWorkspace:
                 instance.grid_x = nx
                 instance.grid_y = ny
                 instance.level = nz
+                instance.rotation = self._auto_rotation_step_for_cell(nx, ny)
                 self.state["room_selected_instance"] = instance.instance_id
                 self.invalidate_gl()
                 return
@@ -1113,6 +1383,18 @@ class RoomTileWorkspace:
                 int(inst.level),
                 self._rotation_cardinal_index(int(getattr(inst, "rotation", 0))),
             ))
+        for obj in getattr(self, "scene_tile_objects", []) or []:
+            if str(obj.get("type", "")) != "duty_station":
+                continue
+            fx, fy = obj.get("footprint_xy", (1, 1))
+            out.append((
+                int(obj.get("grid_x", 0)),
+                int(obj.get("grid_y", 0)),
+                int(fx),
+                int(fy),
+                int(obj.get("level", 0)),
+                int(obj.get("cardinal", 0)),
+            ))
         return out
 
     def _station_back_contact_cells(self, sx: int, sy: int, fw: int, fd: int,
@@ -1193,6 +1475,203 @@ class RoomTileWorkspace:
             rect = pygame.Rect(left + x * cell_size, top + y * cell_size, cell_size, cell_size)
             pygame.draw.rect(surface, col, rect.inflate(-8, -8), 1, border_radius=3)
             pygame.draw.circle(surface, col, rect.center, 2)
+
+    @staticmethod
+    def _cells_for_bounds(
+        lo_x: float,
+        lo_y: float,
+        hi_x: float,
+        hi_y: float,
+        room_width: int,
+        room_depth: int,
+    ) -> set[Tuple[int, int]]:
+        eps = 1e-6
+        x0 = int(math.floor((float(lo_x) + eps) / _CELL_SIZE_M))
+        y0 = int(math.floor((float(lo_y) + eps) / _CELL_SIZE_M))
+        x1 = int(math.ceil((float(hi_x) - eps) / _CELL_SIZE_M)) - 1
+        y1 = int(math.ceil((float(hi_y) - eps) / _CELL_SIZE_M)) - 1
+        cells: set[Tuple[int, int]] = set()
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                if 0 <= x < int(room_width) and 0 <= y < int(room_depth):
+                    cells.add((x, y))
+        return cells
+
+    @staticmethod
+    def _rotate_xy(points: np.ndarray, center: np.ndarray, step: int) -> np.ndarray:
+        step = int(step) % _ROT_STEPS
+        if step == 0:
+            return points
+        theta = (float(step) / float(_ROT_STEPS)) * math.tau
+        c = math.cos(theta)
+        s = math.sin(theta)
+        rel = points - center.reshape(1, 2)
+        rot = np.empty_like(rel)
+        rot[:, 0] = rel[:, 0] * c - rel[:, 1] * s
+        rot[:, 1] = rel[:, 0] * s + rel[:, 1] * c
+        return rot + center.reshape(1, 2)
+
+    def _item_world_xy_bounds(
+        self,
+        instance: RoomTileInstance,
+        preset: RoomTilePreset,
+        item: TileMeshItem,
+    ) -> Tuple[float, float, float, float]:
+        base = np.array([
+            float(instance.grid_x) * _CELL_SIZE_M,
+            float(instance.grid_y) * _CELL_SIZE_M,
+        ], np.float64)
+        center = np.asarray(item.pos_xy, dtype=np.float64) + base
+        half = np.maximum(np.asarray(item.bbox_size[:2], dtype=np.float64) * 0.5, 1e-6)
+        corners = np.array([
+            [center[0] - half[0], center[1] - half[1]],
+            [center[0] + half[0], center[1] - half[1]],
+            [center[0] + half[0], center[1] + half[1]],
+            [center[0] - half[0], center[1] + half[1]],
+        ], np.float64)
+        corners = self._rotate_xy(corners, center, int(getattr(item, "yaw_step", 0)))
+        inst_step = int(getattr(instance, "rotation", 0)) % _ROT_STEPS
+        if inst_step:
+            inst_center = base + np.array([
+                0.5 * float(preset.footprint_xy[0]) * _CELL_SIZE_M,
+                0.5 * float(preset.footprint_xy[1]) * _CELL_SIZE_M,
+            ], np.float64)
+            corners = self._rotate_xy(corners, inst_center, inst_step)
+        lo = corners.min(axis=0)
+        hi = corners.max(axis=0)
+        return float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1])
+
+    @staticmethod
+    def _item_intersects_level(instance: RoomTileInstance, item: TileMeshItem, level: int) -> bool:
+        z0 = float(instance.level) * _LEVEL_HEIGHT_M + float(getattr(item, "z_min", 0.0))
+        z1 = z0 + max(1e-6, float(np.asarray(item.bbox_size, dtype=np.float64)[2]))
+        lv0 = float(level) * _LEVEL_HEIGHT_M
+        lv1 = lv0 + _LEVEL_HEIGHT_M
+        return z0 < lv1 and z1 > lv0
+
+    def floor_plan_object_cell_marks(
+        self,
+        level: int,
+        *,
+        snap_policy: str = "gentle",
+    ) -> Dict[Tuple[int, int], Dict[str, Any]]:
+        """Classify placed tile contents for the room plan image map.
+
+        States returned here describe object occupancy inside placed tiles:
+        ``fit`` is wholly inside the owning footprint, ``snap`` is close enough
+        to a non-overlapping tile footprint under gentle policy, ``dual`` and
+        ``quad`` are accepted raw spillover cases, and ``collision`` overlaps
+        another placed footprint or the station anchor.
+        """
+        room_width = int(self.state.get("room_width_cells", 8))
+        room_depth = int(self.state.get("room_depth_cells", 8))
+        policy = str(snap_policy or self.state.get("room_snap_policy", "gentle"))
+        gentle = policy != "no_snap"
+        snap_eps = 0.18 * _CELL_SIZE_M
+
+        owner_by_cell: Dict[Tuple[int, int], str] = {}
+        for sx, sy, sz in self._station_cells():
+            if int(sz) == int(level):
+                owner_by_cell[(int(sx), int(sy))] = "station"
+        for inst in self.instances:
+            preset = self.presets.get(inst.preset_id)
+            if preset is None:
+                continue
+            if not (inst.level <= int(level) < inst.level + preset.level_span):
+                continue
+            for dx in range(int(preset.footprint_xy[0])):
+                for dy in range(int(preset.footprint_xy[1])):
+                    owner_by_cell[(int(inst.grid_x) + dx, int(inst.grid_y) + dy)] = inst.instance_id
+        for obj in getattr(self, "scene_tile_objects", []) or []:
+            if int(obj.get("level", 0)) != int(level):
+                continue
+            oid = str(obj.get("object_id", "scene"))
+            for cell in set(obj.get("cells", set()) or set()):
+                owner_by_cell[(int(cell[0]), int(cell[1]))] = f"scene:{oid}"
+
+        priority = {"fit": 1, "snap": 2, "dual": 3, "quad": 4, "collision": 5}
+        marks: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+        def put(cell: Tuple[int, int], status: str, label: str) -> None:
+            if not (0 <= cell[0] < room_width and 0 <= cell[1] < room_depth):
+                return
+            cur = marks.get(cell)
+            if cur is None or priority[status] >= priority[str(cur.get("status", "fit"))]:
+                marks[cell] = {"status": status, "label": label}
+
+        for inst in self.instances:
+            preset = self.presets.get(inst.preset_id)
+            if preset is None:
+                continue
+            if not (inst.level <= int(level) < inst.level + preset.level_span):
+                continue
+            parent_cells = {
+                (int(inst.grid_x) + dx, int(inst.grid_y) + dy)
+                for dx in range(int(preset.footprint_xy[0]))
+                for dy in range(int(preset.footprint_xy[1]))
+            }
+            for item in self._items_for_instance(inst, preset):
+                if not self._item_intersects_level(inst, item, int(level)):
+                    continue
+                lo_x, lo_y, hi_x, hi_y = self._item_world_xy_bounds(inst, preset, item)
+                raw_cells = self._cells_for_bounds(lo_x, lo_y, hi_x, hi_y, room_width, room_depth)
+                if not raw_cells:
+                    continue
+
+                def blocked(cells: set[Tuple[int, int]]) -> bool:
+                    for cell in cells:
+                        owner = owner_by_cell.get(cell)
+                        if owner not in (None, inst.instance_id):
+                            return True
+                    return False
+
+                if raw_cells.issubset(parent_cells) and not blocked(raw_cells):
+                    for cell in raw_cells:
+                        put(cell, "fit", str(getattr(item, "label", item.mesh_id)))
+                    continue
+
+                snapped_cells: set[Tuple[int, int]] = set()
+                if gentle:
+                    size_x = max(1e-6, float(hi_x - lo_x))
+                    size_y = max(1e-6, float(hi_y - lo_y))
+                    span_x = max(1, int(math.ceil(size_x / _CELL_SIZE_M - 1e-6)))
+                    span_y = max(1, int(math.ceil(size_y / _CELL_SIZE_M - 1e-6)))
+                    cx = 0.5 * (lo_x + hi_x)
+                    cy = 0.5 * (lo_y + hi_y)
+                    ax = int(round(cx / _CELL_SIZE_M - span_x * 0.5))
+                    ay = int(round(cy / _CELL_SIZE_M - span_y * 0.5))
+                    snapped_cx = (float(ax) + span_x * 0.5) * _CELL_SIZE_M
+                    snapped_cy = (float(ay) + span_y * 0.5) * _CELL_SIZE_M
+                    snap_dist = max(abs(snapped_cx - cx), abs(snapped_cy - cy))
+                    snapped_cells = {
+                        (ax + dx, ay + dy)
+                        for dx in range(span_x)
+                        for dy in range(span_y)
+                        if 0 <= ax + dx < room_width and 0 <= ay + dy < room_depth
+                    }
+                    if snap_dist <= snap_eps and snapped_cells and not blocked(snapped_cells):
+                        for cell in snapped_cells:
+                            put(cell, "snap", str(getattr(item, "label", item.mesh_id)))
+                        continue
+
+                status = "quad" if len(raw_cells) >= 4 else "dual" if len(raw_cells) >= 2 else "collision"
+                if blocked(raw_cells):
+                    status = "collision"
+                for cell in raw_cells:
+                    put(cell, status, str(getattr(item, "label", item.mesh_id)))
+        for obj in getattr(self, "scene_tile_objects", []) or []:
+            if int(obj.get("level", 0)) != int(level):
+                continue
+            cells = set(obj.get("cells", set()) or set())
+            if not cells:
+                continue
+            label = str(obj.get("label", obj.get("object_id", "scene")))
+            status = "quad" if len(cells) >= 4 else "dual" if len(cells) >= 2 else "fit"
+            if str(obj.get("type", "")) == "duty_station":
+                status = "fit"
+            for cell in cells:
+                put((int(cell[0]), int(cell[1])), status, label)
+        return marks
 
     @staticmethod
     def _is_room_control_station_preset(preset: Optional[RoomTilePreset]) -> bool:

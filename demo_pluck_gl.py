@@ -11120,7 +11120,7 @@ class _PlayerCameraPanel:
         """Return (left_sections, center_tabs, right_sections) for the duty HUD.
 
         Converts the flat ``_SLIDERS`` list into the three-panel section format
-        consumed by ``CameraDutyStationHUD.from_sections``.
+        previously consumed by the removed generic camera duty-station HUD.
         """
         _groups: dict[str, list] = {
             "computer": [],

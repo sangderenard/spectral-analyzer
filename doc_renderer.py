@@ -252,6 +252,7 @@ class DocRenderer:
 
         dtype   = getattr(knob, "dtype",   "float")
         choices = getattr(knob, "choices", None)
+        widget = str(getattr(knob, "control_widget", "") or "")
         if choices:
             ntype = DR_NODE_KNOB_ENUM
         elif dtype == "bool":
@@ -284,6 +285,35 @@ class DocRenderer:
             except Exception:
                 val_str = str(current_value or "")
 
+        if widget == "stepper":
+            val_str = f"-   {val_str}   +"
+            ntype = DR_NODE_TEXT_LABEL
+        elif widget == "segmented":
+            try:
+                idx = int(current_value or 0)
+            except Exception:
+                idx = 0
+            opts = list(choices or [])
+            val_str = "  ".join(
+                f"[{opt}]" if i == idx else str(opt)
+                for i, opt in enumerate(opts)
+            )
+            ntype = DR_NODE_TEXT_LABEL
+        elif widget == "readonly":
+            ntype = DR_NODE_TEXT_LABEL
+            val_str = f"{label}: {val_str}" if val_str else str(label)
+        elif widget == "button":
+            ntype = DR_NODE_TEXT_LABEL
+            val_str = str(label)
+
+        if widget == "toggle":
+            ntype = DR_NODE_KNOB_BOOL
+
+        if ntype == DR_NODE_TEXT_LABEL and widget in ("stepper", "segmented"):
+            label = f"{label}: {val_str}"
+        elif widget in ("readonly", "button"):
+            label = val_str
+
         self.submit_raw(node_id, rect, ntype,
                         label=label, value_str=val_str,
                         value_norm=_knob_value_norm(knob, current_value),
@@ -291,17 +321,108 @@ class DocRenderer:
                         sibling_order=sibling_order)
         return node_id
 
+    def submit_image_map_panel(self, panel: Any, rect: tuple,
+                               node_id_map: dict,
+                               parent_id: int = 0,
+                               sibling_order: int = -1) -> dict:
+        """Submit a non-parameter image-map Panel with one coordinate action."""
+        x, y, w, h = rect
+        body_key = f"__body__{panel.name}"
+        if body_key not in node_id_map:
+            node_id_map[body_key] = self._alloc_id()
+        body_id = node_id_map[body_key]
+        label = getattr(panel, "label", None) or getattr(panel, "name", "map")
+        self.submit_raw(
+            body_id,
+            rect,
+            DR_NODE_PANEL_BODY,
+            bg=_THEME["bg"],
+            border_px=1,
+            parent_id=parent_id,
+            sibling_order=sibling_order,
+        )
+        image_map = getattr(panel, "payload", {}) or {}
+        mw = max(1, int(image_map.get("width", 1)))
+        mh = max(1, int(image_map.get("height", 1)))
+        palette = list(image_map.get("palette", []) or [])
+        cells = list(image_map.get("cells", []) or [])
+
+        hdr_h = 18
+        hdr_key = f"__hdr__{panel.name}"
+        if hdr_key not in node_id_map:
+            node_id_map[hdr_key] = self._alloc_id()
+        self.submit_raw(
+            node_id_map[hdr_key],
+            (x + 2, y + 2, max(1, w - 4), hdr_h),
+            DR_NODE_PANEL_HEADER,
+            label=label,
+            bg=_THEME["header_bg"],
+            border_px=0,
+            parent_id=body_id,
+            sibling_order=0,
+        )
+
+        map_x = x + 4
+        map_y = y + hdr_h + 6
+        map_w = max(1, w - 8)
+        map_h = max(1, h - hdr_h - 10)
+        cell_w = max(1, map_w // mw)
+        cell_h = max(1, map_h // mh)
+        default_col = (0.12, 0.14, 0.18, 0.92)
+        border_col = (0.28, 0.32, 0.38, 1.0)
+        for index, raw_cell in enumerate(cells):
+            if isinstance(raw_cell, dict):
+                cx = int(raw_cell.get("x", index % mw))
+                cy = int(raw_cell.get("y", index // mw))
+                state = int(raw_cell.get("state", 0))
+                text = str(raw_cell.get("label", ""))
+            else:
+                cx = index % mw
+                cy = index // mw
+                state = int(raw_cell)
+                text = ""
+            if not (0 <= cx < mw and 0 <= cy < mh):
+                continue
+            col = palette[state] if 0 <= state < len(palette) else default_col
+            cell_key = f"__cell__{panel.name}.{cx}.{cy}"
+            if cell_key not in node_id_map:
+                node_id_map[cell_key] = self._alloc_id()
+            self.submit_raw(
+                node_id_map[cell_key],
+                (map_x + cx * cell_w, map_y + cy * cell_h, cell_w, cell_h),
+                DR_NODE_PRIM_RECT,
+                label=text,
+                bg=(0.0, 0.0, 0.0, 0.0),
+                accent=col,
+                border=border_col,
+                border_px=1,
+                parent_id=body_id,
+                sibling_order=10 + cy * mw + cx,
+            )
+        return node_id_map
+
     def submit_panel(self, panel: Any, rect: tuple,
                      node_id_map: dict | None = None,
                      knob_values: dict | None = None,
                      parent_id: int = 0,
-                     sibling_order: int = -1) -> dict:
+                     sibling_order: int = -1,
+                     action_rects: dict | None = None,
+                     knob_rects: dict | None = None) -> dict:
         if node_id_map is None:
             node_id_map = {}
         if knob_values is None:
             knob_values = {}
 
         x, y, w, h = rect
+        payload = getattr(panel, "payload", {}) or {}
+        if isinstance(payload, dict) and payload.get("type") == "image_map":
+            return self.submit_image_map_panel(
+                panel,
+                rect,
+                node_id_map,
+                parent_id=parent_id,
+                sibling_order=sibling_order,
+            )
 
         body_key = f"__body__{panel.name}"
         if body_key not in node_id_map:
@@ -339,14 +460,49 @@ class DocRenderer:
                 parent_id=body_id,
                 sibling_order=10 + knob_i,
             )
+            if knob_rects is not None:
+                knob_rects[kname] = {
+                    "rect": (x + PAD, cursor_y, w - PAD * 2, KNOB_H),
+                    "widget": str(getattr(knob, "control_widget", "") or ""),
+                    "choices": list(getattr(knob, "choices", []) or []),
+                    "low": float(getattr(knob, "low", 0.0)),
+                    "high": float(getattr(knob, "high", 1.0)),
+                    "step": float(getattr(knob, "step", 0.0)),
+                    "dtype": str(getattr(knob, "dtype", "float")),
+                }
             cursor_y += KNOB_H + PAD
+
+        actions = payload.get("actions", []) if isinstance(payload, dict) else []
+        for action_i, action in enumerate(actions or []):
+            if not isinstance(action, dict):
+                continue
+            action_key = str(action.get("key", action_i))
+            label = str(action.get("label", action_key))
+            map_key = f"__action__{panel.name}.{action_key}"
+            if map_key not in node_id_map:
+                node_id_map[map_key] = self._alloc_id()
+            self.submit_raw(
+                node_id_map[map_key],
+                (x + PAD, cursor_y, w - PAD * 2, 24),
+                DR_NODE_TEXT_LABEL,
+                label=label,
+                bg=_THEME["header_bg"],
+                border_px=1,
+                parent_id=body_id,
+                sibling_order=50 + action_i,
+            )
+            if action_rects is not None:
+                action_rects[f"{panel.name}.{action_key}"] = (x + PAD, cursor_y, w - PAD * 2, 24)
+            cursor_y += 24 + PAD
 
         for sub_i, sub in enumerate(getattr(panel, "panels", []) or []):
             sub_h    = max(60, h - (cursor_y - y) - PAD)
             sub_rect = (x + PAD, cursor_y, w - PAD * 2, sub_h)
             self.submit_panel(sub, sub_rect, node_id_map, knob_values,
                               parent_id=body_id,
-                              sibling_order=100 + sub_i)
+                              sibling_order=100 + sub_i,
+                              action_rects=action_rects,
+                              knob_rects=knob_rects)
             cursor_y += sub_h + PAD
 
         return node_id_map

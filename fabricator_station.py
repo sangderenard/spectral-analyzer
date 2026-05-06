@@ -64,7 +64,7 @@ from fabricator_programmatic_blueprints import (
     default_knob_values as _default_programmatic_knob_values,
     load_programmatic_blueprints,
 )
-from controls import KnobSpec, Panel
+from controls import KnobSpec, Panel, choice_knob, readonly_knob, set_knob_widget, stepper_knob, toggle_knob
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -754,7 +754,7 @@ class FabricatorStation:
     def _programmatic_knob_to_knobspec(prefix: str, spec: ProgrammaticKnobSpec) -> KnobSpec:
         dtype = "choice" if spec.dtype == "choice" else spec.dtype
         choices = list(spec.choices or []) if dtype == "choice" else []
-        return KnobSpec(
+        knob = KnobSpec(
             f"{prefix}{spec.name}",
             spec.label,
             dtype,
@@ -768,76 +768,130 @@ class FabricatorStation:
             spec.group or "Parameters",
             spec.fmt or ".3f",
         )
+        if dtype == "choice":
+            return set_knob_widget(knob, "segmented")
+        if dtype in ("float", "int"):
+            return set_knob_widget(knob, "stepper")
+        return knob
 
     @property
     def panel_spec(self) -> Panel:
-        """Hierarchical document descriptor for the station controls."""
+        """Controls hierarchy for the live fabricator HUD widgets."""
         ws = self.workspace
         process_tabs = ["milling", "drilling", "subtractive", "additive", "beveling", "assembling"]
         mode_choices = [m.value for m in WorkspaceMode]
+        sym_modes = ["none", "bilateral", "radial"]
+        axes = ["x", "y", "z"]
+        snap_angles = ["5", "15", "30"]
+        radial_counts = ["2", "3", "4", "5", "6", "8"]
+
+        self._left_panel._refresh_blueprints()
+        component_items = [str(entry.get("id", "")) for entry in self._left_panel._active_entries()]
+        component_items = [item for item in component_items if item]
+        programmatic_choices = [bp.id for bp in self._prog_blueprints]
         active_bp = self._selected_programmatic_blueprint()
 
         panels = [
             Panel(
-                "fabricator_library",
-                "Library",
+                "fabricator_components",
+                "COMPONENTS",
                 knobs=[
-                    KnobSpec("library_tab", "Catalog tab", "choice", 0, 0, 1, 1, "", ["shapes", "blueprints"], False, "Library"),
-                    KnobSpec("selected_item", "Selected item", "str", "", 0, 0, 0, "", [], False, "Library"),
-                    KnobSpec("center_mode", "Center mode", "choice", 0, 0, 1, 1, "", ["workspace", "programmatic"], False, "Library"),
-                    KnobSpec("programmatic_blueprint", "Programmatic BP", "str", "", 0, 0, 0, "", [], False, "Library"),
+                    choice_knob("library_tab", "Tab", ["Shapes", "Blueprints"], group="COMPONENTS", widget="segmented"),
+                    choice_knob("selected_item", "Item", component_items, group="COMPONENTS", widget="select"),
                 ],
+                payload={"source_panel": "_SolidPickerPanel"},
             ),
             Panel(
-                "fabricator_workspace",
-                "Workspace",
+                "fabricator_center",
+                "WORKSPACE VIEWPORT",
                 knobs=[
-                    KnobSpec("workspace_mode", "Mode", "choice", 0, 0, max(0, len(mode_choices) - 1), 1, "", mode_choices, False, "Workspace"),
-                    KnobSpec("process_tab", "Process", "choice", 0, 0, len(process_tabs) - 1, 1, "", process_tabs, False, "Workspace"),
-                    KnobSpec("picked_id", "Picked", "str", "", 0, 0, 0, "", [], False, "Workspace"),
-                    KnobSpec("hover_face", "Hover face", "int", -1, -1, 100000, 1, "", [], False, "Workspace", ".0f"),
-                    KnobSpec("operation_count", "Operations", "int", 0, 0, 100000, 1, "", [], False, "Workspace", ".0f"),
+                    choice_knob("center_mode", "Center Tab", ["WORKSPACE", "PROGRAMMATIC"], group="CENTER", widget="segmented"),
+                    readonly_knob("workspace_mode", "Mode", "choice", group="Workspace"),
+                    readonly_knob("picked_id", "Picked", group="Workspace"),
+                    readonly_knob("hover_face", "Hover face", "int", default=-1, group="Workspace", fmt=".0f"),
+                    readonly_knob("operation_count", "Operations", "int", default=0, group="Workspace", fmt=".0f"),
+                    choice_knob("programmatic_blueprint", "Blueprint", programmatic_choices, group="PROGRAMMATIC", widget="select"),
                 ],
+                payload={
+                    "source_panel": "FabricatorStation center tabs",
+                    "actions": [{"key": "prog_refresh", "label": "Refresh"}],
+                },
             ),
             Panel(
-                "fabricator_snap_gimbal",
-                "Snap / Gimbal",
+                "fabricator_fabrication",
+                "FABRICATION",
                 knobs=[
-                    KnobSpec("gimbal_pan_deg", "Pan", "float", 0.0, -360.0, 360.0, 0, "deg", [], False, "Gimbal", ".1f"),
-                    KnobSpec("gimbal_tilt_deg", "Tilt", "float", 0.0, -85.0, 85.0, 0, "deg", [], False, "Gimbal", ".1f"),
-                    KnobSpec("snap_enabled", "Snap", "bool", True, 0, 1, 1, "", [], False, "Snap"),
-                    KnobSpec("snap_angle_deg", "Snap angle", "float", 15.0, 1.0, 90.0, 0, "deg", [], False, "Snap", ".1f"),
-                    KnobSpec("snap_distance_m", "Snap dist", "float", 0.08, 0.001, 1.0, 0, "m", [], False, "Snap", ".3f"),
+                    choice_knob("process_tab", "Process", process_tabs, group="FABRICATION", widget="segmented"),
+                    stepper_knob("gimbal_pan_deg", "Gimbal Pan", "float", 0.0, -360.0, 360.0, 15.0, unit="deg", group="Gimbal", fmt=".1f"),
+                    stepper_knob("gimbal_tilt_deg", "Gimbal Tilt", "float", 0.0, -85.0, 85.0, 15.0, unit="deg", group="Gimbal", fmt=".1f"),
+                    toggle_knob("snap_enabled", "Snap", default=True, group="Snap"),
+                    choice_knob("snap_angle_choice", "Snap Step", snap_angles, group="Snap", widget="segmented"),
+                    stepper_knob("snap_distance_m", "Snap Distance", "float", 0.08, 0.001, 1.0, 0.01, unit="m", group="Snap", fmt=".3f"),
                 ],
+                payload={
+                    "source_panel": "_SymmetryPanel",
+                    "actions": [
+                        {"key": "g_pan_l", "label": "Pan-"},
+                        {"key": "g_pan_r", "label": "Pan+"},
+                        {"key": "g_tilt_l", "label": "Tilt-"},
+                        {"key": "g_tilt_r", "label": "Tilt+"},
+                        {"key": "g_reset", "label": "Reset Gimbal"},
+                    ],
+                },
             ),
             Panel(
                 "fabricator_symmetry",
-                "Symmetry",
+                "SYMMETRY",
                 knobs=[
-                    KnobSpec("symmetry_mode", "Mode", "choice", 0, 0, 2, 1, "", ["none", "bilateral", "radial"], False, "Symmetry"),
-                    KnobSpec("symmetry_axis", "Axis", "choice", 2, 0, 2, 1, "", ["x", "y", "z"], False, "Symmetry"),
-                    KnobSpec("symmetry_count", "Count", "int", 4, 2, 16, 1, "", [], False, "Symmetry", ".0f"),
+                    choice_knob("symmetry_mode", "Mode", sym_modes, group="SYMMETRY", widget="segmented"),
+                    choice_knob("symmetry_axis", "Axis", axes, group="SYMMETRY", widget="segmented"),
+                    choice_knob("symmetry_count_choice", "Copies", radial_counts, group="SYMMETRY", widget="segmented"),
                 ],
             ),
             Panel(
-                "fabricator_store",
-                "Store",
+                "fabricator_build_store",
+                "BUILD / STORE",
                 knobs=[
-                    KnobSpec("inventory_count", "Inventory", "int", 0, 0, 100000, 1, "", [], False, "Store", ".0f"),
-                    KnobSpec("last_export_path", "Last export", "str", "", 0, 0, 0, "", [], False, "Store"),
-                    KnobSpec("last_import_path", "Last import", "str", "", 0, 0, 0, "", [], False, "Store"),
+                    readonly_knob("build_state", "Build State", "choice", group="BUILD"),
+                    readonly_knob("inventory_count", "Inventory", "int", default=0, group="Store", fmt=".0f"),
+                    readonly_knob("last_export_path", "Last export", group="Store"),
+                    readonly_knob("last_import_path", "Last import", group="Store"),
                 ],
+                payload={
+                    "source_panel": "_SymmetryPanel",
+                    "actions": [
+                        {"key": "op_drill", "label": "Drill Cut (face)"},
+                        {"key": "op_mill", "label": "Mill Plane Cut"},
+                        {"key": "op_bevel", "label": "Tag Bevel Step"},
+                        {"key": "op_assemble", "label": "Assemble Preview"},
+                        {"key": "confirm", "label": "[ OK ] Confirm"},
+                        {"key": "cancel_place", "label": "[  X ] Cancel"},
+                        {"key": "undo", "label": "[<--] Undo"},
+                        {"key": "import_blueprint", "label": "Import Latest Blueprint"},
+                        {"key": "replay_blueprint", "label": "Replay Blueprint"},
+                        {"key": "review", "label": "Review Build"},
+                        {"key": "store", "label": "[+] Store to Inventory"},
+                        {"key": "export_blueprint", "label": "Export Blueprint"},
+                        {"key": "clear", "label": "[x] Clear Build"},
+                        {"key": "exit_review", "label": "< Back"},
+                    ],
+                },
             ),
         ]
 
         if active_bp is not None:
             panels.append(Panel(
-                "fabricator_programmatic_params",
-                f"Programmatic: {active_bp.label}",
+                "fabricator_programmatic_parameters",
+                "PARAMETERS",
                 knobs=[
                     self._programmatic_knob_to_knobspec("programmatic.", spec)
                     for spec in active_bp.knobspec
                 ],
+                payload={
+                    "source_panel": "FabricatorStation._render_programmatic_knob_panel",
+                    "blueprint_id": active_bp.id,
+                    "actions": [{"key": "print_item", "label": "Print Item"}],
+                },
             ))
 
         return Panel("fabricator_station", "Fabricator", panels=panels)
@@ -849,12 +903,18 @@ class FabricatorStation:
         mode_choices = [m.value for m in WorkspaceMode]
         sym_modes = ["none", "bilateral", "radial"]
         axes = ["x", "y", "z"]
+        snap_angles = ["5", "15", "30"]
+        radial_counts = ["2", "3", "4", "5", "6", "8"]
+        self._left_panel._refresh_blueprints()
+        component_items = [str(entry.get("id", "")) for entry in self._left_panel._active_entries()]
+        component_items = [item for item in component_items if item]
+        programmatic_choices = [bp.id for bp in self._prog_blueprints]
         active_bp = self._selected_programmatic_blueprint()
         vals: dict[str, Any] = {
             "library_tab": 1 if self._left_panel.tab == "blueprints" else 0,
-            "selected_item": self._left_panel.selected or "",
+            "selected_item": self._choice_index(self._left_panel.selected or "", component_items),
             "center_mode": 1 if self._center_mode == "programmatic" else 0,
-            "programmatic_blueprint": self._prog_selected_id,
+            "programmatic_blueprint": self._choice_index(self._prog_selected_id, programmatic_choices),
             "workspace_mode": self._choice_index(getattr(ws.mode, "value", ws.mode), mode_choices),
             "process_tab": self._choice_index(ws.process_tab, process_tabs),
             "picked_id": ws.picked_id or "",
@@ -863,11 +923,14 @@ class FabricatorStation:
             "gimbal_pan_deg": float(ws.gimbal[0]),
             "gimbal_tilt_deg": float(ws.gimbal[1]),
             "snap_enabled": bool(ws.snap_enabled),
+            "snap_angle_choice": self._choice_index(str(int(round(float(ws.snap_angle_deg)))), snap_angles),
             "snap_angle_deg": float(ws.snap_angle_deg),
             "snap_distance_m": float(ws.snap_distance_m),
             "symmetry_mode": self._choice_index(ws.symmetry.mode, sym_modes),
             "symmetry_axis": self._choice_index(ws.symmetry.axis, axes),
+            "symmetry_count_choice": self._choice_index(str(int(ws.symmetry.count)), radial_counts),
             "symmetry_count": int(ws.symmetry.count),
+            "build_state": self._choice_index(getattr(ws.mode, "value", ws.mode), mode_choices),
             "inventory_count": len(ws.inventory),
             "last_export_path": ws.last_export_path,
             "last_import_path": ws.last_import_path,
@@ -882,6 +945,72 @@ class FabricatorStation:
                 else:
                     vals[key] = value
         return vals
+
+    def submit_doc_channel(self, doc_rdr, win_w: int, win_h: int) -> None:
+        """Submit fabricator HUD as left, center, and right station panels."""
+        spec = self.panel_spec
+        values = self.knob_values
+        if not hasattr(self, "_doc_id_map"):
+            self._doc_id_map = {}
+
+        panels = list(getattr(spec, "panels", []) or [])
+        if not panels:
+            return
+
+        left_w = int(self.LEFT_W)
+        right_w = int(self.RIGHT_W)
+        center_w = max(160, int(win_w) - left_w - right_w)
+        panel_h = max(80, int(win_h))
+
+        # Left: actual Components panel.
+        doc_rdr.submit_panel(
+            panels[0],
+            (0, 0, left_w, panel_h),
+            node_id_map=self._doc_id_map,
+            knob_values=values,
+            sibling_order=0,
+        )
+
+        # Center: workspace/programmatic tab controls, plus active programmatic
+        # parameter panel when present.
+        center_controls_h = min(300, max(160, panel_h // 3))
+        doc_rdr.submit_panel(
+            panels[1],
+            (left_w, 0, center_w, center_controls_h),
+            node_id_map=self._doc_id_map,
+            knob_values=values,
+            sibling_order=1,
+        )
+        center_y = center_controls_h
+        if len(panels) > 5:
+            doc_rdr.submit_panel(
+                panels[5],
+                (left_w, center_y, center_w, max(80, panel_h - center_y)),
+                node_id_map=self._doc_id_map,
+                knob_values=values,
+                sibling_order=2,
+            )
+
+        # Right: the actual right-side fabrication/symmetry/build-store control
+        # groups, stacked in the same column that _SymmetryPanel occupies.
+        right_x = left_w + center_w
+        right_panels = panels[2:5]
+        remaining = panel_h
+        y = 0
+        for i, panel in enumerate(right_panels):
+            if i == len(right_panels) - 1:
+                ph = max(80, remaining)
+            else:
+                ph = min(max(120, panel_h // 3), max(80, remaining - 80 * (len(right_panels) - i - 1)))
+            doc_rdr.submit_panel(
+                panel,
+                (right_x, y, right_w, ph),
+                node_id_map=self._doc_id_map,
+                knob_values=values,
+                sibling_order=3 + i,
+            )
+            y += ph
+            remaining = max(0, panel_h - y)
 
     @classmethod
     def from_yaml(cls, ws_path: str, palette_path: str) -> "FabricatorStation":

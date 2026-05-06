@@ -989,6 +989,97 @@ def slider_defs_to_knobs(
     return out
 
 
+def set_knob_widget(knob: Any, widget: str, **metadata: Any) -> Any:
+    """Attach form-layout metadata to a KnobSpec and return it."""
+    setattr(knob, "control_widget", str(widget))
+    if metadata:
+        setattr(knob, "widget_metadata", dict(metadata))
+    return knob
+
+
+def choice_knob(
+    name: str,
+    label: str,
+    choices: Iterable[Any],
+    *,
+    default: int = 0,
+    group: str = "",
+    widget: str = "select",
+) -> Any:
+    vals = [str(v) for v in choices]
+    return set_knob_widget(
+        KnobSpec(str(name), str(label), "choice", int(default), 0.0,
+                 float(max(0, len(vals) - 1)), 1.0, "", vals, False,
+                 group, ".0f"),
+        widget,
+    )
+
+
+def stepper_knob(
+    name: str,
+    label: str,
+    dtype: str,
+    default: Any,
+    low: float,
+    high: float,
+    step: float,
+    *,
+    unit: str = "",
+    group: str = "",
+    fmt: str = ".3g",
+) -> Any:
+    return set_knob_widget(
+        KnobSpec(str(name), str(label), str(dtype), default, float(low),
+                 float(high), float(step), unit, [], False, group, fmt),
+        "stepper",
+    )
+
+
+def readonly_knob(
+    name: str,
+    label: str,
+    dtype: str = "str",
+    *,
+    default: Any = "",
+    group: str = "",
+    fmt: str = ".3g",
+) -> Any:
+    return set_knob_widget(
+        KnobSpec(str(name), str(label), str(dtype), default, 0.0, 0.0, 0.0,
+                 "", [], False, group, fmt),
+        "readonly",
+    )
+
+
+def toggle_knob(
+    name: str,
+    label: str,
+    *,
+    default: bool = False,
+    group: str = "",
+) -> Any:
+    return set_knob_widget(
+        KnobSpec(str(name), str(label), "bool", bool(default), 0.0, 1.0, 1.0,
+                 "", [], False, group, ".0f"),
+        "toggle",
+    )
+
+
+def button_knob(
+    name: str,
+    label: str,
+    *,
+    group: str = "",
+    action_key: str = "",
+) -> Any:
+    return set_knob_widget(
+        KnobSpec(str(name), str(label), "bool", False, 0.0, 1.0, 1.0,
+                 "", [], False, group, ".0f"),
+        "button",
+        action_key=action_key or str(name),
+    )
+
+
 def knobs_to_object_nodes(
     knobs: Iterable[Any],
     *,
@@ -1782,6 +1873,12 @@ __all__ = [
     "start_action_dispatcher",
     "stop_action_dispatcher",
     "slider_defs_to_knobs",
+    "set_knob_widget",
+    "choice_knob",
+    "stepper_knob",
+    "readonly_knob",
+    "toggle_knob",
+    "button_knob",
     "knobs_to_object_nodes",
     "register_triangle_group_action",
     "ShaderSpec",

@@ -470,8 +470,6 @@ floor_tile:
 
 # ── Panels (left / center / right) ───────────────────────────────────────────
 panels:
-  left:    left_controls.yaml
-  center:  center_controls.yaml
   right:   right_controls.yaml
 
   layout:

@@ -31,6 +31,24 @@
  *     [4..6]  color.rgb
  *     [7]     _pad
  *
+ *   TextureStackRecord (cold optional chunk) — 16 floats/material
+ *     [0]     emit_uv_layer      (-1 = none)
+ *     [1]     color_uv_layer     (-1 = none)
+ *     [2]     depth_uv_layer     (-1 = none)
+ *     [3]     remit_uv_layer     (-1 = none)
+ *     [4]     depth_scale_mm
+ *     [5]     thickness_scale_mm
+ *     [6]     depth_bias_mm
+ *     [7]     thickness_bias_mm
+ *     [8]     emit_gain
+ *     [9]     color_blend
+ *     [10]    direct_lobe_power
+ *     [11]    model_flags_or_indices
+ *     [12]    remit_gain
+ *     [13]    remit_attack
+ *     [14]    remit_decay
+ *     [15]    translucence_gain
+ *
  * Geometry input:
  *   verts_view — (n_tris * 3, 6) float32: [x,y,z, nx,ny,nz] per vertex in
  *                VIEW space (after MV, before projection).
@@ -75,6 +93,30 @@ void br_clear(BaseRasterizerState* st, float r, float g, float b, float a);
 void br_set_pbr_chunk   (BaseRasterizerState* st, const float* data, int n_materials);
 void br_set_phong_chunk (BaseRasterizerState* st, const float* data, int n_materials);
 void br_set_enamel_chunk(BaseRasterizerState* st, const float* data, int n_materials);
+void br_set_texture_stack_chunk(BaseRasterizerState* st, const float* data, int n_materials);
+
+/* Copy an RGBA8 emission texture array into the rasterizer.  Data is tightly
+   packed as layers × height × width × 4 bytes. */
+void br_set_emit_uv_texture_array(BaseRasterizerState* st,
+                                  const uint8_t* data,
+                                  int width,
+                                  int height,
+                                  int layers);
+void br_set_color_uv_texture_array(BaseRasterizerState* st,
+                                   const uint8_t* data,
+                                   int width,
+                                   int height,
+                                   int layers);
+void br_set_depth_uv_texture_array(BaseRasterizerState* st,
+                                   const uint8_t* data,
+                                   int width,
+                                   int height,
+                                   int layers);
+void br_set_remit_uv_texture_array(BaseRasterizerState* st,
+                                   const uint8_t* data,
+                                   int width,
+                                   int height,
+                                   int layers);
 
 /* ── Scene illumination ──────────────────────────────────────────────────── */
 
@@ -150,6 +192,8 @@ void br_set_groups(BaseRasterizerState* st,
 /* Cap the number of cluster-lights emitted per frame from the group cache.
    Clamped internally to [1, SceneParams::MAX_LIGHTS]. */
 void br_set_max_lights(BaseRasterizerState* st, int max_lights);
+void br_set_specular_enabled(BaseRasterizerState* st, int enabled);
+void br_set_emission_direct_enabled(BaseRasterizerState* st, int enabled);
 
 /* ── Render ──────────────────────────────────────────────────────────────── */
 
@@ -168,6 +212,13 @@ void br_render(BaseRasterizerState* st,
                int          n_tris,
                const float* mvp);
 
+/* Variant whose vertex rows are [x,y,z, nx,ny,nz, u,v]. */
+void br_render_textured(BaseRasterizerState* st,
+                        const float* verts_view_uv,
+                        const int*   mat_ids,
+                        int          n_tris,
+                        const float* mvp);
+
 /* ── Readback ────────────────────────────────────────────────────────────── */
 
 /* Copy the colour buffer to out_rgba (height * width * 4 uint8, RGBA).
@@ -177,6 +228,11 @@ void br_readback_u8(const BaseRasterizerState* st, uint8_t* out_rgba);
 /* Raw linear float readback (height * width * 4 float32, RGBA [0,1]).
    Use when you plan to upload to a GL texture for tone-mapping yourself. */
 void br_readback_f32(const BaseRasterizerState* st, float* out_rgba);
+
+/* O(1) readback pointer to internal linear float color buffer.
+   Layout is tightly packed [height][width][4] in row-major order.
+   Pointer is valid until the rasterizer is destroyed or resized. */
+const float* br_readback_f32_ptr(const BaseRasterizerState* st);
 
 /* Query dimensions. */
 int br_width (const BaseRasterizerState* st);

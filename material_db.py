@@ -22,6 +22,7 @@ Chunked layout (NOT interleaved / AoS)
 For N registered materials each tensor is shape (N, stride_floats):
 
     pbr_chunk         (N, 16)            — full authored PBR record
+    texture_stack     (N, 16)            — optional base-shader texture stack
     phong_compat      (N,  8)            — DOWNSTREAM-ONLY Phong sink
     raymat_compat     (N, 16)            — DOWNSTREAM-ONLY raytracer sink
     spectral_chunk    (N, MAX_BANDS, 12) — per-frequency-band properties
@@ -261,11 +262,52 @@ class EnamelRecord(ctypes.Structure):
 
 assert ctypes.sizeof(EnamelRecord) == 8 * 4, "EnamelRecord layout broken"
 
+
+class TextureStackRecord(ctypes.Structure):
+    """16 floats = 64 bytes (4 × vec4) — base-shader texture stack.
+
+    Kept parallel to PBR16 so ordinary shading still fetches a single 64-byte
+    PBR row. Texture-enabled paths can opt into this second chunk.
+
+    GLSL/C layout:
+        vec4 layers;   // x=emit_uv_layer, y=color_uv_layer,
+                       // z=depth_uv_layer, w=remit_uv_layer
+        vec4 depth;    // x=depth_scale_mm, y=thickness_scale_mm,
+                       // z=depth_bias_mm, w=thickness_bias_mm
+        vec4 controls; // x=emit_gain, y=color_blend,
+                       // z=direct_lobe_power, w=model_flags_or_indices
+        vec4 remit;    // x=remit_gain, y=bulb_radius_mm,
+                       // z=remit_decay, w=translucence_gain
+    """
+    _pack_ = 4
+    _fields_ = [
+        ('emit_uv_layer',      ctypes.c_float),
+        ('color_uv_layer',     ctypes.c_float),
+        ('depth_uv_layer',     ctypes.c_float),
+        ('remit_uv_layer',     ctypes.c_float),
+        ('depth_scale_mm',     ctypes.c_float),
+        ('thickness_scale_mm', ctypes.c_float),
+        ('depth_bias_mm',      ctypes.c_float),
+        ('thickness_bias_mm',  ctypes.c_float),
+        ('emit_gain',          ctypes.c_float),
+        ('color_blend',        ctypes.c_float),
+        ('direct_lobe_power',  ctypes.c_float),
+        ('model_flags',        ctypes.c_float),
+        ('remit_gain',         ctypes.c_float),
+        ('bulb_radius_mm',     ctypes.c_float),
+        ('remit_decay',        ctypes.c_float),
+        ('translucence_gain',  ctypes.c_float),
+    ]
+
+
+assert ctypes.sizeof(TextureStackRecord) == 16 * 4, "TextureStackRecord layout broken"
+
 # ── Chunk strides in floats ───────────────────────────────────────────────────
 PBR_FLOATS      = ctypes.sizeof(PBRBaseRecord)  // 4   # 16
 PHONG_FLOATS    = ctypes.sizeof(PhongRecord)    // 4   # 8
 RAYMAT_FLOATS   = ctypes.sizeof(RayMatRecord)   // 4   # 20
 ENAMEL_FLOATS   = ctypes.sizeof(EnamelRecord)   // 4   # 8
+TEXSTACK_FLOATS = ctypes.sizeof(TextureStackRecord) // 4 # 16
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Fill helpers: Any (Material object or dict) → record
@@ -435,6 +477,65 @@ def _fill_enamel(rec: EnamelRecord, mat: Any) -> None:
         rec.roughness    = float(getattr(enamel, 'roughness', 0.05))
         c = getattr(enamel, 'color_rgb', [1.0, 1.0, 1.0])
     rec.color[0], rec.color[1], rec.color[2] = float(c[0]), float(c[1]), float(c[2])
+
+
+def _fill_texture_stack(rec: TextureStackRecord, mat: Any) -> None:
+    """Fill optional UV texture-stack metadata from dict/object attributes."""
+    rec.emit_uv_layer = -1.0
+    rec.color_uv_layer = -1.0
+    rec.depth_uv_layer = -1.0
+    rec.remit_uv_layer = -1.0
+    rec.depth_scale_mm = 0.0
+    rec.thickness_scale_mm = 0.0
+    rec.depth_bias_mm = 0.0
+    rec.thickness_bias_mm = 0.0
+    rec.emit_gain = 1.0
+    rec.color_blend = 1.0
+    rec.direct_lobe_power = 32.0
+    rec.model_flags = 0.0
+    rec.remit_gain = 0.0
+    rec.bulb_radius_mm = 0.0
+    rec.remit_decay = 0.0
+    rec.translucence_gain = 0.0
+
+    if isinstance(mat, dict):
+        src = mat.get('texture_stack', mat)
+        if not isinstance(src, dict):
+            src = mat
+        rec.emit_uv_layer = float(src.get('emit_uv_layer', rec.emit_uv_layer))
+        rec.color_uv_layer = float(src.get('color_uv_layer', rec.color_uv_layer))
+        rec.depth_uv_layer = float(src.get('depth_uv_layer', src.get('depth_layer', rec.depth_uv_layer)))
+        rec.remit_uv_layer = float(src.get('remit_uv_layer', src.get('remit_mask_layer', rec.remit_uv_layer)))
+        rec.depth_scale_mm = float(src.get('depth_scale_mm', rec.depth_scale_mm))
+        rec.thickness_scale_mm = float(src.get('thickness_scale_mm', rec.thickness_scale_mm))
+        rec.depth_bias_mm = float(src.get('depth_bias_mm', rec.depth_bias_mm))
+        rec.thickness_bias_mm = float(src.get('thickness_bias_mm', rec.thickness_bias_mm))
+        rec.emit_gain = float(src.get('emit_gain', rec.emit_gain))
+        rec.color_blend = float(src.get('color_blend', rec.color_blend))
+        rec.direct_lobe_power = float(src.get('direct_lobe_power', rec.direct_lobe_power))
+        rec.model_flags = float(src.get('model_flags', src.get('texture_flags', src.get('flags', rec.model_flags))))
+        rec.remit_gain = float(src.get('remit_gain', rec.remit_gain))
+        rec.bulb_radius_mm = float(src.get('bulb_radius_mm', rec.bulb_radius_mm))
+        rec.remit_decay = float(src.get('remit_decay', rec.remit_decay))
+        rec.translucence_gain = float(src.get('translucence_gain', rec.translucence_gain))
+        return
+
+    rec.emit_uv_layer = float(getattr(mat, 'emit_uv_layer', rec.emit_uv_layer))
+    rec.color_uv_layer = float(getattr(mat, 'color_uv_layer', rec.color_uv_layer))
+    rec.depth_uv_layer = float(getattr(mat, 'depth_uv_layer', getattr(mat, 'depth_layer', rec.depth_uv_layer)))
+    rec.remit_uv_layer = float(getattr(mat, 'remit_uv_layer', getattr(mat, 'remit_mask_layer', rec.remit_uv_layer)))
+    rec.depth_scale_mm = float(getattr(mat, 'depth_scale_mm', rec.depth_scale_mm))
+    rec.thickness_scale_mm = float(getattr(mat, 'thickness_scale_mm', rec.thickness_scale_mm))
+    rec.depth_bias_mm = float(getattr(mat, 'depth_bias_mm', rec.depth_bias_mm))
+    rec.thickness_bias_mm = float(getattr(mat, 'thickness_bias_mm', rec.thickness_bias_mm))
+    rec.emit_gain = float(getattr(mat, 'emit_gain', rec.emit_gain))
+    rec.color_blend = float(getattr(mat, 'color_blend', rec.color_blend))
+    rec.direct_lobe_power = float(getattr(mat, 'direct_lobe_power', rec.direct_lobe_power))
+    rec.model_flags = float(getattr(mat, 'model_flags', getattr(mat, 'texture_flags', rec.model_flags)))
+    rec.remit_gain = float(getattr(mat, 'remit_gain', rec.remit_gain))
+    rec.bulb_radius_mm = float(getattr(mat, 'bulb_radius_mm', rec.bulb_radius_mm))
+    rec.remit_decay = float(getattr(mat, 'remit_decay', rec.remit_decay))
+    rec.translucence_gain = float(getattr(mat, 'translucence_gain', rec.translucence_gain))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1210,6 +1311,7 @@ class MaterialDatabase:
         tensors = db.build_tensors()
         # tensors['pbr']            : (N, 16)             float32  authoritative
         # tensors['phong_compat']   : (N,  8)             float32  ← downstream-only
+        # tensors['texture_stack']  : (N, 16)             float32  optional/cold
         # tensors['raymat_compat']  : (N, 16)             float32  ← downstream-only
         # tensors['spectral']       : (N, MAX_BANDS, 12)  float32
         # tensors['enamel']         : (N,  8)             float32
@@ -1332,6 +1434,7 @@ class MaterialDatabase:
                 'raymat_compat':  np.zeros((0, RAYMAT_FLOATS), np.float32),
                 'spectral':       np.zeros((0, MAX_SPECTRAL_BANDS, 12), np.float32),
                 'enamel':         np.zeros((0, ENAMEL_FLOATS), np.float32),
+                'texture_stack':  np.zeros((0, TEXSTACK_FLOATS), np.float32),
                 'n_bands':        np.zeros(0, np.int32),
                 'index':          {},
             }
@@ -1344,6 +1447,7 @@ class MaterialDatabase:
         ray_arr  = (RayMatRecord     * N)()
         spec_arr = (SpectralRecord   * N)()
         enam_arr = (EnamelRecord     * N)()
+        tex_arr  = (TextureStackRecord * N)()
 
         for i, name in enumerate(self._order):
             mat = self._materials[name]
@@ -1377,11 +1481,15 @@ class MaterialDatabase:
             # ── Enamel ──
             _fill_enamel(enam_arr[i], mat)
 
+            # ── Optional UV texture-stack metadata ──
+            _fill_texture_stack(tex_arr[i], mat)
+
         # ── Extract to numpy via frombuffer (zero-copy for contiguous ctypes) ──
         pbr_np  = np.frombuffer(pbr_arr,  dtype=np.float32).reshape(N, PBR_FLOATS).copy()
         phon_np = np.frombuffer(phon_arr, dtype=np.float32).reshape(N, PHONG_FLOATS).copy()
         ray_np  = np.frombuffer(ray_arr,  dtype=np.float32).reshape(N, RAYMAT_FLOATS).copy()
         enam_np = np.frombuffer(enam_arr, dtype=np.float32).reshape(N, ENAMEL_FLOATS).copy()
+        tex_np  = np.frombuffer(tex_arr,  dtype=np.float32).reshape(N, TEXSTACK_FLOATS).copy()
 
         # ── Resolve emit_profile_idx → PBR emission RGB (vectorized) ──────────
         # Build an integer index vector — one entry per material row — then
@@ -1447,6 +1555,7 @@ class MaterialDatabase:
             'raymat_compat':  ray_np,    # downstream-only raytracer sink
             'spectral':       spec_np,
             'enamel':         enam_np,
+            'texture_stack':  tex_np,    # optional cold UV/depth/remit metadata
             'n_bands':        n_bands_np,
             'index':          {name: i for i, name in enumerate(self._order)},
         }

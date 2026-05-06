@@ -28,7 +28,7 @@
  *
  * Scene uniforms (uploaded once per frame by base_gl_renderer.py):
  *   uNumLights        — active light count (0..MAX_LIGHTS)
- *   uLightDir [N]     — view-space unit direction per light
+ *   uLightPos [N]     — view-space position per emitting surface group
  *   uLightColor[N]    — linear sRGB colour per light (no clamp)
  *   uLightIntensity[N]— scalar gain per light
  *
@@ -61,11 +61,19 @@ layout(std430, binding = 11) readonly buffer PhongChunk { float phong[]; };
 // [4..6] color.rgb  [7] _pad
 layout(std430, binding = 14) readonly buffer EnamelChunk { float enamel[]; };
 
+// TextureStackRecord (16 floats)
+// [0] emit_uv_layer  [1] color_uv_layer  [2] depth_uv_layer  [3] remit_uv_layer
+// [4] depth_scale_mm [5] thickness_scale_mm [6] depth_bias_mm [7] thickness_bias_mm
+// [8] emit_gain [9] color_blend [10] direct_lobe_power [11] model_flags_or_indices
+// [12] remit_gain [13] remit_attack [14] remit_decay [15] translucence_gain
+layout(std430, binding = 15) readonly buffer TextureStackChunk { float texstack[]; };
+
 /* ── Accessors ────────────────────────────────────────────────────────────── */
 
 #define PBR_STRIDE    16
 #define PHONG_STRIDE   8
 #define ENAM_STRIDE    8
+#define TEXSTACK_STRIDE 16
 
 vec3  mat_albedo   (int id) { int b=id*PBR_STRIDE;   return vec3(pbr[b],   pbr[b+1], pbr[b+2]); }
 float mat_roughness(int id) { return pbr[id*PBR_STRIDE+3]; }
@@ -83,6 +91,22 @@ vec3  ph_inner    (int id) { int b=id*PHONG_STRIDE+4; return vec3(phong[b],phong
 float en_thick (int id) { return enamel[id*ENAM_STRIDE+0]; }
 float en_ior   (int id) { return enamel[id*ENAM_STRIDE+1]; }
 vec3  en_color (int id) { int b=id*ENAM_STRIDE+4; return vec3(enamel[b],enamel[b+1],enamel[b+2]); }
+float tx_emit_layer(int id) { return texstack[id*TEXSTACK_STRIDE+0]; }
+float tx_color_layer(int id) { return texstack[id*TEXSTACK_STRIDE+1]; }
+float tx_depth_layer(int id) { return texstack[id*TEXSTACK_STRIDE+2]; }
+float tx_remit_layer(int id) { return texstack[id*TEXSTACK_STRIDE+3]; }
+float tx_depth_scale_mm(int id) { return texstack[id*TEXSTACK_STRIDE+4]; }
+float tx_thickness_scale_mm(int id) { return texstack[id*TEXSTACK_STRIDE+5]; }
+float tx_depth_bias_mm(int id) { return texstack[id*TEXSTACK_STRIDE+6]; }
+float tx_thickness_bias_mm(int id) { return texstack[id*TEXSTACK_STRIDE+7]; }
+float tx_emit_gain(int id) { return texstack[id*TEXSTACK_STRIDE+8]; }
+float tx_color_blend(int id) { return texstack[id*TEXSTACK_STRIDE+9]; }
+float tx_direct_lobe_power(int id) { return texstack[id*TEXSTACK_STRIDE+10]; }
+float tx_model_flags(int id) { return texstack[id*TEXSTACK_STRIDE+11]; }
+float tx_remit_gain    (int id) { return texstack[id*TEXSTACK_STRIDE+12]; }
+float tx_bulb_radius_mm(int id) { return texstack[id*TEXSTACK_STRIDE+13]; }
+// [14] remit_decay — reserved for temporal FIR, not yet sampled
+float tx_translucence_gain(int id) { return texstack[id*TEXSTACK_STRIDE+15]; }
 
 /* ── Inputs / uniforms ────────────────────────────────────────────────────── */
 
@@ -94,9 +118,9 @@ in  vec2     vUv;
 out vec4 FragColor;
 
 // Multi-light array — every light is a real emitter.
-#define MAX_LIGHTS 8
+#define MAX_LIGHTS 100
 uniform int   uNumLights;
-uniform vec3  uLightDir      [MAX_LIGHTS];   // unit, view space
+uniform vec3  uLightPos      [MAX_LIGHTS];   // view-space emitter position
 uniform vec3  uLightColor    [MAX_LIGHTS];   // linear sRGB
 uniform float uLightIntensity[MAX_LIGHTS];
 
@@ -107,9 +131,12 @@ uniform float uLightIntensity[MAX_LIGHTS];
 // caller that does not bind aUv / does not author an emission map: the
 // 'diffuse' branch passes the raw mat.emission through unchanged, the
 // 'direct' branch contributes nothing, and the saturation mix is identity.
-// Per-material emit_uv layer dispatch is deferred to a later mat-stride
-// expansion; for now everyone samples layer 0 (the default texel).
 uniform sampler2DArray uEmitUv;
+uniform sampler2DArray uColorUv;
+uniform sampler2DArray uDepthUv;
+uniform sampler2DArray uRemitUv;
+uniform bool uEnableSpecular = true;
+uniform bool uEnableEmissionDirect = false;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -148,9 +175,43 @@ void main() {
     float opacity  = mat_opacity  (id);
     vec3  emission = mat_emission (id);
 
+    // Physics profile — selects equation family for this material
+    //   0 = standard dielectric/conductor (default)
+    //   1 = emissive lobe: emission cone shaped by NdotV^direct_lobe_power
+    //   2 = translucent SSS: thickness_mm drives wrap lighting (4× scale)
+    //   3 = frosted scatter: scatter_mask (depth_uv.A) softens specular
+    int   profile_id = int(tx_model_flags(id)) & 0xFF;
+    float lobe_p     = max(1.0, tx_direct_lobe_power(id));
+
+    // Color UV override
+    float color_layer = tx_color_layer(id);
+    if (color_layer >= 0.0) {
+        vec4 c_uv = texture(uColorUv, vec3(vUv, color_layer));
+        albedo = mix(albedo, c_uv.rgb, clamp(c_uv.a * tx_color_blend(id), 0.0, 1.0));
+    }
+
+    // Depth UV — all four channels read up-front so profile 3 can pre-modify specular
+    //   R = depth offset      G = thickness       B = translucence mask   A = scatter mask
+    float depth_layer = tx_depth_layer(id);
+    float depth_mm = 0.0, thickness_mm = 0.0;
+    float translucence_mask = 1.0, scatter_mask = 0.0;
+    if (depth_layer >= 0.0) {
+        vec4 d_uv = texture(uDepthUv, vec3(vUv, depth_layer));
+        depth_mm          = d_uv.r * tx_depth_scale_mm(id)     + tx_depth_bias_mm(id);
+        thickness_mm      = d_uv.g * tx_thickness_scale_mm(id) + tx_thickness_bias_mm(id);
+        translucence_mask = d_uv.b;
+        scatter_mask      = d_uv.a;
+    }
+
     float specstr  = ph_specstr  (id);
     float shini    = ph_shininess(id);
     vec3  inner    = ph_inner    (id);
+
+    // Profile 3: frosted scatter — reduce specular sharpness before the lights loop
+    if (profile_id == 3 && scatter_mask > 0.001) {
+        shini   = max(1.0,  shini   * (1.0 - scatter_mask * 0.88));
+        specstr = max(0.0,  specstr * (1.0 - scatter_mask * 0.70));
+    }
 
     // Front / back face base colour
     vec3 base = gl_FrontFacing ? albedo : inner;
@@ -167,62 +228,83 @@ void main() {
     float spec_acc = 0.0;
     int n = min(uNumLights, MAX_LIGHTS);
     for (int i = 0; i < n; ++i) {
-        vec3  L     = uLightDir[i];
-        vec3  Lcol  = uLightColor[i] * uLightIntensity[i];
+        vec3  Lvec  = uLightPos[i] - vPosV;
+        float Lr2   = max(dot(Lvec, Lvec), 1e-8);
+        vec3  L     = Lvec * inversesqrt(Lr2);
+        vec3  Lcol  = uLightColor[i] * (uLightIntensity[i] / Lr2);
         vec3  H     = normalize(L + V);
         float NdotL = max(dot(N, L), 0.0);
         float NdotH = max(dot(N, H), 0.0);
         float spec  = pow(NdotH, max(shini, 1.0));
 
-        // Lambertian diffuse: surface albedo × emitter radiance × cos(theta)
         col += base * Lcol * NdotL;
 
-        // Phong specular: emitter colour modulated by Fresnel reflectance.
-        col += Lcol * F_vec * (specstr * spec);
+        if (uEnableSpecular) {
+            col += Lcol * F_vec * (specstr * spec);
+        }
 
         spec_col_acc += Lcol * spec;
         spec_acc     += spec;
     }
 
+    // ── Translucence (profiles 0/1: minimal; profile 2 = SSS: 4× scale) ─
+    float t_scale = (profile_id == 2) ? 0.08 : 0.02;
+    float translucence = max(0.0, thickness_mm) * tx_translucence_gain(id) * translucence_mask;
+    col += base * translucence * t_scale;
+
     // ── Self-emission via UV texture-pack ────────────────────────────────
-    // Five-line hot-loop math from UV_EMISSION_STACK_PLAN.md.  With the
-    // default 1×1×1 identity texel this collapses to `col += emission`,
-    // matching the pre-Stage-2 behaviour for any caller that hasn't yet
-    // bound a real emission texture array.
-    vec4  e_uv     = texture(uEmitUv, vec3(vUv, 0.0));
-    vec3  emit_dim = emission * e_uv.a;                       // dim
-    // 'direct' couples self-emission into the specular lobe of the
-    // dominant light direction.  With no lights the term is zero.
+    float emit_layer = tx_emit_layer(id);
+    vec4  e_uv     = (emit_layer >= 0.0)
+                   ? texture(uEmitUv, vec3(vUv, emit_layer))
+                   : vec4(0.0, 1.0, 0.5, 1.0);
+    vec3  emit_dim = emission * (e_uv.a * tx_emit_gain(id));
     vec3  spec_dir = (spec_acc > 0.0) ? (spec_col_acc / spec_acc) : vec3(0.0);
-    vec3  emit_dir = emit_dim * e_uv.r * spec_dir;
-    vec3  emit_dif = emit_dim * e_uv.g;                       // lambertian
+
+    // Profile 1: forward-emission cone shaped by NdotV^lobe_p
+    // Profiles 0/2/3: standard specular-coupled direct emission
+    vec3 emit_dir;
+    if (profile_id == 1) {
+        float beam = pow(max(0.0, NdotV), lobe_p);
+        emit_dir = emit_dim * (e_uv.r * beam);
+    } else {
+        emit_dir = uEnableEmissionDirect ? emit_dim * e_uv.r * spec_dir : vec3(0.0);
+    }
+
+    vec3  emit_dif = emit_dim * e_uv.g;
     vec3  emit_mix = emit_dir + emit_dif;
     float emit_lum = dot(emit_mix, vec3(0.2126, 0.7152, 0.0722));
     vec3  emit_out = mix(vec3(emit_lum), emit_mix, 0.5 + e_uv.b);
+
+    // depth_uv.A = bulb_radius for profile 1. Raw value, no relationship to
+    // other parameters. R²/(R²+d²): full emission at d=0, half at d=bulb_r.
+    if (profile_id == 1 && scatter_mask > 0.0) {
+        float d = max(0.0, depth_mm);
+        emit_out *= (scatter_mask * scatter_mask) / (scatter_mask * scatter_mask + d * d);
+    }
+
     col += emit_out;
 
-    // Enamel layer below uses these representative spec terms.
+    // Profile 3: frosted scatter — add diffuse halo from emission luminance
+    if (profile_id == 3 && scatter_mask > 0.001) {
+        col += base * (scatter_mask * emit_lum * 0.40 + scatter_mask * 0.025);
+        col = max(col, vec3(0.0));
+    }
+
+    // ── Enamel thin-film coating ──────────────────────────────────────────
     vec3  spec_col = spec_col_acc;
     float spec     = spec_acc;
 
-    // ── Enamel thin-film coating ──────────────────────────────────────────
-    // Skipped entirely if thickness_nm == 0 (most materials).
     float enam_thick = en_thick(id);
     if (enam_thick > 0.0) {
         float enam_ior_v  = en_ior  (id);
         vec3  enam_c      = en_color(id);
 
-        // Optical path difference (nm): 2 * n_film * d * cos(theta_t)
-        // cos(theta_t) ≈ NdotV for near-normal incidence (Snell simplified)
         float opd_nm  = 2.0 * enam_ior_v * enam_thick * NdotV;
-
-        // Iridescence fringe — most visible for thickness 100–800 nm
         vec3  fringe   = thin_film_fringe(opd_nm);
         float fringe_w = clamp(enam_thick / 800.0, 0.0, 0.45);
 
         vec3 tinted = col * enam_c * (vec3(1.0) + fringe * fringe_w);
 
-        // Extra gloss from enamel layer's own Fresnel peak
         float eF0 = (enam_ior_v - 1.0) / (enam_ior_v + 1.0);
         eF0 *= eF0;
         float eF  = schlick(eF0, NdotV);
@@ -232,8 +314,6 @@ void main() {
     }
 
     // ── Opacity ────────────────────────────────────────────────────────────
-    // For transmission > 0 the material is dielectric; blend alpha down.
-    // The GL blend state (SRC_ALPHA, ONE_MINUS_SRC_ALPHA) handles compositing.
     float alpha = opacity * (1.0 - mat_trans(id) * 0.8);
 
     FragColor = vec4(col, alpha);

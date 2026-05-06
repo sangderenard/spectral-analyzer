@@ -21,6 +21,7 @@
 #include "acoustic_pressure_backend.h"
 #include "doc_renderer.h"
 #include "base_rasterizer.h"
+#include "emitter_angle_kernel.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
@@ -3686,7 +3687,7 @@ into a flat RGBA8 numpy array sized (height, width, 4).
     struct PyBaseRasterizer {
         BaseRasterizerState* st;
         // Hold material chunks alive for the lifetime of the rasterizer.
-        std::vector<float> pbr, phong, enamel;
+        std::vector<float> pbr, phong, enamel, texstack;
         PyBaseRasterizer(int w, int h, int tile)
             : st(br_create(w, h, tile)) {
             if (!st) throw std::runtime_error("br_create failed");
@@ -3747,6 +3748,74 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
             },
             py::arg("data"),
             "Upload (N, 8) float32 enamel material records.")
+        .def("set_texture_stack_chunk",
+            [](PyBaseRasterizer& self, py::array_t<float> data) {
+                auto info = data.request();
+                if (info.ndim != 2 || info.shape[1] != 16)
+                    throw std::runtime_error("set_texture_stack_chunk: expected (N, 16) float32 array");
+                int n = (int)info.shape[0];
+                self.texstack.assign(static_cast<const float*>(info.ptr),
+                                     static_cast<const float*>(info.ptr) + (size_t)n * 16);
+                br_set_texture_stack_chunk(self.st, self.texstack.data(), n);
+            },
+            py::arg("data"),
+            "Upload (N, 16) float32 cold UV/depth/remit texture-stack records.")
+        .def("set_emit_uv_texture_array",
+            [](PyBaseRasterizer& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> data) {
+                auto info = data.request();
+                if (info.ndim != 4 || info.shape[3] != 4)
+                    throw std::runtime_error("set_emit_uv_texture_array: expected (layers, height, width, 4) uint8 array");
+                br_set_emit_uv_texture_array(self.st,
+                    static_cast<const uint8_t*>(info.ptr),
+                    (int)info.shape[2],
+                    (int)info.shape[1],
+                    (int)info.shape[0]);
+            },
+            py::arg("data"),
+            "Upload RGBA8 emission UV texture array as (layers, height, width, 4).")
+        .def("set_color_uv_texture_array",
+            [](PyBaseRasterizer& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> data) {
+                auto info = data.request();
+                if (info.ndim != 4 || info.shape[3] != 4)
+                    throw std::runtime_error("set_color_uv_texture_array: expected (layers, height, width, 4) uint8 array");
+                br_set_color_uv_texture_array(self.st,
+                    static_cast<const uint8_t*>(info.ptr),
+                    (int)info.shape[2],
+                    (int)info.shape[1],
+                    (int)info.shape[0]);
+            },
+            py::arg("data"),
+            "Upload RGBA8 color override UV texture array as (layers, height, width, 4).")
+        .def("set_depth_uv_texture_array",
+            [](PyBaseRasterizer& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> data) {
+                auto info = data.request();
+                if (info.ndim != 4 || info.shape[3] != 4)
+                    throw std::runtime_error("set_depth_uv_texture_array: expected (layers, height, width, 4) uint8 array");
+                br_set_depth_uv_texture_array(self.st,
+                    static_cast<const uint8_t*>(info.ptr),
+                    (int)info.shape[2],
+                    (int)info.shape[1],
+                    (int)info.shape[0]);
+            },
+            py::arg("data"),
+            "Upload RGBA8 depth/thickness UV texture array as (layers, height, width, 4).")
+        .def("set_remit_uv_texture_array",
+            [](PyBaseRasterizer& self,
+               py::array_t<uint8_t, py::array::c_style | py::array::forcecast> data) {
+                auto info = data.request();
+                if (info.ndim != 4 || info.shape[3] != 4)
+                    throw std::runtime_error("set_remit_uv_texture_array: expected (layers, height, width, 4) uint8 array");
+                br_set_remit_uv_texture_array(self.st,
+                    static_cast<const uint8_t*>(info.ptr),
+                    (int)info.shape[2],
+                    (int)info.shape[1],
+                    (int)info.shape[0]);
+            },
+            py::arg("data"),
+            "Upload RGBA8 simple reemission UV texture array as (layers, height, width, 4).")
         .def("set_scene",
             [](PyBaseRasterizer& self,
                py::array_t<float> light_v,
@@ -3842,7 +3911,19 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
             },
             py::arg("max_lights"),
             "Cap the number of cluster-lights emitted per frame from the "
-            "group cache.  Clamped to [1, MAX_LIGHTS=32].")
+            "group cache.  Clamped to [1, MAX_LIGHTS=100].")
+        .def("set_specular_enabled",
+            [](PyBaseRasterizer& self, bool enabled) {
+                br_set_specular_enabled(self.st, enabled ? 1 : 0);
+            },
+            py::arg("enabled"),
+            "Enable/disable Phong specular highlights from emitter-derived lights.")
+        .def("set_emission_direct_enabled",
+            [](PyBaseRasterizer& self, bool enabled) {
+                br_set_emission_direct_enabled(self.st, enabled ? 1 : 0);
+            },
+            py::arg("enabled"),
+            "Enable/disable direct texture-stack emission coupling.")
         .def("render",
             [](PyBaseRasterizer& self,
                py::array_t<float, py::array::c_style | py::array::forcecast> verts_view,
@@ -3866,6 +3947,29 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
             },
             py::arg("verts_view"), py::arg("mat_ids"), py::arg("mvp"),
             "Project, bin, and shade n_tris triangles into the framebuffer.")
+        .def("render_textured",
+            [](PyBaseRasterizer& self,
+               py::array_t<float, py::array::c_style | py::array::forcecast> verts_view,
+               py::array_t<int,   py::array::c_style | py::array::forcecast> mat_ids,
+               py::array_t<float, py::array::c_style | py::array::forcecast> mvp) {
+                auto vv = verts_view.request();
+                auto mi = mat_ids.request();
+                auto mp = mvp.request();
+                if (vv.ndim != 2 || vv.shape[1] != 8)
+                    throw std::runtime_error("render_textured: verts_view must be (n_tris*3, 8) float32");
+                if (mp.size != 16)
+                    throw std::runtime_error("render_textured: mvp must have 16 float32 elements");
+                int n_tris = (int)mi.shape[0];
+                if (vv.shape[0] != (py::ssize_t)n_tris * 3)
+                    throw std::runtime_error("render_textured: verts_view rows must equal n_tris*3");
+                br_render_textured(self.st,
+                          static_cast<const float*>(vv.ptr),
+                          static_cast<const int*>(mi.ptr),
+                          n_tris,
+                          static_cast<const float*>(mp.ptr));
+            },
+            py::arg("verts_view"), py::arg("mat_ids"), py::arg("mvp"),
+            "Project, bin, and shade n_tris textured triangles into the framebuffer.")
         .def("readback_u8",
             [](PyBaseRasterizer& self) -> py::array_t<uint8_t> {
                 int w = br_width(self.st), h = br_height(self.st);
@@ -3882,8 +3986,55 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
                 return out;
             },
             "Linear (H, W, 4) float32 RGBA readback.")
+        .def("readback_f32_view",
+            [](PyBaseRasterizer& self) -> py::array {
+                int w = br_width(self.st), h = br_height(self.st);
+                const float* ptr = br_readback_f32_ptr(self.st);
+                if (!ptr) {
+                    throw std::runtime_error("readback_f32_view: null framebuffer pointer");
+                }
+                return py::array(
+                    py::dtype::of<float>(),
+                    {h, w, 4},
+                    {sizeof(float) * w * 4, sizeof(float) * 4, sizeof(float)},
+                    ptr,
+                    py::cast(&self, py::return_value_policy::reference)
+                );
+            },
+            "Zero-copy linear (H, W, 4) float32 framebuffer view.")
         .def_property_readonly("width",
             [](PyBaseRasterizer& self){ return br_width(self.st); })
         .def_property_readonly("height",
             [](PyBaseRasterizer& self){ return br_height(self.st); });
+
+    m.def("analyze_emitter_rgba8_layers",
+        [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> rgba,
+           float active_threshold) {
+            auto info = rgba.request();
+            if (info.ndim != 4 || info.shape[3] != 4)
+                throw std::runtime_error("analyze_emitter_rgba8_layers: expected (layers, height, width, 4) uint8");
+            int layers = (int)info.shape[0];
+            int height = (int)info.shape[1];
+            int width  = (int)info.shape[2];
+            py::array_t<float> out({layers, 16});
+            int rc = eak_analyze_rgba8_layers(
+                static_cast<const uint8_t*>(info.ptr),
+                width, height, layers, active_threshold,
+                reinterpret_cast<EAKMetrics*>(out.mutable_data()));
+            if (rc != EAK_OK)
+                throw std::runtime_error("analyze_emitter_rgba8_layers failed: " + std::to_string(rc));
+            return out;
+        },
+        py::arg("rgba_layers"),
+        py::arg("active_threshold") = 0.0f,
+        R"doc(
+Reduce RGBA8 emitter/scrim texture layers into family-of-angles metrics.
+
+Input shape:  (layers, height, width, 4) uint8
+Output shape: (layers, 16) float32
+Columns:
+  0 flux_scale, 1 active_fraction, 2 active_density,
+  3 centroid_u, 4 centroid_v, 5 axis_u, 6 axis_v,
+  7 spread_major, 8 spread_minor, 9 cone_cos, 10 cone_solid_angle.
+)doc");
 }

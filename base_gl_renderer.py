@@ -74,6 +74,7 @@ _FRAG_PATH = os.path.join(_HERE, "csrc", "shaders", "base_material.frag.glsl")
 _BINDING_PBR   = 10
 _BINDING_PHONG = 11
 _BINDING_ENAMEL = 14
+_BINDING_TEXSTACK = 15
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -132,9 +133,16 @@ class BaseGLRenderer:
         self._u_mvp             = -1
         self._u_mv              = -1
         self._u_num_lights      = -1
-        self._u_light_dir       = -1
+        self._u_light_pos       = -1
         self._u_light_color     = -1
         self._u_light_intensity = -1
+        self._u_enable_specular = -1
+        self._u_enable_emission_direct = -1
+        self._enable_specular = True
+        self._enable_emission_direct = False
+        self._light_pos = np.zeros((0, 3), dtype=np.float32)
+        self._light_color = np.zeros((0, 3), dtype=np.float32)
+        self._light_intensity = np.zeros((0,), dtype=np.float32)
 
         # ── UV texture-pack stack (Stage 2 wired) ───────────────────
         # Default 1×1×1 identity texel `(R=0, G=255, B=128, A=255)` =
@@ -146,8 +154,17 @@ class BaseGLRenderer:
         # pre-Stage-2 behaviour `col += emission` exactly, so any caller
         # that has not yet authored an emission UV texture sees no change.
         self._tex_emit_uv: Optional[int] = None
+        self._tex_color_uv: Optional[int] = None
+        self._tex_depth_uv: Optional[int] = None
+        self._tex_remit_uv: Optional[int] = None
         self._uv_tex_unit_emit = 0
+        self._uv_tex_unit_color = 1
+        self._uv_tex_unit_depth = 2
+        self._uv_tex_unit_remit = 3
         self._u_emit_uv = -1
+        self._u_color_uv = -1
+        self._u_depth_uv = -1
+        self._u_remit_uv = -1
 
         # Mesh draw queue: list of tuples (vao, n_verts, mvp, mv,
         #                                  light_dirs, light_colors, light_intens)
@@ -194,6 +211,138 @@ class BaseGLRenderer:
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
         self._tex_emit_uv = int(tex)
 
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex)
+        default_color = np.array([255, 255, 255, 0], dtype=np.uint8)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            1, 1, 1,
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            default_color.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+        self._tex_color_uv = int(tex)
+
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex)
+        default_depth = np.array([0, 0, 0, 255], dtype=np.uint8)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            1, 1, 1,
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            default_depth.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+        self._tex_depth_uv = int(tex)
+
+        tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex)
+        default_remit = np.array([0, 0, 0, 0], dtype=np.uint8)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            1, 1, 1,
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            default_remit.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+        self._tex_remit_uv = int(tex)
+
+    def set_emit_uv_texture_array(self, rgba_layers: "np.ndarray") -> None:
+        """Upload an RGBA8 emission texture array as (layers, height, width, 4)."""
+        arr = np.ascontiguousarray(rgba_layers, dtype=np.uint8)
+        if arr.ndim != 4 or arr.shape[-1] != 4:
+            raise ValueError("rgba_layers must be (layers, height, width, 4) uint8")
+        layers, height, width, _ = arr.shape
+        if self._tex_emit_uv is None:
+            self._tex_emit_uv = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_emit_uv)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            int(width), int(height), int(layers),
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            arr.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+
+    def set_color_uv_texture_array(self, rgba_layers: "np.ndarray") -> None:
+        """Upload an RGBA8 color override texture array as (layers, height, width, 4)."""
+        arr = np.ascontiguousarray(rgba_layers, dtype=np.uint8)
+        if arr.ndim != 4 or arr.shape[-1] != 4:
+            raise ValueError("rgba_layers must be (layers, height, width, 4) uint8")
+        layers, height, width, _ = arr.shape
+        if self._tex_color_uv is None:
+            self._tex_color_uv = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_color_uv)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            int(width), int(height), int(layers),
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            arr.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+
+    def set_depth_uv_texture_array(self, rgba_layers: "np.ndarray") -> None:
+        """Upload an RGBA8 depth/thickness texture array as (layers, height, width, 4)."""
+        arr = np.ascontiguousarray(rgba_layers, dtype=np.uint8)
+        if arr.ndim != 4 or arr.shape[-1] != 4:
+            raise ValueError("rgba_layers must be (layers, height, width, 4) uint8")
+        layers, height, width, _ = arr.shape
+        if self._tex_depth_uv is None:
+            self._tex_depth_uv = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_depth_uv)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            int(width), int(height), int(layers),
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            arr.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+
+    def set_remit_uv_texture_array(self, rgba_layers: "np.ndarray") -> None:
+        """Upload an RGBA8 simple reemission texture array as (layers, height, width, 4)."""
+        arr = np.ascontiguousarray(rgba_layers, dtype=np.uint8)
+        if arr.ndim != 4 or arr.shape[-1] != 4:
+            raise ValueError("rgba_layers must be (layers, height, width, 4) uint8")
+        layers, height, width, _ = arr.shape
+        if self._tex_remit_uv is None:
+            self._tex_remit_uv = int(glGenTextures(1))
+        glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_remit_uv)
+        glTexImage3D(
+            GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+            int(width), int(height), int(layers),
+            0, GL_RGBA, GL_UNSIGNED_BYTE,
+            arr.ctypes.data_as(ctypes.c_void_p),
+        )
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
+
     def _build_program(self) -> None:
         vert_src = _read_glsl(_VERT_PATH)
         frag_src = _read_glsl(_FRAG_PATH)
@@ -204,10 +353,15 @@ class BaseGLRenderer:
         self._u_mvp             = glGetUniformLocation(self._prog, "uMVP")
         self._u_mv              = glGetUniformLocation(self._prog, "uMV")
         self._u_num_lights      = glGetUniformLocation(self._prog, "uNumLights")
-        self._u_light_dir       = glGetUniformLocation(self._prog, "uLightDir")
+        self._u_light_pos       = glGetUniformLocation(self._prog, "uLightPos")
         self._u_light_color     = glGetUniformLocation(self._prog, "uLightColor")
         self._u_light_intensity = glGetUniformLocation(self._prog, "uLightIntensity")
         self._u_emit_uv         = glGetUniformLocation(self._prog, "uEmitUv")
+        self._u_color_uv        = glGetUniformLocation(self._prog, "uColorUv")
+        self._u_depth_uv        = glGetUniformLocation(self._prog, "uDepthUv")
+        self._u_remit_uv        = glGetUniformLocation(self._prog, "uRemitUv")
+        self._u_enable_specular = glGetUniformLocation(self._prog, "uEnableSpecular")
+        self._u_enable_emission_direct = glGetUniformLocation(self._prog, "uEnableEmissionDirect")
 
     def _build_ssbos(self) -> None:
         """Create and populate the three material SSBOs from the current database state."""
@@ -218,11 +372,13 @@ class BaseGLRenderer:
         pbr_chunk    = t.get('pbr', np.zeros((0, 16), np.float32))
         phong_chunk  = t.get('phong_compat', np.zeros((0, 8), np.float32))
         enamel_chunk = t.get('enamel', np.zeros((0, 8), np.float32))
+        texstack_chunk = t.get('texture_stack', np.zeros((0, 16), np.float32))
 
         for binding, data in (
             (_BINDING_PBR,    pbr_chunk),
             (_BINDING_PHONG,  phong_chunk),
             (_BINDING_ENAMEL, enamel_chunk),
+            (_BINDING_TEXSTACK, texstack_chunk),
         ):
             buf_id = self._ssbo.get(binding, None)
             if buf_id is None:
@@ -247,6 +403,42 @@ class BaseGLRenderer:
     def update_material_ssbo(self) -> None:
         """Re-upload SSBO data after the material database has changed."""
         self._build_ssbos()
+
+    def set_point_lights(self, positions: "np.ndarray", colors: "np.ndarray",
+                         intensities: "np.ndarray") -> None:
+        """Set view-space point emitters derived by the caller from scene groups."""
+        pos = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1, 3)
+        col = np.ascontiguousarray(colors, dtype=np.float32).reshape(-1, 3)
+        inten = np.ascontiguousarray(intensities, dtype=np.float32).reshape(-1)
+        n = min(100, pos.shape[0], col.shape[0], inten.shape[0])
+        self._light_pos = pos[:n]
+        self._light_color = col[:n]
+        self._light_intensity = inten[:n]
+
+    def set_specular_enabled(self, enabled: bool) -> None:
+        self._enable_specular = bool(enabled)
+
+    def set_emission_direct_enabled(self, enabled: bool) -> None:
+        self._enable_emission_direct = bool(enabled)
+
+    def _upload_feature_toggles(self) -> None:
+        if self._u_enable_specular != -1:
+            glUniform1i(self._u_enable_specular, 1 if self._enable_specular else 0)
+        if self._u_enable_emission_direct != -1:
+            glUniform1i(self._u_enable_emission_direct, 1 if self._enable_emission_direct else 0)
+
+    def _upload_point_lights(self) -> None:
+        n = int(min(100, self._light_pos.shape[0]))
+        if self._u_num_lights != -1:
+            glUniform1i(self._u_num_lights, n)
+        if n <= 0:
+            return
+        if self._u_light_pos != -1:
+            glUniform3fv(self._u_light_pos, n, self._light_pos.ctypes.data_as(ctypes.c_void_p))
+        if self._u_light_color != -1:
+            glUniform3fv(self._u_light_color, n, self._light_color.ctypes.data_as(ctypes.c_void_p))
+        if self._u_light_intensity != -1:
+            glUniform1fv(self._u_light_intensity, n, self._light_intensity.ctypes.data_as(ctypes.c_void_p))
 
     # ── Mesh queue ────────────────────────────────────────────────────────────
 
@@ -302,6 +494,21 @@ class BaseGLRenderer:
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_emit_uv)
             if self._u_emit_uv != -1:
                 glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
+        if self._tex_color_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_color)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_color_uv)
+            if self._u_color_uv != -1:
+                glUniform1i(self._u_color_uv, self._uv_tex_unit_color)
+        if self._tex_depth_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_depth)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_depth_uv)
+            if self._u_depth_uv != -1:
+                glUniform1i(self._u_depth_uv, self._uv_tex_unit_depth)
+        if self._tex_remit_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_remit)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_remit_uv)
+            if self._u_remit_uv != -1:
+                glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
 
         # Upload uniforms
         if self._u_mvp != -1:
@@ -309,11 +516,8 @@ class BaseGLRenderer:
         if self._u_mv != -1:
             glUniformMatrix4fv(self._u_mv, 1, GL_FALSE, mv.ctypes.data_as(ctypes.c_void_p))
 
-        # No host-side lights.  Until the CPU geometry mirror lands here,
-        # the GL path renders self-emission only (uNumLights=0).  That is
-        # an honest under-shading, not fake fill.
-        if self._u_num_lights != -1:
-            glUniform1i(self._u_num_lights, 0)
+        self._upload_feature_toggles()
+        self._upload_point_lights()
 
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -352,9 +556,24 @@ class BaseGLRenderer:
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_emit_uv)
             if self._u_emit_uv != -1:
                 glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
+        if self._tex_color_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_color)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_color_uv)
+            if self._u_color_uv != -1:
+                glUniform1i(self._u_color_uv, self._uv_tex_unit_color)
+        if self._tex_depth_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_depth)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_depth_uv)
+            if self._u_depth_uv != -1:
+                glUniform1i(self._u_depth_uv, self._uv_tex_unit_depth)
+        if self._tex_remit_uv is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_remit)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_remit_uv)
+            if self._u_remit_uv != -1:
+                glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
 
-        if self._u_num_lights != -1:
-            glUniform1i(self._u_num_lights, 0)
+        self._upload_feature_toggles()
+        self._upload_point_lights()
 
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)

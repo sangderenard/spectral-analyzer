@@ -461,12 +461,15 @@ class GlobalChannelDispatcher:
             _pbr = _t.get("pbr", None)
             _ph = _t.get("phong_compat", None)
             _en = _t.get("enamel", None)
+            _tx = _t.get("texture_stack", None)
             if _pbr is not None and len(_pbr):
                 rdr.set_pbr_chunk(_np.ascontiguousarray(_pbr, dtype=_np.float32))
             if _ph is not None and len(_ph):
                 rdr.set_phong_chunk(_np.ascontiguousarray(_ph, dtype=_np.float32))
             if _en is not None and len(_en):
                 rdr.set_enamel_chunk(_np.ascontiguousarray(_en, dtype=_np.float32))
+            if _tx is not None and len(_tx) and hasattr(rdr, "set_texture_stack_chunk"):
+                rdr.set_texture_stack_chunk(_np.ascontiguousarray(_tx, dtype=_np.float32))
             self._mat_tensors_ref_c = _t
         except Exception:
             pass

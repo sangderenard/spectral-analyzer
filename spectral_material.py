@@ -1686,6 +1686,47 @@ MATERIAL_PRESETS: dict[str, Material] = {
     "warm_white_emit":
         _em_material("warm_white_emit", [0.95, 0.90, 0.80], 0.30, 0.0,
                      emission_rgb=[0.95, 0.82, 0.60], ior=1.5),
+    "pearl_white_tile": Material(
+        name="pearl_white_tile",
+        domain="em_optical",
+        albedo=[0.96, 0.93, 0.86],
+        roughness=0.11,
+        metallic=0.0,
+        emission_rgb=[0.0, 0.0, 0.0],
+        ior=1.58,
+        transmission=0.0,
+        enamel=EnamelCoating(
+            thickness_m=135e-9,
+            ior_real=1.54,
+            ior_imag=0.0,
+            color_rgb=[1.0, 0.985, 0.94],
+            roughness=0.025,
+            spectral_bands=[
+                SpectralBand(center_hz=nm_to_hz(450), bandwidth_hz=nm_to_hz(450) * 0.055,
+                             reflectance=0.16, transmittance=0.0, diffuse_frac=0.04,
+                             ior_real=1.54, ior_imag=0.0),
+                SpectralBand(center_hz=nm_to_hz(560), bandwidth_hz=nm_to_hz(560) * 0.070,
+                             reflectance=0.12, transmittance=0.0, diffuse_frac=0.05,
+                             ior_real=1.54, ior_imag=0.0),
+            ],
+        ),
+        spectral_identity=SpectralHistogram.from_array(
+            np.array([nm_to_hz(nm) for nm in [780, 700, 620, 560, 500, 450, 400, 380]], dtype=np.float64),
+            np.array([0.78, 0.84, 0.88, 0.86, 0.90, 0.94, 0.91], dtype=np.float64),
+            quantity="reflectance",
+        ),
+        spectral_bands=[
+            SpectralBand(center_hz=nm_to_hz(700), bandwidth_hz=nm_to_hz(700) * 0.080,
+                         reflectance=0.82, transmittance=0.0, diffuse_frac=0.10,
+                         ior_real=1.58, ior_imag=0.0),
+            SpectralBand(center_hz=nm_to_hz(550), bandwidth_hz=nm_to_hz(550) * 0.075,
+                         reflectance=0.88, transmittance=0.0, diffuse_frac=0.09,
+                         ior_real=1.58, ior_imag=0.0),
+            SpectralBand(center_hz=nm_to_hz(450), bandwidth_hz=nm_to_hz(450) * 0.065,
+                         reflectance=0.94, transmittance=0.0, diffuse_frac=0.08,
+                         ior_real=1.58, ior_imag=0.0),
+        ],
+    ),
     # ── Duty-station surface materials ───────────────────────────────────────
     "lcars_body_enamel": Material(
         name="lcars_body_enamel", domain="acoustic",

@@ -1,0 +1,62 @@
+# Material: pearl_white_tile
+# Glossy dielectric floor tile with thin-film pearl clear coat.
+
+name: pearl_white_tile
+description: Pearl white glazed floor tile with high dielectric specular response
+
+color_profile_name: pearl_white_tile
+reflectivity: 0.88
+diffusion: 0.10
+absorption: 0.02
+
+smoothness: 0.89
+ior: 1.58
+opacity: 1.0
+
+pbr:
+  albedo: [0.96, 0.93, 0.86]
+  roughness: 0.11
+  metallic: 0.0
+  transmission: 0.0
+  emission_rgb: [0.0, 0.0, 0.0]
+
+enamel:
+  thickness_m: 0.000000135
+  ior_real: 1.54
+  ior_imag: 0.0
+  color_rgb: [1.0, 0.985, 0.94]
+  roughness: 0.025
+
+spectral_bands:
+  - center_hz: 428274940000000.0
+    bandwidth_hz: 34261995000000.0
+    reflectance: 0.82
+    transmittance: 0.0
+    diffuse_frac: 0.10
+    ior_real: 1.58
+    ior_imag: 0.0
+  - center_hz: 545077196000000.0
+    bandwidth_hz: 40880790000000.0
+    reflectance: 0.88
+    transmittance: 0.0
+    diffuse_frac: 0.09
+    ior_real: 1.58
+    ior_imag: 0.0
+  - center_hz: 666205462000000.0
+    bandwidth_hz: 43303355000000.0
+    reflectance: 0.94
+    transmittance: 0.0
+    diffuse_frac: 0.08
+    ior_real: 1.58
+    ior_imag: 0.0
+
+gameplay:
+  label: Pearl White Tile
+  category: floor_finish
+  tier: finished
+  role: default_floor_tile
+
+notes: >
+  Default deployed room-control floor tile while material selection is offline.
+  The spectral response is a cool-biased white ceramic/glaze model with a
+  nanometre-scale clear coat for glossy pearl highlights.

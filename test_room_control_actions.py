@@ -25,6 +25,7 @@ from room_control_station import (
     build_floor_plan,
     apply_hull_deformation,
     build_envelope_meshes,
+    build_floor_material_triangulation,
     _FLOOR_TYPES,
     _HULL_WALL_TYPES,
     _HULL_CORNER_TYPES,
@@ -278,6 +279,49 @@ def test_doc_grid_cell_click_dispatches_to_workspace():
     print("PASS test_doc_grid_cell_click_dispatches_to_workspace")
 
 
+def test_apply_floor_action_deploys_material_split_triangulation():
+    st = _make_station()
+    st.state["floor_type"] = "rect"
+    st.state["room_width_cells"] = 3
+    st.state["room_depth_cells"] = 2
+    rect = (100, 50, 140, 24)
+    st._doc_action_rects["room_tile_workspace_controls.apply_floor"] = rect
+
+    consumed = _click(st, rect)
+    meshes = st.envelope_meshes
+
+    assert consumed, "apply floor action hit must consume the event"
+    assert st.state.get("floor_triangulation_applied") is True
+    assert meshes["floor_tiles"].shape == (12, 3, 3), "six cells must produce two tile triangles each"
+    assert meshes["floor_fill"].shape[0] > 0, "tile inset must produce surrounding fill triangles"
+    assert meshes["floor_borders"].shape == (48, 3), "six cells must produce four two-vertex border segments each"
+    assert meshes["material_slots"]["floor_tiles"] == "pearl_white_tile"
+    assert meshes["material_slots"]["floor_fill"] == "painted_concrete"
+    print("PASS test_apply_floor_action_deploys_material_split_triangulation")
+
+
+def test_apply_floor_action_publishes_to_scene_workspace_room_cfg():
+    st = _make_station()
+    st.state["floor_type"] = "rect"
+    st.state["room_width_cells"] = 2
+    st.state["room_depth_cells"] = 2
+
+    class _SceneWorkspace:
+        def __init__(self):
+            self.room_cfg = {}
+
+    scene_ws = _SceneWorkspace()
+    st.bind_scene_workspace(scene_ws)
+    st.apply_floor_triangulation()
+
+    assert "applied_floor_meshes" in scene_ws.room_cfg
+    assert scene_ws.room_cfg["applied_floor_revision"] == 1
+    assert scene_ws.room_cfg["applied_floor_meshes"]["floor_tiles"].shape == (8, 3, 3)
+    assert scene_ws.room_cfg["applied_floor_material_slots"]["floor_tiles"] == "pearl_white_tile"
+    assert scene_ws.room_cfg["applied_floor_material_slots"]["floor_fill"] == "painted_concrete"
+    print("PASS test_apply_floor_action_publishes_to_scene_workspace_room_cfg")
+
+
 def test_polar_tile_inner_corners_match_ray_points_exactly():
     cells = _make_polar_tile_cells(24, 8)
     assert cells, "polar tile helper must emit cells"
@@ -459,6 +503,56 @@ def test_build_floor_plan_polar_metadata():
     print("PASS test_build_floor_plan_polar_metadata")
 
 
+def test_floor_material_triangulation_splits_tiles_from_fill():
+    state = {"floor_tile_border_width": 0.05}
+    plan = build_floor_plan("rect", 2, 2, state)
+    result = apply_hull_deformation(plan["mask"], state)
+    meshes = build_floor_material_triangulation(result, state, floor_plan=plan)
+
+    assert meshes["floor_tiles"].shape == (8, 3, 3)
+    assert meshes["floor_fill"].shape == (32, 3, 3)
+    assert meshes["floor_borders"].shape == (32, 3)
+    assert meshes["floor_tiles"].max() < 2.0, "inset tile mesh must stay inside the containing floor"
+    print("PASS test_floor_material_triangulation_splits_tiles_from_fill")
+
+
+def test_polar_rect_packed_cells_receive_world_occlusion_state():
+    st = _make_station()
+    st.state["floor_type"] = "polar_rect"
+    st.state["floor_radius"] = 4.0
+    st.state["floor_radial_segments"] = 4
+    st.state["floor_polar_rays"] = 24
+    st.state["floor_polar_tile_radius"] = 0.0
+    st.state["room_view"] = "plan"
+    st.state["room_level"] = 0
+    st.state["room_snap_policy"] = "gentle"
+
+    class _FakeWorkspace:
+        instances = []
+        presets = {}
+
+        def _station_cells(self):
+            return set()
+
+        def floor_plan_object_cell_marks(self, level, snap_policy="gentle"):
+            return {(0, 0): {"status": "collision", "label": "blocked"}}
+
+        def selected_preset(self):
+            return None
+
+    st._room_workspace = _FakeWorkspace()
+    grid = st._room_grid_panel()
+    cells = list(grid.payload.get("cells", []) or [])
+
+    assert any(isinstance(c, dict) and c.get("polar_tile") for c in cells), (
+        "polar_rect must keep packed polar_tile mechanics"
+    )
+    assert any(isinstance(c, dict) and int(c.get("state", -1)) == _CELL_COLLISION for c in cells), (
+        "packed polar_rect cells must inherit world occlusion/collision marks"
+    )
+    print("PASS test_polar_rect_packed_cells_receive_world_occlusion_state")
+
+
 # ---------------------------------------------------------------------------
 # Test 4 – hull deformation clips correct cells
 # ---------------------------------------------------------------------------
@@ -599,6 +693,8 @@ if __name__ == "__main__":
         test_knob_stepper_clamps,
         test_knob_segmented_selects_option,
         test_doc_grid_cell_click_dispatches_to_workspace,
+        test_apply_floor_action_deploys_material_split_triangulation,
+        test_apply_floor_action_publishes_to_scene_workspace_room_cfg,
         test_polar_tile_inner_corners_match_ray_points_exactly,
         test_polar_tiles_keep_constant_square_side_length,
         test_polar_center_reclaims_flat_edge_tiles_inside_first_ring,
@@ -606,6 +702,8 @@ if __name__ == "__main__":
         test_build_floor_mask_polar,
         test_build_floor_mask_polar_rect_center,
         test_build_floor_plan_polar_metadata,
+        test_floor_material_triangulation_splits_tiles_from_fill,
+        test_polar_rect_packed_cells_receive_world_occlusion_state,
         test_hull_cylindrical_north_edge,
         test_hull_spherical_ne_corner,
         test_hull_flat_does_not_clip,

@@ -150,6 +150,7 @@ class DocRenderer:
 
         self._next_id = 1
         self._polar_floor_sig: tuple | None = None
+        self.shader_widgets: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def _begin_overlay_blit() -> tuple[bool, bool]:
@@ -400,8 +401,8 @@ class DocRenderer:
         cell_h = max(1, map_h // mh)
         fp = image_map.get("floor_plan", {}) if isinstance(image_map, dict) else {}
         fp_type = str(fp.get("type", ""))
-        has_arc_geom = fp_type in ("polar", "arc")
-        polar_floor_only = fp_type == "polar"
+        has_arc_geom = False
+        polar_floor_only = fp_type in ("polar", "polar_rect", "arc")
 
         def _clear_nodes_with_prefix(prefix: str) -> None:
             stale = [k for k in list(node_id_map.keys()) if isinstance(k, str) and k.startswith(prefix)]
@@ -473,16 +474,20 @@ class DocRenderer:
             _ccx = float(map_x + map_w * 0.5)
             _ccy = float(map_y + map_h * 0.5)
 
+            _floor_radius = max(1.0, float(fp.get("floor_radius", 8.0) or 8.0))
+
             state_hash = 1469598103934665603
             for cell in cells:
-                if isinstance(cell, dict) and cell.get("polar_tile"):
+                if isinstance(cell, dict) and int(cell.get("state", 0)) != 8:
                     state_hash ^= int(cell.get("state", 0)) & 0xFF
                     state_hash = (state_hash * 1099511628211) & 0xFFFFFFFFFFFFFFFF
 
             sig = (
                 side,
-                int(fp.get("polar_rays", 0) or 0),
                 int(fp.get("radial_segments", 0) or 0),
+                int(fp.get("angular_segments", 0) or 0),
+                _floor_radius,
+                fp_type,
                 len(cells),
                 state_hash,
                 tuple(int(v) for v in fill_rgba),
@@ -501,6 +506,7 @@ class DocRenderer:
                 r2 = r * r
                 ri = max(0.0, r - edge_px)
                 ri2 = ri * ri
+                _scale_px = ri / _floor_radius
                 fill_mask = dist2 <= r2
                 edge_mask = np.logical_and(fill_mask, dist2 >= ri2)
                 img[fill_mask] = np.array(fill_rgba, dtype=np.uint8)
@@ -577,53 +583,54 @@ class DocRenderer:
                         if 0 <= px < side and 0 <= py < side:
                             img[py, px] = np.array(rgba, dtype=np.uint8)
 
-                for cell in cells:
-                    if not isinstance(cell, dict) or not cell.get("polar_tile"):
-                        continue
-                    qf = cell.get("quad_xy_frac")
-                    if not (isinstance(qf, list) and len(qf) >= 4):
-                        continue
-                    pts = []
-                    for raw_pt in qf[:4]:
-                        if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
-                            pts.append((c + float(raw_pt[0]) * ri, c + float(raw_pt[1]) * ri))
-                    if len(pts) != 4:
-                        continue
-                    state = int(cell.get("state", 0))
-                    col_f = palette[state] if palette and 0 <= state < len(palette) else tile_bg
-                    col = (
+                def _cell_rgba(state_v: int) -> tuple[int, int, int, int]:
+                    col_f = palette[state_v] if palette and 0 <= state_v < len(palette) else tile_bg
+                    return (
                         max(0, min(255, int(float(col_f[0]) * 255.0 + 0.5))),
                         max(0, min(255, int(float(col_f[1]) * 255.0 + 0.5))),
                         max(0, min(255, int(float(col_f[2]) * 255.0 + 0.5))),
                         max(0, min(255, int(float(col_f[3]) * 255.0 + 0.5))),
                     )
-                    bcol = (
-                        max(0, min(255, int(float(tile_border[0]) * 255.0 + 0.5))),
-                        max(0, min(255, int(float(tile_border[1]) * 255.0 + 0.5))),
-                        max(0, min(255, int(float(tile_border[2]) * 255.0 + 0.5))),
-                        max(0, min(255, int(float(tile_border[3]) * 255.0 + 0.5))),
-                    )
-                    _draw_quad(pts, col, bcol, border_px=1)
+                bcol = (
+                    max(0, min(255, int(float(tile_border[0]) * 255.0 + 0.5))),
+                    max(0, min(255, int(float(tile_border[1]) * 255.0 + 0.5))),
+                    max(0, min(255, int(float(tile_border[2]) * 255.0 + 0.5))),
+                    max(0, min(255, int(float(tile_border[3]) * 255.0 + 0.5))),
+                )
+                for cell in cells:
+                    if not isinstance(cell, dict):
+                        continue
+                    state_v = int(cell.get("state", 0))
+                    if state_v == 8:
+                        continue
+                    col = _cell_rgba(state_v)
+                    # polar_rect bypass: quad_xy_frac as fractions of inner-circle radius.
+                    if cell.get("polar_tile"):
+                        qf = cell.get("quad_xy_frac")
+                        if not (isinstance(qf, list) and len(qf) >= 4):
+                            continue
+                        pts = [(c + float(p[0]) * ri, c + float(p[1]) * ri)
+                               for p in qf[:4] if isinstance(p, (list, tuple)) and len(p) >= 2]
+                        if len(pts) == 4:
+                            _draw_quad(pts, col, bcol, border_px=1)
+                        continue
+                    # Square tile path: tile_corners are 1×1m world-space corners.
+                    tc = cell.get("tile_corners")
+                    if isinstance(tc, list) and len(tc) >= 4:
+                        pts = [(c + float(p[0]) * _scale_px, c + float(p[1]) * _scale_px)
+                               for p in tc[:4] if isinstance(p, (list, tuple)) and len(p) >= 2]
+                        if len(pts) == 4:
+                            _draw_quad(pts, col, bcol, border_px=1)
+                        continue
 
-                # Deterministic rays/rings overlay ("rays and chords" guide).
-                try:
-                    mg_rays = max(0, int(fp.get("polar_rays", 0) or 0))
-                except Exception:
-                    mg_rays = 0
-                try:
-                    mg_rings = max(0, int(fp.get("radial_segments", 0) or 0))
-                except Exception:
-                    mg_rings = 0
+                # Guide overlay: rings for both polar types; ray lines for polar_rect only.
                 gcol = (
                     max(0, min(255, int(0.55 * 255.0 + 0.5))),
                     max(0, min(255, int(0.62 * 255.0 + 0.5))),
                     max(0, min(255, int(0.72 * 255.0 + 0.5))),
                     max(0, min(255, int(0.30 * 255.0 + 0.5))),
                 )
-                if mg_rays > 1:
-                    for ray_i in range(mg_rays):
-                        a = (2.0 * math.pi * float(ray_i)) / float(mg_rays)
-                        _draw_line(c, c, c + math.cos(a) * ri, c + math.sin(a) * ri, gcol)
+                mg_rings = max(0, int(fp.get("radial_segments", 0) or 0))
                 if mg_rings > 0:
                     for ring_i in range(1, mg_rings + 1):
                         rr = (ri * float(ring_i)) / float(mg_rings)
@@ -636,6 +643,12 @@ class DocRenderer:
                             py1 = c + math.sin(a) * rr
                             _draw_line(px0, py0, px1, py1, gcol)
                             px0, py0 = px1, py1
+                if fp_type == "polar_rect":
+                    mg_rays = max(0, int(fp.get("polar_rays", 0) or fp.get("angular_segments", 0) or 0))
+                    if mg_rays > 1:
+                        for ray_i in range(mg_rays):
+                            a = (2.0 * math.pi * float(ray_i)) / float(mg_rays)
+                            _draw_line(c, c, c + math.cos(a) * ri, c + math.sin(a) * ri, gcol)
 
                 self.load_primitive_atlas_rgba(img, side, side, prim_cols=1)
                 self._polar_floor_sig = sig
@@ -772,6 +785,79 @@ class DocRenderer:
             )
         return node_id_map
 
+    def submit_shader_widget_panel(self, panel: Any, rect: tuple,
+                                   node_id_map: dict,
+                                   parent_id: int = 0,
+                                   sibling_order: int = -1,
+                                   action_rects: dict | None = None) -> dict:
+        """Submit a generic shader-backed HUD panel and its declared hit regions.
+
+        The actual shader renderer is chosen by the host program from the
+        payload metadata. This method reserves the HUD rectangle and exposes
+        normalized or pixel regions through the same action map used by buttons.
+        """
+        x, y, w, h = rect
+        body_key = f"__body__{panel.name}"
+        if body_key not in node_id_map:
+            node_id_map[body_key] = self._alloc_id()
+        body_id = node_id_map[body_key]
+        payload = getattr(panel, "payload", {}) or {}
+        label = getattr(panel, "label", None) or getattr(panel, "name", "shader")
+        self.submit_raw(
+            body_id,
+            rect,
+            DR_NODE_PANEL_BODY,
+            bg=tuple(payload.get("bg", _THEME["bg"])) if isinstance(payload, dict) else _THEME["bg"],
+            border_px=1,
+            parent_id=parent_id,
+            sibling_order=sibling_order,
+        )
+
+        hdr_h = 18
+        hdr_key = f"__hdr__{panel.name}"
+        if hdr_key not in node_id_map:
+            node_id_map[hdr_key] = self._alloc_id()
+        self.submit_raw(
+            node_id_map[hdr_key],
+            (x + 2, y + 2, max(1, w - 4), hdr_h),
+            DR_NODE_PANEL_HEADER,
+            label=label,
+            bg=_THEME["header_bg"],
+            border_px=0,
+            parent_id=body_id,
+            sibling_order=0,
+        )
+
+        shader_rect = (x + 4, y + hdr_h + 6, max(1, w - 8), max(1, h - hdr_h - 10))
+        self.shader_widgets[str(panel.name)] = {
+            "rect": shader_rect,
+            "payload": dict(payload) if isinstance(payload, dict) else {},
+        }
+
+        if action_rects is not None and isinstance(payload, dict):
+            sx, sy, sw, sh = shader_rect
+            for region_i, region in enumerate(payload.get("regions", []) or []):
+                if not isinstance(region, dict):
+                    continue
+                action_key = str(region.get("action_key", region.get("key", region_i)))
+                raw_rect = region.get("rect", [0.0, 0.0, 1.0, 1.0])
+                if not isinstance(raw_rect, (list, tuple)) or len(raw_rect) < 4:
+                    continue
+                normalized = bool(region.get("normalized", True))
+                if normalized:
+                    rx = sx + int(round(float(raw_rect[0]) * sw))
+                    ry = sy + int(round(float(raw_rect[1]) * sh))
+                    rw = max(1, int(round(float(raw_rect[2]) * sw)))
+                    rh = max(1, int(round(float(raw_rect[3]) * sh)))
+                else:
+                    rx = sx + int(round(float(raw_rect[0])))
+                    ry = sy + int(round(float(raw_rect[1])))
+                    rw = max(1, int(round(float(raw_rect[2]))))
+                    rh = max(1, int(round(float(raw_rect[3]))))
+                action_rects[f"{panel.name}.{action_key}"] = (rx, ry, rw, rh)
+
+        return node_id_map
+
     def submit_panel(self, panel: Any, rect: tuple,
                      node_id_map: dict | None = None,
                      knob_values: dict | None = None,
@@ -793,6 +879,15 @@ class DocRenderer:
                 node_id_map,
                 parent_id=parent_id,
                 sibling_order=sibling_order,
+            )
+        if isinstance(payload, dict) and payload.get("type") == "shader_widget":
+            return self.submit_shader_widget_panel(
+                panel,
+                rect,
+                node_id_map,
+                parent_id=parent_id,
+                sibling_order=sibling_order,
+                action_rects=action_rects,
             )
 
         body_key = f"__body__{panel.name}"

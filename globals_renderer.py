@@ -519,11 +519,11 @@ class GlobalChannelDispatcher:
                            rdr, leftovers)
         return rdr.readback_u8()
 
-    def _run_3d_gl(self) -> bool:
+    def _run_3d_gl(self, leftovers_3d=None) -> bool:
         if self._gl_render is None:
             return False
         try:
-            self._gl_render()
+            self._gl_render(leftovers_3d)
             return True
         except Exception:
             return False
@@ -548,44 +548,12 @@ class GlobalChannelDispatcher:
         result = GlobalDispatchResult()
         now = time.monotonic()
 
-        # ── 2D channel ──────────────────────────────────────────────────
-        if not leftovers_2d:
-            result.skipped_2d_reason = "no leftovers"
-        elif not self.gate_2d.due(frame_index, now):
-            result.skipped_2d_reason = "cadence/period"
-        else:
-            if mode_2d is ChannelBackend.C:
-                if self._worker_2d_c is not None:
-                    # Async: schedule (drop if busy) and return latest.
-                    _lo = leftovers_2d
-                    accepted = self._worker_2d_c.submit(lambda: self._job_2d_c(_lo))
-                    rgba = self._worker_2d_c.latest()
-                    if rgba is not None:
-                        result.out_2d_rgba = rgba
-                        result.used_2d = "c"
-                        self.gate_2d.stamp(frame_index, now)
-                    else:
-                        result.skipped_2d_reason = (
-                            "c worker accepted, awaiting first result"
-                            if accepted else "c worker busy, no prior result"
-                        )
-                else:
-                    rgba = self._job_2d_c(leftovers_2d)
-                    if rgba is not None:
-                        result.out_2d_rgba = rgba
-                        result.used_2d = "c"
-                        self.gate_2d.stamp(frame_index, now)
-                    else:
-                        result.skipped_2d_reason = "c backend unavailable or clean"
-            else:
-                if self._run_2d_gl(leftovers_2d, frame_index, dt):
-                    result.used_2d = "gl"
-                    self.gate_2d.stamp(frame_index, now)
-                else:
-                    result.skipped_2d_reason = "gl backend unavailable"
-
-        # ── 3D channel ──────────────────────────────────────────────────
-        if not leftovers_3d:
+        # ── 3D channel first (background layer) ─────────────────────────
+        # GL path renders the full scene and does not consume per-node
+        # leftover content, so the empty-leftovers guard is skipped for GL.
+        # Running 3D before 2D ensures GL clears happen before the HUD
+        # overlay is drawn on top.
+        if not leftovers_3d and mode_3d is ChannelBackend.C:
             result.skipped_3d_reason = "no leftovers"
         elif not self.gate_3d.due(frame_index, now):
             result.skipped_3d_reason = "cadence/period"
@@ -626,11 +594,47 @@ class GlobalChannelDispatcher:
                     else:
                         result.skipped_3d_reason = "c backend unavailable"
             else:
-                if self._run_3d_gl():
+                if self._run_3d_gl(leftovers_3d):
                     result.used_3d = "gl"
                     self.gate_3d.stamp(frame_index, now)
                 else:
                     result.skipped_3d_reason = "gl backend unavailable"
+
+        # ── 2D channel second (HUD overlay on top of 3D background) ─────
+        if not leftovers_2d:
+            result.skipped_2d_reason = "no leftovers"
+        elif not self.gate_2d.due(frame_index, now):
+            result.skipped_2d_reason = "cadence/period"
+        else:
+            if mode_2d is ChannelBackend.C:
+                if self._worker_2d_c is not None:
+                    # Async: schedule (drop if busy) and return latest.
+                    _lo = leftovers_2d
+                    accepted = self._worker_2d_c.submit(lambda: self._job_2d_c(_lo))
+                    rgba = self._worker_2d_c.latest()
+                    if rgba is not None:
+                        result.out_2d_rgba = rgba
+                        result.used_2d = "c"
+                        self.gate_2d.stamp(frame_index, now)
+                    else:
+                        result.skipped_2d_reason = (
+                            "c worker accepted, awaiting first result"
+                            if accepted else "c worker busy, no prior result"
+                        )
+                else:
+                    rgba = self._job_2d_c(leftovers_2d)
+                    if rgba is not None:
+                        result.out_2d_rgba = rgba
+                        result.used_2d = "c"
+                        self.gate_2d.stamp(frame_index, now)
+                    else:
+                        result.skipped_2d_reason = "c backend unavailable or clean"
+            else:
+                if self._run_2d_gl(leftovers_2d, frame_index, dt):
+                    result.used_2d = "gl"
+                    self.gate_2d.stamp(frame_index, now)
+                else:
+                    result.skipped_2d_reason = "gl backend unavailable"
 
         return result
 

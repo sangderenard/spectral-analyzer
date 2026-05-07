@@ -323,7 +323,7 @@ _ROOM_VIEWS = ["plan", "front", "side", "tile_editor"]
 _ROOM_EDIT_SCOPES = ["archetype", "placed"]
 _ROOM_SNAP_POLICIES = ["gentle", "no_snap"]
 
-_FLOOR_TYPES = ["rect", "polar", "polar_rect_center", "arc", "spherical"]
+_FLOOR_TYPES = ["rect", "polar", "polar_rect", "arc"]
 _HULL_WALL_TYPES = ["flat", "cylindrical"]
 _HULL_CORNER_TYPES = ["flat", "spherical"]
 
@@ -603,11 +603,90 @@ def build_floor_plan(floor_type: str, width: int, depth: int,
         }
 
     if ft == "polar":
+        # Full-circle ring packing, tile_size = 1m × 1m physical tiles.
+        #
+        # Segment count per ring is derived from the INNER radius so that the
+        # inner chord of every tile is exactly 1m:
+        #   n_segs = floor(2π · r0 / 1.0)
+        # Ring 0 (r0 = 0) has no tiles; first populated ring is ring 1 (r0 = 1m, 6 tiles).
+        #
+        # Tile shape: start from the standard trapezoid, then bring the outer
+        # corners inward until the outer edge equals the inner chord.  The outer
+        # half-angle is arcsin(r0 · sin(π/n) / r1).  The back corners therefore
+        # fan outward, leaving triangular waste between tiles at the outer radius.
+        radius = max(1.0, float(state.get("floor_radius", 8.0)))
+        tile_size = 1.0
+        n_rings = max(1, int(math.ceil(radius / tile_size)))
+        ring_segs_list: list[int] = []
+        for ring in range(n_rings):
+            r0 = ring * tile_size
+            n_segs = int(math.floor(2.0 * math.pi * r0 / tile_size)) if r0 > 1e-9 else 0
+            ring_segs_list.append(n_segs)
+        max_segs = max(ring_segs_list) if any(s > 0 for s in ring_segs_list) else 1
+        grid_w = max_segs
+        grid_h = n_rings
+        mask = np.zeros((grid_h, grid_w), dtype=np.int8)
+        cells = []
+        for ring, n_segs in enumerate(ring_segs_list):
+            if n_segs < 1:
+                continue
+            r0 = ring * tile_size
+            r1 = min(radius, (ring + 1) * tile_size)
+            r_mid = 0.5 * (r0 + r1)
+            delta_a = 2.0 * math.pi / n_segs
+            sin_half_inner = math.sin(delta_a * 0.5)
+            # outer half-angle keeps outer edge = inner chord
+            sin_half_outer = min(1.0, r0 * sin_half_inner / r1) if r1 > 1e-9 else 0.0
+            half_out = math.asin(sin_half_outer)
+            my = ring
+            x0_ring = (grid_w - n_segs) // 2
+            for seg in range(n_segs):
+                mx = x0_ring + seg
+                a0 = delta_a * seg
+                a1 = delta_a * (seg + 1)
+                am = 0.5 * (a0 + a1)
+                normal = (math.cos(am), math.sin(am))
+                tangent = (-math.sin(am), math.cos(am))
+                cx = r_mid * normal[0]
+                cy = r_mid * normal[1]
+                p_il = (r0 * math.cos(a0), r0 * math.sin(a0))
+                p_ir = (r0 * math.cos(a1), r0 * math.sin(a1))
+                p_or = (r1 * math.cos(am + half_out), r1 * math.sin(am + half_out))
+                p_ol = (r1 * math.cos(am - half_out), r1 * math.sin(am - half_out))
+                mask[my, mx] = 1
+                cells.append({
+                    "x": mx, "y": my,
+                    "zone": "polar_ring",
+                    "ring": ring, "segment": seg, "segment_count": n_segs,
+                    "center": (cx, cy),
+                    "normal": normal, "tangent": tangent,
+                    "yaw_deg": math.degrees(am),
+                    "tile_width": 2.0 * r0 * sin_half_inner,
+                    "tile_depth": r1 - r0,
+                    "coord": (ring, seg),
+                    "corners": [
+                        p_il,
+                        p_ir,
+                        (r1 * math.cos(a1), r1 * math.sin(a1)),
+                        (r1 * math.cos(a0), r1 * math.sin(a0)),
+                    ],
+                    "tile_corners": [p_il, p_ir, p_or, p_ol],
+                })
+        return {
+            "floor_type": "polar",
+            "width": grid_w, "height": grid_h,
+            "mask": mask, "cells": cells,
+            "radial_segments": n_rings,
+            "angular_segments": max_segs,
+            "ring_segments": ring_segs_list,
+            "floor_radius": radius,
+        }
+
+    if ft == "polar_rect":
+        # Fixed angular-segment lattice (no center rect). User controls rings x arcs.
         radius = max(1.0, float(state.get("floor_radius", 8.0)))
         radial_segments = max(1, int(state.get("floor_radial_segments", math.ceil(radius)) or math.ceil(radius)))
         angular_segments = max(8, int(state.get("floor_angular_segments", 24) or 24))
-
-        # Full 2pi polar-segment lattice: rings x angular segments.
         mask = np.ones((radial_segments, angular_segments), dtype=np.int8)
         cells = []
         for ring in range(radial_segments):
@@ -624,120 +703,16 @@ def build_floor_plan(floor_type: str, width: int, depth: int,
                 cy = rm * normal[1]
                 tile_d = max(0.05, r1 - r0)
                 tile_w = max(0.05, 2.0 * rm * math.sin(0.5 * (a1 - a0)))
-                corners = [
-                    (r0 * math.cos(a0), r0 * math.sin(a0)),
-                    (r1 * math.cos(a0), r1 * math.sin(a0)),
-                    (r1 * math.cos(a1), r1 * math.sin(a1)),
-                    (r0 * math.cos(a1), r0 * math.sin(a1)),
-                ]
                 cells.append({
-                    "x": segment,
-                    "y": ring,
+                    "x": segment, "y": ring,
                     "zone": "polar",
-                    "ring": ring,
-                    "segment": segment,
-                    "segment_count": angular_segments,
-                    "radius_inner": r0,
-                    "radius_outer": r1,
-                    "angle_start": a0,
-                    "angle_end": a1,
+                    "ring": ring, "segment": segment, "segment_count": angular_segments,
+                    "radius_inner": r0, "radius_outer": r1,
+                    "angle_start": a0, "angle_end": a1,
                     "center": (cx, cy),
-                    "normal": normal,
-                    "tangent": tangent,
+                    "normal": normal, "tangent": tangent,
                     "yaw_deg": math.degrees(am),
-                    "tile_width": tile_w,
-                    "tile_depth": tile_d,
-                    "coord": (ring, segment),
-                    "corners": corners,
-                    "tile_corners": _oriented_tile_rect(cx, cy, normal, tangent, tile_w, tile_d),
-                })
-        return {
-            "floor_type": "polar",
-            "width": angular_segments,
-            "height": radial_segments,
-            "mask": mask,
-            "cells": cells,
-            "radial_segments": radial_segments,
-            "angular_segments": angular_segments,
-        }
-
-    if ft == "polar_rect_center":
-        radius = max(1.0, float(state.get("floor_radius", 8.0)))
-        radial_segments = max(1, int(state.get("floor_radial_segments", math.ceil(radius)) or math.ceil(radius)))
-        angular_segments = max(
-            4,
-            int(state.get("floor_angular_segments", max(8, math.ceil(2.0 * math.pi * radius / 2.0))) or 8),
-        )
-        cw = max(2, int(state.get("floor_center_w", 4)))
-        cd = max(2, int(state.get("floor_center_d", 4)))
-        grid_w = max(cw, angular_segments)
-        grid_h = cd + radial_segments
-        x0 = (grid_w - cw) // 2
-        mask = np.zeros((grid_h, grid_w), dtype=np.int8)
-        cells = []
-        center_x0 = -0.5 * cw
-        center_y0 = -0.5 * cd
-        for gy in range(cd):
-            for gx in range(cw):
-                mx = x0 + gx
-                my = gy
-                mask[my, mx] = 1
-                cells.append({
-                    "x": mx,
-                    "y": my,
-                    "zone": "center_rect",
-                    "coord": (gx, gy),
-                    "center": (center_x0 + gx + 0.5, center_y0 + gy + 0.5),
-                    "normal": (0.0, 1.0),
-                    "tangent": (1.0, 0.0),
-                    "yaw_deg": 0.0,
-                    "corners": [
-                        (center_x0 + gx, center_y0 + gy),
-                        (center_x0 + gx + 1, center_y0 + gy),
-                        (center_x0 + gx + 1, center_y0 + gy + 1),
-                        (center_x0 + gx, center_y0 + gy + 1),
-                    ],
-                    "tile_corners": [
-                        (center_x0 + gx, center_y0 + gy),
-                        (center_x0 + gx + 1, center_y0 + gy),
-                        (center_x0 + gx + 1, center_y0 + gy + 1),
-                        (center_x0 + gx, center_y0 + gy + 1),
-                    ],
-                })
-        center_radius = 0.5 * math.hypot(cw, cd)
-        for ring in range(radial_segments):
-            r0 = center_radius + (radius - center_radius) * ring / radial_segments
-            r1 = center_radius + (radius - center_radius) * (ring + 1) / radial_segments
-            my = cd + ring
-            for segment in range(angular_segments):
-                mx = segment + (grid_w - angular_segments) // 2
-                a0 = 2.0 * math.pi * segment / angular_segments
-                a1 = 2.0 * math.pi * (segment + 1) / angular_segments
-                am = 0.5 * (a0 + a1)
-                normal = (math.cos(am), math.sin(am))
-                tangent = (-math.sin(am), math.cos(am))
-                rm = 0.5 * (r0 + r1)
-                cx = rm * normal[0]
-                cy = rm * normal[1]
-                tile_d = max(0.05, r1 - r0)
-                tile_w = max(0.05, 2.0 * rm * math.sin(0.5 * (a1 - a0)))
-                mask[my, mx] = 1
-                cells.append({
-                    "x": mx,
-                    "y": my,
-                    "zone": "polar_outer",
-                    "ring": ring,
-                    "segment": segment,
-                    "radius_inner": r0,
-                    "radius_outer": r1,
-                    "angle_start": a0,
-                    "angle_end": a1,
-                    "center": (cx, cy),
-                    "normal": normal,
-                    "tangent": tangent,
-                    "yaw_deg": math.degrees(am),
-                    "tile_width": tile_w,
-                    "tile_depth": tile_d,
+                    "tile_width": tile_w, "tile_depth": tile_d,
                     "coord": (ring, segment),
                     "corners": [
                         (r0 * math.cos(a0), r0 * math.sin(a0)),
@@ -748,181 +723,88 @@ def build_floor_plan(floor_type: str, width: int, depth: int,
                     "tile_corners": _oriented_tile_rect(cx, cy, normal, tangent, tile_w, tile_d),
                 })
         return {
-            "floor_type": "polar_rect_center",
-            "width": grid_w,
-            "height": grid_h,
-            "mask": mask,
-            "cells": cells,
+            "floor_type": "polar_rect",
+            "width": angular_segments, "height": radial_segments,
+            "mask": mask, "cells": cells,
             "radial_segments": radial_segments,
             "angular_segments": angular_segments,
+            "floor_radius": radius,
         }
 
     if ft == "arc":
-        # Horizontal arc segment floor (concave cylinder, wall curves left/right).
-        # Lon range: user-defined via floor_arc_lon_start / floor_arc_lon_span
-        # Lat is not used (single-level); tiles span the arc's depth.
-        arc_radius = max(1.0, float(state.get("floor_arc_radius", 6.0)))
-        lon_start = float(state.get("floor_arc_lon_start", 45.0))
-        lon_span = float(state.get("floor_arc_lon_span", 90.0))
-        lon_segments = max(4, int(state.get("floor_arc_lon_segments", 16)))
-        radial_depth = max(1, int(state.get("floor_arc_radial_segments", 2)))
-        
-        mask = np.ones((radial_depth, lon_segments), dtype=np.int8)
+        # Arc is polar with the full-circle delta_a intact.
+        # For each ring, compute n_segs_full = floor(2π·r0) — exactly as polar.
+        # delta_a is 2π/n_segs_full (same tile size as polar).
+        # Only keep the first floor(arc_span · n_segs_full) tiles (those within
+        # the arc).  Tile geometry is identical to polar; arc_span just limits
+        # how many tiles of the full ring are included.
+        radius = max(1.0, float(state.get("floor_radius", 8.0)))
+        arc_span = float(np.clip(state.get("floor_arc_span", 1.0) or 1.0, 0.0, 1.0))
+        tile_size = 1.0
+        n_rings = max(1, int(math.ceil(radius / tile_size)))
+        arc_segs_list: list[int] = []
+        for ring in range(n_rings):
+            r0 = ring * tile_size
+            n_segs_full = int(math.floor(2.0 * math.pi * r0 / tile_size)) if r0 > 1e-9 else 0
+            n_segs_arc = int(math.floor(arc_span * n_segs_full))
+            arc_segs_list.append(n_segs_arc)
+        max_segs = max(arc_segs_list) if any(s > 0 for s in arc_segs_list) else 1
+        grid_w = max_segs
+        grid_h = n_rings
+        mask = np.zeros((grid_h, grid_w), dtype=np.int8)
         cells = []
-        
-        for lat_idx in range(radial_depth):
-            r0 = arc_radius * (1.0 - (lat_idx + 0.0) / radial_depth)
-            r1 = arc_radius * (1.0 - (lat_idx + 1.0) / radial_depth)
-            for lon_idx in range(lon_segments):
-                a0 = math.radians(lon_start + (lon_span * lon_idx / lon_segments))
-                a1 = math.radians(lon_start + (lon_span * (lon_idx + 1) / lon_segments))
+        for ring, n_segs_arc in enumerate(arc_segs_list):
+            if n_segs_arc < 1:
+                continue
+            r0 = ring * tile_size
+            r1 = min(radius, (ring + 1) * tile_size)
+            r_mid = 0.5 * (r0 + r1)
+            n_segs_full = int(math.floor(2.0 * math.pi * r0 / tile_size))
+            delta_a = 2.0 * math.pi / n_segs_full
+            sin_half_inner = math.sin(delta_a * 0.5)
+            sin_half_outer = min(1.0, r0 * sin_half_inner / r1) if r1 > 1e-9 else 0.0
+            half_out = math.asin(sin_half_outer)
+            my = ring
+            for seg in range(n_segs_arc):
+                a0 = delta_a * seg
+                a1 = delta_a * (seg + 1)
                 am = 0.5 * (a0 + a1)
-                
-                # On a horizontal cylinder: lon maps to angle around Z axis,
-                # lat maps to depth from operator. Normal points inward (concave).
-                normal = (-math.cos(am), -math.sin(am), 0.0)  # concave (inward)
-                tangent = (math.sin(am), -math.cos(am), 0.0)  # along-longitude
-                
-                rm = 0.5 * (r0 + r1)
-                cx = rm * math.cos(am)
-                cy = rm * math.sin(am)
-                tile_d = max(0.05, r1 - r0)
-                tile_w = max(0.05, rm * (a1 - a0))
-                
+                normal = (math.cos(am), math.sin(am))
+                tangent = (-math.sin(am), math.cos(am))
+                cx = r_mid * normal[0]
+                cy = r_mid * normal[1]
+                p_il = (r0 * math.cos(a0), r0 * math.sin(a0))
+                p_ir = (r0 * math.cos(a1), r0 * math.sin(a1))
+                p_or = (r1 * math.cos(am + half_out), r1 * math.sin(am + half_out))
+                p_ol = (r1 * math.cos(am - half_out), r1 * math.sin(am - half_out))
+                mask[my, seg] = 1
                 cells.append({
-                    "x": lon_idx,
-                    "y": lat_idx,
-                    "zone": "arc",
-                    "lon_idx": lon_idx,
-                    "lat_idx": lat_idx,
-                    "radius_inner": r0,
-                    "radius_outer": r1,
-                    "angle_start": a0,
-                    "angle_end": a1,
-                    "center": (cx, cy, 0.0),
-                    "normal": normal,
-                    "tangent": tangent,
+                    "x": seg, "y": my,
+                    "zone": "arc_ring",
+                    "ring": ring, "segment": seg, "segment_count": n_segs_arc,
+                    "center": (cx, cy),
+                    "normal": normal, "tangent": tangent,
                     "yaw_deg": math.degrees(am),
-                    "tile_width": tile_w,
-                    "tile_depth": tile_d,
-                    "coord": (lon_idx, lat_idx),
+                    "tile_width": 2.0 * r0 * sin_half_inner,
+                    "tile_depth": r1 - r0,
+                    "coord": (ring, seg),
                     "corners": [
-                        (r0 * math.cos(a0), r0 * math.sin(a0), 0.0),
-                        (r1 * math.cos(a0), r1 * math.sin(a0), 0.0),
-                        (r1 * math.cos(a1), r1 * math.sin(a1), 0.0),
-                        (r0 * math.cos(a1), r0 * math.sin(a1), 0.0),
+                        p_il,
+                        p_ir,
+                        (r1 * math.cos(a1), r1 * math.sin(a1)),
+                        (r1 * math.cos(a0), r1 * math.sin(a0)),
                     ],
+                    "tile_corners": [p_il, p_ir, p_or, p_ol],
                 })
-        
         return {
             "floor_type": "arc",
-            "width": lon_segments,
-            "height": radial_depth,
-            "mask": mask,
-            "cells": cells,
-            "lon_segments": lon_segments,
-            "radial_depth": radial_depth,
-            "lon_start": lon_start,
-            "lon_span": lon_span,
-            "arc_radius": arc_radius,
-        }
-
-    if ft == "spherical":
-        # Spherical cap floor (concave dome centred at operator).
-        # Lon: 45°–135° (centred on +Y = into room)
-        # Lat: 0°–90° (above horizon = upper hemisphere)
-        lon_center = float(state.get("floor_sphere_lon_center", 90.0))
-        lat_center = float(state.get("floor_sphere_lat_center", 45.0))
-        sphere_radius = max(1.0, float(state.get("floor_sphere_radius", 6.0)))
-        lon_half = float(state.get("floor_sphere_lon_half", 45.0))
-        lat_half = float(state.get("floor_sphere_lat_half", 45.0))
-        lon_segments = max(4, int(state.get("floor_sphere_lon_segments", 16)))
-        lat_segments = max(2, int(state.get("floor_sphere_lat_segments", 8)))
-        
-        lon_min = lon_center - lon_half
-        lon_max = lon_center + lon_half
-        lat_min = max(0.0, lat_center - lat_half)
-        lat_max = min(90.0, lat_center + lat_half)
-        
-        mask = np.ones((lat_segments, lon_segments), dtype=np.int8)
-        cells = []
-        
-        for lat_idx in range(lat_segments):
-            lat0 = math.radians(lat_min + (lat_max - lat_min) * lat_idx / lat_segments)
-            lat1 = math.radians(lat_min + (lat_max - lat_min) * (lat_idx + 1) / lat_segments)
-            lat_m = 0.5 * (lat0 + lat1)
-            
-            for lon_idx in range(lon_segments):
-                lon0 = math.radians(lon_min + (lon_max - lon_min) * lon_idx / lon_segments)
-                lon1 = math.radians(lon_min + (lon_max - lon_min) * (lon_idx + 1) / lon_segments)
-                lon_m = 0.5 * (lon0 + lon1)
-                
-                # Spherical coordinates (lon, lat) → Cartesian on sphere:
-                # x = r * cos(lat) * cos(lon)
-                # y = r * cos(lat) * sin(lon)
-                # z = r * sin(lat)
-                cx = sphere_radius * math.cos(lat_m) * math.cos(lon_m)
-                cy = sphere_radius * math.cos(lat_m) * math.sin(lon_m)
-                cz = sphere_radius * math.sin(lat_m)
-                
-                # Normal points outward (from operator at origin toward surface):
-                # Normalize (cx, cy, cz) — already on sphere, so just divide by radius
-                normal = (cx / sphere_radius, cy / sphere_radius, cz / sphere_radius)
-                
-                # Tangent (along longitude): perpendicular to normal in XY plane
-                tangent_lon = (-math.sin(lon_m), math.cos(lon_m), 0.0)
-                # Bitangent (along latitude): perpendicular to normal and tangent
-                bitangent_lat = (-math.sin(lat_m) * math.cos(lon_m),
-                                 -math.sin(lat_m) * math.sin(lon_m),
-                                 math.cos(lat_m))
-                
-                # Tile size based on arc length on sphere surface
-                tile_w = max(0.05, sphere_radius * math.cos(lat_m) * (lon1 - lon0))
-                tile_d = max(0.05, sphere_radius * (lat1 - lat0))
-                
-                corners = []
-                for lat_c in (lat0, lat1):
-                    for lon_c in (lon0, lon1):
-                        x = sphere_radius * math.cos(lat_c) * math.cos(lon_c)
-                        y = sphere_radius * math.cos(lat_c) * math.sin(lon_c)
-                        z = sphere_radius * math.sin(lat_c)
-                        corners.append((x, y, z))
-                
-                cells.append({
-                    "x": lon_idx,
-                    "y": lat_idx,
-                    "zone": "spherical",
-                    "lon_idx": lon_idx,
-                    "lat_idx": lat_idx,
-                    "lon_start": lon0,
-                    "lon_end": lon1,
-                    "lat_start": lat0,
-                    "lat_end": lat1,
-                    "center": (cx, cy, cz),
-                    "normal": normal,
-                    "tangent": tangent_lon,
-                    "bitangent": bitangent_lat,
-                    "yaw_deg": math.degrees(lon_m),
-                    "pitch_deg": math.degrees(lat_m - math.pi / 2.0),
-                    "tile_width": tile_w,
-                    "tile_depth": tile_d,
-                    "coord": (lon_idx, lat_idx),
-                    "corners": corners,
-                })
-        
-        return {
-            "floor_type": "spherical",
-            "width": lon_segments,
-            "height": lat_segments,
-            "mask": mask,
-            "cells": cells,
-            "lon_segments": lon_segments,
-            "lat_segments": lat_segments,
-            "sphere_radius": sphere_radius,
-            "lon_center": lon_center,
-            "lat_center": lat_center,
-            "lon_half": lon_half,
-            "lat_half": lat_half,
+            "width": grid_w, "height": grid_h,
+            "mask": mask, "cells": cells,
+            "radial_segments": n_rings,
+            "angular_segments": max_segs,
+            "ring_segments": arc_segs_list,
+            "floor_radius": radius,
+            "arc_span": arc_span,
         }
 
     return build_floor_plan("rect", w, d, state)
@@ -1091,6 +973,117 @@ def build_envelope_meshes(floor_result: np.ndarray,
     return {"floor": _arr(floor_tris), "walls": _arr(wall_tris), "ceiling": _arr(ceil_tris)}
 
 
+def build_floor_material_triangulation(
+    floor_result: np.ndarray,
+    state: dict,
+    cell_size_m: float = 1.0,
+    floor_plan: Optional[dict] = None,
+) -> dict:
+    """Split active floor cells into tile, border/fill, and border-line geometry.
+
+    ``corners`` define the containing floor region for each logical tile slot.
+    ``tile_corners`` define the material tile inside that region. If a plan's
+    tile exactly matches its container, a small inset is applied so rectangular
+    floors still produce a separate border/fill region.
+    """
+    D, W = floor_result.shape
+    cs = float(cell_size_m)
+    inset_m = max(0.0, float(state.get("floor_tile_border_width", 0.04) or 0.0))
+    cell_meta = {
+        (int(cell["x"]), int(cell["y"])): cell
+        for cell in (floor_plan or {}).get("cells", [])
+        if isinstance(cell, dict) and "x" in cell and "y" in cell
+    }
+
+    def _scaled_quad(raw_quad: Any, gx: int, gy: int) -> list[tuple[float, float]]:
+        pts: list[tuple[float, float]] = []
+        if isinstance(raw_quad, list):
+            for raw_pt in raw_quad[:4]:
+                if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
+                    pts.append((float(raw_pt[0]) * cs, float(raw_pt[1]) * cs))
+        if len(pts) == 4:
+            return pts
+        return [
+            (gx * cs, gy * cs),
+            ((gx + 1) * cs, gy * cs),
+            ((gx + 1) * cs, (gy + 1) * cs),
+            (gx * cs, (gy + 1) * cs),
+        ]
+
+    def _quad_area(q: list[tuple[float, float]]) -> float:
+        return 0.5 * abs(sum(
+            q[i][0] * q[(i + 1) % 4][1] - q[(i + 1) % 4][0] * q[i][1]
+            for i in range(4)
+        ))
+
+    def _inset_quad(q: list[tuple[float, float]], inset: float) -> list[tuple[float, float]]:
+        if inset <= 0.0:
+            return list(q)
+        cx = 0.25 * sum(p[0] for p in q)
+        cy = 0.25 * sum(p[1] for p in q)
+        out: list[tuple[float, float]] = []
+        for x, y in q:
+            vx, vy = x - cx, y - cy
+            dist = math.hypot(vx, vy)
+            if dist <= 1e-9:
+                out.append((x, y))
+                continue
+            scale = max(0.0, (dist - inset) / dist)
+            out.append((cx + vx * scale, cy + vy * scale))
+        if _quad_area(out) <= 1e-9:
+            return list(q)
+        return out
+
+    def _same_quad(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> bool:
+        return all(math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]) <= 1e-7 for i in range(4))
+
+    def _tri(q: list[tuple[float, float]]) -> list:
+        p0, p1, p2, p3 = q
+        return [
+            [[p0[0], p0[1], 0.0], [p1[0], p1[1], 0.0], [p2[0], p2[1], 0.0]],
+            [[p0[0], p0[1], 0.0], [p2[0], p2[1], 0.0], [p3[0], p3[1], 0.0]],
+        ]
+
+    tile_tris: list = []
+    fill_tris: list = []
+    border_lines: list = []
+
+    for gy in range(D):
+        for gx in range(W):
+            if floor_result[gy, gx] != 1:
+                continue
+            meta = cell_meta.get((gx, gy), {})
+            outer = _scaled_quad(meta.get("corners"), gx, gy)
+            inner = _scaled_quad(meta.get("tile_corners"), gx, gy)
+            if _same_quad(outer, inner):
+                inner = _inset_quad(outer, min(inset_m, 0.45 * math.sqrt(max(_quad_area(outer), 0.0))))
+            tile_tris.extend(_tri(inner))
+
+            for i in range(4):
+                j = (i + 1) % 4
+                strip = [outer[i], outer[j], inner[j], inner[i]]
+                if _quad_area(strip) > 1e-10:
+                    fill_tris.extend(_tri(strip))
+                border_lines.append([inner[i][0], inner[i][1], 0.003])
+                border_lines.append([inner[j][0], inner[j][1], 0.003])
+
+    def _arr(tris: list) -> np.ndarray:
+        if not tris:
+            return np.zeros((0, 3, 3), np.float64)
+        return np.array(tris, dtype=np.float64)
+
+    border_arr = np.zeros((0, 3), np.float64) if not border_lines else np.array(border_lines, dtype=np.float64)
+    return {
+        "floor_tiles": _arr(tile_tris),
+        "floor_fill": _arr(fill_tris),
+        "floor_borders": border_arr,
+        "material_slots": {
+            "floor_tiles": str(state.get("floor_tile_material", "pearl_white_tile")),
+            "floor_fill": str(state.get("floor_fill_material", "painted_concrete")),
+        },
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Knob panel helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1132,24 +1125,24 @@ def _make_envelope_panel() -> Panel:
         knobs=[
             stepper_knob("room_width_cells",  "Width",    "int",   8,   2, 128,  1,  unit="cells", group="Floor", fmt=".0f"),
             stepper_knob("room_depth_cells",  "Depth",    "int",   8,   2, 128,  1,  unit="cells", group="Floor", fmt=".0f"),
-            stepper_knob("floor_radius",      "Radius",   "float", 8.0, 1.0, 64.0, 0.5, unit="cells", group="Floor", fmt=".1f"),
-            stepper_knob("floor_polar_rays",  "Rays",     "int",  24,   0, 256,  1,  unit="", group="Floor", fmt=".0f"),
-            stepper_knob("floor_radial_segments",  "Rings", "int", 8, 1, 128, 1, unit="", group="Floor", fmt=".0f"),
-            stepper_knob("floor_polar_tile_radius", "Tile R", "float", 0.0625, 0.01, 0.49, 0.005, unit="ri", group="Floor", fmt=".4f"),
-            stepper_knob("floor_angular_segments", "Arcs",  "int", 16, 4, 256, 1, unit="", group="Floor", fmt=".0f"),
-            stepper_knob("floor_center_w",    "Center W", "int",   4,   2,  64,   1,  unit="cells", group="Floor", fmt=".0f"),
-            stepper_knob("floor_center_d",    "Center D", "int",   4,   2,  64,   1,  unit="cells", group="Floor", fmt=".0f"),
+            stepper_knob("floor_radius",           "Radius",   "float", 8.0, 1.0, 64.0, 0.5, unit="m", group="Floor", fmt=".1f"),
+            stepper_knob("floor_radial_segments",  "Rings",    "int",   8,   1, 128,  1,  unit="", group="Floor (POLAR+RECT)", fmt=".0f"),
+            stepper_knob("floor_angular_segments", "Arcs",     "int",  16,   4, 256,  1,  unit="", group="Floor (POLAR+RECT)", fmt=".0f"),
+            stepper_knob("floor_polar_rays",        "Rays",     "int",  24,   2, 128,  1,  unit="", group="Floor (POLAR+RECT)", fmt=".0f"),
+            stepper_knob("floor_polar_tile_radius", "Tile R",  "float", 0.0,  0.0, 0.49, 0.01, unit="", group="Floor (POLAR+RECT)", fmt=".2f"),
+            stepper_knob("floor_arc_span",         "Arc Span", "float", 1.0, 0.0, 1.0, 0.05, unit="", group="Floor (ARC)", fmt=".2f"),
+            stepper_knob("floor_center_w",    "Center W", "int",   4,   2,  64,   1,  unit="cells", group="Floor (POLAR)", fmt=".0f"),
+            stepper_knob("floor_center_d",    "Center D", "int",   4,   2,  64,   1,  unit="cells", group="Floor (POLAR)", fmt=".0f"),
             stepper_knob("wall_height",       "Wall H",   "float", 3.0, 1.0, 20.0, 0.5, unit="m", group="Volume", fmt=".1f"),
             stepper_knob("ceil_height",       "Ceil H",   "float", 3.0, 1.0, 20.0, 0.5, unit="m", group="Volume", fmt=".1f"),
         ],
         payload={
             "action_first": True,
             "actions": [
-                {"key": "floor:rect", "label": "RECT"},
-                {"key": "floor:polar", "label": "POLAR"},
-                {"key": "floor:polar_rect_center", "label": "POLAR+RECT"},
-                {"key": "floor:arc", "label": "ARC"},
-                {"key": "floor:spherical", "label": "SPHERICAL"},
+                {"key": "floor:rect",       "label": "RECT"},
+                {"key": "floor:polar",      "label": "POLAR"},
+                {"key": "floor:polar_rect", "label": "POLAR+RECT"},
+                {"key": "floor:arc",        "label": "ARC"},
             ],
         },
     )
@@ -1740,6 +1733,8 @@ class RoomControlStation(_StationMenuBase):
         # Cached envelope meshes, rebuilt on state change.
         self._envelope_meshes: dict  = {}
         self._envelope_mesh_key: str = ""
+        self._applied_floor_meshes: dict = {}
+        self._applied_floor_mesh_key: str = ""
         self._right_scroll_widget = ScrollableSubpanelList(
             "Room Controls",
             max_height=220,
@@ -1771,13 +1766,13 @@ class RoomControlStation(_StationMenuBase):
                 "dimx:+",
                 "dimy:-",
                 "dimy:+",
+                "apply_floor",
             ),
             "room_floor": (
                 "floor:rect",
                 "floor:polar",
-                "floor:polar_rect_center",
+                "floor:polar_rect",
                 "floor:arc",
-                "floor:spherical",
             ),
         }.items():
             for action_key in action_keys:
@@ -1797,6 +1792,72 @@ class RoomControlStation(_StationMenuBase):
     @staticmethod
     def _doc_dispatch_key(map_key: str) -> str:
         return f"room_control/{map_key}"
+
+    def _current_floor_geometry(self) -> tuple[str, int, int, dict, np.ndarray]:
+        """Return the current room-control floor plan and hull-clipped result."""
+        ft_raw = self.state.get("floor_type", "rect")
+        try:
+            ft_idx = int(ft_raw)
+            floor_type = _FLOOR_TYPES[ft_idx] if 0 <= ft_idx < len(_FLOOR_TYPES) else "rect"
+        except (ValueError, TypeError):
+            floor_type = str(ft_raw)
+        width = max(2, int(self.state.get("room_width_cells", 8)))
+        depth = max(2, int(self.state.get("room_depth_cells", 8)))
+        floor_plan = build_floor_plan(floor_type, width, depth, self.state)
+        floor_result = apply_hull_deformation(floor_plan["mask"], self.state)
+        depth, width = floor_result.shape
+        return floor_type, width, depth, floor_plan, floor_result
+
+    def _current_floor_mesh_key(self, floor_type: str, width: int, depth: int) -> str:
+        parts: list[Any] = [
+            floor_type,
+            width,
+            depth,
+            self.state.get("floor_radius", 8.0),
+            self.state.get("floor_radial_segments", ""),
+            self.state.get("floor_angular_segments", ""),
+            self.state.get("floor_arc_span", ""),
+            self.state.get("floor_center_w", 4),
+            self.state.get("floor_center_d", 4),
+            self.state.get("floor_tile_border_width", 0.04),
+        ]
+        for prefix in ("hull_n", "hull_s", "hull_e", "hull_w"):
+            parts.extend((self.state.get(f"{prefix}_type", 0), self.state.get(f"{prefix}_amount", 0.0)))
+        for prefix in ("hull_ne", "hull_nw", "hull_se", "hull_sw"):
+            parts.extend((self.state.get(f"{prefix}_type", 0), self.state.get(f"{prefix}_radius", 0.0)))
+        return ":".join(str(part) for part in parts)
+
+    def apply_floor_triangulation(self) -> dict:
+        """Deploy the current grid floor as material-split triangulated meshes."""
+        floor_type, width, depth, floor_plan, floor_result = self._current_floor_geometry()
+        meshes = build_floor_material_triangulation(
+            floor_result,
+            self.state,
+            cell_size_m=float(_CELL_SIZE_M),
+            floor_plan=floor_plan,
+        )
+        key = self._current_floor_mesh_key(floor_type, width, depth)
+        tile_count = int(len(meshes.get("floor_tiles", ())) or 0)
+        fill_count = int(len(meshes.get("floor_fill", ())) or 0)
+        border_count = int(len(meshes.get("floor_borders", ())) // 2 if "floor_borders" in meshes else 0)
+        self._applied_floor_meshes = meshes
+        self._applied_floor_mesh_key = key
+        target_ws = self._scene_workspace
+        if target_ws is None and self._host_station is not None:
+            target_ws = getattr(self._host_station, "_room_workspace_ref", None)
+        if target_ws is not None and hasattr(target_ws, "room_cfg"):
+            room_cfg = getattr(target_ws, "room_cfg")
+            if isinstance(room_cfg, dict):
+                room_cfg["applied_floor_meshes"] = meshes
+                room_cfg["applied_floor_mesh_key"] = key
+                room_cfg["applied_floor_material_slots"] = dict(meshes.get("material_slots", {}))
+                room_cfg["applied_floor_revision"] = int(room_cfg.get("applied_floor_revision", 0) or 0) + 1
+        self.state["floor_triangulation_applied"] = True
+        self.state["floor_triangulation_key"] = key
+        self.state["floor_triangulation_tile_triangles"] = tile_count
+        self.state["floor_triangulation_fill_triangles"] = fill_count
+        self.state["floor_triangulation_border_segments"] = border_count
+        return dict(meshes)
 
     @property
     def panel_spec(self) -> Panel:
@@ -1923,6 +1984,7 @@ class RoomControlStation(_StationMenuBase):
                 "source_panel": "RoomTileWorkspace",
                 "action_first": True,
                 "actions": [
+                    {"key": "apply_floor", "label": "Apply Floor"},
                     {"key": "level:-", "label": "Level -"},
                     {"key": "level:+", "label": "Level +"},
                     {"key": "dimx:-", "label": "Width -"},
@@ -2042,7 +2104,7 @@ class RoomControlStation(_StationMenuBase):
             if isinstance(cell, dict)
         }
 
-        use_geo_layout = floor_type in ("polar", "arc", "spherical")
+        use_geo_layout = floor_type in ("polar", "polar_rect", "arc")
         geo_bounds = None
         if use_geo_layout:
             pts_xy = []
@@ -2096,14 +2158,157 @@ class RoomControlStation(_StationMenuBase):
             self._envelope_meshes  = build_envelope_meshes(floor_result, self.state, floor_plan=floor_plan)
             self._envelope_mesh_key = mesh_key
 
+        # polar_rect display uses packed rectangular tiles in ray sectors.
+        if floor_type == "polar_rect":
+            n_rays = max(2, int(self.state.get("floor_polar_rays", 24) or 24))
+            radial_segs = max(1, int(floor_plan.get("radial_segments", 8) or 8))
+            raw_tr = float(self.state.get("floor_polar_tile_radius", 0.0) or 0.0)
+            tr_arg = raw_tr if raw_tr > 1e-4 else None
+            polar_cells = _make_polar_tile_cells(n_rays, radial_segs, tr_arg)
+            _polar_fp = {
+                "type": floor_type,
+                "radial_segments": radial_segs,
+                "angular_segments": n_rays,
+                "polar_rays": n_rays,
+                "ring_segments": [],
+                "floor_radius": float(floor_plan.get("floor_radius", 8.0) or 8.0),
+            }
+            if self._room_workspace is not None:
+                ws = self._room_workspace
+                view_name = str(self.state.get("room_view", "plan"))
+                level = int(self.state.get("room_level", 0))
+                selected_id = str(self.state.get("room_selected_instance", ""))
+                snap_policy = str(self.state.get("room_snap_policy", "gentle"))
+                floor_radius = float(_polar_fp["floor_radius"])
+
+                station_cells = set(ws._station_cells())
+                occupied: dict[tuple[int, int], int] = {}
+                for instance in ws.instances:
+                    preset = ws.presets.get(instance.preset_id)
+                    if preset is None:
+                        continue
+                    if view_name == "plan" and not (instance.level <= level < instance.level + preset.level_span):
+                        continue
+                    state_idx = _CELL_SELECTED if instance.instance_id == selected_id else _CELL_OCCUPIED
+                    for dx in range(preset.footprint_xy[0]):
+                        for dy in range(preset.footprint_xy[1]):
+                            occupied[(instance.grid_x + dx, instance.grid_y + dy)] = state_idx
+
+                object_marks: dict[tuple[int, int], dict[str, Any]] = {}
+                if view_name == "plan" and hasattr(ws, "floor_plan_object_cell_marks"):
+                    object_marks = ws.floor_plan_object_cell_marks(level, snap_policy=snap_policy)
+                mark_state = {
+                    "fit": _CELL_OCCUPIED,
+                    "snap": _CELL_SNAP,
+                    "dual": _CELL_DUAL_SNAP,
+                    "quad": _CELL_QUAD_SNAP,
+                    "collision": _CELL_COLLISION,
+                }
+
+                snap_cells: set[tuple[int, int]] = set()
+                sel_preset = ws.selected_preset()
+                if sel_preset is not None and bool(getattr(sel_preset, "network_strict_snap", False)):
+                    snap_cells = {(int(x), int(y)) for x, y, _ in ws._network_contact_candidates(level, sel_preset)}
+
+                def _world_cells_for_packed_quad(cell: dict) -> set[tuple[int, int]]:
+                    qf = cell.get("quad_xy_frac")
+                    if not (isinstance(qf, list) and len(qf) >= 4):
+                        return set()
+                    quad: list[tuple[float, float]] = []
+                    for raw_pt in qf[:4]:
+                        if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
+                            quad.append((float(raw_pt[0]) * floor_radius, float(raw_pt[1]) * floor_radius))
+                    if len(quad) != 4:
+                        return set()
+
+                    xs = [p[0] for p in quad]
+                    ys = [p[1] for p in quad]
+                    gx0 = int(math.floor(min(xs)))
+                    gx1 = int(math.floor(max(xs)))
+                    gy0 = int(math.floor(min(ys)))
+                    gy1 = int(math.floor(max(ys)))
+                    qcx = 0.25 * sum(p[0] for p in quad)
+                    qcy = 0.25 * sum(p[1] for p in quad)
+                    ordered = sorted(quad, key=lambda p: math.atan2(p[1] - qcy, p[0] - qcx))
+
+                    def _inside(px: float, py: float) -> bool:
+                        sign = 0
+                        for i in range(4):
+                            ax, ay = ordered[i]
+                            bx, by = ordered[(i + 1) % 4]
+                            cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax)
+                            if abs(cross) <= 1e-9:
+                                continue
+                            cur = 1 if cross > 0.0 else -1
+                            if sign == 0:
+                                sign = cur
+                            elif sign != cur:
+                                return False
+                        return True
+
+                    cells_hit: set[tuple[int, int]] = set()
+                    for gy in range(gy0 - 1, gy1 + 2):
+                        for gx in range(gx0 - 1, gx1 + 2):
+                            if _inside(float(gx) + 0.5, float(gy) + 0.5):
+                                cells_hit.add((gx, gy))
+                    for px, py in quad:
+                        cells_hit.add((int(math.floor(px)), int(math.floor(py))))
+                    cells_hit.add((int(math.floor(qcx)), int(math.floor(qcy))))
+                    return cells_hit
+
+                coupled_cells: list[dict[str, Any]] = []
+                for raw_cell in polar_cells:
+                    if not isinstance(raw_cell, dict):
+                        coupled_cells.append(raw_cell)
+                        continue
+                    cell = dict(raw_cell)
+                    world_cells = _world_cells_for_packed_quad(cell)
+                    station_hit = any((gx, gy, level) in station_cells for gx, gy in world_cells)
+                    snap_hit = any((gx, gy) in snap_cells for gx, gy in world_cells)
+                    mark = next((object_marks[(gx, gy)] for gx, gy in world_cells if (gx, gy) in object_marks), {})
+                    occ = next((occupied[(gx, gy)] for gx, gy in world_cells if (gx, gy) in occupied), None)
+                    if station_hit:
+                        idx = _CELL_STATION
+                    elif snap_hit:
+                        idx = _CELL_SNAP
+                    elif mark:
+                        idx = mark_state.get(str(mark.get("status", "")), occ if occ is not None else _CELL_EMPTY)
+                    elif occ is not None:
+                        idx = occ
+                    else:
+                        idx = _CELL_EMPTY
+                    cell["state"] = int(idx)
+                    if mark:
+                        cell["label"] = str(mark.get("label", cell.get("label", "")))
+                    coupled_cells.append(cell)
+                polar_cells = coupled_cells
+
+            _polar_payload: dict[str, Any] = {
+                "type": "image_map",
+                "source_panel": "RoomTileWorkspace",
+                "width": n_rays,
+                "height": radial_segs,
+                "cells": polar_cells,
+                "palette": palette,
+                "action_key": "room_grid.click",
+                "coord_mode": "cell",
+                "floor_plan": _polar_fp,
+            }
+            if self._room_workspace is not None:
+                _polar_payload["level"] = int(self.state.get("room_level", 0))
+                _polar_payload["view"] = str(self.state.get("room_view", "plan"))
+                _polar_payload["snap_policy"] = str(self.state.get("room_snap_policy", "gentle"))
+            return Panel("room_grid", "GRID", payload=_polar_payload)
+
         if self._room_workspace is None:
             cells = []
             for y in range(depth):
                 for x in range(width):
+                    fr = int(floor_result[y, x]) if (0 <= y < floor_result.shape[0] and 0 <= x < floor_result.shape[1]) else 0
+                    if fr == 0 and (x, y) not in floor_meta:
+                        continue
                     meta = dict(floor_meta.get((x, y), {}))
-                    state_idx = _CELL_VOID if floor_result[y, x] == 0 else (
-                        _CELL_COLLISION if floor_result[y, x] == 7 else _CELL_EMPTY
-                    )
+                    state_idx = _CELL_VOID if fr == 0 else (_CELL_COLLISION if fr == 7 else _CELL_EMPTY)
                     if geo_bounds is not None:
                         cx_mid, cy_mid, half = geo_bounds
                         corners = meta.get("tile_corners") or meta.get("corners")
@@ -2142,11 +2347,7 @@ class RoomControlStation(_StationMenuBase):
                     "source_panel": "RoomTileWorkspace",
                     "width": width,
                     "height": depth,
-                    "cells": _make_polar_tile_cells(
-                        int(self.state.get("floor_polar_rays", 24) or 0),
-                        floor_plan.get("radial_segments", 8),
-                        float(self.state.get("floor_polar_tile_radius", 0.5 / max(1, int(floor_plan.get("radial_segments", 8) or 8)))),
-                    ) if floor_type == "polar" else cells,
+                    "cells": cells,
                     "palette": palette,
                     "action_key": "room_grid.click",
                     "coord_mode": "cell",
@@ -2154,8 +2355,8 @@ class RoomControlStation(_StationMenuBase):
                         "type": floor_type,
                         "radial_segments": floor_plan.get("radial_segments", 0),
                         "angular_segments": floor_plan.get("angular_segments", 0),
-                        "polar_rays": int(self.state.get("floor_polar_rays", 24) or 0),
-                        "polar_tile_radius": float(self.state.get("floor_polar_tile_radius", 0.5 / max(1, int(floor_plan.get("radial_segments", 8) or 8)))),
+                        "ring_segments": floor_plan.get("ring_segments", []),
+                        "floor_radius": float(floor_plan.get("floor_radius", 8.0) or 8.0),
                     },
                 },
             )
@@ -2195,10 +2396,77 @@ class RoomControlStation(_StationMenuBase):
         if sel_preset is not None and bool(getattr(sel_preset, "network_strict_snap", False)):
             snap_cells = {(int(x), int(y)) for x, y, _ in ws._network_contact_candidates(level, sel_preset)}
 
+        # ── World→tile translation for geo-layout floor types ─────────────────
+        # occupied / object_marks / station_cells / snap_cells are all keyed by
+        # world-meter integer coords (gx, gy).  For polar / arc / polar_rect the
+        # cell loop iterates mask coords (mx, my).  Bridge them by collecting,
+        # for each mask tile, every world-cell integer that any corner or the
+        # centre of that tile overlaps.
+        if use_geo_layout:
+            # Build: world-cell (int, int) → set of mask tile keys (mx, my)
+            _w2t: dict[tuple[int, int], set[tuple[int, int]]] = {}
+            for (mx, my), _cell in floor_meta.items():
+                _pts: list[tuple[float, float]] = []
+                _tc = _cell.get("tile_corners") or _cell.get("corners")
+                if isinstance(_tc, list):
+                    for _p in _tc:
+                        if isinstance(_p, (list, tuple)) and len(_p) >= 2:
+                            _pts.append((float(_p[0]), float(_p[1])))
+                _ctr = _cell.get("center")
+                if isinstance(_ctr, (list, tuple)) and len(_ctr) >= 2:
+                    _pts.append((float(_ctr[0]), float(_ctr[1])))
+                for _px, _py in _pts:
+                    _gx = int(math.floor(_px))
+                    _gy = int(math.floor(_py))
+                    _w2t.setdefault((_gx, _gy), set()).add((mx, my))
+
+            # Re-key occupied in mask coords
+            _new_occ: dict[tuple[int, int], int] = {}
+            for instance in ws.instances:
+                _pr = ws.presets.get(instance.preset_id)
+                if _pr is None:
+                    continue
+                if view_name == "plan" and not (
+                    instance.level <= level < instance.level + _pr.level_span
+                ):
+                    continue
+                _s = _CELL_SELECTED if instance.instance_id == selected_id else _CELL_OCCUPIED
+                for _dx in range(_pr.footprint_xy[0]):
+                    for _dy in range(_pr.footprint_xy[1]):
+                        for _tk in _w2t.get(
+                            (instance.grid_x + _dx, instance.grid_y + _dy), ()
+                        ):
+                            if _new_occ.get(_tk) != _CELL_SELECTED:
+                                _new_occ[_tk] = _s
+            occupied = _new_occ
+
+            # Re-key object_marks in mask coords
+            _new_marks: dict[tuple[int, int], dict[str, Any]] = {}
+            for (_gx, _gy), _mk in object_marks.items():
+                for _tk in _w2t.get((_gx, _gy), ()):
+                    _new_marks.setdefault(_tk, _mk)
+            object_marks = _new_marks
+
+            # Re-key station_cells in mask coords  (station_cells is set of (sx, sy, lv))
+            _new_st: set[tuple[int, int, int]] = set()
+            for (_sx, _sy, _slv) in station_cells:
+                for (_mx2, _my2) in _w2t.get((_sx, _sy), ()):
+                    _new_st.add((_mx2, _my2, _slv))
+            station_cells = _new_st
+
+            # Re-key snap_cells in mask coords
+            _new_snap: set[tuple[int, int]] = set()
+            for (_wx, _wy) in snap_cells:
+                for _tk in _w2t.get((_wx, _wy), ()):
+                    _new_snap.add(_tk)
+            snap_cells = _new_snap
+
         cells = []
         for y in range(depth):
             for x in range(width):
                 fr = int(floor_result[y, x]) if (0 <= y < floor_result.shape[0] and 0 <= x < floor_result.shape[1]) else 0
+                if fr == 0 and (x, y) not in floor_meta:
+                    continue
                 if fr == 0:
                     idx = _CELL_VOID
                 elif fr == 7:
@@ -2259,11 +2527,7 @@ class RoomControlStation(_StationMenuBase):
                 "source_panel": "RoomTileWorkspace",
                 "width": width,
                 "height": depth,
-                "cells": _make_polar_tile_cells(
-                    int(self.state.get("floor_polar_rays", 24) or 0),
-                    floor_plan.get("radial_segments", 8),
-                    float(self.state.get("floor_polar_tile_radius", 0.5 / max(1, int(floor_plan.get("radial_segments", 8) or 8)))),
-                ) if floor_type == "polar" else cells,
+                "cells": cells,
                 "palette": palette,
                 "action_key": "room_grid.click",
                 "coord_mode": "cell",
@@ -2274,8 +2538,8 @@ class RoomControlStation(_StationMenuBase):
                     "type": floor_type,
                     "radial_segments": floor_plan.get("radial_segments", 0),
                     "angular_segments": floor_plan.get("angular_segments", 0),
-                    "polar_rays": int(self.state.get("floor_polar_rays", 24) or 0),
-                    "polar_tile_radius": float(self.state.get("floor_polar_tile_radius", 0.5 / max(1, int(floor_plan.get("radial_segments", 8) or 8)))),
+                    "ring_segments": floor_plan.get("ring_segments", []),
+                    "floor_radius": float(floor_plan.get("floor_radius", 8.0) or 8.0),
                 },
             },
         )
@@ -2382,6 +2646,8 @@ class RoomControlStation(_StationMenuBase):
             self.state["room_depth_cells"] = max(2, int(self.state.get("room_depth_cells", 8)) - 1)
         elif action_key == "dimy:+":
             self.state["room_depth_cells"] = min(128, int(self.state.get("room_depth_cells", 8)) + 1)
+        elif action_key == "apply_floor":
+            self.apply_floor_triangulation()
         elif action_key.startswith("floor:"):
             mode = action_key.split(":", 1)[1]
             if mode in _FLOOR_TYPES:
@@ -2590,7 +2856,10 @@ class RoomControlStation(_StationMenuBase):
         Each value is an (N, 3, 3) float64 array (N triangles × 3 vertices × xyz).
         Empty on first access; populated after the first call to _room_grid_panel.
         """
-        return dict(self._envelope_meshes)
+        meshes = dict(self._envelope_meshes)
+        if self._applied_floor_meshes:
+            meshes.update(self._applied_floor_meshes)
+        return meshes
 
     def _ensure_room_workspace(self) -> bool:
         if self._room_workspace is not None:

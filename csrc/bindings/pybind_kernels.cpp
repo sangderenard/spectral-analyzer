@@ -22,6 +22,7 @@
 #include "doc_renderer.h"
 #include "base_rasterizer.h"
 #include "emitter_angle_kernel.h"
+#include "tile_overlap.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
@@ -4039,6 +4040,107 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
             [](PyBaseRasterizer& self){ return br_width(self.st); })
         .def_property_readonly("height",
             [](PyBaseRasterizer& self){ return br_height(self.st); });
+
+    /* ── TileOverlap ────────────────────────────────────────────────────────── */
+
+    /* tile_overlap_compute(tile_corners, item_rects) -> dict
+     *
+     * Exact SAT overlap detection: every (tile, item) pair is tested in
+     * parallel across the thread pool.  No discretisation error.
+     *
+     * Parameters
+     * ----------
+     * tile_corners : float32 (N, 4, 2)  — 4 world-space corners per tile (metres).
+     * item_rects   : float32 (M, 4)     — (x, y, w, h) per item (metres).
+     *
+     * Returns
+     * -------
+     * dict with keys:
+     *   'status'        int8   (N,)  — TO_CLEAR=1, TO_OCCUPIED=2, TO_COLLISION=3
+     *   'overlap_counts' int32  (N,)  — number of items overlapping each tile
+     */
+    m.def("tile_overlap_compute",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> corners_arr,
+           py::array_t<float, py::array::c_style | py::array::forcecast> rects_arr) -> py::dict {
+
+            auto ca = corners_arr.request();
+            auto ra = rects_arr.request();
+
+            /* Accept (N,4,2) or (N,8) for corners */
+            int n_tiles = 0;
+            if (ca.ndim == 3) {
+                if (ca.shape[1] != 4 || ca.shape[2] != 2)
+                    throw std::runtime_error(
+                        "tile_overlap_compute: tile_corners must be (N,4,2) float32");
+                n_tiles = (int)ca.shape[0];
+            } else if (ca.ndim == 2) {
+                if (ca.shape[1] != 8)
+                    throw std::runtime_error(
+                        "tile_overlap_compute: tile_corners must be (N,8) float32");
+                n_tiles = (int)ca.shape[0];
+            } else {
+                throw std::runtime_error(
+                    "tile_overlap_compute: tile_corners must be (N,4,2) or (N,8) float32");
+            }
+
+            /* Accept (M,4) for item_rects */
+            if (ra.ndim != 2 || ra.shape[1] != 4)
+                throw std::runtime_error(
+                    "tile_overlap_compute: item_rects must be (M,4) float32");
+            int n_items = (int)ra.shape[0];
+
+            const float* corners_ptr = static_cast<const float*>(ca.ptr);
+            const float* rects_ptr   = static_cast<const float*>(ra.ptr);
+
+            /* Synthetic sequential tile IDs (0..N-1) */
+            std::vector<int> tile_ids(n_tiles);
+            for (int i = 0; i < n_tiles; ++i) tile_ids[i] = i;
+
+            std::vector<int> item_ids(n_items);
+            for (int i = 0; i < n_items; ++i) item_ids[i] = i;
+
+            TileOverlapState* st = to_create();
+            to_set_tiles(st, corners_ptr, tile_ids.data(), n_tiles);
+            to_set_items(st, rects_ptr,   item_ids.data(), n_items);
+
+            py::array_t<int8_t> status(n_tiles);
+            py::array_t<int>    counts(n_tiles);
+            std::vector<int>    echo_ids(n_tiles);
+
+            to_compute(st,
+                       status.mutable_data(),
+                       counts.mutable_data(),
+                       echo_ids.data());
+            to_destroy(st);
+
+            py::dict result;
+            result["status"]         = status;
+            result["overlap_counts"] = counts;
+            return result;
+        },
+        py::arg("tile_corners"),
+        py::arg("item_rects"),
+        R"doc(
+Parallel tile-item overlap detection using the Separating Axis Theorem (SAT).
+
+Exact convex-quad vs AABB intersection test for every (tile, item) pair,
+parallelised across the hardware thread pool.  For a bounded floor mesh
+(hundreds of tiles, tens of items) the full NxM sweep of dot-product
+equations across the mesh is trivially cheap with zero discretisation error.
+
+Parameters
+----------
+tile_corners : float32 (N, 4, 2) or (N, 8)
+    Four world-space corner points per tile, in metres.  Any winding order.
+item_rects : float32 (M, 4)
+    Axis-aligned item footprints as (x, y, w, h) in world metres.
+
+Returns
+-------
+dict
+    'status'         : int8  (N,) — 1=CLEAR, 2=OCCUPIED (1 item), 3=COLLISION (2+ items)
+    'overlap_counts' : int32 (N,) — exact count of items overlapping each tile
+)doc");
 
     m.def("analyze_emitter_rgba8_layers",
         [](py::array_t<uint8_t, py::array::c_style | py::array::forcecast> rgba,

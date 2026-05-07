@@ -234,6 +234,37 @@ def _vao_pos3(data: np.ndarray):
     return vao, vbo, len(data)
 
 
+def _room_floor_transform_points(points: np.ndarray, cfg: dict, transform: tuple[float, float, float] | None = None) -> np.ndarray:
+    """Map applied grid-space floor points into the room floor coordinate space."""
+    pts = np.asarray(points, dtype=np.float32).copy()
+    if pts.ndim != 2 or pts.shape[1] != 3 or pts.size == 0:
+        return np.zeros((0, 3), np.float32)
+    if transform is None:
+        min_xy = np.min(pts[:, :2], axis=0)
+        max_xy = np.max(pts[:, :2], axis=0)
+        transform = (
+            0.5 * float(min_xy[0] + max_xy[0]),
+            float(min_xy[1]),
+            max(0.0, float(cfg.get("applied_floor_z_lift", 0.006) or 0.006)),
+        )
+    center_x, min_y, z_lift = transform
+    pts[:, 0] -= center_x
+    pts[:, 1] -= min_y
+    pts[:, 2] += z_lift
+    return pts
+
+
+def _floor_tris_to_pos_norm(tris: np.ndarray, cfg: dict, transform: tuple[float, float, float] | None = None) -> np.ndarray:
+    """Convert (N,3,3) floor triangles to interleaved position/normal rows."""
+    arr = np.asarray(tris, dtype=np.float32)
+    if arr.ndim != 3 or arr.shape[1:] != (3, 3) or arr.size == 0:
+        return np.zeros((0, 6), np.float32)
+    pts = arr.reshape(-1, 3)
+    pts = _room_floor_transform_points(pts, cfg, transform=transform)
+    norms = np.tile(np.array([[0.0, 0.0, 1.0]], np.float32), (len(pts), 1))
+    return np.concatenate([pts, norms], axis=1).astype(np.float32, copy=False)
+
+
 def _make_tex(surf: pygame.Surface) -> int:
     if not _HAS_GL:
         return 0
@@ -1029,6 +1060,10 @@ class RoomStation:
         self._ceiling_vao: int = 0;  self._ceiling_n: int = 0
         self._walls_vao:   int = 0;  self._walls_n:   int = 0
         self._grid_vao:    int = 0;  self._grid_n:    int = 0
+        self._floor_tile_vao: int = 0; self._floor_tile_n: int = 0
+        self._floor_fill_vao: int = 0; self._floor_fill_n: int = 0
+        self._floor_border_vao: int = 0; self._floor_border_n: int = 0
+        self._room_floor_revision: int = -1
 
         # Per-enclosure VAOs  { obj_id: (mesh_vao, mesh_n, wire_vao, wire_n) }
         self._enc_vaos: dict = {}
@@ -1047,6 +1082,9 @@ class RoomStation:
             v = rcfg.get(key, default)
             return [float(x) for x in (v + [1.0])[:4]]
         self._floor_col   = _rgba("floor_color",   [0.18, 0.18, 0.22, 1.0])
+        self._floor_tile_col = _rgba("floor_tile_color", [0.96, 0.93, 0.86, 1.0])
+        self._floor_fill_col = _rgba("floor_fill_color", [0.18, 0.18, 0.20, 1.0])
+        self._floor_border_col = _rgba("floor_border_color", [0.98, 0.95, 0.82, 0.95])
         self._ceiling_col = _rgba("ceiling_color", [0.12, 0.12, 0.15, 1.0])
         self._wall_col    = _rgba("wall_color",     [0.15, 0.16, 0.20, 1.0])
         self._grid_col    = rcfg.get("floor_grid", {}).get(
@@ -1070,14 +1108,7 @@ class RoomStation:
         self._hud_vao = glGenVertexArrays(1)
         self._hud_vbo = glGenBuffers(1)
 
-        # Room surfaces
-        meshes = build_room_mesh(self._ws.room_cfg)
-        self._floor_vao,   _, self._floor_n   = _vao_pos_norm(meshes["floor"])
-        self._ceiling_vao, _, self._ceiling_n = _vao_pos_norm(meshes["ceiling"])
-        self._walls_vao,   _, self._walls_n   = _vao_pos_norm(meshes["walls"])
-
-        grid = build_room_floor_grid(self._ws.room_cfg)
-        self._grid_vao, _, self._grid_n = _vao_pos3(grid)
+        self._rebuild_room_surfaces()
 
         # Enclosure geometry
         self._rebuild_enclosures()
@@ -1104,12 +1135,70 @@ class RoomStation:
         for vao_n in [(self._floor_vao, self._floor_n),
                       (self._ceiling_vao, self._ceiling_n),
                       (self._walls_vao, self._walls_n),
-                      (self._grid_vao, self._grid_n)]:
+                      (self._grid_vao, self._grid_n),
+                      (self._floor_tile_vao, self._floor_tile_n),
+                      (self._floor_fill_vao, self._floor_fill_n),
+                      (self._floor_border_vao, self._floor_border_n)]:
             if vao_n[0]:
                 glDeleteVertexArrays(1, [vao_n[0]])
         for mv, mw, wv, ww in self._enc_vaos.values():
             if mv: glDeleteVertexArrays(1, [mv])
             if wv: glDeleteVertexArrays(1, [wv])
+
+    def _rebuild_room_surfaces(self):
+        """Build room VAOs, replacing the base floor when an applied floor exists."""
+        if not _HAS_GL:
+            return
+        meshes = build_room_mesh(self._ws.room_cfg)
+        self._floor_vao,   _, self._floor_n   = _vao_pos_norm(meshes["floor"])
+        self._ceiling_vao, _, self._ceiling_n = _vao_pos_norm(meshes["ceiling"])
+        self._walls_vao,   _, self._walls_n   = _vao_pos_norm(meshes["walls"])
+
+        applied = self._ws.room_cfg.get("applied_floor_meshes", {})
+        if isinstance(applied, dict):
+            raw_tiles = np.asarray(applied.get("floor_tiles", []), dtype=np.float32)
+            raw_fill = np.asarray(applied.get("floor_fill", []), dtype=np.float32)
+            borders = np.asarray(applied.get("floor_borders", []), dtype=np.float32)
+            floor_pts: list[np.ndarray] = []
+            if raw_tiles.ndim == 3 and raw_tiles.shape[1:] == (3, 3) and raw_tiles.size:
+                floor_pts.append(raw_tiles.reshape(-1, 3))
+            if raw_fill.ndim == 3 and raw_fill.shape[1:] == (3, 3) and raw_fill.size:
+                floor_pts.append(raw_fill.reshape(-1, 3))
+            if borders.ndim == 2 and borders.shape[1] == 3 and borders.size:
+                floor_pts.append(borders)
+            transform = None
+            if floor_pts:
+                all_pts = np.concatenate(floor_pts, axis=0)
+                min_xy = np.min(all_pts[:, :2], axis=0)
+                max_xy = np.max(all_pts[:, :2], axis=0)
+                transform = (
+                    0.5 * float(min_xy[0] + max_xy[0]),
+                    float(min_xy[1]),
+                    max(0.0, float(self._ws.room_cfg.get("applied_floor_z_lift", 0.006) or 0.006)),
+                )
+            tiles = _floor_tris_to_pos_norm(raw_tiles, self._ws.room_cfg, transform=transform)
+            fill = _floor_tris_to_pos_norm(raw_fill, self._ws.room_cfg, transform=transform)
+            if tiles.size:
+                self._floor_tile_vao, _, self._floor_tile_n = _vao_pos_norm(tiles)
+            else:
+                self._floor_tile_vao, self._floor_tile_n = 0, 0
+            if fill.size:
+                self._floor_fill_vao, _, self._floor_fill_n = _vao_pos_norm(fill)
+            else:
+                self._floor_fill_vao, self._floor_fill_n = 0, 0
+            if borders.ndim == 2 and borders.shape[1] == 3 and borders.size:
+                borders = _room_floor_transform_points(borders, self._ws.room_cfg, transform=transform)
+                self._floor_border_vao, _, self._floor_border_n = _vao_pos3(borders)
+            else:
+                self._floor_border_vao, self._floor_border_n = 0, 0
+        else:
+            self._floor_tile_vao, self._floor_tile_n = 0, 0
+            self._floor_fill_vao, self._floor_fill_n = 0, 0
+            self._floor_border_vao, self._floor_border_n = 0, 0
+
+        grid = build_room_floor_grid(self._ws.room_cfg)
+        self._grid_vao, _, self._grid_n = _vao_pos3(grid)
+        self._room_floor_revision = int(self._ws.room_cfg.get("applied_floor_revision", 0) or 0)
 
     def _rebuild_enclosures(self):
         """Build VAOs for all PlacedEnclosure objects."""
@@ -1143,6 +1232,9 @@ class RoomStation:
         """
         if not _HAS_GL:
             return
+        revision = int(self._ws.room_cfg.get("applied_floor_revision", 0) or 0)
+        if revision != self._room_floor_revision:
+            self._rebuild_room_surfaces()
 
         lv = light_v.astype(np.float32)
 
@@ -1158,12 +1250,23 @@ class RoomStation:
         glUniform1f(glGetUniformLocation(prog, "uSpec"),      self._spec)
         glUniform1f(glGetUniformLocation(prog, "uShin"),      self._shin)
 
-        for (vao, n, col) in [
-            (self._floor_vao,   self._floor_n,   self._floor_col),
-            (self._ceiling_vao, self._ceiling_n, self._ceiling_col),
-            (self._walls_vao,   self._walls_n,   self._wall_col),
+        floor_draws = []
+        if self._floor_tile_vao or self._floor_fill_vao:
+            floor_draws.extend([
+                (self._floor_fill_vao, self._floor_fill_n, self._floor_fill_col, 0.05, 18.0),
+                (self._floor_tile_vao, self._floor_tile_n, self._floor_tile_col, 0.48, 110.0),
+            ])
+        else:
+            floor_draws.append((self._floor_vao, self._floor_n, self._floor_col, self._spec, self._shin))
+
+        for (vao, n, col, spec, shin) in [
+            *floor_draws,
+            (self._ceiling_vao, self._ceiling_n, self._ceiling_col, self._spec, self._shin),
+            (self._walls_vao,   self._walls_n,   self._wall_col, self._spec, self._shin),
         ]:
             if vao and n:
+                glUniform1f(glGetUniformLocation(prog, "uSpec"), float(spec))
+                glUniform1f(glGetUniformLocation(prog, "uShin"), float(shin))
                 glUniform4f(glGetUniformLocation(prog, "uColor"), *col)
                 glBindVertexArray(vao)
                 glDrawArrays(GL_TRIANGLES, 0, n)
@@ -1181,6 +1284,19 @@ class RoomStation:
             glLineWidth(1.0)
             glBindVertexArray(self._grid_vao)
             glDrawArrays(GL_LINES, 0, self._grid_n)
+            glBindVertexArray(0)
+            glDisable(GL_BLEND)
+
+        if self._floor_border_vao and self._floor_border_n:
+            lp = self._prog_line
+            glUseProgram(lp)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            glUniformMatrix4fv(glGetUniformLocation(lp, "uMVP"), 1, GL_TRUE, MVP)
+            glUniform4f(glGetUniformLocation(lp, "uColor"), *self._floor_border_col)
+            glLineWidth(1.25)
+            glBindVertexArray(self._floor_border_vao)
+            glDrawArrays(GL_LINES, 0, self._floor_border_n)
             glBindVertexArray(0)
             glDisable(GL_BLEND)
 

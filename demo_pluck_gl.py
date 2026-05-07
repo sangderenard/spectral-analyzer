@@ -7772,9 +7772,9 @@ class Renderer:
         # 2D and 3D each pick their own backend (C or GL).  The walker
         # fires registered shaders unconditionally; whatever is left
         # over goes to the global default for each channel selected
-        # below.  Defaults: both channels run the C backend.
-        self._mode_2d: 'RenderMode' = RenderMode.C
-        self._mode_3d: 'RenderMode' = RenderMode.C
+        # below.  Defaults: both channels run the GL backend.
+        self._mode_2d: 'RenderMode' = RenderMode.GL
+        self._mode_3d: 'RenderMode' = RenderMode.GL
         self._global_dispatcher = None  # built by the demo at startup
         self._init_gl()
 
@@ -12245,8 +12245,8 @@ def _parse_args():
                    help="Do not automatically start the FDTD/audio physics worker on launch; "
                         "physics can be started later via UI or key binding")
     p.add_argument("--render-mode", dest="render_mode",
-                    choices=[m.value for m in RenderMode], default=RenderMode.C.value,
-                    help="Player-experience render mode: c (default startup), gl, hybrid (GL + baked light field), "
+                    choices=[m.value for m in RenderMode], default=RenderMode.GL.value,
+                    help="Player-experience render mode: gl (default), c (CPU/software), hybrid (GL + baked light field), "
                         "or raytrace (implies --ray-program-only)")
     p.add_argument("--lens-focal-mm", type=float, default=35.0,
                    help="Camera focal length in millimetres")
@@ -12975,6 +12975,10 @@ def main():
         # No light data is produced or forwarded.  The C engine derives
         # all illumination internally from the EMISSIVE MATERIALS attached
         # to the rendered triangles — see base_rasterizer.cpp::br_render.
+        def _stable_group_id(_key: str, _run_idx: int) -> int:
+            _raw = f"{_key}:{int(_run_idx)}".encode("utf-8", "ignore")
+            return int.from_bytes(hashlib.blake2s(_raw, digest_size=4).digest(), "little") & 0x7fffffff
+
         def _pack_3d_c_geometry(_leftovers):
             try:
                 if not _leftovers or _cam_pure_matrices is None:
@@ -13012,10 +13016,6 @@ def main():
                     _out = np.full((_n_tris,), _resolve_mat_id(_payload), dtype=np.int32)
                     _out[:_arr.shape[0]] = _arr
                     return _out
-
-                def _stable_group_id(_key: str, _run_idx: int) -> int:
-                    _raw = f"{_key}:{int(_run_idx)}".encode("utf-8", "ignore")
-                    return int.from_bytes(hashlib.blake2s(_raw, digest_size=4).digest(), "little") & 0x7fffffff
 
                 for _key, _payload in _leftovers.items():
                     if not isinstance(_payload, dict):
@@ -13106,17 +13106,251 @@ def main():
             except Exception:
                 return None
 
-        def _legacy_3d_gl_disabled():
-            # Old Renderer shader stack is intentionally bypassed here; keep
-            # the code parked for later renderer separation instead of running
-            # it underneath the C material rasterizer.
-            return None
+        # ── 3D-GL render callback using BaseGLRenderer ───────────────────────
+        # Parallel to the C BaseRasterizer path above.  Accepts the same
+        # leftovers_3d dict, packs geometry into (N,8) verts [x,y,z,nx,ny,nz,u,v]
+        # in view space, updates a lazy VAO, derives lights from emissive
+        # material groups, and draws via base_material.vert/frag.glsl.
+        _gl_scene_state: dict = {
+            "gl_r": None,
+            "vao": None, "vbo": None, "mbo": None,
+        }
+
+        def _derive_gl_lights(verts8_vs, groups, pbr):
+            gids, mids, offs, cnts, _mvs, _dirty = groups
+            cands = []
+            for gid, mid, off, cnt in zip(gids, mids, offs, cnts):
+                mat_id = int(mid)
+                if mat_id < 0 or mat_id >= len(pbr):
+                    continue
+                rgb = np.asarray(pbr[mat_id, 8:11], np.float32)
+                if float(np.linalg.norm(rgb)) < 1e-6:
+                    continue
+                s = int(off) * 3
+                e = s + int(cnt) * 3
+                pts = verts8_vs[s:e, 0:3].reshape(-1, 3, 3)
+                if pts.size == 0:
+                    continue
+                e1_ = pts[:, 1] - pts[:, 0]
+                e2_ = pts[:, 2] - pts[:, 0]
+                area = 0.5 * np.linalg.norm(np.cross(e1_, e2_), axis=1)
+                total = float(area.sum())
+                if total <= 1e-8:
+                    continue
+                cent = pts.mean(axis=1)
+                pos = (cent * area[:, None]).sum(axis=0) / total
+                cands.append((total, pos.astype(np.float32), rgb))
+            cands.sort(key=lambda x: x[0], reverse=True)
+            cands = cands[:32]
+            if not cands:
+                return (
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0,),   np.float32),
+                )
+            return (
+                np.ascontiguousarray([c[1] for c in cands], np.float32),
+                np.ascontiguousarray([c[2] for c in cands], np.float32),
+                np.ascontiguousarray([c[0] for c in cands], np.float32),
+            )
+
+        def _gl_scene_render(_leftovers):
+            try:
+                import ctypes as _ctypes
+                from OpenGL.GL import (
+                    glGenVertexArrays, glGenBuffers,
+                    glBindVertexArray, glBindBuffer, glBufferData,
+                    glEnableVertexAttribArray, glVertexAttribPointer,
+                    glVertexAttribIPointer, glViewport,
+                    glEnable, glClear, glClearColor,
+                    GL_ARRAY_BUFFER, GL_DYNAMIC_DRAW,
+                    GL_FLOAT, GL_INT, GL_FALSE,
+                    GL_DEPTH_TEST, GL_DEPTH_BUFFER_BIT, GL_COLOR_BUFFER_BIT,
+                )
+                # lazy init
+                if _gl_scene_state["gl_r"] is None:
+                    if _MAT_DB is None:
+                        return
+                    from base_gl_renderer import BaseGLRenderer as _BaseGLRenderer
+                    _gr = _BaseGLRenderer(_MAT_DB)
+                    _gr.init_gl()
+                    _gl_scene_state["gl_r"] = _gr
+
+                _gl_r = _gl_scene_state["gl_r"]
+
+                if not _leftovers or _cam_pure_matrices is None:
+                    return
+
+                # pack geometry (mirrors _pack_3d_c_geometry but produces (N,8))
+                tri_chunks, mat_chunks = [], []
+                grp_ids, grp_mats, grp_offs, grp_cnts, grp_mvs, grp_dirty = \
+                    [], [], [], [], [], []
+
+                def _rmat_id(payload):
+                    try:
+                        return int(payload.get("mat_id", 0))
+                    except Exception:
+                        return 0
+
+                def _rmat_ids(payload, n_tris):
+                    mid = payload.get("mat_ids")
+                    if mid is None:
+                        return np.full((n_tris,), _rmat_id(payload), dtype=np.int32)
+                    try:
+                        arr = np.asarray(mid, dtype=np.int32).reshape(-1)
+                    except Exception:
+                        return np.full((n_tris,), _rmat_id(payload), dtype=np.int32)
+                    if arr.shape[0] == n_tris:
+                        return arr
+                    if arr.shape[0] > n_tris:
+                        return arr[:n_tris]
+                    out = np.full((n_tris,), _rmat_id(payload), dtype=np.int32)
+                    out[:arr.shape[0]] = arr
+                    return out
+
+                for _key, _payload in _leftovers.items():
+                    if not isinstance(_payload, dict):
+                        continue
+                    if _payload.get('kind') != 'triangles':
+                        continue
+                    _tris = _payload.get('triangles')
+                    if _tris is None:
+                        continue
+                    _tris = np.asarray(_tris, dtype=np.float32)
+                    if _tris.ndim != 3 or _tris.shape[1:] != (3, 3) or _tris.shape[0] == 0:
+                        continue
+                    _tri_base = sum(int(_c.shape[0]) for _c in tri_chunks)
+                    tri_chunks.append(_tris)
+                    _mids_local = _rmat_ids(_payload, int(_tris.shape[0]))
+                    mat_chunks.append(_mids_local)
+                    _run_start, _run_idx = 0, 0
+                    _ident_mv = np.eye(4, dtype=np.float32).reshape(16)
+                    while _run_start < int(_mids_local.shape[0]):
+                        _mat = int(_mids_local[_run_start])
+                        _run_end = _run_start + 1
+                        while (_run_end < int(_mids_local.shape[0])
+                               and int(_mids_local[_run_end]) == _mat):
+                            _run_end += 1
+                        grp_ids.append(_stable_group_id(str(_key), _run_idx))
+                        grp_mats.append(_mat)
+                        grp_offs.append(_tri_base + _run_start)
+                        grp_cnts.append(_run_end - _run_start)
+                        grp_mvs.append(_ident_mv)
+                        grp_dirty.append(1)
+                        _run_start = _run_end
+                        _run_idx += 1
+
+                if not tri_chunks:
+                    return
+
+                tris_world = np.concatenate(tri_chunks, axis=0)  # (Nt,3,3)
+                Nt = int(tris_world.shape[0])
+                _P64, _V64 = _cam_pure_matrices(R.cam)
+                _V = np.asarray(_V64, dtype=np.float32)
+                _P = np.asarray(_P64, dtype=np.float32)
+
+                pts_w = tris_world.reshape(-1, 3)
+                pts_h = np.concatenate(
+                    [pts_w, np.ones((pts_w.shape[0], 1), dtype=np.float32)], axis=1)
+                pts_v = (_V @ pts_h.T).T[:, :3].astype(np.float32)
+                tris_v = pts_v.reshape(Nt, 3, 3)
+                e1 = tris_v[:, 1, :] - tris_v[:, 0, :]
+                e2 = tris_v[:, 2, :] - tris_v[:, 0, :]
+                fn_raw = np.cross(e1, e2).astype(np.float32)
+                fn_len = np.where(
+                    np.linalg.norm(fn_raw, axis=1, keepdims=True) > 1e-8,
+                    np.linalg.norm(fn_raw, axis=1, keepdims=True), 1.0)
+                nrm_v = np.repeat((fn_raw / fn_len), 3, axis=0).astype(np.float32)
+
+                uv_zero = np.zeros((Nt * 3, 2), dtype=np.float32)
+                verts8_vs = np.concatenate(
+                    [pts_v, nrm_v, uv_zero], axis=1)  # (Nt*3, 8)
+                verts8_vs = np.ascontiguousarray(verts8_vs, dtype=np.float32)
+
+                mat_ids_tri = np.concatenate(mat_chunks, axis=0) if mat_chunks \
+                    else np.zeros((Nt,), dtype=np.int32)
+                mat_per_v = np.ascontiguousarray(
+                    np.repeat(mat_ids_tri, 3), dtype=np.int32)
+
+                # MVP: verts already in view space, so MV=I, MVP=P
+                mvp_flat = np.ascontiguousarray(_P.T.reshape(-1), dtype=np.float32)
+                mv_flat  = np.ascontiguousarray(
+                    np.eye(4, dtype=np.float32).T.reshape(-1), dtype=np.float32)
+
+                groups_tuple = (
+                    np.ascontiguousarray(grp_ids,  dtype=np.int32),
+                    np.ascontiguousarray(grp_mats, dtype=np.int32),
+                    np.ascontiguousarray(grp_offs, dtype=np.int32),
+                    np.ascontiguousarray(grp_cnts, dtype=np.int32),
+                    np.ascontiguousarray(grp_mvs,  dtype=np.float32).reshape(-1, 16),
+                    np.ascontiguousarray(grp_dirty, dtype=np.int32),
+                )
+
+                # derive lights from emissive material groups
+                _pbr = None
+                if _MAT_DB is not None:
+                    try:
+                        _pbr = _MAT_DB.build_tensors().get('pbr')
+                    except Exception:
+                        pass
+                if _pbr is not None and len(_pbr) > 0:
+                    lpos, lcol, lint = _derive_gl_lights(
+                        verts8_vs, groups_tuple, _pbr)
+                    _gl_r.set_point_lights(lpos, lcol, lint)
+
+                # lazy VAO create / update
+                if _gl_scene_state["vao"] is None:
+                    _vao = int(glGenVertexArrays(1))
+                    _vbo = int(glGenBuffers(1))
+                    _mbo = int(glGenBuffers(1))
+                    glBindVertexArray(_vao)
+                    stride = 8 * 4
+                    glBindBuffer(GL_ARRAY_BUFFER, _vbo)
+                    glBufferData(GL_ARRAY_BUFFER, verts8_vs.nbytes, verts8_vs,
+                                 GL_DYNAMIC_DRAW)
+                    glEnableVertexAttribArray(0)
+                    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride,
+                                         _ctypes.c_void_p(0))
+                    glEnableVertexAttribArray(1)
+                    glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, stride,
+                                         _ctypes.c_void_p(12))
+                    glEnableVertexAttribArray(3)
+                    glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride,
+                                         _ctypes.c_void_p(24))
+                    glBindBuffer(GL_ARRAY_BUFFER, _mbo)
+                    glBufferData(GL_ARRAY_BUFFER, mat_per_v.nbytes, mat_per_v,
+                                 GL_DYNAMIC_DRAW)
+                    glEnableVertexAttribArray(2)
+                    glVertexAttribIPointer(2, 1, GL_INT, 4, _ctypes.c_void_p(0))
+                    glBindVertexArray(0)
+                    _gl_scene_state["vao"] = _vao
+                    _gl_scene_state["vbo"] = _vbo
+                    _gl_scene_state["mbo"] = _mbo
+                else:
+                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["vbo"])
+                    glBufferData(GL_ARRAY_BUFFER, verts8_vs.nbytes, verts8_vs,
+                                 GL_DYNAMIC_DRAW)
+                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["mbo"])
+                    glBufferData(GL_ARRAY_BUFFER, mat_per_v.nbytes, mat_per_v,
+                                 GL_DYNAMIC_DRAW)
+
+                glClearColor(0.02, 0.025, 0.03, 1.0)
+                glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+                glViewport(0, 0, WIN_W, WIN_H)
+                glEnable(GL_DEPTH_TEST)
+                _gl_r.draw_mesh(
+                    _gl_scene_state["vao"], Nt * 3, mvp_flat, mv_flat)
+
+            except Exception as _exc:
+                import traceback
+                print(f"[gl_scene_render] {_exc}", flush=True)
+                traceback.print_exc()
 
         R._global_dispatcher = _GlobalChannelDispatcher(
             width=WIN_W,
             height=WIN_H,
             gl_doc_renderer=_doc_rdr,
-            gl_render_callback=_legacy_3d_gl_disabled,
+            gl_render_callback=_gl_scene_render,
             c_doc_backend=getattr(_doc_rdr, "_backend", None),
             geometry_packer=_pack_3d_c_geometry,
             cadence_2d=1,

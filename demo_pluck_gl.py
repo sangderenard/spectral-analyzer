@@ -437,6 +437,35 @@ def _install_crash_reporting() -> None:
         _install_crash_reporting._registered_exit_dump = True
 
 
+_HANG_DUMP_TIMEOUT_S = max(
+    1.0,
+    float(os.environ.get("SPECTRAL_HANG_DUMP_TIMEOUT_S", "6.0")),
+)
+
+
+def _arm_hang_watchdog(stage: str, **items) -> None:
+    _ray_diag_update(stage, **items)
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+    try:
+        faulthandler.dump_traceback_later(
+            _HANG_DUMP_TIMEOUT_S,
+            repeat=False,
+            exit=False,
+        )
+    except Exception:
+        pass
+
+
+def _disarm_hang_watchdog() -> None:
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+
+
 def _quit_pygame_with_diag(context: str) -> None:
     previous_stage = _RAY_DIAG_LAST.get("stage", "")
     _dump_ray_diag(f"[{context}] before pygame.quit")
@@ -12876,12 +12905,14 @@ def main():
     _player_cam_panel.apply_render_mode()
 
     # ── Doc renderer — HUD second channel ────────────────────────────────────
-    # Registered into the ShaderFrameWalker as "doc_composite" so every HUD
-    # panel is just another channel in the same pipeline (no special shader).
+    # HUD panels submit directly to the shared DocRenderer backend each frame.
+    # The global 2D dispatcher presents that backend output; no separate
+    # walker-published doc target is required here.
     _doc_rdr = None
     _doc_init_err: Exception | None = None
     _doc_slider_ids  = {}   # stable node-id maps, persist across frames
     _doc_camera_ids  = {}
+    _doc_layout_sig_prev = None
     try:
         from doc_renderer import DocRenderer as _DocRenderer
         from controls import Panel as _DocPanel
@@ -12922,6 +12953,19 @@ def main():
     # each channel's registered shaders did not finalise.
     try:
         from globals_renderer import GlobalChannelDispatcher as _GlobalChannelDispatcher
+        from graph_solver import _T as _RENDER_PROF
+        _RENDER_PROF.reset()
+        _RENDER_PROF.start_reporter(
+            interval_s=0.5,
+            title="Render live profile",
+            drain=True,
+        )
+        _RENDER_PROF.register_exit_waterfall(
+            path=os.path.join(os.getcwd(), "render_stall_waterfall.png"),
+            title="Render frame waterfall",
+            max_spans=80,
+            min_duration_us=50.0,
+        )
         # 3D-C geometry packer: pull world-space triangle soups out of the
         # leftover scene.geometry/<owner> payloads, transform to view
         # space using the active camera, compute per-tri face normals,
@@ -13586,6 +13630,7 @@ def main():
           # owner flip-buffer API (no shader registration required).
           # Submission is dirty-aware via change_key, so unchanged objects
           # keep prior geometry in the end-state buffer without re-flipping.
+
           def _resolve_material_id(_name: object) -> int:
               # Integer lookup against startup-baked dictionary only.
               # No YAML load, no database index scan in frame loop.
@@ -13686,6 +13731,7 @@ def main():
                       setattr(_ci, "_material_slot_id", int(_cam_mat_id))
                   except Exception:
                       pass
+
               _shader_walker.publish_owner_target(
                   owner_id=_owner,
                   target_id=f"scene.geometry/{_owner}",
@@ -14121,6 +14167,7 @@ def main():
             # Per-frame framebuffer clear. R.render() (GL 3D path) used
             # to do this; with 3D=C it's never called, so do it here
             # unconditionally so leftover GL state can't bleed through.
+            _arm_hang_watchdog("render:frame:start", frame_index=int(fi))
             glClearColor(0.015, 0.010, 0.040, 1.0)
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             glViewport(0, 0, WIN_W, WIN_H)
@@ -14139,9 +14186,9 @@ def main():
             _player_cam_panel.enforce_menu_camera_lock()
 
             # ── HUD second channel — submit all panels to doc renderer ────────
-            # Each HUD object is a channel in the same pipeline; the walker's
-            # "doc_composite" node composites them into the "doc.layer" target
-            # which the global final-pass resolves alongside the world render.
+            # Each HUD object submits to the shared DocRenderer backend; the
+            # global 2D dispatcher resolves/presents that output alongside
+            # world rendering.
             if _doc_rdr is None:
                 raise RuntimeError(
                     f"HUD second channel unavailable: DocRenderer failed to "
@@ -14149,56 +14196,77 @@ def main():
                     f"Check _spectral_kernels build — run: "
                     f"cmake --build csrc_build --config Release"
                 )
-            _doc_rdr.clear()
-            # Render settings panel is still live, but it no longer has a
-            # default on-screen home. Keep it hidden during normal player HUD.
-            if _render_settings_visible():
-                _doc_rdr.submit_panel(
-                    _doc_slider_spec,
-                    (10, 10, 264, 30 + 42 * len(_doc_slider_spec.knobs)),
-                    node_id_map=_doc_slider_ids,
-                    knob_values=panel.values,
-                )
-            _submit_player_hud_doc(_doc_rdr, WIN_W, WIN_H)
-            # Camera panel — only when open
-            if _player_cam_panel.open:
-                _doc_rdr.submit_panel(
-                    _doc_camera_spec,
-                    (WIN_W - 340, 10, 330, 30 + 42 * len(_doc_camera_spec.knobs)),
-                    node_id_map=_doc_camera_ids,
-                    knob_values={k: getattr(R.cam, k, None) for k in
-                                 [s[0] for s in _PlayerCameraPanel._SLIDERS]},
-                )
-            # Active station — must expose submit_doc_channel; no GL fallback.
-            _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
-            if _active_st is not None:
-                if not hasattr(_active_st, 'submit_doc_channel'):
-                    raise RuntimeError(
-                        f"Station {type(_active_st).__name__!r} has no submit_doc_channel(). "
-                        "Update the station class to expose a panel_spec on its menu "
-                        "and remove any direct render_hud/render_menu GL calls."
-                )
-                _active_st.submit_doc_channel(_doc_rdr, WIN_W, WIN_H)
-            _submit_exit_confirm_doc(_doc_rdr, WIN_W, WIN_H)
-            _shader_walker.publish_owner_target(
-                owner_id="doc_hierarchy",
-                target_id="doc.composite",
-                payload={
-                    "owner_id": "doc_hierarchy",
-                    "kind": "doc_composite",
-                    "frame_index": int(fi),
-                    "node_count": int(getattr(_doc_rdr, "node_count", 0)),
-                },
-                flip_slots=2,
-                change_key=(
-                    int(fi),
-                    int(getattr(_doc_rdr, "node_count", 0)),
+            _arm_hang_watchdog("render:doc:submit", frame_index=int(fi))
+            with _RENDER_PROF.span("demo.frame.doc.submit"):
+                _active_st = getattr(player_ctrl, '_active_station', None) if player_ctrl is not None else None
+                _doc_layout_sig = (
+                    bool(_render_settings_visible()),
+                    bool(_player_cam_panel.open),
                     str(_player_cam_panel.hud_mode),
                     bool(_exit_confirm_open),
-                ),
-            )
+                    type(_active_st).__name__ if _active_st is not None else "",
+                    bool(getattr(_player_cam_panel, "synthesis_open", False)),
+                )
+                if _doc_layout_sig_prev != _doc_layout_sig:
+                    with _RENDER_PROF.span("demo.frame.doc.clear"):
+                        _doc_rdr.clear()
+                    _doc_layout_sig_prev = _doc_layout_sig
+                if _render_settings_visible():
+                    with _RENDER_PROF.span("demo.frame.doc.slider_panel"):
+                        _doc_rdr.submit_panel(
+                            _doc_slider_spec,
+                            (10, 10, 264, 30 + 42 * len(_doc_slider_spec.knobs)),
+                            node_id_map=_doc_slider_ids,
+                            knob_values=panel.values,
+                        )
+                with _RENDER_PROF.span("demo.frame.doc.player_hud"):
+                    _submit_player_hud_doc(_doc_rdr, WIN_W, WIN_H)
+                if _player_cam_panel.open:
+                    with _RENDER_PROF.span("demo.frame.doc.camera_panel"):
+                        _doc_rdr.submit_panel(
+                            _doc_camera_spec,
+                            (WIN_W - 340, 10, 330, 30 + 42 * len(_doc_camera_spec.knobs)),
+                            node_id_map=_doc_camera_ids,
+                            knob_values={k: getattr(R.cam, k, None) for k in
+                                         [s[0] for s in _PlayerCameraPanel._SLIDERS]},
+                        )
+                if _active_st is not None:
+                    if not hasattr(_active_st, 'submit_doc_channel'):
+                        raise RuntimeError(
+                            f"Station {type(_active_st).__name__!r} has no submit_doc_channel(). "
+                            "Update the station class to expose a panel_spec on its menu "
+                            "and remove any direct render_hud/render_menu GL calls."
+                    )
+                    with _RENDER_PROF.span("demo.frame.doc.active_station"):
+                        _active_st.submit_doc_channel(_doc_rdr, WIN_W, WIN_H)
+                with _RENDER_PROF.span("demo.frame.doc.exit_confirm"):
+                    _submit_exit_confirm_doc(_doc_rdr, WIN_W, WIN_H)
 
-            _submit_scene_object_buffers()
+            _arm_hang_watchdog("render:doc:publish", frame_index=int(fi))
+            with _RENDER_PROF.span("demo.frame.doc.publish"):
+                _shader_walker.publish_owner_target(
+                    owner_id="doc_hierarchy",
+                    target_id="doc.layer/doc_hierarchy",
+                    payload={
+                        "owner_id": "doc_hierarchy",
+                        "kind": "doc_layer",
+                        "frame_index": int(fi),
+                        "node_count": int(getattr(_doc_rdr, "node_count", 0)),
+                        "hud_mode": str(_player_cam_panel.hud_mode),
+                        "exit_confirm": bool(_exit_confirm_open),
+                    },
+                    flip_slots=2,
+                    change_key=(
+                        int(fi),
+                        int(getattr(_doc_rdr, "node_count", 0)),
+                        str(_player_cam_panel.hud_mode),
+                        bool(_exit_confirm_open),
+                    ),
+                )
+
+            _arm_hang_watchdog("render:scene:publish", frame_index=int(fi))
+            with _RENDER_PROF.span("demo.frame.scene.publish"):
+                _submit_scene_object_buffers()
 
             # ── Bottom-up shader walk ────────────────────────────────────────
             # Visit every SHADERS-axis node in the control hierarchy in
@@ -14207,25 +14275,29 @@ def main():
             # flip buffer, and stamps its claimed targets as finalized so
             # the final draw below can gate fragments accordingly.
             try:
-                _shader_frame_result = _shader_walker.tick(
-                    frame_index=int(fi),
-                    dt=float(_dt),
-                )
+                _arm_hang_watchdog("render:shader:tick", frame_index=int(fi))
+                with _RENDER_PROF.span("demo.frame.shader_tick"):
+                    _shader_frame_result = _shader_walker.tick(
+                        frame_index=int(fi),
+                        dt=float(_dt),
+                    )
             except Exception:
                 _shader_frame_result = None
 
             # Final arena resolve: only run global cleanup for unresolved
             # target ranges after specific/local shader writes are accounted for.
-            _latest_targets = _shader_graph.snapshot_latest_targets()
-            _finalized = (
-                set(_shader_frame_result.finalized_targets)
-                if _shader_frame_result is not None else set()
-            )
-            _leftover_targets = {
-                _tid: _payload
-                for _tid, _payload in _latest_targets.items()
-                if _tid not in _finalized
-            }
+            _arm_hang_watchdog("render:shader:snapshot", frame_index=int(fi))
+            with _RENDER_PROF.span("demo.frame.shader_snapshot"):
+                _latest_targets = _shader_graph.snapshot_latest_targets()
+                _finalized = (
+                    set(_shader_frame_result.finalized_targets)
+                    if _shader_frame_result is not None else set()
+                )
+                _leftover_targets = {
+                    _tid: _payload
+                    for _tid, _payload in _latest_targets.items()
+                    if _tid not in _finalized
+                }
             # ── Unified two-channel resolve ───────────────────────────────────
             #
             # Channel 3D (geometry):
@@ -14244,20 +14316,22 @@ def main():
             #
             # Both channels are produced every frame regardless of which
             # backend (C or OpenGL) executes the final stages.
-            _geom_channel: dict = {}
-            _tex_channel: dict = {}
-            for _tid, _payload in _latest_targets.items():
-                _key = str(_tid)
-                if _key.startswith("scene.geometry/"):
-                    _geom_channel[_key] = _payload
-                elif _key.startswith("doc.layer/") or _key.startswith("doc.composite"):
-                    _tex_channel[_key] = _payload
+            _arm_hang_watchdog("render:channel:classify", frame_index=int(fi))
+            with _RENDER_PROF.span("demo.frame.channel_classify"):
+                _geom_channel: dict = {}
+                _tex_channel: dict = {}
+                for _tid, _payload in _latest_targets.items():
+                    _key = str(_tid)
+                    if _key.startswith("scene.geometry/"):
+                        _geom_channel[_key] = _payload
+                    elif _key.startswith("doc.layer/"):
+                        _tex_channel[_key] = _payload
 
-            setattr(R, "_geometry_channel", _geom_channel)
-            setattr(R, "_texture_channel", _tex_channel)
-            setattr(R, "_final_targets", _latest_targets)
-            setattr(R, "_final_leftovers", _leftover_targets)
-            setattr(R, "_finalized_targets", _finalized)
+                setattr(R, "_geometry_channel", _geom_channel)
+                setattr(R, "_texture_channel", _tex_channel)
+                setattr(R, "_final_targets", _latest_targets)
+                setattr(R, "_final_leftovers", _leftover_targets)
+                setattr(R, "_finalized_targets", _finalized)
 
             # ── Global default fillers (run on leftovers only) ────────────
             #
@@ -14284,14 +14358,16 @@ def main():
             if getattr(R, "_global_dispatcher", None) is not None:
                 try:
                     from globals_renderer import ChannelBackend as _ChannelBackend
-                    _global_result = R._global_dispatcher.dispatch(
-                        leftovers_2d=_tex_leftovers,
-                        leftovers_3d=_geom_leftovers,
-                        mode_2d=_ChannelBackend.from_render_mode(R._mode_2d),
-                        mode_3d=_ChannelBackend.from_render_mode(R._mode_3d),
-                        frame_index=int(fi),
-                        dt=float(_dt),
-                    )
+                    _arm_hang_watchdog("render:global:dispatch", frame_index=int(fi))
+                    with _RENDER_PROF.span("demo.frame.global_dispatch"):
+                        _global_result = R._global_dispatcher.dispatch(
+                            leftovers_2d=_tex_leftovers,
+                            leftovers_3d=_geom_leftovers,
+                            mode_2d=_ChannelBackend.from_render_mode(R._mode_2d),
+                            mode_3d=_ChannelBackend.from_render_mode(R._mode_3d),
+                            frame_index=int(fi),
+                            dt=float(_dt),
+                        )
                     _diag_n = getattr(R, "_diag_render_count", 0)
                     if _diag_n < 5:
                         _o3 = getattr(_global_result, "out_3d_rgba", None)
@@ -14356,20 +14432,24 @@ def main():
             # there is nothing to blit here — its output is already in
             # the framebuffer (3D-GL) or was deposited inline (2D-GL).
             if _global_result is not None and _doc_rdr is not None:
-                try:
-                    _out_3d = getattr(_global_result, "out_3d_rgba", None)
-                    if _out_3d is not None:
-                        _doc_rdr.blit_rgba(_out_3d, alpha=1.0)
-                except Exception as _exc:
-                    _report_exception("blit 3D-C", _exc)
-                try:
-                    _out_2d = getattr(_global_result, "out_2d_rgba", None)
-                    if _out_2d is not None:
-                        _doc_rdr.blit_rgba(_out_2d, alpha=1.0)
-                except Exception as _exc:
-                    _report_exception("blit 2D-C", _exc)
+                _arm_hang_watchdog("render:blit", frame_index=int(fi))
+                with _RENDER_PROF.span("demo.frame.blit"):
+                    try:
+                        _out_3d = getattr(_global_result, "out_3d_rgba", None)
+                        if _out_3d is not None:
+                            _doc_rdr.blit_rgba(_out_3d, alpha=1.0)
+                    except Exception as _exc:
+                        _report_exception("blit 3D-C", _exc)
+                    try:
+                        _out_2d = getattr(_global_result, "out_2d_rgba", None)
+                        if _out_2d is not None:
+                            _doc_rdr.blit_rgba(_out_2d, alpha=1.0)
+                    except Exception as _exc:
+                        _report_exception("blit 2D-C", _exc)
 
+            _arm_hang_watchdog("render:display:flip", frame_index=int(fi))
             pygame.display.flip()
+            _disarm_hang_watchdog()
         except BaseException as exc:
             _report_exception(f"render frame {fi}", exc)
             raise

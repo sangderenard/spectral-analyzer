@@ -1,0 +1,42 @@
+# Room Tile Library panel — left-side palette configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# Defines the structure of the tile selection and tool palette in the room
+# control duty station. Tool buttons and category tabs are configurable here.
+
+panel:
+  title: "ROOM LIBRARY"
+  accent_rgb: [0.0, 0.5, 1.0]  # bright blue accent color (normalized 0..1)
+
+# Tool buttons — displayed at top of panel
+tools:
+  - id: create
+    label: "Create"
+  - id: move
+    label: "Move"
+  - id: delete
+    label: "Delete"
+
+# Category tabs — organize tile presets by function
+categories:
+  - id: room_tiles
+    label: "Room Tiles"
+  - id: lights
+    label: "Lights"
+  - id: doors
+    label: "Doors"
+  - id: windows
+    label: "Windows"
+  - id: cameras
+    label: "Cameras"
+  - id: duty_stations
+    label: "Duty Stations"
+  - id: duty_modules
+    label: "Duty Modules"
+
+# Layout dimensions (pixels)
+layout:
+  padding: 6
+  header_height: 24
+  tool_height: 24
+  tab_height: 22
+  row_height: 34

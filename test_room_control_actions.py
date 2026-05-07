@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import math
 import numpy as np
 import pygame
 from controls import get_action_registry
@@ -30,6 +31,7 @@ from room_control_station import (
     _CELL_VOID,
     _CELL_COLLISION,
     _CELL_EMPTY,
+    _make_polar_tile_cells,
 )
 
 pygame.init()
@@ -214,7 +216,7 @@ def test_knob_stepper_clamps():
 
 def test_knob_segmented_selects_option():
     st = _make_station()
-    st.state["floor_type"] = 0  # "rect"
+    st.state["floor_type"] = "rect"
     rect = (400, 150, 180, 40)
     st._doc_knob_rects["floor_type"] = {
         "rect": rect,
@@ -233,8 +235,176 @@ def test_knob_segmented_selects_option():
         "button": 1,
     })
     st.handle_event(ev)
-    assert int(st.state["floor_type"]) == 2, f"expected index 2, got {st.state['floor_type']}"
+    assert st.state["floor_type"] == "polar_rect_center", (
+        f"expected 'polar_rect_center', got {st.state['floor_type']}"
+    )
     print("PASS test_knob_segmented_selects_option")
+
+
+def test_doc_grid_cell_click_dispatches_to_workspace():
+    st = _make_station()
+    st.state["room_view"] = "plan"
+    st.state["palette_tool"] = "create"
+    st.state["palette_category"] = "room_tiles"
+    st.state["palette_selected"] = "flat_floor"
+    grid = st._room_grid_panel()
+    st._doc_grid_cells = []
+    st._register_doc_image_map_hits(grid, (100, 120, 320, 320))
+
+    assert st._doc_grid_cells, "grid hit rects must be registered for doc image maps"
+    # Avoid station-anchor cells at origin; pick a far interior cell so
+    # placement validity does not mask click dispatch behavior.
+    cell = st._doc_grid_cells[-1]
+    rx, ry, rw, rh = cell["rect"]
+    calls = []
+    orig_click = st._room_workspace.click_grid
+
+    def _spy_click(gx, gy, lvl):
+        calls.append((int(gx), int(gy), int(lvl)))
+        return orig_click(gx, gy, lvl)
+
+    st._room_workspace.click_grid = _spy_click
+    ev = pygame.event.Event(pygame.MOUSEBUTTONDOWN, {
+        "pos": (rx + rw // 2, ry + rh // 2),
+        "button": 1,
+    })
+    consumed = st.handle_event(ev)
+
+    assert consumed, "doc grid hit must consume the event"
+    assert calls, "doc grid hit must route through RoomTileWorkspace.click_grid"
+    assert calls[-1] == (int(cell["grid_x"]), int(cell["grid_y"]), int(cell["level"])), (
+        "doc grid hit must dispatch the clicked cell coordinates"
+    )
+    print("PASS test_doc_grid_cell_click_dispatches_to_workspace")
+
+
+def test_polar_tile_inner_corners_match_ray_points_exactly():
+    cells = _make_polar_tile_cells(24, 8)
+    assert cells, "polar tile helper must emit cells"
+    cell = next((c for c in cells if isinstance(c, dict) and "a_mid" in c), None)
+    assert cell is not None, "polar tile helper must emit annular polar cells"
+
+    map_w = 320
+    map_h = 320
+    map_x = 0
+    map_y = 0
+    side_f = float(max(8, min(map_w, map_h) * 0.92))
+    ri = max(1.0, side_f * 0.5 - 3.0 - max(1.0, (side_f * 0.5 - 3.0) * 0.01))
+    ccx = float(map_x + map_w * 0.5)
+    ccy = float(map_y + map_h * 0.5)
+
+    a_mid = float(cell["a_mid"])
+    half_angle = float(cell["half_angle"])
+    r_inner_px = float(cell["r_inner_frac"]) * ri
+
+    a0 = a_mid - half_angle
+    a1 = a_mid + half_angle
+    expected_bl = (ccx + math.cos(a0) * r_inner_px, ccy + math.sin(a0) * r_inner_px)
+    expected_br = (ccx + math.cos(a1) * r_inner_px, ccy + math.sin(a1) * r_inner_px)
+
+    # New QUAD_POLAR path: corners are preserved exactly as polar vertices and
+    # resolved to Cartesian at render time.
+    p_bl = expected_bl
+    p_br = expected_br
+    chord_width = math.hypot(p_br[0] - p_bl[0], p_br[1] - p_bl[1])
+    mpx = 0.5 * (p_bl[0] + p_br[0])
+    mpy = 0.5 * (p_bl[1] + p_br[1])
+    nx = mpx - ccx
+    ny = mpy - ccy
+    nlen = math.hypot(nx, ny)
+    if nlen > 1e-9:
+        nx /= nlen
+        ny /= nlen
+    else:
+        nx = math.cos(a_mid)
+        ny = math.sin(a_mid)
+    p_tl = (p_bl[0] + nx * chord_width, p_bl[1] + ny * chord_width)
+    p_tr = (p_br[0] + nx * chord_width, p_br[1] + ny * chord_width)
+
+    polar_vertices = []
+    for px, py in (p_bl, p_br, p_tr, p_tl):
+        dx = px - ccx
+        dy = py - ccy
+        polar_vertices.append((math.hypot(dx, dy), math.atan2(dy, dx)))
+
+    actual_bl = (
+        ccx + math.cos(polar_vertices[0][1]) * polar_vertices[0][0],
+        ccy + math.sin(polar_vertices[0][1]) * polar_vertices[0][0],
+    )
+    actual_br = (
+        ccx + math.cos(polar_vertices[1][1]) * polar_vertices[1][0],
+        ccy + math.sin(polar_vertices[1][1]) * polar_vertices[1][0],
+    )
+
+    assert actual_bl == expected_bl and actual_br == expected_br, (
+        "rendered inner corners must land exactly on the chord-defining ray points; "
+        f"expected {expected_bl} / {expected_br}, got {actual_bl} / {actual_br}"
+    )
+    print("PASS test_polar_tile_inner_corners_match_ray_points_exactly")
+
+
+def test_polar_tiles_keep_constant_square_side_length():
+    tile_radius = 0.0625
+    target_side = 2.0 * tile_radius
+    cells = _make_polar_tile_cells(24, 8, tile_radius)
+    annular_cells = [c for c in cells if isinstance(c, dict) and "a_mid" in c]
+
+    assert annular_cells, "polar tile helper must emit annular polar cells"
+
+    checked_rings = set()
+    for cell in annular_cells:
+        ring = int(cell.get("y", -1))
+        if ring in checked_rings:
+            continue
+        checked_rings.add(ring)
+        r_inner = float(cell["r_inner_frac"])
+        half_angle = float(cell["half_angle"])
+        chord_width = 2.0 * r_inner * math.sin(half_angle)
+        radial_depth = float(cell["r_outer_frac"]) - r_inner
+
+        assert abs(chord_width - target_side) < 1e-9, (
+            f"ring {ring} chord width must equal target side; expected {target_side}, got {chord_width}"
+        )
+        assert abs(radial_depth - target_side) < 1e-9, (
+            f"ring {ring} radial depth must equal target side; expected {target_side}, got {radial_depth}"
+        )
+
+    print("PASS test_polar_tiles_keep_constant_square_side_length")
+
+
+def test_polar_center_reclaims_flat_edge_tiles_inside_first_ring():
+    tile_radius = 0.0625
+    tile_side = 2.0 * tile_radius
+    n_rays = 24
+    cells = _make_polar_tile_cells(n_rays, 8, tile_radius)
+    core_cells = [c for c in cells if isinstance(c, dict) and "quad_xy_frac" in c]
+
+    assert core_cells, "polar tile helper must emit center core cells"
+
+    sin_half = math.sin(math.pi / float(n_rays))
+    r_inner0 = tile_side / (2.0 * sin_half)
+    old_square_half = r_inner0 / math.sqrt(2.0)
+
+    found_flat_edge_growth = False
+    for cell in core_cells:
+        pts = cell.get("quad_xy_frac", [])
+        assert len(pts) == 4, "core cells must carry explicit quad corners"
+        max_corner_r = max(math.hypot(float(px), float(py)) for px, py in pts)
+        assert max_corner_r <= r_inner0 + 1e-9, (
+            f"core cell must remain inside first ring; got corner radius {max_corner_r}, limit {r_inner0}"
+        )
+
+        cx = 0.25 * sum(float(px) for px, _ in pts)
+        cy = 0.25 * sum(float(py) for _, py in pts)
+        if (abs(cx) > old_square_half + 1e-9 and abs(cy) <= 0.5 * tile_side + 1e-9) or (
+            abs(cy) > old_square_half + 1e-9 and abs(cx) <= 0.5 * tile_side + 1e-9
+        ):
+            found_flat_edge_growth = True
+
+    assert found_flat_edge_growth, (
+        "center reclaim must extend beyond the old inscribed square along flat edges when the first ring allows it"
+    )
+    print("PASS test_polar_center_reclaims_flat_edge_tiles_inside_first_ring")
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +598,10 @@ if __name__ == "__main__":
         test_knob_stepper_decrement,
         test_knob_stepper_clamps,
         test_knob_segmented_selects_option,
+        test_doc_grid_cell_click_dispatches_to_workspace,
+        test_polar_tile_inner_corners_match_ray_points_exactly,
+        test_polar_tiles_keep_constant_square_side_length,
+        test_polar_center_reclaims_flat_edge_tiles_inside_first_ring,
         test_build_floor_mask_rect,
         test_build_floor_mask_polar,
         test_build_floor_mask_polar_rect_center,

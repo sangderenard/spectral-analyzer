@@ -36,6 +36,7 @@ glyphs (layout-only) if PIL is unavailable.
 from __future__ import annotations
 
 import os
+import math
 from typing import Any
 
 import numpy as np
@@ -84,6 +85,7 @@ DR_NODE_TEXT_LABEL     = 6
 DR_NODE_PRIM_RECT      = 7
 DR_NODE_PRIM_ROUNDRECT = 8
 DR_NODE_PRIM_ICON      = 9
+DR_NODE_PRIM_QUAD_POLAR = 10
 
 # -- Theme defaults -----------------------------------------------------------
 _THEME = {
@@ -147,6 +149,7 @@ class DocRenderer:
         self._u_alpha: int = -1
 
         self._next_id = 1
+        self._polar_floor_sig: tuple | None = None
 
     @staticmethod
     def _begin_overlay_blit() -> tuple[bool, bool]:
@@ -222,7 +225,18 @@ class DocRenderer:
                    icon_id: int = -1,
                    border_px: int = 1,
                    parent_id: int = 0,
-                   sibling_order: int = -1) -> None:
+                   sibling_order: int = -1,
+                   rotation_angle: float = 0.0,
+                   polar_cx: float = 0.0,
+                   polar_cy: float = 0.0,
+                   polar_r0: float = 0.0,
+                   polar_a0: float = 0.0,
+                   polar_r1: float = 0.0,
+                   polar_a1: float = 0.0,
+                   polar_r2: float = 0.0,
+                   polar_a2: float = 0.0,
+                   polar_r3: float = 0.0,
+                   polar_a3: float = 0.0) -> None:
         self._backend.submit_node(
             node_id,
             rect[0], rect[1], rect[2], rect[3],
@@ -240,6 +254,17 @@ class DocRenderer:
             border_px,
             int(parent_id),
             int(sibling_order),
+            rotation_angle,
+            polar_cx,
+            polar_cy,
+            polar_r0,
+            polar_a0,
+            polar_r1,
+            polar_a1,
+            polar_r2,
+            polar_a2,
+            polar_r3,
+            polar_a3,
         )
 
     def submit_knobspec(self, knob: Any, rect: tuple,
@@ -289,11 +314,16 @@ class DocRenderer:
             val_str = f"-   {val_str}   +"
             ntype = DR_NODE_TEXT_LABEL
         elif widget == "segmented":
-            try:
-                idx = int(current_value or 0)
-            except Exception:
-                idx = 0
             opts = list(choices or [])
+            try:
+                idx = opts.index(str(current_value))
+            except Exception:
+                try:
+                    idx = int(current_value or 0)
+                except Exception:
+                    idx = 0
+            if opts:
+                idx = max(0, min(int(idx), len(opts) - 1))
             val_str = "  ".join(
                 f"[{opt}]" if i == idx else str(opt)
                 for i, opt in enumerate(opts)
@@ -368,6 +398,286 @@ class DocRenderer:
         map_h = max(1, h - hdr_h - 10)
         cell_w = max(1, map_w // mw)
         cell_h = max(1, map_h // mh)
+        fp = image_map.get("floor_plan", {}) if isinstance(image_map, dict) else {}
+        fp_type = str(fp.get("type", ""))
+        has_arc_geom = fp_type in ("polar", "arc")
+        polar_floor_only = fp_type == "polar"
+
+        def _clear_nodes_with_prefix(prefix: str) -> None:
+            stale = [k for k in list(node_id_map.keys()) if isinstance(k, str) and k.startswith(prefix)]
+            for k in stale:
+                try:
+                    self.remove_node(int(node_id_map[k]))
+                except Exception:
+                    pass
+                try:
+                    del node_id_map[k]
+                except Exception:
+                    pass
+
+        def _clear_stale_prefixed_nodes(prefix: str, active_keys: set[str]) -> None:
+            stale = [
+                k for k in list(node_id_map.keys())
+                if isinstance(k, str) and k.startswith(prefix) and k not in active_keys
+            ]
+            for k in stale:
+                try:
+                    self.remove_node(int(node_id_map[k]))
+                except Exception:
+                    pass
+                try:
+                    del node_id_map[k]
+                except Exception:
+                    pass
+
+        if polar_floor_only:
+            _clear_nodes_with_prefix(f"__circle__.{panel.name}.")
+            # Remove non-polar rect cell nodes left from rectangular floor mode.
+            # Rect cell keys use __cell__{name}.X.Y (no dot after __cell__).
+            stale_rect_cells = [
+                k for k in list(node_id_map.keys())
+                if isinstance(k, str)
+                and k.startswith(f"__cell__{panel.name}.")
+                and not k.startswith(f"__cell__{panel.name}.polar.")
+            ]
+            for k in stale_rect_cells:
+                try:
+                    self.remove_node(int(node_id_map[k]))
+                except Exception:
+                    pass
+                try:
+                    del node_id_map[k]
+                except Exception:
+                    pass
+            side = int(max(8, min(map_w, map_h) * 0.92))
+            cx = int(map_x + map_w * 0.5)
+            cy = int(map_y + map_h * 0.5)
+            ox = int(cx - side * 0.5)
+            oy = int(cy - side * 0.5)
+
+            rays = 0
+            try:
+                rays = max(0, int(fp.get("polar_rays", 0) or 0))
+            except Exception:
+                rays = 0
+
+            fill_rgba = (31, 38, 48, 242)
+            edge_rgba = (82, 97, 117, 255)
+            tile_bg = (0.82, 0.78, 0.55, 0.86)
+            tile_border = (0.28, 0.32, 0.38, 1.0)
+            palette = image_map.get("palette", []) if isinstance(image_map, dict) else []
+
+            # Compute circle geometry for this frame (used for both rasterization and placement).
+            _side_f = float(max(8, min(map_w, map_h) * 0.92))
+            _ri = max(1.0, _side_f * 0.5 - 3.0 - max(1.0, (_side_f * 0.5 - 3.0) * 0.01))
+            _ccx = float(map_x + map_w * 0.5)
+            _ccy = float(map_y + map_h * 0.5)
+
+            state_hash = 1469598103934665603
+            for cell in cells:
+                if isinstance(cell, dict) and cell.get("polar_tile"):
+                    state_hash ^= int(cell.get("state", 0)) & 0xFF
+                    state_hash = (state_hash * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+
+            sig = (
+                side,
+                int(fp.get("polar_rays", 0) or 0),
+                int(fp.get("radial_segments", 0) or 0),
+                len(cells),
+                state_hash,
+                tuple(int(v) for v in fill_rgba),
+                tuple(int(v) for v in edge_rgba),
+            )
+
+            if self._polar_floor_sig != sig:
+                img = np.zeros((side, side, 4), dtype=np.uint8)
+                r = max(1.0, 0.5 * float(side - 3))
+                c = 0.5 * float(side - 1)
+                edge_px = max(1.0, r * 0.01)
+                yy, xx = np.ogrid[:side, :side]
+                dx = xx.astype(np.float64) - c
+                dy = yy.astype(np.float64) - c
+                dist2 = dx * dx + dy * dy
+                r2 = r * r
+                ri = max(0.0, r - edge_px)
+                ri2 = ri * ri
+                fill_mask = dist2 <= r2
+                edge_mask = np.logical_and(fill_mask, dist2 >= ri2)
+                img[fill_mask] = np.array(fill_rgba, dtype=np.uint8)
+                img[edge_mask] = np.array(edge_rgba, dtype=np.uint8)
+
+                def _draw_quad(pts: list[tuple[float, float]], accent_rgba: tuple[int, int, int, int], border_rgba: tuple[int, int, int, int], border_px: int = 1) -> None:
+                    # Canonicalize winding/order so fill tests are stable.
+                    cx_q = 0.25 * (pts[0][0] + pts[1][0] + pts[2][0] + pts[3][0])
+                    cy_q = 0.25 * (pts[0][1] + pts[1][1] + pts[2][1] + pts[3][1])
+                    pts = sorted(pts, key=lambda p: math.atan2(p[1] - cy_q, p[0] - cx_q))
+
+                    xs = [p[0] for p in pts]
+                    ys = [p[1] for p in pts]
+                    x0 = max(0, int(math.floor(min(xs))))
+                    x1 = min(side - 1, int(math.ceil(max(xs))))
+                    y0 = max(0, int(math.floor(min(ys))))
+                    y1 = min(side - 1, int(math.ceil(max(ys))))
+                    if x1 < x0 or y1 < y0:
+                        return
+
+                    def _cross(a: tuple[float, float], b: tuple[float, float], p: tuple[float, float]) -> float:
+                        abx = b[0] - a[0]
+                        aby = b[1] - a[1]
+                        apx = p[0] - a[0]
+                        apy = p[1] - a[1]
+                        return abx * apy - aby * apx
+
+                    def _inside(p: tuple[float, float]) -> bool:
+                        s = 0.0
+                        for i in range(4):
+                            cval = _cross(pts[i], pts[(i + 1) % 4], p)
+                            if abs(cval) < 1e-6:
+                                continue
+                            if s == 0.0:
+                                s = 1.0 if cval > 0.0 else -1.0
+                            elif (cval > 0.0 and s < 0.0) or (cval < 0.0 and s > 0.0):
+                                return False
+                        return True
+
+                    def _dist_seg(a: tuple[float, float], b: tuple[float, float], p: tuple[float, float]) -> float:
+                        abx = b[0] - a[0]
+                        aby = b[1] - a[1]
+                        apx = p[0] - a[0]
+                        apy = p[1] - a[1]
+                        den = abx * abx + aby * aby
+                        t = (apx * abx + apy * aby) / den if den > 1e-9 else 0.0
+                        t = max(0.0, min(1.0, t))
+                        dx2 = p[0] - (a[0] + t * abx)
+                        dy2 = p[1] - (a[1] + t * aby)
+                        return math.hypot(dx2, dy2)
+
+                    edge_half = max(0.5, float(border_px))
+                    for py in range(y0, y1 + 1):
+                        for px in range(x0, x1 + 1):
+                            pp = (px + 0.5, py + 0.5)
+                            if not _inside(pp):
+                                continue
+                            on_edge = False
+                            if border_px > 0:
+                                dmin = 1e30
+                                for i in range(4):
+                                    dmin = min(dmin, _dist_seg(pts[i], pts[(i + 1) % 4], pp))
+                                on_edge = dmin <= edge_half
+                            img[py, px] = np.array(border_rgba if on_edge else accent_rgba, dtype=np.uint8)
+
+                def _draw_line(x0: float, y0: float, x1: float, y1: float, rgba: tuple[int, int, int, int]) -> None:
+                    dxl = x1 - x0
+                    dyl = y1 - y0
+                    steps = max(1, int(max(abs(dxl), abs(dyl))))
+                    for si in range(steps + 1):
+                        t = float(si) / float(steps)
+                        px = int(round(x0 + dxl * t))
+                        py = int(round(y0 + dyl * t))
+                        if 0 <= px < side and 0 <= py < side:
+                            img[py, px] = np.array(rgba, dtype=np.uint8)
+
+                for cell in cells:
+                    if not isinstance(cell, dict) or not cell.get("polar_tile"):
+                        continue
+                    qf = cell.get("quad_xy_frac")
+                    if not (isinstance(qf, list) and len(qf) >= 4):
+                        continue
+                    pts = []
+                    for raw_pt in qf[:4]:
+                        if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
+                            pts.append((c + float(raw_pt[0]) * ri, c + float(raw_pt[1]) * ri))
+                    if len(pts) != 4:
+                        continue
+                    state = int(cell.get("state", 0))
+                    col_f = palette[state] if palette and 0 <= state < len(palette) else tile_bg
+                    col = (
+                        max(0, min(255, int(float(col_f[0]) * 255.0 + 0.5))),
+                        max(0, min(255, int(float(col_f[1]) * 255.0 + 0.5))),
+                        max(0, min(255, int(float(col_f[2]) * 255.0 + 0.5))),
+                        max(0, min(255, int(float(col_f[3]) * 255.0 + 0.5))),
+                    )
+                    bcol = (
+                        max(0, min(255, int(float(tile_border[0]) * 255.0 + 0.5))),
+                        max(0, min(255, int(float(tile_border[1]) * 255.0 + 0.5))),
+                        max(0, min(255, int(float(tile_border[2]) * 255.0 + 0.5))),
+                        max(0, min(255, int(float(tile_border[3]) * 255.0 + 0.5))),
+                    )
+                    _draw_quad(pts, col, bcol, border_px=1)
+
+                # Deterministic rays/rings overlay ("rays and chords" guide).
+                try:
+                    mg_rays = max(0, int(fp.get("polar_rays", 0) or 0))
+                except Exception:
+                    mg_rays = 0
+                try:
+                    mg_rings = max(0, int(fp.get("radial_segments", 0) or 0))
+                except Exception:
+                    mg_rings = 0
+                gcol = (
+                    max(0, min(255, int(0.55 * 255.0 + 0.5))),
+                    max(0, min(255, int(0.62 * 255.0 + 0.5))),
+                    max(0, min(255, int(0.72 * 255.0 + 0.5))),
+                    max(0, min(255, int(0.30 * 255.0 + 0.5))),
+                )
+                if mg_rays > 1:
+                    for ray_i in range(mg_rays):
+                        a = (2.0 * math.pi * float(ray_i)) / float(mg_rays)
+                        _draw_line(c, c, c + math.cos(a) * ri, c + math.sin(a) * ri, gcol)
+                if mg_rings > 0:
+                    for ring_i in range(1, mg_rings + 1):
+                        rr = (ri * float(ring_i)) / float(mg_rings)
+                        segs = max(24, int(2.0 * math.pi * rr))
+                        px0 = c + rr
+                        py0 = c
+                        for si in range(1, segs + 1):
+                            a = (2.0 * math.pi * float(si)) / float(segs)
+                            px1 = c + math.cos(a) * rr
+                            py1 = c + math.sin(a) * rr
+                            _draw_line(px0, py0, px1, py1, gcol)
+                            px0, py0 = px1, py1
+
+                self.load_primitive_atlas_rgba(img, side, side, prim_cols=1)
+                self._polar_floor_sig = sig
+
+            outer_key = f"__polar_floor__.{panel.name}.outer"
+            if outer_key not in node_id_map:
+                node_id_map[outer_key] = self._alloc_id()
+            self.submit_raw(
+                node_id_map[outer_key],
+                (ox, oy, int(_side_f), int(_side_f)),
+                DR_NODE_PRIM_ICON,
+                bg=(0.0, 0.0, 0.0, 0.0),
+                border=(0.0, 0.0, 0.0, 0.0),
+                border_px=0,
+                icon_id=0,
+                parent_id=body_id,
+                sibling_order=10,
+            )
+
+            _clear_nodes_with_prefix(f"__metagrid__.{panel.name}.")
+            _clear_nodes_with_prefix(f"__cell__.{panel.name}.polar.")
+
+            return node_id_map
+
+        # Non-polar modes: remove polar-floor helper nodes if present.
+        _clear_nodes_with_prefix(f"__polar_floor__.{panel.name}.")
+        _clear_nodes_with_prefix(f"__cell__.{panel.name}.polar.")
+        _clear_nodes_with_prefix(f"__metagrid__.{panel.name}.")
+
+        max_r = 0.0
+        if has_arc_geom:
+            for c in cells:
+                if isinstance(c, dict):
+                    try:
+                        max_r = max(max_r, float(c.get("radius_outer", 0.0)))
+                    except Exception:
+                        pass
+            max_r = max(1e-6, max_r)
+        side = float(max(1, min(map_w, map_h)))
+        cxp = float(map_x + map_w * 0.5)
+        cyp = float(map_y + map_h * 0.5)
+        scale = 0.48 * side / max_r if has_arc_geom else 0.0
         default_col = (0.12, 0.14, 0.18, 0.92)
         border_col = (0.28, 0.32, 0.38, 1.0)
         for index, raw_cell in enumerate(cells):
@@ -387,9 +697,70 @@ class DocRenderer:
             cell_key = f"__cell__{panel.name}.{cx}.{cy}"
             if cell_key not in node_id_map:
                 node_id_map[cell_key] = self._alloc_id()
+            if has_arc_geom and isinstance(raw_cell, dict) and all(
+                k in raw_cell for k in ("radius_inner", "radius_outer", "angle_start", "angle_end")
+            ):
+                corners = raw_cell.get("corners")
+                pts = []
+                if isinstance(corners, list) and corners:
+                    for raw_pt in corners[:4]:
+                        if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
+                            pts.append((float(raw_pt[0]), float(raw_pt[1])))
+                if not pts:
+                    r0 = float(raw_cell.get("radius_inner", 0.0))
+                    r1 = float(raw_cell.get("radius_outer", r0))
+                    a0 = float(raw_cell.get("angle_start", 0.0))
+                    a1 = float(raw_cell.get("angle_end", a0))
+                    pts = [
+                        (r0 * math.cos(a0), r0 * math.sin(a0)),
+                        (r1 * math.cos(a0), r1 * math.sin(a0)),
+                        (r1 * math.cos(a1), r1 * math.sin(a1)),
+                        (r0 * math.cos(a1), r0 * math.sin(a1)),
+                    ]
+                pxs = [cxp + p[0] * scale for p in pts]
+                pys = [cyp - p[1] * scale for p in pts]
+                rx0 = int(round(min(pxs)))
+                ry0 = int(round(min(pys)))
+                rx1 = int(round(max(pxs)))
+                ry1 = int(round(max(pys)))
+                rx = max(map_x, min(rx0, map_x + map_w - 2))
+                ry = max(map_y, min(ry0, map_y + map_h - 2))
+                rw = max(2, min(rx1 - rx0, map_x + map_w - rx))
+                rh = max(2, min(ry1 - ry0, map_y + map_h - ry))
+                cell_rect = (rx, ry, rw, rh)
+            elif isinstance(raw_cell, dict) and all(k in raw_cell for k in ("ui_x0", "ui_y0", "ui_x1", "ui_y1")):
+                ux0 = float(np.clip(raw_cell.get("ui_x0", 0.0), 0.0, 1.0))
+                uy0 = float(np.clip(raw_cell.get("ui_y0", 0.0), 0.0, 1.0))
+                ux1 = float(np.clip(raw_cell.get("ui_x1", 1.0), 0.0, 1.0))
+                uy1 = float(np.clip(raw_cell.get("ui_y1", 1.0), 0.0, 1.0))
+                rx0 = int(round(map_x + ux0 * max(0, map_w - 1)))
+                ry0 = int(round(map_y + uy0 * max(0, map_h - 1)))
+                rx1 = int(round(map_x + ux1 * max(0, map_w - 1)))
+                ry1 = int(round(map_y + uy1 * max(0, map_h - 1)))
+                rx = max(map_x, min(rx0, rx1))
+                ry = max(map_y, min(ry0, ry1))
+                rw = max(2, abs(rx1 - rx0))
+                rh = max(2, abs(ry1 - ry0))
+                rw = min(rw, map_x + map_w - rx)
+                rh = min(rh, map_y + map_h - ry)
+                cell_rect = (rx, ry, rw, rh)
+            elif isinstance(raw_cell, dict) and "ui_cx" in raw_cell and "ui_cy" in raw_cell:
+                uxc = float(np.clip(raw_cell.get("ui_cx", 0.5), 0.0, 1.0))
+                uyc = float(np.clip(raw_cell.get("ui_cy", 0.5), 0.0, 1.0))
+                uw = float(np.clip(raw_cell.get("ui_w", 0.08), 0.01, 1.0))
+                uh = float(np.clip(raw_cell.get("ui_h", 0.08), 0.01, 1.0))
+                rw = max(2, int(round(uw * map_w)))
+                rh = max(2, int(round(uh * map_h)))
+                rx = int(round(map_x + uxc * max(0, map_w - 1))) - rw // 2
+                ry = int(round(map_y + uyc * max(0, map_h - 1))) - rh // 2
+                rx = max(map_x, min(rx, map_x + map_w - rw))
+                ry = max(map_y, min(ry, map_y + map_h - rh))
+                cell_rect = (rx, ry, rw, rh)
+            else:
+                cell_rect = (map_x + cx * cell_w, map_y + cy * cell_h, cell_w, cell_h)
             self.submit_raw(
                 node_id_map[cell_key],
-                (map_x + cx * cell_w, map_y + cy * cell_h, cell_w, cell_h),
+                cell_rect,
                 DR_NODE_PRIM_RECT,
                 label=text,
                 bg=(0.0, 0.0, 0.0, 0.0),
@@ -447,8 +818,43 @@ class DocRenderer:
         cursor_y = y + HDR_H + 2
         KNOB_H   = 40
         PAD      = 2
+        panel_bottom = y + h
+        action_first = bool(payload.get("action_first", False)) if isinstance(payload, dict) else False
+        actions = payload.get("actions", []) if isinstance(payload, dict) else []
+
+        def _submit_action_rows(start_y: int) -> int:
+            cy = int(start_y)
+            for action_i, action in enumerate(actions or []):
+                if not isinstance(action, dict):
+                    continue
+                if cy + 24 > panel_bottom - PAD:
+                    break
+                action_key = str(action.get("key", action_i))
+                label = str(action.get("label", action_key))
+                map_key = f"__action__{panel.name}.{action_key}"
+                if map_key not in node_id_map:
+                    node_id_map[map_key] = self._alloc_id()
+                self.submit_raw(
+                    node_id_map[map_key],
+                    (x + PAD, cy, w - PAD * 2, 24),
+                    DR_NODE_TEXT_LABEL,
+                    label=label,
+                    bg=_THEME["header_bg"],
+                    border_px=1,
+                    parent_id=body_id,
+                    sibling_order=50 + action_i,
+                )
+                if action_rects is not None:
+                    action_rects[f"{panel.name}.{action_key}"] = (x + PAD, cy, w - PAD * 2, 24)
+                cy += 24 + PAD
+            return cy
+
+        if action_first:
+            cursor_y = _submit_action_rows(cursor_y)
 
         for knob_i, knob in enumerate(getattr(panel, "knobs", []) or []):
+            if cursor_y + KNOB_H > panel_bottom - PAD:
+                break
             kname = getattr(knob, "name", str(id(knob)))
             if kname not in node_id_map:
                 node_id_map[kname] = self._alloc_id()
@@ -465,6 +871,7 @@ class DocRenderer:
                     "rect": (x + PAD, cursor_y, w - PAD * 2, KNOB_H),
                     "widget": str(getattr(knob, "control_widget", "") or ""),
                     "choices": list(getattr(knob, "choices", []) or []),
+                    "default": getattr(knob, "default", None),
                     "low": float(getattr(knob, "low", 0.0)),
                     "high": float(getattr(knob, "high", 1.0)),
                     "step": float(getattr(knob, "step", 0.0)),
@@ -472,31 +879,14 @@ class DocRenderer:
                 }
             cursor_y += KNOB_H + PAD
 
-        actions = payload.get("actions", []) if isinstance(payload, dict) else []
-        for action_i, action in enumerate(actions or []):
-            if not isinstance(action, dict):
-                continue
-            action_key = str(action.get("key", action_i))
-            label = str(action.get("label", action_key))
-            map_key = f"__action__{panel.name}.{action_key}"
-            if map_key not in node_id_map:
-                node_id_map[map_key] = self._alloc_id()
-            self.submit_raw(
-                node_id_map[map_key],
-                (x + PAD, cursor_y, w - PAD * 2, 24),
-                DR_NODE_TEXT_LABEL,
-                label=label,
-                bg=_THEME["header_bg"],
-                border_px=1,
-                parent_id=body_id,
-                sibling_order=50 + action_i,
-            )
-            if action_rects is not None:
-                action_rects[f"{panel.name}.{action_key}"] = (x + PAD, cursor_y, w - PAD * 2, 24)
-            cursor_y += 24 + PAD
+        if not action_first:
+            cursor_y = _submit_action_rows(cursor_y)
 
         for sub_i, sub in enumerate(getattr(panel, "panels", []) or []):
-            sub_h    = max(60, h - (cursor_y - y) - PAD)
+            remaining_h = panel_bottom - cursor_y - PAD
+            if remaining_h < 60:
+                break
+            sub_h    = max(60, remaining_h)
             sub_rect = (x + PAD, cursor_y, w - PAD * 2, sub_h)
             self.submit_panel(sub, sub_rect, node_id_map, knob_values,
                               parent_id=body_id,

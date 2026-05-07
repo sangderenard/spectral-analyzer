@@ -3605,7 +3605,18 @@ into a flat RGBA8 numpy array sized (height, width, 4).
                int icon_id,
                int border_px,
                uint64_t parent_id,
-               int sibling_order) {
+               int sibling_order,
+               float rotation_angle,
+               float polar_cx,
+               float polar_cy,
+               float polar_r0,
+               float polar_a0,
+               float polar_r1,
+               float polar_a1,
+               float polar_r2,
+               float polar_a2,
+               float polar_r3,
+               float polar_a3) {
                 DocNodeRect rect{x, y, w, h};
                 DocNodePayload p{};
                 p.type = static_cast<DocNodeType>(type);
@@ -3621,18 +3632,29 @@ into a flat RGBA8 numpy array sized (height, width, 4).
                 fill4(p.fg_rgba,     fg_rgba);
                 fill4(p.border_rgba, border_rgba);
                 fill4(p.accent_rgba, accent_rgba);
-                p.corner_radius = corner_radius;
-                p.font_scale    = font_scale;
-                p.value_norm    = value_norm;
-                p.icon_id       = icon_id;
-                p.border_px     = border_px;
+                p.corner_radius  = corner_radius;
+                p.font_scale     = font_scale;
+                p.value_norm     = value_norm;
+                p.icon_id        = icon_id;
+                p.border_px      = border_px;
+                p.rotation_angle = rotation_angle;
+                p.polar_cx = polar_cx;
+                p.polar_cy = polar_cy;
+                p.polar_r0 = polar_r0;
+                p.polar_a0 = polar_a0;
+                p.polar_r1 = polar_r1;
+                p.polar_a1 = polar_a1;
+                p.polar_r2 = polar_r2;
+                p.polar_a2 = polar_a2;
+                p.polar_r3 = polar_r3;
+                p.polar_a3 = polar_a3;
                 dr_submit_node_ex(self.st, node_id, parent_id, sibling_order, rect, &p);
             },
             py::arg("node_id"),
             py::arg("x"), py::arg("y"), py::arg("w"), py::arg("h"),
             py::arg("type"),
-            py::arg("label")        = "",
-            py::arg("value_str")    = "",
+            py::arg("label")         = "",
+            py::arg("value_str")     = "",
             py::arg("bg_rgba"),
             py::arg("fg_rgba"),
             py::arg("border_rgba"),
@@ -3644,6 +3666,17 @@ into a flat RGBA8 numpy array sized (height, width, 4).
             py::arg("border_px")     = 1,
             py::arg("parent_id")     = 0,
             py::arg("sibling_order") = -1,
+            py::arg("rotation_angle") = 0.0f,
+            py::arg("polar_cx") = 0.0f,
+            py::arg("polar_cy") = 0.0f,
+            py::arg("polar_r0") = 0.0f,
+            py::arg("polar_a0") = 0.0f,
+            py::arg("polar_r1") = 0.0f,
+            py::arg("polar_a1") = 0.0f,
+            py::arg("polar_r2") = 0.0f,
+            py::arg("polar_a2") = 0.0f,
+            py::arg("polar_r3") = 0.0f,
+            py::arg("polar_a3") = 0.0f,
             "Drop one node payload into the render FIFO.")
         .def("remove_node",
             [](PyDocRenderer& self, uint64_t node_id) {

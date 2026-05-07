@@ -74,6 +74,7 @@ typedef enum {
     DR_NODE_PRIM_RECT       = 7,   /* solid filled rectangle               */
     DR_NODE_PRIM_ROUNDRECT  = 8,   /* rounded-rectangle outline or fill    */
     DR_NODE_PRIM_ICON       = 9,   /* icon tile from primitive atlas       */
+   DR_NODE_PRIM_QUAD_POLAR = 10,  /* polar-defined quad rasterized in float */
 } DocNodeType;
 
 /* ── Node payload ────────────────────────────────────────────────────────── */
@@ -99,6 +100,22 @@ typedef struct {
     int   icon_id;              /* primitive-atlas slot; <0 = none         */
     int   border_px;            /* border thickness in pixels; 0 = none    */
     int   flags;                /* reserved                                */
+    /* For DR_NODE_PRIM_RECT: angle of the outward-normal direction in radians.
+       0 = axis-aligned fill. The rect w×h IS the pre-rotation chord×depth. */
+    float rotation_angle;
+    /* For DR_NODE_PRIM_QUAD_POLAR: center in screen-space pixels and four
+       corner vertices defined in polar coordinates around that center.
+       Corners are ordered BL, BR, TR, TL. */
+    float polar_cx;
+    float polar_cy;
+    float polar_r0;
+    float polar_a0;
+    float polar_r1;
+    float polar_a1;
+    float polar_r2;
+    float polar_a2;
+    float polar_r3;
+    float polar_a3;
 } DocNodePayload;
 
 /* ── Opaque renderer handle ──────────────────────────────────────────────── */

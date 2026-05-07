@@ -232,18 +232,81 @@ class RoomTileLibraryPanel:
     TAB_H = 22
     ROW_H = 34
 
+    @staticmethod
+    def _load_library_config(config_path: Optional[str] = None) -> dict:
+        """Load library panel configuration from YAML.
+        
+        Args:
+            config_path: Path to library.yaml. If None, uses default location.
+            
+        Returns:
+            Config dict with 'tools', 'categories', 'panel', 'layout' keys.
+        """
+        if config_path is None:
+            config_path = "configs/duty_stations/room_control/library.yaml"
+        if not _HAS_YAML:
+            raise RuntimeError("PyYAML is required to load library config")
+        try:
+            with open(config_path, "r", encoding="utf-8") as fh:
+                cfg = _yaml.safe_load(fh) or {}
+        except FileNotFoundError:
+            # Fallback to defaults if config file not found
+            cfg = {
+                "panel": {"title": "ROOM LIBRARY", "accent_rgb": _ACCENT},
+                "tools": [
+                    {"id": "create", "label": "Create"},
+                    {"id": "move", "label": "Move"},
+                    {"id": "delete", "label": "Delete"},
+                ],
+                "categories": [
+                    {"id": "room_tiles", "label": "Room Tiles"},
+                    {"id": "lights", "label": "Lights"},
+                    {"id": "doors", "label": "Doors"},
+                    {"id": "windows", "label": "Windows"},
+                    {"id": "cameras", "label": "Cameras"},
+                    {"id": "duty_stations", "label": "Duty Stations"},
+                    {"id": "duty_modules", "label": "Duty Modules"},
+                ],
+            }
+        return cfg
+
     def __init__(self, state: dict, presets: Dict[str, RoomTilePreset],
-                 title: str = "ROOM LIBRARY",
-                 accent_rgb: Tuple[int, int, int] = _ACCENT,
+                 config_path: Optional[str] = None,
+                 title: str = "",
+                 accent_rgb: Optional[Tuple[int, int, int]] = None,
                  on_rotate_left: Optional[Callable[[], None]] = None,
                  on_rotate_right: Optional[Callable[[], None]] = None,
                  on_import_mesh: Optional[Callable[[], None]] = None):
         pygame.font.init()
         self.state = state
         self._presets = presets
-        self._title = title
+        self._on_rotate_left = on_rotate_left
+        self._on_rotate_right = on_rotate_right
+        self._on_import_mesh = on_import_mesh
+        
+        # Load configuration from YAML
+        cfg = self._load_library_config(config_path)
+        panel_cfg = cfg.get("panel", {})
+        
+        # Use provided title/accent or load from config
+        self._title = title or str(panel_cfg.get("title", "ROOM LIBRARY"))
+        if accent_rgb is None:
+            accent_from_cfg = panel_cfg.get("accent_rgb", _ACCENT)
+            accent_rgb = tuple(accent_from_cfg) if isinstance(accent_from_cfg, (list, tuple)) else _ACCENT
         self._accent = tuple(int(v * 255) if isinstance(v, float) else int(v)
                              for v in accent_rgb)
+        
+        # Extract tool names and category IDs from config
+        tools_list = cfg.get("tools", [])
+        self._tool_names = [str(t.get("id")) for t in tools_list if "id" in t]
+        if not self._tool_names:
+            self._tool_names = ["create", "move", "delete"]
+        
+        categories_list = cfg.get("categories", [])
+        self._categories = [str(c.get("id")) for c in categories_list if "id" in c]
+        if not self._categories:
+            self._categories = ["room_tiles", "lights", "doors", "windows", "cameras", "duty_stations", "duty_modules"]
+        
         self._font = pygame.font.SysFont("consolas", 13)
         self._font_s = pygame.font.SysFont("consolas", 11)
         self._scroll = 0
@@ -259,14 +322,10 @@ class RoomTileLibraryPanel:
         self._scope_arch_rect: Optional[pygame.Rect] = None
         self._scope_inst_rect: Optional[pygame.Rect] = None
         self._list_top = self.HDR_H + self.TOOL_H + self.TAB_H * 2 + 18
-        self._on_rotate_left = on_rotate_left
-        self._on_rotate_right = on_rotate_right
-        self._on_import_mesh = on_import_mesh
-        self._categories = [
-            "room_tiles", "lights", "doors", "windows", "cameras", "duty_stations", "duty_modules"
-        ]
-        self.state.setdefault("palette_tool", "create")
-        self.state.setdefault("palette_category", self._categories[0])
+        
+        # Initialize state defaults
+        self.state.setdefault("palette_tool", self._tool_names[0] if self._tool_names else "create")
+        self.state.setdefault("palette_category", self._categories[0] if self._categories else "room_tiles")
         self.state.setdefault("tile_import_scale", 1.0)
         self.state.setdefault("tile_editor_scope", "archetype")
         if "palette_selected" not in self.state:
@@ -315,10 +374,10 @@ class RoomTileLibraryPanel:
         header = self._font.render(f"  {self._title}", True, _TEXT)
         surface.blit(header, (self.PAD, 4))
 
-        tool_names = ("create", "move", "delete")
-        tool_width = max(40, (width - self.PAD * 2 - 4) // len(tool_names))
+        # Render tool buttons (from config)
+        tool_width = max(40, (width - self.PAD * 2 - 4) // len(self._tool_names)) if self._tool_names else 0
         top = self.HDR_H + 4
-        for index, tool_name in enumerate(tool_names):
+        for index, tool_name in enumerate(self._tool_names):
             rect = pygame.Rect(self.PAD + index * (tool_width + 2), top, tool_width, self.TOOL_H)
             self._tool_rects[tool_name] = rect
             active = self.state.get("palette_tool") == tool_name
@@ -329,6 +388,7 @@ class RoomTileLibraryPanel:
             surface.blit(label, (rect.x + (rect.w - label.get_width()) // 2,
                                  rect.y + (rect.h - label.get_height()) // 2))
 
+        # Render category tabs (from config)
         top += self.TOOL_H + 6
         tab_width = max(30, (width - self.PAD * 2 - 12) // 3)
         row_height = self.TAB_H
@@ -1039,6 +1099,19 @@ class RoomTileWorkspace:
             floor_type = ("rect", "polar", "polar_rect_center")[idx] if 0 <= idx < 3 else "rect"
         except Exception:
             floor_type = str(floor_type)
+
+        # Optional click-time override from polar floor hit geometry.
+        try:
+            ov_a = self.state.get("room_polar_rotation_override_angle", None)
+            ov_x = self.state.get("room_polar_rotation_override_x", None)
+            ov_y = self.state.get("room_polar_rotation_override_y", None)
+            if ov_a is not None and ov_x is not None and ov_y is not None:
+                if int(ov_x) == int(grid_x) and int(ov_y) == int(grid_y):
+                    yaw = (float(ov_a) * 180.0 / math.pi) % 360.0
+                    return int(round(yaw / (360.0 / _ROT_STEPS))) % _ROT_STEPS
+        except Exception:
+            pass
+
         if floor_type == "polar":
             arcs = max(4, int(self.state.get("floor_angular_segments", 16) or 16))
             yaw = 360.0 * (int(grid_x) + 0.5) / float(arcs)
@@ -1331,6 +1404,36 @@ class RoomTileWorkspace:
         if selected:
             pygame.draw.rect(surface, _HILITE_MARKER, rect.inflate(-2, -2), 2, border_radius=4)
 
+    @staticmethod
+    def _projection_overlay_style(status: str) -> Tuple[Tuple[int, int, int], Tuple[int, int, int], int]:
+        status = str(status)
+        if status == "collision":
+            return (196, 84, 84), (244, 124, 124), 2
+        if status == "quad":
+            return (196, 152, 72), (236, 196, 110), 2
+        if status == "dual":
+            return (112, 176, 220), (150, 214, 255), 2
+        if status == "snap":
+            return (72, 172, 214), (118, 214, 255), 1
+        return (76, 146, 210), (120, 228, 172), 1
+
+    def _draw_projection_overlay(self, surface: pygame.Surface, rect: pygame.Rect,
+                                 status: str, selected: bool = False):
+        fill, edge, width = self._projection_overlay_style(status)
+        inset = max(2, rect.w // 7)
+        inner = rect.inflate(-inset, -inset)
+        if inner.w <= 2 or inner.h <= 2:
+            inner = rect.inflate(-2, -2)
+        overlay = pygame.Surface((max(1, inner.w), max(1, inner.h)), pygame.SRCALPHA)
+        alpha = 104 if status == "collision" else 84 if status == "quad" else 68
+        overlay.fill((*fill, alpha))
+        surface.blit(overlay, inner.topleft)
+        pygame.draw.rect(surface, edge if not selected else _HILITE_MARKER, inner, width, border_radius=3)
+
+    @staticmethod
+    def _status_requires_projection(status: str) -> bool:
+        return str(status) in {"dual", "quad", "collision"}
+
     def _projection_levels(self) -> List[int]:
         center = int(self.state.get("room_level", 0))
         return [center + offset for offset in range(4, -5, -1)]
@@ -1541,6 +1644,94 @@ class RoomTileWorkspace:
         hi = corners.max(axis=0)
         return float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1])
 
+    def _tile_editor_item_xy_bounds(self, item: TileMeshItem) -> Tuple[float, float, float, float]:
+        center = np.asarray(item.pos_xy, dtype=np.float64)
+        half = np.maximum(np.asarray(item.bbox_size[:2], dtype=np.float64) * 0.5, 1e-6)
+        corners = np.array([
+            [center[0] - half[0], center[1] - half[1]],
+            [center[0] + half[0], center[1] - half[1]],
+            [center[0] + half[0], center[1] + half[1]],
+            [center[0] - half[0], center[1] + half[1]],
+        ], np.float64)
+        corners = self._rotate_xy(corners, center, int(getattr(item, "yaw_step", 0)))
+        lo = corners.min(axis=0)
+        hi = corners.max(axis=0)
+        return float(lo[0]), float(lo[1]), float(hi[0]), float(hi[1])
+
+    def tile_editor_object_cell_marks(
+        self,
+        *,
+        snap_policy: str = "gentle",
+    ) -> Dict[Tuple[int, int], Dict[str, Any]]:
+        tile_w = max(1, int(self.state.get("tile_editor_footprint_x", 2)))
+        tile_d = max(1, int(self.state.get("tile_editor_footprint_y", 2)))
+        policy = str(snap_policy or self.state.get("room_snap_policy", "gentle"))
+        gentle = policy != "no_snap"
+        snap_eps = 0.18 * _CELL_SIZE_M
+        priority = {"fit": 1, "snap": 2, "dual": 3, "quad": 4, "collision": 5}
+        marks: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+        def put(cell: Tuple[int, int], status: str, item: TileMeshItem) -> None:
+            if not (0 <= cell[0] < tile_w and 0 <= cell[1] < tile_d):
+                return
+            cur = marks.get(cell)
+            if cur is None or priority[status] >= priority[str(cur.get("status", "fit"))]:
+                marks[cell] = {
+                    "status": status,
+                    "label": str(getattr(item, "label", item.mesh_id)),
+                    "mesh_id": str(getattr(item, "mesh_id", "")),
+                }
+
+        parent_cells = {(x, y) for x in range(tile_w) for y in range(tile_d)}
+        for item in self._active_tile_items():
+            lo_x, lo_y, hi_x, hi_y = self._tile_editor_item_xy_bounds(item)
+            raw_cells = self._cells_for_bounds(lo_x, lo_y, hi_x, hi_y, tile_w, tile_d)
+            spills_outside = lo_x < 0.0 or lo_y < 0.0 or hi_x > tile_w * _CELL_SIZE_M or hi_y > tile_d * _CELL_SIZE_M
+            if not raw_cells and not spills_outside:
+                continue
+
+            if raw_cells and raw_cells.issubset(parent_cells) and len(raw_cells) <= 1 and not spills_outside:
+                for cell in raw_cells:
+                    put(cell, "fit", item)
+                continue
+
+            snapped_cells: set[Tuple[int, int]] = set()
+            if gentle:
+                size_x = max(1e-6, float(hi_x - lo_x))
+                size_y = max(1e-6, float(hi_y - lo_y))
+                span_x = max(1, int(math.ceil(size_x / _CELL_SIZE_M - 1e-6)))
+                span_y = max(1, int(math.ceil(size_y / _CELL_SIZE_M - 1e-6)))
+                cx = 0.5 * (lo_x + hi_x)
+                cy = 0.5 * (lo_y + hi_y)
+                ax = int(round(cx / _CELL_SIZE_M - span_x * 0.5))
+                ay = int(round(cy / _CELL_SIZE_M - span_y * 0.5))
+                snapped_cx = (float(ax) + span_x * 0.5) * _CELL_SIZE_M
+                snapped_cy = (float(ay) + span_y * 0.5) * _CELL_SIZE_M
+                snap_dist = max(abs(snapped_cx - cx), abs(snapped_cy - cy))
+                snapped_cells = {
+                    (ax + dx, ay + dy)
+                    for dx in range(span_x)
+                    for dy in range(span_y)
+                    if 0 <= ax + dx < tile_w and 0 <= ay + dy < tile_d
+                }
+                if (
+                    snap_dist <= snap_eps
+                    and snapped_cells
+                    and not spills_outside
+                    and len(snapped_cells) <= 1
+                ):
+                    for cell in snapped_cells:
+                        put(cell, "snap", item)
+                    continue
+
+            cells_to_mark = raw_cells or snapped_cells
+            if not cells_to_mark:
+                continue
+            status = "collision" if spills_outside else "quad" if len(cells_to_mark) >= 4 else "dual"
+            for cell in cells_to_mark:
+                put(cell, status, item)
+        return marks
+
     @staticmethod
     def _item_intersects_level(instance: RoomTileInstance, item: TileMeshItem, level: int) -> bool:
         z0 = float(instance.level) * _LEVEL_HEIGHT_M + float(getattr(item, "z_min", 0.0))
@@ -1592,12 +1783,12 @@ class RoomTileWorkspace:
         priority = {"fit": 1, "snap": 2, "dual": 3, "quad": 4, "collision": 5}
         marks: Dict[Tuple[int, int], Dict[str, Any]] = {}
 
-        def put(cell: Tuple[int, int], status: str, label: str) -> None:
+        def put(cell: Tuple[int, int], status: str, label: str, owner_id: str = "") -> None:
             if not (0 <= cell[0] < room_width and 0 <= cell[1] < room_depth):
                 return
             cur = marks.get(cell)
             if cur is None or priority[status] >= priority[str(cur.get("status", "fit"))]:
-                marks[cell] = {"status": status, "label": label}
+                marks[cell] = {"status": status, "label": label, "owner_id": owner_id}
 
         for inst in self.instances:
             preset = self.presets.get(inst.preset_id)
@@ -1627,7 +1818,7 @@ class RoomTileWorkspace:
 
                 if raw_cells.issubset(parent_cells) and not blocked(raw_cells):
                     for cell in raw_cells:
-                        put(cell, "fit", str(getattr(item, "label", item.mesh_id)))
+                        put(cell, "fit", str(getattr(item, "label", item.mesh_id)), str(inst.instance_id))
                     continue
 
                 snapped_cells: set[Tuple[int, int]] = set()
@@ -1651,14 +1842,14 @@ class RoomTileWorkspace:
                     }
                     if snap_dist <= snap_eps and snapped_cells and not blocked(snapped_cells):
                         for cell in snapped_cells:
-                            put(cell, "snap", str(getattr(item, "label", item.mesh_id)))
+                            put(cell, "snap", str(getattr(item, "label", item.mesh_id)), str(inst.instance_id))
                         continue
 
                 status = "quad" if len(raw_cells) >= 4 else "dual" if len(raw_cells) >= 2 else "collision"
                 if blocked(raw_cells):
                     status = "collision"
                 for cell in raw_cells:
-                    put(cell, status, str(getattr(item, "label", item.mesh_id)))
+                    put(cell, status, str(getattr(item, "label", item.mesh_id)), str(inst.instance_id))
         for obj in getattr(self, "scene_tile_objects", []) or []:
             if int(obj.get("level", 0)) != int(level):
                 continue
@@ -1670,7 +1861,7 @@ class RoomTileWorkspace:
             if str(obj.get("type", "")) == "duty_station":
                 status = "fit"
             for cell in cells:
-                put((int(cell[0]), int(cell[1])), status, label)
+                put((int(cell[0]), int(cell[1])), status, label, str(obj.get("object_id", "scene")))
         return marks
 
     @staticmethod
@@ -2040,6 +2231,7 @@ class RoomTileWorkspace:
             self._grid_rect = pygame.Rect(0, 0, 0, 0)
             tile_w_cells = max(1, int(self.state.get("tile_editor_footprint_x", 2)))
             tile_d_cells = max(1, int(self.state.get("tile_editor_footprint_y", 2)))
+            snap_policy = str(self.state.get("room_snap_policy", "gentle"))
             grid_margin = 12
             grid_top = toolbar_h + 8
             grid_width = width - grid_margin * 2
@@ -2058,7 +2250,19 @@ class RoomTileWorkspace:
                     pygame.draw.rect(surface, _GRID_LINE, rect, 1)
                     self._projection_cells.append(ProjectionCell(gx, gy, 0, rect))
 
+            local_marks = self.tile_editor_object_cell_marks(snap_policy=snap_policy)
             selected_mesh = str(self.state.get("tile_editor_selected_mesh", ""))
+            for cell in self._projection_cells:
+                mark = local_marks.get((cell.grid_x, cell.grid_y))
+                if not mark or not self._status_requires_projection(str(mark.get("status", ""))):
+                    continue
+                self._draw_projection_overlay(
+                    surface,
+                    cell.rect,
+                    str(mark.get("status", "collision")),
+                    selected=str(mark.get("mesh_id", "")) == selected_mesh,
+                )
+
             scale_x = float(total_width) / max(1e-6, tile_w_cells * _CELL_SIZE_M)
             scale_y = float(total_height) / max(1e-6, tile_d_cells * _CELL_SIZE_M)
             for item in active_items:
@@ -2075,11 +2279,11 @@ class RoomTileWorkspace:
                 surface.blit(tag, (rx + 3, max(top + 2, ry - 14)))
 
             footer = self._font_s.render(
-                f"tile footprint: {tile_w_cells}x{tile_d_cells}  levels: {int(self.state.get('tile_editor_levels', 1))}",
+                f"tile footprint: {tile_w_cells}x{tile_d_cells}  levels: {int(self.state.get('tile_editor_levels', 1))}  snap: {snap_policy}",
                 True, _DIM,
             )
             surface.blit(footer, (12, height - 18))
-            hint = self._font_s.render("O: copy selected fabrication order", True, _DIM)
+            hint = self._font_s.render("ROT L/ROT R = free 30deg rotation   O: copy selected fabrication order", True, _DIM)
             surface.blit(hint, (320, height - 18))
             return surface
 
@@ -2093,6 +2297,10 @@ class RoomTileWorkspace:
         selected_id = str(self.state.get("room_selected_instance", ""))
 
         if view_name == "plan":
+            object_marks = self.floor_plan_object_cell_marks(
+                int(self.state.get("room_level", 0)),
+                snap_policy=str(self.state.get("room_snap_policy", "gentle")),
+            )
             cell_size = max(16, min((grid_width // room_width), (grid_height // room_depth)))
             total_width = cell_size * room_width
             total_height = cell_size * room_depth
@@ -2122,6 +2330,17 @@ class RoomTileWorkspace:
                             cell_size,
                         )
                         self._draw_plan_cell(surface, rect, preset, selected=instance.instance_id == selected_id)
+
+            for cell in self._projection_cells:
+                mark = object_marks.get((cell.grid_x, cell.grid_y))
+                if not mark or not self._status_requires_projection(str(mark.get("status", ""))):
+                    continue
+                self._draw_projection_overlay(
+                    surface,
+                    cell.rect,
+                    str(mark.get("status", "collision")),
+                    selected=str(mark.get("owner_id", "")) == selected_id,
+                )
 
             sel_preset = self.selected_preset()
             if sel_preset is not None and bool(getattr(sel_preset, "network_strict_snap", False)):

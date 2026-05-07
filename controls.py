@@ -1595,7 +1595,10 @@ class ShaderFrameWalker:
 
     def mark_shader_dirty(self, shader_id: str) -> None:
         """Mark a registered shader node dirty so it runs on next eligible tick."""
-        node = self._graph.find_by_shader_id(shader_id)
+        node = self._graph.find_by_shader_id(shader_id) if hasattr(self._graph, "find_by_shader_id") else None
+        if node is None:
+            with self._graph._lock:  # type: ignore[attr-defined]
+                node = self._graph._index_by_shader.get(str(shader_id))  # type: ignore[attr-defined]
         if node is None:
             return
         payload = node.payload if isinstance(node.payload, dict) else {}

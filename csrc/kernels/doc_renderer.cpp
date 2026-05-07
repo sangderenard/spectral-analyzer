@@ -21,9 +21,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <chrono>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -146,6 +148,7 @@ struct DocRendererState {
     std::mutex              fifo_mtx;
     std::condition_variable fifo_cv;
     std::atomic<bool>       running{true};
+    std::atomic<int>        in_flight{0};
 
     /* Composite dirty flag */
     std::atomic<bool> composite_dirty{false};
@@ -257,12 +260,17 @@ struct DocRendererState {
         uint8_t border[4] = { f2u8(p.border_rgba[0]), f2u8(p.border_rgba[1]), f2u8(p.border_rgba[2]), f2u8(p.border_rgba[3]) };
         uint8_t accent[4] = { f2u8(p.accent_rgba[0]), f2u8(p.accent_rgba[1]), f2u8(p.accent_rgba[2]), f2u8(p.accent_rgba[3]) };
 
+        const bool rotated_prim_rect =
+            (p.type == DR_NODE_PRIM_RECT) && (std::fabs(p.rotation_angle) > 1e-6f);
+        const bool polar_quad_prim =
+            (p.type == DR_NODE_PRIM_QUAD_POLAR);
+
         /* ── Background fill ── */
         _fill_rect(tile, tw, th, 0, 0, tw, th, bg);
 
         /* ── Border ── */
         int bp = p.border_px > 0 ? p.border_px : 0;
-        if (bp > 0)
+        if (bp > 0 && !rotated_prim_rect && !polar_quad_prim)
             _stroke_rect(tile, tw, th, 0, 0, tw, th, bp, border);
 
         /* Usable inner area after border */
@@ -359,8 +367,116 @@ struct DocRendererState {
         }
 
         case DR_NODE_PRIM_RECT:
-            _fill_rect(tile, tw, th, ix, iy, iw, ih, accent);
+            if (!rotated_prim_rect) {
+                _fill_rect(tile, tw, th, ix, iy, iw, ih, accent);
+                if (bp > 0) _stroke_rect(tile, tw, th, ix, iy, iw, ih, 1, border);
+            } else {
+                const float ca = std::cos(p.rotation_angle);
+                const float sa = std::sin(p.rotation_angle);
+                const float k = std::fabs(ca) + std::fabs(sa);
+                const float side_f = (k > 1e-6f) ? (std::min(static_cast<float>(tw), static_cast<float>(th)) / k)
+                                                 : std::min(static_cast<float>(tw), static_cast<float>(th));
+                float side = std::max(1.0f, side_f);
+                if (side < 1) side = 1;
+                const float cx = tw * 0.5f;
+                const float cy = th * 0.5f;
+                const float hs = side * 0.5f;
+                const float edge_half = std::max(0.5f, static_cast<float>(bp));
+
+                for (int y = 0; y < th; ++y) {
+                    for (int x = 0; x < tw; ++x) {
+                        const float dx = (x + 0.5f) - cx;
+                        const float dy = (y + 0.5f) - cy;
+                        const float u = (-sa) * dx + ca * dy;
+                        const float v = ca * dx + sa * dy;
+                        if (std::fabs(u) <= hs && std::fabs(v) <= hs) {
+                            bool on_edge = false;
+                            if (bp > 0) {
+                                const float du = hs - std::fabs(u);
+                                const float dv = hs - std::fabs(v);
+                                on_edge = (du <= edge_half) || (dv <= edge_half);
+                            }
+                            uint8_t* d = tile + (y * tw + x) * 4;
+                            if (on_edge) {
+                                d[0] = border[0]; d[1] = border[1]; d[2] = border[2]; d[3] = border[3];
+                            } else {
+                                d[0] = accent[0]; d[1] = accent[1]; d[2] = accent[2]; d[3] = accent[3];
+                            }
+                        }
+                    }
+                }
+            }
             break;
+
+        case DR_NODE_PRIM_QUAD_POLAR: {
+            struct Pt { float x, y; };
+            Pt q[4];
+            const float cx = p.polar_cx;
+            const float cy = p.polar_cy;
+            const float rs[4] = { p.polar_r0, p.polar_r1, p.polar_r2, p.polar_r3 };
+            const float as[4] = { p.polar_a0, p.polar_a1, p.polar_a2, p.polar_a3 };
+            for (int i = 0; i < 4; ++i) {
+                const float gx = cx + std::cos(as[i]) * rs[i];
+                const float gy = cy + std::sin(as[i]) * rs[i];
+                q[i].x = gx - static_cast<float>(node.rect.x);
+                q[i].y = gy - static_cast<float>(node.rect.y);
+            }
+
+            auto cross = [](const Pt& a, const Pt& b, const Pt& p0) {
+                const float abx = b.x - a.x;
+                const float aby = b.y - a.y;
+                const float apx = p0.x - a.x;
+                const float apy = p0.y - a.y;
+                return abx * apy - aby * apx;
+            };
+
+            auto inside_convex_quad = [&](const Pt& p0) {
+                float s = 0.0f;
+                for (int i = 0; i < 4; ++i) {
+                    const float c = cross(q[i], q[(i + 1) % 4], p0);
+                    if (std::fabs(c) < 1e-6f) continue;
+                    if (s == 0.0f) s = (c > 0.0f) ? 1.0f : -1.0f;
+                    else if ((c > 0.0f && s < 0.0f) || (c < 0.0f && s > 0.0f)) return false;
+                }
+                return true;
+            };
+
+            auto dist_to_segment = [](const Pt& a, const Pt& b, const Pt& p0) {
+                const float abx = b.x - a.x;
+                const float aby = b.y - a.y;
+                const float apx = p0.x - a.x;
+                const float apy = p0.y - a.y;
+                const float denom = abx * abx + aby * aby;
+                float t = (denom > 1e-9f) ? ((apx * abx + apy * aby) / denom) : 0.0f;
+                t = std::max(0.0f, std::min(1.0f, t));
+                const float dx = p0.x - (a.x + t * abx);
+                const float dy = p0.y - (a.y + t * aby);
+                return std::sqrt(dx * dx + dy * dy);
+            };
+
+            const float edge_half = std::max(0.5f, static_cast<float>(bp));
+            for (int y = 0; y < th; ++y) {
+                for (int x = 0; x < tw; ++x) {
+                    Pt p0{ x + 0.5f, y + 0.5f };
+                    if (!inside_convex_quad(p0)) continue;
+                    bool on_edge = false;
+                    if (bp > 0) {
+                        float dmin = 1e30f;
+                        for (int i = 0; i < 4; ++i) {
+                            dmin = std::min(dmin, dist_to_segment(q[i], q[(i + 1) % 4], p0));
+                        }
+                        on_edge = (dmin <= edge_half);
+                    }
+                    uint8_t* d = tile + (y * tw + x) * 4;
+                    if (on_edge) {
+                        d[0] = border[0]; d[1] = border[1]; d[2] = border[2]; d[3] = border[3];
+                    } else {
+                        d[0] = accent[0]; d[1] = accent[1]; d[2] = accent[2]; d[3] = accent[3];
+                    }
+                }
+            }
+            break;
+        }
 
         case DR_NODE_PRIM_ROUNDRECT:
             /* Filled with accent; simple approximation (no actual rounding in sw) */
@@ -427,7 +543,9 @@ struct DocRendererState {
                 node.sibling_order = item.sibling_order;
                 node.dirty   = false;
 
+                in_flight.fetch_add(1, std::memory_order_relaxed);
                 _render_tile(node);
+                in_flight.fetch_sub(1, std::memory_order_relaxed);
             }
 
             composite_dirty.store(true);
@@ -556,13 +674,18 @@ void dr_clear(DocRendererState* st) {
 }
 
 void dr_flush(DocRendererState* st) {
-    /* Keep polling until FIFO is empty. */
+    /* Drain queue and wait for worker to finish any popped item.
+       Sleep briefly between checks to avoid saturating a core on races. */
     for (;;) {
+        bool fifo_empty = false;
         {
             std::lock_guard<std::mutex> lk(st->fifo_mtx);
-            if (st->fifo.empty()) break;
+            fifo_empty = st->fifo.empty();
         }
-        std::this_thread::yield();
+        if (fifo_empty && st->in_flight.load(std::memory_order_relaxed) <= 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
 }
 
@@ -609,6 +732,18 @@ void dr_composite(DocRendererState* st, uint8_t* out_rgba) {
             return build_key(a) < build_key(b);
         });
 
+    auto blend_pixel = [&](uint8_t* dst, const uint8_t* src) {
+        float sa = src[3] / 255.0f;
+        if (sa <= 0.0f) return;
+        float da = dst[3] / 255.0f;
+        float oa = sa + da * (1.0f - sa);
+        if (oa <= 0.0f) return;
+        dst[0] = f2u8((src[0]/255.0f * sa + dst[0]/255.0f * da*(1.0f-sa)) / oa);
+        dst[1] = f2u8((src[1]/255.0f * sa + dst[1]/255.0f * da*(1.0f-sa)) / oa);
+        dst[2] = f2u8((src[2]/255.0f * sa + dst[2]/255.0f * da*(1.0f-sa)) / oa);
+        dst[3] = f2u8(oa);
+    };
+
     for (uint64_t id : sorted) {
         auto it = st->nodes.find(id);
         if (it == st->nodes.end()) continue;
@@ -624,19 +759,9 @@ void dr_composite(DocRendererState* st, uint8_t* out_rgba) {
             for (int col = 0; col < nw; ++col) {
                 int dx = nx + col;
                 if (dx < 0 || dx >= ow) continue;
-
                 const uint8_t* src = node.tile.data() + (row * nw + col) * 4;
                 uint8_t*       dst = out_rgba + (dy * ow + dx) * 4;
-
-                float sa = src[3] / 255.0f;
-                if (sa <= 0.0f) continue;
-                float da = dst[3] / 255.0f;
-                float oa = sa + da * (1.0f - sa);
-                if (oa <= 0.0f) continue;
-                dst[0] = f2u8((src[0]/255.0f * sa + dst[0]/255.0f * da*(1.0f-sa)) / oa);
-                dst[1] = f2u8((src[1]/255.0f * sa + dst[1]/255.0f * da*(1.0f-sa)) / oa);
-                dst[2] = f2u8((src[2]/255.0f * sa + dst[2]/255.0f * da*(1.0f-sa)) / oa);
-                dst[3] = f2u8(oa);
+                blend_pixel(dst, src);
             }
         }
     }

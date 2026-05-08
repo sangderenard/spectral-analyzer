@@ -70,6 +70,7 @@ Compatibility extraction (post-bake, for legacy callers only)
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import struct as _struct
 from typing import Any, Callable, Dict, List, Optional, Union
 from dataclasses import dataclass, field
@@ -1543,6 +1544,44 @@ class MaterialDatabase:
         if len(m) >= 16:
             d['reactive_shift_hz'] = float(m[15])
         return self.register(name, d)
+
+    def ensure_mat16(self, mat16: np.ndarray) -> int:
+        """Content-keyed registration of an authored 16-float material row.
+
+        Hashes the canonical bytes of the supplied row (padded to 16f, f32);
+        if a material with this exact byte content has already been
+        registered (under any name), returns its existing index.  Otherwise
+        registers it under an anonymous `_anon_<hash>` name.
+
+        This is the GPU packer's bridge from raw mat16 vectors (which carry
+        no name) to MatBuf row indices.  It guarantees that two triangles
+        authored with identical optical properties share one MatBuf row,
+        and that one mat16 row maps to exactly one MatBuf row regardless
+        of how it was originally introduced (named YAML, anon hash, or
+        recovery fallback).
+        """
+        m = np.asarray(mat16, np.float32).ravel()
+        if m.size < 16:
+            pad = np.zeros(16, np.float32)
+            pad[: m.size] = m
+            m = pad
+        elif m.size > 16:
+            m = m[:16].copy()
+        m = np.ascontiguousarray(m, dtype=np.float32)
+        h = hashlib.sha1(m.tobytes()).hexdigest()[:16]
+        if not hasattr(self, '_mat16_hash_index'):
+            self._mat16_hash_index = {}
+        cached = self._mat16_hash_index.get(h)
+        if cached is not None and cached < len(self._order):
+            return cached
+        name = f"_anon_{h}"
+        if name in self._materials:
+            idx = self._order.index(name)
+            self._mat16_hash_index[h] = idx
+            return idx
+        idx = self.register_from_mat16(name, m)
+        self._mat16_hash_index[h] = idx
+        return idx
 
     def index_of(self, name: str) -> int:
         return self._order.index(name)

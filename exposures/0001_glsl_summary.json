@@ -1,0 +1,30 @@
+{
+  "frame_index": 1,
+  "backend": "glsl",
+  "plan": {
+    "f_number": 1.4,
+    "pixel_pitch_um": 8.4,
+    "n_pixels": 12245102,
+    "lens_omega_sr": 0.355384,
+    "exposure_time_s": 0.016666666666666666,
+    "iso": 100.0,
+    "target_H_J": 1.4880502543559749e-06,
+    "target_photons": 4157515233528.204,
+    "total_rays": 12245102,
+    "n_batches": 40,
+    "rays_per_batch": 306128,
+    "energy_per_ray_J": 1.2152207914282584e-13,
+    "ref_wavelength_nm": 555.0
+  },
+  "n_rays_emitted": 12144000,
+  "n_batches": 40,
+  "measured_H_J": 1.0708942434797272e-06,
+  "target_H_J": 1.4880502543559749e-06,
+  "gain_linear": 1.3895398760579336,
+  "gain_db": 2.857420287520479,
+  "virtual_t_s": 0.016666666666666666,
+  "photons_per_pixel": 339524.75312400045,
+  "snr_estimate": 412.0223010493488,
+  "image_path": "exposures\\0001_glsl.png",
+  "summary_path": "exposures\\0001_glsl_summary.json"
+}

@@ -1,0 +1,30 @@
+{
+  "frame_index": 5,
+  "backend": "cpp",
+  "plan": {
+    "f_number": 1.4,
+    "pixel_pitch_um": 8.4,
+    "n_pixels": 12245102,
+    "lens_omega_sr": 0.355384,
+    "exposure_time_s": 0.016666666666666666,
+    "iso": 100.0,
+    "target_H_J": 1.4880503358333175e-06,
+    "target_photons": 4157515461170.5786,
+    "total_rays": 12245102,
+    "n_batches": 40,
+    "rays_per_batch": 306128,
+    "energy_per_ray_J": 1.2152208579669793e-13,
+    "ref_wavelength_nm": 555.0
+  },
+  "n_rays_emitted": 12144000,
+  "n_batches": 40,
+  "measured_H_J": 2.5306835831984535e-06,
+  "target_H_J": 1.4880503358333175e-06,
+  "gain_linear": 0.5880033148800912,
+  "gain_db": -4.612404511467918,
+  "virtual_t_s": 0.016666666666666666,
+  "photons_per_pixel": 339524.77171448455,
+  "snr_estimate": 412.02231232937163,
+  "image_path": "exposures\\0005_cpp.png",
+  "summary_path": "exposures\\0005_cpp_summary.json"
+}

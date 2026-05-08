@@ -400,6 +400,58 @@ static inline double mat_n_real(const RayTracerState& st, int mat_idx, int b = 0
     return static_cast<double>(mat_band_record(st, mat_idx, b)[7]);
 }
 
+/* Per-material Stokes shift (Hz, positive = red-shift). Stored in band-0
+ * pad slot [9] of the MatBuf record by `MaterialDatabase.build_mat_buf()`
+ * and `ray_tracer_bridge.per_tri_spectral_to_mat_buf(...)`. Returns 0.0 for
+ * non-reactive materials. Used together with `MAT_FLAG_REACTIVE` to drive
+ * the in-line band-shift performed by the trace loop on fluorescent hits. */
+static inline double mat_reactive_shift_hz(const RayTracerState& st, int mat_idx) {
+    return static_cast<double>(mat_band_record(st, mat_idx, 0)[9]);
+}
+
+/* Apply a single fluorescent re-emission step to a per-band amplitude vector.
+ *
+ * For each band b the energy is moved to the band whose center frequency is
+ * closest to (freq_hz[b] - shift_hz).  Bands without a valid downshift target
+ * (those that land below the lowest band) are absorbed (energy lost — matches
+ * the GLSL `react_freq = max(packet.x - stokes_shift, 20.0)` floor).  The
+ * caller controls the fraction of energy that takes the shifted path via
+ * `yield_frac` (typically the reemission coefficient at the hit band); the
+ * remainder is left in `amp` unchanged so the primary specular/diffuse bounce
+ * still proceeds with the surviving energy.
+ *
+ * This is the C++-side analogue of GLSL's `append_pending_ray` / PASS_REACTIVE
+ * pair: rather than spawning a separate ray, we collapse the secondary into a
+ * spectral redistribution carried by the same path.  Less faithful to a full
+ * fluorescence kernel, but cheap and consistent with how the C++ tracer
+ * already represents per-ray energy as `amp[n_bands]`. */
+static inline void apply_reactive_shift(
+        VXcd&                       amp,
+        const Eigen::VectorXd&      freq_hz,
+        double                      shift_hz,
+        double                      yield_frac)
+{
+    const int nb = static_cast<int>(amp.size());
+    if (nb <= 1 || shift_hz <= 0.0 || yield_frac <= 0.0) return;
+    const double y = std::min(1.0, yield_frac);
+
+    VXcd shifted = VXcd::Zero(nb);
+    for (int b = 0; b < nb; ++b) {
+        const double f_target = freq_hz[b] - shift_hz;
+        if (f_target <= 0.0) continue;
+        int best = -1;
+        double best_d = 1e300;
+        for (int j = 0; j < nb; ++j) {
+            const double d = std::abs(freq_hz[j] - f_target);
+            if (d < best_d) { best_d = d; best = j; }
+        }
+        if (best < 0) continue;
+        shifted[best] += amp[b] * y;
+    }
+    for (int b = 0; b < nb; ++b)
+        amp[b] = amp[b] * (1.0 - y) + shifted[b];
+}
+
 /* ── Generic inner ray loop ─────────────────────────────────────────────────── */
 
 /* PerBandFn is called once per (source, bounce, band) for every valid surface hit.
@@ -1445,6 +1497,24 @@ static void trace_rays_multiscale(
                         cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
                         if (cur_dir.dot(hit_n) < 0.0)
                             cur_dir = cosine_hemisphere(hit_n, rng);
+                    }
+                }
+
+                /* ── Reactive (fluorescent) re-emission ─────────────────────
+                 * After the elastic surface interaction has updated `amp` and
+                 * `cur_dir`, redistribute a fraction of the per-band energy
+                 * to the Stokes-shifted destination band.  The yield is the
+                 * material's reemission coefficient at band 0 — matches
+                 * GLSL's `tri.emissive.w` / reemission packing convention. */
+                if (tri.flags & MAT_FLAG_REACTIVE) {
+                    const double shift_hz = mat_reactive_shift_hz(st, tri.mat_idx);
+                    if (shift_hz > 0.0) {
+                        /* Slot 6 = reemission (per the documented MatBuf
+                         * SpectralBandRecord layout in material_db.py). */
+                        const double yield_frac = static_cast<double>(
+                            mat_band_record(st, tri.mat_idx, 0)[6]);
+                        apply_reactive_shift(amp, st.freq_hz_vec,
+                                             shift_hz, yield_frac);
                     }
                 }
 

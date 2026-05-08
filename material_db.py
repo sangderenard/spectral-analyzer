@@ -1764,7 +1764,24 @@ class MaterialDatabase:
         `b >= n_bands` early-out in shader/tracer is safe and observable.
         """
         spec = self.build_tensors()['spectral']            # (N, MAX_BANDS, 12) f32
-        flat = np.ascontiguousarray(spec.reshape(-1, 12), dtype=np.float32)
+        # Project per-material reactive_shift_hz (from RayMatRecord, the
+        # legacy authoring slot) into band-0 pad slot [9] so the C++ tracer —
+        # which sees ONLY the MatBuf SSBO — can recover the Stokes shift
+        # without an extra side-channel.  GLSL still reads it from
+        # packed_shade[15]; both agree by construction because both pull from
+        # `RayMatRecord.reactive_shift_hz` at build time.
+        flat = np.ascontiguousarray(spec.copy().reshape(-1, 12), dtype=np.float32)
+        N = spec.shape[0]
+        if N > 0:
+            ray = self.build_tensors()['raymat_compat']    # (N, RAYMAT_FLOATS) f32
+            # RayMatRecord.reactive_shift_hz is at the trailing slot (verified
+            # by struct: see _fill_ray_from_mat11_dict in this module).
+            # Pull last column safely.
+            shift = ray[:, -1].astype(np.float32, copy=False)
+            # Stamp into band-0 pad slot [9] of every material row.
+            row_stride = MAX_SPECTRAL_BANDS
+            for i in range(N):
+                flat[i * row_stride, 9] = shift[i]
         return flat
 
     # ── Compatibility extraction helpers (post-bake; not the hot path) ──────

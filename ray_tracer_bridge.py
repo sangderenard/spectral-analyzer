@@ -1328,6 +1328,7 @@ def per_tri_spectral_to_mat_buf(
         bandwidth_hz:       Optional[np.ndarray] = None,
         ior_real_bands:     Optional[np.ndarray] = None,
         ior_imag_bands:     Optional[np.ndarray] = None,
+        reactive_shift_hz:  Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, np.ndarray, int]:
     """Pack per-triangle spectral surface data into the unified MatBuf format.
 
@@ -1427,6 +1428,16 @@ def per_tri_spectral_to_mat_buf(
     rec[:, :n_bands, 6]  = reemis.astype(np.float32)
     rec[:, :n_bands, 7]  = ior_re.astype(np.float32)
     rec[:, :n_bands, 8]  = ior_im.astype(np.float32)
+    if reactive_shift_hz is not None:
+        # Per-tri Stokes shift packed into band-0 pad slot [9] — matches the
+        # convention used by `MaterialDatabase.build_mat_buf`, so the C++
+        # tracer reads reactive_shift the same way regardless of which
+        # packer fed it.
+        rs = np.asarray(reactive_shift_hz, np.float64).ravel()
+        if rs.size != n_tri:
+            raise ValueError(
+                f"reactive_shift_hz length {rs.size} must equal n_tri={n_tri}")
+        rec[:, 0, 9] = rs.astype(np.float32)
 
     # ── Byte-keyed dedup ────────────────────────────────────────────────────
     flat = np.ascontiguousarray(rec.reshape(n_tri, -1))   # (N_tri, MAX*12) f32

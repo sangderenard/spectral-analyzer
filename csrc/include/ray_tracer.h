@@ -98,9 +98,10 @@ typedef struct RayTracerState RayTracerState;
  * @param n_tri       Number of triangles.
  * @param verts       (n_tri, 3, 3) float64 row-major — triangle vertices.
  * @param normals     (n_tri, 3)    float64 row-major — outward unit normals.
- * @param refl_re     (n_tri, n_bands) float64 row-major — complex reflectance, real.
- * @param refl_im     (n_tri, n_bands) float64 row-major — complex reflectance, imag.
- * @param diffusion   (n_tri,)         float64 — diffuse scatter fraction per tri [0,1].
+ * @param mat_idx     (n_tri,)         int32 — material index per triangle (row in mat_buf).
+ * @param mat_buf     (mat_n_mats * MAX_SPECTRAL_BANDS, 12) float32 row-major —
+ *                    flat MatBuf shared with the GLSL backend (see mat_flags.py).
+ * @param mat_n_mats  Number of registered materials in mat_buf.
  * @param n_bands     Number of frequency bands.
  * @param freq_hz     (n_bands,) float64 — centre frequencies in Hz.
  * @param speed_m_s   Speed of propagation in m/s (343.0 for air at 20°C).
@@ -111,9 +112,9 @@ SK_API RayTracerState* ray_tracer_create(
     int             n_tri,
     const double*   verts,
     const double*   normals,
-    const double*   refl_re,
-    const double*   refl_im,
-    const double*   diffusion,
+    const int*      mat_idx,
+    const float*    mat_buf,
+    int             mat_n_mats,
     int             n_bands,
     const double*   freq_hz,
     double          speed_m_s,
@@ -426,37 +427,24 @@ SK_API int ray_tracer_trace_multiscale_surface(
 
 /* ── Triangle surface flags ────────────────────────────────────────────── */
 
-/** Surface is transmissive (glass, etc.).  The tracer applies exact Snell's
- *  law refraction with angle-dependent Fresnel coefficients (both s and p
- *  polarisations, unpolarised average).  Total internal reflection (TIR) is
- *  handled automatically.  Russian-roulette Monte Carlo splits reflection vs.
- *  transmission using the Fresnel power ratio. */
-#define RT_TRI_FLAG_TRANSMISSIVE   0x01
-
-/** Surface acts as a hard aperture stop.  Rays that reach this surface are
- *  blocked.  Four Huygens secondary wavelets are spawned in the forward
- *  hemisphere with a π/2 phase shift (Huygens secondary source approximation)
- *  to model first-order edge diffraction. */
-#define RT_TRI_FLAG_APERTURE_STOP  0x02
+/* Phase 2 unification: triangle flags use the unified MAT_FLAG_* set defined
+ * in mat_flags.py and emitted into mat_flags_generated.h.  Callers should use
+ * MAT_FLAG_TRANSMISSIVE / MAT_FLAG_APERTURE_STOP / etc. directly. */
+#include "../kernels/mat_flags_generated.h"
 
 /**
- * Set the refractive index and surface flags for a range of triangles.
+ * Set the surface flags for a range of triangles.
  *
- * Call after ray_tracer_create to mark glass lens surfaces as transmissive
- * with the correct IORs.  The triangle range [tri_start, tri_start+n_tris)
- * must be valid.
+ * Phase 2 cutover: per-triangle IOR/refl now live in the MatBuf addressed by
+ * tri.mat_idx (set at create time).  This entry point only adjusts the
+ * MAT_FLAG_* bitmask (TRANSMISSIVE, APERTURE_STOP, …).
  *
- * n_in  = IOR of the medium the outward triangle normal points toward
- *         (the "outside" of the solid, usually air = 1.0 for glass).
- * n_out = IOR of the medium on the other side (inside the glass body).
- * flags = bitwise OR of RT_TRI_FLAG_* constants.
+ * @param flags  bitwise OR of MAT_FLAG_* constants.
  */
 SK_API int ray_tracer_set_tri_ior(
     RayTracerState* st,
     int             tri_start,
     int             n_tris,
-    double          n_in,
-    double          n_out,
     int             flags
 );
 

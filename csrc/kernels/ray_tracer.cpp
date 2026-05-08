@@ -65,6 +65,9 @@ static constexpr double TWO_PI     = 2.0 * M_PI;
 static constexpr double EPS        = 1e-9;
 static constexpr int    BVH_LEAF_MAX = 4;   /* triangles per BVH leaf */
 
+/* ── Unified material flags (Phase 2: single source of truth) ─────────────── */
+#include "mat_flags_generated.h"
+
 /* ── Geometry ──────────────────────────────────────────────────────────────── */
 
 struct Triangle {
@@ -72,12 +75,8 @@ struct Triangle {
     V3d edge1;   /* v1 - v0 (precomputed for Möller-Trumbore) */
     V3d edge2;   /* v2 - v0 */
     V3d normal;  /* outward unit normal */
-    double diffusion;
-    VXcd refl;   /* complex reflectance per band */
-    /* Physical optics fields (defaults = opaque mirror / air-air boundary) */
-    double n_in  = 1.0;  /* IOR of the medium the outward normal points toward   */
-    double n_out = 1.0;  /* IOR of the medium on the other side (inside solid)   */
-    int    flags = 0;    /* RT_TRI_FLAG_TRANSMISSIVE | RT_TRI_FLAG_APERTURE_STOP */
+    int mat_idx = 0;   /* index into RayTracerState::mat_buf rows (per-band record stride) */
+    int flags   = 0;   /* MAT_FLAG_TRANSMISSIVE | MAT_FLAG_APERTURE_STOP | … */
 };
 
 /* ── Möller-Trumbore ray-triangle intersection ─────────────────────────────── */
@@ -324,6 +323,14 @@ struct RayTracerState {
     int                         n_bands = 0;
     Eigen::VectorXd             k_real;      /* 2π f_n / c  (wavenumber, ambient) */
     Eigen::VectorXd             atmo_abs;    /* Np/m per band */
+    /* ── Unified material buffer (Phase 2 cutover) ────────────────────────
+     * Flat (N_mat * MAX_SPECTRAL_BANDS, 12) float32, identical bytes to the
+     * GLSL MatBuf SSBO (binding 10).  Each Triangle::mat_idx selects a
+     * material; the per-band SpectralBandRecord is read at hit time via the
+     * mat_band_record/mat_refl_complex helpers.  Single source of truth
+     * shared with material_db.py / mat_flags.py / GLSL shaders. */
+    std::vector<float>          mat_buf;
+    int                         mat_n_mats = 0;
     std::vector<RtScaleContext> scale_contexts; /* multi-scale zones, smallest-radius-first */
     double                      speed_m_s = 343.0; /* cached for context k scaling */
     Eigen::VectorXd             freq_hz_vec; /* cached for context k scaling */
@@ -342,6 +349,56 @@ struct RayTracerState {
     int                               live_max_bounces   = 8;
     double                            live_min_amplitude = 0.005;
 };
+
+/* ── MatBuf accessors ─────────────────────────────────────────────────────────
+ * Phase 2 unification: per-band physics is read from the flat MatBuf shared
+ * with the GLSL backend.  Layout per row (12 float32):
+ *   [0] center_hz   [1] bandwidth_hz   [2] reflectance_mag  [3] transmittance
+ *   [4] diffuse_frac[5] emission       [6] reemission       [7] ior_real
+ *   [8] ior_imag    [9..11] pad
+ * Row stride per band: 12; per material: MAX_SPECTRAL_BANDS * 12 = 384.
+ *
+ * Complex reflectance derivation: amplitude is the authored `reflectance_mag`;
+ * phase comes from Fresnel at normal incidence using complex IOR
+ *   r_F = (1 - n_complex) / (1 + n_complex),  n_complex = ior_real + i·ior_imag
+ *   r_used = mag · exp(i · arg(r_F))
+ * This matches the GLSL inline derivation (Phase 2c) for both backends.
+ */
+static constexpr int MAT_BUF_BAND_STRIDE = 12;
+static constexpr int MAT_BUF_MAT_STRIDE  = MAT_BUF_BAND_STRIDE * MAX_SPECTRAL_BANDS;
+
+static inline const float* mat_band_record(const RayTracerState& st, int mat_idx, int b) {
+    /* Bounds-safe: out-of-range mat_idx or b clamps to material 0 band 0. */
+    if (mat_idx < 0 || mat_idx >= st.mat_n_mats) mat_idx = 0;
+    if (b < 0 || b >= MAX_SPECTRAL_BANDS) b = 0;
+    size_t off = static_cast<size_t>(mat_idx) * MAT_BUF_MAT_STRIDE
+               + static_cast<size_t>(b)       * MAT_BUF_BAND_STRIDE;
+    if (off + MAT_BUF_BAND_STRIDE > st.mat_buf.size()) {
+        static const float zeros[MAT_BUF_BAND_STRIDE] = {0};
+        return zeros;
+    }
+    return st.mat_buf.data() + off;
+}
+
+static inline cd mat_refl_complex(const RayTracerState& st, int mat_idx, int b) {
+    const float* r = mat_band_record(st, mat_idx, b);
+    double mag  = static_cast<double>(r[2]);
+    double n_re = static_cast<double>(r[7]);
+    double n_im = static_cast<double>(r[8]);
+    cd n_complex(n_re, n_im);
+    cd one(1.0, 0.0);
+    cd r_fresnel = (one - n_complex) / (one + n_complex);
+    double phase = (std::abs(r_fresnel) > 1e-12) ? std::arg(r_fresnel) : 0.0;
+    return cd(mag * std::cos(phase), mag * std::sin(phase));
+}
+
+static inline double mat_diffusion(const RayTracerState& st, int mat_idx, int b = 0) {
+    return static_cast<double>(mat_band_record(st, mat_idx, b)[4]);
+}
+
+static inline double mat_n_real(const RayTracerState& st, int mat_idx, int b = 0) {
+    return static_cast<double>(mat_band_record(st, mat_idx, b)[7]);
+}
 
 /* ── Generic inner ray loop ─────────────────────────────────────────────────── */
 
@@ -437,7 +494,7 @@ static void trace_rays(
                         goto next_ray;
                     }
 
-                    amp[b]     = new_amp * tri.refl[b];
+                    amp[b]     = new_amp * mat_refl_complex(st, tri.mat_idx, b);
                     double a   = std::abs(amp[b]);
                     if (a > max_abs) max_abs = a;
                 }
@@ -452,7 +509,7 @@ static void trace_rays(
                 if (cur_dir.dot(hit_n) > 0.0)
                     hit_n = -hit_n;
 
-                if (U(rng) < tri.diffusion) {
+                if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
                     cur_dir = cosine_hemisphere(hit_n, rng);
                 } else {
                     cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
@@ -576,12 +633,12 @@ static void trace_rays_v2(
 
                 /* Apply reflection. */
                 for (int b = 0; b < n_bands; ++b)
-                    amp[b] = amp_prop[b] * tri.refl[b];
+                    amp[b] = amp_prop[b] * mat_refl_complex(st, tri.mat_idx, b);
 
                 if (max_abs < min_amplitude) break;
 
                 /* Scatter / reflect direction. */
-                if (U(rng) < tri.diffusion) {
+                if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
                     cur_dir = cosine_hemisphere(hit_n, rng);
                 } else {
                     cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
@@ -603,9 +660,9 @@ RayTracerState* ray_tracer_create(
     int           n_tri,
     const double* verts,
     const double* normals,
-    const double* refl_re,
-    const double* refl_im,
-    const double* diffusion,
+    const int*    mat_idx,
+    const float*  mat_buf,
+    int           mat_n_mats,
     int           n_bands,
     const double* freq_hz,
     double        speed_m_s,
@@ -622,6 +679,13 @@ RayTracerState* ray_tracer_create(
 
     for (int b = 0; b < n_bands; ++b)
         st->k_real[b] = TWO_PI * freq_hz[b] / speed_m_s;
+
+    /* Phase 2: copy MatBuf wholesale.  Layout matches GLSL binding=10. */
+    st->mat_n_mats = mat_n_mats;
+    {
+        size_t expect = static_cast<size_t>(mat_n_mats) * MAT_BUF_MAT_STRIDE;
+        st->mat_buf.assign(mat_buf, mat_buf + expect);
+    }
 
     st->tris.resize(static_cast<size_t>(n_tri));
     std::vector<AABB> tri_aabbs(static_cast<size_t>(n_tri));
@@ -642,14 +706,8 @@ RayTracerState* ray_tracer_create(
         const double* n = normals + static_cast<size_t>(i) * 3;
         tri.normal = V3d(n[0], n[1], n[2]).normalized();
 
-        tri.diffusion = diffusion[i];
-
-        /* Complex reflectances */
-        tri.refl.resize(n_bands);
-        const double* rre = refl_re + static_cast<size_t>(i) * n_bands;
-        const double* rim = refl_im + static_cast<size_t>(i) * n_bands;
-        for (int b = 0; b < n_bands; ++b)
-            tri.refl[b] = cd(rre[b], rim[b]);
+        /* Material handle into MatBuf (per-band physics resolved at hit time). */
+        tri.mat_idx = mat_idx[i];
 
         /* AABB for BVH build */
         tri_aabbs[static_cast<size_t>(i)].expand(v0);
@@ -1320,7 +1378,7 @@ static void trace_rays_multiscale(
                 if (max_abs < min_amplitude) break;
 
                 /* ── Surface interaction ──────────────────────────────────── */
-                if (tri.flags & RT_TRI_FLAG_APERTURE_STOP) {
+                if (tri.flags & MAT_FLAG_APERTURE_STOP) {
                     /* Blade material: absorb.  Diffraction is handled
                      * physically — the dense coherent ray field that passes
                      * through the blade gaps is accumulated by project_coherent
@@ -1328,52 +1386,60 @@ static void trace_rays_multiscale(
                      * Rayleigh-Sommerfeld).  No secondary wavelets needed. */
                     break;
 
-                } else if ((tri.flags & RT_TRI_FLAG_TRANSMISSIVE)
-                           && tri.n_in > EPS && tri.n_out > EPS
-                           && std::abs(tri.n_out - tri.n_in) > 1e-6)
-                {
-                    /* Exact Snell's law refraction with angle-dependent Fresnel.
-                     * n_in  = IOR of the medium the outward normal points toward.
-                     * n_out = IOR of the medium on the other side.
-                     * entering: ray going AGAINST the outward normal → ray enters
-                     *           the glass body (air→glass for a front surface). */
-                    bool entering = (cur_dir.dot(tri.normal) < 0.0);
-                    double n1 = entering ? tri.n_in  : tri.n_out;
-                    double n2 = entering ? tri.n_out : tri.n_in;
-
-                    /* hit_n is already flipped to oppose cur_dir. */
-                    double cos_i = std::max(0.0, -cur_dir.dot(hit_n));
-                    V3d refracted;
-                    bool can_refract = snell_refract(cur_dir, hit_n, n1, n2, refracted);
-
-                    if (!can_refract) {
-                        /* TIR: perfect specular reflection, apply surface refl. */
-                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                } else if (tri.flags & MAT_FLAG_TRANSMISSIVE) {
+                    /* Phase 2: refractive boundary uses MatBuf-derived IOR.
+                     * Convention: outside is air (n=1), inside is the material. */
+                    double n_mat = mat_n_real(st, tri.mat_idx);
+                    if (n_mat <= EPS || std::abs(n_mat - 1.0) < 1e-6) {
+                        /* No effective refraction — fall through to opaque path. */
                         for (int b = 0; b < n_bands; ++b)
-                            amp[b] = amp_surf[b] * tri.refl[b];
+                            amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
+                        if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
+                            cur_dir = cosine_hemisphere(hit_n, rng);
+                        } else {
+                            cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                            if (cur_dir.dot(hit_n) < 0.0)
+                                cur_dir = cosine_hemisphere(hit_n, rng);
+                        }
                     } else {
-                        double sin2_t = (n1/n2) * (n1/n2) * (1.0 - cos_i * cos_i);
-                        double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
-                        double R      = fresnel_R(cos_i, cos_t, n1, n2);
-                        if (U(rng) < R) {
-                            /* Probabilistic reflection (Russian roulette, unbiased). */
+                        bool entering = (cur_dir.dot(tri.normal) < 0.0);
+                        double n1 = entering ? 1.0   : n_mat;
+                        double n2 = entering ? n_mat : 1.0;
+
+                        /* hit_n is already flipped to oppose cur_dir. */
+                        double cos_i = std::max(0.0, -cur_dir.dot(hit_n));
+                        V3d refracted;
+                        bool can_refract = snell_refract(cur_dir, hit_n, n1, n2, refracted);
+
+                        if (!can_refract) {
+                            /* TIR: perfect specular reflection, apply surface refl. */
                             cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
                             for (int b = 0; b < n_bands; ++b)
-                                amp[b] = amp_surf[b] * tri.refl[b];
+                                amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
                         } else {
-                            /* Transmission: exact Snell direction, no refl scaling.
-                             * MC probability (1-R) handles energy balance. */
-                            cur_dir = refracted;
-                            for (int b = 0; b < n_bands; ++b)
-                                amp[b] = amp_surf[b];
+                            double sin2_t = (n1/n2) * (n1/n2) * (1.0 - cos_i * cos_i);
+                            double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
+                            double R      = fresnel_R(cos_i, cos_t, n1, n2);
+                            if (U(rng) < R) {
+                                /* Probabilistic reflection (Russian roulette, unbiased). */
+                                cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                                for (int b = 0; b < n_bands; ++b)
+                                    amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
+                            } else {
+                                /* Transmission: exact Snell direction, no refl scaling.
+                                 * MC probability (1-R) handles energy balance. */
+                                cur_dir = refracted;
+                                for (int b = 0; b < n_bands; ++b)
+                                    amp[b] = amp_surf[b];
+                            }
                         }
                     }
 
                 } else {
                     /* Opaque surface: Lambertian or specular reflection. */
                     for (int b = 0; b < n_bands; ++b)
-                        amp[b] = amp_surf[b] * tri.refl[b];
-                    if (U(rng) < tri.diffusion) {
+                        amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
+                    if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
                         cur_dir = cosine_hemisphere(hit_n, rng);
                     } else {
                         cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
@@ -1507,16 +1573,15 @@ int ray_tracer_set_tri_ior(
     RayTracerState* st,
     int             tri_start,
     int             n_tris,
-    double          n_in,
-    double          n_out,
     int             flags)
 {
+    /* Phase 2 cutover: IOR/refl come from MatBuf via tri.mat_idx; this entry
+     * point now only adjusts material flags (TRANSMISSIVE, APERTURE_STOP, …).
+     * Kept for API stability — callers used to pass n_in/n_out + flags here. */
     if (!st) return SK_ERR_NULL_STATE;
     int n_total = static_cast<int>(st->tris.size());
     int end     = std::min(tri_start + n_tris, n_total);
     for (int i = tri_start; i < end; ++i) {
-        st->tris[static_cast<size_t>(i)].n_in  = n_in;
-        st->tris[static_cast<size_t>(i)].n_out = n_out;
         st->tris[static_cast<size_t>(i)].flags = flags;
     }
     return SK_OK;
@@ -1964,39 +2029,43 @@ static bool apply_surface(
     V3d hit_n = tri.normal;
     if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
 
-    if (tri.flags & RT_TRI_FLAG_APERTURE_STOP) {
+    if (tri.flags & MAT_FLAG_APERTURE_STOP) {
         return false;  /* absorbed */
     }
 
-    if ((tri.flags & RT_TRI_FLAG_TRANSMISSIVE)
-        && tri.n_in > EPS && tri.n_out > EPS
-        && std::abs(tri.n_out - tri.n_in) > 1e-6)
     {
-        bool entering  = (dir.dot(tri.normal) < 0.0);
-        double n1      = entering ? tri.n_in  : tri.n_out;
-        double n2      = entering ? tri.n_out : tri.n_in;
-        double cos_i   = std::max(0.0, -dir.dot(hit_n));
-        V3d refracted;
-        bool ok        = snell_refract(dir, hit_n, n1, n2, refracted);
-        if (!ok) {
-            dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+        double n_mat = mat_n_real(st, tri.mat_idx);
+        bool refractive = (tri.flags & MAT_FLAG_TRANSMISSIVE)
+                       && n_mat > EPS && std::abs(n_mat - 1.0) > 1e-6;
+        if (refractive) {
+            bool entering  = (dir.dot(tri.normal) < 0.0);
+            double n1      = entering ? 1.0   : n_mat;
+            double n2      = entering ? n_mat : 1.0;
+            double cos_i   = std::max(0.0, -dir.dot(hit_n));
+            V3d refracted;
+            bool ok        = snell_refract(dir, hit_n, n1, n2, refracted);
+            if (!ok) {
+                dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+            } else {
+                double s2t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
+                double ct  = std::sqrt(std::max(0.0, 1.0 - s2t));
+                double R   = fresnel_R(cos_i, ct, n1, n2);
+                dir = (U(rng) < R)
+                    ? (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized()
+                    : refracted;
+            }
+            for (int b = 0; b < st.n_bands; ++b)
+                amp[b] *= mat_refl_complex(st, tri.mat_idx, b);
         } else {
-            double s2t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
-            double ct  = std::sqrt(std::max(0.0, 1.0 - s2t));
-            double R   = fresnel_R(cos_i, ct, n1, n2);
-            dir = (U(rng) < R)
-                ? (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized()
-                : refracted;
-        }
-        for (int b = 0; b < st.n_bands; ++b) amp[b] *= tri.refl[b];
-    } else {
-        for (int b = 0; b < st.n_bands; ++b) amp[b] *= tri.refl[b];
-        if (U(rng) < tri.diffusion) {
-            dir = cosine_hemisphere(hit_n, rng);
-        } else {
-            dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
-            if (dir.dot(hit_n) < 0.0)
+            for (int b = 0; b < st.n_bands; ++b)
+                amp[b] *= mat_refl_complex(st, tri.mat_idx, b);
+            if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
                 dir = cosine_hemisphere(hit_n, rng);
+            } else {
+                dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+                if (dir.dot(hit_n) < 0.0)
+                    dir = cosine_hemisphere(hit_n, rng);
+            }
         }
     }
     ++bounce;

@@ -3264,33 +3264,57 @@ _GPU_RAY_FIELD_CS = """
 #version 430 core
 layout(local_size_x = 128) in;
 
-// ─── Triangle geometry + material in a single 8×vec4 (128-byte) record ──────
-// normal.w  : mat_flags, stored as uint bits via floatBitsToUint / uintBitsToFloat
-// albedo.w  : 1.0 if an emission profile is assigned, 0.0 otherwise
-// emissive  : .x = emit_profile_idx (float->int, index into EmissionProfileBuf)
-//             .y = remit_profile_idx (float->int, index into EmissionProfileBuf)
-//             .z = _pad
-//             .w = reactive Stokes shift (Hz)
-struct Tri {
-    vec4 v0;        // .xyz = vertex 0,          .w unused
+// ─── Material flag bits ────────────────────────────────────────────────────
+// Mirrored byte-for-byte from mat_flags.py and mat_flags_generated.h — the
+// single Python source of truth.  Any change MUST be made in mat_flags.py;
+// these constants are kept inline here only because GLSL has no #include.
+// Test with: (floatBitsToUint(geom.normal.w) & MAT_FLAG_*) != 0u
+#define MAT_FLAG_EMISSIVE        1u
+#define MAT_FLAG_REACTIVE        2u
+#define MAT_FLAG_ABSORBER        4u
+#define MAT_FLAG_NO_SHADOW       8u
+#define MAT_FLAG_MANIFOLD       16u   // emissive.y holds manifold slot index
+#define MAT_FLAG_PARAMETRIC     32u   // lens-bake mode (Phase 2b: tracer-4 collapse)
+#define MAT_FLAG_TRANSMISSIVE   64u
+#define MAT_FLAG_APERTURE_STOP 128u   // mirrors RT_TRI_FLAG_APERTURE_STOP
+#define MAT_FLAG_PICKING_ONLY  256u   // picking pass (Phase 2b: tracer-5 collapse)
+
+// ─── Cache-line execution-context split ─────────────────────────────────────
+// Q1=B layout: hot BVH inner loop touches only TriGeom (64B, binding 0).
+// Hit-confirmed shading reads from TriShade (64B, binding 9) and MatBuf
+// (binding 10, per-band SpectralBandRecord block).  Bit values + bindings
+// are emitted by mat_flags.glsl_preamble() — the single Python source of
+// truth — and injected at shader-string assembly time, so GLSL and the
+// C++ tracer cannot drift.
+//
+// Legacy `Tri` view is reconstructed per-hit by load_tri(ti) so all
+// downstream `tri.mat_in/.albedo/.emissive/.normal.w` references in the
+// shader body remain untouched.  emissive.z carries `mat_idx` as int bits
+// (uintBitsToFloat) for the future Phase-2b spectral-from-MatBuf path.
+struct TriGeom {
+    vec4 v0;        // .xyz = vertex 0,           .w unused
     vec4 e1;        // .xyz = edge 1,             .w unused
     vec4 e2;        // .xyz = edge 2,             .w unused
     vec4 normal;    // .xyz = face normal,        .w = mat_flags (uint bits)
+};
+struct TriShade {
     vec4 mat_in;    // .xyz = refl/diff/abso,     .w = IOR
     vec4 mat_out;   // .xyz = refl/diff/abso,     .w = opacity
     vec4 albedo;    // .xyz = surface albedo,     .w = 1.0 if emission profile assigned
-    vec4 emissive;  // .x  = emit_profile_idx,   .y = remit_profile_idx,  .z = _pad,  .w = reactive shift Hz
+    vec4 emissive;  // .x  = emit_profile_idx,   .y = remit_profile_idx,  .z = mat_idx (int bits),  .w = reactive shift Hz
 };
-
-// ─── Material flag bits (packed into Tri.normal.w as uint) ──────────────────
-// Test with: (floatBitsToUint(tri.normal.w) & MAT_FLAG_*) != 0u
-#define MAT_FLAG_EMISSIVE    1u  // surface adds energy to field on every hit
-#define MAT_FLAG_REACTIVE    2u  // post-impact re-emitter: enqueues PendingRay
-#define MAT_FLAG_ABSORBER    4u  // terminates ray without bounce
-#define MAT_FLAG_NO_SHADOW   8u  // shadow/visibility rays pass through
-#define MAT_FLAG_MANIFOLD      16u  // lens manifold surface: transform ray direction
-                                    // emissive.y holds the manifold slot index
-#define MAT_FLAG_TRANSMISSIVE  64u  // explicit glass surface (opacity→0 set by scene builder)
+// Compatibility view assembled by load_tri(ti) — identical field set to the
+// pre-split single-SSBO record so downstream shader code is unchanged.
+struct Tri {
+    vec4 v0;
+    vec4 e1;
+    vec4 e2;
+    vec4 normal;
+    vec4 mat_in;
+    vec4 mat_out;
+    vec4 albedo;
+    vec4 emissive;
+};
 
 // ─── PendingRay: mid-bounce secondary emission queued for the reactive pass ─
 // origin_flags.w holds pending-ray-specific pass flags (uint bits).
@@ -3315,7 +3339,9 @@ struct Node {
     vec4 start_count;
 };
 
-layout(std430, binding = 0) readonly buffer TriBuf      { Tri        tris[];          };
+layout(std430, binding = 0) readonly buffer TriGeomBuf  { TriGeom    geom_tris[];     };
+layout(std430, binding = 9) readonly buffer TriShadeBuf { TriShade   shade_tris[];    };
+layout(std430, binding = 10) readonly buffer MatBuf     { float      mat_buf[];       };
 layout(std430, binding = 1) readonly buffer NodeBuf     { Node       nodes[];          };
 layout(std430, binding = 2) readonly buffer TriIdBuf    { int        tri_ids[];        };
 layout(std430, binding = 3) buffer         SegmentBuf   { vec4       segs[];           };
@@ -3595,7 +3621,7 @@ vec3 _emit_dir(float u1, float u2, vec3 axis) {
     return cosine_dir(u1, u2, axis);
 }
 
-bool hit_tri(vec3 ro, vec3 rd, Tri t, out float hit_t) {
+bool hit_tri(vec3 ro, vec3 rd, TriGeom t, out float hit_t) {
     vec3 h = cross(rd, t.e2.xyz);
     float a = dot(t.e1.xyz, h);
     if (abs(a) < 1e-8) return false;
@@ -3610,6 +3636,23 @@ bool hit_tri(vec3 ro, vec3 rd, Tri t, out float hit_t) {
     if (tt <= 1e-6) return false;
     hit_t = tt;
     return true;
+}
+
+// Reconstruct the legacy Tri view from the split SSBOs.  Called exactly
+// once per confirmed hit — never inside the BVH inner loop.
+Tri load_tri(int ti) {
+    TriGeom  g = geom_tris[ti];
+    TriShade s = shade_tris[ti];
+    Tri t;
+    t.v0       = g.v0;
+    t.e1       = g.e1;
+    t.e2       = g.e2;
+    t.normal   = g.normal;
+    t.mat_in   = s.mat_in;
+    t.mat_out  = s.mat_out;
+    t.albedo   = s.albedo;
+    t.emissive = s.emissive;
+    return t;
 }
 
 // Recompute Möller-Trumbore barycentric (u,v) for a known-hit triangle.
@@ -3670,7 +3713,7 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
             for (int k = 0; k < count; ++k) {
                 int ti = tri_ids[start + k];
                 float ht;
-                if (hit_tri(ro, rd, tris[ti], ht) && ht < best) {
+                if (hit_tri(ro, rd, geom_tris[ti], ht) && ht < best) {
                     best = ht;
                     best_tri = ti;
                 }
@@ -4109,7 +4152,7 @@ void sensor_main(uint ray_id, inout uint rng) {
         vec3 hp = ro + rd * best;
         vec4 fwd = sample_activation_field(hp);
 
-        Tri  tri      = tris[hit];
+        Tri  tri      = load_tri(hit);
         vec3 geom_n   = normalize(tri.normal.xyz);
         bool interior = dot(rd, geom_n) > 0.0;
         vec3 n        = interior ? -geom_n : geom_n;
@@ -4229,7 +4272,7 @@ void main() {
                 append_segment(ro, hp, packet.z);
             }
         }
-        Tri tri = tris[hit];
+        Tri tri = load_tri(hit);
         uint  mat_flags_bits = floatBitsToUint(tri.normal.w);
         vec3  geom_n         = normalize(tri.normal.xyz);
         bool  interior_face  = dot(rd, geom_n) > 0.0;
@@ -4412,7 +4455,7 @@ void reactive_main(uint gid, inout uint rng) {
         vec3 hp = ro + rd * best;
         splat_segment_spectral(ro, hp, packet);
 
-        Tri   tri            = tris[hit];
+        Tri   tri            = load_tri(hit);
         uint  flags          = floatBitsToUint(tri.normal.w);
         vec3  geom_n         = normalize(tri.normal.xyz);
         bool  interior_face  = dot(rd, geom_n) > 0.0;
@@ -4548,12 +4591,28 @@ _GPU_SENSOR_CS = """
 #version 430 core
 layout(local_size_x = 16, local_size_y = 16) in;
 
-// ─── BVH geometry (identical 8×vec4 layout to the forward pass) ─────────────
-struct Tri  { vec4 v0; vec4 e1; vec4 e2; vec4 normal; vec4 mat_in; vec4 mat_out; vec4 albedo; vec4 emissive; };
+// ─── Material flag bits (mirrored from mat_flags.py) ──────────────────────────────
+#define MAT_FLAG_EMISSIVE        1u
+#define MAT_FLAG_REACTIVE        2u
+#define MAT_FLAG_ABSORBER        4u
+#define MAT_FLAG_NO_SHADOW       8u
+#define MAT_FLAG_MANIFOLD       16u
+#define MAT_FLAG_PARAMETRIC     32u
+#define MAT_FLAG_TRANSMISSIVE   64u
+#define MAT_FLAG_APERTURE_STOP 128u
+#define MAT_FLAG_PICKING_ONLY  256u
+
+// ─── Cache-line execution-context split (matches forward shader) ────────────────
+struct TriGeom  { vec4 v0; vec4 e1; vec4 e2; vec4 normal; };
+struct TriShade { vec4 mat_in; vec4 mat_out; vec4 albedo; vec4 emissive; };
+struct Tri      { vec4 v0; vec4 e1; vec4 e2; vec4 normal;
+                  vec4 mat_in; vec4 mat_out; vec4 albedo; vec4 emissive; };
 struct Node { vec4 lo_left; vec4 hi_right; vec4 start_count; };
-layout(std430, binding = 0) readonly buffer TriBuf    { Tri   tris[];    };
-layout(std430, binding = 1) readonly buffer NodeBuf   { Node  nodes[];   };
-layout(std430, binding = 2) readonly buffer TriIdBuf  { int   tri_ids[]; };
+layout(std430, binding = 0) readonly buffer TriGeomBuf  { TriGeom  geom_tris[];  };
+layout(std430, binding = 9) readonly buffer TriShadeBuf { TriShade shade_tris[]; };
+layout(std430, binding = 10) readonly buffer MatBuf     { float    mat_buf[];    };
+layout(std430, binding = 1) readonly buffer NodeBuf     { Node     nodes[];      };
+layout(std430, binding = 2) readonly buffer TriIdBuf    { int      tri_ids[];    };
 // Bindings 3-4: reserved (previously used for per-pixel manifold ray dirs/OPLs).
 layout(std430, binding = 3) readonly buffer RayDirBuf { float ray_dirs[]; };
 layout(std430, binding = 4) readonly buffer RayOplBuf { float ray_opls[]; };
@@ -4715,7 +4774,7 @@ int nearest_hit(vec3 ro, vec3 rd, out float best) {
         if (left < 0) {
             for (int k = 0; k < count; ++k) {
                 int ti = tri_ids[start+k]; float ht;
-                if (hit_tri(ro, rd, tris[ti], ht) && ht < best) {
+                if (hit_tri(ro, rd, geom_tris[ti], ht) && ht < best) {
                     best = ht; best_tri = ti;
                 }
             }
@@ -4946,7 +5005,7 @@ void main() {
             if (hit_id < 0 || throughput < 0.003) break;
 
             vec3  hp       = ro + rd * surf_t;
-            Tri   tri      = tris[hit_id];
+            Tri   tri      = load_tri(hit_id);
             vec3  geom_n   = normalize(tri.normal.xyz);
             bool  interior = dot(rd, geom_n) > 0.0;
             vec3  n        = interior ? -geom_n : geom_n;
@@ -5945,6 +6004,7 @@ def _stage_bounds_guitar_frame(outline: np.ndarray) -> tuple[np.ndarray, np.ndar
 
 
 def _gpu_sensor_render(ssbo_tris, ssbo_nodes, ssbo_ids,
+                       ssbo_shade, ssbo_mat,
                        n_tris, n_bvh_nodes,
                        tex_bands, bmin, bmax, dims,
                        camera_eye, camera_target,
@@ -6028,6 +6088,8 @@ def _gpu_sensor_render(ssbo_tris, ssbo_nodes, ssbo_ids,
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_tris)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_nodes)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, ssbo_ids)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, ssbo_shade)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, ssbo_mat)
 
     # Bind forward film-layer volumes as samplers at texture units 0..N-1
     for _i, _tex in enumerate(tex_bands):
@@ -6547,32 +6609,61 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
                   | (emit_has_profile * np.uint32(1))
                   | (_react_mask * np.uint32(2)))
     mat_flags_col = np.frombuffer(_flags_u32.tobytes(), np.float32)
-    # 8×vec4 packed layout (32 floats per tri):
-    #  [0-2]  v0.xyz          [3]    unused
-    #  [4-6]  e1.xyz          [7]    unused
-    #  [8-10] e2.xyz          [11]   unused
-    #  [12-14] normal.xyz     [15]   mat_flags (uint bits as float)
-    #  [16-18] mat_in.xyz     [19]   IOR
-    #  [20-22] mat_out.xyz    [23]   opacity
-    #  [24-26] albedo.xyz     [27]   emissive intensity (1.0 if profile assigned, else 0)
-    #  [28]    emit_profile_idx       [29]  remit_profile_idx  [30] _pad  [31] reactive_shift_hz
-    packed = np.zeros((n_tris, 32), np.float32)
-    packed[:, 0:3]   = tris[:, 0, :]
-    packed[:, 4:7]   = tris[:, 1, :] - tris[:, 0, :]
-    packed[:, 8:11]  = tris[:, 2, :] - tris[:, 0, :]
-    packed[:, 12:15] = nrm
-    packed[:, 15]    = mat_flags_col    # normal.w  = mat_flags
-    packed[:, 16:19] = mat_in
-    packed[:, 19]    = ior_col          # mat_in.w  = IOR
-    packed[:, 20:23] = mat_out
-    packed[:, 23]    = opac_col         # mat_out.w = opacity
-    packed[:, 24:27] = albedo
-    packed[:, 27]    = emit_has_profile.astype(np.float32)  # albedo.w = 1 if emission profile assigned
-    packed[:, 28]    = emit_profile_idx   # emissive.x = emit profile index
-    packed[:, 29]    = remit_profile_idx  # emissive.y = remit profile index
-    packed[:, 30]    = 0.0               # emissive.z = _pad
-    packed[:, 31]    = reactive_shift    # emissive.w = reactive Stokes shift Hz
-    packed = np.ascontiguousarray(packed)
+    # ── Cache-line execution-context split (Phase 2a) ──────────────────────
+    # TriGeom (binding 0, 64B/tri = 4×vec4): hot in BVH inner loop.
+    #   [0-2]  v0.xyz          [3]    _pad
+    #   [4-6]  e1.xyz          [7]    _pad
+    #   [8-10] e2.xyz          [11]   _pad
+    #   [12-14] normal.xyz     [15]   mat_flags (uint bits as float)
+    # TriShade (binding 9, 64B/tri = 4×vec4): touched only after confirmed hit.
+    #   [0-2]  mat_in.xyz      [3]    IOR
+    #   [4-6]  mat_out.xyz     [7]    opacity
+    #   [8-10] albedo.xyz      [11]   emit_assigned (1.0 if profile bound)
+    #   [12]   emit_profile_idx [13]  remit_profile_idx
+    #   [14]   mat_idx (int bits via uintBitsToFloat)   [15] reactive_shift_hz
+    # MatBuf (binding 10): N_mat * MAX_SPECTRAL_BANDS * 12 floats from
+    # MaterialDatabase.build_mat_buf() — single source of truth for spectral
+    # physics.  Phase 2a uploads but doesn't yet read per-band complex amps
+    # in the shader inner loop (Phase 2b will).
+    packed_geom = np.zeros((n_tris, 16), np.float32)
+    packed_geom[:, 0:3]   = tris[:, 0, :]
+    packed_geom[:, 4:7]   = tris[:, 1, :] - tris[:, 0, :]
+    packed_geom[:, 8:11]  = tris[:, 2, :] - tris[:, 0, :]
+    packed_geom[:, 12:15] = nrm
+    packed_geom[:, 15]    = mat_flags_col
+
+    # Resolve every authored mat16 row to a stable MatBuf row index via the
+    # content-keyed registry; identical rows share one MatBuf row.
+    try:
+        from material_db import MaterialDatabase as _MatDB
+        _mat_db = _MatDB.instance()
+        _mat_idx = np.fromiter(
+            (_mat_db.ensure_mat16(_raw16[i]) for i in range(n_tris)),
+            dtype=np.int32, count=n_tris,
+        )
+        mat_buf = _mat_db.build_mat_buf()
+    except Exception:
+        _mat_idx = np.zeros(n_tris, np.int32)
+        mat_buf = np.zeros((1, 12), np.float32)
+    _mat_idx_as_float = np.frombuffer(_mat_idx.astype(np.uint32).tobytes(), np.float32)
+
+    packed_shade = np.zeros((n_tris, 16), np.float32)
+    packed_shade[:, 0:3]   = mat_in
+    packed_shade[:, 3]     = ior_col
+    packed_shade[:, 4:7]   = mat_out
+    packed_shade[:, 7]     = opac_col
+    packed_shade[:, 8:11]  = albedo
+    packed_shade[:, 11]    = emit_has_profile.astype(np.float32)
+    packed_shade[:, 12]    = emit_profile_idx
+    packed_shade[:, 13]    = remit_profile_idx
+    packed_shade[:, 14]    = _mat_idx_as_float
+    packed_shade[:, 15]    = reactive_shift
+    packed_geom  = np.ascontiguousarray(packed_geom,  np.float32)
+    packed_shade = np.ascontiguousarray(packed_shade, np.float32)
+    mat_buf      = np.ascontiguousarray(mat_buf,      np.float32)
+    # Legacy alias retained briefly so any incidental reference downstream
+    # (diagnostics byte counts, logs) keeps working without a stale import.
+    packed = packed_geom
     bvh_nodes, bvh_ids = _build_gpu_bvh(tris)
     _ray_diag_update(
         "gpu_ray_field:geometry",
@@ -6657,7 +6748,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         source_records[_i, 11]   = _model_param_src
     source_records = np.ascontiguousarray(source_records, np.float32)
 
-    ssbo = list(glGenBuffers(9))   # 0=Tri 1=Node 2=TriId 3=Seg 4=Counter 5=Source 6=PendingRay 7=EmitProfiles 8=ScaleCtx
+    ssbo = list(glGenBuffers(11))   # 0=TriGeom 1=Node 2=TriId 3=Seg 4=Counter 5=Source 6=PendingRay 7=EmitProfiles 8=ScaleCtx 9=TriShade 10=MatBuf
     _ray_diag_update(
         "gpu_ray_field:alloc_buffers",
         n_sources=len(sources),
@@ -6670,7 +6761,7 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         source_record_bytes=int(source_records.nbytes),
     )
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[0])
-    glBufferData(GL_SHADER_STORAGE_BUFFER, packed.nbytes, packed, GL_STATIC_DRAW)
+    glBufferData(GL_SHADER_STORAGE_BUFFER, packed_geom.nbytes, packed_geom, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo[0])
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[1])
     glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_nodes.nbytes, bvh_nodes, GL_STATIC_DRAW)
@@ -6705,6 +6796,14 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[8])
     glBufferData(GL_SHADER_STORAGE_BUFFER, _scale_ctx_placeholder.nbytes, _scale_ctx_placeholder, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, ssbo[8])
+
+    # ── TriShade (binding 9) and MatBuf (binding 10) ─────────────────────────
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[9])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, packed_shade.nbytes, packed_shade, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, ssbo[9])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[10])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, mat_buf.nbytes, mat_buf, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, ssbo[10])
 
     prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
     if not glGetProgramiv(prog, GL_LINK_STATUS):
@@ -6993,18 +7092,24 @@ def _gpu_ray_field(scene, outline, body_h, sources, max_bounces,
         _sp = np.array([_bplate_cx, _bplate_cy, _bplate_z - _standoff], np.float32)
     _sw  = max(1, sensor_w) if sensor_w and sensor_w > 0 else WIN_W
     _sh  = max(1, sensor_h) if sensor_h and sensor_h > 0 else WIN_H
-    # Persistent SSBOs owned by the accumulator (not freed here)
-    _s_ssbo = list(glGenBuffers(3))
+    # Persistent SSBOs owned by the accumulator (not freed here):
+    # 0=TriGeom 1=Node 2=TriId 3=TriShade 4=MatBuf
+    _s_ssbo = list(glGenBuffers(5))
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[0])
-    glBufferData(GL_SHADER_STORAGE_BUFFER, packed.nbytes, packed, GL_STATIC_DRAW)
+    glBufferData(GL_SHADER_STORAGE_BUFFER, packed_geom.nbytes, packed_geom, GL_STATIC_DRAW)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[1])
     glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_nodes.nbytes, bvh_nodes, GL_STATIC_DRAW)
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[2])
     glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_ids.nbytes, bvh_ids, GL_STATIC_DRAW)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[3])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, packed_shade.nbytes, packed_shade, GL_STATIC_DRAW)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, _s_ssbo[4])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, mat_buf.nbytes, mat_buf, GL_STATIC_DRAW)
     print(f"  [sensor] starting progressive accumulator  {_sw}x{_sh}  "
           f"{len(tris)} tris  {len(bvh_nodes)} BVH nodes", flush=True)
     sensor_acc = SensorAccumulator(
         ssbo_tris=_s_ssbo[0], ssbo_nodes=_s_ssbo[1], ssbo_ids=_s_ssbo[2],
+        ssbo_shade=_s_ssbo[3], ssbo_mat=_s_ssbo[4],
         n_tris=len(tris), n_bvh_nodes=len(bvh_nodes),
         tex_bands=tex_bands, bmin=bmin, bmax=bmax, dims=dims,
         camera_eye=_sp, camera_target=_sc,
@@ -7065,7 +7170,9 @@ def _upload_uint_ray_textures(data: np.ndarray) -> list[int]:
 GPU_OPTICAL_FIELD_DIMS = (128, 128, 256)
 
 def _gpu_ray_field_prebuilt(
-    packed,          # (N, 32) float32  — pre-packed triangle SSBO
+    packed_geom,     # (N, 16) float32  — TriGeomBuf rows (binding 0)
+    packed_shade,    # (N, 16) float32  — TriShadeBuf rows (binding 9)
+    mat_buf,         # (N_mat * MAX_SPECTRAL_BANDS, 12) float32 — MatBuf (binding 10)
     bvh_nodes,       # float32 from _build_gpu_bvh
     bvh_ids,         # uint32  from _build_gpu_bvh
     context_buf,     # (M, 8)  float32  — ScaleContext SSBO rows
@@ -7144,10 +7251,10 @@ def _gpu_ray_field_prebuilt(
         glClearTexImage(tex, 0, GL_RED_INTEGER, GL_UNSIGNED_INT, zero)
     glBindTexture(GL_TEXTURE_3D, 0)
 
-    # ── 9 SSBOs ───────────────────────────────────────────────────────────
-    ssbo = list(glGenBuffers(9))
+    # ── 11 SSBOs (0=TriGeom 1=Node 2=TriId 3=Seg 4=Counter 5=Source 6=PendingRay 7=EmitProfiles 8=ScaleCtx 9=TriShade 10=MatBuf) ──
+    ssbo = list(glGenBuffers(11))
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[0])
-    glBufferData(GL_SHADER_STORAGE_BUFFER, packed.nbytes, packed, GL_STATIC_DRAW)
+    glBufferData(GL_SHADER_STORAGE_BUFFER, packed_geom.nbytes, packed_geom, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo[0])
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[1])
     glBufferData(GL_SHADER_STORAGE_BUFFER, bvh_nodes.nbytes, bvh_nodes, GL_STATIC_DRAW)
@@ -7181,6 +7288,17 @@ def _gpu_ray_field_prebuilt(
     glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[8])
     glBufferData(GL_SHADER_STORAGE_BUFFER, _ctx.nbytes, _ctx, GL_STATIC_DRAW)
     glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 8, ssbo[8])
+
+    # ── TriShade (binding 9) and MatBuf (binding 10) ─────────────────────
+    _ms = np.ascontiguousarray(packed_shade, np.float32)
+    _mb = np.ascontiguousarray(mat_buf, np.float32) if mat_buf is not None and mat_buf.size > 0 \
+          else np.zeros((1, 12), np.float32)
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[9])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _ms.nbytes, _ms, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, ssbo[9])
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo[10])
+    glBufferData(GL_SHADER_STORAGE_BUFFER, _mb.nbytes, _mb, GL_STATIC_DRAW)
+    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, ssbo[10])
 
     # ── Compile shader ────────────────────────────────────────────────────
     prog = _prog((_GPU_RAY_FIELD_CS, GL_COMPUTE_SHADER))
@@ -9212,7 +9330,9 @@ class SensorAccumulator:
         acc.destroy()       # free GL resources when done
     """
 
-    def __init__(self, ssbo_tris, ssbo_nodes, ssbo_ids, n_tris, n_bvh_nodes,
+    def __init__(self, ssbo_tris, ssbo_nodes, ssbo_ids,
+                 ssbo_shade, ssbo_mat,
+                 n_tris, n_bvh_nodes,
                  tex_bands, bmin, bmax, dims,
                  camera_eye, camera_target,
                  sensor_w: int, sensor_h: int,
@@ -9272,6 +9392,8 @@ class SensorAccumulator:
         self._ssbo_tris   = int(ssbo_tris)
         self._ssbo_nodes  = int(ssbo_nodes)
         self._ssbo_ids    = int(ssbo_ids)
+        self._ssbo_shade  = int(ssbo_shade)
+        self._ssbo_mat    = int(ssbo_mat)
         self._n_tris      = int(n_tris)
         self._n_bvh_nodes = int(n_bvh_nodes)
         self._rfs  = float(ray_field_scale)
@@ -9451,6 +9573,8 @@ class SensorAccumulator:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, self._ssbo_seg_dummy)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, self._ssbo_counter_fwd)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, self._ssbo_sources_fwd)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, self._ssbo_shade)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, self._ssbo_mat)
         # Bind band images for atomic-add streaming accumulation
         for band_idx, tex in enumerate(self._tex_bands):
             glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
@@ -9643,6 +9767,8 @@ class SensorAccumulator:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, self._ssbo_tris)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, self._ssbo_nodes)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, self._ssbo_ids)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, self._ssbo_shade)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, self._ssbo_mat)
         for _i, _t in enumerate(self._tex_bands):
             glActiveTexture(GL_TEXTURE0 + _i)
             glBindTexture(GL_TEXTURE_3D, _t)
@@ -9960,6 +10086,8 @@ class SensorAccumulator:
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, self._ssbo_seg_dummy)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 4, self._ssbo_counter_fwd)
         glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 5, self._ssbo_sources_fwd)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 9, self._ssbo_shade)
+        glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 10, self._ssbo_mat)
         for band_idx, tex in enumerate(self._tex_bands):
             glBindImageTexture(band_idx, tex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32UI)
 

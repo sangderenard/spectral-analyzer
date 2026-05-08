@@ -463,18 +463,17 @@ struct PyRayTracer
     PyRayTracer(int                     n_tri,
                 py::array_t<double>     verts,
                 py::array_t<double>     normals,
-                py::array_t<double>     refl_re,
-                py::array_t<double>     refl_im,
-                py::array_t<double>     diffusion,
+                py::array_t<int>        mat_idx,
+                py::array_t<float>      mat_buf,
+                int                     mat_n_mats,
                 py::array_t<double>     freq_hz,
                 double                  speed_m_s,
                 py::array_t<double>     atmo_abs)
     {
         auto iv  = verts    .request();
         auto in_ = normals  .request();
-        auto ire = refl_re  .request();
-        auto iim = refl_im  .request();
-        auto id  = diffusion.request();
+        auto imi = mat_idx  .request();
+        auto imb = mat_buf  .request();
         auto ifh = freq_hz  .request();
         auto iaa = atmo_abs .request();
 
@@ -485,9 +484,9 @@ struct PyRayTracer
             n_tri,
             static_cast<const double*>(iv .ptr),
             static_cast<const double*>(in_.ptr),
-            static_cast<const double*>(ire.ptr),
-            static_cast<const double*>(iim.ptr),
-            static_cast<const double*>(id .ptr),
+            static_cast<const int*>   (imi.ptr),
+            static_cast<const float*> (imb.ptr),
+            mat_n_mats,
             _n_bands,
             static_cast<const double*>(ifh.ptr),
             speed_m_s,
@@ -986,19 +985,16 @@ struct PyRayTracer
 
     /* ── Physical optics extension methods ──────────────────────────────── */
 
-    /** Mark a range of triangles as transmissive (glass) with given IORs.
-     *  tri_start : index of first triangle in the range
-     *  n_tris    : number of triangles
-     *  n_in      : IOR where the outward normal points (usually air = 1.0)
-     *  n_out     : IOR on the other side (glass)
-     *  flags     : RT_TRI_FLAG_TRANSMISSIVE | RT_TRI_FLAG_APERTURE_STOP etc.
+    /** Set the surface flags for a range of triangles (Phase 2).
+     *  Per-triangle physics (refl, IOR, diffusion) now lives in the MatBuf
+     *  addressed by tri.mat_idx (set at construction).  This entry point
+     *  only adjusts the MAT_FLAG_* bitmask.
+     *  flags : MAT_FLAG_TRANSMISSIVE | MAT_FLAG_APERTURE_STOP | …
      */
-    void set_tri_ior(int tri_start, int n_tris,
-                     double n_in, double n_out, int flags)
+    void set_tri_ior(int tri_start, int n_tris, int flags)
     {
         if (!handle) throw std::runtime_error("RayTracer not initialised");
-        int rc = ray_tracer_set_tri_ior(handle, tri_start, n_tris,
-                                         n_in, n_out, flags);
+        int rc = ray_tracer_set_tri_ior(handle, tri_start, n_tris, flags);
         if (rc != SK_OK)
             throw std::runtime_error("ray_tracer_set_tri_ior failed: rc=" + std::to_string(rc));
     }
@@ -2690,9 +2686,15 @@ verts : float64 array (n_tri, 3, 3)
 normals : float64 array (n_tri, 3)
     Outward unit normals, row-major.
 refl_re, refl_im : float64 array (n_tri, n_bands)
-    Complex reflectance per triangle per frequency band.
+    [REMOVED in Phase 2]  Complex reflectance now lives in mat_buf.
 diffusion : float64 array (n_tri,)
-    Diffuse scatter fraction per triangle [0, 1].
+    [REMOVED in Phase 2]  Diffuse scatter fraction now lives in mat_buf (slot 4).
+mat_idx : int32 array (n_tri,)
+    Per-triangle material index (row in mat_buf).
+mat_buf : float32 array (mat_n_mats * MAX_SPECTRAL_BANDS, 12)
+    Flat unified material buffer shared with the GLSL backend.
+mat_n_mats : int
+    Number of registered materials in mat_buf.
 freq_hz : float64 array (n_bands,)
     Centre frequencies in Hz.
 speed_m_s : float64
@@ -2703,9 +2705,9 @@ atmo_abs : float64 array (n_bands,)
         .def(py::init<int,
                       py::array_t<double>,  /* verts      */
                       py::array_t<double>,  /* normals    */
-                      py::array_t<double>,  /* refl_re    */
-                      py::array_t<double>,  /* refl_im    */
-                      py::array_t<double>,  /* diffusion  */
+                      py::array_t<int>,     /* mat_idx    */
+                      py::array_t<float>,   /* mat_buf    */
+                      int,                  /* mat_n_mats */
                       py::array_t<double>,  /* freq_hz    */
                       double,               /* speed_m_s  */
                       py::array_t<double>   /* atmo_abs   */
@@ -2713,9 +2715,9 @@ atmo_abs : float64 array (n_bands,)
              py::arg("n_tri"),
              py::arg("verts"),
              py::arg("normals"),
-             py::arg("refl_re"),
-             py::arg("refl_im"),
-             py::arg("diffusion"),
+             py::arg("mat_idx"),
+             py::arg("mat_buf"),
+             py::arg("mat_n_mats"),
              py::arg("freq_hz"),
              py::arg("speed_m_s") = 343.0,
              py::arg("atmo_abs"))
@@ -2923,28 +2925,25 @@ scale_type.
         .def("set_tri_ior", &PyRayTracer::set_tri_ior,
              py::arg("tri_start"),
              py::arg("n_tris"),
-             py::arg("n_in"),
-             py::arg("n_out"),
-             py::arg("flags") = RT_TRI_FLAG_TRANSMISSIVE,
+             py::arg("flags") = MAT_FLAG_TRANSMISSIVE,
              R"doc(
-Mark a range of triangles as transmissive (glass / refractive surface).
+Set the surface flags for a range of triangles (Phase 2 unification).
 
-tri_start : index of the first triangle to mark
+Per-triangle physics (refl, IOR, diffusion) now lives in the MatBuf
+addressed by tri.mat_idx (set at construction).  This entry point only
+adjusts the MAT_FLAG_* bitmask.
+
+tri_start : index of the first triangle in the range
 n_tris    : number of triangles in the range
-n_in      : IOR of the medium the outward normal points toward (usually air=1.0)
-n_out     : IOR on the opposite side (glass body)
-flags     : RT_TRI_FLAG_TRANSMISSIVE (1) | RT_TRI_FLAG_APERTURE_STOP (2)
+flags     : MAT_FLAG_TRANSMISSIVE (64) | MAT_FLAG_APERTURE_STOP (128) | …
 
-When RT_TRI_FLAG_TRANSMISSIVE is set the tracer applies exact Snell's law
-refraction with angle-dependent Fresnel power split (both s and p
-polarisations, unpolarised average).  TIR is handled automatically.
-Russian-roulette Monte Carlo selects reflect or transmit probabilistically.
+When MAT_FLAG_TRANSMISSIVE is set the tracer applies exact Snell's law
+refraction with angle-dependent Fresnel power split.  IOR is read from the
+material's MatBuf record (slot 7 = ior_real).  TIR is handled automatically.
 
-When RT_TRI_FLAG_APERTURE_STOP is set the surface absorbs the ray.
-Diffraction is handled by the near-field pipeline: the dense coherent ray
-field that passes through the blade gaps is accumulated by project_coherent
-and propagated to the sensor by rs_propagate (exact Rayleigh-Sommerfeld) or
-advanced step-by-step by wave_bpm_step (paraxial Helmholtz PDE).
+When MAT_FLAG_APERTURE_STOP is set the surface absorbs the ray.
+Diffraction is handled by the near-field pipeline (coherent_accumulate +
+rs_propagate / wave_bpm_step).
 )doc")
         .def("project_coherent", &PyRayTracer::project_coherent,
              py::arg("segs"),
@@ -3519,9 +3518,17 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("CE_STATUS_DONE")      = CE_STATUS_DONE;
     m.attr("CE_STATUS_CANCELLED") = CE_STATUS_CANCELLED;
     m.attr("CE_STATUS_ERROR")     = CE_STATUS_ERROR;
-    /* Ray-tracer triangle surface flags */
-    m.attr("RT_TRI_FLAG_TRANSMISSIVE")  = (int)RT_TRI_FLAG_TRANSMISSIVE;
-    m.attr("RT_TRI_FLAG_APERTURE_STOP") = (int)RT_TRI_FLAG_APERTURE_STOP;
+    /* Ray-tracer triangle surface flags (Phase 2: unified MAT_FLAG_*). */
+    m.attr("MAT_FLAG_EMISSIVE")      = (int)MAT_FLAG_EMISSIVE;
+    m.attr("MAT_FLAG_REACTIVE")      = (int)MAT_FLAG_REACTIVE;
+    m.attr("MAT_FLAG_ABSORBER")      = (int)MAT_FLAG_ABSORBER;
+    m.attr("MAT_FLAG_NO_SHADOW")     = (int)MAT_FLAG_NO_SHADOW;
+    m.attr("MAT_FLAG_MANIFOLD")      = (int)MAT_FLAG_MANIFOLD;
+    m.attr("MAT_FLAG_PARAMETRIC")    = (int)MAT_FLAG_PARAMETRIC;
+    m.attr("MAT_FLAG_TRANSMISSIVE")  = (int)MAT_FLAG_TRANSMISSIVE;
+    m.attr("MAT_FLAG_APERTURE_STOP") = (int)MAT_FLAG_APERTURE_STOP;
+    m.attr("MAT_FLAG_PICKING_ONLY")  = (int)MAT_FLAG_PICKING_ONLY;
+    m.attr("MAX_SPECTRAL_BANDS")     = (int)MAX_SPECTRAL_BANDS;
     /* Multiscale scale-type constants */
     m.attr("RT_SCALE_GEOMETRIC") = (int)RT_SCALE_GEOMETRIC;
     m.attr("RT_SCALE_WAVE")      = (int)RT_SCALE_WAVE;

@@ -1069,9 +1069,9 @@ def build_gpu_scene(
 
     Returns
     -------
-    packed       : (N_tri, 32) float32
-                   Identical 8×vec4 layout as the triangle SSBO in _gpu_ray_field().
-                   Slot [15] carries GLSL MAT_FLAG bits reinterpreted as float.
+    packed_geom  : (N_tri, 16) float32   — TriGeomBuf rows (binding 0)
+    packed_shade : (N_tri, 16) float32   — TriShadeBuf rows (binding 9)
+    mat_buf      : (N_mat * MAX_SPECTRAL_BANDS, 12) float32 — MatBuf (binding 10)
     bvh_tris     : (N_tri, 3, 3) float32  — vertex triples for _build_gpu_bvh()
     context_buf  : (N_ctx, 8)   float32
                    ScaleContext SSBO rows: [cx,cy,cz,r, dt_m,n_re,n_im, type=1]
@@ -1079,6 +1079,9 @@ def build_gpu_scene(
     bounds       : (bmin, bmax)  each float32 (3,)
     source_buf   : (N_src, 9)   float32  [px,py,pz, dx,dy,dz, model_int, model_param, amp_weight]
     """
+    from mat_flags import (
+        MAT_FLAG_EMISSIVE, MAT_FLAG_ABSORBER, MAT_FLAG_TRANSMISSIVE,
+    )
     wavelengths_um = list(wavelengths_um)
 
     (verts_all, normals_all, _refl_re, _refl_im, _diff,
@@ -1094,13 +1097,14 @@ def build_gpu_scene(
     opac_col    = np.ones(n_tri, np.float32)
     flags_u32   = np.zeros(n_tri, np.uint32)
 
-    # Map abstract tokens to GLSL MAT_FLAG bit values
+    # Map abstract geometry tokens to MAT_FLAG bit values from mat_flags
+    # (the single Python source of truth for both backends).
     _glsl_flag = {
-        _GEO_FLAG_TRANSMISSIVE:     np.uint32(64),  # MAT_FLAG_TRANSMISSIVE
-        _GEO_FLAG_APERTURE_STOP:    np.uint32(4),   # MAT_FLAG_ABSORBER
-        _GEO_FLAG_EMITTER:          np.uint32(1),   # MAT_FLAG_EMISSIVE
-        _GEO_FLAG_PROJECTOR_BACK:   np.uint32(1),   # MAT_FLAG_EMISSIVE
-        _GEO_FLAG_CONFINEMENT_WALL: np.uint32(1),   # MAT_FLAG_EMISSIVE — records arrivals
+        _GEO_FLAG_TRANSMISSIVE:     np.uint32(MAT_FLAG_TRANSMISSIVE),
+        _GEO_FLAG_APERTURE_STOP:    np.uint32(MAT_FLAG_ABSORBER),
+        _GEO_FLAG_EMITTER:          np.uint32(MAT_FLAG_EMISSIVE),
+        _GEO_FLAG_PROJECTOR_BACK:   np.uint32(MAT_FLAG_EMISSIVE),
+        _GEO_FLAG_CONFINEMENT_WALL: np.uint32(MAT_FLAG_EMISSIVE),  # records arrivals
     }
 
     for tri_start, n_tris, mi_rgb, mo_rgb, alb_rgb, ior, opa, flag_str in mat_groups:
@@ -1237,7 +1241,7 @@ def build_gpu_scene(
         _order = _RayOrder.from_lights_list(_legacy_lights, wavelengths_um=_WL_UM)
         source_buf = _order.bake_rays(_PREBAKE_N, seed=42)
 
-    return packed, bvh_tris, context_buf, ctx_map, (bmin, bmax), source_buf
+    return packed_geom, packed_shade, mat_buf, bvh_tris, context_buf, ctx_map, (bmin, bmax), source_buf
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1702,7 +1702,7 @@ class CameraDesignerStation:
         try:
             bvh_nodes, bvh_ids = _gpu_bvh_fn(bvh_tris)
             state = _gpu_prebuilt_fn(
-                packed, bvh_nodes, bvh_ids,
+                packed_geom, packed_shade, mat_buf, bvh_nodes, bvh_ids,
                 ctx_buf_send, source_buf, bounds,
                 dims=_GPU_OPT_DIMS,
                 dispatch_batch=8192,

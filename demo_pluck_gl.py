@@ -13701,7 +13701,10 @@ def main():
                     diffusion_bands[_fallback, :] = _diff[_fallback, None]
                 refl_re = np.ascontiguousarray(np.clip(refl_re, 0.0, 0.999), dtype=np.float64)
                 refl_im = np.ascontiguousarray(refl_im, dtype=np.float64)
-                diffusion = np.ascontiguousarray(np.clip(diffusion_bands.mean(axis=1), 0.0, 1.0), dtype=np.float64)
+                diffusion_bands = np.ascontiguousarray(np.clip(diffusion_bands, 0.0, 1.0), dtype=np.float64)
+                from ray_tracer_bridge import per_tri_spectral_to_mat_buf as _per_tri_to_mat_buf
+                mat_idx_arr, mat_buf_arr, mat_n_mats_int = _per_tri_to_mat_buf(
+                    refl_re, refl_im, diffusion_bands, freq_hz)
 
                 # Build one ray source per emissive material island. The current
                 # C tracer has scalar source amplitude, so source colour is carried
@@ -13758,7 +13761,9 @@ def main():
                     "texture_stack16": tex16_by_tri,
                     "refl_re": refl_re,
                     "refl_im": refl_im,
-                    "diffusion": diffusion,
+                    "mat_idx": mat_idx_arr,
+                    "mat_buf": mat_buf_arr,
+                    "mat_n_mats": int(mat_n_mats_int),
                     "freq_hz": freq_hz,
                     "atmo_abs": np.array([0.0, 0.0, 0.0], dtype=np.float64),
                     "speed_m_s": 299792458.0,

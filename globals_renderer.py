@@ -570,15 +570,15 @@ class GlobalChannelDispatcher:
 
         tris = packed.get("tris")
         normals = packed.get("normals")
-        refl_re = packed.get("refl_re")
-        refl_im = packed.get("refl_im")
-        diffusion = packed.get("diffusion")
+        mat_idx = packed.get("mat_idx")
+        mat_buf = packed.get("mat_buf")
+        mat_n_mats = packed.get("mat_n_mats")
         freq_hz = packed.get("freq_hz")
         atmo_abs = packed.get("atmo_abs")
         sources_pos = packed.get("src_pos")
         sources_dir = packed.get("src_dir")
         sources_directivity = packed.get("src_directivity")
-        if tris is None or normals is None or refl_re is None or refl_im is None:
+        if tris is None or normals is None or mat_idx is None or mat_buf is None:
             return None
         if sources_pos is None or sources_dir is None or sources_directivity is None:
             return None
@@ -596,9 +596,9 @@ class GlobalChannelDispatcher:
                     n_tris,
                     tris,
                     _np.ascontiguousarray(normals, dtype=_np.float64),
-                    _np.ascontiguousarray(refl_re, dtype=_np.float64),
-                    _np.ascontiguousarray(refl_im, dtype=_np.float64),
-                    _np.ascontiguousarray(diffusion, dtype=_np.float64),
+                    _np.ascontiguousarray(mat_idx, dtype=_np.int32),
+                    _np.ascontiguousarray(mat_buf, dtype=_np.float32),
+                    int(mat_n_mats),
                     _np.ascontiguousarray(freq_hz, dtype=_np.float64),
                     float(packed.get("speed_m_s", 299792458.0)),
                     _np.ascontiguousarray(atmo_abs, dtype=_np.float64),

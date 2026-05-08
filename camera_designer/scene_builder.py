@@ -1021,13 +1021,33 @@ def build_tracer(
     n_tri    = len(verts_all)
     atmo_abs = np.zeros(n_bands, np.float64)
 
+    # Bake the per-group transmissive IOR (n_out) into the per-tri ior_real
+    # bands. The new RayTracer has no separate set_tri_ior(n_in, n_out) call —
+    # the surface IOR lives in the unified MatBuf, so we fold ior_specs into
+    # the material data here before packing.
+    ior_real_bands = np.ones((n_tri, n_bands), np.float64)
+    ior_imag_bands = np.zeros((n_tri, n_bands), np.float64)
+    for tri_start, n_tris_seg, _n_in, n_out, _flag_str in ior_specs:
+        if n_tris_seg > 0:
+            ior_real_bands[tri_start:tri_start + n_tris_seg, :] = float(n_out)
+
+    from ray_tracer_bridge import per_tri_spectral_to_mat_buf as _per_tri_to_mat_buf
+    mat_idx_arr, mat_buf_arr, mat_n_mats_int = _per_tri_to_mat_buf(
+        refl_re_all.astype(np.float64, copy=False),
+        refl_im_all.astype(np.float64, copy=False),
+        np.tile(diff_all.astype(np.float64, copy=False)[:, None], (1, n_bands)),
+        freq_hz,
+        ior_real_bands=ior_real_bands,
+        ior_imag_bands=ior_imag_bands,
+    )
+
     tracer = _CRayTracer(
         n_tri,
         verts_all.astype(np.float64, copy=False),
         normals_all.astype(np.float64, copy=False),
-        refl_re_all.astype(np.float64, copy=False),
-        refl_im_all.astype(np.float64, copy=False),
-        diff_all.astype(np.float64, copy=False),
+        mat_idx_arr,
+        mat_buf_arr,
+        int(mat_n_mats_int),
         freq_hz,
         speed_m_s,
         atmo_abs,
@@ -1038,9 +1058,9 @@ def build_tracer(
         _GEO_FLAG_TRANSMISSIVE:  RT_TRI_FLAG_TRANSMISSIVE,
         _GEO_FLAG_APERTURE_STOP: RT_TRI_FLAG_APERTURE_STOP,
     }
-    for tri_start, n_tris, n_in, n_out, flag_str in ior_specs:
+    for tri_start, n_tris, _n_in, _n_out, flag_str in ior_specs:
         if n_tris > 0 and flag_str in _flag_map:
-            tracer.set_tri_ior(tri_start, n_tris, n_in, n_out, _flag_map[flag_str])
+            tracer.set_tri_ior(tri_start, n_tris, _flag_map[flag_str])
 
     ctx_map: Dict[str, int] = {}
     for label, center, radius, n_re, n_im, dt_m in context_specs:

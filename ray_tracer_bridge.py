@@ -1287,36 +1287,178 @@ def build_complex_reflectances(
     return refl_re, refl_im
 
 
-def build_complex_reflectances_spectral(
-        materials: list,         # list[_SpectralMaterial], one per triangle
-        freq_hz:   np.ndarray,   # (n_bands,) float64
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute per-band complex reflectances from per-triangle SpectralMaterial objects.
+# ---------------------------------------------------------------------------
+# Phase 2 unified-MatBuf adapter
+# ---------------------------------------------------------------------------
+#
+# The C++ ``RayTracer`` and the GLSL compute path both index a single flat
+# ``mat_buf`` SSBO of shape ``(N_mat * MAX_SPECTRAL_BANDS, 12) float32`` —
+# row ``mat_idx[tri] * MAX_SPECTRAL_BANDS + band`` carries the band record:
+#
+#     0..3 : center_hz, bandwidth_hz, reflectance_mag, transmittance
+#     4..7 : diffuse_frac, emission, reemission, ior_real
+#     8..11: ior_imag, _pad, _pad, _pad
+#
+# The tracer derives the per-band reflectance phase from the complex IOR
+# (``r_F = (1 - n) / (1 + n)``) and multiplies it by ``reflectance_mag``.
+# To reproduce a target complex reflectance ``r = re + j·im`` exactly, set
+# ``n = (1 - r) / (1 + r)`` and ``reflectance_mag = |r|``: the tracer's
+# ``r_F`` then equals ``r`` and the recombined ``r_used = |r| · exp(i·arg r)``
+# matches the input.
+#
+# This helper bakes that transform plus per-tri byte-keyed deduplication so
+# legacy callers that hand us per-tri spectral arrays can hand the new ctor
+# the ``(mat_idx, mat_buf, mat_n_mats)`` triplet it expects.
 
-    This is the spectral-aware replacement for ``build_complex_reflectances``.
-    Each triangle has a full ``spectral_material.Material`` object whose
-    ``SpectralBand`` entries supply Gaussian-lobe reflectance, diffusion,
-    emission, and re-emission curves that are already physically motivated
-    and Kramers–Kronig consistent.
+from material_db import MAX_SPECTRAL_BANDS as _MAX_SPECTRAL_BANDS
+
+_MAT_BUF_BAND_FLOATS = 12
+_MAT_BUF_MAT_FLOATS  = _MAT_BUF_BAND_FLOATS * _MAX_SPECTRAL_BANDS
+
+
+def per_tri_spectral_to_mat_buf(
+        refl_re:            np.ndarray,
+        refl_im:            np.ndarray,
+        diffusion_bands:    np.ndarray,
+        freq_hz:            np.ndarray,
+        *,
+        emission_bands:     Optional[np.ndarray] = None,
+        reemission_bands:   Optional[np.ndarray] = None,
+        transmittance_bands: Optional[np.ndarray] = None,
+        bandwidth_hz:       Optional[np.ndarray] = None,
+        ior_real_bands:     Optional[np.ndarray] = None,
+        ior_imag_bands:     Optional[np.ndarray] = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Pack per-triangle spectral surface data into the unified MatBuf format.
 
     Parameters
     ----------
-    materials : list[Material]  — one Material per triangle (len == n_tri)
-    freq_hz   : (n_bands,) float64
+    refl_re, refl_im     : (N_tri, n_bands) float — complex surface reflectance
+    diffusion_bands      : (N_tri, n_bands) float OR (N_tri,) float
+    freq_hz              : (n_bands,) float
+    emission_bands,
+    reemission_bands,
+    transmittance_bands  : optional (N_tri, n_bands) float, default zeros
+    bandwidth_hz         : optional (n_bands,) float — defaults to adjacent gap
+    ior_real_bands,
+    ior_imag_bands       : optional (N_tri, n_bands) float overrides; when not
+                           supplied the IOR is derived from the target complex
+                           reflectance via ``n = (1 - r) / (1 + r)``.
 
     Returns
     -------
-    refl_re   : (n_tri, n_bands) float64
-    refl_im   : (n_tri, n_bands) float64
-    diffusion : (n_tri, n_bands) float64  — Lambertian fraction per band
-    emission  : (n_tri, n_bands) float64  — self-emission power per band
-    reemission: (n_tri, n_bands) float64  — re-emission coefficient per band
+    mat_idx     : (N_tri,) int32
+    mat_buf     : (N_unique * MAX_SPECTRAL_BANDS, 12) float32
+    mat_n_mats  : int — number of unique materials after byte-deduplication
     """
-    if not _HAS_SPECTRAL_MAT:
-        raise RuntimeError(
-            "spectral_material module is required for build_complex_reflectances_spectral"
-        )
-    return _materials_to_tracer_mat_props(materials, np.asarray(freq_hz, dtype=np.float64))
+    refl_re = np.asarray(refl_re, np.float64)
+    refl_im = np.asarray(refl_im, np.float64)
+    if refl_re.shape != refl_im.shape:
+        raise ValueError("refl_re / refl_im must have identical shape")
+    if refl_re.ndim != 2:
+        raise ValueError("refl_re must be (N_tri, n_bands)")
+    n_tri, n_bands = refl_re.shape
+    if n_bands > _MAX_SPECTRAL_BANDS:
+        raise ValueError(
+            f"n_bands={n_bands} exceeds MAX_SPECTRAL_BANDS={_MAX_SPECTRAL_BANDS}")
+    freq_hz = np.asarray(freq_hz, np.float64).ravel()
+    if freq_hz.size != n_bands:
+        raise ValueError("freq_hz length must equal n_bands")
+
+    # ── Broadcast / default the optional per-band arrays ────────────────────
+    diff = np.asarray(diffusion_bands, np.float64)
+    if diff.ndim == 1:
+        diff = np.tile(diff[:, None], (1, n_bands))
+    if diff.shape != (n_tri, n_bands):
+        raise ValueError("diffusion_bands shape mismatch")
+
+    def _opt(arr, name):
+        if arr is None:
+            return np.zeros((n_tri, n_bands), np.float64)
+        a = np.asarray(arr, np.float64)
+        if a.shape != (n_tri, n_bands):
+            raise ValueError(f"{name} shape mismatch (need {(n_tri, n_bands)})")
+        return a
+
+    emis    = _opt(emission_bands,     "emission_bands")
+    reemis  = _opt(reemission_bands,   "reemission_bands")
+    transm  = _opt(transmittance_bands, "transmittance_bands")
+
+    # Bandwidth: nearest-neighbour spacing, with edges mirrored.
+    if bandwidth_hz is None:
+        if n_bands == 1:
+            bw = np.array([max(1.0, freq_hz[0] * 0.5)], np.float64)
+        else:
+            diffs = np.diff(freq_hz)
+            bw = np.empty(n_bands, np.float64)
+            bw[1:-1] = 0.5 * (np.abs(diffs[:-1]) + np.abs(diffs[1:]))
+            bw[0]    = abs(diffs[0])
+            bw[-1]   = abs(diffs[-1])
+    else:
+        bw = np.asarray(bandwidth_hz, np.float64).ravel()
+        if bw.size != n_bands:
+            raise ValueError("bandwidth_hz length must equal n_bands")
+
+    # ── Reflectance magnitude + Fresnel-consistent IOR per band ─────────────
+    mag = np.hypot(refl_re, refl_im)
+    if ior_real_bands is None or ior_imag_bands is None:
+        r_c = refl_re + 1j * refl_im
+        denom = 1.0 + r_c
+        denom = np.where(np.abs(denom) < 1e-12, 1e-12 + 0j, denom)
+        n_c = (1.0 - r_c) / denom
+        ior_re = np.real(n_c) if ior_real_bands is None else \
+                 np.asarray(ior_real_bands, np.float64)
+        ior_im = np.imag(n_c) if ior_imag_bands is None else \
+                 np.asarray(ior_imag_bands, np.float64)
+    else:
+        ior_re = np.asarray(ior_real_bands, np.float64)
+        ior_im = np.asarray(ior_imag_bands, np.float64)
+    if ior_re.shape != (n_tri, n_bands) or ior_im.shape != (n_tri, n_bands):
+        raise ValueError("ior_*_bands shape mismatch")
+
+    # ── Build the per-tri (MAX_BANDS, 12) record ────────────────────────────
+    rec = np.zeros((n_tri, _MAX_SPECTRAL_BANDS, 12), np.float32)
+    rec[:, :n_bands, 0]  = freq_hz[None, :].astype(np.float32)
+    rec[:, :n_bands, 1]  = bw[None, :].astype(np.float32)
+    rec[:, :n_bands, 2]  = mag.astype(np.float32)
+    rec[:, :n_bands, 3]  = transm.astype(np.float32)
+    rec[:, :n_bands, 4]  = diff.astype(np.float32)
+    rec[:, :n_bands, 5]  = emis.astype(np.float32)
+    rec[:, :n_bands, 6]  = reemis.astype(np.float32)
+    rec[:, :n_bands, 7]  = ior_re.astype(np.float32)
+    rec[:, :n_bands, 8]  = ior_im.astype(np.float32)
+
+    # ── Byte-keyed dedup ────────────────────────────────────────────────────
+    flat = np.ascontiguousarray(rec.reshape(n_tri, -1))   # (N_tri, MAX*12) f32
+    keys = flat.view(np.uint8).reshape(n_tri, -1)
+    seen: dict[bytes, int] = {}
+    mat_idx = np.empty(n_tri, np.int32)
+    unique_rows: list[np.ndarray] = []
+    for i in range(n_tri):
+        kb = keys[i].tobytes()
+        idx = seen.get(kb)
+        if idx is None:
+            idx = len(unique_rows)
+            seen[kb] = idx
+            unique_rows.append(flat[i])
+        mat_idx[i] = idx
+    if unique_rows:
+        mat_buf = np.ascontiguousarray(
+            np.stack(unique_rows, axis=0).reshape(-1, 12), np.float32)
+    else:
+        mat_buf = np.zeros((0, 12), np.float32)
+    return mat_idx, mat_buf, len(unique_rows)
+
+
+def _per_tri_mat_buf_from_legacy(
+        refl_re, refl_im, diffusion_bands, freq_hz,
+        *, emission_bands=None, reemission_bands=None):
+    """Convenience wrapper for the trace_*_scene call sites in this module."""
+    return per_tri_spectral_to_mat_buf(
+        refl_re, refl_im, diffusion_bands, freq_hz,
+        emission_bands=emission_bands,
+        reemission_bands=reemission_bands,
+    )
 
 
 def assign_wall_band_materials(
@@ -1623,7 +1765,7 @@ def trace_cavity_scene(
               or getattr(room, 'spectral_materials', None)
     if _HAS_SPECTRAL_MAT and _spec_mats is not None and len(_spec_mats) == n_tri:
         refl_re, refl_im, diffusion_bands, emission_bands, reemission_bands = \
-            build_complex_reflectances_spectral(_spec_mats, freq_hz)
+            _materials_to_tracer_mat_props(_spec_mats, np.asarray(freq_hz, np.float64))
     else:
         refl_re, refl_im = build_complex_reflectances(mat_props, freq_hz)
         diffusion_bands  = np.tile(mat_props[:, 1:2], (1, n_bands))
@@ -1661,18 +1803,21 @@ def trace_cavity_scene(
     # Pass diffusion as the dominant per-band diffuse fraction (mean across bands
     # for tracers that only accept a 1-D diffusion array; full per-band array
     # is stored in meta for consumers that can use it).
-    diffusion_1d = diffusion_bands.mean(axis=1) if diffusion_bands.ndim == 2 \
-                   else mat_props[:, 1]
+    mat_idx, mat_buf, mat_n_mats = per_tri_spectral_to_mat_buf(
+        refl_re, refl_im, diffusion_bands, freq_hz,
+        emission_bands=emission_bands,
+        reemission_bands=reemission_bands,
+    )
     tracer = _CRayTracer(
-        n_tri     = n_tri,
-        verts     = verts.reshape(n_tri, 9),          # (n_tri, 9) ≡ (n_tri, 3, 3)
-        normals   = normals,
-        refl_re   = refl_re,
-        refl_im   = refl_im,
-        diffusion = diffusion_1d,
-        freq_hz   = freq_hz,
-        speed_m_s = speed_m_s,
-        atmo_abs  = atmo_abs,
+        n_tri      = n_tri,
+        verts      = verts.reshape(n_tri, 9),         # (n_tri, 9) ≡ (n_tri, 3, 3)
+        normals    = normals,
+        mat_idx    = mat_idx,
+        mat_buf    = mat_buf,
+        mat_n_mats = mat_n_mats,
+        freq_hz    = freq_hz,
+        speed_m_s  = speed_m_s,
+        atmo_abs   = atmo_abs,
     )
 
     # Use trace_surface (preferred) if available — returns segs + per-triangle flux.
@@ -2380,16 +2525,19 @@ def integrate_cavity_ir(
     rec_pos_arr = np.array(rec_pos_list, dtype=np.float64)   # (n_rec, 3)
     rec_apr_arr = np.array(rec_apr_list, dtype=np.float64)   # (n_rec,)
 
+    mat_idx, mat_buf, mat_n_mats = per_tri_spectral_to_mat_buf(
+        refl_re, refl_im, mat_props[:, 1], freq_hz,
+    )
     tracer = _CRayTracer(
-        n_tri     = n_tri,
-        verts     = verts.reshape(n_tri, 9),
-        normals   = normals,
-        refl_re   = refl_re,
-        refl_im   = refl_im,
-        diffusion = mat_props[:, 1],
-        freq_hz   = freq_hz,
-        speed_m_s = speed_m_s,
-        atmo_abs  = atmo_abs,
+        n_tri      = n_tri,
+        verts      = verts.reshape(n_tri, 9),
+        normals    = normals,
+        mat_idx    = mat_idx,
+        mat_buf    = mat_buf,
+        mat_n_mats = mat_n_mats,
+        freq_hz    = freq_hz,
+        speed_m_s  = speed_m_s,
+        atmo_abs   = atmo_abs,
     )
 
     ir_re, ir_im = tracer.integrate_ir(
@@ -2509,16 +2657,19 @@ def integrate_cavity_image(
     norms = np.linalg.norm(src_dir, axis=1, keepdims=True)
     src_dir = src_dir / np.where(norms > 1e-9, norms, 1.0)
 
+    mat_idx, mat_buf, mat_n_mats = per_tri_spectral_to_mat_buf(
+        refl_re, refl_im, mat_props[:, 1], freq_hz,
+    )
     tracer = _CRayTracer(
-        n_tri     = n_tri,
-        verts     = verts.reshape(n_tri, 9),
-        normals   = normals,
-        refl_re   = refl_re,
-        refl_im   = refl_im,
-        diffusion = mat_props[:, 1],
-        freq_hz   = freq_hz,
-        speed_m_s = speed_m_s,
-        atmo_abs  = atmo_abs,
+        n_tri      = n_tri,
+        verts      = verts.reshape(n_tri, 9),
+        normals    = normals,
+        mat_idx    = mat_idx,
+        mat_buf    = mat_buf,
+        mat_n_mats = mat_n_mats,
+        freq_hz    = freq_hz,
+        speed_m_s  = speed_m_s,
+        atmo_abs   = atmo_abs,
     )
 
     image = tracer.integrate_image(

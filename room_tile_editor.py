@@ -11,6 +11,8 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import numpy as np
 import pygame
 
+from room_wall_geometry import build_wall_footprints
+
 try:
     from controls import register_triangle_group_action as _register_triangle_group_action
 except Exception:
@@ -52,6 +54,8 @@ _HILITE_FLOOR = (72, 122, 210)
 _HILITE_CEIL = (120, 176, 220)
 _HILITE_WALL = (220, 154, 84)
 _HILITE_MARKER = (120, 228, 172)
+_SCHEMA_WIREFRAME = (76, 255, 116)
+_SCHEMA_WIREFRAME_DIM = (44, 170, 82)
 
 _CELL_SIZE_M = 1.0
 _LEVEL_HEIGHT_M = 1.0
@@ -1430,6 +1434,164 @@ class RoomTileWorkspace:
         surface.blit(overlay, inner.topleft)
         pygame.draw.rect(surface, edge if not selected else _HILITE_MARKER, inner, width, border_radius=3)
 
+    def _draw_wire_rect(self, surface: pygame.Surface, rect: pygame.Rect,
+                        color: Tuple[int, int, int], width: int = 2) -> None:
+        if rect.w <= 1 or rect.h <= 1:
+            return
+        pygame.draw.rect(surface, color, rect, width)
+        tick = max(5, min(rect.w, rect.h) // 5)
+        pygame.draw.line(surface, color, rect.topleft, (rect.left + tick, rect.top), width)
+        pygame.draw.line(surface, color, rect.topleft, (rect.left, rect.top + tick), width)
+        pygame.draw.line(surface, color, (rect.right - 1, rect.top), (rect.right - 1 - tick, rect.top), width)
+        pygame.draw.line(surface, color, (rect.right - 1, rect.top), (rect.right - 1, rect.top + tick), width)
+        pygame.draw.line(surface, color, (rect.left, rect.bottom - 1), (rect.left + tick, rect.bottom - 1), width)
+        pygame.draw.line(surface, color, (rect.left, rect.bottom - 1), (rect.left, rect.bottom - 1 - tick), width)
+        pygame.draw.line(surface, color, (rect.right - 1, rect.bottom - 1), (rect.right - 1 - tick, rect.bottom - 1), width)
+        pygame.draw.line(surface, color, (rect.right - 1, rect.bottom - 1), (rect.right - 1, rect.bottom - 1 - tick), width)
+
+    def _draw_schema_wireframes_plan(
+        self,
+        surface: pygame.Surface,
+        left: int,
+        top: int,
+        cell_size: int,
+        level: int,
+        selected_id: str = "",
+    ) -> None:
+        """Draw tile-schema membership bounds over the plan grid."""
+        if cell_size <= 0:
+            return
+        scale = float(cell_size) / float(_CELL_SIZE_M)
+
+        def to_rect(x0: float, y0: float, x1: float, y1: float) -> pygame.Rect:
+            rx0 = int(round(left + x0 * scale))
+            ry0 = int(round(top + y0 * scale))
+            rx1 = int(round(left + x1 * scale))
+            ry1 = int(round(top + y1 * scale))
+            return pygame.Rect(min(rx0, rx1), min(ry0, ry1), max(2, abs(rx1 - rx0)), max(2, abs(ry1 - ry0)))
+
+        for instance in self.instances:
+            preset = self.presets.get(instance.preset_id)
+            if preset is None:
+                continue
+            if not (instance.level <= int(level) < instance.level + preset.level_span):
+                continue
+            built = bool(self._fabrication_state(instance, preset).get("fully_built", False))
+            color = _SCHEMA_WIREFRAME_DIM if built and instance.instance_id != selected_id else _SCHEMA_WIREFRAME
+            x0 = float(instance.grid_x) * _CELL_SIZE_M
+            y0 = float(instance.grid_y) * _CELL_SIZE_M
+            x1 = x0 + float(preset.footprint_xy[0]) * _CELL_SIZE_M
+            y1 = y0 + float(preset.footprint_xy[1]) * _CELL_SIZE_M
+            self._draw_wire_rect(surface, to_rect(x0, y0, x1, y1), color, 2)
+
+            for item in self._items_for_instance(instance, preset):
+                if not self._item_intersects_level(instance, item, int(level)):
+                    continue
+                half = np.asarray(item.bbox_size[:2], dtype=np.float64) * 0.5
+                cx = x0 + float(item.pos_xy[0])
+                cy = y0 + float(item.pos_xy[1])
+                self._draw_wire_rect(
+                    surface,
+                    to_rect(cx - half[0], cy - half[1], cx + half[0], cy + half[1]),
+                    color,
+                    1,
+                )
+
+        if int(level) == 0:
+            sp = self._station_preset()
+            if sp is not None:
+                sx = float(self.state.get("room_station_x", 0)) * _CELL_SIZE_M
+                sy = float(self.state.get("room_station_y", 0)) * _CELL_SIZE_M
+                self._draw_wire_rect(
+                    surface,
+                    to_rect(sx, sy, sx + sp.footprint_xy[0] * _CELL_SIZE_M, sy + sp.footprint_xy[1] * _CELL_SIZE_M),
+                    _SCHEMA_WIREFRAME,
+                    2,
+                )
+
+        for obj in getattr(self, "scene_tile_objects", []) or []:
+            if int(obj.get("level", 0)) != int(level):
+                continue
+            gx = float(obj.get("grid_x", 0)) * _CELL_SIZE_M
+            gy = float(obj.get("grid_y", 0)) * _CELL_SIZE_M
+            fw, fd = obj.get("footprint_xy", (1, 1))
+            self._draw_wire_rect(
+                surface,
+                to_rect(gx, gy, gx + int(fw) * _CELL_SIZE_M, gy + int(fd) * _CELL_SIZE_M),
+                _SCHEMA_WIREFRAME_DIM,
+                1,
+            )
+
+    def _draw_wall_wireframes_plan(
+        self,
+        surface: pygame.Surface,
+        left: int,
+        top: int,
+        cell_size: int,
+        level: int,
+    ) -> None:
+        if int(level) != 0 or cell_size <= 0:
+            return
+        room_width = max(2, int(self.state.get("room_width_cells", 8)))
+        room_depth = max(2, int(self.state.get("room_depth_cells", 8)))
+        floor_type_raw = self.state.get("floor_type", "rect")
+        floor_names = ("rect", "polar", "polar_rect", "arc")
+        try:
+            floor_type = floor_names[int(floor_type_raw)]
+        except Exception:
+            floor_type = str(floor_type_raw)
+        floor_plan = {
+            "floor_type": floor_type,
+            "width": room_width,
+            "height": room_depth,
+            "floor_radius": float(self.state.get("floor_radius", max(room_width, room_depth) * 0.5) or 1.0),
+            "radial_segments": int(self.state.get("floor_radial_segments", max(1, math.ceil(float(self.state.get("floor_radius", 8.0) or 8.0)))) or 1),
+            "angular_segments": int(self.state.get("floor_angular_segments", 24) or 24),
+        }
+        footprints = build_wall_footprints(floor_plan, self.state, None)
+        if not footprints:
+            return
+
+        total_w = room_width * cell_size
+        total_h = room_depth * cell_size
+        radius = max(1e-6, float(floor_plan["floor_radius"]))
+        radial_scale = min(total_w, total_h) / (2.0 * radius)
+        cx_px = left + total_w * 0.5
+        cy_px = top + total_h * 0.5
+
+        def rect_pt(pt: tuple[float, float]) -> tuple[int, int]:
+            return (int(round(left + pt[0] * cell_size)), int(round(top + pt[1] * cell_size)))
+
+        def radial_pt(pt: tuple[float, float]) -> tuple[int, int]:
+            return (int(round(cx_px + pt[0] * radial_scale)), int(round(cy_px + pt[1] * radial_scale)))
+
+        use_radial = floor_type in ("polar", "polar_rect", "arc")
+        to_pt = radial_pt if use_radial else rect_pt
+        color = _SCHEMA_WIREFRAME
+        dim = _SCHEMA_WIREFRAME_DIM
+
+        for fp in footprints:
+            polygon = fp.get("polygon")
+            if isinstance(polygon, list) and len(polygon) >= 3:
+                pts = [to_pt((float(p[0]), float(p[1]))) for p in polygon if isinstance(p, (list, tuple)) and len(p) >= 2]
+                if len(pts) >= 3:
+                    pygame.draw.lines(surface, dim, True, pts, 2)
+                continue
+
+            polyline = fp.get("polyline")
+            if isinstance(polyline, list) and len(polyline) >= 2:
+                pts = [to_pt((float(p[0]), float(p[1]))) for p in polyline if isinstance(p, (list, tuple)) and len(p) >= 2]
+                if len(pts) >= 2:
+                    pygame.draw.lines(surface, color, False, pts, 2)
+                continue
+
+            center = fp.get("center")
+            r = float(fp.get("radius", 0.0) or 0.0)
+            if isinstance(center, (list, tuple)) and len(center) >= 2 and r > 0.0:
+                cpt = to_pt((float(center[0]), float(center[1])))
+                rr = max(2, int(round(r * (radial_scale if use_radial else cell_size))))
+                pygame.draw.circle(surface, color, cpt, rr, 2)
+
     @staticmethod
     def _status_requires_projection(status: str) -> bool:
         return str(status) in {"dual", "quad", "collision"}
@@ -2381,6 +2543,21 @@ class RoomTileWorkspace:
                     rect = pygame.Rect(left + sx * cell_size, top + sy * cell_size, cell_size, cell_size)
                     pygame.draw.rect(surface, _HILITE_MARKER, rect.inflate(-cell_size // 3, -cell_size // 3), 2, border_radius=2)
                     pygame.draw.line(surface, _HILITE_MARKER, rect.bottomleft, rect.bottomright, 3)
+            self._draw_schema_wireframes_plan(
+                surface,
+                left,
+                top,
+                cell_size,
+                int(self.state.get("room_level", 0)),
+                selected_id=selected_id,
+            )
+            self._draw_wall_wireframes_plan(
+                surface,
+                left,
+                top,
+                cell_size,
+                int(self.state.get("room_level", 0)),
+            )
         else:
             columns = room_width if view_name == "front" else room_depth
             levels = self._projection_levels()
@@ -2672,7 +2849,10 @@ class RoomTileWorkspace:
                     base_y + 0.5 * preset.footprint_xy[1] * _CELL_SIZE_M,
                     step,
                 )
-            vertices_built.extend(instance_vertices)
+            if preset.category == "duty_stations" and not bool(self._fabrication_state(instance, preset).get("fully_built", False)):
+                vertices_plan.extend(instance_vertices)
+            else:
+                vertices_built.extend(instance_vertices)
 
         vertices_built.extend(self._build_station_network_vertices(station_nodes))
         return vertices_plan, vertices_built
@@ -2736,7 +2916,10 @@ class RoomTileWorkspace:
             step = int(getattr(item, "yaw_step", 0)) % _ROT_STEPS
             if step:
                 box_verts = self._rotate_instance_vertices(box_verts, cx, cy, step)
-            verts_built.extend(box_verts)
+            if is_fully_built:
+                verts_built.extend(box_verts)
+            else:
+                verts_plan.extend(box_verts)
 
         inst_step = int(getattr(instance, "rotation", 0)) % _ROT_STEPS
         if inst_step:

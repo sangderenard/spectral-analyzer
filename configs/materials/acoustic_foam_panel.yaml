@@ -1,0 +1,65 @@
+# Material: acoustic_foam_panel
+# Open-cell melamine foam panel, charcoal dye, high acoustic absorption.
+
+name: acoustic_foam_panel
+description: Charcoal open-cell melamine foam panel with very high acoustic absorption
+
+color_profile_name: acoustic_foam_panel
+surface_profile: foam_block
+reflectivity: 0.08
+diffusion: 0.90
+absorption: 0.88
+
+smoothness: 0.04
+ior: 1.05
+opacity: 1.0
+
+pbr:
+  albedo: [0.18, 0.16, 0.15]
+  roughness: 0.95
+  metallic: 0.0
+  transmission: 0.0
+  emission_rgb: [0.0, 0.0, 0.0]
+
+enamel:
+  thickness_m: 0.0
+  ior_real: 1.05
+  ior_imag: 0.04
+  color_rgb: [0.18, 0.16, 0.15]
+  roughness: 0.95
+
+spectral_bands:
+  - center_hz: 428274940000000.0
+    bandwidth_hz: 34261995000000.0
+    reflectance: 0.09
+    transmittance: 0.0
+    diffuse_frac: 0.95
+    ior_real: 1.05
+    ior_imag: 0.04
+  - center_hz: 545077196000000.0
+    bandwidth_hz: 40880790000000.0
+    reflectance: 0.07
+    transmittance: 0.0
+    diffuse_frac: 0.95
+    ior_real: 1.05
+    ior_imag: 0.04
+  - center_hz: 666205462000000.0
+    bandwidth_hz: 43303355000000.0
+    reflectance: 0.06
+    transmittance: 0.0
+    diffuse_frac: 0.96
+    ior_real: 1.05
+    ior_imag: 0.04
+
+gameplay:
+  label: Acoustic Foam Panel
+  category: wall_finish
+  tier: finished
+  role: acoustic_treatment_wall
+
+notes: >
+  Open-cell melamine foam treated with charcoal black dye.  The near-unity
+  diffuse fraction and very low reflectance model the deep-absorption wedge
+  behaviour of professional acoustic panels.  Imaginary IOR component
+  represents the dielectric loss in the foam matrix.  Primary use: dead-room
+  or recording-booth wall treatment option on the room terminal.

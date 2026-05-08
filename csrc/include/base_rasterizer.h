@@ -175,6 +175,7 @@ void br_set_lights(BaseRasterizerState* st,
 #define BR_DIRTY_GEOM 1
 #define BR_DIRTY_MV   2
 #define BR_DIRTY_EMIT 4
+#define BR_GROUP_CULL_IMMUNE 8
 
 typedef struct BRGroup {
     int   group_id;        /* host-stable identity                          */
@@ -194,6 +195,8 @@ void br_set_groups(BaseRasterizerState* st,
 void br_set_max_lights(BaseRasterizerState* st, int max_lights);
 void br_set_specular_enabled(BaseRasterizerState* st, int enabled);
 void br_set_emission_direct_enabled(BaseRasterizerState* st, int enabled);
+void br_set_light_calibration(BaseRasterizerState* st, float factor);
+void br_set_cat_ccm_matrix(BaseRasterizerState* st, const float* m3x3_row_major);
 
 /* ── Render ──────────────────────────────────────────────────────────────── */
 
@@ -222,7 +225,7 @@ void br_render_textured(BaseRasterizerState* st,
 /* ── Readback ────────────────────────────────────────────────────────────── */
 
 /* Copy the colour buffer to out_rgba (height * width * 4 uint8, RGBA).
-   Applies sRGB gamma correction. */
+   Linear clamp/quantize, no transfer function conversion. */
 void br_readback_u8(const BaseRasterizerState* st, uint8_t* out_rgba);
 
 /* Raw linear float readback (height * width * 4 float32, RGBA [0,1]).
@@ -233,6 +236,21 @@ void br_readback_f32(const BaseRasterizerState* st, float* out_rgba);
    Layout is tightly packed [height][width][4] in row-major order.
    Pointer is valid until the rasterizer is destroyed or resized. */
 const float* br_readback_f32_ptr(const BaseRasterizerState* st);
+
+/* Derived emissive-light stats from the most recent render call.
+    Arrays are packed tightly as:
+       positions: (N,3) float32 view-space
+       colors:    (N,3) float32 linear RGB
+       intens:    (N,)  float32 (area-weighted intensity)
+       group_ids: (N,)  int32
+    Caller may pass null pointers for outputs it does not need. */
+int  br_light_count(const BaseRasterizerState* st);
+void br_readback_lights(const BaseRasterizerState* st,
+                                    float* positions,
+                                    float* colors,
+                                    float* intens,
+                                    int* group_ids,
+                                    int max_lights);
 
 /* Query dimensions. */
 int br_width (const BaseRasterizerState* st);

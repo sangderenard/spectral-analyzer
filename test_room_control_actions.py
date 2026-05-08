@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import math
 import numpy as np
 import pygame
-from controls import get_action_registry
+from controls import get_action_registry, get_control_graph
 
 # ---------------------------------------------------------------------------
 # Module-level helpers under test
@@ -34,6 +34,7 @@ from room_control_station import (
     _CELL_EMPTY,
     _make_polar_tile_cells,
 )
+from room_wall_geometry import build_wall_footprints, wall_occlusion_cells, wall_occlusion_voxels
 
 pygame.init()
 pygame.display.set_mode((1, 1), pygame.NOFRAME)   # minimal surface for Event
@@ -318,8 +319,134 @@ def test_apply_floor_action_publishes_to_scene_workspace_room_cfg():
     assert scene_ws.room_cfg["applied_floor_revision"] == 1
     assert scene_ws.room_cfg["applied_floor_meshes"]["floor_tiles"].shape == (8, 3, 3)
     assert scene_ws.room_cfg["applied_floor_material_slots"]["floor_tiles"] == "pearl_white_tile"
-    assert scene_ws.room_cfg["applied_floor_material_slots"]["floor_fill"] == "painted_concrete"
+    assert scene_ws.room_cfg["applied_floor_material_slots"]["floor_fill"] == "concrete_wall"
+    assert isinstance(scene_ws.room_cfg["applied_floor_material_ids"]["floor_tiles"], int)
+    assert isinstance(scene_ws.room_cfg["applied_floor_material_ids"]["floor_fill"], int)
+    assert scene_ws.room_cfg["applied_room_width_m"] == 2.0, scene_ws.room_cfg.get("applied_room_width_m")
+    assert scene_ws.room_cfg["applied_room_depth_m"] == 2.0, scene_ws.room_cfg.get("applied_room_depth_m")
     print("PASS test_apply_floor_action_publishes_to_scene_workspace_room_cfg")
+
+
+def test_apply_floor_publishes_scene_geometry_owner_buffer():
+    st = _make_station()
+    st.state["floor_type"] = "rect"
+    st.state["room_width_cells"] = 2
+    st.state["room_depth_cells"] = 2
+
+    class _SceneWorkspace:
+        def __init__(self):
+            self.room_cfg = {}
+
+    st.bind_scene_workspace(_SceneWorkspace())
+    st.apply_floor_triangulation()
+    payload = get_control_graph().snapshot_latest_targets().get("scene.geometry/room_station")
+
+    assert isinstance(payload, dict), "apply floor must publish floor geometry into owner flip buffer"
+    assert payload.get("kind") == "triangles"
+    assert np.asarray(payload.get("triangles")).shape[1:] == (3, 3)
+    assert np.asarray(payload.get("mat_ids")).shape[0] == np.asarray(payload.get("triangles")).shape[0]
+    print("PASS test_apply_floor_publishes_scene_geometry_owner_buffer")
+
+
+def test_surface_material_apply_republishes_existing_room_geometry():
+    st = _make_station()
+    st.state["floor_type"] = "rect"
+    st.state["room_width_cells"] = 2
+    st.state["room_depth_cells"] = 2
+
+    class _SceneWorkspace:
+        def __init__(self):
+            self.room_cfg = {}
+
+    scene_ws = _SceneWorkspace()
+    st.bind_scene_workspace(scene_ws)
+    st.build_room_geometry()
+    before = int(scene_ws.room_cfg["applied_floor_revision"])
+    st.state["floor_material"] = "stage_floor"
+    st.state["wall_material_interior"] = "construction_glass"
+    st.state["ceiling_material"] = "concrete_wall"
+    st.apply_surface_materials()
+    payload = get_control_graph().snapshot_latest_targets().get("scene.geometry/room_station")
+
+    assert scene_ws.room_cfg["applied_floor_revision"] == before + 1
+    assert scene_ws.room_cfg["applied_floor_material_slots"]["floor_tiles"] == "stage_floor"
+    assert scene_ws.room_cfg["applied_floor_material_slots"]["floor_fill"] == "concrete_wall"
+    assert scene_ws.room_cfg["applied_room_material_slots"]["walls"] == "construction_glass"
+    assert scene_ws.room_cfg["applied_room_material_slots"]["ceiling"] == "concrete_wall"
+    assert isinstance(scene_ws.room_cfg["applied_floor_material_ids"]["floor_tiles"], int)
+    assert isinstance(scene_ws.room_cfg["applied_room_material_ids"]["walls"], int)
+    assert isinstance(scene_ws.room_cfg["applied_room_material_ids"]["ceiling"], int)
+    assert isinstance(payload, dict), "material apply must republish existing room geometry"
+    assert np.asarray(payload.get("triangles")).shape[1:] == (3, 3)
+    print("PASS test_surface_material_apply_republishes_existing_room_geometry")
+
+
+def test_build_walls_action_publishes_walls_and_implicit_ceiling():
+    st = _make_station()
+    st.state["floor_type"] = "rect"
+    st.state["room_width_cells"] = 3
+    st.state["room_depth_cells"] = 2
+
+    class _SceneWorkspace:
+        def __init__(self):
+            self.room_cfg = {}
+
+    scene_ws = _SceneWorkspace()
+    st.bind_scene_workspace(scene_ws)
+    meshes = st.build_walls_and_ceiling()
+
+    assert "applied_room_meshes" in scene_ws.room_cfg
+    assert scene_ws.room_cfg["applied_floor_revision"] == 1
+    assert meshes["walls"].shape[0] > 0
+    assert meshes["ceiling"].shape[0] == 3 * 2 * 2
+    assert "applied_wall_occlusion_voxels" in scene_ws.room_cfg
+    assert st.state["room_ceiling_implicit"] is True
+    print("PASS test_build_walls_action_publishes_walls_and_implicit_ceiling")
+
+
+def test_build_room_action_publishes_floor_walls_and_ceiling():
+    st = _make_station()
+    st.state["floor_type"] = "rect"
+    st.state["room_width_cells"] = 2
+    st.state["room_depth_cells"] = 2
+
+    class _SceneWorkspace:
+        def __init__(self):
+            self.room_cfg = {}
+
+    scene_ws = _SceneWorkspace()
+    st.bind_scene_workspace(scene_ws)
+    meshes = st.build_room_geometry()
+
+    assert "applied_floor_meshes" in scene_ws.room_cfg
+    assert "applied_room_meshes" in scene_ws.room_cfg
+    assert scene_ws.room_cfg["applied_floor_meshes"]["floor_tiles"].shape == (8, 3, 3)
+    assert scene_ws.room_cfg["applied_room_meshes"]["walls"].shape[0] > 0
+    assert scene_ws.room_cfg["applied_room_meshes"]["ceiling"].shape == (8, 3, 3)
+    assert "applied_wall_occlusion_voxels" in scene_ws.room_cfg
+    assert meshes["floor"]["material_slots"]["floor_tiles"] == "pearl_white_tile"
+    print("PASS test_build_room_action_publishes_floor_walls_and_ceiling")
+
+
+def test_build_room_publishes_scene_geometry_owner_buffer():
+    st = _make_station()
+    st.state["floor_type"] = "rect"
+    st.state["room_width_cells"] = 2
+    st.state["room_depth_cells"] = 2
+
+    class _SceneWorkspace:
+        def __init__(self):
+            self.room_cfg = {}
+
+    st.bind_scene_workspace(_SceneWorkspace())
+    st.build_room_geometry()
+    payload = get_control_graph().snapshot_latest_targets().get("scene.geometry/room_station")
+
+    assert isinstance(payload, dict), "build room must publish room geometry into owner flip buffer"
+    assert payload.get("kind") == "triangles"
+    assert np.asarray(payload.get("triangles")).shape[1:] == (3, 3)
+    assert np.asarray(payload.get("mat_ids")).shape[0] == np.asarray(payload.get("triangles")).shape[0]
+    print("PASS test_build_room_publishes_scene_geometry_owner_buffer")
 
 
 def test_polar_tile_inner_corners_match_ray_points_exactly():
@@ -584,6 +711,43 @@ def test_hull_spherical_ne_corner():
     print("PASS test_hull_spherical_ne_corner")
 
 
+def test_wall_footprints_report_hull_occlusion_cells():
+    state = {
+        "hull_n_type": 1,
+        "hull_n_amount": 2.0,
+        "hull_ne_type": 1,
+        "hull_ne_radius": 2.5,
+    }
+    plan = build_floor_plan("rect", 8, 8, state)
+    result = apply_hull_deformation(plan["mask"], state)
+    footprints = build_wall_footprints(plan, state, result)
+    cells = wall_occlusion_cells(footprints)
+    voxels = wall_occlusion_voxels(footprints)
+
+    assert (4, 7) in cells, "north cylindrical wall clip must be exposed as wall occlusion"
+    assert (7, 7) in cells, "spherical corner clip must be exposed as wall occlusion"
+    assert (4, 7, 0) in voxels and (4, 7, 2) in voxels, "wall occlusion must expose vertical voxel levels"
+    assert any(fp.get("kind") == "spherical_corner_wall" for fp in footprints)
+    assert all(fp.get("coordinate_space") == "room_plan_meters" for fp in footprints)
+    print("PASS test_wall_footprints_report_hull_occlusion_cells")
+
+
+def test_polar_rect_wall_footprints_use_existing_rays():
+    state = {
+        "floor_radius": 4.0,
+        "floor_radial_segments": 4,
+        "floor_angular_segments": 12,
+        "floor_polar_rays": 18,
+    }
+    plan = build_floor_plan("polar_rect", 8, 8, state)
+    footprints = build_wall_footprints(plan, state, None)
+    chords = [fp for fp in footprints if fp.get("kind") == "straight_chord_wall"]
+
+    assert len(chords) == 18, "polar_rect wall chord overlay must follow floor_polar_rays"
+    assert plan["width"] == 12 and plan["height"] == 4, "wall derivation must not change polar_rect floor plan"
+    print("PASS test_polar_rect_wall_footprints_use_existing_rays")
+
+
 def test_hull_flat_does_not_clip():
     mask = np.ones((6, 6), dtype=np.int8)
     state = {
@@ -695,6 +859,11 @@ if __name__ == "__main__":
         test_doc_grid_cell_click_dispatches_to_workspace,
         test_apply_floor_action_deploys_material_split_triangulation,
         test_apply_floor_action_publishes_to_scene_workspace_room_cfg,
+        test_apply_floor_publishes_scene_geometry_owner_buffer,
+        test_surface_material_apply_republishes_existing_room_geometry,
+        test_build_walls_action_publishes_walls_and_implicit_ceiling,
+        test_build_room_action_publishes_floor_walls_and_ceiling,
+        test_build_room_publishes_scene_geometry_owner_buffer,
         test_polar_tile_inner_corners_match_ray_points_exactly,
         test_polar_tiles_keep_constant_square_side_length,
         test_polar_center_reclaims_flat_edge_tiles_inside_first_ring,
@@ -706,6 +875,8 @@ if __name__ == "__main__":
         test_polar_rect_packed_cells_receive_world_occlusion_state,
         test_hull_cylindrical_north_edge,
         test_hull_spherical_ne_corner,
+        test_wall_footprints_report_hull_occlusion_cells,
+        test_polar_rect_wall_footprints_use_existing_rays,
         test_hull_flat_does_not_clip,
         test_grid_panel_uses_floor_mask,
         test_envelope_meshes_rect,

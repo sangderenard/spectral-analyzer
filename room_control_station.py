@@ -52,8 +52,10 @@ from controls import (
     choice_knob,
     enqueue_action,
     get_action_registry,
+    publish_owner_target,
     readonly_knob,
     stepper_knob,
+    toggle_knob,
 )
 from bass_viewer import ScrollableSubpanelList, ModularSubpanelSpec
 from room_tile_editor import (
@@ -62,6 +64,8 @@ from room_tile_editor import (
     RoomTileWorkspace,
     load_room_tile_presets,
 )
+from room_wall_geometry import build_wall_footprints, wall_occlusion_cells, wall_occlusion_voxels
+from material_db import EmissionProfileDatabase, MaterialDatabase
 
 try:
     import yaml as _yaml
@@ -126,6 +130,93 @@ def _load_yaml(path: str) -> dict:
         raise RuntimeError("PyYAML is required")
     with open(path, "r", encoding="utf-8") as fh:
         return _yaml.safe_load(fh) or {}
+
+
+def _material_flags_float(*, emissive: bool, reactive: bool) -> float:
+    flags = np.uint32(0)
+    if emissive:
+        flags |= np.uint32(1)  # MAT_FLAG_EMISSIVE
+    if reactive:
+        flags |= np.uint32(2)  # MAT_FLAG_REACTIVE
+    return float(np.frombuffer(np.array([flags], np.uint32).tobytes(), np.float32)[0])
+
+
+def _profile_index(name: object, fallback: object = -1) -> int:
+    if name is not None:
+        try:
+            ep_db = EmissionProfileDatabase.instance()
+            if str(name) not in ep_db:
+                try:
+                    import spectral_library
+                    spectral_library.load_default_library()
+                    ep_db = EmissionProfileDatabase.instance()
+                except Exception:
+                    pass
+            if str(name) in ep_db:
+                return int(ep_db.index_of(str(name)))
+        except Exception:
+            return -1
+        return -1
+    try:
+        return int(fallback)
+    except Exception:
+        return -1
+
+
+def _register_material_yaml_if_available(name: object) -> bool:
+    """Cold-path YAML registration for room HUD materials before ID lookup."""
+    mat_name = str(name)
+    if not mat_name:
+        return False
+    db = MaterialDatabase.instance()
+    if mat_name in db:
+        return True
+    if not _HAS_YAML:
+        return False
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "configs",
+        "materials",
+        f"{mat_name}.yaml",
+    )
+    if not os.path.exists(path):
+        return False
+    try:
+        d = _load_yaml(path)
+        alb = d.get("albedo_rgb", [0.5, 0.5, 0.5])
+        emit_idx = _profile_index(d.get("emit_profile_name"), d.get("emit_profile_idx", -1))
+        remit_idx = _profile_index(d.get("remit_profile_name"), d.get("remit_profile_idx", -1))
+        color_idx = _profile_index(d.get("color_profile_name"), d.get("color_profile_idx", -1))
+        react = float(d.get("reactive_shift_hz", 0.0) or 0.0)
+        arr = np.zeros(16, np.float32)
+        arr[:11] = [
+            float(d.get("reflectivity", 0.5)),
+            float(d.get("diffusion", 0.0)),
+            float(d.get("absorption", 0.0)),
+            float(d.get("reflectivity", 0.5)),
+            float(d.get("diffusion", 0.0)),
+            float(d.get("absorption", 0.0)),
+            float(alb[0]),
+            float(alb[1]),
+            float(alb[2]),
+            float(d.get("ior", 1.5)),
+            float(d.get("opacity", 1.0)),
+        ]
+        arr[11] = _material_flags_float(emissive=emit_idx >= 0, reactive=react != 0.0)
+        arr[12] = float(emit_idx)
+        arr[13] = float(remit_idx)
+        arr[14] = float(color_idx)
+        arr[15] = react
+        db.register_from_mat16(mat_name, arr)
+        if isinstance(d.get("texture_stack"), dict):
+            rec = db._materials.get(mat_name)  # type: ignore[attr-defined]
+            if isinstance(rec, dict):
+                rec["texture_stack"] = dict(d["texture_stack"])
+                db._dirty = True  # type: ignore[attr-defined]
+        return True
+    except Exception as exc:
+        print(f"[room_control] material load failed {mat_name}: {exc}", flush=True)
+        return False
 
 
 def _compile(vs: str, fs: str) -> int:
@@ -878,6 +969,263 @@ def apply_hull_deformation(mask: np.ndarray, state: dict) -> np.ndarray:
     return result
 
 
+def _filtered_triangle_array(tris: list, *, eps: float = 1e-9) -> np.ndarray:
+    if not tris:
+        return np.zeros((0, 3, 3), np.float64)
+    arr = np.asarray(tris, dtype=np.float64).reshape(-1, 3, 3)
+    area2 = np.linalg.norm(np.cross(arr[:, 1] - arr[:, 0], arr[:, 2] - arr[:, 0]), axis=1)
+    return arr[area2 > eps]
+
+
+def _polygon_key(a: tuple[float, float], b: tuple[float, float],
+                 *, scale: float = 1.0e7) -> tuple[tuple[int, int], tuple[int, int]]:
+    ka = (int(round(float(a[0]) * scale)), int(round(float(a[1]) * scale)))
+    kb = (int(round(float(b[0]) * scale)), int(round(float(b[1]) * scale)))
+    return (ka, kb) if ka <= kb else (kb, ka)
+
+
+def _clean_polygon(points: Any, *, eps: float = 1e-8) -> list[tuple[float, float]]:
+    out: list[tuple[float, float]] = []
+    if isinstance(points, list):
+        for raw_pt in points:
+            if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
+                pt = (float(raw_pt[0]), float(raw_pt[1]))
+                if not out or math.hypot(pt[0] - out[-1][0], pt[1] - out[-1][1]) > eps:
+                    out.append(pt)
+    if len(out) > 1 and math.hypot(out[0][0] - out[-1][0], out[0][1] - out[-1][1]) <= eps:
+        out.pop()
+    return out
+
+
+def _polygon_area(poly: list[tuple[float, float]]) -> float:
+    if len(poly) < 3:
+        return 0.0
+    return 0.5 * sum(
+        poly[i][0] * poly[(i + 1) % len(poly)][1]
+        - poly[(i + 1) % len(poly)][0] * poly[i][1]
+        for i in range(len(poly))
+    )
+
+
+def _point_in_convex_polygon(pt: tuple[float, float],
+                             poly: list[tuple[float, float]],
+                             *, eps: float = 1e-7) -> bool:
+    if len(poly) < 3:
+        return False
+    sign = 1.0 if _polygon_area(poly) >= 0.0 else -1.0
+    x, y = pt
+    for i, a in enumerate(poly):
+        b = poly[(i + 1) % len(poly)]
+        cross = (b[0] - a[0]) * (y - a[1]) - (b[1] - a[1]) * (x - a[0])
+        if sign * cross < -eps:
+            return False
+    return True
+
+
+def _triangulate_polygon(poly: list[tuple[float, float]], z: float = 0.0) -> list:
+    if len(poly) < 3 or abs(_polygon_area(poly)) <= 1e-10:
+        return []
+    out = []
+    p0 = poly[0]
+    for i in range(1, len(poly) - 1):
+        p1, p2 = poly[i], poly[i + 1]
+        out.append([[p0[0], p0[1], z], [p1[0], p1[1], z], [p2[0], p2[1], z]])
+    return _filtered_triangle_array(out).tolist()
+
+
+def _triangulate_polygon_array(poly: list[tuple[float, float]], z: float = 0.0) -> np.ndarray:
+    return _filtered_triangle_array(_triangulate_polygon(poly, z))
+
+
+def _inset_polygon(poly: list[tuple[float, float]], inset: float) -> list[tuple[float, float]]:
+    if inset <= 0.0 or len(poly) < 3:
+        return list(poly)
+    cx = sum(p[0] for p in poly) / float(len(poly))
+    cy = sum(p[1] for p in poly) / float(len(poly))
+    out: list[tuple[float, float]] = []
+    for x, y in poly:
+        vx, vy = x - cx, y - cy
+        dist = math.hypot(vx, vy)
+        if dist <= 1e-9:
+            out.append((x, y))
+            continue
+        scale = max(0.0, (dist - inset) / dist)
+        out.append((cx + vx * scale, cy + vy * scale))
+    if abs(_polygon_area(out)) <= 1e-10:
+        return list(poly)
+    return out
+
+
+def _segments_intersect(a: tuple[float, float], b: tuple[float, float],
+                        c: tuple[float, float], d: tuple[float, float],
+                        *, eps: float = 1e-9) -> bool:
+    def orient(p, q, r) -> float:
+        return (q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])
+
+    def on_seg(p, q, r) -> bool:
+        return (min(p[0], r[0]) - eps <= q[0] <= max(p[0], r[0]) + eps
+                and min(p[1], r[1]) - eps <= q[1] <= max(p[1], r[1]) + eps
+                and abs(orient(p, q, r)) <= eps)
+
+    o1 = orient(a, b, c)
+    o2 = orient(a, b, d)
+    o3 = orient(c, d, a)
+    o4 = orient(c, d, b)
+    if o1 * o2 < -eps and o3 * o4 < -eps:
+        return True
+    return (
+        on_seg(a, c, b) or on_seg(a, d, b)
+        or on_seg(c, a, d) or on_seg(c, b, d)
+    )
+
+
+def _triangle_touches_polygon_interior(tri: np.ndarray,
+                                       poly: list[tuple[float, float]]) -> bool:
+    pts = [(float(tri[i, 0]), float(tri[i, 1])) for i in range(3)]
+    centroid = (
+        sum(p[0] for p in pts) / 3.0,
+        sum(p[1] for p in pts) / 3.0,
+    )
+    if _point_in_convex_polygon(centroid, poly):
+        return True
+    if any(_point_in_convex_polygon(p, poly, eps=-1e-9) for p in pts):
+        return True
+    for i, a in enumerate(pts):
+        b = pts[(i + 1) % 3]
+        for j, c in enumerate(poly):
+            d = poly[(j + 1) % len(poly)]
+            if _segments_intersect(a, b, c, d):
+                return True
+    return False
+
+
+def _radial_floor_type(floor_plan: Optional[dict]) -> str:
+    ft = str((floor_plan or {}).get("floor_type", ""))
+    return ft if ft in ("polar", "polar_rect", "arc") else ""
+
+
+def _radial_domain_polygon(floor_plan: dict, *, cell_size_m: float = 1.0) -> list[tuple[float, float]]:
+    cs = float(cell_size_m)
+    ft = str(floor_plan.get("floor_type", ""))
+    radius = max(0.0, float(floor_plan.get("floor_radius", 0.0) or 0.0)) * cs
+    if radius <= 1e-9:
+        return []
+
+    if ft == "polar_rect":
+        n = max(8, int(floor_plan.get("angular_segments", 24) or 24))
+        return [
+            (radius * math.cos(2.0 * math.pi * i / n),
+             radius * math.sin(2.0 * math.pi * i / n))
+            for i in range(n)
+        ]
+
+    if ft == "polar":
+        ring_segments = floor_plan.get("ring_segments", [])
+        n = max(8, max((int(v) for v in ring_segments if int(v) > 0), default=24))
+        return [
+            (radius * math.cos(2.0 * math.pi * i / n),
+             radius * math.sin(2.0 * math.pi * i / n))
+            for i in range(n)
+        ]
+
+    if ft == "arc":
+        span = float(np.clip(floor_plan.get("arc_span", 1.0) or 1.0, 0.0, 1.0))
+        if span >= 0.999:
+            ring_segments = floor_plan.get("ring_segments", [])
+            n = max(8, max((int(v) for v in ring_segments if int(v) > 0), default=24))
+            return [
+                (radius * math.cos(2.0 * math.pi * i / n),
+                 radius * math.sin(2.0 * math.pi * i / n))
+                for i in range(n)
+            ]
+        steps = max(2, int(math.ceil(max(8.0, 96.0 * span))))
+        return [(0.0, 0.0)] + [
+            (radius * math.cos(2.0 * math.pi * span * i / steps),
+             radius * math.sin(2.0 * math.pi * span * i / steps))
+            for i in range(steps + 1)
+        ]
+
+    return []
+
+
+def _triangulate_domain_minus_tiles(
+    domain: list[tuple[float, float]],
+    tile_polys: list[list[tuple[float, float]]],
+    *,
+    z: float = 0.0,
+) -> list:
+    if len(domain) < 3:
+        return []
+    try:
+        from scipy.spatial import Delaunay  # type: ignore
+    except Exception:
+        return _triangulate_polygon(domain, z)
+
+    points: list[tuple[float, float]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add_point(pt: tuple[float, float]) -> None:
+        key = (int(round(pt[0] * 1.0e8)), int(round(pt[1] * 1.0e8)))
+        if key not in seen:
+            seen.add(key)
+            points.append((float(pt[0]), float(pt[1])))
+
+    for p in domain:
+        add_point(p)
+    for poly in tile_polys:
+        for p in poly:
+            add_point(p)
+
+    if len(points) < 3:
+        return []
+    pts = np.asarray(points, dtype=np.float64)
+    try:
+        simplices = Delaunay(pts).simplices
+    except Exception:
+        return _triangulate_polygon(domain, z)
+
+    out: list = []
+    if _polygon_area(domain) < 0.0:
+        domain = list(reversed(domain))
+    tile_polys = [
+        list(reversed(poly)) if _polygon_area(poly) < 0.0 else poly
+        for poly in tile_polys
+        if len(poly) >= 3 and abs(_polygon_area(poly)) > 1e-10
+    ]
+    tile_bounds = [
+        (
+            min(p[0] for p in poly), min(p[1] for p in poly),
+            max(p[0] for p in poly), max(p[1] for p in poly),
+            poly,
+        )
+        for poly in tile_polys
+    ]
+    for simplex in simplices:
+        tri2 = pts[np.asarray(simplex, dtype=np.int64)]
+        centroid = (float(np.mean(tri2[:, 0])), float(np.mean(tri2[:, 1])))
+        if not _point_in_convex_polygon(centroid, domain):
+            continue
+        tri3 = np.asarray([
+            [tri2[0, 0], tri2[0, 1], z],
+            [tri2[1, 0], tri2[1, 1], z],
+            [tri2[2, 0], tri2[2, 1], z],
+        ], dtype=np.float64)
+        min_x = float(np.min(tri2[:, 0]))
+        min_y = float(np.min(tri2[:, 1]))
+        max_x = float(np.max(tri2[:, 0]))
+        max_y = float(np.max(tri2[:, 1]))
+        nearby_tiles = (
+            poly for bx0, by0, bx1, by1, poly in tile_bounds
+            if not (bx1 < min_x or max_x < bx0 or by1 < min_y or max_y < by0)
+        )
+        if any(_triangle_touches_polygon_interior(tri3, poly) for poly in nearby_tiles):
+            continue
+        if _polygon_area([(tri3[0, 0], tri3[0, 1]), (tri3[1, 0], tri3[1, 1]), (tri3[2, 0], tri3[2, 1])]) < 0.0:
+            tri3 = tri3[[0, 2, 1]]
+        out.append(tri3.tolist())
+    return _filtered_triangle_array(out).tolist()
+
+
 def build_envelope_meshes(floor_result: np.ndarray,
                            state: dict,
                            cell_size_m: float = 1.0,
@@ -909,6 +1257,42 @@ def build_envelope_meshes(floor_result: np.ndarray,
     floor_tris: list = []
     wall_tris:  list = []
     ceil_tris:  list = []
+    boundary_edges: dict[tuple[tuple[int, int], tuple[int, int]], tuple[tuple[float, float], tuple[float, float], int]] = {}
+    active_metas: list[dict] = []
+
+    radial_type = _radial_floor_type(floor_plan)
+    if radial_type:
+        domain = _radial_domain_polygon(floor_plan or {}, cell_size_m=cs)
+        if _polygon_area(domain) < 0.0:
+            domain = list(reversed(domain))
+        floor_tris.extend(_triangulate_polygon(domain, 0.0))
+        ceil_tris.extend(_triangulate_polygon(list(reversed(domain)), ceil_h))
+
+        def _add_radial_wall_edge(a: tuple[float, float], b: tuple[float, float]) -> None:
+            wx0, wy0 = a
+            wx1, wy1 = b
+            wall_tris.extend([
+                [[wx0, wy0, 0.0], [wx1, wy1, 0.0], [wx1, wy1, wall_h]],
+                [[wx0, wy0, 0.0], [wx1, wy1, wall_h], [wx0, wy0, wall_h]],
+            ])
+
+        if radial_type == "arc" and len(domain) >= 4 and float((floor_plan or {}).get("arc_span", 1.0)) < 0.999:
+            for i in range(1, len(domain) - 2):
+                _add_radial_wall_edge(domain[i], domain[i + 1])
+            _add_radial_wall_edge(domain[0], domain[1])
+            _add_radial_wall_edge(domain[-1], domain[0])
+        else:
+            for i, a in enumerate(domain):
+                _add_radial_wall_edge(a, domain[(i + 1) % len(domain)])
+
+        return {
+            "floor": _filtered_triangle_array(floor_tris),
+            "walls": _filtered_triangle_array(wall_tris),
+            "ceiling": _filtered_triangle_array(ceil_tris),
+        }
+
+    radial_type = _radial_floor_type(floor_plan)
+    radial_tile_polys: list[list[tuple[float, float]]] = []
 
     for gy in range(D):
         for gx in range(W):
@@ -935,42 +1319,80 @@ def build_envelope_meshes(floor_result: np.ndarray,
                     ((gx + 1) * cs, (gy + 1) * cs),
                     (gx * cs, (gy + 1) * cs),
                 ]
-            p0, p1, p2, p3 = quad
+            poly = _clean_polygon(quad)
+            if len(poly) < 3:
+                continue
+            if _polygon_area(poly) < 0.0:
+                poly = list(reversed(poly))
+            active_metas.append(meta)
 
-            floor_tris += [
-                [[p0[0], p0[1], 0.0], [p1[0], p1[1], 0.0], [p2[0], p2[1], 0.0]],
-                [[p0[0], p0[1], 0.0], [p2[0], p2[1], 0.0], [p3[0], p3[1], 0.0]],
-            ]
-            ceil_tris += [
-                [[p0[0], p0[1], ceil_h], [p2[0], p2[1], ceil_h], [p1[0], p1[1], ceil_h]],
-                [[p0[0], p0[1], ceil_h], [p3[0], p3[1], ceil_h], [p2[0], p2[1], ceil_h]],
-            ]
+            floor_tris.extend(_triangulate_polygon(poly, 0.0))
+            ceil = list(reversed(poly))
+            ceil_tris.extend(_triangulate_polygon(ceil, ceil_h))
 
-            edges = [
-                (-1, 0, p3, p0),
-                (1, 0, p1, p2),
-                (0, -1, p0, p1),
-                (0, 1, p2, p3),
-            ]
-            for dnx, dny, a, b in edges:
-                nx, ny = gx + dnx, gy + dny
-                if plan_type == "polar" and dny == 0:
-                    nx %= W
-                if 0 <= nx < W and 0 <= ny < D and floor_result[ny, nx] == 1:
+            for i, a in enumerate(poly):
+                b = poly[(i + 1) % len(poly)]
+                key = _polygon_key(a, b)
+                if key in boundary_edges:
+                    prev_a, prev_b, count = boundary_edges[key]
+                    boundary_edges[key] = (prev_a, prev_b, count + 1)
+                else:
+                    boundary_edges[key] = (a, b, 1)
+
+    def _add_wall_edge(a: tuple[float, float], b: tuple[float, float]) -> None:
+        wx0, wy0 = a
+        wx1, wy1 = b
+        wall_tris.extend([
+            [[wx0, wy0, 0.0], [wx1, wy1, 0.0], [wx1, wy1, wall_h]],
+            [[wx0, wy0, 0.0], [wx1, wy1, wall_h], [wx0, wy0, wall_h]],
+        ])
+
+    if plan_type in ("polar", "polar_rect", "arc"):
+        rings = [
+            int(meta.get("ring", -1))
+            for meta in active_metas
+            if isinstance(meta, dict) and "ring" in meta
+        ]
+        outer_ring = max(rings) if rings else -1
+        for meta in active_metas:
+            if not isinstance(meta, dict) or int(meta.get("ring", -2)) != outer_ring:
+                continue
+            poly = _clean_polygon(meta.get("corners", []))
+            if len(poly) < 3:
+                continue
+            poly = [(x * cs, y * cs) for x, y in poly]
+            if plan_type == "polar_rect":
+                if len(poly) >= 4:
+                    _add_wall_edge(poly[1], poly[2])
+                else:
+                    _add_wall_edge(poly[1], poly[2])
+            else:
+                _add_wall_edge(poly[2], poly[3])
+
+        if plan_type == "arc" and float((floor_plan or {}).get("arc_span", 1.0)) < 0.999:
+            min_seg = min((int(m.get("segment", 0)) for m in active_metas if isinstance(m, dict)), default=0)
+            max_seg = max((int(m.get("segment", 0)) for m in active_metas if isinstance(m, dict)), default=-1)
+            for meta in active_metas:
+                if not isinstance(meta, dict):
                     continue
-                wx0, wy0 = a
-                wx1, wy1 = b
-                wall_tris += [
-                    [[wx0, wy0, 0.0], [wx1, wy1, 0.0], [wx1, wy1, wall_h]],
-                    [[wx0, wy0, 0.0], [wx1, wy1, wall_h], [wx0, wy0, wall_h]],
-                ]
+                seg = int(meta.get("segment", -1))
+                poly = [(x * cs, y * cs) for x, y in _clean_polygon(meta.get("corners", []))]
+                if len(poly) < 4:
+                    continue
+                if seg == min_seg:
+                    _add_wall_edge(poly[3], poly[0])
+                if seg == max_seg:
+                    _add_wall_edge(poly[1], poly[2])
+    else:
+        for a, b, count in boundary_edges.values():
+            if count == 1:
+                _add_wall_edge(a, b)
 
-    def _arr(tris: list) -> np.ndarray:
-        if not tris:
-            return np.zeros((0, 3, 3), np.float64)
-        return np.array(tris, dtype=np.float64)
-
-    return {"floor": _arr(floor_tris), "walls": _arr(wall_tris), "ceiling": _arr(ceil_tris)}
+    return {
+        "floor": _filtered_triangle_array(floor_tris),
+        "walls": _filtered_triangle_array(wall_tris),
+        "ceiling": _filtered_triangle_array(ceil_tris),
+    }
 
 
 def build_floor_material_triangulation(
@@ -995,13 +1417,14 @@ def build_floor_material_triangulation(
         if isinstance(cell, dict) and "x" in cell and "y" in cell
     }
 
-    def _scaled_quad(raw_quad: Any, gx: int, gy: int) -> list[tuple[float, float]]:
+    def _scaled_poly(raw_quad: Any, gx: int, gy: int) -> list[tuple[float, float]]:
         pts: list[tuple[float, float]] = []
         if isinstance(raw_quad, list):
             for raw_pt in raw_quad[:4]:
                 if isinstance(raw_pt, (list, tuple)) and len(raw_pt) >= 2:
                     pts.append((float(raw_pt[0]) * cs, float(raw_pt[1]) * cs))
-        if len(pts) == 4:
+        pts = _clean_polygon(pts)
+        if len(pts) >= 3:
             return pts
         return [
             (gx * cs, gy * cs),
@@ -1010,76 +1433,76 @@ def build_floor_material_triangulation(
             (gx * cs, (gy + 1) * cs),
         ]
 
-    def _quad_area(q: list[tuple[float, float]]) -> float:
-        return 0.5 * abs(sum(
-            q[i][0] * q[(i + 1) % 4][1] - q[(i + 1) % 4][0] * q[i][1]
-            for i in range(4)
-        ))
+    def _same_poly(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> bool:
+        return len(a) == len(b) and all(
+            math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]) <= 1e-7
+            for i in range(len(a))
+        )
 
-    def _inset_quad(q: list[tuple[float, float]], inset: float) -> list[tuple[float, float]]:
-        if inset <= 0.0:
-            return list(q)
-        cx = 0.25 * sum(p[0] for p in q)
-        cy = 0.25 * sum(p[1] for p in q)
-        out: list[tuple[float, float]] = []
-        for x, y in q:
-            vx, vy = x - cx, y - cy
-            dist = math.hypot(vx, vy)
-            if dist <= 1e-9:
-                out.append((x, y))
-                continue
-            scale = max(0.0, (dist - inset) / dist)
-            out.append((cx + vx * scale, cy + vy * scale))
-        if _quad_area(out) <= 1e-9:
-            return list(q)
+    def _inner_is_nested(outer: list[tuple[float, float]],
+                         inner: list[tuple[float, float]]) -> bool:
+        if len(outer) < 3 or len(inner) < 3:
+            return False
+        return all(_point_in_convex_polygon(pt, outer) for pt in inner)
+
+    def _border_strips(outer: list[tuple[float, float]],
+                       inner: list[tuple[float, float]]) -> list:
+        if len(outer) != len(inner) or len(outer) < 3:
+            return []
+        out: list = []
+        for i in range(len(outer)):
+            j = (i + 1) % len(outer)
+            strip = [outer[i], outer[j], inner[j], inner[i]]
+            if abs(_polygon_area(_clean_polygon(strip))) > 1e-8:
+                out.extend(_triangulate_polygon(_clean_polygon(strip), 0.0))
         return out
-
-    def _same_quad(a: list[tuple[float, float]], b: list[tuple[float, float]]) -> bool:
-        return all(math.hypot(a[i][0] - b[i][0], a[i][1] - b[i][1]) <= 1e-7 for i in range(4))
-
-    def _tri(q: list[tuple[float, float]]) -> list:
-        p0, p1, p2, p3 = q
-        return [
-            [[p0[0], p0[1], 0.0], [p1[0], p1[1], 0.0], [p2[0], p2[1], 0.0]],
-            [[p0[0], p0[1], 0.0], [p2[0], p2[1], 0.0], [p3[0], p3[1], 0.0]],
-        ]
 
     tile_tris: list = []
     fill_tris: list = []
     border_lines: list = []
+    radial_type = _radial_floor_type(floor_plan)
+    radial_tile_polys: list[list[tuple[float, float]]] = []
 
     for gy in range(D):
         for gx in range(W):
             if floor_result[gy, gx] != 1:
                 continue
             meta = cell_meta.get((gx, gy), {})
-            outer = _scaled_quad(meta.get("corners"), gx, gy)
-            inner = _scaled_quad(meta.get("tile_corners"), gx, gy)
-            if _same_quad(outer, inner):
-                inner = _inset_quad(outer, min(inset_m, 0.45 * math.sqrt(max(_quad_area(outer), 0.0))))
-            tile_tris.extend(_tri(inner))
+            outer = _scaled_poly(meta.get("corners"), gx, gy)
+            inner = _scaled_poly(meta.get("tile_corners"), gx, gy)
+            if _polygon_area(outer) < 0.0:
+                outer = list(reversed(outer))
+            if _polygon_area(inner) < 0.0:
+                inner = list(reversed(inner))
+            if _same_poly(outer, inner) or not _inner_is_nested(outer, inner):
+                inset = min(inset_m, 0.45 * math.sqrt(max(abs(_polygon_area(outer)), 0.0)))
+                inner = _inset_polygon(outer, inset)
 
-            for i in range(4):
-                j = (i + 1) % 4
-                strip = [outer[i], outer[j], inner[j], inner[i]]
-                if _quad_area(strip) > 1e-10:
-                    fill_tris.extend(_tri(strip))
+            tile_tris.extend(_triangulate_polygon(inner, 0.0))
+            if radial_type:
+                radial_tile_polys.append(inner)
+            else:
+                fill_tris.extend(_border_strips(outer, inner))
+
+            for i in range(len(inner)):
+                j = (i + 1) % len(inner)
                 border_lines.append([inner[i][0], inner[i][1], 0.003])
                 border_lines.append([inner[j][0], inner[j][1], 0.003])
 
-    def _arr(tris: list) -> np.ndarray:
-        if not tris:
-            return np.zeros((0, 3, 3), np.float64)
-        return np.array(tris, dtype=np.float64)
+    if radial_type:
+        domain = _radial_domain_polygon(floor_plan or {}, cell_size_m=cs)
+        if _polygon_area(domain) < 0.0:
+            domain = list(reversed(domain))
+        fill_tris = _triangulate_polygon(domain, 0.0)
 
     border_arr = np.zeros((0, 3), np.float64) if not border_lines else np.array(border_lines, dtype=np.float64)
     return {
-        "floor_tiles": _arr(tile_tris),
-        "floor_fill": _arr(fill_tris),
+        "floor_tiles": _filtered_triangle_array(tile_tris),
+        "floor_fill": _filtered_triangle_array(fill_tris),
         "floor_borders": border_arr,
         "material_slots": {
-            "floor_tiles": str(state.get("floor_tile_material", "pearl_white_tile")),
-            "floor_fill": str(state.get("floor_fill_material", "painted_concrete")),
+            "floor_tiles": str(state.get("floor_tile_material", state.get("floor_material", "pearl_white_tile"))),
+            "floor_fill": str(state.get("floor_fill_material", "concrete_wall")),
         },
     }
 
@@ -1116,6 +1539,33 @@ def _clamp_float(val: float, k: dict) -> float:
     stp = float(k.get("step", 0.01))
     val = round(round(val / stp) * stp, 10)
     return float(np.clip(val, lo, hi))
+
+
+# ── Surface material palettes ────────────────────────────────────────────────
+_FLOOR_MATERIALS   = ["pearl_white_tile", "stage_floor", "painted_plaster_wall", "concrete_wall", "construction_glass"]
+_WALL_INT_MATERIALS = ["painted_plaster_wall", "acoustic_foam_panel", "concrete_wall", "basic_paneling", "construction_glass"]
+_WALL_EXT_MATERIALS = ["corrugated_steel_exterior", "concrete_wall", "painted_plaster_wall", "construction_glass"]
+_CEIL_MATERIALS    = ["acoustic_plaster_ceiling", "painted_plaster_wall", "concrete_wall", "construction_glass"]
+
+
+def _make_surfaces_panel() -> Panel:
+    return Panel(
+        "room_surfaces",
+        "SURFACES",
+        knobs=[
+            toggle_knob("interior_surface_visible", "Interior",  default=True,  group="Visibility"),
+            toggle_knob("exterior_surface_visible", "Exterior",  default=False, group="Visibility"),
+            _choice_knob("floor_material",        "Floor",        _FLOOR_MATERIALS,    group="Materials"),
+            _choice_knob("wall_material_interior", "Wall (int)",  _WALL_INT_MATERIALS, group="Materials"),
+            _choice_knob("wall_material_exterior", "Wall (ext)",  _WALL_EXT_MATERIALS, group="Materials"),
+            _choice_knob("ceiling_material",       "Ceiling",     _CEIL_MATERIALS,     group="Materials"),
+        ],
+        payload={
+            "actions": [
+                {"key": "apply_surface_materials", "label": "APPLY"},
+            ],
+        },
+    )
 
 
 def _make_envelope_panel() -> Panel:
@@ -1735,6 +2185,7 @@ class RoomControlStation(_StationMenuBase):
         self._envelope_mesh_key: str = ""
         self._applied_floor_meshes: dict = {}
         self._applied_floor_mesh_key: str = ""
+        self._applied_room_meshes: dict = {}
         self._right_scroll_widget = ScrollableSubpanelList(
             "Room Controls",
             max_height=220,
@@ -1767,12 +2218,17 @@ class RoomControlStation(_StationMenuBase):
                 "dimy:-",
                 "dimy:+",
                 "apply_floor",
+                "build_walls",
+                "build_room",
             ),
             "room_floor": (
                 "floor:rect",
                 "floor:polar",
                 "floor:polar_rect",
                 "floor:arc",
+            ),
+            "room_surfaces": (
+                "apply_surface_materials",
             ),
         }.items():
             for action_key in action_keys:
@@ -1830,6 +2286,7 @@ class RoomControlStation(_StationMenuBase):
     def apply_floor_triangulation(self) -> dict:
         """Deploy the current grid floor as material-split triangulated meshes."""
         floor_type, width, depth, floor_plan, floor_result = self._current_floor_geometry()
+        wall_footprints = build_wall_footprints(floor_plan, self.state, floor_result)
         meshes = build_floor_material_triangulation(
             floor_result,
             self.state,
@@ -1851,13 +2308,278 @@ class RoomControlStation(_StationMenuBase):
                 room_cfg["applied_floor_meshes"] = meshes
                 room_cfg["applied_floor_mesh_key"] = key
                 room_cfg["applied_floor_material_slots"] = dict(meshes.get("material_slots", {}))
+                room_cfg["applied_floor_material_ids"] = self._material_id_slots(
+                    room_cfg["applied_floor_material_slots"]
+                )
+                room_cfg["applied_wall_footprints"] = wall_footprints
+                room_cfg["applied_wall_occlusion_voxels"] = sorted(wall_occlusion_voxels(wall_footprints))
+                room_cfg["applied_room_width_m"] = float(width) * float(_CELL_SIZE_M)
+                room_cfg["applied_room_depth_m"] = float(depth) * float(_CELL_SIZE_M)
                 room_cfg["applied_floor_revision"] = int(room_cfg.get("applied_floor_revision", 0) or 0) + 1
+                self._publish_room_scene_geometry(room_cfg)
         self.state["floor_triangulation_applied"] = True
         self.state["floor_triangulation_key"] = key
         self.state["floor_triangulation_tile_triangles"] = tile_count
         self.state["floor_triangulation_fill_triangles"] = fill_count
         self.state["floor_triangulation_border_segments"] = border_count
         return dict(meshes)
+
+    def _has_spherical_top_definition(self, wall_footprints: list[dict]) -> bool:
+        return any(str(fp.get("kind", "")).startswith("spherical_") for fp in wall_footprints)
+
+    def _publish_applied_room_geometry(
+        self,
+        *,
+        floor_meshes: Optional[dict] = None,
+        envelope_meshes: Optional[dict] = None,
+        wall_footprints: Optional[list[dict]] = None,
+        floor_type: str,
+        width: int,
+        depth: int,
+    ) -> None:
+        target_ws = self._scene_workspace
+        if target_ws is None and self._host_station is not None:
+            target_ws = getattr(self._host_station, "_room_workspace_ref", None)
+        if target_ws is None or not hasattr(target_ws, "room_cfg"):
+            return
+        room_cfg = getattr(target_ws, "room_cfg")
+        if not isinstance(room_cfg, dict):
+            return
+
+        key = self._current_floor_mesh_key(floor_type, width, depth)
+        if floor_meshes is not None:
+            room_cfg["applied_floor_meshes"] = floor_meshes
+            room_cfg["applied_floor_mesh_key"] = key
+            room_cfg["applied_floor_material_slots"] = dict(floor_meshes.get("material_slots", {}))
+            room_cfg["applied_floor_material_ids"] = self._material_id_slots(
+                room_cfg["applied_floor_material_slots"]
+            )
+        if envelope_meshes is not None:
+            room_cfg["applied_room_meshes"] = envelope_meshes
+            room_cfg["applied_room_mesh_key"] = key
+            room_cfg["applied_room_material_slots"] = {
+                "walls": str(self.state.get("wall_material_interior", _WALL_INT_MATERIALS[0])),
+                "walls_exterior": str(self.state.get("wall_material_exterior", _WALL_EXT_MATERIALS[0])),
+                "ceiling": str(self.state.get("ceiling_material", _CEIL_MATERIALS[0])),
+                "unfinished": "construction_glass",
+            }
+            room_cfg["applied_room_material_ids"] = self._material_id_slots(
+                room_cfg["applied_room_material_slots"]
+            )
+        if wall_footprints is not None:
+            room_cfg["applied_wall_footprints"] = wall_footprints
+            room_cfg["applied_wall_occlusion_voxels"] = sorted(wall_occlusion_voxels(wall_footprints))
+        room_cfg["applied_room_width_m"] = float(width) * float(_CELL_SIZE_M)
+        room_cfg["applied_room_depth_m"] = float(depth) * float(_CELL_SIZE_M)
+        room_cfg["applied_floor_revision"] = int(room_cfg.get("applied_floor_revision", 0) or 0) + 1
+        self._publish_room_scene_geometry(room_cfg)
+
+    @staticmethod
+    def _room_scene_material_index(name: object) -> int:
+        if isinstance(name, (int, np.integer)):
+            return int(name)
+        _register_material_yaml_if_available(name)
+        try:
+            index = MaterialDatabase.instance().build_tensors().get("index", {})
+        except Exception:
+            index = {}
+        return int(dict(index).get(str(name), dict(index).get("__missing_material__", 0)))
+
+    @staticmethod
+    def _material_id_slots(slots: dict) -> dict:
+        return {
+            str(key): RoomControlStation._room_scene_material_index(value)
+            for key, value in dict(slots or {}).items()
+        }
+
+    def apply_surface_materials(self) -> None:
+        """Persist selected room materials and republish any already-built surfaces."""
+        target_ws = self._scene_workspace
+        if target_ws is None and self._host_station is not None:
+            target_ws = getattr(self._host_station, "_room_workspace_ref", None)
+        if target_ws is None or not hasattr(target_ws, "room_cfg"):
+            return
+        room_cfg = getattr(target_ws, "room_cfg")
+        if not isinstance(room_cfg, dict):
+            return
+
+        floor_slots = dict(room_cfg.get("applied_floor_material_slots", {}) or {})
+        floor_slots["floor_tiles"] = str(self.state.get("floor_material", _FLOOR_MATERIALS[0]))
+        floor_slots["floor_fill"] = str(self.state.get("floor_fill_material", "concrete_wall"))
+        room_cfg["applied_floor_material_slots"] = floor_slots
+        room_cfg["applied_room_material_slots"] = {
+            "walls": str(self.state.get("wall_material_interior", _WALL_INT_MATERIALS[0])),
+            "walls_exterior": str(self.state.get("wall_material_exterior", _WALL_EXT_MATERIALS[0])),
+            "ceiling": str(self.state.get("ceiling_material", _CEIL_MATERIALS[0])),
+            "unfinished": "construction_glass",
+        }
+        room_cfg["applied_floor_material_ids"] = self._material_id_slots(
+            room_cfg["applied_floor_material_slots"]
+        )
+        room_cfg["applied_room_material_ids"] = self._material_id_slots(
+            room_cfg["applied_room_material_slots"]
+        )
+        room_cfg["applied_floor_revision"] = int(room_cfg.get("applied_floor_revision", 0) or 0) + 1
+        self._publish_room_scene_geometry(room_cfg)
+
+    @staticmethod
+    def _append_room_scene_part(
+        tri_parts: list[np.ndarray],
+        mat_parts: list[np.ndarray],
+        raw_tris: object,
+        mat_name: object,
+    ) -> None:
+        arr = np.asarray(raw_tris, dtype=np.float32)
+        if arr.ndim != 3 or arr.shape[1:] != (3, 3) or arr.size == 0:
+            return
+        tri_parts.append(arr)
+        mat_id = RoomControlStation._room_scene_material_index(mat_name)
+        mat_parts.append(np.full((int(arr.shape[0]),), int(mat_id), dtype=np.int32))
+
+    def _publish_room_scene_geometry(self, room_cfg: dict) -> None:
+        """Push built room surfaces into the existing scene.geometry flip buffer."""
+        tri_parts: list[np.ndarray] = []
+        mat_parts: list[np.ndarray] = []
+        floor = room_cfg.get("applied_floor_meshes", {})
+        floor_slots = dict(room_cfg.get("applied_floor_material_slots", {}) or {})
+        if isinstance(floor, dict):
+            self._append_room_scene_part(
+                tri_parts,
+                mat_parts,
+                floor.get("floor_fill", []),
+                floor_slots.get("floor_fill", "concrete_wall"),
+            )
+            self._append_room_scene_part(
+                tri_parts,
+                mat_parts,
+                floor.get("floor_tiles", []),
+                floor_slots.get("floor_tiles", "pearl_white_tile"),
+            )
+
+        room_meshes = room_cfg.get("applied_room_meshes", {})
+        room_slots = dict(room_cfg.get("applied_room_material_slots", {}) or {})
+        if isinstance(room_meshes, dict):
+            self._append_room_scene_part(
+                tri_parts,
+                mat_parts,
+                room_meshes.get("walls", []),
+                room_slots.get("walls", "painted_plaster_wall"),
+            )
+            self._append_room_scene_part(
+                tri_parts,
+                mat_parts,
+                room_meshes.get("ceiling", []),
+                room_slots.get("ceiling", "acoustic_plaster_ceiling"),
+            )
+
+        if not tri_parts:
+            return
+
+        tris = np.concatenate(tri_parts, axis=0).astype(np.float32, copy=False)
+        mat_ids = np.concatenate(mat_parts, axis=0).astype(np.int32, copy=False)
+
+        pts = tris.reshape(-1, 3)
+        min_xy = np.min(pts[:, :2], axis=0)
+        max_xy = np.max(pts[:, :2], axis=0)
+        center_x = 0.5 * float(min_xy[0] + max_xy[0])
+        min_y = float(min_xy[1])
+        tris_world = tris.copy()
+        tris_world[:, :, 0] -= center_x
+        tris_world[:, :, 1] -= min_y
+
+        key = (
+            str(room_cfg.get("applied_floor_mesh_key", "")),
+            str(room_cfg.get("applied_room_mesh_key", "")),
+            int(room_cfg.get("applied_floor_revision", 0) or 0),
+            int(tris_world.shape[0]),
+            tuple(int(x) for x in mat_ids[: min(16, len(mat_ids))]),
+        )
+        publish_owner_target(
+            owner_id="room_station",
+            target_id="scene.geometry/room_station",
+            payload={
+                "owner_id": "room_station",
+                "kind": "triangles",
+                "triangles": np.ascontiguousarray(tris_world, dtype=np.float32),
+                "mat_ids": np.ascontiguousarray(mat_ids, dtype=np.int32),
+                "material_slot": "room_surfaces",
+                "mat_id": self._room_scene_material_index("construction_glass"),
+            },
+            flip_slots=2,
+            change_key=key,
+        )
+
+    def build_walls_and_ceiling(self) -> dict:
+        """Deploy wall geometry and the implicit joined ceiling when eligible."""
+        floor_type, width, depth, floor_plan, floor_result = self._current_floor_geometry()
+        wall_footprints = build_wall_footprints(floor_plan, self.state, floor_result)
+        envelope = build_envelope_meshes(
+            floor_result,
+            self.state,
+            cell_size_m=float(_CELL_SIZE_M),
+            floor_plan=floor_plan,
+        )
+        applied = {
+            "walls": np.asarray(envelope.get("walls", []), dtype=np.float64),
+        }
+        if not self._has_spherical_top_definition(wall_footprints):
+            applied["ceiling"] = np.asarray(envelope.get("ceiling", []), dtype=np.float64)
+            self.state["room_ceiling_implicit"] = True
+        else:
+            applied["ceiling"] = np.zeros((0, 3, 3), dtype=np.float64)
+            self.state["room_ceiling_implicit"] = False
+        self._publish_applied_room_geometry(
+            envelope_meshes=applied,
+            wall_footprints=wall_footprints,
+            floor_type=floor_type,
+            width=width,
+            depth=depth,
+        )
+        self._applied_room_meshes = applied
+        self.state["room_walls_built"] = True
+        self.state["room_wall_triangles"] = int(len(applied.get("walls", ())) or 0)
+        self.state["room_ceiling_triangles"] = int(len(applied.get("ceiling", ())) or 0)
+        return applied
+
+    def build_room_geometry(self) -> dict:
+        """Deploy floor, walls, and implicit ceiling as one applied room set."""
+        floor_type, width, depth, floor_plan, floor_result = self._current_floor_geometry()
+        wall_footprints = build_wall_footprints(floor_plan, self.state, floor_result)
+        floor_meshes = build_floor_material_triangulation(
+            floor_result,
+            self.state,
+            cell_size_m=float(_CELL_SIZE_M),
+            floor_plan=floor_plan,
+        )
+        envelope = build_envelope_meshes(
+            floor_result,
+            self.state,
+            cell_size_m=float(_CELL_SIZE_M),
+            floor_plan=floor_plan,
+        )
+        applied = {"walls": np.asarray(envelope.get("walls", []), dtype=np.float64)}
+        if not self._has_spherical_top_definition(wall_footprints):
+            applied["ceiling"] = np.asarray(envelope.get("ceiling", []), dtype=np.float64)
+            self.state["room_ceiling_implicit"] = True
+        else:
+            applied["ceiling"] = np.zeros((0, 3, 3), dtype=np.float64)
+            self.state["room_ceiling_implicit"] = False
+        self._applied_floor_meshes = floor_meshes
+        self._applied_floor_mesh_key = self._current_floor_mesh_key(floor_type, width, depth)
+        self._applied_room_meshes = applied
+        self._publish_applied_room_geometry(
+            floor_meshes=floor_meshes,
+            envelope_meshes=applied,
+            wall_footprints=wall_footprints,
+            floor_type=floor_type,
+            width=width,
+            depth=depth,
+        )
+        self.state["room_geometry_built"] = True
+        self.state["floor_triangulation_applied"] = True
+        self.state["room_wall_triangles"] = int(len(applied.get("walls", ())) or 0)
+        self.state["room_ceiling_triangles"] = int(len(applied.get("ceiling", ())) or 0)
+        return {"floor": floor_meshes, **applied}
 
     @property
     def panel_spec(self) -> Panel:
@@ -1923,6 +2645,7 @@ class RoomControlStation(_StationMenuBase):
                 ),
                 _make_envelope_panel(),
                 _make_hull_panel(),
+                _make_surfaces_panel(),
                 _environment_panel_from_cfg(self._right_cfg),
             ],
         )
@@ -1985,6 +2708,8 @@ class RoomControlStation(_StationMenuBase):
                 "action_first": True,
                 "actions": [
                     {"key": "apply_floor", "label": "Apply Floor"},
+                    {"key": "build_walls", "label": "Build Walls"},
+                    {"key": "build_room", "label": "Build Room"},
                     {"key": "level:-", "label": "Level -"},
                     {"key": "level:+", "label": "Level +"},
                     {"key": "dimx:-", "label": "Width -"},
@@ -2097,6 +2822,8 @@ class RoomControlStation(_StationMenuBase):
         floor_plan   = build_floor_plan(floor_type, width, depth, self.state)
         floor_mask   = floor_plan["mask"]
         floor_result = apply_hull_deformation(floor_mask, self.state)
+        wall_footprints = build_wall_footprints(floor_plan, self.state, floor_result)
+        wall_cells = wall_occlusion_cells(wall_footprints)
         depth, width = floor_result.shape
         floor_meta = {
             (int(cell["x"]), int(cell["y"])): cell
@@ -2172,6 +2899,7 @@ class RoomControlStation(_StationMenuBase):
                 "polar_rays": n_rays,
                 "ring_segments": [],
                 "floor_radius": float(floor_plan.get("floor_radius", 8.0) or 8.0),
+                "wall_footprints": wall_footprints,
             }
             if self._room_workspace is not None:
                 ws = self._room_workspace
@@ -2263,11 +2991,14 @@ class RoomControlStation(_StationMenuBase):
                         continue
                     cell = dict(raw_cell)
                     world_cells = _world_cells_for_packed_quad(cell)
+                    wall_hit = any((gx, gy) in wall_cells for gx, gy in world_cells)
                     station_hit = any((gx, gy, level) in station_cells for gx, gy in world_cells)
                     snap_hit = any((gx, gy) in snap_cells for gx, gy in world_cells)
                     mark = next((object_marks[(gx, gy)] for gx, gy in world_cells if (gx, gy) in object_marks), {})
                     occ = next((occupied[(gx, gy)] for gx, gy in world_cells if (gx, gy) in occupied), None)
-                    if station_hit:
+                    if wall_hit:
+                        idx = _CELL_COLLISION
+                    elif station_hit:
                         idx = _CELL_STATION
                     elif snap_hit:
                         idx = _CELL_SNAP
@@ -2293,6 +3024,7 @@ class RoomControlStation(_StationMenuBase):
                 "action_key": "room_grid.click",
                 "coord_mode": "cell",
                 "floor_plan": _polar_fp,
+                "wall_footprints": wall_footprints,
             }
             if self._room_workspace is not None:
                 _polar_payload["level"] = int(self.state.get("room_level", 0))
@@ -2357,6 +3089,7 @@ class RoomControlStation(_StationMenuBase):
                         "angular_segments": floor_plan.get("angular_segments", 0),
                         "ring_segments": floor_plan.get("ring_segments", []),
                         "floor_radius": float(floor_plan.get("floor_radius", 8.0) or 8.0),
+                        "wall_footprints": wall_footprints,
                     },
                 },
             )
@@ -2469,7 +3202,7 @@ class RoomControlStation(_StationMenuBase):
                     continue
                 if fr == 0:
                     idx = _CELL_VOID
-                elif fr == 7:
+                elif fr == 7 or (x, y) in wall_cells:
                     # Hull-clipped: show collision if an instance tries to live here
                     idx = _CELL_COLLISION
                 elif (x, y, level) in station_cells:
@@ -2540,6 +3273,7 @@ class RoomControlStation(_StationMenuBase):
                     "angular_segments": floor_plan.get("angular_segments", 0),
                     "ring_segments": floor_plan.get("ring_segments", []),
                     "floor_radius": float(floor_plan.get("floor_radius", 8.0) or 8.0),
+                    "wall_footprints": wall_footprints,
                 },
             },
         )
@@ -2648,6 +3382,12 @@ class RoomControlStation(_StationMenuBase):
             self.state["room_depth_cells"] = min(128, int(self.state.get("room_depth_cells", 8)) + 1)
         elif action_key == "apply_floor":
             self.apply_floor_triangulation()
+        elif action_key == "build_walls":
+            self.build_walls_and_ceiling()
+        elif action_key == "build_room":
+            self.build_room_geometry()
+        elif action_key == "apply_surface_materials":
+            self.apply_surface_materials()
         elif action_key.startswith("floor:"):
             mode = action_key.split(":", 1)[1]
             if mode in _FLOOR_TYPES:
@@ -2859,6 +3599,8 @@ class RoomControlStation(_StationMenuBase):
         meshes = dict(self._envelope_meshes)
         if self._applied_floor_meshes:
             meshes.update(self._applied_floor_meshes)
+        if self._applied_room_meshes:
+            meshes.update(self._applied_room_meshes)
         return meshes
 
     def _ensure_room_workspace(self) -> bool:

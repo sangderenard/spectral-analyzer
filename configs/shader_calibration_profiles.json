@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "default_profile": "tungsten_white_pearl",
+  "profiles": {
+    "tungsten_white_pearl": {
+      "description": "tungsten_filament emitter inside painted_plaster_wall receiver sphere",
+      "temperature_K": 2800.0,
+      "emitter_material": "tungsten_filament",
+      "receiver_material": "painted_plaster_wall",
+      "gl_intensity_gain": 7.314097574969372,
+      "c_intensity_gain": 10.129494923383758,
+      "cat_ccm_matrix": [
+        [
+          0.55714285,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          3.25
+        ]
+      ]
+    }
+  }
+}

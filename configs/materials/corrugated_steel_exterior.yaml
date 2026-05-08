@@ -1,0 +1,66 @@
+# Material: corrugated_steel_exterior
+# Hot-dip galvanised corrugated steel sheet for exterior cladding.
+
+name: corrugated_steel_exterior
+description: Galvanised corrugated steel sheet exterior cladding, neutral metallic
+
+color_profile_name: corrugated_steel_exterior
+surface_profile: corrugated_steel
+reflectivity: 0.72
+diffusion: 0.18
+absorption: 0.10
+
+smoothness: 0.55
+ior: 2.91
+opacity: 1.0
+
+pbr:
+  albedo: [0.72, 0.72, 0.70]
+  roughness: 0.45
+  metallic: 1.0
+  transmission: 0.0
+  emission_rgb: [0.0, 0.0, 0.0]
+
+enamel:
+  thickness_m: 0.0000002
+  ior_real: 2.91
+  ior_imag: 3.40
+  color_rgb: [0.74, 0.74, 0.72]
+  roughness: 0.40
+
+spectral_bands:
+  - center_hz: 428274940000000.0
+    bandwidth_hz: 34261995000000.0
+    reflectance: 0.70
+    transmittance: 0.0
+    diffuse_frac: 0.18
+    ior_real: 2.91
+    ior_imag: 3.40
+  - center_hz: 545077196000000.0
+    bandwidth_hz: 40880790000000.0
+    reflectance: 0.72
+    transmittance: 0.0
+    diffuse_frac: 0.17
+    ior_real: 2.91
+    ior_imag: 3.38
+  - center_hz: 666205462000000.0
+    bandwidth_hz: 43303355000000.0
+    reflectance: 0.73
+    transmittance: 0.0
+    diffuse_frac: 0.16
+    ior_real: 2.85
+    ior_imag: 3.30
+
+gameplay:
+  label: Corrugated Steel Exterior
+  category: wall_finish
+  tier: finished
+  role: default_wall_exterior
+
+notes: >
+  Zinc-coated hot-dip galvanised steel profiled sheet.  Metallic=1 with a
+  moderate roughness captures the slightly diffuse specular of a weathered
+  galvanised surface.  The imaginary IOR component (extinction coefficient)
+  is consistent with published n,k values for zinc at visible wavelengths.
+  Slight red-channel boost at high frequency (blue band) reflects the subtle
+  warm shift of galvanised coatings versus bare steel.

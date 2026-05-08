@@ -23,6 +23,7 @@
 #include "base_rasterizer.h"
 #include "emitter_angle_kernel.h"
 #include "tile_overlap.h"
+#include "player_clip.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
@@ -3958,6 +3959,25 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
             },
             py::arg("enabled"),
             "Enable/disable direct texture-stack emission coupling.")
+        .def("set_light_calibration",
+            [](PyBaseRasterizer& self, float factor) {
+                br_set_light_calibration(self.st, factor);
+            },
+            py::arg("factor"),
+            "Set a global scalar applied to all emitter-derived light intensities.")
+        .def("set_cat_ccm_matrix",
+            [](PyBaseRasterizer& self,
+               py::array_t<float, py::array::c_style | py::array::forcecast> matrix) {
+                auto m = matrix.request();
+                if (!((m.ndim == 2 && m.shape[0] == 3 && m.shape[1] == 3) ||
+                      (m.ndim == 1 && m.shape[0] == 9))) {
+                    throw std::runtime_error("set_cat_ccm_matrix: matrix must be shape (3,3) float32");
+                }
+                const float* p = static_cast<const float*>(m.ptr);
+                br_set_cat_ccm_matrix(self.st, p);
+            },
+            py::arg("matrix"),
+            "Set 3x3 CAT/CCM matrix applied to shaded linear RGB.")
         .def("render",
             [](PyBaseRasterizer& self,
                py::array_t<float, py::array::c_style | py::array::forcecast> verts_view,
@@ -4011,7 +4031,7 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
                 br_readback_u8(self.st, out.mutable_data());
                 return out;
             },
-            "sRGB-corrected (H, W, 4) uint8 RGBA readback.")
+            "Linear clamp/quantized (H, W, 4) uint8 RGBA readback.")
         .def("readback_f32",
             [](PyBaseRasterizer& self) -> py::array_t<float> {
                 int w = br_width(self.st), h = br_height(self.st);
@@ -4036,6 +4056,34 @@ a (H, W, 4) uint8 numpy array suitable for pygame blit or GL texture upload.
                 );
             },
             "Zero-copy linear (H, W, 4) float32 framebuffer view.")
+        .def("light_count",
+            [](PyBaseRasterizer& self) {
+                return br_light_count(self.st);
+            },
+            "Number of internally derived emissive area lights from the latest render call.")
+        .def("readback_lights",
+            [](PyBaseRasterizer& self) {
+                int n = br_light_count(self.st);
+                py::array_t<float> pos({n, 3});
+                py::array_t<float> col({n, 3});
+                py::array_t<float> inten({n});
+                py::array_t<int> gids({n});
+                br_readback_lights(
+                    self.st,
+                    n > 0 ? static_cast<float*>(pos.mutable_data()) : nullptr,
+                    n > 0 ? static_cast<float*>(col.mutable_data()) : nullptr,
+                    n > 0 ? static_cast<float*>(inten.mutable_data()) : nullptr,
+                    n > 0 ? static_cast<int*>(gids.mutable_data()) : nullptr,
+                    n
+                );
+                py::dict out;
+                out["positions"] = pos;
+                out["colors"] = col;
+                out["intensities"] = inten;
+                out["group_ids"] = gids;
+                return out;
+            },
+            "Read internally derived emissive area lights from the latest render call.")
         .def_property_readonly("width",
             [](PyBaseRasterizer& self){ return br_width(self.st); })
         .def_property_readonly("height",
@@ -4172,4 +4220,112 @@ Columns:
   3 centroid_u, 4 centroid_v, 5 axis_u, 6 axis_v,
   7 spread_major, 8 spread_minor, 9 cone_cos, 10 cone_solid_angle.
 )doc");
+
+    /* ── PlayerClipEngine ─────────────────────────────────────────────────── */
+    py::class_<PlayerClipEngine>(m, "PlayerClipEngine",
+        "Axis-aligned slab player collision engine with double-buffered state.\n\n"
+        "Thread-safe read via read_state(); tick() is single-threaded (game loop).")
+        .def(py::init<>())
+        .def("set_slabs",
+            [](PlayerClipEngine& self,
+               py::array_t<float, py::array::c_style | py::array::forcecast> arr) {
+                auto info = arr.request();
+                if (info.ndim != 2 || info.shape[1] != 8)
+                    throw std::runtime_error("set_slabs: expected float32 (N, 8) array");
+                int n = static_cast<int>(info.shape[0]);
+                const float* data = static_cast<const float*>(info.ptr);
+                std::vector<PlayerWallSlab> slabs(n);
+                for (int i = 0; i < n; ++i) {
+                    const float* row = data + i * 8;
+                    slabs[i].axis         = static_cast<int>(row[0]);
+                    slabs[i].pos          = row[1];
+                    slabs[i].normal_sign  = row[2];
+                    slabs[i].range_lo[0]  = row[3];
+                    slabs[i].range_lo[1]  = row[4];
+                    slabs[i].range_hi[0]  = row[5];
+                    slabs[i].range_hi[1]  = row[6];
+                }
+                self.set_slabs(slabs);
+            },
+            py::arg("slabs"),
+            "Set wall slabs from (N, 8) float32 array.\n"
+            "Columns: axis, pos, normal_sign, rlo0, rlo1, rhi0, rhi1, reserved.")
+        .def("tick",
+            [](PlayerClipEngine& self,
+               py::array_t<float, py::array::c_style | py::array::forcecast> pos,
+               py::array_t<float, py::array::c_style | py::array::forcecast> vel,
+               float floor_z, float ceil_z, float radius, float yaw_rad,
+               float dt) {
+                auto pi = pos.request();
+                auto vi = vel.request();
+                if (pi.size < 3) throw std::runtime_error("tick: pos must have ≥3 elements");
+                if (vi.size < 3) throw std::runtime_error("tick: vel must have ≥3 elements");
+                float p[3], v[3];
+                std::memcpy(p, pi.ptr, 3 * sizeof(float));
+                std::memcpy(v, vi.ptr, 3 * sizeof(float));
+                uint32_t flags = self.tick(p, v, floor_z, ceil_z, radius, yaw_rad, dt);
+                py::array_t<float> out_pos(3), out_vel(3);
+                std::memcpy(out_pos.mutable_data(), p, 3 * sizeof(float));
+                std::memcpy(out_vel.mutable_data(), v, 3 * sizeof(float));
+                return py::make_tuple(out_pos, out_vel, static_cast<uint32_t>(flags));
+            },
+            py::arg("pos"), py::arg("vel"),
+            py::arg("floor_z") = 0.0f, py::arg("ceil_z") = 4.0f,
+            py::arg("radius") = 0.25f, py::arg("yaw_rad") = 0.0f,
+            py::arg("dt") = 0.016f,
+            "Advance one tick.  Returns (corrected_pos, corrected_vel, clip_flags).")
+        .def("configure_state_tensor",
+            [](PlayerClipEngine& self, int capacity, int stride) {
+                self.configure_state_tensor(capacity, stride);
+            },
+            py::arg("capacity"),
+            py::arg("stride") = PlayerClipEngine::STATE_TENSOR_MIN_STRIDE,
+            "Preallocate the owned player state tensor ring buffer.")
+        .def("state_tensor_view",
+            [](PlayerClipEngine& self) -> py::array {
+                int cap = self.state_tensor_capacity();
+                int stride = self.state_tensor_stride();
+                const float* ptr = self.state_tensor_data();
+                if (!ptr || cap <= 0 || stride <= 0) {
+                    return py::array(
+                        py::dtype::of<float>(),
+                        {0, PlayerClipEngine::STATE_TENSOR_MIN_STRIDE},
+                        {sizeof(float) * PlayerClipEngine::STATE_TENSOR_MIN_STRIDE, sizeof(float)},
+                        nullptr,
+                        py::cast(&self, py::return_value_policy::reference)
+                    );
+                }
+                return py::array(
+                    py::dtype::of<float>(),
+                    {cap, stride},
+                    {sizeof(float) * stride, sizeof(float)},
+                    const_cast<float*>(ptr),
+                    py::cast(&self, py::return_value_policy::reference)
+                );
+            },
+            "Zero-copy float32 ring-buffer view of player state history.")
+        .def_property_readonly("state_tensor_cursor",
+            [](const PlayerClipEngine& self) {
+                return self.state_tensor_cursor();
+            })
+        .def("read_state",
+            [](const PlayerClipEngine& self) {
+                PlayerStateFrame f;
+                self.read(&f);
+                py::dict d;
+                d["px"]         = f.px;
+                d["py"]         = f.py;
+                d["pz"]         = f.pz;
+                d["vx"]         = f.vx;
+                d["vy"]         = f.vy;
+                d["vz"]         = f.vz;
+                d["yaw_rad"]    = f.yaw_rad;
+                d["radius"]     = f.radius;
+                d["floor_z"]    = f.floor_z;
+                d["ceil_z"]     = f.ceil_z;
+                d["clip_flags"] = static_cast<uint32_t>(f.clip_flags);
+                d["generation"] = static_cast<uint32_t>(f.generation);
+                return d;
+            },
+            "Return last published player state as a dict.  Safe to call from any thread.");
 }

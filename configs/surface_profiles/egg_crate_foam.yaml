@@ -1,0 +1,32 @@
+# Surface tessellation profile: egg_crate_foam
+# Product of two sinusoids — classic egg-crate acoustic foam geometry.
+
+name: egg_crate_foam
+description: >
+  Egg-crate open-cell foam profile produced by the product of two identical
+  sinusoidal profiles on orthogonal axes.  Produces the characteristic
+  alternating peaks and valleys in a square grid pattern.
+
+period_m: 0.050          # 50 mm cell pitch (standard 2-inch egg crate)
+amplitude_m: 0.038       # 38 mm wedge depth (half-amplitude)
+primary_axis: u          # u = world X
+
+harmonics_u:
+  - freq: 1.0
+    amplitude: 1.0
+    phase_rad: 0.0
+
+harmonics_v:
+  - freq: 1.0
+    amplitude: 1.0
+    phase_rad: 0.0
+
+combine_mode: product    # h(u,v) = H_u(u) * H_v(v)
+
+edge_blend_m: 0.030
+tile_policy: repeat
+
+notes: >
+  For combine_mode=product the two per-axis sinusoids are independently
+  evaluated and then multiplied.  This creates a saddle shape at each grid
+  corner and a peak in the centre of each cell.

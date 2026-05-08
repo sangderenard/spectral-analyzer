@@ -151,7 +151,15 @@ emission:
       - {amp: 0.25, center: 620.0, q: 10.0}
     peak_wavelength_nm: 590.0
     fwhm_nm:           49.0
-    total_power_W:     0.22
+    total_power_W:     2.6
+
+  material_database_failure:
+    spd:
+      - {amp: 1.00, center: 532.0, q: 18.0}
+      - {amp: 0.30, center: 505.0, q: 10.0}
+    peak_wavelength_nm: 532.0
+    fwhm_nm:           22.0
+    total_power_W:     3.2
 
   emerald_internal:
     spd:

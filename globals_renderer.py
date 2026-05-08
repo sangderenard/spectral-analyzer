@@ -18,6 +18,7 @@ Architecture
         2D-GL  →  doc_renderer.DocRenderer (this repo)        → GL blit
         3D-C   →  spectral_kernels.BaseRasterizer             → CPU RGBA8
         3D-GL  →  Renderer.render() (existing GL pipeline)    → GL pipeline
+        3D-RT  →  spectral_kernels.RayTracer progressive pass  → CPU RGBA8
 
 The 2D and 3D channels are *not* lock-step.  Each channel has its own
 ``cadence`` (frames-per-call) and ``min_period_s`` (wall-clock floor),
@@ -179,19 +180,24 @@ class _AsyncCWorker:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class ChannelBackend(enum.Enum):
-    C  = "c"
-    GL = "gl"
+    C        = "c"
+    GL       = "gl"
+    RAYTRACE = "raytrace"
 
     @classmethod
     def from_render_mode(cls, mode: Any) -> "ChannelBackend":
         """Coerce a RenderMode (or its .value string) into a backend tag.
 
-        HYBRID and RAYTRACE are treated as GL for the global default
-        selection; explicit C means the CPU global runs.
+        HYBRID is treated as GL for the global default selection; RAYTRACE
+        selects the progressive C ray tracer.
         """
         v = getattr(mode, "value", mode)
         s = str(v).lower() if v is not None else "c"
-        return cls.C if s == "c" else cls.GL
+        if s == "c":
+            return cls.C
+        if s == "raytrace":
+            return cls.RAYTRACE
+        return cls.GL
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -229,9 +235,10 @@ class _ChannelGate:
 @dataclass
 class GlobalDispatchResult:
     out_2d_rgba: Optional[Any] = None    # numpy (H,W,4) uint8 if C 2D ran
-    out_3d_rgba: Optional[Any] = None    # numpy (H,W,4) uint8 if C 3D ran
+    out_3d_rgba: Optional[Any] = None    # numpy (H,W,4) uint8 if CPU 3D ran
+    preblitted_3d: bool = False          # CPU 3D was already deposited before 2D-GL
     used_2d: Optional[str] = None        # 'c' | 'gl' | None
-    used_3d: Optional[str] = None        # 'c' | 'gl' | None
+    used_3d: Optional[str] = None        # 'c' | 'gl' | 'raytrace' | None
     skipped_2d_reason: str = ""
     skipped_3d_reason: str = ""
 
@@ -255,8 +262,10 @@ class GlobalChannelDispatcher:
         height: int,
         gl_doc_renderer: Optional[Any] = None,
         gl_render_callback: Optional[Any] = None,
+        pre_2d_blit_callback: Optional[Any] = None,
         c_doc_backend: Optional[Any] = None,
         geometry_packer: Optional[Any] = None,
+        raytrace_packer: Optional[Any] = None,
         cadence_2d: int = 1,
         cadence_3d: int = 1,
         min_period_2d_s: float = 0.0,
@@ -271,6 +280,7 @@ class GlobalChannelDispatcher:
         # Pre-built GL globals (provided by host).  Either may be None.
         self._gl_doc = gl_doc_renderer        # doc_renderer.DocRenderer instance
         self._gl_render = gl_render_callback  # callable: () -> None  (Renderer.render)
+        self._pre_2d_blit = pre_2d_blit_callback  # callable: (rgba) -> None
 
         # Shared C doc state.  When the host already runs a
         # ``doc_renderer.DocRenderer`` (Python wrapper around
@@ -284,6 +294,12 @@ class GlobalChannelDispatcher:
         # Lazily-built C 3D global.
         self._c_raster = None                 # _spectral_kernels.BaseRasterizer
         self._last_2d_c_rgba = None
+        self._ray_tracer = None               # _spectral_kernels.RayTracer
+        self._ray_scene_key = None
+        self._ray_last_packed = None
+        self._ray_accum = None                # float32 (3,H,W), decayed in place
+        self._ray_last_wall = 0.0
+        self._ray_seed = 0
 
         # Geometry packer for 3D-C: host-supplied callable.  Returns a
         # 3-tuple (verts_view, mat_ids, proj) describing the scene.
@@ -293,6 +309,7 @@ class GlobalChannelDispatcher:
         # No global "scene_rgb" / "scene_indirect" tints are accepted;
         # every photon must trace back to a real emitter cluster.
         self._geometry_packer = geometry_packer
+        self._raytrace_packer = raytrace_packer
 
         # Cached material bundle references for CPU/GPU sync. The material DB
         # already keeps a prebaked tensor dictionary; we only re-upload when
@@ -314,9 +331,11 @@ class GlobalChannelDispatcher:
         if self._async_c:
             self._worker_2d_c: Optional[_AsyncCWorker] = _AsyncCWorker("2D-C")
             self._worker_3d_c: Optional[_AsyncCWorker] = _AsyncCWorker("3D-C")
+            self._worker_3d_raytrace: Optional[_AsyncCWorker] = _AsyncCWorker("3D-RT")
         else:
             self._worker_2d_c = None
             self._worker_3d_c = None
+            self._worker_3d_raytrace = None
 
         # Per-channel feature budget.  Distinct from leftover/content
         # count: this caps how many OPTIONAL RENDERING FEATURES the C
@@ -342,6 +361,14 @@ class GlobalChannelDispatcher:
     def attach_geometry_packer(self, packer: Any) -> None:
         """Set / replace the 3D-C geometry packing callback."""
         self._geometry_packer = packer
+
+    def attach_raytrace_packer(self, packer: Any) -> None:
+        """Set / replace the 3D ray-trace packing callback."""
+        self._raytrace_packer = packer
+
+    def attach_pre_2d_blit_callback(self, callback: Any) -> None:
+        """Set / replace the CPU-background blit hook used before 2D-GL."""
+        self._pre_2d_blit = callback
 
     # -- C backend lazy init --------------------------------------------------
 
@@ -401,7 +428,7 @@ class GlobalChannelDispatcher:
                 pass
 
     def shutdown(self) -> None:
-        for w in (self._worker_2d_c, self._worker_3d_c):
+        for w in (self._worker_2d_c, self._worker_3d_c, self._worker_3d_raytrace):
             if w is not None:
                 try:
                     w.shutdown()
@@ -412,6 +439,7 @@ class GlobalChannelDispatcher:
         return {
             "2d_c": self._worker_2d_c.stats() if self._worker_2d_c else None,
             "3d_c": self._worker_3d_c.stats() if self._worker_3d_c else None,
+            "3d_raytrace": self._worker_3d_raytrace.stats() if self._worker_3d_raytrace else None,
             "feature_budget_2d": self.feature_budget_2d,
             "feature_budget_3d": self.feature_budget_3d,
             "features_2d": [n for _p, n, _f in self._features_2d],
@@ -528,6 +556,107 @@ class GlobalChannelDispatcher:
         except Exception:
             return False
 
+    def _job_3d_raytrace(self, packed: Any, leftovers: Mapping[Any, Any]) -> Optional[Any]:
+        """Worker-thread body: progressive C ray tracing with temporal decay."""
+        try:
+            import math as _math
+            import numpy as _np
+            import _spectral_kernels as _sk
+        except Exception:
+            return None
+
+        if not isinstance(packed, Mapping):
+            return None
+
+        tris = packed.get("tris")
+        normals = packed.get("normals")
+        refl_re = packed.get("refl_re")
+        refl_im = packed.get("refl_im")
+        diffusion = packed.get("diffusion")
+        freq_hz = packed.get("freq_hz")
+        atmo_abs = packed.get("atmo_abs")
+        sources_pos = packed.get("src_pos")
+        sources_dir = packed.get("src_dir")
+        sources_directivity = packed.get("src_directivity")
+        if tris is None or normals is None or refl_re is None or refl_im is None:
+            return None
+        if sources_pos is None or sources_dir is None or sources_directivity is None:
+            return None
+
+        tris = _np.ascontiguousarray(tris, dtype=_np.float64)
+        n_tris = int(tris.shape[0]) if tris.ndim == 3 else 0
+        if n_tris <= 0:
+            return None
+
+        scene_key = packed.get("scene_key", None)
+        n_bands = int(_np.asarray(freq_hz).size) if freq_hz is not None else 3
+        try:
+            if self._ray_tracer is None or scene_key != self._ray_scene_key:
+                self._ray_tracer = _sk.RayTracer(
+                    n_tris,
+                    tris,
+                    _np.ascontiguousarray(normals, dtype=_np.float64),
+                    _np.ascontiguousarray(refl_re, dtype=_np.float64),
+                    _np.ascontiguousarray(refl_im, dtype=_np.float64),
+                    _np.ascontiguousarray(diffusion, dtype=_np.float64),
+                    _np.ascontiguousarray(freq_hz, dtype=_np.float64),
+                    float(packed.get("speed_m_s", 299792458.0)),
+                    _np.ascontiguousarray(atmo_abs, dtype=_np.float64),
+                )
+                self._ray_scene_key = scene_key
+                self._ray_accum = _np.zeros((n_bands, self.height, self.width), dtype=_np.float32)
+                self._ray_last_wall = 0.0
+        except Exception:
+            self._ray_tracer = None
+            self._ray_scene_key = None
+            return None
+
+        if self._ray_accum is None or self._ray_accum.shape != (n_bands, self.height, self.width):
+            self._ray_accum = _np.zeros((n_bands, self.height, self.width), dtype=_np.float32)
+
+        now = time.monotonic()
+        half_life = max(0.0, float(packed.get("decay_half_life_s", 5.0)))
+        if self._ray_last_wall > 0.0 and half_life > 0.0:
+            dt = max(0.0, now - self._ray_last_wall)
+            self._ray_accum *= float(0.5 ** (dt / max(1e-6, half_life)))
+        self._ray_last_wall = now
+
+        n_sources = int(_np.asarray(sources_directivity).size)
+        if n_sources > 0:
+            self._ray_seed = (self._ray_seed + 1) & 0x7fffffff
+            try:
+                self._ray_tracer.integrate_image_into(
+                    _np.ascontiguousarray(sources_pos, dtype=_np.float64),
+                    _np.ascontiguousarray(sources_dir, dtype=_np.float64),
+                    _np.ascontiguousarray(sources_directivity, dtype=_np.float64),
+                    _np.ascontiguousarray(packed.get("cam_pos"), dtype=_np.float64),
+                    _np.ascontiguousarray(packed.get("cam_fwd"), dtype=_np.float64),
+                    _np.ascontiguousarray(packed.get("cam_up"), dtype=_np.float64),
+                    self._ray_accum,
+                    float(packed.get("fov_rad", 1.0)),
+                    int(packed.get("n_rays", 256)),
+                    int(packed.get("max_bounces", 6)),
+                    float(packed.get("min_amplitude", 0.002)),
+                    int(packed.get("seed", 1337)) + self._ray_seed,
+                )
+            except Exception:
+                return None
+
+        rgb = self._ray_accum
+        if n_bands != 3:
+            if n_bands <= 0:
+                return None
+            mono = rgb.mean(axis=0, keepdims=True)
+            rgb = _np.repeat(mono, 3, axis=0)
+        exposure = max(1e-6, float(packed.get("exposure", 1.0)))
+        gamma = max(1e-6, float(packed.get("gamma", 0.55)))
+        img = _np.moveaxis(rgb[:3], 0, -1) * exposure
+        img = img / (1.0 + img)
+        img = _np.clip(img, 0.0, 1.0) ** gamma
+        alpha = _np.where(img.max(axis=2, keepdims=True) > 1e-6, 1.0, 0.0)
+        rgba = _np.concatenate([img, alpha], axis=2)
+        return _np.ascontiguousarray(_np.clip(rgba * 255.0, 0, 255).astype(_np.uint8))
+
     # -- Top-level dispatch ---------------------------------------------------
 
     def dispatch(
@@ -593,17 +722,68 @@ class GlobalChannelDispatcher:
                         self.gate_3d.stamp(frame_index, now)
                     else:
                         result.skipped_3d_reason = "c backend unavailable"
-            else:
+            elif mode_3d is ChannelBackend.GL:
                 if self._run_3d_gl(leftovers_3d):
                     result.used_3d = "gl"
                     self.gate_3d.stamp(frame_index, now)
                 else:
                     result.skipped_3d_reason = "gl backend unavailable"
+            else:
+                packed = None
+                if self._raytrace_packer is not None:
+                    try:
+                        packed = self._raytrace_packer(leftovers_3d)
+                    except Exception:
+                        packed = None
+                if packed is not None:
+                    self._ray_last_packed = packed
+                elif self._ray_last_packed is not None:
+                    packed = self._ray_last_packed
+                if self._worker_3d_raytrace is not None:
+                    _lo = leftovers_3d
+                    _pk = packed
+                    accepted = self._worker_3d_raytrace.submit(
+                        lambda: self._job_3d_raytrace(_pk, _lo)
+                    )
+                    rgba = self._worker_3d_raytrace.latest()
+                    if rgba is not None:
+                        result.out_3d_rgba = rgba
+                        result.used_3d = "raytrace"
+                        self.gate_3d.stamp(frame_index, now)
+                    else:
+                        result.skipped_3d_reason = (
+                            "raytrace worker accepted, awaiting first result"
+                            if accepted else "raytrace worker busy, no prior result"
+                        )
+                else:
+                    rgba = self._job_3d_raytrace(packed, leftovers_3d)
+                    if rgba is not None:
+                        result.out_3d_rgba = rgba
+                        result.used_3d = "raytrace"
+                        self.gate_3d.stamp(frame_index, now)
+                    else:
+                        result.skipped_3d_reason = "raytrace backend unavailable"
+
+        # If the 2D channel is drawn inline through GL, deposit any
+        # CPU-produced 3D background now. Waiting until dispatch returns would
+        # put raytrace/C 3D on top of the GL HUD.
+        if (
+            mode_2d is not ChannelBackend.C
+            and result.out_3d_rgba is not None
+            and self._pre_2d_blit is not None
+        ):
+            try:
+                self._pre_2d_blit(result.out_3d_rgba)
+                result.preblitted_3d = True
+            except Exception:
+                result.preblitted_3d = False
 
         # ── 2D channel second (HUD overlay on top of 3D background) ─────
-        if not leftovers_2d:
-            result.skipped_2d_reason = "no leftovers"
-        elif not self.gate_2d.due(frame_index, now):
+        # The doc renderer receives direct per-frame submissions from the HUD
+        # before dispatch runs.  Those submissions can make the doc backend
+        # dirty even when the shader-walker leftover set is empty, so do not
+        # use ``leftovers_2d`` as a hard skip condition here.
+        if not self.gate_2d.due(frame_index, now):
             result.skipped_2d_reason = "cadence/period"
         else:
             if mode_2d is ChannelBackend.C:

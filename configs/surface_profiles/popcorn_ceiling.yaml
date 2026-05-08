@@ -1,0 +1,47 @@
+# Surface tessellation profile: popcorn_ceiling
+# Multi-frequency stochastic-looking ceiling texture.
+# Irrational-ratio frequencies break visible periodicity over large spans.
+
+name: popcorn_ceiling
+description: >
+  Spray-applied acoustic popcorn (cottage cheese) ceiling texture.
+  Approximated as a 2D sum of sinusoids at incommensurable frequencies to
+  produce an aperiodic-looking random bump field.  Both axes use 3 terms
+  with sqrt(2)-, sqrt(3)-, and sqrt(5)-derived frequencies to avoid
+  Moiré patterns across a typical room span.
+
+period_m: 0.018          # nominal bump size (18 mm base period)
+amplitude_m: 0.003       # 3 mm surface roughness half-amplitude
+primary_axis: u
+
+harmonics_u:
+  - freq: 1.0000
+    amplitude: 1.0000
+    phase_rad: 0.0000
+  - freq: 1.4142          # sqrt(2)
+    amplitude: 0.6000
+    phase_rad: 0.7854      # pi/4
+  - freq: 2.2361          # sqrt(5)
+    amplitude: 0.3500
+    phase_rad: 1.3090
+
+harmonics_v:
+  - freq: 1.0000
+    amplitude: 0.8500
+    phase_rad: 0.5236      # pi/6
+  - freq: 1.7321          # sqrt(3)
+    amplitude: 0.5000
+    phase_rad: 0.9817
+  - freq: 2.6458          # sqrt(7)
+    amplitude: 0.2500
+    phase_rad: 1.8326
+
+combine_mode: sum_abs     # |H_u| + |H_v| gives mound-like bumps not wells
+
+edge_blend_m: 0.020
+tile_policy: repeat
+
+notes: >
+  combine_mode=sum_abs takes the absolute value of each 1D sum before
+  adding the axes together.  This transforms the bipolar sine pattern into
+  an all-positive bump field that reads as a random spray texture.

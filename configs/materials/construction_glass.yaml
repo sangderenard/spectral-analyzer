@@ -1,0 +1,68 @@
+# Material: construction_glass
+# Semi-transparent float glass used for unfinished room surfaces.
+# Serves the same visual role as borosilicate_glass on console enclosures
+# before material delivery is complete.
+
+name: construction_glass
+description: Semi-transparent construction float glass, slight blue-green tint, unfinished surface state
+
+color_profile_name: construction_glass
+emit_profile_name: construction_borosilicate
+reflectivity: 0.06
+diffusion: 0.004
+absorption: 0.08
+
+smoothness: 0.92
+ior: 1.52
+opacity: 0.15
+
+pbr:
+  albedo: [0.72, 0.82, 0.85]
+  roughness: 0.06
+  metallic: 0.0
+  transmission: 0.82
+
+enamel:
+  thickness_m: 0.0
+  ior_real: 1.52
+  ior_imag: 0.0
+  color_rgb: [0.74, 0.84, 0.87]
+  roughness: 0.04
+
+spectral_bands:
+  - center_hz: 428274940000000.0
+    bandwidth_hz: 34261995000000.0
+    reflectance: 0.04
+    transmittance: 0.88
+    diffuse_frac: 0.003
+    ior_real: 1.52
+    ior_imag: 0.0
+  - center_hz: 545077196000000.0
+    bandwidth_hz: 40880790000000.0
+    reflectance: 0.05
+    transmittance: 0.86
+    diffuse_frac: 0.003
+    ior_real: 1.52
+    ior_imag: 0.0
+  - center_hz: 666205462000000.0
+    bandwidth_hz: 43303355000000.0
+    reflectance: 0.06
+    transmittance: 0.80
+    diffuse_frac: 0.004
+    ior_real: 1.51
+    ior_imag: 0.0
+
+gameplay:
+  label: Construction Glass
+  category: surface_state
+  tier: unfinished
+  role: unfinished_surface_placeholder
+
+notes: >
+  Thin float glass (soda-lime composition, IOR 1.52) used as the placeholder
+  material for any room surface triangle that has not yet received its assigned
+  finish material.  The slight blue-green albedo bias ([0.72, 0.82, 0.85])
+  and low opacity (0.15) match the visual language already used for unfinished
+  PlacedEnclosure console glass.  High transmittance means the geometry is
+  visible but clearly incomplete.  This material should never appear in a
+  fully delivered room.

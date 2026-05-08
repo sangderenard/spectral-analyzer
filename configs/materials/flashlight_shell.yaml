@@ -1,0 +1,87 @@
+# Material: flashlight_shell
+# Matte-black anodized aluminium exterior body, back cap, and front rim
+# of the PlayerFlashlight.  High absorption, low specular — designed to
+# disappear visually so the reflector and bulb dominate the read.
+
+name: flashlight_shell
+description: Matte-black anodized aluminium flashlight body
+
+color_profile_name: anodized_black
+# No emission
+
+reflectivity: 0.04
+diffusion:    0.60
+absorption:   0.36
+
+smoothness: 0.30
+ior:        1.80               # anodized aluminium oxide coating
+opacity:    1.0
+
+pbr:
+  albedo:        [0.04, 0.04, 0.04]   # near-black; not pure 0 to avoid banding
+  roughness:     0.65
+  metallic:      0.0
+  transmission:  0.0
+  emission_rgb:  [0.0, 0.0, 0.0]
+
+enamel:
+  thickness_m:  0.0000002          # 200 nm anodize layer — very subtle iridescence
+  ior_real:     1.63               # Al₂O₃
+  ior_imag:     0.0
+  color_rgb:    [0.04, 0.04, 0.04]
+  roughness:    0.65
+
+texture_stack:
+  emit_gain:          0.0
+  color_blend:        0.0
+  direct_lobe_power:  1.0
+  model_flags:        0
+  remit_gain:         0.0
+  bulb_radius_mm:     0.0
+  remit_decay:        0.0
+  translucence_gain:  0.0
+
+spectral_bands:
+  # Blue — matte black absorbs uniformly across visible
+  - center_hz:     666700000000000.0
+    bandwidth_hz:   55000000000000.0
+    reflectance:   0.04
+    transmittance: 0.0
+    diffuse_frac:  0.80
+    emission:      0.0
+    reemission:    0.0
+    ior_real:      1.80
+    ior_imag:      0.0
+  # Green
+  - center_hz:     545000000000000.0
+    bandwidth_hz:   50000000000000.0
+    reflectance:   0.04
+    transmittance: 0.0
+    diffuse_frac:  0.80
+    emission:      0.0
+    reemission:    0.0
+    ior_real:      1.80
+    ior_imag:      0.0
+  # Red
+  - center_hz:     461000000000000.0
+    bandwidth_hz:   45000000000000.0
+    reflectance:   0.04
+    transmittance: 0.0
+    diffuse_frac:  0.80
+    emission:      0.0
+    reemission:    0.0
+    ior_real:      1.80
+    ior_imag:      0.0
+
+gameplay:
+  label:    Flashlight Shell
+  category: equipment_body
+  tier:     equipment
+  role:     structural_shell
+
+notes: >
+  Anodized black Al₂O₃: the 200 nm coating produces a barely-visible darkening
+  of the already-black surface — in the ray-tracer this reads as a matte shell
+  with no competing specular, so the eye goes straight to the bright cup interior.
+  albedo [0.04,0.04,0.04] is slightly above pure black to keep it out of the
+  numerical black-point where some shaders clamp to zero.

@@ -1,0 +1,38 @@
+# Surface tessellation profile: wedge_foam
+# Linear saw-tooth wedge repeated along one axis, flat along the other.
+
+name: wedge_foam
+description: >
+  Wedge-type acoustic foam panel.  Vertical triangular prisms of absorber
+  material arranged side-by-side.  Approximated as an asymmetric sawtooth
+  using the first four odd Fourier harmonics of a square wave.
+
+period_m: 0.100          # 100 mm wedge pitch
+amplitude_m: 0.075       # 75 mm wedge height (half-amplitude)
+primary_axis: u          # wedges run in the u = world X direction
+
+harmonics_u:             # Fourier sawtooth approximation
+  - freq: 1.0
+    amplitude: 1.0000
+    phase_rad: 0.0
+  - freq: 3.0
+    amplitude: 0.1111    # 1/9
+    phase_rad: 0.0
+  - freq: 5.0
+    amplitude: 0.0400    # 1/25
+    phase_rad: 0.0
+  - freq: 7.0
+    amplitude: 0.0204    # 1/49
+    phase_rad: 0.0
+
+harmonics_v: []          # no cross variation; wedges are linear prisms
+
+combine_mode: sum
+
+edge_blend_m: 0.040
+tile_policy: repeat
+
+notes: >
+  The Gibbs-phenomenon ringing from the sawtooth approximation appears as a
+  small overshoot at the wedge tip which is physically plausible and adds
+  micro-scale variation.  More harmonics can be added up to the shader limit.

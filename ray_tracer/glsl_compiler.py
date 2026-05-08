@@ -9,8 +9,8 @@ Current shader ownership and call sites:
 - demo_pluck_gl.py
 - camera_designer_station.py
 - opengl_widget.py
-- _extract_shader.py
-- demo_pluck_gl.old.py
+- _archive/_extract_shader.py
+- _archive/demo_pluck_gl.old.py
 
 Existing standalone shader assets:
 - csrc/shaders/coherent_accumulate.comp.glsl

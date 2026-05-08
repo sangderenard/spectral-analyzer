@@ -15,8 +15,7 @@
  *   - Schlick Fresnel from IOR — no grain texture (this is a materials renderer,
  *     not a guitar prop renderer).
  *   - Thin-film enamel: iridescence via three-cosine OPD approximation + gloss.
- *   - sRGB gamma correction on readback (not inline — avoids repeated pow in
- *     the inner loop when the caller reads back only once per frame).
+ *   - U8 readback is linear clamp/quantize (no sRGB transfer).
  */
 
 #include "base_rasterizer.h"
@@ -38,6 +37,7 @@
 #include <vector>
 
 using Eigen::Matrix4f;
+using Eigen::Matrix3f;
 using Eigen::Vector2f;
 using Eigen::Vector3f;
 using Eigen::Vector4f;
@@ -209,6 +209,9 @@ struct SceneParams {
     Vector3f light_positions[MAX_LIGHTS]; // view-space positions (point lights)
     Vector3f light_colors   [MAX_LIGHTS]; // linear RGB, no clamp
     float    light_intensities[MAX_LIGHTS] = {0};
+    int      light_group_ids[MAX_LIGHTS] = {0};
+    float    light_calibration = 1.0f;
+    Matrix3f cat_ccm = Matrix3f::Identity();
 };
 
 struct MaterialSample {
@@ -360,6 +363,7 @@ static inline Vector3f kernel_shade_lights(
     const GeomTerms& g,
     const FresnelTerms& f,
     const SceneParams& sc,
+    int current_group_id,
     bool enable_specular,
     Vector3f* spec_color_out,
     float* spec_strength_out)
@@ -369,6 +373,9 @@ static inline Vector3f kernel_shade_lights(
     float    spec_strength_acc = 0.0f;
 
     for (int i = 0; i < sc.n_lights; ++i) {
+        if (sc.light_group_ids[i] == current_group_id) {
+            continue;
+        }
         // Per-fragment L from positional light.  This is what makes the
         // illumination track the emitter mesh in space — directional-only
         // lights collapse the geometry to a single point at the camera and
@@ -377,8 +384,10 @@ static inline Vector3f kernel_shade_lights(
         float    Lr2  = std::max(1e-8f, Lvec.squaredNorm());
         float    inv_Lr = 1.0f / std::sqrt(Lr2);
         Vector3f L    = Lvec * inv_Lr;
+        const float emitter_r2 = std::max(0.0f, sc.light_intensities[i]) * 0.0795774715f; // area / (4*pi)
+        const float atten_r2 = std::max(1e-8f, Lr2 + emitter_r2);
         // Inverse-square falloff (intensity already carries emitter area).
-        Vector3f Lcol = sc.light_colors[i] * (sc.light_intensities[i] / Lr2);
+        Vector3f Lcol = sc.light_colors[i] * ((sc.light_intensities[i] * sc.light_calibration) / atten_r2);
         Vector3f LV = L + g.V;
         float lv2 = LV.squaredNorm();
         Vector3f H = (lv2 > 1e-12f) ? Vector3f(LV * (1.0f / std::sqrt(lv2))) : g.V;
@@ -471,6 +480,7 @@ static Vector3f shade(
     const float*    phong_data,
     const float*    enamel_data,
     const SceneParams& sc,
+    int             group_id,
     bool            enable_specular,
     bool            enable_emission_direct,
     const Vector4f& emit_uv,
@@ -500,7 +510,7 @@ static Vector3f shade(
 
     Vector3f spec_col(0.0f, 0.0f, 0.0f);
     float spec = 0.0f;
-    Vector3f col = kernel_shade_lights(m, pos_v, g, f, sc, enable_specular, &spec_col, &spec);
+    Vector3f col = kernel_shade_lights(m, pos_v, g, f, sc, group_id, enable_specular, &spec_col, &spec);
 
     // Translucence: profile 2 (SSS) uses 4× stronger coupling
     float t_scale = (profile_id == 2) ? 0.08f : 0.02f;
@@ -533,6 +543,8 @@ static Vector3f shade(
     }
 
     col = kernel_enamel_coat(col, m, g, spec_col, spec);
+    // Color compensation equation: C' = CAT_CCM * C.
+    col = sc.cat_ccm * col;
     return col;
 }
 
@@ -640,7 +652,9 @@ struct PacketShadeOutput {
         const Array8f Ly = Lvec_y * inv_Lr;
         const Array8f Lz = Lvec_z * inv_Lr;
 
-        const Array8f Lcol_scale = Array8f::Constant(sc.light_intensities[i]) / Lr2;
+        const float emitter_r2 = std::max(0.0f, sc.light_intensities[i]) * 0.0795774715f; // area / (4*pi)
+        const Array8f atten_r2 = (Lr2 + Array8f::Constant(emitter_r2)).max(Array8f::Constant(1e-8f));
+        const Array8f Lcol_scale = Array8f::Constant(sc.light_intensities[i] * sc.light_calibration) / atten_r2;
         const Array8f Lcol_x = Array8f::Constant(sc.light_colors[i].x()) * Lcol_scale;
         const Array8f Lcol_y = Array8f::Constant(sc.light_colors[i].y()) * Lcol_scale;
         const Array8f Lcol_z = Array8f::Constant(sc.light_colors[i].z()) * Lcol_scale;
@@ -780,9 +794,15 @@ struct PacketShadeOutput {
         col_z = tinted_z * Array8f::Constant(0.35f) + col_z * Array8f::Constant(0.65f);
     }
 
-    out.col_r = col_x;
-    out.col_g = col_y;
-    out.col_b = col_z;
+    out.col_r = Array8f::Constant(sc.cat_ccm(0, 0)) * col_x
+              + Array8f::Constant(sc.cat_ccm(0, 1)) * col_y
+              + Array8f::Constant(sc.cat_ccm(0, 2)) * col_z;
+    out.col_g = Array8f::Constant(sc.cat_ccm(1, 0)) * col_x
+              + Array8f::Constant(sc.cat_ccm(1, 1)) * col_y
+              + Array8f::Constant(sc.cat_ccm(1, 2)) * col_z;
+    out.col_b = Array8f::Constant(sc.cat_ccm(2, 0)) * col_x
+              + Array8f::Constant(sc.cat_ccm(2, 1)) * col_y
+              + Array8f::Constant(sc.cat_ccm(2, 2)) * col_z;
     out.alpha = Array8f::Constant(m0.opacity);
     return out;
 }
@@ -804,6 +824,7 @@ struct ProjVertex {
 struct ScreenTri {
     ProjVertex v[3];
     int   mat_id;
+    int   group_id;
     float bbox_x0, bbox_y0, bbox_x1, bbox_y1;  // screen bbox
     bool  valid;
 };
@@ -850,6 +871,8 @@ struct BaseRasterizerState {
     int max_lights = SceneParams::MAX_LIGHTS;
     bool enable_specular = true;
     bool enable_emission_direct = false;
+    float light_calibration = 1.0f;
+    Matrix3f cat_ccm = Matrix3f::Identity();
 
     // ── Object-group cache for emissive cluster lights ────────────────
     //
@@ -1148,6 +1171,36 @@ void br_set_emission_direct_enabled(BaseRasterizerState* st, int enabled)
     st->enable_emission_direct = enabled != 0;
 }
 
+void br_set_light_calibration(BaseRasterizerState* st, float factor)
+{
+    if (!st) return;
+    if (!std::isfinite(factor)) factor = 1.0f;
+    st->light_calibration = factor;
+}
+
+void br_set_cat_ccm_matrix(BaseRasterizerState* st, const float* m3x3_row_major)
+{
+    if (!st) return;
+    if (!m3x3_row_major) {
+        st->cat_ccm = Matrix3f::Identity();
+        return;
+    }
+    Matrix3f m = Matrix3f::Identity();
+    bool ok = true;
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            const float v = m3x3_row_major[r * 3 + c];
+            if (!std::isfinite(v)) {
+                ok = false;
+                break;
+            }
+            m(r, c) = v;
+        }
+        if (!ok) break;
+    }
+    st->cat_ccm = ok ? m : Matrix3f::Identity();
+}
+
 /* ── Project helpers ─────────────────────────────────────────────────────── */
 
 // Vertex projection is performed in bulk inside br_render() as a single
@@ -1196,6 +1249,18 @@ static void br_render_impl(BaseRasterizerState* st,
     }
     Eigen::Matrix<float, 4, Eigen::Dynamic> clip_all = proj * positions;
 
+    std::vector<int> tri_group_ids((size_t)n_tris, -1);
+    std::vector<uint8_t> tri_cull_immune((size_t)n_tris, 0);
+    for (const BRGroup& g : st->groups) {
+        int t0 = std::max(0, g.tri_offset);
+        int t1 = std::min(n_tris, g.tri_offset + g.tri_count);
+        const uint8_t _ci = (g.dirty & BR_GROUP_CULL_IMMUNE) ? 1u : 0u;
+        for (int ti = t0; ti < t1; ++ti) {
+            tri_group_ids[(size_t)ti] = g.group_id;
+            tri_cull_immune[(size_t)ti] = _ci;
+        }
+    }
+
     st->screen_tris.resize(static_cast<size_t>(n_tris));
     for (int i = 0; i < n_tris; ++i) {
         ScreenTri& st_tri = st->screen_tris[i];
@@ -1234,6 +1299,7 @@ static void br_render_impl(BaseRasterizerState* st,
             pv.valid = true;
         }
         st_tri.mat_id = mat_ids[i];
+        st_tri.group_id = tri_group_ids[(size_t)i];
 
         if (!st_tri.v[0].valid || !st_tri.v[1].valid || !st_tri.v[2].valid) {
             st_tri.valid = false;
@@ -1251,14 +1317,22 @@ static void br_render_impl(BaseRasterizerState* st,
             continue;
         }
 
-        // Back-face cull in screen space
+        // Normalize screen-space winding for the rasterizer.
+        // Back-faces are culled by default; cull-immune triangles keep
+        // two-sided behavior.
         float ex0 = st_tri.v[1].sx - st_tri.v[0].sx;
         float ey0 = st_tri.v[1].sy - st_tri.v[0].sy;
         float ex1 = st_tri.v[2].sx - st_tri.v[0].sx;
         float ey1 = st_tri.v[2].sy - st_tri.v[0].sy;
         float signed_area = ex0 * ey1 - ex1 * ey0;
-        // Cull back faces (positive signed area in screen space = back)
-        if (signed_area >= 0.0f) { st_tri.valid = false; continue; }
+        if (std::abs(signed_area) <= 1e-9f) { st_tri.valid = false; continue; }
+        if (signed_area > 0.0f) {
+            if (tri_cull_immune[(size_t)i] == 0u) {
+                st_tri.valid = false;
+                continue;
+            }
+            std::swap(st_tri.v[1], st_tri.v[2]);
+        }
         st_tri.valid = true;
 
         float minx = std::min({st_tri.v[0].sx, st_tri.v[1].sx, st_tri.v[2].sx});
@@ -1320,6 +1394,8 @@ static void br_render_impl(BaseRasterizerState* st,
     // The cache lives in `st->group_cache` and persists across renders.
     // Groups absent from the current st->groups list are dropped.
     SceneParams scene;
+    scene.light_calibration = st->light_calibration;
+    scene.cat_ccm = st->cat_ccm;
     {
         // Drop stale cache entries (groups no longer declared).
         {
@@ -1419,7 +1495,7 @@ static void br_render_impl(BaseRasterizerState* st,
         }
 
         // Emit lights from the cache.  Up to MAX_LIGHTS strongest entries.
-        struct Cand { Vector3f pos; Vector3f col; float inten; };
+        struct Cand { Vector3f pos; Vector3f col; float inten; int group_id; };
         std::vector<Cand> cands;
         cands.reserve(st->group_cache.size());
 
@@ -1437,7 +1513,7 @@ static void br_render_impl(BaseRasterizerState* st,
             // space and let the per-fragment shader compute L = normalize(
             // centroid - pos_v).  Directional approximation produced an
             // apparent axis flip on receivers far from the camera origin.
-            cands.push_back({c.centroid_v, col, c.area_sum});
+            cands.push_back({c.centroid_v, col, c.area_sum, kv.first});
         }
         std::sort(cands.begin(), cands.end(),
                   [](const Cand& a, const Cand& b){ return a.inten > b.inten; });
@@ -1448,7 +1524,12 @@ static void br_render_impl(BaseRasterizerState* st,
             scene.light_positions[i]   = cands[i].pos;
             scene.light_colors[i]      = cands[i].col;
             scene.light_intensities[i] = cands[i].inten;
+            scene.light_group_ids[i]   = cands[i].group_id;
         }
+
+        // Keep debug/readback APIs in sync with the exact light set that is
+        // consumed by the shading loop below.
+        st->scene = scene;
     }
 
     parallel_for(n_tiles, [&](int tile_id) {
@@ -1535,7 +1616,6 @@ static void br_render_impl(BaseRasterizerState* st,
                         int idx = py * W + px;
                         if (depth < -1.0f || depth > 1.0f) continue;
                         if (depth >= zbuf[idx]) continue;
-                        zbuf[idx] = depth;
 
                         float iw = lam0 * tri.v[0].inv_w
                                  + lam1 * tri.v[1].inv_w
@@ -1569,6 +1649,7 @@ static void br_render_impl(BaseRasterizerState* st,
                                              tri.mat_id,
                                              pbr_data, phong_data, enamel_data,
                                              scene,
+                                             tri.group_id,
                                              st->enable_specular,
                                              st->enable_emission_direct,
                                              emit_uv,
@@ -1581,6 +1662,12 @@ static void br_render_impl(BaseRasterizerState* st,
                                              translucence_gain,
                                              bulb_radius_mm,
                                              &alpha);
+
+                        // Transparent fragments blend but do not own depth,
+                        // so geometry behind them can still shade.
+                        if (alpha >= 0.9999f) {
+                            zbuf[idx] = depth;
+                        }
 
                         float* p = cbuf + idx * 4;
                         if (alpha >= 0.9999f) {
@@ -1622,19 +1709,13 @@ void br_render_textured(BaseRasterizerState* st,
 
 /* ── Readback ────────────────────────────────────────────────────────────── */
 
-static inline float linear_to_srgb(float c) {
-    c = std::max(0.0f, std::min(1.0f, c));
-    return (c <= 0.0031308f) ? c * 12.92f
-                              : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
-}
-
 void br_readback_u8(const BaseRasterizerState* st, uint8_t* out) {
     const float* c = st->cbuf.data();
     int n = st->width * st->height;
     for (int i = 0; i < n; ++i) {
-        out[4*i+0] = static_cast<uint8_t>(linear_to_srgb(c[4*i+0]) * 255.0f + 0.5f);
-        out[4*i+1] = static_cast<uint8_t>(linear_to_srgb(c[4*i+1]) * 255.0f + 0.5f);
-        out[4*i+2] = static_cast<uint8_t>(linear_to_srgb(c[4*i+2]) * 255.0f + 0.5f);
+        out[4*i+0] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, c[4*i+0])) * 255.0f + 0.5f);
+        out[4*i+1] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, c[4*i+1])) * 255.0f + 0.5f);
+        out[4*i+2] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, c[4*i+2])) * 255.0f + 0.5f);
         out[4*i+3] = static_cast<uint8_t>(std::max(0.0f, std::min(1.0f, c[4*i+3])) * 255.0f + 0.5f);
     }
 }
@@ -1646,6 +1727,40 @@ void br_readback_f32(const BaseRasterizerState* st, float* out) {
 const float* br_readback_f32_ptr(const BaseRasterizerState* st) {
     if (!st) return nullptr;
     return st->cbuf.data();
+}
+
+int br_light_count(const BaseRasterizerState* st) {
+    if (!st) return 0;
+    return std::max(0, std::min(st->scene.n_lights, SceneParams::MAX_LIGHTS));
+}
+
+void br_readback_lights(const BaseRasterizerState* st,
+                        float* positions,
+                        float* colors,
+                        float* intens,
+                        int* group_ids,
+                        int max_lights)
+{
+    if (!st || max_lights <= 0) return;
+    const int n = std::max(0, std::min(std::min(st->scene.n_lights, max_lights), SceneParams::MAX_LIGHTS));
+    for (int i = 0; i < n; ++i) {
+        if (positions) {
+            positions[i * 3 + 0] = st->scene.light_positions[i].x();
+            positions[i * 3 + 1] = st->scene.light_positions[i].y();
+            positions[i * 3 + 2] = st->scene.light_positions[i].z();
+        }
+        if (colors) {
+            colors[i * 3 + 0] = st->scene.light_colors[i].x();
+            colors[i * 3 + 1] = st->scene.light_colors[i].y();
+            colors[i * 3 + 2] = st->scene.light_colors[i].z();
+        }
+        if (intens) {
+            intens[i] = st->scene.light_intensities[i];
+        }
+        if (group_ids) {
+            group_ids[i] = st->scene.light_group_ids[i];
+        }
+    }
 }
 
 int br_width (const BaseRasterizerState* st) { return st->width;  }

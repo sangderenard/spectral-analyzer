@@ -1,0 +1,33 @@
+# Surface tessellation profile: corrugated_steel
+# Sinusoidal corrugation running along one axis.
+# Matches the ISO 7253-style 18 mm pitch, 19 mm depth box-profile sheet.
+
+name: corrugated_steel
+description: >
+  Sinusoidal corrugation profile for galvanised steel cladding sheets.
+  Primary sinusoid with a small 3rd-harmonic component produces the
+  characteristic near-flat peak and rounded valley of a steel box profile.
+
+period_m: 0.152          # one corrugation pitch in metres (152 mm standard)
+amplitude_m: 0.019       # peak-to-valley half-amplitude in metres (19 mm)
+primary_axis: u          # u = world X; v = world Y
+
+harmonics_u:             # Fourier series along primary axis
+  - freq: 1.0            # fundamental sinusoid
+    amplitude: 1.0       # relative (scaled by amplitude_m at eval time)
+    phase_rad: 0.0
+  - freq: 3.0            # 3rd harmonic sharpens peaks
+    amplitude: 0.04
+    phase_rad: 0.0
+
+harmonics_v: []          # no cross-axis variation (linear extrusion profile)
+
+combine_mode: sum        # sum | product | max | sum_abs
+
+edge_blend_m: 0.06       # feather width at surface boundary (world metres)
+tile_policy: repeat      # repeat | mirror | clamp
+
+notes: >
+  The primary_axis=u (world X) convention means corrugation runs vertically
+  when the sheet is used as a wall panel with its long edge upright.
+  Rotate the sheet 90° in placement coordinates to get horizontal ribs.

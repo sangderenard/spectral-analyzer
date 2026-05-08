@@ -1,0 +1,89 @@
+# Material: tungsten_filament
+# Incandescent tungsten wire operating at ~2800 K.
+# Very high emission_rgb — intended as an HDR point-source emitter inside the
+# parabolic reflector cup (PlayerFlashlight).  The visible spectrum is
+# red-biased (Wien peak ~1036 nm, well into infrared); blue is dim, red is hot.
+# metallic=1.0 because bare wire is a conductor; roughness~0.05 (drawn wire).
+
+name: tungsten_filament
+description: Incandescent tungsten filament — extreme warm-white emitter (~2800 K)
+
+color_profile_name: tungsten_incandescent
+emit_profile_name: tungsten_2800k
+
+reflectivity: 0.35
+diffusion:    0.05
+absorption:   0.60
+
+smoothness: 0.95
+ior:        3.45               # tungsten n at 550 nm (Palik)
+opacity:    1.0
+
+pbr:
+  albedo:        [0.40, 0.28, 0.15]   # reddish-gold wire surface
+  roughness:     0.05
+  metallic:      1.0
+  transmission:  0.0
+  emission_rgb:  [14.0, 7.8, 2.4]    # HDR warm-white; red:green:blue ≈ 5.8:3.3:1
+
+enamel:
+  thickness_m:  0.0
+  ior_real:     1.0
+  ior_imag:     0.0
+  color_rgb:    [1.0, 1.0, 1.0]
+  roughness:    0.05
+
+texture_stack:
+  emit_gain:          1.0
+  color_blend:        0.0
+  direct_lobe_power:  1.0
+  model_flags:        0          # profile 0: isotropic emission (no Fresnel bias)
+  remit_gain:         0.0
+  bulb_radius_mm:     2.5        # wire radius hint for remit decay (unused here)
+  remit_decay:        0.0
+  translucence_gain:  0.0
+
+spectral_bands:
+  # Blue (450 nm → 6.67e14 Hz): very faint — tungsten is red-biased at 2800 K
+  - center_hz:     666700000000000.0
+    bandwidth_hz:   55000000000000.0
+    reflectance:   0.32
+    transmittance: 0.0
+    diffuse_frac:  0.05
+    emission:      0.08
+    reemission:    0.0
+    ior_real:      3.55
+    ior_imag:      2.80
+  # Green (550 nm → 5.45e14 Hz): moderate
+  - center_hz:     545000000000000.0
+    bandwidth_hz:   50000000000000.0
+    reflectance:   0.35
+    transmittance: 0.0
+    diffuse_frac:  0.05
+    emission:      0.22
+    reemission:    0.0
+    ior_real:      3.45
+    ior_imag:      2.62
+  # Red (650 nm → 4.61e14 Hz): dominant — Wien peak is at ~1036 nm
+  - center_hz:     461000000000000.0
+    bandwidth_hz:   45000000000000.0
+    reflectance:   0.38
+    transmittance: 0.0
+    diffuse_frac:  0.05
+    emission:      0.55
+    reemission:    0.0
+    ior_real:      3.30
+    ior_imag:      2.50
+
+gameplay:
+  label:    Tungsten Filament
+  category: emissive_component
+  tier:     equipment
+  role:     light_source
+
+notes: >
+  emission_rgb [14.0, 7.8, 2.4] is intentionally HDR — the renderer's tone-map
+  or bloom pass turns this into the characteristic incandescent bloom.  Metallic=1.0
+  with low roughness gives the glinting specular of drawn wire.  The material is
+  used exclusively inside the PlayerFlashlight reflector cup and should not appear
+  on room surfaces.

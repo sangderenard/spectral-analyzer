@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import math
+import os
 import time
 
 import numpy as np
@@ -37,8 +38,25 @@ from OpenGL.GL import *
 
 import _spectral_kernels as sk
 from base_gl_renderer import BaseGLRenderer
+from camera_exposure_budget import (
+    CameraOptics,
+    FilmExposure,
+    lambertian_emitter_radiance,
+    plan_ray_budget,
+    summarize_plan,
+)
+from emissive_ray_packer import pack_emissive_area_rays, summarize_packed_rays
 from material_db import MaterialDatabase
+from shader_calibration_profiles import load_shader_calibration_profile, save_shader_calibration_gains
 from spherical_mesh import uv_sphere, equirect_texture
+
+try:
+    import yaml as _yaml
+except ImportError as _yaml_exc:  # pragma: no cover - runtime environment check
+    _yaml = None
+    _yaml_import_error = _yaml_exc
+else:
+    _yaml_import_error = None
 
 # ── Window / texture constants ────────────────────────────────────────────────
 WIN_W, WIN_H = 1280, 720
@@ -48,6 +66,8 @@ TEX_W, TEX_H = 256, 128
 # ── Orbital mechanics constants ───────────────────────────────────────────────
 GOLDEN_ANGLE = 2.3999632297286533   # ≈ 137.5° — distributes orbital planes
 SCENE_CENTER = np.array([0.0, 0.0, -3.05], np.float32)
+TUNGSTEN_CAMERA_POS = SCENE_CENTER.copy()
+TUNGSTEN_BULB_OFFSET = np.array([0.0, 0.22, 0.0], np.float32)
 R_MID = 1.90    # orbit semi-major-axis midpoint
 R_AMP = 0.80    # eccentricity amplitude  → r ∈ [1.10, 2.70]
 ORBIT_SPEED = 0.45  # radians / second (all orbiters same period)
@@ -258,6 +278,77 @@ ORBIT_MATS = [
 ]
 N_ORBIT = len(ORBIT_MATS)
 C_RASTER_MAX_LIGHTS = 100
+_CONFIGS_MATERIALS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "configs", "materials"
+)
+
+
+def _load_material_yaml_dict(name: str) -> dict:
+    if _yaml is None:
+        raise RuntimeError(f"PyYAML is required to load {name}.yaml: {_yaml_import_error}")
+    path = os.path.join(_CONFIGS_MATERIALS, f"{name}.yaml")
+    with open(path, "r", encoding="utf-8") as fh:
+        d = _yaml.safe_load(fh) or {}
+    for k in ("name", "description", "notes", "gameplay"):
+        d.pop(k, None)
+    return d
+
+
+def _yaml_to_material_dict(d: dict) -> dict:
+    """Convert canonical material YAML payload to MaterialDatabase dict fields.
+
+    Keeps nested `pbr` authoring values intact so emissive and albedo terms
+    survive tensor bake for both GL and C calibration paths.
+    """
+    out: dict = {}
+    pbr = d.get("pbr", {}) if isinstance(d.get("pbr", {}), dict) else {}
+
+    albedo = pbr.get("albedo", pbr.get("albedo_rgb", d.get("albedo_rgb", [0.5, 0.5, 0.5])))
+    out["albedo_rgb"] = [float(albedo[0]), float(albedo[1]), float(albedo[2])]
+
+    if "roughness" in pbr:
+        out["roughness"] = float(pbr["roughness"])
+    elif "roughness" in d:
+        out["roughness"] = float(d["roughness"])
+    elif "smoothness" in d:
+        out["roughness"] = float(max(0.0, min(1.0, 1.0 - float(d["smoothness"])) ))
+
+    if "metallic" in pbr:
+        out["metallic"] = float(pbr["metallic"])
+    elif "metallic" in d:
+        out["metallic"] = float(d["metallic"])
+
+    if "transmission" in pbr:
+        out["transmission"] = float(pbr["transmission"])
+    elif "transmission" in d:
+        out["transmission"] = float(d["transmission"])
+
+    out["ior"] = float(pbr.get("ior", d.get("ior", 1.5)))
+    out["opacity"] = float(pbr.get("opacity", d.get("opacity", 1.0)))
+
+    emis = pbr.get("emission_rgb", d.get("emission_rgb", [0.0, 0.0, 0.0]))
+    out["emission_rgb"] = [float(emis[0]), float(emis[1]), float(emis[2])]
+
+    if isinstance(d.get("texture_stack"), dict):
+        out["texture_stack"] = dict(d["texture_stack"])
+    if isinstance(d.get("enamel"), dict):
+        out["enamel"] = dict(d["enamel"])
+    if isinstance(d.get("spectral_bands"), list):
+        out["spectral_bands"] = list(d["spectral_bands"])
+
+    for key in (
+        "reflectivity", "diffusion", "absorption",
+        "emit_profile_name", "remit_profile_name", "color_profile_name",
+        "reactive_shift_hz",
+    ):
+        if key in d:
+            out[key] = d[key]
+
+    return out
+
+
+def _register_yaml_material(db: MaterialDatabase, name: str) -> int:
+    return db.register(name, _yaml_to_material_dict(_load_material_yaml_dict(name)))
 
 
 def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
@@ -294,7 +385,6 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
             "albedo_rgb": [0.04, 0.16, 0.62], "roughness": 0.20, "metallic": 0.0,
             "ior": 1.76, "opacity": 0.95, "emission_rgb": [0.08, 0.36, 2.2],
         },
-
         # ── Metallic ──────────────────────────────────────────────────────
         "chrome": {
             "albedo_rgb": [0.85, 0.87, 0.90], "roughness": 0.08, "metallic": 1.0,
@@ -379,6 +469,8 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
         },
     }
     idx = {name: db.register(name, mat) for name, mat in mats.items()}
+    idx["cavity_receiver"] = _register_yaml_material(db, "painted_plaster_wall")
+    idx["tungsten_bulb_emit"] = _register_yaml_material(db, "tungsten_filament")
     return db, idx
 
 
@@ -473,10 +565,11 @@ def flat_from_tris(tris: np.ndarray, mat_ids: np.ndarray,
     return np.ascontiguousarray(verts, np.float32), np.ascontiguousarray(mids, np.int32)
 
 
-def scene_for_phase(idx: dict[str, int], t: float):
+def scene_for_phase(idx: dict[str, int], t: float, scene_mode: str = "orbiters"):
     chunks_v     = []
     tri_mids     = []
     draw_mids    = []
+    draw_gids    = []
     group_ids    = []
     group_mids   = []
     group_offsets = []
@@ -487,32 +580,59 @@ def scene_for_phase(idx: dict[str, int], t: float):
         tri_count  = verts8.shape[0] // 3
         chunks_v.append(verts8)
         draw_mids.append(np.full((verts8.shape[0],), mat_id, np.int32))
+        draw_gids.append(np.full((verts8.shape[0],), group_id, np.int32))
         tri_mids.append(np.full((tri_count,), mat_id, np.int32))
         group_ids.append(group_id)
         group_mids.append(mat_id)
         group_offsets.append(tri_offset)
         group_counts.append(tri_count)
 
-    # Stage
-    st, sm = saddle_mesh(idx["stage_slate"])
-    sv, _  = flat_from_tris(st, sm)
-    add_object(sv, idx["stage_slate"], 1)
+    if scene_mode == "tungsten-cavity":
+        cavity_center = TUNGSTEN_CAMERA_POS
+        bulb_center = TUNGSTEN_CAMERA_POS + TUNGSTEN_BULB_OFFSET
 
-    # Central sphere (texture + SSS target)
-    cv = SPHERE.flat_vertices(center=tuple(SCENE_CENTER.tolist()), radius=0.72, include_uv=True)
-    add_object(cv, idx["center_texture"], 2)
+        # Existing MaterialDB material: painted_plaster_wall receiving shell,
+        # with normals flipped inward so the interior is directly lit.
+        cavity = SPHERE.flat_vertices(
+            center=tuple(cavity_center.tolist()), radius=5.0, include_uv=True
+        )
+        cavity[:, 3:6] *= -1.0
+        # Keep winding consistent with inward normals (true inside-facing shell).
+        cavity = cavity.reshape(-1, 3, 8)
+        cavity[:, [1, 2], :] = cavity[:, [2, 1], :]
+        cavity = cavity.reshape(-1, 8)
+        add_object(cavity, idx["cavity_receiver"], 2)
 
-    # Orbiters — each on its own 3-D orbital plane, evenly phased
-    orbiter_radii = [0.17, 0.19, 0.16, 0.20, 0.18, 0.21,
-                     0.17, 0.19, 0.18, 0.20, 0.17, 0.19]
-    for k, name in enumerate(ORBIT_MATS):
-        center = orbit_position(k, t)
-        radius = orbiter_radii[k]
-        ov = SMALL.flat_vertices(center=center, radius=radius, include_uv=True)
-        add_object(ov, idx[name], 10 + k)
+        # Existing MaterialDB material: tungsten_filament emitter at center.
+        bulb = SMALL.flat_vertices(
+            center=tuple(bulb_center.tolist()), radius=0.11, include_uv=True
+        )
+        add_object(bulb, idx["tungsten_bulb_emit"], 10)
+    else:
+        # Stage
+        st, sm = saddle_mesh(idx["stage_slate"])
+        sv, _  = flat_from_tris(st, sm)
+        add_object(sv, idx["stage_slate"], 1)
+
+        # Central sphere (texture + SSS target)
+        cv = SPHERE.flat_vertices(center=tuple(SCENE_CENTER.tolist()), radius=0.72, include_uv=True)
+        add_object(cv, idx["center_texture"], 2)
+
+        # Orbiters — each on its own 3-D orbital plane, evenly phased
+        orbiter_radii = [0.17, 0.19, 0.16, 0.20, 0.18, 0.21,
+                         0.17, 0.19, 0.18, 0.20, 0.17, 0.19]
+        for k, name in enumerate(ORBIT_MATS):
+            center = orbit_position(k, t)
+            radius = orbiter_radii[k]
+            ov = SMALL.flat_vertices(center=center, radius=radius, include_uv=True)
+            add_object(ov, idx[name], 10 + k)
 
     verts8      = np.ascontiguousarray(np.concatenate(chunks_v,   axis=0), np.float32)
+    if scene_mode == "tungsten-cavity":
+        # Render in explicit view-space so the camera sits at cavity center.
+        verts8[:, 0:3] -= TUNGSTEN_CAMERA_POS[None, :]
     mat_per_v   = np.ascontiguousarray(np.concatenate(draw_mids,  axis=0), np.int32)
+    gid_per_v   = np.ascontiguousarray(np.concatenate(draw_gids,  axis=0), np.int32)
     mat_per_tri = np.ascontiguousarray(np.concatenate(tri_mids,   axis=0), np.int32)
 
     n_groups = len(group_ids)
@@ -524,18 +644,21 @@ def scene_for_phase(idx: dict[str, int], t: float):
         np.tile(np.eye(4, dtype=np.float32).T.reshape(1, 16), (n_groups, 1)),
         np.full((n_groups,), 1, np.int32),
     )
-    # Central sphere is a receiver, not a light source; override its group mat_id
-    if len(groups[1]) > 1:
-        groups[1][1] = idx["stage_slate"]
-    return verts8, mat_per_v, mat_per_tri, groups
+    # Group 2 is always a receiver shell and should not be emitted as a light.
+    if len(groups[1]) > 0 and 2 in set(groups[0].tolist()):
+        recv_i = int(np.where(groups[0] == 2)[0][0])
+        groups[1][recv_i] = idx["stage_slate"]
+    return verts8, mat_per_v, gid_per_v, mat_per_tri, groups
 
 
 # ── GL helpers ────────────────────────────────────────────────────────────────
 
-def make_vao(verts8: np.ndarray, mat_per_vertex: np.ndarray) -> tuple[int, int, int]:
+def make_vao(verts8: np.ndarray, mat_per_vertex: np.ndarray,
+             group_per_vertex: np.ndarray) -> tuple[int, int, int, int]:
     vao = glGenVertexArrays(1)
     vbo = glGenBuffers(1)
     mbo = glGenBuffers(1)
+    gbo = glGenBuffers(1)
     glBindVertexArray(vao)
     glBindBuffer(GL_ARRAY_BUFFER, vbo)
     glBufferData(GL_ARRAY_BUFFER, verts8.nbytes, verts8, GL_DYNAMIC_DRAW)
@@ -550,15 +673,22 @@ def make_vao(verts8: np.ndarray, mat_per_vertex: np.ndarray) -> tuple[int, int, 
     glBufferData(GL_ARRAY_BUFFER, mat_per_vertex.nbytes, mat_per_vertex, GL_DYNAMIC_DRAW)
     glEnableVertexAttribArray(2)
     glVertexAttribIPointer(2, 1, GL_INT, 4, ctypes.c_void_p(0))
+    glBindBuffer(GL_ARRAY_BUFFER, gbo)
+    glBufferData(GL_ARRAY_BUFFER, group_per_vertex.nbytes, group_per_vertex, GL_DYNAMIC_DRAW)
+    glEnableVertexAttribArray(4)
+    glVertexAttribIPointer(4, 1, GL_INT, 4, ctypes.c_void_p(0))
     glBindVertexArray(0)
-    return int(vao), int(vbo), int(mbo)
+    return int(vao), int(vbo), int(mbo), int(gbo)
 
 
-def update_vao(vbo: int, mbo: int, verts8: np.ndarray, mat_per_v: np.ndarray) -> None:
+def update_vao(vbo: int, mbo: int, gbo: int,
+               verts8: np.ndarray, mat_per_v: np.ndarray, gid_per_v: np.ndarray) -> None:
     glBindBuffer(GL_ARRAY_BUFFER, vbo)
     glBufferData(GL_ARRAY_BUFFER, verts8.nbytes, verts8, GL_DYNAMIC_DRAW)
     glBindBuffer(GL_ARRAY_BUFFER, mbo)
     glBufferData(GL_ARRAY_BUFFER, mat_per_v.nbytes, mat_per_v, GL_DYNAMIC_DRAW)
+    glBindBuffer(GL_ARRAY_BUFFER, gbo)
+    glBufferData(GL_ARRAY_BUFFER, gid_per_v.nbytes, gid_per_v, GL_DYNAMIC_DRAW)
 
 
 def make_blit_program() -> int:
@@ -626,7 +756,7 @@ def derive_group_emitters(verts8: np.ndarray, groups, pbr: np.ndarray,
             continue
         cent = pts.mean(axis=1)
         pos  = (cent * area[:, None]).sum(axis=0) / total
-        cands.append((total, pos.astype(np.float32), rgb))
+        cands.append((total, pos.astype(np.float32), rgb, int(gid)))
     cands.sort(key=lambda x: x[0], reverse=True)
     cands = cands[:max_lights]
     if not cands:
@@ -634,12 +764,103 @@ def derive_group_emitters(verts8: np.ndarray, groups, pbr: np.ndarray,
             np.zeros((0, 3), np.float32),
             np.zeros((0, 3), np.float32),
             np.zeros((0,),   np.float32),
+            np.zeros((0,),   np.int32),
         )
     return (
         np.ascontiguousarray([c[1] for c in cands], np.float32),
         np.ascontiguousarray([c[2] for c in cands], np.float32),
         np.ascontiguousarray([c[0] for c in cands], np.float32),
+        np.ascontiguousarray([c[3] for c in cands], np.int32),
     )
+
+
+def _default_pearl_roi_mask(width: int, height: int) -> np.ndarray:
+    """Circular shell ROI for the tungsten cavity receiver on one pane.
+
+    The mask is an annulus centered in the pane. Inner radius removes the bulb,
+    outer radius removes the background around the shell silhouette.
+    """
+    yy, xx = np.mgrid[0:height, 0:width]
+    cx = (width - 1) * 0.5
+    cy = (height - 1) * 0.5
+    r = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+    r_norm = r / float(min(width, height))
+    return np.logical_and(r_norm >= 0.085, r_norm <= 0.205)
+
+
+def _rgb_luma_stats(rgb: np.ndarray, mask: np.ndarray) -> tuple[float, float, float]:
+    """Return mean/std/p95 luma over masked pixels in display space."""
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        return 0.0, 0.0, 0.0
+    if mask.shape != rgb.shape[:2]:
+        return 0.0, 0.0, 0.0
+    sel = np.asarray(mask, dtype=bool)
+    if not np.any(sel):
+        return 0.0, 0.0, 0.0
+    vals = (
+        rgb[..., 0] * 0.2126
+        + rgb[..., 1] * 0.7152
+        + rgb[..., 2] * 0.0722
+    )[sel]
+    vals = np.asarray(vals, np.float32)
+    return float(vals.mean()), float(vals.std()), float(np.percentile(vals, 95.0))
+
+
+def _rgb_mean(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Return masked mean RGB (float32, shape (3,)) in display space."""
+    if rgb.ndim != 3 or rgb.shape[2] < 3:
+        return np.zeros((3,), np.float32)
+    if mask.shape != rgb.shape[:2]:
+        return np.zeros((3,), np.float32)
+    sel = np.asarray(mask, dtype=bool)
+    if not np.any(sel):
+        return np.zeros((3,), np.float32)
+    vals = np.asarray(rgb[sel, :3], np.float32)
+    return np.asarray(vals.mean(axis=0), np.float32)
+
+
+def _read_gl_pane_rgb() -> np.ndarray:
+    """Read the right GL pane as float32 RGB in display orientation."""
+    glPixelStorei(GL_PACK_ALIGNMENT, 1)
+    raw = glReadPixels(PANE_W, 0, PANE_W, WIN_H, GL_RGBA, GL_FLOAT)
+    arr = np.frombuffer(raw, dtype=np.float32).reshape(WIN_H, PANE_W, 4)
+    return np.flipud(arr)[..., :3].copy()
+
+
+def _draw_overlay_text_rgba(text: str, x: int, y: int, color: tuple[int, int, int, int] = (255, 48, 48, 255)) -> None:
+    """Blit a small RGBA text sprite into the OpenGL backbuffer at top-left coords."""
+    font = pygame.font.SysFont("Consolas", 20, bold=True)
+    txt = font.render(text, True, color[:3])
+    w, h = txt.get_size()
+    if w <= 0 or h <= 0:
+        return
+
+    # Build a fully transparent RGBA surface and place glyphs onto it so
+    # glDrawPixels receives valid alpha instead of an opaque rectangle.
+    surf = pygame.Surface((w, h), flags=pygame.SRCALPHA, depth=32)
+    surf.fill((0, 0, 0, 0))
+    surf.blit(txt, (0, 0))
+    rgba = pygame.image.tostring(surf, "RGBA", True)
+
+    glDisable(GL_DEPTH_TEST)
+    glEnable(GL_BLEND)
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1)
+    glWindowPos2i(int(x), int(max(0, WIN_H - y - h)))
+    glDrawPixels(w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba)
+
+
+def _pack_light_stats(pos: np.ndarray, col: np.ndarray, inten: np.ndarray, gids: np.ndarray) -> dict[int, tuple[np.ndarray, np.ndarray, float]]:
+    out: dict[int, tuple[np.ndarray, np.ndarray, float]] = {}
+    n = min(pos.shape[0], col.shape[0], inten.shape[0], gids.shape[0])
+    for i in range(n):
+        gid = int(gids[i])
+        out[gid] = (
+            np.asarray(pos[i], np.float32),
+            np.asarray(col[i], np.float32),
+            float(inten[i]),
+        )
+    return out
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -648,7 +869,87 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--frames", type=int, default=0,
                     help="Render N frames then exit (0 = interactive)")
+    ap.add_argument("--hold-final-frame", action="store_true",
+                    help="After a --frames-limited run, keep the final frame on screen until Esc/close.")
+    ap.add_argument("--gl-calibration", type=float, default=1.0,
+                    help="Global GL light calibration factor.")
+    ap.add_argument("--c-calibration", type=float, default=1.0,
+                    help="Global C rasterizer light calibration factor.")
+    ap.add_argument("--scene", type=str, default="orbiters",
+                    choices=["orbiters", "tungsten-cavity"],
+                    help="Scene preset: default orbiters, or tungsten bulb inside inward receiver sphere.")
+    ap.add_argument("--calibration-file", type=str,
+                    default=os.path.join("configs", "shader_calibration_profiles.json"),
+                    help="JSON file containing shared GL/C shader calibration profiles.")
+    ap.add_argument("--calibration-profile", type=str,
+                    default="tungsten_white_pearl",
+                    help="Calibration profile name from --calibration-file.")
+    ap.add_argument("--temperature-k", type=float, default=None,
+                    help="Optional blackbody temperature override for white balance gain generation.")
+    ap.add_argument("--print-light-stats", action="store_true",
+                    help="Print one-frame C vs GL derived light stats and deltas.")
+    ap.add_argument("--print-pearl-metrics", action="store_true",
+                    help="Print one-frame pearl receiver brightness metrics for both panes.")
+    ap.add_argument("--calib-target-luma", type=float, default=0.84,
+                    help="Target display-space luma for pearl during adaptive calibration.")
+    ap.add_argument("--calib-luma-tol", type=float, default=0.02,
+                    help="Absolute luma tolerance for convergence.")
+    ap.add_argument("--calib-white-tol", type=float, default=0.035,
+                    help="Max channel spread tolerance (max(rgb)-min(rgb)) for white convergence.")
+    ap.add_argument("--calib-integral-rate", type=float, default=0.075,
+                    help="Integral gain rate in 1/s for adaptive calibration search.")
+    ap.add_argument("--calib-max-search", type=float, default=20.0,
+                    help="Clamp for adaptive scalar search gain.")
+    ap.add_argument("--calib-hold-frames", type=int, default=24,
+                    help="Consecutive converged frames required before switching to orbiters.")
+    ap.add_argument("--calib-stall-eps", type=float, default=5.0e-4,
+                    help="Absolute per-frame luma-error delta below which a path is considered stalled.")
+    ap.add_argument("--calib-stall-frames", type=int, default=45,
+                    help="Consecutive stalled frames before freezing that path's gain search.")
+    ap.add_argument("--print-emissive-rays", type=int, default=0,
+                    help="On the first frame, distribute N random ray sources across emissive\n"
+                         "triangle areas (using the same verts8+groups+MaterialDatabase the\n"
+                         "shaders consume) and print calibration stats. 0 = disabled.")
+    ap.add_argument("--emissive-rays-seed", type=int, default=0,
+                    help="RNG seed for --print-emissive-rays.")
+    # ── Camera + film exposure budget (drives the calibration ray count) ──
+    ap.add_argument("--cam-focal-mm",      type=float, default=35.0)
+    ap.add_argument("--cam-aperture-mm",   type=float, default=25.0,
+                    help="Entrance pupil diameter in mm. 0 = use --cam-fstop.")
+    ap.add_argument("--cam-fstop",         type=float, default=1.4,
+                    help="Fallback f-number when --cam-aperture-mm == 0.")
+    ap.add_argument("--cam-pixel-pitch-um", type=float, default=8.4)
+    ap.add_argument("--cam-sensor-w-mm",   type=float, default=36.0)
+    ap.add_argument("--cam-sensor-h-mm",   type=float, default=24.0)
+    ap.add_argument("--cam-lens-tx",       type=float, default=0.95)
+    ap.add_argument("--film-iso",          type=float, default=100.0)
+    ap.add_argument("--film-exposure-s",   type=float, default=1.0 / 60.0)
+    ap.add_argument("--film-qe",           type=float, default=0.5)
+    ap.add_argument("--budget-rays-per-pixel", type=float, default=1.0,
+                    help="Author-side density: rays per pixel per exposure.")
+    ap.add_argument("--budget-spp",        type=float, default=1.0,
+                    help="Sample multiplier (matches sensor_spp).")
+    ap.add_argument("--budget-batches",    type=int,   default=0,
+                    help="Force batch count. 0 = derive from fps * exposure.")
+    ap.add_argument("--budget-fps",        type=float, default=60.0,
+                    help="Frame rate used when --budget-batches == 0.")
+    ap.add_argument("--budget-emitter-area-m2", type=float, default=0.152,
+                    help="Effective emitter area for radiance estimate "
+                         "(default = 4*pi*0.11**2 ≈ small bulb).")
+    ap.add_argument("--budget-capture-eta", type=float, default=1.0,
+                    help="Initial estimate of forward-ray capture efficiency.")
     args = ap.parse_args()
+
+    calib = load_shader_calibration_profile(
+        args.calibration_profile,
+        args.calibration_file,
+        temperature_override=args.temperature_k,
+    )
+    cat_ccm = np.ascontiguousarray(calib.cat_ccm_matrix, np.float32)
+    gl_gain = float(args.gl_calibration) * float(calib.gl_intensity_gain)
+    c_gain = float(args.c_calibration) * float(calib.c_intensity_gain)
+    base_gl_gain = gl_gain
+    base_c_gain = c_gain
 
     print("=" * 70)
     print("Basic shader test - C rasterizer (left) vs OpenGL (right)")
@@ -659,8 +960,13 @@ def main() -> None:
     for line in MISSING:
         print(f"  * {line[:78]}")
     print("=" * 70)
+    print(f"[scene] {args.scene}")
+    print(f"[calibration] profile={calib.name} T={calib.temperature_k:.1f}K")
+    print(f"[calibration] emitter={calib.emitter_material} receiver={calib.receiver_material}")
+    print(f"[calibration] gl_gain={gl_gain:.6g} c_gain={c_gain:.6g} cat_ccm={cat_ccm.tolist()}")
 
     pygame.init()
+    pygame.font.init()
     pygame.display.set_mode((WIN_W, WIN_H), pygame.OPENGL | pygame.DOUBLEBUF)
     pygame.display.set_caption("Basic material: C rasterizer vs OpenGL (profiles 0–3)")
 
@@ -699,6 +1005,9 @@ def main() -> None:
     gl_r.set_color_uv_texture_array(color_tex)
     gl_r.set_specular_enabled(True)
     gl_r.set_emission_direct_enabled(True)
+    # Start from zero and let the integral search ramp up in tungsten calibration phase.
+    gl_r.set_light_calibration(0.0)
+    gl_r.set_cat_ccm_matrix(cat_ccm)
 
     # ── C rasterizer ──────────────────────────────────────────────────────
     c_r = sk.BaseRasterizer(PANE_W, WIN_H, 16)
@@ -712,23 +1021,48 @@ def main() -> None:
     c_r.set_max_lights(C_RASTER_MAX_LIGHTS)
     c_r.set_specular_enabled(True)
     c_r.set_emission_direct_enabled(True)
+    c_r.set_light_calibration(0.0)
+    c_r.set_cat_ccm_matrix(cat_ccm)
 
     proj      = perspective(43.0, PANE_W / WIN_H, 0.1, 60.0)
     proj_flat = np.ascontiguousarray(proj.T.reshape(-1), np.float32)
     mv        = np.eye(4, dtype=np.float32).T.reshape(-1)
 
     prof.begin("scene_build")
-    verts8, mat_v, mat_tri, groups = scene_for_phase(idx, 0.0)
+    verts8, mat_v, gid_v, mat_tri, groups = scene_for_phase(idx, 0.0, args.scene)
     prof.end("scene_build")
 
-    vao, vbo, mbo = make_vao(verts8, mat_v)
+    vao, vbo, mbo, gbo = make_vao(verts8, mat_v, gid_v)
     blit_prog     = make_blit_program()
     c_tex         = int(glGenTextures(1))
 
     clock = pygame.time.Clock()
     t0    = time.perf_counter()
     frame_n = 0
+    post_frame_n = 0
     running = True
+    diag_printed = False
+    pearl_mask = _default_pearl_roi_mask(PANE_W, WIN_H)
+    calib_scene_active = args.scene == "tungsten-cavity"
+    scene_mode = "tungsten-cavity" if calib_scene_active else args.scene
+    search_gain_gl = 0.0
+    search_gain_c = 0.0
+    converged_frames = 0
+    solved_gain_gl = 1.0
+    solved_gain_c = 1.0
+    freeze_gl = False
+    freeze_c = False
+    stall_frames_gl = 0
+    stall_frames_c = 0
+    prev_luma_err_gl = None
+    prev_luma_err_c = None
+    calibration_saved = False
+    calibration_reason = ""
+    t_prev = 0.0
+
+    if not calib_scene_active:
+        gl_r.set_light_calibration(solved_gain_gl * base_gl_gain)
+        c_r.set_light_calibration(solved_gain_c * base_c_gain)
 
     while running:
         for ev in pygame.event.get():
@@ -738,13 +1072,13 @@ def main() -> None:
                 running = False
 
         t = time.perf_counter() - t0
+        dt = max(1.0 / 240.0, min(0.25, t - t_prev))
+        t_prev = t
 
         # Scene rebuild
         prof.begin("scene_build")
-        verts8, mat_v, mat_tri, groups = scene_for_phase(idx, t)
+        verts8, mat_v, gid_v, mat_tri, groups = scene_for_phase(idx, t, scene_mode)
         prof.end("scene_build")
-
-        lpos, lcol, lint = derive_group_emitters(verts8, groups, tensors["pbr"])
 
         # C rasterizer
         prof.begin("c_render")
@@ -774,20 +1108,323 @@ def main() -> None:
 
         # GL render to right pane
         prof.begin("gl_draw")
-        update_vao(vbo, mbo, verts8, mat_v)
-        gl_r.set_point_lights(lpos, lcol, lint)
+        update_vao(vbo, mbo, gbo, verts8, mat_v, gid_v)
+        gl_r.derive_emissive_area_lights(
+            verts8,
+            groups=groups,
+            min_emitter_group_id=10,
+            max_lights=C_RASTER_MAX_LIGHTS,
+        )
+
+        # One-shot calibration: distribute N ray sources across emissive
+        # triangle areas using the SAME (verts8, groups, db) inputs the
+        # shaders read above — no simplified-shader translation step.
+        # Couples the ray count to the camera+film exposure equation so
+        # Σ ray energy across all batches matches the sensor's expected
+        # radiant exposure (no calibration ambiguity in the gain solve).
+        if int(args.print_emissive_rays) > 0 and frame_n == 0:
+            _optics = CameraOptics(
+                focal_mm           = float(args.cam_focal_mm),
+                aperture_mm        = float(args.cam_aperture_mm),
+                max_aperture_fstop = float(args.cam_fstop),
+                pixel_pitch_um     = float(args.cam_pixel_pitch_um),
+                sensor_w_mm        = float(args.cam_sensor_w_mm),
+                sensor_h_mm        = float(args.cam_sensor_h_mm),
+                lens_transmission  = float(args.cam_lens_tx),
+            )
+            _film = FilmExposure(
+                iso                = float(args.film_iso),
+                exposure_time_s    = float(args.film_exposure_s),
+                quantum_efficiency = float(args.film_qe),
+            )
+            # Use the tungsten profile total power (W) as the scene-side
+            # ground truth.  EmissionProfile carries it; if missing, fall
+            # back to a 60 W bulb so the equation system is still defined.
+            _emit_power_W = 60.0
+            try:
+                from material_db import EmissionProfileDatabase as _EPD
+                _eptpl = _EPD.instance()._registry.get(
+                    "tungsten_filament_2400K")
+                if _eptpl is not None:
+                    _emit_power_W = float(getattr(_eptpl, "total_power_W", 60.0))
+            except Exception:
+                pass
+            _L = lambertian_emitter_radiance(
+                _emit_power_W,
+                max(float(args.budget_emitter_area_m2), 1.0e-6),
+            )
+            _plan = plan_ray_budget(
+                _optics, _film,
+                scene_radiance_W_sr_m2    = _L,
+                rays_per_pixel_per_second = float(args.budget_rays_per_pixel),
+                n_batches                 = (int(args.budget_batches)
+                                              if args.budget_batches > 0 else None),
+                sensor_fps                = float(args.budget_fps),
+                sensor_spp                = float(args.budget_spp),
+                capture_efficiency        = float(args.budget_capture_eta),
+            )
+            _budget_summary = summarize_plan(_plan, _optics, _film)
+            print("[exposure-budget] " + "  ".join(
+                f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in _budget_summary.items()
+            ), flush=True)
+
+            # Reconcile the user's --print-emissive-rays count with the
+            # exposure-budget plan: the CLI-requested ray count wins for
+            # this one-shot smoke print, but Σ energy is rescaled to the
+            # plan's target_H_J so the gain search has a known anchor.
+            _rays = pack_emissive_area_rays(
+                verts8,
+                groups,
+                db,
+                n_rays         = int(args.print_emissive_rays),
+                min_emitter_group_id = 10,
+                seed           = int(args.emissive_rays_seed),
+                total_energy_J = float(_plan.target_H_J),
+            )
+            _stats = summarize_packed_rays(_rays)
+            print("[emissive-rays] " + "  ".join(
+                f"{k}={v:.4g}" if isinstance(v, float) else f"{k}={v}"
+                for k, v in _stats.items()
+            ), flush=True)
+            # Sanity: directions should sit on the unit sphere within fp32
+            # tolerance, and energy should be strictly non-negative.
+            assert _stats["n_rays"] == 0 or abs(_stats["dir_norm_mean"] - 1.0) < 1.0e-3, (
+                f"emissive ray directions not unit-length: {_stats['dir_norm_mean']}"
+            )
+            assert _stats["n_rays"] == 0 or _stats["energy_min"] >= 0.0, (
+                f"emissive ray energy went negative: {_stats['energy_min']}"
+            )
+            # Σ energy must equal the plan target (within fp32 round-off)
+            # — this is the calibration anchor the gain solve will hit.
+            if _stats["n_rays"] > 0:
+                _sum_J = float(_stats["energy_total"])
+                _ratio = _sum_J / max(float(_plan.target_H_J), 1.0e-30)
+                assert abs(_ratio - 1.0) < 1.0e-3, (
+                    f"Σ ray energy {_sum_J:.6g} J != target_H_J "
+                    f"{_plan.target_H_J:.6g} J (ratio={_ratio:.6f})"
+                )
+            # NOTE: the actual bidirectional solve is the existing BDPT in
+            # demo_pluck_gl.py — forward _GPU_RAY_FIELD_CS over bdpt_sources
+            # plus backward _GPU_SENSOR_CS, driven by
+            # SensorAccumulator.pump_forward() / .tick() / tick_sensor().
+            # The plan above tells that solver how many rays to emit per
+            # batch and what Σ energy must equal at shutter close; the
+            # gain search then matches the measured sensor integral to
+            # _plan.target_H_J.  Do NOT add a parallel solver here.
         glViewport(PANE_W, 0, PANE_W, WIN_H)
         glEnable(GL_DEPTH_TEST)
         glClear(GL_DEPTH_BUFFER_BIT)
         gl_r.draw_mesh(vao, verts8.shape[0], proj_flat, mv)
         prof.end("gl_draw")
 
+        # Adaptive calibration phase: integrate toward white pearl in tungsten scene.
+        if calib_scene_active:
+            gl_rgb = _read_gl_pane_rgb()
+            c_rgb = np.ascontiguousarray(rgba_c[..., :3], np.float32)
+
+            pearl_rgb_gl = _rgb_mean(gl_rgb, pearl_mask)
+            pearl_rgb_c = _rgb_mean(c_rgb, pearl_mask)
+
+            pearl_luma_gl = float(
+                pearl_rgb_gl[0] * 0.2126 + pearl_rgb_gl[1] * 0.7152 + pearl_rgb_gl[2] * 0.0722
+            )
+            pearl_luma_c = float(
+                pearl_rgb_c[0] * 0.2126 + pearl_rgb_c[1] * 0.7152 + pearl_rgb_c[2] * 0.0722
+            )
+            luma_err_gl = float(args.calib_target_luma) - pearl_luma_gl
+            luma_err_c = float(args.calib_target_luma) - pearl_luma_c
+            white_spread_gl = float(np.max(pearl_rgb_gl) - np.min(pearl_rgb_gl))
+            white_spread_c = float(np.max(pearl_rgb_c) - np.min(pearl_rgb_c))
+
+            # Freeze a path when its luma error stops changing for long enough.
+            if not freeze_gl and prev_luma_err_gl is not None:
+                if abs(luma_err_gl - prev_luma_err_gl) <= float(args.calib_stall_eps):
+                    stall_frames_gl += 1
+                else:
+                    stall_frames_gl = 0
+                if stall_frames_gl >= int(args.calib_stall_frames):
+                    freeze_gl = True
+                    print(
+                        f"[calibration-freeze] path=gl err={luma_err_gl:.6g} "
+                        f"stall_frames={stall_frames_gl}",
+                        flush=True,
+                    )
+            if not freeze_c and prev_luma_err_c is not None:
+                if abs(luma_err_c - prev_luma_err_c) <= float(args.calib_stall_eps):
+                    stall_frames_c += 1
+                else:
+                    stall_frames_c = 0
+                if stall_frames_c >= int(args.calib_stall_frames):
+                    freeze_c = True
+                    print(
+                        f"[calibration-freeze] path=c err={luma_err_c:.6g} "
+                        f"stall_frames={stall_frames_c}",
+                        flush=True,
+                    )
+            prev_luma_err_gl = luma_err_gl
+            prev_luma_err_c = luma_err_c
+
+            # Slow integral-only adaptation with independent GL/C gains.
+            if not freeze_gl:
+                search_gain_gl += float(args.calib_integral_rate) * luma_err_gl * dt
+            if not freeze_c:
+                search_gain_c += float(args.calib_integral_rate) * luma_err_c * dt
+            search_gain_gl = float(np.clip(search_gain_gl, 0.0, float(args.calib_max_search)))
+            search_gain_c = float(np.clip(search_gain_c, 0.0, float(args.calib_max_search)))
+
+            cur_gl_gain = search_gain_gl * base_gl_gain
+            cur_c_gain = search_gain_c * base_c_gain
+            gl_r.set_light_calibration(cur_gl_gain)
+            c_r.set_light_calibration(cur_c_gain)
+
+            luma_ok = (
+                (abs(luma_err_gl) <= float(args.calib_luma_tol) or freeze_gl)
+                and (abs(luma_err_c) <= float(args.calib_luma_tol) or freeze_c)
+            )
+            white_ok = (
+                white_spread_gl <= float(args.calib_white_tol)
+                and white_spread_c <= float(args.calib_white_tol)
+            )
+            # Completion policy:
+            #   1) usual convergence (luma + white), OR
+            #   2) both paths stalled/frozen (no longer changing) with acceptable luma.
+            done_by_goal = luma_ok and white_ok
+            done_by_stall = luma_ok and freeze_gl and freeze_c
+            if done_by_goal or done_by_stall:
+                converged_frames += 1
+            else:
+                converged_frames = 0
+
+            if converged_frames >= int(args.calib_hold_frames):
+                solved_gain_gl = search_gain_gl
+                solved_gain_c = search_gain_c
+                final_gl_gain = solved_gain_gl * base_gl_gain
+                final_c_gain = solved_gain_c * base_c_gain
+                calibration_reason = "goal" if done_by_goal else "stall"
+                if not calibration_saved:
+                    save_shader_calibration_gains(
+                        args.calibration_profile,
+                        args.calibration_file,
+                        gl_intensity_gain=final_gl_gain,
+                        c_intensity_gain=final_c_gain,
+                    )
+                    calibration_saved = True
+                calib_scene_active = False
+                scene_mode = "orbiters"
+                post_frame_n = 0
+                t0 = time.perf_counter()
+                t_prev = 0.0
+                diag_printed = False
+                print(
+                    f"[calibration-converged] reason={calibration_reason} search_gain_gl={solved_gain_gl:.6g} "
+                    f"search_gain_c={solved_gain_c:.6g} "
+                    f"gl_gain={final_gl_gain:.6g} "
+                    f"c_gain={final_c_gain:.6g} "
+                    f"gl_luma={pearl_luma_gl:.6g} c_luma={pearl_luma_c:.6g} "
+                    f"gl_spread={white_spread_gl:.6g} c_spread={white_spread_c:.6g} "
+                    f"saved_profile={args.calibration_profile} file={args.calibration_file}",
+                    flush=True,
+                )
+
+        else:
+            cur_gl_gain = solved_gain_gl * base_gl_gain
+            cur_c_gain = solved_gain_c * base_c_gain
+            gl_r.set_light_calibration(cur_gl_gain)
+            c_r.set_light_calibration(cur_c_gain)
+
+        if (args.print_light_stats or args.print_pearl_metrics) and not diag_printed:
+            c_pos = c_col = c_int = c_gid = None
+            if hasattr(c_r, "readback_lights"):
+                try:
+                    c_l = c_r.readback_lights()
+                    c_pos = np.ascontiguousarray(c_l["positions"], np.float32)
+                    c_col = np.ascontiguousarray(c_l["colors"], np.float32)
+                    c_int = np.ascontiguousarray(c_l["intensities"], np.float32)
+                    c_gid = np.ascontiguousarray(c_l["group_ids"], np.int32)
+                except Exception:
+                    c_pos = c_col = c_int = c_gid = None
+            if c_pos is None:
+                c_pos, c_col, c_int, c_gid = derive_group_emitters(verts8, groups, tensors["pbr"])
+
+            gl_pos = np.ascontiguousarray(gl_r._light_pos, np.float32)
+            gl_col = np.ascontiguousarray(gl_r._light_color, np.float32)
+            gl_int = np.ascontiguousarray(gl_r._light_intensity, np.float32)
+            gl_gid = np.ascontiguousarray(gl_r._light_group_id, np.int32)
+
+            if args.print_light_stats:
+                c_map = _pack_light_stats(c_pos, c_col, c_int, c_gid)
+                gl_map = _pack_light_stats(gl_pos, gl_col, gl_int, gl_gid)
+                gids = sorted(set(c_map.keys()) | set(gl_map.keys()))
+                print(f"[light-stats] c_n={len(c_map)} gl_n={len(gl_map)} gids={gids}", flush=True)
+                for gid in gids:
+                    c_rec = c_map.get(gid)
+                    g_rec = gl_map.get(gid)
+                    if c_rec is None or g_rec is None:
+                        print(f"[light-stats][gid={gid}] present_only_in={'c' if g_rec is None else 'gl'}", flush=True)
+                        continue
+                    dpos = np.max(np.abs(c_rec[0] - g_rec[0]))
+                    dcol = np.max(np.abs(c_rec[1] - g_rec[1]))
+                    dint = abs(c_rec[2] - g_rec[2])
+                    print(
+                        f"[light-stats][gid={gid}] "
+                        f"c_pos={c_rec[0].tolist()} gl_pos={g_rec[0].tolist()} "
+                        f"c_col={c_rec[1].tolist()} gl_col={g_rec[1].tolist()} "
+                        f"c_int={c_rec[2]:.6g} gl_int={g_rec[2]:.6g} "
+                        f"dpos_max={dpos:.6g} dcol_max={dcol:.6g} dint={dint:.6g}",
+                        flush=True,
+                    )
+
+            if args.print_pearl_metrics:
+                c_rgb = np.ascontiguousarray(rgba_c[..., :3], np.float32)
+                gl_rgb = _read_gl_pane_rgb()
+                c_mean, c_std, c_p95 = _rgb_luma_stats(c_rgb, pearl_mask)
+                g_mean, g_std, g_p95 = _rgb_luma_stats(gl_rgb, pearl_mask)
+                print(
+                    f"[pearl-metrics] roi=annulus(r_norm in [0.085, 0.205]) pixels={int(pearl_mask.sum())} "
+                    f"c_luma_mean={c_mean:.6g} c_luma_std={c_std:.6g} c_luma_p95={c_p95:.6g} "
+                    f"gl_luma_mean={g_mean:.6g} gl_luma_std={g_std:.6g} gl_luma_p95={g_p95:.6g} "
+                    f"delta_mean={abs(c_mean - g_mean):.6g}",
+                    flush=True,
+                )
+            diag_printed = True
+
+        if calib_scene_active:
+            overlay = (
+                f"CAL SEARCH  g_gl={search_gain_gl:.6f} g_c={search_gain_c:.6f} "
+                f"gl={search_gain_gl * base_gl_gain:.6f} c={search_gain_c * base_c_gain:.6f} "
+                f"f_gl={int(freeze_gl)} f_c={int(freeze_c)} "
+                f"hold={converged_frames}/{int(args.calib_hold_frames)}"
+            )
+        else:
+            overlay = (
+                f"CAL LOCKED  g_gl={solved_gain_gl:.6f} g_c={solved_gain_c:.6f} "
+                f"gl={solved_gain_gl * base_gl_gain:.6f} c={solved_gain_c * base_c_gain:.6f} "
+                f"scene=orbiters saved={int(calibration_saved)} reason={calibration_reason or 'n/a'}"
+            )
+        _draw_overlay_text_rgba(overlay, 14, 12, (255, 56, 56, 255))
+
         pygame.display.flip()
         prof.tick()
         frame_n += 1
-        if args.frames > 0 and frame_n >= args.frames:
-            running = False
+        if calib_scene_active:
+            # During search, ignore --frames and stop only by convergence or user exit.
+            pass
+        else:
+            post_frame_n += 1
+            if args.frames > 0 and post_frame_n >= args.frames:
+                running = False
         clock.tick(30)
+
+    if args.hold_final_frame and args.frames > 0 and frame_n >= args.frames:
+        hold = True
+        while hold:
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    hold = False
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    hold = False
+            clock.tick(30)
 
     pygame.quit()
 

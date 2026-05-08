@@ -143,6 +143,8 @@ class DocRenderer:
 
         # GL state
         self._tex_id : int | None = None
+        self._blit_tex_id : int | None = None
+        self._blit_tex_size: tuple[int, int] = (0, 0)
         self._prog   : int | None = None
         self._vao    : int | None = None
         self._u_atlas: int = -1
@@ -350,6 +352,18 @@ class DocRenderer:
                         value_norm=_knob_value_norm(knob, current_value),
                         parent_id=parent_id,
                         sibling_order=sibling_order)
+        try:
+            kn = getattr(knob, "name", "")
+            if kn in ("sensor_iso", "focal_mm"):
+                import sys as _s
+                _vn = _knob_value_norm(knob, current_value)
+                print(
+                    f"[knob_submit] {kn} node_id={node_id} cur={current_value!r} "
+                    f"val_str={val_str!r} value_norm={_vn:.4f} ntype={ntype}",
+                    file=_s.stderr, flush=True,
+                )
+        except Exception:
+            pass
         return node_id
 
     def submit_image_map_panel(self, panel: Any, rect: tuple,
@@ -1051,6 +1065,19 @@ class DocRenderer:
         glBindTexture(GL_TEXTURE_2D, 0)
         self._tex_id = tex
 
+        blit_tex = glGenTextures(1)
+        glBindTexture(GL_TEXTURE_2D, blit_tex)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     self._width, self._height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, None)
+        glBindTexture(GL_TEXTURE_2D, 0)
+        self._blit_tex_id = blit_tex
+        self._blit_tex_size = (self._width, self._height)
+
         self._vao = glGenVertexArrays(1)
 
     # -- Per-frame run --------------------------------------------------------
@@ -1061,7 +1088,8 @@ class DocRenderer:
 
         self._backend.flush()
 
-        if self._backend.composite_dirty:
+        _was_dirty = bool(self._backend.composite_dirty)
+        if _was_dirty:
             rgba = self._backend.composite()   # (H, W, 4) uint8
             glBindTexture(GL_TEXTURE_2D, self._tex_id)
             glTexSubImage2D(
@@ -1071,6 +1099,26 @@ class DocRenderer:
                 rgba,
             )
             glBindTexture(GL_TEXTURE_2D, 0)
+            try:
+                import sys as _s, hashlib as _hl
+                _h = _hl.md5(memoryview(rgba).tobytes()[:1<<16]).hexdigest()[:10]
+                _nz = int((rgba[..., 3] > 0).sum())
+                print(
+                    f"[gl_blit] frame={frame_index} dirty=1 tex={self._tex_id} "
+                    f"size={self._width}x{self._height} alpha_nz={_nz} hash={_h}",
+                    file=_s.stderr, flush=True,
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                import sys as _s
+                print(
+                    f"[gl_blit] frame={frame_index} dirty=0 (texture reused)",
+                    file=_s.stderr, flush=True,
+                )
+            except Exception:
+                pass
 
         _depth_state = self._begin_overlay_blit()
         try:
@@ -1106,11 +1154,20 @@ class DocRenderer:
         """
         if not _GL_OK or self._prog is None or rgba is None:
             return
-        # Tolerate (H, W, 4) shape with arbitrary dimensions; if it does
-        # not match our pre-allocated texture, do a full glTexImage2D.
+        if self._blit_tex_id is None:
+            self._blit_tex_id = glGenTextures(1)
+            self._blit_tex_size = (0, 0)
+            glBindTexture(GL_TEXTURE_2D, self._blit_tex_id)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+            glBindTexture(GL_TEXTURE_2D, 0)
+        # Use a dedicated external-blit texture. Reusing the doc-composite
+        # texture corrupts the next HUD draw when the backend is not dirty.
         h = int(rgba.shape[0]); w = int(rgba.shape[1])
-        glBindTexture(GL_TEXTURE_2D, self._tex_id)
-        if w == self._width and h == self._height:
+        glBindTexture(GL_TEXTURE_2D, self._blit_tex_id)
+        if (w, h) == self._blit_tex_size:
             glTexSubImage2D(
                 GL_TEXTURE_2D, 0,
                 0, 0, w, h,
@@ -1124,8 +1181,7 @@ class DocRenderer:
                 GL_RGBA, GL_UNSIGNED_BYTE,
                 rgba,
             )
-            self._width  = w
-            self._height = h
+            self._blit_tex_size = (w, h)
         glBindTexture(GL_TEXTURE_2D, 0)
 
         _depth_state = self._begin_overlay_blit()
@@ -1137,7 +1193,7 @@ class DocRenderer:
 
             glUseProgram(self._prog)
             GL.glActiveTexture(GL.GL_TEXTURE0)
-            glBindTexture(GL_TEXTURE_2D, self._tex_id)
+            glBindTexture(GL_TEXTURE_2D, self._blit_tex_id)
             glUniform1i(self._u_atlas, 0)
             glUniform1f(self._u_alpha, float(alpha))
 

@@ -78,7 +78,12 @@ import numpy as np
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-MAX_SPECTRAL_BANDS: int = 8   # bands stored per material in the spectral chunk
+# Compile-time max spectral bands per material.  Imported from `mat_flags` so
+# the GLSL preamble, the C++ generated header, and this Python registry all
+# share one source of truth.  Runtime n_bands is honored as a power-of-two
+# ≤ MAX_SPECTRAL_BANDS (1, 2, 4, 8, 16, 32).
+from mat_flags import MAX_SPECTRAL_BANDS  # noqa: E402  (re-exported below)
+MAX_SPECTRAL_BANDS: int = MAX_SPECTRAL_BANDS  # type: ignore[no-redef]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ctypes record structures
@@ -588,15 +593,31 @@ class EmissionProfile:
 
     SpreadData fields (``spd``, ``phase``, ``amplitude``) accept any of
     ParametricSpread, HistogramSpread, or TextureSpread.
+
+    Emission Model
+    ~~~~~~~~~~~~~~
+    Keep materials in their natural units (total_power_W, spectral intensity, etc.).
+    Render-time calibration (in _derive_gl_lights) converts these to physical radiance
+    using the emission_model field:
+
+    - emission_model="blackbody": temperature_K + emissivity define the physics
+    - emission_model="parametric": total_power_W is scaled by the SPD shape
+    - (default): use total_power_W directly (legacy)
     """
     # ── Spectral ──────────────────────────────────────────────────────────────
     spd:                     SpreadData = field(default_factory=lambda: ParametricSpread(amp=1.0, center=550.0, q=20.0))
     peak_wavelength_nm:      float      = 550.0   # dominant emission wavelength
     fwhm_nm:                 float      = 30.0    # spectral full-width half-maximum
 
-    # ── Radiometric ───────────────────────────────────────────────────────────
-    total_power_W:           float      = 1.0     # total radiated power
-    radiance_W_sr_m2:        float      = 0.0     # W/(sr·m²), 0 = derive from power
+    # ── Radiometric (natural units for the material) ──────────────────────────
+    total_power_W:           float      = 1.0     # total radiated power (in natural units)
+
+    # ── Emission Model Selector ────────────────────────────────────────────────
+    emission_model:          str        = ""      # "" (default), "blackbody", "parametric"
+
+    # ── Blackbody Physical Parameters ──────────────────────────────────────────
+    temperature_K:           float      = 0.0     # Kelvin; if emission_model="blackbody"
+    emissivity:              float      = 0.95    # [0–1] emissivity for blackbody
 
     # ── Temporal / spatial coherence ─────────────────────────────────────────
     temporal_coherence_length_m:  float = 1.0e-6  # λ²/Δλ  (coherence length)
@@ -772,17 +793,22 @@ class EmissionProfileDatabase:
         self._profiles: Dict[str, Any] = {}
         self._order:    List[str]      = []
         self._rgb_tensor: np.ndarray   = np.zeros((1, 3), np.float32)
+        self._radiance_tensor: np.ndarray = np.zeros((1,), np.float32)
 
     def _rebake_rgb_tensor(self) -> None:
-        """Precompute linear-sRGB for all profiles once (outside render loop).
+        """Precompute linear-sRGB and visible radiance for all profiles once.
 
-        This is the only place where profile_to_rgb is evaluated.
+        This is the only place where profile_to_rgb and profile_to_radiance
+        are evaluated — both baked at registration time, never in render loop.
         """
         N = max(1, len(self._order))
-        out = np.zeros((N, 3), np.float32)
+        rgb_out = np.zeros((N, 3), np.float32)
+        rad_out = np.zeros((N,), np.float32)
         for i, name in enumerate(self._order):
-            out[i] = profile_to_rgb(self._profiles[name])
-        self._rgb_tensor = out
+            rgb_out[i] = profile_to_rgb(self._profiles[name])
+            rad_out[i] = profile_to_radiance(self._profiles[name])
+        self._rgb_tensor = rgb_out
+        self._radiance_tensor = rad_out
 
     @classmethod
     def instance(cls) -> "EmissionProfileDatabase":
@@ -813,12 +839,13 @@ class EmissionProfileDatabase:
             peak_wavelength_nm=450.0,
             fwhm_nm=25.0,
             total_power_W=0.35,
+            emission_model="parametric",
         ))
 
         # Index 1: missing_material_hazard
         # Warm amber warning glow used by fallback materials when a requested
-        # YAML/material registration fails.  This should be noticeable but not
-        # scene-dominating, so keep total_power moderate.
+        # YAML/material registration fails.  Keep this bright so unresolved
+        # material plumbing never reads as ordinary grey or empty space.
         self.register("missing_material_hazard", EmissionProfile(
             spd=[
                 ParametricSpread(amp=1.0, center=590.0, q=12.0),
@@ -826,7 +853,58 @@ class EmissionProfileDatabase:
             ],
             peak_wavelength_nm=590.0,
             fwhm_nm=49.0,
-            total_power_W=0.22,
+            total_power_W=2.6,
+        ))
+
+        # Neon green emergency glow: material database/YAML ingestion failure,
+        # distinct from the authored orange/magenta __missing_material__ marker.
+        self.register("material_database_failure", EmissionProfile(
+            spd=[
+                ParametricSpread(amp=1.0, center=532.0, q=18.0),
+                ParametricSpread(amp=0.30, center=505.0, q=10.0),
+            ],
+            peak_wavelength_nm=532.0,
+            fwhm_nm=22.0,
+            total_power_W=3.2,
+        ))
+
+        # Index 3: construction_borosilicate
+        # Faint cool-white glow for unfinished room-surface triangles.
+        # Blue peak at 480 nm + green shoulder at 540 nm; total power 0.06 W
+        # so it reads as ambient inner light rather than a bright source.
+        # Fresnel-weighted lobe in the fragment shader (model_flags=1) ensures
+        # the edge-glow intensifies at grazing angles, matching lit-glass aesthetics.
+        self.register("construction_borosilicate", EmissionProfile(
+            spd=[
+                ParametricSpread(amp=1.0,  center=480.0, q=10.0),
+                ParametricSpread(amp=0.45, center=540.0, q=6.0),
+            ],
+            peak_wavelength_nm=480.0,
+            fwhm_nm=55.0,
+            total_power_W=0.06,
+        ))
+
+        # Index 4: tungsten_2800k
+        # Incandescent tungsten filament at ~2800 K (physical temperature).
+        # Wien peak is at 1035 nm (infrared); visible output is strongly red-biased.
+        # Modelled as two additive Gaussian terms in the visible range for shape:
+        #   dominant red/NIR shoulder (760 nm, q=4 → FWHM≈190 nm, sigma≈81 nm),
+        #   orange-yellow secondary (600 nm, q=6 → FWHM≈100 nm).
+        # 
+        # Emission model: "blackbody" — radiance computed from Planck law at render time.
+        # This allows the material to stay in its natural (physical) units while the
+        # solid-angle model in _derive_gl_lights() converts to proper illuminance.
+        self.register("tungsten_2800k", EmissionProfile(
+            spd=[
+                ParametricSpread(amp=1.0,  center=760.0, q=4.0),
+                ParametricSpread(amp=0.18, center=600.0, q=6.0),
+            ],
+            peak_wavelength_nm=760.0,
+            fwhm_nm=190.0,
+            total_power_W=1.0,              # ignored when emission_model="blackbody"
+            emission_model="blackbody",     # ← physical calibration
+            temperature_K=2800.0,
+            emissivity=0.95,
         ))
         self._rebake_rgb_tensor()
 
@@ -862,6 +940,14 @@ class EmissionProfileDatabase:
         registration time via _rebake_rgb_tensor().
         """
         return self._rgb_tensor
+
+    def build_radiance_tensor(self) -> np.ndarray:
+        """Return prebaked (max(1,N),) float32 visible radiance profile table.
+
+        Values in W/(m²·sr), baked at registration time via _rebake_rgb_tensor().
+        For legacy profiles with temperature_K=0, returns 0.0; caller uses fake total_power_W.
+        """
+        return self._radiance_tensor
 
     def build_gpu_tensor(self) -> np.ndarray:
         """Return flat float32 array for SSBO upload at binding 7.
@@ -1139,6 +1225,55 @@ def profile_to_rgb(profile: Any) -> np.ndarray:
 
     # Clamp only negative values — positive HDR is valid for emissives.
     return np.array([max(0.0, R), max(0.0, G), max(0.0, B)], dtype=np.float32)
+
+
+def profile_to_radiance(profile: Any) -> float:
+    """Compute physical visible radiance from an EmissionProfile.
+
+    For blackbody profiles, compute raw Planck radiance integrated over visible spectrum.
+    This value is used directly in the shader intensity calculation.
+
+    Args:
+        profile: EmissionProfile with emission_model="blackbody", temperature_K, emissivity
+
+    Returns:
+        Visible radiance in W/(m³·sr) — integrated Planck function (NOT normalized)
+    """
+    # Physical constants
+    PLANCK_H = 6.62607015e-34      # J·s
+    LIGHT_C = 299792458.0          # m/s
+    BOLTZMANN_K = 1.380649e-23     # J/K
+
+    model = getattr(profile, 'emission_model', "")
+
+    # ── Blackbody model: raw Planck integration ───────────────────────────────
+    if model == "blackbody":
+        T_K = float(getattr(profile, 'temperature_K', 0.0))
+        epsilon = float(getattr(profile, 'emissivity', 0.95))
+        
+        if T_K <= 0.0:
+            return float(np.float32(0.0))
+        
+        # Planck spectral radiance L_λ(λ,T) = (2hc²/λ⁵) / (exp(hc/λk_BT) - 1)
+        wl_m = _WL_NM * 1e-9
+        numerator = 2.0 * PLANCK_H * LIGHT_C**2 / (wl_m**5)
+        exponent = (PLANCK_H * LIGHT_C) / (wl_m * BOLTZMANN_K * T_K)
+        exponent = np.clip(exponent, 0.0, 200.0)
+        denominator = np.expm1(exponent)
+        denominator = np.maximum(denominator, 1e-30)
+        L_lambda = numerator / denominator  # W/(m³·sr)
+        
+        # Integrate visible spectrum weighted by CIE Y
+        # NO normalization: use raw integrated value for shader calibration
+        dl = 5.0
+        L_vis = float(np.sum(L_lambda * _CMF_Y) * dl) * epsilon
+        
+        return float(np.float32(L_vis))
+
+    # ── Default: use total_power_W directly ────────────────────────────────────
+    else:
+        total_power = float(getattr(profile, 'total_power_W', 1.0))
+        return float(np.float32(total_power))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1564,6 +1699,34 @@ class MaterialDatabase:
         }
         self._dirty = False
         return self._tensors
+
+    # ── Unified MatBuf SSBO helper ─────────────────────────────────────────
+    def build_mat_buf(self) -> np.ndarray:
+        """Return the contiguous float32 byte stream for the unified `MatBuf`
+        SSBO consumed by both backends (GLSL `_GPU_RAY_FIELD_CS`/
+        `_GPU_SENSOR_CS` at binding=10 and the C++ `_spectral_kernels`
+        `RayTracer`).
+
+        Layout: flat `(N_mat * MAX_SPECTRAL_BANDS, 12)` float32.
+        Row r = `mat_idx * MAX_SPECTRAL_BANDS + band` carries one
+        `SpectralBandRecord` (12 float32):
+
+            slot 0..3 : center_hz, bandwidth_hz, reflectance_mag, transmittance
+            slot 4..7 : diffuse_frac, emission, reemission, ior_real
+            slot 8..11: ior_imag, _pad, _pad, _pad
+
+        Both tracers compute the per-band complex reflectance from
+        (reflectance_mag, ior_real, ior_imag) at lookup time using identical
+        Fresnel/impedance code, eliminating the parallel-derivation drift
+        between `build_complex_reflectances_spectral` (CPU) and the GLSL
+        approximation that prompted this unification.
+
+        Bands beyond the per-material `n_bands` are zero-padded so a runtime
+        `b >= n_bands` early-out in shader/tracer is safe and observable.
+        """
+        spec = self.build_tensors()['spectral']            # (N, MAX_BANDS, 12) f32
+        flat = np.ascontiguousarray(spec.reshape(-1, 12), dtype=np.float32)
+        return flat
 
     # ── Compatibility extraction helpers (post-bake; not the hot path) ──────
 

@@ -890,12 +890,13 @@ def _load_material_yaml(name: str) -> np.ndarray:
         [13] remit_profile_idx, (float(int), -1 = none)
         [14] _pad
         [15] reactive_shift_hz               # Stokes shift; 0 = non-reactive
-    Falls back to a hazard-yellow mildly emissive material so missing/failed
-    material registrations are immediately visible in both C and GL paths.
+    Falls back to a neon-green emergency material so database/config failures
+    are visually distinct from the authored __missing_material__ fallback.
     """
     _FALLBACK = np.zeros(16, np.float32)
-    # Hazard fallback: high-visibility yellow with matte response.
-    _FALLBACK[:11] = [0.34, 0.86, 0.10,  0.34, 0.86, 0.10,  0.95, 0.82, 0.08,  1.52, 1.0]
+    # Emergency fallback: neon green means material DB/YAML load path failure,
+    # not merely "the scene asked for a material name that was not registered".
+    _FALLBACK[:11] = [0.08, 0.90, 0.02,  0.08, 0.90, 0.02,  0.05, 1.00, 0.12,  1.52, 1.0]
     # Profile-index slots: -1 means "no profile bound" (sentinel).  The bake
     # in MaterialDatabase.build_tensors() skips rows whose profile_idx < 0.
     _FALLBACK[12] = -1.0   # emit_profile_idx
@@ -907,7 +908,7 @@ def _load_material_yaml(name: str) -> np.ndarray:
             try:
                 from material_db import EmissionProfileDatabase as _EPDB
                 _ep = _EPDB.instance()
-                _emit_idx = int(_ep.index_of("missing_material_hazard"))
+                _emit_idx = int(_ep.index_of("material_database_failure"))
                 _flags = np.uint32(1)  # MAT_FLAG_EMISSIVE
                 _fb = _FALLBACK.copy()
                 _fb[11] = np.frombuffer(np.array([_flags], np.uint32).tobytes(), np.float32)[0]
@@ -916,6 +917,7 @@ def _load_material_yaml(name: str) -> np.ndarray:
                 _fb[14] = -1.0  # color_profile_idx (sentinel: none)
                 _fb[15] = 0.0
                 _MAT_DB.register_from_mat16(name, _fb)
+                return _fb
             except Exception:
                 _MAT_DB.register_from_mat16(name, _FALLBACK)
         return _FALLBACK
@@ -982,6 +984,22 @@ def _load_material_yaml(name: str) -> np.ndarray:
     arr[15]  = react
     if _MAT_DB is not None:
         _MAT_DB.register_from_mat16(name, arr)   # full mat16 — DB extracts emissive/flag cols
+        if isinstance(d.get("texture_stack"), dict):
+            try:
+                _mat_rec = _MAT_DB._materials.get(name)  # type: ignore[attr-defined]
+                if isinstance(_mat_rec, dict):
+                    _mat_rec["texture_stack"] = dict(d["texture_stack"])
+                    _MAT_DB._dirty = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        if isinstance(d.get("spectral_bands"), list):
+            try:
+                _mat_rec = _MAT_DB._materials.get(name)  # type: ignore[attr-defined]
+                if isinstance(_mat_rec, dict):
+                    _mat_rec["spectral_bands"] = list(d["spectral_bands"])
+                    _MAT_DB._dirty = True  # type: ignore[attr-defined]
+            except Exception:
+                pass
     return arr
 
 
@@ -11256,6 +11274,14 @@ class _PlayerCameraPanel:
         except Exception:
             return []
 
+    @staticmethod
+    def _doc_dispatch_key(map_key: str) -> str:
+        return f"camera_panel/{map_key}"
+
+    @staticmethod
+    def _knob_action_key(knob_name: str) -> str:
+        return f"control/camera_panel.{knob_name}"
+
     def __init__(self):
         self._hud_mode = self.HUD_OFF
         self._open   = False
@@ -11312,6 +11338,21 @@ class _PlayerCameraPanel:
         self._inspect_last_poll_s = 0.0
         self._inspect_last_eye = None
         self._inspect_last_target = None
+        self._doc_visible_rows = 0
+        self._doc_rect = (0, 0, 0, 0)
+        self._doc_action_rects: dict = {}
+        self._doc_knob_rects: dict = {}
+        self._doc_drag_key: str | None = None
+        self._doc_visible_knobs: list = []
+        try:
+            from bass_viewer import ScrollableSubpanelList
+            self._right_scroll_widget = ScrollableSubpanelList(
+                "Camera Controls",
+                max_height=220,
+                key_prefix="camera_right",
+            )
+        except Exception:
+            self._right_scroll_widget = None
 
     # ── GL init ───────────────────────────────────────────────────────────────
 
@@ -11376,6 +11417,7 @@ class _PlayerCameraPanel:
         self._hud_mode = str(mode)
         self._open = (self._hud_mode == self.HUD_FULL)
         self._drag = -1
+        self._doc_drag_key = None
         if not self._open:
             self._synthesis_open = False
         if self._open and self._cam is not None:
@@ -11383,6 +11425,8 @@ class _PlayerCameraPanel:
             self._menu_anchor_target = np.array(self._cam.target, np.float64)
             if hasattr(self._cam, '_forced_eye'):
                 self._cam._forced_eye = np.array(self._menu_anchor_eye, np.float64)
+            if self._right_scroll_widget is not None and hasattr(self._right_scroll_widget, "scroll_y"):
+                self._right_scroll_widget.scroll_y = 0
         else:
             self._menu_anchor_eye = None
             self._menu_anchor_target = None
@@ -11406,6 +11450,155 @@ class _PlayerCameraPanel:
 
     def close(self):
         self._set_hud_mode(self.HUD_OFF)
+
+    def set_doc_viewport(self, rect: tuple[int, int, int, int], visible_rows: int) -> None:
+        self._doc_rect = tuple(int(v) for v in rect)
+        self._doc_visible_rows = max(1, int(visible_rows))
+        if self._right_scroll_widget is not None:
+            self._right_scroll_widget.max_height = max(60, int(rect[3]) - 30)
+
+    def doc_scroll_signature(self) -> tuple[int, int]:
+        scroll_y = int(getattr(self._right_scroll_widget, "scroll_y", 0))
+        return (scroll_y, int(self._doc_visible_rows))
+
+    def doc_visible_knobs(self, knobs: list) -> list:
+        scroll_y = int(getattr(self._right_scroll_widget, "scroll_y", 0))
+        start = int(np.clip(scroll_y // 42, 0, max(0, len(knobs) - 1)))
+        stop = min(len(knobs), start + max(1, int(self._doc_visible_rows)))
+        self._doc_visible_knobs = list(knobs[start:stop])
+        return list(self._doc_visible_knobs)
+
+    def doc_visible_start(self, total: int) -> int:
+        scroll_y = int(getattr(self._right_scroll_widget, "scroll_y", 0))
+        return int(np.clip(scroll_y // 42, 0, max(0, int(total) - 1)))
+
+    def sync_doc_scroll_widget(self, panel_h: int, width: int) -> None:
+        if self._right_scroll_widget is None:
+            return
+        try:
+            from bass_viewer import ModularSubpanelSpec
+            import pygame
+            self._right_scroll_widget.max_height = max(60, int(panel_h) - 30)
+            self._right_scroll_widget.set_subpanels([
+                ModularSubpanelSpec(
+                    key="camera_controls",
+                    title="Camera Controls",
+                    expanded=True,
+                    body_height=max(42, len(self._SLIDERS) * 42),
+                    render_body=lambda *_args, **_kwargs: None,
+                )
+            ])
+            if pygame.get_init():
+                pygame.font.init()
+                font = pygame.font.SysFont("monospace", 13)
+                scratch = pygame.Surface(
+                    (max(32, int(width)), max(80, int(panel_h))),
+                    pygame.SRCALPHA,
+                )
+                self._right_scroll_widget.render(scratch, font, 0, 0, int(width))
+        except Exception:
+            pass
+
+    def clear_doc_hit_maps(self) -> None:
+        self._doc_action_rects.clear()
+        self._doc_knob_rects.clear()
+
+    def _doc_knob_info(self, knob) -> dict:
+        return {
+            "widget": str(getattr(knob, "control_widget", "") or ""),
+            "choices": list(getattr(knob, "choices", []) or []),
+            "default": getattr(knob, "default", None),
+            "low": float(getattr(knob, "low", 0.0)),
+            "high": float(getattr(knob, "high", 1.0)),
+            "step": float(getattr(knob, "step", 0.0)),
+            "dtype": str(getattr(knob, "dtype", "float")),
+        }
+
+    def _submit_knob_action_value(self, key: str, value) -> None:
+        # Apply immediately on the main thread so right-panel knob drags are
+        # live-bound to renderer/camera state without waiting on async actions.
+        self._apply_value(str(key), value)
+
+    def _dispatch_doc_action(self, map_key: str) -> None:
+        # Keep camera menu actions deterministic and immediate for HUD/doc UI.
+        self._handle_registered_doc_action(map_key=str(map_key))
+
+    def _handle_doc_knob_click(self, knob_name: str, info: dict,
+                               local_x: float, rect_w: float) -> None:
+        key = str(knob_name)
+        if key not in self._values:
+            return
+        widget = str(info.get("widget", "") or "")
+        dtype = str(info.get("dtype", "float"))
+        lo = float(info.get("low", 0.0))
+        hi = float(info.get("high", 1.0))
+        step = float(info.get("step", 0.0))
+        choices = list(info.get("choices", []) or [])
+
+        if widget == "stepper":
+            if step == 0.0:
+                step = 1.0 if dtype == "int" else 0.1
+            cur = float(self._values.get(key, info.get("default", 0.0)) or 0.0)
+            delta = -step if local_x < (rect_w * 0.5) else step
+            new_val = max(lo, min(hi, cur + delta))
+            if dtype == "int":
+                self._submit_knob_action_value(key, int(round(new_val)))
+            else:
+                self._submit_knob_action_value(key, float(new_val))
+            return
+
+        if widget == "segmented" or choices:
+            if choices:
+                seg_w = max(1.0, float(rect_w) / max(1, len(choices)))
+                idx = min(len(choices) - 1, max(0, int(float(local_x) / seg_w)))
+                choice_val = choices[idx]
+                if dtype == "choice":
+                    self._submit_knob_action_value(key, choice_val)
+                elif dtype == "int":
+                    self._submit_knob_action_value(key, int(idx))
+                else:
+                    self._submit_knob_action_value(key, choice_val)
+            return
+
+        if widget == "toggle" or dtype == "bool":
+            self._submit_knob_action_value(key, not bool(self._values.get(key, False)))
+            return
+
+        value_x0 = 0.0
+        value_w = max(1.0, float(rect_w))
+        t = float(np.clip(float(local_x) / value_w, 0.0, 1.0))
+        value = self._v_from_t(key, t)
+        if dtype == "int":
+            value = int(round(float(value)))
+        import sys
+        print(f"[knob_click] key={key} local_x={local_x:.1f} rect_w={rect_w:.1f} t={t:.3f} -> value={value}",
+              file=sys.stderr, flush=True)
+        self._submit_knob_action_value(key, value)
+
+    def _handle_doc_mouse_button(self, mx: int, my: int) -> bool:
+        for map_key, rect in reversed(list(self._doc_action_rects.items())):
+            ax, ay, aw, ah = rect
+            if ax <= mx < ax + aw and ay <= my < ay + ah:
+                self._dispatch_doc_action(str(map_key))
+                return True
+        for knob_name, info in reversed(list(self._doc_knob_rects.items())):
+            rx, ry, rw, rh = info.get("rect", (0, 0, 0, 0))
+            if rx <= mx < rx + rw and ry <= my < ry + rh:
+                self._handle_doc_knob_click(str(knob_name), info, float(mx - rx), float(rw))
+                self._doc_drag_key = str(knob_name)
+                return True
+        return False
+
+    def _handle_doc_mouse_motion(self, mx: int, my: int | None = None) -> bool:
+        key = self._doc_drag_key
+        if not key:
+            return False
+        info = self._doc_knob_rects.get(key)
+        if not info:
+            return False
+        rx, _ry, rw, _rh = info.get("rect", (0, 0, 0, 0))
+        self._handle_doc_knob_click(str(key), info, float(mx - rx), float(rw))
+        return True
 
     def enforce_menu_camera_lock(self) -> None:
         if not self._open or self._cam is None:
@@ -11545,6 +11738,61 @@ class _PlayerCameraPanel:
             _ = self.hierarchy_nodes()
         except Exception:
             pass
+        self._register_doc_action_handlers()
+
+    def _register_doc_action_handlers(self) -> None:
+        try:
+            from controls import get_action_registry
+            registry = get_action_registry()
+            for mode in (RenderMode.C, RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE):
+                map_key = f"camera_renderer_menu.{mode.value}"
+                registry.register_callable(
+                    self._doc_dispatch_key(map_key),
+                    self._handle_registered_doc_action,
+                    control_action="camera_menu_doc_action",
+                    metadata={
+                        "origin": "doc_channel",
+                        "owner_id": "demo_pluck.camera_panel",
+                        "panel_name": "camera_renderer_menu",
+                        "action_key": mode.value,
+                    },
+                )
+            for row in self._SLIDERS:
+                knob_name = str(row[0])
+                registry.register_callable(
+                    self._knob_action_key(knob_name),
+                    self._handle_registered_knob_action,
+                    control_action="set_knob",
+                    metadata={
+                        "origin": "doc_channel",
+                        "owner_id": "demo_pluck.camera_panel",
+                        "parent_key": "camera_panel",
+                        "knob_name": knob_name,
+                    },
+                )
+        except Exception:
+            pass
+
+    def _handle_registered_doc_action(self, **context) -> None:
+        map_key = str(context.get("map_key", ""))
+        parts = map_key.split(".", 1)
+        if len(parts) != 2:
+            return
+        panel_name, action_key = parts
+        if panel_name != "camera_renderer_menu":
+            return
+        try:
+            self.set_render_mode_from_menu(RenderMode(action_key))
+        except Exception:
+            return
+
+    def _handle_registered_knob_action(self, **context) -> None:
+        knob_name = str(context.get("knob_name", ""))
+        if not knob_name:
+            return
+        if "value" not in context:
+            return
+        self._apply_value(knob_name, context.get("value"))
 
     @property
     def freeze_player_motion(self) -> bool:
@@ -11559,6 +11807,17 @@ class _PlayerCameraPanel:
             self._raytrace_anchor_target = np.array(self._cam.target, np.float64)
         if self._renderer is not None and hasattr(self._renderer, 'reset_sensor'):
             self._renderer.reset_sensor()
+
+    def set_render_mode_from_menu(self, mode: 'RenderMode') -> None:
+        self._cam_render_mode = mode
+        self.apply_render_mode()
+        if mode is RenderMode.RAYTRACE:
+            self._raytrace_inspect_active = True
+            if self._cam is not None:
+                self._raytrace_anchor_eye = np.array(self._cam.eye, np.float64)
+                self._raytrace_anchor_target = np.array(self._cam.target, np.float64)
+        else:
+            self._raytrace_inspect_active = False
 
     def _clear_render_if_moved(self, eps_m: float = 0.55) -> None:
         if not self._raytrace_inspect_active or self._cam is None:
@@ -11762,10 +12021,14 @@ class _PlayerCameraPanel:
 
     def _apply_value(self, key: str, value) -> None:
         """Store value and fire its on_change callback."""
+        import sys
+        before = self._values.get(key)
         self._values[key] = value
         cb = self._on_change.get(key)
         if cb is not None:
             cb(value)
+        print(f"[apply] {key}: {before} -> {self._values.get(key)} cb={cb is not None}",
+              file=sys.stderr, flush=True)
 
     def apply_render_mode(self) -> None:
         """Push current render-mode selection onto the bound renderer."""
@@ -11788,6 +12051,7 @@ class _PlayerCameraPanel:
         self._show_illum  = (self._renderer._layers[7] != LAYER_HIDDEN)
         self._show_sensor = (self._renderer._layers[8] != LAYER_HIDDEN)
         self._renderer._render_mode = m.value
+        self._renderer._mode_3d = m
 
     def _sync_render_mode(self) -> None:
         """Read bound renderer layer flags and set the matching render mode."""
@@ -11962,8 +12226,20 @@ class _PlayerCameraPanel:
                     self._synthesis_open = True
                 return True
 
+        if ev.type == pygame.MOUSEWHEEL:
+            mx, my = pygame.mouse.get_pos()
+            rx, ry, rw, rh = self._doc_rect
+            if rx <= mx < rx + rw and ry <= my < ry + rh:
+                if self._right_scroll_widget is not None:
+                    return bool(self._right_scroll_widget.handle_scroll(-int(ev.y)))
+            return False
+
         if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
             mx, my = ev.pos
+            rx, ry, rw, rh = self._doc_rect
+            if rx <= mx < rx + rw and ry <= my < ry + rh:
+                if self._handle_doc_mouse_button(int(mx), int(my)):
+                    return True
             top_h = 70
             lp_x, lp_y, lp_w = 12, top_h + 10, 360
             tab_w = (lp_w - 16) // 2
@@ -12009,6 +12285,11 @@ class _PlayerCameraPanel:
                             self._player_ctrl.begin_synthesis(self._synthesis_selected)
                         return True
                     return True
+            mode_hit = self._menu_render_mode_hit(mx, my, win_w)
+            if mode_hit is not None:
+                map_key = f"camera_renderer_menu.{mode_hit.value}"
+                self._dispatch_doc_action(map_key)
+                return True
             if not (px <= mx <= px + self.PW and py <= my <= py + ph):
                 return False
             for i, (key, *_) in enumerate(self._SLIDERS):
@@ -12016,7 +12297,7 @@ class _PlayerCameraPanel:
                 if ry <= my <= ry + self.ROW:
                     tx, ty, tw, th = self._track_rect(i, px, py)
                     t = float(np.clip((mx - tx) / max(tw, 1), 0.0, 1.0))
-                    self._apply_value(key, self._v_from_t(key, t))
+                    self._submit_knob_action_value(key, self._v_from_t(key, t))
                     self._drag = i
                     return True
             for i, (key, _) in enumerate(self._AUTOS):
@@ -12035,8 +12316,8 @@ class _PlayerCameraPanel:
                 for bi, m in enumerate(_modes):
                     bx = px + 8 + bi * (bw + 4)
                     if bx <= mx <= bx + bw:
-                        self._cam_render_mode = m
-                        self.apply_render_mode()   # dispatch immediately
+                        map_key = f"camera_renderer_menu.{m.value}"
+                        self._dispatch_doc_action(map_key)
                         return True
             # Layer / display toggle buttons (Enlarger / Illum / Sensor)
             ltgl_y = self._render_mode_y(py) + 2 * self.ROW
@@ -12077,20 +12358,47 @@ class _PlayerCameraPanel:
             return True  # absorb any click inside panel
 
         if ev.type == pygame.MOUSEBUTTONUP and ev.button == 1:
+            if self._doc_drag_key is not None:
+                self._doc_drag_key = None
+                return True
             if self._drag >= 0:
                 self._drag = -1
                 return True
             return False
+
+        if ev.type == pygame.MOUSEMOTION and self._doc_drag_key is not None:
+            mx, my = ev.pos
+            return self._handle_doc_mouse_motion(int(mx), int(my))
 
         if ev.type == pygame.MOUSEMOTION and self._drag >= 0:
             mx, _ = ev.pos
             key = self._SLIDERS[self._drag][0]
             tx, _, tw, _ = self._track_rect(self._drag, px, py)
             t = float(np.clip((mx - tx) / max(tw, 1), 0.0, 1.0))
-            self._apply_value(key, self._v_from_t(key, t))
+            self._submit_knob_action_value(key, self._v_from_t(key, t))
             return True
 
         return False
+
+    def _menu_render_mode_hit(self, mx: int, my: int, win_w: int):
+        if self._hud_mode != self.HUD_FULL:
+            return None
+        rx, ry, rw, rh = self._doc_rect
+        if rw <= 0 or rh <= 0:
+            return None
+        y = int(ry) + 30
+        h = 26
+        bw = max(48, (int(rw) - 22) // 4)
+        gap = 6
+        x0 = int(rx) + 8
+        if not (y <= int(my) < y + h):
+            return None
+        modes = [RenderMode.C, RenderMode.GL, RenderMode.HYBRID, RenderMode.RAYTRACE]
+        for i, mode in enumerate(modes):
+            x = x0 + i * (bw + gap)
+            if x <= int(mx) < x + bw:
+                return mode
+        return None
 
     # ── Render ────────────────────────────────────────────────────────────────
 
@@ -12985,6 +13293,7 @@ def main():
                     return None
                 tri_chunks = []
                 mat_chunks = []
+                cull_chunks = []
                 group_ids = []
                 group_mats = []
                 group_offsets = []
@@ -13017,6 +13326,24 @@ def main():
                     _out[:_arr.shape[0]] = _arr
                     return _out
 
+                def _resolve_cull_mask(_payload: dict, _n_tris: int) -> np.ndarray:
+                    _raw = _payload.get("cull_immune_tri_mask", None)
+                    if _raw is None:
+                        _v = 1 if bool(_payload.get("cull_immune", False)) else 0
+                        return np.full((_n_tris,), _v, dtype=np.uint8)
+                    try:
+                        _arr = np.asarray(_raw, dtype=np.uint8).reshape(-1)
+                    except Exception:
+                        _v = 1 if bool(_payload.get("cull_immune", False)) else 0
+                        return np.full((_n_tris,), _v, dtype=np.uint8)
+                    if _arr.shape[0] == _n_tris:
+                        return _arr.astype(np.uint8, copy=False)
+                    if _arr.shape[0] > _n_tris:
+                        return _arr[:_n_tris].astype(np.uint8, copy=False)
+                    _out = np.zeros((_n_tris,), dtype=np.uint8)
+                    _out[:_arr.shape[0]] = _arr
+                    return _out
+
                 for _key, _payload in _leftovers.items():
                     if not isinstance(_payload, dict):
                         continue
@@ -13031,7 +13358,9 @@ def main():
                     _tri_base = sum(int(_c.shape[0]) for _c in tri_chunks)
                     tri_chunks.append(_tris)
                     _mat_ids_local = _resolve_mat_ids(_payload, int(_tris.shape[0]))
+                    _cull_local = _resolve_cull_mask(_payload, int(_tris.shape[0]))
                     mat_chunks.append(_mat_ids_local)
+                    cull_chunks.append(_cull_local)
 
                     # The C rasterizer derives emitter lights from declared
                     # object groups.  Split each payload into contiguous
@@ -13043,15 +13372,17 @@ def main():
                     while _run_start < int(_mat_ids_local.shape[0]):
                         _mat = int(_mat_ids_local[_run_start])
                         _run_end = _run_start + 1
+                        _ci = int(_cull_local[_run_start])
                         while (_run_end < int(_mat_ids_local.shape[0])
-                               and int(_mat_ids_local[_run_end]) == _mat):
+                               and int(_mat_ids_local[_run_end]) == _mat
+                               and int(_cull_local[_run_end]) == _ci):
                             _run_end += 1
                         group_ids.append(_stable_group_id(str(_key), _run_idx))
                         group_mats.append(_mat)
                         group_offsets.append(_tri_base + _run_start)
                         group_counts.append(_run_end - _run_start)
                         group_mvs.append(_identity_mv)
-                        group_dirty.append(1)  # BR_DIRTY_GEOM
+                        group_dirty.append(1 | (8 if _ci != 0 else 0))  # BR_DIRTY_GEOM | BR_GROUP_CULL_IMMUNE
                         _run_start = _run_end
                         _run_idx += 1
                 if not tri_chunks:
@@ -13106,6 +13437,217 @@ def main():
             except Exception:
                 return None
 
+        def _pack_3d_raytrace_geometry(_leftovers):
+            try:
+                def _with_live_ray_camera(_base: dict | None):
+                    if not _base:
+                        return None
+                    eye = np.asarray(R.cam.eye, dtype=np.float64).reshape(3)
+                    target = np.asarray(R.cam.target, dtype=np.float64).reshape(3)
+                    fwd = target - eye
+                    fl = float(np.linalg.norm(fwd))
+                    if fl <= 1e-9:
+                        fwd = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+                    else:
+                        fwd /= fl
+                    up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                    if abs(float(np.dot(fwd, up))) > 0.97:
+                        up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+                    packed = dict(_base)
+                    packed.update({
+                        "cam_pos": eye,
+                        "cam_fwd": fwd,
+                        "cam_up": up,
+                        "fov_rad": float(R.cam.fov_y_rad()),
+                        "decay_half_life_s": float(getattr(R, "_sensor_acc", None).half_life)
+                            if getattr(R, "_sensor_acc", None) is not None else 5.0,
+                    })
+                    return packed
+
+                if not _leftovers:
+                    return _with_live_ray_camera(
+                        getattr(_pack_3d_raytrace_geometry, "_last_scene_base", None)
+                    )
+                tri_chunks = []
+                mat_chunks = []
+
+                def _resolve_mat_id(_payload: dict) -> int:
+                    if "mat_id" in _payload:
+                        try:
+                            return int(_payload.get("mat_id", 0))
+                        except Exception:
+                            pass
+                    return 0
+
+                def _resolve_mat_ids(_payload: dict, _n_tris: int) -> np.ndarray:
+                    _mid = _payload.get("mat_ids", None)
+                    if _mid is None:
+                        return np.full((_n_tris,), _resolve_mat_id(_payload), dtype=np.int32)
+                    try:
+                        _arr = np.asarray(_mid, dtype=np.int32).reshape(-1)
+                    except Exception:
+                        return np.full((_n_tris,), _resolve_mat_id(_payload), dtype=np.int32)
+                    if _arr.shape[0] == _n_tris:
+                        return _arr.astype(np.int32, copy=False)
+                    if _arr.shape[0] > _n_tris:
+                        return _arr[:_n_tris].astype(np.int32, copy=False)
+                    _out = np.full((_n_tris,), _resolve_mat_id(_payload), dtype=np.int32)
+                    _out[:_arr.shape[0]] = _arr
+                    return _out
+
+                for _key, _payload in _leftovers.items():
+                    if not isinstance(_payload, dict):
+                        continue
+                    if _payload.get("kind") != "triangles":
+                        continue
+                    _tris = _payload.get("triangles")
+                    if _tris is None:
+                        continue
+                    _tris = np.asarray(_tris, dtype=np.float64)
+                    if _tris.ndim != 3 or _tris.shape[1:] != (3, 3) or _tris.shape[0] == 0:
+                        continue
+                    tri_chunks.append(_tris)
+                    mat_chunks.append(_resolve_mat_ids(_payload, int(_tris.shape[0])))
+                if not tri_chunks:
+                    return None
+
+                tris = np.ascontiguousarray(np.concatenate(tri_chunks, axis=0), dtype=np.float64)
+                mat_ids = np.ascontiguousarray(np.concatenate(mat_chunks, axis=0), dtype=np.int32)
+                n_tris = int(tris.shape[0])
+                e1 = tris[:, 1, :] - tris[:, 0, :]
+                e2 = tris[:, 2, :] - tris[:, 0, :]
+                normals = np.cross(e1, e2)
+                nl = np.linalg.norm(normals, axis=1, keepdims=True)
+                normals = normals / np.where(nl > 1e-10, nl, 1.0)
+
+                _tensors = _MAT_DB.build_tensors() if _MAT_DB is not None else {}
+                pbr = np.asarray(_tensors.get("pbr", np.zeros((1, 16), np.float32)), dtype=np.float32)
+                raymat = np.asarray(_tensors.get("raymat_compat", np.zeros((len(pbr), 20), np.float32)), dtype=np.float32)
+                spec = np.asarray(_tensors.get("spectral", np.zeros((len(pbr), 8, 12), np.float32)), dtype=np.float32)
+                spec_n = np.asarray(_tensors.get("n_bands", np.zeros((len(pbr),), np.int32)), dtype=np.int32)
+                texstack = np.asarray(_tensors.get("texture_stack", np.zeros((len(pbr), 16), np.float32)), dtype=np.float32)
+                if pbr.ndim != 2 or pbr.shape[1] < 11:
+                    pbr = np.zeros((1, 16), dtype=np.float32)
+                if raymat.ndim != 2 or raymat.shape[1] < 20:
+                    raymat = np.zeros((len(pbr), 20), dtype=np.float32)
+                if texstack.ndim != 2 or texstack.shape[1] < 16:
+                    texstack = np.zeros((len(pbr), 16), dtype=np.float32)
+                mids = np.clip(mat_ids, 0, max(0, len(pbr) - 1))
+
+                # The ray tracer receives the same two 16-float material packages
+                # used by the basic material path, plus the DB's prebaked
+                # ray/spectral sinks. No local PBR material invention here.
+                pbr16_by_tri = np.ascontiguousarray(pbr[mids, :16], dtype=np.float32)
+                tex16_by_tri = np.ascontiguousarray(texstack[mids, :16], dtype=np.float32)
+
+                freq_hz = np.array([461.0e12, 545.0e12, 666.7e12], dtype=np.float64)  # R,G,B centres
+                refl_re = np.zeros((n_tris, 3), dtype=np.float64)
+                refl_im = np.zeros((n_tris, 3), dtype=np.float64)
+                diffusion_bands = np.zeros((n_tris, 3), dtype=np.float64)
+                used_spectral = np.zeros((n_tris,), dtype=bool)
+                if spec.ndim == 3 and spec.shape[1] > 0 and spec.shape[2] >= 9 and len(spec_n) >= len(pbr):
+                    for _ti, _mid in enumerate(mids):
+                        _nb = int(spec_n[int(_mid)]) if int(_mid) < len(spec_n) else 0
+                        if _nb <= 0:
+                            continue
+                        _rows = spec[int(_mid), :min(_nb, spec.shape[1]), :]
+                        for _row in _rows:
+                            _center = float(_row[0])
+                            _bw = max(1.0, float(_row[1]))
+                            _r = float(_row[2])
+                            _df = float(_row[4])
+                            _ior_im = float(_row[8])
+                            _g = np.exp(-0.5 * ((freq_hz - _center) / _bw) ** 2)
+                            _phase = np.arctan(max(0.0, _ior_im) * np.log(np.maximum(freq_hz / max(_center, 1.0), 1e-12)) / math.pi)
+                            refl_re[_ti, :] += _r * _g * np.cos(_phase)
+                            refl_im[_ti, :] += _r * _g * np.sin(_phase)
+                            diffusion_bands[_ti, :] += _df * _g
+                        used_spectral[_ti] = True
+                if not np.all(used_spectral):
+                    _rm = raymat[mids, :] if len(raymat) else np.zeros((n_tris, 20), np.float32)
+                    _refl = np.clip(_rm[:, 0].astype(np.float64), 0.0, 0.999)
+                    _diff = np.clip(_rm[:, 1].astype(np.float64), 0.0, 1.0)
+                    _fallback = ~used_spectral
+                    refl_re[_fallback, :] = _refl[_fallback, None]
+                    refl_im[_fallback, :] = 0.0
+                    diffusion_bands[_fallback, :] = _diff[_fallback, None]
+                refl_re = np.ascontiguousarray(np.clip(refl_re, 0.0, 0.999), dtype=np.float64)
+                refl_im = np.ascontiguousarray(refl_im, dtype=np.float64)
+                diffusion = np.ascontiguousarray(np.clip(diffusion_bands.mean(axis=1), 0.0, 1.0), dtype=np.float64)
+
+                # Build one ray source per emissive material island. The current
+                # C tracer has scalar source amplitude, so source colour is carried
+                # by the RGB reflectance bands after interaction.
+                src_pos = []
+                src_dir = []
+                src_directivity = []
+                emit = np.linalg.norm(pbr[mids, 8:11], axis=1) if len(pbr) else np.zeros((n_tris,), np.float32)
+                if np.any(emit > 1e-6):
+                    for _mid in np.unique(mids[emit > 1e-6]):
+                        mask = (mids == int(_mid))
+                        pts = tris[mask]
+                        if pts.size == 0:
+                            continue
+                        ee1 = pts[:, 1] - pts[:, 0]
+                        ee2 = pts[:, 2] - pts[:, 0]
+                        area = 0.5 * np.linalg.norm(np.cross(ee1, ee2), axis=1)
+                        total_area = float(area.sum())
+                        if total_area <= 1e-10:
+                            continue
+                        cent = pts.mean(axis=1)
+                        pos = (cent * area[:, None]).sum(axis=0) / total_area
+                        nrm = normals[mask]
+                        nrm_mean = (nrm * area[:, None]).sum(axis=0)
+                        nrm_len = float(np.linalg.norm(nrm_mean))
+                        if nrm_len <= 1e-10:
+                            nrm_mean = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                        else:
+                            nrm_mean = nrm_mean / nrm_len
+                        _tx = texstack[int(_mid)] if int(_mid) < len(texstack) else np.zeros((16,), np.float32)
+                        _lobe_power = max(0.0, float(_tx[10]))
+                        src_pos.append(pos + nrm_mean * 0.01)
+                        src_dir.append(nrm_mean)
+                        src_directivity.append(_lobe_power)
+
+                if not src_pos:
+                    return None
+
+                # Keep ray count bounded while preserving relative emitter power.
+                src_pos = np.ascontiguousarray(src_pos, dtype=np.float64)
+                src_dir = np.ascontiguousarray(src_dir, dtype=np.float64)
+                src_directivity = np.asarray(src_directivity, dtype=np.float64)
+
+                h = hashlib.blake2s(digest_size=12)
+                h.update(np.ascontiguousarray(tris, dtype=np.float32).view(np.uint8))
+                h.update(np.ascontiguousarray(mat_ids, dtype=np.int32).view(np.uint8))
+                scene_key = h.hexdigest()
+
+                scene_base = {
+                    "scene_key": scene_key,
+                    "tris": tris,
+                    "normals": np.ascontiguousarray(normals, dtype=np.float64),
+                    "pbr16": pbr16_by_tri,
+                    "texture_stack16": tex16_by_tri,
+                    "refl_re": refl_re,
+                    "refl_im": refl_im,
+                    "diffusion": diffusion,
+                    "freq_hz": freq_hz,
+                    "atmo_abs": np.array([0.0, 0.0, 0.0], dtype=np.float64),
+                    "speed_m_s": 299792458.0,
+                    "src_pos": src_pos,
+                    "src_dir": src_dir,
+                    "src_directivity": src_directivity,
+                    "n_rays": 192,
+                    "max_bounces": 5,
+                    "min_amplitude": 0.001,
+                    "exposure": 2.5,
+                    "gamma": 0.55,
+                }
+                setattr(_pack_3d_raytrace_geometry, "_last_scene_base", scene_base)
+                return _with_live_ray_camera(scene_base)
+            except Exception:
+                return None
+
         # ── 3D-GL render callback using BaseGLRenderer ───────────────────────
         # Parallel to the C BaseRasterizer path above.  Accepts the same
         # leftovers_3d dict, packs geometry into (N,8) verts [x,y,z,nx,ny,nz,u,v]
@@ -13113,10 +13655,23 @@ def main():
         # material groups, and draws via base_material.vert/frag.glsl.
         _gl_scene_state: dict = {
             "gl_r": None,
-            "vao": None, "vbo": None, "mbo": None,
+            "vao": None, "vbo": None, "mbo": None, "gbo": None,
         }
 
-        def _derive_gl_lights(verts8_vs, groups, pbr):
+        def _derive_gl_lights(verts8_vs, groups, pbr, radiance_tensor=None):
+            """Derive point lights from emissive material groups.
+
+            Args:
+                verts8_vs: vertex positions in view space, shape (N, 8) or (N, 3+)
+                groups: (gids, mids, offs, cnts, mvs, dirty)
+                pbr: material tensor, shape (M, 16)
+                radiance_tensor: visible radiance per material in W/(m²·sr), shape (M,)
+                                 Used as intensity scale for shader.
+
+            Returns:
+                (positions, colors, intensities, group_ids)
+            """
+            import math
             gids, mids, offs, cnts, _mvs, _dirty = groups
             cands = []
             for gid, mid, off, cnt in zip(gids, mids, offs, cnts):
@@ -13139,7 +13694,16 @@ def main():
                     continue
                 cent = pts.mean(axis=1)
                 pos = (cent * area[:, None]).sum(axis=0) / total
-                cands.append((total, pos.astype(np.float32), rgb))
+                pos_vs = pos.astype(np.float32)
+
+                # Shader formula: Lcol = rgb × (intensity / r²)
+                # Use radiance_tensor (from profile_to_radiance calibration) as intensity.
+                # If not available, fall back to emitter area.
+                intensity = total  # fallback
+                if radiance_tensor is not None and mat_id < len(radiance_tensor):
+                    intensity = float(radiance_tensor[mat_id])
+
+                cands.append((total, pos_vs, rgb, int(gid), float(intensity)))
             cands.sort(key=lambda x: x[0], reverse=True)
             cands = cands[:32]
             if not cands:
@@ -13147,11 +13711,13 @@ def main():
                     np.zeros((0, 3), np.float32),
                     np.zeros((0, 3), np.float32),
                     np.zeros((0,),   np.float32),
+                    np.zeros((0,),   np.int32),
                 )
             return (
                 np.ascontiguousarray([c[1] for c in cands], np.float32),
                 np.ascontiguousarray([c[2] for c in cands], np.float32),
-                np.ascontiguousarray([c[0] for c in cands], np.float32),
+                np.ascontiguousarray([c[4] for c in cands], np.float32),  # radiance-calibrated intensity
+                np.ascontiguousarray([c[3] for c in cands], np.int32),
             )
 
         def _gl_scene_render(_leftovers):
@@ -13174,6 +13740,19 @@ def main():
                     from base_gl_renderer import BaseGLRenderer as _BaseGLRenderer
                     _gr = _BaseGLRenderer(_MAT_DB)
                     _gr.init_gl()
+                    try:
+                        from shader_calibration_profiles import load_shader_calibration_profile as _load_cal_profile
+                        _cal_file = os.path.join("configs", "shader_calibration_profiles.json")
+                        _cal = _load_cal_profile("tungsten_white_pearl", _cal_file)
+                        _gr.set_light_calibration(float(_cal.gl_intensity_gain))
+                        _gr.set_cat_ccm_matrix(np.ascontiguousarray(_cal.cat_ccm_matrix, np.float32))
+                        print(
+                            f"[gl_scene_render] shader calibration loaded profile=tungsten_white_pearl "
+                            f"gl_gain={float(_cal.gl_intensity_gain):.6g}",
+                            flush=True,
+                        )
+                    except Exception as _cal_exc:
+                        print(f"[gl_scene_render] shader calibration load skipped: {_cal_exc}", flush=True)
                     _gl_scene_state["gl_r"] = _gr
 
                 _gl_r = _gl_scene_state["gl_r"]
@@ -13183,6 +13762,9 @@ def main():
 
                 # pack geometry (mirrors _pack_3d_c_geometry but produces (N,8))
                 tri_chunks, mat_chunks = [], []
+                cull_chunks = []
+                group_id_chunks = []
+                cull_id_chunks = []
                 grp_ids, grp_mats, grp_offs, grp_cnts, grp_mvs, grp_dirty = \
                     [], [], [], [], [], []
 
@@ -13208,6 +13790,24 @@ def main():
                     out[:arr.shape[0]] = arr
                     return out
 
+                def _rcull_ids(payload, n_tris):
+                    raw = payload.get("cull_immune_tri_mask", None)
+                    if raw is None:
+                        v = 1 if bool(payload.get("cull_immune", False)) else 0
+                        return np.full((n_tris,), v, dtype=np.uint8)
+                    try:
+                        arr = np.asarray(raw, dtype=np.uint8).reshape(-1)
+                    except Exception:
+                        v = 1 if bool(payload.get("cull_immune", False)) else 0
+                        return np.full((n_tris,), v, dtype=np.uint8)
+                    if arr.shape[0] == n_tris:
+                        return arr
+                    if arr.shape[0] > n_tris:
+                        return arr[:n_tris]
+                    out = np.zeros((n_tris,), dtype=np.uint8)
+                    out[:arr.shape[0]] = arr
+                    return out
+
                 for _key, _payload in _leftovers.items():
                     if not isinstance(_payload, dict):
                         continue
@@ -13222,23 +13822,34 @@ def main():
                     _tri_base = sum(int(_c.shape[0]) for _c in tri_chunks)
                     tri_chunks.append(_tris)
                     _mids_local = _rmat_ids(_payload, int(_tris.shape[0]))
+                    _cull_local = _rcull_ids(_payload, int(_tris.shape[0]))
                     mat_chunks.append(_mids_local)
+                    cull_chunks.append(_cull_local)
                     _run_start, _run_idx = 0, 0
                     _ident_mv = np.eye(4, dtype=np.float32).reshape(16)
+                    _tri_group_ids = np.zeros((int(_tris.shape[0]),), dtype=np.int32)
+                    _tri_cull_ids = np.zeros((int(_tris.shape[0]),), dtype=np.int32)
                     while _run_start < int(_mids_local.shape[0]):
                         _mat = int(_mids_local[_run_start])
                         _run_end = _run_start + 1
+                        _ci = int(_cull_local[_run_start])
                         while (_run_end < int(_mids_local.shape[0])
-                               and int(_mids_local[_run_end]) == _mat):
+                               and int(_mids_local[_run_end]) == _mat
+                               and int(_cull_local[_run_end]) == _ci):
                             _run_end += 1
-                        grp_ids.append(_stable_group_id(str(_key), _run_idx))
+                        _gid = _stable_group_id(str(_key), _run_idx)
+                        grp_ids.append(_gid)
                         grp_mats.append(_mat)
                         grp_offs.append(_tri_base + _run_start)
                         grp_cnts.append(_run_end - _run_start)
                         grp_mvs.append(_ident_mv)
-                        grp_dirty.append(1)
+                        grp_dirty.append(1 | (8 if _ci != 0 else 0))
+                        _tri_group_ids[_run_start:_run_end] = _gid
+                        _tri_cull_ids[_run_start:_run_end] = _ci
                         _run_start = _run_end
                         _run_idx += 1
+                    group_id_chunks.append(_tri_group_ids)
+                    cull_id_chunks.append(_tri_cull_ids)
 
                 if not tri_chunks:
                     return
@@ -13271,6 +13882,14 @@ def main():
                     else np.zeros((Nt,), dtype=np.int32)
                 mat_per_v = np.ascontiguousarray(
                     np.repeat(mat_ids_tri, 3), dtype=np.int32)
+                group_ids_tri = np.concatenate(group_id_chunks, axis=0) if group_id_chunks \
+                    else np.zeros((Nt,), dtype=np.int32)
+                group_per_v = np.ascontiguousarray(
+                    np.repeat(group_ids_tri, 3), dtype=np.int32)
+                cull_ids_tri = np.concatenate(cull_id_chunks, axis=0) if cull_id_chunks \
+                    else np.zeros((Nt,), dtype=np.int32)
+                cull_per_v = np.ascontiguousarray(
+                    np.repeat(cull_ids_tri, 3), dtype=np.int32)
 
                 # MVP: verts already in view space, so MV=I, MVP=P
                 mvp_flat = np.ascontiguousarray(_P.T.reshape(-1), dtype=np.float32)
@@ -13288,25 +13907,77 @@ def main():
 
                 # derive lights from emissive material groups
                 _pbr = None
+                _radiance = None
                 if _MAT_DB is not None:
                     try:
-                        _pbr = _MAT_DB.build_tensors().get('pbr')
+                        tensors = _MAT_DB.build_tensors()
+                        _pbr = tensors.get('pbr')
+                        _radiance = _MAT_DB.build_radiance_tensor()
                     except Exception:
                         pass
                 if _pbr is not None and len(_pbr) > 0:
-                    lpos, lcol, lint = _derive_gl_lights(
-                        verts8_vs, groups_tuple, _pbr)
-                    _gl_r.set_point_lights(lpos, lcol, lint)
+                    lpos, lcol, lint, lgids = _derive_gl_lights(
+                        verts8_vs, groups_tuple, _pbr, _radiance)
+                    _gl_r.set_point_lights(lpos, lcol, lint, lgids)
+
+                # Split into opaque and transparent triangle batches so
+                # transparent surfaces blend without taking depth ownership.
+                if _pbr is not None and len(_pbr) > 0:
+                    _pbr_arr = np.asarray(_pbr, dtype=np.float32)
+                    _safe_mid = np.clip(mat_ids_tri, 0, int(_pbr_arr.shape[0]) - 1)
+                    _alpha_tri = _pbr_arr[_safe_mid, 7] * (1.0 - _pbr_arr[_safe_mid, 5] * 0.8)
+                else:
+                    _alpha_tri = np.ones((Nt,), dtype=np.float32)
+
+                _is_transparent = np.asarray(_alpha_tri < 0.999, dtype=bool)
+                _tri_verts = verts8_vs.reshape(Nt, 3, 8)
+
+                def _pack_pass(_tri_sel: np.ndarray):
+                    if _tri_sel.size == 0:
+                        return (
+                            np.zeros((0, 8), dtype=np.float32),
+                            np.zeros((0,), dtype=np.int32),
+                            np.zeros((0,), dtype=np.int32),
+                            np.zeros((0,), dtype=np.int32),
+                            0,
+                        )
+                    _v = np.ascontiguousarray(_tri_verts[_tri_sel].reshape(-1, 8), dtype=np.float32)
+                    _m = np.ascontiguousarray(np.repeat(mat_ids_tri[_tri_sel], 3), dtype=np.int32)
+                    _g = np.ascontiguousarray(np.repeat(group_ids_tri[_tri_sel], 3), dtype=np.int32)
+                    _c = np.ascontiguousarray(np.repeat(cull_ids_tri[_tri_sel], 3), dtype=np.int32)
+                    return _v, _m, _g, _c, int(_tri_sel.size * 3)
+
+                _opaque_sel = np.where(~_is_transparent)[0]
+                _trans_sel = np.where(_is_transparent)[0]
+                _opaque_v, _opaque_m, _opaque_g, _opaque_c, _opaque_n = _pack_pass(_opaque_sel)
+                _trans_v, _trans_m, _trans_g, _trans_c, _trans_n = _pack_pass(_trans_sel)
+
+                def _upload_scene_buffers(_verts, _mats, _groups, _culls):
+                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["vbo"])
+                    glBufferData(GL_ARRAY_BUFFER, _verts.nbytes, _verts, GL_DYNAMIC_DRAW)
+                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["mbo"])
+                    glBufferData(GL_ARRAY_BUFFER, _mats.nbytes, _mats, GL_DYNAMIC_DRAW)
+                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["gbo"])
+                    glBufferData(GL_ARRAY_BUFFER, _groups.nbytes, _groups, GL_DYNAMIC_DRAW)
+                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["cbo"])
+                    glBufferData(GL_ARRAY_BUFFER, _culls.nbytes, _culls, GL_DYNAMIC_DRAW)
 
                 # lazy VAO create / update
                 if _gl_scene_state["vao"] is None:
                     _vao = int(glGenVertexArrays(1))
                     _vbo = int(glGenBuffers(1))
                     _mbo = int(glGenBuffers(1))
+                    _gbo = int(glGenBuffers(1))
+                    _cbo = int(glGenBuffers(1))
                     glBindVertexArray(_vao)
                     stride = 8 * 4
+                    _seed_verts = _opaque_v if _opaque_n > 0 else (_trans_v if _trans_n > 0 else verts8_vs)
+                    _seed_mats = _opaque_m if _opaque_n > 0 else (_trans_m if _trans_n > 0 else mat_per_v)
+                    _seed_groups = _opaque_g if _opaque_n > 0 else (_trans_g if _trans_n > 0 else group_per_v)
+                    _seed_culls = _opaque_c if _opaque_n > 0 else (_trans_c if _trans_n > 0 else cull_per_v)
+
                     glBindBuffer(GL_ARRAY_BUFFER, _vbo)
-                    glBufferData(GL_ARRAY_BUFFER, verts8_vs.nbytes, verts8_vs,
+                    glBufferData(GL_ARRAY_BUFFER, _seed_verts.nbytes, _seed_verts,
                                  GL_DYNAMIC_DRAW)
                     glEnableVertexAttribArray(0)
                     glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, stride,
@@ -13318,28 +13989,43 @@ def main():
                     glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, stride,
                                          _ctypes.c_void_p(24))
                     glBindBuffer(GL_ARRAY_BUFFER, _mbo)
-                    glBufferData(GL_ARRAY_BUFFER, mat_per_v.nbytes, mat_per_v,
+                    glBufferData(GL_ARRAY_BUFFER, _seed_mats.nbytes, _seed_mats,
                                  GL_DYNAMIC_DRAW)
                     glEnableVertexAttribArray(2)
                     glVertexAttribIPointer(2, 1, GL_INT, 4, _ctypes.c_void_p(0))
+                    glBindBuffer(GL_ARRAY_BUFFER, _gbo)
+                    glBufferData(GL_ARRAY_BUFFER, _seed_groups.nbytes, _seed_groups,
+                                 GL_DYNAMIC_DRAW)
+                    glEnableVertexAttribArray(4)
+                    glVertexAttribIPointer(4, 1, GL_INT, 4, _ctypes.c_void_p(0))
+                    glBindBuffer(GL_ARRAY_BUFFER, _cbo)
+                    glBufferData(GL_ARRAY_BUFFER, _seed_culls.nbytes, _seed_culls,
+                                 GL_DYNAMIC_DRAW)
+                    glEnableVertexAttribArray(5)
+                    glVertexAttribIPointer(5, 1, GL_INT, 4, _ctypes.c_void_p(0))
                     glBindVertexArray(0)
                     _gl_scene_state["vao"] = _vao
                     _gl_scene_state["vbo"] = _vbo
                     _gl_scene_state["mbo"] = _mbo
+                    _gl_scene_state["gbo"] = _gbo
+                    _gl_scene_state["cbo"] = _cbo
                 else:
-                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["vbo"])
-                    glBufferData(GL_ARRAY_BUFFER, verts8_vs.nbytes, verts8_vs,
-                                 GL_DYNAMIC_DRAW)
-                    glBindBuffer(GL_ARRAY_BUFFER, _gl_scene_state["mbo"])
-                    glBufferData(GL_ARRAY_BUFFER, mat_per_v.nbytes, mat_per_v,
-                                 GL_DYNAMIC_DRAW)
+                    pass
 
                 glClearColor(0.02, 0.025, 0.03, 1.0)
                 glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
                 glViewport(0, 0, WIN_W, WIN_H)
                 glEnable(GL_DEPTH_TEST)
-                _gl_r.draw_mesh(
-                    _gl_scene_state["vao"], Nt * 3, mvp_flat, mv_flat)
+                if _opaque_n > 0:
+                    _upload_scene_buffers(_opaque_v, _opaque_m, _opaque_g, _opaque_c)
+                    _gl_r.draw_mesh(
+                        _gl_scene_state["vao"], _opaque_n, mvp_flat, mv_flat,
+                        enable_blend=False, depth_write=True)
+                if _trans_n > 0:
+                    _upload_scene_buffers(_trans_v, _trans_m, _trans_g, _trans_c)
+                    _gl_r.draw_mesh(
+                        _gl_scene_state["vao"], _trans_n, mvp_flat, mv_flat,
+                        enable_blend=True, depth_write=False)
 
             except Exception as _exc:
                 import traceback
@@ -13351,8 +14037,10 @@ def main():
             height=WIN_H,
             gl_doc_renderer=_doc_rdr,
             gl_render_callback=_gl_scene_render,
+            pre_2d_blit_callback=(lambda rgba: _doc_rdr.blit_rgba(rgba, alpha=1.0)),
             c_doc_backend=getattr(_doc_rdr, "_backend", None),
             geometry_packer=_pack_3d_c_geometry,
+            raytrace_packer=_pack_3d_raytrace_geometry,
             cadence_2d=1,
             cadence_3d=1,
             min_period_2d_s=0.0,
@@ -13394,17 +14082,41 @@ def main():
         pass  # package unavailable; renderer keeps its (1,1,1) default
 
     duty_stations: list = []
+    scene_nodes:   list = []   # self-publishing geometry nodes (not duty stations)
     material_piles: list = []
+    _publish_equipped_flashlight_geometry = None
 
     # Startup integer material-id cache (never computed inside frame loop).
     _MAT_ID_MISSING = 0
     _MAT_ID_BASIC_PANELING = 0
     _MAT_ID_BASIC_LED_DISPLAY = 0
+    _MAT_ID_CONSTRUCTION_GLASS = 0
     _MAT_ID_BY_NAME: dict[str, int] = {}
 
     # ── Preload required default materials once (no lazy load in frame loop) ─
     if _MAT_DB is not None:
-        for _mat_name in ("basic_paneling", "basic_led_display", "__missing_material__"):
+        _startup_materials = (
+            "basic_paneling",
+            "basic_led_display",
+            "__missing_material__",
+            # Room Control publishes integer material IDs for shader-bound
+            # room geometry; preload its palette so those IDs are real before
+            # the C/GL material buffers are built.
+            "pearl_white_tile",
+            "stage_floor",
+            "painted_plaster_wall",
+            "concrete_wall",
+            "construction_glass",
+            "acoustic_foam_panel",
+            "corrugated_steel_exterior",
+            "acoustic_plaster_ceiling",
+            # Flashlight scene node materials
+            "tungsten_filament",
+            "flashlight_reflector",
+            "flashlight_shell",
+            "borosilicate_glass",
+        )
+        for _mat_name in _startup_materials:
             try:
                 _load_material_yaml(_mat_name)
             except Exception:
@@ -13417,6 +14129,7 @@ def main():
             _MAT_ID_MISSING = int(_MAT_ID_BY_NAME.get("__missing_material__", 0))
             _MAT_ID_BASIC_PANELING = int(_MAT_ID_BY_NAME.get("basic_paneling", _MAT_ID_MISSING))
             _MAT_ID_BASIC_LED_DISPLAY = int(_MAT_ID_BY_NAME.get("basic_led_display", _MAT_ID_MISSING))
+            _MAT_ID_CONSTRUCTION_GLASS = int(_MAT_ID_BY_NAME.get("construction_glass", _MAT_ID_MISSING))
         except Exception:
             pass
 
@@ -13453,6 +14166,8 @@ def main():
             player_ctrl._walk_yaw = float(_room_ws.station_yaw_deg())
         except Exception as _spawn_err:
             print(f"[player_ctrl] spawn from station_pos failed: {_spawn_err}", flush=True)
+        if hasattr(player_ctrl, "set_room_cfg"):
+            player_ctrl.set_room_cfg(_room_ws.room_cfg)
 
     # ── Camera items (physical cameras placed in the scene) ───────────────────
     cameras: list = []
@@ -13473,6 +14188,21 @@ def main():
         except Exception as _e:
             print(f"[camera_designer_station] init failed: {_e}", flush=True)
             _cam_designer_station = None
+    # ── Scene nodes (self-publishing world geometry, separate from duty stations) ─
+    try:
+        from player_tool import (
+            FlashlightPickup as _FlashlightPickup,
+            publish_equipped_flashlight_geometry as _publish_equipped_flashlight_geometry,
+        )
+        # Keep pickup clear of nearby duty-station meshes so it is visible on spawn.
+        _flashlight_spawn_pos = (0.6, 1.0, 0.65)
+        _flashlight_pickup = _FlashlightPickup(pos=_flashlight_spawn_pos)
+        scene_nodes.append(_flashlight_pickup)
+        if player_ctrl is not None:
+            player_ctrl.register_scene_node(_flashlight_pickup)
+        print(f"[scene] flashlight pickup spawned at {_flashlight_spawn_pos}", flush=True)
+    except Exception as _fle:
+        print(f"[scene] flashlight pickup failed: {_fle}", flush=True)
     # ─────────────────────────────────────────────────────────────────────────
 
     if physics is not None:
@@ -13611,7 +14341,6 @@ def main():
         _doc_text(doc_rdr, "player.material", 14, 48,
                   f"material: {_player_cam_panel._hover_material_label}   ray: {dist_txt}",
                   w=470, parent_id=top_id, sibling_order=2)
-
         owner = _player_cam_panel._hover_owner_obj
         if owner is not None and hasattr(owner, "unfinished_tooltip_lines"):
             try:
@@ -13775,9 +14504,20 @@ def main():
         hotbar_id = _doc_rect(doc_rdr, "player.hotbar.bg",
                               (hb_x - 8, hb_y - 6, hb_w + 16, hb_h + 12),
                               (0.05, 0.08, 0.12, 0.92), sibling_order=30)
-        for i, name in enumerate(_player_cam_panel._hotbar_slots):
+        # Use tool slots when the player controller has them
+        _hb_ctrl = _player_cam_panel._player_ctrl
+        if _hb_ctrl is not None and hasattr(_hb_ctrl, '_tool_slots'):
+            _hb_slots = [
+                (getattr(t, 'label', str(t))[:7] if t is not None else "—")
+                for t in _hb_ctrl._tool_slots
+            ]
+            _hb_index = getattr(_hb_ctrl, '_tool_index', -1)
+        else:
+            _hb_slots = _player_cam_panel._hotbar_slots
+            _hb_index = _player_cam_panel._hotbar_index
+        for i, name in enumerate(_hb_slots):
             bx = hb_x + i * 68
-            active = i == _player_cam_panel._hotbar_index
+            active = i == _hb_index
             _doc_rect(doc_rdr, f"player.hotbar.slot.{i}",
                       (bx, hb_y, 62, hb_h),
                       (0.23, 0.52, 0.30, 0.98) if active else (0.15, 0.20, 0.27, 0.95),
@@ -13885,9 +14625,11 @@ def main():
               _owner = str(getattr(_ds, 'obj_id', getattr(_pref, 'obj_id', f'duty_station_{_i}')))
               _wp = np.asarray(getattr(_ds, 'world_position', np.zeros(3, np.float64)), np.float64).reshape(3)
               _yaw = float(getattr(_ds, '_yaw_deg', 0.0))
+              _unfinished = bool(getattr(_ds, "is_unfinished", False))
               _sig = (
                   float(_wp[0]), float(_wp[1]), float(_wp[2]),
                   _yaw,
+                  int(_unfinished),
                   int(_tris.shape[0]) if hasattr(_tris, 'shape') else 0,
               )
               _mat_name = getattr(_ds, "material_slot", None)
@@ -13905,21 +14647,26 @@ def main():
               # Default one-material assignment (legacy path).
               _mat_ids = np.full((_ntri,), int(_mat_id_default), dtype=np.int32)
 
-              # Fine-grained split for DutyStation geometry: body / screen / wings / wall.
-              # interaction_triangles_world() concatenates these in this exact order.
-              if hasattr(_ds, '_body_data') and hasattr(_ds, '_screen_data'):
-                  _c_body = int(max(0, len(getattr(_ds, '_body_data', [])) // 3))
-                  _c_scr  = int(max(0, len(getattr(_ds, '_screen_data', [])) // 3))
-                  _c_wing = int(max(0, len(getattr(_ds, '_wing_data', [])) // 3))
-                  _c_wall = int(max(0, len(getattr(_ds, '_wall_data', [])) // 3))
-                  _exp = _c_body + _c_scr + _c_wing + _c_wall
-                  if _exp > 0 and _ntri > 0:
-                      _ids = np.full((_ntri,), _MAT_ID_BASIC_PANELING, dtype=np.int32)
-                      _a = min(_ntri, _c_body)
-                      _b = min(_ntri, _a + _c_scr)
-                      if _b > _a:
-                          _ids[_a:_b] = _MAT_ID_BASIC_LED_DISPLAY
-                      _mat_ids = _ids
+              # Unfinished duty-station jobs must render entirely as
+              # construction glass until materials are supplied.
+              if _unfinished:
+                  _mat_ids = np.full((_ntri,), int(_MAT_ID_CONSTRUCTION_GLASS), dtype=np.int32)
+              else:
+                  # Fine-grained split for DutyStation geometry: body / screen / wings / wall.
+                  # interaction_triangles_world() concatenates these in this exact order.
+                  if hasattr(_ds, '_body_data') and hasattr(_ds, '_screen_data'):
+                      _c_body = int(max(0, len(getattr(_ds, '_body_data', [])) // 3))
+                      _c_scr  = int(max(0, len(getattr(_ds, '_screen_data', [])) // 3))
+                      _c_wing = int(max(0, len(getattr(_ds, '_wing_data', [])) // 3))
+                      _c_wall = int(max(0, len(getattr(_ds, '_wall_data', [])) // 3))
+                      _exp = _c_body + _c_scr + _c_wing + _c_wall
+                      if _exp > 0 and _ntri > 0:
+                          _ids = np.full((_ntri,), _MAT_ID_BASIC_PANELING, dtype=np.int32)
+                          _a = min(_ntri, _c_body)
+                          _b = min(_ntri, _a + _c_scr)
+                          if _b > _a:
+                              _ids[_a:_b] = _MAT_ID_BASIC_LED_DISPLAY
+                          _mat_ids = _ids
 
               _shader_walker.publish_owner_target(
                   owner_id=_owner,
@@ -13931,6 +14678,7 @@ def main():
                       "material_slot": _mat_name,
                       "mat_ids": _mat_ids,
                       "mat_id": int(_mat_id_default),
+                      "cull_immune": bool(_unfinished),
                   },
                   flip_slots=2,
                   change_key=_sig,
@@ -14083,6 +14831,11 @@ def main():
                 if ev.type == QUIT:
                     _open_exit_confirm("window close")
                 continue
+            # The right-side player camera menu is doc-rendered and owns its
+            # controls while open. Route it before any camera/station fallback
+            # can absorb the mouse event.
+            if _player_cam_panel.open and _player_cam_panel.handle_event(ev):
+                continue
             # Camera panel consumes mouse events when in IN_CAMERA mode
             if (_camera_panel is not None
                     and player_ctrl is not None
@@ -14094,8 +14847,8 @@ def main():
                 pygame.event.set_grab(False)
                 pygame.mouse.get_rel()
                 continue
-            # Player camera settings panel (walk mode, non-blocking)
-            if _player_cam_panel.handle_event(ev):
+            # Player camera settings panel (status-mode key handling only).
+            if (not _player_cam_panel.open) and _player_cam_panel.handle_event(ev):
                 continue
             # Route through player controller first; it may absorb movement events
             if player_ctrl is not None:
@@ -14440,6 +15193,7 @@ def main():
                     bool(_exit_confirm_open),
                     type(_active_st).__name__ if _active_st is not None else "",
                     bool(getattr(_player_cam_panel, "synthesis_open", False)),
+                    _player_cam_panel.doc_scroll_signature(),
                 )
                 if _doc_layout_sig_prev != _doc_layout_sig:
                     with _RENDER_PROF.span("demo.frame.doc.clear"):
@@ -14457,12 +15211,80 @@ def main():
                     _submit_player_hud_doc(_doc_rdr, WIN_W, WIN_H)
                 if _player_cam_panel.open:
                     with _RENDER_PROF.span("demo.frame.doc.camera_panel"):
+                        _camera_panel_h = min(WIN_H - 20, 720)
+                        _camera_panel_h = max(180, int(_camera_panel_h))
+                        _right_rect = (WIN_W - 340, 10, 330, _camera_panel_h)
+                        _selector_h = 132
+                        _camera_rect = (
+                            _right_rect[0],
+                            _right_rect[1] + _selector_h,
+                            _right_rect[2],
+                            max(90, _right_rect[3] - _selector_h),
+                        )
+                        _visible_rows = max(1, (_camera_rect[3] - 30) // 42)
+                        _player_cam_panel.set_doc_viewport(_right_rect, _visible_rows)
+                        _player_cam_panel.clear_doc_hit_maps()
+                        _renderer_actions = []
+                        for _mode, _label in (
+                            (RenderMode.C, "C"),
+                            (RenderMode.GL, "GL"),
+                            (RenderMode.HYBRID, "Hybrid"),
+                            (RenderMode.RAYTRACE, "Raytrace"),
+                        ):
+                            _active = (_player_cam_panel.render_mode is _mode)
+                            _renderer_actions.append({
+                                "key": _mode.value,
+                                "label": ("> " if _active else "  ") + _label,
+                            })
+                        _doc_renderer_menu_spec = _DocPanel(
+                            name="camera_renderer_menu",
+                            label="Renderer",
+                            payload={
+                                "action_first": True,
+                                "actions": _renderer_actions,
+                            },
+                        )
                         _doc_rdr.submit_panel(
-                            _doc_camera_spec,
-                            (WIN_W - 340, 10, 330, 30 + 42 * len(_doc_camera_spec.knobs)),
+                            _doc_renderer_menu_spec,
+                            (_right_rect[0], _right_rect[1], _right_rect[2], _selector_h - 6),
                             node_id_map=_doc_camera_ids,
-                            knob_values={k: getattr(R.cam, k, None) for k in
-                                         [s[0] for s in _PlayerCameraPanel._SLIDERS]},
+                            knob_values={},
+                            action_rects=_player_cam_panel._doc_action_rects,
+                            knob_rects=_player_cam_panel._doc_knob_rects,
+                        )
+                        _player_cam_panel.sync_doc_scroll_widget(_camera_rect[3], 330)
+                        _player_cam_panel._pull()
+                        _all_camera_knobs = list(_doc_camera_spec.knobs)
+                        _visible_knobs = _player_cam_panel.doc_visible_knobs(_all_camera_knobs)
+                        _scroll_start = _player_cam_panel.doc_visible_start(len(_all_camera_knobs))
+                        _scroll_stop = _scroll_start + len(_visible_knobs)
+                        _doc_camera_visible_spec = _DocPanel(
+                            name="camera_panel",
+                            label=f"Camera {_scroll_start + 1}-{_scroll_stop}/{len(_doc_camera_spec.knobs)}",
+                            knobs=_visible_knobs,
+                        )
+                        _bridge_snapshot = dict(_player_cam_panel._values)
+                        try:
+                            import sys as _s
+                            _kv = _bridge_snapshot.get('sensor_iso')
+                            _vis = [getattr(k, "name", "?") for k in _visible_knobs]
+                            _id_iso = _doc_camera_ids.get('sensor_iso')
+                            print(
+                                f"[bridge] sensor_iso _values={_kv!r} "
+                                f"in_visible={'sensor_iso' in _vis} "
+                                f"node_id_map_id={_id_iso} "
+                                f"r.iso={getattr(getattr(getattr(R, 'film', None), 'active_layer', None), 'iso', None)!r}",
+                                file=_s.stderr, flush=True,
+                            )
+                        except Exception:
+                            pass
+                        _doc_rdr.submit_panel(
+                            _doc_camera_visible_spec,
+                            _camera_rect,
+                            node_id_map=_doc_camera_ids,
+                            knob_values=_bridge_snapshot,
+                            action_rects=_player_cam_panel._doc_action_rects,
+                            knob_rects=_player_cam_panel._doc_knob_rects,
                         )
                 if _active_st is not None:
                     if not hasattr(_active_st, 'submit_doc_channel'):
@@ -14501,6 +15323,22 @@ def main():
             _arm_hang_watchdog("render:scene:publish", frame_index=int(fi))
             with _RENDER_PROF.span("demo.frame.scene.publish"):
                 _submit_scene_object_buffers()
+                for _sn in scene_nodes:
+                    if hasattr(_sn, 'publish_geometry'):
+                        try:
+                            _sn.publish_geometry(
+                                lambda _n: int(_MAT_ID_BY_NAME.get(_n, _MAT_ID_MISSING))
+                            )
+                        except Exception:
+                            pass
+                if _publish_equipped_flashlight_geometry is not None and player_ctrl is not None:
+                    try:
+                        _publish_equipped_flashlight_geometry(
+                            player_ctrl,
+                            lambda _n: int(_MAT_ID_BY_NAME.get(_n, _MAT_ID_MISSING)),
+                        )
+                    except Exception:
+                        pass
 
             # ── Bottom-up shader walk ────────────────────────────────────────
             # Visit every SHADERS-axis node in the control hierarchy in
@@ -14643,19 +15481,9 @@ def main():
 
             setattr(R, "_global_dispatch_result", _global_result)
 
-            # Camera-item draw is part of the 3D channel: cameras publish
-            # their geometry through publish_owner_target; their direct
-            # GL draw remains here only as a transitional convenience until
-            # the base material renderer consumes the geometry channel.
-            _rs_lv = np.array([0.5, 1.0, 0.6], np.float32)
-            _rs_lv /= np.linalg.norm(_rs_lv)
-            if cameras and _cam_pure_matrices is not None:
-                _P, _V = _cam_pure_matrices(R.cam)
-                _MVP = (_P @ _V).astype(np.float32)
-                _MV  = _V.astype(np.float32)
-                _lv  = _rs_lv
-                for _ci in cameras:
-                    _ci.draw(_MVP, _MV, _lv)
+            # Camera scene geometry is rendered through scene.geometry owner
+            # buffers. The previous direct camera draw fallback is archived in
+            # _archive/legacy_direct_camera_draw.py.
 
             # ── Blit policy ────────────────────────────────────────────────
             # The C globals produce CPU RGBA buffers.  Deposit them into
@@ -14670,7 +15498,7 @@ def main():
                 with _RENDER_PROF.span("demo.frame.blit"):
                     try:
                         _out_3d = getattr(_global_result, "out_3d_rgba", None)
-                        if _out_3d is not None:
+                        if _out_3d is not None and not bool(getattr(_global_result, "preblitted_3d", False)):
                             _doc_rdr.blit_rgba(_out_3d, alpha=1.0)
                     except Exception as _exc:
                         _report_exception("blit 3D-C", _exc)

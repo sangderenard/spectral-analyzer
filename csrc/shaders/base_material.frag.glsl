@@ -31,6 +31,7 @@
  *   uLightPos [N]     — view-space position per emitting surface group
  *   uLightColor[N]    — linear sRGB colour per light (no clamp)
  *   uLightIntensity[N]— scalar gain per light
+ *   uLightGroupId[N]  — emitting group id; matching fragments skip that light
  *
  * There is NO ambient, NO scene tint, NO proxy bounce, NO hardcoded sun.
  * Every photon comes from a real emitter pushed in by the host.  A non-
@@ -113,6 +114,8 @@ float tx_translucence_gain(int id) { return texstack[id*TEXSTACK_STRIDE+15]; }
 in  vec3     vNormV;
 in  vec3     vPosV;
 flat in int  vMatId;
+flat in int  vGroupId;
+flat in int  vCullImmune;
 in  vec2     vUv;
 
 out vec4 FragColor;
@@ -123,6 +126,9 @@ uniform int   uNumLights;
 uniform vec3  uLightPos      [MAX_LIGHTS];   // view-space emitter position
 uniform vec3  uLightColor    [MAX_LIGHTS];   // linear sRGB
 uniform float uLightIntensity[MAX_LIGHTS];
+uniform int   uLightGroupId  [MAX_LIGHTS];
+uniform float uLightCalibration = 1.0;
+uniform mat3  uCatCcmMatrix = mat3(1.0);
 
 // ── UV emission/depth/remit texture stack (Stage 2 of the action plan) ─────
 // Channel layout per UV_EMISSION_STACK_PLAN.md:
@@ -164,9 +170,17 @@ void main() {
     int id = vMatId;
 
     // Geometry
-    vec3 N = normalize(gl_FrontFacing ? vNormV : -vNormV);
+    // Use triangle orientation for front/back classification; per-fragment
+    // normal-sign tests can flicker on curved shells and create black speckle.
+    bool front_facing = gl_FrontFacing;
+    vec3 N = normalize(front_facing ? vNormV : -vNormV);
     vec3 V = normalize(-vPosV);
     float NdotV = max(dot(N, V), 0.0);
+    // Selective back-face culling in shader: cull by default, keep both
+    // sides only when the triangle is explicitly marked cull-immune.
+    if (vCullImmune == 0 && !front_facing) {
+        discard;
+    }
 
     // Material parameters
     vec3  albedo   = mat_albedo   (id);
@@ -214,7 +228,7 @@ void main() {
     }
 
     // Front / back face base colour
-    vec3 base = gl_FrontFacing ? albedo : inner;
+    vec3 base = front_facing ? albedo : inner;
 
     // Schlick Fresnel — F0 derived from IOR (dielectric) blended with albedo (conductor)
     float ior_f0 = (ior - 1.0) / (ior + 1.0);
@@ -228,10 +242,15 @@ void main() {
     float spec_acc = 0.0;
     int n = min(uNumLights, MAX_LIGHTS);
     for (int i = 0; i < n; ++i) {
+        if (uLightGroupId[i] == vGroupId) {
+            continue;
+        }
         vec3  Lvec  = uLightPos[i] - vPosV;
         float Lr2   = max(dot(Lvec, Lvec), 1e-8);
         vec3  L     = Lvec * inversesqrt(Lr2);
-        vec3  Lcol  = uLightColor[i] * (uLightIntensity[i] / Lr2);
+        float emitter_r2 = max(uLightIntensity[i], 0.0) * 0.0795774715; // area / (4*pi)
+        float atten_r2 = max(Lr2 + emitter_r2, 1e-8);
+        vec3  Lcol  = uLightColor[i] * ((uLightIntensity[i] * uLightCalibration) / atten_r2);
         vec3  H     = normalize(L + V);
         float NdotL = max(dot(N, L), 0.0);
         float NdotH = max(dot(N, H), 0.0);
@@ -313,8 +332,15 @@ void main() {
         col = mix(col, tinted, 0.35);
     }
 
+    // Color compensation equation: C' = CAT_CCM * C.
+    col = uCatCcmMatrix * col;
+
     // ── Opacity ────────────────────────────────────────────────────────────
     float alpha = opacity * (1.0 - mat_trans(id) * 0.8);
 
-    FragColor = vec4(col, alpha);
+    vec3 lin = max(col, vec3(0.0));
+    vec3 s1 = lin * 12.92;
+    vec3 s2 = 1.055 * pow(lin, vec3(1.0 / 2.4)) - 0.055;
+    vec3 srgb = mix(s1, s2, step(vec3(0.0031308), lin));
+    FragColor = vec4(srgb, alpha);
 }

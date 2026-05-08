@@ -1,0 +1,90 @@
+# Material: construction_borosilicate
+# Glowing borosilicate glass variant used for all unfinished room surfaces.
+# Replaces construction_glass as the default unfinished-state placeholder.
+# Faint cool-white emission (~480 nm peak) reads as live construction activity.
+# Fresnel-weighted lobe (model_flags=1) concentrates glow at grazing angles —
+# characteristic of edge-lit glass used in real construction scaffolding.
+
+name: construction_borosilicate
+description: Glowing borosilicate — faintly emissive construction glass for unfinished surfaces
+
+color_profile_name: borosilicate
+emission_profile_name: construction_borosilicate
+
+reflectivity: 0.07
+diffusion: 0.015
+absorption: 0.003
+
+smoothness: 0.90
+ior: 1.517                          # borosilicate n_d (sodium D line)
+opacity: 0.10
+
+pbr:
+  albedo: [0.88, 0.91, 0.96]        # near-white with faint blue bias
+  roughness: 0.08
+  metallic: 0.0
+  transmission: 0.68
+  emission_rgb: [0.06, 0.07, 0.11]  # very faint cool-white glow (not blown out)
+
+enamel:
+  thickness_m: 0.00000012           # 120 nm — subtle thin-film iridescence
+  ior_real: 1.47
+  ior_imag: 0.0
+  color_rgb: [0.90, 0.93, 0.98]
+  roughness: 0.04
+
+texture_stack:
+  emit_gain: 0.08
+  color_blend: 0.0
+  direct_lobe_power: 3.5            # NdotV^3.5 emission shape (Profile 1)
+  model_flags: 1                    # profile 1 = emissive lobe (base_material.frag)
+  remit_gain: 0.0
+  bulb_radius_mm: 0.0
+  remit_decay: 0.0
+  translucence_gain: 0.0
+
+spectral_bands:
+  # Blue peak: 480 nm → 6.25×10^14 Hz
+  - center_hz: 625000000000000.0
+    bandwidth_hz: 62500000000000.0
+    reflectance: 0.05
+    transmittance: 0.72
+    diffuse_frac: 0.010
+    emission: 0.06
+    reemission: 0.0
+    ior_real: 1.520
+    ior_imag: 0.0
+  # Green shoulder: 540 nm → 5.55×10^14 Hz
+  - center_hz: 555000000000000.0
+    bandwidth_hz: 46000000000000.0
+    reflectance: 0.06
+    transmittance: 0.70
+    diffuse_frac: 0.012
+    emission: 0.04
+    reemission: 0.0
+    ior_real: 1.517
+    ior_imag: 0.0
+  # Red tail: 667 nm → 4.50×10^14 Hz (lower emission — cool-white bias)
+  - center_hz: 450000000000000.0
+    bandwidth_hz: 40000000000000.0
+    reflectance: 0.08
+    transmittance: 0.65
+    diffuse_frac: 0.015
+    emission: 0.02
+    reemission: 0.0
+    ior_real: 1.514
+    ior_imag: 0.0
+
+gameplay:
+  label: Construction Borosilicate
+  category: surface_state
+  tier: construction
+  role: unfinished_surface_placeholder
+
+notes: >
+  IOR 1.517 matches borosilicate_glass exactly.  Emission_rgb [0.06, 0.07, 0.11]
+  is below perceptual white so it reads as ambient inner light rather than a
+  bright source.  Thin-film enamel at 120 nm produces interference fringes
+  visible at near-normal incidence — the structural colour shifts as the player
+  moves, reinforcing the sense that the surface is alive and awaiting completion.
+  This material should never appear in a fully delivered room.

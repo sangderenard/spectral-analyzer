@@ -1,0 +1,65 @@
+# Material: acoustic_plaster_ceiling
+# Textured spray-applied acoustic plaster ceiling finish.
+
+name: acoustic_plaster_ceiling
+description: Off-white textured spray acoustic plaster ceiling finish
+
+color_profile_name: acoustic_plaster_ceiling
+surface_profile: popcorn_ceiling
+reflectivity: 0.82
+diffusion: 0.85
+absorption: 0.14
+
+smoothness: 0.18
+ior: 1.42
+opacity: 1.0
+
+pbr:
+  albedo: [0.92, 0.91, 0.89]
+  roughness: 0.65
+  metallic: 0.0
+  transmission: 0.0
+  emission_rgb: [0.0, 0.0, 0.0]
+
+enamel:
+  thickness_m: 0.0
+  ior_real: 1.42
+  ior_imag: 0.0
+  color_rgb: [0.93, 0.92, 0.90]
+  roughness: 0.62
+
+spectral_bands:
+  - center_hz: 428274940000000.0
+    bandwidth_hz: 34261995000000.0
+    reflectance: 0.88
+    transmittance: 0.0
+    diffuse_frac: 0.85
+    ior_real: 1.42
+    ior_imag: 0.0
+  - center_hz: 545077196000000.0
+    bandwidth_hz: 40880790000000.0
+    reflectance: 0.87
+    transmittance: 0.0
+    diffuse_frac: 0.86
+    ior_real: 1.42
+    ior_imag: 0.0
+  - center_hz: 666205462000000.0
+    bandwidth_hz: 43303355000000.0
+    reflectance: 0.85
+    transmittance: 0.0
+    diffuse_frac: 0.87
+    ior_real: 1.42
+    ior_imag: 0.0
+
+gameplay:
+  label: Acoustic Plaster Ceiling
+  category: ceiling_finish
+  tier: finished
+  role: default_ceiling_interior
+
+notes: >
+  Spray-applied perlite-aggregate acoustic plaster, typical of commercial
+  recording studios and performance spaces.  Off-white tone (near-neutral with
+  very slight warm bias) and high diffuse fraction model the broadband
+  scattering from the rough textured surface.  Moderate absorption coefficient
+  prevents low-frequency flutter without deadening the room.

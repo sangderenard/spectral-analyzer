@@ -1,0 +1,88 @@
+# Material: flashlight_reflector
+# Polished machined aluminium inner cup surface of the PlayerFlashlight.
+# Near-mirror specular with slight warm bias (Al reflectance drops ~3% at
+# 450 nm vs 650 nm, giving the characteristic warm-tinted reflection).
+# metallic=1.0, roughness≈0.03 (electropolished finish).
+
+name: flashlight_reflector
+description: Polished aluminium parabolic reflector — near-mirror, slight warm bias
+
+color_profile_name: aluminium_polished
+# No emission_profile_name — pure reflector, zero emission
+
+reflectivity: 0.91
+diffusion:    0.05
+absorption:   0.04
+
+smoothness: 0.97
+ior:        1.44               # Al n at 550 nm (Palik)
+opacity:    1.0
+
+pbr:
+  albedo:        [0.92, 0.92, 0.88]   # near-white, very faint warm bias
+  roughness:     0.03
+  metallic:      1.0
+  transmission:  0.0
+  emission_rgb:  [0.0, 0.0, 0.0]
+
+enamel:
+  thickness_m:  0.0
+  ior_real:     1.0
+  ior_imag:     0.0
+  color_rgb:    [1.0, 1.0, 1.0]
+  roughness:    0.02
+
+texture_stack:
+  emit_gain:          0.0
+  color_blend:        0.0
+  direct_lobe_power:  1.0
+  model_flags:        0
+  remit_gain:         0.0
+  bulb_radius_mm:     0.0
+  remit_decay:        0.0
+  translucence_gain:  0.0
+
+spectral_bands:
+  # Blue (450 nm): Al reflectance ~88% — slightly lower than red
+  - center_hz:     666700000000000.0
+    bandwidth_hz:   55000000000000.0
+    reflectance:   0.88
+    transmittance: 0.0
+    diffuse_frac:  0.02
+    emission:      0.0
+    reemission:    0.0
+    ior_real:      0.62
+    ior_imag:      5.50    # Al k at 450 nm
+  # Green (550 nm): Al reflectance ~91%
+  - center_hz:     545000000000000.0
+    bandwidth_hz:   50000000000000.0
+    reflectance:   0.91
+    transmittance: 0.0
+    diffuse_frac:  0.02
+    emission:      0.0
+    reemission:    0.0
+    ior_real:      0.96
+    ior_imag:      6.00
+  # Red (650 nm): Al reflectance ~93%
+  - center_hz:     461000000000000.0
+    bandwidth_hz:   45000000000000.0
+    reflectance:   0.93
+    transmittance: 0.0
+    diffuse_frac:  0.02
+    emission:      0.0
+    reemission:    0.0
+    ior_real:      1.44
+    ior_imag:      7.10
+
+gameplay:
+  label:    Flashlight Reflector
+  category: optical_component
+  tier:     equipment
+  role:     reflector_surface
+
+notes: >
+  Electropolished aluminium: roughness 0.03 gives tight near-specular lobe while
+  retaining visible micro-scratches in the ray-tracer.  The spectral IOR values
+  (n,k) are Palik Al measurements — the imaginary part k (extinction) controls
+  the metallic reflectance at each band.  Warm bias (r>b) matches the warm-tinted
+  pool of light produced by a tungsten bulb source.

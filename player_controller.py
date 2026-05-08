@@ -67,6 +67,16 @@ except Exception:
     _trace_focus_cone_rays = None
     _trace_focus_single_ray = None
 
+try:
+    from player_flashlight import PlayerFlashlight as _PlayerFlashlight
+except Exception:
+    _PlayerFlashlight = None
+
+try:
+    from player_tool import FlashlightTool as _FlashlightTool
+except Exception:
+    _FlashlightTool = None
+
 if TYPE_CHECKING:
     pass   # avoid circular imports; Camera is passed by value
 
@@ -159,6 +169,8 @@ def _parse_key(name: str) -> int:
         "tab":    pygame.K_TAB,
         "escape": pygame.K_ESCAPE,
         "e":      pygame.K_e,
+        "f":      pygame.K_f,
+        "g":      pygame.K_g,
         "q":      pygame.K_q,
         "space":  pygame.K_SPACE,
     }
@@ -244,7 +256,35 @@ class PlayerController:
         self._active_camera  = None   # CameraItem being operated
         self._proximity_frac = 0.0   # 0..1 closeness to nearest interactable
         self._focus_target   = None   # interactable centered in player view while disambiguating
+        self._view_hit_point = None   # center-view world hit point cache for held tools
         self._backpack: dict[str, int] = {}
+
+        # Surface-drop (F key): player seeds BFS at aimed room surface triangle
+        d = config.get("drop", {})
+        self._drop_key         = _parse_key(str(d.get("drop_key", "f")))
+        self._drop_area_m2     = float(d.get("area_per_unit_m2", 1.0))
+        self._drop_max_dist    = float(d.get("max_dist_m", 10.0))
+        self._surface_set      = None   # set via set_surface_set()
+
+        # Clip engine (set via set_room_cfg after the room is applied)
+        self._clip_engine = None   # PlayerClipEngine from player_clip_py
+
+        # Tool hotbar (9 slots; number keys 1-9 select; equipped = active)
+        self._tool_slots: list = [None] * 9
+        self._tool_index: int  = -1          # -1 = nothing selected
+        self._tool_inventory: list = []      # persistent tool objects collected by player
+        self._scene_nodes: list = []         # world objects outside duty_stations
+
+        # Flashlight controls (operate on the equipped tool's flashlight)
+        self._flashlight_key       = pygame.K_g
+        self._flashlight_bulb_step = 0.002   # 2 mm per keypress
+        self._flashlight_aim_dist  = 20.0    # ray-cast range for aim point
+        self._aimer_rate_deg_s = 34.0
+        self._aimer_yaw_deg = 0.0
+        self._aimer_pitch_deg = 0.0
+        self._aimer_yaw_limit_deg = 175.0
+        self._aimer_pitch_limit_deg = 150.0
+        self._aimer_return_halflife_s = 0.28
 
         # Camera forced-eye override (set by PlayerController in walk/interact)
         if not hasattr(camera, '_forced_eye'):
@@ -256,6 +296,118 @@ class PlayerController:
 
         if self.state == PlayerState.WALK:
             self._enter_walk()
+
+    # ── Room collision ────────────────────────────────────────────────────────
+
+    def set_room_cfg(self, cfg: dict) -> None:
+        """Build wall slabs from an applied room_cfg and feed them to the clip engine."""
+        try:
+            from player_clip_py import PlayerClipEngine
+            if self._clip_engine is None:
+                self._clip_engine = PlayerClipEngine()
+            slabs = PlayerClipEngine.slabs_from_room_cfg(cfg)
+            self._clip_engine.set_slabs(slabs)
+            if hasattr(self._clip_engine, "set_surface_field_from_room_cfg"):
+                self._clip_engine.set_surface_field_from_room_cfg(cfg)
+            if hasattr(self._clip_engine, "enable_surface_clip"):
+                enabled = bool(cfg.get("player_clip_surface_cast_enabled", False))
+                self._clip_engine.enable_surface_clip(
+                    enabled,
+                    max_distance=float(cfg.get("player_clip_surface_cast_distance_m", 1.0) or 1.0),
+                )
+        except Exception:
+            pass
+
+    def set_clip_engine(self, engine) -> None:
+        """Directly attach a pre-built PlayerClipEngine."""
+        self._clip_engine = engine
+
+    def set_surface_set(self, surface_set) -> None:
+        """Attach a RoomSurfaceSet so the player can seed BFS via surface drops."""
+        self._surface_set = surface_set
+
+    def _pick_surface_triangle(self, surface_set, ro: np.ndarray,
+                               rd: np.ndarray) -> Optional[tuple]:
+        """
+        Ray-cast against all triangles in surface_set; return
+        (surface_key, surface, centroid, tri_idx) for the nearest hit, or None.
+        """
+        max_t  = max(0.10, float(self._drop_max_dist))
+        best_t = float('inf')
+        best   = None
+
+        candidates = [("floor", surface_set.floor),
+                      ("ceiling", surface_set.ceiling)]
+        for i, w in enumerate(surface_set.walls):
+            candidates.append((f"wall_{i}", w))
+
+        for key, surf in candidates:
+            tris = surf._tris
+            if len(tris) == 0:
+                continue
+            for j in range(len(tris)):
+                tri = tris[j]
+                t = self._ray_triangle_t(
+                    ro, rd,
+                    tri[0].astype(np.float64),
+                    tri[1].astype(np.float64),
+                    tri[2].astype(np.float64),
+                )
+                if t < best_t and t <= max_t:
+                    best_t = t
+                    best   = (key, surf,
+                              surf._centroids[j].astype(np.float64), j)
+        return best
+
+    def _try_surface_drop(self) -> bool:
+        """
+        Drop the most-abundant backpack material onto the aimed room surface
+        triangle, seeding BFS diffusion from that point.
+
+        Consumes one inventory unit (= self._drop_area_m2 m²) from the backpack.
+        Returns True if a drop occurred.
+        """
+        if self._surface_set is None or self.state != PlayerState.WALK:
+            return False
+        if not self._backpack:
+            return False
+
+        ro, rd = self._view_ray()
+        hit = self._pick_surface_triangle(self._surface_set, ro, rd)
+        if hit is None:
+            return False
+
+        _key, surf, centroid, _tri_idx = hit
+
+        mat_name = max(self._backpack, key=lambda k: self._backpack[k])
+        if self._backpack.get(mat_name, 0) <= 0:
+            return False
+
+        try:
+            from material_db import MaterialDatabase as _MatDB
+            mat_id = _MatDB.instance().index_of(mat_name)
+        except Exception:
+            return False
+
+        surf.add_seed(centroid.astype(np.float32))
+        surf.fill_batch(mat_id, self._drop_area_m2)
+
+        self._backpack[mat_name] -= 1
+        if self._backpack[mat_name] <= 0:
+            del self._backpack[mat_name]
+        return True
+
+    def _apply_room_bounds(self, pre_pos: np.ndarray, dt: float) -> None:
+        if self._clip_engine is None:
+            return
+        inv_dt = 1.0 / max(float(dt), 1e-6)
+        vel = ((self._walk_pos - pre_pos) * inv_dt).astype(np.float32)
+        new_pos, flags = self._clip_engine.tick(
+            self._walk_pos.astype(np.float32),
+            vel,
+            float(self._floor_z), float(self._floor_z + 4.0),
+            0.25, math.radians(float(self._walk_yaw)), float(dt))
+        self._walk_pos[:] = new_pos.astype(self._walk_pos.dtype)
 
     # ── Public queries ────────────────────────────────────────────────────────
 
@@ -272,6 +424,29 @@ class PlayerController:
     def focus_target(self):
         """Interactable currently under the center-view focus ray, if any."""
         return self._focus_target
+
+    @property
+    def equipped_tool(self):
+        """Currently selected hotbar tool, or None."""
+        if self._tool_index < 0 or self._tool_index >= len(self._tool_slots):
+            return None
+        return self._tool_slots[self._tool_index]
+
+    @property
+    def tool_inventory(self) -> list:
+        """Collected tool objects currently known to the player."""
+        return list(self._tool_inventory)
+
+    @property
+    def flashlight_object(self):
+        """PlayerFlashlight of the equipped tool, or None."""
+        tool = self.equipped_tool
+        return getattr(tool, 'flashlight', None) if tool is not None else None
+
+    @property
+    def flashlight_on(self) -> bool:
+        fl = self.flashlight_object
+        return fl is not None and bool(fl.enabled)
 
     @property
     def backpack(self) -> dict:
@@ -567,12 +742,39 @@ class PlayerController:
             if ev.key == self._to_orbit_key:
                 self._enter_orbit()
                 return True
+            # Hotbar slot selection: 1-9 selects / re-press deselects
+            if pygame.K_1 <= ev.key <= pygame.K_9:
+                new_idx = int(ev.key - pygame.K_1)
+                self._tool_index = -1 if self._tool_index == new_idx else new_idx
+                return True
+            if ev.key == self._drop_key:
+                self._try_surface_drop()
+                return True
+            if ev.key == self._flashlight_key:
+                _fl = self.flashlight_object
+                if _fl is not None:
+                    _fl.toggle()
+                return True
+            if ev.key == pygame.K_LEFTBRACKET:
+                _fl = self.flashlight_object
+                if _fl is not None:
+                    _fl.set_bulb_z(_fl.bulb_z - self._flashlight_bulb_step)
+                return True
+            if ev.key == pygame.K_RIGHTBRACKET:
+                _fl = self.flashlight_object
+                if _fl is not None:
+                    _fl.set_bulb_z(_fl.bulb_z + self._flashlight_bulb_step)
+                return True
             if ev.key == self._trigger_key:
-                hit = self._center_view_interactable(duty_stations, cameras)
+                _all_stations = duty_stations + self._scene_nodes
+                hit = self._center_view_interactable(_all_stations, cameras)
                 if hit is not None:
                     if hit in cameras:
                         self._enter_camera(hit)
                     else:
+                        if hasattr(hit, "try_pickup_tool"):
+                            self._try_pickup_tool(hit)
+                            return True
                         if hasattr(hit, "try_pickup_material"):
                             self._try_pickup_material(hit)
                             return True
@@ -587,8 +789,11 @@ class PlayerController:
                 if near_cam is not None:
                     self._enter_camera(near_cam)
                     return True
-                near = self._nearest_station(duty_stations)
+                near = self._nearest_station(_all_stations)
                 if near is not None:
+                    if hasattr(near, "try_pickup_tool"):
+                        self._try_pickup_tool(near)
+                        return True
                     if hasattr(near, "try_pickup_material"):
                         self._try_pickup_material(near)
                         return True
@@ -611,6 +816,42 @@ class PlayerController:
         if ev.type == pygame.MOUSEWHEEL:
             return True
         return False
+
+    def _try_pickup_tool(self, item) -> bool:
+        """Call item.try_pickup_tool(tool_slots); returns True if collected."""
+        if item is None or not hasattr(item, "try_pickup_tool"):
+            return False
+        try:
+            try:
+                ok = bool(item.try_pickup_tool(
+                    self._tool_slots,
+                    tool_inventory=self._tool_inventory,
+                ))
+            except TypeError:
+                ok = bool(item.try_pickup_tool(self._tool_slots))
+            if ok:
+                # Prefer the exact slot reported by the pickup.
+                picked_slot = int(getattr(item, "last_pick_slot", -1))
+                if 0 <= picked_slot < len(self._tool_slots) and self._tool_slots[picked_slot] is not None:
+                    self._tool_index = picked_slot
+                else:
+                    # Fallback: select first populated slot.
+                    for i, slot in enumerate(self._tool_slots):
+                        if slot is not None:
+                            self._tool_index = i
+                            break
+                # Mirror hotbar tools into inventory in case pickup used legacy signature.
+                for _slot_tool in self._tool_slots:
+                    if _slot_tool is not None and _slot_tool not in self._tool_inventory:
+                        self._tool_inventory.append(_slot_tool)
+            return ok
+        except Exception:
+            return False
+
+    def register_scene_node(self, node) -> None:
+        """Register a world object that lives outside duty_stations."""
+        if node not in self._scene_nodes:
+            self._scene_nodes.append(node)
 
     def _try_pickup_material(self, pile) -> None:
         if pile is None or not hasattr(pile, "try_pickup_material"):
@@ -710,6 +951,7 @@ class PlayerController:
         if keys[pygame.K_a]: move -= right
 
         n = np.linalg.norm(move)
+        pre_pos = self._walk_pos.copy()
         if n > 1e-9:
             self._walk_pos += (move / n) * speed * dt
 
@@ -720,8 +962,48 @@ class PlayerController:
             self._walk_pos[2] = self._floor_z
             self._walk_vel_z  = 0.0
 
+        self._apply_room_bounds(pre_pos, dt)
+
+        # Single-ray aimer nudge (arrow keys).
+        # This offsets the ray-intersection target without changing camera look.
+        _aimer_h = 0.0
+        _aimer_v = 0.0
+        if keys[pygame.K_LEFT]:
+            _aimer_h -= 1.0
+        if keys[pygame.K_RIGHT]:
+            _aimer_h += 1.0
+        if keys[pygame.K_UP]:
+            _aimer_v += 1.0
+        if keys[pygame.K_DOWN]:
+            _aimer_v -= 1.0
+
+        if abs(_aimer_h) > 1e-6:
+            self._aimer_yaw_deg += _aimer_h * self._aimer_rate_deg_s * dt
+        if abs(_aimer_v) > 1e-6:
+            # Intentionally not inverted: Up aims up, Down aims down.
+            self._aimer_pitch_deg += _aimer_v * self._aimer_rate_deg_s * dt
+
+        if abs(_aimer_h) <= 1e-6:
+            _k = math.log(2.0) / max(self._aimer_return_halflife_s, 1e-4)
+            self._aimer_yaw_deg *= math.exp(-_k * dt)
+        if abs(_aimer_v) <= 1e-6:
+            _k = math.log(2.0) / max(self._aimer_return_halflife_s, 1e-4)
+            self._aimer_pitch_deg *= math.exp(-_k * dt)
+
+        self._aimer_yaw_deg = float(np.clip(
+            self._aimer_yaw_deg,
+            -self._aimer_yaw_limit_deg,
+            self._aimer_yaw_limit_deg,
+        ))
+        self._aimer_pitch_deg = float(np.clip(
+            self._aimer_pitch_deg,
+            -self._aimer_pitch_limit_deg,
+            self._aimer_pitch_limit_deg,
+        ))
+
         self._update_walk_camera()
         self._update_focus_target(keys, duty_stations, cameras)
+        self._update_view_hit_point(duty_stations, cameras)
         self._update_proximity(duty_stations, cameras)
 
     def _tick_interact(self, dt: float):
@@ -1071,6 +1353,21 @@ class PlayerController:
             return
         self._focus_target = self._center_view_interactable(duty_stations, cameras)
 
+    def _update_view_hit_point(self, duty_stations: list, cameras: list) -> None:
+        """Cache the single aimed world hit point used by held tools."""
+        ro, rd = self._aimer_ray()
+        owner, t = self.pick_interactable_with_ray(
+            ro,
+            rd,
+            list(duty_stations) + list(self._scene_nodes),
+            list(cameras),
+        )
+        if owner is not None and np.isfinite(float(t)):
+            self._view_hit_point = (ro + rd * float(t)).astype(np.float64)
+            return
+        t = self._surface_ray_t(ro, rd, self._flashlight_aim_dist)
+        self._view_hit_point = (ro + rd * float(t)).astype(np.float64)
+
     def _update_camera_view(self, cam) -> None:
         """Push the camera item's physical orientation into the GL camera.
 
@@ -1111,3 +1408,111 @@ class PlayerController:
                 frac = max(0.0, 1.0 - d / r)
                 best = max(best, frac)
         self._proximity_frac = best
+
+    # ── Flashlight ────────────────────────────────────────────────────────────
+
+    def _surface_ray_t(self, ro: np.ndarray, rd: np.ndarray,
+                       max_dist: float) -> float:
+        """Nearest ray-triangle hit distance across all surface_set surfaces.
+
+        Returns max_dist when there is no hit or no surface_set is attached.
+        """
+        if self._surface_set is None:
+            return max_dist
+        best_t = float('inf')
+        candidates = [("floor", self._surface_set.floor),
+                      ("ceiling", self._surface_set.ceiling)]
+        for i, w in enumerate(self._surface_set.walls):
+            candidates.append((f"wall_{i}", w))
+        for _key, surf in candidates:
+            tris = surf._tris
+            for j in range(len(tris)):
+                tri = tris[j]
+                t = self._ray_triangle_t(
+                    ro, rd,
+                    tri[0].astype(np.float64),
+                    tri[1].astype(np.float64),
+                    tri[2].astype(np.float64),
+                )
+                if t < best_t:
+                    best_t = t
+        return float(min(best_t, max_dist)) if best_t < float('inf') else max_dist
+
+    def flashlight_transform(self) -> np.ndarray:
+        """4×4 column-major world transform for the flashlight held at half
+        eye-height, aimed toward the view-ray surface impact point.
+
+        Local +Z of the flashlight maps to the aim direction.
+        Returns identity (float32) when not in WALK state.
+        """
+        if self.state != PlayerState.WALK:
+            return np.eye(4, dtype=np.float32)
+
+        # Origin: half eye-height above the floor position
+        origin = self._walk_pos.copy()
+        origin[2] += self._eye_height * 0.5
+
+        # Aim: follow the cached single-ray intersection point.
+        ro, rd = self._view_ray()
+        if isinstance(self._view_hit_point, np.ndarray) and self._view_hit_point.shape == (3,):
+            aim_pt = self._view_hit_point.astype(np.float64)
+        else:
+            t = self._surface_ray_t(ro, rd, self._flashlight_aim_dist)
+            aim_pt = ro + rd * t
+        fwd = aim_pt - origin
+        fwd_len = float(np.linalg.norm(fwd))
+        if fwd_len < 1e-9:
+            fwd = rd.copy()
+        else:
+            fwd = fwd / fwd_len
+
+        # Orthonormal frame — degenerate when looking straight up/down
+        world_up = np.array([0.0, 0.0, 1.0], np.float64)
+        right = np.cross(world_up, fwd)
+        r_len = float(np.linalg.norm(right))
+        if r_len < 1e-9:
+            right = np.array([1.0, 0.0, 0.0], np.float64)
+        else:
+            right = right / r_len
+        up = np.cross(fwd, right)
+
+        M = np.eye(4, dtype=np.float32)
+        M[:3, 0] = right.astype(np.float32)
+        M[:3, 1] = up.astype(np.float32)
+        M[:3, 2] = fwd.astype(np.float32)
+        M[:3, 3] = origin.astype(np.float32)
+        return M
+
+    def _aimer_ray(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the single aim ray with arrow-key offsets applied."""
+        ro, rd = self._view_ray()
+        yaw = float(self._aimer_yaw_deg)
+        pitch = float(self._aimer_pitch_deg)
+        if abs(yaw) < 1e-6 and abs(pitch) < 1e-6:
+            return ro, rd
+
+        fwd = np.asarray(rd, np.float64)
+        n = float(np.linalg.norm(fwd))
+        if n <= 1e-12:
+            return ro, rd
+        fwd = fwd / n
+
+        world_up = np.array([0.0, 0.0, 1.0], np.float64)
+        right = np.cross(world_up, fwd)
+        r_len = float(np.linalg.norm(right))
+        if r_len < 1e-9:
+            right = np.array([1.0, 0.0, 0.0], np.float64)
+        else:
+            right = right / r_len
+        up = np.cross(fwd, right)
+
+        def _rotate(v: np.ndarray, axis: np.ndarray, ang_rad: float) -> np.ndarray:
+            c = math.cos(ang_rad)
+            s = math.sin(ang_rad)
+            return (v * c + np.cross(axis, v) * s + axis * np.dot(axis, v) * (1.0 - c))
+
+        fwd = _rotate(fwd, up, -math.radians(yaw))
+        fwd = _rotate(fwd, right, -math.radians(pitch))
+        fwd = fwd / max(float(np.linalg.norm(fwd)), 1e-12)
+        return ro, fwd.astype(np.float64)
+

@@ -1,0 +1,41 @@
+# Surface tessellation profile: mudding_pattern
+# Subtle low-frequency undulation for drywall compound (mud) texture.
+# Very small amplitude — primarily affects specular highlights rather than
+# silhouette shape.
+
+name: mudding_pattern
+description: >
+  Knife-applied drywall compound (mud) finishing texture.  Broad overlapping
+  knife strokes produce a low-frequency undulation with very small amplitude.
+  Two asymmetric frequencies per axis model the irregular hand-applied quality
+  without looking mechanically regular.
+
+period_m: 0.080          # 80 mm dominant knife stroke pitch
+amplitude_m: 0.001       # 1 mm surface bump (barely geometric, mostly specular)
+primary_axis: u
+
+harmonics_u:
+  - freq: 1.0000
+    amplitude: 1.0000
+    phase_rad: 0.0000
+  - freq: 2.3700          # irrational offset breaks knife-stroke regularity
+    amplitude: 0.3000
+    phase_rad: 0.6200
+
+harmonics_v:
+  - freq: 1.1000
+    amplitude: 0.8000
+    phase_rad: 0.3500
+  - freq: 1.8900
+    amplitude: 0.2200
+    phase_rad: 1.1000
+
+combine_mode: sum_abs
+
+edge_blend_m: 0.040
+tile_policy: repeat
+
+notes: >
+  At amplitude_m=0.001 the profile is barely visible in silhouette but
+  produces a realistic dimpling in Phong specular highlights that reads as
+  a hand-finished surface rather than a flat one.

@@ -1,0 +1,40 @@
+# Surface tessellation profile: foam_block
+# Raised rectangular foam blocks on a square grid — like studio isolation pads.
+
+name: foam_block
+description: >
+  Raised rectangular foam-block profile.  Square pillars standing proud of
+  a flat backing sheet, approximated as a truncated pyramid by combining a
+  fundamental and its 3rd harmonic on both axes with combine_mode=product.
+  Represents the pyramid and flat-cut variants of broadband foam panels.
+
+period_m: 0.060          # 60 mm block pitch
+amplitude_m: 0.055       # 55 mm block height (half-amplitude from backing)
+primary_axis: u
+
+harmonics_u:
+  - freq: 1.0
+    amplitude: 1.0000
+    phase_rad: 0.0
+  - freq: 3.0
+    amplitude: 0.3333     # 1/3: flattens the top relative to pure cosine
+    phase_rad: 0.0
+
+harmonics_v:
+  - freq: 1.0
+    amplitude: 1.0000
+    phase_rad: 0.0
+  - freq: 3.0
+    amplitude: 0.3333
+    phase_rad: 0.0
+
+combine_mode: product     # forms distinct pillar tops at grid intersections
+
+edge_blend_m: 0.025
+tile_policy: repeat
+
+notes: >
+  Adding more odd harmonics makes the pillar tops flatter and the inter-pillar
+  channels sharper, converging toward a literal square-wave cross-section.
+  The current 1+3rd harmonic balance gives a visually convincing foam-block
+  silhouette without requiring many terms.

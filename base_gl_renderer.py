@@ -41,18 +41,20 @@ try:
         glGetShaderInfoLog, glCreateProgram, glAttachShader, glLinkProgram,
         glGetProgramiv, glGetProgramInfoLog, glUseProgram, glDeleteShader,
         glGenBuffers, glBindBuffer, glBufferData, glBindBufferBase,
-        glUniformMatrix4fv, glUniform3f, glUniform1f, glUniform1i,
+        glUniformMatrix4fv, glUniformMatrix3fv, glUniform3f, glUniform1f, glUniform1i,
         glUniform3fv, glUniform1fv,
         glGetUniformLocation, glEnable, glDisable, glBlendFunc,
+        glDepthMask,
         glGenTextures, glBindTexture, glTexParameteri, glTexImage3D,
         glActiveTexture,
         GL_VERTEX_SHADER, GL_FRAGMENT_SHADER, GL_COMPILE_STATUS, GL_LINK_STATUS,
         GL_SHADER_STORAGE_BUFFER, GL_DYNAMIC_DRAW, GL_STATIC_DRAW,
-        GL_FLOAT, GL_TRUE, GL_FALSE, GL_BLEND,
+        GL_FLOAT, GL_TRUE, GL_FALSE, GL_BLEND, GL_CULL_FACE,
         GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
         GL_TEXTURE_2D_ARRAY, GL_TEXTURE0, GL_TEXTURE_MIN_FILTER,
         GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
-        GL_LINEAR, GL_CLAMP_TO_EDGE, GL_RGBA, GL_RGBA8, GL_UNSIGNED_BYTE,
+        GL_LINEAR, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_REPEAT,
+        GL_RGBA, GL_RGBA8, GL_UNSIGNED_BYTE,
     )
     _GL_OK = True
 except ImportError:
@@ -136,13 +138,19 @@ class BaseGLRenderer:
         self._u_light_pos       = -1
         self._u_light_color     = -1
         self._u_light_intensity = -1
+        self._u_light_group_id  = -1
+        self._u_light_calibration = -1
+        self._u_cat_ccm_matrix = -1
         self._u_enable_specular = -1
         self._u_enable_emission_direct = -1
         self._enable_specular = True
         self._enable_emission_direct = False
+        self._light_calibration = 1.0
+        self._cat_ccm_matrix = np.eye(3, dtype=np.float32)
         self._light_pos = np.zeros((0, 3), dtype=np.float32)
         self._light_color = np.zeros((0, 3), dtype=np.float32)
         self._light_intensity = np.zeros((0,), dtype=np.float32)
+        self._light_group_id = np.zeros((0,), dtype=np.int32)
 
         # ── UV texture-pack stack (Stage 2 wired) ───────────────────
         # Default 1×1×1 identity texel `(R=0, G=255, B=128, A=255)` =
@@ -195,19 +203,27 @@ class BaseGLRenderer:
         """
         tex = glGenTextures(1)
         glBindTexture(GL_TEXTURE_2D_ARRAY, tex)
-        # Identity texel: R=0 (no direct gain), G=255 (full diffuse pass-through),
-        # B=128 (≈0.5 saturation identity), A=255 (no dim).
-        default_texel = np.array([0, 255, 128, 255], dtype=np.uint8)
+        # Layer 0: identity texel repeated over a 16x16 tile.
+        # Layer 1: missing-material checkerboard emission mask.
+        emit_layers = np.zeros((2, 16, 16, 4), dtype=np.uint8)
+        emit_layers[0, :, :, :] = np.array([0, 255, 128, 255], dtype=np.uint8)
+        for y in range(16):
+            for x in range(16):
+                on = ((x // 4) + (y // 4)) % 2 == 0
+                emit_layers[1, y, x, :] = (
+                    np.array([32, 255, 220, 255], dtype=np.uint8) if on
+                    else np.array([0, 42, 70, 92], dtype=np.uint8)
+                )
         glTexImage3D(
             GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
-            1, 1, 1,                      # width, height, layers
+            16, 16, 2,                    # width, height, layers
             0, GL_RGBA, GL_UNSIGNED_BYTE,
-            default_texel.ctypes.data_as(ctypes.c_void_p),
+            emit_layers.ctypes.data_as(ctypes.c_void_p),
         )
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_REPEAT)
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_REPEAT)
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
         self._tex_emit_uv = int(tex)
 
@@ -356,6 +372,9 @@ class BaseGLRenderer:
         self._u_light_pos       = glGetUniformLocation(self._prog, "uLightPos")
         self._u_light_color     = glGetUniformLocation(self._prog, "uLightColor")
         self._u_light_intensity = glGetUniformLocation(self._prog, "uLightIntensity")
+        self._u_light_group_id  = glGetUniformLocation(self._prog, "uLightGroupId")
+        self._u_light_calibration = glGetUniformLocation(self._prog, "uLightCalibration")
+        self._u_cat_ccm_matrix = glGetUniformLocation(self._prog, "uCatCcmMatrix")
         self._u_emit_uv         = glGetUniformLocation(self._prog, "uEmitUv")
         self._u_color_uv        = glGetUniformLocation(self._prog, "uColorUv")
         self._u_depth_uv        = glGetUniformLocation(self._prog, "uDepthUv")
@@ -405,21 +424,180 @@ class BaseGLRenderer:
         self._build_ssbos()
 
     def set_point_lights(self, positions: "np.ndarray", colors: "np.ndarray",
-                         intensities: "np.ndarray") -> None:
+                         intensities: "np.ndarray",
+                         group_ids: "np.ndarray | None" = None) -> None:
         """Set view-space point emitters derived by the caller from scene groups."""
         pos = np.ascontiguousarray(positions, dtype=np.float32).reshape(-1, 3)
         col = np.ascontiguousarray(colors, dtype=np.float32).reshape(-1, 3)
         inten = np.ascontiguousarray(intensities, dtype=np.float32).reshape(-1)
+        if group_ids is None:
+            gids = np.full((pos.shape[0],), -1, dtype=np.int32)
+        else:
+            gids = np.ascontiguousarray(group_ids, dtype=np.int32).reshape(-1)
         n = min(100, pos.shape[0], col.shape[0], inten.shape[0])
         self._light_pos = pos[:n]
         self._light_color = col[:n]
         self._light_intensity = inten[:n]
+        self._light_group_id = gids[:n] if gids.shape[0] >= n else np.pad(gids, (0, n - gids.shape[0]), constant_values=-1)
+
+    def derive_emissive_area_lights(
+        self,
+        verts8: "np.ndarray",
+        mat_per_vertex: "np.ndarray | None" = None,
+        group_per_vertex: "np.ndarray | None" = None,
+        *,
+        groups: "tuple | None" = None,
+        min_emitter_group_id: int = 10,
+        max_lights: int = 100,
+    ) -> None:
+        """Derive emitter lights from mesh geometry/materials (area-weighted).
+
+        This keeps light derivation in the renderer side from emissive surfaces,
+        instead of requiring host-prebaked light arrays.
+        """
+        verts = np.ascontiguousarray(verts8, dtype=np.float32)
+        agg: dict[int, dict[str, np.ndarray | float | int]] = {}
+
+        if groups is not None:
+            gids, mids, offs, cnts = groups[0], groups[1], groups[2], groups[3]
+            gids = np.ascontiguousarray(gids, dtype=np.int32).reshape(-1)
+            mids = np.ascontiguousarray(mids, dtype=np.int32).reshape(-1)
+            offs = np.ascontiguousarray(offs, dtype=np.int32).reshape(-1)
+            cnts = np.ascontiguousarray(cnts, dtype=np.int32).reshape(-1)
+            n_groups = min(gids.shape[0], mids.shape[0], offs.shape[0], cnts.shape[0])
+            for i in range(n_groups):
+                gid = int(gids[i])
+                if gid < min_emitter_group_id:
+                    continue
+                off = int(offs[i])
+                cnt = int(cnts[i])
+                if cnt <= 0:
+                    continue
+                s = off * 3
+                e = s + cnt * 3
+                if s < 0 or e > verts.shape[0]:
+                    continue
+                tri = verts[s:e, 0:3].reshape(-1, 3, 3)
+                if tri.size == 0:
+                    continue
+                e1 = tri[:, 1] - tri[:, 0]
+                e2 = tri[:, 2] - tri[:, 0]
+                area = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+                total = float(area.sum())
+                if total <= 1e-8:
+                    continue
+                cent = tri.mean(axis=1)
+                pos_acc = (cent * area[:, None]).sum(axis=0)
+                agg[gid] = {
+                    "area": total,
+                    "pos_acc": np.asarray(pos_acc, np.float32),
+                    "mat_id": int(mids[i]),
+                }
+        else:
+            if mat_per_vertex is None or group_per_vertex is None:
+                self.set_point_lights(
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0,), np.float32),
+                    np.zeros((0,), np.int32),
+                )
+                return
+            mats_v = np.ascontiguousarray(mat_per_vertex, dtype=np.int32).reshape(-1)
+            gids_v = np.ascontiguousarray(group_per_vertex, dtype=np.int32).reshape(-1)
+            if verts.shape[0] < 3 or verts.shape[0] != mats_v.shape[0] or verts.shape[0] != gids_v.shape[0]:
+                self.set_point_lights(
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0,), np.float32),
+                    np.zeros((0,), np.int32),
+                )
+                return
+
+            n_tri = verts.shape[0] // 3
+            if n_tri <= 0:
+                self.set_point_lights(
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0, 3), np.float32),
+                    np.zeros((0,), np.float32),
+                    np.zeros((0,), np.int32),
+                )
+                return
+
+            tri = verts[: n_tri * 3, 0:3].reshape(n_tri, 3, 3)
+            tri_m = mats_v[: n_tri * 3].reshape(n_tri, 3)[:, 0]
+            tri_g = gids_v[: n_tri * 3].reshape(n_tri, 3)[:, 0]
+            e1 = tri[:, 1] - tri[:, 0]
+            e2 = tri[:, 2] - tri[:, 0]
+            area = 0.5 * np.linalg.norm(np.cross(e1, e2), axis=1)
+            cent = tri.mean(axis=1)
+
+            for i in range(n_tri):
+                gid = int(tri_g[i])
+                if gid < min_emitter_group_id:
+                    continue
+                a = float(area[i])
+                if a <= 1e-8:
+                    continue
+                rec = agg.get(gid)
+                if rec is None:
+                    agg[gid] = {
+                        "area": a,
+                        "pos_acc": cent[i].astype(np.float32) * a,
+                        "mat_id": int(tri_m[i]),
+                    }
+                else:
+                    rec["area"] = float(rec["area"]) + a
+                    rec["pos_acc"] = np.asarray(rec["pos_acc"], np.float32) + cent[i].astype(np.float32) * a
+
+        pbr = np.ascontiguousarray(self._db.build_tensors().get("pbr", np.zeros((0, 16), np.float32)), np.float32)
+        cands: list[tuple[float, np.ndarray, np.ndarray, int]] = []
+        for gid, rec in agg.items():
+            mat_id = int(rec["mat_id"])
+            if mat_id < 0 or mat_id >= pbr.shape[0]:
+                continue
+            rgb = np.asarray(pbr[mat_id, 8:11], np.float32)
+            if float(np.linalg.norm(rgb)) < 1e-6:
+                continue
+            total = float(rec["area"])
+            if total <= 1e-8:
+                continue
+            pos = np.asarray(rec["pos_acc"], np.float32) / total
+            cands.append((total, pos.astype(np.float32), rgb, gid))
+
+        cands.sort(key=lambda x: x[0], reverse=True)
+        cands = cands[: int(max(1, min(100, max_lights)))]
+        if not cands:
+            self.set_point_lights(
+                np.zeros((0, 3), np.float32),
+                np.zeros((0, 3), np.float32),
+                np.zeros((0,), np.float32),
+                np.zeros((0,), np.int32),
+            )
+            return
+        self.set_point_lights(
+            np.ascontiguousarray([c[1] for c in cands], np.float32),
+            np.ascontiguousarray([c[2] for c in cands], np.float32),
+            np.ascontiguousarray([c[0] for c in cands], np.float32),
+            np.ascontiguousarray([c[3] for c in cands], np.int32),
+        )
 
     def set_specular_enabled(self, enabled: bool) -> None:
         self._enable_specular = bool(enabled)
 
     def set_emission_direct_enabled(self, enabled: bool) -> None:
         self._enable_emission_direct = bool(enabled)
+
+    def set_light_calibration(self, factor: float) -> None:
+        self._light_calibration = float(factor)
+
+    def set_cat_ccm_matrix(self, matrix: "np.ndarray") -> None:
+        m = np.ascontiguousarray(matrix, dtype=np.float32)
+        if m.shape != (3, 3):
+            m = m.reshape(-1)
+            if m.shape[0] != 9:
+                raise ValueError("set_cat_ccm_matrix: matrix must be shape (3,3)")
+            m = m.reshape(3, 3)
+        self._cat_ccm_matrix = np.ascontiguousarray(m, dtype=np.float32)
 
     def _upload_feature_toggles(self) -> None:
         if self._u_enable_specular != -1:
@@ -439,6 +617,15 @@ class BaseGLRenderer:
             glUniform3fv(self._u_light_color, n, self._light_color.ctypes.data_as(ctypes.c_void_p))
         if self._u_light_intensity != -1:
             glUniform1fv(self._u_light_intensity, n, self._light_intensity.ctypes.data_as(ctypes.c_void_p))
+        if self._u_light_group_id != -1:
+            from OpenGL.GL import glUniform1iv
+            glUniform1iv(self._u_light_group_id, n, self._light_group_id.ctypes.data_as(ctypes.c_void_p))
+        if self._u_light_calibration != -1:
+            glUniform1f(self._u_light_calibration, float(self._light_calibration))
+        if self._u_cat_ccm_matrix != -1:
+            mat_col_major = np.ascontiguousarray(self._cat_ccm_matrix.T, dtype=np.float32)
+            glUniformMatrix3fv(self._u_cat_ccm_matrix, 1, GL_FALSE,
+                               mat_col_major.ctypes.data_as(ctypes.c_void_p))
 
     # ── Mesh queue ────────────────────────────────────────────────────────────
 
@@ -475,6 +662,9 @@ class BaseGLRenderer:
         n_verts: int,
         mvp: "np.ndarray",
         mv: "np.ndarray",
+        *,
+        enable_blend: bool = True,
+        depth_write: bool = True,
     ) -> None:
         """Draw a single mesh immediately (requires active GL context + program)."""
         from OpenGL.GL import glBindVertexArray, glDrawArrays, GL_TRIANGLES
@@ -519,12 +709,18 @@ class BaseGLRenderer:
         self._upload_feature_toggles()
         self._upload_point_lights()
 
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        glDisable(GL_CULL_FACE)
+        glDepthMask(GL_TRUE if depth_write else GL_FALSE)
+        if enable_blend:
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        else:
+            glDisable(GL_BLEND)
         glBindVertexArray(vao)
         glDrawArrays(GL_TRIANGLES, 0, n_verts)
         glBindVertexArray(0)
         glDisable(GL_BLEND)
+        glDepthMask(GL_TRUE)
 
         glUseProgram(0)
 
@@ -542,6 +738,7 @@ class BaseGLRenderer:
         from OpenGL.GL import (
             glBindVertexArray, glDrawArrays, GL_TRIANGLES,
             glEnable, glDisable, glBlendFunc, GL_BLEND,
+            GL_CULL_FACE,
             GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
         )
 
@@ -575,6 +772,7 @@ class BaseGLRenderer:
         self._upload_feature_toggles()
         self._upload_point_lights()
 
+        glDisable(GL_CULL_FACE)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 

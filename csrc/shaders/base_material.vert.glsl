@@ -24,6 +24,7 @@
  *   vNormV   — view-space normal (not normalised; fragment does it)
  *   vPosV    — view-space position
  *   vMatId   — flat-interpolated material index
+ *   vGroupId — flat-interpolated emitting surface group identity
  *   vUv      — emission/depth/remit UV
  */
 
@@ -31,6 +32,8 @@ layout(location = 0) in vec3 aPos;
 layout(location = 1) in vec3 aNorm;
 layout(location = 2) in int  aMatId;
 layout(location = 3) in vec2 aUv;
+layout(location = 4) in int  aGroupId;
+layout(location = 5) in int  aCullImmune;
 
 uniform mat4 uMVP;
 uniform mat4 uMV;
@@ -38,6 +41,8 @@ uniform mat4 uMV;
 out vec3 vNormV;
 out vec3 vPosV;
 flat out int vMatId;
+flat out int vGroupId;
+flat out int vCullImmune;
 out vec2 vUv;
 
 void main() {
@@ -45,6 +50,8 @@ void main() {
     vPosV       = posV.xyz;
     vNormV      = mat3(uMV) * aNorm;
     vMatId      = aMatId;
+    vGroupId    = aGroupId;
+    vCullImmune = aCullImmune;
     vUv         = aUv;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }

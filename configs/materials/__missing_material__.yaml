@@ -1,0 +1,64 @@
+# Material: __missing_material__
+# Deliberately loud fallback for unresolved material IDs/names.
+
+name: __missing_material__
+description: High-emission magenta amber checker fallback for missing material registrations
+
+# Fields consumed by demo_pluck_gl._load_material_yaml into the live mat16 path.
+color_profile_name: missing_material_hazard
+reflectivity: 0.18
+diffusion: 0.72
+absorption: 0.02
+ior: 1.49
+opacity: 1.0
+emit_profile_name: missing_material_hazard
+
+# Fields consumed by MaterialDatabase.register(dict) style callers.
+albedo: [1.0, 0.04, 0.92]
+albedo_rgb: [1.0, 0.04, 0.92]
+roughness: 0.19
+metallic: 0.0
+transmission: 0.0
+emission_rgb: [5.0, 1.6, 8.0]
+
+ambient: 0.95
+spec_strength: 0.58
+shininess: 48.0
+grain: 0.11
+inner_color: [0.15, 1.0, 0.08]
+
+enamel:
+  thickness_nm: 410.0
+  ior_real: 1.62
+  ior_imag: 0.0
+  roughness: 0.035
+  color_rgb: [0.0, 1.0, 0.28]
+
+texture_stack:
+  color_uv_layer: 0
+  emit_uv_layer: 1
+  depth_uv_layer: 2
+  remit_uv_layer: 3
+  depth_scale_mm: 2.8
+  thickness_scale_mm: 0.6
+  depth_bias_mm: -0.25
+  thickness_bias_mm: 0.18
+  emit_gain: 6.0
+  color_blend: 1.0
+  direct_lobe_power: 3.5
+  model_flags: 7
+  remit_gain: 0.35
+  bulb_radius_mm: 160.0
+  remit_decay: 0.42
+  translucence_gain: 0.12
+
+gameplay:
+  label: Missing Material
+  category: debug_fallback
+  tier: error_visible
+  role: unresolved_material_marker
+
+notes: >
+  This material should be unmistakable in the world.  It is intentionally
+  saturated, emissive, and physically implausible so unresolved material
+  plumbing is visible instead of reading as unlit grey or empty space.

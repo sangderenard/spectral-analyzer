@@ -644,6 +644,11 @@ void dr_submit_node_ex(DocRendererState* st,
         if (node.rendered && !node.dirty && node.payload_hash == h) return;
 
         node.payload_hash = h;
+        /* Payload changed (or node is new). Mark dirty so the worker's
+           idempotency check does not race with this stamped hash and
+           skip the re-render. The worker clears dirty once it actually
+           rasterizes the tile. */
+        node.dirty = true;
     }
 
     {

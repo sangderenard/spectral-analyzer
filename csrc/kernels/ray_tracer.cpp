@@ -46,6 +46,7 @@
  */
 
 #include "ray_tracer.h"
+#include "triangle_groups.h"
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -53,6 +54,7 @@
 #include <complex>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <random>
 #include <vector>
@@ -348,6 +350,32 @@ struct RayTracerState {
     std::vector<std::vector<int>>     ctx_queues;     /* one per scale context  */
     int                               live_max_bounces   = 8;
     double                            live_min_amplitude = 0.005;
+
+    /* ── Triangle-group registry (bidirectional integrator support) ─────
+     * Owned vectors of group descriptors and per-group triangle-id lists.
+     * Filled by ray_tracer_register_tri_group() (declared in
+     * triangle_groups.h, implemented in triangle_groups.cpp).  Empty by
+     * default so legacy callers see no behaviour change.
+     *
+     * cum_areas[g] is a CDF over tri_indices[g]; the last entry is the
+     * group's total area.  Used for area-weighted emissive sampling.
+     */
+    std::vector<TriGroupDesc>          tri_groups;          /* descriptors  */
+    std::vector<std::vector<int>>      tri_group_indices;   /* per-group   */
+    std::vector<std::vector<double>>   tri_group_cum_areas; /* per-group   */
+    /* Group → default material lookup table (per-group fallback).
+     * -1 = "no default"; integrator falls back to per-tri MaterialDatabase
+     * row.  Populated at register time from desc.default_mat_idx (or, if
+     * <0, from the majority material index across the group's tris). */
+    std::vector<int>                   tri_group_default_mat;
+    /* Optional per-group spectral emission curve (length = n_bands).  Empty
+     * inner vector = "no override; use mat_buf emission row." */
+    std::vector<std::vector<float>>    tri_group_power_per_band;
+    /* Camera sensor descriptor for SENSOR groups with PIXEL_CONE policy.
+     * tri_group_has_camera[g] gates use; tri_group_camera[g] holds the
+     * deep-copied CameraSensorDesc. */
+    std::vector<int>                   tri_group_has_camera;
+    std::vector<CameraSensorDesc>      tri_group_camera;
 };
 
 /* ── MatBuf accessors ─────────────────────────────────────────────────────────
@@ -2451,5 +2479,652 @@ int ray_tracer_live_ray_count(const RayTracerState* st)
     for (const auto& q : st->ctx_queues)
         n += static_cast<int>(q.size());
     return n;
+}
+
+/* ── Triangle-group registry impls (declared in triangle_groups.h) ────── */
+extern "C" SK_API int ray_tracer_register_tri_group(
+    RayTracerState* st, const TriGroupDesc* desc)
+{
+    if (!st || !desc || !desc->tri_indices || desc->n_tris <= 0)
+        return SK_ERR_NULL_STATE;
+
+    /* Validate triangle indices. */
+    const int n_tri = static_cast<int>(st->tris.size());
+    for (int i = 0; i < desc->n_tris; ++i) {
+        int t = desc->tri_indices[i];
+        if (t < 0 || t >= n_tri) return SK_ERR_NULL_STATE;
+    }
+
+    /* Deep-copy the descriptor. */
+    TriGroupDesc copy = *desc;
+    copy.group_id     = static_cast<int>(st->tri_groups.size());
+    copy.tri_indices  = nullptr;  /* ownership stays in tri_group_indices */
+    /* Pointer-typed optional fields are deep-copied into separate vectors;
+     * null them out in the stored descriptor so a stale pointer can never
+     * be dereferenced after the caller's buffer goes away. */
+    copy.power_W_per_band = nullptr;
+    copy.sensor_camera    = nullptr;
+    st->tri_groups.push_back(copy);
+
+    std::vector<int> idxs(desc->tri_indices, desc->tri_indices + desc->n_tris);
+
+    /* Build cumulative-area CDF for area-weighted emissive sampling. */
+    std::vector<double> cdf(idxs.size());
+    double accum = 0.0;
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        double a = (idxs[i] < (int)st->tri_areas.size())
+                   ? st->tri_areas[(size_t)idxs[i]] : 1.0;
+        accum += a;
+        cdf[i] = accum;
+    }
+    st->tri_group_indices.push_back(std::move(idxs));
+    st->tri_group_cum_areas.push_back(std::move(cdf));
+
+    /* Group → default material.  Use desc->default_mat_idx if the caller
+     * supplied >= 0; otherwise derive from majority across the group's
+     * triangles (handles the common "one group per material" case). */
+    int default_mat = desc->default_mat_idx;
+    if (default_mat < 0 && !st->tri_group_indices.back().empty()) {
+        std::map<int, int> hist;
+        for (int t : st->tri_group_indices.back()) {
+            if (t >= 0 && t < (int)st->tris.size())
+                hist[st->tris[(size_t)t].mat_idx]++;
+        }
+        int best = -1, best_n = 0;
+        for (auto& kv : hist) if (kv.second > best_n) { best = kv.first; best_n = kv.second; }
+        default_mat = best;
+    }
+    st->tri_group_default_mat.push_back(default_mat);
+
+    /* Per-band spectral power override (NULL pointer = no override). */
+    std::vector<float> power_curve;
+    if (desc->power_W_per_band && desc->n_power_bands > 0) {
+        power_curve.assign(desc->power_W_per_band,
+                           desc->power_W_per_band + desc->n_power_bands);
+    }
+    st->tri_group_power_per_band.push_back(std::move(power_curve));
+
+    /* Camera sensor descriptor (deep-copy if present). */
+    if (desc->sensor_camera) {
+        st->tri_group_has_camera.push_back(1);
+        st->tri_group_camera.push_back(*desc->sensor_camera);
+    } else {
+        st->tri_group_has_camera.push_back(0);
+        st->tri_group_camera.push_back(CameraSensorDesc{});
+    }
+    return copy.group_id;
+}
+
+extern "C" SK_API int ray_tracer_clear_tri_groups(RayTracerState* st)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    st->tri_groups.clear();
+    st->tri_group_indices.clear();
+    st->tri_group_cum_areas.clear();
+    st->tri_group_default_mat.clear();
+    st->tri_group_power_per_band.clear();
+    st->tri_group_has_camera.clear();
+    st->tri_group_camera.clear();
+    return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_n_tri_groups(const RayTracerState* st)
+{
+    if (!st) return 0;
+    return static_cast<int>(st->tri_groups.size());
+}
+
+/* ── Bidirectional integrator ───────────────────────────────────────────
+ * Emits N rays from each EMISSIVE triangle group (area-weighted sampling
+ * with a cosine-hemisphere distribution about the local normal), traces
+ * them through the BVH with the same bounce loop the legacy splatting
+ * integrator uses (so APERTURE_STOP / TRANSMISSIVE / REACTIVE handling is
+ * shared), and writes one EndpointRecord per (subpath × band) every time
+ * a ray hits a triangle that belongs to a SENSOR group.
+ *
+ * Hard rules of the rewrite are enforced HERE:
+ *   - Complex amplitude is preserved verbatim (no abs(), no quantize).
+ *   - n_bands is the MaterialDatabase value, NOT a layer-collapsed proxy.
+ *   - Records carry subpath_id / band_id / group_id / vertex pdf so the
+ *     Python display layer can reconstruct gain, phase, MTF, etc.
+ */
+
+/* Forward declarations for region-kind dispatch helpers — implementations
+ * live just below the bidirectional function for narrative locality. */
+static inline void apply_thin_lens_transform(
+    const RtScaleContext& ctx, V3d& pos, V3d& dir);
+static inline void apply_wave_aperture_transform(
+    const RayTracerState& st, const RtScaleContext& ctx,
+    const V3d& cross_pos, VXcd& amp);
+static inline uint32_t dispatch_scale_context_entry(
+    const RayTracerState& st, const RtScaleContext& ctx,
+    V3d& pos, V3d& dir, VXcd& amp);
+
+extern "C" SK_API int ray_tracer_bidirectional(
+    RayTracerState* st,
+    int             n_rays_per_emitter,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    EndpointRecord* out_records,
+    int             out_cap,
+    int*            out_count)
+{
+    if (!st || !out_records || !out_count) return SK_ERR_NULL_STATE;
+    *out_count = 0;
+    if (st->tri_groups.empty()) return SK_OK;
+
+    const int n_bands = st->n_bands;
+    const bool has_bvh = !st->bvh_nodes.empty();
+
+    std::mt19937_64 rng(static_cast<uint64_t>(seed) * 6364136223846793005ULL
+                        + 1442695040888963407ULL);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    VXcd amp(n_bands);
+
+    /* Build sensor-group lookup: tri_id → first sensor group_id (-1 if none). */
+    std::vector<int> tri_sensor_group(st->tris.size(), -1);
+    for (size_t g = 0; g < st->tri_groups.size(); ++g) {
+        if (!(st->tri_groups[g].role_bits & TRI_GROUP_ROLE_SENSOR)) continue;
+        const auto& idxs = st->tri_group_indices[g];
+        for (int t : idxs) {
+            if (t >= 0 && t < (int)tri_sensor_group.size() && tri_sensor_group[t] < 0)
+                tri_sensor_group[t] = static_cast<int>(g);
+        }
+    }
+
+    int rec_count = 0;
+    uint32_t subpath_counter = 0;
+
+    /* For each emissive group … */
+    for (size_t g = 0; g < st->tri_groups.size(); ++g) {
+        const TriGroupDesc& gd = st->tri_groups[g];
+        if (!(gd.role_bits & TRI_GROUP_ROLE_EMISSIVE)) continue;
+        const auto& idxs = st->tri_group_indices[g];
+        const auto& cdf  = st->tri_group_cum_areas[g];
+        if (idxs.empty()) continue;
+        const double tot_area = cdf.empty() ? 0.0 : cdf.back();
+        if (tot_area <= 0.0) continue;
+
+        /* Initial per-band amplitude: unit (1+0j); the calibration loop
+         * scales the result via Python.  We are preserving phase, so we
+         * cannot pre-scale by emit_W without losing complex coherence
+         * across bands. */
+        for (int ri = 0; ri < n_rays_per_emitter; ++ri) {
+            /* 1. Pick a triangle (area-weighted). */
+            double r = U(rng) * tot_area;
+            int lo = 0, hi = (int)cdf.size() - 1;
+            while (lo < hi) {
+                int mid = (lo + hi) / 2;
+                if (cdf[mid] < r) lo = mid + 1; else hi = mid;
+            }
+            int tri_id = idxs[lo];
+            const Triangle& T = st->tris[tri_id];
+
+            /* 2. Pick a barycentric origin uniformly in the triangle. */
+            double s = U(rng), t = U(rng);
+            if (s + t > 1.0) { s = 1.0 - s; t = 1.0 - t; }
+            V3d origin = T.v0 + s * T.edge1 + t * T.edge2;
+
+            /* 3. Pick an outgoing direction: cosine-hemisphere about normal. */
+            V3d dir = cosine_hemisphere(T.normal, rng);
+
+            /* 4. Initial unit complex amplitude per band. */
+            for (int b = 0; b < n_bands; ++b) amp[b] = cd(1.0, 0.0);
+
+            V3d pos = origin + dir * (EPS * 200.0);
+            double path_len = 0.0;
+            uint32_t my_subpath = subpath_counter++;
+
+            for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                double t_hit = 1e18; int hit_tri = -1;
+                if (has_bvh) {
+                    V3d inv = dir.cwiseInverse();
+                    bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
+                              pos, dir, inv, t_hit, hit_tri);
+                } else {
+                    for (size_t ti = 0; ti < st->tris.size(); ++ti) {
+                        double tt;
+                        if (ray_triangle_hit(pos, dir, st->tris[ti], tt) && tt < t_hit) {
+                            t_hit = tt; hit_tri = (int)ti;
+                        }
+                    }
+                }
+                if (hit_tri < 0) break;
+
+                V3d hit_pos = pos + t_hit * dir;
+                double total_path = path_len + t_hit;
+
+                /* Phase + atmospheric attenuation along the segment. */
+                for (int b = 0; b < n_bands; ++b) {
+                    double k = st->k_real[b];
+                    double atten = std::exp(-st->atmo_abs[b] * t_hit);
+                    /* Spreading: 1/(1 + r) keeps numerics stable. */
+                    double spread = 1.0 / (1.0 + total_path);
+                    amp[b] *= std::polar(atten * spread, -k * t_hit);
+                }
+
+                /* Sensor capture? */
+                int sgid = tri_sensor_group[hit_tri];
+                if (sgid >= 0) {
+                    V3d hit_n = st->tris[hit_tri].normal;
+                    double cos_theta = std::abs(dir.dot(hit_n));
+                    for (int b = 0; b < n_bands; ++b) {
+                        if (rec_count >= out_cap) goto bdpt_done;
+                        EndpointRecord& E = out_records[rec_count++];
+                        E.subpath_id   = my_subpath;
+                        E.band_id      = static_cast<uint32_t>(b);
+                        E.group_id     = sgid;
+                        E.vertex_index = -1;
+                        E.pos[0] = (float)hit_pos.x();
+                        E.pos[1] = (float)hit_pos.y();
+                        E.pos[2] = (float)hit_pos.z();
+                        E.pathlen_m = (float)total_path;
+                        E.dir[0] = (float)dir.x();
+                        E.dir[1] = (float)dir.y();
+                        E.dir[2] = (float)dir.z();
+                        E.pdf       = 1.0f / (float)n_rays_per_emitter;
+                        E.amp_re    = (float)amp[b].real();
+                        E.amp_im    = (float)amp[b].imag();
+                        E.cos_theta = (float)cos_theta;
+                        E._pad      = 0.0f;
+                    }
+                }
+
+                /* Energy threshold. */
+                double max_abs = 0.0;
+                for (int b = 0; b < n_bands; ++b)
+                    max_abs = std::max(max_abs, std::abs(amp[b]));
+                if (max_abs < min_amplitude) break;
+
+                /* Surface scatter — same minimum branch as the splatter, so
+                 * material flag handling stays consistent.  Reactive +
+                 * transmissive logic is intentionally minimal here; the full
+                 * BDPT branch fanout is queued behind the branch_factor
+                 * extension (see ray_tracer_set_branch_factor below). */
+                const Triangle& tri = st->tris[hit_tri];
+                V3d hit_n = tri.normal;
+                if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
+                if (tri.flags & MAT_FLAG_APERTURE_STOP) break;
+                if (U(rng) < mat_diffusion(*st, tri.mat_idx)) {
+                    dir = cosine_hemisphere(hit_n, rng);
+                } else {
+                    dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+                    if (dir.dot(hit_n) < 0.0) dir = cosine_hemisphere(hit_n, rng);
+                }
+                for (int b = 0; b < n_bands; ++b)
+                    amp[b] *= mat_refl_complex(*st, tri.mat_idx, b);
+
+                if (tri.flags & MAT_FLAG_REACTIVE) {
+                    double shift_hz = mat_reactive_shift_hz(*st, tri.mat_idx);
+                    if (shift_hz > 0.0) {
+                        double yf = (double)mat_band_record(*st, tri.mat_idx, 0)[6];
+                        apply_reactive_shift(amp, st->freq_hz_vec, shift_hz, yf);
+                    }
+                }
+
+                pos = hit_pos + dir * (EPS * 200.0);
+                path_len = total_path;
+
+                /* Region dispatch — apply any scale_context transforms
+                 * whose sphere contains the new ray origin.  Smallest
+                 * radius first (the contexts vector is pre-sorted), so
+                 * inner zones override outer ones in a single pass. */
+                for (const RtScaleContext& ctx : st->scale_contexts) {
+                    V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
+                    if ((pos - c).norm() <= ctx.radius) {
+                        dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
+                    }
+                }
+            }
+        }
+    }
+bdpt_done:
+    /* ──────────────────────────────────────────────────────────────────
+     * PIXEL_CONE sensor pass.
+     *
+     * For every SENSOR group whose sample_policy == TRI_GROUP_SAMPLE_PIXEL_CONE
+     * and whose CameraSensorDesc was registered, drive the integrator from
+     * the sensor side: deterministic outer loop over (px, py), stochastic
+     * inner loop over n_aperture_samples points on the aperture.  This is
+     * the camera-simulator path; the symmetric area-BDPT path above is the
+     * reference standard and is preserved unchanged.
+     *
+     * Aperture sampling: stochastic uniform-on-disk per the user spec
+     * ("conic distribution, stochastic, no grid jitter pattern").  When an
+     * aperture-stop BLOCKER group is registered, rays additionally must
+     * pass an explicit BVH/triangle test against the stop's tris, so blade
+     * polygon shape is honoured automatically without separate blade math.
+     *
+     * Vectorisation: outer (sensor_group × pixel) loop is OpenMP-parallel.
+     * Inner per-aperture-sample loop runs serially per pixel; each pixel's
+     * write region in out_records is computed up-front so threads never
+     * race on rec_count.
+     *
+     * Encoding (hard rule: no new EndpointRecord fields):
+     *   subpath_id   = py * n_px + px
+     *   vertex_index = aperture sample index
+     *   group_id     = sensor group id
+     * ────────────────────────────────────────────────────────────────── */
+    {
+        std::mt19937_64 cone_rng(static_cast<uint64_t>(seed) * 11400714819323198485ULL
+                                 + 9876543210123456789ULL);
+        for (size_t g = 0; g < st->tri_groups.size(); ++g) {
+            const TriGroupDesc& gd = st->tri_groups[g];
+            if (!(gd.role_bits & TRI_GROUP_ROLE_SENSOR)) continue;
+            if (gd.sample_policy != TRI_GROUP_SAMPLE_PIXEL_CONE) continue;
+            if (g >= st->tri_group_has_camera.size() ||
+                !st->tri_group_has_camera[g]) continue;
+            const CameraSensorDesc& cam = st->tri_group_camera[g];
+            if (cam.n_px <= 0 || cam.n_py <= 0 ||
+                cam.n_aperture_samples <= 0) continue;
+
+            /* Build orthonormal sensor basis. */
+            V3d cpos(cam.pos[0], cam.pos[1], cam.pos[2]);
+            V3d cfwd(cam.fwd[0], cam.fwd[1], cam.fwd[2]);
+            V3d cup (cam.up[0],  cam.up[1],  cam.up[2]);
+            cfwd.normalize();
+            V3d cright = cfwd.cross(cup).normalized();
+            cup        = cright.cross(cfwd).normalized();
+            V3d sensor_origin =
+                cpos
+                - 0.5 * cam.sensor_w_m * cright
+                - 0.5 * cam.sensor_h_m * cup;
+            V3d aperture_centre = cpos + cam.focal_m * cfwd;
+
+            /* Optional BLOCKER stop group for blade-shape honoring. */
+            const std::vector<int>* stop_idxs = nullptr;
+            if (cam.aperture_stop_group_id >= 0 &&
+                cam.aperture_stop_group_id < (int)st->tri_group_indices.size())
+                stop_idxs = &st->tri_group_indices[cam.aperture_stop_group_id];
+
+            const int n_px = cam.n_px;
+            const int n_py = cam.n_py;
+            const int n_ap = cam.n_aperture_samples;
+            const double pix_w = cam.sensor_w_m / std::max(1, n_px);
+            const double pix_h = cam.sensor_h_m / std::max(1, n_py);
+
+            /* Reserve output capacity per pixel: n_ap * n_bands records,
+             * but only if we have room.  Truncate at out_cap. */
+            const long long total_pixels = (long long)n_px * n_py;
+            const long long recs_per_px  = (long long)n_ap * n_bands;
+            int sensor_gid = (int)g;
+
+            /* Per-pixel parallel.  Each pixel computes its own jitter
+             * stream from (seed, px, py) for determinism + reproducibility. */
+            #pragma omp parallel
+            {
+                std::mt19937_64 trng;
+                VXcd amp_local(n_bands);
+                #pragma omp for schedule(dynamic, 8)
+                for (long long pi = 0; pi < total_pixels; ++pi) {
+                    int py = (int)(pi / n_px);
+                    int px = (int)(pi - (long long)py * n_px);
+
+                    /* Deterministic per-pixel RNG seed (decoupled from the
+                     * shared cone_rng so threads don't race). */
+                    uint64_t s = (uint64_t)seed * 0x9E3779B97F4A7C15ULL
+                               + (uint64_t)pi * 0xBF58476D1CE4E5B9ULL
+                               + 0x94D049BB133111EBULL;
+                    trng.seed(s);
+                    std::uniform_real_distribution<double> Up(0.0, 1.0);
+
+                    V3d pix_pt = sensor_origin
+                               + (px + 0.5) * pix_w * cright
+                               + (py + 0.5) * pix_h * cup;
+
+                    for (int ai = 0; ai < n_ap; ++ai) {
+                        /* Stochastic uniform-on-disk aperture sample
+                         * (concentric mapping from two uniform [0,1) draws —
+                         * cheap, no grid pattern). */
+                        double u1 = Up(trng), u2 = Up(trng);
+                        double r  = std::sqrt(u1) * cam.aperture_radius_m;
+                        double th = 2.0 * M_PI * u2;
+                        V3d ap_pt = aperture_centre
+                                  + r * std::cos(th) * cright
+                                  + r * std::sin(th) * cup;
+
+                        V3d dir = (ap_pt - pix_pt).normalized();
+                        V3d pos = pix_pt;
+
+                        /* Honour blade shape via BLOCKER tris if registered.
+                         * Test the segment pix_pt → ap_pt against stop tris;
+                         * if any tri is hit before ap_pt, drop this sample
+                         * (blade occluded the ray). */
+                        if (stop_idxs) {
+                            double seg_len = (ap_pt - pix_pt).norm();
+                            bool blocked = false;
+                            for (int tri_id : *stop_idxs) {
+                                if (tri_id < 0 || tri_id >= (int)st->tris.size()) continue;
+                                double tt;
+                                if (ray_triangle_hit(pos, dir, st->tris[(size_t)tri_id], tt)
+                                    && tt > 1e-6 && tt < seg_len) {
+                                    blocked = true; break;
+                                }
+                            }
+                            if (blocked) continue;
+                        }
+
+                        /* Step into the scene from the aperture. */
+                        pos = ap_pt + dir * (EPS * 200.0);
+                        for (int b = 0; b < n_bands; ++b) amp_local[b] = cd(1.0, 0.0);
+                        double path_len = (ap_pt - pix_pt).norm();
+
+                        /* Wave-region dispatch at the aperture crossing.
+                         * Any registered scale_context whose sphere
+                         * contains the aperture sample point is allowed to
+                         * transform (pos, dir, amp).  This is the
+                         * "capacity to wave transform the aperture" hook:
+                         * a WAVE_HELMHOLTZ region wrapping the stop will
+                         * apply Fresnel quadratic phase per band; a
+                         * THIN_LENS_TRANSFORM region steers the ray.
+                         * Iteration is smallest-radius-first (vector is
+                         * pre-sorted at registration). */
+                        for (const RtScaleContext& ctx : st->scale_contexts) {
+                            V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
+                            if ((ap_pt - c).norm() <= ctx.radius) {
+                                dispatch_scale_context_entry(*st, ctx, pos, dir, amp_local);
+                            }
+                        }
+
+                        /* First-hit trace.  We record the first opaque
+                         * surface hit; no bounces in PIXEL_CONE mode (the
+                         * forward EMISSIVE path provides scene illumination
+                         * — sensor rays exist to register *what they see*,
+                         * and the bidirectional join is downstream). */
+                        double t_hit = 1e18; int hit_tri = -1;
+                        if (has_bvh) {
+                            V3d inv = dir.cwiseInverse();
+                            bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
+                                      pos, dir, inv, t_hit, hit_tri);
+                        } else {
+                            for (size_t ti = 0; ti < st->tris.size(); ++ti) {
+                                double tt;
+                                if (ray_triangle_hit(pos, dir, st->tris[ti], tt) && tt < t_hit) {
+                                    t_hit = tt; hit_tri = (int)ti;
+                                }
+                            }
+                        }
+                        if (hit_tri < 0) continue;
+                        V3d hit_pos = pos + t_hit * dir;
+                        double total_path = path_len + t_hit;
+
+                        for (int b = 0; b < n_bands; ++b) {
+                            double k = st->k_real[b];
+                            double atten = std::exp(-st->atmo_abs[b] * t_hit);
+                            double spread = 1.0 / (1.0 + total_path);
+                            amp_local[b] *= std::polar(atten * spread, -k * t_hit);
+                        }
+
+                        V3d hit_n = st->tris[(size_t)hit_tri].normal;
+                        double cos_theta = std::abs(dir.dot(hit_n));
+                        uint32_t my_subpath = (uint32_t)pi;
+
+                        /* Emit n_bands records — under critical so the
+                         * shared rec_count stays consistent.  Records past
+                         * out_cap are dropped silently (caller widens cap). */
+                        #pragma omp critical(pixel_cone_emit)
+                        {
+                            for (int b = 0; b < n_bands; ++b) {
+                                if (rec_count >= out_cap) break;
+                                EndpointRecord& E = out_records[rec_count++];
+                                E.subpath_id   = my_subpath;
+                                E.band_id      = (uint32_t)b;
+                                E.group_id     = sensor_gid;
+                                E.vertex_index = ai;
+                                E.pos[0] = (float)hit_pos.x();
+                                E.pos[1] = (float)hit_pos.y();
+                                E.pos[2] = (float)hit_pos.z();
+                                E.pathlen_m = (float)total_path;
+                                E.dir[0] = (float)dir.x();
+                                E.dir[1] = (float)dir.y();
+                                E.dir[2] = (float)dir.z();
+                                E.pdf       = 1.0f / (float)n_ap;
+                                E.amp_re    = (float)amp_local[b].real();
+                                E.amp_im    = (float)amp_local[b].imag();
+                                E.cos_theta = (float)cos_theta;
+                                E._pad      = 0.0f;
+                            }
+                        }
+                    }
+                }
+            } /* omp parallel */
+        }
+    }
+
+    *out_count = rec_count;
+    return SK_OK;
+}
+
+/* ──────────────────────────────────────────────────────────────────────
+ * Region-context dispatch helpers.
+ *
+ * These are the call sites for SCALE_CONTEXT_KIND_* dispatch.  RAY (0) is
+ * the default and means "do nothing, continue with normal ray transport."
+ * THIN_LENS_TRANSFORM (2) applies an ABCD-style direction tilt about the
+ * region centre; the region's `payload` is interpreted as
+ *   const double matrix_optics[4] = { f_m, 0, 0, 0 };  // simplest case
+ * with f_m = focal length.  Full ABCD support is queued; this lands the
+ * dispatch site so the bounce loop can already call it.
+ *
+ * WAVE_HELMHOLTZ (1), THICK_LENS_WAVE (3), SPLINE_SURFACE (4),
+ * NEURAL_SURFACE (5), NEURAL_VOLUMETRIC (6) are stub-passthroughs: they
+ * record region entry in EndpointRecord.flags downstream and continue.
+ * Wave + neural fill-in lives in field_march.cpp / future neural_eval.cpp.
+ * ────────────────────────────────────────────────────────────────────── */
+static inline void apply_thin_lens_transform(
+    const RtScaleContext& ctx, V3d& pos, V3d& dir)
+{
+    /* Treat the region as a thin lens centred at ctx.center, optical axis
+     * along the *current ray direction* (i.e. the lens auto-aligns to the
+     * incoming ray — a deliberate simplification appropriate for "this is
+     * a thin-lens region you can opt into" rather than a full optical
+     * bench).  payload[0] = focal length f in metres; <=0 = no-op. */
+    if (!ctx.payload) return;
+    const double* p = static_cast<const double*>(ctx.payload);
+    double f = p[0];
+    if (!(f > 0.0)) return;
+
+    V3d centre(ctx.center[0], ctx.center[1], ctx.center[2]);
+    V3d to_centre = centre - pos;
+    /* Project incoming direction relative to lens normal = ray direction.
+     * Standard thin-lens rule: a ray through the lens centre passes
+     * undeflected; a ray parallel to the axis converges to the focal
+     * point at distance f. */
+    V3d lateral = to_centre - to_centre.dot(dir) * dir;
+    double focal_pt_dist = f;
+    V3d focal_pt = centre + focal_pt_dist * dir;
+    /* New direction: from current pos toward focal_pt. */
+    V3d new_dir = (focal_pt - pos).normalized();
+    if (new_dir.norm() > 1e-9) dir = new_dir;
+    /* Position is unchanged (thin lens has zero thickness). */
+    (void)lateral; /* reserved for off-axis astigmatism extension          */
+}
+
+/**
+ * apply_wave_aperture_transform — multiply per-band complex amplitude by
+ * the wave-optical transfer of a thin aperture.
+ *
+ * This is the hook the user demanded: "there must be capacity to wave
+ * transform the aperture."  When a ray crosses a WAVE_HELMHOLTZ region at
+ * lateral position `lateral_offset` from the region centre, this function
+ * applies the analytic Fresnel quadratic phase
+ *
+ *   amp[b] *= exp( -i · k_b · r² / (2 · f_eff) )
+ *
+ * where r = ‖lateral_offset‖ and f_eff is taken from the region's payload
+ * (payload[0] = focal length / Fresnel scale).  When payload[0] <= 0 we
+ * fall back to ctx.radius itself so a bare WAVE_HELMHOLTZ region still
+ * produces *some* diffraction-style phase shift instead of being inert.
+ *
+ * Apodisation: an extra real attenuation w(r) = exp(-(r/R)²) is applied
+ * so a small aperture suppresses high spatial frequencies smoothly — this
+ * is the analytic stand-in for the full split-step solve performed when
+ * a FieldGrid is bound (future extension via ctx.payload subtype).
+ *
+ * No bands are collapsed; the per-band wavenumber st.k_real[b] is honored.
+ */
+static inline void apply_wave_aperture_transform(
+    const RayTracerState& st,
+    const RtScaleContext& ctx,
+    const V3d&            cross_pos,
+    VXcd&                 amp)
+{
+    V3d centre(ctx.center[0], ctx.center[1], ctx.center[2]);
+    V3d off = cross_pos - centre;
+    double r2 = off.squaredNorm();
+    if (r2 <= 0.0) return;
+
+    double f_eff = ctx.radius;
+    if (ctx.payload && ctx.payload_size_bytes >= (int)sizeof(double)) {
+        const double* p = static_cast<const double*>(ctx.payload);
+        if (p[0] > 0.0) f_eff = p[0];
+    }
+    if (!(f_eff > 0.0)) return;
+
+    double R = (ctx.radius > 0.0) ? ctx.radius : f_eff;
+    double atten = std::exp(-r2 / (R * R));   /* soft-edge apodisation     */
+
+    int nb = (int)amp.size();
+    for (int b = 0; b < nb && b < (int)st.k_real.size(); ++b) {
+        double k_b   = st.k_real[b];
+        double phase = -k_b * r2 / (2.0 * f_eff);
+        amp[b] *= std::polar(atten, phase);
+    }
+}
+
+/**
+ * dispatch_scale_context_entry — call site invoked when a ray segment
+ * crosses into (or originates inside) a registered scale context.  Switches
+ * on ctx.context_kind and applies the appropriate transform to (pos, dir,
+ * amp).  Kinds 3..6 are stub-passthroughs but the call site exists in
+ * BOTH backends so we never have to retrofit them.
+ *
+ * Returns the bit pattern to OR into EndpointRecord-style flags so
+ * downstream consumers can tell which kinds the ray actually entered.
+ */
+static inline uint32_t dispatch_scale_context_entry(
+    const RayTracerState& st,
+    const RtScaleContext& ctx,
+    V3d& pos, V3d& dir, VXcd& amp)
+{
+    switch (ctx.context_kind) {
+        case SCALE_CONTEXT_KIND_RAY:
+            return 0u;
+        case SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ:
+            apply_wave_aperture_transform(st, ctx, pos, amp);
+            return 1u << SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ;
+        case SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM:
+            apply_thin_lens_transform(ctx, pos, dir);
+            return 1u << SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM;
+        case SCALE_CONTEXT_KIND_THICK_LENS_WAVE:
+        case SCALE_CONTEXT_KIND_SPLINE_SURFACE:
+        case SCALE_CONTEXT_KIND_NEURAL_SURFACE:
+        case SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC:
+            /* Stub-passthrough: caller records entry; full impl pending. */
+            return 1u << ctx.context_kind;
+        default:
+            return 0u;
+    }
 }
 

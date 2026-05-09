@@ -54,9 +54,32 @@
 #define RT_FLOATS_PER_SEG_MS  14
 #define RT_BYTES_PER_SEG_MS   56
 
-/* Scale context type tags. */
+/* Scale context type tags (legacy `scale_type`). */
 #define RT_SCALE_GEOMETRIC    0   /* coarse BVH geometric optics (cm-scale)     */
 #define RT_SCALE_WAVE         1   /* fine wave-optics sub-stepping (µm-scale)   */
+
+/* Scale-context KIND — orthogonal to scale_type, selects the *dispatch path*
+ * a ray takes when it enters a region.  RAY (0) is the default and matches
+ * legacy behaviour exactly.  Higher kinds hand the ray to specialised
+ * handlers (wave solver in field_march.cpp, matrix optics, spline-surface
+ * refinement, neural transforms).
+ *
+ * Parity rule: this enum is mirrored byte-for-byte in the GLSL
+ * ScaleContextSSBO (binding 8) — see _GPU_RAY_FIELD_CS / _GPU_SENSOR_CS in
+ * demo_pluck_gl.py.  Do not reorder.
+ *
+ * Stub-passthrough for kinds 3..6 right now: dispatch is wired and the
+ * region's `context_kind` reaches the bounce loop, but the implementation is
+ * "record entry, continue with default ray transport".  The dispatch *call
+ * sites* must land in both backends so we never have to retrofit them.
+ */
+#define SCALE_CONTEXT_KIND_RAY                 0
+#define SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ      1
+#define SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM 2
+#define SCALE_CONTEXT_KIND_THICK_LENS_WAVE     3
+#define SCALE_CONTEXT_KIND_SPLINE_SURFACE      4
+#define SCALE_CONTEXT_KIND_NEURAL_SURFACE      5
+#define SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC   6
 
 /**
  * Scale context descriptor.
@@ -73,6 +96,10 @@
  *
  * context_id is assigned sequentially by ray_tracer_add_scale_context and
  * returned in segment field [12] of the MS segment format.
+ *
+ * The additive fields at the end (context_kind + payload) carry the
+ * dispatch-kind enum and an opaque per-region payload (matrix-optics
+ * coefficients, spline patch handle, neural-net weight ptr).  Zero-init = RAY.
  */
 typedef struct {
     double center[3];     /* world-space centre, metres                      */
@@ -83,6 +110,10 @@ typedef struct {
     double n_real;        /* real part of medium refractive index            */
     double n_imag;        /* imaginary part (extinction → absorption per m)  */
     int    context_id;    /* filled by add_scale_context; caller may ignore  */
+    /* ── Additive extensions (safe to leave zeroed) ───────────────────── */
+    int    context_kind;          /* SCALE_CONTEXT_KIND_*; 0 = legacy RAY    */
+    const void* payload;          /* opaque per-region data (kind-specific)  */
+    int    payload_size_bytes;    /* deep-copy hint; 0 = caller-owned        */
 } RtScaleContext;
 
 #ifdef __cplusplus
@@ -704,6 +735,43 @@ SK_API int ray_tracer_clear_rays(RayTracerState* st);
 
 /** Return the total number of live rays across all queues. */
 SK_API int ray_tracer_live_ray_count(const RayTracerState* st);
+
+/* ─── Bidirectional integrator surface ───────────────────────────────── */
+/* Triangle-group registry (declared in triangle_groups.h, implemented in
+ * ray_tracer.cpp).  Forward-include here so callers only need ray_tracer.h. */
+#ifdef __cplusplus
+} /* close extern "C" before include */
+#endif
+#include "triangle_groups.h"
+#include "bdpt_record.h"
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Bidirectional path tracing entry point.  Emits ``n_rays_per_emitter`` rays
+ * from each registered EMISSIVE TriGroup (area-weighted triangle pick +
+ * cosine-hemisphere direction), traces them through the BVH up to
+ * ``max_bounces`` bounces, and writes one EndpointRecord per (subpath × band)
+ * each time a ray strikes a triangle that is part of a SENSOR TriGroup.
+ *
+ * Phase, atmospheric attenuation, reactive band-shift, aperture-stop kill,
+ * and material reflection are all applied inside the bounce loop — the
+ * record carries the FINAL complex amplitude per band at the moment of
+ * sensor capture.  No reduction.
+ *
+ * Returns SK_OK on success, SK_ERR_NULL_STATE on bad arguments.
+ * Writes the record count produced into *out_count (clamped to out_cap).
+ */
+SK_API int ray_tracer_bidirectional(
+    RayTracerState* st,
+    int             n_rays_per_emitter,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    EndpointRecord* out_records,
+    int             out_cap,
+    int*            out_count);
 
 #ifdef __cplusplus
 } /* extern "C" */

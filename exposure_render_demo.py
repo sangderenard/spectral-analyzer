@@ -129,6 +129,7 @@ class TracerScene:
     src_directivity: np.ndarray  # (N_src,)  float64 — Lambertian → 1.0
     src_area_m2:  np.ndarray   # (N_src,)    float64 — for power bookkeeping
     src_emit_W:   np.ndarray   # (N_src,)    float64 — luminance-weighted emission
+    src_tri_idx:  np.ndarray   # (N_src,)    int32   — triangle indices in verts/normals
     bounds_min:   np.ndarray   # (3,)        float32
     bounds_max:   np.ndarray   # (3,)        float32
 
@@ -151,7 +152,7 @@ class TracerScene:
 _LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 
-def _build_tracer_scene(t: float) -> TracerScene:
+def _build_tracer_scene(t: float, scene_mode: str = "orbiters") -> TracerScene:
     """Materialise the borrowed scene into ray-tracer geometry.
 
     The MaterialDatabase is built ONCE per process (we trust scene_mod's
@@ -161,7 +162,7 @@ def _build_tracer_scene(t: float) -> TracerScene:
     """
     db, idx = scene_mod.register_materials()
     verts8, _mat_per_v, _gid_per_v, mat_per_tri, groups = \
-        scene_mod.scene_for_phase(idx, t, scene_mode="orbiters")
+        scene_mod.scene_for_phase(idx, t, scene_mode=scene_mode)
 
     # ── Triangulate ──────────────────────────────────────────────────────
     pts = verts8[:, 0:3].astype(np.float64).reshape(-1, 3, 3)
@@ -224,6 +225,7 @@ def _build_tracer_scene(t: float) -> TracerScene:
         src_directivity  = src_directivity,
         src_area_m2      = src_area,
         src_emit_W       = src_emit_W,
+        src_tri_idx      = sel.astype(np.int32, copy=False),
         bounds_min       = bmin,
         bounds_max       = bmax,
     )
@@ -455,7 +457,10 @@ class ExposureSession:
                  max_bounces: int = 4,
                  freq_hz: Optional[np.ndarray] = None,
                  backends: tuple[str, ...] = ("cpp",),
-                 out_dir: str = "exposures"):
+                 out_dir: str = "exposures",
+                 integrator: str = "splat",
+                 bdpt_records_cap: int = 1_048_576,
+                 scene_mode: str = "orbiters"):
         self.optics = optics
         self.film   = film
         self.width  = int(width)
@@ -467,6 +472,9 @@ class ExposureSession:
                                   np.float64)
         self.backends_requested = tuple(backends)
         self.out_dir = out_dir
+        self.integrator = str(integrator)
+        self.bdpt_records_cap = int(bdpt_records_cap)
+        self.scene_mode = str(scene_mode)
         os.makedirs(out_dir, exist_ok=True)
 
         self._rng_seed = 1
@@ -525,7 +533,7 @@ class ExposureSession:
 
     # ── Render one full exposure (drives all sub-batches) ────────────────
     def render_one_exposure(self, t: float = 0.0) -> list[ExposureFrameResult]:
-        scene = _build_tracer_scene(t)
+        scene = _build_tracer_scene(t, scene_mode=self.scene_mode)
         cam   = PinholeCamera.looking_at_scene(self.width, self.height, self.optics)
         plan  = self._build_plan(scene)
         backs = self._build_backends(scene, cam)
@@ -571,6 +579,50 @@ class ExposureSession:
         elapsed = time.perf_counter() - t0
         print(f"  {plan.n_batches} batches in {elapsed:.2f}s "
               f"({(plan.n_batches/max(elapsed,1e-9)):.1f} batches/s)")
+
+        # ── Optional bidirectional pass ──────────────────────────────────
+        # Per the integrator-rewrite directive: complex EndpointRecords are
+        # written verbatim, no abs(), no quantize, no band collapse.
+        # Sensor-group registration is left to the calling integration test
+        # (see docs/INTEGRATOR_BDPT.md TODO); when none is registered the
+        # call still validates the path and writes a 0-row record array.
+        if self.integrator == "bdpt" and "cpp" in backs:
+            cpp_back = backs["cpp"]  # type: ignore[assignment]
+            tracer = getattr(cpp_back, "tracer", None)
+            if tracer is not None and hasattr(tracer, "register_tri_group"):
+                # Register the actual emissive triangles (TracerScene already
+                # filtered these from the MaterialDatabase emission rows) as
+                # one EMISSIVE TriGroup.  Sensor-group registration is left
+                # to downstream callers; without it the integrator still
+                # walks the full bounce graph and writes 0 EndpointRecords.
+                tracer.clear_tri_groups()
+                emissive_tris = np.ascontiguousarray(
+                    scene.src_tri_idx, dtype=np.int32)
+                if emissive_tris.size > 0:
+                    tracer.register_tri_group(
+                        role_bits     = 1,   # TRI_GROUP_ROLE_EMISSIVE
+                        sample_policy = 1,   # AREA
+                        tri_indices   = emissive_tris,
+                    )
+                t_bd = time.perf_counter()
+                rays_per_emitter = max(64, self.total_rays //
+                                       max(1, tracer.n_tri_groups()) // 16)
+                recs = tracer.bidirectional(
+                    n_rays_per_emitter = rays_per_emitter,
+                    max_bounces        = self.max_bounces,
+                    min_amplitude      = 1.0e-3,
+                    seed               = self._rng_seed,
+                    max_records        = self.bdpt_records_cap,
+                )
+                print(f"  bdpt: {recs.shape[0]:_} EndpointRecords "
+                      f"in {time.perf_counter()-t_bd:.2f}s "
+                      f"(emissive_groups={tracer.n_tri_groups()}, "
+                      f"rays/emitter={rays_per_emitter:_})")
+                bdpt_path = os.path.join(
+                    self.out_dir,
+                    f"bdpt_records_{self._frame_index:04d}.npy")
+                np.save(bdpt_path, recs)
+                print(f"  bdpt records saved → {bdpt_path}")
 
         # ── Per-backend calibration + dump ───────────────────────────────
         results: list[ExposureFrameResult] = []
@@ -753,7 +805,25 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--rays-per-batch", type=int,   default=50_000,
                    help="Sub-batch size; many small batches stream cleanly.")
     p.add_argument("--frames",         type=int,   default=4)
-    p.add_argument("--max-bounces",    type=int,   default=4)
+    p.add_argument("--max-bounces",    type=int,   default=8,
+                   help="Per-ray bounce cap. Raised from 4 because most\n"
+                        "BVH walks terminate before hitting the cap.")
+    p.add_argument("--integrator",     choices=("splat", "bdpt"),
+                   default="splat",
+                   help="splat = legacy pinhole projection (image accum). "
+                        "bdpt  = bidirectional path tracing — emits N rays "
+                        "per registered EMISSIVE TriGroup, dumps complex "
+                        "EndpointRecord array (N,16) per frame to .npy.")
+    p.add_argument("--bdpt-records-cap", type=int, default=1_048_576,
+                   help="Max EndpointRecords per bdpt pass.")
+    p.add_argument("--calibration-scene", action="store_true",
+                   help="Use the tungsten-cavity blackbody calibration "
+                        "scene instead of the default orbiters scene. "
+                        "Equivalent to --scene-mode tungsten-cavity.")
+    p.add_argument("--scene-mode",     default=None,
+                   help="Scene mode passed to scene_mod.scene_for_phase "
+                        "(default: orbiters; tungsten-cavity for blackbody "
+                        "calibration). Overrides --calibration-scene.")
     p.add_argument("--backend",        choices=("cpp", "glsl", "both"),
                    default="cpp")
     p.add_argument("--exposure-time-s", type=float, default=DEFAULT_FILM.exposure_time_s)
@@ -801,6 +871,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         max_bounces    = args.max_bounces,
         backends       = backends,
         out_dir        = args.out_dir,
+        integrator     = args.integrator,
+        bdpt_records_cap = args.bdpt_records_cap,
+        scene_mode     = (args.scene_mode if args.scene_mode is not None
+                          else ("tungsten-cavity" if args.calibration_scene
+                                else "orbiters")),
     )
 
     if args.no_window:

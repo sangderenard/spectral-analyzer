@@ -14,6 +14,7 @@
 #include "serial_kernel.h"
 #include "transforms_api.h"
 #include "ray_tracer.h"
+#include "field_grid.h"
 #include "rt_field_solver.h"
 #include "acoustic_amr.h"
 #include "acoustic_fdtd.h"
@@ -879,7 +880,9 @@ struct PyRayTracer
     int add_scale_context(
         py::array_t<double, py::array::c_style> pos,
         double radius, int scale_type, double dt_m, int n_substeps,
-        double n_real, double n_imag)
+        double n_real, double n_imag,
+        int context_kind,
+        py::object payload)
     {
         if (!handle) throw std::runtime_error("RayTracer not initialised");
         auto cp = pos.request();
@@ -897,6 +900,15 @@ struct PyRayTracer
         ctx.n_substeps = n_substeps;
         ctx.n_real     = n_real;
         ctx.n_imag     = n_imag;
+        ctx.context_kind = context_kind;
+        /* Payload is caller-owned for now (zero-copy) — Python keeps the
+         * underlying bytes alive for the duration of the tracer.  Future:
+         * deep-copy when payload_size_bytes > 0 (kind needs it). */
+        if (!payload.is_none()) {
+            auto buf = py::buffer(payload).request();
+            ctx.payload = buf.ptr;
+            ctx.payload_size_bytes = (int)(buf.size * buf.itemsize);
+        }
 
         int rc = ray_tracer_add_scale_context(handle, &ctx);
         if (rc < 0)
@@ -2871,16 +2883,26 @@ Returns a dict with:
              py::arg("n_substeps")  = 1000,
              py::arg("n_real")      = 1.5,
              py::arg("n_imag")      = 0.0,
+             py::arg("context_kind") = 0,
+             py::arg("payload")     = py::none(),
              R"doc(
 Register a scale-context sphere in the scene.
 
-pos        : (3,) float64 world-space centre (metres)
-radius     : trigger radius (metres)
-scale_type : 0 = RT_SCALE_GEOMETRIC (coarse), 1 = RT_SCALE_WAVE (fine/wave)
-dt_m       : wave sub-step size (metres); only used when scale_type=1
-n_substeps : safety cap on sub-step count per context crossing
-n_real     : real part of medium refractive index inside sphere
-n_imag     : imaginary part (extinction coefficient; >0 = absorbing)
+pos          : (3,) float64 world-space centre (metres)
+radius       : trigger radius (metres)
+scale_type   : 0 = RT_SCALE_GEOMETRIC (coarse), 1 = RT_SCALE_WAVE (fine/wave)
+dt_m         : wave sub-step size (metres); only used when scale_type=1
+n_substeps   : safety cap on sub-step count per context crossing
+n_real       : real part of medium refractive index inside sphere
+n_imag       : imaginary part (extinction coefficient; >0 = absorbing)
+context_kind : SCALE_CONTEXT_KIND_* — 0=RAY (default), 1=WAVE_HELMHOLTZ,
+               2=THIN_LENS_TRANSFORM, 3=THICK_LENS_WAVE, 4=SPLINE_SURFACE,
+               5=NEURAL_SURFACE, 6=NEURAL_VOLUMETRIC.  Selects the
+               dispatch path the integrator takes inside the region.
+               Stub-passthrough for kinds 3..6 right now.
+payload      : optional bytes/array carrying kind-specific parameters.
+               Must be kept alive for the lifetime of the tracer.
+               THIN_LENS_TRANSFORM expects float64[1] = [focal_length_m].
 
 Returns the assigned context_id integer.
 )doc")
@@ -3088,7 +3110,166 @@ Returns : (n_written, n_live) — segments written and rays still alive
         .def("clear_rays", &PyRayTracer::clear_rays,
              R"doc(Remove all live rays and free the internal ray pool.)doc")
         .def("live_ray_count", &PyRayTracer::live_ray_count,
-             R"doc(Return the number of live rays across all context queues.)doc");
+             R"doc(Return the number of live rays across all context queues.)doc")
+        /* ── Triangle-group registry ────────────────────────────────── */
+        .def("register_tri_group",
+             [](PyRayTracer& self, uint32_t role_bits, uint32_t sample_policy,
+                py::array_t<int32_t, py::array::c_style | py::array::forcecast> tri_indices,
+                py::object plane_origin, py::object plane_normal,
+                double custom_emit_W,
+                int default_mat_idx,
+                py::object power_W_per_band,
+                py::object sensor_camera) {
+                 auto buf = tri_indices.request();
+                 if (buf.ndim != 1)
+                     throw std::runtime_error("tri_indices must be 1-D int32");
+                 TriGroupDesc desc{};
+                 desc.group_id     = -1;
+                 desc.role_bits    = role_bits;
+                 desc.sample_policy= sample_policy;
+                 desc.n_tris       = (int)buf.shape[0];
+                 desc.tri_indices  = static_cast<const int*>(buf.ptr);
+                 if (!plane_origin.is_none()) {
+                     auto po = plane_origin.cast<py::array_t<double>>();
+                     auto p  = po.unchecked<1>();
+                     for (int i = 0; i < 3; ++i) desc.plane_origin[i] = p(i);
+                 }
+                 if (!plane_normal.is_none()) {
+                     auto pn = plane_normal.cast<py::array_t<double>>();
+                     auto p  = pn.unchecked<1>();
+                     for (int i = 0; i < 3; ++i) desc.plane_normal[i] = p(i);
+                 }
+                 desc.custom_emit_W   = custom_emit_W;
+                 desc.default_mat_idx = default_mat_idx;
+
+                 /* Optional per-band power curve (deep-copied inside the
+                  * registrar; the float* needs to stay live only across
+                  * the registrar call itself). */
+                 py::array_t<float, py::array::c_style | py::array::forcecast> pw_arr;
+                 if (!power_W_per_band.is_none()) {
+                     pw_arr = power_W_per_band.cast<
+                         py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                     auto pwb = pw_arr.request();
+                     if (pwb.ndim != 1)
+                         throw std::runtime_error("power_W_per_band must be 1-D float32");
+                     desc.n_power_bands    = (int)pwb.shape[0];
+                     desc.power_W_per_band = static_cast<const float*>(pwb.ptr);
+                 }
+
+                 /* Optional CameraSensorDesc dict.  Lifetime: the
+                  * registrar deep-copies into the state, so the local
+                  * cam_desc here just needs to outlive the call. */
+                 CameraSensorDesc cam_desc{};
+                 if (!sensor_camera.is_none()) {
+                     py::dict d = sensor_camera.cast<py::dict>();
+                     auto get3 = [&](const char* key, double* out) {
+                         auto a = d[key].cast<py::array_t<double>>().unchecked<1>();
+                         for (int i = 0; i < 3; ++i) out[i] = a(i);
+                     };
+                     get3("pos", cam_desc.pos);
+                     get3("fwd", cam_desc.fwd);
+                     get3("up",  cam_desc.up);
+                     cam_desc.sensor_w_m         = d["sensor_w_m"].cast<double>();
+                     cam_desc.sensor_h_m         = d["sensor_h_m"].cast<double>();
+                     cam_desc.focal_m            = d["focal_m"].cast<double>();
+                     cam_desc.aperture_radius_m  = d["aperture_radius_m"].cast<double>();
+                     cam_desc.n_px               = d["n_px"].cast<int>();
+                     cam_desc.n_py               = d["n_py"].cast<int>();
+                     cam_desc.n_aperture_samples = d["n_aperture_samples"].cast<int>();
+                     cam_desc.aperture_stop_group_id =
+                         d.contains("aperture_stop_group_id")
+                         ? d["aperture_stop_group_id"].cast<int>() : -1;
+                     desc.sensor_camera = &cam_desc;
+                 }
+
+                 int gid = ray_tracer_register_tri_group(self.handle, &desc);
+                 if (gid < 0)
+                     throw std::runtime_error(
+                         "register_tri_group failed: rc=" + std::to_string(gid));
+                 return gid;
+             },
+             py::arg("role_bits"),
+             py::arg("sample_policy") = TRI_GROUP_SAMPLE_AREA,
+             py::arg("tri_indices"),
+             py::arg("plane_origin") = py::none(),
+             py::arg("plane_normal") = py::none(),
+             py::arg("custom_emit_W") = 0.0,
+             py::arg("default_mat_idx") = -1,
+             py::arg("power_W_per_band") = py::none(),
+             py::arg("sensor_camera") = py::none(),
+             R"doc(
+Register a triangle group for the bidirectional integrator.
+
+role_bits        : OR of TRI_GROUP_ROLE_EMISSIVE / SENSOR / BLOCKER / VOLUME
+sample_policy    : TRI_GROUP_SAMPLE_AREA (default) / UNIFORM / POWER /
+                   PIXEL_CONE (SENSOR-only camera-sim drive mode)
+tri_indices      : int32 1-D array — triangle indices (subset of any size)
+plane_origin/plane_normal : optional virtual-plane metadata for plane-tagged
+                   sensor groups
+custom_emit_W    : optional override for total emitted power (0 = derive)
+default_mat_idx  : per-group fallback material index (-1 = derive from
+                   majority across the group's tris)
+power_W_per_band : optional float32 (n_bands,) per-band emission spectrum
+                   override.  None = use mat_buf emission row.  This is the
+                   ONLY emission-curve fallback path — no PBR.
+sensor_camera    : optional dict for SENSOR + PIXEL_CONE groups, with keys
+                   pos (3,), fwd (3,), up (3,), sensor_w_m, sensor_h_m,
+                   focal_m, aperture_radius_m, n_px, n_py,
+                   n_aperture_samples, [aperture_stop_group_id (default -1)].
+
+Returns assigned group_id (>= 0).  Raises on failure.
+)doc")
+        .def("clear_tri_groups",
+             [](PyRayTracer& self) { ray_tracer_clear_tri_groups(self.handle); })
+        .def("n_tri_groups",
+             [](PyRayTracer& self) {
+                 return ray_tracer_n_tri_groups(self.handle);
+             })
+        /* ── Bidirectional integrator ──────────────────────────────── */
+        .def("bidirectional",
+             [](PyRayTracer& self, int n_rays_per_emitter, int max_bounces,
+                double min_amplitude, uint32_t seed, int max_records) {
+                 if (max_records <= 0) max_records = 1 << 20; /* 1 Mi */
+                 py::array_t<float> recs(
+                     {(py::ssize_t)max_records, (py::ssize_t)16});
+                 auto buf = recs.mutable_unchecked<2>();
+                 EndpointRecord* out = reinterpret_cast<EndpointRecord*>(buf.mutable_data(0, 0));
+                 int n_out = 0;
+                 int rc = ray_tracer_bidirectional(
+                     self.handle, n_rays_per_emitter, max_bounces,
+                     min_amplitude, seed, out, max_records, &n_out);
+                 if (rc != SK_OK)
+                     throw std::runtime_error(
+                         "ray_tracer_bidirectional failed: rc=" + std::to_string(rc));
+                 /* Truncate the output array to actual record count. */
+                 py::array_t<float> trimmed(
+                     {(py::ssize_t)n_out, (py::ssize_t)16});
+                 if (n_out > 0) {
+                     std::memcpy(trimmed.mutable_data(),
+                                 buf.data(0, 0),
+                                 sizeof(EndpointRecord) * n_out);
+                 }
+                 return trimmed;
+             },
+             py::arg("n_rays_per_emitter"),
+             py::arg("max_bounces") = 8,
+             py::arg("min_amplitude") = 0.005,
+             py::arg("seed") = 0,
+             py::arg("max_records") = 0,
+             R"doc(
+Bidirectional path tracing pass.
+
+Returns float32 (N, 16) array — each row is one EndpointRecord.  See
+csrc/include/bdpt_record.h for slot layout.  Phase preserved as (re, im)
+columns 12..13.  No reduction.
+
+n_rays_per_emitter : light subpaths per registered EMISSIVE TriGroup
+max_bounces        : maximum bounces per subpath
+min_amplitude      : kill threshold on max(|amp|) across bands
+seed               : RNG seed
+max_records        : output buffer cap (default 2**20).  Records beyond this
+                     are silently dropped — increase for dense scenes.
+)doc");
 
     py::class_<PyFieldSolver>(m, "FieldSolver",
         R"doc(
@@ -3532,6 +3713,24 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     /* Multiscale scale-type constants */
     m.attr("RT_SCALE_GEOMETRIC") = (int)RT_SCALE_GEOMETRIC;
     m.attr("RT_SCALE_WAVE")      = (int)RT_SCALE_WAVE;
+    /* Scale-context KIND dispatch enum (mirrors GLSL ScaleContext SSBO).
+     * Used by RayTracer.add_scale_context(context_kind=...). */
+    m.attr("SCALE_CONTEXT_KIND_RAY")                 = (int)SCALE_CONTEXT_KIND_RAY;
+    m.attr("SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ")      = (int)SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ;
+    m.attr("SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM") = (int)SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM;
+    m.attr("SCALE_CONTEXT_KIND_THICK_LENS_WAVE")     = (int)SCALE_CONTEXT_KIND_THICK_LENS_WAVE;
+    m.attr("SCALE_CONTEXT_KIND_SPLINE_SURFACE")      = (int)SCALE_CONTEXT_KIND_SPLINE_SURFACE;
+    m.attr("SCALE_CONTEXT_KIND_NEURAL_SURFACE")      = (int)SCALE_CONTEXT_KIND_NEURAL_SURFACE;
+    m.attr("SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC")   = (int)SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC;
+    /* Triangle-group registry constants (used with register_tri_group). */
+    m.attr("TRI_GROUP_ROLE_EMISSIVE")     = (int)TRI_GROUP_ROLE_EMISSIVE;
+    m.attr("TRI_GROUP_ROLE_SENSOR")       = (int)TRI_GROUP_ROLE_SENSOR;
+    m.attr("TRI_GROUP_ROLE_BLOCKER")      = (int)TRI_GROUP_ROLE_BLOCKER;
+    m.attr("TRI_GROUP_ROLE_VOLUME")       = (int)TRI_GROUP_ROLE_VOLUME;
+    m.attr("TRI_GROUP_SAMPLE_UNIFORM")    = (int)TRI_GROUP_SAMPLE_UNIFORM;
+    m.attr("TRI_GROUP_SAMPLE_AREA")       = (int)TRI_GROUP_SAMPLE_AREA;
+    m.attr("TRI_GROUP_SAMPLE_POWER")      = (int)TRI_GROUP_SAMPLE_POWER;
+    m.attr("TRI_GROUP_SAMPLE_PIXEL_CONE") = (int)TRI_GROUP_SAMPLE_PIXEL_CONE;
 
     m.def("amr_create_progress", []() {
         py::dict d;

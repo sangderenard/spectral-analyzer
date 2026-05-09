@@ -1,0 +1,144 @@
+/**
+ * triangle_groups.h — Triangle-group registry for bidirectional integration.
+ *
+ * A "triangle group" is any subset of scene triangles tagged with one or more
+ * roles.  Groups are the unit of bidirectional bookkeeping:
+ *
+ *   - EMISSIVE_GROUP : light subpaths originate by sampling triangles in the
+ *     group (uniform-by-area) and emitting cosine-weighted directions.
+ *   - SENSOR_GROUP   : when a ray hits a triangle that belongs to a sensor
+ *     group, the segment is recorded as an EndpointRecord (complex amplitude,
+ *     phase, direction, path length) instead of being splatted into an image.
+ *
+ * Either role can be set on a subset of triangles inside a group (see
+ * ``TriGroup::tri_indices`` — group membership is by explicit index list, not
+ * by mat_idx, so the same material can be sensor in one group and ordinary
+ * surface in another).
+ *
+ * The registry replaces the old single-image splat with a per-group
+ * EndpointRecord SSBO.  Magnitude / phase / RGB visualisation is computed at
+ * display time only — storage is always full complex per band.
+ *
+ * Hard rules (per the integrator-rewrite directive):
+ *   - No reduction at deposit time. EndpointRecord stores complex amplitude.
+ *   - No abs(), no quantize. Aggregation is the caller's responsibility.
+ *   - Metadata round-trips: every emit/deposit carries subpath_id,
+ *     bounce_index, group_id so the bidirectional join can pair light and
+ *     sensor subpaths exactly.
+ */
+#pragma once
+#include "serial_kernel.h"
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* Role bits. Multiple bits may be combined on the same group. */
+#define TRI_GROUP_ROLE_EMISSIVE   (1u << 0)  /* light subpath origin              */
+#define TRI_GROUP_ROLE_SENSOR     (1u << 1)  /* endpoint deposit on hit           */
+#define TRI_GROUP_ROLE_BLOCKER    (1u << 2)  /* contributes to occlusion only     */
+#define TRI_GROUP_ROLE_VOLUME     (1u << 3)  /* triangles enclose a material region */
+
+/* Sampling weight policy.
+ *
+ * For EMISSIVE groups: how a triangle is picked when spawning a light subpath.
+ * For SENSOR  groups: how the sensor side of the bidirectional join is
+ *   driven.  PIXEL_CONE turns the group into a true camera sensor with a
+ *   deterministic per-pixel outer loop and a stochastic inner aperture
+ *   sampling — see CameraSensorDesc below.
+ */
+#define TRI_GROUP_SAMPLE_UNIFORM       0  /* uniform per triangle index         */
+#define TRI_GROUP_SAMPLE_AREA          1  /* area-weighted (Lambertian default) */
+#define TRI_GROUP_SAMPLE_POWER         2  /* power × area weighted              */
+#define TRI_GROUP_SAMPLE_PIXEL_CONE    3  /* SENSOR-only: per-pixel cone scan   */
+
+/**
+ * Camera sensor descriptor (used when sample_policy == PIXEL_CONE).
+ *
+ * The camera's sensor plane is one TriGroup of role SENSOR.  This descriptor
+ * tells the bidirectional integrator how to *drive* it: deterministic outer
+ * loop over (px, py) ∈ [0, n_px) × [0, n_py), inner stochastic loop drawing
+ * n_aperture_samples points on the aperture stop.  No grid jitter — purely
+ * stochastic so we don't print a sampler pattern into the image.
+ *
+ * Aperture honoring:
+ *   aperture_stop_group_id >= 0  →  rays are tested against that BLOCKER
+ *                                   group's triangles; misses are dropped.
+ *                                   This is how blade polygon shape gets
+ *                                   honored without separate blade math.
+ *   aperture_stop_group_id <  0  →  fall back to a circular aperture of
+ *                                   radius aperture_radius_m centred on
+ *                                   (pos + focal_m * fwd).
+ *
+ * Pixel grid is derived from the camera basis: pixel (px, py) lives at
+ *   sensor_origin + (px+0.5)/n_px * sensor_w * right
+ *                 + (py+0.5)/n_py * sensor_h * up
+ * with sensor_origin = pos - 0.5*sensor_w*right - 0.5*sensor_h*up.
+ */
+typedef struct {
+    double pos[3];                  /* camera nodal/sensor centre (m)       */
+    double fwd[3];                  /* unit forward (sensor → scene)        */
+    double up[3];                   /* unit up (image-y axis)               */
+    double sensor_w_m;              /* physical sensor width  (m)           */
+    double sensor_h_m;              /* physical sensor height (m)           */
+    double focal_m;                 /* nominal focus distance (m)           */
+    double aperture_radius_m;       /* fallback disk radius if no stop grp  */
+    int    n_px;                    /* horizontal pixel count               */
+    int    n_py;                    /* vertical   pixel count               */
+    int    n_aperture_samples;      /* stochastic samples per pixel         */
+    int    aperture_stop_group_id;  /* -1 = use disk fallback               */
+} CameraSensorDesc;
+
+/**
+ * TriGroup descriptor.
+ *
+ * Owned by the RayTracerState; built via ray_tracer_register_tri_group().
+ * The state retains the indices and a precomputed cumulative-area table for
+ * O(log N) area-weighted sampling.
+ *
+ * All "Optional" fields default to 0/NULL/-1 when the caller zero-inits.
+ * Adding a field at the END of this struct is safe; reorder = ABI break.
+ */
+typedef struct {
+    int       group_id;          /* assigned by registrar; -1 in caller copy */
+    uint32_t  role_bits;         /* TRI_GROUP_ROLE_* OR mask                 */
+    uint32_t  sample_policy;     /* TRI_GROUP_SAMPLE_*                       */
+    int       n_tris;            /* count                                    */
+    const int* tri_indices;      /* (n_tris,) — caller-owned during register */
+    /* Optional metadata. Zero/NULL = defaults. */
+    double    plane_origin[3];   /* virtual plane origin (for plane-tagged   */
+    double    plane_normal[3];   /* sensor groups; ignored otherwise)        */
+    double    custom_emit_W;     /* override total emitted power; 0 = derive */
+    /* ── Additive extensions (safe to leave zeroed) ────────────────────── */
+    int       default_mat_idx;   /* -1 = derive from majority tri material   */
+    int       n_power_bands;     /* length of power_W_per_band; 0 = none     */
+    const float*    power_W_per_band; /* (n_power_bands,) optional spectrum  */
+    const CameraSensorDesc* sensor_camera; /* SENSOR + PIXEL_CONE only       */
+} TriGroupDesc;
+
+/* Registrar / accessors (state-mutating side opaquely declared in ray_tracer.h). */
+struct RayTracerState;
+
+/**
+ * Register a triangle group with the tracer.  Returns the assigned group_id
+ * (>= 0) or a negative SK_ERR_* on failure.  The triangle indices are copied
+ * into the state; the caller's TriGroupDesc may be discarded after the call.
+ */
+SK_API int ray_tracer_register_tri_group(
+    struct RayTracerState* st,
+    const TriGroupDesc*    desc);
+
+/**
+ * Drop all registered triangle groups.  Does not free any other state.
+ */
+SK_API int ray_tracer_clear_tri_groups(struct RayTracerState* st);
+
+/**
+ * Number of registered groups.
+ */
+SK_API int ray_tracer_n_tri_groups(const struct RayTracerState* st);
+
+#ifdef __cplusplus
+} /* extern "C" */
+#endif

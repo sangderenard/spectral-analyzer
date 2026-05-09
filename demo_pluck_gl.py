@@ -3260,6 +3260,37 @@ void main() {
 }
 """
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ░░ BDPT parity TODO (forward shader) ░░
+# ─────────────────────────────────────────────────────────────────────────────
+# The C++ tracer (csrc/kernels/ray_tracer.cpp::ray_tracer_bidirectional)
+# now produces complex EndpointRecords (csrc/include/bdpt_record.h, 64 B,
+# {subpath_id, band_id, group_id, vertex_index, pos[3], pathlen_m, dir[3],
+#  pdf, amp_re, amp_im, cos_theta}) for every (light → sensor) subpath.
+# To reach parity inside _GPU_RAY_FIELD_CS the following work is required:
+#
+#   1. Paired r32f atomic-add for COMPLEX storage.  The volume textures
+#      are currently r32f magnitude; we need a sibling r32f bound to the
+#      next image unit holding the imaginary part so that real/imag are
+#      atomically deposited side-by-side per band.  imageAtomicAdd on
+#      r32f is portable (GL_NV_shader_atomic_float_minmax is NV-only and
+#      MUST NOT be required — see user constraint §3, no vendor lock).
+#
+#   2. Sensor-group endpoint deposit interface.  Mirror the EndpointRecord
+#      layout exactly — emit one record per (subpath, sensor-tri hit) into
+#      an SSBO (binding to be chosen, currently 13 free) keyed on a global
+#      atomic counter.  CPU-side code reuses ENDPOINT_DTYPE from
+#      bdpt_integrator.py to read the buffer back unchanged.
+#
+#   3. KDTREE field marcher port.  field_march.cpp's regular-grid Helmholtz
+#      stepper is the reference; the KD variant (field_grid_create_kdtree)
+#      currently only allocates — neither C++ nor GLSL marches it.  GPU
+#      port should consume the same FieldGrid layout via a flat float SSBO.
+#
+# Hard rules (per user §5): no abs() at deposit, no quantize, no band
+# collapse, complex storage end-to-end.
+# ─────────────────────────────────────────────────────────────────────────────
+
 _GPU_RAY_FIELD_CS = """
 #version 430 core
 layout(local_size_x = 128) in;
@@ -4586,6 +4617,18 @@ void reactive_main(uint gid, inout uint rng) {
 # through the pixel (stratified AA), traces the BVH, reads the already-complete
 # forward irradiance bands via integer samplers, applies Lambert BRDF and
 # accumulates an RGBA32F pixel radiance into uSensorOut.
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# ░░ BDPT parity TODO (sensor shader) ░░
+# To pair with ray_tracer_bidirectional and EndpointRecord (see TODO block
+# above _GPU_RAY_FIELD_CS for full details):
+#   1. emit complex EndpointRecord per primary-hit (paired r32f for
+#      amp_re / amp_im — never abs(), never magnitude-only).
+#   2. honour TRI_GROUP_ROLE_SENSOR registration when present so the
+#      shader records arrivals only for sensor-tagged triangles
+#      (mirror the C++ tri_sensor_group lookup table).
+#   3. preserve all spectral bands (n_bands carried through MaterialDatabase
+#      — no collapse to RGB at deposit).
 # ─────────────────────────────────────────────────────────────────────────────
 _GPU_SENSOR_CS = """
 #version 430 core

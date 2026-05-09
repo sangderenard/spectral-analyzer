@@ -1,0 +1,11 @@
+MSBuild version 17.14.19+164abd434 for .NET Framework
+
+  ray_tracer.cpp
+     Creating library C:/Users/alber/Downloads/spectral-analyzer/csrc_build/Release/_spectral_kernels.lib and object C:/Users/alber/Downloads/spectral-analyzer/csrc_build/Release/_spectral_kernels.exp
+  Generating code
+  Finished generating code
+  _spectral_kernels.vcxproj -> C:\Users\alber\Downloads\spectral-analyzer\_spectral_kernels.cp311-win_amd64.pyd
+  base_rasterizer_c.vcxproj -> C:\Users\alber\Downloads\spectral-analyzer\csrc_bin\base_rasterizer.dll
+  player_clip_c.vcxproj -> C:\Users\alber\Downloads\spectral-analyzer\csrc_bin\player_clip.dll
+  router_step_c.vcxproj -> C:\Users\alber\Downloads\spectral-analyzer\csrc_bin\router_step.dll
+  tile_overlap_c.vcxproj -> C:\Users\alber\Downloads\spectral-analyzer\csrc_bin\tile_overlap.dll

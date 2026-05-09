@@ -471,6 +471,12 @@ def _mirror_reflectances(n_bands: int) -> Tuple[np.ndarray, np.ndarray]:
 # Abstract flag tokens used in ior_specs — kept independent of C extension consts
 _GEO_FLAG_TRANSMISSIVE      = "transmissive"
 _GEO_FLAG_APERTURE_STOP     = "aperture_stop"
+# Aperture-blade geometry (subset of APERTURE_STOP) — same material flag,
+# but tagged separately so register_into() can find the BLOCKER tris.
+_GEO_FLAG_APERTURE_BLADE    = "aperture_blade"
+# Sensor surface (subset of APERTURE_STOP) — same material flag (absorber),
+# but tagged separately so register_into() can find the SENSOR tris.
+_GEO_FLAG_SENSOR            = "sensor"
 # Emissive surface: emits light into the ray tracer (LED, flash, projector).
 # Triangulated as a disc; also synthesises a scene-light dict when enabled.
 _GEO_FLAG_EMITTER           = "emitter"

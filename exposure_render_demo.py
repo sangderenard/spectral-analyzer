@@ -1341,7 +1341,8 @@ class ExposureSession:
             sensor_h_m = float(self.optics.sensor_h_mm) * 1.0e-3
             pixel_pitch_m = float(self.optics.pixel_pitch_um) * 1.0e-6
             focal_m = float(self.optics.focal_mm) * 1.0e-3
-            aperture_radius_m = focal_m / (2.0 * self.optics.f_number)
+            # Use aperture_mm directly (more precise for complex aperture sims than f_number)
+            aperture_radius_m = float(self.optics.aperture_mm) * 0.5 * 1.0e-3
             n_px = self.optics.n_pixels()
             
             # Build metadata with explicit noise model (T5)

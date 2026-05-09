@@ -250,7 +250,8 @@ class FilmRecord(ctypes.Structure):
         ('layer1_shadow_point', ctypes.c_float),
         ('layer1_highlight_point', ctypes.c_float),
         # Simplified for now: pack remaining layer data into reserved slots
-        ('_layer_future_0',     ctypes.c_float * 16),  # room for 2 more full layers
+        # Room for layers 2-7 (6 layers × 8 floats = 48 floats) but using compact array
+        ('_layer_future_0',     ctypes.c_float * 36),  # 36 floats = 9 vec4, room for 4+ more layers
         # vec4 14: layer configuration
         ('n_layers',            ctypes.c_float),     # ≤8 active layers
         ('_layer_config_1',     ctypes.c_float),

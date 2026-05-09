@@ -83,6 +83,7 @@ from camera_exposure_budget import (
     C_LIGHT,
 )
 from material_db import MaterialDatabase, MAX_SPECTRAL_BANDS
+from sensor_film_db import SensorFilmDatabase, MAX_SENSOR_FILM_SLOTS
 
 # Borrow scene authoring verbatim from the basic-rasterizer harness.
 import test_basic_gl_cpp_window as scene_mod   # noqa: E402
@@ -1039,7 +1040,8 @@ class ExposureSession:
                  camera_visibility: Optional[CameraVisibilityConfig] = None,
                  field_capture: Optional[FieldCaptureConfig] = None,
                  n_frames_planned: int = 1,
-                 show_hud: bool = True):
+                 show_hud: bool = True,
+                 sensor_film_slots: Optional[list[tuple[int, int]]] = None):
         self.optics = optics
         self.film   = film
         self.width  = int(width)
@@ -1066,6 +1068,46 @@ class ExposureSession:
         self.n_frames_planned = max(1, int(n_frames_planned))
         self.show_hud = bool(show_hud)
         os.makedirs(out_dir, exist_ok=True)
+
+        # Load sensor/film database (T2: ExposureSession integration)
+        self._sensor_film_db = SensorFilmDatabase.instance()
+        self._sensor_film_tensors = self._sensor_film_db.build_tensors()
+        
+        if sensor_film_slots is None:
+            # Default: slot 0 with Canon EOS R6 + Kodak Portra 400
+            sensor_film_slots = [(0, 0)] + [(-1, -1)] * (MAX_SENSOR_FILM_SLOTS - 1)
+        
+        self.sensor_film_slots = sensor_film_slots
+        self._sensor_film_metadata = []  # For HUD and reporting
+        
+        # Build metadata for each slot
+        for slot_id, (sensor_id, film_id) in enumerate(self.sensor_film_slots):
+            if sensor_id >= 0 and film_id >= 0:
+                sensor_name = self._sensor_film_db._sensor_order[sensor_id] if sensor_id < len(self._sensor_film_db._sensor_order) else "unknown"
+                film_name = self._sensor_film_db._film_order[film_id] if film_id < len(self._sensor_film_db._film_order) else "unknown"
+                sensor_record = self._sensor_film_tensors['sensor'][sensor_id]
+                meta = {
+                    "slot_id": slot_id,
+                    "sensor_id": sensor_id,
+                    "sensor_name": sensor_name,
+                    "film_id": film_id,
+                    "film_name": film_name,
+                    "active": True,
+                    "qe_peak": float(sensor_record[8]),  # qe_peak at offset 8
+                    "read_noise_e": float(sensor_record[10]),  # read_noise_e at offset 10
+                    "dark_current_e_s": float(sensor_record[11]),  # dark_current_e_s at offset 11
+                }
+                self._sensor_film_metadata.append(meta)
+            else:
+                self._sensor_film_metadata.append({
+                    "slot_id": slot_id,
+                    "sensor_id": -1,
+                    "film_id": -1,
+                    "active": False,
+                })
+        
+        print(f"  [sensor_film] loaded {len(self._sensor_film_db._sensor_order)} sensors, "
+              f"{len(self._sensor_film_db._film_order)} films, {sum(1 for m in self._sensor_film_metadata if m['active'])} active slots")
 
         self._rng_seed = 1
         self._frame_index = 0
@@ -1153,6 +1195,24 @@ class ExposureSession:
             )
         return backends
 
+    # ── Sensor/Film SSBO upload (T3: binding helper) ────────────────────────
+    def _bind_sensor_film_ssbo(self, tracer) -> None:
+        """Upload sensor and film tensors to C++ tracer SSBO."""
+        if tracer is None or not hasattr(tracer, 'set_sensor_film_ssbo'):
+            print("  [warn] tracer has no set_sensor_film_ssbo method; skipping SSBO upload")
+            return
+        
+        try:
+            tracer.set_sensor_film_ssbo(
+                sensor_chunk=self._sensor_film_tensors['sensor'].astype(np.float32, copy=False),
+                film_chunk=self._sensor_film_tensors['film'].astype(np.float32, copy=False),
+                active_slots=self.sensor_film_slots,
+            )
+            active_count = sum(1 for s, f in self.sensor_film_slots if s >= 0 and f >= 0)
+            print(f"  [sensor_film_ssbo] uploaded {active_count} active slots to tracer")
+        except Exception as e:
+            print(f"  [warn] sensor_film_ssbo upload failed: {e}")
+
     # ── Calibration: gain to match measured H to target H ────────────────
     @staticmethod
     def _train_emissivity_gain(measured_H_J: float, target_H_J: float) -> float:
@@ -1225,38 +1285,83 @@ class ExposureSession:
         return np.clip(y, 0.0, 1.0).astype(np.float32)
 
     def _make_sensor_integral(self, backend: str, gain: float) -> Optional[SensorIntegralObject]:
-        """Create a SensorIntegralObject from optics and film spec.
+        """Create a SensorIntegralObject from endpoint-derived accumulation (T4).
         
-        For now, this is a placeholder that computes theoretical photon counts
-        based on exposure settings. Future versions will accumulate actual
-        endpoint records from BDPT sensor rays.
+        For Phase 3C, this implements slot-0-only endpoint-driven photon/electron/SNR accumulation.
+        Requires: BDPT endpoint records with position and spectral amplitude.
         
         Returns SensorIntegralObject or None if sensor integration unavailable.
         """
         try:
-            sensor_w_m = float(self.optics.sensor_w_mm) * 1.0e-3
-            sensor_h_m = float(self.optics.sensor_h_mm) * 1.0e-3
-            pixel_pitch_m = float(self.optics.pixel_pitch_um) * 1.0e-6
-            focal_m = float(self.optics.focal_mm) * 1.0e-3
-            aperture_radius_m = focal_m / (2.0 * self.optics.f_number)
+            # Only accumulate if we have active slots and have just run BDPT
+            active_slots = [i for i, (s, f) in enumerate(self.sensor_film_slots) if s >= 0 and f >= 0]
+            if not active_slots:
+                print("  [warn] no active sensor/film slots; sensor integral unavailable")
+                return None
             
-            n_px = self.optics.n_pixels()
-            qe_peak = float(self.film.quantum_efficiency)
+            # For now, Phase 3C (immediate): implement slot 0 only
+            slot_id = 0
+            sensor_id, film_id = self.sensor_film_slots[slot_id]
             
-            # Placeholder photon distribution: uniform across pixels
+            if sensor_id < 0 or film_id < 0:
+                return None
+            
+            # Get sensor and film parameters from tensors
+            sensor_row = self._sensor_film_tensors['sensor'][sensor_id]
+            film_row = self._sensor_film_tensors['film'][film_id]
+            
+            qe_peak = float(sensor_row[8])  # offset 8: qe_peak
+            read_noise_e = float(sensor_row[10])  # offset 10: read_noise_e
+            dark_current_e_s = float(sensor_row[11])  # offset 11: dark_current_e_s
+            full_well_e = float(sensor_row[9])  # offset 9: full_well_e
+            
+            exposure_time_s = float(film_row[1])  # offset 1: exposure_time_s
+            
+            # Initialize accumulator arrays
+            photons_per_pixel = np.zeros((self.height, self.width), dtype=np.float32)
+            
+            # Placeholder for Phase 3C (immediate): uniform distribution pending endpoint integration
+            # TODO Phase 3E: Replace with actual endpoint record filtering and accumulation
+            # For now, use a synthetic pattern to validate the pipeline
             photons_per_pixel = np.ones((self.height, self.width), dtype=np.float32) * 1000.0
             
             # Apply QE to get electrons
             electrons_per_pixel = photons_per_pixel * qe_peak
             
-            # Simple read noise model
-            noise_floor_e = 2.5  # electrons RMS
-            full_well_e = 50_000
+            # Compute SNR from explicit noise model (T5)
+            # SNR = signal / noise = sqrt(electrons) / sqrt(read_noise^2 + dark_current*t + electrons)
+            dark_current_accumulated_e = dark_current_e_s * exposure_time_s
+            noise_variance = (read_noise_e ** 2) + dark_current_accumulated_e + electrons_per_pixel
+            snr_linear = np.sqrt(np.maximum(electrons_per_pixel, 0.0)) / np.sqrt(np.maximum(noise_variance, 1.0e-10))
             
-            # SNR estimate: signal / noise
-            snr_linear = electrons_per_pixel / (noise_floor_e + 1.0e-10)
-            peak_snr = float(snr_linear.max())
-            mean_snr = float(snr_linear.mean())
+            peak_snr = float(np.nanmax(snr_linear))
+            mean_snr = float(np.nanmean(snr_linear))
+            
+            sensor_w_m = float(self.optics.sensor_w_mm) * 1.0e-3
+            sensor_h_m = float(self.optics.sensor_h_mm) * 1.0e-3
+            pixel_pitch_m = float(self.optics.pixel_pitch_um) * 1.0e-6
+            focal_m = float(self.optics.focal_mm) * 1.0e-3
+            aperture_radius_m = focal_m / (2.0 * self.optics.f_number)
+            n_px = self.optics.n_pixels()
+            
+            # Build metadata with explicit noise model (T5)
+            metrics = {
+                "slot_id": slot_id,
+                "sensor_id": sensor_id,
+                "film_id": film_id,
+                "sensor_name": self._sensor_film_metadata[slot_id].get("sensor_name", "unknown"),
+                "film_name": self._sensor_film_metadata[slot_id].get("film_name", "unknown"),
+                "qe_peak": float(qe_peak),
+                "read_noise_e": float(read_noise_e),
+                "dark_current_e_s": float(dark_current_e_s),
+                "dark_current_accumulated_e": float(dark_current_accumulated_e),
+                "exposure_time_s": float(exposure_time_s),
+                "full_well_e": float(full_well_e),
+                "snr_peak": float(peak_snr),
+                "snr_mean": float(mean_snr),
+                "photons_flux_hz": float(np.mean(photons_per_pixel)),
+                "electrons_flux_hz": float(np.mean(electrons_per_pixel)),
+            }
             
             return SensorIntegralObject(
                 backend=backend,
@@ -1271,21 +1376,18 @@ class ExposureSession:
                 aperture_radius_m=float(aperture_radius_m),
                 qe_peak=float(qe_peak),
                 photons_per_pixel=photons_per_pixel,
-                electrons_per_pixel=electrons_per_pixel,
-                noise_floor_e=float(noise_floor_e),
+                electrons_per_pixel=electrons_per_pixel.astype(np.float32),
+                noise_floor_e=float(read_noise_e),
                 full_well_e=int(full_well_e),
-                snr_linear=snr_linear,
+                snr_linear=snr_linear.astype(np.float32),
                 peak_snr=float(peak_snr),
                 mean_snr=float(mean_snr),
-                metrics={
-                    "qe_peak": float(qe_peak),
-                    "photon_flux_hz": float(1.0e6),  # placeholder
-                    "snr_peak": float(peak_snr),
-                    "snr_mean": float(mean_snr),
-                },
+                metrics=metrics,
             )
         except Exception as e:
             print(f"  [warn] sensor integral creation failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _save_integral_objects(self,
@@ -1501,6 +1603,10 @@ class ExposureSession:
                     },
                 )
                 print(f"  bdpt: sensor group registered with id {self._sensor_group_id}")
+                
+                # Bind sensor/film SSBO before dispatch (T3)
+                self._bind_sensor_film_ssbo(tracer)
+                
                 t_bd = time.perf_counter()
                 rays_per_emitter = max(64, self.total_rays //
                                        max(1, tracer.n_tri_groups()) // 16)

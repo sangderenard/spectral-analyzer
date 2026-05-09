@@ -1747,8 +1747,12 @@ class ExposureSession:
                 np.save(linear_path, rgb_linear)
 
             if self.save_files:
+                # Convert to dict but exclude non-JSON-serializable fields (numpy arrays)
+                r_dict = asdict(r)
+                r_dict.pop('image_data', None)
+                r_dict.pop('image16_data', None)
                 with open(json_path, "w", encoding="utf-8") as fh:
-                    json.dump(asdict(r), fh, indent=2)
+                    json.dump(r_dict, fh, indent=2)
             results.append(r)
             print(f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
                   f"H_meas={measured:.3e} J  H_targ={plan.target_H_J:.3e} J  "

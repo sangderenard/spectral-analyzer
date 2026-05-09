@@ -660,6 +660,8 @@ class ExposureFrameResult:
     field_capture_strikes_path: str
     summary_path:       str
     frame_config_summary: dict
+    image_data:         Optional[np.ndarray] = None  # (H, W, 3) float32 [0,1]
+    image16_data:       Optional[np.ndarray] = None  # (H, W, 3) uint16 for 16-bit
 
 
 @dataclass
@@ -1041,7 +1043,8 @@ class ExposureSession:
                  field_capture: Optional[FieldCaptureConfig] = None,
                  n_frames_planned: int = 1,
                  show_hud: bool = True,
-                 sensor_film_slots: Optional[list[tuple[int, int]]] = None):
+                 sensor_film_slots: Optional[list[tuple[int, int]]] = None,
+                 save_files: bool = False):
         self.optics = optics
         self.film   = film
         self.width  = int(width)
@@ -1067,6 +1070,7 @@ class ExposureSession:
                       else FieldCaptureConfig())
         self.n_frames_planned = max(1, int(n_frames_planned))
         self.show_hud = bool(show_hud)
+        self.save_files = bool(save_files)
         os.makedirs(out_dir, exist_ok=True)
 
         # Load sensor/film database (T2: ExposureSession integration)
@@ -1732,18 +1736,28 @@ class ExposureSession:
             preview_lines = _make_hud_lines(r, detail_lv) if self.show_hud else []
             img_preview = _burn_overlay_into_preview(img, preview_lines)
 
-            _write_png(png_path, img_preview)
-            _write_png16(png16_path, img)
-            np.save(linear_path, rgb_linear)
+            # Store image data in memory for display
+            r.image_data = np.clip(img_preview, 0.0, 1.0).astype(np.float32)
+            r.image16_data = (np.clip(img, 0.0, 1.0) * 65535.0).astype(np.uint16)
 
-            with open(json_path, "w", encoding="utf-8") as fh:
-                json.dump(asdict(r), fh, indent=2)
+            # Only save files if explicitly enabled via --save-files
+            if self.save_files:
+                _write_png(png_path, img_preview)
+                _write_png16(png16_path, img)
+                np.save(linear_path, rgb_linear)
+
+            if self.save_files:
+                with open(json_path, "w", encoding="utf-8") as fh:
+                    json.dump(asdict(r), fh, indent=2)
             results.append(r)
             print(f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
                   f"H_meas={measured:.3e} J  H_targ={plan.target_H_J:.3e} J  "
                   f"gain={gain:.3e}× ({gain_db:+.2f} dB)  "
                   f"photons/pix={photons_per_pix:.2e}  SNR≈{snr:.2f}")
-            print(f"        → {png_path}")
+            if self.save_files:
+                print(f"        → {png_path}")
+            else:
+                print(f"        (in-memory; use --save-files to save to disk)")
 
         self._frame_index += 1
         self._rng_seed += 1
@@ -1945,22 +1959,21 @@ def _run_viewer(session: ExposureSession, n_frames: int,
         win.blit(bigf.render(f"Exposure {frame+1}/{n_frames}",
                              True, (255, 255, 255)), (16, 8))
 
-        cpp_img = _load_png_rgb(last["cpp"].image_path) if "cpp" in last else None
-        glsl_img = _load_png_rgb(last["glsl"].image_path) if "glsl" in last else None
-
-        for i, (name, img) in enumerate([("cpp", cpp_img), ("glsl", glsl_img)]):
+        # Display images from memory (not from disk)
+        for i, (name, _) in enumerate([("cpp", None), ("glsl", None)]):
             x = 10 + i * (pane_w + 10)
             y = 40
-            if img is None:
+            if name not in last or last[name].image_data is None:
                 pygame.draw.rect(win, (40, 40, 50), (x, y, pane_w, pane_h))
-                win.blit(font.render(f"{name.upper()}: not requested",
+                win.blit(font.render(f"{name.upper()}: not available",
                                      True, (200, 200, 200)),
                          (x + 12, y + 12))
                 continue
 
             r = last[name]
+            img = r.image_data
             info = (f"N_rays={r.n_rays_emitted:_}\n"
-                    f"gain={r.gain_linear:.2e}\u00d7 ({r.gain_db:+.2f} dB)\n"
+                    f"gain={r.gain_linear:.2e}× ({r.gain_db:+.2f} dB)\n"
                     f"H_meas/targ={r.measured_H_J:.2e}/{r.target_H_J:.2e} J")
             detail_lv = r.frame_config_summary.get("detail_level", 0)
             hud = _make_hud_lines(r, detail_lv) if show_hud else None
@@ -2030,6 +2043,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Skip pygame window; just dump PNG/JSON to disk.")
     p.add_argument("--no-hud",         action="store_true",
                    help="Suppress the HUD overlay in the viewer window.")
+    p.add_argument("--save-files",     action="store_true",
+                   help="Save PNG, JSON, and NPZ artifacts to disk (opt-in). "
+                        "Without this, only in-memory rendering and display is performed.")
     p.add_argument("--out-dir",        default="exposures")
     p.add_argument("--pane-w",         type=int, default=640)
     p.add_argument("--pane-h",         type=int, default=360)
@@ -2088,6 +2104,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         ),
         n_frames_planned = args.frames,
         show_hud         = not args.no_hud,
+        save_files       = args.save_files,
     )
 
     if args.no_window:

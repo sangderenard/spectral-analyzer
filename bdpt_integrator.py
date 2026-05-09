@@ -46,6 +46,9 @@ TRI_GROUP_SAMPLE_AREA       = 1
 TRI_GROUP_SAMPLE_POWER      = 2
 TRI_GROUP_SAMPLE_PIXEL_CONE = 3   # SENSOR-only: per-pixel cone scan via CameraSensor
 
+TRI_PARAM_SURFACE_NONE      = 0
+TRI_PARAM_SURFACE_POLY_BARY = 1
+
 
 # Scale-context KIND enum (mirror of csrc/include/ray_tracer.h SCALE_CONTEXT_KIND_*).
 SCALE_CONTEXT_KIND_RAY                 = 0
@@ -141,6 +144,7 @@ class TriangleGroup:
     # Additive (safe to omit): per-group default material + power curve.
     default_mat_idx:  int   = -1                   # -1 = derive from majority
     power_W_per_band: np.ndarray | None = None     # float32 (n_bands,) or None
+    parametric_surface: dict[str, Any] | None = None
     # SENSOR + PIXEL_CONE only; ignored otherwise.
     sensor_camera:    CameraSensor | None = None
 
@@ -160,6 +164,8 @@ class TriangleGroup:
             default_mat_idx = int(self.default_mat_idx),
             power_W_per_band = (np.ascontiguousarray(self.power_W_per_band, np.float32)
                                 if self.power_W_per_band is not None else None),
+            parametric_surface = (self.parametric_surface
+                                  if self.parametric_surface is not None else None),
             sensor_camera  = (self.sensor_camera.to_dict()
                               if self.sensor_camera is not None else None),
         )

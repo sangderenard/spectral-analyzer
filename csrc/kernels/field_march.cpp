@@ -215,3 +215,80 @@ extern "C" SK_API int field_grid_inject_amplitude_regular(
     add(x1, y1, z1,    fx *   fy *   fz );
     return SK_OK;
 }
+
+extern "C" SK_API int field_grid_inject_amplitude(
+    FieldGrid* g, int band,
+    const float pos[3],
+    float amp_re, float amp_im)
+{
+    if (!g || !pos) return SK_ERR_NULL_STATE;
+    if (band < 0 || band >= g->n_bands) return SK_ERR_NULL_STATE;
+
+    if (g->kind == FIELD_GRID_REGULAR)
+        return field_grid_inject_amplitude_regular(g, band, pos, amp_re, amp_im);
+
+    if (g->kind != FIELD_GRID_KDTREE || g->nodes.empty())
+        return SK_ERR_NULL_STATE;
+
+    auto in_aabb = [&](const KdNode& nd) {
+        return pos[0] >= nd.bmin[0] && pos[0] <= nd.bmax[0]
+            && pos[1] >= nd.bmin[1] && pos[1] <= nd.bmax[1]
+            && pos[2] >= nd.bmin[2] && pos[2] <= nd.bmax[2];
+    };
+
+    int node_id = 0;
+    while (node_id >= 0 && node_id < static_cast<int>(g->nodes.size())) {
+        const KdNode& nd = g->nodes[static_cast<size_t>(node_id)];
+        if (!in_aabb(nd)) return SK_OK;
+        if (nd.child_lo < 0 || nd.child_hi < 0) {
+            const int lx = std::max(1, nd.leaf_dims[0]);
+            const int ly = std::max(1, nd.leaf_dims[1]);
+            const int lz = std::max(1, nd.leaf_dims[2]);
+            const float sx = std::max(1.0e-12f, nd.bmax[0] - nd.bmin[0]);
+            const float sy = std::max(1.0e-12f, nd.bmax[1] - nd.bmin[1]);
+            const float sz = std::max(1.0e-12f, nd.bmax[2] - nd.bmin[2]);
+
+            float ux = (pos[0] - nd.bmin[0]) / sx * (lx - 1);
+            float uy = (pos[1] - nd.bmin[1]) / sy * (ly - 1);
+            float uz = (pos[2] - nd.bmin[2]) / sz * (lz - 1);
+            if (ux < 0.f || uy < 0.f || uz < 0.f || ux >= lx || uy >= ly || uz >= lz)
+                return SK_OK;
+
+            int x0 = static_cast<int>(ux), x1 = (x0 + 1 < lx) ? x0 + 1 : x0;
+            int y0 = static_cast<int>(uy), y1 = (y0 + 1 < ly) ? y0 + 1 : y0;
+            int z0 = static_cast<int>(uz), z1 = (z0 + 1 < lz) ? z0 + 1 : z0;
+            float fx = ux - x0, fy = uy - y0, fz = uz - z0;
+
+            cd32 amp(amp_re, amp_im);
+            auto add_leaf = [&](int x, int y, int z, float w) {
+                if (w <= 0.f) return;
+                int64_t local = (static_cast<int64_t>(z) * ly + y) * lx + x;
+                int64_t cell = nd.first_data + local;
+                g->data[static_cast<int64_t>(band) * g->n_cells_total + cell] += amp * w;
+            };
+
+            add_leaf(x0, y0, z0, (1 - fx) * (1 - fy) * (1 - fz));
+            add_leaf(x1, y0, z0,      fx  * (1 - fy) * (1 - fz));
+            add_leaf(x0, y1, z0, (1 - fx) *     fy  * (1 - fz));
+            add_leaf(x1, y1, z0,      fx  *     fy  * (1 - fz));
+            add_leaf(x0, y0, z1, (1 - fx) * (1 - fy) *     fz );
+            add_leaf(x1, y0, z1,      fx  * (1 - fy) *     fz );
+            add_leaf(x0, y1, z1, (1 - fx) *     fy  *     fz );
+            add_leaf(x1, y1, z1,      fx  *     fy  *     fz );
+            return SK_OK;
+        }
+
+        int lo = nd.child_lo;
+        int hi = nd.child_hi;
+        bool in_lo = (lo >= 0 && lo < static_cast<int>(g->nodes.size()))
+                  ? in_aabb(g->nodes[static_cast<size_t>(lo)]) : false;
+        bool in_hi = (hi >= 0 && hi < static_cast<int>(g->nodes.size()))
+                  ? in_aabb(g->nodes[static_cast<size_t>(hi)]) : false;
+
+        if (in_lo && !in_hi) node_id = lo;
+        else if (in_hi && !in_lo) node_id = hi;
+        else if (in_lo) node_id = lo;
+        else return SK_OK;
+    }
+    return SK_OK;
+}

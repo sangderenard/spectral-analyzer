@@ -53,6 +53,47 @@ def _norm3(v: np.ndarray) -> np.ndarray:
     return v / np.where(n > 1e-15, n, 1.0)
 
 
+def _sample_uniform_sphere_cap(axis: np.ndarray,
+                               cos_theta_min: float,
+                               n_samples: int,
+                               rng: np.random.Generator) -> np.ndarray:
+    """Sample unit directions uniformly inside a cone around *axis*.
+
+    Parameters
+    ----------
+    axis          : (3,) unit vector — cone centreline
+    cos_theta_min : cos(half-angle), clamped to [-1, 1]
+    n_samples     : number of directions to generate
+    """
+    axis = np.asarray(axis, np.float64).ravel()[:3]
+    an = float(np.linalg.norm(axis))
+    if an < 1e-12:
+        axis = np.array([0.0, 0.0, 1.0], np.float64)
+    else:
+        axis = axis / an
+
+    ref = np.array([0.0, 0.0, 1.0], np.float64)
+    if abs(float(np.dot(axis, ref))) > 0.9:
+        ref = np.array([1.0, 0.0, 0.0], np.float64)
+    tx = np.cross(ref, axis)
+    tx /= max(float(np.linalg.norm(tx)), 1e-30)
+    ty = np.cross(axis, tx)
+
+    cmin = float(np.clip(cos_theta_min, -1.0, 1.0))
+    u1 = rng.random(int(n_samples))
+    u2 = rng.random(int(n_samples))
+    cos_t = cmin + (1.0 - cmin) * u1
+    sin_t = np.sqrt(np.maximum(0.0, 1.0 - cos_t * cos_t))
+    phi = 2.0 * math.pi * u2
+
+    dirs = (
+        sin_t[:, None] * np.cos(phi)[:, None] * tx[None, :]
+        + sin_t[:, None] * np.sin(phi)[:, None] * ty[None, :]
+        + cos_t[:, None] * axis[None, :]
+    )
+    return _norm3(dirs)
+
+
 def _sphere_grid(n_lat: int, n_lon: int,
                  radius: float,
                  z_offset: float = 0.0,
@@ -162,6 +203,166 @@ class CameraBack:
     def mesh_verts_uvs(self, subdivisions: int = 32) -> tuple:
         """Return (positions (V,3), uvs (V,2), triangles (T,3)).  Override."""
         raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # Backward-projection site generation (sensor/film cone sweeps)
+
+    def sample_projection_sites(self,
+                                mode: str = "uv",
+                                *,
+                                uv_w: Optional[int] = None,
+                                uv_h: Optional[int] = None,
+                                mesh_subdivisions: int = 32,
+                                sites_per_triangle: int = 1,
+                                seed: int = 0) -> dict:
+        """Generate projection sites on the back surface.
+
+        mode
+        ----
+        "uv"        : regular pixel-centre UV lattice (default)
+        "triangle"  : sample sites from triangulated surface geometry
+
+        Returns
+        -------
+        dict with keys:
+          origins : (N,3) float64 sensor/film surface points
+          axes    : (N,3) float64 nominal outward ray directions
+          uvs     : (N,2) float64 in [0,1] when available, else nearest UV
+          site_id : (N,)  int32 stable site IDs
+          mode    : str
+        """
+        rng = np.random.default_rng(int(seed))
+        m = str(mode).strip().lower()
+
+        if m == "uv":
+            w = max(1, int(uv_w if uv_w is not None else self.res_w))
+            h = max(1, int(uv_h if uv_h is not None else self.res_h))
+            u = (np.arange(w, dtype=np.float64) + 0.5) / float(w)
+            v = (np.arange(h, dtype=np.float64) + 0.5) / float(h)
+            uu, vv = np.meshgrid(u, v)
+            uvs = np.stack([uu.ravel(), vv.ravel()], axis=1)
+            origins = self.uv_to_position(uvs)
+            axes = self.uv_to_ray_dir(uvs)
+            site_id = np.arange(len(uvs), dtype=np.int32)
+            return {
+                "origins": np.ascontiguousarray(origins, np.float64),
+                "axes": np.ascontiguousarray(axes, np.float64),
+                "uvs": np.ascontiguousarray(uvs, np.float64),
+                "site_id": np.ascontiguousarray(site_id, np.int32),
+                "mode": "uv",
+            }
+
+        if m == "triangle":
+            pos, tri_uvs, tris = self.mesh_verts_uvs(max(1, int(mesh_subdivisions)))
+            if len(tris) == 0:
+                return {
+                    "origins": np.zeros((0, 3), np.float64),
+                    "axes": np.zeros((0, 3), np.float64),
+                    "uvs": np.zeros((0, 2), np.float64),
+                    "site_id": np.zeros((0,), np.int32),
+                    "mode": "triangle",
+                }
+
+            spp = max(1, int(sites_per_triangle))
+            tri_pos = pos[tris]      # (T,3,3)
+            tri_uv = tri_uvs[tris]   # (T,3,2)
+            origins_l = []
+            uvs_l = []
+            for t_idx in range(len(tris)):
+                p0, p1, p2 = tri_pos[t_idx]
+                uv0, uv1, uv2 = tri_uv[t_idx]
+                for _ in range(spp):
+                    r1 = float(rng.random())
+                    r2 = float(rng.random())
+                    sr1 = math.sqrt(max(r1, 0.0))
+                    b0 = 1.0 - sr1
+                    b1 = sr1 * (1.0 - r2)
+                    b2 = sr1 * r2
+                    origins_l.append(b0 * p0 + b1 * p1 + b2 * p2)
+                    uvs_l.append(b0 * uv0 + b1 * uv1 + b2 * uv2)
+
+            origins = np.asarray(origins_l, np.float64)
+            uvs = np.asarray(uvs_l, np.float64)
+            axes = self.uv_to_ray_dir(uvs)
+            site_id = np.arange(len(origins), dtype=np.int32)
+            return {
+                "origins": np.ascontiguousarray(origins, np.float64),
+                "axes": np.ascontiguousarray(axes, np.float64),
+                "uvs": np.ascontiguousarray(uvs, np.float64),
+                "site_id": np.ascontiguousarray(site_id, np.int32),
+                "mode": "triangle",
+            }
+
+        raise ValueError("sample_projection_sites: mode must be 'uv' or 'triangle'.")
+
+    def build_backward_cone_bundle(self,
+                                   mode: str = "uv",
+                                   *,
+                                   rays_per_site: int = 1,
+                                   cone_half_angle_deg: float = 0.0,
+                                   uv_w: Optional[int] = None,
+                                   uv_h: Optional[int] = None,
+                                   mesh_subdivisions: int = 32,
+                                   sites_per_triangle: int = 1,
+                                   seed: int = 0) -> dict:
+        """Build backward-projection rays from this sensor/film surface.
+
+        This is a thin-lens-compatible geometric first step: each site emits
+        a cone of rays around its nominal back-cast axis.
+
+        Returns
+        -------
+        dict with:
+          origins   : (N,3) float64
+          dirs      : (N,3) float64
+          site_id   : (N,)  int32
+          site_uv   : (N,2) float64
+          site_mode : str
+        """
+        sites = self.sample_projection_sites(
+            mode,
+            uv_w=uv_w,
+            uv_h=uv_h,
+            mesh_subdivisions=mesh_subdivisions,
+            sites_per_triangle=sites_per_triangle,
+            seed=seed,
+        )
+        origins0 = np.asarray(sites["origins"], np.float64)
+        axes0 = np.asarray(sites["axes"], np.float64)
+        uv0 = np.asarray(sites["uvs"], np.float64)
+        sid0 = np.asarray(sites["site_id"], np.int32)
+
+        if len(origins0) == 0:
+            return {
+                "origins": np.zeros((0, 3), np.float64),
+                "dirs": np.zeros((0, 3), np.float64),
+                "site_id": np.zeros((0,), np.int32),
+                "site_uv": np.zeros((0, 2), np.float64),
+                "site_mode": str(sites.get("mode", mode)),
+            }
+
+        rps = max(1, int(rays_per_site))
+        half = max(0.0, float(cone_half_angle_deg))
+        cos_min = math.cos(math.radians(half))
+        rng = np.random.default_rng(int(seed) ^ 0x9E3779B1)
+
+        origins = np.repeat(origins0, rps, axis=0)
+        site_id = np.repeat(sid0, rps, axis=0)
+        site_uv = np.repeat(uv0, rps, axis=0)
+        dirs = np.empty((origins.shape[0], 3), np.float64)
+        w = 0
+        for axis in axes0:
+            d = _sample_uniform_sphere_cap(axis, cos_min, rps, rng)
+            dirs[w:w + rps, :] = d
+            w += rps
+
+        return {
+            "origins": np.ascontiguousarray(origins, np.float64),
+            "dirs": np.ascontiguousarray(dirs, np.float64),
+            "site_id": np.ascontiguousarray(site_id, np.int32),
+            "site_uv": np.ascontiguousarray(site_uv, np.float64),
+            "site_mode": str(sites.get("mode", mode)),
+        }
 
     # ------------------------------------------------------------------
     # Accumulation

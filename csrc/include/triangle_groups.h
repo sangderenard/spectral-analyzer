@@ -53,6 +53,18 @@ extern "C" {
 #define TRI_GROUP_SAMPLE_POWER         2  /* power × area weighted              */
 #define TRI_GROUP_SAMPLE_PIXEL_CONE    3  /* SENSOR-only: per-pixel cone scan   */
 
+/* Optional per-group parametric surface model.
+ * NONE      : use triangle geometry as-is.
+ * POLY_BARY : scalar displacement along the triangle normal using a
+ *             polynomial in barycentric (u,v) coordinates.
+ * Payload format (float64[6]):
+ *   [0]=c0, [1]=cu, [2]=cv, [3]=cuu, [4]=cuv, [5]=cvv
+ * with
+ *   delta(u,v) = c0 + cu*u + cv*v + cuu*u*u + cuv*u*v + cvv*v*v
+ */
+#define TRI_PARAM_SURFACE_NONE       0
+#define TRI_PARAM_SURFACE_POLY_BARY  1
+
 /**
  * Camera sensor descriptor (used when sample_policy == PIXEL_CONE).
  *
@@ -115,6 +127,9 @@ typedef struct {
     int       n_power_bands;     /* length of power_W_per_band; 0 = none     */
     const float*    power_W_per_band; /* (n_power_bands,) optional spectrum  */
     const CameraSensorDesc* sensor_camera; /* SENSOR + PIXEL_CONE only       */
+    int       parametric_surface_kind;   /* TRI_PARAM_SURFACE_*              */
+    int       parametric_payload_bytes;  /* byte size of payload             */
+    const void* parametric_payload;      /* optional coeff payload           */
 } TriGroupDesc;
 
 /* Registrar / accessors (state-mutating side opaquely declared in ray_tracer.h). */

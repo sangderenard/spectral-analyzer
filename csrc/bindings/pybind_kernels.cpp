@@ -25,6 +25,7 @@
 #include "emitter_angle_kernel.h"
 #include "tile_overlap.h"
 #include "player_clip.h"
+#include "surface_spline.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <cstdint>
@@ -460,6 +461,10 @@ struct PyRayTracer
     RayTracerState* handle  = nullptr;
     int             _n_bands = 0;
     int             _n_tris  = 0;
+    int             _camera_vis_mode = RT_CAM_VIS_AS_IS;
+    int             _transparent_mode = RT_CAM_TRANSPARENCY_BLOCK;
+    bool            _depth_cull_enabled = false;
+    double          _depth_cull_m = 0.0;
 
     PyRayTracer(int                     n_tri,
                 py::array_t<double>     verts,
@@ -873,6 +878,198 @@ struct PyRayTracer
             throw std::runtime_error(
                 "ray_tracer_trace_integrate_image failed: rc=" + std::to_string(rc));
         return n_written;
+    }
+
+    void set_camera_visibility(
+        int camera_vis_mode = RT_CAM_VIS_AS_IS,
+        int transparent_mode = RT_CAM_TRANSPARENCY_BLOCK,
+        bool depth_cull_enabled = false,
+        double depth_cull_m = 0.0)
+    {
+        int rc = ray_tracer_set_camera_visibility(
+            handle,
+            camera_vis_mode,
+            transparent_mode,
+            depth_cull_enabled ? 1 : 0,
+            depth_cull_m);
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "ray_tracer_set_camera_visibility failed: rc=" + std::to_string(rc));
+
+        _camera_vis_mode = camera_vis_mode;
+        _transparent_mode = transparent_mode;
+        _depth_cull_enabled = depth_cull_enabled;
+        _depth_cull_m = depth_cull_m;
+    }
+
+    py::dict get_camera_visibility() const
+    {
+        py::dict d;
+        d["camera_vis_mode"] = py::int_(_camera_vis_mode);
+        d["transparent_mode"] = py::int_(_transparent_mode);
+        d["depth_cull_enabled"] = py::bool_(_depth_cull_enabled);
+        d["depth_cull_m"] = py::float_(_depth_cull_m);
+
+        uint64_t steps = 0, entries = 0;
+        if (ray_tracer_get_camera_visibility_stats(handle, &steps, &entries) == SK_OK) {
+            d["full_march_steps"] = py::int_(steps);
+            d["full_march_context_entries"] = py::int_(entries);
+        }
+        return d;
+    }
+
+    void enable_field_capture_regular(
+        int nx, int ny, int nz,
+        py::array_t<float, py::array::c_style> bmin,
+        py::array_t<float, py::array::c_style> bmax,
+        bool capture_strikes = true,
+        int max_strikes = 0,
+        bool clear_existing = true)
+    {
+        auto b0 = bmin.request();
+        auto b1 = bmax.request();
+        if (b0.ndim != 1 || b0.shape[0] != 3 || b1.ndim != 1 || b1.shape[0] != 3)
+            throw std::runtime_error("bmin/bmax must be float32 shape (3,)");
+
+        FieldGrid* g = field_grid_create_regular(
+            _n_bands, nx, ny, nz,
+            static_cast<const float*>(b0.ptr),
+            static_cast<const float*>(b1.ptr));
+        if (!g)
+            throw std::runtime_error("field_grid_create_regular failed");
+
+        int rc = ray_tracer_set_field_capture_grid(
+            handle, g, 1,
+            capture_strikes ? 1 : 0,
+            max_strikes,
+            clear_existing ? 1 : 0);
+        if (rc != SK_OK) {
+            field_grid_destroy(g);
+            throw std::runtime_error("ray_tracer_set_field_capture_grid failed: rc=" + std::to_string(rc));
+        }
+    }
+
+    void enable_field_capture_kdtree(
+        py::list nodes,
+        bool capture_strikes = true,
+        int max_strikes = 0,
+        bool clear_existing = true)
+    {
+        std::vector<KdNode> kd;
+        kd.reserve(py::len(nodes));
+        for (py::handle h : nodes) {
+            py::dict d = py::reinterpret_borrow<py::dict>(h);
+            KdNode n{};
+
+            auto bm = d["bmin"].cast<py::array_t<float, py::array::c_style>>().unchecked<1>();
+            auto bx = d["bmax"].cast<py::array_t<float, py::array::c_style>>().unchecked<1>();
+            auto ld = d["leaf_dims"].cast<py::array_t<int32_t, py::array::c_style>>().unchecked<1>();
+            for (int i = 0; i < 3; ++i) {
+                n.bmin[i] = bm(i);
+                n.bmax[i] = bx(i);
+                n.leaf_dims[i] = ld(i);
+            }
+            n.child_lo = d.contains("child_lo") ? d["child_lo"].cast<int32_t>() : -1;
+            n.child_hi = d.contains("child_hi") ? d["child_hi"].cast<int32_t>() : -1;
+            n.split_axis = d.contains("split_axis") ? d["split_axis"].cast<int32_t>() : -1;
+            n.split_pos = d.contains("split_pos") ? d["split_pos"].cast<float>() : 0.0f;
+            n.first_data = d.contains("first_data") ? d["first_data"].cast<int64_t>() : -1;
+            kd.push_back(n);
+        }
+
+        FieldGrid* g = field_grid_create_kdtree(
+            _n_bands,
+            kd.empty() ? nullptr : kd.data(),
+            static_cast<int>(kd.size()));
+        if (!g)
+            throw std::runtime_error("field_grid_create_kdtree failed");
+
+        int rc = ray_tracer_set_field_capture_grid(
+            handle, g, 1,
+            capture_strikes ? 1 : 0,
+            max_strikes,
+            clear_existing ? 1 : 0);
+        if (rc != SK_OK) {
+            field_grid_destroy(g);
+            throw std::runtime_error("ray_tracer_set_field_capture_grid failed: rc=" + std::to_string(rc));
+        }
+    }
+
+    void clear_field_capture(bool clear_grid = true, bool clear_strikes = true)
+    {
+        int rc = ray_tracer_clear_field_capture(
+            handle,
+            clear_grid ? 1 : 0,
+            clear_strikes ? 1 : 0);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_clear_field_capture failed: rc=" + std::to_string(rc));
+    }
+
+    py::dict get_field_capture_meta() const
+    {
+        int grid_kind = -1, n_bands = 0, stride = 0, n_strikes = 0;
+        int64_t n_cells = 0;
+        int rc = ray_tracer_get_field_capture_layout(
+            handle, &grid_kind, &n_bands, &n_cells, &stride, &n_strikes);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_get_field_capture_layout failed: rc=" + std::to_string(rc));
+
+        py::dict d;
+        d["grid_kind"] = py::int_(grid_kind);
+        d["n_bands"] = py::int_(n_bands);
+        d["n_cells"] = py::int_(n_cells);
+        d["strike_stride_floats"] = py::int_(stride);
+        d["n_strikes"] = py::int_(n_strikes);
+        return d;
+    }
+
+    py::array_t<float> get_field_capture_grid_reim() const
+    {
+        int grid_kind = -1, n_bands = 0, stride = 0, n_strikes = 0;
+        int64_t n_cells = 0;
+        int rc = ray_tracer_get_field_capture_layout(
+            handle, &grid_kind, &n_bands, &n_cells, &stride, &n_strikes);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_get_field_capture_layout failed: rc=" + std::to_string(rc));
+        if (grid_kind < 0)
+            throw std::runtime_error("no field capture grid bound");
+
+        py::array_t<float> out({n_bands, (int)n_cells, 2});
+        rc = ray_tracer_copy_field_capture_grid_reim(
+            handle,
+            static_cast<float*>(out.request().ptr),
+            static_cast<int64_t>(out.size()));
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_copy_field_capture_grid_reim failed: rc=" + std::to_string(rc));
+        return out;
+    }
+
+    py::array_t<float> get_field_capture_strikes() const
+    {
+        int grid_kind = -1, n_bands = 0, stride = 0, n_strikes = 0;
+        int64_t n_cells = 0;
+        int rc = ray_tracer_get_field_capture_layout(
+            handle, &grid_kind, &n_bands, &n_cells, &stride, &n_strikes);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_get_field_capture_layout failed: rc=" + std::to_string(rc));
+
+        py::array_t<float> out({n_strikes, std::max(1, stride)});
+        int written = 0;
+        rc = ray_tracer_copy_field_capture_strikes(
+            handle,
+            static_cast<float*>(out.request().ptr),
+            n_strikes,
+            &written);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_copy_field_capture_strikes failed: rc=" + std::to_string(rc));
+        if (written == n_strikes) return out;
+
+        py::array_t<float> trimmed({written, std::max(1, stride)});
+        if (written > 0) {
+            std::memcpy(trimmed.request().ptr, out.request().ptr,
+                        static_cast<size_t>(written) * stride * sizeof(float));
+        }
+        return trimmed;
     }
 
     /* ── Scale context API ───────────────────────────────────────────────── */
@@ -2855,6 +3052,47 @@ out_image is accumulated in place. out_segs is a reusable float32
 (capacity, 12) segment buffer; if it fills, integration continues and the
 return value reports how many segment records were written.
 )doc")
+                .def("set_camera_visibility", &PyRayTracer::set_camera_visibility,
+                         py::arg("camera_vis_mode") = RT_CAM_VIS_AS_IS,
+                         py::arg("transparent_mode") = RT_CAM_TRANSPARENCY_BLOCK,
+                         py::arg("depth_cull_enabled") = false,
+                         py::arg("depth_cull_m") = 0.0,
+                         R"doc(
+Configure camera-visibility wrappers used by image accumulation APIs.
+
+camera_vis_mode:
+    RT_CAM_VIS_AS_IS       -> no camera LOS culling (legacy behaviour)
+    RT_CAM_VIS_DIRECT_HIT  -> one-shot cam->hit occlusion check
+    RT_CAM_VIS_FULL_MARCH  -> iterative march through transparent media
+
+transparent_mode:
+    RT_CAM_TRANSPARENCY_BLOCK -> transparent triangles still block LOS
+    RT_CAM_TRANSPARENCY_XRAY  -> transmissive triangles are skipped in LOS
+)doc")
+                .def("get_camera_visibility", &PyRayTracer::get_camera_visibility,
+                         "Return current camera visibility policy as a dict.")
+                .def("enable_field_capture_regular", &PyRayTracer::enable_field_capture_regular,
+                         py::arg("nx"),
+                         py::arg("ny"),
+                         py::arg("nz"),
+                         py::arg("bmin"),
+                         py::arg("bmax"),
+                         py::arg("capture_strikes") = true,
+                         py::arg("max_strikes") = 0,
+                         py::arg("clear_existing") = true,
+                         "Bind a regular FieldGrid capture target for full complex spectral accumulation.")
+                .def("enable_field_capture_kdtree", &PyRayTracer::enable_field_capture_kdtree,
+                         py::arg("nodes"),
+                         py::arg("capture_strikes") = true,
+                         py::arg("max_strikes") = 0,
+                         py::arg("clear_existing") = true,
+                         "Bind a KdTree FieldGrid capture target for full complex spectral accumulation.")
+                .def("clear_field_capture", &PyRayTracer::clear_field_capture,
+                         py::arg("clear_grid") = true,
+                         py::arg("clear_strikes") = true)
+                .def("get_field_capture_meta", &PyRayTracer::get_field_capture_meta)
+                .def("get_field_capture_grid_reim", &PyRayTracer::get_field_capture_grid_reim)
+                .def("get_field_capture_strikes", &PyRayTracer::get_field_capture_strikes)
         .def_property_readonly("n_bands", &PyRayTracer::n_bands)
         .def_property_readonly("n_tris",  &PyRayTracer::n_tris,
              "Number of triangles in the scene.")
@@ -3119,6 +3357,7 @@ Returns : (n_written, n_live) — segments written and rays still alive
                 double custom_emit_W,
                 int default_mat_idx,
                 py::object power_W_per_band,
+            py::object parametric_surface,
                 py::object sensor_camera) {
                  auto buf = tri_indices.request();
                  if (buf.ndim != 1)
@@ -3154,6 +3393,25 @@ Returns : (n_written, n_live) — segments written and rays still alive
                          throw std::runtime_error("power_W_per_band must be 1-D float32");
                      desc.n_power_bands    = (int)pwb.shape[0];
                      desc.power_W_per_band = static_cast<const float*>(pwb.ptr);
+                 }
+
+                 /* Optional parametric surface payload.
+                  * Expected dict: {"kind": int, "coeffs": float64[6]} for
+                  * TRI_PARAM_SURFACE_POLY_BARY. */
+                 py::array_t<double, py::array::c_style | py::array::forcecast> param_arr;
+                 if (!parametric_surface.is_none()) {
+                     py::dict d = parametric_surface.cast<py::dict>();
+                     desc.parametric_surface_kind =
+                         d.contains("kind") ? d["kind"].cast<int>() : TRI_PARAM_SURFACE_NONE;
+                     if (d.contains("coeffs") && desc.parametric_surface_kind != TRI_PARAM_SURFACE_NONE) {
+                         param_arr = d["coeffs"].cast<
+                             py::array_t<double, py::array::c_style | py::array::forcecast>>();
+                         auto pa = param_arr.request();
+                         if (pa.ndim != 1)
+                             throw std::runtime_error("parametric_surface.coeffs must be 1-D float64");
+                         desc.parametric_payload = pa.ptr;
+                         desc.parametric_payload_bytes = (int)(pa.size * pa.itemsize);
+                     }
                  }
 
                  /* Optional CameraSensorDesc dict.  Lifetime: the
@@ -3196,6 +3454,7 @@ Returns : (n_written, n_live) — segments written and rays still alive
              py::arg("custom_emit_W") = 0.0,
              py::arg("default_mat_idx") = -1,
              py::arg("power_W_per_band") = py::none(),
+             py::arg("parametric_surface") = py::none(),
              py::arg("sensor_camera") = py::none(),
              R"doc(
 Register a triangle group for the bidirectional integrator.
@@ -3212,6 +3471,11 @@ default_mat_idx  : per-group fallback material index (-1 = derive from
 power_W_per_band : optional float32 (n_bands,) per-band emission spectrum
                    override.  None = use mat_buf emission row.  This is the
                    ONLY emission-curve fallback path — no PBR.
+parametric_surface: optional dict for strike/emission parametric override.
+                                     Supported now:
+                                         {"kind": TRI_PARAM_SURFACE_POLY_BARY,
+                                            "coeffs": float64[6]} where coeffs define normal-offset
+                                            polynomial in barycentric (u,v).
 sensor_camera    : optional dict for SENSOR + PIXEL_CONE groups, with keys
                    pos (3,), fwd (3,), up (3,), sensor_w_m, sensor_h_m,
                    focal_m, aperture_radius_m, n_px, n_py,
@@ -3713,6 +3977,11 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     /* Multiscale scale-type constants */
     m.attr("RT_SCALE_GEOMETRIC") = (int)RT_SCALE_GEOMETRIC;
     m.attr("RT_SCALE_WAVE")      = (int)RT_SCALE_WAVE;
+    m.attr("RT_CAM_VIS_AS_IS") = (int)RT_CAM_VIS_AS_IS;
+    m.attr("RT_CAM_VIS_DIRECT_HIT") = (int)RT_CAM_VIS_DIRECT_HIT;
+    m.attr("RT_CAM_VIS_FULL_MARCH") = (int)RT_CAM_VIS_FULL_MARCH;
+    m.attr("RT_CAM_TRANSPARENCY_BLOCK") = (int)RT_CAM_TRANSPARENCY_BLOCK;
+    m.attr("RT_CAM_TRANSPARENCY_XRAY") = (int)RT_CAM_TRANSPARENCY_XRAY;
     /* Scale-context KIND dispatch enum (mirrors GLSL ScaleContext SSBO).
      * Used by RayTracer.add_scale_context(context_kind=...). */
     m.attr("SCALE_CONTEXT_KIND_RAY")                 = (int)SCALE_CONTEXT_KIND_RAY;
@@ -3731,6 +4000,112 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("TRI_GROUP_SAMPLE_AREA")       = (int)TRI_GROUP_SAMPLE_AREA;
     m.attr("TRI_GROUP_SAMPLE_POWER")      = (int)TRI_GROUP_SAMPLE_POWER;
     m.attr("TRI_GROUP_SAMPLE_PIXEL_CONE") = (int)TRI_GROUP_SAMPLE_PIXEL_CONE;
+    m.attr("TRI_PARAM_SURFACE_NONE")      = (int)TRI_PARAM_SURFACE_NONE;
+    m.attr("TRI_PARAM_SURFACE_POLY_BARY") = (int)TRI_PARAM_SURFACE_POLY_BARY;
+
+    /* ── Surface spline fitter ──────────────────────────────────────────────── */
+    m.def("surface_spline_fit",
+        [](py::array_t<double, py::array::c_style | py::array::forcecast> verts,
+           py::array_t<int,    py::array::c_style | py::array::forcecast> tris,
+           py::object  tri_subset_obj,
+           double      ridge_lambda,
+           int         n_threads) -> py::array_t<double>
+        {
+            auto vb = verts.request();
+            auto tb = tris.request();
+            if (vb.ndim != 2 || vb.shape[1] != 3)
+                throw std::runtime_error("surface_spline_fit: verts must be (N,3) float64");
+            if (tb.ndim != 2 || tb.shape[1] != 3)
+                throw std::runtime_error("surface_spline_fit: tris must be (T,3) int32");
+
+            int n_verts = static_cast<int>(vb.shape[0]);
+            int n_tris  = static_cast<int>(tb.shape[0]);
+
+            /* Optional subset. */
+            py::array_t<int, py::array::c_style | py::array::forcecast> subset_arr;
+            const int* subset_ptr = nullptr;
+            int n_subset = 0;
+            if (!tri_subset_obj.is_none()) {
+                subset_arr = tri_subset_obj.cast<
+                    py::array_t<int, py::array::c_style | py::array::forcecast>>();
+                auto sb = subset_arr.request();
+                subset_ptr = static_cast<const int*>(sb.ptr);
+                n_subset   = static_cast<int>(sb.size);
+            }
+
+            /* Output: (n_tris, 6) float64. */
+            py::array_t<double> out({n_tris, 6});
+            int rc = surface_spline_fit(
+                n_verts,
+                static_cast<const double*>(vb.ptr),
+                n_tris,
+                static_cast<const int*>(tb.ptr),
+                subset_ptr,
+                n_subset,
+                ridge_lambda,
+                n_threads,
+                static_cast<double*>(out.request().ptr));
+            if (rc != SK_OK)
+                throw std::runtime_error("surface_spline_fit failed: rc=" + std::to_string(rc));
+            return out;
+        },
+        py::arg("verts"),
+        py::arg("tris"),
+        py::arg("tri_subset")    = py::none(),
+        py::arg("ridge_lambda") = 0.0,
+        py::arg("n_threads")    = 0,
+        R"doc(
+Fit per-triangle quadratic POLY_BARY displacement coefficients.
+
+For each triangle, a 1-ring neighbourhood is assembled, centroid positions
+are projected into barycentric frame, and a least-squares quadratic
+displacement polynomial is solved with Eigen.
+
+Parameters
+----------
+verts       : (N, 3) float64 vertex positions.
+tris        : (T, 3) int32  vertex index triples.
+tri_subset  : (K,) int32 or None.  If given, only those T-indices are fitted;
+              remaining rows in the output are zero.
+ridge_lambda: Tikhonov regularisation on curvature terms (default 0 = off).
+n_threads   : worker threads (0 = hardware_concurrency).
+
+Returns
+-------
+(T, 6) float64 — per-triangle [c0, cu, cv, cuu, cuv, cvv].
+Pass row t directly as the ``coeffs`` field of TRI_PARAM_SURFACE_POLY_BARY.
+)doc");
+
+    m.def("surface_spline_eval_normal",
+        [](double u, double v,
+           py::array_t<double, py::array::c_style | py::array::forcecast> coeffs_6,
+           py::array_t<double, py::array::c_style | py::array::forcecast> verts,
+           py::array_t<int,    py::array::c_style | py::array::forcecast> tri_row)
+        -> py::array_t<double>
+        {
+            if (coeffs_6.size() < 6)
+                throw std::runtime_error("coeffs_6 must have 6 elements");
+            if (tri_row.size() < 3)
+                throw std::runtime_error("tri_row must have 3 elements");
+            if (verts.request().ndim < 2)
+                throw std::runtime_error("verts must be (N,3) float64");
+
+            py::array_t<double> out({3});
+            int rc = surface_spline_eval_normal(
+                u, v,
+                static_cast<const double*>(coeffs_6.request().ptr),
+                static_cast<const double*>(verts.request().ptr),
+                static_cast<const int*>(tri_row.request().ptr),
+                static_cast<double*>(out.request().ptr));
+            if (rc != SK_OK)
+                throw std::runtime_error("surface_spline_eval_normal failed");
+            return out;
+        },
+        py::arg("u"), py::arg("v"),
+        py::arg("coeffs_6"),
+        py::arg("verts"),
+        py::arg("tri_row"),
+        "Evaluate the perturbed unit normal at barycentric (u,v) from a POLY_BARY coefficient block.");
 
     m.def("amr_create_progress", []() {
         py::dict d;

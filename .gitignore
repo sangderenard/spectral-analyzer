@@ -18,6 +18,9 @@ Thumbs.db
 *.txt
 *.png
 *.wav
+*.npy
+*.npz
+*summary.json
 .*
 # Environments
 .venv/

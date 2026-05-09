@@ -58,6 +58,19 @@
 #define RT_SCALE_GEOMETRIC    0   /* coarse BVH geometric optics (cm-scale)     */
 #define RT_SCALE_WAVE         1   /* fine wave-optics sub-stepping (µm-scale)   */
 
+/* Camera-visibility policy for image accumulation paths.
+ * AS_IS       : no camera LOS cull (legacy behaviour).
+ * DIRECT_HIT  : one-shot occlusion test on cam->hit segment.
+ * FULL_MARCH  : iterative march through transparent surfaces to find blockers.
+ */
+#define RT_CAM_VIS_AS_IS        0
+#define RT_CAM_VIS_DIRECT_HIT   1
+#define RT_CAM_VIS_FULL_MARCH   2
+
+/* How transparent media participates in camera occlusion checks. */
+#define RT_CAM_TRANSPARENCY_BLOCK 0
+#define RT_CAM_TRANSPARENCY_XRAY  1
+
 /* Scale-context KIND — orthogonal to scale_type, selects the *dispatch path*
  * a ray takes when it enters a region.  RAY (0) is the default and matches
  * legacy behaviour exactly.  Higher kinds hand the ray to specialised
@@ -122,6 +135,7 @@ extern "C" {
 
 /* Opaque tracer state — build once from scene geometry, trace many times. */
 typedef struct RayTracerState RayTracerState;
+typedef struct FieldGrid FieldGrid;
 
 /**
  * Build a ray tracer from a triangulated scene.
@@ -326,6 +340,89 @@ SK_API int ray_tracer_trace_integrate_image(
     float*          out_segs,
     int             out_cap,
     int*            out_count
+);
+
+/**
+ * Configure camera visibility wrappers for image accumulation APIs.
+ *
+ * These options affect ray_tracer_integrate_image() and
+ * ray_tracer_trace_integrate_image() only; bounce transport physics are
+ * unchanged.
+ *
+ * @param camera_vis_mode      RT_CAM_VIS_* policy.
+ * @param transparent_mode     RT_CAM_TRANSPARENCY_* policy.
+ * @param enable_depth_cull    0 disables depth cull, nonzero enables it.
+ * @param depth_cull_m         Positive max camera depth in metres.
+ */
+SK_API int ray_tracer_set_camera_visibility(
+    RayTracerState* st,
+    int             camera_vis_mode,
+    int             transparent_mode,
+    int             enable_depth_cull,
+    double          depth_cull_m
+);
+
+/**
+ * Read full-march field-tracking counters.
+ *
+ * @param out_steps            Number of full-march segment steps evaluated.
+ * @param out_context_entries  Number of scale-context entry hooks evaluated.
+ */
+SK_API int ray_tracer_get_camera_visibility_stats(
+    const RayTracerState* st,
+    uint64_t*             out_steps,
+    uint64_t*             out_context_entries
+);
+
+/**
+ * Bind/unbind a full-complex field capture grid for camera/image tracing.
+ *
+ * When bound, every camera strike can be accumulated as complex spectral data
+ * into the grid before any display reduction.
+ */
+SK_API int ray_tracer_set_field_capture_grid(
+    RayTracerState* st,
+    FieldGrid*      grid,
+    int             take_ownership,
+    int             capture_strikes,
+    int             max_strikes,
+    int             clear_existing
+);
+
+/** Clear field-capture buffers (grid and/or strike rows). */
+SK_API int ray_tracer_clear_field_capture(
+    RayTracerState* st,
+    int             clear_grid,
+    int             clear_strikes
+);
+
+/**
+ * Query field-capture layout.
+ *
+ * strike_stride_floats = 16 + 2*n_bands.
+ */
+SK_API int ray_tracer_get_field_capture_layout(
+    const RayTracerState* st,
+    int*                  out_grid_kind,
+    int*                  out_n_bands,
+    int64_t*              out_n_cells,
+    int*                  out_strike_stride_floats,
+    int*                  out_n_strikes
+);
+
+/** Copy captured complex grid data as interleaved float32 (re,im,...). */
+SK_API int ray_tracer_copy_field_capture_grid_reim(
+    const RayTracerState* st,
+    float*                out_reim,
+    int64_t               out_count
+);
+
+/** Copy captured strike rows (shape: n_rows × strike_stride_floats). */
+SK_API int ray_tracer_copy_field_capture_strikes(
+    const RayTracerState* st,
+    float*                out_rows,
+    int                   out_rows_cap,
+    int*                  out_rows_written
 );
 
 /**

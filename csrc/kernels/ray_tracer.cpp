@@ -47,6 +47,7 @@
 
 #include "ray_tracer.h"
 #include "triangle_groups.h"
+#include "field_grid.h"
 
 #include <Eigen/Dense>
 #include <algorithm>
@@ -233,6 +234,8 @@ static void bvh_query(
     }
 }
 
+/* Camera visibility helpers are defined later, after RayTracerState. */
+
 /* ── Direction sampling ────────────────────────────────────────────────────── */
 
 /* Return the i-th direction from an N-point Fibonacci sphere.
@@ -376,6 +379,24 @@ struct RayTracerState {
      * deep-copied CameraSensorDesc. */
     std::vector<int>                   tri_group_has_camera;
     std::vector<CameraSensorDesc>      tri_group_camera;
+    std::vector<int>                   tri_group_parametric_kind;
+    std::vector<std::vector<uint8_t>>  tri_group_parametric_payload;
+    std::vector<int>                   tri_param_group_of_tri; /* tri_id -> group_id or -1 */
+
+    /* Camera-visibility wrappers for image accumulation entry points. */
+    int                                camera_vis_mode = RT_CAM_VIS_AS_IS;
+    int                                camera_transparency_mode = RT_CAM_TRANSPARENCY_BLOCK;
+    int                                camera_depth_cull_enabled = 0;
+    double                             camera_depth_cull_m = 0.0;
+    uint64_t                           camera_full_march_steps = 0;
+    uint64_t                           camera_full_march_context_entries = 0;
+
+    FieldGrid*                         camera_field_grid = nullptr;
+    int                                camera_field_grid_owned = 0;
+    int                                camera_capture_strikes = 0;
+    int                                camera_capture_max_strikes = 0;
+    int                                camera_strike_stride_floats = 0;
+    std::vector<float>                 camera_strike_rows;
 };
 
 /* ── MatBuf accessors ─────────────────────────────────────────────────────────
@@ -478,6 +499,269 @@ static inline void apply_reactive_shift(
     }
     for (int b = 0; b < nb; ++b)
         amp[b] = amp[b] * (1.0 - y) + shifted[b];
+}
+
+/* Forward declaration for context-dispatch hook used by full-march tracking. */
+static inline uint32_t dispatch_scale_context_entry(
+    const RayTracerState& st,
+    const RtScaleContext& ctx,
+    V3d& pos, V3d& dir, VXcd& amp);
+
+static inline bool tri_bary_uv(const Triangle& tri, const V3d& p,
+                               double& u, double& v)
+{
+    V3d q = p - tri.v0;
+    double d00 = tri.edge1.dot(tri.edge1);
+    double d01 = tri.edge1.dot(tri.edge2);
+    double d11 = tri.edge2.dot(tri.edge2);
+    double d20 = q.dot(tri.edge1);
+    double d21 = q.dot(tri.edge2);
+    double den = d00 * d11 - d01 * d01;
+    if (std::abs(den) <= EPS) {
+        u = 0.0; v = 0.0;
+        return false;
+    }
+    u = (d11 * d20 - d01 * d21) / den;
+    v = (d00 * d21 - d01 * d20) / den;
+    return true;
+}
+
+static inline bool apply_parametric_surface_point(
+    const RayTracerState& st,
+    int tri_id,
+    const V3d& hit_pos,
+    V3d& out_pos,
+    V3d& out_normal)
+{
+    out_pos = hit_pos;
+    if (tri_id < 0 || tri_id >= static_cast<int>(st.tris.size()))
+        return false;
+
+    const Triangle& tri = st.tris[static_cast<size_t>(tri_id)];
+    out_normal = tri.normal;
+
+    if (tri_id >= static_cast<int>(st.tri_param_group_of_tri.size()))
+        return false;
+    int gid = st.tri_param_group_of_tri[static_cast<size_t>(tri_id)];
+    if (gid < 0 || gid >= static_cast<int>(st.tri_group_parametric_kind.size()))
+        return false;
+
+    int kind = st.tri_group_parametric_kind[static_cast<size_t>(gid)];
+    if (kind != TRI_PARAM_SURFACE_POLY_BARY)
+        return false;
+
+    const auto& payload = st.tri_group_parametric_payload[static_cast<size_t>(gid)];
+    if (payload.size() < sizeof(double) * 6)
+        return false;
+
+    const double* c = reinterpret_cast<const double*>(payload.data());
+    double u = 0.0, v = 0.0;
+    tri_bary_uv(tri, hit_pos, u, v);
+
+    const double delta = c[0] + c[1] * u + c[2] * v
+                       + c[3] * u * u + c[4] * u * v + c[5] * v * v;
+
+    const V3d t1 = tri.edge1.normalized();
+    const V3d t2 = tri.edge2.normalized();
+    const double dzdu = c[1] + 2.0 * c[3] * u + c[4] * v;
+    const double dzdv = c[2] + c[4] * u + 2.0 * c[5] * v;
+
+    V3d warped_n = (tri.normal - dzdu * t1 - dzdv * t2).normalized();
+    if (warped_n.norm() < EPS)
+        warped_n = tri.normal;
+
+    out_normal = warped_n;
+    out_pos = hit_pos + warped_n * delta;
+    return true;
+}
+
+static bool tri_is_transmissive(const RayTracerState& st, int tri_id)
+{
+    if (tri_id < 0 || tri_id >= static_cast<int>(st.tris.size()))
+        return false;
+    return (st.tris[static_cast<size_t>(tri_id)].flags & MAT_FLAG_TRANSMISSIVE) != 0;
+}
+
+static bool segment_first_hit(
+    const RayTracerState& st,
+    const V3d& orig,
+    const V3d& dir,
+    double t_cap,
+    double& t_hit,
+    int& hit_tri)
+{
+    t_hit = t_cap;
+    hit_tri = -1;
+
+    if (!st.bvh_nodes.empty()) {
+        V3d inv_dir = dir.cwiseInverse();
+        bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
+                  orig, dir, inv_dir, t_hit, hit_tri);
+    } else {
+        for (size_t ti = 0; ti < st.tris.size(); ++ti) {
+            double t;
+            if (ray_triangle_hit(orig, dir, st.tris[ti], t) && t < t_hit) {
+                t_hit = t;
+                hit_tri = static_cast<int>(ti);
+            }
+        }
+    }
+    return hit_tri >= 0;
+}
+
+/* Camera visibility test for image accumulation.
+ * Policy is controlled by RayTracerState::camera_vis_mode and related fields. */
+static bool camera_visible_to_point(
+    RayTracerState& st,
+    const V3d& cam_pos,
+    const V3d& surf_pos)
+{
+    if (st.camera_vis_mode == RT_CAM_VIS_AS_IS)
+        return true;
+
+    V3d to = surf_pos - cam_pos;
+    double dist = to.norm();
+    if (dist <= EPS * 200.0)
+        return true;
+
+    V3d dir = to / dist;
+    V3d orig = cam_pos + dir * (EPS * 100.0);
+    double t_cap = dist - (EPS * 200.0);
+    if (t_cap <= EPS)
+        return true;
+
+    if (st.camera_vis_mode == RT_CAM_VIS_DIRECT_HIT) {
+        double t_hit = t_cap;
+        int hit_tri = -1;
+        if (!segment_first_hit(st, orig, dir, t_cap, t_hit, hit_tri))
+            return true;
+        if (st.camera_transparency_mode == RT_CAM_TRANSPARENCY_XRAY
+            && tri_is_transmissive(st, hit_tri))
+            return true;
+        return false;
+    }
+
+    if (st.camera_vis_mode == RT_CAM_VIS_FULL_MARCH) {
+        static constexpr int MAX_MARCH_STEPS = 256;
+        double remain = t_cap;
+        V3d cur = orig;
+        for (int step = 0; step < MAX_MARCH_STEPS && remain > EPS; ++step) {
+            st.camera_full_march_steps++;
+
+            double t_hit = remain;
+            int hit_tri = -1;
+            if (!segment_first_hit(st, cur, dir, remain, t_hit, hit_tri))
+                return true;
+
+            V3d hit_pos = cur + t_hit * dir;
+            V3d hit_n = st.tris[static_cast<size_t>(hit_tri)].normal;
+            apply_parametric_surface_point(st, hit_tri, hit_pos, hit_pos, hit_n);
+
+            if (st.camera_field_grid) {
+                float p[3] = {
+                    static_cast<float>(hit_pos.x()),
+                    static_cast<float>(hit_pos.y()),
+                    static_cast<float>(hit_pos.z())
+                };
+                for (int b = 0; b < st.n_bands; ++b) {
+                    (void)field_grid_inject_amplitude(st.camera_field_grid, b, p, 1.0f, 0.0f);
+                }
+            }
+
+            VXcd track_amp(1);
+            track_amp[0] = cd(1.0, 0.0);
+            for (const RtScaleContext& ctx : st.scale_contexts) {
+                V3d ctr(ctx.center[0], ctx.center[1], ctx.center[2]);
+                if ((hit_pos - ctr).squaredNorm() <= ctx.radius * ctx.radius) {
+                    V3d p = hit_pos;
+                    V3d d = dir;
+                    (void)dispatch_scale_context_entry(st, ctx, p, d, track_amp);
+                    st.camera_full_march_context_entries++;
+                }
+            }
+
+            bool transparent = (st.camera_transparency_mode == RT_CAM_TRANSPARENCY_XRAY)
+                            && tri_is_transmissive(st, hit_tri);
+            if (!transparent)
+                return false;
+
+            const double advance = std::max(EPS * 200.0, (hit_pos - cur).norm() + EPS * 200.0);
+            cur += dir * advance;
+            remain -= std::min(remain, advance);
+        }
+        return remain <= EPS;
+    }
+
+    return true;
+}
+
+static inline void append_camera_strike(
+    RayTracerState& st,
+    int src_id,
+    int bounce,
+    int tri_id,
+    const V3d& pos,
+    const V3d& normal,
+    const V3d& incoming_dir,
+    double depth,
+    double total_path,
+    int visible,
+    int context_entries,
+    const VXcd& amp_prop)
+{
+    if (!st.camera_capture_strikes) return;
+    if (st.camera_strike_stride_floats <= 0)
+        st.camera_strike_stride_floats = 16 + 2 * st.n_bands;
+
+    const int stride = st.camera_strike_stride_floats;
+    const int rows_now = static_cast<int>(st.camera_strike_rows.size() / stride);
+    if (st.camera_capture_max_strikes > 0 && rows_now >= st.camera_capture_max_strikes)
+        return;
+
+    const size_t base = st.camera_strike_rows.size();
+    st.camera_strike_rows.resize(base + static_cast<size_t>(stride), 0.0f);
+    float* row = st.camera_strike_rows.data() + base;
+
+    row[0] = static_cast<float>(pos.x());
+    row[1] = static_cast<float>(pos.y());
+    row[2] = static_cast<float>(pos.z());
+    row[3] = static_cast<float>(normal.x());
+    row[4] = static_cast<float>(normal.y());
+    row[5] = static_cast<float>(normal.z());
+    row[6] = static_cast<float>(incoming_dir.x());
+    row[7] = static_cast<float>(incoming_dir.y());
+    row[8] = static_cast<float>(incoming_dir.z());
+    row[9] = static_cast<float>(tri_id);
+    row[10] = static_cast<float>(src_id);
+    row[11] = static_cast<float>(bounce);
+    row[12] = static_cast<float>(depth);
+    row[13] = static_cast<float>(total_path);
+    row[14] = static_cast<float>(visible);
+    row[15] = static_cast<float>(context_entries);
+
+    for (int b = 0; b < st.n_bands; ++b) {
+        row[16 + 2 * b] = static_cast<float>(amp_prop[b].real());
+        row[16 + 2 * b + 1] = static_cast<float>(amp_prop[b].imag());
+    }
+}
+
+static inline void accumulate_field_capture(
+    RayTracerState& st,
+    const V3d& pos,
+    const VXcd& amp_prop)
+{
+    if (!st.camera_field_grid) return;
+    float p[3] = {
+        static_cast<float>(pos.x()),
+        static_cast<float>(pos.y()),
+        static_cast<float>(pos.z())
+    };
+    for (int b = 0; b < st.n_bands; ++b) {
+        (void)field_grid_inject_amplitude(
+            st.camera_field_grid, b, p,
+            static_cast<float>(amp_prop[b].real()),
+            static_cast<float>(amp_prop[b].imag()));
+    }
 }
 
 /* ── Generic inner ray loop ─────────────────────────────────────────────────── */
@@ -768,6 +1052,7 @@ RayTracerState* ray_tracer_create(
     }
 
     st->tris.resize(static_cast<size_t>(n_tri));
+    st->tri_param_group_of_tri.assign(static_cast<size_t>(n_tri), -1);
     std::vector<AABB> tri_aabbs(static_cast<size_t>(n_tri));
 
     for (int i = 0; i < n_tri; ++i) {
@@ -816,6 +1101,10 @@ RayTracerState* ray_tracer_create(
 
 void ray_tracer_destroy(RayTracerState* st)
 {
+    if (!st) return;
+    if (st->camera_field_grid && st->camera_field_grid_owned)
+        field_grid_destroy(st->camera_field_grid);
+    st->camera_field_grid = nullptr;
     delete st;
 }
 
@@ -1058,36 +1347,59 @@ int ray_tracer_integrate_image(
     bool abort = false;
     std::mt19937_64 rng(static_cast<uint64_t>(seed));
 
-    trace_rays(
+    trace_rays_v2(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
         rng, abort,
-        [&](int /*si*/, int /*bounce*/, int b, cd new_amp,
-            const V3d& /*p0*/, const V3d& p1, double /*total_path*/) -> bool
+        [&](int si, int bounce, int hit_tri,
+            const V3d& incoming_dir, const V3d& surface_normal,
+            const VXcd& amp_prop,
+            const V3d& /*p0*/, const V3d& p1, double total_path) -> bool
         {
-            V3d v = p1 - cam_p;
+            V3d hit_pos = p1;
+            V3d hit_n = surface_normal;
+            if (hit_tri >= 0)
+                apply_parametric_surface_point(*st, hit_tri, p1, hit_pos, hit_n);
+
+            V3d v = hit_pos - cam_p;
             double depth = v.dot(cam_f);
-            if (depth <= EPS) return true;  /* behind camera */
+            int visible = 0;
+            int context_entries = 0;
+            if (depth > EPS) {
+                const uint64_t c0 = st->camera_full_march_context_entries;
+                visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
+                context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
+            }
+
+            if (st->camera_field_grid)
+                accumulate_field_capture(*st, hit_pos, amp_prop);
+            append_camera_strike(*st, si, bounce, hit_tri, hit_pos, hit_n,
+                                 incoming_dir, depth, total_path,
+                                 visible, context_entries, amp_prop);
+
+            if (depth <= EPS) return true;
+            if (st->camera_depth_cull_enabled && depth > st->camera_depth_cull_m)
+                return true;
+            if (!visible)
+                return true;
 
             double x_img = v.dot(cam_r);
             double y_img = v.dot(cam_u);
-
-            /* NDC in [-1, 1] */
             double ndc_x =  x_img / (depth * tan_half_h);
-            double ndc_y = -y_img / (depth * tan_half_v);  /* flip Y: row 0 = top */
-
-            /* Pixel coordinates (floor). */
+            double ndc_y = -y_img / (depth * tan_half_v);
             int px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
             int py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
 
             if (px < 0 || px >= width || py < 0 || py >= height)
                 return true;
 
-            size_t idx = static_cast<size_t>(b) * (height * width)
-                       + static_cast<size_t>(py) * width
-                       + static_cast<size_t>(px);
-            out_image[idx] += static_cast<float>(std::abs(new_amp));
+            for (int b = 0; b < n_bands; ++b) {
+                size_t idx = static_cast<size_t>(b) * (height * width)
+                           + static_cast<size_t>(py) * width
+                           + static_cast<size_t>(px);
+                out_image[idx] += static_cast<float>(std::abs(amp_prop[b]));
+            }
             return true;
         });
 
@@ -1137,34 +1449,64 @@ int ray_tracer_trace_integrate_image(
     bool abort = false;
     std::mt19937_64 rng(static_cast<uint64_t>(seed));
 
-    trace_rays(
+    trace_rays_v2(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
         rng, abort,
-        [&](int si, int bounce, int b, cd new_amp,
+        [&](int si, int bounce, int hit_tri,
+            const V3d& incoming_dir, const V3d& surface_normal,
+            const VXcd& amp_prop,
             const V3d& p0, const V3d& p1, double total_path) -> bool
         {
-            if (out_segs && count < out_cap) {
-                write_segment(out_segs, count, out_cap,
-                              p0, p1, si, bounce, b,
-                              new_amp, total_path - (p1 - p0).norm());
+            if (out_segs && out_cap > 0) {
+                for (int b = 0; b < st->n_bands; ++b) {
+                    write_segment(out_segs, count, out_cap,
+                                  p0, p1, si, bounce, b,
+                                  amp_prop[b],
+                                  total_path - (p1 - p0).norm());
+                }
             }
 
-            V3d v = p1 - cam_p;
+            V3d hit_pos = p1;
+            V3d hit_n = surface_normal;
+            if (hit_tri >= 0)
+                apply_parametric_surface_point(*st, hit_tri, p1, hit_pos, hit_n);
+
+            V3d v = hit_pos - cam_p;
             double depth = v.dot(cam_f);
+            int visible = 0;
+            int context_entries = 0;
             if (depth > EPS) {
-                double x_img = v.dot(cam_r);
-                double y_img = v.dot(cam_u);
-                double ndc_x =  x_img / (depth * tan_half_h);
-                double ndc_y = -y_img / (depth * tan_half_v);
-                int px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
-                int py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
-                if (px >= 0 && px < width && py >= 0 && py < height) {
+                const uint64_t c0 = st->camera_full_march_context_entries;
+                visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
+                context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
+            }
+
+            if (st->camera_field_grid)
+                accumulate_field_capture(*st, hit_pos, amp_prop);
+            append_camera_strike(*st, si, bounce, hit_tri, hit_pos, hit_n,
+                                 incoming_dir, depth, total_path,
+                                 visible, context_entries, amp_prop);
+
+            if (depth <= EPS) return true;
+            if (st->camera_depth_cull_enabled && depth > st->camera_depth_cull_m)
+                return true;
+            if (!visible)
+                return true;
+
+            double x_img = v.dot(cam_r);
+            double y_img = v.dot(cam_u);
+            double ndc_x =  x_img / (depth * tan_half_h);
+            double ndc_y = -y_img / (depth * tan_half_v);
+            int px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
+            int py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
+            if (px >= 0 && px < width && py >= 0 && py < height) {
+                for (int b = 0; b < st->n_bands; ++b) {
                     size_t idx = static_cast<size_t>(b) * (height * width)
                                + static_cast<size_t>(py) * width
                                + static_cast<size_t>(px);
-                    out_image[idx] += static_cast<float>(std::abs(new_amp));
+                    out_image[idx] += static_cast<float>(std::abs(amp_prop[b]));
                 }
             }
             return true;
@@ -1682,6 +2024,145 @@ int ray_tracer_set_tri_ior(
     for (int i = tri_start; i < end; ++i) {
         st->tris[static_cast<size_t>(i)].flags = flags;
     }
+    return SK_OK;
+}
+
+int ray_tracer_set_camera_visibility(
+    RayTracerState* st,
+    int             camera_vis_mode,
+    int             transparent_mode,
+    int             enable_depth_cull,
+    double          depth_cull_m)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+
+    if (camera_vis_mode != RT_CAM_VIS_AS_IS
+        && camera_vis_mode != RT_CAM_VIS_DIRECT_HIT
+        && camera_vis_mode != RT_CAM_VIS_FULL_MARCH)
+        return SK_ERR_DIM_MISMATCH;
+
+    if (transparent_mode != RT_CAM_TRANSPARENCY_BLOCK
+        && transparent_mode != RT_CAM_TRANSPARENCY_XRAY)
+        return SK_ERR_DIM_MISMATCH;
+
+    st->camera_vis_mode = camera_vis_mode;
+    st->camera_transparency_mode = transparent_mode;
+    st->camera_depth_cull_enabled = enable_depth_cull ? 1 : 0;
+    st->camera_depth_cull_m = (depth_cull_m > 0.0) ? depth_cull_m : 0.0;
+    return SK_OK;
+}
+
+int ray_tracer_get_camera_visibility_stats(
+    const RayTracerState* st,
+    uint64_t*             out_steps,
+    uint64_t*             out_context_entries)
+{
+    if (!st || !out_steps || !out_context_entries) return SK_ERR_NULL_STATE;
+    *out_steps = st->camera_full_march_steps;
+    *out_context_entries = st->camera_full_march_context_entries;
+    return SK_OK;
+}
+
+int ray_tracer_set_field_capture_grid(
+    RayTracerState* st,
+    FieldGrid*      grid,
+    int             take_ownership,
+    int             capture_strikes,
+    int             max_strikes,
+    int             clear_existing)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+
+    if (st->camera_field_grid && st->camera_field_grid_owned)
+        field_grid_destroy(st->camera_field_grid);
+
+    st->camera_field_grid = grid;
+    st->camera_field_grid_owned = (take_ownership && grid) ? 1 : 0;
+    st->camera_capture_strikes = capture_strikes ? 1 : 0;
+    st->camera_capture_max_strikes = std::max(0, max_strikes);
+    st->camera_strike_stride_floats = 16 + 2 * st->n_bands;
+
+    if (clear_existing)
+        st->camera_strike_rows.clear();
+    return SK_OK;
+}
+
+int ray_tracer_clear_field_capture(
+    RayTracerState* st,
+    int             clear_grid,
+    int             clear_strikes)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    if (clear_grid && st->camera_field_grid) {
+        if (st->camera_field_grid_owned)
+            field_grid_destroy(st->camera_field_grid);
+        st->camera_field_grid = nullptr;
+        st->camera_field_grid_owned = 0;
+    }
+    if (clear_strikes)
+        st->camera_strike_rows.clear();
+    return SK_OK;
+}
+
+int ray_tracer_get_field_capture_layout(
+    const RayTracerState* st,
+    int*                  out_grid_kind,
+    int*                  out_n_bands,
+    int64_t*              out_n_cells,
+    int*                  out_strike_stride_floats,
+    int*                  out_n_strikes)
+{
+    if (!st || !out_grid_kind || !out_n_bands || !out_n_cells
+        || !out_strike_stride_floats || !out_n_strikes)
+        return SK_ERR_NULL_STATE;
+
+    *out_grid_kind = st->camera_field_grid ? field_grid_kind(st->camera_field_grid) : -1;
+    *out_n_bands = st->n_bands;
+    *out_n_cells = st->camera_field_grid ? field_grid_n_cells_total(st->camera_field_grid) : 0;
+    *out_strike_stride_floats = st->camera_strike_stride_floats > 0
+                             ? st->camera_strike_stride_floats
+                             : (16 + 2 * st->n_bands);
+    const int stride = *out_strike_stride_floats;
+    *out_n_strikes = (stride > 0)
+                   ? static_cast<int>(st->camera_strike_rows.size() / static_cast<size_t>(stride))
+                   : 0;
+    return SK_OK;
+}
+
+int ray_tracer_copy_field_capture_grid_reim(
+    const RayTracerState* st,
+    float*                out_reim,
+    int64_t               out_count)
+{
+    if (!st || !out_reim || !st->camera_field_grid) return SK_ERR_NULL_STATE;
+    const int64_t n_cells = field_grid_n_cells_total(st->camera_field_grid);
+    const int64_t need = static_cast<int64_t>(st->n_bands) * n_cells * 2;
+    if (out_count < need) return SK_ERR_DIM_MISMATCH;
+    const float* src = field_grid_data_re_im(st->camera_field_grid);
+    if (!src) return SK_ERR_NULL_STATE;
+    std::memcpy(out_reim, src, static_cast<size_t>(need) * sizeof(float));
+    return SK_OK;
+}
+
+int ray_tracer_copy_field_capture_strikes(
+    const RayTracerState* st,
+    float*                out_rows,
+    int                   out_rows_cap,
+    int*                  out_rows_written)
+{
+    if (!st || !out_rows || !out_rows_written) return SK_ERR_NULL_STATE;
+    const int stride = st->camera_strike_stride_floats > 0
+                     ? st->camera_strike_stride_floats
+                     : (16 + 2 * st->n_bands);
+    const int n_rows = (stride > 0)
+                     ? static_cast<int>(st->camera_strike_rows.size() / static_cast<size_t>(stride))
+                     : 0;
+    const int n_copy = std::min(out_rows_cap, n_rows);
+    if (n_copy > 0) {
+        std::memcpy(out_rows, st->camera_strike_rows.data(),
+                    static_cast<size_t>(n_copy) * stride * sizeof(float));
+    }
+    *out_rows_written = n_copy;
     return SK_OK;
 }
 
@@ -2504,6 +2985,7 @@ extern "C" SK_API int ray_tracer_register_tri_group(
      * be dereferenced after the caller's buffer goes away. */
     copy.power_W_per_band = nullptr;
     copy.sensor_camera    = nullptr;
+    copy.parametric_payload = nullptr;
     st->tri_groups.push_back(copy);
 
     std::vector<int> idxs(desc->tri_indices, desc->tri_indices + desc->n_tris);
@@ -2552,6 +3034,22 @@ extern "C" SK_API int ray_tracer_register_tri_group(
         st->tri_group_has_camera.push_back(0);
         st->tri_group_camera.push_back(CameraSensorDesc{});
     }
+
+    std::vector<uint8_t> param_payload;
+    if (desc->parametric_payload && desc->parametric_payload_bytes > 0) {
+        const uint8_t* p = static_cast<const uint8_t*>(desc->parametric_payload);
+        param_payload.assign(p, p + desc->parametric_payload_bytes);
+    }
+    st->tri_group_parametric_kind.push_back(desc->parametric_surface_kind);
+    st->tri_group_parametric_payload.push_back(std::move(param_payload));
+
+    if (desc->parametric_surface_kind != TRI_PARAM_SURFACE_NONE) {
+        for (int t : st->tri_group_indices.back()) {
+            if (t >= 0 && t < (int)st->tri_param_group_of_tri.size()
+                && st->tri_param_group_of_tri[(size_t)t] < 0)
+                st->tri_param_group_of_tri[(size_t)t] = copy.group_id;
+        }
+    }
     return copy.group_id;
 }
 
@@ -2565,6 +3063,9 @@ extern "C" SK_API int ray_tracer_clear_tri_groups(RayTracerState* st)
     st->tri_group_power_per_band.clear();
     st->tri_group_has_camera.clear();
     st->tri_group_camera.clear();
+    st->tri_group_parametric_kind.clear();
+    st->tri_group_parametric_payload.clear();
+    st->tri_param_group_of_tri.assign(st->tris.size(), -1);
     return SK_OK;
 }
 
@@ -2666,8 +3167,11 @@ extern "C" SK_API int ray_tracer_bidirectional(
             if (s + t > 1.0) { s = 1.0 - s; t = 1.0 - t; }
             V3d origin = T.v0 + s * T.edge1 + t * T.edge2;
 
+            V3d emit_n = T.normal;
+            apply_parametric_surface_point(*st, tri_id, origin, origin, emit_n);
+
             /* 3. Pick an outgoing direction: cosine-hemisphere about normal. */
-            V3d dir = cosine_hemisphere(T.normal, rng);
+            V3d dir = cosine_hemisphere(emit_n, rng);
 
             /* 4. Initial unit complex amplitude per band. */
             for (int b = 0; b < n_bands; ++b) amp[b] = cd(1.0, 0.0);
@@ -2693,6 +3197,8 @@ extern "C" SK_API int ray_tracer_bidirectional(
                 if (hit_tri < 0) break;
 
                 V3d hit_pos = pos + t_hit * dir;
+                V3d hit_n_param = st->tris[hit_tri].normal;
+                apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n_param);
                 double total_path = path_len + t_hit;
 
                 /* Phase + atmospheric attenuation along the segment. */
@@ -2743,7 +3249,7 @@ extern "C" SK_API int ray_tracer_bidirectional(
                  * BDPT branch fanout is queued behind the branch_factor
                  * extension (see ray_tracer_set_branch_factor below). */
                 const Triangle& tri = st->tris[hit_tri];
-                V3d hit_n = tri.normal;
+                V3d hit_n = hit_n_param;
                 if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
                 if (tri.flags & MAT_FLAG_APERTURE_STOP) break;
                 if (U(rng) < mat_diffusion(*st, tri.mat_idx)) {

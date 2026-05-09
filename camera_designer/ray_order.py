@@ -88,6 +88,7 @@ __all__ = [
     "TracerGap",
     "SourceRecord",
     "RayOrder",
+    "BidirectionalRayPackage",
 ]
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -158,6 +159,20 @@ class SourceRecord:
     spec_label:        str
     component_label:   str
     tracer_gaps:       List[TracerGap] = field(default_factory=list)
+
+
+@dataclass
+class BidirectionalRayPackage:
+        """Packed forward/backward ray batches for bidirectional workflows.
+
+        Layout for both arrays is the existing (N,12) float32 SourceRec schema.
+        Reserved fields are populated for routing metadata:
+            dir_kind.w  (col 7)  : role tag (0=forward source, 1=sensor backward)
+            packet.w    (col 11) : group id (source index or sensor index)
+        """
+        forward_rows: np.ndarray
+        backward_rows: np.ndarray
+        combined_rows: np.ndarray
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1072,3 +1087,101 @@ class RayOrder:
         if not rows:
             return np.zeros((1, 12), np.float32)
         return np.array(rows, np.float32)
+
+    def bake_backward_sensor_rays(self,
+                                  sensor_bundles: Sequence[dict],
+                                  *,
+                                  seed: int = 0,
+                                  default_freq_hz: float = 5.405e14,
+                                  default_energy: float = 1.0,
+                                  default_phase: float = 0.0,
+                                  sensor_weight: float = 1.0) -> np.ndarray:
+        """Pack backward sensor rays from one or more sensor bundles.
+
+        Parameters
+        ----------
+        sensor_bundles
+            Iterable of dicts each containing at least:
+              origins : (N,3) float64
+              dirs    : (N,3) float64
+            Optional keys:
+              sensor_id : int
+              weights   : (N,) float64
+
+        Returns
+        -------
+        (N_total, 12) float32 in SourceRec layout.
+        """
+        rng = np.random.default_rng(int(seed) ^ 0xA5A5A5A5)
+        rows: list[list[float]] = []
+
+        for s_idx, bundle in enumerate(sensor_bundles):
+            origins = np.asarray(bundle.get("origins", np.zeros((0, 3))), np.float64)
+            dirs = np.asarray(bundle.get("dirs", np.zeros((0, 3))), np.float64)
+            if origins.shape[0] == 0 or dirs.shape[0] == 0:
+                continue
+            n = min(int(origins.shape[0]), int(dirs.shape[0]))
+            sid = int(bundle.get("sensor_id", s_idx))
+            w = np.asarray(bundle.get("weights", np.ones(n, np.float64)), np.float64).ravel()
+            if w.size < n:
+                w = np.pad(w, (0, n - w.size), mode="edge")
+
+            for i in range(n):
+                o = origins[i]
+                d = dirs[i]
+                dn = float(np.linalg.norm(d))
+                if dn < 1e-12:
+                    d = np.array([0.0, 0.0, 1.0], np.float64)
+                else:
+                    d = d / dn
+                amp_w = float(max(0.0, sensor_weight * w[i]))
+                ph = float(default_phase + (2.0 * math.pi * rng.random()))
+                rows.append([
+                    float(o[0]), float(o[1]), float(o[2]),
+                    amp_w,
+                    float(d[0]), float(d[1]), float(d[2]),
+                    1.0,                         # dir_kind.w role = backward sensor ray
+                    float(default_freq_hz),
+                    ph,
+                    float(default_energy),
+                    float(sid),                  # packet.w = sensor group id
+                ])
+
+        if not rows:
+            return np.zeros((0, 12), np.float32)
+        return np.asarray(rows, np.float32)
+
+    def bake_bidirectional_package(self,
+                                   n_forward_rays: int,
+                                   sensor_bundles: Sequence[dict],
+                                   *,
+                                   seed: int = 0,
+                                   default_freq_hz: float = 5.405e14,
+                                   default_energy: float = 1.0,
+                                   default_phase: float = 0.0,
+                                   sensor_weight: float = 1.0) -> BidirectionalRayPackage:
+        """Build forward + backward rows for multi-emitter/multi-sensor tracing."""
+        fwd = self.bake_rays(max(1, int(n_forward_rays)), seed=seed)
+        if fwd.shape[0] > 0:
+            fwd = np.ascontiguousarray(fwd, np.float32)
+            fwd[:, 7] = 0.0   # dir_kind.w role = forward source ray
+            fwd[:, 11] = 0.0  # packet.w reserved for source-group metadata
+
+        bwd = self.bake_backward_sensor_rays(
+            sensor_bundles,
+            seed=seed,
+            default_freq_hz=default_freq_hz,
+            default_energy=default_energy,
+            default_phase=default_phase,
+            sensor_weight=sensor_weight,
+        )
+
+        if bwd.shape[0] > 0:
+            combined = np.concatenate([fwd, bwd], axis=0).astype(np.float32, copy=False)
+        else:
+            combined = np.asarray(fwd, np.float32)
+        return BidirectionalRayPackage(
+            forward_rows=np.ascontiguousarray(fwd, np.float32),
+            backward_rows=np.ascontiguousarray(bwd, np.float32),
+            combined_rows=np.ascontiguousarray(combined, np.float32),
+        )

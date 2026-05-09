@@ -110,6 +110,15 @@ SK_API const float* field_grid_bmax(const FieldGrid* g);
  */
 SK_API float* field_grid_data_re_im(FieldGrid* g);  /* interleaved (re,im,re,im,...) */
 
+/**
+ * Deposit one complex spectral sample into the grid at world position pos.
+ * Supports both REGULAR and KDTREE grid kinds.
+ */
+SK_API int field_grid_inject_amplitude(
+    FieldGrid* g, int band,
+    const float pos[3],
+    float amp_re, float amp_im);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

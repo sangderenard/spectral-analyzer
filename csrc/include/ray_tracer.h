@@ -426,6 +426,29 @@ SK_API int ray_tracer_copy_field_capture_strikes(
 );
 
 /**
+ * Upload sensor/film tensor chunks and active slot mapping into tracer-owned memory.
+ *
+ * This is the C++ ingress point used by Python helpers before bidirectional
+ * dispatch. Data is copied into RayTracerState, so caller buffers can be
+ * released immediately after the call returns.
+ *
+ * sensor_chunk : float32 [sensor_rows, sensor_stride]
+ * film_chunk   : float32 [film_rows,   film_stride]
+ * active_slots : int32   [n_slots, 2]  (sensor_id, film_id) pairs
+ */
+SK_API int ray_tracer_set_sensor_film_ssbo(
+    RayTracerState*   st,
+    const float*      sensor_chunk,
+    int               sensor_rows,
+    int               sensor_stride,
+    const float*      film_chunk,
+    int               film_rows,
+    int               film_stride,
+    const int32_t*    active_slots,
+    int               n_slots
+);
+
+/**
  * Trace rays and accumulate per-triangle irradiance.
  *
  * This combines the segment capture of ray_tracer_trace with direct

@@ -30,6 +30,7 @@
   "image_linear_path": "exposures\\0002_cpp_linear.npy",
   "field_object_path": "exposures\\0002_cpp_field_integral.npz",
   "surface_object_path": "exposures\\0002_cpp_surface_integral.npz",
+  "sensor_object_path": "exposures\\0002_cpp_sensor_integral.npz",
   "field_capture_grid_path": "exposures\\0002_cpp_field_capture_grid_reim.npy",
   "field_capture_strikes_path": "exposures\\0002_cpp_field_capture_strikes.npy",
   "summary_path": "exposures\\0002_cpp_summary.json",

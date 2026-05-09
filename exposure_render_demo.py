@@ -97,6 +97,7 @@ except ImportError:
 try:
     from bdpt_integrator import CameraSensor, TriangleGroup
     from bdpt_integrator import TRI_GROUP_ROLE_SENSOR, TRI_GROUP_SAMPLE_PIXEL_CONE
+    from bdpt_integrator import aggregate_to_image_pixel_cone
     _HAS_BDPT_INTEGRATION = True
 except ImportError:
     _HAS_BDPT_INTEGRATION = False
@@ -104,6 +105,7 @@ except ImportError:
     TriangleGroup = None
     TRI_GROUP_ROLE_SENSOR = None
     TRI_GROUP_SAMPLE_PIXEL_CONE = None
+    aggregate_to_image_pixel_cone = None
 
 
 def _weld_mesh(verts_flat_n9: np.ndarray,
@@ -1116,6 +1118,8 @@ class ExposureSession:
         self._rng_seed = 1
         self._frame_index = 0
         self._sensor_group_id = -1  # BDPT sensor group ID for this frame
+        self._last_bdpt_records: Optional[np.ndarray] = None
+        self._last_target_photons_per_pixel: float = 0.0
 
     # ── Build per-frame plan + scene + backends ──────────────────────────
     def _build_plan(self, scene: TracerScene) -> RayDispatchPlan:
@@ -1302,9 +1306,21 @@ class ExposureSession:
             if not active_slots:
                 print("  [warn] no active sensor/film slots; sensor integral unavailable")
                 return None
+
+            if aggregate_to_image_pixel_cone is None:
+                print("  [warn] bdpt_integrator.aggregate_to_image_pixel_cone unavailable; sensor integral unavailable")
+                return None
+
+            if self._last_bdpt_records is None or self._last_bdpt_records.size == 0:
+                print("  [warn] no bdpt endpoint records available; sensor integral unavailable")
+                return None
+
+            if self._sensor_group_id < 0:
+                print("  [warn] sensor group not registered; sensor integral unavailable")
+                return None
             
-            # For now, Phase 3C (immediate): implement slot 0 only
-            slot_id = 0
+            # Immediate path: first active slot in current session configuration.
+            slot_id = int(active_slots[0])
             sensor_id, film_id = self.sensor_film_slots[slot_id]
             
             if sensor_id < 0 or film_id < 0:
@@ -1321,13 +1337,31 @@ class ExposureSession:
             
             exposure_time_s = float(film_row[1])  # offset 1: exposure_time_s
             
-            # Initialize accumulator arrays
-            photons_per_pixel = np.zeros((self.height, self.width), dtype=np.float32)
-            
-            # Placeholder for Phase 3C (immediate): uniform distribution pending endpoint integration
-            # TODO Phase 3E: Replace with actual endpoint record filtering and accumulation
-            # For now, use a synthetic pattern to validate the pipeline
-            photons_per_pixel = np.ones((self.height, self.width), dtype=np.float32) * 1000.0
+            # Real endpoint-driven coherent accumulation from PIXEL_CONE records.
+            sensor_img = aggregate_to_image_pixel_cone(
+                self._last_bdpt_records,
+                n_bands=int(self.freq_hz.shape[0]),
+                n_px=int(self.width),
+                n_py=int(self.height),
+                sensor_group_id=int(self._sensor_group_id),
+            )
+
+            if sensor_img.size == 0:
+                print("  [warn] empty sensor image after endpoint aggregation")
+                return None
+
+            # Intensity proxy from coherent amplitude: sum_b |A_b|^2, then exposure gain.
+            endpoint_intensity = np.sum(np.abs(sensor_img) ** 2, axis=0, dtype=np.float32)
+            endpoint_intensity = endpoint_intensity.astype(np.float32, copy=False)
+            endpoint_intensity *= float(max(gain, 0.0) ** 2)
+
+            mean_intensity = float(np.mean(endpoint_intensity))
+            target_photons = float(max(self._last_target_photons_per_pixel, 0.0))
+            if mean_intensity > 1.0e-20 and target_photons > 0.0:
+                photons_per_pixel = (endpoint_intensity / mean_intensity) * target_photons
+            else:
+                photons_per_pixel = endpoint_intensity.copy()
+            photons_per_pixel = photons_per_pixel.astype(np.float32, copy=False)
             
             # Apply QE to get electrons
             electrons_per_pixel = photons_per_pixel * qe_peak
@@ -1364,6 +1398,8 @@ class ExposureSession:
                 "full_well_e": float(full_well_e),
                 "snr_peak": float(peak_snr),
                 "snr_mean": float(mean_snr),
+                "endpoint_records_count": int(self._last_bdpt_records.shape[0]),
+                "sensor_group_id": int(self._sensor_group_id),
                 "photons_flux_hz": float(np.mean(photons_per_pixel)),
                 "electrons_flux_hz": float(np.mean(electrons_per_pixel)),
             }
@@ -1454,6 +1490,8 @@ class ExposureSession:
         # Visible-band reference: λ ≈ 555 nm (peak of photopic response).
         photon_E = H_PLANCK * C_LIGHT / (plan.ref_wavelength_nm * 1.0e-9)
         photons_per_pix = plan.target_H_J / max(1, n_pix) / max(photon_E, 1.0e-30)
+        self._last_target_photons_per_pixel = float(photons_per_pix)
+        self._last_bdpt_records = None
 
         fc_active = frame_cfg.field_capture
         cv_active = frame_cfg.camera_visibility
@@ -1622,6 +1660,7 @@ class ExposureSession:
                     seed               = self._rng_seed,
                     max_records        = self.bdpt_records_cap,
                 )
+                self._last_bdpt_records = np.ascontiguousarray(recs, dtype=np.float32)
                 print(f"  bdpt: {recs.shape[0]:_} EndpointRecords "
                       f"in {time.perf_counter()-t_bd:.2f}s "
                       f"(tri_groups={tracer.n_tri_groups()}, "

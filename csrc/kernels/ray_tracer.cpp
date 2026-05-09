@@ -397,6 +397,18 @@ struct RayTracerState {
     int                                camera_capture_max_strikes = 0;
     int                                camera_strike_stride_floats = 0;
     std::vector<float>                 camera_strike_rows;
+
+    /* Sensor/film tensor uploads (Python→C++ ingress for camera simulation).
+     * Stored verbatim and owned by tracer state; later kernels/GLSL bridges
+     * can consume these buffers without touching Python memory. */
+    std::vector<float>                 sensor_film_sensor_chunk;
+    std::vector<float>                 sensor_film_film_chunk;
+    std::vector<int32_t>               sensor_film_active_slots; /* flat [n_slots * 2] */
+    int                                sensor_film_sensor_rows = 0;
+    int                                sensor_film_sensor_stride = 0;
+    int                                sensor_film_film_rows = 0;
+    int                                sensor_film_film_stride = 0;
+    int                                sensor_film_n_slots = 0;
 };
 
 /* ── MatBuf accessors ─────────────────────────────────────────────────────────
@@ -2163,6 +2175,46 @@ int ray_tracer_copy_field_capture_strikes(
                     static_cast<size_t>(n_copy) * stride * sizeof(float));
     }
     *out_rows_written = n_copy;
+    return SK_OK;
+}
+
+int ray_tracer_set_sensor_film_ssbo(
+    RayTracerState*   st,
+    const float*      sensor_chunk,
+    int               sensor_rows,
+    int               sensor_stride,
+    const float*      film_chunk,
+    int               film_rows,
+    int               film_stride,
+    const int32_t*    active_slots,
+    int               n_slots)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    if (sensor_rows <= 0 || sensor_stride <= 0 || film_rows <= 0 || film_stride <= 0)
+        return SK_ERR_DIM_MISMATCH;
+    if (!sensor_chunk || !film_chunk)
+        return SK_ERR_NULL_STATE;
+    if (n_slots < 0)
+        return SK_ERR_DIM_MISMATCH;
+    if (n_slots > 0 && !active_slots)
+        return SK_ERR_NULL_STATE;
+
+    const size_t sensor_count = static_cast<size_t>(sensor_rows) * static_cast<size_t>(sensor_stride);
+    const size_t film_count = static_cast<size_t>(film_rows) * static_cast<size_t>(film_stride);
+
+    st->sensor_film_sensor_chunk.assign(sensor_chunk, sensor_chunk + sensor_count);
+    st->sensor_film_film_chunk.assign(film_chunk, film_chunk + film_count);
+    st->sensor_film_sensor_rows = sensor_rows;
+    st->sensor_film_sensor_stride = sensor_stride;
+    st->sensor_film_film_rows = film_rows;
+    st->sensor_film_film_stride = film_stride;
+
+    st->sensor_film_active_slots.clear();
+    if (n_slots > 0) {
+        const size_t slot_count = static_cast<size_t>(n_slots) * 2u;
+        st->sensor_film_active_slots.assign(active_slots, active_slots + slot_count);
+    }
+    st->sensor_film_n_slots = n_slots;
     return SK_OK;
 }
 

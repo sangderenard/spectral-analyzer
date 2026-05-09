@@ -902,6 +902,61 @@ struct PyRayTracer
         _depth_cull_m = depth_cull_m;
     }
 
+    void set_sensor_film_ssbo(
+        py::array_t<float, py::array::c_style | py::array::forcecast> sensor_chunk,
+        py::array_t<float, py::array::c_style | py::array::forcecast> film_chunk,
+        py::object active_slots_obj = py::none())
+    {
+        auto s = sensor_chunk.request();
+        auto f = film_chunk.request();
+        if (s.ndim != 2)
+            throw std::runtime_error("sensor_chunk must be float32 shape (rows, stride)");
+        if (f.ndim != 2)
+            throw std::runtime_error("film_chunk must be float32 shape (rows, stride)");
+
+        std::vector<int32_t> slots_flat;
+        int n_slots = 0;
+        if (!active_slots_obj.is_none()) {
+            py::array_t<int32_t, py::array::c_style | py::array::forcecast> slots_arr;
+            try {
+                slots_arr = active_slots_obj.cast<
+                    py::array_t<int32_t, py::array::c_style | py::array::forcecast>>();
+                auto sb = slots_arr.request();
+                if (sb.ndim != 2 || sb.shape[1] != 2)
+                    throw std::runtime_error("active_slots must be int32 shape (n_slots, 2)");
+                n_slots = static_cast<int>(sb.shape[0]);
+                const int32_t* ptr = static_cast<const int32_t*>(sb.ptr);
+                slots_flat.assign(ptr, ptr + static_cast<size_t>(n_slots) * 2u);
+            } catch (const py::cast_error&) {
+                py::sequence seq = active_slots_obj.cast<py::sequence>();
+                n_slots = static_cast<int>(py::len(seq));
+                slots_flat.reserve(static_cast<size_t>(n_slots) * 2u);
+                for (py::handle item : seq) {
+                    py::sequence pair = py::reinterpret_borrow<py::sequence>(item);
+                    if (py::len(pair) != 2)
+                        throw std::runtime_error("active_slots sequence entries must be length-2");
+                    slots_flat.push_back(py::cast<int32_t>(pair[0]));
+                    slots_flat.push_back(py::cast<int32_t>(pair[1]));
+                }
+            }
+        }
+
+        const int32_t* slots_ptr = slots_flat.empty() ? nullptr : slots_flat.data();
+        int rc = ray_tracer_set_sensor_film_ssbo(
+            handle,
+            static_cast<const float*>(s.ptr),
+            static_cast<int>(s.shape[0]),
+            static_cast<int>(s.shape[1]),
+            static_cast<const float*>(f.ptr),
+            static_cast<int>(f.shape[0]),
+            static_cast<int>(f.shape[1]),
+            slots_ptr,
+            n_slots);
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "ray_tracer_set_sensor_film_ssbo failed: rc=" + std::to_string(rc));
+    }
+
     py::dict get_camera_visibility() const
     {
         py::dict d;
@@ -3068,6 +3123,19 @@ camera_vis_mode:
 transparent_mode:
     RT_CAM_TRANSPARENCY_BLOCK -> transparent triangles still block LOS
     RT_CAM_TRANSPARENCY_XRAY  -> transmissive triangles are skipped in LOS
+)doc")
+                .def("set_sensor_film_ssbo", &PyRayTracer::set_sensor_film_ssbo,
+                         py::arg("sensor_chunk"),
+                         py::arg("film_chunk"),
+                         py::arg("active_slots") = py::none(),
+                         R"doc(
+Upload sensor/film tensor chunks and active slot pairs into tracer-owned C++ memory.
+
+sensor_chunk : float32 (rows, stride)  — SensorFilmDatabase sensor tensor
+film_chunk   : float32 (rows, stride)  — SensorFilmDatabase film tensor
+active_slots : int32 (n_slots, 2) or sequence of (sensor_id, film_id)
+
+The tracer deep-copies all inputs; caller buffers can be discarded after return.
 )doc")
                 .def("get_camera_visibility", &PyRayTracer::get_camera_visibility,
                          "Return current camera visibility policy as a dict.")

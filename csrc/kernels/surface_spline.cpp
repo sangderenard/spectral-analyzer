@@ -12,8 +12,6 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
-#include <unordered_map>
-#include <unordered_set>
 
 /* ── small helpers ─────────────────────────────────────────────────────────── */
 
@@ -68,21 +66,6 @@ static std::vector<std::vector<int>> build_vtx_to_tris(
 }
 
 /* Collect 1-ring neighbours of triangle t (including t itself). */
-static std::vector<int> one_ring(
-    int t,
-    const int* tri_idx,
-    const std::vector<std::vector<int>>& v2t)
-{
-    std::unordered_set<int> seen;
-    seen.insert(t);
-    for (int k = 0; k < 3; ++k) {
-        int vi = tri_idx[static_cast<size_t>(t) * 3 + k];
-        for (int nb : v2t[static_cast<size_t>(vi)])
-            seen.insert(nb);
-    }
-    return std::vector<int>(seen.begin(), seen.end());
-}
-
 /* ── Per-triangle spline fit ───────────────────────────────────────────────── */
 
 /* Fit the 6 POLY_BARY coefficients for triangle t.
@@ -125,15 +108,35 @@ static void fit_one_triangle(
     if (len_n < EPS_SP) return;
     Eigen::Vector3d n = raw_n / len_n;
 
+    using Mat6 = Eigen::Matrix<double, 6, 6>;
+    using Vec6 = Eigen::Matrix<double, 6, 1>;
+    using Row6 = Eigen::Matrix<double, 1, 6>;
+
+    Mat6 ATA = Mat6::Zero();
+    Vec6 ATb = Vec6::Zero();
+    auto add_row = [&](const Row6& row, double y) {
+        ATA.noalias() += row.transpose() * row;
+        ATb.noalias() += row.transpose() * y;
+    };
+
     /* Self-centroid sample: delta = 0 at bary (1/3, 1/3) — anchor the fit. */
-    std::vector<Eigen::Matrix<double,1,6>> rows;
-    std::vector<double>                    rhs;
+    add_row(basis(1.0 / 3.0, 1.0 / 3.0), 0.0);
 
-    rows.push_back(basis(1.0/3.0, 1.0/3.0));
-    rhs.push_back(0.0);
+    /* 1-ring neighbours (small vector + sort/unique avoids hash allocations). */
+    std::vector<int> ring;
+    ring.reserve(1
+        + v2t[static_cast<size_t>(i0)].size()
+        + v2t[static_cast<size_t>(i1)].size()
+        + v2t[static_cast<size_t>(i2)].size());
+    ring.push_back(t);
+    for (int k = 0; k < 3; ++k) {
+        int vi = vid(t, k);
+        const auto& list = v2t[static_cast<size_t>(vi)];
+        ring.insert(ring.end(), list.begin(), list.end());
+    }
+    std::sort(ring.begin(), ring.end());
+    ring.erase(std::unique(ring.begin(), ring.end()), ring.end());
 
-    /* 1-ring neighbours. */
-    std::vector<int> ring = one_ring(t, tri_idx, v2t);
     for (int nb : ring) {
         if (nb == t) continue;
 
@@ -154,8 +157,7 @@ static void fit_one_triangle(
         /* Displacement along the base triangle's normal axis. */
         double delta = (c - v0).dot(n);
 
-        rows.push_back(basis(u, v));
-        rhs.push_back(delta);
+        add_row(basis(u, v), delta);
     }
 
     /* Also add vertex-normal weighted samples: for each vertex of t, sample
@@ -201,45 +203,32 @@ static void fit_one_triangle(
 
         double u = u_vtx, v = v_vtx;
 
-        Eigen::Matrix<double,1,6> du_row, dv_row;
+        Row6 du_row, dv_row;
         du_row << 0.0, 1.0, 0.0, 2.0*u,     v, 0.0;
         dv_row << 0.0, 0.0, 1.0,     0.0,    u, 2.0*v;
 
-        rows.push_back(du_row);
-        rhs.push_back(du_rhs);
-        rows.push_back(dv_row);
-        rhs.push_back(dv_rhs);
-    }
-
-    const int m = static_cast<int>(rows.size());
-    if (m < 1) return;
-
-    /* Assemble system. */
-    Eigen::MatrixXd A(m, 6);
-    Eigen::VectorXd b(m);
-    for (int i = 0; i < m; ++i) {
-        A.row(i) = rows[static_cast<size_t>(i)];
-        b(i)     = rhs[static_cast<size_t>(i)];
+        add_row(du_row, du_rhs);
+        add_row(dv_row, dv_rhs);
     }
 
     /* Optional Tikhonov ridge on the curvature terms (columns 3-5). */
-    Eigen::MatrixXd ATA = A.transpose() * A;
     if (ridge_lambda > 0.0) {
         for (int j = 3; j < 6; ++j)
             ATA(j, j) += ridge_lambda;
     }
 
-    /* Solve via LDLT (symmetric positive semi-definite after regularisation). */
-    Eigen::VectorXd coeffs(6);
-    if (ridge_lambda > 0.0) {
-        coeffs = ATA.ldlt().solve(A.transpose() * b);
+    /* Solve fixed-size normal equations; QR fallback for rank-deficient cases. */
+    Eigen::LDLT<Mat6> ldlt(ATA);
+    Vec6 coeffs = Vec6::Zero();
+    if (ldlt.info() == Eigen::Success) {
+        coeffs = ldlt.solve(ATb);
     } else {
-        /* Use ColPivHR for potentially rank-deficient systems. */
-        coeffs = A.colPivHouseholderQr().solve(b);
+        coeffs = ATA.colPivHouseholderQr().solve(ATb);
     }
-
-    for (int j = 0; j < 6; ++j)
-        out6[j] = coeffs(j);
+    for (int j = 0; j < 6; ++j) {
+        double v = coeffs(j);
+        out6[j] = std::isfinite(v) ? v : 0.0;
+    }
 }
 
 /* ── Public C API ─────────────────────────────────────────────────────────── */

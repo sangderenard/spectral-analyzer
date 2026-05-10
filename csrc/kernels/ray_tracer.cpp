@@ -49,6 +49,15 @@
 #include "triangle_groups.h"
 #include "field_grid.h"
 
+/* Compile-time parity checks: SensorRecord and FilmRecord must be exactly the
+ * same size as their Python ctypes counterparts (SensorRecord: 48 floats = 192 B,
+ * FilmRecord: 64 floats = 256 B).  A mismatch here means the Python layout and
+ * the C struct have drifted apart and the SSBO upload will be misread.        */
+static_assert(sizeof(SensorRecord) == 48 * sizeof(float),
+              "SensorRecord size mismatch — Python SensorRecord is 48 floats");
+static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
+              "FilmRecord size mismatch — Python FilmRecord is 64 floats");
+
 #include <Eigen/Dense>
 #include <algorithm>
 #include <cmath>
@@ -559,28 +568,151 @@ static inline bool apply_parametric_surface_point(
         return false;
 
     int kind = st.tri_group_parametric_kind[static_cast<size_t>(gid)];
-    if (kind != TRI_PARAM_SURFACE_POLY_BARY)
+    if (kind == TRI_PARAM_SURFACE_NONE)
         return false;
 
     const auto& payload = st.tri_group_parametric_payload[static_cast<size_t>(gid)];
-    if (payload.size() < sizeof(double) * 6)
-        return false;
-
-    const double* c = reinterpret_cast<const double*>(payload.data());
     double u = 0.0, v = 0.0;
     tri_bary_uv(tri, hit_pos, u, v);
-
-    const double delta = c[0] + c[1] * u + c[2] * v
-                       + c[3] * u * u + c[4] * u * v + c[5] * v * v;
-
     const V3d t1 = tri.edge1.normalized();
     const V3d t2 = tri.edge2.normalized();
-    const double dzdu = c[1] + 2.0 * c[3] * u + c[4] * v;
-    const double dzdv = c[2] + c[4] * u + 2.0 * c[5] * v;
 
-    V3d warped_n = (tri.normal - dzdu * t1 - dzdv * t2).normalized();
+    double delta = 0.0;
+    double dzdu = 0.0;
+    double dzdv = 0.0;
+
+    if (kind == TRI_PARAM_SURFACE_POLY_BARY) {
+        if (payload.size() < sizeof(double) * 6)
+            return false;
+        const double* c = reinterpret_cast<const double*>(payload.data());
+        delta = c[0] + c[1] * u + c[2] * v
+              + c[3] * u * u + c[4] * u * v + c[5] * v * v;
+        dzdu = c[1] + 2.0 * c[3] * u + c[4] * v;
+        dzdv = c[2] + c[4] * u + 2.0 * c[5] * v;
+    } else if (kind == TRI_PARAM_SURFACE_SDF_SADDLE) {
+        // Payload: float64[2] [amplitude_m, neighborhood_margin_uv].
+        const double amp = (payload.size() >= sizeof(double))
+            ? *reinterpret_cast<const double*>(payload.data())
+            : 2.0e-3;
+        const double margin = (payload.size() >= sizeof(double) * 2)
+            ? *(reinterpret_cast<const double*>(payload.data()) + 1)
+            : 8.0e-2;
+
+        auto eval_saddle = [&](double uu, double vv, double& d, double& duv, double& dvv) {
+            const double cu = uu - (1.0 / 3.0);
+            const double cv = vv - (1.0 / 3.0);
+            d = amp * (cu * cu - cv * cv);
+            duv = 2.0 * amp * cu;
+            dvv = -2.0 * amp * cv;
+        };
+
+        if (margin <= EPS) {
+            eval_saddle(u, v, delta, dzdu, dzdv);
+        } else {
+            // Post-hit neighborhood integration over candidate impact points.
+            static const double kOff[9][2] = {
+                { 0.0,  0.0},
+                {-1.0,  0.0}, { 1.0,  0.0},
+                { 0.0, -1.0}, { 0.0,  1.0},
+                {-0.70710678118, -0.70710678118},
+                { 0.70710678118, -0.70710678118},
+                {-0.70710678118,  0.70710678118},
+                { 0.70710678118,  0.70710678118},
+            };
+            double d_acc = 0.0, du_acc = 0.0, dv_acc = 0.0, w_acc = 0.0;
+            for (int i = 0; i < 9; ++i) {
+                const double ou = kOff[i][0];
+                const double ov = kOff[i][1];
+                const double uu = u + margin * ou;
+                const double vv = v + margin * ov;
+                const double r2 = ou * ou + ov * ov;
+                const double w = 1.0 / (1.0 + r2);
+                double d_i = 0.0, du_i = 0.0, dv_i = 0.0;
+                eval_saddle(uu, vv, d_i, du_i, dv_i);
+                d_acc += w * d_i;
+                du_acc += w * du_i;
+                dv_acc += w * dv_i;
+                w_acc += w;
+            }
+            const double inv_w = (w_acc > EPS) ? (1.0 / w_acc) : 1.0;
+            delta = d_acc * inv_w;
+            dzdu = du_acc * inv_w;
+            dzdv = dv_acc * inv_w;
+        }
+    } else if (kind == TRI_PARAM_SURFACE_SDF_SPHERE) {
+        // Payload: float64[2] [radius_m, neighborhood_margin_uv].
+        double radius = (payload.size() >= sizeof(double))
+            ? *reinterpret_cast<const double*>(payload.data())
+            : 0.12;
+        const double margin = (payload.size() >= sizeof(double) * 2)
+            ? *(reinterpret_cast<const double*>(payload.data()) + 1)
+            : 8.0e-2;
+        if (std::abs(radius) < EPS) radius = 0.12;
+        const double k = 0.5 / radius;
+
+        auto eval_sphere = [&](double uu, double vv, double& d, double& duv, double& dvv) {
+            const double cu = uu - (1.0 / 3.0);
+            const double cv = vv - (1.0 / 3.0);
+            d = k * (cu * cu + cv * cv);
+            duv = 2.0 * k * cu;
+            dvv = 2.0 * k * cv;
+        };
+
+        if (margin <= EPS) {
+            eval_sphere(u, v, delta, dzdu, dzdv);
+        } else {
+            static const double kOff[9][2] = {
+                { 0.0,  0.0},
+                {-1.0,  0.0}, { 1.0,  0.0},
+                { 0.0, -1.0}, { 0.0,  1.0},
+                {-0.70710678118, -0.70710678118},
+                { 0.70710678118, -0.70710678118},
+                {-0.70710678118,  0.70710678118},
+                { 0.70710678118,  0.70710678118},
+            };
+            double d_acc = 0.0, du_acc = 0.0, dv_acc = 0.0, w_acc = 0.0;
+            for (int i = 0; i < 9; ++i) {
+                const double ou = kOff[i][0];
+                const double ov = kOff[i][1];
+                const double uu = u + margin * ou;
+                const double vv = v + margin * ov;
+                const double r2 = ou * ou + ov * ov;
+                const double w = 1.0 / (1.0 + r2);
+                double d_i = 0.0, du_i = 0.0, dv_i = 0.0;
+                eval_sphere(uu, vv, d_i, du_i, dv_i);
+                d_acc += w * d_i;
+                du_acc += w * du_i;
+                dv_acc += w * dv_i;
+                w_acc += w;
+            }
+            const double inv_w = (w_acc > EPS) ? (1.0 / w_acc) : 1.0;
+            delta = d_acc * inv_w;
+            dzdu = du_acc * inv_w;
+            dzdv = dv_acc * inv_w;
+        }
+    } else {
+        return false;
+    }
+
+    /* Jacobian normal for displaced parametric surface:
+     *   S(u,v) = P(u,v) + N0 * delta(u,v)
+     * with P(u,v)=v0+u*edge1+v*edge2 and constant base normal N0.
+     * Then:
+     *   Su = edge1 + N0 * d(delta)/du
+     *   Sv = edge2 + N0 * d(delta)/dv
+     *   N  = normalize(Su x Sv)
+     */
+    const V3d Su = tri.edge1 + tri.normal * dzdu;
+    const V3d Sv = tri.edge2 + tri.normal * dzdv;
+    V3d warped_n = Su.cross(Sv);
+    if (warped_n.norm() < EPS) {
+        /* Degenerate Jacobian fallback to first-order gradient frame. */
+        warped_n = (tri.normal - dzdu * t1 - dzdv * t2);
+    }
     if (warped_n.norm() < EPS)
         warped_n = tri.normal;
+    else
+        warped_n.normalize();
 
     out_normal = warped_n;
     out_pos = hit_pos + warped_n * delta;
@@ -924,6 +1056,7 @@ static void trace_rays_v2(
     int n_sources, const double* src_pos,
     const double* src_dir, const double* src_directivity,
     int n_rays, int max_bounces, double min_amplitude,
+    const int32_t* n_rays_per_source,
     std::mt19937_64& rng,
     bool& abort,
     HitFn&& hit_fn)
@@ -942,8 +1075,15 @@ static void trace_rays_v2(
         V3d src_d = V3d(sd[0], sd[1], sd[2]).normalized();
         double dirpow = src_directivity[si];
 
-        for (int ri = 0; ri < n_rays && !abort; ++ri) {
-            V3d dir = fibonacci_sphere_dir(ri, n_rays, src_d);
+        const int rays_for_source =
+            n_rays_per_source ? std::max(0, static_cast<int>(n_rays_per_source[si]))
+                              : std::max(0, n_rays);
+        if (rays_for_source <= 0) {
+            continue;
+        }
+
+        for (int ri = 0; ri < rays_for_source && !abort; ++ri) {
+            V3d dir = fibonacci_sphere_dir(ri, rays_for_source, src_d);
 
             double cos_a      = dir.dot(src_d);
             double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
@@ -1195,6 +1335,7 @@ int ray_tracer_trace_surface(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
+        nullptr,
         rng, abort,
         [&](int si, int bounce, int hit_tri,
             const V3d& incoming_dir, const V3d& surface_normal,
@@ -1363,6 +1504,105 @@ int ray_tracer_integrate_image(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
+        nullptr,
+        rng, abort,
+        [&](int si, int bounce, int hit_tri,
+            const V3d& incoming_dir, const V3d& surface_normal,
+            const VXcd& amp_prop,
+            const V3d& /*p0*/, const V3d& p1, double total_path) -> bool
+        {
+            V3d hit_pos = p1;
+            V3d hit_n = surface_normal;
+            if (hit_tri >= 0)
+                apply_parametric_surface_point(*st, hit_tri, p1, hit_pos, hit_n);
+
+            V3d v = hit_pos - cam_p;
+            double depth = v.dot(cam_f);
+            int visible = 0;
+            int context_entries = 0;
+            if (depth > EPS) {
+                const uint64_t c0 = st->camera_full_march_context_entries;
+                visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
+                context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
+            }
+
+            if (st->camera_field_grid)
+                accumulate_field_capture(*st, hit_pos, amp_prop);
+            append_camera_strike(*st, si, bounce, hit_tri, hit_pos, hit_n,
+                                 incoming_dir, depth, total_path,
+                                 visible, context_entries, amp_prop);
+
+            if (depth <= EPS) return true;
+            if (st->camera_depth_cull_enabled && depth > st->camera_depth_cull_m)
+                return true;
+            if (!visible)
+                return true;
+
+            double x_img = v.dot(cam_r);
+            double y_img = v.dot(cam_u);
+            double ndc_x =  x_img / (depth * tan_half_h);
+            double ndc_y = -y_img / (depth * tan_half_v);
+            int px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
+            int py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
+
+            if (px < 0 || px >= width || py < 0 || py >= height)
+                return true;
+
+            for (int b = 0; b < n_bands; ++b) {
+                size_t idx = static_cast<size_t>(b) * (height * width)
+                           + static_cast<size_t>(py) * width
+                           + static_cast<size_t>(px);
+                out_image[idx] += static_cast<float>(std::abs(amp_prop[b]));
+            }
+            return true;
+        });
+
+    return SK_OK;
+}
+
+int ray_tracer_integrate_image_packed(
+    RayTracerState* st,
+    int             n_sources,
+    const double*   src_pos,
+    const double*   src_dir,
+    const double*   src_directivity,
+    const int32_t*  src_n_rays,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    const double*   cam_pos,
+    const double*   cam_fwd,
+    const double*   cam_up,
+    double          fov_rad,
+    int             width,
+    int             height,
+    float*          out_image)
+{
+    if (!st || !out_image || !src_n_rays) return SK_ERR_NULL_STATE;
+
+    V3d cam_p(cam_pos[0], cam_pos[1], cam_pos[2]);
+    V3d cam_f = V3d(cam_fwd[0], cam_fwd[1], cam_fwd[2]).normalized();
+    V3d cam_u_hint(cam_up[0], cam_up[1], cam_up[2]);
+
+    V3d cam_r = cam_f.cross(cam_u_hint);
+    if (cam_r.norm() < EPS)
+        cam_r = cam_f.cross(V3d(1, 0, 0));
+    cam_r.normalize();
+    V3d cam_u = cam_r.cross(cam_f);
+
+    const double tan_half_v  = std::tan(fov_rad * 0.5);
+    const double aspect      = static_cast<double>(width) / height;
+    const double tan_half_h  = tan_half_v * aspect;
+
+    const int n_bands = st->n_bands;
+    bool abort = false;
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+
+    trace_rays_v2(
+        *st,
+        n_sources, src_pos, src_dir, src_directivity,
+        0, max_bounces, min_amplitude,
+        src_n_rays,
         rng, abort,
         [&](int si, int bounce, int hit_tri,
             const V3d& incoming_dir, const V3d& surface_normal,
@@ -1465,6 +1705,7 @@ int ray_tracer_trace_integrate_image(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
+        nullptr,
         rng, abort,
         [&](int si, int bounce, int hit_tri,
             const V3d& incoming_dir, const V3d& surface_normal,
@@ -2215,6 +2456,381 @@ int ray_tracer_set_sensor_film_ssbo(
         st->sensor_film_active_slots.assign(active_slots, active_slots + slot_count);
     }
     st->sensor_film_n_slots = n_slots;
+    return SK_OK;
+}
+
+static inline void sensor_film_row_to_summary(
+    const SensorRecord* sensor_row,
+    const FilmRecord*   film_row,
+    int slot_id,
+    int sensor_id,
+    int film_id,
+    double photons_mean,
+    double electrons_mean,
+    double snr_peak,
+    double snr_mean,
+    SensorFilmSlotSummary& out)
+{
+    const float qe_peak          = sensor_row ? sensor_row->qe_peak          : 0.0f;
+    const float full_well_e      = sensor_row ? sensor_row->full_well_e      : 0.0f;
+    const float read_noise_e     = sensor_row ? sensor_row->read_noise_e     : 0.0f;
+    const float dark_current_e_s = sensor_row ? sensor_row->dark_current_e_s : 0.0f;
+    const float exposure_time_s  = film_row   ? film_row->exposure_time_s    : 0.0f;
+
+    out.slot_id = slot_id;
+    out.sensor_id = sensor_id;
+    out.film_id = film_id;
+    out.qe_peak = qe_peak;
+    out.read_noise_e = read_noise_e;
+    out.dark_current_e_s = dark_current_e_s;
+    out.dark_current_accumulated_e = dark_current_e_s * exposure_time_s;
+    out.exposure_time_s = exposure_time_s;
+    out.full_well_e = full_well_e;
+    out.snr_peak = static_cast<float>(snr_peak);
+    out.snr_mean = static_cast<float>(snr_mean);
+    out.photons_flux_hz = static_cast<float>(photons_mean);
+    out.electrons_flux_hz = static_cast<float>(electrons_mean);
+}
+
+int ray_tracer_reduce_endpoint_records_to_sensor_integral(
+    const RayTracerState* st,
+    const EndpointRecord* records,
+    int                   n_records,
+    int                   n_px,
+    int                   n_py,
+    int                   sensor_group_id,
+    double                target_photons_per_pixel,
+    double                gain,
+    float*                out_photons,
+    float*                out_electrons,
+    float*                out_snr,
+    void*                 out_slot_summaries_void,
+    int                   out_slot_summary_cap,
+    int*                  out_slot_summary_count,
+    int*                  out_endpoint_record_count,
+    EndpointReductionTelemetry* out_telemetry)
+{
+    if (!st || !records || !out_photons || !out_electrons || !out_snr)
+        return SK_ERR_NULL_STATE;
+    if (n_px <= 0 || n_py <= 0 || sensor_group_id < 0)
+        return SK_ERR_DIM_MISMATCH;
+    if (out_slot_summary_count)
+        *out_slot_summary_count = 0;
+    if (out_endpoint_record_count)
+        *out_endpoint_record_count = n_records;
+    if (out_telemetry) {
+        std::memset(out_telemetry, 0, sizeof(*out_telemetry));
+        out_telemetry->input_records = n_records;
+    }
+
+    const int n_bands = st->n_bands;
+    const size_t pix_count = static_cast<size_t>(n_px) * static_cast<size_t>(n_py);
+    const size_t img_count = static_cast<size_t>(n_bands) * pix_count;
+
+    std::vector<cd> sensor_img(img_count, cd(0.0, 0.0));
+    uint32_t prev_subpath = 0u;
+    bool have_prev_subpath = false;
+    for (int i = 0; i < n_records; ++i) {
+        const EndpointRecord& E = records[static_cast<size_t>(i)];
+        if (out_telemetry) {
+            if (!have_prev_subpath) {
+                out_telemetry->first_subpath_id = E.subpath_id;
+                have_prev_subpath = true;
+            } else if (E.subpath_id < prev_subpath) {
+                out_telemetry->order_regressions += 1;
+            }
+            prev_subpath = E.subpath_id;
+            out_telemetry->last_subpath_id = E.subpath_id;
+        }
+
+        if (static_cast<int>(E.group_id) != sensor_group_id) {
+            if (out_telemetry) out_telemetry->drop_wrong_group += 1;
+            continue;
+        }
+        const int band = static_cast<int>(E.band_id);
+        if (band < 0 || band >= n_bands) {
+            if (out_telemetry) out_telemetry->drop_invalid_band += 1;
+            continue;
+        }
+
+        const int sub = static_cast<int>(E.subpath_id);
+        if (sub < 0) {
+            if (out_telemetry) out_telemetry->drop_negative_subpath += 1;
+            continue;
+        }
+        const int py = sub / n_px;
+        const int px = sub - py * n_px;
+        if (px < 0 || px >= n_px || py < 0 || py >= n_py) {
+            if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
+            continue;
+        }
+
+        const size_t idx = static_cast<size_t>(band) * pix_count
+                         + static_cast<size_t>(py) * static_cast<size_t>(n_px)
+                         + static_cast<size_t>(px);
+        sensor_img[idx] += cd(E.amp_re, E.amp_im);
+        if (out_telemetry)
+            out_telemetry->kept_records += 1;
+    }
+
+    std::fill(out_photons, out_photons + pix_count, 0.0f);
+    std::fill(out_electrons, out_electrons + pix_count, 0.0f);
+    std::fill(out_snr, out_snr + pix_count, 0.0f);
+
+    double mean_intensity = 0.0;
+    std::vector<double> intensity(pix_count, 0.0);
+    for (size_t py = 0; py < static_cast<size_t>(n_py); ++py) {
+        for (size_t px = 0; px < static_cast<size_t>(n_px); ++px) {
+            const size_t pix_idx = py * static_cast<size_t>(n_px) + px;
+            double sum_b = 0.0;
+            for (int b = 0; b < n_bands; ++b) {
+                const size_t idx = static_cast<size_t>(b) * pix_count + pix_idx;
+                sum_b += std::norm(sensor_img[idx]);
+            }
+            sum_b *= gain * gain;
+            intensity[pix_idx] = sum_b;
+            mean_intensity += sum_b;
+        }
+    }
+    mean_intensity /= std::max<size_t>(1, pix_count);
+
+    const double target_photons = std::max(0.0, target_photons_per_pixel);
+    for (size_t i = 0; i < pix_count; ++i) {
+        const double photon_val = (mean_intensity > 1.0e-20 && target_photons > 0.0)
+                                ? (intensity[i] / mean_intensity) * target_photons
+                                : intensity[i];
+        out_photons[i] = static_cast<float>(photon_val);
+    }
+
+    double photons_mean = 0.0;
+    for (size_t i = 0; i < pix_count; ++i)
+        photons_mean += out_photons[i];
+    photons_mean /= static_cast<double>(std::max<size_t>(1, pix_count));
+
+    auto* out_slot_summaries = static_cast<SensorFilmSlotSummary*>(out_slot_summaries_void);
+    const int valid_slot_cap = std::max(0, out_slot_summary_cap);
+    int slot_written = 0;
+    int valid_slots = 0;
+    double qe_sum = 0.0;
+    double read_noise_sum = 0.0;
+    double full_well_sum = 0.0;
+    std::vector<float> slot_electrons(pix_count, 0.0f);
+    std::vector<float> slot_snr(pix_count, 0.0f);
+
+    for (int slot_idx = 0; slot_idx < st->sensor_film_n_slots; ++slot_idx) {
+        if (slot_idx >= static_cast<int>(st->sensor_film_active_slots.size()))
+            break;
+        const int sensor_id = st->sensor_film_active_slots[static_cast<size_t>(slot_idx) * 2u];
+        const int film_id   = st->sensor_film_active_slots[static_cast<size_t>(slot_idx) * 2u + 1u];
+        if (sensor_id < 0 || film_id < 0)
+            continue;
+        if (sensor_id >= st->sensor_film_sensor_rows || film_id >= st->sensor_film_film_rows)
+            continue;
+
+        /* Access typed structs via reinterpret_cast — layout is guaranteed identical
+         * to Python SensorRecord/FilmRecord (same #pragma pack(push,4), same field order). */
+        const SensorRecord* sensor_row = st->sensor_film_sensor_chunk.empty()
+            ? nullptr
+            : reinterpret_cast<const SensorRecord*>(
+                  st->sensor_film_sensor_chunk.data()
+                  + static_cast<size_t>(sensor_id) * static_cast<size_t>(st->sensor_film_sensor_stride));
+        const FilmRecord* film_row = st->sensor_film_film_chunk.empty()
+            ? nullptr
+            : reinterpret_cast<const FilmRecord*>(
+                  st->sensor_film_film_chunk.data()
+                  + static_cast<size_t>(film_id) * static_cast<size_t>(st->sensor_film_film_stride));
+        if (!sensor_row || !film_row)
+            continue;
+
+        const float qe_peak              = sensor_row->qe_peak;
+        const float read_noise_e         = sensor_row->read_noise_e;
+        const float dark_current_e_s     = sensor_row->dark_current_e_s;
+        const float exposure_time_s      = film_row->exposure_time_s;
+        const float full_well_e          = sensor_row->full_well_e;
+        const double dark_current_accumulated_e = static_cast<double>(dark_current_e_s) * static_cast<double>(exposure_time_s);
+
+        double slot_snr_peak = 0.0;
+        double slot_snr_mean = 0.0;
+        double slot_electrons_mean = 0.0;
+        for (size_t i = 0; i < pix_count; ++i) {
+            const double electrons = out_photons[i] * qe_peak;
+            const double noise_variance = (read_noise_e * read_noise_e)
+                                        + dark_current_accumulated_e
+                                        + electrons;
+            const double snr = std::sqrt(std::max(0.0, electrons))
+                             / std::sqrt(std::max(noise_variance, 1.0e-10));
+            slot_electrons[i] = static_cast<float>(electrons);
+            slot_snr[i] = static_cast<float>(snr);
+            if (snr > slot_snr_peak)
+                slot_snr_peak = snr;
+            slot_snr_mean += snr;
+            slot_electrons_mean += electrons;
+            out_electrons[i] += static_cast<float>(electrons);
+            out_snr[i] += static_cast<float>(snr);
+        }
+
+        ++valid_slots;
+        const double inv_pix = 1.0 / std::max<size_t>(1, pix_count);
+        slot_snr_mean *= inv_pix;
+        slot_electrons_mean *= inv_pix;
+        qe_sum += qe_peak;
+        read_noise_sum += read_noise_e;
+        full_well_sum += full_well_e;
+
+        if (out_slot_summaries && slot_written < valid_slot_cap) {
+            sensor_film_row_to_summary(
+                sensor_row, film_row,
+                slot_idx, sensor_id, film_id,
+                photons_mean,
+                slot_electrons_mean,
+                slot_snr_peak,
+                slot_snr_mean,
+                out_slot_summaries[static_cast<size_t>(slot_written)]);
+            ++slot_written;
+        }
+    }
+
+    if (valid_slots > 0) {
+        const float inv_slots = 1.0f / static_cast<float>(valid_slots);
+        for (size_t i = 0; i < pix_count; ++i) {
+            out_electrons[i] *= inv_slots;
+            out_snr[i] *= inv_slots;
+        }
+    }
+
+    if (out_slot_summary_count)
+        *out_slot_summary_count = slot_written;
+    return SK_OK;
+}
+
+int ray_tracer_reduce_endpoint_records_to_rgb_image(
+    const RayTracerState* st,
+    const EndpointRecord* records,
+    int                   n_records,
+    int                   n_px,
+    int                   n_py,
+    int                   sensor_group_id,
+    double                gain,
+    double                hdr_white_percentile,
+    float*                out_rgb_linear,
+    float*                out_rgb_tonemapped,
+    EndpointReductionTelemetry* out_telemetry)
+{
+    if (!st || !records || !out_rgb_linear || !out_rgb_tonemapped)
+        return SK_ERR_NULL_STATE;
+    if (n_px <= 0 || n_py <= 0 || sensor_group_id < 0)
+        return SK_ERR_DIM_MISMATCH;
+
+    const int n_bands = st->n_bands;
+    const size_t pix_count = static_cast<size_t>(n_px) * static_cast<size_t>(n_py);
+    const size_t img_count = static_cast<size_t>(n_bands) * pix_count;
+
+    if (out_telemetry) {
+        std::memset(out_telemetry, 0, sizeof(*out_telemetry));
+        out_telemetry->input_records = n_records;
+    }
+
+    // Obstacle-1: make endpoint->color a canonical C++ route.
+    // We accumulate coherent complex amplitudes per (band,pixel), then project
+    // spectral power to RGB directly here instead of delegating color semantics
+    // to Python.
+    std::vector<cd> sensor_img(img_count, cd(0.0, 0.0));
+    uint32_t prev_subpath = 0u;
+    bool have_prev_subpath = false;
+    for (int i = 0; i < n_records; ++i) {
+        const EndpointRecord& E = records[static_cast<size_t>(i)];
+        if (out_telemetry) {
+            if (!have_prev_subpath) {
+                out_telemetry->first_subpath_id = E.subpath_id;
+                have_prev_subpath = true;
+            } else if (E.subpath_id < prev_subpath) {
+                out_telemetry->order_regressions += 1;
+            }
+            prev_subpath = E.subpath_id;
+            out_telemetry->last_subpath_id = E.subpath_id;
+        }
+        if (static_cast<int>(E.group_id) != sensor_group_id) {
+            if (out_telemetry) out_telemetry->drop_wrong_group += 1;
+            continue;
+        }
+        const int band = static_cast<int>(E.band_id);
+        if (band < 0 || band >= n_bands) {
+            if (out_telemetry) out_telemetry->drop_invalid_band += 1;
+            continue;
+        }
+        const int sub = static_cast<int>(E.subpath_id);
+        if (sub < 0) {
+            if (out_telemetry) out_telemetry->drop_negative_subpath += 1;
+            continue;
+        }
+        const int py = sub / n_px;
+        const int px = sub - py * n_px;
+        if (px < 0 || px >= n_px || py < 0 || py >= n_py) {
+            if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
+            continue;
+        }
+        const size_t idx = static_cast<size_t>(band) * pix_count
+                         + static_cast<size_t>(py) * static_cast<size_t>(n_px)
+                         + static_cast<size_t>(px);
+        sensor_img[idx] += cd(E.amp_re, E.amp_im);
+        if (out_telemetry) out_telemetry->kept_records += 1;
+    }
+
+    auto wavelength_nm = [](double freq_hz) -> double {
+        static constexpr double C_LIGHT_M_S = 299792458.0;
+        return (freq_hz > 0.0) ? (C_LIGHT_M_S / freq_hz) * 1.0e9 : 0.0;
+    };
+    auto gauss = [](double x, double mu, double sigma) -> double {
+        const double t = (x - mu) / std::max(1.0e-12, sigma);
+        return std::exp(-0.5 * t * t);
+    };
+
+    std::vector<float> rgb_linear(static_cast<size_t>(3) * pix_count, 0.0f);
+    double white = 0.0;
+    const double gain_sq = gain * gain;
+    for (size_t py = 0; py < static_cast<size_t>(n_py); ++py) {
+        for (size_t px = 0; px < static_cast<size_t>(n_px); ++px) {
+            const size_t pix_idx = py * static_cast<size_t>(n_px) + px;
+            double r = 0.0, g = 0.0, b = 0.0;
+            for (int band = 0; band < n_bands; ++band) {
+                const size_t idx = static_cast<size_t>(band) * pix_count + pix_idx;
+                const double p = std::norm(sensor_img[idx]) * gain_sq;
+                const double wl = wavelength_nm(st->freq_hz_vec[band]);
+                const double wr = gauss(wl, 610.0, 45.0);
+                const double wg = gauss(wl, 540.0, 40.0);
+                const double wb = gauss(wl, 460.0, 35.0);
+                r += p * wr;
+                g += p * wg;
+                b += p * wb;
+            }
+            const size_t base = pix_idx * 3u;
+            rgb_linear[base + 0] = static_cast<float>(r);
+            rgb_linear[base + 1] = static_cast<float>(g);
+            rgb_linear[base + 2] = static_cast<float>(b);
+            white = std::max(white, std::max(r, std::max(g, b)));
+        }
+    }
+
+    if (white < 1.0e-8)
+        white = 1.0;
+
+    // Obstacle-2: expose explicit tone-map semantics and telemetry at C++ API
+    // boundary so preview consumers do not need hidden Python-side transforms.
+    const double wp = std::min(100.0, std::max(75.0, hdr_white_percentile));
+    const double white_scale = std::max(1.0e-8, white * (wp / 100.0));
+    const double log_denom = std::log1p(6.0);
+
+    for (size_t i = 0; i < pix_count; ++i) {
+        const size_t base = i * 3u;
+        for (int c = 0; c < 3; ++c) {
+            const float lin = rgb_linear[base + static_cast<size_t>(c)];
+            out_rgb_linear[base + static_cast<size_t>(c)] = lin;
+            const double x = std::max(0.0, static_cast<double>(lin));
+            const double y = std::log1p((x / white_scale) * 6.0) / log_denom;
+            out_rgb_tonemapped[base + static_cast<size_t>(c)] = static_cast<float>(std::min(1.0, std::max(0.0, y)));
+        }
+    }
+
     return SK_OK;
 }
 
@@ -3149,13 +3765,18 @@ static inline void apply_thin_lens_transform(
 static inline void apply_wave_aperture_transform(
     const RayTracerState& st, const RtScaleContext& ctx,
     const V3d& cross_pos, VXcd& amp);
+static inline void apply_thick_lens_wave_transform(
+    const RayTracerState& st, const RtScaleContext& ctx,
+    V3d& pos, V3d& dir, VXcd& amp);
 static inline uint32_t dispatch_scale_context_entry(
     const RayTracerState& st, const RtScaleContext& ctx,
     V3d& pos, V3d& dir, VXcd& amp);
 
-extern "C" SK_API int ray_tracer_bidirectional(
+static int ray_tracer_bidirectional_impl(
     RayTracerState* st,
     int             n_rays_per_emitter,
+    const int32_t*  packed_n_rays,
+    int             packed_n_emitters,
     int             max_bounces,
     double          min_amplitude,
     uint32_t        seed,
@@ -3189,10 +3810,22 @@ extern "C" SK_API int ray_tracer_bidirectional(
     int rec_count = 0;
     uint32_t subpath_counter = 0;
 
+    int emissive_idx = 0;
+
     /* For each emissive group … */
     for (size_t g = 0; g < st->tri_groups.size(); ++g) {
         const TriGroupDesc& gd = st->tri_groups[g];
         if (!(gd.role_bits & TRI_GROUP_ROLE_EMISSIVE)) continue;
+
+        int n_rays_this = n_rays_per_emitter;
+        if (packed_n_rays && emissive_idx < packed_n_emitters) {
+            n_rays_this = std::max(0, static_cast<int>(packed_n_rays[emissive_idx]));
+        }
+        emissive_idx += 1;
+        if (n_rays_this <= 0) {
+            continue;
+        }
+
         const auto& idxs = st->tri_group_indices[g];
         const auto& cdf  = st->tri_group_cum_areas[g];
         if (idxs.empty()) continue;
@@ -3203,7 +3836,7 @@ extern "C" SK_API int ray_tracer_bidirectional(
          * scales the result via Python.  We are preserving phase, so we
          * cannot pre-scale by emit_W without losing complex coherence
          * across bands. */
-        for (int ri = 0; ri < n_rays_per_emitter; ++ri) {
+        for (int ri = 0; ri < n_rays_this; ++ri) {
             /* 1. Pick a triangle (area-weighted). */
             double r = U(rng) * tot_area;
             int lo = 0, hi = (int)cdf.size() - 1;
@@ -3231,6 +3864,15 @@ extern "C" SK_API int ray_tracer_bidirectional(
             V3d pos = origin + dir * (EPS * 200.0);
             double path_len = 0.0;
             uint32_t my_subpath = subpath_counter++;
+
+            /* Launch-context dispatch: apply region transforms to emission
+             * rays immediately after post-triangulated intercept prep. */
+            for (const RtScaleContext& ctx : st->scale_contexts) {
+                V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
+                if ((pos - c).norm() <= ctx.radius) {
+                    dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
+                }
+            }
 
             for (int bounce = 0; bounce < max_bounces; ++bounce) {
                 double t_hit = 1e18; int hit_tri = -1;
@@ -3281,7 +3923,7 @@ extern "C" SK_API int ray_tracer_bidirectional(
                         E.dir[0] = (float)dir.x();
                         E.dir[1] = (float)dir.y();
                         E.dir[2] = (float)dir.z();
-                        E.pdf       = 1.0f / (float)n_rays_per_emitter;
+                        E.pdf       = 1.0f / (float)std::max(1, n_rays_this);
                         E.amp_re    = (float)amp[b].real();
                         E.amp_im    = (float)amp[b].imag();
                         E.cos_theta = (float)cos_theta;
@@ -3505,6 +4147,8 @@ bdpt_done:
                         }
                         if (hit_tri < 0) continue;
                         V3d hit_pos = pos + t_hit * dir;
+                        V3d hit_n_param = st->tris[(size_t)hit_tri].normal;
+                        apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n_param);
                         double total_path = path_len + t_hit;
 
                         for (int b = 0; b < n_bands; ++b) {
@@ -3514,7 +4158,7 @@ bdpt_done:
                             amp_local[b] *= std::polar(atten * spread, -k * t_hit);
                         }
 
-                        V3d hit_n = st->tris[(size_t)hit_tri].normal;
+                        V3d hit_n = hit_n_param;
                         double cos_theta = std::abs(dir.dot(hit_n));
                         uint32_t my_subpath = (uint32_t)pi;
 
@@ -3552,6 +4196,54 @@ bdpt_done:
 
     *out_count = rec_count;
     return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_bidirectional(
+    RayTracerState* st,
+    int             n_rays_per_emitter,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    EndpointRecord* out_records,
+    int             out_cap,
+    int*            out_count)
+{
+    return ray_tracer_bidirectional_impl(
+        st,
+        n_rays_per_emitter,
+        nullptr,
+        0,
+        max_bounces,
+        min_amplitude,
+        seed,
+        out_records,
+        out_cap,
+        out_count);
+}
+
+extern "C" SK_API int ray_tracer_bidirectional_packed(
+    RayTracerState* st,
+    const int32_t*  n_rays_per_emitter,
+    int             n_emitters,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    EndpointRecord* out_records,
+    int             out_cap,
+    int*            out_count)
+{
+    if (!n_rays_per_emitter || n_emitters <= 0) return SK_ERR_NULL_STATE;
+    return ray_tracer_bidirectional_impl(
+        st,
+        0,
+        n_rays_per_emitter,
+        n_emitters,
+        max_bounces,
+        min_amplitude,
+        seed,
+        out_records,
+        out_cap,
+        out_count);
 }
 
 /* ──────────────────────────────────────────────────────────────────────
@@ -3651,6 +4343,39 @@ static inline void apply_wave_aperture_transform(
     }
 }
 
+/*
+ * apply_thick_lens_wave_transform — combined geometric bend + wave phase.
+ * Payload convention (float64[]):
+ *   [0] focal_m  (optional, defaults to ctx.radius)
+ *   [1] phase_scale (optional, defaults to 1.0)
+ */
+static inline void apply_thick_lens_wave_transform(
+    const RayTracerState& st,
+    const RtScaleContext& ctx,
+    V3d& pos,
+    V3d& dir,
+    VXcd& amp)
+{
+    double focal_m = (ctx.radius > 0.0) ? ctx.radius : 0.1;
+    double phase_scale = 1.0;
+    if (ctx.payload && ctx.payload_size_bytes >= (int)sizeof(double)) {
+        const double* p = static_cast<const double*>(ctx.payload);
+        if (p[0] > 0.0) focal_m = p[0];
+        if (ctx.payload_size_bytes >= (int)(sizeof(double) * 2) && p[1] > 0.0)
+            phase_scale = p[1];
+    }
+
+    // Geometric component: thin-lens steering.
+    apply_thin_lens_transform(ctx, pos, dir);
+
+    // Wave component: Fresnel-style phase/apodization at current crossing.
+    RtScaleContext wave_ctx = ctx;
+    const double payload_local[1] = { focal_m * phase_scale };
+    wave_ctx.payload = payload_local;
+    wave_ctx.payload_size_bytes = (int)sizeof(payload_local);
+    apply_wave_aperture_transform(st, wave_ctx, pos, amp);
+}
+
 /**
  * dispatch_scale_context_entry — call site invoked when a ray segment
  * crosses into (or originates inside) a registered scale context.  Switches
@@ -3676,6 +4401,8 @@ static inline uint32_t dispatch_scale_context_entry(
             apply_thin_lens_transform(ctx, pos, dir);
             return 1u << SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM;
         case SCALE_CONTEXT_KIND_THICK_LENS_WAVE:
+            apply_thick_lens_wave_transform(st, ctx, pos, dir, amp);
+            return 1u << SCALE_CONTEXT_KIND_THICK_LENS_WAVE;
         case SCALE_CONTEXT_KIND_SPLINE_SURFACE:
         case SCALE_CONTEXT_KIND_NEURAL_SURFACE:
         case SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC:

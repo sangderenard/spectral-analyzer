@@ -820,6 +820,62 @@ struct PyRayTracer
                 "ray_tracer_integrate_image failed: rc=" + std::to_string(rc));
     }
 
+    void integrate_image_into_packed(
+        py::array_t<double> src_pos,
+        py::array_t<double> src_dir,
+        py::array_t<double> src_directivity,
+        py::array_t<int32_t> src_n_rays,
+        py::array_t<double> cam_pos,
+        py::array_t<double> cam_fwd,
+        py::array_t<double> cam_up,
+        py::array_t<float>  out_image,
+        double   fov_rad       = 1.0,
+        int      max_bounces   = 12,
+        double   min_amplitude = 0.001,
+        uint32_t seed          = 42)
+    {
+        auto ip   = src_pos        .request();
+        auto id_  = src_dir        .request();
+        auto idv  = src_directivity.request();
+        auto inr  = src_n_rays     .request();
+        auto icp  = cam_pos        .request();
+        auto icf  = cam_fwd        .request();
+        auto icu  = cam_up         .request();
+        auto oi   = out_image      .request();
+
+        if (oi.ndim != 3 || oi.shape[0] != _n_bands)
+            throw std::runtime_error("out_image must be float32 shape (n_bands, height, width)");
+        if (inr.ndim != 1)
+            throw std::runtime_error("src_n_rays must be int32 shape (n_sources,)");
+        if (static_cast<int>(inr.shape[0]) != static_cast<int>(idv.size))
+            throw std::runtime_error("src_n_rays length must match n_sources");
+
+        int height = static_cast<int>(oi.shape[1]);
+        int width  = static_cast<int>(oi.shape[2]);
+
+        int rc;
+        {
+            py::gil_scoped_release release;
+            rc = ray_tracer_integrate_image_packed(
+                handle,
+                static_cast<int>(idv.size),
+                static_cast<const double*>(ip .ptr),
+                static_cast<const double*>(id_.ptr),
+                static_cast<const double*>(idv.ptr),
+                static_cast<const int32_t*>(inr.ptr),
+                max_bounces, min_amplitude, seed,
+                static_cast<const double*>(icp.ptr),
+                static_cast<const double*>(icf.ptr),
+                static_cast<const double*>(icu.ptr),
+                fov_rad, width, height,
+                static_cast<float*>(oi.ptr));
+        }
+
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "ray_tracer_integrate_image_packed failed: rc=" + std::to_string(rc));
+    }
+
     int trace_integrate_image_into(
         py::array_t<double> src_pos,
         py::array_t<double> src_dir,
@@ -3086,6 +3142,25 @@ Accumulate a camera energy image into a caller-owned float32 buffer.
 The output buffer is not cleared. Reuse the same (n_bands, height, width)
 array across massive ray batches, clearing only when you want to erase history.
 )doc")
+    .def("integrate_image_into_packed", &PyRayTracer::integrate_image_into_packed,
+         py::arg("src_pos"),
+         py::arg("src_dir"),
+         py::arg("src_directivity"),
+         py::arg("src_n_rays"),
+         py::arg("cam_pos"),
+         py::arg("cam_fwd"),
+         py::arg("cam_up"),
+         py::arg("out_image"),
+         py::arg("fov_rad")       = 1.0,
+         py::arg("max_bounces")   = 12,
+         py::arg("min_amplitude") = 0.001,
+         py::arg("seed")          = 42,
+         R"doc(
+Accumulate camera energy with per-source packed ray quotas.
+
+src_n_rays is an int32 vector (n_sources,) controlling how many rays each
+source emits in this dispatch. This keeps adaptive allocation in one hot C++ loop.
+)doc")
         .def("trace_integrate_image_into", &PyRayTracer::trace_integrate_image_into,
              py::arg("src_pos"),
              py::arg("src_dir"),
@@ -3464,8 +3539,12 @@ Returns : (n_written, n_live) — segments written and rays still alive
                  }
 
                  /* Optional parametric surface payload.
-                  * Expected dict: {"kind": int, "coeffs": float64[6]} for
-                  * TRI_PARAM_SURFACE_POLY_BARY. */
+                  * Expected dict: {"kind": int, "coeffs": float64[N]} where
+                  * N depends on kind:
+                  *   POLY_BARY   -> 6
+                  *   SDF_SADDLE  -> 2 (amplitude_m, neighborhood_margin_uv)
+                  *   SDF_SPHERE  -> 2 (radius_m, neighborhood_margin_uv)
+                  */
                  py::array_t<double, py::array::c_style | py::array::forcecast> param_arr;
                  if (!parametric_surface.is_none()) {
                      py::dict d = parametric_surface.cast<py::dict>();
@@ -3540,10 +3619,16 @@ power_W_per_band : optional float32 (n_bands,) per-band emission spectrum
                    override.  None = use mat_buf emission row.  This is the
                    ONLY emission-curve fallback path — no PBR.
 parametric_surface: optional dict for strike/emission parametric override.
-                                     Supported now:
-                                         {"kind": TRI_PARAM_SURFACE_POLY_BARY,
-                                            "coeffs": float64[6]} where coeffs define normal-offset
-                                            polynomial in barycentric (u,v).
+                                                 Supported now:
+                                                      {"kind": TRI_PARAM_SURFACE_POLY_BARY,
+                                                          "coeffs": float64[6]} where coeffs define normal-offset
+                                                          polynomial in barycentric (u,v).
+                                                      {"kind": TRI_PARAM_SURFACE_SDF_SADDLE,
+                                                          "coeffs": float64[2]} where coeffs are
+                                                          [amplitude_m, neighborhood_margin_uv].
+                                                      {"kind": TRI_PARAM_SURFACE_SDF_SPHERE,
+                                                          "coeffs": float64[2]} where coeffs are
+                                                          [radius_m, neighborhood_margin_uv].
 sensor_camera    : optional dict for SENSOR + PIXEL_CONE groups, with keys
                    pos (3,), fwd (3,), up (3,), sensor_w_m, sensor_h_m,
                    focal_m, aperture_radius_m, n_px, n_py,
@@ -3600,7 +3685,265 @@ max_bounces        : maximum bounces per subpath
 min_amplitude      : kill threshold on max(|amp|) across bands
 seed               : RNG seed
 max_records        : output buffer cap (default 2**20).  Records beyond this
-                     are silently dropped — increase for dense scenes.
+             are silently dropped — increase for dense scenes.
+)doc")
+        .def("bidirectional_packed",
+             [](PyRayTracer& self,
+                py::array_t<int32_t, py::array::c_style | py::array::forcecast> n_rays_per_emitter,
+                int max_bounces,
+                double min_amplitude,
+                uint32_t seed,
+                int max_records) {
+                 auto nr = n_rays_per_emitter.request();
+                 if (nr.ndim != 1)
+                     throw std::runtime_error("n_rays_per_emitter must be int32 shape (n_emitters,)");
+                 if (max_records <= 0) max_records = 1 << 20;
+                 py::array_t<float> recs(
+                     {(py::ssize_t)max_records, (py::ssize_t)16});
+                 auto buf = recs.mutable_unchecked<2>();
+                 EndpointRecord* out = reinterpret_cast<EndpointRecord*>(buf.mutable_data(0, 0));
+                 int n_out = 0;
+                 int rc = ray_tracer_bidirectional_packed(
+                     self.handle,
+                     static_cast<const int32_t*>(nr.ptr),
+                     static_cast<int>(nr.shape[0]),
+                     max_bounces,
+                     min_amplitude,
+                     seed,
+                     out,
+                     max_records,
+                     &n_out);
+                 if (rc != SK_OK)
+                     throw std::runtime_error(
+                         "ray_tracer_bidirectional_packed failed: rc=" + std::to_string(rc));
+                 py::array_t<float> trimmed(
+                     {(py::ssize_t)n_out, (py::ssize_t)16});
+                 if (n_out > 0) {
+                     std::memcpy(trimmed.mutable_data(),
+                                 buf.data(0, 0),
+                                 sizeof(EndpointRecord) * n_out);
+                 }
+                 return trimmed;
+             },
+             py::arg("n_rays_per_emitter"),
+             py::arg("max_bounces") = 8,
+             py::arg("min_amplitude") = 0.005,
+             py::arg("seed") = 0,
+             py::arg("max_records") = 0,
+             R"doc(
+Bidirectional path tracing pass with per-emitter packed ray quotas.
+
+n_rays_per_emitter: int32 (n_emitters,), registration-order quotas for
+EMISSIVE TriGroups.
+)doc")
+    .def("reduce_endpoint_records_to_sensor_integral",
+             [](PyRayTracer& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> records,
+                int n_px, int n_py, int sensor_group_id,
+                double target_photons_per_pixel, double gain) {
+                 auto rb = records.request();
+                 if (rb.ndim != 2 || rb.shape[1] < 16)
+                     throw std::runtime_error("records must be float32 shape (n_records, 16)");
+
+                 const int n_records = static_cast<int>(rb.shape[0]);
+                 py::array::ShapeContainer shape = {
+                     static_cast<py::ssize_t>(n_py),
+                     static_cast<py::ssize_t>(n_px)
+                 };
+                 py::array_t<float> photons(shape);
+                 py::array_t<float> electrons(shape);
+                 py::array_t<float> snr(shape);
+
+                 std::vector<SensorFilmSlotSummary> slot_summaries(8);
+                 int n_slot_summaries = 0;
+                 int endpoint_count = 0;
+                 EndpointReductionTelemetry telemetry{};
+                 const EndpointRecord* rec_ptr =
+                     reinterpret_cast<const EndpointRecord*>(rb.ptr);
+                 int rc = ray_tracer_reduce_endpoint_records_to_sensor_integral(
+                     self.handle,
+                     rec_ptr,
+                     n_records,
+                     n_px,
+                     n_py,
+                     sensor_group_id,
+                     target_photons_per_pixel,
+                     gain,
+                     static_cast<float*>(photons.mutable_data()),
+                     static_cast<float*>(electrons.mutable_data()),
+                     static_cast<float*>(snr.mutable_data()),
+                     static_cast<void*>(slot_summaries.data()),
+                     static_cast<int>(slot_summaries.size()),
+                     &n_slot_summaries,
+                     &endpoint_count,
+                     &telemetry);
+                 if (rc != SK_OK)
+                     throw std::runtime_error(
+                         "ray_tracer_reduce_endpoint_records_to_sensor_integral failed: rc=" + std::to_string(rc));
+
+                 const size_t pix_count = static_cast<size_t>(n_px) * static_cast<size_t>(n_py);
+                 const float* photons_ptr = static_cast<const float*>(photons.data());
+                 const float* electrons_ptr = static_cast<const float*>(electrons.data());
+                 const float* snr_ptr = static_cast<const float*>(snr.data());
+
+                 double photons_mean = 0.0;
+                 double electrons_mean = 0.0;
+                 double snr_peak = 0.0;
+                 double snr_mean = 0.0;
+                 for (size_t i = 0; i < pix_count; ++i) {
+                     photons_mean += photons_ptr[i];
+                     electrons_mean += electrons_ptr[i];
+                     snr_mean += snr_ptr[i];
+                     if (snr_ptr[i] > snr_peak)
+                         snr_peak = snr_ptr[i];
+                 }
+                 const double inv_pix = 1.0 / std::max<size_t>(1, pix_count);
+                 photons_mean *= inv_pix;
+                 electrons_mean *= inv_pix;
+                 snr_mean *= inv_pix;
+
+                 py::list slot_metrics;
+                 py::list active_slot_ids;
+                 double qe_sum = 0.0;
+                 double read_noise_sum = 0.0;
+                 double full_well_sum = 0.0;
+                 for (int i = 0; i < n_slot_summaries; ++i) {
+                     const auto& s = slot_summaries[static_cast<size_t>(i)];
+                     active_slot_ids.append(py::int_(s.slot_id));
+                     qe_sum += s.qe_peak;
+                     read_noise_sum += s.read_noise_e;
+                     full_well_sum += s.full_well_e;
+
+                     py::dict slot_metric;
+                     slot_metric["slot_id"] = py::int_(s.slot_id);
+                     slot_metric["sensor_id"] = py::int_(s.sensor_id);
+                     slot_metric["film_id"] = py::int_(s.film_id);
+                     slot_metric["qe_peak"] = py::float_(s.qe_peak);
+                     slot_metric["read_noise_e"] = py::float_(s.read_noise_e);
+                     slot_metric["dark_current_e_s"] = py::float_(s.dark_current_e_s);
+                     slot_metric["dark_current_accumulated_e"] = py::float_(s.dark_current_accumulated_e);
+                     slot_metric["exposure_time_s"] = py::float_(s.exposure_time_s);
+                     slot_metric["full_well_e"] = py::float_(s.full_well_e);
+                     slot_metric["snr_peak"] = py::float_(s.snr_peak);
+                     slot_metric["snr_mean"] = py::float_(s.snr_mean);
+                     slot_metric["photons_flux_hz"] = py::float_(s.photons_flux_hz);
+                     slot_metric["electrons_flux_hz"] = py::float_(s.electrons_flux_hz);
+                     slot_metrics.append(slot_metric);
+                 }
+
+                 py::dict metrics;
+                 metrics["active_slot_ids"] = active_slot_ids;
+                 metrics["n_active_slots"] = py::int_(n_slot_summaries);
+                 metrics["qe_peak"] = py::float_(n_slot_summaries > 0 ? qe_sum / n_slot_summaries : 0.0);
+                 metrics["read_noise_e"] = py::float_(n_slot_summaries > 0 ? read_noise_sum / n_slot_summaries : 0.0);
+                 metrics["full_well_e"] = py::float_(n_slot_summaries > 0 ? full_well_sum / n_slot_summaries : 0.0);
+                 metrics["snr_peak"] = py::float_(snr_peak);
+                 metrics["snr_mean"] = py::float_(snr_mean);
+                 metrics["endpoint_records_count"] = py::int_(endpoint_count);
+                 metrics["sensor_group_id"] = py::int_(sensor_group_id);
+                 metrics["photons_flux_hz"] = py::float_(photons_mean);
+                 metrics["electrons_flux_hz"] = py::float_(electrons_mean);
+                 metrics["slot_metrics"] = slot_metrics;
+                 metrics["kept_records"] = py::int_(telemetry.kept_records);
+                 metrics["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
+                 metrics["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
+                 metrics["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
+                 metrics["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);
+                 metrics["order_regressions"] = py::int_(telemetry.order_regressions);
+                 metrics["first_subpath_id"] = py::int_(telemetry.first_subpath_id);
+                 metrics["last_subpath_id"] = py::int_(telemetry.last_subpath_id);
+                 metrics["possibly_clamped_input"] = py::bool_(
+                     n_records > 0 && n_records == (1 << 20));
+
+                 py::dict out;
+                 out["photons_per_pixel"] = photons;
+                 out["electrons_per_pixel"] = electrons;
+                 out["snr_linear"] = snr;
+                 out["metrics"] = metrics;
+                 return out;
+             },
+             py::arg("records"),
+             py::arg("n_px"),
+             py::arg("n_py"),
+             py::arg("sensor_group_id"),
+             py::arg("target_photons_per_pixel"),
+             py::arg("gain") = 1.0,
+             R"doc(
+Reduce EndpointRecord rows into a simulated sensor integral.
+
+records : float32 (n_records, 16) array returned by bidirectional()
+n_px/n_py: sensor pixel dimensions
+sensor_group_id: PIXEL_CONE sensor group to retain
+target_photons_per_pixel: exposure-normalised photon target used to stabilise the preview map
+gain    : exposure gain multiplier applied before photon normalisation
+)doc")
+    .def("reduce_endpoint_records_to_rgb_image",
+             [](PyRayTracer& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> records,
+                int n_px, int n_py, int sensor_group_id,
+                double gain, double hdr_white_percentile) {
+                 auto rb = records.request();
+                 if (rb.ndim != 2 || rb.shape[1] < 16)
+                     throw std::runtime_error("records must be float32 shape (n_records, 16)");
+
+                 const int n_records = static_cast<int>(rb.shape[0]);
+                 py::array::ShapeContainer shape = {
+                     static_cast<py::ssize_t>(n_py),
+                     static_cast<py::ssize_t>(n_px),
+                     static_cast<py::ssize_t>(3)
+                 };
+                 py::array_t<float> rgb_linear(shape);
+                 py::array_t<float> rgb_tonemapped(shape);
+
+                 EndpointReductionTelemetry telemetry{};
+                 const EndpointRecord* rec_ptr =
+                     reinterpret_cast<const EndpointRecord*>(rb.ptr);
+                 int rc = ray_tracer_reduce_endpoint_records_to_rgb_image(
+                     self.handle,
+                     rec_ptr,
+                     n_records,
+                     n_px,
+                     n_py,
+                     sensor_group_id,
+                     gain,
+                     hdr_white_percentile,
+                     static_cast<float*>(rgb_linear.mutable_data()),
+                     static_cast<float*>(rgb_tonemapped.mutable_data()),
+                     &telemetry);
+                 if (rc != SK_OK)
+                     throw std::runtime_error(
+                         "ray_tracer_reduce_endpoint_records_to_rgb_image failed: rc=" + std::to_string(rc));
+
+                 py::dict telemetry_dict;
+                 telemetry_dict["input_records"] = py::int_(telemetry.input_records);
+                 telemetry_dict["kept_records"] = py::int_(telemetry.kept_records);
+                 telemetry_dict["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
+                 telemetry_dict["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
+                 telemetry_dict["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
+                 telemetry_dict["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);
+                 telemetry_dict["order_regressions"] = py::int_(telemetry.order_regressions);
+                 telemetry_dict["first_subpath_id"] = py::int_(telemetry.first_subpath_id);
+                 telemetry_dict["last_subpath_id"] = py::int_(telemetry.last_subpath_id);
+
+                 py::dict out;
+                 out["rgb_linear"] = rgb_linear;
+                 out["rgb_tonemapped"] = rgb_tonemapped;
+                 out["telemetry"] = telemetry_dict;
+                 return out;
+             },
+             py::arg("records"),
+             py::arg("n_px"),
+             py::arg("n_py"),
+             py::arg("sensor_group_id"),
+             py::arg("gain") = 1.0,
+             py::arg("hdr_white_percentile") = 99.8,
+             R"doc(
+Reduce EndpointRecord rows into canonical C++ RGB outputs.
+
+Returns:
+- rgb_linear: float32 (n_py, n_px, 3)
+- rgb_tonemapped: float32 (n_py, n_px, 3)
+- telemetry: drop/order diagnostics for reduction quality
 )doc");
 
     py::class_<PyFieldSolver>(m, "FieldSolver",
@@ -4070,6 +4413,8 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("TRI_GROUP_SAMPLE_PIXEL_CONE") = (int)TRI_GROUP_SAMPLE_PIXEL_CONE;
     m.attr("TRI_PARAM_SURFACE_NONE")      = (int)TRI_PARAM_SURFACE_NONE;
     m.attr("TRI_PARAM_SURFACE_POLY_BARY") = (int)TRI_PARAM_SURFACE_POLY_BARY;
+    m.attr("TRI_PARAM_SURFACE_SDF_SADDLE") = (int)TRI_PARAM_SURFACE_SDF_SADDLE;
+    m.attr("TRI_PARAM_SURFACE_SDF_SPHERE") = (int)TRI_PARAM_SURFACE_SDF_SPHERE;
 
     /* ── Surface spline fitter ──────────────────────────────────────────────── */
     m.def("surface_spline_fit",

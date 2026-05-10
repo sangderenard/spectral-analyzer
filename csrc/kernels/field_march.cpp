@@ -25,10 +25,25 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <new>
 #include <vector>
 
 using cd32 = std::complex<float>;
+
+static inline bool checked_mul_i64(int64_t a, int64_t b, int64_t& out) {
+    if (a < 0 || b < 0) return false;
+    if (a != 0 && b > (std::numeric_limits<int64_t>::max() / a)) return false;
+    out = a * b;
+    return true;
+}
+
+static inline bool checked_add_i64(int64_t a, int64_t b, int64_t& out) {
+    if (a < 0 || b < 0) return false;
+    if (b > (std::numeric_limits<int64_t>::max() - a)) return false;
+    out = a + b;
+    return true;
+}
 
 /* ── Concrete grid struct (declared opaquely in field_grid.h) ──────────── */
 struct FieldGrid {
@@ -49,6 +64,7 @@ struct FieldGrid {
 /* ── Allocation helpers ─────────────────────────────────────────────────── */
 static cd32* _alloc_zero(int64_t n) {
     if (n <= 0) return nullptr;
+    if (n > static_cast<int64_t>(std::numeric_limits<size_t>::max())) return nullptr;
     cd32* p = static_cast<cd32*>(std::calloc(static_cast<size_t>(n), sizeof(cd32)));
     return p;
 }
@@ -67,8 +83,17 @@ extern "C" SK_API FieldGrid* field_grid_create_regular(
         g->bmin[i] = bmin ? bmin[i] : 0.f;
         g->bmax[i] = bmax ? bmax[i] : 1.f;
     }
-    g->n_cells_total = static_cast<int64_t>(nx) * ny * nz;
-    g->data = _alloc_zero(g->n_cells_total * n_bands);
+    int64_t nxy = 0;
+    int64_t nxyz = 0;
+    int64_t total_cells = 0;
+    if (!checked_mul_i64(static_cast<int64_t>(nx), static_cast<int64_t>(ny), nxy)
+        || !checked_mul_i64(nxy, static_cast<int64_t>(nz), nxyz)
+        || !checked_mul_i64(nxyz, static_cast<int64_t>(n_bands), total_cells)) {
+        delete g;
+        return nullptr;
+    }
+    g->n_cells_total = nxyz;
+    g->data = _alloc_zero(total_cells);
     if (!g->data) { delete g; return nullptr; }
     return g;
 }
@@ -88,10 +113,21 @@ extern "C" SK_API FieldGrid* field_grid_create_kdtree(
     int64_t total = 0;
     for (auto& nd : g->nodes) {
         if (nd.child_lo < 0) {  /* leaf */
-            int64_t lc = static_cast<int64_t>(nd.leaf_dims[0])
-                       * nd.leaf_dims[1] * nd.leaf_dims[2];
+            if (nd.leaf_dims[0] <= 0 || nd.leaf_dims[1] <= 0 || nd.leaf_dims[2] <= 0) {
+                delete g;
+                return nullptr;
+            }
+            int64_t lxy = 0;
+            int64_t lc = 0;
+            int64_t total_next = 0;
+            if (!checked_mul_i64(static_cast<int64_t>(nd.leaf_dims[0]), static_cast<int64_t>(nd.leaf_dims[1]), lxy)
+                || !checked_mul_i64(lxy, static_cast<int64_t>(nd.leaf_dims[2]), lc)
+                || !checked_add_i64(total, lc, total_next)) {
+                delete g;
+                return nullptr;
+            }
             nd.first_data = total;
-            total += lc;
+            total = total_next;
         }
     }
     g->n_cells_total = total;
@@ -103,7 +139,12 @@ extern "C" SK_API FieldGrid* field_grid_create_kdtree(
             g->bmax[i] = g->nodes[0].bmax[i];
         }
     }
-    g->data = _alloc_zero(g->n_cells_total * n_bands);
+    int64_t total_cells = 0;
+    if (!checked_mul_i64(g->n_cells_total, static_cast<int64_t>(n_bands), total_cells)) {
+        delete g;
+        return nullptr;
+    }
+    g->data = _alloc_zero(total_cells);
     if (!g->data) { delete g; return nullptr; }
     return g;
 }
@@ -144,13 +185,23 @@ extern "C" SK_API int field_grid_step_helmholtz_regular(
 {
     if (!g || !spec) return SK_ERR_NULL_STATE;
     if (g->kind != FIELD_GRID_REGULAR) return SK_ERR_NULL_STATE;
+    if (n_steps <= 0) return SK_OK;
     const int nx = g->dims[0], ny = g->dims[1], nz = g->dims[2];
+    if (spec->dx <= 0.f || spec->dy <= 0.f || spec->dz <= 0.f) return SK_ERR_DIM_MISMATCH;
     if (nx < 3 || ny < 3 || nz < 3) return SK_OK;  /* nothing to do */
 
     /* Split-step Helmholtz: ψ_new = (1 - i k²Δt) ψ + i Δt ∇²ψ
      * where ∇² uses the requested stencil (defaults to 7-point).
      * Single working buffer per step; in-place layout-aware update. */
-    std::vector<cd32> tmp(static_cast<size_t>(nx) * ny * nz);
+    int64_t nxy = 0;
+    int64_t nxyz = 0;
+    if (!checked_mul_i64(static_cast<int64_t>(nx), static_cast<int64_t>(ny), nxy)
+        || !checked_mul_i64(nxy, static_cast<int64_t>(nz), nxyz)
+        || nxyz <= 0
+        || nxyz > static_cast<int64_t>(std::numeric_limits<size_t>::max())) {
+        return SK_ERR_DIM_MISMATCH;
+    }
+    std::vector<cd32> tmp(static_cast<size_t>(nxyz));
     const float dxi2 = 1.f / (spec->dx * spec->dx);
     const float dyi2 = 1.f / (spec->dy * spec->dy);
     const float dzi2 = 1.f / (spec->dz * spec->dz);

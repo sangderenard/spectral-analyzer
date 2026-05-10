@@ -428,6 +428,28 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
             },
         },
 
+        # ── Calibration materials (explicit BW + RGB chain checks) ─────
+        "calib_black": {
+            "albedo_rgb": [0.0, 0.0, 0.0], "roughness": 1.0, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_white": {
+            "albedo_rgb": [1.0, 1.0, 1.0], "roughness": 0.35, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_red_emit": {
+            "albedo_rgb": [0.2, 0.0, 0.0], "roughness": 0.2, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [2.5, 0.0, 0.0],
+        },
+        "calib_green_emit": {
+            "albedo_rgb": [0.0, 0.2, 0.0], "roughness": 0.2, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 2.5, 0.0],
+        },
+        "calib_blue_emit": {
+            "albedo_rgb": [0.0, 0.0, 0.2], "roughness": 0.2, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 2.5],
+        },
+
         # ── Profile 1: emissive forward cone with bulb darkening ─────────
         # depth_uv layer 3: R=depth (scaled by depth_scale_mm), A=bulb_radius (raw)
         # Lorentzian applied to emission: full at pole center, dark at extremes.
@@ -608,6 +630,30 @@ def scene_for_phase(idx: dict[str, int], t: float, scene_mode: str = "orbiters")
             center=tuple(bulb_center.tolist()), radius=0.11, include_uv=True
         )
         add_object(bulb, idx["tungsten_bulb_emit"], 10)
+    elif scene_mode in ("calib-rgb-diagram", "calib-bw-rgb"):
+        # Procedural calibration scene with unambiguous black/white and
+        # primary emissive anchors for end-to-end sensor->RGB validation.
+        st, _ = saddle_mesh(idx["calib_black"])
+        sv, _ = flat_from_tris(st, np.full((st.shape[0],), idx["calib_black"], np.int32))
+        add_object(sv, idx["calib_black"], 1)
+
+        white_ref = SPHERE.flat_vertices(
+            center=(0.0, -0.10, -3.05), radius=0.60, include_uv=True
+        )
+        add_object(white_ref, idx["calib_white"], 2)
+
+        red_emit = SMALL.flat_vertices(
+            center=(-1.20, 0.35, -2.75), radius=0.22, include_uv=True
+        )
+        green_emit = SMALL.flat_vertices(
+            center=(0.0, 0.45, -2.55), radius=0.22, include_uv=True
+        )
+        blue_emit = SMALL.flat_vertices(
+            center=(1.20, 0.35, -2.75), radius=0.22, include_uv=True
+        )
+        add_object(red_emit, idx["calib_red_emit"], 20)
+        add_object(green_emit, idx["calib_green_emit"], 21)
+        add_object(blue_emit, idx["calib_blue_emit"], 22)
     else:
         # Stage
         st, sm = saddle_mesh(idx["stage_slate"])

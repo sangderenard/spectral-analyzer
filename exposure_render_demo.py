@@ -60,13 +60,16 @@ CLI
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
 import sys
+import tempfile
+import threading
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import numpy as np
 
@@ -93,6 +96,11 @@ try:
     _HAS_SURFACE_SPLINE = True
 except ImportError:
     _HAS_SURFACE_SPLINE = False
+
+try:
+    from sdf_plugins import get_sdf_driver as _get_sdf_driver
+except Exception:
+    _get_sdf_driver = None
 
 try:
     from bdpt_integrator import CameraSensor, TriangleGroup
@@ -210,6 +218,15 @@ DEFAULT_FILM = FilmExposure(
 # slots per material with the unused tail zeroed.
 DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 400e-9, 8)).astype(np.float64)
 
+# EndpointRecord in Python is float32 (N, 16): 64 bytes/record payload.
+_BDPT_RECORD_FLOATS = 16
+_BDPT_RECORD_BYTES = _BDPT_RECORD_FLOATS * np.dtype(np.float32).itemsize
+
+
+def _bdpt_cap_from_bytes(max_bytes: int) -> int:
+    """Analytical endpoint-record cap from byte budget."""
+    return max(0, int(max_bytes) // _BDPT_RECORD_BYTES)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Scene → tracer geometry adapter
@@ -227,6 +244,7 @@ class TracerScene:
     src_directivity: np.ndarray  # (N_src,)  float64 — Lambertian → 1.0
     src_area_m2:  np.ndarray   # (N_src,)    float64 — for power bookkeeping
     src_emit_W:   np.ndarray   # (N_src,)    float64 — luminance-weighted emission
+    src_emit_rgb_W: np.ndarray # (N_src, 3)  float64 — per-channel emissive power proxy
     src_tri_idx:  np.ndarray   # (N_src,)    int32   — triangle indices in verts/normals
     bounds_min:   np.ndarray   # (3,)        float32
     bounds_max:   np.ndarray   # (3,)        float32
@@ -306,6 +324,7 @@ def _build_tracer_scene(t: float, scene_mode: str = "orbiters") -> TracerScene:
     # Emissive power per triangle: luminance × area, scaled to the global
     # ``DEFAULT_FILM`` exposure later by the plan's energy_per_ray_J.
     src_emit_W = (luma[sel].astype(np.float64) * src_area)
+    src_emit_rgb_W = emis_rgb[sel].astype(np.float64) * src_area[:, None]
 
     # ── Scene AABB for the GLSL pipeline ─────────────────────────────────
     pts_all = pts.reshape(-1, 3)
@@ -323,6 +342,7 @@ def _build_tracer_scene(t: float, scene_mode: str = "orbiters") -> TracerScene:
         src_directivity  = src_directivity,
         src_area_m2      = src_area,
         src_emit_W       = src_emit_W,
+        src_emit_rgb_W   = src_emit_rgb_W,
         src_tri_idx      = sel.astype(np.int32, copy=False),
         bounds_min       = bmin,
         bounds_max       = bmax,
@@ -510,6 +530,9 @@ class CppExposureBackend(ExposureBackend):
 
     def __init__(self, scene: TracerScene, cam: PinholeCamera,
                  freq_hz: np.ndarray, **kw: Any):
+        self._adaptive_mode = str(kw.pop("adaptive_mode", "stochastic")).strip().lower()
+        if self._adaptive_mode not in ("stochastic", "quota", "uniform"):
+            self._adaptive_mode = "stochastic"
         super().__init__(scene, cam, freq_hz, **kw)
         self.tracer = _sk.RayTracer(
             n_tri      = int(scene.verts.shape[0]),
@@ -526,6 +549,111 @@ class CppExposureBackend(ExposureBackend):
             self.scene.verts[self.scene.src_tri_idx].reshape(-1, 3, 3),
             np.float64,
         )
+        self._source_need_ema: Optional[np.ndarray] = None
+        self._source_rays_emitted = np.zeros(int(self.scene.src_pos.shape[0]), dtype=np.float64)
+
+    def _camera_basis(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+        cam_f = np.asarray(self.cam.fwd, np.float64)
+        cam_f = cam_f / max(np.linalg.norm(cam_f), 1.0e-12)
+        cam_up_hint = np.asarray(self.cam.up, np.float64)
+        cam_r = np.cross(cam_f, cam_up_hint)
+        if np.linalg.norm(cam_r) < 1.0e-12:
+            cam_r = np.cross(cam_f, np.array([1.0, 0.0, 0.0], np.float64))
+        cam_r = cam_r / max(np.linalg.norm(cam_r), 1.0e-12)
+        cam_u = np.cross(cam_r, cam_f)
+        tan_half_v = math.tan(float(self.cam.fov_y_rad) * 0.5)
+        tan_half_h = tan_half_v * (float(self.cam.width) / max(1.0, float(self.cam.height)))
+        return cam_f, cam_r, cam_u, tan_half_h, tan_half_v
+
+    def _density_need_map(self) -> np.ndarray:
+        # Prioritize under-resolved regions and high local contrast zones.
+        energy = np.sum(self.accum, axis=0, dtype=np.float64)
+        p95 = max(1.0e-12, float(np.percentile(energy, 95.0)))
+        en = np.clip(energy / p95, 0.0, 1.0)
+        gx = np.abs(np.roll(en, -1, axis=1) - en)
+        gy = np.abs(np.roll(en, -1, axis=0) - en)
+        g = np.sqrt(gx * gx + gy * gy)
+        gp95 = max(1.0e-12, float(np.percentile(g, 95.0)))
+        gn = np.clip(g / gp95, 0.0, 1.0)
+        under = 1.0 - np.sqrt(np.clip(en, 0.0, 1.0))
+        need = 0.25 + under + 0.75 * gn
+        return need.astype(np.float64, copy=False)
+
+    def _project_source_need(self, src_pos: np.ndarray, need_map: np.ndarray) -> np.ndarray:
+        cam_pos = np.asarray(self.cam.pos, np.float64)
+        cam_f, cam_r, cam_u, tan_half_h, tan_half_v = self._camera_basis()
+        v = np.asarray(src_pos, np.float64) - cam_pos[None, :]
+        depth = np.dot(v, cam_f)
+
+        need = np.full((src_pos.shape[0],), float(np.mean(need_map, dtype=np.float64)), dtype=np.float64)
+        valid = depth > 1.0e-9
+        if np.any(valid):
+            vv = v[valid]
+            d = depth[valid]
+            x_img = np.dot(vv, cam_r)
+            y_img = np.dot(vv, cam_u)
+            ndc_x = x_img / (d * tan_half_h)
+            ndc_y = -y_img / (d * tan_half_v)
+            px = ((ndc_x + 1.0) * 0.5 * float(self.cam.width)).astype(np.int64)
+            py = ((ndc_y + 1.0) * 0.5 * float(self.cam.height)).astype(np.int64)
+            in_view = ((px >= 0) & (px < int(self.cam.width)) &
+                       (py >= 0) & (py < int(self.cam.height)))
+            idx_valid = np.where(valid)[0]
+            if np.any(in_view):
+                idx = idx_valid[in_view]
+                need[idx] = need_map[py[in_view], px[in_view]]
+        return need
+
+    def _allocate_source_rays(self, n_rays: int, src_pos: np.ndarray,
+                              mode: Optional[str] = None,
+                              seed: Optional[int] = None) -> np.ndarray:
+        n_sources = int(src_pos.shape[0])
+        total_rays = max(n_sources, int(n_rays) * n_sources)
+        alloc_mode = str(mode or self._adaptive_mode).strip().lower()
+        if alloc_mode not in ("stochastic", "quota", "uniform"):
+            alloc_mode = "stochastic"
+        need_map = self._density_need_map()
+        per_source_need = self._project_source_need(src_pos, need_map)
+
+        if self._source_need_ema is None or self._source_need_ema.shape[0] != n_sources:
+            self._source_need_ema = np.asarray(per_source_need, np.float64).copy()
+        else:
+            self._source_need_ema *= 0.8
+            self._source_need_ema += 0.2 * per_source_need
+
+        hist = np.asarray(self._source_rays_emitted[:n_sources], np.float64)
+        hmean = max(1.0, float(np.mean(hist)))
+        novelty = 1.0 / np.sqrt(1.0 + (hist / hmean))
+
+        weights = np.maximum(1.0e-9, self._source_need_ema * novelty)
+        weights_sum = float(np.sum(weights))
+        if weights_sum <= 0.0:
+            weights = np.full((n_sources,), 1.0 / max(1, n_sources), dtype=np.float64)
+        else:
+            weights = weights / weights_sum
+
+        if alloc_mode == "uniform":
+            counts = np.full((n_sources,), total_rays // max(1, n_sources), dtype=np.int64)
+            rem = int(total_rays - int(np.sum(counts)))
+            if rem > 0:
+                counts[:rem] += 1
+        else:
+            raw = weights * float(total_rays - n_sources)
+            counts = np.ones((n_sources,), dtype=np.int64)
+            if alloc_mode == "stochastic":
+                rng = np.random.default_rng(int(seed if seed is not None else 0xC0FFEE))
+                draws = rng.multinomial(int(total_rays - n_sources), weights)
+                counts += draws.astype(np.int64, copy=False)
+            else:
+                counts += np.floor(raw).astype(np.int64)
+                remain = int(total_rays - int(np.sum(counts)))
+                if remain > 0:
+                    frac = raw - np.floor(raw)
+                    order = np.argsort(-frac)
+                    counts[order[:remain]] += 1
+
+        self._source_rays_emitted[:n_sources] += counts.astype(np.float64)
+        return counts.astype(np.int32, copy=False)
 
     @staticmethod
     def _sample_cosine_hemisphere_axes(normals: np.ndarray,
@@ -577,6 +705,27 @@ class CppExposureBackend(ExposureBackend):
         # Ray preparation randomness is externalized here: every emissive
         # receives a fresh launch site and axis each batch before tracing.
         src_pos, src_dir = self._prepare_emissive_batch_sources(seed)
+        if hasattr(self.tracer, "integrate_image_into_packed"):
+            src_n_rays = self._allocate_source_rays(int(n_rays), src_pos,
+                                                    mode=self._adaptive_mode,
+                                                    seed=int(seed))
+            self.tracer.integrate_image_into_packed(
+                src_pos         = src_pos,
+                src_dir         = src_dir,
+                src_directivity = self.scene.src_directivity,
+                src_n_rays      = src_n_rays,
+                cam_pos         = self.cam.pos,
+                cam_fwd         = self.cam.fwd,
+                cam_up          = self.cam.up,
+                out_image       = self.accum,
+                fov_rad         = float(self.cam.fov_y_rad),
+                max_bounces     = self.max_bounces,
+                min_amplitude   = self.min_amplitude,
+                seed            = int(seed),
+            )
+            self.n_rays_accumulated += int(np.sum(src_n_rays, dtype=np.int64))
+            return
+
         self.tracer.integrate_image_into(
             src_pos         = src_pos,
             src_dir         = src_dir,
@@ -664,6 +813,10 @@ class ExposureFrameResult:
     frame_config_summary: dict
     image_data:         Optional[np.ndarray] = None  # (H, W, 3) float32 [0,1]
     image16_data:       Optional[np.ndarray] = None  # (H, W, 3) uint16 for 16-bit
+    field_integrated_data: Optional[np.ndarray] = None  # (B, H, W)
+    surface_integrated_data: Optional[np.ndarray] = None  # (B, H, W)
+    sensor_photons_data: Optional[np.ndarray] = None  # (H, W)
+    sensor_snr_data: Optional[np.ndarray] = None  # (H, W)
 
 
 @dataclass
@@ -683,6 +836,20 @@ class CameraVisibilityConfig:
     transparent_mode: int = int(getattr(_sk, "RT_CAM_TRANSPARENCY_BLOCK", 0))
     depth_cull_enabled: bool = False
     depth_cull_m: float = 0.0
+
+
+@dataclass
+class ConvergenceConfig:
+    """Early-stop controls for exposure batch convergence."""
+    enabled: bool = True
+    drive_batches: bool = True
+    target_pct: float = 99.99
+    max_rel_drift: float = 1.0e-4
+    check_every_batches: int = 1
+    min_batches: int = 4
+    hold_checks: int = 3
+    probe_count: int = 8192
+    max_batches: int = 0
 
 
 @dataclass
@@ -706,6 +873,16 @@ class SurfaceSplineConfig:
     fit_all_tris: bool = False      # True = per-tri groups; False = mean group
 
 
+@dataclass
+class ParametricSdfConfig:
+    """Parametric SDF-style presets mapped onto POLY_BARY payloads."""
+    enabled: bool = False
+    model: str = "off"              # off | saddle | sphere | mixed
+    saddle_amplitude_m: float = 2.0e-3
+    sphere_radius_m: float = 0.12
+    neighborhood_margin_uv: float = 8.0e-2
+
+
 # ── Camera-visibility mode constants (resolved lazily so module loads without ext) ──
 _CAM_VIS_AS_IS      = int(getattr(_sk, "RT_CAM_VIS_AS_IS",      0))
 _CAM_VIS_DIRECT_HIT = int(getattr(_sk, "RT_CAM_VIS_DIRECT_HIT", 1))
@@ -720,9 +897,87 @@ class FrameConfig:
     field_capture:     FieldCaptureConfig
     camera_visibility: CameraVisibilityConfig
     surface_spline:    SurfaceSplineConfig
+    parametric_sdf:    ParametricSdfConfig
     integral_split:    IntegralSplitConfig
     description:       str = ""
     detail_level:      int = 0   # 0-5; drives HUD verbosity
+
+
+def _poly_bary_coeffs_sdf(model: str,
+                          tri_id: int,
+                          saddle_amplitude_m: float,
+                          sphere_radius_m: float) -> np.ndarray:
+    """Build float64[6] POLY_BARY coeffs for parametric SDF-style presets."""
+    m = str(model).strip().lower()
+    if m == "mixed":
+        m = "sphere" if (int(tri_id) % 2) == 0 else "saddle"
+
+    if m == "sphere":
+        # Near-center paraboloid approximation of sphere SDF displacement.
+        # delta ~ k * ((u-1/3)^2 + (v-1/3)^2), k ~= 1/(2R)
+        r = max(float(sphere_radius_m), 1.0e-6)
+        k = 0.5 / r
+        c0 = (2.0 / 9.0) * k
+        cu = -(2.0 / 3.0) * k
+        cv = -(2.0 / 3.0) * k
+        cuu = k
+        cuv = 0.0
+        cvv = k
+        return np.asarray([c0, cu, cv, cuu, cuv, cvv], dtype=np.float64)
+
+    # Default to saddle if unsupported string is supplied.
+    # delta = a * ((u-1/3)^2 - (v-1/3)^2)
+    a = float(saddle_amplitude_m)
+    c0 = 0.0
+    cu = -(2.0 / 3.0) * a
+    cv = (2.0 / 3.0) * a
+    cuu = a
+    cuv = 0.0
+    cvv = -a
+    return np.asarray([c0, cu, cv, cuu, cuv, cvv], dtype=np.float64)
+
+
+def _resolve_native_parametric_payload(raw: Any) -> dict[str, Any]:
+    """Normalize plugin output to register_tri_group parametric_surface payload.
+
+    Accepted forms:
+    - dict: {"kind": int|str, "coeffs": float64[N]}
+    - array-like: float64[6] interpreted as POLY_BARY
+    """
+    if isinstance(raw, dict):
+        kind_raw = raw.get("kind", "poly_bary")
+        coeffs = np.asarray(raw.get("coeffs", []), dtype=np.float64).ravel()
+    else:
+        kind_raw = "poly_bary"
+        coeffs = np.asarray(raw, dtype=np.float64).ravel()
+
+    if coeffs.ndim != 1 or coeffs.size == 0:
+        raise RuntimeError("parametric plugin returned empty coeff payload")
+
+    if isinstance(kind_raw, str):
+        k = kind_raw.strip().lower()
+        if k in ("poly_bary", "poly", "bary"):
+            kind = int(getattr(_sk, "TRI_PARAM_SURFACE_POLY_BARY", 1))
+            if coeffs.size != 6:
+                raise RuntimeError(f"POLY_BARY expects 6 coeffs, got {coeffs.size}")
+        elif k in ("sdf_saddle", "saddle"):
+            kind = int(getattr(_sk, "TRI_PARAM_SURFACE_SDF_SADDLE", -1))
+            if kind < 0:
+                raise RuntimeError("TRI_PARAM_SURFACE_SDF_SADDLE unavailable in native extension")
+            if coeffs.size != 2:
+                raise RuntimeError(f"SDF_SADDLE expects 2 coeffs [amp, margin], got {coeffs.size}")
+        elif k in ("sdf_sphere", "sphere"):
+            kind = int(getattr(_sk, "TRI_PARAM_SURFACE_SDF_SPHERE", -1))
+            if kind < 0:
+                raise RuntimeError("TRI_PARAM_SURFACE_SDF_SPHERE unavailable in native extension")
+            if coeffs.size != 2:
+                raise RuntimeError(f"SDF_SPHERE expects 2 coeffs [radius, margin], got {coeffs.size}")
+        else:
+            raise RuntimeError(f"unknown parametric kind '{kind_raw}'")
+    else:
+        kind = int(kind_raw)
+
+    return {"kind": int(kind), "coeffs": coeffs.astype(np.float64, copy=False)}
 
 
 def _build_frame_config(frame_idx: int,
@@ -733,7 +988,7 @@ def _build_frame_config(frame_idx: int,
     When n_frames_total == 1 only level 0 (baseline) is used.  Each additional
     frame slot unlocks the next feature level up to MAX_LEVELS - 1.
 
-    Level 0  baseline — no field cap, AS_IS camera vis, no spline
+    Level 0  aggressive bootstrap — field capture + strike scatter + full march
     Level 1  field regular 64³ + strike capture
     Level 2  field regular 96³ + DIRECT_HIT + emissive-only spline
     Level 3  field kdtree 64³ + DIRECT_HIT + XRAY + full-mesh spline
@@ -760,17 +1015,27 @@ def _build_frame_config(frame_idx: int,
         )
 
     schedules: list[FrameConfig] = [
-        # level 0 — pure baseline
+        # level 0 — aggressive bootstrap (default first frame)
         FrameConfig(
-            field_capture     = FieldCaptureConfig(enabled=False),
+            field_capture     = FieldCaptureConfig(
+                enabled=True, grid_kind="regular",
+                nx=128, ny=128, nz=128,
+                capture_strikes=True, max_strikes=1_000_000,
+            ),
             camera_visibility = CameraVisibilityConfig(
-                camera_vis_mode  = _CAM_VIS_AS_IS,
-                transparent_mode = _CAM_TRANSP_BLOCK,
+                camera_vis_mode    = _CAM_VIS_FULL_MARCH,
+                transparent_mode   = _CAM_TRANSP_XRAY,
+                depth_cull_enabled = True,
+                depth_cull_m       = 80.0,
             ),
             surface_spline    = SurfaceSplineConfig(enabled=False),
-            integral_split    = _split(),
-            description       = "baseline · no field · AS_IS cam",
-            detail_level      = 0,
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="mixed", saddle_amplitude_m=2.0e-3,
+                sphere_radius_m=0.12, neighborhood_margin_uv=8.0e-2,
+            ),
+            integral_split    = _split(dfi=0.25, dsi=0.10, dwp=-0.4),
+            description       = "aggressive bootstrap · field+scatter · FULL_MARCH+XRAY · parametric mixed",
+            detail_level      = 4,
         ),
         # level 1 — field capture, regular 64³
         FrameConfig(
@@ -784,6 +1049,7 @@ def _build_frame_config(frame_idx: int,
                 transparent_mode = _CAM_TRANSP_BLOCK,
             ),
             surface_spline    = SurfaceSplineConfig(enabled=False),
+            parametric_sdf    = ParametricSdfConfig(enabled=False),
             integral_split    = _split(),
             description       = "field regular-64³ · AS_IS cam",
             detail_level      = 1,
@@ -802,6 +1068,7 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=False, ridge_lambda=0.0,
             ),
+            parametric_sdf    = ParametricSdfConfig(enabled=False),
             integral_split    = _split(dfi=0.10, dsi=0.0),
             description       = "field 96³ · spline emissive · DIRECT_HIT",
             detail_level      = 2,
@@ -820,6 +1087,7 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=True, ridge_lambda=0.0,
             ),
+            parametric_sdf    = ParametricSdfConfig(enabled=False),
             integral_split    = _split(dfi=0.20, dsi=0.05),
             description       = "field kdtree-64³ · spline all · DIRECT_HIT+XRAY",
             detail_level      = 3,
@@ -840,6 +1108,7 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=True, ridge_lambda=1.0e-4,
             ),
+            parametric_sdf    = ParametricSdfConfig(enabled=False),
             integral_split    = _split(dfi=0.25, dsi=0.10, dwp=-0.3),
             description       = "FULL_MARCH 128³ · spline ridge 1e-4 · depth 50m",
             detail_level      = 4,
@@ -860,6 +1129,7 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=True, ridge_lambda=1.0e-3,
             ),
+            parametric_sdf    = ParametricSdfConfig(enabled=False),
             integral_split    = _split(dfi=0.35, dsi=0.12, dwp=-0.8),
             description       = "FULL_MARCH kdtree · XRAY · ridge 1e-3 · depth 100m",
             detail_level      = 5,
@@ -932,6 +1202,25 @@ class SensorIntegralObject:
             "mean_snr": float(self.mean_snr),
             "metrics": self.metrics,
         }
+
+
+@dataclass
+class IntegrationSnapshot:
+    """Live or frame-final integration snapshot for one backend."""
+    backend: str
+    frame_index: int
+    batch_index: int
+    measured_H_J: float
+    target_H_J: float
+    gain_linear: float
+    image_data: np.ndarray
+    rgb_linear: np.ndarray
+    field_integrated_data: np.ndarray
+    surface_integrated_data: np.ndarray
+    sensor_photons_data: Optional[np.ndarray] = None
+    sensor_snr_data: Optional[np.ndarray] = None
+    sensor_rgb_data: Optional[np.ndarray] = None
+    mode: str = "stream"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1038,15 +1327,25 @@ class ExposureSession:
                  backends: tuple[str, ...] = ("cpp",),
                  out_dir: str = "exposures",
                  integrator: str = "bdpt",
-                 bdpt_records_cap: int = 1_048_576,
+                 bdpt_records_cap: int = 0,
                  scene_mode: str = "orbiters",
                  integral_split: Optional[IntegralSplitConfig] = None,
                  camera_visibility: Optional[CameraVisibilityConfig] = None,
                  field_capture: Optional[FieldCaptureConfig] = None,
+                 convergence: Optional[ConvergenceConfig] = None,
+                 adaptive_allocation_mode: str = "stochastic",
                  n_frames_planned: int = 1,
+                 output_width: Optional[int] = None,
+                 output_height: Optional[int] = None,
+                 output_oversample_stencil: str = "box",
                  show_hud: bool = True,
+                 rgb_source: str = "sensor",
                  sensor_film_slots: Optional[list[tuple[int, int]]] = None,
-                 save_files: bool = False):
+                 save_files: bool = False,
+                 bdpt_intermediate_mode: str = "file",
+                 bdpt_intermediate_max_bytes: int = 20 * 1024 * 1024 * 1024,
+                 retain_bdpt_intermediate: bool = False,
+                 bdpt_intermediate_dir: Optional[str] = None):
         self.optics = optics
         self.film   = film
         self.width  = int(width)
@@ -1059,7 +1358,7 @@ class ExposureSession:
         self.backends_requested = tuple(backends)
         self.out_dir = out_dir
         self.integrator = str(integrator)
-        self.bdpt_records_cap = int(bdpt_records_cap)
+        requested_bdpt_cap = int(bdpt_records_cap)
         self.scene_mode = str(scene_mode)
         self.integral_split = (integral_split
                        if integral_split is not None
@@ -1070,10 +1369,37 @@ class ExposureSession:
         self.field_capture = (field_capture
                       if field_capture is not None
                       else FieldCaptureConfig())
+        self.convergence = (convergence
+                 if convergence is not None
+                 else ConvergenceConfig())
+        self.adaptive_allocation_mode = str(adaptive_allocation_mode).strip().lower()
+        if self.adaptive_allocation_mode not in ("stochastic", "quota", "uniform"):
+            self.adaptive_allocation_mode = "stochastic"
         self.n_frames_planned = max(1, int(n_frames_planned))
+        self.output_width = int(output_width) if output_width is not None else int(self.width)
+        self.output_height = int(output_height) if output_height is not None else int(self.height)
+        self.output_width = max(1, self.output_width)
+        self.output_height = max(1, self.output_height)
+        self.output_oversample_stencil = str(output_oversample_stencil).strip().lower()
+        if self.output_oversample_stencil not in ("box", "polar"):
+            self.output_oversample_stencil = "box"
         self.show_hud = bool(show_hud)
+        self.rgb_source = str(rgb_source).strip().lower()
+        if self.rgb_source not in ("accum", "endpoint", "sensor"):
+            self.rgb_source = "sensor"
         self.save_files = bool(save_files)
+        self.bdpt_intermediate_mode = str(bdpt_intermediate_mode).strip().lower()
+        if self.bdpt_intermediate_mode not in ("memory", "file"):
+            self.bdpt_intermediate_mode = "file"
+        self.bdpt_intermediate_max_bytes = max(0, int(bdpt_intermediate_max_bytes))
+        self.retain_bdpt_intermediate = bool(retain_bdpt_intermediate)
+        self.bdpt_intermediate_dir = str(bdpt_intermediate_dir or out_dir)
+        if requested_bdpt_cap > 0:
+            self.bdpt_records_cap = max(4096, requested_bdpt_cap)
+        else:
+            self.bdpt_records_cap = max(4096, _bdpt_cap_from_bytes(self.bdpt_intermediate_max_bytes))
         os.makedirs(out_dir, exist_ok=True)
+        os.makedirs(self.bdpt_intermediate_dir, exist_ok=True)
 
         # Load sensor/film database (T2: ExposureSession integration)
         self._sensor_film_db = SensorFilmDatabase.instance()
@@ -1114,12 +1440,179 @@ class ExposureSession:
         
         print(f"  [sensor_film] loaded {len(self._sensor_film_db._sensor_order)} sensors, "
               f"{len(self._sensor_film_db._film_order)} films, {sum(1 for m in self._sensor_film_metadata if m['active'])} active slots")
+        if self.integrator == "bdpt":
+            cap_gb = (self.bdpt_records_cap * _BDPT_RECORD_BYTES) / float(1024 ** 3)
+            print(f"  [bdpt] records cap={self.bdpt_records_cap:_} (~{cap_gb:.2f} GiB payload)")
+        print(
+            f"  [conv] enabled={bool(self.convergence.enabled)} "
+            f"drive_batches={bool(self.convergence.drive_batches)} "
+            f"target={self.convergence.target_pct:.4f}% "
+            f"H_error<= {float(self.convergence.max_rel_drift):.3e} "
+            f"every={max(1, int(self.convergence.check_every_batches))} "
+            f"min={max(1, int(self.convergence.min_batches))} "
+            f"hold={max(1, int(self.convergence.hold_checks))} "
+            f"max_batches={int(self.convergence.max_batches)}"
+        )
+        print(f"  [adaptive] allocation={self.adaptive_allocation_mode}")
+        print(f"  [rgb] source={self.rgb_source}")
+        print(f"  [res] render={self.width}x{self.height} output={self.output_width}x{self.output_height} stencil={self.output_oversample_stencil}")
 
         self._rng_seed = 1
         self._frame_index = 0
         self._sensor_group_id = -1  # BDPT sensor group ID for this frame
         self._last_bdpt_records: Optional[np.ndarray] = None
         self._last_target_photons_per_pixel: float = 0.0
+        self._last_bdpt_records_path: Optional[str] = None
+        self._last_bdpt_records_is_temp: bool = False
+        self._last_bdpt_emit_counts: Optional[np.ndarray] = None
+        self._bdpt_emit_rays_total: Optional[np.ndarray] = None
+
+    def _release_last_bdpt_records(self) -> None:
+        arr = self._last_bdpt_records
+        self._last_bdpt_records = None
+        if isinstance(arr, np.memmap):
+            try:
+                arr.flush()
+            except Exception:
+                pass
+            try:
+                arr._mmap.close()  # type: ignore[attr-defined]
+            except Exception:
+                pass
+        gc.collect()
+
+    def _cleanup_temp_bdpt_file(self) -> None:
+        if not self._last_bdpt_records_is_temp or not self._last_bdpt_records_path:
+            return
+        self._release_last_bdpt_records()
+        try:
+            os.remove(self._last_bdpt_records_path)
+        except OSError:
+            pass
+        self._last_bdpt_records_path = None
+        self._last_bdpt_records_is_temp = False
+
+    def _stage_bdpt_records(self, recs: np.ndarray) -> None:
+        self._cleanup_temp_bdpt_file()
+        recs32 = np.ascontiguousarray(recs, dtype=np.float32)
+        self._last_bdpt_records_path = None
+        self._last_bdpt_records_is_temp = False
+
+        if self.bdpt_intermediate_mode != "file":
+            self._last_bdpt_records = recs32
+            return
+
+        est_bytes = int(recs32.nbytes)
+        if self.bdpt_intermediate_max_bytes > 0 and est_bytes > self.bdpt_intermediate_max_bytes:
+            lim_gb = self.bdpt_intermediate_max_bytes / float(1024 ** 3)
+            cur_gb = est_bytes / float(1024 ** 3)
+            print(f"  [warn] BDPT intermediate {cur_gb:.2f}GB exceeds cap {lim_gb:.2f}GB; using memory")
+            self._last_bdpt_records = recs32
+            return
+
+        frame_tag = f"{self._frame_index:04d}"
+        if self.retain_bdpt_intermediate:
+            path = os.path.join(self.bdpt_intermediate_dir, f"bdpt_records_{frame_tag}.npy")
+            is_temp = False
+        else:
+            fd, path = tempfile.mkstemp(
+                prefix=f"bdpt_records_{frame_tag}_",
+                suffix=".npy",
+                dir=self.bdpt_intermediate_dir,
+            )
+            os.close(fd)
+            is_temp = True
+
+        mm = np.lib.format.open_memmap(path, mode="w+", dtype=np.float32, shape=recs32.shape)
+        mm[:] = recs32
+        mm.flush()
+        del mm
+
+        self._last_bdpt_records = np.load(path, mmap_mode="r")
+        self._last_bdpt_records_path = path
+        self._last_bdpt_records_is_temp = is_temp
+
+        size_gb = est_bytes / float(1024 ** 3)
+        keep_msg = "retained" if self.retain_bdpt_intermediate else "ephemeral"
+        print(f"  bdpt records staged ({keep_msg}) → {path}  [{size_gb:.2f}GB]")
+
+    def _allocate_bdpt_emit_rays(self,
+                                 cpp_back: CppExposureBackend,
+                                 emitter_centers: np.ndarray,
+                                 target_total_rays: int,
+                                 seed: int) -> np.ndarray:
+        """Adaptive per-emitter allocation for BDPT using endpoint uncertainty.
+
+        Default mode (stochastic) uses EndpointRecord-derived uncertainty and
+        novelty; quota/uniform remain explicit fallback options.
+        """
+        n_emit = int(emitter_centers.shape[0])
+        if n_emit <= 0:
+            return np.zeros((0,), dtype=np.int32)
+
+        total_rays = max(n_emit, int(target_total_rays))
+        mode = str(self.adaptive_allocation_mode).strip().lower()
+        if mode not in ("stochastic", "quota", "uniform"):
+            mode = "stochastic"
+
+        if mode in ("quota", "uniform"):
+            per_emit = max(1, total_rays // n_emit)
+            return cpp_back._allocate_source_rays(
+                n_rays=per_emit,
+                src_pos=emitter_centers,
+                mode=mode,
+                seed=seed,
+            )
+
+        # Smart default: uncertainty + completeness pressure + novelty.
+        if self._bdpt_emit_rays_total is None or self._bdpt_emit_rays_total.shape[0] != n_emit:
+            self._bdpt_emit_rays_total = np.zeros((n_emit,), dtype=np.float64)
+
+        scores = np.ones((n_emit,), dtype=np.float64)
+        recs = self._last_bdpt_records
+        prev_counts = self._last_bdpt_emit_counts
+        if recs is not None and recs.size > 0 and prev_counts is not None and prev_counts.size == n_emit:
+            rec_arr = np.asarray(recs, dtype=np.float32)
+            subpath = rec_arr[:, 0].astype(np.int64, copy=False)
+            amp_re = rec_arr[:, 12].astype(np.float64, copy=False)
+            amp_im = rec_arr[:, 13].astype(np.float64, copy=False)
+            e = amp_re * amp_re + amp_im * amp_im
+
+            prefix = np.cumsum(prev_counts.astype(np.int64, copy=False))
+            emit_idx = np.searchsorted(prefix, subpath, side="right")
+            valid = (emit_idx >= 0) & (emit_idx < n_emit)
+
+            if np.any(valid):
+                idx = emit_idx[valid]
+                ev = e[valid]
+                cnt = np.bincount(idx, minlength=n_emit).astype(np.float64)
+                s1 = np.bincount(idx, weights=ev, minlength=n_emit).astype(np.float64)
+                s2 = np.bincount(idx, weights=ev * ev, minlength=n_emit).astype(np.float64)
+
+                mean = np.divide(s1, np.maximum(1.0, cnt))
+                var = np.maximum(0.0, np.divide(s2, np.maximum(1.0, cnt)) - mean * mean)
+                uncertainty = np.sqrt(var) / np.sqrt(np.maximum(1.0, cnt))
+                completeness = 1.0 / np.sqrt(1.0 + cnt)
+                novelty = 1.0 / np.sqrt(1.0 + self._bdpt_emit_rays_total)
+
+                def _norm(v: np.ndarray) -> np.ndarray:
+                    vmax = float(np.max(v)) if v.size else 0.0
+                    if vmax <= 1.0e-20:
+                        return np.ones_like(v, dtype=np.float64)
+                    return np.clip(v / vmax, 0.0, 1.0)
+
+                scores = (0.50 * _norm(uncertainty) +
+                          0.30 * _norm(completeness) +
+                          0.20 * _norm(novelty))
+                scores = np.maximum(scores, 1.0e-9)
+
+        weights = scores / max(1.0e-20, float(np.sum(scores)))
+        rng = np.random.default_rng(int(seed))
+        draw = rng.multinomial(int(total_rays - n_emit), weights)
+        out = np.ones((n_emit,), dtype=np.int32)
+        out += draw.astype(np.int32, copy=False)
+        self._bdpt_emit_rays_total += out.astype(np.float64)
+        return out
 
     # ── Build per-frame plan + scene + backends ──────────────────────────
     def _build_plan(self, scene: TracerScene) -> RayDispatchPlan:
@@ -1154,6 +1647,7 @@ class ExposureSession:
                 max_bounces   = self.max_bounces,
                 min_amplitude = 1.0e-3,
                 atmo_abs_db_per_m = 0.0,
+                adaptive_mode = self.adaptive_allocation_mode,
             )
             if hasattr(cpp_b.tracer, "set_camera_visibility"):
                 cv = frame_cfg.camera_visibility
@@ -1220,6 +1714,53 @@ class ExposureSession:
             print(f"  [sensor_film_ssbo] uploaded {active_count} active slots to tracer")
         except Exception as e:
             print(f"  [warn] sensor_film_ssbo upload failed: {e}")
+
+    def _configure_default_wave_contexts(self, tracer: Any, cam: PinholeCamera) -> None:
+        """Install default wave contexts so kernel wave path is active in BDPT."""
+        if tracer is None:
+            raise RuntimeError("wave context configuration requires a live tracer")
+        if not hasattr(tracer, "clear_scale_contexts") or not hasattr(tracer, "add_scale_context"):
+            raise RuntimeError("tracer does not expose scale-context API required for wave path")
+
+        tracer.clear_scale_contexts()
+
+        # Center contexts on the aperture/focus region used by PIXEL_CONE sensor rays.
+        cam_pos = np.asarray(cam.pos, np.float64)
+        cam_fwd = np.asarray(cam.fwd, np.float64)
+        cam_fwd = cam_fwd / max(1.0e-12, float(np.linalg.norm(cam_fwd)))
+        focal_m = float(np.linalg.norm(np.asarray(scene_mod.SCENE_CENTER, np.float64) - cam_pos))
+        aperture_center = cam_pos + cam_fwd * max(1.0e-3, focal_m)
+        aperture_radius_m = max(1.0e-6, float(self.optics.aperture_mm) * 0.5e-3)
+
+        wave_kind = int(getattr(_sk, "SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ", 1))
+        thick_kind = int(getattr(_sk, "SCALE_CONTEXT_KIND_THICK_LENS_WAVE", 3))
+        rt_wave = int(getattr(_sk, "RT_SCALE_WAVE", 1))
+
+        wave_payload = np.asarray([max(1.0e-3, focal_m)], dtype=np.float64)
+        tracer.add_scale_context(
+            pos=aperture_center.astype(np.float64),
+            radius=float(max(aperture_radius_m * 1.5, 1.0e-4)),
+            scale_type=rt_wave,
+            dt_m=float(max(1.0e-4, aperture_radius_m * 0.1)),
+            n_substeps=2,
+            n_real=1.0,
+            n_imag=0.0,
+            context_kind=wave_kind,
+            payload=wave_payload,
+        )
+
+        thick_payload = np.asarray([max(1.0e-3, focal_m), 1.0], dtype=np.float64)
+        tracer.add_scale_context(
+            pos=aperture_center.astype(np.float64),
+            radius=float(max(aperture_radius_m * 2.0, 1.0e-4)),
+            scale_type=rt_wave,
+            dt_m=float(max(1.0e-4, aperture_radius_m * 0.1)),
+            n_substeps=2,
+            n_real=1.0,
+            n_imag=0.0,
+            context_kind=thick_kind,
+            payload=thick_payload,
+        )
 
     # ── Calibration: gain to match measured H to target H ────────────────
     @staticmethod
@@ -1292,12 +1833,155 @@ class ExposureSession:
         y = np.log1p(x / white * 6.0) / math.log1p(6.0)
         return np.clip(y, 0.0, 1.0).astype(np.float32)
 
-    def _make_sensor_integral(self, backend: str, gain: float) -> Optional[SensorIntegralObject]:
+    def _sensor_display_rgb(self, sensor_obj: SensorIntegralObject) -> np.ndarray:
+        """Convert backward-pass sensor integral into display RGB."""
+        photons = np.asarray(sensor_obj.photons_per_pixel, dtype=np.float32)
+        electrons = np.asarray(sensor_obj.electrons_per_pixel, dtype=np.float32)
+
+        x = np.maximum(0.0, photons)
+        white = float(np.percentile(x, 99.5)) if x.size else 1.0
+        white = max(white, 1.0e-8)
+        y = np.log1p((x / white) * 6.0) / math.log1p(6.0)
+        y = np.clip(y, 0.0, 1.0).astype(np.float32)
+
+        # Subtle SNR tint preserves sensor intensity as the dominant signal.
+        snr_proxy = np.sqrt(np.maximum(electrons, 0.0))
+        snr_w = float(np.percentile(snr_proxy, 99.0)) if snr_proxy.size else 1.0
+        snr_w = max(snr_w, 1.0e-8)
+        t = np.clip(snr_proxy / snr_w, 0.0, 1.0).astype(np.float32)
+        r = y
+        g = np.clip(y * (0.92 + 0.08 * t), 0.0, 1.0)
+        b = np.clip(y * (0.86 + 0.14 * t), 0.0, 1.0)
+        return np.stack([r, g, b], axis=-1)
+
+    @staticmethod
+    def _downsample_hw(arr: np.ndarray, sy: int, sx: int, stencil: str = "box") -> np.ndarray:
+        """Area-downsample 2D array while preserving dtype."""
+        if sy <= 1 and sx <= 1:
+            return arr
+        h, w = int(arr.shape[0]), int(arr.shape[1])
+        ny = max(1, h // max(1, sy))
+        nx = max(1, w // max(1, sx))
+        trimmed = np.asarray(arr[: ny * sy, : nx * sx])
+        block = trimmed.reshape(ny, sy, nx, sx)
+        if str(stencil).lower() == "polar" and sy > 1 and sx > 1:
+            yy = (np.arange(sy, dtype=np.float64) + 0.5) / float(sy)
+            xx = (np.arange(sx, dtype=np.float64) + 0.5) / float(sx)
+            gy, gx = np.meshgrid(yy, xx, indexing="ij")
+            ry = (gy - 0.5) / 0.5
+            rx = (gx - 0.5) / 0.5
+            r2 = (rx * rx) + (ry * ry)
+            # Polar stencil: circular support with soft radial falloff.
+            wmask = np.clip(1.0 - r2, 0.0, 1.0)
+            wsum = float(np.sum(wmask))
+            if wsum > 1.0e-20:
+                reduced = np.tensordot(block, wmask, axes=([1, 3], [0, 1])) / wsum
+            else:
+                reduced = block.mean(axis=(1, 3), dtype=np.float64)
+        else:
+            reduced = block.mean(axis=(1, 3), dtype=np.float64)
+        if np.issubdtype(arr.dtype, np.integer):
+            reduced = np.rint(reduced)
+        return reduced.astype(arr.dtype, copy=False)
+
+    @classmethod
+    def _downsample_bhw(cls, arr: np.ndarray, sy: int, sx: int, stencil: str = "box") -> np.ndarray:
+        """Area-downsample (B,H,W) tensor while preserving dtype."""
+        if sy <= 1 and sx <= 1:
+            return arr
+        bands = [cls._downsample_hw(arr[b], sy, sx, stencil=stencil) for b in range(int(arr.shape[0]))]
+        return np.stack(bands, axis=0).astype(arr.dtype, copy=False)
+
+    @classmethod
+    def _downsample_hw3(cls, img: np.ndarray, sy: int, sx: int, stencil: str = "box") -> np.ndarray:
+        """Area-downsample (H,W,3) RGB image while preserving dtype."""
+        if sy <= 1 and sx <= 1:
+            return img
+        ch = [cls._downsample_hw(img[:, :, c], sy, sx, stencil=stencil) for c in range(int(img.shape[2]))]
+        return np.stack(ch, axis=-1).astype(img.dtype, copy=False)
+
+    def _output_downsample_factors(self) -> tuple[int, int]:
+        sy = max(1, int(self.height) // max(1, int(self.output_height)))
+        sx = max(1, int(self.width) // max(1, int(self.output_width)))
+        return sy, sx
+
+    def build_integration_snapshot(self,
+                                   backend_name: str,
+                                   back: ExposureBackend,
+                                   plan: RayDispatchPlan,
+                                   frame_cfg: FrameConfig,
+                                   batch_index: int,
+                                   include_sensor: bool = False,
+                                   snapshot_mode: str = "stream") -> IntegrationSnapshot:
+        """Public API: build one integration snapshot from current accum state."""
+        measured = float(back.measured_radiant_exposure_J(plan.energy_per_ray_J))
+        gain = float(self._train_emissivity_gain(measured, float(plan.target_H_J)))
+        field_obj, surface_obj, _merged_bands, rgb_linear = self._make_integral_objects(
+            backend_name,
+            back.accum,
+            gain,
+            frame_cfg.integral_split,
+        )
+        img = self._tone_map_delicate(rgb_linear, frame_cfg.integral_split)
+
+        sensor_obj: Optional[SensorIntegralObject] = None
+        sensor_rgb: Optional[np.ndarray] = None
+        if include_sensor:
+            tracer_obj = getattr(back, "tracer", None)
+            sensor_obj = self._make_sensor_integral(backend_name, gain, tracer_obj)
+            if sensor_obj is not None:
+                sensor_rgb = self._sensor_display_rgb(sensor_obj)
+                if self.rgb_source == "sensor":
+                    img = sensor_rgb
+                    rgb_linear = sensor_rgb.copy()
+
+        return IntegrationSnapshot(
+            backend=str(backend_name),
+            frame_index=int(self._frame_index),
+            batch_index=int(batch_index),
+            measured_H_J=float(measured),
+            target_H_J=float(plan.target_H_J),
+            gain_linear=float(gain),
+            image_data=np.asarray(img, dtype=np.float32),
+            rgb_linear=np.asarray(rgb_linear, dtype=np.float32),
+            field_integrated_data=np.asarray(field_obj.integrated_bands, dtype=np.float32),
+            surface_integrated_data=np.asarray(surface_obj.integrated_bands, dtype=np.float32),
+            sensor_photons_data=(None if sensor_obj is None
+                                 else np.asarray(sensor_obj.photons_per_pixel, dtype=np.float32)),
+            sensor_snr_data=(None if sensor_obj is None
+                             else np.asarray(sensor_obj.snr_linear, dtype=np.float32)),
+            sensor_rgb_data=(None if sensor_rgb is None
+                             else np.asarray(sensor_rgb, dtype=np.float32)),
+            mode=str(snapshot_mode),
+        )
+
+    def stream_integration_snapshots(self,
+                                     backs: dict[str, ExposureBackend],
+                                     plan: RayDispatchPlan,
+                                     frame_cfg: FrameConfig,
+                                     batch_index: int) -> dict[str, IntegrationSnapshot]:
+        """Public API: build stream snapshots for all active backends."""
+        out: dict[str, IntegrationSnapshot] = {}
+        sensor_ready = bool(self._last_bdpt_records is not None and self._last_bdpt_records.size > 0)
+        for name, back in backs.items():
+            out[str(name)] = self.build_integration_snapshot(
+                backend_name=str(name),
+                back=back,
+                plan=plan,
+                frame_cfg=frame_cfg,
+                batch_index=int(batch_index),
+                include_sensor=sensor_ready,
+                snapshot_mode="stream",
+            )
+        return out
+
+    def _make_sensor_integral(self, backend: str, gain: float, tracer: Any = None) -> Optional[SensorIntegralObject]:
         """Create a SensorIntegralObject from endpoint-derived accumulation (T4).
-        
-        For Phase 3C, this implements slot-0-only endpoint-driven photon/electron/SNR accumulation.
+
+        Primary path is now C++ reduction when available; Python fallback keeps
+        orchestration continuity.
         Requires: BDPT endpoint records with position and spectral amplitude.
-        
+
         Returns SensorIntegralObject or None if sensor integration unavailable.
         """
         try:
@@ -1319,24 +2003,14 @@ class ExposureSession:
                 print("  [warn] sensor group not registered; sensor integral unavailable")
                 return None
             
-            # Immediate path: first active slot in current session configuration.
-            slot_id = int(active_slots[0])
-            sensor_id, film_id = self.sensor_film_slots[slot_id]
-            
-            if sensor_id < 0 or film_id < 0:
-                return None
-            
-            # Get sensor and film parameters from tensors
-            sensor_row = self._sensor_film_tensors['sensor'][sensor_id]
-            film_row = self._sensor_film_tensors['film'][film_id]
-            
-            qe_peak = float(sensor_row[8])  # offset 8: qe_peak
-            read_noise_e = float(sensor_row[10])  # offset 10: read_noise_e
-            dark_current_e_s = float(sensor_row[11])  # offset 11: dark_current_e_s
-            full_well_e = float(sensor_row[9])  # offset 9: full_well_e
-            
-            exposure_time_s = float(film_row[1])  # offset 1: exposure_time_s
-            
+            # Obstacle list note:
+            # 1) Canonical endpoint->color path is now C++ (wired in render loop).
+            # 2) Reduction telemetry (drops/order) is emitted by C++ reducer.
+            # 3) Absolute-energy normalization remains target-photon driven.
+            # 4) Python fallback remains for compatibility only.
+            # 5) Per-call allocation hotspots remain in fallback branch.
+            # 6) Multi-slot fusion remains equal-weighted (no confidence model).
+
             # Real endpoint-driven coherent accumulation from PIXEL_CONE records.
             sensor_img = aggregate_to_image_pixel_cone(
                 self._last_bdpt_records,
@@ -1362,16 +2036,126 @@ class ExposureSession:
             else:
                 photons_per_pixel = endpoint_intensity.copy()
             photons_per_pixel = photons_per_pixel.astype(np.float32, copy=False)
-            
-            # Apply QE to get electrons
-            electrons_per_pixel = photons_per_pixel * qe_peak
-            
-            # Compute SNR from explicit noise model (T5)
-            # SNR = signal / noise = sqrt(electrons) / sqrt(read_noise^2 + dark_current*t + electrons)
-            dark_current_accumulated_e = dark_current_e_s * exposure_time_s
-            noise_variance = (read_noise_e ** 2) + dark_current_accumulated_e + electrons_per_pixel
-            snr_linear = np.sqrt(np.maximum(electrons_per_pixel, 0.0)) / np.sqrt(np.maximum(noise_variance, 1.0e-10))
-            
+
+            if tracer is not None and hasattr(tracer, "reduce_endpoint_records_to_sensor_integral"):
+                cpp_result = tracer.reduce_endpoint_records_to_sensor_integral(
+                    self._last_bdpt_records,
+                    int(self.width),
+                    int(self.height),
+                    int(self._sensor_group_id),
+                    float(self._last_target_photons_per_pixel),
+                    float(max(gain, 0.0)),
+                )
+
+                photons_per_pixel = np.asarray(cpp_result["photons_per_pixel"], dtype=np.float32)
+                electrons_per_pixel = np.asarray(cpp_result["electrons_per_pixel"], dtype=np.float32)
+                snr_linear = np.asarray(cpp_result["snr_linear"], dtype=np.float32)
+                metrics = dict(cpp_result["metrics"])
+
+                qe_peak = float(metrics.get("qe_peak", 0.0))
+                read_noise_e = float(metrics.get("read_noise_e", 0.0))
+                full_well_e = float(metrics.get("full_well_e", 0.0))
+                peak_snr = float(metrics.get("snr_peak", 0.0))
+                mean_snr = float(metrics.get("snr_mean", 0.0))
+
+                sensor_w_m = float(self.optics.sensor_w_mm) * 1.0e-3
+                sensor_h_m = float(self.optics.sensor_h_mm) * 1.0e-3
+                pixel_pitch_m = float(self.optics.pixel_pitch_um) * 1.0e-6
+                focal_m = float(self.optics.focal_mm) * 1.0e-3
+                # Use aperture_mm directly (more precise for complex aperture sims than f_number)
+                aperture_radius_m = float(self.optics.aperture_mm) * 0.5 * 1.0e-3
+                n_px = self.optics.n_pixels()
+
+                return SensorIntegralObject(
+                    backend=backend,
+                    frame_index=int(self._frame_index),
+                    optics=self.optics,
+                    film=self.film,
+                    n_pixels=int(n_px),
+                    sensor_w_m=float(sensor_w_m),
+                    sensor_h_m=float(sensor_h_m),
+                    pixel_pitch_m=float(pixel_pitch_m),
+                    focal_m=float(focal_m),
+                    aperture_radius_m=float(aperture_radius_m),
+                    qe_peak=float(qe_peak),
+                    photons_per_pixel=photons_per_pixel,
+                    electrons_per_pixel=electrons_per_pixel,
+                    noise_floor_e=float(read_noise_e),
+                    full_well_e=int(round(full_well_e)),
+                    snr_linear=snr_linear,
+                    peak_snr=float(peak_snr),
+                    mean_snr=float(mean_snr),
+                    metrics=metrics,
+                )
+
+            # Multi-slot accumulation: every active slot contributes its own
+            # sensor/film noise model without re-aggregating endpoint records.
+            h, w = photons_per_pixel.shape
+            electrons_accum = np.zeros((h, w), dtype=np.float32)
+            snr_accum = np.zeros((h, w), dtype=np.float32)
+            qe_accum = 0.0
+            read_noise_accum = 0.0
+            full_well_accum = 0.0
+            slot_metrics: list[dict[str, Any]] = []
+
+            for slot_id in active_slots:
+                sensor_id, film_id = self.sensor_film_slots[int(slot_id)]
+                if sensor_id < 0 or film_id < 0:
+                    continue
+
+                sensor_row = self._sensor_film_tensors['sensor'][sensor_id]
+                film_row = self._sensor_film_tensors['film'][film_id]
+
+                qe_peak = float(sensor_row[8])
+                read_noise_e = float(sensor_row[10])
+                dark_current_e_s = float(sensor_row[11])
+                full_well_e = float(sensor_row[9])
+                exposure_time_s = float(film_row[1])
+
+                electrons_slot = photons_per_pixel * np.float32(qe_peak)
+                dark_current_accumulated_e = dark_current_e_s * exposure_time_s
+                noise_variance = ((read_noise_e ** 2) + dark_current_accumulated_e +
+                                  electrons_slot)
+                snr_slot = (np.sqrt(np.maximum(electrons_slot, 0.0)) /
+                            np.sqrt(np.maximum(noise_variance, 1.0e-10)))
+                snr_slot = snr_slot.astype(np.float32, copy=False)
+
+                electrons_accum += electrons_slot.astype(np.float32, copy=False)
+                snr_accum += snr_slot
+                qe_accum += qe_peak
+                read_noise_accum += read_noise_e
+                full_well_accum += full_well_e
+
+                slot_meta = self._sensor_film_metadata[int(slot_id)]
+                slot_metrics.append({
+                    "slot_id": int(slot_id),
+                    "sensor_id": int(sensor_id),
+                    "film_id": int(film_id),
+                    "sensor_name": slot_meta.get("sensor_name", "unknown"),
+                    "film_name": slot_meta.get("film_name", "unknown"),
+                    "qe_peak": float(qe_peak),
+                    "read_noise_e": float(read_noise_e),
+                    "dark_current_e_s": float(dark_current_e_s),
+                    "dark_current_accumulated_e": float(dark_current_accumulated_e),
+                    "exposure_time_s": float(exposure_time_s),
+                    "full_well_e": float(full_well_e),
+                    "snr_peak": float(np.nanmax(snr_slot)),
+                    "snr_mean": float(np.nanmean(snr_slot)),
+                    "photons_flux_hz": float(np.mean(photons_per_pixel)),
+                    "electrons_flux_hz": float(np.mean(electrons_slot)),
+                })
+
+            if not slot_metrics:
+                print("  [warn] no valid active sensor/film slots after filtering")
+                return None
+
+            inv_slots = np.float32(1.0 / max(1, len(slot_metrics)))
+            electrons_per_pixel = (electrons_accum * inv_slots).astype(np.float32, copy=False)
+            snr_linear = (snr_accum * inv_slots).astype(np.float32, copy=False)
+            qe_peak = float(qe_accum / max(1, len(slot_metrics)))
+            read_noise_e = float(read_noise_accum / max(1, len(slot_metrics)))
+            full_well_e = float(full_well_accum / max(1, len(slot_metrics)))
+
             peak_snr = float(np.nanmax(snr_linear))
             mean_snr = float(np.nanmean(snr_linear))
             
@@ -1385,16 +2169,10 @@ class ExposureSession:
             
             # Build metadata with explicit noise model (T5)
             metrics = {
-                "slot_id": slot_id,
-                "sensor_id": sensor_id,
-                "film_id": film_id,
-                "sensor_name": self._sensor_film_metadata[slot_id].get("sensor_name", "unknown"),
-                "film_name": self._sensor_film_metadata[slot_id].get("film_name", "unknown"),
+                "active_slot_ids": [int(s) for s in active_slots],
+                "n_active_slots": int(len(slot_metrics)),
                 "qe_peak": float(qe_peak),
                 "read_noise_e": float(read_noise_e),
-                "dark_current_e_s": float(dark_current_e_s),
-                "dark_current_accumulated_e": float(dark_current_accumulated_e),
-                "exposure_time_s": float(exposure_time_s),
                 "full_well_e": float(full_well_e),
                 "snr_peak": float(peak_snr),
                 "snr_mean": float(mean_snr),
@@ -1402,6 +2180,7 @@ class ExposureSession:
                 "sensor_group_id": int(self._sensor_group_id),
                 "photons_flux_hz": float(np.mean(photons_per_pixel)),
                 "electrons_flux_hz": float(np.mean(electrons_per_pixel)),
+                "slot_metrics": slot_metrics,
             }
             
             return SensorIntegralObject(
@@ -1419,7 +2198,7 @@ class ExposureSession:
                 photons_per_pixel=photons_per_pixel,
                 electrons_per_pixel=electrons_per_pixel.astype(np.float32),
                 noise_floor_e=float(read_noise_e),
-                full_well_e=int(full_well_e),
+                full_well_e=int(round(full_well_e)),
                 snr_linear=snr_linear.astype(np.float32),
                 peak_snr=float(peak_snr),
                 mean_snr=float(mean_snr),
@@ -1434,9 +2213,11 @@ class ExposureSession:
     def _save_integral_objects(self,
                                field_obj: FieldIntegralObject,
                                surface_obj: SurfaceIntegralObject,
-                               sensor_obj: Optional[SensorIntegralObject] = None
+                               sensor_obj: Optional[SensorIntegralObject] = None,
+                               field_history_bands: Optional[np.ndarray] = None,
+                               surface_history_bands: Optional[np.ndarray] = None
                                ) -> tuple[str, str, Optional[str]]:
-        """Write field/surface/sensor integral objects to npz artifacts."""
+        """Write field/surface/sensor objects and uncompressed full histories."""
         field_path = os.path.join(
             self.out_dir,
             f"{self._frame_index:04d}_{field_obj.backend}_field_integral.npz")
@@ -1449,22 +2230,31 @@ class ExposureSession:
                 self.out_dir,
                 f"{self._frame_index:04d}_{sensor_obj.backend}_sensor_integral.npz")
 
-        np.savez_compressed(
+        field_history = (np.asarray(field_history_bands, dtype=np.float32)
+                         if field_history_bands is not None
+                         else (field_obj.integrated_bands + field_obj.bookkeeping_bands).astype(np.float32, copy=False))
+        surface_history = (np.asarray(surface_history_bands, dtype=np.float32)
+                           if surface_history_bands is not None
+                           else (surface_obj.integrated_bands + surface_obj.bookkeeping_bands).astype(np.float32, copy=False))
+
+        np.savez(
             field_path,
             freq_hz=field_obj.freq_hz,
             integrated_bands=field_obj.integrated_bands,
             bookkeeping_bands=field_obj.bookkeeping_bands,
+            full_history_bands=field_history,
             metrics=np.asarray(json.dumps(field_obj.metrics)),
         )
-        np.savez_compressed(
+        np.savez(
             surf_path,
             freq_hz=surface_obj.freq_hz,
             integrated_bands=surface_obj.integrated_bands,
             bookkeeping_bands=surface_obj.bookkeeping_bands,
+            full_history_bands=surface_history,
             metrics=np.asarray(json.dumps(surface_obj.metrics)),
         )
         if sensor_path is not None and sensor_obj is not None:
-            np.savez_compressed(
+            np.savez(
                 sensor_path,
                 photons_per_pixel=sensor_obj.photons_per_pixel,
                 electrons_per_pixel=sensor_obj.electrons_per_pixel,
@@ -1475,7 +2265,11 @@ class ExposureSession:
         return field_path, surf_path, sensor_path
 
     # ── Render one full exposure (drives all sub-batches) ────────────────
-    def render_one_exposure(self, t: float = 0.0) -> list[ExposureFrameResult]:
+    def render_one_exposure(
+        self,
+        t: float = 0.0,
+        batch_preview_cb: Optional[Callable[[dict[str, ExposureBackend], dict[str, IntegrationSnapshot], int, int, float], None]] = None,
+    ) -> list[ExposureFrameResult]:
         # ── Build per-frame progressive feature configuration ────────────
         frame_cfg = _build_frame_config(
             self._frame_index, self.n_frames_planned, self.integral_split)
@@ -1491,7 +2285,8 @@ class ExposureSession:
         photon_E = H_PLANCK * C_LIGHT / (plan.ref_wavelength_nm * 1.0e-9)
         photons_per_pix = plan.target_H_J / max(1, n_pix) / max(photon_E, 1.0e-30)
         self._last_target_photons_per_pixel = float(photons_per_pix)
-        self._last_bdpt_records = None
+        self._cleanup_temp_bdpt_file()
+        self._release_last_bdpt_records()
 
         fc_active = frame_cfg.field_capture
         cv_active = frame_cfg.camera_visibility
@@ -1509,6 +2304,15 @@ class ExposureSession:
         print(f"  scene:  {scene.verts.shape[0]} tris, {scene.src_pos.shape[0]} emissive sources")
         print(f"  emissive total power = {scene.total_emissive_power_W:.4g} W "
               f"over {scene.total_emissive_area_m2:.4g} m²")
+        if scene.src_emit_rgb_W.size > 0:
+            rgb_emit = np.sum(scene.src_emit_rgb_W, axis=0)
+            rgb_total = float(np.sum(rgb_emit))
+            if rgb_total > 1.0e-12:
+                rgb_frac = rgb_emit / rgb_total
+                print("  emissive rgb share = "
+                      f"R {rgb_frac[0]*100.0:5.1f}%  "
+                      f"G {rgb_frac[1]*100.0:5.1f}%  "
+                      f"B {rgb_frac[2]*100.0:5.1f}%")
         print(f"  budget (total)       : N_rays={plan.total_rays:_}  "
               f"n_batches={plan.n_batches}  rays/batch={plan.rays_per_batch:_}")
         print(f"  per-pixel target     : H={plan.target_H_J/n_pix:.3e} J  "
@@ -1529,19 +2333,103 @@ class ExposureSession:
             if tracer_obj is not None and hasattr(tracer_obj, "clear_field_capture"):
                 tracer_obj.clear_field_capture(clear_grid=False, clear_strikes=True)
 
+        conv_cfg = self.convergence
+        conv_target_pct = float(np.clip(conv_cfg.target_pct, 0.0, 100.0))
+        conv_error_target = max(0.0, float(conv_cfg.max_rel_drift))
+        if conv_error_target <= 0.0:
+            conv_error_target = max(0.0, 1.0 - conv_target_pct / 100.0)
+        conv_every = max(1, int(conv_cfg.check_every_batches))
+        conv_min_batches = max(1, int(conv_cfg.min_batches))
+        conv_hold = max(1, int(conv_cfg.hold_checks))
+        conv_enabled = bool(conv_cfg.enabled)
+        conv_drive_batches = bool(conv_cfg.drive_batches) and conv_enabled
+        conv_max_batches = max(0, int(conv_cfg.max_batches))
+        conv_consecutive_hits = 0
+        conv_last_measured_pct = 0.0
+        conv_last_pct = 0.0
+
+        def _convergence_backend() -> Optional[ExposureBackend]:
+            if "cpp" in backs:
+                return backs["cpp"]
+            return next(iter(backs.values()), None)
+
+        if conv_drive_batches:
+            print("  [conv] acquisition mode: open-ended batches until exposure target is met")
+
         t0 = time.perf_counter()
-        for b_idx in range(plan.n_batches):
+        batches_executed = 0
+        converged_early = False
+        b_idx = 0
+        while True:
+            if not conv_drive_batches and b_idx >= plan.n_batches:
+                break
+            if conv_drive_batches and conv_max_batches > 0 and b_idx >= conv_max_batches:
+                print(f"  [conv] reached max_batches={conv_max_batches}; stopping acquisition")
+                break
+
             seed = (self._rng_seed * 1_000_003) + b_idx + 1
             for back in backs.values():
                 back.render_batch(rays_per_source_per_batch, seed)
-            if (b_idx + 1) % max(1, plan.n_batches // 10) == 0:
+            batches_executed = b_idx + 1
+
+            if batch_preview_cb is not None:
+                try:
+                    n_batches_hint = -1 if conv_drive_batches else int(plan.n_batches)
+                    snaps = self.stream_integration_snapshots(
+                        backs=backs,
+                        plan=plan,
+                        frame_cfg=frame_cfg,
+                        batch_index=int(b_idx + 1),
+                    )
+                    batch_preview_cb(
+                        backs,
+                        snaps,
+                        int(b_idx + 1),
+                        int(n_batches_hint),
+                        float(time.perf_counter() - t0),
+                    )
+                except Exception as exc:
+                    print(f"  [warn] batch preview callback failed: {exc}")
+                    batch_preview_cb = None
+
+            progress_every = 10 if conv_drive_batches else max(1, plan.n_batches // 10)
+            if (b_idx + 1) % progress_every == 0:
                 elapsed = time.perf_counter() - t0
-                pct = 100.0 * (b_idx + 1) / plan.n_batches
-                print(f"    batch {b_idx+1:>5}/{plan.n_batches}  "
-                      f"({pct:5.1f}%)  elapsed={elapsed:6.2f}s")
+                if conv_drive_batches:
+                    print(f"    batch {b_idx+1:>5}  elapsed={elapsed:6.2f}s")
+                else:
+                    pct = 100.0 * (b_idx + 1) / plan.n_batches
+                    print(f"    batch {b_idx+1:>5}/{plan.n_batches}  "
+                          f"({pct:5.1f}%)  elapsed={elapsed:6.2f}s")
+
+            if conv_enabled and ((b_idx + 1) % conv_every) == 0:
+                conv_back = _convergence_backend()
+                if conv_back is not None:
+                    measured_H_J = float(conv_back.measured_radiant_exposure_J(plan.energy_per_ray_J))
+                    target_H_J = max(float(plan.target_H_J), 1.0e-30)
+                    conv_last_measured_pct = 100.0 * measured_H_J / target_H_J
+                    conv_last_pct = 100.0 * abs(measured_H_J - target_H_J) / target_H_J
+                    if (b_idx + 1) >= conv_min_batches and conv_last_pct <= (conv_error_target * 100.0):
+                        conv_consecutive_hits += 1
+                    else:
+                        conv_consecutive_hits = 0
+                    if conv_consecutive_hits >= conv_hold:
+                        converged_early = True
+                        print(f"  [conv] reached H={measured_H_J:.3e} J "
+                              f"({conv_last_measured_pct:.5f}% of target) at batch {b_idx+1}")
+                        print(f"         target H={target_H_J:.3e} J, "
+                              f"error<={conv_error_target:.3e}, hold={conv_hold}")
+                        break
+            b_idx += 1
+
         elapsed = time.perf_counter() - t0
-        print(f"  {plan.n_batches} batches in {elapsed:.2f}s "
-              f"({(plan.n_batches/max(elapsed,1e-9)):.1f} batches/s)")
+        if converged_early:
+            if conv_drive_batches:
+                print(f"  [conv] stop after {batches_executed} open-ended batches")
+            else:
+                print(f"  [conv] early stop after {batches_executed}/{plan.n_batches} batches")
+        print(f"  {batches_executed} batches in {elapsed:.2f}s "
+              f"({(batches_executed/max(elapsed,1e-9)):.1f} batches/s)")
 
         # ── Optional bidirectional pass ──────────────────────────────────
         # Per the integrator-rewrite directive: complex EndpointRecords are
@@ -1557,6 +2445,7 @@ class ExposureSession:
 
                 # ── Surface spline fitting ────────────────────────────────
                 ss_cfg = frame_cfg.surface_spline
+                ps_cfg = frame_cfg.parametric_sdf
                 spline_coeffs: Optional[np.ndarray] = None
                 if ss_cfg.enabled and _HAS_SURFACE_SPLINE and emissive_tris.size > 0:
                     try:
@@ -1579,45 +2468,111 @@ class ExposureSession:
                           "unavailable (rebuild _spectral_kernels)")
 
                 _TRI_POLY_BARY = int(getattr(_sk, "TRI_PARAM_SURFACE_POLY_BARY", 1))
+                emissive_group_centers: list[np.ndarray] = []
+
+                parametric_driver = None
+                if ps_cfg.enabled:
+                    if _get_sdf_driver is None:
+                        raise RuntimeError("parametric SDF requested but sdf_plugins is unavailable")
+                    if _TRI_POLY_BARY <= 0:
+                        raise RuntimeError("parametric SDF requested but TRI_PARAM_SURFACE_POLY_BARY is unavailable")
+                    parametric_driver = _get_sdf_driver(ps_cfg.model, strict=True)
 
                 if emissive_tris.size > 0:
-                    if spline_coeffs is not None and ss_cfg.fit_all_tris:
+                    if (parametric_driver is not None) or (spline_coeffs is not None and ss_cfg.fit_all_tris):
                         # Per-triangle groups — each emissive tri gets individual coefficients.
                         n_tri_total = scene.verts.shape[0]
                         for ti in emissive_tris:
                             ti_int = int(ti)
                             if ti_int < 0 or ti_int >= n_tri_total:
                                 continue
-                            c6 = spline_coeffs[ti_int].ravel().astype(np.float64)
+                            if parametric_driver is not None:
+                                payload = _resolve_native_parametric_payload(parametric_driver(
+                                    tri_id=ti_int,
+                                    tri_vertices=np.asarray(scene.verts[ti_int], dtype=np.float64),
+                                    params={
+                                        "saddle_amplitude_m": float(ps_cfg.saddle_amplitude_m),
+                                        "sphere_radius_m": float(ps_cfg.sphere_radius_m),
+                                        "neighborhood_margin_uv": float(ps_cfg.neighborhood_margin_uv),
+                                    },
+                                ))
+                            else:
+                                payload = {
+                                    "kind": int(getattr(_sk, "TRI_PARAM_SURFACE_POLY_BARY", 1)),
+                                    "coeffs": spline_coeffs[ti_int].ravel().astype(np.float64),
+                                }
                             tracer.register_tri_group(
                                 role_bits          = 1,
                                 sample_policy      = 1,
                                 tri_indices        = np.asarray([ti], np.int32),
-                                parametric_surface = {"kind": _TRI_POLY_BARY, "coeffs": c6},
+                                parametric_surface = payload,
                             )
-                        print(f"  bdpt: {emissive_tris.size} per-tri emissive groups "
-                              f"with POLY_BARY spline")
-                    elif spline_coeffs is not None:
+                            tri_verts = np.asarray(scene.verts[ti_int], np.float64)
+                            emissive_group_centers.append(np.mean(tri_verts, axis=0))
+                        if parametric_driver is not None:
+                            print(f"  bdpt: {emissive_tris.size} per-tri emissive groups with parametric SDF '{ps_cfg.model}'")
+                        else:
+                            print(f"  bdpt: {emissive_tris.size} per-tri emissive groups with POLY_BARY spline")
+                    elif (parametric_driver is not None) or (spline_coeffs is not None):
                         # Single group with mean coefficients across emissive tris.
-                        valid_ids = emissive_tris[emissive_tris < spline_coeffs.shape[0]]
-                        mean_c6 = (spline_coeffs[valid_ids].mean(axis=0)
-                                   if valid_ids.size > 0 else np.zeros(6, np.float64))
+                        if parametric_driver is not None:
+                            payloads: list[dict[str, Any]] = []
+                            for ti in emissive_tris:
+                                ti_int = int(ti)
+                                payload = _resolve_native_parametric_payload(parametric_driver(
+                                    tri_id=ti_int,
+                                    tri_vertices=np.asarray(scene.verts[ti_int], dtype=np.float64),
+                                    params={
+                                        "saddle_amplitude_m": float(ps_cfg.saddle_amplitude_m),
+                                        "sphere_radius_m": float(ps_cfg.sphere_radius_m),
+                                        "neighborhood_margin_uv": float(ps_cfg.neighborhood_margin_uv),
+                                    },
+                                ))
+                                payloads.append(payload)
+                            if not payloads:
+                                raise RuntimeError("parametric SDF requested but plugin returned no payloads")
+                            kind0 = int(payloads[0]["kind"])
+                            if any(int(p["kind"]) != kind0 for p in payloads):
+                                raise RuntimeError(
+                                    "parametric SDF plugin returned mixed kinds for merged group; use per-triangle mode")
+                            coeff_stack = np.asarray([np.asarray(p["coeffs"], dtype=np.float64) for p in payloads], dtype=np.float64)
+                            mean_payload = {
+                                "kind": kind0,
+                                "coeffs": np.mean(coeff_stack, axis=0).astype(np.float64, copy=False),
+                            }
+                        else:
+                            valid_ids = emissive_tris[emissive_tris < spline_coeffs.shape[0]]
+                            mean_payload = {
+                                "kind": _TRI_POLY_BARY,
+                                "coeffs": (spline_coeffs[valid_ids].mean(axis=0)
+                                           if valid_ids.size > 0 else np.zeros(6, np.float64)),
+                            }
                         tracer.register_tri_group(
                             role_bits          = 1,
                             sample_policy      = 1,
                             tri_indices        = emissive_tris,
                             parametric_surface = {
-                                "kind": _TRI_POLY_BARY,
-                                "coeffs": mean_c6.ravel().astype(np.float64),
+                                "kind": int(mean_payload["kind"]),
+                                "coeffs": np.asarray(mean_payload["coeffs"], dtype=np.float64).ravel(),
                             },
                         )
-                        print("  bdpt: 1 emissive group with mean POLY_BARY spline")
+                        tri_pos = np.asarray(scene.verts[emissive_tris], np.float64).reshape(-1, 3)
+                        emissive_group_centers.append(np.mean(tri_pos, axis=0))
+                        if parametric_driver is not None:
+                            print(f"  bdpt: 1 emissive group with mean parametric SDF '{ps_cfg.model}'")
+                        else:
+                            print("  bdpt: 1 emissive group with mean POLY_BARY spline")
                     else:
+                        if ps_cfg.enabled:
+                            raise RuntimeError(
+                                "parametric SDF requested but no emissive tris are available for registration")
                         tracer.register_tri_group(
                             role_bits     = 1,
                             sample_policy = 1,
                             tri_indices   = emissive_tris,
                         )
+                        tri_pos = np.asarray(scene.verts[emissive_tris], np.float64).reshape(-1, 3)
+                        emissive_group_centers.append(np.mean(tri_pos, axis=0))
 
                 # ── Sensor group (PIXEL_CONE) ─────────────────────────────
                 all_tris = np.ascontiguousarray(
@@ -1649,31 +2604,57 @@ class ExposureSession:
                 
                 # Bind sensor/film SSBO before dispatch (T3)
                 self._bind_sensor_film_ssbo(tracer)
+                self._configure_default_wave_contexts(tracer, cam)
                 
                 t_bd = time.perf_counter()
                 rays_per_emitter = max(64, self.total_rays //
                                        max(1, tracer.n_tri_groups()) // 16)
-                recs = tracer.bidirectional(
-                    n_rays_per_emitter = rays_per_emitter,
-                    max_bounces        = self.max_bounces,
-                    min_amplitude      = 1.0e-3,
-                    seed               = self._rng_seed,
-                    max_records        = self.bdpt_records_cap,
-                )
-                self._last_bdpt_records = np.ascontiguousarray(recs, dtype=np.float32)
+                n_emit = len(emissive_group_centers)
+                target_total = max(n_emit, int(rays_per_emitter) * max(1, n_emit))
+                if (n_emit > 0 and hasattr(tracer, "bidirectional_packed") and
+                        hasattr(cpp_back, "_allocate_source_rays")):
+                    emit_pos = np.ascontiguousarray(np.asarray(emissive_group_centers, np.float64))
+                    emit_rays = self._allocate_bdpt_emit_rays(
+                        cpp_back=cpp_back,
+                        emitter_centers=emit_pos,
+                        target_total_rays=target_total,
+                        seed=int(self._rng_seed + self._frame_index),
+                    )
+                    recs = tracer.bidirectional_packed(
+                        n_rays_per_emitter = np.asarray(emit_rays, np.int32),
+                        max_bounces        = self.max_bounces,
+                        min_amplitude      = 1.0e-3,
+                        seed               = self._rng_seed,
+                        max_records        = self.bdpt_records_cap,
+                    )
+                    self._last_bdpt_emit_counts = np.asarray(emit_rays, np.int32)
+                    rays_per_emitter = int(np.sum(emit_rays, dtype=np.int64) // max(1, n_emit))
+                else:
+                    recs = tracer.bidirectional(
+                        n_rays_per_emitter = rays_per_emitter,
+                        max_bounces        = self.max_bounces,
+                        min_amplitude      = 1.0e-3,
+                        seed               = self._rng_seed,
+                        max_records        = self.bdpt_records_cap,
+                    )
+                    self._last_bdpt_emit_counts = (
+                        np.full((n_emit,), int(rays_per_emitter), dtype=np.int32)
+                        if n_emit > 0 else None
+                    )
+                self._stage_bdpt_records(recs)
                 print(f"  bdpt: {recs.shape[0]:_} EndpointRecords "
                       f"in {time.perf_counter()-t_bd:.2f}s "
                       f"(tri_groups={tracer.n_tri_groups()}, "
                       f"rays/emitter={rays_per_emitter:_})")
-                bdpt_path = os.path.join(
-                    self.out_dir, f"bdpt_records_{self._frame_index:04d}.npy")
-                np.save(bdpt_path, recs)
-                print(f"  bdpt records saved → {bdpt_path}")
+                if int(recs.shape[0]) >= int(self.bdpt_records_cap):
+                    print("  [warn] BDPT record cap reached; endpoint stream may be truncated")
+                    print("         raise --bdpt-records-cap or --bdpt-intermediate-max-gb")
 
         # ── Build human-readable frame config summary (HUD + JSON) ───────
         fc_s = frame_cfg.field_capture
         cv_s = frame_cfg.camera_visibility
         ss_s = frame_cfg.surface_spline
+        ps_s = frame_cfg.parametric_sdf
         is_s = frame_cfg.integral_split
         frame_config_summary = {
             "description":   frame_cfg.description,
@@ -1688,6 +2669,11 @@ class ExposureSession:
             "spline":        (f"{'all' if ss_s.fit_all_tris else 'emissive'} "
                               f"λ={ss_s.ridge_lambda:.1e}"
                               if ss_s.enabled else "off"),
+            "parametric":    (f"{ps_s.model} "
+                               f"saddle={ps_s.saddle_amplitude_m:.2e}m "
+                               f"sphereR={ps_s.sphere_radius_m:.2e}m "
+                               f"marginUV={ps_s.neighborhood_margin_uv:.2e}"
+                               if ps_s.enabled else "off"),
             "fi": float(is_s.field_integrate_frac),
             "si": float(is_s.surface_integrate_frac),
             "fb": float(is_s.field_bookkeep_frac),
@@ -1704,16 +2690,89 @@ class ExposureSession:
             virtual_t = self.film.exposure_time_s
             qe = float(self.film.quantum_efficiency)
             snr = math.sqrt(max(photons_per_pix * qe, 0.0))
+            tracer_obj = getattr(back, "tracer", None)
 
             field_obj, surface_obj, _merged_bands, rgb_linear = \
                 self._make_integral_objects(name, back.accum, gain,
                                             frame_cfg.integral_split)
-            sensor_obj = self._make_sensor_integral(name, gain)
-            
-            field_obj_path, surface_obj_path, sensor_obj_path = \
-                self._save_integral_objects(field_obj, surface_obj, sensor_obj)
+            sensor_obj = self._make_sensor_integral(name, gain, tracer_obj)
 
             img = self._tone_map_delicate(rgb_linear, frame_cfg.integral_split)
+
+            if self.rgb_source == "sensor":
+                if sensor_obj is not None:
+                    img = self._sensor_display_rgb(sensor_obj)
+                    rgb_linear = img.copy()
+                else:
+                    print("  [warn] rgb_source=sensor but sensor integral unavailable; using accum RGB")
+
+            # Keep EndpointRecord history intact and optionally derive endpoint RGB.
+            if (tracer_obj is not None
+                and hasattr(tracer_obj, "reduce_endpoint_records_to_rgb_image")
+                and self._last_bdpt_records is not None
+                and self._last_bdpt_records.size > 0
+                and self._sensor_group_id >= 0):
+                try:
+                    cpp_rgb = tracer_obj.reduce_endpoint_records_to_rgb_image(
+                        self._last_bdpt_records,
+                        int(self.width),
+                        int(self.height),
+                        int(self._sensor_group_id),
+                        float(max(gain, 0.0)),
+                        float(frame_cfg.integral_split.hdr_white_percentile),
+                    )
+                    endpoint_rgb_linear = np.asarray(cpp_rgb["rgb_linear"], dtype=np.float32)
+                    endpoint_img = np.asarray(cpp_rgb["rgb_tonemapped"], dtype=np.float32)
+                    rgb_telemetry = dict(cpp_rgb.get("telemetry", {}))
+                    kept = int(rgb_telemetry.get("kept_records", 0))
+                    inp = int(rgb_telemetry.get("input_records", 0))
+                    drop = max(0, inp - kept)
+                    if inp > 0:
+                        drop_frac = float(drop) / float(inp)
+                        if drop_frac > 0.05:
+                            print(f"  [warn] endpoint reduction dropped {drop:_}/{inp:_} records ({100.0*drop_frac:.1f}%)")
+                    ord_reg = int(rgb_telemetry.get("order_regressions", 0))
+                    if ord_reg > 0:
+                        print(f"  [warn] endpoint order regressions detected: {ord_reg:_}")
+                    if sensor_obj is not None and isinstance(sensor_obj.metrics, dict):
+                        sensor_obj.metrics["endpoint_rgb_telemetry"] = rgb_telemetry
+                    if self.rgb_source == "endpoint":
+                        rgb_linear = endpoint_rgb_linear
+                        img = endpoint_img
+                except Exception as exc:
+                    print(f"  [warn] C++ endpoint->RGB reduction failed; using accum RGB: {exc}")
+
+            # Optional output conversion path for oversampled rendering.
+            sy, sx = self._output_downsample_factors()
+            if (self.output_height != self.height) or (self.output_width != self.width):
+                st = self.output_oversample_stencil
+                rgb_linear = self._downsample_hw3(np.asarray(rgb_linear), sy, sx, stencil=st)
+                img = self._downsample_hw3(np.asarray(img), sy, sx, stencil=st)
+                field_obj.integrated_bands = self._downsample_bhw(np.asarray(field_obj.integrated_bands), sy, sx, stencil=st)
+                field_obj.bookkeeping_bands = self._downsample_bhw(np.asarray(field_obj.bookkeeping_bands), sy, sx, stencil=st)
+                surface_obj.integrated_bands = self._downsample_bhw(np.asarray(surface_obj.integrated_bands), sy, sx, stencil=st)
+                surface_obj.bookkeeping_bands = self._downsample_bhw(np.asarray(surface_obj.bookkeeping_bands), sy, sx, stencil=st)
+                if sensor_obj is not None:
+                    sensor_obj.photons_per_pixel = self._downsample_hw(np.asarray(sensor_obj.photons_per_pixel), sy, sx, stencil=st)
+                    sensor_obj.electrons_per_pixel = self._downsample_hw(np.asarray(sensor_obj.electrons_per_pixel), sy, sx, stencil=st)
+                    sensor_obj.snr_linear = self._downsample_hw(np.asarray(sensor_obj.snr_linear), sy, sx, stencil=st)
+
+            field_history = (np.asarray(back.accum, np.float32) * np.float32(max(gain, 0.0)))
+            surface_history = (np.asarray(back.accum, np.float32) * np.float32(max(gain, 0.0)))
+            if (self.output_height != self.height) or (self.output_width != self.width):
+                st = self.output_oversample_stencil
+                field_history = self._downsample_bhw(field_history, sy, sx, stencil=st)
+                surface_history = self._downsample_bhw(surface_history, sy, sx, stencil=st)
+            
+            field_obj_path, surface_obj_path, sensor_obj_path = \
+                self._save_integral_objects(
+                    field_obj,
+                    surface_obj,
+                    sensor_obj,
+                    field_history_bands=field_history,
+                    surface_history_bands=surface_history,
+                )
+
             png_path   = os.path.join(self.out_dir,
                                       f"{self._frame_index:04d}_{name}.png")
             png16_path = os.path.join(self.out_dir,
@@ -1749,7 +2808,7 @@ class ExposureSession:
                 backend            = name,
                 plan               = plan_dict,
                 n_rays_emitted     = int(back.n_rays_accumulated),
-                n_batches          = int(plan.n_batches),
+                n_batches          = int(batches_executed),
                 measured_H_J       = float(measured),
                 target_H_J         = float(plan.target_H_J),
                 gain_linear        = float(gain),
@@ -1768,6 +2827,12 @@ class ExposureSession:
                 summary_path       = json_path,
                 frame_config_summary = frame_config_summary,
             )
+            r.frame_config_summary["convergence_target_pct"] = float(conv_target_pct)
+            r.frame_config_summary["convergence_error_target"] = float(conv_error_target)
+            r.frame_config_summary["convergence_last_measured_pct"] = float(conv_last_measured_pct)
+            r.frame_config_summary["convergence_last_error_pct"] = float(conv_last_pct)
+            r.frame_config_summary["converged_early"] = bool(converged_early)
+            r.frame_config_summary["convergence_drive_batches"] = bool(conv_drive_batches)
 
             # Burn frame details into the standard preview PNG (8-bit only).
             # Keep the 16-bit output pristine for numeric post-processing.
@@ -1778,6 +2843,11 @@ class ExposureSession:
             # Store image data in memory for display
             r.image_data = np.clip(img_preview, 0.0, 1.0).astype(np.float32)
             r.image16_data = (np.clip(img, 0.0, 1.0) * 65535.0).astype(np.uint16)
+            r.field_integrated_data = field_obj.integrated_bands
+            r.surface_integrated_data = surface_obj.integrated_bands
+            if sensor_obj is not None:
+                r.sensor_photons_data = sensor_obj.photons_per_pixel
+                r.sensor_snr_data = sensor_obj.snr_linear
 
             # Only save files if explicitly enabled via --save-files
             if self.save_files:
@@ -1804,6 +2874,7 @@ class ExposureSession:
 
         self._frame_index += 1
         self._rng_seed += 1
+        self._cleanup_temp_bdpt_file()
         return results
 
 
@@ -1934,7 +3005,9 @@ def _make_hud_lines(r: ExposureFrameResult, detail_level: int) -> list[str]:
 
 def _run_viewer(session: ExposureSession, n_frames: int,
                 pane_w: int, pane_h: int,
-                show_hud: bool = True) -> None:
+                show_hud: bool = True,
+                preview_cycle_s: float = 1.5,
+                preview_modes: tuple[str, ...] = ("rgb", "spectral")) -> None:
     try:
         import pygame
     except ImportError:
@@ -1948,6 +3021,171 @@ def _run_viewer(session: ExposureSession, n_frames: int,
     pygame.display.set_caption("Exposure Render Demo — C++ (left) vs GLSL (right)")
     font  = pygame.font.SysFont("consolas", 14)
     bigf  = pygame.font.SysFont("consolas", 18, bold=True)
+    display_order = ("cpp", "glsl")
+    allowed_modes = {
+        "rgb", "spectral",
+        "field-rgb", "field-spectral",
+        "surface-rgb", "surface-spectral",
+        "sensor-color", "sensor-spectral",
+        "endpoint-rgb", "endpoint-spectral",
+    }
+    mode_cycle = tuple(m for m in preview_modes if m in allowed_modes) or ("rgb",)
+    cycle_s = max(0.25, float(preview_cycle_s))
+
+    def _spectral_falsecolor(accum_bhw: np.ndarray) -> np.ndarray:
+        """False-color view showing spectral centroid and intensity."""
+        power = np.maximum(np.asarray(accum_bhw, np.float64), 0.0)
+        if power.ndim != 3 or power.shape[0] <= 0:
+            return np.zeros((session.height, session.width, 3), np.float32)
+        n_b = int(power.shape[0])
+        axis = np.arange(n_b, dtype=np.float64)[:, None, None]
+        total = power.sum(axis=0)
+        centroid = (power * axis).sum(axis=0) / np.maximum(total, 1.0e-20)
+        hue = centroid / max(1.0, float(n_b - 1))
+        p99 = float(np.percentile(total, 99.0)) if total.size else 1.0
+        p99 = max(1.0e-8, p99)
+        light = _sigmoid01((total / p99 - 0.45) * 5.0)
+        sat = np.full_like(light, 0.95, dtype=np.float64)
+        return _hsl_to_rgb(hue, sat, light)
+
+    def _scalar_falsecolor(img_hw: np.ndarray) -> np.ndarray:
+        x = np.maximum(np.asarray(img_hw, np.float64), 0.0)
+        p99 = float(np.percentile(x, 99.0)) if x.size else 1.0
+        p99 = max(1.0e-8, p99)
+        xn = np.clip(x / p99, 0.0, 1.0)
+        hue = (1.0 - xn) * 0.72
+        sat = np.full_like(xn, 0.9, dtype=np.float64)
+        light = _sigmoid01((xn - 0.35) * 5.0)
+        return _hsl_to_rgb(hue, sat, light)
+
+    def _scalar_clear(img_hw: np.ndarray) -> np.ndarray:
+        x = np.maximum(np.asarray(img_hw, np.float64), 0.0)
+        p99 = float(np.percentile(x, 99.0)) if x.size else 1.0
+        p99 = max(1.0e-8, p99)
+        xn = np.clip(x / p99, 0.0, 1.0)
+        y = _sigmoid01((xn - 0.35) * 5.0).astype(np.float32)
+        return np.stack([y, y, y], axis=-1)
+
+    def _missing_mode_image(mode: str) -> np.ndarray:
+        img = np.zeros((session.height, session.width, 3), dtype=np.float32)
+        img[:, :, 0] = 0.20
+        return img
+
+    def _mode_image_for_snapshot(mode: str,
+                                 snap: IntegrationSnapshot,
+                                 fallback_accum: Optional[np.ndarray]) -> tuple[np.ndarray, str]:
+        if mode == "rgb":
+            return np.asarray(snap.image_data, dtype=np.float32), "rgb"
+        if mode == "spectral":
+            if fallback_accum is not None:
+                return _spectral_falsecolor(fallback_accum), "spectral-index"
+            return _missing_mode_image("spectral"), "missing:spectral-index"
+        if mode == "field-rgb":
+            rgb = _bands_to_rgb(snap.field_integrated_data, session.freq_hz)
+            return np.asarray(rgb, dtype=np.float32), "field-rgb-visible"
+        if mode == "field-spectral":
+            return _spectral_falsecolor(snap.field_integrated_data), "field-spectral-index"
+        if mode == "surface-rgb":
+            rgb = _bands_to_rgb(snap.surface_integrated_data, session.freq_hz)
+            return np.asarray(rgb, dtype=np.float32), "surface-rgb-visible"
+        if mode == "surface-spectral":
+            return _spectral_falsecolor(snap.surface_integrated_data), "surface-spectral-index"
+        if mode == "sensor-color":
+            if snap.sensor_photons_data is not None:
+                return _scalar_falsecolor(snap.sensor_photons_data), "sensor-color"
+            return np.asarray(snap.image_data, dtype=np.float32), "sensor-color:live-rgb"
+        if mode == "sensor-spectral":
+            if snap.sensor_snr_data is not None:
+                return _scalar_clear(snap.sensor_snr_data), "sensor-spectral"
+            return np.asarray(snap.image_data, dtype=np.float32), "sensor-spectral:live-rgb"
+        if mode == "endpoint-rgb":
+            return np.asarray(snap.image_data, dtype=np.float32), "endpoint-rgb:live"
+        if mode == "endpoint-spectral":
+            if snap.sensor_snr_data is not None:
+                return _scalar_clear(snap.sensor_snr_data), "endpoint-spectral"
+            return np.asarray(snap.image_data, dtype=np.float32), "endpoint-spectral:live-rgb"
+        return _missing_mode_image(mode), f"missing:{mode}"
+
+    def _available_modes_for_result(result: ExposureFrameResult) -> tuple[str, ...]:
+        modes: list[str] = []
+        if result.image_data is not None:
+            modes.append("rgb")
+        if result.field_integrated_data is not None:
+            modes.extend(["field-rgb", "field-spectral"])
+        if result.surface_integrated_data is not None:
+            modes.extend(["surface-rgb", "surface-spectral"])
+        if result.sensor_photons_data is not None:
+            modes.append("sensor-color")
+        if result.sensor_snr_data is not None:
+            modes.append("sensor-spectral")
+        if session.rgb_source == "endpoint" and result.image_data is not None:
+            modes.append("endpoint-rgb")
+        if session.rgb_source == "endpoint" and result.sensor_snr_data is not None:
+            modes.append("endpoint-spectral")
+        return tuple(modes)
+
+    def _current_mode(elapsed_s: float) -> str:
+        return mode_cycle[int(elapsed_s / cycle_s) % len(mode_cycle)]
+
+    def _mode_image_for_result(mode: str,
+                               result: ExposureFrameResult,
+                               fallback_accum: Optional[np.ndarray]) -> tuple[np.ndarray, str]:
+        if mode == "rgb":
+            return result.image_data if result.image_data is not None else np.zeros((session.height, session.width, 3), np.float32), "rgb"
+        if mode == "spectral":
+            if fallback_accum is not None:
+                return _spectral_falsecolor(fallback_accum), "spectral-index"
+            return _missing_mode_image("spectral"), "missing:spectral-index"
+        if mode == "field-rgb":
+            if result.field_integrated_data is not None:
+                rgb = _bands_to_rgb(result.field_integrated_data, session.freq_hz)
+                return np.asarray(rgb, dtype=np.float32), "field-rgb-visible"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        if mode == "field-spectral":
+            if result.field_integrated_data is not None:
+                return _spectral_falsecolor(result.field_integrated_data), "field-spectral-index"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        if mode == "surface-rgb":
+            if result.surface_integrated_data is not None:
+                rgb = _bands_to_rgb(result.surface_integrated_data, session.freq_hz)
+                return np.asarray(rgb, dtype=np.float32), "surface-rgb-visible"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        if mode == "surface-spectral":
+            if result.surface_integrated_data is not None:
+                return _spectral_falsecolor(result.surface_integrated_data), "surface-spectral-index"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        if mode == "sensor-color":
+            if result.sensor_photons_data is not None:
+                return _scalar_falsecolor(result.sensor_photons_data), "sensor-color"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        if mode == "sensor-spectral":
+            if result.sensor_snr_data is not None:
+                return _scalar_clear(result.sensor_snr_data), "sensor-spectral"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        if mode == "endpoint-rgb":
+            if session.rgb_source == "endpoint" and result.image_data is not None:
+                return result.image_data, "endpoint-rgb"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        if mode == "endpoint-spectral":
+            if result.sensor_snr_data is not None:
+                return _scalar_clear(result.sensor_snr_data), "endpoint-spectral"
+            return _missing_mode_image(mode), f"missing:{mode}"
+        return _missing_mode_image(mode), f"missing:{mode}"
+
+    # Flip buffers for live preview: reuse both pixel arrays and source surfaces.
+    flip_buffers: dict[str, list[np.ndarray]] = {}
+    flip_surfaces: dict[str, list[Any]] = {}
+    flip_index: dict[str, int] = {}
+    for backend_name in display_order:
+        flip_buffers[backend_name] = [
+            np.empty((session.height, session.width, 3), dtype=np.uint8),
+            np.empty((session.height, session.width, 3), dtype=np.uint8),
+        ]
+        flip_surfaces[backend_name] = [
+            pygame.Surface((session.width, session.height)),
+            pygame.Surface((session.width, session.height)),
+        ]
+        flip_index[backend_name] = 0
 
     def _blit_image(img: np.ndarray, dest_rect: tuple[int, int, int, int],
                     label: str, info: str,
@@ -1978,10 +3216,99 @@ def _run_viewer(session: ExposureSession, n_frames: int,
                 txt = font.render(line, True, (180, 220, 255))
                 win.blit(txt, (box_x + 4, box_y + 4 + idx * line_h))
 
-    last: dict[str, ExposureFrameResult] = {}
+    def _blit_progress_accum(backend_name: str,
+                             accum_bhw: np.ndarray,
+                             dest_rect: tuple[int, int, int, int],
+                             label: str,
+                             info: str,
+                             mode: str) -> None:
+        """Render an incremental preview from spectral accum via persistent flip buffers."""
+        rgb_linear = _bands_to_rgb(accum_bhw, session.freq_hz)
+        img = (_spectral_falsecolor(accum_bhw)
+               if mode == "spectral"
+               else session._tone_map_delicate(rgb_linear, session.integral_split))
+
+        idx = flip_index[backend_name]
+        u8buf = flip_buffers[backend_name][idx]
+        np.clip(img, 0.0, 1.0, out=rgb_linear)
+        np.multiply(rgb_linear, 255.0, out=rgb_linear)
+        u8buf[:] = rgb_linear.astype(np.uint8)
+
+        surf = flip_surfaces[backend_name][idx]
+        pygame.surfarray.blit_array(surf, np.transpose(u8buf, (1, 0, 2)))
+        surf_scaled = pygame.transform.smoothscale(surf, (dest_rect[2], dest_rect[3]))
+        win.blit(surf_scaled, (dest_rect[0], dest_rect[1]))
+
+        win.blit(bigf.render(label, True, (255, 255, 255)),
+                 (dest_rect[0] + 6, dest_rect[1] + 6))
+        for i, line in enumerate(info.split("\n")):
+            win.blit(font.render(line, True, (210, 230, 255)),
+                     (dest_rect[0] + 6,
+                      dest_rect[1] + dest_rect[3] - 18 * (3 - i)))
+        flip_index[backend_name] = 1 - idx
+
+    state_lock = threading.Lock()
+    stop_event = threading.Event()
+    render_done = threading.Event()
+
+    state_snapshots: dict[str, IntegrationSnapshot] = {}
+    state_results: dict[str, ExposureFrameResult] = {}
+    state_meta: dict[str, float | int] = {
+        "frame": 0,
+        "batch": 0,
+        "n_batches": 0,
+        "elapsed_s": 0.0,
+    }
+    worker_error: Optional[str] = None
+
+    def _render_worker() -> None:
+        nonlocal worker_error
+        try:
+            for frame_idx in range(n_frames):
+                if stop_event.is_set():
+                    break
+
+                def _on_batch_preview(_backs: dict[str, ExposureBackend],
+                                      snapshots: dict[str, IntegrationSnapshot],
+                                      batch_idx: int,
+                                      n_batches: int,
+                                      elapsed_s: float) -> None:
+                    if n_batches > 0:
+                        cadence = max(1, n_batches // 24)
+                    else:
+                        cadence = 6
+                    if n_batches > 0 and batch_idx < n_batches and (batch_idx % cadence) != 0:
+                        return
+                    with state_lock:
+                        state_snapshots.clear()
+                        state_snapshots.update(snapshots)
+                        state_meta["frame"] = int(frame_idx + 1)
+                        state_meta["batch"] = int(batch_idx)
+                        state_meta["n_batches"] = int(n_batches)
+                        state_meta["elapsed_s"] = float(elapsed_s)
+
+                results = session.render_one_exposure(
+                    t=float(frame_idx) * 0.5,
+                    batch_preview_cb=_on_batch_preview,
+                )
+                with state_lock:
+                    for r in results:
+                        state_results[r.backend] = r
+                    state_meta["frame"] = int(frame_idx + 1)
+                    state_meta["batch"] = int(state_meta.get("n_batches", 0))
+        except Exception as exc:
+            worker_error = str(exc)
+        finally:
+            render_done.set()
+
+    worker = threading.Thread(target=_render_worker, name="exposure-render-worker", daemon=True)
+    worker.start()
+
     running = True
-    frame = 0
-    while running and frame < n_frames:
+    t_cycle0 = time.perf_counter()
+    done_hold_until: Optional[float] = None
+
+    while running:
         for ev in pygame.event.get():
             if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
                 running = False
@@ -1989,43 +3316,83 @@ def _run_viewer(session: ExposureSession, n_frames: int,
         if not running:
             break
 
+        with state_lock:
+            snapshots = dict(state_snapshots)
+            results = dict(state_results)
+            frame_no = int(state_meta.get("frame", 0))
+            batch_idx = int(state_meta.get("batch", 0))
+            n_batches = int(state_meta.get("n_batches", 0))
+            elapsed_s = float(state_meta.get("elapsed_s", 0.0))
+
+        mode = _current_mode(time.perf_counter() - t_cycle0)
         win.fill((12, 12, 18))
-        win.blit(bigf.render(f"Exposure {frame+1}/{n_frames} — accumulating…",
-                             True, (255, 255, 200)), (16, 8))
-        pygame.display.flip()
 
-        results = session.render_one_exposure(t=float(frame) * 0.5)
-        for r in results:
-            last[r.backend] = r
+        if worker_error:
+            title = f"Render worker error: {worker_error}"
+        elif n_batches > 0:
+            pct = 100.0 * float(batch_idx) / max(1, n_batches)
+            title = f"Exposure {max(1, frame_no)}/{n_frames} - {pct:5.1f}% - mode={mode}"
+        elif frame_no > 0 and not render_done.is_set():
+            title = f"Exposure {frame_no}/{n_frames} - batch {batch_idx} (open-ended) - mode={mode}"
+        elif render_done.is_set():
+            title = f"Render complete - mode={mode}"
+        else:
+            title = f"Exposure 1/{n_frames} - initializing - mode={mode}"
 
-        win.fill((12, 12, 18))
-        win.blit(bigf.render(f"Exposure {frame+1}/{n_frames}",
-                             True, (255, 255, 255)), (16, 8))
+        win.blit(bigf.render(title, True, (255, 255, 200)), (16, 8))
 
-        # Display images from memory (not from disk)
-        for i, (name, _) in enumerate([("cpp", None), ("glsl", None)]):
+        for i, name in enumerate(display_order):
             x = 10 + i * (pane_w + 10)
             y = 40
-            if name not in last or last[name].image_data is None:
-                pygame.draw.rect(win, (40, 40, 50), (x, y, pane_w, pane_h))
-                win.blit(font.render(f"{name.upper()}: not available",
-                                     True, (200, 200, 200)),
-                         (x + 12, y + 12))
+
+            if name in snapshots:
+                snap = snapshots[name]
+                img, shown_mode = _mode_image_for_snapshot(mode, snap, None)
+                batch_text = (f"{batch_idx}/{n_batches}" if n_batches > 0 else f"{batch_idx}/∞")
+                info = (f"frame={frame_no}/{n_frames}  batch={batch_text}\n"
+                        f"elapsed={elapsed_s:.1f}s\n"
+                        f"view={mode} (cycle {cycle_s:.2f}s) · stream")
+                _blit_image(
+                    img,
+                    (x, y, pane_w, pane_h),
+                    label=f"{name.upper()} LIVE [{shown_mode}]",
+                    info=info,
+                    hud_lines=None,
+                )
                 continue
 
-            r = last[name]
-            img = r.image_data
-            info = (f"N_rays={r.n_rays_emitted:_}\n"
-                    f"gain={r.gain_linear:.2e}× ({r.gain_db:+.2f} dB)\n"
-                    f"H_meas/targ={r.measured_H_J:.2e}/{r.target_H_J:.2e} J")
-            detail_lv = r.frame_config_summary.get("detail_level", 0)
-            hud = _make_hud_lines(r, detail_lv) if show_hud else None
-            _blit_image(img, (x, y, pane_w, pane_h),
-                        label=name.upper(), info=info, hud_lines=hud)
+            if name in results:
+                r = results[name]
+                img, shown_mode = _mode_image_for_result(mode, r, None)
+                info = (f"N_rays={r.n_rays_emitted:_}\n"
+                        f"gain={r.gain_linear:.2e}× ({r.gain_db:+.2f} dB)\n"
+                        f"H_meas/targ={r.measured_H_J:.2e}/{r.target_H_J:.2e} J")
+                detail_lv = r.frame_config_summary.get("detail_level", 0)
+                hud = _make_hud_lines(r, detail_lv) if show_hud else None
+                _blit_image(
+                    img,
+                    (x, y, pane_w, pane_h),
+                    label=f"{name.upper()} [{shown_mode}]",
+                    info=info,
+                    hud_lines=hud,
+                )
+                continue
+
+            pygame.draw.rect(win, (40, 40, 50), (x, y, pane_w, pane_h))
+            win.blit(font.render(f"{name.upper()}: waiting for first snapshot", True, (200, 200, 200)),
+                     (x + 12, y + 12))
 
         pygame.display.flip()
-        frame += 1
-        time.sleep(0.1)
+
+        if render_done.is_set() and done_hold_until is None:
+            done_hold_until = time.perf_counter() + max(1.0, cycle_s * max(1, len(mode_cycle)))
+        if done_hold_until is not None and time.perf_counter() >= done_hold_until:
+            running = False
+
+        pygame.time.wait(16)
+
+    stop_event.set()
+    worker.join(timeout=2.0)
 
     pygame.quit()
 
@@ -2051,6 +3418,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--width",          type=int,   default=1280)
     p.add_argument("--height",         type=int,   default=720)
+    p.add_argument("--input-size-scale", type=float, default=1.0,
+                   help="Scale input width/height before rendering (e.g., 0.5, 1.0, 1.5).")
+    p.add_argument("--output-oversample", type=int, default=1,
+                   help="Internal render oversample factor; output is downsampled back to scaled size.")
+    p.add_argument("--oversample-stencil", choices=("box", "polar"), default="box",
+                   help="Downsample stencil for oversampled output conversion.")
     p.add_argument("--total-rays",     type=int,   default=1_000_000,
                    help="Total rays per FINISHED exposure (default 1M; "
                         "raise to 10_000_000+ for production exposures).")
@@ -2066,8 +3439,21 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         "bdpt  = bidirectional path tracing — emits N rays "
                         "per registered EMISSIVE TriGroup, dumps complex "
                         "EndpointRecord array (N,16) per frame to .npy.")
-    p.add_argument("--bdpt-records-cap", type=int, default=1_048_576,
-                   help="Max EndpointRecords per bdpt pass.")
+    p.add_argument("--bdpt-records-cap", type=int, default=0,
+                   help="Max EndpointRecords per bdpt pass. Use 0 to auto-derive from "
+                        "--bdpt-intermediate-max-gb.")
+    p.add_argument("--bdpt-intermediate-mode", choices=("memory", "file"), default="file",
+                   help="How to stage BDPT intermediates before reduction."
+                        " 'file' uses mmap-friendly .npy backing.")
+    p.add_argument("--bdpt-intermediate-max-gb", type=float, default=20.0,
+                   help="Hard cap for BDPT file-backed intermediate size (GB)."
+                        " Larger buffers stay in memory.")
+    p.add_argument("--retain-bdpt-intermediate", action="store_true",
+                   help="Keep file-backed BDPT intermediate .npy files."
+                        " Default behavior is ephemeral cleanup.")
+    p.add_argument("--bdpt-intermediate-dir", default=None,
+                   help="Directory for BDPT file-backed intermediates"
+                        " (default: out-dir).")
     p.add_argument("--calibration-scene", action="store_true",
                    help="Use the tungsten-cavity blackbody calibration "
                         "scene instead of the default orbiters scene. "
@@ -2075,7 +3461,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--scene-mode",     default=None,
                    help="Scene mode passed to scene_mod.scene_for_phase "
                         "(default: orbiters; tungsten-cavity for blackbody "
-                        "calibration). Overrides --calibration-scene.")
+                        "calibration; also supports calib-rgb-diagram / calib-bw-rgb "
+                        "for black-white-primary chain validation). Overrides --calibration-scene.")
     p.add_argument("--backend",        choices=("cpp", "glsl", "both"),
                    default="cpp")
     p.add_argument("--exposure-time-s", type=float, default=DEFAULT_FILM.exposure_time_s)
@@ -2092,6 +3479,45 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--out-dir",        default="exposures")
     p.add_argument("--pane-w",         type=int, default=640)
     p.add_argument("--pane-h",         type=int, default=360)
+    p.add_argument("--preview-cycle-s", type=float, default=1.5,
+                   help="Viewer interval (seconds) for RGB/spectral auto-cycling.")
+    p.add_argument(
+        "--preview-modes",
+        default=("rgb,spectral,field-rgb,field-spectral,"
+                 "surface-rgb,surface-spectral,sensor-color,sensor-spectral,"
+                 "endpoint-rgb,endpoint-spectral"),
+        help=("Comma-separated viewer modes: rgb,spectral,field-rgb,"
+              "field-spectral,surface-rgb,surface-spectral,"
+              "sensor-color,sensor-spectral,endpoint-rgb,endpoint-spectral"),
+    )
+    p.add_argument(
+        "--rgb-source",
+        choices=("sensor", "accum", "endpoint"),
+        default="sensor",
+        help=("Visible RGB source: sensor uses backward-pass sensor integration; "
+              "accum uses camera-integrated spectral accum; endpoint uses C++ endpoint reducer output."),
+    )
+    p.add_argument("--convergence-target-pct", type=float, default=99.99,
+                   help="Convergence target percentage for early-stop detector.")
+    p.add_argument("--convergence-max-rel-drift", type=float, default=1.0e-4,
+                   help="Maximum relative drift for convergence stop criterion.")
+    p.add_argument("--no-convergence", action="store_true",
+                   help="Disable convergence detector and run planned finite batches.")
+    p.add_argument("--no-convergence-drive-batches", action="store_true",
+                   help="Keep finite batch planning even when convergence detector is enabled.")
+    p.add_argument("--convergence-check-every", type=int, default=1,
+                   help="Run convergence detector every N batches.")
+    p.add_argument("--convergence-min-batches", type=int, default=4,
+                   help="Minimum batches before convergence early-stop can trigger.")
+    p.add_argument("--convergence-hold-checks", type=int, default=3,
+                   help="Required consecutive convergence hits before early-stop.")
+    p.add_argument("--convergence-probe-count", type=int, default=8192,
+                   help="Probe sample count used by convergence detector.")
+    p.add_argument("--convergence-max-batches", type=int, default=0,
+                   help="Optional hard cap for convergence-driven open-ended mode (0 = unlimited).")
+    p.add_argument("--adaptive-allocation", choices=("stochastic", "quota", "uniform"),
+                   default="stochastic",
+                   help="Adaptive allocation policy for forward and backward ray dispatch.")
     p.add_argument("--field-integrate-frac", type=float, default=0.35)
     p.add_argument("--field-bookkeep-frac", type=float, default=0.65)
     p.add_argument("--surface-integrate-frac", type=float, default=0.85)
@@ -2123,11 +3549,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         target_mid_grey     = DEFAULT_FILM.target_mid_grey,
     )
 
+    input_scale = max(1.0e-6, float(args.input_size_scale))
+    oversample = max(1, int(args.output_oversample))
+    oversample_stencil = str(args.oversample_stencil)
+    if bool(args.save_files) and int(args.output_oversample) == 1 and str(args.oversample_stencil) == "box":
+        oversample = 16
+        oversample_stencil = "polar"
+        print("  [defaults] --save-files detected: using beefy output oversample 16x with polar stencil")
+    output_w = max(1, int(round(float(args.width) * input_scale)))
+    output_h = max(1, int(round(float(args.height) * input_scale)))
+    render_w = max(1, int(output_w * oversample))
+    render_h = max(1, int(output_h * oversample))
+
     session = ExposureSession(
         optics         = optics,
         film           = film,
-        width          = args.width,
-        height         = args.height,
+        width          = render_w,
+        height         = render_h,
         total_rays     = args.total_rays,
         rays_per_batch = args.rays_per_batch,
         max_bounces    = args.max_bounces,
@@ -2135,6 +3573,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         out_dir        = args.out_dir,
         integrator     = args.integrator,
         bdpt_records_cap = args.bdpt_records_cap,
+        bdpt_intermediate_mode = args.bdpt_intermediate_mode,
+        bdpt_intermediate_max_bytes = int(max(0.0, args.bdpt_intermediate_max_gb) * (1024 ** 3)),
+        retain_bdpt_intermediate = bool(args.retain_bdpt_intermediate),
+        bdpt_intermediate_dir = args.bdpt_intermediate_dir,
         scene_mode     = (args.scene_mode if args.scene_mode is not None
                           else ("tungsten-cavity" if args.calibration_scene
                                 else "orbiters")),
@@ -2145,8 +3587,24 @@ def main(argv: Optional[list[str]] = None) -> int:
             surface_bookkeep_frac  = float(args.surface_bookkeep_frac),
             hdr_white_percentile   = float(args.hdr_white_percentile),
         ),
+        convergence     = ConvergenceConfig(
+            enabled             = not bool(args.no_convergence),
+            drive_batches       = not bool(args.no_convergence_drive_batches),
+            target_pct          = float(args.convergence_target_pct),
+            max_rel_drift       = float(args.convergence_max_rel_drift),
+            check_every_batches = int(args.convergence_check_every),
+            min_batches         = int(args.convergence_min_batches),
+            hold_checks         = int(args.convergence_hold_checks),
+            probe_count         = int(args.convergence_probe_count),
+            max_batches         = int(args.convergence_max_batches),
+        ),
+        adaptive_allocation_mode = str(args.adaptive_allocation),
         n_frames_planned = args.frames,
+        output_width     = output_w,
+        output_height    = output_h,
+        output_oversample_stencil = oversample_stencil,
         show_hud         = not args.no_hud,
+        rgb_source       = args.rgb_source,
         save_files       = args.save_files,
     )
 
@@ -2154,8 +3612,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         for k in range(args.frames):
             session.render_one_exposure(t=float(k) * 0.5)
     else:
+        preview_modes = tuple(
+            token.strip().lower() for token in str(args.preview_modes).split(",") if token.strip()
+        )
         _run_viewer(session, args.frames, args.pane_w, args.pane_h,
-                    show_hud=not args.no_hud)
+                    show_hud=not args.no_hud,
+                    preview_cycle_s=float(args.preview_cycle_s),
+                    preview_modes=preview_modes)
     return 0
 
 

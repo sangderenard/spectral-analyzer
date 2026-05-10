@@ -62,8 +62,10 @@ extern "C" {
  * with
  *   delta(u,v) = c0 + cu*u + cv*v + cuu*u*u + cuv*u*v + cvv*v*v
  */
-#define TRI_PARAM_SURFACE_NONE       0
-#define TRI_PARAM_SURFACE_POLY_BARY  1
+#define TRI_PARAM_SURFACE_NONE        0
+#define TRI_PARAM_SURFACE_POLY_BARY   1
+#define TRI_PARAM_SURFACE_SDF_SADDLE  2
+#define TRI_PARAM_SURFACE_SDF_SPHERE  3
 
 /**
  * Camera sensor descriptor (used when sample_policy == PIXEL_CONE).

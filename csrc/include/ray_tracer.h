@@ -40,6 +40,7 @@
 
 #pragma once
 #include "serial_kernel.h"  /* SK_API, SK_OK, SK_ERR_* */
+#include "bdpt_record.h"
 
 #include <stdint.h>
 
@@ -310,6 +311,31 @@ SK_API int ray_tracer_integrate_image(
 );
 
 /**
+ * Packed variant of ray_tracer_integrate_image with per-source ray quotas.
+ *
+ * src_n_rays is an int32 array of length n_sources. Each source si emits
+ * max(src_n_rays[si], 0) rays for this dispatch.
+ */
+SK_API int ray_tracer_integrate_image_packed(
+    RayTracerState* st,
+    int             n_sources,
+    const double*   src_pos,
+    const double*   src_dir,
+    const double*   src_directivity,
+    const int32_t*  src_n_rays,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    const double*   cam_pos,
+    const double*   cam_fwd,
+    const double*   cam_up,
+    double          fov_rad,
+    int             width,
+    int             height,
+    float*          out_image
+);
+
+/**
  * Trace rays and integrate camera energy in the same traversal.
  *
  * out_image is accumulated in place and is never cleared by this function.
@@ -426,15 +452,144 @@ SK_API int ray_tracer_copy_field_capture_strikes(
 );
 
 /**
+ * Maximum number of sensor/film slots in one batch upload.
+ * Matches Python sensor_film_db.MAX_SENSOR_FILM_SLOTS = 8.
+ */
+#define MAX_SENSOR_FILM_SLOTS 8
+
+/**
+ * Sensor parameters — row layout for the sensor_chunk tensor.
+ *
+ * Binary-compatible with Python SensorRecord (_pack_=4, 48 floats = 192 bytes,
+ * 12 × vec4). Every field group is vec4-aligned for std430 safety.
+ *
+ * Use reinterpret_cast<const SensorRecord*>(sensor_chunk + sensor_id * stride)
+ * in C++ reducers instead of raw float offsets.
+ */
+#pragma pack(push, 4)
+typedef struct SensorRecord {
+    /* vec4  0 — optics */
+    float focal_mm;
+    float f_number;
+    float aperture_diam_mm;
+    float _optics_pad;
+    /* vec4  1 — sensor geometry */
+    float sensor_w_mm;
+    float sensor_h_mm;
+    float pixel_pitch_um;
+    float _geom_pad;
+    /* vec4  2 — photon transport  (offsets 8-11) */
+    float qe_peak;           /* peak quantum efficiency [0,1]       */
+    float full_well_e;       /* full-well capacity (electrons)      */
+    float read_noise_e;      /* read noise RMS (electrons)          */
+    float dark_current_e_s;  /* dark current (e⁻/s)                 */
+    /* vec4  3 — digitisation */
+    float adc_bits;
+    float black_level_adu;
+    float white_level_adu;
+    float _dither_pad;
+    /* vec4  4 — CFA red channel */
+    float cfa_r_peak_nm;
+    float cfa_r_fwhm_nm;
+    float cfa_r_area_frac;
+    float _cfa_r_pad;
+    /* vec4  5 — CFA green channel */
+    float cfa_g_peak_nm;
+    float cfa_g_fwhm_nm;
+    float cfa_g_area_frac;
+    float _cfa_g_pad;
+    /* vec4  6 — CFA blue channel */
+    float cfa_b_peak_nm;
+    float cfa_b_fwhm_nm;
+    float cfa_b_area_frac;
+    float _cfa_b_pad;
+    /* vec4  7 — CFA infrared */
+    float cfa_ir_peak_nm;
+    float cfa_ir_fwhm_nm;
+    float cfa_ir_area_frac;
+    float _cfa_ir_pad;
+    /* vec4  8 — photon transfer curve (cubic polynomial) */
+    float pt_0;
+    float pt_1;
+    float pt_2;
+    float pt_3;
+    /* vec4  9 — chromatic aberration */
+    float ca_red_x;
+    float ca_red_y;
+    float ca_blue_x;
+    float ca_blue_y;
+    /* vec4 10 — lens distortion */
+    float dist_k1;
+    float dist_k2;
+    float dist_k3;
+    float focal_length_ratio;
+    /* vec4 11 — reserved */
+    float _future_0;
+    float _future_1;
+    float _future_2;
+    float _future_3;
+} SensorRecord;
+#pragma pack(pop)
+
+/**
+ * Film parameters — row layout for the film_chunk tensor.
+ *
+ * Binary-compatible with Python FilmRecord (_pack_=4, 64 floats = 256 bytes,
+ * 16 × vec4).
+ */
+#pragma pack(push, 4)
+typedef struct FilmRecord {
+    /* vec4  0 — exposure  (offsets 0-3) */
+    float iso;
+    float exposure_time_s;       /* shutter open time (s)   offset 1 */
+    float quantum_efficiency;
+    float target_grey_point;
+    /* vec4  1-2 — layer 0 tone curve (8 floats) */
+    float layer0_shadow_r;
+    float layer0_shadow_g;
+    float layer0_shadow_b;
+    float layer0_light_r;
+    float layer0_light_g;
+    float layer0_light_b;
+    float layer0_shadow_point;
+    float layer0_highlight_point;
+    /* vec4  3-4 — layer 1 tone curve (8 floats) */
+    float layer1_shadow_r;
+    float layer1_shadow_g;
+    float layer1_shadow_b;
+    float layer1_light_r;
+    float layer1_light_g;
+    float layer1_light_b;
+    float layer1_shadow_point;
+    float layer1_highlight_point;
+    /* vec4  5-13 — layers 2-7 + future (36 floats, matches Python _layer_future_0) */
+    float _layer_future_0[36];
+    /* vec4 14 — layer configuration */
+    float n_layers;
+    float _layer_config_1;
+    float _layer_config_2;
+    float _layer_config_3;
+    /* vec4 15 — spectral */
+    float peak_sensitivity_nm;
+    float spectral_fwhm_nm;
+    float _spectral_2;
+    float _spectral_3;
+} FilmRecord;
+#pragma pack(pop)
+
+/**
  * Upload sensor/film tensor chunks and active slot mapping into tracer-owned memory.
  *
  * This is the C++ ingress point used by Python helpers before bidirectional
  * dispatch. Data is copied into RayTracerState, so caller buffers can be
  * released immediately after the call returns.
  *
- * sensor_chunk : float32 [sensor_rows, sensor_stride]
- * film_chunk   : float32 [film_rows,   film_stride]
+ * sensor_chunk : float32 [sensor_rows, sensor_stride]  — row i is SensorRecord i
+ * film_chunk   : float32 [film_rows,   film_stride]    — row i is FilmRecord i
  * active_slots : int32   [n_slots, 2]  (sensor_id, film_id) pairs
+ *
+ * sensor_stride must equal sizeof(SensorRecord)/sizeof(float) = 48.
+ * film_stride   must equal sizeof(FilmRecord)/sizeof(float)   = 64.
  */
 SK_API int ray_tracer_set_sensor_film_ssbo(
     RayTracerState*   st,
@@ -446,6 +601,107 @@ SK_API int ray_tracer_set_sensor_film_ssbo(
     int               film_stride,
     const int32_t*    active_slots,
     int               n_slots
+);
+
+/**
+ * Per-slot summary emitted by endpoint-record reduction into sensor/film data.
+ *
+ * The reduction uses the tracer-owned sensor/film slot tensors previously
+ * uploaded via ray_tracer_set_sensor_film_ssbo().  Each summary describes one
+ * active slot after the endpoint buffer has been converted into a sensor-plane
+ * photon/electron/SNR map.
+ */
+typedef struct SensorFilmSlotSummary {
+    int32_t slot_id;
+    int32_t sensor_id;
+    int32_t film_id;
+    float   qe_peak;
+    float   read_noise_e;
+    float   dark_current_e_s;
+    float   dark_current_accumulated_e;
+    float   exposure_time_s;
+    float   full_well_e;
+    float   snr_peak;
+    float   snr_mean;
+    float   photons_flux_hz;
+    float   electrons_flux_hz;
+} SensorFilmSlotSummary;
+
+/**
+ * Telemetry for endpoint reduction quality and ordering.
+ *
+ * This addresses two integration obstacles explicitly:
+ * 1) make clamp/filter losses visible (no silent degradation),
+ * 2) expose ordering regressions so consumers can reason about ray-order
+ *    assumptions before integrating into color/sensor products.
+ */
+typedef struct EndpointReductionTelemetry {
+    int32_t input_records;
+    int32_t kept_records;
+    int32_t drop_wrong_group;
+    int32_t drop_invalid_band;
+    int32_t drop_negative_subpath;
+    int32_t drop_out_of_bounds_pixel;
+    int32_t order_regressions;
+    uint32_t first_subpath_id;
+    uint32_t last_subpath_id;
+} EndpointReductionTelemetry;
+
+/**
+ * Reduce bidirectional EndpointRecord rows into a simulated sensor integral.
+ *
+ * The input records are the float32 (N, 16) array returned by ray_tracer_bidirectional().
+ * Records are filtered by sensor_group_id, coherently accumulated into one
+ * complex sensor image, then converted into photons/electrons/SNR maps using
+ * the active sensor/film slots stored in RayTracerState.
+ *
+ * out_photons, out_electrons, and out_snr must each point to a float32
+ * buffer of shape (n_py, n_px).  The function zeroes and fills them.
+ *
+ * If out_slot_summaries is non-NULL, one summary is written per valid active
+ * slot, up to out_slot_summary_cap entries.
+ */
+SK_API int ray_tracer_reduce_endpoint_records_to_sensor_integral(
+    const RayTracerState* st,
+    const EndpointRecord* records,
+    int                   n_records,
+    int                   n_px,
+    int                   n_py,
+    int                   sensor_group_id,
+    double                target_photons_per_pixel,
+    double                gain,
+    float*                out_photons,
+    float*                out_electrons,
+    float*                out_snr,
+    void*                 out_slot_summaries,
+    int                   out_slot_summary_cap,
+    int*                  out_slot_summary_count,
+    int*                  out_endpoint_record_count,
+    EndpointReductionTelemetry* out_telemetry
+);
+
+/**
+ * Canonical C++ endpoint->RGB image path.
+ *
+ * This is the C++-owned color integration route from endpoint records to
+ * linear RGB and tone-mapped preview RGB, so Python no longer has to own the
+ * final spectral->color reduction semantics.
+ *
+ * out_rgb_linear and out_rgb_tonemapped are float32 (n_py, n_px, 3).
+ * hdr_white_percentile follows the same semantic as Python tone mapping.
+ */
+SK_API int ray_tracer_reduce_endpoint_records_to_rgb_image(
+    const RayTracerState* st,
+    const EndpointRecord* records,
+    int                   n_records,
+    int                   n_px,
+    int                   n_py,
+    int                   sensor_group_id,
+    double                gain,
+    double                hdr_white_percentile,
+    float*                out_rgb_linear,
+    float*                out_rgb_tonemapped,
+    EndpointReductionTelemetry* out_telemetry
 );
 
 /**
@@ -886,6 +1142,23 @@ extern "C" {
 SK_API int ray_tracer_bidirectional(
     RayTracerState* st,
     int             n_rays_per_emitter,
+    int             max_bounces,
+    double          min_amplitude,
+    uint32_t        seed,
+    EndpointRecord* out_records,
+    int             out_cap,
+    int*            out_count);
+
+/**
+ * Packed bidirectional entry with per-emitter ray quotas.
+ *
+ * n_rays_per_emitter has one entry per registered EMISSIVE TriGroup, in
+ * registration order. Each emitter uses max(entry, 0) rays.
+ */
+SK_API int ray_tracer_bidirectional_packed(
+    RayTracerState* st,
+    const int32_t*  n_rays_per_emitter,
+    int             n_emitters,
     int             max_bounces,
     double          min_amplitude,
     uint32_t        seed,

@@ -48,6 +48,10 @@
 #include "ray_tracer.h"
 #include "triangle_groups.h"
 #include "field_grid.h"
+#include "thread_pool.h"
+
+#include <mutex>
+#include <thread>
 
 /* Compile-time parity checks: SensorRecord and FilmRecord must be exactly the
  * same size as their Python ctypes counterparts (SensorRecord: 48 floats = 192 B,
@@ -61,14 +65,18 @@ static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
 #include <Eigen/Dense>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <complex>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <random>
+#include <sstream>
+#include <string>
 #include <vector>
 
 using cd   = std::complex<double>;
@@ -79,6 +87,8 @@ static constexpr double TWO_PI     = 2.0 * M_PI;
 static constexpr double EPS        = 1e-9;
 static constexpr int    BVH_LEAF_MAX = 4;   /* triangles per BVH leaf */
 static constexpr bool    RT_ENABLE_PROFILE = true;
+
+static thread_local std::string g_rt_alloc_table;
 
 struct RtProfileScope {
     const char* name = nullptr;
@@ -407,6 +417,29 @@ static inline void write_segment(
 
 /* ── RayTracerState ─────────────────────────────────────────────────────────── */
 
+/* ── Per-scene material spectral cache ───────────────────────────────────────
+ * Precomputed lookup tables derived from mat_buf at scene-creation time and
+ * rebuilt whenever mat_buf changes.  Replaces per-hit mat_refl_complex /
+ * mat_diffusion transcendental calls with direct float reads in bounce loops.
+ *
+ * Layout:
+ *   refl_re / refl_im     — [mat_idx * n_bands + b]
+ *   diffusion             — [mat_idx]  (band-0 value)
+ *   reactive_shift_hz     — [mat_idx]  (Stokes shift in Hz from band-0 slot 9)
+ *   reemit_yield          — [mat_idx]  (band-0 slot 6 value)
+ *   reactive_dst_band     — [mat_idx * n_bands + b]  (−1 = no valid downshift)
+ */
+struct MatSpectralCache {
+    int n_mats  = 0;
+    int n_bands = 0;
+    std::vector<float>  refl_re;           /* [mat * n_bands + b] */
+    std::vector<float>  refl_im;
+    std::vector<float>  diffusion;         /* [mat]               */
+    std::vector<double> reactive_shift_hz; /* [mat]               */
+    std::vector<float>  reemit_yield;      /* [mat]               */
+    std::vector<int>    reactive_dst_band; /* [mat * n_bands + b] */
+};
+
 struct RayTracerState {
     std::vector<Triangle>       tris;
     std::vector<BVHNode>        bvh_nodes;
@@ -423,6 +456,7 @@ struct RayTracerState {
      * shared with material_db.py / mat_flags.py / GLSL shaders. */
     std::vector<float>          mat_buf;
     int                         mat_n_mats = 0;
+    MatSpectralCache            mat_cache; /* precomputed hot-path mat lookups */
     std::vector<RtScaleContext> scale_contexts; /* multi-scale zones, smallest-radius-first */
     double                      speed_m_s = 343.0; /* cached for context k scaling */
     Eigen::VectorXd             freq_hz_vec; /* cached for context k scaling */
@@ -496,7 +530,60 @@ struct RayTracerState {
     int                                sensor_film_film_rows = 0;
     int                                sensor_film_film_stride = 0;
     int                                sensor_film_n_slots = 0;
+
+    int                                profile_pulse_enabled = 0;
+    double                             profile_pulse_period_s = 2.0;
+    std::atomic<uint64_t>              profile_pulse_seq{0};
+    std::atomic<uint64_t>              profile_pulse_next_ns{0};
 };
+
+static inline uint64_t rt_steady_now_ns()
+{
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+}
+
+static inline void rt_maybe_emit_pulse(
+    RayTracerState& st,
+    const char* phase,
+    int src_idx,
+    int ray_idx,
+    int bounce_idx)
+{
+    if (!RT_ENABLE_PROFILE) return;
+    if (!st.profile_pulse_enabled) return;
+
+    const uint64_t now_ns = rt_steady_now_ns();
+    const uint64_t due_ns = st.profile_pulse_next_ns.load(std::memory_order_relaxed);
+    if (due_ns != 0 && now_ns < due_ns) return;
+
+    const double period_s = std::max(0.05, st.profile_pulse_period_s);
+    const uint64_t next_ns = now_ns + static_cast<uint64_t>(period_s * 1.0e9);
+    st.profile_pulse_next_ns.store(next_ns, std::memory_order_relaxed);
+
+    const uint64_t seq = st.profile_pulse_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+    std::fprintf(
+        stderr,
+        "[rt-pulse] seq=%llu phase=%s src=%d ray=%d bounce=%d tris=%llu bands=%d strike_rows=%llu full_march_steps=%llu ctx_entries=%llu\n",
+        static_cast<unsigned long long>(seq),
+        phase ? phase : "trace",
+        src_idx,
+        ray_idx,
+        bounce_idx,
+        static_cast<unsigned long long>(st.tris.size()),
+        st.n_bands,
+        static_cast<unsigned long long>(st.camera_strike_stride_floats > 0
+            ? (st.camera_strike_rows.size() / static_cast<size_t>(st.camera_strike_stride_floats))
+            : 0),
+        static_cast<unsigned long long>(st.camera_full_march_steps),
+        static_cast<unsigned long long>(st.camera_full_march_context_entries));
+
+    const char* table = ray_tracer_allocation_table(&st);
+    if (table && table[0] != '\0') {
+        std::fprintf(stderr, "%s\n", table);
+    }
+    std::fflush(stderr);
+}
 
 /* ── MatBuf accessors ─────────────────────────────────────────────────────────
  * Phase 2 unification: per-band physics is read from the flat MatBuf shared
@@ -595,6 +682,81 @@ static inline void apply_reactive_shift(
         }
         if (best < 0) continue;
         shifted[best] += amp[b] * y;
+    }
+    for (int b = 0; b < nb; ++b)
+        amp[b] = amp[b] * (1.0 - y) + shifted[b];
+}
+
+/* ── MatSpectralCache population and fast accessors ─────────────────────── */
+
+/* Populate / refresh the MatSpectralCache from the current mat_buf.
+ * Must be called after ray_tracer_create() and after any mat_buf update. */
+static void rt_build_mat_cache(RayTracerState& st)
+{
+    MatSpectralCache& c = st.mat_cache;
+    const int nm = st.mat_n_mats;
+    const int nb = st.n_bands;
+    c.n_mats  = nm;
+    c.n_bands = nb;
+    c.refl_re.resize(static_cast<size_t>(nm * nb));
+    c.refl_im.resize(static_cast<size_t>(nm * nb));
+    c.diffusion.assign(static_cast<size_t>(nm), 0.f);
+    c.reactive_shift_hz.assign(static_cast<size_t>(nm), 0.0);
+    c.reemit_yield.assign(static_cast<size_t>(nm), 0.f);
+    c.reactive_dst_band.assign(static_cast<size_t>(nm * nb), -1);
+
+    for (int m = 0; m < nm; ++m) {
+        for (int b = 0; b < nb; ++b) {
+            cd r = mat_refl_complex(st, m, b);
+            c.refl_re[m * nb + b] = static_cast<float>(r.real());
+            c.refl_im[m * nb + b] = static_cast<float>(r.imag());
+        }
+        c.diffusion[m]         = static_cast<float>(mat_diffusion(st, m, 0));
+        c.reactive_shift_hz[m] = mat_reactive_shift_hz(st, m);
+        c.reemit_yield[m]      = mat_band_record(st, m, 0)[6];
+        const double shift_hz  = c.reactive_shift_hz[m];
+        if (shift_hz > 0.0 && nb > 1) {
+            for (int b = 0; b < nb; ++b) {
+                double f_target = st.freq_hz_vec[b] - shift_hz;
+                if (f_target <= 0.0) { c.reactive_dst_band[m * nb + b] = -1; continue; }
+                int    best  = 0;
+                double bd    = std::abs(st.freq_hz_vec[0] - f_target);
+                for (int j = 1; j < nb; ++j) {
+                    double d = std::abs(st.freq_hz_vec[j] - f_target);
+                    if (d < bd) { bd = d; best = j; }
+                }
+                c.reactive_dst_band[m * nb + b] = best;
+            }
+        }
+    }
+}
+
+/* Hot-path accessor — avoids mat_band_record bounds check + Fresnel math. */
+static inline cd mat_cache_refl(const MatSpectralCache& c, int m, int b)
+{
+    return cd(c.refl_re[m * c.n_bands + b], c.refl_im[m * c.n_bands + b]);
+}
+
+static inline float mat_cache_diffusion(const MatSpectralCache& c, int m)
+{
+    return c.diffusion[m];
+}
+
+/* O(n_bands) reactive shift using precomputed destination band indices. */
+static inline void apply_reactive_shift_cached(VXcd& amp, const MatSpectralCache& c, int m)
+{
+    const int nb = c.n_bands;
+    if (nb <= 0) return;
+    const double shift_hz = c.reactive_shift_hz[m];
+    if (shift_hz <= 0.0) return;
+    const float  yf = c.reemit_yield[m];
+    if (yf <= 0.f) return;
+    const double y    = std::min(1.0, static_cast<double>(yf));
+    const int    base = m * nb;
+    VXcd shifted = VXcd::Zero(nb);
+    for (int b = 0; b < nb; ++b) {
+        const int dst = c.reactive_dst_band[base + b];
+        if (dst >= 0) shifted[dst] += amp[b] * y;
     }
     for (int b = 0; b < nb; ++b)
         amp[b] = amp[b] * (1.0 - y) + shifted[b];
@@ -885,9 +1047,16 @@ static bool camera_visible_to_point(
                     static_cast<float>(hit_pos.y()),
                     static_cast<float>(hit_pos.z())
                 };
-                for (int b = 0; b < st.n_bands; ++b) {
-                    (void)field_grid_inject_amplitude(st.camera_field_grid, b, p, 1.0f, 0.0f);
-                }
+                static thread_local std::vector<float> amp_re;
+                static thread_local std::vector<float> amp_im;
+                amp_re.assign(static_cast<size_t>(st.n_bands), 1.0f);
+                amp_im.assign(static_cast<size_t>(st.n_bands), 0.0f);
+                (void)field_grid_inject_amplitude_all_bands(
+                    st.camera_field_grid,
+                    p,
+                    amp_re.data(),
+                    amp_im.data(),
+                    st.n_bands);
             }
 
             VXcd track_amp(1);
@@ -915,6 +1084,18 @@ static bool camera_visible_to_point(
     }
 
     return true;
+}
+
+/* Returns true when a strike row CAN be appended (strikes enabled + not full).
+ * Use as a pre-check before computing visibility solely for strike telemetry. */
+static inline bool camera_strikes_will_accept(const RayTracerState& st)
+{
+    if (!st.camera_capture_strikes) return false;
+    const int stride = (st.camera_strike_stride_floats > 0)
+                     ? st.camera_strike_stride_floats
+                     : (16 + 2 * st.n_bands);
+    const int rows_now = static_cast<int>(st.camera_strike_rows.size() / stride);
+    return st.camera_capture_max_strikes <= 0 || rows_now < st.camera_capture_max_strikes;
 }
 
 static inline void append_camera_strike(
@@ -978,12 +1159,20 @@ static inline void accumulate_field_capture(
         static_cast<float>(pos.y()),
         static_cast<float>(pos.z())
     };
+    static thread_local std::vector<float> amp_re;
+    static thread_local std::vector<float> amp_im;
+    amp_re.resize(static_cast<size_t>(st.n_bands));
+    amp_im.resize(static_cast<size_t>(st.n_bands));
     for (int b = 0; b < st.n_bands; ++b) {
-        (void)field_grid_inject_amplitude(
-            st.camera_field_grid, b, p,
-            static_cast<float>(amp_prop[b].real()),
-            static_cast<float>(amp_prop[b].imag()));
+        amp_re[static_cast<size_t>(b)] = static_cast<float>(amp_prop[b].real());
+        amp_im[static_cast<size_t>(b)] = static_cast<float>(amp_prop[b].imag());
     }
+    (void)field_grid_inject_amplitude_all_bands(
+        st.camera_field_grid,
+        p,
+        amp_re.data(),
+        amp_im.data(),
+        st.n_bands);
 }
 
 /* ── Generic inner ray loop ─────────────────────────────────────────────────── */
@@ -1004,7 +1193,7 @@ static inline void accumulate_field_capture(
  */
 template<typename PerBandFn>
 static void trace_rays(
-    const RayTracerState& st,
+    RayTracerState& st,
     int n_sources, const double* src_pos,
     const double* src_dir, const double* src_directivity,
     int n_rays, int max_bounces, double min_amplitude,
@@ -1027,6 +1216,7 @@ static void trace_rays(
         double dirpow = src_directivity[si];
 
         for (int ri = 0; ri < n_rays && !abort; ++ri) {
+            rt_maybe_emit_pulse(st, "trace_rays", si, ri, -1);
             V3d dir = fibonacci_sphere_dir(ri, n_rays, src_d);
 
             double cos_a      = dir.dot(src_d);
@@ -1041,6 +1231,7 @@ static void trace_rays(
             V3d    cur_dir  = dir;
 
             for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                rt_maybe_emit_pulse(st, "trace_rays", si, ri, bounce);
                 double t_min   = 1e18;
                 int    hit_tri = -1;
 
@@ -1081,7 +1272,7 @@ static void trace_rays(
                         goto next_ray;
                     }
 
-                    amp[b]     = new_amp * mat_refl_complex(st, tri.mat_idx, b);
+                    amp[b]     = new_amp * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                     double a   = std::abs(amp[b]);
                     if (a > max_abs) max_abs = a;
                 }
@@ -1096,7 +1287,7 @@ static void trace_rays(
                 if (cur_dir.dot(hit_n) > 0.0)
                     hit_n = -hit_n;
 
-                if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
+                if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
                     cur_dir = cosine_hemisphere(hit_n, rng);
                 } else {
                     cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
@@ -1131,7 +1322,7 @@ static void trace_rays(
  */
 template<typename HitFn>
 static void trace_rays_v2(
-    const RayTracerState& st,
+    RayTracerState& st,
     int n_sources, const double* src_pos,
     const double* src_dir, const double* src_directivity,
     int n_rays, int max_bounces, double min_amplitude,
@@ -1163,6 +1354,7 @@ static void trace_rays_v2(
         }
 
         for (int ri = 0; ri < rays_for_source && !abort; ++ri) {
+            rt_maybe_emit_pulse(st, "trace_rays_v2", si, ri, -1);
             V3d dir = fibonacci_sphere_dir(ri, rays_for_source, src_d);
 
             double cos_a      = dir.dot(src_d);
@@ -1177,6 +1369,7 @@ static void trace_rays_v2(
             V3d    cur_dir  = dir;
 
             for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                rt_maybe_emit_pulse(st, "trace_rays_v2", si, ri, bounce);
                 double t_min   = 1e18;
                 int    hit_tri = -1;
 
@@ -1229,12 +1422,12 @@ static void trace_rays_v2(
 
                 /* Apply reflection. */
                 for (int b = 0; b < n_bands; ++b)
-                    amp[b] = amp_prop[b] * mat_refl_complex(st, tri.mat_idx, b);
+                    amp[b] = amp_prop[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
 
                 if (max_abs < min_amplitude) break;
 
                 /* Scatter / reflect direction. */
-                if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
+                if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
                     cur_dir = cosine_hemisphere(hit_n, rng);
                 } else {
                     cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
@@ -1328,6 +1521,7 @@ RayTracerState* ray_tracer_create(
         bvh_build(st->bvh_nodes, st->bvh_tri_ids, tri_aabbs, 0, n_tri);
     }
 
+    rt_build_mat_cache(*st);
     return st;
 }
 
@@ -1338,6 +1532,213 @@ void ray_tracer_destroy(RayTracerState* st)
         field_grid_destroy(st->camera_field_grid);
     st->camera_field_grid = nullptr;
     delete st;
+}
+
+template <typename T>
+static inline void rt_append_vector_row(
+    std::ostringstream& oss,
+    const char* name,
+    const char* purpose,
+    const std::vector<T>& v,
+    size_t& total_used,
+    size_t& total_reserved)
+{
+    const size_t elem = sizeof(T);
+    const size_t used = v.size() * elem;
+    const size_t reserved = v.capacity() * elem;
+    total_used += used;
+    total_reserved += reserved;
+    oss << "| " << std::left << std::setw(34) << name
+        << " | " << std::left << std::setw(38) << purpose
+        << " | 0x" << std::hex << std::setw(12) << std::setfill('0')
+        << static_cast<uint64_t>(reinterpret_cast<uintptr_t>(v.data()))
+        << std::dec << std::setfill(' ')
+        << " | " << std::right << std::setw(12) << used
+        << " | " << std::right << std::setw(12) << reserved
+        << " |\n";
+}
+
+template <typename T>
+static inline void rt_append_nested_vector_row(
+    std::ostringstream& oss,
+    const char* name,
+    const char* purpose,
+    const std::vector<std::vector<T>>& vv,
+    size_t& total_used,
+    size_t& total_reserved)
+{
+    size_t used = vv.size() * sizeof(std::vector<T>);
+    size_t reserved = vv.capacity() * sizeof(std::vector<T>);
+    for (const auto& row : vv) {
+        used += row.size() * sizeof(T);
+        reserved += row.capacity() * sizeof(T);
+    }
+    total_used += used;
+    total_reserved += reserved;
+    oss << "| " << std::left << std::setw(34) << name
+        << " | " << std::left << std::setw(38) << purpose
+        << " | 0x" << std::hex << std::setw(12) << std::setfill('0')
+        << static_cast<uint64_t>(reinterpret_cast<uintptr_t>(vv.data()))
+        << std::dec << std::setfill(' ')
+        << " | " << std::right << std::setw(12) << used
+        << " | " << std::right << std::setw(12) << reserved
+        << " |\n";
+}
+
+const char* ray_tracer_allocation_table(const RayTracerState* st)
+{
+    std::ostringstream oss;
+    oss << "ray_tracer_allocation_table\n";
+    oss << "| buffer_name                        | purpose                                | address        |   used_bytes | reserved_bytes |\n";
+    oss << "|------------------------------------|----------------------------------------|----------------|--------------|----------------|\n";
+
+    if (!st) {
+        oss << "| " << std::left << std::setw(34) << "(null state)"
+            << " | " << std::left << std::setw(38) << "no tracer allocated"
+            << " | 0x000000000000"
+            << " | " << std::right << std::setw(12) << 0
+            << " | " << std::right << std::setw(12) << 0
+            << " |\n";
+        g_rt_alloc_table = oss.str();
+        return g_rt_alloc_table.c_str();
+    }
+
+    size_t total_used = 0;
+    size_t total_reserved = 0;
+
+    {
+        const size_t used = sizeof(*st);
+        const size_t reserved = sizeof(*st);
+        total_used += used;
+        total_reserved += reserved;
+        oss << "| " << std::left << std::setw(34) << "RayTracerState"
+            << " | " << std::left << std::setw(38) << "state object"
+            << " | 0x" << std::hex << std::setw(12) << std::setfill('0')
+            << static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st))
+            << std::dec << std::setfill(' ')
+            << " | " << std::right << std::setw(12) << used
+            << " | " << std::right << std::setw(12) << reserved
+            << " |\n";
+    }
+
+    rt_append_vector_row(oss, "tris", "scene triangle payload", st->tris, total_used, total_reserved);
+    rt_append_vector_row(oss, "bvh_nodes", "BVH nodes", st->bvh_nodes, total_used, total_reserved);
+    rt_append_vector_row(oss, "bvh_tri_ids", "BVH triangle index list", st->bvh_tri_ids, total_used, total_reserved);
+    rt_append_vector_row(oss, "tri_areas", "triangle area cache", st->tri_areas, total_used, total_reserved);
+    rt_append_vector_row(oss, "mat_buf", "flat material spectral buffer", st->mat_buf, total_used, total_reserved);
+    rt_append_vector_row(oss, "scale_contexts", "registered scale contexts", st->scale_contexts, total_used, total_reserved);
+
+    {
+        const size_t used = static_cast<size_t>(st->k_real.size()) * sizeof(double);
+        const size_t reserved = used;
+        total_used += used;
+        total_reserved += reserved;
+        oss << "| " << std::left << std::setw(34) << "k_real"
+            << " | " << std::left << std::setw(38) << "wavenumber per band"
+            << " | 0x" << std::hex << std::setw(12) << std::setfill('0')
+            << static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st->k_real.data()))
+            << std::dec << std::setfill(' ')
+            << " | " << std::right << std::setw(12) << used
+            << " | " << std::right << std::setw(12) << reserved
+            << " |\n";
+    }
+    {
+        const size_t used = static_cast<size_t>(st->atmo_abs.size()) * sizeof(double);
+        const size_t reserved = used;
+        total_used += used;
+        total_reserved += reserved;
+        oss << "| " << std::left << std::setw(34) << "atmo_abs"
+            << " | " << std::left << std::setw(38) << "absorption per band"
+            << " | 0x" << std::hex << std::setw(12) << std::setfill('0')
+            << static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st->atmo_abs.data()))
+            << std::dec << std::setfill(' ')
+            << " | " << std::right << std::setw(12) << used
+            << " | " << std::right << std::setw(12) << reserved
+            << " |\n";
+    }
+    {
+        const size_t used = static_cast<size_t>(st->freq_hz_vec.size()) * sizeof(double);
+        const size_t reserved = used;
+        total_used += used;
+        total_reserved += reserved;
+        oss << "| " << std::left << std::setw(34) << "freq_hz_vec"
+            << " | " << std::left << std::setw(38) << "frequency grid"
+            << " | 0x" << std::hex << std::setw(12) << std::setfill('0')
+            << static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st->freq_hz_vec.data()))
+            << std::dec << std::setfill(' ')
+            << " | " << std::right << std::setw(12) << used
+            << " | " << std::right << std::setw(12) << reserved
+            << " |\n";
+    }
+
+    rt_append_vector_row(oss, "ray_pool", "persistent live rays", st->ray_pool, total_used, total_reserved);
+    rt_append_vector_row(oss, "ray_amp_pool", "per-ray spectral amplitude", st->ray_amp_pool, total_used, total_reserved);
+    rt_append_vector_row(oss, "geo_queue", "geometric-stage ray queue", st->geo_queue, total_used, total_reserved);
+    rt_append_nested_vector_row(oss, "ctx_queues", "per-context ray queues", st->ctx_queues, total_used, total_reserved);
+
+    rt_append_vector_row(oss, "tri_groups", "triangle-group descriptors", st->tri_groups, total_used, total_reserved);
+    rt_append_nested_vector_row(oss, "tri_group_indices", "tri ids per group", st->tri_group_indices, total_used, total_reserved);
+    rt_append_nested_vector_row(oss, "tri_group_cum_areas", "area CDF per group", st->tri_group_cum_areas, total_used, total_reserved);
+    rt_append_vector_row(oss, "tri_group_default_mat", "default material per group", st->tri_group_default_mat, total_used, total_reserved);
+    rt_append_nested_vector_row(oss, "tri_group_power_per_band", "spectral power override per group", st->tri_group_power_per_band, total_used, total_reserved);
+    rt_append_vector_row(oss, "tri_group_has_camera", "sensor-camera flags", st->tri_group_has_camera, total_used, total_reserved);
+    rt_append_vector_row(oss, "tri_group_camera", "sensor-camera payload", st->tri_group_camera, total_used, total_reserved);
+    rt_append_vector_row(oss, "tri_group_parametric_kind", "parametric surface kind per group", st->tri_group_parametric_kind, total_used, total_reserved);
+    rt_append_nested_vector_row(oss, "tri_group_parametric_payload", "parametric payload bytes", st->tri_group_parametric_payload, total_used, total_reserved);
+    rt_append_vector_row(oss, "tri_param_group_of_tri", "tri->parametric group map", st->tri_param_group_of_tri, total_used, total_reserved);
+
+    {
+        size_t used = 0;
+        if (st->camera_field_grid) {
+            const int64_t n_cells = field_grid_n_cells_total(st->camera_field_grid);
+            if (n_cells > 0 && st->n_bands > 0) {
+                used = static_cast<size_t>(n_cells) * static_cast<size_t>(st->n_bands) * sizeof(float) * 2;
+            }
+        }
+        const size_t reserved = used;
+        total_used += used;
+        total_reserved += reserved;
+        oss << "| " << std::left << std::setw(34) << "camera_field_grid.primary"
+            << " | " << std::left << std::setw(38) << "field capture complex grid"
+            << " | 0x" << std::hex << std::setw(12) << std::setfill('0')
+            << static_cast<uint64_t>(reinterpret_cast<uintptr_t>(st->camera_field_grid ? field_grid_data_re_im(st->camera_field_grid) : nullptr))
+            << std::dec << std::setfill(' ')
+            << " | " << std::right << std::setw(12) << used
+            << " | " << std::right << std::setw(12) << reserved
+            << " |\n";
+    }
+
+    rt_append_vector_row(oss, "camera_strike_rows", "captured strike rows", st->camera_strike_rows, total_used, total_reserved);
+
+    rt_append_vector_row(oss, "sensor_film_sensor_chunk", "uploaded sensor tensor", st->sensor_film_sensor_chunk, total_used, total_reserved);
+    rt_append_vector_row(oss, "sensor_film_film_chunk", "uploaded film tensor", st->sensor_film_film_chunk, total_used, total_reserved);
+    rt_append_vector_row(oss, "sensor_film_active_slots", "active slot pairs", st->sensor_film_active_slots, total_used, total_reserved);
+
+    oss << "|------------------------------------|----------------------------------------|----------------|--------------|----------------|\n";
+    oss << "| " << std::left << std::setw(34) << "TOTAL"
+        << " | " << std::left << std::setw(38) << "RayTracer-owned allocations"
+        << " | " << std::left << std::setw(14) << "-"
+        << " | " << std::right << std::setw(12) << total_used
+        << " | " << std::right << std::setw(12) << total_reserved
+        << " |\n";
+
+    g_rt_alloc_table = oss.str();
+    return g_rt_alloc_table.c_str();
+}
+
+int ray_tracer_set_profile_pulse(
+    RayTracerState* st,
+    int             enabled,
+    double          period_s)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    st->profile_pulse_enabled = enabled ? 1 : 0;
+    st->profile_pulse_period_s = std::max(0.05, period_s > 0.0 ? period_s : 2.0);
+    st->profile_pulse_next_ns.store(0, std::memory_order_relaxed);
+    if (st->profile_pulse_enabled) {
+        rt_maybe_emit_pulse(*st, "profile_enable", -1, -1, -1);
+    }
+    return SK_OK;
 }
 
 int ray_tracer_trace(
@@ -1632,6 +2033,303 @@ int ray_tracer_integrate_ir(
     return SK_OK;
 }
 
+static inline uint64_t rt_splitmix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static inline void append_camera_strike_local(
+    const RayTracerState& st,
+    std::vector<float>& rows,
+    int src_id,
+    int bounce,
+    int tri_id,
+    const V3d& pos,
+    const V3d& normal,
+    const V3d& incoming_dir,
+    double depth,
+    double total_path,
+    int visible,
+    int context_entries,
+    const VXcd& amp_prop)
+{
+    if (!st.camera_capture_strikes) return;
+    const int stride = (st.camera_strike_stride_floats > 0)
+                     ? st.camera_strike_stride_floats
+                     : (16 + 2 * st.n_bands);
+    const size_t base = rows.size();
+    rows.resize(base + static_cast<size_t>(stride), 0.0f);
+    float* row = rows.data() + base;
+
+    row[0] = static_cast<float>(pos.x());
+    row[1] = static_cast<float>(pos.y());
+    row[2] = static_cast<float>(pos.z());
+    row[3] = static_cast<float>(normal.x());
+    row[4] = static_cast<float>(normal.y());
+    row[5] = static_cast<float>(normal.z());
+    row[6] = static_cast<float>(incoming_dir.x());
+    row[7] = static_cast<float>(incoming_dir.y());
+    row[8] = static_cast<float>(incoming_dir.z());
+    row[9] = static_cast<float>(tri_id);
+    row[10] = static_cast<float>(src_id);
+    row[11] = static_cast<float>(bounce);
+    row[12] = static_cast<float>(depth);
+    row[13] = static_cast<float>(total_path);
+    row[14] = static_cast<float>(visible);
+    row[15] = static_cast<float>(context_entries);
+    for (int b = 0; b < st.n_bands; ++b) {
+        row[16 + 2 * b] = static_cast<float>(amp_prop[b].real());
+        row[16 + 2 * b + 1] = static_cast<float>(amp_prop[b].imag());
+    }
+}
+
+struct RtImageWorkerLocal {
+    std::vector<float> image;
+    std::vector<float> strikes;
+};
+
+static int ray_tracer_integrate_image_parallel_impl(
+    RayTracerState* st,
+    int n_sources,
+    const double* src_pos,
+    const double* src_dir,
+    const double* src_directivity,
+    const int32_t* src_n_rays,
+    int n_rays,
+    int max_bounces,
+    double min_amplitude,
+    uint32_t seed,
+    const double* cam_pos,
+    const double* cam_fwd,
+    const double* cam_up,
+    double fov_rad,
+    int width,
+    int height,
+    float* out_image)
+{
+    if (!st || !out_image) return SK_ERR_NULL_STATE;
+    if (src_n_rays == nullptr && n_rays <= 0) return SK_OK;
+
+    V3d cam_p(cam_pos[0], cam_pos[1], cam_pos[2]);
+    V3d cam_f = V3d(cam_fwd[0], cam_fwd[1], cam_fwd[2]).normalized();
+    V3d cam_u_hint(cam_up[0], cam_up[1], cam_up[2]);
+    V3d cam_r = cam_f.cross(cam_u_hint);
+    if (cam_r.norm() < EPS)
+        cam_r = cam_f.cross(V3d(1, 0, 0));
+    cam_r.normalize();
+    V3d cam_u = cam_r.cross(cam_f);
+
+    const double tan_half_v = std::tan(fov_rad * 0.5);
+    const double aspect = static_cast<double>(width) / std::max(1, height);
+    const double tan_half_h = tan_half_v * aspect;
+    const int n_bands = st->n_bands;
+    const bool has_bvh = !st->bvh_nodes.empty();
+
+    std::vector<int> ray_base(static_cast<size_t>(n_sources + 1), 0);
+    for (int si = 0; si < n_sources; ++si) {
+        const int nrs = src_n_rays ? std::max(0, static_cast<int>(src_n_rays[si]))
+                                   : std::max(0, n_rays);
+        ray_base[static_cast<size_t>(si + 1)] = ray_base[static_cast<size_t>(si)] + nrs;
+    }
+    const int total_jobs = ray_base[static_cast<size_t>(n_sources)];
+    if (total_jobs <= 0) return SK_OK;
+
+    const int hw = std::max(1u, std::thread::hardware_concurrency());
+    const int n_workers = std::max(1, std::min(hw, total_jobs));
+    std::vector<RtImageWorkerLocal> locals(static_cast<size_t>(n_workers));
+    const size_t image_size = static_cast<size_t>(n_bands) * static_cast<size_t>(width) * static_cast<size_t>(height);
+    for (int wi = 0; wi < n_workers; ++wi)
+        locals[static_cast<size_t>(wi)].image.assign(image_size, 0.0f);
+
+    std::mutex st_mutex;
+    ThreadPool pool(static_cast<size_t>(n_workers));
+    std::vector<std::future<void>> futures;
+    futures.reserve(static_cast<size_t>(n_workers));
+
+    const int chunk = (total_jobs + n_workers - 1) / n_workers;
+    for (int wi = 0; wi < n_workers; ++wi) {
+        const int lo = wi * chunk;
+        const int hi = std::min(total_jobs, lo + chunk);
+        if (lo >= hi) continue;
+
+        futures.push_back(pool.enqueue([&, wi, lo, hi]() {
+            RtImageWorkerLocal& L = locals[static_cast<size_t>(wi)];
+            VXcd amp(n_bands);
+            VXcd amp_prop(n_bands);
+
+            for (int job = lo; job < hi; ++job) {
+                const int si = static_cast<int>(std::upper_bound(ray_base.begin(), ray_base.end(), job) - ray_base.begin()) - 1;
+                const int ri = job - ray_base[static_cast<size_t>(si)];
+                const int rays_for_source = ray_base[static_cast<size_t>(si + 1)] - ray_base[static_cast<size_t>(si)];
+                if (rays_for_source <= 0) continue;
+
+                const double* sp = src_pos + si * 3;
+                const double* sd = src_dir + si * 3;
+                V3d src_p(sp[0], sp[1], sp[2]);
+                V3d src_d = V3d(sd[0], sd[1], sd[2]).normalized();
+                double dirpow = src_directivity[si];
+
+                V3d dir = fibonacci_sphere_dir(ri, rays_for_source, src_d);
+                double cos_a = dir.dot(src_d);
+                double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
+                if (dir_weight < 0.01) continue;
+
+                const uint64_t ray_seed = rt_splitmix64((uint64_t)seed
+                    ^ (static_cast<uint64_t>(si) << 32)
+                    ^ static_cast<uint64_t>(ri));
+                std::mt19937_64 rng(ray_seed);
+                std::uniform_real_distribution<double> U(0.0, 1.0);
+
+                for (int b = 0; b < n_bands; ++b)
+                    amp[b] = cd(dir_weight, 0.0);
+
+                V3d pos = src_p;
+                V3d cur_dir = dir;
+                double path_len = 0.0;
+
+                for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                    double t_min = 1e18;
+                    int hit_tri = -1;
+
+                    if (has_bvh) {
+                        V3d inv_dir = cur_dir.cwiseInverse();
+                        bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
+                                  pos, cur_dir, inv_dir, t_min, hit_tri);
+                    } else {
+                        for (size_t ti = 0; ti < st->tris.size(); ++ti) {
+                            double t;
+                            if (ray_triangle_hit(pos, cur_dir, st->tris[ti], t) && t < t_min) {
+                                t_min = t;
+                                hit_tri = static_cast<int>(ti);
+                            }
+                        }
+                    }
+                    if (hit_tri < 0) break;
+
+                    V3d hit_pos = pos + t_min * cur_dir;
+                    V3d hit_n = st->tris[static_cast<size_t>(hit_tri)].normal;
+                    apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n);
+                    if (cur_dir.dot(hit_n) > 0.0)
+                        hit_n = -hit_n;
+
+                    const double total_path = path_len + t_min;
+                    const double spread = 1.0 / (1.0 + path_len + t_min * 0.5);
+                    const Triangle& tri = st->tris[static_cast<size_t>(hit_tri)];
+
+                    double max_abs = 0.0;
+                    for (int b = 0; b < n_bands; ++b) {
+                        double kt = st->k_real[b] * t_min;
+                        double decay = std::exp(-st->atmo_abs[b] * t_min) * spread;
+                        cd prop(decay * std::cos(kt), decay * std::sin(kt));
+                        amp_prop[b] = amp[b] * prop;
+                        max_abs = std::max(max_abs, std::abs(amp_prop[b]));
+                    }
+
+                    V3d v = hit_pos - cam_p;
+                    double depth = v.dot(cam_f);
+                    const bool in_front = (depth > EPS);
+                    const bool pass_depth_cull = !st->camera_depth_cull_enabled
+                                              || depth <= st->camera_depth_cull_m;
+                    int px = -1;
+                    int py = -1;
+                    bool in_frame = false;
+                    if (in_front && pass_depth_cull) {
+                        double x_img = v.dot(cam_r);
+                        double y_img = v.dot(cam_u);
+                        double ndc_x = x_img / (depth * tan_half_h);
+                        double ndc_y = -y_img / (depth * tan_half_v);
+                        px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
+                        py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
+                        in_frame = (px >= 0 && px < width && py >= 0 && py < height);
+                    }
+
+                    const bool need_image_vis = in_frame;
+                    const bool need_strike_vis = st->camera_capture_strikes;
+                    int visible = 0;
+                    int context_entries = 0;
+                    if (in_front && (need_image_vis || need_strike_vis)) {
+                        std::lock_guard<std::mutex> lk(st_mutex);
+                        const uint64_t c0 = st->camera_full_march_context_entries;
+                        visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
+                        context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
+                    }
+
+                    if (st->camera_field_grid) {
+                        std::lock_guard<std::mutex> lk(st_mutex);
+                        accumulate_field_capture(*st, hit_pos, amp_prop);
+                    }
+
+                    if (st->camera_capture_strikes) {
+                        append_camera_strike_local(*st, L.strikes,
+                                                   si, bounce, hit_tri,
+                                                   hit_pos, hit_n, cur_dir,
+                                                   depth, total_path,
+                                                   visible, context_entries,
+                                                   amp_prop);
+                    }
+
+                    if (need_image_vis && visible) {
+                        for (int b = 0; b < n_bands; ++b) {
+                            size_t idx = static_cast<size_t>(b) * (height * width)
+                                       + static_cast<size_t>(py) * width
+                                       + static_cast<size_t>(px);
+                            L.image[idx] += static_cast<float>(std::abs(amp_prop[b]));
+                        }
+                    }
+
+                    for (int b = 0; b < n_bands; ++b)
+                        amp[b] = amp_prop[b] * mat_cache_refl(st->mat_cache, tri.mat_idx, b);
+                    if (max_abs < min_amplitude) break;
+
+                    if (U(rng) < mat_cache_diffusion(st->mat_cache, tri.mat_idx)) {
+                        cur_dir = cosine_hemisphere(hit_n, rng);
+                    } else {
+                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                        if (cur_dir.dot(hit_n) < 0.0)
+                            cur_dir = cosine_hemisphere(hit_n, rng);
+                    }
+
+                    pos = hit_pos + cur_dir * (EPS * 100.0);
+                    path_len += t_min;
+                }
+            }
+        }));
+    }
+
+    for (auto& f : futures) f.get();
+
+    for (const RtImageWorkerLocal& L : locals) {
+        for (size_t i = 0; i < image_size; ++i)
+            out_image[i] += L.image[i];
+    }
+
+    if (st->camera_capture_strikes) {
+        if (st->camera_strike_stride_floats <= 0)
+            st->camera_strike_stride_floats = 16 + 2 * st->n_bands;
+        const int stride = st->camera_strike_stride_floats;
+        int rows_now = static_cast<int>(st->camera_strike_rows.size() / static_cast<size_t>(stride));
+        for (const RtImageWorkerLocal& L : locals) {
+            const int n_rows = static_cast<int>(L.strikes.size() / static_cast<size_t>(stride));
+            for (int r = 0; r < n_rows; ++r) {
+                if (st->camera_capture_max_strikes > 0 && rows_now >= st->camera_capture_max_strikes)
+                    return SK_OK;
+                const size_t src_off = static_cast<size_t>(r) * stride;
+                const size_t dst_off = st->camera_strike_rows.size();
+                st->camera_strike_rows.resize(dst_off + static_cast<size_t>(stride));
+                std::memcpy(st->camera_strike_rows.data() + dst_off,
+                            L.strikes.data() + src_off,
+                            sizeof(float) * static_cast<size_t>(stride));
+                rows_now += 1;
+            }
+        }
+    }
+
+    return SK_OK;
+}
+
 int ray_tracer_integrate_image(
     RayTracerState* st,
     int             n_sources,
@@ -1651,86 +2349,24 @@ int ray_tracer_integrate_image(
     float*          out_image)
 {
     RtProfileScope scope("ray_tracer_integrate_image");
-    if (!st || !out_image) return SK_ERR_NULL_STATE;
-
-    /* Build orthonormal camera frame. */
-    V3d cam_p(cam_pos[0], cam_pos[1], cam_pos[2]);
-    V3d cam_f = V3d(cam_fwd[0], cam_fwd[1], cam_fwd[2]).normalized();
-    V3d cam_u_hint(cam_up[0], cam_up[1], cam_up[2]);
-
-    /* cam_right = fwd × up_hint, then re-derive true up. */
-    V3d cam_r = cam_f.cross(cam_u_hint);
-    if (cam_r.norm() < EPS)
-        cam_r = cam_f.cross(V3d(1, 0, 0));  /* fallback if fwd ≈ up hint */
-    cam_r.normalize();
-    V3d cam_u = cam_r.cross(cam_f);  /* guaranteed orthogonal */
-
-    const double tan_half_v  = std::tan(fov_rad * 0.5);
-    const double aspect      = static_cast<double>(width) / height;
-    const double tan_half_h  = tan_half_v * aspect;
-
-    const int n_bands = st->n_bands;
-    bool abort = false;
-    std::mt19937_64 rng(static_cast<uint64_t>(seed));
-
-    trace_rays_v2(
-        *st,
-        n_sources, src_pos, src_dir, src_directivity,
-        n_rays, max_bounces, min_amplitude,
+    return ray_tracer_integrate_image_parallel_impl(
+        st,
+        n_sources,
+        src_pos,
+        src_dir,
+        src_directivity,
         nullptr,
-        rng, abort,
-        [&](int si, int bounce, int hit_tri,
-            const V3d& incoming_dir, const V3d& surface_normal,
-            const VXcd& amp_prop,
-            const V3d& /*p0*/, const V3d& p1, double total_path) -> bool
-        {
-            V3d hit_pos = p1;
-            V3d hit_n = surface_normal;
-            if (hit_tri >= 0)
-                apply_parametric_surface_point(*st, hit_tri, p1, hit_pos, hit_n);
-
-            V3d v = hit_pos - cam_p;
-            double depth = v.dot(cam_f);
-            int visible = 0;
-            int context_entries = 0;
-            if (depth > EPS) {
-                const uint64_t c0 = st->camera_full_march_context_entries;
-                visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
-                context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
-            }
-
-            if (st->camera_field_grid)
-                accumulate_field_capture(*st, hit_pos, amp_prop);
-            append_camera_strike(*st, si, bounce, hit_tri, hit_pos, hit_n,
-                                 incoming_dir, depth, total_path,
-                                 visible, context_entries, amp_prop);
-
-            if (depth <= EPS) return true;
-            if (st->camera_depth_cull_enabled && depth > st->camera_depth_cull_m)
-                return true;
-            if (!visible)
-                return true;
-
-            double x_img = v.dot(cam_r);
-            double y_img = v.dot(cam_u);
-            double ndc_x =  x_img / (depth * tan_half_h);
-            double ndc_y = -y_img / (depth * tan_half_v);
-            int px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
-            int py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
-
-            if (px < 0 || px >= width || py < 0 || py >= height)
-                return true;
-
-            for (int b = 0; b < n_bands; ++b) {
-                size_t idx = static_cast<size_t>(b) * (height * width)
-                           + static_cast<size_t>(py) * width
-                           + static_cast<size_t>(px);
-                out_image[idx] += static_cast<float>(std::abs(amp_prop[b]));
-            }
-            return true;
-        });
-
-    return SK_OK;
+        n_rays,
+        max_bounces,
+        min_amplitude,
+        seed,
+        cam_pos,
+        cam_fwd,
+        cam_up,
+        fov_rad,
+        width,
+        height,
+        out_image);
 }
 
 int ray_tracer_integrate_image_packed(
@@ -1752,83 +2388,280 @@ int ray_tracer_integrate_image_packed(
     float*          out_image)
 {
     RtProfileScope scope("ray_tracer_integrate_image_packed");
-    if (!st || !out_image || !src_n_rays) return SK_ERR_NULL_STATE;
+    return ray_tracer_integrate_image_parallel_impl(
+        st,
+        n_sources,
+        src_pos,
+        src_dir,
+        src_directivity,
+        src_n_rays,
+        0,
+        max_bounces,
+        min_amplitude,
+        seed,
+        cam_pos,
+        cam_fwd,
+        cam_up,
+        fov_rad,
+        width,
+        height,
+        out_image);
+}
+
+struct RtTraceImageWorkerLocal {
+    std::vector<float> image;
+    std::vector<float> strikes;
+    RayWorkerChunk     chunk;
+};
+
+static int ray_tracer_trace_integrate_image_parallel_impl(
+    RayTracerState* st,
+    int n_sources,
+    const double* src_pos,
+    const double* src_dir,
+    const double* src_directivity,
+    int n_rays,
+    int max_bounces,
+    double min_amplitude,
+    uint32_t seed,
+    const double* cam_pos,
+    const double* cam_fwd,
+    const double* cam_up,
+    double fov_rad,
+    int width,
+    int height,
+    float* out_image,
+    float* out_segs,
+    int out_cap,
+    int* out_count)
+{
+    if (!st || !out_image || !out_count) return SK_ERR_NULL_STATE;
+    *out_count = 0;
+    if (n_rays <= 0 || n_sources <= 0) return SK_OK;
 
     V3d cam_p(cam_pos[0], cam_pos[1], cam_pos[2]);
     V3d cam_f = V3d(cam_fwd[0], cam_fwd[1], cam_fwd[2]).normalized();
     V3d cam_u_hint(cam_up[0], cam_up[1], cam_up[2]);
-
     V3d cam_r = cam_f.cross(cam_u_hint);
     if (cam_r.norm() < EPS)
         cam_r = cam_f.cross(V3d(1, 0, 0));
     cam_r.normalize();
     V3d cam_u = cam_r.cross(cam_f);
 
-    const double tan_half_v  = std::tan(fov_rad * 0.5);
-    const double aspect      = static_cast<double>(width) / height;
-    const double tan_half_h  = tan_half_v * aspect;
-
+    const double tan_half_v = std::tan(fov_rad * 0.5);
+    const double aspect = static_cast<double>(width) / std::max(1, height);
+    const double tan_half_h = tan_half_v * aspect;
     const int n_bands = st->n_bands;
-    bool abort = false;
-    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+    const bool has_bvh = !st->bvh_nodes.empty();
 
-    trace_rays_v2(
-        *st,
-        n_sources, src_pos, src_dir, src_directivity,
-        0, max_bounces, min_amplitude,
-        src_n_rays,
-        rng, abort,
-        [&](int si, int bounce, int hit_tri,
-            const V3d& incoming_dir, const V3d& surface_normal,
-            const VXcd& amp_prop,
-            const V3d& /*p0*/, const V3d& p1, double total_path) -> bool
-        {
-            V3d hit_pos = p1;
-            V3d hit_n = surface_normal;
-            if (hit_tri >= 0)
-                apply_parametric_surface_point(*st, hit_tri, p1, hit_pos, hit_n);
+    const int total_jobs = n_sources * n_rays;
+    const int hw = std::max(1u, std::thread::hardware_concurrency());
+    const int n_workers = std::max(1, std::min(hw, total_jobs));
 
-            V3d v = hit_pos - cam_p;
-            double depth = v.dot(cam_f);
-            int visible = 0;
-            int context_entries = 0;
-            if (depth > EPS) {
-                const uint64_t c0 = st->camera_full_march_context_entries;
-                visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
-                context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
+    std::vector<RtTraceImageWorkerLocal> locals(static_cast<size_t>(n_workers));
+    const size_t image_size = static_cast<size_t>(n_bands)
+                            * static_cast<size_t>(width)
+                            * static_cast<size_t>(height);
+    for (int wi = 0; wi < n_workers; ++wi)
+        locals[static_cast<size_t>(wi)].image.assign(image_size, 0.0f);
+
+    std::mutex st_mutex;
+    ThreadPool pool(static_cast<size_t>(n_workers));
+    std::vector<std::future<void>> futures;
+    futures.reserve(static_cast<size_t>(n_workers));
+
+    const int chunk = (total_jobs + n_workers - 1) / n_workers;
+    for (int wi = 0; wi < n_workers; ++wi) {
+        const int lo = wi * chunk;
+        const int hi = std::min(total_jobs, lo + chunk);
+        if (lo >= hi) continue;
+
+        futures.push_back(pool.enqueue([&, wi, lo, hi]() {
+            RtTraceImageWorkerLocal& L = locals[static_cast<size_t>(wi)];
+            VXcd amp(n_bands);
+            VXcd amp_prop(n_bands);
+
+            for (int job = lo; job < hi; ++job) {
+                const int si = job / n_rays;
+                const int ri = job - si * n_rays;
+
+                const double* sp = src_pos + si * 3;
+                const double* sd = src_dir + si * 3;
+                V3d src_p(sp[0], sp[1], sp[2]);
+                V3d src_d = V3d(sd[0], sd[1], sd[2]).normalized();
+                double dirpow = src_directivity[si];
+
+                V3d dir = fibonacci_sphere_dir(ri, n_rays, src_d);
+                double cos_a = dir.dot(src_d);
+                double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
+                if (dir_weight < 0.01) continue;
+
+                const uint64_t ray_seed = rt_splitmix64((uint64_t)seed
+                    ^ (static_cast<uint64_t>(si) << 32)
+                    ^ static_cast<uint64_t>(ri));
+                std::mt19937_64 rng(ray_seed);
+                std::uniform_real_distribution<double> U(0.0, 1.0);
+
+                for (int b = 0; b < n_bands; ++b)
+                    amp[b] = cd(dir_weight, 0.0);
+
+                V3d pos = src_p;
+                V3d cur_dir = dir;
+                double path_len = 0.0;
+
+                for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                    double t_min = 1e18;
+                    int hit_tri = -1;
+
+                    if (has_bvh) {
+                        V3d inv_dir = cur_dir.cwiseInverse();
+                        bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
+                                  pos, cur_dir, inv_dir, t_min, hit_tri);
+                    } else {
+                        for (size_t ti = 0; ti < st->tris.size(); ++ti) {
+                            double t;
+                            if (ray_triangle_hit(pos, cur_dir, st->tris[ti], t) && t < t_min) {
+                                t_min = t;
+                                hit_tri = static_cast<int>(ti);
+                            }
+                        }
+                    }
+                    if (hit_tri < 0) break;
+
+                    V3d p0 = pos;
+                    V3d hit_pos = pos + t_min * cur_dir;
+                    V3d hit_n = st->tris[static_cast<size_t>(hit_tri)].normal;
+                    apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n);
+                    if (cur_dir.dot(hit_n) > 0.0)
+                        hit_n = -hit_n;
+
+                    const double total_path = path_len + t_min;
+                    const double spread = 1.0 / (1.0 + path_len + t_min * 0.5);
+                    const Triangle& tri = st->tris[static_cast<size_t>(hit_tri)];
+
+                    double max_abs = 0.0;
+                    for (int b = 0; b < n_bands; ++b) {
+                        double kt = st->k_real[b] * t_min;
+                        double decay = std::exp(-st->atmo_abs[b] * t_min) * spread;
+                        cd prop(decay * std::cos(kt), decay * std::sin(kt));
+                        amp_prop[b] = amp[b] * prop;
+                        max_abs = std::max(max_abs, std::abs(amp_prop[b]));
+                    }
+
+                    if (out_segs && out_cap > 0) {
+                        const double seg_path_start = total_path - t_min;
+                        for (int b = 0; b < n_bands; ++b) {
+                            L.chunk.write_segment(p0, hit_pos, si, bounce, b,
+                                                  amp_prop[b], seg_path_start);
+                        }
+                    }
+
+                    V3d v = hit_pos - cam_p;
+                    double depth = v.dot(cam_f);
+                    const bool in_front = (depth > EPS);
+                    const bool pass_depth_cull = !st->camera_depth_cull_enabled
+                                              || depth <= st->camera_depth_cull_m;
+                    int px = -1;
+                    int py = -1;
+                    bool in_frame = false;
+                    if (in_front && pass_depth_cull) {
+                        double x_img = v.dot(cam_r);
+                        double y_img = v.dot(cam_u);
+                        double ndc_x = x_img / (depth * tan_half_h);
+                        double ndc_y = -y_img / (depth * tan_half_v);
+                        px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
+                        py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
+                        in_frame = (px >= 0 && px < width && py >= 0 && py < height);
+                    }
+
+                    const bool need_image_vis = in_frame;
+                    const bool need_strike_vis = st->camera_capture_strikes;
+                    int visible = 0;
+                    int context_entries = 0;
+                    if (in_front && (need_image_vis || need_strike_vis)) {
+                        std::lock_guard<std::mutex> lk(st_mutex);
+                        const uint64_t c0 = st->camera_full_march_context_entries;
+                        visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
+                        context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
+                    }
+
+                    if (st->camera_field_grid) {
+                        std::lock_guard<std::mutex> lk(st_mutex);
+                        accumulate_field_capture(*st, hit_pos, amp_prop);
+                    }
+
+                    if (st->camera_capture_strikes) {
+                        append_camera_strike_local(*st, L.strikes,
+                                                   si, bounce, hit_tri,
+                                                   hit_pos, hit_n, cur_dir,
+                                                   depth, total_path,
+                                                   visible, context_entries,
+                                                   amp_prop);
+                    }
+
+                    if (need_image_vis && visible) {
+                        for (int b = 0; b < n_bands; ++b) {
+                            size_t idx = static_cast<size_t>(b) * (height * width)
+                                       + static_cast<size_t>(py) * width
+                                       + static_cast<size_t>(px);
+                            L.image[idx] += static_cast<float>(std::abs(amp_prop[b]));
+                        }
+                    }
+
+                    for (int b = 0; b < n_bands; ++b)
+                        amp[b] = amp_prop[b] * mat_cache_refl(st->mat_cache, tri.mat_idx, b);
+                    if (max_abs < min_amplitude) break;
+
+                    if (U(rng) < mat_cache_diffusion(st->mat_cache, tri.mat_idx)) {
+                        cur_dir = cosine_hemisphere(hit_n, rng);
+                    } else {
+                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                        if (cur_dir.dot(hit_n) < 0.0)
+                            cur_dir = cosine_hemisphere(hit_n, rng);
+                    }
+
+                    pos = hit_pos + cur_dir * (EPS * 100.0);
+                    path_len += t_min;
+                }
             }
+        }));
+    }
 
-            if (st->camera_field_grid)
-                accumulate_field_capture(*st, hit_pos, amp_prop);
-            append_camera_strike(*st, si, bounce, hit_tri, hit_pos, hit_n,
-                                 incoming_dir, depth, total_path,
-                                 visible, context_entries, amp_prop);
+    for (auto& f : futures) f.get();
 
-            if (depth <= EPS) return true;
-            if (st->camera_depth_cull_enabled && depth > st->camera_depth_cull_m)
-                return true;
-            if (!visible)
-                return true;
+    for (const RtTraceImageWorkerLocal& L : locals) {
+        for (size_t i = 0; i < image_size; ++i)
+            out_image[i] += L.image[i];
+    }
 
-            double x_img = v.dot(cam_r);
-            double y_img = v.dot(cam_u);
-            double ndc_x =  x_img / (depth * tan_half_h);
-            double ndc_y = -y_img / (depth * tan_half_v);
-            int px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
-            int py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
-
-            if (px < 0 || px >= width || py < 0 || py >= height)
-                return true;
-
-            for (int b = 0; b < n_bands; ++b) {
-                size_t idx = static_cast<size_t>(b) * (height * width)
-                           + static_cast<size_t>(py) * width
-                           + static_cast<size_t>(px);
-                out_image[idx] += static_cast<float>(std::abs(amp_prop[b]));
+    if (st->camera_capture_strikes) {
+        if (st->camera_strike_stride_floats <= 0)
+            st->camera_strike_stride_floats = 16 + 2 * st->n_bands;
+        const int stride = st->camera_strike_stride_floats;
+        int rows_now = static_cast<int>(st->camera_strike_rows.size() / static_cast<size_t>(stride));
+        for (const RtTraceImageWorkerLocal& L : locals) {
+            const int n_rows = static_cast<int>(L.strikes.size() / static_cast<size_t>(stride));
+            for (int r = 0; r < n_rows; ++r) {
+                if (st->camera_capture_max_strikes > 0 && rows_now >= st->camera_capture_max_strikes)
+                    break;
+                const size_t src_off = static_cast<size_t>(r) * stride;
+                const size_t dst_off = st->camera_strike_rows.size();
+                st->camera_strike_rows.resize(dst_off + static_cast<size_t>(stride));
+                std::memcpy(st->camera_strike_rows.data() + dst_off,
+                            L.strikes.data() + src_off,
+                            sizeof(float) * static_cast<size_t>(stride));
+                rows_now += 1;
             }
-            return true;
-        });
+        }
+    }
 
+    if (out_segs && out_cap > 0) {
+        int written = 0;
+        for (RtTraceImageWorkerLocal& L : locals) {
+            written += L.chunk.flush_to(out_segs, out_cap, written);
+        }
+        *out_count = written;
+    }
     return SK_OK;
 }
 
@@ -1853,93 +2686,26 @@ int ray_tracer_trace_integrate_image(
     int             out_cap,
     int*            out_count)
 {
-    if (!st || !out_image || !out_count) return SK_ERR_NULL_STATE;
-
-    RayWorkerChunk chunk;
-    *out_count = 0;
-
-    V3d cam_p(cam_pos[0], cam_pos[1], cam_pos[2]);
-    V3d cam_f = V3d(cam_fwd[0], cam_fwd[1], cam_fwd[2]).normalized();
-    V3d cam_u_hint(cam_up[0], cam_up[1], cam_up[2]);
-
-    V3d cam_r = cam_f.cross(cam_u_hint);
-    if (cam_r.norm() < EPS)
-        cam_r = cam_f.cross(V3d(1, 0, 0));
-    cam_r.normalize();
-    V3d cam_u = cam_r.cross(cam_f);
-
-    const double tan_half_v = std::tan(fov_rad * 0.5);
-    const double aspect     = static_cast<double>(width) / height;
-    const double tan_half_h = tan_half_v * aspect;
-
-    bool abort = false;
-    std::mt19937_64 rng(static_cast<uint64_t>(seed));
-
-    trace_rays_v2(
-        *st,
-        n_sources, src_pos, src_dir, src_directivity,
-        n_rays, max_bounces, min_amplitude,
-        nullptr,
-        rng, abort,
-        [&](int si, int bounce, int hit_tri,
-            const V3d& incoming_dir, const V3d& surface_normal,
-            const VXcd& amp_prop,
-            const V3d& p0, const V3d& p1, double total_path) -> bool
-        {
-            if (out_segs && out_cap > 0) {
-                for (int b = 0; b < st->n_bands; ++b) {
-                    chunk.write_segment(p0, p1, si, bounce, b,
-                                        amp_prop[b],
-                                        total_path - (p1 - p0).norm());
-                }
-            }
-
-            V3d hit_pos = p1;
-            V3d hit_n = surface_normal;
-            if (hit_tri >= 0)
-                apply_parametric_surface_point(*st, hit_tri, p1, hit_pos, hit_n);
-
-            V3d v = hit_pos - cam_p;
-            double depth = v.dot(cam_f);
-            int visible = 0;
-            int context_entries = 0;
-            if (depth > EPS) {
-                const uint64_t c0 = st->camera_full_march_context_entries;
-                visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
-                context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
-            }
-
-            if (st->camera_field_grid)
-                accumulate_field_capture(*st, hit_pos, amp_prop);
-            append_camera_strike(*st, si, bounce, hit_tri, hit_pos, hit_n,
-                                 incoming_dir, depth, total_path,
-                                 visible, context_entries, amp_prop);
-
-            if (depth <= EPS) return true;
-            if (st->camera_depth_cull_enabled && depth > st->camera_depth_cull_m)
-                return true;
-            if (!visible)
-                return true;
-
-            double x_img = v.dot(cam_r);
-            double y_img = v.dot(cam_u);
-            double ndc_x =  x_img / (depth * tan_half_h);
-            double ndc_y = -y_img / (depth * tan_half_v);
-            int px = static_cast<int>((ndc_x + 1.0) * 0.5 * width);
-            int py = static_cast<int>((ndc_y + 1.0) * 0.5 * height);
-            if (px >= 0 && px < width && py >= 0 && py < height) {
-                for (int b = 0; b < st->n_bands; ++b) {
-                    size_t idx = static_cast<size_t>(b) * (height * width)
-                               + static_cast<size_t>(py) * width
-                               + static_cast<size_t>(px);
-                    out_image[idx] += static_cast<float>(std::abs(amp_prop[b]));
-                }
-            }
-            return true;
-        });
-
-    *out_count = (out_segs && out_cap > 0) ? chunk.flush_to(out_segs, out_cap, 0) : 0;
-    return SK_OK;
+    return ray_tracer_trace_integrate_image_parallel_impl(
+        st,
+        n_sources,
+        src_pos,
+        src_dir,
+        src_directivity,
+        n_rays,
+        max_bounces,
+        min_amplitude,
+        seed,
+        cam_pos,
+        cam_fwd,
+        cam_up,
+        fov_rad,
+        width,
+        height,
+        out_image,
+        out_segs,
+        out_cap,
+        out_count);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -2242,8 +3008,8 @@ static void trace_rays_multiscale(
                     if (n_mat <= EPS || std::abs(n_mat - 1.0) < 1e-6) {
                         /* No effective refraction — fall through to opaque path. */
                         for (int b = 0; b < n_bands; ++b)
-                            amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
-                        if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
+                            amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                        if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
                             cur_dir = cosine_hemisphere(hit_n, rng);
                         } else {
                             cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
@@ -2264,7 +3030,7 @@ static void trace_rays_multiscale(
                             /* TIR: perfect specular reflection, apply surface refl. */
                             cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
                             for (int b = 0; b < n_bands; ++b)
-                                amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
+                                amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                         } else {
                             double sin2_t = (n1/n2) * (n1/n2) * (1.0 - cos_i * cos_i);
                             double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
@@ -2273,7 +3039,7 @@ static void trace_rays_multiscale(
                                 /* Probabilistic reflection (Russian roulette, unbiased). */
                                 cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
                                 for (int b = 0; b < n_bands; ++b)
-                                    amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
+                                    amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                             } else {
                                 /* Transmission: exact Snell direction, no refl scaling.
                                  * MC probability (1-R) handles energy balance. */
@@ -2287,8 +3053,8 @@ static void trace_rays_multiscale(
                 } else {
                     /* Opaque surface: Lambertian or specular reflection. */
                     for (int b = 0; b < n_bands; ++b)
-                        amp[b] = amp_surf[b] * mat_refl_complex(st, tri.mat_idx, b);
-                    if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
+                        amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                    if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
                         cur_dir = cosine_hemisphere(hit_n, rng);
                     } else {
                         cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
@@ -2303,17 +3069,8 @@ static void trace_rays_multiscale(
                  * to the Stokes-shifted destination band.  The yield is the
                  * material's reemission coefficient at band 0 — matches
                  * GLSL's `tri.emissive.w` / reemission packing convention. */
-                if (tri.flags & MAT_FLAG_REACTIVE) {
-                    const double shift_hz = mat_reactive_shift_hz(st, tri.mat_idx);
-                    if (shift_hz > 0.0) {
-                        /* Slot 6 = reemission (per the documented MatBuf
-                         * SpectralBandRecord layout in material_db.py). */
-                        const double yield_frac = static_cast<double>(
-                            mat_band_record(st, tri.mat_idx, 0)[6]);
-                        apply_reactive_shift(amp, st.freq_hz_vec,
-                                             shift_hz, yield_frac);
-                    }
-                }
+                if (tri.flags & MAT_FLAG_REACTIVE)
+                    apply_reactive_shift_cached(amp, st.mat_cache, tri.mat_idx);
 
                 pos       = hit_pos + cur_dir * (EPS * 200.0);
                 path_len += t_hit;
@@ -2723,6 +3480,13 @@ int ray_tracer_reduce_endpoint_records_to_sensor_integral(
             if (out_telemetry) out_telemetry->drop_wrong_group += 1;
             continue;
         }
+        // Only PIXEL_CONE sensor records encode the pixel in subpath_id.
+        // Forward/emission records (vertex_index < 0) use a sequential ray
+        // counter there and must be excluded from subpath_id->pixel mapping.
+        if (E.vertex_index < 0) {
+            if (out_telemetry) out_telemetry->drop_non_pixel_cone += 1;
+            continue;
+        }
         const int band = static_cast<int>(E.band_id);
         if (band < 0 || band >= n_bands) {
             if (out_telemetry) out_telemetry->drop_invalid_band += 1;
@@ -2927,6 +3691,13 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
         }
         if (static_cast<int>(E.group_id) != sensor_group_id) {
             if (out_telemetry) out_telemetry->drop_wrong_group += 1;
+            continue;
+        }
+        // Only PIXEL_CONE sensor records encode the pixel in subpath_id.
+        // Forward/emission records (vertex_index < 0) use a sequential ray
+        // counter there and must be excluded from subpath_id->pixel mapping.
+        if (E.vertex_index < 0) {
+            if (out_telemetry) out_telemetry->drop_non_pixel_cone += 1;
             continue;
         }
         const int band = static_cast<int>(E.band_id);
@@ -3478,11 +4249,11 @@ static bool apply_surface(
                     : refracted;
             }
             for (int b = 0; b < st.n_bands; ++b)
-                amp[b] *= mat_refl_complex(st, tri.mat_idx, b);
+                amp[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
         } else {
             for (int b = 0; b < st.n_bands; ++b)
-                amp[b] *= mat_refl_complex(st, tri.mat_idx, b);
-            if (U(rng) < mat_diffusion(st, tri.mat_idx)) {
+                amp[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+            if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
                 dir = cosine_hemisphere(hit_n, rng);
             } else {
                 dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
@@ -4122,22 +4893,17 @@ static int ray_tracer_bidirectional_impl(
                 V3d hit_n = hit_n_param;
                 if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
                 if (tri.flags & MAT_FLAG_APERTURE_STOP) break;
-                if (U(rng) < mat_diffusion(*st, tri.mat_idx)) {
+                if (U(rng) < mat_cache_diffusion(st->mat_cache, tri.mat_idx)) {
                     dir = cosine_hemisphere(hit_n, rng);
                 } else {
                     dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
                     if (dir.dot(hit_n) < 0.0) dir = cosine_hemisphere(hit_n, rng);
                 }
                 for (int b = 0; b < n_bands; ++b)
-                    amp[b] *= mat_refl_complex(*st, tri.mat_idx, b);
+                    amp[b] *= mat_cache_refl(st->mat_cache, tri.mat_idx, b);
 
-                if (tri.flags & MAT_FLAG_REACTIVE) {
-                    double shift_hz = mat_reactive_shift_hz(*st, tri.mat_idx);
-                    if (shift_hz > 0.0) {
-                        double yf = (double)mat_band_record(*st, tri.mat_idx, 0)[6];
-                        apply_reactive_shift(amp, st->freq_hz_vec, shift_hz, yf);
-                    }
-                }
+                if (tri.flags & MAT_FLAG_REACTIVE)
+                    apply_reactive_shift_cached(amp, st->mat_cache, tri.mat_idx);
 
                 pos = hit_pos + dir * (EPS * 200.0);
                 path_len = total_path;
@@ -4183,8 +4949,6 @@ bdpt_done:
      *   group_id     = sensor group id
      * ────────────────────────────────────────────────────────────────── */
     {
-        std::mt19937_64 cone_rng(static_cast<uint64_t>(seed) * 11400714819323198485ULL
-                                 + 9876543210123456789ULL);
         for (size_t g = 0; g < st->tri_groups.size(); ++g) {
             const TriGroupDesc& gd = st->tri_groups[g];
             if (!(gd.role_bits & TRI_GROUP_ROLE_SENSOR)) continue;
@@ -4220,10 +4984,19 @@ bdpt_done:
             const double pix_w = cam.sensor_w_m / std::max(1, n_px);
             const double pix_h = cam.sensor_h_m / std::max(1, n_py);
 
-            /* Reserve output capacity per pixel: n_ap * n_bands records,
-             * but only if we have room.  Truncate at out_cap. */
+            /* Reserve fixed slots per pixel (n_ap * n_bands each), then
+             * compact per-pixel written counts serially for contiguous output. */
             const long long total_pixels = (long long)n_px * n_py;
             const long long recs_per_px  = (long long)n_ap * n_bands;
+            const int slot_base = rec_count;
+            const long long cap_left = static_cast<long long>(out_cap - slot_base);
+            if (recs_per_px <= 0 || cap_left < recs_per_px)
+                continue;
+            const long long pixels_fit = std::min(total_pixels, cap_left / recs_per_px);
+            if (pixels_fit <= 0)
+                continue;
+
+            std::vector<int> pixel_written(static_cast<size_t>(pixels_fit), 0);
             int sensor_gid = (int)g;
 
             /* Per-pixel parallel.  Each pixel computes its own jitter
@@ -4233,9 +5006,11 @@ bdpt_done:
                 std::mt19937_64 trng;
                 VXcd amp_local(n_bands);
                 #pragma omp for schedule(dynamic, 8)
-                for (long long pi = 0; pi < total_pixels; ++pi) {
+                for (long long pi = 0; pi < pixels_fit; ++pi) {
                     int py = (int)(pi / n_px);
                     int px = (int)(pi - (long long)py * n_px);
+                    EndpointRecord* slot = out_records + slot_base + pi * recs_per_px;
+                    int slot_written = 0;
 
                     /* Deterministic per-pixel RNG seed (decoupled from the
                      * shared cone_rng so threads don't race). */
@@ -4338,35 +5113,44 @@ bdpt_done:
                         double cos_theta = std::abs(dir.dot(hit_n));
                         uint32_t my_subpath = (uint32_t)pi;
 
-                        /* Emit n_bands records — under critical so the
-                         * shared rec_count stays consistent.  Records past
-                         * out_cap are dropped silently (caller widens cap). */
-                        #pragma omp critical(pixel_cone_emit)
-                        {
-                            for (int b = 0; b < n_bands; ++b) {
-                                if (rec_count >= out_cap) break;
-                                EndpointRecord& E = out_records[rec_count++];
-                                E.subpath_id   = my_subpath;
-                                E.band_id      = (uint32_t)b;
-                                E.group_id     = sensor_gid;
-                                E.vertex_index = ai;
-                                E.pos[0] = (float)hit_pos.x();
-                                E.pos[1] = (float)hit_pos.y();
-                                E.pos[2] = (float)hit_pos.z();
-                                E.pathlen_m = (float)total_path;
-                                E.dir[0] = (float)dir.x();
-                                E.dir[1] = (float)dir.y();
-                                E.dir[2] = (float)dir.z();
-                                E.pdf       = 1.0f / (float)n_ap;
-                                E.amp_re    = (float)amp_local[b].real();
-                                E.amp_im    = (float)amp_local[b].imag();
-                                E.cos_theta = (float)cos_theta;
-                                E._pad      = 0.0f;
-                            }
+                        /* Write into this pixel's private fixed slot. */
+                        for (int b = 0; b < n_bands; ++b) {
+                            EndpointRecord& E = slot[slot_written++];
+                            E.subpath_id   = my_subpath;
+                            E.band_id      = (uint32_t)b;
+                            E.group_id     = sensor_gid;
+                            E.vertex_index = ai;
+                            E.pos[0] = (float)hit_pos.x();
+                            E.pos[1] = (float)hit_pos.y();
+                            E.pos[2] = (float)hit_pos.z();
+                            E.pathlen_m = (float)total_path;
+                            E.dir[0] = (float)dir.x();
+                            E.dir[1] = (float)dir.y();
+                            E.dir[2] = (float)dir.z();
+                            E.pdf       = 1.0f / (float)n_ap;
+                            E.amp_re    = (float)amp_local[b].real();
+                            E.amp_im    = (float)amp_local[b].imag();
+                            E.cos_theta = (float)cos_theta;
+                            E._pad      = 0.0f;
                         }
                     }
+                    pixel_written[static_cast<size_t>(pi)] = slot_written;
                 }
             } /* omp parallel */
+
+            int write_cursor = slot_base;
+            for (long long pi = 0; pi < pixels_fit; ++pi) {
+                const int n_write = pixel_written[static_cast<size_t>(pi)];
+                if (n_write <= 0) continue;
+                const int slot_start = slot_base + static_cast<int>(pi * recs_per_px);
+                if (slot_start != write_cursor) {
+                    std::memmove(out_records + write_cursor,
+                                 out_records + slot_start,
+                                 static_cast<size_t>(n_write) * sizeof(EndpointRecord));
+                }
+                write_cursor += n_write;
+            }
+            rec_count = write_cursor;
         }
     }
 

@@ -69,6 +69,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import tracemalloc
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
@@ -88,6 +89,7 @@ from camera_exposure_budget import (
     H_PLANCK,
     C_LIGHT,
 )
+from camera_parametric_solver import solve_sane_pinhole_camera
 from material_db import MaterialDatabase, MAX_SPECTRAL_BANDS
 from sensor_film_db import SensorFilmDatabase, MAX_SENSOR_FILM_SLOTS
 
@@ -244,16 +246,21 @@ class StageProfiler:
             if name not in self._order:
                 self._order.append(name)
 
-    def report(self, prefix: str = "[profile]") -> None:
+    def format_report(self, prefix: str = "[profile]") -> str:
         if not self.enabled or not self._order:
-            return
+            return ""
         parts = [f"{k}={np.mean(self._data[k]):.1f}ms" for k in self._order if self._data.get(k)]
         current = peak = None
         if tracemalloc.is_tracing():
             current, peak = tracemalloc.get_traced_memory()
         if current is not None and peak is not None:
             parts.append(f"mem={current / (1024 ** 2):.1f}MB/{peak / (1024 ** 2):.1f}MB")
-        print(f"{prefix} " + "  ".join(parts), flush=True)
+        return f"{prefix} " + "  ".join(parts)
+
+    def report(self, prefix: str = "[profile]") -> None:
+        msg = self.format_report(prefix=prefix)
+        if msg:
+            print(msg, flush=True)
 
 DEFAULT_CALIBRATION_SCENE_SEQUENCE = (
     "calib-grid",
@@ -446,13 +453,19 @@ class ExposureBackend:
         self.max_bounces = int(max_bounces)
         self.min_amplitude = float(min_amplitude)
         self.atmo_abs = np.full(self.n_bands, float(atmo_abs_db_per_m), np.float64)
-        # Persistent per-exposure accumulator (n_bands, H, W) in float32.
-        self.accum = np.zeros((self.n_bands, cam.height, cam.width), np.float32)
+        # Persistent per-exposure accumulators (n_bands, H, W) in float32.
+        self.accum       = np.zeros((self.n_bands, cam.height, cam.width), np.float32)
+        # surf_accum: sensor-group EndpointRecord contributions (direct hits).
+        # field_accum: non-sensor EndpointRecord contributions (ambient/field).
+        self.surf_accum  = np.zeros((self.n_bands, cam.height, cam.width), np.float32)
+        self.field_accum = np.zeros((self.n_bands, cam.height, cam.width), np.float32)
         self.n_rays_accumulated = 0
 
     # ── Sub-class hooks ──────────────────────────────────────────────────
     def reset_exposure(self) -> None:
         self.accum.fill(0.0)
+        self.surf_accum.fill(0.0)
+        self.field_accum.fill(0.0)
         self.n_rays_accumulated = 0
 
     def render_batch(self, n_rays: int, seed: int) -> None:
@@ -756,6 +769,139 @@ class CppExposureBackend(ExposureBackend):
         src_dir = self._sample_cosine_hemisphere_axes(self.scene.src_dir, rng)
         return np.ascontiguousarray(src_pos, np.float64), src_dir
 
+    def run_bdpt_batch(self, emit_rays: np.ndarray, seed: int) -> np.ndarray:
+        """Fire one BDPT batch using the pre-registered tri-group layout.
+
+        Returns raw float32 (N, 16) EndpointRecord array.  The caller must
+        follow up with scatter_bdpt_records() to accumulate surf/field_accum.
+        """
+        if not (hasattr(self.tracer, "bidirectional_packed") and emit_rays.size > 0):
+            return np.zeros((0, 16), np.float32)
+        # Size the buffer exactly to this batch's worst-case output.
+        # Every ray can produce at most (max_bounces + 1) records.
+        # Records are scattered and discarded immediately after; no session
+        # cap is needed — overflow is impossible by construction.
+        batch_max = int(np.sum(emit_rays)) * (self.max_bounces + 1)
+        return self.tracer.bidirectional_packed(
+            n_rays_per_emitter = np.ascontiguousarray(emit_rays, np.int32),
+            max_bounces        = self.max_bounces,
+            min_amplitude      = self.min_amplitude,
+            seed               = int(seed),
+            max_records        = batch_max,
+        )
+
+    def scatter_bdpt_records(self, recs: np.ndarray, sensor_group_id: int) -> None:
+        """Scatter EndpointRecord rows into surf_accum (sensor hits) and field_accum (scene).
+
+        EndpointRecord float32 column layout (bdpt_record.h, 64 bytes = 16 floats):
+          col[0] subpath_id (uint32), col[1] band_id (uint32),
+          col[2] group_id  (int32),   col[3] vertex_index (int32),
+          col[4:7] pos xyz,           col[7] pathlen_m,
+          col[8:11] dir xyz,          col[11] pdf,
+          col[12] amp_re, col[13] amp_im, col[14] cos_theta, col[15] _pad
+
+        Records with group_id == sensor_group_id are camera-sensor hits
+        (surf_accum); all others are ambient/field paths (field_accum).
+        self.accum is kept in sync as surf_accum + field_accum so that
+        measured_radiant_exposure_J() and _density_need_map() remain valid.
+        """
+        if recs.shape[0] == 0:
+            return
+        recs = np.ascontiguousarray(recs, np.float32)
+        n = recs.shape[0]
+        H, W = int(self.cam.height), int(self.cam.width)
+
+        # Reinterpret float32 storage as int32 to read integer-typed columns.
+        col_i32  = recs.view(np.int32).reshape(n, 16)
+        raw_band_ids = col_i32[:, 1].astype(np.int64)   # uint32 in struct
+        group_ids    = col_i32[:, 2]                     # int32, signed
+
+        # Discard records whose band_id is out of range — never silently wrap.
+        valid_band = (raw_band_ids >= 0) & (raw_band_ids < self.n_bands)
+        if not np.all(valid_band):
+            n_bad = int(np.sum(~valid_band))
+            print(f"  [bdpt] scatter: discarding {n_bad} records with out-of-range band_id")
+            recs      = recs[valid_band]
+            col_i32   = recs.view(np.int32).reshape(-1, 16)
+            raw_band_ids = raw_band_ids[valid_band]
+            group_ids    = col_i32[:, 2]
+            n = recs.shape[0]
+            if n == 0:
+                return
+        band_ids    = raw_band_ids
+        subpath_ids = col_i32[:, 0].astype(np.int64)   # uint32 → int64
+        vertex_idx  = col_i32[:, 3].astype(np.int64)   # int32, -1 = forward path
+
+        amp_re = recs[:, 12].astype(np.float64)
+        amp_im = recs[:, 13].astype(np.float64)
+        amp    = np.sqrt(amp_re * amp_re + amp_im * amp_im)
+
+        # Split sensor-group records by semantic:
+        #   pixel_cone     — vertex_index >= 0: PIXEL_CONE sensor hit.
+        #                    subpath_id encodes the pixel as py*W + px.
+        #                    Use subpath_id directly for pixel mapping.
+        #   forward_sensor — vertex_index < 0, group == sensor_group_id:
+        #                    Forward/emission path that happened to hit a
+        #                    sensor-group triangle.  Project world-pos.
+        #   field          — group != sensor_group_id: ambient scene path.
+        #                    Project world-pos; only in-frustum kept.
+        sensor_group  = (group_ids == int(sensor_group_id))
+        pixel_cone    = sensor_group & (vertex_idx >= 0)
+        forward_snsr  = sensor_group & (vertex_idx < 0)
+        field         = ~sensor_group
+
+        # --- PIXEL_CONE scatter: subpath_id = py*W + px already. ---
+        def _scatter_pixel_cone() -> None:
+            m = pixel_cone & (subpath_ids >= 0) & (subpath_ids < H * W)
+            if not np.any(m):
+                n_bad = int(np.sum(pixel_cone)) - int(np.sum(m))
+                if n_bad:
+                    print(f"  [bdpt] scatter: discarding {n_bad} "
+                          f"pixel_cone records with out-of-range subpath_id")
+                return
+            flat = band_ids[m] * (H * W) + subpath_ids[m]
+            counts = np.bincount(flat, weights=amp[m],
+                                 minlength=self.n_bands * H * W)
+            self.surf_accum.ravel()[:] += counts.astype(np.float32)
+
+        # --- World-pos projection for forward_sensor + field records. ---
+        # Only compute the projection when there are records that need it.
+        proj_mask = forward_snsr | field
+        if np.any(proj_mask):
+            pos = recs[:, 4:7].astype(np.float64)   # (N, 3) world-space
+            cam_pos = np.asarray(self.cam.pos, np.float64)
+            cam_f, cam_r, cam_u, tan_half_h, tan_half_v = self._camera_basis()
+            v      = pos - cam_pos[None, :]
+            depth  = v @ cam_f
+            fwd_valid = depth > 1.0e-6
+            safe_d = np.where(fwd_valid, depth, 1.0)
+            x_ndc  = (v @ cam_r) / (safe_d * tan_half_h)
+            y_ndc  = -(v @ cam_u) / (safe_d * tan_half_v)
+            px_proj = ((x_ndc + 1.0) * 0.5 * W).astype(np.int64)
+            py_proj = ((y_ndc + 1.0) * 0.5 * H).astype(np.int64)
+            in_frame = fwd_valid & (px_proj >= 0) & (px_proj < W) & \
+                       (py_proj >= 0) & (py_proj < H)
+        else:
+            in_frame = np.zeros(n, dtype=bool)
+            px_proj  = np.zeros(n, dtype=np.int64)
+            py_proj  = np.zeros(n, dtype=np.int64)
+
+        def _scatter_proj(mask: np.ndarray, target: np.ndarray) -> None:
+            m = mask & in_frame
+            if not np.any(m):
+                return
+            flat = band_ids[m] * (H * W) + py_proj[m] * W + px_proj[m]
+            counts = np.bincount(flat, weights=amp[m],
+                                 minlength=self.n_bands * H * W)
+            target.ravel()[:] += counts.astype(np.float32)
+
+        _scatter_pixel_cone()
+        _scatter_proj(forward_snsr, self.surf_accum)
+        _scatter_proj(field,        self.field_accum)
+        # Keep combined accum in sync for measured_radiant_exposure_J / density map.
+        np.add(self.surf_accum, self.field_accum, out=self.accum)
+        self.n_rays_accumulated += n
+
     def render_batch(self, n_rays: int, seed: int) -> None:
         # Ray preparation randomness is externalized here: every emissive
         # receives a fresh launch site and axis each batch before tracing.
@@ -833,9 +979,11 @@ class GlslExposureBackend(ExposureBackend):
         if self._gl_ready:
             return  # full path goes here once wired
         if self._mirror is not None:
-            # Track the C++ accumulator so the right pane has something
+            # Track the C++ accumulators so the right pane has something
             # spectrally meaningful to show during calibration testing.
-            self.accum[:] = self._mirror.accum
+            self.accum[:]       = self._mirror.accum
+            self.surf_accum[:]  = self._mirror.surf_accum
+            self.field_accum[:] = self._mirror.field_accum
             self.n_rays_accumulated = self._mirror.n_rays_accumulated
 
 
@@ -1050,7 +1198,7 @@ def _build_frame_config(frame_idx: int,
     Level 4  field regular 128³ + FULL_MARCH + XRAY + depth cull + ridge spline
     Level 5  field kdtree 128³ + FULL_MARCH + XRAY + max ridge + field-heavy
     """
-    MAX_LEVELS = 6
+    MAX_LEVELS = 8
     n_levels = min(n_frames_total, MAX_LEVELS)
     level = frame_idx % max(1, n_levels)
 
@@ -1070,34 +1218,12 @@ def _build_frame_config(frame_idx: int,
         )
 
     schedules: list[FrameConfig] = [
-        # level 0 — aggressive bootstrap (default first frame)
+        # level 0 — fastest baseline: AS_IS cam, coarse regular grid, no extras
         FrameConfig(
             field_capture     = FieldCaptureConfig(
                 enabled=True, grid_kind="regular",
-                nx=128, ny=128, nz=128,
-                capture_strikes=True, max_strikes=1_000_000,
-            ),
-            camera_visibility = CameraVisibilityConfig(
-                camera_vis_mode    = _CAM_VIS_FULL_MARCH,
-                transparent_mode   = _CAM_TRANSP_XRAY,
-                depth_cull_enabled = True,
-                depth_cull_m       = 80.0,
-            ),
-            surface_spline    = SurfaceSplineConfig(enabled=False),
-            parametric_sdf    = ParametricSdfConfig(
-                enabled=True, model="mixed", saddle_amplitude_m=2.0e-3,
-                sphere_radius_m=0.12, neighborhood_margin_uv=8.0e-2,
-            ),
-            integral_split    = _split(dfi=0.25, dsi=0.10, dwp=-0.4),
-            description       = "aggressive bootstrap · field+scatter · FULL_MARCH+XRAY · parametric mixed",
-            detail_level      = 4,
-        ),
-        # level 1 — field capture, regular 64³
-        FrameConfig(
-            field_capture     = FieldCaptureConfig(
-                enabled=True, grid_kind="regular",
-                nx=64, ny=64, nz=64,
-                capture_strikes=True, max_strikes=500_000,
+                nx=48, ny=48, nz=48,
+                capture_strikes=True, max_strikes=200_000,
             ),
             camera_visibility = CameraVisibilityConfig(
                 camera_vis_mode  = _CAM_VIS_AS_IS,
@@ -1106,15 +1232,35 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(enabled=False),
             parametric_sdf    = ParametricSdfConfig(enabled=False),
             integral_split    = _split(),
-            description       = "field regular-64³ · AS_IS cam",
-            detail_level      = 1,
+            description       = "baseline · AS_IS · regular-48³ · no extras",
+            detail_level      = 0,
         ),
-        # level 2 — field 96³ + emissive spline + DIRECT_HIT
+        # level 1 — add parametric saddle on emissive tris + DIRECT_HIT
         FrameConfig(
             field_capture     = FieldCaptureConfig(
                 enabled=True, grid_kind="regular",
-                nx=96, ny=96, nz=96,
-                capture_strikes=True, max_strikes=750_000,
+                nx=64, ny=64, nz=64,
+                capture_strikes=True, max_strikes=350_000,
+            ),
+            camera_visibility = CameraVisibilityConfig(
+                camera_vis_mode  = _CAM_VIS_DIRECT_HIT,
+                transparent_mode = _CAM_TRANSP_BLOCK,
+            ),
+            surface_spline    = SurfaceSplineConfig(enabled=False),
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="saddle", saddle_amplitude_m=1.5e-3,
+                neighborhood_margin_uv=8.0e-2,
+            ),
+            integral_split    = _split(dfi=0.05),
+            description       = "DIRECT_HIT · regular-64³ · parametric saddle",
+            detail_level      = 1,
+        ),
+        # level 2 — parametric sphere + emissive-only spline + DIRECT_HIT
+        FrameConfig(
+            field_capture     = FieldCaptureConfig(
+                enabled=True, grid_kind="regular",
+                nx=80, ny=80, nz=80,
+                capture_strikes=True, max_strikes=500_000,
             ),
             camera_visibility = CameraVisibilityConfig(
                 camera_vis_mode  = _CAM_VIS_DIRECT_HIT,
@@ -1123,17 +1269,20 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=False, ridge_lambda=0.0,
             ),
-            parametric_sdf    = ParametricSdfConfig(enabled=False),
-            integral_split    = _split(dfi=0.10, dsi=0.0),
-            description       = "field 96³ · spline emissive · DIRECT_HIT",
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="sphere", sphere_radius_m=0.12,
+                neighborhood_margin_uv=8.0e-2,
+            ),
+            integral_split    = _split(dfi=0.10),
+            description       = "DIRECT_HIT · regular-80³ · spline emissive · parametric sphere",
             detail_level      = 2,
         ),
-        # level 3 — field kdtree 64³ + full-mesh spline + DIRECT_HIT + XRAY
+        # level 3 — DIRECT_HIT + XRAY + kdtree 64³ + mixed parametric + all spline
         FrameConfig(
             field_capture     = FieldCaptureConfig(
                 enabled=True, grid_kind="kdtree",
                 nx=64, ny=64, nz=64,
-                capture_strikes=True, max_strikes=1_000_000,
+                capture_strikes=True, max_strikes=750_000,
             ),
             camera_visibility = CameraVisibilityConfig(
                 camera_vis_mode  = _CAM_VIS_DIRECT_HIT,
@@ -1142,12 +1291,39 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=True, ridge_lambda=0.0,
             ),
-            parametric_sdf    = ParametricSdfConfig(enabled=False),
-            integral_split    = _split(dfi=0.20, dsi=0.05),
-            description       = "field kdtree-64³ · spline all · DIRECT_HIT+XRAY",
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="mixed", saddle_amplitude_m=2.0e-3,
+                sphere_radius_m=0.12, neighborhood_margin_uv=8.0e-2,
+            ),
+            integral_split    = _split(dfi=0.15, dsi=0.05),
+            description       = "DIRECT_HIT+XRAY · kdtree-64³ · spline all · parametric mixed",
             detail_level      = 3,
         ),
-        # level 4 — FULL_MARCH + depth cull + ridge spline + regular 128³
+        # level 4 — FULL_MARCH + regular 96³ + parametric saddle + depth cull
+        FrameConfig(
+            field_capture     = FieldCaptureConfig(
+                enabled=True, grid_kind="regular",
+                nx=96, ny=96, nz=96,
+                capture_strikes=True, max_strikes=1_000_000,
+            ),
+            camera_visibility = CameraVisibilityConfig(
+                camera_vis_mode    = _CAM_VIS_FULL_MARCH,
+                transparent_mode   = _CAM_TRANSP_BLOCK,
+                depth_cull_enabled = True,
+                depth_cull_m       = 80.0,
+            ),
+            surface_spline    = SurfaceSplineConfig(
+                enabled=True, fit_all_tris=False, ridge_lambda=0.0,
+            ),
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="saddle", saddle_amplitude_m=2.0e-3,
+                neighborhood_margin_uv=8.0e-2,
+            ),
+            integral_split    = _split(dfi=0.20, dsi=0.08, dwp=-0.2),
+            description       = "FULL_MARCH · regular-96³ · emissive spline · parametric saddle · depth 80m",
+            detail_level      = 4,
+        ),
+        # level 5 — FULL_MARCH + regular 128³ + ridge spline + parametric mixed + depth cull
         FrameConfig(
             field_capture     = FieldCaptureConfig(
                 enabled=True, grid_kind="regular",
@@ -1163,12 +1339,15 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=True, ridge_lambda=1.0e-4,
             ),
-            parametric_sdf    = ParametricSdfConfig(enabled=False),
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="mixed", saddle_amplitude_m=2.0e-3,
+                sphere_radius_m=0.12, neighborhood_margin_uv=8.0e-2,
+            ),
             integral_split    = _split(dfi=0.25, dsi=0.10, dwp=-0.3),
-            description       = "FULL_MARCH 128³ · spline ridge 1e-4 · depth 50m",
-            detail_level      = 4,
+            description       = "FULL_MARCH · regular-128³ · spline ridge 1e-4 · parametric mixed · depth 50m",
+            detail_level      = 5,
         ),
-        # level 5 — FULL_MARCH + XRAY + kdtree 128³ + max ridge + field-heavy
+        # level 6 — FULL_MARCH + XRAY + kdtree 128³ + ridge spline + parametric mixed
         FrameConfig(
             field_capture     = FieldCaptureConfig(
                 enabled=True, grid_kind="kdtree",
@@ -1184,10 +1363,37 @@ def _build_frame_config(frame_idx: int,
             surface_spline    = SurfaceSplineConfig(
                 enabled=True, fit_all_tris=True, ridge_lambda=1.0e-3,
             ),
-            parametric_sdf    = ParametricSdfConfig(enabled=False),
-            integral_split    = _split(dfi=0.35, dsi=0.12, dwp=-0.8),
-            description       = "FULL_MARCH kdtree · XRAY · ridge 1e-3 · depth 100m",
-            detail_level      = 5,
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="mixed", saddle_amplitude_m=2.5e-3,
+                sphere_radius_m=0.12, neighborhood_margin_uv=6.0e-2,
+            ),
+            integral_split    = _split(dfi=0.30, dsi=0.12, dwp=-0.6),
+            description       = "FULL_MARCH+XRAY · kdtree-128³ · spline ridge 1e-3 · parametric mixed",
+            detail_level      = 6,
+        ),
+        # level 7 — most expensive: FULL_MARCH + XRAY + kdtree 192³ + max ridge + heavy field
+        FrameConfig(
+            field_capture     = FieldCaptureConfig(
+                enabled=True, grid_kind="kdtree",
+                nx=192, ny=192, nz=192,
+                capture_strikes=True, max_strikes=2_000_000,
+            ),
+            camera_visibility = CameraVisibilityConfig(
+                camera_vis_mode    = _CAM_VIS_FULL_MARCH,
+                transparent_mode   = _CAM_TRANSP_XRAY,
+                depth_cull_enabled = True,
+                depth_cull_m       = 150.0,
+            ),
+            surface_spline    = SurfaceSplineConfig(
+                enabled=True, fit_all_tris=True, ridge_lambda=1.0e-3,
+            ),
+            parametric_sdf    = ParametricSdfConfig(
+                enabled=True, model="mixed", saddle_amplitude_m=3.0e-3,
+                sphere_radius_m=0.12, neighborhood_margin_uv=5.0e-2,
+            ),
+            integral_split    = _split(dfi=0.40, dsi=0.15, dwp=-0.8),
+            description       = "FULL_MARCH+XRAY · kdtree-192³ · spline max ridge · parametric mixed · deep",
+            detail_level      = 7,
         ),
     ]
     return schedules[level]
@@ -1400,7 +1606,7 @@ class ExposureSession:
                  sensor_film_slots: Optional[list[tuple[int, int]]] = None,
                  save_files: bool = False,
                  bdpt_intermediate_mode: str = "file",
-                 bdpt_intermediate_max_bytes: int = 20 * 1024 * 1024 * 1024,
+                 bdpt_intermediate_max_bytes: int = 0,
                  retain_bdpt_intermediate: bool = False,
                  bdpt_intermediate_dir: Optional[str] = None):
         self.optics = optics
@@ -1500,6 +1706,8 @@ class ExposureSession:
         
         print(f"  [sensor_film] loaded {len(self._sensor_film_db._sensor_order)} sensors, "
               f"{len(self._sensor_film_db._film_order)} films, {sum(1 for m in self._sensor_film_metadata if m['active'])} active slots")
+        self._sensor_film_lock = threading.Lock()
+
         if self.integrator == "bdpt":
             cap_gb = (self.bdpt_records_cap * _BDPT_RECORD_BYTES) / float(1024 ** 3)
             print(f"  [bdpt] records cap={self.bdpt_records_cap:_} (~{cap_gb:.2f} GiB payload)")
@@ -1526,6 +1734,37 @@ class ExposureSession:
         self._last_bdpt_records_is_temp: bool = False
         self._last_bdpt_emit_counts: Optional[np.ndarray] = None
         self._bdpt_emit_rays_total: Optional[np.ndarray] = None
+
+    def swap_sensor_film_slot(self, slot_idx: int, sensor_delta: int = 0, film_delta: int = 0) -> dict:
+        """Cycle sensor and/or film on slot_idx by delta steps (wraps around).
+        Returns the new metadata dict for the slot."""
+        n_sensors = len(self._sensor_film_db._sensor_order)
+        n_films   = len(self._sensor_film_db._film_order)
+        if n_sensors == 0 or n_films == 0:
+            return {}
+        with self._sensor_film_lock:
+            s_id, f_id = self.sensor_film_slots[slot_idx]
+            if s_id < 0: s_id = 0
+            if f_id < 0: f_id = 0
+            s_id = (s_id + sensor_delta) % n_sensors
+            f_id = (f_id + film_delta)   % n_films
+            self.sensor_film_slots[slot_idx] = (s_id, f_id)
+            sensor_name = self._sensor_film_db._sensor_order[s_id]
+            film_name   = self._sensor_film_db._film_order[f_id]
+            sensor_record = self._sensor_film_tensors['sensor'][s_id]
+            meta = {
+                "slot_id": slot_idx,
+                "sensor_id": s_id,
+                "sensor_name": sensor_name,
+                "film_id": f_id,
+                "film_name": film_name,
+                "active": True,
+                "qe_peak": float(sensor_record[8]),
+                "read_noise_e": float(sensor_record[10]),
+                "dark_current_e_s": float(sensor_record[11]),
+            }
+            self._sensor_film_metadata[slot_idx] = meta
+        return meta
 
     def _release_last_bdpt_records(self) -> None:
         arr = self._last_bdpt_records
@@ -1723,35 +1962,64 @@ class ExposureSession:
                     depth_cull_enabled = bool(cv.depth_cull_enabled),
                     depth_cull_m       = float(cv.depth_cull_m),
                 )
+            if self.profile_enabled and hasattr(cpp_b.tracer, "set_profile_pulse"):
+                try:
+                    cpp_b.tracer.set_profile_pulse(True, 2.0)
+                except Exception as exc:
+                    print(f"  [warn] native profile pulse enable failed: {exc}")
             fc = frame_cfg.field_capture
             if fc.enabled and hasattr(cpp_b.tracer, "enable_field_capture_regular"):
                 bmin = np.asarray(scene.bounds_min, np.float32)
                 bmax = np.asarray(scene.bounds_max, np.float32)
-                if fc.grid_kind == "kdtree" and hasattr(cpp_b.tracer, "enable_field_capture_kdtree"):
-                    nodes = [{
-                        "bmin": bmin,
-                        "bmax": bmax,
-                        "child_lo": -1,
-                        "child_hi": -1,
-                        "split_axis": -1,
-                        "split_pos": 0.0,
-                        "leaf_dims": np.asarray([fc.nx, fc.ny, fc.nz], np.int32),
-                        "first_data": 0,
-                    }]
-                    cpp_b.tracer.enable_field_capture_kdtree(
-                        nodes,
-                        capture_strikes=bool(fc.capture_strikes),
-                        max_strikes=int(fc.max_strikes),
-                        clear_existing=True,
+                n_bands = int(getattr(cpp_b, "n_bands", int(np.asarray(self.freq_hz).size)))
+                n_cells = int(max(1, int(fc.nx)) * max(1, int(fc.ny)) * max(1, int(fc.nz)))
+                est_field_bytes = int(n_cells * max(1, n_bands) * 8)
+                est_field_mib = float(est_field_bytes) / float(1024 ** 2)
+                if self.profile_enabled:
+                    print(
+                        "  [field_capture] "
+                        f"kind={fc.grid_kind} dims={int(fc.nx)}x{int(fc.ny)}x{int(fc.nz)} "
+                        f"bands={n_bands} est_field={est_field_mib:.2f} MiB "
+                        f"capture_strikes={bool(fc.capture_strikes)} max_strikes={int(fc.max_strikes)}"
                     )
-                else:
-                    cpp_b.tracer.enable_field_capture_regular(
-                        int(fc.nx), int(fc.ny), int(fc.nz),
-                        bmin, bmax,
-                        capture_strikes=bool(fc.capture_strikes),
-                        max_strikes=int(fc.max_strikes),
-                        clear_existing=True,
+                    print(
+                        "                  "
+                        f"bounds min={np.asarray(bmin, dtype=np.float32).tolist()} "
+                        f"max={np.asarray(bmax, dtype=np.float32).tolist()}"
                     )
+                try:
+                    if fc.grid_kind == "kdtree" and hasattr(cpp_b.tracer, "enable_field_capture_kdtree"):
+                        nodes = [{
+                            "bmin": bmin,
+                            "bmax": bmax,
+                            "child_lo": -1,
+                            "child_hi": -1,
+                            "split_axis": -1,
+                            "split_pos": 0.0,
+                            "leaf_dims": np.asarray([fc.nx, fc.ny, fc.nz], np.int32),
+                            "first_data": 0,
+                        }]
+                        cpp_b.tracer.enable_field_capture_kdtree(
+                            nodes,
+                            capture_strikes=bool(fc.capture_strikes),
+                            max_strikes=int(fc.max_strikes),
+                            clear_existing=True,
+                        )
+                    else:
+                        cpp_b.tracer.enable_field_capture_regular(
+                            int(fc.nx), int(fc.ny), int(fc.nz),
+                            bmin, bmax,
+                            capture_strikes=bool(fc.capture_strikes),
+                            max_strikes=int(fc.max_strikes),
+                            clear_existing=True,
+                        )
+                except Exception as exc:
+                    detail = (
+                        "field capture gate failed: "
+                        f"gate=enable_field_capture_{fc.grid_kind} "
+                        f"native_error={exc}"
+                    )
+                    raise RuntimeError(detail) from exc
             backends["cpp"] = cpp_b
         if "glsl" in self.backends_requested:
             backends["glsl"] = GlslExposureBackend(
@@ -1781,7 +2049,7 @@ class ExposureSession:
         except Exception as e:
             print(f"  [warn] sensor_film_ssbo upload failed: {e}")
 
-    def _configure_default_wave_contexts(self, tracer: Any, cam: PinholeCamera) -> None:
+    def _configure_default_wave_contexts(self, tracer: Any, cam: PinholeCamera, solved: Any | None = None) -> None:
         """Install default wave contexts so kernel wave path is active in BDPT."""
         if tracer is None:
             raise RuntimeError("wave context configuration requires a live tracer")
@@ -1794,15 +2062,37 @@ class ExposureSession:
         cam_pos = np.asarray(cam.pos, np.float64)
         cam_fwd = np.asarray(cam.fwd, np.float64)
         cam_fwd = cam_fwd / max(1.0e-12, float(np.linalg.norm(cam_fwd)))
-        focal_m = float(np.linalg.norm(np.asarray(scene_mod.SCENE_CENTER, np.float64) - cam_pos))
-        aperture_center = cam_pos + cam_fwd * max(1.0e-3, focal_m)
-        aperture_radius_m = max(1.0e-6, float(self.optics.aperture_mm) * 0.5e-3)
+        focus_m = float(np.linalg.norm(np.asarray(scene_mod.SCENE_CENTER, np.float64) - cam_pos))
+        focal_len_m = max(1.0e-4, float(self.optics.focal_mm) * 1.0e-3)
+        phase_scale = 1.0
+        lens_tube_len_m = 0.05
+        if solved is not None:
+            focus_m = float(max(1.0e-3, solved.sanity_input.focus_distance_m))
+            lens_tube_len_m = float(abs(solved.sanity_input.sensor_plane_z_m - solved.sanity_input.lens_center_z_m))
+            phase_scale += min(2.0, max(0.0, float(solved.sanity_report.error_degree.overall)))
+
+        aperture_center = cam_pos + cam_fwd * max(1.0e-3, focus_m)
+        aperture_radius_m = max(1.0e-6, focal_len_m / max(2.0 * float(self.optics.f_number), 1.0e-6))
 
         wave_kind = int(getattr(_sk, "SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ", 1))
+        thin_kind = int(getattr(_sk, "SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM", 2))
         thick_kind = int(getattr(_sk, "SCALE_CONTEXT_KIND_THICK_LENS_WAVE", 3))
         rt_wave = int(getattr(_sk, "RT_SCALE_WAVE", 1))
 
-        wave_payload = np.asarray([max(1.0e-3, focal_m)], dtype=np.float64)
+        thin_payload = np.asarray([focal_len_m], dtype=np.float64)
+        tracer.add_scale_context(
+            pos=aperture_center.astype(np.float64),
+            radius=float(max(aperture_radius_m * 1.2, 1.0e-4)),
+            scale_type=rt_wave,
+            dt_m=float(max(1.0e-4, aperture_radius_m * 0.08)),
+            n_substeps=2,
+            n_real=1.0,
+            n_imag=0.0,
+            context_kind=thin_kind,
+            payload=thin_payload,
+        )
+
+        wave_payload = np.asarray([focal_len_m], dtype=np.float64)
         tracer.add_scale_context(
             pos=aperture_center.astype(np.float64),
             radius=float(max(aperture_radius_m * 1.5, 1.0e-4)),
@@ -1815,7 +2105,20 @@ class ExposureSession:
             payload=wave_payload,
         )
 
-        thick_payload = np.asarray([max(1.0e-3, focal_m), 1.0], dtype=np.float64)
+        tube_center = aperture_center - cam_fwd * max(1.0e-3, 0.5 * lens_tube_len_m)
+        tracer.add_scale_context(
+            pos=tube_center.astype(np.float64),
+            radius=float(max(aperture_radius_m * 1.1, 1.0e-4)),
+            scale_type=rt_wave,
+            dt_m=float(max(1.0e-4, lens_tube_len_m * 0.1)),
+            n_substeps=2,
+            n_real=1.0,
+            n_imag=0.0,
+            context_kind=wave_kind,
+            payload=wave_payload,
+        )
+
+        thick_payload = np.asarray([focal_len_m, phase_scale], dtype=np.float64)
         tracer.add_scale_context(
             pos=aperture_center.astype(np.float64),
             radius=float(max(aperture_radius_m * 2.0, 1.0e-4)),
@@ -1837,29 +2140,33 @@ class ExposureSession:
 
     def _make_integral_objects(self,
                                backend: str,
-                               accum_bhw: np.ndarray,
+                               surf_bhw: np.ndarray,
+                               field_bhw: np.ndarray,
                                gain: float,
                                integral_split: Optional[IntegralSplitConfig] = None
                                ) -> tuple[FieldIntegralObject,
                                           SurfaceIntegralObject,
                                           np.ndarray,
                                           np.ndarray]:
-        """Build field/surface integral objects and return merged band tensor."""
+        """Build field/surface integral objects from separated BDPT accumulators.
+
+        surf_bhw  — (n_bands, H, W) sensor-hit accumulation (surf_accum).
+        field_bhw — (n_bands, H, W) ambient/field accumulation (field_accum).
+        Both are produced by scatter_bdpt_records() per batch.
+        """
         cfg = integral_split if integral_split is not None else self.integral_split
-        a = np.asarray(accum_bhw, np.float64) * float(gain)
+        s = np.asarray(surf_bhw,  np.float64) * float(gain)
+        f = np.asarray(field_bhw, np.float64) * float(gain)
 
         fi = float(np.clip(cfg.field_integrate_frac, 0.0, 1.0))
         fb = float(np.clip(cfg.field_bookkeep_frac, 0.0, 1.0))
         si = float(np.clip(cfg.surface_integrate_frac, 0.0, 1.0))
         sb = float(np.clip(cfg.surface_bookkeep_frac, 0.0, 1.0))
 
-        # A light-touch branch: field tracks diffuse/global energy envelope,
-        # surface tracks direct projected sensor-space accumulation.
-        band_mean = a.mean(axis=(1, 2), keepdims=True)
-        field_integrated = fi * np.broadcast_to(band_mean, a.shape)
-        field_bookkeep = fb * np.maximum(0.0, a - field_integrated)
-        surf_integrated = si * np.maximum(0.0, a - field_integrated)
-        surf_bookkeep = sb * np.maximum(0.0, a - surf_integrated)
+        field_integrated = fi * f
+        field_bookkeep   = fb * np.maximum(0.0, f - field_integrated)
+        surf_integrated  = si * s
+        surf_bookkeep    = sb * np.maximum(0.0, s - surf_integrated)
 
         field_obj = FieldIntegralObject(
             backend=backend,
@@ -1894,7 +2201,9 @@ class ExposureSession:
         """Soft-knee tone mapper that preserves low-light separation."""
         cfg = integral_split if integral_split is not None else self.integral_split
         x = np.maximum(0.0, np.asarray(rgb_linear, np.float32))
-        white = float(np.percentile(x, float(np.clip(cfg.hdr_white_percentile, 75.0, 100.0))))
+        nz = x[x > 0.0]
+        pct = float(np.clip(cfg.hdr_white_percentile, 75.0, 100.0))
+        white = float(np.percentile(nz, pct)) if nz.size >= 16 else float(x.max())
         white = max(white, 1.0e-8)
         y = np.log1p(x / white * 6.0) / math.log1p(6.0)
         return np.clip(y, 0.0, 1.0).astype(np.float32)
@@ -1984,7 +2293,8 @@ class ExposureSession:
         gain = float(self._train_emissivity_gain(measured, float(plan.target_H_J)))
         field_obj, surface_obj, _merged_bands, rgb_linear = self._make_integral_objects(
             backend_name,
-            back.accum,
+            back.surf_accum,
+            back.field_accum,
             gain,
             frame_cfg.integral_split,
         )
@@ -1994,7 +2304,8 @@ class ExposureSession:
         sensor_rgb: Optional[np.ndarray] = None
         if include_sensor:
             tracer_obj = getattr(back, "tracer", None)
-            sensor_obj = self._make_sensor_integral(backend_name, gain, tracer_obj)
+            sensor_obj = self._make_sensor_integral(backend_name, gain, tracer_obj,
+                                                    surf_accum=back.surf_accum)
             if sensor_obj is not None:
                 sensor_rgb = self._sensor_display_rgb(sensor_obj)
                 if self.rgb_source == "sensor":
@@ -2041,7 +2352,8 @@ class ExposureSession:
             )
         return out
 
-    def _make_sensor_integral(self, backend: str, gain: float, tracer: Any = None) -> Optional[SensorIntegralObject]:
+    def _make_sensor_integral(self, backend: str, gain: float, tracer: Any = None,
+                               surf_accum: Optional[np.ndarray] = None) -> Optional[SensorIntegralObject]:
         """Create a SensorIntegralObject from endpoint-derived accumulation (T4).
 
         Primary path is now C++ reduction when available; Python fallback keeps
@@ -2068,32 +2380,36 @@ class ExposureSession:
             if self._sensor_group_id < 0:
                 print("  [warn] sensor group not registered; sensor integral unavailable")
                 return None
-            
-            # Obstacle list note:
-            # 1) Canonical endpoint->color path is now C++ (wired in render loop).
-            # 2) Reduction telemetry (drops/order) is emitted by C++ reducer.
-            # 3) Absolute-energy normalization remains target-photon driven.
-            # 4) Python fallback remains for compatibility only.
-            # 5) Per-call allocation hotspots remain in fallback branch.
-            # 6) Multi-slot fusion remains equal-weighted (no confidence model).
 
-            # Real endpoint-driven coherent accumulation from PIXEL_CONE records.
-            sensor_img = aggregate_to_image_pixel_cone(
-                self._last_bdpt_records,
-                n_bands=int(self.freq_hz.shape[0]),
-                n_px=int(self.width),
-                n_py=int(self.height),
-                sensor_group_id=int(self._sensor_group_id),
-            )
+            # In streaming BDPT mode surf_accum holds the full accumulated
+            # scatter of every batch.  Use it directly instead of the
+            # single-batch _last_bdpt_records, which is too sparse.
+            if surf_accum is not None and surf_accum.size > 0 and np.any(surf_accum):
+                # surf_accum is (n_bands, H, W) of per-band amplitude magnitude.
+                # Sum across bands for total intensity proxy.
+                endpoint_intensity = surf_accum.sum(axis=0, dtype=np.float32)
+                endpoint_intensity = endpoint_intensity.astype(np.float32, copy=False)
+                endpoint_intensity *= float(max(gain, 0.0) ** 2)
+            else:
+                # Fallback: derive from _last_bdpt_records when surf_accum
+                # is unavailable (non-streaming paths only).
+                if self._last_bdpt_records is None or self._last_bdpt_records.size == 0:
+                    print("  [warn] no bdpt endpoint records available; sensor integral unavailable")
+                    return None
 
-            if sensor_img.size == 0:
-                print("  [warn] empty sensor image after endpoint aggregation")
-                return None
-
-            # Intensity proxy from coherent amplitude: sum_b |A_b|^2, then exposure gain.
-            endpoint_intensity = np.sum(np.abs(sensor_img) ** 2, axis=0, dtype=np.float32)
-            endpoint_intensity = endpoint_intensity.astype(np.float32, copy=False)
-            endpoint_intensity *= float(max(gain, 0.0) ** 2)
+                sensor_img = aggregate_to_image_pixel_cone(
+                    self._last_bdpt_records,
+                    n_bands=int(self.freq_hz.shape[0]),
+                    n_px=int(self.width),
+                    n_py=int(self.height),
+                    sensor_group_id=int(self._sensor_group_id),
+                )
+                if sensor_img.size == 0:
+                    print("  [warn] empty sensor image after endpoint aggregation")
+                    return None
+                endpoint_intensity = np.sum(np.abs(sensor_img) ** 2, axis=0, dtype=np.float32)
+                endpoint_intensity = endpoint_intensity.astype(np.float32, copy=False)
+                endpoint_intensity *= float(max(gain, 0.0) ** 2)
 
             mean_intensity = float(np.mean(endpoint_intensity))
             target_photons = float(max(self._last_target_photons_per_pixel, 0.0))
@@ -2103,7 +2419,13 @@ class ExposureSession:
                 photons_per_pixel = endpoint_intensity.copy()
             photons_per_pixel = photons_per_pixel.astype(np.float32, copy=False)
 
-            if tracer is not None and hasattr(tracer, "reduce_endpoint_records_to_sensor_integral"):
+            if (tracer is not None
+                    and hasattr(tracer, "reduce_endpoint_records_to_sensor_integral")
+                    and self._last_bdpt_emit_counts is None):
+                # Only use the C++ per-record reducer in non-streaming mode.
+                # In streaming mode surf_accum already holds the full
+                # accumulated scatter from all batches; no need to re-reduce
+                # the last (sparse) batch.
                 cpp_result = tracer.reduce_endpoint_records_to_sensor_integral(
                     self._last_bdpt_records,
                     int(self.width),
@@ -2345,7 +2667,16 @@ class ExposureSession:
         with self._profiler.section("build_scene"):
             scene = _build_tracer_scene(t, scene_mode=scene_mode)
         with self._profiler.section("build_camera"):
-            cam   = PinholeCamera.looking_at_scene(self.width, self.height, self.optics)
+            solved = solve_sane_pinhole_camera(
+                camera_cls=PinholeCamera,
+                width=self.width,
+                height=self.height,
+                optics=self.optics,
+                film=self.film,
+                scene_center=np.asarray(scene_mod.SCENE_CENTER, np.float64),
+                eye=np.array([0.0, 0.0, 0.0], np.float64),
+            )
+            cam = solved.camera
         with self._profiler.section("build_plan"):
             plan  = self._build_plan(scene)
         with self._profiler.section("build_backends"):
@@ -2391,6 +2722,15 @@ class ExposureSession:
               f"photons={photons_per_pix:.3e} @ λ={plan.ref_wavelength_nm:.0f} nm")
         print(f"  shutter t            : {self.film.exposure_time_s:.4g} s @ "
               f"f/{self.optics.f_number:.2f}, ISO {self.film.iso:.0f}")
+        print(f"  cam sanity           : {solved.sanity_report.status.upper()}"
+              f"  coc={solved.sanity_report.circle_of_confusion_um:.2f} um"
+              f"  sensor_adjust={solved.sanity_report.sensor_adjustment_needed_mm:+.2f} mm"
+              f"  err={solved.sanity_report.error_degree.overall:.3f}"
+              f"  iter={solved.iterations}")
+        if solved.sanity_report.warnings:
+            print("  cam warnings         : " + " | ".join(solved.sanity_report.warnings))
+        if solved.sanity_report.failures:
+            print("  cam failures         : " + " | ".join(solved.sanity_report.failures))
 
         # ── Sub-batch streaming loop ─────────────────────────────────────
         # rays_per_batch in plan is per-pixel·n_pixels = per-frame ray budget /
@@ -2428,86 +2768,12 @@ class ExposureSession:
         if conv_drive_batches:
             print("  [conv] acquisition mode: open-ended batches until exposure target is met")
 
-        t0 = time.perf_counter()
-        batches_executed = 0
-        converged_early = False
-        b_idx = 0
-        while True:
-            if not conv_drive_batches and b_idx >= plan.n_batches:
-                break
-            if conv_drive_batches and conv_max_batches > 0 and b_idx >= conv_max_batches:
-                print(f"  [conv] reached max_batches={conv_max_batches}; stopping acquisition")
-                break
-
-            seed = (self._rng_seed * 1_000_003) + b_idx + 1
-            for back in backs.values():
-                back.render_batch(rays_per_source_per_batch, seed)
-            batches_executed = b_idx + 1
-
-            if batch_preview_cb is not None:
-                try:
-                    n_batches_hint = -1 if conv_drive_batches else int(plan.n_batches)
-                    snaps = self.stream_integration_snapshots(
-                        backs=backs,
-                        plan=plan,
-                        frame_cfg=frame_cfg,
-                        batch_index=int(b_idx + 1),
-                    )
-                    batch_preview_cb(
-                        backs,
-                        snaps,
-                        int(b_idx + 1),
-                        int(n_batches_hint),
-                        float(time.perf_counter() - t0),
-                    )
-                except Exception as exc:
-                    print(f"  [warn] batch preview callback failed: {exc}")
-                    batch_preview_cb = None
-
-            progress_every = 10 if conv_drive_batches else max(1, plan.n_batches // 10)
-            if (b_idx + 1) % progress_every == 0:
-                elapsed = time.perf_counter() - t0
-                if conv_drive_batches:
-                    print(f"    batch {b_idx+1:>5}  elapsed={elapsed:6.2f}s")
-                else:
-                    pct = 100.0 * (b_idx + 1) / plan.n_batches
-                    print(f"    batch {b_idx+1:>5}/{plan.n_batches}  "
-                          f"({pct:5.1f}%)  elapsed={elapsed:6.2f}s")
-
-            if conv_enabled and ((b_idx + 1) % conv_every) == 0:
-                conv_back = _convergence_backend()
-                if conv_back is not None:
-                    measured_H_J = float(conv_back.measured_radiant_exposure_J(plan.energy_per_ray_J))
-                    target_H_J = max(float(plan.target_H_J), 1.0e-30)
-                    conv_last_measured_pct = 100.0 * measured_H_J / target_H_J
-                    conv_last_pct = 100.0 * abs(measured_H_J - target_H_J) / target_H_J
-                    if (b_idx + 1) >= conv_min_batches and conv_last_pct <= (conv_error_target * 100.0):
-                        conv_consecutive_hits += 1
-                    else:
-                        conv_consecutive_hits = 0
-                    if conv_consecutive_hits >= conv_hold:
-                        converged_early = True
-                        print(f"  [conv] reached H={measured_H_J:.3e} J "
-                              f"({conv_last_measured_pct:.5f}% of target) at batch {b_idx+1}")
-                        print(f"         target H={target_H_J:.3e} J, "
-                              f"error<={conv_error_target:.3e}, hold={conv_hold}")
-                        break
-            b_idx += 1
-
-        elapsed = time.perf_counter() - t0
-        if converged_early:
-            if conv_drive_batches:
-                print(f"  [conv] stop after {batches_executed} open-ended batches")
-            else:
-                print(f"  [conv] early stop after {batches_executed}/{plan.n_batches} batches")
-        print(f"  {batches_executed} batches in {elapsed:.2f}s "
-              f"({(batches_executed/max(elapsed,1e-9)):.1f} batches/s)")
-
-        # ── Optional bidirectional pass ──────────────────────────────────
-        # Per the integrator-rewrite directive: complex EndpointRecords are
-        # written verbatim, no abs(), no quantize, no band collapse.
-        # We register both EMISSIVE and SENSOR groups here so the camera
-        # PIXEL_CONE path is active by default for exposure calibration.
+        # ── BDPT pre-batch registration ──────────────────────────────────
+        # Register emissive/sensor tri-groups once before the batch loop so
+        # that each per-batch bidirectional_packed call sees a stable topology.
+        _bdpt_stream_active = False
+        _bdpt_emitter_centers: np.ndarray = np.zeros((0, 3), np.float64)
+        _bdpt_target_total: int = 0
         if self.integrator == "bdpt" and "cpp" in backs:
             cpp_back = backs["cpp"]  # type: ignore[assignment]
             tracer = getattr(cpp_back, "tracer", None)
@@ -2651,8 +2917,7 @@ class ExposureSession:
                     np.arange(scene.verts.shape[0], dtype=np.int32))
                 sensor_w_m = float(self.optics.sensor_w_mm) * 1.0e-3
                 sensor_h_m = float(self.optics.sensor_h_mm) * 1.0e-3
-                focal_m = float(np.linalg.norm(
-                    np.asarray(scene_mod.SCENE_CENTER, np.float64) - cam.pos))
+                focal_m = max(1.0e-4, float(self.optics.focal_mm) * 1.0e-3)
                 aperture_radius_m = max(0.0, float(self.optics.aperture_mm) * 0.5e-3)
                 self._sensor_group_id = tracer.register_tri_group(
                     role_bits     = 2,
@@ -2673,54 +2938,125 @@ class ExposureSession:
                     },
                 )
                 print(f"  bdpt: sensor group registered with id {self._sensor_group_id}")
-                
-                # Bind sensor/film SSBO before dispatch (T3)
+
+                # Bind sensor/film SSBO before batch dispatch.
                 self._bind_sensor_film_ssbo(tracer)
-                self._configure_default_wave_contexts(tracer, cam)
-                
-                t_bd = time.perf_counter()
-                rays_per_emitter = max(64, self.total_rays //
-                                       max(1, tracer.n_tri_groups()) // 16)
-                n_emit = len(emissive_group_centers)
-                target_total = max(n_emit, int(rays_per_emitter) * max(1, n_emit))
-                if (n_emit > 0 and hasattr(tracer, "bidirectional_packed") and
-                        hasattr(cpp_back, "_allocate_source_rays")):
-                    emit_pos = np.ascontiguousarray(np.asarray(emissive_group_centers, np.float64))
-                    emit_rays = self._allocate_bdpt_emit_rays(
-                        cpp_back=cpp_back,
-                        emitter_centers=emit_pos,
-                        target_total_rays=target_total,
-                        seed=int(self._rng_seed + self._frame_index),
+                self._configure_default_wave_contexts(tracer, cam, solved)
+
+                _bdpt_emitter_centers = (
+                    np.asarray(emissive_group_centers, np.float64)
+                    if emissive_group_centers else np.zeros((0, 3), np.float64)
+                )
+                n_emit_pre = len(emissive_group_centers)
+                _rays_per_emit = max(64, self.total_rays // max(1, tracer.n_tri_groups()))
+                _bdpt_target_total = max(n_emit_pre, int(_rays_per_emit) * max(1, n_emit_pre))
+                _bdpt_stream_active = True
+                print(f"  bdpt: streaming {n_emit_pre} emitter groups, "
+                      f"~{_bdpt_target_total:_} rays/batch target")
+
+        t0 = time.perf_counter()
+        batches_executed = 0
+        converged_early = False
+        b_idx = 0
+        while True:
+            if not conv_drive_batches and b_idx >= plan.n_batches:
+                break
+            if conv_drive_batches and conv_max_batches > 0 and b_idx >= conv_max_batches:
+                print(f"  [conv] reached max_batches={conv_max_batches}; stopping acquisition")
+                break
+
+            seed = (self._rng_seed * 1_000_003) + b_idx + 1
+            if _bdpt_stream_active:
+                _cpp = backs.get("cpp")
+                if _cpp is not None:
+                    _emit_rays = self._allocate_bdpt_emit_rays(
+                        cpp_back=_cpp,
+                        emitter_centers=_bdpt_emitter_centers,
+                        target_total_rays=_bdpt_target_total,
+                        seed=int(seed),
                     )
-                    recs = tracer.bidirectional_packed(
-                        n_rays_per_emitter = np.asarray(emit_rays, np.int32),
-                        max_bounces        = self.max_bounces,
-                        min_amplitude      = 1.0e-3,
-                        seed               = self._rng_seed,
-                        max_records        = self.bdpt_records_cap,
+                    _recs = _cpp.run_bdpt_batch(_emit_rays, seed)
+                    _cpp.scatter_bdpt_records(_recs, self._sensor_group_id)
+                    # Store last batch's records for adaptive allocator only.
+                    # Do NOT call _stage_bdpt_records here — it would overwrite
+                    # the intermediary file every batch (the cause of narrow
+                    # noise bands / blank first frame in streaming BDPT mode).
+                    self._last_bdpt_records = np.ascontiguousarray(_recs, dtype=np.float32)
+                    self._last_bdpt_emit_counts = np.asarray(_emit_rays, np.int32)
+                    for _b in backs.values():
+                        if isinstance(_b, GlslExposureBackend):
+                            _b.surf_accum[:]      = _cpp.surf_accum
+                            _b.field_accum[:]     = _cpp.field_accum
+                            _b.accum[:]           = _cpp.accum
+                            _b.n_rays_accumulated = _cpp.n_rays_accumulated
+            else:
+                for back in backs.values():
+                    back.render_batch(rays_per_source_per_batch, seed)
+                    # Forward-trace path writes into accum only; there is no
+                    # field/surface split available.  Treat all accumulated
+                    # energy as surface so _make_integral_objects has real data.
+                    back.surf_accum[:] = back.accum
+                    # field_accum stays zero — no ambient data in forward mode.
+            batches_executed = b_idx + 1
+
+            if batch_preview_cb is not None:
+                try:
+                    n_batches_hint = -1 if conv_drive_batches else int(plan.n_batches)
+                    snaps = self.stream_integration_snapshots(
+                        backs=backs,
+                        plan=plan,
+                        frame_cfg=frame_cfg,
+                        batch_index=int(b_idx + 1),
                     )
-                    self._last_bdpt_emit_counts = np.asarray(emit_rays, np.int32)
-                    rays_per_emitter = int(np.sum(emit_rays, dtype=np.int64) // max(1, n_emit))
+                    batch_preview_cb(
+                        backs,
+                        snaps,
+                        int(b_idx + 1),
+                        int(n_batches_hint),
+                        float(time.perf_counter() - t0),
+                    )
+                except Exception as exc:
+                    print(f"  [warn] batch preview callback failed: {exc}")
+                    batch_preview_cb = None
+
+            progress_every = 10 if conv_drive_batches else max(1, plan.n_batches // 10)
+            if (b_idx + 1) % progress_every == 0:
+                elapsed = time.perf_counter() - t0
+                if conv_drive_batches:
+                    print(f"    batch {b_idx+1:>5}  elapsed={elapsed:6.2f}s")
                 else:
-                    recs = tracer.bidirectional(
-                        n_rays_per_emitter = rays_per_emitter,
-                        max_bounces        = self.max_bounces,
-                        min_amplitude      = 1.0e-3,
-                        seed               = self._rng_seed,
-                        max_records        = self.bdpt_records_cap,
-                    )
-                    self._last_bdpt_emit_counts = (
-                        np.full((n_emit,), int(rays_per_emitter), dtype=np.int32)
-                        if n_emit > 0 else None
-                    )
-                self._stage_bdpt_records(recs)
-                print(f"  bdpt: {recs.shape[0]:_} EndpointRecords "
-                      f"in {time.perf_counter()-t_bd:.2f}s "
-                      f"(tri_groups={tracer.n_tri_groups()}, "
-                      f"rays/emitter={rays_per_emitter:_})")
-                if int(recs.shape[0]) >= int(self.bdpt_records_cap):
-                    print("  [warn] BDPT record cap reached; endpoint stream may be truncated")
-                    print("         raise --bdpt-records-cap or --bdpt-intermediate-max-gb")
+                    pct = 100.0 * (b_idx + 1) / plan.n_batches
+                    print(f"    batch {b_idx+1:>5}/{plan.n_batches}  "
+                          f"({pct:5.1f}%)  elapsed={elapsed:6.2f}s")
+
+            if conv_enabled and ((b_idx + 1) % conv_every) == 0:
+                conv_back = _convergence_backend()
+                if conv_back is not None:
+                    measured_H_J = float(conv_back.measured_radiant_exposure_J(plan.energy_per_ray_J))
+                    target_H_J = max(float(plan.target_H_J), 1.0e-30)
+                    conv_last_measured_pct = 100.0 * measured_H_J / target_H_J
+                    conv_last_pct = 100.0 * abs(measured_H_J - target_H_J) / target_H_J
+                    if (b_idx + 1) >= conv_min_batches and conv_last_pct <= (conv_error_target * 100.0):
+                        conv_consecutive_hits += 1
+                    else:
+                        conv_consecutive_hits = 0
+                    if conv_consecutive_hits >= conv_hold:
+                        converged_early = True
+                        print(f"  [conv] reached H={measured_H_J:.3e} J "
+                              f"({conv_last_measured_pct:.5f}% of target) at batch {b_idx+1}")
+                        print(f"         target H={target_H_J:.3e} J, "
+                              f"error<={conv_error_target:.3e}, hold={conv_hold}")
+                        break
+            b_idx += 1
+
+        elapsed = time.perf_counter() - t0
+        if converged_early:
+            if conv_drive_batches:
+                print(f"  [conv] stop after {batches_executed} open-ended batches")
+            else:
+                print(f"  [conv] early stop after {batches_executed}/{plan.n_batches} batches")
+        print(f"  {batches_executed} batches in {elapsed:.2f}s "
+              f"({(batches_executed/max(elapsed,1e-9)):.1f} batches/s)")
 
         # ── Build human-readable frame config summary (HUD + JSON) ───────
         fc_s = frame_cfg.field_capture
@@ -2769,9 +3105,10 @@ class ExposureSession:
 
             with self._profiler.section(f"backend_{name}_integrals"):
                 field_obj, surface_obj, _merged_bands, rgb_linear = \
-                    self._make_integral_objects(name, back.accum, gain,
-                                                frame_cfg.integral_split)
-                sensor_obj = self._make_sensor_integral(name, gain, tracer_obj)
+                    self._make_integral_objects(name, back.surf_accum, back.field_accum,
+                                                gain, frame_cfg.integral_split)
+                sensor_obj = self._make_sensor_integral(name, gain, tracer_obj,
+                                                    surf_accum=back.surf_accum)
 
             img = self._tone_map_delicate(rgb_linear, frame_cfg.integral_split)
 
@@ -2783,7 +3120,13 @@ class ExposureSession:
                     print("  [warn] rgb_source=sensor but sensor integral unavailable; using accum RGB")
 
             # Keep EndpointRecord history intact and optionally derive endpoint RGB.
-            if (tracer_obj is not None
+            # In streaming BDPT mode _last_bdpt_records holds only the final
+            # batch — not the full session.  Endpoint-RGB reduction on a single
+            # sparse batch produces noise.  Skip it; rgb_linear already carries
+            # the fully-accumulated surf_accum/field_accum result.
+            _streaming_bdpt = self._last_bdpt_emit_counts is not None
+            if (not _streaming_bdpt
+                and tracer_obj is not None
                 and hasattr(tracer_obj, "reduce_endpoint_records_to_rgb_image")
                 and self._last_bdpt_records is not None
                 and self._last_bdpt_records.size > 0
@@ -3150,13 +3493,13 @@ def _run_viewer(session: ExposureSession, n_frames: int,
         return img
 
     def _mode_image_for_snapshot(mode: str,
-                                 snap: IntegrationSnapshot,
-                                 fallback_accum: Optional[np.ndarray]) -> tuple[np.ndarray, str]:
+                                 snap: IntegrationSnapshot) -> tuple[np.ndarray, str]:
         if mode == "rgb":
             return np.asarray(snap.image_data, dtype=np.float32), "rgb"
         if mode == "spectral":
-            if fallback_accum is not None:
-                return _spectral_falsecolor(fallback_accum), "spectral-index"
+            src = snap.field_integrated_data
+            if src is not None:
+                return _spectral_falsecolor(src), "spectral-index"
             return _missing_mode_image("spectral"), "missing:spectral-index"
         if mode == "field-rgb":
             rgb = _bands_to_rgb(snap.field_integrated_data, session.freq_hz)
@@ -3206,13 +3549,15 @@ def _run_viewer(session: ExposureSession, n_frames: int,
         return mode_cycle[int(elapsed_s / cycle_s) % len(mode_cycle)]
 
     def _mode_image_for_result(mode: str,
-                               result: ExposureFrameResult,
-                               fallback_accum: Optional[np.ndarray]) -> tuple[np.ndarray, str]:
+                               result: ExposureFrameResult) -> tuple[np.ndarray, str]:
         if mode == "rgb":
             return result.image_data if result.image_data is not None else np.zeros((session.height, session.width, 3), np.float32), "rgb"
         if mode == "spectral":
-            if fallback_accum is not None:
-                return _spectral_falsecolor(fallback_accum), "spectral-index"
+            src = (result.field_integrated_data
+                   if result.field_integrated_data is not None
+                   else result.surface_integrated_data)
+            if src is not None:
+                return _spectral_falsecolor(src), "spectral-index"
             return _missing_mode_image("spectral"), "missing:spectral-index"
         if mode == "field-rgb":
             if result.field_integrated_data is not None:
@@ -3336,34 +3681,95 @@ def _run_viewer(session: ExposureSession, n_frames: int,
         "batch": 0,
         "n_batches": 0,
         "elapsed_s": 0.0,
+        "telemetry_frame": 0,
+        "telemetry_batch": 0,
     }
-    worker_error: Optional[str] = None
+    state_telemetry: dict[str, str] = {
+        "profile": "",
+        "alloc": "",
+    }
+    # Per-backend pre-rendered uint8 image cache: {backend_name: {mode: uint8 HxWx3}}
+    # Worker deposits here; UI reads here — no computation on the main thread.
+    state_images: dict[str, dict[str, np.ndarray]] = {}
+    # Viewer-side UI state (mutated by event loop, read by display)
+    ui_mode_idx: list[int] = [0]        # index into mode_cycle (manual override)
+    ui_cycle_paused: list[bool] = [False]
+    ui_sensor_film_label: list[str] = [""]  # display label for current slot 0 sensor+film
+    # Seed display label from current session state
+    if session._sensor_film_metadata and session._sensor_film_metadata[0].get("active"):
+        m = session._sensor_film_metadata[0]
+        ui_sensor_film_label[0] = f"{m['sensor_name']} / {m['film_name']}"
+    worker_error_summary: Optional[str] = None
+    worker_error_report: Optional[str] = None
+    pulse_stop = threading.Event()
 
     def _render_worker() -> None:
-        nonlocal worker_error
+        nonlocal worker_error_summary, worker_error_report
         try:
             for frame_idx in range(n_frames):
                 if stop_event.is_set():
                     break
+
+                next_telemetry_collect_t = 0.0
 
                 def _on_batch_preview(_backs: dict[str, ExposureBackend],
                                       snapshots: dict[str, IntegrationSnapshot],
                                       batch_idx: int,
                                       n_batches: int,
                                       elapsed_s: float) -> None:
+                    nonlocal next_telemetry_collect_t
                     if n_batches > 0:
                         cadence = max(1, n_batches // 24)
                     else:
                         cadence = 6
                     if n_batches > 0 and batch_idx < n_batches and (batch_idx % cadence) != 0:
                         return
+
+                    now = time.perf_counter()
+                    collect_telemetry = bool(session.profile_enabled) and (now >= next_telemetry_collect_t)
+                    if collect_telemetry:
+                        next_telemetry_collect_t = now + 1.0
+
+                    profile_msg = ""
+                    alloc_msg = ""
+                    if collect_telemetry:
+                        profile_msg = session._profiler.format_report(
+                            prefix=(f"[profile pulse frame={frame_idx+1} "
+                                    f"batch={batch_idx} elapsed={elapsed_s:0.1f}s]")
+                        )
+                        cpp_back = _backs.get("cpp")
+                        tracer_obj = getattr(cpp_back, "tracer", None) if cpp_back is not None else None
+                        if tracer_obj is not None and hasattr(tracer_obj, "allocation_table"):
+                            try:
+                                alloc_msg = str(tracer_obj.allocation_table())
+                            except Exception as exc:
+                                alloc_msg = f"[allocation_table error] {exc}"
+
+                    # Pre-render every display mode as uint16 — no computation on the UI thread.
+                    fresh_images: dict[str, dict[str, np.ndarray]] = {}
+                    for _bname, _snap in snapshots.items():
+                        _per: dict[str, np.ndarray] = {}
+                        for _m in mode_cycle:
+                            try:
+                                _img, _ = _mode_image_for_snapshot(_m, _snap)
+                                _per[_m] = (np.clip(_img, 0.0, 1.0) * 65535.0).astype(np.uint16)
+                            except Exception:
+                                pass
+                        fresh_images[_bname] = _per
+
                     with state_lock:
                         state_snapshots.clear()
                         state_snapshots.update(snapshots)
+                        state_images.update(fresh_images)
                         state_meta["frame"] = int(frame_idx + 1)
                         state_meta["batch"] = int(batch_idx)
                         state_meta["n_batches"] = int(n_batches)
                         state_meta["elapsed_s"] = float(elapsed_s)
+                        if collect_telemetry:
+                            state_meta["telemetry_frame"] = int(frame_idx + 1)
+                            state_meta["telemetry_batch"] = int(batch_idx)
+                            state_telemetry["profile"] = profile_msg
+                            state_telemetry["alloc"] = alloc_msg
 
                 results = session.render_one_exposure(
                     t=float(frame_idx) * 0.5,
@@ -3375,12 +3781,43 @@ def _run_viewer(session: ExposureSession, n_frames: int,
                     state_meta["frame"] = int(frame_idx + 1)
                     state_meta["batch"] = int(state_meta.get("n_batches", 0))
         except Exception as exc:
-            worker_error = str(exc)
+            worker_error_summary = str(exc)
+            worker_error_report = traceback.format_exc()
+            print(f"  [error] render worker failed: {worker_error_summary}", file=sys.stderr, flush=True)
+            if worker_error_report:
+                print(worker_error_report, file=sys.stderr, flush=True)
         finally:
             render_done.set()
 
+    def _telemetry_pulse_worker() -> None:
+        last_signature = ""
+        while not pulse_stop.is_set():
+            with state_lock:
+                t_frame = int(state_meta.get("telemetry_frame", 0))
+                t_batch = int(state_meta.get("telemetry_batch", 0))
+                profile_msg = str(state_telemetry.get("profile", ""))
+                alloc_msg = str(state_telemetry.get("alloc", ""))
+            if profile_msg or alloc_msg:
+                sig = f"{t_frame}:{t_batch}:{len(profile_msg)}:{len(alloc_msg)}"
+                if sig != last_signature:
+                    print(f"[pulse] frame={t_frame} batch={t_batch}", file=sys.stderr, flush=True)
+                    if profile_msg:
+                        print(profile_msg, file=sys.stderr, flush=True)
+                    if alloc_msg:
+                        print(alloc_msg, file=sys.stderr, flush=True)
+                    last_signature = sig
+            pulse_stop.wait(2.0)
+
     worker = threading.Thread(target=_render_worker, name="exposure-render-worker", daemon=True)
     worker.start()
+    pulse_worker: Optional[threading.Thread] = None
+    if session.profile_enabled:
+        pulse_worker = threading.Thread(
+            target=_telemetry_pulse_worker,
+            name="exposure-telemetry-pulse",
+            daemon=True,
+        )
+        pulse_worker.start()
 
     running = True
     t_cycle0 = time.perf_counter()
@@ -3391,31 +3828,74 @@ def _run_viewer(session: ExposureSession, n_frames: int,
             if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
                 running = False
                 break
+            if ev.type == pygame.KEYDOWN:
+                # Mode cycling: left/right step through mode_cycle manually
+                if ev.key == pygame.K_RIGHT:
+                    ui_mode_idx[0] = (ui_mode_idx[0] + 1) % len(mode_cycle)
+                    ui_cycle_paused[0] = True
+                    t_cycle0 = time.perf_counter()
+                elif ev.key == pygame.K_LEFT:
+                    ui_mode_idx[0] = (ui_mode_idx[0] - 1) % len(mode_cycle)
+                    ui_cycle_paused[0] = True
+                    t_cycle0 = time.perf_counter()
+                elif ev.key == pygame.K_SPACE:
+                    ui_cycle_paused[0] = not ui_cycle_paused[0]
+                    if not ui_cycle_paused[0]:
+                        t_cycle0 = time.perf_counter()
+                # Sensor cycling: [ / ] step sensor on slot 0
+                elif ev.key == pygame.K_LEFTBRACKET:
+                    m = session.swap_sensor_film_slot(0, sensor_delta=-1)
+                    if m:
+                        ui_sensor_film_label[0] = f"{m['sensor_name']} / {m['film_name']}"
+                elif ev.key == pygame.K_RIGHTBRACKET:
+                    m = session.swap_sensor_film_slot(0, sensor_delta=+1)
+                    if m:
+                        ui_sensor_film_label[0] = f"{m['sensor_name']} / {m['film_name']}"
+                # Film cycling: - / = step film on slot 0
+                elif ev.key == pygame.K_MINUS:
+                    m = session.swap_sensor_film_slot(0, film_delta=-1)
+                    if m:
+                        ui_sensor_film_label[0] = f"{m['sensor_name']} / {m['film_name']}"
+                elif ev.key in (pygame.K_EQUALS, pygame.K_PLUS):
+                    m = session.swap_sensor_film_slot(0, film_delta=+1)
+                    if m:
+                        ui_sensor_film_label[0] = f"{m['sensor_name']} / {m['film_name']}"
         if not running:
             break
 
         with state_lock:
             snapshots = dict(state_snapshots)
             results = dict(state_results)
+            cached_images = {k: dict(v) for k, v in state_images.items()}
             frame_no = int(state_meta.get("frame", 0))
             batch_idx = int(state_meta.get("batch", 0))
             n_batches = int(state_meta.get("n_batches", 0))
             elapsed_s = float(state_meta.get("elapsed_s", 0.0))
 
-        mode = _current_mode(time.perf_counter() - t_cycle0)
+        # Mode selection: auto-cycle unless paused/manually stepped
+        if ui_cycle_paused[0]:
+            mode = mode_cycle[ui_mode_idx[0] % len(mode_cycle)]
+        else:
+            mode = mode_cycle[int((time.perf_counter() - t_cycle0) / cycle_s) % len(mode_cycle)]
+            ui_mode_idx[0] = mode_cycle.index(mode)
+
         win.fill((12, 12, 18))
 
-        if worker_error:
-            title = f"Render worker error: {worker_error}"
+        if worker_error_summary:
+            title = f"Render worker error: {worker_error_summary}"
         elif n_batches > 0:
             pct = 100.0 * float(batch_idx) / max(1, n_batches)
-            title = f"Exposure {max(1, frame_no)}/{n_frames} - {pct:5.1f}% - mode={mode}"
+            title = f"Exposure {max(1, frame_no)}/{n_frames} - {pct:5.1f}% - [{mode}]{'⏸' if ui_cycle_paused[0] else ''}"
         elif frame_no > 0 and not render_done.is_set():
-            title = f"Exposure {frame_no}/{n_frames} - batch {batch_idx} (open-ended) - mode={mode}"
+            title = f"Exposure {frame_no}/{n_frames} - batch {batch_idx} (open-ended) - [{mode}]{'⏸' if ui_cycle_paused[0] else ''}"
         elif render_done.is_set():
-            title = f"Render complete - mode={mode}"
+            title = f"Render complete - [{mode}]{'⏸' if ui_cycle_paused[0] else ''}"
         else:
-            title = f"Exposure 1/{n_frames} - initializing - mode={mode}"
+            title = f"Exposure 1/{n_frames} - initializing - [{mode}]"
+
+        sf_label = ui_sensor_film_label[0]
+        if sf_label:
+            title += f"  ·  {sf_label}"
 
         win.blit(bigf.render(title, True, (255, 255, 200)), (16, 8))
 
@@ -3424,24 +3904,30 @@ def _run_viewer(session: ExposureSession, n_frames: int,
             y = 40
 
             if name in snapshots:
-                snap = snapshots[name]
-                img, shown_mode = _mode_image_for_snapshot(mode, snap, None)
                 batch_text = (f"{batch_idx}/{n_batches}" if n_batches > 0 else f"{batch_idx}/∞")
+                cycle_hint = "⏸" if ui_cycle_paused[0] else f"↻{cycle_s:.1f}s"
                 info = (f"frame={frame_no}/{n_frames}  batch={batch_text}\n"
                         f"elapsed={elapsed_s:.1f}s\n"
-                        f"view={mode} (cycle {cycle_s:.2f}s) · stream")
-                _blit_image(
-                    img,
-                    (x, y, pane_w, pane_h),
-                    label=f"{name.upper()} LIVE [{shown_mode}]",
-                    info=info,
-                    hud_lines=None,
-                )
+                        f"view={mode} {cycle_hint} · stream")
+                u16 = cached_images.get(name, {}).get(mode)
+                if u16 is not None:
+                    # Worker-rendered uint16 cache — convert to display, no computation.
+                    _blit_image(
+                        u16.astype(np.float32) * (1.0 / 65535.0),
+                        (x, y, pane_w, pane_h),
+                        label=f"{name.upper()} LIVE [{mode}]",
+                        info=info,
+                        hud_lines=None,
+                    )
+                else:
+                    pygame.draw.rect(win, (40, 40, 50), (x, y, pane_w, pane_h))
+                    win.blit(font.render(f"{name.upper()}: rendering…", True, (200, 200, 200)),
+                             (x + 12, y + 12))
                 continue
 
             if name in results:
                 r = results[name]
-                img, shown_mode = _mode_image_for_result(mode, r, None)
+                img, shown_mode = _mode_image_for_result(mode, r)
                 info = (f"N_rays={r.n_rays_emitted:_}\n"
                         f"gain={r.gain_linear:.2e}× ({r.gain_db:+.2f} dB)\n"
                         f"H_meas/targ={r.measured_H_J:.2e}/{r.target_H_J:.2e} J")
@@ -3470,9 +3956,15 @@ def _run_viewer(session: ExposureSession, n_frames: int,
         pygame.time.wait(16)
 
     stop_event.set()
+    pulse_stop.set()
     worker.join(timeout=2.0)
+    if pulse_worker is not None:
+        pulse_worker.join(timeout=1.0)
 
     pygame.quit()
+
+    if worker_error_summary:
+        raise RuntimeError(worker_error_report or worker_error_summary)
 
 
 def _load_png_rgb(path: str) -> Optional[np.ndarray]:

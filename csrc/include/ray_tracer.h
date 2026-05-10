@@ -252,6 +252,27 @@ SK_API RayTracerState* ray_tracer_create(
 SK_API void ray_tracer_destroy(RayTracerState* st);
 
 /**
+ * Return an ASCII table describing RayTracer-owned allocations.
+ *
+ * Includes persistent buffers with programmatic names, purposes, addresses,
+ * used bytes, and reserved bytes. Returned pointer is thread-local storage
+ * valid until the next call on the same thread.
+ */
+SK_API const char* ray_tracer_allocation_table(const RayTracerState* st);
+
+/**
+ * Enable/disable periodic native profiling pulses during active tracing.
+ *
+ * When enabled, the tracer emits progress lines and the allocation table to
+ * stderr at roughly period_s cadence from inside active trace loops.
+ */
+SK_API int ray_tracer_set_profile_pulse(
+    RayTracerState* st,
+    int             enabled,
+    double          period_s
+);
+
+/**
  * Trace rays from all sources and write segments into the output buffer.
  *
  * Each source emits n_rays directions sampled from a Fibonacci sphere,
@@ -720,6 +741,7 @@ typedef struct EndpointReductionTelemetry {
     int32_t input_records;
     int32_t kept_records;
     int32_t drop_wrong_group;
+    int32_t drop_non_pixel_cone;     /* vertex_index < 0: forward/emission record */
     int32_t drop_invalid_band;
     int32_t drop_negative_subpath;
     int32_t drop_out_of_bounds_pixel;

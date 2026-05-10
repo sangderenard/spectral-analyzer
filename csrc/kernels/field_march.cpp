@@ -21,15 +21,53 @@
 #include "field_grid.h"
 #include "serial_kernel.h"
 
+#include <cmath>
+#include <cerrno>
 #include <complex>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <sstream>
+#include <string>
 #include <vector>
 
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 using cd32 = std::complex<float>;
+
+static thread_local std::string g_field_grid_last_error;
+static thread_local int g_field_grid_last_errno = 0;
+
+static inline void fg_set_error(const std::string& msg) {
+    g_field_grid_last_error = msg;
+}
+
+static inline void fg_log_error_to_stderr(const char* gate) {
+    if (g_field_grid_last_error.empty()) return;
+    std::fprintf(stderr, "[field-grid] %s: %s\n", gate, g_field_grid_last_error.c_str());
+    std::fflush(stderr);
+}
+
+static inline void fg_clear_error() {
+    g_field_grid_last_error.clear();
+    g_field_grid_last_errno = 0;
+}
+
+extern "C" SK_API const char* field_grid_last_error(void) {
+    return g_field_grid_last_error.c_str();
+}
 
 static inline bool checked_mul_i64(int64_t a, int64_t b, int64_t& out) {
     if (a < 0 || b < 0) return false;
@@ -68,18 +106,62 @@ struct FieldGrid {
 /* ── Allocation helpers ─────────────────────────────────────────────────── */
 static cd32* _alloc_zero(int64_t n) {
     if (n <= 0) return nullptr;
-    if (n > static_cast<int64_t>(std::numeric_limits<size_t>::max())) return nullptr;
-    cd32* p = static_cast<cd32*>(std::calloc(static_cast<size_t>(n), sizeof(cd32)));
-    return p;
+    if (static_cast<uint64_t>(n) > static_cast<uint64_t>(std::numeric_limits<size_t>::max())) return nullptr;
+    if (static_cast<uint64_t>(n) >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max() / sizeof(cd32))) {
+        return nullptr;
+    }
+    const size_t bytes = static_cast<size_t>(n) * sizeof(cd32);
+    errno = 0;
+    void* raw = std::malloc(bytes);
+    if (!raw) {
+        g_field_grid_last_errno = errno;
+        return nullptr;
+    }
+    std::memset(raw, 0, bytes);
+    return static_cast<cd32*>(raw);
 }
 
 extern "C" SK_API FieldGrid* field_grid_create_regular(
     int n_bands, int nx, int ny, int nz,
     const float bmin[3], const float bmax[3])
 {
-    if (n_bands <= 0 || nx <= 0 || ny <= 0 || nz <= 0) return nullptr;
+    fg_clear_error();
+    if (n_bands <= 0 || nx <= 0 || ny <= 0 || nz <= 0) {
+        std::ostringstream oss;
+        oss << "invalid regular grid shape: n_bands=" << n_bands
+            << " dims=" << nx << "x" << ny << "x" << nz;
+        fg_set_error(oss.str());
+        fg_log_error_to_stderr("field_grid_create_regular");
+        return nullptr;
+    }
+    if (bmin && bmax) {
+        for (int i = 0; i < 3; ++i) {
+            if (!std::isfinite(bmin[i]) || !std::isfinite(bmax[i])) {
+                std::ostringstream oss;
+                oss << "non-finite regular grid bounds at axis " << i
+                    << ": bmin=" << bmin[i] << " bmax=" << bmax[i];
+                fg_set_error(oss.str());
+                fg_log_error_to_stderr("field_grid_create_regular");
+                return nullptr;
+            }
+            if (!(bmax[i] > bmin[i])) {
+                std::ostringstream oss;
+                oss << "invalid regular grid bounds at axis " << i
+                    << ": bmin=" << bmin[i] << " bmax=" << bmax[i]
+                    << " (requires bmax > bmin)";
+                fg_set_error(oss.str());
+                fg_log_error_to_stderr("field_grid_create_regular");
+                return nullptr;
+            }
+        }
+    }
     FieldGrid* g = new (std::nothrow) FieldGrid();
-    if (!g) return nullptr;
+    if (!g) {
+        fg_set_error("FieldGrid allocation failed (new returned null)");
+        fg_log_error_to_stderr("field_grid_create_regular");
+        return nullptr;
+    }
     g->kind = FIELD_GRID_REGULAR;
     g->n_bands = n_bands;
     g->dims[0] = nx; g->dims[1] = ny; g->dims[2] = nz;
@@ -93,12 +175,32 @@ extern "C" SK_API FieldGrid* field_grid_create_regular(
     if (!checked_mul_i64(static_cast<int64_t>(nx), static_cast<int64_t>(ny), nxy)
         || !checked_mul_i64(nxy, static_cast<int64_t>(nz), nxyz)
         || !checked_mul_i64(nxyz, static_cast<int64_t>(n_bands), total_cells)) {
+        std::ostringstream oss;
+        oss << "regular grid cell-count overflow: n_bands=" << n_bands
+            << " dims=" << nx << "x" << ny << "x" << nz;
+        fg_set_error(oss.str());
+        fg_log_error_to_stderr("field_grid_create_regular");
         delete g;
         return nullptr;
     }
     g->n_cells_total = nxyz;
     g->data = _alloc_zero(total_cells);
-    if (!g->data) { delete g; return nullptr; }
+    if (!g->data) {
+        std::ostringstream oss;
+        const size_t req_bytes = static_cast<size_t>(total_cells) * sizeof(cd32);
+        oss << "regular grid data allocation failed: requested "
+            << static_cast<double>(req_bytes) / (1024.0L * 1024.0L) << " MiB"
+            << " (n_bands=" << n_bands
+            << ", dims=" << nx << "x" << ny << "x" << nz << ")";
+        if (g_field_grid_last_errno != 0) {
+            oss << " errno=" << g_field_grid_last_errno
+                << " " << std::strerror(g_field_grid_last_errno);
+        }
+        fg_set_error(oss.str());
+        fg_log_error_to_stderr("field_grid_create_regular");
+        delete g;
+        return nullptr;
+    }
     return g;
 }
 
@@ -106,9 +208,21 @@ extern "C" SK_API FieldGrid* field_grid_create_kdtree(
     int n_bands,
     const KdNode* nodes, int n_nodes)
 {
-    if (n_bands <= 0 || !nodes || n_nodes <= 0) return nullptr;
+    fg_clear_error();
+    if (n_bands <= 0 || !nodes || n_nodes <= 0) {
+        std::ostringstream oss;
+        oss << "invalid kdtree grid input: n_bands=" << n_bands
+            << " nodes=" << (nodes ? n_nodes : 0);
+        fg_set_error(oss.str());
+        fg_log_error_to_stderr("field_grid_create_kdtree");
+        return nullptr;
+    }
     FieldGrid* g = new (std::nothrow) FieldGrid();
-    if (!g) return nullptr;
+    if (!g) {
+        fg_set_error("FieldGrid allocation failed (new returned null)");
+        fg_log_error_to_stderr("field_grid_create_kdtree");
+        return nullptr;
+    }
     g->kind = FIELD_GRID_KDTREE;
     g->n_bands = n_bands;
     g->nodes.assign(nodes, nodes + n_nodes);
@@ -118,6 +232,11 @@ extern "C" SK_API FieldGrid* field_grid_create_kdtree(
     for (auto& nd : g->nodes) {
         if (nd.child_lo < 0) {  /* leaf */
             if (nd.leaf_dims[0] <= 0 || nd.leaf_dims[1] <= 0 || nd.leaf_dims[2] <= 0) {
+                std::ostringstream oss;
+                oss << "kdtree leaf has invalid dims: "
+                    << nd.leaf_dims[0] << "x" << nd.leaf_dims[1] << "x" << nd.leaf_dims[2];
+                fg_set_error(oss.str());
+                fg_log_error_to_stderr("field_grid_create_kdtree");
                 delete g;
                 return nullptr;
             }
@@ -127,6 +246,8 @@ extern "C" SK_API FieldGrid* field_grid_create_kdtree(
             if (!checked_mul_i64(static_cast<int64_t>(nd.leaf_dims[0]), static_cast<int64_t>(nd.leaf_dims[1]), lxy)
                 || !checked_mul_i64(lxy, static_cast<int64_t>(nd.leaf_dims[2]), lc)
                 || !checked_add_i64(total, lc, total_next)) {
+                fg_set_error("kdtree leaf cell-count overflow while flattening nodes");
+                fg_log_error_to_stderr("field_grid_create_kdtree");
                 delete g;
                 return nullptr;
             }
@@ -145,11 +266,31 @@ extern "C" SK_API FieldGrid* field_grid_create_kdtree(
     }
     int64_t total_cells = 0;
     if (!checked_mul_i64(g->n_cells_total, static_cast<int64_t>(n_bands), total_cells)) {
+        std::ostringstream oss;
+        oss << "kdtree total cell-count overflow: n_bands=" << n_bands
+            << " n_cells_total=" << g->n_cells_total;
+        fg_set_error(oss.str());
+        fg_log_error_to_stderr("field_grid_create_kdtree");
         delete g;
         return nullptr;
     }
     g->data = _alloc_zero(total_cells);
-    if (!g->data) { delete g; return nullptr; }
+    if (!g->data) {
+        std::ostringstream oss;
+        const size_t req_bytes = static_cast<size_t>(total_cells) * sizeof(cd32);
+        oss << "kdtree data allocation failed: requested "
+            << static_cast<double>(req_bytes) / (1024.0L * 1024.0L) << " MiB"
+            << " (n_bands=" << n_bands
+            << ", n_cells_total=" << g->n_cells_total << ")";
+        if (g_field_grid_last_errno != 0) {
+            oss << " errno=" << g_field_grid_last_errno
+                << " " << std::strerror(g_field_grid_last_errno);
+        }
+        fg_set_error(oss.str());
+        fg_log_error_to_stderr("field_grid_create_kdtree");
+        delete g;
+        return nullptr;
+    }
     return g;
 }
 
@@ -223,21 +364,49 @@ extern "C" SK_API int field_grid_step_helmholtz_regular(
     const cd32 i_k2dt(0.f, -spec->dt * (spec->k_real * spec->k_real
                                        - spec->k_imag * spec->k_imag));
 
+    const int64_t z_stride = static_cast<int64_t>(nx) * ny;
     for (int step = 0; step < n_steps; ++step) {
+        #pragma omp parallel for schedule(static)
         for (int b = 0; b < g->n_bands; ++b) {
             const cd32* src = g->data     + static_cast<int64_t>(b) * g->n_cells_total;
             cd32*       dst = g->data_alt + static_cast<int64_t>(b) * g->n_cells_total;
-            /* Copy the full band slice so boundary cells in dst start from src
-             * (boundary indices are not updated by the stencil loop). */
-            std::memcpy(dst, src, sizeof(cd32) * static_cast<size_t>(nxyz));
+
+            /* Boundary-only preservation: copy 6 faces instead of full volume. */
+            std::memcpy(dst, src, sizeof(cd32) * static_cast<size_t>(z_stride));
+            std::memcpy(dst + static_cast<int64_t>(nz - 1) * z_stride,
+                        src + static_cast<int64_t>(nz - 1) * z_stride,
+                        sizeof(cd32) * static_cast<size_t>(z_stride));
+
             for (int z = 1; z < nz - 1; ++z) {
+                const int64_t z_base = static_cast<int64_t>(z) * z_stride;
+                std::memcpy(dst + z_base,
+                            src + z_base,
+                            sizeof(cd32) * static_cast<size_t>(nx));
+                std::memcpy(dst + z_base + static_cast<int64_t>(ny - 1) * nx,
+                            src + z_base + static_cast<int64_t>(ny - 1) * nx,
+                            sizeof(cd32) * static_cast<size_t>(nx));
                 for (int y = 1; y < ny - 1; ++y) {
+                    const int64_t row = z_base + static_cast<int64_t>(y) * nx;
+                    dst[row] = src[row];
+                    dst[row + (nx - 1)] = src[row + (nx - 1)];
+                }
+            }
+        }
+
+        #pragma omp parallel for schedule(static)
+        for (int b = 0; b < g->n_bands; ++b) {
+            for (int z = 1; z < nz - 1; ++z) {
+                const cd32* src = g->data     + static_cast<int64_t>(b) * g->n_cells_total;
+                cd32*       dst = g->data_alt + static_cast<int64_t>(b) * g->n_cells_total;
+                const int64_t z_base = static_cast<int64_t>(z) * z_stride;
+                for (int y = 1; y < ny - 1; ++y) {
+                    const int64_t row = z_base + static_cast<int64_t>(y) * nx;
                     for (int x = 1; x < nx - 1; ++x) {
-                        int64_t i = (static_cast<int64_t>(z) * ny + y) * nx + x;
+                        int64_t i = row + x;
                         cd32 c = src[i];
                         cd32 lap = (src[i+1] + src[i-1] - 2.f*c) * dxi2
                                  + (src[i+nx] + src[i-nx] - 2.f*c) * dyi2
-                                 + (src[i+(int64_t)nx*ny] + src[i-(int64_t)nx*ny] - 2.f*c) * dzi2;
+                                 + (src[i+z_stride] + src[i-z_stride] - 2.f*c) * dzi2;
                         dst[i] = c + i_k2dt * c + i_dt * lap;
                     }
                 }
@@ -361,6 +530,61 @@ extern "C" SK_API int field_grid_inject_amplitude(
         else if (in_hi && !in_lo) node_id = hi;
         else if (in_lo) node_id = lo;
         else return SK_OK;
+    }
+    return SK_OK;
+}
+
+extern "C" SK_API int field_grid_inject_amplitude_all_bands(
+    FieldGrid* g,
+    const float pos[3],
+    const float* amp_re,
+    const float* amp_im,
+    int n_bands)
+{
+    if (!g || !pos || !amp_re || !amp_im) return SK_ERR_NULL_STATE;
+    if (n_bands <= 0) return SK_OK;
+    const int nb = std::min(n_bands, g->n_bands);
+
+    if (g->kind == FIELD_GRID_REGULAR) {
+        float u[3];
+        for (int i = 0; i < 3; ++i) {
+            float span = g->bmax[i] - g->bmin[i];
+            if (span <= 0.f) return SK_OK;
+            u[i] = (pos[i] - g->bmin[i]) / span * (g->dims[i] - 1);
+            if (u[i] < 0 || u[i] >= g->dims[i]) return SK_OK;
+        }
+
+        int x0 = static_cast<int>(u[0]); int x1 = (x0 + 1 < g->dims[0]) ? x0 + 1 : x0;
+        int y0 = static_cast<int>(u[1]); int y1 = (y0 + 1 < g->dims[1]) ? y0 + 1 : y0;
+        int z0 = static_cast<int>(u[2]); int z1 = (z0 + 1 < g->dims[2]) ? z0 + 1 : z0;
+        float fx = u[0] - x0, fy = u[1] - y0, fz = u[2] - z0;
+
+        const float w000 = (1-fx)*(1-fy)*(1-fz);
+        const float w100 =    fx *(1-fy)*(1-fz);
+        const float w010 = (1-fx)*   fy *(1-fz);
+        const float w110 =    fx *   fy *(1-fz);
+        const float w001 = (1-fx)*(1-fy)*   fz ;
+        const float w101 =    fx *(1-fy)*   fz ;
+        const float w011 = (1-fx)*   fy *   fz ;
+        const float w111 =    fx *   fy *   fz ;
+
+        for (int b = 0; b < nb; ++b) {
+            cd32 amp(amp_re[b], amp_im[b]);
+            if (w000 > 0.f) g->data[_idx_reg(g, b, x0, y0, z0)] += amp * w000;
+            if (w100 > 0.f) g->data[_idx_reg(g, b, x1, y0, z0)] += amp * w100;
+            if (w010 > 0.f) g->data[_idx_reg(g, b, x0, y1, z0)] += amp * w010;
+            if (w110 > 0.f) g->data[_idx_reg(g, b, x1, y1, z0)] += amp * w110;
+            if (w001 > 0.f) g->data[_idx_reg(g, b, x0, y0, z1)] += amp * w001;
+            if (w101 > 0.f) g->data[_idx_reg(g, b, x1, y0, z1)] += amp * w101;
+            if (w011 > 0.f) g->data[_idx_reg(g, b, x0, y1, z1)] += amp * w011;
+            if (w111 > 0.f) g->data[_idx_reg(g, b, x1, y1, z1)] += amp * w111;
+        }
+        return SK_OK;
+    }
+
+    for (int b = 0; b < nb; ++b) {
+        int rc = field_grid_inject_amplitude(g, b, pos, amp_re[b], amp_im[b]);
+        if (rc != SK_OK) return rc;
     }
     return SK_OK;
 }

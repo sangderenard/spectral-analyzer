@@ -97,6 +97,10 @@ SK_API FieldGrid* field_grid_create_kdtree(
 
 SK_API void field_grid_destroy(FieldGrid* g);
 
+/* Returns the most recent field-grid constructor failure reason for the
+ * calling thread. Empty string means no recorded error. */
+SK_API const char* field_grid_last_error(void);
+
 /* Introspection ---------------------------------------------------------- */
 SK_API int   field_grid_kind     (const FieldGrid* g);
 SK_API int   field_grid_n_bands  (const FieldGrid* g);
@@ -118,6 +122,19 @@ SK_API int field_grid_inject_amplitude(
     FieldGrid* g, int band,
     const float pos[3],
     float amp_re, float amp_im);
+
+/**
+ * Deposit one complex sample for each band at world position pos.
+ * For REGULAR grids this computes trilinear coordinates once and applies
+ * all band deposits, reducing per-band coordinate overhead in hot loops.
+ * For KDTREE grids this falls back to per-band scalar injection.
+ */
+SK_API int field_grid_inject_amplitude_all_bands(
+    FieldGrid* g,
+    const float pos[3],
+    const float* amp_re,
+    const float* amp_im,
+    int n_bands);
 
 /**
  * Return the size in bytes of one full band of a REGULAR grid

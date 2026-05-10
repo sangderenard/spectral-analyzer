@@ -504,6 +504,22 @@ struct PyRayTracer
 
     ~PyRayTracer() { ray_tracer_destroy(handle); handle = nullptr; }
 
+    py::str allocation_table() const
+    {
+        const char* t = ray_tracer_allocation_table(handle);
+        return py::str(t ? t : "");
+    }
+
+    void set_profile_pulse(bool enabled = true, double period_s = 2.0)
+    {
+        int rc = ray_tracer_set_profile_pulse(
+            handle,
+            enabled ? 1 : 0,
+            period_s);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_set_profile_pulse failed: rc=" + std::to_string(rc));
+    }
+
     /**
      * trace(src_pos, src_dir, src_directivity,
      *       n_rays, max_bounces, min_amplitude, seed, out_cap)
@@ -1046,8 +1062,15 @@ struct PyRayTracer
             _n_bands, nx, ny, nz,
             static_cast<const float*>(b0.ptr),
             static_cast<const float*>(b1.ptr));
-        if (!g)
-            throw std::runtime_error("field_grid_create_regular failed");
+        if (!g) {
+            const char* detail = field_grid_last_error();
+            std::string msg = "field_grid_create_regular failed";
+            if (detail && detail[0] != '\0') {
+                msg += ": ";
+                msg += detail;
+            }
+            throw std::runtime_error(msg);
+        }
 
         int rc = ray_tracer_set_field_capture_grid(
             handle, g, 1,
@@ -1092,8 +1115,15 @@ struct PyRayTracer
             _n_bands,
             kd.empty() ? nullptr : kd.data(),
             static_cast<int>(kd.size()));
-        if (!g)
-            throw std::runtime_error("field_grid_create_kdtree failed");
+        if (!g) {
+            const char* detail = field_grid_last_error();
+            std::string msg = "field_grid_create_kdtree failed";
+            if (detail && detail[0] != '\0') {
+                msg += ": ";
+                msg += detail;
+            }
+            throw std::runtime_error(msg);
+        }
 
         int rc = ray_tracer_set_field_capture_grid(
             handle, g, 1,
@@ -3233,6 +3263,10 @@ The tracer deep-copies all inputs; caller buffers can be discarded after return.
                 .def("clear_field_capture", &PyRayTracer::clear_field_capture,
                          py::arg("clear_grid") = true,
                          py::arg("clear_strikes") = true)
+                .def("allocation_table", &PyRayTracer::allocation_table)
+                .def("set_profile_pulse", &PyRayTracer::set_profile_pulse,
+                         py::arg("enabled") = true,
+                         py::arg("period_s") = 2.0)
                 .def("get_field_capture_meta", &PyRayTracer::get_field_capture_meta)
                 .def("get_field_capture_grid_reim", &PyRayTracer::get_field_capture_grid_reim)
                 .def("get_field_capture_strikes", &PyRayTracer::get_field_capture_strikes)
@@ -3646,19 +3680,28 @@ Returns assigned group_id (>= 0).  Raises on failure.
         .def("bidirectional",
              [](PyRayTracer& self, int n_rays_per_emitter, int max_bounces,
                 double min_amplitude, uint32_t seed, int max_records) {
-                 if (max_records <= 0) max_records = 1 << 20; /* 1 Mi */
+                 /* max_records must be set by the caller to the per-batch
+                    worst-case: sum(emit_rays) * (max_bounces + 1).  There is
+                    no silent ceiling here — the caller is responsible for
+                    sizing the buffer correctly. */
+                 if (max_records <= 0)
+                     throw std::invalid_argument("max_records must be > 0");
                  py::array_t<float> recs(
                      {(py::ssize_t)max_records, (py::ssize_t)16});
                  auto buf = recs.mutable_unchecked<2>();
                  EndpointRecord* out = reinterpret_cast<EndpointRecord*>(buf.mutable_data(0, 0));
                  int n_out = 0;
-                 int rc = ray_tracer_bidirectional(
-                     self.handle, n_rays_per_emitter, max_bounces,
-                     min_amplitude, seed, out, max_records, &n_out);
+                 int rc;
+                 {
+                     py::gil_scoped_release release;
+                     rc = ray_tracer_bidirectional(
+                         self.handle, n_rays_per_emitter, max_bounces,
+                         min_amplitude, seed, out, max_records, &n_out);
+                 }
                  if (rc != SK_OK)
                      throw std::runtime_error(
                          "ray_tracer_bidirectional failed: rc=" + std::to_string(rc));
-                 /* Truncate the output array to actual record count. */
+                 /* Trim to actual record count. */
                  py::array_t<float> trimmed(
                      {(py::ssize_t)n_out, (py::ssize_t)16});
                  if (n_out > 0) {
@@ -3684,8 +3727,10 @@ n_rays_per_emitter : light subpaths per registered EMISSIVE TriGroup
 max_bounces        : maximum bounces per subpath
 min_amplitude      : kill threshold on max(|amp|) across bands
 seed               : RNG seed
-max_records        : output buffer cap (default 2**20).  Records beyond this
-             are silently dropped — increase for dense scenes.
+max_records        : exact output buffer size — caller must pass
+                     sum(n_rays_per_emitter) * (max_bounces + 1).
+             No records are silently dropped; the buffer is sized to hold
+             the worst-case output for this batch.
 )doc")
         .def("bidirectional_packed",
              [](PyRayTracer& self,
@@ -3697,22 +3742,28 @@ max_records        : output buffer cap (default 2**20).  Records beyond this
                  auto nr = n_rays_per_emitter.request();
                  if (nr.ndim != 1)
                      throw std::runtime_error("n_rays_per_emitter must be int32 shape (n_emitters,)");
-                 if (max_records <= 0) max_records = 1 << 20;
+                 /* max_records sized by caller: sum(emit_rays)*(max_bounces+1). */
+                 if (max_records <= 0)
+                     throw std::invalid_argument("max_records must be > 0");
                  py::array_t<float> recs(
                      {(py::ssize_t)max_records, (py::ssize_t)16});
                  auto buf = recs.mutable_unchecked<2>();
                  EndpointRecord* out = reinterpret_cast<EndpointRecord*>(buf.mutable_data(0, 0));
                  int n_out = 0;
-                 int rc = ray_tracer_bidirectional_packed(
-                     self.handle,
-                     static_cast<const int32_t*>(nr.ptr),
-                     static_cast<int>(nr.shape[0]),
-                     max_bounces,
-                     min_amplitude,
-                     seed,
-                     out,
-                     max_records,
-                     &n_out);
+                 int rc;
+                 {
+                     py::gil_scoped_release release;
+                     rc = ray_tracer_bidirectional_packed(
+                         self.handle,
+                         static_cast<const int32_t*>(nr.ptr),
+                         static_cast<int>(nr.shape[0]),
+                         max_bounces,
+                         min_amplitude,
+                         seed,
+                         out,
+                         max_records,
+                         &n_out);
+                 }
                  if (rc != SK_OK)
                      throw std::runtime_error(
                          "ray_tracer_bidirectional_packed failed: rc=" + std::to_string(rc));
@@ -3846,6 +3897,7 @@ EMISSIVE TriGroups.
                  metrics["slot_metrics"] = slot_metrics;
                  metrics["kept_records"] = py::int_(telemetry.kept_records);
                  metrics["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
+                 metrics["drop_non_pixel_cone"] = py::int_(telemetry.drop_non_pixel_cone);
                  metrics["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
                  metrics["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
                  metrics["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);
@@ -3918,6 +3970,7 @@ gain    : exposure gain multiplier applied before photon normalisation
                  telemetry_dict["input_records"] = py::int_(telemetry.input_records);
                  telemetry_dict["kept_records"] = py::int_(telemetry.kept_records);
                  telemetry_dict["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
+                 telemetry_dict["drop_non_pixel_cone"] = py::int_(telemetry.drop_non_pixel_cone);
                  telemetry_dict["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
                  telemetry_dict["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
                  telemetry_dict["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);

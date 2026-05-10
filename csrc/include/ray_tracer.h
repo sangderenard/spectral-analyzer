@@ -47,6 +47,87 @@
 #define RT_FLOATS_PER_SEG     12
 #define RT_BYTES_PER_SEG      48
 
+/**
+ * Per-call output statistics filled by ray_tracer_trace and related exported
+ * functions.  Pass a pointer to a zero-initialised struct; the tracer writes
+ * to it on return.  Pass NULL to discard stats.
+ *
+ * segments_written : records actually placed in the output buffer.
+ * segments_dropped : records discarded because the buffer was full (overflow).
+ * total_bounces    : sum of successful ray bounces across all sources/rays.
+ */
+typedef struct {
+    int64_t segments_written;
+    int64_t segments_dropped;
+    int64_t total_bounces;
+} RtTraceStats;
+
+/* Forward declaration — full definition follows below. */
+typedef struct RayTracerState RayTracerState;
+
+/**
+ * C function-pointer callback for streaming segment records.
+ *
+ * @param records    Flat float32 array: n_records × RT_FLOATS_PER_SEG floats.
+ * @param n_records  Number of records in this batch.
+ * @param user       Caller-provided opaque context pointer.
+ * @return           0 to continue tracing; non-zero to request early stop.
+ *
+ * Thread context: called from the same thread as ray_tracer_trace_callback,
+ * single-threaded.  Do not call back into the tracer from within the callback.
+ */
+typedef int (*RtSegmentCallback)(
+    const float* records,
+    int          n_records,
+    void*        user);
+
+/**
+ * Callback-based streaming ray trace.
+ *
+ * Identical physics to ray_tracer_trace(), but instead of writing into a
+ * pre-allocated flat buffer, calls `cb(records, n, user)` whenever the
+ * internal flush buffer accumulates flush_records records.  A final flush
+ * is performed after the last ray regardless of count.
+ *
+ * Suitable for scenes where the total segment count is not known in advance
+ * or may exceed available RAM — the callback can stream to disk, accumulate
+ * into a ChunkedMemorySink, or consume records on-the-fly.
+ *
+ * @param st            Tracer handle.
+ * @param n_sources     Number of sources.
+ * @param src_pos       (n_sources, 3) float64 — source positions.
+ * @param src_dir       (n_sources, 3) float64 — dominant emit directions.
+ * @param src_directivity (n_sources,) float64 — directivity exponent.
+ * @param n_rays        Rays per source.
+ * @param max_bounces   Maximum reflection bounces.
+ * @param min_amplitude Amplitude cutoff.
+ * @param seed          RNG seed.
+ * @param cb            Callback invoked with each batch of segments.
+ * @param user          Opaque pointer forwarded verbatim to cb.
+ * @param flush_records Batch size; 0 → default (4096 records).
+ * @param stats         [out] Optional stats; may be NULL.
+ *
+ * @return  SK_OK on success.
+ *          SK_ERR_NULL_STATE  if st or cb is NULL.
+ *          SK_ERR_DIVERGED    if cb returned non-zero (early termination
+ *                             requested); records already delivered are not
+ *                             retracted and stats reflect actual work done.
+ */
+SK_API int ray_tracer_trace_callback(
+    RayTracerState*   st,
+    int               n_sources,
+    const double*     src_pos,
+    const double*     src_dir,
+    const double*     src_directivity,
+    int               n_rays,
+    int               max_bounces,
+    double            min_amplitude,
+    uint32_t          seed,
+    RtSegmentCallback cb,
+    void*             user,
+    int               flush_records,
+    RtTraceStats*     stats);
+
 /* Multiscale segment format — 14 floats (56 bytes).
  * Extends the base 12-float layout with two extra fields:
  *   [12]  context_id   — index of the scale context (-1 = ambient/coarse)

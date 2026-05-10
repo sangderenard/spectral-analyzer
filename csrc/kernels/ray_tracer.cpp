@@ -59,10 +59,12 @@ static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
               "FilmRecord size mismatch — Python FilmRecord is 64 floats");
 
 #include <Eigen/Dense>
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <memory>
@@ -76,6 +78,23 @@ using VXcd = Eigen::VectorXcd;
 static constexpr double TWO_PI     = 2.0 * M_PI;
 static constexpr double EPS        = 1e-9;
 static constexpr int    BVH_LEAF_MAX = 4;   /* triangles per BVH leaf */
+static constexpr bool    RT_ENABLE_PROFILE = true;
+
+struct RtProfileScope {
+    const char* name = nullptr;
+    std::chrono::steady_clock::time_point t0;
+
+    explicit RtProfileScope(const char* label)
+        : name(label), t0(std::chrono::steady_clock::now())
+    {}
+
+    ~RtProfileScope() {
+        if (!RT_ENABLE_PROFILE || !name) return;
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        std::fprintf(stderr, "[rt-prof] %s %.3f ms\n", name, ms);
+    }
+};
 
 /* ── Unified material flags (Phase 2: single source of truth) ─────────────── */
 #include "mat_flags_generated.h"
@@ -302,15 +321,73 @@ static V3d cosine_hemisphere(const V3d& n, std::mt19937_64& rng)
     return (x * t + y * b + z * n).normalized();
 }
 
-/* ── Segment writer ─────────────────────────────────────────────────────────── */
+/* ── Per-worker output chunk ─────────────────────────────────────────────────
+ * Holds a thread-local (or call-local) segment buffer and running stats.
+ * Using a local chunk rather than writing directly into the caller's buffer
+ * makes `count` fully private — no shared reference required — and enables
+ * future parallelisation without adding locks around the output path.
+ *
+ * flush_to(): copies collected segments into the caller-provided output array
+ * and credits any excess (over out_cap - already_written) as dropped.
+ */
+struct RayWorkerChunk {
+    std::vector<float> segs;
+    RtTraceStats       stats = {0, 0, 0};
 
+    void write_segment(
+        const V3d& p0, const V3d& p1,
+        int src_id, int bounce, int band,
+        cd amp, double path_len)
+    {
+        segs.resize(segs.size() + RT_FLOATS_PER_SEG);
+        float* s = segs.data() + segs.size() - RT_FLOATS_PER_SEG;
+        s[0]  = static_cast<float>(p0.x());
+        s[1]  = static_cast<float>(p0.y());
+        s[2]  = static_cast<float>(p0.z());
+        s[3]  = static_cast<float>(p1.x());
+        s[4]  = static_cast<float>(p1.y());
+        s[5]  = static_cast<float>(p1.z());
+        s[6]  = static_cast<float>(src_id);
+        s[7]  = static_cast<float>(bounce);
+        s[8]  = static_cast<float>(band);
+        s[9]  = static_cast<float>(std::abs(amp));
+        s[10] = static_cast<float>(std::arg(amp));
+        s[11] = static_cast<float>(path_len);
+        ++stats.segments_written;
+    }
+
+    /* Flush into caller-owned buffer.  Returns number of records copied.
+     * Records that don't fit are counted as dropped (not silently lost). */
+    int flush_to(float* out, int out_cap, int already_written)
+    {
+        int available = out_cap - already_written;
+        int n_seg     = static_cast<int>(segs.size() / RT_FLOATS_PER_SEG);
+        int n_copy    = std::min(n_seg, std::max(0, available));
+        if (n_copy > 0)
+            std::memcpy(out + static_cast<size_t>(already_written) * RT_FLOATS_PER_SEG,
+                        segs.data(),
+                        static_cast<size_t>(n_copy) * RT_FLOATS_PER_SEG * sizeof(float));
+        int n_drop = n_seg - n_copy;
+        stats.segments_dropped += n_drop;
+        stats.segments_written -= n_drop;   /* correct: those were not written */
+        return n_copy;
+    }
+};
+
+/* ── Segment writer (legacy thin wrapper used by multiscale path) ────────────
+ * New code should use RayWorkerChunk::write_segment instead.
+ */
 static inline void write_segment(
     float* buf, int& count, int cap,
     const V3d& p0, const V3d& p1,
     int src_id, int bounce, int band,
-    cd amp, double path_len)
+    cd amp, double path_len,
+    RtTraceStats* stats = nullptr)
 {
-    if (count >= cap) return;
+    if (count >= cap) {
+        if (stats) ++stats->segments_dropped;
+        return;
+    }
     float* s = buf + static_cast<size_t>(count) * RT_FLOATS_PER_SEG;
     s[0]  = static_cast<float>(p0.x());
     s[1]  = static_cast<float>(p0.y());
@@ -325,6 +402,7 @@ static inline void write_segment(
     s[10] = static_cast<float>(std::arg(amp));
     s[11] = static_cast<float>(path_len);
     ++count;
+    if (stats) ++stats->segments_written;
 }
 
 /* ── RayTracerState ─────────────────────────────────────────────────────────── */
@@ -934,6 +1012,7 @@ static void trace_rays(
     bool& abort,          /* set to true by callback to stop all loops */
     PerBandFn&& per_band)
 {
+    RtProfileScope scope("trace_rays");
     const int  n_bands = st.n_bands;
     const bool has_bvh = !st.bvh_nodes.empty();
 
@@ -1061,6 +1140,7 @@ static void trace_rays_v2(
     bool& abort,
     HitFn&& hit_fn)
 {
+    RtProfileScope scope("trace_rays_v2");
     const int  n_bands = st.n_bands;
     const bool has_bvh = !st.bvh_nodes.empty();
 
@@ -1274,11 +1354,16 @@ int ray_tracer_trace(
     int             out_cap,
     int*            out_count)
 {
+    RtProfileScope scope("ray_tracer_trace");
     if (!st || !out_segs || !out_count) return SK_ERR_NULL_STATE;
 
     *out_count = 0;
-    int count  = 0;
     bool abort = false;
+
+    /* Use a local RayWorkerChunk so `count` is fully private.  The chunk
+     * owns its segment buffer; after tracing it is flushed into out_segs
+     * with explicit overflow accounting. */
+    RayWorkerChunk chunk;
 
     std::mt19937_64 rng(static_cast<uint64_t>(seed));
 
@@ -1290,15 +1375,12 @@ int ray_tracer_trace(
         [&](int si, int bounce, int b, cd new_amp,
             const V3d& p0, const V3d& p1, double total_path) -> bool
         {
-            /* Silently drop segments once the vis buffer is full — never abort
-               the trace itself, all rays must complete for correct physics. */
-            write_segment(out_segs, count, out_cap,
-                          p0, p1, si, bounce, b,
-                          new_amp, total_path - (p1 - p0).norm());
+            chunk.write_segment(p0, p1, si, bounce, b,
+                                new_amp, total_path - (p1 - p0).norm());
             return true;
         });
 
-    *out_count = count;
+    *out_count = chunk.flush_to(out_segs, out_cap, 0);
     return SK_OK;
 }
 
@@ -1324,8 +1406,8 @@ int ray_tracer_trace_surface(
     const int n_tri   = static_cast<int>(st->tris.size());
     static constexpr double AREA_EPS = 1e-12;
 
-    int  count = 0;
     bool abort = false;
+    RayWorkerChunk chunk;
 
     if (out_count) *out_count = 0;
 
@@ -1342,13 +1424,12 @@ int ray_tracer_trace_surface(
             const VXcd& amp_prop,
             const V3d& p0, const V3d& p1, double total_path) -> bool
         {
-            /* Write segment record (vis buffer). */
+            /* Write segment record into local chunk (vis buffer). */
             if (out_segs && out_cap > 0) {
                 for (int b = 0; b < n_bands; ++b) {
-                    write_segment(out_segs, count, out_cap,
-                                  p0, p1, si, bounce, b,
-                                  amp_prop[b],
-                                  total_path - (p1 - p0).norm());
+                    chunk.write_segment(p0, p1, si, bounce, b,
+                                        amp_prop[b],
+                                        total_path - (p1 - p0).norm());
                 }
             }
 
@@ -1380,8 +1461,98 @@ int ray_tracer_trace_surface(
             return true;
         });
 
-    if (out_count) *out_count = count;
+    int written = (out_segs && out_cap > 0) ? chunk.flush_to(out_segs, out_cap, 0) : 0;
+    if (out_count) *out_count = written;
     return SK_OK;
+}
+
+/* ── ray_tracer_trace_callback ───────────────────────────────────────────── */
+
+int ray_tracer_trace_callback(
+    RayTracerState*   st,
+    int               n_sources,
+    const double*     src_pos,
+    const double*     src_dir,
+    const double*     src_directivity,
+    int               n_rays,
+    int               max_bounces,
+    double            min_amplitude,
+    uint32_t          seed,
+    RtSegmentCallback cb,
+    void*             user,
+    int               flush_records,
+    RtTraceStats*     stats)
+{
+    RtProfileScope scope("ray_tracer_trace_callback");
+    if (!st || !cb) return SK_ERR_NULL_STATE;
+
+    const int flush_n = (flush_records > 0) ? flush_records : 4096;
+    const int buf_float_cap = flush_n * RT_FLOATS_PER_SEG;
+
+    /* Internal batch buffer — one flush_n-deep slab, recycled each flush. */
+    std::vector<float> buf;
+    buf.reserve(static_cast<size_t>(buf_float_cap));
+
+    int64_t total_delivered = 0;
+    bool    abort      = false;
+    bool    cb_stopped = false;
+
+    /* Flush buf → callback; clear buf.  Returns false if cb signals stop. */
+    auto do_flush = [&]() -> bool {
+        int n = static_cast<int>(buf.size()) / RT_FLOATS_PER_SEG;
+        if (n == 0) return true;
+        int r = cb(buf.data(), n, user);
+        total_delivered += n;
+        buf.clear();
+        if (r != 0) {
+            cb_stopped = true;
+            abort = true;
+            return false;
+        }
+        return true;
+    };
+
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+
+    trace_rays(
+        *st, n_sources, src_pos, src_dir, src_directivity,
+        n_rays, max_bounces, min_amplitude, rng, abort,
+        [&](int si, int bounce, int b, cd new_amp,
+            const V3d& p0, const V3d& p1, double total_path) -> bool
+        {
+            /* Append one record to the batch buffer. */
+            size_t old_sz = buf.size();
+            buf.resize(old_sz + RT_FLOATS_PER_SEG);
+            float* s = buf.data() + old_sz;
+            s[0]  = static_cast<float>(p0.x());
+            s[1]  = static_cast<float>(p0.y());
+            s[2]  = static_cast<float>(p0.z());
+            s[3]  = static_cast<float>(p1.x());
+            s[4]  = static_cast<float>(p1.y());
+            s[5]  = static_cast<float>(p1.z());
+            s[6]  = static_cast<float>(si);
+            s[7]  = static_cast<float>(bounce);
+            s[8]  = static_cast<float>(b);
+            s[9]  = static_cast<float>(std::abs(new_amp));
+            s[10] = static_cast<float>(std::arg(new_amp));
+            /* path_len at segment start = total_path minus this segment's length */
+            s[11] = static_cast<float>(total_path - (p1 - p0).norm());
+
+            if (static_cast<int>(buf.size()) >= buf_float_cap)
+                return do_flush();
+            return true;
+        });
+
+    /* Final flush for any records that did not fill the batch. */
+    if (!cb_stopped)
+        do_flush();
+
+    if (stats) {
+        stats->segments_written = total_delivered;
+        stats->segments_dropped = 0;
+        stats->total_bounces    = 0;  /* not tracked in callback path */
+    }
+    return cb_stopped ? SK_ERR_DIVERGED : SK_OK;
 }
 
 int ray_tracer_integrate_ir(
@@ -1403,6 +1574,7 @@ int ray_tracer_integrate_ir(
     float*          out_re,
     float*          out_im)
 {
+    RtProfileScope scope("ray_tracer_integrate_ir");
     if (!st || !out_re || !out_im) return SK_ERR_NULL_STATE;
 
     const int   n_bands = st->n_bands;
@@ -1478,6 +1650,7 @@ int ray_tracer_integrate_image(
     int             height,
     float*          out_image)
 {
+    RtProfileScope scope("ray_tracer_integrate_image");
     if (!st || !out_image) return SK_ERR_NULL_STATE;
 
     /* Build orthonormal camera frame. */
@@ -1578,6 +1751,7 @@ int ray_tracer_integrate_image_packed(
     int             height,
     float*          out_image)
 {
+    RtProfileScope scope("ray_tracer_integrate_image_packed");
     if (!st || !out_image || !src_n_rays) return SK_ERR_NULL_STATE;
 
     V3d cam_p(cam_pos[0], cam_pos[1], cam_pos[2]);
@@ -1681,7 +1855,7 @@ int ray_tracer_trace_integrate_image(
 {
     if (!st || !out_image || !out_count) return SK_ERR_NULL_STATE;
 
-    int count = 0;
+    RayWorkerChunk chunk;
     *out_count = 0;
 
     V3d cam_p(cam_pos[0], cam_pos[1], cam_pos[2]);
@@ -1714,10 +1888,9 @@ int ray_tracer_trace_integrate_image(
         {
             if (out_segs && out_cap > 0) {
                 for (int b = 0; b < st->n_bands; ++b) {
-                    write_segment(out_segs, count, out_cap,
-                                  p0, p1, si, bounce, b,
-                                  amp_prop[b],
-                                  total_path - (p1 - p0).norm());
+                    chunk.write_segment(p0, p1, si, bounce, b,
+                                        amp_prop[b],
+                                        total_path - (p1 - p0).norm());
                 }
             }
 
@@ -1765,7 +1938,7 @@ int ray_tracer_trace_integrate_image(
             return true;
         });
 
-    *out_count = count;
+    *out_count = (out_segs && out_cap > 0) ? chunk.flush_to(out_segs, out_cap, 0) : 0;
     return SK_OK;
 }
 
@@ -1921,6 +2094,7 @@ static void trace_rays_multiscale(
     float* out_segs, int seg_cap, int& seg_count,
     HitFn2&& hit_fn)
 {
+    RtProfileScope scope("trace_rays_multiscale");
     const int  n_bands = st.n_bands;
     const bool has_bvh = !st.bvh_nodes.empty();
     const int  n_ctx   = static_cast<int>(st.scale_contexts.size());
@@ -2187,6 +2361,7 @@ int ray_tracer_trace_multiscale(
     int             out_cap,
     int*            out_count)
 {
+    RtProfileScope scope("ray_tracer_trace_multiscale");
     if (!st || !out_segs || !out_count) return SK_ERR_NULL_STATE;
     *out_count = 0;
     int count = 0;
@@ -2222,6 +2397,7 @@ int ray_tracer_trace_multiscale_surface(
     float*          out_direct,
     float*          out_indirect)
 {
+    RtProfileScope scope("ray_tracer_trace_multiscale_surface");
     if (!st) return SK_ERR_NULL_STATE;
     if (out_count) *out_count = 0;
 

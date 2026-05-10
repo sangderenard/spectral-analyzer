@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import faulthandler
 import json
 import math
 import os
@@ -68,6 +69,8 @@ import sys
 import tempfile
 import threading
 import time
+import tracemalloc
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from typing import Any, Callable, Optional
 
@@ -217,6 +220,58 @@ DEFAULT_FILM = FilmExposure(
 # visible) so RAM stays manageable; the unified mat_buf still allocates 32
 # slots per material with the unused tail zeroed.
 DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 400e-9, 8)).astype(np.float64)
+
+ENABLE_EXPOSURE_PROFILING = False
+
+
+class StageProfiler:
+    def __init__(self, enabled: bool = False):
+        self.enabled = bool(enabled)
+        self._data: dict[str, list[float]] = {}
+        self._order: list[str] = []
+
+    @contextmanager
+    def section(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            ms = (time.perf_counter() - t0) * 1e3
+            self._data.setdefault(name, []).append(ms)
+            if name not in self._order:
+                self._order.append(name)
+
+    def report(self, prefix: str = "[profile]") -> None:
+        if not self.enabled or not self._order:
+            return
+        parts = [f"{k}={np.mean(self._data[k]):.1f}ms" for k in self._order if self._data.get(k)]
+        current = peak = None
+        if tracemalloc.is_tracing():
+            current, peak = tracemalloc.get_traced_memory()
+        if current is not None and peak is not None:
+            parts.append(f"mem={current / (1024 ** 2):.1f}MB/{peak / (1024 ** 2):.1f}MB")
+        print(f"{prefix} " + "  ".join(parts), flush=True)
+
+DEFAULT_CALIBRATION_SCENE_SEQUENCE = (
+    "calib-grid",
+    "calib-bw-rgb",
+    "calib-rgb-diagram",
+    "calib-step-wedge",
+    "calib-prism-backplate",
+    "tungsten-cavity",
+)
+
+
+def _build_default_scene_schedule(n_frames_planned: int, demo_scene: str = "orbiters") -> tuple[str, ...]:
+    n_frames = max(1, int(n_frames_planned))
+    if n_frames == 1:
+        return (demo_scene,)
+    calibs = DEFAULT_CALIBRATION_SCENE_SEQUENCE
+    prefix = tuple(calibs[i % len(calibs)] for i in range(n_frames - 1))
+    return prefix + (demo_scene,)
 
 # EndpointRecord in Python is float32 (N, 16): 64 bytes/record payload.
 _BDPT_RECORD_FLOATS = 16
@@ -1329,6 +1384,8 @@ class ExposureSession:
                  integrator: str = "bdpt",
                  bdpt_records_cap: int = 0,
                  scene_mode: str = "orbiters",
+                 scene_mode_schedule: Optional[tuple[str, ...]] = None,
+                 profile_enabled: bool = False,
                  integral_split: Optional[IntegralSplitConfig] = None,
                  camera_visibility: Optional[CameraVisibilityConfig] = None,
                  field_capture: Optional[FieldCaptureConfig] = None,
@@ -1360,6 +1417,9 @@ class ExposureSession:
         self.integrator = str(integrator)
         requested_bdpt_cap = int(bdpt_records_cap)
         self.scene_mode = str(scene_mode)
+        self.scene_mode_schedule = tuple(str(s) for s in scene_mode_schedule) if scene_mode_schedule else None
+        self.profile_enabled = bool(profile_enabled)
+        self._profiler = StageProfiler(self.profile_enabled)
         self.integral_split = (integral_split
                        if integral_split is not None
                        else IntegralSplitConfig())
@@ -1480,6 +1540,12 @@ class ExposureSession:
             except Exception:
                 pass
         gc.collect()
+
+    def _scene_mode_for_frame(self) -> str:
+        if self.scene_mode_schedule:
+            idx = min(max(self._frame_index, 0), len(self.scene_mode_schedule) - 1)
+            return self.scene_mode_schedule[idx]
+        return self.scene_mode
 
     def _cleanup_temp_bdpt_file(self) -> None:
         if not self._last_bdpt_records_is_temp or not self._last_bdpt_records_path:
@@ -2271,13 +2337,19 @@ class ExposureSession:
         batch_preview_cb: Optional[Callable[[dict[str, ExposureBackend], dict[str, IntegrationSnapshot], int, int, float], None]] = None,
     ) -> list[ExposureFrameResult]:
         # ── Build per-frame progressive feature configuration ────────────
-        frame_cfg = _build_frame_config(
-            self._frame_index, self.n_frames_planned, self.integral_split)
+        with self._profiler.section("frame_config"):
+            frame_cfg = _build_frame_config(
+                self._frame_index, self.n_frames_planned, self.integral_split)
 
-        scene = _build_tracer_scene(t, scene_mode=self.scene_mode)
-        cam   = PinholeCamera.looking_at_scene(self.width, self.height, self.optics)
-        plan  = self._build_plan(scene)
-        backs = self._build_backends(scene, cam, frame_cfg)
+        scene_mode = self._scene_mode_for_frame()
+        with self._profiler.section("build_scene"):
+            scene = _build_tracer_scene(t, scene_mode=scene_mode)
+        with self._profiler.section("build_camera"):
+            cam   = PinholeCamera.looking_at_scene(self.width, self.height, self.optics)
+        with self._profiler.section("build_plan"):
+            plan  = self._build_plan(scene)
+        with self._profiler.section("build_backends"):
+            backs = self._build_backends(scene, cam, frame_cfg)
 
         plan_dict = summarize_plan(plan, self.optics, self.film)
         n_pix = max(1, self.optics.n_pixels())
@@ -2659,6 +2731,7 @@ class ExposureSession:
         frame_config_summary = {
             "description":   frame_cfg.description,
             "detail_level":  int(frame_cfg.detail_level),
+            "scene_mode":    scene_mode,
             "field":         (f"{fc_s.grid_kind} {fc_s.nx}³"
                               if fc_s.enabled else "off"),
             "field_strikes": fc_s.capture_strikes if fc_s.enabled else False,
@@ -2684,18 +2757,21 @@ class ExposureSession:
         # ── Per-backend calibration + dump ───────────────────────────────
         results: list[ExposureFrameResult] = []
         for name, back in backs.items():
-            measured = back.measured_radiant_exposure_J(plan.energy_per_ray_J)
-            gain     = self._train_emissivity_gain(measured, plan.target_H_J)
-            gain_db  = 20.0 * math.log10(max(gain, 1.0e-12))
+            with self._profiler.section(f"backend_{name}_measure"):
+                measured = back.measured_radiant_exposure_J(plan.energy_per_ray_J)
+            with self._profiler.section(f"backend_{name}_gain"):
+                gain     = self._train_emissivity_gain(measured, plan.target_H_J)
+                gain_db  = 20.0 * math.log10(max(gain, 1.0e-12))
             virtual_t = self.film.exposure_time_s
             qe = float(self.film.quantum_efficiency)
             snr = math.sqrt(max(photons_per_pix * qe, 0.0))
             tracer_obj = getattr(back, "tracer", None)
 
-            field_obj, surface_obj, _merged_bands, rgb_linear = \
-                self._make_integral_objects(name, back.accum, gain,
-                                            frame_cfg.integral_split)
-            sensor_obj = self._make_sensor_integral(name, gain, tracer_obj)
+            with self._profiler.section(f"backend_{name}_integrals"):
+                field_obj, surface_obj, _merged_bands, rgb_linear = \
+                    self._make_integral_objects(name, back.accum, gain,
+                                                frame_cfg.integral_split)
+                sensor_obj = self._make_sensor_integral(name, gain, tracer_obj)
 
             img = self._tone_map_delicate(rgb_linear, frame_cfg.integral_split)
 
@@ -2851,9 +2927,10 @@ class ExposureSession:
 
             # Only save files if explicitly enabled via --save-files
             if self.save_files:
-                _write_png(png_path, img_preview)
-                _write_png16(png16_path, img)
-                np.save(linear_path, rgb_linear)
+                with self._profiler.section(f"backend_{name}_write_files"):
+                    _write_png(png_path, img_preview)
+                    _write_png16(png16_path, img)
+                    np.save(linear_path, rgb_linear)
 
             if self.save_files:
                 # Convert to dict but exclude non-JSON-serializable fields (numpy arrays)
@@ -2872,6 +2949,7 @@ class ExposureSession:
             else:
                 print(f"        (in-memory; use --save-files to save to disk)")
 
+        self._profiler.report(prefix=f"[frame {self._frame_index:04d}]")
         self._frame_index += 1
         self._rng_seed += 1
         self._cleanup_temp_bdpt_file()
@@ -3462,7 +3540,9 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                    help="Scene mode passed to scene_mod.scene_for_phase "
                         "(default: orbiters; tungsten-cavity for blackbody "
                         "calibration; also supports calib-rgb-diagram / calib-bw-rgb "
-                        "for black-white-primary chain validation). Overrides --calibration-scene.")
+                        "for black-white-primary chain validation, and calib-grid / "
+                        "calib-step-wedge / calib-prism-backplate for grid, wedge, "
+                        "and prism comparator scenes). Overrides --calibration-scene.")
     p.add_argument("--backend",        choices=("cpp", "glsl", "both"),
                    default="cpp")
     p.add_argument("--exposure-time-s", type=float, default=DEFAULT_FILM.exposure_time_s)
@@ -3476,6 +3556,8 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--save-files",     action="store_true",
                    help="Save PNG, JSON, and NPZ artifacts to disk (opt-in). "
                         "Without this, only in-memory rendering and display is performed.")
+    p.add_argument("--profile",        action="store_true",
+                   help="Enable Python stage profiling and native failure breadcrumbs.")
     p.add_argument("--out-dir",        default="exposures")
     p.add_argument("--pane-w",         type=int, default=640)
     p.add_argument("--pane-h",         type=int, default=360)
@@ -3528,6 +3610,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+    profile_enabled = bool(ENABLE_EXPOSURE_PROFILING or args.profile)
+    if profile_enabled:
+        faulthandler.enable(all_threads=True)
+        if not tracemalloc.is_tracing():
+            tracemalloc.start()
     backends = {
         "cpp":  ("cpp",),
         "glsl": ("glsl",),
@@ -3553,13 +3640,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     oversample = max(1, int(args.output_oversample))
     oversample_stencil = str(args.oversample_stencil)
     if bool(args.save_files) and int(args.output_oversample) == 1 and str(args.oversample_stencil) == "box":
-        oversample = 16
+        oversample = 4
         oversample_stencil = "polar"
-        print("  [defaults] --save-files detected: using beefy output oversample 16x with polar stencil")
+        print("  [defaults] --save-files detected: using output oversample 4x with polar stencil")
     output_w = max(1, int(round(float(args.width) * input_scale)))
     output_h = max(1, int(round(float(args.height) * input_scale)))
     render_w = max(1, int(output_w * oversample))
     render_h = max(1, int(output_h * oversample))
+
+    scene_mode_schedule = None if args.scene_mode is not None or args.calibration_scene else _build_default_scene_schedule(args.frames, "orbiters")
 
     session = ExposureSession(
         optics         = optics,
@@ -3580,6 +3669,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         scene_mode     = (args.scene_mode if args.scene_mode is not None
                           else ("tungsten-cavity" if args.calibration_scene
                                 else "orbiters")),
+          scene_mode_schedule = scene_mode_schedule,
+          profile_enabled = profile_enabled,
         integral_split = IntegralSplitConfig(
             field_integrate_frac   = float(args.field_integrate_frac),
             field_bookkeep_frac    = float(args.field_bookkeep_frac),

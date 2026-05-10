@@ -65,7 +65,64 @@ static std::vector<std::vector<int>> build_vtx_to_tris(
     return v2t;
 }
 
-/* Collect 1-ring neighbours of triangle t (including t itself). */
+/* ── Triangle 1-ring CSR ───────────────────────────────────────────────────── */
+
+/* Precomputed CSR (compressed sparse row) of 1-ring neighbour indices
+ * (including self) for every triangle.  Built once per surface_spline_fit call
+ * so the hot per-triangle loop pays only a pointer-range lookup. */
+struct TriRingCSR {
+    std::vector<int> offsets;  /* size n_tris + 1; offsets[t..t+1) indexes data */
+    std::vector<int> data;     /* flat sorted-unique neighbour ids */
+};
+
+static TriRingCSR build_tri_ring_csr(
+    int n_tris, int n_verts, const int* tri_idx,
+    const std::vector<std::vector<int>>& v2t)
+{
+    TriRingCSR csr;
+    csr.offsets.resize(static_cast<size_t>(n_tris) + 1, 0);
+    std::vector<int> ring_tmp;
+
+    /* First pass: compute ring sizes (sort/unique to count distinct neighbours). */
+    for (int t = 0; t < n_tris; ++t) {
+        ring_tmp.clear();
+        ring_tmp.push_back(t);
+        for (int k = 0; k < 3; ++k) {
+            int vi = tri_idx[static_cast<size_t>(t) * 3 + k];
+            if (vi < 0 || vi >= n_verts) continue;
+            const auto& list = v2t[static_cast<size_t>(vi)];
+            ring_tmp.insert(ring_tmp.end(), list.begin(), list.end());
+        }
+        std::sort(ring_tmp.begin(), ring_tmp.end());
+        ring_tmp.erase(std::unique(ring_tmp.begin(), ring_tmp.end()), ring_tmp.end());
+        csr.offsets[static_cast<size_t>(t) + 1] = static_cast<int>(ring_tmp.size());
+    }
+
+    /* Exclusive prefix-sum to get absolute offsets. */
+    for (int t = 0; t < n_tris; ++t)
+        csr.offsets[static_cast<size_t>(t) + 1] += csr.offsets[static_cast<size_t>(t)];
+
+    csr.data.resize(static_cast<size_t>(csr.offsets[n_tris]));
+
+    /* Second pass: fill data (recompute ring, copy into CSR slot). */
+    for (int t = 0; t < n_tris; ++t) {
+        ring_tmp.clear();
+        ring_tmp.push_back(t);
+        for (int k = 0; k < 3; ++k) {
+            int vi = tri_idx[static_cast<size_t>(t) * 3 + k];
+            if (vi < 0 || vi >= n_verts) continue;
+            const auto& list = v2t[static_cast<size_t>(vi)];
+            ring_tmp.insert(ring_tmp.end(), list.begin(), list.end());
+        }
+        std::sort(ring_tmp.begin(), ring_tmp.end());
+        ring_tmp.erase(std::unique(ring_tmp.begin(), ring_tmp.end()), ring_tmp.end());
+        int off = csr.offsets[static_cast<size_t>(t)];
+        std::copy(ring_tmp.begin(), ring_tmp.end(), csr.data.begin() + off);
+    }
+
+    return csr;
+}
+
 /* ── Per-triangle spline fit ───────────────────────────────────────────────── */
 
 /* Fit the 6 POLY_BARY coefficients for triangle t.
@@ -78,6 +135,8 @@ static void fit_one_triangle(
     int           n_tris,
     const int*    tri_idx,
     const std::vector<std::vector<int>>& v2t,
+    const int*    ring_begin,  /* precomputed sorted 1-ring for triangle t  */
+    const int*    ring_end,    /* one-past-end of that ring span            */
     double        ridge_lambda,
     double*       out6)   /* pointer to float64[6] for this triangle */
 {
@@ -122,22 +181,9 @@ static void fit_one_triangle(
     /* Self-centroid sample: delta = 0 at bary (1/3, 1/3) — anchor the fit. */
     add_row(basis(1.0 / 3.0, 1.0 / 3.0), 0.0);
 
-    /* 1-ring neighbours (small vector + sort/unique avoids hash allocations). */
-    std::vector<int> ring;
-    ring.reserve(1
-        + v2t[static_cast<size_t>(i0)].size()
-        + v2t[static_cast<size_t>(i1)].size()
-        + v2t[static_cast<size_t>(i2)].size());
-    ring.push_back(t);
-    for (int k = 0; k < 3; ++k) {
-        int vi = vid(t, k);
-        const auto& list = v2t[static_cast<size_t>(vi)];
-        ring.insert(ring.end(), list.begin(), list.end());
-    }
-    std::sort(ring.begin(), ring.end());
-    ring.erase(std::unique(ring.begin(), ring.end()), ring.end());
-
-    for (int nb : ring) {
+    /* 1-ring neighbours — use precomputed CSR span (sorted, deduplicated). */
+    for (const int* it = ring_begin; it != ring_end; ++it) {
+        int nb = *it;
         if (nb == t) continue;
 
         /* Centroid of neighbour in world space. */
@@ -253,6 +299,10 @@ extern "C" SS_API int surface_spline_fit(
     /* Build adjacency once (shared across all threads; read-only after). */
     const auto v2t = build_vtx_to_tris(n_verts, n_tris, tri_indices);
 
+    /* Precompute 1-ring CSR for all triangles (one sort/unique pass per tri,
+     * done here so the parallel hot loop pays only a pointer-range lookup). */
+    const TriRingCSR ring_csr = build_tri_ring_csr(n_tris, n_verts, tri_indices, v2t);
+
     /* Decide which triangle indices to process. */
     std::vector<int> work_list;
     if (tri_subset && n_subset > 0) {
@@ -268,10 +318,13 @@ extern "C" SS_API int surface_spline_fit(
     ThreadPool::parallel_for(pool, size_t(0), n_work, [&](size_t wi) {
         int t = work_list[wi];
         if (t < 0 || t >= n_tris) return;
+        const int* ring_begin = ring_csr.data.data() + ring_csr.offsets[static_cast<size_t>(t)];
+        const int* ring_end   = ring_csr.data.data() + ring_csr.offsets[static_cast<size_t>(t) + 1];
         fit_one_triangle(
             t,
             verts_xyz, n_verts, n_tris, tri_indices,
             v2t,
+            ring_begin, ring_end,
             ridge_lambda,
             out_coeffs + static_cast<ptrdiff_t>(t) * 6);
     });

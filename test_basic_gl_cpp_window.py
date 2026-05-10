@@ -48,6 +48,7 @@ from camera_exposure_budget import (
 from emissive_ray_packer import pack_emissive_area_rays, summarize_packed_rays
 from material_db import MaterialDatabase
 from shader_calibration_profiles import load_shader_calibration_profile, save_shader_calibration_gains
+from platonic_solids import triangular_prism
 from spherical_mesh import uv_sphere, equirect_texture
 
 try:
@@ -75,6 +76,7 @@ ORBIT_SPEED = 0.45  # radians / second (all orbiters same period)
 # ── Sphere meshes ─────────────────────────────────────────────────────────────
 SPHERE = uv_sphere(56, 28)
 SMALL  = uv_sphere(24, 12)
+CALIB_STEP_MATERIALS = tuple(f"calib_step_{i}" for i in range(8))
 
 # ── Feature / missing report ──────────────────────────────────────────────────
 MISSING = [
@@ -450,6 +452,40 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
             "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 2.5],
         },
 
+        # ── Calibration step wedge ───────────────────────────────────────
+        "calib_step_0": {
+            "albedo_rgb": [0.06, 0.06, 0.06], "roughness": 1.0, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_step_1": {
+            "albedo_rgb": [0.16, 0.16, 0.16], "roughness": 1.0, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_step_2": {
+            "albedo_rgb": [0.28, 0.28, 0.28], "roughness": 1.0, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_step_3": {
+            "albedo_rgb": [0.40, 0.40, 0.40], "roughness": 1.0, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_step_4": {
+            "albedo_rgb": [0.52, 0.52, 0.52], "roughness": 0.95, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_step_5": {
+            "albedo_rgb": [0.66, 0.66, 0.66], "roughness": 0.75, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_step_6": {
+            "albedo_rgb": [0.80, 0.80, 0.80], "roughness": 0.50, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+        "calib_step_7": {
+            "albedo_rgb": [0.94, 0.94, 0.94], "roughness": 0.30, "metallic": 0.0,
+            "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
+        },
+
         # ── Profile 1: emissive forward cone with bulb darkening ─────────
         # depth_uv layer 3: R=depth (scaled by depth_scale_mm), A=bulb_radius (raw)
         # Lorentzian applied to emission: full at pole center, dark at extremes.
@@ -587,6 +623,30 @@ def flat_from_tris(tris: np.ndarray, mat_ids: np.ndarray,
     return np.ascontiguousarray(verts, np.float32), np.ascontiguousarray(mids, np.int32)
 
 
+def quad_patch(x0: float, y0: float, x1: float, y1: float, z: float) -> np.ndarray:
+    return np.array([
+        [[x0, y0, z], [x1, y0, z], [x1, y1, z]],
+        [[x0, y0, z], [x1, y1, z], [x0, y1, z]],
+    ], dtype=np.float32)
+
+
+def mesh_tris(mesh, *, center: tuple[float, float, float], scale: float = 1.0,
+              rot_z_deg: float = 0.0, rot_y_deg: float = 0.0) -> np.ndarray:
+    verts = np.asarray(mesh.verts, np.float32) * float(scale)
+    if rot_z_deg:
+        a = math.radians(rot_z_deg)
+        cz, sz = math.cos(a), math.sin(a)
+        rot = np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]], np.float32)
+        verts = verts @ rot.T
+    if rot_y_deg:
+        a = math.radians(rot_y_deg)
+        cy, sy = math.cos(a), math.sin(a)
+        rot = np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]], np.float32)
+        verts = verts @ rot.T
+    verts += np.asarray(center, np.float32)[None, :]
+    return np.ascontiguousarray(verts[np.asarray(mesh.tris, np.int32)], np.float32)
+
+
 def scene_for_phase(idx: dict[str, int], t: float, scene_mode: str = "orbiters"):
     chunks_v     = []
     tri_mids     = []
@@ -608,6 +668,12 @@ def scene_for_phase(idx: dict[str, int], t: float, scene_mode: str = "orbiters")
         group_mids.append(mat_id)
         group_offsets.append(tri_offset)
         group_counts.append(tri_count)
+
+    def add_quad(x0: float, y0: float, x1: float, y1: float, z: float,
+                 mat_id: int, group_id: int) -> None:
+        tris = quad_patch(x0, y0, x1, y1, z)
+        verts8, _ = flat_from_tris(tris, np.full((tris.shape[0],), mat_id, np.int32))
+        add_object(verts8, mat_id, group_id)
 
     if scene_mode == "tungsten-cavity":
         cavity_center = TUNGSTEN_CAMERA_POS
@@ -654,6 +720,50 @@ def scene_for_phase(idx: dict[str, int], t: float, scene_mode: str = "orbiters")
         add_object(red_emit, idx["calib_red_emit"], 20)
         add_object(green_emit, idx["calib_green_emit"], 21)
         add_object(blue_emit, idx["calib_blue_emit"], 22)
+    elif scene_mode == "calib-grid":
+        # Checkerboard / marker target for geometry, sampling, and reprojection.
+        nx = 12
+        ny = 8
+        x0, x1 = -2.2, 2.2
+        y0, y1 = -1.6, 1.6
+        z = -3.00
+        dx = (x1 - x0) / nx
+        dy = (y1 - y0) / ny
+        for iy in range(ny):
+            for ix in range(nx):
+                mx0 = x0 + ix * dx
+                my0 = y0 + iy * dy
+                mat_name = "calib_black" if (ix + iy) % 2 == 0 else "calib_white"
+                add_quad(mx0, my0, mx0 + dx, my0 + dy, z, idx[mat_name], 30 + iy * nx + ix)
+        for j, (cx, cy) in enumerate(((-1.9, -1.2), (1.9, -1.2), (1.9, 1.2), (-1.9, 1.2))):
+            marker = SMALL.flat_vertices(center=(cx, cy, -2.92), radius=0.10, include_uv=True)
+            add_object(marker, idx["calib_white" if j % 2 == 0 else "calib_black"], 200 + j)
+        add_quad(-1.85, -1.85, -1.15, -1.72, -2.88, idx["calib_red_emit"], 210)
+        add_quad(-0.35, -1.85, 0.35, -1.72, -2.88, idx["calib_green_emit"], 211)
+        add_quad(1.15, -1.85, 1.85, -1.72, -2.88, idx["calib_blue_emit"], 212)
+    elif scene_mode == "calib-step-wedge":
+        # Radiometric step wedge: increasing reflectance across the frame.
+        x0, x1 = -2.35, 2.35
+        y0, y1 = -0.9, 0.95
+        dx = (x1 - x0) / float(len(CALIB_STEP_MATERIALS))
+        for i, mat_name in enumerate(CALIB_STEP_MATERIALS):
+            sx0 = x0 + i * dx
+            sx1 = sx0 + dx
+            add_quad(sx0, y0, sx1, y1, -3.02, idx[mat_name], 50 + i)
+        add_quad(-2.55, -1.25, 2.55, -1.05, -2.96, idx["calib_black"], 70)
+        add_quad(-2.55, 1.05, 2.55, 1.25, -2.96, idx["calib_white"], 71)
+        add_quad(-2.55, -0.05, 2.55, 0.05, -2.94, idx["calib_black"], 72)
+    elif scene_mode == "calib-prism-backplate":
+        # Prism comparator: a chromatic backplate with a triangular prism in front.
+        back_z = -4.05
+        add_quad(-2.8, -1.3, 2.8, 1.3, back_z, idx["calib_white"], 80)
+        for i, (mat_name, x0) in enumerate((("calib_red_emit", -2.5), ("calib_green_emit", -0.8), ("calib_blue_emit", 0.9))):
+            add_quad(x0, -0.28, x0 + 1.25, 0.28, back_z + 0.01, idx[mat_name], 90 + i)
+        prism = triangular_prism()
+        prism_tris = mesh_tris(prism, center=(0.0, -0.12, -3.08), scale=0.60, rot_y_deg=28.0)
+        prism_verts8, _ = flat_from_tris(prism_tris, np.full((prism_tris.shape[0],), idx["acrylic"], np.int32))
+        add_object(prism_verts8, idx["acrylic"], 95)
+        add_quad(-0.22, -1.05, 0.22, 1.05, -3.96, idx["calib_black"], 96)
     else:
         # Stage
         st, sm = saddle_mesh(idx["stage_slate"])
@@ -922,8 +1032,13 @@ def main() -> None:
     ap.add_argument("--c-calibration", type=float, default=1.0,
                     help="Global C rasterizer light calibration factor.")
     ap.add_argument("--scene", type=str, default="orbiters",
-                    choices=["orbiters", "tungsten-cavity"],
-                    help="Scene preset: default orbiters, or tungsten bulb inside inward receiver sphere.")
+                    choices=[
+                        "orbiters", "tungsten-cavity", "calib-rgb-diagram",
+                        "calib-bw-rgb", "calib-grid", "calib-step-wedge",
+                        "calib-prism-backplate",
+                    ],
+                    help=("Scene preset: default orbiters, tungsten bulb inside inward receiver sphere, "
+                          "or one of the calibration plates/backplate scenes."))
     ap.add_argument("--calibration-file", type=str,
                     default=os.path.join("configs", "shader_calibration_profiles.json"),
                     help="JSON file containing shared GL/C shader calibration profiles.")

@@ -119,6 +119,61 @@ SK_API int field_grid_inject_amplitude(
     const float pos[3],
     float amp_re, float amp_im);
 
+/**
+ * Return the size in bytes of one full band of a REGULAR grid
+ * (n_cells_total × sizeof(std::complex<float>)).
+ * Returns 0 for KDTREE grids or null pointers.
+ * Useful for budgeting before mmap or file-backed operations.
+ */
+SK_API size_t field_grid_band_bytes(const FieldGrid* g);
+
+/**
+ * Read a rectangular tile (sub-volume) from one band of a REGULAR grid.
+ *
+ * @param g         Grid handle (must be FIELD_GRID_REGULAR).
+ * @param band      Band index in [0, n_bands).
+ * @param x0,y0,z0  Lower-corner cell indices (inclusive).
+ * @param nx,ny,nz  Tile dimensions in cells.
+ * @param out_re_im Destination buffer: interleaved (re, im) float32 pairs,
+ *                  row-major (x fastest, z slowest): length >= nx*ny*nz*2.
+ * @param out_len   Capacity of out_re_im in float elements.
+ *
+ * Layout written: out_re_im[(iz*ny*nx + iy*nx + ix)*2 + {0=re,1=im}]
+ *
+ * @return SK_OK on success.
+ *         SK_ERR_NULL_STATE  if g or out_re_im is NULL.
+ *         SK_ERR_DIM_MISMATCH if band/tile coords are out of range,
+ *                             out_len is too small, or grid is KDTREE.
+ */
+SK_API int field_grid_read_tile(
+    const FieldGrid* g,
+    int band,
+    int x0, int y0, int z0,
+    int nx, int ny, int nz,
+    float* out_re_im,
+    int    out_len);
+
+/**
+ * Write a rectangular tile into one band of a REGULAR grid.
+ *
+ * @param g         Grid handle (must be FIELD_GRID_REGULAR).
+ * @param band      Band index in [0, n_bands).
+ * @param x0,y0,z0  Lower-corner cell indices (inclusive).
+ * @param nx,ny,nz  Tile dimensions in cells.
+ * @param in_re_im  Source buffer: interleaved (re, im) float32 pairs,
+ *                  same layout as field_grid_read_tile; length >= nx*ny*nz*2.
+ * @param in_len    Number of float elements in in_re_im (bounds check).
+ *
+ * @return SK_OK on success.  Same error codes as field_grid_read_tile.
+ */
+SK_API int field_grid_write_tile(
+    FieldGrid*   g,
+    int band,
+    int x0, int y0, int z0,
+    int nx, int ny, int nz,
+    const float* in_re_im,
+    int          in_len);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

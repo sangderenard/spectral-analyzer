@@ -56,6 +56,10 @@ struct FieldGrid {
     /* Storage: n_bands * n_cells_total * sizeof(cd32) bytes.  Indexed for
      * REGULAR as data[band * n_cells_total + (z*ny + y)*nx + x]. */
     cd32*        data        = nullptr;
+    /* Alternate buffer for ping-pong stepping (lazily allocated on first step).
+     * After each full step, data and data_alt are swapped so data always holds
+     * the current field state and external callers see no change in semantics. */
+    cd32*        data_alt    = nullptr;
     /* KDTREE only: a flat node list.  Leaf nodes carry first_data offsets
      * into the contiguous data array. */
     std::vector<KdNode> nodes;
@@ -151,7 +155,8 @@ extern "C" SK_API FieldGrid* field_grid_create_kdtree(
 
 extern "C" SK_API void field_grid_destroy(FieldGrid* g) {
     if (!g) return;
-    if (g->data) std::free(g->data);
+    if (g->data)     std::free(g->data);
+    if (g->data_alt) std::free(g->data_alt);
     delete g;
 }
 
@@ -201,30 +206,46 @@ extern "C" SK_API int field_grid_step_helmholtz_regular(
         || nxyz > static_cast<int64_t>(std::numeric_limits<size_t>::max())) {
         return SK_ERR_DIM_MISMATCH;
     }
-    std::vector<cd32> tmp(static_cast<size_t>(nxyz));
+
+    /* Ping-pong: lazily allocate the alternate buffer (full n_bands × n_cells). */
+    if (!g->data_alt) {
+        int64_t total_cells = 0;
+        if (!checked_mul_i64(nxyz, static_cast<int64_t>(g->n_bands), total_cells))
+            return SK_ERR_DIM_MISMATCH;
+        g->data_alt = _alloc_zero(total_cells);
+        if (!g->data_alt) return SK_ERR_NULL_STATE;
+    }
+
     const float dxi2 = 1.f / (spec->dx * spec->dx);
     const float dyi2 = 1.f / (spec->dy * spec->dy);
     const float dzi2 = 1.f / (spec->dz * spec->dz);
     const cd32 i_dt(0.f, spec->dt);
     const cd32 i_k2dt(0.f, -spec->dt * (spec->k_real * spec->k_real
                                        - spec->k_imag * spec->k_imag));
+
     for (int step = 0; step < n_steps; ++step) {
         for (int b = 0; b < g->n_bands; ++b) {
-            cd32* base = g->data + static_cast<int64_t>(b) * g->n_cells_total;
-            std::memcpy(tmp.data(), base, sizeof(cd32) * tmp.size());
+            const cd32* src = g->data     + static_cast<int64_t>(b) * g->n_cells_total;
+            cd32*       dst = g->data_alt + static_cast<int64_t>(b) * g->n_cells_total;
+            /* Copy the full band slice so boundary cells in dst start from src
+             * (boundary indices are not updated by the stencil loop). */
+            std::memcpy(dst, src, sizeof(cd32) * static_cast<size_t>(nxyz));
             for (int z = 1; z < nz - 1; ++z) {
                 for (int y = 1; y < ny - 1; ++y) {
                     for (int x = 1; x < nx - 1; ++x) {
                         int64_t i = (static_cast<int64_t>(z) * ny + y) * nx + x;
-                        cd32 c = tmp[i];
-                        cd32 lap = (tmp[i+1] + tmp[i-1] - 2.f*c) * dxi2
-                                 + (tmp[i+nx] + tmp[i-nx] - 2.f*c) * dyi2
-                                 + (tmp[i+(int64_t)nx*ny] + tmp[i-(int64_t)nx*ny] - 2.f*c) * dzi2;
-                        base[i] = c + i_k2dt * c + i_dt * lap;
+                        cd32 c = src[i];
+                        cd32 lap = (src[i+1] + src[i-1] - 2.f*c) * dxi2
+                                 + (src[i+nx] + src[i-nx] - 2.f*c) * dyi2
+                                 + (src[i+(int64_t)nx*ny] + src[i-(int64_t)nx*ny] - 2.f*c) * dzi2;
+                        dst[i] = c + i_k2dt * c + i_dt * lap;
                     }
                 }
             }
         }
+        /* Swap: data always points to the current (just-written) result.
+         * data_alt becomes the next step's scratch target. */
+        std::swap(g->data, g->data_alt);
     }
     return SK_OK;
 }
@@ -340,6 +361,106 @@ extern "C" SK_API int field_grid_inject_amplitude(
         else if (in_hi && !in_lo) node_id = hi;
         else if (in_lo) node_id = lo;
         else return SK_OK;
+    }
+    return SK_OK;
+}
+
+/* ── Tile access (REGULAR grids only) ─────────────────────────────────────
+ * Provides safe windowed read/write so Python callers never need to map or
+ * copy the entire grid buffer.  Prefer these over field_grid_data_re_im()
+ * for any operation that touches a sub-volume.
+ *
+ * Data layout in the grid (REGULAR, band-major):
+ *   data[b * n_cells_total + z * ny * nx + y * nx + x]
+ *
+ * Tile buffer layout (x fastest, z slowest):
+ *   buf[(iz * ny_tile + iy) * nx_tile + ix]  (one cd32 = two floats re,im)
+ * ─────────────────────────────────────────────────────────────────────────*/
+
+extern "C" SK_API size_t field_grid_band_bytes(const FieldGrid* g)
+{
+    if (!g || g->kind != FIELD_GRID_REGULAR) return 0;
+    return static_cast<size_t>(g->n_cells_total) * sizeof(cd32);
+}
+
+/* Helper: validate tile coordinates and output capacity.
+ * Returns SK_OK on success, SK_ERR_NULL_STATE / SK_ERR_DIM_MISMATCH on error. */
+static int _validate_tile(
+    const FieldGrid* g,
+    int band,
+    int x0, int y0, int z0,
+    int nx_t, int ny_t, int nz_t,
+    int buf_len)
+{
+    if (!g) return SK_ERR_NULL_STATE;
+    if (g->kind != FIELD_GRID_REGULAR) return SK_ERR_DIM_MISMATCH;
+    if (band < 0 || band >= g->n_bands) return SK_ERR_DIM_MISMATCH;
+    if (nx_t <= 0 || ny_t <= 0 || nz_t <= 0) return SK_ERR_DIM_MISMATCH;
+    /* Bounds: tile must fit entirely within grid dims. */
+    if (x0 < 0 || y0 < 0 || z0 < 0) return SK_ERR_DIM_MISMATCH;
+    if (x0 + nx_t > g->dims[0]) return SK_ERR_DIM_MISMATCH;
+    if (y0 + ny_t > g->dims[1]) return SK_ERR_DIM_MISMATCH;
+    if (z0 + nz_t > g->dims[2]) return SK_ERR_DIM_MISMATCH;
+    /* Capacity check: caller buffer must hold nx*ny*nz complex cells = 2 floats each. */
+    int64_t need = static_cast<int64_t>(nx_t) * ny_t * nz_t * 2;
+    if (need > static_cast<int64_t>(buf_len)) return SK_ERR_DIM_MISMATCH;
+    return SK_OK;
+}
+
+extern "C" SK_API int field_grid_read_tile(
+    const FieldGrid* g,
+    int band,
+    int x0, int y0, int z0,
+    int nx_t, int ny_t, int nz_t,
+    float* out_re_im,
+    int    out_len)
+{
+    if (!out_re_im) return SK_ERR_NULL_STATE;
+    int rc = _validate_tile(g, band, x0, y0, z0, nx_t, ny_t, nz_t, out_len);
+    if (rc != SK_OK) return rc;
+
+    const int nx_g = g->dims[0];
+    const int ny_g = g->dims[1];
+    float* dst = out_re_im;
+
+    for (int iz = 0; iz < nz_t; ++iz) {
+        for (int iy = 0; iy < ny_t; ++iy) {
+            /* Source: contiguous run of nx_t cells in x */
+            int64_t cell = (static_cast<int64_t>(z0 + iz) * ny_g + (y0 + iy)) * nx_g + x0;
+            const cd32* src = g->data + static_cast<int64_t>(band) * g->n_cells_total + cell;
+            /* Destination: nx_t interleaved (re, im) pairs */
+            std::memcpy(dst, reinterpret_cast<const float*>(src),
+                        static_cast<size_t>(nx_t) * sizeof(cd32));
+            dst += static_cast<ptrdiff_t>(nx_t) * 2;
+        }
+    }
+    return SK_OK;
+}
+
+extern "C" SK_API int field_grid_write_tile(
+    FieldGrid*   g,
+    int band,
+    int x0, int y0, int z0,
+    int nx_t, int ny_t, int nz_t,
+    const float* in_re_im,
+    int          in_len)
+{
+    if (!in_re_im) return SK_ERR_NULL_STATE;
+    int rc = _validate_tile(g, band, x0, y0, z0, nx_t, ny_t, nz_t, in_len);
+    if (rc != SK_OK) return rc;
+
+    const int nx_g = g->dims[0];
+    const int ny_g = g->dims[1];
+    const float* src = in_re_im;
+
+    for (int iz = 0; iz < nz_t; ++iz) {
+        for (int iy = 0; iy < ny_t; ++iy) {
+            int64_t cell = (static_cast<int64_t>(z0 + iz) * ny_g + (y0 + iy)) * nx_g + x0;
+            cd32* dst = g->data + static_cast<int64_t>(band) * g->n_cells_total + cell;
+            std::memcpy(reinterpret_cast<float*>(dst), src,
+                        static_cast<size_t>(nx_t) * sizeof(cd32));
+            src += static_cast<ptrdiff_t>(nx_t) * 2;
+        }
     }
     return SK_OK;
 }

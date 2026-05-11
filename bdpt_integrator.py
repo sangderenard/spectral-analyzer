@@ -256,14 +256,13 @@ def aggregate_to_image_pixel_cone(
         n_px:      int,
         n_py:      int,
         sensor_group_id: int,
+        sensor_camera: dict[str, Any] | None = None,
         ) -> np.ndarray:
-    """PIXEL_CONE aggregator: bin EndpointRecords whose ``subpath_id``
-    encodes the pixel index directly.
+    """PIXEL_CONE aggregator: bin EndpointRecords by decoding ``subpath_id``.
 
-    Records emitted by the C++ PIXEL_CONE pass set ``subpath_id =
-    py * n_px + px`` and ``group_id = sensor_group_id`` for the camera
-    sensor group.  No plane projection is needed — pixel coordinates are
-    decoded directly.
+    Records emitted by the C++ PIXEL_CONE pass encode the destination pixel as
+    ``subpath_id = py * n_px + px``.  Use that encoding directly; do not
+    project world hit positions back onto the sensor plane.
 
     Returns a complex64 array of shape ``(n_bands, n_py, n_px)``, summed
     coherently (no normalisation) so the consumer can compute mean,
@@ -286,13 +285,14 @@ def aggregate_to_image_pixel_cone(
     if not np.any(keep):
         return out
 
-    sub = sub[keep]
     bid = bid[keep]
-    py  = (sub // int(n_px)).astype(np.int32)
-    px  = (sub %  int(n_px)).astype(np.int32)
+    sub = sub[keep]
     re  = records["amp_re"][keep]
     im  = records["amp_im"][keep]
     amp = re.astype(np.float32) + 1j * im.astype(np.float32)
+
+    px = (sub % int(n_px)).astype(np.int32)
+    py = (sub // int(n_px)).astype(np.int32)
 
     in_range = (px >= 0) & (px < n_px) & (py >= 0) & (py < n_py)
     if not np.any(in_range):

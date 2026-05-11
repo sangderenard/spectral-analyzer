@@ -102,6 +102,9 @@ typedef struct {
     int    n_py;                    /* vertical   pixel count               */
     int    n_aperture_samples;      /* stochastic samples per pixel         */
     int    aperture_stop_group_id;  /* -1 = use disk fallback               */
+    int    pixel_stream_divisor;    /* process every Nth pixel (>=1)        */
+    int    pixel_stream_phase;      /* stream phase offset [0, N)           */
+    int    pixel_stream_phase_from_seed; /* 1: derive phase from batch seed */
 } CameraSensorDesc;
 
 /**

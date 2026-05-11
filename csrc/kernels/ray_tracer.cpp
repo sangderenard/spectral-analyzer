@@ -3425,6 +3425,14 @@ static inline void sensor_film_row_to_summary(
     out.electrons_flux_hz = static_cast<float>(electrons_mean);
 }
 
+static bool project_endpoint_record_to_sensor_pixel(
+    const CameraSensorDesc& cam,
+    const EndpointRecord&    E,
+    int                      n_px,
+    int                      n_py,
+    int&                     out_px,
+    int&                     out_py);
+
 int ray_tracer_reduce_endpoint_records_to_sensor_integral(
     const RayTracerState* st,
     const EndpointRecord* records,
@@ -3455,6 +3463,15 @@ int ray_tracer_reduce_endpoint_records_to_sensor_integral(
         std::memset(out_telemetry, 0, sizeof(*out_telemetry));
         out_telemetry->input_records = n_records;
     }
+
+    const CameraSensorDesc* cam_desc = nullptr;
+    if (sensor_group_id >= 0
+        && sensor_group_id < static_cast<int>(st->tri_group_has_camera.size())
+        && st->tri_group_has_camera[static_cast<size_t>(sensor_group_id)]) {
+        cam_desc = &st->tri_group_camera[static_cast<size_t>(sensor_group_id)];
+    }
+    if (!cam_desc)
+        return SK_ERR_DIM_MISMATCH;
 
     const int n_bands = st->n_bands;
     const size_t pix_count = static_cast<size_t>(n_px) * static_cast<size_t>(n_py);
@@ -3493,14 +3510,9 @@ int ray_tracer_reduce_endpoint_records_to_sensor_integral(
             continue;
         }
 
-        const int sub = static_cast<int>(E.subpath_id);
-        if (sub < 0) {
-            if (out_telemetry) out_telemetry->drop_negative_subpath += 1;
-            continue;
-        }
-        const int py = sub / n_px;
-        const int px = sub - py * n_px;
-        if (px < 0 || px >= n_px || py < 0 || py >= n_py) {
+        int px = -1;
+        int py = -1;
+        if (!project_endpoint_record_to_sensor_pixel(*cam_desc, E, n_px, n_py, px, py)) {
             if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
             continue;
         }
@@ -3643,6 +3655,53 @@ int ray_tracer_reduce_endpoint_records_to_sensor_integral(
     return SK_OK;
 }
 
+static bool project_endpoint_record_to_sensor_pixel(
+    const CameraSensorDesc& cam,
+    const EndpointRecord&    E,
+    int                      n_px,
+    int                      n_py,
+    int&                     out_px,
+    int&                     out_py)
+{
+    if (n_px <= 0 || n_py <= 0)
+        return false;
+
+    V3d cpos(cam.pos[0], cam.pos[1], cam.pos[2]);
+    V3d cfwd(cam.fwd[0], cam.fwd[1], cam.fwd[2]);
+    V3d cup (cam.up[0],  cam.up[1],  cam.up[2]);
+    const double cfwd_norm = cfwd.norm();
+    const double cup_norm = cup.norm();
+    if (cfwd_norm <= 1.0e-12 || cup_norm <= 1.0e-12)
+        return false;
+    cfwd /= cfwd_norm;
+    cup  /= cup_norm;
+
+    V3d cright = cfwd.cross(cup);
+    const double cright_norm = cright.norm();
+    if (cright_norm <= 1.0e-12)
+        return false;
+    cright /= cright_norm;
+    cup = cright.cross(cfwd).normalized();
+
+    if (cam.sensor_w_m <= 0.0 || cam.sensor_h_m <= 0.0)
+        return false;
+
+    const V3d sensor_origin = cpos
+        - 0.5 * cam.sensor_w_m * cright
+        - 0.5 * cam.sensor_h_m * cup;
+    const V3d hit_pos(E.pos[0], E.pos[1], E.pos[2]);
+    const V3d rel = hit_pos - sensor_origin;
+
+    const double pix_w = cam.sensor_w_m / static_cast<double>(std::max(1, n_px));
+    const double pix_h = cam.sensor_h_m / static_cast<double>(std::max(1, n_py));
+    if (pix_w <= 0.0 || pix_h <= 0.0)
+        return false;
+
+    out_px = static_cast<int>(std::floor(rel.dot(cright) / pix_w));
+    out_py = static_cast<int>(std::floor(rel.dot(cup) / pix_h));
+    return (out_px >= 0 && out_px < n_px && out_py >= 0 && out_py < n_py);
+}
+
 int ray_tracer_reduce_endpoint_records_to_rgb_image(
     const RayTracerState* st,
     const EndpointRecord* records,
@@ -3669,6 +3728,15 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
         std::memset(out_telemetry, 0, sizeof(*out_telemetry));
         out_telemetry->input_records = n_records;
     }
+
+    const CameraSensorDesc* cam_desc = nullptr;
+    if (sensor_group_id >= 0
+        && sensor_group_id < static_cast<int>(st->tri_group_has_camera.size())
+        && st->tri_group_has_camera[static_cast<size_t>(sensor_group_id)]) {
+        cam_desc = &st->tri_group_camera[static_cast<size_t>(sensor_group_id)];
+    }
+    if (!cam_desc)
+        return SK_ERR_DIM_MISMATCH;
 
     // Obstacle-1: make endpoint->color a canonical C++ route.
     // We accumulate coherent complex amplitudes per (band,pixel), then project
@@ -3705,14 +3773,9 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
             if (out_telemetry) out_telemetry->drop_invalid_band += 1;
             continue;
         }
-        const int sub = static_cast<int>(E.subpath_id);
-        if (sub < 0) {
-            if (out_telemetry) out_telemetry->drop_negative_subpath += 1;
-            continue;
-        }
-        const int py = sub / n_px;
-        const int px = sub - py * n_px;
-        if (px < 0 || px >= n_px || py < 0 || py >= n_py) {
+        int px = -1;
+        int py = -1;
+        if (!project_endpoint_record_to_sensor_pixel(*cam_desc, E, n_px, n_py, px, py)) {
             if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
             continue;
         }
@@ -4811,13 +4874,14 @@ static int ray_tracer_bidirectional_impl(
             V3d pos = origin + dir * (EPS * 200.0);
             double path_len = 0.0;
             uint32_t my_subpath = subpath_counter++;
+            uint32_t interaction_flags = 0u;
 
             /* Launch-context dispatch: apply region transforms to emission
              * rays immediately after post-triangulated intercept prep. */
             for (const RtScaleContext& ctx : st->scale_contexts) {
                 V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
                 if ((pos - c).norm() <= ctx.radius) {
-                    dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
+                    interaction_flags |= dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
                 }
             }
 
@@ -4874,7 +4938,7 @@ static int ray_tracer_bidirectional_impl(
                         E.amp_re    = (float)amp[b].real();
                         E.amp_im    = (float)amp[b].imag();
                         E.cos_theta = (float)cos_theta;
-                        E._pad      = 0.0f;
+                        E._pad      = (float)interaction_flags;
                     }
                 }
 
@@ -4915,7 +4979,7 @@ static int ray_tracer_bidirectional_impl(
                 for (const RtScaleContext& ctx : st->scale_contexts) {
                     V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
                     if ((pos - c).norm() <= ctx.radius) {
-                        dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
+                        interaction_flags |= dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
                     }
                 }
             }
@@ -4981,18 +5045,33 @@ bdpt_done:
             const int n_px = cam.n_px;
             const int n_py = cam.n_py;
             const int n_ap = cam.n_aperture_samples;
+            const int stream_div = std::max(1, cam.pixel_stream_divisor);
+            int stream_phase = cam.pixel_stream_phase;
+            if (cam.pixel_stream_phase_from_seed) {
+                stream_phase = (stream_div > 0)
+                    ? static_cast<int>(seed % static_cast<uint32_t>(stream_div))
+                    : 0;
+            }
+            if (stream_div > 0) {
+                stream_phase %= stream_div;
+                if (stream_phase < 0) stream_phase += stream_div;
+            }
             const double pix_w = cam.sensor_w_m / std::max(1, n_px);
             const double pix_h = cam.sensor_h_m / std::max(1, n_py);
 
             /* Reserve fixed slots per pixel (n_ap * n_bands each), then
              * compact per-pixel written counts serially for contiguous output. */
             const long long total_pixels = (long long)n_px * n_py;
+            const long long stream_pixels =
+                (total_pixels > stream_phase)
+                ? (1LL + (total_pixels - 1LL - stream_phase) / stream_div)
+                : 0LL;
             const long long recs_per_px  = (long long)n_ap * n_bands;
             const int slot_base = rec_count;
             const long long cap_left = static_cast<long long>(out_cap - slot_base);
             if (recs_per_px <= 0 || cap_left < recs_per_px)
                 continue;
-            const long long pixels_fit = std::min(total_pixels, cap_left / recs_per_px);
+            const long long pixels_fit = std::min(stream_pixels, cap_left / recs_per_px);
             if (pixels_fit <= 0)
                 continue;
 
@@ -5007,15 +5086,17 @@ bdpt_done:
                 VXcd amp_local(n_bands);
                 #pragma omp for schedule(dynamic, 8)
                 for (long long pi = 0; pi < pixels_fit; ++pi) {
-                    int py = (int)(pi / n_px);
-                    int px = (int)(pi - (long long)py * n_px);
+                    const long long pixel_linear =
+                        static_cast<long long>(stream_phase) + pi * static_cast<long long>(stream_div);
+                    int py = (int)(pixel_linear / n_px);
+                    int px = (int)(pixel_linear - (long long)py * n_px);
                     EndpointRecord* slot = out_records + slot_base + pi * recs_per_px;
                     int slot_written = 0;
 
                     /* Deterministic per-pixel RNG seed (decoupled from the
                      * shared cone_rng so threads don't race). */
                     uint64_t s = (uint64_t)seed * 0x9E3779B97F4A7C15ULL
-                               + (uint64_t)pi * 0xBF58476D1CE4E5B9ULL
+                               + (uint64_t)pixel_linear * 0xBF58476D1CE4E5B9ULL
                                + 0x94D049BB133111EBULL;
                     trng.seed(s);
                     std::uniform_real_distribution<double> Up(0.0, 1.0);
@@ -5025,12 +5106,20 @@ bdpt_done:
                                + (py + 0.5) * pix_h * cup;
 
                     for (int ai = 0; ai < n_ap; ++ai) {
-                        /* Stochastic uniform-on-disk aperture sample
-                         * (concentric mapping from two uniform [0,1) draws —
-                         * cheap, no grid pattern). */
-                        double u1 = Up(trng), u2 = Up(trng);
-                        double r  = std::sqrt(u1) * cam.aperture_radius_m;
-                        double th = 2.0 * M_PI * u2;
+                        uint32_t interaction_flags = 0u;
+                        /* Stratified stochastic uniform-on-disk aperture sample.
+                         * The radial stratum guarantees full support coverage
+                         * of the aperture-projected angle family, including
+                         * near-edge influence at very large apertures and
+                         * stable center behavior at very small apertures.
+                         * Angle uses golden-angle progression with jitter to
+                         * avoid grid artifacts while preserving reproducibility.
+                         */
+                        double j1 = Up(trng), j2 = Up(trng);
+                        double q  = (static_cast<double>(ai) + j1) / static_cast<double>(std::max(1, n_ap));
+                        double r  = std::sqrt(std::min(1.0, std::max(0.0, q))) * cam.aperture_radius_m;
+                        const double golden = 2.39996322972865332; /* radians */
+                        double th = golden * static_cast<double>(ai) + 2.0 * M_PI * j2;
                         V3d ap_pt = aperture_centre
                                   + r * std::cos(th) * cright
                                   + r * std::sin(th) * cup;
@@ -5074,7 +5163,7 @@ bdpt_done:
                         for (const RtScaleContext& ctx : st->scale_contexts) {
                             V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
                             if ((ap_pt - c).norm() <= ctx.radius) {
-                                dispatch_scale_context_entry(*st, ctx, pos, dir, amp_local);
+                                interaction_flags |= dispatch_scale_context_entry(*st, ctx, pos, dir, amp_local);
                             }
                         }
 
@@ -5111,7 +5200,7 @@ bdpt_done:
 
                         V3d hit_n = hit_n_param;
                         double cos_theta = std::abs(dir.dot(hit_n));
-                        uint32_t my_subpath = (uint32_t)pi;
+                        uint32_t my_subpath = (uint32_t)pixel_linear;
 
                         /* Write into this pixel's private fixed slot. */
                         for (int b = 0; b < n_bands; ++b) {
@@ -5131,7 +5220,7 @@ bdpt_done:
                             E.amp_re    = (float)amp_local[b].real();
                             E.amp_im    = (float)amp_local[b].imag();
                             E.cos_theta = (float)cos_theta;
-                            E._pad      = 0.0f;
+                            E._pad      = (float)interaction_flags;
                         }
                     }
                     pixel_written[static_cast<size_t>(pi)] = slot_written;

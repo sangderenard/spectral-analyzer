@@ -3618,6 +3618,15 @@ Returns : (n_written, n_live) — segments written and rays still alive
                      cam_desc.aperture_stop_group_id =
                          d.contains("aperture_stop_group_id")
                          ? d["aperture_stop_group_id"].cast<int>() : -1;
+                     cam_desc.pixel_stream_divisor =
+                         d.contains("pixel_stream_divisor")
+                         ? d["pixel_stream_divisor"].cast<int>() : 1;
+                     cam_desc.pixel_stream_phase =
+                         d.contains("pixel_stream_phase")
+                         ? d["pixel_stream_phase"].cast<int>() : 0;
+                     cam_desc.pixel_stream_phase_from_seed =
+                         d.contains("pixel_stream_phase_from_seed")
+                         ? d["pixel_stream_phase_from_seed"].cast<int>() : 1;
                      desc.sensor_camera = &cam_desc;
                  }
 
@@ -3666,7 +3675,10 @@ parametric_surface: optional dict for strike/emission parametric override.
 sensor_camera    : optional dict for SENSOR + PIXEL_CONE groups, with keys
                    pos (3,), fwd (3,), up (3,), sensor_w_m, sensor_h_m,
                    focal_m, aperture_radius_m, n_px, n_py,
-                   n_aperture_samples, [aperture_stop_group_id (default -1)].
+                   n_aperture_samples, [aperture_stop_group_id (default -1)],
+                   [pixel_stream_divisor (default 1)],
+                   [pixel_stream_phase (default 0)],
+                   [pixel_stream_phase_from_seed (default 1)].
 
 Returns assigned group_id (>= 0).  Raises on failure.
 )doc")
@@ -3786,6 +3798,55 @@ Bidirectional path tracing pass with per-emitter packed ray quotas.
 
 n_rays_per_emitter: int32 (n_emitters,), registration-order quotas for
 EMISSIVE TriGroups.
+)doc")
+        .def("bidirectional_packed_into",
+             [](PyRayTracer& self,
+                py::array_t<int32_t, py::array::c_style | py::array::forcecast> n_rays_per_emitter,
+                int max_bounces,
+                double min_amplitude,
+                uint32_t seed,
+                py::array_t<float, py::array::c_style | py::array::forcecast> out_records) {
+                 auto nr = n_rays_per_emitter.request();
+                 if (nr.ndim != 1)
+                     throw std::runtime_error("n_rays_per_emitter must be int32 shape (n_emitters,)");
+                 auto ob = out_records.request();
+                 if (ob.ndim != 2 || ob.shape[1] != 16)
+                     throw std::runtime_error("out_records must be float32 shape (N, 16)");
+                 if (ob.shape[0] <= 0)
+                     throw std::invalid_argument("out_records must have N > 0");
+
+                 EndpointRecord* out = reinterpret_cast<EndpointRecord*>(ob.ptr);
+                 int out_cap = static_cast<int>(ob.shape[0]);
+                 int n_out = 0;
+                 int rc;
+                 {
+                     py::gil_scoped_release release;
+                     rc = ray_tracer_bidirectional_packed(
+                         self.handle,
+                         static_cast<const int32_t*>(nr.ptr),
+                         static_cast<int>(nr.shape[0]),
+                         max_bounces,
+                         min_amplitude,
+                         seed,
+                         out,
+                         out_cap,
+                         &n_out);
+                 }
+                 if (rc != SK_OK)
+                     throw std::runtime_error(
+                         "ray_tracer_bidirectional_packed failed: rc=" + std::to_string(rc));
+                 return n_out;
+             },
+             py::arg("n_rays_per_emitter"),
+             py::arg("max_bounces") = 8,
+             py::arg("min_amplitude") = 0.005,
+             py::arg("seed") = 0,
+             py::arg("out_records"),
+             R"doc(
+Bidirectional packed pass writing directly into caller-provided output storage.
+
+Returns number of written EndpointRecords (N_out <= out_records.shape[0]).
+Useful for file-backed memmap buffers to avoid RAM-only allocation limits.
 )doc")
     .def("reduce_endpoint_records_to_sensor_integral",
              [](PyRayTracer& self,

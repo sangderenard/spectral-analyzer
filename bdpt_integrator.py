@@ -49,6 +49,30 @@ TRI_GROUP_SAMPLE_PIXEL_CONE = 3   # SENSOR-only: per-pixel cone scan via CameraS
 TRI_PARAM_SURFACE_NONE      = 0
 TRI_PARAM_SURFACE_POLY_BARY = 1
 
+# Camera operating modes for CameraSensor.camera_mode.
+# Tier 0 — oracle pinhole reference: 1 ray per pixel, deterministic, clean supervision
+CAMERA_MODE_ORACLE_PINHOLE_REFERENCE = 0
+
+# Tier 1 — physical pinhole: tiny aperture, photon-limited, noise-dominated
+CAMERA_MODE_PHYSICAL_PINHOLE = 1
+
+# Tier 2 — aperture cone: disk samples, no lens bending (default for simple scenes)
+CAMERA_MODE_APERTURE_CONE = 2
+
+# Tier 3 — ideal thin-lens geometric: focus-plane convergence via thin lens
+CAMERA_MODE_THIN_LENS_GEOMETRIC = 3
+
+# Tier 4 — element-by-element geometric assembly: real optical surface chain (STUB)
+CAMERA_MODE_GEOMETRIC_ASSEMBLY = 4
+
+# Tier 5 — wave-patch transport: diffraction, interference, finite-element waves (STUB)
+CAMERA_MODE_WAVE_ASSEMBLY = 5
+
+# Tier 6 — baked transform function: accelerated LUT/spline/neural transport map (STUB)
+CAMERA_MODE_BAKED_TRANSFORM = 6
+
+# Legacy alias for API compatibility during transition (will be removed)
+CAMERA_MODE_THICK_LENS_WAVE = 5  # maps to WAVE_ASSEMBLY
 
 # Scale-context KIND enum (mirror of csrc/include/ray_tracer.h SCALE_CONTEXT_KIND_*).
 SCALE_CONTEXT_KIND_RAY                 = 0
@@ -109,15 +133,21 @@ class CameraSensor:
     up:                   np.ndarray   # (3,) float64 — unit up
     sensor_w_m:           float
     sensor_h_m:           float
-    focal_m:              float
+    focal_m:              float        # image-side dist sensor→aperture (m)
     aperture_radius_m:    float
     n_px:                 int
     n_py:                 int
     n_aperture_samples:   int
     aperture_stop_group_id: int = -1
+    # Optical mode extensions — optional, default = APERTURE_CONE.
+    camera_mode:          int   = CAMERA_MODE_APERTURE_CONE
+    effective_focal_m:    float = 0.0   # effective focal length; 0 = use focal_m
+    focus_distance_m:     float = 0.0   # scene focus distance; 0 = auto
+    lens_center: np.ndarray | None = None  # (3,) float64; None = use aperture centre
+    lens_fwd:    np.ndarray | None = None  # (3,) float64 unit vec; None = camera fwd
 
     def to_dict(self) -> dict:
-        return dict(
+        d = dict(
             pos = np.asarray(self.pos, np.float64).reshape(3),
             fwd = np.asarray(self.fwd, np.float64).reshape(3),
             up  = np.asarray(self.up,  np.float64).reshape(3),
@@ -129,7 +159,15 @@ class CameraSensor:
             n_py               = int(self.n_py),
             n_aperture_samples = int(self.n_aperture_samples),
             aperture_stop_group_id = int(self.aperture_stop_group_id),
+            camera_mode        = int(self.camera_mode),
+            effective_focal_m  = float(self.effective_focal_m),
+            focus_distance_m   = float(self.focus_distance_m),
         )
+        if self.lens_center is not None:
+            d["lens_center"] = np.asarray(self.lens_center, np.float64).reshape(3)
+        if self.lens_fwd is not None:
+            d["lens_fwd"] = np.asarray(self.lens_fwd, np.float64).reshape(3)
+        return d
 
 
 @_dc.dataclass

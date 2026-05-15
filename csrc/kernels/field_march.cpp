@@ -309,6 +309,14 @@ extern "C" SK_API int64_t field_grid_n_cells_total(const FieldGrid* g) {
 }
 extern "C" SK_API const float* field_grid_bmin(const FieldGrid* g) { return g ? g->bmin : nullptr; }
 extern "C" SK_API const float* field_grid_bmax(const FieldGrid* g) { return g ? g->bmax : nullptr; }
+extern "C" SK_API int field_grid_regular_dims(const FieldGrid* g, int* out_nx, int* out_ny, int* out_nz) {
+    if (!g || !out_nx || !out_ny || !out_nz) return SK_ERR_NULL_STATE;
+    if (g->kind != FIELD_GRID_REGULAR) return SK_ERR_DIM_MISMATCH;
+    *out_nx = g->dims[0];
+    *out_ny = g->dims[1];
+    *out_nz = g->dims[2];
+    return SK_OK;
+}
 extern "C" SK_API float* field_grid_data_re_im(FieldGrid* g) {
     return g ? reinterpret_cast<float*>(g->data) : nullptr;
 }

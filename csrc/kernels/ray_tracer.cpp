@@ -1,4 +1,7 @@
 #define _USE_MATH_DEFINES
+#ifndef NOMINMAX
+#  define NOMINMAX
+#endif
 /**
  * ray_tracer.cpp — Complex spectral 3-D ray tracer.
  *
@@ -49,9 +52,13 @@
 #include "triangle_groups.h"
 #include "field_grid.h"
 #include "thread_pool.h"
+#include "optical_handlers.h"
 
 #include <mutex>
 #include <thread>
+#include <cstring>
+#include "ray_pipeline.h"
+#include "gl_compute.h"
 
 /* Compile-time parity checks: SensorRecord and FilmRecord must be exactly the
  * same size as their Python ctypes counterparts (SensorRecord: 48 floats = 192 B,
@@ -77,6 +84,7 @@ static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 using cd   = std::complex<double>;
@@ -85,8 +93,9 @@ using VXcd = Eigen::VectorXcd;
 
 static constexpr double TWO_PI     = 2.0 * M_PI;
 static constexpr double EPS        = 1e-9;
+static constexpr double T_SELF     = 1e-10;
 static constexpr int    BVH_LEAF_MAX = 4;   /* triangles per BVH leaf */
-static constexpr bool    RT_ENABLE_PROFILE = true;
+static constexpr bool    RT_ENABLE_PROFILE = false;
 
 static thread_local std::string g_rt_alloc_table;
 
@@ -117,14 +126,20 @@ struct Triangle {
     V3d edge2;   /* v2 - v0 */
     V3d normal;  /* outward unit normal */
     int mat_idx = 0;   /* index into RayTracerState::mat_buf rows (per-band record stride) */
-    int flags   = 0;   /* MAT_FLAG_TRANSMISSIVE | MAT_FLAG_APERTURE_STOP | … */
+    /* Boundary-side media relative to geometric normal:
+     *   medium_pos_mat_idx = medium on +normal side
+     *   medium_neg_mat_idx = medium on -normal side
+     * Use -1 for ambient air/vacuum. */
+    int medium_pos_mat_idx = -1;
+    int medium_neg_mat_idx = -1;
+    int flags   = 0;   /* MAT_FLAG_APERTURE_STOP | MAT_FLAG_EMISSIVE | … */
 };
 
 /* ── Möller-Trumbore ray-triangle intersection ─────────────────────────────── */
 
-/* Returns true and sets t_out (distance > EPS) when the ray (orig + t*dir)
-   hits the triangle.  Culls back-faces when the ray originates inside the
-   scene (normal-dot-dir could be positive after a diffuse bounce). */
+/* Returns true and sets t_out when the ray (orig + t*dir) hits either side
+   of the triangle.  Back-face hits are real material interactions; response
+   code orients the transport normal after the hit is found. */
 static bool ray_triangle_hit(
     const V3d& orig, const V3d& dir,
     const Triangle& tri,
@@ -147,7 +162,7 @@ static bool ray_triangle_hit(
         return false;
 
     double t = f * tri.edge2.dot(q);
-    if (t < 1e-6)
+    if (t <= T_SELF)
         return false;           /* behind or at origin */
 
     t_out = t;
@@ -170,7 +185,7 @@ struct AABB {
 
     /* Slab test.  inv_dir = 1/dir (IEEE-754 handles ±inf correctly). */
     bool hit(const V3d& orig, const V3d& inv_dir, double t_max) const {
-        double tmin = 1e-6;
+        double tmin = T_SELF;
         for (int i = 0; i < 3; ++i) {
             double a = (lo[i] - orig[i]) * inv_dir[i];
             double b = (hi[i] - orig[i]) * inv_dir[i];
@@ -259,7 +274,7 @@ static void bvh_query(
                 int ti = tri_ids[static_cast<size_t>(i)];
                 double t;
                 if (ray_triangle_hit(orig, dir, tris[static_cast<size_t>(ti)], t)
-                    && t < t_min)
+                    && t > T_SELF && t < t_min)
                 {
                     t_min   = t;
                     hit_tri = ti;
@@ -328,6 +343,30 @@ static V3d cosine_hemisphere(const V3d& n, std::mt19937_64& rng)
     V3d t  = n.cross(up).normalized();
     V3d b  = n.cross(t);
 
+    return (x * t + y * b + z * n).normalized();
+}
+
+/* Sample a hemisphere lobe around axis with PDF proportional to cos(theta)^k.
+ * k=0 gives uniform hemisphere; larger k narrows around axis. */
+static V3d cosine_power_lobe(const V3d& axis, double k, std::mt19937_64& rng)
+{
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    const double u1 = U(rng);
+    const double u2 = U(rng);
+    const double kk = std::max(0.0, k);
+
+    const double cos_t = std::pow(u1, 1.0 / (kk + 1.0));
+    const double sin_t = std::sqrt(std::max(0.0, 1.0 - cos_t * cos_t));
+    const double phi   = TWO_PI * u2;
+
+    const double x = sin_t * std::cos(phi);
+    const double y = sin_t * std::sin(phi);
+    const double z = cos_t;
+
+    const V3d n = axis.normalized();
+    const V3d up = (std::abs(n.x()) < 0.9) ? V3d(1, 0, 0) : V3d(0, 1, 0);
+    const V3d t = n.cross(up).normalized();
+    const V3d b = n.cross(t);
     return (x * t + y * b + z * n).normalized();
 }
 
@@ -535,6 +574,32 @@ struct RayTracerState {
     double                             profile_pulse_period_s = 2.0;
     std::atomic<uint64_t>              profile_pulse_seq{0};
     std::atomic<uint64_t>              profile_pulse_next_ns{0};
+
+    /* ── Optical assembly for camera sensor rays (Phase C) ──────────────────── */
+    OpticalAssembly*                   optical_assembly = nullptr;
+    int                                optical_assembly_owned = 0;
+    int                                camera_mode = 0;
+
+    /* ── Event telemetry for optical event tracking (Phase C) ────────────────── */
+    struct {
+        uint64_t rays_launched = 0;
+        uint64_t rays_blocked_by_stop = 0;
+        uint64_t rays_hit_lens_surface = 0;
+        uint64_t rays_refracted = 0;
+        uint64_t rays_reflected = 0;
+        uint64_t rays_total_internal_reflection = 0;
+        uint64_t rays_entered_wave_region = 0;
+        uint64_t rays_exited_wave_region = 0;
+        uint64_t rays_deposited_sensor = 0;
+        uint64_t rays_out_of_domain = 0;
+        uint64_t rays_fell_back_to_full_solve = 0;
+        double energy_in = 0.0;
+        double energy_out = 0.0;
+        double energy_absorbed = 0.0;
+        double energy_blocked = 0.0;
+        double mean_phase_error = 0.0;
+        double mean_focus_error = 0.0;
+    } camera_event_telemetry;
 };
 
 static inline uint64_t rt_steady_now_ns()
@@ -562,21 +627,12 @@ static inline void rt_maybe_emit_pulse(
     st.profile_pulse_next_ns.store(next_ns, std::memory_order_relaxed);
 
     const uint64_t seq = st.profile_pulse_seq.fetch_add(1, std::memory_order_relaxed) + 1;
-    std::fprintf(
-        stderr,
-        "[rt-pulse] seq=%llu phase=%s src=%d ray=%d bounce=%d tris=%llu bands=%d strike_rows=%llu full_march_steps=%llu ctx_entries=%llu\n",
-        static_cast<unsigned long long>(seq),
-        phase ? phase : "trace",
-        src_idx,
-        ray_idx,
-        bounce_idx,
-        static_cast<unsigned long long>(st.tris.size()),
-        st.n_bands,
-        static_cast<unsigned long long>(st.camera_strike_stride_floats > 0
-            ? (st.camera_strike_rows.size() / static_cast<size_t>(st.camera_strike_stride_floats))
-            : 0),
-        static_cast<unsigned long long>(st.camera_full_march_steps),
-        static_cast<unsigned long long>(st.camera_full_march_context_entries));
+        std::fprintf(stderr, "[rt-pulse] seq=%llu phase=%s src=%d ray=%d bounce=%d\n",
+            static_cast<unsigned long long>(seq),
+            phase ? phase : "trace",
+            src_idx,
+            ray_idx,
+            bounce_idx);
 
     const char* table = ray_tracer_allocation_table(&st);
     if (table && table[0] != '\0') {
@@ -634,6 +690,42 @@ static inline double mat_diffusion(const RayTracerState& st, int mat_idx, int b 
 static inline double mat_n_real(const RayTracerState& st, int mat_idx, int b = 0) {
     return static_cast<double>(mat_band_record(st, mat_idx, b)[7]);
 }
+
+static inline double mat_n_imag(const RayTracerState& st, int mat_idx, int b = 0) {
+    return static_cast<double>(mat_band_record(st, mat_idx, b)[8]);
+}
+
+static inline double mat_transmittance(const RayTracerState& st, int mat_idx, int b = 0) {
+    return static_cast<double>(mat_band_record(st, mat_idx, b)[3]);
+}
+
+static inline double medium_n_real(const RayTracerState& st, int medium_mat_idx, int b = 0) {
+    if (medium_mat_idx < 0) return 1.0;
+    const double n = mat_n_real(st, medium_mat_idx, b);
+    return (n > EPS) ? n : 1.0;
+}
+
+static inline bool tri_boundary_media(
+    const Triangle& tri,
+    bool front_face,
+    int& medium_from_mat_idx,
+    int& medium_to_mat_idx)
+{
+    const bool explicit_pair = (tri.medium_pos_mat_idx != tri.medium_neg_mat_idx);
+    if (!explicit_pair) return false;
+
+    if (front_face) {
+        /* incoming from +normal side, crossing to -normal side */
+        medium_from_mat_idx = tri.medium_pos_mat_idx;
+        medium_to_mat_idx   = tri.medium_neg_mat_idx;
+    } else {
+        /* incoming from -normal side, crossing to +normal side */
+        medium_from_mat_idx = tri.medium_neg_mat_idx;
+        medium_to_mat_idx   = tri.medium_pos_mat_idx;
+    }
+    return true;
+}
+
 
 /* Per-material Stokes shift (Hz, positive = red-shift). Stored in band-0
  * pad slot [9] of the MatBuf record by `MaterialDatabase.build_mat_buf()`
@@ -787,6 +879,9 @@ static inline bool tri_bary_uv(const Triangle& tri, const V3d& p,
     return true;
 }
 
+static inline bool tri_param_kind_is_sdf(const int kind);
+static inline bool tri_requires_optical_sdf(const Triangle& tri);
+
 static inline bool apply_parametric_surface_point(
     const RayTracerState& st,
     int tri_id,
@@ -808,6 +903,8 @@ static inline bool apply_parametric_surface_point(
         return false;
 
     int kind = st.tri_group_parametric_kind[static_cast<size_t>(gid)];
+    if (tri_requires_optical_sdf(tri) && !tri_param_kind_is_sdf(kind))
+        return false;
     if (kind == TRI_PARAM_SURFACE_NONE)
         return false;
 
@@ -959,11 +1056,24 @@ static inline bool apply_parametric_surface_point(
     return true;
 }
 
-static bool tri_is_transmissive(const RayTracerState& st, int tri_id)
+static inline bool tri_material_is_transmissive(const RayTracerState& st, const Triangle& tri, int band = 0)
 {
-    if (tri_id < 0 || tri_id >= static_cast<int>(st.tris.size()))
-        return false;
-    return (st.tris[static_cast<size_t>(tri_id)].flags & MAT_FLAG_TRANSMISSIVE) != 0;
+    return (mat_transmittance(st, tri.mat_idx, band) > 1e-6)
+        || (std::abs(mat_n_real(st, tri.mat_idx, band) - 1.0) > 1e-6);
+}
+
+static inline bool tri_param_kind_is_sdf(const int kind)
+{
+    return kind == TRI_PARAM_SURFACE_SDF_SADDLE || kind == TRI_PARAM_SURFACE_SDF_SPHERE;
+}
+
+static inline bool tri_requires_optical_sdf(const Triangle& tri)
+{
+    const int optical_mask =
+        MAT_FLAG_REACTIVE |
+        MAT_FLAG_EMISSIVE |
+        MAT_FLAG_APERTURE_STOP;
+    return (tri.flags & optical_mask) != 0;
 }
 
 static bool segment_first_hit(
@@ -1019,9 +1129,6 @@ static bool camera_visible_to_point(
         int hit_tri = -1;
         if (!segment_first_hit(st, orig, dir, t_cap, t_hit, hit_tri))
             return true;
-        if (st.camera_transparency_mode == RT_CAM_TRANSPARENCY_XRAY
-            && tri_is_transmissive(st, hit_tri))
-            return true;
         return false;
     }
 
@@ -1071,10 +1178,7 @@ static bool camera_visible_to_point(
                 }
             }
 
-            bool transparent = (st.camera_transparency_mode == RT_CAM_TRANSPARENCY_XRAY)
-                            && tri_is_transmissive(st, hit_tri);
-            if (!transparent)
-                return false;
+            return false;
 
             const double advance = std::max(EPS * 200.0, (hit_pos - cur).norm() + EPS * 200.0);
             cur += dir * advance;
@@ -1175,38 +1279,200 @@ static inline void accumulate_field_capture(
         st.n_bands);
 }
 
-/* ── Generic inner ray loop ─────────────────────────────────────────────────── */
+/* Deposit field continuously along a segment p0->p1 by sampling points and
+ * injecting complex amplitude into the bound field grid. */
+static inline void accumulate_field_capture_segment(
+    RayTracerState& st,
+    const V3d& p0,
+    const V3d& p1,
+    const VXcd& amp_prop)
+{
+    if (!st.camera_field_grid) return;
+    const double seg_len = (p1 - p0).norm();
+    if (!(seg_len > 0.0)) {
+        accumulate_field_capture(st, p1, amp_prop);
+        return;
+    }
 
-/* PerBandFn is called once per (source, bounce, band) for every valid surface hit.
+    /* Convert complex spectrum once per segment (not once per sample). */
+    static thread_local std::vector<float> amp_re;
+    static thread_local std::vector<float> amp_im;
+    amp_re.resize(static_cast<size_t>(st.n_bands));
+    amp_im.resize(static_cast<size_t>(st.n_bands));
+    for (int b = 0; b < st.n_bands; ++b) {
+        amp_re[static_cast<size_t>(b)] = static_cast<float>(amp_prop[b].real());
+        amp_im[static_cast<size_t>(b)] = static_cast<float>(amp_prop[b].imag());
+    }
+
+    // Fast regular-grid path: Amanatides-Woo voxel traversal visits crossed
+    // voxels once (O(n_voxels_crossed)) instead of fixed-distance sampling.
+    int nx = 0, ny = 0, nz = 0;
+    const int dims_rc = field_grid_regular_dims(st.camera_field_grid, &nx, &ny, &nz);
+    const float* bmin = field_grid_bmin(st.camera_field_grid);
+    const float* bmax = field_grid_bmax(st.camera_field_grid);
+    if (dims_rc == SK_OK && bmin && bmax && nx > 0 && ny > 0 && nz > 0) {
+        const double minx = static_cast<double>(bmin[0]);
+        const double miny = static_cast<double>(bmin[1]);
+        const double minz = static_cast<double>(bmin[2]);
+        const double maxx = static_cast<double>(bmax[0]);
+        const double maxy = static_cast<double>(bmax[1]);
+        const double maxz = static_cast<double>(bmax[2]);
+        const double dx = (maxx - minx) / static_cast<double>(nx);
+        const double dy = (maxy - miny) / static_cast<double>(ny);
+        const double dz = (maxz - minz) / static_cast<double>(nz);
+
+        if (dx > 0.0 && dy > 0.0 && dz > 0.0) {
+            const V3d d = p1 - p0;
+            auto world_to_idx = [](double v, double vmin, double dv, int n) -> int {
+                int i = static_cast<int>(std::floor((v - vmin) / dv));
+                if (i < 0) i = 0;
+                if (i >= n) i = n - 1;
+                return i;
+            };
+
+            int ix = world_to_idx(p0.x(), minx, dx, nx);
+            int iy = world_to_idx(p0.y(), miny, dy, ny);
+            int iz = world_to_idx(p0.z(), minz, dz, nz);
+
+            const int stepx = (d.x() > 0.0) ? 1 : ((d.x() < 0.0) ? -1 : 0);
+            const int stepy = (d.y() > 0.0) ? 1 : ((d.y() < 0.0) ? -1 : 0);
+            const int stepz = (d.z() > 0.0) ? 1 : ((d.z() < 0.0) ? -1 : 0);
+
+            const double inf = std::numeric_limits<double>::infinity();
+            auto t_delta = [&](double dd, double dv) -> double {
+                return (std::abs(dd) > 1.0e-15) ? std::abs(dv / dd) : inf;
+            };
+            auto next_boundary_t = [&](double p, double vmin, double dv, int i, int step, double dd) -> double {
+                if (step == 0 || std::abs(dd) <= 1.0e-15) return inf;
+                double boundary = vmin + ((step > 0 ? (i + 1) : i) * dv);
+                return (boundary - p) / dd;
+            };
+
+            double tx = next_boundary_t(p0.x(), minx, dx, ix, stepx, d.x());
+            double ty = next_boundary_t(p0.y(), miny, dy, iy, stepy, d.y());
+            double tz = next_boundary_t(p0.z(), minz, dz, iz, stepz, d.z());
+            const double dtx = t_delta(d.x(), dx);
+            const double dty = t_delta(d.y(), dy);
+            const double dtz = t_delta(d.z(), dz);
+
+            double t_prev = 0.0;
+            int guard = 0;
+            const int guard_max = nx + ny + nz + 1024;
+            while (ix >= 0 && ix < nx && iy >= 0 && iy < ny && iz >= 0 && iz < nz && t_prev <= 1.0 && guard < guard_max) {
+                double t_next = std::min(tx, std::min(ty, tz));
+                if (!std::isfinite(t_next)) t_next = 1.0;
+                t_next = std::max(t_prev, std::min(1.0, t_next));
+                const double t_mid = 0.5 * (t_prev + t_next);
+                const V3d pm = p0 + d * t_mid;
+                float pf[3] = {
+                    static_cast<float>(pm.x()),
+                    static_cast<float>(pm.y()),
+                    static_cast<float>(pm.z())
+                };
+                (void)field_grid_inject_amplitude_all_bands(
+                    st.camera_field_grid,
+                    pf,
+                    amp_re.data(),
+                    amp_im.data(),
+                    st.n_bands);
+
+                if (t_next >= 1.0) break;
+                if (tx <= ty && tx <= tz) {
+                    ix += stepx;
+                    tx += dtx;
+                } else if (ty <= tx && ty <= tz) {
+                    iy += stepy;
+                    ty += dty;
+                } else {
+                    iz += stepz;
+                    tz += dtz;
+                }
+                t_prev = t_next;
+                ++guard;
+            }
+            return;
+        }
+    }
+
+    // Fallback for non-regular grids: bounded arc-length sampling.
+    double cell_step = 0.015;
+    int n_steps = static_cast<int>(std::ceil(seg_len / cell_step));
+    n_steps = std::max(1, std::min(256, n_steps));
+    for (int i = 0; i < n_steps; ++i) {
+        const double t = (static_cast<double>(i) + 0.5) / static_cast<double>(n_steps);
+        const V3d p = p0 + (p1 - p0) * t;
+        float pf[3] = {
+            static_cast<float>(p.x()),
+            static_cast<float>(p.y()),
+            static_cast<float>(p.z())
+        };
+        (void)field_grid_inject_amplitude_all_bands(
+            st.camera_field_grid,
+            pf,
+            amp_re.data(),
+            amp_im.data(),
+            st.n_bands);
+    }
+}
+
+/* ── Bounce result ─────────────────────────────────────────────────────────── */
+
+struct BounceStepResult {
+    int      hit_tri;
+    uint32_t hit_tri_flags;
+    V3d      hit_pos;
+    V3d      hit_n_param;
+    V3d      hit_n_transport;  /* hit_n_param oriented to face the incoming ray */
+    bool     should_continue;
+    bool     is_sensor_hit;
+    bool     is_emissive_hit;
+    int      sensor_group_id;
+};
+
+static BounceStepResult ray_bounce_step_bdpt(
+    RayTracerState& st,
+    const int* tri_sensor_group,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double& path_len,
+    int& current_medium_mat_idx,
+    uint32_t& interaction_flags,
+    int n_bands, double min_amplitude,
+    std::mt19937_64& rng,
+    VXcd* amp_at_hit = nullptr,
+    bool is_backward = false);  /* defined below */
+
+/* ── Forward-path tracer ────────────────────────────────────────────────────── */
+
+/* PerHitFn is called once per (source, bounce) for every valid surface hit.
+ * All bands are available in amp_hit simultaneously.
  *
  * Signature:
- *   bool per_band(int src_id, int bounce, int band,
- *                 cd new_amp,        // amplitude AFTER propagation, BEFORE reflection
- *                 const V3d& p0,     // segment start (previous hit / source pos)
- *                 const V3d& p1,     // hit point
- *                 double total_path) // cumulative path length to p1 (metres)
+ *   bool fn(int src_id, int bounce,
+ *           const V3d& seg_start,    // ray origin for this segment
+ *           const V3d& incoming_dir, // unit direction before the bounce
+ *           const BounceStepResult& step,
+ *           const VXcd& amp_hit,     // amplitude post-propagation, pre-reflection
+ *           double path_start,       // cumulative path at seg_start
+ *           double path_at_hit)      // cumulative path at hit point
  *
- * Returning false from the callback signals an abort: the inner band loop is
- * cut short, the current ray is abandoned, and the outer source/ray loops stop.
- * Used by ray_tracer_trace to exit early when the segment buffer is full.
- * Integrators should always return true.
+ * Return false to abort all tracing.
  */
-template<typename PerBandFn>
+template<typename PerHitFn>
 static void trace_rays(
     RayTracerState& st,
     int n_sources, const double* src_pos,
     const double* src_dir, const double* src_directivity,
     int n_rays, int max_bounces, double min_amplitude,
     std::mt19937_64& rng,
-    bool& abort,          /* set to true by callback to stop all loops */
-    PerBandFn&& per_band)
+    bool& abort,
+    PerHitFn&& per_hit)
 {
-    RtProfileScope scope("trace_rays");
-    const int  n_bands = st.n_bands;
-    const bool has_bvh = !st.bvh_nodes.empty();
+    const int n_bands = st.n_bands;
 
-    std::uniform_real_distribution<double> U(0.0, 1.0);
-    VXcd amp(n_bands);
+    if (st.optical_assembly)
+        st.camera_event_telemetry.rays_launched += n_sources * n_rays;
+
+    VXcd amp(n_bands), amp_hit(n_bands);
 
     for (int si = 0; si < n_sources && !abort; ++si) {
         const double* sp = src_pos + si * 3;
@@ -1223,225 +1489,41 @@ static void trace_rays(
             double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
             if (dir_weight < 0.01) continue;
 
+            const int ray_band = (n_bands > 0) ? ((si + ri) % n_bands) : 0;
             for (int b = 0; b < n_bands; ++b)
-                amp[b] = cd(dir_weight, 0.0);
+                amp[b] = (b == ray_band) ? cd(dir_weight, 0.0) : cd(0.0, 0.0);
 
             V3d    pos      = src_p;
             double path_len = 0.0;
-            V3d    cur_dir  = dir;
+            int    current_medium_mat_idx = -1;
+            uint32_t interaction_flags    = 0u;
 
-            for (int bounce = 0; bounce < max_bounces; ++bounce) {
+            for (int bounce = 0; bounce < max_bounces && !abort; ++bounce) {
                 rt_maybe_emit_pulse(st, "trace_rays", si, ri, bounce);
-                double t_min   = 1e18;
-                int    hit_tri = -1;
+                const V3d    seg_start  = pos;
+                const V3d    incoming   = dir;
+                const double path_start = path_len;
 
-                if (has_bvh) {
-                    V3d inv_dir = cur_dir.cwiseInverse();
-                    bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
-                              pos, cur_dir, inv_dir, t_min, hit_tri);
-                } else {
-                    for (size_t ti = 0; ti < st.tris.size(); ++ti) {
-                        double t;
-                        if (ray_triangle_hit(pos, cur_dir, st.tris[ti], t)
-                            && t < t_min)
-                        {
-                            t_min   = t;
-                            hit_tri = static_cast<int>(ti);
-                        }
-                    }
-                }
+                BounceStepResult step = ray_bounce_step_bdpt(
+                    st, nullptr, pos, dir, amp, path_len,
+                    current_medium_mat_idx, interaction_flags,
+                    n_bands, min_amplitude, rng, &amp_hit);
 
-                if (hit_tri < 0) break;
+                if (step.hit_tri < 0) break;
 
-                V3d    hit_pos    = pos + t_min * cur_dir;
-                double total_path = path_len + t_min;
-                double spread     = 1.0 / (1.0 + path_len + t_min * 0.5);
-
-                const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
-                double max_abs = 0.0;
-
-                for (int b = 0; b < n_bands; ++b) {
-                    double kt    = st.k_real[b] * t_min;
-                    double decay = std::exp(-st.atmo_abs[b] * t_min) * spread;
-                    cd prop(decay * std::cos(kt), decay * std::sin(kt));
-
-                    cd new_amp = amp[b] * prop;
-
-                    if (!per_band(si, bounce, b, new_amp, pos, hit_pos, total_path)) {
-                        abort = true;
-                        goto next_ray;
-                    }
-
-                    amp[b]     = new_amp * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
-                    double a   = std::abs(amp[b]);
-                    if (a > max_abs) max_abs = a;
-                }
-
-                if (max_abs < min_amplitude) break;
-
-                /* Orient the boundary normal against the incoming ray.  Meshes
-                 * extracted from scene builders are not guaranteed to have inward
-                 * normals for a cavity, and using the raw normal here can offset the
-                 * next origin through the wall and kill the ray set after one hit. */
-                V3d hit_n = tri.normal;
-                if (cur_dir.dot(hit_n) > 0.0)
-                    hit_n = -hit_n;
-
-                if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
-                    cur_dir = cosine_hemisphere(hit_n, rng);
-                } else {
-                    cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
-                    if (cur_dir.dot(hit_n) < 0.0)
-                        cur_dir = cosine_hemisphere(hit_n, rng);
-                }
-
-                pos = hit_pos + cur_dir * (EPS * 100.0);
-
-                path_len += t_min;
-            }
-            next_ray:;
-        }
-    }
-}
-
-/* ── Extended inner ray loop (v2) ──────────────────────────────────────────── */
-
-/* Like trace_rays but passes hit_tri, incoming_dir, surface_normal, and the
- * full per-band amplitude vector (AFTER propagation, BEFORE reflection) to the
- * callback.  This allows callers to accumulate per-triangle irradiance.
- *
- * HitFn signature:
- *   bool hit_fn(int src_id, int bounce,
- *               int hit_tri,
- *               const V3d& incoming_dir,   // unit ray direction before hit
- *               const V3d& surface_normal, // outward-facing normal (corrected)
- *               const VXcd& amp_prop,      // amplitude vector after propagation, before reflection
- *               const V3d& p0,             // segment start
- *               const V3d& p1,             // hit point
- *               double total_path)         // cumulative path length to p1 (m)
- */
-template<typename HitFn>
-static void trace_rays_v2(
-    RayTracerState& st,
-    int n_sources, const double* src_pos,
-    const double* src_dir, const double* src_directivity,
-    int n_rays, int max_bounces, double min_amplitude,
-    const int32_t* n_rays_per_source,
-    std::mt19937_64& rng,
-    bool& abort,
-    HitFn&& hit_fn)
-{
-    RtProfileScope scope("trace_rays_v2");
-    const int  n_bands = st.n_bands;
-    const bool has_bvh = !st.bvh_nodes.empty();
-
-    std::uniform_real_distribution<double> U(0.0, 1.0);
-    VXcd amp(n_bands);
-    VXcd amp_prop(n_bands);
-
-    for (int si = 0; si < n_sources && !abort; ++si) {
-        const double* sp = src_pos + si * 3;
-        const double* sd = src_dir + si * 3;
-        V3d src_p(sp[0], sp[1], sp[2]);
-        V3d src_d = V3d(sd[0], sd[1], sd[2]).normalized();
-        double dirpow = src_directivity[si];
-
-        const int rays_for_source =
-            n_rays_per_source ? std::max(0, static_cast<int>(n_rays_per_source[si]))
-                              : std::max(0, n_rays);
-        if (rays_for_source <= 0) {
-            continue;
-        }
-
-        for (int ri = 0; ri < rays_for_source && !abort; ++ri) {
-            rt_maybe_emit_pulse(st, "trace_rays_v2", si, ri, -1);
-            V3d dir = fibonacci_sphere_dir(ri, rays_for_source, src_d);
-
-            double cos_a      = dir.dot(src_d);
-            double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
-            if (dir_weight < 0.01) continue;
-
-            for (int b = 0; b < n_bands; ++b)
-                amp[b] = cd(dir_weight, 0.0);
-
-            V3d    pos      = src_p;
-            double path_len = 0.0;
-            V3d    cur_dir  = dir;
-
-            for (int bounce = 0; bounce < max_bounces; ++bounce) {
-                rt_maybe_emit_pulse(st, "trace_rays_v2", si, ri, bounce);
-                double t_min   = 1e18;
-                int    hit_tri = -1;
-
-                if (has_bvh) {
-                    V3d inv_dir = cur_dir.cwiseInverse();
-                    bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
-                              pos, cur_dir, inv_dir, t_min, hit_tri);
-                } else {
-                    for (size_t ti = 0; ti < st.tris.size(); ++ti) {
-                        double t;
-                        if (ray_triangle_hit(pos, cur_dir, st.tris[ti], t)
-                            && t < t_min)
-                        {
-                            t_min   = t;
-                            hit_tri = static_cast<int>(ti);
-                        }
-                    }
-                }
-
-                if (hit_tri < 0) break;
-
-                V3d    hit_pos    = pos + t_min * cur_dir;
-                double total_path = path_len + t_min;
-                double spread     = 1.0 / (1.0 + path_len + t_min * 0.5);
-
-                const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
-
-                /* Surface normal corrected to face the incoming ray. */
-                V3d hit_n = tri.normal;
-                if (cur_dir.dot(hit_n) > 0.0)
-                    hit_n = -hit_n;
-
-                /* Propagate amplitude (no reflection yet). */
-                double max_abs = 0.0;
-                for (int b = 0; b < n_bands; ++b) {
-                    double kt    = st.k_real[b] * t_min;
-                    double decay = std::exp(-st.atmo_abs[b] * t_min) * spread;
-                    cd prop(decay * std::cos(kt), decay * std::sin(kt));
-                    amp_prop[b] = amp[b] * prop;
-                    double a    = std::abs(amp_prop[b]);
-                    if (a > max_abs) max_abs = a;
-                }
-
-                /* Deliver to caller with full context. */
-                if (!hit_fn(si, bounce, hit_tri, cur_dir, hit_n, amp_prop,
-                            pos, hit_pos, total_path)) {
+                if (!per_hit(si, bounce, seg_start, incoming, step, amp_hit, path_start, path_len)) {
                     abort = true;
-                    goto v2_next_ray;
+                    break;
                 }
 
-                /* Apply reflection. */
-                for (int b = 0; b < n_bands; ++b)
-                    amp[b] = amp_prop[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
-
-                if (max_abs < min_amplitude) break;
-
-                /* Scatter / reflect direction. */
-                if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
-                    cur_dir = cosine_hemisphere(hit_n, rng);
-                } else {
-                    cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
-                    if (cur_dir.dot(hit_n) < 0.0)
-                        cur_dir = cosine_hemisphere(hit_n, rng);
-                }
-
-                pos = hit_pos + cur_dir * (EPS * 100.0);
-                path_len += t_min;
+                if (!step.should_continue) break;
             }
-            v2_next_ray:;
         }
     }
 }
+
+/* trace_rays_v2 deleted — its caller (ray_tracer_trace_surface) now uses trace_rays. */
+/* This block intentionally left as a stub so the compiler errors on any remaining call sites. */
 
 /* ── C API ──────────────────────────────────────────────────────────────────── */
 
@@ -1498,6 +1580,24 @@ RayTracerState* ray_tracer_create(
 
         /* Material handle into MatBuf (per-band physics resolved at hit time). */
         tri.mat_idx = mat_idx[i];
+        tri.flags = 0;
+        const bool mat_transmissive = tri_material_is_transmissive(*st, tri, 0);
+        if (mat_transmissive) {
+            /* Default boundary convention: +normal side is ambient air,
+             * -normal side is the triangle material.  This gives physically
+             * directional n1/n2 when mesh normals are outward-oriented. */
+            tri.medium_pos_mat_idx = -1;
+            tri.medium_neg_mat_idx = tri.mat_idx;
+        } else {
+            tri.medium_pos_mat_idx = -1;
+            tri.medium_neg_mat_idx = -1;
+        }
+        if (mat_reactive_shift_hz(*st, tri.mat_idx) > 0.0 &&
+            mat_band_record(*st, tri.mat_idx, 0)[6] > 0.0f)
+            tri.flags |= MAT_FLAG_REACTIVE;
+        /* slot [5] = emission in SpectralBandRecord layout */
+        if (mat_band_record(*st, tri.mat_idx, 0)[5] > 0.0f)
+            tri.flags |= MAT_FLAG_EMISSIVE;
 
         /* AABB for BVH build */
         tri_aabbs[static_cast<size_t>(i)].expand(v0);
@@ -1768,16 +1868,21 @@ int ray_tracer_trace(
 
     std::mt19937_64 rng(static_cast<uint64_t>(seed));
 
+    const int n_bands = st->n_bands;
     trace_rays(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
         rng, abort,
-        [&](int si, int bounce, int b, cd new_amp,
-            const V3d& p0, const V3d& p1, double total_path) -> bool
+        [&](int si, int bounce, const V3d& seg_start, const V3d& /*incoming*/,
+            const BounceStepResult& step, const VXcd& amp_hit,
+            double path_start, double /*path_at_hit*/) -> bool
         {
-            chunk.write_segment(p0, p1, si, bounce, b,
-                                new_amp, total_path - (p1 - p0).norm());
+            for (int b = 0; b < n_bands; ++b) {
+                if (std::abs(amp_hit[b]) <= min_amplitude) continue;
+                chunk.write_segment(seg_start, step.hit_pos, si, bounce, b,
+                                    amp_hit[b], path_start);
+            }
             return true;
         });
 
@@ -1814,39 +1919,48 @@ int ray_tracer_trace_surface(
 
     std::mt19937_64 rng(static_cast<uint64_t>(seed));
 
-    trace_rays_v2(
+    trace_rays(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
-        nullptr,
         rng, abort,
-        [&](int si, int bounce, int hit_tri,
-            const V3d& incoming_dir, const V3d& surface_normal,
-            const VXcd& amp_prop,
-            const V3d& p0, const V3d& p1, double total_path) -> bool
+        [&](int si, int bounce, const V3d& seg_start, const V3d& incoming_dir,
+            const BounceStepResult& step, const VXcd& amp_hit,
+            double path_start, double path_at_hit) -> bool
         {
-            /* Write segment record into local chunk (vis buffer). */
+            (void)path_at_hit;
+            const int hit_tri = step.hit_tri;
+            const V3d& p1 = step.hit_pos;
+
+            if (st->camera_field_grid) {
+                accumulate_field_capture_segment(*st, seg_start, p1, amp_hit);
+            }
+            append_camera_strike(
+                *st,
+                si,
+                bounce,
+                hit_tri,
+                p1,
+                step.hit_n_transport,
+                incoming_dir,
+                path_at_hit,
+                path_at_hit,
+                1,
+                0,
+                amp_hit);
+
             if (out_segs && out_cap > 0) {
                 for (int b = 0; b < n_bands; ++b) {
-                    chunk.write_segment(p0, p1, si, bounce, b,
-                                        amp_prop[b],
-                                        total_path - (p1 - p0).norm());
+                    if (std::abs(amp_hit[b]) <= min_amplitude) continue;
+                    chunk.write_segment(seg_start, p1, si, bounce, b,
+                                        amp_hit[b], path_start);
                 }
             }
 
-            /* Irradiance contribution to triangle surface.
-             *
-             * energy = |A|² * cos(θ) / area
-             *
-             * cos(θ) is the angle between the incoming direction and the
-             * surface normal.  We already corrected surface_normal to face
-             * the incoming ray, so:
-             *   cos_in = -dot(incoming_dir, surface_normal)
-             * (incoming_dir points AWAY from the source, normal points TOWARD it).
-             */
+            /* Irradiance: energy = |A|² * cos(θ_in) / area */
             if (hit_tri >= 0 && hit_tri < n_tri) {
                 double area    = st->tri_areas[static_cast<size_t>(hit_tri)];
-                double cos_in  = std::max(0.0, -incoming_dir.dot(surface_normal));
+                double cos_in  = std::max(0.0, -incoming_dir.dot(step.hit_n_transport));
                 double inv_area = cos_in / std::max(area, AREA_EPS);
 
                 size_t base = static_cast<size_t>(hit_tri) * n_bands;
@@ -1854,7 +1968,7 @@ int ray_tracer_trace_surface(
                 float* dest = (bounce == 0 && out_direct) ? out_direct : out_indirect;
                 if (dest) {
                     for (int b = 0; b < n_bands; ++b) {
-                        double e = std::norm(amp_prop[b]) * inv_area;
+                        double e = std::norm(amp_hit[b]) * inv_area;
                         dest[base + b] += static_cast<float>(e);
                     }
                 }
@@ -1915,32 +2029,34 @@ int ray_tracer_trace_callback(
 
     std::mt19937_64 rng(static_cast<uint64_t>(seed));
 
+    const int n_bands_cb = st->n_bands;
     trace_rays(
         *st, n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude, rng, abort,
-        [&](int si, int bounce, int b, cd new_amp,
-            const V3d& p0, const V3d& p1, double total_path) -> bool
+        [&](int si, int bounce, const V3d& seg_start, const V3d& /*incoming*/,
+            const BounceStepResult& step, const VXcd& amp_hit,
+            double path_start, double /*path_at_hit*/) -> bool
         {
-            /* Append one record to the batch buffer. */
-            size_t old_sz = buf.size();
-            buf.resize(old_sz + RT_FLOATS_PER_SEG);
-            float* s = buf.data() + old_sz;
-            s[0]  = static_cast<float>(p0.x());
-            s[1]  = static_cast<float>(p0.y());
-            s[2]  = static_cast<float>(p0.z());
-            s[3]  = static_cast<float>(p1.x());
-            s[4]  = static_cast<float>(p1.y());
-            s[5]  = static_cast<float>(p1.z());
-            s[6]  = static_cast<float>(si);
-            s[7]  = static_cast<float>(bounce);
-            s[8]  = static_cast<float>(b);
-            s[9]  = static_cast<float>(std::abs(new_amp));
-            s[10] = static_cast<float>(std::arg(new_amp));
-            /* path_len at segment start = total_path minus this segment's length */
-            s[11] = static_cast<float>(total_path - (p1 - p0).norm());
-
-            if (static_cast<int>(buf.size()) >= buf_float_cap)
-                return do_flush();
+            for (int b = 0; b < n_bands_cb; ++b) {
+                if (std::abs(amp_hit[b]) <= min_amplitude) continue;
+                size_t old_sz = buf.size();
+                buf.resize(old_sz + RT_FLOATS_PER_SEG);
+                float* s = buf.data() + old_sz;
+                s[0]  = static_cast<float>(seg_start.x());
+                s[1]  = static_cast<float>(seg_start.y());
+                s[2]  = static_cast<float>(seg_start.z());
+                s[3]  = static_cast<float>(step.hit_pos.x());
+                s[4]  = static_cast<float>(step.hit_pos.y());
+                s[5]  = static_cast<float>(step.hit_pos.z());
+                s[6]  = static_cast<float>(si);
+                s[7]  = static_cast<float>(bounce);
+                s[8]  = static_cast<float>(b);
+                s[9]  = static_cast<float>(std::abs(amp_hit[b]));
+                s[10] = static_cast<float>(std::arg(amp_hit[b]));
+                s[11] = static_cast<float>(path_start);
+                if (static_cast<int>(buf.size()) >= buf_float_cap && !do_flush())
+                    return false;
+            }
             return true;
         });
 
@@ -1989,42 +2105,46 @@ int ray_tracer_integrate_ir(
     bool abort = false;
     std::mt19937_64 rng(static_cast<uint64_t>(seed));
 
+    const int n_bands_ir = st->n_bands;
     trace_rays(
         *st,
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude,
         rng, abort,
-        [&](int si, int /*bounce*/, int b, cd new_amp,
-            const V3d& /*p0*/, const V3d& p1, double total_path) -> bool
+        [&](int si, int /*bounce*/, const V3d& /*seg_start*/, const V3d& /*incoming*/,
+            const BounceStepResult& step, const VXcd& amp_hit,
+            double /*path_start*/, double path_at_hit) -> bool
         {
-            /* Delay in samples from source to this hit point. */
-            double delay_s  = total_path * inv_speed * sample_rate;
-            int    t0       = static_cast<int>(delay_s);
-            double frac     = delay_s - t0;  /* for linear interpolation */
+            for (int b = 0; b < n_bands_ir; ++b) {
+                const cd new_amp = amp_hit[b];
+                if (std::abs(new_amp) <= min_amplitude) continue;
 
-            for (int ri = 0; ri < n_receivers; ++ri) {
-                double dist = (p1 - rpos[static_cast<size_t>(ri)]).norm();
-                double apr  = rec_aperture_r[ri];
-                if (dist >= apr) continue;
+                double delay_s = path_at_hit * inv_speed * sample_rate;
+                int    t0      = static_cast<int>(delay_s);
+                double frac    = delay_s - t0;
 
-                /* Linear distance falloff within aperture. */
-                double weight = 1.0 - dist / apr;
+                for (int ri = 0; ri < n_receivers; ++ri) {
+                    double dist = (step.hit_pos - rpos[static_cast<size_t>(ri)]).norm();
+                    double apr  = rec_aperture_r[ri];
+                    if (dist >= apr) continue;
 
-                size_t base = (static_cast<size_t>(si) * n_receivers * n_bands * n_samples)
-                            + (static_cast<size_t>(ri) * n_bands * n_samples)
-                            + (static_cast<size_t>(b)  * n_samples);
+                    double weight = 1.0 - dist / apr;
 
-                /* Splat with linear interpolation across two adjacent bins. */
-                if (t0 >= 0 && t0 < n_samples) {
-                    float w = static_cast<float>(weight * (1.0 - frac));
-                    out_re[base + t0] += w * static_cast<float>(new_amp.real());
-                    out_im[base + t0] += w * static_cast<float>(new_amp.imag());
-                }
-                int t1 = t0 + 1;
-                if (t1 >= 0 && t1 < n_samples) {
-                    float w = static_cast<float>(weight * frac);
-                    out_re[base + t1] += w * static_cast<float>(new_amp.real());
-                    out_im[base + t1] += w * static_cast<float>(new_amp.imag());
+                    size_t base = (static_cast<size_t>(si) * n_receivers * n_bands_ir * n_samples)
+                                + (static_cast<size_t>(ri) * n_bands_ir * n_samples)
+                                + (static_cast<size_t>(b)  * n_samples);
+
+                    if (t0 >= 0 && t0 < n_samples) {
+                        float w = static_cast<float>(weight * (1.0 - frac));
+                        out_re[base + t0] += w * static_cast<float>(new_amp.real());
+                        out_im[base + t0] += w * static_cast<float>(new_amp.imag());
+                    }
+                    int t1 = t0 + 1;
+                    if (t1 >= 0 && t1 < n_samples) {
+                        float w = static_cast<float>(weight * frac);
+                        out_re[base + t1] += w * static_cast<float>(new_amp.real());
+                        out_im[base + t1] += w * static_cast<float>(new_amp.imag());
+                    }
                 }
             }
             return true;
@@ -2181,54 +2301,26 @@ static int ray_tracer_integrate_image_parallel_impl(
                     ^ (static_cast<uint64_t>(si) << 32)
                     ^ static_cast<uint64_t>(ri));
                 std::mt19937_64 rng(ray_seed);
-                std::uniform_real_distribution<double> U(0.0, 1.0);
 
+                const int ray_band = (n_bands > 0) ? ((si + ri) % n_bands) : 0;
                 for (int b = 0; b < n_bands; ++b)
-                    amp[b] = cd(dir_weight, 0.0);
+                    amp[b] = (b == ray_band) ? cd(dir_weight, 0.0) : cd(0.0, 0.0);
 
                 V3d pos = src_p;
                 V3d cur_dir = dir;
                 double path_len = 0.0;
+                int    current_medium_mat_idx = -1;
+                uint32_t interaction_flags    = 0u;
 
                 for (int bounce = 0; bounce < max_bounces; ++bounce) {
-                    double t_min = 1e18;
-                    int hit_tri = -1;
+                    BounceStepResult step = ray_bounce_step_bdpt(
+                        *st, nullptr, pos, cur_dir, amp, path_len,
+                        current_medium_mat_idx, interaction_flags,
+                        n_bands, min_amplitude, rng, &amp_prop);
 
-                    if (has_bvh) {
-                        V3d inv_dir = cur_dir.cwiseInverse();
-                        bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
-                                  pos, cur_dir, inv_dir, t_min, hit_tri);
-                    } else {
-                        for (size_t ti = 0; ti < st->tris.size(); ++ti) {
-                            double t;
-                            if (ray_triangle_hit(pos, cur_dir, st->tris[ti], t) && t < t_min) {
-                                t_min = t;
-                                hit_tri = static_cast<int>(ti);
-                            }
-                        }
-                    }
-                    if (hit_tri < 0) break;
+                    if (step.hit_tri < 0) break;
 
-                    V3d hit_pos = pos + t_min * cur_dir;
-                    V3d hit_n = st->tris[static_cast<size_t>(hit_tri)].normal;
-                    apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n);
-                    if (cur_dir.dot(hit_n) > 0.0)
-                        hit_n = -hit_n;
-
-                    const double total_path = path_len + t_min;
-                    const double spread = 1.0 / (1.0 + path_len + t_min * 0.5);
-                    const Triangle& tri = st->tris[static_cast<size_t>(hit_tri)];
-
-                    double max_abs = 0.0;
-                    for (int b = 0; b < n_bands; ++b) {
-                        double kt = st->k_real[b] * t_min;
-                        double decay = std::exp(-st->atmo_abs[b] * t_min) * spread;
-                        cd prop(decay * std::cos(kt), decay * std::sin(kt));
-                        amp_prop[b] = amp[b] * prop;
-                        max_abs = std::max(max_abs, std::abs(amp_prop[b]));
-                    }
-
-                    V3d v = hit_pos - cam_p;
+                    V3d v = step.hit_pos - cam_p;
                     double depth = v.dot(cam_f);
                     const bool in_front = (depth > EPS);
                     const bool pass_depth_cull = !st->camera_depth_cull_enabled
@@ -2253,20 +2345,15 @@ static int ray_tracer_integrate_image_parallel_impl(
                     if (in_front && (need_image_vis || need_strike_vis)) {
                         std::lock_guard<std::mutex> lk(st_mutex);
                         const uint64_t c0 = st->camera_full_march_context_entries;
-                        visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
+                        visible = camera_visible_to_point(*st, cam_p, step.hit_pos) ? 1 : 0;
                         context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
-                    }
-
-                    if (st->camera_field_grid) {
-                        std::lock_guard<std::mutex> lk(st_mutex);
-                        accumulate_field_capture(*st, hit_pos, amp_prop);
                     }
 
                     if (st->camera_capture_strikes) {
                         append_camera_strike_local(*st, L.strikes,
-                                                   si, bounce, hit_tri,
-                                                   hit_pos, hit_n, cur_dir,
-                                                   depth, total_path,
+                                                   si, bounce, step.hit_tri,
+                                                   step.hit_pos, step.hit_n_param, cur_dir,
+                                                   depth, path_len,
                                                    visible, context_entries,
                                                    amp_prop);
                     }
@@ -2280,20 +2367,7 @@ static int ray_tracer_integrate_image_parallel_impl(
                         }
                     }
 
-                    for (int b = 0; b < n_bands; ++b)
-                        amp[b] = amp_prop[b] * mat_cache_refl(st->mat_cache, tri.mat_idx, b);
-                    if (max_abs < min_amplitude) break;
-
-                    if (U(rng) < mat_cache_diffusion(st->mat_cache, tri.mat_idx)) {
-                        cur_dir = cosine_hemisphere(hit_n, rng);
-                    } else {
-                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
-                        if (cur_dir.dot(hit_n) < 0.0)
-                            cur_dir = cosine_hemisphere(hit_n, rng);
-                    }
-
-                    pos = hit_pos + cur_dir * (EPS * 100.0);
-                    path_len += t_min;
+                    if (!step.should_continue) break;
                 }
             }
         }));
@@ -2500,63 +2574,36 @@ static int ray_tracer_trace_integrate_image_parallel_impl(
                     ^ (static_cast<uint64_t>(si) << 32)
                     ^ static_cast<uint64_t>(ri));
                 std::mt19937_64 rng(ray_seed);
-                std::uniform_real_distribution<double> U(0.0, 1.0);
 
+                const int ray_band = (n_bands > 0) ? ((si + ri) % n_bands) : 0;
                 for (int b = 0; b < n_bands; ++b)
-                    amp[b] = cd(dir_weight, 0.0);
+                    amp[b] = (b == ray_band) ? cd(dir_weight, 0.0) : cd(0.0, 0.0);
 
                 V3d pos = src_p;
                 V3d cur_dir = dir;
                 double path_len = 0.0;
+                int    current_medium_mat_idx = -1;
+                uint32_t interaction_flags    = 0u;
 
                 for (int bounce = 0; bounce < max_bounces; ++bounce) {
-                    double t_min = 1e18;
-                    int hit_tri = -1;
+                    const V3d seg_start = pos;
+                    const double path_start = path_len;
 
-                    if (has_bvh) {
-                        V3d inv_dir = cur_dir.cwiseInverse();
-                        bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
-                                  pos, cur_dir, inv_dir, t_min, hit_tri);
-                    } else {
-                        for (size_t ti = 0; ti < st->tris.size(); ++ti) {
-                            double t;
-                            if (ray_triangle_hit(pos, cur_dir, st->tris[ti], t) && t < t_min) {
-                                t_min = t;
-                                hit_tri = static_cast<int>(ti);
-                            }
-                        }
-                    }
-                    if (hit_tri < 0) break;
+                    BounceStepResult step = ray_bounce_step_bdpt(
+                        *st, nullptr, pos, cur_dir, amp, path_len,
+                        current_medium_mat_idx, interaction_flags,
+                        n_bands, min_amplitude, rng, &amp_prop);
 
-                    V3d p0 = pos;
-                    V3d hit_pos = pos + t_min * cur_dir;
-                    V3d hit_n = st->tris[static_cast<size_t>(hit_tri)].normal;
-                    apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n);
-                    if (cur_dir.dot(hit_n) > 0.0)
-                        hit_n = -hit_n;
-
-                    const double total_path = path_len + t_min;
-                    const double spread = 1.0 / (1.0 + path_len + t_min * 0.5);
-                    const Triangle& tri = st->tris[static_cast<size_t>(hit_tri)];
-
-                    double max_abs = 0.0;
-                    for (int b = 0; b < n_bands; ++b) {
-                        double kt = st->k_real[b] * t_min;
-                        double decay = std::exp(-st->atmo_abs[b] * t_min) * spread;
-                        cd prop(decay * std::cos(kt), decay * std::sin(kt));
-                        amp_prop[b] = amp[b] * prop;
-                        max_abs = std::max(max_abs, std::abs(amp_prop[b]));
-                    }
+                    if (step.hit_tri < 0) break;
 
                     if (out_segs && out_cap > 0) {
-                        const double seg_path_start = total_path - t_min;
                         for (int b = 0; b < n_bands; ++b) {
-                            L.chunk.write_segment(p0, hit_pos, si, bounce, b,
-                                                  amp_prop[b], seg_path_start);
+                            L.chunk.write_segment(seg_start, step.hit_pos, si, bounce, b,
+                                                  amp_prop[b], path_start);
                         }
                     }
 
-                    V3d v = hit_pos - cam_p;
+                    V3d v = step.hit_pos - cam_p;
                     double depth = v.dot(cam_f);
                     const bool in_front = (depth > EPS);
                     const bool pass_depth_cull = !st->camera_depth_cull_enabled
@@ -2581,20 +2628,15 @@ static int ray_tracer_trace_integrate_image_parallel_impl(
                     if (in_front && (need_image_vis || need_strike_vis)) {
                         std::lock_guard<std::mutex> lk(st_mutex);
                         const uint64_t c0 = st->camera_full_march_context_entries;
-                        visible = camera_visible_to_point(*st, cam_p, hit_pos) ? 1 : 0;
+                        visible = camera_visible_to_point(*st, cam_p, step.hit_pos) ? 1 : 0;
                         context_entries = static_cast<int>(st->camera_full_march_context_entries - c0);
-                    }
-
-                    if (st->camera_field_grid) {
-                        std::lock_guard<std::mutex> lk(st_mutex);
-                        accumulate_field_capture(*st, hit_pos, amp_prop);
                     }
 
                     if (st->camera_capture_strikes) {
                         append_camera_strike_local(*st, L.strikes,
-                                                   si, bounce, hit_tri,
-                                                   hit_pos, hit_n, cur_dir,
-                                                   depth, total_path,
+                                                   si, bounce, step.hit_tri,
+                                                   step.hit_pos, step.hit_n_param, cur_dir,
+                                                   depth, path_len,
                                                    visible, context_entries,
                                                    amp_prop);
                     }
@@ -2608,20 +2650,7 @@ static int ray_tracer_trace_integrate_image_parallel_impl(
                         }
                     }
 
-                    for (int b = 0; b < n_bands; ++b)
-                        amp[b] = amp_prop[b] * mat_cache_refl(st->mat_cache, tri.mat_idx, b);
-                    if (max_abs < min_amplitude) break;
-
-                    if (U(rng) < mat_cache_diffusion(st->mat_cache, tri.mat_idx)) {
-                        cur_dir = cosine_hemisphere(hit_n, rng);
-                    } else {
-                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
-                        if (cur_dir.dot(hit_n) < 0.0)
-                            cur_dir = cosine_hemisphere(hit_n, rng);
-                    }
-
-                    pos = hit_pos + cur_dir * (EPS * 100.0);
-                    path_len += t_min;
+                    if (!step.should_continue) break;
                 }
             }
         }));
@@ -2806,6 +2835,10 @@ static inline void write_seg_ms(
 
 /* Propagate 'amp' in-place through 'dist' metres in 'ctx' (NULL = ambient),
  * then write one segment record per band. */
+/* medium_mat_idx >= 0: ray is currently propagating inside this material;
+ * the material's per-band ior_real (slot 7) and ior_imag (slot 8) override
+ * the context n_real/n_imag for OPL phase and Beer-Lambert extinction.
+ * This is the "medium transform" hook for transmissive optical media. */
 static inline void propagate_ms(
     VXcd& amp,
     const RayTracerState& st,
@@ -2815,17 +2848,31 @@ static inline void propagate_ms(
     const V3d& p0, const V3d& p1,
     int si, int bounce,
     float* out_segs, int& seg_count, int seg_cap,
-    int context_id)
+    int context_id,
+    int medium_mat_idx = -1)
 {
     const int    n_bands = st.n_bands;
     const int    scale_t = (ctx && ctx->scale_type == RT_SCALE_WAVE)
                              ? RT_SCALE_WAVE : RT_SCALE_GEOMETRIC;
-    const double n_re    = ctx ? ctx->n_real : 1.0;
-    const double n_im    = ctx ? ctx->n_imag : 0.0;
     const double c       = st.speed_m_s;
 
     for (int b = 0; b < n_bands; ++b) {
-        double f_hz  = st.freq_hz_vec[b];
+        double f_hz = st.freq_hz_vec[b];
+        /* ── Medium transform ──────────────────────────────────────────────
+         * Priority: material IOR > scale-context IOR > air (1.0/0.0).
+         * When inside a transmissive solid, use the material's per-band
+         * ior_real for OPL phase scaling and ior_imag for Beer-Lambert
+         * absorption — the two physically distinct wave effects of a medium.
+         */
+        double n_re, n_im;
+        if (medium_mat_idx >= 0) {
+            n_re = mat_n_real(st, medium_mat_idx, b);
+            n_im = mat_n_imag(st, medium_mat_idx, b);
+            if (n_re < 1.0) n_re = 1.0;   /* clamp: never slower than vacuum */
+        } else {
+            n_re = ctx ? ctx->n_real : 1.0;
+            n_im = ctx ? ctx->n_imag : 0.0;
+        }
         double k_ctx = TWO_PI * f_hz * n_re / c;
         double alpha = TWO_PI * f_hz * n_im / c + st.atmo_abs[b];
 
@@ -2848,7 +2895,7 @@ static inline void propagate_ms(
 }
 
 /* Core multiscale inner loop.
- * HitFn2: (si, bounce, hit_tri, incoming_dir, surface_normal,
+ * HitFn2: (si, bounce, hit_tri, incoming_dir, geom_normal, transport_normal, front_face,
  *           amp_at_surface, p0, hit_pos, total_path) -> bool */
 template<typename HitFn2>
 static void trace_rays_multiscale(
@@ -2884,12 +2931,17 @@ static void trace_rays_multiscale(
             double dir_weight = std::pow(std::max(0.0, (cos_a + 1.0) * 0.5), dirpow);
             if (dir_weight < 0.01) continue;
 
+            const int ray_band = (n_bands > 0) ? ((si + ri) % n_bands) : 0;
             for (int b = 0; b < n_bands; ++b)
-                amp[b] = cd(dir_weight, 0.0);
+                amp[b] = (b == ray_band) ? cd(dir_weight, 0.0) : cd(0.0, 0.0);
 
             V3d    pos      = src_p;
             double path_len = 0.0;
             V3d    cur_dir  = dir;
+            /* current_medium_mat_idx: material the ray is currently propagating
+             * through (-1 = air/vacuum).  Updated at every transmissive boundary
+             * crossing to enable per-material OPL phase and Beer-Lambert. */
+            int current_medium_mat_idx = -1;
 
             for (int bounce = 0; bounce < max_bounces; ++bounce) {
                 double t_hit   = 1e18;
@@ -2939,7 +2991,8 @@ static void trace_rays_multiscale(
                     V3d p1s = pos + tb * cur_dir;
                     propagate_ms(amp_surf, st, nullptr, tb - ta,
                                  path_here, p0s, p1s,
-                                 si, bounce, out_segs, seg_count, seg_cap, -1);
+                                 si, bounce, out_segs, seg_count, seg_cap, -1,
+                                 current_medium_mat_idx);
                     path_here += tb - ta;
                 };
                 auto wave_sub = [&](double ta, double tb, int ci) {
@@ -2956,7 +3009,8 @@ static void trace_rays_multiscale(
                         V3d p1s = p0s + step * cur_dir;
                         propagate_ms(amp_surf, st, &ctx, step,
                                      path_here, p0s, p1s,
-                                     si, bounce, out_segs, seg_count, seg_cap, ci);
+                                     si, bounce, out_segs, seg_count, seg_cap, ci,
+                                     current_medium_mat_idx);
                         path_here += step;
                         t_sub     += step;
                         remaining -= step;
@@ -2976,8 +3030,11 @@ static void trace_rays_multiscale(
 
                 double total_path = path_len + t_hit;
 
-                V3d hit_n = st.tris[static_cast<size_t>(hit_tri)].normal;
-                if (cur_dir.dot(hit_n) > 0.0) hit_n = -hit_n;
+                V3d hit_n_geom = st.tris[static_cast<size_t>(hit_tri)].normal;
+                apply_parametric_surface_point(st, hit_tri, hit_pos, hit_pos, hit_n_geom);
+                V3d hit_n_transport = hit_n_geom;
+                if (cur_dir.dot(hit_n_transport) > 0.0) hit_n_transport = -hit_n_transport;
+                const bool front_face = (cur_dir.dot(hit_n_geom) < 0.0);
 
                 double max_abs = 0.0;
                 for (int b = 0; b < n_bands; ++b) {
@@ -2985,7 +3042,7 @@ static void trace_rays_multiscale(
                     if (a > max_abs) max_abs = a;
                 }
 
-                bool cont = hit_fn(si, bounce, hit_tri, cur_dir, hit_n,
+                bool cont = hit_fn(si, bounce, hit_tri, cur_dir, hit_n_geom, hit_n_transport, front_face,
                                    amp_surf, pos, hit_pos, total_path);
                 if (!cont) goto ms_done;
 
@@ -2993,16 +3050,11 @@ static void trace_rays_multiscale(
                 if (max_abs < min_amplitude) break;
 
                 /* ── Surface interaction ──────────────────────────────────── */
-                if (tri.flags & MAT_FLAG_APERTURE_STOP) {
-                    /* Blade material: absorb.  Diffraction is handled
-                     * physically — the dense coherent ray field that passes
-                     * through the blade gaps is accumulated by project_coherent
-                     * and propagated to the sensor by rs_propagate (exact
-                     * Rayleigh-Sommerfeld).  No secondary wavelets needed. */
-                    break;
+                const bool mat_transmissive = tri_material_is_transmissive(st, tri);
+                bool medium_changed = false;
 
-                } else if (tri.flags & MAT_FLAG_TRANSMISSIVE) {
-                    /* Phase 2: refractive boundary uses MatBuf-derived IOR.
+                if (mat_transmissive) {
+                    /* Material-driven refractive boundary from MatBuf IOR/transmittance.
                      * Convention: outside is air (n=1), inside is the material. */
                     double n_mat = mat_n_real(st, tri.mat_idx);
                     if (n_mat <= EPS || std::abs(n_mat - 1.0) < 1e-6) {
@@ -3010,25 +3062,34 @@ static void trace_rays_multiscale(
                         for (int b = 0; b < n_bands; ++b)
                             amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                         if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
-                            cur_dir = cosine_hemisphere(hit_n, rng);
+                            cur_dir = cosine_hemisphere(hit_n_transport, rng);
                         } else {
-                            cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
-                            if (cur_dir.dot(hit_n) < 0.0)
-                                cur_dir = cosine_hemisphere(hit_n, rng);
+                            cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n_transport) * hit_n_transport).normalized();
+                            if (cur_dir.dot(hit_n_transport) < 0.0)
+                                cur_dir = cosine_hemisphere(hit_n_transport, rng);
                         }
                     } else {
-                        bool entering = (cur_dir.dot(tri.normal) < 0.0);
-                        double n1 = entering ? 1.0   : n_mat;
-                        double n2 = entering ? n_mat : 1.0;
-
-                        /* hit_n is already flipped to oppose cur_dir. */
-                        double cos_i = std::max(0.0, -cur_dir.dot(hit_n));
+                        int medium_from = -1;
+                        int medium_to = -1;
+                        const bool has_side_pair = tri_boundary_media(tri, front_face, medium_from, medium_to);
+                        const bool entering =
+                            (current_medium_mat_idx < 0) ? front_face
+                                                         : (current_medium_mat_idx != tri.mat_idx);
+                        double n1 = has_side_pair
+                            ? medium_n_real(st, medium_from)
+                            : (entering
+                                ? ((current_medium_mat_idx >= 0) ? mat_n_real(st, current_medium_mat_idx) : 1.0)
+                                : n_mat);
+                        double n2 = has_side_pair
+                            ? medium_n_real(st, medium_to)
+                            : (entering ? n_mat : 1.0);
+                        double cos_i = std::max(0.0, -cur_dir.dot(hit_n_transport));
                         V3d refracted;
-                        bool can_refract = snell_refract(cur_dir, hit_n, n1, n2, refracted);
+                        bool can_refract = snell_refract(cur_dir, hit_n_transport, n1, n2, refracted);
 
                         if (!can_refract) {
                             /* TIR: perfect specular reflection, apply surface refl. */
-                            cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                            cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n_transport) * hit_n_transport).normalized();
                             for (int b = 0; b < n_bands; ++b)
                                 amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                         } else {
@@ -3037,7 +3098,7 @@ static void trace_rays_multiscale(
                             double R      = fresnel_R(cos_i, cos_t, n1, n2);
                             if (U(rng) < R) {
                                 /* Probabilistic reflection (Russian roulette, unbiased). */
-                                cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
+                                cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n_transport) * hit_n_transport).normalized();
                                 for (int b = 0; b < n_bands; ++b)
                                     amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                             } else {
@@ -3046,6 +3107,7 @@ static void trace_rays_multiscale(
                                 cur_dir = refracted;
                                 for (int b = 0; b < n_bands; ++b)
                                     amp[b] = amp_surf[b];
+                                medium_changed = true;
                             }
                         }
                     }
@@ -3055,12 +3117,27 @@ static void trace_rays_multiscale(
                     for (int b = 0; b < n_bands; ++b)
                         amp[b] = amp_surf[b] * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                     if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
-                        cur_dir = cosine_hemisphere(hit_n, rng);
+                        cur_dir = cosine_hemisphere(hit_n_transport, rng);
                     } else {
-                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n) * hit_n).normalized();
-                        if (cur_dir.dot(hit_n) < 0.0)
-                            cur_dir = cosine_hemisphere(hit_n, rng);
+                        cur_dir = (cur_dir - 2.0 * cur_dir.dot(hit_n_transport) * hit_n_transport).normalized();
+                        if (cur_dir.dot(hit_n_transport) < 0.0)
+                            cur_dir = cosine_hemisphere(hit_n_transport, rng);
                     }
+                }
+
+                /* ── Medium tracking ─────────────────────────────────────────
+                 * Update current_medium_mat_idx after every surface event so
+                 * the next segment's propagate_ms uses the correct IOR.
+                 * entering: ray moves into the solid → medium = this material.
+                 * exiting:  ray leaves back to air → medium = air (-1). */
+                if (mat_transmissive && medium_changed)
+                {
+                    int medium_from = -1;
+                    int medium_to = -1;
+                    if (tri_boundary_media(tri, front_face, medium_from, medium_to))
+                        current_medium_mat_idx = medium_to;
+                    else
+                        current_medium_mat_idx = front_face ? tri.mat_idx : -1;
                 }
 
                 /* ── Reactive (fluorescent) re-emission ─────────────────────
@@ -3069,10 +3146,11 @@ static void trace_rays_multiscale(
                  * to the Stokes-shifted destination band.  The yield is the
                  * material's reemission coefficient at band 0 — matches
                  * GLSL's `tri.emissive.w` / reemission packing convention. */
-                if (tri.flags & MAT_FLAG_REACTIVE)
+                if (st.mat_cache.reactive_shift_hz[tri.mat_idx] > 0.0 &&
+                    st.mat_cache.reemit_yield[tri.mat_idx] > 0.0f)
                     apply_reactive_shift_cached(amp, st.mat_cache, tri.mat_idx);
 
-                pos       = hit_pos + cur_dir * (EPS * 200.0);
+                pos       = hit_pos;
                 path_len += t_hit;
             }
             continue;
@@ -3129,7 +3207,7 @@ int ray_tracer_trace_multiscale(
         n_sources, src_pos, src_dir, src_directivity,
         n_rays, max_bounces, min_amplitude, rng,
         out_segs, out_cap, count,
-        [](int, int, int, const V3d&, const V3d&,
+        [](int, int, int, const V3d&, const V3d&, const V3d&, bool,
            const VXcd&, const V3d&, const V3d&, double) -> bool {
             return true;
         });
@@ -3171,13 +3249,16 @@ int ray_tracer_trace_multiscale_surface(
         n_rays, max_bounces, min_amplitude, rng,
         out_segs, out_cap, count,
         [&](int, int bounce, int hit_tri,
-            const V3d& incoming_dir, const V3d& surface_normal,
+            const V3d& incoming_dir, const V3d& geom_normal,
+            const V3d& transport_normal, bool front_face,
             const VXcd& amp_prop,
             const V3d&, const V3d&, double) -> bool
         {
+            (void)geom_normal;
+            (void)front_face;
             if (hit_tri >= 0 && hit_tri < n_tri) {
                 double area     = st->tri_areas[static_cast<size_t>(hit_tri)];
-                double cos_in   = std::max(0.0, -incoming_dir.dot(surface_normal));
+                double cos_in   = std::max(0.0, -incoming_dir.dot(transport_normal));
                 double inv_area = cos_in / std::max(area, AREA_EPS);
                 size_t base     = static_cast<size_t>(hit_tri) * n_bands;
                 float* dest     = (bounce == 0 && out_direct) ? out_direct : out_indirect;
@@ -3209,6 +3290,24 @@ int ray_tracer_set_tri_ior(
     int end     = std::min(tri_start + n_tris, n_total);
     for (int i = tri_start; i < end; ++i) {
         st->tris[static_cast<size_t>(i)].flags = flags;
+    }
+    return SK_OK;
+}
+
+int ray_tracer_set_tri_boundary_media(
+    RayTracerState* st,
+    int             tri_start,
+    int             n_tris,
+    int             medium_pos_mat_idx,
+    int             medium_neg_mat_idx)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    int n_total = static_cast<int>(st->tris.size());
+    int end     = std::min(tri_start + n_tris, n_total);
+    for (int i = tri_start; i < end; ++i) {
+        Triangle& tri = st->tris[static_cast<size_t>(i)];
+        tri.medium_pos_mat_idx = medium_pos_mat_idx;
+        tri.medium_neg_mat_idx = medium_neg_mat_idx;
     }
     return SK_OK;
 }
@@ -3497,24 +3596,41 @@ int ray_tracer_reduce_endpoint_records_to_sensor_integral(
             if (out_telemetry) out_telemetry->drop_wrong_group += 1;
             continue;
         }
-        // Only PIXEL_CONE sensor records encode the pixel in subpath_id.
-        // Forward/emission records (vertex_index < 0) use a sequential ray
-        // counter there and must be excluded from subpath_id->pixel mapping.
-        if (E.vertex_index < 0) {
-            if (out_telemetry) out_telemetry->drop_non_pixel_cone += 1;
-            continue;
-        }
+        if (out_telemetry) out_telemetry->sensor_group_records += 1;
         const int band = static_cast<int>(E.band_id);
         if (band < 0 || band >= n_bands) {
             if (out_telemetry) out_telemetry->drop_invalid_band += 1;
             continue;
         }
+        if (!(E.pdf > 0.0f)) {
+            continue;
+        }
 
         int px = -1;
         int py = -1;
-        if (!project_endpoint_record_to_sensor_pixel(*cam_desc, E, n_px, n_py, px, py)) {
-            if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
-            continue;
+        if (E.vertex_index >= 0) {
+            // PIXEL_CONE: subpath_id encodes py * n_px + px directly.
+            // Do not project E.pos (scene hit) back onto the sensor plane.
+            const int pix = static_cast<int>(E.subpath_id);
+            if (pix < 0 || pix >= n_px * n_py) {
+                if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
+                continue;
+            }
+            px = pix % n_px;
+            py = pix / n_px;
+            if (out_telemetry) out_telemetry->kept_pixel_cone_records += 1;
+        } else {
+            // Fallback for forward/area-BDPT sensor hits: same-group endpoint
+            // landed on sensor geometry but did not come from PIXEL_CONE pixel
+            // sampling, so recover the pixel from hit position.
+            if (!project_endpoint_record_to_sensor_pixel(*cam_desc, E, n_px, n_py, px, py)) {
+                if (out_telemetry) {
+                    out_telemetry->drop_non_pixel_cone += 1;
+                    out_telemetry->drop_projection_failed += 1;
+                }
+                continue;
+            }
+            if (out_telemetry) out_telemetry->kept_projected_records += 1;
         }
 
         const size_t idx = static_cast<size_t>(band) * pix_count
@@ -3761,23 +3877,40 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
             if (out_telemetry) out_telemetry->drop_wrong_group += 1;
             continue;
         }
-        // Only PIXEL_CONE sensor records encode the pixel in subpath_id.
-        // Forward/emission records (vertex_index < 0) use a sequential ray
-        // counter there and must be excluded from subpath_id->pixel mapping.
-        if (E.vertex_index < 0) {
-            if (out_telemetry) out_telemetry->drop_non_pixel_cone += 1;
-            continue;
-        }
+        if (out_telemetry) out_telemetry->sensor_group_records += 1;
         const int band = static_cast<int>(E.band_id);
         if (band < 0 || band >= n_bands) {
             if (out_telemetry) out_telemetry->drop_invalid_band += 1;
             continue;
         }
+        if (!(E.pdf > 0.0f)) {
+            continue;
+        }
         int px = -1;
         int py = -1;
-        if (!project_endpoint_record_to_sensor_pixel(*cam_desc, E, n_px, n_py, px, py)) {
-            if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
-            continue;
+        if (E.vertex_index >= 0) {
+            // PIXEL_CONE: subpath_id encodes py * n_px + px directly.
+            // Do not project E.pos (scene hit) back onto the sensor plane.
+            const int pix = static_cast<int>(E.subpath_id);
+            if (pix < 0 || pix >= n_px * n_py) {
+                if (out_telemetry) out_telemetry->drop_out_of_bounds_pixel += 1;
+                continue;
+            }
+            px = pix % n_px;
+            py = pix / n_px;
+            if (out_telemetry) out_telemetry->kept_pixel_cone_records += 1;
+        } else {
+            // Fallback for forward/area-BDPT sensor hits: project the sensor
+            // hit position into the registered camera plane instead of forcing
+            // perfect PIXEL_CONE encoding.
+            if (!project_endpoint_record_to_sensor_pixel(*cam_desc, E, n_px, n_py, px, py)) {
+                if (out_telemetry) {
+                    out_telemetry->drop_non_pixel_cone += 1;
+                    out_telemetry->drop_projection_failed += 1;
+                }
+                continue;
+            }
+            if (out_telemetry) out_telemetry->kept_projected_records += 1;
         }
         const size_t idx = static_cast<size_t>(band) * pix_count
                          + static_cast<size_t>(py) * static_cast<size_t>(n_px)
@@ -3790,9 +3923,27 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
         static constexpr double C_LIGHT_M_S = 299792458.0;
         return (freq_hz > 0.0) ? (C_LIGHT_M_S / freq_hz) * 1.0e9 : 0.0;
     };
-    auto gauss = [](double x, double mu, double sigma) -> double {
-        const double t = (x - mu) / std::max(1.0e-12, sigma);
-        return std::exp(-0.5 * t * t);
+    auto wavelength_to_rgb = [](double wl, double& r, double& g, double& b) {
+        r = 0.0; g = 0.0; b = 0.0;
+        if (wl >= 380.0 && wl < 440.0) {
+            r = -(wl - 440.0) / (440.0 - 380.0); b = 1.0;
+        } else if (wl < 490.0) {
+            g = (wl - 440.0) / (490.0 - 440.0); b = 1.0;
+        } else if (wl < 510.0) {
+            g = 1.0; b = -(wl - 510.0) / (510.0 - 490.0);
+        } else if (wl < 580.0) {
+            r = (wl - 510.0) / (580.0 - 510.0); g = 1.0;
+        } else if (wl < 645.0) {
+            r = 1.0; g = -(wl - 645.0) / (645.0 - 580.0);
+        } else if (wl <= 700.0) {
+            r = 1.0;
+        }
+        double edge = 1.0;
+        if (wl >= 380.0 && wl < 420.0)
+            edge = 0.3 + 0.7 * (wl - 380.0) / (420.0 - 380.0);
+        else if (wl > 645.0 && wl <= 700.0)
+            edge = 0.3 + 0.7 * (700.0 - wl) / (700.0 - 645.0);
+        r *= edge; g *= edge; b *= edge;
     };
 
     std::vector<float> rgb_linear(static_cast<size_t>(3) * pix_count, 0.0f);
@@ -3806,9 +3957,8 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
                 const size_t idx = static_cast<size_t>(band) * pix_count + pix_idx;
                 const double p = std::norm(sensor_img[idx]) * gain_sq;
                 const double wl = wavelength_nm(st->freq_hz_vec[band]);
-                const double wr = gauss(wl, 610.0, 45.0);
-                const double wg = gauss(wl, 540.0, 40.0);
-                const double wb = gauss(wl, 460.0, 35.0);
+                double wr = 0.0, wg = 0.0, wb = 0.0;
+                wavelength_to_rgb(std::min(700.0, std::max(380.0, wl)), wr, wg, wb);
                 r += p * wr;
                 g += p * wg;
                 b += p * wb;
@@ -3832,11 +3982,18 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
 
     for (size_t i = 0; i < pix_count; ++i) {
         const size_t base = i * 3u;
+        double rgb_tmp[3] = {0.0, 0.0, 0.0};
         for (int c = 0; c < 3; ++c) {
             const float lin = rgb_linear[base + static_cast<size_t>(c)];
             out_rgb_linear[base + static_cast<size_t>(c)] = lin;
             const double x = std::max(0.0, static_cast<double>(lin));
-            const double y = std::log1p((x / white_scale) * 6.0) / log_denom;
+            double y = std::log1p((x / white_scale) * 6.0) / log_denom;
+            y = y / (1.0 + 0.18 * y);
+            rgb_tmp[c] = std::min(1.0, std::max(0.0, y));
+        }
+        const double luma = 0.2126 * rgb_tmp[0] + 0.7152 * rgb_tmp[1] + 0.0722 * rgb_tmp[2];
+        for (int c = 0; c < 3; ++c) {
+            const double y = 0.90 * rgb_tmp[c] + 0.10 * luma;
             out_rgb_tonemapped[base + static_cast<size_t>(c)] = static_cast<float>(std::min(1.0, std::max(0.0, y)));
         }
     }
@@ -4276,6 +4433,7 @@ static int ctx_nearest_entry(
 static bool apply_surface(
     RayTracerState& st,
     VXcd& amp, V3d& dir,
+    const V3d& hit_n_geom,
     int hit_tri, int& bounce,
     std::mt19937_64& rng,
     std::uniform_real_distribution<double>& U)
@@ -4283,8 +4441,8 @@ static bool apply_surface(
     if (bounce >= st.live_max_bounces) return false;
 
     const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
-    V3d hit_n = tri.normal;
-    if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
+    V3d hit_n_transport = hit_n_geom;
+    if (dir.dot(hit_n_transport) > 0.0) hit_n_transport = -hit_n_transport;
 
     if (tri.flags & MAT_FLAG_APERTURE_STOP) {
         return false;  /* absorbed */
@@ -4292,23 +4450,23 @@ static bool apply_surface(
 
     {
         double n_mat = mat_n_real(st, tri.mat_idx);
-        bool refractive = (tri.flags & MAT_FLAG_TRANSMISSIVE)
+        bool refractive = tri_material_is_transmissive(st, tri)
                        && n_mat > EPS && std::abs(n_mat - 1.0) > 1e-6;
         if (refractive) {
-            bool entering  = (dir.dot(tri.normal) < 0.0);
+            bool entering  = (dir.dot(hit_n_geom) < 0.0);
             double n1      = entering ? 1.0   : n_mat;
             double n2      = entering ? n_mat : 1.0;
-            double cos_i   = std::max(0.0, -dir.dot(hit_n));
+            double cos_i   = std::max(0.0, -dir.dot(hit_n_transport));
             V3d refracted;
-            bool ok        = snell_refract(dir, hit_n, n1, n2, refracted);
+            bool ok        = snell_refract(dir, hit_n_transport, n1, n2, refracted);
             if (!ok) {
-                dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+                dir = (dir - 2.0 * dir.dot(hit_n_transport) * hit_n_transport).normalized();
             } else {
                 double s2t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
                 double ct  = std::sqrt(std::max(0.0, 1.0 - s2t));
                 double R   = fresnel_R(cos_i, ct, n1, n2);
                 dir = (U(rng) < R)
-                    ? (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized()
+                    ? (dir - 2.0 * dir.dot(hit_n_transport) * hit_n_transport).normalized()
                     : refracted;
             }
             for (int b = 0; b < st.n_bands; ++b)
@@ -4317,11 +4475,11 @@ static bool apply_surface(
             for (int b = 0; b < st.n_bands; ++b)
                 amp[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
             if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
-                dir = cosine_hemisphere(hit_n, rng);
+                dir = cosine_hemisphere(hit_n_transport, rng);
             } else {
-                dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
-                if (dir.dot(hit_n) < 0.0)
-                    dir = cosine_hemisphere(hit_n, rng);
+                dir = (dir - 2.0 * dir.dot(hit_n_transport) * hit_n_transport).normalized();
+                if (dir.dot(hit_n_transport) < 0.0)
+                    dir = cosine_hemisphere(hit_n_transport, rng);
             }
         }
     }
@@ -4446,7 +4604,10 @@ static int scheduler_advance_ray(
     }
 
     if (act == ACT_HIT_SURFACE) {
-        bool alive = apply_surface(st, amp, dir, hit_tri, rs.bounce, rng, U);
+        V3d hit_n_geom = st.tris[static_cast<size_t>(hit_tri)].normal;
+        V3d hit_pos = p1;
+        apply_parametric_surface_point(st, hit_tri, hit_pos, hit_pos, hit_n_geom);
+        bool alive = apply_surface(st, amp, dir, hit_n_geom, hit_tri, rs.bounce, rng, U);
         if (!alive) {
             rs.alive = 0;
             for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
@@ -4768,19 +4929,233 @@ extern "C" SK_API int ray_tracer_n_tri_groups(const RayTracerState* st)
  *     Python display layer can reconstruct gain, phase, MTF, etc.
  */
 
-/* Forward declarations for region-kind dispatch helpers — implementations
- * live just below the bidirectional function for narrative locality. */
+/* Forward declarations for region-kind dispatch helpers. */
 static inline void apply_thin_lens_transform(
     const RtScaleContext& ctx, V3d& pos, V3d& dir);
-static inline void apply_wave_aperture_transform(
-    const RayTracerState& st, const RtScaleContext& ctx,
-    const V3d& cross_pos, VXcd& amp);
 static inline void apply_thick_lens_wave_transform(
     const RayTracerState& st, const RtScaleContext& ctx,
     V3d& pos, V3d& dir, VXcd& amp);
-static inline uint32_t dispatch_scale_context_entry(
-    const RayTracerState& st, const RtScaleContext& ctx,
-    V3d& pos, V3d& dir, VXcd& amp);
+/* ── Unified bounce step for BDPT forward and backward paths ──────────
+ * Encapsulates the complete physics of one bounce: intersection, 
+ * attenuation, material response, and state updates. Both forward 
+ * (emitter→scene) and backward (sensor→scene) paths call this identically.
+ * No physics or material property code is simplified or duplicated.
+ * 
+ * RETURNS: struct with:
+ *   hit_tri: triangle ID (-1 if miss)
+ *   hit_pos: world position of hit
+ *   hit_n_param: parametric surface normal at hit
+ *   should_continue: true if ray should bounce again
+ *   is_sensor_hit: true if hit triangle is a sensor endpoint (backward only)
+ */
+/* ── Causal bounce record: per-hit data for post-trace power propagation ─────
+ * Stores structural information from one bounce step in causal order.
+ * Both forward and backward paths may accumulate these into a path array,
+ * enabling the power sustenance calculation ("how does emissive light
+ * sustain its power back to where I came from") to be vectorized externally
+ * on the record stream rather than computed inline per-bounce. */
+struct BounceRecord {
+    int          bounce_index;
+    int          hit_tri;
+    uint32_t     hit_tri_flags;
+    V3d          hit_pos;
+    V3d          hit_n_param;
+    V3d          incoming_dir;
+    uint32_t     interaction_flags;
+    bool         is_emissive_hit;
+    bool         is_sensor_hit;
+    int          sensor_group_id;
+};
+
+
+static BounceStepResult ray_bounce_step_bdpt(
+    RayTracerState& st,
+    const int* tri_sensor_group,
+    V3d& pos,
+    V3d& dir,
+    VXcd& amp,
+    double& path_len,
+    int& current_medium_mat_idx,
+    uint32_t& interaction_flags,
+    int n_bands,
+    double min_amplitude,
+    std::mt19937_64& rng,
+    VXcd* amp_at_hit,
+    bool is_backward)
+{
+    const bool has_bvh = !st.bvh_nodes.empty();
+    BounceStepResult res;
+    res.hit_tri         = -1;
+    res.hit_tri_flags   = 0u;
+    res.should_continue = false;
+    res.is_sensor_hit   = false;
+    res.is_emissive_hit = false;
+    res.sensor_group_id = -1;
+    
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    
+    /* ─ Intersection query ─ */
+    double t_hit = 1e18;
+    if (has_bvh) {
+        V3d inv = dir.cwiseInverse();
+        bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris, pos, dir, inv, t_hit, res.hit_tri);
+    } else {
+        for (size_t ti = 0; ti < st.tris.size(); ++ti) {
+            double tt;
+            if (ray_triangle_hit(pos, dir, st.tris[ti], tt) && tt > T_SELF && tt < t_hit) {
+                t_hit = tt;
+                res.hit_tri = (int)ti;
+            }
+        }
+    }
+    if (res.hit_tri < 0) {
+        return res;  /* Miss → terminate */
+    }
+    
+    /* ─ Compute hit point and attenuation ─ */
+    res.hit_pos = pos + t_hit * dir;
+    res.hit_n_param = st.tris[(size_t)res.hit_tri].normal;
+    apply_parametric_surface_point(st, res.hit_tri, res.hit_pos, res.hit_pos, res.hit_n_param);
+    double total_path = path_len + t_hit;
+    
+    /* ─ Phase + atmospheric attenuation along segment ─ */
+    for (int b = 0; b < n_bands; ++b) {
+        double n_re = 1.0, n_im = 0.0;
+        if (current_medium_mat_idx >= 0) {
+            n_re = mat_n_real(st, current_medium_mat_idx, b);
+            n_im = mat_n_imag(st, current_medium_mat_idx, b);
+            if (n_re < 1.0) n_re = 1.0;
+        }
+        double k_medium = st.k_real[b] * n_re;
+        double alpha = st.atmo_abs[b];
+        if (current_medium_mat_idx >= 0) {
+            alpha += TWO_PI * st.freq_hz_vec[b] * n_im / st.speed_m_s;
+        }
+        double atten = std::exp(-alpha * t_hit);
+        double spread = is_backward ? 1.0 : 1.0 / (1.0 + total_path);
+        amp[b] *= std::polar(atten * spread, -k_medium * t_hit);
+    }
+    
+    /* ─ Field capture ─ */
+    if (st.camera_field_grid) {
+        accumulate_field_capture_segment(st, pos, res.hit_pos, amp);
+    }
+
+    if (amp_at_hit) *amp_at_hit = amp;  /* post-propagation, pre-reflection */
+
+    /* ─ Material consequence kernel ────────────────────────────────────────────
+     * tri is the authoritative source for all flag queries. Classify the hit
+     * surface first; terminal conditions (aperture stop, emissive) return before
+     * any surface physics so arrival amplitude is preserved unmodified.
+     * Non-terminal surfaces receive full Fresnel/Snell/diffuse/specular physics. */
+    const Triangle& tri = st.tris[(size_t)res.hit_tri];
+    res.hit_tri_flags = tri.flags;
+    V3d hit_n = res.hit_n_param;
+    if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
+    res.hit_n_transport = hit_n;
+
+    /* ─ Sensor endpoint (recorded by caller; physics continues unless terminal) ─ */
+    if (tri_sensor_group) {
+        int sgid = tri_sensor_group[res.hit_tri];
+        if (sgid >= 0) {
+            res.is_sensor_hit = true;
+            res.sensor_group_id = sgid;
+        }
+    }
+
+    /* Aperture stop: ray terminates unconditionally */
+    if (tri.flags & MAT_FLAG_APERTURE_STOP) {
+        return res;
+    }
+
+    /* Emissive surface: arrival amplitude is the measurement; skip surface
+     * response. path_len advanced so callers record the correct total path.
+     * Forward path should not reach emissive mid-chain; backward path
+     * terminates here — this is the light source the backward ray sought. */
+    if (tri.flags & MAT_FLAG_EMISSIVE) {
+        res.is_emissive_hit = true;
+        path_len = total_path;  /* advance to emissive surface for EndpointRecord */
+        return res;
+    }
+
+    const bool mat_transmissive = tri_material_is_transmissive(st, tri);
+    
+    /* ─ Material physics: transmission vs. reflection ─ */
+    if (mat_transmissive) {
+        /* Fresnel refraction / TIR for glass surfaces */
+        const bool front_face = (dir.dot(res.hit_n_param) < 0.0);
+        int medium_from = -1, medium_to = -1;
+        const bool has_side_pair = tri_boundary_media(tri, front_face, medium_from, medium_to);
+        const double n1 = has_side_pair
+            ? medium_n_real(st, medium_from)
+            : ((current_medium_mat_idx >= 0) ? mat_n_real(st, current_medium_mat_idx) : 1.0);
+        const double n2 = has_side_pair
+            ? medium_n_real(st, medium_to)
+            : (front_face ? mat_n_real(st, tri.mat_idx) : 1.0);
+        const double cos_i = std::max(0.0, -dir.dot(hit_n));
+        V3d refracted;
+        const bool can_refract = snell_refract(dir, hit_n, n1, n2, refracted);
+        if (!can_refract) {
+            /* TIR — reflect */
+            dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+            for (int b = 0; b < n_bands; ++b)
+                amp[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+        } else {
+            const double sin2_t = (n1 / n2) * (n1 / n2) * (1.0 - cos_i * cos_i);
+            const double cos_t = std::sqrt(std::max(0.0, 1.0 - sin2_t));
+            const double R = fresnel_R(cos_i, cos_t, n1, n2);
+            if (U(rng) < R) {
+                /* Reflect (Fresnel) */
+                dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+                for (int b = 0; b < n_bands; ++b)
+                    amp[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+            } else {
+                /* Refract through — no amplitude rescale; probability already encodes it */
+                dir = refracted;
+                if (has_side_pair)
+                    current_medium_mat_idx = medium_to;
+                else
+                    current_medium_mat_idx = (current_medium_mat_idx == tri.mat_idx) ? -1 : tri.mat_idx;
+            }
+        }
+    } else if (U(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
+        /* Diffuse scatter */
+        dir = cosine_hemisphere(hit_n, rng);
+        for (int b = 0; b < n_bands; ++b)
+            amp[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+    } else {
+        /* Specular reflection */
+        dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
+        if (dir.dot(hit_n) < 0.0) dir = cosine_hemisphere(hit_n, rng);
+        for (int b = 0; b < n_bands; ++b)
+            amp[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+    }
+    
+    /* ─ Reactive material shifts ─ */
+    if (tri.flags & MAT_FLAG_REACTIVE) {
+        apply_reactive_shift_cached(amp, st.mat_cache, tri.mat_idx);
+    }
+    
+    /* ─ Update ray state ─ */
+    pos = res.hit_pos;
+    path_len = total_path;
+    
+    /* ─ Region dispatch (scale contexts) ─ */
+    for (const RtScaleContext& ctx : st.scale_contexts) {
+        V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
+        if ((pos - c).norm() <= ctx.radius) {
+            interaction_flags |= dispatch_scale_context_entry(st, ctx, pos, dir, amp);
+        }
+    }
+    
+    /* ─ Energy threshold ─ */
+    double max_abs = 0.0;
+    for (int b = 0; b < n_bands; ++b)
+        max_abs = std::max(max_abs, std::abs(amp[b]));
+    
+    res.should_continue = (max_abs >= min_amplitude);
+    return res;
+}
 
 static int ray_tracer_bidirectional_impl(
     RayTracerState* st,
@@ -4868,13 +5243,15 @@ static int ray_tracer_bidirectional_impl(
             /* 3. Pick an outgoing direction: cosine-hemisphere about normal. */
             V3d dir = cosine_hemisphere(emit_n, rng);
 
-            /* 4. Initial unit complex amplitude per band. */
-            for (int b = 0; b < n_bands; ++b) amp[b] = cd(1.0, 0.0);
+            const int ray_band = (n_bands > 0) ? (static_cast<int>(subpath_counter % static_cast<uint32_t>(n_bands))) : 0;
+            for (int b = 0; b < n_bands; ++b)
+                amp[b] = (b == ray_band) ? cd(1.0, 0.0) : cd(0.0, 0.0);
 
             V3d pos = origin + dir * (EPS * 200.0);
             double path_len = 0.0;
             uint32_t my_subpath = subpath_counter++;
             uint32_t interaction_flags = 0u;
+            int current_medium_mat_idx = -1; /* tracks which material the ray is inside */
 
             /* Launch-context dispatch: apply region transforms to emission
              * rays immediately after post-triangulated intercept prep. */
@@ -4886,51 +5263,44 @@ static int ray_tracer_bidirectional_impl(
             }
 
             for (int bounce = 0; bounce < max_bounces; ++bounce) {
-                double t_hit = 1e18; int hit_tri = -1;
-                if (has_bvh) {
-                    V3d inv = dir.cwiseInverse();
-                    bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
-                              pos, dir, inv, t_hit, hit_tri);
-                } else {
-                    for (size_t ti = 0; ti < st->tris.size(); ++ti) {
-                        double tt;
-                        if (ray_triangle_hit(pos, dir, st->tris[ti], tt) && tt < t_hit) {
-                            t_hit = tt; hit_tri = (int)ti;
-                        }
-                    }
-                }
-                if (hit_tri < 0) break;
-
-                V3d hit_pos = pos + t_hit * dir;
-                V3d hit_n_param = st->tris[hit_tri].normal;
-                apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n_param);
-                double total_path = path_len + t_hit;
-
-                /* Phase + atmospheric attenuation along the segment. */
-                for (int b = 0; b < n_bands; ++b) {
-                    double k = st->k_real[b];
-                    double atten = std::exp(-st->atmo_abs[b] * t_hit);
-                    /* Spreading: 1/(1 + r) keeps numerics stable. */
-                    double spread = 1.0 / (1.0 + total_path);
-                    amp[b] *= std::polar(atten * spread, -k * t_hit);
-                }
-
-                /* Sensor capture? */
-                int sgid = tri_sensor_group[hit_tri];
-                if (sgid >= 0) {
-                    V3d hit_n = st->tris[hit_tri].normal;
+                /* ─ Unified bounce physics (shared with backward path) ─ */
+                BounceStepResult step = ray_bounce_step_bdpt(
+                    *st, tri_sensor_group.data(), pos, dir, amp, path_len,
+                    current_medium_mat_idx, interaction_flags, n_bands, min_amplitude, rng,
+                    nullptr, false);
+                
+                if (step.hit_tri < 0) break;  /* Miss */
+                
+                /* ─ Forward-path-specific: legacy visualization callback ─ */
+                append_camera_strike(
+                    *st,
+                    static_cast<int>(g),
+                    bounce,
+                    step.hit_tri,
+                    step.hit_pos,
+                    step.hit_n_param,
+                    dir,
+                    path_len,
+                    path_len,
+                    1,
+                    0,
+                    amp);
+                
+                /* ─ Forward-path-specific: sensor endpoint recording ─ */
+                if (step.is_sensor_hit) {
+                    V3d hit_n = st->tris[step.hit_tri].normal;
                     double cos_theta = std::abs(dir.dot(hit_n));
                     for (int b = 0; b < n_bands; ++b) {
                         if (rec_count >= out_cap) goto bdpt_done;
                         EndpointRecord& E = out_records[rec_count++];
                         E.subpath_id   = my_subpath;
                         E.band_id      = static_cast<uint32_t>(b);
-                        E.group_id     = sgid;
+                        E.group_id     = step.sensor_group_id;
                         E.vertex_index = -1;
-                        E.pos[0] = (float)hit_pos.x();
-                        E.pos[1] = (float)hit_pos.y();
-                        E.pos[2] = (float)hit_pos.z();
-                        E.pathlen_m = (float)total_path;
+                        E.pos[0] = (float)step.hit_pos.x();
+                        E.pos[1] = (float)step.hit_pos.y();
+                        E.pos[2] = (float)step.hit_pos.z();
+                        E.pathlen_m = (float)path_len;
                         E.dir[0] = (float)dir.x();
                         E.dir[1] = (float)dir.y();
                         E.dir[2] = (float)dir.z();
@@ -4941,310 +5311,23 @@ static int ray_tracer_bidirectional_impl(
                         E._pad      = (float)interaction_flags;
                     }
                 }
-
-                /* Energy threshold. */
-                double max_abs = 0.0;
-                for (int b = 0; b < n_bands; ++b)
-                    max_abs = std::max(max_abs, std::abs(amp[b]));
-                if (max_abs < min_amplitude) break;
-
-                /* Surface scatter — same minimum branch as the splatter, so
-                 * material flag handling stays consistent.  Reactive +
-                 * transmissive logic is intentionally minimal here; the full
-                 * BDPT branch fanout is queued behind the branch_factor
-                 * extension (see ray_tracer_set_branch_factor below). */
-                const Triangle& tri = st->tris[hit_tri];
-                V3d hit_n = hit_n_param;
-                if (dir.dot(hit_n) > 0.0) hit_n = -hit_n;
-                if (tri.flags & MAT_FLAG_APERTURE_STOP) break;
-                if (U(rng) < mat_cache_diffusion(st->mat_cache, tri.mat_idx)) {
-                    dir = cosine_hemisphere(hit_n, rng);
-                } else {
-                    dir = (dir - 2.0 * dir.dot(hit_n) * hit_n).normalized();
-                    if (dir.dot(hit_n) < 0.0) dir = cosine_hemisphere(hit_n, rng);
-                }
-                for (int b = 0; b < n_bands; ++b)
-                    amp[b] *= mat_cache_refl(st->mat_cache, tri.mat_idx, b);
-
-                if (tri.flags & MAT_FLAG_REACTIVE)
-                    apply_reactive_shift_cached(amp, st->mat_cache, tri.mat_idx);
-
-                pos = hit_pos + dir * (EPS * 200.0);
-                path_len = total_path;
-
-                /* Region dispatch — apply any scale_context transforms
-                 * whose sphere contains the new ray origin.  Smallest
-                 * radius first (the contexts vector is pre-sorted), so
-                 * inner zones override outer ones in a single pass. */
-                for (const RtScaleContext& ctx : st->scale_contexts) {
-                    V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
-                    if ((pos - c).norm() <= ctx.radius) {
-                        interaction_flags |= dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
-                    }
-                }
+                
+                /* ─ Check if ray should continue bouncing ─ */
+                if (!step.should_continue) break;
             }
         }
     }
 bdpt_done:
-    /* ──────────────────────────────────────────────────────────────────
-     * PIXEL_CONE sensor pass.
-     *
-     * For every SENSOR group whose sample_policy == TRI_GROUP_SAMPLE_PIXEL_CONE
-     * and whose CameraSensorDesc was registered, drive the integrator from
-     * the sensor side: deterministic outer loop over (px, py), stochastic
-     * inner loop over n_aperture_samples points on the aperture.  This is
-     * the camera-simulator path; the symmetric area-BDPT path above is the
-     * reference standard and is preserved unchanged.
-     *
-     * Aperture sampling: stochastic uniform-on-disk per the user spec
-     * ("conic distribution, stochastic, no grid jitter pattern").  When an
-     * aperture-stop BLOCKER group is registered, rays additionally must
-     * pass an explicit BVH/triangle test against the stop's tris, so blade
-     * polygon shape is honoured automatically without separate blade math.
-     *
-     * Vectorisation: outer (sensor_group × pixel) loop is OpenMP-parallel.
-     * Inner per-aperture-sample loop runs serially per pixel; each pixel's
-     * write region in out_records is computed up-front so threads never
-     * race on rec_count.
-     *
-     * Encoding (hard rule: no new EndpointRecord fields):
-     *   subpath_id   = py * n_px + px
-     *   vertex_index = aperture sample index
-     *   group_id     = sensor group id
-     * ────────────────────────────────────────────────────────────────── */
-    {
-        for (size_t g = 0; g < st->tri_groups.size(); ++g) {
-            const TriGroupDesc& gd = st->tri_groups[g];
-            if (!(gd.role_bits & TRI_GROUP_ROLE_SENSOR)) continue;
-            if (gd.sample_policy != TRI_GROUP_SAMPLE_PIXEL_CONE) continue;
-            if (g >= st->tri_group_has_camera.size() ||
-                !st->tri_group_has_camera[g]) continue;
-            const CameraSensorDesc& cam = st->tri_group_camera[g];
-            if (cam.n_px <= 0 || cam.n_py <= 0 ||
-                cam.n_aperture_samples <= 0) continue;
-
-            /* Build orthonormal sensor basis. */
-            V3d cpos(cam.pos[0], cam.pos[1], cam.pos[2]);
-            V3d cfwd(cam.fwd[0], cam.fwd[1], cam.fwd[2]);
-            V3d cup (cam.up[0],  cam.up[1],  cam.up[2]);
-            cfwd.normalize();
-            V3d cright = cfwd.cross(cup).normalized();
-            cup        = cright.cross(cfwd).normalized();
-            V3d sensor_origin =
-                cpos
-                - 0.5 * cam.sensor_w_m * cright
-                - 0.5 * cam.sensor_h_m * cup;
-            V3d aperture_centre = cpos + cam.focal_m * cfwd;
-
-            /* Optional BLOCKER stop group for blade-shape honoring. */
-            const std::vector<int>* stop_idxs = nullptr;
-            if (cam.aperture_stop_group_id >= 0 &&
-                cam.aperture_stop_group_id < (int)st->tri_group_indices.size())
-                stop_idxs = &st->tri_group_indices[cam.aperture_stop_group_id];
-
-            const int n_px = cam.n_px;
-            const int n_py = cam.n_py;
-            const int n_ap = cam.n_aperture_samples;
-            const int stream_div = std::max(1, cam.pixel_stream_divisor);
-            int stream_phase = cam.pixel_stream_phase;
-            if (cam.pixel_stream_phase_from_seed) {
-                stream_phase = (stream_div > 0)
-                    ? static_cast<int>(seed % static_cast<uint32_t>(stream_div))
-                    : 0;
-            }
-            if (stream_div > 0) {
-                stream_phase %= stream_div;
-                if (stream_phase < 0) stream_phase += stream_div;
-            }
-            const double pix_w = cam.sensor_w_m / std::max(1, n_px);
-            const double pix_h = cam.sensor_h_m / std::max(1, n_py);
-
-            /* Reserve fixed slots per pixel (n_ap * n_bands each), then
-             * compact per-pixel written counts serially for contiguous output. */
-            const long long total_pixels = (long long)n_px * n_py;
-            const long long stream_pixels =
-                (total_pixels > stream_phase)
-                ? (1LL + (total_pixels - 1LL - stream_phase) / stream_div)
-                : 0LL;
-            const long long recs_per_px  = (long long)n_ap * n_bands;
-            const int slot_base = rec_count;
-            const long long cap_left = static_cast<long long>(out_cap - slot_base);
-            if (recs_per_px <= 0 || cap_left < recs_per_px)
-                continue;
-            const long long pixels_fit = std::min(stream_pixels, cap_left / recs_per_px);
-            if (pixels_fit <= 0)
-                continue;
-
-            std::vector<int> pixel_written(static_cast<size_t>(pixels_fit), 0);
-            int sensor_gid = (int)g;
-
-            /* Per-pixel parallel.  Each pixel computes its own jitter
-             * stream from (seed, px, py) for determinism + reproducibility. */
-            #pragma omp parallel
-            {
-                std::mt19937_64 trng;
-                VXcd amp_local(n_bands);
-                #pragma omp for schedule(dynamic, 8)
-                for (long long pi = 0; pi < pixels_fit; ++pi) {
-                    const long long pixel_linear =
-                        static_cast<long long>(stream_phase) + pi * static_cast<long long>(stream_div);
-                    int py = (int)(pixel_linear / n_px);
-                    int px = (int)(pixel_linear - (long long)py * n_px);
-                    EndpointRecord* slot = out_records + slot_base + pi * recs_per_px;
-                    int slot_written = 0;
-
-                    /* Deterministic per-pixel RNG seed (decoupled from the
-                     * shared cone_rng so threads don't race). */
-                    uint64_t s = (uint64_t)seed * 0x9E3779B97F4A7C15ULL
-                               + (uint64_t)pixel_linear * 0xBF58476D1CE4E5B9ULL
-                               + 0x94D049BB133111EBULL;
-                    trng.seed(s);
-                    std::uniform_real_distribution<double> Up(0.0, 1.0);
-
-                    V3d pix_pt = sensor_origin
-                               + (px + 0.5) * pix_w * cright
-                               + (py + 0.5) * pix_h * cup;
-
-                    for (int ai = 0; ai < n_ap; ++ai) {
-                        uint32_t interaction_flags = 0u;
-                        /* Stratified stochastic uniform-on-disk aperture sample.
-                         * The radial stratum guarantees full support coverage
-                         * of the aperture-projected angle family, including
-                         * near-edge influence at very large apertures and
-                         * stable center behavior at very small apertures.
-                         * Angle uses golden-angle progression with jitter to
-                         * avoid grid artifacts while preserving reproducibility.
-                         */
-                        double j1 = Up(trng), j2 = Up(trng);
-                        double q  = (static_cast<double>(ai) + j1) / static_cast<double>(std::max(1, n_ap));
-                        double r  = std::sqrt(std::min(1.0, std::max(0.0, q))) * cam.aperture_radius_m;
-                        const double golden = 2.39996322972865332; /* radians */
-                        double th = golden * static_cast<double>(ai) + 2.0 * M_PI * j2;
-                        V3d ap_pt = aperture_centre
-                                  + r * std::cos(th) * cright
-                                  + r * std::sin(th) * cup;
-
-                        V3d dir = (ap_pt - pix_pt).normalized();
-                        V3d pos = pix_pt;
-
-                        /* Honour blade shape via BLOCKER tris if registered.
-                         * Test the segment pix_pt → ap_pt against stop tris;
-                         * if any tri is hit before ap_pt, drop this sample
-                         * (blade occluded the ray). */
-                        if (stop_idxs) {
-                            double seg_len = (ap_pt - pix_pt).norm();
-                            bool blocked = false;
-                            for (int tri_id : *stop_idxs) {
-                                if (tri_id < 0 || tri_id >= (int)st->tris.size()) continue;
-                                double tt;
-                                if (ray_triangle_hit(pos, dir, st->tris[(size_t)tri_id], tt)
-                                    && tt > 1e-6 && tt < seg_len) {
-                                    blocked = true; break;
-                                }
-                            }
-                            if (blocked) continue;
-                        }
-
-                        /* Step into the scene from the aperture. */
-                        pos = ap_pt + dir * (EPS * 200.0);
-                        for (int b = 0; b < n_bands; ++b) amp_local[b] = cd(1.0, 0.0);
-                        double path_len = (ap_pt - pix_pt).norm();
-
-                        /* Wave-region dispatch at the aperture crossing.
-                         * Any registered scale_context whose sphere
-                         * contains the aperture sample point is allowed to
-                         * transform (pos, dir, amp).  This is the
-                         * "capacity to wave transform the aperture" hook:
-                         * a WAVE_HELMHOLTZ region wrapping the stop will
-                         * apply Fresnel quadratic phase per band; a
-                         * THIN_LENS_TRANSFORM region steers the ray.
-                         * Iteration is smallest-radius-first (vector is
-                         * pre-sorted at registration). */
-                        for (const RtScaleContext& ctx : st->scale_contexts) {
-                            V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
-                            if ((ap_pt - c).norm() <= ctx.radius) {
-                                interaction_flags |= dispatch_scale_context_entry(*st, ctx, pos, dir, amp_local);
-                            }
-                        }
-
-                        /* First-hit trace.  We record the first opaque
-                         * surface hit; no bounces in PIXEL_CONE mode (the
-                         * forward EMISSIVE path provides scene illumination
-                         * — sensor rays exist to register *what they see*,
-                         * and the bidirectional join is downstream). */
-                        double t_hit = 1e18; int hit_tri = -1;
-                        if (has_bvh) {
-                            V3d inv = dir.cwiseInverse();
-                            bvh_query(st->bvh_nodes, st->bvh_tri_ids, st->tris,
-                                      pos, dir, inv, t_hit, hit_tri);
-                        } else {
-                            for (size_t ti = 0; ti < st->tris.size(); ++ti) {
-                                double tt;
-                                if (ray_triangle_hit(pos, dir, st->tris[ti], tt) && tt < t_hit) {
-                                    t_hit = tt; hit_tri = (int)ti;
-                                }
-                            }
-                        }
-                        if (hit_tri < 0) continue;
-                        V3d hit_pos = pos + t_hit * dir;
-                        V3d hit_n_param = st->tris[(size_t)hit_tri].normal;
-                        apply_parametric_surface_point(*st, hit_tri, hit_pos, hit_pos, hit_n_param);
-                        double total_path = path_len + t_hit;
-
-                        for (int b = 0; b < n_bands; ++b) {
-                            double k = st->k_real[b];
-                            double atten = std::exp(-st->atmo_abs[b] * t_hit);
-                            double spread = 1.0 / (1.0 + total_path);
-                            amp_local[b] *= std::polar(atten * spread, -k * t_hit);
-                        }
-
-                        V3d hit_n = hit_n_param;
-                        double cos_theta = std::abs(dir.dot(hit_n));
-                        uint32_t my_subpath = (uint32_t)pixel_linear;
-
-                        /* Write into this pixel's private fixed slot. */
-                        for (int b = 0; b < n_bands; ++b) {
-                            EndpointRecord& E = slot[slot_written++];
-                            E.subpath_id   = my_subpath;
-                            E.band_id      = (uint32_t)b;
-                            E.group_id     = sensor_gid;
-                            E.vertex_index = ai;
-                            E.pos[0] = (float)hit_pos.x();
-                            E.pos[1] = (float)hit_pos.y();
-                            E.pos[2] = (float)hit_pos.z();
-                            E.pathlen_m = (float)total_path;
-                            E.dir[0] = (float)dir.x();
-                            E.dir[1] = (float)dir.y();
-                            E.dir[2] = (float)dir.z();
-                            E.pdf       = 1.0f / (float)n_ap;
-                            E.amp_re    = (float)amp_local[b].real();
-                            E.amp_im    = (float)amp_local[b].imag();
-                            E.cos_theta = (float)cos_theta;
-                            E._pad      = (float)interaction_flags;
-                        }
-                    }
-                    pixel_written[static_cast<size_t>(pi)] = slot_written;
-                }
-            } /* omp parallel */
-
-            int write_cursor = slot_base;
-            for (long long pi = 0; pi < pixels_fit; ++pi) {
-                const int n_write = pixel_written[static_cast<size_t>(pi)];
-                if (n_write <= 0) continue;
-                const int slot_start = slot_base + static_cast<int>(pi * recs_per_px);
-                if (slot_start != write_cursor) {
-                    std::memmove(out_records + write_cursor,
-                                 out_records + slot_start,
-                                 static_cast<size_t>(n_write) * sizeof(EndpointRecord));
-                }
-                write_cursor += n_write;
-            }
-            rec_count = write_cursor;
-        }
-    }
 
     *out_count = rec_count;
     return SK_OK;
+}
+
+extern "C" SK_API void ray_tracer_attach_optical_assembly(RayTracerState* st, OpticalAssembly* assembly)
+{
+    if (!st) return;
+    st->optical_assembly       = assembly;
+    st->optical_assembly_owned = 0; /* never owned; caller manages lifetime */
 }
 
 extern "C" SK_API int ray_tracer_bidirectional(
@@ -5295,6 +5378,58 @@ extern "C" SK_API int ray_tracer_bidirectional_packed(
         out_count);
 }
 
+extern "C" SK_API int ray_tracer_accumulate_endpoint_records_to_field_capture(
+    RayTracerState*       st,
+    const EndpointRecord* records,
+    int                   n_records,
+    int                   sensor_group_id,
+    int                   include_sensor_group,
+    int                   include_non_sensor_groups,
+    int*                  out_written_records,
+    double*               out_written_power)
+{
+    if (!st || !records) return SK_ERR_NULL_STATE;
+    if (n_records < 0) return SK_ERR_DIM_MISMATCH;
+    if (!st->camera_field_grid) return SK_ERR_DIM_MISMATCH;
+
+    const int n_bands = st->n_bands;
+    if (n_bands <= 0) return SK_ERR_DIM_MISMATCH;
+
+    int written = 0;
+    double power_sum = 0.0;
+
+    for (int i = 0; i < n_records; ++i) {
+        const EndpointRecord& E = records[static_cast<size_t>(i)];
+        const bool is_sensor = (sensor_group_id >= 0) && (static_cast<int>(E.group_id) == sensor_group_id);
+        if (is_sensor && !include_sensor_group) continue;
+        if (!is_sensor && !include_non_sensor_groups) continue;
+
+        const int band = static_cast<int>(E.band_id);
+        if (band < 0 || band >= n_bands) continue;
+        if (!(E.pdf > 0.0f)) continue;
+
+        const float pos[3] = { E.pos[0], E.pos[1], E.pos[2] };
+        const float ar = E.amp_re;
+        const float ai = E.amp_im;
+        const int rc = field_grid_inject_amplitude(
+            st->camera_field_grid,
+            band,
+            pos,
+            ar,
+            ai);
+        if (rc == SK_OK) {
+            written += 1;
+            const double dr = static_cast<double>(ar);
+            const double di = static_cast<double>(ai);
+            power_sum += dr * dr + di * di;
+        }
+    }
+
+    if (out_written_records) *out_written_records = written;
+    if (out_written_power) *out_written_power = power_sum;
+    return SK_OK;
+}
+
 /* ──────────────────────────────────────────────────────────────────────
  * Region-context dispatch helpers.
  *
@@ -5314,127 +5449,67 @@ extern "C" SK_API int ray_tracer_bidirectional_packed(
 static inline void apply_thin_lens_transform(
     const RtScaleContext& ctx, V3d& pos, V3d& dir)
 {
-    /* Treat the region as a thin lens centred at ctx.center, optical axis
-     * along the *current ray direction* (i.e. the lens auto-aligns to the
-     * incoming ray — a deliberate simplification appropriate for "this is
-     * a thin-lens region you can opt into" rather than a full optical
-     * bench).  payload[0] = focal length f in metres; <=0 = no-op. */
+    /* payload[0]   = focal length f (m); <= 0 → no-op.
+     * payload[1..3] = fixed lens axis (unit vector), OPTIONAL.
+     *   If present and non-zero, the lens has a fixed optical axis and
+     *   the standard thin-lens matrix deflection is used (physically correct).
+     *   If absent or zero, the axis auto-aligns to the current ray direction
+     *   (legacy behavior, preserved for non-PIXEL_CONE forward rays). */
     if (!ctx.payload) return;
     const double* p = static_cast<const double*>(ctx.payload);
     double f = p[0];
     if (!(f > 0.0)) return;
 
     V3d centre(ctx.center[0], ctx.center[1], ctx.center[2]);
-    V3d to_centre = centre - pos;
-    /* Project incoming direction relative to lens normal = ray direction.
-     * Standard thin-lens rule: a ray through the lens centre passes
-     * undeflected; a ray parallel to the axis converges to the focal
-     * point at distance f. */
-    V3d lateral = to_centre - to_centre.dot(dir) * dir;
-    double focal_pt_dist = f;
-    V3d focal_pt = centre + focal_pt_dist * dir;
-    /* New direction: from current pos toward focal_pt. */
+
+    bool has_fixed_axis = (ctx.payload_size_bytes >= (int)(4 * sizeof(double)));
+    if (has_fixed_axis) {
+        V3d axis(p[1], p[2], p[3]);
+        double axis_norm = axis.norm();
+        has_fixed_axis = (axis_norm > 0.5);
+        if (has_fixed_axis) axis /= axis_norm;
+
+        if (has_fixed_axis) {
+            /* Fixed-axis thin-lens: ray-transfer matrix deflection.
+             *   h     = lateral offset of crossing point from lens axis
+             *   slope = perpendicular / axial velocity component
+             *   slope_out = slope_in - h / f   (thin-lens paraxial)
+             * Implemented geometrically (exact for finite angles):
+             *   new_dir_perp = dir_perp - (h / f) * dir_axial
+             *   new_dir = normalize(dir_axial * axis + new_dir_perp) */
+            V3d rel = pos - centre;
+            V3d h = rel - rel.dot(axis) * axis;   /* lateral offset vector */
+            double d_axial = dir.dot(axis);
+            V3d d_perp = dir - d_axial * axis;
+            V3d new_d_perp = d_perp - h * (d_axial / f);
+            V3d new_dir = (d_axial * axis + new_d_perp).normalized();
+            if (new_dir.squaredNorm() > 1.0e-18) dir = new_dir;
+            return;
+        }
+    }
+
+    /* Legacy auto-align: optical axis = current ray direction.
+     * Preserved for backward compatibility; not a physically fixed lens. */
+    V3d focal_pt = centre + f * dir;
     V3d new_dir = (focal_pt - pos).normalized();
     if (new_dir.norm() > 1e-9) dir = new_dir;
-    /* Position is unchanged (thin lens has zero thickness). */
-    (void)lateral; /* reserved for off-axis astigmatism extension          */
 }
 
-/**
- * apply_wave_aperture_transform — multiply per-band complex amplitude by
- * the wave-optical transfer of a thin aperture.
- *
- * This is the hook the user demanded: "there must be capacity to wave
- * transform the aperture."  When a ray crosses a WAVE_HELMHOLTZ region at
- * lateral position `lateral_offset` from the region centre, this function
- * applies the analytic Fresnel quadratic phase
- *
- *   amp[b] *= exp( -i · k_b · r² / (2 · f_eff) )
- *
- * where r = ‖lateral_offset‖ and f_eff is taken from the region's payload
- * (payload[0] = focal length / Fresnel scale).  When payload[0] <= 0 we
- * fall back to ctx.radius itself so a bare WAVE_HELMHOLTZ region still
- * produces *some* diffraction-style phase shift instead of being inert.
- *
- * Apodisation: an extra real attenuation w(r) = exp(-(r/R)²) is applied
- * so a small aperture suppresses high spatial frequencies smoothly — this
- * is the analytic stand-in for the full split-step solve performed when
- * a FieldGrid is bound (future extension via ctx.payload subtype).
- *
- * No bands are collapsed; the per-band wavenumber st.k_real[b] is honored.
- */
-static inline void apply_wave_aperture_transform(
-    const RayTracerState& st,
-    const RtScaleContext& ctx,
-    const V3d&            cross_pos,
-    VXcd&                 amp)
-{
-    V3d centre(ctx.center[0], ctx.center[1], ctx.center[2]);
-    V3d off = cross_pos - centre;
-    double r2 = off.squaredNorm();
-    if (r2 <= 0.0) return;
-
-    double f_eff = ctx.radius;
-    if (ctx.payload && ctx.payload_size_bytes >= (int)sizeof(double)) {
-        const double* p = static_cast<const double*>(ctx.payload);
-        if (p[0] > 0.0) f_eff = p[0];
-    }
-    if (!(f_eff > 0.0)) return;
-
-    double R = (ctx.radius > 0.0) ? ctx.radius : f_eff;
-    double atten = std::exp(-r2 / (R * R));   /* soft-edge apodisation     */
-
-    int nb = (int)amp.size();
-    for (int b = 0; b < nb && b < (int)st.k_real.size(); ++b) {
-        double k_b   = st.k_real[b];
-        double phase = -k_b * r2 / (2.0 * f_eff);
-        amp[b] *= std::polar(atten, phase);
-    }
-}
-
-/*
- * apply_thick_lens_wave_transform — combined geometric bend + wave phase.
- * Payload convention (float64[]):
- *   [0] focal_m  (optional, defaults to ctx.radius)
- *   [1] phase_scale (optional, defaults to 1.0)
- */
+/* apply_thick_lens_wave_transform — geometric thin-lens ray steering only.
+ * Wave physics for RT_SCALE_WAVE regions is handled by WaveArena (T4). */
 static inline void apply_thick_lens_wave_transform(
-    const RayTracerState& st,
+    const RayTracerState& /*st*/,
     const RtScaleContext& ctx,
-    V3d& pos,
-    V3d& dir,
-    VXcd& amp)
+    V3d& pos, V3d& dir, VXcd& /*amp*/)
 {
-    double focal_m = (ctx.radius > 0.0) ? ctx.radius : 0.1;
-    double phase_scale = 1.0;
-    if (ctx.payload && ctx.payload_size_bytes >= (int)sizeof(double)) {
-        const double* p = static_cast<const double*>(ctx.payload);
-        if (p[0] > 0.0) focal_m = p[0];
-        if (ctx.payload_size_bytes >= (int)(sizeof(double) * 2) && p[1] > 0.0)
-            phase_scale = p[1];
-    }
-
-    // Geometric component: thin-lens steering.
     apply_thin_lens_transform(ctx, pos, dir);
-
-    // Wave component: Fresnel-style phase/apodization at current crossing.
-    RtScaleContext wave_ctx = ctx;
-    const double payload_local[1] = { focal_m * phase_scale };
-    wave_ctx.payload = payload_local;
-    wave_ctx.payload_size_bytes = (int)sizeof(payload_local);
-    apply_wave_aperture_transform(st, wave_ctx, pos, amp);
 }
 
-/**
- * dispatch_scale_context_entry — call site invoked when a ray segment
- * crosses into (or originates inside) a registered scale context.  Switches
- * on ctx.context_kind and applies the appropriate transform to (pos, dir,
- * amp).  Kinds 3..6 are stub-passthroughs but the call site exists in
- * BOTH backends so we never have to retrofit them.
- *
- * Returns the bit pattern to OR into EndpointRecord-style flags so
- * downstream consumers can tell which kinds the ray actually entered.
- */
+/* dispatch_scale_context_entry — apply the appropriate geometric or lens
+ * transform when a ray segment crosses into a registered scale context.
+ * RT_SCALE_WAVE / WAVE_HELMHOLTZ regions are handled by WaveArena in the
+ * pipeline (T4); here we only set the flag so downstream consumers know the
+ * ray passed through a wave region. */
 static inline uint32_t dispatch_scale_context_entry(
     const RayTracerState& st,
     const RtScaleContext& ctx,
@@ -5444,7 +5519,7 @@ static inline uint32_t dispatch_scale_context_entry(
         case SCALE_CONTEXT_KIND_RAY:
             return 0u;
         case SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ:
-            apply_wave_aperture_transform(st, ctx, pos, amp);
+            /* Real wave propagation done by WaveArena; just flag the entry. */
             return 1u << SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ;
         case SCALE_CONTEXT_KIND_THIN_LENS_TRANSFORM:
             apply_thin_lens_transform(ctx, pos, dir);
@@ -5455,10 +5530,1854 @@ static inline uint32_t dispatch_scale_context_entry(
         case SCALE_CONTEXT_KIND_SPLINE_SURFACE:
         case SCALE_CONTEXT_KIND_NEURAL_SURFACE:
         case SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC:
-            /* Stub-passthrough: caller records entry; full impl pending. */
             return 1u << ctx.context_kind;
         default:
             return 0u;
     }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4-stage ray transport pipeline
+ *
+ * T1 intersector  — BVH query + amplitude propagation + field capture.
+ *                   Routes to T4 if hit is inside a RT_SCALE_WAVE arena.
+ * T2 refiner      — parametric surface point / normal refinement.
+ * T3 material     — Fresnel/Snell/diffuse physics; spawns child RayIntents.
+ * T4 wave solver  — ADI-CN BPM march per arena; exits re-enter T1.
+ *
+ * Forward and backward paths are identical — BDPT delivers RayIntents only.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+struct RayPipelineState {
+    RayTracerState*      st  = nullptr;
+    RayPipelineConfig    cfg;
+
+    PipelineQueue<RayIntent>  Q_intent;
+    PipelineQueue<HitRecord>  Q_hit;
+    PipelineQueue<RefinedHit> Q_refined;
+    PipelineQueue<WaveIntent> Q_wave;
+    PipelineQueue<RayRecord>  Q_out;    /* output records drained by the caller */
+
+    std::atomic<int>          in_flight{0};
+
+    /* Pre-flagged materials: flag[m]=1 means max reflectance < cfg.min_amplitude,
+     * so any opaque ray hitting material m will never produce a viable child.
+     * T3 fast-path skips direction sampling + reflectance multiply for these. */
+    std::vector<uint8_t>      mat_epsilon_flags;
+
+    StageStats                stats[4]; /* [0]=T1 [1]=T2 [2]=T3 [3]=T4        */
+
+    std::deque<WaveArena>     arenas;   /* deque: never moves elements, safe with mutex */
+    std::vector<std::thread>  workers;
+
+    /* ── Sensor image accumulator ─────────────────────────────────────────
+     * Three-channel float64 buffer, res×res, layout [ch][iy][iz].
+     * ch0 = forward plate hits; ch1 = backward emissive paths; ch2 = BDPT snap.
+     * Protected by sensor_mu; read by ray_pipeline_get_sensor_image(). */
+    mutable std::mutex        sensor_mu;
+    int                       sensor_res  = 0;   /* 0 = disabled */
+    float                     sensor_px   = 0.0f;
+    float                     sensor_pr   = 0.0f;
+    float                     sensor_eps  = 0.008f;
+    std::vector<double>       sensor_accum;       /* res*res*4 doubles: ch0=fwd, ch1=bwd-emis, ch2=exact-BDPT, ch3=near-miss */
+    std::vector<float>        priority_map;       /* res*res sugar-auxin field (1.0 = baseline) */
+    mutable double            sensor_peak[4]      = {1e-30, 1e-30, 1e-30, 1e-30}; /* running per-channel max, never decreases */
+
+    /* ── GPU compute dispatch (nullptr = CPU-only) ─────────────────────────── */
+    class GlPipelineDispatch;                       /* forward-declared below    */
+    GlPipelineDispatch*       gpu_dispatch = nullptr;
+
+    /* ── Live BDPT diagnostic stats (updated by T3, lock-free) ──────────
+     * nearest_d2: running min of squared YZ distance over all fwd/rev pairs
+     * best_collinearity: cos(angle between fwd and rev directions) of best pair
+     * exact_snaps / near_miss_count: cumulative hit counts */
+    std::atomic<uint64_t>     bdpt_nearest_d2_bits{0xFFFFFFFFFFFFFFFFULL}; /* float bits via reinterpret */
+    std::atomic<uint64_t>     bdpt_best_colinear_bits{0};
+    std::atomic<uint64_t>     bdpt_exact_snaps{0};
+    std::atomic<uint64_t>     bdpt_near_miss_count{0};
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * GlPipelineDispatch — GPU compute backend for all four pipeline stages.
+ *
+ * Design:
+ *   One GlPipelineDispatch object owns the WGL headless GL 4.3 context and
+ *   all shader programs + SSBOs.  A single `gl_dispatch_thread` (spawned in
+ *   ray_pipeline_create when use_gpu_compute=true) runs thread_main(), which
+ *   pops large batches from the SAME queues as the CPU workers and dispatches
+ *   them through T1→T2→T3 on the GPU, writing results back to Q_hit /
+ *   Q_refined / Q_intent (child rays) and Q_out (output records).
+ *
+ *   Both CPU workers and the GPU thread compete on the shared queues.  The
+ *   StageStats adaptive-batch logic causes the GPU thread (which uses larger
+ *   batches) to absorb more work when the queue is deep, and fall back to CPU
+ *   when the queue is thin — automatically balancing the two operators.
+ *
+ *   T4 (wave BPM) runs on the GPU when a WaveIntent is popped from Q_wave.
+ *   The CPU pipeline_wave_solver thread is NOT spawned when use_gpu_compute
+ *   is set; T4 runs exclusively on GPU in that mode.
+ *
+ * Per-stage profiling:
+ *   After each GPU dispatch the elapsed wall time is reported via
+ *   ps.stats[i].record_gpu(n, ns, q_depth), which updates gpu_items_per_sec
+ *   and the adaptive gpu_fraction EMA so Python callers can observe load split.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+class RayPipelineState::GlPipelineDispatch {
+public:
+    GlComputeContext ctx{};
+    bool             ready = false;
+
+    /* Shader programs for each stage */
+    GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
+
+    /* Per-stage SSBOs allocated once and resized as needed */
+    /* T1 inputs */
+    GLuint ssbo_intent      = 0; /* RayIntent flat float buffer */
+    GLuint ssbo_bvh         = 0; /* BVH nodes */
+    GLuint ssbo_tri_id      = 0; /* BVH permutation ints */
+    GLuint ssbo_tri_full    = 0; /* triangle geometry */
+    GLuint ssbo_mat_band    = 0; /* material band records */
+    GLuint ssbo_scene_band  = 0; /* k_real + atmo_abs */
+    GLuint ssbo_wave_arena  = 0; /* arena center+radius */
+    GLuint ssbo_tri_sensor  = 0; /* per-tri sensor group id */
+    /* T1/T2 outputs */
+    GLuint ssbo_hit         = 0; /* RefinedHit layout (T1 out / T2 in-place) */
+    GLuint ssbo_counter     = 0; /* {hit_count, miss_count, wave_count, cpu_refine} uint */
+    /* T2 refinement */
+    GLuint ssbo_tri_param   = 0; /* per-tri parametric group id */
+    GLuint ssbo_group_kind  = 0;
+    GLuint ssbo_group_pay   = 0;
+    /* T3 output child intents */
+    GLuint ssbo_child_int   = 0; /* child RayIntent flat buffer */
+    GLuint ssbo_child_cnt   = 0; /* child intent counter */
+    /* T4 BPM wave field */
+    GLuint ssbo_wave_re     = 0;
+    GLuint ssbo_wave_im     = 0;
+    GLuint ssbo_bpm_tmp_re  = 0;
+    GLuint ssbo_bpm_tmp_im  = 0;
+    GLuint ssbo_thomas_cp   = 0;
+    GLuint ssbo_thomas_dp   = 0;
+
+    /* Capacities to know when realloc is needed */
+    int cap_intents  = 0;
+    int cap_hits     = 0;
+    int cap_children = 0;
+    int cap_wave_pix = 0; /* per band */
+
+    /* Arena data cached for per-dispatch uniform upload (≤16 arenas × 4 floats) */
+    std::vector<float> arena_uniform_data;
+
+    /* Scene data uploaded once */
+    bool scene_uploaded = false;
+
+    /* ── helpers ──────────────────────────────────────────────────────────── */
+
+    static std::string resolve_shader(const std::string& dir, const std::string& name) {
+        if (!dir.empty()) return dir + "/" + name;
+        return "csrc/shaders/" + name;
+    }
+
+    /* Allocate or grow an SSBO to at least `bytes`.  Returns false on GL error. */
+    bool ensure_ssbo(GLuint& id, GLsizeiptr bytes) {
+        if (!id) glc_GenBuffers(1, &id);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        return (glGetError() == GL_NO_ERROR);
+    }
+
+    void bind_ssbo(GLuint id, GLuint binding) {
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, id);
+    }
+
+    /* Upload data to an SSBO (auto-grows if needed). */
+    void upload_ssbo(GLuint& id, const void* data, GLsizeiptr bytes) {
+        if (!id) glc_GenBuffers(1, &id);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, bytes, data, GL_STATIC_DRAW);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    }
+
+    /* Read back bytes from an SSBO into dst. */
+    void readback_ssbo(GLuint id, void* dst, GLsizeiptr bytes) {
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
+        glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, dst);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    }
+
+    /* ── init ──────────────────────────────────────────────────────────────────── */
+    bool init(RayPipelineState& ps, const std::string& shader_dir) {
+        if (!gl_compute_create_context(&ctx)) {
+            fprintf(stderr, "[gpu-dispatch] gl_compute_create_context failed\n"); fflush(stderr);
+            return false;
+        }
+        if (!gl_compute_make_current(&ctx)) {
+            fprintf(stderr, "[gpu-dispatch] gl_compute_make_current failed\n"); fflush(stderr);
+            return false;
+        }
+        if (!gl_compute_load_procs()) {
+            fprintf(stderr, "[gpu-dispatch] gl_compute_load_procs failed\n"); fflush(stderr);
+            return false;
+        }
+
+        /* Apply per-stage initial GPU batch sizes from config */
+        auto& cfg = ps.cfg;
+        if (cfg.gpu_batch_size_t1 > 0) ps.stats[0].batch_sz_gpu.store(cfg.gpu_batch_size_t1, std::memory_order_relaxed);
+        if (cfg.gpu_batch_size_t2 > 0) ps.stats[1].batch_sz_gpu.store(cfg.gpu_batch_size_t2, std::memory_order_relaxed);
+        if (cfg.gpu_batch_size_t3 > 0) ps.stats[2].batch_sz_gpu.store(cfg.gpu_batch_size_t3, std::memory_order_relaxed);
+        if (cfg.gpu_batch_size_t4 > 0) ps.stats[3].batch_sz_gpu.store(cfg.gpu_batch_size_t4, std::memory_order_relaxed);
+
+        /* Apply pinned GPU fractions (if non-zero in config) */
+        if (cfg.gpu_fraction_t1 > 0.0f) ps.stats[0].set_gpu_fraction(cfg.gpu_fraction_t1);
+        if (cfg.gpu_fraction_t2 > 0.0f) ps.stats[1].set_gpu_fraction(cfg.gpu_fraction_t2);
+        if (cfg.gpu_fraction_t3 > 0.0f) ps.stats[2].set_gpu_fraction(cfg.gpu_fraction_t3);
+
+        /* Compile all four compute shaders */
+        char err[1024];
+        auto load = [&](const std::string& name, GLuint& prog) -> bool {
+            std::string path = resolve_shader(shader_dir, name);
+            FILE* f = fopen(path.c_str(), "rb");
+            if (!f) { snprintf(err, sizeof(err), "Cannot open %s", path.c_str()); return false; }
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            std::string src(static_cast<size_t>(sz), '\0');
+            fread(&src[0], 1, static_cast<size_t>(sz), f); fclose(f);
+            prog = gl_compute_build_program(src.c_str(), err, sizeof(err));
+            return prog != 0;
+        };
+
+        if (!load("ray_bvh_intersect.comp.glsl", prog_t1)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
+        if (!load("ray_refine.comp.glsl",        prog_t2)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
+        if (!load("ray_material.comp.glsl",      prog_t3)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
+        if (!load("ray_wave_bpm.comp.glsl",      prog_t4)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
+
+        ready = true;
+        return true;
+    }
+
+    /* ── upload_scene_data ──────────────────────────────────────────────── */
+    void upload_scene_data(RayPipelineState& ps) {
+        const RayTracerState& st = *ps.st;
+
+        /* BVH nodes: 10 floats each */
+        {
+            const int nn = (int)st.bvh_nodes.size();
+            std::vector<float> buf(nn * 10);
+            for (int i = 0; i < nn; ++i) {
+                const auto& nd = st.bvh_nodes[static_cast<size_t>(i)];
+                float* b = buf.data() + i * 10;
+                b[0] = (float)nd.aabb.lo.x(); b[1] = (float)nd.aabb.lo.y(); b[2] = (float)nd.aabb.lo.z();
+                b[3] = (float)nd.aabb.hi.x(); b[4] = (float)nd.aabb.hi.y(); b[5] = (float)nd.aabb.hi.z();
+                memcpy(b+6, &nd.left,      4); memcpy(b+7, &nd.right,     4);
+                memcpy(b+8, &nd.tri_start, 4); memcpy(b+9, &nd.tri_end,   4);
+            }
+            upload_ssbo(ssbo_bvh, buf.data(), (GLsizeiptr)(nn * 10 * sizeof(float)));
+        }
+
+        /* BVH permutation indices */
+        if (!st.bvh_tri_ids.empty())
+            upload_ssbo(ssbo_tri_id, st.bvh_tri_ids.data(),
+                        (GLsizeiptr)(st.bvh_tri_ids.size() * sizeof(int)));
+
+        /* Triangle full geometry: 16 floats each.  Layout:
+         *   [0..2]  = v0  (origin vertex)
+         *   [3..5]  = edge1 = v1-v0
+         *   [6..8]  = edge2 = v2-v0
+         *   [9..11] = normal
+         *   [12]    = flags (int reinterpreted)
+         *   [13]    = mat_idx
+         *   [14]    = medium_pos_mat_idx
+         *   [15]    = medium_neg_mat_idx
+         */
+        {
+            const int nt = (int)st.tris.size();
+            std::vector<float> buf(nt * 16);
+            for (int i = 0; i < nt; ++i) {
+                const auto& tri = st.tris[static_cast<size_t>(i)];
+                float* b = buf.data() + i * 16;
+                b[0]=(float)tri.v0.x();    b[1]=(float)tri.v0.y();    b[2]=(float)tri.v0.z();
+                b[3]=(float)tri.edge1.x(); b[4]=(float)tri.edge1.y(); b[5]=(float)tri.edge1.z();
+                b[6]=(float)tri.edge2.x(); b[7]=(float)tri.edge2.y(); b[8]=(float)tri.edge2.z();
+                b[9]=(float)tri.normal.x();b[10]=(float)tri.normal.y();b[11]=(float)tri.normal.z();
+                memcpy(b+12, &tri.flags,              4);
+                memcpy(b+13, &tri.mat_idx,            4);
+                memcpy(b+14, &tri.medium_pos_mat_idx, 4);
+                memcpy(b+15, &tri.medium_neg_mat_idx, 4);
+            }
+            upload_ssbo(ssbo_tri_full, buf.data(), (GLsizeiptr)(nt * 16 * sizeof(float)));
+        }
+
+        /* Material band records: pass mat_buf directly */
+        if (!st.mat_buf.empty())
+            upload_ssbo(ssbo_mat_band, st.mat_buf.data(),
+                        (GLsizeiptr)(st.mat_buf.size() * sizeof(float)));
+
+        /* Scene band buffer: k_real[0..nb-1] | atmo_abs[0..nb-1] */
+        {
+            const int nb = st.n_bands;
+            std::vector<float> sb(nb * 2);
+            for (int b = 0; b < nb; ++b) {
+                sb[b]      = (float)st.k_real[b];
+                sb[nb + b] = (float)st.atmo_abs[b];
+            }
+            upload_ssbo(ssbo_scene_band, sb.data(), (GLsizeiptr)(nb * 2 * sizeof(float)));
+        }
+
+        /* Wave arenas: cache as uniform data (max 16 × 4 floats: xyz center + radius). */
+        {
+            const int na = std::min((int)ps.arenas.size(), 16);
+            arena_uniform_data.assign(na * 4, 0.0f);
+            for (int i = 0; i < na; ++i) {
+                const auto& a = ps.arenas[static_cast<size_t>(i)];
+                arena_uniform_data[i*4]   = (float)a.center.x();
+                arena_uniform_data[i*4+1] = (float)a.center.y();
+                arena_uniform_data[i*4+2] = (float)a.center.z();
+                arena_uniform_data[i*4+3] = (float)a.radius;
+            }
+        }
+        /* TriSensorGroupBuf removed — T1 shader no longer has that binding. */
+
+        /* Param groups: tri → param group id.  We don't have a parametric
+         * group system in RayTracerState, so default to -1 for all tris. */
+        {
+            const int nt = (int)st.tris.size();
+            std::vector<int> pg(nt, -1);
+            upload_ssbo(ssbo_tri_param, pg.data(), (GLsizeiptr)(nt * sizeof(int)));
+        }
+        /* group_kind and payload are empty — allocate 4-byte stubs */
+        { int stub = 0; upload_ssbo(ssbo_group_kind, &stub, sizeof(int)); }
+        { float stub = 0.0f; upload_ssbo(ssbo_group_pay, &stub, sizeof(float)); }
+
+        /* Counter SSBO: 8 uints — allocate once, zeroed on each dispatch */
+        ensure_ssbo(ssbo_counter, 8 * sizeof(uint32_t));
+        scene_uploaded = true;
+    }
+
+    /* ── dispatch_t1_t2_t3: run one GPU batch through T1→T2→T3 ──────────── */
+    int dispatch_t1_t2_t3(RayPipelineState& ps,
+                           const std::vector<RayIntent>& batch)
+    {
+        using Clock = std::chrono::high_resolution_clock;
+        const RayTracerState& st = *ps.st;
+        const int n  = (int)batch.size();
+        const int nb = st.n_bands;
+        const int nm = st.mat_n_mats;
+        const int na = (int)ps.arenas.size();
+        const int nt = (int)st.tris.size();
+
+        /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 52 floats) */
+        static constexpr int INTENT_STRIDE = 52;
+        if (n > cap_intents) {
+            cap_intents = n * 2;
+            ensure_ssbo(ssbo_intent, (GLsizeiptr)(cap_intents * INTENT_STRIDE * sizeof(float)));
+        }
+
+        /* Pack intents to flat float buffer */
+        std::vector<float> ibuf((size_t)n * INTENT_STRIDE, 0.0f);
+        for (int i = 0; i < n; ++i) {
+            const RayIntent& ri = batch[static_cast<size_t>(i)];
+            float* row = ibuf.data() + i * INTENT_STRIDE;
+            row[0]=(float)ri.pos.x();  row[1]=(float)ri.pos.y();  row[2]=(float)ri.pos.z();
+            row[3]=(float)ri.dir.x();  row[4]=(float)ri.dir.y();  row[5]=(float)ri.dir.z();
+            row[6]=(float)ri.path_len;
+            memcpy(row+7,  &ri.medium_mat_idx,     4);
+            memcpy(row+8,  &ri.interaction_flags,  4);
+            memcpy(row+9,  &ri.src_id,             4);
+            memcpy(row+10, &ri.bounce,             4);
+            memcpy(row+11, &ri.bounces_left,       4);
+            row[12]=(float)ri.min_amplitude;
+            uint32_t tag_lo = (uint32_t)(ri.tag & 0xFFFFFFFFULL);
+            uint32_t tag_hi = (uint32_t)(ri.tag >> 32);
+            memcpy(row+13, &tag_lo, 4); memcpy(row+14, &tag_hi, 4);
+            memcpy(row+15, &ri.color_flag, 4);
+            row[16] = ri.priority;
+            row[17] = ri.sensor_origin_y; row[18] = ri.sensor_origin_z; row[19] = 0.0f;
+            const int bands = std::min(nb, 16);
+            for (int b = 0; b < bands; ++b) {
+                row[20+b] = (float)ri.amp[b].real();
+                row[36+b] = (float)ri.amp[b].imag();
+            }
+        }
+        /* Upload intents */
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_intent);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(n * INTENT_STRIDE * sizeof(float)), ibuf.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        /* ── Ensure hit SSBO (HIT_STRIDE = 58 floats) */
+        static constexpr int HIT_STRIDE = 58;
+        int max_hits = n * 4;
+        if (max_hits > cap_hits) {
+            cap_hits = max_hits * 2;
+            ensure_ssbo(ssbo_hit, (GLsizeiptr)(cap_hits * HIT_STRIDE * sizeof(float)));
+        }
+
+        /* Zero counter SSBO */
+        {
+            uint32_t zeros[8] = {};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8 * sizeof(uint32_t), zeros);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+
+        /* ── T1 dispatch ──────────────────────────────────────────────═ */
+        auto t1_start = Clock::now();
+        glc_UseProgram(prog_t1);
+        bind_ssbo(ssbo_intent,     0); bind_ssbo(ssbo_hit,       1);
+        bind_ssbo(ssbo_counter,    2); bind_ssbo(ssbo_bvh,       3);
+        bind_ssbo(ssbo_tri_id,     4); bind_ssbo(ssbo_tri_full,  5);
+        bind_ssbo(ssbo_mat_band,   6); bind_ssbo(ssbo_scene_band,7);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_intents"), n);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_bands"),   nb);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_mats"),    nm);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_arenas"),  na);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_tris"),    nt);
+        /* Upload arena center+radius as uniform vec4 array */
+        {
+            GLint loc = glc_GetUniformLocation(prog_t1, "u_arenas");
+            if (loc >= 0 && na > 0)
+                glc_Uniform4fv(loc, na, arena_uniform_data.data());
+        }
+        glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        /* Read back hit count */
+        uint32_t counters[8] = {};
+        readback_ssbo(ssbo_counter, counters, 8 * sizeof(uint32_t));
+        int n_hits = (int)counters[0];
+        ps.stats[0].record_gpu(n, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - t1_start).count(), ps.Q_intent.size());
+
+        if (n_hits <= 0) return 0;
+        n_hits = std::min(n_hits, cap_hits);
+
+        /* ── T2 dispatch (in-place on ssbo_hit) ─────────────────────────═ */
+        auto t2_start = Clock::now();
+        /* Reset counter[3] (cpu_refine count) */
+        {
+            uint32_t z = 0;
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 3 * sizeof(uint32_t), sizeof(uint32_t), &z);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+        glc_UseProgram(prog_t2);
+        bind_ssbo(ssbo_hit,        0); bind_ssbo(ssbo_tri_full,  1);
+        bind_ssbo(ssbo_tri_param,  2); bind_ssbo(ssbo_group_kind,3);
+        bind_ssbo(ssbo_group_pay,  4); bind_ssbo(ssbo_counter,   5);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t2,"n_hits"),   n_hits);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t2,"n_tris"),   nt);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t2,"n_groups"),
+                      0);  /* param groups not used; stub zero */
+        glc_DispatchCompute((GLuint)((n_hits + 63) / 64), 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        ps.stats[1].record_gpu(n_hits, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - t2_start).count(), ps.Q_hit.size());
+
+        /* ── T3 dispatch ──────────────────────────────────────────────═ */
+        static constexpr int CHILD_STRIDE = 52;
+        int max_children = n_hits * ps.cfg.max_children + 1;
+        if (max_children > cap_children) {
+            cap_children = max_children * 2;
+            ensure_ssbo(ssbo_child_int, (GLsizeiptr)(cap_children * CHILD_STRIDE * sizeof(float)));
+            ensure_ssbo(ssbo_child_cnt, sizeof(uint32_t));
+        }
+        { uint32_t z = 0;
+          glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_child_cnt);
+          glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(uint32_t), &z);
+          glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0); }
+
+        auto t3_start = Clock::now();
+        glc_UseProgram(prog_t3);
+        bind_ssbo(ssbo_hit,        0); bind_ssbo(ssbo_mat_band,  1);
+        bind_ssbo(ssbo_tri_full,   2); bind_ssbo(ssbo_scene_band,3);
+        bind_ssbo(ssbo_counter,    4); bind_ssbo(ssbo_child_int, 5);
+        bind_ssbo(ssbo_child_cnt,  6);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t3,"n_hits"),   n_hits);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t3,"n_bands"),  nb);
+        glc_Uniform1i(glc_GetUniformLocation(prog_t3,"n_mats"),   nm);
+        glc_DispatchCompute((GLuint)((n_hits + 63) / 64), 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        ps.stats[2].record_gpu(n_hits, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - t3_start).count(), ps.Q_refined.size());
+
+        /* Read back child count and re-submit child intents */
+        uint32_t child_count = 0;
+        readback_ssbo(ssbo_child_cnt, &child_count, sizeof(uint32_t));
+        int nc = (int)std::min((uint32_t)cap_children, child_count);
+        if (nc > 0) {
+            std::vector<float> cbuf((size_t)nc * CHILD_STRIDE);
+            readback_ssbo(ssbo_child_int, cbuf.data(), (GLsizeiptr)(nc * CHILD_STRIDE * sizeof(float)));
+            for (int ci = 0; ci < nc; ++ci) {
+                const float* row = cbuf.data() + ci * CHILD_STRIDE;
+                RayIntent ri{};
+                ri.pos = V3d(row[0], row[1], row[2]);
+                ri.dir = V3d(row[3], row[4], row[5]);
+                ri.path_len = (double)row[6];
+                memcpy(&ri.medium_mat_idx,    row+7,  4);
+                memcpy(&ri.interaction_flags, row+8,  4);
+                memcpy(&ri.src_id,            row+9,  4);
+                memcpy(&ri.bounce,            row+10, 4);
+                memcpy(&ri.bounces_left,      row+11, 4);
+                ri.min_amplitude = (double)row[12];
+                uint32_t tlo, thi; memcpy(&tlo, row+13, 4); memcpy(&thi, row+14, 4);
+                ri.tag = (uint64_t)tlo | ((uint64_t)thi << 32);
+                memcpy(&ri.color_flag,        row+15, 4);
+                ri.priority = row[16];
+                ri.sensor_origin_y = row[17]; ri.sensor_origin_z = row[18];
+                const int bands = std::min(nb, 16);
+                for (int b = 0; b < bands; ++b) {
+                    ri.amp[b] = std::complex<double>(row[20+b], row[36+b]);
+                }
+                ++ps.in_flight;
+                ps.Q_intent.push(std::move(ri));
+            }
+        }
+        return n_hits;
+    }
+
+    /* ── dispatch_t4_step: one ADI-CN BPM step for a WaveArena ────────── */
+    void dispatch_t4_step(RayPipelineState& ps, WaveArena& arena) {
+        using Clock = std::chrono::high_resolution_clock;
+        const int nx     = arena.nx;
+        const int ny     = arena.nz;    /* WaveArena uses nz for the second dim */
+        const int nb     = arena.n_bands;
+        const int n_pix  = nx * ny * nb;
+
+        if (n_pix > cap_wave_pix) {
+            cap_wave_pix = n_pix * 2;
+            GLsizeiptr psz = (GLsizeiptr)(cap_wave_pix * sizeof(float));
+            ensure_ssbo(ssbo_wave_re,    psz); ensure_ssbo(ssbo_wave_im,    psz);
+            ensure_ssbo(ssbo_bpm_tmp_re, psz); ensure_ssbo(ssbo_bpm_tmp_im, psz);
+            /* Thomas scratch: n_bands * max(nx,ny) * MAX_WAVE_DIM (=1024) vec2 */
+            int max_dim = std::max(nx, ny);
+            GLsizeiptr tsz = (GLsizeiptr)((size_t)nb * (size_t)max_dim * 1024 * 2 * sizeof(float));
+            ensure_ssbo(ssbo_thomas_cp, tsz); ensure_ssbo(ssbo_thomas_dp, tsz);
+        }
+
+        /* Upload field */
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_wave_re);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(n_pix * sizeof(float)), arena.re_buf.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_wave_im);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(n_pix * sizeof(float)), arena.im_buf.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        auto t4_start = Clock::now();
+        glc_UseProgram(prog_t4);
+        auto set_bpm_uniforms = [&](int mode) {
+            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"mode"),    mode);
+            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"nx"),      nx);
+            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"ny"),      ny);
+            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"n_bands"), nb);
+            glc_Uniform1f(glc_GetUniformLocation(prog_t4,"dx"),      (float)arena.dx);
+            glc_Uniform1f(glc_GetUniformLocation(prog_t4,"dz"),      (float)arena.dz);
+            /* Upload wavelengths array */
+            float wl[16] = {};
+            for (int b = 0; b < std::min(nb,16); ++b)
+                wl[b] = (float)arena.wavelengths_m[b];
+            glc_Uniform1fv(glc_GetUniformLocation(prog_t4,"wavelengths"), 16, wl);
+        };
+
+        bind_ssbo(ssbo_wave_re, 0); bind_ssbo(ssbo_wave_im, 1);
+        bind_ssbo(ssbo_bpm_tmp_re, 2); bind_ssbo(ssbo_bpm_tmp_im, 3);
+        bind_ssbo(ssbo_thomas_cp, 4); bind_ssbo(ssbo_thomas_dp, 5);
+
+        /* Mode 0: carrier advance */
+        set_bpm_uniforms(0);
+        glc_DispatchCompute((GLuint)n_pix, 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        /* Mode 1: horizontal sweep */
+        set_bpm_uniforms(1);
+        glc_DispatchCompute((GLuint)(nb * ny), 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        /* Mode 2: vertical sweep */
+        set_bpm_uniforms(2);
+        glc_DispatchCompute((GLuint)(nb * nx), 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        ps.stats[3].record_gpu(1, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - t4_start).count(), ps.Q_wave.size());
+
+        /* Read back updated field */
+        readback_ssbo(ssbo_wave_re, arena.re_buf.data(), (GLsizeiptr)(n_pix * sizeof(float)));
+        readback_ssbo(ssbo_wave_im, arena.im_buf.data(), (GLsizeiptr)(n_pix * sizeof(float)));
+    }
+
+    /* ── thread_main: GPU dispatch loop ──────────────────────────────────── */
+    void thread_main(RayPipelineState& ps) {
+        if (!gl_compute_make_current(&ctx)) {
+            fprintf(stderr, "[gpu-dispatch] thread: make_current failed — GPU thread exiting\n");
+            fflush(stderr);
+            return;
+        }
+        if (!scene_uploaded) upload_scene_data(ps);
+        fprintf(stderr, "[gpu-dispatch] thread: scene uploaded, entering dispatch loop\n");
+        fflush(stderr);
+
+        std::vector<RayIntent>  batch;
+        std::vector<WaveIntent> wave_batch;
+
+        while (true) {
+            /* Block on Q_intent — the primary work source.  Returns 0 only
+             * when set_done() has been called AND the queue is empty.      */
+            batch.clear();
+            int gpu_bsz = ps.stats[0].batch_sz_gpu.load(std::memory_order_relaxed);
+            int n = ps.Q_intent.pop_batch(batch, gpu_bsz);
+
+            /* Non-blocking drain of Q_wave — never stall here; the CPU T4
+             * worker is absent when use_gpu_compute=true so we opportunistically
+             * pick up any wave intents that have accumulated.              */
+            wave_batch.clear();
+            ps.Q_wave.drain(wave_batch, gpu_bsz);
+
+            /* Exit only when Q_intent is exhausted-and-done (n==0); do one
+             * final wave drain before leaving so nothing is orphaned.     */
+            if (n == 0) {
+                /* Final wave drain */
+                ps.Q_wave.drain(wave_batch, gpu_bsz);
+                for (auto& wi : wave_batch) {
+                    if (wi.arena_id >= 0 && wi.arena_id < (int)ps.arenas.size())
+                        dispatch_t4_step(ps, ps.arenas[static_cast<size_t>(wi.arena_id)]);
+                    ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+                }
+                break;
+            }
+
+            /* T1→T2→T3 batch */
+            {
+                int n_hits = dispatch_t1_t2_t3(ps, batch);
+                for (int i = 0; i < n; ++i)
+                    ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+                (void)n_hits;
+            }
+
+            /* T4 wave step per arena */
+            for (auto& wi : wave_batch) {
+                if (wi.arena_id >= 0 && wi.arena_id < (int)ps.arenas.size())
+                    dispatch_t4_step(ps, ps.arenas[static_cast<size_t>(wi.arena_id)]);
+                ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
+    }
+};
+
+/* ── Wave arena helpers ──────────────────────────────────────────────────────────────── */
+
+static void wave_arena_build(
+    WaveArena&               arena,
+    int                      id,
+    const RtScaleContext&    ctx,
+    const RayPipelineConfig& cfg,
+    const RayTracerState&    st)
+{
+    arena.id     = id;
+    arena.center = V3d(ctx.center[0], ctx.center[1], ctx.center[2]);
+    arena.radius = ctx.radius;
+    arena.n_real = (ctx.n_real > 0.0) ? ctx.n_real : 1.0;
+    arena.dz     = (ctx.dt_m > 0.0) ? ctx.dt_m : cfg.wave_grid_dx_m * 0.5;
+    arena.nz     = (ctx.n_substeps > 0) ? ctx.n_substeps
+                 : std::max(4, (int)std::ceil(2.0 * ctx.radius / arena.dz));
+    arena.dx     = cfg.wave_grid_dx_m;
+    arena.nx = arena.ny = std::min(256, std::max(16,
+        (int)std::ceil(2.0 * ctx.radius / cfg.wave_grid_dx_m)));
+
+    /* Propagation axis: payload[3..5] if available, else world +z. */
+    arena.axis_z = V3d(0.0, 0.0, 1.0);
+    if (ctx.payload && ctx.payload_size_bytes >= (int)(6 * sizeof(double))) {
+        const double* p = static_cast<const double*>(ctx.payload);
+        V3d cand(p[3], p[4], p[5]);
+        if (cand.norm() > 0.5) arena.axis_z = cand.normalized();
+    }
+    V3d up = (std::abs(arena.axis_z.dot(V3d(0,1,0))) < 0.9)
+           ? V3d(0,1,0) : V3d(1,0,0);
+    arena.axis_x = arena.axis_z.cross(up).normalized();
+    arena.axis_y = arena.axis_z.cross(arena.axis_x).normalized();
+
+    arena.n_bands = std::min(st.n_bands, 32);
+    for (int b = 0; b < arena.n_bands; ++b) {
+        double freq = (b < (int)st.freq_hz_vec.size()) ? st.freq_hz_vec[b] : 1e3;
+        arena.wavelengths_m[b] = (st.speed_m_s / freq) / arena.n_real;
+    }
+    size_t npix = static_cast<size_t>(arena.n_bands) * arena.ny * arena.nx;
+    arena.re_buf.assign(npix, 0.0f);
+    arena.im_buf.assign(npix, 0.0f);
+}
+
+static V3d wave_arena_to_local(const WaveArena& a, const V3d& wp)
+{
+    V3d off = wp - a.center;
+    return V3d(off.dot(a.axis_x), off.dot(a.axis_y), off.dot(a.axis_z));
+}
+
+/* Seed the entry plane from a ray: Gaussian envelope centred at entry point. */
+static void wave_arena_seed(WaveArena& arena, const RayIntent& ray)
+{
+    arena.re_buf.assign(arena.re_buf.size(), 0.0f);
+    arena.im_buf.assign(arena.im_buf.size(), 0.0f);
+
+    V3d lpos  = wave_arena_to_local(arena, ray.pos);
+    double lx = lpos.x(), ly = lpos.y();
+    double ox  = (arena.nx * 0.5) * arena.dx;
+    double oy  = (arena.ny * 0.5) * arena.dx;
+    const double sigma = 3.0 * arena.dx;
+
+    for (int iy = 0; iy < arena.ny; ++iy) {
+        for (int ix = 0; ix < arena.nx; ++ix) {
+            double xm = ix * arena.dx - ox;
+            double ym = iy * arena.dx - oy;
+            double r2 = (xm - lx)*(xm - lx) + (ym - ly)*(ym - ly);
+            float  env = static_cast<float>(std::exp(-r2 / (2.0 * sigma * sigma)));
+            if (env < 1e-9f) continue;
+            size_t xy_off = static_cast<size_t>(iy) * arena.nx + ix;
+            for (int b = 0; b < arena.n_bands && b < (int)ray.amp.size(); ++b) {
+                cd a = ray.amp[b] * static_cast<double>(env);
+                size_t idx = static_cast<size_t>(b) * arena.ny * arena.nx + xy_off;
+                arena.re_buf[idx] = static_cast<float>(a.real());
+                arena.im_buf[idx] = static_cast<float>(a.imag());
+            }
+        }
+    }
+}
+
+/* March BPM from entry to exit plane (nz ADI-CN steps). */
+static void wave_arena_march(WaveArena& arena)
+{
+    for (int step = 0; step < arena.nz; ++step)
+        ray_tracer_wave_bpm_step(
+            arena.n_bands, arena.nx, arena.ny,
+            arena.dx, arena.dz,
+            arena.wavelengths_m,
+            arena.re_buf.data(), arena.im_buf.data());
+}
+
+/* Extract exit ray: power-weighted centroid for position, phase-gradient
+ * for direction, field value at centroid for per-band amplitude. */
+static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src)
+{
+    const int    nb   = arena.n_bands;
+    const int    nx   = arena.nx, ny = arena.ny;
+    const size_t npix = static_cast<size_t>(nx * ny);
+
+    double sum_pow = 0.0, cx = 0.0, cy = 0.0;
+    for (int b = 0; b < nb; ++b) {
+        const float* re = arena.re_buf.data() + static_cast<size_t>(b) * npix;
+        const float* im = arena.im_buf.data() + static_cast<size_t>(b) * npix;
+        for (int iy = 0; iy < ny; ++iy) {
+            for (int ix = 0; ix < nx; ++ix) {
+                size_t i = static_cast<size_t>(iy * nx + ix);
+                double p = (double)re[i]*re[i] + (double)im[i]*im[i];
+                sum_pow += p;
+                cx += p * ix;
+                cy += p * iy;
+            }
+        }
+    }
+    int ic_x = (sum_pow > 0.0) ? (int)std::round(cx / sum_pow) : nx / 2;
+    int ic_y = (sum_pow > 0.0) ? (int)std::round(cy / sum_pow) : ny / 2;
+    ic_x = std::max(1, std::min(nx - 2, ic_x));
+    ic_y = std::max(1, std::min(ny - 2, ic_y));
+
+    /* Phase-gradient estimate for exit direction */
+    double kx_sum = 0.0, ky_sum = 0.0;
+    int    k_count = 0;
+    for (int b = 0; b < nb; ++b) {
+        const float* re = arena.re_buf.data() + static_cast<size_t>(b) * npix;
+        const float* im = arena.im_buf.data() + static_cast<size_t>(b) * npix;
+        auto at = [&](int ix, int iy) -> cd {
+            return cd(re[iy*nx+ix], im[iy*nx+ix]);
+        };
+        cd Ux_fwd = at(ic_x+1, ic_y), Ux_bwd = at(ic_x-1, ic_y);
+        cd Uy_fwd = at(ic_x, ic_y+1), Uy_bwd = at(ic_x, ic_y-1);
+        if (std::abs(Ux_fwd) > 1e-30 && std::abs(Ux_bwd) > 1e-30) {
+            kx_sum += std::arg(Ux_fwd * std::conj(Ux_bwd)) / (2.0 * arena.dx);
+            ky_sum += std::arg(Uy_fwd * std::conj(Uy_bwd)) / (2.0 * arena.dx);
+            ++k_count;
+        }
+    }
+    double kx = (k_count > 0) ? kx_sum / k_count : 0.0;
+    double ky = (k_count > 0) ? ky_sum / k_count : 0.0;
+    double k0  = (nb > 0 && arena.wavelengths_m[0] > 0.0)
+               ? (TWO_PI / arena.wavelengths_m[0]) : 1.0;
+    double kz2 = k0*k0 - kx*kx - ky*ky;
+    double kz  = (kz2 > 0.0) ? std::sqrt(kz2) : k0;
+    V3d exit_dir = (arena.axis_x * (kx/k0)
+                  + arena.axis_y * (ky/k0)
+                  + arena.axis_z * (kz/k0)).normalized();
+
+    double ox = (nx * 0.5) * arena.dx;
+    double oy = (ny * 0.5) * arena.dx;
+    V3d exit_pos = arena.center
+                 + arena.axis_z * arena.radius
+                 + arena.axis_x * (ic_x * arena.dx - ox)
+                 + arena.axis_y * (ic_y * arena.dx - oy)
+                 + exit_dir * (EPS * 200.0);
+
+    VXcd exit_amp(nb);
+    for (int b = 0; b < nb; ++b) {
+        const float* re = arena.re_buf.data() + static_cast<size_t>(b) * npix;
+        const float* im = arena.im_buf.data() + static_cast<size_t>(b) * npix;
+        exit_amp[b] = cd(re[ic_y*nx+ic_x], im[ic_y*nx+ic_x]);
+    }
+
+    ChildRay cr;
+    cr.intent              = src;
+    cr.intent.pos          = exit_pos;
+    cr.intent.dir          = exit_dir;
+    cr.intent.amp          = exit_amp;
+    cr.intent.path_len    += 2.0 * arena.radius;
+    cr.intent.bounce      += 1;
+    cr.intent.bounces_left = std::max(0, src.bounces_left - 1);
+    return cr;
+}
+
+/* ── In-flight accounting ─────────────────────────────────────────────────── */
+
+static void pipeline_finish_ray(RayPipelineState& ps)
+{
+    ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+}
+
+static void pipeline_spawn_child(RayPipelineState& ps, RayIntent child)
+{
+    ++ps.in_flight;
+    ps.Q_intent.push(std::move(child));
+}
+
+/* ── T1: intersector ──────────────────────────────────────────────────────── */
+
+static void pipeline_intersector(RayPipelineState& ps)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    RayTracerState& st      = *ps.st;
+    const bool      has_bvh = !st.bvh_nodes.empty();
+    std::vector<RayIntent> batch;
+    std::mt19937 t1_rng(static_cast<uint32_t>(ps.cfg.seed) ^ 0xDEADBEEFu);
+
+    while (true) {
+        batch.clear();
+        int bsz = ps.stats[0].batch_sz.load(std::memory_order_relaxed);
+        float shuf = ps.cfg.intent_queue_shuffle;
+        int n;
+        if (shuf > 0.0f) {
+            n = ps.Q_intent.pop_batch_shuffled(batch, bsz, shuf, t1_rng);
+        } else {
+            n = ps.Q_intent.pop_batch(batch, bsz);
+        }
+        if (n == 0) break;
+
+        auto t0 = Clock::now();
+
+        for (auto& intent : batch) {
+            const V3d pos0 = intent.pos;
+            const V3d dir  = intent.dir;
+
+            double t_hit   = 1e18;
+            int    hit_tri = -1;
+            if (has_bvh) {
+                V3d inv = dir.cwiseInverse();
+                bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
+                          pos0, dir, inv, t_hit, hit_tri);
+            } else {
+                for (size_t ti = 0; ti < st.tris.size(); ++ti) {
+                    double tt;
+                    if (ray_triangle_hit(pos0, dir, st.tris[ti], tt) && tt > T_SELF && tt < t_hit) {
+                        t_hit = tt;  hit_tri = (int)ti;
+                    }
+                }
+            }
+
+            if (hit_tri < 0) {
+                RayRecord rec;
+                rec.kind      = RayRecordKind::MISS;
+                rec.tag       = intent.tag;
+                rec.src_id    = intent.src_id;
+                rec.bounce    = intent.bounce;
+                rec.pos[0]    = static_cast<float>(pos0.x());
+                rec.pos[1]    = static_cast<float>(pos0.y());
+                rec.pos[2]    = static_cast<float>(pos0.z());
+                rec.dir[0]    = static_cast<float>(dir.x());
+                rec.dir[1]    = static_cast<float>(dir.y());
+                rec.dir[2]    = static_cast<float>(dir.z());
+                rec.path_len  = static_cast<float>(intent.path_len);
+                rec.color_flag = intent.color_flag;
+                ps.Q_out.push(std::move(rec));
+                pipeline_finish_ray(ps);
+                continue;
+            }
+
+            const V3d hit_pos    = pos0 + t_hit * dir;
+            const double tot_len = intent.path_len + t_hit;
+            VXcd amp_prop        = intent.amp;
+            const int nb         = std::min((int)amp_prop.size(), st.n_bands);
+
+            for (int b = 0; b < nb; ++b) {
+                double n_re = 1.0, n_im = 0.0;
+                if (intent.medium_mat_idx >= 0) {
+                    n_re = mat_n_real(st, intent.medium_mat_idx, b);
+                    n_im = mat_n_imag(st, intent.medium_mat_idx, b);
+                    if (n_re < 1.0) n_re = 1.0;
+                }
+                double k_med  = st.k_real[b] * n_re;
+                double alpha  = st.atmo_abs[b];
+                if (intent.medium_mat_idx >= 0)
+                    alpha += TWO_PI * st.freq_hz_vec[b] * n_im / st.speed_m_s;
+                double atten  = std::exp(-alpha * t_hit);
+                /* Backward (sensor-cast) rays are importance-sampling paths, not
+                 * physical power carriers — skip 1/r² spherical spread so they
+                 * are not culled by the amplitude threshold before reaching the
+                 * scene emitters on the far side of the lens stack. */
+                double spread = (intent.color_flag == 1) ? 1.0 : 1.0 / (1.0 + tot_len);
+                amp_prop[b] *= std::polar(atten * spread, -k_med * t_hit);
+            }
+
+            if (st.camera_field_grid)
+                accumulate_field_capture_segment(st, pos0, hit_pos, amp_prop);
+
+            int wave_id = -1;
+            for (int ai = 0; ai < (int)ps.arenas.size(); ++ai) {
+                if ((hit_pos - ps.arenas[static_cast<size_t>(ai)].center).norm()
+                        <= ps.arenas[static_cast<size_t>(ai)].radius) {
+                    wave_id = ai;
+                    break;
+                }
+            }
+
+            const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
+            HitRecord hr;
+            hr.ray               = intent;
+            hr.ray.amp           = amp_prop;
+            hr.ray.path_len      = tot_len;
+            hr.seg_start         = pos0;
+            hr.incoming_dir      = dir;
+            hr.path_at_seg_start = intent.path_len;
+            hr.hit_tri           = hit_tri;
+            hr.hit_tri_flags     = tri.flags;
+            hr.hit_pos           = hit_pos;
+            hr.hit_n             = tri.normal;
+            if (dir.dot(hr.hit_n) > 0.0) hr.hit_n = -hr.hit_n;
+            hr.t_hit             = t_hit;
+            hr.amp_propagated    = amp_prop;
+
+            /* Barycentric coordinates via 2×2 least-squares on the edge basis.
+             * Cheap: 6 dot products, 1 divide — exact for the MT parametric. */
+            const V3d bq  = hit_pos - tri.v0;
+            const double bd11 = tri.edge1.dot(tri.edge1);
+            const double bd12 = tri.edge1.dot(tri.edge2);
+            const double bd22 = tri.edge2.dot(tri.edge2);
+            const double bd1q = tri.edge1.dot(bq);
+            const double bd2q = tri.edge2.dot(bq);
+            const double bden = bd11 * bd22 - bd12 * bd12 + 1e-30;
+            const float  bu   = static_cast<float>((bd22 * bd1q - bd12 * bd2q) / bden);
+            const float  bv   = static_cast<float>((bd11 * bd2q - bd12 * bd1q) / bden);
+
+            {
+                RayRecord rec;
+                rec.kind              = RayRecordKind::STRIKE;
+                rec.tag               = intent.tag;
+                rec.src_id            = intent.src_id;
+                rec.bounce            = intent.bounce;
+                rec.seg_start[0]      = static_cast<float>(pos0.x());
+                rec.seg_start[1]      = static_cast<float>(pos0.y());
+                rec.seg_start[2]      = static_cast<float>(pos0.z());
+                rec.pos[0]            = static_cast<float>(hit_pos.x());
+                rec.pos[1]            = static_cast<float>(hit_pos.y());
+                rec.pos[2]            = static_cast<float>(hit_pos.z());
+                rec.dir[0]            = static_cast<float>(dir.x());
+                rec.dir[1]            = static_cast<float>(dir.y());
+                rec.dir[2]            = static_cast<float>(dir.z());
+                rec.normal[0]         = static_cast<float>(hr.hit_n.x());
+                rec.normal[1]         = static_cast<float>(hr.hit_n.y());
+                rec.normal[2]         = static_cast<float>(hr.hit_n.z());
+                rec.path_len          = static_cast<float>(tot_len);
+                rec.path_at_seg_start = static_cast<float>(intent.path_len);
+                rec.hit_tri           = hit_tri;
+                rec.mat_idx           = tri.mat_idx;
+                rec.bary_u            = bu;
+                rec.bary_v            = bv;
+                rec.color_flag        = intent.color_flag;
+                const int rnb = std::min(nb, RAY_RECORD_MAX_BANDS);
+                rec.n_bands = rnb;
+                for (int b = 0; b < rnb; ++b) {
+                    rec.amp_re[b] = static_cast<float>(amp_prop[b].real());
+                    rec.amp_im[b] = static_cast<float>(amp_prop[b].imag());
+                }
+                ps.Q_out.push(std::move(rec));
+            }
+
+            /* ── Sensor image accumulator (T1) ───────────────────────────
+             * Forward ray (color_flag==0) hitting near the sensor plate →
+             * ch0.  Backward ray (bounce==0) hitting near the plate → ch1. */
+            if (ps.sensor_res > 0) {
+                const float hx = static_cast<float>(hit_pos.x());
+                const float hy = static_cast<float>(hit_pos.y());
+                const float hz = static_cast<float>(hit_pos.z());
+                if (std::abs(hx - ps.sensor_px) < 0.004f) {
+                    const float inv_r = static_cast<float>(ps.sensor_res) / (2.0f * ps.sensor_pr);
+                    const int   iy    = static_cast<int>((hy + ps.sensor_pr) * inv_r);
+                    const int   iz    = static_cast<int>((hz + ps.sensor_pr) * inv_r);
+                    const int   res   = ps.sensor_res;
+                    if (iy >= 0 && iy < res && iz >= 0 && iz < res) {
+                        double amp_mag = 0.0;
+                        for (int b = 0; b < nb; ++b) {
+                            const double re = amp_prop[b].real(), im = amp_prop[b].imag();
+                            amp_mag += std::sqrt(re*re + im*im);
+                        }
+                        const int ch  = (intent.color_flag == 0) ? 0 : 1;
+                        const int idx = ch * res * res + iy * res + iz;
+                        std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                        ps.sensor_accum[static_cast<size_t>(idx)] += amp_mag;
+                    }
+                }
+            }
+
+            if (wave_id >= 0) {
+                WaveIntent wi;
+                wi.ray      = intent;
+                wi.ray.amp  = amp_prop;
+                wi.ray.path_len = tot_len;
+                wi.ray.interaction_flags |= (1u << SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ);
+                wi.arena_id = wave_id;
+                ps.Q_wave.push(std::move(wi));
+            } else {
+                ps.Q_hit.push(std::move(hr));
+            }
+        }
+
+        auto t1 = Clock::now();
+        ps.stats[0].record(n,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+            ps.Q_intent.size());
+    }
+}
+
+/* ── T2: refiner ──────────────────────────────────────────────────────────── */
+
+static void pipeline_refiner(RayPipelineState& ps)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    RayTracerState& st = *ps.st;
+    std::vector<HitRecord> batch;
+
+    while (true) {
+        batch.clear();
+        int bsz = ps.stats[1].batch_sz.load(std::memory_order_relaxed);
+        int n   = ps.Q_hit.pop_batch(batch, bsz);
+        if (n == 0) break;
+        auto t0 = Clock::now();
+
+        for (auto& hr : batch) {
+            RefinedHit rh;
+            rh.base        = hr;
+            rh.refined_pos = hr.hit_pos;
+            rh.refined_n   = hr.hit_n;
+            rh.was_parametric = apply_parametric_surface_point(
+                st, hr.hit_tri, hr.hit_pos, rh.refined_pos, rh.refined_n);
+            if (hr.incoming_dir.dot(rh.refined_n) > 0.0)
+                rh.refined_n = -rh.refined_n;
+            ps.Q_refined.push(std::move(rh));
+        }
+
+        auto t1 = Clock::now();
+        ps.stats[1].record(n,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+            ps.Q_hit.size());
+    }
+}
+
+/* ── T3: material handler ─────────────────────────────────────────────────── */
+
+static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    RayTracerState& st = *ps.st;
+    std::mt19937_64 rng(rng_seed);
+    std::uniform_real_distribution<double> U01(0.0, 1.0);
+
+    /* Build a TERMINAL RayRecord from a HitRecord and push to Q_out. */
+    auto push_terminal = [&](const HitRecord& h) {
+        RayRecord rec;
+        rec.kind              = RayRecordKind::TERMINAL;
+        rec.tag               = h.ray.tag;
+        rec.src_id            = h.ray.src_id;
+        rec.bounce            = h.ray.bounce;
+        rec.seg_start[0]      = static_cast<float>(h.seg_start.x());
+        rec.seg_start[1]      = static_cast<float>(h.seg_start.y());
+        rec.seg_start[2]      = static_cast<float>(h.seg_start.z());
+        rec.pos[0]            = static_cast<float>(h.hit_pos.x());
+        rec.pos[1]            = static_cast<float>(h.hit_pos.y());
+        rec.pos[2]            = static_cast<float>(h.hit_pos.z());
+        rec.dir[0]            = static_cast<float>(h.incoming_dir.x());
+        rec.dir[1]            = static_cast<float>(h.incoming_dir.y());
+        rec.dir[2]            = static_cast<float>(h.incoming_dir.z());
+        rec.normal[0]         = static_cast<float>(h.hit_n.x());
+        rec.normal[1]         = static_cast<float>(h.hit_n.y());
+        rec.normal[2]         = static_cast<float>(h.hit_n.z());
+        rec.path_len          = static_cast<float>(h.ray.path_len);
+        rec.path_at_seg_start = static_cast<float>(h.path_at_seg_start);
+        rec.hit_tri           = h.hit_tri;
+        rec.mat_idx           = (h.hit_tri >= 0)
+            ? st.tris[static_cast<size_t>(h.hit_tri)].mat_idx : -1;
+        rec.color_flag        = h.ray.color_flag;
+        const int nb = std::min((int)h.amp_propagated.size(), RAY_RECORD_MAX_BANDS);
+        rec.n_bands = nb;
+        for (int b = 0; b < nb; ++b) {
+            rec.amp_re[b] = static_cast<float>(h.amp_propagated[b].real());
+            rec.amp_im[b] = static_cast<float>(h.amp_propagated[b].imag());
+        }
+        ps.Q_out.push(std::move(rec));
+    };
+
+    std::vector<RefinedHit> batch;
+
+    while (true) {
+        batch.clear();
+        int bsz = ps.stats[2].batch_sz.load(std::memory_order_relaxed);
+        int n   = ps.Q_refined.pop_batch(batch, bsz);
+        if (n == 0) break;
+        auto t0 = Clock::now();
+
+        for (auto& rh : batch) {
+            const HitRecord& hr     = rh.base;
+            const Triangle&  tri    = st.tris[static_cast<size_t>(hr.hit_tri)];
+        const int        nb     = std::min((int)hr.amp_propagated.size(), st.n_bands);
+        const V3d&       hit_n  = rh.refined_n;
+        const V3d&       in_dir = hr.incoming_dir;
+        VXcd             amp    = hr.amp_propagated;
+
+        /* ── Terminal: aperture stop ── */
+        if (tri.flags & MAT_FLAG_APERTURE_STOP) {
+            push_terminal(hr);
+            pipeline_finish_ray(ps);
+            continue;
+        }
+        /* ── Terminal: emissive ── */
+        if (tri.flags & MAT_FLAG_EMISSIVE) {
+            HitRecord eh = hr;
+            eh.is_emissive_hit = true;
+            push_terminal(eh);
+            pipeline_finish_ray(ps);
+            /* ── Sensor accumulator (T3): backward ray found emissive surface.
+             * Use sensor_origin_y/z (set at submit time, propagated through all
+             * children) so this works regardless of how many refractions the ray
+             * passed through on its way from the sensor to the source. */
+            if (ps.sensor_res > 0 && hr.ray.color_flag == 1) {
+                const float sy    = hr.ray.sensor_origin_y;
+                const float sz    = hr.ray.sensor_origin_z;
+                const int   res   = ps.sensor_res;
+                const float inv_r = static_cast<float>(res) / (2.0f * ps.sensor_pr);
+                const int   iy    = static_cast<int>((sy + ps.sensor_pr) * inv_r);
+                const int   iz    = static_cast<int>((sz + ps.sensor_pr) * inv_r);
+                if (iy >= 0 && iy < res && iz >= 0 && iz < res) {
+                    /* Physical amplitude carried by this ray at the emissive. */
+                    double amp_mag = 0.0;
+                    for (int b = 0; b < nb; ++b) {
+                        const double re = amp[b].real(), im = amp[b].imag();
+                        amp_mag += std::sqrt(re*re + im*im);
+                    }
+                    /* Backward rays start with unit amplitude (setOnes) across
+                     * nb bands, so the initial magnitude is nb.
+                     * transmission = amp_mag / nb  ∈ (0, 1].
+                     *
+                     * ch1 = exposure-compensated contribution:
+                     *   weight = 1 / transmission = nb / amp_mag
+                     * This treats each path as representing (1/transmission)
+                     * equivalent physical rays — exactly the "infinite exposure
+                     * time" scaling the user requested.  Paths that are dimmed
+                     * by the lens (Fresnel, Beer, etc.) are up-weighted so the
+                     * sensor image integrates correctly over time regardless of
+                     * optical attenuation.
+                     *
+                     * ch2 = physically weighted (amp_mag) for the raw-physics view. */
+                    const double n_bands_d = static_cast<double>(nb > 0 ? nb : 1);
+                    const double transmission = amp_mag / n_bands_d;
+                    /* Guard against degenerate zero-amplitude rays (should not
+                     * happen after the spread fix, but be safe). */
+                    const double weight = (transmission > 1e-12)
+                        ? (1.0 / transmission)
+                        : n_bands_d;   /* fallback: treat as unit transmission */
+                    const int idx1 = 1 * res * res + iy * res + iz;
+                    const int idx2 = 2 * res * res + iy * res + iz;
+                    std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                    ps.sensor_accum[static_cast<size_t>(idx1)] += weight;
+                    ps.sensor_accum[static_cast<size_t>(idx2)] += amp_mag;
+                }
+            }
+            continue;
+        }
+        /* ── Budget exhausted ── */
+        if (hr.ray.bounces_left <= 0) {
+            push_terminal(hr);
+            pipeline_finish_ray(ps);
+            continue;
+        }
+
+        /* Helper: build a child RayIntent from the current hit. */
+        auto make_child = [&](const V3d& new_dir, const VXcd& new_amp,
+                              int new_medium = -2) -> RayIntent {
+            RayIntent ri      = hr.ray;
+            ri.pos            = rh.refined_pos;
+            ri.dir            = new_dir;
+            ri.amp            = new_amp;
+            ri.path_len       = hr.ray.path_len;
+            ri.bounce        += 1;
+            ri.bounces_left   = hr.ray.bounces_left - 1;
+            if (new_medium != -2) ri.medium_mat_idx = new_medium;
+            return ri;
+        };
+
+        const bool mat_transmissive = tri_material_is_transmissive(st, tri);
+        const bool front_face       = (in_dir.dot(tri.normal) < 0.0);
+
+        if (mat_transmissive) {
+            int medium_from = -1, medium_to = -1;
+            const bool has_pair = tri_boundary_media(tri, front_face,
+                                                     medium_from, medium_to);
+            const double n1 = has_pair ? medium_n_real(st, medium_from)
+                : ((hr.ray.medium_mat_idx >= 0)
+                   ? mat_n_real(st, hr.ray.medium_mat_idx) : 1.0);
+            const double n2 = has_pair ? medium_n_real(st, medium_to)
+                : (front_face ? mat_n_real(st, tri.mat_idx) : 1.0);
+            const double cos_i = std::max(0.0, -in_dir.dot(hit_n));
+            V3d   refracted;
+            const bool can_refract = snell_refract(in_dir, hit_n, n1, n2, refracted);
+
+            if (!can_refract) {
+                V3d  rd = (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
+                VXcd ra = amp;
+                for (int b = 0; b < nb; ++b)
+                    ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                pipeline_spawn_child(ps, make_child(rd, ra));
+            } else {
+                const double sin2_t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
+                const double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
+                const double R      = fresnel_R(cos_i, cos_t, n1, n2);
+                const int    new_med = has_pair ? medium_to
+                    : ((hr.ray.medium_mat_idx == tri.mat_idx) ? -1 : tri.mat_idx);
+
+                if (ps.cfg.max_children >= 2) {
+                    {
+                        V3d  rd = (in_dir - 2.0*in_dir.dot(hit_n)*hit_n).normalized();
+                        VXcd ra = amp;
+                        double rs = std::sqrt(R);
+                        for (int b = 0; b < nb; ++b)
+                            ra[b] *= rs * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                        pipeline_spawn_child(ps, make_child(rd, ra));
+                    }
+                    {
+                        VXcd ta = amp;
+                        double ts = std::sqrt(1.0 - R);
+                        for (int b = 0; b < nb; ++b)
+                            ta[b] *= ts;
+                        pipeline_spawn_child(ps, make_child(refracted, ta, new_med));
+                    }
+                } else {
+                    if (U01(rng) < R) {
+                        V3d  rd = (in_dir - 2.0*in_dir.dot(hit_n)*hit_n).normalized();
+                        VXcd ra = amp;
+                        for (int b = 0; b < nb; ++b)
+                            ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                        pipeline_spawn_child(ps, make_child(rd, ra));
+                    } else {
+                        VXcd ta = amp;
+                        pipeline_spawn_child(ps, make_child(refracted, ta, new_med));
+                    }
+                }
+            }
+        } else {
+            /* ── Epsilon fast-path: skip direction sampling for fully absorptive materials ── */
+            if (!ps.mat_epsilon_flags.empty() &&
+                static_cast<size_t>(tri.mat_idx) < ps.mat_epsilon_flags.size() &&
+                ps.mat_epsilon_flags[static_cast<size_t>(tri.mat_idx)]) {
+                push_terminal(hr);
+                pipeline_finish_ray(ps);
+                continue;
+            }
+
+            /* Opaque: diffuse or specular */
+            V3d new_dir;
+            if (U01(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx))
+                new_dir = cosine_hemisphere(hit_n, rng);
+            else {
+                new_dir = (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
+                if (new_dir.dot(hit_n) < 0.0) new_dir = cosine_hemisphere(hit_n, rng);
+            }
+            VXcd na = amp;
+            for (int b = 0; b < nb; ++b)
+                na[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+            if (tri.flags & MAT_FLAG_REACTIVE)
+                apply_reactive_shift_cached(na, st.mat_cache, tri.mat_idx);
+
+            double max_abs = 0.0;
+            for (int b = 0; b < nb; ++b)
+                max_abs = std::max(max_abs, std::abs(na[b]));
+            if (max_abs >= hr.ray.min_amplitude)
+                pipeline_spawn_child(ps, make_child(new_dir, na));
+            else
+                push_terminal(hr);  /* amplitude extinguished */
+        }
+
+        pipeline_finish_ray(ps);
+    }  /* end for rh : batch */
+
+        /* ── BDPT snap pass (T3) ─────────────────────────────────────────
+         * For each backward-origin STRIKE in this batch, find forward STRIKE
+         * hits in YZ proximity and accumulate on the sensor image:
+         *
+         *   d <= eps          → exact match → ch2 (blue)  + sugar on priority map
+         *   eps < d <= 3*eps  → near-miss   → ch3 (green, provisional), Gaussian
+         *
+         * ch3 fills in tentative data where convergence is approaching but not
+         * yet snapped; it is superseded visually by ch2 as exact matches arrive. */
+        if (ps.sensor_res > 0) {
+            const int   res    = ps.sensor_res;
+            const float eps    = ps.sensor_eps;
+            const float eps3   = 3.0f * eps;
+            const float inv_r  = static_cast<float>(res) / (2.0f * ps.sensor_pr);
+            const float sigma2 = eps * eps;
+
+            struct HitXY {
+                float y, z, amp, ss_y, ss_z, ss_x;
+                float dir_y, dir_z, dir_x;   /* incoming direction for collinearity */
+            };
+            std::vector<HitXY> fwd_hits, rev_hits;
+            fwd_hits.reserve(batch.size());
+            rev_hits.reserve(batch.size());
+
+            for (auto& rh : batch) {
+                const HitRecord& hr = rh.base;
+                const V3d& hp = hr.hit_pos;
+                double amp_mag = 0.0;
+                for (int b = 0; b < (int)hr.amp_propagated.size(); ++b) {
+                    const double re = hr.amp_propagated[b].real();
+                    const double im = hr.amp_propagated[b].imag();
+                    amp_mag += std::sqrt(re*re + im*im);
+                }
+                HitXY h;
+                h.y     = static_cast<float>(hp.y());
+                h.z     = static_cast<float>(hp.z());
+                h.amp   = static_cast<float>(amp_mag);
+                h.ss_y  = static_cast<float>(hr.seg_start.y());
+                h.ss_z  = static_cast<float>(hr.seg_start.z());
+                h.ss_x  = static_cast<float>(hr.seg_start.x());
+                h.dir_y = static_cast<float>(hr.incoming_dir.y());
+                h.dir_z = static_cast<float>(hr.incoming_dir.z());
+                h.dir_x = static_cast<float>(hr.incoming_dir.x());
+                if      (hr.ray.color_flag == 0) fwd_hits.push_back(h);
+                else if (hr.ray.bounce     == 0) rev_hits.push_back(h);
+            }
+
+            /* --- lock-free stats: track nearest pair and best collinearity --- */
+            float batch_nearest_d2   = std::numeric_limits<float>::max();
+            float batch_best_colinear = -1.0f;
+            for (auto& rv : rev_hits) {
+                for (auto& fv : fwd_hits) {
+                    const float dy = rv.y - fv.y;
+                    const float dz = rv.z - fv.z;
+                    const float d2 = dy*dy + dz*dz;
+                    if (d2 < batch_nearest_d2) batch_nearest_d2 = d2;
+                    /* Collinearity: |cos θ| between forward and backward incoming dirs.
+                     * A back-to-back pair on the same path → cos θ ≈ -1 → |cos|≈1. */
+                    const float fx = fv.dir_x, fy = fv.dir_y, fz = fv.dir_z;
+                    const float rx = rv.dir_x, ry = rv.dir_y, rz = rv.dir_z;
+                    const float flen = std::sqrt(fx*fx + fy*fy + fz*fz) + 1e-12f;
+                    const float rlen = std::sqrt(rx*rx + ry*ry + rz*rz) + 1e-12f;
+                    const float colinear = std::abs((fx*rx + fy*ry + fz*rz) / (flen * rlen));
+                    if (colinear > batch_best_colinear) batch_best_colinear = colinear;
+                }
+            }
+            if (batch_nearest_d2 < std::numeric_limits<float>::max()) {
+                /* Atomic CAS-loop to update running minimum nearest d² */
+                uint64_t newbits;
+                std::memcpy(&newbits, &batch_nearest_d2, sizeof(float));
+                /* Pad to 64 bits for atomic; only lower 32 bits meaningful. */
+                newbits &= 0xFFFFFFFFULL;
+                for (;;) {
+                    uint64_t cur = ps.bdpt_nearest_d2_bits.load(std::memory_order_relaxed);
+                    float cur_f; uint32_t cur32 = static_cast<uint32_t>(cur & 0xFFFFFFFFULL);
+                    std::memcpy(&cur_f, &cur32, sizeof(float));
+                    if (batch_nearest_d2 >= cur_f) break;
+                    if (ps.bdpt_nearest_d2_bits.compare_exchange_weak(cur, newbits,
+                            std::memory_order_relaxed, std::memory_order_relaxed)) break;
+                }
+            }
+            if (batch_best_colinear > -1.0f) {
+                uint64_t newbits;
+                std::memcpy(&newbits, &batch_best_colinear, sizeof(float));
+                newbits &= 0xFFFFFFFFULL;
+                for (;;) {
+                    uint64_t cur = ps.bdpt_best_colinear_bits.load(std::memory_order_relaxed);
+                    float cur_f; uint32_t cur32 = static_cast<uint32_t>(cur & 0xFFFFFFFFULL);
+                    std::memcpy(&cur_f, &cur32, sizeof(float));
+                    if (batch_best_colinear <= cur_f) break;
+                    if (ps.bdpt_best_colinear_bits.compare_exchange_weak(cur, newbits,
+                            std::memory_order_relaxed, std::memory_order_relaxed)) break;
+                }
+            }
+
+            if (!fwd_hits.empty() && !rev_hits.empty()) {
+                std::lock_guard<std::mutex> lk(ps.sensor_mu);
+
+                for (auto& rv : rev_hits) {
+                    if (std::abs(rv.ss_x - ps.sensor_px) >= 0.004f) continue;
+                    const int iy = static_cast<int>((rv.ss_y + ps.sensor_pr) * inv_r);
+                    const int iz = static_cast<int>((rv.ss_z + ps.sensor_pr) * inv_r);
+                    if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
+
+                    double exact_w = 0.0, nearmi_w = 0.0;
+                    for (auto& fv : fwd_hits) {
+                        const float dy = rv.y - fv.y;
+                        const float dz = rv.z - fv.z;
+                        const float d2 = dy*dy + dz*dz;
+                        if (d2 > eps3 * eps3) continue;
+                        const float wg = fv.amp * std::exp(-d2 / sigma2);
+                        if (d2 <= eps * eps) exact_w  += wg;
+                        else                 nearmi_w += wg;
+                    }
+
+                    if (exact_w > 0.0) {
+                        ps.sensor_accum[static_cast<size_t>(2 * res * res + iy * res + iz)]
+                            += exact_w * rv.amp;
+                        ps.bdpt_exact_snaps.fetch_add(1, std::memory_order_relaxed);
+                        /* Sugar splash around exact match pixel. */
+                        const float sugar = static_cast<float>(exact_w) * rv.amp * 0.4f;
+                        for (int dy2 = -2; dy2 <= 2; ++dy2) {
+                            for (int dz2 = -2; dz2 <= 2; ++dz2) {
+                                const int ny = iy + dy2, nz = iz + dz2;
+                                if (ny < 0 || ny >= res || nz < 0 || nz >= res) continue;
+                                ps.priority_map[static_cast<size_t>(ny * res + nz)] +=
+                                    sugar * std::exp(-0.5f * static_cast<float>(dy2*dy2 + dz2*dz2));
+                            }
+                        }
+                    }
+                    if (nearmi_w > 0.0) {
+                        ps.sensor_accum[static_cast<size_t>(3 * res * res + iy * res + iz)]
+                            += nearmi_w * rv.amp;
+                        ps.bdpt_near_miss_count.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+
+                /* One diffusion step on priority map (coeffs sum <1 → steady state=1).
+                 * 0.90 self + 0.02*4 neighbours + 0.02 baseline injection = 1.0 eq. */
+                if (!ps.priority_map.empty()) {
+                    std::vector<float> tmp(ps.priority_map);
+                    for (int y = 1; y < res - 1; ++y) {
+                        for (int z = 1; z < res - 1; ++z) {
+                            const float nb = tmp[(y-1)*res+z] + tmp[(y+1)*res+z]
+                                           + tmp[y*res+z-1]   + tmp[y*res+z+1];
+                            ps.priority_map[static_cast<size_t>(y*res+z)] =
+                                0.90f * tmp[y*res+z] + 0.02f * nb + 0.02f;
+                        }
+                    }
+                }
+            }
+        }
+
+        auto t1 = Clock::now();
+        ps.stats[2].record(n,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+            ps.Q_refined.size());
+    }  /* end while pop_batch */
+}
+
+/* ── T4: wave solver ──────────────────────────────────────────────────────── */
+
+static void pipeline_wave_solver(RayPipelineState& ps)
+{
+    using Clock = std::chrono::high_resolution_clock;
+    std::vector<WaveIntent> batch;
+
+    while (true) {
+        batch.clear();
+        int bsz = ps.stats[3].batch_sz.load(std::memory_order_relaxed);
+        int n   = ps.Q_wave.pop_batch(batch, bsz);
+        if (n == 0) break;
+        auto t0 = Clock::now();
+
+        for (auto& wi : batch) {
+            if (wi.arena_id < 0 || wi.arena_id >= (int)ps.arenas.size()) {
+                pipeline_finish_ray(ps);
+                continue;
+            }
+            WaveArena& arena = ps.arenas[static_cast<size_t>(wi.arena_id)];
+            {
+                std::lock_guard<std::mutex> lk(arena.mu);
+                wave_arena_seed(arena, wi.ray);
+                wave_arena_march(arena);
+            }
+            ChildRay cr = wave_arena_extract(arena, wi.ray);
+
+            {
+                RayRecord rec;
+                rec.kind       = RayRecordKind::FIELD;
+                rec.tag        = wi.ray.tag;
+                rec.src_id     = wi.ray.src_id;
+                rec.bounce     = wi.ray.bounce;
+                rec.arena_id   = wi.arena_id;
+                rec.color_flag = wi.ray.color_flag;
+                rec.pos[0]   = static_cast<float>(wi.ray.pos.x());
+                rec.pos[1]   = static_cast<float>(wi.ray.pos.y());
+                rec.pos[2]   = static_cast<float>(wi.ray.pos.z());
+                rec.dir[0]   = static_cast<float>(wi.ray.dir.x());
+                rec.dir[1]   = static_cast<float>(wi.ray.dir.y());
+                rec.dir[2]   = static_cast<float>(wi.ray.dir.z());
+                rec.path_len = static_cast<float>(wi.ray.path_len);
+                const int nb = std::min((int)cr.intent.amp.size(), RAY_RECORD_MAX_BANDS);
+                rec.n_bands  = nb;
+                for (int b = 0; b < nb; ++b) {
+                    rec.amp_re[b] = static_cast<float>(cr.intent.amp[b].real());
+                    rec.amp_im[b] = static_cast<float>(cr.intent.amp[b].imag());
+                }
+                ps.Q_out.push(std::move(rec));
+            }
+
+            double max_abs = 0.0;
+            for (int b = 0; b < (int)cr.intent.amp.size(); ++b)
+                max_abs = std::max(max_abs, std::abs(cr.intent.amp[b]));
+
+            if (max_abs >= wi.ray.min_amplitude && cr.intent.bounces_left > 0)
+                pipeline_spawn_child(ps, std::move(cr.intent));
+
+            pipeline_finish_ray(ps);
+        }
+
+        auto t1 = Clock::now();
+        ps.stats[3].record(n,
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
+            ps.Q_wave.size());
+    }
+}
+
+/* ── Public API ───────────────────────────────────────────────────────────── */
+
+/* (Re)scan mat_cache reflectances; flag materials whose max |refl| <
+ * cfg.min_amplitude.  T3 uses these flags to skip child spawning immediately,
+ * saving BVH + Fresnel work for rays that would die on the next bounce anyway. */
+static void pipeline_precompute_epsilon_flags(RayPipelineState& ps)
+{
+    const MatSpectralCache& c = ps.st->mat_cache;
+    const int nm = c.n_mats;
+    const int nb = c.n_bands;
+    const double threshold = ps.cfg.min_amplitude;
+    ps.mat_epsilon_flags.assign(static_cast<size_t>(std::max(nm, 0)), 0u);
+    for (int m = 0; m < nm; ++m) {
+        double max_refl = 0.0;
+        for (int b = 0; b < nb; ++b)
+            max_refl = std::max(max_refl, std::abs(mat_cache_refl(c, m, b)));
+        if (max_refl < threshold)
+            ps.mat_epsilon_flags[static_cast<size_t>(m)] = 1u;
+    }
+}
+
+RayPipelineState* ray_pipeline_create(
+    RayTracerState*          st,
+    const RayPipelineConfig* cfg)
+{
+    if (!st) return nullptr;
+    auto* ps  = new RayPipelineState();
+    ps->st    = st;
+    ps->cfg   = cfg ? *cfg : RayPipelineConfig{};
+
+    for (int i = 0; i < (int)st->scale_contexts.size(); ++i) {
+        const RtScaleContext& ctx = st->scale_contexts[static_cast<size_t>(i)];
+        if (ctx.scale_type != RT_SCALE_WAVE) continue;
+        ps->arenas.emplace_back();
+        wave_arena_build(ps->arenas.back(),
+                         (int)ps->arenas.size() - 1,
+                         ctx, ps->cfg, *st);
+    }
+
+    const uint64_t base  = static_cast<uint64_t>(ps->cfg.seed);
+    const int      n_hw  = std::max(1, (int)std::thread::hardware_concurrency());
+    const int      n_t3  = std::max(1, n_hw / 2);
+
+    ps->workers.emplace_back([ps](){ pipeline_intersector(*ps); });
+    ps->workers.emplace_back([ps](){ pipeline_refiner(*ps); });
+    for (int i = 0; i < n_t3; ++i) {
+        uint64_t seed_i = base ^ (static_cast<uint64_t>(0xDEADBEEFULL) * static_cast<uint64_t>(i + 1));
+        ps->workers.emplace_back([ps, seed_i](){ pipeline_material(*ps, seed_i); });
+    }
+    if (!ps->arenas.empty() && !ps->cfg.use_gpu_compute)
+        ps->workers.emplace_back([ps](){ pipeline_wave_solver(*ps); });
+
+    /* GPU dispatch: spawned in addition to CPU workers when use_gpu_compute.
+     * Both compete on the shared queues; adaptive batch sizing lets each
+     * operator absorb the share it can process fastest. */
+    if (ps->cfg.use_gpu_compute) {
+        ps->gpu_dispatch = new RayPipelineState::GlPipelineDispatch();
+        if (ps->gpu_dispatch->init(*ps, ps->cfg.shader_dir)) {
+            fprintf(stderr, "[gpu-dispatch] GL 4.3 compute context ready — GPU thread starting\n");
+            fflush(stderr);
+            ps->workers.emplace_back([ps]() {
+                ps->gpu_dispatch->thread_main(*ps);
+            });
+        } else {
+            fprintf(stderr, "[gpu-dispatch] GL init FAILED (%s) — falling back to CPU\n",
+                    ps->gpu_dispatch->ctx.error[0] ? ps->gpu_dispatch->ctx.error : "unknown error");
+            fflush(stderr);
+            delete ps->gpu_dispatch;
+            ps->gpu_dispatch = nullptr;
+            /* Restore T4 CPU wave thread that was skipped above */
+            if (!ps->arenas.empty())
+                ps->workers.emplace_back([ps](){ pipeline_wave_solver(*ps); });
+        }
+    }
+
+    /* Pre-compute epsilon material flags so T3 can fast-path highly absorptive
+     * surfaces without recomputing reflectance on every hit. */
+    pipeline_precompute_epsilon_flags(*ps);
+
+    return ps;
+}
+
+void ray_pipeline_destroy(RayPipelineState* ps)
+{
+    if (!ps) return;
+    ps->Q_intent.set_done();
+    ps->Q_hit.set_done();
+    ps->Q_refined.set_done();
+    ps->Q_wave.set_done();
+    for (auto& t : ps->workers) if (t.joinable()) t.join();
+    if (ps->gpu_dispatch) {
+        gl_compute_destroy_context(&ps->gpu_dispatch->ctx);
+        delete ps->gpu_dispatch;
+        ps->gpu_dispatch = nullptr;
+    }
+    delete ps;
+}
+
+void ray_pipeline_submit(
+    RayPipelineState*  ps,
+    const RayIntent*   intents,
+    int                n_intents)
+{
+    if (!ps || !intents || n_intents <= 0) return;
+    ps->in_flight.fetch_add(n_intents, std::memory_order_relaxed);
+    const int    max_q   = ps->cfg.max_intent_queue;
+    const double min_amp = ps->cfg.min_amplitude;
+    /* Snapshot map state once outside the per-ray loop. */
+    const bool   has_map  = (ps->sensor_res > 0 && !ps->priority_map.empty());
+    const int    map_res  = ps->sensor_res;
+    const float  map_inv  = has_map ? static_cast<float>(map_res) / (2.0f * ps->sensor_pr) : 0.0f;
+    for (int i = 0; i < n_intents; ++i) {
+        RayIntent ri = intents[i];
+        /* Raise per-ray floor to the pipeline minimum (never lower it). */
+        if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
+        /* Assign priority from the sugar-auxin map for backward-origin (sensor)
+         * rays so productive sensor pixels are explored more intensively. */
+        if (has_map && ri.color_flag == 1 && ri.bounce == 0) {
+            const int iy = static_cast<int>((static_cast<float>(ri.pos.y()) + ps->sensor_pr) * map_inv);
+            const int iz = static_cast<int>((static_cast<float>(ri.pos.z()) + ps->sensor_pr) * map_inv);
+            if (iy >= 0 && iy < map_res && iz >= 0 && iz < map_res) {
+                std::lock_guard<std::mutex> lk(ps->sensor_mu);
+                ri.priority = std::max(1.0f, ps->priority_map[static_cast<size_t>(iy * map_res + iz)]);
+            }
+        }
+        if (max_q > 0)
+            ps->Q_intent.push_bounded(std::move(ri), max_q);
+        else
+            ps->Q_intent.push(std::move(ri));
+    }
+}
+
+int ray_pipeline_drain(
+    RayPipelineState*        ps,
+    std::vector<RayRecord>&  out,
+    int                      max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_out.drain(out, max_n);
+}
+
+int ray_pipeline_in_flight(const RayPipelineState* ps)
+{
+    return ps ? (int)ps->in_flight.load(std::memory_order_relaxed) : 0;
+}
+
+void ray_pipeline_get_stats(const RayPipelineState* ps, RayPipelineStats* out)
+{
+    if (!ps || !out) return;
+    auto snap = [](const StageStats& s, RayPipelineStats::Stage& d) {
+        d.throughput      = s.items_per_sec();
+        d.processed       = s.n_processed.load(std::memory_order_relaxed);
+        d.batch_size      = s.batch_sz.load(std::memory_order_relaxed);
+        d.queue_depth     = s.q_depth.load(std::memory_order_relaxed);
+        d.gpu_throughput  = s.gpu_items_per_sec();
+        d.gpu_processed   = s.n_gpu.load(std::memory_order_relaxed);
+        d.gpu_batch_size  = s.batch_sz_gpu.load(std::memory_order_relaxed);
+        d.gpu_fraction    = s.gpu_fraction();
+    };
+    snap(ps->stats[0], out->t1);
+    snap(ps->stats[1], out->t2);
+    snap(ps->stats[2], out->t3);
+    snap(ps->stats[3], out->t4);
+    out->output_queue_depth = ps->Q_out.size();
+    out->in_flight          = ps->in_flight.load(std::memory_order_relaxed);
+}
+
+void ray_pipeline_set_min_amplitude(RayPipelineState* ps, double eps)
+{
+    if (!ps) return;
+    ps->cfg.min_amplitude = eps;
+    pipeline_precompute_epsilon_flags(*ps);
+}
+
+void ray_pipeline_precompute_epsilon_flags(RayPipelineState* ps)
+{
+    if (!ps) return;
+    pipeline_precompute_epsilon_flags(*ps);
+}
+
+int ray_pipeline_n_bands(const RayPipelineState* ps)
+{
+    if (!ps || !ps->st) return 0;
+    return ps->st->n_bands;
+}
+
+int ray_pipeline_tri_mat_idx(const RayPipelineState* ps, int tri_idx)
+{
+    if (!ps || !ps->st || tri_idx < 0 ||
+        static_cast<size_t>(tri_idx) >= ps->st->tris.size()) return -1;
+    return ps->st->tris[static_cast<size_t>(tri_idx)].mat_idx;
+}
+
+int ray_pipeline_drain_refined(RayPipelineState* ps,
+                                std::vector<RefinedHit>& out,
+                                int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_refined.drain(out, max_n);
+}
+
+void ray_pipeline_set_shuffle(RayPipelineState* ps, float shuffle_frac)
+{
+    if (!ps) return;
+    ps->cfg.intent_queue_shuffle = std::max(0.0f, std::min(1.0f, shuffle_frac));
+}
+
+void ray_pipeline_configure_sensor_image(
+    RayPipelineState* ps,
+    float plate_x, float plate_r,
+    int   res,
+    float bdpt_eps)
+{
+    if (!ps) return;
+    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+    ps->sensor_res = res;
+    ps->sensor_px  = plate_x;
+    ps->sensor_pr  = (plate_r > 0.0f) ? plate_r : 0.16f;
+    ps->sensor_eps = (bdpt_eps > 0.0f) ? bdpt_eps : 0.008f;
+    /* 4 channels: ch0=forward hits, ch1=backward emissive, ch2=exact BDPT, ch3=near-miss */
+    ps->sensor_accum.assign(static_cast<size_t>(res) * res * 4, 0.0);
+    ps->priority_map.assign(static_cast<size_t>(res) * res, 1.0f);
+    /* Reset running peaks so the new accumulator starts fresh. */
+    for (int _c = 0; _c < 4; ++_c) ps->sensor_peak[_c] = 1e-30;
+}
+
+void ray_pipeline_get_sensor_image(
+    const RayPipelineState* ps,
+    float* buf,
+    int*   out_res)
+{
+    if (out_res) *out_res = 0;
+    if (!ps || ps->sensor_res <= 0) return;
+    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+    const int res = ps->sensor_res;
+    if (out_res) *out_res = res;
+    if (!buf) return;
+    const size_t pix = static_cast<size_t>(res) * res;
+    /* Update the running per-channel peaks — they only ever grow so that
+     * accumulated data never dims as new brighter pixels are added. */
+    for (int c = 0; c < 4; ++c)
+        for (size_t i = 0; i < pix; ++i)
+            ps->sensor_peak[c] = std::max(ps->sensor_peak[c], ps->sensor_accum[c * pix + i]);
+    const double* peak = ps->sensor_peak;
+    const double inv_log10 = 1.0 / std::log(10.0);
+    auto tone = [&](double v, double pk) -> float {
+        double n = v / pk;
+        return static_cast<float>(std::log1p(n * 9.0) * inv_log10);
+    };
+    /* Output layout: (res, res, 3) RGB.
+     *   R = ch0  (forward plate hits)
+     *   G = ch1 + ch3  (backward emissive + provisional near-miss),
+     *         with ch3 attenuated where ch2 (exact) is strong
+     *   B = ch2 (exact BDPT snap) */
+    for (int y = 0; y < res; ++y) {
+        for (int z = 0; z < res; ++z) {
+            const size_t px = static_cast<size_t>(y * res + z);
+            const float ch2_n = tone(ps->sensor_accum[2 * pix + px], peak[2]);
+            const float attn  = 1.0f - std::min(1.0f, ch2_n);  /* provisional fades as exact grows */
+            buf[px * 3 + 0] = tone(ps->sensor_accum[0 * pix + px], peak[0]);  /* R */
+            buf[px * 3 + 1] = std::min(1.0f,
+                tone(ps->sensor_accum[1 * pix + px], peak[1]) +
+                attn * tone(ps->sensor_accum[3 * pix + px], peak[3]));         /* G */
+            buf[px * 3 + 2] = ch2_n;                                           /* B */
+        }
+    }
+}
+
+void ray_pipeline_get_priority_map(
+    const RayPipelineState* ps,
+    float* buf,
+    int*   out_res)
+{
+    if (out_res) *out_res = 0;
+    if (!ps || ps->sensor_res <= 0) return;
+    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+    const int res = ps->sensor_res;
+    if (out_res) *out_res = res;
+    if (!buf || ps->priority_map.empty()) return;
+    std::copy(ps->priority_map.begin(), ps->priority_map.end(), buf);
+}
+
+void ray_pipeline_get_bdpt_stats(
+    const RayPipelineState* ps,
+    float* out_nearest_dist_m,
+    float* out_best_collinearity,
+    uint64_t* out_exact_snaps,
+    uint64_t* out_near_miss_count)
+{
+    if (!ps) {
+        if (out_nearest_dist_m)    *out_nearest_dist_m    = -1.0f;
+        if (out_best_collinearity) *out_best_collinearity = 0.0f;
+        if (out_exact_snaps)       *out_exact_snaps       = 0;
+        if (out_near_miss_count)   *out_near_miss_count   = 0;
+        return;
+    }
+    if (out_nearest_dist_m) {
+        uint64_t bits = ps->bdpt_nearest_d2_bits.load(std::memory_order_relaxed);
+        if (bits == 0xFFFFFFFFFFFFFFFFULL) {
+            *out_nearest_dist_m = -1.0f;
+        } else {
+            uint32_t b32 = static_cast<uint32_t>(bits & 0xFFFFFFFFULL);
+            float d2; std::memcpy(&d2, &b32, sizeof(float));
+            *out_nearest_dist_m = std::sqrt(std::max(0.0f, d2));
+        }
+    }
+    if (out_best_collinearity) {
+        uint64_t bits = ps->bdpt_best_colinear_bits.load(std::memory_order_relaxed);
+        uint32_t b32 = static_cast<uint32_t>(bits & 0xFFFFFFFFULL);
+        std::memcpy(out_best_collinearity, &b32, sizeof(float));
+    }
+    if (out_exact_snaps)     *out_exact_snaps     = ps->bdpt_exact_snaps.load(std::memory_order_relaxed);
+    if (out_near_miss_count) *out_near_miss_count = ps->bdpt_near_miss_count.load(std::memory_order_relaxed);
+}
+
+/* ── Synchronous compatibility wrapper ───────────────────────────────────── */
+/* Callers that need blocking semantics: submit, poll until done, drain.
+ * Uses a temporary pipeline so it does not interfere with a persistent one. */
+int ray_pipeline_trace_sync(
+    RayTracerState*          st,
+    const RayPipelineConfig* cfg,
+    const RayIntent*         intents,
+    int                      n_intents,
+    std::vector<RayRecord>&  out)
+{
+    if (!st || !intents || n_intents <= 0) return SK_ERR_NULL_STATE;
+    RayPipelineState* ps = ray_pipeline_create(st, cfg);
+    if (!ps) return SK_ERR_NULL_STATE;
+    ray_pipeline_submit(ps, intents, n_intents);
+    while (ray_pipeline_in_flight(ps) > 0)
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    ray_pipeline_drain(ps, out, n_intents * 256);
+    ray_pipeline_destroy(ps);
+    return SK_OK;
 }
 

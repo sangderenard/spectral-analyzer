@@ -107,6 +107,7 @@ SK_API int   field_grid_n_bands  (const FieldGrid* g);
 SK_API int64_t field_grid_n_cells_total(const FieldGrid* g);
 SK_API const float* field_grid_bmin(const FieldGrid* g);
 SK_API const float* field_grid_bmax(const FieldGrid* g);
+SK_API int field_grid_regular_dims(const FieldGrid* g, int* out_nx, int* out_ny, int* out_nz);
 
 /**
  * Raw data pointer — std::complex<float> *, length field_grid_n_cells_total

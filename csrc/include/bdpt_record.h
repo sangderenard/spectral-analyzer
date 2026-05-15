@@ -61,6 +61,20 @@ typedef struct {
     float    _pad;            /* keep 16-byte alignment */
 } EndpointRecord;
 
+/* Ray segment for diagnostic visualization — records each bounce point. */
+typedef struct {
+    float    p0[3];           /* ray origin (m) */
+    float    p1[3];           /* ray endpoint / hit point (m) */
+    float    amp_mag;         /* amplitude magnitude at this segment */
+    float    mat_idx;         /* material hit (or -1 if no hit) */
+    int32_t  bounce_index;    /* 0 = first segment, etc */
+    int32_t  pixel_id;        /* which sensor pixel launched this ray */
+} RayPathSegment;
+
+#ifdef __cplusplus
+static_assert(sizeof(RayPathSegment) == 40, "RayPathSegment layout broken");
+#endif
+
 /* Sanity sizes (must match the docs above). */
 #ifdef __cplusplus
 static_assert(sizeof(PathVertex)     == 80, "PathVertex layout broken");

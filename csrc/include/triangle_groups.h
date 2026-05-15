@@ -67,6 +67,37 @@ extern "C" {
 #define TRI_PARAM_SURFACE_SDF_SADDLE  2
 #define TRI_PARAM_SURFACE_SDF_SPHERE  3
 
+/* Camera operating modes for CameraSensorDesc.camera_mode.
+ *
+ * PINHOLE             — one ray per pixel through lens/aperture centre; no disk.
+ * APERTURE_CONE       — stochastic disk samples; no lens bending (default).
+ * THIN_LENS_GEOMETRIC — focus-plane ray generation: all aperture samples for a
+ *                       pixel converge to a single world point on the focus plane.
+ */
+/* Tier 0 — oracle pinhole reference: 1 ray per pixel, deterministic, clean supervision */
+#define CAMERA_MODE_ORACLE_PINHOLE_REFERENCE 0
+
+/* Tier 1 — physical pinhole: tiny aperture, photon-limited, noise-dominated */
+#define CAMERA_MODE_PHYSICAL_PINHOLE 1
+
+/* Tier 2 — aperture cone: disk samples, no lens bending (default for simple scenes) */
+#define CAMERA_MODE_APERTURE_CONE 2
+
+/* Tier 3 — ideal thin-lens geometric: focus-plane convergence via thin lens */
+#define CAMERA_MODE_THIN_LENS_GEOMETRIC 3
+
+/* Tier 4 — element-by-element geometric assembly: real optical surface chain (STUB) */
+#define CAMERA_MODE_GEOMETRIC_ASSEMBLY 4
+
+/* Tier 5 — wave-patch transport: diffraction, interference, finite-element waves (STUB) */
+#define CAMERA_MODE_WAVE_ASSEMBLY 5
+
+/* Tier 6 — baked transform function: accelerated LUT/spline/neural transport map (STUB) */
+#define CAMERA_MODE_BAKED_TRANSFORM 6
+
+/* Legacy alias for API compatibility during transition (will be removed) */
+#define CAMERA_MODE_THICK_LENS_WAVE 5
+
 /**
  * Camera sensor descriptor (used when sample_policy == PIXEL_CONE).
  *
@@ -89,6 +120,14 @@ extern "C" {
  *   sensor_origin + (px+0.5)/n_px * sensor_w * right
  *                 + (py+0.5)/n_py * sensor_h * up
  * with sensor_origin = pos - 0.5*sensor_w*right - 0.5*sensor_h*up.
+ *
+ * Thin-lens mode (camera_mode == CAMERA_MODE_THIN_LENS_GEOMETRIC):
+ *   effective_focal_m  — effective focal length f (lens formula: 1/f = 1/si + 1/so).
+ *                        0 = fall back to focal_m (image-side distance).
+ *   focus_distance_m   — scene focus distance so from the lens centre.
+ *                        0 = auto-compute as so = f*si / (si - f).
+ *   lens_center[3]     — lens plane centre in world space; zeros = aperture_centre.
+ *   lens_fwd[3]        — fixed lens optical axis (unit vector); zeros = camera fwd.
  */
 typedef struct {
     double pos[3];                  /* camera nodal/sensor centre (m)       */
@@ -96,7 +135,7 @@ typedef struct {
     double up[3];                   /* unit up (image-y axis)               */
     double sensor_w_m;              /* physical sensor width  (m)           */
     double sensor_h_m;              /* physical sensor height (m)           */
-    double focal_m;                 /* nominal focus distance (m)           */
+    double focal_m;                 /* image-side dist sensor→aperture (m)  */
     double aperture_radius_m;       /* fallback disk radius if no stop grp  */
     int    n_px;                    /* horizontal pixel count               */
     int    n_py;                    /* vertical   pixel count               */
@@ -105,6 +144,13 @@ typedef struct {
     int    pixel_stream_divisor;    /* process every Nth pixel (>=1)        */
     int    pixel_stream_phase;      /* stream phase offset [0, N)           */
     int    pixel_stream_phase_from_seed; /* 1: derive phase from batch seed */
+    /* ── Optical mode extensions (additive; zero-init = APERTURE_CONE) ── */
+    int    camera_mode;             /* CAMERA_MODE_*                        */
+    double effective_focal_m;       /* effective focal length; 0 = focal_m  */
+    double focus_distance_m;        /* scene focus dist from lens; 0 = auto */
+    double lens_center[3];          /* lens plane centre; zeros = ap_centre */
+    double lens_fwd[3];             /* fixed lens axis; zeros = cam fwd     */
+    int    use_optical_handlers;    /* 1: run st->optical_assembly per ray  */
 } CameraSensorDesc;
 
 /**

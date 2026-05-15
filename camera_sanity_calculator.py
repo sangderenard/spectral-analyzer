@@ -91,6 +91,7 @@ class CameraSanityReport:
     error_degree: "CameraErrorDegree"
     warnings: List[str] = field(default_factory=list)
     failures: List[str] = field(default_factory=list)
+    geometry_ok: bool = True
 
 
 @dataclass(frozen=True)
@@ -300,4 +301,8 @@ def evaluate_camera_sanity(cfg: CameraSanityInput) -> CameraSanityReport:
         error_degree=err,
         warnings=warnings,
         failures=failures,
+        geometry_ok=not any(
+            f for f in failures
+            if "blur" not in f.lower() and "exposure mismatch" not in f.lower()
+        ),
     )

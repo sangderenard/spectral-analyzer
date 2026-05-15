@@ -41,6 +41,7 @@
 #pragma once
 #include "serial_kernel.h"  /* SK_API, SK_OK, SK_ERR_* */
 #include "bdpt_record.h"
+#include "optical_handlers.h"  /* OpticalAssembly for attach API */
 
 #include <stdint.h>
 
@@ -250,6 +251,18 @@ SK_API RayTracerState* ray_tracer_create(
 
 /** Free tracer state.  Safe to call with NULL. */
 SK_API void ray_tracer_destroy(RayTracerState* st);
+
+/**
+ * Attach (or detach) an OpticalAssembly to the tracer for PIXEL_CONE dispatch.
+ *
+ * The assembly is NOT owned by the tracer; the caller must ensure it remains
+ * valid until the tracer is destroyed or the assembly is detached (pass NULL
+ * to detach).  The assembly is invoked per-ray per-band when the registered
+ * SENSOR group's CameraSensorDesc.use_optical_handlers is non-zero.
+ */
+SK_API void ray_tracer_attach_optical_assembly(
+    RayTracerState*  st,
+    OpticalAssembly* assembly);
 
 /**
  * Return an ASCII table describing RayTracer-owned allocations.
@@ -739,9 +752,13 @@ typedef struct SensorFilmSlotSummary {
  */
 typedef struct EndpointReductionTelemetry {
     int32_t input_records;
+    int32_t sensor_group_records;
     int32_t kept_records;
+    int32_t kept_pixel_cone_records;
+    int32_t kept_projected_records;
     int32_t drop_wrong_group;
     int32_t drop_non_pixel_cone;     /* vertex_index < 0: forward/emission record */
+    int32_t drop_projection_failed;
     int32_t drop_invalid_band;
     int32_t drop_negative_subpath;
     int32_t drop_out_of_bounds_pixel;
@@ -937,17 +954,17 @@ SK_API int ray_tracer_trace_multiscale_surface(
 
 /* ── Triangle surface flags ────────────────────────────────────────────── */
 
-/* Phase 2 unification: triangle flags use the unified MAT_FLAG_* set defined
- * in mat_flags.py and emitted into mat_flags_generated.h.  Callers should use
- * MAT_FLAG_TRANSMISSIVE / MAT_FLAG_APERTURE_STOP / etc. directly. */
+/* Triangle flags are only for non-material semantic roles such as aperture
+ * stops or picking-only surfaces.  Optical transmission/refraction comes from
+ * the material MatBuf record, not from a triangle flag. */
 #include "../kernels/mat_flags_generated.h"
 
 /**
  * Set the surface flags for a range of triangles.
  *
- * Phase 2 cutover: per-triangle IOR/refl now live in the MatBuf addressed by
- * tri.mat_idx (set at create time).  This entry point only adjusts the
- * MAT_FLAG_* bitmask (TRANSMISSIVE, APERTURE_STOP, …).
+ * Per-triangle optical physics (refl, IOR, diffusion, transmittance) lives in
+ * the MatBuf addressed by tri.mat_idx.  This entry point only adjusts semantic
+ * flags such as MAT_FLAG_APERTURE_STOP.
  *
  * @param flags  bitwise OR of MAT_FLAG_* constants.
  */
@@ -956,6 +973,25 @@ SK_API int ray_tracer_set_tri_ior(
     int             tri_start,
     int             n_tris,
     int             flags
+);
+
+/**
+ * Set directional boundary media for a range of triangles.
+ *
+ * Each triangle stores two media, one per side of its geometric normal:
+ *   medium_pos_mat_idx : medium on +normal side
+ *   medium_neg_mat_idx : medium on -normal side
+ * Use -1 for ambient air/vacuum.
+ *
+ * Refraction transitions then use side crossing direction directly:
+ * front-face hit crosses +normal -> -normal, back-face does the reverse.
+ */
+SK_API int ray_tracer_set_tri_boundary_media(
+    RayTracerState* st,
+    int             tri_start,
+    int             n_tris,
+    int             medium_pos_mat_idx,
+    int             medium_neg_mat_idx
 );
 
 /**
@@ -1268,6 +1304,25 @@ SK_API int ray_tracer_bidirectional_packed(
     EndpointRecord* out_records,
     int             out_cap,
     int*            out_count);
+
+/**
+ * Deposit EndpointRecord amplitudes into the bound field-capture grid.
+ *
+ * This wires BDPT endpoint transport into volumetric field capture so sensor
+ * visibility and volume activation share the same backend accumulation path.
+ *
+ * include_sensor_group and include_non_sensor_groups control which records are
+ * injected relative to sensor_group_id.
+ */
+SK_API int ray_tracer_accumulate_endpoint_records_to_field_capture(
+    RayTracerState*      st,
+    const EndpointRecord* records,
+    int                  n_records,
+    int                  sensor_group_id,
+    int                  include_sensor_group,
+    int                  include_non_sensor_groups,
+    int*                 out_written_records,
+    double*              out_written_power);
 
 #ifdef __cplusplus
 } /* extern "C" */

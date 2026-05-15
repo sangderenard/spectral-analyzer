@@ -242,7 +242,9 @@ def plan_ray_budget(
 
     # ── Total rays demanded by the author-side density knob ───────────────
     spp = max(0.0, float(sensor_spp))
-    rays_per_pix = max(1.0, float(rays_per_pixel_per_second) * spp)
+    # Allow sub-1 ray/pixel budgets so callers can request low total-ray
+    # quick previews (e.g., 100k rays on a multi-megapixel sensor).
+    rays_per_pix = max(0.0, float(rays_per_pixel_per_second) * spp)
     total_rays = int(round(rays_per_pix * n_pix))
     total_rays = max(total_rays, 1)
 

@@ -26,12 +26,19 @@
 #include "tile_overlap.h"
 #include "player_clip.h"
 #include "surface_spline.h"
+#include "optical_handlers.h"
+#include "exposure_backend.h"
+#include "ray_pipeline.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
+#include <pybind11/complex.h>
 #include <cstdint>
+#include <algorithm>
+#include <mutex>
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -456,15 +463,64 @@ struct PyPicardSCC
 
 /* ── RayTracer wrapper ───────────────────────────────────────────────────── */
 
+/* Declared in ray_tracer.cpp — not in the public header, called here only. */
+extern int ray_pipeline_trace_sync(
+    RayTracerState*          st,
+    const RayPipelineConfig* cfg,
+    const RayIntent*         intents,
+    int                      n_intents,
+    std::vector<RayRecord>&  out);
+
 struct PyRayTracer
 {
-    RayTracerState* handle  = nullptr;
-    int             _n_bands = 0;
-    int             _n_tris  = 0;
-    int             _camera_vis_mode = RT_CAM_VIS_AS_IS;
-    int             _transparent_mode = RT_CAM_TRANSPARENCY_BLOCK;
-    bool            _depth_cull_enabled = false;
-    double          _depth_cull_m = 0.0;
+    RayTracerState*   handle   = nullptr;
+    int               _n_bands = 0;
+    int               _n_tris  = 0;
+    std::vector<double> _freq_hz;
+    int               _camera_vis_mode    = RT_CAM_VIS_AS_IS;
+    int               _transparent_mode   = RT_CAM_TRANSPARENCY_BLOCK;
+    bool              _depth_cull_enabled  = false;
+    double            _depth_cull_m        = 0.0;
+
+    /* Persistent pipeline — created on first submit_rays(), destroyed with tracer. */
+    RayPipelineState* _pipeline   = nullptr;
+    std::mutex        _pipeline_mu;
+    double            _default_min_amplitude = 1e-6;  /* raised before first create */
+    int               _max_intent_queue      = 0;     /* 0 = unbounded             */
+
+    /* Sensor image parameters — cached so configure_sensor_image() can be
+     * called before the pipeline is created (lazy init on first submit_rays). */
+    float _sensor_plate_x   = 0.0f;
+    float _sensor_plate_r   = 0.0f;
+    int   _sensor_res       = 0;
+    float _sensor_bdpt_eps  = 0.008f;
+
+    /* GPU compute config — stored before pipeline creation so first submit_rays
+     * can enable the GPU backend.  Ignored after the pipeline is created. */
+    bool        _use_gpu_compute = false;
+    std::string _shader_dir;
+
+    RayPipelineState* _get_pipeline(int max_children = 2, int seed = 42) {
+        std::lock_guard<std::mutex> lk(_pipeline_mu);
+        if (!_pipeline) {
+            RayPipelineConfig cfg;
+            cfg.max_children     = max_children;
+            cfg.seed             = seed;
+            cfg.min_amplitude    = _default_min_amplitude;
+            cfg.max_intent_queue = _max_intent_queue;
+            cfg.use_gpu_compute  = _use_gpu_compute;
+            cfg.shader_dir       = _shader_dir;
+            _pipeline = ray_pipeline_create(handle, &cfg);
+            if (!_pipeline)
+                throw std::runtime_error("ray_pipeline_create failed");
+            /* Apply sensor image config that may have been set before pipeline existed. */
+            if (_sensor_res > 0)
+                ray_pipeline_configure_sensor_image(
+                    _pipeline, _sensor_plate_x, _sensor_plate_r,
+                    _sensor_res, _sensor_bdpt_eps);
+        }
+        return _pipeline;
+    }
 
     PyRayTracer(int                     n_tri,
                 py::array_t<double>     verts,
@@ -485,6 +541,8 @@ struct PyRayTracer
 
         _n_bands = static_cast<int>(ifh.size);
         _n_tris  = n_tri;
+        _freq_hz.assign(static_cast<const double*>(ifh.ptr),
+                static_cast<const double*>(ifh.ptr) + _n_bands);
 
         handle = ray_tracer_create(
             n_tri,
@@ -502,7 +560,510 @@ struct PyRayTracer
             throw std::runtime_error("ray_tracer_create: allocation failed");
     }
 
-    ~PyRayTracer() { ray_tracer_destroy(handle); handle = nullptr; }
+    ~PyRayTracer() {
+        if (_pipeline) { ray_pipeline_destroy(_pipeline); _pipeline = nullptr; }
+        ray_tracer_destroy(handle); handle = nullptr;
+    }
+
+    py::dict build_frequency_sidecar(
+        py::array_t<float> segs_arr,
+        int band_col = 8) const
+    {
+        auto s = segs_arr.request();
+        if (s.ndim != 2)
+            throw std::invalid_argument("segs must be shape (N, M)");
+        const int n_rows = static_cast<int>(s.shape[0]);
+        const int n_cols = static_cast<int>(s.shape[1]);
+        if (band_col < 0 || band_col >= n_cols)
+            throw std::invalid_argument("band_col is out of range for segs columns");
+
+        py::array_t<int32_t> band_id({n_rows});
+        py::array_t<double>  frequency_hz({n_rows});
+        py::array_t<double>  wavelength_nm({n_rows});
+
+        const float* src = static_cast<const float*>(s.ptr);
+        int32_t* out_band = band_id.mutable_data();
+        double* out_f = frequency_hz.mutable_data();
+        double* out_wl = wavelength_nm.mutable_data();
+
+        for (int i = 0; i < n_rows; ++i) {
+            const float raw_b = src[static_cast<size_t>(i) * static_cast<size_t>(n_cols) + static_cast<size_t>(band_col)];
+            int b = static_cast<int>(std::llround(static_cast<double>(raw_b)));
+            if (b < 0 || b >= _n_bands) b = -1;
+            out_band[i] = static_cast<int32_t>(b);
+            if (b >= 0) {
+                const double f = _freq_hz[static_cast<size_t>(b)];
+                out_f[i] = f;
+                out_wl[i] = (f > 0.0) ? (299792458.0 / f) * 1.0e9 : 0.0;
+            } else {
+                out_f[i] = 0.0;
+                out_wl[i] = 0.0;
+            }
+        }
+
+        py::dict out;
+        out["band_id"] = band_id;
+        out["frequency_hz"] = frequency_hz;
+        out["wavelength_nm"] = wavelength_nm;
+        return out;
+    }
+
+    py::dict spectral_bands_to_rgb(
+        py::array_t<float, py::array::c_style | py::array::forcecast> image_bhw,
+        double gain = 1.0,
+        double hdr_white_percentile = 99.8) const
+    {
+        auto ib = image_bhw.request();
+        if (ib.ndim != 3)
+            throw std::invalid_argument("image_bhw must be shape (n_bands, H, W)");
+        const int n_bands = static_cast<int>(ib.shape[0]);
+        const int H = static_cast<int>(ib.shape[1]);
+        const int W = static_cast<int>(ib.shape[2]);
+        if (n_bands != _n_bands)
+            throw std::invalid_argument("image_bhw first dimension must match tracer n_bands");
+
+        py::array::ShapeContainer shape = {
+            static_cast<py::ssize_t>(H),
+            static_cast<py::ssize_t>(W),
+            static_cast<py::ssize_t>(3)
+        };
+        py::array_t<float> rgb_linear(shape);
+        py::array_t<float> rgb_tonemapped(shape);
+
+        const float* src = static_cast<const float*>(ib.ptr);
+        const size_t pix_count = static_cast<size_t>(H) * static_cast<size_t>(W);
+        const double gain_sq = gain * gain;
+
+        auto wavelength_nm = [](double freq_hz) -> double {
+            return (freq_hz > 0.0) ? (299792458.0 / freq_hz) * 1.0e9 : 0.0;
+        };
+        auto wavelength_to_rgb = [](double wl, double& r, double& g, double& b) {
+            r = 0.0;
+            g = 0.0;
+            b = 0.0;
+            if (wl >= 380.0 && wl < 440.0) {
+                r = -(wl - 440.0) / (440.0 - 380.0);
+                b = 1.0;
+            } else if (wl < 490.0) {
+                g = (wl - 440.0) / (490.0 - 440.0);
+                b = 1.0;
+            } else if (wl < 510.0) {
+                g = 1.0;
+                b = -(wl - 510.0) / (510.0 - 490.0);
+            } else if (wl < 580.0) {
+                r = (wl - 510.0) / (580.0 - 510.0);
+                g = 1.0;
+            } else if (wl < 645.0) {
+                r = 1.0;
+                g = -(wl - 645.0) / (645.0 - 580.0);
+            } else if (wl <= 700.0) {
+                r = 1.0;
+            }
+            double edge = 1.0;
+            if (wl >= 380.0 && wl < 420.0)
+                edge = 0.3 + 0.7 * (wl - 380.0) / (420.0 - 380.0);
+            else if (wl > 645.0 && wl <= 700.0)
+                edge = 0.3 + 0.7 * (700.0 - wl) / (700.0 - 645.0);
+            r *= edge;
+            g *= edge;
+            b *= edge;
+        };
+
+        std::vector<double> wr(static_cast<size_t>(_n_bands), 0.0);
+        std::vector<double> wg(static_cast<size_t>(_n_bands), 0.0);
+        std::vector<double> wb(static_cast<size_t>(_n_bands), 0.0);
+        for (int b = 0; b < _n_bands; ++b) {
+            const double wl = wavelength_nm(_freq_hz[static_cast<size_t>(b)]);
+            wavelength_to_rgb(
+                std::min(700.0, std::max(380.0, wl)),
+                wr[static_cast<size_t>(b)],
+                wg[static_cast<size_t>(b)],
+                wb[static_cast<size_t>(b)]);
+        }
+
+        float* out_lin = rgb_linear.mutable_data();
+        double white = 0.0;
+        for (size_t pix = 0; pix < pix_count; ++pix) {
+            double r = 0.0;
+            double g = 0.0;
+            double b = 0.0;
+            for (int band = 0; band < _n_bands; ++band) {
+                const size_t idx = static_cast<size_t>(band) * pix_count + pix;
+                const double p = std::max(0.0, static_cast<double>(src[idx])) * gain_sq;
+                r += p * wr[static_cast<size_t>(band)];
+                g += p * wg[static_cast<size_t>(band)];
+                b += p * wb[static_cast<size_t>(band)];
+            }
+            const size_t base = pix * 3u;
+            out_lin[base + 0] = static_cast<float>(r);
+            out_lin[base + 1] = static_cast<float>(g);
+            out_lin[base + 2] = static_cast<float>(b);
+            white = std::max(white, std::max(r, std::max(g, b)));
+        }
+
+        // Robust highlight control: derive a global white point from luminance
+        // percentile, then apply Reinhard in normalized space.  This prevents
+        // large hot regions from washing out the entire frame.
+        std::vector<double> lum;
+        lum.resize(pix_count);
+        double min_positive_lum = std::numeric_limits<double>::infinity();
+        double max_lum = 0.0;
+        for (size_t pix = 0; pix < pix_count; ++pix) {
+            const size_t base = pix * 3u;
+            const double r = std::max(0.0, static_cast<double>(out_lin[base + 0]));
+            const double g = std::max(0.0, static_cast<double>(out_lin[base + 1]));
+            const double b = std::max(0.0, static_cast<double>(out_lin[base + 2]));
+            lum[pix] = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            if (lum[pix] > 0.0) {
+                min_positive_lum = std::min(min_positive_lum, lum[pix]);
+                max_lum = std::max(max_lum, lum[pix]);
+            }
+        }
+        const double pct = std::min(100.0, std::max(0.0, hdr_white_percentile));
+        const size_t rank = static_cast<size_t>(std::llround((pct * 0.01) * static_cast<double>(pix_count - 1)));
+        std::nth_element(lum.begin(), lum.begin() + rank, lum.end());
+        double white_scale = std::max(lum[rank], max_lum);
+        if (!(white_scale > 0.0)) white_scale = 1.0;
+        if (!std::isfinite(min_positive_lum)) min_positive_lum = white_scale;
+        const double black_scale = std::max(1.0e-30, min_positive_lum);
+        white_scale = std::max(white_scale, black_scale * 1.000001);
+
+        const float* lin = rgb_linear.data();
+        float* out_tm = rgb_tonemapped.mutable_data();
+        const double log_denom = std::max(1.0e-12, std::log1p(white_scale / black_scale));
+        for (size_t pix = 0; pix < pix_count; ++pix) {
+            const size_t base = pix * 3u;
+            const double lum_pix = 0.2126 * std::max(0.0, static_cast<double>(lin[base + 0]))
+                                 + 0.7152 * std::max(0.0, static_cast<double>(lin[base + 1]))
+                                 + 0.0722 * std::max(0.0, static_cast<double>(lin[base + 2]));
+            if (!(lum_pix > 0.0)) {
+                out_tm[base + 0] = 0.0f;
+                out_tm[base + 1] = 0.0f;
+                out_tm[base + 2] = 0.0f;
+                continue;
+            }
+            const double y_raw = std::log1p(lum_pix / black_scale) / log_denom;
+            const double y = std::max(0.04, y_raw);
+            const double scale = std::min(1.0, std::max(0.0, y)) / std::max(lum_pix, 1.0e-30);
+            double rgb_tmp[3] = {0.0, 0.0, 0.0};
+            for (int c = 0; c < 3; ++c) {
+                const double x = std::max(0.0, static_cast<double>(lin[base + static_cast<size_t>(c)]));
+                double v = std::min(1.0, x * scale);
+                /* Mild post-curve regularization: rounded highlight shoulder
+                 * and slight saturation damping after the nonzero-visible map.
+                * This keeps tiny signals visible without letting hot bands
+                 * turn the preview into hard clipped neon blocks. */
+                v = v / (1.0 + 0.18 * v);
+                rgb_tmp[c] = std::min(1.0, std::max(0.0, v));
+            }
+            const double luma = 0.2126 * rgb_tmp[0] + 0.7152 * rgb_tmp[1] + 0.0722 * rgb_tmp[2];
+            for (int c = 0; c < 3; ++c) {
+                const double v = 0.90 * rgb_tmp[c] + 0.10 * luma;
+                out_tm[base + static_cast<size_t>(c)] = static_cast<float>(std::min(1.0, std::max(0.0, v)));
+            }
+        }
+
+        py::dict out;
+        out["rgb_linear"] = rgb_linear;
+        out["rgb_tonemapped"] = rgb_tonemapped;
+        return out;
+    }
+
+    py::dict rasterize_tri_flux_uv(
+        py::array_t<float, py::array::c_style | py::array::forcecast> tri_flux,
+        py::array_t<int, py::array::c_style | py::array::forcecast> tri_indices,
+        py::array_t<float, py::array::c_style | py::array::forcecast> tri_uv,
+        int atlas_h,
+        int atlas_w,
+        double gain = 1.0,
+        double hdr_white_percentile = 100.0) const
+    {
+        auto tf = tri_flux.request();
+        auto ti = tri_indices.request();
+        auto tu = tri_uv.request();
+        if (tf.ndim != 2 || static_cast<int>(tf.shape[0]) != _n_tris || static_cast<int>(tf.shape[1]) != _n_bands)
+            throw std::invalid_argument("tri_flux must be shape (n_tri, n_bands)");
+        if (ti.ndim != 1)
+            throw std::invalid_argument("tri_indices must be shape (n_selected,)");
+        if (tu.ndim != 3 || tu.shape[1] != 3 || tu.shape[2] != 2 || tu.shape[0] != ti.shape[0])
+            throw std::invalid_argument("tri_uv must be shape (n_selected, 3, 2)");
+        if (atlas_h <= 0 || atlas_w <= 0)
+            throw std::invalid_argument("atlas_h and atlas_w must be positive");
+
+        py::array_t<float> atlas({
+            static_cast<py::ssize_t>(_n_bands),
+            static_cast<py::ssize_t>(atlas_h),
+            static_cast<py::ssize_t>(atlas_w)
+        });
+        float* out = atlas.mutable_data();
+        std::fill(out, out + atlas.size(), 0.0f);
+
+        const float* flux = static_cast<const float*>(tf.ptr);
+        const int* indices = static_cast<const int*>(ti.ptr);
+        const float* uv = static_cast<const float*>(tu.ptr);
+        const int n_sel = static_cast<int>(ti.shape[0]);
+        const size_t pix_count = static_cast<size_t>(atlas_h) * static_cast<size_t>(atlas_w);
+
+        auto edge = [](double ax, double ay, double bx, double by, double px, double py) -> double {
+            return (px - ax) * (by - ay) - (py - ay) * (bx - ax);
+        };
+
+        for (int i = 0; i < n_sel; ++i) {
+            const int tri = indices[i];
+            if (tri < 0 || tri >= _n_tris) continue;
+            const size_t ubase = static_cast<size_t>(i) * 6u;
+            const double u0 = std::min(1.0, std::max(0.0, static_cast<double>(uv[ubase + 0u])));
+            const double v0 = std::min(1.0, std::max(0.0, static_cast<double>(uv[ubase + 1u])));
+            const double u1 = std::min(1.0, std::max(0.0, static_cast<double>(uv[ubase + 2u])));
+            const double v1 = std::min(1.0, std::max(0.0, static_cast<double>(uv[ubase + 3u])));
+            const double u2 = std::min(1.0, std::max(0.0, static_cast<double>(uv[ubase + 4u])));
+            const double v2 = std::min(1.0, std::max(0.0, static_cast<double>(uv[ubase + 5u])));
+
+            const double x0 = u0 * static_cast<double>(atlas_w - 1);
+            const double y0 = (1.0 - v0) * static_cast<double>(atlas_h - 1);
+            const double x1 = u1 * static_cast<double>(atlas_w - 1);
+            const double y1 = (1.0 - v1) * static_cast<double>(atlas_h - 1);
+            const double x2 = u2 * static_cast<double>(atlas_w - 1);
+            const double y2 = (1.0 - v2) * static_cast<double>(atlas_h - 1);
+
+            const double area2 = edge(x0, y0, x1, y1, x2, y2);
+            if (std::abs(area2) < 1.0e-9) continue;
+            const int xmin = std::max(0, static_cast<int>(std::floor(std::min({x0, x1, x2}))));
+            const int xmax = std::min(atlas_w - 1, static_cast<int>(std::ceil (std::max({x0, x1, x2}))));
+            const int ymin = std::max(0, static_cast<int>(std::floor(std::min({y0, y1, y2}))));
+            const int ymax = std::min(atlas_h - 1, static_cast<int>(std::ceil (std::max({y0, y1, y2}))));
+            const double inv_pixels = 1.0 / std::max(1.0, 0.5 * std::abs(area2));
+
+            for (int y = ymin; y <= ymax; ++y) {
+                const double py = static_cast<double>(y) + 0.5;
+                for (int x = xmin; x <= xmax; ++x) {
+                    const double px = static_cast<double>(x) + 0.5;
+                    const double w0 = edge(x1, y1, x2, y2, px, py);
+                    const double w1 = edge(x2, y2, x0, y0, px, py);
+                    const double w2 = edge(x0, y0, x1, y1, px, py);
+                    if ((area2 > 0.0 && (w0 < 0.0 || w1 < 0.0 || w2 < 0.0)) ||
+                        (area2 < 0.0 && (w0 > 0.0 || w1 > 0.0 || w2 > 0.0))) {
+                        continue;
+                    }
+                    const size_t pix = static_cast<size_t>(y) * static_cast<size_t>(atlas_w) + static_cast<size_t>(x);
+                    const size_t fbase = static_cast<size_t>(tri) * static_cast<size_t>(_n_bands);
+                    for (int b = 0; b < _n_bands; ++b) {
+                        out[static_cast<size_t>(b) * pix_count + pix] +=
+                            static_cast<float>(static_cast<double>(flux[fbase + static_cast<size_t>(b)]) * inv_pixels);
+                    }
+                }
+            }
+        }
+
+        py::dict rgb = spectral_bands_to_rgb(atlas, gain, hdr_white_percentile);
+        rgb["spectral_atlas"] = atlas;
+        return rgb;
+    }
+
+    py::tuple compose_lens_bench_views(
+        py::array_t<float, py::array::c_style | py::array::forcecast> tri_flux,
+        py::array_t<double, py::array::c_style | py::array::forcecast> tri_centroids,
+        int view_h,
+        int view_w,
+        double x_min,
+        double x_max,
+        double view_radius,
+        int field_nx,
+        int field_ny,
+        int field_nz,
+        double field_gain = 2.5,
+        double surface_gain = 1.0,
+        double hdr_white_percentile = 99.8) const
+    {
+        auto tf = tri_flux.request();
+        auto tc = tri_centroids.request();
+        if (tf.ndim != 2)
+            throw std::invalid_argument("tri_flux must be shape (n_tri, n_bands)");
+        if (tc.ndim != 2 || tc.shape[1] != 3)
+            throw std::invalid_argument("tri_centroids must be shape (n_tri, 3)");
+        if (tf.shape[0] != tc.shape[0])
+            throw std::invalid_argument("tri_flux and tri_centroids must have matching n_tri");
+        if (static_cast<int>(tf.shape[1]) != _n_bands)
+            throw std::invalid_argument("tri_flux second dimension must match tracer n_bands");
+        if (view_h <= 0 || view_w <= 0)
+            throw std::invalid_argument("view_h and view_w must be positive");
+        if (field_nx <= 0 || field_ny <= 0 || field_nz <= 0)
+            throw std::invalid_argument("field grid dimensions must be positive");
+
+        const int n_tri = static_cast<int>(tf.shape[0]);
+        const float* tri_flux_ptr = static_cast<const float*>(tf.ptr);
+        const double* tri_centroids_ptr = static_cast<const double*>(tc.ptr);
+
+        py::array_t<float> surf_top_bhw({
+            static_cast<py::ssize_t>(_n_bands),
+            static_cast<py::ssize_t>(view_h),
+            static_cast<py::ssize_t>(view_w)
+        });
+        py::array_t<float> surf_side_bhw({
+            static_cast<py::ssize_t>(_n_bands),
+            static_cast<py::ssize_t>(view_h),
+            static_cast<py::ssize_t>(view_w)
+        });
+        float* surf_top_ptr = surf_top_bhw.mutable_data();
+        float* surf_side_ptr = surf_side_bhw.mutable_data();
+        const size_t surf_count = static_cast<size_t>(_n_bands) * static_cast<size_t>(view_h) * static_cast<size_t>(view_w);
+        std::fill(surf_top_ptr, surf_top_ptr + surf_count, 0.0f);
+        std::fill(surf_side_ptr, surf_side_ptr + surf_count, 0.0f);
+
+        const double x_span = std::max(1.0e-12, x_max - x_min);
+        const double v_span = std::max(1.0e-12, 2.0 * view_radius);
+
+        std::vector<int> ix(static_cast<size_t>(n_tri));
+        std::vector<int> iy_top(static_cast<size_t>(n_tri));
+        std::vector<int> iy_side(static_cast<size_t>(n_tri));
+        for (int i = 0; i < n_tri; ++i) {
+            const size_t base = static_cast<size_t>(i) * 3u;
+            const double x = tri_centroids_ptr[base + 0u];
+            const double y = tri_centroids_ptr[base + 1u];
+            const double z = tri_centroids_ptr[base + 2u];
+
+            int px = static_cast<int>(std::llround(((x - x_min) / x_span) * static_cast<double>(view_w - 1)));
+            int py_top = static_cast<int>(std::llround((0.5 - (y / v_span)) * static_cast<double>(view_h - 1)));
+            int py_side = static_cast<int>(std::llround((0.5 - (z / v_span)) * static_cast<double>(view_h - 1)));
+
+            px = std::max(0, std::min(view_w - 1, px));
+            py_top = std::max(0, std::min(view_h - 1, py_top));
+            py_side = std::max(0, std::min(view_h - 1, py_side));
+
+            ix[static_cast<size_t>(i)] = px;
+            iy_top[static_cast<size_t>(i)] = py_top;
+            iy_side[static_cast<size_t>(i)] = py_side;
+        }
+
+        for (int b = 0; b < _n_bands; ++b) {
+            const size_t b_off_surf = static_cast<size_t>(b) * static_cast<size_t>(view_h) * static_cast<size_t>(view_w);
+            for (int i = 0; i < n_tri; ++i) {
+                const float v = tri_flux_ptr[static_cast<size_t>(i) * static_cast<size_t>(_n_bands) + static_cast<size_t>(b)];
+                const size_t idx_top = b_off_surf + static_cast<size_t>(iy_top[static_cast<size_t>(i)]) * static_cast<size_t>(view_w) + static_cast<size_t>(ix[static_cast<size_t>(i)]);
+                const size_t idx_side = b_off_surf + static_cast<size_t>(iy_side[static_cast<size_t>(i)]) * static_cast<size_t>(view_w) + static_cast<size_t>(ix[static_cast<size_t>(i)]);
+                surf_top_ptr[idx_top] += v;
+                surf_side_ptr[idx_side] += v;
+            }
+        }
+
+        py::array_t<float> grid_reim = get_field_capture_grid_reim();
+        auto gr = grid_reim.request();
+        if (gr.ndim != 3 || static_cast<int>(gr.shape[0]) != _n_bands || static_cast<int>(gr.shape[2]) != 2)
+            throw std::runtime_error("field capture grid has unexpected shape");
+        const size_t n_vox = static_cast<size_t>(field_nx) * static_cast<size_t>(field_ny) * static_cast<size_t>(field_nz);
+        if (static_cast<size_t>(gr.shape[1]) != n_vox)
+            throw std::runtime_error("field capture grid size does not match provided field_nx/ny/nz");
+        const float* grid_ptr = static_cast<const float*>(gr.ptr);
+
+        py::array_t<float> field_top_bhw({
+            static_cast<py::ssize_t>(_n_bands),
+            static_cast<py::ssize_t>(view_h),
+            static_cast<py::ssize_t>(view_w)
+        });
+        py::array_t<float> field_side_bhw({
+            static_cast<py::ssize_t>(_n_bands),
+            static_cast<py::ssize_t>(view_h),
+            static_cast<py::ssize_t>(view_w)
+        });
+        float* field_top_ptr = field_top_bhw.mutable_data();
+        float* field_side_ptr = field_side_bhw.mutable_data();
+        std::fill(field_top_ptr, field_top_ptr + surf_count, 0.0f);
+        std::fill(field_side_ptr, field_side_ptr + surf_count, 0.0f);
+
+        std::vector<int> gx(static_cast<size_t>(view_w), 0);
+        std::vector<int> gy(static_cast<size_t>(view_h), 0);
+        std::vector<int> gz(static_cast<size_t>(view_h), 0);
+        for (int x = 0; x < view_w; ++x) {
+            gx[static_cast<size_t>(x)] = (view_w > 1)
+                ? static_cast<int>(std::llround((static_cast<double>(x) * static_cast<double>(field_nx - 1)) / static_cast<double>(view_w - 1)))
+                : 0;
+        }
+        for (int y = 0; y < view_h; ++y) {
+            gy[static_cast<size_t>(y)] = (view_h > 1)
+                ? static_cast<int>(std::llround((static_cast<double>(y) * static_cast<double>(field_ny - 1)) / static_cast<double>(view_h - 1)))
+                : 0;
+            gz[static_cast<size_t>(y)] = (view_h > 1)
+                ? static_cast<int>(std::llround((static_cast<double>(y) * static_cast<double>(field_nz - 1)) / static_cast<double>(view_h - 1)))
+                : 0;
+        }
+
+        std::vector<float> top_raw(static_cast<size_t>(field_ny) * static_cast<size_t>(field_nx), 0.0f);
+        std::vector<float> side_raw(static_cast<size_t>(field_nz) * static_cast<size_t>(field_nx), 0.0f);
+
+        for (int b = 0; b < _n_bands; ++b) {
+            std::fill(top_raw.begin(), top_raw.end(), 0.0f);
+            std::fill(side_raw.begin(), side_raw.end(), 0.0f);
+
+            const size_t b_off_vox = static_cast<size_t>(b) * n_vox;
+            for (int x = 0; x < field_nx; ++x) {
+                for (int y = 0; y < field_ny; ++y) {
+                    float sum_top = 0.0f;
+                    for (int z = 0; z < field_nz; ++z) {
+                        const size_t v = (static_cast<size_t>(z) * static_cast<size_t>(field_ny) + static_cast<size_t>(y)) * static_cast<size_t>(field_nx) + static_cast<size_t>(x);
+                        const size_t reim_base = (b_off_vox + v) * 2u;
+                        const float re = grid_ptr[reim_base + 0u];
+                        const float im = grid_ptr[reim_base + 1u];
+                        const float amp = std::sqrt(std::max(0.0f, re * re + im * im));
+                        sum_top += amp;
+                        side_raw[static_cast<size_t>(z) * static_cast<size_t>(field_nx) + static_cast<size_t>(x)] += amp;
+                    }
+                    top_raw[static_cast<size_t>(y) * static_cast<size_t>(field_nx) + static_cast<size_t>(x)] = sum_top;
+                }
+            }
+
+            const size_t b_off_img = static_cast<size_t>(b) * static_cast<size_t>(view_h) * static_cast<size_t>(view_w);
+            for (int y = 0; y < view_h; ++y) {
+                const int sy = std::max(0, std::min(field_ny - 1, gy[static_cast<size_t>(y)]));
+                const int sz = std::max(0, std::min(field_nz - 1, gz[static_cast<size_t>(y)]));
+                for (int x = 0; x < view_w; ++x) {
+                    const int sx = std::max(0, std::min(field_nx - 1, gx[static_cast<size_t>(x)]));
+                    const size_t idx = b_off_img + static_cast<size_t>(y) * static_cast<size_t>(view_w) + static_cast<size_t>(x);
+                    field_top_ptr[idx] = top_raw[static_cast<size_t>(sy) * static_cast<size_t>(field_nx) + static_cast<size_t>(sx)];
+                    field_side_ptr[idx] = side_raw[static_cast<size_t>(sz) * static_cast<size_t>(field_nx) + static_cast<size_t>(sx)];
+                }
+            }
+        }
+
+        // surface_gain / field_gain are forwarded as pre-tonemap gain (gain_sq = gain*gain
+        // inside spectral_bands_to_rgb).  This lifts dim transmitted signals before Reinhard
+        // so they are proportionally visible rather than crushed by a global white point.
+        py::dict surf_top_rgb_d  = spectral_bands_to_rgb(surf_top_bhw,  surface_gain, hdr_white_percentile);
+        py::dict surf_side_rgb_d = spectral_bands_to_rgb(surf_side_bhw, surface_gain, hdr_white_percentile);
+        py::dict field_top_rgb_d  = spectral_bands_to_rgb(field_top_bhw,  field_gain, hdr_white_percentile);
+        py::dict field_side_rgb_d = spectral_bands_to_rgb(field_side_bhw, field_gain, hdr_white_percentile);
+
+        py::array_t<float> surf_top_rgb = surf_top_rgb_d["rgb_tonemapped"].cast<py::array_t<float>>();
+        py::array_t<float> surf_side_rgb = surf_side_rgb_d["rgb_tonemapped"].cast<py::array_t<float>>();
+        py::array_t<float> field_top_rgb = field_top_rgb_d["rgb_tonemapped"].cast<py::array_t<float>>();
+        py::array_t<float> field_side_rgb = field_side_rgb_d["rgb_tonemapped"].cast<py::array_t<float>>();
+
+        py::array_t<float> top_rgb({
+            static_cast<py::ssize_t>(view_h),
+            static_cast<py::ssize_t>(view_w),
+            static_cast<py::ssize_t>(3)
+        });
+        py::array_t<float> side_rgb({
+            static_cast<py::ssize_t>(view_h),
+            static_cast<py::ssize_t>(view_w),
+            static_cast<py::ssize_t>(3)
+        });
+
+        const float* surf_top_rgb_ptr = surf_top_rgb.data();
+        const float* surf_side_rgb_ptr = surf_side_rgb.data();
+        const float* field_top_rgb_ptr = field_top_rgb.data();
+        const float* field_side_rgb_ptr = field_side_rgb.data();
+        float* top_rgb_ptr = top_rgb.mutable_data();
+        float* side_rgb_ptr = side_rgb.mutable_data();
+        const size_t rgb_count = static_cast<size_t>(view_h) * static_cast<size_t>(view_w) * 3u;
+
+        // Gains are already baked into each tonemapped buffer; just add and clamp.
+        for (size_t i = 0; i < rgb_count; ++i) {
+            top_rgb_ptr[i]  = std::min(1.0f, surf_top_rgb_ptr[i]  + field_top_rgb_ptr[i]);
+            side_rgb_ptr[i] = std::min(1.0f, surf_side_rgb_ptr[i] + field_side_rgb_ptr[i]);
+        }
+
+        return py::make_tuple(top_rgb, side_rgb);
+    }
 
     py::str allocation_table() const
     {
@@ -570,6 +1131,31 @@ struct PyRayTracer
         /* Trim to actual count and reshape to (N, 12). */
         out.resize({static_cast<py::ssize_t>(n_written),
                     static_cast<py::ssize_t>(RT_FLOATS_PER_SEG)});
+        return out;
+    }
+
+    py::dict trace_with_frequency_sidecar(
+        py::array_t<double> src_pos,
+        py::array_t<double> src_dir,
+        py::array_t<double> src_directivity,
+        int     n_rays        = 256,
+        int     max_bounces   = 8,
+        double  min_amplitude = 0.005,
+        uint32_t seed         = 42,
+        int     out_cap       = -1)
+    {
+        py::array_t<float> segs = trace(
+            src_pos,
+            src_dir,
+            src_directivity,
+            n_rays,
+            max_bounces,
+            min_amplitude,
+            seed,
+            out_cap);
+        py::dict out;
+        out["segs"] = segs;
+        out["freq_sidecar"] = build_frequency_sidecar(segs, 8);
         return out;
     }
 
@@ -659,6 +1245,788 @@ struct PyRayTracer
         result["direct"]   = direct;
         result["indirect"] = indirect;
         return result;
+    }
+
+    py::dict trace_surface_with_frequency_sidecar(
+        py::array_t<double> src_pos,
+        py::array_t<double> src_dir,
+        py::array_t<double> src_directivity,
+        int      n_rays        = 256,
+        int      max_bounces   = 8,
+        double   min_amplitude = 0.005,
+        uint32_t seed          = 42,
+        int      out_cap       = -1)
+    {
+        py::dict result = trace_surface(
+            src_pos,
+            src_dir,
+            src_directivity,
+            n_rays,
+            max_bounces,
+            min_amplitude,
+            seed,
+            out_cap);
+        py::array_t<float> segs = result["segs"].cast<py::array_t<float>>();
+        result["freq_sidecar"] = build_frequency_sidecar(segs, 8);
+        return result;
+    }
+
+    /**
+     * trace_pipeline(origins, directions, amplitudes,
+     *                max_bounces, min_amplitude, seed, max_children)
+     *   -> dict with key:
+     *       'segs' : float32 (N_segs, 12)
+     *
+     * Runs the 4-stage threaded ray pipeline (T1 intersector, T2 refiner,
+     * T3 material, T4 wave solver).  origins and directions are float64 (N,3).
+     * amplitudes is complex128 (N, n_bands); if omitted, unit amplitude is used.
+     * src_ids is int32 (N,) tagging each ray's source; if omitted, 0 for all.
+     * tags is uint64 (N,) free slot carried through all stages; 0 if omitted.
+     *
+     * Segment layout is identical to trace_surface: 12 floats per segment.
+     *   [0..2]  seg_start   [3..5]  hit_pos   [6] src_id   [7] bounce
+     *   [8] freq_band   [9] |amplitude|   [10] phase   [11] path_at_seg_start
+     */
+    py::dict trace_pipeline(
+        py::array_t<double>  origins,
+        py::array_t<double>  directions,
+        py::object           amplitudes  = py::none(),
+        py::object           src_ids     = py::none(),
+        py::object           tags        = py::none(),
+        int                  max_bounces    = 8,
+        double               min_amplitude  = 1e-6,
+        int                  seed           = 42,
+        int                  max_children   = 2,
+        int                  out_cap        = 4'000'000)
+    {
+        auto io = origins   .request();
+        auto id = directions.request();
+        if (io.ndim != 2 || io.shape[1] != 3)
+            throw std::invalid_argument("origins must be (N,3)");
+        if (id.ndim != 2 || id.shape[1] != 3)
+            throw std::invalid_argument("directions must be (N,3)");
+        const int n_rays = static_cast<int>(io.shape[0]);
+        if (id.shape[0] != n_rays)
+            throw std::invalid_argument("origins and directions must have the same length");
+
+        /* Optional amplitude array (N, n_bands) complex128 */
+        py::array_t<std::complex<double>> amp_arr;
+        bool has_amp = !amplitudes.is_none();
+        if (has_amp) {
+            amp_arr = amplitudes.cast<py::array_t<std::complex<double>>>();
+            auto ia = amp_arr.request();
+            if (ia.ndim != 2 || ia.shape[0] != n_rays)
+                throw std::invalid_argument("amplitudes must be (N, n_bands) complex128");
+        }
+
+        /* Optional src_ids (N,) int32 */
+        py::array_t<int32_t> sid_arr;
+        bool has_sid = !src_ids.is_none();
+        if (has_sid) {
+            sid_arr = src_ids.cast<py::array_t<int32_t>>();
+            if (sid_arr.request().size != n_rays)
+                throw std::invalid_argument("src_ids must be length N");
+        }
+
+        /* Optional tags (N,) uint64 */
+        py::array_t<uint64_t> tag_arr;
+        bool has_tag = !tags.is_none();
+        if (has_tag) {
+            tag_arr = tags.cast<py::array_t<uint64_t>>();
+            if (tag_arr.request().size != n_rays)
+                throw std::invalid_argument("tags must be length N");
+        }
+
+        /* Build RayIntents */
+        const double* op  = static_cast<const double*>(io.ptr);
+        const double* dp  = static_cast<const double*>(id.ptr);
+        const std::complex<double>* ap = has_amp
+            ? static_cast<const std::complex<double>*>(amp_arr.request().ptr)
+            : nullptr;
+        const int32_t*  sp = has_sid
+            ? static_cast<const int32_t*>(sid_arr.request().ptr) : nullptr;
+        const uint64_t* tp = has_tag
+            ? static_cast<const uint64_t*>(tag_arr.request().ptr) : nullptr;
+        const int amp_bands = has_amp
+            ? static_cast<int>(amp_arr.request().shape[1]) : _n_bands;
+
+        std::vector<RayIntent> intents(n_rays);
+        for (int i = 0; i < n_rays; ++i) {
+            RayIntent& ri    = intents[i];
+            ri.pos           = Eigen::Vector3d(op[i*3+0], op[i*3+1], op[i*3+2]);
+            ri.dir           = Eigen::Vector3d(dp[i*3+0], dp[i*3+1], dp[i*3+2]).normalized();
+            ri.amp.resize(amp_bands);
+            if (ap) {
+                for (int b = 0; b < amp_bands; ++b)
+                    ri.amp[b] = ap[i*amp_bands + b];
+            } else {
+                ri.amp.setOnes();
+            }
+            ri.src_id        = sp ? sp[i] : i;
+            ri.tag           = tp ? tp[i] : 0u;
+            ri.bounces_left  = max_bounces;
+            ri.min_amplitude = min_amplitude;
+        }
+
+        /* Per-triangle irradiance buffers (|amp|² per hit, direct vs indirect). */
+        const int n_tris = _n_tris;
+        const int n_bands_buf = amp_bands;
+        py::array_t<float> direct(
+            {static_cast<py::ssize_t>(n_tris), static_cast<py::ssize_t>(n_bands_buf)});
+        py::array_t<float> indirect(
+            {static_cast<py::ssize_t>(n_tris), static_cast<py::ssize_t>(n_bands_buf)});
+        std::fill(direct  .mutable_data(), direct  .mutable_data() + direct  .size(), 0.0f);
+        std::fill(indirect.mutable_data(), indirect.mutable_data() + indirect.size(), 0.0f);
+        float* direct_p   = direct  .mutable_data();
+        float* indirect_p = indirect.mutable_data();
+
+        std::vector<float> seg_buf;
+        seg_buf.reserve(static_cast<size_t>(std::min(n_rays * 4, out_cap))
+                        * RT_FLOATS_PER_SEG);
+
+        /* Run synchronous trace via persistent-machine API.
+         * GIL released for the whole trace. */
+        std::vector<RayRecord> records;
+        records.reserve(static_cast<size_t>(std::min(n_rays * 8, out_cap)));
+        {
+            py::gil_scoped_release release;
+            RayPipelineConfig cfg;
+            cfg.max_children = max_children;
+            cfg.seed         = seed;
+            ray_pipeline_trace_sync(handle, &cfg, intents.data(), n_rays, records);
+        }
+
+        /* Pack RayRecord stream into irradiance buffers and seg_buf. */
+        for (const auto& rec : records) {
+            if (rec.kind != RayRecordKind::STRIKE) continue;
+            const int tri = rec.hit_tri;
+            if (tri >= 0 && tri < n_tris) {
+                float* flux = (rec.bounce == 0 ? direct_p : indirect_p)
+                              + static_cast<ptrdiff_t>(tri) * n_bands_buf;
+                for (int b = 0; b < rec.n_bands && b < n_bands_buf; ++b)
+                    flux[b] += rec.amp_re[b]*rec.amp_re[b] + rec.amp_im[b]*rec.amp_im[b];
+            }
+            if (static_cast<int>(seg_buf.size() / RT_FLOATS_PER_SEG) >= out_cap) continue;
+            for (int b = 0; b < rec.n_bands; ++b) {
+                float amp_abs = std::hypot(rec.amp_re[b], rec.amp_im[b]);
+                float amp_arg = std::atan2(rec.amp_im[b], rec.amp_re[b]);
+                seg_buf.push_back(rec.seg_start[0]);
+                seg_buf.push_back(rec.seg_start[1]);
+                seg_buf.push_back(rec.seg_start[2]);
+                seg_buf.push_back(rec.pos[0]);
+                seg_buf.push_back(rec.pos[1]);
+                seg_buf.push_back(rec.pos[2]);
+                seg_buf.push_back(static_cast<float>(rec.src_id));
+                seg_buf.push_back(static_cast<float>(rec.bounce));
+                seg_buf.push_back(static_cast<float>(b));
+                seg_buf.push_back(amp_abs);
+                seg_buf.push_back(amp_arg);
+                seg_buf.push_back(rec.path_at_seg_start);
+            }
+        }
+
+        const int n_segs = static_cast<int>(seg_buf.size()) / RT_FLOATS_PER_SEG;
+        py::array_t<float> segs({static_cast<py::ssize_t>(n_segs),
+                                  static_cast<py::ssize_t>(RT_FLOATS_PER_SEG)});
+        if (n_segs > 0)
+            std::memcpy(segs.mutable_data(), seg_buf.data(),
+                        seg_buf.size() * sizeof(float));
+
+        py::dict result;
+        result["segs"]     = segs;
+        result["direct"]   = direct;
+        result["indirect"] = indirect;
+        return result;
+    }
+
+    /* ── Persistent-machine async API ───────────────────────────────────── */
+
+    /*
+     * submit_rays(origins, directions, amplitudes, src_ids, tags,
+     *             max_bounces, min_amplitude, max_children, seed)
+     *
+     * Non-blocking: pushes ray intents into the persistent T1 input queue
+     * and returns immediately.  The pipeline chews them as fast as it can.
+     * Call drain_records() to collect output.
+     */
+    void submit_rays(
+        py::array_t<double>  origins,
+        py::array_t<double>  directions,
+        py::object           amplitudes    = py::none(),
+        py::object           src_ids       = py::none(),
+        py::object           tags          = py::none(),
+        py::object           color_flags   = py::none(),
+        int                  max_bounces   = 8,
+        double               min_amplitude = 1e-6,
+        int                  max_children  = 2,
+        int                  seed          = 42,
+        bool                 use_gpu_compute = false,
+        std::string          shader_dir      = "")
+    {
+        auto io = origins   .request();
+        auto id = directions.request();
+        if (io.ndim != 2 || io.shape[1] != 3)
+            throw std::invalid_argument("origins must be (N,3)");
+        if (id.ndim != 2 || id.shape[1] != 3)
+            throw std::invalid_argument("directions must be (N,3)");
+        const int n_rays = static_cast<int>(io.shape[0]);
+
+        py::array_t<std::complex<double>> amp_arr;
+        bool has_amp = !amplitudes.is_none();
+        if (has_amp) {
+            amp_arr = amplitudes.cast<py::array_t<std::complex<double>>>();
+            if (amp_arr.request().shape[0] != n_rays)
+                throw std::invalid_argument("amplitudes row count must match origins");
+        }
+        py::array_t<int32_t> sid_arr;
+        bool has_sid = !src_ids.is_none();
+        if (has_sid) {
+            sid_arr = src_ids.cast<py::array_t<int32_t>>();
+            if (sid_arr.request().size != n_rays)
+                throw std::invalid_argument("src_ids length must match origins");
+        }
+        py::array_t<uint64_t> tag_arr;
+        bool has_tag = !tags.is_none();
+        if (has_tag) {
+            tag_arr = tags.cast<py::array_t<uint64_t>>();
+            if (tag_arr.request().size != n_rays)
+                throw std::invalid_argument("tags length must match origins");
+        }
+        py::array_t<uint8_t> cflag_arr;
+        bool has_cflag = !color_flags.is_none();
+        if (has_cflag) {
+            cflag_arr = color_flags.cast<py::array_t<uint8_t>>();
+            if (cflag_arr.request().size != n_rays)
+                throw std::invalid_argument("color_flags length must match origins");
+        }
+
+        const double* op = static_cast<const double*>(io.ptr);
+        const double* dp = static_cast<const double*>(id.ptr);
+        const int amp_bands = has_amp
+            ? static_cast<int>(amp_arr.request().shape[1]) : _n_bands;
+        const std::complex<double>* ap = has_amp
+            ? static_cast<const std::complex<double>*>(amp_arr.request().ptr) : nullptr;
+        const int32_t*  sp = has_sid
+            ? static_cast<const int32_t*>(sid_arr.request().ptr) : nullptr;
+        const uint64_t* tp = has_tag
+            ? static_cast<const uint64_t*>(tag_arr.request().ptr) : nullptr;
+        const uint8_t*  cp = has_cflag
+            ? static_cast<const uint8_t*>(cflag_arr.request().ptr) : nullptr;
+
+        std::vector<RayIntent> intents(n_rays);
+        for (int i = 0; i < n_rays; ++i) {
+            RayIntent& ri    = intents[i];
+            ri.pos           = Eigen::Vector3d(op[i*3+0], op[i*3+1], op[i*3+2]);
+            ri.dir           = Eigen::Vector3d(dp[i*3+0], dp[i*3+1], dp[i*3+2]).normalized();
+            ri.amp.resize(amp_bands);
+            if (ap) {
+                for (int b = 0; b < amp_bands; ++b)
+                    ri.amp[b] = ap[i*amp_bands + b];
+            } else {
+                ri.amp.setOnes();
+            }
+            ri.src_id        = sp ? sp[i] : i;
+            ri.tag           = tp ? tp[i] : static_cast<uint64_t>(i);
+            ri.color_flag    = cp ? cp[i] : 0u;
+            ri.bounces_left  = max_bounces;
+            ri.min_amplitude = min_amplitude;
+            /* For backward (sensor-cast) rays, record the pixel origin so it
+             * can be used to splat the sensor image after any number of bounces. */
+            if (ri.color_flag == 1) {
+                ri.sensor_origin_y = static_cast<float>(op[i*3+1]);
+                ri.sensor_origin_z = static_cast<float>(op[i*3+2]);
+            }
+        }
+
+        /* Store GPU config before first pipeline creation (no-op if already created). */
+        {
+            std::lock_guard<std::mutex> lk(_pipeline_mu);
+            if (!_pipeline) {
+                _use_gpu_compute = use_gpu_compute;
+                if (!shader_dir.empty()) _shader_dir = shader_dir;
+            }
+        }
+        RayPipelineState* ps = _get_pipeline(max_children, seed);
+        {
+            py::gil_scoped_release release;
+            ray_pipeline_submit(ps, intents.data(), n_rays);
+        }
+    }
+
+    /*
+     * drain_records(max_n=50000)
+     *
+     * Non-blocking: pops up to max_n completed records from the output queue.
+     * Returns a dict of numpy arrays — empty arrays if nothing is ready.
+     *
+     * Array keys (all shape (N,) unless noted):
+     *   kind         uint8   0=STRIKE 1=TERMINAL 2=MISS 3=FIELD
+     *   tag          uint64
+     *   src_id       int32
+     *   bounce       int32
+     *   seg_start    float32 (N,3)  ray origin entering this segment
+     *   pos          float32 (N,3)  hit position or last position
+     *   dir          float32 (N,3)  incoming ray direction
+     *   normal       float32 (N,3)  surface normal (STRIKE)
+     *   path_len     float32
+     *   path_at_seg  float32
+     *   hit_tri      int32
+     *   mat_idx      int32
+     *   arena_id     int32   (FIELD)
+     *   is_sensor    bool
+     *   sensor_gid   int32
+     *   amp_re       float32 (N, n_bands)
+     *   amp_im       float32 (N, n_bands)
+     */
+    py::dict drain_records(int max_n = 50000)
+    {
+        const int nb = _n_bands;
+        std::vector<RayRecord> recs;
+
+        if (_pipeline) {
+            recs.reserve(std::min(max_n, 4096));
+            py::gil_scoped_release release;
+            ray_pipeline_drain(_pipeline, recs, max_n);
+        }
+
+        const int N = static_cast<int>(recs.size());
+
+        py::array_t<uint8_t>  kind_arr(N);
+        py::array_t<uint64_t> tag_arr(N);
+        py::array_t<int32_t>  src_id_arr(N);
+        py::array_t<int32_t>  bounce_arr(N);
+        py::array_t<float>    seg_start_arr({(py::ssize_t)N, (py::ssize_t)3});
+        py::array_t<float>    pos_arr      ({(py::ssize_t)N, (py::ssize_t)3});
+        py::array_t<float>    dir_arr      ({(py::ssize_t)N, (py::ssize_t)3});
+        py::array_t<float>    normal_arr   ({(py::ssize_t)N, (py::ssize_t)3});
+        py::array_t<float>    path_len_arr(N);
+        py::array_t<float>    path_seg_arr(N);
+        py::array_t<int32_t>  hit_tri_arr(N);
+        py::array_t<int32_t>  mat_idx_arr(N);
+        py::array_t<int32_t>  arena_id_arr(N);
+        py::array_t<bool>     is_sensor_arr(N);
+        py::array_t<int32_t>  sensor_gid_arr(N);
+        py::array_t<float>    bary_u_arr(N);
+        py::array_t<float>    bary_v_arr(N);
+        py::array_t<uint8_t>  color_flag_arr(N);
+        py::array_t<float>    amp_re_arr({(py::ssize_t)N, (py::ssize_t)nb});
+        py::array_t<float>    amp_im_arr({(py::ssize_t)N, (py::ssize_t)nb});
+
+        if (N > 0) {
+            auto* k   = kind_arr      .mutable_data();
+            auto* tg  = tag_arr       .mutable_data();
+            auto* si  = src_id_arr    .mutable_data();
+            auto* bo  = bounce_arr    .mutable_data();
+            auto* ss  = seg_start_arr .mutable_data();
+            auto* po  = pos_arr       .mutable_data();
+            auto* di  = dir_arr       .mutable_data();
+            auto* no  = normal_arr    .mutable_data();
+            auto* pl  = path_len_arr  .mutable_data();
+            auto* ps_ = path_seg_arr  .mutable_data();
+            auto* ht  = hit_tri_arr   .mutable_data();
+            auto* mi  = mat_idx_arr   .mutable_data();
+            auto* ai  = arena_id_arr  .mutable_data();
+            auto* isn = is_sensor_arr .mutable_data();
+            auto* sg  = sensor_gid_arr.mutable_data();
+            auto* bu  = bary_u_arr    .mutable_data();
+            auto* bv  = bary_v_arr    .mutable_data();
+            auto* cf  = color_flag_arr.mutable_data();
+            auto* re  = amp_re_arr    .mutable_data();
+            auto* im  = amp_im_arr    .mutable_data();
+
+            for (int i = 0; i < N; ++i) {
+                const RayRecord& r = recs[i];
+                k[i]  = static_cast<uint8_t>(r.kind);
+                tg[i] = r.tag;
+                si[i] = r.src_id;
+                bo[i] = r.bounce;
+                ss[i*3+0] = r.seg_start[0]; ss[i*3+1] = r.seg_start[1]; ss[i*3+2] = r.seg_start[2];
+                po[i*3+0] = r.pos[0];       po[i*3+1] = r.pos[1];       po[i*3+2] = r.pos[2];
+                di[i*3+0] = r.dir[0];       di[i*3+1] = r.dir[1];       di[i*3+2] = r.dir[2];
+                no[i*3+0] = r.normal[0];    no[i*3+1] = r.normal[1];    no[i*3+2] = r.normal[2];
+                pl[i]  = r.path_len;
+                ps_[i] = r.path_at_seg_start;
+                ht[i]  = r.hit_tri;
+                mi[i]  = r.mat_idx;
+                ai[i]  = r.arena_id;
+                isn[i] = r.is_sensor;
+                sg[i]  = r.sensor_group_id;
+                bu[i]  = r.bary_u;
+                bv[i]  = r.bary_v;
+                cf[i]  = r.color_flag;
+                const int cap = std::min((int)r.n_bands, nb);
+                for (int b = 0; b < cap; ++b) {
+                    re[i*nb + b] = r.amp_re[b];
+                    im[i*nb + b] = r.amp_im[b];
+                }
+                for (int b = cap; b < nb; ++b) {
+                    re[i*nb + b] = 0.f;
+                    im[i*nb + b] = 0.f;
+                }
+            }
+        }
+
+        py::dict out;
+        out["kind"]       = kind_arr;
+        out["tag"]        = tag_arr;
+        out["src_id"]     = src_id_arr;
+        out["bounce"]     = bounce_arr;
+        out["seg_start"]  = seg_start_arr;
+        out["pos"]        = pos_arr;
+        out["dir"]        = dir_arr;
+        out["normal"]     = normal_arr;
+        out["path_len"]   = path_len_arr;
+        out["path_at_seg"] = path_seg_arr;
+        out["hit_tri"]    = hit_tri_arr;
+        out["mat_idx"]    = mat_idx_arr;
+        out["arena_id"]   = arena_id_arr;
+        out["is_sensor"]  = is_sensor_arr;
+        out["sensor_gid"] = sensor_gid_arr;
+        out["bary_u"]      = bary_u_arr;
+        out["bary_v"]      = bary_v_arr;
+        out["color_flag"]  = color_flag_arr;
+        out["amp_re"]      = amp_re_arr;
+        out["amp_im"]     = amp_im_arr;
+        return out;
+    }
+
+    /* Slim drain: returns only the 7 arrays needed by the voxel accumulator.
+     * Allocates ~5× less memory than drain_records() per call.
+     * Keys: kind (uint8), bounce (int32), seg_start (N,3 f32),
+     *       pos (N,3 f32), color_flag (uint8), amp_re (N,n_bands f32), amp_im. */
+    py::dict drain_records_slim(int max_n = 50000)
+    {
+        const int nb = _n_bands;
+        std::vector<RayRecord> recs;
+        if (_pipeline) {
+            recs.reserve(std::min(max_n, 4096));
+            py::gil_scoped_release release;
+            ray_pipeline_drain(_pipeline, recs, max_n);
+        }
+        const int N = static_cast<int>(recs.size());
+
+        py::array_t<uint8_t> kind_arr(N);
+        py::array_t<int32_t> bounce_arr(N);
+        py::array_t<float>   seg_start_arr({(py::ssize_t)N, (py::ssize_t)3});
+        py::array_t<float>   pos_arr      ({(py::ssize_t)N, (py::ssize_t)3});
+        py::array_t<uint8_t> color_flag_arr(N);
+        py::array_t<float>   amp_re_arr({(py::ssize_t)N, (py::ssize_t)nb});
+        py::array_t<float>   amp_im_arr({(py::ssize_t)N, (py::ssize_t)nb});
+
+        if (N > 0) {
+            auto* k  = kind_arr      .mutable_data();
+            auto* bo = bounce_arr    .mutable_data();
+            auto* ss = seg_start_arr .mutable_data();
+            auto* po = pos_arr       .mutable_data();
+            auto* cf = color_flag_arr.mutable_data();
+            auto* re = amp_re_arr    .mutable_data();
+            auto* im = amp_im_arr    .mutable_data();
+            for (int i = 0; i < N; ++i) {
+                const RayRecord& r = recs[i];
+                k[i]  = static_cast<uint8_t>(r.kind);
+                bo[i] = r.bounce;
+                ss[i*3+0]=r.seg_start[0]; ss[i*3+1]=r.seg_start[1]; ss[i*3+2]=r.seg_start[2];
+                po[i*3+0]=r.pos[0];       po[i*3+1]=r.pos[1];       po[i*3+2]=r.pos[2];
+                cf[i] = r.color_flag;
+                const int cap = std::min((int)r.n_bands, nb);
+                for (int b = 0;   b < cap; ++b) { re[i*nb+b]=r.amp_re[b]; im[i*nb+b]=r.amp_im[b]; }
+                for (int b = cap; b < nb;  ++b) { re[i*nb+b]=0.f;         im[i*nb+b]=0.f; }
+            }
+        }
+        py::dict out;
+        out["kind"]       = kind_arr;
+        out["bounce"]     = bounce_arr;
+        out["seg_start"]  = seg_start_arr;
+        out["pos"]        = pos_arr;
+        out["color_flag"] = color_flag_arr;
+        out["amp_re"]     = amp_re_arr;
+        out["amp_im"]     = amp_im_arr;
+        return out;
+    }
+
+    /* Set pipeline-wide amplitude floor and rebuild material epsilon flags.
+     * Safe to call before or after the pipeline is created. */
+    void set_min_amplitude(double eps) {
+        _default_min_amplitude = eps;
+        if (_pipeline)
+            ray_pipeline_set_min_amplitude(_pipeline, eps);
+    }
+
+    /* (Re)scan material reflectances; flag fully-absorptive ones for fast T3 kill.
+     * Pipeline must exist (call after first submit_rays). */
+    void precompute_epsilon_material_flags() {
+        if (_pipeline)
+            ray_pipeline_precompute_epsilon_flags(_pipeline);
+    }
+
+    /* Set the maximum depth of the intent queue (backpressure bound).
+     * 0 = unbounded.  Must be set before the pipeline is first created. */
+    void set_max_intent_queue(int n) {
+        _max_intent_queue = n;
+    }
+
+    /* Shuffle lever: 0 = strict FIFO, 1 = fully random window into Q_intent.
+     * Can be changed at any time; takes effect on the next T1 pop. */
+    void set_intent_shuffle(float frac) {
+        if (_pipeline)
+            ray_pipeline_set_shuffle(_pipeline, frac);
+    }
+
+    /* Configure sensor image accumulator.  Call before submitting rays.
+     * plate_x, plate_r: world-space sensor plane position and disc radius.
+     * res: pixel grid side length (res×res).
+     * bdpt_eps: YZ proximity threshold in metres for BDPT snap. */
+    void configure_sensor_image(float plate_x, float plate_r, int res, float bdpt_eps) {
+        /* Cache params unconditionally — pipeline may not exist yet (it is
+         * created lazily on the first submit_rays call).  _get_pipeline will
+         * apply these stored values when it constructs the pipeline. */
+        _sensor_plate_x  = plate_x;
+        _sensor_plate_r  = plate_r;
+        _sensor_res      = res;
+        _sensor_bdpt_eps = bdpt_eps;
+        if (_pipeline)
+            ray_pipeline_configure_sensor_image(_pipeline, plate_x, plate_r, res, bdpt_eps);
+    }
+
+    /* ── GPU T3 bridge ─────────────────────────────────────────────────────
+     *
+     * drain_refined_hits(max_n)
+     *   Dequeue up to max_n records from Q_refined and pack them into a flat
+     *   float32 numpy array of shape (n, REFINED_HIT_STRIDE) using the layout
+     *   defined in ray_material.comp.glsl.
+     *
+     *   REFINED_HIT_STRIDE = 26 + 2*MAX_BANDS  (MAX_BANDS = 16 → stride = 58)
+     *
+     *   Returns shape (0,) when the queue is empty.
+     *
+     * submit_intents_flat(buf)
+     *   Accepts a float32 numpy array of shape (n, INTENT_STRIDE) — the output
+     *   produced by the GPU T3 shader — and feeds each record back into the
+     *   pipeline as a new child RayIntent.
+     *
+     *   INTENT_STRIDE = 20 + 2*MAX_BANDS  (stride = 52)
+     *
+     * Together these two methods allow Python to intercept the T3 stage and
+     * run the GPU shader instead of the C++ worker, or to hybridise. */
+
+    static constexpr int _GPU_MAX_BANDS     = 16;
+    static constexpr int _REFINED_HIT_STRIDE = 26 + 2 * _GPU_MAX_BANDS;  /* 58 */
+    static constexpr int _INTENT_STRIDE      = 20 + 2 * _GPU_MAX_BANDS;  /* 52 */
+
+    py::array_t<float> drain_refined_hits(int max_n = 256) {
+        auto* pl = _pipeline;  /* may be null if no rays yet submitted */
+        if (!pl || max_n <= 0)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+
+        std::vector<RefinedHit> batch;
+        /* Non-blocking bulk drain: pop up to max_n in one call. */
+        ray_pipeline_drain_refined(pl, batch, max_n);
+
+        const int n   = static_cast<int>(batch.size());
+        const int nb  = std::min(ray_pipeline_n_bands(pl), _GPU_MAX_BANDS);
+        if (n == 0)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+
+        auto arr = py::array_t<float>(
+            std::vector<py::ssize_t>{n, _REFINED_HIT_STRIDE});
+        float* p = arr.mutable_data();
+
+        for (int i = 0; i < n; ++i) {
+            const RefinedHit& rh = batch[static_cast<size_t>(i)];
+            const HitRecord&  hr = rh.base;
+            float* row = p + i * _REFINED_HIT_STRIDE;
+
+            /* [0..2] hit_pos */
+            row[0]  = static_cast<float>(rh.refined_pos.x());
+            row[1]  = static_cast<float>(rh.refined_pos.y());
+            row[2]  = static_cast<float>(rh.refined_pos.z());
+            /* [3..5] hit_n */
+            row[3]  = static_cast<float>(rh.refined_n.x());
+            row[4]  = static_cast<float>(rh.refined_n.y());
+            row[5]  = static_cast<float>(rh.refined_n.z());
+            /* [6..8] incoming_dir */
+            row[6]  = static_cast<float>(hr.incoming_dir.x());
+            row[7]  = static_cast<float>(hr.incoming_dir.y());
+            row[8]  = static_cast<float>(hr.incoming_dir.z());
+            /* [9..11] seg_start */
+            row[9]  = static_cast<float>(hr.seg_start.x());
+            row[10] = static_cast<float>(hr.seg_start.y());
+            row[11] = static_cast<float>(hr.seg_start.z());
+            /* [12] path_len */
+            row[12] = static_cast<float>(hr.ray.path_len);
+            /* [13] path_at_seg_start */
+            row[13] = static_cast<float>(hr.path_at_seg_start);
+            /* [14] hit_tri */
+            int hit_tri_i = hr.hit_tri;
+            std::memcpy(&row[14], &hit_tri_i, sizeof(float));
+            /* [15] mat_idx */
+            int mat_idx_i = ray_pipeline_tri_mat_idx(pl, hr.hit_tri);
+            std::memcpy(&row[15], &mat_idx_i, sizeof(float));
+            /* [16] color_flag */
+            uint32_t cflag = hr.ray.color_flag;
+            std::memcpy(&row[16], &cflag, sizeof(float));
+            /* [17] bounce */
+            int bounce_i = hr.ray.bounce;
+            std::memcpy(&row[17], &bounce_i, sizeof(float));
+            /* [18] bounces_left */
+            int bleft_i = hr.ray.bounces_left;
+            std::memcpy(&row[18], &bleft_i, sizeof(float));
+            /* [19] min_amplitude */
+            row[19] = static_cast<float>(hr.ray.min_amplitude);
+            /* [20] src_id */
+            int src_id_i = hr.ray.src_id;
+            std::memcpy(&row[20], &src_id_i, sizeof(float));
+            /* [21] tag_lo, [22] tag_hi */
+            uint32_t tag_lo = static_cast<uint32_t>(hr.ray.tag & 0xFFFFFFFFULL);
+            uint32_t tag_hi = static_cast<uint32_t>(hr.ray.tag >> 32);
+            std::memcpy(&row[21], &tag_lo, sizeof(float));
+            std::memcpy(&row[22], &tag_hi, sizeof(float));
+            /* [23] sensor_origin_y, [24] sensor_origin_z */
+            row[23] = hr.ray.sensor_origin_y;
+            row[24] = hr.ray.sensor_origin_z;
+            /* [25] medium_mat_idx */
+            int med_i = hr.ray.medium_mat_idx;
+            std::memcpy(&row[25], &med_i, sizeof(float));
+            /* [26 .. 26+nb-1] amp_re, [26+MAX_BANDS .. 26+MAX_BANDS+nb-1] amp_im */
+            for (int b = 0; b < nb; ++b) {
+                row[26 + b]              = static_cast<float>(hr.amp_propagated[b].real());
+                row[26 + _GPU_MAX_BANDS + b] = static_cast<float>(hr.amp_propagated[b].imag());
+            }
+            for (int b = nb; b < _GPU_MAX_BANDS; ++b) {
+                row[26 + b] = 0.0f;
+                row[26 + _GPU_MAX_BANDS + b] = 0.0f;
+            }
+        }
+        return arr;
+    }
+
+    /* Feed GPU-processed child intents back into the pipeline.
+     * buf: float32 array of shape (n, INTENT_STRIDE=52).
+     * Each row is decoded into a RayIntent and pushed to Q_intent. */
+    void submit_intents_flat(py::array_t<float, py::array::c_style> buf) {
+        auto* pl = _get_pipeline();
+        auto info = buf.request();
+        if (info.ndim != 2 || info.shape[1] != _INTENT_STRIDE) return;
+        const int n  = static_cast<int>(info.shape[0]);
+        const int nb = std::min(ray_pipeline_n_bands(pl), _GPU_MAX_BANDS);
+        const float* p = static_cast<const float*>(info.ptr);
+
+        for (int i = 0; i < n; ++i) {
+            const float* row = p + i * _INTENT_STRIDE;
+            RayIntent ri;
+            ri.pos = Eigen::Vector3d(row[0], row[1], row[2]);
+            ri.dir = Eigen::Vector3d(row[3], row[4], row[5]);
+            ri.path_len = static_cast<double>(row[6]);
+            std::memcpy(&ri.medium_mat_idx,    &row[7],  sizeof(int));
+            uint32_t iflags_u; std::memcpy(&iflags_u, &row[8],  sizeof(uint32_t));
+            ri.interaction_flags = iflags_u;
+            std::memcpy(&ri.src_id,            &row[9],  sizeof(int));
+            std::memcpy(&ri.bounce,            &row[10], sizeof(int));
+            std::memcpy(&ri.bounces_left,      &row[11], sizeof(int));
+            ri.min_amplitude = static_cast<double>(row[12]);
+            uint32_t tag_lo; std::memcpy(&tag_lo, &row[13], sizeof(uint32_t));
+            uint32_t tag_hi; std::memcpy(&tag_hi, &row[14], sizeof(uint32_t));
+            ri.tag = (static_cast<uint64_t>(tag_hi) << 32) | tag_lo;
+            uint32_t cflag; std::memcpy(&cflag, &row[15], sizeof(uint32_t));
+            ri.color_flag = static_cast<uint8_t>(cflag & 0xFFu);
+            ri.priority = row[16];
+            ri.sensor_origin_y = row[17];
+            ri.sensor_origin_z = row[18];
+            ri.amp.resize(nb);
+            for (int b = 0; b < nb; ++b)
+                ri.amp[b] = std::complex<double>(
+                    static_cast<double>(row[20 + b]),
+                    static_cast<double>(row[20 + _GPU_MAX_BANDS + b]));
+            ray_pipeline_submit(pl, &ri, 1);
+        }
+    }
+
+    /* Return current sensor image as a (res, res, 3) float32 numpy array.
+     * Channels: R=forward plate hits, G=backward emissive+provisional near-miss,
+     * B=exact BDPT snap.  Values are log-tone-mapped to [0, 1]. */
+    py::array_t<float> get_sensor_image() {
+        int res = 0;
+        ray_pipeline_get_sensor_image(_pipeline, nullptr, &res);
+        if (res <= 0 || !_pipeline)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+        auto arr = py::array_t<float>(
+            std::vector<py::ssize_t>{res, res, 3},
+            std::vector<py::ssize_t>{
+                (py::ssize_t)(res * 3 * sizeof(float)),
+                (py::ssize_t)(3 * sizeof(float)),
+                (py::ssize_t)(sizeof(float))});
+        ray_pipeline_get_sensor_image(_pipeline, arr.mutable_data(), &res);
+        return arr;
+    }
+
+    /* Return the sugar-auxin priority map as a float32 (res, res) array.
+     * Values >= 1.0; baseline = 1.0; elevated regions recently had BDPT
+     * convergence and will receive more backward-ray budget next frame. */
+    py::array_t<float> get_priority_map() {
+        int res = 0;
+        ray_pipeline_get_priority_map(_pipeline, nullptr, &res);
+        if (res <= 0 || !_pipeline)
+            return py::array_t<float>(std::vector<py::ssize_t>{0});
+        auto arr = py::array_t<float>(
+            std::vector<py::ssize_t>{res, res},
+            std::vector<py::ssize_t>{
+                (py::ssize_t)(res * sizeof(float)),
+                (py::ssize_t)(sizeof(float))});
+        ray_pipeline_get_priority_map(_pipeline, arr.mutable_data(), &res);
+        return arr;
+    }
+
+    /* Live BDPT diagnostic stats (lock-free snapshot from T3 atomics).
+     * Returns a dict with keys:
+     *   nearest_dist_m     : float  — √(min YZ d²) in metres, -1 if no pair seen yet
+     *   best_collinearity  : float  — |cos θ| of best collinear fwd/rev direction pair [0,1]
+     *   exact_snaps        : int    — cumulative exact BDPT pixel hits (ch2)
+     *   near_miss_count    : int    — cumulative near-miss pixel hits (ch3)
+     */
+    py::dict get_bdpt_stats() const {
+        float    nd = -1.0f, bc = 0.0f;
+        uint64_t es = 0,     nm = 0;
+        ray_pipeline_get_bdpt_stats(_pipeline, &nd, &bc, &es, &nm);
+        py::dict d;
+        d["nearest_dist_m"]    = nd;
+        d["best_collinearity"] = bc;
+        d["exact_snaps"]       = static_cast<long long>(es);
+        d["near_miss_count"]   = static_cast<long long>(nm);
+        return d;
+    }
+
+    int in_flight_count() const
+    {
+        return _pipeline ? ray_pipeline_in_flight(_pipeline) : 0;
+    }
+
+    /* Snapshot of pipeline throughput / batch-size / queue-depth for all stages. */
+    py::dict pipeline_stats() const
+    {
+        RayPipelineStats s{};
+        if (_pipeline) ray_pipeline_get_stats(_pipeline, &s);
+
+        auto stage_dict = [](const RayPipelineStats::Stage& st) {
+            py::dict d;
+            d["throughput"]      = st.throughput;
+            d["processed"]       = st.processed;
+            d["batch_size"]      = st.batch_size;
+            d["queue_depth"]     = st.queue_depth;
+            d["gpu_throughput"]  = st.gpu_throughput;
+            d["gpu_processed"]   = st.gpu_processed;
+            d["gpu_batch_size"]  = st.gpu_batch_size;
+            d["gpu_fraction"]    = st.gpu_fraction;
+            return d;
+        };
+
+        py::dict out;
+        out["t1"]                 = stage_dict(s.t1);
+        out["t2"]                 = stage_dict(s.t2);
+        out["t3"]                 = stage_dict(s.t3);
+        out["t4"]                 = stage_dict(s.t4);
+        out["output_queue_depth"] = s.output_queue_depth;
+        out["in_flight"]          = s.in_flight;
+        return out;
     }
 
     /**
@@ -1213,6 +2581,41 @@ struct PyRayTracer
         return trimmed;
     }
 
+    py::dict accumulate_endpoint_records_to_field_capture(
+        py::array_t<float, py::array::c_style | py::array::forcecast> records,
+        int sensor_group_id,
+        bool include_sensor_group = true,
+        bool include_non_sensor_groups = true)
+    {
+        auto rb = records.request();
+        if (rb.ndim != 2 || rb.shape[1] != 16)
+            throw std::runtime_error("records must be float32 shape (N, 16)");
+
+        auto recs = py::array_t<float, py::array::c_style | py::array::forcecast>(records);
+        auto req = recs.request();
+        const int n_records = static_cast<int>(req.shape[0]);
+        const EndpointRecord* ptr = reinterpret_cast<const EndpointRecord*>(req.ptr);
+
+        int written = 0;
+        double power = 0.0;
+        int rc = ray_tracer_accumulate_endpoint_records_to_field_capture(
+            handle,
+            ptr,
+            n_records,
+            sensor_group_id,
+            include_sensor_group ? 1 : 0,
+            include_non_sensor_groups ? 1 : 0,
+            &written,
+            &power);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_accumulate_endpoint_records_to_field_capture failed: rc=" + std::to_string(rc));
+
+        py::dict out;
+        out["written_records"] = py::int_(written);
+        out["written_power"] = py::float_(power);
+        return out;
+    }
+
     /* ── Scale context API ───────────────────────────────────────────────── */
 
     int add_scale_context(
@@ -1333,13 +2736,37 @@ struct PyRayTracer
         return result;
     }
 
+    py::dict trace_multiscale_with_frequency_sidecar(
+        py::array_t<double, py::array::c_style> src_pos_arr,
+        py::array_t<double, py::array::c_style> src_dir_arr,
+        py::array_t<double, py::array::c_style> src_directivity_arr,
+        int    n_rays        = 512,
+        int    max_bounces   = 12,
+        double min_amplitude = 0.001,
+        uint32_t seed        = 42,
+        int    out_cap       = 65536)
+    {
+        py::array_t<float> segs = trace_multiscale(
+            src_pos_arr,
+            src_dir_arr,
+            src_directivity_arr,
+            n_rays,
+            max_bounces,
+            min_amplitude,
+            seed,
+            out_cap);
+        py::dict out;
+        out["segs"] = segs;
+        out["freq_sidecar"] = build_frequency_sidecar(segs, 8);
+        return out;
+    }
+
     /* ── Physical optics extension methods ──────────────────────────────── */
 
-    /** Set the surface flags for a range of triangles (Phase 2).
-     *  Per-triangle physics (refl, IOR, diffusion) now lives in the MatBuf
+    /** Set semantic surface flags for a range of triangles.
+     *  Per-triangle physics (refl, IOR, diffusion, transmission) lives in the MatBuf
      *  addressed by tri.mat_idx (set at construction).  This entry point
-     *  only adjusts the MAT_FLAG_* bitmask.
-     *  flags : MAT_FLAG_TRANSMISSIVE | MAT_FLAG_APERTURE_STOP | …
+     *  only adjusts non-material flags such as MAT_FLAG_APERTURE_STOP.
      */
     void set_tri_ior(int tri_start, int n_tris, int flags)
     {
@@ -1347,6 +2774,28 @@ struct PyRayTracer
         int rc = ray_tracer_set_tri_ior(handle, tri_start, n_tris, flags);
         if (rc != SK_OK)
             throw std::runtime_error("ray_tracer_set_tri_ior failed: rc=" + std::to_string(rc));
+    }
+
+    /** Set directional boundary media for a range of triangles.
+     *  medium_pos_mat_idx = medium on +normal side
+     *  medium_neg_mat_idx = medium on -normal side
+     *  Use -1 for ambient air/vacuum.
+     */
+    void set_tri_boundary_media(
+        int tri_start,
+        int n_tris,
+        int medium_pos_mat_idx,
+        int medium_neg_mat_idx)
+    {
+        if (!handle) throw std::runtime_error("RayTracer not initialised");
+        int rc = ray_tracer_set_tri_boundary_media(
+            handle,
+            tri_start,
+            n_tris,
+            medium_pos_mat_idx,
+            medium_neg_mat_idx);
+        if (rc != SK_OK)
+            throw std::runtime_error("ray_tracer_set_tri_boundary_media failed: rc=" + std::to_string(rc));
     }
 
     /** Project a (N, 14) float32 multiscale segment array onto a coherent
@@ -3088,6 +4537,77 @@ Returns
 np.ndarray, float32, shape (N_segs, 12)
     Columns: x0,y0,z0, x1,y1,z1, src_id, bounce, band, amplitude, phase, path_len
 )doc")
+                .def("spectral_bands_to_rgb", &PyRayTracer::spectral_bands_to_rgb,
+                         py::arg("image_bhw"),
+                         py::arg("gain") = 1.0,
+                         py::arg("hdr_white_percentile") = 99.8,
+R"doc(
+Convert spectral band image data to canonical backend RGB outputs.
+
+image_bhw: float32 (n_bands, H, W)
+
+Returns dict:
+    - rgb_linear: float32 (H, W, 3)
+    - rgb_tonemapped: float32 (H, W, 3)
+)doc")
+                .def("rasterize_tri_flux_uv", &PyRayTracer::rasterize_tri_flux_uv,
+                     py::arg("tri_flux"),
+                     py::arg("tri_indices"),
+                     py::arg("tri_uv"),
+                     py::arg("atlas_h"),
+                     py::arg("atlas_w"),
+                     py::arg("gain") = 1.0,
+                     py::arg("hdr_white_percentile") = 100.0,
+R"doc(
+Rasterize per-triangle spectral flux into a UV atlas in the C++ backend.
+
+tri_flux:    float32 (n_tri, n_bands)
+tri_indices: int32   (n_selected,)
+tri_uv:      float32 (n_selected, 3, 2), per-triangle UV coordinates in [0, 1]
+
+Returns dict:
+    - spectral_atlas: float32 (n_bands, atlas_h, atlas_w)
+    - rgb_linear: float32 (atlas_h, atlas_w, 3)
+    - rgb_tonemapped: float32 (atlas_h, atlas_w, 3)
+)doc")
+                .def("compose_lens_bench_views", &PyRayTracer::compose_lens_bench_views,
+                     py::arg("tri_flux"),
+                     py::arg("tri_centroids"),
+                     py::arg("view_h"),
+                     py::arg("view_w"),
+                     py::arg("x_min"),
+                     py::arg("x_max"),
+                     py::arg("view_radius"),
+                     py::arg("field_nx"),
+                     py::arg("field_ny"),
+                     py::arg("field_nz"),
+                     py::arg("field_gain") = 2.5,
+                     py::arg("surface_gain") = 1.0,
+                     py::arg("hdr_white_percentile") = 99.8,
+R"doc(
+Compose thick-lens top/side RGB views entirely in C++ backend code.
+
+Returns a tuple: (top_rgb, side_rgb), each float32 (view_h, view_w, 3).
+)doc")
+        .def("trace_with_frequency_sidecar", &PyRayTracer::trace_with_frequency_sidecar,
+             py::arg("src_pos"),
+             py::arg("src_dir"),
+             py::arg("src_directivity"),
+             py::arg("n_rays")        = 256,
+             py::arg("max_bounces")   = 8,
+             py::arg("min_amplitude") = 0.005,
+             py::arg("seed")          = 42,
+             py::arg("out_cap")       = -1,
+R"doc(
+Trace rays and return both segment records and C++-computed frequency sidecar.
+
+Returns a dict with:
+  'segs'         : float32 (N_segs, 12)
+  'freq_sidecar' : dict with
+      'band_id'       int32  (N_segs,)
+      'frequency_hz'  float64(N_segs,)
+      'wavelength_nm' float64(N_segs,)
+)doc")
         .def("integrate_ir", &PyRayTracer::integrate_ir,
              py::arg("src_pos"),
              py::arg("src_dir"),
@@ -3270,6 +4790,19 @@ The tracer deep-copies all inputs; caller buffers can be discarded after return.
                 .def("get_field_capture_meta", &PyRayTracer::get_field_capture_meta)
                 .def("get_field_capture_grid_reim", &PyRayTracer::get_field_capture_grid_reim)
                 .def("get_field_capture_strikes", &PyRayTracer::get_field_capture_strikes)
+                .def("accumulate_endpoint_records_to_field_capture", &PyRayTracer::accumulate_endpoint_records_to_field_capture,
+                         py::arg("records"),
+                         py::arg("sensor_group_id"),
+                         py::arg("include_sensor_group") = true,
+                         py::arg("include_non_sensor_groups") = true,
+R"doc(
+Deposit BDPT EndpointRecord amplitudes into the currently bound field-capture grid.
+
+records: float32 (N, 16), output of bidirectional()/bidirectional_packed().
+Returns dict with:
+    - written_records: number of endpoint records injected into field grid.
+    - written_power: accumulated spectral power sum (|amp|^2) for injected rows.
+)doc")
         .def_property_readonly("n_bands", &PyRayTracer::n_bands)
         .def_property_readonly("n_tris",  &PyRayTracer::n_tris,
              "Number of triangles in the scene.")
@@ -3290,6 +4823,151 @@ Returns a dict with:
   'direct'   : float32 (n_tri, n_bands) — direct-illumination irradiance per triangle
   'indirect' : float32 (n_tri, n_bands) — reflected irradiance per triangle
 )doc")
+                .def("trace_surface_with_frequency_sidecar",
+                         &PyRayTracer::trace_surface_with_frequency_sidecar,
+                         py::arg("src_pos"),
+                         py::arg("src_dir"),
+                         py::arg("src_directivity"),
+                         py::arg("n_rays")         = 256,
+                         py::arg("max_bounces")    = 8,
+                         py::arg("min_amplitude")  = 0.005,
+                         py::arg("seed")           = 42,
+                         py::arg("out_cap")        = -1,
+R"doc(
+Trace rays with surface accumulation and include C++-computed frequency sidecar.
+
+Returns a dict with:
+    'segs'         : float32 (N_segs, 12)
+    'direct'       : float32 (n_tri, n_bands)
+    'indirect'     : float32 (n_tri, n_bands)
+    'freq_sidecar' : dict with per-segment
+            'band_id', 'frequency_hz', 'wavelength_nm'
+)doc")
+        .def("trace_pipeline", &PyRayTracer::trace_pipeline,
+             py::arg("origins"),
+             py::arg("directions"),
+             py::arg("amplitudes")     = py::none(),
+             py::arg("src_ids")        = py::none(),
+             py::arg("tags")           = py::none(),
+             py::arg("max_bounces")    = 8,
+             py::arg("min_amplitude")  = 1e-6,
+             py::arg("seed")           = 42,
+             py::arg("max_children")   = 2,
+             py::arg("out_cap")        = 4'000'000,
+R"doc(
+Run the 4-stage threaded ray transport pipeline.
+
+origins    : float64 (N, 3) — ray start positions
+directions : float64 (N, 3) — ray directions (normalised internally)
+amplitudes : complex128 (N, n_bands) — initial amplitude per band; None = unit
+src_ids    : int32 (N,) — source tag per ray; None = sequential 0..N-1
+tags       : uint64 (N,) — free slot carried through all stages; None = 0
+max_bounces, min_amplitude, seed, max_children : pipeline settings
+out_cap    : max segment records to accumulate
+
+Returns dict with:
+  'segs' : float32 (M, 12) — one row per (intersection, band)
+           [0..2] seg_start  [3..5] hit_pos  [6] src_id  [7] bounce
+           [8] freq_band  [9] |amplitude|  [10] phase  [11] path_at_seg_start
+)doc")
+        /* ── Persistent-machine async API ─────────────────────────────── */
+        .def("submit_rays", &PyRayTracer::submit_rays,
+             py::arg("origins"),
+             py::arg("directions"),
+             py::arg("amplitudes")      = py::none(),
+             py::arg("src_ids")         = py::none(),
+             py::arg("tags")            = py::none(),
+             py::arg("color_flags")     = py::none(),
+             py::arg("max_bounces")     = 8,
+             py::arg("min_amplitude")   = 1e-6,
+             py::arg("max_children")    = 2,
+             py::arg("seed")            = 42,
+             py::arg("use_gpu_compute") = false,
+             py::arg("shader_dir")      = "",
+R"doc(Non-blocking submit: push ray intents into the persistent pipeline.
+Returns immediately; the pipeline processes them concurrently.
+Call drain_records() to collect output records.)doc")
+        .def("drain_records", &PyRayTracer::drain_records,
+             py::arg("max_n") = 50000,
+R"doc(Non-blocking drain: pop up to max_n completed records from the output queue.
+Returns a dict of numpy arrays (empty arrays if nothing is ready yet).
+kind: 0=STRIKE 1=TERMINAL 2=MISS 3=FIELD)doc")
+        .def("in_flight_count", &PyRayTracer::in_flight_count,
+R"doc(Return the number of ray paths currently live in the persistent pipeline.
+Zero means all previously submitted rays have completed.)doc")
+        .def("pipeline_stats", &PyRayTracer::pipeline_stats,
+R"doc(Snapshot of pipeline throughput/batch-size/queue-depth for all four stages.
+Returns dict with keys t1, t2, t3, t4 (each a dict with throughput, processed,
+batch_size, queue_depth) plus output_queue_depth and in_flight.)doc")
+        .def("drain_records_slim", &PyRayTracer::drain_records_slim,
+             py::arg("max_n") = 50000,
+R"doc(Non-blocking slim drain: returns only the 7 arrays needed for voxel accumulation.
+~5x less allocation than drain_records(). Keys: kind, bounce, seg_start, pos,
+color_flag, amp_re, amp_im.)doc")
+        .def("set_min_amplitude", &PyRayTracer::set_min_amplitude,
+             py::arg("eps"),
+R"doc(Set the pipeline-wide amplitude floor.  Rays with per-ray min_amplitude below this
+are silently raised.  Also rebuilds material epsilon flags so T3 can fast-path
+fully-absorptive surfaces.)doc")
+        .def("precompute_epsilon_material_flags", &PyRayTracer::precompute_epsilon_material_flags,
+R"doc(Rescan material reflectances and flag those with max|refl| < min_amplitude.
+T3 uses these flags to skip direction sampling for guaranteed-dying rays.
+Call after the pipeline is first created (i.e. after first submit_rays).)doc")
+        .def("set_max_intent_queue", &PyRayTracer::set_max_intent_queue,
+             py::arg("n"),
+R"doc(Set bounded capacity of the intent queue (0 = unbounded).
+When > 0, submit_rays blocks until queue is below this limit (backpressure).
+Must be called before the first submit_rays.)doc")
+        .def("set_intent_shuffle", &PyRayTracer::set_intent_shuffle,
+             py::arg("frac"),
+R"doc(Shuffle lever for the T1 intent queue.  0.0 = strict FIFO (default);
+1.0 = fully random window — every T1 pop draws from a uniformly random position
+in Q_intent so deep-bounce children are interleaved with fresh primary rays,
+giving diffusion across both depth and breadth.  Can be changed at any time.\n
+Typical values: 0.0 (off), 0.25 (mild), 0.75 (strong).)doc")
+        .def("configure_sensor_image",
+             &PyRayTracer::configure_sensor_image,
+             py::arg("plate_x"), py::arg("plate_r"), py::arg("res"), py::arg("bdpt_eps"),
+R"doc(Configure sensor-plane image accumulator.
+plate_x: world X of the sensor disc centre; plate_r: disc radius (metres);
+res: pixel grid side (res×res); bdpt_eps: YZ proximity threshold for BDPT snap.
+Resets accumulator.  Call before submitting rays.)doc")
+        .def("get_sensor_image",
+             &PyRayTracer::get_sensor_image,
+R"doc(Return current sensor image as float32 ndarray of shape (res, res, 3).
+R=forward plate hits, G=backward emissive+provisional near-miss, B=exact BDPT snap.
+Values are log-tone-mapped to [0, 1]. Thread-safe.)doc")
+        .def("get_priority_map",
+             &PyRayTracer::get_priority_map,
+R"doc(Return the sugar-auxin work-priority map as float32 ndarray of shape (res, res).
+Values >= 1.0.  Baseline = 1.0; elevated pixels had recent BDPT convergence and
+receive more backward-ray budget on the next submit call.  Thread-safe.)doc")
+        .def("drain_refined_hits",
+             &PyRayTracer::drain_refined_hits,
+             py::arg("max_n") = 256,
+R"doc(Dequeue up to max_n records from Q_refined and return them as a float32
+ndarray of shape (n, 58) using the flat RefinedHit layout defined in
+ray_material.comp.glsl.  Returns shape (0,) when the queue is empty.
+
+Used by the GPU T3 bridge (GpuRayMaterialStage) to intercept the material/Fresnel
+stage and dispatch it on the GPU instead of the C++ worker threads.)doc")
+        .def("submit_intents_flat",
+             &PyRayTracer::submit_intents_flat,
+             py::arg("buf"),
+R"doc(Feed GPU-processed child RayIntents back into the pipeline.
+buf: float32 ndarray of shape (n, 52) using the flat RayIntent layout defined
+in ray_material.comp.glsl.  Each row is decoded into a RayIntent and pushed
+to the T1 intent queue.
+
+Used with drain_refined_hits() to form a round-trip GPU T3 dispatch loop.)doc")
+        .def("get_bdpt_stats",
+             &PyRayTracer::get_bdpt_stats,
+R"doc(Return a dict of live BDPT convergence diagnostics (lock-free snapshot):
+  nearest_dist_m     (float)  — sqrt(min YZ d²) in metres of best fwd/rev pair seen.
+                                -1.0 if no pairs observed yet.
+  best_collinearity  (float)  — |cos θ| between incoming directions at best pair [0,1].
+  exact_snaps        (int)    — cumulative exact-match (ch2) pixel accumulations.
+  near_miss_count    (int)    — cumulative near-miss (ch3) pixel accumulations.)doc")
         .def("add_scale_context", &PyRayTracer::add_scale_context,
              py::arg("pos"),
              py::arg("radius"),
@@ -3359,28 +5037,61 @@ Returns ndarray of shape (N, 14) where N <= out_cap.  Columns 0-11 match
 the standard 12-float segment layout; columns 12-13 are context_id and
 scale_type.
 )doc")
+                .def("trace_multiscale_with_frequency_sidecar",
+                         &PyRayTracer::trace_multiscale_with_frequency_sidecar,
+                         py::arg("src_pos"),
+                         py::arg("src_dir"),
+                         py::arg("src_directivity"),
+                         py::arg("n_rays")        = 512,
+                         py::arg("max_bounces")   = 12,
+                         py::arg("min_amplitude") = 0.001,
+                         py::arg("seed")          = 42,
+                         py::arg("out_cap")       = 65536,
+R"doc(
+Trace rays using the multiscale kernel and include C++-computed frequency sidecar.
+
+Returns a dict with:
+    'segs'         : float32 (N, 14)
+    'freq_sidecar' : dict with per-segment
+            'band_id', 'frequency_hz', 'wavelength_nm'
+)doc")
         .def("set_tri_ior", &PyRayTracer::set_tri_ior,
              py::arg("tri_start"),
              py::arg("n_tris"),
-             py::arg("flags") = MAT_FLAG_TRANSMISSIVE,
+             py::arg("flags") = 0,
              R"doc(
-Set the surface flags for a range of triangles (Phase 2 unification).
+Set semantic surface flags for a range of triangles.
 
-Per-triangle physics (refl, IOR, diffusion) now lives in the MatBuf
-addressed by tri.mat_idx (set at construction).  This entry point only
-adjusts the MAT_FLAG_* bitmask.
+Per-triangle physics (refl, IOR, diffusion, transmission) lives in the
+MatBuf addressed by tri.mat_idx.  This entry point only adjusts non-material
+flags.
 
 tri_start : index of the first triangle in the range
 n_tris    : number of triangles in the range
-flags     : MAT_FLAG_TRANSMISSIVE (64) | MAT_FLAG_APERTURE_STOP (128) | …
+flags     : MAT_FLAG_APERTURE_STOP (128) | MAT_FLAG_PICKING_ONLY (256) | …
 
-When MAT_FLAG_TRANSMISSIVE is set the tracer applies exact Snell's law
-refraction with angle-dependent Fresnel power split.  IOR is read from the
-material's MatBuf record (slot 7 = ior_real).  TIR is handled automatically.
+Transmission/refraction is inferred from the material MatBuf record
+(transmittance and ior_real). TIR is handled automatically.
 
 When MAT_FLAG_APERTURE_STOP is set the surface absorbs the ray.
 Diffraction is handled by the near-field pipeline (coherent_accumulate +
 rs_propagate / wave_bpm_step).
+)doc")
+                .def("set_tri_boundary_media", &PyRayTracer::set_tri_boundary_media,
+                         py::arg("tri_start"),
+                         py::arg("n_tris"),
+                         py::arg("medium_pos_mat_idx"),
+                         py::arg("medium_neg_mat_idx"),
+                         R"doc(
+Set directional boundary media for a range of triangles.
+
+Each triangle stores media per side of its geometric normal:
+    medium_pos_mat_idx : medium on +normal side
+    medium_neg_mat_idx : medium on -normal side
+Use -1 for ambient air/vacuum.
+
+Refraction then uses crossing direction directly (front-face: + -> -,
+back-face: - -> +) instead of material-equality toggles.
 )doc")
         .def("project_coherent", &PyRayTracer::project_coherent,
              py::arg("segs"),
@@ -3627,6 +5338,23 @@ Returns : (n_written, n_live) — segments written and rays still alive
                      cam_desc.pixel_stream_phase_from_seed =
                          d.contains("pixel_stream_phase_from_seed")
                          ? d["pixel_stream_phase_from_seed"].cast<int>() : 1;
+                     /* Optical mode extensions (all optional, safe to omit). */
+                     cam_desc.camera_mode =
+                         d.contains("camera_mode")
+                         ? d["camera_mode"].cast<int>() : 0;
+                     cam_desc.effective_focal_m =
+                         d.contains("effective_focal_m")
+                         ? d["effective_focal_m"].cast<double>() : 0.0;
+                     cam_desc.focus_distance_m =
+                         d.contains("focus_distance_m")
+                         ? d["focus_distance_m"].cast<double>() : 0.0;
+                     if (d.contains("lens_center"))
+                         get3("lens_center", cam_desc.lens_center);
+                     if (d.contains("lens_fwd"))
+                         get3("lens_fwd", cam_desc.lens_fwd);
+                     cam_desc.use_optical_handlers =
+                         d.contains("use_optical_handlers")
+                         ? d["use_optical_handlers"].cast<int>() : 0;
                      desc.sensor_camera = &cam_desc;
                  }
 
@@ -3684,6 +5412,18 @@ Returns assigned group_id (>= 0).  Raises on failure.
 )doc")
         .def("clear_tri_groups",
              [](PyRayTracer& self) { ray_tracer_clear_tri_groups(self.handle); })
+        .def("attach_optical_assembly",
+             [](PyRayTracer& self, py::object backend) {
+                 OpticalAssembly* asmb = nullptr;
+                 if (!backend.is_none()) {
+                     auto* b = backend.cast<ExposureBackendCpp*>();
+                     if (b) asmb = b->assembly;
+                 }
+                 ray_tracer_attach_optical_assembly(self.handle, asmb);
+             },
+             py::arg("backend"),
+             "Attach an ExposureBackendCpp optical assembly for PIXEL_CONE handler "
+             "dispatch.  Pass None to detach.")
         .def("n_tri_groups",
              [](PyRayTracer& self) {
                  return ray_tracer_n_tri_groups(self.handle);
@@ -3956,9 +5696,13 @@ Useful for file-backed memmap buffers to avoid RAM-only allocation limits.
                  metrics["photons_flux_hz"] = py::float_(photons_mean);
                  metrics["electrons_flux_hz"] = py::float_(electrons_mean);
                  metrics["slot_metrics"] = slot_metrics;
+                 metrics["sensor_group_records"] = py::int_(telemetry.sensor_group_records);
                  metrics["kept_records"] = py::int_(telemetry.kept_records);
+                 metrics["kept_pixel_cone_records"] = py::int_(telemetry.kept_pixel_cone_records);
+                 metrics["kept_projected_records"] = py::int_(telemetry.kept_projected_records);
                  metrics["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
                  metrics["drop_non_pixel_cone"] = py::int_(telemetry.drop_non_pixel_cone);
+                 metrics["drop_projection_failed"] = py::int_(telemetry.drop_projection_failed);
                  metrics["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
                  metrics["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
                  metrics["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);
@@ -4029,9 +5773,13 @@ gain    : exposure gain multiplier applied before photon normalisation
 
                  py::dict telemetry_dict;
                  telemetry_dict["input_records"] = py::int_(telemetry.input_records);
+                 telemetry_dict["sensor_group_records"] = py::int_(telemetry.sensor_group_records);
                  telemetry_dict["kept_records"] = py::int_(telemetry.kept_records);
+                 telemetry_dict["kept_pixel_cone_records"] = py::int_(telemetry.kept_pixel_cone_records);
+                 telemetry_dict["kept_projected_records"] = py::int_(telemetry.kept_projected_records);
                  telemetry_dict["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
                  telemetry_dict["drop_non_pixel_cone"] = py::int_(telemetry.drop_non_pixel_cone);
+                 telemetry_dict["drop_projection_failed"] = py::int_(telemetry.drop_projection_failed);
                  telemetry_dict["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
                  telemetry_dict["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
                  telemetry_dict["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);
@@ -4495,7 +6243,6 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("MAT_FLAG_NO_SHADOW")     = (int)MAT_FLAG_NO_SHADOW;
     m.attr("MAT_FLAG_MANIFOLD")      = (int)MAT_FLAG_MANIFOLD;
     m.attr("MAT_FLAG_PARAMETRIC")    = (int)MAT_FLAG_PARAMETRIC;
-    m.attr("MAT_FLAG_TRANSMISSIVE")  = (int)MAT_FLAG_TRANSMISSIVE;
     m.attr("MAT_FLAG_APERTURE_STOP") = (int)MAT_FLAG_APERTURE_STOP;
     m.attr("MAT_FLAG_PICKING_ONLY")  = (int)MAT_FLAG_PICKING_ONLY;
     m.attr("MAX_SPECTRAL_BANDS")     = (int)MAX_SPECTRAL_BANDS;
@@ -5436,4 +7183,108 @@ Columns:
                 return d;
             },
             "Return last published player state as a dict.  Safe to call from any thread.");
+
+    /* ── Optical Assembly (Phase C) ──────────────────────────────────────── */
+    /* OpticalHandlerRole enum — maps to optical_assembly.py roles */
+    py::enum_<OpticalHandlerRole>(m, "OpticalHandlerRole", py::arithmetic())
+        .value("STOP",         OPTICAL_ROLE_STOP)
+        .value("MIRROR",       OPTICAL_ROLE_MIRROR)
+        .value("REFRACTOR",    OPTICAL_ROLE_REFRACTOR)
+        .value("FILTER",       OPTICAL_ROLE_FILTER)
+        .value("DIFFUSER",     OPTICAL_ROLE_DIFFUSER)
+        .value("SENSOR",       OPTICAL_ROLE_SENSOR)
+        .value("WAVE_REGION",  OPTICAL_ROLE_WAVE_REGION)
+        .export_values();
+
+    /* OpticalRayState — ray transport state through optical element */
+    py::class_<OpticalRayState>(m, "OpticalRayState",
+        "Optical ray state: amplitude, phase, wavelength during element traversal.")
+        .def(py::init<>())
+        .def_readwrite("amplitude_real", &OpticalRayState::amplitude_real)
+        .def_readwrite("amplitude_imag", &OpticalRayState::amplitude_imag)
+        .def_readwrite("phase_error", &OpticalRayState::phase_error)
+        .def_readwrite("wavelength_m", &OpticalRayState::wavelength_m)
+        .def_readwrite("cumulative_path_length_m", &OpticalRayState::cumulative_path_length_m)
+        .def_readwrite("bounce_count", &OpticalRayState::bounce_count)
+        .def_readwrite("is_active", &OpticalRayState::is_active)
+        .def_readwrite("hit_sensor", &OpticalRayState::hit_sensor);
+
+    /* OpticalGeometry — surface shape and curvature */
+    py::class_<OpticalGeometry>(m, "OpticalGeometry",
+        "Optical element geometry: position, diameter, curvature, aspheric terms.")
+        .def(py::init<>())
+        .def_readwrite("center_z_m", &OpticalGeometry::center_z_m)
+        .def_readwrite("diameter_m", &OpticalGeometry::diameter_m)
+        .def_readwrite("radius_m", &OpticalGeometry::radius_m)
+        .def_readwrite("radius_of_curvature_m", &OpticalGeometry::radius_of_curvature_m)
+        .def_readwrite("conic_k", &OpticalGeometry::conic_k)
+        .def_readwrite("aspheric_a4", &OpticalGeometry::aspheric_a4)
+        .def_readwrite("aspheric_a6", &OpticalGeometry::aspheric_a6)
+        .def_readwrite("surface_roughness_m", &OpticalGeometry::surface_roughness_m);
+
+    /* OpticalMaterial — refractive index, absorption, thermal properties */
+    py::class_<OpticalMaterial>(m, "OpticalMaterial",
+        "Optical material: refractive index, absorption, thermal dependence.")
+        .def(py::init<>())
+        .def_readwrite("n_real", &OpticalMaterial::n_real)
+        .def_readwrite("absorption_coeff_per_m", &OpticalMaterial::absorption_coeff_per_m)
+        .def_readwrite("fresnel_r_amplitude", &OpticalMaterial::fresnel_r_amplitude)
+        .def_readwrite("fresnel_r_phase", &OpticalMaterial::fresnel_r_phase)
+        .def_readwrite("dn_dT_per_K", &OpticalMaterial::dn_dT_per_K);
+
+    /* OpticalHandlerResult — output from handler processing */
+    py::class_<OpticalHandlerResult>(m, "OpticalHandlerResult",
+        "Result from optical handler: status and event counters.")
+        .def(py::init<>())
+        .def_readwrite("status", &OpticalHandlerResult::status)
+        .def_readwrite("rays_blocked", &OpticalHandlerResult::rays_blocked)
+        .def_readwrite("rays_hit_surface", &OpticalHandlerResult::rays_hit_surface)
+        .def_readwrite("rays_refracted", &OpticalHandlerResult::rays_refracted)
+        .def_readwrite("rays_reflected", &OpticalHandlerResult::rays_reflected)
+        .def_readwrite("rays_absorbed", &OpticalHandlerResult::rays_absorbed)
+        .def_readwrite("rays_transmitted", &OpticalHandlerResult::rays_transmitted);
+
+    /* ExposureBackendTelemetry — aggregated event and energy counters */
+    py::class_<ExposureBackendTelemetry>(m, "ExposureBackendTelemetry",
+        "Aggregated telemetry from optical assembly ray transport: event counts and energy.")
+        .def(py::init<>())
+        .def_readwrite("rays_launched", &ExposureBackendTelemetry::rays_launched)
+        .def_readwrite("rays_blocked_by_stop", &ExposureBackendTelemetry::rays_blocked_by_stop)
+        .def_readwrite("rays_hit_lens_surface", &ExposureBackendTelemetry::rays_hit_lens_surface)
+        .def_readwrite("rays_refracted", &ExposureBackendTelemetry::rays_refracted)
+        .def_readwrite("rays_reflected", &ExposureBackendTelemetry::rays_reflected)
+        .def_readwrite("rays_total_internal_reflection", &ExposureBackendTelemetry::rays_total_internal_reflection)
+        .def_readwrite("rays_entered_wave_region", &ExposureBackendTelemetry::rays_entered_wave_region)
+        .def_readwrite("rays_exited_wave_region", &ExposureBackendTelemetry::rays_exited_wave_region)
+        .def_readwrite("rays_deposited_sensor", &ExposureBackendTelemetry::rays_deposited_sensor)
+        .def_readwrite("rays_out_of_domain", &ExposureBackendTelemetry::rays_out_of_domain)
+        .def_readwrite("rays_fell_back_to_full_solve", &ExposureBackendTelemetry::rays_fell_back_to_full_solve)
+        .def_readwrite("energy_in", &ExposureBackendTelemetry::energy_in)
+        .def_readwrite("energy_out", &ExposureBackendTelemetry::energy_out)
+        .def_readwrite("energy_absorbed", &ExposureBackendTelemetry::energy_absorbed)
+        .def_readwrite("energy_blocked", &ExposureBackendTelemetry::energy_blocked)
+        .def_readwrite("mean_phase_error", &ExposureBackendTelemetry::mean_phase_error)
+        .def_readwrite("mean_focus_error", &ExposureBackendTelemetry::mean_focus_error);
+
+    /* ExposureBackendCpp — optical assembly ray transport backend */
+    py::class_<ExposureBackendCpp>(m, "ExposureBackendCpp",
+        "Backend for optical assembly ray transport: processes rays and aggregates telemetry.")
+        .def(py::init<>(),
+            "Create backend with no assembly (assembly can be attached in native code).")
+        .def_readwrite("assembly", &ExposureBackendCpp::assembly)
+        .def_readwrite("telemetry", &ExposureBackendCpp::telemetry)
+        .def("create_thin_lens_assembly",
+            &ExposureBackendCpp::create_thin_lens_assembly,
+            py::arg("focal_length_m"), py::arg("aperture_diameter_m"), py::arg("sensor_distance_m"),
+            "Create a simple thin lens optical assembly (aperture + lens + sensor).")
+        .def("process_ray",
+            &ExposureBackendCpp::process_ray,
+            py::arg("ray_in"), py::arg("ray_out"), py::arg("camera_mode"),
+            "Process a ray through the optical assembly, return 0 if reaches sensor.")
+        .def("get_telemetry",
+            &ExposureBackendCpp::get_telemetry,
+            "Get accumulated telemetry from ray processing.")
+        .def("reset_telemetry",
+            &ExposureBackendCpp::reset_telemetry,
+            "Reset telemetry counters to zero.");
 }

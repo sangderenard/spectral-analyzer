@@ -41,6 +41,60 @@ EPS = 1.0e-9
 C_LIGHT = 299_792_458.0
 DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 380e-9, MAX_SPECTRAL_BANDS)).astype(np.float64)
 DEBUG_BDPT_BACKTRACE_ONLY_DEFAULT = False
+UV_PAGE_RES_DEFAULT = 512
+UV_HOT_GROUP_LIMIT_DEFAULT = 8
+UV_HDR_CHANNELS = 11
+
+
+class FrameProfiler:
+    """Small rolling profiler for Python-side frame and display costs."""
+
+    def __init__(self, report_every: int = 60) -> None:
+        self.report_every = max(1, int(report_every))
+        self.frame = 0
+        self._order: List[str] = []
+        self._data: Dict[str, List[float]] = {}
+        self._t0: Dict[str, float] = {}
+
+    def begin(self, name: str) -> None:
+        if name not in self._data:
+            self._data[name] = []
+            self._order.append(name)
+        self._t0[name] = time.perf_counter()
+
+    def end(self, name: str) -> None:
+        t0 = self._t0.pop(name, None)
+        if t0 is None:
+            return
+        self._data.setdefault(name, []).append((time.perf_counter() - t0) * 1.0e3)
+
+    def measure(self, name: str):
+        profiler = self
+
+        class _Scope:
+            def __enter__(self_inner):
+                profiler.begin(name)
+                return self_inner
+
+            def __exit__(self_inner, _exc_type, _exc, _tb):
+                profiler.end(name)
+                return False
+
+        return _Scope()
+
+    def tick(self, extra: str = "") -> None:
+        self.frame += 1
+        if self.frame % self.report_every:
+            return
+        parts = []
+        for key in self._order:
+            vals = self._data.get(key, [])
+            if vals:
+                parts.append(f"{key}={float(np.mean(vals)):.2f}ms")
+        suffix = f"  {extra}" if extra else ""
+        print(f"[py-profile f={self.frame}] " + "  ".join(parts) + suffix, flush=True)
+        for vals in self._data.values():
+            vals.clear()
 
 
 def _nm_to_hz(nm: np.ndarray) -> np.ndarray:
@@ -94,6 +148,26 @@ def _wavelength_to_rgb_weights(wl_nm: np.ndarray) -> np.ndarray:
 
     out = np.column_stack([r * edge, g * edge, b * edge])
     return np.ascontiguousarray(out, dtype=np.float64)
+
+
+def _sensor_rgb_sensitivity_bands(freq_hz: np.ndarray) -> np.ndarray:
+    """Return RGB sensor emission spectra as (3, n_bands), normalized per row."""
+    f = np.asarray(freq_hz, dtype=np.float64).reshape(-1)
+    if f.size <= 0:
+        return np.zeros((3, 0), dtype=np.float64)
+    wl = np.clip(C_LIGHT / np.maximum(f, EPS) * 1.0e9, 360.0, 760.0)
+
+    def gaussian(center_nm: float, sigma_nm: float) -> np.ndarray:
+        return np.exp(-0.5 * ((wl - center_nm) / max(sigma_nm, EPS)) ** 2)
+
+    # Broad, overlapping camera-like sensitivity lobes.  These are launch
+    # spectra for reverse/sensor paths, not display colors.
+    r = gaussian(610.0, 42.0)
+    g = gaussian(540.0, 38.0)
+    b = gaussian(460.0, 32.0)
+    curves = np.stack([r, g, b], axis=0)
+    curves /= np.maximum(curves.max(axis=1, keepdims=True), 1.0e-12)
+    return np.ascontiguousarray(curves, dtype=np.float64)
 
 
 def _free_frequency_hits_to_rgb(
@@ -1619,6 +1693,7 @@ def _build_decorative_mesh(
     radius: float = 0.020,
     n_u: int = 28,
     n_v: int = 20,
+    tri_ids: List[int] | None = None,
 ) -> None:
     cx, cy, cz = float(center[0]), float(center[1]), float(center[2])
     pts = np.zeros((n_u + 1, n_v + 1, 3), dtype=np.float64)
@@ -1639,7 +1714,11 @@ def _build_decorative_mesh(
             p01 = pts[iu, iv + 1]
             p10 = pts[iu + 1, iv]
             p11 = pts[iu + 1, iv + 1]
+            if tri_ids is not None:
+                tri_ids.append(len(tri_list))
             _append_tri(tri_list, mat_ids, p00, p10, p11, mat_idx)
+            if tri_ids is not None:
+                tri_ids.append(len(tri_list))
             _append_tri(tri_list, mat_ids, p00, p11, p01, mat_idx)
 
 
@@ -1876,7 +1955,7 @@ def _build_lens_mesh(
 def _build_scene_mesh(
     scene: SceneConfig,
     sidecar: FreeFrequencySidecar,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MaterialDatabase, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MaterialDatabase, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[np.ndarray, np.ndarray, float, float]], np.ndarray, np.ndarray]:
     db = MaterialDatabase()
 
     idx_black = db.register(
@@ -2060,11 +2139,14 @@ def _build_scene_mesh(
     mats: List[int] = []
     lens_front_tri_ids: List[int] = []
     lens_back_tri_ids: List[int] = []
+    # Per-lens (front_ids, back_ids, radius_front, radius_back) for parametric surface registration.
+    lens_surface_groups: List[Tuple[np.ndarray, np.ndarray, float, float]] = []
     silver_wall_tri_ids: List[int] = []
     black_wall_tri_ids: List[int] = []
     camera_body_tri_ids: List[int] = []
     aperture_stop_tri_ids: List[int] = []
     image_plate_tri_ids: List[int] = []
+    object_tri_ids: List[int] = []
     lenses: List[LensConfig] = []
     if not bool(getattr(scene, "disable_optics", False)):
         lenses = [l for l in _scene_lenses(scene) if _lens_is_valid(l)]
@@ -2179,6 +2261,7 @@ def _build_scene_mesh(
         radius=0.045,
         n_u=40,
         n_v=28,
+        tri_ids=object_tri_ids,
     )
 
     # Mirror end-cap disc at the back of the light chamber (at source_x, faces +x inward).
@@ -2276,6 +2359,8 @@ def _build_scene_mesh(
             _build_baffle_annulus(lens.x_front - 0.002, stage_lip_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
             _build_baffle_annulus(lens.x_back + 0.002, stage_lip_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
             _build_baffle_annulus(lens.x_back + 0.010, stage_clear_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
+            _f_start = len(lens_front_tri_ids)
+            _b_start = len(lens_back_tri_ids)
             _build_lens_mesh(
                 lens,
                 tris,
@@ -2286,6 +2371,12 @@ def _build_scene_mesh(
                 front_tri_ids=lens_front_tri_ids,
                 back_tri_ids=lens_back_tri_ids,
             )
+            lens_surface_groups.append((
+                np.ascontiguousarray(lens_front_tri_ids[_f_start:], dtype=np.int32),
+                np.ascontiguousarray(lens_back_tri_ids[_b_start:], dtype=np.int32),
+                float(lens.radius_front),
+                float(lens.radius_back),
+            ))
 
         # Post-lens bellows frustum: flares from the last-lens aperture radius
         # out to the full sensor plate radius.  No cylindrical tube — every pixel
@@ -2430,6 +2521,14 @@ def _build_scene_mesh(
         ]),
         dtype=np.int32,
     )
+    tube_baffle_ids = np.ascontiguousarray(
+        np.concatenate([
+            np.asarray(silver_wall_tri_ids, dtype=np.int32),
+            np.asarray(black_wall_tri_ids, dtype=np.int32),
+            np.asarray(camera_body_tri_ids, dtype=np.int32),
+        ]),
+        dtype=np.int32,
+    )
     return (
         verts,
         normals,
@@ -2442,7 +2541,185 @@ def _build_scene_mesh(
         np.ascontiguousarray(np.asarray(image_plate_tri_ids, dtype=np.int32)),
         np.ascontiguousarray(np.asarray(aperture_stop_tri_ids, dtype=np.int32)),
         suppress_ids,
+        lens_surface_groups,
+        np.ascontiguousarray(np.asarray(object_tri_ids, dtype=np.int32)),
+        tube_baffle_ids,
     )
+
+
+@dataclass
+class UvSurfaceGroup:
+    name: str
+    kind: str
+    tri_ids: np.ndarray
+    uv_coords: np.ndarray
+    res: int = UV_PAGE_RES_DEFAULT
+    layer: int = -1
+    group_id: int = -1
+    hot: bool = True
+    warm_channels: Optional[np.ndarray] = None
+    warm_page: Optional[np.ndarray] = None
+    last_summary: Dict[str, object] = field(default_factory=dict)
+
+
+class UvPageBank:
+    """Physical-surface UV page registry and warm-page cache."""
+
+    def __init__(self, n_bands: int, res: int = UV_PAGE_RES_DEFAULT,
+                 hot_limit: int = UV_HOT_GROUP_LIMIT_DEFAULT) -> None:
+        self.n_bands = int(n_bands)
+        self.res = int(res)
+        self.hot_limit = int(hot_limit)
+        self.groups: List[UvSurfaceGroup] = []
+        self._by_gid: Dict[int, UvSurfaceGroup] = {}
+
+    @property
+    def n_channels(self) -> int:
+        return UV_HDR_CHANNELS + 5 * self.n_bands
+
+    def add(self, name: str, kind: str, tri_ids: np.ndarray, uv_coords: np.ndarray) -> None:
+        ids = np.ascontiguousarray(np.asarray(tri_ids, dtype=np.int32).reshape(-1), dtype=np.int32)
+        if ids.size <= 0:
+            return
+        uv = np.ascontiguousarray(np.asarray(uv_coords, dtype=np.float32).reshape(ids.size, 3, 2), dtype=np.float32)
+        layer = len(self.groups)
+        self.groups.append(UvSurfaceGroup(
+            name=str(name),
+            kind=str(kind),
+            tri_ids=ids,
+            uv_coords=uv,
+            res=self.res,
+            layer=layer,
+            hot=(layer < self.hot_limit),
+        ))
+
+    def register_all(self, tracer, sample_area: int) -> None:
+        self._by_gid.clear()
+        for g in self.groups:
+            g.group_id = -1
+            if g.warm_page is None:
+                g.warm_page = np.zeros((g.res, g.res, 4), dtype=np.float32)
+            if not g.hot:
+                continue
+            gid = int(tracer.register_tri_group(
+                0,
+                int(sample_area),
+                np.ascontiguousarray(g.tri_ids, dtype=np.int32),
+                uv_image={
+                    "res": int(g.res),
+                    "uv_coords": np.ascontiguousarray(g.uv_coords, dtype=np.float32),
+                },
+            ))
+            g.group_id = gid
+            self._by_gid[gid] = g
+            if g.warm_channels is not None:
+                tracer.set_group_uv_image(
+                    gid,
+                    np.ascontiguousarray(g.warm_channels, dtype=np.float32),
+                )
+
+    def update_from_tracer(self, tracer, freq_hz: np.ndarray, mode: str = "combined") -> np.ndarray:
+        layers = max(1, len(self.groups))
+        tex = np.zeros((layers, self.res, self.res, 4), dtype=np.float32)
+        if not self.groups:
+            return tex
+        for g in self.groups:
+            if g.warm_page is not None:
+                tex[g.layer] = np.asarray(g.warm_page, dtype=np.float32)
+        wl_nm = (C_LIGHT / np.maximum(np.asarray(freq_hz, dtype=np.float64)[:self.n_bands], EPS)) * 1.0e9
+        rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
+        for g in self.groups:
+            if g.group_id < 0:
+                continue
+            try:
+                d = tracer.get_group_uv_image(int(g.group_id))
+                summary = tracer.get_group_uv_summary(int(g.group_id))
+            except Exception as exc:
+                if not g.last_summary.get("warned"):
+                    print(f"[uv-bank] readback unavailable group={g.name} gid={g.group_id}: {exc}", flush=True)
+                    g.last_summary["warned"] = True
+                continue
+            channels = np.asarray(d["channels"], dtype=np.float32)
+            nb = int(d.get("n_bands", self.n_bands))
+            g.warm_channels = np.ascontiguousarray(channels, dtype=np.float32)
+            if channels.shape[0] >= UV_HDR_CHANNELS + 5 * nb:
+                fwd = channels[UV_HDR_CHANNELS + 3 * nb:UV_HDR_CHANNELS + 4 * nb]
+                sen = channels[UV_HDR_CHANNELS + 4 * nb:UV_HDR_CHANNELS + 5 * nb]
+                if mode == "forward":
+                    band_mags = fwd
+                elif mode == "sensor":
+                    band_mags = sen
+                elif mode == "difference":
+                    band_mags = np.maximum(fwd - sen, 0.0)
+                else:
+                    band_mags = fwd + sen
+            else:
+                band_mags = channels[UV_HDR_CHANNELS:UV_HDR_CHANNELS + nb]
+            rgb = np.einsum("byx,bc->yxc", band_mags[:self.n_bands], rgb_w[:band_mags.shape[0]], optimize=True)
+            alpha = np.maximum.reduce(rgb, axis=2) if rgb.size else np.zeros((self.res, self.res), dtype=np.float32)
+            tex[g.layer, :, :, :3] = np.maximum(rgb, 0.0)
+            tex[g.layer, :, :, 3] = np.maximum(alpha, 0.0)
+            g.warm_page = tex[g.layer].copy()
+            g.last_summary = dict(summary)
+        return tex
+
+    def metadata(self) -> List[Dict[str, object]]:
+        return [
+            {
+                "name": g.name,
+                "kind": g.kind,
+                "group_id": int(g.group_id),
+                "layer": int(g.layer),
+                "res": int(g.res),
+                "hot": bool(g.hot),
+                "tri_count": int(g.tri_ids.size),
+                **g.last_summary,
+            }
+            for g in self.groups
+        ]
+
+    def refresh_summaries(self, tracer) -> bool:
+        any_nonzero = False
+        for g in self.groups:
+            if g.group_id < 0:
+                continue
+            try:
+                s = tracer.get_group_uv_summary(int(g.group_id))
+            except Exception:
+                continue
+            g.last_summary = dict(s)
+            nz = int(g.last_summary.get("nonzero_texels", 0) or 0)
+            fwd = float(g.last_summary.get("total_forward", 0.0) or 0.0)
+            sen = float(g.last_summary.get("total_sensor", 0.0) or 0.0)
+            any_nonzero = any_nonzero or (nz > 0 or fwd > 0.0 or sen > 0.0)
+        return any_nonzero
+
+    def any_hot_data(self) -> bool:
+        for g in self.groups:
+            if not g.hot:
+                continue
+            s = g.last_summary
+            if int(s.get("nonzero_texels", 0) or 0) > 0:
+                return True
+            if float(s.get("total_forward", 0.0) or 0.0) > 0.0:
+                return True
+            if float(s.get("total_sensor", 0.0) or 0.0) > 0.0:
+                return True
+        return False
+
+    def memory_report(self) -> Dict[str, float]:
+        group_count = len(self.groups)
+        hot_count = sum(1 for g in self.groups if g.hot)
+        accum_bytes = self.n_channels * self.res * self.res * 4
+        warm_bytes = group_count * self.res * self.res * 4 * 4
+        return {
+            "groups": float(group_count),
+            "hot_groups": float(hot_count),
+            "channels": float(self.n_channels),
+            "gpu_hot_mb": float(hot_count * accum_bytes) / (1024.0 * 1024.0),
+            "planned_warm_analytical_mb": float(group_count * accum_bytes) / (1024.0 * 1024.0),
+            "warm_rgba32f_mb": float(warm_bytes) / (1024.0 * 1024.0),
+        }
 
 
 @dataclass
@@ -2460,6 +2737,7 @@ class ForwardCppLensBench:
         self._bdpt_sensor_cfg: Tuple[int, int] | None = None
         self._bdpt_source_gid = -1
         self.bdpt_last_sensor_gid = -1
+        self.uv_page_bank: Optional[UvPageBank] = None
         self.bdpt_last_launched_rays = 0
         self.bdpt_last_records = 0
         self.bdpt_last_volume_records = 0
@@ -2480,6 +2758,9 @@ class ForwardCppLensBench:
         self._plate_sensor_photons_accum: Optional[np.ndarray] = None
         self._plate_sensor_electrons_accum: Optional[np.ndarray] = None
         self._last_bdpt_records: Optional[np.ndarray] = None
+        # GPU/CPU compute mode: 'gpu', 'cpu', or 'mixed'.
+        # Controls use_gpu_compute and gpu_all_stages in submit_rays.
+        self.compute_mode: str = "gpu"
         # Persistent-pipeline drain loop
         self._drain_thread: Optional[threading.Thread] = None
         self._drain_stop  = threading.Event()
@@ -2492,10 +2773,16 @@ class ForwardCppLensBench:
         self._vis_buf     = np.zeros((_VIS_CAP, 5), dtype=np.float32)
         self._vis_ptr     = 0     # next write position (ring head)
         self._vis_full    = False  # True once ring has wrapped at least once
-        self.uv_accum:    Optional["UVLightAccumulator"] = None  # set by caller if desired
         # Tunable amplitude floor: rays (and child spawns) below this threshold
         # are terminated.  Also used for material epsilon-kill pre-flagging.
         self._min_amplitude: float = 1e-5
+        # Sensor ray bias/gain: sensor rays are launched with amplitude
+        # multiplied by sensor_amp_gain (pre-compensates multi-lens Fresnel
+        # dropoff) and survive until amplitude falls below sensor_min_amplitude
+        # (0.0 = never kill on amplitude, appropriate for single-photon detectors).
+        self.sensor_amp_gain: float = 1.0
+        self.sensor_min_amplitude: float = 0.0
+        self._sensor_aim_reported: bool = False
         # Whether the pipeline has been configured with adaptive thresholds yet
         self._pipeline_configured: bool = False
         # Preferred render frame rate (Hz) and blending weight used in drain-loop
@@ -2525,7 +2812,13 @@ class ForwardCppLensBench:
                 freq_hz_vec = np.ascontiguousarray(np.concatenate([freq_hz_vec, pad[int(freq_hz_vec.size):n_req]]), dtype=np.float64)
         self.freq_hz = freq_hz_vec
 
-        verts, normals, mat_idx, tri_arr, db, source_ids, lens_front_ids, lens_back_ids, image_plate_ids, aperture_stop_ids, tube_wall_ids = _build_scene_mesh(self.scene, self.sidecar)
+        (
+            verts, normals, mat_idx, tri_arr, db,
+            source_ids, lens_front_ids, lens_back_ids, image_plate_ids,
+            aperture_stop_ids, tube_wall_ids, lens_surface_groups,
+            object_ids, tube_baffle_ids,
+        ) = _build_scene_mesh(self.scene, self.sidecar)
+        self.lens_surface_groups = lens_surface_groups
         self.tri_vertices = np.ascontiguousarray(tri_arr, dtype=np.float64)
         self.tri_centroids = np.ascontiguousarray(np.mean(tri_arr, axis=1), dtype=np.float64)
         self.n_tris = int(tri_arr.shape[0])
@@ -2533,6 +2826,8 @@ class ForwardCppLensBench:
         self.source_tri_ids = np.ascontiguousarray(source_ids, dtype=np.int32)
         self.image_plate_tri_ids = np.ascontiguousarray(image_plate_ids, dtype=np.int32)
         self.aperture_stop_tri_ids = np.ascontiguousarray(aperture_stop_ids, dtype=np.int32)
+        self.object_tri_ids = np.ascontiguousarray(object_ids, dtype=np.int32)
+        self.tube_baffle_tri_ids = np.ascontiguousarray(tube_baffle_ids, dtype=np.int32)
 
         # Per-triangle kind for cross-section rendering.
         tri_kind = np.full(self.n_tris, TRI_KIND_DEFAULT, dtype=np.int8)
@@ -2741,9 +3036,107 @@ class ForwardCppLensBench:
             clear_existing=True,
         )
 
-        # The lens mesh is already spherical.  Do not register an extra
-        # parametric SDF warp here; doing so changes the transport normal away
-        # from the explicit glass surface and can corrupt exit behavior.
+        self._build_uv_page_bank()
+        n_lens_param = self._register_lens_parametric_groups()
+        print(f"[parametric-register] lens_surface_groups={n_lens_param}", flush=True)
+        self._register_uv_page_bank()
+
+        # Lens surface groups are registered as TRI_PARAM_SURFACE_SDF_SPHERE so
+        # T2 refines hit_pos and computes exact Jacobian normals for each
+        # spherical surface in the live persistent pipeline.
+
+    def _uv_coords_for_tri_ids(self, tri_ids: np.ndarray, mode: str) -> np.ndarray:
+        ids = np.ascontiguousarray(np.asarray(tri_ids, dtype=np.int32).reshape(-1), dtype=np.int32)
+        verts = self.tri_vertices[ids] if ids.size else np.zeros((0, 3, 3), dtype=np.float64)
+        uv = np.zeros((ids.size, 3, 2), dtype=np.float32)
+        if ids.size <= 0:
+            return uv
+        if mode == "x_cylinder":
+            y = verts[:, :, 1]
+            z = verts[:, :, 2]
+            x = verts[:, :, 0]
+            ang = np.arctan2(z, y)
+            uv[:, :, 0] = ((ang + math.pi) / (2.0 * math.pi)).astype(np.float32)
+            xmin = float(np.min(x)); xmax = float(np.max(x)); span = max(EPS, xmax - xmin)
+            uv[:, :, 1] = np.clip((x - xmin) / span, 0.0, 1.0).astype(np.float32)
+        else:
+            if mode == "xy":
+                a = verts[:, :, 0]; b = verts[:, :, 1]
+            elif mode == "xz":
+                a = verts[:, :, 0]; b = verts[:, :, 2]
+            else:
+                a = verts[:, :, 1]; b = verts[:, :, 2]
+            amin = float(np.min(a)); amax = float(np.max(a)); aspan = max(EPS, amax - amin)
+            bmin = float(np.min(b)); bmax = float(np.max(b)); bspan = max(EPS, bmax - bmin)
+            uv[:, :, 0] = np.clip((a - amin) / aspan, 0.0, 1.0).astype(np.float32)
+            uv[:, :, 1] = np.clip((b - bmin) / bspan, 0.0, 1.0).astype(np.float32)
+        return np.ascontiguousarray(uv, dtype=np.float32)
+
+    def _build_uv_page_bank(self) -> None:
+        bank = UvPageBank(self.n_bands, res=UV_PAGE_RES_DEFAULT, hot_limit=UV_HOT_GROUP_LIMIT_DEFAULT)
+        bank.add("emitters", "emitter", self.source_tri_ids, self._uv_coords_for_tri_ids(self.source_tri_ids, "yz"))
+        bank.add("object_plane", "object", self.object_tri_ids, self._uv_coords_for_tri_ids(self.object_tri_ids, "yz"))
+        bank.add("sensor_plate", "sensor", self.image_plate_tri_ids, self._uv_coords_for_tri_ids(self.image_plate_tri_ids, "yz"))
+        bank.add("aperture_or_iris", "aperture", self.aperture_stop_tri_ids, self._uv_coords_for_tri_ids(self.aperture_stop_tri_ids, "yz"))
+        bank.add("tube_or_baffles", "baffle", self.tube_baffle_tri_ids, self._uv_coords_for_tri_ids(self.tube_baffle_tri_ids, "x_cylinder"))
+        for i, (front_ids, back_ids, _rf, _rb) in enumerate(getattr(self, "lens_surface_groups", [])):
+            bank.add(f"lens_{i:02d}_front", "lens_front", front_ids, self._uv_coords_for_tri_ids(front_ids, "yz"))
+            bank.add(f"lens_{i:02d}_back", "lens_back", back_ids, self._uv_coords_for_tri_ids(back_ids, "yz"))
+        self.uv_page_bank = bank
+        mem = bank.memory_report()
+        print(
+            "[uv-bank]",
+            f"groups={int(mem['groups'])}",
+            f"hot_limit={UV_HOT_GROUP_LIMIT_DEFAULT}",
+            f"page={UV_PAGE_RES_DEFAULT}x{UV_PAGE_RES_DEFAULT}",
+            f"channels={int(mem['channels'])}",
+            f"gpu_hot_mb~={mem['gpu_hot_mb']:.1f}",
+            f"warm_rgba32f_mb={mem['warm_rgba32f_mb']:.1f}",
+            flush=True,
+        )
+
+    def _register_uv_page_bank(self) -> None:
+        if self.uv_page_bank is None:
+            return
+        sample_area = int(getattr(_sk, "TRI_GROUP_SAMPLE_AREA", 1))
+        self.uv_page_bank.register_all(self.tracer, sample_area)
+        print(
+            "[uv-bank-register]",
+            " ".join(f"{g.name}:gid={g.group_id}:layer={g.layer}:tris={g.tri_ids.size}" for g in self.uv_page_bank.groups),
+            flush=True,
+        )
+
+    def _register_lens_parametric_groups(self) -> int:
+        """Register passive exact lens-surface refiners for the live pipeline."""
+        sample_area = int(getattr(_sk, "TRI_GROUP_SAMPLE_AREA", 1))
+        param_sdf_sphere = int(getattr(_sk, "TRI_PARAM_SURFACE_SDF_SPHERE", 3))
+        param_none_role = 0
+        n_lens_param = 0
+        for front_ids, back_ids, r_front, r_back in getattr(self, "lens_surface_groups", []):
+            margin = 0.12
+            if front_ids.size > 0:
+                self.tracer.register_tri_group(
+                    param_none_role,
+                    sample_area,
+                    np.ascontiguousarray(front_ids, dtype=np.int32),
+                    parametric_surface={
+                        "kind": param_sdf_sphere,
+                        "coeffs": np.array([float(r_front), margin], dtype=np.float64),
+                    },
+                )
+                n_lens_param += 1
+            if back_ids.size > 0:
+                self.tracer.register_tri_group(
+                    param_none_role,
+                    sample_area,
+                    np.ascontiguousarray(back_ids, dtype=np.int32),
+                    parametric_surface={
+                        "kind": param_sdf_sphere,
+                        "coeffs": np.array([float(r_back), margin], dtype=np.float64),
+                    },
+                )
+                n_lens_param += 1
+        return n_lens_param
 
     def _world_to_field_ijk(self, p: np.ndarray) -> Tuple[int, int, int]:
         x_span = max(EPS, float(self.scene.x_max - self.scene.x_min))
@@ -2870,6 +3263,13 @@ class ForwardCppLensBench:
                 },
             )
         )
+        # Register exact spherical surface refiners before UV pages so both the
+        # legacy BDPT path and live persistent pipeline use the same geometry.
+        n_lens_param = self._register_lens_parametric_groups()
+
+        # Re-register physical UV pages — clear_tri_groups() above destroyed them.
+        self._register_uv_page_bank()
+
         self._bdpt_sensor_cfg = cfg
         print(
             "[bdpt-register]",
@@ -2883,6 +3283,8 @@ class ForwardCppLensBench:
             f"stop_r={stop_radius_m*1e3:.2f}mm",
             f"lens_center_x={lens_stack_center_x:.4f}",
             f"camera_mode={int(camera_mode)}",
+            f"lens_param_groups={n_lens_param}",
+            f"uv_groups={len(self.uv_page_bank.groups) if self.uv_page_bank is not None else 0}",
             flush=True,
         )
         return int(self.bdpt_last_sensor_gid)
@@ -2972,6 +3374,8 @@ class ForwardCppLensBench:
             if tags is not None and si < len(tags):
                 tag_arr[base:base+n_rays] = int(tags[si])
 
+        _use_gpu = self.compute_mode in ("gpu", "mixed")
+        _all_gpu = self.compute_mode == "gpu"
         self.tracer.submit_rays(
             origins=np.ascontiguousarray(origins),
             directions=np.ascontiguousarray(directions),
@@ -2983,7 +3387,8 @@ class ForwardCppLensBench:
             min_amplitude=float(self._min_amplitude),
             max_children=2,
             seed=int(seed),
-            use_gpu_compute=True,
+            use_gpu_compute=_use_gpu,
+            gpu_all_stages=_all_gpu,
             shader_dir=_SHADER_DIR,
         )
 
@@ -3038,7 +3443,9 @@ class ForwardCppLensBench:
             [np.full(n_pixels, plate_x, dtype=np.float64), gy, gz], axis=1
         )  # (n_pixels, 3)
 
-        total = n_pixels * n_rays
+        n_sensor_channels = 3
+        samples_per_pixel = n_rays * n_sensor_channels
+        total = n_pixels * samples_per_pixel
 
         # ── Orthonormal basis for aperture disc ──────────────────────────────
         ap_n = self.aperture_normal / (np.linalg.norm(self.aperture_normal) + 1e-30)
@@ -3057,12 +3464,12 @@ class ForwardCppLensBench:
         stencil_cx = sc_rad * np.cos(sc_ang)   # (n_pixels,) in aperture-plane coords
         stencil_cy = sc_rad * np.sin(sc_ang)
 
-        # n_rays jitter samples per pixel within stencil_r of its centre.
+        # n_rays RGB triplets per pixel within stencil_r of its centre.
         jit_ang = rng.uniform(0.0, 2.0 * math.pi, total)
         jit_rad = np.sqrt(rng.uniform(0.0, 1.0, total)) * stencil_r
-        # Tile stencil centres across n_rays per pixel.
-        s_cx = np.repeat(stencil_cx, n_rays) + jit_rad * np.cos(jit_ang)  # (total,)
-        s_cy = np.repeat(stencil_cy, n_rays) + jit_rad * np.sin(jit_ang)
+        # Tile stencil centres across RGB triplets per pixel.
+        s_cx = np.repeat(stencil_cx, samples_per_pixel) + jit_rad * np.cos(jit_ang)  # (total,)
+        s_cy = np.repeat(stencil_cy, samples_per_pixel) + jit_rad * np.sin(jit_ang)
         # Clamp to aperture disc so stencil near the edge stays valid.
         s_rr = np.sqrt(s_cx ** 2 + s_cy ** 2)
         over = s_rr > ap_r
@@ -3076,23 +3483,59 @@ class ForwardCppLensBench:
                   + s_cy[:, None] * tc[None, :])  # (total, 3)
 
         # ── Assemble origins / directions ─────────────────────────────────────
-        origins    = np.repeat(sensor_cents, n_rays, axis=0)   # (total, 3)
+        origins    = np.repeat(sensor_cents, samples_per_pixel, axis=0)   # (total, 3)
         d          = ap_pts - origins
         nrm        = np.linalg.norm(d, axis=1, keepdims=True)
         directions = d / np.maximum(nrm, 1e-30)
-        src_ids    = np.repeat(np.arange(n_pixels, dtype=np.int32), n_rays)
+        src_ids    = np.repeat(np.arange(n_pixels, dtype=np.int32), samples_per_pixel)
         cflag_arr  = np.ones(total, dtype=np.uint8)   # 1 = sensor-cast / reverse
 
+        if not self._sensor_aim_reported:
+            center_origin = np.array([plate_x, 0.0, 0.0], dtype=np.float64)
+            aim_vec = np.asarray(self.aperture_centroid, dtype=np.float64) - center_origin
+            aim_len = float(np.linalg.norm(aim_vec))
+            aim_dir = aim_vec / max(aim_len, 1.0e-30)
+            print(
+                "[sensor-aim]",
+                f"plate_x={plate_x:.6f}",
+                f"plate_radius={float(plate.radius):.6f}",
+                f"target={np.asarray(self.aperture_centroid, dtype=np.float64).tolist()}",
+                f"target_radius={float(ap_r):.6f}",
+                f"center_dir={aim_dir.tolist()}",
+                f"center_distance={aim_len:.6f}",
+                f"pixels={n_pixels}",
+                f"rays_per_pixel={n_rays}",
+                flush=True,
+            )
+            self._sensor_aim_reported = True
+
+        # Reverse paths are launched through RGB sensor sensitivity lobes.  This
+        # makes the sensor an RGB spectral emitter instead of a flat white source.
+        amp_scale = float(self.sensor_amp_gain)
+        sens_rgb = _sensor_rgb_sensitivity_bands(self.freq_hz[:self.n_bands])
+        channel_idx = np.tile(np.arange(n_sensor_channels, dtype=np.int32), n_pixels * n_rays)
+        sensor_amps = (amp_scale * sens_rgb[channel_idx]).astype(np.complex128, copy=False)
+        # Tag the channel in the high bits without disturbing the pixel src_id.
+        tag_arr = (channel_idx.astype(np.uint64) << np.uint64(60)) | src_ids.astype(np.uint64)
+
+        _use_gpu = self.compute_mode in ("gpu", "mixed")
+        _all_gpu = self.compute_mode == "gpu"
         self.tracer.submit_rays(
             origins=np.ascontiguousarray(origins),
             directions=np.ascontiguousarray(directions),
+            amplitudes=np.ascontiguousarray(sensor_amps),
             src_ids=np.ascontiguousarray(src_ids),
+            tags=np.ascontiguousarray(tag_arr),
             color_flags=np.ascontiguousarray(cflag_arr),
             max_bounces=int(max_bounces),
-            min_amplitude=float(self._min_amplitude),
-            max_children=2,
+            min_amplitude=float(self.sensor_min_amplitude),
+            # Camera subpaths use one sampled continuation per surface event.
+            # Deterministic two-way splitting from every sensor pixel explodes
+            # as O(2^bounce) and will keep the GPU queue saturated at 256².
+            max_children=1,
             seed=int(seed ^ 0xBEEF),
-            use_gpu_compute=True,
+            use_gpu_compute=_use_gpu,
+            gpu_all_stages=_all_gpu,
             shader_dir=_SHADER_DIR,
         )
         self._ensure_drain_loop()
@@ -3187,7 +3630,12 @@ class ForwardCppLensBench:
                     if n >= batch * 3 // 4:
                         continue
                 else:
-                    time.sleep(0.001)   # nothing ready; back off
+                    # Back off harder when the pipeline is also empty — avoids
+                    # spinning the CPU core at full speed in GPU-all mode.
+                    if int(self.tracer.in_flight_count()) == 0:
+                        time.sleep(0.020)
+                    else:
+                        time.sleep(0.001)
             except Exception as _drain_exc:
                 print(f"[drain-loop ERROR] {_drain_exc}", flush=True)
                 time.sleep(0.1)
@@ -3235,9 +3683,6 @@ class ForwardCppLensBench:
         vis_mask    = strike_mask | field_mask
         if not np.any(vis_mask):
             return
-
-        if self.uv_accum is not None:
-            self.uv_accum.feed(records)
 
         # --- Build unified segment rows (13 cols) ---
         # col 0:2  seg_start xyz
@@ -3754,8 +4199,8 @@ class ForwardCppLensBench:
         self,
         field_gain: float = 0.25,
         surface_gain: float = 0.35,
-        field_leak: float = 0.92,
-        surface_leak: float = 0.92,
+        field_leak: float = 0.0,
+        surface_leak: float = 0.0,
     ) -> Tuple[np.ndarray, np.ndarray]:
         with self._trace_lock:
             tri_flux_vis = np.ascontiguousarray(self.tri_flux, dtype=np.float32)
@@ -3868,12 +4313,15 @@ class ForwardCppLensBench:
                 raise RuntimeError("field capture grid size does not match configured volume")
 
             amp = np.sqrt(np.maximum(0.0, grid[..., 0] ** 2 + grid[..., 1] ** 2))
-            scalar = np.sum(amp, axis=0).reshape((self._field_nz, self._field_ny, self._field_nx))
-            scalar_pos = scalar[scalar > 0.0]
-            white = float(np.percentile(scalar_pos, 99.8)) if scalar_pos.size else 0.0
-            white = max(white, 1.0e-8)
-            f = np.minimum((scalar / white) * float(max(0.0, field_gain)), 64.0)
-            field_rgb = np.stack([0.55 * f, 0.78 * f, 1.00 * f], axis=-1)
+            # Keep the field texture in raw persistent exposure units.  Do not
+            # percentile-normalize per frame: that makes accumulated light appear
+            # to fade whenever a newer/brighter voxel changes the white point.
+            bands = min(int(amp.shape[0]), int(self.freq_hz.shape[0]))
+            wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:bands], dtype=np.float64), EPS)) * 1.0e9
+            rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
+            rgb_flat = np.einsum("bn,bc->nc", amp[:bands], rgb_w, optimize=True)
+            field_rgb = rgb_flat.reshape((self._field_nz, self._field_ny, self._field_nx, 3))
+            field_rgb = np.maximum(field_rgb, 0.0) * float(max(0.0, field_gain))
 
         # ── Build per-class vertex arrays from the pipeline ring buffer ──────
         x_span  = max(EPS, float(self.scene.x_max - self.scene.x_min))
@@ -3928,22 +4376,31 @@ class ForwardCppLensBench:
 
         try:
             ps = self.tracer.pipeline_stats()
-            gpu_parts = []
+            stage_parts = []
             for stage in ("t1", "t2", "t3", "t4"):
-                st = ps[stage]
+                st       = ps[stage]
+                cpu_tp   = float(st["throughput"])
                 gpu_tp   = float(st["gpu_throughput"])
-                gpu_frac = float(st["gpu_fraction"])
+                cpu_n    = int(st["processed"])
+                gpu_n    = int(st["gpu_processed"])
                 bs_gpu   = int(st["gpu_batch_size"])
-                gpu_parts.append(f"{stage}:{gpu_tp/1e3:.1f}k/{gpu_frac:.2f}/{bs_gpu}")
-            gpu_summary = "  ".join(gpu_parts)
+                gpu_frac = float(st["gpu_fraction"])
+                # Skip stages where neither CPU nor GPU has processed anything yet
+                if cpu_n == 0 and gpu_n == 0:
+                    continue
+                cpu_str = f"cpu={cpu_tp/1e3:.1f}k(n={cpu_n})" if cpu_n > 0 else "cpu=-"
+                gpu_str = f"gpu={gpu_tp/1e3:.1f}k(n={gpu_n},bs={bs_gpu},f={gpu_frac:.2f})" if gpu_n > 0 else "gpu=-"
+                stage_parts.append(f"{stage}:[{cpu_str} {gpu_str}]")
+            pipeline_summary = "  ".join(stage_parts) if stage_parts else "no activity"
         except Exception:
-            gpu_summary = "n/a"
+            pipeline_summary = "n/a"
 
+        field_nonzero = int(np.count_nonzero(np.maximum.reduce(field_rgb, axis=3)))
         print(
             "[display-records]",
-            f"field_nonzero={int(np.count_nonzero(scalar))}",
+            f"field_nonzero={field_nonzero}",
             f"pts={[n_by_class[c] for c in range(4)]}",
-            f"gpu(tp_k/s|frac|bs)=[{gpu_summary}]",
+            f"pipeline={pipeline_summary}",
             flush=True,
         )
 
@@ -4528,123 +4985,6 @@ def tune_zoom_focus_scene(base_scene: SceneConfig, iterations: int = 32, seed: i
     return best_scene
 
 
-class UVLightAccumulator:
-    """Accumulates STRIKE RayRecords into per-group UV irradiance maps.
-
-    Usage::
-
-        acc = UVLightAccumulator(n_groups=4, n_bands=32, resolution=512)
-        acc.set_tri_mapping(tri_to_group, tri_uv)   # optional
-        # inside drain loop:
-        acc.feed(tracer.drain_records())
-        irr, normals, hits = acc.get_uv_maps()
-    """
-
-    def __init__(self, n_groups: int, n_bands: int, resolution: int = 512) -> None:
-        self.n_groups  = int(n_groups)
-        self.n_bands   = int(n_bands)
-        self.H = self.W = int(resolution)
-        # Buffer layout: (n_groups, H, W, n_bands+4)
-        # channels: [0..n_bands-1] irradiance per band, [n_bands..n_bands+2] normal xyz, [n_bands+3] hit count
-        self._buf = np.zeros((self.n_groups, self.H, self.W, n_bands + 4), dtype=np.float32)
-        self._lock = threading.Lock()
-
-        self._tri_to_group: Optional[np.ndarray] = None  # int32 (n_tris,)
-        self._tri_uv:       Optional[np.ndarray] = None  # float32 (n_tris, 3, 2) — UV at each vertex
-
-    def set_tri_mapping(
-        self,
-        tri_to_group: np.ndarray,
-        tri_uv: Optional[np.ndarray] = None,
-    ) -> None:
-        """Assign each triangle to a group and optionally provide per-vertex UV coords.
-
-        tri_to_group : int32 (n_tris,)   — which group index owns each triangle
-        tri_uv       : float32 (n_tris, 3, 2) — UV for each of the 3 vertices; if None,
-                       bary coords are used directly as (u, v)
-        """
-        self._tri_to_group = np.asarray(tri_to_group, dtype=np.int32)
-        if tri_uv is not None:
-            self._tri_uv = np.asarray(tri_uv, dtype=np.float32)
-
-    def feed(self, records: dict) -> None:
-        """Accumulate STRIKE records into the UV buffer."""
-        if not records:
-            return
-        kinds = records["kind"]
-        mask  = kinds == 0  # STRIKE
-        if not np.any(mask):
-            return
-
-        tris   = records["hit_tri"][mask]       # int32 (M,)
-        bu     = records["bary_u"][mask]         # float32 (M,)
-        bv     = records["bary_v"][mask]         # float32 (M,)
-        normals = records["normal"][mask]        # float32 (M, 3)
-        amp_re = records["amp_re"][mask]         # float32 (M, n_bands)
-        amp_im = records["amp_im"][mask]         # float32 (M, n_bands)
-
-        nb  = min(amp_re.shape[1], self.n_bands)
-        amp_sq = amp_re[:, :nb] ** 2 + amp_im[:, :nb] ** 2  # (M, nb)
-
-        # Resolve UV coordinates
-        if self._tri_uv is not None and self._tri_to_group is not None:
-            n_tris = self._tri_uv.shape[0]
-            valid  = (tris >= 0) & (tris < n_tris)
-            tv     = self._tri_uv[tris[valid]]          # (Mv, 3, 2)
-            bw     = 1.0 - bu[valid] - bv[valid]        # weight for vertex 0
-            u = bw * tv[:, 0, 0] + bu[valid] * tv[:, 1, 0] + bv[valid] * tv[:, 2, 0]
-            v = bw * tv[:, 0, 1] + bu[valid] * tv[:, 1, 1] + bv[valid] * tv[:, 2, 1]
-            g = self._tri_to_group[tris[valid]]
-        elif self._tri_to_group is not None:
-            n_tris = self._tri_to_group.shape[0]
-            valid  = (tris >= 0) & (tris < n_tris)
-            u = np.clip(bu[valid], 0.0, 1.0)
-            v = np.clip(bv[valid], 0.0, 1.0)
-            g = self._tri_to_group[tris[valid]]
-        else:
-            # No mapping: use mat_idx mod n_groups as group, bary as UV
-            valid = tris >= 0
-            u = np.clip(bu[valid], 0.0, 1.0)
-            v = np.clip(bv[valid], 0.0, 1.0)
-            g = records["mat_idx"][mask][valid] % self.n_groups
-
-        g_valid = (g >= 0) & (g < self.n_groups)
-        u = u[g_valid]; v = v[g_valid]; g = g[g_valid]
-        nv = normals[np.where(valid)[0][g_valid]]
-        aq = amp_sq[np.where(valid)[0][g_valid]]
-
-        pi_y = np.clip((v * self.H).astype(np.int32), 0, self.H - 1)
-        pi_x = np.clip((u * self.W).astype(np.int32), 0, self.W - 1)
-
-        with self._lock:
-            for b in range(nb):
-                np.add.at(self._buf[:, :, :, b].reshape(self.n_groups, -1),
-                          (g, pi_y * self.W + pi_x), aq[:, b])
-            for c, ch in enumerate(range(self.n_bands, self.n_bands + 3)):
-                np.add.at(self._buf[:, :, :, ch].reshape(self.n_groups, -1),
-                          (g, pi_y * self.W + pi_x), nv[:, c])
-            np.add.at(self._buf[:, :, :, self.n_bands + 3].reshape(self.n_groups, -1),
-                      (g, pi_y * self.W + pi_x), 1.0)
-
-    def get_uv_maps(self) -> tuple:
-        """Return (irradiance, normal, hit_count) — all float32 numpy arrays.
-
-        irradiance : (n_groups, H, W, n_bands)
-        normal     : (n_groups, H, W, 3)   — summed unnormalized normals
-        hit_count  : (n_groups, H, W)
-        """
-        with self._lock:
-            buf = self._buf.copy()
-        irr   = buf[:, :, :, :self.n_bands]
-        norm  = buf[:, :, :, self.n_bands:self.n_bands + 3]
-        hits  = buf[:, :, :, self.n_bands + 3]
-        return irr, norm, hits
-
-    def reset(self) -> None:
-        with self._lock:
-            self._buf[:] = 0.0
-
-
 class AsyncTraceAccumulator:
     """Background tracer runner with bounded queue back pressure."""
 
@@ -4903,11 +5243,19 @@ def _online_adam_update(
 
 
 
-def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
+def run(
+    ray_mode: str = "bdpt",
+    sensor_res: int = 64,
+    sensor_amp_gain: float = 1.0,
+    sensor_min_amplitude: float = 0.0,
+    compute_mode: str = "gpu",
+    profile: bool = False,
+) -> None:
     try:
         from OpenGL.GL import (
             glGenTextures, glBindTexture, GL_TEXTURE_2D, GL_TEXTURE_3D,
-            glTexImage2D, glTexImage3D, GL_RGB, GL_RGB32F, GL_FLOAT,
+            GL_TEXTURE_2D_ARRAY,
+            glTexImage2D, glTexImage3D, GL_RGB, GL_RGBA, GL_RGB32F, GL_RGBA16F, GL_FLOAT,
             glTexParameteri,
             GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
             GL_LINEAR, GL_CLAMP_TO_EDGE, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R,
@@ -4923,6 +5271,12 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
             glGetProgramiv, glGetProgramInfoLog, GL_LINK_STATUS, glUseProgram,
             glGetUniformLocation, glUniform1i, glUniform1f, glUniform3f, glDeleteProgram,
             glDeleteShader,
+            glBindAttribLocation, glGetAttribLocation,
+            glGenBuffers, glBindBuffer, glBufferData, glDeleteBuffers,
+            GL_ARRAY_BUFFER, GL_STATIC_DRAW,
+            glEnableVertexAttribArray, glDisableVertexAttribArray, glVertexAttribPointer,
+            GL_TRIANGLES, GL_FALSE,
+            glTexSubImage2D, glTexSubImage3D,
             # PIP stats overlay (text-as-texture)
             GL_RGBA, GL_UNSIGNED_BYTE,
         )
@@ -4935,6 +5289,7 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
     pygame.display.set_caption("Thick Lens — Spectral Cross-Section Viewer")
     pygame.display.set_mode((W, H), pygame.OPENGL | pygame.DOUBLEBUF)
     clock = pygame.time.Clock()
+    frame_profiler = FrameProfiler(report_every=60) if profile else None
 
     scene    = SceneConfig()
     scene.image_plate.sensor_res = int(max(4, sensor_res))
@@ -4947,8 +5302,12 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
         view_w=view_w,
         sidecar=sidecar,
     )
+    bench.sensor_amp_gain      = float(sensor_amp_gain)
+    bench.sensor_min_amplitude = float(sensor_min_amplitude)
+    bench.compute_mode         = str(compute_mode)
     print(f"[bench] tris={bench.n_tris}  bands={bench.n_bands}  "
-          f"view={view_w}x{view_h}", flush=True)
+          f"view={view_w}x{view_h}  sensor_amp_gain={bench.sensor_amp_gain}  "
+          f"sensor_min_amplitude={bench.sensor_min_amplitude}", flush=True)
     # ── Configure C++ sensor image accumulator ─────────────────────────────
     _pip_res = int(max(16, scene.image_plate.sensor_res))
     bench.tracer.configure_sensor_image(
@@ -4984,8 +5343,8 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
         varying vec2 v_uv;
 
         vec3 display_curve(vec3 x) {
-            vec3 y = log(vec3(1.0) + max(x, vec3(0.0)) * 6.0) / log(7.0);
-            return y / (vec3(1.0) + 0.18 * y);
+            vec3 y = log(vec3(1.0) + max(x, vec3(0.0)));
+            return y / (vec3(1.0) + y);
         }
 
         void main() {
@@ -5032,8 +5391,8 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
         varying float v_depth;
 
         vec3 display_curve(vec3 x) {
-            vec3 y = log(vec3(1.0) + max(x, vec3(0.0)) * 6.0) / log(7.0);
-            return y / (vec3(1.0) + 0.18 * y);
+            vec3 y = log(vec3(1.0) + max(x, vec3(0.0)));
+            return y / (vec3(1.0) + y);
         }
 
         void main() {
@@ -5068,6 +5427,66 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
     if not glGetProgramiv(point_prog, GL_LINK_STATUS):
         msg = glGetProgramInfoLog(point_prog)
         raise RuntimeError(msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else str(msg))
+
+    # ── UV-mesh shader: renders every scene triangle lit by the UV-splat atlas ──
+    # Uses the same Y/Z projection rotation as the volume + point shaders so
+    # mesh, volume, and scatter are always co-registered in screen space.
+    mesh_vert_src = """
+        #version 130
+        attribute vec3 a_pos;
+        attribute vec2 a_uv;
+        attribute float a_layer;
+        uniform float u_time;
+        uniform float u_mode;
+        varying vec2 v_uv;
+        varying float v_layer;
+        void main() {
+            float t = u_time * 0.16;
+            float a = (u_mode < 0.5) ? (0.24 * sin(t))
+                    : ((u_mode < 1.5) ? 0.0 : 1.57079632679);
+            float ca = cos(a); float sa = sin(a);
+            vec2 yz = a_pos.yz - vec2(0.5);
+            float vp = dot(yz, vec2(ca, sa));
+            gl_Position = vec4(a_pos.x * 2.0 - 1.0, vp * 2.0, 0.0, 1.0);
+            v_uv = a_uv;
+            v_layer = a_layer;
+        }
+    """
+    mesh_frag_src = """
+        #version 130
+        uniform sampler2DArray u_uv_pages;
+        uniform float u_gain;
+        varying vec2 v_uv;
+        varying float v_layer;
+
+        vec3 display_curve(vec3 x) {
+            vec3 y = log(vec3(1.0) + max(x, vec3(0.0)));
+            return y / (vec3(1.0) + y);
+        }
+
+        void main() {
+            vec3 tex = max(texture(u_uv_pages, vec3(v_uv, v_layer)).rgb, vec3(0.0));
+            vec3 c   = clamp(display_curve(tex * u_gain), 0.0, 1.0);
+            float alpha = clamp(max(max(c.r, c.g), c.b), 0.0, 1.0);
+            if (alpha < 0.005) discard;
+            gl_FragColor = vec4(c, alpha);
+        }
+    """
+    mvs = _compile_shader(GL_VERTEX_SHADER,   mesh_vert_src)
+    mfs = _compile_shader(GL_FRAGMENT_SHADER, mesh_frag_src)
+    mesh_prog = glCreateProgram()
+    glAttachShader(mesh_prog, mvs)
+    glAttachShader(mesh_prog, mfs)
+    glBindAttribLocation(mesh_prog, 0, "a_pos")
+    glBindAttribLocation(mesh_prog, 1, "a_uv")
+    glBindAttribLocation(mesh_prog, 2, "a_layer")
+    glLinkProgram(mesh_prog)
+    if not glGetProgramiv(mesh_prog, GL_LINK_STATUS):
+        msg = glGetProgramInfoLog(mesh_prog)
+        raise RuntimeError(msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else str(msg))
+    _mesh_loc_pos = glGetAttribLocation(mesh_prog, "a_pos")
+    _mesh_loc_uv  = glGetAttribLocation(mesh_prog, "a_uv")
+    _mesh_loc_layer = glGetAttribLocation(mesh_prog, "a_layer")
 
     # ── GL volume textures ───────────────────────────────────────── #
     tex_field = glGenTextures(1)
@@ -5142,6 +5561,19 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, _pip_res, _pip_res, 0,
                  GL_RGB, GL_FLOAT, _pip_blank)
 
+    # ── Per-physical-group analytical UV page array ─────────────────────────
+    tex_uv_pages = glGenTextures(1)
+    _uv_layers = max(1, len(bench.uv_page_bank.groups) if bench.uv_page_bank is not None else 1)
+    _uv_res = int(bench.uv_page_bank.res if bench.uv_page_bank is not None else UV_PAGE_RES_DEFAULT)
+    _uv_blank = np.zeros((_uv_layers, _uv_res, _uv_res, 4), dtype=np.float32)
+    glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA16F, _uv_res, _uv_res, _uv_layers,
+                 0, GL_RGBA, GL_FLOAT, _uv_blank)
+
     # HUD text texture — RGBA8, sized to a reasonable stats strip width × height
     _HUD_W, _HUD_H = 256, 48
     tex_hud = glGenTextures(1)
@@ -5189,9 +5621,8 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
 
         if has_img:
             glBindTexture(GL_TEXTURE_2D, tex_pip)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, img.shape[1], img.shape[0], 0,
-                         GL_RGB, GL_FLOAT,
-                         np.ascontiguousarray(img[::-1], dtype=np.float32))
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.shape[1], img.shape[0],
+                            GL_RGB, GL_FLOAT, img)  # C++ already emits rows bottom-first
 
         # Always draw the pip quad — border is baked into the shader.
         # When sensor has no data yet the quad draws a pure cyan border on
@@ -5242,11 +5673,17 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
                                      hud_mode=True)
 
 
+    _vol_tex_size = [bench._field_nx, bench._field_ny, bench._field_nz]  # already allocated at init
+
     def upload_volume(tex, rgb_zyx3: np.ndarray) -> None:
         arr = np.ascontiguousarray(rgb_zyx3, dtype=np.float32)
+        w, h, d = arr.shape[2], arr.shape[1], arr.shape[0]
         glBindTexture(GL_TEXTURE_3D, tex)
-        glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB32F, arr.shape[2], arr.shape[1], arr.shape[0],
-                     0, GL_RGB, GL_FLOAT, arr)
+        if w != _vol_tex_size[0] or h != _vol_tex_size[1] or d != _vol_tex_size[2]:
+            glTexImage3D(GL_TEXTURE_3D, 0, GL_RGB32F, w, h, d, 0, GL_RGB, GL_FLOAT, arr)
+            _vol_tex_size[0], _vol_tex_size[1], _vol_tex_size[2] = w, h, d
+        else:
+            glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, w, h, d, GL_RGB, GL_FLOAT, arr)
 
     def draw_volume(vp_x: int, vp_y: int, vp_w: int, vp_h: int, mode: int, gain: float, t_now: float) -> None:
         glViewport(vp_x, vp_y, vp_w, vp_h)
@@ -5287,6 +5724,93 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
         glDisable(GL_BLEND)
         glUseProgram(0)
 
+    # ── UV-mesh draw: physical groups render as layers in a texture array ───
+    _mesh_vbo: list = [None]   # [vbo_pos, vbo_uv, vbo_layer] once uploaded
+    _mesh_n_verts: list = [0]
+    _uv_last_update_s: list = [-1.0]
+    _uv_mode: list = ["combined"]
+
+    def _ensure_mesh_vbo() -> bool:
+        if _mesh_vbo[0] is not None:
+            return True
+        bank = bench.uv_page_bank
+        if bank is None or not bank.groups:
+            return False
+        pos_parts = []
+        uv_parts = []
+        layer_parts = []
+        v_all = bench.tri_vertices
+        x0  = float(scene.x_min);  x1  = float(scene.x_max)
+        r_v = float(scene.view_radius)
+        xsp = max(1e-8, x1 - x0);  yzsp = max(1e-8, 2.0 * r_v)
+        for g in bank.groups:
+            if g.tri_ids.size <= 0:
+                continue
+            v = v_all[g.tri_ids]
+            pos = np.empty((v.shape[0], 3, 3), dtype=np.float32)
+            pos[..., 0] = np.clip((v[..., 0] - x0) / xsp,    0.0, 1.0)
+            pos[..., 1] = np.clip((v[..., 1] + r_v) / yzsp,  0.0, 1.0)
+            pos[..., 2] = np.clip((v[..., 2] + r_v) / yzsp,  0.0, 1.0)
+            pos_parts.append(pos.reshape(-1, 3))
+            uv_parts.append(g.uv_coords.reshape(-1, 2))
+            layer_parts.append(np.full((g.tri_ids.size * 3,), float(g.layer), dtype=np.float32))
+        if not pos_parts:
+            return False
+        pos_flat = np.ascontiguousarray(np.concatenate(pos_parts, axis=0), dtype=np.float32)
+        uv_flat = np.ascontiguousarray(np.concatenate(uv_parts, axis=0), dtype=np.float32)
+        layer_flat = np.ascontiguousarray(np.concatenate(layer_parts, axis=0), dtype=np.float32)
+        vbos = glGenBuffers(3)
+        glBindBuffer(GL_ARRAY_BUFFER, vbos[0])
+        glBufferData(GL_ARRAY_BUFFER, pos_flat.nbytes, pos_flat, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, vbos[1])
+        glBufferData(GL_ARRAY_BUFFER, uv_flat.nbytes, uv_flat, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, vbos[2])
+        glBufferData(GL_ARRAY_BUFFER, layer_flat.nbytes, layer_flat, GL_STATIC_DRAW)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        _mesh_vbo[0]     = vbos
+        _mesh_n_verts[0] = int(pos_flat.shape[0])
+        return True
+
+    def draw_uv_mesh(gain: float, t_now: float) -> None:
+        if not _ensure_mesh_vbo():
+            return
+        bank = bench.uv_page_bank
+        if bank is None:
+            return
+        if t_now - _uv_last_update_s[0] >= 0.05:
+            pages = bank.update_from_tracer(bench.tracer, bench.freq_hz, mode=_uv_mode[0])
+            glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
+            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0,
+                            int(pages.shape[2]), int(pages.shape[1]), int(pages.shape[0]),
+                            GL_RGBA, GL_FLOAT, np.ascontiguousarray(pages, dtype=np.float32))
+            _uv_last_update_s[0] = float(t_now)
+        glUseProgram(mesh_prog)
+        glUniform1f(glGetUniformLocation(mesh_prog, "u_time"), float(t_now))
+        glUniform1f(glGetUniformLocation(mesh_prog, "u_mode"), 0.0)
+        glUniform1f(glGetUniformLocation(mesh_prog, "u_gain"), float(gain))
+        glActiveTexture(GL_TEXTURE0)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
+        glUniform1i(glGetUniformLocation(mesh_prog, "u_uv_pages"), 0)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        vbos = _mesh_vbo[0]
+        glBindBuffer(GL_ARRAY_BUFFER, vbos[0])
+        glEnableVertexAttribArray(_mesh_loc_pos)
+        glVertexAttribPointer(_mesh_loc_pos, 3, GL_FLOAT, GL_FALSE, 0, None)
+        glBindBuffer(GL_ARRAY_BUFFER, vbos[1])
+        glEnableVertexAttribArray(_mesh_loc_uv)
+        glVertexAttribPointer(_mesh_loc_uv,  2, GL_FLOAT, GL_FALSE, 0, None)
+        glBindBuffer(GL_ARRAY_BUFFER, vbos[2])
+        glEnableVertexAttribArray(_mesh_loc_layer)
+        glVertexAttribPointer(_mesh_loc_layer, 1, GL_FLOAT, GL_FALSE, 0, None)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+        glDrawArrays(GL_TRIANGLES, 0, _mesh_n_verts[0])
+        glDisableVertexAttribArray(_mesh_loc_pos)
+        glDisableVertexAttribArray(_mesh_loc_uv)
+        glDisableVertexAttribArray(_mesh_loc_layer)
+        glDisable(GL_BLEND)
+        glUseProgram(0)
+
     # ── Clip plane helpers ───────────────────────────────────────── #
     r         = float(scene.view_radius)
     clip_step = r * 0.02
@@ -5313,12 +5837,14 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
     trace_fut: Optional[concurrent.futures.Future] = None
 
     field_gain      = 0.6
-    field_leak      = 0.92
+    field_leak      = 0.0
     max_bounces     = 64
     rays_per_emitter = 32
     seed            = 13579
     frame           = 0
+    _display_frame  = 0   # independent counter for display-update rate limiting
     paused          = False
+    closing         = threading.Event()
 
     projection_axis = 1  # 1 = X/Y top projection, 2 = X/Z side projection, 0 = subtle auto-wiggle blend
     auto_wiggle = True
@@ -5331,8 +5857,11 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
 
     def _trace(rpe: int, sd: int, mb: int):
         import time as _t
-        while bench.tracer.in_flight_count() >= _MAX_IN_FLIGHT:
+        target_in_flight = 0 if ray_mode == "backward" else _MAX_IN_FLIGHT
+        while not closing.is_set() and bench.tracer.in_flight_count() > target_in_flight:
             _t.sleep(0.002)   # back off; let drain-loop consume Q_intent
+        if closing.is_set():
+            return
         if ray_mode != "backward":
             bench.trace_forward(rpe, sd, max_bounces=mb)
         if ray_mode != "forward":
@@ -5340,44 +5869,53 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
 
     try:
         while True:
+            if frame_profiler is not None:
+                frame_profiler.begin("events")
             for ev in pygame.event.get():
-                if ev.type == pygame.QUIT:
-                    return
-                if ev.type == pygame.KEYDOWN:
-                    k = ev.key
-                    if k == pygame.K_ESCAPE:
+                    if ev.type == pygame.QUIT:
                         return
-                    elif k == pygame.K_SPACE:
-                        paused = not paused
-                    elif k == pygame.K_x:
-                        projection_axis = 0
-                        auto_wiggle = True
-                    elif k == pygame.K_y:
-                        projection_axis = 1
-                        auto_wiggle = False
-                    elif k == pygame.K_s or k == pygame.K_z:
-                        projection_axis = 2
-                        auto_wiggle = False
-                    elif k == pygame.K_q:
-                        clip_top  = max(-r, clip_top  - clip_step)
-                    elif k == pygame.K_e:
-                        clip_top  = min( r, clip_top  + clip_step)
-                    elif k == pygame.K_c:
-                        clip_side = min( r, clip_side + clip_step)
-                    elif k == pygame.K_r:
-                        clip_top = clip_side = r
-                    elif k == pygame.K_9:
-                        field_gain = max(0.0, field_gain - 0.05)
-                    elif k == pygame.K_0:
-                        field_gain = min(5.0, field_gain + 0.05)
-                    elif k == pygame.K_LEFTBRACKET:
-                        bench.intent_shuffle = max(0.0, bench.intent_shuffle - 0.1)
-                        bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
-                        print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
-                    elif k == pygame.K_RIGHTBRACKET:
-                        bench.intent_shuffle = min(1.0, bench.intent_shuffle + 0.1)
-                        bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
-                        print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+                    if ev.type == pygame.KEYDOWN:
+                        k = ev.key
+                        if k == pygame.K_ESCAPE:
+                            return
+                        elif k == pygame.K_SPACE:
+                            paused = not paused
+                        elif k == pygame.K_x:
+                            projection_axis = 0
+                            auto_wiggle = True
+                        elif k == pygame.K_y:
+                            projection_axis = 1
+                            auto_wiggle = False
+                        elif k == pygame.K_s or k == pygame.K_z:
+                            projection_axis = 2
+                            auto_wiggle = False
+                        elif k == pygame.K_q:
+                            clip_top  = max(-r, clip_top  - clip_step)
+                        elif k == pygame.K_e:
+                            clip_top  = min( r, clip_top  + clip_step)
+                        elif k == pygame.K_c:
+                            clip_side = min( r, clip_side + clip_step)
+                        elif k == pygame.K_r:
+                            clip_top = clip_side = r
+                        elif k == pygame.K_9:
+                            field_gain = max(0.0, field_gain - 0.05)
+                        elif k == pygame.K_0:
+                            field_gain = min(5.0, field_gain + 0.05)
+                        elif k == pygame.K_u:
+                            modes = ["combined", "forward", "sensor", "difference"]
+                            _uv_mode[0] = modes[(modes.index(_uv_mode[0]) + 1) % len(modes)]
+                            _uv_last_update_s[0] = -1.0
+                            print(f"[uv-mode] {_uv_mode[0]}", flush=True)
+                        elif k == pygame.K_LEFTBRACKET:
+                            bench.intent_shuffle = max(0.0, bench.intent_shuffle - 0.1)
+                            bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
+                            print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+                        elif k == pygame.K_RIGHTBRACKET:
+                            bench.intent_shuffle = min(1.0, bench.intent_shuffle + 0.1)
+                            bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
+                            print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+            if frame_profiler is not None:
+                frame_profiler.end("events")
 
             if not paused and trace_fut is None:
                 trace_fut = executor.submit(
@@ -5392,16 +5930,27 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
                     print(f"[trace] {exc}", flush=True)
                 trace_fut = None
 
-            # Refresh display every frame — the drain loop continuously fills
-            # _vis_buf in the background; reading it here gives a live stream
-            # of points independent of whether a trace future is pending.
-            try:
-                field_texels, new_vbc = bench.display_pipeline_records(field_gain=field_gain)
-                upload_volume(tex_field, field_texels)
-                for _ci in range(4):
-                    _svc[_ci] = new_vbc[_ci]
-            except Exception as exc:
-                print(f"[display] {exc}", flush=True)
+            # Refresh field + UV textures at ~20 Hz (every 3 frames) to avoid
+            # running multi-MB NumPy reductions on every 60 Hz display frame.
+            _display_frame += 1
+            if _display_frame % 3 == 0:
+                try:
+                    if frame_profiler is not None:
+                        frame_profiler.begin("display_records")
+                    field_texels, new_vbc = bench.display_pipeline_records(field_gain=field_gain)
+                    if frame_profiler is not None:
+                        frame_profiler.end("display_records")
+                        frame_profiler.begin("upload_volume")
+                    upload_volume(tex_field, field_texels)
+                    if frame_profiler is not None:
+                        frame_profiler.end("upload_volume")
+                    for _ci in range(4):
+                        _svc[_ci] = new_vbc[_ci]
+                except Exception as exc:
+                    if frame_profiler is not None:
+                        frame_profiler.end("display_records")
+                        frame_profiler.end("upload_volume")
+                    print(f"[display] {exc}", flush=True)
 
             if auto_wiggle or projection_axis == 0:
                 shader_mode = 0
@@ -5421,34 +5970,179 @@ def run(ray_mode: str = "bdpt", sensor_res: int = 64) -> None:
             glClearColor(8/255, 8/255, 10/255, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
             t_now = pygame.time.get_ticks() * 0.001
+            if frame_profiler is not None:
+                frame_profiler.begin("draw_volume")
             draw_volume(0, 0, W, H, shader_mode, volume_gain, t_now)
-            draw_surface_points(shader_mode, volume_gain, t_now)
+            if frame_profiler is not None:
+                frame_profiler.end("draw_volume")
+                frame_profiler.begin("draw_uv_mesh")
+            draw_uv_mesh(volume_gain, t_now)
+            if frame_profiler is not None:
+                frame_profiler.end("draw_uv_mesh")
+                frame_profiler.begin("draw_pip")
             try:
                 draw_pip()
             except Exception as _pip_exc:
                 print(f"[pip] {_pip_exc}", flush=True)
+            if frame_profiler is not None:
+                frame_profiler.end("draw_pip")
+                frame_profiler.begin("flip")
             pygame.display.flip()
+            if frame_profiler is not None:
+                frame_profiler.end("flip")
+                try:
+                    ps = bench.tracer.pipeline_stats()
+                    extra = (
+                        f"inflight={int(ps.get('in_flight', 0))} "
+                        f"qout={int(ps.get('output_queue_depth', 0))} "
+                        f"uv_rb={float(ps.get('gpu_uv_readback_mb', 0.0)):.1f}MB/"
+                        f"{int(ps.get('gpu_uv_readback_count', 0))} "
+                        f"hit_rb={float(ps.get('gpu_hit_readback_mb', 0.0)):.1f}MB/"
+                        f"{int(ps.get('gpu_hit_readback_count', 0))}"
+                    )
+                except Exception:
+                    extra = ""
+                frame_profiler.tick(extra)
             clock.tick(60)
     finally:
-        # Signal the drain thread to stop before joining executor threads so we
-        # don't hang waiting for a blocked drain call.
+        import gc
+        closing.set()
+        # 1. Stop the drain loop first so it releases the pipeline before we destroy it.
         bench._drain_stop.set()
+        if bench._drain_thread is not None:
+            bench._drain_thread.join(timeout=2.0)
+        # 2. Wait for any pending trace future so its submit_rays/pipeline call finishes.
         if trace_fut is not None:
             trace_fut.cancel()
-        executor.shutdown(wait=False)
+        executor.shutdown(wait=False, cancel_futures=True)
+        # 3. Force immediate destruction of the C++ pipeline and its worker threads.
+        #    PyRayTracer.__del__ calls ray_pipeline_destroy() which joins all std::threads.
+        del bench
+        gc.collect()
         glDeleteTextures(1, [tex_field])
         glDeleteTextures(1, [tex_pip])
         glDeleteTextures(1, [tex_hud])
+        glDeleteTextures(1, [tex_uv_pages])
+        if _mesh_vbo[0] is not None:
+            glDeleteBuffers(3, _mesh_vbo[0])
         glDeleteProgram(volume_prog)
         glDeleteProgram(point_prog)
         glDeleteProgram(pip_prog)
+        glDeleteProgram(mesh_prog)
         glDeleteShader(vs)
         glDeleteShader(fs)
         glDeleteShader(pvs)
         glDeleteShader(pfs)
         glDeleteShader(pip_vs)
         glDeleteShader(pip_fs)
+        glDeleteShader(mvs)
+        glDeleteShader(mfs)
         pygame.quit()
+
+
+def run_uv_smoke(
+    ray_mode: str = "bdpt",
+    sensor_res: int = 32,
+    sensor_amp_gain: float = 1.0,
+    sensor_min_amplitude: float = 0.0,
+    compute_mode: str = "cpu",
+    steps: int = 2,
+    timeout_s: float = 12.0,
+) -> int:
+    """Headless end-to-end UV wiring check using the real ray pipeline."""
+    import gc
+    import time
+
+    scene = SceneConfig()
+    scene.image_plate.sensor_res = int(max(4, sensor_res))
+    sidecar = FreeFrequencySidecar.lazy_prepare(int(DEFAULT_FREQ_HZ.size))
+    bench = ForwardCppLensBench(
+        scene=scene,
+        freq_hz=DEFAULT_FREQ_HZ.copy(),
+        view_h=360,
+        view_w=640,
+        sidecar=sidecar,
+    )
+    bench.compute_mode = str(compute_mode)
+    bench.sensor_amp_gain = float(sensor_amp_gain)
+    bench.sensor_min_amplitude = float(sensor_min_amplitude)
+    bench.tracer.configure_sensor_image(
+        float(scene.image_plate.x),
+        float(scene.image_plate.radius),
+        int(max(16, scene.image_plate.sensor_res)),
+        0.008,
+    )
+
+    rc = 1
+    try:
+        print(
+            "[uv-smoke-start]",
+            f"mode={ray_mode}",
+            f"compute={compute_mode}",
+            f"sensor_res={scene.image_plate.sensor_res}",
+            f"steps={int(max(1, steps))}",
+            flush=True,
+        )
+        for step in range(int(max(1, steps))):
+            seed = 20260516 + step * 101
+            if ray_mode != "backward":
+                bench.trace_forward(1, seed, max_bounces=1)
+            if ray_mode != "forward":
+                bench.trace_sensor_cast(1, seed ^ 0x5A5A, max_bounces=1)
+
+            t0 = time.perf_counter()
+            t_last_probe = 0.0
+            while True:
+                try:
+                    in_flight = int(bench.tracer.in_flight_count())
+                except Exception:
+                    in_flight = 0
+                now = time.perf_counter()
+                if bench.uv_page_bank is not None and now - t_last_probe >= 0.5:
+                    bench.uv_page_bank.refresh_summaries(bench.tracer)
+                    t_last_probe = now
+                    if bench.uv_page_bank.any_hot_data():
+                        break
+                if in_flight <= 0:
+                    break
+                if now - t0 > float(timeout_s):
+                    print(f"[uv-smoke-timeout] step={step} in_flight={in_flight}", flush=True)
+                    break
+                time.sleep(0.02)
+
+            if bench.uv_page_bank is not None:
+                bench.uv_page_bank.update_from_tracer(bench.tracer, bench.freq_hz, mode="combined")
+
+        any_uv = False
+        if bench.uv_page_bank is not None:
+            for g in bench.uv_page_bank.groups:
+                s = dict(g.last_summary)
+                nz = int(s.get("nonzero_texels", 0) or 0)
+                fwd = float(s.get("total_forward", 0.0) or 0.0)
+                sen = float(s.get("total_sensor", 0.0) or 0.0)
+                if g.hot and (nz > 0 or fwd > 0.0 or sen > 0.0):
+                    any_uv = True
+                print(
+                    "[uv-smoke-group]",
+                    f"name={g.name}",
+                    f"hot={int(g.hot)}",
+                    f"gid={int(g.group_id)}",
+                    f"layer={int(g.layer)}",
+                    f"tris={int(g.tri_ids.size)}",
+                    f"nonzero={nz}",
+                    f"forward={fwd:.6g}",
+                    f"sensor={sen:.6g}",
+                    flush=True,
+                )
+        rc = 0 if any_uv else 2
+        print(f"[uv-smoke-result] rc={rc}", flush=True)
+        return rc
+    finally:
+        bench._drain_stop.set()
+        if bench._drain_thread is not None:
+            bench._drain_thread.join(timeout=2.0)
+        del bench
+        gc.collect()
 
 
 if __name__ == "__main__":
@@ -5465,7 +6159,64 @@ if __name__ == "__main__":
         type=int,
         default=64,
         metavar="N",
-        help="Sensor pixel-grid side length (default: 64); actual active pixels ≈ π/4·N²",
+        help="Sensor pixel-grid side length (default: 64); active pixels about pi/4*N^2",
+    )
+    _ap.add_argument(
+        "--sensor-gain",
+        type=float,
+        default=1.0,
+        metavar="G",
+        help="Multiply sensor ray launch amplitude by G to pre-compensate Fresnel dropoff (default: 1.0)",
+    )
+    _ap.add_argument(
+        "--sensor-min-amp",
+        type=float,
+        default=0.0,
+        metavar="A",
+        help="Amplitude floor for sensor rays; 0.0 = never kill (single-photon mode, default)",
+    )
+    _ap.add_argument(
+        "--compute-mode",
+        choices=["cpu", "gpu", "mixed"],
+        default="gpu",
+        help=(
+            "cpu  = CPU workers only, no GPU compute shaders; "
+            "gpu  = GPU handles all pipeline stages (default); "
+            "mixed = GPU compute enabled but CPU workers also active (compete for work)"
+        ),
+    )
+    _ap.add_argument(
+        "--uv-smoke-exit",
+        action="store_true",
+        help="Run a headless end-to-end UV pipeline smoke test and exit",
+    )
+    _ap.add_argument(
+        "--uv-smoke-steps",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Number of trace/readback iterations for --uv-smoke-exit",
+    )
+    _ap.add_argument(
+        "--profile",
+        action="store_true",
+        help="Print rolling Python frame timings and pipeline readback counters",
     )
     _args = _ap.parse_args()
-    run(ray_mode=_args.ray_mode, sensor_res=_args.sensor_res)
+    if _args.uv_smoke_exit:
+        raise SystemExit(run_uv_smoke(
+            ray_mode=_args.ray_mode,
+            sensor_res=_args.sensor_res,
+            sensor_amp_gain=_args.sensor_gain,
+            sensor_min_amplitude=_args.sensor_min_amp,
+            compute_mode=_args.compute_mode,
+            steps=_args.uv_smoke_steps,
+        ))
+    run(
+        ray_mode=_args.ray_mode,
+        sensor_res=_args.sensor_res,
+        sensor_amp_gain=_args.sensor_gain,
+        sensor_min_amplitude=_args.sensor_min_amp,
+        compute_mode=_args.compute_mode,
+        profile=bool(_args.profile),
+    )

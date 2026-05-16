@@ -163,7 +163,9 @@ float aabb_hit(vec3 lo, vec3 hi, vec3 org, vec3 inv_dir, float t_max) {
     float t_enter = max(max(tmin3.x, tmin3.y), tmin3.z);
     float t_exit  = min(min(tmax3.x, tmax3.y), tmax3.z);
     if (t_exit < T_SELF || t_enter > t_exit || t_enter > t_max) return -1.0;
-    return t_enter;
+    /* Clamp to 0: negative t_enter means the ray origin is inside the box.
+     * The node still intersects the ray — do not skip it. */
+    return max(t_enter, 0.0);
 }
 
 /* Möller-Trumbore ray-triangle intersection. Returns t or -1 on miss. */
@@ -296,7 +298,8 @@ void main() {
     float tot_len = path_len + best_t;
     vec3  hit_pos = pos + best_t * dir;
 
-    for (int b = 0; b < n_bands; ++b) {
+    int nb = min(n_bands, MAX_GPU_BANDS);
+    for (int b = 0; b < nb; ++b) {
         float n_re = (medium_mat >= 0) ? mat_n_real_gpu(medium_mat, b) : 1.0;
         float n_im = (medium_mat >= 0) ? mat_n_imag_gpu(medium_mat, b) : 0.0;
         float k_real_b = scene_bands[b];

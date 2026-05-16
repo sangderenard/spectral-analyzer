@@ -60,7 +60,8 @@ layout(std430, binding = 4) readonly  buffer GroupPayloadBuf   { float group_pay
 layout(std430, binding = 5) coherent  buffer CounterBuf        { uint  counters[];  };
 
 /* ── Uniforms ───────────────────────────────────────────────────────────── */
-uniform int n_hits;
+/* n_hits is now read from counters[0] written by T1 so the CPU can dispatch
+ * T2 immediately after T1 without an intermediate GPU→CPU readback. */
 uniform int n_tris;
 uniform int n_groups;
 
@@ -153,7 +154,7 @@ void refine_poly(in vec3 v0, in vec3 e1, in vec3 e2, in vec3 n0,
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    if (int(gid) >= n_hits) return;
+    if (int(gid) >= int(counters[0])) return;  /* counters[0] = T1 hit count */
 
     int hb = int(gid) * HIT_STRIDE;
 

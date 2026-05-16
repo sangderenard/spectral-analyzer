@@ -1324,6 +1324,92 @@ SK_API int ray_tracer_accumulate_endpoint_records_to_field_capture(
     int*                 out_written_records,
     double*              out_written_power);
 
+/* ── UV integrator image API ─────────────────────────────────────────────
+ *
+ * Each triangle group with uv_image_res > 0 gets a multi-channel flat
+ * accumulator: (UV_N_HDR_CHANNELS + 5*n_bands) uint32 channels, each of
+ * size res×res, packed as channel-major (channel 0 first, then channel 1, …).
+ * Both the GPU T3 shader and the CPU T3 scatter path write identically.
+ *
+ * Fixed header channels (indices 0..UV_N_HDR_CHANNELS-1):
+ *   UV_CH_HIT_COUNT    [0]  raw hit count (atomicAdd 1)
+ *   UV_CH_SRC_FLAGS    [1]  source-ID bitfield (atomicOr 1<<src_id, max 32 sources)
+ *   UV_CH_BOUNCE_0     [2]  direct-hit count   (bounce == 0)
+ *   UV_CH_BOUNCE_1     [3]  1st-order count    (bounce == 1)
+ *   UV_CH_BOUNCE_2     [4]  2nd-order count    (bounce == 2)
+ *   UV_CH_BOUNCE_3PLUS [5]  3rd-and-higher     (bounce >= 3)
+ *   UV_CH_TAG_LO       [6]  tag_lo OR bitfield
+ *   UV_CH_TAG_HI       [7]  tag_hi OR bitfield
+ *   UV_CH_NORMAL_X     [8]  hit-normal x sum, signed fixed-pt ×32768
+ *   UV_CH_NORMAL_Y     [9]  hit-normal y sum, signed fixed-pt ×32768
+ *   UV_CH_NORMAL_Z     [10] hit-normal z sum, signed fixed-pt ×32768
+ *
+ * Per-band channels (b = 0..n_bands-1):
+ *   UV_N_HDR_CHANNELS + b            amplitude magnitude, unsigned ×65536
+ *   UV_N_HDR_CHANNELS + n_bands + b  amplitude real part, signed ×32768
+ *   UV_N_HDR_CHANNELS + 2*n_bands+b  amplitude imag part, signed ×32768
+ *   UV_N_HDR_CHANNELS + 3*n_bands+b  forward/emissive magnitude, unsigned ×65536
+ *   UV_N_HDR_CHANNELS + 4*n_bands+b  sensor/reverse magnitude, unsigned ×65536
+ *
+ * Decode signed channels: value = (int32_t)raw_uint / scale
+ *
+ * ray_tracer_get_group_uv_image() — decode and copy all channels for group_id.
+ *   out_channels must be float32[n_channels * res * res]; layout is
+ *   channel-major: out_channels[ch * res*res + texel].
+ *   *out_res and *out_n_channels are filled with actual values.
+ *
+ * ray_tracer_clear_group_uv_accum() — zero accumulator for group_id,
+ *   or all groups when group_id < 0.
+ */
+
+#define UV_N_HDR_CHANNELS   11
+#define UV_CH_HIT_COUNT      0
+#define UV_CH_SRC_FLAGS      1
+#define UV_CH_BOUNCE_0       2
+#define UV_CH_BOUNCE_1       3
+#define UV_CH_BOUNCE_2       4
+#define UV_CH_BOUNCE_3PLUS   5
+#define UV_CH_TAG_LO         6
+#define UV_CH_TAG_HI         7
+#define UV_CH_NORMAL_X       8
+#define UV_CH_NORMAL_Y       9
+#define UV_CH_NORMAL_Z      10
+
+SK_API int ray_tracer_get_group_uv_image(
+    const RayTracerState* st,
+    int                   group_id,
+    float*                out_channels,   /* float32[n_channels * res * res] */
+    int*                  out_res,
+    int*                  out_n_channels);
+
+SK_API int ray_tracer_set_group_uv_image(
+    RayTracerState*       st,
+    int                   group_id,
+    const float*          channels,       /* float32[n_channels * res * res] */
+    int                   res,
+    int                   n_channels);
+
+typedef struct RayTracerUvGroupSummary {
+    int      group_id;
+    int      res;
+    int      n_channels;
+    int      tri_count;
+    uint64_t memory_bytes;
+    uint64_t nonzero_texels;
+    double   total_forward;
+    double   total_sensor;
+    double   peak_total;
+} RayTracerUvGroupSummary;
+
+SK_API int ray_tracer_get_group_uv_summary(
+    const RayTracerState*      st,
+    int                        group_id,
+    RayTracerUvGroupSummary*   out_summary);
+
+SK_API int ray_tracer_clear_group_uv_accum(
+    RayTracerState* st,
+    int             group_id);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

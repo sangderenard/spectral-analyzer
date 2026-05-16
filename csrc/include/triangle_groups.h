@@ -181,6 +181,10 @@ typedef struct {
     int       parametric_surface_kind;   /* TRI_PARAM_SURFACE_*              */
     int       parametric_payload_bytes;  /* byte size of payload             */
     const void* parametric_payload;      /* optional coeff payload           */
+    /* ── UV integrator image (optional) ────────────────────────────────── */
+    int          uv_image_res;    /* 0 = no UV accumulation; >0 = enable    */
+    int          uv_n_coords;     /* n_tris * 6 floats; 0 = auto planar     */
+    const float* uv_coords;       /* (n_tris, 3, 2) float32; NULL = auto    */
 } TriGroupDesc;
 
 /* Registrar / accessors (state-mutating side opaquely declared in ray_tracer.h). */

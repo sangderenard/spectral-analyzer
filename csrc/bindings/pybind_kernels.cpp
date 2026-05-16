@@ -498,6 +498,7 @@ struct PyRayTracer
     /* GPU compute config — stored before pipeline creation so first submit_rays
      * can enable the GPU backend.  Ignored after the pipeline is created. */
     bool        _use_gpu_compute = false;
+    bool        _gpu_all_stages  = false;
     std::string _shader_dir;
 
     RayPipelineState* _get_pipeline(int max_children = 2, int seed = 42) {
@@ -509,6 +510,7 @@ struct PyRayTracer
             cfg.min_amplitude    = _default_min_amplitude;
             cfg.max_intent_queue = _max_intent_queue;
             cfg.use_gpu_compute  = _use_gpu_compute;
+            cfg.gpu_all_stages   = _gpu_all_stages;
             cfg.shader_dir       = _shader_dir;
             _pipeline = ray_pipeline_create(handle, &cfg);
             if (!_pipeline)
@@ -1461,6 +1463,7 @@ struct PyRayTracer
         int                  max_children  = 2,
         int                  seed          = 42,
         bool                 use_gpu_compute = false,
+        bool                 gpu_all_stages  = false,
         std::string          shader_dir      = "")
     {
         auto io = origins   .request();
@@ -1542,7 +1545,9 @@ struct PyRayTracer
         {
             std::lock_guard<std::mutex> lk(_pipeline_mu);
             if (!_pipeline) {
+                _default_min_amplitude = min_amplitude;
                 _use_gpu_compute = use_gpu_compute;
+                _gpu_all_stages  = gpu_all_stages;
                 if (!shader_dir.empty()) _shader_dir = shader_dir;
             }
         }
@@ -2016,6 +2021,8 @@ struct PyRayTracer
             d["gpu_processed"]   = st.gpu_processed;
             d["gpu_batch_size"]  = st.gpu_batch_size;
             d["gpu_fraction"]    = st.gpu_fraction;
+            d["cpu_active_ms"]   = st.cpu_active_ms;
+            d["gpu_active_ms"]   = st.gpu_active_ms;
             return d;
         };
 
@@ -2026,6 +2033,10 @@ struct PyRayTracer
         out["t4"]                 = stage_dict(s.t4);
         out["output_queue_depth"] = s.output_queue_depth;
         out["in_flight"]          = s.in_flight;
+        out["gpu_uv_readback_mb"] = static_cast<double>(s.gpu_uv_readback_bytes) / (1024.0 * 1024.0);
+        out["gpu_uv_readback_count"] = static_cast<unsigned long long>(s.gpu_uv_readback_count);
+        out["gpu_hit_readback_mb"] = static_cast<double>(s.gpu_hit_readback_bytes) / (1024.0 * 1024.0);
+        out["gpu_hit_readback_count"] = static_cast<unsigned long long>(s.gpu_hit_readback_count);
         return out;
     }
 
@@ -4883,6 +4894,7 @@ Returns dict with:
              py::arg("max_children")    = 2,
              py::arg("seed")            = 42,
              py::arg("use_gpu_compute") = false,
+             py::arg("gpu_all_stages")  = false,
              py::arg("shader_dir")      = "",
 R"doc(Non-blocking submit: push ray intents into the persistent pipeline.
 Returns immediately; the pipeline processes them concurrently.
@@ -5246,7 +5258,8 @@ Returns : (n_written, n_live) — segments written and rays still alive
                 int default_mat_idx,
                 py::object power_W_per_band,
             py::object parametric_surface,
-                py::object sensor_camera) {
+                py::object sensor_camera,
+                py::object uv_image) {
                  auto buf = tri_indices.request();
                  if (buf.ndim != 1)
                      throw std::runtime_error("tri_indices must be 1-D int32");
@@ -5358,6 +5371,26 @@ Returns : (n_written, n_live) — segments written and rays still alive
                      desc.sensor_camera = &cam_desc;
                  }
 
+                 /* Optional UV integrator image.
+                  * Expected dict: {"res": int} — enables UV accumulation at
+                  * the given resolution (res×res texels, 2 channels: count +
+                  * amplitude).  An optional "uv_coords" key may supply an
+                  * explicit float32 array of shape (n_tris*6,) / (n_tris,3,2)
+                  * containing per-vertex UV coordinates.  When absent, planar
+                  * projection is used (auto-computed from group geometry). */
+                 py::array_t<float, py::array::c_style | py::array::forcecast> uv_arr;
+                 if (!uv_image.is_none()) {
+                     py::dict ud = uv_image.cast<py::dict>();
+                     desc.uv_image_res = ud["res"].cast<int>();
+                     if (ud.contains("uv_coords") && !ud["uv_coords"].is_none()) {
+                         uv_arr = ud["uv_coords"].cast<
+                             py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                         auto uvb = uv_arr.request();
+                         desc.uv_n_coords = (int)uvb.size;
+                         desc.uv_coords   = static_cast<const float*>(uvb.ptr);
+                     }
+                 }
+
                  int gid = ray_tracer_register_tri_group(self.handle, &desc);
                  if (gid < 0)
                      throw std::runtime_error(
@@ -5374,6 +5407,7 @@ Returns : (n_written, n_live) — segments written and rays still alive
              py::arg("power_W_per_band") = py::none(),
              py::arg("parametric_surface") = py::none(),
              py::arg("sensor_camera") = py::none(),
+             py::arg("uv_image") = py::none(),
              R"doc(
 Register a triangle group for the bidirectional integrator.
 
@@ -5428,6 +5462,140 @@ Returns assigned group_id (>= 0).  Raises on failure.
              [](PyRayTracer& self) {
                  return ray_tracer_n_tri_groups(self.handle);
              })
+        /* ── UV integrator image readback ─────────────────────────────────── */
+        .def("get_group_uv_image",
+             [](PyRayTracer& self, int group_id) -> py::dict {
+                 int res = 0, n_ch = 0;
+                 int rc  = ray_tracer_get_group_uv_image(
+                     self.handle, group_id, nullptr, &res, &n_ch);
+                 if (rc != 0 || res <= 0 || n_ch <= 0)
+                     throw std::runtime_error(
+                         "get_group_uv_image: group " + std::to_string(group_id) +
+                         " has no UV image or is invalid (rc=" + std::to_string(rc) + ")");
+                 py::array_t<float> ch_arr({(py::ssize_t)n_ch,
+                                            (py::ssize_t)res,
+                                            (py::ssize_t)res});
+                 rc = ray_tracer_get_group_uv_image(
+                     self.handle, group_id,
+                     static_cast<float*>(ch_arr.mutable_data()), &res, &n_ch);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "get_group_uv_image failed rc=" + std::to_string(rc));
+                 const int nb = self._n_bands;
+                 py::dict result;
+                 result["channels"]  = ch_arr;
+                 result["res"]       = res;
+                 result["n_bands"]   = nb;
+                 /* Convenience aliases. */
+                 result["count"]     = ch_arr[py::int_(0)];
+                 result["src_flags"] = ch_arr[py::int_(1)];
+                 result["normal"]    = ch_arr[py::slice(8, 11, 1)];
+                 /* amp: sum of per-band magnitudes → (res,res) */
+                 py::object amp_bands = ch_arr[py::slice(11, 11 + nb, 1)];
+                 result["amp"] = amp_bands.attr("sum")(
+                     py::arg("axis") = 0);
+                 result["band_mag"]    = amp_bands;
+                 result["amp_re"]      = ch_arr[py::slice(11 + nb,     11 + 2 * nb, 1)];
+                 result["amp_im"]      = ch_arr[py::slice(11 + 2 * nb, 11 + 3 * nb, 1)];
+                 result["forward_mag"] = ch_arr[py::slice(11 + 3 * nb, 11 + 4 * nb, 1)];
+                 result["sensor_mag"]  = ch_arr[py::slice(11 + 4 * nb, 11 + 5 * nb, 1)];
+                 return result;
+             },
+             py::arg("group_id"),
+             R"doc(Return UV accumulator data for a group.
+
+Keys:
+  channels   : float32(n_channels, res, res) — all decoded channels
+  res        : int
+  n_bands    : int
+  count      : float32(res,res)     — hit count              [ch 0]
+  src_flags  : float32(res,res)     — source-ID bitfield     [ch 1]
+  normal     : float32(3,res,res)   — hit-normal xyz sum     [ch 8-10]
+  amp        : float32(res,res)     — sum of per-band |amp|  [ch 11..11+B]
+  band_mag   : float32(B,res,res)   — total per-band magnitude
+  amp_re/im  : float32(B,res,res)   — signed complex amplitude components
+  forward_mag: float32(B,res,res)   — forward/emissive contribution only
+  sensor_mag : float32(B,res,res)   — sensor/reverse contribution only
+
+Full channel layout and UV_CH_* indices are documented in ray_tracer.h.
+)doc")
+        .def("set_group_uv_image",
+             [](PyRayTracer& self, int group_id,
+                py::array_t<float, py::array::c_style | py::array::forcecast> channels) {
+                 auto b = channels.request();
+                 if (b.ndim != 3)
+                     throw std::invalid_argument("channels must be float32 shape (n_channels, res, res)");
+                 const int n_ch = (int)b.shape[0];
+                 const int res_y = (int)b.shape[1];
+                 const int res_x = (int)b.shape[2];
+                 if (res_x != res_y)
+                     throw std::invalid_argument("channels must have square res x res pages");
+                 int rc = ray_tracer_set_group_uv_image(
+                     self.handle,
+                     group_id,
+                     static_cast<const float*>(b.ptr),
+                     res_x,
+                     n_ch);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "set_group_uv_image failed rc=" + std::to_string(rc));
+             },
+             py::arg("group_id"),
+             py::arg("channels"),
+             "Replace one group's UV accumulator from decoded float32 channels.")
+        .def("clear_group_uv_accum",
+             [](PyRayTracer& self, int group_id) {
+                 int rc = ray_tracer_clear_group_uv_accum(self.handle, group_id);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "clear_group_uv_accum failed rc=" + std::to_string(rc));
+             },
+             py::arg("group_id") = -1,
+             "Zero the UV accumulator for group_id (pass -1 to clear all groups).")
+        .def("get_group_uv_summary",
+             [](PyRayTracer& self, int group_id) -> py::dict {
+                 RayTracerUvGroupSummary s{};
+                 int rc = ray_tracer_get_group_uv_summary(self.handle, group_id, &s);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "get_group_uv_summary failed rc=" + std::to_string(rc));
+                 py::dict out;
+                 out["group_id"] = s.group_id;
+                 out["res"] = s.res;
+                 out["n_channels"] = s.n_channels;
+                 out["tri_count"] = s.tri_count;
+                 out["memory_bytes"] = py::int_(s.memory_bytes);
+                 out["nonzero_texels"] = py::int_(s.nonzero_texels);
+                 out["total_forward"] = s.total_forward;
+                 out["total_sensor"] = s.total_sensor;
+                 out["peak_total"] = s.peak_total;
+                 return out;
+             },
+             py::arg("group_id"),
+             "Return cheap telemetry for one UV accumulator group.")
+        .def("list_uv_groups",
+             [](PyRayTracer& self) -> py::list {
+                 py::list groups;
+                 const int n = ray_tracer_n_tri_groups(self.handle);
+                 for (int gid = 0; gid < n; ++gid) {
+                     RayTracerUvGroupSummary s{};
+                     int rc = ray_tracer_get_group_uv_summary(self.handle, gid, &s);
+                     if (rc != 0) continue;
+                     py::dict out;
+                     out["group_id"] = s.group_id;
+                     out["res"] = s.res;
+                     out["n_channels"] = s.n_channels;
+                     out["tri_count"] = s.tri_count;
+                     out["memory_bytes"] = py::int_(s.memory_bytes);
+                     out["nonzero_texels"] = py::int_(s.nonzero_texels);
+                     out["total_forward"] = s.total_forward;
+                     out["total_sensor"] = s.total_sensor;
+                     out["peak_total"] = s.peak_total;
+                     groups.append(out);
+                 }
+                 return groups;
+             },
+             "List UV accumulator groups with cheap telemetry.")
         /* ── Bidirectional integrator ──────────────────────────────── */
         .def("bidirectional",
              [](PyRayTracer& self, int n_rays_per_emitter, int max_bounces,

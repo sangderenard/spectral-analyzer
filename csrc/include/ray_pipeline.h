@@ -114,7 +114,7 @@ struct StageStats {
     /* GPU */
     std::atomic<uint64_t> n_gpu{0};            /* items processed by GPU dispatch */
     std::atomic<uint64_t> ns_gpu{0};           /* total ns spent on GPU dispatch  */
-    std::atomic<int>      batch_sz_gpu{4096};  /* adaptive GPU pop batch size (start large) */
+    std::atomic<int>      batch_sz_gpu{65536}; /* adaptive GPU pop batch size (start large) */
     /* Observed GPU fraction [0,1] stored as IEEE-754 float bits */
     std::atomic<uint32_t> gpu_frac_bits{0};    /* reinterpret as float            */
 
@@ -192,9 +192,15 @@ struct RayPipelineStats {
         uint64_t gpu_processed;    /* GPU items processed */
         int      gpu_batch_size;   /* current GPU batch size */
         float    gpu_fraction;     /* observed fraction going to GPU [0,1] */
+        double   cpu_active_ms;    /* cumulative CPU stage wall time */
+        double   gpu_active_ms;    /* cumulative GPU stage wall time */
     } t1, t2, t3, t4;
     int output_queue_depth;
     int in_flight;
+    uint64_t gpu_uv_readback_bytes;
+    uint64_t gpu_uv_readback_count;
+    uint64_t gpu_hit_readback_bytes;
+    uint64_t gpu_hit_readback_count;
 };
 
 /* ─── Output record ─────────────────────────────────────────────────────── */
@@ -241,8 +247,27 @@ template<typename T>
 class PipelineQueue {
 public:
     void push(T item) {
-        { std::lock_guard<std::mutex> lk(mu_); q_.push_back(std::move(item)); }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (done_) return;
+            q_.push_back(std::move(item));
+        }
         cv_.notify_one();
+    }
+
+    void push_many(std::vector<T>& items) {
+        if (items.empty()) return;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (done_) {
+                items.clear();
+                return;
+            }
+            for (T& item : items)
+                q_.push_back(std::move(item));
+        }
+        cv_.notify_one();
+        items.clear();
     }
 
     /* Bounded push: blocks (spin-sleep 500 µs) until size < max_size.
@@ -253,6 +278,7 @@ public:
             for (;;) {
                 {
                     std::lock_guard<std::mutex> lk(mu_);
+                    if (done_) return;
                     if ((int)q_.size() < max_size) {
                         q_.push_back(std::move(item));
                         cv_.notify_one();
@@ -265,40 +291,42 @@ public:
         push(std::move(item));
     }
 
-    /* Blocking pop.  Brief spin before sleeping — reduces CV overhead on hot queues. */
+    /* Blocking pop.  Brief spin before sleeping — reduces CV overhead on hot queues.
+     * Spin count kept small (8) to avoid mutex thrashing when the queue is idle.
+     * 512 iterations with a lock/yield per iter caused max-CPU on multi-threaded paths. */
     bool pop(T& out) {
-        for (int s = 0; s < 512; ++s) {
+        for (int s = 0; s < 8; ++s) {
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                if (!q_.empty()) { out = std::move(q_.front()); q_.pop_front(); return true; }
                 if (done_) return false;
+                if (!q_.empty()) { out = std::move(q_.front()); q_.pop_front(); return true; }
             }
             std::this_thread::yield();
         }
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [this]{ return !q_.empty() || done_; });
-        if (q_.empty()) return false;
+        if (done_ || q_.empty()) return false;
         out = std::move(q_.front()); q_.pop_front(); return true;
     }
 
     /* Blocking batch pop — waits for ≥1 item, takes up to max_n.
      * Appends to out.  Returns count taken; 0 means done+empty. */
     int pop_batch(std::vector<T>& out, int max_n) {
-        for (int s = 0; s < 512; ++s) {
+        for (int s = 0; s < 8; ++s) {
             {
                 std::lock_guard<std::mutex> lk(mu_);
+                if (done_) return 0;
                 if (!q_.empty()) {
                     int n = std::min(max_n, (int)q_.size());
                     for (int i = 0; i < n; ++i) { out.push_back(std::move(q_.front())); q_.pop_front(); }
                     return n;
                 }
-                if (done_) return 0;
             }
             std::this_thread::yield();
         }
         std::unique_lock<std::mutex> lk(mu_);
         cv_.wait(lk, [this]{ return !q_.empty() || done_; });
-        if (q_.empty()) return 0;
+        if (done_ || q_.empty()) return 0;
         int n = std::min(max_n, (int)q_.size());
         for (int i = 0; i < n; ++i) { out.push_back(std::move(q_.front())); q_.pop_front(); }
         return n;
@@ -324,22 +352,23 @@ public:
             return pop_batch(out, max_n);
 
         /* Spin-wait then CV-wait for at least one item (same as pop_batch). */
-        for (int s = 0; s < 512; ++s) {
+        for (int s = 0; s < 8; ++s) {
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                if (!q_.empty()) goto take;
                 if (done_) return 0;
+                if (!q_.empty()) goto take;
             }
             std::this_thread::yield();
         }
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [this]{ return !q_.empty() || done_; });
-            if (q_.empty()) return 0;
+            if (done_ || q_.empty()) return 0;
         }
     take:
         {
             std::lock_guard<std::mutex> lk(mu_);
+            if (done_) return 0;
             int sz = (int)q_.size();
             if (sz == 0) return 0;
             int n      = std::min(max_n, sz);
@@ -377,24 +406,25 @@ public:
     int pop_batch_priority(std::vector<T>& out, int max_n, KeyFn key_fn,
                            int oversample = 4) {
         if (max_n <= 0) return 0;
-        for (int s = 0; s < 512; ++s) {
+        for (int s = 0; s < 8; ++s) {
             {
                 std::lock_guard<std::mutex> lk(mu_);
-                if (!q_.empty()) goto priority_take;
                 if (done_) return 0;
+                if (!q_.empty()) goto priority_take;
             }
             std::this_thread::yield();
         }
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [this]{ return !q_.empty() || done_; });
-            if (q_.empty()) return 0;
+            if (done_ || q_.empty()) return 0;
         }
     priority_take:
         {
             std::vector<T> grabbed;
             {
                 std::lock_guard<std::mutex> lk(mu_);
+                if (done_) return 0;
                 int sz   = (int)q_.size();
                 if (sz == 0) return 0;
                 int grab = std::min(max_n * oversample, sz);
@@ -410,6 +440,7 @@ public:
                 out.push_back(std::move(grabbed[i]));
             if (take < (int)grabbed.size()) {
                 std::lock_guard<std::mutex> lk(mu_);
+                if (done_) return take;
                 for (int i = (int)grabbed.size() - 1; i >= take; --i)
                     q_.push_front(std::move(grabbed[i]));
                 cv_.notify_one();
@@ -424,7 +455,11 @@ public:
     }
 
     void set_done() {
-        { std::lock_guard<std::mutex> lk(mu_); done_ = true; }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            done_ = true;
+            q_.clear();
+        }
         cv_.notify_all();
     }
 
@@ -499,6 +534,20 @@ struct RayPipelineConfig {
     float       gpu_fraction_t1    = 0.0f;
     float       gpu_fraction_t2    = 0.0f;
     float       gpu_fraction_t3    = 0.0f;
+
+    /* When true the GPU worker reads back hit records after T1 and feeds them
+     * into accumulate_field_capture_segment — matching the CPU T1 path so that
+     * camera_field_grid receives contributions from GPU-processed segments.
+     * When false the field grid only sees segments traced by CPU T1 workers. */
+    bool        gpu_segment_field_capture = true;
+
+    /* When true (and use_gpu_compute=true) the CPU T1/T2/T3 workers are NOT
+     * spawned; the GPU handles all intent→hit→material work exclusively.
+     * This eliminates CPU/GPU competition and prevents CPU thrashing when the
+     * GPU is capable of processing all work.  T4 wave-solver still runs on GPU
+     * when use_gpu_compute=true.  If GPU init fails, CPU workers are spawned as
+     * a fallback regardless of this flag. */
+    bool        gpu_all_stages = false;
 };
 
 /* ─── Opaque pipeline state (defined in ray_tracer.cpp) ─────────────────── */

@@ -91,6 +91,29 @@ using cd   = std::complex<double>;
 using V3d  = Eigen::Vector3d;
 using VXcd = Eigen::VectorXcd;
 
+/* Portable lock-free add for a plain uint32_t in a shared buffer.
+ * std::atomic<uint32_t> is required to be lock-free on all targeted
+ * platforms.  The reinterpret_cast is well-defined by the note in
+ * [atomics.ref] that std::atomic<T> must have the same size/alignment
+ * as T, and is the accepted cross-platform (GCC/Clang/MSVC) idiom when
+ * std::atomic_ref (C++20) is not yet available.                            */
+static inline void uv_accum_add(uint32_t& slot, uint32_t val) {
+    reinterpret_cast<std::atomic<uint32_t>&>(slot)
+        .fetch_add(val, std::memory_order_relaxed);
+}
+
+static inline float rt_i32_as_f32(int32_t v) {
+    float f;
+    std::memcpy(&f, &v, sizeof(f));
+    return f;
+}
+
+static inline float rt_u32_as_f32(uint32_t v) {
+    float f;
+    std::memcpy(&f, &v, sizeof(f));
+    return f;
+}
+
 static constexpr double TWO_PI     = 2.0 * M_PI;
 static constexpr double EPS        = 1e-9;
 static constexpr double T_SELF     = 1e-10;
@@ -542,6 +565,18 @@ struct RayTracerState {
     std::vector<int>                   tri_group_parametric_kind;
     std::vector<std::vector<uint8_t>>  tri_group_parametric_payload;
     std::vector<int>                   tri_param_group_of_tri; /* tri_id -> group_id or -1 */
+
+    /* ── UV integrator image state ──────────────────────────────────────────
+     * Each tri group with uv_image_res > 0 gets a (UV_N_HDR_CHANNELS + 5*n_bands)
+     * channel flat accumulator.  Layout: channel-major, each channel is res×res
+     * uint32 slots.  See ray_tracer.h UV_CH_* constants for semantics.
+     * Both the GPU T3 shader and the CPU T3 scatter path write atomically. */
+    std::vector<int>                   tri_uv_group_of_tri;   /* tri_id -> uv group_id or -1 */
+    std::vector<float>                 tri_uv_data;            /* n_tris * 6: uv0,uv1,uv2 per tri */
+    std::vector<int>                   group_uv_res;           /* per-group res (0 = no UV image) */
+    std::vector<int>                   group_uv_accum_offset;  /* per-group offset into uv_accum (uint32s) */
+    int                                uv_accum_total = 0;     /* total uint32 slots allocated */
+    mutable std::vector<uint32_t>      uv_accum_cpu;           /* flat CPU-side accumulator     */
 
     /* Camera-visibility wrappers for image accumulation entry points. */
     int                                camera_vis_mode = RT_CAM_VIS_AS_IS;
@@ -1413,6 +1448,159 @@ static inline void accumulate_field_capture_segment(
             amp_im.data(),
             st.n_bands);
     }
+}
+
+static bool accumulate_field_capture_segments_regular_threaded(
+    RayTracerState& st,
+    const float* hbuf,
+    int n_hits,
+    int hit_stride,
+    int n_bands)
+{
+    if (!st.camera_field_grid || !hbuf || n_hits <= 0 || n_bands <= 0) return false;
+
+    int nx = 0, ny = 0, nz = 0;
+    const int dims_rc = field_grid_regular_dims(st.camera_field_grid, &nx, &ny, &nz);
+    const float* bmin = field_grid_bmin(st.camera_field_grid);
+    const float* bmax = field_grid_bmax(st.camera_field_grid);
+    float* data = field_grid_data_re_im(st.camera_field_grid);
+    if (dims_rc != SK_OK || !bmin || !bmax || !data || nx <= 0 || ny <= 0 || nz <= 0)
+        return false;
+
+    const int bands = std::min(std::min(n_bands, st.n_bands), 16);
+    if (bands <= 0) return true;
+
+    const double minx = static_cast<double>(bmin[0]);
+    const double miny = static_cast<double>(bmin[1]);
+    const double minz = static_cast<double>(bmin[2]);
+    const double maxx = static_cast<double>(bmax[0]);
+    const double maxy = static_cast<double>(bmax[1]);
+    const double maxz = static_cast<double>(bmax[2]);
+    const double dx = (maxx - minx) / static_cast<double>(nx);
+    const double dy = (maxy - miny) / static_cast<double>(ny);
+    const double dz = (maxz - minz) / static_cast<double>(nz);
+    if (!(dx > 0.0 && dy > 0.0 && dz > 0.0)) return false;
+
+    const int64_t n_cells = static_cast<int64_t>(nx) * static_cast<int64_t>(ny) * static_cast<int64_t>(nz);
+    static constexpr size_t N_LOCKS = 4096;
+    std::vector<std::mutex> locks(N_LOCKS);
+
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const int n_threads = std::max(1, std::min<int>((int)hw, (n_hits + 1023) / 1024));
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<size_t>(n_threads));
+
+    auto world_to_idx = [](double v, double vmin, double dv, int n) -> int {
+        int i = static_cast<int>(std::floor((v - vmin) / dv));
+        if (i < 0) i = 0;
+        if (i >= n) i = n - 1;
+        return i;
+    };
+
+    auto add_trilinear = [&](double px, double py, double pz, const float* row) {
+        const double ux = (px - minx) / (maxx - minx) * static_cast<double>(nx - 1);
+        const double uy = (py - miny) / (maxy - miny) * static_cast<double>(ny - 1);
+        const double uz = (pz - minz) / (maxz - minz) * static_cast<double>(nz - 1);
+        if (ux < 0.0 || uy < 0.0 || uz < 0.0 || ux >= nx || uy >= ny || uz >= nz)
+            return;
+
+        const int x0 = static_cast<int>(ux);
+        const int y0 = static_cast<int>(uy);
+        const int z0 = static_cast<int>(uz);
+        const int x1 = (x0 + 1 < nx) ? x0 + 1 : x0;
+        const int y1 = (y0 + 1 < ny) ? y0 + 1 : y0;
+        const int z1 = (z0 + 1 < nz) ? z0 + 1 : z0;
+        const float fx = static_cast<float>(ux - x0);
+        const float fy = static_cast<float>(uy - y0);
+        const float fz = static_cast<float>(uz - z0);
+
+        auto add_cell = [&](int x, int y, int z, float w) {
+            if (w <= 0.0f) return;
+            const int64_t cell = (static_cast<int64_t>(z) * ny + y) * nx + x;
+            std::lock_guard<std::mutex> lk(locks[static_cast<size_t>(cell) & (N_LOCKS - 1)]);
+            for (int b = 0; b < bands; ++b) {
+                const int64_t off = 2 * (static_cast<int64_t>(b) * n_cells + cell);
+                data[off + 0] += row[26 + b] * w;
+                data[off + 1] += row[42 + b] * w;
+            }
+        };
+
+        add_cell(x0, y0, z0, (1-fx)*(1-fy)*(1-fz));
+        add_cell(x1, y0, z0,    fx *(1-fy)*(1-fz));
+        add_cell(x0, y1, z0, (1-fx)*   fy *(1-fz));
+        add_cell(x1, y1, z0,    fx *   fy *(1-fz));
+        add_cell(x0, y0, z1, (1-fx)*(1-fy)*   fz );
+        add_cell(x1, y0, z1,    fx *(1-fy)*   fz );
+        add_cell(x0, y1, z1, (1-fx)*   fy *   fz );
+        add_cell(x1, y1, z1,    fx *   fy *   fz );
+    };
+
+    auto worker = [&](int lo, int hi) {
+        const double inf = std::numeric_limits<double>::infinity();
+        for (int i = lo; i < hi; ++i) {
+            const float* row = hbuf + static_cast<size_t>(i) * hit_stride;
+            const V3d p0(row[9], row[10], row[11]);
+            const V3d p1(row[0], row[1], row[2]);
+            const V3d d = p1 - p0;
+
+            int ix = world_to_idx(p0.x(), minx, dx, nx);
+            int iy = world_to_idx(p0.y(), miny, dy, ny);
+            int iz = world_to_idx(p0.z(), minz, dz, nz);
+            const int stepx = (d.x() > 0.0) ? 1 : ((d.x() < 0.0) ? -1 : 0);
+            const int stepy = (d.y() > 0.0) ? 1 : ((d.y() < 0.0) ? -1 : 0);
+            const int stepz = (d.z() > 0.0) ? 1 : ((d.z() < 0.0) ? -1 : 0);
+
+            auto t_delta = [&](double dd, double dv) -> double {
+                return (std::abs(dd) > 1.0e-15) ? std::abs(dv / dd) : inf;
+            };
+            auto next_boundary_t = [&](double p, double vmin, double dv, int idx, int step, double dd) -> double {
+                if (step == 0 || std::abs(dd) <= 1.0e-15) return inf;
+                const double boundary = vmin + ((step > 0 ? (idx + 1) : idx) * dv);
+                return (boundary - p) / dd;
+            };
+
+            double tx = next_boundary_t(p0.x(), minx, dx, ix, stepx, d.x());
+            double ty = next_boundary_t(p0.y(), miny, dy, iy, stepy, d.y());
+            double tz = next_boundary_t(p0.z(), minz, dz, iz, stepz, d.z());
+            const double dtx = t_delta(d.x(), dx);
+            const double dty = t_delta(d.y(), dy);
+            const double dtz = t_delta(d.z(), dz);
+
+            double t_prev = 0.0;
+            int guard = 0;
+            const int guard_max = nx + ny + nz + 1024;
+            while (ix >= 0 && ix < nx && iy >= 0 && iy < ny && iz >= 0 && iz < nz
+                    && t_prev <= 1.0 && guard < guard_max) {
+                double t_next = std::min(tx, std::min(ty, tz));
+                if (!std::isfinite(t_next)) t_next = 1.0;
+                t_next = std::max(t_prev, std::min(1.0, t_next));
+                const double t_mid = 0.5 * (t_prev + t_next);
+                const V3d pm = p0 + d * t_mid;
+                add_trilinear(pm.x(), pm.y(), pm.z(), row);
+
+                if (t_next >= 1.0) break;
+                if (tx <= ty && tx <= tz) {
+                    ix += stepx; tx += dtx;
+                } else if (ty <= tx && ty <= tz) {
+                    iy += stepy; ty += dty;
+                } else {
+                    iz += stepz; tz += dtz;
+                }
+                t_prev = t_next;
+                ++guard;
+            }
+        }
+    };
+
+    for (int ti = 0; ti < n_threads; ++ti) {
+        const int lo = (n_hits * ti) / n_threads;
+        const int hi = (n_hits * (ti + 1)) / n_threads;
+        if (lo < hi) workers.emplace_back(worker, lo, hi);
+    }
+    for (auto& t : workers) {
+        if (t.joinable()) t.join();
+    }
+    return true;
 }
 
 /* ── Bounce result ─────────────────────────────────────────────────────────── */
@@ -3048,6 +3236,77 @@ static void trace_rays_multiscale(
 
                 const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
                 if (max_abs < min_amplitude) break;
+
+                /* ── UV integrator image splat (fires for every hit) ──────── */
+                if (!st.tri_uv_group_of_tri.empty()
+                        && hit_tri < (int)st.tri_uv_group_of_tri.size()) {
+                    const int uv_gid = st.tri_uv_group_of_tri[(size_t)hit_tri];
+                    if (uv_gid >= 0 && uv_gid < (int)st.group_uv_res.size()) {
+                        const int res    = st.group_uv_res[(size_t)uv_gid];
+                        const int offset = st.group_uv_accum_offset[(size_t)uv_gid];
+                        if (res > 0 && !st.uv_accum_cpu.empty()) {
+                            /* Recover barycentric (bu, bv) via Gram matrix solve. */
+                            const V3d dp = hit_pos - tri.v0;
+                            const double e1e1 = tri.edge1.dot(tri.edge1);
+                            const double e1e2 = tri.edge1.dot(tri.edge2);
+                            const double e2e2 = tri.edge2.dot(tri.edge2);
+                            const double de1  = dp.dot(tri.edge1);
+                            const double de2  = dp.dot(tri.edge2);
+                            const double det  = e1e1 * e2e2 - e1e2 * e1e2;
+                            double bu = 0.0, bv = 0.0;
+                            if (det > 1.0e-20) {
+                                bu = (e2e2 * de1 - e1e2 * de2) / det;
+                                bv = (e1e1 * de2 - e1e2 * de1) / det;
+                            }
+                            bu = std::max(0.0, std::min(1.0, bu));
+                            bv = std::max(0.0, std::min(1.0 - bu, bv));
+                            /* Interpolate UV vertex data for this tri. */
+                            const float* uvd = st.tri_uv_data.data() + (size_t)hit_tri * 6;
+                            const double u = uvd[0] + bu * (uvd[2] - uvd[0]) + bv * (uvd[4] - uvd[0]);
+                            const double v = uvd[1] + bu * (uvd[3] - uvd[1]) + bv * (uvd[5] - uvd[1]);
+                            const int ix = std::max(0, std::min(res - 1, (int)(u * res)));
+                            const int iy = std::max(0, std::min(res - 1, (int)(v * res)));
+                            const int texel  = iy * res + ix;
+                            const int n2     = res * res;
+                            auto& ac = st.uv_accum_cpu;
+                            /* [0] hit count */
+                            uv_accum_add(ac[(size_t)(offset + 0 * n2 + texel)], 1u);
+                            /* [1] source-ID bitfield */
+                            reinterpret_cast<std::atomic<uint32_t>&>(
+                                ac[(size_t)(offset + 1 * n2 + texel)])
+                                .fetch_or(1u << std::min(si, 31), std::memory_order_relaxed);
+                            /* [2-5] bounce histogram */
+                            uv_accum_add(ac[(size_t)(offset + (2 + std::min(bounce, 3)) * n2 + texel)], 1u);
+                            /* [6-7] tag fields — not tracked in CPU path */
+                            /* [8-10] hit normal xyz, signed ×32768 */
+                            const V3d& hn = hit_n_geom;
+                            auto add_signed = [&](int ch, double v) {
+                                const int32_t fp = (int32_t)std::max(-1073741824.0,
+                                    std::min(1073741824.0, v * 32768.0));
+                                uv_accum_add(ac[(size_t)(offset + ch * n2 + texel)],
+                                             static_cast<uint32_t>(fp));
+                            };
+                            add_signed(8, hn.x());
+                            add_signed(9, hn.y());
+                            add_signed(10, hn.z());
+                            /* [11..11+B-1] per-band magnitude ×65536 */
+                            /* [11+B..11+2B-1] per-band amp_re ×32768 (signed) */
+                            /* [11+2B..11+3B-1] per-band amp_im ×32768 (signed) */
+                            /* [11+3B..11+4B-1] forward magnitude ×65536 */
+                            /* [11+4B..11+5B-1] sensor magnitude ×65536 */
+                            for (int b = 0; b < n_bands; ++b) {
+                                const std::complex<double> a = amp_surf[b];
+                                const double mag = std::abs(a);
+                                const uint32_t fp_mag = (uint32_t)std::min(
+                                    mag * 65536.0, (double)0xFFFFFFFFu);
+                                uv_accum_add(ac[(size_t)(offset + (11 + b) * n2 + texel)], fp_mag);
+                                add_signed(11 + n_bands + b,     a.real());
+                                add_signed(11 + 2 * n_bands + b, a.imag());
+                                uv_accum_add(ac[(size_t)(offset + (11 + 3 * n_bands + b) * n2 + texel)], fp_mag);
+                            }
+                        }
+                    }
+                }
 
                 /* ── Surface interaction ──────────────────────────────────── */
                 const bool mat_transmissive = tri_material_is_transmissive(st, tri);
@@ -4889,6 +5148,92 @@ extern "C" SK_API int ray_tracer_register_tri_group(
                 st->tri_param_group_of_tri[(size_t)t] = copy.group_id;
         }
     }
+
+    /* ── UV integrator image registration ──────────────────────────────── */
+    st->group_uv_res.push_back(desc->uv_image_res);
+    if (desc->uv_image_res > 0) {
+        const int res          = desc->uv_image_res;
+        const int n_total_tris = (int)st->tris.size();
+
+        /* Ensure per-tri UV arrays cover the full triangle list. */
+        if ((int)st->tri_uv_group_of_tri.size() < n_total_tris) {
+            st->tri_uv_group_of_tri.resize(n_total_tris, -1);
+            st->tri_uv_data.resize(n_total_tris * 6, 0.0f);
+        }
+
+        const std::vector<int>& tidx = st->tri_group_indices.back();
+        const int n_gtris = (int)tidx.size();
+
+        if (desc->uv_coords && desc->uv_n_coords == n_gtris * 6) {
+            /* Explicit UV vertex coordinates provided (n_tris * 6 floats). */
+            for (int gi = 0; gi < n_gtris; ++gi) {
+                int t = tidx[(size_t)gi];
+                if (t < 0 || t >= n_total_tris) continue;
+                st->tri_uv_group_of_tri[(size_t)t] = copy.group_id;
+                float* dst = st->tri_uv_data.data() + (size_t)t * 6;
+                const float* src = desc->uv_coords + gi * 6;
+                for (int k = 0; k < 6; ++k) dst[k] = src[k];
+            }
+        } else {
+            /* Auto planar UV: project vertices onto the group's tangent plane,
+             * normalise the bounding box in that plane to [0,1]×[0,1].       */
+            V3d pn(desc->plane_normal[0], desc->plane_normal[1], desc->plane_normal[2]);
+            if (pn.norm() < 1.0e-10) {
+                /* No plane_normal: fall back to the geometric normal of first tri. */
+                if (!tidx.empty()) {
+                    int first = tidx[0];
+                    if (first >= 0 && first < n_total_tris)
+                        pn = st->tris[(size_t)first].normal;
+                }
+            }
+            pn.normalize();
+
+            /* Orthonormal tangent frame: right × up span the UV plane. */
+            V3d world_up = (std::abs(pn.dot(V3d(0, 1, 0))) < 0.9)
+                           ? V3d(0, 1, 0) : V3d(0, 0, 1);
+            const V3d right = world_up.cross(pn).normalized();
+            const V3d up    = pn.cross(right).normalized();
+
+            /* First pass: bounding box in (right, up) coordinates. */
+            double umin = 1.0e30, umax = -1.0e30;
+            double vmin = 1.0e30, vmax = -1.0e30;
+            for (int t : tidx) {
+                if (t < 0 || t >= n_total_tris) continue;
+                const Triangle& tri = st->tris[(size_t)t];
+                const V3d verts[3] = { tri.v0, tri.v0 + tri.edge1, tri.v0 + tri.edge2 };
+                for (const V3d& v : verts) {
+                    double u = right.dot(v), vv = up.dot(v);
+                    umin = std::min(umin, u); umax = std::max(umax, u);
+                    vmin = std::min(vmin, vv); vmax = std::max(vmax, vv);
+                }
+            }
+            const double uspan = (umax - umin > 1.0e-12) ? (umax - umin) : 1.0;
+            const double vspan = (vmax - vmin > 1.0e-12) ? (vmax - vmin) : 1.0;
+
+            /* Second pass: write normalised UV coords. */
+            for (int t : tidx) {
+                if (t < 0 || t >= n_total_tris) continue;
+                st->tri_uv_group_of_tri[(size_t)t] = copy.group_id;
+                const Triangle& tri = st->tris[(size_t)t];
+                const V3d verts[3] = { tri.v0, tri.v0 + tri.edge1, tri.v0 + tri.edge2 };
+                float* dst = st->tri_uv_data.data() + (size_t)t * 6;
+                for (int k = 0; k < 3; ++k) {
+                    dst[k * 2 + 0] = (float)((right.dot(verts[k]) - umin) / uspan);
+                    dst[k * 2 + 1] = (float)((up.dot(verts[k]) - vmin) / vspan);
+                }
+            }
+        }
+
+        /* Allocate (UV_N_HDR_CHANNELS + 5*n_bands) × res × res uint32 slots. */
+        const int uv_n_ch     = UV_N_HDR_CHANNELS + 5 * st->n_bands;
+        const int slot_offset = st->uv_accum_total;
+        st->group_uv_accum_offset.push_back(slot_offset);
+        st->uv_accum_total += uv_n_ch * res * res;
+        st->uv_accum_cpu.resize(st->uv_accum_total, 0u);
+    } else {
+        st->group_uv_accum_offset.push_back(0);
+    }
+
     return copy.group_id;
 }
 
@@ -4905,6 +5250,13 @@ extern "C" SK_API int ray_tracer_clear_tri_groups(RayTracerState* st)
     st->tri_group_parametric_kind.clear();
     st->tri_group_parametric_payload.clear();
     st->tri_param_group_of_tri.assign(st->tris.size(), -1);
+    /* UV integrator image state */
+    st->group_uv_res.clear();
+    st->group_uv_accum_offset.clear();
+    st->tri_uv_group_of_tri.assign(st->tris.size(), -1);
+    st->tri_uv_data.assign(st->tris.size() * 6, 0.0f);
+    st->uv_accum_total = 0;
+    st->uv_accum_cpu.clear();
     return SK_OK;
 }
 
@@ -4914,7 +5266,195 @@ extern "C" SK_API int ray_tracer_n_tri_groups(const RayTracerState* st)
     return static_cast<int>(st->tri_groups.size());
 }
 
-/* ── Bidirectional integrator ───────────────────────────────────────────
+extern "C" SK_API int ray_tracer_get_group_uv_image(
+    const RayTracerState* st,
+    int    group_id,
+    float* out_channels,
+    int*   out_res,
+    int*   out_n_channels)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    if (group_id < 0 || group_id >= (int)st->group_uv_res.size())
+        return SK_ERR_DIM_MISMATCH;
+    const int res     = st->group_uv_res[(size_t)group_id];
+    const int n_ch    = UV_N_HDR_CHANNELS + 5 * st->n_bands;
+    const int n_texel = res * res;
+    if (out_res)        *out_res        = res;
+    if (out_n_channels) *out_n_channels = n_ch;
+    if (res <= 0) return SK_ERR_DIM_MISMATCH;
+    if (!out_channels) return SK_OK;
+
+    const int offset = st->group_uv_accum_offset[(size_t)group_id];
+    if (offset + n_ch * n_texel > (int)st->uv_accum_cpu.size())
+        return SK_ERR_DIM_MISMATCH;
+    const uint32_t* base = st->uv_accum_cpu.data() + offset;
+
+    /* Channels 0-7: raw uint counts / bitfields → cast directly. */
+    for (int ch = 0; ch < 8; ++ch)
+        for (int i = 0; i < n_texel; ++i)
+            out_channels[ch * n_texel + i] = (float)base[ch * n_texel + i];
+
+    /* Channels 8-10: signed normal xyz, ×32768. */
+    for (int ch = 8; ch <= 10; ++ch)
+        for (int i = 0; i < n_texel; ++i)
+            out_channels[ch * n_texel + i] =
+                (float)(int32_t)base[ch * n_texel + i] / 32768.0f;
+
+    /* Channels 11..11+B-1: per-band magnitude, unsigned ×65536. */
+    const int nb = st->n_bands;
+    for (int b = 0; b < nb; ++b)
+        for (int i = 0; i < n_texel; ++i)
+            out_channels[(11 + b) * n_texel + i] =
+                (float)base[(11 + b) * n_texel + i] / 65536.0f;
+
+    /* Channels 11+B..11+3B-1: per-band re/im, signed ×32768. */
+    for (int b = 0; b < 2 * nb; ++b)
+        for (int i = 0; i < n_texel; ++i)
+            out_channels[(11 + nb + b) * n_texel + i] =
+                (float)(int32_t)base[(11 + nb + b) * n_texel + i] / 32768.0f;
+
+    /* Channels 11+3B..11+5B-1: forward/sensor magnitudes, unsigned ×65536. */
+    for (int b = 0; b < 2 * nb; ++b)
+        for (int i = 0; i < n_texel; ++i)
+            out_channels[(11 + 3 * nb + b) * n_texel + i] =
+                (float)base[(11 + 3 * nb + b) * n_texel + i] / 65536.0f;
+
+    return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_set_group_uv_image(
+    RayTracerState* st,
+    int group_id,
+    const float* channels,
+    int res,
+    int n_channels)
+{
+    if (!st || !channels) return SK_ERR_NULL_STATE;
+    if (group_id < 0 || group_id >= (int)st->group_uv_res.size())
+        return SK_ERR_DIM_MISMATCH;
+    const int group_res = st->group_uv_res[(size_t)group_id];
+    const int n_ch = UV_N_HDR_CHANNELS + 5 * st->n_bands;
+    if (group_res <= 0 || res != group_res || n_channels != n_ch)
+        return SK_ERR_DIM_MISMATCH;
+    const int n_texel = res * res;
+    const int offset = st->group_uv_accum_offset[(size_t)group_id];
+    const int n_slot = n_ch * n_texel;
+    if (offset < 0 || offset + n_slot > (int)st->uv_accum_cpu.size())
+        return SK_ERR_DIM_MISMATCH;
+
+    uint32_t* base = st->uv_accum_cpu.data() + offset;
+    auto encode_unsigned = [](float v, double scale) -> uint32_t {
+        if (!(v > 0.0f)) return 0u;
+        const double x = std::min((double)v * scale, (double)0xFFFFFFFFu);
+        return (uint32_t)std::llround(x);
+    };
+    auto encode_signed = [](float v, double scale) -> uint32_t {
+        const double x = std::max(-(double)INT32_MAX,
+                                  std::min((double)INT32_MAX, (double)v * scale));
+        return (uint32_t)(int32_t)std::llround(x);
+    };
+
+    for (int ch = 0; ch < 8; ++ch) {
+        for (int i = 0; i < n_texel; ++i)
+            base[ch * n_texel + i] = encode_unsigned(channels[ch * n_texel + i], 1.0);
+    }
+    for (int ch = 8; ch <= 10; ++ch) {
+        for (int i = 0; i < n_texel; ++i)
+            base[ch * n_texel + i] = encode_signed(channels[ch * n_texel + i], 32768.0);
+    }
+
+    const int nb = st->n_bands;
+    for (int b = 0; b < nb; ++b) {
+        for (int i = 0; i < n_texel; ++i)
+            base[(11 + b) * n_texel + i] =
+                encode_unsigned(channels[(11 + b) * n_texel + i], 65536.0);
+    }
+    for (int b = 0; b < 2 * nb; ++b) {
+        for (int i = 0; i < n_texel; ++i)
+            base[(11 + nb + b) * n_texel + i] =
+                encode_signed(channels[(11 + nb + b) * n_texel + i], 32768.0);
+    }
+    for (int b = 0; b < 2 * nb; ++b) {
+        for (int i = 0; i < n_texel; ++i)
+            base[(11 + 3 * nb + b) * n_texel + i] =
+                encode_unsigned(channels[(11 + 3 * nb + b) * n_texel + i], 65536.0);
+    }
+    return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_get_group_uv_summary(
+    const RayTracerState* st,
+    int group_id,
+    RayTracerUvGroupSummary* out_summary)
+{
+    if (!st || !out_summary) return SK_ERR_NULL_STATE;
+    if (group_id < 0 || group_id >= (int)st->group_uv_res.size())
+        return SK_ERR_DIM_MISMATCH;
+
+    const int res = st->group_uv_res[(size_t)group_id];
+    const int nb = st->n_bands;
+    const int n_ch = UV_N_HDR_CHANNELS + 5 * nb;
+    const int n_texel = res * res;
+    const int offset = st->group_uv_accum_offset[(size_t)group_id];
+    const int n_slot = n_ch * n_texel;
+    if (res <= 0 || offset < 0 || offset + n_slot > (int)st->uv_accum_cpu.size())
+        return SK_ERR_DIM_MISMATCH;
+
+    const uint32_t* base = st->uv_accum_cpu.data() + offset;
+    uint64_t nonzero = 0;
+    double total_forward = 0.0;
+    double total_sensor = 0.0;
+    double peak_total = 0.0;
+    for (int i = 0; i < n_texel; ++i) {
+        const uint32_t hits = base[UV_CH_HIT_COUNT * n_texel + i];
+        if (hits != 0u) ++nonzero;
+        double total = 0.0;
+        for (int b = 0; b < nb; ++b) {
+            const double fwd = (double)base[(11 + 3 * nb + b) * n_texel + i] / 65536.0;
+            const double sen = (double)base[(11 + 4 * nb + b) * n_texel + i] / 65536.0;
+            total_forward += fwd;
+            total_sensor += sen;
+            total += fwd + sen;
+        }
+        if (total > peak_total) peak_total = total;
+    }
+
+    RayTracerUvGroupSummary s{};
+    s.group_id = group_id;
+    s.res = res;
+    s.n_channels = n_ch;
+    s.tri_count = (group_id >= 0 && group_id < (int)st->tri_group_indices.size())
+        ? (int)st->tri_group_indices[(size_t)group_id].size()
+        : 0;
+    s.memory_bytes = (uint64_t)n_slot * (uint64_t)sizeof(uint32_t);
+    s.nonzero_texels = nonzero;
+    s.total_forward = total_forward;
+    s.total_sensor = total_sensor;
+    s.peak_total = peak_total;
+    *out_summary = s;
+    return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_clear_group_uv_accum(RayTracerState* st, int group_id)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    if (group_id < 0) {
+        /* Clear all groups. */
+        std::fill(st->uv_accum_cpu.begin(), st->uv_accum_cpu.end(), 0u);
+        return SK_OK;
+    }
+    if (group_id >= (int)st->group_uv_res.size()) return SK_ERR_DIM_MISMATCH;
+    const int res    = st->group_uv_res[(size_t)group_id];
+    if (res <= 0) return SK_OK;
+    const int offset = st->group_uv_accum_offset[(size_t)group_id];
+    const int n_slot = (UV_N_HDR_CHANNELS + 5 * st->n_bands) * res * res;
+    if (offset + n_slot > (int)st->uv_accum_cpu.size()) return SK_ERR_DIM_MISMATCH;
+    std::fill(st->uv_accum_cpu.begin() + offset,
+              st->uv_accum_cpu.begin() + offset + n_slot, 0u);
+    return SK_OK;
+}
+
+/*
  * Emits N rays from each EMISSIVE triangle group (area-weighted sampling
  * with a cosine-hemisphere distribution about the local normal), traces
  * them through the BVH with the same bounce loop the legacy splatting
@@ -5566,6 +6106,10 @@ struct RayPipelineState {
     std::vector<uint8_t>      mat_epsilon_flags;
 
     StageStats                stats[4]; /* [0]=T1 [1]=T2 [2]=T3 [3]=T4        */
+    std::atomic<uint64_t>     gpu_uv_readback_bytes{0};
+    std::atomic<uint64_t>     gpu_uv_readback_count{0};
+    std::atomic<uint64_t>     gpu_hit_readback_bytes{0};
+    std::atomic<uint64_t>     gpu_hit_readback_count{0};
 
     std::deque<WaveArena>     arenas;   /* deque: never moves elements, safe with mutex */
     std::vector<std::thread>  workers;
@@ -5605,10 +6149,11 @@ struct RayPipelineState {
  *   all shader programs + SSBOs.  A single `gl_dispatch_thread` (spawned in
  *   ray_pipeline_create when use_gpu_compute=true) runs thread_main(), which
  *   pops large batches from the SAME queues as the CPU workers and dispatches
- *   them through T1→T2→T3 on the GPU, writing results back to Q_hit /
- *   Q_refined / Q_intent (child rays) and Q_out (output records).
+ *   them through T1→T2→T3 on the GPU atomically, then pushes child intents
+ *   back to Q_intent for the next generation.  T2 and T3 are GPU-internal;
+ *   they do not compete with CPU T2/T3 on Q_hit/Q_refined.
  *
- *   Both CPU workers and the GPU thread compete on the shared queues.  The
+ *   Both CPU workers and the GPU thread compete on Q_intent.  The
  *   StageStats adaptive-batch logic causes the GPU thread (which uses larger
  *   batches) to absorb more work when the queue is deep, and fall back to CPU
  *   when the queue is thin — automatically balancing the two operators.
@@ -5631,6 +6176,18 @@ public:
     /* Shader programs for each stage */
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
 
+    /* Cached uniform locations — populated once after shader link */
+    struct { GLint n_intents, n_bands, n_mats, n_arenas, n_tris, u_arenas; }
+        uloc_t1 = {-1,-1,-1,-1,-1,-1};
+    struct { GLint n_tris, n_groups; }
+        uloc_t2 = {-1,-1};
+    struct { GLint n_bands, n_mats, max_children, max_children_per_hit,
+                   sensor_res, sensor_pr, sensor_px,
+                   n_uv_groups, uv_meta_base, rng_seed; }
+        uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+    struct { GLint mode, nx, ny, n_bands, dx, dz, wavelengths; }
+        uloc_t4 = {-1,-1,-1,-1,-1,-1,-1};
+
     /* Per-stage SSBOs allocated once and resized as needed */
     /* T1 inputs */
     GLuint ssbo_intent      = 0; /* RayIntent flat float buffer */
@@ -5648,9 +6205,18 @@ public:
     GLuint ssbo_tri_param   = 0; /* per-tri parametric group id */
     GLuint ssbo_group_kind  = 0;
     GLuint ssbo_group_pay   = 0;
-    /* T3 output child intents */
-    GLuint ssbo_child_int   = 0; /* child RayIntent flat buffer */
-    GLuint ssbo_child_cnt   = 0; /* child intent counter */
+    /* T3 output: child intents at [0..max_children*INTENT_STRIDE) and
+     * terminal records at [max_children*INTENT_STRIDE..) packed in one SSBO */
+    GLuint ssbo_child_int   = 0;
+    /* T3 meta: [0]=intent_count [1]=terminal_count [2..2+n_mats-1]=eps_flags
+     * Only [0] and [1] are zeroed before each dispatch; eps_flags are written
+     * at scene-upload time and persist across dispatches. */
+    GLuint ssbo_t3_meta     = 0;
+    /* UV integrator image: per-tri UV data + per-tri group mapping,
+     * per-group metadata, and the flat atomic accumulator. */
+    GLuint ssbo_tri_uv          = 0;  /* binding 5: n_tris*6 float32 UV vertex coords         */
+    GLuint ssbo_tri_uv_and_meta = 0;  /* binding 6: [n_tris group-ids] ++ [n_groups*2 meta]   */
+    GLuint ssbo_uv_accum        = 0;  /* binding 7: flat uint32 accumulator                   */
     /* T4 BPM wave field */
     GLuint ssbo_wave_re     = 0;
     GLuint ssbo_wave_im     = 0;
@@ -5662,14 +6228,32 @@ public:
     /* Capacities to know when realloc is needed */
     int cap_intents  = 0;
     int cap_hits     = 0;
-    int cap_children = 0;
+    int cap_children = 0; /* also gates terminal capacity: buffer = cap*(INTENT_STRIDE+TERMINAL_STRIDE) */
     int cap_wave_pix = 0; /* per band */
 
     /* Arena data cached for per-dispatch uniform upload (≤16 arenas × 4 floats) */
     std::vector<float> arena_uniform_data;
 
+    /* CPU-side staging buffers — grown as needed, never shrunk.
+     * Eliminates large malloc/free pairs per dispatch batch. */
+    std::vector<float>     stg_ibuf;     /* intent upload (n*INTENT_STRIDE)             */
+    std::vector<float>     stg_cbuf;     /* child intent readback (nc*CHILD_STRIDE)     */
+    std::vector<float>     stg_tbuf;     /* terminal readback (nt_term*TERMINAL_STRIDE) */
+    std::vector<float>     stg_hbuf;     /* hit readback (n_hits*HIT_STRIDE)            */
+    std::vector<RayRecord> stg_strike;   /* STRIKE records for Q_out                   */
+    std::vector<RayIntent> stg_children; /* child intents for push_many                */
+    std::vector<uint32_t>  stg_uv_acc;  /* UV accumulator readback                    */
+    std::vector<VXcd>      stg_amp_recycle; /* Eigen amp allocs harvested from prior batch */
+    struct SensorUpdate { int iy, iz; double ch1, ch2; };
+    std::vector<SensorUpdate> stg_sensor_updates; /* precomputed sensor updates, outside lock */
+    std::chrono::steady_clock::time_point last_uv_readback_t = std::chrono::steady_clock::now();
+    double uv_readback_interval_s = 1.0;
+
     /* Scene data uploaded once */
     bool scene_uploaded = false;
+
+    /* Number of parametric groups uploaded to GPU — 0 means T2 is a no-op */
+    int n_param_groups = 0;
 
     /* ── helpers ──────────────────────────────────────────────────────────── */
 
@@ -5695,7 +6279,9 @@ public:
     void upload_ssbo(GLuint& id, const void* data, GLsizeiptr bytes) {
         if (!id) glc_GenBuffers(1, &id);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
-        glc_BufferData(GL_SHADER_STORAGE_BUFFER, bytes, data, GL_STATIC_DRAW);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, bytes, nullptr, GL_DYNAMIC_DRAW);
+        if (data && bytes > 0)
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, data);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
     }
 
@@ -5751,6 +6337,36 @@ public:
         if (!load("ray_material.comp.glsl",      prog_t3)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
         if (!load("ray_wave_bpm.comp.glsl",      prog_t4)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
 
+        /* Cache uniform locations — string lookup done once at init, not per dispatch */
+        uloc_t1.n_intents = glc_GetUniformLocation(prog_t1, "n_intents");
+        uloc_t1.n_bands   = glc_GetUniformLocation(prog_t1, "n_bands");
+        uloc_t1.n_mats    = glc_GetUniformLocation(prog_t1, "n_mats");
+        uloc_t1.n_arenas  = glc_GetUniformLocation(prog_t1, "n_arenas");
+        uloc_t1.n_tris    = glc_GetUniformLocation(prog_t1, "n_tris");
+        uloc_t1.u_arenas  = glc_GetUniformLocation(prog_t1, "u_arenas");
+
+        uloc_t2.n_tris    = glc_GetUniformLocation(prog_t2, "n_tris");
+        uloc_t2.n_groups  = glc_GetUniformLocation(prog_t2, "n_groups");
+
+        uloc_t3.n_bands              = glc_GetUniformLocation(prog_t3, "n_bands");
+        uloc_t3.n_mats               = glc_GetUniformLocation(prog_t3, "n_mats");
+        uloc_t3.max_children         = glc_GetUniformLocation(prog_t3, "max_children");
+        uloc_t3.max_children_per_hit = glc_GetUniformLocation(prog_t3, "max_children_per_hit");
+        uloc_t3.sensor_res           = glc_GetUniformLocation(prog_t3, "sensor_res");
+        uloc_t3.sensor_pr            = glc_GetUniformLocation(prog_t3, "sensor_pr");
+        uloc_t3.sensor_px            = glc_GetUniformLocation(prog_t3, "sensor_px");
+        uloc_t3.n_uv_groups          = glc_GetUniformLocation(prog_t3, "n_uv_groups");
+        uloc_t3.uv_meta_base         = glc_GetUniformLocation(prog_t3, "uv_meta_base");
+        uloc_t3.rng_seed             = glc_GetUniformLocation(prog_t3, "rng_seed");
+
+        uloc_t4.mode        = glc_GetUniformLocation(prog_t4, "mode");
+        uloc_t4.nx          = glc_GetUniformLocation(prog_t4, "nx");
+        uloc_t4.ny          = glc_GetUniformLocation(prog_t4, "ny");
+        uloc_t4.n_bands     = glc_GetUniformLocation(prog_t4, "n_bands");
+        uloc_t4.dx          = glc_GetUniformLocation(prog_t4, "dx");
+        uloc_t4.dz          = glc_GetUniformLocation(prog_t4, "dz");
+        uloc_t4.wavelengths = glc_GetUniformLocation(prog_t4, "wavelengths");
+
         ready = true;
         return true;
     }
@@ -5768,8 +6384,10 @@ public:
                 float* b = buf.data() + i * 10;
                 b[0] = (float)nd.aabb.lo.x(); b[1] = (float)nd.aabb.lo.y(); b[2] = (float)nd.aabb.lo.z();
                 b[3] = (float)nd.aabb.hi.x(); b[4] = (float)nd.aabb.hi.y(); b[5] = (float)nd.aabb.hi.z();
-                memcpy(b+6, &nd.left,      4); memcpy(b+7, &nd.right,     4);
-                memcpy(b+8, &nd.tri_start, 4); memcpy(b+9, &nd.tri_end,   4);
+                b[6] = rt_i32_as_f32((int32_t)nd.left);
+                b[7] = rt_i32_as_f32((int32_t)nd.right);
+                b[8] = rt_i32_as_f32((int32_t)nd.tri_start);
+                b[9] = rt_i32_as_f32((int32_t)nd.tri_end);
             }
             upload_ssbo(ssbo_bvh, buf.data(), (GLsizeiptr)(nn * 10 * sizeof(float)));
         }
@@ -5799,10 +6417,10 @@ public:
                 b[3]=(float)tri.edge1.x(); b[4]=(float)tri.edge1.y(); b[5]=(float)tri.edge1.z();
                 b[6]=(float)tri.edge2.x(); b[7]=(float)tri.edge2.y(); b[8]=(float)tri.edge2.z();
                 b[9]=(float)tri.normal.x();b[10]=(float)tri.normal.y();b[11]=(float)tri.normal.z();
-                memcpy(b+12, &tri.flags,              4);
-                memcpy(b+13, &tri.mat_idx,            4);
-                memcpy(b+14, &tri.medium_pos_mat_idx, 4);
-                memcpy(b+15, &tri.medium_neg_mat_idx, 4);
+                b[12] = rt_i32_as_f32((int32_t)tri.flags);
+                b[13] = rt_i32_as_f32((int32_t)tri.mat_idx);
+                b[14] = rt_i32_as_f32((int32_t)tri.medium_pos_mat_idx);
+                b[15] = rt_i32_as_f32((int32_t)tri.medium_neg_mat_idx);
             }
             upload_ssbo(ssbo_tri_full, buf.data(), (GLsizeiptr)(nt * 16 * sizeof(float)));
         }
@@ -5837,19 +6455,124 @@ public:
         }
         /* TriSensorGroupBuf removed — T1 shader no longer has that binding. */
 
-        /* Param groups: tri → param group id.  We don't have a parametric
-         * group system in RayTracerState, so default to -1 for all tris. */
+        /* Parametric group data — tri→group map and per-group kind+payload.
+         * CPU stores payloads as double arrays; GPU T2 shader uses float[16]. */
         {
             const int nt = (int)st.tris.size();
-            std::vector<int> pg(nt, -1);
-            upload_ssbo(ssbo_tri_param, pg.data(), (GLsizeiptr)(nt * sizeof(int)));
+            const int ng = (int)st.tri_group_parametric_kind.size();
+
+            if (!st.tri_param_group_of_tri.empty()) {
+                upload_ssbo(ssbo_tri_param, st.tri_param_group_of_tri.data(),
+                            (GLsizeiptr)(nt * sizeof(int)));
+            } else {
+                std::vector<int> pg(nt, -1);
+                upload_ssbo(ssbo_tri_param, pg.data(), (GLsizeiptr)(nt * sizeof(int)));
+            }
+
+            if (ng > 0) {
+                upload_ssbo(ssbo_group_kind, st.tri_group_parametric_kind.data(),
+                            (GLsizeiptr)(ng * sizeof(int)));
+                static constexpr int GPS = 16; /* GROUP_PAYLOAD_STRIDE */
+                std::vector<float> pay(static_cast<size_t>(ng) * GPS, 0.0f);
+                for (int gi = 0; gi < ng; ++gi) {
+                    int kind = st.tri_group_parametric_kind[static_cast<size_t>(gi)];
+                    const auto& pb = st.tri_group_parametric_payload[static_cast<size_t>(gi)];
+                    float* dst = pay.data() + gi * GPS;
+                    if (kind == TRI_PARAM_SURFACE_POLY_BARY
+                            && pb.size() >= 6 * sizeof(double)) {
+                        const double* src = reinterpret_cast<const double*>(pb.data());
+                        for (int i = 0; i < 6; ++i) dst[i] = (float)src[i];
+                    } else if (kind == TRI_PARAM_SURFACE_SDF_SPHERE
+                            && pb.size() >= sizeof(double)) {
+                        dst[0] = (float)(*reinterpret_cast<const double*>(pb.data()));
+                    }
+                    /* SDF_SADDLE (kind=2): GPU falls back to CPU via counter[3]; no payload needed */
+                }
+                upload_ssbo(ssbo_group_pay, pay.data(),
+                            (GLsizeiptr)(ng * GPS * sizeof(float)));
+                n_param_groups = ng;
+            } else {
+                int stub_i = 0;    upload_ssbo(ssbo_group_kind, &stub_i, sizeof(int));
+                float stub_f = 0.f; upload_ssbo(ssbo_group_pay, &stub_f, sizeof(float));
+                n_param_groups = 0;
+            }
         }
-        /* group_kind and payload are empty — allocate 4-byte stubs */
-        { int stub = 0; upload_ssbo(ssbo_group_kind, &stub, sizeof(int)); }
-        { float stub = 0.0f; upload_ssbo(ssbo_group_pay, &stub, sizeof(float)); }
 
         /* Counter SSBO: 8 uints — allocate once, zeroed on each dispatch */
         ensure_ssbo(ssbo_counter, 8 * sizeof(uint32_t));
+
+        /* T3 meta SSBO: [0]=intent_count [1]=terminal_count [2..2+nm-1]=eps_flags
+         * Allocate as 2+nm uints.  Counters are zeroed before each dispatch;
+         * eps_flags are written here and survive across dispatches. */
+        {
+            const int nm2 = std::max(1, st.mat_n_mats);  /* at least 1 so the SSBO is non-empty */
+            std::vector<uint32_t> meta(2 + nm2, 0u);
+            const auto& ef = ps.mat_epsilon_flags;
+            for (int i = 0; i < nm2 && i < (int)ef.size(); ++i)
+                meta[2 + i] = ef[i] ? 1u : 0u;
+            upload_ssbo(ssbo_t3_meta, meta.data(),
+                        (GLsizeiptr)((2 + nm2) * sizeof(uint32_t)));
+        }
+
+        {
+            const auto& root = st.bvh_nodes[0];
+            fprintf(stderr,
+                "[gpu-upload] scene: %d BVH nodes, %d tris, %d mats, n_bands=%d, n_param_groups=%d\n"
+                "[gpu-upload] root AABB: lo=(%.4f,%.4f,%.4f) hi=(%.4f,%.4f,%.4f) left=%d right=%d\n",
+                (int)st.bvh_nodes.size(), (int)st.tris.size(),
+                st.mat_n_mats, st.n_bands, n_param_groups,
+                (float)root.aabb.lo.x(), (float)root.aabb.lo.y(), (float)root.aabb.lo.z(),
+                (float)root.aabb.hi.x(), (float)root.aabb.hi.y(), (float)root.aabb.hi.z(),
+                root.left, root.right);
+            fflush(stderr);
+        }
+
+        /* UV integrator image SSBOs.
+         * These are uploaded once at scene-upload time; ssbo_uv_accum is the
+         * only one that changes (GPU atomicAdds during T3) and is readback +
+         * zeroed after every T3 dispatch.                                     */
+        {
+            const int nt_uv = (int)st.tri_uv_data.size() / 6;
+            if (nt_uv > 0 && !st.tri_uv_group_of_tri.empty()) {
+                upload_ssbo(ssbo_tri_uv, st.tri_uv_data.data(),
+                            (GLsizeiptr)(st.tri_uv_data.size() * sizeof(float)));
+            } else {
+                float stub_f = 0.0f; upload_ssbo(ssbo_tri_uv, &stub_f, sizeof(float));
+            }
+
+            /* Merged buffer at binding 6: [n_tris group-ids] ++ [n_groups*2 meta ints].
+             * Build it unconditionally so the binding is always valid. */
+            {
+                const size_t n_id = st.tri_uv_group_of_tri.size();
+                const int    ng   = (int)st.group_uv_res.size();
+                std::vector<int32_t> merged(std::max((size_t)1, n_id + (size_t)ng * 2), -1);
+                for (size_t i = 0; i < n_id; ++i)
+                    merged[i] = st.tri_uv_group_of_tri[i];
+                for (int g = 0; g < ng; ++g) {
+                    merged[n_id + (size_t)g * 2 + 0] = st.group_uv_res[(size_t)g];
+                    merged[n_id + (size_t)g * 2 + 1] = st.group_uv_accum_offset[(size_t)g];
+                }
+                upload_ssbo(ssbo_tri_uv_and_meta, merged.data(),
+                            (GLsizeiptr)(merged.size() * sizeof(int32_t)));
+            }
+
+            /* Accumulator (binding 7): allocate to match CPU side; zero-init once. */
+            const int n_accum = st.uv_accum_total;
+            if (n_accum > 0)
+                ensure_ssbo(ssbo_uv_accum, (GLsizeiptr)(n_accum * sizeof(uint32_t)));
+            else {
+                uint32_t stub_u = 0; ensure_ssbo(ssbo_uv_accum, sizeof(uint32_t));
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_uv_accum);
+            {
+                const GLsizeiptr clr_sz = (n_accum > 0)
+                    ? (GLsizeiptr)(n_accum * sizeof(uint32_t)) : sizeof(uint32_t);
+                std::vector<uint32_t> zeros(n_accum > 0 ? n_accum : 1, 0u);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, clr_sz, zeros.data());
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+
         scene_uploaded = true;
     }
 
@@ -5872,24 +6595,26 @@ public:
             ensure_ssbo(ssbo_intent, (GLsizeiptr)(cap_intents * INTENT_STRIDE * sizeof(float)));
         }
 
-        /* Pack intents to flat float buffer */
-        std::vector<float> ibuf((size_t)n * INTENT_STRIDE, 0.0f);
+        /* Pack intents to flat float buffer — persistent staging, no malloc after warmup */
+        stg_ibuf.resize((size_t)n * INTENT_STRIDE);
+        auto& ibuf = stg_ibuf;
         for (int i = 0; i < n; ++i) {
             const RayIntent& ri = batch[static_cast<size_t>(i)];
             float* row = ibuf.data() + i * INTENT_STRIDE;
             row[0]=(float)ri.pos.x();  row[1]=(float)ri.pos.y();  row[2]=(float)ri.pos.z();
             row[3]=(float)ri.dir.x();  row[4]=(float)ri.dir.y();  row[5]=(float)ri.dir.z();
             row[6]=(float)ri.path_len;
-            memcpy(row+7,  &ri.medium_mat_idx,     4);
-            memcpy(row+8,  &ri.interaction_flags,  4);
-            memcpy(row+9,  &ri.src_id,             4);
-            memcpy(row+10, &ri.bounce,             4);
-            memcpy(row+11, &ri.bounces_left,       4);
-            row[12]=(float)ri.min_amplitude;
+            row[7]  = rt_i32_as_f32((int32_t)ri.medium_mat_idx);
+            row[8]  = rt_u32_as_f32((uint32_t)ri.interaction_flags);
+            row[9]  = rt_i32_as_f32((int32_t)ri.src_id);
+            row[10] = rt_i32_as_f32((int32_t)ri.bounce);
+            row[11] = rt_i32_as_f32((int32_t)ri.bounces_left);
+            row[12] = (float)ri.min_amplitude;
             uint32_t tag_lo = (uint32_t)(ri.tag & 0xFFFFFFFFULL);
             uint32_t tag_hi = (uint32_t)(ri.tag >> 32);
-            memcpy(row+13, &tag_lo, 4); memcpy(row+14, &tag_hi, 4);
-            memcpy(row+15, &ri.color_flag, 4);
+            row[13] = rt_u32_as_f32(tag_lo);
+            row[14] = rt_u32_as_f32(tag_hi);
+            row[15] = rt_u32_as_f32((uint32_t)ri.color_flag);
             row[16] = ri.priority;
             row[17] = ri.sensor_origin_y; row[18] = ri.sensor_origin_z; row[19] = 0.0f;
             const int bands = std::min(nb, 16);
@@ -5926,89 +6651,175 @@ public:
         bind_ssbo(ssbo_counter,    2); bind_ssbo(ssbo_bvh,       3);
         bind_ssbo(ssbo_tri_id,     4); bind_ssbo(ssbo_tri_full,  5);
         bind_ssbo(ssbo_mat_band,   6); bind_ssbo(ssbo_scene_band,7);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_intents"), n);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_bands"),   nb);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_mats"),    nm);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_arenas"),  na);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t1,"n_tris"),    nt);
-        /* Upload arena center+radius as uniform vec4 array */
-        {
-            GLint loc = glc_GetUniformLocation(prog_t1, "u_arenas");
-            if (loc >= 0 && na > 0)
-                glc_Uniform4fv(loc, na, arena_uniform_data.data());
-        }
+        glc_Uniform1i(uloc_t1.n_intents, n);
+        glc_Uniform1i(uloc_t1.n_bands,   nb);
+        glc_Uniform1i(uloc_t1.n_mats,    nm);
+        glc_Uniform1i(uloc_t1.n_arenas,  na);
+        glc_Uniform1i(uloc_t1.n_tris,    nt);
+        if (uloc_t1.u_arenas >= 0 && na > 0)
+            glc_Uniform4fv(uloc_t1.u_arenas, na, arena_uniform_data.data());
         glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
+        /* Shader-storage barrier only — no CPU readback here.
+         * T2 and T3 read n_hits from counters[0] in the SSBO so we can
+         * dispatch T1→T2→T3 as a single GPU command sequence with only
+         * one CPU sync point (after T3).  This halves GPU↔CPU round-trips. */
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-        /* Read back hit count */
-        uint32_t counters[8] = {};
-        readback_ssbo(ssbo_counter, counters, 8 * sizeof(uint32_t));
-        int n_hits = (int)counters[0];
-        ps.stats[0].record_gpu(n, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now() - t1_start).count(), ps.Q_intent.size());
-
-        if (n_hits <= 0) return 0;
-        n_hits = std::min(n_hits, cap_hits);
-
-        /* ── T2 dispatch (in-place on ssbo_hit) ─────────────────────────═ */
-        auto t2_start = Clock::now();
-        /* Reset counter[3] (cpu_refine count) */
-        {
-            uint32_t z = 0;
-            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
-            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 3 * sizeof(uint32_t), sizeof(uint32_t), &z);
-            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        /* ── T2 dispatch (in-place on ssbo_hit) ─────────────────────────═
+         * Dispatched on the input batch size (worst case = all hits).
+         * Invocations beyond the actual hit count early-return via the
+         * counters[0] guard inside the shader — no CPU sync needed between stages. */
+        if (n_param_groups > 0) {
+            /* Reset counter[3] (cpu_refine count for SDF_SADDLE fallbacks) */
+            {
+                uint32_t z = 0;
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 3 * sizeof(uint32_t), sizeof(uint32_t), &z);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            }
+            glc_UseProgram(prog_t2);
+            bind_ssbo(ssbo_hit,        0); bind_ssbo(ssbo_tri_full,  1);
+            bind_ssbo(ssbo_tri_param,  2); bind_ssbo(ssbo_group_kind,3);
+            bind_ssbo(ssbo_group_pay,  4); bind_ssbo(ssbo_counter,   5);
+            /* n_hits uniform removed — shader reads counters[0] from SSBO */
+            glc_Uniform1i(uloc_t2.n_tris,   nt);
+            glc_Uniform1i(uloc_t2.n_groups, n_param_groups);
+            glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         }
-        glc_UseProgram(prog_t2);
-        bind_ssbo(ssbo_hit,        0); bind_ssbo(ssbo_tri_full,  1);
-        bind_ssbo(ssbo_tri_param,  2); bind_ssbo(ssbo_group_kind,3);
-        bind_ssbo(ssbo_group_pay,  4); bind_ssbo(ssbo_counter,   5);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t2,"n_hits"),   n_hits);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t2,"n_tris"),   nt);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t2,"n_groups"),
-                      0);  /* param groups not used; stub zero */
-        glc_DispatchCompute((GLuint)((n_hits + 63) / 64), 1, 1);
-        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        ps.stats[1].record_gpu(n_hits, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now() - t2_start).count(), ps.Q_hit.size());
 
         /* ── T3 dispatch ──────────────────────────────────────────────═ */
-        static constexpr int CHILD_STRIDE = 52;
-        int max_children = n_hits * ps.cfg.max_children + 1;
+        static constexpr int CHILD_STRIDE    = 52;  /* INTENT_STRIDE: 20 + 2*16 */
+        static constexpr int TERMINAL_STRIDE = 58;  /* 26 + 2*16 (MAX_BANDS=16) */
+        /* Size child buffer for worst-case (all n intents hit and spawn children).
+         * Actual n_hits is unknown until after T3; sizing by n is always sufficient
+         * since n_hits <= n. */
+        int max_children = n * ps.cfg.max_children + 1;
         if (max_children > cap_children) {
             cap_children = max_children * 2;
-            ensure_ssbo(ssbo_child_int, (GLsizeiptr)(cap_children * CHILD_STRIDE * sizeof(float)));
-            ensure_ssbo(ssbo_child_cnt, sizeof(uint32_t));
+            GLsizeiptr combined = (GLsizeiptr)((size_t)cap_children
+                                               * (CHILD_STRIDE + TERMINAL_STRIDE)
+                                               * sizeof(float));
+            ensure_ssbo(ssbo_child_int, combined);
         }
-        { uint32_t z = 0;
-          glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_child_cnt);
-          glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(uint32_t), &z);
+        /* Zero only the counter pair in ssbo_t3_meta; eps_flags at [2+] persist */
+        { uint32_t z[2] = {};
+          glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
+          glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 2 * sizeof(uint32_t), z);
           glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0); }
 
+        static uint32_t t3_rng_seed = 0;
         auto t3_start = Clock::now();
         glc_UseProgram(prog_t3);
-        bind_ssbo(ssbo_hit,        0); bind_ssbo(ssbo_mat_band,  1);
-        bind_ssbo(ssbo_tri_full,   2); bind_ssbo(ssbo_scene_band,3);
-        bind_ssbo(ssbo_counter,    4); bind_ssbo(ssbo_child_int, 5);
-        bind_ssbo(ssbo_child_cnt,  6);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t3,"n_hits"),   n_hits);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t3,"n_bands"),  nb);
-        glc_Uniform1i(glc_GetUniformLocation(prog_t3,"n_mats"),   nm);
-        glc_DispatchCompute((GLuint)((n_hits + 63) / 64), 1, 1);
-        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        ps.stats[2].record_gpu(n_hits, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-            Clock::now() - t3_start).count(), ps.Q_refined.size());
+        /* Bindings match ray_material.comp.glsl:
+         * 0=RefinedHitBuf  1=OutBuf(intents+terminals)  2=MetaBuf
+         * 3=TriangleBuf    4=MatBandBuf  5=TriUvBuf  6=TriUvAndMetaBuf
+         * 7=UvAccumBuf     8=CounterBuf (T1 hit count for early-exit guard) */
+        bind_ssbo(ssbo_hit,             0);
+        bind_ssbo(ssbo_child_int,       1);
+        bind_ssbo(ssbo_t3_meta,         2);
+        bind_ssbo(ssbo_tri_full,        3);
+        bind_ssbo(ssbo_mat_band,        4);
+        bind_ssbo(ssbo_tri_uv,          5);
+        bind_ssbo(ssbo_tri_uv_and_meta, 6);
+        bind_ssbo(ssbo_uv_accum,        7);
+        bind_ssbo(ssbo_counter,         8);  /* T1 counters — read by shader for n_hits */
+        const int n_uv_groups  = (int)st.group_uv_res.size();
+        const int uv_meta_base = (int)st.tri_uv_group_of_tri.size();
+        /* n_hits uniform removed — shader reads t1_counters[0] from binding 8 */
+        glc_Uniform1i (uloc_t3.n_bands,              nb);
+        glc_Uniform1i (uloc_t3.n_mats,               nm);
+        glc_Uniform1i (uloc_t3.max_children,         max_children);
+        glc_Uniform1i (uloc_t3.max_children_per_hit, ps.cfg.max_children);
+        glc_Uniform1i (uloc_t3.sensor_res,            0);
+        glc_Uniform1f (uloc_t3.sensor_pr,             ps.sensor_pr);
+        glc_Uniform1f (uloc_t3.sensor_px,             ps.sensor_px);
+        glc_Uniform1i (uloc_t3.n_uv_groups,           n_uv_groups);
+        glc_Uniform1i (uloc_t3.uv_meta_base,          uv_meta_base);
+        glc_Uniform1ui(uloc_t3.rng_seed,              ++t3_rng_seed);
+        glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
 
-        /* Read back child count and re-submit child intents */
-        uint32_t child_count = 0;
-        readback_ssbo(ssbo_child_cnt, &child_count, sizeof(uint32_t));
-        int nc = (int)std::min((uint32_t)cap_children, child_count);
+        /* Single full barrier + readback covers ALL of T1/T2/T3 output in one
+         * GPU→CPU sync.  GL_ALL_BARRIER_BITS ensures CPU-side GetBufferSubData
+         * visibility of the atomic writes from all three stages. */
+        glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
+
+        /* Read counters and meta in one pass — the GPU is done after the barrier. */
+        uint32_t counters[8] = {};
+        readback_ssbo(ssbo_counter, counters, 8 * sizeof(uint32_t));
+        int n_hits = std::min((int)counters[0], cap_hits);
+
+        ps.stats[0].record_gpu(n, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - t1_start).count(), ps.Q_intent.size());
+        ps.stats[1].record_gpu(n_hits, 0, n_hits);
+        ps.stats[2].record_gpu(n_hits, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            Clock::now() - t3_start).count(), n_hits);
+
+        if (n_hits <= 0) return 0;
+
+        /* Merge GPU UV accumulator into the CPU-side uv_accum_cpu and re-zero
+         * the GPU SSBO.  This is intentionally rate-limited: with physical
+         * 512x512 pages and 11+5*bands channels, the flat accumulator can be
+         * >1 GB for the default hot set.  Per-dispatch readback makes GPU mode
+         * PCIe/CPU-bound; the GPU buffer is allowed to keep accumulating until
+         * the next scheduled readback.                                      */
+        const auto uv_now = Clock::now();
+        const bool do_uv_readback = n_uv_groups > 0 && st.uv_accum_total > 0
+            && std::chrono::duration<double>(uv_now - last_uv_readback_t).count() >= uv_readback_interval_s;
+        if (do_uv_readback) {
+            last_uv_readback_t = uv_now;
+            const GLsizeiptr accum_sz = (GLsizeiptr)((size_t)st.uv_accum_total * sizeof(uint32_t));
+            stg_uv_acc.resize(static_cast<size_t>(st.uv_accum_total));
+            auto& gpu_acc = stg_uv_acc;
+            readback_ssbo(ssbo_uv_accum, gpu_acc.data(), accum_sz);
+            ps.gpu_uv_readback_bytes.fetch_add((uint64_t)accum_sz, std::memory_order_relaxed);
+            ps.gpu_uv_readback_count.fetch_add(1, std::memory_order_relaxed);
+            /* Atomic-add GPU counts into CPU accumulator. */
+            for (int i = 0; i < st.uv_accum_total; ++i)
+                uv_accum_add(st.uv_accum_cpu[i], gpu_acc[i]);
+            /* Zero the GPU accumulator for the next dispatch. */
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_uv_accum);
+            std::fill(gpu_acc.begin(), gpu_acc.end(), 0u);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, accum_sz, gpu_acc.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+
+        /* Read back meta[0]=intent_count  meta[1]=terminal_count */
+        uint32_t t3_meta_rb[2] = {};
+        readback_ssbo(ssbo_t3_meta, t3_meta_rb, 2 * sizeof(uint32_t));
+        int nc      = (int)std::min(t3_meta_rb[0], (uint32_t)cap_children);
+        int nt_term = (int)std::min(t3_meta_rb[1], (uint32_t)cap_children);
+        static bool t3_post_diag_once = true;
+        const bool t3_post_diag = t3_post_diag_once;
+        if (t3_post_diag) {
+            t3_post_diag_once = false;
+            fprintf(stderr,
+                "[gpu-T3-post] n_hits=%d child_count=%u capped_child=%d terminal_count=%u capped_terminal=%d do_field=%d\n",
+                n_hits, t3_meta_rb[0], nc, t3_meta_rb[1], nt_term,
+                (int)(ps.cfg.gpu_segment_field_capture && ps.st && ps.st->camera_field_grid));
+            fflush(stderr);
+        }
+
+        /* Re-submit child intents */
         if (nc > 0) {
-            std::vector<float> cbuf((size_t)nc * CHILD_STRIDE);
+            stg_cbuf.resize((size_t)nc * CHILD_STRIDE);
+            auto& cbuf = stg_cbuf;
             readback_ssbo(ssbo_child_int, cbuf.data(), (GLsizeiptr)(nc * CHILD_STRIDE * sizeof(float)));
+            stg_children.clear();
+            stg_children.reserve((size_t)nc);
+            auto& children = stg_children;
+            int amp_pool_idx = 0;
             for (int ci = 0; ci < nc; ++ci) {
                 const float* row = cbuf.data() + ci * CHILD_STRIDE;
                 RayIntent ri{};
+                /* Reuse a pre-allocated Eigen amp from the recycling pool when
+                 * available — avoids a heap alloc per child intent after warmup. */
+                if (amp_pool_idx < (int)stg_amp_recycle.size()) {
+                    ri.amp = std::move(stg_amp_recycle[amp_pool_idx++]);
+                    if ((int)ri.amp.size() != nb) ri.amp.resize(nb);
+                } else {
+                    ri.amp.resize(nb);
+                }
                 ri.pos = V3d(row[0], row[1], row[2]);
                 ri.dir = V3d(row[3], row[4], row[5]);
                 ri.path_len = (double)row[6];
@@ -6020,17 +6831,168 @@ public:
                 ri.min_amplitude = (double)row[12];
                 uint32_t tlo, thi; memcpy(&tlo, row+13, 4); memcpy(&thi, row+14, 4);
                 ri.tag = (uint64_t)tlo | ((uint64_t)thi << 32);
-                memcpy(&ri.color_flag,        row+15, 4);
+                uint32_t cflag = 0u;
+                memcpy(&cflag, row+15, 4);
+                ri.color_flag = (uint8_t)cflag;
                 ri.priority = row[16];
                 ri.sensor_origin_y = row[17]; ri.sensor_origin_z = row[18];
                 const int bands = std::min(nb, 16);
-                for (int b = 0; b < bands; ++b) {
+                for (int b = 0; b < bands; ++b)
                     ri.amp[b] = std::complex<double>(row[20+b], row[36+b]);
+                for (int b = bands; b < nb; ++b)
+                    ri.amp[b] = std::complex<double>(0.0, 0.0);
+                children.push_back(std::move(ri));
+            }
+            ps.in_flight.fetch_add((int)children.size(), std::memory_order_relaxed);
+            ps.Q_intent.push_many(children);
+        }
+        if (t3_post_diag) {
+            fprintf(stderr, "[gpu-T3-post] child requeue done\n");
+            fflush(stderr);
+        }
+
+        /* Accumulate emissive terminal hits onto the CPU sensor image.
+         * Terminal record layout (TERMINAL_STRIDE=58 floats, MAX_BANDS=16):
+         *   [16]=color_flag  [23]=sensor_origin_y  [24]=sensor_origin_z
+         *   [25]=is_emissive_hit  [26..41]=amp_re  [42..57]=amp_im        */
+        if (nt_term > 0 && ps.sensor_res > 0) {
+            /* terminals start at max_children*CHILD_STRIDE floats into the combined buffer */
+            GLintptr term_off = (GLintptr)((size_t)max_children * CHILD_STRIDE * sizeof(float));
+            stg_tbuf.resize((size_t)nt_term * TERMINAL_STRIDE);
+            auto& tbuf = stg_tbuf;
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_child_int);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, term_off,
+                                 (GLsizeiptr)((size_t)nt_term * TERMINAL_STRIDE * sizeof(float)),
+                                 tbuf.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            const int    res       = ps.sensor_res;
+            const float  inv_r     = (float)res / (2.0f * ps.sensor_pr);
+            /* Pre-compute sensor updates outside the lock so get_sensor_image()
+             * is not blocked for the entire terminal scan. */
+            auto& sensor_updates = stg_sensor_updates;
+            sensor_updates.clear();
+            sensor_updates.reserve(static_cast<size_t>(nt_term / 4 + 1));
+            for (int ti = 0; ti < nt_term; ++ti) {
+                const float* rec = tbuf.data() + (size_t)ti * TERMINAL_STRIDE;
+                uint32_t is_emissive; memcpy(&is_emissive, rec + 25, 4);
+                if (!is_emissive) continue;
+                uint32_t cflag; memcpy(&cflag, rec + 16, 4);
+                if (cflag != 1u) continue;
+                const float soy = rec[23], soz = rec[24];
+                const int iy = (int)((soy + ps.sensor_pr) * inv_r);
+                const int iz = (int)((soz + ps.sensor_pr) * inv_r);
+                if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
+                double amp_mag = 0.0;
+                for (int b = 0; b < nb && b < 16; ++b) {
+                    const double re = (double)rec[26 + b], im = (double)rec[42 + b];
+                    amp_mag += std::sqrt(re*re + im*im);
                 }
-                ++ps.in_flight;
-                ps.Q_intent.push(std::move(ri));
+                sensor_updates.push_back({iy, iz, 1.0, amp_mag});
+            }
+            /* Apply all updates under a short-held lock, tracking peaks
+             * incrementally so get_sensor_image() skips the O(res²) scan. */
+            if (!sensor_updates.empty()) {
+                std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                for (const auto& u : sensor_updates) {
+                    const double v1 = (ps.sensor_accum[(size_t)(1*res*res + u.iy*res + u.iz)] += u.ch1);
+                    const double v2 = (ps.sensor_accum[(size_t)(2*res*res + u.iy*res + u.iz)] += u.ch2);
+                    if (v1 > ps.sensor_peak[1]) ps.sensor_peak[1] = v1;
+                    if (v2 > ps.sensor_peak[2]) ps.sensor_peak[2] = v2;
+                }
             }
         }
+        if (t3_post_diag) {
+            fprintf(stderr, "[gpu-T3-post] terminal readback done\n");
+            fflush(stderr);
+        }
+        /* ── Post-T3: STRIKE records → Q_out + field grid (one readback) ──
+         * ssbo_hit still holds T2-refined positions (T3 reads it, never writes).
+         * Combining both purposes into one PCIe transfer halves the readback cost
+         * vs doing them separately. */
+        {
+            const bool do_field = ps.cfg.gpu_segment_field_capture
+                                  && ps.st && ps.st->camera_field_grid;
+            static constexpr int Q_OUT_VIS_CAP = 65536;
+            /* Skip the hit readback entirely when Q_out is already full and field
+             * capture is disabled: the STRIKE records would be discarded anyway,
+             * and this avoids a potentially large (10-15 MB) PCIe transfer.   */
+            const int q_space = Q_OUT_VIS_CAP - (int)ps.Q_out.size();
+            if (q_space > 0 || do_field) {
+                /* Only readback the records we'll actually use.  When field
+                 * capture is disabled, limit to n_vis (the cap we'll push to
+                 * Q_out), saving PCIe bandwidth on excess hits.              */
+                const int n_vis = std::max(0, std::min(n_hits, q_space));
+                const int n_rb  = do_field ? n_hits : n_vis;
+                stg_hbuf.resize((size_t)n_rb * HIT_STRIDE);
+                auto& hbuf = stg_hbuf;
+                readback_ssbo(ssbo_hit, hbuf.data(),
+                              (GLsizeiptr)((size_t)n_rb * HIT_STRIDE * sizeof(float)));
+                ps.gpu_hit_readback_bytes.fetch_add(
+                    (uint64_t)((size_t)n_rb * HIT_STRIDE * sizeof(float)),
+                    std::memory_order_relaxed);
+                ps.gpu_hit_readback_count.fetch_add(1, std::memory_order_relaxed);
+                const int bands = std::min(nb, 16);
+                const bool field_done_bulk = do_field
+                    && accumulate_field_capture_segments_regular_threaded(*ps.st, hbuf.data(), n_rb, HIT_STRIDE, nb);
+                /* amp_tmp only needed for per-segment field capture fallback */
+                VXcd amp_tmp;
+                if (do_field && !field_done_bulk) amp_tmp.resize(nb);
+
+                stg_strike.clear();
+                stg_strike.reserve(static_cast<size_t>(n_vis));
+                auto& strike_batch = stg_strike;
+
+                for (int hi = 0; hi < n_rb; ++hi) {
+                    const float* row = hbuf.data() + (size_t)hi * HIT_STRIDE;
+
+                    if (hi < n_vis) {
+                        /* Build STRIKE record for the visualization drain loop */
+                        RayRecord rec{};
+                        rec.kind = RayRecordKind::STRIKE;
+                        uint32_t tlo, thi;
+                        memcpy(&tlo, row + 21, 4); memcpy(&thi, row + 22, 4);
+                        rec.tag  = (uint64_t)tlo | ((uint64_t)thi << 32);
+                        memcpy(&rec.src_id, row + 20, 4);
+                        memcpy(&rec.bounce, row + 17, 4);
+                        rec.seg_start[0] = row[9];  rec.seg_start[1] = row[10]; rec.seg_start[2] = row[11];
+                        rec.pos[0]    = row[0];  rec.pos[1]    = row[1];  rec.pos[2]    = row[2];
+                        rec.dir[0]    = row[6];  rec.dir[1]    = row[7];  rec.dir[2]    = row[8];
+                        rec.normal[0] = row[3];  rec.normal[1] = row[4];  rec.normal[2] = row[5];
+                        rec.path_len          = row[12];
+                        rec.path_at_seg_start = row[13];
+                        memcpy(&rec.hit_tri, row + 14, 4);
+                        memcpy(&rec.mat_idx, row + 15, 4);
+                        uint32_t cflag; memcpy(&cflag, row + 16, 4);
+                        rec.color_flag = (uint8_t)cflag;
+                        rec.n_bands = bands;
+                        for (int b = 0; b < bands; ++b) {
+                            rec.amp_re[b] = row[26 + b];
+                            rec.amp_im[b] = row[42 + b];
+                        }
+                        strike_batch.push_back(std::move(rec));
+                    }
+
+                    /* Field grid contribution using T2-refined segment endpoints */
+                    if (do_field && !field_done_bulk) {
+                        const V3d seg_s(row[9], row[10], row[11]);
+                        const V3d hit_p(row[0], row[1],  row[2]);
+                        for (int b = 0; b < bands; ++b)
+                            amp_tmp[b] = std::complex<double>(row[26 + b], row[42 + b]);
+                        for (int b = bands; b < nb; ++b)
+                            amp_tmp[b] = cd(0.0, 0.0);
+                        accumulate_field_capture_segment(*ps.st, seg_s, hit_p, amp_tmp);
+                    }
+                }
+
+                if (!strike_batch.empty())
+                    ps.Q_out.push_many(strike_batch);
+            }
+        }
+        if (t3_post_diag) {
+            fprintf(stderr, "[gpu-T3-post] qout/field readback done\n");
+            fflush(stderr);
+        }
+
         return n_hits;
     }
 
@@ -6063,17 +7025,17 @@ public:
         auto t4_start = Clock::now();
         glc_UseProgram(prog_t4);
         auto set_bpm_uniforms = [&](int mode) {
-            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"mode"),    mode);
-            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"nx"),      nx);
-            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"ny"),      ny);
-            glc_Uniform1i(glc_GetUniformLocation(prog_t4,"n_bands"), nb);
-            glc_Uniform1f(glc_GetUniformLocation(prog_t4,"dx"),      (float)arena.dx);
-            glc_Uniform1f(glc_GetUniformLocation(prog_t4,"dz"),      (float)arena.dz);
+            glc_Uniform1i(uloc_t4.mode,    mode);
+            glc_Uniform1i(uloc_t4.nx,      nx);
+            glc_Uniform1i(uloc_t4.ny,      ny);
+            glc_Uniform1i(uloc_t4.n_bands, nb);
+            glc_Uniform1f(uloc_t4.dx,      (float)arena.dx);
+            glc_Uniform1f(uloc_t4.dz,      (float)arena.dz);
             /* Upload wavelengths array */
             float wl[16] = {};
             for (int b = 0; b < std::min(nb,16); ++b)
                 wl[b] = (float)arena.wavelengths_m[b];
-            glc_Uniform1fv(glc_GetUniformLocation(prog_t4,"wavelengths"), 16, wl);
+            glc_Uniform1fv(uloc_t4.wavelengths, 16, wl);
         };
 
         bind_ssbo(ssbo_wave_re, 0); bind_ssbo(ssbo_wave_im, 1);
@@ -6144,6 +7106,17 @@ public:
             /* T1→T2→T3 batch */
             {
                 int n_hits = dispatch_t1_t2_t3(ps, batch);
+                /* Harvest Eigen amp allocations from the just-processed batch into
+                 * the recycling pool.  dispatch_t1_t2_t3 has already read all amp
+                 * data into the flat ibuf; the VXcd heap blocks are now idle until
+                 * batch.clear() would free them.  Moving them into the pool lets
+                 * the next child-intent build reuse them without new malloc calls. */
+                {
+                    const int bsz = (int)batch.size();
+                    if ((int)stg_amp_recycle.size() < bsz) stg_amp_recycle.resize(bsz);
+                    for (int i = 0; i < bsz; ++i)
+                        stg_amp_recycle[i] = std::move(batch[i].amp);
+                }
                 for (int i = 0; i < n; ++i)
                     ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
                 (void)n_hits;
@@ -6504,8 +7477,12 @@ static void pipeline_intersector(RayPipelineState& ps)
 
             /* ── Sensor image accumulator (T1) ───────────────────────────
              * Forward ray (color_flag==0) hitting near the sensor plate →
-             * ch0.  Backward ray (bounce==0) hitting near the plate → ch1. */
-            if (ps.sensor_res > 0) {
+             * ch0 (irradiance view).  Backward/sensor rays are NOT accumulated
+             * here — their correct contribution arrives only when they terminate
+             * on an emissive surface (T3 path).  Counting backward hits at the
+             * plate from reflections would produce spurious sensor image
+             * saturation before any emitter is found. */
+            if (ps.sensor_res > 0 && intent.color_flag == 0) {
                 const float hx = static_cast<float>(hit_pos.x());
                 const float hy = static_cast<float>(hit_pos.y());
                 const float hz = static_cast<float>(hit_pos.z());
@@ -6520,10 +7497,10 @@ static void pipeline_intersector(RayPipelineState& ps)
                             const double re = amp_prop[b].real(), im = amp_prop[b].imag();
                             amp_mag += std::sqrt(re*re + im*im);
                         }
-                        const int ch  = (intent.color_flag == 0) ? 0 : 1;
-                        const int idx = ch * res * res + iy * res + iz;
+                        const int idx = 0 * res * res + iy * res + iz;  /* ch0 only */
                         std::lock_guard<std::mutex> lk(ps.sensor_mu);
-                        ps.sensor_accum[static_cast<size_t>(idx)] += amp_mag;
+                        const double nv = (ps.sensor_accum[static_cast<size_t>(idx)] += amp_mag);
+                        if (nv > ps.sensor_peak[0]) ps.sensor_peak[0] = nv;
                     }
                 }
             }
@@ -6563,6 +7540,8 @@ static void pipeline_refiner(RayPipelineState& ps)
         if (n == 0) break;
         auto t0 = Clock::now();
 
+        std::vector<RefinedHit> refined_batch;
+        refined_batch.reserve(static_cast<size_t>(n));
         for (auto& hr : batch) {
             RefinedHit rh;
             rh.base        = hr;
@@ -6572,8 +7551,9 @@ static void pipeline_refiner(RayPipelineState& ps)
                 st, hr.hit_tri, hr.hit_pos, rh.refined_pos, rh.refined_n);
             if (hr.incoming_dir.dot(rh.refined_n) > 0.0)
                 rh.refined_n = -rh.refined_n;
-            ps.Q_refined.push(std::move(rh));
+            refined_batch.push_back(std::move(rh));
         }
+        ps.Q_refined.push_many(refined_batch);
 
         auto t1 = Clock::now();
         ps.stats[1].record(n,
@@ -6642,6 +7622,74 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         const V3d&       in_dir = hr.incoming_dir;
         VXcd             amp    = hr.amp_propagated;
 
+        /* ── UV integrator image splat (CPU T3 parity with ray_material.comp) ── */
+        if (!st.tri_uv_group_of_tri.empty()
+                && hr.hit_tri >= 0
+                && hr.hit_tri < (int)st.tri_uv_group_of_tri.size()) {
+            const int uv_gid = st.tri_uv_group_of_tri[(size_t)hr.hit_tri];
+            if (uv_gid >= 0 && uv_gid < (int)st.group_uv_res.size()) {
+                const int res    = st.group_uv_res[(size_t)uv_gid];
+                const int offset = st.group_uv_accum_offset[(size_t)uv_gid];
+                const int n2     = res * res;
+                const int n_slot = (UV_N_HDR_CHANNELS + 5 * st.n_bands) * n2;
+                if (res > 0 && offset >= 0
+                    && offset + n_slot <= (int)st.uv_accum_cpu.size()) {
+                    const V3d dp = rh.refined_pos - tri.v0;
+                    const double e1e1 = tri.edge1.dot(tri.edge1);
+                    const double e1e2 = tri.edge1.dot(tri.edge2);
+                    const double e2e2 = tri.edge2.dot(tri.edge2);
+                    const double de1  = dp.dot(tri.edge1);
+                    const double de2  = dp.dot(tri.edge2);
+                    const double det  = e1e1 * e2e2 - e1e2 * e1e2;
+                    double bu = 0.0, bv = 0.0;
+                    if (det > 1.0e-20) {
+                        bu = (e2e2 * de1 - e1e2 * de2) / det;
+                        bv = (e1e1 * de2 - e1e2 * de1) / det;
+                    }
+                    bu = std::max(0.0, std::min(1.0, bu));
+                    bv = std::max(0.0, std::min(1.0 - bu, bv));
+                    const float* uvd = st.tri_uv_data.data() + (size_t)hr.hit_tri * 6;
+                    const double u = uvd[0] + bu * (uvd[2] - uvd[0]) + bv * (uvd[4] - uvd[0]);
+                    const double v = uvd[1] + bu * (uvd[3] - uvd[1]) + bv * (uvd[5] - uvd[1]);
+                    const int ix = std::max(0, std::min(res - 1, (int)(u * res)));
+                    const int iy = std::max(0, std::min(res - 1, (int)(v * res)));
+                    const int texel = iy * res + ix;
+                    auto& ac = st.uv_accum_cpu;
+                    uv_accum_add(ac[(size_t)(offset + UV_CH_HIT_COUNT * n2 + texel)], 1u);
+                    reinterpret_cast<std::atomic<uint32_t>&>(
+                        ac[(size_t)(offset + UV_CH_SRC_FLAGS * n2 + texel)])
+                        .fetch_or(1u << std::min((int)hr.ray.src_id, 31), std::memory_order_relaxed);
+                    uv_accum_add(ac[(size_t)(offset + (UV_CH_BOUNCE_0 + std::min((int)hr.ray.bounce, 3)) * n2 + texel)], 1u);
+                    const uint32_t tag_lo = (uint32_t)(hr.ray.tag & 0xFFFFFFFFull);
+                    const uint32_t tag_hi = (uint32_t)((hr.ray.tag >> 32) & 0xFFFFFFFFull);
+                    reinterpret_cast<std::atomic<uint32_t>&>(ac[(size_t)(offset + UV_CH_TAG_LO * n2 + texel)])
+                        .fetch_or(tag_lo, std::memory_order_relaxed);
+                    reinterpret_cast<std::atomic<uint32_t>&>(ac[(size_t)(offset + UV_CH_TAG_HI * n2 + texel)])
+                        .fetch_or(tag_hi, std::memory_order_relaxed);
+                    auto add_signed = [&](int ch, double val) {
+                        const int32_t fp = (int32_t)std::max(-1073741824.0,
+                            std::min(1073741824.0, val * 32768.0));
+                        uv_accum_add(ac[(size_t)(offset + ch * n2 + texel)], (uint32_t)fp);
+                    };
+                    add_signed(UV_CH_NORMAL_X, hit_n.x());
+                    add_signed(UV_CH_NORMAL_Y, hit_n.y());
+                    add_signed(UV_CH_NORMAL_Z, hit_n.z());
+                    const int split_base = UV_N_HDR_CHANNELS
+                        + ((hr.ray.color_flag == 1) ? 4 : 3) * st.n_bands;
+                    for (int b = 0; b < nb; ++b) {
+                        const std::complex<double> a = amp[b];
+                        const double mag = std::abs(a);
+                        const uint32_t fp_mag = (uint32_t)std::min(
+                            mag * 65536.0, (double)0xFFFFFFFFu);
+                        uv_accum_add(ac[(size_t)(offset + (UV_N_HDR_CHANNELS + b) * n2 + texel)], fp_mag);
+                        add_signed(UV_N_HDR_CHANNELS + st.n_bands + b,     a.real());
+                        add_signed(UV_N_HDR_CHANNELS + 2 * st.n_bands + b, a.imag());
+                        uv_accum_add(ac[(size_t)(offset + (split_base + b) * n2 + texel)], fp_mag);
+                    }
+                }
+            }
+        }
+
         /* ── Terminal: aperture stop ── */
         if (tri.flags & MAT_FLAG_APERTURE_STOP) {
             push_terminal(hr);
@@ -6672,31 +7720,17 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                         const double re = amp[b].real(), im = amp[b].imag();
                         amp_mag += std::sqrt(re*re + im*im);
                     }
-                    /* Backward rays start with unit amplitude (setOnes) across
-                     * nb bands, so the initial magnitude is nb.
-                     * transmission = amp_mag / nb  ∈ (0, 1].
+                    /* ch1 = photon-count: each successful sensor→emissive connection
+                     * contributes exactly 1.0 regardless of optical attenuation.
+                     * This is the single-photon-detector model: every photon that
+                     * arrives at an emissive surface is counted once.  Amplitude
+                     * variations from Fresnel/Beer are recorded separately in ch2.
                      *
-                     * ch1 = exposure-compensated contribution:
-                     *   weight = 1 / transmission = nb / amp_mag
-                     * This treats each path as representing (1/transmission)
-                     * equivalent physical rays — exactly the "infinite exposure
-                     * time" scaling the user requested.  Paths that are dimmed
-                     * by the lens (Fresnel, Beer, etc.) are up-weighted so the
-                     * sensor image integrates correctly over time regardless of
-                     * optical attenuation.
-                     *
-                     * ch2 = physically weighted (amp_mag) for the raw-physics view. */
-                    const double n_bands_d = static_cast<double>(nb > 0 ? nb : 1);
-                    const double transmission = amp_mag / n_bands_d;
-                    /* Guard against degenerate zero-amplitude rays (should not
-                     * happen after the spread fix, but be safe). */
-                    const double weight = (transmission > 1e-12)
-                        ? (1.0 / transmission)
-                        : n_bands_d;   /* fallback: treat as unit transmission */
+                     * ch2 = physically weighted (amp_mag) for the radiance view. */
                     const int idx1 = 1 * res * res + iy * res + iz;
                     const int idx2 = 2 * res * res + iy * res + iz;
                     std::lock_guard<std::mutex> lk(ps.sensor_mu);
-                    ps.sensor_accum[static_cast<size_t>(idx1)] += weight;
+                    ps.sensor_accum[static_cast<size_t>(idx1)] += 1.0;
                     ps.sensor_accum[static_cast<size_t>(idx2)] += amp_mag;
                 }
             }
@@ -6712,8 +7746,9 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         /* Helper: build a child RayIntent from the current hit. */
         auto make_child = [&](const V3d& new_dir, const VXcd& new_amp,
                               int new_medium = -2) -> RayIntent {
+            static constexpr double RAY_ORIGIN_EPS = 2.0e-4;
             RayIntent ri      = hr.ray;
-            ri.pos            = rh.refined_pos;
+            ri.pos            = rh.refined_pos + RAY_ORIGIN_EPS * new_dir.normalized();
             ri.dir            = new_dir;
             ri.amp            = new_amp;
             ri.path_len       = hr.ray.path_len;
@@ -6948,8 +7983,9 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                         }
                     }
                     if (nearmi_w > 0.0) {
-                        ps.sensor_accum[static_cast<size_t>(3 * res * res + iy * res + iz)]
-                            += nearmi_w * rv.amp;
+                        const double nv3 = (ps.sensor_accum[static_cast<size_t>(3 * res * res + iy * res + iz)]
+                            += nearmi_w * rv.amp);
+                        if (nv3 > ps.sensor_peak[3]) ps.sensor_peak[3] = nv3;
                         ps.bdpt_near_miss_count.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -7088,23 +8124,38 @@ RayPipelineState* ray_pipeline_create(
     const int      n_hw  = std::max(1, (int)std::thread::hardware_concurrency());
     const int      n_t3  = std::max(1, n_hw / 2);
 
-    ps->workers.emplace_back([ps](){ pipeline_intersector(*ps); });
-    ps->workers.emplace_back([ps](){ pipeline_refiner(*ps); });
-    for (int i = 0; i < n_t3; ++i) {
-        uint64_t seed_i = base ^ (static_cast<uint64_t>(0xDEADBEEFULL) * static_cast<uint64_t>(i + 1));
-        ps->workers.emplace_back([ps, seed_i](){ pipeline_material(*ps, seed_i); });
-    }
+    /* Pre-compute epsilon material flags before any CPU/GPU worker can consume
+     * scene data.  GPU scene upload copies these flags once into ssbo_t3_meta. */
+    pipeline_precompute_epsilon_flags(*ps);
+
+    /* When gpu_all_stages is requested we defer CPU T1/T2/T3 workers so the GPU
+     * can take all work without competing.  They are added as a fallback below if
+     * GPU init fails. */
+    const bool defer_cpu = ps->cfg.use_gpu_compute && ps->cfg.gpu_all_stages;
+
+    auto spawn_cpu_stages = [&]() {
+        ps->workers.emplace_back([ps](){ pipeline_intersector(*ps); });
+        ps->workers.emplace_back([ps](){ pipeline_refiner(*ps); });
+        for (int i = 0; i < n_t3; ++i) {
+            uint64_t seed_i = base ^ (static_cast<uint64_t>(0xDEADBEEFULL) * static_cast<uint64_t>(i + 1));
+            ps->workers.emplace_back([ps, seed_i](){ pipeline_material(*ps, seed_i); });
+        }
+    };
+
+    if (!defer_cpu) spawn_cpu_stages();
+
     if (!ps->arenas.empty() && !ps->cfg.use_gpu_compute)
         ps->workers.emplace_back([ps](){ pipeline_wave_solver(*ps); });
 
-    /* GPU dispatch: spawned in addition to CPU workers when use_gpu_compute.
-     * Both compete on the shared queues; adaptive batch sizing lets each
-     * operator absorb the share it can process fastest. */
+    /* GPU dispatch: when gpu_all_stages=false both CPU and GPU workers compete
+     * on shared queues; when gpu_all_stages=true only the GPU worker runs T1-T3. */
     if (ps->cfg.use_gpu_compute) {
         ps->gpu_dispatch = new RayPipelineState::GlPipelineDispatch();
         if (ps->gpu_dispatch->init(*ps, ps->cfg.shader_dir)) {
-            fprintf(stderr, "[gpu-dispatch] GL 4.3 compute context ready — GPU thread starting\n");
+            fprintf(stderr, "[gpu-dispatch] GL 4.3 compute context ready — GPU thread starting%s\n",
+                    defer_cpu ? " (exclusive: CPU T1/T2/T3 not spawned)" : "");
             fflush(stderr);
+            gl_compute_release_current();   /* transfer ownership to the GPU worker thread */
             ps->workers.emplace_back([ps]() {
                 ps->gpu_dispatch->thread_main(*ps);
             });
@@ -7114,15 +8165,13 @@ RayPipelineState* ray_pipeline_create(
             fflush(stderr);
             delete ps->gpu_dispatch;
             ps->gpu_dispatch = nullptr;
-            /* Restore T4 CPU wave thread that was skipped above */
+            /* GPU failed — if we deferred CPU workers above, add them now */
+            if (defer_cpu) spawn_cpu_stages();
+            /* Restore T4 CPU wave thread */
             if (!ps->arenas.empty())
                 ps->workers.emplace_back([ps](){ pipeline_wave_solver(*ps); });
         }
     }
-
-    /* Pre-compute epsilon material flags so T3 can fast-path highly absorptive
-     * surfaces without recomputing reflectance on every hit. */
-    pipeline_precompute_epsilon_flags(*ps);
 
     return ps;
 }
@@ -7152,24 +8201,10 @@ void ray_pipeline_submit(
     ps->in_flight.fetch_add(n_intents, std::memory_order_relaxed);
     const int    max_q   = ps->cfg.max_intent_queue;
     const double min_amp = ps->cfg.min_amplitude;
-    /* Snapshot map state once outside the per-ray loop. */
-    const bool   has_map  = (ps->sensor_res > 0 && !ps->priority_map.empty());
-    const int    map_res  = ps->sensor_res;
-    const float  map_inv  = has_map ? static_cast<float>(map_res) / (2.0f * ps->sensor_pr) : 0.0f;
     for (int i = 0; i < n_intents; ++i) {
         RayIntent ri = intents[i];
         /* Raise per-ray floor to the pipeline minimum (never lower it). */
         if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
-        /* Assign priority from the sugar-auxin map for backward-origin (sensor)
-         * rays so productive sensor pixels are explored more intensively. */
-        if (has_map && ri.color_flag == 1 && ri.bounce == 0) {
-            const int iy = static_cast<int>((static_cast<float>(ri.pos.y()) + ps->sensor_pr) * map_inv);
-            const int iz = static_cast<int>((static_cast<float>(ri.pos.z()) + ps->sensor_pr) * map_inv);
-            if (iy >= 0 && iy < map_res && iz >= 0 && iz < map_res) {
-                std::lock_guard<std::mutex> lk(ps->sensor_mu);
-                ri.priority = std::max(1.0f, ps->priority_map[static_cast<size_t>(iy * map_res + iz)]);
-            }
-        }
         if (max_q > 0)
             ps->Q_intent.push_bounded(std::move(ri), max_q);
         else
@@ -7195,6 +8230,8 @@ void ray_pipeline_get_stats(const RayPipelineState* ps, RayPipelineStats* out)
 {
     if (!ps || !out) return;
     auto snap = [](const StageStats& s, RayPipelineStats::Stage& d) {
+        const uint64_t cpu_ns = s.ns_active.load(std::memory_order_relaxed);
+        const uint64_t gpu_ns = s.ns_gpu.load(std::memory_order_relaxed);
         d.throughput      = s.items_per_sec();
         d.processed       = s.n_processed.load(std::memory_order_relaxed);
         d.batch_size      = s.batch_sz.load(std::memory_order_relaxed);
@@ -7203,6 +8240,8 @@ void ray_pipeline_get_stats(const RayPipelineState* ps, RayPipelineStats* out)
         d.gpu_processed   = s.n_gpu.load(std::memory_order_relaxed);
         d.gpu_batch_size  = s.batch_sz_gpu.load(std::memory_order_relaxed);
         d.gpu_fraction    = s.gpu_fraction();
+        d.cpu_active_ms   = (double)cpu_ns / 1.0e6;
+        d.gpu_active_ms   = (double)gpu_ns / 1.0e6;
     };
     snap(ps->stats[0], out->t1);
     snap(ps->stats[1], out->t2);
@@ -7210,6 +8249,10 @@ void ray_pipeline_get_stats(const RayPipelineState* ps, RayPipelineStats* out)
     snap(ps->stats[3], out->t4);
     out->output_queue_depth = ps->Q_out.size();
     out->in_flight          = ps->in_flight.load(std::memory_order_relaxed);
+    out->gpu_uv_readback_bytes = ps->gpu_uv_readback_bytes.load(std::memory_order_relaxed);
+    out->gpu_uv_readback_count = ps->gpu_uv_readback_count.load(std::memory_order_relaxed);
+    out->gpu_hit_readback_bytes = ps->gpu_hit_readback_bytes.load(std::memory_order_relaxed);
+    out->gpu_hit_readback_count = ps->gpu_hit_readback_count.load(std::memory_order_relaxed);
 }
 
 void ray_pipeline_set_min_amplitude(RayPipelineState* ps, double eps)
@@ -7283,32 +8326,32 @@ void ray_pipeline_get_sensor_image(
     if (out_res) *out_res = res;
     if (!buf) return;
     const size_t pix = static_cast<size_t>(res) * res;
-    /* Update the running per-channel peaks — they only ever grow so that
-     * accumulated data never dims as new brighter pixels are added. */
-    for (int c = 0; c < 4; ++c)
-        for (size_t i = 0; i < pix; ++i)
-            ps->sensor_peak[c] = std::max(ps->sensor_peak[c], ps->sensor_accum[c * pix + i]);
+    /* Peaks are now tracked incrementally at each write to sensor_accum,
+     * so no O(res²) scan is needed here. */
     const double* peak = ps->sensor_peak;
     const double inv_log10 = 1.0 / std::log(10.0);
     auto tone = [&](double v, double pk) -> float {
         double n = v / pk;
         return static_cast<float>(std::log1p(n * 9.0) * inv_log10);
     };
-    /* Output layout: (res, res, 3) RGB.
-     *   R = ch0  (forward plate hits)
-     *   G = ch1 + ch3  (backward emissive + provisional near-miss),
-     *         with ch3 attenuated where ch2 (exact) is strong
-     *   B = ch2 (exact BDPT snap) */
+    /* Output layout: (res, res, 3) RGB, rows written bottom-first (y-flipped)
+     * so the returned NumPy array is already in OpenGL texture order.
+     *   R = ch0  (forward plate hits, irradiance)
+     *   G = ch1 + ch3  (sensor photon count: each emissive connection counts 1,
+     *         plus provisional near-miss ch3 attenuated where ch2 is strong)
+     *   B = ch2 (amplitude-weighted BDPT radiance) */
     for (int y = 0; y < res; ++y) {
+        const int out_y = res - 1 - y;  /* flip for OpenGL bottom-to-top convention */
         for (int z = 0; z < res; ++z) {
-            const size_t px = static_cast<size_t>(y * res + z);
-            const float ch2_n = tone(ps->sensor_accum[2 * pix + px], peak[2]);
+            const size_t src_px = static_cast<size_t>(y * res + z);
+            const size_t dst_px = static_cast<size_t>(out_y * res + z);
+            const float ch2_n = tone(ps->sensor_accum[2 * pix + src_px], peak[2]);
             const float attn  = 1.0f - std::min(1.0f, ch2_n);  /* provisional fades as exact grows */
-            buf[px * 3 + 0] = tone(ps->sensor_accum[0 * pix + px], peak[0]);  /* R */
-            buf[px * 3 + 1] = std::min(1.0f,
-                tone(ps->sensor_accum[1 * pix + px], peak[1]) +
-                attn * tone(ps->sensor_accum[3 * pix + px], peak[3]));         /* G */
-            buf[px * 3 + 2] = ch2_n;                                           /* B */
+            buf[dst_px * 3 + 0] = tone(ps->sensor_accum[0 * pix + src_px], peak[0]);  /* R */
+            buf[dst_px * 3 + 1] = std::min(1.0f,
+                tone(ps->sensor_accum[1 * pix + src_px], peak[1]) +
+                attn * tone(ps->sensor_accum[3 * pix + src_px], peak[3]));             /* G */
+            buf[dst_px * 3 + 2] = ch2_n;                                               /* B */
         }
     }
 }

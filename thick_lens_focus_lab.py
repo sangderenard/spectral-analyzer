@@ -2816,6 +2816,7 @@ class ForwardCppLensBench:
         self._plate_sensor_photons_accum: Optional[np.ndarray] = None
         self._plate_sensor_electrons_accum: Optional[np.ndarray] = None
         self._last_bdpt_records: Optional[np.ndarray] = None
+        self._last_bdpt_plate_rgb: Optional[np.ndarray] = None
         # GPU/CPU compute mode: 'gpu', 'cpu', or 'mixed'.
         # Controls use_gpu_compute and gpu_all_stages in submit_rays.
         self.compute_mode: str = "gpu"
@@ -4331,7 +4332,9 @@ class ForwardCppLensBench:
                 f"sensor_power={self.bdpt_last_sensor_power:.3e}",
                 flush=True,
             )
-            return np.clip(rgb_tm_arr, 0.0, 1.0).astype(np.float32, copy=False)
+            out = np.clip(rgb_tm_arr, 0.0, 1.0).astype(np.float32, copy=False)
+            self._last_bdpt_plate_rgb = out
+            return out
 
     def export_bdpt_ray_visualization(self, output_file: str = "bdpt_rays.txt") -> Dict[str, any]:
         """Export BDPT ray paths to a text file for detailed visualization.
@@ -5841,6 +5844,15 @@ def run(
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, _pip_res, _pip_res, 0,
                  GL_RGB, GL_FLOAT, _pip_blank)
 
+    tex_bdpt_pip = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, _pip_res, _pip_res, 0,
+                 GL_RGB, GL_FLOAT, _pip_blank)
+
     # ── Per-physical-group analytical UV page array ─────────────────────────
     tex_uv_pages = glGenTextures(1)
     _uv_layers = max(1, len(bench.uv_page_bank.groups) if bench.uv_page_bank is not None else 1)
@@ -5961,11 +5973,13 @@ def run(
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, _hud_blank)
 
-    # PIP viewports: reverse sensor feed + forward strike image, near top of window.
+    # PIP viewports: bdpt image + reverse sensor feed + forward strike image.
+    # Three pips left-to-right: [bdpt | backward | forward]
     _pip_dim = int(min(W * 0.22, H * 0.22))
     _pip_gap = 10
-    _pip_vx  = (W - (2 * _pip_dim + _pip_gap)) // 2
-    _uv_pip_vx = _pip_vx + _pip_dim + _pip_gap
+    _bdpt_pip_vx = (W - (3 * _pip_dim + 2 * _pip_gap)) // 2
+    _pip_vx      = _bdpt_pip_vx + _pip_dim + _pip_gap
+    _uv_pip_vx   = _pip_vx      + _pip_dim + _pip_gap
     _pip_vy  = 6
 
     # Lazy font for PIP stats overlay – created on first draw to avoid init cost.
@@ -5994,6 +6008,19 @@ def run(
         glUseProgram(0)
 
     def draw_pip() -> None:
+        # ── BDPT pip (leftmost — violet border) ─────────────────────────────
+        bdpt_plate = bench._last_bdpt_plate_rgb
+        if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
+            glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                            bdpt_plate.shape[1], bdpt_plate.shape[0],
+                            GL_RGB, GL_FLOAT, bdpt_plate)
+        _draw_quad_with_pip_prog(
+            tex_bdpt_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
+            border_col=(0.65, 0.25, 1.0),
+        )
+
+        # ── Backward accumulation pip (centre — cyan border) ────────────────
         img = bench.get_reverse_strike_image()
         cpp_img = bench.tracer.get_sensor_image()   # resolved reverse/BDPT sensor image
         if cpp_img.shape[0] > 0 and float(np.max(cpp_img)) > 0.0:

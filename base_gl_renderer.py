@@ -275,6 +275,10 @@ class BaseGLRenderer:
         glBindTexture(GL_TEXTURE_2D_ARRAY, 0)
         self._tex_remit_uv = int(tex)
 
+    def set_emit_uv_texture_id(self, tex_id: int) -> None:
+        """Point uEmitUv at an externally-managed GL texture (no upload)."""
+        self._tex_emit_uv = int(tex_id)
+
     def set_emit_uv_texture_array(self, rgba_layers: "np.ndarray") -> None:
         """Upload an RGBA8 emission texture array as (layers, height, width, 4)."""
         arr = np.ascontiguousarray(rgba_layers, dtype=np.uint8)

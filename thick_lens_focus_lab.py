@@ -13,6 +13,7 @@ import os
 import queue
 import sys
 import threading
+import ctypes
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -28,9 +29,10 @@ except Exception as exc:
     raise RuntimeError("pygame is required. Install with: pip install pygame") from exc
 
 import _spectral_kernels as _sk
+from base_gl_renderer import BaseGLRenderer
 from material_db import MAX_SPECTRAL_BANDS, MaterialDatabase
 from sensor_film_db import MAX_SENSOR_FILM_SLOTS, SensorFilmDatabase
-from spectral_material import Material, SpectralBand
+from spectral_material import Material, RadianceProfile, SpectralBand
 
 try:
     import torch
@@ -295,6 +297,33 @@ def _make_sidecar_spectral_bands(
                 ior_imag=float(ior_imag),
             )
         )
+    return bands
+
+
+def _make_red_only_spectral_bands(
+    sidecar: FreeFrequencySidecar,
+    *,
+    emission_scale: float = 1.0,
+    red_cutoff_nm: float = 600.0,
+) -> List[SpectralBand]:
+    """Spectral bands that emit only at wavelengths longer than red_cutoff_nm."""
+    freq_hz = sidecar.freq_hz
+    bw_hz   = _sidecar_bandwidths(freq_hz)
+    bands: List[SpectralBand] = []
+    for freq, bw in zip(freq_hz, bw_hz):
+        wl_nm = (C_LIGHT / max(freq, EPS)) * 1.0e9
+        em = float(emission_scale) if wl_nm >= red_cutoff_nm else 0.0
+        bands.append(SpectralBand(
+            center_hz=float(freq),
+            bandwidth_hz=float(bw),
+            reflectance=0.0,
+            transmittance=0.0,
+            diffuse_frac=0.0,
+            emission=em,
+            reemission=0.0,
+            ior_real=1.0,
+            ior_imag=0.0,
+        ))
     return bands
 
 
@@ -958,7 +987,7 @@ class SceneConfig:
     side_room_source_z: float = 0.00
     # Large emissive probe object placed in the stage volume to verify that the
     # lens train is doing anything intelligible independent of the side tube.
-    stage_probe_emitter_enabled: bool = True
+    stage_probe_emitter_enabled: bool = False
     stage_probe_x: float = 0.62
     stage_probe_y: float = 0.00
     stage_probe_z: float = 0.00
@@ -1955,7 +1984,7 @@ def _build_lens_mesh(
 def _build_scene_mesh(
     scene: SceneConfig,
     sidecar: FreeFrequencySidecar,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MaterialDatabase, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[np.ndarray, np.ndarray, float, float]], np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, MaterialDatabase, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[Tuple[np.ndarray, np.ndarray, float, float]], np.ndarray, np.ndarray, np.ndarray]:
     db = MaterialDatabase()
 
     idx_black = db.register(
@@ -2032,6 +2061,13 @@ def _build_scene_mesh(
             emission_rgb=[1.0, 1.0, 1.0],
             ior=1.0,
             transmission=0.0,
+            radiance=RadianceProfile(
+                luminance=5000.0,
+                cct_k=5500.0,
+                cri=95.0,
+                solid_angle_sr=math.pi * 2.0,
+                distribution="lambertian",
+            ),
             spectral_bands=_make_sidecar_spectral_bands(
                 sidecar,
                 reflectance=0.0,
@@ -2447,31 +2483,38 @@ def _build_scene_mesh(
     _x_sensor  = float(scene.image_plate.x)
     _tube_r    = float(scene.tube_radius)
 
-    # 1. Outer barrel
+    # 1. Outer barrel — tracked separately so it can have its own UV page
+    camera_barrel_tri_ids: list = []
     _build_cylinder_walls(
         _x_ap, _x_sensor, _barrel_r, 96,
         tris, mats, idx_aperture_black,
-        tri_ids=camera_body_tri_ids,
+        tri_ids=camera_barrel_tri_ids,
     )
+    camera_body_tri_ids.extend(camera_barrel_tri_ids)
     # 2. Rear cap: ring from tube wall to barrel (inward-facing, closes the back)
+    camera_rear_cap_tri_ids: list = []
     _build_baffle_annulus(
         _x_ap, _tube_r, _barrel_r, 96,
         tris, mats, idx_aperture_black,
-        tri_ids=camera_body_tri_ids,
+        tri_ids=camera_rear_cap_tri_ids,
         thickness=0.0,
     )
+    camera_body_tri_ids.extend(camera_rear_cap_tri_ids)
     # 3. Front cap: ring from inscribed sensor circle to barrel (closes corner arcs)
+    camera_front_cap_tri_ids: list = []
     _build_baffle_annulus(
         _x_sensor, _sensor_r, _barrel_r, 96,
         tris, mats, idx_aperture_black,
-        tri_ids=camera_body_tri_ids,
+        tri_ids=camera_front_cap_tri_ids,
         thickness=0.0,
     )
+    camera_body_tri_ids.extend(camera_front_cap_tri_ids)
 
     # Sensor-to-aperture frustum: inner cone wall connecting exit-pupil
     # aperture hole to the sensor diagonal so all corner pixels are bounded.
     # r_sensor is the full diagonal (= barrel_r) so no corner pixel starts
     # outside the cone.
+    camera_frustum_tri_ids: list = []
     _build_sensor_aperture_frustum(
         x_aperture=_x_ap,
         r_aperture=float(scene.exit_pupil_radius),
@@ -2481,8 +2524,9 @@ def _build_scene_mesh(
         tri_list=tris,
         mat_ids=mats,
         mat_idx=idx_aperture_black,
-        tri_ids=camera_body_tri_ids,
+        tri_ids=camera_frustum_tri_ids,
     )
+    camera_body_tri_ids.extend(camera_frustum_tri_ids)
     print(
         "[sensor-enclosure]",
         f"x_ap={_x_ap:.4f}",
@@ -2503,6 +2547,54 @@ def _build_scene_mesh(
 
         _append_tri(tris, mats, p00, p10, p11, idx_black)
         _append_tri(tris, mats, p00, p11, p01, idx_black)
+
+    # ── Red leak-probe sphere: outside the camera barrel, red-only emitter ──
+    # Placed just past the camera's rear edge (x > image_plate_x) and outside
+    # the barrel radius, so it only illuminates the sensor if there is a gap
+    # in the sealed enclosure.  Any red energy on the sensor = confirmed leak.
+    idx_red_probe = db.register(
+        "red_leak_probe",
+        Material(
+            name="red_leak_probe",
+            domain="em_optical",
+            albedo=[1.0, 0.0, 0.0],
+            roughness=0.0,
+            metallic=0.0,
+            emission_rgb=[1.0, 0.0, 0.0],
+            ior=1.0,
+            transmission=0.0,
+            radiance=RadianceProfile(
+                luminance=3000.0,
+                cct_k=1800.0,
+                cri=20.0,
+                solid_angle_sr=math.pi * 2.0,
+                distribution="lambertian",
+            ),
+            spectral_bands=_make_red_only_spectral_bands(
+                sidecar,
+                emission_scale=float(scene.side_room_source_emission),
+            ),
+        ),
+    )
+    _probe_r  = 0.018   # 18 mm radius sphere
+    _probe_x  = float(scene.screen_x) + _probe_r + 0.002   # just behind the sensor plate
+    _probe_y  = float(scene.view_radius) * 0.85             # outside the barrel, inside view
+    red_probe_tri_ids: list = []
+    _build_emissive_sphere(
+        center=np.array([_probe_x, _probe_y, 0.0], dtype=np.float64),
+        radius=_probe_r,
+        tri_list=tris,
+        mat_ids=mats,
+        mat_idx=idx_red_probe,
+        n_theta=24,
+        n_phi=12,
+        tri_ids=red_probe_tri_ids,
+    )
+    print(
+        f"[red-probe] x={_probe_x:.4f} y={_probe_y:.4f} r={_probe_r*1e3:.1f}mm"
+        f" tris={len(red_probe_tri_ids)} mat_idx={idx_red_probe}",
+        flush=True,
+    )
 
     tri_arr = np.ascontiguousarray(np.asarray(tris, dtype=np.float64))
     _orient_surface_patch_outward(tri_arr, lens_front_tri_ids, expected_x_sign=-1.0)
@@ -2544,6 +2636,11 @@ def _build_scene_mesh(
         lens_surface_groups,
         np.ascontiguousarray(np.asarray(object_tri_ids, dtype=np.int32)),
         tube_baffle_ids,
+        np.ascontiguousarray(np.asarray(camera_barrel_tri_ids, dtype=np.int32)),
+        np.ascontiguousarray(np.asarray(camera_rear_cap_tri_ids, dtype=np.int32)),
+        np.ascontiguousarray(np.asarray(camera_front_cap_tri_ids, dtype=np.int32)),
+        np.ascontiguousarray(np.asarray(camera_frustum_tri_ids, dtype=np.int32)),
+        np.ascontiguousarray(np.asarray(red_probe_tri_ids, dtype=np.int32)),
     )
 
 
@@ -2729,6 +2826,7 @@ class ForwardCppLensBench:
     view_h: int
     view_w: int
     sidecar: FreeFrequencySidecar | None = None
+    field_capture: bool = True
 
     def __post_init__(self) -> None:
         self._trace_lock = threading.Lock()
@@ -2782,6 +2880,10 @@ class ForwardCppLensBench:
         # (0.0 = never kill on amplitude, appropriate for single-photon detectors).
         self.sensor_amp_gain: float = 1.0
         self.sensor_min_amplitude: float = 0.0
+        # Emitter ray gain: forward rays are launched with amplitude multiplied
+        # by emitter_amp_gain.  Use to pre-compensate scene absorption or boost
+        # light level without changing the physical source count.
+        self.emitter_amp_gain: float = 1.0
         self._sensor_aim_reported: bool = False
         # Whether the pipeline has been configured with adaptive thresholds yet
         self._pipeline_configured: bool = False
@@ -2816,7 +2918,9 @@ class ForwardCppLensBench:
             verts, normals, mat_idx, tri_arr, db,
             source_ids, lens_front_ids, lens_back_ids, image_plate_ids,
             aperture_stop_ids, tube_wall_ids, lens_surface_groups,
-            object_ids, tube_baffle_ids,
+            object_ids, tube_baffle_ids, camera_barrel_ids,
+            camera_rear_cap_ids, camera_front_cap_ids, camera_frustum_ids,
+            red_probe_ids,
         ) = _build_scene_mesh(self.scene, self.sidecar)
         self.lens_surface_groups = lens_surface_groups
         self.tri_vertices = np.ascontiguousarray(tri_arr, dtype=np.float64)
@@ -2828,6 +2932,16 @@ class ForwardCppLensBench:
         self.aperture_stop_tri_ids = np.ascontiguousarray(aperture_stop_ids, dtype=np.int32)
         self.object_tri_ids = np.ascontiguousarray(object_ids, dtype=np.int32)
         self.tube_baffle_tri_ids = np.ascontiguousarray(tube_baffle_ids, dtype=np.int32)
+        self.camera_barrel_tri_ids   = np.ascontiguousarray(camera_barrel_ids,    dtype=np.int32)
+        self.camera_rear_cap_tri_ids = np.ascontiguousarray(camera_rear_cap_ids,  dtype=np.int32)
+        self.camera_front_cap_tri_ids= np.ascontiguousarray(camera_front_cap_ids, dtype=np.int32)
+        self.camera_frustum_tri_ids  = np.ascontiguousarray(camera_frustum_ids,   dtype=np.int32)
+        self.red_probe_tri_ids       = np.ascontiguousarray(red_probe_ids,         dtype=np.int32)
+        # tube_wall_ids = silver + black cylinder walls only (no flat caps or frustum).
+        # Used for UV display so the x_cylinder UV mode stays valid (no degenerate flat discs).
+        self.tube_wall_tri_ids = np.ascontiguousarray(tube_wall_ids, dtype=np.int32)
+        self.material_db  = db
+        self.tri_mat_ids  = np.ascontiguousarray(mat_idx, dtype=np.int32)
 
         # Per-triangle kind for cross-section rendering.
         tri_kind = np.full(self.n_tris, TRI_KIND_DEFAULT, dtype=np.int8)
@@ -2939,9 +3053,19 @@ class ForwardCppLensBench:
         if int(self.aperture_stop_tri_ids.size) > 0:
             ap_cents = self.tri_centroids[self.aperture_stop_tri_ids]   # (K, 3)
             self.aperture_centroid = ap_cents.mean(axis=0).astype(np.float64)
-            self.aperture_radius = float(
-                np.max(np.linalg.norm(ap_cents - self.aperture_centroid, axis=1))
-            ) + 1e-4
+            # The iris triangles span the full opaque area (r_inner to tube_radius),
+            # so max-centroid-distance gives the *opaque* footprint radius (~49 mm),
+            # not the clear aperture hole.  Use the clear aperture radius instead so
+            # sensor-cast stencils are aimed through the exit pupil, not at the blades.
+            _iris_cfg = getattr(self.scene, "iris_aperture", None)
+            _ep_r     = float(getattr(self.scene, "exit_pupil_radius", 0.0))
+            if _iris_cfg is not None and bool(getattr(_iris_cfg, "enabled", False)):
+                _iris_r = float(getattr(_iris_cfg, "r_inner", 0.0))
+                self.aperture_radius = (min(_iris_r, _ep_r) if _ep_r > 0.0 else _iris_r)
+            else:
+                self.aperture_radius = float(
+                    np.max(np.linalg.norm(ap_cents - self.aperture_centroid, axis=1))
+                ) + 1e-4
             # Normal: aperture faces along the optical (X) axis in this scene layout
             self.aperture_normal = np.array([1.0, 0.0, 0.0], dtype=np.float64)
         else:
@@ -3027,23 +3151,22 @@ class ForwardCppLensBench:
         self._field_nx = 128
         self._field_ny = 64
         self._field_nz = 64
-        bmin = np.array([self.scene.x_min, -self.scene.view_radius, -self.scene.view_radius], dtype=np.float32)
-        bmax = np.array([self.scene.x_max,  self.scene.view_radius,  self.scene.view_radius], dtype=np.float32)
-        self.tracer.enable_field_capture_regular(
-            self._field_nx, self._field_ny, self._field_nz,
-            bmin, bmax,
-            capture_strikes=True,
-            clear_existing=True,
-        )
+        if self.field_capture:
+            bmin = np.array([self.scene.x_min, -self.scene.view_radius, -self.scene.view_radius], dtype=np.float32)
+            bmax = np.array([self.scene.x_max,  self.scene.view_radius,  self.scene.view_radius], dtype=np.float32)
+            self.tracer.enable_field_capture_regular(
+                self._field_nx, self._field_ny, self._field_nz,
+                bmin, bmax,
+                capture_strikes=True,
+                clear_existing=True,
+            )
+        else:
+            print("[field-capture] disabled via --no-field", flush=True)
 
         self._build_uv_page_bank()
         n_lens_param = self._register_lens_parametric_groups()
         print(f"[parametric-register] lens_surface_groups={n_lens_param}", flush=True)
         self._register_uv_page_bank()
-
-        # Lens surface groups are registered as TRI_PARAM_SURFACE_SDF_SPHERE so
-        # T2 refines hit_pos and computes exact Jacobian normals for each
-        # spherical surface in the live persistent pipeline.
 
     def _uv_coords_for_tri_ids(self, tri_ids: np.ndarray, mode: str) -> np.ndarray:
         ids = np.ascontiguousarray(np.asarray(tri_ids, dtype=np.int32).reshape(-1), dtype=np.int32)
@@ -3078,7 +3201,16 @@ class ForwardCppLensBench:
         bank.add("object_plane", "object", self.object_tri_ids, self._uv_coords_for_tri_ids(self.object_tri_ids, "yz"))
         bank.add("sensor_plate", "sensor", self.image_plate_tri_ids, self._uv_coords_for_tri_ids(self.image_plate_tri_ids, "yz"))
         bank.add("aperture_or_iris", "aperture", self.aperture_stop_tri_ids, self._uv_coords_for_tri_ids(self.aperture_stop_tri_ids, "yz"))
-        bank.add("tube_or_baffles", "baffle", self.tube_baffle_tri_ids, self._uv_coords_for_tri_ids(self.tube_baffle_tri_ids, "x_cylinder"))
+        # Use only the cylindrical tube walls (silver + black) for UV display.
+        # The camera_body triangles (flat annular caps + frustum cone) are excluded:
+        # flat discs are degenerate under x_cylinder UV (constant V) and project
+        # as full-height vertical lines in the screen view.
+        bank.add("tube_or_baffles", "baffle", self.tube_wall_tri_ids, self._uv_coords_for_tri_ids(self.tube_wall_tri_ids, "x_cylinder"))
+        bank.add("camera_barrel",    "baffle", self.camera_barrel_tri_ids,    self._uv_coords_for_tri_ids(self.camera_barrel_tri_ids,    "x_cylinder"))
+        bank.add("camera_rear_cap",  "baffle", self.camera_rear_cap_tri_ids,  self._uv_coords_for_tri_ids(self.camera_rear_cap_tri_ids,  "yz"))
+        bank.add("camera_front_cap", "baffle", self.camera_front_cap_tri_ids, self._uv_coords_for_tri_ids(self.camera_front_cap_tri_ids, "yz"))
+        bank.add("camera_frustum",   "baffle", self.camera_frustum_tri_ids,   self._uv_coords_for_tri_ids(self.camera_frustum_tri_ids,   "x_cylinder"))
+        bank.add("red_leak_probe",   "source", self.red_probe_tri_ids,         self._uv_coords_for_tri_ids(self.red_probe_tri_ids,         "yz"))
         for i, (front_ids, back_ids, _rf, _rb) in enumerate(getattr(self, "lens_surface_groups", [])):
             bank.add(f"lens_{i:02d}_front", "lens_front", front_ids, self._uv_coords_for_tri_ids(front_ids, "yz"))
             bank.add(f"lens_{i:02d}_back", "lens_back", back_ids, self._uv_coords_for_tri_ids(back_ids, "yz"))
@@ -3107,32 +3239,49 @@ class ForwardCppLensBench:
         )
 
     def _register_lens_parametric_groups(self) -> int:
-        """Register passive exact lens-surface refiners for the live pipeline."""
+        """Register passive exact lens-surface refiners for the live pipeline.
+
+        The SDF-sphere formula computes a displacement in WORLD METRES:
+            delta = k * (cu² + cv²),   k = 0.5 / radius_param
+        where cu = u - 1/3, cv = v - 1/3 are barycentric offsets from the
+        triangle centroid.  For this to equal the true spherical sag at the
+        corner vertices (delta_vertex ≈ L²/(8·R_curv)) we need:
+            k = 9·L²/(40·R_curv)   →   radius_param = 20·R_curv / (9·L²)
+        where L is the mean edge length of the surface's triangles in metres.
+        Passing the raw radius-of-curvature (metres) instead of radius_param
+        gives displacements O(1/R) ~ metres, which is catastrophically wrong.
+        """
         sample_area = int(getattr(_sk, "TRI_GROUP_SAMPLE_AREA", 1))
         param_sdf_sphere = int(getattr(_sk, "TRI_PARAM_SURFACE_SDF_SPHERE", 3))
         param_none_role = 0
         n_lens_param = 0
+        margin = 0.12  # barycentric UV neighbourhood radius for blended eval
         for front_ids, back_ids, r_front, r_back in getattr(self, "lens_surface_groups", []):
-            margin = 0.12
-            if front_ids.size > 0:
+            for ids, r_curv in [(front_ids, r_front), (back_ids, r_back)]:
+                if ids.size <= 0:
+                    continue
+                r_curv = abs(float(r_curv))
+                if r_curv < 1.0e-6:
+                    continue
+                # Mean edge length of this surface's triangles (metres).
+                verts = self.tri_vertices[ids]          # (n, 3, 3)
+                e1 = verts[:, 1] - verts[:, 0]          # (n, 3)
+                e2 = verts[:, 2] - verts[:, 0]
+                e3 = verts[:, 2] - verts[:, 1]
+                mean_L = float(np.mean([
+                    np.mean(np.linalg.norm(e, axis=1))
+                    for e in [e1, e2, e3]
+                ]))
+                mean_L = max(mean_L, 1.0e-8)
+                # Scale radius_param so delta_vertex ≈ L²/(8·R_curv).
+                radius_param = 20.0 * r_curv / (9.0 * mean_L ** 2)
                 self.tracer.register_tri_group(
                     param_none_role,
                     sample_area,
-                    np.ascontiguousarray(front_ids, dtype=np.int32),
+                    np.ascontiguousarray(ids, dtype=np.int32),
                     parametric_surface={
                         "kind": param_sdf_sphere,
-                        "coeffs": np.array([float(r_front), margin], dtype=np.float64),
-                    },
-                )
-                n_lens_param += 1
-            if back_ids.size > 0:
-                self.tracer.register_tri_group(
-                    param_none_role,
-                    sample_area,
-                    np.ascontiguousarray(back_ids, dtype=np.int32),
-                    parametric_surface={
-                        "kind": param_sdf_sphere,
-                        "coeffs": np.array([float(r_back), margin], dtype=np.float64),
+                        "coeffs": np.array([radius_param, margin], dtype=np.float64),
                     },
                 )
                 n_lens_param += 1
@@ -3263,11 +3412,9 @@ class ForwardCppLensBench:
                 },
             )
         )
-        # Register exact spherical surface refiners before UV pages so both the
-        # legacy BDPT path and live persistent pipeline use the same geometry.
-        n_lens_param = self._register_lens_parametric_groups()
-
         # Re-register physical UV pages — clear_tri_groups() above destroyed them.
+        # NOTE: _register_lens_parametric_groups() is intentionally NOT called here.
+        # See the comment in __init__ for the full explanation.
         self._register_uv_page_bank()
 
         self._bdpt_sensor_cfg = cfg
@@ -3283,7 +3430,6 @@ class ForwardCppLensBench:
             f"stop_r={stop_radius_m*1e3:.2f}mm",
             f"lens_center_x={lens_stack_center_x:.4f}",
             f"camera_mode={int(camera_mode)}",
-            f"lens_param_groups={n_lens_param}",
             f"uv_groups={len(self.uv_page_bank.groups) if self.uv_page_bank is not None else 0}",
             flush=True,
         )
@@ -3344,7 +3490,7 @@ class ForwardCppLensBench:
 
         origins     = np.empty((total, 3), dtype=np.float64)
         directions  = np.empty((total, 3), dtype=np.float64)
-        amplitudes  = np.ones((total, n_bands), dtype=np.complex128)
+        amplitudes  = np.full((total, n_bands), complex(float(self.emitter_amp_gain)), dtype=np.complex128)
         src_ids     = np.empty((total,), dtype=np.int32)
         tag_arr     = np.zeros((total,), dtype=np.uint64)
         cflag_arr   = np.zeros((total,), dtype=np.uint8)  # 0 = emissive / forward
@@ -5248,8 +5394,10 @@ def run(
     sensor_res: int = 64,
     sensor_amp_gain: float = 1.0,
     sensor_min_amplitude: float = 0.0,
+    emitter_amp_gain: float = 1.0,
     compute_mode: str = "gpu",
     profile: bool = False,
+    field_capture: bool = True,
 ) -> None:
     try:
         from OpenGL.GL import (
@@ -5288,6 +5436,25 @@ def run(
     W, H = 1560, 860
     pygame.display.set_caption("Thick Lens — Spectral Cross-Section Viewer")
     pygame.display.set_mode((W, H), pygame.OPENGL | pygame.DOUBLEBUF)
+
+    # Capture the Pygame/WGL display context handle for GL object sharing,
+    # and the HDC for pixel-format matching (prevents err=0 on stricter drivers).
+    # Must be called immediately after set_mode() while the context is current.
+    _gl_display_hglrc: int = 0
+    _gl_display_hdc: int = 0
+    if sys.platform == "win32":
+        try:
+            _wgl_get_current_context = ctypes.windll.opengl32.wglGetCurrentContext
+            _wgl_get_current_dc = ctypes.windll.opengl32.wglGetCurrentDC
+            _wgl_get_current_context.restype = ctypes.c_void_p
+            _wgl_get_current_dc.restype = ctypes.c_void_p
+            _gl_display_hglrc = int(_wgl_get_current_context() or 0)
+            _gl_display_hdc = int(_wgl_get_current_dc() or 0)
+            if _gl_display_hglrc:
+                print(f"[gl-share] captured display HGLRC=0x{_gl_display_hglrc:x}"
+                      f" HDC=0x{_gl_display_hdc:x}", flush=True)
+        except Exception as _hglrc_err:
+            print(f"[gl-share] HGLRC capture failed: {_hglrc_err}", flush=True)
     clock = pygame.time.Clock()
     frame_profiler = FrameProfiler(report_every=60) if profile else None
 
@@ -5301,12 +5468,29 @@ def run(
         view_h=view_h,
         view_w=view_w,
         sidecar=sidecar,
+        field_capture=field_capture,
     )
+
+    # Wire the display HGLRC and HDC to the tracer BEFORE the first submit_rays.
+    if _gl_display_hglrc:
+        if _gl_display_hdc:
+            bench.tracer.set_gl_display_hdc(_gl_display_hdc)
+        bench.tracer.set_gl_display_hglrc(_gl_display_hglrc)
+        # Pre-upload RGB weights for the GPU blit shader.
+        try:
+            _wl_nm = np.clip(C_LIGHT / np.maximum(bench.freq_hz, EPS) * 1.0e9, 380.0, 700.0)
+            _blit_w = _wavelength_to_rgb_weights(_wl_nm).astype(np.float32)
+            bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
+            print(f"[gl-share] UV blit weights uploaded ({len(bench.freq_hz)} bands)", flush=True)
+        except Exception as _bw_err:
+            print(f"[gl-share] blit weight upload failed: {_bw_err}", flush=True)
     bench.sensor_amp_gain      = float(sensor_amp_gain)
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
+    bench.emitter_amp_gain     = float(emitter_amp_gain)
     bench.compute_mode         = str(compute_mode)
     print(f"[bench] tris={bench.n_tris}  bands={bench.n_bands}  "
           f"view={view_w}x{view_h}  sensor_amp_gain={bench.sensor_amp_gain}  "
+          f"emitter_amp_gain={bench.emitter_amp_gain}  "
           f"sensor_min_amplitude={bench.sensor_min_amplitude}", flush=True)
     # ── Configure C++ sensor image accumulator ─────────────────────────────
     _pip_res = int(max(16, scene.image_plate.sensor_res))
@@ -5574,6 +5758,98 @@ def run(
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA16F, _uv_res, _uv_res, _uv_layers,
                  0, GL_RGBA, GL_FLOAT, _uv_blank)
 
+    # ── BaseGLRenderer: bridge tex_uv_pages into the base-material shader ───
+    # The renderer and shaders already exist; this wires the shared texture ID
+    # so uEmitUv samples from the same array that the blit shader writes into.
+    _gl_renderer = BaseGLRenderer(bench.material_db)
+    _gl_renderer.init_gl()
+    _gl_renderer.set_emit_uv_texture_id(int(tex_uv_pages))
+    _scene_vao: list = [None]  # lazily built once uv_page_bank groups are ready
+
+    def _build_scene_vao() -> None:
+        bank = bench.uv_page_bank
+        if bank is None or not bank.groups:
+            return
+        n_tris = bench.n_tris
+        tv = bench.tri_vertices  # (N, 3, 3) float64 xyz
+        # Normalise into [0, 1]³ — same mapping as _ensure_mesh_vbo.
+        x0  = float(scene.x_min);  x1  = float(scene.x_max)
+        r_v = float(scene.view_radius)
+        xsp = max(1e-8, x1 - x0);  yzsp = max(1e-8, 2.0 * r_v)
+        pos_n = np.empty((n_tris, 3, 3), dtype=np.float32)
+        pos_n[..., 0] = np.clip((tv[..., 0] - x0)    / xsp,  0.0, 1.0)
+        pos_n[..., 1] = np.clip((tv[..., 1] + r_v)   / yzsp, 0.0, 1.0)
+        pos_n[..., 2] = np.clip((tv[..., 2] + r_v)   / yzsp, 0.0, 1.0)
+        pos_flat = pos_n.reshape(-1, 3)                          # (N*3, 3)
+        # Flat normals.
+        e1 = (tv[:, 1] - tv[:, 0]).astype(np.float32)
+        e2 = (tv[:, 2] - tv[:, 0]).astype(np.float32)
+        raw_n = np.cross(e1, e2)
+        nlen  = np.linalg.norm(raw_n, axis=1, keepdims=True)
+        norms = (raw_n / np.where(nlen > 1e-12, nlen, 1.0)).astype(np.float32)
+        norm_flat = np.repeat(norms, 3, axis=0)                  # (N*3, 3)
+        uv_flat = np.zeros((n_tris * 3, 2), dtype=np.float32)
+        # Use the actual scene material IDs so that emissive surfaces (red probe
+        # sphere, light sources) carry their real emission_rgb into the fragment
+        # shader.  The renderer's derive_emissive_area_lights will pick those up
+        # and handle illumination — no manual light setup needed here.
+        mat_flat = np.repeat(bench.tri_mat_ids, 3)               # (N*3,) ints
+        # Group IDs for self-exclusion in the fragment shader.
+        gid_flat = np.zeros(n_tris * 3, dtype=np.int32)
+        for g in bank.groups:
+            if g.tri_ids.size <= 0:
+                continue
+            for tid in g.tri_ids:
+                base = int(tid) * 3
+                gid_flat[base:base + 3] = int(g.group_id)
+        mat_v  = np.ascontiguousarray(mat_flat, dtype=np.int32)
+        gid_v  = np.ascontiguousarray(gid_flat, dtype=np.int32)
+        # Build verts8: [x, y, z, nx, ny, nz, u, v]
+        verts8 = np.concatenate([pos_flat, norm_flat, uv_flat], axis=1)
+        verts8 = np.ascontiguousarray(verts8, dtype=np.float32)
+        # All triangles double-sided (closed opaque shell).
+        cull_v = np.ones(n_tris * 3, dtype=np.int32)
+        from OpenGL.GL import (
+            glGenVertexArrays, glBindVertexArray, glGenBuffers, glBindBuffer,
+            glBufferData, glEnableVertexAttribArray, glVertexAttribPointer,
+            glVertexAttribIPointer,
+            GL_ARRAY_BUFFER, GL_STATIC_DRAW, GL_FLOAT, GL_INT,
+        )
+        vao = glGenVertexArrays(1)
+        vbo = glGenBuffers(1)
+        mbo = glGenBuffers(1)
+        gbo = glGenBuffers(1)
+        cbo = glGenBuffers(1)
+        glBindVertexArray(vao)
+        glBindBuffer(GL_ARRAY_BUFFER, vbo)
+        glBufferData(GL_ARRAY_BUFFER, verts8.nbytes, verts8, GL_STATIC_DRAW)
+        stride = 8 * 4
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, False, stride, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, False, stride, ctypes.c_void_p(12))
+        glEnableVertexAttribArray(3)
+        glVertexAttribPointer(3, 2, GL_FLOAT, False, stride, ctypes.c_void_p(24))
+        glBindBuffer(GL_ARRAY_BUFFER, mbo)
+        glBufferData(GL_ARRAY_BUFFER, mat_v.nbytes, mat_v, GL_STATIC_DRAW)
+        glEnableVertexAttribArray(2)
+        glVertexAttribIPointer(2, 1, GL_INT, 4, ctypes.c_void_p(0))
+        glBindBuffer(GL_ARRAY_BUFFER, gbo)
+        glBufferData(GL_ARRAY_BUFFER, gid_v.nbytes, gid_v, GL_STATIC_DRAW)
+        glEnableVertexAttribArray(4)
+        glVertexAttribIPointer(4, 1, GL_INT, 4, ctypes.c_void_p(0))
+        glBindBuffer(GL_ARRAY_BUFFER, cbo)
+        glBufferData(GL_ARRAY_BUFFER, cull_v.nbytes, cull_v, GL_STATIC_DRAW)
+        glEnableVertexAttribArray(5)
+        glVertexAttribIPointer(5, 1, GL_INT, 4, ctypes.c_void_p(0))
+        glBindVertexArray(0)
+        _scene_vao[0] = (int(vao), n_tris * 3, int(vbo), int(mbo), int(gbo), int(cbo))
+        # Let the renderer derive lights from all emissive surfaces in the scene
+        # (red probe sphere, source triangles, etc.) — no manual light setup.
+        _gl_renderer.derive_emissive_area_lights(verts8, mat_v, gid_v, min_emitter_group_id=-999)
+        print(f"[gl-renderer] scene VAO built: {n_tris*3} verts, "
+              f"{len(bank.groups)} UV groups", flush=True)
+
     # HUD text texture — RGBA8, sized to a reasonable stats strip width × height
     _HUD_W, _HUD_H = 256, 48
     tex_hud = glGenTextures(1)
@@ -5729,6 +6005,7 @@ def run(
     _mesh_n_verts: list = [0]
     _uv_last_update_s: list = [-1.0]
     _uv_mode: list = ["combined"]
+    _uv_shared_tex_id: list = [0]  # [int tex ID] when C++ GPU blit is active, else 0
 
     def _ensure_mesh_vbo() -> bool:
         if _mesh_vbo[0] is not None:
@@ -5777,19 +6054,42 @@ def run(
         bank = bench.uv_page_bank
         if bank is None:
             return
-        if t_now - _uv_last_update_s[0] >= 0.05:
-            pages = bank.update_from_tracer(bench.tracer, bench.freq_hz, mode=_uv_mode[0])
-            glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
-            glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0,
-                            int(pages.shape[2]), int(pages.shape[1]), int(pages.shape[0]),
-                            GL_RGBA, GL_FLOAT, np.ascontiguousarray(pages, dtype=np.float32))
-            _uv_last_update_s[0] = float(t_now)
+
+        # Lazily build the BaseGLRenderer VAO from the UV page bank geometry.
+        if _scene_vao[0] is None:
+            _build_scene_vao()
+
+        # Lazily discover the shared GPU texture ID from the C++ blit shader.
+        if _uv_shared_tex_id[0] == 0:
+            try:
+                tid = bench.tracer.get_uv_pages_tex_id()
+                if tid:
+                    _uv_shared_tex_id[0] = int(tid)
+                    _gl_renderer.set_emit_uv_texture_id(int(tid))
+                    print(f"[gl-share] GPU-direct UV tex id={tid} active", flush=True)
+            except Exception:
+                pass
+
+        if _uv_shared_tex_id[0]:
+            # GPU-direct path: C++ blit shader already wrote RGBA16F into the
+            # shared texture.  No CPU round-trip needed; just bind and draw.
+            active_tex = _uv_shared_tex_id[0]
+        else:
+            # CPU fallback path: readback → NumPy → glTexSubImage3D.
+            if t_now - _uv_last_update_s[0] >= 0.05:
+                pages = bank.update_from_tracer(bench.tracer, bench.freq_hz, mode=_uv_mode[0])
+                glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
+                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0,
+                                int(pages.shape[2]), int(pages.shape[1]), int(pages.shape[0]),
+                                GL_RGBA, GL_FLOAT, np.ascontiguousarray(pages, dtype=np.float32))
+                _uv_last_update_s[0] = float(t_now)
+            active_tex = tex_uv_pages
         glUseProgram(mesh_prog)
         glUniform1f(glGetUniformLocation(mesh_prog, "u_time"), float(t_now))
         glUniform1f(glGetUniformLocation(mesh_prog, "u_mode"), 0.0)
         glUniform1f(glGetUniformLocation(mesh_prog, "u_gain"), float(gain))
         glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
+        glBindTexture(GL_TEXTURE_2D_ARRAY, active_tex)
         glUniform1i(glGetUniformLocation(mesh_prog, "u_uv_pages"), 0)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
@@ -5810,6 +6110,23 @@ def run(
         glDisableVertexAttribArray(_mesh_loc_layer)
         glDisable(GL_BLEND)
         glUseProgram(0)
+
+        # Drive BaseGLRenderer with the same rotation MVP so it overlays
+        # the base-material Phong pass on top of the UV-mesh blit.
+        if _scene_vao[0] is not None:
+            t   = t_now * 0.16
+            a   = 0.24 * math.sin(t)
+            ca  = math.cos(a);  sa = math.sin(a)
+            mvp = np.array([
+                [ 2,     0,     0, -1          ],
+                [ 0,  2*ca,  2*sa, -(ca + sa)  ],
+                [ 0,     0,     0,  0          ],
+                [ 0,     0,     0,  1          ],
+            ], dtype=np.float32)
+            mvp_col = np.ascontiguousarray(mvp.T.ravel(), dtype=np.float32)
+            mv_col  = np.ascontiguousarray(np.eye(4, dtype=np.float32).ravel())
+            vao_id, n_verts = _scene_vao[0][0], _scene_vao[0][1]
+            _gl_renderer.draw_mesh(vao_id, n_verts, mvp_col, mv_col)
 
     # ── Clip plane helpers ───────────────────────────────────────── #
     r         = float(scene.view_radius)
@@ -5838,8 +6155,8 @@ def run(
 
     field_gain      = 0.6
     field_leak      = 0.0
-    max_bounces     = 64
-    rays_per_emitter = 32
+    max_bounces     = 16
+    rays_per_emitter = 8
     seed            = 13579
     frame           = 0
     _display_frame  = 0   # independent counter for display-update rate limiting
@@ -5930,10 +6247,9 @@ def run(
                     print(f"[trace] {exc}", flush=True)
                 trace_fut = None
 
-            # Refresh field + UV textures at ~20 Hz (every 3 frames) to avoid
-            # running multi-MB NumPy reductions on every 60 Hz display frame.
+            # Refresh field + UV textures every frame for continuous trickle display.
             _display_frame += 1
-            if _display_frame % 3 == 0:
+            if True:
                 try:
                     if frame_profiler is not None:
                         frame_profiler.begin("display_records")
@@ -6025,6 +6341,11 @@ def run(
         glDeleteTextures(1, [tex_uv_pages])
         if _mesh_vbo[0] is not None:
             glDeleteBuffers(3, _mesh_vbo[0])
+        if _scene_vao[0] is not None:
+            vao_id, _, vbo, mbo, gbo, cbo = _scene_vao[0]
+            from OpenGL.GL import glDeleteVertexArrays
+            glDeleteVertexArrays(1, [vao_id])
+            glDeleteBuffers(4, [vbo, mbo, gbo, cbo])
         glDeleteProgram(volume_prog)
         glDeleteProgram(point_prog)
         glDeleteProgram(pip_prog)
@@ -6169,6 +6490,13 @@ if __name__ == "__main__":
         help="Multiply sensor ray launch amplitude by G to pre-compensate Fresnel dropoff (default: 1.0)",
     )
     _ap.add_argument(
+        "--emitter-gain",
+        type=float,
+        default=1.0,
+        metavar="G",
+        help="Multiply forward emitter ray launch amplitude by G (default: 1.0)",
+    )
+    _ap.add_argument(
         "--sensor-min-amp",
         type=float,
         default=0.0,
@@ -6202,6 +6530,11 @@ if __name__ == "__main__":
         action="store_true",
         help="Print rolling Python frame timings and pipeline readback counters",
     )
+    _ap.add_argument(
+        "--no-field",
+        action="store_true",
+        help="Disable volumetric field capture (saves ~128×64×64 complex grid memory per frame)",
+    )
     _args = _ap.parse_args()
     if _args.uv_smoke_exit:
         raise SystemExit(run_uv_smoke(
@@ -6217,6 +6550,8 @@ if __name__ == "__main__":
         sensor_res=_args.sensor_res,
         sensor_amp_gain=_args.sensor_gain,
         sensor_min_amplitude=_args.sensor_min_amp,
+        emitter_amp_gain=_args.emitter_gain,
         compute_mode=_args.compute_mode,
         profile=bool(_args.profile),
+        field_capture=not _args.no_field,
     )

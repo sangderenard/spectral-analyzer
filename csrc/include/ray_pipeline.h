@@ -548,6 +548,17 @@ struct RayPipelineConfig {
      * when use_gpu_compute=true.  If GPU init fails, CPU workers are spawned as
      * a fallback regardless of this flag. */
     bool        gpu_all_stages = false;
+
+    /* Handle to the display GL context (e.g. Pygame's HGLRC on Windows).
+     * When non-zero the compute context is created as a share partner of this
+     * context so all GL objects (SSBOs, textures) are visible in both.
+     * Must be set before the first submit_rays call.  Set via the pybind
+     * method set_gl_display_hglrc() on the Python-facing RayTracer object. */
+    uint64_t    gl_display_hglrc = 0;
+    /* HDC of the Pygame display window.  When non-zero, the hidden compute
+     * window copies this DC's pixel format so wglCreateContextAttribsARB
+     * finds compatible formats and succeeds even with stricter drivers. */
+    uint64_t    gl_display_hdc   = 0;
 };
 
 /* ─── Opaque pipeline state (defined in ray_tracer.cpp) ─────────────────── */
@@ -558,6 +569,18 @@ struct RayPipelineState;
 
 /* Number of spectral bands in the associated tracer (0 if none). */
 int ray_pipeline_n_bands(const RayPipelineState* ps);
+
+/* Return the GL texture object ID of the shared tex_uv_pages array (0 if not active). */
+uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps);
+
+/* Upload per-band RGB weights for the GPU UV blit shader.
+ * weights : float array of length n_bands*3 (interleaved r,g,b per band).
+ * n_bands : number of bands (clamped to [1, MAX_SPECTRAL_BANDS]).
+ * mode    : 0=combined, 1=forward only, 2=sensor only. */
+void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,
+                                       const float* weights,
+                                       int n_bands,
+                                       int mode);
 
 /* mat_idx of triangle tri_idx (-1 if ps/st is null or index out of range). */
 int ray_pipeline_tri_mat_idx(const RayPipelineState* ps, int tri_idx);

@@ -6176,6 +6176,27 @@ public:
     /* Shader programs for each stage */
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
 
+    /* UV blit shader + shared display texture (valid only when WGL context sharing
+     * is active — i.e. ps.cfg.gl_display_hglrc != 0 and prog_uv_blit != 0). */
+    GLuint prog_uv_blit  = 0;
+    GLuint tex_uv_pages  = 0;   /* GL_TEXTURE_2D_ARRAY RGBA16F, shared with display ctx */
+    int    blit_n_layers = 0;   /* layer count the texture was allocated for */
+    int    blit_res      = 0;   /* texel resolution (res×res per layer)                 */
+    bool   display_context_shared = false;
+    /* Cached uniform locations for uv_blit.comp.glsl */
+    struct { GLint n_uv_groups, uv_meta_base, n_bands, uv_blit_mode, rgb_w; }
+        uloc_blit = {-1, -1, -1, -1, -1};
+    /* Per-band RGB weights uploaded as rgb_w[32] uniform (3 floats × 32 bands max).
+     * Set from Python via set_uv_blit_weights().  Default: equal-weight gray. */
+    std::array<float, MAX_SPECTRAL_BANDS * 3> blit_rgb_weights = []() {
+        std::array<float, MAX_SPECTRAL_BANDS * 3> a{};
+        for (int i = 0; i < MAX_SPECTRAL_BANDS * 3; ++i) a[i] = 1.f/3.f;
+        return a;
+    }();
+    int  blit_n_bands_stored = 0;  /* 0 = use st.n_bands at dispatch time */
+    int  blit_mode           = 0;  /* 0=combined(fwd+sen), 1=forward, 2=sensor */
+    static constexpr GLuint UV_BLIT_IMAGE_UNIT = 0;
+
     /* Cached uniform locations — populated once after shader link */
     struct { GLint n_intents, n_bands, n_mats, n_arenas, n_tris, u_arenas; }
         uloc_t1 = {-1,-1,-1,-1,-1,-1};
@@ -6294,7 +6315,9 @@ public:
 
     /* ── init ──────────────────────────────────────────────────────────────────── */
     bool init(RayPipelineState& ps, const std::string& shader_dir) {
-        if (!gl_compute_create_context(&ctx)) {
+        if (!gl_compute_create_context(&ctx,
+                reinterpret_cast<void*>((uintptr_t)ps.cfg.gl_display_hglrc),
+                reinterpret_cast<void*>((uintptr_t)ps.cfg.gl_display_hdc))) {
             fprintf(stderr, "[gpu-dispatch] gl_compute_create_context failed\n"); fflush(stderr);
             return false;
         }
@@ -6306,6 +6329,8 @@ public:
             fprintf(stderr, "[gpu-dispatch] gl_compute_load_procs failed\n"); fflush(stderr);
             return false;
         }
+        display_context_shared =
+            (ps.cfg.gl_display_hglrc != 0 && std::strcmp(ctx.error, "no-share") != 0);
 
         /* Apply per-stage initial GPU batch sizes from config */
         auto& cfg = ps.cfg;
@@ -6336,6 +6361,21 @@ public:
         if (!load("ray_refine.comp.glsl",        prog_t2)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
         if (!load("ray_material.comp.glsl",      prog_t3)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
         if (!load("ray_wave_bpm.comp.glsl",      prog_t4)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
+
+        /* Load UV blit shader — non-fatal, falls back to CPU path silently */
+        if (display_context_shared) {
+            if (!load("uv_blit.comp.glsl", prog_uv_blit)) {
+                fprintf(stderr, "[gpu-dispatch] uv_blit.comp.glsl not loaded (%s) — GPU blit disabled\n", err);
+                fflush(stderr);
+                prog_uv_blit = 0;
+            } else {
+                uloc_blit.n_uv_groups  = glc_GetUniformLocation(prog_uv_blit, "n_uv_groups");
+                uloc_blit.uv_meta_base = glc_GetUniformLocation(prog_uv_blit, "uv_meta_base");
+                uloc_blit.n_bands      = glc_GetUniformLocation(prog_uv_blit, "n_bands");
+                uloc_blit.uv_blit_mode = glc_GetUniformLocation(prog_uv_blit, "uv_blit_mode");
+                uloc_blit.rgb_w        = glc_GetUniformLocation(prog_uv_blit, "rgb_w");
+            }
+        }
 
         /* Cache uniform locations — string lookup done once at init, not per dispatch */
         uloc_t1.n_intents = glc_GetUniformLocation(prog_t1, "n_intents");
@@ -6571,9 +6611,69 @@ public:
                 glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, clr_sz, zeros.data());
             }
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+            /* Allocate shared tex_uv_pages when WGL context sharing is active.
+             * The texture lives in the shared object namespace so the display
+             * context can sample it after the blit shader writes to it. */
+            if (prog_uv_blit != 0 && display_context_shared) {
+                const int ng  = (int)st.group_uv_res.size();
+                const int res = (ng > 0) ? st.group_uv_res[0] : 512;
+                if (ng != blit_n_layers || res != blit_res) {
+                    if (tex_uv_pages) { glDeleteTextures(1, &tex_uv_pages); tex_uv_pages = 0; }
+                    if (ng > 0) {
+                        glGenTextures(1, &tex_uv_pages);
+                        glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages);
+                        glc_TexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA16F, res, res, ng);
+                        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                        glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
+                        blit_n_layers = ng;
+                        blit_res      = res;
+                    }
+                }
+            }
         }
 
         scene_uploaded = true;
+    }
+
+    /* ── dispatch_uv_blit: GPU-direct accumulator → RGBA16F display texture ─ */
+    void dispatch_uv_blit(RayPipelineState& ps) {
+        if (!prog_uv_blit || !tex_uv_pages || blit_n_layers <= 0) return;
+        const RayTracerState& st = *ps.st;
+        const int n_uv_groups  = (int)st.group_uv_res.size();
+        const int uv_meta_base = (int)st.tri_uv_group_of_tri.size();
+        const int nb           = (blit_n_bands_stored > 0) ? blit_n_bands_stored : st.n_bands;
+        const int res          = blit_res;
+
+        /* Ensure T3 image stores are visible before we read the SSBO. */
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        /* Bind resources */
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_uv_accum);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_tri_uv_and_meta);
+        glc_BindImageTexture(UV_BLIT_IMAGE_UNIT, tex_uv_pages, 0, GL_TRUE, 0,
+                             GL_WRITE_ONLY, GL_RGBA16F);
+
+        glc_UseProgram(prog_uv_blit);
+        glc_Uniform1i(uloc_blit.n_uv_groups,  n_uv_groups);
+        glc_Uniform1i(uloc_blit.uv_meta_base, uv_meta_base);
+        glc_Uniform1i(uloc_blit.n_bands,       nb);
+        glc_Uniform1i(uloc_blit.uv_blit_mode,  blit_mode);
+        glc_Uniform3fv(uloc_blit.rgb_w, std::min(nb, MAX_SPECTRAL_BANDS), blit_rgb_weights.data());
+
+        const unsigned int gx = (unsigned int)((res + 7) / 8);
+        const unsigned int gy = (unsigned int)((res + 7) / 8);
+        const unsigned int gz = (unsigned int)n_uv_groups;
+        glc_DispatchCompute(gx, gy, gz);
+
+        /* Ensure image writes complete before the display context reads the texture. */
+        glc_MemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    }
+
+    /* Return the GL texture object ID of tex_uv_pages (0 if not allocated). */
+    uint64_t get_uv_pages_tex_id() const {
+        return display_context_shared ? (uint64_t)tex_uv_pages : 0u;
     }
 
     /* ── dispatch_t1_t2_t3: run one GPU batch through T1→T2→T3 ──────────── */
@@ -6777,6 +6877,11 @@ public:
             /* Atomic-add GPU counts into CPU accumulator. */
             for (int i = 0; i < st.uv_accum_total; ++i)
                 uv_accum_add(st.uv_accum_cpu[i], gpu_acc[i]);
+            /* GPU-direct display blit: write ssbo_uv_accum → tex_uv_pages directly
+             * (no CPU round-trip) when WGL context sharing is active. */
+            if (prog_uv_blit && tex_uv_pages)
+                dispatch_uv_blit(ps);
+
             /* Zero the GPU accumulator for the next dispatch. */
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_uv_accum);
             std::fill(gpu_acc.begin(), gpu_acc.end(), 0u);
@@ -8287,6 +8392,25 @@ int ray_pipeline_drain_refined(RayPipelineState* ps,
 {
     if (!ps || max_n <= 0) return 0;
     return ps->Q_refined.drain(out, max_n);
+}
+
+uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps)
+{
+    if (!ps || !ps->gpu_dispatch) return 0;
+    return ps->gpu_dispatch->get_uv_pages_tex_id();
+}
+
+void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,
+                                       const float* weights,
+                                       int n_bands,
+                                       int mode)
+{
+    if (!ps || !ps->gpu_dispatch || !weights || n_bands < 1) return;
+    if (n_bands > MAX_SPECTRAL_BANDS) n_bands = MAX_SPECTRAL_BANDS;
+    auto* gd = ps->gpu_dispatch;
+    std::copy_n(weights, (size_t)n_bands * 3, gd->blit_rgb_weights.data());
+    gd->blit_n_bands_stored = n_bands;
+    gd->blit_mode = mode;
 }
 
 void ray_pipeline_set_shuffle(RayPipelineState* ps, float shuffle_frac)

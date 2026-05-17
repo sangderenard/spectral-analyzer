@@ -79,6 +79,12 @@ typedef unsigned int   GLbitfield;
 #ifndef GL_TEXTURE_2D_ARRAY
 #  define GL_TEXTURE_2D_ARRAY             0x8C1A
 #endif
+#ifndef GL_RGBA16F
+#  define GL_RGBA16F                      0x881A
+#endif
+#ifndef GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
+#  define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT  0x00000020
+#endif
 #ifndef GL_READ_WRITE
 #  define GL_READ_WRITE                   0x88BA
 #endif
@@ -126,8 +132,16 @@ extern "C" {
  * Create a WGL headless 4.3 core context on a hidden window.
  * Returns true on success; ctx->error contains a description on failure.
  * Must be called from the thread that will own (and drive) the context.
+ *
+ * hShareContext: optional HGLRC (cast to void*) of an existing GL context
+ * whose object namespace should be shared with this new context.  Pass NULL
+ * for a fully isolated compute context (no object sharing).  When a valid
+ * handle is supplied, wglCreateContextAttribsARB is called with that context
+ * as hShareContext so both contexts see the same textures and buffers — the
+ * key requirement for the GPU-direct UV blit path.
  */
-bool gl_compute_create_context(GlComputeContext* ctx);
+bool gl_compute_create_context(GlComputeContext* ctx, void* hShareContext,
+                               void* hShareDC = nullptr);
 
 /**
  * Load all GL 4.3 extension function pointers.
@@ -189,6 +203,7 @@ typedef void    (APIENTRY* PFNGLUNIFORM1FPROC)(GLint location, GLfloat v0);
 typedef void    (APIENTRY* PFNGLUNIFORM1UIPROC)(GLint location, GLuint v0);
 typedef void    (APIENTRY* PFNGLUNIFORM1IVPROC)(GLint location, GLsizei count, const GLint* value);
 typedef void    (APIENTRY* PFNGLUNIFORM1FVPROC)(GLint location, GLsizei count, const GLfloat* value);
+typedef void    (APIENTRY* PFNGLUNIFORM3FVPROC)(GLint location, GLsizei count, const GLfloat* value);
 typedef void    (APIENTRY* PFNGLUNIFORM4FVPROC)(GLint location, GLsizei count, const GLfloat* value);
 typedef void    (APIENTRY* PFNGLUNIFORM2IVPROC)(GLint location, GLsizei count, const GLint* value);
 
@@ -240,6 +255,7 @@ extern PFNGLUNIFORM1FPROC           glc_Uniform1f;
 extern PFNGLUNIFORM1UIPROC          glc_Uniform1ui;
 extern PFNGLUNIFORM1IVPROC          glc_Uniform1iv;
 extern PFNGLUNIFORM1FVPROC          glc_Uniform1fv;
+extern PFNGLUNIFORM3FVPROC          glc_Uniform3fv;
 extern PFNGLUNIFORM4FVPROC          glc_Uniform4fv;
 extern PFNGLUNIFORM2IVPROC          glc_Uniform2iv;
 

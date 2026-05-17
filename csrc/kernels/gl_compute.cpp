@@ -46,6 +46,7 @@ PFNGLUNIFORM1FPROC          glc_Uniform1f          = nullptr;
 PFNGLUNIFORM1UIPROC         glc_Uniform1ui         = nullptr;
 PFNGLUNIFORM1IVPROC         glc_Uniform1iv         = nullptr;
 PFNGLUNIFORM1FVPROC         glc_Uniform1fv         = nullptr;
+PFNGLUNIFORM3FVPROC         glc_Uniform3fv         = nullptr;
 PFNGLUNIFORM4FVPROC         glc_Uniform4fv         = nullptr;
 PFNGLUNIFORM2IVPROC         glc_Uniform2iv         = nullptr;
 
@@ -85,7 +86,8 @@ static void* gl_get_proc(const char* name) {
     return p;
 }
 
-bool gl_compute_create_context(GlComputeContext* ctx) {
+bool gl_compute_create_context(GlComputeContext* ctx, void* hShareContext,
+                               void* hShareDC) {
     if (!ctx) return false;
 
     /* Step 1: Register a window class for the hidden window. */
@@ -119,21 +121,34 @@ bool gl_compute_create_context(GlComputeContext* ctx) {
         return false;
     }
 
-    /* Step 3: Set a basic pixel format for the dummy context. */
+    /* Step 3: Set a pixel format for the dummy context.
+     * If the caller provides the display DC, copy its pixel format so that
+     * wglCreateContextAttribsARB finds compatible formats on both sides.
+     * Pixel-format mismatch is the most common cause of err=0 failures. */
     PIXELFORMATDESCRIPTOR pfd = {};
-    pfd.nSize        = sizeof(pfd);
-    pfd.nVersion     = 1;
-    pfd.dwFlags      = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
-    pfd.iPixelType   = PFD_TYPE_RGBA;
-    pfd.cColorBits   = 32;
-    pfd.cDepthBits   = 24;
-    pfd.iLayerType   = PFD_MAIN_PLANE;
-
-    int fmt = ChoosePixelFormat(ctx->hdc, &pfd);
-    if (!fmt || !SetPixelFormat(ctx->hdc, fmt, &pfd)) {
-        snprintf(ctx->error, sizeof(ctx->error),
-                 "SetPixelFormat failed (err=%lu)", GetLastError());
-        return false;
+    pfd.nSize    = sizeof(pfd);
+    pfd.nVersion = 1;
+    int fmt = 0;
+    if (hShareDC) {
+        int share_fmt = GetPixelFormat((HDC)hShareDC);
+        if (share_fmt > 0) {
+            DescribePixelFormat((HDC)hShareDC, share_fmt, sizeof(pfd), &pfd);
+            fmt = share_fmt;
+            SetPixelFormat(ctx->hdc, fmt, &pfd);  /* may fail if already set */
+        }
+    }
+    if (!fmt) {
+        pfd.dwFlags    = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER;
+        pfd.iPixelType = PFD_TYPE_RGBA;
+        pfd.cColorBits = 32;
+        pfd.cDepthBits = 24;
+        pfd.iLayerType = PFD_MAIN_PLANE;
+        fmt = ChoosePixelFormat(ctx->hdc, &pfd);
+        if (!fmt || !SetPixelFormat(ctx->hdc, fmt, &pfd)) {
+            snprintf(ctx->error, sizeof(ctx->error),
+                     "SetPixelFormat failed (err=%lu)", GetLastError());
+            return false;
+        }
     }
 
     /* Step 4: Create a dummy legacy context to bootstrap wglCreateContextAttribsARB. */
@@ -165,10 +180,22 @@ bool gl_compute_create_context(GlComputeContext* ctx) {
         WGL_CONTEXT_MAJOR_VERSION_ARB, 4,
         WGL_CONTEXT_MINOR_VERSION_ARB, 3,
         WGL_CONTEXT_PROFILE_MASK_ARB,  WGL_CONTEXT_CORE_PROFILE_BIT_ARB,
-        WGL_CONTEXT_FLAGS_ARB,         WGL_CONTEXT_FORWARD_COMPATIBLE_BIT_ARB,
         0
     };
-    ctx->hglrc = wglCreateContextAttribsARB(ctx->hdc, nullptr, attribs);
+    ctx->hglrc = wglCreateContextAttribsARB(ctx->hdc, (HGLRC)hShareContext, attribs);
+    if (!ctx->hglrc && hShareContext) {
+        /* Sharing failed (e.g. share context is current on another thread, or
+         * pixel-format mismatch despite best efforts).  Retry without sharing
+         * so at least compute shaders work; GPU-direct UV blit will be skipped
+         * but the CPU readback fallback path remains active. */
+        fprintf(stderr, "[gpu-dispatch] shared context failed (err=%lu), retrying without share\n",
+                GetLastError()); fflush(stderr);
+        ctx->hglrc = wglCreateContextAttribsARB(ctx->hdc, nullptr, attribs);
+        if (ctx->hglrc) {
+            /* Mark that sharing is unavailable so callers can skip blit setup. */
+            snprintf(ctx->error, sizeof(ctx->error), "no-share");
+        }
+    }
 
     /* Step 7: Tear down the dummy context. */
     wglMakeCurrent(nullptr, nullptr);
@@ -247,6 +274,7 @@ bool gl_compute_load_procs(void) {
     LOAD(glc_Uniform1ui,       PFNGLUNIFORM1UIPROC,       glUniform1ui)
     LOAD(glc_Uniform1iv,       PFNGLUNIFORM1IVPROC,       glUniform1iv)
     LOAD(glc_Uniform1fv,       PFNGLUNIFORM1FVPROC,       glUniform1fv)
+    LOAD(glc_Uniform3fv,       PFNGLUNIFORM3FVPROC,       glUniform3fv)
     LOAD(glc_Uniform4fv,       PFNGLUNIFORM4FVPROC,       glUniform4fv)
     LOAD(glc_Uniform2iv,       PFNGLUNIFORM2IVPROC,       glUniform2iv)
 
@@ -309,7 +337,7 @@ GLuint gl_compute_build_program(const char* glsl_source, char* err_out, int err_
 
 #else  /* !_WIN32 — stub implementation for non-Windows platforms */
 
-bool gl_compute_create_context(GlComputeContext* ctx) {
+bool gl_compute_create_context(GlComputeContext* ctx, void* /*hShareContext*/) {
     if (ctx) snprintf(ctx->error, sizeof(ctx->error),
                       "gl_compute: not supported on this platform");
     return false;

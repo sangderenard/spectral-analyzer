@@ -500,6 +500,11 @@ struct PyRayTracer
     bool        _use_gpu_compute = false;
     bool        _gpu_all_stages  = false;
     std::string _shader_dir;
+    uint64_t    _gl_display_hglrc = 0;  /* Pygame display HGLRC for WGL object sharing */
+    uint64_t    _gl_display_hdc   = 0;  /* Pygame display HDC for pixel-format matching */
+    std::array<float, MAX_SPECTRAL_BANDS * 3> _uv_blit_weights{};
+    int         _uv_blit_n_bands = 0;
+    int         _uv_blit_mode = 0;
 
     RayPipelineState* _get_pipeline(int max_children = 2, int seed = 42) {
         std::lock_guard<std::mutex> lk(_pipeline_mu);
@@ -512,6 +517,8 @@ struct PyRayTracer
             cfg.use_gpu_compute  = _use_gpu_compute;
             cfg.gpu_all_stages   = _gpu_all_stages;
             cfg.shader_dir       = _shader_dir;
+            cfg.gl_display_hglrc = _gl_display_hglrc;
+            cfg.gl_display_hdc   = _gl_display_hdc;
             _pipeline = ray_pipeline_create(handle, &cfg);
             if (!_pipeline)
                 throw std::runtime_error("ray_pipeline_create failed");
@@ -520,6 +527,10 @@ struct PyRayTracer
                 ray_pipeline_configure_sensor_image(
                     _pipeline, _sensor_plate_x, _sensor_plate_r,
                     _sensor_res, _sensor_bdpt_eps);
+            if (_uv_blit_n_bands > 0)
+                ray_pipeline_set_uv_blit_weights(
+                    _pipeline, _uv_blit_weights.data(),
+                    _uv_blit_n_bands, _uv_blit_mode);
         }
         return _pipeline;
     }
@@ -5596,6 +5607,65 @@ Full channel layout and UV_CH_* indices are documented in ray_tracer.h.
                  return groups;
              },
              "List UV accumulator groups with cheap telemetry.")
+        /* ── WGL context sharing / GPU-direct UV blit ─────────────────────── */
+        .def("set_gl_display_hglrc",
+             [](PyRayTracer& self, uint64_t h) {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 self._gl_display_hglrc = h;
+                 if (self._pipeline)
+                     fprintf(stderr, "[warn] set_gl_display_hglrc called after pipeline "
+                             "created — has no effect on this session\n");
+             },
+             py::arg("hglrc"),
+             "Set display HGLRC for WGL object sharing.  Call before first submit_rays.")
+        .def("set_gl_display_hdc",
+             [](PyRayTracer& self, uint64_t h) {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 self._gl_display_hdc = h;
+                 if (self._pipeline)
+                     fprintf(stderr, "[warn] set_gl_display_hdc called after pipeline "
+                             "created — has no effect on this session\n");
+             },
+             py::arg("hdc"),
+             "Set display HDC for pixel-format matching.  Call before first submit_rays.")
+        .def("get_uv_pages_tex_id",
+             [](PyRayTracer& self) -> uint64_t {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 return ray_pipeline_get_uv_pages_tex_id(self._pipeline);
+             },
+             R"doc(Return the OpenGL texture object ID of the shared tex_uv_pages
+TEXTURE_2D_ARRAY (RGBA16F).  Returns 0 if WGL sharing is not active or the
+pipeline has not been initialised yet.  When non-zero the texture is already
+owned by the shared GL namespace — bind it directly in the display context for
+zero-copy UV visualisation.)doc")
+        .def("set_uv_blit_weights",
+             [](PyRayTracer& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> weights,
+                int mode) {
+                 auto b = weights.request();
+                 if (b.ndim != 2 || b.shape[1] != 3)
+                     throw std::invalid_argument(
+                         "weights must be float32 shape (n_bands, 3)");
+                 const int nb = (int)b.shape[0];
+                 if (nb < 1 || nb > MAX_SPECTRAL_BANDS)
+                     throw std::invalid_argument("n_bands must be in [1, MAX_SPECTRAL_BANDS]");
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 std::copy_n(static_cast<const float*>(b.ptr),
+                             static_cast<size_t>(nb) * 3,
+                             self._uv_blit_weights.data());
+                 self._uv_blit_n_bands = nb;
+                 self._uv_blit_mode = mode;
+                 if (self._pipeline)
+                     ray_pipeline_set_uv_blit_weights(
+                         self._pipeline, self._uv_blit_weights.data(), nb, mode);
+             },
+             py::arg("weights"),
+             py::arg("mode") = 0,
+             R"doc(Upload per-band RGB weights for the GPU UV blit shader.
+weights : float32 ndarray of shape (n_bands, 3) — each row is [r, g, b] weight
+          for mapping one spectral band's magnitude to sRGB.  Typically from
+          _wavelength_to_rgb_weights(freq_hz).
+mode    : 0 = combined (fwd+sensor), 1 = forward only, 2 = sensor only.)doc")
         /* ── Bidirectional integrator ──────────────────────────────── */
         .def("bidirectional",
              [](PyRayTracer& self, int n_rays_per_emitter, int max_bounces,

@@ -570,7 +570,7 @@ struct RayPipelineState;
 /* Number of spectral bands in the associated tracer (0 if none). */
 int ray_pipeline_n_bands(const RayPipelineState* ps);
 
-/* Return the GL texture object ID of the shared tex_uv_pages array (0 if not active). */
+/* Return the latest completed shared UV texture object ID (0 if none is ready). */
 uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps);
 
 /* Upload per-band RGB weights for the GPU UV blit shader.
@@ -581,6 +581,15 @@ void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,
                                        const float* weights,
                                        int n_bands,
                                        int mode);
+
+/* Feed display frame timing back into the GPU producer governor.
+ * frame_ms  : most recent interactive frame time.
+ * target_ms : desired frame budget, e.g. 16.667 for 60 Hz or 33.333 for 30 Hz.
+ * The pipeline responds by shrinking/growing GPU batch sizes and UV update cadence.
+ */
+void ray_pipeline_report_display_frame_time(RayPipelineState* ps,
+                                            double frame_ms,
+                                            double target_ms);
 
 /* mat_idx of triangle tri_idx (-1 if ps/st is null or index out of range). */
 int ray_pipeline_tri_mat_idx(const RayPipelineState* ps, int tri_idx);

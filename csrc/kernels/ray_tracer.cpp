@@ -6176,10 +6176,17 @@ public:
     /* Shader programs for each stage */
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
 
-    /* UV blit shader + shared display texture (valid only when WGL context sharing
+    /* UV blit shader + shared display textures (valid only when WGL context sharing
      * is active — i.e. ps.cfg.gl_display_hglrc != 0 and prog_uv_blit != 0). */
     GLuint prog_uv_blit  = 0;
-    GLuint tex_uv_pages  = 0;   /* GL_TEXTURE_2D_ARRAY RGBA16F, shared with display ctx */
+    static constexpr int UV_TEX_RING = 3;
+    std::array<GLuint, UV_TEX_RING> tex_uv_pages = {}; /* shared GL_TEXTURE_2D_ARRAY ring */
+    std::array<GLsync, UV_TEX_RING> uv_fences = {};
+    int    uv_build_slot = 0;
+    int    uv_active_slot = -1;
+    int    uv_pending_slot = -1;
+    uint64_t uv_generation = 0;
+    mutable std::mutex uv_publish_mu;
     int    blit_n_layers = 0;   /* layer count the texture was allocated for */
     int    blit_res      = 0;   /* texel resolution (res×res per layer)                 */
     bool   display_context_shared = false;
@@ -6268,7 +6275,7 @@ public:
     struct SensorUpdate { int iy, iz; double ch1, ch2; };
     std::vector<SensorUpdate> stg_sensor_updates; /* precomputed sensor updates, outside lock */
     std::chrono::steady_clock::time_point last_uv_readback_t = std::chrono::steady_clock::now();
-    double uv_readback_interval_s = 1.0;
+    std::atomic<double> uv_readback_interval_s{1.0};
 
     /* Scene data uploaded once */
     bool scene_uploaded = false;
@@ -6612,23 +6619,37 @@ public:
             }
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-            /* Allocate shared tex_uv_pages when WGL context sharing is active.
-             * The texture lives in the shared object namespace so the display
-             * context can sample it after the blit shader writes to it. */
+            /* Allocate shared tex_uv_pages ring when WGL context sharing is active.
+             * The display samples only a completed generation; the worker writes a
+             * different slot so a render frame never reads the texture being built. */
             if (prog_uv_blit != 0 && display_context_shared) {
                 const int ng  = (int)st.group_uv_res.size();
                 const int res = (ng > 0) ? st.group_uv_res[0] : 512;
                 if (ng != blit_n_layers || res != blit_res) {
-                    if (tex_uv_pages) { glDeleteTextures(1, &tex_uv_pages); tex_uv_pages = 0; }
+                    for (GLsync& f : uv_fences) {
+                        if (f && glc_DeleteSync) glc_DeleteSync(f);
+                        f = nullptr;
+                    }
+                    for (GLuint& tex : tex_uv_pages) {
+                        if (tex) { glDeleteTextures(1, &tex); tex = 0; }
+                    }
+                    uv_build_slot = 0;
+                    uv_active_slot = -1;
+                    uv_pending_slot = -1;
                     if (ng > 0) {
-                        glGenTextures(1, &tex_uv_pages);
-                        glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages);
-                        glc_TexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA16F, res, res, ng);
-                        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                        glGenTextures(UV_TEX_RING, tex_uv_pages.data());
+                        for (GLuint tex : tex_uv_pages) {
+                            glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+                            glc_TexStorage3D(GL_TEXTURE_2D_ARRAY, 1, GL_RGBA16F, res, res, ng);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+                            glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                        }
                         glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
                         blit_n_layers = ng;
                         blit_res      = res;
+                    } else {
+                        blit_n_layers = 0;
+                        blit_res      = 0;
                     }
                 }
             }
@@ -6639,12 +6660,32 @@ public:
 
     /* ── dispatch_uv_blit: GPU-direct accumulator → RGBA16F display texture ─ */
     void dispatch_uv_blit(RayPipelineState& ps) {
-        if (!prog_uv_blit || !tex_uv_pages || blit_n_layers <= 0) return;
+        if (!prog_uv_blit || blit_n_layers <= 0) return;
+        int slot = -1;
+        {
+            std::lock_guard<std::mutex> lk(uv_publish_mu);
+            if (uv_pending_slot >= 0) return; /* Display has not adopted the prior generation. */
+            for (int i = 0; i < UV_TEX_RING; ++i) {
+                const int cand = (uv_build_slot + i) % UV_TEX_RING;
+                if (cand != uv_active_slot && tex_uv_pages[(size_t)cand] != 0) {
+                    slot = cand;
+                    break;
+                }
+            }
+            if (slot < 0) return;
+            uv_build_slot = (slot + 1) % UV_TEX_RING;
+            if (uv_fences[(size_t)slot] && glc_DeleteSync) {
+                glc_DeleteSync(uv_fences[(size_t)slot]);
+                uv_fences[(size_t)slot] = nullptr;
+            }
+        }
         const RayTracerState& st = *ps.st;
         const int n_uv_groups  = (int)st.group_uv_res.size();
         const int uv_meta_base = (int)st.tri_uv_group_of_tri.size();
         const int nb           = (blit_n_bands_stored > 0) ? blit_n_bands_stored : st.n_bands;
         const int res          = blit_res;
+        const GLuint tex       = tex_uv_pages[(size_t)slot];
+        if (!tex) return;
 
         /* Ensure T3 image stores are visible before we read the SSBO. */
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -6652,7 +6693,7 @@ public:
         /* Bind resources */
         glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_uv_accum);
         glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_tri_uv_and_meta);
-        glc_BindImageTexture(UV_BLIT_IMAGE_UNIT, tex_uv_pages, 0, GL_TRUE, 0,
+        glc_BindImageTexture(UV_BLIT_IMAGE_UNIT, tex, 0, GL_TRUE, 0,
                              GL_WRITE_ONLY, GL_RGBA16F);
 
         glc_UseProgram(prog_uv_blit);
@@ -6669,11 +6710,40 @@ public:
 
         /* Ensure image writes complete before the display context reads the texture. */
         glc_MemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+        GLsync fence = glc_FenceSync ? glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0) : nullptr;
+        {
+            std::lock_guard<std::mutex> lk(uv_publish_mu);
+            uv_fences[(size_t)slot] = fence;
+            uv_pending_slot = slot;
+            ++uv_generation;
+        }
     }
 
-    /* Return the GL texture object ID of tex_uv_pages (0 if not allocated). */
-    uint64_t get_uv_pages_tex_id() const {
-        return display_context_shared ? (uint64_t)tex_uv_pages : 0u;
+    /* Return the latest completed UV texture ID without blocking the display context. */
+    uint64_t get_uv_pages_tex_id() {
+        if (!display_context_shared) return 0u;
+        std::lock_guard<std::mutex> lk(uv_publish_mu);
+        if (uv_pending_slot >= 0) {
+            GLsync fence = uv_fences[(size_t)uv_pending_slot];
+            GLenum rc = GL_ALREADY_SIGNALED;
+            if (fence && glc_ClientWaitSync)
+                rc = glc_ClientWaitSync(fence, 0, 0);
+            if (rc == GL_ALREADY_SIGNALED || rc == GL_CONDITION_SATISFIED) {
+                if (fence && glc_DeleteSync)
+                    glc_DeleteSync(fence);
+                uv_fences[(size_t)uv_pending_slot] = nullptr;
+                uv_active_slot = uv_pending_slot;
+                uv_pending_slot = -1;
+            } else if (rc == GL_WAIT_FAILED) {
+                if (fence && glc_DeleteSync)
+                    glc_DeleteSync(fence);
+                uv_fences[(size_t)uv_pending_slot] = nullptr;
+                uv_pending_slot = -1;
+            }
+        }
+        if (uv_active_slot < 0) return 0u;
+        return (uint64_t)tex_uv_pages[(size_t)uv_active_slot];
     }
 
     /* ── dispatch_t1_t2_t3: run one GPU batch through T1→T2→T3 ──────────── */
@@ -6865,7 +6935,8 @@ public:
          * the next scheduled readback.                                      */
         const auto uv_now = Clock::now();
         const bool do_uv_readback = n_uv_groups > 0 && st.uv_accum_total > 0
-            && std::chrono::duration<double>(uv_now - last_uv_readback_t).count() >= uv_readback_interval_s;
+            && std::chrono::duration<double>(uv_now - last_uv_readback_t).count() >=
+               uv_readback_interval_s.load(std::memory_order_relaxed);
         if (do_uv_readback) {
             last_uv_readback_t = uv_now;
             const GLsizeiptr accum_sz = (GLsizeiptr)((size_t)st.uv_accum_total * sizeof(uint32_t));
@@ -6879,7 +6950,7 @@ public:
                 uv_accum_add(st.uv_accum_cpu[i], gpu_acc[i]);
             /* GPU-direct display blit: write ssbo_uv_accum → tex_uv_pages directly
              * (no CPU round-trip) when WGL context sharing is active. */
-            if (prog_uv_blit && tex_uv_pages)
+            if (prog_uv_blit && blit_n_layers > 0)
                 dispatch_uv_blit(ps);
 
             /* Zero the GPU accumulator for the next dispatch. */
@@ -8397,7 +8468,7 @@ int ray_pipeline_drain_refined(RayPipelineState* ps,
 uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps)
 {
     if (!ps || !ps->gpu_dispatch) return 0;
-    return ps->gpu_dispatch->get_uv_pages_tex_id();
+    return const_cast<RayPipelineState::GlPipelineDispatch*>(ps->gpu_dispatch)->get_uv_pages_tex_id();
 }
 
 void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,
@@ -8411,6 +8482,43 @@ void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,
     std::copy_n(weights, (size_t)n_bands * 3, gd->blit_rgb_weights.data());
     gd->blit_n_bands_stored = n_bands;
     gd->blit_mode = mode;
+}
+
+void ray_pipeline_report_display_frame_time(RayPipelineState* ps,
+                                            double frame_ms,
+                                            double target_ms)
+{
+    if (!ps || frame_ms <= 0.0) return;
+    if (target_ms <= 0.0) target_ms = 16.667;
+    const bool spiked = frame_ms > target_ms * 1.15;
+    const bool stable = frame_ms < target_ms * 0.80;
+
+    auto shrink_batch = [](StageStats& s) {
+        int cur = s.batch_sz_gpu.load(std::memory_order_relaxed);
+        int next = std::max(256, cur / 2);
+        if (next != cur) s.batch_sz_gpu.store(next, std::memory_order_relaxed);
+    };
+    auto grow_batch = [](StageStats& s) {
+        int cur = s.batch_sz_gpu.load(std::memory_order_relaxed);
+        int next = std::min(65536, cur + std::max(64, cur / 8));
+        if (next != cur) s.batch_sz_gpu.store(next, std::memory_order_relaxed);
+    };
+
+    if (spiked) {
+        for (StageStats& s : ps->stats) shrink_batch(s);
+        if (ps->gpu_dispatch) {
+            double cur = ps->gpu_dispatch->uv_readback_interval_s.load(std::memory_order_relaxed);
+            ps->gpu_dispatch->uv_readback_interval_s.store(std::min(5.0, cur * 1.25),
+                                                           std::memory_order_relaxed);
+        }
+    } else if (stable) {
+        for (StageStats& s : ps->stats) grow_batch(s);
+        if (ps->gpu_dispatch) {
+            double cur = ps->gpu_dispatch->uv_readback_interval_s.load(std::memory_order_relaxed);
+            ps->gpu_dispatch->uv_readback_interval_s.store(std::max(0.25, cur * 0.95),
+                                                           std::memory_order_relaxed);
+        }
+    }
 }
 
 void ray_pipeline_set_shuffle(RayPipelineState* ps, float shuffle_frac)

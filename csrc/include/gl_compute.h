@@ -85,6 +85,21 @@ typedef unsigned int   GLbitfield;
 #ifndef GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
 #  define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT  0x00000020
 #endif
+#ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
+#  define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117
+#endif
+#ifndef GL_ALREADY_SIGNALED
+#  define GL_ALREADY_SIGNALED 0x911A
+#endif
+#ifndef GL_TIMEOUT_EXPIRED
+#  define GL_TIMEOUT_EXPIRED 0x911B
+#endif
+#ifndef GL_CONDITION_SATISFIED
+#  define GL_CONDITION_SATISFIED 0x911C
+#endif
+#ifndef GL_WAIT_FAILED
+#  define GL_WAIT_FAILED 0x911D
+#endif
 #ifndef GL_READ_WRITE
 #  define GL_READ_WRITE                   0x88BA
 #endif
@@ -110,6 +125,7 @@ typedef unsigned int   GLbitfield;
 typedef ptrdiff_t  GLintptr;
 typedef ptrdiff_t  GLsizeiptr;
 typedef char       GLchar;
+typedef struct __GLsync* GLsync;
 
 /* ── Headless context struct ─────────────────────────────────────────────── */
 
@@ -209,6 +225,9 @@ typedef void    (APIENTRY* PFNGLUNIFORM2IVPROC)(GLint location, GLsizei count, c
 
 typedef void    (APIENTRY* PFNGLDISPATCHCOMPUTEPROC)(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z);
 typedef void    (APIENTRY* PFNGLMEMORYBARRIERPROC)(GLbitfield barriers);
+typedef GLsync  (APIENTRY* PFNGLFENCESYNCPROC)(GLenum condition, GLbitfield flags);
+typedef GLenum  (APIENTRY* PFNGLCLIENTWAITSYNCPROC)(GLsync sync, GLbitfield flags, uint64_t timeout);
+typedef void    (APIENTRY* PFNGLDELETESYNCPROC)(GLsync sync);
 
 /* GL 4.2 image textures */
 typedef void    (APIENTRY* PFNGLBINDIMAGETEXTUREPROC)(GLuint unit, GLuint texture, GLint level,
@@ -261,6 +280,9 @@ extern PFNGLUNIFORM2IVPROC          glc_Uniform2iv;
 
 extern PFNGLDISPATCHCOMPUTEPROC     glc_DispatchCompute;
 extern PFNGLMEMORYBARRIERPROC       glc_MemoryBarrier;
+extern PFNGLFENCESYNCPROC           glc_FenceSync;
+extern PFNGLCLIENTWAITSYNCPROC      glc_ClientWaitSync;
+extern PFNGLDELETESYNCPROC          glc_DeleteSync;
 
 extern PFNGLBINDIMAGETEXTUREPROC    glc_BindImageTexture;
 extern PFNGLTEXSTORAGE3DPROC        glc_TexStorage3D;

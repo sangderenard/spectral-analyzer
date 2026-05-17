@@ -2071,6 +2071,12 @@ struct PyRayTracer
         return out;
     }
 
+    void report_display_frame_time(double frame_ms, double target_ms = 16.667)
+    {
+        if (_pipeline)
+            ray_pipeline_report_display_frame_time(_pipeline, frame_ms, target_ms);
+    }
+
     /**
      * integrate_ir(src_pos, src_dir, src_directivity,
      *              rec_pos, rec_aperture_r,
@@ -4952,6 +4958,12 @@ Zero means all previously submitted rays have completed.)doc")
 R"doc(Snapshot of pipeline throughput/batch-size/queue-depth for all four stages.
 Returns dict with keys t1, t2, t3, t4 (each a dict with throughput, processed,
 batch_size, queue_depth) plus output_queue_depth and in_flight.)doc")
+        .def("report_display_frame_time", &PyRayTracer::report_display_frame_time,
+             py::arg("frame_ms"),
+             py::arg("target_ms") = 16.667,
+R"doc(Feed display frame timing into the GPU producer governor.
+Call once per interactive frame; spikes shrink GPU batch sizes and slow UV
+updates, while stable frames cautiously restore throughput.)doc")
         .def("drain_records_slim", &PyRayTracer::drain_records_slim,
              py::arg("max_n") = 50000,
 R"doc(Non-blocking slim drain: returns only the 7 arrays needed for voxel accumulation.
@@ -5665,9 +5677,10 @@ Full channel layout and UV_CH_* indices are documented in ray_tracer.h.
              },
              R"doc(Return the OpenGL texture object ID of the shared tex_uv_pages
 TEXTURE_2D_ARRAY (RGBA16F).  Returns 0 if WGL sharing is not active or the
-pipeline has not been initialised yet.  When non-zero the texture is already
-owned by the shared GL namespace — bind it directly in the display context for
-zero-copy UV visualisation.)doc")
+pipeline has not been initialised or no completed generation is ready yet.
+When non-zero the texture is already owned by the shared GL namespace and the
+fence for that generation has signaled; bind it directly in the display context
+for zero-copy UV visualisation.)doc")
         .def("set_uv_blit_weights",
              [](PyRayTracer& self,
                 py::array_t<float, py::array::c_style | py::array::forcecast> weights,

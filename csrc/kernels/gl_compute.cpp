@@ -52,6 +52,9 @@ PFNGLUNIFORM2IVPROC         glc_Uniform2iv         = nullptr;
 
 PFNGLDISPATCHCOMPUTEPROC    glc_DispatchCompute    = nullptr;
 PFNGLMEMORYBARRIERPROC      glc_MemoryBarrier      = nullptr;
+PFNGLFENCESYNCPROC          glc_FenceSync          = nullptr;
+PFNGLCLIENTWAITSYNCPROC     glc_ClientWaitSync     = nullptr;
+PFNGLDELETESYNCPROC         glc_DeleteSync         = nullptr;
 
 PFNGLBINDIMAGETEXTUREPROC   glc_BindImageTexture   = nullptr;
 PFNGLTEXSTORAGE3DPROC       glc_TexStorage3D       = nullptr;
@@ -296,6 +299,9 @@ bool gl_compute_load_procs(void) {
 
     LOAD(glc_DispatchCompute,  PFNGLDISPATCHCOMPUTEPROC,  glDispatchCompute)
     LOAD(glc_MemoryBarrier,    PFNGLMEMORYBARRIERPROC,    glMemoryBarrier)
+    LOAD(glc_FenceSync,        PFNGLFENCESYNCPROC,         glFenceSync)
+    LOAD(glc_ClientWaitSync,   PFNGLCLIENTWAITSYNCPROC,    glClientWaitSync)
+    LOAD(glc_DeleteSync,       PFNGLDELETESYNCPROC,        glDeleteSync)
 
     LOAD(glc_BindImageTexture, PFNGLBINDIMAGETEXTUREPROC, glBindImageTexture)
     LOAD(glc_TexStorage3D,     PFNGLTEXSTORAGE3DPROC,     glTexStorage3D)

@@ -2877,6 +2877,11 @@ class ForwardCppLensBench:
         self._vis_buf     = np.zeros((_VIS_CAP, 5), dtype=np.float32)
         self._vis_ptr     = 0     # next write position (ring head)
         self._vis_full    = False  # True once ring has wrapped at least once
+        self._forward_img_res = int(max(16, int(self.scene.image_plate.sensor_res)))
+        self._forward_img_accum = np.zeros((self._forward_img_res, self._forward_img_res, 3), dtype=np.float32)
+        self._forward_img_gain = 0.035
+        self._reverse_img_accum = np.zeros_like(self._forward_img_accum)
+        self._reverse_img_gain = 0.035
         # Tunable amplitude floor: rays (and child spawns) below this threshold
         # are terminated.  Also used for material epsilon-kill pre-flagging.
         self._min_amplitude: float = 1e-5
@@ -3923,6 +3928,43 @@ class ForwardCppLensBench:
             amp_v_all    = amp_v
             disp_cls_all = disp_class
 
+        def _records_to_preview(mask: np.ndarray, dst: np.ndarray) -> None:
+            if not np.any(mask):
+                return
+            plate = self.scene.image_plate
+            pr = float(max(1.0e-9, plate.radius))
+            p = vm_pos[mask]
+            in_disc = (p[:, 1] * p[:, 1] + p[:, 2] * p[:, 2]) <= (pr * pr)
+            m_img = in_disc
+            if np.any(m_img):
+                p_img = p[m_img]
+                re_img = vm_re[mask][m_img]
+                im_img = vm_im[mask][m_img]
+                nb_img = min(int(re_img.shape[1]), self.n_bands)
+                if nb_img > 0:
+                    mag = np.sqrt(np.maximum(0.0, re_img[:, :nb_img] ** 2 + im_img[:, :nb_img] ** 2))
+                    wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:nb_img], dtype=np.float64), EPS)) * 1.0e9
+                    rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
+                    rgb = np.einsum("nb,bc->nc", mag, rgb_w[:nb_img], optimize=True).astype(np.float32)
+                else:
+                    rgb = np.repeat(amp_v[mask][m_img, None], 3, axis=1).astype(np.float32)
+                res = int(self._forward_img_res)
+                iy = np.clip(((p_img[:, 1] + pr) / (2.0 * pr) * res).astype(np.int32), 0, res - 1)
+                iz = np.clip(((p_img[:, 2] + pr) / (2.0 * pr) * res).astype(np.int32), 0, res - 1)
+                with self._segs_lock:
+                    rows = res - 1 - iz
+                    for ch in range(3):
+                        np.add.at(dst[:, :, ch], (rows, iy), rgb[:, ch])
+
+        # Pure preview feeds: project all strike records into the image-plane Y/Z
+        # grid.  Do not require the ray to hit the image plate; this is a live
+        # diagnostic of the forward/reverse ray distributions before final image
+        # formation rules are trusted.
+        fwd_strike = (vm_kinds == 0) & (vm_cflags == 0)
+        rev_strike = (vm_kinds == 0) & (vm_cflags == 1)
+        _records_to_preview(fwd_strike, self._forward_img_accum)
+        _records_to_preview(rev_strike, self._reverse_img_accum)
+
         # Pack raw hit positions into ring-buffer rows: (x, y, z, amp, class)
         pts = np.empty((vm_pos_all.shape[0], 5), dtype=np.float32)
         pts[:, :3] = vm_pos_all
@@ -3959,6 +4001,20 @@ class ForwardCppLensBench:
         """Return last captured backend BDPT endpoint records (N, 16)."""
         with self._trace_lock:
             return self._last_bdpt_records
+
+    def get_forward_strike_image(self) -> np.ndarray:
+        """Return the pure forward-traced image-plate accumulation preview."""
+        with self._segs_lock:
+            img = self._forward_img_accum.copy()
+        disp = np.log1p(np.maximum(img, 0.0) * float(self._forward_img_gain))
+        return np.ascontiguousarray(disp / (1.0 + disp), dtype=np.float32)
+
+    def get_reverse_strike_image(self) -> np.ndarray:
+        """Return the pure reverse-traced strike distribution preview."""
+        with self._segs_lock:
+            img = self._reverse_img_accum.copy()
+        disp = np.log1p(np.maximum(img, 0.0) * float(self._reverse_img_gain))
+        return np.ascontiguousarray(disp / (1.0 + disp), dtype=np.float32)
 
     def build_all_prospective_reverse_segments(
         self,
@@ -5847,6 +5903,15 @@ def run(
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, _pip_res, _pip_res, 0,
                  GL_RGB, GL_FLOAT, _pip_blank)
 
+    tex_forward_pip = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex_forward_pip)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, _pip_res, _pip_res, 0,
+                 GL_RGB, GL_FLOAT, _pip_blank)
+
     # ── Per-physical-group analytical UV page array ─────────────────────────
     tex_uv_pages = glGenTextures(1)
     _uv_layers = max(1, len(bench.uv_page_bank.groups) if bench.uv_page_bank is not None else 1)
@@ -5968,9 +6033,11 @@ def run(
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, _hud_blank)
 
-    # PIP viewport: square centred horizontally, near top of window.
+    # PIP viewports: reverse sensor feed + forward strike image, near top of window.
     _pip_dim = int(min(W * 0.22, H * 0.22))
-    _pip_vx  = (W - _pip_dim) // 2
+    _pip_gap = 10
+    _pip_vx  = (W - (2 * _pip_dim + _pip_gap)) // 2
+    _uv_pip_vx = _pip_vx + _pip_dim + _pip_gap
     _pip_vy  = 6
 
     # Lazy font for PIP stats overlay – created on first draw to avoid init cost.
@@ -5979,7 +6046,8 @@ def run(
     _u_border_col  = glGetUniformLocation(pip_prog, "u_border_col")
 
     def _draw_quad_with_pip_prog(tex: int, vx: int, vy: int, vw: int, vh: int,
-                                 hud_mode: bool = False) -> None:
+                                 hud_mode: bool = False,
+                                 border_col: tuple[float, float, float] = (0.35, 0.85, 1.0)) -> None:
         """Draw a fullscreen quad in the given viewport using pip_prog."""
         glViewport(vx, vy, vw, vh)
         glUseProgram(pip_prog)
@@ -5987,7 +6055,7 @@ def run(
         glBindTexture(GL_TEXTURE_2D, tex)
         glUniform1i(glGetUniformLocation(pip_prog, "u_pip"), 0)
         glUniform1f(_u_border, 1.0 if hud_mode else 0.0)
-        glUniform3f(_u_border_col, 0.35, 0.85, 1.0)   # cyan border
+        glUniform3f(_u_border_col, *border_col)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE if not hud_mode else GL_ONE_MINUS_SRC_ALPHA)
         glEnableClientState(GL_VERTEX_ARRAY)
@@ -5998,7 +6066,10 @@ def run(
         glUseProgram(0)
 
     def draw_pip() -> None:
-        img = bench.tracer.get_sensor_image()   # (res, res, 3) float32 [0,1]
+        img = bench.get_reverse_strike_image()
+        cpp_img = bench.tracer.get_sensor_image()   # resolved reverse/BDPT sensor image
+        if cpp_img.shape[0] > 0 and float(np.max(cpp_img)) > 0.0:
+            img = np.maximum(img, cpp_img)
         has_img = img.shape[0] > 0
 
         if has_img:
@@ -6010,6 +6081,16 @@ def run(
         # When sensor has no data yet the quad draws a pure cyan border on
         # transparent background (additive over the scene), which is visible.
         _draw_quad_with_pip_prog(tex_pip, _pip_vx, _pip_vy, _pip_dim, _pip_dim)
+
+        fwd_img = bench.get_forward_strike_image()
+        if fwd_img.shape[0] > 0:
+            glBindTexture(GL_TEXTURE_2D, tex_forward_pip)
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fwd_img.shape[1], fwd_img.shape[0],
+                            GL_RGB, GL_FLOAT, fwd_img)
+        _draw_quad_with_pip_prog(
+            tex_forward_pip, _uv_pip_vx, _pip_vy, _pip_dim, _pip_dim,
+            border_col=(1.00, 0.62, 0.18),
+        )
 
         # --- BDPT stats text rendered as a texture quad above the PIP ---
         try:
@@ -6510,6 +6591,7 @@ def run(
         gc.collect()
         glDeleteTextures(1, [tex_field])
         glDeleteTextures(1, [tex_pip])
+        glDeleteTextures(1, [tex_forward_pip])
         glDeleteTextures(1, [tex_hud])
         glDeleteTextures(1, [tex_uv_pages])
         if _mesh_vbo[0] is not None:

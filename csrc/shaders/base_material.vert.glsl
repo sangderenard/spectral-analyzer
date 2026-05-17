@@ -40,6 +40,7 @@ uniform mat4 uMV;
 
 out vec3 vNormV;
 out vec3 vPosV;
+out vec3 vPosObj;
 flat out int vMatId;
 flat out int vGroupId;
 flat out int vCullImmune;
@@ -49,6 +50,7 @@ void main() {
     vec4 posV   = uMV  * vec4(aPos, 1.0);
     vPosV       = posV.xyz;
     vNormV      = mat3(uMV) * aNorm;
+    vPosObj     = aPos;
     vMatId      = aMatId;
     vGroupId    = aGroupId;
     vCullImmune = aCullImmune;

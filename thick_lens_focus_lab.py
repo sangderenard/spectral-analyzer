@@ -2464,21 +2464,21 @@ def _build_scene_mesh(
 
     # Sensor chamber enclosure — three-piece opaque box around the entire
     # sensor plate region.  This region has NO tube wall: tube_radius (70 mm)
-    # is far smaller than the sensor (160 mm radius, 226 mm corner diagonal).
+    # is far smaller than the sensor (160 mm radius disc).
     # Without this enclosure every backward ray from an outer pixel launches
     # into open air and traverses the entire scene unchecked.
     #
-    # The sensor plate is SQUARE (±sensor_r in Y and Z), so corners reach
-    # r = sensor_r * sqrt(2).  barrel_r is set to the corner diagonal + margin
-    # so the circular barrel encloses every corner pixel.
+    # The sensor plate is a CIRCULAR DISC of radius sensor_r, so the barrel
+    # only needs a small margin over sensor_r — not the sqrt(2) diagonal that
+    # would be needed for a square sensor.
     #
     # Three pieces:
     #   1. Outer barrel cylinder  — lateral wall, exit_pupil_x → image_plate.x
     #   2. Rear annular cap       — seals face at exit_pupil_x (tube_r → barrel_r)
-    #   3. Front annular cap      — seals circular-vs-square gap at image_plate.x
+    #   3. Front annular cap      — seals disc-vs-barrel gap at image_plate.x
     #                               (sensor_r → barrel_r)
     _sensor_r  = float(scene.image_plate.radius)
-    _barrel_r  = _sensor_r * math.sqrt(2.0) + 0.010   # full diagonal + 10 mm margin
+    _barrel_r  = _sensor_r + 0.010   # 10 mm margin over circular sensor disc
     _x_ap      = float(scene.exit_pupil_x)
     _x_sensor  = float(scene.image_plate.x)
     _tube_r    = float(scene.tube_radius)
@@ -2576,12 +2576,13 @@ def _build_scene_mesh(
             ),
         ),
     )
-    _probe_r  = 0.018   # 18 mm radius sphere
-    _probe_x  = float(scene.screen_x) + _probe_r + 0.002   # just behind the sensor plate
-    _probe_y  = float(scene.view_radius) * 0.85             # outside the barrel, inside view
+    _probe_r  = 0.018   # 18 mm radius
+    _probe_x  = (float(scene.object_plane.x) + float(scene.screen_x)) * 0.5  # center of display region
+    _probe_y  = float(scene.view_radius) * 0.90   # near top, inside the [0,1]³ normalized volume
+    _probe_z  = float(scene.view_radius) * 0.90   # near camera side (+Z), inside the volume
     red_probe_tri_ids: list = []
     _build_emissive_sphere(
-        center=np.array([_probe_x, _probe_y, 0.0], dtype=np.float64),
+        center=np.array([_probe_x, _probe_y, _probe_z], dtype=np.float64),
         radius=_probe_r,
         tri_list=tris,
         mat_ids=mats,
@@ -2591,7 +2592,7 @@ def _build_scene_mesh(
         tri_ids=red_probe_tri_ids,
     )
     print(
-        f"[red-probe] x={_probe_x:.4f} y={_probe_y:.4f} r={_probe_r*1e3:.1f}mm"
+        f"[red-probe] x={_probe_x:.4f} y={_probe_y:.4f} z={_probe_z:.4f} r={_probe_r*1e3:.1f}mm"
         f" tris={len(red_probe_tri_ids)} mat_idx={idx_red_probe}",
         flush=True,
     )
@@ -2603,13 +2604,16 @@ def _build_scene_mesh(
     normals = np.stack([_normal(t[0], t[1], t[2]) for t in tri_arr], axis=0).astype(np.float64)
     mat_idx = np.ascontiguousarray(np.asarray(mats, dtype=np.int32))
 
-    # Surface overlay suppression: hide source disc and walls so they do not
-    # dominate display dynamic range.
+    # Surface overlay suppression: triangles listed here are zeroed out of
+    # tri_flux before tone-mapping so they don't swamp the display dynamic
+    # range.  Add any always-emissive or structural surface that should be
+    # FIELD_EXEMPT (excluded from the field-integration overlay).
     suppress_ids = np.ascontiguousarray(
         np.concatenate([
-            np.asarray(source_tri_ids, dtype=np.int32),
+            np.asarray(source_tri_ids,    dtype=np.int32),  # FIELD_EXEMPT: primary emitter
+            np.asarray(red_probe_tri_ids, dtype=np.int32),  # FIELD_EXEMPT: debug probe
             np.asarray(silver_wall_tri_ids, dtype=np.int32),
-            np.asarray(black_wall_tri_ids, dtype=np.int32),
+            np.asarray(black_wall_tri_ids,  dtype=np.int32),
         ]),
         dtype=np.int32,
     )
@@ -2834,6 +2838,7 @@ class ForwardCppLensBench:
         self.bdpt_debug_print_counter = 0
         self._bdpt_sensor_cfg: Tuple[int, int] | None = None
         self._bdpt_source_gid = -1
+        self._bdpt_red_probe_gid = -1
         self.bdpt_last_sensor_gid = -1
         self.uv_page_bank: Optional[UvPageBank] = None
         self.bdpt_last_launched_rays = 0
@@ -2937,6 +2942,10 @@ class ForwardCppLensBench:
         self.camera_front_cap_tri_ids= np.ascontiguousarray(camera_front_cap_ids, dtype=np.int32)
         self.camera_frustum_tri_ids  = np.ascontiguousarray(camera_frustum_ids,   dtype=np.int32)
         self.red_probe_tri_ids       = np.ascontiguousarray(red_probe_ids,         dtype=np.int32)
+        self.emitter_tri_ids = np.ascontiguousarray(
+            np.concatenate([self.source_tri_ids, self.red_probe_tri_ids]).astype(np.int32),
+            dtype=np.int32,
+        )
         # tube_wall_ids = silver + black cylinder walls only (no flat caps or frustum).
         # Used for UV display so the x_cylinder UV mode stays valid (no degenerate flat discs).
         self.tube_wall_tri_ids = np.ascontiguousarray(tube_wall_ids, dtype=np.int32)
@@ -3088,11 +3097,15 @@ class ForwardCppLensBench:
             flush=True,
         )
         
-        # Suppress walls AND lens faces from the surface overlay so the tone-map
-        # white point is set by downstream surfaces (baffles, screen) rather than
-        # the high-flux lens faces that every ray hits.
+        # Suppress walls, lens faces, and FIELD_EXEMPT sources from the surface
+        # overlay so the tone-map white point is set by downstream surfaces.
         self._surface_suppress_tri_ids = np.ascontiguousarray(
-            np.concatenate([tube_wall_ids, lens_front_ids, lens_back_ids]),
+            np.concatenate([
+                tube_wall_ids,
+                lens_front_ids,
+                lens_back_ids,
+                self.red_probe_tri_ids,  # FIELD_EXEMPT: always-emissive debug probe
+            ]),
             dtype=np.int32,
         )
         self.lens_normal_report = {
@@ -3116,18 +3129,25 @@ class ForwardCppLensBench:
         )
         self._configure_sensor_film_pipeline()
 
-        # Drive forward tracing from actual emissive geometry in the scene.
-        self.src_pos = np.ascontiguousarray(self.tri_centroids[self.source_tri_ids], dtype=np.float64)
+        # Drive forward tracing from all emissive geometry: primary source + red probe.
+        self.src_pos = np.ascontiguousarray(self.tri_centroids[self.emitter_tri_ids], dtype=np.float64)
         src_n = int(self.src_pos.shape[0])
-        src_normals = np.ascontiguousarray(normals[self.source_tri_ids], dtype=np.float64)
+        src_normals = np.ascontiguousarray(normals[self.emitter_tri_ids], dtype=np.float64)
         self.src_dir = np.ascontiguousarray(src_normals, dtype=np.float64)
         # Neutral launch profile: no Python-side beaming. Keep transport driven
         # by emissive materials and scene geometry only.
         self.src_directivity = np.ones((src_n,), dtype=np.float64)
         self.tri_flux = np.zeros((self.n_tris, self.n_bands), dtype=np.float32)
         print(
+            "[emitter-tris]",
+            f"source={self.source_tri_ids.size}",
+            f"red_probe={self.red_probe_tri_ids.size}",
+            f"total={self.emitter_tri_ids.size}",
+            flush=True,
+        )
+        print(
             "[lighting-mode] emissive-material-only",
-            f"source_tris={src_n}",
+            f"emitter_tris={src_n}",
             "python_power_override=OFF",
             "python_beam_bias=OFF",
             flush=True,
@@ -3211,10 +3231,24 @@ class ForwardCppLensBench:
         bank.add("camera_front_cap", "baffle", self.camera_front_cap_tri_ids, self._uv_coords_for_tri_ids(self.camera_front_cap_tri_ids, "yz"))
         bank.add("camera_frustum",   "baffle", self.camera_frustum_tri_ids,   self._uv_coords_for_tri_ids(self.camera_frustum_tri_ids,   "x_cylinder"))
         bank.add("red_leak_probe",   "source", self.red_probe_tri_ids,         self._uv_coords_for_tri_ids(self.red_probe_tri_ids,         "yz"))
+        # The red probe is a diagnostic emitter and must always be hot regardless
+        # of layer budget; force it after add() so register_all() sees hot=True.
+        for g in bank.groups:
+            if g.name == "red_leak_probe":
+                g.hot = True
         for i, (front_ids, back_ids, _rf, _rb) in enumerate(getattr(self, "lens_surface_groups", [])):
             bank.add(f"lens_{i:02d}_front", "lens_front", front_ids, self._uv_coords_for_tri_ids(front_ids, "yz"))
             bank.add(f"lens_{i:02d}_back", "lens_back", back_ids, self._uv_coords_for_tri_ids(back_ids, "yz"))
         self.uv_page_bank = bank
+        for g in bank.groups:
+            if g.name == "red_leak_probe":
+                print(
+                    "[red-probe-group]",
+                    f"hot={int(g.hot)}",
+                    f"layer={int(g.layer)}",
+                    f"tris={int(g.tri_ids.size)}",
+                    flush=True,
+                )
         mem = bank.memory_report()
         print(
             "[uv-bank]",
@@ -3372,6 +3406,15 @@ class ForwardCppLensBench:
                 np.ascontiguousarray(self.source_tri_ids, dtype=np.int32),
             )
         )
+        self._bdpt_red_probe_gid = -1
+        if int(self.red_probe_tri_ids.size) > 0:
+            self._bdpt_red_probe_gid = int(
+                self.tracer.register_tri_group(
+                    role_emissive,
+                    sample_area,
+                    np.ascontiguousarray(self.red_probe_tri_ids, dtype=np.int32),
+                )
+            )
         aperture_stop_gid = -1
         if int(self.aperture_stop_tri_ids.size) > 0:
             aperture_stop_gid = int(
@@ -3421,8 +3464,10 @@ class ForwardCppLensBench:
         print(
             "[bdpt-register]",
             f"source_gid={self._bdpt_source_gid}",
+            f"red_probe_gid={self._bdpt_red_probe_gid}",
             f"sensor_gid={self.bdpt_last_sensor_gid}",
             f"source_tris={int(self.source_tri_ids.size)}",
+            f"red_probe_tris={int(self.red_probe_tri_ids.size)}",
             f"plate_tris={int(self.image_plate_tri_ids.size)}",
             f"stop_gid={int(aperture_stop_gid)}",
             f"stop_tris={int(self.aperture_stop_tri_ids.size)}",
@@ -5389,6 +5434,33 @@ def _online_adam_update(
 
 
 
+def _fly_norm(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-9 else v
+
+
+def _fly_lookat(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
+    f = _fly_norm(center - eye)
+    r = _fly_norm(np.cross(f, up))
+    u = np.cross(r, f)
+    return np.array([
+        [ r[0],  r[1],  r[2], -float(np.dot(r, eye))],
+        [ u[0],  u[1],  u[2], -float(np.dot(u, eye))],
+        [-f[0], -f[1], -f[2],  float(np.dot(f, eye))],
+        [    0,      0,     0,                      1],
+    ], dtype=np.float32)
+
+
+def _fly_persp(fov_y_rad: float, aspect: float, near: float, far: float) -> np.ndarray:
+    f = 1.0 / math.tan(fov_y_rad * 0.5)
+    return np.array([
+        [f / aspect, 0,  0,                          0                        ],
+        [0,          f,  0,                          0                        ],
+        [0,          0,  (far + near) / (near - far), 2*far*near / (near - far)],
+        [0,          0, -1,                          0                        ],
+    ], dtype=np.float32)
+
+
 def run(
     ray_mode: str = "bdpt",
     sensor_res: int = 64,
@@ -5828,6 +5900,8 @@ def run(
         for g in bank.groups:
             if g.tri_ids.size <= 0:
                 continue
+            if g.group_id < 0:
+                continue
             for tid in g.tri_ids:
                 base = int(tid) * 3
                 gid_flat[base:base + 3] = int(g.group_id)
@@ -5836,7 +5910,9 @@ def run(
         # Build verts8: [x, y, z, nx, ny, nz, u, v]
         verts8 = np.concatenate([pos_flat, norm_flat, uv_flat], axis=1)
         verts8 = np.ascontiguousarray(verts8, dtype=np.float32)
-        # All triangles double-sided (closed opaque shell).
+        # All surfaces double-sided so the fly camera can view geometry from
+        # any angle.  The red probe and sensor plate are always double-sided
+        # for field-side visibility as well.
         cull_v = np.ones(n_tris * 3, dtype=np.int32)
         from OpenGL.GL import (
             glGenVertexArrays, glBindVertexArray, glGenBuffers, glBindBuffer,
@@ -6140,20 +6216,36 @@ def run(
         glDisable(GL_BLEND)
         glUseProgram(0)
 
-        # Drive BaseGLRenderer with the same rotation MVP so it overlays
-        # the base-material Phong pass on top of the UV-mesh blit.
+        # Drive BaseGLRenderer: fly-camera perspective when fly_mode is active,
+        # otherwise fall back to the orthographic auto-wiggle.
         if _scene_vao[0] is not None:
-            t   = t_now * 0.16
-            a   = 0.24 * math.sin(t)
-            ca  = math.cos(a);  sa = math.sin(a)
-            mvp = np.array([
-                [ 2,     0,     0, -1          ],
-                [ 0,  2*ca,  2*sa, -(ca + sa)  ],
-                [ 0,     0,     0,  0          ],
-                [ 0,     0,     0,  1          ],
-            ], dtype=np.float32)
-            mvp_col = np.ascontiguousarray(mvp.T.ravel(), dtype=np.float32)
-            mv_col  = np.ascontiguousarray(np.eye(4, dtype=np.float32).ravel())
+            if fly_mode:
+                # ── Perspective MVP ───────────────────────────────────────── #
+                _aspect  = float(W) / float(H)
+                _cp = math.cos(fly_pitch); _sp = math.sin(fly_pitch)
+                _cy = math.cos(fly_yaw);   _sy = math.sin(fly_yaw)
+                _fwd_d   = np.array([_cp*_sy, _sp, _cp*_cy], dtype=np.float64)
+                _target  = fly_pos + _fwd_d
+                _world_up = np.array([0.0, 1.0, 0.0])   # Y is up
+                if abs(float(np.dot(_fly_norm(_fwd_d), _world_up))) > 0.97:
+                    _world_up = np.array([0.0, 0.0, 1.0])
+                V = _fly_lookat(fly_pos, _target, _world_up)
+                P = _fly_persp(math.radians(60.0), _aspect, 0.005, 5.0)
+                _mvp_fly = (P @ V).astype(np.float32)
+                mvp_col  = np.ascontiguousarray(_mvp_fly.T.ravel(), dtype=np.float32)
+                mv_col   = np.ascontiguousarray(V.T.ravel(), dtype=np.float32)
+            else:
+                t   = t_now * 0.16
+                a   = 0.24 * math.sin(t)
+                ca  = math.cos(a);  sa = math.sin(a)
+                mvp = np.array([
+                    [ 2,     0,     0, -1          ],
+                    [ 0,  2*ca,  2*sa, -(ca + sa)  ],
+                    [ 0,     0,     0,  0          ],
+                    [ 0,     0,     0,  1          ],
+                ], dtype=np.float32)
+                mvp_col = np.ascontiguousarray(mvp.T.ravel(), dtype=np.float32)
+                mv_col  = np.ascontiguousarray(np.eye(4, dtype=np.float32).ravel())
             vao_id, n_verts = _scene_vao[0][0], _scene_vao[0][1]
             _gl_renderer.draw_mesh(vao_id, n_verts, mvp_col, mv_col)
 
@@ -6196,6 +6288,17 @@ def run(
     auto_wiggle = True
     volume_gain = 1.0
 
+    # ── Fly camera (F to toggle) ──────────────────────────────────────────── #
+    # Positions are in the same [0,1]³ normalised space the VAO uses.
+    # Scene centre = (0.5, 0.5, 0.5).  Start outside the scene on the -Z side,
+    # looking toward the centre of the optical bench.
+    fly_mode  = False
+    fly_pos   = np.array([0.5, 0.5, -0.4], dtype=np.float64)
+    fly_yaw   = 0.0              # yaw=0 → forward = +Z (into the scene)
+    fly_pitch = 0.0
+    _FLY_SPEED = 0.6   # normalised units / second
+    _FLY_SENS  = 0.20  # degrees per pixel of mouse movement
+
     # KPN back-pressure gate: block submit until C++ intent queue drains to below
     # capacity.  display_pipeline_records() still runs every frame so the viewer
     # stays live while the pipeline is catching up.
@@ -6220,48 +6323,90 @@ def run(
             for ev in pygame.event.get():
                     if ev.type == pygame.QUIT:
                         return
+                    if ev.type == pygame.MOUSEMOTION and fly_mode:
+                        dx, dy = ev.rel
+                        fly_yaw   += math.radians(dx * _FLY_SENS)
+                        fly_pitch  = float(np.clip(
+                            fly_pitch - math.radians(dy * _FLY_SENS),
+                            -math.pi * 0.44, math.pi * 0.44,
+                        ))
                     if ev.type == pygame.KEYDOWN:
                         k = ev.key
                         if k == pygame.K_ESCAPE:
-                            return
-                        elif k == pygame.K_SPACE:
+                            if fly_mode:
+                                fly_mode = False
+                                pygame.mouse.set_visible(True)
+                                pygame.event.set_grab(False)
+                            else:
+                                return
+                        elif k == pygame.K_f:
+                            fly_mode = not fly_mode
+                            if fly_mode:
+                                pygame.mouse.set_visible(False)
+                                pygame.event.set_grab(True)
+                            else:
+                                pygame.mouse.set_visible(True)
+                                pygame.event.set_grab(False)
+                        elif k == pygame.K_SPACE and not fly_mode:
                             paused = not paused
-                        elif k == pygame.K_x:
-                            projection_axis = 0
-                            auto_wiggle = True
-                        elif k == pygame.K_y:
-                            projection_axis = 1
-                            auto_wiggle = False
-                        elif k == pygame.K_s or k == pygame.K_z:
-                            projection_axis = 2
-                            auto_wiggle = False
-                        elif k == pygame.K_q:
-                            clip_top  = max(-r, clip_top  - clip_step)
-                        elif k == pygame.K_e:
-                            clip_top  = min( r, clip_top  + clip_step)
-                        elif k == pygame.K_c:
-                            clip_side = min( r, clip_side + clip_step)
-                        elif k == pygame.K_r:
-                            clip_top = clip_side = r
-                        elif k == pygame.K_9:
-                            field_gain = max(0.0, field_gain - 0.05)
-                        elif k == pygame.K_0:
-                            field_gain = min(5.0, field_gain + 0.05)
-                        elif k == pygame.K_u:
-                            modes = ["combined", "forward", "sensor", "difference"]
-                            _uv_mode[0] = modes[(modes.index(_uv_mode[0]) + 1) % len(modes)]
-                            _uv_last_update_s[0] = -1.0
-                            print(f"[uv-mode] {_uv_mode[0]}", flush=True)
-                        elif k == pygame.K_LEFTBRACKET:
-                            bench.intent_shuffle = max(0.0, bench.intent_shuffle - 0.1)
-                            bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
-                            print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
-                        elif k == pygame.K_RIGHTBRACKET:
-                            bench.intent_shuffle = min(1.0, bench.intent_shuffle + 0.1)
-                            bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
-                            print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+                        elif not fly_mode:
+                            if k == pygame.K_x:
+                                projection_axis = 0
+                                auto_wiggle = True
+                            elif k == pygame.K_y:
+                                projection_axis = 1
+                                auto_wiggle = False
+                            elif k == pygame.K_z:
+                                projection_axis = 2
+                                auto_wiggle = False
+                            elif k == pygame.K_q:
+                                clip_top  = max(-r, clip_top  - clip_step)
+                            elif k == pygame.K_e:
+                                clip_top  = min( r, clip_top  + clip_step)
+                            elif k == pygame.K_c:
+                                clip_side = min( r, clip_side + clip_step)
+                            elif k == pygame.K_r:
+                                clip_top = clip_side = r
+                            elif k == pygame.K_9:
+                                field_gain = max(0.0, field_gain - 0.05)
+                            elif k == pygame.K_0:
+                                field_gain = min(5.0, field_gain + 0.05)
+                            elif k == pygame.K_u:
+                                modes = ["combined", "forward", "sensor", "difference"]
+                                _uv_mode[0] = modes[(modes.index(_uv_mode[0]) + 1) % len(modes)]
+                                _uv_last_update_s[0] = -1.0
+                                print(f"[uv-mode] {_uv_mode[0]}", flush=True)
+                            elif k == pygame.K_LEFTBRACKET:
+                                bench.intent_shuffle = max(0.0, bench.intent_shuffle - 0.1)
+                                bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
+                                print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+                            elif k == pygame.K_RIGHTBRACKET:
+                                bench.intent_shuffle = min(1.0, bench.intent_shuffle + 0.1)
+                                bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
+                                print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
             if frame_profiler is not None:
                 frame_profiler.end("events")
+
+            # ── Fly-camera WASD movement (main loop, not in draw closure) ── #
+            if fly_mode:
+                _dt_s     = max(0.001, clock.get_time() * 1e-3)
+                _keys_now = pygame.key.get_pressed()
+                _cp = math.cos(fly_pitch); _sp = math.sin(fly_pitch)
+                _cy = math.cos(fly_yaw);   _sy = math.sin(fly_yaw)
+                _fwd   = np.array([_cp*_sy, _sp, _cp*_cy], dtype=np.float64)
+                _right = _fly_norm(np.cross(np.array([0.0, 1.0, 0.0]), _fwd))
+                if np.linalg.norm(_right) < 1e-9:
+                    _right = np.array([1.0, 0.0, 0.0])
+                _up_v  = _fly_norm(np.cross(_fwd, _right))
+                _spd   = _FLY_SPEED * _dt_s
+                if _keys_now[pygame.K_LSHIFT] or _keys_now[pygame.K_RSHIFT]:
+                    _spd *= 3.0
+                if _keys_now[pygame.K_w]: fly_pos = fly_pos + _fwd   * _spd
+                if _keys_now[pygame.K_s]: fly_pos = fly_pos - _fwd   * _spd
+                if _keys_now[pygame.K_a]: fly_pos = fly_pos - _right * _spd
+                if _keys_now[pygame.K_d]: fly_pos = fly_pos + _right * _spd
+                if _keys_now[pygame.K_q]: fly_pos = fly_pos + _up_v  * _spd
+                if _keys_now[pygame.K_e]: fly_pos = fly_pos - _up_v  * _spd
 
             if not paused and trace_fut is None:
                 trace_fut = executor.submit(
@@ -6287,6 +6432,7 @@ def run(
                         frame_profiler.end("display_records")
                         frame_profiler.begin("upload_volume")
                     upload_volume(tex_field, field_texels)
+                    _gl_renderer.set_field_volume_texture(int(tex_field), field_gain)
                     if frame_profiler is not None:
                         frame_profiler.end("upload_volume")
                     for _ci in range(4):
@@ -6314,12 +6460,9 @@ def run(
 
             glClearColor(8/255, 8/255, 10/255, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
+            glViewport(0, 0, W, H)
             t_now = pygame.time.get_ticks() * 0.001
             if frame_profiler is not None:
-                frame_profiler.begin("draw_volume")
-            draw_volume(0, 0, W, H, shader_mode, volume_gain, t_now)
-            if frame_profiler is not None:
-                frame_profiler.end("draw_volume")
                 frame_profiler.begin("draw_uv_mesh")
             draw_uv_mesh(volume_gain, t_now)
             if frame_profiler is not None:

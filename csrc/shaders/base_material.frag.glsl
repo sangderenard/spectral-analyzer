@@ -113,6 +113,7 @@ float tx_translucence_gain(int id) { return texstack[id*TEXSTACK_STRIDE+15]; }
 
 in  vec3     vNormV;
 in  vec3     vPosV;
+in  vec3     vPosObj;
 flat in int  vMatId;
 flat in int  vGroupId;
 flat in int  vCullImmune;
@@ -143,6 +144,8 @@ uniform sampler2DArray uDepthUv;
 uniform sampler2DArray uRemitUv;
 uniform bool uEnableSpecular = true;
 uniform bool uEnableEmissionDirect = false;
+uniform sampler3D uFieldVolume;
+uniform float uFieldGain = 0.0;
 
 /* ── Helpers ──────────────────────────────────────────────────────────────── */
 
@@ -330,6 +333,12 @@ void main() {
         tinted   += spec_col * (eF * 0.28 * spec);
 
         col = mix(col, tinted, 0.35);
+    }
+
+    // 3-D field volume — sample energy density at this fragment's scene position
+    // and add as glow.  vPosObj is already in [0,1]³ (= field texture UVW space).
+    if (uFieldGain > 0.0) {
+        col += texture(uFieldVolume, vPosObj).rgb * uFieldGain;
     }
 
     // Color compensation equation: C' = CAT_CCM * C.

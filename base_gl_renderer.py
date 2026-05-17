@@ -51,8 +51,8 @@ try:
         GL_SHADER_STORAGE_BUFFER, GL_DYNAMIC_DRAW, GL_STATIC_DRAW,
         GL_FLOAT, GL_TRUE, GL_FALSE, GL_BLEND, GL_CULL_FACE,
         GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-        GL_TEXTURE_2D_ARRAY, GL_TEXTURE0, GL_TEXTURE_MIN_FILTER,
-        GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T,
+        GL_TEXTURE_2D_ARRAY, GL_TEXTURE_3D, GL_TEXTURE0, GL_TEXTURE_MIN_FILTER,
+        GL_TEXTURE_MAG_FILTER, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R,
         GL_LINEAR, GL_NEAREST, GL_CLAMP_TO_EDGE, GL_REPEAT,
         GL_RGBA, GL_RGBA8, GL_UNSIGNED_BYTE,
     )
@@ -165,14 +165,19 @@ class BaseGLRenderer:
         self._tex_color_uv: Optional[int] = None
         self._tex_depth_uv: Optional[int] = None
         self._tex_remit_uv: Optional[int] = None
+        self._tex_field_vol: Optional[int] = None
         self._uv_tex_unit_emit = 0
         self._uv_tex_unit_color = 1
         self._uv_tex_unit_depth = 2
         self._uv_tex_unit_remit = 3
+        self._uv_tex_unit_field = 4
         self._u_emit_uv = -1
         self._u_color_uv = -1
         self._u_depth_uv = -1
         self._u_remit_uv = -1
+        self._u_field_vol = -1
+        self._u_field_gain = -1
+        self._field_gain = 0.0
 
         # Mesh draw queue: list of tuples (vao, n_verts, mvp, mv,
         #                                  light_dirs, light_colors, light_intens)
@@ -278,6 +283,11 @@ class BaseGLRenderer:
     def set_emit_uv_texture_id(self, tex_id: int) -> None:
         """Point uEmitUv at an externally-managed GL texture (no upload)."""
         self._tex_emit_uv = int(tex_id)
+
+    def set_field_volume_texture(self, tex_id: int, gain: float = 0.0) -> None:
+        """Point uFieldVolume at an externally-managed GL_TEXTURE_3D (no upload)."""
+        self._tex_field_vol = int(tex_id)
+        self._field_gain = float(gain)
 
     def set_emit_uv_texture_array(self, rgba_layers: "np.ndarray") -> None:
         """Upload an RGBA8 emission texture array as (layers, height, width, 4)."""
@@ -385,6 +395,8 @@ class BaseGLRenderer:
         self._u_remit_uv        = glGetUniformLocation(self._prog, "uRemitUv")
         self._u_enable_specular = glGetUniformLocation(self._prog, "uEnableSpecular")
         self._u_enable_emission_direct = glGetUniformLocation(self._prog, "uEnableEmissionDirect")
+        self._u_field_vol  = glGetUniformLocation(self._prog, "uFieldVolume")
+        self._u_field_gain = glGetUniformLocation(self._prog, "uFieldGain")
 
     def _build_ssbos(self) -> None:
         """Create and populate the three material SSBOs from the current database state."""
@@ -703,6 +715,13 @@ class BaseGLRenderer:
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_remit_uv)
             if self._u_remit_uv != -1:
                 glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
+        if self._tex_field_vol is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_field)
+            glBindTexture(GL_TEXTURE_3D, self._tex_field_vol)
+            if self._u_field_vol != -1:
+                glUniform1i(self._u_field_vol, self._uv_tex_unit_field)
+            if self._u_field_gain != -1:
+                glUniform1f(self._u_field_gain, self._field_gain)
 
         # Upload uniforms
         if self._u_mvp != -1:
@@ -772,6 +791,13 @@ class BaseGLRenderer:
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_remit_uv)
             if self._u_remit_uv != -1:
                 glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
+        if self._tex_field_vol is not None:
+            glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_field)
+            glBindTexture(GL_TEXTURE_3D, self._tex_field_vol)
+            if self._u_field_vol != -1:
+                glUniform1i(self._u_field_vol, self._uv_tex_unit_field)
+            if self._u_field_gain != -1:
+                glUniform1f(self._u_field_gain, self._field_gain)
 
         self._upload_feature_toggles()
         self._upload_point_lights()

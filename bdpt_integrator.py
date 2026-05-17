@@ -337,3 +337,153 @@ def aggregate_to_image_pixel_cone(
         return out
     np.add.at(out, (bid[in_range], py[in_range], px[in_range]), amp[in_range])
     return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Ray-stream semantic taxonomy
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These constants name the ORIGIN and TRAVEL DIRECTION of a ray sub-path.
+# They are attached to EndpointRecord rows (or carried through the new
+# RayEvent structs) so that downstream consumers can make semantically
+# correct routing decisions — e.g. refusing to deposit a backward-sensor
+# record into the forward physical field buffer.
+#
+# Values match the C-side enum in csrc/include/ray_stream_kind.h (to be
+# added when the C kernel is updated).  Until then only the Python side
+# uses them.
+
+class RayStreamKind:
+    """Integer constants naming the origin/direction of a ray sub-path."""
+    FORWARD_LIGHT   = 0   # emitter → scene → sensor  (light-side subpath)
+    BACKWARD_SENSOR = 1   # sensor → scene → emitter  (sensor-side subpath)
+    MIDDLE_MANIFOLD = 2   # neither end is a primary emitter or sensor;
+                          # placed by a manifold-walk or connection strategy
+    APERTURE_PUPIL  = 3   # backward-sensor sub-path that enters the scene
+                          # through the aperture / exit pupil.  This IS a
+                          # BACKWARD_SENSOR path — the PIXEL_CONE pass is one
+                          # concrete realisation of this stream.  It is a valid
+                          # half of a true BDPT pair and must NOT be removed;
+                          # it simply cannot be deposited unresolved into the
+                          # physical field buffer without first being correlated
+                          # with a forward light sub-path by RayCorrelator.
+    DIAGNOSTIC_ONLY = 4   # carries no physical energy; display/debug only
+
+
+class RecordIntent:
+    """Integer constants describing HOW an EndpointRecord should be used.
+
+    These are NOT mutually exclusive by value — a record can be promoted from
+    CORRELATION_CANDIDATE to PHYSICAL_DEPOSIT only after the correlator
+    resolves a valid connection.  Consumers must check intent before writing
+    to any shared accumulation buffer.
+    """
+    PHYSICAL_DEPOSIT      = 0   # resolved contribution — safe to write to
+                                #   the physical field / image accumulator
+    DIAGNOSTIC_RECORD     = 1   # display-only; must NOT touch physical buffers
+    CORRELATION_CANDIDATE = 2   # endpoint proposed for a connection strategy;
+                                #   becomes PHYSICAL_DEPOSIT iff accepted by
+                                #   RayCorrelator (visibility confirmed, MIS done)
+    SENSOR_ESTIMATE       = 3   # backward sub-path sensor estimate (e.g.
+                                #   PIXEL_CONE / APERTURE_PUPIL pass).  Writes
+                                #   ONLY to the per-pixel sensor image buffer,
+                                #   never to the physical 3-D field grid unless
+                                #   first promoted via correlation.
+    UV_CACHE_SAMPLE       = 4   # read from the UV lightfield cache
+    UV_CACHE_WRITE        = 5   # write to the UV lightfield cache
+    FIELD_CAPTURE_WRITE   = 6   # write to the 3-D volumetric field grid
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Structured data model for the forward / backward / middle correlation system
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@_dc.dataclass
+class RayEvent:
+    """One recorded event on a ray sub-path (a surface or volume hit).
+
+    Carries enough information to connect sub-paths without re-tracing.
+    All positions and directions are in world-space metres / unit vectors.
+
+    ``stream_kind``  — RayStreamKind constant, set at launch and propagated
+                       through every bounce.
+    ``record_intent`` — RecordIntent constant, set by the kernel or correlator.
+    ``subpath_id``   — opaque ID linking all events on the same sub-path;
+                       matches EndpointRecord.subpath_id when bridging records.
+    ``bounce_index`` — 0-based depth from the sub-path origin.
+    ``pos``          — hit position (world-space, metres), shape (3,).
+    ``dir_in``       — incoming direction at this event (normalised), shape (3,).
+    ``dir_out``      — scattered/reflected direction (normalised), shape (3,).
+    ``normal``       — surface/volume normal at hit (normalised), shape (3,).
+    ``pdf``          — sampling PDF for the outgoing direction.
+    ``pathlen_m``    — optical path length from the sub-path origin (metres).
+    ``amp_re``       — per-band amplitude real part, shape (n_bands,).
+    ``amp_im``       — per-band amplitude imaginary part, shape (n_bands,).
+    ``group_id``     — registered tri-group ID of the hit surface (-1 = none).
+    ``tri_id``       — local triangle index within the group (-1 = none).
+    """
+    stream_kind:    int
+    record_intent:  int
+    subpath_id:     int
+    bounce_index:   int
+    pos:            np.ndarray          # float64, shape (3,)
+    dir_in:         np.ndarray          # float64, shape (3,)
+    dir_out:        np.ndarray          # float64, shape (3,)
+    normal:         np.ndarray          # float64, shape (3,)
+    pdf:            float
+    pathlen_m:      float
+    amp_re:         np.ndarray          # float32, shape (n_bands,)
+    amp_im:         np.ndarray          # float32, shape (n_bands,)
+    group_id:       int = -1
+    tri_id:         int = -1
+
+
+@_dc.dataclass
+class MiddlePoint:
+    """A proposed connection point on a manifold walk or a shared surface.
+
+    Produced by RayCorrelator strategies that search for a common vertex
+    between a forward light sub-path and a backward sensor sub-path.
+
+    ``forward_event``  — the RayEvent on the light sub-path nearest to this
+                         connection point (may be an extrapolation).
+    ``backward_event`` — the RayEvent on the sensor sub-path nearest to this
+                         connection point.
+    ``pos``            — resolved connection world position, shape (3,).
+    ``visibility``     — fraction in [0, 1]; 1.0 = fully unoccluded.
+    ``mis_weight``     — multiple importance sampling weight for this
+                         connection strategy (may be 1.0 if not yet
+                         computed).
+    """
+    forward_event:  RayEvent
+    backward_event: RayEvent
+    pos:            np.ndarray          # float64, shape (3,)
+    visibility:     float = 1.0
+    mis_weight:     float = 1.0
+
+
+@_dc.dataclass
+class CorrelationCandidate:
+    """A matched (forward, backward) sub-path pair proposed by RayCorrelator.
+
+    Once a candidate is accepted (visibility confirmed, MIS weight applied)
+    it can be promoted to a PHYSICAL_DEPOSIT and written into the sensor
+    accumulator.
+
+    ``middle``         — the shared / connection point (may be None if the
+                         paths connect directly endpoint-to-endpoint).
+    ``forward_record`` — the EndpointRecord row (structured) for the light
+                         sub-path endpoint, or None if source is a RayEvent.
+    ``backward_record``— the EndpointRecord row (structured) for the sensor
+                         sub-path endpoint, or None if source is a RayEvent.
+    ``strategy_id``    — RayCorrelator strategy that produced this candidate.
+    ``contribution``   — per-band complex amplitude after MIS weighting,
+                         shape (n_bands,) complex64.
+    ``accepted``       — True once visibility check passes and MIS is final.
+    """
+    middle:           MiddlePoint | None
+    forward_record:   np.ndarray | None     # single structured EndpointRecord
+    backward_record:  np.ndarray | None     # single structured EndpointRecord
+    strategy_id:      int = 0
+    contribution:     np.ndarray | None = None   # complex64, shape (n_bands,)
+    accepted:         bool = False

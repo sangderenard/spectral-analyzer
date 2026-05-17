@@ -43,6 +43,13 @@ EPS = 1.0e-9
 C_LIGHT = 299_792_458.0
 DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 380e-9, MAX_SPECTRAL_BANDS)).astype(np.float64)
 DEBUG_BDPT_BACKTRACE_ONLY_DEFAULT = False
+# When False (the default), backward-sensor sub-path records (PIXEL_CONE /
+# APERTURE_PUPIL) are NOT deposited into the physical 3-D field grid because
+# they are unresolved half-paths.  They remain available to RayCorrelator for
+# pairing with forward light sub-paths.  Set True only to restore legacy
+# behaviour where all endpoint records were written to the field regardless
+# of stream origin.
+ENABLE_UNSAFE_BACKWARD_FIELD_DEPOSIT: bool = False
 UV_PAGE_RES_DEFAULT = 512
 UV_HOT_GROUP_LIMIT_DEFAULT = 8
 UV_HDR_CHANNELS = 11
@@ -2806,6 +2813,10 @@ class ForwardCppLensBench:
         self.bdpt_last_survivor_records = 0
         self.bdpt_last_sensor_photons = 0.0
         self.bdpt_last_sensor_power = 0.0
+        self.bdpt_last_stream_counts: Dict[str, int] = {
+            "forward_light": 0, "backward_sensor": 0,
+            "pixel_cone": 0, "field_deposit_blocked": 0,
+        }
         self.bdpt_last_n_px = int(max(4, int(self.scene.image_plate.pixels)))
         self.bdpt_last_aperture_samples = 1
         self._surface_top_ema: Optional[np.ndarray] = None
@@ -4152,7 +4163,7 @@ class ForwardCppLensBench:
         )
         return _spectral_image_to_rgb(spec, ideal_bench.freq_hz)
 
-    def capture_plate_bdpt_rgb(
+    def trace_forward_backward_sensor_rgb(
         self,
         pixels: int | None = None,
         aperture_samples: int = 2,
@@ -4163,6 +4174,21 @@ class ForwardCppLensBench:
         n_rays_bdpt: int | None = None,
         camera_mode: int = 2,
     ) -> np.ndarray:
+        """Capture the sensor plate by running the forward-light + backward-sensor
+        (pixel-cone) passes and returning a tonemapped RGB array.
+
+        The name ``capture_plate_bdpt_rgb`` was misleading: the underlying
+        C++ kernel ``ray_tracer_bidirectional_impl`` fires forward rays from
+        emissive groups only; the backward sensor contribution comes from the
+        PIXEL_CONE pass (``RayStreamKind.APERTURE_PUPIL``), which IS a valid
+        backward sub-path strategy.  No connection step or MIS is performed
+        here — that is handled by ``RayCorrelator`` in a separate pass.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(n, n, 3)``, dtype ``float32``, values in ``[0, 1]``.
+        """
         with self._trace_lock:
             n = int(max(4, pixels or self.scene.image_plate.pixels))
             aperture_samples_i = int(max(1, aperture_samples))
@@ -4206,11 +4232,19 @@ class ForwardCppLensBench:
             self.bdpt_last_volume_records = 0
             self.bdpt_last_volume_power = 0.0
             try:
+                # ``include_sensor_group=True``   → forward light paths that
+                #   terminated at the sensor surface: valid physical deposit.
+                # ``include_non_sensor_groups``   → backward-sensor (PIXEL_CONE /
+                #   APERTURE_PUPIL) paths that hit scene geometry on the way
+                #   back from the sensor.  These are UNRESOLVED backward
+                #   sub-paths; depositing them into the physical field without
+                #   correlation introduces radiometric bias.  Gated by
+                #   ENABLE_UNSAFE_BACKWARD_FIELD_DEPOSIT (default False).
                 vol = self.tracer.accumulate_endpoint_records_to_field_capture(
                     records,
                     int(sensor_gid),
-                    True,
-                    True,
+                    True,                                    # include_sensor_group
+                    ENABLE_UNSAFE_BACKWARD_FIELD_DEPOSIT,    # include_non_sensor_groups
                 )
                 if isinstance(vol, dict):
                     self.bdpt_last_volume_records = int(vol.get("written_records", 0))
@@ -4275,6 +4309,33 @@ class ForwardCppLensBench:
                 self.bdpt_last_sensor_photons = 0.0
                 self.bdpt_last_sensor_power = 0.0
 
+            # ── Stream-type validation counts ──────────────────────────────
+            # Classify endpoint records by stream origin using the available
+            # heuristics (no C-side stream_id field yet):
+            #   forward light:      group_id == sensor_gid  (hit the sensor)
+            #   backward sensor:    group_id != sensor_gid  (pixel-cone scene hit)
+            # pixel-cone records additionally satisfy subpath_id < n*n.
+            _stream_fwd_count  = 0
+            _stream_bwd_count  = 0
+            _stream_pixcone_count = 0
+            if self._last_bdpt_records is not None and self._last_bdpt_records.shape[0] > 0:
+                _r = self._last_bdpt_records
+                _gids = _r[:, 3].view(np.int32)     # group_id is col-3 int32
+                _sids = _r[:, 0].view(np.uint32)    # subpath_id is col-0 uint32
+                _fwd_mask = _gids == int(sensor_gid)
+                _bwd_mask = ~_fwd_mask
+                _stream_fwd_count  = int(np.count_nonzero(_fwd_mask))
+                _stream_bwd_count  = int(np.count_nonzero(_bwd_mask))
+                _pixel_cap = int(n) * int(n)
+                _stream_pixcone_count = int(np.count_nonzero(_bwd_mask & (_sids < np.uint32(_pixel_cap))))
+            self.bdpt_last_stream_counts = {
+                "forward_light":     _stream_fwd_count,
+                "backward_sensor":   _stream_bwd_count,
+                "pixel_cone":        _stream_pixcone_count,
+                "field_deposit_blocked": _stream_bwd_count if not ENABLE_UNSAFE_BACKWARD_FIELD_DEPOSIT else 0,
+            }
+            # ───────────────────────────────────────────────────────────────
+
             if rgb_tm is None:
                 self.bdpt_debug_print_counter += 1
                 print(
@@ -4282,6 +4343,9 @@ class ForwardCppLensBench:
                     f"call={self.bdpt_debug_print_counter}",
                     f"launched={self.bdpt_last_launched_rays}",
                     f"endpoint_records={self.bdpt_last_records}",
+                    f"fwd={_stream_fwd_count}",
+                    f"bwd={_stream_bwd_count}(pixcone={_stream_pixcone_count})",
+                    f"field_blocked={self.bdpt_last_stream_counts['field_deposit_blocked']}",
                     f"kept={self.bdpt_last_survivor_records}",
                     f"sensor_gid={sensor_gid}",
                     f"vol_records={self.bdpt_last_volume_records}",
@@ -4317,6 +4381,9 @@ class ForwardCppLensBench:
                 f"call={self.bdpt_debug_print_counter}",
                 f"launched={self.bdpt_last_launched_rays}",
                 f"endpoint_records={self.bdpt_last_records}",
+                f"fwd={_stream_fwd_count}",
+                f"bwd={_stream_bwd_count}(pixcone={_stream_pixcone_count})",
+                f"field_blocked={self.bdpt_last_stream_counts['field_deposit_blocked']}",
                 f"sensor_group_records={self.bdpt_last_telemetry.get('sensor_group_records', 0)}",
                 f"kept={self.bdpt_last_survivor_records}",
                 f"kept_pixel={self.bdpt_last_telemetry.get('kept_pixel_cone_records', 0)}",
@@ -4335,6 +4402,9 @@ class ForwardCppLensBench:
             out = np.clip(rgb_tm_arr, 0.0, 1.0).astype(np.float32, copy=False)
             self._last_bdpt_plate_rgb = out
             return out
+
+    # Hard cutover: old name → new semantically-correct name.
+    capture_plate_bdpt_rgb = trace_forward_backward_sensor_rgb
 
     def export_bdpt_ray_visualization(self, output_file: str = "bdpt_rays.txt") -> Dict[str, any]:
         """Export BDPT ray paths to a text file for detailed visualization.

@@ -218,6 +218,7 @@ struct MaterialSample {
     Vector3f albedo;
     float    roughness;
     float    metallic;
+    float    transmission;
     float    ior;
     float    opacity;
     Vector3f emission;
@@ -293,6 +294,7 @@ static inline MaterialSample kernel_sample_material(
     m.albedo           = pbr_data   ? pbr_albedo    (pbr_data,   mat_id) : Vector3f(0.5f,0.5f,0.5f);
     m.roughness        = pbr_data   ? pbr_roughness (pbr_data,   mat_id) : 0.5f;
     m.metallic         = pbr_data   ? pbr_metallic  (pbr_data,   mat_id) : 0.0f;
+    m.transmission     = pbr_data   ? pbr_trans     (pbr_data,   mat_id) : 0.0f;
     m.ior              = pbr_data   ? pbr_ior       (pbr_data,   mat_id) : 1.5f;
     m.opacity          = pbr_data   ? pbr_opacity   (pbr_data,   mat_id) : 1.0f;
     m.emission         = pbr_data   ? pbr_emission  (pbr_data,   mat_id) : Vector3f(0.0f,0.0f,0.0f);
@@ -495,7 +497,7 @@ static Vector3f shade(
     float*          alpha_out)
 {
     MaterialSample m = kernel_sample_material(mat_id, pbr_data, phong_data, enamel_data);
-    *alpha_out = m.opacity;
+    *alpha_out = std::max(0.0f, std::min(1.0f, m.opacity * (1.0f - m.transmission * 0.8f)));
     float color_a = std::max(0.0f, std::min(1.0f, color_uv.w() * color_blend));
     m.albedo = m.albedo * (1.0f - color_a) + color_uv.head<3>() * color_a;
 
@@ -803,7 +805,8 @@ struct PacketShadeOutput {
     out.col_b = Array8f::Constant(sc.cat_ccm(2, 0)) * col_x
               + Array8f::Constant(sc.cat_ccm(2, 1)) * col_y
               + Array8f::Constant(sc.cat_ccm(2, 2)) * col_z;
-    out.alpha = Array8f::Constant(m0.opacity);
+    out.alpha = Array8f::Constant(
+        std::max(0.0f, std::min(1.0f, m0.opacity * (1.0f - m0.transmission * 0.8f))));
     return out;
 }
 
@@ -1663,10 +1666,9 @@ static void br_render_impl(BaseRasterizerState* st,
                                              bulb_radius_mm,
                                              &alpha);
 
-                        // Transparent fragments blend but do not own depth,
-                        // so geometry behind them can still shade.
-                        if (alpha >= 0.9999f) {
-                            zbuf[idx] = depth;
+                        alpha = std::max(0.0f, std::min(1.0f, alpha));
+                        if (alpha <= 1.0e-5f) {
+                            continue;
                         }
 
                         float* p = cbuf + idx * 4;
@@ -1680,8 +1682,14 @@ static void br_render_impl(BaseRasterizerState* st,
                             p[0] = col.x() * alpha + p[0] * inv_a;
                             p[1] = col.y() * alpha + p[1] * inv_a;
                             p[2] = col.z() * alpha + p[2] * inv_a;
-                            p[3] = std::min(1.0f, p[3] + alpha);
+                            p[3] = alpha + p[3] * inv_a;
                         }
+
+                        // Match the BaseGLRenderer path: the fragment shader
+                        // supplies alpha, blending composes colour, and the
+                        // depth buffer still records the closest accepted
+                        // fragment so later geometry is composed by depth.
+                        zbuf[idx] = depth;
                     }
                 }
             }

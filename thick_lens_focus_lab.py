@@ -2549,54 +2549,9 @@ def _build_scene_mesh(
         _append_tri(tris, mats, p00, p10, p11, idx_black)
         _append_tri(tris, mats, p00, p11, p01, idx_black)
 
-    # ── Red leak-probe sphere: outside the camera barrel, red-only emitter ──
-    # Placed just past the camera's rear edge (x > image_plate_x) and outside
-    # the barrel radius, so it only illuminates the sensor if there is a gap
-    # in the sealed enclosure.  Any red energy on the sensor = confirmed leak.
-    idx_red_probe = db.register(
-        "red_leak_probe",
-        Material(
-            name="red_leak_probe",
-            domain="em_optical",
-            albedo=[1.0, 0.0, 0.0],
-            roughness=0.0,
-            metallic=0.0,
-            emission_rgb=[1.0, 0.0, 0.0],
-            ior=1.0,
-            transmission=0.0,
-            radiance=RadianceProfile(
-                luminance=3000.0,
-                cct_k=1800.0,
-                cri=20.0,
-                solid_angle_sr=math.pi * 2.0,
-                distribution="lambertian",
-            ),
-            spectral_bands=_make_red_only_spectral_bands(
-                sidecar,
-                emission_scale=float(scene.side_room_source_emission),
-            ),
-        ),
-    )
-    _probe_r  = 0.018   # 18 mm radius
-    _probe_x  = (float(scene.object_plane.x) + float(scene.screen_x)) * 0.5  # center of display region
-    _probe_y  = float(scene.view_radius) * 0.90   # near top, inside the [0,1]³ normalized volume
-    _probe_z  = float(scene.view_radius) * 0.90   # near camera side (+Z), inside the volume
+    # Debug leak-probe emitter removed: keep the plumbing arrays empty so the
+    # optical scene is lit only by authored source geometry.
     red_probe_tri_ids: list = []
-    _build_emissive_sphere(
-        center=np.array([_probe_x, _probe_y, _probe_z], dtype=np.float64),
-        radius=_probe_r,
-        tri_list=tris,
-        mat_ids=mats,
-        mat_idx=idx_red_probe,
-        n_theta=24,
-        n_phi=12,
-        tri_ids=red_probe_tri_ids,
-    )
-    print(
-        f"[red-probe] x={_probe_x:.4f} y={_probe_y:.4f} z={_probe_z:.4f} r={_probe_r*1e3:.1f}mm"
-        f" tris={len(red_probe_tri_ids)} mat_idx={idx_red_probe}",
-        flush=True,
-    )
 
     tri_arr = np.ascontiguousarray(np.asarray(tris, dtype=np.float64))
     _orient_surface_patch_outward(tri_arr, lens_front_tri_ids, expected_x_sign=-1.0)
@@ -2612,7 +2567,6 @@ def _build_scene_mesh(
     suppress_ids = np.ascontiguousarray(
         np.concatenate([
             np.asarray(source_tri_ids,    dtype=np.int32),  # FIELD_EXEMPT: primary emitter
-            np.asarray(red_probe_tri_ids, dtype=np.int32),  # FIELD_EXEMPT: debug probe
             np.asarray(silver_wall_tri_ids, dtype=np.int32),
             np.asarray(black_wall_tri_ids,  dtype=np.int32),
         ]),
@@ -3110,7 +3064,6 @@ class ForwardCppLensBench:
                 tube_wall_ids,
                 lens_front_ids,
                 lens_back_ids,
-                self.red_probe_tri_ids,  # FIELD_EXEMPT: always-emissive debug probe
             ]),
             dtype=np.int32,
         )
@@ -3135,7 +3088,7 @@ class ForwardCppLensBench:
         )
         self._configure_sensor_film_pipeline()
 
-        # Drive forward tracing from all emissive geometry: primary source + red probe.
+        # Drive forward tracing from authored emissive source geometry.
         self.src_pos = np.ascontiguousarray(self.tri_centroids[self.emitter_tri_ids], dtype=np.float64)
         src_n = int(self.src_pos.shape[0])
         src_normals = np.ascontiguousarray(normals[self.emitter_tri_ids], dtype=np.float64)
@@ -3147,7 +3100,7 @@ class ForwardCppLensBench:
         print(
             "[emitter-tris]",
             f"source={self.source_tri_ids.size}",
-            f"red_probe={self.red_probe_tri_ids.size}",
+            f"debug_probe=removed",
             f"total={self.emitter_tri_ids.size}",
             flush=True,
         )
@@ -3236,25 +3189,10 @@ class ForwardCppLensBench:
         bank.add("camera_rear_cap",  "baffle", self.camera_rear_cap_tri_ids,  self._uv_coords_for_tri_ids(self.camera_rear_cap_tri_ids,  "yz"))
         bank.add("camera_front_cap", "baffle", self.camera_front_cap_tri_ids, self._uv_coords_for_tri_ids(self.camera_front_cap_tri_ids, "yz"))
         bank.add("camera_frustum",   "baffle", self.camera_frustum_tri_ids,   self._uv_coords_for_tri_ids(self.camera_frustum_tri_ids,   "x_cylinder"))
-        bank.add("red_leak_probe",   "source", self.red_probe_tri_ids,         self._uv_coords_for_tri_ids(self.red_probe_tri_ids,         "yz"))
-        # The red probe is a diagnostic emitter and must always be hot regardless
-        # of layer budget; force it after add() so register_all() sees hot=True.
-        for g in bank.groups:
-            if g.name == "red_leak_probe":
-                g.hot = True
         for i, (front_ids, back_ids, _rf, _rb) in enumerate(getattr(self, "lens_surface_groups", [])):
             bank.add(f"lens_{i:02d}_front", "lens_front", front_ids, self._uv_coords_for_tri_ids(front_ids, "yz"))
             bank.add(f"lens_{i:02d}_back", "lens_back", back_ids, self._uv_coords_for_tri_ids(back_ids, "yz"))
         self.uv_page_bank = bank
-        for g in bank.groups:
-            if g.name == "red_leak_probe":
-                print(
-                    "[red-probe-group]",
-                    f"hot={int(g.hot)}",
-                    f"layer={int(g.layer)}",
-                    f"tris={int(g.tri_ids.size)}",
-                    flush=True,
-                )
         mem = bank.memory_report()
         print(
             "[uv-bank]",
@@ -3413,14 +3351,6 @@ class ForwardCppLensBench:
             )
         )
         self._bdpt_red_probe_gid = -1
-        if int(self.red_probe_tri_ids.size) > 0:
-            self._bdpt_red_probe_gid = int(
-                self.tracer.register_tri_group(
-                    role_emissive,
-                    sample_area,
-                    np.ascontiguousarray(self.red_probe_tri_ids, dtype=np.int32),
-                )
-            )
         aperture_stop_gid = -1
         if int(self.aperture_stop_tri_ids.size) > 0:
             aperture_stop_gid = int(
@@ -3470,10 +3400,9 @@ class ForwardCppLensBench:
         print(
             "[bdpt-register]",
             f"source_gid={self._bdpt_source_gid}",
-            f"red_probe_gid={self._bdpt_red_probe_gid}",
+            f"debug_probe=removed",
             f"sensor_gid={self.bdpt_last_sensor_gid}",
             f"source_tris={int(self.source_tri_ids.size)}",
-            f"red_probe_tris={int(self.red_probe_tri_ids.size)}",
             f"plate_tris={int(self.image_plate_tri_ids.size)}",
             f"stop_gid={int(aperture_stop_gid)}",
             f"stop_tris={int(self.aperture_stop_tri_ids.size)}",
@@ -5956,8 +5885,8 @@ def run(
         norms = (raw_n / np.where(nlen > 1e-12, nlen, 1.0)).astype(np.float32)
         norm_flat = np.repeat(norms, 3, axis=0)                  # (N*3, 3)
         uv_flat = np.zeros((n_tris * 3, 2), dtype=np.float32)
-        # Use the actual scene material IDs so that emissive surfaces (red probe
-        # sphere, light sources) carry their real emission_rgb into the fragment
+        # Use the actual scene material IDs so that emissive source surfaces
+        # carry their real emission_rgb into the fragment
         # shader.  The renderer's derive_emissive_area_lights will pick those up
         # and handle illumination — no manual light setup needed here.
         mat_flat = np.repeat(bench.tri_mat_ids, 3)               # (N*3,) ints
@@ -5977,8 +5906,7 @@ def run(
         verts8 = np.concatenate([pos_flat, norm_flat, uv_flat], axis=1)
         verts8 = np.ascontiguousarray(verts8, dtype=np.float32)
         # All surfaces double-sided so the fly camera can view geometry from
-        # any angle.  The red probe and sensor plate are always double-sided
-        # for field-side visibility as well.
+        # any angle; the sensor plate remains visible from the field side.
         cull_v = np.ones(n_tris * 3, dtype=np.int32)
         from OpenGL.GL import (
             glGenVertexArrays, glBindVertexArray, glGenBuffers, glBindBuffer,
@@ -6015,8 +5943,8 @@ def run(
         glVertexAttribIPointer(5, 1, GL_INT, 4, ctypes.c_void_p(0))
         glBindVertexArray(0)
         _scene_vao[0] = (int(vao), n_tris * 3, int(vbo), int(mbo), int(gbo), int(cbo))
-        # Let the renderer derive lights from all emissive surfaces in the scene
-        # (red probe sphere, source triangles, etc.) — no manual light setup.
+        # Let the renderer derive lights from all emissive source surfaces in
+        # the scene; there is no manual light setup.
         _gl_renderer.derive_emissive_area_lights(verts8, mat_v, gid_v, min_emitter_group_id=-999)
         print(f"[gl-renderer] scene VAO built: {n_tris*3} verts, "
               f"{len(bank.groups)} UV groups", flush=True)

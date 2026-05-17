@@ -5442,12 +5442,16 @@ def run(
     # Must be called immediately after set_mode() while the context is current.
     _gl_display_hglrc: int = 0
     _gl_display_hdc: int = 0
+    _wgl_make_current = None
     if sys.platform == "win32":
         try:
             _wgl_get_current_context = ctypes.windll.opengl32.wglGetCurrentContext
             _wgl_get_current_dc = ctypes.windll.opengl32.wglGetCurrentDC
+            _wgl_make_current = ctypes.windll.opengl32.wglMakeCurrent
             _wgl_get_current_context.restype = ctypes.c_void_p
             _wgl_get_current_dc.restype = ctypes.c_void_p
+            _wgl_make_current.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            _wgl_make_current.restype = ctypes.c_int
             _gl_display_hglrc = int(_wgl_get_current_context() or 0)
             _gl_display_hdc = int(_wgl_get_current_dc() or 0)
             if _gl_display_hglrc:
@@ -5455,6 +5459,19 @@ def run(
                       f" HDC=0x{_gl_display_hdc:x}", flush=True)
         except Exception as _hglrc_err:
             print(f"[gl-share] HGLRC capture failed: {_hglrc_err}", flush=True)
+
+    def _restore_display_gl_context() -> None:
+        if not (_wgl_make_current and _gl_display_hdc and _gl_display_hglrc):
+            return
+        try:
+            rc = _wgl_make_current(
+                ctypes.c_void_p(int(_gl_display_hdc)),
+                ctypes.c_void_p(int(_gl_display_hglrc)),
+            )
+            if not rc:
+                print("[gl-share] display context restore failed", flush=True)
+        except Exception as _restore_err:
+            print(f"[gl-share] display context restore failed: {_restore_err}", flush=True)
     clock = pygame.time.Clock()
     frame_profiler = FrameProfiler(report_every=60) if profile else None
 
@@ -5500,6 +5517,18 @@ def run(
         _pip_res,
         0.008,
     )
+    if compute_mode in ("gpu", "mixed"):
+        try:
+            bench.tracer.ensure_pipeline(
+                max_children=2,
+                seed=13579,
+                min_amplitude=float(bench._min_amplitude),
+                use_gpu_compute=True,
+                gpu_all_stages=(compute_mode == "gpu"),
+                shader_dir=_SHADER_DIR,
+            )
+        finally:
+            _restore_display_gl_context()
 
     def _compile_shader(kind: int, source: str) -> int:
         shader = glCreateShader(kind)

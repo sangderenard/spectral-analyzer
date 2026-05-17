@@ -133,8 +133,21 @@ bool gl_compute_create_context(GlComputeContext* ctx, void* hShareContext,
         int share_fmt = GetPixelFormat((HDC)hShareDC);
         if (share_fmt > 0) {
             DescribePixelFormat((HDC)hShareDC, share_fmt, sizeof(pfd), &pfd);
-            fmt = share_fmt;
-            SetPixelFormat(ctx->hdc, fmt, &pfd);  /* may fail if already set */
+            if (SetPixelFormat(ctx->hdc, share_fmt, &pfd)) {
+                fmt = share_fmt;
+                fprintf(stderr,
+                        "[gpu-dispatch] WGL share pixel format copied: display=%d hidden=%d flags=0x%08lx color=%u depth=%u\n",
+                        share_fmt, GetPixelFormat(ctx->hdc), (unsigned long)pfd.dwFlags,
+                        (unsigned)pfd.cColorBits, (unsigned)pfd.cDepthBits);
+                fflush(stderr);
+            } else {
+                DWORD e = GetLastError();
+                fprintf(stderr,
+                        "[gpu-dispatch] WGL share pixel format copy failed: display=%d err=%lu (0x%08lx); choosing compatible format\n",
+                        share_fmt, e, (unsigned long)e);
+                fflush(stderr);
+                fmt = 0;
+            }
         }
     }
     if (!fmt) {
@@ -188,8 +201,11 @@ bool gl_compute_create_context(GlComputeContext* ctx, void* hShareContext,
          * pixel-format mismatch despite best efforts).  Retry without sharing
          * so at least compute shaders work; GPU-direct UV blit will be skipped
          * but the CPU readback fallback path remains active. */
-        fprintf(stderr, "[gpu-dispatch] shared context failed (err=%lu), retrying without share\n",
-                GetLastError()); fflush(stderr);
+        DWORD e = GetLastError();
+        fprintf(stderr, "[gpu-dispatch] shared context failed (err=%lu / 0x%08lx, display_pf=%d hidden_pf=%d), retrying without share\n",
+                e, (unsigned long)e,
+                hShareDC ? GetPixelFormat((HDC)hShareDC) : 0,
+                GetPixelFormat(ctx->hdc)); fflush(stderr);
         ctx->hglrc = wglCreateContextAttribsARB(ctx->hdc, nullptr, attribs);
         if (ctx->hglrc) {
             /* Mark that sharing is unavailable so callers can skip blit setup. */

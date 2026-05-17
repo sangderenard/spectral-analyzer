@@ -1454,6 +1454,26 @@ struct PyRayTracer
 
     /* ── Persistent-machine async API ───────────────────────────────────── */
 
+    void ensure_pipeline(
+        int                  max_children  = 2,
+        int                  seed          = 42,
+        double               min_amplitude = 1e-6,
+        bool                 use_gpu_compute = false,
+        bool                 gpu_all_stages  = false,
+        std::string          shader_dir      = "")
+    {
+        {
+            std::lock_guard<std::mutex> lk(_pipeline_mu);
+            if (!_pipeline) {
+                _default_min_amplitude = min_amplitude;
+                _use_gpu_compute = use_gpu_compute;
+                _gpu_all_stages  = gpu_all_stages;
+                if (!shader_dir.empty()) _shader_dir = shader_dir;
+            }
+        }
+        (void)_get_pipeline(max_children, seed);
+    }
+
     /*
      * submit_rays(origins, directions, amplitudes, src_ids, tags,
      *             max_bounces, min_amplitude, max_children, seed)
@@ -4910,6 +4930,16 @@ Returns dict with:
 R"doc(Non-blocking submit: push ray intents into the persistent pipeline.
 Returns immediately; the pipeline processes them concurrently.
 Call drain_records() to collect output records.)doc")
+        .def("ensure_pipeline", &PyRayTracer::ensure_pipeline,
+             py::arg("max_children") = 2,
+             py::arg("seed") = 42,
+             py::arg("min_amplitude") = 1e-6,
+             py::arg("use_gpu_compute") = false,
+             py::arg("gpu_all_stages") = false,
+             py::arg("shader_dir") = "",
+R"doc(Force creation of the persistent ray pipeline without submitting rays.
+Use this on the display thread when the pipeline needs to share with the
+currently-bound OpenGL display context.)doc")
         .def("drain_records", &PyRayTracer::drain_records,
              py::arg("max_n") = 50000,
 R"doc(Non-blocking drain: pop up to max_n completed records from the output queue.

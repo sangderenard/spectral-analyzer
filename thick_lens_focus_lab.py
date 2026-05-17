@@ -2462,48 +2462,51 @@ def _build_scene_mesh(
     
     _build_screen(scene, tris, mats, idx_black, tri_ids=image_plate_tri_ids)
 
-    # Sensor chamber enclosure — three-piece opaque box around the entire
-    # sensor plate region.  This region has NO tube wall: tube_radius (70 mm)
-    # is far smaller than the sensor (160 mm radius disc).
+    # Sensor chamber enclosure around the full circular sensor plate.  The
+    # outer wall tapers from the post-lens tube to the sensor disc instead of
+    # carrying the sensor radius all the way back to the exit-pupil plane.
     # Without this enclosure every backward ray from an outer pixel launches
     # into open air and traverses the entire scene unchecked.
     #
-    # The sensor plate is a CIRCULAR DISC of radius sensor_r, so the barrel
-    # only needs a small margin over sensor_r — not the sqrt(2) diagonal that
-    # would be needed for a square sensor.
-    #
     # Three pieces:
-    #   1. Outer barrel cylinder  — lateral wall, exit_pupil_x → image_plate.x
-    #   2. Rear annular cap       — seals face at exit_pupil_x (tube_r → barrel_r)
-    #   3. Front annular cap      — seals disc-vs-barrel gap at image_plate.x
-    #                               (sensor_r → barrel_r)
-    _sensor_r  = float(scene.image_plate.radius)
-    _barrel_r  = _sensor_r + 0.010   # 10 mm margin over circular sensor disc
+    #   1. Outer tapered hull — lateral wall, exit_pupil_x → image_plate.x
+    #   2. Rear annular cap   — seals face at exit_pupil_x (tube_r → rear hull)
+    #   3. Front annular cap  — seals disc-vs-hull gap at image_plate.x
     _x_ap      = float(scene.exit_pupil_x)
     _x_sensor  = float(scene.image_plate.x)
     _tube_r    = float(scene.tube_radius)
+    _sensor_r  = float(scene.image_plate.radius)
+    _hull_margin = 0.010
+    _hull_r_ap     = _tube_r + _hull_margin
+    _hull_r_sensor = _sensor_r + _hull_margin
 
-    # 1. Outer barrel — tracked separately so it can have its own UV page
+    # 1. Outer tapered hull — tracked separately so it can have its own UV page.
     camera_barrel_tri_ids: list = []
-    _build_cylinder_walls(
-        _x_ap, _x_sensor, _barrel_r, 96,
-        tris, mats, idx_aperture_black,
+    _build_sensor_aperture_frustum(
+        x_aperture=_x_ap,
+        r_aperture=_hull_r_ap,
+        x_sensor=_x_sensor,
+        r_sensor=_hull_r_sensor,
+        n_theta=96,
+        tri_list=tris,
+        mat_ids=mats,
+        mat_idx=idx_aperture_black,
         tri_ids=camera_barrel_tri_ids,
     )
     camera_body_tri_ids.extend(camera_barrel_tri_ids)
-    # 2. Rear cap: ring from tube wall to barrel (inward-facing, closes the back)
+    # 2. Rear cap: ring from tube wall to tapered hull (closes the back)
     camera_rear_cap_tri_ids: list = []
     _build_baffle_annulus(
-        _x_ap, _tube_r, _barrel_r, 96,
+        _x_ap, _tube_r, _hull_r_ap, 96,
         tris, mats, idx_aperture_black,
         tri_ids=camera_rear_cap_tri_ids,
         thickness=0.0,
     )
     camera_body_tri_ids.extend(camera_rear_cap_tri_ids)
-    # 3. Front cap: ring from inscribed sensor circle to barrel (closes corner arcs)
+    # 3. Front cap: ring from sensor circle to tapered hull
     camera_front_cap_tri_ids: list = []
     _build_baffle_annulus(
-        _x_sensor, _sensor_r, _barrel_r, 96,
+        _x_sensor, _sensor_r, _hull_r_sensor, 96,
         tris, mats, idx_aperture_black,
         tri_ids=camera_front_cap_tri_ids,
         thickness=0.0,
@@ -2512,14 +2515,12 @@ def _build_scene_mesh(
 
     # Sensor-to-aperture frustum: inner cone wall connecting exit-pupil
     # aperture hole to the sensor diagonal so all corner pixels are bounded.
-    # r_sensor is the full diagonal (= barrel_r) so no corner pixel starts
-    # outside the cone.
     camera_frustum_tri_ids: list = []
     _build_sensor_aperture_frustum(
         x_aperture=_x_ap,
         r_aperture=float(scene.exit_pupil_radius),
         x_sensor=_x_sensor,
-        r_sensor=_barrel_r,
+        r_sensor=_sensor_r,
         n_theta=96,
         tri_list=tris,
         mat_ids=mats,
@@ -2533,7 +2534,7 @@ def _build_scene_mesh(
         f"x_sensor={_x_sensor:.4f}",
         f"tube_r={_tube_r*1e3:.1f}mm",
         f"sensor_r={_sensor_r*1e3:.1f}mm",
-        f"barrel_r={_barrel_r*1e3:.1f}mm",
+        f"hull_r=({_hull_r_ap*1e3:.1f},{_hull_r_sensor*1e3:.1f})mm",
         flush=True,
     )
 

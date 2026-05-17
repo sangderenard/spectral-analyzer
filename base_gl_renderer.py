@@ -621,14 +621,24 @@ class BaseGLRenderer:
         if self._u_enable_emission_direct != -1:
             glUniform1i(self._u_enable_emission_direct, 1 if self._enable_emission_direct else 0)
 
-    def _upload_point_lights(self) -> None:
+    def _upload_point_lights(self, mv_mat: "np.ndarray | None" = None) -> None:
         n = int(min(100, self._light_pos.shape[0]))
         if self._u_num_lights != -1:
             glUniform1i(self._u_num_lights, n)
         if n <= 0:
             return
         if self._u_light_pos != -1:
-            glUniform3fv(self._u_light_pos, n, self._light_pos.ctypes.data_as(ctypes.c_void_p))
+            if mv_mat is not None and n > 0:
+                # Transform object-space light positions into view space so the
+                # fragment shader's vPosV (also view-space) produces correct Lvec.
+                R = mv_mat[:3, :3]
+                t = mv_mat[:3, 3]
+                pos_vs = np.ascontiguousarray(
+                    (self._light_pos[:n] @ R.T) + t, dtype=np.float32
+                )
+                glUniform3fv(self._u_light_pos, n, pos_vs.ctypes.data_as(ctypes.c_void_p))
+            else:
+                glUniform3fv(self._u_light_pos, n, self._light_pos.ctypes.data_as(ctypes.c_void_p))
         if self._u_light_color != -1:
             glUniform3fv(self._u_light_color, n, self._light_color.ctypes.data_as(ctypes.c_void_p))
         if self._u_light_intensity != -1:
@@ -730,7 +740,9 @@ class BaseGLRenderer:
             glUniformMatrix4fv(self._u_mv, 1, GL_FALSE, mv.ctypes.data_as(ctypes.c_void_p))
 
         self._upload_feature_toggles()
-        self._upload_point_lights()
+        # mv arrives column-major (V.T.ravel()); reshape+transpose recovers row-major V.
+        _mv_mat = mv.reshape(4, 4).T
+        self._upload_point_lights(mv_mat=_mv_mat)
 
         glDisable(GL_CULL_FACE)
         glDepthMask(GL_TRUE if depth_write else GL_FALSE)

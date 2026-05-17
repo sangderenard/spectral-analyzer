@@ -5441,8 +5441,8 @@ def _fly_norm(v: np.ndarray) -> np.ndarray:
 
 def _fly_lookat(eye: np.ndarray, center: np.ndarray, up: np.ndarray) -> np.ndarray:
     f = _fly_norm(center - eye)
-    r = _fly_norm(np.cross(f, up))
-    u = np.cross(r, f)
+    r = _fly_norm(np.cross(up, f))  # cross(up, f) gives +right when looking along +Z
+    u = np.cross(f, r)
     return np.array([
         [ r[0],  r[1],  r[2], -float(np.dot(r, eye))],
         [ u[0],  u[1],  u[2], -float(np.dot(u, eye))],

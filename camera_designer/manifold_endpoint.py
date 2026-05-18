@@ -82,7 +82,10 @@ class ManifoldEndpoint:
         self._r_inner  = float(ap.r_inner)
         self._z_sensor = float(preset.sensor.z_pos)
         self._r_sensor = float(preset.sensor.r_max)
-        self._manifold_lut = None   # set by bake_lut(); queried by transfer_ray()
+        self._z_front_ref = float(
+            max(el.z_vertex for el in preset.lens_group.elements) + 0.001)
+        self._manifold_lut  = None   # set by bake_lut(); queried by transfer_ray()
+        self._full_data: Optional[np.ndarray] = None  # (N,14) set by bake_full_assembly()
 
     # ── Public helpers ─────────────────────────────────────────────────────
 
@@ -139,6 +142,148 @@ class ManifoldEndpoint:
         self._manifold_lut = worker.bake()
         return self._manifold_lut
 
+    def bake_full_assembly(
+        self,
+        n_rays: int = 65_536,
+        n_wavelengths: int = 3,
+        n_refine: int = 2,
+        focus_offsets: "list[float] | None" = None,
+        n_focus_steps: int = 1,
+        focus_range_m: float = 2e-3,
+        verbose: bool = True,
+    ) -> np.ndarray:
+        """Bake the complete front-lens → sensor path as a single (N, 14) array.
+
+        This is the "whole assembly as one LUT" bake.  Every noodle records:
+          cols 0-10 : standard schema (aperture UV, field angle, in/out dirs, OPL)
+          col  11,12: sensor_x, sensor_y — the actual traced sensor landing position
+          col  13   : focus_z offset (metres) — 0.0 for nominal focus
+
+        For a single focus position use ``n_focus_steps=1`` (default).
+        For a focus sweep provide either ``focus_offsets`` (explicit list of
+        sensor z offsets in metres) or ``n_focus_steps`` + ``focus_range_m``
+        (uniform steps over ±focus_range_m/2).
+
+        The result is stored in ``self._full_data`` and returned.
+        ``render_sensor_image()`` will use it automatically — zero ray tracing
+        at query time.
+
+        Parameters
+        ----------
+        n_rays        : rays per focus step
+        n_wavelengths : wavelength samples for chromatic averaging
+        n_refine      : adaptive refinement passes per focus step
+        focus_offsets : explicit sensor z offsets (metres); overrides n_focus_steps
+        n_focus_steps : number of focus steps when focus_offsets is None
+        focus_range_m : total focus sweep range (metres)
+        verbose       : print progress
+
+        Returns
+        -------
+        (N, 14) float64 array
+        """
+        from .bake_worker import BakeWorker
+        worker = BakeWorker(
+            self.preset,
+            n_rays=n_rays,
+            n_wavelengths=n_wavelengths,
+            n_refine=n_refine,
+            verbose=verbose,
+        )
+        self._full_data = worker.bake_assembly(
+            focus_offsets=focus_offsets,
+            n_focus_steps=n_focus_steps,
+            focus_range_m=focus_range_m,
+        )
+        return self._full_data
+
+    def bake_cpp_transfer_grid_streaming(
+        self,
+        n_rays: int,
+        n_u: int,
+        n_v: int,
+        n_wavelengths: int = 3,
+        full_assembly_payload: bool = True,
+        focus_z: float = 0.0,
+        batch_size: int = 65_536,
+        verbose: bool = True,
+    ) -> np.ndarray:
+        """Bake directly into the C++ transfer payload without storing noodles.
+
+        This is the path for very large tables.  It streams traced noodle
+        chunks into the final float32 grid, then normalizes cell means in place.
+        """
+        import copy
+        from .bake_worker import BakeWorker
+
+        stride = 9 if full_assembly_payload else 7
+        header_len = 12 if full_assembly_payload else 8
+        magic = 14947.0 if full_assembly_payload else 14946.0
+        header = np.array(
+            [magic, float(n_u), float(n_v),
+             -1.0, 1.0, -1.0, 1.0, self._r_ap],
+            dtype=np.float32,
+        )
+        if full_assembly_payload:
+            header = np.concatenate([
+                header,
+                np.array([self._z_sensor, focus_z, self._z_front_ref, 0.0],
+                         dtype=np.float32),
+            ])
+
+        payload = np.zeros(header_len + n_u * n_v * stride, dtype=np.float32)
+        payload[:header_len] = header
+        cells = payload[header_len:].reshape(n_v, n_u, stride)
+
+        preset = copy.deepcopy(self.preset)
+        preset.sensor.z_pos = float(preset.sensor.z_pos) + float(focus_z)
+        worker = BakeWorker(
+            preset,
+            n_rays=batch_size,
+            n_wavelengths=n_wavelengths,
+            n_refine=0,
+            verbose=False,
+        )
+
+        def _accumulate(data: np.ndarray) -> int:
+            if data is None or len(data) == 0:
+                return 0
+            iu = np.clip(((data[:, 0] + 1.0) * 0.5 * n_u).astype(np.int64),
+                         0, n_u - 1)
+            iv = np.clip(((data[:, 1] + 1.0) * 0.5 * n_v).astype(np.int64),
+                         0, n_v - 1)
+            np.add.at(cells[:, :, 0], (iv, iu), data[:, 7].astype(np.float32, copy=False))
+            np.add.at(cells[:, :, 1], (iv, iu), data[:, 8].astype(np.float32, copy=False))
+            np.add.at(cells[:, :, 2], (iv, iu), data[:, 9].astype(np.float32, copy=False))
+            np.add.at(cells[:, :, 3], (iv, iu), data[:, 10].astype(np.float32, copy=False))
+            np.add.at(cells[:, :, 4], (iv, iu), 1.0)
+            np.add.at(cells[:, :, 5], (iv, iu), data[:, 4].astype(np.float32, copy=False))
+            np.add.at(cells[:, :, 6], (iv, iu), data[:, 5].astype(np.float32, copy=False))
+            if full_assembly_payload:
+                np.add.at(cells[:, :, 7], (iv, iu), data[:, 11].astype(np.float32, copy=False))
+                np.add.at(cells[:, :, 8], (iv, iu), data[:, 12].astype(np.float32, copy=False))
+            return int(len(data))
+
+        traced = 0
+        accepted = 0
+        while traced < n_rays:
+            n = min(batch_size, n_rays - traced)
+            ro, rd = worker._sample_rays(n)
+            chunk = worker._trace_batch(
+                ro, rd, focus_z=float(focus_z), preset_override=preset)
+            accepted += _accumulate(chunk)
+            traced += n
+            if verbose and (traced == n_rays or traced % max(batch_size * 16, 1) == 0):
+                print(f"[ManifoldEndpoint] streamed {traced:,}/{n_rays:,} rays"
+                      f" accepted={accepted:,}", flush=True)
+
+        counts = cells[:, :, 4]
+        mask = counts > 0.0
+        for ch in ([0, 1, 2, 3, 5, 6, 7, 8]
+                   if full_assembly_payload else [0, 1, 2, 3, 5, 6]):
+            cells[:, :, ch][mask] /= counts[mask]
+        return payload
+
     def transfer_ray(
         self,
         ap_uv: np.ndarray,
@@ -172,8 +317,11 @@ class ManifoldEndpoint:
         self,
         n_u: int = 32,
         n_v: int = 32,
+        focus_z: float = 0.0,
+        full_assembly_payload: bool = False,
+        accumulator_dtype=np.float32,
     ) -> Optional[np.ndarray]:
-        """Convert the baked LensManifold into a compact float32 payload grid.
+        """Convert baked noodles into a compact float32 payload grid.
 
         The grid can be passed directly to
         ``tracer.add_scale_context(..., payload=grid)`` with
@@ -196,22 +344,48 @@ class ManifoldEndpoint:
           [4]    count         — noodle count (0 = empty cell)
           [5..6] in_dx/dy      — mean input direction x, y (diagnostics)
 
+        If a standard ``LensManifold`` exists, its 11-column data is used.
+        Otherwise a full-assembly bake can provide the same columns in
+        ``_full_data``; for focus sweeps, the nearest focus slice is selected.
+
         Returns None if no LUT has been baked yet.
         """
-        if self._manifold_lut is None or self._manifold_lut._data is None:
+        if self._manifold_lut is not None and self._manifold_lut._data is not None:
+            data = self._manifold_lut._data   # (N, 11) float64
+        elif self._full_data is not None and len(self._full_data) > 0:
+            full = self._full_data
+            fz = full[:, 13]
+            unique_fz = np.unique(fz)
+            nearest = unique_fz[np.argmin(np.abs(unique_fz - focus_z))]
+            data = full[np.abs(fz - nearest) < 1e-9, :]
+            if len(data) == 0:
+                return None
+        else:
             return None
 
-        data = self._manifold_lut._data   # (N, 11) float64
-
-        MAGIC = 14946.0
+        use_full = (
+            full_assembly_payload
+            and self._full_data is not None
+            and len(self._full_data) > 0
+        )
+        MAGIC = 14947.0 if use_full else 14946.0
         header = np.array(
             [MAGIC, float(n_u), float(n_v),
              -1.0, 1.0, -1.0, 1.0, self._r_ap],
             dtype=np.float32,
         )
 
-        # Accumulate into (n_v, n_u, 7) grid
-        cells = np.zeros((n_v, n_u, 7), dtype=np.float64)
+        if use_full:
+            header = np.concatenate([
+                header,
+                np.array([self._z_sensor, focus_z, self._z_front_ref, 0.0], dtype=np.float32),
+            ])
+
+        stride = 9 if use_full else 7
+        header_len = 12 if use_full else 8
+        payload = np.zeros(header_len + n_v * n_u * stride, dtype=np.float32)
+        payload[:header_len] = header.astype(np.float32, copy=False)
+        cells = payload[header_len:].reshape(n_v, n_u, stride)
 
         u_vals = data[:, 0]   # normalised u in [-1, 1]
         v_vals = data[:, 1]   # normalised v in [-1, 1]
@@ -223,22 +397,123 @@ class ManifoldEndpoint:
         iu = np.clip(((u_vals + 1.0) * 0.5 * n_u).astype(int), 0, n_u - 1)
         iv = np.clip(((v_vals + 1.0) * 0.5 * n_v).astype(int), 0, n_v - 1)
 
-        np.add.at(cells[:, :, 0], (iv, iu), out_d[:, 0])
-        np.add.at(cells[:, :, 1], (iv, iu), out_d[:, 1])
-        np.add.at(cells[:, :, 2], (iv, iu), out_d[:, 2])
-        np.add.at(cells[:, :, 3], (iv, iu), opl)
+        np.add.at(cells[:, :, 0], (iv, iu), out_d[:, 0].astype(accumulator_dtype, copy=False))
+        np.add.at(cells[:, :, 1], (iv, iu), out_d[:, 1].astype(accumulator_dtype, copy=False))
+        np.add.at(cells[:, :, 2], (iv, iu), out_d[:, 2].astype(accumulator_dtype, copy=False))
+        np.add.at(cells[:, :, 3], (iv, iu), opl.astype(accumulator_dtype, copy=False))
         np.add.at(cells[:, :, 4], (iv, iu), 1.0)
-        np.add.at(cells[:, :, 5], (iv, iu), in_d[:, 0])
-        np.add.at(cells[:, :, 6], (iv, iu), in_d[:, 1])
+        np.add.at(cells[:, :, 5], (iv, iu), in_d[:, 0].astype(accumulator_dtype, copy=False))
+        np.add.at(cells[:, :, 6], (iv, iu), in_d[:, 1].astype(accumulator_dtype, copy=False))
+        if use_full:
+            np.add.at(cells[:, :, 7], (iv, iu), data[:, 11].astype(accumulator_dtype, copy=False))
+            np.add.at(cells[:, :, 8], (iv, iu), data[:, 12].astype(accumulator_dtype, copy=False))
 
         # Divide accumulated sums by count
         counts = cells[:, :, 4:5]
         mask   = counts[:, :, 0] > 0
-        for ch in [0, 1, 2, 3, 5, 6]:
+        mean_channels = [0, 1, 2, 3, 5, 6]
+        if use_full:
+            mean_channels.extend([7, 8])
+        for ch in mean_channels:
             cells[:, :, ch][mask] /= counts[:, :, 0][mask]
 
-        payload = np.concatenate([header, cells.ravel().astype(np.float32)])
-        return payload.astype(np.float32, copy=False)
+        return payload
+
+    def render_sensor_image(
+        self,
+        n_px: int,
+        n_py: int,
+        focus_z: float = 0.0,
+        focus_sigma_m: float = 0.5e-3,
+    ) -> Optional[np.ndarray]:
+        """Fast sensor image from the baked LUT — no ray tracing.
+
+        Uses pre-baked sensor hit positions (``_full_data``) when available.
+        Falls back to projecting ``out_dir`` from the standard 11-col LUT.
+        Returns ``(n_py, n_px, 3)`` float32 RGB, or None if nothing is baked.
+
+        Parameters
+        ----------
+        n_px, n_py    : output image dimensions
+        focus_z       : desired focus offset from nominal (metres).
+                        Only meaningful when ``_full_data`` has focus sweep data.
+        focus_sigma_m : Gaussian width for blending across focus steps.
+                        Noodles are weighted by exp(-(Δfz/focus_sigma_m)²).
+                        Use 0.0 to select only the nearest focus slice.
+        """
+        # ── Preferred path: full-assembly data with pre-baked sensor hits ──
+        if self._full_data is not None and len(self._full_data) > 0:
+            data = self._full_data        # (N, 14)
+            fz   = data[:, 13]           # focus_z of each noodle
+
+            if focus_sigma_m > 0.0:
+                d = (fz - focus_z) / focus_sigma_m
+                w = np.exp(-(d * d))
+            else:
+                # Hard-select nearest focus slice
+                unique_fz = np.unique(fz)
+                nearest   = unique_fz[np.argmin(np.abs(unique_fz - focus_z))]
+                w = (np.abs(fz - nearest) < 1e-9).astype(np.float64)
+
+            valid_mask = w > 1e-4
+            if not np.any(valid_mask):
+                return None
+
+            sx = data[valid_mask, 11]   # pre-baked sensor x (metres)
+            sy = data[valid_mask, 12]   # pre-baked sensor y
+            nw = w[valid_mask]
+
+            r_s = self._r_sensor
+            px  = ((sx + r_s) / (2.0 * r_s) * n_px).astype(int)
+            py  = ((sy + r_s) / (2.0 * r_s) * n_py).astype(int)
+            ok  = (px >= 0) & (px < n_px) & (py >= 0) & (py < n_py)
+            px, py, nw = px[ok], py[ok], nw[ok]
+
+            accum = np.zeros(n_px * n_py, dtype=np.float64)
+            np.add.at(accum, py * n_px + px, nw)
+
+            img  = np.zeros((n_py, n_px, 3), dtype=np.float32)
+            peak = float(accum.max())
+            if peak > 0.0:
+                bright = (accum / peak).reshape(n_py, n_px).astype(np.float32)
+                img[:, :, 0] = bright
+                img[:, :, 1] = bright * 0.85
+                img[:, :, 2] = bright * 0.65
+            return img
+
+        # ── Fallback: project out_dir from standard LUT ────────────────────
+        if self._manifold_lut is None or self._manifold_lut._data is None:
+            return None
+
+        data   = self._manifold_lut._data   # (N, 11)
+        u_ap   = data[:, 0] * self._r_ap
+        v_ap   = data[:, 1] * self._r_ap
+        out_dx = data[:, 7]
+        out_dy = data[:, 8]
+        out_dz = data[:, 9]
+
+        dz_safe = np.where(np.abs(out_dz) > 1e-12, out_dz, np.nan)
+        t  = (self._z_sensor - self._z_ap) / dz_safe
+        sx = u_ap + out_dx * t
+        sy = v_ap + out_dy * t
+
+        r_s = self._r_sensor
+        px  = ((sx + r_s) / (2.0 * r_s) * n_px).astype(int)
+        py  = ((sy + r_s) / (2.0 * r_s) * n_py).astype(int)
+        ok  = (px >= 0) & (px < n_px) & (py >= 0) & (py < n_py) & np.isfinite(sx)
+        px, py = px[ok], py[ok]
+
+        accum = np.zeros(n_px * n_py, dtype=np.float64)
+        np.add.at(accum, py * n_px + px, 1.0)
+
+        img  = np.zeros((n_py, n_px, 3), dtype=np.float32)
+        peak = float(accum.max())
+        if peak > 0.0:
+            bright = (accum / peak).reshape(n_py, n_px).astype(np.float32)
+            img[:, :, 0] = bright
+            img[:, :, 1] = bright * 0.85
+            img[:, :, 2] = bright * 0.65
+        return img
 
     # ── Record samplers ────────────────────────────────────────────────────
 

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import math
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -1056,6 +1057,233 @@ class TestStreamId(unittest.TestCase):
         self.assertTrue(np.all(recs["stream_id"] == 1.0))
 
 
+class TestManifoldEndpointBake(unittest.TestCase):
+    """Smoke tests for ManifoldEndpoint bake_lut / build_transfer_grid / transfer_ray."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from camera_designer.camera_preset import simple_doublet_preset
+            from camera_designer.manifold_endpoint import ManifoldEndpoint
+            cls._preset = simple_doublet_preset()
+            cls._ep     = ManifoldEndpoint(cls._preset, n_bands=1)
+            cls._skip   = False
+        except Exception:
+            cls._skip = True
+
+    def _maybe_skip(self):
+        if self._skip:
+            self.skipTest("camera_designer not importable")
+
+    def test_forward_records_non_empty(self):
+        self._maybe_skip()
+        recs = self._ep.sample_forward_records(64, seed=0)
+        self.assertGreater(recs.shape[0], 0, "forward records should be non-empty")
+
+    def test_sensor_records_non_empty(self):
+        self._maybe_skip()
+        recs = self._ep.sample_sensor_records(4, 4, n_per_pixel=1, seed=0)
+        self.assertGreater(recs.shape[0], 0, "sensor records should be non-empty")
+
+    def test_bake_lut_runs(self):
+        self._maybe_skip()
+        lut = self._ep.bake_lut(n_rays=256, n_wavelengths=1, n_refine=0, verbose=False)
+        self.assertIsNotNone(lut)
+        self.assertGreater(lut.n_noodles, 0, "baked LUT should have noodles")
+
+    def test_transfer_ray_returns_unit_vector(self):
+        self._maybe_skip()
+        if self._ep._manifold_lut is None:
+            self._ep.bake_lut(n_rays=256, n_wavelengths=1, n_refine=0, verbose=False)
+        out = self._ep.transfer_ray(np.array([0.0, 0.0]), np.array([0.0, 0.0, -1.0]))
+        if out is not None:
+            self.assertAlmostEqual(float(np.linalg.norm(out)), 1.0, places=5)
+
+    def test_build_transfer_grid_shape(self):
+        self._maybe_skip()
+        if self._ep._manifold_lut is None:
+            self._ep.bake_lut(n_rays=256, n_wavelengths=1, n_refine=0, verbose=False)
+        grid = self._ep.build_transfer_grid(n_u=16, n_v=16)
+        self.assertIsNotNone(grid)
+        expected_len = 8 + 7 * 16 * 16
+        self.assertEqual(len(grid), expected_len,
+                         f"grid should be {expected_len} floats, got {len(grid)}")
+        self.assertEqual(grid.dtype, np.float32)
+
+    def test_transfer_grid_magic(self):
+        self._maybe_skip()
+        if self._ep._manifold_lut is None:
+            self._ep.bake_lut(n_rays=256, n_wavelengths=1, n_refine=0, verbose=False)
+        grid = self._ep.build_transfer_grid(n_u=16, n_v=16)
+        self.assertAlmostEqual(float(grid[0]), 14946.0, places=1, msg="magic sentinel")
+        self.assertAlmostEqual(float(grid[1]), 16.0, places=1, msg="n_u")
+        self.assertAlmostEqual(float(grid[2]), 16.0, places=1, msg="n_v")
+
+    def test_transfer_grid_non_empty_cells(self):
+        self._maybe_skip()
+        if self._ep._manifold_lut is None:
+            self._ep.bake_lut(n_rays=256, n_wavelengths=1, n_refine=0, verbose=False)
+        grid = self._ep.build_transfer_grid(n_u=16, n_v=16)
+        cells = grid[8:].reshape(16, 16, 7)
+        counts = cells[:, :, 4]
+        n_filled = int(np.count_nonzero(counts))
+        self.assertGreater(n_filled, 0, "at least some grid cells should be filled")
+
+    def test_render_sensor_image_shape_and_non_empty(self):
+        self._maybe_skip()
+        if self._ep._manifold_lut is None:
+            self._ep.bake_lut(n_rays=512, n_wavelengths=1, n_refine=0, verbose=False)
+        img = self._ep.render_sensor_image(8, 8)
+        self.assertIsNotNone(img)
+        self.assertEqual(img.shape, (8, 8, 3))
+        self.assertGreater(float(img.max()), 0.0, "sensor image should have non-zero pixels")
+
+    def test_render_sensor_image_none_without_bake(self):
+        self._maybe_skip()
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+        ep_fresh = ManifoldEndpoint(self._preset, n_bands=1)
+        result = ep_fresh.render_sensor_image(8, 8)
+        self.assertIsNone(result, "should return None when no LUT is baked")
+
+
+class TestFullAssemblyBake(unittest.TestCase):
+    """Tests for BakeWorker.bake_assembly and ManifoldEndpoint.bake_full_assembly."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from camera_designer.camera_preset import simple_doublet_preset
+            from camera_designer.manifold_endpoint import ManifoldEndpoint
+            from camera_designer.bake_worker import BakeWorker
+            cls._preset     = simple_doublet_preset()
+            cls._ep         = ManifoldEndpoint(cls._preset, n_bands=1)
+            cls._BakeWorker = BakeWorker
+            cls._skip       = False
+        except Exception:
+            cls._skip = True
+
+    def _maybe_skip(self):
+        if self._skip:
+            self.skipTest("camera_designer not importable")
+
+    def test_bake_assembly_14_cols(self):
+        self._maybe_skip()
+        worker = self._BakeWorker(
+            self._preset, n_rays=128, n_wavelengths=1, n_refine=0, verbose=False)
+        data = worker.bake_assembly(n_focus_steps=1)
+        self.assertEqual(data.ndim, 2)
+        self.assertEqual(data.shape[1], 14, "full-assembly noodles must have 14 cols")
+        self.assertGreater(data.shape[0], 0, "must produce at least one noodle")
+
+    def test_bake_assembly_focus_z_nominal(self):
+        self._maybe_skip()
+        worker = self._BakeWorker(
+            self._preset, n_rays=128, n_wavelengths=1, n_refine=0, verbose=False)
+        data = worker.bake_assembly(n_focus_steps=1)
+        self.assertTrue(
+            np.all(data[:, 13] == 0.0),
+            "nominal single-step bake should tag all noodles with focus_z=0 in col 13")
+
+    def test_bake_assembly_multi_focus_unique_tags(self):
+        self._maybe_skip()
+        worker = self._BakeWorker(
+            self._preset, n_rays=64, n_wavelengths=1, n_refine=0, verbose=False)
+        data = worker.bake_assembly(n_focus_steps=3, focus_range_m=1e-3)
+        unique_fz = np.unique(data[:, 13])
+        self.assertGreaterEqual(
+            len(unique_fz), 2,
+            "3-step bake should produce at least 2 distinct focus_z values in col 13")
+
+    def test_bake_full_assembly_stores_full_data(self):
+        self._maybe_skip()
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+        ep = ManifoldEndpoint(self._preset, n_bands=1)
+        result = ep.bake_full_assembly(
+            n_rays=128, n_wavelengths=1, n_refine=0, n_focus_steps=1, verbose=False)
+        self.assertIsNotNone(ep._full_data)
+        self.assertEqual(ep._full_data.shape[1], 14)
+        self.assertIs(result, ep._full_data,
+                      "bake_full_assembly must return the same array stored in _full_data")
+
+    def test_full_assembly_builds_transfer_grid(self):
+        self._maybe_skip()
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+        ep = ManifoldEndpoint(self._preset, n_bands=1)
+        ep.bake_full_assembly(
+            n_rays=128, n_wavelengths=1, n_refine=0, n_focus_steps=1, verbose=False)
+        grid = ep.build_transfer_grid(n_u=8, n_v=8)
+        self.assertIsNotNone(grid)
+        self.assertEqual(grid.dtype, np.float32)
+        self.assertEqual(len(grid), 8 + 7 * 8 * 8)
+
+    def test_full_assembly_builds_cpp_v2_transfer_grid(self):
+        self._maybe_skip()
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+        ep = ManifoldEndpoint(self._preset, n_bands=1)
+        ep.bake_full_assembly(
+            n_rays=128, n_wavelengths=1, n_refine=0, n_focus_steps=1, verbose=False)
+        grid = ep.build_transfer_grid(
+            n_u=8, n_v=8, full_assembly_payload=True)
+        self.assertIsNotNone(grid)
+        self.assertEqual(grid.dtype, np.float32)
+        self.assertAlmostEqual(float(grid[0]), 14947.0, places=1)
+        self.assertTrue(np.isfinite(grid[10]))
+        self.assertEqual(len(grid), 12 + 9 * 8 * 8)
+
+    def test_render_sensor_image_full_assembly_path(self):
+        self._maybe_skip()
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+        ep = ManifoldEndpoint(self._preset, n_bands=1)
+        ep.bake_full_assembly(
+            n_rays=256, n_wavelengths=1, n_refine=0, n_focus_steps=1, verbose=False)
+        img = ep.render_sensor_image(16, 16, focus_z=0.0)
+        self.assertIsNotNone(img)
+        self.assertEqual(img.shape, (16, 16, 3))
+        self.assertEqual(img.dtype, np.float32)
+        self.assertGreater(float(img.max()), 0.0, "image must have non-zero pixels")
+
+    def test_render_sensor_image_focus_hard_select(self):
+        self._maybe_skip()
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+        ep = ManifoldEndpoint(self._preset, n_bands=1)
+        ep.bake_full_assembly(
+            n_rays=64, n_wavelengths=1, n_refine=0,
+            n_focus_steps=2, focus_range_m=0.5e-3, verbose=False)
+        if ep._full_data is None or len(ep._full_data) == 0:
+            self.skipTest("no full_data produced")
+        img = ep.render_sensor_image(8, 8, focus_z=0.0, focus_sigma_m=0.0)
+        if img is not None:
+            self.assertEqual(img.shape, (8, 8, 3))
+
+    def test_render_sensor_image_focus_blend(self):
+        self._maybe_skip()
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+        ep = ManifoldEndpoint(self._preset, n_bands=1)
+        ep.bake_full_assembly(
+            n_rays=128, n_wavelengths=1, n_refine=0,
+            n_focus_steps=3, focus_range_m=1e-3, verbose=False)
+        img = ep.render_sensor_image(8, 8, focus_z=0.0, focus_sigma_m=0.5e-3)
+        self.assertIsNotNone(img, "Gaussian-blended image should not be None")
+        self.assertEqual(img.shape, (8, 8, 3))
+
+    def test_training_table_contains_focus_and_wavelength(self):
+        self._maybe_skip()
+        with tempfile.TemporaryDirectory() as td:
+            path = f"{td}/training.npy"
+            worker = self._BakeWorker(
+                self._preset, n_rays=32, n_wavelengths=1, n_refine=0, verbose=False)
+            written, target = worker.bake_training_table(
+                path, target_gb=1e-6, n_focus_steps=2, focus_range_m=1e-3,
+                batch_size=32, max_attempt_factor=200.0)
+            data = np.load(path, mmap_mode="r")
+            self.assertEqual(data.shape[1], 16)
+            self.assertGreater(written, 0)
+            self.assertEqual(target, data.shape[0])
+            self.assertTrue(np.any(np.isfinite(data[:written, 13])))
+            self.assertTrue(np.any(data[:written, 14] > 0.0))
+            del data
+
+
 class TestMISWeights(unittest.TestCase):
     """MIS balance and power heuristic weight functions."""
 
@@ -1275,6 +1503,8 @@ if __name__ == "__main__":
         TestPixelConeOverlapStrategy,
         TestEndToEndPipelineSmoke,
         TestStreamId,
+        TestManifoldEndpointBake,
+        TestFullAssemblyBake,
         TestMISWeights,
         TestShadowRayChecker,
         TestManifoldWalkWithShadow,

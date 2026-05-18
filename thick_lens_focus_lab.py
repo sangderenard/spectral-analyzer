@@ -2839,6 +2839,27 @@ class ForwardCppLensBench:
         # Camera preset used by render_middle().  None → simple_doublet_preset().
         # Set this after construction to override the default.
         self._camera_preset = None
+        # Baked manifold transfer grid (float32 array) for NEURAL_SURFACE context.
+        # Built by render_middle() in a background thread after the first bake.
+        self._transfer_grid: Optional[np.ndarray] = None
+        self._transfer_grid_noodles: int = 0   # noodle count in latest bake
+        self._manifold_ctx_id: int = -1         # scale context id (-1 = not registered)
+        # The baked ManifoldEndpoint instance (set by _bake_transfer_grid_async).
+        # render_middle() uses this to call render_sensor_image() instead of
+        # re-tracing rays on subsequent calls.
+        self._baked_ep = None
+        # Noodle count target for the bake; set via bake_noodles run() param.
+        self._bake_noodles: int = 0
+        # Full-assembly bake parameters; set via run() params.
+        self._bake_full_assembly: bool = False
+        self._bake_focus_steps: int = 1
+        self._bake_focus_range_m: float = 2e-3
+        self._bake_grid_res: int = 64
+        self._bake_table_gb: float = 0.0
+        self._prebake_manifold: bool = False
+        self._bake_refine: int = 2
+        self._bake_wavelengths: int = 3
+        self._bake_noodles_per_cell: float = 1.0
         # Aperture plane geometry cached by _ensure_bdpt_plate_sensor_group;
         # used by _run_manifold_correlator to construct the PlaneSurface.
         self._bdpt_aperture_centre: Optional[np.ndarray] = None
@@ -4589,6 +4610,17 @@ class ForwardCppLensBench:
         if preset is None:
             preset = self._camera_preset or simple_doublet_preset()
 
+        # Fast path: if the baked LUT is ready, project all noodles onto the
+        # sensor plane directly — no Snell tracing needed.  This is the real
+        # "skip lens geometry" behaviour the bake enables.
+        if self._baked_ep is not None and manifold_mode == "full":
+            img = self._baked_ep.render_sensor_image(n_px, n_py)
+            if img is not None:
+                print(f"[middle/lut] {self._transfer_grid_noodles:,} noodles → "
+                      f"sensor {n_px}×{n_py}", flush=True)
+                self._last_bdpt_plate_rgb = img
+                return img
+
         ep = ManifoldEndpoint(preset, n_bands=1)
 
         fwd_recs = ep.sample_forward_records(
@@ -4638,7 +4670,131 @@ class ForwardCppLensBench:
             img[:, :, 2] = bright * 0.65
 
         self._last_bdpt_plate_rgb = img
+
+        # Background bake: build transfer grid and register NEURAL_SURFACE ctx.
+        # Fires only on the first render_middle call (or when no grid is cached).
+        if self._transfer_grid is None:
+            self._bake_transfer_grid_async(ep)
+
         return img
+
+    def _transfer_grid_resolved_size(self, stride: int) -> int:
+        if self._bake_table_gb > 0.0:
+            target_bytes = int(float(self._bake_table_gb) * (1024.0 ** 3))
+            n_cells = max(1, target_bytes // max(1, stride * 4))
+            return max(2, int(np.sqrt(float(n_cells))))
+        return max(2, int(self._bake_grid_res))
+
+    def _resolved_bake_noodles(self, n_grid: int) -> int:
+        if self._bake_noodles > 0:
+            return int(self._bake_noodles)
+        if self._bake_table_gb > 0.0:
+            n_cells = int(n_grid) * int(n_grid)
+            return max(1, int(np.ceil(n_cells * max(0.0, self._bake_noodles_per_cell))))
+        return 65_536
+
+    def _bake_transfer_grid_now(self, ep) -> None:
+        """Bake ep into a dense transfer grid and register the C++ scale context."""
+        stride = 9 if self._bake_full_assembly else 7
+        n_grid = self._transfer_grid_resolved_size(stride)
+        n_rays = self._resolved_bake_noodles(n_grid)
+        if self._bake_table_gb > 0.0:
+            approx_gb = ((12 if self._bake_full_assembly else 8) + n_grid * n_grid * stride) * 4.0 / (1024.0 ** 3)
+            print(f"[middle] streaming C++ transfer bake {n_rays:,} rays "
+                  f"into {n_grid}x{n_grid} stride={stride} "
+                  f"(~{approx_gb:.2f} GiB)...", flush=True)
+            grid = ep.bake_cpp_transfer_grid_streaming(
+                n_rays=n_rays,
+                n_u=n_grid,
+                n_v=n_grid,
+                n_wavelengths=self._bake_wavelengths,
+                full_assembly_payload=self._bake_full_assembly,
+                verbose=True,
+            )
+            n_src = n_rays
+            self._transfer_grid         = grid
+            self._transfer_grid_noodles = int(n_src)
+            self._baked_ep              = ep
+            return self._register_transfer_grid(ep, grid)
+
+        if self._bake_full_assembly:
+            fsteps = self._bake_focus_steps
+            frange = self._bake_focus_range_m
+            print(f"[middle] full-assembly bake ({n_rays:,}×{fsteps} focus steps"
+                  f", ±{frange*1e3:.1f}mm)…", flush=True)
+            ep.bake_full_assembly(
+                n_rays=n_rays, n_wavelengths=self._bake_wavelengths, n_refine=self._bake_refine,
+                n_focus_steps=fsteps, focus_range_m=frange, verbose=True)
+            n_total = len(ep._full_data) if ep._full_data is not None else 0
+            print(f"[middle] full-assembly bake done — {n_total:,} noodles", flush=True)
+        else:
+            print(f"[middle] baking transfer LUT ({n_rays:,} noodles)…", flush=True)
+            ep.bake_lut(
+                n_rays=n_rays,
+                n_wavelengths=self._bake_wavelengths,
+                n_refine=self._bake_refine,
+                verbose=True,
+            )
+
+        approx_gb = ((12 if self._bake_full_assembly else 8) + n_grid * n_grid * stride) * 4.0 / (1024.0 ** 3)
+        print(f"[middle] building C++ transfer payload {n_grid}×{n_grid} "
+              f"stride={stride} (~{approx_gb:.2f} GiB)…", flush=True)
+        grid = ep.build_transfer_grid(
+            n_u=n_grid,
+            n_v=n_grid,
+            full_assembly_payload=self._bake_full_assembly,
+        )
+        if grid is None:
+            print("[middle] bake produced empty grid", flush=True)
+            return
+        n_src = (len(ep._full_data) if ep._full_data is not None
+                 else ep._manifold_lut.n_noodles if ep._manifold_lut is not None
+                 else 0)
+        self._transfer_grid         = grid
+        self._transfer_grid_noodles = int(n_src)
+        self._baked_ep              = ep
+
+        self._register_transfer_grid(ep, grid)
+
+    def _register_transfer_grid(self, ep, grid) -> None:
+        import _spectral_kernels as _sk
+        NEURAL = _sk.SCALE_CONTEXT_KIND_NEURAL_SURFACE
+        RT_SCALE_GEOMETRIC = 0
+        ap = ep.preset.aperture_stop
+        ctx_id = self.tracer.add_scale_context(
+            pos          = np.array([0.0, 0.0, float(ap.z_pos)]),
+            radius       = float(ap.r_outer) * 6.0,
+            scale_type   = RT_SCALE_GEOMETRIC,
+            dt_m         = 0.0,
+            n_substeps   = 0,
+            n_real       = 1.0,
+            n_imag       = 0.0,
+            context_kind = NEURAL,
+            payload      = self._transfer_grid,
+        )
+        self._manifold_ctx_id = ctx_id
+        print(f"[middle] bake done — {self._transfer_grid_noodles:,} noodles,"
+              f" payload={grid.nbytes/(1024.0**3):.2f} GiB ctx_id={ctx_id}", flush=True)
+
+    def prebake_transfer_grid(self, preset=None) -> None:
+        from camera_designer.camera_preset import simple_doublet_preset
+        from camera_designer.manifold_endpoint import ManifoldEndpoint
+
+        preset = preset or self._camera_preset or simple_doublet_preset()
+        ep = ManifoldEndpoint(preset, n_bands=1)
+        self._bake_transfer_grid_now(ep)
+
+    def _bake_transfer_grid_async(self, ep) -> None:
+        """Fire a background bake for legacy first-render warmup."""
+        import threading as _th
+
+        def _worker():
+            try:
+                self._bake_transfer_grid_now(ep)
+            except Exception as _e:
+                print(f"[middle] bake error: {_e}", flush=True)
+
+        _th.Thread(target=_worker, daemon=True, name="manifold-bake").start()
 
     def render_manifold_bdpt(self, preset=None, **kw) -> np.ndarray:
         """Legacy alias for render_middle(manifold_mode='full').
@@ -5771,6 +5927,18 @@ def run(
     profile: bool = False,
     field_capture: bool = True,
     manifold_mode: str = "full",
+    bake_noodles: int = 0,
+    full_assembly: bool = False,
+    focus_steps: int = 1,
+    focus_range_mm: float = 2.0,
+    prebake_manifold: bool = False,
+    bake_grid_res: int = 64,
+    bake_table_gb: float = 0.0,
+    bake_refine: int = 2,
+    bake_wavelengths: int = 3,
+    bake_noodles_per_cell: float = 1.0,
+    bake_training_table: str = "",
+    bake_training_gb: float = 0.0,
 ) -> None:
     # "bdpt" is a legacy alias for "middle"
     if ray_mode == "bdpt":
@@ -5866,6 +6034,16 @@ def run(
         sidecar=sidecar,
         field_capture=field_capture,
     )
+    bench._bake_noodles       = int(bake_noodles)
+    bench._bake_full_assembly = bool(full_assembly)
+    bench._bake_focus_steps   = int(focus_steps)
+    bench._bake_focus_range_m = float(focus_range_mm) * 1e-3
+    bench._prebake_manifold   = bool(prebake_manifold)
+    bench._bake_grid_res      = int(bake_grid_res)
+    bench._bake_table_gb      = float(bake_table_gb)
+    bench._bake_refine        = int(bake_refine)
+    bench._bake_wavelengths   = int(bake_wavelengths)
+    bench._bake_noodles_per_cell = float(bake_noodles_per_cell)
 
     # Wire the display HGLRC and HDC to the tracer BEFORE the first submit_rays.
     if _gl_display_hglrc:
@@ -5896,6 +6074,28 @@ def run(
         _pip_res,
         0.008,
     )
+    if bake_training_gb > 0.0:
+        from camera_designer.camera_preset import simple_doublet_preset
+        from camera_designer.bake_worker import BakeWorker
+
+        train_path = bake_training_table or "manifold_training_table.npy"
+        worker = BakeWorker(
+            simple_doublet_preset(),
+            n_rays=max(1, int(bake_noodles)) if int(bake_noodles) > 0 else 65_536,
+            n_wavelengths=int(bake_wavelengths),
+            n_refine=0,
+            verbose=True,
+        )
+        written, target = worker.bake_training_table(
+            train_path,
+            target_gb=float(bake_training_gb),
+            n_focus_steps=int(focus_steps),
+            focus_range_m=float(focus_range_mm) * 1e-3,
+        )
+        print(f"[middle] neural training table {train_path}: "
+              f"{written:,}/{target:,} rows", flush=True)
+    if ray_mode == "middle" and (bench._prebake_manifold or bench._bake_table_gb > 0.0):
+        bench.prebake_transfer_grid()
     if compute_mode in ("gpu", "mixed"):
         try:
             bench.tracer.ensure_pipeline(
@@ -6382,34 +6582,50 @@ def run(
             nm = stats.get("near_miss_count", 0)
             dist_str = (f"dyz {nd*1000:.2f}mm" if nd >= 0.0 else "dyz --")
             mode_str = f"M/{manifold_mode}" if ray_mode == "middle" else ray_mode
-            hud_surf = pygame.Surface((_HUD_W, _HUD_H), pygame.SRCALPHA)
-            hud_surf.fill((0, 0, 0, 0))
             line_h = font.get_linesize()
-            for i, txt in enumerate([mode_str,
-                                      dist_str,
-                                      f"col {bc:.3f}",
-                                      f"snaps {es} nr {nm}"]):
-                colour = (180, 140, 255) if i == 0 else (80, 210, 255)
-                rendered = font.render(txt, True, colour)
-                hud_surf.blit(rendered, (2, i * (line_h + 1)))
-            # pygame surface → RGBA8 numpy array (y-flipped for GL)
-            raw = pygame.surfarray.array_alpha(
-                hud_surf.convert_alpha())  # shape (W, H)
-            rgb_raw = pygame.surfarray.array3d(hud_surf)  # shape (W, H, 3)
-            rgba = np.zeros((_HUD_H, _HUD_W, 4), dtype=np.uint8)
-            rgba[:, :, :3] = np.transpose(rgb_raw, (1, 0, 2))
-            rgba[:, :, 3]  = np.transpose(raw,     (1, 0))
-            rgba = rgba[::-1].copy()  # flip rows: pygame y-down → GL y-up
+
+            def _render_hud_lines(lines, colours):
+                surf = pygame.Surface((_HUD_W, _HUD_H), pygame.SRCALPHA)
+                surf.fill((0, 0, 0, 0))
+                for idx, txt in enumerate(lines):
+                    col = colours[idx] if idx < len(colours) else (80, 210, 255)
+                    surf.blit(font.render(txt, True, col), (2, idx * (line_h + 1)))
+                raw_a  = pygame.surfarray.array_alpha(surf.convert_alpha())
+                raw_c  = pygame.surfarray.array3d(surf)
+                arr    = np.zeros((_HUD_H, _HUD_W, 4), dtype=np.uint8)
+                arr[:, :, :3] = np.transpose(raw_c, (1, 0, 2))
+                arr[:, :,  3] = np.transpose(raw_a, (1, 0))
+                return arr[::-1].copy()
+
+            # ── Manifold label above left (violet) PIP ─────────────────────
+            bake_str = (
+                f"BAKED {bench._transfer_grid_noodles:,}n  ctx={bench._manifold_ctx_id}"
+                if bench._transfer_grid is not None
+                else "baking…" if ray_mode == "middle" else ""
+            )
+            manifold_lines  = [mode_str]
+            manifold_colours = [(180, 140, 255)]
+            if bake_str:
+                manifold_lines.append(bake_str)
+                manifold_colours.append((255, 200, 80))
+            rgba_m = _render_hud_lines(manifold_lines, manifold_colours)
             glBindTexture(GL_TEXTURE_2D, tex_hud)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, rgba)
-            # Place stats strip just above the PIP top edge
-            hud_vx = _pip_vx
-            hud_vy = _pip_vy + _pip_dim + 2
-            hud_vw = _HUD_W
-            hud_vh = _HUD_H
-            _draw_quad_with_pip_prog(tex_hud, hud_vx, hud_vy, hud_vw, hud_vh,
-                                     hud_mode=True)
+                         GL_RGBA, GL_UNSIGNED_BYTE, rgba_m)
+            _draw_quad_with_pip_prog(tex_hud,
+                                     _bdpt_pip_vx, _pip_vy + _pip_dim + 2,
+                                     _HUD_W, _HUD_H, hud_mode=True)
+
+            # ── BDPT tracking stats above center (cyan) PIP ─────────────────
+            tracking_lines = [dist_str, f"col {bc:.3f}", f"snaps {es} nr {nm}"]
+            tracking_cols  = [(80, 210, 255)] * 3
+            rgba_t = _render_hud_lines(tracking_lines, tracking_cols)
+            glBindTexture(GL_TEXTURE_2D, tex_hud)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, rgba_t)
+            _draw_quad_with_pip_prog(tex_hud,
+                                     _pip_vx, _pip_vy + _pip_dim + 2,
+                                     _HUD_W, _HUD_H, hud_mode=True)
 
 
     _vol_tex_size = [bench._field_nx, bench._field_ny, bench._field_nz]  # already allocated at init
@@ -7109,6 +7325,89 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable volumetric field capture (saves ~128×64×64 complex grid memory per frame)",
     )
+    _ap.add_argument(
+        "--bake-noodles",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Number of rays per focus slice to bake; 0 auto-scales from table cells",
+    )
+    _ap.add_argument(
+        "--prebake-manifold",
+        action="store_true",
+        help="Bake and register the C++ manifold transfer payload before the first trace",
+    )
+    _ap.add_argument(
+        "--bake-grid-res",
+        type=int,
+        default=64,
+        metavar="N",
+        help="C++ transfer payload grid resolution N×N when --bake-table-gb is not set",
+    )
+    _ap.add_argument(
+        "--bake-table-gb",
+        type=float,
+        default=0.0,
+        metavar="GB",
+        help="Approximate C++ transfer payload size in GiB; e.g. 6 builds about a 6 GiB grid",
+    )
+    _ap.add_argument(
+        "--bake-noodles-per-cell",
+        type=float,
+        default=1.0,
+        metavar="K",
+        help="Auto bake density when --bake-noodles=0 and --bake-table-gb is set",
+    )
+    _ap.add_argument(
+        "--bake-refine",
+        type=int,
+        default=2,
+        metavar="N",
+        help="Adaptive refinement passes for manifold baking (default: 2)",
+    )
+    _ap.add_argument(
+        "--bake-wavelengths",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Wavelength samples averaged per baked noodle (default: 3)",
+    )
+    _ap.add_argument(
+        "--bake-training-table",
+        default="",
+        metavar="PATH",
+        help="Write a neural-lens training table .npy before tracing",
+    )
+    _ap.add_argument(
+        "--bake-training-gb",
+        type=float,
+        default=0.0,
+        metavar="GB",
+        help="Size of neural-lens training table to stream in GiB; includes wavelength and focus columns",
+    )
+    _ap.add_argument(
+        "--full-assembly",
+        action="store_true",
+        help=(
+            "Bake the complete front-lens-to-sensor path as a single LUT including "
+            "pre-traced sensor hit positions (no projection at query time). "
+            "Combines with --focus-steps for a focus-swept assembly."
+        ),
+    )
+    _ap.add_argument(
+        "--focus-steps",
+        type=int,
+        default=1,
+        metavar="N",
+        help="Number of focus positions to sweep in a full-assembly bake (default: 1 = nominal only)",
+    )
+    _ap.add_argument(
+        "--focus-range-mm",
+        type=float,
+        default=2.0,
+        metavar="MM",
+        help="Total sensor z sweep range for --focus-steps (default: 2.0 mm, centred on nominal)",
+    )
     _args = _ap.parse_args()
     if _args.uv_smoke_exit:
         raise SystemExit(run_uv_smoke(
@@ -7129,4 +7428,16 @@ if __name__ == "__main__":
         profile=bool(_args.profile),
         field_capture=not _args.no_field,
         manifold_mode=_args.manifold_mode,
+        bake_noodles=_args.bake_noodles,
+        full_assembly=bool(_args.full_assembly),
+        focus_steps=_args.focus_steps,
+        focus_range_mm=_args.focus_range_mm,
+        prebake_manifold=bool(_args.prebake_manifold),
+        bake_grid_res=_args.bake_grid_res,
+        bake_table_gb=_args.bake_table_gb,
+        bake_refine=_args.bake_refine,
+        bake_wavelengths=_args.bake_wavelengths,
+        bake_noodles_per_cell=_args.bake_noodles_per_cell,
+        bake_training_table=_args.bake_training_table,
+        bake_training_gb=_args.bake_training_gb,
     )

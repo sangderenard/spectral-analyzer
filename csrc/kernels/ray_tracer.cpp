@@ -893,7 +893,8 @@ static inline void apply_reactive_shift_cached(VXcd& amp, const MatSpectralCache
 static inline uint32_t dispatch_scale_context_entry(
     const RayTracerState& st,
     const RtScaleContext& ctx,
-    V3d& pos, V3d& dir, VXcd& amp);
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len = nullptr);
 
 static inline bool tri_bary_uv(const Triangle& tri, const V3d& p,
                                double& u, double& v)
@@ -4855,11 +4856,18 @@ static int scheduler_advance_ray(
 
     /* ── Handle the outcome ──────────────────────────────────────────────── */
     if (act == ACT_ENTER_CTX) {
-        /* Transfer to finer context */
-        rs.pos[0] = p1.x(); rs.pos[1] = p1.y(); rs.pos[2] = p1.z();
-        rs.context_id = enter_ci;
+        /* Transfer to finer context and apply its entry transform immediately.
+         * Full-assembly neural payloads may move pos near the baked sensor hit,
+         * so re-evaluate the destination context after dispatch. */
+        pos = p1;
+        const RtScaleContext& enter_ctx = st.scale_contexts[static_cast<size_t>(enter_ci)];
+        (void)dispatch_scale_context_entry(st, enter_ctx, pos, dir, amp, &rs.path_len);
+        rs.pos[0] = pos.x(); rs.pos[1] = pos.y(); rs.pos[2] = pos.z();
+        rs.dir[0] = dir.x(); rs.dir[1] = dir.y(); rs.dir[2] = dir.z();
         for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
-        return enter_ci;
+        int new_ci = ctx_for_pos(st, pos);
+        rs.context_id = new_ci;
+        return new_ci;
     }
 
     if (act == ACT_HIT_SURFACE) {
@@ -5684,7 +5692,7 @@ static BounceStepResult ray_bounce_step_bdpt(
     for (const RtScaleContext& ctx : st.scale_contexts) {
         V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
         if ((pos - c).norm() <= ctx.radius) {
-            interaction_flags |= dispatch_scale_context_entry(st, ctx, pos, dir, amp);
+            interaction_flags |= dispatch_scale_context_entry(st, ctx, pos, dir, amp, &path_len);
         }
     }
     
@@ -5798,7 +5806,7 @@ static int ray_tracer_bidirectional_impl(
             for (const RtScaleContext& ctx : st->scale_contexts) {
                 V3d c(ctx.center[0], ctx.center[1], ctx.center[2]);
                 if ((pos - c).norm() <= ctx.radius) {
-                    interaction_flags |= dispatch_scale_context_entry(*st, ctx, pos, dir, amp);
+                    interaction_flags |= dispatch_scale_context_entry(*st, ctx, pos, dir, amp, &path_len);
                 }
             }
 
@@ -5991,17 +5999,30 @@ extern "C" SK_API int ray_tracer_accumulate_endpoint_records_to_field_capture(
 /* apply_manifold_transfer — redirect dir via a baked float32 transfer grid.
  *
  * Payload layout (float32):
- *   Header [0..7]: magic=14946, n_u, n_v, u_min, u_max, v_min, v_max, r_ap
- *   Cells  [8..]: (n_v × n_u) × 7 floats — out_dx, out_dy, out_dz, opl,
- *                 count, in_dx, in_dy  (row-major [iv, iu])
+ *   V1 header [0..7]: magic=14946, n_u, n_v, u_min, u_max, v_min, v_max, r_ap
+ *   V1 cells  [8..]: (n_v × n_u) × 7 floats — out_dx, out_dy, out_dz, opl,
+ *                    count, in_dx, in_dy  (row-major [iv, iu])
+ *
+ *   V2 header [0..11]: magic=14947, n_u, n_v, u_min, u_max, v_min, v_max,
+ *                      r_ap, z_sensor, focus_z, z_front_ref, reserved
+ *   V2 cells  [12..]: (n_v × n_u) × 9 floats — V1 fields plus sensor_x,
+ *                     sensor_y.  V2 teleports the ray to just before the
+ *                     baked sensor hit so the next BVH step can strike the
+ *                     sensor without traversing the lens geometry again.
  */
 static inline void apply_manifold_transfer(
-    const RtScaleContext& ctx, V3d& pos, V3d& dir)
+    const RayTracerState& st,
+    const RtScaleContext& ctx,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len)
 {
     if (!ctx.payload) return;
     const float* p = static_cast<const float*>(ctx.payload);
     if (ctx.payload_size_bytes < (int)(8 * sizeof(float))) return;
-    if (p[0] != 14946.0f) return;   /* magic check */
+    const bool is_v1 = (p[0] == 14946.0f);
+    const bool is_v2 = (p[0] == 14947.0f);
+    if (!is_v1 && !is_v2) return;   /* magic check */
+    if (is_v2 && ctx.payload_size_bytes < (int)(12 * sizeof(float))) return;
 
     const int   n_u   = (int)p[1];
     const int   n_v   = (int)p[2];
@@ -6009,6 +6030,12 @@ static inline void apply_manifold_transfer(
     const float v_min = p[5], v_max = p[6];
     const float r_ap  = p[7];
     if (n_u <= 1 || n_v <= 1 || r_ap <= 0.0f) return;
+
+    const int header_floats = is_v2 ? 12 : 8;
+    const int cell_stride   = is_v2 ? 9 : 7;
+    const size_t need_floats = (size_t)header_floats
+        + (size_t)n_u * (size_t)n_v * (size_t)cell_stride;
+    if ((size_t)ctx.payload_size_bytes < need_floats * sizeof(float)) return;
 
     /* Project ray onto aperture plane z = center_z */
     const double cz = ctx.center[2];
@@ -6030,20 +6057,26 @@ static inline void apply_manifold_transfer(
     const float wu1 = fu - (float)iu0, wu0 = 1.0f - wu1;
     const float wv1 = fv - (float)iv0, wv0 = 1.0f - wv1;
 
-    const float* data = p + 8;
+    const float* data = p + header_floats;
     /* cell(iu, iv) → pointer to 7-float cell at row-major [iv * n_u + iu] */
     auto cell = [&](int iu, int iv) -> const float* {
-        return data + ((size_t)iv * (size_t)n_u + (size_t)iu) * 7u;
+        return data + ((size_t)iv * (size_t)n_u + (size_t)iu) * (size_t)cell_stride;
     };
 
     /* Bilinear blend of non-empty cells */
-    float odx = 0.0f, ody = 0.0f, odz = 0.0f, tot_w = 0.0f;
+    float odx = 0.0f, ody = 0.0f, odz = 0.0f, opl = 0.0f, tot_w = 0.0f;
+    float sx = 0.0f, sy = 0.0f;
     auto blend = [&](int iu, int iv, float w) {
         const float* c = cell(iu, iv);
         if (c[4] > 0.0f) {
             odx   += w * c[0];
             ody   += w * c[1];
             odz   += w * c[2];
+            opl   += w * c[3];
+            if (is_v2) {
+                sx += w * c[7];
+                sy += w * c[8];
+            }
             tot_w += w;
         }
     };
@@ -6055,12 +6088,39 @@ static inline void apply_manifold_transfer(
 
     const float inv_w = 1.0f / tot_w;
     odx *= inv_w;  ody *= inv_w;  odz *= inv_w;
+    opl *= inv_w;
     const float norm = std::sqrt(odx*odx + ody*ody + odz*odz);
     if (norm < 1e-12f) return;
 
-    /* Advance pos to aperture plane then apply baked exit direction */
-    pos = ap_hit;
+    if (opl > 0.0f) {
+        double skipped_opl_m = (double)opl;
+        if (is_v2) {
+            const double z_front_ref = (double)p[10];
+            if (std::isfinite(z_front_ref) && std::abs(dir[2]) > 1.0e-12) {
+                const double t_ref = (z_front_ref - pos[2]) / dir[2];
+                if (t_ref > 0.0) skipped_opl_m += t_ref;
+            }
+        }
+        const double c0 = (st.speed_m_s > EPS) ? st.speed_m_s : 299792458.0;
+        for (int b = 0; b < st.n_bands; ++b) {
+            const double phase = TWO_PI * st.freq_hz_vec[b] * skipped_opl_m / c0;
+            const double decay = std::exp(-st.atmo_abs[b] * skipped_opl_m);
+            amp[b] *= cd(decay * std::cos(phase), decay * std::sin(phase));
+        }
+        if (path_len) *path_len += skipped_opl_m;
+    }
+
     dir = V3d((double)(odx / norm), (double)(ody / norm), (double)(odz / norm));
+    if (is_v2) {
+        sx *= inv_w;
+        sy *= inv_w;
+        const double z_sensor = (double)p[8];
+        V3d sensor_hit((double)sx, (double)sy, z_sensor);
+        pos = sensor_hit - dir * (EPS * 200.0);
+    } else {
+        /* V1: advance pos to aperture plane then apply baked exit direction. */
+        pos = ap_hit;
+    }
 }
 
 static inline void apply_thin_lens_transform(
@@ -6130,7 +6190,8 @@ static inline void apply_thick_lens_wave_transform(
 static inline uint32_t dispatch_scale_context_entry(
     const RayTracerState& st,
     const RtScaleContext& ctx,
-    V3d& pos, V3d& dir, VXcd& amp)
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len)
 {
     switch (ctx.context_kind) {
         case SCALE_CONTEXT_KIND_RAY:
@@ -6147,7 +6208,7 @@ static inline uint32_t dispatch_scale_context_entry(
         case SCALE_CONTEXT_KIND_SPLINE_SURFACE:
             return 1u << SCALE_CONTEXT_KIND_SPLINE_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_SURFACE:
-            apply_manifold_transfer(ctx, pos, dir);
+            apply_manifold_transfer(st, ctx, pos, dir, amp, path_len);
             return 1u << SCALE_CONTEXT_KIND_NEURAL_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC:
             return 1u << SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC;

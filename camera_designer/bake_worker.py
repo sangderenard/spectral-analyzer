@@ -15,12 +15,17 @@ hit position (u,v) ∈ [-1,1]² and their scene-side incident direction
 (in_dx, in_dy, in_dz).  The LUT output is the sensor-side exit direction
 (out_dx, out_dy, out_dz) and the optical path length (OPL).
 
-Noodle schema matches camera_software/lens_manifold.py exactly:
+Standard noodle schema (camera_software/lens_manifold.py compatible, 11 cols):
   col 0,1  : u, v         aperture normalised hit position
   col 2,3  : fu, fv       scene field-angle factors (tan of angular deviation)
   col 4,5,6: in_dir       unit incident ray direction (scene → aperture)
   col 7,8,9: out_dir      unit exit ray direction (aperture → sensor)
   col 10   : opl          optical path length (metres)
+
+Full-assembly noodle schema (14 cols, produced by bake_assembly()):
+  col 0-10 : same as above
+  col 11,12: sensor_x, sensor_y   pre-baked sensor hit (metres)
+  col 13   : focus_z              sensor z offset from nominal (metres)
 
 Usage
 -----
@@ -379,25 +384,31 @@ class BakeWorker:
         self,
         ro_arr: np.ndarray,
         rd_arr: np.ndarray,
+        focus_z: float = 0.0,
+        preset_override=None,
     ) -> np.ndarray:
-        """Trace a batch of rays; return noodle rows (M, 11) float64.
+        """Trace a batch of rays; return noodle rows (M, 14) float64.
+
+        Columns 0-10 match the standard LensManifold schema.
+        Columns 11-13 are the full-assembly extension:
+          11, 12: sensor_x, sensor_y  — actual traced sensor landing position
+          13:     focus_z             — sensor z offset from nominal
 
         Rows for missed/TIR rays are silently dropped.
         """
-        wls = self.preset.wavelengths[:self.n_wavelengths]
+        preset = preset_override if preset_override is not None else self.preset
+        wls = preset.wavelengths[:self.n_wavelengths]
         rows = []
         for i in range(len(ro_arr)):
             ro = ro_arr[i]
             rd = rd_arr[i]
-            # Average over wavelengths for chromatic averaging
             results = []
             for wl in wls:
-                r = trace_ray(self.preset, ro, rd, wl)
+                r = trace_ray(preset, ro, rd, wl)
                 if r is not None:
                     results.append(r)
             if not results:
                 continue
-            # Mean over wavelengths
             u    = float(np.mean([r["aperture_uv"][0]  for r in results]))
             v    = float(np.mean([r["aperture_uv"][1]  for r in results]))
             fu   = float(np.mean([r["field_angle"][0]  for r in results]))
@@ -407,12 +418,15 @@ class BakeWorker:
             opl  = float(np.mean([r["opl"] for r in results]))
             in_d  /= max(np.linalg.norm(in_d), 1e-30)
             out_d /= max(np.linalg.norm(out_d), 1e-30)
+            sh   = np.mean([r["sensor_hit"] for r in results], axis=0)
             rows.append([u, v, fu, fv,
-                         in_d[0], in_d[1], in_d[2],
+                         in_d[0],  in_d[1],  in_d[2],
                          out_d[0], out_d[1], out_d[2],
-                         opl])
+                         opl,
+                         float(sh[0]), float(sh[1]),
+                         focus_z])
         if not rows:
-            return np.zeros((0, 11), np.float64)
+            return np.zeros((0, 14), np.float64)
         return np.array(rows, np.float64)
 
     # ── Public API ─────────────────────────────────────────────────────────
@@ -497,6 +511,175 @@ class BakeWorker:
             print(f"[BakeWorker] done. {len(data)} noodles in manifold.", flush=True)
 
         return manifold
+
+    def bake_assembly(
+        self,
+        focus_offsets: list[float] | None = None,
+        n_focus_steps: int = 1,
+        focus_range_m: float = 2e-3,
+    ) -> np.ndarray:
+        """Bake a full-assembly (N, 14) noodle array covering focus range.
+
+        Each focus step shifts ``preset.sensor.z_pos`` by a different offset and
+        traces ``self.n_rays`` rays, tagging each noodle with its ``focus_z``
+        value.  The result is a single (N_total, 14) float64 array covering
+        the full front-lens → sensor path across all focus positions.
+
+        Parameters
+        ----------
+        focus_offsets : explicit list of sensor z offsets (metres).  If None,
+                        ``n_focus_steps`` offsets are sampled uniformly over
+                        ±``focus_range_m`` / 2 around the nominal position.
+        n_focus_steps : number of focus steps when ``focus_offsets`` is None.
+        focus_range_m : total focus sweep range in metres (default 2 mm).
+
+        Returns
+        -------
+        (N, 14) float64 array.  Columns 0-10 match the standard noodle schema;
+        cols 11-12 are baked sensor x/y; col 13 is focus_z offset (metres).
+        """
+        import copy
+
+        if focus_offsets is None:
+            if n_focus_steps == 1:
+                focus_offsets = [0.0]
+            else:
+                half = focus_range_m * 0.5
+                focus_offsets = list(
+                    np.linspace(-half, half, n_focus_steps))
+
+        slices = []
+        for idx, fz in enumerate(focus_offsets):
+            # Deep-copy the preset so each focus step is independent
+            p = copy.deepcopy(self.preset)
+            p.sensor.z_pos = float(p.sensor.z_pos) + fz
+
+            ro_arr, rd_arr = self._sample_rays(self.n_rays)
+            chunk = self._trace_batch(ro_arr, rd_arr,
+                                      focus_z=fz, preset_override=p)
+
+            # Adaptive refinement at each focus step
+            for _ in range(self.n_refine):
+                if len(chunk) == 0:
+                    break
+                quads = [
+                    (chunk[:, 0] >= 0) & (chunk[:, 1] >= 0),
+                    (chunk[:, 0] <  0) & (chunk[:, 1] >= 0),
+                    (chunk[:, 0] >= 0) & (chunk[:, 1] <  0),
+                    (chunk[:, 0] <  0) & (chunk[:, 1] <  0),
+                ]
+                extras = []
+                for mask in quads:
+                    seg = chunk[mask]
+                    if len(seg) < 4:
+                        continue
+                    if float(np.mean(np.var(seg[:, 7:10], axis=0))) > self.threshold:
+                        ro2, rd2 = self._sample_rays(max(64, len(seg) // 2))
+                        ex = self._trace_batch(ro2, rd2,
+                                               focus_z=fz, preset_override=p)
+                        if len(ex):
+                            extras.append(ex)
+                if extras:
+                    chunk = np.concatenate([chunk, *extras], axis=0)
+
+            if self.verbose:
+                print(f"[BakeWorker.bake_assembly] step {idx+1}/{len(focus_offsets)}"
+                      f"  fz={fz*1e3:+.2f}mm  {len(chunk)} noodles", flush=True)
+            if len(chunk):
+                slices.append(chunk)
+
+        if not slices:
+            raise RuntimeError("bake_assembly: no rays traced successfully.")
+
+        full = np.concatenate(slices, axis=0)
+        if self.verbose:
+            print(f"[BakeWorker.bake_assembly] done — {len(full):,} noodles "
+                  f"across {len(focus_offsets)} focus steps", flush=True)
+        return full
+
+    def bake_training_table(
+        self,
+        path: str,
+        target_gb: float,
+        n_focus_steps: int = 1,
+        focus_range_m: float = 2e-3,
+        batch_size: int = 8192,
+        max_attempt_factor: float = 20.0,
+    ) -> tuple[int, int]:
+        """Stream a neural-lens training table to a float32 ``.npy`` memmap.
+
+        Row schema, 16 float32 columns:
+          0,1    aperture u,v
+          2,3    field-angle fu,fv
+          4..6   in_dir
+          7..9   out_dir
+          10     opl
+          11,12  sensor_x,sensor_y
+          13     focus_z
+          14     wavelength_um
+          15     reserved sample weight, currently 1
+
+        Unlike ``_trace_batch()``, this does not average wavelengths.  Each
+        successful ray/wavelength/focus combination becomes its own row.
+        """
+        import copy
+        from numpy.lib.format import open_memmap
+
+        row_cols = 16
+        target_rows = max(1, int(float(target_gb) * (1024.0 ** 3) // (row_cols * 4)))
+        table = open_memmap(path, mode="w+", dtype=np.float32,
+                            shape=(target_rows, row_cols))
+
+        if n_focus_steps <= 1:
+            focus_offsets = [0.0]
+        else:
+            half = focus_range_m * 0.5
+            focus_offsets = list(np.linspace(-half, half, n_focus_steps))
+        wavelengths = list(self.preset.wavelengths[:self.n_wavelengths])
+
+        written = 0
+        attempted = 0
+        max_attempts = max(batch_size, int(target_rows * max_attempt_factor))
+        combo = 0
+        while written < target_rows and attempted < max_attempts:
+            fz = float(focus_offsets[combo % len(focus_offsets)])
+            wl = float(wavelengths[(combo // len(focus_offsets)) % len(wavelengths)])
+            combo += 1
+
+            p = copy.deepcopy(self.preset)
+            p.sensor.z_pos = float(p.sensor.z_pos) + fz
+            n = min(batch_size, max_attempts - attempted)
+            ro_arr, rd_arr = self._sample_rays(n)
+            attempted += n
+
+            rows = []
+            for i in range(n):
+                r = trace_ray(p, ro_arr[i], rd_arr[i], wl)
+                if r is None:
+                    continue
+                in_d = r["in_dir"] / max(np.linalg.norm(r["in_dir"]), 1e-30)
+                out_d = r["out_dir"] / max(np.linalg.norm(r["out_dir"]), 1e-30)
+                sh = r["sensor_hit"]
+                rows.append([
+                    r["aperture_uv"][0], r["aperture_uv"][1],
+                    r["field_angle"][0], r["field_angle"][1],
+                    in_d[0], in_d[1], in_d[2],
+                    out_d[0], out_d[1], out_d[2],
+                    r["opl"], sh[0], sh[1], fz, wl, 1.0,
+                ])
+
+            if rows:
+                arr = np.asarray(rows, dtype=np.float32)
+                take = min(len(arr), target_rows - written)
+                table[written:written + take, :] = arr[:take]
+                written += take
+                if self.verbose:
+                    print(f"[BakeWorker.training] {written:,}/{target_rows:,} rows"
+                          f"  attempts={attempted:,}  fz={fz*1e3:+.3f}mm"
+                          f"  wl={wl:.4f}um", flush=True)
+
+        table.flush()
+        return written, target_rows
 
     def bake_glsl_source(self) -> str:
         """Emit a GLSL compute shader that traces one ray per invocation.

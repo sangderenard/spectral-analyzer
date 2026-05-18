@@ -82,6 +82,7 @@ class ManifoldEndpoint:
         self._r_inner  = float(ap.r_inner)
         self._z_sensor = float(preset.sensor.z_pos)
         self._r_sensor = float(preset.sensor.r_max)
+        self._manifold_lut = None   # set by bake_lut(); queried by transfer_ray()
 
     # ── Public helpers ─────────────────────────────────────────────────────
 
@@ -108,6 +109,136 @@ class ManifoldEndpoint:
             use_mis=True,
         )
         return RayCorrelator(strategies=[strategy])
+
+    # ── Baked transfer function ────────────────────────────────────────────
+
+    def bake_lut(
+        self,
+        n_rays: int = 65_536,
+        n_wavelengths: int = 3,
+        n_refine: int = 2,
+        verbose: bool = True,
+    ):
+        """Run BakeWorker to produce a dense LensManifold transfer LUT.
+
+        The result is cached in self._manifold_lut and returned.  Subsequent
+        calls to transfer_ray() and build_transfer_grid() use this cache.
+
+        Returns
+        -------
+        LensManifold  (camera_software.lens_manifold.LensManifold)
+        """
+        from .bake_worker import BakeWorker
+        worker = BakeWorker(
+            self.preset,
+            n_rays=n_rays,
+            n_wavelengths=n_wavelengths,
+            n_refine=n_refine,
+            verbose=verbose,
+        )
+        self._manifold_lut = worker.bake()
+        return self._manifold_lut
+
+    def transfer_ray(
+        self,
+        ap_uv: np.ndarray,
+        in_dir: np.ndarray,
+        k: int = 8,
+    ) -> Optional[np.ndarray]:
+        """Query baked LUT: aperture UV + input direction → output direction.
+
+        Parameters
+        ----------
+        ap_uv  : (2,) float64 — normalised aperture position in [-1, 1]
+        in_dir : (3,) float64 — unit approach direction (scene → aperture)
+        k      : KNN neighbour count for IDW blend
+
+        Returns
+        -------
+        (3,) float64 unit output direction, or None if no LUT is baked.
+        """
+        if self._manifold_lut is None or self._manifold_lut._data is None:
+            return None
+        uv  = np.atleast_2d(np.asarray(ap_uv,  np.float64))
+        ind = np.atleast_2d(np.asarray(in_dir, np.float64))
+        dirs, weights = self._manifold_lut.query(uv, k=k, in_dir=ind)
+        out = np.sum(dirs[0] * weights[0, :, np.newaxis], axis=0)
+        norm = np.linalg.norm(out)
+        if norm < 1e-12:
+            return None
+        return out / norm
+
+    def build_transfer_grid(
+        self,
+        n_u: int = 32,
+        n_v: int = 32,
+    ) -> Optional[np.ndarray]:
+        """Convert the baked LensManifold into a compact float32 payload grid.
+
+        The grid can be passed directly to
+        ``tracer.add_scale_context(..., payload=grid)`` with
+        ``context_kind=SCALE_CONTEXT_KIND_NEURAL_SURFACE``.  The C++ handler
+        decodes the header, projects each incoming ray to the aperture plane,
+        bilinearly interpolates the baked output direction, and redirects the
+        ray — skipping the detailed per-element lens geometry entirely.
+
+        Format
+        ------
+        Header (8 × float32):
+          [0] MAGIC = 14946.0 (sentinel)
+          [1] n_u, [2] n_v  (grid dimensions, stored as float)
+          [3] u_min=-1, [4] u_max=+1, [5] v_min=-1, [6] v_max=+1
+          [7] r_ap  (aperture radius, metres)
+
+        Cell data (7 × float32 per cell, row-major [iv, iu]):
+          [0..2] out_dx/dy/dz — mean output direction (lens→sensor)
+          [3]    opl           — mean OPL (metres)
+          [4]    count         — noodle count (0 = empty cell)
+          [5..6] in_dx/dy      — mean input direction x, y (diagnostics)
+
+        Returns None if no LUT has been baked yet.
+        """
+        if self._manifold_lut is None or self._manifold_lut._data is None:
+            return None
+
+        data = self._manifold_lut._data   # (N, 11) float64
+
+        MAGIC = 14946.0
+        header = np.array(
+            [MAGIC, float(n_u), float(n_v),
+             -1.0, 1.0, -1.0, 1.0, self._r_ap],
+            dtype=np.float32,
+        )
+
+        # Accumulate into (n_v, n_u, 7) grid
+        cells = np.zeros((n_v, n_u, 7), dtype=np.float64)
+
+        u_vals = data[:, 0]   # normalised u in [-1, 1]
+        v_vals = data[:, 1]   # normalised v in [-1, 1]
+        out_d  = data[:, 7:10]
+        opl    = data[:, 10]
+        in_d   = data[:, 4:6]  # x, y only
+
+        # Map to grid indices (clamp to valid range)
+        iu = np.clip(((u_vals + 1.0) * 0.5 * n_u).astype(int), 0, n_u - 1)
+        iv = np.clip(((v_vals + 1.0) * 0.5 * n_v).astype(int), 0, n_v - 1)
+
+        np.add.at(cells[:, :, 0], (iv, iu), out_d[:, 0])
+        np.add.at(cells[:, :, 1], (iv, iu), out_d[:, 1])
+        np.add.at(cells[:, :, 2], (iv, iu), out_d[:, 2])
+        np.add.at(cells[:, :, 3], (iv, iu), opl)
+        np.add.at(cells[:, :, 4], (iv, iu), 1.0)
+        np.add.at(cells[:, :, 5], (iv, iu), in_d[:, 0])
+        np.add.at(cells[:, :, 6], (iv, iu), in_d[:, 1])
+
+        # Divide accumulated sums by count
+        counts = cells[:, :, 4:5]
+        mask   = counts[:, :, 0] > 0
+        for ch in [0, 1, 2, 3, 5, 6]:
+            cells[:, :, ch][mask] /= counts[:, :, 0][mask]
+
+        payload = np.concatenate([header, cells.ravel().astype(np.float32)])
+        return payload.astype(np.float32, copy=False)
 
     # ── Record samplers ────────────────────────────────────────────────────
 

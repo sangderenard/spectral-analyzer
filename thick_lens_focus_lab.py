@@ -6330,9 +6330,9 @@ def run(
         bdpt_plate = bench._last_bdpt_plate_rgb
         if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
             glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
-                            bdpt_plate.shape[1], bdpt_plate.shape[0],
-                            GL_RGB, GL_FLOAT, bdpt_plate)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         bdpt_plate.shape[1], bdpt_plate.shape[0], 0,
+                         GL_RGB, GL_FLOAT, bdpt_plate)
         _draw_quad_with_pip_prog(
             tex_bdpt_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(0.65, 0.25, 1.0),

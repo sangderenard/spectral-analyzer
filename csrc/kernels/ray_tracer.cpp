@@ -5982,10 +5982,87 @@ extern "C" SK_API int ray_tracer_accumulate_endpoint_records_to_field_capture(
  * dispatch site so the bounce loop can already call it.
  *
  * WAVE_HELMHOLTZ (1), THICK_LENS_WAVE (3), SPLINE_SURFACE (4),
- * NEURAL_SURFACE (5), NEURAL_VOLUMETRIC (6) are stub-passthroughs: they
- * record region entry in EndpointRecord.flags downstream and continue.
- * Wave + neural fill-in lives in field_march.cpp / future neural_eval.cpp.
+ * NEURAL_SURFACE (5) decodes a float32 transfer-grid payload built by
+ * ManifoldEndpoint.build_transfer_grid() and bilinearly interpolates the
+ * baked output direction, skipping detailed per-element lens geometry.
+ * NEURAL_VOLUMETRIC (6) remains a stub-passthrough.
  * ────────────────────────────────────────────────────────────────────── */
+
+/* apply_manifold_transfer — redirect dir via a baked float32 transfer grid.
+ *
+ * Payload layout (float32):
+ *   Header [0..7]: magic=14946, n_u, n_v, u_min, u_max, v_min, v_max, r_ap
+ *   Cells  [8..]: (n_v × n_u) × 7 floats — out_dx, out_dy, out_dz, opl,
+ *                 count, in_dx, in_dy  (row-major [iv, iu])
+ */
+static inline void apply_manifold_transfer(
+    const RtScaleContext& ctx, V3d& pos, V3d& dir)
+{
+    if (!ctx.payload) return;
+    const float* p = static_cast<const float*>(ctx.payload);
+    if (ctx.payload_size_bytes < (int)(8 * sizeof(float))) return;
+    if (p[0] != 14946.0f) return;   /* magic check */
+
+    const int   n_u   = (int)p[1];
+    const int   n_v   = (int)p[2];
+    const float u_min = p[3], u_max = p[4];
+    const float v_min = p[5], v_max = p[6];
+    const float r_ap  = p[7];
+    if (n_u <= 1 || n_v <= 1 || r_ap <= 0.0f) return;
+
+    /* Project ray onto aperture plane z = center_z */
+    const double cz = ctx.center[2];
+    const double dz = dir[2];
+    if (std::abs(dz) < 1e-12) return;
+    const double t  = (cz - pos[2]) / dz;
+    const V3d ap_hit = pos + t * dir;
+
+    /* Normalised aperture UV */
+    const float ap_u = (float)(ap_hit[0] / r_ap);
+    const float ap_v = (float)(ap_hit[1] / r_ap);
+    if (ap_u < u_min || ap_u > u_max || ap_v < v_min || ap_v > v_max) return;
+
+    /* Continuous grid coordinates */
+    const float fu  = (ap_u - u_min) / (u_max - u_min) * (float)(n_u - 1);
+    const float fv  = (ap_v - v_min) / (v_max - v_min) * (float)(n_v - 1);
+    const int   iu0 = std::max(0, std::min(n_u - 2, (int)fu));
+    const int   iv0 = std::max(0, std::min(n_v - 2, (int)fv));
+    const float wu1 = fu - (float)iu0, wu0 = 1.0f - wu1;
+    const float wv1 = fv - (float)iv0, wv0 = 1.0f - wv1;
+
+    const float* data = p + 8;
+    /* cell(iu, iv) → pointer to 7-float cell at row-major [iv * n_u + iu] */
+    auto cell = [&](int iu, int iv) -> const float* {
+        return data + ((size_t)iv * (size_t)n_u + (size_t)iu) * 7u;
+    };
+
+    /* Bilinear blend of non-empty cells */
+    float odx = 0.0f, ody = 0.0f, odz = 0.0f, tot_w = 0.0f;
+    auto blend = [&](int iu, int iv, float w) {
+        const float* c = cell(iu, iv);
+        if (c[4] > 0.0f) {
+            odx   += w * c[0];
+            ody   += w * c[1];
+            odz   += w * c[2];
+            tot_w += w;
+        }
+    };
+    blend(iu0,   iv0,   wu0 * wv0);
+    blend(iu0+1, iv0,   wu1 * wv0);
+    blend(iu0,   iv0+1, wu0 * wv1);
+    blend(iu0+1, iv0+1, wu1 * wv1);
+    if (tot_w < 1e-12f) return;
+
+    const float inv_w = 1.0f / tot_w;
+    odx *= inv_w;  ody *= inv_w;  odz *= inv_w;
+    const float norm = std::sqrt(odx*odx + ody*ody + odz*odz);
+    if (norm < 1e-12f) return;
+
+    /* Advance pos to aperture plane then apply baked exit direction */
+    pos = ap_hit;
+    dir = V3d((double)(odx / norm), (double)(ody / norm), (double)(odz / norm));
+}
+
 static inline void apply_thin_lens_transform(
     const RtScaleContext& ctx, V3d& pos, V3d& dir)
 {
@@ -6068,9 +6145,12 @@ static inline uint32_t dispatch_scale_context_entry(
             apply_thick_lens_wave_transform(st, ctx, pos, dir, amp);
             return 1u << SCALE_CONTEXT_KIND_THICK_LENS_WAVE;
         case SCALE_CONTEXT_KIND_SPLINE_SURFACE:
+            return 1u << SCALE_CONTEXT_KIND_SPLINE_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_SURFACE:
+            apply_manifold_transfer(ctx, pos, dir);
+            return 1u << SCALE_CONTEXT_KIND_NEURAL_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC:
-            return 1u << ctx.context_kind;
+            return 1u << SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC;
         default:
             return 0u;
     }

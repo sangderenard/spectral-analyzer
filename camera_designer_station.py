@@ -248,6 +248,15 @@ def _make_vao2() -> tuple[int, int]:
     return vao, vbo
 
 
+class _NumpyBack:
+    """Thin wrapper so a raw numpy (H,W,C) image can be passed to _draw_back_image."""
+    def __init__(self, img: np.ndarray) -> None:
+        self._img = img
+
+    def to_rect(self) -> np.ndarray:
+        return self._img.astype(np.float64)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SensorPlaneConfig — mutable runtime state for sensor + plate planes
 # ─────────────────────────────────────────────────────────────────────────────
@@ -390,6 +399,7 @@ class _ComponentTreePanel:
         # External state flags
         self.bake_state: str = "idle"
         self.bake_msg:   str = ""
+        self.manifold_bdpt_state: str = "idle"
         self.scene_lights: list = []
         self.glow_rays_done:  int   = 0
         self.glow_rays_per_s: float = 0.0
@@ -523,6 +533,28 @@ class _ComponentTreePanel:
         vs.blit(bt, (br.x + (br.w - bt.get_width()) // 2, br.y + 4))
         self._knob_rects["btn_bake"] = (0, 0, 'row', br)
         self._ctrl["btn_bake"] = br   # backward-compat
+        y += 32
+
+        # MANIFOLD BDPT RENDER
+        y += 2
+        mbdpt_clr = {
+            "idle":      (60, 50, 120),
+            "rendering": (120, 80, 20),
+            "done":      (20, 100, 60),
+            "error":     (130, 30, 30),
+        }.get(self.manifold_bdpt_state, (60, 50, 120))
+        mbr = pygame.Rect(self.PAD, y, w - 2 * self.PAD, 26)
+        pygame.draw.rect(vs, mbdpt_clr, mbr)
+        pygame.draw.rect(vs, (100, 100, 160), mbr, 1)
+        mblbl = {
+            "idle":      "MANIFOLD BDPT",
+            "rendering": "RENDERING...",
+            "done":      "BDPT DONE",
+            "error":     "BDPT ERROR",
+        }.get(self.manifold_bdpt_state, "MANIFOLD BDPT")
+        mbt = self._font.render(mblbl, True, (210, 200, 240))
+        vs.blit(mbt, (mbr.x + (mbr.w - mbt.get_width()) // 2, mbr.y + 4))
+        self._knob_rects["btn_manifold_bdpt"] = (0, 0, 'row', mbr)
         y += 32
 
         # ORTHO MODE
@@ -792,8 +824,9 @@ class _ElementPropsPanel:
     ROW_H  = 20
     MODE_H = 28
 
-    _BR_VIEWS    = ('gpu_field', 'sensor', 'plate')
-    _BR_LABELS   = {'gpu_field': 'GPU field', 'sensor': 'sensor', 'plate': 'plate'}
+    _BR_VIEWS    = ('gpu_field', 'sensor', 'plate', 'manifold_bdpt')
+    _BR_LABELS   = {'gpu_field': 'GPU field', 'sensor': 'sensor',
+                    'plate': 'plate', 'manifold_bdpt': 'manifold BDPT'}
     _PLACE_MODES = ('mesh',)
     _PLACE_LABELS = {'mesh': 'mesh'}
 
@@ -1256,6 +1289,8 @@ class CameraDesignerStation:
 
         # GL texture for the bottom-right live sensor/plate image overlay
         self._br_tex: Optional[int] = None
+        # Manifold BDPT render result (set by _start_manifold_bdpt)
+        self._bdpt_manifold_img: Optional[np.ndarray] = None
 
         # UI panels
         pygame.font.init()
@@ -2004,6 +2039,20 @@ class CameraDesignerStation:
                 )
                 self._draw_back_image(vp_x + half_vp_w, 0,
                                       half_vp_w, half_vp_h, self._plate_back)
+            elif _br_view == 'manifold_bdpt':
+                img = getattr(self, '_bdpt_manifold_img', None)
+                self._draw_cross_section(
+                    vp_x + half_vp_w, 0,
+                    half_vp_w,        half_vp_h,
+                    self._xy_lines,   self._view_xy,
+                    win_w, win_h,
+                    title=_br_title,
+                    border_rgba=_sb,
+                )
+                if img is not None:
+                    self._draw_back_image(vp_x + half_vp_w, 0,
+                                          half_vp_w, half_vp_h,
+                                          _NumpyBack(img))
         else:
             # Non-VIEWS tab: fill the center area with a pygame content panel
             glDisable(GL_SCISSOR_TEST)
@@ -2349,6 +2398,9 @@ class CameraDesignerStation:
         if action == "btn_bake":
             self._start_bake()
             self._panels_dirty = True
+        elif action == "btn_manifold_bdpt":
+            self._start_manifold_bdpt()
+            self._panels_dirty = True
             return True
         if consumed:
             self._panels_dirty = True
@@ -2548,6 +2600,58 @@ class CameraDesignerStation:
 
         self._bake_thread = threading.Thread(target=_worker, daemon=True)
         self._bake_thread.start()
+
+    # ── Manifold BDPT render (threaded) ──────────────────────────────────────
+
+    def _start_manifold_bdpt(self) -> None:
+        if self._left_panel.manifold_bdpt_state == "rendering":
+            return
+        import threading
+        from camera_designer import ManifoldEndpoint
+        self._left_panel.manifold_bdpt_state = "rendering"
+        self._panels_dirty = True
+        preset = self.preset
+
+        def _worker():
+            try:
+                ep = ManifoldEndpoint(preset, n_bands=1)
+                fwd = ep.sample_forward_records(512, seed=0)
+                bwd = ep.sample_sensor_records(32, 32, n_per_pixel=4, seed=1)
+                corr = ep.make_correlator(grid_n=16, match_radius_bins=2)
+                cands = corr.correlate(fwd, bwd, n_bands=1)
+
+                import numpy as np
+                accum = np.zeros(32 * 32, np.float64)
+                for c in cands:
+                    if not c.accepted:
+                        continue
+                    if c.backward_record is None:
+                        continue
+                    pid = int(c.backward_record["subpath_id"].flat[0]) % (32 * 32)
+                    cv  = complex(np.ravel(c.contribution)[0])
+                    w   = c.middle.mis_weight if c.middle is not None else 1.0
+                    accum[pid] += (cv.real ** 2 + cv.imag ** 2) * w
+
+                img = np.zeros((32, 32, 3), np.float32)
+                peak = accum.max()
+                if peak > 0.0:
+                    bright = (accum / peak).reshape(32, 32).astype(np.float32)
+                    img[:, :, 0] = bright
+                    img[:, :, 1] = bright * 0.85
+                    img[:, :, 2] = bright * 0.65
+                # Store on the station so the plate viewer can display it.
+                self._bdpt_manifold_img = img
+                n_hits = sum(1 for c in cands if c.accepted)
+                print(f"[manifold-bdpt] {n_hits} hits, "
+                      f"fwd={len(fwd)}, bwd={len(bwd)}", flush=True)
+                self._left_panel.manifold_bdpt_state = "done"
+            except Exception as exc:
+                import traceback
+                traceback.print_exc()
+                self._left_panel.manifold_bdpt_state = "error"
+            self._panels_dirty = True
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     # ── Preset switching ──────────────────────────────────────────────────────
 

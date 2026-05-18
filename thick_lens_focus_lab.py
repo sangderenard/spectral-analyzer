@@ -39,6 +39,14 @@ try:
 except Exception:
     torch = None
 
+try:
+    from ray_correlator import ManifoldWalkStrategy, RayCorrelator, ShadowRayChecker
+    from parametric_surface import PlaneSurface
+    from bdpt_integrator import RayStreamKind
+    _MANIFOLD_CORRELATOR_AVAILABLE = True
+except Exception:
+    _MANIFOLD_CORRELATOR_AVAILABLE = False
+
 EPS = 1.0e-9
 C_LIGHT = 299_792_458.0
 DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 380e-9, MAX_SPECTRAL_BANDS)).astype(np.float64)
@@ -2828,6 +2836,15 @@ class ForwardCppLensBench:
         self._plate_sensor_electrons_accum: Optional[np.ndarray] = None
         self._last_bdpt_records: Optional[np.ndarray] = None
         self._last_bdpt_plate_rgb: Optional[np.ndarray] = None
+        # Camera preset used by render_middle().  None → simple_doublet_preset().
+        # Set this after construction to override the default.
+        self._camera_preset = None
+        # Aperture plane geometry cached by _ensure_bdpt_plate_sensor_group;
+        # used by _run_manifold_correlator to construct the PlaneSurface.
+        self._bdpt_aperture_centre: Optional[np.ndarray] = None
+        self._bdpt_aperture_normal: Optional[np.ndarray] = None
+        self._bdpt_aperture_up:     Optional[np.ndarray] = None
+        self._bdpt_aperture_radius: float = 0.0
         # GPU/CPU compute mode: 'gpu', 'cpu', or 'mixed'.
         # Controls use_gpu_compute and gpu_all_stages in submit_rays.
         self.compute_mode: str = "gpu"
@@ -3408,6 +3425,11 @@ class ForwardCppLensBench:
         # See the comment in __init__ for the full explanation.
         self._register_uv_page_bank()
 
+        # Store aperture plane geometry for ManifoldWalkStrategy construction.
+        self._bdpt_aperture_centre = np.array([stop_plane_x, 0.0, 0.0], np.float64)
+        self._bdpt_aperture_normal = np.array([-1.0, 0.0, 0.0], np.float64)
+        self._bdpt_aperture_radius = float(stop_radius_m)
+        self._bdpt_aperture_up     = np.array([0.0, 1.0, 0.0], np.float64)
         self._bdpt_sensor_cfg = cfg
         print(
             "[bdpt-register]",
@@ -4177,12 +4199,22 @@ class ForwardCppLensBench:
         """Capture the sensor plate by running the forward-light + backward-sensor
         (pixel-cone) passes and returning a tonemapped RGB array.
 
-        The name ``capture_plate_bdpt_rgb`` was misleading: the underlying
-        C++ kernel ``ray_tracer_bidirectional_impl`` fires forward rays from
-        emissive groups only; the backward sensor contribution comes from the
-        PIXEL_CONE pass (``RayStreamKind.APERTURE_PUPIL``), which IS a valid
-        backward sub-path strategy.  No connection step or MIS is performed
-        here — that is handled by ``RayCorrelator`` in a separate pass.
+        .. deprecated::
+            This method is now formalised as the *aperture-only* special case of
+            the manifold BDPT framework.  It is equivalent to
+            ``render_middle(manifold_mode='aperture')``, where the ManifoldEndpoint
+            is set to backward-only (pixel-cone sampling) and acts purely as an
+            aperture connection point — no scene-side radiance is propagated
+            through the manifold in the forward direction.
+
+            Prefer ``render_middle()`` for new code.  This method remains for
+            backward compatibility and as a C++ fast-path when no Python manifold
+            overhead is acceptable.
+
+        The underlying C++ kernel ``ray_tracer_bidirectional_impl`` fires forward
+        rays from emissive groups; the backward sensor contribution comes from the
+        PIXEL_CONE pass (``RayStreamKind.APERTURE_PUPIL``).  No MIS connection
+        step is performed here — that is handled by ``RayCorrelator`` separately.
 
         Returns
         -------
@@ -4310,24 +4342,37 @@ class ForwardCppLensBench:
                 self.bdpt_last_sensor_power = 0.0
 
             # ── Stream-type validation counts ──────────────────────────────
-            # Classify endpoint records by stream origin using the available
-            # heuristics (no C-side stream_id field yet):
-            #   forward light:      group_id == sensor_gid  (hit the sensor)
-            #   backward sensor:    group_id != sensor_gid  (pixel-cone scene hit)
-            # pixel-cone records additionally satisfy subpath_id < n*n.
+            # Classify endpoint records by stream origin.  Primary: read the
+            # stream_id field (ENDPOINT_DTYPE col-15, float32) written by the
+            # C++ kernel — 0.0 = BDPT_SIDE_LIGHT (forward), 1.0 =
+            # BDPT_SIDE_SENSOR (backward/PIXEL_CONE).  Fallback: use the
+            # vertex_index sign heuristic (col-3 int32) for records produced
+            # by older builds that still have the _pad field.
+            #   forward light:   stream_id == 0.0  (or vertex_index < 0)
+            #   backward sensor: stream_id == 1.0  (or vertex_index >= 0)
             _stream_fwd_count  = 0
             _stream_bwd_count  = 0
             _stream_pixcone_count = 0
+            _fwd_mask = None
+            _bwd_mask = None
             if self._last_bdpt_records is not None and self._last_bdpt_records.shape[0] > 0:
                 _r = self._last_bdpt_records
-                _gids = _r[:, 3].view(np.int32)     # group_id is col-3 int32
-                _sids = _r[:, 0].view(np.uint32)    # subpath_id is col-0 uint32
-                _fwd_mask = _gids == int(sensor_gid)
-                _bwd_mask = ~_fwd_mask
+                _sids  = _r[:, 0].view(np.uint32)    # subpath_id   (col-0 uint32)
+                _sid15 = _r[:, 15]                   # stream_id    (col-15 float32)
+                _have_stream_id = np.any(_sid15 == 0.0) or np.any(_sid15 == 1.0)
+                if _have_stream_id:
+                    # Use explicit stream_id written by C++ kernel (Step 6).
+                    _fwd_mask = _sid15 == 0.0        # BDPT_SIDE_LIGHT
+                    _bwd_mask = _sid15 == 1.0        # BDPT_SIDE_SENSOR
+                else:
+                    # Fallback: vertex_index sign heuristic (pre-Step-6 build).
+                    _vidx = _r[:, 3].view(np.int32)  # vertex_index (col-3 int32)
+                    _fwd_mask = _vidx < 0
+                    _bwd_mask = _vidx >= 0
                 _stream_fwd_count  = int(np.count_nonzero(_fwd_mask))
                 _stream_bwd_count  = int(np.count_nonzero(_bwd_mask))
                 _pixel_cap = int(n) * int(n)
-                _stream_pixcone_count = int(np.count_nonzero(_bwd_mask & (_sids < np.uint32(_pixel_cap))))
+                _stream_pixcone_count = int(np.count_nonzero(_sids < np.uint32(_pixel_cap)))
             self.bdpt_last_stream_counts = {
                 "forward_light":     _stream_fwd_count,
                 "backward_sensor":   _stream_bwd_count,
@@ -4399,12 +4444,208 @@ class ForwardCppLensBench:
                 f"sensor_power={self.bdpt_last_sensor_power:.3e}",
                 flush=True,
             )
+            if _corr_overlay is not None:
+                rgb_tm_arr = np.clip(
+                    rgb_tm_arr.astype(np.float32, copy=False) + _corr_overlay,
+                    0.0, 1.0,
+                ).astype(np.float32, copy=False)
             out = np.clip(rgb_tm_arr, 0.0, 1.0).astype(np.float32, copy=False)
             self._last_bdpt_plate_rgb = out
             return out
 
+    def _run_manifold_correlator(
+        self,
+        n: int,
+        fwd_mask: np.ndarray,
+        bwd_mask: np.ndarray,
+    ) -> np.ndarray:
+        """Pair forward and backward half-paths at the aperture plane via
+        ManifoldWalkStrategy and return an (n, n, 3) float32 overlay.
+
+        Contributions are |A_fwd * A_bwd|^2 normalised and encoded as a
+        warm (R+G) tint so they are visually distinguishable from the
+        physical image produced by the forward pass alone.
+        """
+        overlay = np.zeros((n, n, 3), dtype=np.float32)
+        if self._last_bdpt_records is None:
+            return overlay
+        if self._bdpt_aperture_centre is None:
+            return overlay
+        ap_radius = self._bdpt_aperture_radius
+        if ap_radius <= 0.0:
+            ap_radius = 0.015  # fallback: 15 mm
+        try:
+            aperture = PlaneSurface(
+                centre=self._bdpt_aperture_centre.copy(),
+                normal=self._bdpt_aperture_normal.copy(),
+                u_axis=self._bdpt_aperture_up.copy(),
+                half_extent_u=float(ap_radius),
+                half_extent_v=float(ap_radius),
+            )
+            n_bands = int(self.n_bands)
+            strategy = ManifoldWalkStrategy(
+                aperture=aperture,
+                n_bands=n_bands,
+                grid_n_u=16,
+                grid_n_v=16,
+                match_radius_bins=1,
+                shadow_checker=ShadowRayChecker(tracer=self.tracer),
+                use_mis=True,
+            )
+            correlator = RayCorrelator(strategies=[strategy])
+            _r = self._last_bdpt_records
+            fwd_records = np.ascontiguousarray(_r[fwd_mask], dtype=np.float32)
+            bwd_records = np.ascontiguousarray(_r[bwd_mask], dtype=np.float32)
+            if fwd_records.shape[0] == 0 or bwd_records.shape[0] == 0:
+                return overlay
+            candidates = correlator.correlate(fwd_records, bwd_records, n_bands)
+            if not candidates:
+                return overlay
+            n_sq = n * n
+            accum = np.zeros(n_sq, dtype=np.float64)
+            for cand in candidates:
+                if not cand.accepted:
+                    continue
+                # Pixel address: for PIXEL_CONE backward records subpath_id
+                # encodes (py * n_px + px) directly.  For non-PIXEL_CONE pairs
+                # we fall back to the forward record's subpath index modulo n²
+                # so contributions still land somewhere useful on the overlay.
+                bwd_rec = cand.backward_record
+                if bwd_rec is not None and hasattr(bwd_rec, '__len__') and len(bwd_rec) > 0:
+                    raw_sid = int(bwd_rec.flat[0]) if bwd_rec.dtype == np.float32 else int(bwd_rec["subpath_id"].flat[0])
+                    pid = int(raw_sid) % n_sq
+                else:
+                    fwd_rec = cand.forward_record
+                    raw_sid = int(fwd_rec.flat[0]) if (fwd_rec is not None and fwd_rec.dtype == np.float32) else 0
+                    pid = int(raw_sid) % n_sq
+                c = cand.contribution
+                accum[int(pid)] += float(c.real * c.real + c.imag * c.imag) * cand.middle.mis_weight
+            peak = float(accum.max())
+            if peak > 0.0:
+                img = (accum / peak).reshape(n, n).astype(np.float32)
+                overlay[:, :, 0] = img * 0.5
+                overlay[:, :, 1] = img * 0.3
+        except Exception as exc:
+            print(f"[manifold-correlator] error: {exc}", flush=True)
+        return overlay
+
     # Hard cutover: old name → new semantically-correct name.
     capture_plate_bdpt_rgb = trace_forward_backward_sensor_rgb
+
+    def render_middle(
+        self,
+        manifold_mode: str = "full",
+        preset=None,
+        n_fwd: int = 512,
+        n_px:  int = 32,
+        n_py:  int = 32,
+        n_per_pixel: int = 4,
+        wavelength_um: float = 0.587,
+        grid_n: int = 16,
+        match_radius_bins: int = 2,
+        seed: int = 0,
+    ) -> np.ndarray:
+        """Canonical BDPT via ManifoldEndpoint — the manifold as the connection middle.
+
+        The ManifoldEndpoint sits between the scene and the sensor, acting as the
+        shared connection vertex for both subpaths.  Two modes are available:
+
+        manifold_mode='full'
+            Both directions: forward records (scene→aperture) paired with
+            sensor records (forward-trace mapped, stream_id=SENSOR).
+            Paints a complete sensor UV image.  This is the real BDPT default.
+
+        manifold_mode='aperture'
+            Backward-only as aperture: forward records paired with pixel-cone
+            backward records (sensor→aperture, strict aperture acceptance).
+            Equivalent to the deprecated ``trace_forward_backward_sensor_rgb``
+            C++ path, formalised as a special case of the manifold framework.
+            The manifold acts purely as a connection point; only scene-side
+            radiance arriving at the aperture is transported.
+
+        Parameters
+        ----------
+        manifold_mode  : 'full' (default) or 'aperture'
+        preset         : CameraPreset.  None → self._camera_preset or simple_doublet.
+        n_fwd          : forward (scene-side) ray samples.
+        n_px, n_py     : sensor pixel grid dimensions.
+        n_per_pixel    : sensor samples per pixel.
+        wavelength_um  : wavelength for Snell tracing.
+        grid_n         : ManifoldWalkStrategy grid resolution.
+        match_radius_bins : neighbourhood search radius in bins.
+        seed           : RNG seed.
+
+        Returns
+        -------
+        (n_py, n_px, 3) float32 RGB image, normalised to [0, 1].
+        """
+        try:
+            from camera_designer.manifold_endpoint import ManifoldEndpoint
+            from camera_designer.camera_preset import simple_doublet_preset
+        except ImportError as exc:
+            print(f"[middle] import error: {exc}", flush=True)
+            return np.zeros((n_py, n_px, 3), dtype=np.float32)
+
+        if preset is None:
+            preset = self._camera_preset or simple_doublet_preset()
+
+        ep = ManifoldEndpoint(preset, n_bands=1)
+
+        fwd_recs = ep.sample_forward_records(
+            n_fwd, wavelength_um=wavelength_um, seed=seed)
+
+        if manifold_mode == "aperture":
+            bwd_recs = ep.sample_backward_records(
+                n_px, n_py, n_per_pixel=n_per_pixel,
+                wavelength_um=wavelength_um, seed=seed + 1)
+        else:
+            bwd_recs = ep.sample_sensor_records(
+                n_px, n_py, n_per_pixel=n_per_pixel,
+                wavelength_um=wavelength_um, seed=seed + 1)
+
+        if fwd_recs.shape[0] == 0 or bwd_recs.shape[0] == 0:
+            print(f"[middle/{manifold_mode}] no records — check preset geometry",
+                  flush=True)
+            return np.zeros((n_py, n_px, 3), dtype=np.float32)
+
+        correlator = ep.make_correlator(
+            grid_n=grid_n, match_radius_bins=match_radius_bins)
+        candidates = correlator.correlate(fwd_recs, bwd_recs, n_bands=1)
+
+        accum  = np.zeros(n_px * n_py, dtype=np.float64)
+        n_hits = 0
+        for cand in candidates:
+            if not cand.accepted:
+                continue
+            bwd = cand.backward_record
+            if bwd is None or bwd.shape[0] == 0:
+                continue
+            pid = int(bwd["subpath_id"].flat[0]) % (n_px * n_py)
+            c   = complex(np.ravel(cand.contribution)[0])
+            w   = cand.middle.mis_weight if cand.middle is not None else 1.0
+            accum[pid] += (c.real * c.real + c.imag * c.imag) * w
+            n_hits += 1
+
+        print(f"[middle/{manifold_mode}] {n_hits} pairs  "
+              f"fwd={fwd_recs.shape[0]}  bwd={bwd_recs.shape[0]}", flush=True)
+
+        img = np.zeros((n_py, n_px, 3), dtype=np.float32)
+        peak = float(accum.max())
+        if peak > 0.0:
+            bright = (accum / peak).reshape(n_py, n_px).astype(np.float32)
+            img[:, :, 0] = bright
+            img[:, :, 1] = bright * 0.85
+            img[:, :, 2] = bright * 0.65
+
+        self._last_bdpt_plate_rgb = img
+        return img
+
+    def render_manifold_bdpt(self, preset=None, **kw) -> np.ndarray:
+        """Legacy alias for render_middle(manifold_mode='full').
+
+        .. deprecated:: use render_middle() directly.
+        """
+        return self.render_middle(manifold_mode="full", preset=preset, **kw)
 
     def export_bdpt_ray_visualization(self, output_file: str = "bdpt_rays.txt") -> Dict[str, any]:
         """Export BDPT ray paths to a text file for detailed visualization.
@@ -5521,7 +5762,7 @@ def _fly_persp(fov_y_rad: float, aspect: float, near: float, far: float) -> np.n
 
 
 def run(
-    ray_mode: str = "bdpt",
+    ray_mode: str = "middle",
     sensor_res: int = 64,
     sensor_amp_gain: float = 1.0,
     sensor_min_amplitude: float = 0.0,
@@ -5529,7 +5770,11 @@ def run(
     compute_mode: str = "gpu",
     profile: bool = False,
     field_capture: bool = True,
+    manifold_mode: str = "full",
 ) -> None:
+    # "bdpt" is a legacy alias for "middle"
+    if ray_mode == "bdpt":
+        ray_mode = "middle"
     try:
         from OpenGL.GL import (
             glGenTextures, glBindTexture, GL_TEXTURE_2D, GL_TEXTURE_3D,
@@ -5565,7 +5810,10 @@ def run(
 
     pygame.init()
     W, H = 1560, 860
-    pygame.display.set_caption("Thick Lens — Spectral Cross-Section Viewer")
+    _mode_label = {"middle": "M", "forward": ">", "backward": "<"}.get(ray_mode, ray_mode)
+    pygame.display.set_caption(
+        f"Thick Lens — Spectral Cross-Section Viewer  [{_mode_label}]"
+    )
     pygame.display.set_mode((W, H), pygame.OPENGL | pygame.DOUBLEBUF)
 
     # Capture the Pygame/WGL display context handle for GL object sharing,
@@ -6133,13 +6381,16 @@ def run(
             es = stats.get("exact_snaps", 0)
             nm = stats.get("near_miss_count", 0)
             dist_str = (f"dyz {nd*1000:.2f}mm" if nd >= 0.0 else "dyz --")
+            mode_str = f"M/{manifold_mode}" if ray_mode == "middle" else ray_mode
             hud_surf = pygame.Surface((_HUD_W, _HUD_H), pygame.SRCALPHA)
             hud_surf.fill((0, 0, 0, 0))
             line_h = font.get_linesize()
-            for i, txt in enumerate([dist_str,
+            for i, txt in enumerate([mode_str,
+                                      dist_str,
                                       f"col {bc:.3f}",
                                       f"snaps {es} nr {nm}"]):
-                rendered = font.render(txt, True, (80, 210, 255))
+                colour = (180, 140, 255) if i == 0 else (80, 210, 255)
+                rendered = font.render(txt, True, colour)
                 hud_surf.blit(rendered, (2, i * (line_h + 1)))
             # pygame surface → RGBA8 numpy array (y-flipped for GL)
             raw = pygame.surfarray.array_alpha(
@@ -6411,6 +6662,24 @@ def run(
     # stays live while the pipeline is catching up.
     _MAX_IN_FLIGHT = 65_536
 
+    # Manifold ("M") render state — fires once at startup then every N frames.
+    _MANIFOLD_INTERVAL = 60     # re-render every 60 trace calls
+    _manifold_ctr      = [0]    # mutable so _trace closure can update it
+    _manifold_busy     = [False]
+
+    def _fire_manifold_render() -> None:
+        if _manifold_busy[0]:
+            return
+        _manifold_busy[0] = True
+        def _worker():
+            try:
+                bench.render_middle(manifold_mode=manifold_mode)
+            except Exception as _me:
+                print(f"[middle] render error: {_me}", flush=True)
+            finally:
+                _manifold_busy[0] = False
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _trace(rpe: int, sd: int, mb: int):
         import time as _t
         target_in_flight = 0 if ray_mode == "backward" else _MAX_IN_FLIGHT
@@ -6418,10 +6687,20 @@ def run(
             _t.sleep(0.002)   # back off; let drain-loop consume Q_intent
         if closing.is_set():
             return
-        if ray_mode != "backward":
+        # "middle" drives C++ forward+backward for the field display, and
+        # additionally fires the manifold render periodically for the left PIP.
+        if ray_mode not in ("backward",):
             bench.trace_forward(rpe, sd, max_bounces=mb)
-        if ray_mode != "forward":
+        if ray_mode not in ("forward",):
             bench.trace_sensor_cast(rpe, sd ^ 0x5A5A, max_bounces=mb)
+        if ray_mode == "middle":
+            _manifold_ctr[0] += 1
+            if _manifold_ctr[0] % _MANIFOLD_INTERVAL == 1:
+                _fire_manifold_render()
+
+    # Kick off the first manifold render immediately when in "middle" mode.
+    if ray_mode == "middle":
+        _fire_manifold_render()
 
     try:
         while True:
@@ -6751,9 +7030,24 @@ if __name__ == "__main__":
     _ap = argparse.ArgumentParser(description="Spectral lens bench")
     _ap.add_argument(
         "--ray-mode",
-        choices=["bdpt", "forward", "backward"],
-        default="bdpt",
-        help="bdpt = forward+backward (default); forward = forward rays only; backward = sensor-cast rays only",
+        choices=["middle", "bdpt", "forward", "backward"],
+        default="middle",
+        help=(
+            "middle = ManifoldEndpoint BDPT (default); "
+            "bdpt   = legacy alias for middle; "
+            "forward = forward rays only; "
+            "backward = sensor-cast rays only"
+        ),
+    )
+    _ap.add_argument(
+        "--manifold-mode",
+        choices=["full", "aperture"],
+        default="full",
+        help=(
+            "full     = both directions, paints to sensor UV (default); "
+            "aperture = backward-only as aperture connection point "
+            "(special case: formalises the old C++ BDPT path)"
+        ),
     )
     _ap.add_argument(
         "--sensor-res",
@@ -6834,4 +7128,5 @@ if __name__ == "__main__":
         compute_mode=_args.compute_mode,
         profile=bool(_args.profile),
         field_capture=not _args.no_field,
+        manifold_mode=_args.manifold_mode,
     )

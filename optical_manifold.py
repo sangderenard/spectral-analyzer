@@ -326,14 +326,8 @@ def project_record_to_aperture(
     if r.dtype == ENDPOINT_DTYPE:
         if r.ndim == 0:
             r = r.reshape(1)
-        pos = np.array(
-            [float(r['pos_x']), float(r['pos_y']), float(r['pos_z'])],
-            dtype=np.float64,
-        )
-        d = np.array(
-            [float(r['dir_x']), float(r['dir_y']), float(r['dir_z'])],
-            dtype=np.float64,
-        )
+        pos = np.array(r['pos'][0], dtype=np.float64)
+        d   = np.array(r['dir'][0], dtype=np.float64)
     else:
         flat = np.asarray(r, dtype=np.float64).ravel()
         pos = flat[4:7]
@@ -416,14 +410,8 @@ def build_halves_from_records(
                 amp_re[b] = float(r['amp_re'])
                 amp_im[b] = float(r['amp_im'])
 
-        pos = np.array(
-            [float(ref['pos_x']), float(ref['pos_y']), float(ref['pos_z'])],
-            dtype=np.float64,
-        )
-        d = np.array(
-            [float(ref['dir_x']), float(ref['dir_y']), float(ref['dir_z'])],
-            dtype=np.float64,
-        )
+        pos = np.array(ref['pos'], dtype=np.float64)
+        d   = np.array(ref['dir'], dtype=np.float64)
         d_len = math.sqrt(float(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]))
         dir_unit = d / d_len if d_len > 1e-15 else d
 

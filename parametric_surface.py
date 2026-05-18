@@ -32,6 +32,9 @@ Coordinate conventions
 
 Provided surfaces
 -----------------
+  UVMappableSurface — mixin that can be combined with any camera_designer
+                      surface type to add UV-parameterisation without
+                      duplicating intersection logic.
   PlaneSurface   — flat plane (aperture stops, sensor planes, flat mirrors)
   ConicSurface   — conic section of revolution about a given axis:
                      k = 0          sphere
@@ -40,14 +43,88 @@ Provided surfaces
                     -1 < k < 0      prolate ellipsoid
                      k > 0          oblate ellipsoid
   SphericalSurface — shortcut constructor for ConicSurface(k=0)
+  CdFlatSurfaceWithUV — camera_designer.FlatSurface + UVMappableSurface;
+                        delegates intersection to camera_designer, keeps
+                        UV-mapping from this module.
 """
 
 from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from typing import Optional
 
 import numpy as np
+
+try:
+    from camera_designer.parametric_surfaces import (
+        FlatSurface as _CdFlatSurface,
+        ParametricSurface as _CdParametricSurface,
+    )
+    _CD_AVAILABLE = True
+except Exception:
+    _CD_AVAILABLE = False
+    _CdFlatSurface = None
+    _CdParametricSurface = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UVMappableSurface mixin
+# ─────────────────────────────────────────────────────────────────────────────
+
+class UVMappableSurface:
+    """Mixin that exposes the UV-parameterisation protocol.
+
+    Any surface — including camera_designer types that implement only
+    intersect() — can gain UV support by subclassing both the base surface
+    and this mixin and overriding ``point_to_uv`` / ``uv_to_point``.
+
+    The contract:
+      point_to_uv(pos)         → (u, v) or None
+      uv_to_point(u, v)        → (3,) float64
+      project_ray_to_uv(o, d)  → (u, v) or None  (default: intersect then map)
+      area_element(u, v)       → float            (default: numerical Jacobian)
+
+    The mixin deliberately provides a numerical default for ``area_element``
+    so concrete classes only need to override it for analytical accuracy.
+    """
+
+    def point_to_uv(self, pos: np.ndarray) -> tuple[float, float] | None:
+        raise NotImplementedError("point_to_uv must be implemented by subclass")
+
+    def uv_to_point(self, u: float, v: float) -> np.ndarray:
+        raise NotImplementedError("uv_to_point must be implemented by subclass")
+
+    def project_ray_to_uv(
+        self,
+        origin: np.ndarray,
+        direction: np.ndarray,
+    ) -> tuple[float, float] | None:
+        """Intersect then map.  Delegates to intersect_ray if available."""
+        fn = getattr(self, 'intersect_ray', None) or getattr(self, 'intersect', None)
+        if fn is None:
+            return None
+        result = fn(np.asarray(origin, np.float64), np.asarray(direction, np.float64))
+        # intersect_ray returns scalar t or None; intersect returns (t, hit, normal)
+        if result is None:
+            return None
+        if isinstance(result, tuple):
+            t_val = result[0]
+        else:
+            t_val = result
+        if t_val is None or (hasattr(t_val, '__float__') and not math.isfinite(float(t_val))):
+            return None
+        o = np.asarray(origin, np.float64)
+        d = np.asarray(direction, np.float64)
+        hit = o + float(t_val) * d
+        return self.point_to_uv(hit)
+
+    def area_element(self, u: float, v: float, eps: float = 1e-4) -> float:
+        """Numerical Jacobian |\u2202r/\u2202u \u00d7 \u2202r/\u2202v| at (u, v)."""
+        p0 = self.uv_to_point(u, v)
+        pu = self.uv_to_point(u + eps, v)
+        pv = self.uv_to_point(u, v + eps)
+        return float(np.linalg.norm(np.cross(pu - p0, pv - p0))) / (eps * eps)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -117,7 +194,7 @@ class ParametricSurface(ABC):
 # PlaneSurface
 # ─────────────────────────────────────────────────────────────────────────────
 
-class PlaneSurface(ParametricSurface):
+class PlaneSurface(UVMappableSurface, ParametricSurface):
     """Flat plane parameterised by two orthonormal in-plane axes.
 
     The natural coordinate frame has:
@@ -236,7 +313,7 @@ class PlaneSurface(ParametricSurface):
 # ConicSurface
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ConicSurface(ParametricSurface):
+class ConicSurface(UVMappableSurface, ParametricSurface):
     """Conic section of revolution parameterised by (u, v) = (x/R_ca, y/R_ca).
 
     The surface is defined by the sag formula in object space
@@ -420,3 +497,74 @@ def SphericalSurface(
         clear_aperture_radius=clear_aperture_radius,
         u_ref_axis=u_ref_axis,
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CdFlatSurfaceWithUV — camera_designer FlatSurface + UVMappableSurface
+# ─────────────────────────────────────────────────────────────────────────────
+
+if _CD_AVAILABLE:
+    class CdFlatSurfaceWithUV(UVMappableSurface, _CdFlatSurface):  # type: ignore[valid-type]
+        """camera_designer.FlatSurface extended with UV-mapping.
+
+        Delegates intersection to camera_designer's Newton-polished FlatSurface
+        implementation; adds ``point_to_uv`` / ``uv_to_point`` so the surface
+        can be used as the aperture parameter in ``ApertureGrid`` and
+        ``ManifoldWalkStrategy``.
+
+        (u, v) ∈ [-1, 1]² with the Y/Z axes of the local camera_designer frame
+        as the u/v axes.  r_max is used for normalisation.
+
+        Parameters
+        ----------
+        z_pos  : z position of the plane along the optical axis (metres).
+        r_max  : physical semi-diameter (metres); maps to ||(u,v)|| = 1.
+        r_min  : inner hole radius (0 = solid disc).
+        """
+
+        def __init__(
+            self,
+            z_pos: float = 0.0,
+            r_max: float = 0.020,
+            r_min: float = 0.0,
+        ) -> None:
+            # camera_designer FlatSurface uses local Z-axis frame.
+            _CdFlatSurface.__init__(self, z_pos=z_pos, r_max=r_max, r_min=r_min)
+
+        def point_to_uv(self, pos: np.ndarray) -> tuple[float, float] | None:
+            """Map world-space pos to (u, v).
+
+            For the camera_designer local Z-axis frame, x and y in local space
+            map to u and v.  The surfaces live in local frame, so pos is already
+            in local coordinates when passed from an intersect() call.
+            """
+            p = np.asarray(pos, np.float64)
+            u = float(p[0]) / self.r_max if self.r_max > 0 else 0.0
+            v = float(p[1]) / self.r_max if self.r_max > 0 else 0.0
+            if abs(u) > 1.0 + 1e-6 or abs(v) > 1.0 + 1e-6:
+                return None
+            return (u, v)
+
+        def uv_to_point(self, u: float, v: float) -> np.ndarray:
+            return np.array([u * self.r_max, v * self.r_max, self.z_pos],
+                            dtype=np.float64)
+
+        def area_element(self, u: float, v: float, eps: float = 1e-4) -> float:
+            return float(self.r_max * self.r_max)  # constant Jacobian
+
+else:
+    # Stub so imports don't fail when camera_designer is unavailable.
+    class CdFlatSurfaceWithUV(UVMappableSurface, ParametricSurface):  # type: ignore[no-redef]
+        """Stub: camera_designer not available.  Raises NotImplementedError."""
+        def __init__(self, **kwargs) -> None:
+            raise NotImplementedError(
+                "camera_designer is required for CdFlatSurfaceWithUV"
+            )
+        def intersect_ray(self, origin, direction):
+            raise NotImplementedError
+        def normal_at_point(self, pos):
+            raise NotImplementedError
+        def point_to_uv(self, pos):
+            raise NotImplementedError
+        def uv_to_point(self, u, v):
+            raise NotImplementedError

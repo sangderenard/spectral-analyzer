@@ -5848,7 +5848,7 @@ static int ray_tracer_bidirectional_impl(
                         E.amp_re    = (float)amp[b].real();
                         E.amp_im    = (float)amp[b].imag();
                         E.cos_theta = (float)cos_theta;
-                        E._pad      = (float)interaction_flags;
+                        E.stream_id = (float)BDPT_SIDE_LIGHT;
                     }
                 }
                 

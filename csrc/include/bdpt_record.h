@@ -58,7 +58,7 @@ typedef struct {
     float    amp_re;          /* complex amplitude — real part */
     float    amp_im;          /* complex amplitude — imag part */
     float    cos_theta;       /* |dir · normal|, useful for energy conservation */
-    float    _pad;            /* keep 16-byte alignment */
+    float    stream_id;       /* BDPT_SIDE_LIGHT (0) or BDPT_SIDE_SENSOR (1) */
 } EndpointRecord;
 
 /* Ray segment for diagnostic visualization — records each bounce point. */

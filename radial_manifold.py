@@ -227,7 +227,20 @@ def wedge_direction_sampler(
     phi    : (n,) float64  — azimuth within wedge
     dirs   : (n, 3) float64 — unit direction vectors (Z = optical axis)
     """
-    ...
+    if rng is None:
+        rng = np.random.default_rng()
+    u = rng.uniform(0.0, 1.0, n)
+    v = rng.uniform(0.0, 1.0, n)
+    cos_theta_max = math.cos(theta_max)
+    cos_theta = 1.0 - u * (1.0 - cos_theta_max)
+    theta = np.arccos(np.clip(cos_theta, -1.0, 1.0))   # (n,) float64
+    phi   = delta_phi_half * (2.0 * v - 1.0)            # (n,) float64
+    sin_theta = np.sin(theta)
+    dirs = np.empty((n, 3), dtype=np.float64)
+    dirs[:, 0] = sin_theta * np.cos(phi)
+    dirs[:, 1] = sin_theta * np.sin(phi)
+    dirs[:, 2] = cos_theta
+    return theta, phi, dirs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -250,7 +263,23 @@ def rotate_directions_xy(
     This is the analytic step that extends a baked wedge to any azimuth
     without re-tracing.  OPL is a scalar invariant — do not rotate it.
     """
-    ...
+    dirs = np.asarray(dirs)                     # preserve input dtype
+    out  = dirs.copy()
+    c    = math.cos(delta_phi)
+    s    = math.sin(delta_phi)
+    if dirs.ndim == 1:
+        x      = float(dirs[0])
+        y      = float(dirs[1])
+        out[0] = x * c - y * s
+        out[1] = x * s + y * c
+        # out[2] = dirs[2]  (already copied)
+    else:
+        x        = dirs[:, 0].copy()
+        y        = dirs[:, 1].copy()
+        out[:, 0] = x * c - y * s
+        out[:, 1] = x * s + y * c
+        # out[:, 2] unchanged
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,7 +339,75 @@ class WedgeManifold:
         All arithmetic is float64.  Per-band amplitudes are accumulated
         separately as float32 to match EndpointRecord dtype.
         """
-        ...
+        rng = np.random.default_rng(seed)
+        theta, phi_dirs, in_dirs = wedge_direction_sampler(
+            n, delta_phi_half, theta_max, rng
+        )
+
+        # Derive aperture radius from the aperture surface.
+        ap_radius = float(
+            getattr(aperture_surface, 'r_max',
+            getattr(aperture_surface, 'aperture_radius',
+            getattr(aperture_surface, 'clear_aperture_radius', 0.015)))
+        )
+        ap_z = float(getattr(aperture_surface, 'z_pos', 0.0))
+
+        # Sample aperture positions uniformly over the aperture disk,
+        # restricting azimuth to the wedge to keep the bake self-consistent.
+        r_norm = np.sqrt(rng.uniform(0.0, 1.0, n))  # uniform disk sampling
+        phi_ap = rng.uniform(-delta_phi_half, delta_phi_half, n)
+        x_ap   = r_norm * np.cos(phi_ap) * ap_radius
+        y_ap   = r_norm * np.sin(phi_ap) * ap_radius
+
+        # Ray origins at aperture plane (local Z frame, z = ap_z)
+        ro = np.column_stack([x_ap, y_ap, np.full(n, ap_z)])
+
+        # Propagate each ray through the surface chain.
+        # Surfaces use a single-ray interface: intersect(ro_1d, rd_1d).
+        # Tracing is geometric only (no refraction) — IOR data is not
+        # available here; the manifold records the geometric skeleton.
+        rd   = in_dirs.astype(np.float64, copy=True)   # (N, 3)
+        opls = np.zeros(n, dtype=np.float64)
+
+        for surf in surface_chain:
+            for i in range(n):
+                try:
+                    t_i, hit_i, _nrm = surf.intersect(ro[i], rd[i])
+                    t_f = float(t_i)
+                    if math.isfinite(t_f) and t_f > 1e-9:
+                        opls[i] += t_f
+                        ro[i]    = ro[i] + t_f * rd[i]
+                except Exception:
+                    pass
+
+        out_dirs = rd  # geometric: direction unchanged (no refraction)
+
+        # Normalised aperture (u, v) in [-1, 1] for LensManifold.
+        uv_ap = np.column_stack([r_norm * np.cos(phi_ap),
+                                  r_norm * np.sin(phi_ap)])
+        # Field-angle factors: use (theta, phi_dirs) as proxies.
+        fufv = np.column_stack([theta, phi_dirs])
+
+        manifold = LensManifold.from_pairs(
+            uv=uv_ap,
+            fufv=fufv,
+            in_dirs=in_dirs,
+            out_dirs=out_dirs,
+            opls=opls,
+        )
+        return cls(
+            _manifold=manifold,
+            delta_phi_half=delta_phi_half,
+            theta_max=theta_max,
+            meta={
+                "n": n,
+                "seed": seed,
+                "forward": forward,
+                "backward": backward,
+                "ap_radius": ap_radius,
+                "ap_z": ap_z,
+            },
+        )
 
     def query_polar(
         self,
@@ -324,16 +421,66 @@ class WedgeManifold:
         Returns (out_dir (3,) float64, opl float64).
         Caller applies rotate_directions_xy to move from wedge frame to world φ.
         """
-        ...
+        if self._manifold is None or self._manifold._data is None:
+            return np.array([0.0, 0.0, 1.0], np.float64), 0.0
+        # Normalise r to [-1, 1] aperture space.
+        ap_radius = float(self.meta.get("ap_radius", 0.015))
+        if ap_radius <= 0.0:
+            ap_radius = 0.015
+        r_norm = max(-1.0, min(1.0, r / ap_radius))
+        u = r_norm * math.cos(phi_rel)
+        v = r_norm * math.sin(phi_rel)
+        in_dir = np.array(
+            [math.sin(theta) * math.cos(phi_rel),
+             math.sin(theta) * math.sin(phi_rel),
+             math.cos(theta)],
+            dtype=np.float64,
+        )
+        uv_q  = np.array([[u, v]], dtype=np.float64)
+        dirs, opl_arr = self._manifold.interpolate_with_opl(
+            uv_q, k=k, in_dir=in_dir[np.newaxis, :]
+        )
+        return dirs[0], float(opl_arr[0])
 
     def save(self, path: str) -> None:
         """Persist to .npz (delegates to LensManifold.save + meta sidecar)."""
-        ...
+        import json
+        if not path.endswith(".npz"):
+            path += ".npz"
+        if self._manifold is not None:
+            self._manifold.save(path)
+            # Append wedge-specific meta by reopening and re-saving.
+            npz = dict(np.load(path, allow_pickle=False))
+            npz["wedge_meta"] = np.frombuffer(
+                json.dumps({
+                    "delta_phi_half": self.delta_phi_half,
+                    "theta_max":      self.theta_max,
+                    **self.meta,
+                }).encode(),
+                dtype=np.uint8,
+            )
+            np.savez_compressed(path, **npz)
 
     @classmethod
     def load(cls, path: str) -> "WedgeManifold":
         """Load from .npz."""
-        ...
+        import json
+        manifold = LensManifold.load(path)
+        wedge_meta: dict = {}
+        try:
+            npz = np.load(path, allow_pickle=False)
+            if "wedge_meta" in npz:
+                wedge_meta = json.loads(bytes(npz["wedge_meta"]).decode())
+        except Exception:
+            pass
+        delta_phi_half = float(wedge_meta.pop("delta_phi_half", math.pi / 36))
+        theta_max      = float(wedge_meta.pop("theta_max",      math.pi / 2))
+        return cls(
+            _manifold=manifold,
+            delta_phi_half=delta_phi_half,
+            theta_max=theta_max,
+            meta=wedge_meta,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,7 +522,24 @@ class SymmetryManifold:
         out_dirs : (M, 3) float64 — unit directions in world frame
         opls     : (M,)   float64 — optical path lengths (metres)
         """
-        ...
+        r     = np.asarray(r,     np.float64).ravel()
+        phi   = np.asarray(phi,   np.float64).ravel()
+        theta = np.asarray(theta, np.float64).ravel()
+        M = len(r)
+        out_dirs = np.empty((M, 3), dtype=np.float64)
+        opls     = np.empty(M,       dtype=np.float64)
+        for i in range(M):
+            # Fold phi into the canonical wedge.
+            sector_idx = round(float(phi[i]) / self._sector_width)
+            phi_baked  = float(phi[i]) - sector_idx * self._sector_width
+            out_dir_w, opl_i = self.wedge.query_polar(
+                float(r[i]), phi_baked, float(theta[i]), k=k
+            )
+            # Rotate back to world azimuth.
+            delta = sector_idx * self._sector_width
+            out_dirs[i] = rotate_directions_xy(out_dir_w, delta)
+            opls[i]     = opl_i
+        return out_dirs, opls
 
     def query_halves(
         self,
@@ -394,7 +558,65 @@ class SymmetryManifold:
         Both sets are keyed on aperture (r, phi) for connection by
         RadialApertureGrid.
         """
-        ...
+        from bdpt_integrator import RayStreamKind
+        from optical_manifold import ManifoldVertex, SurfaceManifold, INTERACTION_PROPAGATE
+        r      = np.asarray(r,     np.float64).ravel()
+        phi    = np.asarray(phi,   np.float64).ravel()
+        theta  = np.asarray(theta, np.float64).ravel()
+        M      = len(r)
+        halves: list[ManifoldHalf] = []
+        ap_radius = float(self.wedge.meta.get("ap_radius", 0.015))
+        if ap_radius <= 0.0:
+            ap_radius = 0.015
+        for kind, enabled in [
+            (RayStreamKind.FORWARD_LIGHT,  forward),
+            (RayStreamKind.APERTURE_PUPIL, backward),
+        ]:
+            if not enabled:
+                continue
+            out_dirs, opls = self.query(r, phi, theta, k=k)
+            for i in range(M):
+                r_norm = float(r[i]) / ap_radius
+                u_ap   = r_norm * math.cos(float(phi[i]))
+                v_ap   = r_norm * math.sin(float(phi[i]))
+                # Build a minimal ManifoldVertex at the aperture.
+                x_ap = float(r[i]) * math.cos(float(phi[i]))
+                y_ap = float(r[i]) * math.sin(float(phi[i]))
+                pos  = np.array([x_ap, y_ap, float(
+                    self.wedge.meta.get("ap_z", 0.0)
+                )], dtype=np.float64)
+                in_d = np.array([
+                    math.sin(float(theta[i])) * math.cos(float(phi[i])),
+                    math.sin(float(theta[i])) * math.sin(float(phi[i])),
+                    math.cos(float(theta[i])),
+                ], dtype=np.float64)
+                vert = ManifoldVertex(
+                    pos=pos,
+                    dir_in=in_d,
+                    dir_out=out_dirs[i],
+                    normal=np.array([0.0, 0.0, 1.0], dtype=np.float64),
+                    amp_re=np.ones(n_bands, dtype=np.float32),
+                    amp_im=np.zeros(n_bands, dtype=np.float32),
+                    pdf=1.0 / max(M, 1),
+                    cos_in=float(abs(math.cos(float(theta[i])))),
+                    cos_out=float(abs(math.cos(float(theta[i])))),
+                    pathlen_m=float(opls[i]),
+                    interaction=INTERACTION_PROPAGATE,
+                )
+                smanifold = SurfaceManifold(
+                    subpath_id=i,
+                    vertices=[vert],
+                )
+                half = ManifoldHalf(
+                    kind=kind,
+                    aperture_surface_id=0,
+                    aperture_uv=(u_ap, v_ap),
+                    manifold=smanifold,
+                    pixel_id=i,
+                    source_records=None,
+                )
+                halves.append(half)
+        return halves
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -427,7 +649,10 @@ class RadialApertureGrid:
 
     def _bin_idx(self, r: float) -> int:
         """Map radius r to bin index, clamped to [0, n_r-1]."""
-        ...
+        if self.r_max <= 0.0:
+            return 0
+        idx = int(float(r) / self.r_max * self.n_r)
+        return max(0, min(idx, self.n_r - 1))
 
     def insert(self, half: ManifoldHalf) -> None:
         """Insert a ManifoldHalf keyed on its aperture radius.
@@ -436,7 +661,12 @@ class RadialApertureGrid:
         r = sqrt(u²+v²) · aperture_surface.clear_aperture_radius,
         or directly if half stores (r, phi) in aperture_uv.
         """
-        ...
+        u, v = half.aperture_uv
+        # aperture_uv is normalized (u,v) in [-1,1]; r_norm in [0, sqrt(2)].
+        # Scale back to physical radius using r_max.
+        r_norm = math.sqrt(float(u) ** 2 + float(v) ** 2)
+        r_phys = r_norm * self.r_max
+        self._bins[self._bin_idx(r_phys)].append(half)
 
     def query_ring(
         self,
@@ -444,7 +674,13 @@ class RadialApertureGrid:
         width_bins:  int = 1,
     ) -> list[ManifoldHalf]:
         """Return all ManifoldHalf objects within ±width_bins of r's bin."""
-        ...
+        idx  = self._bin_idx(float(r))
+        lo   = max(0, idx - width_bins)
+        hi   = min(self.n_r - 1, idx + width_bins)
+        result: list[ManifoldHalf] = []
+        for b in range(lo, hi + 1):
+            result.extend(self._bins[b])
+        return result
 
     @property
     def count(self) -> int:

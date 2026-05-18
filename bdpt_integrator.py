@@ -97,7 +97,7 @@ ENDPOINT_DTYPE = np.dtype([
     ("amp_re",       np.float32),
     ("amp_im",       np.float32),
     ("cos_theta",    np.float32),
-    ("_pad",         np.float32),
+    ("stream_id",    np.float32),
 ])
 assert ENDPOINT_DTYPE.itemsize == 64, "EndpointRecord dtype size mismatch"
 

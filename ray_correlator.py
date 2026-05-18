@@ -73,6 +73,12 @@ from bdpt_integrator import (
 )
 from parametric_surface import ParametricSurface
 
+try:
+    from radial_manifold import RadialApertureGrid as _RadialApertureGrid
+    _RADIAL_GRID_AVAILABLE = True
+except Exception:
+    _RADIAL_GRID_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 class StrategyID(enum.IntEnum):
@@ -84,7 +90,119 @@ class StrategyID(enum.IntEnum):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class CorrelationStrategy(Protocol):
+# MIS (Multiple Importance Sampling) weighting functions.
+
+def mis_balance_weight(pdf_a: float, pdf_b: float) -> float:
+    """Balance-heuristic MIS weight for strategy A given pdfs of A and B.
+
+    Returns pdf_a / (pdf_a + pdf_b), or 0.5 when the denominator underflows.
+    """
+    denom = pdf_a + pdf_b
+    return pdf_a / denom if denom > 1e-30 else 0.5
+
+
+def mis_power_weight(pdf_a: float, pdf_b: float, beta: float = 2.0) -> float:
+    """Power-heuristic MIS weight for strategy A.
+
+    mis_power_weight(a, b, 2) = a^2 / (a^2 + b^2).
+    """
+    pa = pdf_a ** beta
+    pb = pdf_b ** beta
+    denom = pa + pb
+    return pa / denom if denom > 1e-30 else 0.5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class ShadowRayChecker:
+    """Batch visibility checker for BDPT path connection.
+
+    Two modes:
+    - *Stub* (``tracer=None``): always returns visible; no geometry test.
+    - *Tracer-backed* (``tracer`` provided): fires a batch probe ray via
+      ``tracer.trace()`` from ``p0`` toward ``p1`` and classifies the segment
+      as occluded if any hit is found closer than ``|p1 - p0| - epsilon``.
+
+    The tracer-backed path requires the C++ tracer to support a single-ray
+    ``trace()`` call returning a hit-distance (or negative on miss).  If the
+    tracer does not support the required interface the checker silently falls
+    back to the always-visible stub.
+
+    Parameters
+    ----------
+    tracer : optional
+        The C++ ray-tracer object (``PyRayTracer``).  ``None`` → always visible.
+    epsilon : float
+        Distance tolerance (m) subtracted from segment length when classifying
+        hits; prevents self-intersection from the endpoint positions.
+    """
+
+    def __init__(self, tracer=None, epsilon: float = 1e-4) -> None:
+        self._tracer  = tracer
+        self._epsilon = float(epsilon)
+        # Probe for tracer capability once at construction.
+        self._has_trace = (
+            tracer is not None
+            and hasattr(tracer, "trace")
+            and callable(getattr(tracer, "trace"))
+        )
+
+    # ------------------------------------------------------------------
+    def visible(self, p0: np.ndarray, p1: np.ndarray) -> bool:
+        """Return True if the segment p0→p1 is unoccluded.
+
+        Both ``p0`` and ``p1`` should be 1-D arrays of shape (3,).
+        """
+        p0 = np.asarray(p0, dtype=np.float64).ravel()
+        p1 = np.asarray(p1, dtype=np.float64).ravel()
+        if not self._has_trace:
+            return True
+        seg_len = float(np.linalg.norm(p1 - p0))
+        if seg_len < self._epsilon:
+            return True  # degenerate segment — treat as co-located, unoccluded
+        direction = (p1 - p0) / seg_len
+        try:
+            result = self._tracer.trace(
+                p0.tolist(),
+                direction.tolist(),
+                float(seg_len),
+            )
+            # result is expected to be a hit-distance (float) or a dict with "t".
+            if isinstance(result, dict):
+                t_hit = float(result.get("t", -1.0))
+            else:
+                t_hit = float(result)
+            return t_hit < 0.0 or t_hit >= seg_len - self._epsilon
+        except Exception:
+            # Unsupported API or error → optimistic
+            return True
+
+    # ------------------------------------------------------------------
+    def visible_batch(
+        self,
+        p0s: np.ndarray,
+        p1s: np.ndarray,
+    ) -> np.ndarray:
+        """Vectorised visibility test.
+
+        Parameters
+        ----------
+        p0s : (N, 3) float64
+        p1s : (N, 3) float64
+
+        Returns
+        -------
+        np.ndarray of bool, shape (N,)
+        """
+        p0s = np.asarray(p0s, dtype=np.float64)
+        p1s = np.asarray(p1s, dtype=np.float64)
+        n   = p0s.shape[0]
+        out = np.ones(n, dtype=bool)
+        for i in range(n):
+            out[i] = self.visible(p0s[i], p1s[i])
+        return out
+
+
+
     """Protocol satisfied by all strategy classes."""
 
     strategy_id: int
@@ -332,6 +450,10 @@ class ManifoldWalkStrategy:
         grid_n_u: int = 16,
         grid_n_v: int = 16,
         match_radius_bins: int = 1,
+        use_radial_grid: bool = False,
+        grid_n_r: int = 64,
+        shadow_checker: "ShadowRayChecker | None" = None,
+        use_mis: bool = True,
     ) -> None:
         self.aperture            = aperture
         self.n_bands             = int(n_bands)
@@ -339,6 +461,13 @@ class ManifoldWalkStrategy:
         self.grid_n_u            = int(grid_n_u)
         self.grid_n_v            = int(grid_n_v)
         self.match_radius_bins   = int(match_radius_bins)
+        # Radial-grid path: 1-D axisymmetric binning for rotationally
+        # symmetric optics (Step 4 of the BDPT manifold plan).
+        self.use_radial_grid     = bool(use_radial_grid) and _RADIAL_GRID_AVAILABLE
+        self.grid_n_r            = int(grid_n_r)
+        # Step 6: optional shadow-ray checker and MIS balance weight.
+        self.shadow_checker      = shadow_checker   # None → optimistic (always visible)
+        self.use_mis             = bool(use_mis)
 
     def correlate(
         self,
@@ -371,80 +500,136 @@ class ManifoldWalkStrategy:
             self.aperture_surface_id,
         )
 
-        # Bin forward halves into the aperture grid.
-        fwd_grid = ApertureGrid(self.aperture, self.grid_n_u, self.grid_n_v)
-        for half in fwd_halves:
-            fwd_grid.insert(half)
+        # ── Build forward-half lookup grid ───────────────────────────────────
+        if self.use_radial_grid:
+            # 1-D radial grid for axisymmetric systems.
+            ap_radius = float(
+                getattr(self.aperture, 'half_extent_u',
+                getattr(self.aperture, 'r_max',
+                getattr(self.aperture, 'clear_aperture_radius', 0.015)))
+            )
+            fwd_grid_r = _RadialApertureGrid(r_max=ap_radius, n_r=self.grid_n_r)
+            for half in fwd_halves:
+                fwd_grid_r.insert(half)
 
-        candidates: list[CorrelationCandidate] = []
-
-        for bwd_half in bwd_halves:
-            bu, bv = bwd_half.aperture_uv
-            nearby_fwd = fwd_grid.query_neighbors(bu, bv, self.match_radius_bins)
-
-            for fwd_half in nearby_fwd:
-                # Contribution = product of terminal amplitudes (no geometry
-                # term yet; shadow-ray / MIS deferred to caller).
-                fre, fim = fwd_half.manifold.terminal_amp
-                bre, bim = bwd_half.manifold.terminal_amp
-                # (fre + j*fim) * (bre + j*bim)  — stays float32
-                contrib_re = fre * bre - fim * bim
-                contrib_im = fre * bim + fim * bre
-                contribution = (contrib_re + 1j * contrib_im).astype(np.complex64)
-
-                # Middle point: the aperture-plane crossing position.
-                ap_u, ap_v = fwd_half.aperture_uv
-                ap_pos = self.aperture.uv_to_point(ap_u, ap_v)
-
-                fwd_tv = fwd_half.manifold.terminal_vertex
-                bwd_tv = bwd_half.manifold.terminal_vertex
-
-                fwd_ev = RayEvent(
-                    stream_kind=RayStreamKind.FORWARD_LIGHT,
-                    record_intent=RecordIntent.CORRELATION_CANDIDATE,
-                    subpath_id=fwd_half.manifold.subpath_id,
-                    bounce_index=len(fwd_half.manifold.vertices) - 1,
-                    pos=fwd_tv.pos if fwd_tv is not None else np.zeros(3, np.float64),
-                    dir_in=fwd_tv.dir_in if fwd_tv is not None else np.zeros(3, np.float64),
-                    dir_out=fwd_tv.dir_out if fwd_tv is not None else np.zeros(3, np.float64),
-                    normal=fwd_tv.normal if fwd_tv is not None else np.zeros(3, np.float64),
-                    pdf=fwd_tv.pdf if fwd_tv is not None else 1.0,
-                    pathlen_m=fwd_tv.pathlen_m if fwd_tv is not None else 0.0,
-                    amp_re=fre,
-                    amp_im=fim,
+            candidates: list[CorrelationCandidate] = []
+            for bwd_half in bwd_halves:
+                bu, bv = bwd_half.aperture_uv
+                import math as _math
+                r_norm = _math.sqrt(float(bu) ** 2 + float(bv) ** 2)
+                r_phys = r_norm * ap_radius
+                nearby_fwd = fwd_grid_r.query_ring(r_phys, self.match_radius_bins)
+                candidates.extend(
+                    self._make_candidates(bwd_half, nearby_fwd)
                 )
-                bwd_ev = RayEvent(
-                    stream_kind=RayStreamKind.APERTURE_PUPIL,
-                    record_intent=RecordIntent.SENSOR_ESTIMATE,
-                    subpath_id=bwd_half.manifold.subpath_id,
-                    bounce_index=len(bwd_half.manifold.vertices) - 1,
-                    pos=bwd_tv.pos if bwd_tv is not None else np.zeros(3, np.float64),
-                    dir_in=bwd_tv.dir_in if bwd_tv is not None else np.zeros(3, np.float64),
-                    dir_out=bwd_tv.dir_out if bwd_tv is not None else np.zeros(3, np.float64),
-                    normal=bwd_tv.normal if bwd_tv is not None else np.zeros(3, np.float64),
-                    pdf=bwd_tv.pdf if bwd_tv is not None else 1.0,
-                    pathlen_m=bwd_tv.pathlen_m if bwd_tv is not None else 0.0,
-                    amp_re=bre,
-                    amp_im=bim,
-                )
-                middle = MiddlePoint(
-                    forward_event=fwd_ev,
-                    backward_event=bwd_ev,
-                    pos=ap_pos,
-                    visibility=1.0,   # optimistic — caller verifies with shadow ray
-                    mis_weight=1.0,   # MIS deferred
-                )
+            return candidates
+        else:
+            # 2-D Cartesian aperture grid (default).
+            fwd_grid = ApertureGrid(self.aperture, self.grid_n_u, self.grid_n_v)
+            for half in fwd_halves:
+                fwd_grid.insert(half)
 
-                candidates.append(CorrelationCandidate(
-                    middle=middle,
-                    forward_record=fwd_half.source_records,
-                    backward_record=bwd_half.source_records,
-                    strategy_id=self.strategy_id,
-                    contribution=contribution,
-                    accepted=True,
-                ))
+            candidates: list[CorrelationCandidate] = []
+            for bwd_half in bwd_halves:
+                bu, bv = bwd_half.aperture_uv
+                nearby_fwd = fwd_grid.query_neighbors(bu, bv, self.match_radius_bins)
+                candidates.extend(
+                    self._make_candidates(bwd_half, nearby_fwd)
+                )
+            return candidates
 
-        return candidates
+    def _make_candidates(
+        self,
+        bwd_half,
+        nearby_fwd: list,
+    ) -> list[CorrelationCandidate]:
+        """Build CorrelationCandidate objects for one backward half paired
+        against a list of forward halves.  Shared by both grid paths.
+        """
+        results: list[CorrelationCandidate] = []
+        for fwd_half in nearby_fwd:
+            # Contribution = product of terminal amplitudes (no geometry
+            # term yet; shadow-ray / MIS deferred to caller).
+            fre, fim = fwd_half.manifold.terminal_amp
+            bre, bim = bwd_half.manifold.terminal_amp
+            # (fre + j*fim) * (bre + j*bim)  — stays float32
+            contrib_re = fre * bre - fim * bim
+            contrib_im = fre * bim + fim * bre
+            contribution = (contrib_re + 1j * contrib_im).astype(np.complex64)
+
+            # Middle point: the aperture-plane crossing position.
+            ap_u, ap_v = fwd_half.aperture_uv
+            ap_pos = self.aperture.uv_to_point(ap_u, ap_v)
+
+            fwd_tv = fwd_half.manifold.terminal_vertex
+            bwd_tv = bwd_half.manifold.terminal_vertex
+
+            # ── Step 6: shadow-ray occlusion check ──────────────────────────
+            fwd_pos_3d = fwd_tv.pos if fwd_tv is not None else ap_pos
+            bwd_pos_3d = bwd_tv.pos if bwd_tv is not None else ap_pos
+            if self.shadow_checker is not None:
+                vis = self.shadow_checker.visible(fwd_pos_3d, bwd_pos_3d)
+                visibility = 1.0 if vis else 0.0
+                accepted   = bool(vis)
+            else:
+                visibility = 1.0
+                accepted   = True
+
+            # ── Step 6: MIS balance-heuristic weight ─────────────────────────
+            if self.use_mis and accepted:
+                pdf_fwd = float(fwd_tv.pdf) if fwd_tv is not None else 1.0
+                pdf_bwd = float(bwd_tv.pdf) if bwd_tv is not None else 1.0
+                w_mis = mis_balance_weight(pdf_fwd, pdf_bwd)
+            else:
+                w_mis = 1.0
+            mis_w_real = np.float32(w_mis)
+
+            fwd_ev = RayEvent(
+                stream_kind=RayStreamKind.FORWARD_LIGHT,
+                record_intent=RecordIntent.CORRELATION_CANDIDATE,
+                subpath_id=fwd_half.manifold.subpath_id,
+                bounce_index=len(fwd_half.manifold.vertices) - 1,
+                pos=fwd_tv.pos if fwd_tv is not None else np.zeros(3, np.float64),
+                dir_in=fwd_tv.dir_in if fwd_tv is not None else np.zeros(3, np.float64),
+                dir_out=fwd_tv.dir_out if fwd_tv is not None else np.zeros(3, np.float64),
+                normal=fwd_tv.normal if fwd_tv is not None else np.zeros(3, np.float64),
+                pdf=fwd_tv.pdf if fwd_tv is not None else 1.0,
+                pathlen_m=fwd_tv.pathlen_m if fwd_tv is not None else 0.0,
+                amp_re=fre,
+                amp_im=fim,
+            )
+            bwd_ev = RayEvent(
+                stream_kind=RayStreamKind.APERTURE_PUPIL,
+                record_intent=RecordIntent.SENSOR_ESTIMATE,
+                subpath_id=bwd_half.manifold.subpath_id,
+                bounce_index=len(bwd_half.manifold.vertices) - 1,
+                pos=bwd_tv.pos if bwd_tv is not None else np.zeros(3, np.float64),
+                dir_in=bwd_tv.dir_in if bwd_tv is not None else np.zeros(3, np.float64),
+                dir_out=bwd_tv.dir_out if bwd_tv is not None else np.zeros(3, np.float64),
+                normal=bwd_tv.normal if bwd_tv is not None else np.zeros(3, np.float64),
+                pdf=bwd_tv.pdf if bwd_tv is not None else 1.0,
+                pathlen_m=bwd_tv.pathlen_m if bwd_tv is not None else 0.0,
+                amp_re=bre,
+                amp_im=bim,
+            )
+            middle = MiddlePoint(
+                forward_event=fwd_ev,
+                backward_event=bwd_ev,
+                pos=ap_pos,
+                visibility=visibility,
+                mis_weight=float(mis_w_real),
+            )
+
+            results.append(CorrelationCandidate(
+                middle=middle,
+                forward_record=fwd_half.source_records,
+                backward_record=bwd_half.source_records,
+                strategy_id=self.strategy_id,
+                contribution=contribution * mis_w_real,
+                accepted=accepted,
+            ))
+
+        return results
 
 
 # ─────────────────────────────────────────────────────────────────────────────

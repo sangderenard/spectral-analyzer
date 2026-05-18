@@ -41,7 +41,7 @@ import numpy as np
 from .camera_preset import CameraPreset
 from .parametric_surfaces import ParametricSurface, ApertureStop
 
-__all__ = ["BakeWorker", "trace_ray"]
+__all__ = ["BakeWorker", "trace_ray", "trace_ray_backward"]
 
 _INF = np.inf
 
@@ -191,6 +191,121 @@ def trace_ray(
     }
 
 
+def trace_ray_backward(
+    preset: CameraPreset,
+    ro: np.ndarray,
+    rd: np.ndarray,
+    wavelength_um: float = 0.587,
+) -> Optional[dict]:
+    """Trace a ray from sensor side backward through the lens to scene.
+
+    Applies Snell's law with swapped n1/n2 through elements in reverse order
+    (sensor-side first), giving the time-reversed optical path.
+
+    Parameters
+    ----------
+    ro : (3,) array — ray origin near the sensor plane (camera local space)
+    rd : (3,) unit direction pointing toward the lens / scene (+z nominally)
+
+    Returns
+    -------
+    dict with same keys as trace_ray, or None on miss or TIR.
+      'aperture_hit' : (3,) world-space aperture crossing point
+      'in_dir'       : (3,) ray direction AT the aperture crossing
+      'out_dir'      : (3,) final scene-side direction after exiting the lens
+      'aperture_uv'  : (2,) normalised aperture UV [-1, 1]
+      'field_angle'  : (2,) (fu, fv) tangent-field factors
+      'opl'          : float  optical path length (metres)
+    """
+    ro = np.asarray(ro, np.float64)
+    rd = np.asarray(rd, np.float64)
+    rd = rd / max(np.linalg.norm(rd), 1e-30)
+
+    opl      = 0.0
+    ap_surf  = preset.aperture_stop
+    z_ap     = float(ap_surf.z_pos)
+    ap_hit   = None
+    ap_dir   = None
+
+    # Build forward n-sequence then reverse it for backward traversal.
+    elements_fwd = sorted(preset.lens_group.elements,
+                          key=lambda e: e.z_vertex, reverse=True)
+    n_seq = [1.0] + [el.glass_out.n_at(wavelength_um) for el in elements_fwd]
+    N = len(elements_fwd)
+    elements_bwd = list(reversed(elements_fwd))
+
+    # Start in sensor-side air (n_seq[N] should be 1.0).
+    n_current = n_seq[N]
+    prev_ro   = ro.copy()
+
+    for bwd_k, el in enumerate(elements_bwd):
+        fwd_k  = N - 1 - bwd_k
+        n_exit = n_seq[fwd_k]
+
+        ro_local        = ro.copy()
+        ro_local[2]    -= el.z_vertex
+        t, hit_local, normal = el.surface.intersect(ro_local, rd)
+        if not math.isfinite(t):
+            return None
+
+        hit_world        = hit_local.copy()
+        hit_world[2]    += el.z_vertex
+
+        # Detect aperture crossing on this ray segment (prev_ro → hit_world).
+        if ap_hit is None:
+            dz_seg = hit_world[2] - prev_ro[2]
+            if abs(dz_seg) > 1e-12:
+                s = (z_ap - prev_ro[2]) / dz_seg
+                if 0.0 < s < 1.0:
+                    ap_pt = prev_ro + s * (hit_world - prev_ro)
+                    r_ap  = math.sqrt(ap_pt[0] ** 2 + ap_pt[1] ** 2)
+                    if ap_surf.r_inner <= r_ap <= ap_surf.r_outer:
+                        ap_hit = ap_pt
+                        ap_dir = rd.copy()
+
+        opl += n_current * t
+
+        # Snell's law — ensure normal faces the incoming ray.
+        if np.dot(rd, normal) > 0:
+            normal = -normal
+        rd_new = _snell(rd, normal, n_current, n_exit)
+        if rd_new is None:
+            return None
+        rd        = rd_new / max(np.linalg.norm(rd_new), 1e-30)
+        n_current = n_exit
+        prev_ro   = hit_world
+        ro        = hit_world
+
+    # Fallback: extrapolate scene-side ray back to aperture plane.
+    if ap_hit is None:
+        if abs(rd[2]) > 1e-9:
+            t_ap  = (z_ap - ro[2]) / rd[2]   # negative (aperture is behind scene pos)
+            ap_pt = ro + t_ap * rd
+            r_ap  = math.sqrt(ap_pt[0] ** 2 + ap_pt[1] ** 2)
+            if r_ap <= ap_surf.r_outer:
+                ap_hit = ap_pt
+                ap_dir = rd.copy()
+        if ap_hit is None:
+            return None
+
+    r_max = ap_surf.r_outer
+    u = ap_hit[0] / max(r_max, 1e-12)
+    v = ap_hit[1] / max(r_max, 1e-12)
+    if abs(u) > 1.0 or abs(v) > 1.0:
+        return None
+
+    safe_z = rd[2] if abs(rd[2]) > 1e-9 else 1e-9
+    return {
+        "aperture_uv":  np.array([u, v],       np.float64),
+        "field_angle":  np.array([rd[0] / safe_z, rd[1] / safe_z], np.float64),
+        "aperture_hit": ap_hit,
+        "in_dir":       ap_dir / max(np.linalg.norm(ap_dir), 1e-30),
+        "out_dir":      rd    / max(np.linalg.norm(rd),      1e-30),
+        "opl":          opl,
+        "sensor_hit":   prev_ro,
+    }
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BakeWorker
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,7 +360,9 @@ class BakeWorker:
         r   = np.sqrt(r2)
         ax  = r * np.cos(ang)
         ay  = r * np.sin(ang)
-        az  = np.full(n, ap.z_pos + 0.001)   # start 1 mm in front of aperture
+        z_front = max(el.z_vertex
+                      for el in self.preset.lens_group.elements) + 0.001
+        az  = np.full(n, z_front)  # start 1 mm in front of frontmost element
 
         ro_arr = np.stack([ax, ay, az], axis=1)  # (n, 3)
 

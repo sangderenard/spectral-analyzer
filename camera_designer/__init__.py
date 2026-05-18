@@ -47,7 +47,8 @@ from .emitter_profile import (
     TEXTURE_CHANNEL_MAP,
     emitter_from_dict,
 )
-from .bake_worker import BakeWorker, trace_ray
+from .bake_worker import BakeWorker, trace_ray, trace_ray_backward
+from .manifold_endpoint import ManifoldEndpoint
 from .ray_order import TracerGap, SourceRecord, RayOrder
 
 __all__ = [
@@ -67,7 +68,7 @@ __all__ = [
     "EmissiveTexture", "TEXTURE_CHANNEL_MAP",
     "EmitterProfile", "EMITTER_CATALOG", "emitter_from_dict",
     # bake
-    "BakeWorker", "trace_ray",
+    "BakeWorker", "trace_ray", "trace_ray_backward", "ManifoldEndpoint",
     # ray order
     "TracerGap", "SourceRecord", "RayOrder",
 ]

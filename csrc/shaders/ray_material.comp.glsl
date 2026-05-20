@@ -375,6 +375,24 @@ void main() {
     }
     for (int b = nb; b < MAX_BANDS; b++) { amp_re[b] = 0.0; amp_im[b] = 0.0; }
 
+    /* Absorb: T2 rejected this ray via parametric acceptance boundary (bit 3).
+     * No child intent, no terminal — ray contributes zero energy. */
+    if ((cflag & 8u) != 0u) return;
+
+    /* ── Neural passthrough: T2 teleported this hit via MLP ────────────────
+     * Bit 4 of cflag is set by T2 for NEURAL_ASSEMBLY hits.  Re-emit the ray
+     * directly with the updated pos/dir and current medium (air), bypassing
+     * all Snell/Fresnel physics to avoid corrupting the teleported trajectory. */
+    if ((cflag & 4u) != 0u) {
+        float cf_re[MAX_BANDS], cf_im[MAX_BANDS];
+        for (int b = 0; b < MAX_BANDS; b++) { cf_re[b] = amp_re[b]; cf_im[b] = amp_im[b]; }
+        uint islot = atomicAdd(meta[0], 1u);
+        write_intent(islot, pos, in_dir, path_len, medium, 0u,
+                     src_id, bounce, bleft, min_amp,
+                     tag_lo, tag_hi, cflag & ~4u, 1.0, soy, soz, cf_re, cf_im);
+        return;
+    }
+
     int flags   = tri_flags(tri_idx);
     vec3 geom_n = normalize(tri_normal(tri_idx));
     bool front_face = dot(in_dir, geom_n) < 0.0;

@@ -62,10 +62,53 @@ extern "C" {
  * with
  *   delta(u,v) = c0 + cu*u + cv*v + cuu*u*u + cuv*u*v + cvv*v*v
  */
-#define TRI_PARAM_SURFACE_NONE        0
-#define TRI_PARAM_SURFACE_POLY_BARY   1
-#define TRI_PARAM_SURFACE_SDF_SADDLE  2
-#define TRI_PARAM_SURFACE_SDF_SPHERE  3
+#define TRI_PARAM_SURFACE_NONE              0
+#define TRI_PARAM_SURFACE_POLY_BARY         1
+#define TRI_PARAM_SURFACE_SDF_SADDLE        2
+#define TRI_PARAM_SURFACE_SDF_SPHERE        3
+/* Neural assembly surface.  Payload = float32 neural MLP payload (magic 14948).
+ * Header bytes p[11..16] carry surface geometry and dispatch control:
+ *   p[11] = ROC          (radius of curvature, m; 0 = flat)
+ *   p[12] = k            (conic constant)
+ *   p[13] = axis_index   (0=X scene-axis, 2=Z lens-design default)
+ *   p[14] = r_out        (outer radius — hits outside are blocked)
+ *   p[15] = side         (0 = entrance/scene-side, 1 = exit/sensor-side)
+ *   p[16] = x_field_plane (projection plane for the MLP's "field" input:
+ *                          z_entrance for side=0, z_sensor_plane for side=1)
+ *
+ * Two payloads are registered — one per surface, each with a separate set
+ * of MLP weights trained in the appropriate direction (forward / backward).
+ * The MLP output plane is always p[6]: z_sensor for side=0, z_entrance for
+ * side=1.  Rays are teleported to p[6] with the decoded direction. */
+#define TRI_PARAM_SURFACE_NEURAL_ASSEMBLY   4
+
+/* Parametric lens surface.  Payload = float32 compact assembly description
+ * (magic 14949) built by CompoundLens.build_gpu_payload().
+ *
+ * Header  (8 floats):
+ *   [0] magic  (14949.0)
+ *   [1] n_surfaces  (cast to int)
+ *   [2] hood_r_opening  (0 = no hood check)
+ *   [3] hood_x_front
+ *   [4] hood_x_rim
+ *   [5..7] reserved
+ *
+ * Per surface record  (8 floats each, PLENS_SURF_STRIDE):
+ *   [0] x_pos         axial vertex position (scene X, metres)
+ *   [1] R_curvature   signed ROC; 0 = flat plane
+ *   [2] n_before      IOR on entry side
+ *   [3] n_after       IOR on exit side
+ *   [4] aperture_r    clear aperture radius
+ *   [5] conic_k       conic constant (0=sphere, −1=paraboloid, …)
+ *   [6] flags         bit 0 = is_stop (aperture check only, no refraction)
+ *   [7] reserved
+ *
+ * T2 evaluates the exact quadratic conic intersection + vector Snell's law
+ * for each surface in one pass, accumulates OPL, then teleports the ray
+ * (bit 4) or absorbs (bit 3) using the same protocol as NEURAL_ASSEMBLY.
+ * Physical parameters live exclusively in the payload; mesh geometry is
+ * only used by T1 for intersection detection. */
+#define TRI_PARAM_SURFACE_PARAMETRIC_LENS   5
 
 /* Camera operating modes for CameraSensorDesc.camera_mode.
  *

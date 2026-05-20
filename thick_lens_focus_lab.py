@@ -20,6 +20,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from camera_designer.lens_assembly import LensAssemblySpec
+
 # Directory containing the GLSL compute shaders (ray_bvh_intersect.comp.glsl etc.)
 _SHADER_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "shaders")
 
@@ -2013,6 +2015,7 @@ def _build_scene_mesh(
             emission_rgb=[0.0, 0.0, 0.0],
             ior=1.0,
             transmission=0.0,
+            gl_opacity=0.15,
             spectral_bands=_make_sidecar_spectral_bands(
                 sidecar,
                 reflectance=0.05,
@@ -2057,6 +2060,7 @@ def _build_scene_mesh(
             emission_rgb=[0.0, 0.0, 0.0],
             ior=float(scene.lens.ior),
             transmission=0.98,
+            gl_opacity=0.35,
             spectral_bands=_make_dispersive_lens_bands(
                 sidecar,
                 base_ior=float(scene.lens.ior),
@@ -2821,6 +2825,10 @@ class ForwardCppLensBench:
         self.bdpt_last_survivor_records = 0
         self.bdpt_last_sensor_photons = 0.0
         self.bdpt_last_sensor_power = 0.0
+        self.bdpt_last_backward_transport: Dict[str, float] = {}
+        self._backward_transport_accum: Optional[Dict[str, np.ndarray]] = None
+        self._last_backward_transport_image: Optional[np.ndarray] = None
+        self._emissive_material_id_cache: Optional[set] = None
         self.bdpt_last_stream_counts: Dict[str, int] = {
             "forward_light": 0, "backward_sensor": 0,
             "pixel_cone": 0, "field_deposit_blocked": 0,
@@ -2839,15 +2847,10 @@ class ForwardCppLensBench:
         # Camera preset used by render_middle().  None → simple_doublet_preset().
         # Set this after construction to override the default.
         self._camera_preset = None
-        # Baked manifold transfer grid (float32 array) for NEURAL_SURFACE context.
-        # Built by render_middle() in a background thread after the first bake.
-        self._transfer_grid: Optional[np.ndarray] = None
-        self._transfer_grid_noodles: int = 0   # noodle count in latest bake
-        self._manifold_ctx_id: int = -1         # scale context id (-1 = not registered)
-        # The baked ManifoldEndpoint instance (set by _bake_transfer_grid_async).
-        # render_middle() uses this to call render_sensor_image() instead of
-        # re-tracing rays on subsequent calls.
-        self._baked_ep = None
+        # Lens assembly descriptor — owns manifold representation state (NONE | LUT | MLP),
+        # registration, and rendering.  Replaces the former scattered _neural_assembly_*,
+        # _baked_ep, _transfer_grid, _manifold_ctx_id attributes.
+        self._lens_assembly: Optional[LensAssemblySpec] = None
         # Noodle count target for the bake; set via bake_noodles run() param.
         self._bake_noodles: int = 0
         # Full-assembly bake parameters; set via run() params.
@@ -3267,53 +3270,25 @@ class ForwardCppLensBench:
         )
 
     def _register_lens_parametric_groups(self) -> int:
-        """Register passive exact lens-surface refiners for the live pipeline.
+        """Register lens surfaces with the GPU tracer via LensAssemblySpec.
 
-        The SDF-sphere formula computes a displacement in WORLD METRES:
-            delta = k * (cu² + cv²),   k = 0.5 / radius_param
-        where cu = u - 1/3, cv = v - 1/3 are barycentric offsets from the
-        triangle centroid.  For this to equal the true spherical sag at the
-        corner vertices (delta_vertex ≈ L²/(8·R_curv)) we need:
-            k = 9·L²/(40·R_curv)   →   radius_param = 20·R_curv / (9·L²)
-        where L is the mean edge length of the surface's triangles in metres.
-        Passing the raw radius-of-curvature (metres) instead of radius_param
-        gives displacements O(1/R) ~ metres, which is catastrophically wrong.
+        In NONE/LUT mode: SDF_SPHERE parametric refinement on all lens surfaces.
+        In MLP mode: NEURAL_ASSEMBLY entrance/exit + interior absorbers.
+        Assembly is created here the first time (mode=NONE) if not already set.
         """
-        sample_area = int(getattr(_sk, "TRI_GROUP_SAMPLE_AREA", 1))
-        param_sdf_sphere = int(getattr(_sk, "TRI_PARAM_SURFACE_SDF_SPHERE", 3))
-        param_none_role = 0
-        n_lens_param = 0
-        margin = 0.12  # barycentric UV neighbourhood radius for blended eval
-        for front_ids, back_ids, r_front, r_back in getattr(self, "lens_surface_groups", []):
-            for ids, r_curv in [(front_ids, r_front), (back_ids, r_back)]:
-                if ids.size <= 0:
-                    continue
-                r_curv = abs(float(r_curv))
-                if r_curv < 1.0e-6:
-                    continue
-                # Mean edge length of this surface's triangles (metres).
-                verts = self.tri_vertices[ids]          # (n, 3, 3)
-                e1 = verts[:, 1] - verts[:, 0]          # (n, 3)
-                e2 = verts[:, 2] - verts[:, 0]
-                e3 = verts[:, 2] - verts[:, 1]
-                mean_L = float(np.mean([
-                    np.mean(np.linalg.norm(e, axis=1))
-                    for e in [e1, e2, e3]
-                ]))
-                mean_L = max(mean_L, 1.0e-8)
-                # Scale radius_param so delta_vertex ≈ L²/(8·R_curv).
-                radius_param = 20.0 * r_curv / (9.0 * mean_L ** 2)
-                self.tracer.register_tri_group(
-                    param_none_role,
-                    sample_area,
-                    np.ascontiguousarray(ids, dtype=np.int32),
-                    parametric_surface={
-                        "kind": param_sdf_sphere,
-                        "coeffs": np.array([radius_param, margin], dtype=np.float64),
-                    },
-                )
-                n_lens_param += 1
-        return n_lens_param
+        lsg = getattr(self, "lens_surface_groups", [])
+        if not lsg:
+            return 0
+        if self._lens_assembly is None:
+            self._lens_assembly = LensAssemblySpec()
+        self._lens_assembly.register(
+            self.tracer,
+            lsg,
+            self.tri_vertices,
+            self.tri_centroids,
+            _scene_lenses(self.scene),
+        )
+        return len(lsg)
 
     def _world_to_field_ijk(self, p: np.ndarray) -> Tuple[int, int, int]:
         x_span = max(EPS, float(self.scene.x_max - self.scene.x_min))
@@ -3445,6 +3420,9 @@ class ForwardCppLensBench:
         # NOTE: _register_lens_parametric_groups() is intentionally NOT called here.
         # See the comment in __init__ for the full explanation.
         self._register_uv_page_bank()
+        # Re-register assembly groups if a payload or parametric model was previously loaded.
+        self._do_register_neural_assembly_group()
+        self._do_register_parametric_assembly()
 
         # Store aperture plane geometry for ManifoldWalkStrategy construction.
         self._bdpt_aperture_centre = np.array([stop_plane_x, 0.0, 0.0], np.float64)
@@ -3509,69 +3487,111 @@ class ForwardCppLensBench:
         max_bounces: int = 6,
         decay: float = 0.97,
         tags: Optional[np.ndarray] = None,
-    ) -> int:
-        """Non-blocking forward trace via the persistent T1/T2/T3/T4 pipeline.
+        blocking: bool = False,
+        bake_origins: Optional[np.ndarray] = None,
+        bake_directions: Optional[np.ndarray] = None,
+    ):
+        """Forward trace via the persistent T1/T2/T3/T4 pipeline.
 
         Fans cosine-hemisphere rays from each source triangle and submits them
         to the machine immediately.  Returns the number of intents submitted.
         Output records arrive asynchronously via the background drain loop and
         are accumulated into tri_flux and _last_ray_segments.
+
+        When ``blocking=True`` drains synchronously and returns the full records
+        dict instead of the submitted count.  Pass ``bake_origins`` /
+        ``bake_directions`` to bypass emitter sampling entirely (sequential tags,
+        single child per ray — intended for baking training data).
         """
-        rng = np.random.default_rng(seed)
-        n_src  = int(self.src_pos.shape[0])
-        n_rays = int(max(1, rays_per_emitter))
-        total  = n_src * n_rays
-        n_bands = self.n_bands
-
-        origins     = np.empty((total, 3), dtype=np.float64)
-        directions  = np.empty((total, 3), dtype=np.float64)
-        amplitudes  = np.full((total, n_bands), complex(float(self.emitter_amp_gain)), dtype=np.complex128)
-        src_ids     = np.empty((total,), dtype=np.int32)
-        tag_arr     = np.zeros((total,), dtype=np.uint64)
-        cflag_arr   = np.zeros((total,), dtype=np.uint8)  # 0 = emissive / forward
-
-        for si in range(n_src):
-            base   = si * n_rays
-            normal = self.src_dir[si]
-            up = np.array([0.0, 0.0, 1.0])
-            if abs(normal[2]) > 0.9:
-                up = np.array([1.0, 0.0, 0.0])
-            tx = np.cross(normal, up);  tx /= np.linalg.norm(tx)
-            ty = np.cross(normal, tx)
-
-            u1 = rng.random(n_rays)
-            u2 = rng.random(n_rays)
-            cos_th = np.sqrt(1.0 - u1)
-            sin_th = np.sqrt(u1)
-            phi    = 2.0 * np.pi * u2
-            dirs_local = (sin_th[:, None] * np.cos(phi)[:, None] * tx[None, :]
-                        + sin_th[:, None] * np.sin(phi)[:, None] * ty[None, :]
-                        + cos_th[:, None]                        * normal[None, :])
-            dirs_local /= np.linalg.norm(dirs_local, axis=1, keepdims=True) + 1e-30
-
-            origins   [base:base+n_rays] = self.src_pos[si]
-            directions[base:base+n_rays] = dirs_local
-            src_ids   [base:base+n_rays] = si
-            if tags is not None and si < len(tags):
-                tag_arr[base:base+n_rays] = int(tags[si])
-
         _use_gpu = self.compute_mode in ("gpu", "mixed")
         _all_gpu = self.compute_mode == "gpu"
+
+        if bake_origins is not None:
+            n_submit      = len(bake_origins)
+            origins       = np.ascontiguousarray(bake_origins,     dtype=np.float64)
+            directions    = np.ascontiguousarray(bake_directions,   dtype=np.float64)
+            amplitudes    = np.ones((n_submit, self.n_bands), dtype=np.complex128)
+            src_ids       = np.zeros(n_submit, dtype=np.int32)
+            tag_arr       = np.arange(n_submit, dtype=np.uint64)
+            cflag_arr     = np.zeros(n_submit, dtype=np.uint8)
+            total         = n_submit
+            _max_children = 1
+        else:
+            rng = np.random.default_rng(seed)
+            n_src  = int(self.src_pos.shape[0])
+            n_rays = int(max(1, rays_per_emitter))
+            total  = n_src * n_rays
+            n_bands = self.n_bands
+
+            origins     = np.empty((total, 3), dtype=np.float64)
+            directions  = np.empty((total, 3), dtype=np.float64)
+            amplitudes  = np.full((total, n_bands), complex(float(self.emitter_amp_gain)), dtype=np.complex128)
+            src_ids     = np.empty((total,), dtype=np.int32)
+            tag_arr     = np.zeros((total,), dtype=np.uint64)
+            cflag_arr   = np.zeros((total,), dtype=np.uint8)  # 0 = emissive / forward
+
+            for si in range(n_src):
+                base   = si * n_rays
+                normal = self.src_dir[si]
+                up = np.array([0.0, 0.0, 1.0])
+                if abs(normal[2]) > 0.9:
+                    up = np.array([1.0, 0.0, 0.0])
+                tx = np.cross(normal, up);  tx /= np.linalg.norm(tx)
+                ty = np.cross(normal, tx)
+
+                u1 = rng.random(n_rays)
+                u2 = rng.random(n_rays)
+                cos_th = np.sqrt(1.0 - u1)
+                sin_th = np.sqrt(u1)
+                phi    = 2.0 * np.pi * u2
+                dirs_local = (sin_th[:, None] * np.cos(phi)[:, None] * tx[None, :]
+                            + sin_th[:, None] * np.sin(phi)[:, None] * ty[None, :]
+                            + cos_th[:, None]                        * normal[None, :])
+                dirs_local /= np.linalg.norm(dirs_local, axis=1, keepdims=True) + 1e-30
+
+                origins   [base:base+n_rays] = self.src_pos[si]
+                directions[base:base+n_rays] = dirs_local
+                src_ids   [base:base+n_rays] = si
+                if tags is not None and si < len(tags):
+                    tag_arr[base:base+n_rays] = int(tags[si])
+
+            _max_children = 2
+
         self.tracer.submit_rays(
             origins=np.ascontiguousarray(origins),
             directions=np.ascontiguousarray(directions),
             amplitudes=np.ascontiguousarray(amplitudes),
             src_ids=np.ascontiguousarray(src_ids),
-            tags=np.ascontiguousarray(tag_arr) if tags is not None else None,
+            tags=np.ascontiguousarray(tag_arr) if (tags is not None or bake_origins is not None) else None,
             color_flags=np.ascontiguousarray(cflag_arr),
             max_bounces=int(max_bounces),
             min_amplitude=float(self._min_amplitude),
-            max_children=2,
+            max_children=_max_children,
             seed=int(seed),
             use_gpu_compute=_use_gpu,
             gpu_all_stages=_all_gpu,
             shader_dir=_SHADER_DIR,
         )
+
+        if blocking:
+            _DRAIN_KEYS = ("kind", "tag", "pos", "dir", "seg_start", "path_len",
+                           "bounce", "is_sensor", "hit_tri", "mat_idx", "amp_re", "amp_im")
+            acc: Dict[str, list] = {k: [] for k in _DRAIN_KEYS}
+            while True:
+                recs = self.tracer.drain_records(max_n=100_000)
+                if len(recs.get("kind", [])) > 0:
+                    for k in _DRAIN_KEYS:
+                        if k in recs:
+                            acc[k].append(np.asarray(recs[k]))
+                if self.tracer.in_flight_count() == 0:
+                    recs = self.tracer.drain_records(max_n=500_000)
+                    if len(recs.get("kind", [])) > 0:
+                        for k in _DRAIN_KEYS:
+                            if k in recs:
+                                acc[k].append(np.asarray(recs[k]))
+                    break
+                time.sleep(0.001)
+            return {k: np.concatenate(v) if v else np.array([]) for k, v in acc.items()}
 
         self._ensure_drain_loop()
         return total
@@ -3855,6 +3875,7 @@ class ForwardCppLensBench:
         seg_start = records["seg_start"]   # float32 (N, 3)
         pos       = records["pos"]         # float32 (N, 3)
         cflags    = records["color_flag"]  # uint8  (N,)  0=emissive 1=sensor
+        self._accumulate_backward_transport(records)
 
         # Display class encoding:
         #   STRIKE + flag 0 → class 0 (forward strike)   FIELD + flag 0 → class 1 (forward volume)
@@ -3976,6 +3997,219 @@ class ForwardCppLensBench:
             self._vis_ptr = end % cap
             if end >= cap:
                 self._vis_full = True
+
+    def _emissive_material_ids(self) -> set:
+        if self._emissive_material_id_cache is not None:
+            return self._emissive_material_id_cache
+        try:
+            pbr = np.asarray(self.material_db.build_tensors().get("pbr", np.zeros((0, 16), np.float32)))
+            if pbr.ndim != 2 or pbr.shape[1] < 11:
+                self._emissive_material_id_cache = set()
+            else:
+                self._emissive_material_id_cache = set(
+                    int(i) for i in np.nonzero(np.linalg.norm(pbr[:, 8:11], axis=1) > 1.0e-8)[0]
+                )
+        except Exception:
+            self._emissive_material_id_cache = set()
+        return self._emissive_material_id_cache
+
+    def _ensure_backward_transport_arrays(self) -> Dict[str, np.ndarray]:
+        n = int(max(1, self.bdpt_last_n_px))
+        shape = (n, n)
+        acc = self._backward_transport_accum
+        if acc is not None and acc.get("found_emission", np.empty((0, 0))).shape == shape:
+            return acc
+        acc = {
+            "found_emission": np.zeros(shape, dtype=np.float64),
+            "terminated_no_emission": np.zeros(shape, dtype=np.float64),
+            "missed_scene": np.zeros(shape, dtype=np.float64),
+            "emission_weight": np.zeros(shape, dtype=np.float64),
+            "no_emission_weight": np.zeros(shape, dtype=np.float64),
+            "missed_weight": np.zeros(shape, dtype=np.float64),
+            "emission_rgb": np.zeros((n, n, 3), dtype=np.float64),
+        }
+        self._backward_transport_accum = acc
+        return acc
+
+    def _accumulate_backward_transport(self, records: dict) -> None:
+        """Classify backward ray terminations without treating them as the image.
+
+        The result is transport evidence:
+          - found_emission: backward sensor path reached an emissive material
+          - terminated_no_emission: path terminated on non-emissive geometry
+          - missed_scene: path escaped without a hit
+
+        These arrays can be used to derive an image later, but they are not the
+        rendered image by themselves.
+        """
+        if not records or "kind" not in records or "color_flag" not in records:
+            return
+        kinds = np.asarray(records["kind"])
+        cflags = np.asarray(records["color_flag"])
+        bwd = cflags == 1
+        if not np.any(bwd):
+            return
+
+        amp_re = np.asarray(records.get("amp_re", np.zeros((len(kinds), 0), np.float32)))
+        amp_im = np.asarray(records.get("amp_im", np.zeros_like(amp_re)))
+        nb = min(int(amp_re.shape[1]) if amp_re.ndim == 2 else 0, self.n_bands)
+        if nb > 0:
+            amp_power_b = np.maximum(0.0, amp_re[:, :nb] ** 2 + amp_im[:, :nb] ** 2)
+            amp_mag = amp_power_b.sum(axis=1)
+            wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:nb], dtype=np.float64), EPS)) * 1.0e9
+            rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float64, copy=False)
+            transport_rgb = np.einsum("nb,bc->nc", amp_power_b, rgb_w[:nb], optimize=True)
+        else:
+            amp_power_b = np.ones((len(kinds), 1), dtype=np.float32)
+            amp_mag = np.ones(len(kinds), dtype=np.float32)
+            transport_rgb = np.repeat(amp_mag[:, None], 3, axis=1).astype(np.float64, copy=False)
+
+        tags = np.asarray(records.get("tag", np.full(len(kinds), -1, dtype=np.int64))).astype(np.int64, copy=False)
+        mat_idx = np.asarray(records.get("mat_idx", np.full(len(kinds), -1, dtype=np.int32))).astype(np.int32, copy=False)
+        emissive_mats = self._emissive_material_ids()
+        try:
+            pbr = np.asarray(self.material_db.build_tensors().get("pbr", np.zeros((0, 16), np.float32)))
+            mat_emit_rgb = np.zeros((len(kinds), 3), dtype=np.float64)
+            valid_mat = (mat_idx >= 0) & (mat_idx < int(pbr.shape[0])) & (pbr.ndim == 2) & (pbr.shape[1] >= 11)
+            if np.any(valid_mat):
+                mat_emit_rgb[valid_mat] = np.maximum(0.0, pbr[mat_idx[valid_mat], 8:11]).astype(np.float64)
+        except Exception:
+            mat_emit_rgb = np.zeros((len(kinds), 3), dtype=np.float64)
+
+        n = int(max(1, self.bdpt_last_n_px))
+        # High four tag bits encode the sampled RGB sensor channel.  The low
+        # 60 bits carry the pixel id assigned at launch.
+        pix = tags & ((np.int64(1) << np.int64(60)) - np.int64(1))
+        valid_pix = (tags >= 0) & (pix >= 0) & (pix < n * n)
+        rows = (pix // n).astype(np.int64, copy=False)
+        cols = (pix % n).astype(np.int64, copy=False)
+
+        is_miss = bwd & (kinds == 1) & valid_pix
+        is_terminal = bwd & (kinds == 2) & valid_pix
+        is_emissive = is_terminal & np.array([int(m) in emissive_mats for m in mat_idx], dtype=bool)
+        is_no_emission = is_terminal & ~is_emissive
+
+        acc = self._ensure_backward_transport_arrays()
+        if np.any(is_emissive):
+            illum_rgb = transport_rgb[is_emissive] * mat_emit_rgb[is_emissive]
+            np.add.at(acc["found_emission"], (rows[is_emissive], cols[is_emissive]), 1.0)
+            np.add.at(acc["emission_weight"], (rows[is_emissive], cols[is_emissive]), amp_mag[is_emissive])
+            for ch in range(3):
+                np.add.at(acc["emission_rgb"][:, :, ch],
+                          (rows[is_emissive], cols[is_emissive]),
+                          illum_rgb[:, ch])
+        if np.any(is_no_emission):
+            np.add.at(acc["terminated_no_emission"], (rows[is_no_emission], cols[is_no_emission]), 1.0)
+            np.add.at(acc["no_emission_weight"], (rows[is_no_emission], cols[is_no_emission]), amp_mag[is_no_emission])
+        if np.any(is_miss):
+            np.add.at(acc["missed_scene"], (rows[is_miss], cols[is_miss]), 1.0)
+            np.add.at(acc["missed_weight"], (rows[is_miss], cols[is_miss]), amp_mag[is_miss])
+
+        self.bdpt_last_backward_transport = {
+            "found_emission": int(np.count_nonzero(is_emissive)),
+            "terminated_no_emission": int(np.count_nonzero(is_no_emission)),
+            "missed_scene": int(np.count_nonzero(is_miss)),
+            "emission_weight": float(np.sum(amp_mag[is_emissive])) if np.any(is_emissive) else 0.0,
+            "no_emission_weight": float(np.sum(amp_mag[is_no_emission])) if np.any(is_no_emission) else 0.0,
+            "missed_weight": float(np.sum(amp_mag[is_miss])) if np.any(is_miss) else 0.0,
+            "emission_rgb_power": float(np.sum(acc["emission_rgb"])) if np.any(is_emissive) else 0.0,
+        }
+        self._last_backward_transport_image = self.get_backward_emission_image()
+
+    def get_backward_transport(self) -> Optional[Dict[str, np.ndarray]]:
+        """Return accumulated backward transport evidence, not a rendered image.
+
+        The arrays are per sensor pixel.  Counts describe how reverse paths ended;
+        weights are the transported ray amplitudes at that termination event.
+        """
+        acc = self._backward_transport_accum
+        if not acc:
+            return None
+        return {k: np.array(v, copy=True) for k, v in acc.items()}
+
+    def derive_backward_transport_image(self, mode: str = "diagnostic") -> np.ndarray:
+        """Build a display image from backward transport evidence.
+
+        This is intentionally a derived diagnostic view.  It does not replace the
+        physical image estimate:
+
+          diagnostic: green=found emission, red=non-emissive terminal, blue=miss
+          emission:   transported emission weight only
+          probability: probability that a launched sensor ray found emission
+          failure:    red/blue failure composition only
+        """
+        acc = self._backward_transport_accum
+        n = int(max(1, self.bdpt_last_n_px))
+        if not acc:
+            return np.zeros((n, n, 3), dtype=np.float32)
+
+        found = np.asarray(acc["found_emission"], dtype=np.float64)
+        noem  = np.asarray(acc["terminated_no_emission"], dtype=np.float64)
+        miss  = np.asarray(acc["missed_scene"], dtype=np.float64)
+        emit_w = np.asarray(acc["emission_weight"], dtype=np.float64)
+        no_w   = np.asarray(acc["no_emission_weight"], dtype=np.float64)
+        miss_w = np.asarray(acc["missed_weight"], dtype=np.float64)
+
+        total = found + noem + miss
+        denom = np.maximum(total, 1.0)
+
+        def _tone(x: np.ndarray) -> np.ndarray:
+            x = np.maximum(x, 0.0)
+            scale = float(np.percentile(x[x > 0.0], 99.0)) if np.any(x > 0.0) else 1.0
+            return np.log1p(x / max(scale, 1.0e-12)) / np.log1p(1.0)
+
+        if mode == "emission":
+            g = np.clip(_tone(emit_w), 0.0, 1.0)
+            img = np.stack([0.15 * g, g, 0.20 * g], axis=-1)
+        elif mode == "probability":
+            p = np.clip(found / denom, 0.0, 1.0)
+            img = np.stack([0.10 * p, p, 0.25 * p], axis=-1)
+        elif mode == "failure":
+            r = np.clip(no_w / np.maximum(no_w + miss_w, 1.0e-12), 0.0, 1.0)
+            b = np.clip(miss_w / np.maximum(no_w + miss_w, 1.0e-12), 0.0, 1.0)
+            strength = np.clip(_tone(no_w + miss_w), 0.0, 1.0)
+            img = np.stack([r * strength, np.zeros_like(strength), b * strength], axis=-1)
+        else:
+            img = np.stack([
+                np.clip(noem / denom, 0.0, 1.0),
+                np.clip(found / denom, 0.0, 1.0),
+                np.clip(miss / denom, 0.0, 1.0),
+            ], axis=-1)
+
+        return np.ascontiguousarray(np.clip(img, 0.0, 1.0), dtype=np.float32)
+
+    def get_backward_emission_image(self) -> np.ndarray:
+        """Collapse emissive backward terminations into a sensor-facing RGB image.
+
+        Each deposit is:
+
+            transported reverse-ray intensity spectrum × hit-material emission RGB
+
+        indexed by the original sensor pixel stored in the low tag bits.
+
+        Non-emissive terminal hits and misses contribute zero radiance, but they
+        remain in the Monte-Carlo denominator.  That is what makes blocked or
+        unilluminated directions darken the pixel instead of simply vanishing
+        from accounting.
+        """
+        acc = self._backward_transport_accum
+        n = int(max(1, self.bdpt_last_n_px))
+        if not acc or "emission_rgb" not in acc:
+            return np.zeros((n, n, 3), dtype=np.float32)
+        rgb = np.maximum(0.0, np.asarray(acc["emission_rgb"], dtype=np.float64))
+        total = (
+            np.asarray(acc.get("found_emission", 0.0), dtype=np.float64)
+            + np.asarray(acc.get("terminated_no_emission", 0.0), dtype=np.float64)
+            + np.asarray(acc.get("missed_scene", 0.0), dtype=np.float64)
+        )
+        rgb = rgb / np.maximum(total[..., None], 1.0)
+        if not np.any(rgb > 0.0):
+            return np.zeros(rgb.shape, dtype=np.float32)
+        white = float(np.percentile(rgb[rgb > 0.0], 99.5))
+        white = max(white, 1.0e-12)
+        y = np.log1p((rgb / white) * 6.0) / np.log1p(6.0)
+        y = y / (1.0 + 0.18 * y)
+        return np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
 
     def get_ray_segments(self) -> Optional[np.ndarray]:
         """Superseded by the voxel display grid (_disp_grid). Returns None."""
@@ -4415,6 +4649,9 @@ class ForwardCppLensBench:
                     f"kept={self.bdpt_last_survivor_records}",
                     f"sensor_gid={sensor_gid}",
                     f"vol_records={self.bdpt_last_volume_records}",
+                    f"bwd_emit={self.bdpt_last_backward_transport.get('found_emission', 0)}",
+                    f"bwd_noemit={self.bdpt_last_backward_transport.get('terminated_no_emission', 0)}",
+                    f"bwd_miss={self.bdpt_last_backward_transport.get('missed_scene', 0)}",
                     f"photons={self.bdpt_last_sensor_photons:.3e}",
                     f"sensor_power={self.bdpt_last_sensor_power:.3e}",
                     "rgb_tonemapped=NONE",
@@ -4432,6 +4669,9 @@ class ForwardCppLensBench:
                     f"kept={self.bdpt_last_survivor_records}",
                     f"sensor_gid={sensor_gid}",
                     f"vol_records={self.bdpt_last_volume_records}",
+                    f"bwd_emit={self.bdpt_last_backward_transport.get('found_emission', 0)}",
+                    f"bwd_noemit={self.bdpt_last_backward_transport.get('terminated_no_emission', 0)}",
+                    f"bwd_miss={self.bdpt_last_backward_transport.get('missed_scene', 0)}",
                     f"photons={self.bdpt_last_sensor_photons:.3e}",
                     f"sensor_power={self.bdpt_last_sensor_power:.3e}",
                     f"rgb_shape={tuple(rgb_tm_arr.shape)}",
@@ -4461,6 +4701,9 @@ class ForwardCppLensBench:
                 f"lit_frac={lit_fraction:.4f}",
                 f"sensor_gid={sensor_gid}",
                 f"vol_records={self.bdpt_last_volume_records}",
+                f"bwd_emit={self.bdpt_last_backward_transport.get('found_emission', 0)}",
+                f"bwd_noemit={self.bdpt_last_backward_transport.get('terminated_no_emission', 0)}",
+                f"bwd_miss={self.bdpt_last_backward_transport.get('missed_scene', 0)}",
                 f"photons={self.bdpt_last_sensor_photons:.3e}",
                 f"sensor_power={self.bdpt_last_sensor_power:.3e}",
                 flush=True,
@@ -4610,14 +4853,18 @@ class ForwardCppLensBench:
         if preset is None:
             preset = self._camera_preset or simple_doublet_preset()
 
-        # Fast path: if the baked LUT is ready, project all noodles onto the
-        # sensor plane directly — no Snell tracing needed.  This is the real
-        # "skip lens geometry" behaviour the bake enables.
-        if self._baked_ep is not None and manifold_mode == "full":
-            img = self._baked_ep.render_sensor_image(n_px, n_py)
+        # Assembly fast path: MLP → direct network inference; LUT → ManifoldEndpoint render.
+        if self._lens_assembly is not None and manifold_mode == "full":
+            img = self._lens_assembly.render_sensor_image(
+                preset, n_px, n_py,
+                n_samples=max(n_fwd * 16, 8192),
+                wavelength_um=wavelength_um,
+                seed=seed,
+            )
             if img is not None:
-                print(f"[middle/lut] {self._transfer_grid_noodles:,} noodles → "
-                      f"sensor {n_px}×{n_py}", flush=True)
+                mode_tag = self._lens_assembly.mode.lower()
+                n_lit = int(np.count_nonzero(img[:, :, 0]))
+                print(f"[middle/{mode_tag}] {n_lit} px lit  sensor {n_px}×{n_py}", flush=True)
                 self._last_bdpt_plate_rgb = img
                 return img
 
@@ -4671,9 +4918,11 @@ class ForwardCppLensBench:
 
         self._last_bdpt_plate_rgb = img
 
-        # Background bake: build transfer grid and register NEURAL_SURFACE ctx.
-        # Fires only on the first render_middle call (or when no grid is cached).
-        if self._transfer_grid is None:
+        # Background bake: suppressed when MLP is loaded (network IS the manifold)
+        # and when a LUT bake has already been done.
+        _asm = self._lens_assembly
+        _has_bake = _asm is not None and _asm.mode in (LensAssemblySpec.MODE_LUT, LensAssemblySpec.MODE_MLP)
+        if not _has_bake:
             self._bake_transfer_grid_async(ep)
 
         return img
@@ -4694,87 +4943,66 @@ class ForwardCppLensBench:
         return 65_536
 
     def _bake_transfer_grid_now(self, ep) -> None:
-        """Bake ep into a dense transfer grid and register the C++ scale context."""
+        """Bake ep into a LUT transfer grid via LensAssemblySpec."""
+        if self._lens_assembly is None:
+            self._lens_assembly = LensAssemblySpec()
         stride = 9 if self._bake_full_assembly else 7
         n_grid = self._transfer_grid_resolved_size(stride)
         n_rays = self._resolved_bake_noodles(n_grid)
-        if self._bake_table_gb > 0.0:
-            approx_gb = ((12 if self._bake_full_assembly else 8) + n_grid * n_grid * stride) * 4.0 / (1024.0 ** 3)
-            print(f"[middle] streaming C++ transfer bake {n_rays:,} rays "
-                  f"into {n_grid}x{n_grid} stride={stride} "
-                  f"(~{approx_gb:.2f} GiB)...", flush=True)
-            grid = ep.bake_cpp_transfer_grid_streaming(
-                n_rays=n_rays,
-                n_u=n_grid,
-                n_v=n_grid,
-                n_wavelengths=self._bake_wavelengths,
-                full_assembly_payload=self._bake_full_assembly,
-                verbose=True,
-            )
-            n_src = n_rays
-            self._transfer_grid         = grid
-            self._transfer_grid_noodles = int(n_src)
-            self._baked_ep              = ep
-            return self._register_transfer_grid(ep, grid)
-
-        if self._bake_full_assembly:
-            fsteps = self._bake_focus_steps
-            frange = self._bake_focus_range_m
-            print(f"[middle] full-assembly bake ({n_rays:,}×{fsteps} focus steps"
-                  f", ±{frange*1e3:.1f}mm)…", flush=True)
-            ep.bake_full_assembly(
-                n_rays=n_rays, n_wavelengths=self._bake_wavelengths, n_refine=self._bake_refine,
-                n_focus_steps=fsteps, focus_range_m=frange, verbose=True)
-            n_total = len(ep._full_data) if ep._full_data is not None else 0
-            print(f"[middle] full-assembly bake done — {n_total:,} noodles", flush=True)
-        else:
-            print(f"[middle] baking transfer LUT ({n_rays:,} noodles)…", flush=True)
-            ep.bake_lut(
-                n_rays=n_rays,
-                n_wavelengths=self._bake_wavelengths,
-                n_refine=self._bake_refine,
-                verbose=True,
-            )
-
-        approx_gb = ((12 if self._bake_full_assembly else 8) + n_grid * n_grid * stride) * 4.0 / (1024.0 ** 3)
-        print(f"[middle] building C++ transfer payload {n_grid}×{n_grid} "
-              f"stride={stride} (~{approx_gb:.2f} GiB)…", flush=True)
-        grid = ep.build_transfer_grid(
-            n_u=n_grid,
-            n_v=n_grid,
-            full_assembly_payload=self._bake_full_assembly,
+        self._lens_assembly.bake_lut(
+            ep,
+            tracer=self.tracer,
+            bake_full_assembly=self._bake_full_assembly,
+            n_rays=n_rays,
+            n_wavelengths=self._bake_wavelengths,
+            n_refine=self._bake_refine,
+            n_grid=n_grid,
+            bake_table_gb=self._bake_table_gb,
+            focus_steps=self._bake_focus_steps,
+            focus_range_m=self._bake_focus_range_m,
+            verbose=True,
         )
-        if grid is None:
-            print("[middle] bake produced empty grid", flush=True)
+
+    def _do_register_neural_assembly_group(self) -> None:
+        """Re-register neural assembly after clear_tri_groups().  No-op if no MLP loaded."""
+        if self._lens_assembly is None or self._lens_assembly.mode != LensAssemblySpec.MODE_MLP:
             return
-        n_src = (len(ep._full_data) if ep._full_data is not None
-                 else ep._manifold_lut.n_noodles if ep._manifold_lut is not None
-                 else 0)
-        self._transfer_grid         = grid
-        self._transfer_grid_noodles = int(n_src)
-        self._baked_ep              = ep
-
-        self._register_transfer_grid(ep, grid)
-
-    def _register_transfer_grid(self, ep, grid) -> None:
-        import _spectral_kernels as _sk
-        NEURAL = _sk.SCALE_CONTEXT_KIND_NEURAL_SURFACE
-        RT_SCALE_GEOMETRIC = 0
-        ap = ep.preset.aperture_stop
-        ctx_id = self.tracer.add_scale_context(
-            pos          = np.array([0.0, 0.0, float(ap.z_pos)]),
-            radius       = float(ap.r_outer) * 6.0,
-            scale_type   = RT_SCALE_GEOMETRIC,
-            dt_m         = 0.0,
-            n_substeps   = 0,
-            n_real       = 1.0,
-            n_imag       = 0.0,
-            context_kind = NEURAL,
-            payload      = self._transfer_grid,
+        lsg = getattr(self, "lens_surface_groups", None)
+        if not lsg:
+            return
+        self._lens_assembly.register(
+            self.tracer,
+            lsg,
+            self.tri_vertices,
+            self.tri_centroids,
+            _scene_lenses(self.scene),
         )
-        self._manifold_ctx_id = ctx_id
-        print(f"[middle] bake done — {self._transfer_grid_noodles:,} noodles,"
-              f" payload={grid.nbytes/(1024.0**3):.2f} GiB ctx_id={ctx_id}", flush=True)
+
+    def _do_register_parametric_assembly(self) -> None:
+        """Re-register parametric lens assembly after clear_tri_groups().  No-op if not PARAMETRIC."""
+        if self._lens_assembly is None or self._lens_assembly.mode != LensAssemblySpec.MODE_PARAMETRIC:
+            return
+        lsg = getattr(self, "lens_surface_groups", None)
+        if not lsg:
+            return
+        self._lens_assembly.register(
+            self.tracer,
+            lsg,
+            self.tri_vertices,
+            self.tri_centroids,
+            _scene_lenses(self.scene),
+        )
+
+    def _register_neural_payload(
+        self,
+        fwd_payload: np.ndarray,
+        bwd_payload: Optional[np.ndarray] = None,
+    ) -> None:
+        """Load MLP payloads and register NEURAL_ASSEMBLY groups on the lens assembly."""
+        if self._lens_assembly is None:
+            self._lens_assembly = LensAssemblySpec()
+        self._lens_assembly.load_payload(fwd_payload, bwd_payload)
+        self._do_register_neural_assembly_group()
 
     def prebake_transfer_grid(self, preset=None) -> None:
         from camera_designer.camera_preset import simple_doublet_preset
@@ -5939,6 +6167,11 @@ def run(
     bake_noodles_per_cell: float = 1.0,
     bake_training_table: str = "",
     bake_training_gb: float = 0.0,
+    neural_assembly: bool = False,
+    neural_train_epochs: int = 60,
+    neural_payload_in: str = "",
+    neural_payload_out: str = "",
+    parametric: bool = False,
 ) -> None:
     # "bdpt" is a legacy alias for "middle"
     if ray_mode == "bdpt":
@@ -6074,7 +6307,237 @@ def run(
         _pip_res,
         0.008,
     )
-    if bake_training_gb > 0.0:
+    if neural_payload_in:
+        # ── Load pre-trained payload(s) and register immediately ──────────────
+        _loaded_payload = np.load(neural_payload_in).astype(np.float32)
+        print(f"[neural] loaded forward payload from {neural_payload_in} "
+              f"({len(_loaded_payload)} floats)", flush=True)
+        _bwd_path = neural_payload_in.replace(".npy", "_bwd.npy")
+        _loaded_bwd = None
+        if os.path.exists(_bwd_path):
+            _loaded_bwd = np.load(_bwd_path).astype(np.float32)
+            print(f"[neural] loaded backward payload from {_bwd_path} "
+                  f"({len(_loaded_bwd)} floats)", flush=True)
+        bench._register_neural_payload(_loaded_payload, _loaded_bwd)
+    elif neural_assembly:
+        # ── Full neural-assembly pipeline: bake → train → export → register ───
+        import math as _math
+        from numpy.lib.format import open_memmap as _open_memmap
+        from camera_designer.neural_assembly import (
+            train as _na_train,
+            export_payload as _na_export,
+            fit_acceptance_boundary as _na_fit_boundary,
+        )
+
+        _na_train_path  = bake_training_table or "neural_assembly_train.npy"
+        _na_n_rays      = max(1, int(bake_noodles)) if int(bake_noodles) > 0 else 65_536
+        _na_target_rows = max(1024, int(float(bake_training_gb) * (1024 ** 3) / 44))
+        _na_n_wl        = int(bake_wavelengths)
+
+        # Derive lens geometry from loaded scene
+        _lsg = getattr(bench, "lens_surface_groups", [])
+        if not _lsg:
+            raise RuntimeError("[neural] No lens_surface_groups — upload_scene_data first")
+        _lenses = _scene_lenses(bench.scene)
+        if not _lenses:
+            raise RuntimeError("[neural] Cannot derive lens x positions — no LensConfig in scene")
+        _x_ent  = float(_lenses[0].x_front)
+        _x_exit = float(_lenses[-1].x_back)
+        _r_lens = float(_lenses[0].aperture_radius)
+
+        _preset = bench._camera_preset
+        _wls: list = []
+        if _preset is not None and hasattr(_preset, "wavelengths"):
+            _wls = list(_preset.wavelengths[:_na_n_wl])
+        if not _wls:
+            _wls = [0.486, 0.587, 0.656][:_na_n_wl]
+
+        _N_COLS = 11
+        _table  = _open_memmap(_na_train_path, mode="w+", dtype=np.float32,
+                               shape=(_na_target_rows, _N_COLS))
+
+        _rng     = np.random.default_rng(42)
+        _written = 0
+        _page    = 0
+        _bnd_r:  list = []
+        _bnd_dz: list = []
+        _bnd_ok: list = []
+
+        while _written < _na_target_rows:
+            _wl   = float(_wls[_page % len(_wls)])
+            _seed = 42 + _page
+            _page += 1
+
+            # Uniform disc at entrance plane; stochastic hemisphere into lens (-X)
+            _r2    = _rng.uniform(0.0, _r_lens ** 2, _na_n_rays)
+            _ang   = _rng.uniform(0.0, 2.0 * _math.pi, _na_n_rays)
+            _r_in  = np.sqrt(_r2)
+            _bake_o = np.column_stack([
+                np.full(_na_n_rays, _x_ent + 1e-4, dtype=np.float64),
+                (_r_in * np.cos(_ang)).astype(np.float64),
+                (_r_in * np.sin(_ang)).astype(np.float64),
+            ])
+            _phi_d  = _rng.uniform(0.0, 2.0 * _math.pi, _na_n_rays)
+            _cos_th = _rng.random(_na_n_rays)
+            _sin_th = np.sqrt(1.0 - _cos_th ** 2)
+            _bake_d = np.column_stack([
+                -_cos_th,
+                _sin_th * np.cos(_phi_d),
+                _sin_th * np.sin(_phi_d),
+            ]).astype(np.float64)
+
+            _bnd_r.append(_r_in.astype(np.float32))
+            _bnd_dz.append(_cos_th.astype(np.float32))
+
+            recs = bench.trace_forward(
+                0, _seed,
+                max_bounces=20,
+                blocking=True,
+                bake_origins=_bake_o,
+                bake_directions=_bake_d,
+            )
+
+            if len(recs.get("kind", [])) == 0:
+                _bnd_ok.append(np.zeros(_na_n_rays, dtype=bool))
+                continue
+
+            _kind_a   = np.asarray(recs["kind"])
+            _tag_a    = np.asarray(recs["tag"])
+            _pos_a    = np.asarray(recs["pos"])
+            _dir_a    = np.asarray(recs["dir"])
+            _seg_a    = np.asarray(recs["seg_start"])
+            _plen_a   = np.asarray(recs["path_len"])
+            _bounce_a = np.asarray(recs["bounce"])
+            _sensor_a = np.asarray(recs["is_sensor"]).astype(bool)
+
+            _keep     = (_kind_a == 0) | (_kind_a == 1)
+            _tag_a    = _tag_a[_keep];    _pos_a    = _pos_a[_keep]
+            _dir_a    = _dir_a[_keep];    _seg_a    = _seg_a[_keep]
+            _plen_a   = _plen_a[_keep];   _bounce_a = _bounce_a[_keep]
+            _sensor_a = _sensor_a[_keep]
+
+            _entry_by_tag:  dict = {}
+            _sensor_by_tag: dict = {}
+            for _i in range(len(_tag_a)):
+                _t = int(_tag_a[_i])
+                if _bounce_a[_i] == 0 and _t not in _entry_by_tag:
+                    _entry_by_tag[_t] = _i
+                if _sensor_a[_i] and _t not in _sensor_by_tag:
+                    _sensor_by_tag[_t] = _i
+
+            _alive = np.zeros(_na_n_rays, dtype=bool)
+            for _t in _sensor_by_tag:
+                if _t < _na_n_rays:
+                    _alive[_t] = True
+            _bnd_ok.append(_alive)
+
+            _rows = []
+            for _t, _si in _sensor_by_tag.items():
+                _ei = _entry_by_tag.get(_t)
+                if _ei is None:
+                    continue
+                _, _ye, _ze      = _pos_a[_ei]
+                _dxe, _dye, _dze = _dir_a[_ei]
+                _theta_hit = float(np.arctan2(_ze, _ye))
+                _r_in_v    = float(np.hypot(_ye, _ze))
+                _cos_t     = _math.cos(_theta_hit)
+                _sin_t     = _math.sin(_theta_hit)
+                _dir_z_in   = float(-_dxe)
+                _dir_r_in   = float( _dye * _cos_t + _dze * _sin_t)
+                _dir_phi_in = float(-_dye * _sin_t + _dze * _cos_t)
+
+                _, _yo, _zo      = _seg_a[_si]
+                _dxo, _dyo, _dzo = _dir_a[_si]
+                _theta_out  = float(np.arctan2(_zo, _yo))
+                _r_out_v    = float(np.hypot(_yo, _zo))
+                _delta_phi  = _theta_out - _theta_hit
+                _delta_phi -= 2.0 * _math.pi * round(_delta_phi / (2.0 * _math.pi))
+                _dir_r_out   = float( _dyo * _cos_t + _dzo * _sin_t)
+                _dir_phi_out = float(-_dyo * _sin_t + _dzo * _cos_t)
+                _dir_z_out   = float(-_dxo)
+                _opl         = float(_plen_a[_si])
+
+                _rows.append((_r_in_v, _dir_r_in, _dir_phi_in, _dir_z_in, _wl,
+                              _r_out_v, _delta_phi, _dir_r_out, _dir_phi_out, _dir_z_out, _opl))
+
+            if _rows:
+                _chunk = np.array(_rows, dtype=np.float32)
+                _take  = min(len(_chunk), _na_target_rows - _written)
+                _table[_written:_written + _take] = _chunk[:_take]
+                _written += _take
+
+            print(f"[bake/gpu] {_written:,}/{_na_target_rows:,}"
+                  f"  wl={_wl:.4f}µm  hits={len(_rows):,}", flush=True)
+
+        _na_bnd = np.array([0.0, 0.0], np.float32)
+        if _bnd_r:
+            _c0, _c1 = _na_fit_boundary(
+                np.concatenate(_bnd_r),
+                np.concatenate(_bnd_dz),
+                np.concatenate(_bnd_ok),
+                r_lens=float(_r_lens),
+            )
+            _na_bnd = np.array([_c0, _c1], np.float32)
+        _table.flush()
+        print(f"[neural] training table {_na_train_path}: "
+              f"{_written:,}/{_na_target_rows:,} rows  "
+              f"boundary c0={float(_na_bnd[0]):.4f} c1={float(_na_bnd[1]):.4f}",
+              flush=True)
+
+        _na_kw = dict(
+            z_entry=float(_x_ent),
+            z_exit=float(_x_exit),
+            r_lens=float(_r_lens),
+            boundary_c0=float(_na_bnd[0]),
+            boundary_c1=float(_na_bnd[1]),
+        )
+
+        # Train once — same weights serve both directions.
+        # Backward surface uses the same payload with z_entry/z_exit swapped.
+        _na_model, _na_norm = _na_train(
+            _na_train_path, epochs=int(neural_train_epochs), verbose=True)
+        _na_payload     = _na_export(_na_model, _na_norm, **_na_kw)
+        _na_payload_bwd = _na_export(_na_model, _na_norm,
+                                     z_entry=_na_kw["z_exit"],
+                                     z_exit=_na_kw["z_entry"])
+
+        if neural_payload_out:
+            np.save(neural_payload_out, _na_payload)
+            np.save(neural_payload_out.replace(".npy", "_bwd.npy"), _na_payload_bwd)
+            print(f"[neural] saved payloads → {neural_payload_out} + _bwd", flush=True)
+
+        bench._register_neural_payload(_na_payload, _na_payload_bwd)
+    elif parametric:
+        # ── Exact algebraic parametric lens: bypass LUT/MLP entirely ─────────
+        from camera_designer.camera_preset import simple_doublet_preset
+        from camera_designer.compound_optics import CompoundLens
+
+        _preset = bench._camera_preset or simple_doublet_preset()
+        _cl = CompoundLens.from_preset(_preset)
+        print(
+            f"[parametric] CompoundLens: {len(_cl.elements)} elements"
+            f"  f_eff={_cl.f_eff * 1e3:.1f} mm  f/{_cl.f_number:.1f}",
+            flush=True,
+        )
+
+        if bench._lens_assembly is None:
+            bench._lens_assembly = LensAssemblySpec()
+        bench._lens_assembly.set_optics(_cl, mode=LensAssemblySpec.MODE_PARAMETRIC)
+
+        lsg = getattr(bench, "lens_surface_groups", [])
+        if lsg:
+            bench._lens_assembly.register(
+                bench.tracer,
+                lsg,
+                bench.tri_vertices,
+                bench.tri_centroids,
+                _scene_lenses(bench.scene),
+            )
+        else:
+            print("[parametric] no lens_surface_groups — will register on first render",
+                  flush=True)
+    elif bake_training_gb > 0.0:
+        # ── Legacy path: bake old averaged training table ─────────────────────
         from camera_designer.camera_preset import simple_doublet_preset
         from camera_designer.bake_worker import BakeWorker
 
@@ -6538,11 +7001,11 @@ def run(
             border_col=(0.65, 0.25, 1.0),
         )
 
-        # ── Backward accumulation pip (centre — cyan border) ────────────────
-        img = bench.get_reverse_strike_image()
-        cpp_img = bench.tracer.get_sensor_image()   # resolved reverse/BDPT sensor image
-        if cpp_img.shape[0] > 0 and float(np.max(cpp_img)) > 0.0:
-            img = np.maximum(img, cpp_img)
+        # ── Backward illumination collapse pip (centre — cyan border) ──────
+        # Sensor-launched rays deposit only when they terminate on emissive
+        # material.  Non-emissive terminal hits and misses contribute zero but
+        # remain in the per-pixel denominator, so unlit paths darken the pixel.
+        img = bench.get_backward_emission_image()
         has_img = img.shape[0] > 0
 
         if has_img:
@@ -6598,11 +7061,13 @@ def run(
                 return arr[::-1].copy()
 
             # ── Manifold label above left (violet) PIP ─────────────────────
-            bake_str = (
-                f"BAKED {bench._transfer_grid_noodles:,}n  ctx={bench._manifold_ctx_id}"
-                if bench._transfer_grid is not None
-                else "baking…" if ray_mode == "middle" else ""
-            )
+            _asm = bench._lens_assembly
+            if _asm is not None and _asm.mode == LensAssemblySpec.MODE_LUT:
+                bake_str = f"BAKED {_asm._transfer_grid_noodles:,}n  ctx={_asm._manifold_ctx_id}"
+            elif ray_mode == "middle":
+                bake_str = "baking…"
+            else:
+                bake_str = ""
             manifold_lines  = [mode_str]
             manifold_colours = [(180, 140, 255)]
             if bake_str:
@@ -6616,8 +7081,13 @@ def run(
                                      _bdpt_pip_vx, _pip_vy + _pip_dim + 2,
                                      _HUD_W, _HUD_H, hud_mode=True)
 
-            # ── BDPT tracking stats above center (cyan) PIP ─────────────────
-            tracking_lines = [dist_str, f"col {bc:.3f}", f"snaps {es} nr {nm}"]
+            # ── Backward transport stats above center (cyan) PIP ───────────
+            bwd_t = bench.bdpt_last_backward_transport or {}
+            tracking_lines = [
+                f"emit {int(bwd_t.get('found_emission', 0))} no {int(bwd_t.get('terminated_no_emission', 0))}",
+                f"miss {int(bwd_t.get('missed_scene', 0))} ew {float(bwd_t.get('emission_weight', 0.0)):.2g}",
+                f"{dist_str} col {bc:.3f}",
+            ]
             tracking_cols  = [(80, 210, 255)] * 3
             rgba_t = _render_hud_lines(tracking_lines, tracking_cols)
             glBindTexture(GL_TEXTURE_2D, tex_hud)
@@ -6876,7 +7346,7 @@ def run(
     # KPN back-pressure gate: block submit until C++ intent queue drains to below
     # capacity.  display_pipeline_records() still runs every frame so the viewer
     # stays live while the pipeline is catching up.
-    _MAX_IN_FLIGHT = 65_536
+    _MAX_IN_FLIGHT = 2_000_000
 
     # Manifold ("M") render state — fires once at startup then every N frames.
     _MANIFOLD_INTERVAL = 60     # re-render every 60 trace calls
@@ -7386,6 +7856,38 @@ if __name__ == "__main__":
         help="Size of neural-lens training table to stream in GiB; includes wavelength and focus columns",
     )
     _ap.add_argument(
+        "--neural-assembly",
+        action="store_true",
+        help=(
+            "Replace the full optical assembly with a trained MLP stand-in. "
+            "Bakes per-band training data (4-dimensional: aperture, field, focus, wavelength), "
+            "trains the network, exports a magic-14948 payload, and registers it as the "
+            "optical context.  Use --bake-training-gb to control data size, "
+            "--focus-steps / --focus-range-mm for the focus sweep, "
+            "--neural-payload-out to save the payload, "
+            "--neural-payload-in to skip baking and load a pre-trained payload."
+        ),
+    )
+    _ap.add_argument(
+        "--neural-train-epochs",
+        type=int,
+        default=60,
+        metavar="N",
+        help="Training epochs for --neural-assembly (default: 60)",
+    )
+    _ap.add_argument(
+        "--neural-payload-in",
+        default="",
+        metavar="PATH",
+        help="Load a pre-trained .npy neural-assembly payload and skip baking/training",
+    )
+    _ap.add_argument(
+        "--neural-payload-out",
+        default="",
+        metavar="PATH",
+        help="Save the trained neural-assembly payload to this .npy path",
+    )
+    _ap.add_argument(
         "--full-assembly",
         action="store_true",
         help=(
@@ -7407,6 +7909,15 @@ if __name__ == "__main__":
         default=2.0,
         metavar="MM",
         help="Total sensor z sweep range for --focus-steps (default: 2.0 mm, centred on nominal)",
+    )
+    _ap.add_argument(
+        "--parametric",
+        action="store_true",
+        help=(
+            "Use exact algebraic CompoundLens transform instead of LUT or MLP. "
+            "Evaluates the closed-form parametric equation of the full optical assembly "
+            "per ray hit; no baking or training required."
+        ),
     )
     _args = _ap.parse_args()
     if _args.uv_smoke_exit:
@@ -7440,4 +7951,9 @@ if __name__ == "__main__":
         bake_noodles_per_cell=_args.bake_noodles_per_cell,
         bake_training_table=_args.bake_training_table,
         bake_training_gb=_args.bake_training_gb,
+        neural_assembly=bool(_args.neural_assembly),
+        neural_train_epochs=int(_args.neural_train_epochs),
+        neural_payload_in=_args.neural_payload_in,
+        neural_payload_out=_args.neural_payload_out,
+        parametric=bool(_args.parametric),
     )

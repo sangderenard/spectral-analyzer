@@ -144,6 +144,7 @@ uniform sampler2DArray uDepthUv;
 uniform sampler2DArray uRemitUv;
 uniform bool uEnableSpecular = true;
 uniform bool uEnableEmissionDirect = false;
+uniform int  uRenderPass = 0;  // 0=all, 1=opaque-only (alpha>=0.85), 2=transparent-only
 uniform sampler3D uFieldVolume;
 uniform float uFieldGain = 0.0;
 
@@ -345,7 +346,9 @@ void main() {
     col = uCatCcmMatrix * col;
 
     // ── Opacity ────────────────────────────────────────────────────────────
-    float alpha = opacity * (1.0 - mat_trans(id) * 0.8);
+    float alpha = opacity;
+    if (uRenderPass == 1 && alpha < 0.85) discard;
+    if (uRenderPass == 2 && alpha >= 0.85) discard;
 
     vec3 lin = max(col, vec3(0.0));
     vec3 s1 = lin * 12.92;

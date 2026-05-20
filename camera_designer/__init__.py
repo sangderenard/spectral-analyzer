@@ -2,6 +2,7 @@
 
 Submodules
 ----------
+compound_optics       Exact algebraic compound lens model (CompoundLens)
 parametric_surfaces   Closed-form surface primitives (CPU + GLSL)
 camera_preset         CameraPreset dataclass + built-in presets
 bake_worker           64-bit ray tracer → LensManifold noodle LUT
@@ -47,9 +48,28 @@ from .emitter_profile import (
     TEXTURE_CHANNEL_MAP,
     emitter_from_dict,
 )
+from .compound_optics import (
+    CompoundLens,
+    LensHood,
+    TerminationReason,
+    TracedRay,
+    PLENS_MAGIC,
+    PLENS_HEADER,
+    PLENS_SURF_STRIDE,
+)
 from .bake_worker import BakeWorker, trace_ray, trace_ray_backward
 from .manifold_endpoint import ManifoldEndpoint
 from .ray_order import TracerGap, SourceRecord, RayOrder
+from .neural_assembly import (
+    NeuralAssemblyMLP,
+    NormStats,
+    train as train_neural_assembly,
+    export_payload as export_neural_payload,
+    load_training_data,
+    infer_payload,
+    MAGIC_NEURAL,
+)
+
 
 __all__ = [
     # surfaces
@@ -67,8 +87,16 @@ __all__ = [
     "PolarizationMode", "PolarizationState",
     "EmissiveTexture", "TEXTURE_CHANNEL_MAP",
     "EmitterProfile", "EMITTER_CATALOG", "emitter_from_dict",
+    # compound optics (element types accessed via camera_designer.compound_optics)
+    "CompoundLens", "LensHood", "TerminationReason", "TracedRay",
+    "PLENS_MAGIC", "PLENS_HEADER", "PLENS_SURF_STRIDE",
     # bake
     "BakeWorker", "trace_ray", "trace_ray_backward", "ManifoldEndpoint",
     # ray order
     "TracerGap", "SourceRecord", "RayOrder",
+    # neural assembly
+    "NeuralAssemblyMLP", "NormStats",
+    "train_neural_assembly", "export_neural_payload",
+    "load_training_data", "infer_payload",
+    "MAGIC_NEURAL",
 ]

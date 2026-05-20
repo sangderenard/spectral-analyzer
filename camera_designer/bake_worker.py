@@ -1,5 +1,22 @@
 """camera_designer/bake_worker.py
 ==================================
+
+DEPRECATION NOTICE
+------------------
+This module is a transitional utility.  The CPU Snell ray tracer (trace_ray,
+trace_ray_backward, trace_ray_batch, BakeWorker) duplicates T1→T2→T3 without
+wave simulation and must NOT be used as the primary pipeline.
+
+Intended final state:
+  - trace_ray / trace_ray_backward / trace_ray_batch  →  replace with GPU dispatch
+    (submit T1→T2→T3 and read back the SSBO output hit records)
+  - BakeWorker.bake() / bake_assembly() / _trace_batch()  →  deprecated; use
+    LensAssemblySpec.bake_lut() which wraps ManifoldEndpoint (same CPU path today,
+    but will call the GPU pipeline once the read-back API is available)
+  - bake_neural_training_data()  →  TODO: replace with GPU dispatch + wave sim
+  - bake_glsl_source()  →  potentially useful for parametric equation generation;
+    kept pending evaluation
+
 64-bit parametric ray tracer that bakes a CameraPreset into a LensManifold
 noodle LUT.
 
@@ -83,6 +100,8 @@ def trace_ray(
     wavelength_um: float = 0.587,
 ) -> Optional[dict]:
     """Trace one ray through the full lens group.
+
+    TRANSITIONAL: replace with GPU dispatch (T1→T2→T3 SSBO read-back).
 
     Parameters
     ----------
@@ -204,6 +223,8 @@ def trace_ray_backward(
 ) -> Optional[dict]:
     """Trace a ray from sensor side backward through the lens to scene.
 
+    TRANSITIONAL: replace with GPU dispatch (T1→T2→T3 SSBO read-back).
+
     Applies Snell's law with swapped n1/n2 through elements in reverse order
     (sensor-side first), giving the time-reversed optical path.
 
@@ -312,6 +333,159 @@ def trace_ray_backward(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Vectorised batch ray tracer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _snell_batch(
+    rd:     np.ndarray,   # (N,3) unit incident directions
+    normal: np.ndarray,   # (N,3) unit surface normals (oriented against ray)
+    n1:     np.ndarray,   # (N,) or scalar — medium before
+    n2:     np.ndarray,   # (N,) or scalar — medium after
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorised Snell's law.  Returns (rd_out (N,3), tir_mask (N,) bool)."""
+    n1 = np.asarray(n1, np.float64)
+    n2 = np.asarray(n2, np.float64)
+    ratio  = n1 / np.maximum(n2, 1e-30)
+    cos_i  = -np.einsum("ij,ij->i", normal, rd)          # (N,)  >0 for front face
+    sin2_t = ratio ** 2 * (1.0 - cos_i ** 2)
+    tir    = sin2_t > 1.0
+    cos_t  = np.sqrt(np.maximum(1.0 - sin2_t, 0.0))
+    if np.ndim(ratio) == 0:
+        rd_out = ratio * rd + (ratio * cos_i - cos_t)[:, None] * normal
+    else:
+        rd_out = ratio[:, None] * rd + (ratio * cos_i - cos_t)[:, None] * normal
+    norms  = np.linalg.norm(rd_out, axis=1, keepdims=True)
+    rd_out = rd_out / np.maximum(norms, 1e-30)
+    return rd_out, tir
+
+
+def trace_ray_batch(
+    preset:        "CameraPreset",
+    ro_arr:        np.ndarray,   # (N,3) float64 — ray origins at entrance plane
+    rd_arr:        np.ndarray,   # (N,3) float64 — unit ray directions
+    wavelength_um: float,
+) -> dict:
+    """Batch-vectorised analogue of trace_ray().
+
+    TRANSITIONAL: replace with GPU dispatch (T1→T2→T3 SSBO read-back).
+
+    Propagates N rays simultaneously through every lens element using
+    NumPy array operations instead of a per-ray Python loop.  Each element
+    step is O(N) NumPy; the sequential element loop (M elements deep) is
+    unavoidable.
+
+    Returns a dict with arrays of shape (N,) / (N,3):
+        alive      (N,) bool  — False for TIR / miss / aperture-blocked
+        sensor_hit (N,3)      — world-space sensor intersection
+        out_dir    (N,3)      — unit exit direction
+        opl        (N,)       — optical path length entrance→sensor (m)
+        ap_uv      (N,2)      — normalised aperture UV [-1,1]
+    Dead-ray entries are undefined (use alive mask to filter).
+    """
+    N   = len(ro_arr)
+    ro  = np.asarray(ro_arr, np.float64).copy()
+    rd  = np.asarray(rd_arr, np.float64).copy()
+    rd  = rd / np.maximum(np.linalg.norm(rd, axis=1, keepdims=True), 1e-30)
+
+    alive   = np.ones(N, bool)
+    opl     = np.zeros(N, np.float64)
+    n_cur   = np.ones(N, np.float64)  # current medium refractive index
+
+    ap      = preset.aperture_stop
+    z_ap    = float(ap.z_pos)
+    r_outer = float(ap.r_outer)
+    r_inner = float(getattr(ap, "r_inner", 0.0))
+
+    # Track first aperture-plane crossing
+    ap_hit_xy = np.zeros((N, 2), np.float64)
+    ap_found  = np.zeros(N, bool)
+
+    elements = sorted(preset.lens_group.elements,
+                      key=lambda e: e.z_vertex, reverse=True)
+
+    for el in elements:
+        if not np.any(alive):
+            break
+        ro_local      = ro.copy()
+        ro_local[:, 2] -= el.z_vertex
+
+        t_el, hit_local, nrm = el.surface.intersect_batch(ro_local, rd)
+
+        # Rays that miss this element die
+        alive &= np.isfinite(t_el)
+
+        hit_world      = hit_local.copy()
+        hit_world[:, 2] += el.z_vertex
+
+        # OPL accumulation
+        opl = np.where(alive, opl + n_cur * t_el, opl)
+
+        # Refraction
+        n_out_v = float(el.glass_out.n_at(wavelength_um))
+        n_out   = np.full(N, n_out_v, np.float64)
+        rd_new, tir = _snell_batch(rd, nrm, n_cur, n_out)
+        alive   &= ~tir
+
+        # Advance state for surviving rays
+        ro    = np.where(alive[:, None], hit_world, ro)
+        rd    = np.where(alive[:, None], rd_new, rd)
+        n_cur = np.where(alive, n_out, n_cur)
+
+        # Capture aperture crossing (first time ray passes z_ap)
+        unset = alive & ~ap_found
+        if np.any(unset):
+            # Check whether this step crossed z_ap
+            prev_z = ro[:, 2] - t_el * rd[:, 2]   # approx pre-step z
+            crossed = unset & (
+                ((prev_z - z_ap) * (hit_world[:, 2] - z_ap) <= 0) |
+                (np.abs(hit_world[:, 2] - z_ap) < 1e-6)
+            )
+            if np.any(crossed):
+                dz_safe = np.where(np.abs(rd[:, 2]) > 1e-9, rd[:, 2], 1.0)
+                t_ap    = (z_ap - ro[:, 2]) / dz_safe
+                ap_pt   = ro + t_ap[:, None] * rd
+                ap_hit_xy = np.where(
+                    crossed[:, None],
+                    ap_pt[:, :2],
+                    ap_hit_xy,
+                )
+                ap_found |= crossed
+
+    # Rays that never found an aperture crossing: project from current pos
+    no_ap = alive & ~ap_found
+    if np.any(no_ap):
+        dz_safe = np.where(np.abs(rd[:, 2]) > 1e-9, rd[:, 2], 1.0)
+        t_ap    = (z_ap - ro[:, 2]) / dz_safe
+        ap_pt   = ro + t_ap[:, None] * rd
+        ap_hit_xy = np.where(no_ap[:, None], ap_pt[:, :2], ap_hit_xy)
+        ap_found |= no_ap
+
+    # Aperture radius check — kill rays outside aperture disk
+    ap_r2 = ap_hit_xy[:, 0] ** 2 + ap_hit_xy[:, 1] ** 2
+    alive &= (ap_r2 <= r_outer ** 2) & (ap_r2 >= r_inner ** 2)
+
+    # Propagate to sensor
+    sensor_z = float(preset.sensor.z_pos)
+    ro_sensor = ro.copy()
+    ro_sensor[:, 2] -= sensor_z
+    t_s, hit_s_local, _ = preset.sensor.intersect_batch(ro_sensor, rd)
+    alive &= np.isfinite(t_s)
+    hit_sensor = hit_s_local.copy()
+    hit_sensor[:, 2] += sensor_z
+    opl = np.where(alive, opl + n_cur * t_s, opl)
+
+    ap_uv = ap_hit_xy / max(r_outer, 1e-12)
+
+    return {
+        "alive":      alive,
+        "sensor_hit": hit_sensor,
+        "out_dir":    rd / np.maximum(np.linalg.norm(rd, axis=1, keepdims=True), 1e-30),
+        "opl":        opl,
+        "ap_uv":      ap_uv,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # BakeWorker
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -332,7 +506,7 @@ class BakeWorker:
     def __init__(
         self,
         preset:        CameraPreset,
-        n_rays:        int   = 65_536,
+        n_rays:        int   = 2_000_000,
         n_wavelengths: int   = 3,
         n_refine:      int   = 2,
         threshold:     float = 1e-4,
@@ -351,15 +525,14 @@ class BakeWorker:
 
     def _sample_rays(self, n: int) -> tuple[np.ndarray, np.ndarray]:
         """Sample n (ro, rd) pairs: origins on the aperture disk, directions
-        spanning the scene-side FOV cone.
+        from a Fibonacci hemisphere covering all incoming angles (full θ ∈ [0, π/2]).
 
         Returns (ro_arr, rd_arr) each (n, 3) float64.
         """
-        ap   = self.preset.aperture_stop
-        fov  = math.radians(self.preset.fov_deg * 0.5)
-        ftan = math.tan(fov)
+        ap  = self.preset.aperture_stop
+        PHI = (1.0 + math.sqrt(5.0)) / 2.0  # golden ratio
 
-        # Aperture disk: uniform Halton-like sampling
+        # Aperture disk: uniform area sampling
         r2  = self.rng.uniform(0., ap.r_outer**2, n)
         ang = self.rng.uniform(0., 2*math.pi, n)
         r   = np.sqrt(r2)
@@ -367,17 +540,22 @@ class BakeWorker:
         ay  = r * np.sin(ang)
         z_front = max(el.z_vertex
                       for el in self.preset.lens_group.elements) + 0.001
-        az  = np.full(n, z_front)  # start 1 mm in front of frontmost element
-
+        az  = np.full(n, z_front)
         ro_arr = np.stack([ax, ay, az], axis=1)  # (n, 3)
 
-        # Scene directions: uniform over cone
-        fu = self.rng.uniform(-ftan, ftan, n)
-        fv = self.rng.uniform(-ftan, ftan, n)
-        rd_raw = np.stack([fu, fv, -np.ones(n)], axis=1)  # pointing -Z (toward sensor)
-        norms  = np.linalg.norm(rd_raw, axis=1, keepdims=True)
-        rd_arr = rd_raw / np.maximum(norms, 1e-30)
-
+        # Fibonacci hemisphere — uniform area coverage, θ ∈ [0, π/2]
+        # rd_z < 0 = pointing into the lens (−Z camera direction)
+        i_arr  = np.arange(n, dtype=np.float64)
+        cos_th = 1.0 - (i_arr + 0.5) / n
+        sin_th = np.sqrt(np.maximum(1.0 - cos_th * cos_th, 0.0))
+        phi    = 2.0 * math.pi * i_arr / PHI + self.rng.uniform(0., 2*math.pi)
+        rd_arr = np.stack([
+            sin_th * np.cos(phi),
+            sin_th * np.sin(phi),
+            -cos_th,
+        ], axis=1)
+        norms  = np.linalg.norm(rd_arr, axis=1, keepdims=True)
+        rd_arr = rd_arr / np.maximum(norms, 1e-30)
         return ro_arr, rd_arr
 
     def _trace_batch(
@@ -388,6 +566,8 @@ class BakeWorker:
         preset_override=None,
     ) -> np.ndarray:
         """Trace a batch of rays; return noodle rows (M, 14) float64.
+
+        DEPRECATED: uses CPU Snell tracer; replace with GPU dispatch.
 
         Columns 0-10 match the standard LensManifold schema.
         Columns 11-13 are the full-assembly extension:
@@ -433,6 +613,8 @@ class BakeWorker:
 
     def bake(self):
         """Trace rays and build a LensManifold.
+
+        DEPRECATED: uses CPU Snell tracer; use LensAssemblySpec.bake_lut() instead.
 
         Returns
         -------
@@ -520,6 +702,8 @@ class BakeWorker:
     ) -> np.ndarray:
         """Bake a full-assembly (N, 14) noodle array covering focus range.
 
+        DEPRECATED: uses CPU Snell tracer; use LensAssemblySpec.bake_lut() instead.
+
         Each focus step shifts ``preset.sensor.z_pos`` by a different offset and
         traces ``self.n_rays`` rays, tagging each noodle with its ``focus_z``
         value.  The result is a single (N_total, 14) float64 array covering
@@ -603,7 +787,7 @@ class BakeWorker:
         target_gb: float,
         n_focus_steps: int = 1,
         focus_range_m: float = 2e-3,
-        batch_size: int = 8192,
+        batch_size: int = 2_000_000,
         max_attempt_factor: float = 20.0,
     ) -> tuple[int, int]:
         """Stream a neural-lens training table to a float32 ``.npy`` memmap.
@@ -680,6 +864,163 @@ class BakeWorker:
 
         table.flush()
         return written, target_rows
+
+    def bake_neural_training_data(
+        self,
+        path: str,
+        target_rows: int,
+        batch_size: int = 2_000_000,
+    ) -> tuple[int, int]:
+        """Stream an (N, 11) noodle training table to a float32 ``.npy`` memmap.
+
+        TODO: replace with GPU dispatch (T1→T2→T3 read-back + wave simulation).
+
+        Row schema — 11 float32 columns (entry-surface canonical frame):
+
+          Inputs (5):
+            0  r_in          radial hit distance on entry surface (m)
+            1  dir_r_in      radial direction component (into surface)
+            2  dir_phi_in    azimuthal direction component (relative to theta_hit)
+            3  dir_z_in      axial direction, positive = into front surface
+            4  wavelength_um vacuum wavelength (µm)
+
+          Outputs (6):
+            5  r_out         radial distance on exit surface (m)
+            6  delta_phi     exit azimuth offset = theta_out − theta_hit (radians)
+            7  dir_r_out     radial direction at exit (theta_hit frame)
+            8  dir_phi_out   azimuthal direction at exit (theta_hit frame)
+            9  dir_z_out     axial direction at exit, positive = away from entry
+           10  opl           optical path length entry→exit (m)
+
+        Only transmitted rays are recorded; blocked rays are dropped entirely.
+        All angles are in the entry-surface canonical frame (relative to theta_hit).
+        """
+        from numpy.lib.format import open_memmap
+
+        N_COLS = 11
+        table = open_memmap(path, mode="w+", dtype=np.float32,
+                            shape=(target_rows, N_COLS))
+
+        wavelengths = list(self.preset.wavelengths[:self.n_wavelengths])
+        z_ent = self._z_entrance()
+        z_ext = self._z_exit()
+
+        written = 0
+        page    = 0
+        rows_per_page = math.ceil(target_rows / len(wavelengths))
+        n_batch       = max(batch_size, rows_per_page * 3)
+
+        bnd_r: list = []; bnd_dz: list = []; bnd_ok: list = []; bnd_count = 0
+
+        while written < target_rows:
+            wl = float(wavelengths[page % len(wavelengths)])
+            page += 1
+
+            ro_arr, rd_arr = self._sample_rays(n_batch)
+            ro_arr[:, 2] = z_ent
+
+            result = trace_ray_batch(self.preset, ro_arr, rd_arr, wl)
+            alive = result["alive"]
+
+            # Collect (r_in, dir_z_in, alive) for all rays before alive filter
+            if bnd_count < 300_000:
+                _r_all  = np.hypot(ro_arr[:, 0], ro_arr[:, 1])
+                _dz_all = -rd_arr[:, 2]   # positive = into entrance surface
+                bnd_r.append(_r_all); bnd_dz.append(_dz_all); bnd_ok.append(alive)
+                bnd_count += len(_r_all)
+
+            sh    = result["sensor_hit"]   # (N,3)
+            od    = result["out_dir"]      # (N,3) unit, od_z < 0 toward sensor
+            opl_v = result["opl"]          # (N,)
+
+            if not alive.any():
+                if self.verbose:
+                    print(f"[BakeWorker.neural] wl={wl:.4f}µm: 0 hits, skipping",
+                          flush=True)
+                continue
+
+            # ── Mask to live rays ─────────────────────────────────────────────
+            ro_live = ro_arr[alive]
+            rd_live = rd_arr[alive]
+            sh_live = sh[alive]
+            od_live = od[alive]
+            op_live = opl_v[alive]
+
+            # ── Entry-surface canonical frame ─────────────────────────────────
+            x_hit     = ro_live[:, 0]
+            y_hit     = ro_live[:, 1]
+            theta_hit = np.arctan2(y_hit, x_hit)
+            r_in      = np.hypot(x_hit, y_hit)
+            cos_t     = np.cos(theta_hit)
+            sin_t     = np.sin(theta_hit)
+
+            dir_r_in  =  rd_live[:, 0] * cos_t + rd_live[:, 1] * sin_t
+            dir_phi_in= -rd_live[:, 0] * sin_t + rd_live[:, 1] * cos_t
+            dir_z_in  = -rd_live[:, 2]   # positive: rd_z < 0 into front surface
+
+            # ── Backproject sensor hit to exit surface ────────────────────────
+            dz_safe  = np.where(np.abs(od_live[:, 2]) > 1e-9, od_live[:, 2], -1e-9)
+            t_exit   = (z_ext - sh_live[:, 2]) / dz_safe
+            exit_pos = sh_live + t_exit[:, None] * od_live
+
+            x_out     = exit_pos[:, 0]
+            y_out     = exit_pos[:, 1]
+            theta_out = np.arctan2(y_out, x_out)
+            r_out     = np.hypot(x_out, y_out)
+
+            delta_phi = theta_out - theta_hit
+            delta_phi = delta_phi - (2.0 * np.pi) * np.round(delta_phi / (2.0 * np.pi))
+
+            dir_r_out  =  od_live[:, 0] * cos_t + od_live[:, 1] * sin_t
+            dir_phi_out= -od_live[:, 0] * sin_t + od_live[:, 1] * cos_t
+            dir_z_out  = -od_live[:, 2]   # positive: od_z < 0 away from entry
+
+            rows = np.column_stack([
+                r_in, dir_r_in, dir_phi_in, dir_z_in,
+                np.full(alive.sum(), wl, np.float32),
+                r_out, delta_phi, dir_r_out, dir_phi_out, dir_z_out,
+                op_live,
+            ]).astype(np.float32)
+
+            take = min(len(rows), target_rows - written)
+            table[written:written + take] = rows[:take]
+            written += take
+
+            if self.verbose:
+                print(f"[BakeWorker.neural] {written:,}/{target_rows:,}  "
+                      f"wl={wl:.4f}µm  hits={alive.sum():,}", flush=True)
+
+        # Fit parametric acceptance boundary from collected ray data
+        c0, c1 = 0.0, 0.0
+        if bnd_r:
+            from .neural_assembly import fit_acceptance_boundary
+            c0, c1 = fit_acceptance_boundary(
+                np.concatenate(bnd_r),
+                np.concatenate(bnd_dz),
+                np.concatenate(bnd_ok),
+                r_lens=float(self.preset.aperture_stop.r_outer),
+            )
+        if self.verbose:
+            print(f"[BakeWorker.neural] acceptance boundary c0={c0:.4f} c1={c1:.4f}",
+                  flush=True)
+        table.flush()
+        return written, target_rows, np.array([c0, c1], np.float32)
+
+    def _z_exit(self) -> float:
+        """Z coordinate of the last optical surface (back/exit plane)."""
+        return float(min(el.z_vertex
+                         for el in self.preset.lens_group.elements) - 0.001)
+
+    def _z_entrance(self) -> float:
+        """Z coordinate of the first optical surface (entrance plane).
+
+        This is the front-most lens vertex plus a small safety margin — the
+        same value used internally by bake_neural_training_data as z_ent.
+        Pass to export_payload(z_entrance=...) so the C++ header matches the
+        training geometry exactly.
+        """
+        return float(max(el.z_vertex
+                         for el in self.preset.lens_group.elements) + 0.001)
 
     def bake_glsl_source(self) -> str:
         """Emit a GLSL compute shader that traces one ray per invocation.

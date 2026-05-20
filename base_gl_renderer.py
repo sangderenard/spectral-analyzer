@@ -395,8 +395,30 @@ class BaseGLRenderer:
         self._u_remit_uv        = glGetUniformLocation(self._prog, "uRemitUv")
         self._u_enable_specular = glGetUniformLocation(self._prog, "uEnableSpecular")
         self._u_enable_emission_direct = glGetUniformLocation(self._prog, "uEnableEmissionDirect")
-        self._u_field_vol  = glGetUniformLocation(self._prog, "uFieldVolume")
-        self._u_field_gain = glGetUniformLocation(self._prog, "uFieldGain")
+        self._u_field_vol   = glGetUniformLocation(self._prog, "uFieldVolume")
+        self._u_field_gain  = glGetUniformLocation(self._prog, "uFieldGain")
+        self._u_render_pass = glGetUniformLocation(self._prog, "uRenderPass")
+
+        # Assign every active sampler to a distinct texture unit immediately.
+        # Otherwise optional samplers that are not rebound later (notably the
+        # 3D field texture when --no-field is active) keep GL's default unit 0.
+        # A sampler2DArray and sampler3D sharing one unit makes glDrawArrays
+        # fail with GL_INVALID_OPERATION even if the branch sampling the 3D
+        # texture is disabled by uFieldGain.
+        glUseProgram(self._prog)
+        if self._u_emit_uv != -1:
+            glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
+        if self._u_color_uv != -1:
+            glUniform1i(self._u_color_uv, self._uv_tex_unit_color)
+        if self._u_depth_uv != -1:
+            glUniform1i(self._u_depth_uv, self._uv_tex_unit_depth)
+        if self._u_remit_uv != -1:
+            glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
+        if self._u_field_vol != -1:
+            glUniform1i(self._u_field_vol, self._uv_tex_unit_field)
+        if self._u_field_gain != -1:
+            glUniform1f(self._u_field_gain, 0.0)
+        glUseProgram(0)
 
     def _build_ssbos(self) -> None:
         """Create and populate the three material SSBOs from the current database state."""
@@ -705,33 +727,33 @@ class BaseGLRenderer:
         # point the sampler uniform at that unit.  With the identity texel
         # this is a no-op for current callers; once a caller uploads a real
         # emission UV array the Stage 2 fragment math activates.
+        if self._u_emit_uv != -1:
+            glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
+        if self._u_color_uv != -1:
+            glUniform1i(self._u_color_uv, self._uv_tex_unit_color)
+        if self._u_depth_uv != -1:
+            glUniform1i(self._u_depth_uv, self._uv_tex_unit_depth)
+        if self._u_remit_uv != -1:
+            glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
+        if self._u_field_vol != -1:
+            glUniform1i(self._u_field_vol, self._uv_tex_unit_field)
         if self._tex_emit_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_emit)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_emit_uv)
-            if self._u_emit_uv != -1:
-                glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
         if self._tex_color_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_color)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_color_uv)
-            if self._u_color_uv != -1:
-                glUniform1i(self._u_color_uv, self._uv_tex_unit_color)
         if self._tex_depth_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_depth)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_depth_uv)
-            if self._u_depth_uv != -1:
-                glUniform1i(self._u_depth_uv, self._uv_tex_unit_depth)
         if self._tex_remit_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_remit)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_remit_uv)
-            if self._u_remit_uv != -1:
-                glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
         if self._tex_field_vol is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_field)
             glBindTexture(GL_TEXTURE_3D, self._tex_field_vol)
-            if self._u_field_vol != -1:
-                glUniform1i(self._u_field_vol, self._uv_tex_unit_field)
-            if self._u_field_gain != -1:
-                glUniform1f(self._u_field_gain, self._field_gain)
+        if self._u_field_gain != -1:
+            glUniform1f(self._u_field_gain, self._field_gain if self._tex_field_vol is not None else 0.0)
 
         # Upload uniforms
         if self._u_mvp != -1:
@@ -783,44 +805,64 @@ class BaseGLRenderer:
         for binding, buf_id in self._ssbo.items():
             glBindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, buf_id)
 
+        if self._u_emit_uv != -1:
+            glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
+        if self._u_color_uv != -1:
+            glUniform1i(self._u_color_uv, self._uv_tex_unit_color)
+        if self._u_depth_uv != -1:
+            glUniform1i(self._u_depth_uv, self._uv_tex_unit_depth)
+        if self._u_remit_uv != -1:
+            glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
+        if self._u_field_vol != -1:
+            glUniform1i(self._u_field_vol, self._uv_tex_unit_field)
         if self._tex_emit_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_emit)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_emit_uv)
-            if self._u_emit_uv != -1:
-                glUniform1i(self._u_emit_uv, self._uv_tex_unit_emit)
         if self._tex_color_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_color)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_color_uv)
-            if self._u_color_uv != -1:
-                glUniform1i(self._u_color_uv, self._uv_tex_unit_color)
         if self._tex_depth_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_depth)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_depth_uv)
-            if self._u_depth_uv != -1:
-                glUniform1i(self._u_depth_uv, self._uv_tex_unit_depth)
         if self._tex_remit_uv is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_remit)
             glBindTexture(GL_TEXTURE_2D_ARRAY, self._tex_remit_uv)
-            if self._u_remit_uv != -1:
-                glUniform1i(self._u_remit_uv, self._uv_tex_unit_remit)
         if self._tex_field_vol is not None:
             glActiveTexture(GL_TEXTURE0 + self._uv_tex_unit_field)
             glBindTexture(GL_TEXTURE_3D, self._tex_field_vol)
-            if self._u_field_vol != -1:
-                glUniform1i(self._u_field_vol, self._uv_tex_unit_field)
-            if self._u_field_gain != -1:
-                glUniform1f(self._u_field_gain, self._field_gain)
+        if self._u_field_gain != -1:
+            glUniform1f(self._u_field_gain, self._field_gain if self._tex_field_vol is not None else 0.0)
 
         self._upload_feature_toggles()
         self._upload_point_lights()
 
         glDisable(GL_CULL_FACE)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
 
         u_mvp = self._u_mvp
         u_mv  = self._u_mv
+        u_rp  = self._u_render_pass
         c_void_p = ctypes.c_void_p
+
+        # Pass 1 — opaque fragments (alpha >= 0.85): depth-write on, blend off
+        glDepthMask(GL_TRUE)
+        glDisable(GL_BLEND)
+        if u_rp != -1:
+            glUniform1i(u_rp, 1)
+        for entry in self._mesh_list:
+            vao, n_verts, mvp, mv = entry
+            if u_mvp != -1:
+                glUniformMatrix4fv(u_mvp, 1, GL_FALSE, mvp.ctypes.data_as(c_void_p))
+            if u_mv != -1:
+                glUniformMatrix4fv(u_mv, 1, GL_FALSE, mv.ctypes.data_as(c_void_p))
+            glBindVertexArray(vao)
+            glDrawArrays(GL_TRIANGLES, 0, n_verts)
+
+        # Pass 2 — transparent fragments (alpha < 0.85): depth-write off, blend on
+        glDepthMask(GL_FALSE)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        if u_rp != -1:
+            glUniform1i(u_rp, 2)
         for entry in self._mesh_list:
             vao, n_verts, mvp, mv = entry
             if u_mvp != -1:
@@ -831,7 +873,10 @@ class BaseGLRenderer:
             glDrawArrays(GL_TRIANGLES, 0, n_verts)
 
         glBindVertexArray(0)
+        glDepthMask(GL_TRUE)
         glDisable(GL_BLEND)
+        if u_rp != -1:
+            glUniform1i(u_rp, 0)  # reset so draw_mesh callers see uRenderPass=0 (draw all)
         glUseProgram(0)
 
         if self._auto_drain:

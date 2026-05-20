@@ -152,6 +152,24 @@ class ParametricSurface(ABC):
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 
+    def intersect_batch(
+        self,
+        ro: np.ndarray,
+        rd: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Vectorised intersect: ro/rd are (N,3) float64 in surface-local frame.
+
+        Returns (t, hit, normal) each shape (N,) or (N,3).
+        t[i]=inf on miss.  Default: scalar loop — override for speed.
+        """
+        N = len(ro)
+        t_arr   = np.empty(N, np.float64)
+        hit_arr = np.empty((N, 3), np.float64)
+        nrm_arr = np.empty((N, 3), np.float64)
+        for i in range(N):
+            t_arr[i], hit_arr[i], nrm_arr[i] = self.intersect(ro[i], rd[i])
+        return t_arr, hit_arr, nrm_arr
+
     def to_dict(self) -> dict:
         """Return a plain-Python dict for JSON / YAML serialisation."""
         raise NotImplementedError
@@ -194,6 +212,18 @@ class FlatSurface(ParametricSurface):
             return _INF, np.zeros(3), np.zeros(3)
         n = np.array([0., 0., 1. if dz < 0 else -1.], np.float64)
         return t, hit, n
+
+    def intersect_batch(self, ro, rd):
+        dz   = rd[:, 2]
+        safe = np.abs(dz) > 1e-12
+        t    = np.where(safe, (self.z_pos - ro[:, 2]) / np.where(safe, dz, 1.0), np.inf)
+        t    = np.where((t > 1e-9) & safe, t, np.inf)
+        hit  = ro + t[:, None] * rd
+        r2   = hit[:, 0] ** 2 + hit[:, 1] ** 2
+        t    = np.where(np.isfinite(t) & (r2 <= self.r_max ** 2) & (r2 >= self.r_min ** 2), t, np.inf)
+        nrm  = np.zeros_like(rd)
+        nrm[:, 2] = np.where(dz < 0, 1.0, -1.0)
+        return t, hit, nrm
 
     def glsl_intercept_fn(self, fn_name="surf_intercept") -> str:
         return f"""
@@ -264,6 +294,31 @@ class SphericalSurface(ParametricSurface):
         if np.dot(n, rd) > 0:
             n = -n
         return t, hit, n
+
+    def intersect_batch(self, ro, rd):
+        ctr  = np.array([0., 0., self.R], np.float64)
+        oc   = ro - ctr[None, :]
+        a    = np.sum(rd * rd, axis=1)
+        b    = 2.0 * np.sum(oc * rd, axis=1)
+        c    = np.sum(oc * oc, axis=1) - self.R ** 2
+        disc = b * b - 4 * a * c
+        sq   = np.sqrt(np.maximum(disc, 0.0))
+        t1   = (-b - sq) / (2 * a)
+        t2   = (-b + sq) / (2 * a)
+        h1   = ro + t1[:, None] * rd
+        h2   = ro + t2[:, None] * rd
+        r2_1 = h1[:, 0] ** 2 + h1[:, 1] ** 2
+        r2_2 = h2[:, 0] ** 2 + h2[:, 1] ** 2
+        rim2 = self.r_min ** 2
+        rox2 = self.r_max ** 2
+        ok1  = (disc >= 0) & (t1 > 1e-9) & (r2_1 >= rim2) & (r2_1 <= rox2)
+        ok2  = (disc >= 0) & (t2 > 1e-9) & (r2_2 >= rim2) & (r2_2 <= rox2)
+        t    = np.where(ok1, t1, np.where(ok2, t2, np.inf))
+        hit  = np.where(ok1[:, None], h1, np.where(ok2[:, None], h2, ro))
+        nrm  = (hit - ctr[None, :]) / abs(self.R)
+        flip = np.sum(nrm * rd, axis=1) > 0
+        nrm  = np.where(flip[:, None], -nrm, nrm)
+        return t, hit, nrm
 
     def glsl_intercept_fn(self, fn_name="surf_intercept") -> str:
         return f"""
@@ -382,6 +437,50 @@ class ConicSurface(ParametricSurface):
         if np.dot(n, rd) > 0:
             n = -n
         return t, hit, n
+
+    def intersect_batch(self, ro, rd):
+        K1   = 1.0 + self.K
+        A2   = K1 * (rd[:, 0] ** 2 + rd[:, 1] ** 2) + rd[:, 2] ** 2
+        B2   = 2 * (K1 * (ro[:, 0] * rd[:, 0] + ro[:, 1] * rd[:, 1])
+                    + ro[:, 2] * rd[:, 2] - self.R * rd[:, 2])
+        C2   = K1 * (ro[:, 0] ** 2 + ro[:, 1] ** 2) + ro[:, 2] ** 2 - 2 * self.R * ro[:, 2]
+        disc = B2 ** 2 - 4 * A2 * C2
+        ok_a = np.abs(A2) > 1e-30
+        sq   = np.sqrt(np.maximum(disc, 0.0))
+        denom = np.where(ok_a, 2 * A2, 1.0)
+        t1   = np.where(ok_a, (-B2 - sq) / denom, np.inf)
+        t2   = np.where(ok_a, (-B2 + sq) / denom, np.inf)
+        h1   = ro + t1[:, None] * rd
+        h2   = ro + t2[:, None] * rd
+        r2_1 = h1[:, 0] ** 2 + h1[:, 1] ** 2
+        r2_2 = h2[:, 0] ** 2 + h2[:, 1] ** 2
+        rim2 = self.r_min ** 2
+        rox2 = self.r_max ** 2
+        ok1  = ok_a & (disc >= 0) & (t1 > 1e-9) & (r2_1 >= rim2) & (r2_1 <= rox2)
+        ok2  = ok_a & (disc >= 0) & (t2 > 1e-9) & (r2_2 >= rim2) & (r2_2 <= rox2)
+        t    = np.where(ok1, t1, np.where(ok2, t2, np.inf))
+        # Newton refinement on finite-t rays
+        with np.errstate(invalid='ignore', divide='ignore'):
+            alive = np.isfinite(t)
+            for _ in range(3):
+                if not np.any(alive):
+                    break
+                h  = ro + t[:, None] * rd
+                F  = K1 * (h[:, 0] ** 2 + h[:, 1] ** 2) + h[:, 2] ** 2 - 2 * self.R * h[:, 2]
+                dF = 2 * (K1 * (h[:, 0] * rd[:, 0] + h[:, 1] * rd[:, 1])
+                          + h[:, 2] * rd[:, 2] - self.R * rd[:, 2])
+                safe_dF = np.abs(dF) > 1e-30
+                t = np.where(alive & safe_dF, t - F / np.where(safe_dF, dF, 1.0), t)
+            hit  = ro + t[:, None] * rd
+            nrm  = np.stack([2 * K1 * hit[:, 0],
+                             2 * K1 * hit[:, 1],
+                             2 * hit[:, 2] - 2 * self.R], axis=1)
+            nrm  = nrm / np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-30)
+        flip = np.sum(nrm * rd, axis=1) > 0
+        nrm  = np.where(flip[:, None], -nrm, nrm)
+        r2   = hit[:, 0] ** 2 + hit[:, 1] ** 2
+        t    = np.where(alive & (t > 1e-9) & (r2 >= rim2) & (r2 <= rox2), t, np.inf)
+        return t, hit, nrm
 
     def glsl_intercept_fn(self, fn_name="surf_intercept") -> str:
         return f"""

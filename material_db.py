@@ -330,6 +330,8 @@ def _fill_pbr(rec: PBRBaseRecord, mat: Any) -> None:
         rec.transmission = float(mat.transmission)
         rec.ior          = float(mat.ior)
         rec.opacity      = max(0.0, 1.0 - float(mat.transmission))
+        if getattr(mat, 'gl_opacity', None) is not None:
+            rec.opacity = float(mat.gl_opacity)
         e = mat.emission_rgb
         rec.emission[0], rec.emission[1], rec.emission[2] = float(e[0]), float(e[1]), float(e[2])
     else:

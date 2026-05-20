@@ -1063,6 +1063,59 @@ static inline bool apply_parametric_surface_point(
             dzdu = du_acc * inv_w;
             dzdv = dv_acc * inv_w;
         }
+    } else if (kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+        /* Exact conic surface refinement.
+         * Payload is float32; surface geometry in reserved header bytes:
+         *   p[11]=ROC  p[12]=conic_k  p[13]=axis_index  p[14]=r_out  p[15]=side
+         * axis_index: 0=X(scene), 2=Z(lens-design default). */
+        if (payload.size() < 16 * sizeof(float)) return false;
+        const float* pf = reinterpret_cast<const float*>(payload.data());
+        const double ROC    = (double)pf[11];
+        const double k_con  = (double)pf[12];
+        const int    ax_i   = (int)pf[13];   /* optical axis index */
+        const double r_out  = (double)pf[14];
+
+        /* Transverse component indices. */
+        const int ax = (ax_i >= 0 && ax_i <= 2) ? ax_i : 2;
+        const int t0 = (ax == 0) ? 1 : 0;
+        const int t1 = (ax == 2) ? 1 : 2;
+
+        const double pt0 = hit_pos[t0], pt1 = hit_pos[t1];
+        const double r2  = pt0*pt0 + pt1*pt1;
+        const double r   = std::sqrt(r2);
+        if (r_out > EPS && r > r_out) return false;
+
+        if (std::abs(ROC) < EPS) {
+            out_pos    = hit_pos;
+            out_normal = tri.normal;
+            return true;
+        }
+
+        const double c  = 1.0 / ROC;
+        const double c2 = c * c;
+        const double disc = 1.0 - (1.0 + k_con) * c2 * r2;
+        if (disc < EPS) { out_pos = hit_pos; out_normal = tri.normal; return true; }
+        const double sq   = std::sqrt(disc);
+        delta             = c * r2 / (1.0 + sq);
+        double d0 = 0.0, d1 = 0.0;  /* dz/dt0, dz/dt1 */
+        if (r > EPS) {
+            const double dsdr = c * r / sq;
+            d0 = dsdr * (pt0 / r);
+            d1 = dsdr * (pt1 / r);
+        }
+        /* Displace along optical axis; normal from Jacobian. */
+        V3d np = hit_pos;
+        np[ax] += delta;
+        out_pos = np;
+        V3d raw_n;
+        raw_n[ax] = 1.0;
+        raw_n[t0] = -d0;
+        raw_n[t1] = -d1;
+        if (raw_n.norm() > EPS) raw_n.normalize();
+        else raw_n = tri.normal;
+        if (raw_n.dot(tri.normal) < 0.0) raw_n = -raw_n;
+        out_normal = raw_n;
+        return true;
     } else {
         return false;
     }
@@ -1102,6 +1155,30 @@ static inline bool tri_param_kind_is_sdf(const int kind)
 {
     return kind == TRI_PARAM_SURFACE_SDF_SADDLE || kind == TRI_PARAM_SURFACE_SDF_SPHERE;
 }
+
+/* Return the parametric payload pointer + size for a neural-assembly triangle,
+ * or nullptr if the triangle does not belong to a NEURAL_ASSEMBLY group. */
+static inline const float* tri_neural_assembly_payload(
+    const RayTracerState& st, int tri_id, int* out_bytes)
+{
+    if (tri_id < 0 || (size_t)tri_id >= st.tri_param_group_of_tri.size()) return nullptr;
+    int gid = st.tri_param_group_of_tri[(size_t)tri_id];
+    if (gid < 0 || (size_t)gid >= st.tri_group_parametric_kind.size()) return nullptr;
+    if (st.tri_group_parametric_kind[(size_t)gid] != TRI_PARAM_SURFACE_NEURAL_ASSEMBLY)
+        return nullptr;
+    const auto& pb = st.tri_group_parametric_payload[(size_t)gid];
+    if (out_bytes) *out_bytes = (int)pb.size();
+    return reinterpret_cast<const float*>(pb.data());
+}
+
+/* apply_neural_mlp_from_f32 — inner MLP dispatch that works directly from a
+ * raw float32 payload pointer.  Called by both the scale-context path and the
+ * parametric surface hit path. */
+static inline void apply_neural_mlp_from_f32(
+    const RayTracerState& st,
+    const float* p, int payload_bytes,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len);
 
 static inline bool tri_requires_optical_sdf(const Triangle& tri)
 {
@@ -4874,6 +4951,20 @@ static int scheduler_advance_ray(
         V3d hit_n_geom = st.tris[static_cast<size_t>(hit_tri)].normal;
         V3d hit_pos = p1;
         apply_parametric_surface_point(st, hit_tri, hit_pos, hit_pos, hit_n_geom);
+        {
+            int nb = 0;
+            const float* nap = tri_neural_assembly_payload(st, hit_tri, &nb);
+            if (nap) {
+                pos = hit_pos;
+                apply_neural_mlp_from_f32(st, nap, nb, pos, dir, amp, &rs.path_len);
+                rs.pos[0] = pos.x(); rs.pos[1] = pos.y(); rs.pos[2] = pos.z();
+                rs.dir[0] = dir.x(); rs.dir[1] = dir.y(); rs.dir[2] = dir.z();
+                for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+                int new_ci = ctx_for_pos(st, pos);
+                rs.context_id = new_ci;
+                return new_ci;
+            }
+        }
         bool alive = apply_surface(st, amp, dir, hit_n_geom, hit_tri, rs.bounce, rng, U);
         if (!alive) {
             rs.alive = 0;
@@ -5150,9 +5241,10 @@ extern "C" SK_API int ray_tracer_register_tri_group(
     st->tri_group_parametric_payload.push_back(std::move(param_payload));
 
     if (desc->parametric_surface_kind != TRI_PARAM_SURFACE_NONE) {
+        const bool neural = (desc->parametric_surface_kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY);
         for (int t : st->tri_group_indices.back()) {
             if (t >= 0 && t < (int)st->tri_param_group_of_tri.size()
-                && st->tri_param_group_of_tri[(size_t)t] < 0)
+                && (st->tri_param_group_of_tri[(size_t)t] < 0 || neural))
                 st->tri_param_group_of_tri[(size_t)t] = copy.group_id;
         }
     }
@@ -5591,6 +5683,19 @@ static BounceStepResult ray_bounce_step_bdpt(
 
     if (amp_at_hit) *amp_at_hit = amp;  /* post-propagation, pre-reflection */
 
+    /* ─ Neural assembly surface dispatch ─ */
+    {
+        int nb = 0;
+        const float* nap = tri_neural_assembly_payload(st, res.hit_tri, &nb);
+        if (nap) {
+            pos = res.hit_pos;
+            apply_neural_mlp_from_f32(st, nap, nb, pos, dir, amp, &path_len);
+            res.hit_pos = pos;
+            res.should_continue = true;
+            return res;
+        }
+    }
+
     /* ─ Material consequence kernel ────────────────────────────────────────────
      * tri is the authoritative source for all flag queries. Classify the hit
      * surface first; terminal conditions (aperture stop, emissive) return before
@@ -6009,7 +6114,24 @@ extern "C" SK_API int ray_tracer_accumulate_endpoint_records_to_field_capture(
  *                     sensor_y.  V2 teleports the ray to just before the
  *                     baked sensor hit so the next BVH step can strike the
  *                     sensor without traversing the lens geometry again.
+ *
+ *   V3 header [0..15]: magic=14950, n_u, n_v, n_a, n_b,
+ *                      u_min, u_max, v_min, v_max,
+ *                      a_min, a_max, b_min, b_max, r_ap, axis_idx, reserved
+ *   V3 cells  [16..]: (n_v × n_u × n_b × n_a) × 7 floats — V1 fields, but
+ *                     angle-resolved by incoming transverse direction.
+ *
+ *   V4 header/cells: magic=14951, same as V3 but 9-float cells.  Header[15]
+ *                    stores the destination axis coordinate for teleport.
  */
+/* kill_ray_amplitudes — zero all band amplitudes so the tracer's min_amplitude
+ * check terminates this ray on the next step. */
+static inline void kill_ray_amplitudes(VXcd& amp)
+{
+    for (int b = 0; b < (int)amp.size(); ++b)
+        amp[b] = cd(0.0, 0.0);
+}
+
 static inline void apply_manifold_transfer(
     const RayTracerState& st,
     const RtScaleContext& ctx,
@@ -6021,33 +6143,69 @@ static inline void apply_manifold_transfer(
     if (ctx.payload_size_bytes < (int)(8 * sizeof(float))) return;
     const bool is_v1 = (p[0] == 14946.0f);
     const bool is_v2 = (p[0] == 14947.0f);
-    if (!is_v1 && !is_v2) return;   /* magic check */
+    const bool is_v3 = (p[0] == 14950.0f);
+    const bool is_v4 = (p[0] == 14951.0f);
+    if (!is_v1 && !is_v2 && !is_v3 && !is_v4) return;   /* magic check */
     if (is_v2 && ctx.payload_size_bytes < (int)(12 * sizeof(float))) return;
+    if ((is_v3 || is_v4) && ctx.payload_size_bytes < (int)(16 * sizeof(float))) return;
 
     const int   n_u   = (int)p[1];
     const int   n_v   = (int)p[2];
-    const float u_min = p[3], u_max = p[4];
-    const float v_min = p[5], v_max = p[6];
-    const float r_ap  = p[7];
+    const int   n_a   = (is_v3 || is_v4) ? (int)p[3] : 1;
+    const int   n_b   = (is_v3 || is_v4) ? (int)p[4] : 1;
+    const float u_min = (is_v3 || is_v4) ? p[5]  : p[3];
+    const float u_max = (is_v3 || is_v4) ? p[6]  : p[4];
+    const float v_min = (is_v3 || is_v4) ? p[7]  : p[5];
+    const float v_max = (is_v3 || is_v4) ? p[8]  : p[6];
+    const float a_min = (is_v3 || is_v4) ? p[9]  : 0.0f;
+    const float a_max = (is_v3 || is_v4) ? p[10] : 0.0f;
+    const float b_min = (is_v3 || is_v4) ? p[11] : 0.0f;
+    const float b_max = (is_v3 || is_v4) ? p[12] : 0.0f;
+    const float r_ap  = (is_v3 || is_v4) ? p[13] : p[7];
+    const int   axis_idx = (is_v3 || is_v4) ? (int)p[14] : 2;
     if (n_u <= 1 || n_v <= 1 || r_ap <= 0.0f) return;
+    if ((is_v3 || is_v4) && (n_a <= 1 || n_b <= 1)) return;
 
-    const int header_floats = is_v2 ? 12 : 8;
-    const int cell_stride   = is_v2 ? 9 : 7;
+    const int header_floats = (is_v3 || is_v4) ? 16 : (is_v2 ? 12 : 8);
+    const int cell_stride   = (is_v2 || is_v4) ? 9 : 7;
     const size_t need_floats = (size_t)header_floats
-        + (size_t)n_u * (size_t)n_v * (size_t)cell_stride;
+        + (size_t)n_u * (size_t)n_v * (size_t)n_a * (size_t)n_b * (size_t)cell_stride;
     if ((size_t)ctx.payload_size_bytes < need_floats * sizeof(float)) return;
 
-    /* Project ray onto aperture plane z = center_z */
-    const double cz = ctx.center[2];
-    const double dz = dir[2];
-    if (std::abs(dz) < 1e-12) return;
-    const double t  = (cz - pos[2]) / dz;
+    /* Project ray onto the LUT side plane. Legacy payloads use Z axis. */
+    const double denom = (axis_idx == 0) ? dir[0] : (axis_idx == 1 ? dir[1] : dir[2]);
+    if (std::abs(denom) < 1e-12) return;
+    const double plane = (axis_idx == 0) ? ctx.center[0] : (axis_idx == 1 ? ctx.center[1] : ctx.center[2]);
+    const double paxis = (axis_idx == 0) ? pos[0] : (axis_idx == 1 ? pos[1] : pos[2]);
+    const double t  = (plane - paxis) / denom;
     const V3d ap_hit = pos + t * dir;
 
-    /* Normalised aperture UV */
-    const float ap_u = (float)(ap_hit[0] / r_ap);
-    const float ap_v = (float)(ap_hit[1] / r_ap);
-    if (ap_u < u_min || ap_u > u_max || ap_v < v_min || ap_v > v_max) return;
+    /* Normalised aperture UV — rays outside the aperture are blocked. */
+    float ap_u = 0.0f, ap_v = 0.0f, ang_a = 0.0f, ang_b = 0.0f;
+    if (axis_idx == 0) {
+        ap_u = (float)(ap_hit[1] / r_ap);
+        ap_v = (float)(ap_hit[2] / r_ap);
+        ang_a = (float)dir[1];
+        ang_b = (float)dir[2];
+    } else if (axis_idx == 1) {
+        ap_u = (float)(ap_hit[0] / r_ap);
+        ap_v = (float)(ap_hit[2] / r_ap);
+        ang_a = (float)dir[0];
+        ang_b = (float)dir[2];
+    } else {
+        ap_u = (float)(ap_hit[0] / r_ap);
+        ap_v = (float)(ap_hit[1] / r_ap);
+        ang_a = (float)dir[0];
+        ang_b = (float)dir[1];
+    }
+    if (ap_u < u_min || ap_u > u_max || ap_v < v_min || ap_v > v_max) {
+        kill_ray_amplitudes(amp);
+        return;
+    }
+    if ((is_v3 || is_v4) && (ang_a < a_min || ang_a > a_max || ang_b < b_min || ang_b > b_max)) {
+        kill_ray_amplitudes(amp);
+        return;
+    }
 
     /* Continuous grid coordinates */
     const float fu  = (ap_u - u_min) / (u_max - u_min) * (float)(n_u - 1);
@@ -6056,43 +6214,80 @@ static inline void apply_manifold_transfer(
     const int   iv0 = std::max(0, std::min(n_v - 2, (int)fv));
     const float wu1 = fu - (float)iu0, wu0 = 1.0f - wu1;
     const float wv1 = fv - (float)iv0, wv0 = 1.0f - wv1;
+    float wa0 = 1.0f, wa1 = 0.0f, wb0 = 1.0f, wb1 = 0.0f;
+    int ia0 = 0, ib0 = 0;
+    if (is_v3 || is_v4) {
+        const float fa  = (ang_a - a_min) / (a_max - a_min) * (float)(n_a - 1);
+        const float fb  = (ang_b - b_min) / (b_max - b_min) * (float)(n_b - 1);
+        ia0 = std::max(0, std::min(n_a - 2, (int)fa));
+        ib0 = std::max(0, std::min(n_b - 2, (int)fb));
+        wa1 = fa - (float)ia0; wa0 = 1.0f - wa1;
+        wb1 = fb - (float)ib0; wb0 = 1.0f - wb1;
+    }
 
     const float* data = p + header_floats;
-    /* cell(iu, iv) → pointer to 7-float cell at row-major [iv * n_u + iu] */
-    auto cell = [&](int iu, int iv) -> const float* {
-        return data + ((size_t)iv * (size_t)n_u + (size_t)iu) * (size_t)cell_stride;
+    auto cell = [&](int iu, int iv, int ia, int ib) -> const float* {
+        const size_t idx = (((size_t)iv * (size_t)n_u + (size_t)iu)
+            * (size_t)n_b + (size_t)ib) * (size_t)n_a + (size_t)ia;
+        return data + idx * (size_t)cell_stride;
     };
 
     /* Bilinear blend of non-empty cells */
     float odx = 0.0f, ody = 0.0f, odz = 0.0f, opl = 0.0f, tot_w = 0.0f;
     float sx = 0.0f, sy = 0.0f;
-    auto blend = [&](int iu, int iv, float w) {
-        const float* c = cell(iu, iv);
+    auto blend = [&](int iu, int iv, int ia, int ib, float w) {
+        const float* c = cell(iu, iv, ia, ib);
         if (c[4] > 0.0f) {
             odx   += w * c[0];
             ody   += w * c[1];
             odz   += w * c[2];
             opl   += w * c[3];
-            if (is_v2) {
+            if (is_v2 || is_v4) {
                 sx += w * c[7];
                 sy += w * c[8];
             }
             tot_w += w;
         }
     };
-    blend(iu0,   iv0,   wu0 * wv0);
-    blend(iu0+1, iv0,   wu1 * wv0);
-    blend(iu0,   iv0+1, wu0 * wv1);
-    blend(iu0+1, iv0+1, wu1 * wv1);
-    if (tot_w < 1e-12f) return;
+    if (is_v3 || is_v4) {
+        blend(iu0,   iv0,   ia0,   ib0,   wu0 * wv0 * wa0 * wb0);
+        blend(iu0+1, iv0,   ia0,   ib0,   wu1 * wv0 * wa0 * wb0);
+        blend(iu0,   iv0+1, ia0,   ib0,   wu0 * wv1 * wa0 * wb0);
+        blend(iu0+1, iv0+1, ia0,   ib0,   wu1 * wv1 * wa0 * wb0);
+        blend(iu0,   iv0,   ia0+1, ib0,   wu0 * wv0 * wa1 * wb0);
+        blend(iu0+1, iv0,   ia0+1, ib0,   wu1 * wv0 * wa1 * wb0);
+        blend(iu0,   iv0+1, ia0+1, ib0,   wu0 * wv1 * wa1 * wb0);
+        blend(iu0+1, iv0+1, ia0+1, ib0,   wu1 * wv1 * wa1 * wb0);
+        blend(iu0,   iv0,   ia0,   ib0+1, wu0 * wv0 * wa0 * wb1);
+        blend(iu0+1, iv0,   ia0,   ib0+1, wu1 * wv0 * wa0 * wb1);
+        blend(iu0,   iv0+1, ia0,   ib0+1, wu0 * wv1 * wa0 * wb1);
+        blend(iu0+1, iv0+1, ia0,   ib0+1, wu1 * wv1 * wa0 * wb1);
+        blend(iu0,   iv0,   ia0+1, ib0+1, wu0 * wv0 * wa1 * wb1);
+        blend(iu0+1, iv0,   ia0+1, ib0+1, wu1 * wv0 * wa1 * wb1);
+        blend(iu0,   iv0+1, ia0+1, ib0+1, wu0 * wv1 * wa1 * wb1);
+        blend(iu0+1, iv0+1, ia0+1, ib0+1, wu1 * wv1 * wa1 * wb1);
+    } else {
+        blend(iu0,   iv0,   0, 0, wu0 * wv0);
+        blend(iu0+1, iv0,   0, 0, wu1 * wv0);
+        blend(iu0,   iv0+1, 0, 0, wu0 * wv1);
+        blend(iu0+1, iv0+1, 0, 0, wu1 * wv1);
+    }
+
+    /* Empty cell region — no baked data means the aperture blocks here. */
+    if (tot_w < 1e-12f) {
+        kill_ray_amplitudes(amp);
+        return;
+    }
 
     const float inv_w = 1.0f / tot_w;
     odx *= inv_w;  ody *= inv_w;  odz *= inv_w;
     opl *= inv_w;
     const float norm = std::sqrt(odx*odx + ody*ody + odz*odz);
-    if (norm < 1e-12f) return;
+    if (norm < 1e-12f) { kill_ray_amplitudes(amp); return; }
 
     if (opl > 0.0f) {
+        /* V2 bakes OPL from z_front_ref onward. If the context sphere entry
+         * precedes z_front_ref the difference is free-space air, so add it. */
         double skipped_opl_m = (double)opl;
         if (is_v2) {
             const double z_front_ref = (double)p[10];
@@ -6103,24 +6298,229 @@ static inline void apply_manifold_transfer(
         }
         const double c0 = (st.speed_m_s > EPS) ? st.speed_m_s : 299792458.0;
         for (int b = 0; b < st.n_bands; ++b) {
+            /* Phase only — atmo_abs does not apply inside the optical assembly. */
             const double phase = TWO_PI * st.freq_hz_vec[b] * skipped_opl_m / c0;
-            const double decay = std::exp(-st.atmo_abs[b] * skipped_opl_m);
-            amp[b] *= cd(decay * std::cos(phase), decay * std::sin(phase));
+            amp[b] *= cd(std::cos(phase), std::sin(phase));
         }
         if (path_len) *path_len += skipped_opl_m;
     }
 
     dir = V3d((double)(odx / norm), (double)(ody / norm), (double)(odz / norm));
-    if (is_v2) {
+    if (is_v2 || is_v4) {
         sx *= inv_w;
         sy *= inv_w;
-        const double z_sensor = (double)p[8];
-        V3d sensor_hit((double)sx, (double)sy, z_sensor);
+        const double sensor_axis = (is_v4 ? (double)p[15] : (double)p[8]);
+        V3d sensor_hit;
+        if (axis_idx == 0) sensor_hit = V3d(sensor_axis, (double)sx, (double)sy);
+        else if (axis_idx == 1) sensor_hit = V3d((double)sx, sensor_axis, (double)sy);
+        else sensor_hit = V3d((double)sx, (double)sy, sensor_axis);
         pos = sensor_hit - dir * (EPS * 200.0);
     } else {
-        /* V1: advance pos to aperture plane then apply baked exit direction. */
         pos = ap_hit;
     }
+}
+
+/* apply_neural_mlp_from_f32 — bidirectional surface-to-surface noodle manifold.
+ *
+ * Teleports any ray hitting a registered surface to the paired surface.
+ * Direction-agnostic: the ray continues in whatever axial direction it arrived from.
+ * p[15] side is kept for geometry registration only (which z is entry, which is exit).
+ *
+ * Payload layout (float32):
+ *   Header (16 floats):
+ *     [0]  14948.0    magic
+ *     [1]  n_layers   total layer count (hidden + output)
+ *     [2]  input_dim  must be 5
+ *     [3]  hidden_dim
+ *     [4]  output_dim must be 6
+ *     [5]  z_entry    this surface plane z (metres)
+ *     [6]  z_exit     destination surface plane z (metres)
+ *     [7..9] reserved
+ *     [10] r_lens     physical lens radius (0 = skip check)
+ *     [11] roc        (set by registration)
+ *     [12] k          (set by registration)
+ *     [13] axis_idx   0=X, 1=Y, 2=Z (default)
+ *     [14] r_out      (set by registration)
+ *     [15] side       0=forward/entry, 1=backward/exit
+ *
+ *   Normalization (22 floats, NORM_FLOATS = 5*2 + 6*2):
+ *     [16..20]  in_mean[5]
+ *     [21..25]  in_scale[5]
+ *     [26..31]  out_mean[6]
+ *     [32..37]  out_scale[6]
+ *
+ *   Layer data starting at [38] (LAYER_OFFSET = 38):
+ *     layer 0:      hidden_dim × input_dim  weights + hidden_dim bias
+ *     layer 1..n-2: hidden_dim × hidden_dim weights + hidden_dim bias
+ *     layer n-1:    output_dim × hidden_dim weights + output_dim bias
+ *
+ *   MLP inputs — entry-surface canonical frame (angles relative to theta_hit):
+ *     [0] r_in          radial hit distance (m)
+ *     [1] dir_r_in      radial direction component
+ *     [2] dir_phi_in    azimuthal direction component
+ *     [3] dir_z_in      axial direction, positive = into surface
+ *     [4] wavelength_um vacuum wavelength (µm)
+ *
+ *   MLP outputs — all relative to theta_hit:
+ *     [0] r_out         radial distance on exit surface (m)
+ *     [1] delta_phi     azimuth offset theta_out − theta_hit (rad)
+ *     [2] dir_r_out     radial direction at exit
+ *     [3] dir_phi_out   azimuthal direction at exit
+ *     [4] dir_z_out     axial direction at exit, positive = away from entry
+ *     [5] opl           optical path length entry→exit (m)
+ */
+static inline void apply_neural_mlp_from_f32(
+    const RayTracerState& st,
+    const float* p, int payload_bytes,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len)
+{
+    if (!p) return;
+    if (payload_bytes < (int)(38 * sizeof(float))) return;
+    if (p[0] != 14948.0f) return;
+
+    const int   n_layers  = (int)p[1];
+    const int   input_dim = (int)p[2];   /* must be 5 */
+    const int   hidden_dim= (int)p[3];
+    const int   output_dim= (int)p[4];   /* must be 6 */
+    const float z_exit    = p[6];
+
+    if (input_dim != 5 /* N_INPUTS=5 */ || output_dim != 6 /* N_OUTPUTS=6 */
+        || n_layers < 2 || hidden_dim < 1) return;
+
+    const int axis_idx = (int)p[13];
+    const int ax = (axis_idx >= 0 && axis_idx <= 2) ? axis_idx : 2;
+    const int t0 = (ax == 0) ? 1 : 0;
+    const int t1 = (ax == 2) ? 1 : 2;
+    /* Normalization block at [16..37] (HEADER_FLOATS=16, NORM_FLOATS=22). */
+    const float* in_mean  = p + 16;
+    const float* in_scale = p + 21;   /* in_mean + N_INPUTS=5 */
+    const float* out_mean = p + 26;   /* in_scale + N_INPUTS=5 */
+    const float* out_scl  = p + 32;   /* out_mean + N_OUTPUTS=6 */
+
+    const size_t min_layer_floats =
+        (size_t)hidden_dim * (size_t)input_dim  + (size_t)hidden_dim
+      + (size_t)output_dim * (size_t)hidden_dim + (size_t)output_dim;
+    if ((size_t)payload_bytes < 38u * sizeof(float)
+                              + min_layer_floats * sizeof(float))
+        return;
+
+    /* Entry-surface canonical frame: pos is already on the hit surface. */
+    const float x_hit     = (float)pos[t0];
+    const float y_hit     = (float)pos[t1];
+    const float theta_hit = std::atan2(y_hit, x_hit);
+    const float r_in      = std::hypot(x_hit, y_hit);
+    const float cos_t     = std::cos(theta_hit);
+    const float sin_t     = std::sin(theta_hit);
+
+    const float dx_in      = (float)dir[t0];
+    const float dy_in      = (float)dir[t1];
+    const float dir_r_in   =  dx_in * cos_t + dy_in * sin_t;
+    const float dir_phi_in = -dx_in * sin_t + dy_in * cos_t;
+    const float dir_z_in = std::abs((float)dir[ax]);
+    if (dir_z_in < 1e-9f) return;
+
+    const double c0 = (st.speed_m_s > EPS) ? st.speed_m_s : 299792458.0;
+
+    int    ref_band = -1;
+    double ref_ex = 0.0, ref_ey = 0.0;
+    double ref_dx = 0.0, ref_dy = 0.0, ref_dz = 0.0;
+    double ref_opl = 0.0;
+
+    float buf0[512], buf1[512];
+
+    for (int b = 0; b < st.n_bands; ++b) {
+        const double wavelength_um = (c0 / st.freq_hz_vec[b]) * 1.0e6;
+
+        const float raw_in[5] = {
+            r_in, dir_r_in, dir_phi_in, dir_z_in, (float)wavelength_um
+        };
+        for (int i = 0; i < 5 /* N_INPUTS=5 */; ++i) {
+            const float s = std::max(std::abs(in_scale[i]), 1e-12f);
+            buf0[i] = (raw_in[i] - in_mean[i]) / s;
+        }
+
+        /* Forward pass — LAYER_OFFSET = 38. */
+        const float* w_ptr = p + 38;
+        for (int l = 0; l < n_layers; ++l) {
+            const int in_d  = (l == 0)           ? input_dim  : hidden_dim;
+            const int out_d = (l == n_layers - 1) ? output_dim : hidden_dim;
+            const float* W  = w_ptr;
+            const float* bv = w_ptr + out_d * in_d;
+            w_ptr += out_d * in_d + out_d;
+            const bool relu = (l < n_layers - 1);
+            for (int j = 0; j < out_d; ++j) {
+                float acc = bv[j];
+                const float* row = W + j * in_d;
+                for (int i = 0; i < in_d; ++i)
+                    acc += row[i] * buf0[i];
+                buf1[j] = (relu && acc < 0.0f) ? 0.0f : acc;
+            }
+            for (int i = 0; i < out_d; ++i) buf0[i] = buf1[i];
+        }
+
+        /* Denormalize all 6 outputs. */
+        const float r_out       = buf0[0] * out_scl[0] + out_mean[0];
+        const float delta_phi   = buf0[1] * out_scl[1] + out_mean[1];
+        const float dir_r_out   = buf0[2] * out_scl[2] + out_mean[2];
+        const float dir_phi_out = buf0[3] * out_scl[3] + out_mean[3];
+        const float dir_z_out   = buf0[4] * out_scl[4] + out_mean[4];
+        const double opl        = (double)(buf0[5] * out_scl[5] + out_mean[5]);
+
+        /* Reconstruct exit position in Cartesian. */
+        const float theta_out = theta_hit + delta_phi;
+        const float ex        = r_out * std::cos(theta_out);
+        const float ey        = r_out * std::sin(theta_out);
+
+        float out_dx = dir_r_out * cos_t - dir_phi_out * sin_t;
+        float out_dy = dir_r_out * sin_t + dir_phi_out * cos_t;
+        float out_dz = dir_z_out;
+
+        const float dnorm = std::sqrt(out_dx*out_dx + out_dy*out_dy + out_dz*out_dz);
+        if (dnorm < 1e-12f) { amp[b] = cd(0.0, 0.0); continue; }
+        out_dx /= dnorm;  out_dy /= dnorm;  out_dz /= dnorm;
+
+        const double phase = TWO_PI * st.freq_hz_vec[b] * opl / c0;
+        amp[b] *= cd(std::cos(phase), std::sin(phase));
+
+        if (ref_band < 0 || b == 0) {
+            ref_band = b;
+            ref_ex  = (double)ex;    ref_ey  = (double)ey;
+            ref_dx  = (double)out_dx; ref_dy = (double)out_dy; ref_dz = (double)out_dz;
+            ref_opl = opl;
+        }
+    }
+
+    if (ref_band < 0) return;
+
+    if (path_len) *path_len += ref_opl;
+
+    const double rnorm = std::sqrt(ref_dx*ref_dx + ref_dy*ref_dy + ref_dz*ref_dz);
+    if (rnorm < 1e-12) { kill_ray_amplitudes(amp); return; }
+    V3d new_dir;
+    new_dir[ax] = ref_dz / rnorm;
+    new_dir[t0] = ref_dx / rnorm;
+    new_dir[t1] = ref_dy / rnorm;
+    V3d new_pos;
+    new_pos[ax] = (double)z_exit;
+    new_pos[t0] = ref_ex;
+    new_pos[t1] = ref_ey;
+    dir = new_dir;
+    pos = new_pos - dir * (EPS * 200.0);
+}
+
+/* Thin wrapper so the scale-context dispatch path keeps its original signature. */
+static inline void apply_neural_mlp_transfer(
+    const RayTracerState& st,
+    const RtScaleContext& ctx,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len)
+{
+    apply_neural_mlp_from_f32(
+        st,
+        static_cast<const float*>(ctx.payload),
+        ctx.payload_size_bytes,
+        pos, dir, amp, path_len);
 }
 
 static inline void apply_thin_lens_transform(
@@ -6208,7 +6608,10 @@ static inline uint32_t dispatch_scale_context_entry(
         case SCALE_CONTEXT_KIND_SPLINE_SURFACE:
             return 1u << SCALE_CONTEXT_KIND_SPLINE_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_SURFACE:
-            apply_manifold_transfer(st, ctx, pos, dir, amp, path_len);
+            if (ctx.payload && static_cast<const float*>(ctx.payload)[0] == 14948.0f)
+                apply_neural_mlp_transfer(st, ctx, pos, dir, amp, path_len);
+            else
+                apply_manifold_transfer(st, ctx, pos, dir, amp, path_len);
             return 1u << SCALE_CONTEXT_KIND_NEURAL_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC:
             return 1u << SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC;
@@ -6348,8 +6751,8 @@ public:
     /* Cached uniform locations — populated once after shader link */
     struct { GLint n_intents, n_bands, n_mats, n_arenas, n_tris, u_arenas; }
         uloc_t1 = {-1,-1,-1,-1,-1,-1};
-    struct { GLint n_tris, n_groups; }
-        uloc_t2 = {-1,-1};
+    struct { GLint n_tris, n_groups, n_bands, freq_hz; }
+        uloc_t2 = {-1,-1,-1,-1};
     struct { GLint n_bands, n_mats, max_children, max_children_per_hit,
                    sensor_res, sensor_pr, sensor_px,
                    n_uv_groups, uv_meta_base, rng_seed; }
@@ -6374,6 +6777,7 @@ public:
     GLuint ssbo_tri_param   = 0; /* per-tri parametric group id */
     GLuint ssbo_group_kind  = 0;
     GLuint ssbo_group_pay   = 0;
+    GLuint ssbo_neural_pay  = 0; /* concatenated neural MLP payloads (float32) */
     /* T3 output: child intents at [0..max_children*INTENT_STRIDE) and
      * terminal records at [max_children*INTENT_STRIDE..) packed in one SSBO */
     GLuint ssbo_child_int   = 0;
@@ -6424,6 +6828,10 @@ public:
     /* Number of parametric groups uploaded to GPU — 0 means T2 is a no-op */
     int n_param_groups = 0;
 
+    /* Total float count last uploaded to ssbo_neural_pay; used to skip
+     * re-uploading the large MLP weight buffer when payloads haven't changed. */
+    size_t neural_pay_floats_uploaded = 0;
+
     /* ── helpers ──────────────────────────────────────────────────────────── */
 
     static std::string resolve_shader(const std::string& dir, const std::string& name) {
@@ -6459,6 +6867,98 @@ public:
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
         glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, dst);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    }
+
+    /* Re-sync parametric SSBOs from current CPU state.
+     * Called once from upload_scene_data and again before every T2 dispatch so
+     * that clear_tri_groups() + re-registration (e.g. from _ensure_bdpt_plate_sensor_group)
+     * is always visible to the GPU without requiring a full scene re-upload.
+     * ssbo_neural_pay (large MLP weights) is skipped when the total payload float
+     * count hasn't changed, avoiding multi-MB PCIe transfers every batch. */
+    void upload_param_groups_data(const RayTracerState& st) {
+        const int nt = (int)st.tris.size();
+        const int ng = (int)st.tri_group_parametric_kind.size();
+        static constexpr int GPS = 16;
+
+        if (!st.tri_param_group_of_tri.empty()) {
+            upload_ssbo(ssbo_tri_param, st.tri_param_group_of_tri.data(),
+                        (GLsizeiptr)(nt * sizeof(int)));
+        } else {
+            std::vector<int> pg(nt, -1);
+            upload_ssbo(ssbo_tri_param, pg.data(), (GLsizeiptr)(nt * sizeof(int)));
+        }
+
+        if (ng > 0) {
+            upload_ssbo(ssbo_group_kind, st.tri_group_parametric_kind.data(),
+                        (GLsizeiptr)(ng * sizeof(int)));
+
+            /* Build neural payload offset table and measure total size. */
+            std::vector<int> neural_pay_off(static_cast<size_t>(ng), -1);
+            size_t total_nf = 0;
+            for (int gi = 0; gi < ng; ++gi) {
+                if (st.tri_group_parametric_kind[static_cast<size_t>(gi)]
+                        == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+                    const auto& pb = st.tri_group_parametric_payload[static_cast<size_t>(gi)];
+                    if (!pb.empty()) {
+                        neural_pay_off[static_cast<size_t>(gi)] = static_cast<int>(total_nf);
+                        total_nf += pb.size() / sizeof(float);
+                    }
+                }
+            }
+
+            /* Only re-upload the large MLP weight buffer when payload content changed. */
+            if (total_nf != neural_pay_floats_uploaded) {
+                std::vector<float> neural_pay_buf;
+                neural_pay_buf.reserve(total_nf);
+                for (int gi = 0; gi < ng; ++gi) {
+                    if (st.tri_group_parametric_kind[static_cast<size_t>(gi)]
+                            == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+                        const auto& pb = st.tri_group_parametric_payload[static_cast<size_t>(gi)];
+                        if (!pb.empty()) {
+                            const float* src = reinterpret_cast<const float*>(pb.data());
+                            int nf = static_cast<int>(pb.size() / sizeof(float));
+                            neural_pay_buf.insert(neural_pay_buf.end(), src, src + nf);
+                        }
+                    }
+                }
+                if (!neural_pay_buf.empty())
+                    upload_ssbo(ssbo_neural_pay, neural_pay_buf.data(),
+                                (GLsizeiptr)(neural_pay_buf.size() * sizeof(float)));
+                else {
+                    float stub = 0.f;
+                    upload_ssbo(ssbo_neural_pay, &stub, sizeof(float));
+                }
+                neural_pay_floats_uploaded = total_nf;
+            }
+
+            /* Build group_pay: small inline payload or neural offset. */
+            std::vector<float> pay(static_cast<size_t>(ng) * GPS, 0.0f);
+            for (int gi = 0; gi < ng; ++gi) {
+                int kind = st.tri_group_parametric_kind[static_cast<size_t>(gi)];
+                const auto& pb = st.tri_group_parametric_payload[static_cast<size_t>(gi)];
+                float* dst = pay.data() + gi * GPS;
+                if (kind == TRI_PARAM_SURFACE_POLY_BARY && pb.size() >= 6 * sizeof(double)) {
+                    const double* src = reinterpret_cast<const double*>(pb.data());
+                    for (int i = 0; i < 6; ++i) dst[i] = (float)src[i];
+                } else if (kind == TRI_PARAM_SURFACE_SDF_SPHERE && pb.size() >= sizeof(double)) {
+                    dst[0] = (float)(*reinterpret_cast<const double*>(pb.data()));
+                } else if (kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+                    int off = neural_pay_off[static_cast<size_t>(gi)];
+                    std::memcpy(dst, &off, sizeof(int));
+                }
+            }
+            upload_ssbo(ssbo_group_pay, pay.data(),
+                        (GLsizeiptr)(ng * GPS * sizeof(float)));
+            n_param_groups = ng;
+        } else {
+            int   stub_i = 0;    upload_ssbo(ssbo_group_kind,  &stub_i, sizeof(int));
+            float stub_f = 0.f;  upload_ssbo(ssbo_group_pay,   &stub_f, sizeof(float));
+            if (neural_pay_floats_uploaded != 0) {
+                upload_ssbo(ssbo_neural_pay, &stub_f, sizeof(float));
+                neural_pay_floats_uploaded = 0;
+            }
+            n_param_groups = 0;
+        }
     }
 
     /* ── init ──────────────────────────────────────────────────────────────────── */
@@ -6535,6 +7035,8 @@ public:
 
         uloc_t2.n_tris    = glc_GetUniformLocation(prog_t2, "n_tris");
         uloc_t2.n_groups  = glc_GetUniformLocation(prog_t2, "n_groups");
+        uloc_t2.n_bands   = glc_GetUniformLocation(prog_t2, "n_bands");
+        uloc_t2.freq_hz   = glc_GetUniformLocation(prog_t2, "freq_hz");
 
         uloc_t3.n_bands              = glc_GetUniformLocation(prog_t3, "n_bands");
         uloc_t3.n_mats               = glc_GetUniformLocation(prog_t3, "n_mats");
@@ -6643,48 +7145,10 @@ public:
         }
         /* TriSensorGroupBuf removed — T1 shader no longer has that binding. */
 
-        /* Parametric group data — tri→group map and per-group kind+payload.
-         * CPU stores payloads as double arrays; GPU T2 shader uses float[16]. */
-        {
-            const int nt = (int)st.tris.size();
-            const int ng = (int)st.tri_group_parametric_kind.size();
-
-            if (!st.tri_param_group_of_tri.empty()) {
-                upload_ssbo(ssbo_tri_param, st.tri_param_group_of_tri.data(),
-                            (GLsizeiptr)(nt * sizeof(int)));
-            } else {
-                std::vector<int> pg(nt, -1);
-                upload_ssbo(ssbo_tri_param, pg.data(), (GLsizeiptr)(nt * sizeof(int)));
-            }
-
-            if (ng > 0) {
-                upload_ssbo(ssbo_group_kind, st.tri_group_parametric_kind.data(),
-                            (GLsizeiptr)(ng * sizeof(int)));
-                static constexpr int GPS = 16; /* GROUP_PAYLOAD_STRIDE */
-                std::vector<float> pay(static_cast<size_t>(ng) * GPS, 0.0f);
-                for (int gi = 0; gi < ng; ++gi) {
-                    int kind = st.tri_group_parametric_kind[static_cast<size_t>(gi)];
-                    const auto& pb = st.tri_group_parametric_payload[static_cast<size_t>(gi)];
-                    float* dst = pay.data() + gi * GPS;
-                    if (kind == TRI_PARAM_SURFACE_POLY_BARY
-                            && pb.size() >= 6 * sizeof(double)) {
-                        const double* src = reinterpret_cast<const double*>(pb.data());
-                        for (int i = 0; i < 6; ++i) dst[i] = (float)src[i];
-                    } else if (kind == TRI_PARAM_SURFACE_SDF_SPHERE
-                            && pb.size() >= sizeof(double)) {
-                        dst[0] = (float)(*reinterpret_cast<const double*>(pb.data()));
-                    }
-                    /* SDF_SADDLE (kind=2): GPU falls back to CPU via counter[3]; no payload needed */
-                }
-                upload_ssbo(ssbo_group_pay, pay.data(),
-                            (GLsizeiptr)(ng * GPS * sizeof(float)));
-                n_param_groups = ng;
-            } else {
-                int stub_i = 0;    upload_ssbo(ssbo_group_kind, &stub_i, sizeof(int));
-                float stub_f = 0.f; upload_ssbo(ssbo_group_pay, &stub_f, sizeof(float));
-                n_param_groups = 0;
-            }
-        }
+        /* Parametric group data — initial upload via shared helper.
+         * The helper is also called before every T2 dispatch to re-sync after
+         * clear_tri_groups() + re-registration (see dispatch_t1_t2_t3). */
+        upload_param_groups_data(st);
 
         /* Counter SSBO: 8 uints — allocate once, zeroed on each dispatch */
         ensure_ssbo(ssbo_counter, 8 * sizeof(uint32_t));
@@ -6977,8 +7441,13 @@ public:
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         /* ── T2 dispatch (in-place on ssbo_hit) ─────────────────────────═
-         * Dispatched on the input batch size (worst case = all hits).
-         * Invocations beyond the actual hit count early-return via the
+         * Re-sync parametric SSBOs from current CPU state before every T2 dispatch.
+         * This keeps GPU data consistent after clear_tri_groups() + re-registration
+         * (e.g. from _ensure_bdpt_plate_sensor_group) which happens while the scene
+         * is already uploaded.  ssbo_neural_pay is skipped when payload hasn't changed. */
+        upload_param_groups_data(st);
+
+        /* Invocations beyond the actual hit count early-return via the
          * counters[0] guard inside the shader — no CPU sync needed between stages. */
         if (n_param_groups > 0) {
             /* Reset counter[3] (cpu_refine count for SDF_SADDLE fallbacks) */
@@ -6992,9 +7461,18 @@ public:
             bind_ssbo(ssbo_hit,        0); bind_ssbo(ssbo_tri_full,  1);
             bind_ssbo(ssbo_tri_param,  2); bind_ssbo(ssbo_group_kind,3);
             bind_ssbo(ssbo_group_pay,  4); bind_ssbo(ssbo_counter,   5);
+            bind_ssbo(ssbo_neural_pay, 6);
             /* n_hits uniform removed — shader reads counters[0] from SSBO */
             glc_Uniform1i(uloc_t2.n_tris,   nt);
             glc_Uniform1i(uloc_t2.n_groups, n_param_groups);
+            glc_Uniform1i(uloc_t2.n_bands,  nb);
+            if (uloc_t2.freq_hz >= 0) {
+                float fhz[16] = {};
+                const int nbf = std::min(nb, 16);
+                for (int i = 0; i < nbf; ++i)
+                    fhz[i] = (float)st.freq_hz_vec[i];
+                glc_Uniform1fv(uloc_t2.freq_hz, 16, fhz);
+            }
             glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
             glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         }

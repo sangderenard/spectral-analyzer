@@ -1728,8 +1728,9 @@ struct PyRayTracer
 
     /* Slim drain: returns only the 7 arrays needed by the voxel accumulator.
      * Allocates ~5× less memory than drain_records() per call.
-     * Keys: kind (uint8), bounce (int32), seg_start (N,3 f32),
-     *       pos (N,3 f32), color_flag (uint8), amp_re (N,n_bands f32), amp_im. */
+     * Keys: kind (uint8), tag (uint64), bounce (int32), seg_start (N,3 f32),
+     *       pos (N,3 f32), color_flag (uint8), hit_tri (int32), mat_idx (int32),
+     *       amp_re (N,n_bands f32), amp_im. */
     py::dict drain_records_slim(int max_n = 50000)
     {
         const int nb = _n_bands;
@@ -1742,28 +1743,37 @@ struct PyRayTracer
         const int N = static_cast<int>(recs.size());
 
         py::array_t<uint8_t> kind_arr(N);
+        py::array_t<uint64_t> tag_arr(N);
         py::array_t<int32_t> bounce_arr(N);
         py::array_t<float>   seg_start_arr({(py::ssize_t)N, (py::ssize_t)3});
         py::array_t<float>   pos_arr      ({(py::ssize_t)N, (py::ssize_t)3});
         py::array_t<uint8_t> color_flag_arr(N);
+        py::array_t<int32_t> hit_tri_arr(N);
+        py::array_t<int32_t> mat_idx_arr(N);
         py::array_t<float>   amp_re_arr({(py::ssize_t)N, (py::ssize_t)nb});
         py::array_t<float>   amp_im_arr({(py::ssize_t)N, (py::ssize_t)nb});
 
         if (N > 0) {
             auto* k  = kind_arr      .mutable_data();
+            auto* tg = tag_arr       .mutable_data();
             auto* bo = bounce_arr    .mutable_data();
             auto* ss = seg_start_arr .mutable_data();
             auto* po = pos_arr       .mutable_data();
             auto* cf = color_flag_arr.mutable_data();
+            auto* ht = hit_tri_arr   .mutable_data();
+            auto* mi = mat_idx_arr   .mutable_data();
             auto* re = amp_re_arr    .mutable_data();
             auto* im = amp_im_arr    .mutable_data();
             for (int i = 0; i < N; ++i) {
                 const RayRecord& r = recs[i];
                 k[i]  = static_cast<uint8_t>(r.kind);
+                tg[i] = r.tag;
                 bo[i] = r.bounce;
                 ss[i*3+0]=r.seg_start[0]; ss[i*3+1]=r.seg_start[1]; ss[i*3+2]=r.seg_start[2];
                 po[i*3+0]=r.pos[0];       po[i*3+1]=r.pos[1];       po[i*3+2]=r.pos[2];
                 cf[i] = r.color_flag;
+                ht[i] = r.hit_tri;
+                mi[i] = r.mat_idx;
                 const int cap = std::min((int)r.n_bands, nb);
                 for (int b = 0;   b < cap; ++b) { re[i*nb+b]=r.amp_re[b]; im[i*nb+b]=r.amp_im[b]; }
                 for (int b = cap; b < nb;  ++b) { re[i*nb+b]=0.f;         im[i*nb+b]=0.f; }
@@ -1771,10 +1781,13 @@ struct PyRayTracer
         }
         py::dict out;
         out["kind"]       = kind_arr;
+        out["tag"]        = tag_arr;
         out["bounce"]     = bounce_arr;
         out["seg_start"]  = seg_start_arr;
         out["pos"]        = pos_arr;
         out["color_flag"] = color_flag_arr;
+        out["hit_tri"]    = hit_tri_arr;
+        out["mat_idx"]    = mat_idx_arr;
         out["amp_re"]     = amp_re_arr;
         out["amp_im"]     = amp_im_arr;
         return out;
@@ -5357,11 +5370,21 @@ Returns : (n_written, n_live) — segments written and rays still alive
                   *   SDF_SPHERE  -> 2 (radius_m, neighborhood_margin_uv)
                   */
                  py::array_t<double, py::array::c_style | py::array::forcecast> param_arr;
+                 py::array_t<float,  py::array::c_style | py::array::forcecast> param_arr_f32;
                  if (!parametric_surface.is_none()) {
                      py::dict d = parametric_surface.cast<py::dict>();
                      desc.parametric_surface_kind =
                          d.contains("kind") ? d["kind"].cast<int>() : TRI_PARAM_SURFACE_NONE;
-                     if (d.contains("coeffs") && desc.parametric_surface_kind != TRI_PARAM_SURFACE_NONE) {
+                     if (d.contains("payload_f32") && desc.parametric_surface_kind != TRI_PARAM_SURFACE_NONE) {
+                         /* float32 payload — used by NEURAL_ASSEMBLY; avoids float64 conversion */
+                         param_arr_f32 = d["payload_f32"].cast<
+                             py::array_t<float, py::array::c_style | py::array::forcecast>>();
+                         auto pa = param_arr_f32.request();
+                         if (pa.ndim != 1)
+                             throw std::runtime_error("parametric_surface.payload_f32 must be 1-D float32");
+                         desc.parametric_payload = pa.ptr;
+                         desc.parametric_payload_bytes = (int)(pa.size * pa.itemsize);
+                     } else if (d.contains("coeffs") && desc.parametric_surface_kind != TRI_PARAM_SURFACE_NONE) {
                          param_arr = d["coeffs"].cast<
                              py::array_t<double, py::array::c_style | py::array::forcecast>>();
                          auto pa = param_arr.request();
@@ -6553,10 +6576,12 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("TRI_GROUP_SAMPLE_AREA")       = (int)TRI_GROUP_SAMPLE_AREA;
     m.attr("TRI_GROUP_SAMPLE_POWER")      = (int)TRI_GROUP_SAMPLE_POWER;
     m.attr("TRI_GROUP_SAMPLE_PIXEL_CONE") = (int)TRI_GROUP_SAMPLE_PIXEL_CONE;
-    m.attr("TRI_PARAM_SURFACE_NONE")      = (int)TRI_PARAM_SURFACE_NONE;
-    m.attr("TRI_PARAM_SURFACE_POLY_BARY") = (int)TRI_PARAM_SURFACE_POLY_BARY;
-    m.attr("TRI_PARAM_SURFACE_SDF_SADDLE") = (int)TRI_PARAM_SURFACE_SDF_SADDLE;
-    m.attr("TRI_PARAM_SURFACE_SDF_SPHERE") = (int)TRI_PARAM_SURFACE_SDF_SPHERE;
+    m.attr("TRI_PARAM_SURFACE_NONE")             = (int)TRI_PARAM_SURFACE_NONE;
+    m.attr("TRI_PARAM_SURFACE_POLY_BARY")        = (int)TRI_PARAM_SURFACE_POLY_BARY;
+    m.attr("TRI_PARAM_SURFACE_SDF_SADDLE")       = (int)TRI_PARAM_SURFACE_SDF_SADDLE;
+    m.attr("TRI_PARAM_SURFACE_SDF_SPHERE")       = (int)TRI_PARAM_SURFACE_SDF_SPHERE;
+    m.attr("TRI_PARAM_SURFACE_NEURAL_ASSEMBLY")  = (int)TRI_PARAM_SURFACE_NEURAL_ASSEMBLY;
+    m.attr("TRI_PARAM_SURFACE_PARAMETRIC_LENS")  = (int)TRI_PARAM_SURFACE_PARAMETRIC_LENS;
 
     /* ── Surface spline fitter ──────────────────────────────────────────────── */
     m.def("surface_spline_fit",

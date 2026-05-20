@@ -634,6 +634,7 @@ class Material:
     transmission:        float = 0.0
     normal_map:    Optional[str] = None
     albedo_texture:Optional[str] = None
+    gl_opacity:    Optional[float] = None  # GL visual alpha; overrides 1-transmission
 
     # Spectral description
     spectral_bands:    list                        = field(default_factory=list)

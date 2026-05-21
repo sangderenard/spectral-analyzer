@@ -309,6 +309,43 @@ def train(
     return model, norm
 
 
+def train_from_array(
+    data:       np.ndarray,
+    epochs:     int   = 60,
+    batch_size: int   = 8192,
+    lr:         float = 1e-3,
+    hidden_dim: int   = 256,
+    n_hidden:   int   = 4,
+    max_rows:   Optional[int] = None,
+    device:     Optional[str] = None,
+    verbose:    bool  = True,
+) -> tuple["NeuralAssemblyMLP", NormStats]:
+    """Train forward MLP from an in-memory (N, 11) float32 noodle array.
+
+    Identical to train() but takes a numpy array instead of a file path,
+    so the progressive bake loop can train without touching the filesystem.
+    """
+    if not _TORCH_OK:
+        raise ImportError("torch is required for training")
+    dev  = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    data = np.asarray(data, dtype=np.float32)
+    if max_rows is not None and len(data) > max_rows:
+        idx = np.random.default_rng(0).choice(len(data), max_rows, replace=False)
+        idx.sort()
+        data = data[idx]
+    if verbose:
+        print(f"[neural_assembly.train_from_array] {len(data):,} rows  device={dev}",
+              flush=True)
+    norm  = NormStats.from_data(data)
+    X     = torch.tensor((data[:, :N_INPUTS] - norm.in_mean) / norm.in_scale, dtype=torch.float32)
+    Y_raw = torch.tensor(data[:, N_INPUTS:N_INPUTS + N_OUTPUTS], dtype=torch.float32)
+    Y_norm = norm.normalize_outputs_inplace(Y_raw)
+    model = NeuralAssemblyMLP(hidden_dim=hidden_dim, n_hidden=n_hidden).to(dev)
+    _run_training_loop(X, Y_norm, model, epochs, batch_size, lr, verbose,
+                       "neural_assembly.train_from_array")
+    return model, norm
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

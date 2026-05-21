@@ -229,6 +229,7 @@ struct RayRecord {
     float         path_len          = 0.f; /* cumulative path length at hit     */
     float         path_at_seg_start = 0.f;
     int32_t       hit_tri           = -1;
+    int32_t       hit_group_id      = -1;  /* tri_param_group_of_tri[hit_tri], or -1 */
     int32_t       mat_idx           = -1;
     float         bary_u            = 0.f; /* Möller–Trumbore u at hit (STRIKE) */
     float         bary_v            = 0.f; /* Möller–Trumbore v at hit (STRIKE) */

@@ -1410,6 +1410,72 @@ SK_API int ray_tracer_clear_group_uv_accum(
     RayTracerState* st,
     int             group_id);
 
+/**
+ * Update the per-band emission power of an already-registered EMISSIVE group.
+ *
+ * This is the primary mechanism for surrogate emitters whose power is
+ * determined by an external solver (BPM wave tube, neural network, measured
+ * radiance) rather than a fixed material property.  Safe to call between
+ * tracing passes; never safe to call concurrently with an active trace.
+ *
+ * group_id       — as returned by ray_tracer_register_tri_group()
+ * power_W_per_band — float32 array of length n_bands; caller-owned
+ * n_bands        — must match the tracer's n_bands
+ */
+SK_API int ray_tracer_set_tri_group_power(
+    RayTracerState* st,
+    int             group_id,
+    const float*    power_W_per_band,
+    int             n_bands);
+
+/* ── BSSRDF per-triangle illumination accumulator ────────────────────────────
+ * Forward paths that hit a diffuse-transmissive surface (diffuse_frac > 0)
+ * accumulate their pre-interaction amplitude here.  Backward paths query this
+ * accumulator to analytically claim their diffuse illumination contribution
+ * without traversing the scatter volume via Monte Carlo.
+ *
+ * Two-pass protocol:
+ *   1. ray_tracer_init_illum_accum()   — after geometry is set; sizes + zeros.
+ *   2. ray_tracer_reset_illum_accum()  — between batches (keeps allocation).
+ *   3. Run forward tracing pass.
+ *   4. Run backward tracing pass (reads the now-populated accumulator).
+ *   5. ray_tracer_export_illum_accum() — optional GPU SSBO / Python inspection.
+ *
+ * BPM wave solver seeding (optional, wave-domain alternative to Monte Carlo):
+ *   After T4 BPM propagates the emitter field through a diffusing volume,
+ *   write the exit-plane amplitude directly into the accumulator via
+ *   ray_tracer_export_illum_accum() + modify + set_illum_accum() (TBD).
+ *   Backward rays then receive diffraction-correct illumination automatically.
+ */
+SK_API int ray_tracer_init_illum_accum(RayTracerState* st);
+SK_API int ray_tracer_reset_illum_accum(RayTracerState* st);
+SK_API int ray_tracer_export_illum_accum(
+    const RayTracerState* st,
+    float*                buf,       /* out: float32[n_tris * stride]; NULL = query */
+    int                   buf_floats,
+    int*                  out_n_tris,
+    int*                  out_stride); /* stride = 2*n_bands + 2 */
+
+/* Write BPM-computed complex amplitudes directly into tri_illum_accum for
+ * the specified triangles, replacing any Monte Carlo data already there.
+ * After this call backward rays at those triangles receive diffraction-correct
+ * BPM illumination instead of a Monte Carlo average.
+ *
+ *   tri_ids  : (n_tris,) int32  — triangle indices
+ *   amp_re   : (n_tris, n_bands) float32 row-major — real part of field amplitude
+ *   amp_im   : (n_tris, n_bands) float32 row-major — imaginary part
+ *   cos_avg  : (n_tris,) float32 — mean |cos θ| of incidence (use 1.0 for normal incidence)
+ *   n_bands  : number of spectral bands in amp_re / amp_im
+ */
+SK_API int ray_tracer_write_tri_illum(
+    RayTracerState* st,
+    const int*      tri_ids,
+    int             n_tris,
+    const float*    amp_re,
+    const float*    amp_im,
+    const float*    cos_avg,
+    int             n_bands);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

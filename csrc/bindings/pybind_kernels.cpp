@@ -1749,21 +1749,23 @@ struct PyRayTracer
         py::array_t<float>   pos_arr      ({(py::ssize_t)N, (py::ssize_t)3});
         py::array_t<uint8_t> color_flag_arr(N);
         py::array_t<int32_t> hit_tri_arr(N);
+        py::array_t<int32_t> hit_group_id_arr(N);
         py::array_t<int32_t> mat_idx_arr(N);
         py::array_t<float>   amp_re_arr({(py::ssize_t)N, (py::ssize_t)nb});
         py::array_t<float>   amp_im_arr({(py::ssize_t)N, (py::ssize_t)nb});
 
         if (N > 0) {
-            auto* k  = kind_arr      .mutable_data();
-            auto* tg = tag_arr       .mutable_data();
-            auto* bo = bounce_arr    .mutable_data();
-            auto* ss = seg_start_arr .mutable_data();
-            auto* po = pos_arr       .mutable_data();
-            auto* cf = color_flag_arr.mutable_data();
-            auto* ht = hit_tri_arr   .mutable_data();
-            auto* mi = mat_idx_arr   .mutable_data();
-            auto* re = amp_re_arr    .mutable_data();
-            auto* im = amp_im_arr    .mutable_data();
+            auto* k  = kind_arr       .mutable_data();
+            auto* tg = tag_arr        .mutable_data();
+            auto* bo = bounce_arr     .mutable_data();
+            auto* ss = seg_start_arr  .mutable_data();
+            auto* po = pos_arr        .mutable_data();
+            auto* cf = color_flag_arr .mutable_data();
+            auto* ht = hit_tri_arr    .mutable_data();
+            auto* hg = hit_group_id_arr.mutable_data();
+            auto* mi = mat_idx_arr    .mutable_data();
+            auto* re = amp_re_arr     .mutable_data();
+            auto* im = amp_im_arr     .mutable_data();
             for (int i = 0; i < N; ++i) {
                 const RayRecord& r = recs[i];
                 k[i]  = static_cast<uint8_t>(r.kind);
@@ -1773,6 +1775,7 @@ struct PyRayTracer
                 po[i*3+0]=r.pos[0];       po[i*3+1]=r.pos[1];       po[i*3+2]=r.pos[2];
                 cf[i] = r.color_flag;
                 ht[i] = r.hit_tri;
+                hg[i] = r.hit_group_id;
                 mi[i] = r.mat_idx;
                 const int cap = std::min((int)r.n_bands, nb);
                 for (int b = 0;   b < cap; ++b) { re[i*nb+b]=r.amp_re[b]; im[i*nb+b]=r.amp_im[b]; }
@@ -1780,16 +1783,17 @@ struct PyRayTracer
             }
         }
         py::dict out;
-        out["kind"]       = kind_arr;
-        out["tag"]        = tag_arr;
-        out["bounce"]     = bounce_arr;
-        out["seg_start"]  = seg_start_arr;
-        out["pos"]        = pos_arr;
-        out["color_flag"] = color_flag_arr;
-        out["hit_tri"]    = hit_tri_arr;
-        out["mat_idx"]    = mat_idx_arr;
-        out["amp_re"]     = amp_re_arr;
-        out["amp_im"]     = amp_im_arr;
+        out["kind"]        = kind_arr;
+        out["tag"]         = tag_arr;
+        out["bounce"]      = bounce_arr;
+        out["seg_start"]   = seg_start_arr;
+        out["pos"]         = pos_arr;
+        out["color_flag"]  = color_flag_arr;
+        out["hit_tri"]     = hit_tri_arr;
+        out["hit_group_id"]= hit_group_id_arr;
+        out["mat_idx"]     = mat_idx_arr;
+        out["amp_re"]      = amp_re_arr;
+        out["amp_im"]      = amp_im_arr;
         return out;
     }
 
@@ -5522,6 +5526,29 @@ Returns assigned group_id (>= 0).  Raises on failure.
 )doc")
         .def("clear_tri_groups",
              [](PyRayTracer& self) { ray_tracer_clear_tri_groups(self.handle); })
+        .def("set_tri_group_power",
+             [](PyRayTracer& self, int group_id,
+                py::array_t<float, py::array::c_style | py::array::forcecast> power_arr) {
+                 auto b = power_arr.request();
+                 int rc = ray_tracer_set_tri_group_power(
+                     self.handle, group_id,
+                     static_cast<const float*>(b.ptr),
+                     static_cast<int>(b.size));
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "set_tri_group_power failed rc=" + std::to_string(rc));
+             },
+             py::arg("group_id"),
+             py::arg("power_W_per_band"),
+             R"doc(Update the per-band emission power of an already-registered EMISSIVE group.
+
+Call between tracing passes (never during an active trace).  The primary use
+case is the WaveTube surrogate emitter: after BPM solve the exit group's power
+is set to the BPM-integrated exit flux ∫|E(x,y)|² dx dy per band.
+
+group_id          : int — group_id returned by register_tri_group()
+power_W_per_band  : float32 (n_bands,) — physical power in watts per band
+)doc")
         .def("attach_optical_assembly",
              [](PyRayTracer& self, py::object backend) {
                  OpticalAssembly* asmb = nullptr;
@@ -5538,6 +5565,40 @@ Returns assigned group_id (>= 0).  Raises on failure.
              [](PyRayTracer& self) {
                  return ray_tracer_n_tri_groups(self.handle);
              })
+        .def("get_manifold_gid_stats",
+             [](PyRayTracer& self, int gid) -> py::dict {
+                 py::dict out;
+                 out["magic"]       = py::float_(0.0f);
+                 out["transmitted"] = py::int_(0);
+                 out["absorbed"]    = py::int_(0);
+                 float m = 0.0f; uint64_t ok = 0, ab = 0;
+                 if (ray_tracer_get_manifold_gid_stats(self.handle, gid, &m, &ok, &ab) == SK_OK) {
+                     out["magic"]       = py::float_(m);
+                     out["transmitted"] = py::int_(ok);
+                     out["absorbed"]    = py::int_(ab);
+                 }
+                 return out;
+             },
+             py::arg("gid"),
+             "Per-GID manifold dispatch stats: {magic, transmitted, absorbed}. CPU T2 path only.")
+        .def("get_all_manifold_stats",
+             [](PyRayTracer& self) -> py::list {
+                 py::list out;
+                 const int n = ray_tracer_n_tri_groups(self.handle);
+                 for (int gid = 0; gid < n; ++gid) {
+                     float m = 0.0f; uint64_t ok = 0, ab = 0;
+                     if (ray_tracer_get_manifold_gid_stats(self.handle, gid, &m, &ok, &ab) != SK_OK)
+                         continue;
+                     py::dict d;
+                     d["gid"]         = py::int_(gid);
+                     d["magic"]       = py::float_(m);
+                     d["transmitted"] = py::int_(ok);
+                     d["absorbed"]    = py::int_(ab);
+                     out.append(d);
+                 }
+                 return out;
+             },
+             "All per-GID manifold dispatch stats as a list of {gid, magic, transmitted, absorbed}.")
         /* ── UV integrator image readback ─────────────────────────────────── */
         .def("get_group_uv_image",
              [](PyRayTracer& self, int group_id) -> py::dict {
@@ -5628,6 +5689,109 @@ Full channel layout and UV_CH_* indices are documented in ray_tracer.h.
              },
              py::arg("group_id") = -1,
              "Zero the UV accumulator for group_id (pass -1 to clear all groups).")
+        /* ── BSSRDF illumination accumulator ──────────────────────────────── */
+        .def("init_illum_accum",
+             [](PyRayTracer& self) {
+                 int rc = ray_tracer_init_illum_accum(self.handle);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "init_illum_accum failed rc=" + std::to_string(rc));
+             },
+             R"doc(Size and zero the per-triangle BSSRDF illumination accumulator.
+
+Call once after scene geometry is set (before any tracing).  The accumulator
+stores the pre-interaction amplitude of forward paths that hit diffuse-transmissive
+surfaces (diffuse_frac > 0).  Backward paths query this to receive their
+analytical diffuse illumination contribution without scatter-volume traversal.
+
+Two-pass protocol:
+  tracer.init_illum_accum()    # once after geometry is set
+  tracer.reset_illum_accum()   # between forward-pass batches
+  tracer.trace_forward(...)    # forward paths populate the accumulator
+  tracer.trace_backward(...)   # backward paths query the accumulator
+  data = tracer.export_illum_accum()  # optional: inspect or feed T4 BPM
+)doc")
+        .def("reset_illum_accum",
+             [](PyRayTracer& self) {
+                 int rc = ray_tracer_reset_illum_accum(self.handle);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "reset_illum_accum failed rc=" + std::to_string(rc));
+             },
+             "Zero the illumination accumulator without freeing memory. "
+             "Call between forward-pass batches to avoid contaminating backward-ray "
+             "lookups with stale data.")
+        .def("export_illum_accum",
+             [](PyRayTracer& self) -> py::array_t<float> {
+                 int n_tris = 0, stride = 0;
+                 ray_tracer_export_illum_accum(self.handle, nullptr, 0,
+                                               &n_tris, &stride);
+                 if (n_tris <= 0 || stride <= 0)
+                     return py::array_t<float>({0});
+                 py::array_t<float> out({(py::ssize_t)n_tris,
+                                         (py::ssize_t)stride});
+                 int rc = ray_tracer_export_illum_accum(
+                     self.handle,
+                     static_cast<float*>(out.mutable_data()),
+                     n_tris * stride,
+                     &n_tris, &stride);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "export_illum_accum failed rc=" + std::to_string(rc));
+                 return out;
+             },
+             R"doc(Return float32 array of shape (n_tris, stride) from the BSSRDF accumulator.
+
+stride = 2 * n_bands + 2.  Layout per triangle row:
+  col 2*b + 0   amp_sum[b].real  (sum of forward-path pre-interaction re amplitudes)
+  col 2*b + 1   amp_sum[b].imag
+  col 2*nb      cos_sum          (sum of |cos θ| incidence weights)
+  col 2*nb + 1  count            (number of forward contributions)
+
+Divide re/im by count to get the average forward amplitude at each surface.
+cos_sum / count gives avg_cos for the Lambertian coupling weight.
+
+This array can be used to seed a T4 BPM wave-solver run: replace the
+Monte Carlo averages with diffraction-correct BPM exit-plane amplitudes
+for a more physically accurate BSSRDF contribution.)doc")
+        .def("write_tri_illum",
+             [](PyRayTracer& self,
+                py::array_t<int32_t, py::array::c_style|py::array::forcecast>   tri_ids,
+                py::array_t<float,   py::array::c_style|py::array::forcecast>   amp_re,
+                py::array_t<float,   py::array::c_style|py::array::forcecast>   amp_im,
+                py::array_t<float,   py::array::c_style|py::array::forcecast>   cos_avg) {
+                 const int n_tris  = static_cast<int>(tri_ids.shape(0));
+                 const int n_bands = (amp_re.ndim() == 2)
+                                         ? static_cast<int>(amp_re.shape(1)) : 1;
+                 int rc = ray_tracer_write_tri_illum(
+                     self.handle,
+                     static_cast<const int*>(tri_ids.data()),
+                     n_tris,
+                     static_cast<const float*>(amp_re.data()),
+                     static_cast<const float*>(amp_im.data()),
+                     static_cast<const float*>(cos_avg.data()),
+                     n_bands);
+                 if (rc != 0)
+                     throw std::runtime_error(
+                         "write_tri_illum failed rc=" + std::to_string(rc));
+             },
+             py::arg("tri_ids"),
+             py::arg("amp_re"),
+             py::arg("amp_im"),
+             py::arg("cos_avg"),
+             R"doc(Write BPM-computed amplitudes into tri_illum_accum for specific triangles.
+
+Replaces any Monte Carlo data at those triangles with the BPM exit field.
+Backward rays that subsequently hit those triangles receive diffraction-correct
+illumination from the BSSRDF analytical path.
+
+Parameters
+----------
+tri_ids  : int32  (n_tris,)          triangle indices
+amp_re   : float32 (n_tris, n_bands) real part of BPM exit field per triangle
+amp_im   : float32 (n_tris, n_bands) imaginary part
+cos_avg  : float32 (n_tris,)         mean |cos θ| of incidence; use 1.0 for
+                                     normal incidence at a flat diffuser face)doc")
         .def("get_group_uv_summary",
              [](PyRayTracer& self, int group_id) -> py::dict {
                  RayTracerUvGroupSummary s{};

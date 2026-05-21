@@ -8,6 +8,7 @@ camera_preset         CameraPreset dataclass + built-in presets
 bake_worker           64-bit ray tracer → LensManifold noodle LUT
 emitter_profile       Physical emitter profiles (spectral, phase, directional,
                       polarization, UV texture)
+wave_tube             ADI-BPM wave context + surrogate emitter (WaveTube)
 """
 from .parametric_surfaces import (
     ParametricSurface,
@@ -51,8 +52,6 @@ from .emitter_profile import (
 from .compound_optics import (
     CompoundLens,
     LensHood,
-    TerminationReason,
-    TracedRay,
     PLENS_MAGIC,
     PLENS_HEADER,
     PLENS_SURF_STRIDE,
@@ -64,11 +63,13 @@ from .neural_assembly import (
     NeuralAssemblyMLP,
     NormStats,
     train as train_neural_assembly,
+    train_from_array as train_neural_assembly_from_array,
     export_payload as export_neural_payload,
     load_training_data,
     infer_payload,
     MAGIC_NEURAL,
 )
+from .wave_tube import WaveTube, WaveTubeConfig
 
 
 __all__ = [
@@ -88,7 +89,7 @@ __all__ = [
     "EmissiveTexture", "TEXTURE_CHANNEL_MAP",
     "EmitterProfile", "EMITTER_CATALOG", "emitter_from_dict",
     # compound optics (element types accessed via camera_designer.compound_optics)
-    "CompoundLens", "LensHood", "TerminationReason", "TracedRay",
+    "CompoundLens", "LensHood",
     "PLENS_MAGIC", "PLENS_HEADER", "PLENS_SURF_STRIDE",
     # bake
     "BakeWorker", "trace_ray", "trace_ray_backward", "ManifoldEndpoint",
@@ -96,7 +97,10 @@ __all__ = [
     "TracerGap", "SourceRecord", "RayOrder",
     # neural assembly
     "NeuralAssemblyMLP", "NormStats",
-    "train_neural_assembly", "export_neural_payload",
+    "train_neural_assembly", "train_neural_assembly_from_array",
+    "export_neural_payload",
     "load_training_data", "infer_payload",
     "MAGIC_NEURAL",
+    # wave tube
+    "WaveTube", "WaveTubeConfig",
 ]

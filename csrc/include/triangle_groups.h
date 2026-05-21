@@ -252,6 +252,19 @@ SK_API int ray_tracer_clear_tri_groups(struct RayTracerState* st);
  */
 SK_API int ray_tracer_n_tri_groups(const struct RayTracerState* st);
 
+/**
+ * Per-GID manifold dispatch stats (CPU T2 path).
+ * Returns SK_OK and fills the out-pointers for group `gid`.
+ * out_magic       — payload magic float (14949=param, 14948=MLP, 14946-51=LUT, 0=none)
+ * out_transmitted — rays successfully teleported through this surface
+ * out_absorbed    — rays absorbed (vignetting, TIR, unknown magic)
+ */
+SK_API int ray_tracer_get_manifold_gid_stats(
+    const struct RayTracerState* st, int gid,
+    float*    out_magic,
+    uint64_t* out_transmitted,
+    uint64_t* out_absorbed);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

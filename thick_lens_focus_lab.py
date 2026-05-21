@@ -518,6 +518,20 @@ class StageLightTubeConfig:
 
 
 @dataclass
+class DiffuserWaveTubeSpec:
+    """Geometry for one diffuser disc, ready for WaveTube.register()."""
+    entry_tri_ids:      np.ndarray   # c1 face (tube-interior side) int32
+    exit_tri_ids:       np.ndarray   # c0 face (stage side) int32
+    entry_pos:          np.ndarray   # centre of entry face (3,) metres
+    exit_pos:           np.ndarray   # centre of exit face  (3,) metres
+    axis:               np.ndarray   # unit vec from entry to exit
+    tube_radius_m:      float
+    diffuser_thickness: float
+    ior_real:           float = 1.45
+    ior_imag:           float = 0.002
+
+
+@dataclass
 @dataclass
 class PipeCSGSpec:
     center: np.ndarray
@@ -752,6 +766,7 @@ def _build_stage_light_tube(
     tri_list: List[np.ndarray],
     mat_ids: List[int],
     source_tri_ids: List[int],
+    wave_spec_out: Optional[List["DiffuserWaveTubeSpec"]] = None,
 ) -> PipeCSGSpec:
     open_pt = np.array([float(cfg.opening_x), float(cfg.opening_y), float(cfg.opening_z)], dtype=np.float64)
     axis = np.array([float(cfg.axis_x), float(cfg.axis_y), float(cfg.axis_z)], dtype=np.float64)
@@ -819,6 +834,8 @@ def _build_stage_light_tube(
             1.0e-4,
             diffuser_fit_r,
         ))
+        _diff_entry_ids: List[int] = [] if wave_spec_out is not None else None  # type: ignore[assignment]
+        _diff_exit_ids:  List[int] = [] if wave_spec_out is not None else None  # type: ignore[assignment]
         _build_thin_disc_element_oriented(
             center=np.ascontiguousarray(diff_center, dtype=np.float64),
             normal=np.ascontiguousarray(axis, dtype=np.float64),
@@ -828,7 +845,19 @@ def _build_stage_light_tube(
             mat_ids=mat_ids,
             mat_idx=idx_diffuser,
             n_theta=96,
+            entry_tri_ids=_diff_entry_ids,
+            exit_tri_ids=_diff_exit_ids,
         )
+        if wave_spec_out is not None:
+            wave_spec_out.append(DiffuserWaveTubeSpec(
+                entry_tri_ids      = np.ascontiguousarray(_diff_entry_ids, dtype=np.int32),
+                exit_tri_ids       = np.ascontiguousarray(_diff_exit_ids,  dtype=np.int32),
+                entry_pos          = np.ascontiguousarray(diff_center + diff_half * axis, dtype=np.float64),
+                exit_pos           = np.ascontiguousarray(diff_center - diff_half * axis, dtype=np.float64),
+                axis               = np.ascontiguousarray(-axis, dtype=np.float64),
+                tube_radius_m      = diff_r,
+                diffuser_thickness = diff_thick,
+            ))
 
     emit_t = float(np.clip(cfg.emitter_depth_frac, 0.55, 0.97)) * depth
     emit_center = open_pt + axis * emit_t
@@ -1877,6 +1906,8 @@ def _build_thin_disc_element_oriented(
     mat_ids: List[int],
     mat_idx: int,
     n_theta: int = 72,
+    entry_tri_ids: Optional[List[int]] = None,
+    exit_tri_ids:  Optional[List[int]] = None,
 ) -> None:
     c = np.asarray(center, dtype=np.float64).reshape(3)
     n = np.asarray(normal, dtype=np.float64).reshape(3)
@@ -1911,15 +1942,19 @@ def _build_thin_disc_element_oriented(
 
     for i in range(n_theta):
         j = (i + 1) % n_theta
+        idx_c0 = len(tri_list)
         # c0 = center - h*n: stage-side face, normal must point away from disc toward -n.
         # Reversed winding flips the normal from +n to -n so front-face is visible from outside.
         _append_tri(tri_list, mat_ids, c0, ring0[j], ring0[i], mat_idx)
+        idx_c1 = len(tri_list)
         # c1 = center + h*n: tube-interior-side face, normal must point away from disc toward +n.
         # Reversed winding flips the normal from -n to +n so front-face is visible from tube interior.
         _append_tri(tri_list, mat_ids, c1, ring1[i], ring1[j], mat_idx)
         # Side walls: outward-pointing radial normals are correct as-is.
         _append_tri(tri_list, mat_ids, ring0[i], ring1[i], ring1[j], mat_idx)
         _append_tri(tri_list, mat_ids, ring0[i], ring1[j], ring0[j], mat_idx)
+        if exit_tri_ids  is not None: exit_tri_ids.append(idx_c0)
+        if entry_tri_ids is not None: entry_tri_ids.append(idx_c1)
 
 
 def _lens_front_x(lens: LensConfig, r: np.ndarray) -> np.ndarray:
@@ -2229,6 +2264,7 @@ def _build_scene_mesh(
     # Track source triangles so they can be suppressed from the surface tone map.
     source_tri_ids: List[int] = []
     stage_light_cutters: List[PipeCSGSpec] = []
+    diffuser_wave_specs: List[DiffuserWaveTubeSpec] = []
 
     # Default legacy side-room tube as first macro light tube.
     default_tube = StageLightTubeConfig(
@@ -2260,6 +2296,7 @@ def _build_scene_mesh(
             tri_list=tris,
             mat_ids=mats,
             source_tri_ids=source_tri_ids,
+            wave_spec_out=diffuser_wave_specs,
         )
         stage_light_cutters.append(cut_spec)
 
@@ -2619,6 +2656,7 @@ def _build_scene_mesh(
         np.ascontiguousarray(np.asarray(camera_front_cap_tri_ids, dtype=np.int32)),
         np.ascontiguousarray(np.asarray(camera_frustum_tri_ids, dtype=np.int32)),
         np.ascontiguousarray(np.asarray(red_probe_tri_ids, dtype=np.int32)),
+        diffuser_wave_specs,
     )
 
 
@@ -2877,11 +2915,12 @@ class ForwardCppLensBench:
         self._drain_stop  = threading.Event()
         self._segs_lock   = threading.Lock()
         # Bounded ring buffer of raw hit positions for the point overlay.
-        # Each row: (x, y, z, amplitude, display_class).  Memory is constant:
-        # 65536 rows × 5 floats × 4 bytes = 1.25 MB.  No spatial quantization.
+        # Each row: (x, y, z, amplitude, display_class, hit_group_id).
+        # 2M rows × 6 floats × 4 bytes = 48 MB.  No spatial quantization.
         _VIS_CAP          = 2_000_000
         self._VIS_CAP     = _VIS_CAP
-        self._vis_buf     = np.zeros((_VIS_CAP, 5), dtype=np.float32)
+        self._vis_buf     = np.zeros((_VIS_CAP, 6), dtype=np.float32)
+        self._gid_crossing_counts: dict = {}  # gid → hit count in current ring window
         self._vis_ptr     = 0     # next write position (ring head)
         self._vis_full    = False  # True once ring has wrapped at least once
         self._forward_img_res = int(max(16, int(self.scene.image_plate.sensor_res)))
@@ -2938,8 +2977,9 @@ class ForwardCppLensBench:
             aperture_stop_ids, tube_wall_ids, lens_surface_groups,
             object_ids, tube_baffle_ids, camera_barrel_ids,
             camera_rear_cap_ids, camera_front_cap_ids, camera_frustum_ids,
-            red_probe_ids,
+            red_probe_ids, diffuser_wave_specs,
         ) = _build_scene_mesh(self.scene, self.sidecar)
+        self._diffuser_wave_specs: List[DiffuserWaveTubeSpec] = list(diffuser_wave_specs)
         self.lens_surface_groups = lens_surface_groups
         self.tri_vertices = np.ascontiguousarray(tri_arr, dtype=np.float64)
         self.tri_centroids = np.ascontiguousarray(np.mean(tri_arr, axis=1), dtype=np.float64)
@@ -3423,6 +3463,7 @@ class ForwardCppLensBench:
         # Re-register assembly groups if a payload or parametric model was previously loaded.
         self._do_register_neural_assembly_group()
         self._do_register_parametric_assembly()
+        self._do_register_lut_assembly()
 
         # Store aperture plane geometry for ManifoldWalkStrategy construction.
         self._bdpt_aperture_centre = np.array([stop_plane_x, 0.0, 0.0], np.float64)
@@ -3446,7 +3487,93 @@ class ForwardCppLensBench:
             f"uv_groups={len(self.uv_page_bank.groups) if self.uv_page_bank is not None else 0}",
             flush=True,
         )
+        self._register_wave_tubes()
         return int(self.bdpt_last_sensor_gid)
+
+    def _register_wave_tubes(self) -> None:
+        """Register a WaveTube surrogate emitter for every diffuser disc in the scene.
+
+        Called at the end of _configure_sensor_film_pipeline() so groups survive
+        clear_tri_groups().  Wave tubes are stored in self._wave_tubes.
+        """
+        from camera_designer.wave_tube import WaveTube, WaveTubeConfig
+        specs = getattr(self, "_diffuser_wave_specs", [])
+        wavelengths_m = (C_LIGHT / np.maximum(
+            np.asarray(self.freq_hz, dtype=np.float64), 1.0
+        )).astype(np.float64)
+        self._wave_tubes: List[WaveTube] = []
+        for spec in specs:
+            if not int(spec.entry_tri_ids.size) or not int(spec.exit_tri_ids.size):
+                continue
+            cfg = WaveTubeConfig(
+                axis            = spec.axis,
+                entry_pos       = spec.entry_pos,
+                exit_pos        = spec.exit_pos,
+                tube_radius_m   = spec.tube_radius_m,
+                n_medium        = spec.ior_real,
+                n_imag          = spec.ior_imag,
+                wavelengths_m   = wavelengths_m,
+                nx              = 64,
+                ny              = 64,
+                dx_m            = 0.0,
+                n_bpm_steps     = 0,
+                pre_roll_frames = 8,
+            )
+            # Exit face centroids for BPM→tri_illum_accum spatial mapping.
+            exit_cents = np.mean(
+                self.tri_vertices[spec.exit_tri_ids], axis=1
+            ).astype(np.float64)
+            try:
+                wt = WaveTube.register(
+                    self.tracer,
+                    spec.entry_tri_ids,
+                    spec.exit_tri_ids,
+                    cfg,
+                    exit_tri_centroids=exit_cents,
+                )
+                self._wave_tubes.append(wt)
+            except Exception as exc:
+                print(f"[wave-tube] registration failed: {exc}", flush=True)
+        # Ensure tri_illum_accum is sized for the full scene so write_tri_illum
+        # has a valid buffer to target.
+        if self._wave_tubes:
+            try:
+                self.tracer.init_illum_accum()
+            except Exception:
+                pass
+        if self._wave_tubes:
+            print(
+                "[wave-tube]",
+                f"registered={len(self._wave_tubes)}",
+                f"pre_roll_frames={self._wave_tubes[0].config.pre_roll_frames}",
+                "exit_role=pending_write_api",
+                flush=True,
+            )
+
+    def solve_wave_tubes(self) -> int:
+        """Advance all wave-tube BPM solvers by one frame.
+
+        During pre-roll the accumulator warms up; on the pre-roll completion
+        frame it is cleared so the live integral starts from zero.  After
+        pre-roll each call propagates the captured entry field through the ADI
+        BPM and stores the exit irradiance in wt._exit_field for downstream
+        use (e.g., writing into tri_illum_accum when the API is available).
+
+        Returns the number of tubes that are live (past pre-roll).
+        """
+        tubes = getattr(self, "_wave_tubes", [])
+        if not tubes:
+            return 0
+        n_live = 0
+        for wt in tubes:
+            try:
+                ef = wt.solve(self.tracer)
+            except Exception as exc:
+                print(f"[wave-tube] solve error: {exc}", flush=True)
+                continue
+            if ef is not None and wt._frames_collected > wt.config.pre_roll_frames:
+                n_live += 1
+        return n_live
 
     def reset_visual_integrators(self) -> None:
         with self._trace_lock:
@@ -3503,6 +3630,13 @@ class ForwardCppLensBench:
         ``bake_directions`` to bypass emitter sampling entirely (sequential tags,
         single child per ray — intended for baking training data).
         """
+        # Advance wave-tube BPM solvers before submitting the next ray batch.
+        # Uses the entry-accumulator data collected during the previous drain
+        # cycle.  Bake calls bypass this (bake_origins implies a controlled
+        # single-pass trace that should not disturb the wave-tube state).
+        if bake_origins is None:
+            self.solve_wave_tubes()
+
         _use_gpu = self.compute_mode in ("gpu", "mixed")
         _all_gpu = self.compute_mode == "gpu"
 
@@ -3922,16 +4056,25 @@ class ForwardCppLensBench:
         amp_v = (np.sqrt(np.clip(amp_sq[:, 0], 0.0, None)) if nb > 0
                  else np.ones(int(np.count_nonzero(vis_mask)), dtype=np.float32)).astype(np.float32)
 
+        # Extract per-hit group IDs (set in T1 from tri_param_group_of_tri).
+        raw_hgid = records.get("hit_group_id", None)
+        if raw_hgid is not None:
+            vm_gid = np.asarray(raw_hgid)[vis_mask].astype(np.int32)
+        else:
+            vm_gid = np.full(int(np.count_nonzero(vis_mask)), -1, dtype=np.int32)
+
         # For class-3 also count the ray origin (image-plate surface) as a hit.
         rev_strike_mask = (disp_class == 3)
         if np.any(rev_strike_mask):
             vm_pos_all   = np.concatenate([vm_pos,   vm_ss[rev_strike_mask]],    axis=0)
             amp_v_all    = np.concatenate([amp_v,    amp_v[rev_strike_mask]],    axis=0)
             disp_cls_all = np.concatenate([disp_class, np.full(int(np.count_nonzero(rev_strike_mask)), 3, dtype=np.int32)], axis=0)
+            gid_all      = np.concatenate([vm_gid,   vm_gid[rev_strike_mask]],   axis=0)
         else:
             vm_pos_all   = vm_pos
             amp_v_all    = amp_v
             disp_cls_all = disp_class
+            gid_all      = vm_gid
 
         def _records_to_preview(mask: np.ndarray, dst: np.ndarray) -> None:
             if not np.any(mask):
@@ -3970,11 +4113,12 @@ class ForwardCppLensBench:
         _records_to_preview(fwd_strike, self._forward_img_accum)
         _records_to_preview(rev_strike, self._reverse_img_accum)
 
-        # Pack raw hit positions into ring-buffer rows: (x, y, z, amp, class)
-        pts = np.empty((vm_pos_all.shape[0], 5), dtype=np.float32)
+        # Pack raw hit positions into ring-buffer rows: (x, y, z, amp, class, gid)
+        pts = np.empty((vm_pos_all.shape[0], 6), dtype=np.float32)
         pts[:, :3] = vm_pos_all
         pts[:, 3]  = amp_v_all
         pts[:, 4]  = disp_cls_all.astype(np.float32)
+        pts[:, 5]  = gid_all.astype(np.float32)
         n   = pts.shape[0]
         cap = self._VIS_CAP
         with self._segs_lock:
@@ -4992,6 +5136,54 @@ class ForwardCppLensBench:
             self.tri_centroids,
             _scene_lenses(self.scene),
         )
+        self._start_progressive_refinement()
+
+    def _do_register_lut_assembly(self) -> None:
+        """Re-register LUT lens assembly after clear_tri_groups() or after baking.
+        No-op if assembly is not in LUT mode or grid not yet built."""
+        if self._lens_assembly is None or self._lens_assembly.mode != LensAssemblySpec.MODE_LUT:
+            return
+        if self._lens_assembly._transfer_grid is None:
+            return
+        lsg = getattr(self, "lens_surface_groups", None)
+        if not lsg:
+            return
+        self._lens_assembly.register(
+            self.tracer,
+            lsg,
+            self.tri_vertices,
+            self.tri_centroids,
+            _scene_lenses(self.scene),
+        )
+
+    def _start_progressive_refinement(self) -> None:
+        """Start parametric→LUT→MLP background refinement if in PARAMETRIC mode."""
+        if self._lens_assembly is None:
+            return
+        if self._lens_assembly.mode != LensAssemblySpec.MODE_PARAMETRIC:
+            return
+        if self._lens_assembly.optics is None:
+            return
+        self._lens_assembly.start_progressive_refinement()
+
+    def _poll_assembly_mode_switch(self) -> None:
+        """Apply any pending LUT/MLP transition from the background worker.
+        Call once per render frame on the main thread."""
+        if self._lens_assembly is None:
+            return
+        result = self._lens_assembly.poll_pending_mode_switch(self.tracer)
+        if result == "LUT":
+            self.register_lut_ctx_if_needed()
+        elif result == "MLP":
+            pass  # _register_mlp already re-registered triangles
+
+    def register_lut_ctx_if_needed(self) -> None:
+        """Register the LUT scale context if assembly switched to LUT mode."""
+        if self._lens_assembly is None:
+            return
+        if self._lens_assembly._transfer_grid is None:
+            return
+        self._lens_assembly.register_lut_ctx(self.tracer)
 
     def _register_neural_payload(
         self,
@@ -5019,6 +5211,7 @@ class ForwardCppLensBench:
         def _worker():
             try:
                 self._bake_transfer_grid_now(ep)
+                self._do_register_lut_assembly()
             except Exception as _e:
                 print(f"[middle] bake error: {_e}", flush=True)
 
@@ -5209,8 +5402,8 @@ class ForwardCppLensBench:
             count = self._VIS_CAP if self._vis_full else self._vis_ptr
             buf   = self._vis_buf[:count].copy() if count > 0 else None
 
-        verts_by_class: List[np.ndarray] = [_empty4, _empty4, _empty4, _empty4]
-        n_by_class = [0, 0, 0, 0]
+        verts_by_class: List[np.ndarray] = [_empty4, _empty4, _empty4, _empty4, _empty4, _empty4]
+        n_by_class = [0, 0, 0, 0, 0, 0]
 
         if buf is not None and buf.shape[0] > 0:
             # Normalise world positions → [0,1] scene box for the renderer.
@@ -5219,13 +5412,34 @@ class ForwardCppLensBench:
             norm_z = np.clip((buf[:, 2] + r)      / yz_span, 0.0, 1.0)
             amp_v  = buf[:, 3]
             cls_v  = buf[:, 4].astype(np.int32)
+            if buf.shape[1] >= 6:
+                gid_v = buf[:, 5].astype(np.int32)
+                valid_gid = gid_v >= 0
+                if np.any(valid_gid):
+                    uq, uc = np.unique(gid_v[valid_gid], return_counts=True)
+                    self._gid_crossing_counts = dict(zip(uq.tolist(), uc.tolist()))
+                else:
+                    self._gid_crossing_counts = {}
+
+                # Remap entrance/exit GID hits to display classes 4 (red) and 5 (green).
+                # Classes 4/5 are always kept — no amplitude threshold applied to them.
+                _asm = getattr(self, "_lens_assembly", None)
+                if _asm is not None:
+                    _ap = _asm.acceptance_params()
+                    if _ap is not None:
+                        _ent_gid = int(_ap["entrance_gid"])
+                        _exit_gid = int(_ap["exit_gid"])
+                        if _ent_gid >= 0:
+                            cls_v = np.where(gid_v == _ent_gid, 4, cls_v)
+                        if _exit_gid >= 0:
+                            cls_v = np.where(gid_v == _exit_gid, 5, cls_v)
 
             # Amplitude threshold for volume/field points only (cls 1, 2).
-            # Strike points (cls 0, 3) are always kept.
+            # Strike points (cls 0, 3, 4, 5) are always kept.
             # Use a fast sample-based estimate instead of a full sort — sorting
             # 20M elements per frame blocks the main thread long enough to
             # trigger Windows TDR and crash the GL context.
-            strike_mask = (cls_v == 0) | (cls_v == 3)
+            strike_mask = (cls_v == 0) | (cls_v == 3) | (cls_v == 4) | (cls_v == 5)
             non_strike_amp = amp_v[~strike_mask]
             if non_strike_amp.size > 4096:
                 sample = non_strike_amp[::max(1, non_strike_amp.size // 4096)]
@@ -5237,7 +5451,7 @@ class ForwardCppLensBench:
             amp_thresh = max(amp_thresh, 1.0e-9)
             keep = strike_mask | (amp_v > amp_thresh)
 
-            for cls in range(4):
+            for cls in range(6):
                 m = keep & (cls_v == cls)
                 if not np.any(m):
                     continue
@@ -5274,7 +5488,7 @@ class ForwardCppLensBench:
         print(
             "[display-records]",
             f"field_nonzero={field_nonzero}",
-            f"pts={[n_by_class[c] for c in range(4)]}",
+            f"pts={[n_by_class[c] for c in range(6)]}",
             f"pipeline={pipeline_summary}",
             flush=True,
         )
@@ -6188,13 +6402,14 @@ def run(
             GL_BLEND, GL_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA, glBlendFunc,
             glViewport,
             glEnableClientState, glDisableClientState, glVertexPointer, glDrawArrays,
-            GL_VERTEX_ARRAY, GL_TRIANGLE_STRIP, GL_POINTS, glPointSize,
+            GL_VERTEX_ARRAY, GL_TRIANGLE_STRIP, GL_POINTS, GL_LINES, GL_LINE_STRIP,
+            glPointSize, glLineWidth,
             glDeleteTextures, glActiveTexture, GL_TEXTURE0, GL_TEXTURE1,
             glCreateShader, glShaderSource, glCompileShader, glGetShaderiv,
             glGetShaderInfoLog, GL_VERTEX_SHADER, GL_FRAGMENT_SHADER,
             GL_COMPILE_STATUS, glCreateProgram, glAttachShader, glLinkProgram,
             glGetProgramiv, glGetProgramInfoLog, GL_LINK_STATUS, glUseProgram,
-            glGetUniformLocation, glUniform1i, glUniform1f, glUniform3f, glDeleteProgram,
+            glGetUniformLocation, glUniform1i, glUniform1f, glUniform3f, glUniform4f, glDeleteProgram,
             glDeleteShader,
             glBindAttribLocation, glGetAttribLocation,
             glGenBuffers, glBindBuffer, glBufferData, glDeleteBuffers,
@@ -6513,7 +6728,15 @@ def run(
         from camera_designer.compound_optics import CompoundLens
 
         _preset = bench._camera_preset or simple_doublet_preset()
-        _cl = CompoundLens.from_preset(_preset)
+
+        # Map the preset's local Z frame to scene X using the aperture stop as the
+        # registration datum — the same one iris_from_camera_preset() uses.
+        # x_offset = scene_aperture_x − preset_aperture_z_local
+        _iris     = getattr(bench.scene, "iris_aperture", None)
+        _iris_x   = float(_iris.x_pos) if _iris is not None else 1.12
+        _x_offset = _iris_x - float(_preset.aperture_stop.z_pos)
+
+        _cl = CompoundLens.from_preset(_preset, x_offset=_x_offset)
         print(
             f"[parametric] CompoundLens: {len(_cl.elements)} elements"
             f"  f_eff={_cl.f_eff * 1e3:.1f} mm  f/{_cl.f_number:.1f}",
@@ -6653,14 +6876,19 @@ def run(
         void main() {
             // 0=forward-strike amber  1=forward-volume cyan
             // 2=reverse-volume green  3=reverse-strike magenta
+            // 4=entrance-surface red  5=exit-surface green
             vec3 base;
             if      (u_class < 0.5) base = vec3(1.00, 0.60, 0.18);
             else if (u_class < 1.5) base = vec3(0.18, 0.88, 1.00);
             else if (u_class < 2.5) base = vec3(0.18, 1.00, 0.45);
-            else                    base = vec3(1.00, 0.28, 0.72);
-            vec3 c = display_curve(vec3(v_amp)) * base;
-            // Additive alpha: near = bright/opaque, far = dim (shows through volume)
-            float alpha = clamp(0.2 + 0.8 * v_depth, 0.0, 1.0);
+            else if (u_class < 3.5) base = vec3(1.00, 0.28, 0.72);
+            else if (u_class < 4.5) base = vec3(1.00, 0.18, 0.18);   // entrance: hot red
+            else                    base = vec3(0.18, 1.00, 0.18);   // exit: bright green
+            // Entrance/exit hits glow brighter — boost and keep constant alpha
+            float is_special = step(3.5, u_class);
+            float amp_boost  = mix(1.0, 3.0, is_special);
+            vec3 c = display_curve(vec3(v_amp * amp_boost)) * base;
+            float alpha = mix(clamp(0.2 + 0.8 * v_depth, 0.0, 1.0), 0.85, is_special);
             gl_FragColor = vec4(clamp(c, 0.0, 1.0), alpha);
         }
     """
@@ -6681,6 +6909,31 @@ def run(
     glLinkProgram(point_prog)
     if not glGetProgramiv(point_prog, GL_LINK_STATUS):
         msg = glGetProgramInfoLog(point_prog)
+        raise RuntimeError(msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else str(msg))
+
+    # ── Acceptance-cone wireframe shader ─────────────────────────────────────
+    # Simple 2-D pass-through: vertices arrive pre-projected in NDC.
+    cone_vert_src = """
+        #version 120
+        void main() {
+            gl_Position = vec4(gl_Vertex.xy, 0.0, 1.0);
+        }
+    """
+    cone_frag_src = """
+        #version 120
+        uniform vec4 u_color;
+        void main() {
+            gl_FragColor = u_color;
+        }
+    """
+    cvs = _compile_shader(GL_VERTEX_SHADER,   cone_vert_src)
+    cfs = _compile_shader(GL_FRAGMENT_SHADER,  cone_frag_src)
+    cone_prog = glCreateProgram()
+    glAttachShader(cone_prog, cvs)
+    glAttachShader(cone_prog, cfs)
+    glLinkProgram(cone_prog)
+    if not glGetProgramiv(cone_prog, GL_LINK_STATUS):
+        msg = glGetProgramInfoLog(cone_prog)
         raise RuntimeError(msg.decode("utf-8", errors="replace") if isinstance(msg, bytes) else str(msg))
 
     # ── UV-mesh shader: renders every scene triangle lit by the UV-splat atlas ──
@@ -6748,7 +7001,7 @@ def run(
     blank_vol = np.zeros((bench._field_nz, bench._field_ny, bench._field_nx, 3), dtype=np.float32)
     _empty4 = np.zeros((0, 4), dtype=np.float32)
     # List is mutated in-place so draw_surface_points closure always sees current arrays
-    surface_verts_by_class: List[np.ndarray] = [_empty4, _empty4, _empty4, _empty4]
+    surface_verts_by_class: List[np.ndarray] = [_empty4, _empty4, _empty4, _empty4, _empty4, _empty4]
     _svc = surface_verts_by_class  # alias used by the closure
     fullscreen_quad = np.ascontiguousarray(
         [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]],
@@ -7097,6 +7350,57 @@ def run(
                                      _pip_vx, _pip_vy + _pip_dim + 2,
                                      _HUD_W, _HUD_H, hud_mode=True)
 
+            # ── Lens assembly entry/exit stats above right (orange) PIP ────
+            # Per-GID hit counts from the ring buffer (hit_group_id column),
+            # updated by display_pipeline_records() every frame.
+            _gcc = bench._gid_crossing_counts
+            _asm = bench._lens_assembly
+            if _asm is not None:
+                _asm.refresh_teleport_stats(bench.tracer)
+                _asm_mode = _asm.mode
+                _ent_gid  = _asm._entrance_gid
+                _ex_gid   = _asm._exit_gid
+                _gid_str  = (f"ent={_ent_gid}" if _ent_gid >= 0 else "ent=--") + \
+                            ("" if _ex_gid < 0 else f" ex={_ex_gid}")
+                _n_ent = _gcc.get(_ent_gid, 0) if _ent_gid >= 0 else 0
+                _n_ex  = _gcc.get(_ex_gid,  0) if _ex_gid  >= 0 else 0
+                _MAGIC_NAMES = {14949.0: "param", 14948.0: "mlp",
+                                14946.0: "lut0",  14947.0: "lut1",
+                                14950.0: "lut2",  14951.0: "lut3"}
+                _es = _asm._entrance_stats
+                _xs = _asm._exit_stats
+                _ent_kind = _MAGIC_NAMES.get(float(_es.get("magic", 0)), "?")
+                _ex_kind  = _MAGIC_NAMES.get(float(_xs.get("magic", 0)), "?")
+                _ent_tx  = f"{_ent_kind} T:{_es['transmitted']} abs:{_es['absorbed']}"
+                _ex_tx   = f"{_ex_kind} T:{_xs['transmitted']} abs:{_xs['absorbed']}"
+                # Progressive refinement progress line
+                if _asm_mode == LensAssemblySpec.MODE_PARAMETRIC and _asm._prog_noodle_idx > 0:
+                    _prog_k = _asm._prog_noodle_idx // 1000
+                    _mlp_thresh_k = _asm._prog_cfg.get("mlp_min_samples", 100_000) // 1000
+                    _prog_line = f"prog {_prog_k}k/{_mlp_thresh_k}k"
+                elif _asm_mode == LensAssemblySpec.MODE_LUT and _asm._transfer_grid_noodles > 0:
+                    _prog_line = f"lut {_asm._transfer_grid_noodles:,}n"
+                else:
+                    _prog_line = ""
+                asm_lines = [
+                    f"{_asm_mode} {_gid_str}",
+                    f"ent {_n_ent} ({_ent_tx})",
+                    f"ex  {_n_ex} ({_ex_tx})",
+                ]
+                if _prog_line:
+                    asm_lines.append(_prog_line)
+                asm_cols = [(255, 160, 60), (255, 220, 120), (200, 210, 255), (200, 200, 200)]
+            else:
+                asm_lines = [f"asm:none gids={len(_gcc)}"]
+                asm_cols  = [(120, 120, 120)]
+            rgba_a = _render_hud_lines(asm_lines, asm_cols)
+            glBindTexture(GL_TEXTURE_2D, tex_hud)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, rgba_a)
+            _draw_quad_with_pip_prog(tex_hud,
+                                     _uv_pip_vx, _pip_vy + _pip_dim + 2,
+                                     _HUD_W, _HUD_H, hud_mode=True)
+
 
     _vol_tex_size = [bench._field_nx, bench._field_ny, bench._field_nz]  # already allocated at init
 
@@ -7126,7 +7430,7 @@ def run(
         glUseProgram(0)
 
     # Display-class colours in same order as shader: amber, cyan, green, magenta
-    _CLASS_NAMES = ["fwd-strike", "fwd-volume", "rev-volume", "rev-strike"]
+    _CLASS_NAMES = ["fwd-strike", "fwd-volume", "rev-volume", "rev-strike", "entrance", "exit"]
 
     def draw_surface_points(mode: int, gain: float, t_now: float) -> None:
         any_pts = any(v.shape[0] > 0 for v in _svc)
@@ -7145,6 +7449,141 @@ def run(
             glUniform1f(glGetUniformLocation(point_prog, "u_class"), float(cls))
             glVertexPointer(4, GL_FLOAT, 0, verts)
             glDrawArrays(GL_POINTS, 0, int(verts.shape[0]))
+        glDisableClientState(GL_VERTEX_ARRAY)
+        glDisable(GL_BLEND)
+        glUseProgram(0)
+
+    def draw_acceptance_cones(t_now: float, mode: int = 0) -> None:
+        """Draw wireframe acceptance cones for the registered lens assembly.
+
+        Renders two aperture circles (at entrance and exit planes) plus the four
+        generator lines that bound the forward and backward acceptance cones.
+        Everything is in normalised [0,1]³ scene space with the same Y/Z rotation
+        as the point/volume shaders so all overlays stay co-registered.
+
+        Colors: entrance ring + backward cone generators = red (#FF3030),
+                exit ring + forward cone generators       = green (#30FF30).
+        """
+        _asm = getattr(bench, "_lens_assembly", None)
+        if _asm is None:
+            return
+        _ap = _asm.acceptance_params()
+        if _ap is None:
+            return
+
+        x_span  = max(1e-8, float(scene.x_max - scene.x_min))
+        yz_span = max(1e-8, float(2.0 * scene.view_radius))
+        x_min_s = float(scene.x_min)
+
+        def _nx(x):   return float((x - x_min_s) / x_span)
+        def _nr(rad): return float(rad / yz_span)
+
+        # entrance_x / exit_x are exact analytical surface vertex positions in
+        # scene space — from optics.side("front"/"back").x_pos, which is correctly
+        # offset by iris_x − aperture_z_local at CompoundLens construction time.
+        x_ent_w  = float(_ap["entrance_x"])
+        x_exit_w = float(_ap["exit_x"])
+        x_ent    = _nx(x_ent_w)
+        x_exit   = _nx(x_exit_w)
+        r_ent    = _nr(float(_ap["entrance_r"]))
+        r_exit   = _nr(float(_ap["exit_r"]))
+
+        # Build aperture circle vertices (in normalised XYZ, Y/Z are transverse).
+        # These mark the physical clear aperture at each side.
+        N_SEG = 48
+        angles = np.linspace(0.0, 2.0 * math.pi, N_SEG, endpoint=False, dtype=np.float32)
+        cos_a = np.cos(angles)
+        sin_a = np.sin(angles)
+
+        # Entrance circle (red): XYZ columns, closed by repeating first point
+        ent_circle = np.empty((N_SEG + 1, 3), dtype=np.float32)
+        ent_circle[:N_SEG, 0] = x_ent
+        ent_circle[:N_SEG, 1] = 0.5 + r_ent * cos_a
+        ent_circle[:N_SEG, 2] = 0.5 + r_ent * sin_a
+        ent_circle[N_SEG]     = ent_circle[0]
+
+        # Exit circle (green)
+        exit_circle = np.empty((N_SEG + 1, 3), dtype=np.float32)
+        exit_circle[:N_SEG, 0] = x_exit
+        exit_circle[:N_SEG, 1] = 0.5 + r_exit * cos_a
+        exit_circle[:N_SEG, 2] = 0.5 + r_exit * sin_a
+        exit_circle[N_SEG]     = exit_circle[0]
+
+        # Characteristic optical length — purely from the lens assembly, not the mesh.
+        # f_eff sets the natural scale; axial_depth is the fallback for degenerate lenses.
+        axial_depth   = abs(x_exit_w - x_ent_w)
+        f_eff_abs     = abs(float(_asm.optics.f_eff)) if hasattr(_asm, "optics") and _asm.optics is not None else axial_depth
+        optical_scale = max(f_eff_abs, axial_depth, 1e-6)
+        # Extend 8× the optical scale on each side — lens-derived, scene-agnostic.
+        # Lines will be clipped at the screen edge if they run past the scene bounds.
+        extent = optical_scale * 8.0
+
+        # Object-side cone (red): apex at entrance, opens BACKWARD into the scene.
+        # A ray from the scene within fwd_half_angle of the axis traverses the full column.
+        x_obj_far_w = x_ent_w - extent
+        x_obj_far   = _nx(x_obj_far_w)
+        h_obj       = float(math.tan(float(_ap["fwd_half_angle"])) * extent / yz_span)
+        obj_lines = np.array([
+            [x_ent, 0.5,       0.5      ], [x_obj_far, 0.5 + h_obj, 0.5      ],
+            [x_ent, 0.5,       0.5      ], [x_obj_far, 0.5 - h_obj, 0.5      ],
+            [x_ent, 0.5,       0.5      ], [x_obj_far, 0.5,          0.5 + h_obj],
+            [x_ent, 0.5,       0.5      ], [x_obj_far, 0.5,          0.5 - h_obj],
+        ], dtype=np.float32)
+
+        # Image-side cone (green): apex at exit, opens FORWARD toward the sensor.
+        # A backward sensor ray within bwd_half_angle can traverse back to the scene.
+        x_img_far_w = x_exit_w + extent
+        x_img_far   = _nx(x_img_far_w)
+        h_img       = float(math.tan(float(_ap["bwd_half_angle"])) * extent / yz_span)
+        img_lines = np.array([
+            [x_exit, 0.5,      0.5      ], [x_img_far, 0.5 + h_img, 0.5      ],
+            [x_exit, 0.5,      0.5      ], [x_img_far, 0.5 - h_img, 0.5      ],
+            [x_exit, 0.5,      0.5      ], [x_img_far, 0.5,          0.5 + h_img],
+            [x_exit, 0.5,      0.5      ], [x_img_far, 0.5,          0.5 - h_img],
+        ], dtype=np.float32)
+
+        t     = t_now * 0.16
+        if mode < 0 or mode == 0:
+            a_rot = 0.24 * math.sin(t)
+        elif mode == 2:
+            a_rot = math.pi / 2.0
+        else:
+            a_rot = 0.0
+        ca, sa = math.cos(a_rot), math.sin(a_rot)
+
+        def _project(pts3):
+            """Project (N,3) XYZ → (N,2) NDC using the same rotation as point shader."""
+            x  = pts3[:, 0]
+            yz = pts3[:, 1:] - 0.5
+            v  = yz[:, 0] * ca + yz[:, 1] * sa
+            return np.stack([x * 2.0 - 1.0, v * 2.0], axis=1).astype(np.float32)
+
+        glUseProgram(cone_prog)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+        glLineWidth(2.0)
+        glEnableClientState(GL_VERTEX_ARRAY)
+
+        def _draw_lines(pts3, r, g, b):
+            pts2 = np.ascontiguousarray(_project(pts3))
+            glUniform4f(glGetUniformLocation(cone_prog, "u_color"), r, g, b, 0.75)
+            glVertexPointer(2, GL_FLOAT, 0, pts2)
+            glDrawArrays(GL_LINES, 0, int(pts2.shape[0]))
+
+        def _draw_loop(pts3, r, g, b):
+            pts2 = np.ascontiguousarray(_project(pts3))
+            glUniform4f(glGetUniformLocation(cone_prog, "u_color"), r, g, b, 0.75)
+            glVertexPointer(2, GL_FLOAT, 0, pts2)
+            glDrawArrays(GL_LINE_STRIP, 0, int(pts2.shape[0]))
+
+        # Entrance aperture ring + object-side FOV cone: red
+        _draw_loop(ent_circle, 1.0, 0.18, 0.18)
+        _draw_lines(obj_lines, 1.0, 0.18, 0.18)
+        # Exit aperture ring + image-side FOV cone: green
+        _draw_loop(exit_circle, 0.18, 1.0, 0.18)
+        _draw_lines(img_lines,  0.18, 1.0, 0.18)
+
+        glLineWidth(1.0)
         glDisableClientState(GL_VERTEX_ARRAY)
         glDisable(GL_BLEND)
         glUseProgram(0)
@@ -7507,7 +7946,7 @@ def run(
                     _gl_renderer.set_field_volume_texture(int(tex_field), field_gain)
                     if frame_profiler is not None:
                         frame_profiler.end("upload_volume")
-                    for _ci in range(4):
+                    for _ci in range(6):
                         _svc[_ci] = new_vbc[_ci]
                 except Exception as exc:
                     if frame_profiler is not None:
@@ -7530,6 +7969,9 @@ def run(
                 f"shuffle={bench.intent_shuffle:.2f} ([/] to adjust)"
             )
 
+            # Apply any pending LUT/MLP transition from the background worker.
+            bench._poll_assembly_mode_switch()
+
             glClearColor(8/255, 8/255, 10/255, 1.0)
             glClear(GL_COLOR_BUFFER_BIT)
             glViewport(0, 0, W, H)
@@ -7537,6 +7979,8 @@ def run(
             if frame_profiler is not None:
                 frame_profiler.begin("draw_uv_mesh")
             draw_uv_mesh(volume_gain, t_now)
+            draw_surface_points(shader_mode, volume_gain, t_now)
+            draw_acceptance_cones(t_now, shader_mode)
             if frame_profiler is not None:
                 frame_profiler.end("draw_uv_mesh")
                 frame_profiler.begin("draw_pip")
@@ -7567,6 +8011,9 @@ def run(
     finally:
         import gc
         closing.set()
+        # 0. Stop progressive bake thread before tearing down the tracer.
+        if bench._lens_assembly is not None:
+            bench._lens_assembly.stop_progressive_refinement()
         # 1. Stop the drain loop first so it releases the pipeline before we destroy it.
         bench._drain_stop.set()
         if bench._drain_thread is not None:
@@ -7593,12 +8040,15 @@ def run(
             glDeleteBuffers(4, [vbo, mbo, gbo, cbo])
         glDeleteProgram(volume_prog)
         glDeleteProgram(point_prog)
+        glDeleteProgram(cone_prog)
         glDeleteProgram(pip_prog)
         glDeleteProgram(mesh_prog)
         glDeleteShader(vs)
         glDeleteShader(fs)
         glDeleteShader(pvs)
         glDeleteShader(pfs)
+        glDeleteShader(cvs)
+        glDeleteShader(cfs)
         glDeleteShader(pip_vs)
         glDeleteShader(pip_fs)
         glDeleteShader(mvs)

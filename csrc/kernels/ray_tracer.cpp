@@ -546,6 +546,30 @@ struct RayTracerState {
      * cum_areas[g] is a CDF over tri_indices[g]; the last entry is the
      * group's total area.  Used for area-weighted emissive sampling.
      */
+    /* Per-GID manifold dispatch stats.  One entry per registered tri-group, sized
+     * alongside tri_groups.  Keyed by (gid, magic) — magic is set at registration
+     * from the first float of the parametric payload, making each entry fully
+     * self-describing without a separate look-up.  Counters are incremented by
+     * CPU T2 (pipeline_refiner) and the batch trace path for every manifold hit
+     * regardless of representation (parametric/MLP/LUT/absorber). */
+    struct ManifoldGIDStats {
+        float                 magic = 0.0f;  /* payload magic (14949=param, 14948=MLP, 14946-51=LUT) */
+        std::atomic<uint64_t> ok{0};         /* rays successfully teleported through this surface    */
+        std::atomic<uint64_t> abs{0};        /* rays absorbed (vignetting, TIR, unknown magic)       */
+        ManifoldGIDStats() noexcept = default;
+        explicit ManifoldGIDStats(float m) noexcept : magic(m) {}
+        /* Copy resets counters but preserves magic — safe for vector reallocation
+         * at registration time (before any tracing starts). */
+        ManifoldGIDStats(const ManifoldGIDStats& o) noexcept : magic(o.magic) {}
+        ManifoldGIDStats& operator=(const ManifoldGIDStats& o) noexcept {
+            magic = o.magic;
+            ok .store(0, std::memory_order_relaxed);
+            abs.store(0, std::memory_order_relaxed);
+            return *this;
+        }
+    };
+    std::vector<ManifoldGIDStats>      gid_manifold_stats;
+
     std::vector<TriGroupDesc>          tri_groups;          /* descriptors  */
     std::vector<std::vector<int>>      tri_group_indices;   /* per-group   */
     std::vector<std::vector<double>>   tri_group_cum_areas; /* per-group   */
@@ -577,6 +601,24 @@ struct RayTracerState {
     std::vector<int>                   group_uv_accum_offset;  /* per-group offset into uv_accum (uint32s) */
     int                                uv_accum_total = 0;     /* total uint32 slots allocated */
     mutable std::vector<uint32_t>      uv_accum_cpu;           /* flat CPU-side accumulator     */
+
+    /* ── BSSRDF per-triangle illumination accumulator ──────────────────────
+     * Forward paths that hit a transmissive surface with diffuse_frac > 0
+     * accumulate their pre-interaction amplitude here (thread-safe via
+     * uv_accum_add).  Backward paths (color_flag==1 / is_backward=true)
+     * query this buffer to claim analytical diffuse illumination without
+     * Monte Carlo scatter traversal through the diffusing volume.
+     *
+     * Layout per triangle: stride = 2*tri_illum_nb + 2 uint32 slots:
+     *   [2*b + 0] amp_sum[b].real() × 32768  (int32 in uint32 slot)
+     *   [2*b + 1] amp_sum[b].imag() × 32768  (int32 in uint32 slot)
+     *   [2*nb   ] cos_sum           × 32768  (int32 in uint32 slot)
+     *   [2*nb+1 ] count             as uint32 integer
+     *
+     * Call ray_tracer_init_illum_accum() once after geometry is set.
+     * Call ray_tracer_reset_illum_accum() between forward-pass batches. */
+    std::vector<uint32_t>              tri_illum_accum;         /* flat uint32 buffer  */
+    int                                tri_illum_nb = 0;        /* n_bands used in buf */
 
     /* Camera-visibility wrappers for image accumulation entry points. */
     int                                camera_vis_mode = RT_CAM_VIS_AS_IS;
@@ -1171,12 +1213,49 @@ static inline const float* tri_neural_assembly_payload(
     return reinterpret_cast<const float*>(pb.data());
 }
 
+/* Return the manifold payload for any lens-teleport tri-group (kind=4 MLP,
+ * kind=5 parametric).  Also returns a non-null sentinel for empty-payload
+ * groups (interior absorbers): check *out_bytes == 0 to distinguish absorbers
+ * from teleport payloads.  Returns nullptr when the triangle carries no
+ * manifold group at all (SDF_SPHERE, POLY_BARY, or unregistered). */
+static inline const float* tri_manifold_payload(
+    const RayTracerState& st, int tri_id, int* out_bytes)
+{
+    if (tri_id < 0 || (size_t)tri_id >= st.tri_param_group_of_tri.size()) return nullptr;
+    int gid = st.tri_param_group_of_tri[(size_t)tri_id];
+    if (gid < 0 || (size_t)gid >= st.tri_group_parametric_kind.size()) return nullptr;
+    const int kind = st.tri_group_parametric_kind[(size_t)gid];
+    if (kind != TRI_PARAM_SURFACE_NEURAL_ASSEMBLY &&
+        kind != TRI_PARAM_SURFACE_PARAMETRIC_LENS)
+        return nullptr;
+    const auto& pb = st.tri_group_parametric_payload[(size_t)gid];
+    if (out_bytes) *out_bytes = (int)pb.size();
+    if (pb.empty()) {
+        static const float _absorb_sentinel = 0.0f;
+        return &_absorb_sentinel;   /* non-null + out_bytes==0 → absorber */
+    }
+    return reinterpret_cast<const float*>(pb.data());
+}
+
 /* apply_neural_mlp_from_f32 — inner MLP dispatch that works directly from a
  * raw float32 payload pointer.  Called by both the scale-context path and the
  * parametric surface hit path. */
 static inline void apply_neural_mlp_from_f32(
     const RayTracerState& st,
     const float* p, int payload_bytes,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len);
+
+static inline bool apply_parametric_lens_from_f32(
+    const RayTracerState& st,
+    const float* p, int payload_bytes,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len);
+
+static inline void apply_manifold_transfer_from_payload(
+    const RayTracerState& st,
+    const float* p, int payload_bytes,
+    const V3d& ap_hit,
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len);
 
@@ -1693,6 +1772,13 @@ struct BounceStepResult {
     bool     is_sensor_hit;
     bool     is_emissive_hit;
     int      sensor_group_id;
+    /* BSSRDF analytical contribution (backward path at diffuse-transmissive surface).
+     * When has_illum_contrib=true, illum_contrib carries the per-band complex
+     * amplitude that the backward ray receives analytically from forward-path
+     * illumination accumulated in tri_illum_accum.  Caller should emit this as
+     * an EndpointRecord rather than waiting for a stochastic scatter hit. */
+    bool     has_illum_contrib;
+    VXcd     illum_contrib;
 };
 
 static BounceStepResult ray_bounce_step_bdpt(
@@ -4952,11 +5038,36 @@ static int scheduler_advance_ray(
         V3d hit_pos = p1;
         apply_parametric_surface_point(st, hit_tri, hit_pos, hit_pos, hit_n_geom);
         {
-            int nb = 0;
-            const float* nap = tri_neural_assembly_payload(st, hit_tri, &nb);
-            if (nap) {
+            int nb_mfld = 0;
+            const float* mpp = tri_manifold_payload(st, hit_tri, &nb_mfld);
+            if (mpp) {
+                if (nb_mfld < (int)(8 * sizeof(float))) {
+                    /* Interior absorber — kill ray. */
+                    rs.alive = 0;
+                    for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+                    return -2;
+                }
+                /* pos is set to T1 proxy-mesh hit; for PARAMETRIC the
+                 * apply_* function now seeks to the exact s=0 conic entry. */
                 pos = hit_pos;
-                apply_neural_mlp_from_f32(st, nap, nb, pos, dir, amp, &rs.path_len);
+                const float magic = mpp[0];
+                bool absorbed = false;
+                if (magic == 14949.0f) {
+                    absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, pos, dir, amp, &rs.path_len);
+                } else if (magic == 14948.0f) {
+                    apply_neural_mlp_from_f32(st, mpp, nb_mfld, pos, dir, amp, &rs.path_len);
+                } else if (magic == 14946.0f || magic == 14947.0f ||
+                           magic == 14950.0f || magic == 14951.0f) {
+                    apply_manifold_transfer_from_payload(st, mpp, nb_mfld,
+                        hit_pos, pos, dir, amp, &rs.path_len);
+                } else {
+                    absorbed = true;
+                }
+                if (absorbed) {
+                    rs.alive = 0;
+                    for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
+                    return -2;
+                }
                 rs.pos[0] = pos.x(); rs.pos[1] = pos.y(); rs.pos[2] = pos.z();
                 rs.dir[0] = dir.x(); rs.dir[1] = dir.y(); rs.dir[2] = dir.z();
                 for (int b = 0; b < n_bands; ++b) st.ray_amp_pool[amp_base + b] = amp[b];
@@ -5241,10 +5352,12 @@ extern "C" SK_API int ray_tracer_register_tri_group(
     st->tri_group_parametric_payload.push_back(std::move(param_payload));
 
     if (desc->parametric_surface_kind != TRI_PARAM_SURFACE_NONE) {
-        const bool neural = (desc->parametric_surface_kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY);
+        const bool can_overwrite =
+            (desc->parametric_surface_kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY ||
+             desc->parametric_surface_kind == TRI_PARAM_SURFACE_PARAMETRIC_LENS);
         for (int t : st->tri_group_indices.back()) {
             if (t >= 0 && t < (int)st->tri_param_group_of_tri.size()
-                && (st->tri_param_group_of_tri[(size_t)t] < 0 || neural))
+                && (st->tri_param_group_of_tri[(size_t)t] < 0 || can_overwrite))
                 st->tri_param_group_of_tri[(size_t)t] = copy.group_id;
         }
     }
@@ -5334,6 +5447,12 @@ extern "C" SK_API int ray_tracer_register_tri_group(
         st->group_uv_accum_offset.push_back(0);
     }
 
+    {
+        float m = 0.0f;
+        const auto& pp = st->tri_group_parametric_payload.back();
+        if (pp.size() >= sizeof(float)) std::memcpy(&m, pp.data(), sizeof(float));
+        st->gid_manifold_stats.emplace_back(m);
+    }
     return copy.group_id;
 }
 
@@ -5350,6 +5469,7 @@ extern "C" SK_API int ray_tracer_clear_tri_groups(RayTracerState* st)
     st->tri_group_parametric_kind.clear();
     st->tri_group_parametric_payload.clear();
     st->tri_param_group_of_tri.assign(st->tris.size(), -1);
+    st->gid_manifold_stats.clear();
     /* UV integrator image state */
     st->group_uv_res.clear();
     st->group_uv_accum_offset.clear();
@@ -5364,6 +5484,19 @@ extern "C" SK_API int ray_tracer_n_tri_groups(const RayTracerState* st)
 {
     if (!st) return 0;
     return static_cast<int>(st->tri_groups.size());
+}
+
+extern "C" SK_API int ray_tracer_get_manifold_gid_stats(
+    const RayTracerState* st, int gid,
+    float* out_magic, uint64_t* out_transmitted, uint64_t* out_absorbed)
+{
+    if (!st || gid < 0 || (size_t)gid >= st->gid_manifold_stats.size())
+        return SK_ERR_NULL_STATE;
+    const auto& s = st->gid_manifold_stats[(size_t)gid];
+    if (out_magic)       *out_magic       = s.magic;
+    if (out_transmitted) *out_transmitted = s.ok .load(std::memory_order_relaxed);
+    if (out_absorbed)    *out_absorbed    = s.abs.load(std::memory_order_relaxed);
+    return SK_OK;
 }
 
 extern "C" SK_API int ray_tracer_get_group_uv_image(
@@ -5625,15 +5758,16 @@ static BounceStepResult ray_bounce_step_bdpt(
 {
     const bool has_bvh = !st.bvh_nodes.empty();
     BounceStepResult res;
-    res.hit_tri         = -1;
-    res.hit_tri_flags   = 0u;
-    res.should_continue = false;
-    res.is_sensor_hit   = false;
-    res.is_emissive_hit = false;
-    res.sensor_group_id = -1;
-    
+    res.hit_tri           = -1;
+    res.hit_tri_flags     = 0u;
+    res.should_continue   = false;
+    res.is_sensor_hit     = false;
+    res.is_emissive_hit   = false;
+    res.sensor_group_id   = -1;
+    res.has_illum_contrib = false;
+
     std::uniform_real_distribution<double> U(0.0, 1.0);
-    
+
     /* ─ Intersection query ─ */
     double t_hit = 1e18;
     if (has_bvh) {
@@ -5651,7 +5785,7 @@ static BounceStepResult ray_bounce_step_bdpt(
     if (res.hit_tri < 0) {
         return res;  /* Miss → terminate */
     }
-    
+
     /* ─ Compute hit point and attenuation ─ */
     res.hit_pos = pos + t_hit * dir;
     res.hit_n_param = st.tris[(size_t)res.hit_tri].normal;
@@ -5683,14 +5817,49 @@ static BounceStepResult ray_bounce_step_bdpt(
 
     if (amp_at_hit) *amp_at_hit = amp;  /* post-propagation, pre-reflection */
 
-    /* ─ Neural assembly surface dispatch ─ */
+    /* ─ Manifold surface dispatch (MLP / parametric / LUT) ─ */
     {
-        int nb = 0;
-        const float* nap = tri_neural_assembly_payload(st, res.hit_tri, &nb);
-        if (nap) {
+        int nb_mfld = 0;
+        const float* mpp = tri_manifold_payload(st, res.hit_tri, &nb_mfld);
+        if (mpp) {
+            if (nb_mfld < (int)(8 * sizeof(float))) {
+                /* Interior absorber — drop ray. */
+                res.hit_tri      = -1;
+                res.should_continue = false;
+                return res;
+            }
+            /* pos is set to T1 proxy-mesh hit; for PARAMETRIC the
+             * apply_* function now seeks to the exact s=0 conic entry. */
+            const float magic = mpp[0];
             pos = res.hit_pos;
-            apply_neural_mlp_from_f32(st, nap, nb, pos, dir, amp, &path_len);
-            res.hit_pos = pos;
+            bool absorbed = false;
+            if (magic == 14949.0f) {
+                absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, pos, dir, amp, &path_len);
+            } else if (magic == 14948.0f) {
+                apply_neural_mlp_from_f32(st, mpp, nb_mfld, pos, dir, amp, &path_len);
+            } else if (magic == 14946.0f || magic == 14947.0f ||
+                       magic == 14950.0f || magic == 14951.0f) {
+                apply_manifold_transfer_from_payload(st, mpp, nb_mfld,
+                    res.hit_pos, pos, dir, amp, &path_len);
+            } else {
+                absorbed = true;
+            }
+            {
+                const int _gp = (res.hit_tri >= 0 &&
+                                 (size_t)res.hit_tri < st.tri_param_group_of_tri.size())
+                                ? st.tri_param_group_of_tri[(size_t)res.hit_tri] : -1;
+                if (_gp >= 0 && (size_t)_gp < st.gid_manifold_stats.size()) {
+                    auto& _ms = st.gid_manifold_stats[(size_t)_gp];
+                    if (absorbed) _ms.abs.fetch_add(1, std::memory_order_relaxed);
+                    else          _ms.ok .fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            if (absorbed) {
+                res.hit_tri      = -1;
+                res.should_continue = false;
+                return res;
+            }
+            res.hit_pos         = pos;
             res.should_continue = true;
             return res;
         }
@@ -5732,9 +5901,103 @@ static BounceStepResult ray_bounce_step_bdpt(
     }
 
     const bool mat_transmissive = tri_material_is_transmissive(st, tri);
-    
+    const float bssrdf_d_frac   = mat_cache_diffusion(st.mat_cache, tri.mat_idx);
+
+    /* ── BSSRDF forward: accumulate pre-interaction amplitude at diffuse-transmissive
+     * surfaces so that backward paths can query it analytically.
+     * Single-threaded BDPT path: uv_accum_add is atomic but contention is zero. */
+    if (!is_backward && mat_transmissive && bssrdf_d_frac > 0.0f
+        && !st.tri_illum_accum.empty())
+    {
+        const int nb_il  = st.tri_illum_nb;
+        const int stride = 2 * nb_il + 2;
+        const int base   = res.hit_tri * stride;
+        if (nb_il > 0 && base >= 0 && base + stride <= (int)st.tri_illum_accum.size()) {
+            const double cos_i_il = std::max(0.0, -dir.dot(hit_n));
+            auto add_fp_il = [&](int off, double val) {
+                const int32_t fp = (int32_t)std::max(-1073741824.0,
+                    std::min(1073741824.0, val * 32768.0));
+                uv_accum_add(st.tri_illum_accum[(size_t)(base + off)], (uint32_t)fp);
+            };
+            for (int b = 0; b < std::min(n_bands, nb_il); ++b) {
+                add_fp_il(2 * b,     amp[b].real());
+                add_fp_il(2 * b + 1, amp[b].imag());
+            }
+            add_fp_il(2 * nb_il, cos_i_il);
+            uv_accum_add(st.tri_illum_accum[(size_t)(base + 2 * nb_il + 1)], 1u);
+        }
+    }
+
     /* ─ Material physics: transmission vs. reflection ─ */
     if (mat_transmissive) {
+        /* ── BSSRDF backward: analytical illumination claim ────────────────────
+         * A backward ray at a diffuse-transmissive surface analytically receives
+         * illumination accumulated during the forward pass.  This replaces the
+         * futile scatter-volume traversal for the diffuse fraction.
+         *
+         * Coupling weight = T_fresnel × diffuse_frac × avg_cos_forward / π
+         *
+         *   T_fresnel    power fraction entering the surface from the backward side
+         *   diffuse_frac fraction of that power which was scattered (not refracted)
+         *   avg_cos/π    Lambertian normalization for the illuminated surface
+         *
+         * The backward amplitude is scaled by (1 − diffuse_frac) before the
+         * standard Snell/Fresnel block below so the coherent portion is not
+         * double-counted. */
+        if (is_backward && bssrdf_d_frac > 0.0f && !st.tri_illum_accum.empty()) {
+            const int nb_il  = st.tri_illum_nb;
+            const int stride = 2 * nb_il + 2;
+            const int base   = res.hit_tri * stride;
+            if (nb_il > 0 && base >= 0 && base + stride <= (int)st.tri_illum_accum.size()) {
+                const int count = static_cast<int>(
+                    st.tri_illum_accum[(size_t)(base + stride - 1)]);
+                if (count > 0) {
+                    const bool fface_bk = (dir.dot(res.hit_n_param) < 0.0);
+                    int mfrom_bk = -1, mto_bk = -1;
+                    tri_boundary_media(tri, fface_bk, mfrom_bk, mto_bk);
+                    const double n1_bk = (mfrom_bk >= 0) ? medium_n_real(st, mfrom_bk)
+                        : ((current_medium_mat_idx >= 0)
+                           ? mat_n_real(st, current_medium_mat_idx) : 1.0);
+                    const double n2_bk = (mto_bk >= 0) ? medium_n_real(st, mto_bk)
+                        : (fface_bk ? mat_n_real(st, tri.mat_idx) : 1.0);
+                    const double cos_i_bk = std::max(0.0, -dir.dot(hit_n));
+                    V3d refr_bk;
+                    const bool can_bk = snell_refract(dir, hit_n, n1_bk, n2_bk, refr_bk);
+                    double T_bk = 0.0;
+                    if (can_bk) {
+                        const double sin2_bk  = (n1_bk/n2_bk)*(n1_bk/n2_bk)
+                                                * (1.0 - cos_i_bk*cos_i_bk);
+                        const double cos_t_bk = std::sqrt(std::max(0.0, 1.0 - sin2_bk));
+                        T_bk = 1.0 - fresnel_R(cos_i_bk, cos_t_bk, n1_bk, n2_bk);
+                    }
+                    if (T_bk > 1e-9) {
+                        const double cos_sum_bk = static_cast<double>(
+                            static_cast<int32_t>(
+                                st.tri_illum_accum[(size_t)(base + 2*nb_il)])) / 32768.0;
+                        const double avg_cos_bk = cos_sum_bk / static_cast<double>(count);
+                        const double coupling   = T_bk * static_cast<double>(bssrdf_d_frac)
+                                                  * avg_cos_bk / M_PI;
+                        const double inv_n_bk   = 1.0 / static_cast<double>(count);
+                        res.has_illum_contrib   = true;
+                        res.illum_contrib       = VXcd::Zero(n_bands);
+                        for (int b = 0; b < std::min(n_bands, nb_il); ++b) {
+                            const double re_il = static_cast<double>(
+                                static_cast<int32_t>(
+                                    st.tri_illum_accum[(size_t)(base + 2*b)])) / 32768.0;
+                            const double im_il = static_cast<double>(
+                                static_cast<int32_t>(
+                                    st.tri_illum_accum[(size_t)(base + 2*b+1)])) / 32768.0;
+                            const cd illum_avg_bk(re_il * inv_n_bk, im_il * inv_n_bk);
+                            res.illum_contrib[b] = amp[b] * coupling * illum_avg_bk;
+                        }
+                    }
+                    /* Scale backward amplitude to coherent fraction only. */
+                    const double scale_bk = 1.0 - static_cast<double>(bssrdf_d_frac);
+                    for (int b = 0; b < n_bands; ++b) amp[b] *= scale_bk;
+                }
+            }
+        }
+
         /* Fresnel refraction / TIR for glass surfaces */
         const bool front_face = (dir.dot(res.hit_n_param) < 0.0);
         int medium_from = -1, medium_to = -1;
@@ -5921,8 +6184,10 @@ static int ray_tracer_bidirectional_impl(
                     *st, tri_sensor_group.data(), pos, dir, amp, path_len,
                     current_medium_mat_idx, interaction_flags, n_bands, min_amplitude, rng,
                     nullptr, false);
-                
-                if (step.hit_tri < 0) break;  /* Miss */
+
+                if (step.hit_tri < 0) {
+                    break;  /* Miss */
+                }
                 
                 /* ─ Forward-path-specific: legacy visualization callback ─ */
                 append_camera_strike(
@@ -6509,6 +6774,260 @@ static inline void apply_neural_mlp_from_f32(
     pos = new_pos - dir * (EPS * 200.0);
 }
 
+/* ── apply_parametric_lens_from_f32 ─────────────────────────────────────────
+ * CPU equivalent of GPU T2 parametric_lens_teleport().
+ * Reads CompoundLens.build_gpu_payload() float32 payload (magic 14949),
+ * evaluates exact conic intersection + vector Snell at each surface, and
+ * teleports pos/dir to the assembly exit.  Returns true if the ray was
+ * absorbed (vignetted, TIR, degenerate), false if teleported successfully.
+ * Optical axis is scene-X (same convention as CompoundLens). */
+static inline bool apply_parametric_lens_from_f32(
+    const RayTracerState& st,
+    const float* p, int payload_bytes,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len)
+{
+    if (!p) return true;
+    if (payload_bytes < (int)(8 * sizeof(float))) return true;
+    if (p[0] != 14949.0f) return true;    /* PLENS_MAGIC */
+
+    const int   n_surf  = (int)p[1];
+    const float hood_r  = p[2];
+    const float hood_xf = p[3];
+
+    if (n_surf < 1 || n_surf > 64) return true;
+    if (payload_bytes < (int)((8 + n_surf * 8) * sizeof(float))) return true;
+
+    /* Lens hood: if opening radius is set, check if ray enters outside it. */
+    if (hood_r > 0.0f && std::abs(dir[0]) > 1e-12) {
+        const double t_hood = (double(hood_xf) - pos[0]) / dir[0];
+        if (t_hood < 0.0) {
+            const V3d p_hood = pos + t_hood * dir;
+            if (std::hypot(p_hood[1], p_hood[2]) > (double)hood_r)
+                return true;
+        }
+    }
+
+    double opl = 0.0;
+    V3d    rp  = pos;
+    V3d    rd  = dir;
+
+    for (int s = 0; s < n_surf; ++s) {
+        const int    sb    = 8 + s * 8;   /* PLENS_HEADER + s * PLENS_SURF_STRIDE */
+        const double x_v   = (double)p[sb + 0];
+        const double R     = (double)p[sb + 1];
+        const double n_bf  = (double)p[sb + 2];
+        const double n_af  = (double)p[sb + 3];
+        const double ap_r  = (double)p[sb + 4];
+        const double k     = (double)p[sb + 5];
+        const bool is_stop = ((int)p[sb + 6] & 1) != 0;
+
+        /* Seek to exact parametric surface.
+         *
+         * s=0: entry seek from T1 BVH hit position.  The proxy mesh that fired
+         * T1 is geometrically close to the parametric surface but not identical.
+         * Allow t ∈ [-0.01, +∞) so the ray can roll back up to 1 cm to reach
+         * the exact conic vertex — this corrects for proxy-mesh overshoot without
+         * letting a ray that missed entirely sneak in.
+         *
+         * s>0: the previous Snell step left rp just in front of the next surface;
+         * t must be strictly forward (> 2e-7 m). */
+        {
+            const double t_min = (s == 0) ? -1e-2 : 2e-7;
+            double t = 1e30;
+            if (std::abs(R) < 1e-12) {
+                if (std::abs(rd[0]) < 1e-12) return true;
+                t = (x_v - rp[0]) / rd[0];
+            } else {
+                const double c  = 1.0 / R;
+                const double kp = 1.0 + k;
+                const double ox = rp[0] - x_v, oy = rp[1], oz = rp[2];
+                const double dx = rd[0],  dy = rd[1],  dz = rd[2];
+                const double A  = c * (dy*dy + dz*dz + kp*dx*dx);
+                const double B  = 2.0 * (c*(oy*dy + oz*dz + kp*ox*dx) - dx);
+                const double C  = c * (oy*oy + oz*oz + kp*ox*ox) - 2.0*ox;
+                if (std::abs(A) < 1e-14) {
+                    if (std::abs(B) < 1e-14) return true;
+                    t = -C / B;
+                } else {
+                    const double disc = B*B - 4.0*A*C;
+                    if (disc < 0.0) return true;
+                    const double sq   = std::sqrt(disc);
+                    const double t1   = (-B - sq) / (2.0 * A);
+                    const double t2   = (-B + sq) / (2.0 * A);
+                    if (s == 0) {
+                        /* Pick the root with smallest |t| that is >= t_min. */
+                        const bool v1 = t1 >= t_min, v2 = t2 >= t_min;
+                        if (v1 && v2)      t = (std::abs(t1) <= std::abs(t2)) ? t1 : t2;
+                        else if (v1)       t = t1;
+                        else if (v2)       t = t2;
+                        else return true;
+                    } else {
+                        const double x1 = rp[0] + t1 * dx;
+                        const double x2 = rp[0] + t2 * dx;
+                        if (t1 > 2e-7 && std::abs(x1 - x_v) <= std::abs(x2 - x_v)) t = t1;
+                        else if (t2 > 2e-7) t = t2;
+                        else return true;
+                    }
+                }
+            }
+            if (t < t_min) return true;
+            opl += n_bf * t;
+            rp  += t * rd;
+        }
+
+        /* Aperture/stop check. */
+        const double r_tr = std::hypot(rp[1], rp[2]);
+        if (ap_r > 0.0 && r_tr > ap_r) return true;
+        if (is_stop) continue;
+
+        /* Exact surface normal (gradient of conic implicit). */
+        V3d surf_n;
+        if (std::abs(R) < 1e-12) {
+            surf_n = V3d(1.0, 0.0, 0.0);
+        } else {
+            const double c  = 1.0 / R;
+            const double kp = 1.0 + k;
+            const double dx = rp[0] - x_v;
+            surf_n = V3d(-1.0 + kp*c*dx, c*rp[1], c*rp[2]);
+            const double nn = surf_n.norm();
+            surf_n = (nn > 1e-14) ? surf_n / nn : V3d(1.0, 0.0, 0.0);
+        }
+        if (rd.dot(surf_n) > 0.0) surf_n = -surf_n;
+
+        /* Vector Snell's law. */
+        const double cos_i  = -rd.dot(surf_n);
+        const double eta    = n_bf / n_af;
+        const double sin2_t = eta * eta * std::max(0.0, 1.0 - cos_i*cos_i);
+        if (sin2_t > 1.0) return true;   /* TIR */
+        const double cos_t  = std::sqrt(1.0 - sin2_t);
+        V3d refr = eta * rd + (eta * cos_i - cos_t) * surf_n;
+        const double rn = refr.norm();
+        if (rn < 1e-14) return true;
+        rd = refr / rn;
+    }
+
+    /* Accumulate OPL phase on all bands. */
+    if (opl > 0.0 && path_len) {
+        const double c0 = (st.speed_m_s > EPS) ? st.speed_m_s : 299792458.0;
+        for (int b = 0; b < (int)amp.size() && b < st.n_bands; ++b) {
+            const double phase = TWO_PI * st.freq_hz_vec[b] * opl / c0;
+            amp[b] *= cd(std::cos(phase), std::sin(phase));
+        }
+        *path_len += opl;
+    }
+
+    pos = rp + rd * (EPS * 200.0);
+    dir = rd;
+    return false;   /* teleported */
+}
+
+/* ── apply_manifold_transfer_from_payload ───────────────────────────────────
+ * Like apply_manifold_transfer() but reads directly from a raw float payload
+ * pointer instead of a RtScaleContext.  The aperture hit point is provided
+ * directly (it is the T1/T2 BVH hit position, already on the entry plane). */
+static inline void apply_manifold_transfer_from_payload(
+    const RayTracerState& st,
+    const float* p, int payload_bytes,
+    const V3d& ap_hit,
+    V3d& pos, V3d& dir, VXcd& amp,
+    double* path_len)
+{
+    if (!p) { kill_ray_amplitudes(amp); return; }
+    if (payload_bytes < (int)(8 * sizeof(float))) { kill_ray_amplitudes(amp); return; }
+    /* Construct a temporary RtScaleContext so we can reuse apply_manifold_transfer. */
+    RtScaleContext tmp_ctx;
+    std::memset(&tmp_ctx, 0, sizeof(tmp_ctx));
+    tmp_ctx.payload            = p;
+    tmp_ctx.payload_size_bytes = payload_bytes;
+    /* axis_idx is stored at p[14] for V3/V4 or defaults to 2 (Z). */
+    const bool is_v3v4 = (p[0] == 14950.0f || p[0] == 14951.0f);
+    const int  ax_idx  = is_v3v4 ? (int)p[14] : 2;
+    /* Set center on the aperture plane using the BVH hit position. */
+    tmp_ctx.center[0] = (float)ap_hit[0];
+    tmp_ctx.center[1] = (float)ap_hit[1];
+    tmp_ctx.center[2] = (float)ap_hit[2];
+    /* Override: set the axis component to the exact hit pos so t=0 in the
+     * projection step of apply_manifold_transfer and ap_hit = pos. */
+    (void)ax_idx;
+    pos = ap_hit;   /* ray is already at the aperture plane */
+    apply_manifold_transfer(st, tmp_ctx, pos, dir, amp, path_len);
+}
+
+/* ── seek_parametric_entry_s0 ────────────────────────────────────────────────
+ * Advance (or roll back) `pos` from the T1 BVH proxy-mesh hit to the exact
+ * parametric s=0 entrance surface defined in a PLENS payload (magic 14949).
+ * Used before dispatching LUT or MLP transfers so their entry state is
+ * anchored on the true parametric geometry, not the proxy mesh.
+ *
+ * `dir` is left unchanged — LUT/MLP encode the full lens including the first
+ * surface refraction; the caller provides the pre-refraction incident direction.
+ *
+ * Returns false if the payload is invalid or the ray misses / is out of range.
+ * On success `pos` is at the exact s=0 surface intersection and `opl_accum`
+ * receives n_before * t (air path from proxy hit to parametric surface). */
+static inline bool seek_parametric_entry_s0(
+    const float* p, int payload_bytes,
+    V3d& pos, const V3d& dir, double& opl_accum)
+{
+    if (!p || payload_bytes < (int)(16 * sizeof(float))) return false;
+    /* Works for PLENS (14949) and LUT/MLP payloads that embed a PLENS header at
+     * a 16-float offset — for those, surface geometry lives in the same place. */
+    if (p[0] != 14949.0f) return false;  /* only PLENS carries explicit surface geometry */
+
+    const int   n_surf = (int)p[1];
+    if (n_surf < 1) return false;
+
+    const int    sb   = 8;   /* s=0 surface record start */
+    const double x_v  = (double)p[sb + 0];
+    const double R    = (double)p[sb + 1];
+    const double n_bf = (double)p[sb + 2];
+    const double ap_r = (double)p[sb + 4];
+    const double k    = (double)p[sb + 5];
+
+    V3d rp = pos;
+    const V3d& rd = dir;
+    double t = 1e30;
+
+    if (std::abs(R) < 1e-12) {
+        if (std::abs(rd[0]) < 1e-12) return false;
+        t = (x_v - rp[0]) / rd[0];
+    } else {
+        const double c  = 1.0 / R;
+        const double kp = 1.0 + k;
+        const double ox = rp[0] - x_v, oy = rp[1], oz = rp[2];
+        const double dx = rd[0],  dy = rd[1],  dz = rd[2];
+        const double A  = c * (dy*dy + dz*dz + kp*dx*dx);
+        const double B  = 2.0 * (c*(oy*dy + oz*dz + kp*ox*dx) - dx);
+        const double C  = c * (oy*oy + oz*oz + kp*ox*ox) - 2.0*ox;
+        if (std::abs(A) < 1e-14) {
+            if (std::abs(B) < 1e-14) return false;
+            t = -C / B;
+        } else {
+            const double disc = B*B - 4.0*A*C;
+            if (disc < 0.0) return false;
+            const double sq = std::sqrt(disc);
+            const double t1 = (-B - sq) / (2.0 * A);
+            const double t2 = (-B + sq) / (2.0 * A);
+            const bool   v1 = t1 >= -1e-2, v2 = t2 >= -1e-2;
+            if      (v1 && v2) t = (std::abs(t1) <= std::abs(t2)) ? t1 : t2;
+            else if (v1)       t = t1;
+            else if (v2)       t = t2;
+            else return false;
+        }
+    }
+    if (t < -1e-2) return false;
+
+    rp += t * rd;
+
+    /* Aperture check at the exact entry surface. */
+    if (ap_r > 0.0 && std::hypot(rp[1], rp[2]) > ap_r) return false;
+
+    opl_accum += n_bf * t;
+    pos = rp;
+    return true;
+}
+
 /* Thin wrapper so the scale-context dispatch path keeps its original signature. */
 static inline void apply_neural_mlp_transfer(
     const RayTracerState& st,
@@ -6892,12 +7411,15 @@ public:
             upload_ssbo(ssbo_group_kind, st.tri_group_parametric_kind.data(),
                         (GLsizeiptr)(ng * sizeof(int)));
 
-            /* Build neural payload offset table and measure total size. */
+            /* Build neural payload offset table and measure total size.
+             * Both MLP (kind=4) and PARAMETRIC_LENS (kind=5) share NeuralPayBuf
+             * so the GPU shader can read either via the same offset mechanism. */
             std::vector<int> neural_pay_off(static_cast<size_t>(ng), -1);
             size_t total_nf = 0;
             for (int gi = 0; gi < ng; ++gi) {
-                if (st.tri_group_parametric_kind[static_cast<size_t>(gi)]
-                        == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+                const int k = st.tri_group_parametric_kind[static_cast<size_t>(gi)];
+                if (k == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY ||
+                    k == TRI_PARAM_SURFACE_PARAMETRIC_LENS) {
                     const auto& pb = st.tri_group_parametric_payload[static_cast<size_t>(gi)];
                     if (!pb.empty()) {
                         neural_pay_off[static_cast<size_t>(gi)] = static_cast<int>(total_nf);
@@ -6906,13 +7428,14 @@ public:
                 }
             }
 
-            /* Only re-upload the large MLP weight buffer when payload content changed. */
+            /* Only re-upload the large payload buffer when content changed. */
             if (total_nf != neural_pay_floats_uploaded) {
                 std::vector<float> neural_pay_buf;
                 neural_pay_buf.reserve(total_nf);
                 for (int gi = 0; gi < ng; ++gi) {
-                    if (st.tri_group_parametric_kind[static_cast<size_t>(gi)]
-                            == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+                    const int k = st.tri_group_parametric_kind[static_cast<size_t>(gi)];
+                    if (k == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY ||
+                        k == TRI_PARAM_SURFACE_PARAMETRIC_LENS) {
                         const auto& pb = st.tri_group_parametric_payload[static_cast<size_t>(gi)];
                         if (!pb.empty()) {
                             const float* src = reinterpret_cast<const float*>(pb.data());
@@ -6942,7 +7465,8 @@ public:
                     for (int i = 0; i < 6; ++i) dst[i] = (float)src[i];
                 } else if (kind == TRI_PARAM_SURFACE_SDF_SPHERE && pb.size() >= sizeof(double)) {
                     dst[0] = (float)(*reinterpret_cast<const double*>(pb.data()));
-                } else if (kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+                } else if (kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY ||
+                           kind == TRI_PARAM_SURFACE_PARAMETRIC_LENS) {
                     int off = neural_pay_off[static_cast<size_t>(gi)];
                     std::memcpy(dst, &off, sizeof(int));
                 }
@@ -7708,16 +8232,17 @@ public:
             const bool do_field = ps.cfg.gpu_segment_field_capture
                                   && ps.st && ps.st->camera_field_grid;
             static constexpr int Q_OUT_VIS_CAP = 65536;
-            /* Skip the hit readback entirely when Q_out is already full and field
-             * capture is disabled: the STRIKE records would be discarded anyway,
-             * and this avoids a potentially large (10-15 MB) PCIe transfer.   */
-            const int q_space = Q_OUT_VIS_CAP - (int)ps.Q_out.size();
-            if (q_space > 0 || do_field) {
-                /* Only readback the records we'll actually use.  When field
-                 * capture is disabled, limit to n_vis (the cap we'll push to
-                 * Q_out), saving PCIe bandwidth on excess hits.              */
-                const int n_vis = std::max(0, std::min(n_hits, q_space));
-                const int n_rb  = do_field ? n_hits : n_vis;
+            /* Skip the hit readback entirely when Q_out is already full, field
+             * capture is disabled, and there are no parametric groups to count. */
+            const int  q_space   = Q_OUT_VIS_CAP - (int)ps.Q_out.size();
+            const bool do_stats  = ps.st && !ps.st->gid_manifold_stats.empty();
+            if (q_space > 0 || do_field || do_stats) {
+                /* Readback window: vis cap for STRIKE, Q_OUT_VIS_CAP for stats
+                 * (bounded so stats-only mode stays within the same PCIe budget),
+                 * n_hits only for field capture. */
+                const int n_vis   = std::max(0, std::min(n_hits, q_space));
+                const int n_stats = do_stats ? std::min(n_hits, Q_OUT_VIS_CAP) : 0;
+                const int n_rb    = do_field ? n_hits : std::max(n_vis, n_stats);
                 stg_hbuf.resize((size_t)n_rb * HIT_STRIDE);
                 auto& hbuf = stg_hbuf;
                 readback_ssbo(ssbo_hit, hbuf.data(),
@@ -7756,6 +8281,9 @@ public:
                         rec.path_len          = row[12];
                         rec.path_at_seg_start = row[13];
                         memcpy(&rec.hit_tri, row + 14, 4);
+                        rec.hit_group_id = (rec.hit_tri >= 0 && ps.st &&
+                                            (size_t)rec.hit_tri < ps.st->tri_param_group_of_tri.size())
+                                           ? ps.st->tri_param_group_of_tri[(size_t)rec.hit_tri] : -1;
                         memcpy(&rec.mat_idx, row + 15, 4);
                         uint32_t cflag; memcpy(&cflag, row + 16, 4);
                         rec.color_flag = (uint8_t)cflag;
@@ -7776,6 +8304,26 @@ public:
                         for (int b = bands; b < nb; ++b)
                             amp_tmp[b] = cd(0.0, 0.0);
                         accumulate_field_capture_segment(*ps.st, seg_s, hit_p, amp_tmp);
+                    }
+
+                    /* GPU-T2 per-GID outcome: bit2(4u)=teleported, bit3(8u)=absorbed.
+                     * Only NEURAL_ASSEMBLY and PARAMETRIC_LENS set these bits; geometry-
+                     * only refiners (POLY_BARY, SDF_SPHERE) leave them clear. */
+                    if (ps.st) {
+                        uint32_t _cf; std::memcpy(&_cf, row + 16, sizeof(uint32_t));
+                        const bool _tp = (_cf & 4u) != 0u;
+                        const bool _ab = (_cf & 8u) != 0u;
+                        if (_tp || _ab) {
+                            int32_t _ht; std::memcpy(&_ht, row + 14, sizeof(int32_t));
+                            const int _gp = (_ht >= 0 &&
+                                             (size_t)_ht < ps.st->tri_param_group_of_tri.size())
+                                            ? ps.st->tri_param_group_of_tri[(size_t)_ht] : -1;
+                            if (_gp >= 0 && (size_t)_gp < ps.st->gid_manifold_stats.size()) {
+                                auto& _ms = ps.st->gid_manifold_stats[(size_t)_gp];
+                                if (_tp) _ms.ok .fetch_add(1, std::memory_order_relaxed);
+                                else     _ms.abs.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
                     }
                 }
 
@@ -8257,6 +8805,8 @@ static void pipeline_intersector(RayPipelineState& ps)
                 rec.path_len          = static_cast<float>(tot_len);
                 rec.path_at_seg_start = static_cast<float>(intent.path_len);
                 rec.hit_tri           = hit_tri;
+                rec.hit_group_id      = (hit_tri >= 0 && (size_t)hit_tri < st.tri_param_group_of_tri.size())
+                                        ? st.tri_param_group_of_tri[(size_t)hit_tri] : -1;
                 rec.mat_idx           = tri.mat_idx;
                 rec.bary_u            = bu;
                 rec.bary_v            = bv;
@@ -8346,6 +8896,67 @@ static void pipeline_refiner(RayPipelineState& ps)
                 st, hr.hit_tri, hr.hit_pos, rh.refined_pos, rh.refined_n);
             if (hr.incoming_dir.dot(rh.refined_n) > 0.0)
                 rh.refined_n = -rh.refined_n;
+
+            /* ── Manifold teleport: MLP / parametric / LUT (CPU parity with GPU T2)
+             * All three representations share the same intercept: if the hit
+             * triangle belongs to a manifold tri-group (kind=4 or kind=5), apply
+             * the appropriate evaluator and recycle back to T1.  Magic number in
+             * the payload selects the evaluator:
+             *   14948 → MLP (apply_neural_mlp_from_f32)
+             *   14949 → parametric exact conic (apply_parametric_lens_from_f32)
+             *   14946/7/50/51 → LUT bilinear lookup (apply_manifold_transfer_from_payload)
+             * Empty payload (out_bytes==0) → interior absorber: terminate ray. */
+            {
+                int nb_mfld = 0;
+                const float* mpp = tri_manifold_payload(st, hr.hit_tri, &nb_mfld);
+                if (mpp) {
+                    if (nb_mfld < (int)(8 * sizeof(float))) {
+                        /* Interior absorber (no payload or stub) — terminate. */
+                        pipeline_finish_ray(ps);
+                        continue;
+                    }
+                    V3d   tpos = rh.refined_pos;
+                    V3d   tdir = hr.incoming_dir;
+                    VXcd  tamp = hr.amp_propagated;
+                    double tpl = hr.ray.path_len;
+                    bool absorbed = false;
+                    const float magic = mpp[0];
+                    if (magic == 14948.0f) {
+                        apply_neural_mlp_from_f32(st, mpp, nb_mfld, tpos, tdir, tamp, &tpl);
+                    } else if (magic == 14949.0f) {
+                        absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, tpos, tdir, tamp, &tpl);
+                    } else if (magic == 14946.0f || magic == 14947.0f ||
+                               magic == 14950.0f || magic == 14951.0f) {
+                        apply_manifold_transfer_from_payload(st, mpp, nb_mfld,
+                            rh.refined_pos, tpos, tdir, tamp, &tpl);
+                    } else {
+                        absorbed = true;  /* unknown magic → absorb */
+                    }
+                    {
+                        const int _gp = (hr.hit_tri >= 0 &&
+                                         (size_t)hr.hit_tri < st.tri_param_group_of_tri.size())
+                                        ? st.tri_param_group_of_tri[(size_t)hr.hit_tri] : -1;
+                        if (_gp >= 0 && (size_t)_gp < st.gid_manifold_stats.size()) {
+                            auto& _ms = st.gid_manifold_stats[(size_t)_gp];
+                            if (absorbed) _ms.abs.fetch_add(1, std::memory_order_relaxed);
+                            else          _ms.ok .fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    if (absorbed) {
+                        pipeline_finish_ray(ps);
+                        continue;
+                    }
+                    RayIntent ri      = hr.ray;
+                    ri.pos            = tpos;
+                    ri.dir            = tdir;
+                    ri.amp            = std::move(tamp);
+                    ri.path_len       = tpl;
+                    ri.medium_mat_idx = -1;
+                    ps.Q_intent.push(std::move(ri));
+                    continue;  /* skip refined_batch; don't touch in_flight */
+                }
+            }
+
             refined_batch.push_back(std::move(rh));
         }
         ps.Q_refined.push_many(refined_batch);
@@ -8568,6 +9179,102 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             const double cos_i = std::max(0.0, -in_dir.dot(hit_n));
             V3d   refracted;
             const bool can_refract = snell_refract(in_dir, hit_n, n1, n2, refracted);
+
+            /* ── BSSRDF forward: accumulate illumination (color_flag==0) ─────── */
+            if (hr.ray.color_flag == 0 && !st.tri_illum_accum.empty()) {
+                const float d_frac_il = mat_cache_diffusion(st.mat_cache, tri.mat_idx);
+                if (d_frac_il > 0.0f) {
+                    const int nb_il  = st.tri_illum_nb;
+                    const int stride = 2 * nb_il + 2;
+                    const int base   = hr.hit_tri * stride;
+                    if (nb_il > 0 && base >= 0
+                        && base + stride <= (int)st.tri_illum_accum.size()) {
+                        auto add_fp_il = [&](int off, double val) {
+                            const int32_t fp = (int32_t)std::max(-1073741824.0,
+                                std::min(1073741824.0, val * 32768.0));
+                            uv_accum_add(st.tri_illum_accum[(size_t)(base + off)],
+                                         (uint32_t)fp);
+                        };
+                        for (int b = 0; b < std::min(nb, nb_il); ++b) {
+                            add_fp_il(2 * b,     amp[b].real());
+                            add_fp_il(2 * b + 1, amp[b].imag());
+                        }
+                        add_fp_il(2 * nb_il, cos_i);
+                        uv_accum_add(st.tri_illum_accum[(size_t)(base + 2 * nb_il + 1)],
+                                     1u);
+                    }
+                }
+            }
+
+            /* ── BSSRDF backward: analytical illumination claim (color_flag==1) ─
+             * Query forward-path accumulator and inject the diffuse contribution
+             * directly into the sensor pixel accumulator.  The backward amplitude
+             * is scaled by (1 − diffuse_frac) so the coherent refracted children
+             * spawned below carry only the remaining coherent energy. */
+            if (hr.ray.color_flag == 1 && !st.tri_illum_accum.empty()) {
+                const float d_frac_bk = mat_cache_diffusion(st.mat_cache, tri.mat_idx);
+                if (d_frac_bk > 0.0f) {
+                    const int nb_il  = st.tri_illum_nb;
+                    const int stride = 2 * nb_il + 2;
+                    const int base   = hr.hit_tri * stride;
+                    if (nb_il > 0 && base >= 0
+                        && base + stride <= (int)st.tri_illum_accum.size()) {
+                        const int count = static_cast<int>(
+                            st.tri_illum_accum[(size_t)(base + stride - 1)]);
+                        if (count > 0) {
+                            double T_bk = 0.0;
+                            if (can_refract) {
+                                const double sin2_bk  = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
+                                const double cos_t_bk = std::sqrt(std::max(0.0, 1.0 - sin2_bk));
+                                T_bk = 1.0 - fresnel_R(cos_i, cos_t_bk, n1, n2);
+                            }
+                            if (T_bk > 1e-9) {
+                                const double cos_sum_bk = static_cast<double>(
+                                    static_cast<int32_t>(
+                                        st.tri_illum_accum[(size_t)(base + 2*nb_il)]))
+                                    / 32768.0;
+                                const double avg_cos_bk = cos_sum_bk / static_cast<double>(count);
+                                const double coupling   = T_bk * static_cast<double>(d_frac_bk)
+                                                          * avg_cos_bk / M_PI;
+                                const double inv_n_bk   = 1.0 / static_cast<double>(count);
+                                double contrib_mag = 0.0;
+                                for (int b = 0; b < std::min(nb, nb_il); ++b) {
+                                    const double re_il = static_cast<double>(
+                                        static_cast<int32_t>(
+                                            st.tri_illum_accum[(size_t)(base + 2*b)]))
+                                        / 32768.0;
+                                    const double im_il = static_cast<double>(
+                                        static_cast<int32_t>(
+                                            st.tri_illum_accum[(size_t)(base + 2*b+1)]))
+                                        / 32768.0;
+                                    const cd illum_avg_bk(re_il * inv_n_bk, im_il * inv_n_bk);
+                                    contrib_mag += std::abs(amp[b] * coupling * illum_avg_bk);
+                                }
+                                if (contrib_mag > 0.0 && ps.sensor_res > 0) {
+                                    const float sy    = hr.ray.sensor_origin_y;
+                                    const float sz    = hr.ray.sensor_origin_z;
+                                    const int   res_s = ps.sensor_res;
+                                    const float inv_r = static_cast<float>(res_s)
+                                                        / (2.0f * ps.sensor_pr);
+                                    const int   iy = static_cast<int>(
+                                        (sy + ps.sensor_pr) * inv_r);
+                                    const int   iz = static_cast<int>(
+                                        (sz + ps.sensor_pr) * inv_r);
+                                    if (iy >= 0 && iy < res_s && iz >= 0 && iz < res_s) {
+                                        const int idx2 = 2 * res_s * res_s + iy * res_s + iz;
+                                        std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                                        ps.sensor_accum[static_cast<size_t>(idx2)]
+                                            += contrib_mag;
+                                    }
+                                }
+                                /* Scale down to coherent fraction. */
+                                const double scale_bk = 1.0 - static_cast<double>(d_frac_bk);
+                                for (int b = 0; b < nb; ++b) amp[b] *= scale_bk;
+                            }
+                        }
+                    }
+                }
+            }
 
             if (!can_refract) {
                 V3d  rd = (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
@@ -9252,6 +9959,140 @@ void ray_pipeline_get_bdpt_stats(
     }
     if (out_exact_snaps)     *out_exact_snaps     = ps->bdpt_exact_snaps.load(std::memory_order_relaxed);
     if (out_near_miss_count) *out_near_miss_count = ps->bdpt_near_miss_count.load(std::memory_order_relaxed);
+}
+
+/* ── Surrogate-emitter power update ──────────────────────────────────────── */
+
+extern "C" SK_API int ray_tracer_set_tri_group_power(
+    RayTracerState* st,
+    int             group_id,
+    const float*    power_W_per_band,
+    int             n_bands)
+{
+    if (!st || !power_W_per_band) return SK_ERR_NULL_STATE;
+    if (group_id < 0 || group_id >= static_cast<int>(st->tri_groups.size()))
+        return SK_ERR_DIM_MISMATCH;
+    /* Resize to match and overwrite. */
+    auto& pv = st->tri_group_power_per_band[static_cast<size_t>(group_id)];
+    pv.assign(power_W_per_band, power_W_per_band + n_bands);
+    st->tri_groups[static_cast<size_t>(group_id)].n_power_bands = n_bands;
+    st->tri_groups[static_cast<size_t>(group_id)].power_W_per_band = pv.data();
+    return SK_OK;
+}
+
+/* ── BSSRDF illumination accumulator API ─────────────────────────────────── */
+
+extern "C" SK_API int ray_tracer_init_illum_accum(RayTracerState* st)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    const int nb     = st->n_bands;
+    const int n_tris = static_cast<int>(st->tris.size());
+    if (nb <= 0 || n_tris <= 0) return SK_OK;  /* no-op until scene is built */
+    const int stride = 2 * nb + 2;
+    st->tri_illum_nb = nb;
+    st->tri_illum_accum.assign(static_cast<size_t>(n_tris * stride), 0u);
+    return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_reset_illum_accum(RayTracerState* st)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    std::fill(st->tri_illum_accum.begin(), st->tri_illum_accum.end(), 0u);
+    return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_export_illum_accum(
+    const RayTracerState* st,
+    float*                buf,
+    int                   buf_floats,
+    int*                  out_n_tris,
+    int*                  out_stride)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+    const int nb     = st->tri_illum_nb;
+    const int stride = (nb > 0) ? (2 * nb + 2) : 0;
+    const int n_tris = (stride > 0)
+        ? static_cast<int>(st->tri_illum_accum.size() / (size_t)stride) : 0;
+    if (out_n_tris) *out_n_tris = n_tris;
+    if (out_stride) *out_stride = stride;
+    if (!buf) return SK_OK;
+    if (buf_floats < n_tris * stride) return SK_ERR_DIM_MISMATCH;
+    for (int t = 0; t < n_tris; ++t) {
+        float* row       = buf + t * stride;
+        const int base   = t * stride;
+        for (int b = 0; b < nb; ++b) {
+            row[2*b + 0] = static_cast<float>(
+                static_cast<double>(
+                    static_cast<int32_t>(st->tri_illum_accum[(size_t)(base + 2*b)]))
+                / 32768.0);
+            row[2*b + 1] = static_cast<float>(
+                static_cast<double>(
+                    static_cast<int32_t>(st->tri_illum_accum[(size_t)(base + 2*b+1)]))
+                / 32768.0);
+        }
+        row[2*nb + 0] = static_cast<float>(
+            static_cast<double>(
+                static_cast<int32_t>(st->tri_illum_accum[(size_t)(base + 2*nb)]))
+            / 32768.0);
+        row[2*nb + 1] = static_cast<float>(
+            st->tri_illum_accum[(size_t)(base + 2*nb + 1)]);
+    }
+    return SK_OK;
+}
+
+extern "C" SK_API int ray_tracer_write_tri_illum(
+    RayTracerState* st,
+    const int*      tri_ids,
+    int             n_tris,
+    const float*    amp_re,
+    const float*    amp_im,
+    const float*    cos_avg,
+    int             n_bands)
+{
+    if (!st || !tri_ids || !amp_re || !amp_im || !cos_avg || n_bands <= 0)
+        return SK_ERR_NULL_STATE;
+    if (st->tri_illum_accum.empty()) return SK_ERR_DIM_MISMATCH;
+    const int nb     = st->tri_illum_nb;
+    const int stride = 2 * nb + 2;
+    const int nb_use = std::min(nb, n_bands);
+    const int n_scene_tris = static_cast<int>(st->tris.size());
+    /* Fixed-point encode: float → int32 × 32768, stored as uint32 bitcast.
+     * Mirrors the existing uv_accum_add / tri_illum_accum encoding. */
+    auto fp32 = [](float v) -> uint32_t {
+        const int32_t x = static_cast<int32_t>(
+            std::max(-1073741824.0f, std::min(1073741824.0f, v * 32768.0f)));
+        return static_cast<uint32_t>(x);
+    };
+    for (int i = 0; i < n_tris; ++i) {
+        const int t = tri_ids[i];
+        if (t < 0 || t >= n_scene_tris) continue;
+        const int base = t * stride;
+        if (base + stride > static_cast<int>(st->tri_illum_accum.size())) continue;
+        /* Zero existing Monte Carlo data for this triangle, then write BPM values.
+         * Use relaxed atomic stores — we run between drain batches (Python side
+         * guarantees the forward pipeline is idle at this call site). */
+        for (int off = 0; off < stride; ++off)
+            reinterpret_cast<std::atomic<uint32_t>&>(
+                st->tri_illum_accum[static_cast<size_t>(base + off)])
+                .store(0u, std::memory_order_relaxed);
+        for (int b = 0; b < nb_use; ++b) {
+            const int row_off = i * n_bands + b;
+            reinterpret_cast<std::atomic<uint32_t>&>(
+                st->tri_illum_accum[static_cast<size_t>(base + 2*b)])
+                .store(fp32(amp_re[row_off]), std::memory_order_relaxed);
+            reinterpret_cast<std::atomic<uint32_t>&>(
+                st->tri_illum_accum[static_cast<size_t>(base + 2*b + 1)])
+                .store(fp32(amp_im[row_off]), std::memory_order_relaxed);
+        }
+        reinterpret_cast<std::atomic<uint32_t>&>(
+            st->tri_illum_accum[static_cast<size_t>(base + 2*nb)])
+            .store(fp32(cos_avg[i]), std::memory_order_relaxed);
+        /* count = 1: the BPM result is treated as a single synthetic forward hit */
+        reinterpret_cast<std::atomic<uint32_t>&>(
+            st->tri_illum_accum[static_cast<size_t>(base + 2*nb + 1)])
+            .store(1u, std::memory_order_relaxed);
+    }
+    return SK_OK;
 }
 
 /* ── Synchronous compatibility wrapper ───────────────────────────────────── */

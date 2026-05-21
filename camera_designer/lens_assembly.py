@@ -210,6 +210,28 @@ class LensAssemblySpec:
         # ── Registration GIDs (set by register()) ─────────────────────────────
         self._entrance_gid: int = -1
         self._exit_gid:     int = -1
+        self._entrance_stats: dict = {"transmitted": 0, "absorbed": 0}
+        self._exit_stats:     dict = {"transmitted": 0, "absorbed": 0}
+        self._cached_acceptance_params: "dict | None" = None
+
+        # ── Cached registration args (for re-registration without mesh geometry) ─
+        self._cached_lsg:             Optional[list]       = None
+        self._cached_tri_centroids:   Optional[np.ndarray] = None
+        self._cached_scene_lenses:    Optional[list]       = None
+
+        # ── Progressive refinement state (PARAMETRIC → LUT → MLP) ──────────────
+        self._prog_thread    = None   # threading.Thread | None
+        self._prog_stop      = None   # threading.Event  | None
+        self._prog_lock      = None   # threading.Lock   | None
+        self._prog_acc:      Optional[np.ndarray] = None   # (nv,nu,nb,na,7) float64
+        self._prog_noodles:  Optional[np.ndarray] = None   # (mlp_min, 11) float32
+        self._prog_noodle_idx: int = 0
+        self._prog_header:   Optional[np.ndarray] = None   # 16-float LUT header
+        self._prog_cfg:      dict = {}
+        # Pending payloads posted by worker, consumed by main thread
+        self._pending_lut_payload:     Optional[np.ndarray] = None
+        self._pending_mlp_fwd_payload: Optional[np.ndarray] = None
+        self._pending_mlp_bwd_payload: Optional[np.ndarray] = None
 
     # ── Payload management ────────────────────────────────────────────────────
 
@@ -247,9 +269,10 @@ class LensAssemblySpec:
         lens positions, apertures, curvatures, and material parameters from this
         object rather than from mesh measurements.
         """
-        if not hasattr(optics, "build_gpu_payload") or not hasattr(optics, "evaluate_bundle"):
-            raise TypeError("optics must provide build_gpu_payload() and evaluate_bundle()")
+        if not hasattr(optics, "build_gpu_payload"):
+            raise TypeError("optics must provide build_gpu_payload()")
         self.optics = optics
+        self._cached_acceptance_params = None  # invalidate when optics changes
         if mode is not None:
             self.mode = mode
 
@@ -263,12 +286,97 @@ class LensAssemblySpec:
         return self.optics
 
     def build_parametric_payload(self) -> np.ndarray:
-        """Build the shader payload from the canonical physical lens state."""
+        """Build the forward (scene→sensor) shader payload from the canonical model."""
         return self.require_optics().build_gpu_payload()
 
-    def evaluate_transfer(self, ray_bundle):
-        """Evaluate the canonical parametric transfer for a vectorized ray bundle."""
-        return self.require_optics().evaluate_bundle(ray_bundle)
+    def build_parametric_payload_backward(self) -> np.ndarray:
+        """Build the backward (sensor→scene) shader payload.
+
+        Derived from the forward payload by reversing the surface sequence and
+        swapping n_bf / n_af at each surface.  No new physics — same surfaces,
+        traversed in the opposite order.
+        """
+        from camera_designer.compound_optics import PLENS_HEADER, PLENS_SURF_STRIDE
+        fwd = self.build_parametric_payload()
+        n_surf = int(fwd[1])
+        bwd = fwd.copy()
+        h = PLENS_HEADER        # = 8
+        s = PLENS_SURF_STRIDE   # = 8
+        for i in range(n_surf):
+            j = n_surf - 1 - i          # source index (reversed)
+            src = h + j * s
+            dst = h + i * s
+            bwd[dst + 0] = fwd[src + 0]   # x_v
+            bwd[dst + 1] = fwd[src + 1]   # R
+            bwd[dst + 2] = fwd[src + 3]   # n_bf ← original n_af  (direction reversed)
+            bwd[dst + 3] = fwd[src + 2]   # n_af ← original n_bf
+            bwd[dst + 4] = fwd[src + 4]   # ap_r
+            bwd[dst + 5] = fwd[src + 5]   # k
+            bwd[dst + 6] = fwd[src + 6]   # flags
+            bwd[dst + 7] = fwd[src + 7]   # reserved
+        return bwd
+
+    def acceptance_params(self) -> "dict | None":
+        """Return acceptance cone geometry from the analytical parametric model.
+
+        Positions and radii come from CompoundLens.side() — analytically exact
+        values derived from the payload, independent of mesh geometry.  Acceptance
+        angles are not computed here; they require a T2 query path that has not
+        yet been implemented.
+
+        Returns a dict with:
+            entrance_gid  : registered TriGroup ID for the entrance mesh (-1 if unregistered)
+            exit_gid      : registered TriGroup ID for the exit mesh (-1 if unregistered)
+            entrance_x    : axial position of the entrance surface (m)
+            entrance_r    : clear aperture radius at the entrance (m)
+            exit_x        : axial position of the exit surface (m)
+            exit_r        : clear aperture radius at the exit (m)
+        or None if optics is not set.
+        """
+        if self.optics is None:
+            return None
+
+        if self._cached_acceptance_params is not None:
+            return self._cached_acceptance_params
+
+        try:
+            front = self.optics.side("front")
+            back  = self.optics.side("back")
+
+            self._cached_acceptance_params = {
+                "entrance_gid": self._entrance_gid,
+                "exit_gid":     self._exit_gid,
+                "entrance_x":   float(front.x_pos),
+                "entrance_r":   float(front.radius),
+                "exit_x":       float(back.x_pos),
+                "exit_r":       float(back.radius),
+            }
+            print(
+                f"[acceptance] entrance_x={float(front.x_pos)*1e3:.1f}mm"
+                f"  exit_x={float(back.x_pos)*1e3:.1f}mm"
+                f"  r_ent={float(front.radius)*1e3:.1f}mm"
+                f"  r_exit={float(back.radius)*1e3:.1f}mm",
+                flush=True,
+            )
+            return self._cached_acceptance_params
+        except Exception as exc:
+            print(f"[acceptance] failed: {exc}", flush=True)
+            return None
+
+    def refresh_teleport_stats(self, tracer) -> None:
+        """Pull per-GID manifold dispatch stats from the C++ tracer.
+
+        Updates _entrance_stats and _exit_stats dicts with keys 'magic',
+        'transmitted', and 'absorbed'.  Only CPU T2 pipeline rays are counted;
+        GPU-shader-dispatched T2 outcomes are not tracked here.
+        """
+        for attr, gid in (("_entrance_stats", self._entrance_gid),
+                          ("_exit_stats",     self._exit_gid)):
+            if gid >= 0:
+                try:
+                    setattr(self, attr, tracer.get_manifold_gid_stats(gid))
+                except Exception:
+                    pass
 
     # ── Registration ─────────────────────────────────────────────────────────
 
@@ -301,6 +409,11 @@ class LensAssemblySpec:
         kind_parametric = int(getattr(_sk, "TRI_PARAM_SURFACE_PARAMETRIC_LENS",  5))
         role_none       = 0
 
+        # Cache so bake_lut / poll_pending_mode_switch can re-register.
+        self._cached_lsg           = lens_surface_groups
+        self._cached_tri_centroids = tri_centroids
+        self._cached_scene_lenses  = scene_lenses
+
         if self.mode == self.MODE_PARAMETRIC:
             self._register_parametric(
                 tracer, lens_surface_groups, sample_area, kind_parametric, role_none,
@@ -310,8 +423,12 @@ class LensAssemblySpec:
                 tracer, lens_surface_groups, tri_centroids,
                 scene_lenses, sample_area, kind_neural, role_none,
             )
+        elif self.mode == self.MODE_LUT and self._transfer_grid is not None:
+            self._register_lut(
+                tracer, lens_surface_groups, sample_area, kind_neural, role_none,
+            )
         else:
-            # NONE and LUT both keep exact SDF_SPHERE refinement on lens surfaces
+            # NONE and LUT-not-yet-baked: exact SDF_SPHERE refinement
             self._register_sdf(
                 tracer, lens_surface_groups, tri_vertices,
                 sample_area, kind_sdf, role_none,
@@ -381,6 +498,78 @@ class LensAssemblySpec:
         if n:
             print(f"[assembly] SDF_SPHERE groups: {n}", flush=True)
 
+    def _register_lut(
+        self, tracer, lsg, sample_area, kind_neural, role_none,
+    ) -> None:
+        """Register LUT transfer grid on entrance surface; absorb all others.
+
+        Entrance (front face of first group) gets the full transfer-grid payload
+        so the CPU T2 manifold dispatch teleports forward rays correctly.
+        All interior and exit surfaces are registered as kind=4 absorbers so
+        rays that reach them (e.g. backward BDPT rays) are killed rather than
+        traversing lens interiors via Snell physics.
+        """
+        if not lsg or self._transfer_grid is None:
+            return
+
+        payload = np.ascontiguousarray(self._transfer_grid, dtype=np.float32)
+        front_ids = lsg[0][0]
+        back_ids  = lsg[-1][1]
+
+        if int(front_ids.size) == 0:
+            return
+
+        self._entrance_gid = int(tracer.register_tri_group(
+            role_none, sample_area,
+            np.ascontiguousarray(front_ids, dtype=np.int32),
+            parametric_surface={"kind": kind_neural, "payload_f32": payload},
+        ))
+        print(
+            f"[assembly] LUT entrance gid={self._entrance_gid}"
+            f"  grid={len(payload)} floats  magic={payload[0]:.0f}",
+            flush=True,
+        )
+
+        # Interior and exit surfaces — NEURAL_ASSEMBLY absorbers
+        n_interior = 0
+        n_els = len(lsg)
+        for i, (f_ids, b_ids, _rf, _rb) in enumerate(lsg):
+            is_first = (i == 0);  is_last = (i == n_els - 1)
+            for ids in ([f_ids] if not is_first else []) + ([b_ids] if not is_last else []):
+                if int(ids.size) == 0:
+                    continue
+                tracer.register_tri_group(
+                    role_none, sample_area,
+                    np.ascontiguousarray(ids, dtype=np.int32),
+                    parametric_surface={"kind": kind_neural},
+                )
+                n_interior += int(ids.size)
+        # Exit face (back of last group) — backward PLENS teleport for sensor→scene rays.
+        # Falls back to absorber if optics is not available.
+        if int(back_ids.size) > 0:
+            if self.optics is not None:
+                import _spectral_kernels as _sk2
+                kind_p = int(getattr(_sk2, "TRI_PARAM_SURFACE_PARAMETRIC_LENS", 5))
+                bwd_p = self.build_parametric_payload_backward()
+                self._exit_gid = int(tracer.register_tri_group(
+                    role_none, sample_area,
+                    np.ascontiguousarray(back_ids, dtype=np.int32),
+                    parametric_surface={"kind": kind_p, "payload_f32": bwd_p},
+                ))
+                print(
+                    f"[assembly] LUT exit gid={self._exit_gid} (backward PLENS)",
+                    flush=True,
+                )
+            else:
+                tracer.register_tri_group(
+                    role_none, sample_area,
+                    np.ascontiguousarray(back_ids, dtype=np.int32),
+                    parametric_surface={"kind": kind_neural},
+                )
+                n_interior += int(back_ids.size)
+        if n_interior:
+            print(f"[assembly] LUT absorbers: {n_interior} tris", flush=True)
+
     def _register_mlp(
         self, tracer, lsg, tri_centroids, scene_lenses,
         sample_area, kind_neural, role_none,
@@ -393,15 +582,30 @@ class LensAssemblySpec:
         if int(front_ids.size) == 0:
             return
 
-        x_ent  = float(np.mean(tri_centroids[front_ids, 0]))
-        x_exit = float(np.mean(tri_centroids[back_ids,  0])) \
-                 if int(back_ids.size) > 0 else x_ent
+        # All geometry comes from the optics model — the canonical physical source.
+        # Mesh centroids and scene_lenses are only used as a fallback when optics
+        # is not set (legacy load_payload_files path without a CompoundLens).
+        if self.optics is not None:
+            x_ent   = float(self.optics.side("front").x_pos)
+            x_exit  = float(self.optics.side("back").x_pos)
+            r_lens  = float(self.optics.side("front").radius)
+            refr = [e for e in self.optics.elements if hasattr(e, "R_curvature")]
+            roc_front = float(refr[0].R_curvature)  if refr else 0.0
+            roc_back  = float(refr[-1].R_curvature) if refr else 0.0
+        else:
+            x_ent     = float(np.mean(tri_centroids[front_ids, 0])) \
+                        if tri_centroids is not None else 0.0
+            x_exit    = float(np.mean(tri_centroids[back_ids, 0])) \
+                        if (tri_centroids is not None and int(back_ids.size) > 0) else x_ent
+            r_lens    = 0.0
+            roc_front = float(scene_lenses[0].radius_front)  if scene_lenses else 0.0
+            roc_back  = float(scene_lenses[-1].radius_back)  if scene_lenses else 0.0
 
         # Entrance surface — forward MLP (side=0)
-        roc_front = float(scene_lenses[0].radius_front) if scene_lenses else 0.0
         p = self._fwd_payload.copy()
         p[5]  = np.float32(x_ent);   p[6]  = np.float32(x_exit)
-        p[9]  = np.float32(0.0);     p[11] = np.float32(roc_front)
+        p[9]  = np.float32(0.0);     p[10] = np.float32(r_lens)
+        p[11] = np.float32(roc_front)
         p[12] = np.float32(0.0);     p[13] = np.float32(0)    # axis = X
         p[14] = np.float32(0.0);     p[15] = np.float32(0)    # side = fwd
 
@@ -417,25 +621,39 @@ class LensAssemblySpec:
             flush=True,
         )
 
-        # Exit surface — backward MLP (side=1)
-        if self._bwd_payload is not None and int(back_ids.size) > 0:
-            roc_back = float(scene_lenses[-1].radius_back) if scene_lenses else 0.0
-            p_bwd = self._bwd_payload.copy()
-            p_bwd[5]  = np.float32(x_exit);  p_bwd[6]  = np.float32(x_ent)
-            p_bwd[9]  = np.float32(0.0);     p_bwd[11] = np.float32(roc_back)
-            p_bwd[12] = np.float32(0.0);     p_bwd[13] = np.float32(0)
-            p_bwd[14] = np.float32(0.0);     p_bwd[15] = np.float32(1)   # side = bwd
+        # Exit surface — backward MLP, or PLENS fallback when no bwd MLP payload yet
+        if int(back_ids.size) > 0:
+            if self._bwd_payload is not None:
+                p_bwd = self._bwd_payload.copy()
+                p_bwd[5]  = np.float32(x_exit);  p_bwd[6]  = np.float32(x_ent)
+                p_bwd[9]  = np.float32(0.0);     p_bwd[10] = np.float32(r_lens)
+                p_bwd[11] = np.float32(roc_back)
+                p_bwd[12] = np.float32(0.0);     p_bwd[13] = np.float32(0)
+                p_bwd[14] = np.float32(0.0);     p_bwd[15] = np.float32(1)  # side = bwd
 
-            self._exit_gid = int(tracer.register_tri_group(
-                role_none, sample_area,
-                np.ascontiguousarray(back_ids, dtype=np.int32),
-                parametric_surface={"kind": kind_neural, "payload_f32": p_bwd},
-            ))
-            print(
-                f"[assembly] MLP exit gid={self._exit_gid}"
-                f"  x_exit={x_exit*1e3:.2f}mm  ROC={roc_back*1e3:.1f}mm",
-                flush=True,
-            )
+                self._exit_gid = int(tracer.register_tri_group(
+                    role_none, sample_area,
+                    np.ascontiguousarray(back_ids, dtype=np.int32),
+                    parametric_surface={"kind": kind_neural, "payload_f32": p_bwd},
+                ))
+                print(
+                    f"[assembly] MLP exit gid={self._exit_gid}"
+                    f"  x_exit={x_exit*1e3:.2f}mm  ROC={roc_back*1e3:.1f}mm",
+                    flush=True,
+                )
+            elif self.optics is not None:
+                import _spectral_kernels as _sk2
+                kind_p = int(getattr(_sk2, "TRI_PARAM_SURFACE_PARAMETRIC_LENS", 5))
+                bwd_p = self.build_parametric_payload_backward()
+                self._exit_gid = int(tracer.register_tri_group(
+                    role_none, sample_area,
+                    np.ascontiguousarray(back_ids, dtype=np.int32),
+                    parametric_surface={"kind": kind_p, "payload_f32": bwd_p},
+                ))
+                print(
+                    f"[assembly] MLP exit gid={self._exit_gid} (backward PLENS fallback)",
+                    flush=True,
+                )
 
         # Interior surfaces — NEURAL_ASSEMBLY absorbers (no payload → T2 bit-3 drop)
         n_interior = 0
@@ -516,14 +734,19 @@ class LensAssemblySpec:
                     parametric_surface={"kind": kind_parametric},
                 )
                 n_interior += int(ids.size)
-        # Back face of last lens group is also an absorber
+        # Back face of last lens group — backward teleport payload for sensor→scene rays
         if int(back_ids.size) > 0:
-            tracer.register_tri_group(
+            bwd_payload = self.build_parametric_payload_backward()
+            self._exit_gid = int(tracer.register_tri_group(
                 role_none, sample_area,
                 np.ascontiguousarray(back_ids, dtype=np.int32),
-                parametric_surface={"kind": kind_parametric},
+                parametric_surface={"kind": kind_parametric, "payload_f32": bwd_payload},
+            ))
+            print(
+                f"[assembly] PARAMETRIC exit gid={self._exit_gid}"
+                f"  n_surfs={int(bwd_payload[1])} (backward)",
+                flush=True,
             )
-            n_interior += int(back_ids.size)
 
         if n_interior:
             print(f"[assembly] PARAMETRIC absorbers: {n_interior} tris", flush=True)
@@ -564,52 +787,6 @@ class LensAssemblySpec:
                 if verbose:
                     print(f"[assembly] CompoundLens construction failed; falling back: {exc}",
                           flush=True)
-
-        if self.optics is not None:
-            if bake_table_gb > 0.0:
-                n_cells    = max(1, int(bake_table_gb * (1024.0 ** 3) // (stride * 4)))
-                n_grid_eff = max(2, int(np.sqrt(float(n_cells))))
-            else:
-                n_grid_eff = int(max(2, n_grid))
-            n_dirs = max(4, int(math.ceil(max(1, n_rays) / float(n_grid_eff * n_grid_eff))))
-            wavelengths = None
-            if ep is not None and getattr(ep, "preset", None) is not None:
-                wavelengths = list(getattr(ep.preset, "wavelengths", [])[:max(1, n_wavelengths)])
-            if not wavelengths:
-                wavelengths = [0.486, 0.587, 0.656][:max(1, n_wavelengths)]
-
-            if verbose:
-                print(
-                    f"[assembly] parametric LUT bake grid={n_grid_eff}x{n_grid_eff} "
-                    f"angle_samples/cell≈{n_dirs} "
-                    f"wavelengths={len(wavelengths)}",
-                    flush=True,
-                )
-
-            grid, n_src = self.optics.build_transfer_lut(
-                side="front",
-                n_u=n_grid_eff,
-                n_v=n_grid_eff,
-                n_directions=n_dirs,
-                wavelengths_um=wavelengths,
-                full_assembly_payload=bake_full_assembly,
-                verbose=verbose,
-            )
-            self._transfer_grid         = grid
-            self._transfer_grid_noodles = int(n_src)
-            self._baked_ep              = None
-            self.mode                   = self.MODE_LUT
-
-            if tracer is not None:
-                self.register_lut_ctx(tracer)
-
-            if verbose:
-                print(
-                    f"[assembly] parametric LUT done — "
-                    f"{self._transfer_grid_noodles:,} transmitted samples",
-                    flush=True,
-                )
-            return
 
         if bake_table_gb > 0.0:
             n_cells    = max(1, int(bake_table_gb * (1024.0 ** 3) // (stride * 4)))
@@ -659,6 +836,66 @@ class LensAssemblySpec:
 
         if verbose:
             print(f"[assembly] LUT done — {self._transfer_grid_noodles:,} noodles", flush=True)
+
+    # ── Progressive parametric → LUT → MLP refinement ───────────────────────
+
+    def start_progressive_refinement(
+        self,
+        *,
+        n_u: int   = 32,
+        n_v: int   = 32,
+        n_a: int   = 8,
+        n_b: int   = 8,
+        batch_size: int   = 4096,
+        lut_min_cells_frac: float = 0.25,
+        mlp_min_samples:    int   = 100_000,
+        mlp_epochs:         int   = 40,
+        lut_refine_interval: int  = 20,
+    ) -> None:
+        """Stub — Python CPU ray tracer removed; progressive baking is no-op."""
+        return
+
+    def stop_progressive_refinement(self) -> None:
+        """No-op — progressive refinement was removed with the Python CPU tracer."""
+        pass
+
+    def poll_pending_mode_switch(self, tracer) -> Optional[str]:
+        """Apply any pending LUT or MLP transition; must be called on the main thread.
+
+        Returns "LUT", "MLP", or None.
+        """
+        import _spectral_kernels as _sk
+        sa = int(getattr(_sk, "TRI_GROUP_SAMPLE_AREA",             1))
+        kn = int(getattr(_sk, "TRI_PARAM_SURFACE_NEURAL_ASSEMBLY", 4))
+
+        fwd = self._pending_mlp_fwd_payload
+        if fwd is not None:
+            self._pending_mlp_fwd_payload = None
+            bwd = self._pending_mlp_bwd_payload
+            self._pending_mlp_bwd_payload = None
+            self._fwd_payload = fwd
+            self._bwd_payload = bwd
+            self.mode = self.MODE_MLP
+            lsg = self._cached_lsg
+            if lsg:
+                self._register_mlp(tracer, lsg, None, None, sa, kn, 0)
+            print("[assembly] → MLP mode", flush=True)
+            return "MLP"
+
+        lut = self._pending_lut_payload
+        if lut is not None:
+            self._pending_lut_payload = None
+            self._transfer_grid = lut
+            prev = self.mode
+            self.mode = self.MODE_LUT
+            lsg = self._cached_lsg
+            if lsg:
+                self._register_lut(tracer, lsg, sa, kn, 0)
+            if prev != self.MODE_LUT:
+                print("[assembly] → LUT mode", flush=True)
+            return "LUT"
+
+        return None
 
     # ── Sensor image rendering ────────────────────────────────────────────────
 

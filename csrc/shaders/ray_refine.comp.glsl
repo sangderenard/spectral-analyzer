@@ -472,19 +472,25 @@ void parametric_lens_teleport(int hb, int pay_off)
         bool  is_stop= (int(npay[sb + PLENS_S_FLAGS]) & 1) != 0;
 
         /* ── Intersect ray with this surface ─────────────────────────────── */
-        if (s > 0) {
-            /* s == 0: ray is already on the entrance surface (T1 hit point) */
+        /* s=0: entry seek from T1 BVH proxy-mesh hit.  Allow t >= -0.01 so the
+         * ray can roll back up to 1 cm to the exact conic entrance vertex.
+         * s>0: previous Snell step left ray just in front; require t > 2e-7. */
+        {
+            float t_min = (s == 0) ? -0.01 : 2e-7;
             float t;
             if (abs(R) < EPS) {
-                /* Flat surface: t = (x_v − ray_pos.x) / ray_dir.x */
                 if (abs(ray_dir.x) < EPS) {
                     uint cf = floatBitsToUint(hit_f(hb, 16));
                     hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
                     return;
                 }
                 t = (x_v - ray_pos.x) / ray_dir.x;
+                if (t < t_min) {
+                    uint cf = floatBitsToUint(hit_f(hb, 16));
+                    hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                    return;
+                }
             } else {
-                /* Exact conic quadratic */
                 float c  = 1.0 / R;
                 float kp = 1.0 + k;
                 float ox = ray_pos.x - x_v;
@@ -496,7 +502,7 @@ void parametric_lens_teleport(int hb, int pay_off)
                 float B  = 2.0 * (c * (oy*dy + oz*dz + kp * ox*dx) - dx);
                 float C  = c * (oy*oy + oz*oz + kp * ox*ox) - 2.0 * ox;
 
-                float disc, t1, t2;
+                float t1, t2;
                 if (abs(A) < EPS) {
                     if (abs(B) < EPS) {
                         uint cf = floatBitsToUint(hit_f(hb, 16));
@@ -504,8 +510,13 @@ void parametric_lens_teleport(int hb, int pay_off)
                         return;
                     }
                     t = -C / B;
+                    if (t < t_min) {
+                        uint cf = floatBitsToUint(hit_f(hb, 16));
+                        hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                        return;
+                    }
                 } else {
-                    disc = B*B - 4.0*A*C;
+                    float disc = B*B - 4.0*A*C;
                     if (disc < 0.0) {
                         uint cf = floatBitsToUint(hit_f(hb, 16));
                         hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
@@ -514,22 +525,33 @@ void parametric_lens_teleport(int hb, int pay_off)
                     float sq = sqrt(disc);
                     t1 = (-B - sq) / (2.0 * A);
                     t2 = (-B + sq) / (2.0 * A);
-                    float x1 = ray_pos.x + t1 * dx;
-                    float x2 = ray_pos.x + t2 * dx;
-                    if (t1 > 2e-7 && abs(x1 - x_v) <= abs(x2 - x_v)) {
-                        t = t1;
-                    } else if (t2 > 2e-7) {
-                        t = t2;
+                    if (s == 0) {
+                        /* Entry seek: pick root with smallest |t| that is >= t_min. */
+                        bool v1 = t1 >= t_min, v2 = t2 >= t_min;
+                        if (v1 && v2) {
+                            t = (abs(t1) <= abs(t2)) ? t1 : t2;
+                        } else if (v1) {
+                            t = t1;
+                        } else if (v2) {
+                            t = t2;
+                        } else {
+                            uint cf = floatBitsToUint(hit_f(hb, 16));
+                            hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                            return;
+                        }
                     } else {
-                        uint cf = floatBitsToUint(hit_f(hb, 16));
-                        hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
-                        return;
+                        float x1 = ray_pos.x + t1 * dx;
+                        float x2 = ray_pos.x + t2 * dx;
+                        if (t1 > 2e-7 && abs(x1 - x_v) <= abs(x2 - x_v)) {
+                            t = t1;
+                        } else if (t2 > 2e-7) {
+                            t = t2;
+                        } else {
+                            uint cf = floatBitsToUint(hit_f(hb, 16));
+                            hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                            return;
+                        }
                     }
-                }
-                if (t <= 2e-7) {
-                    uint cf = floatBitsToUint(hit_f(hb, 16));
-                    hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
-                    return;
                 }
             }
             opl     += n_bef * t;

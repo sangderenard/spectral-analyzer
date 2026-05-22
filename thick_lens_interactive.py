@@ -53,7 +53,7 @@ import pygame
 from pygame.locals import (
     DOUBLEBUF, KEYDOWN, KEYUP, MOUSEBUTTONDOWN, MOUSEBUTTONUP,
     MOUSEMOTION, MOUSEWHEEL, OPENGL, QUIT, RESIZABLE, VIDEORESIZE,
-    K_SPACE, K_ESCAPE, K_e, K_a, K_l, K_r, K_c,
+    K_SPACE, K_ESCAPE, K_e, K_a, K_l, K_r, K_c, K_o, K_w,
     K_LSHIFT, K_RSHIFT, K_LCTRL, K_RCTRL, K_LALT, K_RALT,
 )
 from OpenGL.GL import *
@@ -62,15 +62,25 @@ from PIL import Image, ImageDraw, ImageFont
 
 from thick_lens_focus_lab import (
     SceneConfig, ForwardCppLensBench, DEFAULT_FREQ_HZ,
-    MaterialDatabase, _build_scene_mesh, _scene_lenses, C_LIGHT,
+    LensConfig, MaterialDatabase, _build_scene_mesh, _scene_lenses, C_LIGHT,
+    _compound_lens_from_scene,
     FreeFrequencySidecar, MAX_SPECTRAL_BANDS,
 )
 import _spectral_kernels as _sk
+from camera_designer.lens_assembly import LensAssemblySpec
+from camera_software import OpticalDesignSpec
 
 
 @dataclass
 class SceneParameters:
     """Mutable scene configuration for interactive tuning."""
+    use_optical_design: bool = True
+    zoom: float = 0.40
+    focus_distance_m: float = 2.0
+    f_number: float = 2.8
+    focal_min_m: float = 0.070
+    focal_max_m: float = 0.160
+    aperture_model: str = "geometry"
     # Lens group
     lens_x_list: list[float] = field(default_factory=lambda: [0.3, 0.8])  # Primary lens positions
     lens_aperture_radius_list: list[float] = field(default_factory=lambda: [0.025, 0.022])
@@ -94,6 +104,13 @@ class SceneParameters:
     def copy(self) -> SceneParameters:
         """Deep copy for worker thread use."""
         return SceneParameters(
+            use_optical_design=self.use_optical_design,
+            zoom=self.zoom,
+            focus_distance_m=self.focus_distance_m,
+            f_number=self.f_number,
+            focal_min_m=self.focal_min_m,
+            focal_max_m=self.focal_max_m,
+            aperture_model=self.aperture_model,
             lens_x_list=self.lens_x_list.copy(),
             lens_aperture_radius_list=self.lens_aperture_radius_list.copy(),
             lens_thickness_list=self.lens_thickness_list.copy(),
@@ -163,27 +180,74 @@ class SceneUpdateWorker(threading.Thread):
                 # Build scene configuration from parameters
                 base_scene = SceneConfig()
                 params = msg.params
+                base_scene.aperture_model = str(params.aperture_model)
                 
-                # TODO: Apply params to scene config (lens positions, aperture, emitter, etc.)
-                # For now, use base config as-is
+                if params.use_optical_design:
+                    base_scene.optical_design = OpticalDesignSpec(
+                        focal_length_range_m=(float(params.focal_min_m), float(params.focal_max_m)),
+                        zoom=float(params.zoom),
+                        focus_distance_m=float(max(1.0e-3, params.focus_distance_m)),
+                        f_number=float(max(0.2, params.f_number)),
+                        entrance_x_m=0.88,
+                        sensor_x_m=float(base_scene.image_plate.x),
+                        image_radius_m=float(base_scene.image_plate.radius),
+                    )
+                else:
+                    base_scene.optical_design = None
+                    base_scene.lens_stack = []
+                    for x, aperture_r, thickness, curvature in zip(
+                        params.lens_x_list,
+                        params.lens_aperture_radius_list,
+                        params.lens_thickness_list,
+                        params.lens_curvature_list,
+                    ):
+                        base_scene.lens_stack.append(LensConfig(
+                            center_x=float(x),
+                            thickness=float(max(1.0e-4, thickness)),
+                            aperture_radius=float(max(1.0e-4, aperture_r)),
+                            radius_front=float(max(1.0e-4, curvature)),
+                            radius_back=float(max(1.0e-4, curvature)),
+                            ior=1.52,
+                        ))
+                    base_scene.exit_pupil_x = float(params.aperture_x)
+                    base_scene.exit_pupil_radius = float(max(1.0e-4, params.aperture_radius))
+                base_scene.source_radius = float(max(1.0e-4, params.emitter_radius))
                 
                 # Rebuild mesh geometry
                 sidecar = FreeFrequencySidecar.lazy_prepare(len(DEFAULT_FREQ_HZ))
-                verts, normals, mat_idx, tri_arr, db, source_ids, lens_front_ids, lens_back_ids, image_plate_ids, aperture_stop_ids, tube_wall_ids = _build_scene_mesh(
-                    base_scene, sidecar
+                mesh_tuple = _build_scene_mesh(base_scene, sidecar)
+                (
+                    verts, normals, mat_idx, tri_arr, db,
+                    source_ids, lens_front_ids, lens_back_ids, image_plate_ids,
+                    aperture_stop_ids, suppress_ids, lens_surface_groups,
+                    object_ids, tube_baffle_ids, camera_barrel_ids,
+                    camera_rear_cap_ids, camera_front_cap_ids, camera_frustum_ids,
+                    red_probe_ids, diffuser_wave_specs,
+                ) = mesh_tuple
+                optics = _compound_lens_from_scene(base_scene)
+                field_pair = optics.profile_field_pair(
+                    object_point=(float(base_scene.object_plane.x), 0.0, 0.0),
+                    image_point=(float(base_scene.image_plate.x), 0.0, 0.0),
                 )
                 
                 # Package for ray tracer thread
                 mesh_data = {
                     "scene": base_scene,
+                    "optics": optics,
+                    "field_pair": field_pair,
                     "tri_arr": tri_arr,
                     "verts": verts,
                     "normals": normals,
                     "mat_idx": mat_idx,
                     "db": db,
                     "source_ids": source_ids,
+                    "lens_front_ids": lens_front_ids,
+                    "lens_back_ids": lens_back_ids,
+                    "lens_surface_groups": lens_surface_groups,
                     "image_plate_ids": image_plate_ids,
                     "aperture_stop_ids": aperture_stop_ids,
+                    "suppress_ids": suppress_ids,
+                    "tube_baffle_ids": tube_baffle_ids,
                     "freq_hz": np.ascontiguousarray(np.asarray(DEFAULT_FREQ_HZ, dtype=np.float64)),
                 }
                 
@@ -315,6 +379,7 @@ class RayTracerWorker(threading.Thread):
         source_ids = mesh["source_ids"]
         image_plate_ids = mesh["image_plate_ids"]
         aperture_stop_ids = mesh["aperture_stop_ids"]
+        lens_surface_groups = mesh.get("lens_surface_groups", [])
         freq_hz = mesh["freq_hz"]
         
         # ─── C++ API: Create RayTracer ──────────────────────────────────
@@ -357,6 +422,19 @@ class RayTracerWorker(threading.Thread):
                 sample_area,
                 np.ascontiguousarray(aperture_stop_ids, dtype=np.int32),
             ))
+
+        optics = mesh.get("optics")
+        if optics is not None and lens_surface_groups:
+            assembly = LensAssemblySpec()
+            assembly.set_optics(optics, mode=LensAssemblySpec.MODE_PARAMETRIC)
+            assembly.register(
+                self.tracer,
+                lens_surface_groups,
+                tri_arr,
+                np.ascontiguousarray(np.mean(tri_arr, axis=1), dtype=np.float64),
+                _scene_lenses(scene),
+            )
+            mesh["lens_assembly"] = assembly
         
         # Register sensor (image plate) with camera descriptor
         plate = scene.image_plate
@@ -474,6 +552,14 @@ class ThickLensInteractiveViewer:
                 elif event.key == K_l:
                     self.params.show_lenses = not self.params.show_lenses
                     self.queue_scene_update()
+                elif event.key == K_o:
+                    self.params.use_optical_design = not self.params.use_optical_design
+                    self.queue_scene_update()
+                elif event.key == K_w:
+                    self.params.aperture_model = (
+                        "wave3d" if self.params.aperture_model != "wave3d" else "geometry"
+                    )
+                    self.queue_scene_update()
                 elif event.key == K_r:
                     self.params = SceneParameters()
                     self.queue_scene_update()
@@ -497,7 +583,16 @@ class ThickLensInteractiveViewer:
             
             elif event.type == MOUSEWHEEL:
                 mods = pygame.key.get_mods()
-                if mods & (K_LSHIFT | K_RSHIFT):
+                if self.params.use_optical_design and mods & (K_LSHIFT | K_RSHIFT):
+                    self.params.f_number = max(0.5, self.params.f_number + event.y * 0.1)
+                elif self.params.use_optical_design and mods & (K_LCTRL | K_RCTRL):
+                    self.params.focus_distance_m = max(0.05, self.params.focus_distance_m + event.y * 0.05)
+                elif self.params.use_optical_design and mods & (K_LALT | K_RALT):
+                    self.params.focal_max_m = max(
+                        self.params.focal_min_m + 0.005,
+                        self.params.focal_max_m + event.y * 0.005,
+                    )
+                elif mods & (K_LSHIFT | K_RSHIFT):
                     # Adjust aperture radius
                     delta = event.y * 0.001
                     self.params.aperture_radius = max(0.001, self.params.aperture_radius + delta)
@@ -530,12 +625,17 @@ class ThickLensInteractiveViewer:
         dx = self.mouse_current_pos[0] - self.mouse_start_pos[0]
         
         if self.mouse_mode == MouseMode.DRAG_LENS:
-            if self.mouse_dragged_lens_idx >= 0 and self.mouse_dragged_lens_idx < len(self.params.lens_x_list):
+            if self.params.use_optical_design:
+                self.params.zoom = float(np.clip(self.params.zoom + dx * 0.0008, 0.0, 1.0))
+                self.queue_scene_update()
+                self.mouse_start_pos = self.mouse_current_pos
+            elif self.mouse_dragged_lens_idx >= 0 and self.mouse_dragged_lens_idx < len(self.params.lens_x_list):
                 # Map screen x-drag to scene x-axis change
                 # ~100 pixels = 0.01 m along optical axis
                 scene_dx = dx * 0.0001
                 self.params.lens_x_list[self.mouse_dragged_lens_idx] += scene_dx
                 self.queue_scene_update()
+                self.mouse_start_pos = self.mouse_current_pos
     
     def queue_scene_update(self):
         """Request a scene rebuild."""
@@ -600,7 +700,17 @@ class ThickLensInteractiveViewer:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
         
         # TODO: render radiance to left panel
-        # TODO: render parameters to right panel
+        if self.frame_count % 120 == 0:
+            print(
+                "[interactive-optics]",
+                f"mode={'design' if self.params.use_optical_design else 'manual'}",
+                f"zoom={self.params.zoom:.3f}",
+                f"focus={self.params.focus_distance_m:.2f}m",
+                f"f/{self.params.f_number:.2f}",
+                f"focal=({self.params.focal_min_m*1e3:.0f},{self.params.focal_max_m*1e3:.0f})mm",
+                f"aperture_model={self.params.aperture_model}",
+                flush=True,
+            )
         
         pygame.display.flip()
     

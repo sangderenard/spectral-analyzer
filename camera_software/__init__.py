@@ -19,6 +19,16 @@ from .camera_back   import (CameraBack, FlatBack, CylindricalBack,
                              build_eye_mesh)
 from .eye_geometry   import EyeGeometry, HUMAN_EYE, bake_eye_manifold, RetinalSensor
 from .auto_computer  import CameraComputer
+from .optical_design import (
+    OpticalDesignSpec,
+    ParaxialGroup,
+    SolvedOpticalTrain,
+    paraxial_system_matrix,
+    effective_focal_length,
+    back_focal_distance,
+    image_distance_for_object,
+    solve_four_group_zoom_surrogate,
+)
 
 __all__ = [
     "SpeedSpline",
@@ -50,4 +60,12 @@ __all__ = [
     "bake_eye_manifold",
     "RetinalSensor",
     "CameraComputer",
+    "OpticalDesignSpec",
+    "ParaxialGroup",
+    "SolvedOpticalTrain",
+    "paraxial_system_matrix",
+    "effective_focal_length",
+    "back_focal_distance",
+    "image_distance_for_object",
+    "solve_four_group_zoom_surrogate",
 ]

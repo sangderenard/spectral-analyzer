@@ -595,7 +595,7 @@ def saddle_mesh(mat_id: int, n: int = 28) -> tuple[np.ndarray, np.ndarray]:
     lin = np.linspace(-3.2, 3.2, n, dtype=np.float32)
     xs, zs = np.meshgrid(lin, lin, indexing="xy")
     ys = -0.75 - (xs * xs - zs * zs) / 5.2
-    grid = np.stack([xs, ys, zs - 5.9], axis=-1).astype(np.float32)
+    grid = np.stack([xs, zs - 0.75, -ys - 6.65], axis=-1).astype(np.float32)
     tris = []
     for i in range(n - 1):
         for j in range(n - 1):

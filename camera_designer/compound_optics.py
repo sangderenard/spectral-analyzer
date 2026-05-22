@@ -1,5 +1,4 @@
-"""camera_designer/compound_optics.py
-=====================================
+"""=====================================
 Exact algebraic model of a compound optical assembly.
 
 Each element is expressed as a closed-form algebraic operation on rays.
@@ -49,7 +48,7 @@ Human-interest properties
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -63,7 +62,16 @@ __all__ = [
     # System
     "CompoundLens",
     "ConeSpec",
+    "OpticalFace",
+    "FaceVignettingProfile",
+    "BoundaryTeleportProfile",
+    "AssemblyFieldProfile",
+    "FaceAngularLimit",
+    "AssemblyAngularLimits",
     "OpticalSide",
+    "RayBundle",
+    "BundleTraceResult",
+    "RayTraceResult",
     # Payload constants (mirror shader)
     "PLENS_MAGIC",
     "PLENS_HEADER",
@@ -116,6 +124,158 @@ class ConeSpec:
     aperture_radius: float
     axis:           np.ndarray
     half_angle_rad: float
+
+
+@dataclass(frozen=True)
+class OpticalFace:
+    """One registered analytical face in a compound assembly.
+
+    This is the compact, mesh-independent inventory used by batch domain
+    builders.  ``radius`` is exact for the clear aperture of the face; whether
+    rays actually survive to or through that face is a transport question.
+    """
+    element_idx: int
+    kind:        str
+    x_pos:       float
+    radius:      float
+    n_before:    float
+    n_after:     float
+    conic_k:     float = 0.0
+    R_curvature: float = 0.0
+    is_stop:     bool = False
+
+    @property
+    def center(self) -> np.ndarray:
+        """Clear-aperture center in scene coordinates."""
+        return np.array([self.x_pos, 0.0, 0.0], dtype=np.float64)
+
+
+@dataclass(frozen=True)
+class FaceVignettingProfile:
+    """Closed-form aperture cone from a chosen focal point to one face.
+
+    ``q_matrix`` is the symmetric quadratic form for unit directions ``d``:
+    ``d.T @ q_matrix @ d >= 0`` means the ray direction lies inside the clear
+    cone of this face, before upstream/downstream transport is considered.
+    """
+    face:                         OpticalFace
+    side:                         str
+    focal_point:                  np.ndarray
+    center:                       np.ndarray
+    center_direction:             np.ndarray
+    center_half_angle_rad:         float
+    clear_cone_half_angle_rad:     float
+    onset_half_angle_rad:          float
+    cutoff_half_angle_rad:         float
+    q_matrix:                     np.ndarray
+    axial_distance:               float
+    center_offset:                float
+    reachable_from_side:          bool
+
+
+@dataclass(frozen=True)
+class BoundaryTeleportProfile:
+    """Compound interface cone between the assembly's own side boundaries.
+
+    This is not a cone to every interior element.  It is the high-level domain
+    of the special parametric/teleport handler: rays enter at ``source_side``,
+    are evaluated through the whole chain, and emerge at ``target_side``.
+    """
+    source_side:                    str
+    target_side:                    str
+    source_center:                  np.ndarray
+    target_center:                  np.ndarray
+    source_radius:                  float
+    target_radius:                  float
+    axis:                           np.ndarray
+    center_direction:               np.ndarray
+    center_distance:                float
+    target_cone_half_angle_rad:      float
+    edge_to_edge_half_angle_rad:     float
+    q_matrix:                       np.ndarray
+    verified_transmission_fraction: float
+    verified_exit_center:           np.ndarray
+    verified_exit_radius:           float
+    verified_projection:            Optional[BundleTraceResult] = None
+
+
+@dataclass(frozen=True)
+class AssemblyFieldProfile:
+    """Field profile for a focal point on one side of the optical system."""
+    side:                         str
+    focal_point:                  np.ndarray
+    faces:                        Tuple[FaceVignettingProfile, ...]
+    limiting_face:                Optional[FaceVignettingProfile]
+    boundary:                     Optional[BoundaryTeleportProfile]
+    full_field_half_angle_rad:     float
+    cutoff_half_angle_rad:         float
+    verified_projection:          Optional[BundleTraceResult] = None
+
+
+@dataclass(frozen=True)
+class FaceAngularLimit:
+    """Angular domain for one registered face, measured from a launch origin."""
+    face:                         OpticalFace
+    origin:                       np.ndarray
+    spread_half_angle_rad:         float
+    verified_transmission_fraction: float
+    convergence_half_angle_rad:    float
+    axis_intercept_x:              float
+    status_counts:                 dict
+
+
+@dataclass(frozen=True)
+class AssemblyAngularLimits:
+    """Batch angular envelope across every registered face in an assembly."""
+    origin:                         np.ndarray
+    side:                           str
+    faces:                          Tuple[FaceAngularLimit, ...]
+    spread_half_angle_rad:           float
+    verified_spread_half_angle_rad:  float
+    convergence_half_angle_rad:      float
+
+
+@dataclass(frozen=True)
+class RayBundle:
+    """Batch of ray origins/directions plus optional wavelengths."""
+    origins:      np.ndarray
+    directions:   np.ndarray
+    wavelengths:  Optional[np.ndarray] = None
+
+    def __post_init__(self):
+        object.__setattr__(self, "origins", np.asarray(self.origins, dtype=np.float64))
+        dirs = np.asarray(self.directions, dtype=np.float64)
+        norms = np.linalg.norm(dirs, axis=1)
+        dirs = dirs / np.maximum(norms[:, None], _EPS)
+        object.__setattr__(self, "directions", dirs)
+        if self.origins.ndim != 2 or self.origins.shape[1] != 3:
+            raise ValueError("RayBundle.origins must have shape (N, 3)")
+        if dirs.shape != self.origins.shape:
+            raise ValueError("RayBundle.directions must have shape (N, 3)")
+        if self.wavelengths is not None:
+            wl = np.asarray(self.wavelengths, dtype=np.float64).reshape(-1)
+            if wl.shape[0] != self.origins.shape[0]:
+                raise ValueError("RayBundle.wavelengths must have length N")
+            object.__setattr__(self, "wavelengths", wl)
+
+
+@dataclass(frozen=True)
+class RayTraceResult:
+    """Scalar transfer result for one ray."""
+    origin:      np.ndarray
+    direction:   np.ndarray
+    opl:         float
+    reason:      TerminationReason
+    intercepts:  Tuple[np.ndarray, ...]
+
+
+@dataclass(frozen=True)
+class BundleTraceResult:
+    """Vectorized container returned by CompoundLens.evaluate_bundle()."""
+    origins:     np.ndarray
+    directions:  np.ndarray
+    opl:         np.ndarray
+    status:      np.ndarray
 
 
 # ── Algebraic primitives ──────────────────────────────────────────────────────
@@ -638,9 +798,538 @@ class CompoundLens:
             "back": self.side_cone("back"),
         }
 
+    def registered_faces(self) -> Tuple[OpticalFace, ...]:
+        """Return all analytical faces registered by this compound model.
+
+        The result unifies lenses, flat interfaces, mirrors added later through
+        handler roles, and aperture stops under a single face inventory.  These
+        fields are exact parameters; transport-dependent limits are computed by
+        tracing against this inventory.
+        """
+        faces: list[OpticalFace] = []
+        for idx, el in enumerate(self._elements):
+            if isinstance(el, ApertureStop):
+                faces.append(OpticalFace(
+                    element_idx=idx,
+                    kind="aperture_stop",
+                    x_pos=float(el.x_pos),
+                    radius=float(el.r_clear),
+                    n_before=float(el.n_medium),
+                    n_after=float(el.n_medium),
+                    is_stop=True,
+                ))
+            elif isinstance(el, FlatSurface):
+                faces.append(OpticalFace(
+                    element_idx=idx,
+                    kind="flat_surface",
+                    x_pos=float(el.x_pos),
+                    radius=float(el.aperture_r),
+                    n_before=float(el.n_before),
+                    n_after=float(el.n_after),
+                ))
+            elif isinstance(el, ConicSurface):
+                faces.append(OpticalFace(
+                    element_idx=idx,
+                    kind="conic_surface",
+                    x_pos=float(el.x_pos),
+                    radius=float(el.aperture_r),
+                    n_before=float(el.n_before),
+                    n_after=float(el.n_after),
+                    conic_k=float(el.conic_k),
+                    R_curvature=float(el.R_curvature),
+                ))
+        return tuple(faces)
+
+    def boundary_teleport_profile(
+        self,
+        side: str,
+        *,
+        n_azimuth: int = 32,
+        verify: bool = True,
+    ) -> BoundaryTeleportProfile:
+        """Return the compound front↔back interface profile for one launch side.
+
+        The cone is defined only by the assembly's own side planes.  It is the
+        shape a parametric teleport handler presents to the surrounding scene:
+        enter one boundary, evaluate the entire optical chain, emerge at the
+        other boundary.
+        """
+        src = self.side(side)
+        dst = self.side("back" if src.side == "front" else "front")
+        source_center = np.array([float(src.x_pos), 0.0, 0.0], dtype=np.float64)
+        target_center = np.array([float(dst.x_pos), 0.0, 0.0], dtype=np.float64)
+        axis = np.array([float(src.axis_sign), 0.0, 0.0], dtype=np.float64)
+        delta = target_center - source_center
+        dist = float(np.linalg.norm(delta))
+        center_dir = delta / max(dist, _EPS)
+        target_half = math.atan2(max(0.0, float(dst.radius)), max(dist, _EPS))
+        edge_half = math.atan2(
+            max(0.0, float(src.radius)) + max(0.0, float(dst.radius)),
+            max(dist, _EPS),
+        )
+        cos_half = math.cos(target_half)
+        q = np.outer(center_dir, center_dir) - (cos_half * cos_half) * np.eye(3, dtype=np.float64)
+
+        result = None
+        verified_fraction = 0.0
+        verified_center = np.full(3, np.nan, dtype=np.float64)
+        verified_radius = float("nan")
+        if verify:
+            origins = []
+            dirs = []
+            n_phi = max(4, int(n_azimuth))
+            for scale in (0.0, 0.5, 0.95, 1.0):
+                for k in range(n_phi):
+                    phi = 2.0 * math.pi * k / n_phi
+                    target = np.array([
+                        float(dst.x_pos),
+                        scale * float(dst.radius) * math.cos(phi),
+                        scale * float(dst.radius) * math.sin(phi),
+                    ], dtype=np.float64)
+                    d = target - source_center
+                    if float(np.dot(d, axis)) <= _EPS:
+                        continue
+                    origins.append(source_center - axis * 1.0e-9)
+                    dirs.append(d)
+            if origins:
+                bundle = RayBundle(np.asarray(origins, dtype=np.float64),
+                                   np.asarray(dirs, dtype=np.float64))
+                result = self.evaluate_bundle(bundle)
+                ok = result.status == int(TerminationReason.PASSED.value)
+                verified_fraction = float(np.count_nonzero(ok)) / float(ok.shape[0])
+                if np.any(ok):
+                    pts = result.origins[ok]
+                    verified_center = np.mean(pts, axis=0)
+                    radial = np.linalg.norm(pts[:, 1:3] - verified_center[None, 1:3], axis=1)
+                    verified_radius = float(np.max(radial)) if radial.size else 0.0
+
+        return BoundaryTeleportProfile(
+            source_side=src.side,
+            target_side=dst.side,
+            source_center=source_center,
+            target_center=target_center,
+            source_radius=float(src.radius),
+            target_radius=float(dst.radius),
+            axis=axis,
+            center_direction=center_dir,
+            center_distance=float(dist),
+            target_cone_half_angle_rad=float(target_half),
+            edge_to_edge_half_angle_rad=float(edge_half),
+            q_matrix=q,
+            verified_transmission_fraction=float(verified_fraction),
+            verified_exit_center=verified_center,
+            verified_exit_radius=float(verified_radius),
+            verified_projection=result,
+        )
+
+    def boundary_teleport_profiles(self, *, n_azimuth: int = 32, verify: bool = True) -> dict:
+        """Return both front→back and back→front compound boundary profiles."""
+        return {
+            "front": self.boundary_teleport_profile("front", n_azimuth=n_azimuth, verify=verify),
+            "back": self.boundary_teleport_profile("back", n_azimuth=n_azimuth, verify=verify),
+        }
+
+    def vignetting_profile_from_point(
+        self,
+        focal_point: Sequence[float],
+        *,
+        side: str = "front",
+        verify: bool = False,
+        n_azimuth: int = 32,
+    ) -> AssemblyFieldProfile:
+        """Profile face-by-face vignetting from a focal point on either side.
+
+        The closed-form part is geometric and exact for every registered clear
+        aperture: each face contributes a cone in direction space.  If
+        ``verify`` is true, edge samples on the limiting face are traced through
+        the full refractive/stop chain to identify transport losses.
+        """
+        p = np.asarray(focal_point, dtype=np.float64)
+        s = self.side(side)
+        axis = np.array([float(s.axis_sign), 0.0, 0.0], dtype=np.float64)
+        profiles = []
+        identity = np.eye(3, dtype=np.float64)
+
+        for face in self.registered_faces():
+            center = face.center
+            v = center - p
+            dist = float(np.linalg.norm(v))
+            reachable = dist > _EPS and float(np.dot(v, axis)) > _EPS
+            if reachable:
+                cdir = v / dist
+                alpha = math.asin(float(np.clip(face.radius / max(dist, _EPS), 0.0, 1.0)))
+                cos_alpha = math.cos(alpha)
+                q = np.outer(cdir, cdir) - (cos_alpha * cos_alpha) * identity
+                center_angle = math.acos(float(np.clip(np.dot(cdir, axis), -1.0, 1.0)))
+                onset = max(0.0, center_angle - alpha)
+                cutoff = min(0.5 * math.pi, center_angle + alpha)
+                axial_distance = abs(float(np.dot(v, axis)))
+                center_offset = float(np.linalg.norm(v - np.dot(v, axis) * axis))
+            else:
+                cdir = np.zeros(3, dtype=np.float64)
+                q = np.full((3, 3), np.nan, dtype=np.float64)
+                center_angle = float("nan")
+                alpha = 0.0
+                onset = 0.0
+                cutoff = 0.0
+                axial_distance = 0.0
+                center_offset = float("nan")
+
+            profiles.append(FaceVignettingProfile(
+                face=face,
+                side=s.side,
+                focal_point=p.copy(),
+                center=center,
+                center_direction=cdir,
+                center_half_angle_rad=float(center_angle),
+                clear_cone_half_angle_rad=float(alpha),
+                onset_half_angle_rad=float(onset),
+                cutoff_half_angle_rad=float(cutoff),
+                q_matrix=q,
+                axial_distance=float(axial_distance),
+                center_offset=float(center_offset),
+                reachable_from_side=bool(reachable),
+            ))
+
+        reachable_profiles = [prof for prof in profiles if prof.reachable_from_side]
+        limiting = min(
+            reachable_profiles,
+            key=lambda prof: prof.cutoff_half_angle_rad,
+            default=None,
+        )
+        full_field = min((prof.onset_half_angle_rad for prof in reachable_profiles),
+                         default=0.0)
+        cutoff = min((prof.cutoff_half_angle_rad for prof in reachable_profiles),
+                     default=0.0)
+
+        verified = None
+        if verify and limiting is not None:
+            bundle = self._bundle_for_profile_edge(p, limiting, axis, n_azimuth)
+            if bundle.origins.shape[0] > 0:
+                verified = self.evaluate_bundle(bundle)
+
+        return AssemblyFieldProfile(
+            side=s.side,
+            focal_point=p.copy(),
+            faces=tuple(profiles),
+            limiting_face=limiting,
+            boundary=self.boundary_teleport_profile(s.side, n_azimuth=n_azimuth, verify=verify),
+            full_field_half_angle_rad=float(full_field),
+            cutoff_half_angle_rad=float(cutoff),
+            verified_projection=verified,
+        )
+
+    def profile_field_pair(
+        self,
+        object_point: Sequence[float],
+        image_point: Optional[Sequence[float]] = None,
+        *,
+        verify: bool = False,
+        n_azimuth: int = 32,
+    ) -> dict:
+        """Return front and optional back field profiles for a receptive/projective pair.
+
+        This is intentionally point-to-point: camera use supplies an object-side
+        point and optionally a sensor/image point; portal use may supply only one
+        side and treat the returned face cones as the projective domain.
+        """
+        front = self.vignetting_profile_from_point(
+            object_point,
+            side="front",
+            verify=verify,
+            n_azimuth=n_azimuth,
+        )
+        result = {"front": front}
+        if image_point is not None:
+            result["back"] = self.vignetting_profile_from_point(
+                image_point,
+                side="back",
+                verify=verify,
+                n_azimuth=n_azimuth,
+            )
+        return result
+
     @property
     def elements(self) -> List[_Element]:
         return list(self._elements)
+
+    # ── Scalar and batch transport ───────────────────────────────────────────
+
+    def trace(
+        self,
+        origin: Sequence[float],
+        direction: Sequence[float],
+    ) -> RayTraceResult:
+        """Trace one ray through the assembly.
+
+        Forward rays traverse front→back.  Backward rays traverse back→front
+        with refractive indices swapped at every refracting face, so the same
+        analytical model supports sensor→scene domain probes.
+        """
+        o = np.asarray(origin, dtype=np.float64).copy()
+        d = np.asarray(direction, dtype=np.float64).copy()
+        d_norm = float(np.linalg.norm(d))
+        if d_norm <= _EPS:
+            raise ValueError("ray direction must be non-zero")
+        d /= d_norm
+
+        if self.hood is not None and d[0] > 0.0 and self.hood.clips(o, d):
+            return RayTraceResult(o, d, 0.0, TerminationReason.CLIPPED_HOOD, tuple())
+
+        opl = 0.0
+        hits: list[np.ndarray] = []
+        sequence = self._trace_sequence(d[0])
+        for el in sequence:
+            if isinstance(el, ApertureStop):
+                o2, d2, opl, reason = el.check(o, d, opl)
+            else:
+                o2, d2, opl, reason = el.refract(o, d, opl)
+            if reason is not TerminationReason.PASSED:
+                return RayTraceResult(o, d, float(opl), reason, tuple(hits))
+            assert o2 is not None and d2 is not None
+            hits.append(o2.copy())
+            o = o2 + d2 * (10.0 * _EPS)
+            d = d2
+
+        return RayTraceResult(o, d, float(opl), TerminationReason.PASSED, tuple(hits))
+
+    def evaluate_bundle(self, bundle: RayBundle) -> BundleTraceResult:
+        """Trace a ray bundle through the current parametric chain."""
+        n = int(bundle.origins.shape[0])
+        out_o = np.empty((n, 3), dtype=np.float64)
+        out_d = np.empty((n, 3), dtype=np.float64)
+        opl = np.empty(n, dtype=np.float64)
+        status = np.empty(n, dtype=np.int32)
+        for i in range(n):
+            r = self.trace(bundle.origins[i], bundle.directions[i])
+            if r.reason is TerminationReason.PASSED:
+                out_o[i] = r.intercepts[-1] if r.intercepts else r.origin
+                out_d[i] = r.direction
+            else:
+                out_o[i] = r.origin
+                out_d[i] = r.direction
+            opl[i] = r.opl
+            status[i] = int(r.reason.value)
+        return BundleTraceResult(out_o, out_d, opl, status)
+
+    def drop_terminated(
+        self,
+        bundle: RayBundle,
+    ) -> Tuple[RayBundle, BundleTraceResult, np.ndarray]:
+        """Evaluate a bundle and return only rays that passed the assembly."""
+        result = self.evaluate_bundle(bundle)
+        mask = result.status == int(TerminationReason.PASSED.value)
+        wl = bundle.wavelengths[mask] if bundle.wavelengths is not None else None
+        return RayBundle(bundle.origins[mask], bundle.directions[mask], wl), result, mask
+
+    def sample_side_bundle(
+        self,
+        side: str,
+        *,
+        n_spatial: int = 8,
+        n_directions: int = 8,
+        wavelengths_um: Optional[Sequence[float]] = None,
+    ) -> RayBundle:
+        """Generate a deterministic polar bundle on a side's clear aperture."""
+        s = self.side(side)
+        cone = self.side_cone(s.side)
+        wls = list(wavelengths_um) if wavelengths_um is not None else [0.587]
+        origins: list[list[float]] = []
+        dirs: list[list[float]] = []
+        wl_out: list[float] = []
+
+        n_r = max(1, int(n_spatial))
+        n_a = max(1, int(n_directions))
+        for ir in range(n_r):
+            r = 0.0 if n_r == 1 else s.radius * math.sqrt((ir + 0.5) / n_r)
+            phi_o = 2.0 * math.pi * (ir % max(1, n_r)) / max(1, n_r)
+            oy = r * math.cos(phi_o)
+            oz = r * math.sin(phi_o)
+            for ia in range(n_a):
+                frac = 0.0 if n_a == 1 else (ia + 0.5) / n_a
+                theta = frac * cone.half_angle_rad
+                phi_d = 2.0 * math.pi * ia / n_a
+                dx = float(s.axis_sign) * math.cos(theta)
+                dy = math.sin(theta) * math.cos(phi_d)
+                dz = math.sin(theta) * math.sin(phi_d)
+                for wl in wls:
+                    origins.append([s.x_pos - float(s.axis_sign) * 1.0e-9, oy, oz])
+                    dirs.append([dx, dy, dz])
+                    wl_out.append(float(wl))
+
+        return RayBundle(
+            np.asarray(origins, dtype=np.float64),
+            np.asarray(dirs, dtype=np.float64),
+            np.asarray(wl_out, dtype=np.float64),
+        )
+
+    def build_transfer_lut(
+        self,
+        *,
+        n_u: int = 32,
+        n_v: int = 32,
+        n_directions: int = 8,
+    ) -> Tuple[np.ndarray, int]:
+        """Build a compact transfer LUT by verified parametric ray batches.
+
+        Payload layout:
+          magic, n_u, n_v, n_a, n_b, reserved..., then cells (n_u,n_v,n_a,n_b,7)
+        The seven cell fields are exit origin y/z, exit dir x/y/z, valid, opl.
+        """
+        n_u = max(2, int(n_u))
+        n_v = max(2, int(n_v))
+        n_a = max(1, int(math.sqrt(max(1, n_directions))))
+        n_b = max(1, int(math.ceil(max(1, n_directions) / n_a)))
+        side = self.side("front")
+        cone = self.side_cone("front")
+
+        origins: list[list[float]] = []
+        dirs: list[list[float]] = []
+        slots: list[tuple[int, int, int, int]] = []
+        for iu in range(n_u):
+            y = ((iu + 0.5) / n_u * 2.0 - 1.0) * side.radius
+            for iv in range(n_v):
+                z = ((iv + 0.5) / n_v * 2.0 - 1.0) * side.radius
+                if y*y + z*z > side.radius * side.radius:
+                    continue
+                for ia in range(n_a):
+                    theta = ((ia + 0.5) / n_a) * cone.half_angle_rad
+                    for ib in range(n_b):
+                        phi = 2.0 * math.pi * (ib + 0.5) / n_b
+                        origins.append([side.x_pos - float(side.axis_sign) * 1.0e-9, y, z])
+                        dirs.append([
+                            math.cos(theta),
+                            math.sin(theta) * math.cos(phi),
+                            math.sin(theta) * math.sin(phi),
+                        ])
+                        slots.append((iu, iv, ia, ib))
+
+        payload = np.zeros(16 + n_u * n_v * n_a * n_b * 7, dtype=np.float32)
+        payload[:5] = np.array([14950.0, n_u, n_v, n_a, n_b], dtype=np.float32)
+        if not origins:
+            return payload, 0
+
+        result = self.evaluate_bundle(RayBundle(np.asarray(origins), np.asarray(dirs)))
+        cells = payload[16:].reshape(n_u, n_v, n_a, n_b, 7)
+        valid_count = 0
+        passed = result.status == int(TerminationReason.PASSED.value)
+        for i, ok in enumerate(passed):
+            if not ok:
+                continue
+            iu, iv, ia, ib = slots[i]
+            cells[iu, iv, ia, ib, 0] = float(result.origins[i, 1])
+            cells[iu, iv, ia, ib, 1] = float(result.origins[i, 2])
+            cells[iu, iv, ia, ib, 2:5] = result.directions[i].astype(np.float32)
+            cells[iu, iv, ia, ib, 5] = 1.0
+            cells[iu, iv, ia, ib, 6] = float(result.opl[i])
+            valid_count += 1
+        return payload, valid_count
+
+    def angular_limits_from_origin(
+        self,
+        origin: Sequence[float] = (0.0, 0.0, 0.0),
+        *,
+        side: str = "front",
+        n_azimuth: int = 16,
+    ) -> AssemblyAngularLimits:
+        """Compute per-face and aggregate angular limits from a launch origin.
+
+        ``spread_half_angle_rad`` is exact geometry from the origin to each
+        registered clear aperture.  ``verified_*`` fields are derived by tracing
+        the corresponding edge rays through the whole chain.
+        """
+        o = np.asarray(origin, dtype=np.float64)
+        s = self.side(side)
+        axis = np.array([float(s.axis_sign), 0.0, 0.0], dtype=np.float64)
+        face_limits: list[FaceAngularLimit] = []
+        n_phi = max(4, int(n_azimuth))
+
+        for face in self.registered_faces():
+            dx = face.x_pos - float(o[0])
+            transverse_center = math.hypot(float(o[1]), float(o[2]))
+            spread = math.atan2(max(0.0, face.radius) + transverse_center, abs(dx))
+            ray_dirs = []
+            targets = [np.array([face.x_pos, 0.0, 0.0], dtype=np.float64)]
+            for scale in (0.5, 0.95, 1.0):
+                for k in range(n_phi):
+                    phi = 2.0 * math.pi * k / n_phi
+                    targets.append(np.array([
+                        face.x_pos,
+                        scale * face.radius * math.cos(phi),
+                        scale * face.radius * math.sin(phi),
+                    ], dtype=np.float64))
+            for target in targets:
+                d = target - o
+                if np.dot(d, axis) > _EPS:
+                    ray_dirs.append(d)
+
+            if ray_dirs:
+                bundle = RayBundle(np.repeat(o[None, :], len(ray_dirs), axis=0),
+                                   np.asarray(ray_dirs, dtype=np.float64))
+                result = self.evaluate_bundle(bundle)
+                ok = result.status == int(TerminationReason.PASSED.value)
+                counts = {
+                    TerminationReason(int(v)).name: int(np.count_nonzero(result.status == v))
+                    for v in np.unique(result.status)
+                }
+                verified_frac = float(np.count_nonzero(ok)) / float(len(ok))
+                conv = float("nan")
+                axis_x = float("nan")
+                if np.any(ok):
+                    conv_vals = []
+                    axis_vals = []
+                    for ro, rd in zip(result.origins[ok], result.directions[ok]):
+                        r2 = float(rd[1] * rd[1] + rd[2] * rd[2])
+                        if r2 > _EPS:
+                            t_axis = -float(ro[1] * rd[1] + ro[2] * rd[2]) / r2
+                            if t_axis > 0.0:
+                                x_axis = float(ro[0] + t_axis * rd[0])
+                                axial_dist = abs(x_axis - float(ro[0]))
+                                radius_at_exit = math.hypot(float(ro[1]), float(ro[2]))
+                                conv_vals.append(math.atan2(radius_at_exit, max(axial_dist, _EPS)))
+                                axis_vals.append(x_axis)
+                    if conv_vals:
+                        conv = float(max(conv_vals))
+                        axis_x = float(np.mean(axis_vals))
+                    else:
+                        out = result.directions[ok]
+                        cosang = np.clip(out @ axis, -1.0, 1.0)
+                        conv = float(np.max(np.arccos(cosang)))
+                face_limits.append(FaceAngularLimit(
+                    face=face,
+                    origin=o.copy(),
+                    spread_half_angle_rad=float(spread),
+                    verified_transmission_fraction=verified_frac,
+                    convergence_half_angle_rad=conv,
+                    axis_intercept_x=axis_x,
+                    status_counts=counts,
+                ))
+            else:
+                face_limits.append(FaceAngularLimit(
+                    face=face,
+                    origin=o.copy(),
+                    spread_half_angle_rad=float(spread),
+                    verified_transmission_fraction=0.0,
+                    convergence_half_angle_rad=float("nan"),
+                    axis_intercept_x=float("nan"),
+                    status_counts={},
+                ))
+
+        spread_all = max((f.spread_half_angle_rad for f in face_limits), default=0.0)
+        verified_spread = max(
+            (f.spread_half_angle_rad for f in face_limits if f.verified_transmission_fraction > 0.0),
+            default=0.0,
+        )
+        finite_conv = [f.convergence_half_angle_rad for f in face_limits
+                       if math.isfinite(f.convergence_half_angle_rad)]
+        return AssemblyAngularLimits(
+            origin=o.copy(),
+            side=s.side,
+            faces=tuple(face_limits),
+            spread_half_angle_rad=float(spread_all),
+            verified_spread_half_angle_rad=float(verified_spread),
+            convergence_half_angle_rad=float(max(finite_conv) if finite_conv else 0.0),
+        )
 
     # ── Paraxial system matrix ────────────────────────────────────────────────
 
@@ -734,7 +1423,19 @@ class CompoundLens:
 
     @property
     def exit_pupil(self) -> Tuple[float, float]:
-        """(x_position, radius) of the exit pupil in scene coords."""
+        """(x_position, radius) of the exit pupil in scene coords.
+
+        The exit pupil is the image of the aperture stop formed by all optical
+        elements that follow it.  Found via the ABCD imaging condition B=0:
+        propagate past the last element by d = -B/D to the plane where all
+        rays from a given stop-edge point converge.
+
+        Using [y, nu] (reduced-angle) convention throughout.
+        For an air-to-air system det(M_after) = 1, so the lateral magnification
+        is m = 1/D.
+
+        Returns (x_ep, r_ep) in the same coordinate system as element x_pos.
+        """
         stop = self._aperture_stop()
         if stop is None:
             for el in reversed(self._elements):
@@ -742,10 +1443,28 @@ class CompoundLens:
                     return el.x_pos, el.aperture_r
             return 0.0, 0.0
 
-        M_after = self._paraxial_matrix_after_stop()
-        r_stop  = stop.r_clear
-        y_exit  = M_after[0, 0] * r_stop
-        return stop.x_pos, abs(y_exit)
+        M_after, last_x = self._paraxial_matrix_after_stop_with_last_x()
+        r_stop = stop.r_clear
+        A = float(M_after[0, 0])
+        B = float(M_after[0, 1])
+        C = float(M_after[1, 0])
+        D = float(M_after[1, 1])
+
+        if abs(D) > _EPS:
+            # Imaging condition: all rays from stop edge meet at distance d_ep
+            # past the last element where B + d*D = 0.
+            d_ep = -B / D
+            x_ep = last_x + d_ep
+            det = A * D - B * C          # = 1 for air-to-air (Lagrange invariant)
+            m = det / D                  # lateral magnification stop→exit pupil
+            r_ep = abs(m) * r_stop
+        else:
+            # D=0 → telecentric image space; exit pupil at infinity.
+            # Use last element position; radius from A (stop height magnification).
+            x_ep = last_x
+            r_ep = abs(A) * r_stop if abs(A) > _EPS else r_stop
+
+        return float(x_ep), float(r_ep)
 
     @property
     def f_number(self) -> float:
@@ -766,6 +1485,51 @@ class CompoundLens:
         if f <= 0.0 or r_ent <= 0.0:
             return 0.0
         return math.atan2(r_ent, f)
+
+    def pixel_acceptance_fan(
+        self,
+        sensor_x: float,
+        sensor_heights: Sequence[float],
+    ) -> List[dict]:
+        """Per-pixel acceptance cone geometry for a set of sensor pixel heights.
+
+        For each pixel at height h on the sensor, returns the image-side cone
+        (pixel → exit pupil rim / centre) and the paraxial object-side chief ray
+        direction (entrance pupil → scene).
+
+        Returns a list of dicts keyed by:
+            h_sensor          – pixel transverse height (m)
+            x_ep_img, r_ep_img – exit pupil centre and radius
+            x_ep_obj, r_ep_obj – entrance pupil centre and radius
+            chief_angle_img   – angle of chief ray from axis on image side (rad)
+            marginal_half_angle_img – half-angle subtended by exit pupil (rad)
+            chief_angle_obj   – field angle of this pixel in object space (rad,
+                                 paraxial: atan2(h, f_eff))
+        """
+        x_ep_img, r_ep_img = self.exit_pupil
+        x_ep_obj, r_ep_obj = self.entrance_pupil
+        f = abs(self.f_eff)
+        result: List[dict] = []
+        for h in sensor_heights:
+            d_img = abs(sensor_x - x_ep_img)
+            if d_img < _EPS:
+                chief_img = 0.5 * math.pi * (1.0 if h > 0 else -1.0)
+                marginal_img = 0.5 * math.pi
+            else:
+                chief_img = math.atan2(h, d_img)
+                marginal_img = math.atan2(r_ep_img, math.sqrt(d_img ** 2 + h ** 2))
+            chief_obj = math.atan2(h, f) if f > _EPS else 0.0
+            result.append({
+                "h_sensor": float(h),
+                "x_ep_img": float(x_ep_img),
+                "r_ep_img": float(r_ep_img),
+                "x_ep_obj": float(x_ep_obj),
+                "r_ep_obj": float(r_ep_obj),
+                "chief_angle_img": float(chief_img),
+                "marginal_half_angle_img": float(marginal_img),
+                "chief_angle_obj": float(chief_obj),
+            })
+        return result
 
     def depth_of_field(
         self,
@@ -871,6 +1635,64 @@ class CompoundLens:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    def _trace_sequence(self, dir_x: float) -> List[_Element]:
+        """Return forward or reverse traversal elements for a ray direction."""
+        if dir_x >= 0.0:
+            return list(self._elements)
+
+        rev: list[_Element] = []
+        for el in reversed(self._elements):
+            if isinstance(el, ApertureStop):
+                rev.append(ApertureStop(el.x_pos, el.r_clear, el.n_medium))
+            elif isinstance(el, FlatSurface):
+                rev.append(FlatSurface(el.x_pos, el.n_after, el.n_before, el.aperture_r))
+            elif isinstance(el, ConicSurface):
+                rev.append(ConicSurface(
+                    x_pos=float(el.x_pos),
+                    R_curvature=float(el.R_curvature),
+                    n_before=float(el.n_after),
+                    n_after=float(el.n_before),
+                    aperture_r=float(el.aperture_r),
+                    conic_k=float(el.conic_k),
+                ))
+        return rev
+
+    def _bundle_for_profile_edge(
+        self,
+        focal_point: np.ndarray,
+        profile: FaceVignettingProfile,
+        axis: np.ndarray,
+        n_azimuth: int,
+    ) -> RayBundle:
+        """Build edge rays on a face profile's aperture cone."""
+        n_phi = max(4, int(n_azimuth))
+        origins = []
+        dirs = []
+        ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+        if abs(float(np.dot(ref, profile.center_direction))) > 0.9:
+            ref = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        u = np.cross(profile.center_direction, ref)
+        u_n = float(np.linalg.norm(u))
+        if u_n <= _EPS:
+            return RayBundle(np.zeros((0, 3), dtype=np.float64),
+                             np.zeros((0, 3), dtype=np.float64))
+        u /= u_n
+        v = np.cross(profile.center_direction, u)
+        for scale in (0.0, 0.5, 1.0):
+            alpha = profile.clear_cone_half_angle_rad * scale
+            for k in range(n_phi):
+                phi = 2.0 * math.pi * k / n_phi
+                d = (math.cos(alpha) * profile.center_direction
+                     + math.sin(alpha) * (math.cos(phi) * u + math.sin(phi) * v))
+                if float(np.dot(d, axis)) > _EPS:
+                    origins.append(focal_point)
+                    dirs.append(d)
+        if not origins:
+            return RayBundle(np.zeros((0, 3), dtype=np.float64),
+                             np.zeros((0, 3), dtype=np.float64))
+        return RayBundle(np.asarray(origins, dtype=np.float64),
+                         np.asarray(dirs, dtype=np.float64))
+
     def _aperture_stop(self) -> Optional[ApertureStop]:
         """Return the first ApertureStop in the element list, or None."""
         for el in self._elements:
@@ -902,14 +1724,21 @@ class CompoundLens:
 
     def _paraxial_matrix_after_stop(self) -> np.ndarray:
         """System matrix for elements following (not including) the aperture stop."""
+        M, _ = self._paraxial_matrix_after_stop_with_last_x()
+        return M
+
+    def _paraxial_matrix_after_stop_with_last_x(self) -> "Tuple[np.ndarray, float]":
+        """System matrix after the aperture stop plus x-position of the last element."""
         M = np.eye(2)
-        prev_x = None
+        prev_x: Optional[float] = None
         prev_n = 1.0
         past_stop = False
+        last_x = 0.0
         for el in self._elements:
             if isinstance(el, ApertureStop):
                 past_stop = True
                 prev_x = el.x_pos
+                last_x = el.x_pos
                 continue
             if not past_stop:
                 continue
@@ -925,4 +1754,5 @@ class CompoundLens:
                 M = np.array([[1.0, 0.0], [-P, 1.0]]) @ M
                 prev_x = x
                 prev_n = n2
-        return M
+                last_x = x
+        return M, float(last_x)

@@ -20,6 +20,11 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from camera_designer.compound_optics import (
+    ApertureStop as CompoundApertureStop,
+    CompoundLens,
+    ConicSurface as CompoundConicSurface,
+)
 from camera_designer.lens_assembly import LensAssemblySpec
 
 # Directory containing the GLSL compute shaders (ray_bvh_intersect.comp.glsl etc.)
@@ -484,8 +489,8 @@ class ObjectPlaneConfig:
 
 @dataclass
 class ImagePlateConfig:
-    x: float = 2.42
-    radius: float = 0.16
+    x: float = 1.25
+    radius: float = 0.045
     pixels: int = 64          # mesh tessellation rings (polar disc)
     sensor_res: int = 64      # pixel-grid side length; ~π/4·res² sites active in disc
     bokeh_rays: int = 4       # stencil rays fired per pixel site per call
@@ -991,6 +996,23 @@ class IrisApertureConfig:
     rotation_deg: float = 0.0    # first-blade edge angle (degrees)
 
 
+def _default_optical_design_spec():
+    from camera_software.optical_design import OpticalDesignSpec
+    return OpticalDesignSpec(
+        focal_length_range_m=(0.045, 0.070),
+        zoom=0.40,
+        focus_distance_m=0.35,
+        f_number=2.8,
+        entrance_x_m=0.43,
+        sensor_x_m=1.25,
+        sensor_clearance_m=0.025,
+        image_radius_m=0.045,
+        min_air_gap_m=0.008,
+        group_thickness_m=0.014,
+        max_group_radius_m=0.060,
+    )
+
+
 @dataclass
 class SceneConfig:
     x_min: float = 0.0
@@ -1004,16 +1026,26 @@ class SceneConfig:
     baffle0_aperture: float = 0.1
     baffle1_x: float = 1.15  # After lens back at 1.13, before screen
     baffle1_aperture: float = 0.1
-    baffle2_x: float = 2.35  # Just before screen at 2.42
+    baffle2_x: float = 1.18  # Just before the default sensor plane.
     baffle2_aperture: float = 0.1
-    screen_x: float = 2.42
-    screen_radius: float = 0.16
+    screen_x: float = 1.25
+    screen_radius: float = 0.045
     view_radius: float = 0.24
+    auto_fit_view: bool = True
+    view_aspect: float = 1560.0 / 860.0
     enable_debug_plate: bool = False
     debug_plate_x: float = 0.50
     debug_plate_radius: float = 0.20
     object_plane: ObjectPlaneConfig = field(default_factory=ObjectPlaneConfig)
     image_plate: ImagePlateConfig = field(default_factory=ImagePlateConfig)
+    include_legacy_stage: bool = False
+    subject_scene_mode: str = "orbiters"
+    subject_time_s: float = 0.0
+    subject_scale: float = 0.12
+    subject_depth_scale: Optional[float] = None
+    subject_x: Optional[float] = None
+    subject_y: float = 0.0
+    subject_z: float = 0.0
     side_room_y: float = -0.090
     side_room_aperture: float = 0.035
     side_room_bore_radius: float = 0.064
@@ -1052,6 +1084,7 @@ class SceneConfig:
     exit_pupil_x: float = 1.85
     exit_pupil_radius: float = 0.008   # 8 mm radius
     exit_pupil_thickness: float = 0.0003  # 0.3 mm — blade aperture
+    lens_hood_front_radius: float = 0.115
     # Optional supplementary macro lens (close focus helper): inserted at the front
     # to extend working distance and achieve extreme magnification.
     # Leave None to use standard lens stack; set to a LensConfig to add macro element.
@@ -1073,11 +1106,327 @@ class SceneConfig:
         LensConfig(center_x=1.19, thickness=0.040, aperture_radius=0.034, radius_front=0.100, radius_back=0.090, ior=1.52),
         LensConfig(center_x=1.34, thickness=0.045, aperture_radius=0.038, radius_front=0.120, radius_back=0.120, ior=1.57),
     ])
+    optical_design: Optional[object] = field(default_factory=_default_optical_design_spec)
+    aperture_model: str = "geometry"  # geometry | wave3d
+    bdpt_join_element: str = "iris"    # iris | exit-pupil | body-front | gN-front/back/center
 
 
 def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
+    design = getattr(scene, "optical_design", None)
+    if design is not None:
+        try:
+            solved = design
+            if hasattr(design, "form") and not hasattr(design, "groups"):
+                import dataclasses as _dc
+                from camera_software.optical_design import solve_four_group_zoom_surrogate
+
+                # ── Physical camera placement from scene geometry ──────────────
+                # G1 entrance: placed so scene.object_plane.x is exactly at the
+                # design focus distance.
+                # Sensor: placed at paraxial image distance past the minimum group
+                # span.  This keeps the camera compact (correct tube length for
+                # the focal length) and ensures the image actually forms at the
+                # sensor plane instead of hundreds of mm past it.
+                obj_x   = float(scene.object_plane.x)
+                f_m     = float(design.target_focal_length_m)
+                u_m     = float(max(design.focus_distance_m, f_m * 1.05))
+
+                # Optional macro supplementary: adjust effective focus distance.
+                macro_cfg = getattr(scene, "macro_lens", None)
+                if macro_cfg is not None:
+                    # Thin lens: 1/u_eff = 1/u + P_macro
+                    _tc = float(getattr(macro_cfg, "thickness", 0.0))
+                    _rf = float(getattr(macro_cfg, "radius_front", 0.0))
+                    _rb = float(getattr(macro_cfg, "radius_back",  0.0))
+                    _n  = float(getattr(macro_cfg, "ior", 1.52))
+                    if abs(_rf) > 1e-6:
+                        _p_macro = (_n - 1.0) * (1.0/abs(_rf) + 1.0/abs(_rb) if abs(_rb) > 1e-6 else 1.0/abs(_rf))
+                        _inv = 1.0/u_m + _p_macro
+                        if _inv > 1e-6:
+                            u_m = 1.0 / _inv
+
+                # Thin-lens paraxial image distance at this focus.
+                _denom = 1.0/f_m - 1.0/u_m
+                v_m = (1.0/_denom) if abs(_denom) > 1e-9 else f_m * 20.0
+                # Clamp sensor to scene bounds.
+                v_m = min(v_m, float(scene.x_max) - float(obj_x) - u_m - 0.05)
+
+                entrance_x = obj_x + u_m
+                min_group_span = (
+                    float(design.group_count - 1) * float(design.min_air_gap_m)
+                    + float(design.group_count)   * float(design.group_thickness_m)
+                )
+                sensor_x = entrance_x + min_group_span + v_m + float(design.sensor_clearance_m)
+
+                # The camera barrel can be wider than the scene/stage bore, but
+                # scene.tube_radius is a scene scale.  Keep it stable so camera
+                # placement does not stretch the rest of the world.
+                camera_barrel_r = float(design.max_group_radius_m + 0.012)
+
+                design = _dc.replace(
+                    design,
+                    entrance_x_m=round(entrance_x, 4),
+                    sensor_x_m=round(sensor_x, 4),
+                )
+                scene.image_plate.x     = round(sensor_x, 4)
+                scene.screen_x          = round(sensor_x, 4)
+                print(
+                    "[camera-placement]",
+                    f"obj_x={obj_x:.4f}",
+                    f"u={u_m*1e3:.1f}mm  v={v_m*1e3:.1f}mm",
+                    f"entrance={entrance_x:.4f}  sensor={sensor_x:.4f}",
+                    f"camera_barrel_r={camera_barrel_r*1e3:.1f}mm",
+                    f"scene_tube_r={float(scene.tube_radius)*1e3:.1f}mm",
+                    flush=True,
+                )
+
+                solved = solve_four_group_zoom_surrogate(design)
+            if hasattr(solved, "apply_to_scene"):
+                scene.optical_design = solved
+                solved.apply_to_scene(scene)
+                print(
+                    "[optical-design]",
+                    f"form={getattr(getattr(solved, 'spec', None), 'form', 'unknown')}",
+                    f"groups={len(getattr(solved, 'groups', []))}",
+                    f"f_eff={float(getattr(solved, 'effective_focal_length_m', 0.0))*1e3:.1f}mm",
+                    f"sensor_error={float(getattr(solved, 'sensor_error_m', 0.0))*1e3:.2f}mm",
+                    flush=True,
+                )
+                groups = getattr(solved, "groups", ())
+                if len(groups) >= 3 and getattr(scene, "iris_aperture", None) is None:
+                    g2 = groups[1]
+                    g3 = groups[2]
+                    ap_x = float(0.5 * (float(g2.x_m) + float(g3.x_m)))
+                    ap_r = float(max(1.0e-4, getattr(solved.spec, "aperture_radius_m", 0.018)))
+                    ap_outer = float(min(float(scene.tube_radius), ap_r * 1.55))
+                    scene.iris_aperture = IrisApertureConfig(
+                        enabled=True,
+                        x_pos=round(ap_x, 6),
+                        r_inner=round(ap_r, 6),
+                        r_outer=round(max(ap_r * 1.4, ap_outer), 6),
+                        n_blades=6,
+                    )
+                    print(
+                        "[aperture-placed]",
+                        f"x={ap_x:.4f}  (between G2@{float(g2.x_m):.4f} G3@{float(g3.x_m):.4f})",
+                        f"r_inner={ap_r*1e3:.2f}mm",
+                        flush=True,
+                    )
+        except Exception as exc:
+            print(f"[optical-design] solve/apply failed: {exc}", flush=True)
+            scene.optical_design = None
     lenses = list(getattr(scene, "lens_stack", []) or [])
-    return lenses if lenses else [scene.lens]
+    if not lenses:
+        lenses = [scene.lens]
+
+    # Optional macro supplementary group: positive close-up lens prepended at
+    # the front of the stack.  It reduces the effective focal length, allowing
+    # the main lens to focus closer than its minimum native focus distance.
+    macro_cfg = getattr(scene, "macro_lens", None)
+    if macro_cfg is not None and lenses:
+        # Place macro element just in front of G1 with a small air gap.
+        g1_front = float(lenses[0].x_front)
+        gap = float(getattr(scene, "min_air_gap_m", 0.006) if hasattr(scene, "min_air_gap_m") else 0.006)
+        thick = float(getattr(macro_cfg, "thickness", 0.012))
+        macro_center = g1_front - gap - thick * 0.5
+        import dataclasses as _dc
+        placed_macro = _dc.replace(macro_cfg, center_x=round(macro_center, 5))
+        lenses = [placed_macro] + lenses
+        print(
+            "[macro-lens]",
+            f"center_x={macro_center:.4f}",
+            f"thickness={thick*1e3:.1f}mm",
+            f"radius_front={getattr(placed_macro,'radius_front',0.0)*1e3:.1f}mm",
+            flush=True,
+        )
+
+    return lenses
+
+
+def _auto_fit_scene_view_to_mesh(scene: SceneConfig, tri_arr: np.ndarray) -> None:
+    """Fit orthographic and field-grid bounds to the generated physical mesh."""
+    if not bool(getattr(scene, "auto_fit_view", True)):
+        return
+    arr = np.asarray(tri_arr, dtype=np.float64)
+    if arr.size <= 0:
+        return
+    pts = arr.reshape(-1, 3)
+    finite = np.all(np.isfinite(pts), axis=1)
+    if not np.any(finite):
+        return
+    pts = pts[finite]
+    x0 = float(np.min(pts[:, 0]))
+    x1 = float(np.max(pts[:, 0]))
+    r = float(np.max(np.abs(pts[:, 1:3]))) if pts.shape[1] >= 3 else float(scene.view_radius)
+
+    semantic_x = [
+        float(getattr(scene, "source_x", x0)),
+        float(getattr(getattr(scene, "object_plane", None), "x", x0)),
+        float(getattr(scene, "exit_pupil_x", x1)),
+        float(getattr(getattr(scene, "image_plate", None), "x", x1)),
+    ]
+    x0 = min(x0, min(semantic_x))
+    x1 = max(x1, max(semantic_x))
+    r = max(
+        r,
+        float(getattr(scene, "source_radius", 0.0)),
+        float(getattr(getattr(scene, "object_plane", None), "radius", 0.0)),
+        float(getattr(getattr(scene, "image_plate", None), "radius", 0.0)),
+    )
+
+    x_content_span = max(0.10, x1 - x0)
+    x_pad = max(0.025, 0.035 * x_content_span)
+    y_content_span = max(0.10, 2.0 * (r * 1.08 + 0.010))
+    aspect = float(max(1.0e-6, getattr(scene, "view_aspect", 1.0)))
+    x_span = max(x_content_span + 2.0 * x_pad, y_content_span * aspect)
+    y_span = max(y_content_span, x_span / aspect)
+    x_mid = 0.5 * (x0 + x1)
+    old = (float(scene.x_min), float(scene.x_max), float(scene.view_radius))
+    scene.x_min = float(x_mid - 0.5 * x_span)
+    scene.x_max = float(x_mid + 0.5 * x_span)
+    scene.view_radius = float(0.5 * y_span)
+    new = (float(scene.x_min), float(scene.x_max), float(scene.view_radius))
+    if any(abs(a - b) > 1.0e-6 for a, b in zip(old, new)):
+        print(
+            "[view-fit]",
+            f"x=({scene.x_min:.4f},{scene.x_max:.4f})",
+            f"radius={scene.view_radius:.4f}",
+            flush=True,
+        )
+
+
+def _compound_lens_from_scene(scene: SceneConfig) -> CompoundLens:
+    """Build the canonical parametric optical model from SceneConfig.
+
+    Mesh generation and optical transport both consume the same LensConfig list,
+    so changing the scene's ordinary lens parameters changes the visible mesh and
+    the parametric transfer chain together.
+    """
+    lens = CompoundLens()
+    elements = []
+    n_air = 1.0
+    for cfg in _scene_lenses(scene):
+        if not _lens_is_valid(cfg):
+            continue
+        n_glass = float(max(1.0, cfg.ior))
+        elements.append((
+            float(cfg.x_front),
+            CompoundConicSurface(
+                x_pos=float(cfg.x_front),
+                R_curvature=float(cfg.radius_front),
+                n_before=n_air,
+                n_after=n_glass,
+                aperture_r=float(cfg.aperture_radius),
+                conic_k=0.0,
+            ),
+        ))
+        elements.append((
+            float(cfg.x_back),
+            CompoundConicSurface(
+                x_pos=float(cfg.x_back),
+                R_curvature=-float(cfg.radius_back),
+                n_before=n_glass,
+                n_after=n_air,
+                aperture_r=float(cfg.aperture_radius),
+                conic_k=0.0,
+            ),
+        ))
+
+    iris = getattr(scene, "iris_aperture", None)
+    if iris is not None and bool(getattr(iris, "enabled", False)):
+        elements.append((
+            float(iris.x_pos),
+            CompoundApertureStop(
+                x_pos=float(iris.x_pos),
+                r_clear=float(iris.r_inner),
+                n_medium=n_air,
+            ),
+        ))
+
+    for _x, element in sorted(elements, key=lambda item: item[0]):
+        lens.add(element)
+    return lens
+
+
+def _import_subject_scene(
+    scene: SceneConfig,
+    db: MaterialDatabase,
+    tris: List[np.ndarray],
+    mats: List[int],
+    source_tri_ids: List[int],
+    object_tri_ids: List[int],
+) -> None:
+    """Import the reusable orbiter/saddle demo as the subject in front of the camera."""
+    mode = str(getattr(scene, "subject_scene_mode", "") or "").strip()
+    if not mode or mode.lower() in ("none", "off"):
+        return
+    try:
+        import test_basic_gl_cpp_window as subject_mod
+    except Exception as exc:
+        print(f"[subject-scene] import failed: {exc}", flush=True)
+        return
+
+    subject_db, subject_idx = subject_mod.register_materials()
+    verts8, _mat_per_v, _gid_per_v, mat_per_tri, _groups = subject_mod.scene_for_phase(
+        subject_idx,
+        float(getattr(scene, "subject_time_s", 0.0)),
+        scene_mode=mode,
+    )
+    pts = np.asarray(verts8[:, 0:3], dtype=np.float64).reshape(-1, 3, 3)
+    mat_per_tri = np.asarray(mat_per_tri, dtype=np.int32).reshape(-1)
+    center = np.asarray(getattr(subject_mod, "SCENE_CENTER", np.zeros(3)), dtype=np.float64).reshape(3)
+    scale = float(max(1.0e-6, getattr(scene, "subject_scale", 0.12)))
+    depth_override = getattr(scene, "subject_depth_scale", None)
+    depth_scale = scale if depth_override is None else float(max(0.0, depth_override))
+    sx = getattr(scene, "subject_x", None)
+    subject_x = float(scene.object_plane.x if sx is None else sx)
+    subject_y = float(getattr(scene, "subject_y", 0.0))
+    subject_z = float(getattr(scene, "subject_z", 0.0))
+
+    old_to_new: Dict[int, int] = {}
+    emissive_old: set[int] = set()
+    for name in getattr(subject_db, "_order", []):
+        old_i = int(subject_idx.get(name, -1))
+        if old_i < 0:
+            continue
+        material = subject_db._materials[name]
+        new_i = db.register(f"subject_{name}", material)
+        old_to_new[old_i] = int(new_i)
+        emission = np.asarray(
+            material.get("emission_rgb", [0.0, 0.0, 0.0]) if isinstance(material, dict) else getattr(material, "emission_rgb", [0.0, 0.0, 0.0]),
+            dtype=np.float64,
+        )
+        if emission.size >= 3 and float(np.max(np.abs(emission[:3]))) > 1.0e-8:
+            emissive_old.add(old_i)
+
+    start = len(tris)
+    for i, tri in enumerate(pts):
+        p = np.empty_like(tri, dtype=np.float64)
+        # Original demo camera looks down -Z.  For the thick-lens demo it is a
+        # camera subject: original Z becomes optical depth, while original X/Y
+        # remain transverse subject coordinates.
+        p[:, 0] = subject_x + (tri[:, 2] - center[2]) * depth_scale
+        p[:, 1] = subject_y + (tri[:, 1] - center[1]) * scale
+        p[:, 2] = subject_z + (tri[:, 0] - center[0]) * scale
+        old_mat = int(mat_per_tri[i]) if i < mat_per_tri.size else -1
+        mat_idx = old_to_new.get(old_mat, 0)
+        tri_id = len(tris)
+        tris.append(np.ascontiguousarray(p, dtype=np.float64))
+        mats.append(int(mat_idx))
+        object_tri_ids.append(tri_id)
+        if old_mat in emissive_old:
+            source_tri_ids.append(tri_id)
+
+    print(
+        "[subject-scene]",
+        f"mode={mode}",
+        f"tris={len(tris) - start}",
+        f"emitters={len(source_tri_ids)}",
+        f"scale={scale:.4f}",
+        f"depth_scale={depth_scale:.4f}",
+        f"center_x={subject_x:.4f}",
+        flush=True,
+    )
 
 
 def _lens_is_valid(lens: LensConfig, min_edge_thickness: float = 0.004) -> bool:
@@ -1958,13 +2307,17 @@ def _build_thin_disc_element_oriented(
 
 
 def _lens_front_x(lens: LensConfig, r: np.ndarray) -> np.ndarray:
-    c = lens.x_front + lens.radius_front
-    return c - np.sqrt(np.maximum(0.0, lens.radius_front * lens.radius_front - r * r))
+    R = float(lens.radius_front)
+    c = lens.x_front + R
+    s = 1.0 if R >= 0.0 else -1.0
+    return c - s * np.sqrt(np.maximum(0.0, R * R - r * r))
 
 
 def _lens_back_x(lens: LensConfig, r: np.ndarray) -> np.ndarray:
-    c = lens.x_back - lens.radius_back
-    return c + np.sqrt(np.maximum(0.0, lens.radius_back * lens.radius_back - r * r))
+    R = float(lens.radius_back)
+    c = lens.x_back - R
+    s = 1.0 if R >= 0.0 else -1.0
+    return c + s * np.sqrt(np.maximum(0.0, R * R - r * r))
 
 
 def _build_lens_mesh(
@@ -2266,157 +2619,182 @@ def _build_scene_mesh(
     stage_light_cutters: List[PipeCSGSpec] = []
     diffuser_wave_specs: List[DiffuserWaveTubeSpec] = []
 
-    # Default legacy side-room tube as first macro light tube.
-    default_tube = StageLightTubeConfig(
-        opening_x=float(scene.side_room_source_x),
-        opening_y=-float(scene.tube_radius),
-        opening_z=float(scene.side_room_source_z),
-        axis_x=0.0,
-        axis_y=-1.0,
-        axis_z=0.0,
-        depth=float(max(0.02, scene.side_room_depth)),
-        profile="square",
-        bore_radius=float(scene.side_room_bore_radius),
-        n_sides=4,
-        diffuser_enabled=bool(scene.side_room_diffuser_enabled),
-        diffuser_radius=float(scene.side_room_diffuser_radius),
-        diffuser_thickness=float(scene.side_room_diffuser_thickness),
-        diffuser_transmittance=float(scene.side_room_diffuser_transmittance),
-        diffuser_diffuse_frac=float(scene.side_room_diffuser_diffuse_frac),
-        emitter_radius=float(scene.side_room_source_radius),
-        emitter_depth_frac=0.90,
-    )
-    all_tubes = [default_tube] + list(scene.stage_light_tubes)
-    for tube_cfg in all_tubes:
-        cut_spec = _build_stage_light_tube(
-            tube_cfg,
-            idx_wall=idx_silver,
-            idx_diffuser=idx_diffuser,
-            idx_source=idx_source,
-            tri_list=tris,
-            mat_ids=mats,
-            source_tri_ids=source_tri_ids,
-            wave_spec_out=diffuser_wave_specs,
+    if bool(getattr(scene, "include_legacy_stage", False)):
+        # Default legacy side-room tube as first macro light tube.
+        default_tube = StageLightTubeConfig(
+            opening_x=float(scene.side_room_source_x),
+            opening_y=-float(scene.tube_radius),
+            opening_z=float(scene.side_room_source_z),
+            axis_x=0.0,
+            axis_y=-1.0,
+            axis_z=0.0,
+            depth=float(max(0.02, scene.side_room_depth)),
+            profile="square",
+            bore_radius=float(scene.side_room_bore_radius),
+            n_sides=4,
+            diffuser_enabled=bool(scene.side_room_diffuser_enabled),
+            diffuser_radius=float(scene.side_room_diffuser_radius),
+            diffuser_thickness=float(scene.side_room_diffuser_thickness),
+            diffuser_transmittance=float(scene.side_room_diffuser_transmittance),
+            diffuser_diffuse_frac=float(scene.side_room_diffuser_diffuse_frac),
+            emitter_radius=float(scene.side_room_source_radius),
+            emitter_depth_frac=0.90,
         )
-        stage_light_cutters.append(cut_spec)
+        all_tubes = [default_tube] + list(scene.stage_light_tubes)
+        for tube_cfg in all_tubes:
+            cut_spec = _build_stage_light_tube(
+                tube_cfg,
+                idx_wall=idx_silver,
+                idx_diffuser=idx_diffuser,
+                idx_source=idx_source,
+                tri_list=tris,
+                mat_ids=mats,
+                source_tri_ids=source_tri_ids,
+                wave_spec_out=diffuser_wave_specs,
+            )
+            stage_light_cutters.append(cut_spec)
 
-    if bool(scene.stage_probe_emitter_enabled):
-        _build_emissive_sphere(
-            center=np.array([
-                float(scene.stage_probe_x),
-                float(scene.stage_probe_y),
-                float(scene.stage_probe_z),
-            ], dtype=np.float64),
-            radius=float(max(1.0e-4, scene.stage_probe_radius)),
-            tri_list=tris,
-            mat_ids=mats,
-            mat_idx=idx_source,
-            n_theta=20,
-            n_phi=12,
-            tri_ids=source_tri_ids,
-        )
+        if bool(scene.stage_probe_emitter_enabled):
+            _build_emissive_sphere(
+                center=np.array([
+                    float(scene.stage_probe_x),
+                    float(scene.stage_probe_y),
+                    float(scene.stage_probe_z),
+                ], dtype=np.float64),
+                radius=float(max(1.0e-4, scene.stage_probe_radius)),
+                tri_list=tris,
+                mat_ids=mats,
+                mat_idx=idx_source,
+                n_theta=20,
+                n_phi=12,
+                tri_ids=source_tri_ids,
+            )
+            print(
+                "[stage-probe]",
+                "enabled=1",
+                f"center=({scene.stage_probe_x:.3f},{scene.stage_probe_y:.3f},{scene.stage_probe_z:.3f})",
+                f"radius={scene.stage_probe_radius:.3f}",
+                flush=True,
+            )
+
         print(
-            "[stage-probe]",
-            "enabled=1",
-            f"center=({scene.stage_probe_x:.3f},{scene.stage_probe_y:.3f},{scene.stage_probe_z:.3f})",
-            f"radius={scene.stage_probe_radius:.3f}",
+            "[macro-stage-light]",
+            f"tubes={len(all_tubes)}",
+            f"open_mouth={1 if scene.side_room_diffuser_enabled else 0}",
+            f"diffuser_mouth={1 if scene.side_room_diffuser_enabled else 0}",
             flush=True,
         )
-    
-    # ─── Diagnostic: Diffuser Material Verification ─────────────────────────────
-    diffuser_mat = db._materials.get("light_room_diffuser")
-    if diffuser_mat:
-        print(
-            "[diffuser-material]",
-            f"transmission={diffuser_mat.transmission}",
-            f"transmittance_config={scene.side_room_diffuser_transmittance}",
-            f"albedo={diffuser_mat.albedo}",
-            f"roughness={diffuser_mat.roughness}",
-            flush=True,
+
+        _build_decorative_mesh(
+            tris,
+            mats,
+            idx_art,
+            center=np.array([scene.object_plane.x + 0.24, 0.0, 0.0], dtype=np.float64),
+            radius=0.045,
+            n_u=40,
+            n_v=28,
+            tri_ids=object_tri_ids,
+        )
+
+        # Mirror end-cap disc at the back of the light chamber (at source_x, faces +x inward).
+        _build_disc_cap(scene.source_x, scene.tube_radius, tris, mats, idx_silver, n_theta=48)
+
+        # Light chamber entrance: silver mirror cylinder from source to the
+        # collimating baffle.
+        _build_cylinder_walls(
+            scene.source_x,
+            scene.baffle0_x,
+            scene.tube_radius,
+            64,
+            tris,
+            mats,
+            idx_silver,
+            tri_ids=silver_wall_tri_ids,
         )
     else:
-        print("[diffuser-material] NOT FOUND in database", flush=True)
-    
-    print(
-        "[macro-stage-light]",
-        f"tubes={len(all_tubes)}",
-        f"open_mouth={1 if scene.side_room_diffuser_enabled else 0}",
-        f"diffuser_mouth={1 if scene.side_room_diffuser_enabled else 0}",
-        flush=True,
-    )
-    
-    _build_decorative_mesh(
-        tris,
-        mats,
-        idx_art,
-        center=np.array([scene.object_plane.x + 0.24, 0.0, 0.0], dtype=np.float64),
-        radius=0.045,
-        n_u=40,
-        n_v=28,
-        tri_ids=object_tri_ids,
-    )
-
-    # Mirror end-cap disc at the back of the light chamber (at source_x, faces +x inward).
-    _build_disc_cap(scene.source_x, scene.tube_radius, tris, mats, idx_silver, n_theta=48)
-
-    # Light chamber entrance: silver mirror cylinder from source to the
-    # collimating baffle.
-    _build_cylinder_walls(
-        scene.source_x,
-        scene.baffle0_x,
-        scene.tube_radius,
-        64,
-        tris,
-        mats,
-        idx_silver,
-        tri_ids=silver_wall_tri_ids,
-    )
+        _import_subject_scene(scene, db, tris, mats, source_tri_ids, object_tri_ids)
     _iris = getattr(scene, "iris_aperture", None)
     _iris_active = _iris is not None and getattr(_iris, "enabled", False)
     if _iris_active:
         _build_iris_baffle(_iris, scene.tube_radius, tris, mats, idx_aperture_black, aperture_stop_tri_ids)
+    if str(getattr(scene, "aperture_model", "geometry")).lower() == "wave3d":
+        print(
+            "[aperture-model] wave3d requested; geometric aperture mesh remains the boundary, "
+            "wave aperture propagation is pending",
+            flush=True,
+        )
     if lenses:
         first_lens = lenses[0]
         last_lens = lenses[-1]
-        # Place the exit pupil / aperture stop just behind the last lens so
-        # sensor backcast rays don't have to pass through a long barrel before
-        # reaching it.  Only override when the scene still holds the dataclass
-        # default (1.85); explicit non-default values are respected as-is.
-        if abs(scene.exit_pupil_x - 1.85) < 1.0e-4:
-            scene.exit_pupil_x = round(float(last_lens.x_back) + 0.015, 6)
-        # Pre-lens bore: narrow silver sleeve from baffle0 to lens front.
-        # This keeps rays confined and prevents pre-lens spray.
-        # Has a hole-saw opening where the side-room light chamber penetrates.
-        # The stage chamber stays at the configured chamber radius. Narrowing
-        # this segment creates an artificial annular discontinuity at baffle0_x.
+        # Physical camera body entrance = back face of the last lens group.
+        # This is always driven by the actual lens geometry, not a heuristic or
+        # the optical exit pupil (which may be a virtual pupil before G1).
+        # exit_pupil_x  : where the light-tight barrel starts (G4 back face).
+        # exit_pupil_radius : clear opening of the barrel at that face (G4 aperture).
+        # Both are set unconditionally so they are correct before mesh triangles
+        # are built below — set_optics() also writes them but runs after the mesh.
+        scene.exit_pupil_x = round(float(last_lens.x_back) + 0.005, 6)
+        scene.exit_pupil_radius = round(float(last_lens.aperture_radius), 6)
         bore_r = float(scene.tube_radius)
-        # General CSG opening: subtract all stage-light tube interiors from the
-        # main pre-lens bore wall so each tube forms an interior union channel.
-        host_pipe = PipeCSGSpec(
-            center=np.array([0.0, 0.0, 0.0], dtype=np.float64),
-            axis_dir=np.array([1.0, 0.0, 0.0], dtype=np.float64),
-            t0=float(scene.baffle0_x),
-            t1=float(first_lens.x_front - 0.002),
-            kind="circle",
-            radius=float(bore_r),
-        )
-        _build_pipe_walls_csg(
-            host_pipe,
-            tris,
-            mats,
-            idx_silver,
-            n_axial=64,
-            n_profile=64,
-            cutters=stage_light_cutters,
-            csg_mode="subtract",
-            tri_ids=silver_wall_tri_ids,
-        )
+        lens_housing_r = float(last_lens.aperture_radius + 0.008)
+        if bool(getattr(scene, "include_legacy_stage", False)):
+            # Legacy pre-lens bore with CSG openings for authored light tubes.
+            host_pipe = PipeCSGSpec(
+                center=np.array([0.0, 0.0, 0.0], dtype=np.float64),
+                axis_dir=np.array([1.0, 0.0, 0.0], dtype=np.float64),
+                t0=float(scene.baffle0_x),
+                t1=float(first_lens.x_front - 0.002),
+                kind="circle",
+                radius=float(bore_r),
+            )
+            _build_pipe_walls_csg(
+                host_pipe,
+                tris,
+                mats,
+                idx_silver,
+                n_axial=64,
+                n_profile=64,
+                cutters=stage_light_cutters,
+                csg_mode="subtract",
+                tri_ids=silver_wall_tri_ids,
+            )
+        else:
+            # Camera-owned lens hood: a conic frustum from the front mouth into
+            # the first lens seat, with no imported stage walls or light tubes.
+            hood_depth = float(min(0.030, max(0.010, 0.35 * first_lens.aperture_radius)))
+            hood_x0 = float(first_lens.x_front - hood_depth)
+            hood_x1 = float(first_lens.x_front - 0.002)
+            hood_r1 = float(max(lens_housing_r, first_lens.aperture_radius + 0.004))
+            _hood_depth = max(float(first_lens.x_front) - float(hood_x0), 1.0e-5)
+            _tan_half_fov = float(scene.image_plate.radius) / max(float(scene.image_plate.x) - float(first_lens.x_front), 1.0e-5)
+            _hood_r_fov = float(first_lens.aperture_radius) + _hood_depth * _tan_half_fov
+            hood_clear_r0 = float(max(scene.lens_hood_front_radius, hood_r1 + 0.010, _hood_r_fov))
+            hood_wall = float(max(0.004, 0.035 * hood_clear_r0))
+            hood_r0 = float(hood_clear_r0 + hood_wall)
+            _build_sensor_aperture_frustum(
+                hood_x0,
+                hood_r0,
+                hood_x1,
+                hood_r1,
+                96,
+                tris,
+                mats,
+                idx_aperture_black,
+                tri_ids=black_wall_tri_ids,
+            )
+            _build_baffle_annulus(
+                hood_x0,
+                hood_clear_r0,
+                hood_r0,
+                96,
+                tris,
+                mats,
+                idx_aperture_black,
+                tri_ids=black_wall_tri_ids,
+            )
         # Lens housing sleeve: keeps the lens mechanically inset in a bore rather
         # than visually floating in open space.
-        # Built with CSG so stage light tube bore holes are subtracted, allowing
-        # diffuse light to escape from the diffuser into the interior.
         # Tighten the housing bore to last lens aperture to prevent rear light escape.
-        lens_housing_r = min(scene.tube_radius, last_lens.aperture_radius + 0.008)
         lens_housing_pipe = PipeCSGSpec(
             center=np.array([0.0, 0.0, 0.0], dtype=np.float64),
             axis_dir=np.array([1.0, 0.0, 0.0], dtype=np.float64),
@@ -2470,17 +2848,17 @@ def _build_scene_mesh(
                 float(lens.radius_back),
             ))
 
-        # Post-lens bellows frustum: flares from the last-lens aperture radius
-        # out to the full sensor plate radius.  No cylindrical tube — every pixel
-        # on the sensor has line-of-sight back through the lens with no wall strike.
-        _pl_x0 = float(last_lens.x_back + 0.002)
-        _pl_x1 = float(scene.image_plate.x - 0.002)
-        _pl_r0 = float(last_lens.aperture_radius)
-        _pl_r1 = float(scene.image_plate.radius)
-        _build_sensor_aperture_frustum(
-            _pl_x0, _pl_r0, _pl_x1, _pl_r1,
-            96, tris, mats, idx_aperture_black, tri_ids=black_wall_tri_ids,
-        )
+        if bool(getattr(scene, "include_legacy_stage", False)):
+            # Legacy post-lens bellows.  The default camera-only path uses the
+            # sensor enclosure's aperture-to-sensor frustum as the single rear cone.
+            _pl_x0 = float(last_lens.x_back + 0.002)
+            _pl_x1 = float(scene.image_plate.x - 0.002)
+            _pl_r0 = float(last_lens.aperture_radius)
+            _pl_r1 = float(scene.image_plate.radius)
+            _build_sensor_aperture_frustum(
+                _pl_x0, _pl_r0, _pl_x1, _pl_r1,
+                96, tris, mats, idx_aperture_black, tri_ids=black_wall_tri_ids,
+            )
     else:
         # No-lens path: interior from baffle0 to image plate, subtracted by light tubes.
         baffle_to_image_pipe = PipeCSGSpec(
@@ -2530,7 +2908,9 @@ def _build_scene_mesh(
     #   3. Front annular cap  — seals disc-vs-hull gap at image_plate.x
     _x_ap      = float(scene.exit_pupil_x)
     _x_sensor  = float(scene.image_plate.x)
-    _tube_r    = float(scene.tube_radius)
+    # Use actual lens housing radius (from group apertures), not the scene stage
+    # tube radius — the camera barrel belongs to the lens assembly, not the stage.
+    _tube_r    = float(lens_housing_r)
     _sensor_r  = float(scene.image_plate.radius)
     _hull_margin = 0.010
     _hull_r_ap     = _tube_r + _hull_margin
@@ -2610,6 +2990,7 @@ def _build_scene_mesh(
     red_probe_tri_ids: list = []
 
     tri_arr = np.ascontiguousarray(np.asarray(tris, dtype=np.float64))
+    _auto_fit_scene_view_to_mesh(scene, tri_arr)
     _orient_surface_patch_outward(tri_arr, lens_front_tri_ids, expected_x_sign=-1.0)
     _orient_surface_patch_outward(tri_arr, lens_back_tri_ids, expected_x_sign=1.0)
     verts = tri_arr.reshape(tri_arr.shape[0], 9)
@@ -2867,6 +3248,9 @@ class ForwardCppLensBench:
         self._backward_transport_accum: Optional[Dict[str, np.ndarray]] = None
         self._last_backward_transport_image: Optional[np.ndarray] = None
         self._emissive_material_id_cache: Optional[set] = None
+        self._aperture_aim_extrema: dict = {}
+        self._bwd_diag_printed: bool = False
+        self._bwd_diag_prev_found: int = -1
         self.bdpt_last_stream_counts: Dict[str, int] = {
             "forward_light": 0, "backward_sensor": 0,
             "pixel_cone": 0, "field_deposit_blocked": 0,
@@ -2882,6 +3266,8 @@ class ForwardCppLensBench:
         self._plate_sensor_electrons_accum: Optional[np.ndarray] = None
         self._last_bdpt_records: Optional[np.ndarray] = None
         self._last_bdpt_plate_rgb: Optional[np.ndarray] = None
+        self._last_correlator_bdpt_rgb: Optional[np.ndarray] = None
+        self._last_correlator_stats: Dict[str, object] = {}
         # Camera preset used by render_middle().  None → simple_doublet_preset().
         # Set this after construction to override the default.
         self._camera_preset = None
@@ -2907,6 +3293,7 @@ class ForwardCppLensBench:
         self._bdpt_aperture_normal: Optional[np.ndarray] = None
         self._bdpt_aperture_up:     Optional[np.ndarray] = None
         self._bdpt_aperture_radius: float = 0.0
+        self._bdpt_join_element: str = str(getattr(self.scene, "bdpt_join_element", "iris"))
         # GPU/CPU compute mode: 'gpu', 'cpu', or 'mixed'.
         # Controls use_gpu_compute and gpu_all_stages in submit_rays.
         self.compute_mode: str = "gpu"
@@ -3147,6 +3534,67 @@ class ForwardCppLensBench:
             "[aperture-focal-region]",
             f"centroid={self.aperture_centroid.tolist()}",
             f"radius={self.aperture_radius:.4f}",
+            flush=True,
+        )
+
+        if self._lens_assembly is None:
+            self._lens_assembly = LensAssemblySpec()
+        self._lens_assembly.set_optics(
+            _compound_lens_from_scene(self.scene),
+            mode=LensAssemblySpec.MODE_PARAMETRIC,
+        )
+        # Assembly now owns the sensor plate and iris aperture.  All backward-ray
+        # geometry derives from the assembly's actual part positions, not from
+        # the surrogate solver's heuristic exit-pupil fields.
+        self._lens_assembly.sync_from_scene(self.scene)
+
+        # ── Optical exit pupil: where backward rays must be AIMED ─────────────
+        # This can be a virtual pupil (x < G1) for telephoto layouts — physically
+        # correct.  It drives aperture_centroid/radius (the ray-direction target)
+        # but must NOT drive physical camera-body mesh positions.
+        _ap_cen, _ap_r = self._lens_assembly.backward_ray_target()
+        if _ap_cen is not None and _ap_r > 0.0:
+            self.aperture_centroid = np.asarray(_ap_cen, dtype=np.float64)
+            self.aperture_radius = float(_ap_r)
+            print(
+                "[assembly-optical-ep]",
+                f"x={float(_ap_cen[0]):.4f}",
+                f"r={_ap_r*1e3:.2f}mm",
+                flush=True,
+            )
+
+        # ── Physical camera body: where the barrel geometry lives ─────────────
+        # Always the back face of the last lens group (G4), never the optical EP.
+        # scene.exit_pupil_x is the anchor for all camera-body mesh construction.
+        _body_x = self._lens_assembly.camera_body_front_x()
+        _body_r = self._lens_assembly.camera_body_entrance_radius()
+        if _body_x is not None and _body_x > 0.0:
+            self.scene.exit_pupil_x = float(_body_x)
+            if _body_r > 0.0:
+                self.scene.exit_pupil_radius = float(_body_r)
+            print(
+                "[assembly-physical-body]",
+                f"body_x={float(_body_x):.4f}",
+                f"body_r={_body_r*1e3:.2f}mm",
+                f"sensor_x={self._lens_assembly.sensor_x()}",
+                flush=True,
+            )
+        self._report_aperture_aim_extrema()
+        _field_pair = self._lens_assembly.profile_field_pair(
+            object_point=(float(self.scene.object_plane.x), 0.0, 0.0),
+            image_point=(float(self.scene.image_plate.x), 0.0, 0.0),
+            verify=False,
+        )
+        self._optical_field_pair = _field_pair
+        _front_lim = _field_pair["front"].limiting_face
+        _back_lim = _field_pair.get("back").limiting_face if _field_pair.get("back") is not None else None
+        print(
+            "[parametric-field]",
+            f"faces={len(self._lens_assembly.optics.registered_faces())}",
+            f"front_limit={_front_lim.face.element_idx if _front_lim is not None else -1}",
+            f"front_cutoff={_field_pair['front'].cutoff_half_angle_rad:.4f}rad",
+            f"back_limit={_back_lim.face.element_idx if _back_lim is not None else -1}",
+            f"back_cutoff={_field_pair['back'].cutoff_half_angle_rad:.4f}rad",
             flush=True,
         )
         
@@ -3393,14 +3841,11 @@ class ForwardCppLensBench:
         lens_stack_center_x = 0.5 * (first_lens.x_front + last_lens.x_back)
         stop_plane_x = float(last_lens.center_x)
         stop_radius_m = float(max(0.001, first_lens.aperture_radius))
-        iris_cfg = getattr(self.scene, "iris_aperture", None)
-        if iris_cfg is not None and bool(getattr(iris_cfg, "enabled", False)):
-            stop_plane_x = float(iris_cfg.x_pos)
-            stop_radius_m = float(max(1.0e-4, iris_cfg.r_inner))
-        exit_pupil_radius = float(getattr(self.scene, "exit_pupil_radius", 0.0))
-        if exit_pupil_radius > 0.0:
-            stop_plane_x = float(getattr(self.scene, "exit_pupil_x", stop_plane_x))
-            stop_radius_m = float(max(1.0e-4, exit_pupil_radius))
+        if self._lens_assembly is not None:
+            _bdpt_cen, _bdpt_r = self._lens_assembly.backward_ray_target()
+            if _bdpt_cen is not None and _bdpt_r > 0.0:
+                stop_plane_x = float(_bdpt_cen[0])
+                stop_radius_m = float(_bdpt_r)
 
         role_emissive = int(getattr(_sk, "TRI_GROUP_ROLE_EMISSIVE", 1))
         role_sensor = int(getattr(_sk, "TRI_GROUP_ROLE_SENSOR", 2))
@@ -3427,7 +3872,17 @@ class ForwardCppLensBench:
             )
         has_aperture_geometry = aperture_stop_gid >= 0
         if not has_aperture_geometry:
-            # No explicit aperture geometry: backend launches hemisphere rays.
+            # No explicit aperture mesh → hemisphere launch.  Nearly all rays will
+            # be absorbed by the camera body frustum before reaching the scene.
+            # Fix: place an IrisApertureConfig inside the lens assembly so the
+            # pixel-cone can aim through the stop.  This is done automatically by
+            # _scene_lenses() for four-group zoom surrogate designs.
+            print(
+                "[bdpt-no-aperture] aperture_stop_tri_ids=0"
+                " -> hemisphere launch; backward rays will have ~0 emissive hits."
+                " Ensure scene.iris_aperture is configured inside the lens stack.",
+                flush=True,
+            )
             stop_radius_m = 0.0
         self.bdpt_last_sensor_gid = int(
             self.tracer.register_tri_group(
@@ -3755,6 +4210,18 @@ class ForwardCppLensBench:
         res     = int(max(4, plate.sensor_res))
         n_rays  = max(1, int(rays_per_sensor) if rays_per_sensor > 0 else int(plate.bokeh_rays))
         s_frac  = float(plate.bokeh_stencil_frac)
+        # The mesh build and optics setup may update the assembly after the
+        # scene fields are cloned.  Refresh the real reverse-ray target here so
+        # sensor-cast launches defer to the assembly's current optical extents.
+        _asm = getattr(self, "_lens_assembly", None)
+        if _asm is not None:
+            try:
+                _ap_cen, _ap_r = _asm.backward_ray_target()
+                if _ap_cen is not None and float(_ap_r) > 0.0:
+                    self.aperture_centroid = np.asarray(_ap_cen, dtype=np.float64)
+                    self.aperture_radius = float(_ap_r)
+            except Exception:
+                pass
         ap_r    = float(self.aperture_radius)
         stencil_r = s_frac * ap_r
 
@@ -4142,6 +4609,109 @@ class ForwardCppLensBench:
             if end >= cap:
                 self._vis_full = True
 
+    def _report_aperture_aim_extrema(self) -> dict:
+        """Compute and print the valid backward-ray cone for representative sensor sites.
+
+        For a pixel at transverse height h from the optical axis, and an aperture
+        disk at axial distance d with clear radius r_ap, the valid backward ray
+        directions are those that intersect the disk.  In the meridional plane the
+        cone spans [theta_near, theta_far]:
+
+            theta_near = atan2(h - r_ap, d)   (near aperture rim; can be negative)
+            theta_far  = atan2(h + r_ap, d)   (far aperture rim)
+            theta_chief = atan2(h, d)          (aimed at aperture centre)
+
+        The solid-angle fraction relative to a hemisphere is stored as
+        ``accept_fraction``.  A fraction near zero means almost no backward rays
+        launched toward the hemisphere will reach the aperture.
+
+        Results are stored in self._aperture_aim_extrema and printed once.
+        """
+        ap_cen = getattr(self, "aperture_centroid", None)
+        ap_r   = float(getattr(self, "aperture_radius", 0.0))
+        plate  = self.scene.image_plate
+        plate_x = float(plate.x)
+        plate_r = float(plate.radius)
+
+        if ap_cen is None or ap_r <= 0.0:
+            print("[aim-extrema] aperture not yet set", flush=True)
+            self._aperture_aim_extrema = {}
+            return {}
+
+        ap_x = float(np.asarray(ap_cen, dtype=np.float64)[0])
+        d = abs(plate_x - ap_x)
+        if d < 1.0e-6:
+            print("[aim-extrema] aperture and sensor are coplanar", flush=True)
+            self._aperture_aim_extrema = {}
+            return {}
+
+        # Check camera-frustum constraint: backward rays must also pass through
+        # the frustum aperture at scene.exit_pupil_x / scene.exit_pupil_radius.
+        frust_x = float(getattr(self.scene, "exit_pupil_x", 0.0))
+        frust_r = float(getattr(self.scene, "exit_pupil_radius", 0.0))
+        has_frust = frust_r > 0.0 and 0.0 < frust_x < plate_x
+
+        results = {}
+        labels_and_heights = [
+            ("center", 0.0),
+            ("mid",    0.5 * plate_r),
+            ("edge",   plate_r),
+        ]
+        for label, h in labels_and_heights:
+            theta_near  = math.atan2(h - ap_r, d)
+            theta_far   = math.atan2(h + ap_r, d)
+            theta_chief = math.atan2(h, d)
+            cone_half   = math.atan2(ap_r, math.sqrt(d * d + h * h))
+            # Solid angle of aperture disk from this pixel (paraxial approx).
+            dist2 = d * d + h * h
+            solid_angle = math.pi * ap_r * ap_r / dist2
+            accept_frac = solid_angle / (2.0 * math.pi)   # fraction of hemisphere
+
+            # Frustum constraint: which portion of the aperture disk is reachable
+            # without being blocked by the camera-body frustum cone?
+            frust_note = ""
+            if has_frust and frust_x > ap_x:
+                df = abs(plate_x - frust_x)          # sensor → frustum plane
+                # Max aperture y-coordinate visible from pixel h=h through frustum r=frust_r:
+                # y_ap_max satisfies: h + (y_ap_max - h)*df/d = frust_r
+                # → y_ap_max = h + (frust_r - h) * d / df
+                y_ap_max = h + (frust_r - h) * d / df
+                r_visible = max(0.0, min(ap_r, y_ap_max - 0.0))
+                # Near side: y_ap_min from the negative frustum boundary
+                y_ap_min_neg = h + (-frust_r - h) * d / df
+                r_blocked_near = max(0.0, -(y_ap_min_neg))   # how much of -y side is blocked
+                visible_frac = max(0.0, min(1.0, (r_visible + r_blocked_near) / (2.0 * ap_r)))
+                accept_frac *= visible_frac
+                frust_note = f" frust_visible_frac={visible_frac:.2f}"
+
+            entry = {
+                "h_sensor_m": h,
+                "ap_x_m": ap_x,
+                "ap_r_m": ap_r,
+                "d_m": d,
+                "theta_near_rad":  theta_near,
+                "theta_far_rad":   theta_far,
+                "theta_chief_rad": theta_chief,
+                "cone_half_angle_rad": cone_half,
+                "solid_angle_sr":  solid_angle,
+                "accept_fraction": accept_frac,
+            }
+            results[label] = entry
+            print(
+                f"[aim-extrema:{label}]"
+                f"  h={h*1e3:.1f}mm"
+                f"  ap_x={ap_x:.3f}  r={ap_r*1e3:.1f}mm  d={d:.3f}"
+                f"  near={math.degrees(theta_near):.1f}°"
+                f"  chief={math.degrees(theta_chief):.1f}°"
+                f"  far={math.degrees(theta_far):.1f}°"
+                f"  half={math.degrees(cone_half):.2f}°"
+                f"  accept={accept_frac*100:.3f}%{frust_note}",
+                flush=True,
+            )
+
+        self._aperture_aim_extrema = results
+        return results
+
     def _emissive_material_ids(self) -> set:
         if self._emissive_material_id_cache is not None:
             return self._emissive_material_id_cache
@@ -4229,9 +4799,12 @@ class ForwardCppLensBench:
         cols = (pix % n).astype(np.int64, copy=False)
 
         is_miss = bwd & (kinds == 1) & valid_pix
-        is_terminal = bwd & (kinds == 2) & valid_pix
-        is_emissive = is_terminal & np.array([int(m) in emissive_mats for m in mat_idx], dtype=bool)
-        is_no_emission = is_terminal & ~is_emissive
+        # RayRecordKind::STRIKE is the normal visible surface contact.  Older
+        # accounting only looked at terminal records, which made reverse rays
+        # that clearly struck scene geometry appear as "no backward transport".
+        is_surface_hit = bwd & ((kinds == 0) | (kinds == 2)) & valid_pix
+        is_emissive = is_surface_hit & np.array([int(m) in emissive_mats for m in mat_idx], dtype=bool)
+        is_no_emission = is_surface_hit & ~is_emissive
 
         acc = self._ensure_backward_transport_arrays()
         if np.any(is_emissive):
@@ -4249,15 +4822,61 @@ class ForwardCppLensBench:
             np.add.at(acc["missed_scene"], (rows[is_miss], cols[is_miss]), 1.0)
             np.add.at(acc["missed_weight"], (rows[is_miss], cols[is_miss]), amp_mag[is_miss])
 
+        n_bwd = int(np.count_nonzero(bwd))
+        n_emissive = int(np.count_nonzero(is_emissive))
+        n_no_emission = int(np.count_nonzero(is_no_emission))
+        n_miss = int(np.count_nonzero(is_miss))
+        n_tagged = int(np.count_nonzero(bwd & valid_pix))
+        n_untagged = int(np.count_nonzero(bwd & ~valid_pix))
+
         self.bdpt_last_backward_transport = {
-            "found_emission": int(np.count_nonzero(is_emissive)),
-            "terminated_no_emission": int(np.count_nonzero(is_no_emission)),
-            "missed_scene": int(np.count_nonzero(is_miss)),
+            "found_emission": n_emissive,
+            "terminated_no_emission": n_no_emission,
+            "missed_scene": n_miss,
             "emission_weight": float(np.sum(amp_mag[is_emissive])) if np.any(is_emissive) else 0.0,
             "no_emission_weight": float(np.sum(amp_mag[is_no_emission])) if np.any(is_no_emission) else 0.0,
             "missed_weight": float(np.sum(amp_mag[is_miss])) if np.any(is_miss) else 0.0,
             "emission_rgb_power": float(np.sum(acc["emission_rgb"])) if np.any(is_emissive) else 0.0,
         }
+
+        # Print a diagnostic summary the first time each session backward rays
+        # arrive, and whenever the emissive hit count changes sign (0 → >0).
+        _prev_found = getattr(self, "_bwd_diag_prev_found", -1)
+        _diag_printed = getattr(self, "_bwd_diag_printed", False)
+        if not _diag_printed or (n_emissive > 0 and _prev_found == 0):
+            mat_names = {int(v): str(k) for k, v in getattr(self, "_mat_index", {}).items()}
+            # Find which material stopped the most non-emissive rays.
+            terminal_mats: dict = {}
+            if n_no_emission > 0:
+                for m in mat_idx[is_no_emission]:
+                    key = mat_names.get(int(m), f"mat_{m}")
+                    terminal_mats[key] = terminal_mats.get(key, 0) + 1
+                top_blockers = sorted(terminal_mats.items(), key=lambda kv: -kv[1])[:4]
+            else:
+                top_blockers = []
+            print(
+                "[bwd-transport-diag]"
+                f"  bwd_rays={n_bwd}"
+                f"  tagged={n_tagged}  untagged={n_untagged}"
+                f"  emissive={n_emissive}"
+                f"  no_emission={n_no_emission}"
+                f"  missed={n_miss}"
+                f"  top_blockers={top_blockers}",
+                flush=True,
+            )
+            if n_emissive == 0 and n_no_emission > 0:
+                print(
+                    "[bwd-transport-diag] DIAGNOSIS: backward rays are terminating"
+                    " on non-emissive geometry.  Common causes:"
+                    " (1) aperture_stop_tri_ids=0 -> hemisphere launch, most rays"
+                    "     absorbed by camera body frustum (add iris inside lens stack);"
+                    " (2) aperture_centroid outside lens or frustum blocks rays;"
+                    " (3) PARAMETRIC_LENS backward teleport not registered (check"
+                    "     _do_register_parametric_assembly was called after clear_tri_groups).",
+                    flush=True,
+                )
+            self._bwd_diag_printed = True
+        self._bwd_diag_prev_found = n_emissive
         self._last_backward_transport_image = self.get_backward_emission_image()
 
     def get_backward_transport(self) -> Optional[Dict[str, np.ndarray]]:
@@ -4378,6 +4997,14 @@ class ForwardCppLensBench:
         disp = np.log1p(np.maximum(img, 0.0) * float(self._reverse_img_gain))
         return np.ascontiguousarray(disp / (1.0 + disp), dtype=np.float32)
 
+    def get_correlator_bdpt_image(self) -> np.ndarray:
+        """Return the latest RayCorrelator BDPT image for the center PIP."""
+        img = self._last_correlator_bdpt_rgb
+        n = int(max(1, self.bdpt_last_n_px))
+        if img is None or img.shape[0] <= 0:
+            return np.zeros((n, n, 3), dtype=np.float32)
+        return np.ascontiguousarray(np.asarray(img, dtype=np.float32), dtype=np.float32)
+
     def build_all_prospective_reverse_segments(
         self,
         seed: int,
@@ -4403,10 +5030,19 @@ class ForwardCppLensBench:
             if iris_cfg is not None and bool(getattr(iris_cfg, "enabled", False)):
                 stop_plane_x = float(iris_cfg.x_pos)
                 stop_radius_m = float(max(1.0e-4, iris_cfg.r_inner))
-            exit_pupil_radius = float(getattr(self.scene, "exit_pupil_radius", 0.0))
-            if exit_pupil_radius > 0.0:
-                stop_plane_x = float(getattr(self.scene, "exit_pupil_x", stop_plane_x))
-                stop_radius_m = float(max(1.0e-4, exit_pupil_radius))
+            # Prefer the optical exit pupil (assembly-computed) over the physical
+            # body position stored in scene.exit_pupil_x, which may be the G4
+            # back face rather than where rays should actually be aimed.
+            if self._lens_assembly is not None:
+                _bdpt_cen, _bdpt_r = self._lens_assembly.backward_ray_target()
+                if _bdpt_cen is not None and _bdpt_r > 0.0:
+                    stop_plane_x = float(_bdpt_cen[0])
+                    stop_radius_m = float(_bdpt_r)
+            else:
+                exit_pupil_radius = float(getattr(self.scene, "exit_pupil_radius", 0.0))
+                if exit_pupil_radius > 0.0:
+                    stop_plane_x = float(getattr(self.scene, "exit_pupil_x", stop_plane_x))
+                    stop_radius_m = float(max(1.0e-4, exit_pupil_radius))
 
             sensor_pos = np.array([float(plate.x), 0.0, 0.0], dtype=np.float64)
             fwd = np.array([-1.0, 0.0, 0.0], dtype=np.float64)
@@ -4428,8 +5064,8 @@ class ForwardCppLensBench:
             py_grid, px_grid = np.indices((n_py, n_px), dtype=np.float64)
             pix_pts = (
                 sensor_pos[None, None, :]
-                + (px_grid[:, :, None] + 0.5) * pix_w * right[None, None, :]
-                + (py_grid[:, :, None] + 0.5) * pix_h * up[None, None, :]
+                + (px_grid[:, :, None] + 0.5 - 0.5 * float(n_px)) * pix_w * right[None, None, :]
+                + (py_grid[:, :, None] + 0.5 - 0.5 * float(n_py)) * pix_h * up[None, None, :]
             )
 
             pix_pts = np.repeat(pix_pts[:, :, None, :], n_ap, axis=2)
@@ -4527,11 +5163,21 @@ class ForwardCppLensBench:
             screen_x=self.scene.screen_x,
             screen_radius=self.scene.screen_radius,
             view_radius=self.scene.view_radius,
+            auto_fit_view=self.scene.auto_fit_view,
+            view_aspect=self.scene.view_aspect,
             enable_debug_plate=self.scene.enable_debug_plate,
             debug_plate_x=self.scene.debug_plate_x,
             debug_plate_radius=self.scene.debug_plate_radius,
             object_plane=self.scene.object_plane,
             image_plate=ImagePlateConfig(x=self.scene.image_plate.x, radius=self.scene.image_plate.radius, pixels=n),
+            include_legacy_stage=self.scene.include_legacy_stage,
+            subject_scene_mode=self.scene.subject_scene_mode,
+            subject_time_s=self.scene.subject_time_s,
+            subject_scale=self.scene.subject_scale,
+            subject_depth_scale=self.scene.subject_depth_scale,
+            subject_x=self.scene.subject_x,
+            subject_y=self.scene.subject_y,
+            subject_z=self.scene.subject_z,
             side_room_y=self.scene.side_room_y,
             side_room_aperture=self.scene.side_room_aperture,
             side_room_bore_radius=self.scene.side_room_bore_radius,
@@ -4554,6 +5200,8 @@ class ForwardCppLensBench:
             stage_probe_y=self.scene.stage_probe_y,
             stage_probe_z=self.scene.stage_probe_z,
             stage_probe_radius=self.scene.stage_probe_radius,
+            lens_hood_front_radius=self.scene.lens_hood_front_radius,
+            bdpt_join_element=self.scene.bdpt_join_element,
             disable_optics=True,
             lens=self.scene.lens,
             lens_stack=list(self.scene.lens_stack),
@@ -4634,7 +5282,10 @@ class ForwardCppLensBench:
             # BDPT launch count must not be tied to aperture sample count alone.
             # Keep a substantive per-frame budget so reverse paths actually form.
             if n_rays_bdpt is None:
-                n_rays_bdpt = int(max(64, min(8192, 8 * n)))
+                # f/2.8 exit pupil → ~0.008% hemisphere acceptance from scene.
+                # Need ~16k forward rays to expect even a handful to arrive at
+                # the sensor through the aperture each call.
+                n_rays_bdpt = int(max(256, min(65536, 256 * n)))
             else:
                 n_rays_bdpt = int(max(1, n_rays_bdpt))
             # Size output records to backend worst-case for this batch so
@@ -4778,6 +5429,19 @@ class ForwardCppLensBench:
                 "pixel_cone":        _stream_pixcone_count,
                 "field_deposit_blocked": _stream_bwd_count if not ENABLE_UNSAFE_BACKWARD_FIELD_DEPOSIT else 0,
             }
+            _corr_overlay = None
+            if (
+                _MANIFOLD_CORRELATOR_AVAILABLE
+                and _fwd_mask is not None
+                and _bwd_mask is not None
+                and _stream_fwd_count > 0
+                and _stream_bwd_count > 0
+            ):
+                _corr_overlay = self._run_manifold_correlator(n, _fwd_mask, _bwd_mask)
+                self._last_correlator_bdpt_rgb = np.ascontiguousarray(
+                    np.clip(_corr_overlay, 0.0, 1.0),
+                    dtype=np.float32,
+                )
             # ───────────────────────────────────────────────────────────────
 
             if rgb_tm is None:
@@ -4801,7 +5465,12 @@ class ForwardCppLensBench:
                     "rgb_tonemapped=NONE",
                     flush=True,
                 )
-                return np.zeros((n, n, 3), dtype=np.float32)
+                out = (
+                    self._last_correlator_bdpt_rgb
+                    if self._last_correlator_bdpt_rgb is not None
+                    else np.zeros((n, n, 3), dtype=np.float32)
+                )
+                return np.ascontiguousarray(out, dtype=np.float32)
             rgb_tm_arr = np.asarray(rgb_tm, dtype=np.float32)
             if rgb_tm_arr.shape != (n, n, 3):
                 self.bdpt_debug_print_counter += 1
@@ -4867,29 +5536,24 @@ class ForwardCppLensBench:
         fwd_mask: np.ndarray,
         bwd_mask: np.ndarray,
     ) -> np.ndarray:
-        """Pair forward and backward half-paths at the aperture plane via
-        ManifoldWalkStrategy and return an (n, n, 3) float32 overlay.
+        """Pair forward and backward half-paths at the selected camera element.
 
-        Contributions are |A_fwd * A_bwd|^2 normalised and encoded as a
-        warm (R+G) tint so they are visually distinguishable from the
-        physical image produced by the forward pass alone.
+        The returned image is the correlator's BDPT estimate, indexed by the
+        backward pixel-cone subpath id.  The join element is selected by
+        ``self._bdpt_join_element`` / ``scene.bdpt_join_element``.
         """
         overlay = np.zeros((n, n, 3), dtype=np.float32)
         if self._last_bdpt_records is None:
             return overlay
-        if self._bdpt_aperture_centre is None:
+        aperture, join_label = self._resolve_bdpt_join_surface(self._bdpt_join_element)
+        if aperture is None:
+            self._last_correlator_stats = {
+                "join": join_label,
+                "candidates": 0,
+                "accepted": 0,
+            }
             return overlay
-        ap_radius = self._bdpt_aperture_radius
-        if ap_radius <= 0.0:
-            ap_radius = 0.015  # fallback: 15 mm
         try:
-            aperture = PlaneSurface(
-                centre=self._bdpt_aperture_centre.copy(),
-                normal=self._bdpt_aperture_normal.copy(),
-                u_axis=self._bdpt_aperture_up.copy(),
-                half_extent_u=float(ap_radius),
-                half_extent_v=float(ap_radius),
-            )
             n_bands = int(self.n_bands)
             strategy = ManifoldWalkStrategy(
                 aperture=aperture,
@@ -4897,6 +5561,8 @@ class ForwardCppLensBench:
                 grid_n_u=16,
                 grid_n_v=16,
                 match_radius_bins=1,
+                use_radial_grid=True,
+                grid_n_r=64,
                 shadow_checker=ShadowRayChecker(tracer=self.tracer),
                 use_mis=True,
             )
@@ -4908,9 +5574,19 @@ class ForwardCppLensBench:
                 return overlay
             candidates = correlator.correlate(fwd_records, bwd_records, n_bands)
             if not candidates:
+                self._last_correlator_stats = {
+                    "join": join_label,
+                    "forward": int(fwd_records.shape[0]),
+                    "backward": int(bwd_records.shape[0]),
+                    "candidates": 0,
+                    "accepted": 0,
+                }
                 return overlay
             n_sq = n * n
-            accum = np.zeros(n_sq, dtype=np.float64)
+            accum = np.zeros((n_sq, 3), dtype=np.float64)
+            wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:n_bands], dtype=np.float64), EPS)) * 1.0e9
+            rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float64, copy=False)
+            accepted = 0
             for cand in candidates:
                 if not cand.accepted:
                     continue
@@ -4926,19 +5602,110 @@ class ForwardCppLensBench:
                     fwd_rec = cand.forward_record
                     raw_sid = int(fwd_rec.flat[0]) if (fwd_rec is not None and fwd_rec.dtype == np.float32) else 0
                     pid = int(raw_sid) % n_sq
-                c = cand.contribution
-                accum[int(pid)] += float(c.real * c.real + c.imag * c.imag) * cand.middle.mis_weight
+                c = np.ravel(np.asarray(cand.contribution, dtype=np.complex64))
+                if c.size == 0:
+                    continue
+                pwr = np.maximum(0.0, c.real.astype(np.float64) ** 2 + c.imag.astype(np.float64) ** 2)
+                pwr = pwr[:n_bands]
+                if pwr.size < n_bands:
+                    pwr = np.pad(pwr, (0, n_bands - pwr.size))
+                accum[int(pid)] += np.einsum("b,bc->c", pwr, rgb_w[:n_bands], optimize=True)
+                accepted += 1
             peak = float(accum.max())
             if peak > 0.0:
-                img = (accum / peak).reshape(n, n).astype(np.float32)
-                overlay[:, :, 0] = img * 0.5
-                overlay[:, :, 1] = img * 0.3
+                img = (accum / peak).reshape(n, n, 3).astype(np.float32)
+                overlay[:, :, :] = np.clip(img, 0.0, 1.0)
+            self._last_correlator_stats = {
+                "join": join_label,
+                "forward": int(fwd_records.shape[0]),
+                "backward": int(bwd_records.shape[0]),
+                "candidates": int(len(candidates)),
+                "accepted": int(accepted),
+                "peak": float(peak),
+            }
+            if accepted > 0:
+                print(
+                    "[manifold-correlator]",
+                    f"join={join_label}",
+                    f"fwd={fwd_records.shape[0]}",
+                    f"bwd={bwd_records.shape[0]}",
+                    f"candidates={len(candidates)}",
+                    f"accepted={accepted}",
+                    f"peak={peak:.3e}",
+                    flush=True,
+                )
         except Exception as exc:
             print(f"[manifold-correlator] error: {exc}", flush=True)
         return overlay
 
     # Hard cutover: old name → new semantically-correct name.
     capture_plate_bdpt_rgb = trace_forward_backward_sensor_rgb
+
+    def _resolve_bdpt_join_surface(self, selector: str):
+        """Return (PlaneSurface, label) for the correlator join element."""
+        if not _MANIFOLD_CORRELATOR_AVAILABLE:
+            return None, "unavailable"
+
+        sel = (selector or "iris").strip().lower().replace("_", "-")
+        lenses = [l for l in _scene_lenses(self.scene) if _lens_is_valid(l)]
+
+        def _plane(label: str, x: float, radius: float):
+            r = float(max(1.0e-5, radius))
+            return PlaneSurface(
+                centre=np.array([float(x), 0.0, 0.0], dtype=np.float64),
+                normal=np.array([-1.0, 0.0, 0.0], dtype=np.float64),
+                u_axis=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+                half_extent_u=r,
+                half_extent_v=r,
+            ), f"{label}@x={float(x):.4f},r={r*1e3:.2f}mm"
+
+        iris = getattr(self.scene, "iris_aperture", None)
+        if sel in ("iris", "aperture", "aperture-stop", "stop"):
+            if iris is not None and bool(getattr(iris, "enabled", False)):
+                return _plane("iris", float(iris.x_pos), float(iris.r_inner))
+            if self._bdpt_aperture_centre is not None and self._bdpt_aperture_radius > 0.0:
+                return _plane("bdpt-stop", float(self._bdpt_aperture_centre[0]), self._bdpt_aperture_radius)
+
+        if sel in ("exit-pupil", "optical-exit-pupil", "backward-target"):
+            asm = getattr(self, "_lens_assembly", None)
+            if asm is not None:
+                try:
+                    cen, r = asm.backward_ray_target()
+                    if cen is not None and float(r) > 0.0:
+                        return _plane("exit-pupil", float(np.asarray(cen, dtype=np.float64)[0]), float(r))
+                except Exception:
+                    pass
+
+        if sel in ("body-front", "camera-body", "g-last-back"):
+            return _plane("body-front", float(self.scene.exit_pupil_x), float(self.scene.exit_pupil_radius))
+
+        if sel in ("first-lens", "g1-front"):
+            if lenses:
+                return _plane("g1-front", float(lenses[0].x_front), float(lenses[0].aperture_radius))
+        if sel == "g1-back":
+            if lenses:
+                return _plane("g1-back", float(lenses[0].x_back), float(lenses[0].aperture_radius))
+
+        import re as _re
+        m = _re.fullmatch(r"g(\d+)-(front|back|center)", sel)
+        if m and lenses:
+            idx = int(m.group(1)) - 1
+            face = m.group(2)
+            if 0 <= idx < len(lenses):
+                lens = lenses[idx]
+                if face == "front":
+                    return _plane(f"g{idx + 1}-front", float(lens.x_front), float(lens.aperture_radius))
+                if face == "back":
+                    return _plane(f"g{idx + 1}-back", float(lens.x_back), float(lens.aperture_radius))
+                return _plane(f"g{idx + 1}-center", float(lens.center_x), float(lens.aperture_radius))
+
+        # Conservative fallback: use the physical iris when available, otherwise
+        # the current pixel-cone target cached by the BDPT registration path.
+        if iris is not None and bool(getattr(iris, "enabled", False)):
+            return _plane("iris", float(iris.x_pos), float(iris.r_inner))
+        if self._bdpt_aperture_centre is not None and self._bdpt_aperture_radius > 0.0:
+            return _plane("bdpt-stop", float(self._bdpt_aperture_centre[0]), self._bdpt_aperture_radius)
+        return None, f"{sel}:unresolved"
 
     def render_middle(
         self,
@@ -5984,11 +6751,21 @@ def _clone_scene_with_lenses(scene: SceneConfig, lenses: Sequence[LensConfig]) -
         screen_x=scene.screen_x,
         screen_radius=scene.screen_radius,
         view_radius=scene.view_radius,
+        auto_fit_view=scene.auto_fit_view,
+        view_aspect=scene.view_aspect,
         enable_debug_plate=scene.enable_debug_plate,
         debug_plate_x=scene.debug_plate_x,
         debug_plate_radius=scene.debug_plate_radius,
         object_plane=scene.object_plane,
         image_plate=scene.image_plate,
+        include_legacy_stage=scene.include_legacy_stage,
+        subject_scene_mode=scene.subject_scene_mode,
+        subject_time_s=scene.subject_time_s,
+        subject_scale=scene.subject_scale,
+        subject_depth_scale=scene.subject_depth_scale,
+        subject_x=scene.subject_x,
+        subject_y=scene.subject_y,
+        subject_z=scene.subject_z,
         side_room_y=scene.side_room_y,
         side_room_aperture=scene.side_room_aperture,
         side_room_bore_radius=scene.side_room_bore_radius,
@@ -6011,6 +6788,8 @@ def _clone_scene_with_lenses(scene: SceneConfig, lenses: Sequence[LensConfig]) -
         stage_probe_y=scene.stage_probe_y,
         stage_probe_z=scene.stage_probe_z,
         stage_probe_radius=scene.stage_probe_radius,
+        lens_hood_front_radius=scene.lens_hood_front_radius,
+        bdpt_join_element=scene.bdpt_join_element,
         disable_optics=scene.disable_optics,
         lens=lenses[0] if lenses else scene.lens,
         lens_stack=list(lenses),
@@ -6369,6 +7148,7 @@ def run(
     profile: bool = False,
     field_capture: bool = True,
     manifold_mode: str = "full",
+    bdpt_join_element: str = "iris",
     bake_noodles: int = 0,
     full_assembly: bool = False,
     focus_steps: int = 1,
@@ -6399,6 +7179,7 @@ def run(
             GL_TEXTURE_MIN_FILTER, GL_TEXTURE_MAG_FILTER,
             GL_LINEAR, GL_CLAMP_TO_EDGE, GL_TEXTURE_WRAP_S, GL_TEXTURE_WRAP_T, GL_TEXTURE_WRAP_R,
             glEnable, glDisable, glClearColor, glClear, GL_COLOR_BUFFER_BIT,
+            GL_DEPTH_TEST, GL_DEPTH_BUFFER_BIT, glDepthMask, glDepthFunc, GL_LEQUAL,
             GL_BLEND, GL_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA, glBlendFunc,
             glViewport,
             glEnableClientState, glDisableClientState, glVertexPointer, glDrawArrays,
@@ -6471,6 +7252,8 @@ def run(
     frame_profiler = FrameProfiler(report_every=60) if profile else None
 
     scene    = SceneConfig()
+    scene.bdpt_join_element = str(bdpt_join_element)
+    scene.view_aspect = float(W) / float(max(1, H))
     scene.image_plate.sensor_res = int(max(4, sensor_res))
     view_h, view_w = H, W
     sidecar  = FreeFrequencySidecar.lazy_prepare(int(DEFAULT_FREQ_HZ.size))
@@ -6510,6 +7293,7 @@ def run(
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
     bench.emitter_amp_gain     = float(emitter_amp_gain)
     bench.compute_mode         = str(compute_mode)
+    bench._bdpt_join_element   = str(bdpt_join_element)
     print(f"[bench] tris={bench.n_tris}  bands={bench.n_bands}  "
           f"view={view_w}x{view_h}  sensor_amp_gain={bench.sensor_amp_gain}  "
           f"emitter_amp_gain={bench.emitter_amp_gain}  "
@@ -6724,19 +7508,7 @@ def run(
         bench._register_neural_payload(_na_payload, _na_payload_bwd)
     elif parametric:
         # ── Exact algebraic parametric lens: bypass LUT/MLP entirely ─────────
-        from camera_designer.camera_preset import simple_doublet_preset
-        from camera_designer.compound_optics import CompoundLens
-
-        _preset = bench._camera_preset or simple_doublet_preset()
-
-        # Map the preset's local Z frame to scene X using the aperture stop as the
-        # registration datum — the same one iris_from_camera_preset() uses.
-        # x_offset = scene_aperture_x − preset_aperture_z_local
-        _iris     = getattr(bench.scene, "iris_aperture", None)
-        _iris_x   = float(_iris.x_pos) if _iris is not None else 1.12
-        _x_offset = _iris_x - float(_preset.aperture_stop.z_pos)
-
-        _cl = CompoundLens.from_preset(_preset, x_offset=_x_offset)
+        _cl = _compound_lens_from_scene(bench.scene)
         print(
             f"[parametric] CompoundLens: {len(_cl.elements)} elements"
             f"  f_eff={_cl.f_eff * 1e3:.1f} mm  f/{_cl.f_number:.1f}",
@@ -6826,8 +7598,7 @@ def run(
         }
 
         void main() {
-            float t = u_time * 0.16;
-            float a = (u_mode < 0.5) ? (0.24 * sin(t)) : ((u_mode < 1.5) ? 0.0 : 1.57079632679);
+            float a = (u_mode < 1.5) ? 0.0 : 1.57079632679;
             float ca = cos(a);
             float sa = sin(a);
             vec2 yz_axis = vec2(ca, sa);
@@ -6848,16 +7619,15 @@ def run(
         varying float v_depth;
 
         void main() {
-            float t = u_time * 0.16;
-            float a = (u_mode < 0.5) ? (0.24 * sin(t)) : ((u_mode < 1.5) ? 0.0 : 1.57079632679);
+            float a = (u_mode < 1.5) ? 0.0 : 1.57079632679;
             float ca = cos(a);
             float sa = sin(a);
             vec3 p = gl_Vertex.xyz;
             vec2 yz = p.yz - vec2(0.5);
             float v = dot(yz, vec2(ca, sa));
             gl_Position = vec4(p.x * 2.0 - 1.0, v * 2.0, 0.0, 1.0);
-            // Near points (v > 0) get larger, far points smaller — natural depth cue
-            gl_PointSize = max(1.0, 1.5 + (v + 0.5) * 2.5);
+            // Keep diagnostic points subordinate to the exposure texture.
+            gl_PointSize = 1.35;
             v_amp   = gl_Vertex.w * u_gain;
             v_depth = v + 0.5;  // 0 = far, 1 = near
         }
@@ -6888,7 +7658,7 @@ def run(
             float is_special = step(3.5, u_class);
             float amp_boost  = mix(1.0, 3.0, is_special);
             vec3 c = display_curve(vec3(v_amp * amp_boost)) * base;
-            float alpha = mix(clamp(0.2 + 0.8 * v_depth, 0.0, 1.0), 0.85, is_special);
+            float alpha = mix(0.28, 0.55, is_special);
             gl_FragColor = vec4(clamp(c, 0.0, 1.0), alpha);
         }
     """
@@ -6955,7 +7725,8 @@ def run(
             float ca = cos(a); float sa = sin(a);
             vec2 yz = a_pos.yz - vec2(0.5);
             float vp = dot(yz, vec2(ca, sa));
-            gl_Position = vec4(a_pos.x * 2.0 - 1.0, vp * 2.0, 0.0, 1.0);
+            float vd = dot(yz, vec2(-sa, ca));  // depth: perp to view direction in YZ
+            gl_Position = vec4(a_pos.x * 2.0 - 1.0, vp * 2.0, clamp(vd * 2.0, -1.0, 1.0), 1.0);
             v_uv = a_uv;
             v_layer = a_layer;
         }
@@ -7196,7 +7967,7 @@ def run(
               f"{len(bank.groups)} UV groups", flush=True)
 
     # HUD text texture — RGBA8, sized to a reasonable stats strip width × height
-    _HUD_W, _HUD_H = 256, 48
+    _HUD_W, _HUD_H = 380, 104
     tex_hud = glGenTextures(1)
     glBindTexture(GL_TEXTURE_2D, tex_hud)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
@@ -7254,11 +8025,17 @@ def run(
             border_col=(0.65, 0.25, 1.0),
         )
 
-        # ── Backward illumination collapse pip (centre — cyan border) ──────
-        # Sensor-launched rays deposit only when they terminate on emissive
-        # material.  Non-emissive terminal hits and misses contribute zero but
-        # remain in the per-pixel denominator, so unlit paths darken the pixel.
-        img = bench.get_backward_emission_image()
+        # ── Correlator BDPT pip (centre — cyan border) ─────────────────────
+        # This is the resolved forward/backward connection estimate produced by
+        # RayCorrelator at the selected camera join element.  If no correlator
+        # connections have been accepted yet, show the real sensor BDPT plate
+        # instead of a diagnostic strike projection or an empty texture.
+        corr_img = bench.get_correlator_bdpt_image()
+        img = corr_img
+        if not np.any(np.asarray(img) > 0.0):
+            plate_img = bench._last_bdpt_plate_rgb
+            if plate_img is not None and plate_img.shape[0] > 0:
+                img = plate_img
         has_img = img.shape[0] > 0
 
         if has_img:
@@ -7285,122 +8062,135 @@ def run(
         try:
             stats = bench.tracer.get_bdpt_stats()
         except Exception:
-            stats = None
-        if stats is not None:
-            if _pip_font[0] is None:
-                pygame.font.init()
-                _pip_font[0] = (pygame.font.SysFont("consolas", 11) or
-                                pygame.font.SysFont("monospace", 11))
-            font = _pip_font[0]
-            nd = stats.get("nearest_dist_m", -1.0)
-            bc = stats.get("best_collinearity", 0.0)
-            es = stats.get("exact_snaps", 0)
-            nm = stats.get("near_miss_count", 0)
-            dist_str = (f"dyz {nd*1000:.2f}mm" if nd >= 0.0 else "dyz --")
-            mode_str = f"M/{manifold_mode}" if ray_mode == "middle" else ray_mode
-            line_h = font.get_linesize()
+            stats = {}
+        if _pip_font[0] is None:
+            pygame.font.init()
+            _pip_font[0] = (pygame.font.SysFont("consolas", 11) or
+                            pygame.font.SysFont("monospace", 11))
+        font = _pip_font[0]
+        nd = stats.get("nearest_dist_m", -1.0) if isinstance(stats, dict) else -1.0
+        bc = stats.get("best_collinearity", 0.0) if isinstance(stats, dict) else 0.0
+        dist_str = (f"dyz {nd*1000:.2f}mm" if nd >= 0.0 else "dyz --")
+        mode_str = f"M/{manifold_mode}" if ray_mode == "middle" else ray_mode
+        line_h = font.get_linesize()
 
-            def _render_hud_lines(lines, colours):
-                surf = pygame.Surface((_HUD_W, _HUD_H), pygame.SRCALPHA)
-                surf.fill((0, 0, 0, 0))
-                for idx, txt in enumerate(lines):
-                    col = colours[idx] if idx < len(colours) else (80, 210, 255)
-                    surf.blit(font.render(txt, True, col), (2, idx * (line_h + 1)))
-                raw_a  = pygame.surfarray.array_alpha(surf.convert_alpha())
-                raw_c  = pygame.surfarray.array3d(surf)
-                arr    = np.zeros((_HUD_H, _HUD_W, 4), dtype=np.uint8)
-                arr[:, :, :3] = np.transpose(raw_c, (1, 0, 2))
-                arr[:, :,  3] = np.transpose(raw_a, (1, 0))
-                return arr[::-1].copy()
+        def _render_hud_lines(lines, colours):
+            surf = pygame.Surface((_HUD_W, _HUD_H), pygame.SRCALPHA)
+            surf.fill((0, 0, 0, 0))
+            max_lines = max(1, _HUD_H // max(1, line_h + 1))
+            for idx, txt in enumerate(lines[:max_lines]):
+                col = colours[idx] if idx < len(colours) else (80, 210, 255)
+                surf.blit(font.render(txt, True, col), (2, idx * (line_h + 1)))
+            raw_a  = pygame.surfarray.array_alpha(surf.convert_alpha())
+            raw_c  = pygame.surfarray.array3d(surf)
+            arr    = np.zeros((_HUD_H, _HUD_W, 4), dtype=np.uint8)
+            arr[:, :, :3] = np.transpose(raw_c, (1, 0, 2))
+            arr[:, :,  3] = np.transpose(raw_a, (1, 0))
+            return arr[::-1].copy()
 
-            # ── Manifold label above left (violet) PIP ─────────────────────
-            _asm = bench._lens_assembly
-            if _asm is not None and _asm.mode == LensAssemblySpec.MODE_LUT:
-                bake_str = f"BAKED {_asm._transfer_grid_noodles:,}n  ctx={_asm._manifold_ctx_id}"
-            elif ray_mode == "middle":
-                bake_str = "baking…"
-            else:
-                bake_str = ""
-            manifold_lines  = [mode_str]
-            manifold_colours = [(180, 140, 255)]
-            if bake_str:
-                manifold_lines.append(bake_str)
-                manifold_colours.append((255, 200, 80))
-            rgba_m = _render_hud_lines(manifold_lines, manifold_colours)
+        def _draw_hud(lines, colours, vx):
+            rgba = _render_hud_lines(lines, colours)
             glBindTexture(GL_TEXTURE_2D, tex_hud)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, rgba_m)
-            _draw_quad_with_pip_prog(tex_hud,
-                                     _bdpt_pip_vx, _pip_vy + _pip_dim + 2,
-                                     _HUD_W, _HUD_H, hud_mode=True)
+                         GL_RGBA, GL_UNSIGNED_BYTE, rgba)
+            _draw_quad_with_pip_prog(
+                tex_hud,
+                int(vx),
+                int(_pip_vy + _pip_dim + 2),
+                _HUD_W,
+                _HUD_H,
+                hud_mode=True,
+            )
 
-            # ── Backward transport stats above center (cyan) PIP ───────────
-            bwd_t = bench.bdpt_last_backward_transport or {}
-            tracking_lines = [
-                f"emit {int(bwd_t.get('found_emission', 0))} no {int(bwd_t.get('terminated_no_emission', 0))}",
-                f"miss {int(bwd_t.get('missed_scene', 0))} ew {float(bwd_t.get('emission_weight', 0.0)):.2g}",
-                f"{dist_str} col {bc:.3f}",
-            ]
-            tracking_cols  = [(80, 210, 255)] * 3
-            rgba_t = _render_hud_lines(tracking_lines, tracking_cols)
-            glBindTexture(GL_TEXTURE_2D, tex_hud)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, rgba_t)
-            _draw_quad_with_pip_prog(tex_hud,
-                                     _pip_vx, _pip_vy + _pip_dim + 2,
-                                     _HUD_W, _HUD_H, hud_mode=True)
+        # ── Manifold label above left (violet) PIP ─────────────────────────
+        _asm = bench._lens_assembly
+        if _asm is not None and _asm.mode == LensAssemblySpec.MODE_LUT:
+            bake_str = f"BAKED {_asm._transfer_grid_noodles:,}n  ctx={_asm._manifold_ctx_id}"
+        elif ray_mode == "middle":
+            bake_str = "baking..."
+        else:
+            bake_str = ""
+        manifold_lines  = [mode_str]
+        manifold_colours = [(180, 140, 255)]
+        if bake_str:
+            manifold_lines.append(bake_str)
+            manifold_colours.append((255, 200, 80))
+        _draw_hud(manifold_lines, manifold_colours, _bdpt_pip_vx)
 
-            # ── Lens assembly entry/exit stats above right (orange) PIP ────
-            # Per-GID hit counts from the ring buffer (hit_group_id column),
-            # updated by display_pipeline_records() every frame.
-            _gcc = bench._gid_crossing_counts
-            _asm = bench._lens_assembly
-            if _asm is not None:
+        # ── Backward transport stats above center (cyan) PIP ───────────────
+        bwd_t = bench.bdpt_last_backward_transport or {}
+        corr_s = getattr(bench, "_last_correlator_stats", {}) or {}
+        tracking_lines = [
+            f"emit {int(bwd_t.get('found_emission', 0))} no {int(bwd_t.get('terminated_no_emission', 0))}",
+            f"miss {int(bwd_t.get('missed_scene', 0))} ew {float(bwd_t.get('emission_weight', 0.0)):.2g}",
+            f"{dist_str} col {bc:.3f}",
+            f"corr {corr_s.get('join', getattr(bench, '_bdpt_join_element', 'iris'))} cand {int(corr_s.get('candidates', 0) or 0)} acc {int(corr_s.get('accepted', 0) or 0)}",
+        ]
+        tracking_cols  = [(80, 210, 255)] * 3
+        _draw_hud(tracking_lines, tracking_cols, _pip_vx)
+
+        # ── Camera assembly relaxation stats above right (orange) PIP ──────
+        _gcc = bench._gid_crossing_counts
+        _asm = bench._lens_assembly
+        if _asm is not None:
+            try:
                 _asm.refresh_teleport_stats(bench.tracer)
-                _asm_mode = _asm.mode
-                _ent_gid  = _asm._entrance_gid
-                _ex_gid   = _asm._exit_gid
-                _gid_str  = (f"ent={_ent_gid}" if _ent_gid >= 0 else "ent=--") + \
-                            ("" if _ex_gid < 0 else f" ex={_ex_gid}")
-                _n_ent = _gcc.get(_ent_gid, 0) if _ent_gid >= 0 else 0
-                _n_ex  = _gcc.get(_ex_gid,  0) if _ex_gid  >= 0 else 0
-                _MAGIC_NAMES = {14949.0: "param", 14948.0: "mlp",
-                                14946.0: "lut0",  14947.0: "lut1",
-                                14950.0: "lut2",  14951.0: "lut3"}
-                _es = _asm._entrance_stats
-                _xs = _asm._exit_stats
-                _ent_kind = _MAGIC_NAMES.get(float(_es.get("magic", 0)), "?")
-                _ex_kind  = _MAGIC_NAMES.get(float(_xs.get("magic", 0)), "?")
-                _ent_tx  = f"{_ent_kind} T:{_es['transmitted']} abs:{_es['absorbed']}"
-                _ex_tx   = f"{_ex_kind} T:{_xs['transmitted']} abs:{_xs['absorbed']}"
-                # Progressive refinement progress line
-                if _asm_mode == LensAssemblySpec.MODE_PARAMETRIC and _asm._prog_noodle_idx > 0:
-                    _prog_k = _asm._prog_noodle_idx // 1000
-                    _mlp_thresh_k = _asm._prog_cfg.get("mlp_min_samples", 100_000) // 1000
-                    _prog_line = f"prog {_prog_k}k/{_mlp_thresh_k}k"
-                elif _asm_mode == LensAssemblySpec.MODE_LUT and _asm._transfer_grid_noodles > 0:
-                    _prog_line = f"lut {_asm._transfer_grid_noodles:,}n"
-                else:
-                    _prog_line = ""
-                asm_lines = [
-                    f"{_asm_mode} {_gid_str}",
-                    f"ent {_n_ent} ({_ent_tx})",
-                    f"ex  {_n_ex} ({_ex_tx})",
-                ]
-                if _prog_line:
-                    asm_lines.append(_prog_line)
-                asm_cols = [(255, 160, 60), (255, 220, 120), (200, 210, 255), (200, 200, 200)]
-            else:
-                asm_lines = [f"asm:none gids={len(_gcc)}"]
-                asm_cols  = [(120, 120, 120)]
-            rgba_a = _render_hud_lines(asm_lines, asm_cols)
-            glBindTexture(GL_TEXTURE_2D, tex_hud)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, rgba_a)
-            _draw_quad_with_pip_prog(tex_hud,
-                                     _uv_pip_vx, _pip_vy + _pip_dim + 2,
-                                     _HUD_W, _HUD_H, hud_mode=True)
-
+            except Exception:
+                pass
+        _od = getattr(scene, "optical_design", None)
+        _lenses = [l for l in (getattr(scene, "lens_stack", []) or []) if l is not None]
+        if _lenses:
+            _front = float(_lenses[0].x_front)
+            _back = float(_lenses[-1].x_back)
+            _gap_vals = [float(b.x_front - a.x_back) for a, b in zip(_lenses, _lenses[1:])]
+            _min_gap_mm = (min(_gap_vals) * 1e3) if _gap_vals else 0.0
+            _max_r_mm = max(float(l.aperture_radius) for l in _lenses) * 1e3
+            _span_mm = (_back - _front) * 1e3
+        else:
+            _front = _back = _min_gap_mm = _max_r_mm = _span_mm = 0.0
+        _target_f = float(getattr(getattr(_od, "spec", None), "target_focal_length_m", 0.0))
+        _eff_f = float(getattr(_od, "effective_focal_length_m", 0.0))
+        _sensor_err = float(getattr(_od, "sensor_error_m", 0.0))
+        _sensor_x = float(getattr(getattr(scene, "image_plate", None), "x", 0.0))
+        _obj_x = float(getattr(getattr(scene, "object_plane", None), "x", 0.0))
+        _iris = getattr(scene, "iris_aperture", None)
+        _iris_x = float(getattr(_iris, "x_pos", 0.0)) if _iris is not None else 0.0
+        _iris_r = float(getattr(_iris, "r_inner", 0.0)) if _iris is not None else 0.0
+        _ep_x = float(getattr(scene, "exit_pupil_x", 0.0))
+        _ep_r = float(getattr(scene, "exit_pupil_radius", 0.0))
+        _mode = getattr(_asm, "mode", "none") if _asm is not None else "none"
+        _ent_gid = int(getattr(_asm, "_entrance_gid", -1)) if _asm is not None else -1
+        _ex_gid = int(getattr(_asm, "_exit_gid", -1)) if _asm is not None else -1
+        _n_ent = int(_gcc.get(_ent_gid, 0)) if _ent_gid >= 0 else 0
+        _n_ex = int(_gcc.get(_ex_gid, 0)) if _ex_gid >= 0 else 0
+        _ent_stats = getattr(_asm, "_entrance_stats", {}) if _asm is not None else {}
+        _ex_stats = getattr(_asm, "_exit_stats", {}) if _asm is not None else {}
+        _fwd_t = int(_ent_stats.get("transmitted", 0) or 0)
+        _fwd_a = int(_ent_stats.get("absorbed", 0) or 0)
+        _bwd_t = int(_ex_stats.get("transmitted", 0) or 0)
+        _bwd_a = int(_ex_stats.get("absorbed", 0) or 0)
+        _fwd_den = max(1, _fwd_t + _fwd_a)
+        _bwd_den = max(1, _bwd_t + _bwd_a)
+        _fwd_pct = 100.0 * float(_fwd_t) / float(_fwd_den)
+        _bwd_pct = 100.0 * float(_bwd_t) / float(_bwd_den)
+        _field_pair = getattr(bench, "_optical_field_pair", None)
+        if _field_pair is not None:
+            _front_cut = float(_field_pair["front"].cutoff_half_angle_rad) * 180.0 / math.pi
+            _back_cut = float(_field_pair["back"].cutoff_half_angle_rad) * 180.0 / math.pi if "back" in _field_pair else 0.0
+        else:
+            _front_cut = _back_cut = 0.0
+        assembly_lines = [
+            f"cam {_mode} join={getattr(bench, '_bdpt_join_element', 'iris')}",
+            f"f {(_eff_f*1e3):.1f}/{(_target_f*1e3):.1f}mm err {(_sensor_err*1e3):+.2f}mm",
+            f"x obj {_obj_x:.3f} g1 {_front:.3f} sens {_sensor_x:.3f}",
+            f"span {_span_mm:.1f}mm gap {_min_gap_mm:.1f}mm r {_max_r_mm:.1f}mm",
+            f"iris {_iris_x:.3f} r{_iris_r*1e3:.1f} ep {_ep_x:.3f} r{_ep_r*1e3:.1f}",
+            f"fwd T/A {_fwd_t}/{_fwd_a} {_fwd_pct:.1f}% ent_gid {_ent_gid} hits {_n_ent}",
+            f"bwd T/A {_bwd_t}/{_bwd_a} {_bwd_pct:.1f}% ex_gid {_ex_gid} hits {_n_ex}",
+            f"cut f/b {_front_cut:.1f}/{_back_cut:.1f}deg",
+        ]
+        assembly_cols = [(255, 170, 70)] * len(assembly_lines)
+        _draw_hud(assembly_lines, assembly_cols, _uv_pip_vx)
 
     _vol_tex_size = [bench._field_nx, bench._field_ny, bench._field_nz]  # already allocated at init
 
@@ -7441,7 +8231,7 @@ def run(
         glUniform1f(glGetUniformLocation(point_prog, "u_mode"), float(mode))
         glUniform1f(glGetUniformLocation(point_prog, "u_gain"), float(gain))
         glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE)   # additive — depth order doesn't matter
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         glEnableClientState(GL_VERTEX_ARRAY)
         for cls, verts in enumerate(_svc):
             if verts.shape[0] == 0:
@@ -7461,8 +8251,10 @@ def run(
         Everything is in normalised [0,1]³ scene space with the same Y/Z rotation
         as the point/volume shaders so all overlays stay co-registered.
 
-        Colors: entrance ring + backward cone generators = red (#FF3030),
-                exit ring + forward cone generators       = green (#30FF30).
+        Colors: per-element front-side cones             = red
+                per-element back-side cones              = green
+                system front->back teleport boundary     = amber
+                system back->front teleport boundary     = cyan
         """
         _asm = getattr(bench, "_lens_assembly", None)
         if _asm is None:
@@ -7470,6 +8262,23 @@ def run(
         _ap = _asm.acceptance_params()
         if _ap is None:
             return
+        try:
+            _field_pair = _asm.profile_field_pair(
+                object_point=(float(scene.object_plane.x), 0.0, 0.0),
+                image_point=(float(scene.image_plate.x), 0.0, 0.0),
+                verify=False,
+            )
+        except Exception:
+            _field_pair = getattr(bench, "_optical_field_pair", None)
+        _boundary_profiles = None
+        try:
+            _boundary_profiles = _asm.boundary_teleport_profiles(verify=True, n_azimuth=16)
+        except Exception:
+            if _field_pair is not None:
+                _boundary_profiles = {
+                    k: v.boundary for k, v in _field_pair.items()
+                    if getattr(v, "boundary", None) is not None
+                }
 
         x_span  = max(1e-8, float(scene.x_max - scene.x_min))
         yz_span = max(1e-8, float(2.0 * scene.view_radius))
@@ -7522,7 +8331,10 @@ def run(
         # A ray from the scene within fwd_half_angle of the axis traverses the full column.
         x_obj_far_w = x_ent_w - extent
         x_obj_far   = _nx(x_obj_far_w)
-        h_obj       = float(math.tan(float(_ap["fwd_half_angle"])) * extent / yz_span)
+        obj_half = float(_ap.get("fwd_half_angle", _ap.get("verified_spread_half_angle_rad", 0.0)))
+        if _field_pair is not None:
+            obj_half = max(obj_half, float(_field_pair["front"].cutoff_half_angle_rad))
+        h_obj       = float(math.tan(obj_half) * extent / yz_span)
         obj_lines = np.array([
             [x_ent, 0.5,       0.5      ], [x_obj_far, 0.5 + h_obj, 0.5      ],
             [x_ent, 0.5,       0.5      ], [x_obj_far, 0.5 - h_obj, 0.5      ],
@@ -7534,7 +8346,10 @@ def run(
         # A backward sensor ray within bwd_half_angle can traverse back to the scene.
         x_img_far_w = x_exit_w + extent
         x_img_far   = _nx(x_img_far_w)
-        h_img       = float(math.tan(float(_ap["bwd_half_angle"])) * extent / yz_span)
+        img_half = float(_ap.get("bwd_half_angle", 0.0))
+        if _field_pair is not None and "back" in _field_pair:
+            img_half = max(img_half, float(_field_pair["back"].cutoff_half_angle_rad))
+        h_img       = float(math.tan(img_half) * extent / yz_span)
         img_lines = np.array([
             [x_exit, 0.5,      0.5      ], [x_img_far, 0.5 + h_img, 0.5      ],
             [x_exit, 0.5,      0.5      ], [x_img_far, 0.5 - h_img, 0.5      ],
@@ -7576,12 +8391,166 @@ def run(
             glVertexPointer(2, GL_FLOAT, 0, pts2)
             glDrawArrays(GL_LINE_STRIP, 0, int(pts2.shape[0]))
 
+        def _ring_at(center, radius):
+            rad = _nr(float(radius))
+            cx = _nx(float(center[0]))
+            circle = np.empty((N_SEG + 1, 3), dtype=np.float32)
+            circle[:N_SEG, 0] = cx
+            circle[:N_SEG, 1] = 0.5 + rad * cos_a
+            circle[:N_SEG, 2] = 0.5 + rad * sin_a
+            circle[N_SEG] = circle[0]
+            return circle
+
+        def _boundary_generators(boundary):
+            src = np.asarray(boundary.source_center, dtype=np.float64)
+            dst = np.asarray(boundary.target_center, dtype=np.float64)
+            src3 = np.array([_nx(src[0]), 0.5 + src[1] / yz_span, 0.5 + src[2] / yz_span], dtype=np.float32)
+            tx = _nx(float(dst[0]))
+            tr = _nr(float(boundary.target_radius))
+            lines = []
+            for y, z in ((tr, 0.0), (-tr, 0.0), (0.0, tr), (0.0, -tr)):
+                lines.append(src3)
+                lines.append(np.array([tx, 0.5 + y, 0.5 + z], dtype=np.float32))
+            return np.asarray(lines, dtype=np.float32)
+
+        def _face_circle(face_profile):
+            rad = _nr(float(face_profile.face.radius))
+            cx = _nx(float(face_profile.center[0]))
+            circle = np.empty((N_SEG + 1, 3), dtype=np.float32)
+            circle[:N_SEG, 0] = cx
+            circle[:N_SEG, 1] = 0.5 + rad * cos_a
+            circle[:N_SEG, 2] = 0.5 + rad * sin_a
+            circle[N_SEG] = circle[0]
+            return circle
+
+        def _face_generators(face_profile):
+            fp = np.asarray(face_profile.focal_point, dtype=np.float64)
+            fp3 = np.array([_nx(fp[0]), 0.5 + fp[1] / yz_span, 0.5 + fp[2] / yz_span], dtype=np.float32)
+            cx = _nx(float(face_profile.center[0]))
+            rr = _nr(float(face_profile.face.radius))
+            lines = []
+            for y, z in ((rr, 0.0), (-rr, 0.0), (0.0, rr), (0.0, -rr)):
+                lines.append(fp3)
+                lines.append(np.array([cx, 0.5 + y, 0.5 + z], dtype=np.float32))
+            return np.asarray(lines, dtype=np.float32)
+
+        if _field_pair is not None:
+            for prof in _field_pair["front"].faces:
+                if prof.reachable_from_side:
+                    _draw_loop(_face_circle(prof), 0.72, 0.08, 0.08)
+                    _draw_lines(_face_generators(prof), 0.72, 0.08, 0.08)
+            if "back" in _field_pair:
+                for prof in _field_pair["back"].faces:
+                    if prof.reachable_from_side:
+                        _draw_loop(_face_circle(prof), 0.08, 0.72, 0.08)
+                        _draw_lines(_face_generators(prof), 0.08, 0.72, 0.08)
+
+        if _boundary_profiles is not None:
+            front_boundary = _boundary_profiles.get("front")
+            back_boundary = _boundary_profiles.get("back")
+            if front_boundary is not None:
+                _draw_loop(_ring_at(front_boundary.source_center, front_boundary.source_radius), 1.0, 0.68, 0.05)
+                _draw_loop(_ring_at(front_boundary.target_center, front_boundary.target_radius), 1.0, 0.68, 0.05)
+                _draw_lines(_boundary_generators(front_boundary), 1.0, 0.68, 0.05)
+            if back_boundary is not None:
+                _draw_loop(_ring_at(back_boundary.source_center, back_boundary.source_radius), 0.0, 0.88, 1.0)
+                _draw_loop(_ring_at(back_boundary.target_center, back_boundary.target_radius), 0.0, 0.88, 1.0)
+                _draw_lines(_boundary_generators(back_boundary), 0.0, 0.88, 1.0)
+
         # Entrance aperture ring + object-side FOV cone: red
         _draw_loop(ent_circle, 1.0, 0.18, 0.18)
         _draw_lines(obj_lines, 1.0, 0.18, 0.18)
         # Exit aperture ring + image-side FOV cone: green
         _draw_loop(exit_circle, 0.18, 1.0, 0.18)
         _draw_lines(img_lines,  0.18, 1.0, 0.18)
+
+        # Physical iris / aperture stop: blue.  This is the real mechanical
+        # stop in the lens stack, distinct from the virtual entrance/exit pupils.
+        _iris_overlay = getattr(scene, "iris_aperture", None)
+        if _iris_overlay is not None and bool(getattr(_iris_overlay, "enabled", False)):
+            _draw_loop(
+                _ring_at([float(_iris_overlay.x_pos), 0.0, 0.0], float(_iris_overlay.r_inner)),
+                0.12, 0.42, 1.0,
+            )
+
+        # Parametric glass profiles: draw the actual spherical front/back
+        # meridians and edge joins so the display reads as glass, not boxes.
+        _display_lenses = [l for l in (getattr(scene, "lens_stack", []) or [getattr(scene, "lens", None)]) if l is not None and _lens_is_valid(l)]
+        for _lens in _display_lenses:
+            _r_vals = np.linspace(-float(_lens.aperture_radius), float(_lens.aperture_radius), 80, dtype=np.float64)
+            _r_abs = np.abs(_r_vals)
+            _front_x = _lens_front_x(_lens, _r_abs)
+            _back_x = _lens_back_x(_lens, _r_abs)
+            _front_profile = np.stack([
+                np.array([_nx(float(x)) for x in _front_x], dtype=np.float32),
+                0.5 + (_r_vals / yz_span).astype(np.float32),
+                np.full(_r_vals.shape, 0.5, dtype=np.float32),
+            ], axis=1)
+            _back_profile = np.stack([
+                np.array([_nx(float(x)) for x in _back_x], dtype=np.float32),
+                0.5 + (_r_vals / yz_span).astype(np.float32),
+                np.full(_r_vals.shape, 0.5, dtype=np.float32),
+            ], axis=1)
+            _edge_lines = np.array([
+                [_nx(float(_front_x[0])), 0.5 + float(_r_vals[0]) / yz_span, 0.5],
+                [_nx(float(_back_x[0])),  0.5 + float(_r_vals[0]) / yz_span, 0.5],
+                [_nx(float(_front_x[-1])), 0.5 + float(_r_vals[-1]) / yz_span, 0.5],
+                [_nx(float(_back_x[-1])),  0.5 + float(_r_vals[-1]) / yz_span, 0.5],
+            ], dtype=np.float32)
+            _draw_loop(_front_profile, 0.72, 0.92, 1.0)
+            _draw_loop(_back_profile, 0.72, 0.92, 1.0)
+            _draw_lines(_edge_lines, 0.72, 0.92, 1.0)
+
+        # Per-pixel acceptance fan (magenta image-side, gold object-side).
+        # Shows the family of angles each sensor site can accept:
+        #   magenta — from sensor pixel toward exit pupil rim (fans OUT from pupil)
+        #   gold    — from entrance pupil toward scene at each pixel's field angle
+        if hasattr(_asm, "optics") and _asm.optics is not None:
+            _r_sensor = float(getattr(getattr(scene, "image_plate", None), "radius", 0.0))
+            _x_sensor = float(getattr(getattr(scene, "image_plate", None), "x", 0.0))
+            if _r_sensor > 1e-9 and _x_sensor > 1e-9:
+                _fan_heights = np.linspace(0.0, _r_sensor, 6)[1:]  # 5 rings, exclude 0
+                try:
+                    _fan = _asm.optics.pixel_acceptance_fan(_x_sensor, _fan_heights.tolist())
+                except Exception:
+                    _fan = []
+                for _pix in _fan:
+                    _h   = float(_pix["h_sensor"])
+                    _xep = float(_pix["x_ep_img"])
+                    _rep = float(_pix["r_ep_img"])
+                    _x_s_n  = _nx(_x_sensor)
+                    _h_n    = _h / yz_span
+                    _xep_n  = _nx(_xep)
+                    _rep_n  = _rep / yz_span
+                    # Image-side: sensor pixel → exit pupil centre and rim (magenta)
+                    _mlines = np.array([
+                        [_x_s_n, 0.5 + _h_n, 0.5], [_xep_n, 0.5,         0.5],
+                        [_x_s_n, 0.5 + _h_n, 0.5], [_xep_n, 0.5 + _rep_n, 0.5],
+                        [_x_s_n, 0.5 + _h_n, 0.5], [_xep_n, 0.5 - _rep_n, 0.5],
+                    ], dtype=np.float32)
+                    _draw_lines(_mlines, 0.85, 0.15, 0.85)
+                    # Object-side: entrance pupil → scene at this pixel's field angle (gold)
+                    _x_enp  = float(_pix["x_ep_obj"])
+                    _r_enp  = float(_pix["r_ep_obj"])
+                    _th_obj = float(_pix["chief_angle_obj"])
+                    _th_mar = float(_pix["marginal_half_angle_img"])
+                    _xen_n  = _nx(_x_enp)
+                    _obj_far_n = _nx(_x_enp - extent)
+                    for _ang in (_th_obj - _th_mar, _th_obj, _th_obj + _th_mar):
+                        _ho = math.tan(_ang) * extent / yz_span
+                        _olines = np.array([
+                            [_xen_n, 0.5, 0.5], [_obj_far_n, 0.5 + _ho, 0.5],
+                        ], dtype=np.float32)
+                        _draw_lines(_olines, 1.0, 0.82, 0.1)
+                # Entrance pupil ring (white)
+                if _fan:
+                    _xen0 = float(_fan[0]["x_ep_obj"])
+                    _ren0 = float(_fan[0]["r_ep_obj"])
+                    _draw_loop(_ring_at([_xen0, 0.0, 0.0], _ren0), 0.9, 0.9, 0.9)
+                    # Exit pupil ring (bright cyan)
+                    _xep0 = float(_fan[0]["x_ep_img"])
+                    _rep0 = float(_fan[0]["r_ep_img"])
+                    _draw_loop(_ring_at([_xep0, 0.0, 0.0], _rep0), 0.1, 1.0, 0.9)
 
         glLineWidth(1.0)
         glDisableClientState(GL_VERTEX_ARRAY)
@@ -7672,6 +8641,8 @@ def run(
                                 GL_RGBA, GL_FLOAT, np.ascontiguousarray(pages, dtype=np.float32))
                 _uv_last_update_s[0] = float(t_now)
             active_tex = tex_uv_pages
+        glEnable(GL_DEPTH_TEST)
+        glDepthMask(True)
         glUseProgram(mesh_prog)
         glUniform1f(glGetUniformLocation(mesh_prog, "u_time"), float(t_now))
         glUniform1f(glGetUniformLocation(mesh_prog, "u_mode"), 0.0)
@@ -7697,11 +8668,15 @@ def run(
         glDisableVertexAttribArray(_mesh_loc_uv)
         glDisableVertexAttribArray(_mesh_loc_layer)
         glDisable(GL_BLEND)
+        glDepthMask(False)
+        glDisable(GL_DEPTH_TEST)
         glUseProgram(0)
 
         # Drive BaseGLRenderer: fly-camera perspective when fly_mode is active,
-        # otherwise fall back to the orthographic auto-wiggle.
+        # otherwise use a fixed orthographic X/Y view.
         if _scene_vao[0] is not None:
+            glEnable(GL_DEPTH_TEST)
+            glDepthMask(True)
             if fly_mode:
                 # ── Perspective MVP ───────────────────────────────────────── #
                 _aspect  = float(W) / float(H)
@@ -7718,19 +8693,20 @@ def run(
                 mvp_col  = np.ascontiguousarray(_mvp_fly.T.ravel(), dtype=np.float32)
                 mv_col   = np.ascontiguousarray(V.T.ravel(), dtype=np.float32)
             else:
-                t   = t_now * 0.16
-                a   = 0.24 * math.sin(t)
-                ca  = math.cos(a);  sa = math.sin(a)
+                ca  = 1.0
+                sa  = 0.0
                 mvp = np.array([
-                    [ 2,     0,     0, -1          ],
-                    [ 0,  2*ca,  2*sa, -(ca + sa)  ],
-                    [ 0,     0,     0,  0          ],
-                    [ 0,     0,     0,  1          ],
+                    [ 2,       0,      0,    -1           ],
+                    [ 0,    2*ca,   2*sa,    -(ca+sa)     ],
+                    [ 0,   -2*sa,   2*ca,    (sa-ca)      ],
+                    [ 0,       0,      0,    1            ],
                 ], dtype=np.float32)
                 mvp_col = np.ascontiguousarray(mvp.T.ravel(), dtype=np.float32)
                 mv_col  = np.ascontiguousarray(np.eye(4, dtype=np.float32).ravel())
             vao_id, n_verts = _scene_vao[0][0], _scene_vao[0][1]
             _gl_renderer.draw_mesh(vao_id, n_verts, mvp_col, mv_col)
+            glDepthMask(False)
+            glDisable(GL_DEPTH_TEST)
 
     # ── Clip plane helpers ───────────────────────────────────────── #
     r         = float(scene.view_radius)
@@ -7767,17 +8743,19 @@ def run(
     paused          = False
     closing         = threading.Event()
 
-    projection_axis = 1  # 1 = X/Y top projection, 2 = X/Z side projection, 0 = subtle auto-wiggle blend
-    auto_wiggle = True
+    projection_axis = 1  # 1 = X/Y orthographic projection, 2 = X/Z projection
+    auto_wiggle = False
+    show_impact_points = False
     volume_gain = 1.0
 
     # ── Fly camera (F to toggle) ──────────────────────────────────────────── #
     # Positions are in the same [0,1]³ normalised space the VAO uses.
-    # Scene centre = (0.5, 0.5, 0.5).  Start outside the scene on the -Z side,
-    # looking toward the centre of the optical bench.
+    # Start in front of the object plane looking along +X (the optical axis).
+    # yaw=π/2 → forward = +X; the viewer sees the YZ cross-section — lenses
+    # and subject objects appear as circles rather than as side-on slivers.
     fly_mode  = False
-    fly_pos   = np.array([0.5, 0.5, -0.4], dtype=np.float64)
-    fly_yaw   = 0.0              # yaw=0 → forward = +Z (into the scene)
+    fly_pos   = np.array([-0.35, 0.5, 0.5], dtype=np.float64)
+    fly_yaw   = math.pi / 2      # yaw=π/2 → forward = +X (along optical axis)
     fly_pitch = 0.0
     _FLY_SPEED = 0.6   # normalised units / second
     _FLY_SENS  = 0.20  # degrees per pixel of mouse movement
@@ -7798,7 +8776,16 @@ def run(
         _manifold_busy[0] = True
         def _worker():
             try:
-                bench.render_middle(manifold_mode=manifold_mode)
+                if manifold_mode == "synthetic":
+                    bench.render_middle(manifold_mode="full")
+                else:
+                    bench.trace_forward_backward_sensor_rgb(
+                        pixels=max(8, min(48, int(scene.image_plate.sensor_res))),
+                        aperture_samples=2,
+                        seed=20260522 + _manifold_ctr[0],
+                        max_bounces=48,
+                        n_rays_bdpt=8192,
+                    )
             except Exception as _me:
                 print(f"[middle] render error: {_me}", flush=True)
             finally:
@@ -7862,8 +8849,8 @@ def run(
                             paused = not paused
                         elif not fly_mode:
                             if k == pygame.K_x:
-                                projection_axis = 0
-                                auto_wiggle = True
+                                projection_axis = 1
+                                auto_wiggle = False
                             elif k == pygame.K_y:
                                 projection_axis = 1
                                 auto_wiggle = False
@@ -7887,6 +8874,9 @@ def run(
                                 _uv_mode[0] = modes[(modes.index(_uv_mode[0]) + 1) % len(modes)]
                                 _uv_last_update_s[0] = -1.0
                                 print(f"[uv-mode] {_uv_mode[0]}", flush=True)
+                            elif k == pygame.K_p:
+                                show_impact_points = not show_impact_points
+                                print(f"[impact-points] {1 if show_impact_points else 0}", flush=True)
                             elif k == pygame.K_LEFTBRACKET:
                                 bench.intent_shuffle = max(0.0, bench.intent_shuffle - 0.1)
                                 bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
@@ -7954,10 +8944,7 @@ def run(
                         frame_profiler.end("upload_volume")
                     print(f"[display] {exc}", flush=True)
 
-            if auto_wiggle or projection_axis == 0:
-                shader_mode = 0
-                axis_label = "AUTO X/Y↔X/Z"
-            elif projection_axis == 2:
+            if projection_axis == 2:
                 shader_mode = 2
                 axis_label = "X/Z"
             else:
@@ -7973,13 +8960,15 @@ def run(
             bench._poll_assembly_mode_switch()
 
             glClearColor(8/255, 8/255, 10/255, 1.0)
-            glClear(GL_COLOR_BUFFER_BIT)
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            glDepthFunc(GL_LEQUAL)
             glViewport(0, 0, W, H)
             t_now = pygame.time.get_ticks() * 0.001
             if frame_profiler is not None:
                 frame_profiler.begin("draw_uv_mesh")
-            draw_uv_mesh(volume_gain, t_now)
-            draw_surface_points(shader_mode, volume_gain, t_now)
+            draw_uv_mesh(volume_gain, 0.0)
+            if show_impact_points:
+                draw_surface_points(shader_mode, volume_gain, 0.0)
             draw_acceptance_cones(t_now, shader_mode)
             if frame_profiler is not None:
                 frame_profiler.end("draw_uv_mesh")
@@ -8177,12 +9166,22 @@ if __name__ == "__main__":
     )
     _ap.add_argument(
         "--manifold-mode",
-        choices=["full", "aperture"],
+        choices=["full", "aperture", "synthetic"],
         default="full",
         help=(
-            "full     = both directions, paints to sensor UV (default); "
+            "full     = live C++ forward/backward records joined by RayCorrelator (default); "
             "aperture = backward-only as aperture connection point "
-            "(special case: formalises the old C++ BDPT path)"
+            "(special case: formalises the old C++ BDPT path); "
+            "synthetic = legacy ManifoldEndpoint CPU demo"
+        ),
+    )
+    _ap.add_argument(
+        "--bdpt-join",
+        default="iris",
+        metavar="ELEM",
+        help=(
+            "Camera element used as RayCorrelator join surface: iris, exit-pupil, "
+            "body-front, g1-front, g1-back, gN-front, gN-back, or gN-center"
         ),
     )
     _ap.add_argument(
@@ -8389,6 +9388,7 @@ if __name__ == "__main__":
         profile=bool(_args.profile),
         field_capture=not _args.no_field,
         manifold_mode=_args.manifold_mode,
+        bdpt_join_element=_args.bdpt_join,
         bake_noodles=_args.bake_noodles,
         full_assembly=bool(_args.full_assembly),
         focus_steps=_args.focus_steps,

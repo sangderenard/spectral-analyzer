@@ -285,6 +285,139 @@ class LensAssemblySpec:
             )
         return self.optics
 
+    # ── Sensor + aperture ownership ───────────────────────────────────────────
+
+    def populate_sensor(self, scene) -> None:
+        """Register the sensor plate as a part of this assembly (StraightBoxSpec).
+
+        After this call straight_section encodes the sensor plane position and
+        half-size, derived from scene.image_plate and optics.side("back").
+        """
+        plate = getattr(scene, "image_plate", None)
+        if plate is None:
+            return
+        sensor_x = float(plate.x)
+        sensor_r = float(getattr(plate, "radius", 0.0))
+        x_exit: Optional[float] = None
+        if self.optics is not None:
+            try:
+                x_exit = float(self.optics.side("back").x_pos)
+            except Exception:
+                pass
+        if x_exit is None:
+            x_exit = sensor_x - 0.05
+        # StraightBoxSpec z_front is the lens-facing end; sensor_z_offset is how far
+        # the sensor is racked back from that face (sensor_plane = z_front − offset).
+        # In our scene x-coords x_exit < sensor_x, so offset must be negative of
+        # (sensor_x − x_exit).  We store depth = sensor_x − x_exit and set
+        # z_front = sensor_x so sensor_z_offset = 0 keeps sensor_x() correct.
+        depth = max(1.0e-4, float(sensor_x) - float(x_exit))
+        self.straight_section = StraightBoxSpec(
+            half_w=float(sensor_r),
+            half_h=float(sensor_r),
+            z_front=float(sensor_x),
+            depth=float(depth),
+            sensor_z_offset=0.0,            # sensor plane = z_front = sensor_x
+        )
+
+    def sync_from_scene(self, scene) -> None:
+        """Pull sensor plate and iris aperture from scene into the assembly.
+
+        After this call the assembly owns all geometry needed to compute
+        backward_ray_target() without consulting scene attributes again.
+        """
+        self.populate_sensor(scene)
+        iris = getattr(scene, "iris_aperture", None)
+        if iris is not None and bool(getattr(iris, "enabled", False)):
+            self.aperture = ApertureSpec(
+                z=float(iris.x_pos),
+                r_clear=float(iris.r_inner),
+            )
+
+    def backward_ray_target(self) -> Tuple[Optional[np.ndarray], float]:
+        """Return (centroid_xyz, radius) — where sensor backward rays must aim.
+
+        When a physical iris is present, we target the EXIT PUPIL — the image of
+        the iris through whatever lens groups lie between it and the sensor.  That
+        is the cone vertex that backward rays from the sensor actually converge on,
+        so aiming there avoids the camera-body frustum blocking them before they
+        reach the scene.
+
+        Precedence:
+          1. Exit pupil computed by optics (requires iris encoded in CompoundLens)
+          2. Physical iris position (fallback when no optics or EP is degenerate)
+          3. Exit face of the last lens group
+          4. Front face of the straight_section
+        """
+        if self.optics is not None:
+            try:
+                x_ep, r_ep = self.optics.exit_pupil
+                if r_ep > 0.0:
+                    return (np.array([float(x_ep), 0.0, 0.0], dtype=np.float64),
+                            float(r_ep))
+            except Exception:
+                pass
+        if self.aperture is not None and self.aperture.r_clear > 0.0:
+            return (np.array([self.aperture.z, 0.0, 0.0], dtype=np.float64),
+                    float(self.aperture.r_clear))
+        if self.optics is not None:
+            try:
+                back = self.optics.side("back")
+                if back.radius > 0.0:
+                    return (np.array([float(back.x_pos), 0.0, 0.0], dtype=np.float64),
+                            float(back.radius))
+            except Exception:
+                pass
+        if self.straight_section is not None:
+            s = self.straight_section
+            return (np.array([float(s.z_front), 0.0, 0.0], dtype=np.float64),
+                    float(max(s.half_w, s.half_h)))
+        return None, 0.0
+
+    def sensor_x(self) -> Optional[float]:
+        """Axial position of the sensor plane (z_front − sensor_z_offset)."""
+        if self.straight_section is None:
+            return None
+        s = self.straight_section
+        return float(s.z_front - s.sensor_z_offset)
+
+    def sensor_radius(self) -> float:
+        """Sensor half-size from straight_section."""
+        if self.straight_section is None:
+            return 0.0
+        return float(max(self.straight_section.half_w, self.straight_section.half_h))
+
+    def camera_body_front_x(self) -> Optional[float]:
+        """Physical x where the camera barrel starts — the back face of the last lens group.
+
+        This is the entrance to the enclosed light-tight box between the rear
+        lens group and the sensor.  Used for camera-body mesh geometry; it is
+        NOT the optical exit pupil (which may be virtual and in front of G1).
+        """
+        if self.optics is not None:
+            try:
+                return float(self.optics.side("back").x_pos)
+            except Exception:
+                pass
+        if self.straight_section is not None:
+            s = self.straight_section
+            return float(s.z_front - s.depth)   # = z_front − depth = G4-back end
+        return None
+
+    def camera_body_entrance_radius(self) -> float:
+        """Clear aperture at the barrel entrance (last lens group aperture radius).
+
+        Determines the inner radius of the camera-body frustum at the G4-back end.
+        """
+        if self.optics is not None:
+            try:
+                return float(self.optics.side("back").radius)
+            except Exception:
+                pass
+        if self.straight_section is not None:
+            return float(max(self.straight_section.half_w, self.straight_section.half_h))
+        return 0.0
+
     def build_parametric_payload(self) -> np.ndarray:
         """Build the forward (scene→sensor) shader payload from the canonical model."""
         return self.require_optics().build_gpu_payload()
@@ -316,13 +449,84 @@ class LensAssemblySpec:
             bwd[dst + 7] = fwd[src + 7]   # reserved
         return bwd
 
+    def evaluate_transfer(self, bundle):
+        """Evaluate a ray bundle through the installed canonical optics."""
+        return self.require_optics().evaluate_bundle(bundle)
+
+    def angular_limits_from_origin(
+        self,
+        origin=(0.0, 0.0, 0.0),
+        *,
+        side: str = "front",
+        n_azimuth: int = 16,
+    ):
+        """Return exact-plus-verified angular limits for all registered faces."""
+        return self.require_optics().angular_limits_from_origin(
+            origin,
+            side=side,
+            n_azimuth=n_azimuth,
+        )
+
+    def vignetting_profile_from_point(
+        self,
+        focal_point=(0.0, 0.0, 0.0),
+        *,
+        side: str = "front",
+        verify: bool = False,
+        n_azimuth: int = 32,
+    ):
+        """Return per-element closed-form vignetting cones from a focal point."""
+        return self.require_optics().vignetting_profile_from_point(
+            focal_point,
+            side=side,
+            verify=verify,
+            n_azimuth=n_azimuth,
+        )
+
+    def boundary_teleport_profile(
+        self,
+        side: str = "front",
+        *,
+        verify: bool = True,
+        n_azimuth: int = 32,
+    ):
+        """Return the compound boundary-to-boundary teleport cone for one side."""
+        return self.require_optics().boundary_teleport_profile(
+            side,
+            verify=verify,
+            n_azimuth=n_azimuth,
+        )
+
+    def boundary_teleport_profiles(self, *, verify: bool = True, n_azimuth: int = 32):
+        """Return front→back and back→front compound boundary profiles."""
+        return self.require_optics().boundary_teleport_profiles(
+            verify=verify,
+            n_azimuth=n_azimuth,
+        )
+
+    def profile_field_pair(
+        self,
+        object_point=(0.0, 0.0, 0.0),
+        image_point=None,
+        *,
+        verify: bool = False,
+        n_azimuth: int = 32,
+    ):
+        """Return object-side and optional image-side field profiles."""
+        return self.require_optics().profile_field_pair(
+            object_point,
+            image_point,
+            verify=verify,
+            n_azimuth=n_azimuth,
+        )
+
     def acceptance_params(self) -> "dict | None":
         """Return acceptance cone geometry from the analytical parametric model.
 
         Positions and radii come from CompoundLens.side() — analytically exact
-        values derived from the payload, independent of mesh geometry.  Acceptance
-        angles are not computed here; they require a T2 query path that has not
-        yet been implemented.
+        values derived from the payload, independent of mesh geometry.  Angular
+        limits combine exact face geometry with a batch parametric verification
+        pass through the installed CompoundLens.
 
         Returns a dict with:
             entrance_gid  : registered TriGroup ID for the entrance mesh (-1 if unregistered)
@@ -331,6 +535,7 @@ class LensAssemblySpec:
             entrance_r    : clear aperture radius at the entrance (m)
             exit_x        : axial position of the exit surface (m)
             exit_r        : clear aperture radius at the exit (m)
+            angular_limits: AssemblyAngularLimits, or None on verification failure
         or None if optics is not set.
         """
         if self.optics is None:
@@ -342,6 +547,20 @@ class LensAssemblySpec:
         try:
             front = self.optics.side("front")
             back  = self.optics.side("back")
+            limits = None
+            try:
+                limits = self.optics.angular_limits_from_origin(
+                    (0.0, 0.0, 0.0),
+                    side="front",
+                    n_azimuth=16,
+                )
+                boundary_profiles = self.optics.boundary_teleport_profiles(
+                    n_azimuth=16,
+                    verify=True,
+                )
+            except Exception as exc:
+                print(f"[acceptance] angular verification failed: {exc}", flush=True)
+                boundary_profiles = None
 
             self._cached_acceptance_params = {
                 "entrance_gid": self._entrance_gid,
@@ -350,12 +569,33 @@ class LensAssemblySpec:
                 "entrance_r":   float(front.radius),
                 "exit_x":       float(back.x_pos),
                 "exit_r":       float(back.radius),
+                "spread_half_angle_rad": (
+                    float(limits.spread_half_angle_rad) if limits is not None else 0.0
+                ),
+                "verified_spread_half_angle_rad": (
+                    float(limits.verified_spread_half_angle_rad) if limits is not None else 0.0
+                ),
+                "convergence_half_angle_rad": (
+                    float(limits.convergence_half_angle_rad) if limits is not None else 0.0
+                ),
+                "fwd_half_angle": (
+                    float(limits.verified_spread_half_angle_rad) if limits is not None else 0.0
+                ),
+                "bwd_half_angle": (
+                    float(self.optics.side_cone("back").half_angle_rad)
+                    if self.optics is not None else 0.0
+                ),
+                "angular_limits": limits,
+                "boundary_profiles": boundary_profiles,
             }
             print(
                 f"[acceptance] entrance_x={float(front.x_pos)*1e3:.1f}mm"
                 f"  exit_x={float(back.x_pos)*1e3:.1f}mm"
                 f"  r_ent={float(front.radius)*1e3:.1f}mm"
-                f"  r_exit={float(back.radius)*1e3:.1f}mm",
+                f"  r_exit={float(back.radius)*1e3:.1f}mm"
+                f"  spread={self._cached_acceptance_params['spread_half_angle_rad']:.4f}rad"
+                f"  verified={self._cached_acceptance_params['verified_spread_half_angle_rad']:.4f}rad"
+                f"  convergence={self._cached_acceptance_params['convergence_half_angle_rad']:.4f}rad",
                 flush=True,
             )
             return self._cached_acceptance_params
@@ -787,6 +1027,27 @@ class LensAssemblySpec:
                 if verbose:
                     print(f"[assembly] CompoundLens construction failed; falling back: {exc}",
                           flush=True)
+
+        if self.optics is not None and not bake_full_assembly and bake_table_gb <= 0.0:
+            if verbose:
+                print(
+                    f"[assembly] parametric LUT bake from CompoundLens ({n_grid}x{n_grid})",
+                    flush=True,
+                )
+            grid, n_src = self.optics.build_transfer_lut(
+                n_u=n_grid,
+                n_v=n_grid,
+                n_directions=max(1, int(n_refine) * max(1, int(n_wavelengths))),
+            )
+            self._transfer_grid         = grid
+            self._transfer_grid_noodles = int(n_src)
+            self._baked_ep              = None
+            self.mode                   = self.MODE_LUT
+            if tracer is not None:
+                self.register_lut_ctx(tracer)
+            if verbose:
+                print(f"[assembly] parametric LUT done - {n_src:,} verified samples", flush=True)
+            return
 
         if bake_table_gb > 0.0:
             n_cells    = max(1, int(bake_table_gb * (1024.0 ** 3) // (stride * 4)))

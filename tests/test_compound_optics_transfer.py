@@ -103,3 +103,83 @@ def test_lens_assembly_lut_bake_uses_parametric_compound_lens():
     assert assembly._baked_ep is None
     assert assembly._transfer_grid[0] == np.float32(14950.0)
     assert assembly._transfer_grid_noodles > 0
+
+
+def test_vignetting_profile_declares_face_cones_from_either_side():
+    lens = CompoundLens.from_preset(simple_doublet_preset())
+
+    front = lens.vignetting_profile_from_point((0.0, 0.0, 0.0), side="front")
+    back = lens.vignetting_profile_from_point((0.08, 0.0, 0.0), side="back")
+
+    assert len(front.faces) == len(lens.registered_faces())
+    assert front.limiting_face is not None
+    assert front.cutoff_half_angle_rad > 0.0
+    assert front.limiting_face.q_matrix.shape == (3, 3)
+    assert np.allclose(front.limiting_face.center, front.limiting_face.face.center)
+
+    assert back.limiting_face is not None
+    assert back.limiting_face.center_direction[0] < 0.0
+    assert back.cutoff_half_angle_rad > 0.0
+
+
+def test_lens_assembly_profiles_point_pair():
+    lens = CompoundLens.from_preset(simple_doublet_preset())
+    assembly = LensAssemblySpec()
+    assembly.set_optics(lens, mode=LensAssemblySpec.MODE_PARAMETRIC)
+
+    profiles = assembly.profile_field_pair(
+        object_point=(0.0, 0.0, 0.0),
+        image_point=(0.08, 0.0, 0.0),
+    )
+
+    assert set(profiles) == {"front", "back"}
+    assert profiles["front"].limiting_face is not None
+    assert profiles["back"].limiting_face is not None
+    assert profiles["front"].boundary is not None
+    assert profiles["back"].boundary is not None
+
+
+def test_boundary_teleport_profiles_describe_compound_interfaces():
+    lens = CompoundLens.from_preset(simple_doublet_preset())
+    profiles = lens.boundary_teleport_profiles(n_azimuth=8, verify=True)
+
+    front = profiles["front"]
+    back = profiles["back"]
+
+    assert front.source_side == "front"
+    assert front.target_side == "back"
+    assert back.source_side == "back"
+    assert back.target_side == "front"
+    assert front.q_matrix.shape == (3, 3)
+    assert front.edge_to_edge_half_angle_rad >= front.target_cone_half_angle_rad
+    assert back.edge_to_edge_half_angle_rad >= back.target_cone_half_angle_rad
+    assert 0.0 <= front.verified_transmission_fraction <= 1.0
+    assert 0.0 <= back.verified_transmission_fraction <= 1.0
+
+
+def test_thick_lens_scene_builds_matching_parametric_faces():
+    from thick_lens_focus_lab import LensConfig, SceneConfig, _compound_lens_from_scene
+
+    scene = SceneConfig()
+    scene.optical_design = None
+    scene.lens_stack = [
+        LensConfig(
+            center_x=0.5,
+            thickness=0.04,
+            aperture_radius=0.025,
+            radius_front=0.08,
+            radius_back=0.09,
+            ior=1.55,
+        )
+    ]
+    scene.exit_pupil_x = 0.7
+    scene.exit_pupil_radius = 0.012
+
+    lens = _compound_lens_from_scene(scene)
+    faces = lens.registered_faces()
+
+    assert len(faces) == 3
+    assert np.isclose(faces[0].x_pos, scene.lens_stack[0].x_front)
+    assert np.isclose(faces[1].x_pos, scene.lens_stack[0].x_back)
+    assert np.isclose(faces[2].x_pos, scene.exit_pupil_x)
+    assert np.isclose(faces[2].radius, scene.exit_pupil_radius)

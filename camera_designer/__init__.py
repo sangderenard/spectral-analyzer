@@ -52,6 +52,15 @@ from .emitter_profile import (
 from .compound_optics import (
     CompoundLens,
     LensHood,
+    RayBundle,
+    BundleTraceResult,
+    RayTraceResult,
+    OpticalFace,
+    FaceVignettingProfile,
+    BoundaryTeleportProfile,
+    AssemblyFieldProfile,
+    FaceAngularLimit,
+    AssemblyAngularLimits,
     PLENS_MAGIC,
     PLENS_HEADER,
     PLENS_SURF_STRIDE,
@@ -90,6 +99,10 @@ __all__ = [
     "EmitterProfile", "EMITTER_CATALOG", "emitter_from_dict",
     # compound optics (element types accessed via camera_designer.compound_optics)
     "CompoundLens", "LensHood",
+    "RayBundle", "BundleTraceResult", "RayTraceResult",
+    "OpticalFace", "FaceVignettingProfile", "BoundaryTeleportProfile",
+    "AssemblyFieldProfile",
+    "FaceAngularLimit", "AssemblyAngularLimits",
     "PLENS_MAGIC", "PLENS_HEADER", "PLENS_SURF_STRIDE",
     # bake
     "BakeWorker", "trace_ray", "trace_ray_backward", "ManifoldEndpoint",

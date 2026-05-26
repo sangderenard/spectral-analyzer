@@ -1306,6 +1306,30 @@ SK_API int ray_tracer_bidirectional_packed(
     int*            out_count);
 
 /**
+ * BDPT connection step.
+ *
+ * For every backward (sensor-side) EndpointRecord and a random sample of
+ * forward (light-side) EndpointRecords in the same spectral band, cast a
+ * shadow ray between the two scene-side vertices.  Unoccluded pairs contribute
+ *   |b.amp| * |f.amp| / dist²
+ * to the pixel addressed by b.subpath_id.
+ *
+ * out_rgb must be pre-zeroed by the caller; size = n_px * n_py * 3 floats.
+ * max_fwd_samples == 0 tests all forward records (potentially very slow).
+ */
+SK_API int ray_tracer_bdpt_connect(
+    const RayTracerState* st,
+    const EndpointRecord* records,
+    int                   n_records,
+    int                   n_px,
+    int                   n_py,
+    int                   sensor_gid,
+    int                   max_fwd_samples,
+    uint32_t              seed,
+    float*                out_rgb,
+    int                   n_rgb);
+
+/**
  * Deposit EndpointRecord amplitudes into the bound field-capture grid.
  *
  * This wires BDPT endpoint transport into volumetric field capture so sensor

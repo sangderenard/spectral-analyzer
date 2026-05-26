@@ -265,18 +265,18 @@ def make_color_uv_layers() -> np.ndarray:
 # ── Material registry ─────────────────────────────────────────────────────────
 
 ORBIT_MATS = [
-    "ruby_emit",     # emissive + enamel (thin-film iridescence)
-    "emerald_emit",  # emissive green
-    "sapphire_emit", # emissive blue
     "chrome",        # pure metallic
     "copper",        # warm metallic
     "gold",          # metallic + enamel
     "acrylic",       # semi-transparent dielectric
-    "color_mosaic",  # color UV texture (profile 0)
-    "emit_pattern",  # emit UV texture (profile 0)
-    "amber_lobe",    # profile 1: emissive forward cone
-    "jade_sss",      # profile 2: translucent SSS
-    "frosted_glass", # profile 3: frosted scatter
+    "color_mosaic",  # color UV texture
+    "jade_sss",      # translucent SSS
+    "frosted_glass", # frosted scatter
+    "chrome",        # repeat: metallic
+    "copper",        # repeat: warm metallic
+    "gold",          # repeat: metallic
+    "acrylic",       # repeat: dielectric
+    "jade_sss",      # repeat: SSS
 ]
 N_ORBIT = len(ORBIT_MATS)
 C_RASTER_MAX_LIGHTS = 100
@@ -594,8 +594,11 @@ def perspective(fov_y_deg: float, aspect: float, near: float, far: float) -> np.
 def saddle_mesh(mat_id: int, n: int = 28) -> tuple[np.ndarray, np.ndarray]:
     lin = np.linspace(-3.2, 3.2, n, dtype=np.float32)
     xs, zs = np.meshgrid(lin, lin, indexing="xy")
-    ys = -0.75 - (xs * xs - zs * zs) / 5.2
-    grid = np.stack([xs, zs - 0.75, -ys - 6.65], axis=-1).astype(np.float32)
+    # Paraboloid: center closest to camera, rim curves away → concave face toward camera.
+    # Using (xs²+zs²) so all edges recede equally (bowl shape, not saddle).
+    ys = -0.75 + (xs * xs + zs * zs) / 5.2
+    # Remove the -0.75 Y-offset so the dish is centered on the middle orb.
+    grid = np.stack([xs, zs, -ys - 6.65], axis=-1).astype(np.float32)
     tris = []
     for i in range(n - 1):
         for j in range(n - 1):

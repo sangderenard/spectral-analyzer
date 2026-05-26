@@ -1250,7 +1250,8 @@ static inline bool apply_parametric_lens_from_f32(
     const RayTracerState& st,
     const float* p, int payload_bytes,
     V3d& pos, V3d& dir, VXcd& amp,
-    double* path_len);
+    double* path_len,
+    bool is_backward = false);
 
 static inline void apply_manifold_transfer_from_payload(
     const RayTracerState& st,
@@ -1771,6 +1772,7 @@ struct BounceStepResult {
     bool     should_continue;
     bool     is_sensor_hit;
     bool     is_emissive_hit;
+    bool     was_teleported;   /* true when a parametric lens teleport handled this hit */
     int      sensor_group_id;
     /* BSSRDF analytical contribution (backward path at diffuse-transmissive surface).
      * When has_illum_contrib=true, illum_contrib carries the per-band complex
@@ -5763,6 +5765,7 @@ static BounceStepResult ray_bounce_step_bdpt(
     res.should_continue   = false;
     res.is_sensor_hit     = false;
     res.is_emissive_hit   = false;
+    res.was_teleported    = false;
     res.sensor_group_id   = -1;
     res.has_illum_contrib = false;
 
@@ -5834,7 +5837,7 @@ static BounceStepResult ray_bounce_step_bdpt(
             pos = res.hit_pos;
             bool absorbed = false;
             if (magic == 14949.0f) {
-                absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, pos, dir, amp, &path_len);
+                absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, pos, dir, amp, &path_len, is_backward);
             } else if (magic == 14948.0f) {
                 apply_neural_mlp_from_f32(st, mpp, nb_mfld, pos, dir, amp, &path_len);
             } else if (magic == 14946.0f || magic == 14947.0f ||
@@ -5861,6 +5864,7 @@ static BounceStepResult ray_bounce_step_bdpt(
             }
             res.hit_pos         = pos;
             res.should_continue = true;
+            res.was_teleported  = true;
             return res;
         }
     }
@@ -6204,17 +6208,25 @@ static int ray_tracer_bidirectional_impl(
                     0,
                     amp);
                 
-                /* ─ Forward-path-specific: sensor endpoint recording ─ */
-                if (step.is_sensor_hit) {
+                /* ─ Forward-path-specific: endpoint recording ─ */
+                {
                     V3d hit_n = st->tris[step.hit_tri].normal;
                     double cos_theta = std::abs(dir.dot(hit_n));
+                    /* Sensor plate hits: full endpoint with sensor group_id so
+                     * the reducer can project them to pixels.
+                     * All other scene hits: record with group_id=-1 so the
+                     * reducer ignores them, but the correlator can project them
+                     * backward through the aperture to find fwd-half pairings. */
+                    const int32_t rec_gid = step.is_sensor_hit
+                        ? static_cast<int32_t>(step.sensor_group_id)
+                        : int32_t(-1);
                     for (int b = 0; b < n_bands; ++b) {
                         if (rec_count >= out_cap) goto bdpt_done;
                         EndpointRecord& E = out_records[rec_count++];
                         E.subpath_id   = my_subpath;
                         E.band_id      = static_cast<uint32_t>(b);
-                        E.group_id     = step.sensor_group_id;
-                        E.vertex_index = -1;
+                        E.group_id     = rec_gid;
+                        E.vertex_index = static_cast<int32_t>(bounce);
                         E.pos[0] = (float)step.hit_pos.x();
                         E.pos[1] = (float)step.hit_pos.y();
                         E.pos[2] = (float)step.hit_pos.z();
@@ -6229,9 +6241,140 @@ static int ray_tracer_bidirectional_impl(
                         E.stream_id = (float)BDPT_SIDE_LIGHT;
                     }
                 }
-                
+
                 /* ─ Check if ray should continue bouncing ─ */
                 if (!step.should_continue) break;
+            }
+        }
+    }
+
+    /* ── Backward pixel-cone pass ─────────────────────────────────────────────
+     * For each SENSOR group that carries a CameraSensorDesc, launch one
+     * backward ray per (pixel, aperture-sample).  Rays trace from the sensor
+     * plane through the aperture into the scene; when a backward ray reaches
+     * an emissive surface the contribution is deposited as an EndpointRecord
+     * keyed to the originating pixel:
+     *   subpath_id  = py * n_px + px
+     *   vertex_index = 0   (non-negative → PIXEL_CONE path, not a forward hit)
+     *   group_id    = sensor group id  (so the reducer keeps it)
+     *   stream_id   = BDPT_SIDE_SENSOR
+     * The reducer in reduce_endpoint_records_to_rgb_image routes these records
+     * straight to pixels without any position-projection step.              */
+    for (size_t g = 0; g < st->tri_groups.size(); ++g) {
+        const TriGroupDesc& sgd = st->tri_groups[g];
+        if (!(sgd.role_bits & TRI_GROUP_ROLE_SENSOR)) continue;
+        if (g >= st->tri_group_has_camera.size() || !st->tri_group_has_camera[g]) continue;
+
+        const CameraSensorDesc& cam = st->tri_group_camera[g];
+        const int n_px = cam.n_px;
+        const int n_py = cam.n_py;
+        const int n_ap = std::max(1, cam.n_aperture_samples);
+        if (n_px <= 0 || n_py <= 0) continue;
+        if (cam.sensor_w_m <= 0.0 || cam.sensor_h_m <= 0.0) continue;
+
+        /* Build orthonormal camera basis */
+        V3d cpos(cam.pos[0], cam.pos[1], cam.pos[2]);
+        V3d cfwd(cam.fwd[0], cam.fwd[1], cam.fwd[2]);
+        V3d cup (cam.up[0],  cam.up[1],  cam.up[2]);
+        if (cfwd.norm() < 1.0e-12 || cup.norm() < 1.0e-12) continue;
+        cfwd.normalize();
+        cup.normalize();
+        V3d cright = cfwd.cross(cup).normalized();
+        cup = cright.cross(cfwd).normalized();
+
+        /* Aperture disk centre and radius */
+        const double ap_r  = cam.aperture_radius_m;
+        const V3d    ap_cen = cpos + cam.focal_m * cfwd;
+
+        const double pix_w = cam.sensor_w_m / n_px;
+        const double pix_h = cam.sensor_h_m / n_py;
+        const V3d sensor_origin = cpos
+            - 0.5 * cam.sensor_w_m * cright
+            - 0.5 * cam.sensor_h_m * cup;
+
+        for (int bpy = 0; bpy < n_py; ++bpy) {
+            for (int bpx = 0; bpx < n_px; ++bpx) {
+                const V3d pix_center = sensor_origin
+                    + (bpx + 0.5) * pix_w * cright
+                    + (bpy + 0.5) * pix_h * cup;
+                const uint32_t pix_id = static_cast<uint32_t>(bpy * n_px + bpx);
+
+                for (int ap = 0; ap < n_ap; ++ap) {
+                    /* Uniform disk sample for aperture point */
+                    const double r2 = U(rng);
+                    const double th = 2.0 * M_PI * U(rng);
+                    const double r  = (ap_r > 0.0) ? std::sqrt(r2) * ap_r : 0.0;
+                    const V3d ap_pt = ap_cen
+                        + r * std::cos(th) * cright
+                        + r * std::sin(th) * cup;
+
+                    V3d bdir = ap_pt - pix_center;
+                    const double blen = bdir.norm();
+                    if (blen < 1.0e-12) continue;
+                    bdir /= blen;
+
+                    const int ray_band = (n_bands > 0)
+                        ? static_cast<int>(subpath_counter % static_cast<uint32_t>(n_bands))
+                        : 0;
+                    for (int b = 0; b < n_bands; ++b)
+                        amp[b] = (b == ray_band) ? cd(1.0, 0.0) : cd(0.0, 0.0);
+
+                    V3d bpos = pix_center + bdir * (EPS * 200.0);
+                    double bpath_len = 0.0;
+                    uint32_t bflags = 0u;
+                    int bmedium = -1;
+                    subpath_counter++;
+
+                    for (int bounce = 0; bounce < max_bounces; ++bounce) {
+                        BounceStepResult step = ray_bounce_step_bdpt(
+                            *st, tri_sensor_group.data(),
+                            bpos, bdir, amp, bpath_len,
+                            bmedium, bflags,
+                            n_bands, min_amplitude, rng,
+                            nullptr, true);  /* is_backward=true */
+
+                        if (step.hit_tri < 0) break;
+
+                        /* Parametric lens teleport: ray has been redirected to the
+                         * scene side.  Continue bouncing — the next hit is the
+                         * genuine scene vertex we want as the backward endpoint. */
+                        if (step.was_teleported) {
+                            bpos = step.hit_pos;
+                            if (!step.should_continue) break;
+                            continue;
+                        }
+
+                        /* Record first real scene-side hit as backward endpoint.
+                         * Skip hits on the sensor itself (ray leaving the sensor). */
+                        if (!step.is_sensor_hit) {
+                            const V3d hit_n = st->tris[step.hit_tri].normal;
+                            const double cos_theta = std::abs(bdir.dot(hit_n));
+                            for (int b = 0; b < n_bands; ++b) {
+                                if (rec_count >= out_cap) goto bdpt_done;
+                                EndpointRecord& E = out_records[rec_count++];
+                                E.subpath_id   = pix_id;
+                                E.band_id      = static_cast<uint32_t>(b);
+                                E.group_id     = static_cast<int32_t>(g);
+                                E.vertex_index = 0;
+                                E.pos[0]       = (float)step.hit_pos.x();
+                                E.pos[1]       = (float)step.hit_pos.y();
+                                E.pos[2]       = (float)step.hit_pos.z();
+                                E.pathlen_m    = (float)bpath_len;
+                                E.dir[0]       = (float)bdir.x();
+                                E.dir[1]       = (float)bdir.y();
+                                E.dir[2]       = (float)bdir.z();
+                                E.pdf          = 1.0f / static_cast<float>(n_ap);
+                                E.amp_re       = (float)amp[b].real();
+                                E.amp_im       = (float)amp[b].imag();
+                                E.cos_theta    = (float)cos_theta;
+                                E.stream_id    = (float)BDPT_SIDE_SENSOR;
+                            }
+                            break;  /* one scene-side endpoint per backward subpath */
+                        }
+
+                        if (!step.should_continue) break;
+                    }
+                }
             }
         }
     }
@@ -6294,6 +6437,141 @@ extern "C" SK_API int ray_tracer_bidirectional_packed(
         out_records,
         out_cap,
         out_count);
+}
+
+/* ── BDPT connection step ────────────────────────────────────────────────────
+ * For every backward (sensor) vertex b and every sampled forward (light)
+ * vertex f in the same spectral band, cast a shadow ray.  If the segment
+ * b.pos → f.pos is unoccluded, the contribution
+ *   |b.amp| * |f.amp| / dist²
+ * is deposited into the pixel encoded in b.subpath_id.
+ * max_fwd_samples caps the number of forward vertices tested per backward
+ * vertex; set to 0 to use all forward vertices.                            */
+extern "C" SK_API int ray_tracer_bdpt_connect(
+    const RayTracerState* st,
+    const EndpointRecord* records,
+    int                   n_records,
+    int                   n_px,
+    int                   n_py,
+    int                   sensor_gid,
+    int                   max_fwd_samples,
+    uint32_t              seed,
+    float*                out_rgb,   /* n_px * n_py * 3, pre-zeroed by caller */
+    int                   n_rgb)
+{
+    if (!st || !records || !out_rgb) return SK_ERR_NULL_STATE;
+    if (n_px <= 0 || n_py <= 0)     return SK_ERR_DIM_MISMATCH;
+
+    const int n_pixels = n_px * n_py;
+    const int n_bands  = std::max(1, st->n_bands);
+
+    /* Separate fwd / bwd by stream_id. */
+    std::vector<const EndpointRecord*> fwd_recs, bwd_recs;
+    fwd_recs.reserve(static_cast<size_t>(n_records));
+    bwd_recs.reserve(static_cast<size_t>(n_records));
+    for (int i = 0; i < n_records; ++i) {
+        const EndpointRecord& E = records[i];
+        if (E.stream_id < 0.5f) fwd_recs.push_back(&E);
+        else                    bwd_recs.push_back(&E);
+    }
+    if (fwd_recs.empty() || bwd_recs.empty()) return SK_OK;
+
+    /* Band-bucket the forward records. */
+    std::vector<std::vector<const EndpointRecord*>> fwd_by_band(
+        static_cast<size_t>(n_bands));
+    for (const EndpointRecord* f : fwd_recs) {
+        const int b = static_cast<int>(f->band_id);
+        if (b >= 0 && b < n_bands) fwd_by_band[b].push_back(f);
+    }
+
+    /* Wavelength → RGB using CIE-approximate spectral locus. */
+    auto band_to_rgb = [&](int b, double& wr, double& wg, double& wb) {
+        if (n_bands == 1 || b < 0 || b >= n_bands) { wr = wg = wb = 1.0; return; }
+        double wl_nm = 550.0;
+        if (b < (int)st->freq_hz_vec.size() && st->freq_hz_vec[b] > 0.0) {
+            constexpr double C = 299792458.0;
+            wl_nm = std::max(380.0, std::min(700.0, (C / st->freq_hz_vec[b]) * 1.0e9));
+        } else {
+            double t = static_cast<double>(b) / static_cast<double>(n_bands - 1);
+            wl_nm = 380.0 + t * 320.0;
+        }
+        wr = wg = wb = 0.0;
+        if      (wl_nm < 440.0) { wr = -(wl_nm-440.0)/60.0; wb = 1.0; }
+        else if (wl_nm < 490.0) { wg =  (wl_nm-440.0)/50.0; wb = 1.0; }
+        else if (wl_nm < 510.0) { wg = 1.0; wb = -(wl_nm-510.0)/20.0; }
+        else if (wl_nm < 580.0) { wr =  (wl_nm-510.0)/70.0; wg = 1.0; }
+        else if (wl_nm < 645.0) { wr = 1.0; wg = -(wl_nm-645.0)/65.0; }
+        else                    { wr = 1.0; }
+        double edge = 1.0;
+        if      (wl_nm < 420.0) edge = 0.3 + 0.7*(wl_nm-380.0)/40.0;
+        else if (wl_nm > 645.0) edge = 0.3 + 0.7*(700.0-wl_nm)/55.0;
+        wr *= edge; wg *= edge; wb *= edge;
+    };
+
+    std::mt19937 rng(seed ^ 0xBD97u);
+    std::vector<double> accum(static_cast<size_t>(n_pixels) * 3u, 0.0);
+
+    for (const EndpointRecord* bptr : bwd_recs) {
+        const int pid = static_cast<int>(bptr->subpath_id);
+        if (pid < 0 || pid >= n_pixels) continue;
+
+        const int band = static_cast<int>(bptr->band_id);
+        if (band < 0 || band >= n_bands) continue;
+
+        const V3d b_pos(bptr->pos[0], bptr->pos[1], bptr->pos[2]);
+        const double b_amp = static_cast<double>(std::hypot(bptr->amp_re, bptr->amp_im));
+
+        /* Use the same-band forward pool — the backward ray already sampled
+         * this wavelength; match spectrally for coherent transport. */
+        const auto& fpool = fwd_by_band[band];
+        const int n_f = static_cast<int>(fpool.size());
+        if (n_f == 0) continue;
+
+        const bool do_sample = (max_fwd_samples > 0 && max_fwd_samples < n_f);
+        const int  n_test    = do_sample ? max_fwd_samples : n_f;
+        const double inv_n   = 1.0 / static_cast<double>(n_test);
+
+        double wr, wg, wb;
+        band_to_rgb(band, wr, wg, wb);
+
+        const size_t base = static_cast<size_t>(pid) * 3u;
+
+        for (int si = 0; si < n_test; ++si) {
+            int fi = do_sample
+                ? static_cast<int>(rng() % static_cast<uint32_t>(n_f))
+                : si;
+            const EndpointRecord* fptr = fpool[fi];
+
+            const V3d f_pos(fptr->pos[0], fptr->pos[1], fptr->pos[2]);
+            V3d seg = f_pos - b_pos;
+            double dist = seg.norm();
+            if (dist < EPS * 200.0) continue;
+            V3d seg_dir = seg / dist;
+
+            V3d orig   = b_pos + seg_dir * (EPS * 400.0);
+            double t_c = dist - EPS * 800.0;
+            if (t_c <= 0.0) continue;
+            double t_hit = t_c;
+            int hit_tri  = -1;
+            segment_first_hit(*st, orig, seg_dir, t_c, t_hit, hit_tri);
+            if (hit_tri >= 0) continue;
+
+            const double f_amp = static_cast<double>(std::hypot(fptr->amp_re, fptr->amp_im));
+            const double w = b_amp * f_amp * inv_n / (dist * dist + 1.0e-6);
+
+            accum[base + 0] += w * wr;
+            accum[base + 1] += w * wg;
+            accum[base + 2] += w * wb;
+        }
+    }
+
+    double peak = 0.0;
+    for (double v : accum) peak = std::max(peak, v);
+    if (peak > 0.0) {
+        for (int i = 0; i < n_pixels * 3; ++i)
+            out_rgb[i] = static_cast<float>(accum[i] / peak);
+    }
+    return SK_OK;
 }
 
 extern "C" SK_API int ray_tracer_accumulate_endpoint_records_to_field_capture(
@@ -6785,7 +7063,8 @@ static inline bool apply_parametric_lens_from_f32(
     const RayTracerState& st,
     const float* p, int payload_bytes,
     V3d& pos, V3d& dir, VXcd& amp,
-    double* path_len)
+    double* path_len,
+    bool is_backward)
 {
     if (!p) return true;
     if (payload_bytes < (int)(8 * sizeof(float))) return true;
@@ -6798,8 +7077,8 @@ static inline bool apply_parametric_lens_from_f32(
     if (n_surf < 1 || n_surf > 64) return true;
     if (payload_bytes < (int)((8 + n_surf * 8) * sizeof(float))) return true;
 
-    /* Lens hood: if opening radius is set, check if ray enters outside it. */
-    if (hood_r > 0.0f && std::abs(dir[0]) > 1e-12) {
+    /* Lens hood check (only for forward direction). */
+    if (!is_backward && hood_r > 0.0f && std::abs(dir[0]) > 1e-12) {
         const double t_hood = (double(hood_xf) - pos[0]) / dir[0];
         if (t_hood < 0.0) {
             const V3d p_hood = pos + t_hood * dir;
@@ -6812,28 +7091,36 @@ static inline bool apply_parametric_lens_from_f32(
     V3d    rp  = pos;
     V3d    rd  = dir;
 
-    for (int s = 0; s < n_surf; ++s) {
-        const int    sb    = 8 + s * 8;   /* PLENS_HEADER + s * PLENS_SURF_STRIDE */
+    /* Backward rays traverse surfaces in reverse order with swapped
+     * refractive indices (sensor side → scene side). */
+    for (int si = 0; si < n_surf; ++si) {
+        const int s = is_backward ? (n_surf - 1 - si) : si;
+        const int    sb    = 8 + s * 8;
         const double x_v   = (double)p[sb + 0];
         const double R     = (double)p[sb + 1];
-        const double n_bf  = (double)p[sb + 2];
-        const double n_af  = (double)p[sb + 3];
+        /* Forward: ray travels from n_bf into n_af.
+         * Backward: ray travels from n_af into n_bf at this surface. */
+        const double n_bf  = is_backward ? (double)p[sb + 3] : (double)p[sb + 2];
+        const double n_af  = is_backward ? (double)p[sb + 2] : (double)p[sb + 3];
         const double ap_r  = (double)p[sb + 4];
         const double k     = (double)p[sb + 5];
         const bool is_stop = ((int)p[sb + 6] & 1) != 0;
 
         /* Seek to exact parametric surface.
          *
-         * s=0: entry seek from T1 BVH hit position.  The proxy mesh that fired
-         * T1 is geometrically close to the parametric surface but not identical.
-         * Allow t ∈ [-0.01, +∞) so the ray can roll back up to 1 cm to reach
-         * the exact conic vertex — this corrects for proxy-mesh overshoot without
-         * letting a ray that missed entirely sneak in.
+         * si=0 (first iteration): entry seek from T1 BVH hit position.
+         * The proxy mesh that fired T1 is geometrically close to the parametric
+         * surface but not identical.  Allow t ∈ [-0.01, +∞) so the ray can
+         * roll back up to 1 cm to reach the exact conic vertex — this corrects
+         * for proxy-mesh overshoot without letting a ray that missed entirely
+         * sneak in.  For backward rays si=0 maps to s=n_surf-1 (sensor-side
+         * surface), so the si-index (not the physical surface index s) must
+         * gate this relaxed t_min and the root-selection branch.
          *
-         * s>0: the previous Snell step left rp just in front of the next surface;
-         * t must be strictly forward (> 2e-7 m). */
+         * si>0: the previous Snell step left rp just in front of the next
+         * surface; t must be strictly forward (> 2e-7 m). */
         {
-            const double t_min = (s == 0) ? -1e-2 : 2e-7;
+            const double t_min = (si == 0) ? -1e-2 : 2e-7;
             double t = 1e30;
             if (std::abs(R) < 1e-12) {
                 if (std::abs(rd[0]) < 1e-12) return true;
@@ -6855,7 +7142,7 @@ static inline bool apply_parametric_lens_from_f32(
                     const double sq   = std::sqrt(disc);
                     const double t1   = (-B - sq) / (2.0 * A);
                     const double t2   = (-B + sq) / (2.0 * A);
-                    if (s == 0) {
+                    if (si == 0) {
                         /* Pick the root with smallest |t| that is >= t_min. */
                         const bool v1 = t1 >= t_min, v2 = t2 >= t_min;
                         if (v1 && v2)      t = (std::abs(t1) <= std::abs(t2)) ? t1 : t2;

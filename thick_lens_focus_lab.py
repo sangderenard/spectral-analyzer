@@ -24,6 +24,8 @@ from camera_designer.compound_optics import (
     ApertureStop as CompoundApertureStop,
     CompoundLens,
     ConicSurface as CompoundConicSurface,
+    RayBundle,
+    TerminationReason,
 )
 from camera_designer.lens_assembly import LensAssemblySpec
 
@@ -1001,9 +1003,9 @@ def _default_optical_design_spec():
     return OpticalDesignSpec(
         focal_length_range_m=(0.045, 0.070),
         zoom=0.40,
-        focus_distance_m=0.35,
+        focus_distance_m=1.0,
         f_number=2.8,
-        entrance_x_m=0.43,
+        entrance_x_m=1.08,
         sensor_x_m=1.25,
         sensor_clearance_m=0.025,
         image_radius_m=0.045,
@@ -1078,6 +1080,13 @@ class SceneConfig:
     # Set to an IrisApertureConfig (or use iris_from_camera_preset()) to register
     # blade-polygon geometry as the BLOCKER aperture stop for BDPT pixel-cone tests.
     iris_aperture: Optional[IrisApertureConfig] = None
+    # Ring light: emissive annular ring mounted flush with the front of the lens barrel.
+    # The forward-facing face is emissive (ring_light_emission); the rear face is black
+    # matte so light only exits toward the subject.
+    ring_light_enabled: bool = True
+    ring_light_width_m: float = 0.018      # radial width of the emitting annulus (m)
+    ring_light_emission: float = 50.0      # emission scale (relative to source material)
+    ring_light_n_sectors: int = 72         # angular tessellation segments
     # Exit pupil / field stop aperture between last lens and sensor. When enabled
     # this limits light transmission post-optics, letting you tune spectral content
     # and transmission efficiency independently of the entrance aperture.
@@ -1348,6 +1357,215 @@ def _compound_lens_from_scene(scene: SceneConfig) -> CompoundLens:
     return lens
 
 
+def _compound_lens_from_stack(lens_stack, iris_aperture=None) -> CompoundLens:
+    """Build CompoundLens directly from a lens stack without calling _scene_lenses().
+
+    Used for live element adjustment so apply_to_scene() is never triggered.
+    """
+    lens = CompoundLens()
+    elements = []
+    n_air = 1.0
+    for cfg in lens_stack:
+        if not _lens_is_valid(cfg):
+            continue
+        n_glass = float(max(1.0, cfg.ior))
+        elements.append((float(cfg.x_front), CompoundConicSurface(
+            x_pos=float(cfg.x_front),
+            R_curvature=float(cfg.radius_front),
+            n_before=n_air, n_after=n_glass,
+            aperture_r=float(cfg.aperture_radius), conic_k=0.0,
+        )))
+        elements.append((float(cfg.x_back), CompoundConicSurface(
+            x_pos=float(cfg.x_back),
+            R_curvature=-float(cfg.radius_back),
+            n_before=n_glass, n_after=n_air,
+            aperture_r=float(cfg.aperture_radius), conic_k=0.0,
+        )))
+    if iris_aperture is not None and bool(getattr(iris_aperture, "enabled", False)):
+        elements.append((float(iris_aperture.x_pos), CompoundApertureStop(
+            x_pos=float(iris_aperture.x_pos),
+            r_clear=float(iris_aperture.r_inner),
+            n_medium=n_air,
+        )))
+    for _x, element in sorted(elements, key=lambda item: item[0]):
+        lens.add(element)
+    return lens
+
+
+def _paraxial_image_x(compound_lens: "CompoundLens", object_x: float) -> float:
+    """Paraxial image x for an on-axis point at *object_x*.
+
+    Uses the CompoundLens system matrix.  A marginal ray at h=0 is propagated
+    from the object plane to the first refractive surface, then through the
+    full system, then in air until it crosses the axis.
+
+    Returns float('inf') when the system is afocal or divergent for this object.
+    """
+    elements = getattr(compound_lens, "_elements", [])
+    x_first = None
+    x_last  = None
+    for el in elements:
+        if isinstance(el, (CompoundConicSurface, )):
+            if x_first is None:
+                x_first = float(el.x_pos)
+            x_last = float(el.x_pos)
+    if x_first is None or x_last is None:
+        return float("inf")
+
+    d = max(0.0, x_first - float(object_x))  # object-to-first-surface propagation
+    M = compound_lens._paraxial_matrix()      # system matrix first→last surface
+
+    # Propagate from object to first surface: state [h=0, nu=1] → [d, 1]
+    # Then through system: M @ [d, 1]
+    A, B = float(M[0, 0]), float(M[0, 1])
+    C, D = float(M[1, 0]), float(M[1, 1])
+    Bt = A * d + B
+    Dt = C * d + D
+
+    # Image distance from last surface: v = −Bt/Dt
+    if abs(Dt) < 1.0e-12:
+        return float("inf")
+    v = -Bt / Dt
+    return float(x_last + v)
+
+
+def _solver_focal_plane_x(scene) -> float:
+    """Focal plane from the optical design solver's thin-lens group model.
+
+    Uses exactly the same computation the solver used when placing the sensor, so
+    the result is within sensor_error (~0.02mm) of scene.image_plate.x.
+    Falls back to float('inf') when the solved design is unavailable.
+    """
+    design = getattr(scene, "optical_design", None)
+    if design is None:
+        return float("inf")
+    groups = getattr(design, "groups", None)
+    if not groups:
+        return float("inf")
+    try:
+        from camera_software.optical_design import image_distance_for_object as _img_dist_fn
+        obj_x  = float(scene.object_plane.x)
+        img_d  = _img_dist_fn(groups, obj_x)
+        if not math.isfinite(img_d):
+            return float("inf")
+        last_x = float(max(g.x_m for g in groups))
+        return float(last_x + img_d)
+    except Exception:
+        return float("inf")
+
+
+def _probe_focus_coc(
+    compound_lens: "CompoundLens",
+    object_x: float,
+    sensor_x: float,
+    aperture_r: float,
+    *,
+    n_rings: int = 4,
+    n_phi: int = 12,
+    n_sweep: int = 32,
+    sweep_half_range: float = 0.015,
+) -> dict:
+    """Trace a polar fan of rays to measure the circle of confusion at the sensor
+    and locate the minimum-spot-size plane (true ray-traced focus).
+
+    Python-side exact algebraic trace via CompoundLens.evaluate_bundle() — no GPU,
+    runs in ~1 ms for the default 49-ray fan.
+
+    Returns a dict:
+        coc_at_sensor_mm : RMS transverse spot radius (mm) at sensor_x
+        min_coc_x        : X position (m) of the tightest spot
+        min_coc_mm       : tightest RMS spot radius (mm)
+        n_passed         : rays that cleared the assembly
+    """
+    # Aim rays at the first conic surface (entrance of the lens)
+    elements = getattr(compound_lens, "_elements", [])
+    x_first = None
+    for el in elements:
+        if isinstance(el, CompoundConicSurface):
+            x_first = float(el.x_pos)
+            break
+    if x_first is None:
+        x_first = float(sensor_x) - 0.050
+
+    obj_x  = float(object_x)
+    snsr_x = float(sensor_x)
+    ap_r   = float(aperture_r)
+
+    origins_list: list = []
+    dirs_list:    list = []
+    for ir in range(n_rings):
+        r   = ap_r * (ir + 1) / n_rings
+        n_a = n_phi if ir > 0 else 1
+        for ia in range(n_a):
+            phi = 2.0 * math.pi * ia / n_a
+            hy  = r * math.cos(phi)
+            hz  = r * math.sin(phi)
+            origins_list.append([obj_x, 0.0, 0.0])
+            d = np.array([x_first - obj_x, hy, hz], dtype=np.float64)
+            d /= max(1.0e-15, float(np.linalg.norm(d)))
+            dirs_list.append(d.tolist())
+
+    bundle = RayBundle(
+        np.array(origins_list, dtype=np.float64),
+        np.array(dirs_list,    dtype=np.float64),
+    )
+    result      = compound_lens.evaluate_bundle(bundle)
+    passed_mask = result.status == int(TerminationReason.PASSED.value)
+    n_passed    = int(np.sum(passed_mask))
+    _nan        = float("nan")
+    if n_passed < 2:
+        return {"coc_at_sensor_mm": _nan, "min_coc_x": _nan, "min_coc_mm": _nan, "n_passed": n_passed}
+
+    out_o = result.origins[passed_mask]     # (n_passed, 3) exit position at last surface
+    out_d = result.directions[passed_mask]  # (n_passed, 3) exit direction
+
+    def _rms_spot_at(x_plane: float) -> float:
+        fwd  = out_d[:, 0] > 1.0e-10
+        if np.sum(fwd) < 2:
+            return _nan
+        oo = out_o[fwd];  od = out_d[fwd]
+        t  = (x_plane - oo[:, 0]) / od[:, 0]
+        ok = t >= 0.0
+        if np.sum(ok) < 2:
+            return _nan
+        oo = oo[ok];  od = od[ok];  t = t[ok]
+        hy = oo[:, 1] + t * od[:, 1]
+        hz = oo[:, 2] + t * od[:, 2]
+        return float(np.sqrt(np.mean(hy * hy + hz * hz)))
+
+    coc_sensor = _rms_spot_at(snsr_x)
+
+    # Sweep around the paraxial estimate to find minimum CoC
+    try:
+        px = _paraxial_image_x(compound_lens, obj_x)
+    except Exception:
+        px = snsr_x
+    if not math.isfinite(px):
+        px = snsr_x
+
+    x_sweep  = np.linspace(px - sweep_half_range, px + sweep_half_range, n_sweep)
+    coc_vals = np.array([_rms_spot_at(float(x)) for x in x_sweep])
+    valid    = np.isfinite(coc_vals)
+    if not np.any(valid):
+        return {
+            "coc_at_sensor_mm": coc_sensor * 1000.0 if math.isfinite(coc_sensor) else _nan,
+            "min_coc_x": px,
+            "min_coc_mm": _nan,
+            "n_passed": n_passed,
+        }
+
+    best_i  = int(np.argmin(coc_vals[valid]))
+    min_x   = float(x_sweep[valid][best_i])
+    min_coc = float(coc_vals[valid][best_i])
+
+    return {
+        "coc_at_sensor_mm": coc_sensor * 1000.0 if math.isfinite(coc_sensor) else _nan,
+        "min_coc_x": min_x,
+        "min_coc_mm": min_coc * 1000.0,
+        "n_passed": n_passed,
+    }
+
+
 def _import_subject_scene(
     scene: SceneConfig,
     db: MaterialDatabase,
@@ -1407,7 +1625,9 @@ def _import_subject_scene(
         # remain transverse subject coordinates.
         p[:, 0] = subject_x + (tri[:, 2] - center[2]) * depth_scale
         p[:, 1] = subject_y + (tri[:, 1] - center[1]) * scale
-        p[:, 2] = subject_z + (tri[:, 0] - center[0]) * scale
+        # Negate X→Z so original-camera-right (+X) maps to thick-lens-camera-right (−Z).
+        # Without the negation, orbiters render behind the centre globe in the side view.
+        p[:, 2] = subject_z - (tri[:, 0] - center[0]) * scale
         old_mat = int(mat_per_tri[i]) if i < mat_per_tri.size else -1
         mat_idx = old_to_new.get(old_mat, 0)
         tri_id = len(tris)
@@ -2386,6 +2606,45 @@ def _build_lens_mesh(
         _append_tri(tri_list, mat_ids, f0, b1, f1, mat_idx)
 
 
+def _build_ring_light(
+    x_pos: float,
+    r_inner: float,
+    r_outer: float,
+    n_sectors: int,
+    tri_list: List[np.ndarray],
+    mat_ids: List[int],
+    mat_emissive: int,
+    mat_back: int,
+    source_tri_ids: List[int],
+) -> None:
+    """Flat annular ring light flush with the front of the lens barrel.
+
+    Scene-facing side (-X normal, toward subject) is emissive and registered as a
+    light source.  Camera-body side (+X normal) is black matte — no light exits
+    toward the sensor.  Camera looks in -X so the scene is at smaller X values.
+    """
+    n = max(6, int(n_sectors))
+    for i in range(n):
+        a0 = 2.0 * math.pi * i       / n
+        a1 = 2.0 * math.pi * (i + 1) / n
+        ca0, sa0 = math.cos(a0), math.sin(a0)
+        ca1, sa1 = math.cos(a1), math.sin(a1)
+        # Four corners of the quad (in YZ plane at x_pos)
+        p_i0 = np.array([x_pos, r_inner * ca0, r_inner * sa0], dtype=np.float64)
+        p_i1 = np.array([x_pos, r_inner * ca1, r_inner * sa1], dtype=np.float64)
+        p_o0 = np.array([x_pos, r_outer * ca0, r_outer * sa0], dtype=np.float64)
+        p_o1 = np.array([x_pos, r_outer * ca1, r_outer * sa1], dtype=np.float64)
+        # Scene-facing side: -X normal (toward subject, camera looks in -X).
+        # Reversed winding so normal points in -X direction.
+        source_tri_ids.append(len(tri_list))
+        _append_tri(tri_list, mat_ids, p_i1, p_o0, p_i0, mat_emissive)
+        source_tri_ids.append(len(tri_list))
+        _append_tri(tri_list, mat_ids, p_i1, p_o1, p_o0, mat_emissive)
+        # Camera-body side: +X normal (black matte, no light exits toward sensor)
+        _append_tri(tri_list, mat_ids, p_i0, p_o0, p_i1, mat_back)
+        _append_tri(tri_list, mat_ids, p_o0, p_o1, p_i1, mat_back)
+
+
 def _build_scene_mesh(
     scene: SceneConfig,
     sidecar: FreeFrequencySidecar,
@@ -2481,6 +2740,35 @@ def _build_scene_mesh(
                 transmittance=0.0,
                 diffuse_frac=0.0,
                 emission_scale=float(scene.side_room_source_emission),
+                ior_real=1.0,
+                ior_imag=0.0,
+            ),
+        ),
+    )
+    idx_ring_light = db.register(
+        "ring_light_emitter",
+        Material(
+            name="ring_light_emitter",
+            domain="em_optical",
+            albedo=[1.0, 0.98, 0.94],
+            roughness=0.0,
+            metallic=0.0,
+            emission_rgb=[1.0, 0.98, 0.94],
+            ior=1.0,
+            transmission=0.0,
+            radiance=RadianceProfile(
+                luminance=8000.0,
+                cct_k=5600.0,
+                cri=98.0,
+                solid_angle_sr=math.pi,
+                distribution="lambertian",
+            ),
+            spectral_bands=_make_sidecar_spectral_bands(
+                sidecar,
+                reflectance=0.0,
+                transmittance=0.0,
+                diffuse_frac=0.0,
+                emission_scale=float(getattr(scene, "ring_light_emission", 8.0)),
                 ior_real=1.0,
                 ior_imag=0.0,
             ),
@@ -2717,6 +3005,7 @@ def _build_scene_mesh(
     _iris_active = _iris is not None and getattr(_iris, "enabled", False)
     if _iris_active:
         _build_iris_baffle(_iris, scene.tube_radius, tris, mats, idx_aperture_black, aperture_stop_tri_ids)
+
     if str(getattr(scene, "aperture_model", "geometry")).lower() == "wave3d":
         print(
             "[aperture-model] wave3d requested; geometric aperture mesh remains the boundary, "
@@ -2792,6 +3081,33 @@ def _build_scene_mesh(
                 idx_aperture_black,
                 tri_ids=black_wall_tri_ids,
             )
+            # ── Ring light: emissive annulus flush with the front face of the hood ──
+            if bool(getattr(scene, "ring_light_enabled", True)):
+                _rl_r_inner = hood_r0
+                _rl_r_outer = _rl_r_inner + float(getattr(scene, "ring_light_width_m", 0.018))
+                _rl_x = hood_x0
+                _rl_n = int(getattr(scene, "ring_light_n_sectors", 72))
+                _rl_before = len(tris)
+                _build_ring_light(
+                    x_pos=_rl_x,
+                    r_inner=_rl_r_inner,
+                    r_outer=_rl_r_outer,
+                    n_sectors=_rl_n,
+                    tri_list=tris,
+                    mat_ids=mats,
+                    mat_emissive=idx_ring_light,
+                    mat_back=idx_black,
+                    source_tri_ids=source_tri_ids,
+                )
+                print(
+                    "[ring-light]",
+                    f"x={_rl_x:.4f}",
+                    f"r_inner={_rl_r_inner*1e3:.1f}mm",
+                    f"r_outer={_rl_r_outer*1e3:.1f}mm",
+                    f"sectors={_rl_n}",
+                    f"emission_tris={len(tris)-_rl_before}",
+                    flush=True,
+                )
         # Lens housing sleeve: keeps the lens mechanically inset in a bore rather
         # than visually floating in open space.
         # Tighten the housing bore to last lens aperture to prevent rear light escape.
@@ -3227,6 +3543,7 @@ class ForwardCppLensBench:
 
     def __post_init__(self) -> None:
         self._trace_lock = threading.Lock()
+        self._mobile_lens_idx: int = 0
         self.bdpt_consecutive_no_survivor_frames = 0
         self.bdpt_debug_print_counter = 0
         self._bdpt_sensor_cfg: Tuple[int, int] | None = None
@@ -3901,7 +4218,7 @@ class ForwardCppLensBench:
                     "aperture_radius_m": float(stop_radius_m),
                     "n_px": int(n_px),
                     "n_py": int(n_px),
-                    "n_aperture_samples": int(max(1, n_aperture_samples)),
+                    "n_aperture_samples": int(max(self.n_bands, n_aperture_samples)),
                     "aperture_stop_group_id": int(aperture_stop_gid),
                     "effective_focal_m": float(max(1.0e-3, plate.x - lens_stack_center_x)),
                     "focus_distance_m": float(max(1.0e-3, lens_stack_center_x - self.scene.object_plane.x)),
@@ -4233,6 +4550,7 @@ class ForwardCppLensBench:
         gy  = gy.ravel()
         gz  = gz.ravel()
         in_disc = (gy ** 2 + gz ** 2) <= 1.0
+        disc_grid_indices = np.where(in_disc)[0]  # row*res+col for each disc pixel
         gy  = gy[in_disc] * float(plate.radius)
         gz  = gz[in_disc] * float(plate.radius)
         n_pixels = int(gy.shape[0])
@@ -4289,7 +4607,7 @@ class ForwardCppLensBench:
         d          = ap_pts - origins
         nrm        = np.linalg.norm(d, axis=1, keepdims=True)
         directions = d / np.maximum(nrm, 1e-30)
-        src_ids    = np.repeat(np.arange(n_pixels, dtype=np.int32), samples_per_pixel)
+        src_ids    = np.repeat(disc_grid_indices.astype(np.int32), samples_per_pixel)
         cflag_arr  = np.ones(total, dtype=np.uint8)   # 1 = sensor-cast / reverse
 
         if not self._sensor_aim_reported:
@@ -4530,6 +4848,13 @@ class ForwardCppLensBench:
         else:
             vm_gid = np.full(int(np.count_nonzero(vis_mask)), -1, dtype=np.int32)
 
+        # Extract hit triangle indices for forward-preview filtering.
+        raw_htri = records.get("hit_tri", None)
+        if raw_htri is not None:
+            vm_hit_tri = np.asarray(raw_htri)[vis_mask].astype(np.int32)
+        else:
+            vm_hit_tri = np.full(int(np.count_nonzero(vis_mask)), -1, dtype=np.int32)
+
         # For class-3 also count the ray origin (image-plate surface) as a hit.
         rev_strike_mask = (disp_class == 3)
         if np.any(rev_strike_mask):
@@ -4546,11 +4871,22 @@ class ForwardCppLensBench:
         def _records_to_preview(mask: np.ndarray, dst: np.ndarray) -> None:
             if not np.any(mask):
                 return
-            plate = self.scene.image_plate
-            pr = float(max(1.0e-9, plate.radius))
+            # Use scene view_radius for Y-Z extent: scene-side hits are spread
+            # over the full scene volume, not just the millimeter-scale sensor disc.
+            vr = float(max(1.0e-9, self.scene.view_radius))
             p = vm_pos[mask]
-            in_disc = (p[:, 1] * p[:, 1] + p[:, 2] * p[:, 2]) <= (pr * pr)
-            m_img = in_disc
+            in_view = (np.abs(p[:, 1]) <= vr) & (np.abs(p[:, 2]) <= vr)
+            # Exclude lens-glass and camera-optics hits: they dominate hit counts
+            # and obscure actual scene geometry in the forward preview.
+            htri_m = vm_hit_tri[mask]
+            tri_kind = getattr(self, "tri_kind", None)
+            if tri_kind is not None and htri_m.size > 0:
+                safe = np.clip(htri_m, 0, len(tri_kind) - 1)
+                kind_m = np.where(htri_m >= 0, tri_kind[safe], TRI_KIND_DEFAULT)
+                is_optic = (kind_m == TRI_KIND_LENS) | (kind_m == TRI_KIND_APERTURE) | (kind_m == TRI_KIND_SENSOR)
+                m_img = in_view & ~is_optic
+            else:
+                m_img = in_view
             if np.any(m_img):
                 p_img = p[m_img]
                 re_img = vm_re[mask][m_img]
@@ -4564,12 +4900,11 @@ class ForwardCppLensBench:
                 else:
                     rgb = np.repeat(amp_v[mask][m_img, None], 3, axis=1).astype(np.float32)
                 res = int(self._forward_img_res)
-                iy = np.clip(((p_img[:, 1] + pr) / (2.0 * pr) * res).astype(np.int32), 0, res - 1)
-                iz = np.clip(((p_img[:, 2] + pr) / (2.0 * pr) * res).astype(np.int32), 0, res - 1)
+                iy = np.clip(((p_img[:, 1] + vr) / (2.0 * vr) * res).astype(np.int32), 0, res - 1)
+                iz = np.clip(((p_img[:, 2] + vr) / (2.0 * vr) * res).astype(np.int32), 0, res - 1)
                 with self._segs_lock:
-                    rows = res - 1 - iz
                     for ch in range(3):
-                        np.add.at(dst[:, :, ch], (rows, iy), rgb[:, ch])
+                        np.add.at(dst[:, :, ch], (iy, iz), rgb[:, ch])
 
         # Pure preview feeds: project all strike records into the image-plane Y/Z
         # grid.  Do not require the ray to hit the image plate; this is a live
@@ -4728,7 +5063,7 @@ class ForwardCppLensBench:
         return self._emissive_material_id_cache
 
     def _ensure_backward_transport_arrays(self) -> Dict[str, np.ndarray]:
-        n = int(max(1, self.bdpt_last_n_px))
+        n = int(max(4, self.scene.image_plate.sensor_res))
         shape = (n, n)
         acc = self._backward_transport_accum
         if acc is not None and acc.get("found_emission", np.empty((0, 0))).shape == shape:
@@ -4790,13 +5125,15 @@ class ForwardCppLensBench:
         except Exception:
             mat_emit_rgb = np.zeros((len(kinds), 3), dtype=np.float64)
 
-        n = int(max(1, self.bdpt_last_n_px))
+        res = int(max(4, self.scene.image_plate.sensor_res))
+        n = res
         # High four tag bits encode the sampled RGB sensor channel.  The low
-        # 60 bits carry the pixel id assigned at launch.
+        # 60 bits carry the pixel src_id, encoded as row*res+col in the full
+        # sensor_res x sensor_res grid (disc pixels only, but indexed by grid pos).
         pix = tags & ((np.int64(1) << np.int64(60)) - np.int64(1))
-        valid_pix = (tags >= 0) & (pix >= 0) & (pix < n * n)
-        rows = (pix // n).astype(np.int64, copy=False)
-        cols = (pix % n).astype(np.int64, copy=False)
+        valid_pix = (tags >= 0) & (pix >= 0) & (pix < res * res)
+        rows = (pix // res).astype(np.int64, copy=False)
+        cols = (pix % res).astype(np.int64, copy=False)
 
         is_miss = bwd & (kinds == 1) & valid_pix
         # RayRecordKind::STRIKE is the normal visible surface contact.  Older
@@ -4902,7 +5239,7 @@ class ForwardCppLensBench:
           failure:    red/blue failure composition only
         """
         acc = self._backward_transport_accum
-        n = int(max(1, self.bdpt_last_n_px))
+        n = int(max(4, self.scene.image_plate.sensor_res))
         if not acc:
             return np.zeros((n, n, 3), dtype=np.float32)
 
@@ -4956,7 +5293,7 @@ class ForwardCppLensBench:
         from accounting.
         """
         acc = self._backward_transport_accum
-        n = int(max(1, self.bdpt_last_n_px))
+        n = int(max(4, self.scene.image_plate.sensor_res))
         if not acc or "emission_rgb" not in acc:
             return np.zeros((n, n, 3), dtype=np.float32)
         rgb = np.maximum(0.0, np.asarray(acc["emission_rgb"], dtype=np.float64))
@@ -4987,8 +5324,16 @@ class ForwardCppLensBench:
         """Return the pure forward-traced image-plate accumulation preview."""
         with self._segs_lock:
             img = self._forward_img_accum.copy()
-        disp = np.log1p(np.maximum(img, 0.0) * float(self._forward_img_gain))
-        return np.ascontiguousarray(disp / (1.0 + disp), dtype=np.float32)
+        flat = np.asarray(img, dtype=np.float64).ravel()
+        pos = flat[flat > 0.0]
+        if pos.size == 0:
+            return np.zeros(img.shape, dtype=np.float32)
+        # Auto-normalise to 99th-percentile so the projection becomes visible
+        # as soon as any hits arrive, regardless of absolute amplitude scale.
+        white = float(np.percentile(pos, 99.0))
+        white = max(white, 1.0e-30)
+        y = np.log1p(np.maximum(img, 0.0) / white * 6.0) / np.log1p(6.0)
+        return np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
 
     def get_reverse_strike_image(self) -> np.ndarray:
         """Return the pure reverse-traced strike distribution preview."""
@@ -5282,10 +5627,7 @@ class ForwardCppLensBench:
             # BDPT launch count must not be tied to aperture sample count alone.
             # Keep a substantive per-frame budget so reverse paths actually form.
             if n_rays_bdpt is None:
-                # f/2.8 exit pupil → ~0.008% hemisphere acceptance from scene.
-                # Need ~16k forward rays to expect even a handful to arrive at
-                # the sensor through the aperture each call.
-                n_rays_bdpt = int(max(256, min(65536, 256 * n)))
+                n_rays_bdpt = int(max(1_000_000, n * n * 1000))
             else:
                 n_rays_bdpt = int(max(1, n_rays_bdpt))
             # Size output records to backend worst-case for this batch so
@@ -5429,19 +5771,31 @@ class ForwardCppLensBench:
                 "pixel_cone":        _stream_pixcone_count,
                 "field_deposit_blocked": _stream_bwd_count if not ENABLE_UNSAFE_BACKWARD_FIELD_DEPOSIT else 0,
             }
+            # ── BDPT connection step (shadow-ray join of fwd/bwd vertices) ──
             _corr_overlay = None
-            if (
-                _MANIFOLD_CORRELATOR_AVAILABLE
-                and _fwd_mask is not None
-                and _bwd_mask is not None
-                and _stream_fwd_count > 0
-                and _stream_bwd_count > 0
-            ):
-                _corr_overlay = self._run_manifold_correlator(n, _fwd_mask, _bwd_mask)
-                self._last_correlator_bdpt_rgb = np.ascontiguousarray(
-                    np.clip(_corr_overlay, 0.0, 1.0),
-                    dtype=np.float32,
-                )
+            if _stream_fwd_count > 0 and _stream_bwd_count > 0:
+                try:
+                    _bdpt_img = self.tracer.bdpt_connect(
+                        np.ascontiguousarray(self._last_bdpt_records, dtype=np.float32),
+                        n, n, int(sensor_gid),
+                        500,   # max forward samples per backward vertex
+                        int(seed),
+                    )
+                    _bdpt_arr = np.asarray(_bdpt_img, dtype=np.float32)
+                    if _bdpt_arr.shape == (n, n, 3) and np.any(_bdpt_arr > 0.0):
+                        _corr_overlay = _bdpt_arr
+                        self._last_correlator_bdpt_rgb = np.ascontiguousarray(
+                            _bdpt_arr, dtype=np.float32)
+                        self._last_bdpt_plate_rgb = self._last_correlator_bdpt_rgb
+                        print(
+                            "[bdpt-connect]",
+                            f"fwd={_stream_fwd_count}",
+                            f"bwd={_stream_bwd_count}",
+                            f"peak={float(np.max(_bdpt_arr)):.3e}",
+                            flush=True,
+                        )
+                except Exception as _exc:
+                    print(f"[bdpt-connect] error: {_exc}", flush=True)
             # ───────────────────────────────────────────────────────────────
 
             if rgb_tm is None:
@@ -5470,6 +5824,10 @@ class ForwardCppLensBench:
                     if self._last_correlator_bdpt_rgb is not None
                     else np.zeros((n, n, 3), dtype=np.float32)
                 )
+                # Expose correlator data in the BDPT plate channel so the
+                # left pip isn't permanently blank when C++ finds no survivors.
+                if self._last_correlator_bdpt_rgb is not None and np.any(self._last_correlator_bdpt_rgb > 0.0):
+                    self._last_bdpt_plate_rgb = np.ascontiguousarray(self._last_correlator_bdpt_rgb, dtype=np.float32)
                 return np.ascontiguousarray(out, dtype=np.float32)
             rgb_tm_arr = np.asarray(rgb_tm, dtype=np.float32)
             if rgb_tm_arr.shape != (n, n, 3):
@@ -5490,7 +5848,14 @@ class ForwardCppLensBench:
                     f"rgb_shape={tuple(rgb_tm_arr.shape)}",
                     flush=True,
                 )
-                return np.zeros((n, n, 3), dtype=np.float32)
+                out = (
+                    self._last_correlator_bdpt_rgb
+                    if self._last_correlator_bdpt_rgb is not None
+                    else np.zeros((n, n, 3), dtype=np.float32)
+                )
+                if self._last_correlator_bdpt_rgb is not None and np.any(self._last_correlator_bdpt_rgb > 0.0):
+                    self._last_bdpt_plate_rgb = np.ascontiguousarray(self._last_correlator_bdpt_rgb, dtype=np.float32)
+                return np.ascontiguousarray(out, dtype=np.float32)
             lit_mask = np.sum(np.asarray(rgb_tm_arr, dtype=np.float64), axis=2) > 1.0e-8
             lit_pixels = int(np.count_nonzero(lit_mask))
             lit_fraction = float(lit_pixels) / float(max(1, n * n))
@@ -5596,11 +5961,21 @@ class ForwardCppLensBench:
                 # so contributions still land somewhere useful on the overlay.
                 bwd_rec = cand.backward_record
                 if bwd_rec is not None and hasattr(bwd_rec, '__len__') and len(bwd_rec) > 0:
-                    raw_sid = int(bwd_rec.flat[0]) if bwd_rec.dtype == np.float32 else int(bwd_rec["subpath_id"].flat[0])
+                    if np.asarray(bwd_rec).dtype == np.float32:
+                        # col-0 is subpath_id stored as uint32 bits in float32 storage.
+                        # ravel() handles both (16,) and (1,16) record shapes before view().
+                        _f32 = np.ascontiguousarray(bwd_rec, dtype=np.float32).ravel()
+                        raw_sid = int(_f32[:1].view(np.uint32)[0])
+                    else:
+                        raw_sid = int(np.asarray(bwd_rec)["subpath_id"].flat[0])
                     pid = int(raw_sid) % n_sq
                 else:
                     fwd_rec = cand.forward_record
-                    raw_sid = int(fwd_rec.flat[0]) if (fwd_rec is not None and fwd_rec.dtype == np.float32) else 0
+                    if fwd_rec is not None and np.asarray(fwd_rec).dtype == np.float32:
+                        _f32f = np.ascontiguousarray(fwd_rec, dtype=np.float32).ravel()
+                        raw_sid = int(_f32f[:1].view(np.uint32)[0])
+                    else:
+                        raw_sid = 0
                     pid = int(raw_sid) % n_sq
                 c = np.ravel(np.asarray(cand.contribution, dtype=np.complex64))
                 if c.size == 0:
@@ -5922,6 +6297,112 @@ class ForwardCppLensBench:
             self.tri_centroids,
             _scene_lenses(self.scene),
         )
+
+    def _adjust_lens_element(self, idx: int, delta_x: float) -> None:
+        """Shift lens element `idx` along X by `delta_x` metres and recast all ray correlation.
+
+        Works for any element — focus group, floating compensator, variator, or front group.
+        Bypasses apply_to_scene() so the solver never overrides the live adjustment.
+        """
+        import dataclasses as _dc
+        lenses = list(getattr(self.scene, "lens_stack", None) or [])
+        if not lenses:
+            return
+        idx = int(idx) % len(lenses)
+        lenses[idx] = _dc.replace(lenses[idx], center_x=round(lenses[idx].center_x + delta_x, 6))
+        self.scene.lens_stack = lenses
+
+        if self._lens_assembly is not None and self._lens_assembly.mode == LensAssemblySpec.MODE_PARAMETRIC:
+            new_cl = _compound_lens_from_stack(lenses, getattr(self.scene, "iris_aperture", None))
+            self._lens_assembly.set_optics(new_cl)
+            lsg = getattr(self, "lens_surface_groups", None)
+            if lsg:
+                saved_design = getattr(self.scene, "optical_design", None)
+                self.scene.optical_design = None
+                try:
+                    self.tracer.clear_tri_groups()
+                    self._lens_assembly.register(
+                        self.tracer,
+                        lsg,
+                        self.tri_vertices,
+                        self.tri_centroids,
+                        _scene_lenses(self.scene),
+                    )
+                finally:
+                    self.scene.optical_design = saved_design
+                self._start_progressive_refinement()
+
+        # Clear all ray accumulators so fresh correlation begins immediately.
+        self._forward_img_accum[:] = 0.0
+        self._reverse_img_accum[:] = 0.0
+        if isinstance(self._backward_transport_accum, dict):
+            for v in self._backward_transport_accum.values():
+                if isinstance(v, np.ndarray):
+                    v[:] = 0.0
+        self._last_bdpt_plate_rgb = None
+        self._last_correlator_bdpt_rgb = None
+        self._last_backward_transport_image = None
+        self._bdpt_sensor_cfg = None
+
+        cfg = lenses[idx]
+        fp_x = self.focal_plane_x
+        sensor_x = float(getattr(getattr(self.scene, "image_plate", None), "x", 0.0))
+        defocus_mm = (fp_x - sensor_x) * 1000.0 if math.isfinite(fp_x) else float("nan")
+        print(
+            f"[lens-live] element {idx}/{len(lenses)-1}"
+            f"  dx={delta_x*1000:+.3f}mm"
+            f"  center_x={cfg.center_x:.5f}"
+            f"  span=[{cfg.x_front:.5f}, {cfg.x_back:.5f}]"
+            f"  focal_plane={fp_x:.5f}"
+            f"  defocus={defocus_mm:+.2f}mm",
+            flush=True,
+        )
+
+        # Fast focus probe: trace a ray bundle to measure actual CoC and true focus.
+        optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
+        if optics is not None:
+            _ap_r = float(getattr(lenses[0], "aperture_radius", 0.015)) if lenses else 0.015
+            _iris = getattr(self.scene, "iris_aperture", None)
+            if _iris is not None and bool(getattr(_iris, "enabled", False)):
+                _ap_r = min(_ap_r, float(getattr(_iris, "r_inner", _ap_r)))
+            _probe = _probe_focus_coc(
+                optics,
+                float(self.scene.object_plane.x),
+                float(getattr(getattr(self.scene, "image_plate", None), "x", 0.0)),
+                _ap_r,
+            )
+            self._focus_probe_result = _probe
+            print(
+                f"[focus-probe] traced_focus={_probe['min_coc_x']:.5f}"
+                f"  min_coc={_probe['min_coc_mm']:.3f}mm"
+                f"  coc@sensor={_probe['coc_at_sensor_mm']:.3f}mm"
+                f"  ({_probe['n_passed']} rays passed)",
+                flush=True,
+            )
+
+    @property
+    def focal_plane_x(self) -> float:
+        """Design focal plane x — where the solver placed focus relative to the sensor.
+
+        Uses the optical design solver's thin-lens group model, which is the same
+        computation used to place the sensor, so the result is within sensor_error
+        (~0.02mm) of image_plate.x at startup.  After manual lens adjustments the
+        orange probe ring (from _focus_probe_result) shows the new traced focus;
+        this yellow-ring property stays at the design position for reference.
+
+        Returns float('inf') if not computable.
+        """
+        fp = _solver_focal_plane_x(self.scene)
+        if math.isfinite(fp):
+            return fp
+        # Fallback: compound-lens paraxial matrix (may differ from solver's model)
+        optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
+        if optics is None:
+            return float("inf")
+        try:
+            return _paraxial_image_x(optics, float(self.scene.object_plane.x))
+        except Exception:
+            return float("inf")
 
     def _start_progressive_refinement(self) -> None:
         """Start parametric→LUT→MLP background refinement if in PARAMETRIC mode."""
@@ -6278,6 +6759,9 @@ def map_side(scene: SceneConfig, x: float, z: float, rect: pygame.Rect) -> Tuple
     return map_top(scene, x, z, rect)
 
 
+_dm_font_cache: list = [None]
+
+
 def draw_scene_overlays(
     surf: pygame.Surface,
     rect: pygame.Rect,
@@ -6368,6 +6852,27 @@ def draw_scene_overlays(
     else:
         src_t = map_top(scene, scene.object_plane.x, 0.0, rect) if top_view else map_side(scene, scene.object_plane.x, 0.0, rect)
         pygame.draw.circle(surf, (255, 188, 98), src_t, 4)
+
+    # 10 cm scale stick at object plane (same in both views).
+    _dm_col = (255, 185, 0)
+    if top_view:
+        _dm_p0 = map_top(scene, scene.object_plane.x, -0.05, rect)
+        _dm_p1 = map_top(scene, scene.object_plane.x, +0.05, rect)
+    else:
+        _dm_p0 = map_side(scene, scene.object_plane.x, -0.05, rect)
+        _dm_p1 = map_side(scene, scene.object_plane.x, +0.05, rect)
+    pygame.draw.line(surf, _dm_col, _dm_p0, _dm_p1, 2)
+    _tk = 5
+    pygame.draw.line(surf, _dm_col, (_dm_p0[0] - _tk, _dm_p0[1]), (_dm_p0[0] + _tk, _dm_p0[1]), 1)
+    pygame.draw.line(surf, _dm_col, (_dm_p1[0] - _tk, _dm_p1[1]), (_dm_p1[0] + _tk, _dm_p1[1]), 1)
+    if pygame.font.get_init():
+        if _dm_font_cache[0] is None:
+            _dm_font_cache[0] = (pygame.font.SysFont("consolas", 9) or
+                                 pygame.font.SysFont("monospace", 9) or False)
+        _sf = _dm_font_cache[0]
+        if _sf:
+            _lbl = _sf.render("10cm", True, _dm_col)
+            surf.blit(_lbl, (_dm_p1[0] + _tk + 2, _dm_p1[1] - _lbl.get_height() // 2))
 
 
 # ── Cross-section triangle kind constants ──────────────────────────────── #
@@ -8013,46 +8518,29 @@ def run(
         glUseProgram(0)
 
     def draw_pip() -> None:
-        # ── BDPT pip (leftmost — violet border) ─────────────────────────────
-        bdpt_plate = bench._last_bdpt_plate_rgb
-        if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
-            glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
-                         bdpt_plate.shape[1], bdpt_plate.shape[0], 0,
-                         GL_RGB, GL_FLOAT, bdpt_plate)
+        # ── Left pip: empty (border only) ───────────────────────────────────
         _draw_quad_with_pip_prog(
             tex_bdpt_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
-            border_col=(0.65, 0.25, 1.0),
+            border_col=(0.3, 0.3, 0.3),
         )
 
-        # ── Correlator BDPT pip (centre — cyan border) ─────────────────────
-        # This is the resolved forward/backward connection estimate produced by
-        # RayCorrelator at the selected camera join element.  If no correlator
-        # connections have been accepted yet, show the real sensor BDPT plate
-        # instead of a diagnostic strike projection or an empty texture.
-        corr_img = bench.get_correlator_bdpt_image()
-        img = corr_img
-        if not np.any(np.asarray(img) > 0.0):
-            plate_img = bench._last_bdpt_plate_rgb
-            if plate_img is not None and plate_img.shape[0] > 0:
-                img = plate_img
-        has_img = img.shape[0] > 0
-
-        if has_img:
+        # ── Centre pip: BDPT sensor plate (cyan border) ─────────────────────
+        bdpt_plate = bench._last_bdpt_plate_rgb
+        if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
+            bdpt_disp = np.ascontiguousarray(bdpt_plate[::-1, :], dtype=np.float32)
             glBindTexture(GL_TEXTURE_2D, tex_pip)
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, img.shape[1], img.shape[0],
-                            GL_RGB, GL_FLOAT, img)  # C++ already emits rows bottom-first
-
-        # Always draw the pip quad — border is baked into the shader.
-        # When sensor has no data yet the quad draws a pure cyan border on
-        # transparent background (additive over the scene), which is visible.
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         bdpt_disp.shape[1], bdpt_disp.shape[0], 0,
+                         GL_RGB, GL_FLOAT, bdpt_disp)
         _draw_quad_with_pip_prog(tex_pip, _pip_vx, _pip_vy, _pip_dim, _pip_dim)
 
+        # ── Right pip: forward ray strikes (orange border) ──────────────────
         fwd_img = bench.get_forward_strike_image()
         if fwd_img.shape[0] > 0:
             glBindTexture(GL_TEXTURE_2D, tex_forward_pip)
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fwd_img.shape[1], fwd_img.shape[0],
-                            GL_RGB, GL_FLOAT, fwd_img)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         fwd_img.shape[1], fwd_img.shape[0], 0,
+                         GL_RGB, GL_FLOAT, fwd_img)
         _draw_quad_with_pip_prog(
             tex_forward_pip, _uv_pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(1.00, 0.62, 0.18),
@@ -8297,6 +8785,16 @@ def run(
         r_ent    = _nr(float(_ap["entrance_r"]))
         r_exit   = _nr(float(_ap["exit_r"]))
 
+        # True optical entrance pupil: image of aperture stop formed by front
+        # elements.  x_ep is distinct from x_ent (physical front surface vertex).
+        _x_ep_w = x_ent_w  # fallback: front surface
+        if hasattr(_asm, "optics") and _asm.optics is not None:
+            try:
+                _x_ep_w = float(_asm.optics.entrance_pupil[0])
+            except Exception:
+                pass
+        _x_ep = _nx(_x_ep_w)
+
         # Build aperture circle vertices (in normalised XYZ, Y/Z are transverse).
         # These mark the physical clear aperture at each side.
         N_SEG = 48
@@ -8434,35 +8932,58 @@ def run(
                 lines.append(np.array([cx, 0.5 + y, 0.5 + z], dtype=np.float32))
             return np.asarray(lines, dtype=np.float32)
 
-        if _field_pair is not None:
-            for prof in _field_pair["front"].faces:
-                if prof.reachable_from_side:
-                    _draw_loop(_face_circle(prof), 0.72, 0.08, 0.08)
-                    _draw_lines(_face_generators(prof), 0.72, 0.08, 0.08)
-            if "back" in _field_pair:
-                for prof in _field_pair["back"].faces:
-                    if prof.reachable_from_side:
-                        _draw_loop(_face_circle(prof), 0.08, 0.72, 0.08)
-                        _draw_lines(_face_generators(prof), 0.08, 0.72, 0.08)
+        # Sensor FOV bowtie: sensor corners → entrance pupil (pinch) → far scene.
+        # This is the actual projection of the sensor through the optics — not the
+        # aperture transmission cone.  The hourglass shape makes it unambiguous
+        # that the lines originate at the sensor and project into the scene.
+        _r_s = float(getattr(getattr(scene, "image_plate", None), "radius", 0.0))
+        _x_sen = float(getattr(getattr(scene, "image_plate", None), "x", 0.0))
+        _fov_half = obj_half  # fallback: aperture angle
+        if hasattr(_asm, "optics") and _asm.optics is not None and _r_s > 1e-9:
+            _f_e = abs(float(_asm.optics.f_eff))
+            if _f_e > 1e-9:
+                _fov_half = math.atan2(_r_s, _f_e)
+        _h_fov = float(math.tan(_fov_half) * extent / yz_span)
+        if _r_s > 1e-9 and _x_sen > 1e-9:
+            _x_s_n = _nx(_x_sen)
+            _h_s_n = _r_s / yz_span
+            _fov_bowtie = np.array([
+                # Camera side: sensor +Y → entrance pupil (pinch)
+                [_x_s_n, 0.5 + _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
+                # Scene side: entrance pupil (pinch) → far +Y
+                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 + _h_fov, 0.5],
+                # Camera side: sensor -Y → entrance pupil (pinch)
+                [_x_s_n, 0.5 - _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
+                # Scene side: entrance pupil (pinch) → far -Y
+                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 - _h_fov, 0.5],
+                # Same for Z axis
+                [_x_s_n, 0.5, 0.5 + _h_s_n],  [_x_ep, 0.5, 0.5],
+                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 + _h_fov],
+                [_x_s_n, 0.5, 0.5 - _h_s_n],  [_x_ep, 0.5, 0.5],
+                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 - _h_fov],
+            ], dtype=np.float32)
+            _draw_lines(_fov_bowtie, 0.88, 0.88, 0.88)
 
-        if _boundary_profiles is not None:
-            front_boundary = _boundary_profiles.get("front")
-            back_boundary = _boundary_profiles.get("back")
-            if front_boundary is not None:
-                _draw_loop(_ring_at(front_boundary.source_center, front_boundary.source_radius), 1.0, 0.68, 0.05)
-                _draw_loop(_ring_at(front_boundary.target_center, front_boundary.target_radius), 1.0, 0.68, 0.05)
-                _draw_lines(_boundary_generators(front_boundary), 1.0, 0.68, 0.05)
-            if back_boundary is not None:
-                _draw_loop(_ring_at(back_boundary.source_center, back_boundary.source_radius), 0.0, 0.88, 1.0)
-                _draw_loop(_ring_at(back_boundary.target_center, back_boundary.target_radius), 0.0, 0.88, 1.0)
-                _draw_lines(_boundary_generators(back_boundary), 0.0, 0.88, 1.0)
-
-        # Entrance aperture ring + object-side FOV cone: red
-        _draw_loop(ent_circle, 1.0, 0.18, 0.18)
-        _draw_lines(obj_lines, 1.0, 0.18, 0.18)
-        # Exit aperture ring + image-side FOV cone: green
-        _draw_loop(exit_circle, 0.18, 1.0, 0.18)
-        _draw_lines(img_lines,  0.18, 1.0, 0.18)
+        # 10 cm scale stick at object plane (orange), perpendicular to axis.
+        # Gives a real-world reference to judge how wide the FOV cone actually is.
+        _x_op_n = _nx(float(scene.object_plane.x))
+        _dm_h   = 0.05 / yz_span   # half of 10 cm in normalised coords
+        _tick_w = max(0.004, 0.008 / max(1e-8, x_span))
+        _dm_bar_y = np.array([
+            [_x_op_n, 0.5 - _dm_h, 0.5],
+            [_x_op_n, 0.5 + _dm_h, 0.5],
+        ], dtype=np.float32)
+        _dm_bar_z = np.array([
+            [_x_op_n, 0.5, 0.5 - _dm_h],
+            [_x_op_n, 0.5, 0.5 + _dm_h],
+        ], dtype=np.float32)
+        _dm_ticks = np.array([
+            [_x_op_n - _tick_w, 0.5 - _dm_h, 0.5], [_x_op_n + _tick_w, 0.5 - _dm_h, 0.5],
+            [_x_op_n - _tick_w, 0.5 + _dm_h, 0.5], [_x_op_n + _tick_w, 0.5 + _dm_h, 0.5],
+        ], dtype=np.float32)
+        _draw_loop(_dm_bar_y,  1.0, 0.72, 0.0)
+        _draw_loop(_dm_bar_z,  1.0, 0.72, 0.0)
+        _draw_lines(_dm_ticks, 1.0, 0.72, 0.0)
 
         # Physical iris / aperture stop: blue.  This is the real mechanical
         # stop in the lens stack, distinct from the virtual entrance/exit pupils.
@@ -8501,56 +9022,54 @@ def run(
             _draw_loop(_back_profile, 0.72, 0.92, 1.0)
             _draw_lines(_edge_lines, 0.72, 0.92, 1.0)
 
-        # Per-pixel acceptance fan (magenta image-side, gold object-side).
-        # Shows the family of angles each sensor site can accept:
-        #   magenta — from sensor pixel toward exit pupil rim (fans OUT from pupil)
-        #   gold    — from entrance pupil toward scene at each pixel's field angle
-        if hasattr(_asm, "optics") and _asm.optics is not None:
-            _r_sensor = float(getattr(getattr(scene, "image_plate", None), "radius", 0.0))
-            _x_sensor = float(getattr(getattr(scene, "image_plate", None), "x", 0.0))
-            if _r_sensor > 1e-9 and _x_sensor > 1e-9:
-                _fan_heights = np.linspace(0.0, _r_sensor, 6)[1:]  # 5 rings, exclude 0
-                try:
-                    _fan = _asm.optics.pixel_acceptance_fan(_x_sensor, _fan_heights.tolist())
-                except Exception:
-                    _fan = []
-                for _pix in _fan:
-                    _h   = float(_pix["h_sensor"])
-                    _xep = float(_pix["x_ep_img"])
-                    _rep = float(_pix["r_ep_img"])
-                    _x_s_n  = _nx(_x_sensor)
-                    _h_n    = _h / yz_span
-                    _xep_n  = _nx(_xep)
-                    _rep_n  = _rep / yz_span
-                    # Image-side: sensor pixel → exit pupil centre and rim (magenta)
-                    _mlines = np.array([
-                        [_x_s_n, 0.5 + _h_n, 0.5], [_xep_n, 0.5,         0.5],
-                        [_x_s_n, 0.5 + _h_n, 0.5], [_xep_n, 0.5 + _rep_n, 0.5],
-                        [_x_s_n, 0.5 + _h_n, 0.5], [_xep_n, 0.5 - _rep_n, 0.5],
-                    ], dtype=np.float32)
-                    _draw_lines(_mlines, 0.85, 0.15, 0.85)
-                    # Object-side: entrance pupil → scene at this pixel's field angle (gold)
-                    _x_enp  = float(_pix["x_ep_obj"])
-                    _r_enp  = float(_pix["r_ep_obj"])
-                    _th_obj = float(_pix["chief_angle_obj"])
-                    _th_mar = float(_pix["marginal_half_angle_img"])
-                    _xen_n  = _nx(_x_enp)
-                    _obj_far_n = _nx(_x_enp - extent)
-                    for _ang in (_th_obj - _th_mar, _th_obj, _th_obj + _th_mar):
-                        _ho = math.tan(_ang) * extent / yz_span
-                        _olines = np.array([
-                            [_xen_n, 0.5, 0.5], [_obj_far_n, 0.5 + _ho, 0.5],
-                        ], dtype=np.float32)
-                        _draw_lines(_olines, 1.0, 0.82, 0.1)
-                # Entrance pupil ring (white)
-                if _fan:
-                    _xen0 = float(_fan[0]["x_ep_obj"])
-                    _ren0 = float(_fan[0]["r_ep_obj"])
-                    _draw_loop(_ring_at([_xen0, 0.0, 0.0], _ren0), 0.9, 0.9, 0.9)
-                    # Exit pupil ring (bright cyan)
-                    _xep0 = float(_fan[0]["x_ep_img"])
-                    _rep0 = float(_fan[0]["r_ep_img"])
-                    _draw_loop(_ring_at([_xep0, 0.0, 0.0], _rep0), 0.1, 1.0, 0.9)
+
+        # ── Range finder: design focal plane ───────────────────────────────
+        # Yellow ring = where the solver placed focus (matches sensor at startup).
+        # When the ring coincides with the sensor disc (green), focus is correct.
+        # Uses bench.focal_plane_x which calls _solver_focal_plane_x() — consistent
+        # with the solver's thin-lens model and thus with the sensor placement.
+        _fp_x = bench.focal_plane_x
+        if math.isfinite(_fp_x) and float(scene.x_min) <= _fp_x <= float(scene.x_max) + 0.02:
+            _x_fp_n  = _nx(_fp_x)
+            _r_fp_m  = float(getattr(getattr(scene, "image_plate", None), "radius", 0.025))
+            _r_fp_n  = _nr(_r_fp_m)
+            _sensor_x = float(getattr(getattr(scene, "image_plate", None), "x", 0.0))
+            _defocus_mm = (_fp_x - _sensor_x) * 1000.0
+            # Ring at focal plane (yellow)
+            _draw_loop(_ring_at([_fp_x, 0.0, 0.0], _r_fp_m), 1.0, 1.0, 0.15)
+            # Cross-wire at focal plane center
+            _cross_r = _r_fp_n * 0.45
+            _fp_cross = np.array([
+                [_x_fp_n, 0.5 - _cross_r, 0.5], [_x_fp_n, 0.5 + _cross_r, 0.5],
+                [_x_fp_n, 0.5, 0.5 - _cross_r], [_x_fp_n, 0.5, 0.5 + _cross_r],
+            ], dtype=np.float32)
+            _draw_lines(_fp_cross, 1.0, 1.0, 0.15)
+            # Defocus line from focal plane to sensor (dim white)
+            if abs(_defocus_mm) > 0.01 and _x_ep > 0.0:
+                _x_s_n = _nx(_sensor_x)
+                _defocus_bar = np.array([
+                    [_x_fp_n, 0.5, 0.5], [_x_s_n, 0.5, 0.5],
+                ], dtype=np.float32)
+                _draw_lines(_defocus_bar, 0.9, 0.9, 0.4)
+
+        # ── Traced focus ring (orange) ──────────────────────────────────────
+        # Shows the minimum circle-of-confusion plane found by _probe_focus_coc().
+        # Distinct from the paraxial ring (yellow) — deviates when aberrations are
+        # significant or when the marginal-focus doesn't match the paraxial estimate.
+        _probe = getattr(bench, "_focus_probe_result", None)
+        if _probe is not None and math.isfinite(float(_probe.get("min_coc_x", float("nan")))):
+            _tf_x = float(_probe["min_coc_x"])
+            if float(scene.x_min) <= _tf_x <= float(scene.x_max) * 1.5:
+                _x_tf_n = _nx(_tf_x)
+                _r_tf_m = float(getattr(getattr(scene, "image_plate", None), "radius", 0.025))
+                _draw_loop(_ring_at([_tf_x, 0.0, 0.0], _r_tf_m), 1.0, 0.50, 0.05)
+                # Tick marks on the ring cross-wire (orange, slightly shorter)
+                _cr_tf = _nr(_r_tf_m) * 0.30
+                _tf_cross = np.array([
+                    [_x_tf_n, 0.5 - _cr_tf, 0.5], [_x_tf_n, 0.5 + _cr_tf, 0.5],
+                    [_x_tf_n, 0.5, 0.5 - _cr_tf], [_x_tf_n, 0.5, 0.5 + _cr_tf],
+                ], dtype=np.float32)
+                _draw_lines(_tf_cross, 1.0, 0.50, 0.05)
 
         glLineWidth(1.0)
         glDisableClientState(GL_VERTEX_ARRAY)
@@ -8754,8 +9273,8 @@ def run(
     # yaw=π/2 → forward = +X; the viewer sees the YZ cross-section — lenses
     # and subject objects appear as circles rather than as side-on slivers.
     fly_mode  = False
-    fly_pos   = np.array([-0.35, 0.5, 0.5], dtype=np.float64)
-    fly_yaw   = math.pi / 2      # yaw=π/2 → forward = +X (along optical axis)
+    fly_pos   = np.array([ 1.35, 0.5, 0.5], dtype=np.float64)
+    fly_yaw   = -math.pi / 2     # yaw=−π/2 → forward = −X (same look direction as camera)
     fly_pitch = 0.0
     _FLY_SPEED = 0.6   # normalised units / second
     _FLY_SENS  = 0.20  # degrees per pixel of mouse movement
@@ -8766,9 +9285,10 @@ def run(
     _MAX_IN_FLIGHT = 2_000_000
 
     # Manifold ("M") render state — fires once at startup then every N frames.
-    _MANIFOLD_INTERVAL = 60     # re-render every 60 trace calls
-    _manifold_ctr      = [0]    # mutable so _trace closure can update it
-    _manifold_busy     = [False]
+    _MANIFOLD_INTERVAL    = 30    # re-render every 30 trace calls
+    _manifold_ctr         = [0]   # mutable so _trace closure can update it
+    _manifold_busy        = [False]
+    _startup_iris_pending = [True]   # apply f/22 on first loop iteration
 
     def _fire_manifold_render() -> None:
         if _manifold_busy[0]:
@@ -8781,10 +9301,10 @@ def run(
                 else:
                     bench.trace_forward_backward_sensor_rgb(
                         pixels=max(8, min(48, int(scene.image_plate.sensor_res))),
-                        aperture_samples=2,
+                        aperture_samples=8,
                         seed=20260522 + _manifold_ctr[0],
                         max_bounces=48,
-                        n_rays_bdpt=8192,
+                        n_rays_bdpt=1_000_000,
                     )
             except Exception as _me:
                 print(f"[middle] render error: {_me}", flush=True)
@@ -8810,12 +9330,99 @@ def run(
             if _manifold_ctr[0] % _MANIFOLD_INTERVAL == 1:
                 _fire_manifold_render()
 
-    # Kick off the first manifold render immediately when in "middle" mode.
-    if ray_mode == "middle":
-        _fire_manifold_render()
+    # No pre-loop bench1 render: f/22 startup rebuild immediately replaces bench1
+    # with bench2 on the first loop iteration.  BDPT fires from the loop's first
+    # eligible _manifold_ctr tick (ctr % 30 == 1) using bench2.
+
+    def _rebuild_bench_with_iris(new_r_inner: float) -> None:
+        """Full scene rebuild with a new iris r_inner (new f-number).
+
+        This is the only correct path — the iris geometry is baked into the BVH at
+        init time and cannot be patched in-place.  The rebuild takes ~1-2 s but
+        gives a physically accurate aperture stop.
+        """
+        nonlocal bench
+        # Clamp to reasonable range (1 mm – 30 mm clear aperture)
+        new_r = float(np.clip(new_r_inner, 0.001, 0.030))
+        iris = getattr(scene, "iris_aperture", None)
+        if iris is None:
+            print("[aperture] no iris_aperture on scene; cannot rebuild", flush=True)
+            return
+        import dataclasses as _dc
+        scene.iris_aperture = _dc.replace(
+            iris,
+            r_inner=round(new_r, 5),
+            r_outer=round(max(new_r * 1.55, float(iris.r_outer)), 5),
+        )
+        # Reset the optical design spec so the solver re-runs with the new geometry.
+        scene.optical_design = _default_optical_design_spec()
+        # Reset GL-side state that references old BVH data.
+        _scene_vao[0]           = None
+        _mesh_vbo[0]            = None
+        _mesh_n_verts[0]        = 0
+        _uv_last_update_s[0]    = -1.0
+        _uv_shared_tex_id[0]    = 0
+        print("[aperture] rebuilding scene…", flush=True)
+        bench = ForwardCppLensBench(
+            scene=scene,
+            freq_hz=bench.freq_hz.copy(),
+            view_h=view_h,
+            view_w=view_w,
+            sidecar=sidecar,
+            field_capture=field_capture,
+        )
+        bench.sensor_amp_gain      = float(sensor_amp_gain)
+        bench.sensor_min_amplitude = float(sensor_min_amplitude)
+        bench.emitter_amp_gain     = float(emitter_amp_gain)
+        bench.compute_mode         = str(compute_mode)
+        bench._bdpt_join_element   = str(bdpt_join_element)
+        if _gl_display_hglrc:
+            if _gl_display_hdc:
+                bench.tracer.set_gl_display_hdc(_gl_display_hdc)
+            bench.tracer.set_gl_display_hglrc(_gl_display_hglrc)
+            try:
+                _wl_nm = np.clip(C_LIGHT / np.maximum(bench.freq_hz, EPS) * 1.0e9, 380.0, 700.0)
+                _blit_w = _wavelength_to_rgb_weights(_wl_nm).astype(np.float32)
+                bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
+            except Exception:
+                pass
+        bench.tracer.configure_sensor_image(
+            float(scene.image_plate.x), float(scene.image_plate.radius),
+            int(max(16, scene.image_plate.sensor_res)), 0.008,
+        )
+        # Derive and print the new f-number from EFL and entrance pupil radius
+        _efl = float(getattr(getattr(scene, "optical_design", None),
+                              "effective_focal_length_m", 0.0) or 0.0)
+        _ep_r = float(new_r)
+        _asm_ap = getattr(getattr(bench, "_lens_assembly", None), "acceptance_params", lambda: None)()
+        if _asm_ap is not None:
+            _ep_r = float(_asm_ap.get("ep_r", new_r))
+        _fnum = (_efl / (2.0 * _ep_r)) if _ep_r > 1e-6 and _efl > 1e-6 else float("nan")
+        print(
+            f"[aperture] r_inner={new_r*1e3:.2f}mm"
+            f"  f/{_fnum:.1f}"
+            f"  EFL={_efl*1e3:.1f}mm"
+            f"  rebuilt tris={bench.n_tris}",
+            flush=True,
+        )
+        _restore_display_gl_context()
 
     try:
         while True:
+            # ── First-frame: set f/22 aperture ───────────────────────────────────
+            # Called inside the loop (not before it) so the GPU dispatch thread is
+            # in steady state.  _restore_display_gl_context() is called immediately
+            # after because the new GPU thread's wglShareLists may temporarily
+            # release the main thread's display context.
+            if _startup_iris_pending[0] and getattr(scene, "iris_aperture", None) is not None:
+                _startup_iris_pending[0] = False
+                _od_s = getattr(scene, "optical_design", None)
+                _efl_s = float(getattr(_od_s, "effective_focal_length_m", 0.0) or 0.0)
+                if _efl_s > 1e-4:
+                    _r_f22 = _efl_s / (2.0 * 22.0)
+                    print(f"[startup] f/22 → r={_r_f22*1e3:.2f}mm  EFL={_efl_s*1e3:.1f}mm", flush=True)
+                    _rebuild_bench_with_iris(_r_f22)
+
             if frame_profiler is not None:
                 frame_profiler.begin("events")
             for ev in pygame.event.get():
@@ -8878,13 +9485,51 @@ def run(
                                 show_impact_points = not show_impact_points
                                 print(f"[impact-points] {1 if show_impact_points else 0}", flush=True)
                             elif k == pygame.K_LEFTBRACKET:
-                                bench.intent_shuffle = max(0.0, bench.intent_shuffle - 0.1)
-                                bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
-                                print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+                                _mods = pygame.key.get_mods()
+                                if _mods & pygame.KMOD_SHIFT:
+                                    # Shift+[ → close aperture (higher f-number, less DoF)
+                                    _iris_now = getattr(bench.scene, "iris_aperture", None)
+                                    if _iris_now is not None:
+                                        _new_r = float(_iris_now.r_inner) * 0.80
+                                        _rebuild_bench_with_iris(_new_r)
+                                else:
+                                    bench.intent_shuffle = max(0.0, bench.intent_shuffle - 0.1)
+                                    bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
+                                    print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
                             elif k == pygame.K_RIGHTBRACKET:
-                                bench.intent_shuffle = min(1.0, bench.intent_shuffle + 0.1)
-                                bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
-                                print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+                                _mods = pygame.key.get_mods()
+                                if _mods & pygame.KMOD_SHIFT:
+                                    # Shift+] → open aperture (lower f-number, more DoF)
+                                    _iris_now = getattr(bench.scene, "iris_aperture", None)
+                                    if _iris_now is not None:
+                                        _new_r = float(_iris_now.r_inner) * 1.25
+                                        _rebuild_bench_with_iris(_new_r)
+                                else:
+                                    bench.intent_shuffle = min(1.0, bench.intent_shuffle + 0.1)
+                                    bench.tracer.set_intent_shuffle(float(bench.intent_shuffle))
+                                    print(f"[shuffle] {bench.intent_shuffle:.2f}", flush=True)
+                            # ── Live lens element selection ──────────────────────
+                            # , / .  — cycle selected element backward / forward
+                            elif k == pygame.K_COMMA:
+                                _n = len(list(getattr(bench.scene, "lens_stack", None) or []))
+                                if _n > 0:
+                                    bench._mobile_lens_idx = (bench._mobile_lens_idx - 1) % _n
+                                    print(f"[lens-select] element {bench._mobile_lens_idx}/{_n-1}", flush=True)
+                            elif k == pygame.K_PERIOD:
+                                _n = len(list(getattr(bench.scene, "lens_stack", None) or []))
+                                if _n > 0:
+                                    bench._mobile_lens_idx = (bench._mobile_lens_idx + 1) % _n
+                                    print(f"[lens-select] element {bench._mobile_lens_idx}/{_n-1}", flush=True)
+                            # ── Live lens element translation ────────────────────
+                            # -  / =  — move element -/+ 0.1 mm  (×10 with Shift)
+                            elif k == pygame.K_MINUS:
+                                _mods = pygame.key.get_mods()
+                                _step = -0.001 if (_mods & pygame.KMOD_SHIFT) else -0.0001
+                                bench._adjust_lens_element(bench._mobile_lens_idx, _step)
+                            elif k == pygame.K_EQUALS:
+                                _mods = pygame.key.get_mods()
+                                _step = 0.001 if (_mods & pygame.KMOD_SHIFT) else 0.0001
+                                bench._adjust_lens_element(bench._mobile_lens_idx, _step)
             if frame_profiler is not None:
                 frame_profiler.end("events")
 

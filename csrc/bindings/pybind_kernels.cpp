@@ -6056,6 +6056,46 @@ Bidirectional packed pass writing directly into caller-provided output storage.
 Returns number of written EndpointRecords (N_out <= out_records.shape[0]).
 Useful for file-backed memmap buffers to avoid RAM-only allocation limits.
 )doc")
+    .def("bdpt_connect",
+             [](PyRayTracer& self,
+                py::array_t<float, py::array::c_style | py::array::forcecast> records,
+                int n_px, int n_py, int sensor_gid,
+                int max_fwd_samples, uint32_t seed) {
+                 auto rb = records.request();
+                 if (rb.ndim != 2 || rb.shape[1] < 16)
+                     throw std::runtime_error("records must be float32 shape (n_records, 16)");
+                 const int n_records = static_cast<int>(rb.shape[0]);
+                 const py::ssize_t n_rgb = static_cast<py::ssize_t>(n_px) * n_py * 3;
+                 py::array_t<float> out({n_rgb});
+                 std::memset(out.mutable_data(), 0, sizeof(float) * static_cast<size_t>(n_rgb));
+                 int rc;
+                 {
+                     py::gil_scoped_release release;
+                     rc = ray_tracer_bdpt_connect(
+                         self.handle,
+                         reinterpret_cast<const EndpointRecord*>(rb.ptr),
+                         n_records, n_px, n_py, sensor_gid,
+                         max_fwd_samples, seed,
+                         out.mutable_data(), static_cast<int>(n_rgb));
+                 }
+                 if (rc != SK_OK)
+                     throw std::runtime_error(
+                         "ray_tracer_bdpt_connect failed: rc=" + std::to_string(rc));
+                 /* Return (n_py, n_px, 3) float32 image. */
+                 return out.reshape({(py::ssize_t)n_py, (py::ssize_t)n_px, (py::ssize_t)3});
+             },
+             py::arg("records"),
+             py::arg("n_px"), py::arg("n_py"), py::arg("sensor_gid"),
+             py::arg("max_fwd_samples") = 500,
+             py::arg("seed") = 0u,
+             R"doc(
+BDPT connection step: for every backward (sensor) scene vertex, sample up to
+max_fwd_samples forward (light) scene vertices in the same spectral band,
+cast a shadow ray, and accumulate f.amp * b.amp / dist² to the pixel encoded
+in the backward subpath_id.
+
+Returns (n_py, n_px, 3) float32 tonemapped RGB image.
+)doc")
     .def("reduce_endpoint_records_to_sensor_integral",
              [](PyRayTracer& self,
                 py::array_t<float, py::array::c_style | py::array::forcecast> records,

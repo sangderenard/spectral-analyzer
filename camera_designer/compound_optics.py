@@ -1408,18 +1408,33 @@ class CompoundLens:
                     return el.x_pos, el.aperture_r
             return 0.0, 0.0
 
-        # Trace a ray from the stop edge back to object space via reversed elements
-        # (paraxial approximation for pupil location)
+        # System matrix from first element to stop (reduced-angle convention).
         M = self._paraxial_matrix_to_stop()
-        # Marginal ray at stop: [y=r_stop, u=0]
+        A = float(M[0, 0])
+        B = float(M[0, 1])
+        D = float(M[1, 1])
         r_stop = stop.r_clear
-        y_ent  = M[0, 0] * r_stop           # image of stop edge in entrance space
-        # x position: track propagation
-        x_stop = stop.x_pos
-        # Paraxial: entrance pupil x is where the backward-traced chief ray would cross axis.
-        # Use the system matrix's x-mapping (simplified: report stop position for now;
-        # a full pupil trace uses the complete conjugate calculation).
-        return x_stop, abs(y_ent)
+
+        # x position of the first refractive element (reference plane for M).
+        x_first = stop.x_pos
+        for el in self._elements:
+            if isinstance(el, (ConicSurface, FlatSurface)):
+                x_first = el.x_pos
+                break
+
+        # Entrance pupil x: where a chief ray (y_stop=0) back-traced through M
+        # crosses the axis in object space.
+        # From M: A*y_first + B*nu_first = 0  →  y_first/nu_first = -B/A
+        # Crossing zero from x_first:  x_ep = x_first + B/A
+        if abs(A) > _EPS:
+            x_ep = x_first + B / A
+        else:
+            x_ep = x_first  # telecentric front: pupil at front surface
+
+        # Entrance pupil radius: height of marginal ray [r_stop, 0] back-traced.
+        # M_inv (det=1) = [[D, -B], [-C, A]]; y_first = D * r_stop.
+        r_ep = abs(D * r_stop)
+        return x_ep, r_ep
 
     @property
     def exit_pupil(self) -> Tuple[float, float]:

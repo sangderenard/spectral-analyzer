@@ -53,6 +53,7 @@
 #include "field_grid.h"
 #include "thread_pool.h"
 #include "optical_handlers.h"
+#include "bdpt_record.h"
 
 #include <mutex>
 #include <thread>
@@ -1213,8 +1214,13 @@ static inline const float* tri_neural_assembly_payload(
     return reinterpret_cast<const float*>(pb.data());
 }
 
-/* Return the manifold payload for any lens-teleport tri-group (kind=4 MLP,
- * kind=5 parametric).  Also returns a non-null sentinel for empty-payload
+/* Return the manifold payload for the active parametric-lens tri-group.
+ * NEURAL_ASSEMBLY/LUT payloads are intentionally not transport paths right now:
+ * they consumed time before the basic reversible camera was complete.  If one
+ * is encountered, return an absorber sentinel so it cannot masquerade as a
+ * valid optical transform.
+ *
+ * Also returns a non-null sentinel for empty-payload parametric-lens
  * groups (interior absorbers): check *out_bytes == 0 to distinguish absorbers
  * from teleport payloads.  Returns nullptr when the triangle carries no
  * manifold group at all (SDF_SPHERE, POLY_BARY, or unregistered). */
@@ -1225,8 +1231,12 @@ static inline const float* tri_manifold_payload(
     int gid = st.tri_param_group_of_tri[(size_t)tri_id];
     if (gid < 0 || (size_t)gid >= st.tri_group_parametric_kind.size()) return nullptr;
     const int kind = st.tri_group_parametric_kind[(size_t)gid];
-    if (kind != TRI_PARAM_SURFACE_NEURAL_ASSEMBLY &&
-        kind != TRI_PARAM_SURFACE_PARAMETRIC_LENS)
+    if (kind == TRI_PARAM_SURFACE_NEURAL_ASSEMBLY) {
+        static const float _disabled_neural_sentinel = 0.0f;
+        if (out_bytes) *out_bytes = 0;
+        return &_disabled_neural_sentinel;
+    }
+    if (kind != TRI_PARAM_SURFACE_PARAMETRIC_LENS)
         return nullptr;
     const auto& pb = st.tri_group_parametric_payload[(size_t)gid];
     if (out_bytes) *out_bytes = (int)pb.size();
@@ -1237,21 +1247,35 @@ static inline const float* tri_manifold_payload(
     return reinterpret_cast<const float*>(pb.data());
 }
 
-/* apply_neural_mlp_from_f32 — inner MLP dispatch that works directly from a
- * raw float32 payload pointer.  Called by both the scale-context path and the
- * parametric surface hit path. */
+/* apply_neural_mlp_from_f32 -- deferred MLP transport.
+ * Intention: restore only after the transform can report reversible optical
+ * metadata: direction mapping, OPL, eta/cosines, Jacobian, and PDFs. */
 static inline void apply_neural_mlp_from_f32(
     const RayTracerState& st,
     const float* p, int payload_bytes,
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len);
 
+struct ParametricLensTraceInfo {
+    double geom_len = 0.0;
+    double opl = 0.0;
+    double phase_space_jacobian = 1.0;
+    double first_cos_incident = 0.0;
+    double last_cos_transmitted = 0.0;
+    double first_eta_i = 1.0;
+    double last_eta_t = 1.0;
+    double throughput_multiplier = 1.0;
+    int reason = BDPT_OPT_REFRACTION;
+    std::vector<BdptOpticalEventRecord> events;
+};
+
 static inline bool apply_parametric_lens_from_f32(
     const RayTracerState& st,
     const float* p, int payload_bytes,
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len,
-    bool is_backward = false);
+    bool is_backward = false,
+    ParametricLensTraceInfo* trace_info = nullptr);
 
 static inline void apply_manifold_transfer_from_payload(
     const RayTracerState& st,
@@ -5069,11 +5093,14 @@ static int scheduler_advance_ray(
                 if (magic == 14949.0f) {
                     absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, pos, dir, amp, &rs.path_len);
                 } else if (magic == 14948.0f) {
-                    apply_neural_mlp_from_f32(st, mpp, nb_mfld, pos, dir, amp, &rs.path_len);
+                    /* Deferred: MLP transport is disabled until the basic
+                     * reversible parametric camera path is finished. */
+                    absorbed = true;
                 } else if (magic == 14946.0f || magic == 14947.0f ||
                            magic == 14950.0f || magic == 14951.0f) {
-                    apply_manifold_transfer_from_payload(st, mpp, nb_mfld,
-                        hit_pos, pos, dir, amp, &rs.path_len);
+                    /* Deferred: LUT transport is disabled until it can supply
+                     * the same reversible optical data as the parametric path. */
+                    absorbed = true;
                 } else {
                     absorbed = true;
                 }
@@ -5851,11 +5878,14 @@ static BounceStepResult ray_bounce_step_bdpt(
             if (magic == 14949.0f) {
                 absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, pos, dir, amp, &path_len, is_backward);
             } else if (magic == 14948.0f) {
-                apply_neural_mlp_from_f32(st, mpp, nb_mfld, pos, dir, amp, &path_len);
+                /* Deferred: MLP transport is disabled until the basic
+                 * reversible parametric camera path is finished. */
+                absorbed = true;
             } else if (magic == 14946.0f || magic == 14947.0f ||
                        magic == 14950.0f || magic == 14951.0f) {
-                apply_manifold_transfer_from_payload(st, mpp, nb_mfld,
-                    res.hit_pos, pos, dir, amp, &path_len);
+                /* Deferred: LUT transport is disabled until it can supply
+                 * the same reversible optical data as the parametric path. */
+                absorbed = true;
             } else {
                 absorbed = true;
             }
@@ -6705,375 +6735,28 @@ static inline void apply_manifold_transfer(
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len)
 {
-    if (!ctx.payload) return;
-    const float* p = static_cast<const float*>(ctx.payload);
-    if (ctx.payload_size_bytes < (int)(8 * sizeof(float))) return;
-    const bool is_v1 = (p[0] == 14946.0f);
-    const bool is_v2 = (p[0] == 14947.0f);
-    const bool is_v3 = (p[0] == 14950.0f);
-    const bool is_v4 = (p[0] == 14951.0f);
-    if (!is_v1 && !is_v2 && !is_v3 && !is_v4) return;   /* magic check */
-    if (is_v2 && ctx.payload_size_bytes < (int)(12 * sizeof(float))) return;
-    if ((is_v3 || is_v4) && ctx.payload_size_bytes < (int)(16 * sizeof(float))) return;
-
-    const int   n_u   = (int)p[1];
-    const int   n_v   = (int)p[2];
-    const int   n_a   = (is_v3 || is_v4) ? (int)p[3] : 1;
-    const int   n_b   = (is_v3 || is_v4) ? (int)p[4] : 1;
-    const float u_min = (is_v3 || is_v4) ? p[5]  : p[3];
-    const float u_max = (is_v3 || is_v4) ? p[6]  : p[4];
-    const float v_min = (is_v3 || is_v4) ? p[7]  : p[5];
-    const float v_max = (is_v3 || is_v4) ? p[8]  : p[6];
-    const float a_min = (is_v3 || is_v4) ? p[9]  : 0.0f;
-    const float a_max = (is_v3 || is_v4) ? p[10] : 0.0f;
-    const float b_min = (is_v3 || is_v4) ? p[11] : 0.0f;
-    const float b_max = (is_v3 || is_v4) ? p[12] : 0.0f;
-    const float r_ap  = (is_v3 || is_v4) ? p[13] : p[7];
-    const int   axis_idx = (is_v3 || is_v4) ? (int)p[14] : 2;
-    if (n_u <= 1 || n_v <= 1 || r_ap <= 0.0f) return;
-    if ((is_v3 || is_v4) && (n_a <= 1 || n_b <= 1)) return;
-
-    const int header_floats = (is_v3 || is_v4) ? 16 : (is_v2 ? 12 : 8);
-    const int cell_stride   = (is_v2 || is_v4) ? 9 : 7;
-    const size_t need_floats = (size_t)header_floats
-        + (size_t)n_u * (size_t)n_v * (size_t)n_a * (size_t)n_b * (size_t)cell_stride;
-    if ((size_t)ctx.payload_size_bytes < need_floats * sizeof(float)) return;
-
-    /* Project ray onto the LUT side plane. Legacy payloads use Z axis. */
-    const double denom = (axis_idx == 0) ? dir[0] : (axis_idx == 1 ? dir[1] : dir[2]);
-    if (std::abs(denom) < 1e-12) return;
-    const double plane = (axis_idx == 0) ? ctx.center[0] : (axis_idx == 1 ? ctx.center[1] : ctx.center[2]);
-    const double paxis = (axis_idx == 0) ? pos[0] : (axis_idx == 1 ? pos[1] : pos[2]);
-    const double t  = (plane - paxis) / denom;
-    const V3d ap_hit = pos + t * dir;
-
-    /* Normalised aperture UV — rays outside the aperture are blocked. */
-    float ap_u = 0.0f, ap_v = 0.0f, ang_a = 0.0f, ang_b = 0.0f;
-    if (axis_idx == 0) {
-        ap_u = (float)(ap_hit[1] / r_ap);
-        ap_v = (float)(ap_hit[2] / r_ap);
-        ang_a = (float)dir[1];
-        ang_b = (float)dir[2];
-    } else if (axis_idx == 1) {
-        ap_u = (float)(ap_hit[0] / r_ap);
-        ap_v = (float)(ap_hit[2] / r_ap);
-        ang_a = (float)dir[0];
-        ang_b = (float)dir[2];
-    } else {
-        ap_u = (float)(ap_hit[0] / r_ap);
-        ap_v = (float)(ap_hit[1] / r_ap);
-        ang_a = (float)dir[0];
-        ang_b = (float)dir[1];
-    }
-    if (ap_u < u_min || ap_u > u_max || ap_v < v_min || ap_v > v_max) {
-        kill_ray_amplitudes(amp);
-        return;
-    }
-    if ((is_v3 || is_v4) && (ang_a < a_min || ang_a > a_max || ang_b < b_min || ang_b > b_max)) {
-        kill_ray_amplitudes(amp);
-        return;
-    }
-
-    /* Continuous grid coordinates */
-    const float fu  = (ap_u - u_min) / (u_max - u_min) * (float)(n_u - 1);
-    const float fv  = (ap_v - v_min) / (v_max - v_min) * (float)(n_v - 1);
-    const int   iu0 = std::max(0, std::min(n_u - 2, (int)fu));
-    const int   iv0 = std::max(0, std::min(n_v - 2, (int)fv));
-    const float wu1 = fu - (float)iu0, wu0 = 1.0f - wu1;
-    const float wv1 = fv - (float)iv0, wv0 = 1.0f - wv1;
-    float wa0 = 1.0f, wa1 = 0.0f, wb0 = 1.0f, wb1 = 0.0f;
-    int ia0 = 0, ib0 = 0;
-    if (is_v3 || is_v4) {
-        const float fa  = (ang_a - a_min) / (a_max - a_min) * (float)(n_a - 1);
-        const float fb  = (ang_b - b_min) / (b_max - b_min) * (float)(n_b - 1);
-        ia0 = std::max(0, std::min(n_a - 2, (int)fa));
-        ib0 = std::max(0, std::min(n_b - 2, (int)fb));
-        wa1 = fa - (float)ia0; wa0 = 1.0f - wa1;
-        wb1 = fb - (float)ib0; wb0 = 1.0f - wb1;
-    }
-
-    const float* data = p + header_floats;
-    auto cell = [&](int iu, int iv, int ia, int ib) -> const float* {
-        const size_t idx = (((size_t)iv * (size_t)n_u + (size_t)iu)
-            * (size_t)n_b + (size_t)ib) * (size_t)n_a + (size_t)ia;
-        return data + idx * (size_t)cell_stride;
-    };
-
-    /* Bilinear blend of non-empty cells */
-    float odx = 0.0f, ody = 0.0f, odz = 0.0f, opl = 0.0f, tot_w = 0.0f;
-    float sx = 0.0f, sy = 0.0f;
-    auto blend = [&](int iu, int iv, int ia, int ib, float w) {
-        const float* c = cell(iu, iv, ia, ib);
-        if (c[4] > 0.0f) {
-            odx   += w * c[0];
-            ody   += w * c[1];
-            odz   += w * c[2];
-            opl   += w * c[3];
-            if (is_v2 || is_v4) {
-                sx += w * c[7];
-                sy += w * c[8];
-            }
-            tot_w += w;
-        }
-    };
-    if (is_v3 || is_v4) {
-        blend(iu0,   iv0,   ia0,   ib0,   wu0 * wv0 * wa0 * wb0);
-        blend(iu0+1, iv0,   ia0,   ib0,   wu1 * wv0 * wa0 * wb0);
-        blend(iu0,   iv0+1, ia0,   ib0,   wu0 * wv1 * wa0 * wb0);
-        blend(iu0+1, iv0+1, ia0,   ib0,   wu1 * wv1 * wa0 * wb0);
-        blend(iu0,   iv0,   ia0+1, ib0,   wu0 * wv0 * wa1 * wb0);
-        blend(iu0+1, iv0,   ia0+1, ib0,   wu1 * wv0 * wa1 * wb0);
-        blend(iu0,   iv0+1, ia0+1, ib0,   wu0 * wv1 * wa1 * wb0);
-        blend(iu0+1, iv0+1, ia0+1, ib0,   wu1 * wv1 * wa1 * wb0);
-        blend(iu0,   iv0,   ia0,   ib0+1, wu0 * wv0 * wa0 * wb1);
-        blend(iu0+1, iv0,   ia0,   ib0+1, wu1 * wv0 * wa0 * wb1);
-        blend(iu0,   iv0+1, ia0,   ib0+1, wu0 * wv1 * wa0 * wb1);
-        blend(iu0+1, iv0+1, ia0,   ib0+1, wu1 * wv1 * wa0 * wb1);
-        blend(iu0,   iv0,   ia0+1, ib0+1, wu0 * wv0 * wa1 * wb1);
-        blend(iu0+1, iv0,   ia0+1, ib0+1, wu1 * wv0 * wa1 * wb1);
-        blend(iu0,   iv0+1, ia0+1, ib0+1, wu0 * wv1 * wa1 * wb1);
-        blend(iu0+1, iv0+1, ia0+1, ib0+1, wu1 * wv1 * wa1 * wb1);
-    } else {
-        blend(iu0,   iv0,   0, 0, wu0 * wv0);
-        blend(iu0+1, iv0,   0, 0, wu1 * wv0);
-        blend(iu0,   iv0+1, 0, 0, wu0 * wv1);
-        blend(iu0+1, iv0+1, 0, 0, wu1 * wv1);
-    }
-
-    /* Empty cell region — no baked data means the aperture blocks here. */
-    if (tot_w < 1e-12f) {
-        kill_ray_amplitudes(amp);
-        return;
-    }
-
-    const float inv_w = 1.0f / tot_w;
-    odx *= inv_w;  ody *= inv_w;  odz *= inv_w;
-    opl *= inv_w;
-    const float norm = std::sqrt(odx*odx + ody*ody + odz*odz);
-    if (norm < 1e-12f) { kill_ray_amplitudes(amp); return; }
-
-    if (opl > 0.0f) {
-        /* V2 bakes OPL from z_front_ref onward. If the context sphere entry
-         * precedes z_front_ref the difference is free-space air, so add it. */
-        double skipped_opl_m = (double)opl;
-        if (is_v2) {
-            const double z_front_ref = (double)p[10];
-            if (std::isfinite(z_front_ref) && std::abs(dir[2]) > 1.0e-12) {
-                const double t_ref = (z_front_ref - pos[2]) / dir[2];
-                if (t_ref > 0.0) skipped_opl_m += t_ref;
-            }
-        }
-        const double c0 = (st.speed_m_s > EPS) ? st.speed_m_s : 299792458.0;
-        for (int b = 0; b < st.n_bands; ++b) {
-            /* Phase only — atmo_abs does not apply inside the optical assembly. */
-            const double phase = TWO_PI * st.freq_hz_vec[b] * skipped_opl_m / c0;
-            amp[b] *= cd(std::cos(phase), std::sin(phase));
-        }
-        if (path_len) *path_len += skipped_opl_m;
-    }
-
-    dir = V3d((double)(odx / norm), (double)(ody / norm), (double)(odz / norm));
-    if (is_v2 || is_v4) {
-        sx *= inv_w;
-        sy *= inv_w;
-        const double sensor_axis = (is_v4 ? (double)p[15] : (double)p[8]);
-        V3d sensor_hit;
-        if (axis_idx == 0) sensor_hit = V3d(sensor_axis, (double)sx, (double)sy);
-        else if (axis_idx == 1) sensor_hit = V3d((double)sx, sensor_axis, (double)sy);
-        else sensor_hit = V3d((double)sx, (double)sy, sensor_axis);
-        pos = sensor_hit - dir * (EPS * 200.0);
-    } else {
-        pos = ap_hit;
-    }
+    (void)st; (void)ctx; (void)pos; (void)dir; (void)path_len;
+    /* Deferred: LUT/spline/neural manifold transport is disabled while the
+     * basic reversible camera path is being completed.  Re-enable only with
+     * OPL, Jacobian, eta/cosine, and valid forward/reverse PDF records. */
+    kill_ray_amplitudes(amp);
 }
 
-/* apply_neural_mlp_from_f32 — bidirectional surface-to-surface noodle manifold.
- *
- * Teleports any ray hitting a registered surface to the paired surface.
- * Direction-agnostic: the ray continues in whatever axial direction it arrived from.
- * p[15] side is kept for geometry registration only (which z is entry, which is exit).
- *
- * Payload layout (float32):
- *   Header (16 floats):
- *     [0]  14948.0    magic
- *     [1]  n_layers   total layer count (hidden + output)
- *     [2]  input_dim  must be 5
- *     [3]  hidden_dim
- *     [4]  output_dim must be 6
- *     [5]  z_entry    this surface plane z (metres)
- *     [6]  z_exit     destination surface plane z (metres)
- *     [7..9] reserved
- *     [10] r_lens     physical lens radius (0 = skip check)
- *     [11] roc        (set by registration)
- *     [12] k          (set by registration)
- *     [13] axis_idx   0=X, 1=Y, 2=Z (default)
- *     [14] r_out      (set by registration)
- *     [15] side       0=forward/entry, 1=backward/exit
- *
- *   Normalization (22 floats, NORM_FLOATS = 5*2 + 6*2):
- *     [16..20]  in_mean[5]
- *     [21..25]  in_scale[5]
- *     [26..31]  out_mean[6]
- *     [32..37]  out_scale[6]
- *
- *   Layer data starting at [38] (LAYER_OFFSET = 38):
- *     layer 0:      hidden_dim × input_dim  weights + hidden_dim bias
- *     layer 1..n-2: hidden_dim × hidden_dim weights + hidden_dim bias
- *     layer n-1:    output_dim × hidden_dim weights + output_dim bias
- *
- *   MLP inputs — entry-surface canonical frame (angles relative to theta_hit):
- *     [0] r_in          radial hit distance (m)
- *     [1] dir_r_in      radial direction component
- *     [2] dir_phi_in    azimuthal direction component
- *     [3] dir_z_in      axial direction, positive = into surface
- *     [4] wavelength_um vacuum wavelength (µm)
- *
- *   MLP outputs — all relative to theta_hit:
- *     [0] r_out         radial distance on exit surface (m)
- *     [1] delta_phi     azimuth offset theta_out − theta_hit (rad)
- *     [2] dir_r_out     radial direction at exit
- *     [3] dir_phi_out   azimuthal direction at exit
- *     [4] dir_z_out     axial direction at exit, positive = away from entry
- *     [5] opl           optical path length entry→exit (m)
- */
+/* apply_neural_mlp_from_f32 -- deferred MLP transport.
+ * Intention: restore only after the transform can report reversible optical
+ * metadata: direction mapping, OPL, eta/cosines, Jacobian, and PDFs. */
 static inline void apply_neural_mlp_from_f32(
     const RayTracerState& st,
     const float* p, int payload_bytes,
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len)
 {
-    if (!p) return;
-    if (payload_bytes < (int)(38 * sizeof(float))) return;
-    if (p[0] != 14948.0f) return;
-
-    const int   n_layers  = (int)p[1];
-    const int   input_dim = (int)p[2];   /* must be 5 */
-    const int   hidden_dim= (int)p[3];
-    const int   output_dim= (int)p[4];   /* must be 6 */
-    const float z_exit    = p[6];
-
-    if (input_dim != 5 /* N_INPUTS=5 */ || output_dim != 6 /* N_OUTPUTS=6 */
-        || n_layers < 2 || hidden_dim < 1) return;
-
-    const int axis_idx = (int)p[13];
-    const int ax = (axis_idx >= 0 && axis_idx <= 2) ? axis_idx : 2;
-    const int t0 = (ax == 0) ? 1 : 0;
-    const int t1 = (ax == 2) ? 1 : 2;
-    /* Normalization block at [16..37] (HEADER_FLOATS=16, NORM_FLOATS=22). */
-    const float* in_mean  = p + 16;
-    const float* in_scale = p + 21;   /* in_mean + N_INPUTS=5 */
-    const float* out_mean = p + 26;   /* in_scale + N_INPUTS=5 */
-    const float* out_scl  = p + 32;   /* out_mean + N_OUTPUTS=6 */
-
-    const size_t min_layer_floats =
-        (size_t)hidden_dim * (size_t)input_dim  + (size_t)hidden_dim
-      + (size_t)output_dim * (size_t)hidden_dim + (size_t)output_dim;
-    if ((size_t)payload_bytes < 38u * sizeof(float)
-                              + min_layer_floats * sizeof(float))
-        return;
-
-    /* Entry-surface canonical frame: pos is already on the hit surface. */
-    const float x_hit     = (float)pos[t0];
-    const float y_hit     = (float)pos[t1];
-    const float theta_hit = std::atan2(y_hit, x_hit);
-    const float r_in      = std::hypot(x_hit, y_hit);
-    const float cos_t     = std::cos(theta_hit);
-    const float sin_t     = std::sin(theta_hit);
-
-    const float dx_in      = (float)dir[t0];
-    const float dy_in      = (float)dir[t1];
-    const float dir_r_in   =  dx_in * cos_t + dy_in * sin_t;
-    const float dir_phi_in = -dx_in * sin_t + dy_in * cos_t;
-    const float dir_z_in = std::abs((float)dir[ax]);
-    if (dir_z_in < 1e-9f) return;
-
-    const double c0 = (st.speed_m_s > EPS) ? st.speed_m_s : 299792458.0;
-
-    int    ref_band = -1;
-    double ref_ex = 0.0, ref_ey = 0.0;
-    double ref_dx = 0.0, ref_dy = 0.0, ref_dz = 0.0;
-    double ref_opl = 0.0;
-
-    float buf0[512], buf1[512];
-
-    for (int b = 0; b < st.n_bands; ++b) {
-        const double wavelength_um = (c0 / st.freq_hz_vec[b]) * 1.0e6;
-
-        const float raw_in[5] = {
-            r_in, dir_r_in, dir_phi_in, dir_z_in, (float)wavelength_um
-        };
-        for (int i = 0; i < 5 /* N_INPUTS=5 */; ++i) {
-            const float s = std::max(std::abs(in_scale[i]), 1e-12f);
-            buf0[i] = (raw_in[i] - in_mean[i]) / s;
-        }
-
-        /* Forward pass — LAYER_OFFSET = 38. */
-        const float* w_ptr = p + 38;
-        for (int l = 0; l < n_layers; ++l) {
-            const int in_d  = (l == 0)           ? input_dim  : hidden_dim;
-            const int out_d = (l == n_layers - 1) ? output_dim : hidden_dim;
-            const float* W  = w_ptr;
-            const float* bv = w_ptr + out_d * in_d;
-            w_ptr += out_d * in_d + out_d;
-            const bool relu = (l < n_layers - 1);
-            for (int j = 0; j < out_d; ++j) {
-                float acc = bv[j];
-                const float* row = W + j * in_d;
-                for (int i = 0; i < in_d; ++i)
-                    acc += row[i] * buf0[i];
-                buf1[j] = (relu && acc < 0.0f) ? 0.0f : acc;
-            }
-            for (int i = 0; i < out_d; ++i) buf0[i] = buf1[i];
-        }
-
-        /* Denormalize all 6 outputs. */
-        const float r_out       = buf0[0] * out_scl[0] + out_mean[0];
-        const float delta_phi   = buf0[1] * out_scl[1] + out_mean[1];
-        const float dir_r_out   = buf0[2] * out_scl[2] + out_mean[2];
-        const float dir_phi_out = buf0[3] * out_scl[3] + out_mean[3];
-        const float dir_z_out   = buf0[4] * out_scl[4] + out_mean[4];
-        const double opl        = (double)(buf0[5] * out_scl[5] + out_mean[5]);
-
-        /* Reconstruct exit position in Cartesian. */
-        const float theta_out = theta_hit + delta_phi;
-        const float ex        = r_out * std::cos(theta_out);
-        const float ey        = r_out * std::sin(theta_out);
-
-        float out_dx = dir_r_out * cos_t - dir_phi_out * sin_t;
-        float out_dy = dir_r_out * sin_t + dir_phi_out * cos_t;
-        float out_dz = dir_z_out;
-
-        const float dnorm = std::sqrt(out_dx*out_dx + out_dy*out_dy + out_dz*out_dz);
-        if (dnorm < 1e-12f) { amp[b] = cd(0.0, 0.0); continue; }
-        out_dx /= dnorm;  out_dy /= dnorm;  out_dz /= dnorm;
-
-        const double phase = TWO_PI * st.freq_hz_vec[b] * opl / c0;
-        amp[b] *= cd(std::cos(phase), std::sin(phase));
-
-        if (ref_band < 0 || b == 0) {
-            ref_band = b;
-            ref_ex  = (double)ex;    ref_ey  = (double)ey;
-            ref_dx  = (double)out_dx; ref_dy = (double)out_dy; ref_dz = (double)out_dz;
-            ref_opl = opl;
-        }
-    }
-
-    if (ref_band < 0) return;
-
-    if (path_len) *path_len += ref_opl;
-
-    const double rnorm = std::sqrt(ref_dx*ref_dx + ref_dy*ref_dy + ref_dz*ref_dz);
-    if (rnorm < 1e-12) { kill_ray_amplitudes(amp); return; }
-    V3d new_dir;
-    new_dir[ax] = ref_dz / rnorm;
-    new_dir[t0] = ref_dx / rnorm;
-    new_dir[t1] = ref_dy / rnorm;
-    V3d new_pos;
-    new_pos[ax] = (double)z_exit;
-    new_pos[t0] = ref_ex;
-    new_pos[t1] = ref_ey;
-    dir = new_dir;
-    pos = new_pos - dir * (EPS * 200.0);
+    (void)st; (void)p; (void)payload_bytes; (void)pos; (void)dir; (void)path_len;
+    /* Deferred: the MLP surface transport is disabled until the basic camera
+     * path has a complete reversible optical contract.  When restored, this
+     * must emit the same data as the parametric lens path: direction mapping,
+     * OPL, eta/cosines, Jacobian, and valid forward/reverse PDFs. */
+    kill_ray_amplitudes(amp);
 }
 
 /* ── apply_parametric_lens_from_f32 ─────────────────────────────────────────
@@ -7088,8 +6771,10 @@ static inline bool apply_parametric_lens_from_f32(
     const float* p, int payload_bytes,
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len,
-    bool is_backward)
+    bool is_backward,
+    ParametricLensTraceInfo* trace_info)
 {
+    ParametricLensTraceInfo local_trace{};
     if (!p) return true;
     if (payload_bytes < (int)(8 * sizeof(float))) return true;
     if (p[0] != 14949.0f) return true;    /* PLENS_MAGIC */
@@ -7100,6 +6785,7 @@ static inline bool apply_parametric_lens_from_f32(
 
     if (n_surf < 1 || n_surf > 64) return true;
     if (payload_bytes < (int)((8 + n_surf * 8) * sizeof(float))) return true;
+    local_trace.events.reserve(static_cast<size_t>(n_surf));
 
     /* Lens hood check (only for forward direction). */
     if (!is_backward && hood_r > 0.0f && std::abs(dir[0]) > 1e-12) {
@@ -7143,6 +6829,8 @@ static inline bool apply_parametric_lens_from_f32(
          *
          * si>0: the previous Snell step left rp just in front of the next
          * surface; t must be strictly forward (> 2e-7 m). */
+        double seg_t = 0.0;
+        double seg_opl = 0.0;
         {
             const double t_min = (si == 0) ? -1e-2 : 2e-7;
             double t = 1e30;
@@ -7183,13 +6871,38 @@ static inline bool apply_parametric_lens_from_f32(
                 }
             }
             if (t < t_min) return true;
-            opl += n_bf * t;
+            seg_t = t;
+            seg_opl = n_bf * t;
+            opl += seg_opl;
+            local_trace.geom_len += std::abs(t);
             rp  += t * rd;
         }
 
         /* Aperture/stop check. */
         const double r_tr = std::hypot(rp[1], rp[2]);
-        if (ap_r > 0.0 && r_tr > ap_r) return true;
+        if (ap_r > 0.0 && r_tr > ap_r) {
+            local_trace.reason = BDPT_OPT_APERTURE_CLIP;
+            BdptOpticalEventRecord ev{};
+            ev.element_index = static_cast<uint16_t>(s);
+            ev.reason = BDPT_OPT_APERTURE_CLIP;
+            ev.pos[0] = static_cast<float>(rp.x());
+            ev.pos[1] = static_cast<float>(rp.y());
+            ev.pos[2] = static_cast<float>(rp.z());
+            ev.dir_in[0] = static_cast<float>(rd.x());
+            ev.dir_in[1] = static_cast<float>(rd.y());
+            ev.dir_in[2] = static_cast<float>(rd.z());
+            ev.eta_i = static_cast<float>(n_bf);
+            ev.eta_t = static_cast<float>(n_af);
+            ev.opl = static_cast<float>(seg_opl);
+            ev.geom_len = static_cast<float>(std::abs(seg_t));
+            ev.aperture_radius = static_cast<float>(ap_r);
+            ev.transverse_radius = static_cast<float>(r_tr);
+            ev.dist_past_aperture = static_cast<float>(r_tr - ap_r);
+            ev.phase_space_jacobian = 1.0f;
+            local_trace.events.push_back(ev);
+            if (trace_info) *trace_info = local_trace;
+            return true;
+        }
         if (is_stop) continue;
 
         /* Exact surface normal (gradient of conic implicit). */
@@ -7210,12 +6923,60 @@ static inline bool apply_parametric_lens_from_f32(
         const double cos_i  = -rd.dot(surf_n);
         const double eta    = n_bf / n_af;
         const double sin2_t = eta * eta * std::max(0.0, 1.0 - cos_i*cos_i);
-        if (sin2_t > 1.0) return true;   /* TIR */
+        BdptOpticalEventRecord ev{};
+        ev.element_index = static_cast<uint16_t>(s);
+        ev.pos[0] = static_cast<float>(rp.x());
+        ev.pos[1] = static_cast<float>(rp.y());
+        ev.pos[2] = static_cast<float>(rp.z());
+        ev.normal[0] = static_cast<float>(surf_n.x());
+        ev.normal[1] = static_cast<float>(surf_n.y());
+        ev.normal[2] = static_cast<float>(surf_n.z());
+        ev.dir_in[0] = static_cast<float>(rd.x());
+        ev.dir_in[1] = static_cast<float>(rd.y());
+        ev.dir_in[2] = static_cast<float>(rd.z());
+        ev.cos_incident = static_cast<float>(cos_i);
+        ev.eta_i = static_cast<float>(n_bf);
+        ev.eta_t = static_cast<float>(n_af);
+        ev.opl = static_cast<float>(seg_opl);
+        ev.geom_len = static_cast<float>(std::abs(seg_t));
+        ev.aperture_radius = static_cast<float>(ap_r);
+        ev.transverse_radius = static_cast<float>(r_tr);
+        if (sin2_t > 1.0) {
+            local_trace.reason = BDPT_OPT_TIR;
+            ev.reason = BDPT_OPT_TIR;
+            ev.fresnel_reflectance = 1.0f;
+            ev.transmittance = 0.0f;
+            ev.phase_space_jacobian = 1.0f;
+            local_trace.events.push_back(ev);
+            if (trace_info) *trace_info = local_trace;
+            return true;
+        }
         const double cos_t  = std::sqrt(1.0 - sin2_t);
+        const double Rf     = fresnel_R(cos_i, cos_t, n_bf, n_af);
+        const double J      = (cos_i > EPS && cos_t > EPS)
+            ? (eta * eta) * (cos_t / cos_i) : 0.0;
+        if (local_trace.first_cos_incident <= 0.0) {
+            local_trace.first_cos_incident = cos_i;
+            local_trace.first_eta_i = n_bf;
+        }
+        local_trace.last_cos_transmitted = cos_t;
+        local_trace.last_eta_t = n_af;
+        if (cos_i > EPS && cos_t > EPS)
+            local_trace.phase_space_jacobian *= J;
         V3d refr = eta * rd + (eta * cos_i - cos_t) * surf_n;
         const double rn = refr.norm();
         if (rn < 1e-14) return true;
         rd = refr / rn;
+        ev.reason = BDPT_OPT_REFRACTION;
+        ev.dir_out[0] = static_cast<float>(rd.x());
+        ev.dir_out[1] = static_cast<float>(rd.y());
+        ev.dir_out[2] = static_cast<float>(rd.z());
+        ev.cos_transmitted = static_cast<float>(cos_t);
+        ev.fresnel_reflectance = static_cast<float>(Rf);
+        ev.transmittance = static_cast<float>(1.0 - Rf);
+        ev.throughput_multiplier = static_cast<float>(1.0 - Rf);
+        ev.phase_space_jacobian = static_cast<float>(J);
+        local_trace.events.push_back(ev);
     }
 
     /* Accumulate OPL phase on all bands. */
@@ -7227,9 +6988,11 @@ static inline bool apply_parametric_lens_from_f32(
         }
         *path_len += opl;
     }
+    local_trace.opl = opl;
 
     pos = rp + rd * (EPS * 200.0);
     dir = rd;
+    if (trace_info) *trace_info = local_trace;
     return false;   /* teleported */
 }
 
@@ -7244,25 +7007,10 @@ static inline void apply_manifold_transfer_from_payload(
     V3d& pos, V3d& dir, VXcd& amp,
     double* path_len)
 {
-    if (!p) { kill_ray_amplitudes(amp); return; }
-    if (payload_bytes < (int)(8 * sizeof(float))) { kill_ray_amplitudes(amp); return; }
-    /* Construct a temporary RtScaleContext so we can reuse apply_manifold_transfer. */
-    RtScaleContext tmp_ctx;
-    std::memset(&tmp_ctx, 0, sizeof(tmp_ctx));
-    tmp_ctx.payload            = p;
-    tmp_ctx.payload_size_bytes = payload_bytes;
-    /* axis_idx is stored at p[14] for V3/V4 or defaults to 2 (Z). */
-    const bool is_v3v4 = (p[0] == 14950.0f || p[0] == 14951.0f);
-    const int  ax_idx  = is_v3v4 ? (int)p[14] : 2;
-    /* Set center on the aperture plane using the BVH hit position. */
-    tmp_ctx.center[0] = (float)ap_hit[0];
-    tmp_ctx.center[1] = (float)ap_hit[1];
-    tmp_ctx.center[2] = (float)ap_hit[2];
-    /* Override: set the axis component to the exact hit pos so t=0 in the
-     * projection step of apply_manifold_transfer and ap_hit = pos. */
-    (void)ax_idx;
-    pos = ap_hit;   /* ray is already at the aperture plane */
-    apply_manifold_transfer(st, tmp_ctx, pos, dir, amp, path_len);
+    (void)st; (void)p; (void)payload_bytes; (void)ap_hit; (void)pos; (void)dir; (void)path_len;
+    /* Deferred: LUT/spline manifold transport is disabled until it can provide
+     * reversible optical metadata instead of an opaque teleport. */
+    kill_ray_amplitudes(amp);
 }
 
 /* ── seek_parametric_entry_s0 ────────────────────────────────────────────────
@@ -7438,10 +7186,10 @@ static inline uint32_t dispatch_scale_context_entry(
         case SCALE_CONTEXT_KIND_SPLINE_SURFACE:
             return 1u << SCALE_CONTEXT_KIND_SPLINE_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_SURFACE:
-            if (ctx.payload && static_cast<const float*>(ctx.payload)[0] == 14948.0f)
-                apply_neural_mlp_transfer(st, ctx, pos, dir, amp, path_len);
-            else
-                apply_manifold_transfer(st, ctx, pos, dir, amp, path_len);
+            /* Deferred: neural/LUT scale-context transforms are disabled until
+             * they carry the same reversible optical contract as the parametric
+             * lens path. */
+            kill_ray_amplitudes(amp);
             return 1u << SCALE_CONTEXT_KIND_NEURAL_SURFACE;
         case SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC:
             return 1u << SCALE_CONTEXT_KIND_NEURAL_VOLUMETRIC;
@@ -7471,6 +7219,66 @@ struct RayPipelineState {
     PipelineQueue<RefinedHit> Q_refined;
     PipelineQueue<WaveIntent> Q_wave;
     PipelineQueue<RayRecord>  Q_out;    /* output records drained by the caller */
+
+    /* ── BDPT side-data queues — never mixed into Q_out ──────────────────────
+     * Each queue is drained separately via a dedicated pybind function.
+     * Emission sites: T1 → Q_bdpt_vertices, T2/lens → Q_bdpt_optical,
+     *                 T3 → Q_bdpt_pdfs + Q_bdpt_spectral. */
+    PipelineQueue<BdptVertexRecord>         Q_bdpt_vertices;
+    PipelineQueue<BdptSpectralWeightRecord> Q_bdpt_spectral;
+    PipelineQueue<BdptPdfRecord>            Q_bdpt_pdfs;
+    PipelineQueue<BdptOpticalEventRecord>   Q_bdpt_optical;
+    PipelineQueue<BdptConnectionRecord>     Q_bdpt_connections;
+
+    /* Overflow counters — incremented when a side queue is full.
+     * Never wraps: saturate at UINT64_MAX. */
+    std::atomic<uint64_t>     bdpt_overflow_vertices{0};
+    std::atomic<uint64_t>     bdpt_overflow_spectral{0};
+    std::atomic<uint64_t>     bdpt_overflow_pdfs{0};
+    std::atomic<uint64_t>     bdpt_overflow_optical{0};
+    std::atomic<uint64_t>     bdpt_overflow_connections{0};
+
+    /* Bounded push helpers — drop + count when at cap. */
+    void push_bdpt_vertex(BdptVertexRecord r) {
+        int cap = cfg.bdpt_max_vertices;
+        if (cap > 0 && Q_bdpt_vertices.size() >= cap) {
+            bdpt_overflow_vertices.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Q_bdpt_vertices.push(std::move(r));
+    }
+    void push_bdpt_spectral(BdptSpectralWeightRecord r) {
+        int cap = cfg.bdpt_max_spectral;
+        if (cap > 0 && Q_bdpt_spectral.size() >= cap) {
+            bdpt_overflow_spectral.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Q_bdpt_spectral.push(std::move(r));
+    }
+    void push_bdpt_pdf(BdptPdfRecord r) {
+        int cap = cfg.bdpt_max_pdfs;
+        if (cap > 0 && Q_bdpt_pdfs.size() >= cap) {
+            bdpt_overflow_pdfs.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Q_bdpt_pdfs.push(std::move(r));
+    }
+    void push_bdpt_optical(BdptOpticalEventRecord r) {
+        int cap = cfg.bdpt_max_optical;
+        if (cap > 0 && Q_bdpt_optical.size() >= cap) {
+            bdpt_overflow_optical.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Q_bdpt_optical.push(std::move(r));
+    }
+    void push_bdpt_connection(BdptConnectionRecord r) {
+        int cap = cfg.bdpt_max_connections;
+        if (cap > 0 && Q_bdpt_connections.size() >= cap) {
+            bdpt_overflow_connections.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        Q_bdpt_connections.push(std::move(r));
+    }
 
     std::atomic<int>          in_flight{0};
 
@@ -7513,6 +7321,11 @@ struct RayPipelineState {
     std::atomic<uint64_t>     bdpt_best_colinear_bits{0};
     std::atomic<uint64_t>     bdpt_exact_snaps{0};
     std::atomic<uint64_t>     bdpt_near_miss_count{0};
+
+    /* Count of camera-stream BDPT vertices emitted since last auto-trigger.
+     * Reset to 0 by the auto-trigger when it fires.  Used by pipeline_material
+     * to detect sweep completion without any Python involvement. */
+    std::atomic<uint64_t>     bdpt_cam_vertex_count{0};
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7585,8 +7398,9 @@ public:
         uloc_t2 = {-1,-1,-1,-1};
     struct { GLint n_bands, n_mats, max_children, max_children_per_hit,
                    sensor_res, sensor_pr, sensor_px,
-                   n_uv_groups, uv_meta_base, rng_seed; }
-        uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+                   n_uv_groups, uv_meta_base, rng_seed,
+                   bdpt_max_verts, bdpt_max_spectral, bdpt_max_pdfs; }
+        uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     struct { GLint mode, nx, ny, n_bands, dx, dz, wavelengths; }
         uloc_t4 = {-1,-1,-1,-1,-1,-1,-1};
 
@@ -7615,6 +7429,15 @@ public:
      * Only [0] and [1] are zeroed before each dispatch; eps_flags are written
      * at scene-upload time and persist across dispatches. */
     GLuint ssbo_t3_meta     = 0;
+    /* BDPT side-data SSBOs: one uint32 per hit (subpath id) + output record buffers */
+    GLuint ssbo_bdpt_ids      = 0;  /* uint32 per hit: bdpt_subpath_id from T1 */
+    GLuint ssbo_bdpt_verts    = 0;  /* float32: BdptVertexRecord output (28 floats each) */
+    GLuint ssbo_bdpt_spectral = 0;  /* float32: BdptSpectralWeightRecord output (8 floats each) */
+    GLuint ssbo_bdpt_pdfs     = 0;  /* float32: BdptPdfRecord output (12 floats each) */
+    GLuint ssbo_bdpt_counters = 0;  /* uint32[3]: [0]=vertex_count, [1]=spectral_count, [2]=pdf_count */
+    int    cap_bdpt_verts     = 0;
+    int    cap_bdpt_spectral  = 0;
+    int    cap_bdpt_pdfs      = 0;
     /* UV integrator image: per-tri UV data + per-tri group mapping,
      * per-group metadata, and the flat atomic accumulator. */
     GLuint ssbo_tri_uv          = 0;  /* binding 5: n_tris*6 float32 UV vertex coords         */
@@ -7639,10 +7462,13 @@ public:
 
     /* CPU-side staging buffers — grown as needed, never shrunk.
      * Eliminates large malloc/free pairs per dispatch batch. */
-    std::vector<float>     stg_ibuf;     /* intent upload (n*INTENT_STRIDE)             */
-    std::vector<float>     stg_cbuf;     /* child intent readback (nc*CHILD_STRIDE)     */
-    std::vector<float>     stg_tbuf;     /* terminal readback (nt_term*TERMINAL_STRIDE) */
-    std::vector<float>     stg_hbuf;     /* hit readback (n_hits*HIT_STRIDE)            */
+    std::vector<float>     stg_ibuf;          /* intent upload (n*INTENT_STRIDE)             */
+    std::vector<float>     stg_cbuf;          /* child intent readback (nc*CHILD_STRIDE)     */
+    std::vector<float>     stg_tbuf;          /* terminal readback (nt_term*TERMINAL_STRIDE) */
+    std::vector<float>     stg_hbuf;          /* hit readback (n_hits*HIT_STRIDE)            */
+    std::vector<float>     stg_bdpt_verts;    /* BdptVertexRecord readback                   */
+    std::vector<float>     stg_bdpt_spectral; /* BdptSpectralWeightRecord readback           */
+    std::vector<float>     stg_bdpt_pdfs;     /* BdptPdfRecord readback                      */
     std::vector<RayRecord> stg_strike;   /* STRIKE records for Q_out                   */
     std::vector<RayIntent> stg_children; /* child intents for push_many                */
     std::vector<uint32_t>  stg_uv_acc;  /* UV accumulator readback                    */
@@ -7883,6 +7709,9 @@ public:
         uloc_t3.n_uv_groups          = glc_GetUniformLocation(prog_t3, "n_uv_groups");
         uloc_t3.uv_meta_base         = glc_GetUniformLocation(prog_t3, "uv_meta_base");
         uloc_t3.rng_seed             = glc_GetUniformLocation(prog_t3, "rng_seed");
+        uloc_t3.bdpt_max_verts       = glc_GetUniformLocation(prog_t3, "bdpt_max_verts");
+        uloc_t3.bdpt_max_spectral    = glc_GetUniformLocation(prog_t3, "bdpt_max_spectral");
+        uloc_t3.bdpt_max_pdfs        = glc_GetUniformLocation(prog_t3, "bdpt_max_pdfs");
 
         uloc_t4.mode        = glc_GetUniformLocation(prog_t4, "mode");
         uloc_t4.nx          = glc_GetUniformLocation(prog_t4, "nx");
@@ -8226,7 +8055,8 @@ public:
             row[14] = rt_u32_as_f32(tag_hi);
             row[15] = rt_u32_as_f32((uint32_t)ri.color_flag);
             row[16] = ri.priority;
-            row[17] = ri.sensor_origin_y; row[18] = ri.sensor_origin_z; row[19] = 0.0f;
+            row[17] = ri.sensor_origin_y; row[18] = ri.sensor_origin_z;
+            row[19] = rt_u32_as_f32((uint32_t)ri.bdpt_subpath_id); /* bdpt_subpath_id in _pad */
             const int bands = std::min(nb, 16);
             for (int b = 0; b < bands; ++b) {
                 row[20+b] = (float)ri.amp[b].real();
@@ -8244,13 +8074,43 @@ public:
         if (max_hits > cap_hits) {
             cap_hits = max_hits * 2;
             ensure_ssbo(ssbo_hit, (GLsizeiptr)(cap_hits * HIT_STRIDE * sizeof(float)));
+            /* BdptIdBuf: one uint32 per hit slot, same capacity as ssbo_hit. */
+            ensure_ssbo(ssbo_bdpt_ids, (GLsizeiptr)(cap_hits * sizeof(uint32_t)));
         }
+
+        /* ── Ensure BDPT output SSBOs ────────────────────────────────────── */
+        static constexpr int BDPT_VERTEX_STRIDE_F   = 28;  /* floats per BdptVertexRecord */
+        static constexpr int BDPT_SPECTRAL_STRIDE_F =  8;  /* floats per BdptSpectralWeightRecord */
+        static constexpr int BDPT_PDF_STRIDE_F      = 12;  /* floats per BdptPdfRecord */
+        const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 2000000;
+        const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 4000000;
+        const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 2000000;
+        if (max_bdpt_v > cap_bdpt_verts) {
+            cap_bdpt_verts = max_bdpt_v;
+            ensure_ssbo(ssbo_bdpt_verts, (GLsizeiptr)((int64_t)cap_bdpt_verts * BDPT_VERTEX_STRIDE_F * sizeof(float)));
+        }
+        if (max_bdpt_s > cap_bdpt_spectral) {
+            cap_bdpt_spectral = max_bdpt_s;
+            ensure_ssbo(ssbo_bdpt_spectral, (GLsizeiptr)((int64_t)cap_bdpt_spectral * BDPT_SPECTRAL_STRIDE_F * sizeof(float)));
+        }
+        if (max_bdpt_p > cap_bdpt_pdfs) {
+            cap_bdpt_pdfs = max_bdpt_p;
+            ensure_ssbo(ssbo_bdpt_pdfs, (GLsizeiptr)((int64_t)cap_bdpt_pdfs * BDPT_PDF_STRIDE_F * sizeof(float)));
+        }
+        ensure_ssbo(ssbo_bdpt_counters, 3 * sizeof(uint32_t));
 
         /* Zero counter SSBO */
         {
             uint32_t zeros[8] = {};
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8 * sizeof(uint32_t), zeros);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+        /* Zero BDPT counters */
+        {
+            uint32_t bzeros[3] = {};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_counters);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 3 * sizeof(uint32_t), bzeros);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         }
 
@@ -8261,6 +8121,7 @@ public:
         bind_ssbo(ssbo_counter,    2); bind_ssbo(ssbo_bvh,       3);
         bind_ssbo(ssbo_tri_id,     4); bind_ssbo(ssbo_tri_full,  5);
         bind_ssbo(ssbo_mat_band,   6); bind_ssbo(ssbo_scene_band,7);
+        bind_ssbo(ssbo_bdpt_ids,   9);  /* BDPT: write bdpt_subpath_id per hit slot */
         glc_Uniform1i(uloc_t1.n_intents, n);
         glc_Uniform1i(uloc_t1.n_bands,   nb);
         glc_Uniform1i(uloc_t1.n_mats,    nm);
@@ -8348,6 +8209,11 @@ public:
         bind_ssbo(ssbo_tri_uv_and_meta, 6);
         bind_ssbo(ssbo_uv_accum,        7);
         bind_ssbo(ssbo_counter,         8);  /* T1 counters — read by shader for n_hits */
+        bind_ssbo(ssbo_bdpt_ids,        9);  /* BDPT: bdpt_subpath_id per hit slot (read-only) */
+        bind_ssbo(ssbo_bdpt_verts,     10);  /* BDPT: BdptVertexRecord output */
+        bind_ssbo(ssbo_bdpt_spectral,  11);  /* BDPT: BdptSpectralWeightRecord output */
+        bind_ssbo(ssbo_bdpt_counters,  12);  /* BDPT: atomic counts */
+        bind_ssbo(ssbo_bdpt_pdfs,      13);  /* BDPT: BdptPdfRecord output */
         const int n_uv_groups  = (int)st.group_uv_res.size();
         const int uv_meta_base = (int)st.tri_uv_group_of_tri.size();
         /* n_hits uniform removed — shader reads t1_counters[0] from binding 8 */
@@ -8361,6 +8227,9 @@ public:
         glc_Uniform1i (uloc_t3.n_uv_groups,           n_uv_groups);
         glc_Uniform1i (uloc_t3.uv_meta_base,          uv_meta_base);
         glc_Uniform1ui(uloc_t3.rng_seed,              ++t3_rng_seed);
+        glc_Uniform1i (uloc_t3.bdpt_max_verts,        max_bdpt_v);
+        glc_Uniform1i (uloc_t3.bdpt_max_spectral,     max_bdpt_s);
+        glc_Uniform1i (uloc_t3.bdpt_max_pdfs,         max_bdpt_p);
         glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
 
         /* Single full barrier + readback covers ALL of T1/T2/T3 output in one
@@ -8466,6 +8335,11 @@ public:
                 ri.color_flag = (uint8_t)cflag;
                 ri.priority = row[16];
                 ri.sensor_origin_y = row[17]; ri.sensor_origin_z = row[18];
+                { uint32_t sid = 0u; memcpy(&sid, row+19, 4); ri.bdpt_subpath_id = sid; }
+                ri.bdpt_vertex = (ri.bounce < 0) ? 0u
+                    : static_cast<uint16_t>(std::min(ri.bounce, 0xFFFF));
+                ri.bdpt_stream = (ri.color_flag == 1u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
+                ri.bdpt_strategy = 0u;
                 const int bands = std::min(nb, 16);
                 for (int b = 0; b < bands; ++b)
                     ri.amp[b] = std::complex<double>(row[20+b], row[36+b]);
@@ -8645,6 +8519,116 @@ public:
         if (t3_post_diag) {
             fprintf(stderr, "[gpu-T3-post] qout/field readback done\n");
             fflush(stderr);
+        }
+
+        /* ── BDPT side-data readback: push GPU-emitted records to CPU queues ──
+         * Read bdpt_counters to know how many records were emitted this batch,
+         * then pull BdptVertexRecord and BdptSpectralWeightRecord from their SSBOs. */
+        {
+            uint32_t bdpt_cnts[3] = {};
+            readback_ssbo(ssbo_bdpt_counters, bdpt_cnts, 3 * sizeof(uint32_t));
+            const int nv = std::min((int)bdpt_cnts[0], cap_bdpt_verts);
+            const int ns = std::min((int)bdpt_cnts[1], cap_bdpt_spectral);
+            const int np = std::min((int)bdpt_cnts[2], cap_bdpt_pdfs);
+
+            if (nv > 0) {
+                stg_bdpt_verts.resize((size_t)nv * BDPT_VERTEX_STRIDE_F);
+                readback_ssbo(ssbo_bdpt_verts, stg_bdpt_verts.data(),
+                              (GLsizeiptr)((size_t)nv * BDPT_VERTEX_STRIDE_F * sizeof(float)));
+                uint64_t cam_count = 0;
+                for (int i = 0; i < nv; ++i) {
+                    const float* row = stg_bdpt_verts.data() + (size_t)i * BDPT_VERTEX_STRIDE_F;
+                    BdptVertexRecord vr{};
+                    memcpy(&vr.subpath_id,  row +  0, 4);
+                    {
+                        uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
+                        vr.vertex_index  = (uint16_t)(pk >> 16);
+                        vr.stream        = (uint8_t)((pk >> 8) & 0xFFu);
+                        vr.sample_domain = (uint8_t)(pk & 0xFFu);
+                    }
+                    memcpy(&vr.flags,      row +  2, 4);
+                    /* row[3] = strategy_id = 0 */
+                    memcpy(&vr.tri_id,     row +  4, 4);
+                    vr.group_id = -1;  /* row[5] written as -1 by shader */
+                    memcpy(&vr.mat_idx,    row +  6, 4);
+                    vr.pos[0] = row[7];  vr.pos[1] = row[8];  vr.pos[2] = row[9];
+                    vr.normal[0] = row[10]; vr.normal[1] = row[11]; vr.normal[2] = row[12];
+                    vr.dir_in[0] = row[13]; vr.dir_in[1] = row[14]; vr.dir_in[2] = row[15];
+                    /* dir_out = 0 (row[16..18]) */
+                    vr.path_len          = row[19];
+                    vr.path_at_seg_start = row[20];
+                    vr.pdf_fwd           = row[21];
+                    vr.pdf_rev           = row[22];
+                    vr.pdf_area          = row[23];
+                    vr.pdf_solid_angle   = row[24];
+                    vr.throughput_scalar = row[25];
+                    vr.sensor_origin_y   = row[26];
+                    vr.sensor_origin_z   = row[27];
+                    ps.push_bdpt_vertex(vr);
+                    if (vr.stream == BDPT_SIDE_SENSOR) ++cam_count;
+                }
+                if (cam_count > 0)
+                    ps.bdpt_cam_vertex_count.fetch_add(cam_count, std::memory_order_relaxed);
+            }
+
+            if (ns > 0) {
+                stg_bdpt_spectral.resize((size_t)ns * BDPT_SPECTRAL_STRIDE_F);
+                readback_ssbo(ssbo_bdpt_spectral, stg_bdpt_spectral.data(),
+                              (GLsizeiptr)((size_t)ns * BDPT_SPECTRAL_STRIDE_F * sizeof(float)));
+                for (int i = 0; i < ns; ++i) {
+                    const float* row = stg_bdpt_spectral.data() + (size_t)i * BDPT_SPECTRAL_STRIDE_F;
+                    BdptSpectralWeightRecord sw{};
+                    memcpy(&sw.subpath_id, row + 0, 4);
+                    {
+                        uint32_t vb = 0u; memcpy(&vb, row + 1, 4);
+                        sw.vertex_index = (uint16_t)(vb >> 16);
+                        sw.band_id      = (uint16_t)(vb & 0xFFFFu);
+                    }
+                    sw.beta_re               = row[2];
+                    sw.beta_im               = row[3];
+                    sw.wavelength_or_center  = row[4];
+                    sw.band_pdf              = row[5];
+                    sw.sensor_rgb_weight     = row[6];
+                    ps.push_bdpt_spectral(sw);
+                }
+            }
+
+            if (np > 0) {
+                stg_bdpt_pdfs.resize((size_t)np * BDPT_PDF_STRIDE_F);
+                readback_ssbo(ssbo_bdpt_pdfs, stg_bdpt_pdfs.data(),
+                              (GLsizeiptr)((size_t)np * BDPT_PDF_STRIDE_F * sizeof(float)));
+                for (int i = 0; i < np; ++i) {
+                    const float* row = stg_bdpt_pdfs.data() + (size_t)i * BDPT_PDF_STRIDE_F;
+                    BdptPdfRecord pr{};
+                    memcpy(&pr.subpath_id, row + 0, 4);
+                    {
+                        uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
+                        pr.vertex_index  = (uint16_t)(pk & 0xFFFFu);
+                        pr.sample_domain = (uint8_t)((pk >> 16) & 0xFFu);
+                        pr.measure       = (uint8_t)((pk >> 24) & 0xFFu);
+                    }
+                    pr.pdf_fwd         = row[2];
+                    pr.pdf_rev         = row[3];
+                    pr.pdf_area        = row[4];
+                    pr.pdf_solid_angle = row[5];
+                    pr.jacobian_det    = row[6];
+                    pr.geometry_term   = row[7];
+                    memcpy(&pr.flags, row + 8, 4);
+                    ps.push_bdpt_pdf(pr);
+                }
+            }
+
+            /* GPU path: check sweep trigger after accumulating new camera vertices. */
+            if (ps.cfg.bdpt_sweep_trigger > 0 && ps.sensor_res > 0) {
+                const uint64_t thr = static_cast<uint64_t>(ps.cfg.bdpt_sweep_trigger);
+                uint64_t cur = ps.bdpt_cam_vertex_count.load(std::memory_order_relaxed);
+                if (cur >= thr) {
+                    if (ps.bdpt_cam_vertex_count.compare_exchange_strong(
+                            cur, 0, std::memory_order_acq_rel, std::memory_order_relaxed)) {
+                        ray_pipeline_run_bdpt_connection(&ps);
+                    }
+                }
+            }
         }
 
         return n_hits;
@@ -8952,6 +8936,7 @@ static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src)
     cr.intent.path_len    += 2.0 * arena.radius;
     cr.intent.bounce      += 1;
     cr.intent.bounces_left = std::max(0, src.bounces_left - 1);
+    if (cr.intent.bdpt_vertex < 0xFFFFu) cr.intent.bdpt_vertex += 1u;
     return cr;
 }
 
@@ -9131,6 +9116,41 @@ static void pipeline_intersector(RayPipelineState& ps)
                 ps.Q_out.push(std::move(rec));
             }
 
+            /* ── BDPT vertex record (T1) ─────────────────────────────────
+             * Only emitted for rays stamped with a subpath id at launch.
+             * dir_out and PDFs are unknown here; they arrive via the
+             * BdptPdfRecord emitted by T3 at the same (subpath_id, vertex). */
+            if (intent.bdpt_subpath_id != 0u) {
+                const int grp = (hit_tri >= 0 && (size_t)hit_tri < st.tri_param_group_of_tri.size())
+                                ? st.tri_param_group_of_tri[(size_t)hit_tri] : -1;
+                BdptVertexRecord vr{};
+                vr.subpath_id        = intent.bdpt_subpath_id;
+                vr.vertex_index      = intent.bdpt_vertex;
+                vr.stream            = intent.bdpt_stream;
+                vr.sample_domain     = BDPT_DOMAIN_UNKNOWN;
+                vr.flags             = tri.flags;
+                vr.strategy_id       = intent.bdpt_strategy;
+                vr.tri_id            = hit_tri;
+                vr.group_id          = grp;
+                vr.mat_idx           = tri.mat_idx;
+                vr.pos[0]            = static_cast<float>(hit_pos.x());
+                vr.pos[1]            = static_cast<float>(hit_pos.y());
+                vr.pos[2]            = static_cast<float>(hit_pos.z());
+                vr.normal[0]         = static_cast<float>(hr.hit_n.x());
+                vr.normal[1]         = static_cast<float>(hr.hit_n.y());
+                vr.normal[2]         = static_cast<float>(hr.hit_n.z());
+                vr.dir_in[0]         = static_cast<float>(dir.x());
+                vr.dir_in[1]         = static_cast<float>(dir.y());
+                vr.dir_in[2]         = static_cast<float>(dir.z());
+                vr.path_len          = static_cast<float>(tot_len);
+                vr.path_at_seg_start = static_cast<float>(intent.path_len);
+                vr.sensor_origin_y   = intent.sensor_origin_y;
+                vr.sensor_origin_z   = intent.sensor_origin_z;
+                ps.push_bdpt_vertex(vr);
+                if (intent.bdpt_stream == BDPT_SIDE_SENSOR)
+                    ps.bdpt_cam_vertex_count.fetch_add(1, std::memory_order_relaxed);
+            }
+
             /* ── Sensor image accumulator (T1) ───────────────────────────
              * Forward ray (color_flag==0) hitting near the sensor plate →
              * ch0 (irradiance view).  Backward/sensor rays are NOT accumulated
@@ -9208,14 +9228,13 @@ static void pipeline_refiner(RayPipelineState& ps)
             if (hr.incoming_dir.dot(rh.refined_n) > 0.0)
                 rh.refined_n = -rh.refined_n;
 
-            /* ── Manifold teleport: MLP / parametric / LUT (CPU parity with GPU T2)
-             * All three representations share the same intercept: if the hit
-             * triangle belongs to a manifold tri-group (kind=4 or kind=5), apply
-             * the appropriate evaluator and recycle back to T1.  Magic number in
-             * the payload selects the evaluator:
-             *   14948 → MLP (apply_neural_mlp_from_f32)
+            /* ── Manifold teleport: parametric lens only
+             * Neural MLP and LUT transports are intentionally disabled here.
+             * They need a reversible optical contract (Jacobian, eta/cosine,
+             * probability measure) before they can re-enter the camera path.
+             * Magic number in the payload selects the evaluator:
              *   14949 → parametric exact conic (apply_parametric_lens_from_f32)
-             *   14946/7/50/51 → LUT bilinear lookup (apply_manifold_transfer_from_payload)
+             *   14948 / 14946 / 14947 / 14950 / 14951 → deferred absorber
              * Empty payload (out_bytes==0) → interior absorber: terminate ray. */
             {
                 int nb_mfld = 0;
@@ -9230,27 +9249,81 @@ static void pipeline_refiner(RayPipelineState& ps)
                     V3d   tdir = hr.incoming_dir;
                     VXcd  tamp = hr.amp_propagated;
                     double tpl = hr.ray.path_len;
+                    /* Save pre-teleport direction and amplitude sum for the
+                     * optical event record computed after the lens transfer. */
+                    const V3d    dir_before  = tdir;
+                    const double amp_mag_pre = [&]() {
+                        double s = 0.0;
+                        for (int _b = 0; _b < (int)tamp.size(); ++_b)
+                            s += std::abs(tamp[_b]);
+                        return s;
+                    }();
                     bool absorbed = false;
+                    ParametricLensTraceInfo lens_trace{};
+                    bool lens_trace_valid = false;
                     const float magic = mpp[0];
                     if (magic == 14948.0f) {
-                        apply_neural_mlp_from_f32(st, mpp, nb_mfld, tpos, tdir, tamp, &tpl);
+                        /* Deferred MLP transport: absorb rather than fabricate
+                         * an optical transform without reversible metadata. */
+                        absorbed = true;
                     } else if (magic == 14949.0f) {
-                        absorbed = apply_parametric_lens_from_f32(st, mpp, nb_mfld, tpos, tdir, tamp, &tpl);
+                        absorbed = apply_parametric_lens_from_f32(
+                            st, mpp, nb_mfld, tpos, tdir, tamp, &tpl,
+                            hr.ray.bdpt_stream == BDPT_SIDE_SENSOR, &lens_trace);
+                        lens_trace_valid = true;
                     } else if (magic == 14946.0f || magic == 14947.0f ||
                                magic == 14950.0f || magic == 14951.0f) {
-                        apply_manifold_transfer_from_payload(st, mpp, nb_mfld,
-                            rh.refined_pos, tpos, tdir, tamp, &tpl);
+                        /* Deferred LUT transport: absorb rather than fabricate
+                         * an optical transform without reversible metadata. */
+                        absorbed = true;
                     } else {
                         absorbed = true;  /* unknown magic → absorb */
                     }
+                    const int _gp = (hr.hit_tri >= 0 &&
+                                     (size_t)hr.hit_tri < st.tri_param_group_of_tri.size())
+                                    ? st.tri_param_group_of_tri[(size_t)hr.hit_tri] : -1;
                     {
-                        const int _gp = (hr.hit_tri >= 0 &&
-                                         (size_t)hr.hit_tri < st.tri_param_group_of_tri.size())
-                                        ? st.tri_param_group_of_tri[(size_t)hr.hit_tri] : -1;
                         if (_gp >= 0 && (size_t)_gp < st.gid_manifold_stats.size()) {
                             auto& _ms = st.gid_manifold_stats[(size_t)_gp];
                             if (absorbed) _ms.abs.fetch_add(1, std::memory_order_relaxed);
                             else          _ms.ok .fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                    /* Emit optical event records for BDPT-stamped rays.
+                     * Parametric lenses report every refractive interface/clip
+                     * they traverse; opaque/deferred absorbers get a single
+                     * absorption record so connection can invalidate the edge. */
+                    if (hr.ray.bdpt_subpath_id != 0u) {
+                        double amp_mag_post = 0.0;
+                        for (int _b = 0; _b < (int)tamp.size(); ++_b)
+                            amp_mag_post += std::abs(tamp[_b]);
+                        const float tp_mul = (amp_mag_pre > 1e-30)
+                            ? static_cast<float>(amp_mag_post / amp_mag_pre) : 0.0f;
+                        lens_trace.throughput_multiplier = tp_mul;
+                        if (lens_trace_valid && !lens_trace.events.empty()) {
+                            for (auto oer : lens_trace.events) {
+                                oer.subpath_id = hr.ray.bdpt_subpath_id;
+                                oer.vertex_index = hr.ray.bdpt_vertex;
+                                oer.stream = hr.ray.bdpt_stream;
+                                if (oer.throughput_multiplier == 0.0f && !absorbed)
+                                    oer.throughput_multiplier = tp_mul;
+                                ps.push_bdpt_optical(oer);
+                            }
+                        } else {
+                            BdptOpticalEventRecord oer{};
+                            oer.subpath_id           = hr.ray.bdpt_subpath_id;
+                            oer.vertex_index         = hr.ray.bdpt_vertex;
+                            oer.element_index        = static_cast<uint16_t>(_gp >= 0 ? _gp : 0);
+                            oer.reason               = BDPT_OPT_ABSORPTION;
+                            oer.stream               = hr.ray.bdpt_stream;
+                            oer.pos[0]               = static_cast<float>(rh.refined_pos.x());
+                            oer.pos[1]               = static_cast<float>(rh.refined_pos.y());
+                            oer.pos[2]               = static_cast<float>(rh.refined_pos.z());
+                            oer.dir_in[0]            = static_cast<float>(dir_before.x());
+                            oer.dir_in[1]            = static_cast<float>(dir_before.y());
+                            oer.dir_in[2]            = static_cast<float>(dir_before.z());
+                            oer.throughput_multiplier = 0.0f;
+                            ps.push_bdpt_optical(oer);
                         }
                     }
                     if (absorbed) {
@@ -9472,7 +9545,60 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             ri.bounce        += 1;
             ri.bounces_left   = hr.ray.bounces_left - 1;
             if (new_medium != -2) ri.medium_mat_idx = new_medium;
+            /* Advance BDPT vertex index for the child so all side-data records
+             * emitted by T1/T2/T3 can be correlated back to (subpath, vertex). */
+            if (ri.bdpt_vertex < 0xFFFFu) ri.bdpt_vertex += 1u;
             return ri;
+        };
+
+        /* BDPT scatter record emitter.
+         * Called once per spawned child — one BdptPdfRecord and nb
+         * BdptSpectralWeightRecords are pushed to their respective side queues.
+         * pdf_fwd : forward sampling PDF in the given domain.
+         * domain  : one of BDPT_DOMAIN_* constants.
+         * delta   : 1 if this is a specular/delta lobe, 0 otherwise. */
+        auto emit_scatter = [&](const V3d& dir_out, const VXcd& child_amp,
+                                uint8_t domain, float pdf_fwd, float pdf_rev,
+                                uint32_t extra_flags = 0u) {
+            if (hr.ray.bdpt_subpath_id == 0u) return;
+            /* Geometry term at this vertex. */
+            const double cos_in  = std::max(0.0, -in_dir.dot(hit_n));
+            const double cos_out_v = std::max(0.0, dir_out.dot(hit_n));
+            const float  geom   = static_cast<float>(cos_in * cos_out_v);
+            /* Scalar throughput at this vertex (ratio of amplitude magnitudes). */
+            double amp_in_mag = 0.0, amp_out_mag = 0.0;
+            for (int _b = 0; _b < nb; ++_b) {
+                amp_in_mag  += std::abs(amp[_b]);
+                amp_out_mag += std::abs(child_amp[_b]);
+            }
+            const float tp = (amp_in_mag > 1e-30)
+                ? static_cast<float>(amp_out_mag / amp_in_mag) : 0.0f;
+            BdptPdfRecord pr{};
+            pr.subpath_id    = hr.ray.bdpt_subpath_id;
+            pr.vertex_index  = hr.ray.bdpt_vertex;
+            pr.sample_domain = domain;
+            pr.measure       = domain;   /* domain and measure align for scatter */
+            pr.pdf_fwd       = pdf_fwd;
+            pr.pdf_rev       = pdf_rev;
+            pr.pdf_solid_angle = pdf_fwd;
+            pr.jacobian_det  = 1.0f;
+            pr.geometry_term = geom;
+            pr.flags         = tri.flags | extra_flags;
+            ps.push_bdpt_pdf(pr);
+            /* Per-band spectral weights. */
+            for (int _b = 0; _b < nb; ++_b) {
+                BdptSpectralWeightRecord sw{};
+                sw.subpath_id         = hr.ray.bdpt_subpath_id;
+                sw.vertex_index       = hr.ray.bdpt_vertex;
+                sw.band_id            = static_cast<uint16_t>(_b);
+                sw.beta_re            = static_cast<float>(child_amp[_b].real());
+                sw.beta_im            = static_cast<float>(child_amp[_b].imag());
+                sw.wavelength_or_center = (_b < (int)st.freq_hz_vec.size())
+                    ? static_cast<float>(st.freq_hz_vec[static_cast<size_t>(_b)]) : 0.0f;
+                sw.band_pdf           = (nb > 0) ? 1.0f / static_cast<float>(nb) : 1.0f;
+                sw.sensor_rgb_weight  = tp;
+                ps.push_bdpt_spectral(sw);
+            }
         };
 
         const bool mat_transmissive = tri_material_is_transmissive(st, tri);
@@ -9588,25 +9714,33 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             }
 
             if (!can_refract) {
+                /* TIR: pure reflection (delta lobe). */
                 V3d  rd = (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
                 VXcd ra = amp;
                 for (int b = 0; b < nb; ++b)
                     ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE, 1.0f, 1.0f,
+                             BDPT_PDF_FLAG_DELTA_SPECULAR);
                 pipeline_spawn_child(ps, make_child(rd, ra));
             } else {
                 const double sin2_t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
                 const double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
                 const double R      = fresnel_R(cos_i, cos_t, n1, n2);
+                const double R_rev  = fresnel_R(cos_t, cos_i, n2, n1);
                 const int    new_med = has_pair ? medium_to
                     : ((hr.ray.medium_mat_idx == tri.mat_idx) ? -1 : tri.mat_idx);
 
                 if (ps.cfg.max_children >= 2) {
+                    /* Deterministic split: both lobes launched with √R/√T weights. */
                     {
                         V3d  rd = (in_dir - 2.0*in_dir.dot(hit_n)*hit_n).normalized();
                         VXcd ra = amp;
                         double rs = std::sqrt(R);
                         for (int b = 0; b < nb; ++b)
                             ra[b] *= rs * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                        emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE,
+                                     static_cast<float>(R), static_cast<float>(R),
+                                     BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
                         pipeline_spawn_child(ps, make_child(rd, ra));
                     }
                     {
@@ -9614,17 +9748,29 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                         double ts = std::sqrt(1.0 - R);
                         for (int b = 0; b < nb; ++b)
                             ta[b] *= ts;
+                        emit_scatter(refracted, ta, BDPT_DOMAIN_SOLID_ANGLE,
+                                     static_cast<float>(1.0 - R),
+                                     static_cast<float>(1.0 - R_rev),
+                                     BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
                         pipeline_spawn_child(ps, make_child(refracted, ta, new_med));
                     }
                 } else {
+                    /* Russian roulette: one lobe sampled with probability R. */
                     if (U01(rng) < R) {
                         V3d  rd = (in_dir - 2.0*in_dir.dot(hit_n)*hit_n).normalized();
                         VXcd ra = amp;
                         for (int b = 0; b < nb; ++b)
                             ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                        emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE,
+                                     static_cast<float>(R), static_cast<float>(R),
+                                     BDPT_PDF_FLAG_DELTA_SPECULAR);
                         pipeline_spawn_child(ps, make_child(rd, ra));
                     } else {
                         VXcd ta = amp;
+                        emit_scatter(refracted, ta, BDPT_DOMAIN_SOLID_ANGLE,
+                                     static_cast<float>(1.0 - R),
+                                     static_cast<float>(1.0 - R_rev),
+                                     BDPT_PDF_FLAG_DELTA_SPECULAR);
                         pipeline_spawn_child(ps, make_child(refracted, ta, new_med));
                     }
                 }
@@ -9641,11 +9787,16 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
 
             /* Opaque: diffuse or specular */
             V3d new_dir;
-            if (U01(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx))
+            bool chose_diffuse = false;
+            if (U01(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
                 new_dir = cosine_hemisphere(hit_n, rng);
-            else {
+                chose_diffuse = true;
+            } else {
                 new_dir = (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
-                if (new_dir.dot(hit_n) < 0.0) new_dir = cosine_hemisphere(hit_n, rng);
+                if (new_dir.dot(hit_n) < 0.0) {
+                    new_dir = cosine_hemisphere(hit_n, rng);
+                    chose_diffuse = true;
+                }
             }
             VXcd na = amp;
             for (int b = 0; b < nb; ++b)
@@ -9656,165 +9807,44 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             double max_abs = 0.0;
             for (int b = 0; b < nb; ++b)
                 max_abs = std::max(max_abs, std::abs(na[b]));
-            if (max_abs >= hr.ray.min_amplitude)
+            if (max_abs >= hr.ray.min_amplitude) {
+                /* PDF: cosine hemisphere → cos(θ)/π; specular mirror → delta. */
+                const double diffuse_p = static_cast<double>(
+                    mat_cache_diffusion(st.mat_cache, tri.mat_idx));
+                const double cos_in_pdf = std::max(0.0, -in_dir.dot(hit_n));
+                const float scatter_pdf = chose_diffuse
+                    ? static_cast<float>(diffuse_p * std::max(0.0, new_dir.dot(hit_n)) / M_PI)
+                    : static_cast<float>(std::max(0.0, 1.0 - diffuse_p));
+                const float scatter_pdf_rev = chose_diffuse
+                    ? static_cast<float>(diffuse_p * cos_in_pdf / M_PI)
+                    : static_cast<float>(std::max(0.0, 1.0 - diffuse_p));
+                const uint32_t scatter_flags = chose_diffuse
+                    ? BDPT_PDF_FLAG_DIFFUSE
+                    : BDPT_PDF_FLAG_DELTA_SPECULAR;
+                emit_scatter(new_dir, na,
+                             chose_diffuse ? BDPT_DOMAIN_PROJ_SOLID_ANGLE
+                                           : BDPT_DOMAIN_SOLID_ANGLE,
+                             scatter_pdf, scatter_pdf_rev, scatter_flags);
                 pipeline_spawn_child(ps, make_child(new_dir, na));
-            else
+            } else {
                 push_terminal(hr);  /* amplitude extinguished */
+            }
         }
 
         pipeline_finish_ray(ps);
     }  /* end for rh : batch */
 
-        /* ── BDPT snap pass (T3) ─────────────────────────────────────────
-         * For each backward-origin STRIKE in this batch, find forward STRIKE
-         * hits in YZ proximity and accumulate on the sensor image:
-         *
-         *   d <= eps          → exact match → ch2 (blue)  + sugar on priority map
-         *   eps < d <= 3*eps  → near-miss   → ch3 (green, provisional), Gaussian
-         *
-         * ch3 fills in tentative data where convergence is approaching but not
-         * yet snapped; it is superseded visually by ch2 as exact matches arrive. */
-        if (ps.sensor_res > 0) {
-            const int   res    = ps.sensor_res;
-            const float eps    = ps.sensor_eps;
-            const float eps3   = 3.0f * eps;
-            const float inv_r  = static_cast<float>(res) / (2.0f * ps.sensor_pr);
-            const float sigma2 = eps * eps;
-
-            struct HitXY {
-                float y, z, amp, ss_y, ss_z, ss_x;
-                float dir_y, dir_z, dir_x;   /* incoming direction for collinearity */
-            };
-            std::vector<HitXY> fwd_hits, rev_hits;
-            fwd_hits.reserve(batch.size());
-            rev_hits.reserve(batch.size());
-
-            for (auto& rh : batch) {
-                const HitRecord& hr = rh.base;
-                const V3d& hp = hr.hit_pos;
-                double amp_mag = 0.0;
-                for (int b = 0; b < (int)hr.amp_propagated.size(); ++b) {
-                    const double re = hr.amp_propagated[b].real();
-                    const double im = hr.amp_propagated[b].imag();
-                    amp_mag += std::sqrt(re*re + im*im);
-                }
-                HitXY h;
-                h.y     = static_cast<float>(hp.y());
-                h.z     = static_cast<float>(hp.z());
-                h.amp   = static_cast<float>(amp_mag);
-                h.ss_y  = static_cast<float>(hr.seg_start.y());
-                h.ss_z  = static_cast<float>(hr.seg_start.z());
-                h.ss_x  = static_cast<float>(hr.seg_start.x());
-                h.dir_y = static_cast<float>(hr.incoming_dir.y());
-                h.dir_z = static_cast<float>(hr.incoming_dir.z());
-                h.dir_x = static_cast<float>(hr.incoming_dir.x());
-                if      (hr.ray.color_flag == 0) fwd_hits.push_back(h);
-                else if (hr.ray.bounce     == 0) rev_hits.push_back(h);
-            }
-
-            /* --- lock-free stats: track nearest pair and best collinearity --- */
-            float batch_nearest_d2   = std::numeric_limits<float>::max();
-            float batch_best_colinear = -1.0f;
-            for (auto& rv : rev_hits) {
-                for (auto& fv : fwd_hits) {
-                    const float dy = rv.y - fv.y;
-                    const float dz = rv.z - fv.z;
-                    const float d2 = dy*dy + dz*dz;
-                    if (d2 < batch_nearest_d2) batch_nearest_d2 = d2;
-                    /* Collinearity: |cos θ| between forward and backward incoming dirs.
-                     * A back-to-back pair on the same path → cos θ ≈ -1 → |cos|≈1. */
-                    const float fx = fv.dir_x, fy = fv.dir_y, fz = fv.dir_z;
-                    const float rx = rv.dir_x, ry = rv.dir_y, rz = rv.dir_z;
-                    const float flen = std::sqrt(fx*fx + fy*fy + fz*fz) + 1e-12f;
-                    const float rlen = std::sqrt(rx*rx + ry*ry + rz*rz) + 1e-12f;
-                    const float colinear = std::abs((fx*rx + fy*ry + fz*rz) / (flen * rlen));
-                    if (colinear > batch_best_colinear) batch_best_colinear = colinear;
-                }
-            }
-            if (batch_nearest_d2 < std::numeric_limits<float>::max()) {
-                /* Atomic CAS-loop to update running minimum nearest d² */
-                uint64_t newbits;
-                std::memcpy(&newbits, &batch_nearest_d2, sizeof(float));
-                /* Pad to 64 bits for atomic; only lower 32 bits meaningful. */
-                newbits &= 0xFFFFFFFFULL;
-                for (;;) {
-                    uint64_t cur = ps.bdpt_nearest_d2_bits.load(std::memory_order_relaxed);
-                    float cur_f; uint32_t cur32 = static_cast<uint32_t>(cur & 0xFFFFFFFFULL);
-                    std::memcpy(&cur_f, &cur32, sizeof(float));
-                    if (batch_nearest_d2 >= cur_f) break;
-                    if (ps.bdpt_nearest_d2_bits.compare_exchange_weak(cur, newbits,
-                            std::memory_order_relaxed, std::memory_order_relaxed)) break;
-                }
-            }
-            if (batch_best_colinear > -1.0f) {
-                uint64_t newbits;
-                std::memcpy(&newbits, &batch_best_colinear, sizeof(float));
-                newbits &= 0xFFFFFFFFULL;
-                for (;;) {
-                    uint64_t cur = ps.bdpt_best_colinear_bits.load(std::memory_order_relaxed);
-                    float cur_f; uint32_t cur32 = static_cast<uint32_t>(cur & 0xFFFFFFFFULL);
-                    std::memcpy(&cur_f, &cur32, sizeof(float));
-                    if (batch_best_colinear <= cur_f) break;
-                    if (ps.bdpt_best_colinear_bits.compare_exchange_weak(cur, newbits,
-                            std::memory_order_relaxed, std::memory_order_relaxed)) break;
-                }
-            }
-
-            if (!fwd_hits.empty() && !rev_hits.empty()) {
-                std::lock_guard<std::mutex> lk(ps.sensor_mu);
-
-                for (auto& rv : rev_hits) {
-                    if (std::abs(rv.ss_x - ps.sensor_px) >= 0.004f) continue;
-                    const int iy = static_cast<int>((rv.ss_y + ps.sensor_pr) * inv_r);
-                    const int iz = static_cast<int>((rv.ss_z + ps.sensor_pr) * inv_r);
-                    if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
-
-                    double exact_w = 0.0, nearmi_w = 0.0;
-                    for (auto& fv : fwd_hits) {
-                        const float dy = rv.y - fv.y;
-                        const float dz = rv.z - fv.z;
-                        const float d2 = dy*dy + dz*dz;
-                        if (d2 > eps3 * eps3) continue;
-                        const float wg = fv.amp * std::exp(-d2 / sigma2);
-                        if (d2 <= eps * eps) exact_w  += wg;
-                        else                 nearmi_w += wg;
-                    }
-
-                    if (exact_w > 0.0) {
-                        ps.sensor_accum[static_cast<size_t>(2 * res * res + iy * res + iz)]
-                            += exact_w * rv.amp;
-                        ps.bdpt_exact_snaps.fetch_add(1, std::memory_order_relaxed);
-                        /* Sugar splash around exact match pixel. */
-                        const float sugar = static_cast<float>(exact_w) * rv.amp * 0.4f;
-                        for (int dy2 = -2; dy2 <= 2; ++dy2) {
-                            for (int dz2 = -2; dz2 <= 2; ++dz2) {
-                                const int ny = iy + dy2, nz = iz + dz2;
-                                if (ny < 0 || ny >= res || nz < 0 || nz >= res) continue;
-                                ps.priority_map[static_cast<size_t>(ny * res + nz)] +=
-                                    sugar * std::exp(-0.5f * static_cast<float>(dy2*dy2 + dz2*dz2));
-                            }
-                        }
-                    }
-                    if (nearmi_w > 0.0) {
-                        const double nv3 = (ps.sensor_accum[static_cast<size_t>(3 * res * res + iy * res + iz)]
-                            += nearmi_w * rv.amp);
-                        if (nv3 > ps.sensor_peak[3]) ps.sensor_peak[3] = nv3;
-                        ps.bdpt_near_miss_count.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
-
-                /* One diffusion step on priority map (coeffs sum <1 → steady state=1).
-                 * 0.90 self + 0.02*4 neighbours + 0.02 baseline injection = 1.0 eq. */
-                if (!ps.priority_map.empty()) {
-                    std::vector<float> tmp(ps.priority_map);
-                    for (int y = 1; y < res - 1; ++y) {
-                        for (int z = 1; z < res - 1; ++z) {
-                            const float nb = tmp[(y-1)*res+z] + tmp[(y+1)*res+z]
-                                           + tmp[y*res+z-1]   + tmp[y*res+z+1];
-                            ps.priority_map[static_cast<size_t>(y*res+z)] =
-                                0.90f * tmp[y*res+z] + 0.02f * nb + 0.02f;
-                        }
-                    }
+        /* Auto-trigger BDPT connection once per sweep.
+         * One worker claims the trigger via CAS; all others skip. */
+        if (ps.cfg.bdpt_sweep_trigger > 0 && ps.sensor_res > 0) {
+            const uint64_t thr = static_cast<uint64_t>(ps.cfg.bdpt_sweep_trigger);
+            uint64_t cur = ps.bdpt_cam_vertex_count.load(std::memory_order_relaxed);
+            if (cur >= thr) {
+                if (ps.bdpt_cam_vertex_count.compare_exchange_strong(
+                        cur, 0,
+                        std::memory_order_acq_rel,
+                        std::memory_order_relaxed)) {
+                    ray_pipeline_run_bdpt_connection(&ps);
                 }
             }
         }
@@ -9996,6 +10026,11 @@ void ray_pipeline_destroy(RayPipelineState* ps)
     ps->Q_hit.set_done();
     ps->Q_refined.set_done();
     ps->Q_wave.set_done();
+    ps->Q_bdpt_vertices.set_done();
+    ps->Q_bdpt_spectral.set_done();
+    ps->Q_bdpt_pdfs.set_done();
+    ps->Q_bdpt_optical.set_done();
+    ps->Q_bdpt_connections.set_done();
     for (auto& t : ps->workers) if (t.joinable()) t.join();
     if (ps->gpu_dispatch) {
         gl_compute_destroy_context(&ps->gpu_dispatch->ctx);
@@ -10100,6 +10135,532 @@ int ray_pipeline_drain_refined(RayPipelineState* ps,
 {
     if (!ps || max_n <= 0) return 0;
     return ps->Q_refined.drain(out, max_n);
+}
+
+int ray_pipeline_drain_bdpt_vertices(RayPipelineState* ps,
+                                      std::vector<BdptVertexRecord>& out,
+                                      int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_bdpt_vertices.drain(out, max_n);
+}
+
+int ray_pipeline_drain_bdpt_spectral(RayPipelineState* ps,
+                                      std::vector<BdptSpectralWeightRecord>& out,
+                                      int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_bdpt_spectral.drain(out, max_n);
+}
+
+int ray_pipeline_drain_bdpt_pdfs(RayPipelineState* ps,
+                                  std::vector<BdptPdfRecord>& out,
+                                  int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_bdpt_pdfs.drain(out, max_n);
+}
+
+int ray_pipeline_drain_bdpt_optical(RayPipelineState* ps,
+                                     std::vector<BdptOpticalEventRecord>& out,
+                                     int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_bdpt_optical.drain(out, max_n);
+}
+
+int ray_pipeline_drain_bdpt_connections(RayPipelineState* ps,
+                                         std::vector<BdptConnectionRecord>& out,
+                                         int max_n)
+{
+    if (!ps || max_n <= 0) return 0;
+    return ps->Q_bdpt_connections.drain(out, max_n);
+}
+
+void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
+                                     uint64_t* out_vertices,
+                                     uint64_t* out_spectral,
+                                     uint64_t* out_pdfs,
+                                     uint64_t* out_optical,
+                                     uint64_t* out_connections)
+{
+    if (!ps) return;
+    if (out_vertices) *out_vertices = ps->bdpt_overflow_vertices.load(std::memory_order_relaxed);
+    if (out_spectral) *out_spectral = ps->bdpt_overflow_spectral.load(std::memory_order_relaxed);
+    if (out_pdfs)     *out_pdfs     = ps->bdpt_overflow_pdfs    .load(std::memory_order_relaxed);
+    if (out_optical)  *out_optical  = ps->bdpt_overflow_optical .load(std::memory_order_relaxed);
+    if (out_connections) *out_connections = ps->bdpt_overflow_connections.load(std::memory_order_relaxed);
+}
+
+/* ── BDPT connection pass with balance-heuristic MIS ─────────────────────────
+ *
+ * Drains the BDPT side records, reconstructs full camera/light subpaths, and
+ * evaluates all connectable vertex pairs as (s,t) strategies.  This deliberately
+ * does not collapse each subpath to a terminal endpoint: every non-delta vertex
+ * can be the connection vertex for its side.
+ *
+ * Current estimator contract:
+ *   - Vertex records provide geometry, stream, pixel origin, material flags.
+ *   - Spectral records provide per-band beta; scalar throughput is used only
+ *     when it was explicitly emitted on the vertex record.
+ *   - PDF records provide sampled-direction densities between vertex i and i+1.
+ *   - Prefix PDFs are products of valid area-measure edge PDFs; missing PDF
+ *     data invalidates downstream strategies instead of pretending unit density.
+ *   - Optical records contribute reversible transform Jacobians where present.
+ *   - MIS is a balance heuristic over all valid vertex-pair strategies for the
+ *     same camera/light subpath pair.
+ *
+ * Results accumulate into sensor channel 2 at the sensor_origin_y/z carried by
+ * the camera subpath. */
+void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
+{
+    if (!ps || !ps->st || ps->sensor_res <= 0) return;
+
+    /* Drain side queues atomically — subsequent calls see only new records. */
+    std::vector<BdptVertexRecord>         verts;
+    std::vector<BdptSpectralWeightRecord> sweights;
+    std::vector<BdptPdfRecord>            pdfs;
+    std::vector<BdptOpticalEventRecord>   optical;
+    ray_pipeline_drain_bdpt_vertices(ps, verts,   ps->cfg.bdpt_max_vertices > 0 ? ps->cfg.bdpt_max_vertices : 2000000);
+    ray_pipeline_drain_bdpt_spectral(ps, sweights, ps->cfg.bdpt_max_spectral > 0 ? ps->cfg.bdpt_max_spectral : 4000000);
+    ray_pipeline_drain_bdpt_pdfs    (ps, pdfs,     ps->cfg.bdpt_max_pdfs     > 0 ? ps->cfg.bdpt_max_pdfs     : 2000000);
+    ray_pipeline_drain_bdpt_optical (ps, optical,  ps->cfg.bdpt_max_optical  > 0 ? ps->cfg.bdpt_max_optical  : 1000000);
+
+    if (verts.empty()) return;
+
+    /* Build spectral beta LUT: key = subpath_id<<32 | vertex_index<<16 | band_id */
+    std::unordered_map<uint64_t, std::complex<float>> beta_lut;
+    beta_lut.reserve(sweights.size());
+    for (const auto& sw : sweights) {
+        const uint64_t k = ((uint64_t)sw.subpath_id << 32)
+                         | ((uint64_t)sw.vertex_index << 16)
+                         | (uint64_t)sw.band_id;
+        beta_lut[k] = {sw.beta_re, sw.beta_im};
+    }
+
+    /* Build PDF LUT: key = subpath_id<<32 | vertex_index<<16 | sample_domain */
+    std::unordered_map<uint64_t, BdptPdfRecord> pdf_lut;
+    pdf_lut.reserve(pdfs.size());
+    for (const auto& pr : pdfs) {
+        const uint64_t k = ((uint64_t)pr.subpath_id << 32)
+                         | ((uint64_t)pr.vertex_index << 16)
+                         | (uint64_t)pr.sample_domain;
+        pdf_lut[k] = pr;
+    }
+
+    std::unordered_map<uint64_t, std::vector<BdptOpticalEventRecord>> optical_lut;
+    optical_lut.reserve(optical.size());
+    for (const auto& oe : optical) {
+        const uint64_t k = ((uint64_t)oe.subpath_id << 32)
+                         | ((uint64_t)oe.vertex_index << 16)
+                         | (uint64_t)oe.stream;
+        optical_lut[k].push_back(oe);
+    }
+
+    auto optical_for = [&](const BdptVertexRecord& v) -> const std::vector<BdptOpticalEventRecord>* {
+        const uint64_t k = ((uint64_t)v.subpath_id << 32)
+                         | ((uint64_t)v.vertex_index << 16)
+                         | (uint64_t)v.stream;
+        auto it = optical_lut.find(k);
+        return (it == optical_lut.end()) ? nullptr : &it->second;
+    };
+
+    auto pdf_for = [&](uint32_t sid, uint16_t vi) -> const BdptPdfRecord* {
+        const uint64_t base = ((uint64_t)sid << 32) | ((uint64_t)vi << 16);
+        const uint64_t domains[] = {
+            BDPT_DOMAIN_PROJ_SOLID_ANGLE,
+            BDPT_DOMAIN_SOLID_ANGLE,
+            BDPT_DOMAIN_AREA,
+            BDPT_DOMAIN_UNKNOWN
+        };
+        for (uint64_t d : domains) {
+            auto it = pdf_lut.find(base | d);
+            if (it != pdf_lut.end()) return &it->second;
+        }
+        return nullptr;
+    };
+
+    auto beta_scalar = [&](const BdptVertexRecord& v, int n_bands) -> double {
+        double beta = 0.0;
+        bool have = false;
+        for (int b = 0; b < n_bands; ++b) {
+            const uint64_t k = ((uint64_t)v.subpath_id << 32)
+                             | ((uint64_t)v.vertex_index << 16)
+                             | (uint64_t)b;
+            auto it = beta_lut.find(k);
+            if (it == beta_lut.end()) break;
+            beta += std::abs(it->second);
+            have = true;
+        }
+        return have ? beta : (double)v.throughput_scalar;
+    };
+
+    auto optical_allows_sampling = [&](const BdptVertexRecord& v, bool reverse,
+                                       double& out_jacobian) -> bool {
+        out_jacobian = 1.0;
+        const auto* oes = optical_for(v);
+        if (oes) {
+            for (const auto& oe : *oes) {
+                if (oe.reason == BDPT_OPT_ABSORPTION ||
+                    oe.reason == BDPT_OPT_APERTURE_CLIP ||
+                    oe.reason == BDPT_OPT_VIGNETTE_CLIP ||
+                    oe.reason == BDPT_OPT_TIR)
+                    return false;
+                if (oe.phase_space_jacobian > 0.0f && std::isfinite(oe.phase_space_jacobian)) {
+                    const double j = static_cast<double>(oe.phase_space_jacobian);
+                    out_jacobian *= reverse ? (1.0 / j) : j;
+                }
+            }
+        }
+        return out_jacobian > 0.0 && std::isfinite(out_jacobian);
+    };
+
+    auto edge_pdf_area_component = [&](const BdptVertexRecord& pdf_vertex,
+                                       const BdptVertexRecord& sampler_from,
+                                       const BdptVertexRecord& target,
+                                       bool reverse_pdf,
+                                       double& out_pdf) -> bool {
+        const BdptPdfRecord* pr = pdf_for(pdf_vertex.subpath_id, pdf_vertex.vertex_index);
+        if (!pr) return false;
+
+        double optical_j = 1.0;
+        if (!optical_allows_sampling(pdf_vertex, reverse_pdf, optical_j))
+            return false;
+
+        double pdf = 0.0;
+        const float pdf_component = reverse_pdf ? pr->pdf_rev : pr->pdf_fwd;
+        const float pdf_solid = reverse_pdf ? pr->pdf_rev : pr->pdf_solid_angle;
+        if (!reverse_pdf && pr->pdf_area > 0.0f && std::isfinite(pr->pdf_area)) {
+            pdf = (double)pr->pdf_area;
+        } else {
+            const V3d p0(sampler_from.pos[0], sampler_from.pos[1], sampler_from.pos[2]);
+            const V3d p1(target.pos[0], target.pos[1], target.pos[2]);
+            V3d d = p1 - p0;
+            const double dist2 = d.squaredNorm();
+            if (dist2 <= 1e-18) {
+                out_pdf = 1e-12;
+                return true;
+            }
+            d /= std::sqrt(dist2);
+
+            const V3d n1(target.normal[0], target.normal[1], target.normal[2]);
+            const double cos_to = std::max(0.0, std::abs(n1.dot(-d)));
+            if (cos_to <= 0.0) return false;
+            if (pdf_solid > 0.0f)
+                pdf = (double)pdf_solid * cos_to / dist2;
+            else if (pdf_component > 0.0f)
+                pdf = (double)pdf_component * cos_to / dist2;
+        }
+
+        pdf *= optical_j;
+        if (!(pdf > 0.0) || !std::isfinite(pdf)) return false;
+        out_pdf = std::max(pdf, 1e-12);
+        return true;
+    };
+
+    auto edge_pdf_area = [&](const BdptVertexRecord& from,
+                             const BdptVertexRecord& to,
+                             double& out_pdf) -> bool {
+        return edge_pdf_area_component(from, from, to, false, out_pdf);
+    };
+
+    auto diffuse_connection_pdf_area = [&](const BdptVertexRecord& from,
+                                           const BdptVertexRecord& to,
+                                           double& out_pdf) -> bool {
+        const BdptPdfRecord* pr = pdf_for(from.subpath_id, from.vertex_index);
+        if (!pr) return false;
+        if ((pr->flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
+        if (from.mat_idx < 0) return false;
+        const double diffuse_p = static_cast<double>(
+            mat_cache_diffusion(ps->st->mat_cache, from.mat_idx));
+        if (!(diffuse_p > 0.0)) return false;
+
+        double optical_j = 1.0;
+        if (!optical_allows_sampling(from, false, optical_j))
+            return false;
+
+        const V3d p0(from.pos[0], from.pos[1], from.pos[2]);
+        const V3d p1(to.pos[0], to.pos[1], to.pos[2]);
+        V3d d = p1 - p0;
+        const double dist2 = d.squaredNorm();
+        if (dist2 <= 1e-18) {
+            out_pdf = 1e-12;
+            return true;
+        }
+        d /= std::sqrt(dist2);
+        const V3d n0(from.normal[0], from.normal[1], from.normal[2]);
+        const V3d n1(to.normal[0], to.normal[1], to.normal[2]);
+        const double cos_out = std::max(0.0, n0.dot(d));
+        const double cos_to  = std::max(0.0, std::abs(n1.dot(-d)));
+        if (cos_out <= 0.0 || cos_to <= 0.0) return false;
+        const double pdf_sa = diffuse_p * cos_out / M_PI;
+        const double pdf = pdf_sa * cos_to / dist2 * optical_j;
+        if (!(pdf > 0.0) || !std::isfinite(pdf)) return false;
+        out_pdf = std::max(pdf, 1e-12);
+        return true;
+    };
+
+    auto vertex_connectable = [&](const BdptVertexRecord& v) -> bool {
+        if (v.tri_id < 0) return false;
+        if ((v.flags & MAT_FLAG_APERTURE_STOP) != 0) return false;
+        const auto* oes = optical_for(v);
+        if (oes) {
+            for (const auto& oe : *oes) {
+                if (oe.reason == BDPT_OPT_ABSORPTION ||
+                    oe.reason == BDPT_OPT_APERTURE_CLIP ||
+                    oe.reason == BDPT_OPT_VIGNETTE_CLIP ||
+                    oe.reason == BDPT_OPT_TIR)
+                    return false;
+            }
+        }
+        const BdptPdfRecord* pr = pdf_for(v.subpath_id, v.vertex_index);
+        if (pr && (pr->flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
+        return true;
+    };
+
+    auto visible = [&](const BdptVertexRecord& a, const BdptVertexRecord& b) -> bool {
+        const RayTracerState& st = *ps->st;
+        if (st.bvh_nodes.empty()) return true;
+        V3d p0(a.pos[0], a.pos[1], a.pos[2]);
+        V3d p1(b.pos[0], b.pos[1], b.pos[2]);
+        V3d d = p1 - p0;
+        const double dist = d.norm();
+        if (dist <= 1e-9) return false;
+        d /= dist;
+        const V3d orig = p0 + d * (T_SELF * 16.0);
+        const V3d inv(1.0 / d.x(), 1.0 / d.y(), 1.0 / d.z());
+        double t_min = std::max(0.0, dist - T_SELF * 32.0);
+        int hit_tri = -1;
+        bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris, orig, d, inv, t_min, hit_tri);
+        if (hit_tri < 0) return true;
+        return hit_tri == a.tri_id || hit_tri == b.tri_id;
+    };
+
+    struct BdptSubpathView {
+        std::vector<const BdptVertexRecord*> v;
+        std::vector<double> prefix_pdf;
+        std::vector<uint8_t> prefix_valid;
+    };
+
+    std::unordered_map<uint32_t, BdptSubpathView> cam_paths, light_paths;
+    for (const auto& v : verts) {
+        auto& paths = (v.stream == BDPT_SIDE_SENSOR) ? cam_paths : light_paths;
+        paths[v.subpath_id].v.push_back(&v);
+    }
+
+    auto prepare_paths = [&](std::unordered_map<uint32_t, BdptSubpathView>& paths) {
+        for (auto& kv : paths) {
+            auto& sp = kv.second;
+            std::sort(sp.v.begin(), sp.v.end(),
+                      [](const BdptVertexRecord* a, const BdptVertexRecord* b) {
+                          return a->vertex_index < b->vertex_index;
+                      });
+            sp.v.erase(std::unique(sp.v.begin(), sp.v.end(),
+                      [](const BdptVertexRecord* a, const BdptVertexRecord* b) {
+                          return a->vertex_index == b->vertex_index;
+                      }), sp.v.end());
+
+            sp.prefix_pdf.assign(sp.v.size(), 1.0);
+            sp.prefix_valid.assign(sp.v.size(), 1u);
+            double accum = 1.0;
+            bool valid = true;
+            for (size_t i = 0; i < sp.v.size(); ++i) {
+                if (i > 0) {
+                    double edge_pdf = 0.0;
+                    valid = valid && edge_pdf_area(*sp.v[i - 1], *sp.v[i], edge_pdf);
+                    if (valid) accum *= edge_pdf;
+                }
+                sp.prefix_valid[i] = valid ? 1u : 0u;
+                sp.prefix_pdf[i] = valid ? std::max(accum, 1e-300) : 0.0;
+            }
+        }
+    };
+
+    prepare_paths(cam_paths);
+    prepare_paths(light_paths);
+
+    if (cam_paths.empty() || light_paths.empty()) return;
+
+    auto candidate_strategy_density = [&](const BdptSubpathView& cam,
+                                          size_t ci,
+                                          const BdptSubpathView& light,
+                                          size_t li,
+                                          double& out_selected_pdf,
+                                          double& out_denom) -> bool {
+        std::vector<const BdptVertexRecord*> chain;
+        chain.reserve(ci + li + 2);
+        for (size_t i = 0; i <= ci; ++i)
+            chain.push_back(cam.v[i]);
+        for (size_t n = 0; n <= li; ++n)
+            chain.push_back(light.v[li - n]);
+
+        const size_t N = chain.size();
+        if (N < 2) return false;
+        std::vector<double> edge_fwd(N - 1, 0.0);
+        std::vector<double> edge_bwd(N - 1, 0.0);
+        std::vector<uint8_t> edge_fwd_ok(N - 1, 0u);
+        std::vector<uint8_t> edge_bwd_ok(N - 1, 0u);
+
+        for (size_t e = 0; e + 1 < N; ++e) {
+            double pf = 0.0, pb = 0.0;
+            bool ok_f = false, ok_b = false;
+            if (e < ci) {
+                const auto& parent = *cam.v[e];
+                const auto& child  = *cam.v[e + 1];
+                ok_f = edge_pdf_area_component(parent, parent, child, false, pf);
+                ok_b = edge_pdf_area_component(parent, child, parent, true, pb);
+            } else if (e == ci) {
+                ok_f = diffuse_connection_pdf_area(*chain[e], *chain[e + 1], pf);
+                ok_b = diffuse_connection_pdf_area(*chain[e + 1], *chain[e], pb);
+            } else {
+                const size_t light_child_idx = li - (e - ci - 1);
+                if (light_child_idx == 0) return false;
+                const auto& parent = *light.v[light_child_idx - 1];
+                const auto& child  = *light.v[light_child_idx];
+                ok_f = edge_pdf_area_component(parent, child, parent, true, pf);
+                ok_b = edge_pdf_area_component(parent, parent, child, false, pb);
+            }
+            if (ok_f) {
+                edge_fwd[e] = pf;
+                edge_fwd_ok[e] = 1u;
+            }
+            if (ok_b) {
+                edge_bwd[e] = pb;
+                edge_bwd_ok[e] = 1u;
+            }
+        }
+
+        std::vector<double> prefix_fwd(N, 0.0);
+        std::vector<double> suffix_bwd(N, 0.0);
+        std::vector<uint8_t> prefix_ok(N, 0u);
+        std::vector<uint8_t> suffix_ok(N, 0u);
+        prefix_fwd[0] = 1.0;
+        prefix_ok[0] = 1u;
+        for (size_t i = 1; i < N; ++i) {
+            prefix_ok[i] = (prefix_ok[i - 1] && edge_fwd_ok[i - 1]) ? 1u : 0u;
+            prefix_fwd[i] = prefix_ok[i]
+                ? std::max(prefix_fwd[i - 1] * edge_fwd[i - 1], 1e-300)
+                : 0.0;
+        }
+        suffix_bwd[N - 1] = 1.0;
+        suffix_ok[N - 1] = 1u;
+        for (size_t i = N - 1; i-- > 0;) {
+            suffix_ok[i] = (suffix_ok[i + 1] && edge_bwd_ok[i]) ? 1u : 0u;
+            suffix_bwd[i] = suffix_ok[i]
+                ? std::max(suffix_bwd[i + 1] * edge_bwd[i], 1e-300)
+                : 0.0;
+        }
+
+        const size_t selected_cut = ci + 1;
+        if (selected_cut == 0 || selected_cut >= N) return false;
+        if (!prefix_ok[selected_cut - 1] || !suffix_ok[selected_cut])
+            return false;
+
+        out_selected_pdf = std::max(prefix_fwd[selected_cut - 1] *
+                                    suffix_bwd[selected_cut], 1e-300);
+        out_denom = 0.0;
+        for (size_t cut = 1; cut < N; ++cut) {
+            if (!vertex_connectable(*chain[cut - 1])) continue;
+            if (!vertex_connectable(*chain[cut])) continue;
+            if (!prefix_ok[cut - 1] || !suffix_ok[cut]) continue;
+            const double p = prefix_fwd[cut - 1] * suffix_bwd[cut];
+            if (p > 0.0 && std::isfinite(p))
+                out_denom += p;
+        }
+        return out_selected_pdf > 0.0 && out_denom > 0.0 && std::isfinite(out_denom);
+    };
+
+    const int   res   = ps->sensor_res;
+    const float inv_r = static_cast<float>(res) / (2.0f * ps->sensor_pr);
+
+    /* Determine n_bands from the spectral weight records (or fall back to scalar). */
+    uint16_t max_band = 0;
+    for (const auto& sw : sweights)
+        if (sw.band_id > max_band) max_band = sw.band_id;
+    const int n_bands = (int)max_band + 1;
+
+    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+
+    for (const auto& [cam_id, cam] : cam_paths) {
+        for (const auto& [light_id, light] : light_paths) {
+            for (size_t ci = 0; ci < cam.v.size(); ++ci) {
+                const BdptVertexRecord& c = *cam.v[ci];
+                if (!vertex_connectable(c)) continue;
+                if (!cam.prefix_valid[ci]) continue;
+                const int iy = static_cast<int>((c.sensor_origin_y + ps->sensor_pr) * inv_r);
+                const int iz = static_cast<int>((c.sensor_origin_z + ps->sensor_pr) * inv_r);
+                if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
+
+                const double beta_cam = beta_scalar(c, n_bands);
+                if (beta_cam < 1e-15) continue;
+
+                double pixel_accum = 0.0;
+                for (size_t li = 0; li < light.v.size(); ++li) {
+                    const BdptVertexRecord& l = *light.v[li];
+                    if (!vertex_connectable(l)) continue;
+                    if (!light.prefix_valid[li]) continue;
+
+                    const float dx = l.pos[0] - c.pos[0];
+                    const float dy = l.pos[1] - c.pos[1];
+                    const float dz = l.pos[2] - c.pos[2];
+                    const float dist2 = dx*dx + dy*dy + dz*dz;
+                    if (dist2 < 1e-12f) continue;
+                    const float dist = std::sqrt(dist2);
+                    const float cx = dx/dist, cy = dy/dist, cz = dz/dist;
+                    const float cos_c = std::abs(c.normal[0]*cx + c.normal[1]*cy + c.normal[2]*cz);
+                    const float cos_l = std::abs(l.normal[0]*(-cx) + l.normal[1]*(-cy) + l.normal[2]*(-cz));
+                    const float geom = cos_c * cos_l / dist2;
+                    if (geom < 1e-20f) continue;
+                    const bool is_visible = visible(c, l);
+
+                    const double beta_light = beta_scalar(l, n_bands);
+                    if (beta_light < 1e-15) continue;
+
+                    double strategy_pdf = 0.0;
+                    double denom = 0.0;
+                    if (!candidate_strategy_density(cam, ci, light, li, strategy_pdf, denom))
+                        continue;
+                    const double mis_weight = strategy_pdf / denom;
+                    BdptConnectionRecord cr{};
+                    cr.camera_subpath_id   = c.subpath_id;
+                    cr.light_subpath_id    = l.subpath_id;
+                    cr.camera_vertex_index = c.vertex_index;
+                    cr.light_vertex_index  = l.vertex_index;
+                    cr.strategy_s          = static_cast<uint16_t>(std::min<size_t>(ci + 1, 0xFFFFu));
+                    cr.strategy_t          = static_cast<uint16_t>(std::min<size_t>(li + 1, 0xFFFFu));
+                    cr.flags               = is_visible ? 0u : (1u << 0);
+                    cr.p0[0] = c.pos[0]; cr.p0[1] = c.pos[1]; cr.p0[2] = c.pos[2];
+                    cr.p1[0] = l.pos[0]; cr.p1[1] = l.pos[1]; cr.p1[2] = l.pos[2];
+                    cr.dist2               = dist2;
+                    cr.cos_camera          = cos_c;
+                    cr.cos_light           = cos_l;
+                    cr.geometry_term       = geom;
+                    cr.visibility          = is_visible ? 1.0f : 0.0f;
+                    cr.strategy_pdf        = static_cast<float>(std::min(strategy_pdf, (double)std::numeric_limits<float>::max()));
+                    cr.mis_weight          = static_cast<float>(mis_weight);
+                    ps->push_bdpt_connection(cr);
+                    if (!is_visible) continue;
+
+                    const double raw = beta_cam * beta_light * (double)geom / strategy_pdf;
+                    pixel_accum += raw * mis_weight;
+                }
+
+                if (pixel_accum > 0.0) {
+                    const size_t idx = static_cast<size_t>(2 * res * res + iy * res + iz);
+                    ps->sensor_accum[idx] += pixel_accum;
+                    if (ps->sensor_accum[idx] > ps->sensor_peak[2])
+                        ps->sensor_peak[2] = ps->sensor_accum[idx];
+                    ps->bdpt_exact_snaps.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
+}
+
+void ray_pipeline_set_bdpt_sweep_trigger(RayPipelineState* ps, int n)
+{
+    if (!ps) return;
+    ps->cfg.bdpt_sweep_trigger = n;
 }
 
 uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps)

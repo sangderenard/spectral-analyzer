@@ -145,6 +145,18 @@ layout(std430, binding = 7) coherent buffer UvAccumBuf        { uint  uv_accum[]
  * count without a CPU readback between T1 and T3 dispatch. */
 layout(std430, binding = 8) readonly buffer CounterBuf        { uint  t1_counters[];      };
 
+/* ── BDPT side-data SSBOs (bindings 9-12) ───────────────────────────────── *
+ * binding  9: BdptIdBuf      — one uint32 per hit slot (bdpt_subpath_id from T1)
+ * binding 10: BdptVertexBuf  — flat float32 output for BdptVertexRecord (28 floats each)
+ * binding 11: BdptSpectralBuf— flat float32 output for BdptSpectralWeightRecord (8 each)
+ * binding 12: BdptCounterBuf — uint32[3]: [0]=vertex_count, [1]=spectral_count, [2]=pdf_count
+ * binding 13: BdptPdfBuf     — flat float32 output for BdptPdfRecord (12 each)       */
+layout(std430, binding =  9) readonly buffer BdptIdBuf       { uint  bdpt_ids[];       };
+layout(std430, binding = 10) coherent buffer BdptVertexBuf   { float bdpt_verts[];     };
+layout(std430, binding = 11) coherent buffer BdptSpectralBuf { float bdpt_spectral[];  };
+layout(std430, binding = 12) coherent buffer BdptCounterBuf  { uint  bdpt_counters[];  };
+layout(std430, binding = 13) coherent buffer BdptPdfBuf      { float bdpt_pdfs[];      };
+
 /* image2DArray sensor — image unit binding 7 is a separate namespace from SSBO binding 7 */
 layout(r32ui, binding = 7) coherent volatile uniform uimage2DArray sensor_image;
 
@@ -160,6 +172,9 @@ uniform float sensor_px;
 uniform int   n_uv_groups;        /* number of registered UV integrator groups (0 = none) */
 uniform int   uv_meta_base;       /* index in tri_uv_and_meta[] where group metadata begins */
 uniform uint  rng_seed;
+uniform int   bdpt_max_verts;     /* cap for BdptVertexBuf; 0 = BDPT disabled */
+uniform int   bdpt_max_spectral;  /* cap for BdptSpectralBuf */
+uniform int   bdpt_max_pdfs;      /* cap for BdptPdfBuf */
 
 /* ── Hash-based PRNG (xorshift32 + Weyl) ────────────────────────────────── */
 float rand_next(inout uint s) {
@@ -283,6 +298,90 @@ float hit_soz        (uint b) { return HIT(b,24); }
 int   hit_medium     (uint b) { return floatBitsToInt(HIT(b,25)); }
 float hit_amp_re(uint b, int band) { return HIT(b, 26 + band); }
 float hit_amp_im(uint b, int band) { return HIT(b, 26 + MAX_BANDS + band); }
+float hit_pathatseg(uint b) { return HIT(b, 13); }
+
+/* ── BDPT emit helpers ───────────────────────────────────────────────────── */
+#define BDPT_VERTEX_STRIDE   28
+#define BDPT_SPECTRAL_STRIDE  8
+#define BDPT_PDF_STRIDE      12
+#define BDPT_DOMAIN_SOLID_ANGLE       2u
+#define BDPT_DOMAIN_PROJ_SOLID_ANGLE  3u
+#define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)
+#define BDPT_PDF_FLAG_SPLIT           (1u << 17)
+#define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)
+
+void emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, int mat_id,
+                      vec3 pos, vec3 nrm, vec3 dir_in,
+                      float path_len, float path_at_seg, float throughput,
+                      float soy, float soz)
+{
+    if (bdpt_max_verts <= 0) return;
+    uint slot = atomicAdd(bdpt_counters[0], 1u);
+    if (int(slot) >= bdpt_max_verts) return;
+    uint vb = slot * uint(BDPT_VERTEX_STRIDE);
+    bdpt_verts[vb +  0] = uintBitsToFloat(sid);
+    bdpt_verts[vb +  1] = uintBitsToFloat(packed_vi);  /* vertex_index<<16 | stream<<8 | sample_domain */
+    bdpt_verts[vb +  2] = uintBitsToFloat(tri_flags_u);
+    bdpt_verts[vb +  3] = 0.0;                         /* strategy_id = 0 */
+    bdpt_verts[vb +  4] = intBitsToFloat(tri_id);
+    bdpt_verts[vb +  5] = intBitsToFloat(-1);           /* group_id = -1 (not computed GPU-side) */
+    bdpt_verts[vb +  6] = intBitsToFloat(mat_id);
+    bdpt_verts[vb +  7] = pos.x;   bdpt_verts[vb +  8] = pos.y;   bdpt_verts[vb +  9] = pos.z;
+    bdpt_verts[vb + 10] = nrm.x;   bdpt_verts[vb + 11] = nrm.y;   bdpt_verts[vb + 12] = nrm.z;
+    bdpt_verts[vb + 13] = dir_in.x; bdpt_verts[vb + 14] = dir_in.y; bdpt_verts[vb + 15] = dir_in.z;
+    bdpt_verts[vb + 16] = 0.0;     bdpt_verts[vb + 17] = 0.0;     bdpt_verts[vb + 18] = 0.0; /* dir_out */
+    bdpt_verts[vb + 19] = path_len;
+    bdpt_verts[vb + 20] = path_at_seg;
+    bdpt_verts[vb + 21] = 0.0;  /* pdf_fwd lives in BdptPdfRecord */
+    bdpt_verts[vb + 22] = 0.0;  /* pdf_rev lives in BdptPdfRecord */
+    bdpt_verts[vb + 23] = 0.0;  /* pdf_area lives in BdptPdfRecord */
+    bdpt_verts[vb + 24] = 0.0;  /* pdf_solid_angle lives in BdptPdfRecord */
+    bdpt_verts[vb + 25] = throughput;
+    bdpt_verts[vb + 26] = soy;
+    bdpt_verts[vb + 27] = soz;
+}
+
+void emit_bdpt_spectral(uint sid, uint vi_band, float re, float im, float band_pdf)
+{
+    if (bdpt_max_spectral <= 0) return;
+    uint slot = atomicAdd(bdpt_counters[1], 1u);
+    if (int(slot) >= bdpt_max_spectral) return;
+    uint sb = slot * uint(BDPT_SPECTRAL_STRIDE);
+    bdpt_spectral[sb + 0] = uintBitsToFloat(sid);
+    bdpt_spectral[sb + 1] = uintBitsToFloat(vi_band);  /* vertex_index<<16 | band_id */
+    bdpt_spectral[sb + 2] = re;
+    bdpt_spectral[sb + 3] = im;
+    bdpt_spectral[sb + 4] = 0.0;      /* wavelength_or_center (not available GPU-side) */
+    bdpt_spectral[sb + 5] = band_pdf;
+    bdpt_spectral[sb + 6] = 1.0;      /* sensor_rgb_weight */
+    bdpt_spectral[sb + 7] = 0.0;      /* pad */
+}
+
+void emit_bdpt_pdf(uint sid, uint vi, uint domain, float pdf_fwd, float pdf_rev,
+                   uint flags, vec3 nrm, vec3 dir_in, vec3 dir_out)
+{
+    if (sid == 0u || bdpt_max_pdfs <= 0) return;
+    uint slot = atomicAdd(bdpt_counters[2], 1u);
+    if (int(slot) >= bdpt_max_pdfs) return;
+
+    float cos_in  = max(0.0, -dot(dir_in, nrm));
+    float cos_out = max(0.0,  dot(dir_out, nrm));
+    uint packed_vm = ((domain & 0xFFu) << 16) | ((domain & 0xFFu) << 24) | (vi & 0xFFFFu);
+
+    uint pb = slot * uint(BDPT_PDF_STRIDE);
+    bdpt_pdfs[pb +  0] = uintBitsToFloat(sid);
+    bdpt_pdfs[pb +  1] = uintBitsToFloat(packed_vm);  /* vertex_index | sample_domain | measure */
+    bdpt_pdfs[pb +  2] = pdf_fwd;
+    bdpt_pdfs[pb +  3] = pdf_rev;
+    bdpt_pdfs[pb +  4] = 0.0;       /* pdf_area */
+    bdpt_pdfs[pb +  5] = pdf_fwd;   /* pdf_solid_angle */
+    bdpt_pdfs[pb +  6] = 1.0;       /* jacobian_det */
+    bdpt_pdfs[pb +  7] = cos_in * cos_out;
+    bdpt_pdfs[pb +  8] = uintBitsToFloat(flags);
+    bdpt_pdfs[pb +  9] = 0.0;
+    bdpt_pdfs[pb + 10] = 0.0;
+    bdpt_pdfs[pb + 11] = 0.0;
+}
 
 /* ── Triangle accessors (TRI_FULL_STRIDE = 16, matches T1/T2 buffer) ──────── */
 int   tri_flags  (int t) { return floatBitsToInt(tris[t * TRI_FULL_STRIDE + 12]); }
@@ -310,7 +409,7 @@ void write_intent(uint slot,
                   int medium, uint iflags,
                   int src_id, int bounce, int bounces_left, float min_amp,
                   uint tag_lo, uint tag_hi, uint color_flag, float priority,
-                  float soy, float soz,
+                  float soy, float soz, uint bdpt_sid,
                   float amp_re[MAX_BANDS], float amp_im[MAX_BANDS])
 {
     uint ibase = slot * uint(INTENT_STRIDE);
@@ -334,7 +433,7 @@ void write_intent(uint slot,
     out_buf[ibase + 16] = priority;
     out_buf[ibase + 17] = soy;
     out_buf[ibase + 18] = soz;
-    out_buf[ibase + 19] = 0.0;
+    out_buf[ibase + 19] = uintBitsToFloat(bdpt_sid);
     for (int b = 0; b < MAX_BANDS; b++) {
         out_buf[ibase + 20 +           b] = amp_re[b];
         out_buf[ibase + 20 + MAX_BANDS + b] = amp_im[b];
@@ -375,6 +474,31 @@ void main() {
     }
     for (int b = nb; b < MAX_BANDS; b++) { amp_re[b] = 0.0; amp_im[b] = 0.0; }
 
+    /* ── BDPT vertex and spectral weight emission ───────────────────────────
+     * Emitted for every hit where bdpt_subpath_id != 0, before any early exits,
+     * so terminal and scatter paths are both recorded. */
+    uint bdpt_sid = bdpt_ids[gid];
+    if (bdpt_sid != 0u && bdpt_max_verts > 0) {
+        uint vi         = uint(bounce) & 0xFFFFu;
+        uint stream_bit = (cflag == 1u) ? 1u : 0u;  /* 1=SENSOR, 0=LIGHT */
+        uint packed_vi  = (vi << 16) | (stream_bit << 8);  /* sample_domain=0=UNKNOWN */
+        int  tri_idx_v  = hit_tri(hbase);
+        int  mat_id_v   = hit_mat(hbase);
+        uint tflags_u   = (tri_idx_v >= 0) ? uint(tri_flags(tri_idx_v)) : 0u;
+        float throughput = 0.0;
+        for (int b = 0; b < nb; b++)
+            throughput += sqrt(amp_re[b] * amp_re[b] + amp_im[b] * amp_im[b]);
+        emit_bdpt_vertex(bdpt_sid, packed_vi, tflags_u, tri_idx_v, mat_id_v,
+                         pos, nrm, in_dir,
+                         path_len, hit_pathatseg(hbase),
+                         throughput, soy, soz);
+        float band_pdf = (nb > 0) ? 1.0 / float(nb) : 1.0;
+        for (int b = 0; b < nb; b++) {
+            uint vi_band = (vi << 16) | uint(b);
+            emit_bdpt_spectral(bdpt_sid, vi_band, amp_re[b], amp_im[b], band_pdf);
+        }
+    }
+
     /* Absorb: T2 rejected this ray via parametric acceptance boundary (bit 3).
      * No child intent, no terminal — ray contributes zero energy. */
     if ((cflag & 8u) != 0u) return;
@@ -389,7 +513,7 @@ void main() {
         uint islot = atomicAdd(meta[0], 1u);
         write_intent(islot, pos, in_dir, path_len, medium, 0u,
                      src_id, bounce, bleft, min_amp,
-                     tag_lo, tag_hi, cflag & ~4u, 1.0, soy, soz, cf_re, cf_im);
+                     tag_lo, tag_hi, cflag & ~4u, 1.0, soy, soz, bdpt_sid, cf_re, cf_im);
         return;
     }
 
@@ -555,13 +679,17 @@ void main() {
             for (int b = nb; b < MAX_BANDS; b++) { ra_re[b]=0.0; ra_im[b]=0.0; }
             uint islot = atomicAdd(meta[0], 1u);
             int new_med = has_pair ? medium_from : (front_face ? mat_id : -1);
+            emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, 1.0, 1.0,
+                          uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR,
+                          nrm, in_dir, rd);
             write_intent(islot, pos, rd, path_len, new_med, iflags,
                          src_id, new_bounce, new_bleft, min_amp,
-                         tag_lo, tag_hi, cflag, 1.0, soy, soz, ra_re, ra_im);
+                         tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ra_re, ra_im);
         } else {
             float sin2_t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
             float cos_t  = sqrt(max(0.0, 1.0 - sin2_t));
             float R      = fresnel_R(cos_i, cos_t, n1, n2);
+            float R_rev  = fresnel_R(cos_t, cos_i, n2, n1);
             int   new_med = has_pair ? medium_to : (front_face ? mat_id : -1);
 
             if (max_children_per_hit >= 2) {
@@ -578,9 +706,12 @@ void main() {
                     }
                     for (int b = nb; b < MAX_BANDS; b++) { ra_re[b]=0.0; ra_im[b]=0.0; }
                     uint islot = atomicAdd(meta[0], 1u);
+                    emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, R, R,
+                                  uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
+                                  nrm, in_dir, rd);
                     write_intent(islot, pos, rd, path_len, medium, iflags,
                                  src_id, new_bounce, new_bleft, min_amp,
-                                 tag_lo, tag_hi, cflag, 1.0, soy, soz, ra_re, ra_im);
+                                 tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ra_re, ra_im);
                 }
                 {
                     float ta_re[MAX_BANDS], ta_im[MAX_BANDS];
@@ -590,9 +721,13 @@ void main() {
                     }
                     for (int b = nb; b < MAX_BANDS; b++) { ta_re[b]=0.0; ta_im[b]=0.0; }
                     uint islot = atomicAdd(meta[0], 1u);
+                    emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE,
+                                  1.0 - R, 1.0 - R_rev,
+                                  uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
+                                  nrm, in_dir, refracted);
                     write_intent(islot, pos, refracted, path_len, new_med, iflags,
                                  src_id, new_bounce, new_bleft, min_amp,
-                                 tag_lo, tag_hi, cflag, 1.0, soy, soz, ta_re, ta_im);
+                                 tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ta_re, ta_im);
                 }
             } else {
                 float u = rand_next(rng);
@@ -615,20 +750,29 @@ void main() {
                 }
                 for (int b = nb; b < MAX_BANDS; b++) { ca_re[b]=0.0; ca_im[b]=0.0; }
                 uint islot = atomicAdd(meta[0], 1u);
+                uint pdf_flags = BDPT_PDF_FLAG_DELTA_SPECULAR;
+                float pdf_fwd = (u < R) ? R : (1.0 - R);
+                float pdf_rev = (u < R) ? R : (1.0 - R_rev);
+                emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, pdf_fwd, pdf_rev,
+                              uint(flags) | pdf_flags, nrm, in_dir, cdir);
                 write_intent(islot, pos, cdir, path_len, cmed, iflags,
                              src_id, new_bounce, new_bleft, min_amp,
-                             tag_lo, tag_hi, cflag, 1.0, soy, soz, ca_re, ca_im);
+                             tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ca_re, ca_im);
             }
         }
     } else {
         float diffusion = (mat_id >= 0) ? mat_diffusion(mat_id) : 0.0;
         vec3 new_dir;
+        bool chose_diffuse = false;
         if (rand_next(rng) < diffusion) {
             new_dir = cosine_hemisphere(nrm, rng);
+            chose_diffuse = true;
         } else {
             new_dir = normalize(in_dir - 2.0 * dot(in_dir, nrm) * nrm);
-            if (dot(new_dir, nrm) < 0.0)
+            if (dot(new_dir, nrm) < 0.0) {
                 new_dir = cosine_hemisphere(nrm, rng);
+                chose_diffuse = true;
+            }
         }
 
         float na_re[MAX_BANDS], na_im[MAX_BANDS];
@@ -645,9 +789,20 @@ void main() {
 
         if (max_abs >= min_amp) {
             uint islot = atomicAdd(meta[0], 1u);
+            float diffuse_p = (mat_id >= 0) ? mat_diffusion(mat_id) : 0.0;
+            float scatter_pdf = chose_diffuse
+                ? diffuse_p * max(0.0, dot(new_dir, nrm)) / 3.141592653589793
+                : max(0.0, 1.0 - diffuse_p);
+            float scatter_pdf_rev = chose_diffuse
+                ? diffuse_p * max(0.0, -dot(in_dir, nrm)) / 3.141592653589793
+                : max(0.0, 1.0 - diffuse_p);
+            uint scatter_domain = chose_diffuse ? BDPT_DOMAIN_PROJ_SOLID_ANGLE : BDPT_DOMAIN_SOLID_ANGLE;
+            uint scatter_flags = chose_diffuse ? BDPT_PDF_FLAG_DIFFUSE : BDPT_PDF_FLAG_DELTA_SPECULAR;
+            emit_bdpt_pdf(bdpt_sid, uint(bounce), scatter_domain, scatter_pdf, scatter_pdf_rev,
+                          uint(flags) | scatter_flags, nrm, in_dir, new_dir);
             write_intent(islot, pos, new_dir, path_len, medium, iflags,
                          src_id, new_bounce, new_bleft, min_amp,
-                         tag_lo, tag_hi, cflag, 1.0, soy, soz, na_re, na_im);
+                         tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, na_re, na_im);
         } else {
             uint tslot = atomicAdd(meta[1], 1u);
             write_terminal(tslot, hbase, false);

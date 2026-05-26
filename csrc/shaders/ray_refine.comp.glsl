@@ -11,7 +11,8 @@
  *   1 = POLY_BARY       — polynomial height: delta = c0+cu*u+cv*v+cuu*uu+cuv*uv+cvv*vv
  *   2 = SDF_SADDLE      — (falls back to CPU; mark bit set in counter[3])
  *   3 = SDF_SPHERE      — spherical cap: delta = k*(cu²+cv²), k=0.5/radius
- *   4 = NEURAL_ASSEMBLY — MLP teleport: entrance→exit surface in one shot
+ *   4 = NEURAL_ASSEMBLY — deferred absorber; MLP transport is disabled until
+ *                          it supplies reversible optical metadata
  *
  * Flat buffer layouts (same bindings as T1 but shared HitBuf is now input):
  *
@@ -30,29 +31,17 @@
  *    POLY_BARY:        [0..5] = {c0, cu, cv, cuu, cuv, cvv}
  *    NEURAL_ASSEMBLY:  [0]=int offset into NeuralPayBuf (bit-cast via floatBitsToInt)
  *
- *  NeuralPayBuf  (binding 6): concatenated float32 neural payloads.
- *    Magic header at [off+0]=14948.0, then layout per neural_assembly.py:
- *      [0]     MAGIC_NEURAL (14948.0)
- *      [1..4]  n_layers, input_dim(5), hidden_dim, output_dim(6)
- *      [5]     z_ent   (scene axial coord of entrance)
- *      [6]     z_exit  (scene axial coord of exit)
- *      [7..12] reserved
- *      [13]    axis_idx (0=X, 2=Z)
- *      [14..15] reserved
- *      [16..20] in_mean[5]
- *      [21..25] in_scale[5]
- *      [26..31] out_mean[6]
- *      [32..37] out_scl[6]
- *      [38..]   layer weights (W row-major then bias for each layer)
+ *  NeuralPayBuf  (binding 6): still present because PARAMETRIC_LENS shares
+ *    this transport payload buffer.  NEURAL_ASSEMBLY no longer consumes it.
  *
  *  CounterBuf:
  *    [0] = hit count  (from T1, used as n_hits here)
  *    [3] = cpu_refine count  (incremented for complex-kind fallbacks)
  *
- * NEURAL_ASSEMBLY passthrough protocol:
- *   T2 sets bit 4 of color_flag (HitBuf[16]) to signal T3 to re-emit the
- *   ray without Snell/Fresnel physics.  T3 checks this flag and forwards
- *   the ray with the updated pos/dir and original medium.
+ * NEURAL_ASSEMBLY policy:
+ *   T2 sets bit 3 of color_flag (HitBuf[16]) to absorb the ray.  The intended
+ *   future implementation must emit OPL, Jacobian, eta/cosines, and PDFs like
+ *   the parametric lens path before it is allowed back into the camera pipeline.
  */
 #version 430 core
 
@@ -227,189 +216,19 @@ void refine_poly(in vec3 v0, in vec3 e1, in vec3 e2, in vec3 n0,
     n   = wn;
 }
 
-/* ── NEURAL_ASSEMBLY MLP teleport ──────────────────────────────────────── */
+/* ── NEURAL_ASSEMBLY deferred absorber ─────────────────────────────────── */
 /*
- * Runs the trained MLP forward pass to teleport the ray from the entrance
- * surface (hit point) to the exit surface, accumulating phase on each band.
- * On success writes back updated pos, incoming_dir, hit_n, path_len, amp
- * and sets bit 4 of color_flag to signal T3 to skip Snell/Fresnel physics.
+ * The old MLP teleport is intentionally disabled.  It must not re-enter the
+ * camera pipeline until it can emit reversible optical metadata equivalent to
+ * the parametric lens path.  Current behavior is fail-closed absorption.
  */
 void neural_assembly_teleport(int hb, int pay_off)
 {
-    /* Validate magic */
-    if (abs(npay[pay_off] - NEURAL_MAGIC) > 1.0) return;
-
-    int n_layers   = int(npay[pay_off + NPAY_N_LAYERS]);
-    int input_dim  = int(npay[pay_off + NPAY_IN_DIM]);
-    int hidden_dim = int(npay[pay_off + NPAY_HIDDEN_DIM]);
-    int output_dim = int(npay[pay_off + NPAY_OUT_DIM]);
-    float z_exit   = npay[pay_off + NPAY_Z_EXIT];
-    int axis_idx   = int(npay[pay_off + NPAY_AXIS_IDX]);
-
-    if (input_dim != 5 || output_dim != 6) return;
-    if (n_layers < 2 || hidden_dim < 1 || hidden_dim > MAX_NEURAL_DIM) return;
-
-    int nb = min(n_bands, MAX_GPU_BANDS);
-    if (nb <= 0) return;
-
-    /* Coordinate axis setup: ax=optical axis, t0/t1=transverse */
-    int ax = (axis_idx >= 0 && axis_idx <= 2) ? axis_idx : 2;
-    int t0 = (ax == 0) ? 1 : 0;
-    int t1 = (ax == 2) ? 1 : 2;
-
-    vec3 pos     = vec3(hit_f(hb, 0), hit_f(hb, 1), hit_f(hb, 2));
-    vec3 inc_dir = vec3(hit_f(hb, 6), hit_f(hb, 7), hit_f(hb, 8));
-
-    float pos_t0 = vec3_comp(pos, t0);
-    float pos_t1 = vec3_comp(pos, t1);
-    float inc_t0 = vec3_comp(inc_dir, t0);
-    float inc_t1 = vec3_comp(inc_dir, t1);
-    float dir_z_in = abs(vec3_comp(inc_dir, ax));
-
-    if (dir_z_in < 1e-9) return;
-
-    /* Parametric acceptance boundary: c0 + c1*(r/r_lens)^2
-     * Shared gate for both LUT and MLP paths — reject outside the acceptance
-     * cone and mark for silent absorption by T3 (bit 3 = 8u of color_flag). */
-    {
-        float bnd_c0 = npay[pay_off + NPAY_BND_C0];
-        float bnd_c1 = npay[pay_off + NPAY_BND_C1];
-        float r_lens = npay[pay_off + NPAY_R_LENS];
-        if ((bnd_c0 != 0.0 || bnd_c1 != 0.0) && r_lens > 0.0) {
-            float r_in_bnd = sqrt(pos_t0 * pos_t0 + pos_t1 * pos_t1);
-            float r_norm   = r_in_bnd / r_lens;
-            if (dir_z_in < bnd_c0 + bnd_c1 * r_norm * r_norm) {
-                uint cflag_rej = floatBitsToUint(hit_f(hb, 16));
-                hit_wf(hb, 16, uintBitsToFloat(cflag_rej | 8u));
-                return;
-            }
-        }
-    }
-
-    /* Canonical cylindrical frame */
-    float theta_hit  = atan(pos_t1, pos_t0);
-    float r_in       = sqrt(pos_t0 * pos_t0 + pos_t1 * pos_t1);
-    float cos_t      = cos(theta_hit);
-    float sin_t      = sin(theta_hit);
-    float dir_r_in   =  inc_t0 * cos_t + inc_t1 * sin_t;
-    float dir_phi_in = -inc_t0 * sin_t + inc_t1 * cos_t;
-
-    /* Normalization block offsets in npay */
-    int in_mean_o  = pay_off + NPAY_IN_MEAN;
-    int in_scl_o   = pay_off + NPAY_IN_SCALE;
-    int out_mean_o = pay_off + NPAY_OUT_MEAN;
-    int out_scl_o  = pay_off + NPAY_OUT_SCL;
-
-    float buf0[MAX_NEURAL_DIM];
-    float buf1[MAX_NEURAL_DIM];
-
-    float ref_opl = 0.0;
-    float ref_ex  = 0.0, ref_ey  = 0.0;
-    float ref_dx  = 0.0, ref_dy  = 0.0, ref_dz = 0.0;
-    bool  ref_valid = false;
-
-    for (int b = 0; b < nb; b++) {
-        float freq = freq_hz[b];
-        if (freq <= 0.0) continue;
-        float wavelength_um = SPEED_LIGHT / freq * 1.0e6;
-
-        /* Normalize input */
-        float raw_in[5];
-        raw_in[0] = r_in;
-        raw_in[1] = dir_r_in;
-        raw_in[2] = dir_phi_in;
-        raw_in[3] = dir_z_in;
-        raw_in[4] = wavelength_um;
-        for (int i = 0; i < 5; i++) {
-            float scl = max(abs(npay[in_scl_o + i]), 1e-12);
-            buf0[i] = (raw_in[i] - npay[in_mean_o + i]) / scl;
-        }
-
-        /* MLP forward pass */
-        int w_off = pay_off + NPAY_LAYER_OFF;
-        for (int l = 0; l < n_layers; l++) {
-            int in_d  = (l == 0) ? 5 : hidden_dim;
-            int out_d = (l == n_layers - 1) ? 6 : hidden_dim;
-            bool relu = (l < n_layers - 1);
-            int bv_off = w_off + out_d * in_d;
-            for (int j = 0; j < out_d; j++) {
-                float acc = npay[bv_off + j];
-                for (int i = 0; i < in_d; i++)
-                    acc += npay[w_off + j * in_d + i] * buf0[i];
-                buf1[j] = (relu && acc < 0.0) ? 0.0 : acc;
-            }
-            for (int i = 0; i < out_d; i++) buf0[i] = buf1[i];
-            w_off = bv_off + out_d;
-        }
-
-        /* Denormalize output */
-        float r_out       = buf0[0] * npay[out_scl_o + 0] + npay[out_mean_o + 0];
-        float delta_phi   = buf0[1] * npay[out_scl_o + 1] + npay[out_mean_o + 1];
-        float dir_r_out   = buf0[2] * npay[out_scl_o + 2] + npay[out_mean_o + 2];
-        float dir_phi_out = buf0[3] * npay[out_scl_o + 3] + npay[out_mean_o + 3];
-        float dir_z_out   = buf0[4] * npay[out_scl_o + 4] + npay[out_mean_o + 4];
-        float opl         = buf0[5] * npay[out_scl_o + 5] + npay[out_mean_o + 5];
-
-        /* Reconstruct exit position and direction */
-        float theta_out = theta_hit + delta_phi;
-        float ex = r_out * cos(theta_out);
-        float ey = r_out * sin(theta_out);
-
-        float out_dx = dir_r_out * cos_t - dir_phi_out * sin_t;
-        float out_dy = dir_r_out * sin_t + dir_phi_out * cos_t;
-        float out_dz = dir_z_out;
-        float dnorm  = sqrt(out_dx*out_dx + out_dy*out_dy + out_dz*out_dz);
-        if (dnorm < 1e-12) continue;
-        out_dx /= dnorm; out_dy /= dnorm; out_dz /= dnorm;
-
-        /* Apply OPL phase rotation to this band's amplitude */
-        float phase  = TWO_PI * freq * opl / SPEED_LIGHT;
-        float ph_cos = cos(phase);
-        float ph_sin = sin(phase);
-        float ar = hit_f(hb, 26 + b);
-        float ai = hit_f(hb, 26 + MAX_GPU_BANDS + b);
-        hit_wf(hb, 26 + b,                ar * ph_cos - ai * ph_sin);
-        hit_wf(hb, 26 + MAX_GPU_BANDS + b, ar * ph_sin + ai * ph_cos);
-
-        /* First valid band defines pos/dir reference */
-        if (!ref_valid) {
-            ref_opl = opl;
-            ref_ex  = ex;  ref_ey  = ey;
-            ref_dx  = out_dx; ref_dy = out_dy; ref_dz = out_dz;
-            ref_valid = true;
-        }
-    }
-
-    if (!ref_valid) return;
-
-    /* Reconstruct exit position and direction in scene space */
-    vec3 new_pos;
-    vec3_set_comp(new_pos, ax, z_exit);
-    vec3_set_comp(new_pos, t0, ref_ex);
-    vec3_set_comp(new_pos, t1, ref_ey);
-
-    vec3 new_dir;
-    vec3_set_comp(new_dir, ax, ref_dz);
-    vec3_set_comp(new_dir, t0, ref_dx);
-    vec3_set_comp(new_dir, t1, ref_dy);
-    new_dir = normalize(new_dir);
-
-    /* Nudge past exit surface to avoid self-intersection */
-    new_pos = new_pos + new_dir * 2.0e-7;
-
-    /* Update path_len */
-    float new_path_len = hit_f(hb, 12) + ref_opl;
-
-    /* Write back: pos, hit_n (= new_dir, any value — T3 skips physics),
-     * incoming_dir (= new_dir so T3 uses correct direction in re-emit). */
-    hit_wf(hb, 0, new_pos.x); hit_wf(hb, 1, new_pos.y); hit_wf(hb, 2, new_pos.z);
-    hit_wf(hb, 3, new_dir.x); hit_wf(hb, 4, new_dir.y); hit_wf(hb, 5, new_dir.z);
-    hit_wf(hb, 6, new_dir.x); hit_wf(hb, 7, new_dir.y); hit_wf(hb, 8, new_dir.z);
-    hit_wf(hb, 12, new_path_len);
-
-    /* Set bit 4 of color_flag: neural passthrough — T3 re-emits without Snell/Fresnel */
-    uint cflag = floatBitsToUint(hit_f(hb, 16));
-    hit_wf(hb, 16, uintBitsToFloat(cflag | 4u));
+    /* Deferred: MLP transport is disabled until it can emit reversible optical
+     * data equivalent to the parametric lens path.  Fail closed by absorbing
+     * the ray instead of performing an opaque teleport. */
+    uint cflag_disabled = floatBitsToUint(hit_f(hb, 16));
+    hit_wf(hb, 16, uintBitsToFloat(cflag_disabled | 8u));
 }
 
 /* ── Parametric lens exact algebraic teleport ───────────────────────────── */
@@ -658,21 +477,13 @@ void main() {
 
     int pb = gid_param * GROUP_PAYLOAD_STRIDE;
 
-    /* ── NEURAL_ASSEMBLY: full MLP teleport (writes back and returns) ─── */
+    /* ── NEURAL_ASSEMBLY: deferred ───────────────────────────────────────
+     * Disabled until it can provide the same reversible optical metadata as
+     * the parametric lens path.  Absorb instead of performing an opaque MLP
+     * teleport inside the basic camera pipeline. */
     if (kind == PARAM_NEURAL_ASSEMBLY) {
-        int pay_off = floatBitsToInt(group_payload[pb]);
-        if (pay_off >= 0) {
-            neural_assembly_teleport(hb, pay_off);
-        }
-        /* Force absorb if teleport didn't fire (bit 4) and boundary didn't already
-         * mark absorb (bit 3).  Covers: no-payload interior absorbers (pay_off<0),
-         * magic mismatch, degenerate geometry, and any other early-return path.
-         * T3 silently drops rays with bit 3 set — they contribute zero energy. */
-        {
-            uint cflag_na = floatBitsToUint(hit_f(hb, 16));
-            if ((cflag_na & (4u | 8u)) == 0u)
-                hit_wf(hb, 16, uintBitsToFloat(cflag_na | 8u));
-        }
+        uint cflag_na = floatBitsToUint(hit_f(hb, 16));
+        hit_wf(hb, 16, uintBitsToFloat(cflag_na | 8u));
         return;
     }
 

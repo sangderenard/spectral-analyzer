@@ -33,6 +33,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/complex.h>
+#include <atomic>
 #include <cstdint>
 #include <algorithm>
 #include <mutex>
@@ -545,10 +546,12 @@ struct PyRayTracer
 
     /* Sensor image parameters — cached so configure_sensor_image() can be
      * called before the pipeline is created (lazy init on first submit_rays). */
-    float _sensor_plate_x   = 0.0f;
-    float _sensor_plate_r   = 0.0f;
-    int   _sensor_res       = 0;
-    float _sensor_bdpt_eps  = 0.008f;
+    float _sensor_plate_x      = 0.0f;
+    float _sensor_plate_r      = 0.0f;
+    int   _sensor_res          = 0;
+    float _sensor_bdpt_eps     = 0.008f;
+    int   _bdpt_sweep_trigger  = 0;
+    std::atomic<uint32_t> _bdpt_subpath_counter{1u};
 
     /* GPU compute config — stored before pipeline creation so first submit_rays
      * can enable the GPU backend.  Ignored after the pipeline is created. */
@@ -565,11 +568,12 @@ struct PyRayTracer
         std::lock_guard<std::mutex> lk(_pipeline_mu);
         if (!_pipeline) {
             RayPipelineConfig cfg;
-            cfg.max_children     = max_children;
-            cfg.seed             = seed;
-            cfg.min_amplitude    = _default_min_amplitude;
-            cfg.max_intent_queue = _max_intent_queue;
-            cfg.use_gpu_compute  = _use_gpu_compute;
+            cfg.max_children        = max_children;
+            cfg.seed                = seed;
+            cfg.min_amplitude       = _default_min_amplitude;
+            cfg.max_intent_queue    = _max_intent_queue;
+            cfg.bdpt_sweep_trigger  = _bdpt_sweep_trigger;
+            cfg.use_gpu_compute     = _use_gpu_compute;
             cfg.gpu_all_stages   = _gpu_all_stages;
             cfg.shader_dir       = _shader_dir;
             cfg.gl_display_hglrc = _gl_display_hglrc;
@@ -1619,6 +1623,13 @@ struct PyRayTracer
             ri.color_flag    = cp ? cp[i] : 0u;
             ri.bounces_left  = max_bounces;
             ri.min_amplitude = min_amplitude;
+            uint32_t bdpt_sid = _bdpt_subpath_counter.fetch_add(1u, std::memory_order_relaxed);
+            if (bdpt_sid == 0u)
+                bdpt_sid = _bdpt_subpath_counter.fetch_add(1u, std::memory_order_relaxed);
+            ri.bdpt_subpath_id = bdpt_sid;
+            ri.bdpt_vertex     = 0u;
+            ri.bdpt_stream     = (ri.color_flag == 1u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
+            ri.bdpt_strategy   = 0u;
             /* For backward (sensor-cast) rays, record the pixel origin so it
              * can be used to splat the sensor image after any number of bounces. */
             if (ri.color_flag == 1) {
@@ -2101,6 +2112,119 @@ struct PyRayTracer
         d["exact_snaps"]       = static_cast<long long>(es);
         d["near_miss_count"]   = static_cast<long long>(nm);
         return d;
+    }
+
+    /* ── BDPT side-data drains ─────────────────────────────────────────────
+     *
+     * Each function returns a uint8 ndarray of shape (n, sizeof(Record)).
+     * Python converts to a structured array via:
+     *   records = np.frombuffer(arr.tobytes(), dtype=BDPT_XYZ_DTYPE)
+     * or directly for aligned memory:
+     *   records = arr.view(dtype=BDPT_XYZ_DTYPE).reshape(-1)
+     *
+     * Returns shape (0, stride) when the queue is empty. */
+
+    py::array_t<uint8_t> drain_bdpt_vertices(int max_n = 100000) {
+        constexpr py::ssize_t stride = static_cast<py::ssize_t>(sizeof(BdptVertexRecord));
+        auto* pl = _pipeline;
+        if (!pl || max_n <= 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        std::vector<BdptVertexRecord> batch;
+        ray_pipeline_drain_bdpt_vertices(pl, batch, max_n);
+        const py::ssize_t n = static_cast<py::ssize_t>(batch.size());
+        if (n == 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{n, stride});
+        std::memcpy(arr.mutable_data(), batch.data(),
+                    static_cast<size_t>(n) * sizeof(BdptVertexRecord));
+        return arr;
+    }
+
+    py::array_t<uint8_t> drain_bdpt_spectral(int max_n = 100000) {
+        constexpr py::ssize_t stride = static_cast<py::ssize_t>(sizeof(BdptSpectralWeightRecord));
+        auto* pl = _pipeline;
+        if (!pl || max_n <= 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        std::vector<BdptSpectralWeightRecord> batch;
+        ray_pipeline_drain_bdpt_spectral(pl, batch, max_n);
+        const py::ssize_t n = static_cast<py::ssize_t>(batch.size());
+        if (n == 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{n, stride});
+        std::memcpy(arr.mutable_data(), batch.data(),
+                    static_cast<size_t>(n) * sizeof(BdptSpectralWeightRecord));
+        return arr;
+    }
+
+    py::array_t<uint8_t> drain_bdpt_pdfs(int max_n = 100000) {
+        constexpr py::ssize_t stride = static_cast<py::ssize_t>(sizeof(BdptPdfRecord));
+        auto* pl = _pipeline;
+        if (!pl || max_n <= 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        std::vector<BdptPdfRecord> batch;
+        ray_pipeline_drain_bdpt_pdfs(pl, batch, max_n);
+        const py::ssize_t n = static_cast<py::ssize_t>(batch.size());
+        if (n == 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{n, stride});
+        std::memcpy(arr.mutable_data(), batch.data(),
+                    static_cast<size_t>(n) * sizeof(BdptPdfRecord));
+        return arr;
+    }
+
+    py::array_t<uint8_t> drain_bdpt_optical(int max_n = 100000) {
+        constexpr py::ssize_t stride = static_cast<py::ssize_t>(sizeof(BdptOpticalEventRecord));
+        auto* pl = _pipeline;
+        if (!pl || max_n <= 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        std::vector<BdptOpticalEventRecord> batch;
+        ray_pipeline_drain_bdpt_optical(pl, batch, max_n);
+        const py::ssize_t n = static_cast<py::ssize_t>(batch.size());
+        if (n == 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{n, stride});
+        std::memcpy(arr.mutable_data(), batch.data(),
+                    static_cast<size_t>(n) * sizeof(BdptOpticalEventRecord));
+        return arr;
+    }
+
+    py::array_t<uint8_t> drain_bdpt_connections(int max_n = 100000) {
+        constexpr py::ssize_t stride = static_cast<py::ssize_t>(sizeof(BdptConnectionRecord));
+        auto* pl = _pipeline;
+        if (!pl || max_n <= 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        std::vector<BdptConnectionRecord> batch;
+        ray_pipeline_drain_bdpt_connections(pl, batch, max_n);
+        const py::ssize_t n = static_cast<py::ssize_t>(batch.size());
+        if (n == 0)
+            return py::array_t<uint8_t>(std::vector<py::ssize_t>{0, stride});
+        auto arr = py::array_t<uint8_t>(std::vector<py::ssize_t>{n, stride});
+        std::memcpy(arr.mutable_data(), batch.data(),
+                    static_cast<size_t>(n) * sizeof(BdptConnectionRecord));
+        return arr;
+    }
+
+    py::dict get_bdpt_overflow() const {
+        uint64_t ov = 0, os = 0, op = 0, oo = 0, oc = 0;
+        ray_pipeline_get_bdpt_overflow(_pipeline, &ov, &os, &op, &oo, &oc);
+        py::dict d;
+        d["vertices"]    = static_cast<long long>(ov);
+        d["spectral"]    = static_cast<long long>(os);
+        d["pdfs"]        = static_cast<long long>(op);
+        d["optical"]     = static_cast<long long>(oo);
+        d["connections"] = static_cast<long long>(oc);
+        return d;
+    }
+
+    void run_bdpt_connection() {
+        if (_pipeline)
+            ray_pipeline_run_bdpt_connection(_pipeline);
+    }
+
+    void set_bdpt_sweep_trigger(int n) {
+        _bdpt_sweep_trigger = n;
+        if (_pipeline)
+            ray_pipeline_set_bdpt_sweep_trigger(_pipeline, n);
     }
 
     int in_flight_count() const
@@ -5124,6 +5248,60 @@ R"doc(Return a dict of live BDPT convergence diagnostics (lock-free snapshot):
   best_collinearity  (float)  — |cos θ| between incoming directions at best pair [0,1].
   exact_snaps        (int)    — cumulative exact-match (ch2) pixel accumulations.
   near_miss_count    (int)    — cumulative near-miss (ch3) pixel accumulations.)doc")
+        .def("drain_bdpt_vertices",
+             &PyRayTracer::drain_bdpt_vertices,
+             py::arg("max_n") = 100000,
+R"doc(Non-blocking drain from the BDPT vertex side-queue.
+Returns uint8 ndarray of shape (n, 112).  Convert to structured array via:
+  import numpy as np
+  raw = tracer.drain_bdpt_vertices()
+  verts = np.frombuffer(raw.tobytes(), dtype=BDPT_VERTEX_DTYPE)
+Returns shape (0, 112) when the queue is empty.)doc")
+        .def("drain_bdpt_spectral",
+             &PyRayTracer::drain_bdpt_spectral,
+             py::arg("max_n") = 100000,
+R"doc(Non-blocking drain from the BDPT spectral-weight side-queue.
+Returns uint8 ndarray of shape (n, 32).  One row per (subpath, vertex, band).
+Returns shape (0, 32) when the queue is empty.)doc")
+        .def("drain_bdpt_pdfs",
+             &PyRayTracer::drain_bdpt_pdfs,
+             py::arg("max_n") = 100000,
+R"doc(Non-blocking drain from the BDPT PDF side-queue.
+Returns uint8 ndarray of shape (n, 48).  One row per scatter event.
+Returns shape (0, 48) when the queue is empty.)doc")
+        .def("drain_bdpt_optical",
+             &PyRayTracer::drain_bdpt_optical,
+             py::arg("max_n") = 100000,
+R"doc(Non-blocking drain from the BDPT optical-event side-queue.
+Returns uint8 ndarray of shape (n, 112).  One row per lens/interface event.
+Returns shape (0, 112) when the queue is empty.)doc")
+        .def("drain_bdpt_connections",
+             &PyRayTracer::drain_bdpt_connections,
+             py::arg("max_n") = 100000,
+R"doc(Non-blocking drain from the BDPT connection side-queue.
+Returns uint8 ndarray of shape (n, 80).  One row per attempted MIS connection.
+Returns shape (0, 80) when the queue is empty.)doc")
+        .def("get_bdpt_overflow",
+             &PyRayTracer::get_bdpt_overflow,
+R"doc(Cumulative overflow counts for BDPT side queues.
+Returns dict with keys: vertices, spectral, pdfs, optical, connections (all int).
+A non-zero value means records were silently dropped when the queue was full.
+Check this after a run to know whether to increase bdpt_max_* in the pipeline config.)doc")
+        .def("run_bdpt_connection",
+             &PyRayTracer::run_bdpt_connection,
+R"doc(Run BDPT connection pass with balance-heuristic MIS.
+Drains Q_bdpt_vertices, Q_bdpt_spectral, Q_bdpt_pdfs accumulated since the
+last call, evaluates valid sensor/light vertex-pair strategies, computes
+geometry terms and MIS weights, emits BdptConnectionRecord diagnostics, and
+accumulates visible contributions into sensor channel 2.
+Call once per sensor sweep after the pipeline is idle.)doc")
+        .def("set_bdpt_sweep_trigger",
+             &PyRayTracer::set_bdpt_sweep_trigger,
+             py::arg("n"),
+R"doc(Set the BDPT sweep auto-trigger threshold.
+n > 0: pipeline_material auto-fires run_bdpt_connection() once per sweep
+       when bdpt_cam_vertex_count reaches n (typical: sensor_res*sensor_res).
+n = 0: disable auto-trigger; call run_bdpt_connection() manually.)doc")
         .def("add_scale_context", &PyRayTracer::add_scale_context,
              py::arg("pos"),
              py::arg("radius"),

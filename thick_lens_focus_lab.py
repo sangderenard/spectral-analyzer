@@ -507,7 +507,7 @@ class ObjectPlaneConfig:
 @dataclass
 class ImagePlateConfig:
     x: float = 1.25
-    radius: float = 0.045
+    radius: float = 0.040    # 120 6×6 format: 56mm square frame, half-diagonal ≈ 39.6mm
     pixels: int = 64          # mesh tessellation rings (polar disc)
     sensor_res: int = 64      # pixel-grid side length; ~π/4·res² sites active in disc
     bokeh_rays: int = 4       # stencil rays fired per pixel site per call
@@ -1021,17 +1021,17 @@ class IrisApertureConfig:
 def _default_optical_design_spec():
     from camera_software.optical_design import OpticalDesignSpec
     return OpticalDesignSpec(
-        focal_length_range_m=(0.045, 0.070),
+        focal_length_range_m=(0.075, 0.100),  # 120 6×6: ~80mm normal FOV
         zoom=0.40,
         focus_distance_m=1.0,
         f_number=2.8,
         entrance_x_m=1.08,
         sensor_x_m=1.25,
-        sensor_clearance_m=0.025,
-        image_radius_m=0.045,
+        sensor_clearance_m=0.030,
+        image_radius_m=0.040,                 # matches ImagePlateConfig.radius
         min_air_gap_m=0.008,
-        group_thickness_m=0.014,
-        max_group_radius_m=0.060,
+        group_thickness_m=0.018,
+        max_group_radius_m=0.075,             # medium format needs larger elements
     )
 
 
@@ -1051,7 +1051,7 @@ class SceneConfig:
     baffle2_x: float = 1.18  # Just before the default sensor plane.
     baffle2_aperture: float = 0.1
     screen_x: float = 1.25
-    screen_radius: float = 0.045
+    screen_radius: float = 0.040    # matches image_plate.radius for 120 6×6 format
     view_radius: float = 0.24
     auto_fit_view: bool = True
     view_aspect: float = 1560.0 / 860.0
@@ -1129,11 +1129,14 @@ class SceneConfig:
             ior=1.52,
         )
     )
+    # Fallback 4-group design for 120 6×6 format (~80mm EFL).
+    # The optical design solver replaces this at runtime; these are
+    # only used when the solver is disabled or fails.
     lens_stack: List[LensConfig] = field(default_factory=lambda: [
-        LensConfig(center_x=0.98, thickness=0.040, aperture_radius=0.036, radius_front=0.090, radius_back=0.110, ior=1.52),
-        LensConfig(center_x=1.08, thickness=0.030, aperture_radius=0.030, radius_front=0.140, radius_back=0.140, ior=1.62),
-        LensConfig(center_x=1.19, thickness=0.040, aperture_radius=0.034, radius_front=0.100, radius_back=0.090, ior=1.52),
-        LensConfig(center_x=1.34, thickness=0.045, aperture_radius=0.038, radius_front=0.120, radius_back=0.120, ior=1.57),
+        LensConfig(center_x=0.98, thickness=0.046, aperture_radius=0.052, radius_front=0.110, radius_back=0.135, ior=1.52),
+        LensConfig(center_x=1.08, thickness=0.034, aperture_radius=0.044, radius_front=0.180, radius_back=0.180, ior=1.62),
+        LensConfig(center_x=1.19, thickness=0.046, aperture_radius=0.048, radius_front=0.130, radius_back=0.115, ior=1.52),
+        LensConfig(center_x=1.34, thickness=0.050, aperture_radius=0.052, radius_front=0.150, radius_back=0.150, ior=1.57),
     ])
     optical_design: Optional[object] = field(default_factory=_default_optical_design_spec)
     aperture_model: str = "geometry"  # geometry | wave3d
@@ -4208,6 +4211,7 @@ class ForwardCppLensBench:
         self._backward_jacobian_by_tag: Dict[int, float] = {}
         self._async_bdpt_next_subpath: int = 0
         self._async_bdpt_next_segment_subpath: int = 0
+        self._sweep_pixel_offset: int = 0   # deterministic scan position across disc pixels
         self._async_bdpt_forward_warmup_target: int = 0
         self._async_bdpt_forward_warmup_batch: int = 0
         self._async_forward_strike_count: int = 0
@@ -5212,9 +5216,9 @@ class ForwardCppLensBench:
         sample_i = np.arange(total, dtype=np.int64)
         channel_idx = (sample_i % n_sensor_channels).astype(np.int32)
 
-        # Cycle evenly over the circular pixel set, but jitter inside each pixel
-        # so the transport does not reproject a rigid sensor lattice.
-        pix_offset = int(rng.integers(0, max(1, n_pixels)))
+        # Deterministic raster scan across the disc pixel set with sub-pixel jitter.
+        pix_offset = self._sweep_pixel_offset % max(1, n_pixels)
+        self._sweep_pixel_offset += total // n_sensor_channels
         pixel_seq = disc_grid_indices[(pix_offset + (sample_i // n_sensor_channels)) % n_pixels].astype(np.int64)
         pix_y = pixel_seq // res
         pix_z = pixel_seq % res
@@ -8689,6 +8693,7 @@ def run(
         _pip_res,
         0.008,
     )
+    bench.tracer.set_bdpt_sweep_trigger(_pip_res * _pip_res)
     if neural_payload_in:
         # ── Load pre-trained payload(s) and register immediately ──────────────
         _loaded_payload = np.load(neural_payload_in).astype(np.float32)
@@ -9815,13 +9820,16 @@ def run(
                 lines.append(np.array([cx, 0.5 + y, 0.5 + z], dtype=np.float32))
             return np.asarray(lines, dtype=np.float32)
 
-        # Sensor FOV bowtie: sensor corners → entrance pupil (pinch) → far scene.
-        # This is the actual projection of the sensor through the optics — not the
-        # aperture transmission cone.  The hourglass shape makes it unambiguous
-        # that the lines originate at the sensor and project into the scene.
-        _r_s = float(getattr(getattr(scene, "image_plate", None), "radius", 0.0))
-        _x_sen = float(getattr(getattr(scene, "image_plate", None), "x", 0.0))
-        _fov_half = obj_half  # fallback: aperture angle
+        # Physical iris / aperture stop: fetched here so the bowtie below can use it.
+        _iris_overlay = getattr(scene, "iris_aperture", None)
+
+        # Sensor FOV bowtie: marginal rays from sensor edge through aperture stop edge.
+        # When the iris is present, lines graze its rim and continue with the same slope
+        # into the scene (crossing the axis beyond the lens — correct bowtie geometry).
+        # Fallback: chief-ray bowtie converging to the entrance pupil axis point.
+        _r_s   = float(getattr(getattr(scene, "image_plate", None), "radius", 0.0))
+        _x_sen = float(getattr(getattr(scene, "image_plate", None), "x",      0.0))
+        _fov_half = obj_half
         if hasattr(_asm, "optics") and _asm.optics is not None and _r_s > 1e-9:
             _f_e = abs(float(_asm.optics.f_eff))
             if _f_e > 1e-9:
@@ -9830,21 +9838,36 @@ def run(
         if _r_s > 1e-9 and _x_sen > 1e-9:
             _x_s_n = _nx(_x_sen)
             _h_s_n = _r_s / yz_span
-            _fov_bowtie = np.array([
-                # Camera side: sensor +Y → entrance pupil (pinch)
-                [_x_s_n, 0.5 + _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
-                # Scene side: entrance pupil (pinch) → far +Y
-                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 + _h_fov, 0.5],
-                # Camera side: sensor -Y → entrance pupil (pinch)
-                [_x_s_n, 0.5 - _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
-                # Scene side: entrance pupil (pinch) → far -Y
-                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 - _h_fov, 0.5],
-                # Same for Z axis
-                [_x_s_n, 0.5, 0.5 + _h_s_n],  [_x_ep, 0.5, 0.5],
-                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 + _h_fov],
-                [_x_s_n, 0.5, 0.5 - _h_s_n],  [_x_ep, 0.5, 0.5],
-                [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 - _h_fov],
-            ], dtype=np.float32)
+            _iris_ok = (_iris_overlay is not None
+                        and bool(getattr(_iris_overlay, "enabled", False))
+                        and abs(_nx(float(_iris_overlay.x_pos)) - _x_s_n) > 1e-6)
+            if _iris_ok:
+                _x_pinch   = _nx(float(_iris_overlay.x_pos))
+                _r_pinch_n = _nr(float(_iris_overlay.r_inner))
+                _ddx   = _x_pinch - _x_s_n
+                _slope = (_r_pinch_n - _h_s_n) / _ddx if abs(_ddx) > 1e-9 else 0.0
+                _h_far = _r_pinch_n + _slope * (x_obj_far - _x_pinch)
+                _fov_bowtie = np.array([
+                    [_x_s_n, 0.5 + _h_s_n, 0.5],       [_x_pinch, 0.5 + _r_pinch_n, 0.5],
+                    [_x_pinch, 0.5 + _r_pinch_n, 0.5],  [x_obj_far, 0.5 + _h_far, 0.5],
+                    [_x_s_n, 0.5 - _h_s_n, 0.5],       [_x_pinch, 0.5 - _r_pinch_n, 0.5],
+                    [_x_pinch, 0.5 - _r_pinch_n, 0.5],  [x_obj_far, 0.5 - _h_far, 0.5],
+                    [_x_s_n, 0.5, 0.5 + _h_s_n],       [_x_pinch, 0.5, 0.5 + _r_pinch_n],
+                    [_x_pinch, 0.5, 0.5 + _r_pinch_n],  [x_obj_far, 0.5, 0.5 + _h_far],
+                    [_x_s_n, 0.5, 0.5 - _h_s_n],       [_x_pinch, 0.5, 0.5 - _r_pinch_n],
+                    [_x_pinch, 0.5, 0.5 - _r_pinch_n],  [x_obj_far, 0.5, 0.5 - _h_far],
+                ], dtype=np.float32)
+            else:
+                _fov_bowtie = np.array([
+                    [_x_s_n, 0.5 + _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
+                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 + _h_fov, 0.5],
+                    [_x_s_n, 0.5 - _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
+                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 - _h_fov, 0.5],
+                    [_x_s_n, 0.5, 0.5 + _h_s_n],  [_x_ep, 0.5, 0.5],
+                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 + _h_fov],
+                    [_x_s_n, 0.5, 0.5 - _h_s_n],  [_x_ep, 0.5, 0.5],
+                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 - _h_fov],
+                ], dtype=np.float32)
             _draw_lines(_fov_bowtie, 0.88, 0.88, 0.88)
 
         # 10 cm scale stick at object plane (orange), perpendicular to axis.
@@ -9868,9 +9891,7 @@ def run(
         _draw_loop(_dm_bar_z,  1.0, 0.72, 0.0)
         _draw_lines(_dm_ticks, 1.0, 0.72, 0.0)
 
-        # Physical iris / aperture stop: blue.  This is the real mechanical
-        # stop in the lens stack, distinct from the virtual entrance/exit pupils.
-        _iris_overlay = getattr(scene, "iris_aperture", None)
+        # Physical iris / aperture stop: blue.
         if _iris_overlay is not None and bool(getattr(_iris_overlay, "enabled", False)):
             _draw_loop(
                 _ring_at([float(_iris_overlay.x_pos), 0.0, 0.0], float(_iris_overlay.r_inner)),
@@ -10295,10 +10316,12 @@ def run(
                 bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
             except Exception:
                 pass
+        _new_pip_res = int(max(16, scene.image_plate.sensor_res))
         bench.tracer.configure_sensor_image(
             float(scene.image_plate.x), float(scene.image_plate.radius),
-            int(max(16, scene.image_plate.sensor_res)), 0.008,
+            _new_pip_res, 0.008,
         )
+        bench.tracer.set_bdpt_sweep_trigger(_new_pip_res * _new_pip_res)
         # Derive and print the new f-number from EFL and entrance pupil radius
         _efl = float(getattr(getattr(scene, "optical_design", None),
                               "effective_focal_length_m", 0.0) or 0.0)
@@ -10621,12 +10644,14 @@ def run_uv_smoke(
     bench.compute_mode = str(compute_mode)
     bench.sensor_amp_gain = float(sensor_amp_gain)
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
+    _batch_pip_res = int(max(16, scene.image_plate.sensor_res))
     bench.tracer.configure_sensor_image(
         float(scene.image_plate.x),
         float(scene.image_plate.radius),
-        int(max(16, scene.image_plate.sensor_res)),
+        _batch_pip_res,
         0.008,
     )
+    bench.tracer.set_bdpt_sweep_trigger(_batch_pip_res * _batch_pip_res)
 
     rc = 1
     try:

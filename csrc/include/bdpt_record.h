@@ -81,6 +81,210 @@ static_assert(sizeof(PathVertex)     == 80, "PathVertex layout broken");
 static_assert(sizeof(EndpointRecord) == 64, "EndpointRecord layout broken");
 #endif
 
+/* ── BDPT side-data records ──────────────────────────────────────────────────
+ *
+ * These are kept strictly separate from the GLSL ray-payload types (RayIntent,
+ * RefinedHit, TerminalRecord).  Each record class is emitted into its own
+ * PipelineQueue and drained via a dedicated pybind function so the transport
+ * channel budget is never affected.
+ *
+ * Layout rules:
+ *   - Every struct is padded to a multiple of 16 bytes.
+ *   - alignas(16) is applied in C++ mode so arrays stay cache-line aligned
+ *     and SSBO element strides are predictable.
+ *   - All structs are directly NumPy-mappable as structured arrays.
+ *   - Fixed-size; no pointers, no std::string, no VLAs.
+ *   - Static-assert guards for both size and alignment are at the bottom.
+ */
+
+/* ── BdptVertexRecord — one row per (subpath, bounce) geometry vertex ──────
+ * Raw layout: 104 bytes.  Padded to 112 (7 × 16). */
+#ifdef __cplusplus
+struct alignas(16) BdptVertexRecord {
+#else
+typedef struct {
+#endif
+    uint32_t subpath_id;         /* opaque id assigned at launch */
+    uint16_t vertex_index;       /* 0 = first surface interaction */
+    uint8_t  stream;             /* BDPT_SIDE_LIGHT or BDPT_SIDE_SENSOR */
+    uint8_t  sample_domain;      /* sampling domain at this vertex (see BDPT_DOMAIN_*) */
+    uint32_t flags;              /* material/event flags at hit */
+    uint32_t strategy_id;        /* which (s,t) strategy produced this subpath */
+    int32_t  tri_id;             /* hit triangle (-1 = virtual endpoint) */
+    int32_t  group_id;           /* TriGroup id (-1 = none) */
+    int32_t  mat_idx;            /* material index (-1 = none) */
+    float    pos[3];             /* hit position (m) */
+    float    normal[3];          /* surface normal at hit */
+    float    dir_in[3];          /* incoming ray direction */
+    float    dir_out[3];         /* outgoing (post-scatter) direction */
+    float    path_len;           /* cumulative path length at this vertex */
+    float    path_at_seg_start;  /* path length at the start of this segment */
+    float    pdf_fwd;            /* forward sampling PDF at this vertex */
+    float    pdf_rev;            /* reverse sampling PDF at this vertex */
+    float    pdf_area;           /* area-measure PDF (converted from solid angle) */
+    float    pdf_solid_angle;    /* solid-angle PDF before measure conversion */
+    float    throughput_scalar;  /* scalar throughput beta at this vertex */
+    float    sensor_origin_y;   /* camera-stream only: sensor launch Y (m); 0 for light stream */
+    float    sensor_origin_z;   /* camera-stream only: sensor launch Z (m); 0 for light stream */
+#ifdef __cplusplus
+};
+#else
+} BdptVertexRecord;
+#endif
+
+/* ── BdptSpectralWeightRecord — per (subpath, vertex, band) complex beta ────
+ * Raw layout: 28 bytes.  Padded to 32 (2 × 16). */
+#ifdef __cplusplus
+struct alignas(16) BdptSpectralWeightRecord {
+#else
+typedef struct {
+#endif
+    uint32_t subpath_id;
+    uint16_t vertex_index;
+    uint16_t band_id;
+    float    beta_re;               /* complex throughput β — real part */
+    float    beta_im;               /* complex throughput β — imag part */
+    float    wavelength_or_center;  /* wavelength (m) or band center frequency (Hz) */
+    float    band_pdf;              /* probability of selecting this band */
+    float    sensor_rgb_weight;     /* camera sensitivity weight for display */
+    uint8_t  _pad[4];               /* padding to 32 bytes (2 × 16) */
+#ifdef __cplusplus
+};
+#else
+} BdptSpectralWeightRecord;
+#endif
+
+/* ── BdptPdfRecord — per sampling event where measure conversion matters ─────
+ * Raw layout: 36 bytes.  Padded to 48 (3 × 16). */
+#ifdef __cplusplus
+struct alignas(16) BdptPdfRecord {
+#else
+typedef struct {
+#endif
+    uint32_t subpath_id;
+    uint16_t vertex_index;
+    uint8_t  sample_domain;   /* which domain was sampled (see BDPT_DOMAIN_*) */
+    uint8_t  measure;         /* PDF measure (see BDPT_MEASURE_*) */
+    float    pdf_fwd;
+    float    pdf_rev;
+    float    pdf_area;
+    float    pdf_solid_angle;
+    float    jacobian_det;    /* measure-conversion Jacobian (area↔solid-angle) */
+    float    geometry_term;   /* |cos θ_0 · cos θ_1| / dist² at connection */
+    uint32_t flags;           /* delta/specular/aperture eligibility bits */
+    uint8_t  _pad[12];        /* padding to 48 bytes (3 × 16) */
+#ifdef __cplusplus
+};
+#else
+} BdptPdfRecord;
+#endif
+
+/* ── BdptOpticalEventRecord — per lens/interface/stop event ──────────────────
+ * Raw layout: 112 bytes — already a multiple of 16, no padding needed. */
+#ifdef __cplusplus
+struct alignas(16) BdptOpticalEventRecord {
+#else
+typedef struct {
+#endif
+    uint32_t subpath_id;
+    uint16_t vertex_index;
+    uint16_t element_index;         /* lens element or interface index */
+    uint8_t  reason;                /* termination/event reason (see BDPT_OPT_*) */
+    uint8_t  stream;                /* BDPT_SIDE_LIGHT or BDPT_SIDE_SENSOR */
+    uint16_t flags;
+    float    pos[3];                /* interface hit point (m) */
+    float    normal[3];             /* interface normal */
+    float    dir_in[3];             /* ray direction before interface */
+    float    dir_out[3];            /* ray direction after interface (0 if terminated) */
+    float    cos_incident;
+    float    cos_transmitted;
+    float    eta_i;                 /* refractive index of incident medium */
+    float    eta_t;                 /* refractive index of transmitted medium */
+    float    fresnel_reflectance;   /* Fresnel reflectance [0,1] */
+    float    transmittance;         /* Fresnel transmittance [0,1] */
+    float    throughput_multiplier; /* net throughput multiplier at this surface */
+    float    opl;                   /* optical path length through this element (m) */
+    float    geom_len;              /* geometric length through this element (m) */
+    float    aperture_radius;       /* clear aperture radius (m) */
+    float    transverse_radius;     /* ray transverse radius at this surface (m) */
+    float    dist_past_aperture;    /* signed distance past clear aperture (m); >0 = clipped */
+    float    phase_space_jacobian;  /* phase-space (étendue) Jacobian at this surface */
+#ifdef __cplusplus
+};
+#else
+} BdptOpticalEventRecord;
+#endif
+
+/* ── BdptConnectionRecord — per attempted (s,t) connection candidate ─────────
+ * Raw layout: 72 bytes.  Padded to 80 (5 × 16). */
+#ifdef __cplusplus
+struct alignas(16) BdptConnectionRecord {
+#else
+typedef struct {
+#endif
+    uint32_t camera_subpath_id;
+    uint32_t light_subpath_id;
+    uint16_t camera_vertex_index;
+    uint16_t light_vertex_index;
+    uint16_t strategy_s;          /* number of camera-side vertices in this strategy */
+    uint16_t strategy_t;          /* number of light-side vertices in this strategy */
+    uint32_t flags;               /* visibility, delta-skip, overflow bits */
+    float    p0[3];               /* camera-side connection point (m) */
+    float    p1[3];               /* light-side connection point (m) */
+    float    dist2;               /* squared distance between p0 and p1 */
+    float    cos_camera;          /* |cos θ| at camera-side vertex */
+    float    cos_light;           /* |cos θ| at light-side vertex */
+    float    geometry_term;       /* |cos_camera · cos_light| / dist2 */
+    float    visibility;          /* 1.0 = unoccluded, 0.0 = shadowed */
+    float    strategy_pdf;        /* PDF of the chosen (s,t) connection strategy */
+    float    mis_weight;          /* MIS weight for this strategy */
+    uint8_t  _pad[8];             /* padding to 80 bytes (5 × 16) */
+#ifdef __cplusplus
+};
+#else
+} BdptConnectionRecord;
+#endif
+
+/* ── Sample domain tags (sample_domain / measure fields) ─────────────────── */
+#define BDPT_DOMAIN_UNKNOWN         0u
+#define BDPT_DOMAIN_AREA            1u  /* sampled w.r.t. surface area */
+#define BDPT_DOMAIN_SOLID_ANGLE     2u  /* sampled w.r.t. solid angle */
+#define BDPT_DOMAIN_PROJ_SOLID_ANGLE 3u /* sampled w.r.t. projected solid angle */
+#define BDPT_DOMAIN_FILM_AREA       4u  /* sampled on the sensor film plane */
+#define BDPT_DOMAIN_APERTURE_AREA   5u  /* sampled on the aperture disc */
+#define BDPT_DOMAIN_WAVELENGTH      6u  /* spectral band probability */
+#define BDPT_DOMAIN_DISCRETE        7u  /* discrete strategy selection */
+
+/* ── Optical event reason tags (reason field of BdptOpticalEventRecord) ───── */
+#define BDPT_OPT_REFRACTION         0u
+#define BDPT_OPT_REFLECTION         1u
+#define BDPT_OPT_TIR                2u  /* total internal reflection */
+#define BDPT_OPT_APERTURE_CLIP      3u  /* ray clipped by aperture stop */
+#define BDPT_OPT_VIGNETTE_CLIP      4u  /* ray clipped by vignetting stop */
+#define BDPT_OPT_ABSORPTION         5u  /* absorbed at this surface */
+#define BDPT_OPT_SENSOR_HIT         6u  /* reached sensor plane */
+#define BDPT_OPT_EMISSION           7u  /* emissive surface hit */
+
+/* ── Scatter flags for BdptPdfRecord.flags ────────────────────────────────── */
+#define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)  /* mirror reflection or Snell refraction */
+#define BDPT_PDF_FLAG_SPLIT           (1u << 17)  /* deterministic split (max_children >= 2) */
+#define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)  /* cosine hemisphere scatter */
+#define BDPT_PDF_FLAG_ABSORBED        (1u << 19)  /* path terminated here */
+
+/* ── Layout sanity checks ────────────────────────────────────────────────── */
+#ifdef __cplusplus
+static_assert(sizeof(BdptVertexRecord)         == 112, "BdptVertexRecord layout broken");
+static_assert(sizeof(BdptSpectralWeightRecord) == 32,  "BdptSpectralWeightRecord layout broken");
+static_assert(sizeof(BdptPdfRecord)            == 48,  "BdptPdfRecord layout broken");
+static_assert(sizeof(BdptOpticalEventRecord)   == 112, "BdptOpticalEventRecord layout broken");
+static_assert(sizeof(BdptConnectionRecord)     == 80,  "BdptConnectionRecord layout broken");
+static_assert(alignof(BdptVertexRecord)         == 16, "BdptVertexRecord alignment broken");
+static_assert(alignof(BdptSpectralWeightRecord) == 16, "BdptSpectralWeightRecord alignment broken");
+static_assert(alignof(BdptPdfRecord)            == 16, "BdptPdfRecord alignment broken");
+static_assert(alignof(BdptOpticalEventRecord)   == 16, "BdptOpticalEventRecord alignment broken");
+static_assert(alignof(BdptConnectionRecord)     == 16, "BdptConnectionRecord alignment broken");
+#endif
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

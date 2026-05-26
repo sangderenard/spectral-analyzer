@@ -115,6 +115,9 @@ layout(std430, binding = 4) readonly buffer TriIdBuf   { int   tri_ids[];  };
 layout(std430, binding = 5) readonly buffer TriFullBuf { float trifull[];  };
 layout(std430, binding = 6) readonly buffer MatBandBuf { float mat_bands[];};
 layout(std430, binding = 7) readonly buffer SceneBandBuf{ float scene_bands[];};
+/* BDPT: one uint32 per hit slot carrying bdpt_subpath_id, written to BdptIdBuf
+ * at the same index as the hit record.  T3 reads it to emit BdptVertexRecord. */
+layout(std430, binding = 9) coherent buffer BdptIdBuf   { uint  bdpt_ids[];   };
 
 /* Wave arenas passed as uniform array (max 16 arenas × 4 floats each).
  * Avoids needing binding slots beyond 7. */
@@ -222,6 +225,7 @@ void main() {
     uint  color_flag = intent_u(ib, 15);
     float sensor_oy  = intent_f(ib, 17);
     float sensor_oz  = intent_f(ib, 18);
+    uint  bdpt_sid   = intent_u(ib, 19);  /* bdpt_subpath_id packed in the _pad slot */
 
     float amp_re[MAX_GPU_BANDS];
     float amp_im[MAX_GPU_BANDS];
@@ -341,6 +345,8 @@ void main() {
 
     /* ── Write hit record to HitBuf ─────────────────────────────────────── */
     uint out_idx = atomicAdd(counters[0], 1u);
+    /* Store bdpt_subpath_id at the same slot index so T3 can read via gid. */
+    bdpt_ids[out_idx] = bdpt_sid;
     int ob = int(out_idx) * HIT_STRIDE;
 
     hit_wf(ob, 0, hit_pos.x);  hit_wf(ob, 1, hit_pos.y);  hit_wf(ob, 2, hit_pos.z);

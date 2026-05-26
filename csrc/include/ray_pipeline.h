@@ -30,6 +30,7 @@
 #include <random>
 #include <cstdint>
 #include <cstring>
+#include "bdpt_record.h"
 
 struct RayTracerState;
 
@@ -54,6 +55,18 @@ struct RayIntent {
      * of how many refractions the ray traversed. */
     float            sensor_origin_y   = 0.0f;
     float            sensor_origin_z   = 0.0f;
+
+    /* ── BDPT sidecar identity ────────────────────────────────────────────
+     * Assigned at launch; propagated unchanged into every child intent so
+     * that T1/T2/T3 side-data records can be correlated back to a subpath.
+     * subpath_id  : unique id for the full subpath (assigned by submitter).
+     * bdpt_vertex : vertex index within the subpath (incremented per bounce).
+     * bdpt_stream : BDPT_SIDE_LIGHT (0) or BDPT_SIDE_SENSOR (1).
+     * bdpt_strategy: which (s,t) strategy launched this subpath. */
+    uint32_t         bdpt_subpath_id   = 0u;
+    uint16_t         bdpt_vertex       = 0u;
+    uint8_t          bdpt_stream       = 0u;
+    uint8_t          bdpt_strategy     = 0u;
 };
 
 struct HitRecord {
@@ -511,6 +524,25 @@ struct RayPipelineConfig {
     int    sensor_pip_res   = 0;      /* 0 = disabled */
     float  sensor_bdpt_eps  = 0.008f;
 
+    /* ── BDPT side-queue caps ─────────────────────────────────────────────
+     * When a side queue reaches the cap the incoming record is dropped and
+     * the corresponding overflow counter is incremented.  0 = unlimited
+     * (not recommended for production — will grow unbounded for any scene).
+     * Typical small-scene budget: 1–4 M entries per queue. */
+    int    bdpt_max_vertices = 2000000;  /* BdptVertexRecord cap */
+    int    bdpt_max_spectral = 4000000;  /* BdptSpectralWeightRecord cap */
+    int    bdpt_max_pdfs     = 2000000;  /* BdptPdfRecord cap */
+    int    bdpt_max_optical  = 1000000;  /* BdptOpticalEventRecord cap */
+    int    bdpt_max_connections = 2000000; /* BdptConnectionRecord cap */
+
+    /* ── BDPT sweep auto-trigger ────────────────────────────────────────────
+     * When bdpt_sweep_trigger > 0, pipeline_material fires
+     * ray_pipeline_run_bdpt_connection() automatically once per sweep:
+     * the trigger fires when bdpt_cam_vertex_count reaches this value.
+     * 0 = disabled (call run_bdpt_connection() manually from Python).
+     * Typical value: sensor_pip_res² (one vertex per pixel per sweep). */
+    int    bdpt_sweep_trigger = 0;
+
     /* ── GPU compute dispatch ────────────────────────────────────────────
      * When use_gpu_compute=true a GlPipelineDispatch thread is spawned that
      * competes with the CPU workers on the shared intent/hit/refined queues.
@@ -600,6 +632,47 @@ int ray_pipeline_tri_mat_idx(const RayPipelineState* ps, int tri_idx);
 int ray_pipeline_drain_refined(RayPipelineState* ps,
                                 std::vector<RefinedHit>& out,
                                 int max_n);
+
+/* ── BDPT side-data drains (non-blocking, pop up to max_n each) ─────────────
+ * Each function is independent of the others.  Returns count appended (0 if
+ * the corresponding queue is empty).  These queues are never affected by
+ * ray_pipeline_drain() or drain_records_slim() on the Python side. */
+int ray_pipeline_drain_bdpt_vertices(RayPipelineState* ps,
+                                      std::vector<BdptVertexRecord>& out,
+                                      int max_n);
+int ray_pipeline_drain_bdpt_spectral(RayPipelineState* ps,
+                                      std::vector<BdptSpectralWeightRecord>& out,
+                                      int max_n);
+int ray_pipeline_drain_bdpt_pdfs(RayPipelineState* ps,
+                                  std::vector<BdptPdfRecord>& out,
+                                  int max_n);
+int ray_pipeline_drain_bdpt_optical(RayPipelineState* ps,
+                                     std::vector<BdptOpticalEventRecord>& out,
+                                     int max_n);
+int ray_pipeline_drain_bdpt_connections(RayPipelineState* ps,
+                                         std::vector<BdptConnectionRecord>& out,
+                                         int max_n);
+
+/* Snapshot cumulative overflow counts for BDPT side queues.
+ * Any out-pointer may be null.  Counts only increase; never wrap.
+ * A non-zero count means records were silently dropped at the cap. */
+void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
+                                     uint64_t* out_vertices,
+                                     uint64_t* out_spectral,
+                                     uint64_t* out_pdfs,
+                                     uint64_t* out_optical,
+                                     uint64_t* out_connections);
+
+/* Run BDPT connection pass with balance-heuristic MIS.
+ * Drains Q_bdpt_vertices, Q_bdpt_spectral, Q_bdpt_pdfs and evaluates all
+ * valid (sensor-stream vertex, light-stream vertex) strategies accumulated
+ * since the last call.  Results accumulate into sensor channel 2.
+ * Call once per sensor sweep after ray_pipeline_wait_idle(). */
+void ray_pipeline_run_bdpt_connection(RayPipelineState* ps);
+
+/* Update the bdpt_sweep_trigger threshold on a running pipeline.
+ * 0 = disable auto-trigger; >0 = fire once per sweep (n camera vertices). */
+void ray_pipeline_set_bdpt_sweep_trigger(RayPipelineState* ps, int n);
 
 RayPipelineState* ray_pipeline_create(
     RayTracerState*          st,

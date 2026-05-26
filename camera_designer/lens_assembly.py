@@ -4,22 +4,19 @@ Central descriptor for a complete optical assembly.
 
 LensAssemblySpec owns:
   - Geometry specification (lens groups, casing, baffles, aperture, sensor back)
-  - Manifold representation state (NONE | LUT | MLP)
+  - Camera representation state (NONE | LUT | MLP)
   - Registration logic (maps to tri_groups in the real GPU tracer)
-  - Manifold image rendering
+  - Pipeline camera registration
 
-Replaces the scattered _neural_assembly_*, _baked_ep, _transfer_grid,
-_manifold_ctx_id state on ThickLensFocusLab.
+Replaces the scattered _neural_assembly_* and _transfer_grid state on
+ThickLensFocusLab.
 
 The three representation modes:
 
-  NONE — no manifold proxy; lens surfaces registered as SDF_SPHERE (T2 exact
+  NONE — no camera proxy; lens surfaces registered as SDF_SPHERE (T2 exact
          parametric refinement, Fresnel physics in T3).
 
-  LUT  — pre-baked dense transfer grid via ManifoldEndpoint.bake_*().
-         TODO: replace ManifoldEndpoint.bake_* with GPU dispatch (T1→T2→T3
-         read-back), so baking uses wave simulation rather than the CPU Snell
-         tracer in bake_worker.py.
+  LUT  — precomputed transfer grid registered into the ray pipeline.
 
   MLP  — trained neural network payload registered on entrance/exit surfaces.
          Interior surfaces registered as absorbers (no payload → T2 bit-3 drop).
@@ -194,7 +191,7 @@ class LensAssemblySpec:
         # All physical positions and curvatures come from here; never from mesh.
         self.optics = None   # Optional[camera_designer.compound_optics.CompoundLens]
 
-        # ── Manifold representation ────────────────────────────────────────────
+        # ── Camera representation ──────────────────────────────────────────────
         self.mode: str = self.MODE_NONE
 
         # MLP state
@@ -202,7 +199,6 @@ class LensAssemblySpec:
         self._bwd_payload:  Optional[np.ndarray] = None
 
         # LUT state
-        self._baked_ep                             = None   # ManifoldEndpoint | None
         self._transfer_grid: Optional[np.ndarray]  = None
         self._transfer_grid_noodles: int           = 0
         self._manifold_ctx_id: int                 = -1
@@ -453,6 +449,10 @@ class LensAssemblySpec:
         """Evaluate a ray bundle through the installed canonical optics."""
         return self.require_optics().evaluate_bundle(bundle)
 
+    def evaluate_transfer_detailed(self, bundle):
+        """Evaluate a ray bundle and retain per-element parametric events."""
+        return self.require_optics().evaluate_bundle_detailed(bundle)
+
     def angular_limits_from_origin(
         self,
         origin=(0.0, 0.0, 0.0),
@@ -684,11 +684,7 @@ class LensAssemblySpec:
         if self._transfer_grid is None:
             return
         import _spectral_kernels as _sk
-        if self._baked_ep is not None:
-            ap = self._baked_ep.preset.aperture_stop
-            ctx_pos = np.array([0.0, 0.0, float(ap.z_pos)])
-            ctx_radius = float(ap.r_outer) * 6.0
-        elif self.optics is not None:
+        if self.optics is not None:
             side = self.optics.side("front")
             # New angle-resolved parametric LUT payloads declare axis_idx=0,
             # so the runtime handler projects onto center.x.
@@ -991,113 +987,6 @@ class LensAssemblySpec:
         if n_interior:
             print(f"[assembly] PARAMETRIC absorbers: {n_interior} tris", flush=True)
 
-    # ── Baking ────────────────────────────────────────────────────────────────
-
-    def bake_lut(
-        self,
-        ep,                             # ManifoldEndpoint
-        tracer=None,
-        bake_full_assembly: bool  = False,
-        n_rays:             int   = 65_536,
-        n_wavelengths:      int   = 3,
-        n_refine:           int   = 2,
-        n_grid:             int   = 64,
-        bake_table_gb:      float = 0.0,
-        focus_steps:        int   = 1,
-        focus_range_m:      float = 2e-3,
-        verbose:            bool  = True,
-    ) -> None:
-        """Bake a LUT transfer grid and switch to LUT mode.
-
-        ep must be a ManifoldEndpoint constructed from the camera preset.
-
-        TODO: Replace ManifoldEndpoint.bake_* with GPU dispatch (read-back from
-        T1→T2→T3 SSBO output) so that baking uses wave simulation rather than
-        the CPU Snell path in bake_worker.trace_ray_batch.
-        """
-        stride = 9 if bake_full_assembly else 7
-
-        if self.optics is None and ep is not None and getattr(ep, "preset", None) is not None:
-            try:
-                from camera_designer.compound_optics import CompoundLens
-                self.optics = CompoundLens.from_preset(ep.preset)
-                if verbose:
-                    print("[assembly] built CompoundLens from preset for LUT bake", flush=True)
-            except Exception as exc:
-                if verbose:
-                    print(f"[assembly] CompoundLens construction failed; falling back: {exc}",
-                          flush=True)
-
-        if self.optics is not None and not bake_full_assembly and bake_table_gb <= 0.0:
-            if verbose:
-                print(
-                    f"[assembly] parametric LUT bake from CompoundLens ({n_grid}x{n_grid})",
-                    flush=True,
-                )
-            grid, n_src = self.optics.build_transfer_lut(
-                n_u=n_grid,
-                n_v=n_grid,
-                n_directions=max(1, int(n_refine) * max(1, int(n_wavelengths))),
-            )
-            self._transfer_grid         = grid
-            self._transfer_grid_noodles = int(n_src)
-            self._baked_ep              = None
-            self.mode                   = self.MODE_LUT
-            if tracer is not None:
-                self.register_lut_ctx(tracer)
-            if verbose:
-                print(f"[assembly] parametric LUT done - {n_src:,} verified samples", flush=True)
-            return
-
-        if bake_table_gb > 0.0:
-            n_cells    = max(1, int(bake_table_gb * (1024.0 ** 3) // (stride * 4)))
-            n_grid_eff = max(2, int(np.sqrt(float(n_cells))))
-            approx_gb  = ((12 if bake_full_assembly else 8)
-                          + n_grid_eff * n_grid_eff * stride) * 4.0 / (1024.0 ** 3)
-            if verbose:
-                print(f"[assembly] streaming LUT bake {n_rays:,} rays "
-                      f"into {n_grid_eff}×{n_grid_eff} (~{approx_gb:.2f} GiB)...",
-                      flush=True)
-            grid = ep.bake_cpp_transfer_grid_streaming(
-                n_rays=n_rays, n_u=n_grid_eff, n_v=n_grid_eff,
-                n_wavelengths=n_wavelengths,
-                full_assembly_payload=bake_full_assembly, verbose=verbose,
-            )
-            n_src = n_rays
-        elif bake_full_assembly:
-            if verbose:
-                print(f"[assembly] full-assembly bake ({n_rays:,}×{focus_steps} focus steps)...",
-                      flush=True)
-            ep.bake_full_assembly(
-                n_rays=n_rays, n_wavelengths=n_wavelengths, n_refine=n_refine,
-                n_focus_steps=focus_steps, focus_range_m=focus_range_m, verbose=verbose,
-            )
-            grid  = ep.build_transfer_grid(n_u=n_grid, n_v=n_grid, full_assembly_payload=True)
-            n_src = len(ep._full_data) if ep._full_data is not None else 0
-        else:
-            if verbose:
-                print(f"[assembly] LUT bake ({n_rays:,} noodles)...", flush=True)
-            ep.bake_lut(n_rays=n_rays, n_wavelengths=n_wavelengths,
-                        n_refine=n_refine, verbose=verbose)
-            grid  = ep.build_transfer_grid(n_u=n_grid, n_v=n_grid)
-            n_src = ep._manifold_lut.n_noodles if ep._manifold_lut is not None else 0
-
-        if grid is None:
-            if verbose:
-                print("[assembly] LUT bake produced empty grid", flush=True)
-            return
-
-        self._transfer_grid         = grid
-        self._transfer_grid_noodles = int(n_src)
-        self._baked_ep              = ep
-        self.mode                   = self.MODE_LUT
-
-        if tracer is not None:
-            self.register_lut_ctx(tracer)
-
-        if verbose:
-            print(f"[assembly] LUT done — {self._transfer_grid_noodles:,} noodles", flush=True)
-
     # ── Progressive parametric → LUT → MLP refinement ───────────────────────
 
     def start_progressive_refinement(
@@ -1156,29 +1045,6 @@ class LensAssemblySpec:
                 print("[assembly] → LUT mode", flush=True)
             return "LUT"
 
-        return None
-
-    # ── Sensor image rendering ────────────────────────────────────────────────
-
-    def render_sensor_image(
-        self,
-        preset,
-        n_px:          int,
-        n_py:          int,
-        n_samples:     int   = 8192,
-        wavelength_um: float = 0.587,
-        seed:          int   = 0,
-    ) -> Optional[np.ndarray]:
-        """Return (n_py, n_px, 3) float32 RGB image from the current manifold.
-
-        MLP mode  — batch-infers the network over uniform entry-surface samples.
-        LUT mode  — delegates to ManifoldEndpoint.render_sensor_image().
-        NONE mode — returns None (caller falls back to full BDPT correlation).
-        """
-        if self.mode == self.MODE_MLP and self._fwd_payload is not None:
-            return self._render_from_mlp(preset, n_px, n_py, n_samples, wavelength_um, seed)
-        if self.mode == self.MODE_LUT and self._baked_ep is not None:
-            return self._baked_ep.render_sensor_image(n_px, n_py)
         return None
 
     def _render_from_mlp(

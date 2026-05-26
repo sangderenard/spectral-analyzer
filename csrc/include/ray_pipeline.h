@@ -114,7 +114,7 @@ struct StageStats {
     /* GPU */
     std::atomic<uint64_t> n_gpu{0};            /* items processed by GPU dispatch */
     std::atomic<uint64_t> ns_gpu{0};           /* total ns spent on GPU dispatch  */
-    std::atomic<int>      batch_sz_gpu{65536}; /* adaptive GPU pop batch size (start large) */
+    std::atomic<int>      batch_sz_gpu{262144}; /* adaptive GPU pop batch size (start large) */
     /* Observed GPU fraction [0,1] stored as IEEE-754 float bits */
     std::atomic<uint32_t> gpu_frac_bits{0};    /* reinterpret as float            */
 
@@ -134,9 +134,9 @@ struct StageStats {
         ns_gpu.fetch_add(elapsed_ns,              std::memory_order_relaxed);
         q_depth.store(q_now, std::memory_order_relaxed);
         /* Adapt GPU batch size: ramp up aggressively, back off slowly.
-         * Upper bound 65536 lets a GPU absorb a full frame's worth in one shot. */
+         * Upper bound 1048576 (1M) covers production ray tracing dispatch sizes. */
         int cur = batch_sz_gpu.load(std::memory_order_relaxed);
-        if      (q_now > cur     && cur < 65536) batch_sz_gpu.store(cur * 2, std::memory_order_relaxed);
+        if      (q_now > cur     && cur < 1048576) batch_sz_gpu.store(cur * 2, std::memory_order_relaxed);
         else if (q_now < 16      && cur > 256)   batch_sz_gpu.store(cur / 2, std::memory_order_relaxed);
         _update_gpu_fraction();
     }
@@ -521,7 +521,7 @@ struct RayPipelineConfig {
      *   Empty string → searches "csrc/shaders/" relative to cwd.
      *
      * gpu_batch_size_t{1,2,3,4}: initial GPU pop batch size per stage.
-     *   0 = use the StageStats default (256). */
+     *   0 = use the StageStats default (262144). */
     bool        use_gpu_compute    = false;
     std::string shader_dir;
     int         gpu_batch_size_t1  = 0;

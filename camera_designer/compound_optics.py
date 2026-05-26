@@ -71,7 +71,10 @@ __all__ = [
     "OpticalSide",
     "RayBundle",
     "BundleTraceResult",
+    "DetailedBundleTraceResult",
+    "OpticalTraceEvent",
     "RayTraceResult",
+    "DetailedRayTraceResult",
     # Payload constants (mirror shader)
     "PLENS_MAGIC",
     "PLENS_HEADER",
@@ -270,12 +273,50 @@ class RayTraceResult:
 
 
 @dataclass(frozen=True)
+class OpticalTraceEvent:
+    """One parametric optical event inside a compound transfer."""
+    ray_index:   int
+    event_index: int
+    element_idx: int
+    kind:        str
+    reason:      TerminationReason
+    p0:          np.ndarray
+    p1:          np.ndarray
+    dir_in:      np.ndarray
+    dir_out:     np.ndarray
+    normal:      np.ndarray
+    geom_len:    float
+    opl:         float
+    n_before:    float
+    n_after:     float
+    aperture_r:  float
+
+
+@dataclass(frozen=True)
+class DetailedRayTraceResult:
+    """Scalar transfer result plus per-element optical events."""
+    origin:      np.ndarray
+    direction:   np.ndarray
+    opl:         float
+    reason:      TerminationReason
+    intercepts:  Tuple[np.ndarray, ...]
+    events:      Tuple[OpticalTraceEvent, ...]
+
+
+@dataclass(frozen=True)
 class BundleTraceResult:
     """Vectorized container returned by CompoundLens.evaluate_bundle()."""
     origins:     np.ndarray
     directions:  np.ndarray
     opl:         np.ndarray
     status:      np.ndarray
+
+
+@dataclass(frozen=True)
+class DetailedBundleTraceResult:
+    """Batch transfer result plus flattened per-element optical events."""
+    result: BundleTraceResult
+    events: Tuple[OpticalTraceEvent, ...]
 
 
 # ── Algebraic primitives ──────────────────────────────────────────────────────
@@ -1093,6 +1134,138 @@ class CompoundLens:
 
         return RayTraceResult(o, d, float(opl), TerminationReason.PASSED, tuple(hits))
 
+    def trace_detailed(
+        self,
+        origin: Sequence[float],
+        direction: Sequence[float],
+        *,
+        ray_index: int = 0,
+    ) -> DetailedRayTraceResult:
+        """Trace one ray while retaining every parametric optical event."""
+        o = np.asarray(origin, dtype=np.float64).copy()
+        d = np.asarray(direction, dtype=np.float64).copy()
+        d_norm = float(np.linalg.norm(d))
+        if d_norm <= _EPS:
+            raise ValueError("ray direction must be non-zero")
+        d /= d_norm
+
+        if self.hood is not None and d[0] > 0.0 and self.hood.clips(o, d):
+            return DetailedRayTraceResult(
+                o, d, 0.0, TerminationReason.CLIPPED_HOOD, tuple(), tuple()
+            )
+
+        opl = 0.0
+        hits: list[np.ndarray] = []
+        events: list[OpticalTraceEvent] = []
+        sequence = self._trace_sequence_indexed(d[0])
+        for event_idx, (element_idx, el) in enumerate(sequence):
+            p0 = o.copy()
+            dir_in = d.copy()
+            kind = type(el).__name__
+            normal = np.zeros(3, dtype=np.float64)
+            geom_len = 0.0
+            n_before = float(getattr(el, "n_before", getattr(el, "n_medium", 1.0)))
+            n_after = float(getattr(el, "n_after", getattr(el, "n_medium", 1.0)))
+            aperture_r = float(getattr(el, "aperture_r", getattr(el, "r_clear", 0.0)))
+
+            if isinstance(el, ApertureStop):
+                if abs(d[0]) < _EPS:
+                    reason = TerminationReason.MISSED_SURFACE
+                    hit = p0
+                    d2 = d
+                else:
+                    t = (el.x_pos - o[0]) / d[0]
+                    if t <= _EPS:
+                        reason = TerminationReason.MISSED_SURFACE
+                        hit = p0
+                        d2 = d
+                    else:
+                        geom_len = float(t)
+                        hit = o + t * d
+                        normal = np.array([-1.0, 0.0, 0.0], dtype=np.float64) if d[0] > 0.0 else np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                        if math.hypot(hit[1], hit[2]) > el.r_clear:
+                            reason = TerminationReason.CLIPPED_STOP
+                            d2 = d
+                        else:
+                            opl += el.n_medium * t
+                            reason = TerminationReason.PASSED
+                            d2 = d.copy()
+            elif isinstance(el, FlatSurface):
+                if abs(d[0]) < _EPS:
+                    reason = TerminationReason.MISSED_SURFACE
+                    hit = p0
+                    d2 = d
+                else:
+                    t = (el.x_pos - o[0]) / d[0]
+                    if t <= _EPS:
+                        reason = TerminationReason.MISSED_SURFACE
+                        hit = p0
+                        d2 = d
+                    else:
+                        geom_len = float(t)
+                        hit = o + t * d
+                        normal = np.array([-1.0, 0.0, 0.0], dtype=np.float64) if d[0] < 0.0 else np.array([1.0, 0.0, 0.0], dtype=np.float64)
+                        if el.aperture_r > 0.0 and math.hypot(hit[1], hit[2]) > el.aperture_r:
+                            reason = TerminationReason.VIGNETTED
+                            d2 = d
+                        else:
+                            opl += el.n_before * t
+                            refracted = _snell(d, normal, el.n_before, el.n_after)
+                            if refracted is None:
+                                reason = TerminationReason.TIR
+                                d2 = d
+                            else:
+                                reason = TerminationReason.PASSED
+                                d2 = refracted
+            else:
+                t = _conic_intersect(o, d, el.x_pos, el.R_curvature, el.conic_k)
+                if t is None:
+                    reason = TerminationReason.MISSED_SURFACE
+                    hit = p0
+                    d2 = d
+                else:
+                    geom_len = float(t)
+                    hit = o + t * d
+                    normal = _conic_normal(hit, el.x_pos, el.R_curvature, el.conic_k)
+                    if el.aperture_r > 0.0 and math.hypot(hit[1], hit[2]) > el.aperture_r:
+                        reason = TerminationReason.VIGNETTED
+                        d2 = d
+                    else:
+                        opl += el.n_before * t
+                        refracted = _snell(d, normal, el.n_before, el.n_after)
+                        if refracted is None:
+                            reason = TerminationReason.TIR
+                            d2 = d
+                        else:
+                            reason = TerminationReason.PASSED
+                            d2 = refracted
+
+            events.append(OpticalTraceEvent(
+                ray_index=int(ray_index),
+                event_index=int(event_idx),
+                element_idx=int(element_idx),
+                kind=kind,
+                reason=reason,
+                p0=p0,
+                p1=np.asarray(hit, dtype=np.float64).copy(),
+                dir_in=dir_in,
+                dir_out=np.asarray(d2, dtype=np.float64).copy(),
+                normal=normal,
+                geom_len=float(geom_len),
+                opl=float(opl),
+                n_before=float(n_before),
+                n_after=float(n_after),
+                aperture_r=float(aperture_r),
+            ))
+            if reason is not TerminationReason.PASSED:
+                return DetailedRayTraceResult(o, d, float(opl), reason, tuple(hits), tuple(events))
+
+            hits.append(np.asarray(hit, dtype=np.float64).copy())
+            o = hit + d2 * (10.0 * _EPS)
+            d = d2
+
+        return DetailedRayTraceResult(o, d, float(opl), TerminationReason.PASSED, tuple(hits), tuple(events))
+
     def evaluate_bundle(self, bundle: RayBundle) -> BundleTraceResult:
         """Trace a ray bundle through the current parametric chain."""
         n = int(bundle.origins.shape[0])
@@ -1111,6 +1284,30 @@ class CompoundLens:
             opl[i] = r.opl
             status[i] = int(r.reason.value)
         return BundleTraceResult(out_o, out_d, opl, status)
+
+    def evaluate_bundle_detailed(self, bundle: RayBundle) -> DetailedBundleTraceResult:
+        """Trace a ray bundle and retain flattened per-element optical events."""
+        n = int(bundle.origins.shape[0])
+        out_o = np.empty((n, 3), dtype=np.float64)
+        out_d = np.empty((n, 3), dtype=np.float64)
+        opl = np.empty(n, dtype=np.float64)
+        status = np.empty(n, dtype=np.int32)
+        events: list[OpticalTraceEvent] = []
+        for i in range(n):
+            r = self.trace_detailed(bundle.origins[i], bundle.directions[i], ray_index=i)
+            if r.reason is TerminationReason.PASSED:
+                out_o[i] = r.intercepts[-1] if r.intercepts else r.origin
+                out_d[i] = r.direction
+            else:
+                out_o[i] = r.origin
+                out_d[i] = r.direction
+            opl[i] = r.opl
+            status[i] = int(r.reason.value)
+            events.extend(r.events)
+        return DetailedBundleTraceResult(
+            BundleTraceResult(out_o, out_d, opl, status),
+            tuple(events),
+        )
 
     def drop_terminated(
         self,
@@ -1670,6 +1867,28 @@ class CompoundLens:
                     aperture_r=float(el.aperture_r),
                     conic_k=float(el.conic_k),
                 ))
+        return rev
+
+    def _trace_sequence_indexed(self, dir_x: float) -> List[Tuple[int, _Element]]:
+        """Return traversal elements with original front-to-back element indices."""
+        if dir_x >= 0.0:
+            return list(enumerate(self._elements))
+
+        rev: list[Tuple[int, _Element]] = []
+        for idx, el in reversed(list(enumerate(self._elements))):
+            if isinstance(el, ApertureStop):
+                rev.append((idx, ApertureStop(el.x_pos, el.r_clear, el.n_medium)))
+            elif isinstance(el, FlatSurface):
+                rev.append((idx, FlatSurface(el.x_pos, el.n_after, el.n_before, el.aperture_r)))
+            elif isinstance(el, ConicSurface):
+                rev.append((idx, ConicSurface(
+                    x_pos=float(el.x_pos),
+                    R_curvature=float(el.R_curvature),
+                    n_before=float(el.n_after),
+                    n_after=float(el.n_before),
+                    aperture_r=float(el.aperture_r),
+                    conic_k=float(el.conic_k),
+                )))
         return rev
 
     def _bundle_for_profile_edge(

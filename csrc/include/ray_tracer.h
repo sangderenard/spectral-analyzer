@@ -757,7 +757,7 @@ typedef struct EndpointReductionTelemetry {
     int32_t kept_pixel_cone_records;
     int32_t kept_projected_records;
     int32_t drop_wrong_group;
-    int32_t drop_non_pixel_cone;     /* vertex_index < 0: forward/emission record */
+    int32_t drop_non_pixel_cone;     /* forward/emission record requiring projection */
     int32_t drop_projection_failed;
     int32_t drop_invalid_band;
     int32_t drop_negative_subpath;

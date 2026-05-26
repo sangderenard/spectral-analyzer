@@ -26,6 +26,7 @@
 #include "tile_overlap.h"
 #include "player_clip.h"
 #include "surface_spline.h"
+#include "lens_optics.h"
 #include "optical_handlers.h"
 #include "exposure_backend.h"
 #include "ray_pipeline.h"
@@ -47,6 +48,60 @@
 #include <vector>
 
 namespace py = pybind11;
+
+static py::tuple estimate_lens_camera_jacobians_py(
+    py::array_t<float, py::array::c_style | py::array::forcecast> payload,
+    py::array_t<double, py::array::c_style | py::array::forcecast> film_origins,
+    py::array_t<double, py::array::c_style | py::array::forcecast> aperture_points,
+    py::array_t<double, py::array::c_style | py::array::forcecast> base_exit_origins,
+    py::array_t<double, py::array::c_style | py::array::forcecast> base_exit_dirs,
+    double plate_radius,
+    double aperture_radius,
+    py::array_t<double, py::array::c_style | py::array::forcecast> tb,
+    py::array_t<double, py::array::c_style | py::array::forcecast> tc,
+    int n_threads)
+{
+    auto p = payload.request();
+    auto fo = film_origins.request();
+    auto ap = aperture_points.request();
+    auto bo = base_exit_origins.request();
+    auto bd = base_exit_dirs.request();
+    auto tbv = tb.request();
+    auto tcv = tc.request();
+    if (p.ndim != 1) throw std::runtime_error("payload must be 1-D float32");
+    if (fo.ndim != 2 || ap.ndim != 2 || bo.ndim != 2 || bd.ndim != 2 ||
+        fo.shape[1] != 3 || ap.shape[1] != 3 || bo.shape[1] != 3 || bd.shape[1] != 3)
+        throw std::runtime_error("ray arrays must have shape (N, 3)");
+    if (fo.shape[0] != ap.shape[0] || fo.shape[0] != bo.shape[0] || fo.shape[0] != bd.shape[0])
+        throw std::runtime_error("ray arrays must have the same N");
+    if (tbv.size != 3 || tcv.size != 3)
+        throw std::runtime_error("tb and tc must have length 3");
+    const int n = static_cast<int>(fo.shape[0]);
+    py::array_t<float> ap_jac(n);
+    py::array_t<float> phase_jac(n);
+    float* ap_jac_ptr = static_cast<float*>(ap_jac.mutable_data());
+    float* phase_jac_ptr = static_cast<float*>(phase_jac.mutable_data());
+    {
+        py::gil_scoped_release release;
+        const int rc = lens_optics_estimate_camera_jacobians(
+            static_cast<const float*>(p.ptr),
+            static_cast<int>(p.size),
+            static_cast<const double*>(fo.ptr),
+            static_cast<const double*>(ap.ptr),
+            static_cast<const double*>(bo.ptr),
+            static_cast<const double*>(bd.ptr),
+            n,
+            plate_radius,
+            aperture_radius,
+            static_cast<const double*>(tbv.ptr),
+            static_cast<const double*>(tcv.ptr),
+            n_threads,
+            ap_jac_ptr,
+            phase_jac_ptr);
+        if (rc != 0) throw std::runtime_error("lens_optics_estimate_camera_jacobians failed");
+    }
+    return py::make_tuple(ap_jac, phase_jac);
+}
 
 /* ── Forward declarations for PicardSCC (defined in transforms/picard_step.cpp) */
 
@@ -4438,6 +4493,25 @@ PYBIND11_MODULE(_spectral_kernels, m)
 {
     m.doc() = "Spectral-analyzer C serial kernel extensions";
 
+    m.def("estimate_lens_camera_jacobians",
+          &estimate_lens_camera_jacobians_py,
+          py::arg("payload"),
+          py::arg("film_origins"),
+          py::arg("aperture_points"),
+          py::arg("base_exit_origins"),
+          py::arg("base_exit_dirs"),
+          py::arg("plate_radius"),
+          py::arg("aperture_radius"),
+          py::arg("tb"),
+          py::arg("tc"),
+          py::arg("n_threads") = 0,
+          R"doc(
+Threaded C++/Eigen finite-difference camera transfer Jacobians.
+
+Returns (aperture_to_solid_angle_jac, phase_space_jac) for a batch of
+parametric compound-lens camera samples using the compact PLENS payload.
+)doc");
+
     py::class_<PyRouterStep>(m, "RouterStep",
         R"doc(
 Stateful per-sample complex-graph router daemon.
@@ -4863,7 +4937,7 @@ The tracer deep-copies all inputs; caller buffers can be discarded after return.
 R"doc(
 Deposit BDPT EndpointRecord amplitudes into the currently bound field-capture grid.
 
-records: float32 (N, 16), output of bidirectional()/bidirectional_packed().
+records: float32 (N, 16), endpoint records retained by the live ray pipeline.
 Returns dict with:
     - written_records: number of endpoint records injected into field grid.
     - written_power: accumulated spectral power sum (|amp|^2) for injected rows.
@@ -5896,425 +5970,7 @@ weights : float32 ndarray of shape (n_bands, 3) — each row is [r, g, b] weight
           for mapping one spectral band's magnitude to sRGB.  Typically from
           _wavelength_to_rgb_weights(freq_hz).
 mode    : 0 = combined (fwd+sensor), 1 = forward only, 2 = sensor only.)doc")
-        /* ── Bidirectional integrator ──────────────────────────────── */
-        .def("bidirectional",
-             [](PyRayTracer& self, int n_rays_per_emitter, int max_bounces,
-                double min_amplitude, uint32_t seed, int max_records) {
-                 /* max_records must be set by the caller to the per-batch
-                    worst-case: sum(emit_rays) * (max_bounces + 1).  There is
-                    no silent ceiling here — the caller is responsible for
-                    sizing the buffer correctly. */
-                 if (max_records <= 0)
-                     throw std::invalid_argument("max_records must be > 0");
-                 py::array_t<float> recs(
-                     {(py::ssize_t)max_records, (py::ssize_t)16});
-                 auto buf = recs.mutable_unchecked<2>();
-                 EndpointRecord* out = reinterpret_cast<EndpointRecord*>(buf.mutable_data(0, 0));
-                 int n_out = 0;
-                 int rc;
-                 {
-                     py::gil_scoped_release release;
-                     rc = ray_tracer_bidirectional(
-                         self.handle, n_rays_per_emitter, max_bounces,
-                         min_amplitude, seed, out, max_records, &n_out);
-                 }
-                 if (rc != SK_OK)
-                     throw std::runtime_error(
-                         "ray_tracer_bidirectional failed: rc=" + std::to_string(rc));
-                 /* Trim to actual record count. */
-                 py::array_t<float> trimmed(
-                     {(py::ssize_t)n_out, (py::ssize_t)16});
-                 if (n_out > 0) {
-                     std::memcpy(trimmed.mutable_data(),
-                                 buf.data(0, 0),
-                                 sizeof(EndpointRecord) * n_out);
-                 }
-                 return trimmed;
-             },
-             py::arg("n_rays_per_emitter"),
-             py::arg("max_bounces") = 8,
-             py::arg("min_amplitude") = 0.005,
-             py::arg("seed") = 0,
-             py::arg("max_records") = 0,
-             R"doc(
-Bidirectional path tracing pass.
-
-Returns float32 (N, 16) array — each row is one EndpointRecord.  See
-csrc/include/bdpt_record.h for slot layout.  Phase preserved as (re, im)
-columns 12..13.  No reduction.
-
-n_rays_per_emitter : light subpaths per registered EMISSIVE TriGroup
-max_bounces        : maximum bounces per subpath
-min_amplitude      : kill threshold on max(|amp|) across bands
-seed               : RNG seed
-max_records        : exact output buffer size — caller must pass
-                     sum(n_rays_per_emitter) * (max_bounces + 1).
-             No records are silently dropped; the buffer is sized to hold
-             the worst-case output for this batch.
-)doc")
-        .def("bidirectional_packed",
-             [](PyRayTracer& self,
-                py::array_t<int32_t, py::array::c_style | py::array::forcecast> n_rays_per_emitter,
-                int max_bounces,
-                double min_amplitude,
-                uint32_t seed,
-                int max_records) {
-                 auto nr = n_rays_per_emitter.request();
-                 if (nr.ndim != 1)
-                     throw std::runtime_error("n_rays_per_emitter must be int32 shape (n_emitters,)");
-                 /* max_records sized by caller: sum(emit_rays)*(max_bounces+1). */
-                 if (max_records <= 0)
-                     throw std::invalid_argument("max_records must be > 0");
-                 py::array_t<float> recs(
-                     {(py::ssize_t)max_records, (py::ssize_t)16});
-                 auto buf = recs.mutable_unchecked<2>();
-                 EndpointRecord* out = reinterpret_cast<EndpointRecord*>(buf.mutable_data(0, 0));
-                 int n_out = 0;
-                 int rc;
-                 {
-                     py::gil_scoped_release release;
-                     rc = ray_tracer_bidirectional_packed(
-                         self.handle,
-                         static_cast<const int32_t*>(nr.ptr),
-                         static_cast<int>(nr.shape[0]),
-                         max_bounces,
-                         min_amplitude,
-                         seed,
-                         out,
-                         max_records,
-                         &n_out);
-                 }
-                 if (rc != SK_OK)
-                     throw std::runtime_error(
-                         "ray_tracer_bidirectional_packed failed: rc=" + std::to_string(rc));
-                 py::array_t<float> trimmed(
-                     {(py::ssize_t)n_out, (py::ssize_t)16});
-                 if (n_out > 0) {
-                     std::memcpy(trimmed.mutable_data(),
-                                 buf.data(0, 0),
-                                 sizeof(EndpointRecord) * n_out);
-                 }
-                 return trimmed;
-             },
-             py::arg("n_rays_per_emitter"),
-             py::arg("max_bounces") = 8,
-             py::arg("min_amplitude") = 0.005,
-             py::arg("seed") = 0,
-             py::arg("max_records") = 0,
-             R"doc(
-Bidirectional path tracing pass with per-emitter packed ray quotas.
-
-n_rays_per_emitter: int32 (n_emitters,), registration-order quotas for
-EMISSIVE TriGroups.
-)doc")
-        .def("bidirectional_packed_into",
-             [](PyRayTracer& self,
-                py::array_t<int32_t, py::array::c_style | py::array::forcecast> n_rays_per_emitter,
-                int max_bounces,
-                double min_amplitude,
-                uint32_t seed,
-                py::array_t<float, py::array::c_style | py::array::forcecast> out_records) {
-                 auto nr = n_rays_per_emitter.request();
-                 if (nr.ndim != 1)
-                     throw std::runtime_error("n_rays_per_emitter must be int32 shape (n_emitters,)");
-                 auto ob = out_records.request();
-                 if (ob.ndim != 2 || ob.shape[1] != 16)
-                     throw std::runtime_error("out_records must be float32 shape (N, 16)");
-                 if (ob.shape[0] <= 0)
-                     throw std::invalid_argument("out_records must have N > 0");
-
-                 EndpointRecord* out = reinterpret_cast<EndpointRecord*>(ob.ptr);
-                 int out_cap = static_cast<int>(ob.shape[0]);
-                 int n_out = 0;
-                 int rc;
-                 {
-                     py::gil_scoped_release release;
-                     rc = ray_tracer_bidirectional_packed(
-                         self.handle,
-                         static_cast<const int32_t*>(nr.ptr),
-                         static_cast<int>(nr.shape[0]),
-                         max_bounces,
-                         min_amplitude,
-                         seed,
-                         out,
-                         out_cap,
-                         &n_out);
-                 }
-                 if (rc != SK_OK)
-                     throw std::runtime_error(
-                         "ray_tracer_bidirectional_packed failed: rc=" + std::to_string(rc));
-                 return n_out;
-             },
-             py::arg("n_rays_per_emitter"),
-             py::arg("max_bounces") = 8,
-             py::arg("min_amplitude") = 0.005,
-             py::arg("seed") = 0,
-             py::arg("out_records"),
-             R"doc(
-Bidirectional packed pass writing directly into caller-provided output storage.
-
-Returns number of written EndpointRecords (N_out <= out_records.shape[0]).
-Useful for file-backed memmap buffers to avoid RAM-only allocation limits.
-)doc")
-    .def("bdpt_connect",
-             [](PyRayTracer& self,
-                py::array_t<float, py::array::c_style | py::array::forcecast> records,
-                int n_px, int n_py, int sensor_gid,
-                int max_fwd_samples, uint32_t seed) {
-                 auto rb = records.request();
-                 if (rb.ndim != 2 || rb.shape[1] < 16)
-                     throw std::runtime_error("records must be float32 shape (n_records, 16)");
-                 const int n_records = static_cast<int>(rb.shape[0]);
-                 const py::ssize_t n_rgb = static_cast<py::ssize_t>(n_px) * n_py * 3;
-                 py::array_t<float> out({n_rgb});
-                 std::memset(out.mutable_data(), 0, sizeof(float) * static_cast<size_t>(n_rgb));
-                 int rc;
-                 {
-                     py::gil_scoped_release release;
-                     rc = ray_tracer_bdpt_connect(
-                         self.handle,
-                         reinterpret_cast<const EndpointRecord*>(rb.ptr),
-                         n_records, n_px, n_py, sensor_gid,
-                         max_fwd_samples, seed,
-                         out.mutable_data(), static_cast<int>(n_rgb));
-                 }
-                 if (rc != SK_OK)
-                     throw std::runtime_error(
-                         "ray_tracer_bdpt_connect failed: rc=" + std::to_string(rc));
-                 /* Return (n_py, n_px, 3) float32 image. */
-                 return out.reshape({(py::ssize_t)n_py, (py::ssize_t)n_px, (py::ssize_t)3});
-             },
-             py::arg("records"),
-             py::arg("n_px"), py::arg("n_py"), py::arg("sensor_gid"),
-             py::arg("max_fwd_samples") = 500,
-             py::arg("seed") = 0u,
-             R"doc(
-BDPT connection step: for every backward (sensor) scene vertex, sample up to
-max_fwd_samples forward (light) scene vertices in the same spectral band,
-cast a shadow ray, and accumulate f.amp * b.amp / dist² to the pixel encoded
-in the backward subpath_id.
-
-Returns (n_py, n_px, 3) float32 tonemapped RGB image.
-)doc")
-    .def("reduce_endpoint_records_to_sensor_integral",
-             [](PyRayTracer& self,
-                py::array_t<float, py::array::c_style | py::array::forcecast> records,
-                int n_px, int n_py, int sensor_group_id,
-                double target_photons_per_pixel, double gain) {
-                 auto rb = records.request();
-                 if (rb.ndim != 2 || rb.shape[1] < 16)
-                     throw std::runtime_error("records must be float32 shape (n_records, 16)");
-
-                 const int n_records = static_cast<int>(rb.shape[0]);
-                 py::array::ShapeContainer shape = {
-                     static_cast<py::ssize_t>(n_py),
-                     static_cast<py::ssize_t>(n_px)
-                 };
-                 py::array_t<float> photons(shape);
-                 py::array_t<float> electrons(shape);
-                 py::array_t<float> snr(shape);
-
-                 std::vector<SensorFilmSlotSummary> slot_summaries(8);
-                 int n_slot_summaries = 0;
-                 int endpoint_count = 0;
-                 EndpointReductionTelemetry telemetry{};
-                 const EndpointRecord* rec_ptr =
-                     reinterpret_cast<const EndpointRecord*>(rb.ptr);
-                 int rc = ray_tracer_reduce_endpoint_records_to_sensor_integral(
-                     self.handle,
-                     rec_ptr,
-                     n_records,
-                     n_px,
-                     n_py,
-                     sensor_group_id,
-                     target_photons_per_pixel,
-                     gain,
-                     static_cast<float*>(photons.mutable_data()),
-                     static_cast<float*>(electrons.mutable_data()),
-                     static_cast<float*>(snr.mutable_data()),
-                     static_cast<void*>(slot_summaries.data()),
-                     static_cast<int>(slot_summaries.size()),
-                     &n_slot_summaries,
-                     &endpoint_count,
-                     &telemetry);
-                 if (rc != SK_OK)
-                     throw std::runtime_error(
-                         "ray_tracer_reduce_endpoint_records_to_sensor_integral failed: rc=" + std::to_string(rc));
-
-                 const size_t pix_count = static_cast<size_t>(n_px) * static_cast<size_t>(n_py);
-                 const float* photons_ptr = static_cast<const float*>(photons.data());
-                 const float* electrons_ptr = static_cast<const float*>(electrons.data());
-                 const float* snr_ptr = static_cast<const float*>(snr.data());
-
-                 double photons_mean = 0.0;
-                 double electrons_mean = 0.0;
-                 double snr_peak = 0.0;
-                 double snr_mean = 0.0;
-                 for (size_t i = 0; i < pix_count; ++i) {
-                     photons_mean += photons_ptr[i];
-                     electrons_mean += electrons_ptr[i];
-                     snr_mean += snr_ptr[i];
-                     if (snr_ptr[i] > snr_peak)
-                         snr_peak = snr_ptr[i];
-                 }
-                 const double inv_pix = 1.0 / std::max<size_t>(1, pix_count);
-                 photons_mean *= inv_pix;
-                 electrons_mean *= inv_pix;
-                 snr_mean *= inv_pix;
-
-                 py::list slot_metrics;
-                 py::list active_slot_ids;
-                 double qe_sum = 0.0;
-                 double read_noise_sum = 0.0;
-                 double full_well_sum = 0.0;
-                 for (int i = 0; i < n_slot_summaries; ++i) {
-                     const auto& s = slot_summaries[static_cast<size_t>(i)];
-                     active_slot_ids.append(py::int_(s.slot_id));
-                     qe_sum += s.qe_peak;
-                     read_noise_sum += s.read_noise_e;
-                     full_well_sum += s.full_well_e;
-
-                     py::dict slot_metric;
-                     slot_metric["slot_id"] = py::int_(s.slot_id);
-                     slot_metric["sensor_id"] = py::int_(s.sensor_id);
-                     slot_metric["film_id"] = py::int_(s.film_id);
-                     slot_metric["qe_peak"] = py::float_(s.qe_peak);
-                     slot_metric["read_noise_e"] = py::float_(s.read_noise_e);
-                     slot_metric["dark_current_e_s"] = py::float_(s.dark_current_e_s);
-                     slot_metric["dark_current_accumulated_e"] = py::float_(s.dark_current_accumulated_e);
-                     slot_metric["exposure_time_s"] = py::float_(s.exposure_time_s);
-                     slot_metric["full_well_e"] = py::float_(s.full_well_e);
-                     slot_metric["snr_peak"] = py::float_(s.snr_peak);
-                     slot_metric["snr_mean"] = py::float_(s.snr_mean);
-                     slot_metric["photons_flux_hz"] = py::float_(s.photons_flux_hz);
-                     slot_metric["electrons_flux_hz"] = py::float_(s.electrons_flux_hz);
-                     slot_metrics.append(slot_metric);
-                 }
-
-                 py::dict metrics;
-                 metrics["active_slot_ids"] = active_slot_ids;
-                 metrics["n_active_slots"] = py::int_(n_slot_summaries);
-                 metrics["qe_peak"] = py::float_(n_slot_summaries > 0 ? qe_sum / n_slot_summaries : 0.0);
-                 metrics["read_noise_e"] = py::float_(n_slot_summaries > 0 ? read_noise_sum / n_slot_summaries : 0.0);
-                 metrics["full_well_e"] = py::float_(n_slot_summaries > 0 ? full_well_sum / n_slot_summaries : 0.0);
-                 metrics["snr_peak"] = py::float_(snr_peak);
-                 metrics["snr_mean"] = py::float_(snr_mean);
-                 metrics["endpoint_records_count"] = py::int_(endpoint_count);
-                 metrics["sensor_group_id"] = py::int_(sensor_group_id);
-                 metrics["photons_flux_hz"] = py::float_(photons_mean);
-                 metrics["electrons_flux_hz"] = py::float_(electrons_mean);
-                 metrics["slot_metrics"] = slot_metrics;
-                 metrics["sensor_group_records"] = py::int_(telemetry.sensor_group_records);
-                 metrics["kept_records"] = py::int_(telemetry.kept_records);
-                 metrics["kept_pixel_cone_records"] = py::int_(telemetry.kept_pixel_cone_records);
-                 metrics["kept_projected_records"] = py::int_(telemetry.kept_projected_records);
-                 metrics["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
-                 metrics["drop_non_pixel_cone"] = py::int_(telemetry.drop_non_pixel_cone);
-                 metrics["drop_projection_failed"] = py::int_(telemetry.drop_projection_failed);
-                 metrics["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
-                 metrics["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
-                 metrics["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);
-                 metrics["order_regressions"] = py::int_(telemetry.order_regressions);
-                 metrics["first_subpath_id"] = py::int_(telemetry.first_subpath_id);
-                 metrics["last_subpath_id"] = py::int_(telemetry.last_subpath_id);
-                 metrics["possibly_clamped_input"] = py::bool_(
-                     n_records > 0 && n_records == (1 << 20));
-
-                 py::dict out;
-                 out["photons_per_pixel"] = photons;
-                 out["electrons_per_pixel"] = electrons;
-                 out["snr_linear"] = snr;
-                 out["metrics"] = metrics;
-                 return out;
-             },
-             py::arg("records"),
-             py::arg("n_px"),
-             py::arg("n_py"),
-             py::arg("sensor_group_id"),
-             py::arg("target_photons_per_pixel"),
-             py::arg("gain") = 1.0,
-             R"doc(
-Reduce EndpointRecord rows into a simulated sensor integral.
-
-records : float32 (n_records, 16) array returned by bidirectional()
-n_px/n_py: sensor pixel dimensions
-sensor_group_id: PIXEL_CONE sensor group to retain
-target_photons_per_pixel: exposure-normalised photon target used to stabilise the preview map
-gain    : exposure gain multiplier applied before photon normalisation
-)doc")
-    .def("reduce_endpoint_records_to_rgb_image",
-             [](PyRayTracer& self,
-                py::array_t<float, py::array::c_style | py::array::forcecast> records,
-                int n_px, int n_py, int sensor_group_id,
-                double gain, double hdr_white_percentile) {
-                 auto rb = records.request();
-                 if (rb.ndim != 2 || rb.shape[1] < 16)
-                     throw std::runtime_error("records must be float32 shape (n_records, 16)");
-
-                 const int n_records = static_cast<int>(rb.shape[0]);
-                 py::array::ShapeContainer shape = {
-                     static_cast<py::ssize_t>(n_py),
-                     static_cast<py::ssize_t>(n_px),
-                     static_cast<py::ssize_t>(3)
-                 };
-                 py::array_t<float> rgb_linear(shape);
-                 py::array_t<float> rgb_tonemapped(shape);
-
-                 EndpointReductionTelemetry telemetry{};
-                 const EndpointRecord* rec_ptr =
-                     reinterpret_cast<const EndpointRecord*>(rb.ptr);
-                 int rc = ray_tracer_reduce_endpoint_records_to_rgb_image(
-                     self.handle,
-                     rec_ptr,
-                     n_records,
-                     n_px,
-                     n_py,
-                     sensor_group_id,
-                     gain,
-                     hdr_white_percentile,
-                     static_cast<float*>(rgb_linear.mutable_data()),
-                     static_cast<float*>(rgb_tonemapped.mutable_data()),
-                     &telemetry);
-                 if (rc != SK_OK)
-                     throw std::runtime_error(
-                         "ray_tracer_reduce_endpoint_records_to_rgb_image failed: rc=" + std::to_string(rc));
-
-                 py::dict telemetry_dict;
-                 telemetry_dict["input_records"] = py::int_(telemetry.input_records);
-                 telemetry_dict["sensor_group_records"] = py::int_(telemetry.sensor_group_records);
-                 telemetry_dict["kept_records"] = py::int_(telemetry.kept_records);
-                 telemetry_dict["kept_pixel_cone_records"] = py::int_(telemetry.kept_pixel_cone_records);
-                 telemetry_dict["kept_projected_records"] = py::int_(telemetry.kept_projected_records);
-                 telemetry_dict["drop_wrong_group"] = py::int_(telemetry.drop_wrong_group);
-                 telemetry_dict["drop_non_pixel_cone"] = py::int_(telemetry.drop_non_pixel_cone);
-                 telemetry_dict["drop_projection_failed"] = py::int_(telemetry.drop_projection_failed);
-                 telemetry_dict["drop_invalid_band"] = py::int_(telemetry.drop_invalid_band);
-                 telemetry_dict["drop_negative_subpath"] = py::int_(telemetry.drop_negative_subpath);
-                 telemetry_dict["drop_out_of_bounds_pixel"] = py::int_(telemetry.drop_out_of_bounds_pixel);
-                 telemetry_dict["order_regressions"] = py::int_(telemetry.order_regressions);
-                 telemetry_dict["first_subpath_id"] = py::int_(telemetry.first_subpath_id);
-                 telemetry_dict["last_subpath_id"] = py::int_(telemetry.last_subpath_id);
-
-                 py::dict out;
-                 out["rgb_linear"] = rgb_linear;
-                 out["rgb_tonemapped"] = rgb_tonemapped;
-                 out["telemetry"] = telemetry_dict;
-                 return out;
-             },
-             py::arg("records"),
-             py::arg("n_px"),
-             py::arg("n_py"),
-             py::arg("sensor_group_id"),
-             py::arg("gain") = 1.0,
-             py::arg("hdr_white_percentile") = 99.8,
-             R"doc(
-Reduce EndpointRecord rows into canonical C++ RGB outputs.
-
-Returns:
-- rgb_linear: float32 (n_py, n_px, 3)
-- rgb_tonemapped: float32 (n_py, n_px, 3)
-- telemetry: drop/order diagnostics for reduction quality
-)doc");
+    ;
 
     py::class_<PyFieldSolver>(m, "FieldSolver",
         R"doc(

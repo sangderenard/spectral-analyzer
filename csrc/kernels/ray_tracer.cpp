@@ -4033,7 +4033,13 @@ int ray_tracer_reduce_endpoint_records_to_sensor_integral(
 
         int px = -1;
         int py = -1;
-        if (E.vertex_index >= 0) {
+        const bool has_stream_id =
+            (E.stream_id == (float)BDPT_SIDE_LIGHT) ||
+            (E.stream_id == (float)BDPT_SIDE_SENSOR);
+        const bool is_pixel_cone = has_stream_id
+            ? (E.stream_id == (float)BDPT_SIDE_SENSOR)
+            : (E.vertex_index >= 0);
+        if (is_pixel_cone) {
             // PIXEL_CONE: subpath_id encodes py * n_px + px directly.
             // Do not project E.pos (scene hit) back onto the sensor plane.
             const int pix = static_cast<int>(E.subpath_id);
@@ -4313,7 +4319,13 @@ int ray_tracer_reduce_endpoint_records_to_rgb_image(
         }
         int px = -1;
         int py = -1;
-        if (E.vertex_index >= 0) {
+        const bool has_stream_id =
+            (E.stream_id == (float)BDPT_SIDE_LIGHT) ||
+            (E.stream_id == (float)BDPT_SIDE_SENSOR);
+        const bool is_pixel_cone = has_stream_id
+            ? (E.stream_id == (float)BDPT_SIDE_SENSOR)
+            : (E.vertex_index >= 0);
+        if (is_pixel_cone) {
             // PIXEL_CONE: subpath_id encodes py * n_px + px directly.
             // Do not project E.pos (scene hit) back onto the sensor plane.
             const int pix = static_cast<int>(E.subpath_id);
@@ -6220,13 +6232,19 @@ static int ray_tracer_bidirectional_impl(
                     const int32_t rec_gid = step.is_sensor_hit
                         ? static_cast<int32_t>(step.sensor_group_id)
                         : int32_t(-1);
+                    const double min_amp2 = min_amplitude * min_amplitude;
                     for (int b = 0; b < n_bands; ++b) {
+                        const double ar = amp[b].real();
+                        const double ai = amp[b].imag();
+                        if (ar * ar + ai * ai <= min_amp2) {
+                            continue;
+                        }
                         if (rec_count >= out_cap) goto bdpt_done;
                         EndpointRecord& E = out_records[rec_count++];
                         E.subpath_id   = my_subpath;
                         E.band_id      = static_cast<uint32_t>(b);
                         E.group_id     = rec_gid;
-                        E.vertex_index = static_cast<int32_t>(bounce);
+                        E.vertex_index = -1 - static_cast<int32_t>(bounce);
                         E.pos[0] = (float)step.hit_pos.x();
                         E.pos[1] = (float)step.hit_pos.y();
                         E.pos[2] = (float)step.hit_pos.z();
@@ -6235,8 +6253,8 @@ static int ray_tracer_bidirectional_impl(
                         E.dir[1] = (float)dir.y();
                         E.dir[2] = (float)dir.z();
                         E.pdf       = 1.0f / (float)std::max(1, n_rays_this);
-                        E.amp_re    = (float)amp[b].real();
-                        E.amp_im    = (float)amp[b].imag();
+                        E.amp_re    = (float)ar;
+                        E.amp_im    = (float)ai;
                         E.cos_theta = (float)cos_theta;
                         E.stream_id = (float)BDPT_SIDE_LIGHT;
                     }
@@ -6349,7 +6367,13 @@ static int ray_tracer_bidirectional_impl(
                         if (!step.is_sensor_hit) {
                             const V3d hit_n = st->tris[step.hit_tri].normal;
                             const double cos_theta = std::abs(bdir.dot(hit_n));
+                            const double min_amp2 = min_amplitude * min_amplitude;
                             for (int b = 0; b < n_bands; ++b) {
+                                const double ar = amp[b].real();
+                                const double ai = amp[b].imag();
+                                if (ar * ar + ai * ai <= min_amp2) {
+                                    continue;
+                                }
                                 if (rec_count >= out_cap) goto bdpt_done;
                                 EndpointRecord& E = out_records[rec_count++];
                                 E.subpath_id   = pix_id;
@@ -6364,8 +6388,8 @@ static int ray_tracer_bidirectional_impl(
                                 E.dir[1]       = (float)bdir.y();
                                 E.dir[2]       = (float)bdir.z();
                                 E.pdf          = 1.0f / static_cast<float>(n_ap);
-                                E.amp_re       = (float)amp[b].real();
-                                E.amp_im       = (float)amp[b].imag();
+                                E.amp_re       = (float)ar;
+                                E.amp_im       = (float)ai;
                                 E.cos_theta    = (float)cos_theta;
                                 E.stream_id    = (float)BDPT_SIDE_SENSOR;
                             }
@@ -8518,7 +8542,7 @@ public:
         {
             const bool do_field = ps.cfg.gpu_segment_field_capture
                                   && ps.st && ps.st->camera_field_grid;
-            static constexpr int Q_OUT_VIS_CAP = 65536;
+            static constexpr int Q_OUT_VIS_CAP = 4'000'000;
             /* Skip the hit readback entirely when Q_out is already full, field
              * capture is disabled, and there are no parametric groups to count. */
             const int  q_space   = Q_OUT_VIS_CAP - (int)ps.Q_out.size();
@@ -10113,7 +10137,7 @@ void ray_pipeline_report_display_frame_time(RayPipelineState* ps,
     };
     auto grow_batch = [](StageStats& s) {
         int cur = s.batch_sz_gpu.load(std::memory_order_relaxed);
-        int next = std::min(65536, cur + std::max(64, cur / 8));
+        int next = std::min(1048576, cur + std::max(64, cur / 8));
         if (next != cur) s.batch_sz_gpu.store(next, std::memory_order_relaxed);
     };
 

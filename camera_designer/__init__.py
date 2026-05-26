@@ -5,7 +5,6 @@ Submodules
 compound_optics       Exact algebraic compound lens model (CompoundLens)
 parametric_surfaces   Closed-form surface primitives (CPU + GLSL)
 camera_preset         CameraPreset dataclass + built-in presets
-bake_worker           64-bit ray tracer → LensManifold noodle LUT
 emitter_profile       Physical emitter profiles (spectral, phase, directional,
                       polarization, UV texture)
 wave_tube             ADI-BPM wave context + surrogate emitter (WaveTube)
@@ -65,8 +64,6 @@ from .compound_optics import (
     PLENS_HEADER,
     PLENS_SURF_STRIDE,
 )
-from .bake_worker import BakeWorker, trace_ray, trace_ray_backward
-from .manifold_endpoint import ManifoldEndpoint
 from .ray_order import TracerGap, SourceRecord, RayOrder
 from .neural_assembly import (
     NeuralAssemblyMLP,
@@ -104,8 +101,6 @@ __all__ = [
     "AssemblyFieldProfile",
     "FaceAngularLimit", "AssemblyAngularLimits",
     "PLENS_MAGIC", "PLENS_HEADER", "PLENS_SURF_STRIDE",
-    # bake
-    "BakeWorker", "trace_ray", "trace_ray_backward", "ManifoldEndpoint",
     # ray order
     "TracerGap", "SourceRecord", "RayOrder",
     # neural assembly

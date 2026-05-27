@@ -29,7 +29,7 @@
  *
  * ── Per-record flat float32 layouts ─────────────────────────────────────
  *
- * RefinedHit  (REFINED_HIT_STRIDE = 26 + 2*MAX_BANDS floats):
+ * RefinedHit  (REFINED_HIT_STRIDE = 27 + 2*MAX_BANDS = 59 floats):
  *   [0..2]   hit_pos xyz
  *   [3..5]   hit_n xyz
  *   [6..8]   incoming_dir xyz
@@ -50,6 +50,7 @@
  *   [25]     medium_mat_idx   (intBitsToFloat)
  *   [26 .. 26+MAX_BANDS-1]          amp_re[MAX_BANDS]
  *   [26+MAX_BANDS .. 26+2*MAX_BANDS-1] amp_im[MAX_BANDS]
+ *   [58]     bdpt_subpath_id  (uintBitsToFloat; 0=untracked)
  *
  * RayIntent  (INTENT_STRIDE = 20 + 2*MAX_BANDS floats):
  *   [0..2]   pos xyz
@@ -97,9 +98,9 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 /* ── Compile-time constants ─────────────────────────────────────────────── */
 #define MAX_BANDS           16
-#define REFINED_HIT_STRIDE  (26 + 2 * MAX_BANDS)   /* 58 */
+#define REFINED_HIT_STRIDE  (27 + 2 * MAX_BANDS)   /* 59: [58]=bdpt_sid at end */
 #define INTENT_STRIDE       (20 + 2 * MAX_BANDS)   /* 52 */
-#define TERMINAL_STRIDE     (26 + 2 * MAX_BANDS)   /* 58 */
+#define TERMINAL_STRIDE     (26 + 2 * MAX_BANDS)   /* 58: terminals don't carry bdpt_sid */
 #define TRI_FULL_STRIDE     16
 #define MAT_BAND_STRIDE     12
 #define MAT_FULL_BANDS      32
@@ -116,65 +117,58 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define MAT_FLAG_APERTURE_STOP  128u
 #define MAT_FLAG_PICKING_ONLY   256u
 
-/* ── SSBOs ──────────────────────────────────────────────────────────────── */
+/* ── SSBOs (8 total — max per GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS) ──────────
+ *
+ *  binding  name              access    description
+ *  -------  ----------------  --------  ------------------------------------
+ *    0      RefinedHitBuf     readonly  flat RefinedHit records (stride 59)
+ *                                         hit[58] = bdpt_subpath_id (uintBitsToFloat)
+ *    1      OutBuf            coherent  child intents [0..max_children*INTENT_STRIDE)
+ *                                       + terminal records [max_children*INTENT_STRIDE..)
+ *    2      MetaBuf           coherent  [0]=intent_count [1]=terminal_count
+ *                                       [2..2+n_mats-1]=per-mat epsilon flags
+ *                                       [bdpt_count_base+0..+2]=bdpt vert/spec/pdf counts
+ *    3      TriangleBuf       readonly  full triangle geometry (16 floats each)
+ *    4      MatBandBuf        readonly  mat_buf: (n_mats*n_bands, 12) float32
+ *    5      MergedUvBuf       readonly  int32 array:
+ *                                         [0..uv_group_id_base): UV coords as intBitsToFloat
+ *                                         [uv_group_id_base..uv_meta_base): per-tri group IDs
+ *                                         [uv_meta_base..): group meta (res, accum_offset pairs)
+ *    6      UvAccumBuf        coherent  flat uint32 UV accumulator
+ *    7      BdptOutputBuf     coherent  float32: verts at [0], spectral at [bdpt_spectral_base],
+ *                                         pdfs at [bdpt_pdf_base]
+ */
 layout(std430, binding = 0) readonly buffer RefinedHitBuf { float hits[];      };
 layout(std430, binding = 1) coherent buffer OutBuf        { float out_buf[];   };
 layout(std430, binding = 2) coherent buffer MetaBuf       { uint  meta[];      };
-    /* meta[0] = intent_count (atomic, zeroed before dispatch)
-     * meta[1] = terminal_count (atomic, zeroed before dispatch)
-     * meta[2..2+n_mats-1] = per-material epsilon flags (written at scene upload, never zeroed) */
 layout(std430, binding = 3) readonly buffer TriangleBuf   { float tris[];      };
 layout(std430, binding = 4) readonly buffer MatBandBuf    { float mat_bands[]; };
-
-/* ── UV integrator image SSBOs ──────────────────────────────────────────
- *
- * binding 5: per-tri UV vertex coordinates (6 floats per tri: uv0,uv1,uv2)
- * binding 6: merged int32 buffer —
- *              [0 .. uv_meta_base-1]  : per-tri UV group ID (-1 = no group)
- *              [uv_meta_base .. ]     : per-group metadata (2 ints each:
- *                                       res, accum_offset)
- * binding 7: flat uint32 UV accumulator.
- *
- * All three are valid and non-empty whenever n_uv_groups > 0.
- * uv_meta_base == total number of triangles (size of the group-id section).
- */
-layout(std430, binding = 5) readonly buffer TriUvBuf          { float tri_uv[];          };
-layout(std430, binding = 6) readonly buffer TriUvAndMetaBuf   { int   tri_uv_and_meta[]; };
-layout(std430, binding = 7) coherent buffer UvAccumBuf        { uint  uv_accum[];         };
-/* CounterBuf at binding 8: written by T1, read here to get the actual hit
- * count without a CPU readback between T1 and T3 dispatch. */
-layout(std430, binding = 8) readonly buffer CounterBuf        { uint  t1_counters[];      };
-
-/* ── BDPT side-data SSBOs (bindings 9-12) ───────────────────────────────── *
- * binding  9: BdptIdBuf      — one uint32 per hit slot (bdpt_subpath_id from T1)
- * binding 10: BdptVertexBuf  — flat float32 output for BdptVertexRecord (28 floats each)
- * binding 11: BdptSpectralBuf— flat float32 output for BdptSpectralWeightRecord (8 each)
- * binding 12: BdptCounterBuf — uint32[3]: [0]=vertex_count, [1]=spectral_count, [2]=pdf_count
- * binding 13: BdptPdfBuf     — flat float32 output for BdptPdfRecord (12 each)       */
-layout(std430, binding =  9) readonly buffer BdptIdBuf       { uint  bdpt_ids[];       };
-layout(std430, binding = 10) coherent buffer BdptVertexBuf   { float bdpt_verts[];     };
-layout(std430, binding = 11) coherent buffer BdptSpectralBuf { float bdpt_spectral[];  };
-layout(std430, binding = 12) coherent buffer BdptCounterBuf  { uint  bdpt_counters[];  };
-layout(std430, binding = 13) coherent buffer BdptPdfBuf      { float bdpt_pdfs[];      };
+layout(std430, binding = 5) readonly buffer MergedUvBuf   { int   merged_uv[]; };
+layout(std430, binding = 6) coherent buffer UvAccumBuf    { uint  uv_accum[];  };
+layout(std430, binding = 7) coherent buffer BdptOutputBuf { float bdpt_out[];  };
 
 /* image2DArray sensor — image unit binding 7 is a separate namespace from SSBO binding 7 */
 layout(r32ui, binding = 7) coherent volatile uniform uimage2DArray sensor_image;
 
 /* ── Uniforms ────────────────────────────────────────────────────────────── */
-uniform int   n_hits;
+uniform int   n_hits;             /* exact hit count from T1 (replaces CounterBuf read) */
 uniform int   n_bands;
 uniform int   n_mats;
-uniform int   max_children;       /* split point: terminals start at max_children*INTENT_STRIDE in out_buf */
+uniform int   max_children;
 uniform int   max_children_per_hit;
-uniform int   sensor_res;         /* 0 = sensor disabled (always 0; accumulation done CPU-side) */
+uniform int   sensor_res;
 uniform float sensor_pr;
 uniform float sensor_px;
-uniform int   n_uv_groups;        /* number of registered UV integrator groups (0 = none) */
-uniform int   uv_meta_base;       /* index in tri_uv_and_meta[] where group metadata begins */
+uniform int   n_uv_groups;
+uniform int   uv_group_id_base;   /* int index in merged_uv[] where per-tri group IDs start (= n_tris*6) */
+uniform int   uv_meta_base;       /* int index in merged_uv[] where group metadata starts (= n_tris*7) */
 uniform uint  rng_seed;
-uniform int   bdpt_max_verts;     /* cap for BdptVertexBuf; 0 = BDPT disabled */
-uniform int   bdpt_max_spectral;  /* cap for BdptSpectralBuf */
-uniform int   bdpt_max_pdfs;      /* cap for BdptPdfBuf */
+uniform int   bdpt_max_verts;     /* cap for vertex records in BdptOutputBuf; 0 = BDPT disabled */
+uniform int   bdpt_max_spectral;  /* cap for spectral records */
+uniform int   bdpt_max_pdfs;      /* cap for PDF records */
+uniform int   bdpt_count_base;    /* uint index in MetaBuf where BDPT counts live (= 2 + n_mats) */
+uniform int   bdpt_spectral_base; /* float index in bdpt_out[] where spectral records start */
+uniform int   bdpt_pdf_base;      /* float index in bdpt_out[] where PDF records start */
 
 /* ── Hash-based PRNG (xorshift32 + Weyl) ────────────────────────────────── */
 float rand_next(inout uint s) {
@@ -299,6 +293,7 @@ int   hit_medium     (uint b) { return floatBitsToInt(HIT(b,25)); }
 float hit_amp_re(uint b, int band) { return HIT(b, 26 + band); }
 float hit_amp_im(uint b, int band) { return HIT(b, 26 + MAX_BANDS + band); }
 float hit_pathatseg(uint b) { return HIT(b, 13); }
+uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 58)); }
 
 /* ── BDPT emit helpers ───────────────────────────────────────────────────── */
 #define BDPT_VERTEX_STRIDE   28
@@ -316,71 +311,71 @@ void emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, in
                       float soy, float soz)
 {
     if (bdpt_max_verts <= 0) return;
-    uint slot = atomicAdd(bdpt_counters[0], 1u);
+    uint slot = atomicAdd(meta[bdpt_count_base + 0], 1u);
     if (int(slot) >= bdpt_max_verts) return;
     uint vb = slot * uint(BDPT_VERTEX_STRIDE);
-    bdpt_verts[vb +  0] = uintBitsToFloat(sid);
-    bdpt_verts[vb +  1] = uintBitsToFloat(packed_vi);  /* vertex_index<<16 | stream<<8 | sample_domain */
-    bdpt_verts[vb +  2] = uintBitsToFloat(tri_flags_u);
-    bdpt_verts[vb +  3] = 0.0;                         /* strategy_id = 0 */
-    bdpt_verts[vb +  4] = intBitsToFloat(tri_id);
-    bdpt_verts[vb +  5] = intBitsToFloat(-1);           /* group_id = -1 (not computed GPU-side) */
-    bdpt_verts[vb +  6] = intBitsToFloat(mat_id);
-    bdpt_verts[vb +  7] = pos.x;   bdpt_verts[vb +  8] = pos.y;   bdpt_verts[vb +  9] = pos.z;
-    bdpt_verts[vb + 10] = nrm.x;   bdpt_verts[vb + 11] = nrm.y;   bdpt_verts[vb + 12] = nrm.z;
-    bdpt_verts[vb + 13] = dir_in.x; bdpt_verts[vb + 14] = dir_in.y; bdpt_verts[vb + 15] = dir_in.z;
-    bdpt_verts[vb + 16] = 0.0;     bdpt_verts[vb + 17] = 0.0;     bdpt_verts[vb + 18] = 0.0; /* dir_out */
-    bdpt_verts[vb + 19] = path_len;
-    bdpt_verts[vb + 20] = path_at_seg;
-    bdpt_verts[vb + 21] = 0.0;  /* pdf_fwd lives in BdptPdfRecord */
-    bdpt_verts[vb + 22] = 0.0;  /* pdf_rev lives in BdptPdfRecord */
-    bdpt_verts[vb + 23] = 0.0;  /* pdf_area lives in BdptPdfRecord */
-    bdpt_verts[vb + 24] = 0.0;  /* pdf_solid_angle lives in BdptPdfRecord */
-    bdpt_verts[vb + 25] = throughput;
-    bdpt_verts[vb + 26] = soy;
-    bdpt_verts[vb + 27] = soz;
+    bdpt_out[vb +  0] = uintBitsToFloat(sid);
+    bdpt_out[vb +  1] = uintBitsToFloat(packed_vi);
+    bdpt_out[vb +  2] = uintBitsToFloat(tri_flags_u);
+    bdpt_out[vb +  3] = 0.0;
+    bdpt_out[vb +  4] = intBitsToFloat(tri_id);
+    bdpt_out[vb +  5] = intBitsToFloat(-1);
+    bdpt_out[vb +  6] = intBitsToFloat(mat_id);
+    bdpt_out[vb +  7] = pos.x;   bdpt_out[vb +  8] = pos.y;   bdpt_out[vb +  9] = pos.z;
+    bdpt_out[vb + 10] = nrm.x;   bdpt_out[vb + 11] = nrm.y;   bdpt_out[vb + 12] = nrm.z;
+    bdpt_out[vb + 13] = dir_in.x; bdpt_out[vb + 14] = dir_in.y; bdpt_out[vb + 15] = dir_in.z;
+    bdpt_out[vb + 16] = 0.0;     bdpt_out[vb + 17] = 0.0;     bdpt_out[vb + 18] = 0.0;
+    bdpt_out[vb + 19] = path_len;
+    bdpt_out[vb + 20] = path_at_seg;
+    bdpt_out[vb + 21] = 0.0;
+    bdpt_out[vb + 22] = 0.0;
+    bdpt_out[vb + 23] = 0.0;
+    bdpt_out[vb + 24] = 0.0;
+    bdpt_out[vb + 25] = throughput;
+    bdpt_out[vb + 26] = soy;
+    bdpt_out[vb + 27] = soz;
 }
 
 void emit_bdpt_spectral(uint sid, uint vi_band, float re, float im, float band_pdf)
 {
     if (bdpt_max_spectral <= 0) return;
-    uint slot = atomicAdd(bdpt_counters[1], 1u);
+    uint slot = atomicAdd(meta[bdpt_count_base + 1], 1u);
     if (int(slot) >= bdpt_max_spectral) return;
-    uint sb = slot * uint(BDPT_SPECTRAL_STRIDE);
-    bdpt_spectral[sb + 0] = uintBitsToFloat(sid);
-    bdpt_spectral[sb + 1] = uintBitsToFloat(vi_band);  /* vertex_index<<16 | band_id */
-    bdpt_spectral[sb + 2] = re;
-    bdpt_spectral[sb + 3] = im;
-    bdpt_spectral[sb + 4] = 0.0;      /* wavelength_or_center (not available GPU-side) */
-    bdpt_spectral[sb + 5] = band_pdf;
-    bdpt_spectral[sb + 6] = 1.0;      /* sensor_rgb_weight */
-    bdpt_spectral[sb + 7] = 0.0;      /* pad */
+    uint sb = uint(bdpt_spectral_base) + slot * uint(BDPT_SPECTRAL_STRIDE);
+    bdpt_out[sb + 0] = uintBitsToFloat(sid);
+    bdpt_out[sb + 1] = uintBitsToFloat(vi_band);
+    bdpt_out[sb + 2] = re;
+    bdpt_out[sb + 3] = im;
+    bdpt_out[sb + 4] = 0.0;
+    bdpt_out[sb + 5] = band_pdf;
+    bdpt_out[sb + 6] = 1.0;
+    bdpt_out[sb + 7] = 0.0;
 }
 
 void emit_bdpt_pdf(uint sid, uint vi, uint domain, float pdf_fwd, float pdf_rev,
                    uint flags, vec3 nrm, vec3 dir_in, vec3 dir_out)
 {
     if (sid == 0u || bdpt_max_pdfs <= 0) return;
-    uint slot = atomicAdd(bdpt_counters[2], 1u);
+    uint slot = atomicAdd(meta[bdpt_count_base + 2], 1u);
     if (int(slot) >= bdpt_max_pdfs) return;
 
     float cos_in  = max(0.0, -dot(dir_in, nrm));
     float cos_out = max(0.0,  dot(dir_out, nrm));
     uint packed_vm = ((domain & 0xFFu) << 16) | ((domain & 0xFFu) << 24) | (vi & 0xFFFFu);
 
-    uint pb = slot * uint(BDPT_PDF_STRIDE);
-    bdpt_pdfs[pb +  0] = uintBitsToFloat(sid);
-    bdpt_pdfs[pb +  1] = uintBitsToFloat(packed_vm);  /* vertex_index | sample_domain | measure */
-    bdpt_pdfs[pb +  2] = pdf_fwd;
-    bdpt_pdfs[pb +  3] = pdf_rev;
-    bdpt_pdfs[pb +  4] = 0.0;       /* pdf_area */
-    bdpt_pdfs[pb +  5] = pdf_fwd;   /* pdf_solid_angle */
-    bdpt_pdfs[pb +  6] = 1.0;       /* jacobian_det */
-    bdpt_pdfs[pb +  7] = cos_in * cos_out;
-    bdpt_pdfs[pb +  8] = uintBitsToFloat(flags);
-    bdpt_pdfs[pb +  9] = 0.0;
-    bdpt_pdfs[pb + 10] = 0.0;
-    bdpt_pdfs[pb + 11] = 0.0;
+    uint pb = uint(bdpt_pdf_base) + slot * uint(BDPT_PDF_STRIDE);
+    bdpt_out[pb +  0] = uintBitsToFloat(sid);
+    bdpt_out[pb +  1] = uintBitsToFloat(packed_vm);
+    bdpt_out[pb +  2] = pdf_fwd;
+    bdpt_out[pb +  3] = pdf_rev;
+    bdpt_out[pb +  4] = 0.0;
+    bdpt_out[pb +  5] = pdf_fwd;
+    bdpt_out[pb +  6] = 1.0;
+    bdpt_out[pb +  7] = cos_in * cos_out;
+    bdpt_out[pb +  8] = uintBitsToFloat(flags);
+    bdpt_out[pb +  9] = 0.0;
+    bdpt_out[pb + 10] = 0.0;
+    bdpt_out[pb + 11] = 0.0;
 }
 
 /* ── Triangle accessors (TRI_FULL_STRIDE = 16, matches T1/T2 buffer) ──────── */
@@ -398,7 +393,7 @@ vec3  tri_normal (int t) { return vec3(tris[t * TRI_FULL_STRIDE + 9],
  * Terminals are packed at out_buf[max_children*INTENT_STRIDE + slot*TERMINAL_STRIDE]. */
 void write_terminal(uint slot, uint hbase, bool is_emissive) {
     uint tbase = uint(max_children) * uint(INTENT_STRIDE) + slot * uint(TERMINAL_STRIDE);
-    for (int i = 0; i < REFINED_HIT_STRIDE; i++)
+    for (int i = 0; i < TERMINAL_STRIDE; i++)   /* copy 58 floats; hit[58]=bdpt_sid not needed */
         out_buf[tbase + i] = hits[hbase + i];
     out_buf[tbase + 25] = uintBitsToFloat(is_emissive ? 1u : 0u);
 }
@@ -443,7 +438,7 @@ void write_intent(uint slot,
 /* ── Main ────────────────────────────────────────────────────────────────── */
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    if (int(gid) >= int(t1_counters[0])) return;  /* t1_counters[0] = T1 hit count */
+    if (int(gid) >= n_hits) return;
 
     uint hbase = gid * uint(REFINED_HIT_STRIDE);
     uint rng   = rng_init(gid);
@@ -477,7 +472,7 @@ void main() {
     /* ── BDPT vertex and spectral weight emission ───────────────────────────
      * Emitted for every hit where bdpt_subpath_id != 0, before any early exits,
      * so terminal and scatter paths are both recorded. */
-    uint bdpt_sid = bdpt_ids[gid];
+    uint bdpt_sid = hit_bdpt_sid(hbase);
     if (bdpt_sid != 0u && bdpt_max_verts > 0) {
         uint vi         = uint(bounce) & 0xFFFFu;
         uint stream_bit = (cflag == 1u) ? 1u : 0u;  /* 1=SENSOR, 0=LIGHT */
@@ -537,10 +532,10 @@ void main() {
      *   [11+4B..11+5B-1] sensor/reverse magnitude ×65536
      * Total channels = 11 + 5*n_bands. */
     if (n_uv_groups > 0 && tri_idx >= 0) {
-        int uv_gid = tri_uv_and_meta[tri_idx];
+        int uv_gid = merged_uv[uv_group_id_base + tri_idx];
         if (uv_gid >= 0 && uv_gid < n_uv_groups) {
-            int res    = tri_uv_and_meta[uv_meta_base + uv_gid * 2 + 0];
-            int offset = tri_uv_and_meta[uv_meta_base + uv_gid * 2 + 1];
+            int res    = merged_uv[uv_meta_base + uv_gid * 2 + 0];
+            int offset = merged_uv[uv_meta_base + uv_gid * 2 + 1];
             if (res > 0) {
                 int tb = tri_idx * TRI_FULL_STRIDE;
                 vec3 v0 = vec3(tris[tb + 0], tris[tb + 1], tris[tb + 2]);
@@ -557,10 +552,10 @@ void main() {
                 float bv   = (det > 1.0e-20) ? (e1e1 * de2 - e1e2 * de1) / det : 0.0;
                 bu = clamp(bu, 0.0, 1.0);
                 bv = clamp(bv, 0.0, 1.0 - bu);
-                int uvb = tri_idx * 6;
-                vec2 uv0 = vec2(tri_uv[uvb + 0], tri_uv[uvb + 1]);
-                vec2 uv1 = vec2(tri_uv[uvb + 2], tri_uv[uvb + 3]);
-                vec2 uv2 = vec2(tri_uv[uvb + 4], tri_uv[uvb + 5]);
+                int uvb = tri_idx * 6;  /* into merged_uv[] UV coord section */
+                vec2 uv0 = vec2(intBitsToFloat(merged_uv[uvb + 0]), intBitsToFloat(merged_uv[uvb + 1]));
+                vec2 uv1 = vec2(intBitsToFloat(merged_uv[uvb + 2]), intBitsToFloat(merged_uv[uvb + 3]));
+                vec2 uv2 = vec2(intBitsToFloat(merged_uv[uvb + 4]), intBitsToFloat(merged_uv[uvb + 5]));
                 vec2 uv  = uv0 + bu * (uv1 - uv0) + bv * (uv2 - uv0);
                 int ix    = clamp(int(uv.x * float(res)), 0, res - 1);
                 int iy    = clamp(int(uv.y * float(res)), 0, res - 1);

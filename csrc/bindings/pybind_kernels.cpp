@@ -2641,6 +2641,30 @@ struct PyRayTracer
                 "ray_tracer_set_sensor_film_ssbo failed: rc=" + std::to_string(rc));
     }
 
+    void set_surface_chunks(
+        py::array_t<float, py::array::c_style | py::array::forcecast> pbr,
+        py::array_t<float, py::array::c_style | py::array::forcecast> enamel,
+        py::array_t<float, py::array::c_style | py::array::forcecast> tex_stack)
+    {
+        auto pb = pbr.request();
+        auto en = enamel.request();
+        auto tx = tex_stack.request();
+        if (pb.ndim != 2 || pb.shape[1] != 16)
+            throw std::runtime_error("set_surface_chunks: pbr must be (N,16) float32");
+        if (en.ndim != 2 || en.shape[1] != 8)
+            throw std::runtime_error("set_surface_chunks: enamel must be (N,8) float32");
+        if (tx.ndim != 2 || tx.shape[1] != 16)
+            throw std::runtime_error("set_surface_chunks: tex_stack must be (N,16) float32");
+        int rc = ray_tracer_set_surface_chunks(
+            handle,
+            static_cast<const float*>(pb.ptr), static_cast<int>(pb.shape[0]),
+            static_cast<const float*>(en.ptr), static_cast<int>(en.shape[0]),
+            static_cast<const float*>(tx.ptr), static_cast<int>(tx.shape[0]));
+        if (rc != SK_OK)
+            throw std::runtime_error(
+                "ray_tracer_set_surface_chunks failed: rc=" + std::to_string(rc));
+    }
+
     py::dict get_camera_visibility() const
     {
         py::dict d;
@@ -5024,6 +5048,25 @@ film_chunk   : float32 (rows, stride)  — SensorFilmDatabase film tensor
 active_slots : int32 (n_slots, 2) or sequence of (sensor_id, film_id)
 
 The tracer deep-copies all inputs; caller buffers can be discarded after return.
+)doc")
+                .def("set_surface_chunks", &PyRayTracer::set_surface_chunks,
+                         py::arg("pbr"),
+                         py::arg("enamel"),
+                         py::arg("tex_stack"),
+                         R"doc(
+Upload PBR, enamel, and texture-stack material chunks and rebuild the
+RtMaterialSurfaceCache for GGX / thin-film BDPT lobes.
+
+pbr       : float32 (N, 16)  — PBRBaseRecord per material (albedo, roughness,
+            metallic, transmission, ior, opacity, emission_rgb)
+enamel    : float32 (N,  8)  — EnamelRecord per material (thickness_nm, ior_real,
+            ior_imag, roughness, tint_rgb)
+tex_stack : float32 (N, 16)  — TextureStackRecord per material; [11] = profile_id
+            (0=standard, 1=emissive, 2=SSS, 3=frosted scatter)
+
+All three arrays must have N equal to mat_n_mats used at construction time.
+The tracer deep-copies all inputs.  Call after construction and after any
+material-database change.
 )doc")
                 .def("get_camera_visibility", &PyRayTracer::get_camera_visibility,
                          "Return current camera visibility policy as a dict.")

@@ -719,6 +719,27 @@ SK_API int ray_tracer_set_sensor_film_ssbo(
 );
 
 /**
+ * Upload PBR / enamel / texture-stack material chunks and rebuild the
+ * RtMaterialSurfaceCache held inside RayTracerState.
+ *
+ * pbr_chunk       : float32 (n_pbr,   16) — PBRBaseRecord layout per material
+ * enamel_chunk    : float32 (n_enamel,  8) — EnamelRecord layout per material
+ * tex_stack_chunk : float32 (n_tex,   16) — TextureStackRecord layout per material
+ *
+ * Pass NULL / 0 for any chunk to clear it (defaults used in the cache).
+ * Returns SK_OK on success, SK_ERR_NULL_STATE if st is NULL.
+ */
+SK_API int ray_tracer_set_surface_chunks(
+    RayTracerState* st,
+    const float*    pbr_chunk,
+    int             n_pbr,
+    const float*    enamel_chunk,
+    int             n_enamel,
+    const float*    tex_stack_chunk,
+    int             n_tex
+);
+
+/**
  * Per-slot summary emitted by endpoint-record reduction into sensor/film data.
  *
  * The reduction uses the tracer-owned sensor/film slot tensors previously

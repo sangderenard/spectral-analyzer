@@ -48,6 +48,7 @@
  *    [25]     medium_mat_idx  (intBitsToFloat)
  *    [26..41] amp_re[MAX_GPU_BANDS]  (after amplitude propagation)
  *    [42..57] amp_im[MAX_GPU_BANDS]
+ *    [58]     bdpt_subpath_id (uintBitsToFloat; 0=untracked)
  *
  *  BvhBuf  (BVH_NODE_STRIDE = 10 floats):
  *    [0..2] lo xyz   [3..5] hi xyz
@@ -87,7 +88,7 @@ layout(local_size_x = 64) in;
 /* ── Binding constants ──────────────────────────────────────────────────── */
 #define MAX_GPU_BANDS     16
 #define INTENT_STRIDE     52      /* 20 + 2*MAX_GPU_BANDS */
-#define HIT_STRIDE        58      /* 26 + 2*MAX_GPU_BANDS */
+#define HIT_STRIDE        59      /* 26 + 2*MAX_GPU_BANDS + 1 (bdpt_sid at [58]) */
 #define BVH_NODE_STRIDE   10
 #define TRI_FULL_STRIDE   16
 #define MAT_BAND_STRIDE   12
@@ -115,9 +116,7 @@ layout(std430, binding = 4) readonly buffer TriIdBuf   { int   tri_ids[];  };
 layout(std430, binding = 5) readonly buffer TriFullBuf { float trifull[];  };
 layout(std430, binding = 6) readonly buffer MatBandBuf { float mat_bands[];};
 layout(std430, binding = 7) readonly buffer SceneBandBuf{ float scene_bands[];};
-/* BDPT: one uint32 per hit slot carrying bdpt_subpath_id, written to BdptIdBuf
- * at the same index as the hit record.  T3 reads it to emit BdptVertexRecord. */
-layout(std430, binding = 9) coherent buffer BdptIdBuf   { uint  bdpt_ids[];   };
+/* bdpt_subpath_id is written to hit[58] (as uintBitsToFloat) — no extra binding needed. */
 
 /* Wave arenas passed as uniform array (max 16 arenas × 4 floats each).
  * Avoids needing binding slots beyond 7. */
@@ -345,8 +344,6 @@ void main() {
 
     /* ── Write hit record to HitBuf ─────────────────────────────────────── */
     uint out_idx = atomicAdd(counters[0], 1u);
-    /* Store bdpt_subpath_id at the same slot index so T3 can read via gid. */
-    bdpt_ids[out_idx] = bdpt_sid;
     int ob = int(out_idx) * HIT_STRIDE;
 
     hit_wf(ob, 0, hit_pos.x);  hit_wf(ob, 1, hit_pos.y);  hit_wf(ob, 2, hit_pos.z);
@@ -372,6 +369,8 @@ void main() {
         hit_wf(ob, 26 + b,              amp_re[b]);
         hit_wf(ob, 26 + MAX_GPU_BANDS + b, amp_im[b]);
     }
+    /* bdpt_subpath_id embedded at hit[58] (last slot) so T3 needs no extra binding. */
+    hit_wu(ob, 58, bdpt_sid);
 
     /* ── Wave intent counter (C++ dispatcher routes these to Q_wave) ─────── */
     if (wave_arena_id >= 0)

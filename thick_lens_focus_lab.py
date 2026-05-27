@@ -4567,6 +4567,12 @@ class ForwardCppLensBench:
             speed_m_s=float(C_LIGHT),
             atmo_abs=np.zeros_like(self.freq_hz, dtype=np.float64),
         )
+        # tensors was built from db.build_tensors() earlier in this method
+        self.tracer.set_surface_chunks(
+            pbr=np.ascontiguousarray(tensors["pbr"], dtype=np.float32),
+            enamel=np.ascontiguousarray(tensors["enamel"], dtype=np.float32),
+            tex_stack=np.ascontiguousarray(tensors["texture_stack"], dtype=np.float32),
+        )
         self._configure_sensor_film_pipeline()
 
         # Drive forward tracing from authored emissive source geometry.

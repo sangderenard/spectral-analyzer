@@ -503,6 +503,33 @@ struct MatSpectralCache {
     std::vector<int>    reactive_dst_band; /* [mat * n_bands + b] */
 };
 
+/* ── Per-scene PBR / enamel / texture-stack surface cache ────────────────────
+ * Populated by rt_build_surf_cache() from pbr_chunk (N×16), enamel_chunk (N×8)
+ * and tex_stack_chunk (N×16) after ray_tracer_set_surface_chunks().
+ *
+ * PBR layout (16 floats):  [0..2]=albedo, [3]=roughness, [4]=metallic,
+ *   [5]=transmission, [6]=ior, [7]=opacity, [8..10]=emission_rgb, [11..15]=_pad
+ * Enamel layout (8 floats): [0]=thickness_nm, [1]=ior_real, [2]=ior_imag,
+ *   [3]=roughness, [4..6]=tint_rgb, [7]=_pad
+ * TextureStack layout (16 floats): [11]=profile_id (float-encoded uint)
+ *   profile_id: 0=standard, 1=emissive, 2=SSS, 3=frosted scatter
+ */
+struct RtMaterialSurfaceCache {
+    int n_mats = 0;
+    std::vector<float>    roughness;           /* [mat]    GGX alpha          */
+    std::vector<float>    metallic;            /* [mat]    conductor weight   */
+    std::vector<float>    transmission;        /* [mat]    bulk transmittance */
+    std::vector<float>    opacity;             /* [mat]    1 - transparency   */
+    std::vector<float>    albedo;              /* [mat*3]  base RGB           */
+    std::vector<float>    f0;                  /* [mat*3]  Schlick F0         */
+    std::vector<float>    enamel_thickness_nm; /* [mat]    0 = no coating     */
+    std::vector<float>    enamel_ior_real;     /* [mat]                       */
+    std::vector<float>    enamel_ior_imag;     /* [mat]                       */
+    std::vector<float>    enamel_roughness;    /* [mat]                       */
+    std::vector<float>    enamel_tint;         /* [mat*3]                     */
+    std::vector<uint32_t> profile_id;          /* [mat]                       */
+};
+
 struct RayTracerState {
     std::vector<Triangle>       tris;
     std::vector<BVHNode>        bvh_nodes;
@@ -519,7 +546,12 @@ struct RayTracerState {
      * shared with material_db.py / mat_flags.py / GLSL shaders. */
     std::vector<float>          mat_buf;
     int                         mat_n_mats = 0;
-    MatSpectralCache            mat_cache; /* precomputed hot-path mat lookups */
+    MatSpectralCache            mat_cache;     /* precomputed spectral lookups */
+    /* ── PBR / enamel / texture-stack chunks (set via ray_tracer_set_surface_chunks) ─ */
+    std::vector<float>          pbr_chunk;       /* (mat_n_mats, 16) PBRBaseRecord   */
+    std::vector<float>          enamel_chunk;    /* (mat_n_mats,  8) EnamelRecord    */
+    std::vector<float>          tex_stack_chunk; /* (mat_n_mats, 16) TextureStack    */
+    RtMaterialSurfaceCache      surf_cache;      /* precomputed GGX/enamel lookups   */
     std::vector<RtScaleContext> scale_contexts; /* multi-scale zones, smallest-radius-first */
     double                      speed_m_s = 343.0; /* cached for context k scaling */
     Eigen::VectorXd             freq_hz_vec; /* cached for context k scaling */
@@ -897,6 +929,65 @@ static void rt_build_mat_cache(RayTracerState& st)
                 }
                 c.reactive_dst_band[m * nb + b] = best;
             }
+        }
+    }
+}
+
+/* Populate / refresh the RtMaterialSurfaceCache from pbr_chunk / enamel_chunk /
+ * tex_stack_chunk.  Safe to call when chunks are empty (produces defaults). */
+static void rt_build_surf_cache(RayTracerState& st)
+{
+    RtMaterialSurfaceCache& c = st.surf_cache;
+    const int nm = st.mat_n_mats;
+    c.n_mats = nm;
+    if (nm <= 0) return;
+
+    c.roughness.assign(nm, 0.5f);
+    c.metallic.assign(nm, 0.0f);
+    c.transmission.assign(nm, 0.0f);
+    c.opacity.assign(nm, 1.0f);
+    c.albedo.assign(nm * 3, 0.5f);
+    c.f0.assign(nm * 3, 0.04f);
+    c.enamel_thickness_nm.assign(nm, 0.0f);
+    c.enamel_ior_real.assign(nm, 1.5f);
+    c.enamel_ior_imag.assign(nm, 0.0f);
+    c.enamel_roughness.assign(nm, 0.0f);
+    c.enamel_tint.assign(nm * 3, 1.0f);
+    c.profile_id.assign(nm, 0u);
+
+    const bool have_pbr    = (int)st.pbr_chunk.size()       >= nm * 16;
+    const bool have_enamel = (int)st.enamel_chunk.size()    >= nm * 8;
+    const bool have_tex    = (int)st.tex_stack_chunk.size() >= nm * 16;
+
+    for (int m = 0; m < nm; ++m) {
+        if (have_pbr) {
+            const float* p = st.pbr_chunk.data() + m * 16;
+            c.albedo[m*3+0]   = p[0]; c.albedo[m*3+1] = p[1]; c.albedo[m*3+2] = p[2];
+            c.roughness[m]    = p[3];
+            c.metallic[m]     = p[4];
+            c.transmission[m] = p[5];
+            const float ior   = (p[6] > 0.f) ? p[6] : 1.5f;
+            c.opacity[m]      = p[7];
+            /* Schlick F0 = mix(vec3(ior_f0), albedo, metallic) */
+            const float denom = ior + 1.f;
+            const float ior_f0 = (ior - 1.f) / denom * ((ior - 1.f) / denom);
+            const float ml = c.metallic[m];
+            for (int ch = 0; ch < 3; ++ch)
+                c.f0[m*3+ch] = ior_f0 * (1.f - ml) + c.albedo[m*3+ch] * ml;
+        }
+        if (have_enamel) {
+            const float* e = st.enamel_chunk.data() + m * 8;
+            c.enamel_thickness_nm[m] = e[0];
+            c.enamel_ior_real[m]     = e[1];
+            c.enamel_ior_imag[m]     = e[2];
+            c.enamel_roughness[m]    = e[3];
+            c.enamel_tint[m*3+0]     = e[4];
+            c.enamel_tint[m*3+1]     = e[5];
+            c.enamel_tint[m*3+2]     = e[6];
+        }
+        if (have_tex) {
+            const float* t = st.tex_stack_chunk.data() + m * 16;
+            c.profile_id[m] = static_cast<uint32_t>(t[11]);
         }
     }
 }
@@ -3937,6 +4028,39 @@ int ray_tracer_set_sensor_film_ssbo(
         st->sensor_film_active_slots.assign(active_slots, active_slots + slot_count);
     }
     st->sensor_film_n_slots = n_slots;
+    return SK_OK;
+}
+
+/* Upload PBR / enamel / texture-stack material chunks and rebuild the
+ * RtMaterialSurfaceCache.  Each chunk must have exactly mat_n_mats rows.
+ * Pass NULL / 0 for any chunk to clear it (defaults are used in the cache). */
+int ray_tracer_set_surface_chunks(
+    RayTracerState* st,
+    const float*    pbr_chunk,
+    int             n_pbr,
+    const float*    enamel_chunk,
+    int             n_enamel,
+    const float*    tex_stack_chunk,
+    int             n_tex)
+{
+    if (!st) return SK_ERR_NULL_STATE;
+
+    if (pbr_chunk && n_pbr > 0)
+        st->pbr_chunk.assign(pbr_chunk, pbr_chunk + (size_t)n_pbr * 16);
+    else
+        st->pbr_chunk.clear();
+
+    if (enamel_chunk && n_enamel > 0)
+        st->enamel_chunk.assign(enamel_chunk, enamel_chunk + (size_t)n_enamel * 8);
+    else
+        st->enamel_chunk.clear();
+
+    if (tex_stack_chunk && n_tex > 0)
+        st->tex_stack_chunk.assign(tex_stack_chunk, tex_stack_chunk + (size_t)n_tex * 16);
+    else
+        st->tex_stack_chunk.clear();
+
+    rt_build_surf_cache(*st);
     return SK_OK;
 }
 
@@ -7398,9 +7522,11 @@ public:
         uloc_t2 = {-1,-1,-1,-1};
     struct { GLint n_bands, n_mats, max_children, max_children_per_hit,
                    sensor_res, sensor_pr, sensor_px,
-                   n_uv_groups, uv_meta_base, rng_seed,
-                   bdpt_max_verts, bdpt_max_spectral, bdpt_max_pdfs; }
-        uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+                   n_uv_groups, uv_group_id_base, uv_meta_base, rng_seed,
+                   bdpt_max_verts, bdpt_max_spectral, bdpt_max_pdfs,
+                   bdpt_count_base, bdpt_spectral_base, bdpt_pdf_base,
+                   n_hits; }
+        uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     struct { GLint mode, nx, ny, n_bands, dx, dz, wavelengths; }
         uloc_t4 = {-1,-1,-1,-1,-1,-1,-1};
 
@@ -7429,20 +7555,18 @@ public:
      * Only [0] and [1] are zeroed before each dispatch; eps_flags are written
      * at scene-upload time and persist across dispatches. */
     GLuint ssbo_t3_meta     = 0;
-    /* BDPT side-data SSBOs: one uint32 per hit (subpath id) + output record buffers */
-    GLuint ssbo_bdpt_ids      = 0;  /* uint32 per hit: bdpt_subpath_id from T1 */
-    GLuint ssbo_bdpt_verts    = 0;  /* float32: BdptVertexRecord output (28 floats each) */
-    GLuint ssbo_bdpt_spectral = 0;  /* float32: BdptSpectralWeightRecord output (8 floats each) */
-    GLuint ssbo_bdpt_pdfs     = 0;  /* float32: BdptPdfRecord output (12 floats each) */
-    GLuint ssbo_bdpt_counters = 0;  /* uint32[3]: [0]=vertex_count, [1]=spectral_count, [2]=pdf_count */
-    int    cap_bdpt_verts     = 0;
-    int    cap_bdpt_spectral  = 0;
-    int    cap_bdpt_pdfs      = 0;
-    /* UV integrator image: per-tri UV data + per-tri group mapping,
-     * per-group metadata, and the flat atomic accumulator. */
-    GLuint ssbo_tri_uv          = 0;  /* binding 5: n_tris*6 float32 UV vertex coords         */
-    GLuint ssbo_tri_uv_and_meta = 0;  /* binding 6: [n_tris group-ids] ++ [n_groups*2 meta]   */
-    GLuint ssbo_uv_accum        = 0;  /* binding 7: flat uint32 accumulator                   */
+    /* BDPT output: single SSBO (verts first, then spectral at bdpt_spectral_base floats in,
+     * then pdfs at bdpt_pdf_base floats in).  Counts live in MetaBuf at [2+n_mats..2+n_mats+2].
+     * bdpt_sid is embedded in hit[58] by T1 — no separate id SSBO needed. */
+    GLuint ssbo_bdpt_output   = 0;
+    int    cap_bdpt_output    = 0;  /* in floats */
+    /* UV integrator image: merged_uv int32 SSBO at binding 5 contains:
+     *   [0 .. n_tris*6)            UV vertex coords as floatBitsToInt (6 per tri)
+     *   [n_tris*6 .. n_tris*7)     per-tri UV group IDs (int; -1=no group)
+     *   [n_tris*7 .. )             group metadata (2 ints each: res, accum_offset)
+     * UvAccumBuf at binding 6; BdptOutputBuf at binding 7. */
+    GLuint ssbo_merged_uv  = 0;  /* binding 5: merged UV coords + group IDs + meta */
+    GLuint ssbo_uv_accum   = 0;  /* binding 6: flat uint32 accumulator             */
     /* T4 BPM wave field */
     GLuint ssbo_wave_re     = 0;
     GLuint ssbo_wave_im     = 0;
@@ -7657,7 +7781,12 @@ public:
         char err[1024];
         auto load = [&](const std::string& name, GLuint& prog) -> bool {
             std::string path = resolve_shader(shader_dir, name);
-            FILE* f = fopen(path.c_str(), "rb");
+            FILE* f = nullptr;
+#ifdef _MSC_VER
+            fopen_s(&f, path.c_str(), "rb");
+#else
+            f = fopen(path.c_str(), "rb");
+#endif
             if (!f) { snprintf(err, sizeof(err), "Cannot open %s", path.c_str()); return false; }
             fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
             std::string src(static_cast<size_t>(sz), '\0');
@@ -7666,10 +7795,10 @@ public:
             return prog != 0;
         };
 
-        if (!load("ray_bvh_intersect.comp.glsl", prog_t1)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
-        if (!load("ray_refine.comp.glsl",        prog_t2)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
-        if (!load("ray_material.comp.glsl",      prog_t3)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
-        if (!load("ray_wave_bpm.comp.glsl",      prog_t4)) { ctx.error[0] = '\0'; strncpy(ctx.error, err, sizeof(ctx.error)-1); return false; }
+        if (!load("ray_bvh_intersect.comp.glsl", prog_t1)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("ray_refine.comp.glsl",        prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("ray_material.comp.glsl",      prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("ray_wave_bpm.comp.glsl",      prog_t4)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
 
         /* Load UV blit shader — non-fatal, falls back to CPU path silently */
         if (display_context_shared) {
@@ -7707,11 +7836,16 @@ public:
         uloc_t3.sensor_pr            = glc_GetUniformLocation(prog_t3, "sensor_pr");
         uloc_t3.sensor_px            = glc_GetUniformLocation(prog_t3, "sensor_px");
         uloc_t3.n_uv_groups          = glc_GetUniformLocation(prog_t3, "n_uv_groups");
+        uloc_t3.uv_group_id_base     = glc_GetUniformLocation(prog_t3, "uv_group_id_base");
         uloc_t3.uv_meta_base         = glc_GetUniformLocation(prog_t3, "uv_meta_base");
         uloc_t3.rng_seed             = glc_GetUniformLocation(prog_t3, "rng_seed");
         uloc_t3.bdpt_max_verts       = glc_GetUniformLocation(prog_t3, "bdpt_max_verts");
         uloc_t3.bdpt_max_spectral    = glc_GetUniformLocation(prog_t3, "bdpt_max_spectral");
         uloc_t3.bdpt_max_pdfs        = glc_GetUniformLocation(prog_t3, "bdpt_max_pdfs");
+        uloc_t3.bdpt_count_base      = glc_GetUniformLocation(prog_t3, "bdpt_count_base");
+        uloc_t3.bdpt_spectral_base   = glc_GetUniformLocation(prog_t3, "bdpt_spectral_base");
+        uloc_t3.bdpt_pdf_base        = glc_GetUniformLocation(prog_t3, "bdpt_pdf_base");
+        uloc_t3.n_hits               = glc_GetUniformLocation(prog_t3, "n_hits");
 
         uloc_t4.mode        = glc_GetUniformLocation(prog_t4, "mode");
         uloc_t4.nx          = glc_GetUniformLocation(prog_t4, "nx");
@@ -7822,12 +7956,14 @@ public:
          * eps_flags are written here and survive across dispatches. */
         {
             const int nm2 = std::max(1, st.mat_n_mats);  /* at least 1 so the SSBO is non-empty */
-            std::vector<uint32_t> meta(2 + nm2, 0u);
+            /* +3 tail slots: [2+nm2..2+nm2+2] = bdpt_vert_count, bdpt_spectral_count, bdpt_pdf_count.
+             * Zeroed before each dispatch; eps_flags [2..2+nm2) persist across dispatches. */
+            std::vector<uint32_t> meta(2 + nm2 + 3, 0u);
             const auto& ef = ps.mat_epsilon_flags;
             for (int i = 0; i < nm2 && i < (int)ef.size(); ++i)
                 meta[2 + i] = ef[i] ? 1u : 0u;
             upload_ssbo(ssbo_t3_meta, meta.data(),
-                        (GLsizeiptr)((2 + nm2) * sizeof(uint32_t)));
+                        (GLsizeiptr)((2 + nm2 + 3) * sizeof(uint32_t)));
         }
 
         {
@@ -7844,33 +7980,39 @@ public:
         }
 
         /* UV integrator image SSBOs.
-         * These are uploaded once at scene-upload time; ssbo_uv_accum is the
-         * only one that changes (GPU atomicAdds during T3) and is readback +
-         * zeroed after every T3 dispatch.                                     */
+         * MergedUvBuf (binding 5) layout: [n_tris*6 UV coords as int-bits] ++
+         *   [n_tris group-ids (int)] ++ [n_groups*2 meta ints].
+         * ssbo_uv_accum (binding 6) is zeroed after each T3 dispatch. */
         {
-            const int nt_uv = (int)st.tri_uv_data.size() / 6;
-            if (nt_uv > 0 && !st.tri_uv_group_of_tri.empty()) {
-                upload_ssbo(ssbo_tri_uv, st.tri_uv_data.data(),
-                            (GLsizeiptr)(st.tri_uv_data.size() * sizeof(float)));
-            } else {
-                float stub_f = 0.0f; upload_ssbo(ssbo_tri_uv, &stub_f, sizeof(float));
-            }
-
-            /* Merged buffer at binding 6: [n_tris group-ids] ++ [n_groups*2 meta ints].
-             * Build it unconditionally so the binding is always valid. */
-            {
-                const size_t n_id = st.tri_uv_group_of_tri.size();
-                const int    ng   = (int)st.group_uv_res.size();
-                std::vector<int32_t> merged(std::max((size_t)1, n_id + (size_t)ng * 2), -1);
-                for (size_t i = 0; i < n_id; ++i)
-                    merged[i] = st.tri_uv_group_of_tri[i];
-                for (int g = 0; g < ng; ++g) {
-                    merged[n_id + (size_t)g * 2 + 0] = st.group_uv_res[(size_t)g];
-                    merged[n_id + (size_t)g * 2 + 1] = st.group_uv_accum_offset[(size_t)g];
+            const int nt     = (int)st.tris.size();
+            const int nt_uv  = (int)st.tri_uv_data.size() / 6;  /* tris with UV data */
+            const int ng     = (int)st.group_uv_res.size();
+            const size_t n_coord_ints = (size_t)nt * 6;
+            const size_t n_id_ints    = (size_t)nt;
+            const size_t n_meta_ints  = (size_t)ng * 2;
+            const size_t total        = std::max((size_t)1,
+                                                 n_coord_ints + n_id_ints + n_meta_ints);
+            std::vector<int32_t> merged(total, -1);
+            /* Section 1: UV vertex coords as floatBitsToInt, stride 6 per tri */
+            for (int i = 0; i < nt_uv && i < nt; ++i) {
+                for (int c = 0; c < 6; ++c) {
+                    float fv = st.tri_uv_data[static_cast<size_t>(i) * 6 + c];
+                    int32_t iv;
+                    static_assert(sizeof(float) == sizeof(int32_t), "size mismatch");
+                    std::memcpy(&iv, &fv, sizeof(int32_t));
+                    merged[static_cast<size_t>(i) * 6 + c] = iv;
                 }
-                upload_ssbo(ssbo_tri_uv_and_meta, merged.data(),
-                            (GLsizeiptr)(merged.size() * sizeof(int32_t)));
             }
+            /* Section 2: per-tri UV group IDs */
+            for (size_t i = 0; i < st.tri_uv_group_of_tri.size(); ++i)
+                merged[n_coord_ints + i] = st.tri_uv_group_of_tri[i];
+            /* Section 3: group metadata (res, accum_offset pairs) */
+            for (int g = 0; g < ng; ++g) {
+                merged[n_coord_ints + n_id_ints + (size_t)g * 2 + 0] = st.group_uv_res[(size_t)g];
+                merged[n_coord_ints + n_id_ints + (size_t)g * 2 + 1] = st.group_uv_accum_offset[(size_t)g];
+            }
+            upload_ssbo(ssbo_merged_uv, merged.data(),
+                        (GLsizeiptr)(total * sizeof(int32_t)));
 
             /* Accumulator (binding 7): allocate to match CPU side; zero-init once. */
             const int n_accum = st.uv_accum_total;
@@ -7950,7 +8092,10 @@ public:
         }
         const RayTracerState& st = *ps.st;
         const int n_uv_groups  = (int)st.group_uv_res.size();
-        const int uv_meta_base = (int)st.tri_uv_group_of_tri.size();
+        /* MergedUvBuf section 3 (group metadata) starts at index n_tris*7.
+         * The uv_blit shader reads uv_meta[uv_meta_base + g*2 + {0,1}]. */
+        const int n_tris_blit  = (int)st.tris.size();
+        const int uv_meta_base = n_tris_blit * 7;
         const int nb           = (blit_n_bands_stored > 0) ? blit_n_bands_stored : st.n_bands;
         const int res          = blit_res;
         const GLuint tex       = tex_uv_pages[(size_t)slot];
@@ -7959,9 +8104,9 @@ public:
         /* Ensure T3 image stores are visible before we read the SSBO. */
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-        /* Bind resources */
+        /* Bind resources — binding 6 = MergedUvBuf (contains group metadata at section 3) */
         glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 7, ssbo_uv_accum);
-        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_tri_uv_and_meta);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 6, ssbo_merged_uv);
         glc_BindImageTexture(UV_BLIT_IMAGE_UNIT, tex, 0, GL_TRUE, 0,
                              GL_WRITE_ONLY, GL_RGBA16F);
 
@@ -8068,36 +8213,30 @@ public:
         glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(n * INTENT_STRIDE * sizeof(float)), ibuf.data());
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-        /* ── Ensure hit SSBO (HIT_STRIDE = 58 floats) */
-        static constexpr int HIT_STRIDE = 58;
+        /* ── Ensure hit SSBO (HIT_STRIDE = 59 floats; hit[58] = bdpt_subpath_id as uintBitsToFloat) */
+        static constexpr int HIT_STRIDE = 59;
         int max_hits = n * 4;
         if (max_hits > cap_hits) {
             cap_hits = max_hits * 2;
             ensure_ssbo(ssbo_hit, (GLsizeiptr)(cap_hits * HIT_STRIDE * sizeof(float)));
-            /* BdptIdBuf: one uint32 per hit slot, same capacity as ssbo_hit. */
-            ensure_ssbo(ssbo_bdpt_ids, (GLsizeiptr)(cap_hits * sizeof(uint32_t)));
         }
 
-        /* ── Ensure BDPT output SSBOs ────────────────────────────────────── */
+        /* ── Ensure BDPT output SSBO (single buffer, binding 7) ─────────── *
+         * Layout: [verts 0..bdpt_spectral_base_f) ++ [spectral ..bdpt_pdf_base_f) ++ [pdfs ..)
+         * Counts live in MetaBuf tail at [2+nm..2+nm+2] (no separate counter SSBO). */
         static constexpr int BDPT_VERTEX_STRIDE_F   = 28;  /* floats per BdptVertexRecord */
         static constexpr int BDPT_SPECTRAL_STRIDE_F =  8;  /* floats per BdptSpectralWeightRecord */
         static constexpr int BDPT_PDF_STRIDE_F      = 12;  /* floats per BdptPdfRecord */
         const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 2000000;
         const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 4000000;
         const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 2000000;
-        if (max_bdpt_v > cap_bdpt_verts) {
-            cap_bdpt_verts = max_bdpt_v;
-            ensure_ssbo(ssbo_bdpt_verts, (GLsizeiptr)((int64_t)cap_bdpt_verts * BDPT_VERTEX_STRIDE_F * sizeof(float)));
+        const int  bdpt_spectral_base_f = max_bdpt_v * BDPT_VERTEX_STRIDE_F;
+        const int  bdpt_pdf_base_f      = bdpt_spectral_base_f + max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
+        const int64_t bdpt_total_f      = (int64_t)bdpt_pdf_base_f + (int64_t)max_bdpt_p * BDPT_PDF_STRIDE_F;
+        if (bdpt_total_f > cap_bdpt_output) {
+            cap_bdpt_output = (int)bdpt_total_f;
+            ensure_ssbo(ssbo_bdpt_output, (GLsizeiptr)(bdpt_total_f * sizeof(float)));
         }
-        if (max_bdpt_s > cap_bdpt_spectral) {
-            cap_bdpt_spectral = max_bdpt_s;
-            ensure_ssbo(ssbo_bdpt_spectral, (GLsizeiptr)((int64_t)cap_bdpt_spectral * BDPT_SPECTRAL_STRIDE_F * sizeof(float)));
-        }
-        if (max_bdpt_p > cap_bdpt_pdfs) {
-            cap_bdpt_pdfs = max_bdpt_p;
-            ensure_ssbo(ssbo_bdpt_pdfs, (GLsizeiptr)((int64_t)cap_bdpt_pdfs * BDPT_PDF_STRIDE_F * sizeof(float)));
-        }
-        ensure_ssbo(ssbo_bdpt_counters, 3 * sizeof(uint32_t));
 
         /* Zero counter SSBO */
         {
@@ -8106,11 +8245,13 @@ public:
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8 * sizeof(uint32_t), zeros);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         }
-        /* Zero BDPT counters */
+        /* Zero BDPT count slots in MetaBuf tail: [2+nm..2+nm+2] */
         {
             uint32_t bzeros[3] = {};
-            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_counters);
-            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 3 * sizeof(uint32_t), bzeros);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                              (GLintptr)((2 + nm) * sizeof(uint32_t)),
+                              3 * sizeof(uint32_t), bzeros);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         }
 
@@ -8121,7 +8262,6 @@ public:
         bind_ssbo(ssbo_counter,    2); bind_ssbo(ssbo_bvh,       3);
         bind_ssbo(ssbo_tri_id,     4); bind_ssbo(ssbo_tri_full,  5);
         bind_ssbo(ssbo_mat_band,   6); bind_ssbo(ssbo_scene_band,7);
-        bind_ssbo(ssbo_bdpt_ids,   9);  /* BDPT: write bdpt_subpath_id per hit slot */
         glc_Uniform1i(uloc_t1.n_intents, n);
         glc_Uniform1i(uloc_t1.n_bands,   nb);
         glc_Uniform1i(uloc_t1.n_mats,    nm);
@@ -8174,11 +8314,17 @@ public:
         }
 
         /* ── T3 dispatch ──────────────────────────────────────────────═ */
+        /* CounterBuf is absent from T3 (all 8 bindings used); read n_hits now via CPU sync.
+         * Cost: one GPU→CPU 4-byte transfer after T1/T2 barriers are already in flight. */
+        int n_hits = 0;
+        {
+            uint32_t cnt0 = 0u;
+            readback_ssbo(ssbo_counter, &cnt0, sizeof(uint32_t));
+            n_hits = std::min((int)cnt0, cap_hits);
+        }
         static constexpr int CHILD_STRIDE    = 52;  /* INTENT_STRIDE: 20 + 2*16 */
         static constexpr int TERMINAL_STRIDE = 58;  /* 26 + 2*16 (MAX_BANDS=16) */
-        /* Size child buffer for worst-case (all n intents hit and spawn children).
-         * Actual n_hits is unknown until after T3; sizing by n is always sufficient
-         * since n_hits <= n. */
+        /* Size child buffer for worst-case (all n intents hit and spawn children). */
         int max_children = n * ps.cfg.max_children + 1;
         if (max_children > cap_children) {
             cap_children = max_children * 2;
@@ -8196,27 +8342,21 @@ public:
         static uint32_t t3_rng_seed = 0;
         auto t3_start = Clock::now();
         glc_UseProgram(prog_t3);
-        /* Bindings match ray_material.comp.glsl:
-         * 0=RefinedHitBuf  1=OutBuf(intents+terminals)  2=MetaBuf
-         * 3=TriangleBuf    4=MatBandBuf  5=TriUvBuf  6=TriUvAndMetaBuf
-         * 7=UvAccumBuf     8=CounterBuf (T1 hit count for early-exit guard) */
-        bind_ssbo(ssbo_hit,             0);
-        bind_ssbo(ssbo_child_int,       1);
-        bind_ssbo(ssbo_t3_meta,         2);
-        bind_ssbo(ssbo_tri_full,        3);
-        bind_ssbo(ssbo_mat_band,        4);
-        bind_ssbo(ssbo_tri_uv,          5);
-        bind_ssbo(ssbo_tri_uv_and_meta, 6);
-        bind_ssbo(ssbo_uv_accum,        7);
-        bind_ssbo(ssbo_counter,         8);  /* T1 counters — read by shader for n_hits */
-        bind_ssbo(ssbo_bdpt_ids,        9);  /* BDPT: bdpt_subpath_id per hit slot (read-only) */
-        bind_ssbo(ssbo_bdpt_verts,     10);  /* BDPT: BdptVertexRecord output */
-        bind_ssbo(ssbo_bdpt_spectral,  11);  /* BDPT: BdptSpectralWeightRecord output */
-        bind_ssbo(ssbo_bdpt_counters,  12);  /* BDPT: atomic counts */
-        bind_ssbo(ssbo_bdpt_pdfs,      13);  /* BDPT: BdptPdfRecord output */
-        const int n_uv_groups  = (int)st.group_uv_res.size();
-        const int uv_meta_base = (int)st.tri_uv_group_of_tri.size();
-        /* n_hits uniform removed — shader reads t1_counters[0] from binding 8 */
+        /* Bindings match ray_material.comp.glsl (8 slots, 0-7 — GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS=8):
+         * 0=RefinedHitBuf  1=OutBuf  2=MetaBuf     3=TriangleBuf
+         * 4=MatBandBuf     5=MergedUvBuf  6=UvAccumBuf  7=BdptOutputBuf */
+        bind_ssbo(ssbo_hit,         0);
+        bind_ssbo(ssbo_child_int,   1);
+        bind_ssbo(ssbo_t3_meta,     2);
+        bind_ssbo(ssbo_tri_full,    3);
+        bind_ssbo(ssbo_mat_band,    4);
+        bind_ssbo(ssbo_merged_uv,   5);
+        bind_ssbo(ssbo_uv_accum,    6);
+        bind_ssbo(ssbo_bdpt_output, 7);
+        const int n_uv_groups      = (int)st.group_uv_res.size();
+        const int uv_group_id_base = nt * 6;   /* MergedUvBuf section 2: per-tri group IDs */
+        const int uv_meta_base     = nt * 7;   /* MergedUvBuf section 3: group metadata */
+        const int bdpt_count_base  = 2 + nm;   /* MetaBuf tail: [2+nm..2+nm+2] BDPT counts */
         glc_Uniform1i (uloc_t3.n_bands,              nb);
         glc_Uniform1i (uloc_t3.n_mats,               nm);
         glc_Uniform1i (uloc_t3.max_children,         max_children);
@@ -8225,11 +8365,16 @@ public:
         glc_Uniform1f (uloc_t3.sensor_pr,             ps.sensor_pr);
         glc_Uniform1f (uloc_t3.sensor_px,             ps.sensor_px);
         glc_Uniform1i (uloc_t3.n_uv_groups,           n_uv_groups);
+        glc_Uniform1i (uloc_t3.uv_group_id_base,      uv_group_id_base);
         glc_Uniform1i (uloc_t3.uv_meta_base,          uv_meta_base);
         glc_Uniform1ui(uloc_t3.rng_seed,              ++t3_rng_seed);
         glc_Uniform1i (uloc_t3.bdpt_max_verts,        max_bdpt_v);
         glc_Uniform1i (uloc_t3.bdpt_max_spectral,     max_bdpt_s);
         glc_Uniform1i (uloc_t3.bdpt_max_pdfs,         max_bdpt_p);
+        glc_Uniform1i (uloc_t3.bdpt_count_base,       bdpt_count_base);
+        glc_Uniform1i (uloc_t3.bdpt_spectral_base,    bdpt_spectral_base_f);
+        glc_Uniform1i (uloc_t3.bdpt_pdf_base,         bdpt_pdf_base_f);
+        glc_Uniform1i (uloc_t3.n_hits,                n_hits);
         glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
 
         /* Single full barrier + readback covers ALL of T1/T2/T3 output in one
@@ -8237,10 +8382,9 @@ public:
          * visibility of the atomic writes from all three stages. */
         glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
 
-        /* Read counters and meta in one pass — the GPU is done after the barrier. */
+        /* Read full counter block for stats; n_hits was resolved before T3 dispatch. */
         uint32_t counters[8] = {};
         readback_ssbo(ssbo_counter, counters, 8 * sizeof(uint32_t));
-        int n_hits = std::min((int)counters[0], cap_hits);
 
         ps.stats[0].record_gpu(n, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
             Clock::now() - t1_start).count(), ps.Q_intent.size());
@@ -8522,19 +8666,25 @@ public:
         }
 
         /* ── BDPT side-data readback: push GPU-emitted records to CPU queues ──
-         * Read bdpt_counters to know how many records were emitted this batch,
-         * then pull BdptVertexRecord and BdptSpectralWeightRecord from their SSBOs. */
+         * Counts live in MetaBuf tail at [2+nm..2+nm+2]; records in ssbo_bdpt_output. */
         {
             uint32_t bdpt_cnts[3] = {};
-            readback_ssbo(ssbo_bdpt_counters, bdpt_cnts, 3 * sizeof(uint32_t));
-            const int nv = std::min((int)bdpt_cnts[0], cap_bdpt_verts);
-            const int ns = std::min((int)bdpt_cnts[1], cap_bdpt_spectral);
-            const int np = std::min((int)bdpt_cnts[2], cap_bdpt_pdfs);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                 (GLintptr)((2 + nm) * sizeof(uint32_t)),
+                                 3 * sizeof(uint32_t), bdpt_cnts);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            const int nv = std::min((int)bdpt_cnts[0], max_bdpt_v);
+            const int ns = std::min((int)bdpt_cnts[1], max_bdpt_s);
+            const int np = std::min((int)bdpt_cnts[2], max_bdpt_p);
 
             if (nv > 0) {
                 stg_bdpt_verts.resize((size_t)nv * BDPT_VERTEX_STRIDE_F);
-                readback_ssbo(ssbo_bdpt_verts, stg_bdpt_verts.data(),
-                              (GLsizeiptr)((size_t)nv * BDPT_VERTEX_STRIDE_F * sizeof(float)));
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                     (GLsizeiptr)((size_t)nv * BDPT_VERTEX_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_verts.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
                 uint64_t cam_count = 0;
                 for (int i = 0; i < nv; ++i) {
                     const float* row = stg_bdpt_verts.data() + (size_t)i * BDPT_VERTEX_STRIDE_F;
@@ -8573,8 +8723,12 @@ public:
 
             if (ns > 0) {
                 stg_bdpt_spectral.resize((size_t)ns * BDPT_SPECTRAL_STRIDE_F);
-                readback_ssbo(ssbo_bdpt_spectral, stg_bdpt_spectral.data(),
-                              (GLsizeiptr)((size_t)ns * BDPT_SPECTRAL_STRIDE_F * sizeof(float)));
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                     (GLintptr)((size_t)bdpt_spectral_base_f * sizeof(float)),
+                                     (GLsizeiptr)((size_t)ns * BDPT_SPECTRAL_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_spectral.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
                 for (int i = 0; i < ns; ++i) {
                     const float* row = stg_bdpt_spectral.data() + (size_t)i * BDPT_SPECTRAL_STRIDE_F;
                     BdptSpectralWeightRecord sw{};
@@ -8595,8 +8749,12 @@ public:
 
             if (np > 0) {
                 stg_bdpt_pdfs.resize((size_t)np * BDPT_PDF_STRIDE_F);
-                readback_ssbo(ssbo_bdpt_pdfs, stg_bdpt_pdfs.data(),
-                              (GLsizeiptr)((size_t)np * BDPT_PDF_STRIDE_F * sizeof(float)));
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                     (GLintptr)((size_t)bdpt_pdf_base_f * sizeof(float)),
+                                     (GLsizeiptr)((size_t)np * BDPT_PDF_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_pdfs.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
                 for (int i = 0; i < np; ++i) {
                     const float* row = stg_bdpt_pdfs.data() + (size_t)i * BDPT_PDF_STRIDE_F;
                     BdptPdfRecord pr{};

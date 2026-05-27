@@ -118,6 +118,7 @@ flat in int  vMatId;
 flat in int  vGroupId;
 flat in int  vCullImmune;
 in  vec2     vUv;
+in  vec3     vVelocityW;   // world-space surface velocity (m/s) for optical effects
 
 out vec4 FragColor;
 

@@ -58,6 +58,7 @@ class ExposureSlice:
     flash_weight: float
     sensor_weight: float
     profile: str = "steady"
+    scene_version_id: Optional[int] = None
 
     @property
     def dt(self) -> float:
@@ -387,6 +388,135 @@ class SceneCameraCoordinator:
         self.last_snapshot = None
         self.camera_scheduler.reset(scene_time_s)
         self.scene_provider.reset(scene_time_s)
+
+
+@dataclass(frozen=True)
+class CameraTimelineSlice:
+    """Camera program state at one em-timescale time slice.
+
+    Wraps ExposureSlice with explicit camera-program booleans so the
+    pipeline can enforce ordering without inspecting shutter weights.
+    """
+
+    frame_id: int
+    slice_id: int
+    t0: float
+    t1: float
+    flash_active: bool
+    shutter_open_fraction: float
+    sensor_integrating: bool
+    exposure_slice: "ExposureSlice"
+    scene_version_id: Optional[int] = None
+
+    @property
+    def dt(self) -> float:
+        return max(0.0, self.t1 - self.t0)
+
+
+@dataclass(frozen=True)
+class CameraTimeline:
+    """Ordered em-timescale slice sequence for one camera exposure.
+
+    prerequisite_flash_slice_for_sensor maps each sensor slice_id to the
+    flash slice_id whose records must have materialized before that sensor
+    slice may be submitted.  With flash_duty_cycle=1.0 (the default) this
+    is a same-slice dependency: sensor S waits for flash S.
+    """
+
+    frame_id: int
+    flash_slices: tuple          # tuple[int, ...]
+    sensor_slices: tuple         # tuple[int, ...]
+    prerequisite_flash_slice_for_sensor: Dict[int, int]
+    slices: tuple                # tuple[CameraTimelineSlice, ...]
+
+    @staticmethod
+    def from_exposure_frame(frame: "ExposureFrame",
+                             flash_duty_cycle: float = 1.0) -> "CameraTimeline":
+        import math as _math
+        n = len(frame.slices)
+        if n == 0:
+            return CameraTimeline(
+                frame_id=frame.frame_id,
+                flash_slices=(),
+                sensor_slices=(),
+                prerequisite_flash_slice_for_sensor={},
+                slices=(),
+            )
+        n_flash = max(1, int(_math.ceil(n * max(0.0, min(1.0, float(flash_duty_cycle))))))
+        flash_slice_ids = tuple(range(n_flash))
+        sensor_slice_ids = tuple(range(n))
+        prereqs: Dict[int, int] = {s: min(s, n_flash - 1) for s in sensor_slice_ids}
+        timeline_slices = []
+        for i, es in enumerate(frame.slices):
+            timeline_slices.append(CameraTimelineSlice(
+                frame_id=frame.frame_id,
+                slice_id=i,
+                t0=es.t0,
+                t1=es.t1,
+                flash_active=(i < n_flash),
+                shutter_open_fraction=float(es.shutter_open),
+                sensor_integrating=True,
+                exposure_slice=es,
+            ))
+        return CameraTimeline(
+            frame_id=frame.frame_id,
+            flash_slices=flash_slice_ids,
+            sensor_slices=sensor_slice_ids,
+            prerequisite_flash_slice_for_sensor=prereqs,
+            slices=tuple(timeline_slices),
+        )
+
+
+class ExposureBarrier:
+    """Tracks flash/sensor submission ordering for one camera exposure.
+
+    Two-phase lifecycle per flash slice:
+      dispatched  — trace_forward() was called (C++ async, results pending)
+      materialized — drain loop confirmed records in _bdpt_endpoints
+
+    sensor_may_submit(slice_id) is the gate: returns True only when the
+    prerequisite flash slice has been confirmed materialized.
+    """
+
+    def __init__(self, timeline: CameraTimeline) -> None:
+        self.timeline = timeline
+        self._flash_dispatched_through: int = -1
+        self.flash_submitted_through: int = -1   # confirmed materialized
+        self.sensor_submitted_through: int = -1
+
+    def record_flash_dispatched(self, slice_id: int, submitted: int = 1) -> None:
+        self._flash_dispatched_through = max(self._flash_dispatched_through, slice_id)
+        if submitted == 0:
+            # Nothing was emitted; nothing to wait for — confirm immediately.
+            self.flash_submitted_through = max(self.flash_submitted_through, slice_id)
+
+    def confirm_flash_materialized(self, slice_id: int) -> None:
+        self.flash_submitted_through = max(self.flash_submitted_through, slice_id)
+
+    def sensor_may_submit(self, slice_id: int) -> bool:
+        prereq = self.timeline.prerequisite_flash_slice_for_sensor.get(slice_id, -1)
+        if prereq < 0:
+            return True
+        return self.flash_submitted_through >= prereq
+
+    def record_sensor_submitted(self, slice_id: int) -> None:
+        self.sensor_submitted_through = max(self.sensor_submitted_through, slice_id)
+
+    @property
+    def all_flash_dispatched(self) -> bool:
+        if not self.timeline.flash_slices:
+            return True
+        return self._flash_dispatched_through >= max(self.timeline.flash_slices)
+
+    @property
+    def all_sensor_submitted(self) -> bool:
+        if not self.timeline.sensor_slices:
+            return True
+        return self.sensor_submitted_through >= max(self.timeline.sensor_slices)
+
+    @property
+    def exposure_complete(self) -> bool:
+        return self.all_flash_dispatched and self.all_sensor_submitted
 
 
 class SceneCameraClock:

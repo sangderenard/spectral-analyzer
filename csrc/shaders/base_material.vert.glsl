@@ -34,6 +34,7 @@ layout(location = 2) in int  aMatId;
 layout(location = 3) in vec2 aUv;
 layout(location = 4) in int  aGroupId;
 layout(location = 5) in int  aCullImmune;
+layout(location = 6) in vec3 aVelocity;   // world-space surface velocity (m/s)
 
 uniform mat4 uMVP;
 uniform mat4 uMV;
@@ -45,6 +46,7 @@ flat out int vMatId;
 flat out int vGroupId;
 flat out int vCullImmune;
 out vec2 vUv;
+out vec3 vVelocityW;   // world-space velocity passed to fragment for optical effects
 
 void main() {
     vec4 posV   = uMV  * vec4(aPos, 1.0);
@@ -55,5 +57,6 @@ void main() {
     vGroupId    = aGroupId;
     vCullImmune = aCullImmune;
     vUv         = aUv;
+    vVelocityW  = aVelocity;
     gl_Position = uMVP * vec4(aPos, 1.0);
 }

@@ -53,6 +53,9 @@ from camera_software.sensor_back import (
 )
 from camera_software.exposure_timing import (
     CameraExposureScheduler,
+    CameraTimeline,
+    CameraTimelineSlice,
+    ExposureBarrier,
     ExposureFrame,
     ExposureSlice,
     MutableSceneFrameProvider,
@@ -60,6 +63,7 @@ from camera_software.exposure_timing import (
     SceneCameraStep,
     SceneSnapshot,
 )
+from camera_software.scene_version import SceneVersionCache
 try:
     import torch
 except Exception:
@@ -1655,16 +1659,20 @@ def _import_subject_scene(
     mats: List[int],
     source_tri_ids: List[int],
     object_tri_ids: List[int],
-) -> None:
-    """Import the reusable orbiter/saddle demo as the subject in front of the camera."""
+) -> Dict[int, Tuple[int, int]]:
+    """Import the reusable orbiter/saddle demo as the subject in front of the camera.
+
+    Returns group_tri_map: {group_id: (tri_start, tri_count)} in bench tri space.
+    Empty dict when no subject scene is active.
+    """
     mode = str(getattr(scene, "subject_scene_mode", "") or "").strip()
     if not mode or mode.lower() in ("none", "off"):
-        return
+        return {}
     try:
         import test_basic_gl_cpp_window as subject_mod
     except Exception as exc:
         print(f"[subject-scene] import failed: {exc}", flush=True)
-        return
+        return {}
 
     subject_time = float(getattr(scene, "subject_time_s", 0.0))
     subject_db, subject_idx = subject_mod.register_materials()
@@ -1720,6 +1728,16 @@ def _import_subject_scene(
         if old_mat in emissive_old:
             source_tri_ids.append(tri_id)
 
+    # Build group → bench-tri-space mapping for the physics actor system.
+    _gids    = np.asarray(_groups[0], dtype=np.int32)
+    _offsets = np.asarray(_groups[2], dtype=np.int32)
+    _counts  = np.asarray(_groups[3], dtype=np.int32)
+    group_tri_map: Dict[int, Tuple[int, int]] = {
+        int(g): (start + int(o), int(c))
+        for g, o, c in zip(_gids.tolist(), _offsets.tolist(), _counts.tolist())
+        if int(c) > 0
+    }
+
     print(
         "[subject-scene]",
         f"mode={mode}",
@@ -1729,8 +1747,10 @@ def _import_subject_scene(
         f"depth_scale={depth_scale:.4f}",
         f"center_x={subject_x:.4f}",
         f"t={subject_time:.3f}s",
+        f"actor_groups={len(group_tri_map)}",
         flush=True,
     )
+    return group_tri_map
 
 
 def _lens_is_valid(lens: LensConfig, min_edge_thickness: float = 0.004) -> bool:
@@ -2991,6 +3011,7 @@ def _build_scene_mesh(
     stage_light_cutters: List[PipeCSGSpec] = []
     diffuser_wave_specs: List[DiffuserWaveTubeSpec] = []
 
+    _subject_group_tri_map: Dict[int, Tuple[int, int]] = {}
     if bool(getattr(scene, "include_legacy_stage", False)):
         # Default legacy side-room tube as first macro light tube.
         default_tube = StageLightTubeConfig(
@@ -3084,7 +3105,7 @@ def _build_scene_mesh(
             tri_ids=silver_wall_tri_ids,
         )
     else:
-        _import_subject_scene(scene, db, tris, mats, source_tri_ids, object_tri_ids)
+        _subject_group_tri_map = _import_subject_scene(scene, db, tris, mats, source_tri_ids, object_tri_ids)
     _iris = getattr(scene, "iris_aperture", None)
     _iris_active = _iris is not None and getattr(_iris, "enabled", False)
     if _iris_active:
@@ -3438,6 +3459,7 @@ def _build_scene_mesh(
         np.ascontiguousarray(np.asarray(camera_frustum_tri_ids, dtype=np.int32)),
         np.ascontiguousarray(np.asarray(red_probe_tri_ids, dtype=np.int32)),
         diffuser_wave_specs,
+        _subject_group_tri_map,
     )
 
 
@@ -4252,6 +4274,15 @@ class ForwardCppLensBench:
         )
         self._last_scene_camera_step: Optional[SceneCameraStep] = None
         self._last_scene_snapshot: Optional[SceneSnapshot] = None
+        self._camera_timeline: Optional[CameraTimeline] = None
+        self._exposure_barrier: Optional[ExposureBarrier] = None
+        self._flash_materialization_threshold: int = 1
+        self._scene_version_cache = SceneVersionCache(
+            max_versions=8,
+            position_epsilon=float(getattr(self.scene, "subject_rebuild_epsilon_m", 0.001)),
+            angle_epsilon=float(getattr(self.scene, "subject_rebuild_angle_rad", 0.01)),
+        )
+        self._vertex_motion_buf: Optional[np.ndarray] = None
         self.bdpt_last_records = 0
         self.bdpt_last_volume_records = 0
         self.bdpt_last_volume_power = 0.0
@@ -4390,10 +4421,11 @@ class ForwardCppLensBench:
             aperture_stop_ids, tube_wall_ids, lens_surface_groups,
             object_ids, tube_baffle_ids, camera_barrel_ids,
             camera_rear_cap_ids, camera_front_cap_ids, camera_frustum_ids,
-            red_probe_ids, diffuser_wave_specs,
+            red_probe_ids, diffuser_wave_specs, subject_group_tri_map,
         ) = _build_scene_mesh(self.scene, self.sidecar)
         self._diffuser_wave_specs: List[DiffuserWaveTubeSpec] = list(diffuser_wave_specs)
         self.lens_surface_groups = lens_surface_groups
+        self._subject_group_tri_map: Dict[int, Tuple[int, int]] = dict(subject_group_tri_map)
         self.tri_vertices = np.ascontiguousarray(tri_arr, dtype=np.float64)
         self.tri_centroids = np.ascontiguousarray(np.mean(tri_arr, axis=1), dtype=np.float64)
         self.n_tris = int(tri_arr.shape[0])
@@ -4727,6 +4759,15 @@ class ForwardCppLensBench:
         n_lens_param = self._register_lens_parametric_groups()
         print(f"[parametric-register] lens_surface_groups={n_lens_param}", flush=True)
         self._register_uv_page_bank()
+
+        _t0_physics = float(getattr(self.scene, "subject_time_s", 0.0))
+        self._scene_version_cache.commit_version(
+            _t0_physics,
+            self._subject_group_tri_map,
+            self.tri_vertices,
+            label="init",
+        )
+        self._scene_version_cache.note_rebuild(_t0_physics)
 
     def _uv_coords_for_tri_ids(self, tri_ids: np.ndarray, mode: str) -> np.ndarray:
         ids = np.ascontiguousarray(np.asarray(tri_ids, dtype=np.int32).reshape(-1), dtype=np.int32)
@@ -5157,6 +5198,27 @@ class ForwardCppLensBench:
     def _finish_exposure_frame(self) -> None:
         self._scene_camera_coordinator.finish_frame()
         self._active_exposure_frame = None
+        self._camera_timeline = None
+        self._exposure_barrier = None
+
+    def _ensure_camera_timeline(self) -> CameraTimeline:
+        frame = self._ensure_exposure_frame()
+        if self._camera_timeline is None or self._camera_timeline.frame_id != frame.frame_id:
+            self._camera_timeline = CameraTimeline.from_exposure_frame(frame)
+            self._exposure_barrier = ExposureBarrier(self._camera_timeline)
+        return self._camera_timeline
+
+    def _poll_flash_materialization(self, dispatched_slice_id: int) -> bool:
+        """True when forward records for dispatched_slice_id have drained into _bdpt_endpoints."""
+        barrier = self._exposure_barrier
+        if barrier is None:
+            return True
+        if barrier.flash_submitted_through >= dispatched_slice_id:
+            return True
+        if self._async_bdpt_forward_count() >= self._flash_materialization_threshold:
+            barrier.confirm_flash_materialized(dispatched_slice_id)
+            return True
+        return False
 
     def _exposure_slice(self, stage_idx: int) -> ExposureSlice:
         frame = self._ensure_exposure_frame()
@@ -6797,6 +6859,8 @@ class ForwardCppLensBench:
         self._camera_exposure_forward_stage = 0
         self._camera_exposure_complete = False
         self._active_exposure_frame = None
+        self._camera_timeline = None
+        self._exposure_barrier = None
         self._scene_camera_coordinator.reset(float(getattr(self.scene, "subject_time_s", 0.0)))
         self._last_scene_camera_step = None
         self._last_scene_snapshot = None
@@ -8801,6 +8865,14 @@ def run(
         # All surfaces double-sided so the fly camera can view geometry from
         # any angle; the sensor plate remains visible from the field side.
         cull_v = np.ones(n_tris * 3, dtype=np.int32)
+        # Per-vertex world-space velocity (m/s) for velocity-sensitive shaders.
+        # Populated from the physics actor cache; zero until the second scene
+        # version is committed and the cache has derived velocity estimates.
+        _mot_buf = getattr(bench, "_vertex_motion_buf", None)
+        if _mot_buf is not None and _mot_buf.shape == (n_tris * 3, 3):
+            vel_v = np.ascontiguousarray(_mot_buf, dtype=np.float32)
+        else:
+            vel_v = np.zeros((n_tris * 3, 3), dtype=np.float32)
         from OpenGL.GL import (
             glGenVertexArrays, glBindVertexArray, glGenBuffers, glBindBuffer,
             glBufferData, glEnableVertexAttribArray, glVertexAttribPointer,
@@ -8812,6 +8884,7 @@ def run(
         mbo = glGenBuffers(1)
         gbo = glGenBuffers(1)
         cbo = glGenBuffers(1)
+        velbo = glGenBuffers(1)
         glBindVertexArray(vao)
         glBindBuffer(GL_ARRAY_BUFFER, vbo)
         glBufferData(GL_ARRAY_BUFFER, verts8.nbytes, verts8, GL_STATIC_DRAW)
@@ -8834,8 +8907,12 @@ def run(
         glBufferData(GL_ARRAY_BUFFER, cull_v.nbytes, cull_v, GL_STATIC_DRAW)
         glEnableVertexAttribArray(5)
         glVertexAttribIPointer(5, 1, GL_INT, 4, ctypes.c_void_p(0))
+        glBindBuffer(GL_ARRAY_BUFFER, velbo)
+        glBufferData(GL_ARRAY_BUFFER, vel_v.nbytes, vel_v, GL_STATIC_DRAW)
+        glEnableVertexAttribArray(6)
+        glVertexAttribPointer(6, 3, GL_FLOAT, False, 12, ctypes.c_void_p(0))
         glBindVertexArray(0)
-        _scene_vao[0] = (int(vao), n_tris * 3, int(vbo), int(mbo), int(gbo), int(cbo))
+        _scene_vao[0] = (int(vao), n_tris * 3, int(vbo), int(mbo), int(gbo), int(cbo), int(velbo))
         # Let the renderer derive lights from all emissive source surfaces in
         # the scene; there is no manual light setup.
         _gl_renderer.derive_emissive_area_lights(verts8, mat_v, gid_v, min_emitter_group_id=-999)
@@ -9768,56 +9845,68 @@ def run(
     def _trace(rpe: int, sd: int, mb: int, camera_dt_s: float):
         import time as _t
         if getattr(bench, "_camera_exposure_complete", False):
-            # One exposure cycle done; reset so the next cycle can begin.
             bench._camera_exposure_complete = False
             bench._finish_exposure_frame()
             bench._camera_exposure_forward_stage = 0
             bench._bdpt_camera_sweep_stage = 0
             return
         while not closing.is_set() and bench.tracer.in_flight_count() > _MAX_IN_FLIGHT:
-            _t.sleep(0.002)   # back off; let drain-loop consume Q_intent
+            _t.sleep(0.002)
         if closing.is_set():
             return
         with bench._trace_lock:
             if bench._active_exposure_frame is None:
                 bench.begin_scene_camera_step(float(camera_dt_s))
-            stage_count = bench._exposure_stage_count()
-            if (
-                int(getattr(bench, "_camera_exposure_forward_stage", 0)) >= stage_count and
-                int(getattr(bench, "_bdpt_camera_sweep_stage", 0)) >= stage_count
-            ):
+            timeline = bench._ensure_camera_timeline()
+            barrier  = bench._exposure_barrier
+            stage_count  = bench._exposure_stage_count()
+            fwd_stage    = int(getattr(bench, "_camera_exposure_forward_stage", 0))
+            sensor_stage = int(getattr(bench, "_bdpt_camera_sweep_stage", 0))
+            if fwd_stage >= stage_count and sensor_stage >= stage_count:
                 bench._camera_exposure_complete = True
                 return
-            fwd_stage = int(getattr(bench, "_camera_exposure_forward_stage", 0))
-            sensor_stage = int(getattr(bench, "_bdpt_camera_sweep_stage", 0))
+            # Sensor worker for the previous slice is still running — its
+            # records are still entering T1.  Wait for it to complete and
+            # advance _bdpt_camera_sweep_stage before submitting the next slice.
             if fwd_stage > sensor_stage:
+                return
+            # Per-slice interleave: flash and sensor for slice N enter T1
+            # together in the same tick.  They share the pipeline as temporal
+            # cohorts so T4 always has matching records from the same time bucket.
+            if fwd_stage < stage_count and fwd_stage == sensor_stage:
+                slice_idx = int(fwd_stage)
+                exposure_weight = bench._exposure_stage_weight()
+                submit_rpe = bench._exposure_rays_per_emitter(rpe)
+                submitted = bench.trace_forward(submit_rpe, sd,
+                                                max_bounces=mb,
+                                                exposure_weight=exposure_weight)
+                if barrier is not None:
+                    barrier.record_flash_dispatched(slice_idx,
+                                                    submitted=int(submitted or 0))
+                bench._camera_exposure_forward_stage += 1
+                if frame % 30 == 0:
+                    _s = bench.bdpt_last_connection_stats
+                    print(
+                        "[pipeline-trace]",
+                        f"slice={slice_idx}/{stage_count}",
+                        f"forward_launched={bench._async_forward_launched_count:_}",
+                        f"fwd_retained={bench._async_bdpt_forward_count():_}",
+                        f"submit_rpe={submit_rpe:_}",
+                        f"cpp_fwd={_s.get('forward_records',0)}",
+                        f"cpp_sensor={_s.get('sensor_records',0)}",
+                        f"sensor_rays_total={bench._bdpt_native_sensor_sweep_rays:_}",
+                        f"sensor_strikes={bench._async_backward_strike_count:_}",
+                        f"exact={_s.get('exact_snaps',0)}",
+                        f"lit={_s.get('lit_pixels',0)}",
+                        f"overflow_conn={_s.get('overflow_connections',0)}",
+                        flush=True,
+                    )
+                # Submit sensor for the same slice immediately so both enter
+                # T1 together.  C++ T5 latch gates the connection; Python does
+                # not need to wait for drain output before sensor submission.
+                if barrier is not None:
+                    barrier.record_sensor_submitted(slice_idx)
                 _fire_pipeline_camera_render()
-                return
-            if fwd_stage >= stage_count:
-                return
-            exposure_weight = bench._exposure_stage_weight()
-            submit_rpe = bench._exposure_rays_per_emitter(rpe)
-            bench.trace_forward(submit_rpe, sd, max_bounces=mb, exposure_weight=exposure_weight)
-            bench._camera_exposure_forward_stage += 1
-            if frame % 30 == 0:
-                _s = bench.bdpt_last_connection_stats
-                print(
-                    "[pipeline-trace]",
-                    f"stage={int(bench._camera_exposure_forward_stage)}/{stage_count}",
-                    f"forward_launched={bench._async_forward_launched_count:_}",
-                    f"fwd_retained={bench._async_bdpt_forward_count():_}",
-                    f"submit_rpe={submit_rpe:_}",
-                    f"cpp_fwd={_s.get('forward_records',0)}",
-                    f"cpp_sensor={_s.get('sensor_records',0)}",
-                    f"sensor_rays_total={bench._bdpt_native_sensor_sweep_rays:_}",
-                    f"sensor_strikes={bench._async_backward_strike_count:_}",
-                    f"exact={_s.get('exact_snaps',0)}",
-                    f"lit={_s.get('lit_pixels',0)}",
-                    f"overflow_conn={_s.get('overflow_connections',0)}",
-                    flush=True,
-                )
-        if bench._async_bdpt_forward_count() > 0:
-            _fire_pipeline_camera_render()
 
     def _stop_bench_runtime(old_bench: ForwardCppLensBench) -> None:
         try:
@@ -9885,6 +9974,18 @@ def run(
         _wire_rebuilt_bench(bench)
         bench._scene_camera_coordinator.reset(float(snapshot.t0))
         bench.begin_scene_camera_step(max(0.0, float(snapshot.t1) - float(snapshot.t0)))
+        _t_rebuild = float(snapshot.sample_time)
+        bench._scene_version_cache.commit_version(
+            _t_rebuild,
+            bench._subject_group_tri_map,
+            bench.tri_vertices,
+            label=f"rebuild:{reason}",
+        )
+        bench._scene_version_cache.note_rebuild(_t_rebuild)
+        bench._vertex_motion_buf = bench._scene_version_cache.build_vertex_motion_buffer(
+            bench.tri_vertices,
+            bench._subject_group_tri_map,
+        )
         _restore_display_gl_context()
 
     def _rebuild_bench_with_iris(new_r_inner: float) -> None:
@@ -10124,12 +10225,20 @@ def run(
                     _mode = str(getattr(scene, "subject_scene_mode", "") or "").lower()
                     _snap = getattr(bench, "_last_scene_snapshot", None)
                     if _snap is not None and _mode not in ("", "none", "off"):
-                        _anim_hz = float(max(0.0, getattr(scene, "subject_animation_rebuild_hz", 0.5)))
-                        if _anim_hz > 0.0:
-                            _anim_interval = 1.0 / _anim_hz
-                            if (float(_snap.sample_time) - _subject_anim_last_rebuild_t) >= _anim_interval:
+                        _t_now = float(_snap.sample_time)
+                        _version_cache = getattr(bench, "_scene_version_cache", None)
+                        if _version_cache is not None and _version_cache._actors:
+                            if _version_cache.any_actor_needs_rebuild(_t_now):
                                 _subject_anim_pending[0] = True
                                 _subject_anim_pending_snapshot[0] = _snap
+                        else:
+                            # Fallback to time-based gate until velocity history accumulates.
+                            _anim_hz = float(max(0.0, getattr(scene, "subject_animation_rebuild_hz", 0.5)))
+                            if _anim_hz > 0.0:
+                                _anim_interval = 1.0 / _anim_hz
+                                if (_t_now - _subject_anim_last_rebuild_t) >= _anim_interval:
+                                    _subject_anim_pending[0] = True
+                                    _subject_anim_pending_snapshot[0] = _snap
 
             # Refresh field + hit-overlay textures at a fixed cadence.  The
             # refresh reads the full field capture grid and copies the hit ring,
@@ -10237,10 +10346,10 @@ def run(
         if _mesh_vbo[0] is not None:
             glDeleteBuffers(3, _mesh_vbo[0])
         if _scene_vao[0] is not None:
-            vao_id, _, vbo, mbo, gbo, cbo = _scene_vao[0]
+            vao_id, _, vbo, mbo, gbo, cbo, velbo = _scene_vao[0]
             from OpenGL.GL import glDeleteVertexArrays
             glDeleteVertexArrays(1, [vao_id])
-            glDeleteBuffers(4, [vbo, mbo, gbo, cbo])
+            glDeleteBuffers(5, [vbo, mbo, gbo, cbo, velbo])
         glDeleteProgram(volume_prog)
         glDeleteProgram(point_prog)
         glDeleteProgram(cone_prog)

@@ -61,6 +61,15 @@ from .exposure_timing import (
     SceneCameraStep,
     SceneCameraCoordinator,
     SceneCameraClock,
+    CameraTimelineSlice,
+    CameraTimeline,
+    ExposureBarrier,
+)
+from .scene_version import (
+    ActorState,
+    PhysicsActor,
+    SceneVersion,
+    SceneVersionCache,
 )
 __all__ = [
     "SpeedSpline",
@@ -129,4 +138,11 @@ __all__ = [
     "SceneCameraStep",
     "SceneCameraCoordinator",
     "SceneCameraClock",
+    "CameraTimelineSlice",
+    "CameraTimeline",
+    "ExposureBarrier",
+    "ActorState",
+    "PhysicsActor",
+    "SceneVersion",
+    "SceneVersionCache",
 ]

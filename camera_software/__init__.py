@@ -51,7 +51,6 @@ from .sensor_back import (
     MOUNT_MF_DIGITAL,
     MOUNT_CUSTOM,
 )
-
 __all__ = [
     "SpeedSpline",
     "MotorDrive",

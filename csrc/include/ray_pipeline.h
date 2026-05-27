@@ -30,6 +30,7 @@
 #include <random>
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
 #include "bdpt_record.h"
 
 struct RayTracerState;
@@ -146,11 +147,13 @@ struct StageStats {
         n_gpu.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
         ns_gpu.fetch_add(elapsed_ns,              std::memory_order_relaxed);
         q_depth.store(q_now, std::memory_order_relaxed);
-        /* Adapt GPU batch size: ramp up aggressively, back off slowly.
-         * Upper bound 1048576 (1M) covers production ray tracing dispatch sizes. */
+        /* Adapt GPU batch size as a preferred pop capacity, not as a reaction to
+         * finite burst tails.  Staged exposure often drains Q_intent to zero; if
+         * we shrink on low post-pop depth, the next exposure packet is forced
+         * through tiny dispatches. */
         int cur = batch_sz_gpu.load(std::memory_order_relaxed);
-        if      (q_now > cur     && cur < 1048576) batch_sz_gpu.store(cur * 2, std::memory_order_relaxed);
-        else if (q_now < 16      && cur > 256)   batch_sz_gpu.store(cur / 2, std::memory_order_relaxed);
+        if (q_now > cur && cur < 1048576)
+            batch_sz_gpu.store(std::min(cur * 2, 1048576), std::memory_order_relaxed);
         _update_gpu_fraction();
     }
 
@@ -194,7 +197,7 @@ private:
     }
 };
 
-/* Snapshot of all four stages + output queue, returned to callers. */
+/* Snapshot of all pipeline stages + output queue, returned to callers. */
 struct RayPipelineStats {
     struct Stage {
         double   throughput;       /* CPU items / second */
@@ -207,7 +210,7 @@ struct RayPipelineStats {
         float    gpu_fraction;     /* observed fraction going to GPU [0,1] */
         double   cpu_active_ms;    /* cumulative CPU stage wall time */
         double   gpu_active_ms;    /* cumulative GPU stage wall time */
-    } t1, t2, t3, t4;
+    } t1, t2, t3, t4, t5;
     int output_queue_depth;
     int in_flight;
     uint64_t gpu_uv_readback_bytes;
@@ -552,7 +555,7 @@ struct RayPipelineConfig {
      * shader_dir: directory containing the four .comp.glsl shader files.
      *   Empty string → searches "csrc/shaders/" relative to cwd.
      *
-     * gpu_batch_size_t{1,2,3,4}: initial GPU pop batch size per stage.
+     * gpu_batch_size_t{1,2,3,4,5}: initial GPU pop batch size per stage.
      *   0 = use the StageStats default (262144). */
     bool        use_gpu_compute    = false;
     std::string shader_dir;
@@ -560,6 +563,7 @@ struct RayPipelineConfig {
     int         gpu_batch_size_t2  = 0;
     int         gpu_batch_size_t3  = 0;
     int         gpu_batch_size_t4  = 0;
+    int         gpu_batch_size_t5  = 0;
 
     /* Fraction of work to pin to GPU per stage (0=compete freely, >0=soft target).
      * 0.0 = CPU and GPU compete naturally on the shared queue.
@@ -567,6 +571,7 @@ struct RayPipelineConfig {
     float       gpu_fraction_t1    = 0.0f;
     float       gpu_fraction_t2    = 0.0f;
     float       gpu_fraction_t3    = 0.0f;
+    float       gpu_fraction_t5    = 0.0f;
 
     /* When true the GPU worker reads back hit records after T1 and feeds them
      * into accumulate_field_capture_segment — matching the CPU T1 path so that
@@ -702,6 +707,25 @@ void ray_pipeline_submit(
     const RayIntent*   intents,
     int                n_intents);
 
+/* Native forward-light launcher: samples authored emissive triangles inside C++
+ * and submits RayIntents directly to the persistent T1 queue.  This avoids the
+ * Python path building origin/direction/amplitude arrays for every exposure
+ * stage.  Returns the number of intents submitted. */
+int ray_pipeline_submit_emissive_triangles(
+    RayPipelineState* ps,
+    const int*        tri_ids,
+    int               n_tris,
+    int               rays_per_tri,
+    double            exposure_weight,
+    double            emitter_amp_gain,
+    int               max_bounces,
+    double            min_amplitude,
+    double            interaction_target_x,
+    double            interaction_target_y,
+    double            interaction_target_z,
+    double            interaction_target_r,
+    uint32_t          seed);
+
 /* Non-blocking drain: pop up to max_n records from the output queue.
  * Appends to out.  Returns count appended (0 if output queue is empty). */
 int ray_pipeline_drain(
@@ -733,7 +757,9 @@ void ray_pipeline_configure_sensor_image(
     RayPipelineState* ps,
     float plate_x, float plate_r,
     int   res,
-    float bdpt_eps);
+    float bdpt_eps,
+    float target_x,
+    float target_r);
 
 /* Copy current sensor image into caller-owned float32 buffer.
  * buf must hold res*res*3 floats (row-major RGB).

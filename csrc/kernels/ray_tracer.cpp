@@ -7407,6 +7407,7 @@ static inline uint32_t dispatch_scale_context_entry(
  * T2 refiner      — parametric surface point / normal refinement.
  * T3 material     — Fresnel/Snell/diffuse physics; spawns child RayIntents.
  * T4 wave solver  — ADI-CN BPM march per arena; exits re-enter T1.
+ * T5 connector    — staged BDPT connection/MIS over collected side records.
  *
  * Forward and backward paths are identical — BDPT delivers RayIntents only.
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -7498,7 +7499,7 @@ struct RayPipelineState {
      * T3 fast-path skips direction sampling + reflectance multiply for these. */
     std::vector<uint8_t>      mat_epsilon_flags;
 
-    StageStats                stats[4]; /* [0]=T1 [1]=T2 [2]=T3 [3]=T4        */
+    StageStats                stats[5]; /* [0]=T1 [1]=T2 [2]=T3 [3]=T4 [4]=T5 */
     std::atomic<uint64_t>     gpu_uv_readback_bytes{0};
     std::atomic<uint64_t>     gpu_uv_readback_count{0};
     std::atomic<uint64_t>     gpu_hit_readback_bytes{0};
@@ -7516,6 +7517,8 @@ struct RayPipelineState {
     float                     sensor_px   = 0.0f;
     float                     sensor_pr   = 0.0f;
     float                     sensor_eps  = 0.008f;
+    float                     sensor_target_x = 0.0f;
+    float                     sensor_target_r = 0.0f;
     std::vector<double>       sensor_accum;       /* res*res*4 doubles: ch0=fwd, ch1=bwd-emis, ch2=exact-BDPT, ch3=near-miss */
     std::vector<float>        priority_map;       /* res*res sugar-auxin field (1.0 = baseline) */
     mutable double            sensor_peak[4]      = {1e-30, 1e-30, 1e-30, 1e-30}; /* running per-channel max, never decreases */
@@ -7538,6 +7541,8 @@ struct RayPipelineState {
      * to detect sweep completion without any Python involvement. */
     std::atomic<uint64_t>     bdpt_cam_vertex_count{0};
     std::atomic<uint32_t>     bdpt_next_subpath_id{1u};
+    std::atomic<bool>         bdpt_connection_running{false};
+    std::atomic<uint64_t>     emitter_world_culled{0};
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7863,11 +7868,13 @@ public:
         if (cfg.gpu_batch_size_t2 > 0) ps.stats[1].batch_sz_gpu.store(cfg.gpu_batch_size_t2, std::memory_order_relaxed);
         if (cfg.gpu_batch_size_t3 > 0) ps.stats[2].batch_sz_gpu.store(cfg.gpu_batch_size_t3, std::memory_order_relaxed);
         if (cfg.gpu_batch_size_t4 > 0) ps.stats[3].batch_sz_gpu.store(cfg.gpu_batch_size_t4, std::memory_order_relaxed);
+        if (cfg.gpu_batch_size_t5 > 0) ps.stats[4].batch_sz_gpu.store(cfg.gpu_batch_size_t5, std::memory_order_relaxed);
 
         /* Apply pinned GPU fractions (if non-zero in config) */
         if (cfg.gpu_fraction_t1 > 0.0f) ps.stats[0].set_gpu_fraction(cfg.gpu_fraction_t1);
         if (cfg.gpu_fraction_t2 > 0.0f) ps.stats[1].set_gpu_fraction(cfg.gpu_fraction_t2);
         if (cfg.gpu_fraction_t3 > 0.0f) ps.stats[2].set_gpu_fraction(cfg.gpu_fraction_t3);
+        if (cfg.gpu_fraction_t5 > 0.0f) ps.stats[4].set_gpu_fraction(cfg.gpu_fraction_t5);
 
         /* Compile all four compute shaders */
         char err[1024];
@@ -10386,6 +10393,142 @@ void ray_pipeline_submit(
     }
 }
 
+int ray_pipeline_submit_emissive_triangles(
+    RayPipelineState* ps,
+    const int*        tri_ids,
+    int               n_tris,
+    int               rays_per_tri,
+    double            exposure_weight,
+    double            emitter_amp_gain,
+    int               max_bounces,
+    double            min_amplitude,
+    double            interaction_target_x,
+    double            interaction_target_y,
+    double            interaction_target_z,
+    double            interaction_target_r,
+    uint32_t          seed)
+{
+    if (!ps || !ps->st || !tri_ids || n_tris <= 0 || rays_per_tri <= 0)
+        return 0;
+
+    RayTracerState& st = *ps->st;
+    const int nb = std::max(1, st.n_bands);
+    const int n_scene_tris = static_cast<int>(st.tris.size());
+    const double scale = std::max(0.0, exposure_weight) * std::max(0.0, emitter_amp_gain);
+    if (!(scale > 0.0)) return 0;
+
+    static constexpr int SUBMIT_CHUNK = 262144;
+    std::vector<RayIntent> batch;
+    batch.reserve(SUBMIT_CHUNK);
+
+    std::mt19937_64 rng(static_cast<uint64_t>(seed) * 6364136223846793005ULL
+                        + 1442695040888963407ULL);
+    std::uniform_real_distribution<double> U(0.0, 1.0);
+    const bool use_interaction_target =
+        interaction_target_r > 0.0 &&
+        std::isfinite(interaction_target_x) &&
+        std::isfinite(interaction_target_y) &&
+        std::isfinite(interaction_target_z);
+    const V3d interaction_target(interaction_target_x,
+                                 interaction_target_y,
+                                 interaction_target_z);
+    const double interaction_r2 = interaction_target_r * interaction_target_r;
+    uint64_t culled = 0;
+
+    auto intersects_interaction_target = [&](const V3d& origin, const V3d& dir) -> bool {
+        if (!use_interaction_target) return true;
+        const V3d oc = origin - interaction_target;
+        const double b = oc.dot(dir);
+        const double c = oc.squaredNorm() - interaction_r2;
+        if (c <= 0.0) return true;
+        const double disc = b * b - c;
+        if (disc < 0.0) return false;
+        const double t = -b - std::sqrt(disc);
+        return t > T_SELF;
+    };
+
+    auto flush_batch = [&]() {
+        if (!batch.empty()) {
+            ray_pipeline_submit(ps, batch.data(), static_cast<int>(batch.size()));
+            batch.clear();
+        }
+    };
+
+    int submitted = 0;
+    for (int si = 0; si < n_tris; ++si) {
+        const int tri_id = tri_ids[si];
+        if (tri_id < 0 || tri_id >= n_scene_tris) continue;
+        const Triangle& T = st.tris[static_cast<size_t>(tri_id)];
+        const int mat = T.mat_idx;
+        if (mat < 0 || mat >= st.mat_n_mats) continue;
+
+        const double area = (tri_id < static_cast<int>(st.tri_areas.size()))
+            ? std::max(0.0, st.tri_areas[static_cast<size_t>(tri_id)])
+            : 0.5 * T.edge1.cross(T.edge2).norm();
+        if (!(area > 0.0)) continue;
+
+        std::vector<cd> emit(static_cast<size_t>(nb), cd(0.0, 0.0));
+        double emit_sum = 0.0;
+        for (int b = 0; b < nb; ++b) {
+            const double e = std::max(0.0, static_cast<double>(mat_band_record(st, mat, b)[5]));
+            const double a = scale * area * e / static_cast<double>(rays_per_tri);
+            emit[static_cast<size_t>(b)] = cd(a, 0.0);
+            emit_sum += a;
+        }
+        if (!(emit_sum > 0.0)) continue;
+
+        V3d n = T.normal;
+        if (n.norm() < 1.0e-12)
+            n = T.edge1.cross(T.edge2);
+        if (n.norm() < 1.0e-12) continue;
+        n.normalize();
+
+        for (int r = 0; r < rays_per_tri; ++r) {
+            double u = U(rng);
+            double v = U(rng);
+            if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
+            V3d origin = T.v0 + u * T.edge1 + v * T.edge2;
+            V3d emit_n = n;
+            apply_parametric_surface_point(st, tri_id, origin, origin, emit_n);
+            if (emit_n.norm() < 1.0e-12) emit_n = n;
+            emit_n.normalize();
+
+            V3d dir = cosine_hemisphere(emit_n, rng);
+            if (!intersects_interaction_target(origin, dir)) {
+                ++culled;
+                continue;
+            }
+            RayIntent ri{};
+            ri.pos = origin + dir * (EPS * 200.0);
+            ri.dir = dir;
+            ri.amp.resize(nb);
+            for (int b = 0; b < nb; ++b)
+                ri.amp[b] = emit[static_cast<size_t>(b)];
+            ri.src_id = si;
+            ri.tag = 0u;
+            ri.color_flag = 0u;
+            ri.bounces_left = max_bounces;
+            ri.min_amplitude = min_amplitude;
+            uint32_t sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+            if (sid == 0u)
+                sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+            ri.bdpt_subpath_id = sid;
+            ri.bdpt_vertex = 0u;
+            ri.bdpt_stream = BDPT_SIDE_LIGHT;
+            ri.bdpt_strategy = 0u;
+            batch.push_back(std::move(ri));
+            ++submitted;
+            if (static_cast<int>(batch.size()) >= SUBMIT_CHUNK)
+                flush_batch();
+        }
+    }
+
+    flush_batch();
+    if (culled > 0)
+        ps->emitter_world_culled.fetch_add(culled, std::memory_order_relaxed);
+    return submitted;
+}
+
 int ray_pipeline_drain(
     RayPipelineState*        ps,
     std::vector<RayRecord>&  out,
@@ -10421,6 +10564,7 @@ void ray_pipeline_get_stats(const RayPipelineState* ps, RayPipelineStats* out)
     snap(ps->stats[1], out->t2);
     snap(ps->stats[2], out->t3);
     snap(ps->stats[3], out->t4);
+    snap(ps->stats[4], out->t5);
     out->output_queue_depth = ps->Q_out.size();
     out->in_flight          = ps->in_flight.load(std::memory_order_relaxed);
     out->gpu_uv_readback_bytes = ps->gpu_uv_readback_bytes.load(std::memory_order_relaxed);
@@ -10570,9 +10714,10 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     const int limit = (max_rays > 0) ? std::min(max_rays, total) : total;
     if (limit <= 0) return 0;
 
-    double target_x = static_cast<double>(ps->sensor_px) - std::max(0.05, 2.0 * static_cast<double>(ps->sensor_pr));
-    double target_r = 0.0;
-    (void)bdpt_find_parametric_stop_target(*ps->st, target_x, target_r);
+    const double target_x = static_cast<double>(ps->sensor_target_x);
+    const double target_r = static_cast<double>(ps->sensor_target_r);
+    if (!(target_r > 0.0) || !std::isfinite(target_x))
+        return 0;
     const V3d target(target_x, 0.0, 0.0);
 
     const int n_bands = std::max(1, std::min(ps->st->n_bands, MAX_SPECTRAL_BANDS));
@@ -10698,6 +10843,34 @@ void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
 void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 {
     if (!ps || !ps->st || ps->sensor_res <= 0) return;
+    bool expected_running = false;
+    if (!ps->bdpt_connection_running.compare_exchange_strong(
+            expected_running, true,
+            std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+        return;
+    struct BdptConnectionRunGuard {
+        RayPipelineState* ps;
+        ~BdptConnectionRunGuard() {
+            ps->bdpt_connection_running.store(false, std::memory_order_release);
+        }
+    } run_guard{ps};
+    auto t5_start = std::chrono::steady_clock::now();
+    size_t t5_work_items = 0;
+    struct BdptT5StatsGuard {
+        RayPipelineState* ps;
+        std::chrono::steady_clock::time_point start;
+        size_t* work_items;
+        ~BdptT5StatsGuard() {
+            const auto t1 = std::chrono::steady_clock::now();
+            const uint64_t ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - start).count());
+            const int n = static_cast<int>(std::min<size_t>(
+                std::max<size_t>(1, *work_items),
+                static_cast<size_t>(std::numeric_limits<int>::max())));
+            ps->stats[4].record(n, ns, 0);
+        }
+    } t5_stats{ps, t5_start, &t5_work_items};
 
     std::vector<BdptVertexRecord>         verts_new;
     std::vector<BdptSpectralWeightRecord> sweights_new;
@@ -10707,6 +10880,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     ray_pipeline_drain_bdpt_spectral(ps, sweights_new, ps->cfg.bdpt_max_spectral > 0 ? ps->cfg.bdpt_max_spectral : 4000000);
     ray_pipeline_drain_bdpt_pdfs    (ps, pdfs_new,     ps->cfg.bdpt_max_pdfs     > 0 ? ps->cfg.bdpt_max_pdfs     : 2000000);
     ray_pipeline_drain_bdpt_optical (ps, optical_new,  ps->cfg.bdpt_max_optical  > 0 ? ps->cfg.bdpt_max_optical  : 1000000);
+    t5_work_items = verts_new.size() + sweights_new.size() + pdfs_new.size() + optical_new.size();
 
     std::vector<BdptVertexRecord>         verts;
     std::vector<BdptSpectralWeightRecord> sweights;
@@ -10737,6 +10911,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         sweights.swap(ps->bdpt_pending_spectral);
         pdfs.swap(ps->bdpt_pending_pdfs);
         optical.swap(ps->bdpt_pending_optical);
+        t5_work_items = verts.size() + sweights.size() + pdfs.size() + optical.size();
     }
 
     if (verts.empty()) return;
@@ -11008,13 +11183,39 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     if (cam_paths.empty() || light_paths.empty()) return;
 
+    struct BdptCandidateScratch {
+        std::vector<const BdptVertexRecord*> chain;
+        std::vector<double> edge_fwd;
+        std::vector<double> edge_bwd;
+        std::vector<uint8_t> edge_fwd_ok;
+        std::vector<uint8_t> edge_bwd_ok;
+        std::vector<double> prefix_fwd;
+        std::vector<double> suffix_bwd;
+        std::vector<uint8_t> prefix_ok;
+        std::vector<uint8_t> suffix_ok;
+
+        BdptCandidateScratch() {
+            chain.reserve(32);
+            edge_fwd.reserve(31);
+            edge_bwd.reserve(31);
+            edge_fwd_ok.reserve(31);
+            edge_bwd_ok.reserve(31);
+            prefix_fwd.reserve(32);
+            suffix_bwd.reserve(32);
+            prefix_ok.reserve(32);
+            suffix_ok.reserve(32);
+        }
+    };
+
     auto candidate_strategy_density = [&](const BdptSubpathView& cam,
                                           size_t ci,
                                           const BdptSubpathView& light,
                                           size_t li,
+                                          BdptCandidateScratch& scratch,
                                           double& out_selected_pdf,
                                           double& out_denom) -> bool {
-        std::vector<const BdptVertexRecord*> chain;
+        auto& chain = scratch.chain;
+        chain.clear();
         chain.reserve(ci + li + 2);
         for (size_t i = 0; i <= ci; ++i)
             chain.push_back(cam.v[i]);
@@ -11023,10 +11224,18 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
         const size_t N = chain.size();
         if (N < 2) return false;
-        std::vector<double> edge_fwd(N - 1, 0.0);
-        std::vector<double> edge_bwd(N - 1, 0.0);
-        std::vector<uint8_t> edge_fwd_ok(N - 1, 0u);
-        std::vector<uint8_t> edge_bwd_ok(N - 1, 0u);
+        auto& edge_fwd = scratch.edge_fwd;
+        auto& edge_bwd = scratch.edge_bwd;
+        auto& edge_fwd_ok = scratch.edge_fwd_ok;
+        auto& edge_bwd_ok = scratch.edge_bwd_ok;
+        edge_fwd.resize(N - 1);
+        edge_bwd.resize(N - 1);
+        edge_fwd_ok.resize(N - 1);
+        edge_bwd_ok.resize(N - 1);
+        std::fill(edge_fwd.begin(), edge_fwd.end(), 0.0);
+        std::fill(edge_bwd.begin(), edge_bwd.end(), 0.0);
+        std::fill(edge_fwd_ok.begin(), edge_fwd_ok.end(), 0u);
+        std::fill(edge_bwd_ok.begin(), edge_bwd_ok.end(), 0u);
 
         for (size_t e = 0; e + 1 < N; ++e) {
             double pf = 0.0, pb = 0.0;
@@ -11057,10 +11266,18 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             }
         }
 
-        std::vector<double> prefix_fwd(N, 0.0);
-        std::vector<double> suffix_bwd(N, 0.0);
-        std::vector<uint8_t> prefix_ok(N, 0u);
-        std::vector<uint8_t> suffix_ok(N, 0u);
+        auto& prefix_fwd = scratch.prefix_fwd;
+        auto& suffix_bwd = scratch.suffix_bwd;
+        auto& prefix_ok = scratch.prefix_ok;
+        auto& suffix_ok = scratch.suffix_ok;
+        prefix_fwd.resize(N);
+        suffix_bwd.resize(N);
+        prefix_ok.resize(N);
+        suffix_ok.resize(N);
+        std::fill(prefix_fwd.begin(), prefix_fwd.end(), 0.0);
+        std::fill(suffix_bwd.begin(), suffix_bwd.end(), 0.0);
+        std::fill(prefix_ok.begin(), prefix_ok.end(), 0u);
+        std::fill(suffix_ok.begin(), suffix_ok.end(), 0u);
         prefix_fwd[0] = 1.0;
         prefix_ok[0] = 1u;
         for (size_t i = 1; i < N; ++i) {
@@ -11106,82 +11323,150 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         if (sw.band_id > max_band) max_band = sw.band_id;
     const int n_bands = (int)max_band + 1;
 
-    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+    std::vector<const BdptSubpathView*> cam_items;
+    std::vector<const BdptSubpathView*> light_items;
+    cam_items.reserve(cam_paths.size());
+    light_items.reserve(light_paths.size());
+    for (const auto& kv : cam_paths) cam_items.push_back(&kv.second);
+    for (const auto& kv : light_paths) light_items.push_back(&kv.second);
 
-    for (const auto& [cam_id, cam] : cam_paths) {
-        for (const auto& [light_id, light] : light_paths) {
-            for (size_t ci = 0; ci < cam.v.size(); ++ci) {
-                const BdptVertexRecord& c = *cam.v[ci];
-                if (!vertex_connectable(c)) continue;
-                if (!cam.prefix_valid[ci]) continue;
-                const int iy = static_cast<int>((c.sensor_origin_y + ps->sensor_pr) * inv_r);
-                const int iz = static_cast<int>((c.sensor_origin_z + ps->sensor_pr) * inv_r);
-                if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
+    const size_t pix = static_cast<size_t>(res) * static_cast<size_t>(res);
+    const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
+    const size_t nw = std::max<size_t>(1, std::min<size_t>(cam_items.size(), hw));
+    std::vector<std::vector<double>> local_sensor(nw, std::vector<double>(pix, 0.0));
+    std::vector<uint64_t> local_exact(nw, 0);
+    std::mutex connection_flush_mu;
 
-                const double beta_cam = beta_scalar(c, n_bands);
-                if (beta_cam < 1e-15) continue;
+    auto flush_connections = [&](std::vector<BdptConnectionRecord>& batch) {
+        if (batch.empty()) return;
+        std::lock_guard<std::mutex> lk(connection_flush_mu);
+        for (auto& cr : batch)
+            ps->push_bdpt_connection(std::move(cr));
+        batch.clear();
+    };
 
-                double pixel_accum = 0.0;
-                for (size_t li = 0; li < light.v.size(); ++li) {
-                    const BdptVertexRecord& l = *light.v[li];
-                    if (!vertex_connectable(l)) continue;
-                    if (!light.prefix_valid[li]) continue;
+    auto worker = [&](size_t tid, size_t c_begin, size_t c_end) {
+        BdptCandidateScratch scratch;
+        std::vector<BdptConnectionRecord> conn_batch;
+        conn_batch.reserve(4096);
+        auto& sensor_local = local_sensor[tid];
+        uint64_t exact_local = 0;
 
-                    const float dx = l.pos[0] - c.pos[0];
-                    const float dy = l.pos[1] - c.pos[1];
-                    const float dz = l.pos[2] - c.pos[2];
-                    const float dist2 = dx*dx + dy*dy + dz*dz;
-                    if (dist2 < 1e-12f) continue;
-                    const float dist = std::sqrt(dist2);
-                    const float cx = dx/dist, cy = dy/dist, cz = dz/dist;
-                    const float cos_c = std::abs(c.normal[0]*cx + c.normal[1]*cy + c.normal[2]*cz);
-                    const float cos_l = std::abs(l.normal[0]*(-cx) + l.normal[1]*(-cy) + l.normal[2]*(-cz));
-                    const float geom = cos_c * cos_l / dist2;
-                    if (geom < 1e-20f) continue;
-                    const bool is_visible = visible(c, l);
+        for (size_t ck = c_begin; ck < c_end; ++ck) {
+            const BdptSubpathView& cam = *cam_items[ck];
+            for (const BdptSubpathView* light_ptr : light_items) {
+                const BdptSubpathView& light = *light_ptr;
+                for (size_t ci = 0; ci < cam.v.size(); ++ci) {
+                    const BdptVertexRecord& c = *cam.v[ci];
+                    if (!vertex_connectable(c)) continue;
+                    if (!cam.prefix_valid[ci]) continue;
+                    const int iy = static_cast<int>((c.sensor_origin_y + ps->sensor_pr) * inv_r);
+                    const int iz = static_cast<int>((c.sensor_origin_z + ps->sensor_pr) * inv_r);
+                    if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
 
-                    const double beta_light = beta_scalar(l, n_bands);
-                    if (beta_light < 1e-15) continue;
+                    const double beta_cam = beta_scalar(c, n_bands);
+                    if (beta_cam < 1e-15) continue;
 
-                    double strategy_pdf = 0.0;
-                    double denom = 0.0;
-                    if (!candidate_strategy_density(cam, ci, light, li, strategy_pdf, denom))
-                        continue;
-                    const double mis_weight = strategy_pdf / denom;
-                    BdptConnectionRecord cr{};
-                    cr.camera_subpath_id   = c.subpath_id;
-                    cr.light_subpath_id    = l.subpath_id;
-                    cr.camera_vertex_index = c.vertex_index;
-                    cr.light_vertex_index  = l.vertex_index;
-                    cr.strategy_s          = static_cast<uint16_t>(std::min<size_t>(ci + 1, 0xFFFFu));
-                    cr.strategy_t          = static_cast<uint16_t>(std::min<size_t>(li + 1, 0xFFFFu));
-                    cr.flags               = is_visible ? 0u : (1u << 0);
-                    cr.p0[0] = c.pos[0]; cr.p0[1] = c.pos[1]; cr.p0[2] = c.pos[2];
-                    cr.p1[0] = l.pos[0]; cr.p1[1] = l.pos[1]; cr.p1[2] = l.pos[2];
-                    cr.dist2               = dist2;
-                    cr.cos_camera          = cos_c;
-                    cr.cos_light           = cos_l;
-                    cr.geometry_term       = geom;
-                    cr.visibility          = is_visible ? 1.0f : 0.0f;
-                    cr.strategy_pdf        = static_cast<float>(std::min(strategy_pdf, (double)std::numeric_limits<float>::max()));
-                    cr.mis_weight          = static_cast<float>(mis_weight);
-                    ps->push_bdpt_connection(cr);
-                    if (!is_visible) continue;
+                    double pixel_accum = 0.0;
+                    for (size_t li = 0; li < light.v.size(); ++li) {
+                        const BdptVertexRecord& l = *light.v[li];
+                        if (!vertex_connectable(l)) continue;
+                        if (!light.prefix_valid[li]) continue;
 
-                    const double raw = beta_cam * beta_light * (double)geom / strategy_pdf;
-                    pixel_accum += raw * mis_weight;
-                }
+                        const float dx = l.pos[0] - c.pos[0];
+                        const float dy = l.pos[1] - c.pos[1];
+                        const float dz = l.pos[2] - c.pos[2];
+                        const float dist2 = dx*dx + dy*dy + dz*dz;
+                        if (dist2 < 1e-12f) continue;
+                        const float dist = std::sqrt(dist2);
+                        const float cx = dx/dist, cy = dy/dist, cz = dz/dist;
+                        const float cos_c = std::abs(c.normal[0]*cx + c.normal[1]*cy + c.normal[2]*cz);
+                        const float cos_l = std::abs(l.normal[0]*(-cx) + l.normal[1]*(-cy) + l.normal[2]*(-cz));
+                        const float geom = cos_c * cos_l / dist2;
+                        if (geom < 1e-20f) continue;
+                        const bool is_visible = visible(c, l);
 
-                if (pixel_accum > 0.0) {
-                    const size_t idx = static_cast<size_t>(2 * res * res + iy * res + iz);
-                    ps->sensor_accum[idx] += pixel_accum;
-                    if (ps->sensor_accum[idx] > ps->sensor_peak[2])
-                        ps->sensor_peak[2] = ps->sensor_accum[idx];
-                    ps->bdpt_exact_snaps.fetch_add(1, std::memory_order_relaxed);
+                        const double beta_light = beta_scalar(l, n_bands);
+                        if (beta_light < 1e-15) continue;
+
+                        double strategy_pdf = 0.0;
+                        double denom = 0.0;
+                        if (!candidate_strategy_density(cam, ci, light, li, scratch, strategy_pdf, denom))
+                            continue;
+                        const double mis_weight = strategy_pdf / denom;
+                        BdptConnectionRecord cr{};
+                        cr.camera_subpath_id   = c.subpath_id;
+                        cr.light_subpath_id    = l.subpath_id;
+                        cr.camera_vertex_index = c.vertex_index;
+                        cr.light_vertex_index  = l.vertex_index;
+                        cr.strategy_s          = static_cast<uint16_t>(std::min<size_t>(ci + 1, 0xFFFFu));
+                        cr.strategy_t          = static_cast<uint16_t>(std::min<size_t>(li + 1, 0xFFFFu));
+                        cr.flags               = is_visible ? 0u : (1u << 0);
+                        cr.p0[0] = c.pos[0]; cr.p0[1] = c.pos[1]; cr.p0[2] = c.pos[2];
+                        cr.p1[0] = l.pos[0]; cr.p1[1] = l.pos[1]; cr.p1[2] = l.pos[2];
+                        cr.dist2               = dist2;
+                        cr.cos_camera          = cos_c;
+                        cr.cos_light           = cos_l;
+                        cr.geometry_term       = geom;
+                        cr.visibility          = is_visible ? 1.0f : 0.0f;
+                        cr.strategy_pdf        = static_cast<float>(std::min(strategy_pdf, (double)std::numeric_limits<float>::max()));
+                        cr.mis_weight          = static_cast<float>(mis_weight);
+                        conn_batch.push_back(cr);
+                        if (conn_batch.size() >= 4096)
+                            flush_connections(conn_batch);
+                        if (!is_visible) continue;
+
+                        const double raw = beta_cam * beta_light * (double)geom / strategy_pdf;
+                        pixel_accum += raw * mis_weight;
+                    }
+
+                    if (pixel_accum > 0.0) {
+                        const size_t idx = static_cast<size_t>(iy * res + iz);
+                        sensor_local[idx] += pixel_accum;
+                        ++exact_local;
+                    }
                 }
             }
         }
+
+        flush_connections(conn_batch);
+        local_exact[tid] = exact_local;
+    };
+
+    if (nw == 1) {
+        worker(0, 0, cam_items.size());
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(nw);
+        const size_t chunk = (cam_items.size() + nw - 1) / nw;
+        for (size_t t = 0; t < nw; ++t) {
+            const size_t lo = t * chunk;
+            const size_t hi = std::min(cam_items.size(), lo + chunk);
+            if (lo >= hi) break;
+            workers.emplace_back([&, t, lo, hi] { worker(t, lo, hi); });
+        }
+        for (auto& th : workers)
+            if (th.joinable()) th.join();
     }
+
+    uint64_t exact_total = 0;
+    {
+        std::lock_guard<std::mutex> lk(ps->sensor_mu);
+        const size_t ch2 = 2 * pix;
+        for (size_t t = 0; t < nw; ++t) {
+            exact_total += local_exact[t];
+            const auto& src = local_sensor[t];
+            for (size_t i = 0; i < pix; ++i) {
+                const double v = src[i];
+                if (v <= 0.0) continue;
+                const double nv = (ps->sensor_accum[ch2 + i] += v);
+                if (nv > ps->sensor_peak[2])
+                    ps->sensor_peak[2] = nv;
+            }
+        }
+    }
+    if (exact_total > 0)
+        ps->bdpt_exact_snaps.fetch_add(exact_total, std::memory_order_relaxed);
 
     /* Keep the finite camera projection packet resident for the current
      * exposure.  Light-side records are consumed by this connection pass, but
@@ -11244,7 +11529,10 @@ void ray_pipeline_report_display_frame_time(RayPipelineState* ps,
 
     auto shrink_batch = [](StageStats& s) {
         int cur = s.batch_sz_gpu.load(std::memory_order_relaxed);
-        int next = std::max(256, cur / 2);
+        /* Keep compute dispatches large enough to amortize GL sync/readback
+         * overhead.  A slow interactive frame should not collapse ray tracing
+         * into hundreds of 256-ray launches. */
+        int next = std::max(16384, cur / 2);
         if (next != cur) s.batch_sz_gpu.store(next, std::memory_order_relaxed);
     };
     auto grow_batch = [](StageStats& s) {
@@ -11280,7 +11568,9 @@ void ray_pipeline_configure_sensor_image(
     RayPipelineState* ps,
     float plate_x, float plate_r,
     int   res,
-    float bdpt_eps)
+    float bdpt_eps,
+    float target_x,
+    float target_r)
 {
     if (!ps) return;
     std::lock_guard<std::mutex> lk(ps->sensor_mu);
@@ -11288,6 +11578,8 @@ void ray_pipeline_configure_sensor_image(
     ps->sensor_px  = plate_x;
     ps->sensor_pr  = (plate_r > 0.0f) ? plate_r : 0.16f;
     ps->sensor_eps = (bdpt_eps > 0.0f) ? bdpt_eps : 0.008f;
+    ps->sensor_target_x = target_x;
+    ps->sensor_target_r = target_r;
     /* 4 channels: ch0=forward hits, ch1=backward emissive, ch2=exact BDPT, ch3=near-miss */
     ps->sensor_accum.assign(static_cast<size_t>(res) * res * 4, 0.0);
     ps->priority_map.assign(static_cast<size_t>(res) * res, 1.0f);

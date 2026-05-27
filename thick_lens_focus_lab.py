@@ -51,7 +51,6 @@ from camera_software.sensor_back import (
     ColorScienceProfile,
     HookStage,
 )
-
 try:
     import torch
 except Exception:
@@ -534,6 +533,7 @@ class CameraLightBurstConfig:
     enabled: bool = True
     exposure_time_s: float = 0.010
     stages: int = 1
+    rays_per_emitter: int = 64
     energy_scale: float = 1.0
     duty_cycle: float = 1.0
     profile: str = "steady"
@@ -1270,6 +1270,10 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
     lenses = list(getattr(scene, "lens_stack", []) or [])
     if not lenses:
         lenses = [scene.lens]
+    # Always ascending X so lenses[0] is the subject-facing group (G1) and
+    # lenses[-1] is the sensor-facing group (G4), regardless of the order
+    # that apply_to_scene or solve_four_group_zoom_surrogate returns them.
+    lenses.sort(key=lambda l: l.center_x)
 
     # Optional macro supplementary group: positive close-up lens prepended at
     # the front of the stack.  It reduces the effective focal length, allowing
@@ -4314,6 +4318,9 @@ class ForwardCppLensBench:
         # Once _gpu_calibrated is True, a calibration report has been printed.
         self._gpu_profile_snapshots: list = []
         self._gpu_calibrated: bool = False
+        self._display_report_interval_s: float = 1.0
+        self._display_last_report_t: float = 0.0
+        self._display_last_pipeline_summary: str = "no activity"
         n_req = int(np.asarray(self.freq_hz, dtype=np.float64).size)
         if self.sidecar is None:
             self.sidecar = FreeFrequencySidecar.lazy_prepare(n_req)
@@ -4598,18 +4605,21 @@ class ForwardCppLensBench:
             atmo_abs=np.zeros_like(self.freq_hz, dtype=np.float64),
         )
         # tensors was built from db.build_tensors() earlier in this method
+        self._base_pbr: np.ndarray = np.ascontiguousarray(tensors["pbr"], dtype=np.float32)
+        self._base_enamel: np.ndarray = np.ascontiguousarray(tensors["enamel"], dtype=np.float32)
+        self._base_tex_stack: np.ndarray = np.ascontiguousarray(tensors["texture_stack"], dtype=np.float32)
         self.tracer.set_surface_chunks(
-            pbr=np.ascontiguousarray(tensors["pbr"], dtype=np.float32),
-            enamel=np.ascontiguousarray(tensors["enamel"], dtype=np.float32),
-            tex_stack=np.ascontiguousarray(tensors["texture_stack"], dtype=np.float32),
+            pbr=self._base_pbr,
+            enamel=self._base_enamel,
+            tex_stack=self._base_tex_stack,
         )
         self._configure_sensor_film_pipeline()
 
         # Drive forward tracing from authored emissive source geometry.
         self.src_pos = np.ascontiguousarray(self.tri_centroids[self.emitter_tri_ids], dtype=np.float64)
+        self._emitter_tri_ids_i32 = np.ascontiguousarray(self.emitter_tri_ids, dtype=np.int32)
         src_n = int(self.src_pos.shape[0])
         src_normals = np.ascontiguousarray(normals[self.emitter_tri_ids], dtype=np.float64)
-        self.src_dir = np.ascontiguousarray(src_normals, dtype=np.float64)
         # Emitter area PDF: uniform area sampling over all emitter triangles.
         _ev = self.tri_vertices[self.emitter_tri_ids]   # (N, 3, 3)
         _e0 = _ev[:, 1, :] - _ev[:, 0, :]
@@ -4618,20 +4628,6 @@ class ForwardCppLensBench:
         self._emitter_tri_areas = np.ascontiguousarray(_tri_areas.astype(np.float64, copy=False), dtype=np.float64)
         _total_emitter_area = float(np.sum(_tri_areas))
         self._emitter_launch_pdf: float = 1.0 / max(_total_emitter_area, 1.0e-30)
-        _emitter_mat_ids = self.tri_mat_ids[self.emitter_tri_ids].astype(np.int32, copy=False)
-        self._emitter_band_emission = np.zeros((src_n, self.n_bands), dtype=np.float64)
-        if mat_buf.size > 0 and mat_n_mats > 0:
-            _mat_rows = mat_buf.reshape(mat_n_mats, MAX_SPECTRAL_BANDS, -1)
-            for _si, _mid in enumerate(_emitter_mat_ids):
-                if 0 <= int(_mid) < mat_n_mats:
-                    _nb = min(self.n_bands, MAX_SPECTRAL_BANDS)
-                    self._emitter_band_emission[_si, :_nb] = np.maximum(
-                        _mat_rows[int(_mid), :_nb, 5].astype(np.float64, copy=False),
-                        0.0,
-                    )
-        # Neutral launch profile: no Python-side beaming. Keep transport driven
-        # by emissive materials and scene geometry only.
-        self.src_directivity = np.ones((src_n,), dtype=np.float64)
         self.tri_flux = np.zeros((self.n_tris, self.n_bands), dtype=np.float32)
         print(
             "[emitter-tris]",
@@ -4651,7 +4647,7 @@ class ForwardCppLensBench:
         radial = self.src_pos - src_center[None, :]
         radial_norm = np.linalg.norm(radial, axis=1, keepdims=True)
         radial_unit = radial / np.maximum(radial_norm, 1.0e-12)
-        radial_dot = np.sum(radial_unit * self.src_dir, axis=1) if src_n > 0 else np.zeros((0,), dtype=np.float64)
+        radial_dot = np.sum(radial_unit * src_normals, axis=1) if src_n > 0 else np.zeros((0,), dtype=np.float64)
         print(
             "[source-normal-check]",
             f"mean_dot={float(np.mean(radial_dot)) if radial_dot.size else 0.0:+.4f}",
@@ -5092,6 +5088,45 @@ class ForwardCppLensBench:
         duty = float(np.clip(getattr(burst, "duty_cycle", 1.0), 0.0, 1.0))
         return energy * duty / float(max(1, self._exposure_stage_count()))
 
+    def _exposure_rays_per_emitter(self, requested: int) -> int:
+        burst = getattr(self.scene, "camera_light_burst", None)
+        if burst is None or not bool(getattr(burst, "enabled", True)):
+            return max(1, int(requested))
+        return max(1, int(requested), int(getattr(burst, "rays_per_emitter", 64)))
+
+    def _emitter_interaction_target(self) -> Tuple[float, float, float, float]:
+        obj = self.scene.object_plane
+        subject_r = float(max(
+            getattr(obj, "radius", 0.0),
+            getattr(self.scene, "subject_scale", 0.0) * 1.75,
+            getattr(self.scene, "tube_radius", 0.0) * 0.75,
+        ))
+        return (
+            float(getattr(obj, "x", 0.0)),
+            float(getattr(self.scene, "subject_y", 0.0)),
+            float(getattr(self.scene, "subject_z", 0.0)),
+            subject_r,
+        )
+
+    def _configure_cpp_sensor_image(self, res: int, bdpt_eps: float = 0.008) -> None:
+        target_x = float(np.asarray(getattr(self, "aperture_centroid", np.zeros(3, dtype=np.float64)), dtype=np.float64)[0])
+        target_r = float(getattr(self, "aperture_radius", 0.0))
+        self.tracer.configure_sensor_image(
+            float(self.scene.image_plate.x),
+            float(self.scene.image_plate.radius),
+            int(res),
+            float(bdpt_eps),
+            target_x,
+            target_r,
+        )
+        print(
+            "[sensor-sweep-target]",
+            f"sensor_x={float(self.scene.image_plate.x):.4f}",
+            f"target_x={target_x:.4f}",
+            f"target_r={target_r*1e3:.2f}mm",
+            flush=True,
+        )
+
     def _shutter_stage_args(self, stage_idx: int, stage_count: int) -> dict:
         plate = self.scene.image_plate
         mode_s = str(getattr(plate, "shutter_mode", "open") or "open").lower()
@@ -5163,64 +5198,40 @@ class ForwardCppLensBench:
         _use_gpu = self.compute_mode in ("gpu", "mixed")
         _all_gpu = self.compute_mode == "gpu"
 
-        if bake_origins is not None:
-            n_submit      = len(bake_origins)
-            origins       = np.ascontiguousarray(bake_origins,     dtype=np.float64)
-            directions    = np.ascontiguousarray(bake_directions,   dtype=np.float64)
-            amplitudes    = np.ones((n_submit, self.n_bands), dtype=np.complex128)
-            src_ids       = np.zeros(n_submit, dtype=np.int32)
-            tag_arr       = np.arange(n_submit, dtype=np.uint64)
-            cflag_arr     = np.zeros(n_submit, dtype=np.uint8)
-            total         = n_submit
-            _max_children = 1
-        else:
-            rng = np.random.default_rng(seed)
-            n_src  = int(self.src_pos.shape[0])
+        if bake_origins is None and tags is not None:
+            raise RuntimeError("tagged Python forward launch was removed; live forward emission uses native C++ emissive triangle submission")
+        if bake_origins is None and blocking:
+            raise RuntimeError("blocking Python forward launch is only supported for explicit bake_origins training rays")
+
+        if bake_origins is None:
             n_rays = int(max(1, rays_per_emitter))
-            total  = n_src * n_rays
-            n_bands = self.n_bands
+            submitted = int(self.tracer.submit_emissive_triangles(
+                self._emitter_tri_ids_i32,
+                n_rays,
+                float(max(0.0, exposure_weight)),
+                float(self.emitter_amp_gain),
+                int(max_bounces),
+                float(self._min_amplitude),
+                2,
+                int(seed),
+                bool(_use_gpu),
+                bool(_all_gpu),
+                _SHADER_DIR,
+                *self._emitter_interaction_target(),
+            ))
+            self._ensure_drain_loop()
+            self._async_forward_launched_count += int(submitted)
+            return submitted
 
-            origins     = np.empty((total, 3), dtype=np.float64)
-            directions  = np.empty((total, 3), dtype=np.float64)
-            amplitudes  = np.zeros((total, n_bands), dtype=np.complex128)
-            src_ids     = np.empty((total,), dtype=np.int32)
-            tag_arr     = np.zeros((total,), dtype=np.uint64)
-            cflag_arr   = np.zeros((total,), dtype=np.uint8)  # 0 = emissive / forward
-
-            for si in range(n_src):
-                base   = si * n_rays
-                normal = self.src_dir[si]
-                up = np.array([0.0, 0.0, 1.0])
-                if abs(normal[2]) > 0.9:
-                    up = np.array([1.0, 0.0, 0.0])
-                tx = np.cross(normal, up);  tx /= np.linalg.norm(tx)
-                ty = np.cross(normal, tx)
-
-                u1 = rng.random(n_rays)
-                u2 = rng.random(n_rays)
-                cos_th = np.sqrt(1.0 - u1)
-                sin_th = np.sqrt(u1)
-                phi    = 2.0 * np.pi * u2
-                dirs_local = (sin_th[:, None] * np.cos(phi)[:, None] * tx[None, :]
-                            + sin_th[:, None] * np.sin(phi)[:, None] * ty[None, :]
-                            + cos_th[:, None]                        * normal[None, :])
-                dirs_local /= np.linalg.norm(dirs_local, axis=1, keepdims=True) + 1e-30
-
-                origins   [base:base+n_rays] = self.src_pos[si]
-                directions[base:base+n_rays] = dirs_local
-                src_ids   [base:base+n_rays] = si
-                emit = np.asarray(self._emitter_band_emission[si, :n_bands], dtype=np.float64)
-                area = float(self._emitter_tri_areas[si]) if si < int(self._emitter_tri_areas.size) else 0.0
-                ray_energy = (float(self.emitter_amp_gain)
-                              * float(max(0.0, exposure_weight))
-                              * area
-                              * emit
-                              / float(max(1, n_rays)))
-                amplitudes[base:base+n_rays, :] = ray_energy[None, :].astype(np.complex128)
-                if tags is not None and si < len(tags):
-                    tag_arr[base:base+n_rays] = int(tags[si])
-
-            _max_children = 2
+        n_submit      = len(bake_origins)
+        origins       = np.ascontiguousarray(bake_origins,     dtype=np.float64)
+        directions    = np.ascontiguousarray(bake_directions,   dtype=np.float64)
+        amplitudes    = np.ones((n_submit, self.n_bands), dtype=np.complex128)
+        src_ids       = np.zeros(n_submit, dtype=np.int32)
+        tag_arr       = np.arange(n_submit, dtype=np.uint64)
+        cflag_arr     = np.zeros(n_submit, dtype=np.uint8)
+        total         = n_submit
+        _max_children = 1
 
         if self.cull_infinite_rays:
             origins, directions, amplitudes, src_ids, cflag_arr, tag_arr = _cull_finite_rays(
@@ -5343,6 +5354,7 @@ class ForwardCppLensBench:
         _n_since_update  = 0
         _PROFILE_INTERVAL_S  = 0.5   # snapshot every 500 ms
         _PROFILE_WARMUP      = 8     # print calibration report after N non-trivial snapshots
+        _empty_polls         = 0
         while not self._drain_stop.is_set():
             try:
                 # Blend frame-rate preference into the target drain window.
@@ -5363,6 +5375,7 @@ class ForwardCppLensBench:
                 records    = self.tracer.drain_records_slim(max_n=batch)
                 n          = int(records["kind"].shape[0]) if records else 0
                 if n > 0:
+                    _empty_polls = 0
                     self._fast_bdpt_feed(records)
                     self._accumulate_records(records)
                     # Update rolling throughput estimate every 50ms or 1k records.
@@ -5389,7 +5402,7 @@ class ForwardCppLensBench:
                             # Count as non-trivial if any GPU work has been done.
                             gpu_total = sum(
                                 s[stage].get("gpu_processed", 0)
-                                for stage in ("t1", "t2", "t3", "t4")
+                                for stage in ("t1", "t2", "t3", "t4", "t5")
                             )
                             if gpu_total > 0:
                                 self._gpu_profile_snapshots.append(s)
@@ -5400,12 +5413,16 @@ class ForwardCppLensBench:
                     if n >= batch * 3 // 4:
                         continue
                 else:
+                    _empty_polls += 1
                     # Back off harder when the pipeline is also empty — avoids
-                    # spinning the CPU core at full speed in GPU-all mode.
+                    # spinning the CPU core at full speed in GPU-all mode.  When
+                    # GPU work is still in flight but has not produced records
+                    # yet, use a short adaptive idle instead of polling at 1 kHz.
                     if int(self.tracer.in_flight_count()) == 0:
+                        _empty_polls = 0
                         time.sleep(0.020)
                     else:
-                        time.sleep(0.001)
+                        time.sleep(min(0.010, 0.001 * max(1, _empty_polls)))
             except Exception as _drain_exc:
                 print(f"[drain-loop ERROR] {_drain_exc}", flush=True)
                 time.sleep(0.1)
@@ -5415,7 +5432,7 @@ class ForwardCppLensBench:
         snaps = self._gpu_profile_snapshots
         if not snaps:
             return
-        stages = ("t1", "t2", "t3", "t4")
+        stages = ("t1", "t2", "t3", "t4", "t5")
         print("[gpu-calibration] === pipeline efficiency report ===", flush=True)
         for stage in stages:
             cpu_tp  = float(np.mean([s[stage]["throughput"]     for s in snaps]))
@@ -6485,12 +6502,6 @@ class ForwardCppLensBench:
                 print(f"[bdpt-cpp] camera projection submit failed: {exc}", flush=True)
 
             try:
-                if self._bdpt_native_sensor_sweep_started:
-                    self.tracer.run_bdpt_connection()
-            except Exception as exc:
-                print(f"[bdpt-cpp] connection pass failed: {exc}", flush=True)
-
-            try:
                 stats = dict(self.tracer.get_bdpt_stats())
             except Exception:
                 stats = {}
@@ -7025,35 +7036,42 @@ class ForwardCppLensBench:
                 verts_by_class[cls] = np.ascontiguousarray(v)
                 n_by_class[cls]     = v.shape[0]
 
-        try:
-            ps = self.tracer.pipeline_stats()
-            stage_parts = []
-            for stage in ("t1", "t2", "t3", "t4"):
-                st       = ps[stage]
-                cpu_tp   = float(st["throughput"])
-                gpu_tp   = float(st["gpu_throughput"])
-                cpu_n    = int(st["processed"])
-                gpu_n    = int(st["gpu_processed"])
-                bs_gpu   = int(st["gpu_batch_size"])
-                gpu_frac = float(st["gpu_fraction"])
-                # Skip stages where neither CPU nor GPU has processed anything yet
-                if cpu_n == 0 and gpu_n == 0:
-                    continue
-                cpu_str = f"cpu={cpu_tp/1e3:.1f}k(n={cpu_n})" if cpu_n > 0 else "cpu=-"
-                gpu_str = f"gpu={gpu_tp/1e3:.1f}k(n={gpu_n},bs={bs_gpu},f={gpu_frac:.2f})" if gpu_n > 0 else "gpu=-"
-                stage_parts.append(f"{stage}:[{cpu_str} {gpu_str}]")
-            pipeline_summary = "  ".join(stage_parts) if stage_parts else "no activity"
-        except Exception:
-            pipeline_summary = "n/a"
-
         field_nonzero = int(np.count_nonzero(np.maximum.reduce(field_rgb, axis=3)))
-        print(
-            "[display-records]",
-            f"field_nonzero={field_nonzero}",
-            f"pts={[n_by_class[c] for c in range(6)]}",
-            f"pipeline={pipeline_summary}",
-            flush=True,
-        )
+        report_now = False
+        t_report = time.perf_counter()
+        if (t_report - self._display_last_report_t) >= self._display_report_interval_s:
+            self._display_last_report_t = t_report
+            report_now = True
+
+        if report_now:
+            try:
+                ps = self.tracer.pipeline_stats()
+                stage_parts = []
+                for stage in ("t1", "t2", "t3", "t4", "t5"):
+                    st       = ps[stage]
+                    cpu_tp   = float(st["throughput"])
+                    gpu_tp   = float(st["gpu_throughput"])
+                    cpu_n    = int(st["processed"])
+                    gpu_n    = int(st["gpu_processed"])
+                    bs_gpu   = int(st["gpu_batch_size"])
+                    gpu_frac = float(st["gpu_fraction"])
+                    # Skip stages where neither CPU nor GPU has processed anything yet
+                    if cpu_n == 0 and gpu_n == 0:
+                        continue
+                    cpu_str = f"cpu={cpu_tp/1e3:.1f}k(n={cpu_n})" if cpu_n > 0 else "cpu=-"
+                    gpu_str = f"gpu={gpu_tp/1e3:.1f}k(n={gpu_n},bs={bs_gpu},f={gpu_frac:.2f})" if gpu_n > 0 else "gpu=-"
+                    stage_parts.append(f"{stage}:[{cpu_str} {gpu_str}]")
+                self._display_last_pipeline_summary = "  ".join(stage_parts) if stage_parts else "no activity"
+            except Exception:
+                self._display_last_pipeline_summary = "n/a"
+
+            print(
+                "[display-records]",
+                f"field_nonzero={field_nonzero}",
+                f"pts={[n_by_class[c] for c in range(6)]}",
+                f"pipeline={self._display_last_pipeline_summary}",
+                flush=True,
+            )
 
         return (
             np.ascontiguousarray(np.maximum(field_rgb, 0.0).astype(np.float32)),
@@ -8082,12 +8100,7 @@ def run(
           f"sensor_min_amplitude={bench.sensor_min_amplitude}", flush=True)
     # ── Configure C++ sensor image accumulator ─────────────────────────────
     _pip_res = int(max(16, scene.image_plate.sensor_res))
-    bench.tracer.configure_sensor_image(
-        float(scene.image_plate.x),
-        float(scene.image_plate.radius),
-        _pip_res,
-        0.008,
-    )
+    bench._configure_cpp_sensor_image(_pip_res, 0.008)
     bench.tracer.set_bdpt_sweep_trigger(_pip_res * _pip_res)
     if neural_payload_in:
         # ── Load pre-trained payload(s) and register immediately ──────────────
@@ -9539,6 +9552,8 @@ def run(
     seed            = 13579
     frame           = 0
     _display_frame  = 0   # independent counter for display-update rate limiting
+    _display_records_interval_s = 0.20
+    _display_records_last_t = 0.0
     paused          = False
     closing         = threading.Event()
 
@@ -9622,7 +9637,8 @@ def run(
                 )
                 return
             exposure_weight = bench._exposure_stage_weight()
-            bench.trace_forward(rpe, sd, max_bounces=mb, exposure_weight=exposure_weight)
+            submit_rpe = bench._exposure_rays_per_emitter(rpe)
+            bench.trace_forward(submit_rpe, sd, max_bounces=mb, exposure_weight=exposure_weight)
             bench._camera_exposure_forward_stage += 1
             if frame % 30 == 0:
                 _s = bench.bdpt_last_connection_stats
@@ -9631,7 +9647,7 @@ def run(
                     f"stage={int(bench._camera_exposure_forward_stage)}/{stage_count}",
                     f"forward_launched={bench._async_forward_launched_count:_}",
                     f"fwd_retained={bench._async_bdpt_forward_count():_}",
-                    f"submit_rpe={rpe:_}",
+                    f"submit_rpe={submit_rpe:_}",
                     f"cpp_fwd={_s.get('forward_records',0)}",
                     f"cpp_sensor={_s.get('sensor_records',0)}",
                     f"exact={_s.get('exact_snaps',0)}",
@@ -9692,10 +9708,7 @@ def run(
             except Exception:
                 pass
         _new_pip_res = int(max(16, scene.image_plate.sensor_res))
-        bench.tracer.configure_sensor_image(
-            float(scene.image_plate.x), float(scene.image_plate.radius),
-            _new_pip_res, 0.008,
-        )
+        bench._configure_cpp_sensor_image(_new_pip_res, 0.008)
         bench.tracer.set_bdpt_sweep_trigger(_new_pip_res * _new_pip_res)
         # Derive and print the new f-number from EFL and entrance pupil radius
         _efl = float(getattr(getattr(scene, "optical_design", None),
@@ -9871,9 +9884,14 @@ def run(
                     print(f"[trace] {exc}", flush=True)
                 trace_fut = None
 
-            # Refresh field + UV textures every frame for continuous trickle display.
+            # Refresh field + hit-overlay textures at a fixed cadence.  The
+            # refresh reads the full field capture grid and copies the hit ring,
+            # so doing it every render frame can starve the transport threads
+            # while producing identical display data.
             _display_frame += 1
-            if True:
+            _display_now = time.perf_counter()
+            if (_display_now - _display_records_last_t) >= _display_records_interval_s:
+                _display_records_last_t = _display_now
                 try:
                     if frame_profiler is not None:
                         frame_profiler.begin("display_records")
@@ -10020,12 +10038,7 @@ def run_uv_smoke(
     bench.sensor_amp_gain = float(sensor_amp_gain)
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
     _batch_pip_res = int(max(16, scene.image_plate.sensor_res))
-    bench.tracer.configure_sensor_image(
-        float(scene.image_plate.x),
-        float(scene.image_plate.radius),
-        _batch_pip_res,
-        0.008,
-    )
+    bench._configure_cpp_sensor_image(_batch_pip_res, 0.008)
     bench.tracer.set_bdpt_sweep_trigger(_batch_pip_res * _batch_pip_res)
 
     rc = 1

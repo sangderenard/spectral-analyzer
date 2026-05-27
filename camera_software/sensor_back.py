@@ -880,6 +880,59 @@ class _ColorScienceHook(RawHandoffHook):
 
 
 # ---------------------------------------------------------------------------
+# Frame crop helper
+# ---------------------------------------------------------------------------
+
+def _apply_frame_crop(raw: np.ndarray, geom: "BackGeometrySpec") -> np.ndarray:
+    """Crop the square C++ sensor grid to match the physical frame aspect ratio.
+
+    The C++ renders ``res × res`` pixels over the full image plane regardless
+    of the film gate shape.  For a non-square format (e.g. 6×4.5 = 56×42 mm)
+    the rows/columns that fall outside the film gate must be discarded.
+
+    For a square format (6×6) the two sides are equal and this is a no-op.
+    The crop is always centred.  The native dtype is preserved.
+
+    Parameters
+    ----------
+    raw  : ndarray — shape (H, W) or (H, W, C); must be square (H == W).
+    geom : BackGeometrySpec — provides frame_w_mm and frame_h_mm.
+
+    Returns
+    -------
+    ndarray — cropped array; dtype unchanged.  If no crop is needed, the
+    *same object* is returned (no copy).
+    """
+    if raw.ndim < 2:
+        return raw
+    res_h, res_w = raw.shape[0], raw.shape[1]
+    if res_h != res_w:
+        return raw   # already non-square — trust caller
+    fw = float(geom.frame_w_mm)
+    fh = float(geom.frame_h_mm)
+    if fw <= 1e-6 or fh <= 1e-6:
+        return raw
+    if abs(fw - fh) < 1e-3 * max(fw, fh):
+        return raw   # square format — no crop needed
+    if fw > fh:
+        # landscape: full width, trim height
+        crop_w = res_w
+        crop_h = max(1, round(res_h * fh / fw))
+    else:
+        # portrait: full height, trim width
+        crop_h = res_h
+        crop_w = max(1, round(res_w * fw / fh))
+    cy, cx = res_h // 2, res_w // 2
+    y0 = cy - crop_h // 2
+    y1 = y0 + crop_h
+    x0 = cx - crop_w // 2
+    x1 = x0 + crop_w
+    if raw.ndim == 2:
+        return raw[y0:y1, x0:x1]
+    return raw[y0:y1, x0:x1, ...]
+
+
+# ---------------------------------------------------------------------------
 # SensorBack
 # ---------------------------------------------------------------------------
 
@@ -1034,6 +1087,7 @@ class SensorBack(FlatBack):
                   Shape matches the C++ sensor image output (typically H×W×C).
         """
         raw = np.asarray(tracer.get_sensor_image())   # preserve native dtype
+        raw = _apply_frame_crop(raw, self._profile.geometry)
         return self.run_pipeline(raw)
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
@@ -1044,6 +1098,22 @@ class SensorBack(FlatBack):
             return f"SensorBack(profile={self._profile.label!r}, hooks=[])"
         parts = [f"{h.stage.name}:{h.name}(p={h.priority})" for h in self._hooks]
         return f"SensorBack(profile={self._profile.label!r}, hooks=[{', '.join(parts)}])"
+
+    @property
+    def output_shape(self) -> Tuple[int, int]:
+        """Expected (H, W) of the cropped output based on the profile geometry.
+
+        Computed from ``res_w``, ``res_h`` and the frame aspect ratio so
+        callers (GL renderer, display panel) can allocate buffers before the
+        first frame arrives.
+        """
+        fw = self._profile.geometry.frame_w_mm
+        fh = self._profile.geometry.frame_h_mm
+        if fw <= 1e-6 or fh <= 1e-6 or abs(fw - fh) < 1e-3 * max(fw, fh):
+            return (self.res_h, self.res_w)
+        if fw > fh:
+            return (max(1, round(self.res_h * fh / fw)), self.res_w)
+        return (self.res_h, max(1, round(self.res_w * fw / fh)))
 
     @property
     def profile(self) -> SensorBackProfile:

@@ -550,6 +550,8 @@ struct PyRayTracer
     float _sensor_plate_r      = 0.0f;
     int   _sensor_res          = 0;
     float _sensor_bdpt_eps     = 0.008f;
+    float _sensor_target_x     = 0.0f;
+    float _sensor_target_r     = 0.0f;
     int   _bdpt_sweep_trigger  = 0;
     std::atomic<uint32_t> _bdpt_subpath_counter{1u};
 
@@ -585,7 +587,8 @@ struct PyRayTracer
             if (_sensor_res > 0)
                 ray_pipeline_configure_sensor_image(
                     _pipeline, _sensor_plate_x, _sensor_plate_r,
-                    _sensor_res, _sensor_bdpt_eps);
+                    _sensor_res, _sensor_bdpt_eps,
+                    _sensor_target_x, _sensor_target_r);
             if (_uv_blit_n_bands > 0)
                 ray_pipeline_set_uv_blit_weights(
                     _pipeline, _uv_blit_weights.data(),
@@ -1655,6 +1658,56 @@ struct PyRayTracer
         }
     }
 
+    int submit_emissive_triangles(
+        py::array_t<int32_t, py::array::c_style | py::array::forcecast> tri_ids,
+        int                  rays_per_tri,
+        double               exposure_weight = 1.0,
+        double               emitter_amp_gain = 1.0,
+        int                  max_bounces   = 8,
+        double               min_amplitude = 1e-6,
+        int                  max_children  = 2,
+        int                  seed          = 42,
+        bool                 use_gpu_compute = false,
+        bool                 gpu_all_stages  = false,
+        std::string          shader_dir      = "",
+        double               interaction_target_x = 0.0,
+        double               interaction_target_y = 0.0,
+        double               interaction_target_z = 0.0,
+        double               interaction_target_r = 0.0)
+    {
+        auto ids = tri_ids.request();
+        if (ids.ndim != 1)
+            throw std::invalid_argument("tri_ids must be a 1-D int32 array");
+        if (rays_per_tri <= 0 || ids.size <= 0)
+            return 0;
+
+        {
+            std::lock_guard<std::mutex> lk(_pipeline_mu);
+            if (!_pipeline) {
+                _default_min_amplitude = min_amplitude;
+                _use_gpu_compute = use_gpu_compute;
+                _gpu_all_stages  = gpu_all_stages;
+                if (!shader_dir.empty()) _shader_dir = shader_dir;
+            }
+        }
+        RayPipelineState* ps = _get_pipeline(max_children, seed);
+        py::gil_scoped_release release;
+        return ray_pipeline_submit_emissive_triangles(
+            ps,
+            static_cast<const int*>(ids.ptr),
+            static_cast<int>(ids.size),
+            rays_per_tri,
+            exposure_weight,
+            emitter_amp_gain,
+            max_bounces,
+            min_amplitude,
+            interaction_target_x,
+            interaction_target_y,
+            interaction_target_z,
+            interaction_target_r,
+            static_cast<uint32_t>(seed));
+    }
+
     /*
      * drain_records(max_n=50000)
      *
@@ -1895,7 +1948,8 @@ struct PyRayTracer
      * plate_x, plate_r: world-space sensor plane position and disc radius.
      * res: pixel grid side length (res×res).
      * bdpt_eps: YZ proximity threshold in metres for BDPT snap. */
-    void configure_sensor_image(float plate_x, float plate_r, int res, float bdpt_eps) {
+    void configure_sensor_image(float plate_x, float plate_r, int res, float bdpt_eps,
+                                float target_x = 0.0f, float target_r = 0.0f) {
         /* Cache params unconditionally — pipeline may not exist yet (it is
          * created lazily on the first submit_rays call).  _get_pipeline will
          * apply these stored values when it constructs the pipeline. */
@@ -1903,8 +1957,11 @@ struct PyRayTracer
         _sensor_plate_r  = plate_r;
         _sensor_res      = res;
         _sensor_bdpt_eps = bdpt_eps;
+        _sensor_target_x = target_x;
+        _sensor_target_r = target_r;
         if (_pipeline)
-            ray_pipeline_configure_sensor_image(_pipeline, plate_x, plate_r, res, bdpt_eps);
+            ray_pipeline_configure_sensor_image(_pipeline, plate_x, plate_r, res, bdpt_eps,
+                                                target_x, target_r);
     }
 
     /* ── GPU T3 bridge ─────────────────────────────────────────────────────
@@ -2228,8 +2285,10 @@ struct PyRayTracer
     }
 
     void run_bdpt_connection() {
-        if (_pipeline)
+        if (_pipeline) {
+            py::gil_scoped_release release;
             ray_pipeline_run_bdpt_connection(_pipeline);
+        }
     }
 
     int submit_sensor_sweep(int max_bounces = 8,
@@ -2288,6 +2347,7 @@ struct PyRayTracer
         out["t2"]                 = stage_dict(s.t2);
         out["t3"]                 = stage_dict(s.t3);
         out["t4"]                 = stage_dict(s.t4);
+        out["t5"]                 = stage_dict(s.t5);
         out["output_queue_depth"] = s.output_queue_depth;
         out["in_flight"]          = s.in_flight;
         out["gpu_uv_readback_mb"] = static_cast<double>(s.gpu_uv_readback_bytes) / (1024.0 * 1024.0);
@@ -5224,6 +5284,27 @@ Returns dict with:
 R"doc(Non-blocking submit: push ray intents into the persistent pipeline.
 Returns immediately; the pipeline processes them concurrently.
 Call drain_records() to collect output records.)doc")
+        .def("submit_emissive_triangles", &PyRayTracer::submit_emissive_triangles,
+             py::arg("tri_ids"),
+             py::arg("rays_per_tri"),
+             py::arg("exposure_weight") = 1.0,
+             py::arg("emitter_amp_gain") = 1.0,
+             py::arg("max_bounces") = 8,
+             py::arg("min_amplitude") = 1e-6,
+             py::arg("max_children") = 2,
+             py::arg("seed") = 42,
+             py::arg("use_gpu_compute") = false,
+             py::arg("gpu_all_stages") = false,
+             py::arg("shader_dir") = "",
+             py::arg("interaction_target_x") = 0.0,
+             py::arg("interaction_target_y") = 0.0,
+             py::arg("interaction_target_z") = 0.0,
+             py::arg("interaction_target_r") = 0.0,
+R"doc(Non-blocking native forward-light submit.
+Samples authored emissive triangles in C++ using mat_buf band emission, creates
+RayIntents, and submits them directly to the persistent pipeline.  The optional
+interaction target is a world-space sphere; sampled emitter rays that cannot
+intersect it are not launched.)doc")
         .def("ensure_pipeline", &PyRayTracer::ensure_pipeline,
              py::arg("max_children") = 2,
              py::arg("seed") = 42,
@@ -5244,7 +5325,7 @@ R"doc(Return the number of ray paths currently live in the persistent pipeline.
 Zero means all previously submitted rays have completed.)doc")
         .def("pipeline_stats", &PyRayTracer::pipeline_stats,
 R"doc(Snapshot of pipeline throughput/batch-size/queue-depth for all four stages.
-Returns dict with keys t1, t2, t3, t4 (each a dict with throughput, processed,
+Returns dict with keys t1, t2, t3, t4, t5 (each a dict with throughput, processed,
 batch_size, queue_depth) plus output_queue_depth and in_flight.)doc")
         .def("report_display_frame_time", &PyRayTracer::report_display_frame_time,
              py::arg("frame_ms"),
@@ -5281,9 +5362,11 @@ Typical values: 0.0 (off), 0.25 (mild), 0.75 (strong).)doc")
         .def("configure_sensor_image",
              &PyRayTracer::configure_sensor_image,
              py::arg("plate_x"), py::arg("plate_r"), py::arg("res"), py::arg("bdpt_eps"),
+             py::arg("target_x") = 0.0f, py::arg("target_r") = 0.0f,
 R"doc(Configure sensor-plane image accumulator.
 plate_x: world X of the sensor disc centre; plate_r: disc radius (metres);
 res: pixel grid side (res×res); bdpt_eps: YZ proximity threshold for BDPT snap.
+target_x/target_r: camera projection target, normally the assembly exit pupil.
 Resets accumulator.  Call before submitting rays.)doc")
         .def("get_sensor_image",
              &PyRayTracer::get_sensor_image,

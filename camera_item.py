@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+from camera_software.exposure_timing import CameraExposureScheduler
 
 try:
     from OpenGL.GL import (
@@ -410,6 +411,7 @@ class CameraItem:
         self._vbo_emit     = None
         self._n_emit       = 0    # total emitter vertices across all faces
         self._emitters: List[EmitterFace] = []  # live emitter face list
+        self.exposure_scheduler = CameraExposureScheduler()
         # Projector back panel (optional)
         self._projector_back       = None   # ProjectorBackSpec-like object | None
         self._pb_sensor_r_max      = 0.020  # default APS-C half-diagonal

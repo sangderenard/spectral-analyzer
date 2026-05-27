@@ -42,6 +42,17 @@ def test_lens_assembly_transfer_uses_installed_optics():
     assert int(payload[1]) == len(lens.elements)
 
 
+def test_backward_parametric_payload_stays_canonical():
+    lens = CompoundLens.from_preset(simple_doublet_preset())
+    assembly = LensAssemblySpec()
+    assembly.set_optics(lens, mode=LensAssemblySpec.MODE_PARAMETRIC)
+
+    fwd = assembly.build_parametric_payload()
+    bwd = assembly.build_parametric_payload_backward()
+
+    assert np.array_equal(bwd, fwd)
+
+
 def test_side_bundle_sampling_and_failure_short_circuit():
     lens = CompoundLens.from_preset(simple_doublet_preset())
 

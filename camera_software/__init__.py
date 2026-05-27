@@ -51,6 +51,17 @@ from .sensor_back import (
     MOUNT_MF_DIGITAL,
     MOUNT_CUSTOM,
 )
+from .exposure_timing import (
+    ExposureSlice,
+    ExposureFrame,
+    CameraExposureScheduler,
+    SceneSnapshot,
+    SceneFrameProvider,
+    MutableSceneFrameProvider,
+    SceneCameraStep,
+    SceneCameraCoordinator,
+    SceneCameraClock,
+)
 __all__ = [
     "SpeedSpline",
     "MotorDrive",
@@ -109,4 +120,13 @@ __all__ = [
     "MOUNT_APS_H",
     "MOUNT_MF_DIGITAL",
     "MOUNT_CUSTOM",
+    "ExposureSlice",
+    "ExposureFrame",
+    "CameraExposureScheduler",
+    "SceneSnapshot",
+    "SceneFrameProvider",
+    "MutableSceneFrameProvider",
+    "SceneCameraStep",
+    "SceneCameraCoordinator",
+    "SceneCameraClock",
 ]

@@ -880,6 +880,9 @@ class CameraContext:
         object.__setattr__(self, 'histogram',    None)  # np.ndarray | None
         object.__setattr__(self, 'last_ev',      None)  # float | None
         object.__setattr__(self, 'focus_score',  None)  # float | None
+        # Camera-owned exposure scheduler, when the concrete camera item has one.
+        object.__setattr__(self, 'exposure_scheduler',
+                           getattr(camera_item, 'exposure_scheduler', None))
         # Sub-system configs (per-context, owned by the context):
         object.__setattr__(self, 'sensor_surface',  ParametricSurface(ParametricSurface.FLAT))
         object.__setattr__(self, 'film_surface',    ParametricSurface(ParametricSurface.FLAT))

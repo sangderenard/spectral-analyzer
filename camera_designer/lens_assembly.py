@@ -421,29 +421,13 @@ class LensAssemblySpec:
     def build_parametric_payload_backward(self) -> np.ndarray:
         """Build the backward (sensor→scene) shader payload.
 
-        Derived from the forward payload by reversing the surface sequence and
-        swapping n_bf / n_af at each surface.  No new physics — same surfaces,
-        traversed in the opposite order.
+        The payload itself remains in canonical front→back physical order.
+        Runtime parametric handlers already detect reverse/sensor rays and
+        traverse the canonical payload in reverse with swapped media. Returning
+        a pre-reversed payload here would double-reverse sensor transport and
+        make back-side rays absorb at the wrong interfaces.
         """
-        from camera_designer.compound_optics import PLENS_HEADER, PLENS_SURF_STRIDE
-        fwd = self.build_parametric_payload()
-        n_surf = int(fwd[1])
-        bwd = fwd.copy()
-        h = PLENS_HEADER        # = 8
-        s = PLENS_SURF_STRIDE   # = 8
-        for i in range(n_surf):
-            j = n_surf - 1 - i          # source index (reversed)
-            src = h + j * s
-            dst = h + i * s
-            bwd[dst + 0] = fwd[src + 0]   # x_v
-            bwd[dst + 1] = fwd[src + 1]   # R
-            bwd[dst + 2] = fwd[src + 3]   # n_bf ← original n_af  (direction reversed)
-            bwd[dst + 3] = fwd[src + 2]   # n_af ← original n_bf
-            bwd[dst + 4] = fwd[src + 4]   # ap_r
-            bwd[dst + 5] = fwd[src + 5]   # k
-            bwd[dst + 6] = fwd[src + 6]   # flags
-            bwd[dst + 7] = fwd[src + 7]   # reserved
-        return bwd
+        return self.build_parametric_payload()
 
     def evaluate_transfer(self, bundle):
         """Evaluate a ray bundle through the installed canonical optics."""
@@ -780,8 +764,8 @@ class LensAssemblySpec:
                     parametric_surface={"kind": kind_neural},
                 )
                 n_interior += int(ids.size)
-        # Exit face (back of last group) — backward PLENS teleport for sensor→scene rays.
-        # Falls back to absorber if optics is not available.
+        # Exit face (back of last group) — canonical PLENS payload. Runtime
+        # handlers reverse traversal for sensor rays from color_flag/dir.
         if int(back_ids.size) > 0:
             if self.optics is not None:
                 import _spectral_kernels as _sk2
@@ -857,7 +841,7 @@ class LensAssemblySpec:
             flush=True,
         )
 
-        # Exit surface — backward MLP, or PLENS fallback when no bwd MLP payload yet
+        # Exit surface — backward MLP, or canonical PLENS fallback when no bwd MLP payload yet.
         if int(back_ids.size) > 0:
             if self._bwd_payload is not None:
                 p_bwd = self._bwd_payload.copy()
@@ -970,7 +954,8 @@ class LensAssemblySpec:
                     parametric_surface={"kind": kind_parametric},
                 )
                 n_interior += int(ids.size)
-        # Back face of last lens group — backward teleport payload for sensor→scene rays
+        # Back face of last lens group — canonical teleport payload. Runtime
+        # handlers reverse traversal for sensor→scene rays.
         if int(back_ids.size) > 0:
             bwd_payload = self.build_parametric_payload_backward()
             self._exit_gid = int(tracer.register_tri_group(

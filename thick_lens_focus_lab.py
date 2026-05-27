@@ -51,6 +51,15 @@ from camera_software.sensor_back import (
     ColorScienceProfile,
     HookStage,
 )
+from camera_software.exposure_timing import (
+    CameraExposureScheduler,
+    ExposureFrame,
+    ExposureSlice,
+    MutableSceneFrameProvider,
+    SceneCameraCoordinator,
+    SceneCameraStep,
+    SceneSnapshot,
+)
 try:
     import torch
 except Exception:
@@ -1106,6 +1115,8 @@ class SceneConfig:
     include_legacy_stage: bool = False
     subject_scene_mode: str = "orbiters"
     subject_time_s: float = 0.0
+    subject_animation_enabled: bool = True
+    subject_animation_rebuild_hz: float = 0.5
     subject_scale: float = 0.12
     subject_depth_scale: Optional[float] = None
     subject_x: Optional[float] = None
@@ -1655,10 +1666,11 @@ def _import_subject_scene(
         print(f"[subject-scene] import failed: {exc}", flush=True)
         return
 
+    subject_time = float(getattr(scene, "subject_time_s", 0.0))
     subject_db, subject_idx = subject_mod.register_materials()
     verts8, _mat_per_v, _gid_per_v, mat_per_tri, _groups = subject_mod.scene_for_phase(
         subject_idx,
-        float(getattr(scene, "subject_time_s", 0.0)),
+        subject_time,
         scene_mode=mode,
     )
     pts = np.asarray(verts8[:, 0:3], dtype=np.float64).reshape(-1, 3, 3)
@@ -1716,6 +1728,7 @@ def _import_subject_scene(
         f"scale={scale:.4f}",
         f"depth_scale={depth_scale:.4f}",
         f"center_x={subject_x:.4f}",
+        f"t={subject_time:.3f}s",
         flush=True,
     )
 
@@ -4225,6 +4238,20 @@ class ForwardCppLensBench:
         self._bdpt_camera_sweep_stage = 0
         self._camera_exposure_forward_stage = 0
         self._camera_exposure_complete = False
+        self._exposure_scheduler = CameraExposureScheduler()
+        self._active_exposure_frame: Optional[ExposureFrame] = None
+        self._scene_frame_provider = MutableSceneFrameProvider(
+            self.scene,
+            time_attr="subject_time_s",
+            label="thick-lens",
+        )
+        self._scene_camera_coordinator = SceneCameraCoordinator(
+            self._scene_frame_provider,
+            self._exposure_scheduler,
+            scene_time_s=float(getattr(self.scene, "subject_time_s", 0.0)),
+        )
+        self._last_scene_camera_step: Optional[SceneCameraStep] = None
+        self._last_scene_snapshot: Optional[SceneSnapshot] = None
         self.bdpt_last_records = 0
         self.bdpt_last_volume_records = 0
         self.bdpt_last_volume_power = 0.0
@@ -4270,8 +4297,6 @@ class ForwardCppLensBench:
         self._async_bdpt_next_subpath: int = 0
         self._async_bdpt_next_segment_subpath: int = 0
         self._sweep_pixel_offset: int = 0   # deterministic scan position across disc pixels
-        self._async_bdpt_forward_warmup_target: int = 0
-        self._async_bdpt_forward_warmup_batch: int = 0
         self._async_forward_strike_count: int = 0
         self._async_forward_lens_hit_count: int = 0
         self._async_forward_lens_hit_after_bounce_count: int = 0
@@ -5103,14 +5128,42 @@ class ForwardCppLensBench:
         return np.ascontiguousarray(leak_f * previous + cur, dtype=np.float32)
 
     def _exposure_stage_count(self) -> int:
-        burst = getattr(self.scene, "camera_light_burst", None)
-        return int(max(1, getattr(burst, "stages", 1)))
+        return len(self._ensure_exposure_frame().slices)
 
     def _exposure_stage_weight(self) -> float:
-        burst = getattr(self.scene, "camera_light_burst", None)
-        energy = float(max(0.0, getattr(burst, "energy_scale", 1.0)))
-        duty = float(np.clip(getattr(burst, "duty_cycle", 1.0), 0.0, 1.0))
-        return energy * duty / float(max(1, self._exposure_stage_count()))
+        frame = self._ensure_exposure_frame()
+        idx = int(np.clip(self._camera_exposure_forward_stage, 0, max(0, len(frame.slices) - 1)))
+        return float(frame.slices[idx].flash_weight if frame.slices else 0.0)
+
+    def _ensure_exposure_frame(self, dt_s: Optional[float] = None) -> ExposureFrame:
+        if self._active_exposure_frame is None:
+            raise RuntimeError("camera exposure frame requested before camera coordinator began a frame")
+        return self._active_exposure_frame
+
+    def begin_scene_camera_step(self, dt_s: float) -> SceneCameraStep:
+        """Ask the coordinator for the scene snapshot and camera frame.
+
+        Repeated display-loop calls reuse the active frame. The scene advances
+        when a new camera exposure frame begins, not when the HUD polls state.
+        """
+        step = self._scene_camera_coordinator.ensure_step(
+            float(dt_s),
+        )
+        self._active_exposure_frame = step.exposure_frame
+        self._last_scene_camera_step = step
+        self._last_scene_snapshot = step.snapshot
+        return step
+
+    def _finish_exposure_frame(self) -> None:
+        self._scene_camera_coordinator.finish_frame()
+        self._active_exposure_frame = None
+
+    def _exposure_slice(self, stage_idx: int) -> ExposureSlice:
+        frame = self._ensure_exposure_frame()
+        if not frame.slices:
+            raise RuntimeError("camera exposure frame has no slices")
+        idx = int(np.clip(stage_idx, 0, len(frame.slices) - 1))
+        return frame.slices[idx]
 
     def _exposure_rays_per_emitter(self, requested: int) -> int:
         burst = getattr(self.scene, "camera_light_burst", None)
@@ -5168,41 +5221,8 @@ class ForwardCppLensBench:
         )
 
     def _shutter_stage_args(self, stage_idx: int, stage_count: int) -> dict:
-        plate = self.scene.image_plate
-        mode_s = str(getattr(plate, "shutter_mode", "open") or "open").lower()
-        mode_map = {
-            "open": 0,
-            "closed": 1,
-            "cap": 1,
-            "lens_cap": 1,
-            "iris": 2,
-            "sliding_x": 3,
-            "sliding_y": 4,
-        }
-        mode = int(mode_map.get(mode_s, 0))
-        open_f = float(np.clip(getattr(plate, "shutter_open", 1.0), 0.0, 1.0))
-        cu = float(np.clip(getattr(plate, "shutter_center_u", 0.5), 0.0, 1.0))
-        cv = float(np.clip(getattr(plate, "shutter_center_v", 0.5), 0.0, 1.0))
-        if stage_count > 1 and mode == 3:
-            half = 0.5 * open_f
-            lo = half
-            hi = 1.0 - half
-            t = (float(stage_idx) + 0.5) / float(stage_count)
-            cu = float(lo + (hi - lo) * t)
-        elif stage_count > 1 and mode == 4:
-            half = 0.5 * open_f
-            lo = half
-            hi = 1.0 - half
-            t = (float(stage_idx) + 0.5) / float(stage_count)
-            cv = float(lo + (hi - lo) * t)
-        return {
-            "shutter_mode": mode,
-            "shutter_open": open_f,
-            "shutter_center_u": cu,
-            "shutter_center_v": cv,
-            "shutter_softness": float(max(0.0, getattr(plate, "shutter_softness", 0.0))),
-            "exposure_weight": self._exposure_stage_weight(),
-        }
+        _ = stage_count
+        return self._exposure_slice(stage_idx).sensor_submit_args()
 
     def trace_forward(
         self,
@@ -6536,7 +6556,8 @@ class ForwardCppLensBench:
             try:
                 stage_count = self._exposure_stage_count()
                 if self._bdpt_camera_sweep_stage < stage_count:
-                    stage_args = self._shutter_stage_args(self._bdpt_camera_sweep_stage, stage_count)
+                    stage_idx = int(self._bdpt_camera_sweep_stage)
+                    stage_args = self._shutter_stage_args(stage_idx, stage_count)
                     self.bdpt_last_launched_rays = int(
                         self.tracer.submit_sensor_sweep(
                             max_bounces=int(max_bounces or 8),
@@ -6546,6 +6567,16 @@ class ForwardCppLensBench:
                             **stage_args,
                         )
                     )
+                    should_launch = (
+                        float(stage_args.get("exposure_weight", 0.0)) > 0.0 and
+                        float(stage_args.get("shutter_open", 0.0)) > 0.0 and
+                        int(stage_args.get("shutter_mode", 0)) != 1
+                    )
+                    if self.bdpt_last_launched_rays <= 0 and should_launch:
+                        raise RuntimeError(
+                            "active sensor exposure slice launched zero rays "
+                            f"(stage={stage_idx}/{stage_count}, args={stage_args})"
+                        )
                     self._bdpt_native_sensor_sweep_started = self.bdpt_last_launched_rays > 0
                     self._bdpt_camera_sweep_stage += 1
                     self._bdpt_native_sensor_sweep_rays += int(self.bdpt_last_launched_rays)
@@ -6765,6 +6796,10 @@ class ForwardCppLensBench:
         self._bdpt_camera_sweep_stage = 0
         self._camera_exposure_forward_stage = 0
         self._camera_exposure_complete = False
+        self._active_exposure_frame = None
+        self._scene_camera_coordinator.reset(float(getattr(self.scene, "subject_time_s", 0.0)))
+        self._last_scene_camera_step = None
+        self._last_scene_snapshot = None
 
         cfg = lenses[idx]
         fp_x = self.focal_plane_x
@@ -8807,8 +8842,16 @@ def run(
         print(f"[gl-renderer] scene VAO built: {n_tris*3} verts, "
               f"{len(bank.groups)} UV groups", flush=True)
 
-    # HUD text texture — RGBA8, sized to a reasonable stats strip width × height
-    _HUD_W, _HUD_H = 380, 118
+    # PIP viewports: C++ BDPT image + forward strike image.
+    _pip_dim = int(min(W * 0.22, H * 0.22))
+    _pip_gap = 10
+    _bdpt_pip_vx = (W - (3 * _pip_dim + 2 * _pip_gap)) // 2
+    _pip_vx      = _bdpt_pip_vx + _pip_dim + _pip_gap
+    _uv_pip_vx   = _pip_vx      + _pip_dim + _pip_gap
+    _pip_vy  = 6
+
+    # HUD text texture — RGBA8, constrained to one PIP column.
+    _HUD_W, _HUD_H = int(_pip_dim), 154
     tex_hud = glGenTextures(1)
     glBindTexture(GL_TEXTURE_2D, tex_hud)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
@@ -8818,14 +8861,6 @@ def run(
     _hud_blank = np.zeros((_HUD_H, _HUD_W, 4), dtype=np.uint8)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, _hud_blank)
-
-    # PIP viewports: C++ BDPT image + forward strike image.
-    _pip_dim = int(min(W * 0.22, H * 0.22))
-    _pip_gap = 10
-    _bdpt_pip_vx = (W - (3 * _pip_dim + 2 * _pip_gap)) // 2
-    _pip_vx      = _bdpt_pip_vx + _pip_dim + _pip_gap
-    _uv_pip_vx   = _pip_vx      + _pip_dim + _pip_gap
-    _pip_vy  = 6
 
     # Lazy font for PIP stats overlay – created on first draw to avoid init cost.
     _pip_font: list = [None]  # mutable container so closure can write it
@@ -8853,10 +8888,10 @@ def run(
         glUseProgram(0)
 
     def draw_pip() -> None:
-        # ── Left pip: empty (border only) ───────────────────────────────────
+        # ── Left pip: camera pipeline progress (violet border) ──────────────
         _draw_quad_with_pip_prog(
             tex_bdpt_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
-            border_col=(0.3, 0.3, 0.3),
+            border_col=(0.58, 0.32, 1.00),
         )
 
         # ── Centre pip: BDPT sensor plate (cyan border) ─────────────────────
@@ -8925,10 +8960,7 @@ def run(
                 hud_mode=True,
             )
 
-        # Pipeline camera label above left (violet) PIP.
-        _draw_hud([mode_str], [(180, 140, 255)], _bdpt_pip_vx)
-
-        # ── C++ BDPT connection stats above center (cyan) PIP ──────────────
+        # ── C++ BDPT connection/progress stats under left violet PIP ───────
         _cx_stats = bench.bdpt_last_connection_stats
         _cx_fwd   = int(_cx_stats.get("forward_records", 0))
         _cx_sens  = int(_cx_stats.get("sensor_records", 0))
@@ -8948,41 +8980,73 @@ def run(
         _lt_t5     = int(_latch.get("t5_fired", 0))
         _lt_run    = bool(_latch.get("connection_running", False))
         # Progress bar: each █ = one completed T5 cycle; gap shows pending
-        _BAR_W  = 12
+        _BAR_W  = 8
         _lt_min = min(_lt_flash, _lt_sensor)
         _lt_gap = max(0, _lt_min - _lt_t5)   # cycles ready but T5 not yet consumed
         _filled = min(_BAR_W, _lt_t5 % (_BAR_W + 1)) if _lt_t5 > 0 else 0
         _bar    = ("█" * _filled).ljust(_BAR_W, "░")
         _t5_lbl = ("RUN" if _lt_run else f"+{_lt_gap}" if _lt_gap > 0 else "  .")
-        _latch_str = f"F{_lt_flash} S{_lt_sensor} T{_lt_t5} [{_bar}]{_t5_lbl}"
+        _latch_str = f"F{_lt_flash} S{_lt_sensor} T{_lt_t5}"
+        _prog_str = f"[{_bar}]{_t5_lbl}"
         if _cx_fwd == 0:
-            _stage_lbl = "WAIT:forward-records"
+            _stage_lbl = "wait:fwd"
         elif _cx_exact == 0 and _cx_lit == 0:
-            _stage_lbl = "BDPT:connecting"
+            _stage_lbl = "connecting"
         else:
-            _stage_lbl = f"BDPT exact {_cx_exact:_}"
+            _stage_lbl = f"exact {_cx_exact:_}"
+        _step = getattr(bench, "_last_scene_camera_step", None)
+        _snap = getattr(bench, "_last_scene_snapshot", None)
+        _time_lbl = "t --"
+        if _step is not None:
+            _time_lbl = f"t {float(getattr(_step, 't1', 0.0)):.3f}s"
+        _snap_lbl = "snap --"
+        if _snap is not None:
+            _snap_lbl = f"snap {int(getattr(_snap, 'snapshot_id', 0))}"
         tracking_lines = [
-            f"{dist_str} col {bc:.3f}",
-            f"async fwd {bench._async_bdpt_forward_count()}",
-            f"records fwd {_cx_fwd:_} sensor {_cx_sens:_}",
+            mode_str,
+            _time_lbl,
+            _snap_lbl,
+            f"BDPT {_stage_lbl}",
             _latch_str,
-            f"cam samp {int(bench.bdpt_last_camera_samples.get('samples', 0)):_} pdf {float(bench.bdpt_last_camera_samples.get('strategy_pdf_mean', 0.0)):.1e}",
-            f"optic ev {int(bench.bdpt_last_optical_transfer.get('events', 0)):_} fail {int(bench.bdpt_last_optical_transfer.get('failed_rays', 0)):_}",
-            f"optic top e{bench.bdpt_last_optical_transfer.get('top_fail_element', -1)} {bench.bdpt_last_optical_transfer.get('top_fail_reason', '')}",
-            f"{_stage_lbl}",
-            f"lit {_cx_lit:_} ({100.0 * _cx_frac:.1f}%) near {_cx_near:_}",
-            f"overflow vtx {_cx_ovv:_} conn {_cx_ovc:_}",
+            _prog_str,
+            f"fwd {_cx_fwd:_}",
+            f"sens {_cx_sens:_}",
+            f"async {bench._async_bdpt_forward_count():_}",
+            f"{dist_str} c{bc:.3f}",
+            f"cam {int(bench.bdpt_last_camera_samples.get('samples', 0)):_}",
+            f"opt {int(bench.bdpt_last_optical_transfer.get('events', 0)):_}/{int(bench.bdpt_last_optical_transfer.get('failed_rays', 0)):_}",
+            f"ov v{_cx_ovv:_} c{_cx_ovc:_}",
         ]
-        tracking_cols  = [(80, 210, 255)] * 3 + [
+        tracking_cols  = [
+            (180, 140, 255),
+            (180, 140, 255),
+            (180, 140, 255),
+            (120, 255, 160) if _cx_exact > 0 else (255, 180, 90),
             (120, 255, 160) if _lt_run else (255, 200, 80) if _lt_gap > 0 else (160, 160, 160),
+            (120, 255, 160) if _lt_run else (255, 200, 80) if _lt_gap > 0 else (160, 160, 160),
+            (80, 210, 255),
+            (80, 210, 255),
+            (80, 210, 255),
+            (80, 210, 255),
             (120, 255, 160) if int(bench.bdpt_last_camera_samples.get("samples", 0)) > 0 else (160, 160, 160),
             (255, 180, 90) if int(bench.bdpt_last_optical_transfer.get("failed_rays", 0)) > 0 else (120, 255, 160),
-            (255, 150, 90) if int(bench.bdpt_last_optical_transfer.get("failed_rays", 0)) > 0 else (160, 160, 160),
-            (120, 255, 160) if _cx_exact > 0 else (255, 180, 90),
-            (100, 220, 255) if _cx_lit > 0 else (160, 160, 160),
             (255, 150, 90) if (_cx_ovv > 0 or _cx_ovc > 0) else (160, 160, 160),
         ]
-        _draw_hud(tracking_lines, tracking_cols, _pip_vx)
+        _draw_hud(tracking_lines, tracking_cols, _bdpt_pip_vx)
+
+        plate_lines = [
+            "BDPT sensor",
+            f"lit {_cx_lit:_}",
+            f"{100.0 * _cx_frac:.1f}% near {_cx_near:_}",
+            f"phot {bench.bdpt_last_sensor_photons:.2e}",
+        ]
+        plate_cols = [
+            (100, 220, 255),
+            (120, 255, 160) if _cx_lit > 0 else (160, 160, 160),
+            (100, 220, 255) if _cx_lit > 0 else (160, 160, 160),
+            (120, 255, 160) if bench.bdpt_last_sensor_photons > 0.0 else (160, 160, 160),
+        ]
+        _draw_hud(plate_lines, plate_cols, _pip_vx)
 
         # ── Camera assembly relaxation stats above right (orange) PIP ──────
         _gcc = bench._gid_crossing_counts
@@ -9644,6 +9708,10 @@ def run(
     _display_frame  = 0   # independent counter for display-update rate limiting
     _display_records_interval_s = 0.20
     _display_records_last_t = 0.0
+    _sim_dt_s       = 1.0 / 60.0
+    _subject_anim_last_rebuild_t = float(getattr(scene, "subject_time_s", 0.0))
+    _subject_anim_pending = [False]
+    _subject_anim_pending_snapshot: list[Optional[SceneSnapshot]] = [None]
     paused          = False
     closing         = threading.Event()
 
@@ -9676,6 +9744,11 @@ def run(
     def _fire_pipeline_camera_render() -> None:
         if _pipeline_camera_busy[0]:
             return
+        frame_obj = getattr(bench, "_active_exposure_frame", None)
+        if frame_obj is None:
+            return
+        if int(getattr(bench, "_bdpt_camera_sweep_stage", 0)) >= len(getattr(frame_obj, "slices", ())):
+            return
         _pipeline_camera_busy[0] = True
         def _worker():
             try:
@@ -9692,13 +9765,12 @@ def run(
                 _pipeline_camera_busy[0] = False
         threading.Thread(target=_worker, daemon=True).start()
 
-    def _trace(rpe: int, sd: int, mb: int):
+    def _trace(rpe: int, sd: int, mb: int, camera_dt_s: float):
         import time as _t
-        if bench._async_bdpt_forward_count() > 0:
-            _fire_pipeline_camera_render()
         if getattr(bench, "_camera_exposure_complete", False):
             # One exposure cycle done; reset so the next cycle can begin.
             bench._camera_exposure_complete = False
+            bench._finish_exposure_frame()
             bench._camera_exposure_forward_stage = 0
             bench._bdpt_camera_sweep_stage = 0
             return
@@ -9707,28 +9779,21 @@ def run(
         if closing.is_set():
             return
         with bench._trace_lock:
+            if bench._active_exposure_frame is None:
+                bench.begin_scene_camera_step(float(camera_dt_s))
             stage_count = bench._exposure_stage_count()
-            if int(getattr(bench, "_camera_exposure_forward_stage", 0)) >= stage_count:
+            if (
+                int(getattr(bench, "_camera_exposure_forward_stage", 0)) >= stage_count and
+                int(getattr(bench, "_bdpt_camera_sweep_stage", 0)) >= stage_count
+            ):
                 bench._camera_exposure_complete = True
                 return
-            fwd_have = int(bench._async_forward_launched_count)
-            fwd_target = int(getattr(bench, "_async_bdpt_forward_warmup_target", 0))
-            if fwd_have < fwd_target:
-                warmup_batch = int(max(1, getattr(bench, "_async_bdpt_forward_warmup_batch", 500_000)))
-                warmup_total = int(min(max(1, fwd_target - fwd_have), warmup_batch))
-                warmup_rpe = max(int(rpe), max(1, warmup_total // max(1, int(bench.src_pos.shape[0]))))
-                bench.trace_forward(warmup_rpe, sd, max_bounces=mb)
-                if frame % 30 == 0:
-                    print(
-                        "[bdpt-forward-warmup]",
-                        f"forward_launched={fwd_have:_}/{fwd_target:_}",
-                        f"fwd_retained={bench._async_bdpt_forward_count():_}",
-                        f"fwd_strikes={bench._async_forward_strike_count:_}",
-                        f"lens_hits={bench._async_forward_lens_hit_count:_}",
-                        f"lens_after_bounce={bench._async_forward_lens_hit_after_bounce_count:_}",
-                        f"submit_rpe={warmup_rpe:_}",
-                        flush=True,
-                )
+            fwd_stage = int(getattr(bench, "_camera_exposure_forward_stage", 0))
+            sensor_stage = int(getattr(bench, "_bdpt_camera_sweep_stage", 0))
+            if fwd_stage > sensor_stage:
+                _fire_pipeline_camera_render()
+                return
+            if fwd_stage >= stage_count:
                 return
             exposure_weight = bench._exposure_stage_weight()
             submit_rpe = bench._exposure_rays_per_emitter(rpe)
@@ -9751,6 +9816,76 @@ def run(
                     f"overflow_conn={_s.get('overflow_connections',0)}",
                     flush=True,
                 )
+        if bench._async_bdpt_forward_count() > 0:
+            _fire_pipeline_camera_render()
+
+    def _stop_bench_runtime(old_bench: ForwardCppLensBench) -> None:
+        try:
+            if old_bench._lens_assembly is not None:
+                old_bench._lens_assembly.stop_progressive_refinement()
+        except Exception as exc:
+            print(f"[bench-rebuild] lens assembly stop failed: {exc}", flush=True)
+        try:
+            old_bench._drain_stop.set()
+            if old_bench._drain_thread is not None:
+                old_bench._drain_thread.join(timeout=2.0)
+        except Exception as exc:
+            print(f"[bench-rebuild] drain stop failed: {exc}", flush=True)
+
+    def _invalidate_scene_gl_cache() -> None:
+        _scene_vao[0]           = None
+        _mesh_vbo[0]            = None
+        _mesh_n_verts[0]        = 0
+        _uv_last_update_s[0]    = -1.0
+        _uv_shared_tex_id[0]    = 0
+
+    def _wire_rebuilt_bench(new_bench: ForwardCppLensBench) -> None:
+        new_bench.sensor_amp_gain      = float(sensor_amp_gain)
+        new_bench.sensor_min_amplitude = float(sensor_min_amplitude)
+        new_bench.emitter_amp_gain     = float(emitter_amp_gain)
+        new_bench.compute_mode         = str(compute_mode)
+        if _gl_display_hglrc:
+            if _gl_display_hdc:
+                new_bench.tracer.set_gl_display_hdc(_gl_display_hdc)
+            new_bench.tracer.set_gl_display_hglrc(_gl_display_hglrc)
+            try:
+                _wl_nm = np.clip(C_LIGHT / np.maximum(new_bench.freq_hz, EPS) * 1.0e9, 380.0, 700.0)
+                _blit_w = _wavelength_to_rgb_weights(_wl_nm).astype(np.float32)
+                new_bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
+            except Exception as exc:
+                print(f"[bench-rebuild] blit weight upload failed: {exc}", flush=True)
+        _new_pip_res = int(max(16, scene.image_plate.sensor_res))
+        new_bench._configure_cpp_sensor_image(_new_pip_res, 0.008)
+
+    def _rebuild_bench_for_snapshot(snapshot: SceneSnapshot, reason: str) -> None:
+        """Rebuild static BVH-backed geometry for a coordinator scene snapshot."""
+        nonlocal bench
+        if snapshot.scene is not scene:
+            raise RuntimeError("thick-lens snapshot does not belong to the active scene")
+        if hasattr(scene, "subject_time_s"):
+            scene.subject_time_s = float(snapshot.sample_time)
+        print(
+            "[scene-animation]",
+            f"rebuilding reason={reason}",
+            f"snapshot={int(snapshot.snapshot_id)}",
+            f"t={float(snapshot.sample_time):.3f}s",
+            f"delta={float(snapshot.delta_metric):.6f}",
+            flush=True,
+        )
+        _stop_bench_runtime(bench)
+        _invalidate_scene_gl_cache()
+        bench = ForwardCppLensBench(
+            scene=scene,
+            freq_hz=bench.freq_hz.copy(),
+            view_h=view_h,
+            view_w=view_w,
+            sidecar=sidecar,
+            field_capture=field_capture,
+        )
+        _wire_rebuilt_bench(bench)
+        bench._scene_camera_coordinator.reset(float(snapshot.t0))
+        bench.begin_scene_camera_step(max(0.0, float(snapshot.t1) - float(snapshot.t0)))
+        _restore_display_gl_context()
 
     def _rebuild_bench_with_iris(new_r_inner: float) -> None:
         """Full scene rebuild with a new iris r_inner (new f-number).
@@ -9774,13 +9909,9 @@ def run(
         )
         # Reset the optical design spec so the solver re-runs with the new geometry.
         scene.optical_design = _default_optical_design_spec()
-        # Reset GL-side state that references old BVH data.
-        _scene_vao[0]           = None
-        _mesh_vbo[0]            = None
-        _mesh_n_verts[0]        = 0
-        _uv_last_update_s[0]    = -1.0
-        _uv_shared_tex_id[0]    = 0
         print("[aperture] rebuilding scene…", flush=True)
+        _stop_bench_runtime(bench)
+        _invalidate_scene_gl_cache()
         bench = ForwardCppLensBench(
             scene=scene,
             freq_hz=bench.freq_hz.copy(),
@@ -9789,22 +9920,7 @@ def run(
             sidecar=sidecar,
             field_capture=field_capture,
         )
-        bench.sensor_amp_gain      = float(sensor_amp_gain)
-        bench.sensor_min_amplitude = float(sensor_min_amplitude)
-        bench.emitter_amp_gain     = float(emitter_amp_gain)
-        bench.compute_mode         = str(compute_mode)
-        if _gl_display_hglrc:
-            if _gl_display_hdc:
-                bench.tracer.set_gl_display_hdc(_gl_display_hdc)
-            bench.tracer.set_gl_display_hglrc(_gl_display_hglrc)
-            try:
-                _wl_nm = np.clip(C_LIGHT / np.maximum(bench.freq_hz, EPS) * 1.0e9, 380.0, 700.0)
-                _blit_w = _wavelength_to_rgb_weights(_wl_nm).astype(np.float32)
-                bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
-            except Exception:
-                pass
-        _new_pip_res = int(max(16, scene.image_plate.sensor_res))
-        bench._configure_cpp_sensor_image(_new_pip_res, 0.008)
+        _wire_rebuilt_bench(bench)
         # Derive and print the new f-number from EFL and entrance pupil radius
         _efl = float(getattr(getattr(scene, "optical_design", None),
                               "effective_focal_length_m", 0.0) or 0.0)
@@ -9945,9 +10061,14 @@ def run(
             if frame_profiler is not None:
                 frame_profiler.end("events")
 
+            _clock_dt = max(0.0, clock.get_time() * 1e-3)
+            if _clock_dt <= 0.0:
+                _clock_dt = _sim_dt_s
+            _sim_dt_s = float(np.clip(_clock_dt, 1.0 / 240.0, 1.0 / 15.0))
+
             # ── Fly-camera WASD movement (main loop, not in draw closure) ── #
             if fly_mode:
-                _dt_s     = max(0.001, clock.get_time() * 1e-3)
+                _dt_s     = max(0.001, _sim_dt_s)
                 _keys_now = pygame.key.get_pressed()
                 _cp = math.cos(fly_pitch); _sp = math.sin(fly_pitch)
                 _cy = math.cos(fly_yaw);   _sy = math.sin(fly_yaw)
@@ -9966,10 +10087,31 @@ def run(
                 if _keys_now[pygame.K_q]: fly_pos = fly_pos + _up_v  * _spd
                 if _keys_now[pygame.K_e]: fly_pos = fly_pos - _up_v  * _spd
 
+            if _subject_anim_pending[0] and trace_fut is None and not _pipeline_camera_busy[0]:
+                try:
+                    _can_rebuild_subject = (
+                        bench.tracer.in_flight_count() <= 0 and
+                        int(getattr(bench, "_camera_exposure_forward_stage", 0)) == 0 and
+                        int(getattr(bench, "_bdpt_camera_sweep_stage", 0)) == 0
+                    )
+                except Exception as _anim_gate_exc:
+                    _can_rebuild_subject = False
+                    print(f"[scene-animation] rebuild gate failed: {_anim_gate_exc}", flush=True)
+                if _can_rebuild_subject:
+                    _snap = _subject_anim_pending_snapshot[0]
+                    if _snap is None:
+                        print("[scene-animation] pending rebuild had no coordinator snapshot", flush=True)
+                        _subject_anim_pending[0] = False
+                    else:
+                        _rebuild_bench_for_snapshot(_snap, "subject")
+                        _subject_anim_last_rebuild_t = float(_snap.sample_time)
+                        _subject_anim_pending[0] = False
+                        _subject_anim_pending_snapshot[0] = None
+
             if not paused and trace_fut is None:
                 trace_fut = executor.submit(
                     _trace, rays_per_emitter, (seed + frame) & 0x7FFFFFFF,
-                    max_bounces)
+                    max_bounces, _sim_dt_s)
                 frame += 1
 
             if trace_fut is not None and trace_fut.done():
@@ -9978,6 +10120,16 @@ def run(
                 except Exception as exc:
                     print(f"[trace] {exc}", flush=True)
                 trace_fut = None
+                if bool(getattr(scene, "subject_animation_enabled", True)):
+                    _mode = str(getattr(scene, "subject_scene_mode", "") or "").lower()
+                    _snap = getattr(bench, "_last_scene_snapshot", None)
+                    if _snap is not None and _mode not in ("", "none", "off"):
+                        _anim_hz = float(max(0.0, getattr(scene, "subject_animation_rebuild_hz", 0.5)))
+                        if _anim_hz > 0.0:
+                            _anim_interval = 1.0 / _anim_hz
+                            if (float(_snap.sample_time) - _subject_anim_last_rebuild_t) >= _anim_interval:
+                                _subject_anim_pending[0] = True
+                                _subject_anim_pending_snapshot[0] = _snap
 
             # Refresh field + hit-overlay textures at a fixed cadence.  The
             # refresh reads the full field capture grid and copies the hit ring,

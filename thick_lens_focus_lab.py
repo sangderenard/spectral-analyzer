@@ -42,6 +42,15 @@ from base_gl_renderer import BaseGLRenderer
 from material_db import MAX_SPECTRAL_BANDS, MaterialDatabase
 from sensor_film_db import MAX_SENSOR_FILM_SLOTS, SensorFilmDatabase
 from spectral_material import Material, RadianceProfile, SpectralBand
+from camera_software.sensor_back import (
+    SensorBack,
+    SensorBackProfile,
+    BackGeometrySpec,
+    SensorChipSpec,
+    FilmEmulsionSpec,
+    ColorScienceProfile,
+    HookStage,
+)
 
 try:
     import torch
@@ -3660,49 +3669,6 @@ def film_shutter_transmission(plate: ImagePlateConfig, film_uv: np.ndarray) -> n
     return np.ones((uv.shape[0],), dtype=np.float64)
 
 
-BDPT_MIS_EPS = 1.0e-30
-
-
-def assemble_bdpt_connection_weight(
-    fa: np.ndarray,
-    ba: np.ndarray,
-    dist: np.ndarray,
-    fwd_pdf: np.ndarray,
-    bwd_pdf: np.ndarray,
-    pair_scale: float,
-) -> np.ndarray:
-    """MIS-weighted contribution for connected forward/backward endpoint pairs.
-
-    ``fwd_pdf`` is an emitter endpoint area PDF. ``bwd_pdf`` is the camera
-    exit solid-angle PDF computed from the aperture→exit-direction Jacobian.
-    For a connection to a scene endpoint, the camera PDF is converted to
-    endpoint-area measure with dω ≈ dA / r². Endpoint surface cosine terms are
-    still not available in BDPT_ENDPOINT_DTYPE.
-    """
-    d2  = np.maximum(dist * dist, 1.0e-12)
-    p_b = np.maximum(bwd_pdf.astype(np.float64) / d2, BDPT_MIS_EPS)
-    p_f = np.maximum(fwd_pdf.astype(np.float64), BDPT_MIS_EPS)
-    # Balance heuristic: w_cam = p_bwd / (p_bwd + p_fwd)
-    # Combined estimator: f * w_cam / p_bwd = f / (p_bwd + p_fwd)
-    mis_denom = p_b + p_f
-    raw = np.abs(fa * ba) / d2
-    return raw * (pair_scale / mis_denom)
-
-
-def mis_balance_weight(this_pdf: float, all_pdfs: Sequence[float]) -> float:
-    """Balance-heuristic MIS weight for one sampling strategy."""
-    denom = float(np.sum(np.maximum(np.asarray(all_pdfs, dtype=np.float64), 0.0)))
-    return float(max(float(this_pdf), 0.0) / max(denom, BDPT_MIS_EPS))
-
-
-def mis_power_weight(this_pdf: float, all_pdfs: Sequence[float], beta: float = 2.0) -> float:
-    """Power-heuristic MIS weight.  This is the default hook for future BDPT strategies."""
-    p = np.maximum(np.asarray(all_pdfs, dtype=np.float64), 0.0)
-    w = np.power(p, float(beta))
-    this = float(max(float(this_pdf), 0.0) ** float(beta))
-    return float(this / max(float(np.sum(w)), BDPT_MIS_EPS))
-
-
 BDPT_SEGMENT_DTYPE = np.dtype([
     ("subpath_id", "u4"),
     ("band", "u4"),
@@ -3773,6 +3739,57 @@ class BdptSegmentStore:
     def clear(self) -> None:
         self._chunks.clear()
         self._count = 0
+
+
+# ── C++ struct mirrors (bdpt_record.h) ────────────────────────────────────────
+# Exact NumPy mirrors of BdptVertexRecord and BdptPdfRecord.  The header
+# explicitly designed both structs to be directly NumPy-mappable; these dtypes
+# allow drain_bdpt_vertices() / drain_bdpt_pdfs() raw bytes to be viewed as
+# structured arrays without any copy or conversion.
+#
+# BdptVertexRecord: 112 bytes (7 × 16), alignas(16)
+BDPT_VERTEX_RECORD_DTYPE = np.dtype([
+    ("subpath_id",        "u4"),
+    ("vertex_index",      "u2"),
+    ("stream",            "u1"),
+    ("sample_domain",     "u1"),
+    ("flags",             "u4"),
+    ("strategy_id",       "u4"),
+    ("tri_id",            "i4"),
+    ("group_id",          "i4"),
+    ("mat_idx",           "i4"),
+    ("pos",               "f4", (3,)),
+    ("normal",            "f4", (3,)),
+    ("dir_in",            "f4", (3,)),
+    ("dir_out",           "f4", (3,)),
+    ("path_len",          "f4"),
+    ("path_at_seg_start", "f4"),
+    ("pdf_fwd",           "f4"),
+    ("pdf_rev",           "f4"),
+    ("pdf_area",          "f4"),
+    ("pdf_solid_angle",   "f4"),
+    ("throughput_scalar", "f4"),
+    ("sensor_origin_y",   "f4"),
+    ("sensor_origin_z",   "f4"),
+], align=False)
+assert BDPT_VERTEX_RECORD_DTYPE.itemsize == 112, "BdptVertexRecord size mismatch"
+
+# BdptPdfRecord: 48 bytes (3 × 16), alignas(16)
+BDPT_PDF_RECORD_DTYPE = np.dtype([
+    ("subpath_id",     "u4"),
+    ("vertex_index",   "u2"),
+    ("sample_domain",  "u1"),
+    ("measure",        "u1"),
+    ("pdf_fwd",        "f4"),
+    ("pdf_rev",        "f4"),
+    ("pdf_area",       "f4"),
+    ("pdf_solid_angle","f4"),
+    ("jacobian_det",   "f4"),
+    ("geometry_term",  "f4"),
+    ("flags",          "u4"),
+    ("_pad",           "u1", (12,)),
+], align=False)
+assert BDPT_PDF_RECORD_DTYPE.itemsize == 48, "BdptPdfRecord size mismatch"
 
 
 OPTICAL_TRANSFER_DTYPE = np.dtype([
@@ -4237,6 +4254,9 @@ class ForwardCppLensBench:
         self._async_backward_strike_count: int = 0
         self._async_backward_skip_reason: str = ""
         self.bdpt_last_connection_stats: Dict[str, float] = {}
+        # Sensor back — owns the raw image handoff from the C++ tracer.
+        # When set, receive_raw() is called in place of tracer.get_sensor_image().
+        self._sensor_back: Optional[SensorBack] = None
         # Lens assembly descriptor — owns camera representation state (NONE | LUT | MLP),
         # registration, and rendering.  Replaces the former scattered _neural_assembly_*,
         # and _transfer_grid attributes.
@@ -4803,6 +4823,36 @@ class ForwardCppLensBench:
             film_chunk=np.ascontiguousarray(tensors["film"], dtype=np.float32),
             active_slots=self._sensor_film_slots,
         )
+        # Build the SensorBack from the plate geometry and current sensor/film params.
+        # The chip spec mirrors the values registered in the SensorFilmDatabase above
+        # so Python and C++ operate from the same physical parameters.
+        _sb_chip = SensorChipSpec(
+            sensor_db_name="thick_lens_focus_lab_sensor",
+            pixel_pitch_um=float(pixel_pitch_um),
+            full_well_e=150_000.0,
+            qe_peak=0.78,
+            read_noise_e=2.5,
+            dark_current_e_s=0.1,
+            adc_bits=16,
+            cfa_layout="RGGB",
+        )
+        _sb_geom = BackGeometrySpec(
+            mount_standard="120_6x6",
+            frame_w_mm=float(sensor_w_mm),
+            frame_h_mm=float(sensor_h_mm),
+            image_circle_mm=float(sensor_w_mm * 0.5 * math.sqrt(2.0)),
+        )
+        _sb_profile = SensorBackProfile(
+            geometry=_sb_geom,
+            sensor_chip=_sb_chip,
+            color_science=ColorScienceProfile.film_print(),
+            exposure_time_s=float(max(1e-4, focal_mm / max(1.0, f_number) / 1000.0)),
+            energy_scale=1.0,
+            label="thick_lens_focus_lab_120_6x6",
+        )
+        _pip_res = int(max(16, plate.sensor_res))
+        self._sensor_back = SensorBack.from_profile(_sb_profile, res=_pip_res)
+        print(f"[sensor-back] {self._sensor_back.hook_summary()}", flush=True)
 
     def _ensure_bdpt_plate_sensor_group(self, n_px: int, n_aperture_samples: int, camera_mode: int = 2) -> int:
         cfg = (int(n_px), int(n_aperture_samples), int(camera_mode))
@@ -5665,10 +5715,12 @@ class ForwardCppLensBench:
     def _append_bdpt_segment_records(self, records: dict) -> None:
         """Retain ray subsegments in a MIS-facing structured format.
 
-        This records path geometry and provisional launch PDFs.  Backward
-        camera segments receive the per-ray camera endpoint PDF carried by tag;
-        full reverse PDFs, lens Jacobians, and material sampling PDFs remain
-        explicitly absent.
+        Backward camera segments receive the per-ray camera endpoint PDF
+        carried by tag.  Scatter-domain PDFs (pdf_fwd, pdf_rev) are populated
+        from a concurrent drain_bdpt_pdfs() call, joined on (subpath_id,
+        vertex_index == bounce).  Records that arrive before the matching
+        BdptPdfRecord is queued are left as 0.0 (diagnostic store only; the
+        C++ MIS pipeline is not affected).
         """
         if not records:
             return
@@ -5724,6 +5776,28 @@ class ForwardCppLensBench:
             base_ids[~is_bwd] = np.arange(start, start + n_fwd, dtype=np.uint32)
             self._async_bdpt_next_segment_subpath = start + n_fwd
 
+        # ── drain BdptPdfRecord from C++ and build a join table ───────────────
+        # Key: (subpath_id << 16) | vertex_index  (vertex_index == bounce at
+        # the scatter site).  Records not in the current batch get 0.0, which
+        # is correct for the camera launch vertex that has no scatter PDF.
+        _pdf_fwd_map: dict[int, float] = {}
+        _pdf_rev_map: dict[int, float] = {}
+        try:
+            _pdf_chunks = []
+            while True:
+                _chunk = self.tracer.drain_bdpt_pdfs()
+                if _chunk.size == 0:
+                    break
+                _pdf_chunks.append(_chunk.reshape(-1))
+            if _pdf_chunks:
+                _pr = np.concatenate(_pdf_chunks).view(BDPT_PDF_RECORD_DTYPE)
+                for _i in range(len(_pr)):
+                    _k = int(_pr["subpath_id"][_i]) << 16 | int(_pr["vertex_index"][_i])
+                    _pdf_fwd_map[_k] = float(_pr["pdf_fwd"][_i])
+                    _pdf_rev_map[_k] = float(_pr["pdf_rev"][_i])
+        except Exception:
+            pass
+
         rows = np.empty(int(ev_rel.size), dtype=BDPT_SEGMENT_DTYPE)
         rows["subpath_id"] = base_ids[ev_rel]
         rows["band"] = band_ids.astype(np.uint32, copy=False)
@@ -5760,8 +5834,33 @@ class ForwardCppLensBench:
             dtype=np.float32,
             count=int(tag_event.shape[0]),
         )
-        rows["pdf_fwd"]        = np.where(is_bwd_ev, bwd_strat, np.float32(0.0))
-        rows["pdf_rev"]        = np.float32(0.0)
+
+        # Build scatter-PDF columns from the BdptPdfRecord join; fall back to
+        # the camera launch PDF for backward rays without a scatter match.
+        _seg_sid  = rows["subpath_id"].astype(np.uint64)
+        _seg_vtx  = bounces[event_idx].astype(np.uint64)
+        _seg_keys = (_seg_sid << np.uint64(16)) | _seg_vtx
+        if _pdf_fwd_map:
+            _scatter_fwd = np.fromiter(
+                (_pdf_fwd_map.get(int(k), 0.0) for k in _seg_keys),
+                dtype=np.float32, count=int(_seg_keys.shape[0]),
+            )
+            _scatter_rev = np.fromiter(
+                (_pdf_rev_map.get(int(k), 0.0) for k in _seg_keys),
+                dtype=np.float32, count=int(_seg_keys.shape[0]),
+            )
+        else:
+            _scatter_fwd = np.zeros(len(rows), dtype=np.float32)
+            _scatter_rev = np.zeros(len(rows), dtype=np.float32)
+
+        # pdf_fwd: use scatter PDF when available, else fall back to launch PDF
+        # for backward camera rays.
+        rows["pdf_fwd"] = np.where(
+            _scatter_fwd > np.float32(0.0),
+            _scatter_fwd,
+            np.where(is_bwd_ev, bwd_strat, np.float32(0.0)),
+        )
+        rows["pdf_rev"]        = _scatter_rev
         rows["pdf_area"]       = np.where(is_bwd_ev, bwd_area, np.float32(0.0))
         rows["pdf_solid_angle"] = np.where(is_bwd_ev, bwd_strat, np.float32(0.0))
         rows["strategy_id"]   = np.where(is_bwd_ev, np.uint16(CAMERA_STRATEGY_SENSOR_APERTURE), np.uint16(0))
@@ -6130,6 +6229,23 @@ class ForwardCppLensBench:
         with self._trace_lock:
             return self._bdpt_segments.snapshot()
 
+    def get_bdpt_vertices(self) -> np.ndarray:
+        """Drain all pending BdptVertexRecord entries from C++ and return them
+        as a structured NumPy array (BDPT_VERTEX_RECORD_DTYPE).
+
+        Each record carries per-vertex geometry, pdf_fwd, pdf_rev, throughput,
+        and sensor origin coordinates directly from the C++ pipeline.
+        """
+        chunks = []
+        while True:
+            raw = self.tracer.drain_bdpt_vertices()
+            if raw.size == 0:
+                break
+            chunks.append(raw.reshape(-1))
+        if not chunks:
+            return np.empty(0, dtype=BDPT_VERTEX_RECORD_DTYPE)
+        return np.concatenate(chunks).view(BDPT_VERTEX_RECORD_DTYPE)
+
     def get_optical_transfers(self) -> Optional[np.ndarray]:
         """Return retained parametric lens transfer event records."""
         with self._trace_lock:
@@ -6383,7 +6499,10 @@ class ForwardCppLensBench:
             except Exception:
                 overflow = {}
 
-            img = np.asarray(self.tracer.get_sensor_image(), dtype=np.float32)
+            if self._sensor_back is not None:
+                img = self._sensor_back.receive_raw(self.tracer)
+            else:
+                img = np.asarray(self.tracer.get_sensor_image(), dtype=np.float32)
             if img.ndim != 3 or img.shape[2] < 3 or img.shape[0] <= 0 or img.shape[1] <= 0:
                 img = np.zeros((n, n, 3), dtype=np.float32)
             else:

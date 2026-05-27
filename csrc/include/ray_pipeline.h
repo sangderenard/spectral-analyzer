@@ -674,6 +674,22 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps);
  * 0 = disable auto-trigger; >0 = fire once per sweep (n camera vertices). */
 void ray_pipeline_set_bdpt_sweep_trigger(RayPipelineState* ps, int n);
 
+/* Submit one native sensor-frame sweep into the same T1->T2->T3 pipeline as
+ * light paths.  The sweep uses the configured sensor image grid and stamps all
+ * launched intents as BDPT_SIDE_SENSOR so the normal BDPT vertex/spectral/pdf/
+ * optical queues are populated by the existing transport stages.
+ * max_rays <= 0 submits the full configured grid.  Returns submitted intents. */
+int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
+                                     int max_bounces,
+                                     double min_amplitude,
+                                     int max_rays,
+                                     int shutter_mode,
+                                     double shutter_open,
+                                     double shutter_center_u,
+                                     double shutter_center_v,
+                                     double shutter_softness,
+                                     double exposure_weight);
+
 RayPipelineState* ray_pipeline_create(
     RayTracerState*          st,
     const RayPipelineConfig* cfg);

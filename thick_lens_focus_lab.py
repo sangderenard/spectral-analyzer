@@ -520,6 +520,17 @@ class ImagePlateConfig:
 
 
 @dataclass
+class CameraLightBurstConfig:
+    """Camera-owned exposure packet for mounted emitters."""
+    enabled: bool = True
+    exposure_time_s: float = 0.010
+    stages: int = 1
+    energy_scale: float = 1.0
+    duty_cycle: float = 1.0
+    profile: str = "steady"
+
+
+@dataclass
 class StageLightTubeConfig:
     # Opening point where the tube meets stage envelope.
     opening_x: float = 0.26
@@ -1107,6 +1118,7 @@ class SceneConfig:
     ring_light_width_m: float = 0.018      # radial width of the emitting annulus (m)
     ring_light_emission: float = 50.0      # emission scale (relative to source material)
     ring_light_n_sectors: int = 72         # angular tessellation segments
+    camera_light_burst: CameraLightBurstConfig = field(default_factory=CameraLightBurstConfig)
     # Exit pupil / field stop aperture between last lens and sensor. When enabled
     # this limits light transmission post-optics, letting you tune spectral content
     # and transmission efficiency independently of the entrance aperture.
@@ -4163,6 +4175,11 @@ class ForwardCppLensBench:
         self.bdpt_last_sensor_gid = -1
         self.uv_page_bank: Optional[UvPageBank] = None
         self.bdpt_last_launched_rays = 0
+        self._bdpt_native_sensor_sweep_started = False
+        self._bdpt_native_sensor_sweep_rays = 0
+        self._bdpt_camera_sweep_stage = 0
+        self._camera_exposure_forward_stage = 0
+        self._camera_exposure_complete = False
         self.bdpt_last_records = 0
         self.bdpt_last_volume_records = 0
         self.bdpt_last_volume_power = 0.0
@@ -4578,8 +4595,20 @@ class ForwardCppLensBench:
         _e0 = _ev[:, 1, :] - _ev[:, 0, :]
         _e1 = _ev[:, 2, :] - _ev[:, 0, :]
         _tri_areas = 0.5 * np.linalg.norm(np.cross(_e0, _e1), axis=1)
+        self._emitter_tri_areas = np.ascontiguousarray(_tri_areas.astype(np.float64, copy=False), dtype=np.float64)
         _total_emitter_area = float(np.sum(_tri_areas))
         self._emitter_launch_pdf: float = 1.0 / max(_total_emitter_area, 1.0e-30)
+        _emitter_mat_ids = self.tri_mat_ids[self.emitter_tri_ids].astype(np.int32, copy=False)
+        self._emitter_band_emission = np.zeros((src_n, self.n_bands), dtype=np.float64)
+        if mat_buf.size > 0 and mat_n_mats > 0:
+            _mat_rows = mat_buf.reshape(mat_n_mats, MAX_SPECTRAL_BANDS, -1)
+            for _si, _mid in enumerate(_emitter_mat_ids):
+                if 0 <= int(_mid) < mat_n_mats:
+                    _nb = min(self.n_bands, MAX_SPECTRAL_BANDS)
+                    self._emitter_band_emission[_si, :_nb] = np.maximum(
+                        _mat_rows[int(_mid), :_nb, 5].astype(np.float64, copy=False),
+                        0.0,
+                    )
         # Neutral launch profile: no Python-side beaming. Keep transport driven
         # by emissive materials and scene geometry only.
         self.src_directivity = np.ones((src_n,), dtype=np.float64)
@@ -5003,6 +5032,53 @@ class ForwardCppLensBench:
             return np.ascontiguousarray(cur, dtype=np.float32)
         return np.ascontiguousarray(leak_f * previous + cur, dtype=np.float32)
 
+    def _exposure_stage_count(self) -> int:
+        burst = getattr(self.scene, "camera_light_burst", None)
+        return int(max(1, getattr(burst, "stages", 1)))
+
+    def _exposure_stage_weight(self) -> float:
+        burst = getattr(self.scene, "camera_light_burst", None)
+        energy = float(max(0.0, getattr(burst, "energy_scale", 1.0)))
+        duty = float(np.clip(getattr(burst, "duty_cycle", 1.0), 0.0, 1.0))
+        return energy * duty / float(max(1, self._exposure_stage_count()))
+
+    def _shutter_stage_args(self, stage_idx: int, stage_count: int) -> dict:
+        plate = self.scene.image_plate
+        mode_s = str(getattr(plate, "shutter_mode", "open") or "open").lower()
+        mode_map = {
+            "open": 0,
+            "closed": 1,
+            "cap": 1,
+            "lens_cap": 1,
+            "iris": 2,
+            "sliding_x": 3,
+            "sliding_y": 4,
+        }
+        mode = int(mode_map.get(mode_s, 0))
+        open_f = float(np.clip(getattr(plate, "shutter_open", 1.0), 0.0, 1.0))
+        cu = float(np.clip(getattr(plate, "shutter_center_u", 0.5), 0.0, 1.0))
+        cv = float(np.clip(getattr(plate, "shutter_center_v", 0.5), 0.0, 1.0))
+        if stage_count > 1 and mode == 3:
+            half = 0.5 * open_f
+            lo = half
+            hi = 1.0 - half
+            t = (float(stage_idx) + 0.5) / float(stage_count)
+            cu = float(lo + (hi - lo) * t)
+        elif stage_count > 1 and mode == 4:
+            half = 0.5 * open_f
+            lo = half
+            hi = 1.0 - half
+            t = (float(stage_idx) + 0.5) / float(stage_count)
+            cv = float(lo + (hi - lo) * t)
+        return {
+            "shutter_mode": mode,
+            "shutter_open": open_f,
+            "shutter_center_u": cu,
+            "shutter_center_v": cv,
+            "shutter_softness": float(max(0.0, getattr(plate, "shutter_softness", 0.0))),
+            "exposure_weight": self._exposure_stage_weight(),
+        }
+
     def trace_forward(
         self,
         rays_per_emitter: int,
@@ -5013,6 +5089,7 @@ class ForwardCppLensBench:
         blocking: bool = False,
         bake_origins: Optional[np.ndarray] = None,
         bake_directions: Optional[np.ndarray] = None,
+        exposure_weight: float = 1.0,
     ):
         """Forward trace via the persistent T1/T2/T3/T4 pipeline.
 
@@ -5055,7 +5132,7 @@ class ForwardCppLensBench:
 
             origins     = np.empty((total, 3), dtype=np.float64)
             directions  = np.empty((total, 3), dtype=np.float64)
-            amplitudes  = np.full((total, n_bands), complex(float(self.emitter_amp_gain)), dtype=np.complex128)
+            amplitudes  = np.zeros((total, n_bands), dtype=np.complex128)
             src_ids     = np.empty((total,), dtype=np.int32)
             tag_arr     = np.zeros((total,), dtype=np.uint64)
             cflag_arr   = np.zeros((total,), dtype=np.uint8)  # 0 = emissive / forward
@@ -5082,6 +5159,14 @@ class ForwardCppLensBench:
                 origins   [base:base+n_rays] = self.src_pos[si]
                 directions[base:base+n_rays] = dirs_local
                 src_ids   [base:base+n_rays] = si
+                emit = np.asarray(self._emitter_band_emission[si, :n_bands], dtype=np.float64)
+                area = float(self._emitter_tri_areas[si]) if si < int(self._emitter_tri_areas.size) else 0.0
+                ray_energy = (float(self.emitter_amp_gain)
+                              * float(max(0.0, exposure_weight))
+                              * area
+                              * emit
+                              / float(max(1, n_rays)))
+                amplitudes[base:base+n_rays, :] = ray_energy[None, :].astype(np.complex128)
                 if tags is not None and si < len(tags):
                     tag_arr[base:base+n_rays] = int(tags[si])
 
@@ -6262,7 +6347,30 @@ class ForwardCppLensBench:
             }
 
             try:
-                self.tracer.run_bdpt_connection()
+                stage_count = self._exposure_stage_count()
+                if self._bdpt_camera_sweep_stage < stage_count:
+                    stage_args = self._shutter_stage_args(self._bdpt_camera_sweep_stage, stage_count)
+                    self.bdpt_last_launched_rays = int(
+                        self.tracer.submit_sensor_sweep(
+                            max_bounces=int(max_bounces or 8),
+                            min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
+                            max_rays=0,
+                            seed=int(seed),
+                            **stage_args,
+                        )
+                    )
+                    self._bdpt_native_sensor_sweep_started = self.bdpt_last_launched_rays > 0
+                    self._bdpt_camera_sweep_stage += 1
+                    self._bdpt_native_sensor_sweep_rays += int(self.bdpt_last_launched_rays)
+                else:
+                    self.bdpt_last_launched_rays = 0
+            except Exception as exc:
+                self.bdpt_last_launched_rays = 0
+                print(f"[bdpt-cpp] camera projection submit failed: {exc}", flush=True)
+
+            try:
+                if self._bdpt_native_sensor_sweep_started:
+                    self.tracer.run_bdpt_connection()
             except Exception as exc:
                 print(f"[bdpt-cpp] connection pass failed: {exc}", flush=True)
 
@@ -6298,7 +6406,7 @@ class ForwardCppLensBench:
             self.bdpt_last_sensor_power = self.bdpt_last_sensor_photons
             self.bdpt_last_connection_stats = {
                 "forward_records": stream_fwd_count,
-                "sensor_records": stream_sensor_count,
+                "sensor_records": int(self._bdpt_native_sensor_sweep_rays),
                 "lit_pixels": lit_pixels,
                 "lit_fraction": lit_fraction,
                 "nearest_dist_m": float(stats.get("nearest_dist_m", -1.0)) if isinstance(stats, dict) else -1.0,
@@ -6326,7 +6434,8 @@ class ForwardCppLensBench:
                 f"call={self.bdpt_debug_print_counter}",
                 f"endpoint_records={self.bdpt_last_records}",
                 f"fwd={stream_fwd_count}",
-                f"sensor_records={stream_sensor_count}",
+                f"camera_records={int(self._bdpt_native_sensor_sweep_rays)}",
+                f"legacy_stream={stream_sensor_count}",
                 f"exact={self.bdpt_last_connection_stats['exact_snaps']}",
                 f"near={self.bdpt_last_connection_stats['near_miss_count']}",
                 f"lit_pixels={lit_pixels}",
@@ -6452,6 +6561,11 @@ class ForwardCppLensBench:
         self.bdpt_last_optical_transfer = {}
         self.bdpt_last_camera_samples = {}
         self._bdpt_sensor_cfg = None
+        self._bdpt_native_sensor_sweep_started = False
+        self._bdpt_native_sensor_sweep_rays = 0
+        self._bdpt_camera_sweep_stage = 0
+        self._camera_exposure_forward_stage = 0
+        self._camera_exposure_complete = False
 
         cfg = lenses[idx]
         fp_x = self.focal_plane_x
@@ -9358,11 +9472,17 @@ def run(
         import time as _t
         if bench._async_bdpt_forward_count() > 0:
             _fire_pipeline_camera_render()
+        if getattr(bench, "_camera_exposure_complete", False):
+            return
         while not closing.is_set() and bench.tracer.in_flight_count() > _MAX_IN_FLIGHT:
             _t.sleep(0.002)   # back off; let drain-loop consume Q_intent
         if closing.is_set():
             return
         with bench._trace_lock:
+            stage_count = bench._exposure_stage_count()
+            if int(getattr(bench, "_camera_exposure_forward_stage", 0)) >= stage_count:
+                bench._camera_exposure_complete = True
+                return
             fwd_have = int(bench._async_forward_launched_count)
             fwd_target = int(getattr(bench, "_async_bdpt_forward_warmup_target", 0))
             if fwd_have < fwd_target:
@@ -9380,13 +9500,16 @@ def run(
                         f"lens_after_bounce={bench._async_forward_lens_hit_after_bounce_count:_}",
                         f"submit_rpe={warmup_rpe:_}",
                         flush=True,
-                    )
+                )
                 return
-            bench.trace_forward(rpe, sd, max_bounces=mb)
+            exposure_weight = bench._exposure_stage_weight()
+            bench.trace_forward(rpe, sd, max_bounces=mb, exposure_weight=exposure_weight)
+            bench._camera_exposure_forward_stage += 1
             if frame % 30 == 0:
                 _s = bench.bdpt_last_connection_stats
                 print(
                     "[pipeline-trace]",
+                    f"stage={int(bench._camera_exposure_forward_stage)}/{stage_count}",
                     f"forward_launched={bench._async_forward_launched_count:_}",
                     f"fwd_retained={bench._async_bdpt_forward_count():_}",
                     f"submit_rpe={rpe:_}",

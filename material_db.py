@@ -1754,7 +1754,7 @@ class MaterialDatabase:
 
             slot 0..3 : center_hz, bandwidth_hz, reflectance_mag, transmittance
             slot 4..7 : diffuse_frac, emission, reemission, ior_real
-            slot 8..11: ior_imag, _pad, _pad, _pad
+            slot 8..11: ior_imag, reactive_shift_hz, ggx_alpha, metallic
 
         Both tracers compute the per-band complex reflectance from
         (reflectance_mag, ior_real, ior_imag) at lookup time using identical
@@ -1766,24 +1766,27 @@ class MaterialDatabase:
         `b >= n_bands` early-out in shader/tracer is safe and observable.
         """
         spec = self.build_tensors()['spectral']            # (N, MAX_BANDS, 12) f32
-        # Project per-material reactive_shift_hz (from RayMatRecord, the
-        # legacy authoring slot) into band-0 pad slot [9] so the C++ tracer —
-        # which sees ONLY the MatBuf SSBO — can recover the Stokes shift
-        # without an extra side-channel.  GLSL still reads it from
-        # packed_shade[15]; both agree by construction because both pull from
-        # `RayMatRecord.reactive_shift_hz` at build time.
+        # Project per-material surface controls into MatBuf pad slots so the
+        # C++ tracer and GLSL T3 can sample the same lobes without adding an
+        # SSBO binding. Slot [9] remains the Stokes shift convention; [10]/[11]
+        # carry the active GGX alpha and metallic weight for every band row.
         flat = np.ascontiguousarray(spec.copy().reshape(-1, 12), dtype=np.float32)
         N = spec.shape[0]
         if N > 0:
             ray = self.build_tensors()['raymat_compat']    # (N, RAYMAT_FLOATS) f32
+            pbr = self.build_tensors()['pbr']              # (N, PBR_FLOATS) f32
             # RayMatRecord.reactive_shift_hz is at the trailing slot (verified
             # by struct: see _fill_ray_from_mat11_dict in this module).
             # Pull last column safely.
             shift = ray[:, -1].astype(np.float32, copy=False)
-            # Stamp into band-0 pad slot [9] of every material row.
+            roughness = np.clip(pbr[:, 3].astype(np.float32, copy=False), 0.0, 1.0)
+            metallic = np.clip(pbr[:, 4].astype(np.float32, copy=False), 0.0, 1.0)
             row_stride = MAX_SPECTRAL_BANDS
             for i in range(N):
-                flat[i * row_stride, 9] = shift[i]
+                base = i * row_stride
+                flat[base, 9] = shift[i]
+                flat[base : base + row_stride, 10] = roughness[i]
+                flat[base : base + row_stride, 11] = metallic[i]
         return flat
 
     # ── Compatibility extraction helpers (post-bake; not the hot path) ──────

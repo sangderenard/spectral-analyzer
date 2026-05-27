@@ -38,6 +38,7 @@
  *  CounterBuf:
  *    [0] = hit count  (from T1, used as n_hits here)
  *    [3] = cpu_refine count  (incremented for complex-kind fallbacks)
+ *    [4] = BDPT optical-event count
  *
  * NEURAL_ASSEMBLY policy:
  *   T2 sets bit 3 of color_flag (HitBuf[16]) to absorb the ray.  The intended
@@ -113,17 +114,100 @@ layout(std430, binding = 3) readonly  buffer GroupKindBuf      { int   group_kin
 layout(std430, binding = 4) readonly  buffer GroupPayloadBuf   { float group_payload[]; };
 layout(std430, binding = 5) coherent  buffer CounterBuf        { uint  counters[];   };
 layout(std430, binding = 6) readonly  buffer NeuralPayBuf      { float npay[];       };
+layout(std430, binding = 7) coherent  buffer BdptOutputBuf     { float bdpt_out[];   };
 
 /* ── Uniforms ───────────────────────────────────────────────────────────── */
 uniform int   n_tris;
 uniform int   n_groups;
 uniform int   n_bands;
 uniform float freq_hz[MAX_GPU_BANDS];
+uniform int   bdpt_max_optical;
+uniform int   bdpt_optical_base;
+
+#define BDPT_OPTICAL_STRIDE        28
+#define BDPT_OPT_REFRACTION         0u
+#define BDPT_OPT_REFLECTION         1u
+#define BDPT_OPT_TIR                2u
+#define BDPT_OPT_APERTURE_CLIP      3u
+#define BDPT_OPT_VIGNETTE_CLIP      4u
+#define BDPT_OPT_ABSORPTION         5u
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
 
 float hit_f(int base, int i) { return hits[base + i]; }
 void  hit_wf(int base, int i, float v) { hits[base + i] = v; }
+
+uint hit_u(int base, int i) { return floatBitsToUint(hits[base + i]); }
+int  hit_i(int base, int i) { return floatBitsToInt(hits[base + i]); }
+
+float fresnel_R(float cos_i, float cos_t, float n1, float n2)
+{
+    float rs_num = n1*cos_i - n2*cos_t;
+    float rs_den = n1*cos_i + n2*cos_t;
+    float rp_num = n1*cos_t - n2*cos_i;
+    float rp_den = n1*cos_t + n2*cos_i;
+    float rs = (abs(rs_den) > EPS) ? rs_num / rs_den : 1.0;
+    float rp = (abs(rp_den) > EPS) ? rp_num / rp_den : 1.0;
+    return clamp(0.5 * (rs*rs + rp*rp), 0.0, 1.0);
+}
+
+void emit_bdpt_optical(int hb, uint reason, uint element_index, uint flags,
+                       vec3 pos, vec3 nrm, vec3 dir_in, vec3 dir_out,
+                       float cos_i, float cos_t, float eta_i, float eta_t,
+                       float fresnel_r, float transmittance, float throughput,
+                       float opl, float geom_len, float aperture_r,
+                       float transverse_r, float dist_past_aperture,
+                       float phase_space_j)
+{
+    uint sid = hit_u(hb, 58);
+    if (sid == 0u || bdpt_max_optical <= 0) return;
+    uint slot = atomicAdd(counters[4], 1u);
+    if (int(slot) >= bdpt_max_optical) return;
+
+    uint vi = uint(max(0, hit_i(hb, 17))) & 0xFFFFu;
+    uint cflag = hit_u(hb, 16);
+    uint stream = (cflag == 1u) ? 1u : 0u;
+    uint packed_ve = vi | ((element_index & 0xFFFFu) << 16);
+    uint packed_rf = (reason & 0xFFu) | ((stream & 0xFFu) << 8) | ((flags & 0xFFFFu) << 16);
+
+    uint ob = uint(bdpt_optical_base) + slot * uint(BDPT_OPTICAL_STRIDE);
+    bdpt_out[ob +  0] = uintBitsToFloat(sid);
+    bdpt_out[ob +  1] = uintBitsToFloat(packed_ve);
+    bdpt_out[ob +  2] = uintBitsToFloat(packed_rf);
+    bdpt_out[ob +  3] = pos.x;       bdpt_out[ob +  4] = pos.y;       bdpt_out[ob +  5] = pos.z;
+    bdpt_out[ob +  6] = nrm.x;       bdpt_out[ob +  7] = nrm.y;       bdpt_out[ob +  8] = nrm.z;
+    bdpt_out[ob +  9] = dir_in.x;    bdpt_out[ob + 10] = dir_in.y;    bdpt_out[ob + 11] = dir_in.z;
+    bdpt_out[ob + 12] = dir_out.x;   bdpt_out[ob + 13] = dir_out.y;   bdpt_out[ob + 14] = dir_out.z;
+    bdpt_out[ob + 15] = cos_i;
+    bdpt_out[ob + 16] = cos_t;
+    bdpt_out[ob + 17] = eta_i;
+    bdpt_out[ob + 18] = eta_t;
+    bdpt_out[ob + 19] = fresnel_r;
+    bdpt_out[ob + 20] = transmittance;
+    bdpt_out[ob + 21] = throughput;
+    bdpt_out[ob + 22] = opl;
+    bdpt_out[ob + 23] = geom_len;
+    bdpt_out[ob + 24] = aperture_r;
+    bdpt_out[ob + 25] = transverse_r;
+    bdpt_out[ob + 26] = dist_past_aperture;
+    bdpt_out[ob + 27] = phase_space_j;
+}
+
+void absorb_with_optical_event(int hb, uint reason, uint element_index,
+                               vec3 pos, vec3 dir_in, float eta_i, float eta_t,
+                               float opl, float geom_len, float aperture_r,
+                               float transverse_r, float dist_past_aperture)
+{
+    emit_bdpt_optical(hb, reason, element_index, 0u,
+                      pos, vec3(0.0), dir_in, vec3(0.0),
+                      0.0, 0.0, eta_i, eta_t,
+                      reason == BDPT_OPT_TIR ? 1.0 : 0.0,
+                      0.0, 0.0,
+                      opl, geom_len, aperture_r, transverse_r,
+                      dist_past_aperture, 1.0);
+    uint cf = hit_u(hb, 16);
+    hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+}
 
 float vec3_comp(vec3 v, int i) {
     if (i == 0) return v.x;
@@ -258,22 +342,28 @@ void parametric_lens_teleport(int hb, int pay_off)
     float hood_xr= npay[pay_off + PLENS_HOOD_XR];
 
     if (n_surf < 1 || n_surf > PLENS_MAX_SURF) {
-        uint cf = floatBitsToUint(hit_f(hb, 16));
-        hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+        absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, 0u,
+                                  vec3(hit_f(hb, 0), hit_f(hb, 1), hit_f(hb, 2)),
+                                  normalize(vec3(hit_f(hb, 6), hit_f(hb, 7), hit_f(hb, 8))),
+                                  1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0);
         return;
     }
 
     vec3 ray_pos = vec3(hit_f(hb, 0), hit_f(hb, 1), hit_f(hb, 2));
     vec3 ray_dir = normalize(vec3(hit_f(hb, 6), hit_f(hb, 7), hit_f(hb, 8)));
+    bool is_backward = (hit_u(hb, 16) == 1u);
 
     /* Lens hood: project to hood opening plane and check radius */
-    if (hood_r > 0.0 && abs(ray_dir.x) > EPS) {
+    if (!is_backward && hood_r > 0.0 && abs(ray_dir.x) > EPS) {
         float t_hood = (hood_xf - ray_pos.x) / ray_dir.x;
         if (t_hood < 0.0) {   /* hood is in front; t negative = forward projection */
             vec3 p_hood = ray_pos + t_hood * ray_dir;
             if (sqrt(p_hood.y*p_hood.y + p_hood.z*p_hood.z) > hood_r) {
-                uint cf = floatBitsToUint(hit_f(hb, 16));
-                hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                absorb_with_optical_event(hb, BDPT_OPT_VIGNETTE_CLIP, 0u,
+                                          p_hood, ray_dir, 1.0, 1.0,
+                                          0.0, abs(t_hood), hood_r,
+                                          sqrt(p_hood.y*p_hood.y + p_hood.z*p_hood.z),
+                                          sqrt(p_hood.y*p_hood.y + p_hood.z*p_hood.z) - hood_r);
                 return;
             }
         }
@@ -281,33 +371,38 @@ void parametric_lens_teleport(int hb, int pay_off)
 
     float opl = 0.0;
 
-    for (int s = 0; s < n_surf; s++) {
+    for (int si = 0; si < n_surf; si++) {
+        int s = is_backward ? (n_surf - 1 - si) : si;
         int   sb     = pay_off + PLENS_HEADER + s * PLENS_SURF_STRIDE;
         float x_v    = npay[sb + PLENS_S_XPOS];
         float R      = npay[sb + PLENS_S_RCURV];
-        float n_bef  = npay[sb + PLENS_S_NBEF];
-        float n_aft  = npay[sb + PLENS_S_NAFT];
+        float n_bef  = is_backward ? npay[sb + PLENS_S_NAFT] : npay[sb + PLENS_S_NBEF];
+        float n_aft  = is_backward ? npay[sb + PLENS_S_NBEF] : npay[sb + PLENS_S_NAFT];
         float ap_r   = npay[sb + PLENS_S_APR];
         float k      = npay[sb + PLENS_S_CONIK];
         bool  is_stop= (int(npay[sb + PLENS_S_FLAGS]) & 1) != 0;
+        float seg_t = 0.0;
+        float seg_opl = 0.0;
 
         /* ── Intersect ray with this surface ─────────────────────────────── */
         /* s=0: entry seek from T1 BVH proxy-mesh hit.  Allow t >= -0.01 so the
          * ray can roll back up to 1 cm to the exact conic entrance vertex.
          * s>0: previous Snell step left ray just in front; require t > 2e-7. */
         {
-            float t_min = (s == 0) ? -0.01 : 2e-7;
+            float t_min = (si == 0) ? -0.01 : 2e-7;
             float t;
             if (abs(R) < EPS) {
                 if (abs(ray_dir.x) < EPS) {
-                    uint cf = floatBitsToUint(hit_f(hb, 16));
-                    hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                    absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, uint(s),
+                                              ray_pos, ray_dir, n_bef, n_aft,
+                                              0.0, 0.0, ap_r, 0.0, 0.0);
                     return;
                 }
                 t = (x_v - ray_pos.x) / ray_dir.x;
                 if (t < t_min) {
-                    uint cf = floatBitsToUint(hit_f(hb, 16));
-                    hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                    absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, uint(s),
+                                              ray_pos, ray_dir, n_bef, n_aft,
+                                              0.0, 0.0, ap_r, 0.0, 0.0);
                     return;
                 }
             } else {
@@ -325,27 +420,30 @@ void parametric_lens_teleport(int hb, int pay_off)
                 float t1, t2;
                 if (abs(A) < EPS) {
                     if (abs(B) < EPS) {
-                        uint cf = floatBitsToUint(hit_f(hb, 16));
-                        hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                        absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, uint(s),
+                                                  ray_pos, ray_dir, n_bef, n_aft,
+                                                  0.0, 0.0, ap_r, 0.0, 0.0);
                         return;
                     }
                     t = -C / B;
                     if (t < t_min) {
-                        uint cf = floatBitsToUint(hit_f(hb, 16));
-                        hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                        absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, uint(s),
+                                                  ray_pos, ray_dir, n_bef, n_aft,
+                                                  0.0, 0.0, ap_r, 0.0, 0.0);
                         return;
                     }
                 } else {
                     float disc = B*B - 4.0*A*C;
                     if (disc < 0.0) {
-                        uint cf = floatBitsToUint(hit_f(hb, 16));
-                        hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                        absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, uint(s),
+                                                  ray_pos, ray_dir, n_bef, n_aft,
+                                                  0.0, 0.0, ap_r, 0.0, 0.0);
                         return;
                     }
                     float sq = sqrt(disc);
                     t1 = (-B - sq) / (2.0 * A);
                     t2 = (-B + sq) / (2.0 * A);
-                    if (s == 0) {
+                    if (si == 0) {
                         /* Entry seek: pick root with smallest |t| that is >= t_min. */
                         bool v1 = t1 >= t_min, v2 = t2 >= t_min;
                         if (v1 && v2) {
@@ -355,8 +453,9 @@ void parametric_lens_teleport(int hb, int pay_off)
                         } else if (v2) {
                             t = t2;
                         } else {
-                            uint cf = floatBitsToUint(hit_f(hb, 16));
-                            hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                            absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, uint(s),
+                                                      ray_pos, ray_dir, n_bef, n_aft,
+                                                      0.0, 0.0, ap_r, 0.0, 0.0);
                             return;
                         }
                     } else {
@@ -367,22 +466,26 @@ void parametric_lens_teleport(int hb, int pay_off)
                         } else if (t2 > 2e-7) {
                             t = t2;
                         } else {
-                            uint cf = floatBitsToUint(hit_f(hb, 16));
-                            hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+                            absorb_with_optical_event(hb, BDPT_OPT_ABSORPTION, uint(s),
+                                                      ray_pos, ray_dir, n_bef, n_aft,
+                                                      0.0, 0.0, ap_r, 0.0, 0.0);
                             return;
                         }
                     }
                 }
             }
-            opl     += n_bef * t;
+            seg_t = t;
+            seg_opl = n_bef * t;
+            opl     += seg_opl;
             ray_pos += t * ray_dir;
         }
 
         /* ── Aperture / stop check ───────────────────────────────────────── */
         float r_tr = sqrt(ray_pos.y*ray_pos.y + ray_pos.z*ray_pos.z);
         if (ap_r > 0.0 && r_tr > ap_r) {
-            uint cf = floatBitsToUint(hit_f(hb, 16));
-            hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
+            absorb_with_optical_event(hb, BDPT_OPT_APERTURE_CLIP, uint(s),
+                                      ray_pos, ray_dir, n_bef, n_aft,
+                                      seg_opl, abs(seg_t), ap_r, r_tr, r_tr - ap_r);
             return;
         }
         if (is_stop) continue;   /* stop passed — no refraction, advance to next */
@@ -406,12 +509,25 @@ void parametric_lens_teleport(int hb, int pay_off)
         float sin2_t = eta * eta * max(0.0, 1.0 - cos_i*cos_i);
         if (sin2_t > 1.0) {
             /* TIR */
-            uint cf = floatBitsToUint(hit_f(hb, 16));
+            emit_bdpt_optical(hb, BDPT_OPT_TIR, uint(s), 0u,
+                              ray_pos, surf_n, ray_dir, vec3(0.0),
+                              cos_i, 0.0, n_bef, n_aft,
+                              1.0, 0.0, 0.0,
+                              seg_opl, abs(seg_t), ap_r, r_tr, 0.0, 1.0);
+            uint cf = hit_u(hb, 16);
             hit_wf(hb, 16, uintBitsToFloat(cf | 8u));
             return;
         }
         float cos_t = sqrt(1.0 - sin2_t);
+        vec3 dir_before = ray_dir;
         ray_dir = normalize(eta * ray_dir + (eta * cos_i - cos_t) * surf_n);
+        float Rf = fresnel_R(cos_i, cos_t, n_bef, n_aft);
+        float J = (cos_i > EPS && cos_t > EPS) ? (eta * eta) * (cos_t / cos_i) : 0.0;
+        emit_bdpt_optical(hb, BDPT_OPT_REFRACTION, uint(s), 0u,
+                          ray_pos, surf_n, dir_before, ray_dir,
+                          cos_i, cos_t, n_bef, n_aft,
+                          Rf, 1.0 - Rf, 1.0 - Rf,
+                          seg_opl, abs(seg_t), ap_r, r_tr, 0.0, J);
     }
 
     /* ── Apply accumulated OPL phase to all spectral bands ──────────────── */

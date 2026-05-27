@@ -91,7 +91,7 @@
  *           row = mat_idx * MAT_FULL_BANDS + band_idx):
  *   [0]  center_hz     [1]  bandwidth_hz   [2]  reflectance_mag  [3]  transmittance
  *   [4]  diffuse_frac  [5]  emission       [6]  reemission       [7]  ior_real
- *   [8]  ior_imag      [9..11] pad
+ *   [8]  ior_imag      [9] reactive_shift_hz [10] ggx_alpha [11] metallic
  */
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -262,6 +262,7 @@ float mat_refl_im  (int mat, int b) { return mat_refl_complex(mat, b).y; }
 float mat_ior_real       (int mat, int b) { return mat_band_field(mat, b, 7, 1.0); }
 float mat_transmittance  (int mat, int b) { return mat_band_field(mat, b, 3, 0.0); }
 float mat_diffusion(int mat)              { return clamp(mat_band_field(mat, 0, 4, 0.0), 0.0, 1.0); }
+float mat_ggx_alpha(int mat)              { return clamp(mat_band_field(mat, 0, 10, 0.0), 0.0, 1.0); }
 bool  mat_is_transmissive(int mat) {
     if (mat < 0 || mat >= n_mats) return false;
     return mat_transmittance(mat, 0) > 1.0e-6 || abs(mat_ior_real(mat, 0) - 1.0) > 1.0e-6;
@@ -270,6 +271,65 @@ float medium_n_real(int mat) {
     if (mat < 0 || mat >= n_mats) return 1.0;
     float n = mat_ior_real(mat, 0);
     return (n > 1.0e-10) ? n : 1.0;
+}
+
+float ggx_D(float alpha, float NoH) {
+    float a = max(alpha, 1.0e-4);
+    float a2 = a * a;
+    float d = NoH * NoH * (a2 - 1.0) + 1.0;
+    return a2 / (3.141592653589793 * d * d);
+}
+
+float ggx_G1(float alpha, float NoV) {
+    float a = max(alpha, 1.0e-4);
+    float a2 = a * a;
+    return (NoV > 0.0) ? (2.0 * NoV) / (NoV + sqrt(a2 + (1.0 - a2) * NoV * NoV)) : 0.0;
+}
+
+float ggx_pdf_solid_angle(vec3 n, vec3 in_dir, vec3 out_dir, float alpha) {
+    vec3 V = normalize(-in_dir);
+    vec3 L = normalize(out_dir);
+    float NoV = max(0.0, dot(n, V));
+    float NoL = max(0.0, dot(n, L));
+    if (NoV <= 0.0 || NoL <= 0.0) return 0.0;
+    vec3 H = V + L;
+    float h2 = dot(H, H);
+    if (h2 <= 1.0e-20) return 0.0;
+    H *= inversesqrt(h2);
+    float NoH = max(0.0, dot(n, H));
+    float VoH = max(0.0, dot(V, H));
+    if (NoH <= 0.0 || VoH <= 1.0e-12) return 0.0;
+    return ggx_D(alpha, NoH) * ggx_G1(alpha, NoV) / (4.0 * NoV);
+}
+
+vec3 ggx_sample_reflection(vec3 n, vec3 in_dir, float alpha, inout uint rng) {
+    float u1 = rand_next(rng);
+    float u2 = rand_next(rng);
+    float a = max(alpha, 1.0e-4);
+    vec3 up = abs(n.z) < 0.999 ? vec3(0,0,1) : vec3(1,0,0);
+    vec3 t = normalize(cross(up, n));
+    vec3 b = cross(n, t);
+    vec3 V = normalize(-in_dir);
+    vec3 Vlocal = vec3(dot(V, t), dot(V, b), dot(V, n));
+    if (Vlocal.z <= 1.0e-8) {
+        return normalize(in_dir - 2.0 * dot(in_dir, n) * n);
+    }
+    vec3 Vh = normalize(vec3(a * Vlocal.x, a * Vlocal.y, Vlocal.z));
+    float lensq = Vh.x * Vh.x + Vh.y * Vh.y;
+    vec3 T1 = (lensq > 1.0e-20) ? vec3(-Vh.y, Vh.x, 0.0) * inversesqrt(lensq) : vec3(1.0, 0.0, 0.0);
+    vec3 T2 = cross(Vh, T1);
+    float r = sqrt(max(0.0, u1));
+    float phi = 6.28318530718 * u2;
+    float t1 = r * cos(phi);
+    float t2 = r * sin(phi);
+    float s = 0.5 * (1.0 + Vh.z);
+    t2 = (1.0 - s) * sqrt(max(0.0, 1.0 - t1 * t1)) + s * t2;
+    vec3 Nh = t1 * T1 + t2 * T2
+            + sqrt(max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+    vec3 Hlocal = normalize(vec3(a * Nh.x, a * Nh.y, max(0.0, Nh.z)));
+    vec3 H = normalize(t * Hlocal.x + b * Hlocal.y + n * Hlocal.z);
+    if (dot(H, V) < 0.0) H = -H;
+    return normalize(in_dir - 2.0 * dot(in_dir, H) * H);
 }
 
 /* ── RefinedHit field accessors ──────────────────────────────────────────── */
@@ -304,6 +364,7 @@ uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 58)); }
 #define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)
 #define BDPT_PDF_FLAG_SPLIT           (1u << 17)
 #define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)
+#define BDPT_PDF_FLAG_GGX             (1u << 20)
 
 void emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, int mat_id,
                       vec3 pos, vec3 nrm, vec3 dir_in,
@@ -757,17 +818,24 @@ void main() {
         }
     } else {
         float diffusion = (mat_id >= 0) ? mat_diffusion(mat_id) : 0.0;
+        float spec_p = max(0.0, 1.0 - diffusion);
+        float ggx_alpha = (mat_id >= 0) ? mat_ggx_alpha(mat_id) : 0.0;
         vec3 new_dir;
         bool chose_diffuse = false;
+        bool chose_ggx = false;
         if (rand_next(rng) < diffusion) {
             new_dir = cosine_hemisphere(nrm, rng);
             chose_diffuse = true;
+        } else if (spec_p > 0.0 && ggx_alpha > 1.0e-3) {
+            new_dir = ggx_sample_reflection(nrm, in_dir, ggx_alpha, rng);
+            chose_ggx = dot(new_dir, nrm) > 0.0;
         } else {
             new_dir = normalize(in_dir - 2.0 * dot(in_dir, nrm) * nrm);
-            if (dot(new_dir, nrm) < 0.0) {
-                new_dir = cosine_hemisphere(nrm, rng);
-                chose_diffuse = true;
-            }
+        }
+        if (dot(new_dir, nrm) <= 0.0) {
+            uint tslot = atomicAdd(meta[1], 1u);
+            write_terminal(tslot, hbase, false);
+            return;
         }
 
         float na_re[MAX_BANDS], na_im[MAX_BANDS];
@@ -785,14 +853,28 @@ void main() {
         if (max_abs >= min_amp) {
             uint islot = atomicAdd(meta[0], 1u);
             float diffuse_p = (mat_id >= 0) ? mat_diffusion(mat_id) : 0.0;
-            float scatter_pdf = chose_diffuse
-                ? diffuse_p * max(0.0, dot(new_dir, nrm)) / 3.141592653589793
-                : max(0.0, 1.0 - diffuse_p);
-            float scatter_pdf_rev = chose_diffuse
-                ? diffuse_p * max(0.0, -dot(in_dir, nrm)) / 3.141592653589793
-                : max(0.0, 1.0 - diffuse_p);
+            float scatter_pdf = 0.0;
+            float scatter_pdf_rev = 0.0;
             uint scatter_domain = chose_diffuse ? BDPT_DOMAIN_PROJ_SOLID_ANGLE : BDPT_DOMAIN_SOLID_ANGLE;
-            uint scatter_flags = chose_diffuse ? BDPT_PDF_FLAG_DIFFUSE : BDPT_PDF_FLAG_DELTA_SPECULAR;
+            uint scatter_flags = 0u;
+            if (chose_diffuse) {
+                scatter_pdf = diffuse_p * max(0.0, dot(new_dir, nrm)) / 3.141592653589793;
+                scatter_pdf_rev = diffuse_p * max(0.0, -dot(in_dir, nrm)) / 3.141592653589793;
+                scatter_flags = BDPT_PDF_FLAG_DIFFUSE;
+            } else if (chose_ggx) {
+                scatter_pdf = spec_p * ggx_pdf_solid_angle(nrm, in_dir, new_dir, ggx_alpha);
+                scatter_pdf_rev = spec_p * ggx_pdf_solid_angle(nrm, -new_dir, -in_dir, ggx_alpha);
+                scatter_flags = BDPT_PDF_FLAG_GGX;
+            } else {
+                scatter_pdf = spec_p;
+                scatter_pdf_rev = spec_p;
+                scatter_flags = BDPT_PDF_FLAG_DELTA_SPECULAR;
+            }
+            if (scatter_pdf <= 0.0 || scatter_pdf_rev <= 0.0) {
+                uint tslot = atomicAdd(meta[1], 1u);
+                write_terminal(tslot, hbase, false);
+                return;
+            }
             emit_bdpt_pdf(bdpt_sid, uint(bounce), scatter_domain, scatter_pdf, scatter_pdf_rev,
                           uint(flags) | scatter_flags, nrm, in_dir, new_dir);
             write_intent(islot, pos, new_dir, path_len, medium, iflags,

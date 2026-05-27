@@ -2232,6 +2232,25 @@ struct PyRayTracer
             ray_pipeline_run_bdpt_connection(_pipeline);
     }
 
+    int submit_sensor_sweep(int max_bounces = 8,
+                            double min_amplitude = 1e-6,
+                            int max_rays = 0,
+                            int max_children = 2,
+                            int seed = 42,
+                            int shutter_mode = 0,
+                            double shutter_open = 1.0,
+                            double shutter_center_u = 0.5,
+                            double shutter_center_v = 0.5,
+                            double shutter_softness = 0.0,
+                            double exposure_weight = 1.0) {
+        RayPipelineState* ps = _get_pipeline(max_children, seed);
+        py::gil_scoped_release release;
+        return ray_pipeline_submit_sensor_sweep(
+            ps, max_bounces, min_amplitude, max_rays,
+            shutter_mode, shutter_open, shutter_center_u, shutter_center_v,
+            shutter_softness, exposure_weight);
+    }
+
     void set_bdpt_sweep_trigger(int n) {
         _bdpt_sweep_trigger = n;
         if (_pipeline)
@@ -5349,6 +5368,23 @@ last call, evaluates valid sensor/light vertex-pair strategies, computes
 geometry terms and MIS weights, emits BdptConnectionRecord diagnostics, and
 accumulates visible contributions into sensor channel 2.
 Call once per sensor sweep after the pipeline is idle.)doc")
+        .def("submit_sensor_sweep",
+             &PyRayTracer::submit_sensor_sweep,
+             py::arg("max_bounces") = 8,
+             py::arg("min_amplitude") = 1e-6,
+             py::arg("max_rays") = 0,
+             py::arg("max_children") = 2,
+             py::arg("seed") = 42,
+             py::arg("shutter_mode") = 0,
+             py::arg("shutter_open") = 1.0,
+             py::arg("shutter_center_u") = 0.5,
+             py::arg("shutter_center_v") = 0.5,
+             py::arg("shutter_softness") = 0.0,
+             py::arg("exposure_weight") = 1.0,
+R"doc(Submit a native BDPT sensor-frame sweep into the persistent pipeline.
+Uses the configured sensor image grid and stamps all rays as BDPT_SIDE_SENSOR.
+shutter_mode: 0=open, 1=closed, 2=iris, 3=sliding_x, 4=sliding_y.
+max_rays <= 0 submits the full grid after shutter masking.)doc")
         .def("set_bdpt_sweep_trigger",
              &PyRayTracer::set_bdpt_sweep_trigger,
              py::arg("n"),

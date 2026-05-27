@@ -270,6 +270,7 @@ typedef struct {
 #define BDPT_PDF_FLAG_SPLIT           (1u << 17)  /* deterministic split (max_children >= 2) */
 #define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)  /* cosine hemisphere scatter */
 #define BDPT_PDF_FLAG_ABSORBED        (1u << 19)  /* path terminated here */
+#define BDPT_PDF_FLAG_GGX             (1u << 20)  /* rough microfacet reflection */
 
 /* ── Layout sanity checks ────────────────────────────────────────────────── */
 #ifdef __cplusplus

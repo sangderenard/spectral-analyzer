@@ -1003,6 +1003,83 @@ static inline float mat_cache_diffusion(const MatSpectralCache& c, int m)
     return c.diffusion[m];
 }
 
+static inline float surf_cache_ggx_alpha(const RtMaterialSurfaceCache& c, int m)
+{
+    if (m < 0 || m >= c.n_mats || c.roughness.empty()) return 0.0f;
+    return std::max(0.0f, std::min(1.0f, c.roughness[static_cast<size_t>(m)]));
+}
+
+static inline double ggx_D(double alpha, double NoH)
+{
+    const double a = std::max(1.0e-4, alpha);
+    const double a2 = a * a;
+    const double d = NoH * NoH * (a2 - 1.0) + 1.0;
+    return a2 / (M_PI * d * d);
+}
+
+static inline double ggx_G1(double alpha, double NoV)
+{
+    const double a = std::max(1.0e-4, alpha);
+    const double a2 = a * a;
+    return (NoV > 0.0)
+        ? (2.0 * NoV) / (NoV + std::sqrt(a2 + (1.0 - a2) * NoV * NoV))
+        : 0.0;
+}
+
+static inline double ggx_pdf_solid_angle(const V3d& n, const V3d& in_dir,
+                                         const V3d& out_dir, double alpha)
+{
+    const V3d V = (-in_dir).normalized();
+    const V3d L = out_dir.normalized();
+    const double NoV = std::max(0.0, n.dot(V));
+    const double NoL = std::max(0.0, n.dot(L));
+    if (NoV <= 0.0 || NoL <= 0.0) return 0.0;
+    V3d H = V + L;
+    const double h2 = H.squaredNorm();
+    if (h2 <= 1.0e-20) return 0.0;
+    H /= std::sqrt(h2);
+    const double NoH = std::max(0.0, n.dot(H));
+    const double VoH = std::max(0.0, V.dot(H));
+    if (NoH <= 0.0 || VoH <= 1.0e-12) return 0.0;
+    return ggx_D(alpha, NoH) * ggx_G1(alpha, NoV) / (4.0 * NoV);
+}
+
+static inline V3d ggx_sample_reflection(const V3d& n, const V3d& in_dir,
+                                        double alpha, double u1, double u2)
+{
+    const double a = std::max(1.0e-4, alpha);
+    const V3d up = (std::abs(n.z()) < 0.999) ? V3d(0.0, 0.0, 1.0) : V3d(1.0, 0.0, 0.0);
+    const V3d t = up.cross(n).normalized();
+    const V3d b = n.cross(t);
+    const V3d V = (-in_dir).normalized();
+    const V3d Vlocal(t.dot(V), b.dot(V), n.dot(V));
+    if (Vlocal.z() <= 1.0e-8) {
+        return (in_dir - 2.0 * in_dir.dot(n) * n).normalized();
+    }
+
+    V3d Vh(a * Vlocal.x(), a * Vlocal.y(), Vlocal.z());
+    Vh.normalize();
+    const double lensq = Vh.x() * Vh.x() + Vh.y() * Vh.y();
+    V3d T1 = (lensq > 1.0e-20)
+        ? V3d(-Vh.y(), Vh.x(), 0.0) / std::sqrt(lensq)
+        : V3d(1.0, 0.0, 0.0);
+    const V3d T2 = Vh.cross(T1);
+
+    const double r = std::sqrt(std::max(0.0, u1));
+    const double phi = 2.0 * M_PI * u2;
+    const double t1 = r * std::cos(phi);
+    double t2 = r * std::sin(phi);
+    const double s = 0.5 * (1.0 + Vh.z());
+    t2 = (1.0 - s) * std::sqrt(std::max(0.0, 1.0 - t1 * t1)) + s * t2;
+    V3d Nh = t1 * T1 + t2 * T2
+           + std::sqrt(std::max(0.0, 1.0 - t1 * t1 - t2 * t2)) * Vh;
+    V3d Hlocal(a * Nh.x(), a * Nh.y(), std::max(0.0, Nh.z()));
+    Hlocal.normalize();
+    V3d H = (t * Hlocal.x() + b * Hlocal.y() + n * Hlocal.z()).normalized();
+    if (H.dot(V) < 0.0) H = -H;
+    return (in_dir - 2.0 * in_dir.dot(H) * H).normalized();
+}
+
 /* O(n_bands) reactive shift using precomputed destination band indices. */
 static inline void apply_reactive_shift_cached(VXcd& amp, const MatSpectralCache& c, int m)
 {
@@ -7354,6 +7431,16 @@ struct RayPipelineState {
     PipelineQueue<BdptOpticalEventRecord>   Q_bdpt_optical;
     PipelineQueue<BdptConnectionRecord>     Q_bdpt_connections;
 
+    /* Records drained from the live stage queues but not yet connected.
+     * Connection can be requested while only one side of the bidirectional
+     * exposure has arrived; those records must remain available until the
+     * matching camera/light side is present. */
+    std::mutex                              bdpt_pending_mu;
+    std::vector<BdptVertexRecord>           bdpt_pending_vertices;
+    std::vector<BdptSpectralWeightRecord>   bdpt_pending_spectral;
+    std::vector<BdptPdfRecord>              bdpt_pending_pdfs;
+    std::vector<BdptOpticalEventRecord>     bdpt_pending_optical;
+
     /* Overflow counters — incremented when a side queue is full.
      * Never wraps: saturate at UINT64_MAX. */
     std::atomic<uint64_t>     bdpt_overflow_vertices{0};
@@ -7450,6 +7537,7 @@ struct RayPipelineState {
      * Reset to 0 by the auto-trigger when it fires.  Used by pipeline_material
      * to detect sweep completion without any Python involvement. */
     std::atomic<uint64_t>     bdpt_cam_vertex_count{0};
+    std::atomic<uint32_t>     bdpt_next_subpath_id{1u};
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -7518,8 +7606,9 @@ public:
     /* Cached uniform locations — populated once after shader link */
     struct { GLint n_intents, n_bands, n_mats, n_arenas, n_tris, u_arenas; }
         uloc_t1 = {-1,-1,-1,-1,-1,-1};
-    struct { GLint n_tris, n_groups, n_bands, freq_hz; }
-        uloc_t2 = {-1,-1,-1,-1};
+    struct { GLint n_tris, n_groups, n_bands, freq_hz,
+                   bdpt_max_optical, bdpt_optical_base; }
+        uloc_t2 = {-1,-1,-1,-1,-1,-1};
     struct { GLint n_bands, n_mats, max_children, max_children_per_hit,
                    sensor_res, sensor_pr, sensor_px,
                    n_uv_groups, uv_group_id_base, uv_meta_base, rng_seed,
@@ -7555,8 +7644,10 @@ public:
      * Only [0] and [1] are zeroed before each dispatch; eps_flags are written
      * at scene-upload time and persist across dispatches. */
     GLuint ssbo_t3_meta     = 0;
-    /* BDPT output: single SSBO (verts first, then spectral at bdpt_spectral_base floats in,
-     * then pdfs at bdpt_pdf_base floats in).  Counts live in MetaBuf at [2+n_mats..2+n_mats+2].
+    /* BDPT output: single SSBO (verts first, spectral at bdpt_spectral_base,
+     * pdfs at bdpt_pdf_base, optical at bdpt_optical_base).
+     * Vertex/spectral/pdf counts live in MetaBuf at [2+n_mats..2+n_mats+2];
+     * GPU T2 optical count lives in CounterBuf[4].
      * bdpt_sid is embedded in hit[58] by T1 — no separate id SSBO needed. */
     GLuint ssbo_bdpt_output   = 0;
     int    cap_bdpt_output    = 0;  /* in floats */
@@ -7593,6 +7684,7 @@ public:
     std::vector<float>     stg_bdpt_verts;    /* BdptVertexRecord readback                   */
     std::vector<float>     stg_bdpt_spectral; /* BdptSpectralWeightRecord readback           */
     std::vector<float>     stg_bdpt_pdfs;     /* BdptPdfRecord readback                      */
+    std::vector<float>     stg_bdpt_optical;  /* BdptOpticalEventRecord readback             */
     std::vector<RayRecord> stg_strike;   /* STRIKE records for Q_out                   */
     std::vector<RayIntent> stg_children; /* child intents for push_many                */
     std::vector<uint32_t>  stg_uv_acc;  /* UV accumulator readback                    */
@@ -7827,6 +7919,8 @@ public:
         uloc_t2.n_groups  = glc_GetUniformLocation(prog_t2, "n_groups");
         uloc_t2.n_bands   = glc_GetUniformLocation(prog_t2, "n_bands");
         uloc_t2.freq_hz   = glc_GetUniformLocation(prog_t2, "freq_hz");
+        uloc_t2.bdpt_max_optical = glc_GetUniformLocation(prog_t2, "bdpt_max_optical");
+        uloc_t2.bdpt_optical_base = glc_GetUniformLocation(prog_t2, "bdpt_optical_base");
 
         uloc_t3.n_bands              = glc_GetUniformLocation(prog_t3, "n_bands");
         uloc_t3.n_mats               = glc_GetUniformLocation(prog_t3, "n_mats");
@@ -8227,12 +8321,15 @@ public:
         static constexpr int BDPT_VERTEX_STRIDE_F   = 28;  /* floats per BdptVertexRecord */
         static constexpr int BDPT_SPECTRAL_STRIDE_F =  8;  /* floats per BdptSpectralWeightRecord */
         static constexpr int BDPT_PDF_STRIDE_F      = 12;  /* floats per BdptPdfRecord */
+        static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;  /* floats per BdptOpticalEventRecord */
         const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 2000000;
         const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 4000000;
         const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 2000000;
+        const int max_bdpt_o = (ps.cfg.bdpt_max_optical > 0) ? ps.cfg.bdpt_max_optical : 1000000;
         const int  bdpt_spectral_base_f = max_bdpt_v * BDPT_VERTEX_STRIDE_F;
         const int  bdpt_pdf_base_f      = bdpt_spectral_base_f + max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
-        const int64_t bdpt_total_f      = (int64_t)bdpt_pdf_base_f + (int64_t)max_bdpt_p * BDPT_PDF_STRIDE_F;
+        const int  bdpt_optical_base_f  = bdpt_pdf_base_f + max_bdpt_p * BDPT_PDF_STRIDE_F;
+        const int64_t bdpt_total_f      = (int64_t)bdpt_optical_base_f + (int64_t)max_bdpt_o * BDPT_OPTICAL_STRIDE_F;
         if (bdpt_total_f > cap_bdpt_output) {
             cap_bdpt_output = (int)bdpt_total_f;
             ensure_ssbo(ssbo_bdpt_output, (GLsizeiptr)(bdpt_total_f * sizeof(float)));
@@ -8298,10 +8395,13 @@ public:
             bind_ssbo(ssbo_tri_param,  2); bind_ssbo(ssbo_group_kind,3);
             bind_ssbo(ssbo_group_pay,  4); bind_ssbo(ssbo_counter,   5);
             bind_ssbo(ssbo_neural_pay, 6);
+            bind_ssbo(ssbo_bdpt_output, 7);
             /* n_hits uniform removed — shader reads counters[0] from SSBO */
             glc_Uniform1i(uloc_t2.n_tris,   nt);
             glc_Uniform1i(uloc_t2.n_groups, n_param_groups);
             glc_Uniform1i(uloc_t2.n_bands,  nb);
+            glc_Uniform1i(uloc_t2.bdpt_max_optical, max_bdpt_o);
+            glc_Uniform1i(uloc_t2.bdpt_optical_base, bdpt_optical_base_f);
             if (uloc_t2.freq_hz >= 0) {
                 float fhz[16] = {};
                 const int nbf = std::min(nb, 16);
@@ -8677,6 +8777,7 @@ public:
             const int nv = std::min((int)bdpt_cnts[0], max_bdpt_v);
             const int ns = std::min((int)bdpt_cnts[1], max_bdpt_s);
             const int np = std::min((int)bdpt_cnts[2], max_bdpt_p);
+            const int no = std::min((int)counters[4], max_bdpt_o);
 
             if (nv > 0) {
                 stg_bdpt_verts.resize((size_t)nv * BDPT_VERTEX_STRIDE_F);
@@ -8773,6 +8874,50 @@ public:
                     pr.geometry_term   = row[7];
                     memcpy(&pr.flags, row + 8, 4);
                     ps.push_bdpt_pdf(pr);
+                }
+            }
+
+            if (no > 0) {
+                stg_bdpt_optical.resize((size_t)no * BDPT_OPTICAL_STRIDE_F);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                     (GLintptr)((size_t)bdpt_optical_base_f * sizeof(float)),
+                                     (GLsizeiptr)((size_t)no * BDPT_OPTICAL_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_optical.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                for (int i = 0; i < no; ++i) {
+                    const float* row = stg_bdpt_optical.data() + (size_t)i * BDPT_OPTICAL_STRIDE_F;
+                    BdptOpticalEventRecord oe{};
+                    memcpy(&oe.subpath_id, row + 0, 4);
+                    {
+                        uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
+                        oe.vertex_index  = (uint16_t)(pk & 0xFFFFu);
+                        oe.element_index = (uint16_t)((pk >> 16) & 0xFFFFu);
+                    }
+                    {
+                        uint32_t pk = 0u; memcpy(&pk, row + 2, 4);
+                        oe.reason = (uint8_t)(pk & 0xFFu);
+                        oe.stream = (uint8_t)((pk >> 8) & 0xFFu);
+                        oe.flags  = (uint16_t)((pk >> 16) & 0xFFFFu);
+                    }
+                    oe.pos[0] = row[3];  oe.pos[1] = row[4];  oe.pos[2] = row[5];
+                    oe.normal[0] = row[6]; oe.normal[1] = row[7]; oe.normal[2] = row[8];
+                    oe.dir_in[0] = row[9]; oe.dir_in[1] = row[10]; oe.dir_in[2] = row[11];
+                    oe.dir_out[0] = row[12]; oe.dir_out[1] = row[13]; oe.dir_out[2] = row[14];
+                    oe.cos_incident         = row[15];
+                    oe.cos_transmitted      = row[16];
+                    oe.eta_i                = row[17];
+                    oe.eta_t                = row[18];
+                    oe.fresnel_reflectance  = row[19];
+                    oe.transmittance        = row[20];
+                    oe.throughput_multiplier = row[21];
+                    oe.opl                  = row[22];
+                    oe.geom_len             = row[23];
+                    oe.aperture_radius      = row[24];
+                    oe.transverse_radius    = row[25];
+                    oe.dist_past_aperture   = row[26];
+                    oe.phase_space_jacobian = row[27];
+                    ps.push_bdpt_optical(oe);
                 }
             }
 
@@ -9943,18 +10088,29 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 continue;
             }
 
-            /* Opaque: diffuse or specular */
+            /* Opaque: diffuse, GGX microfacet, or mathematically-degenerate mirror. */
             V3d new_dir;
             bool chose_diffuse = false;
-            if (U01(rng) < mat_cache_diffusion(st.mat_cache, tri.mat_idx)) {
+            bool chose_ggx = false;
+            const double diffuse_p = std::max(0.0, std::min(1.0,
+                static_cast<double>(mat_cache_diffusion(st.mat_cache, tri.mat_idx))));
+            const double spec_p = std::max(0.0, 1.0 - diffuse_p);
+            const double ggx_alpha = static_cast<double>(
+                surf_cache_ggx_alpha(st.surf_cache, tri.mat_idx));
+            if (U01(rng) < diffuse_p) {
                 new_dir = cosine_hemisphere(hit_n, rng);
                 chose_diffuse = true;
+            } else if (spec_p > 0.0 && ggx_alpha > 1.0e-3) {
+                new_dir = ggx_sample_reflection(hit_n, in_dir, ggx_alpha,
+                                                U01(rng), U01(rng));
+                chose_ggx = (new_dir.dot(hit_n) > 0.0);
             } else {
                 new_dir = (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
-                if (new_dir.dot(hit_n) < 0.0) {
-                    new_dir = cosine_hemisphere(hit_n, rng);
-                    chose_diffuse = true;
-                }
+            }
+            if (new_dir.dot(hit_n) <= 0.0) {
+                push_terminal(hr);
+                pipeline_finish_ray(ps);
+                continue;
             }
             VXcd na = amp;
             for (int b = 0; b < nb; ++b)
@@ -9966,22 +10122,34 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             for (int b = 0; b < nb; ++b)
                 max_abs = std::max(max_abs, std::abs(na[b]));
             if (max_abs >= hr.ray.min_amplitude) {
-                /* PDF: cosine hemisphere → cos(θ)/π; specular mirror → delta. */
-                const double diffuse_p = static_cast<double>(
-                    mat_cache_diffusion(st.mat_cache, tri.mat_idx));
+                /* PDF: cosine hemisphere, GGX microfacet reflection, or delta mirror. */
                 const double cos_in_pdf = std::max(0.0, -in_dir.dot(hit_n));
-                const float scatter_pdf = chose_diffuse
-                    ? static_cast<float>(diffuse_p * std::max(0.0, new_dir.dot(hit_n)) / M_PI)
-                    : static_cast<float>(std::max(0.0, 1.0 - diffuse_p));
-                const float scatter_pdf_rev = chose_diffuse
-                    ? static_cast<float>(diffuse_p * cos_in_pdf / M_PI)
-                    : static_cast<float>(std::max(0.0, 1.0 - diffuse_p));
-                const uint32_t scatter_flags = chose_diffuse
-                    ? BDPT_PDF_FLAG_DIFFUSE
-                    : BDPT_PDF_FLAG_DELTA_SPECULAR;
+                float scatter_pdf = 0.0f;
+                float scatter_pdf_rev = 0.0f;
+                uint32_t scatter_flags = 0u;
+                if (chose_diffuse) {
+                    scatter_pdf = static_cast<float>(
+                        diffuse_p * std::max(0.0, new_dir.dot(hit_n)) / M_PI);
+                    scatter_pdf_rev = static_cast<float>(diffuse_p * cos_in_pdf / M_PI);
+                    scatter_flags = BDPT_PDF_FLAG_DIFFUSE;
+                } else if (chose_ggx) {
+                    scatter_pdf = static_cast<float>(
+                        spec_p * ggx_pdf_solid_angle(hit_n, in_dir, new_dir, ggx_alpha));
+                    scatter_pdf_rev = static_cast<float>(
+                        spec_p * ggx_pdf_solid_angle(hit_n, -new_dir, -in_dir, ggx_alpha));
+                    scatter_flags = BDPT_PDF_FLAG_GGX;
+                } else {
+                    scatter_pdf = static_cast<float>(spec_p);
+                    scatter_pdf_rev = static_cast<float>(spec_p);
+                    scatter_flags = BDPT_PDF_FLAG_DELTA_SPECULAR;
+                }
+                if (!(scatter_pdf > 0.0f) || !(scatter_pdf_rev > 0.0f)) {
+                    push_terminal(hr);
+                    pipeline_finish_ray(ps);
+                    continue;
+                }
                 emit_scatter(new_dir, na,
-                             chose_diffuse ? BDPT_DOMAIN_PROJ_SOLID_ANGLE
-                                           : BDPT_DOMAIN_SOLID_ANGLE,
+                             chose_diffuse ? BDPT_DOMAIN_PROJ_SOLID_ANGLE : BDPT_DOMAIN_SOLID_ANGLE,
                              scatter_pdf, scatter_pdf_rev, scatter_flags);
                 pipeline_spawn_child(ps, make_child(new_dir, na));
             } else {
@@ -10328,11 +10496,168 @@ int ray_pipeline_drain_bdpt_optical(RayPipelineState* ps,
 }
 
 int ray_pipeline_drain_bdpt_connections(RayPipelineState* ps,
-                                         std::vector<BdptConnectionRecord>& out,
-                                         int max_n)
+                                          std::vector<BdptConnectionRecord>& out,
+                                          int max_n)
 {
     if (!ps || max_n <= 0) return 0;
     return ps->Q_bdpt_connections.drain(out, max_n);
+}
+
+static bool bdpt_find_parametric_stop_target(const RayTracerState& st,
+                                             double& out_x,
+                                             double& out_radius)
+{
+    bool have = false;
+    double best_r = std::numeric_limits<double>::infinity();
+    for (size_t gi = 0; gi < st.tri_group_parametric_kind.size(); ++gi) {
+        if (st.tri_group_parametric_kind[gi] != TRI_PARAM_SURFACE_PARAMETRIC_LENS)
+            continue;
+        const auto& payload = st.tri_group_parametric_payload[gi];
+        auto f32 = [&](size_t idx) -> float {
+            float v = 0.0f;
+            const size_t off = idx * sizeof(float);
+            if (off + sizeof(float) <= payload.size())
+                std::memcpy(&v, payload.data() + off, sizeof(float));
+            return v;
+        };
+        if (payload.size() < 8u * sizeof(float) || f32(0) != 14949.0f)
+            continue;
+        const int n_surf = static_cast<int>(f32(1));
+        if (n_surf < 1 || n_surf > 64)
+            continue;
+        if (payload.size() < static_cast<size_t>(8 + n_surf * 8) * sizeof(float))
+            continue;
+
+        for (int s = 0; s < n_surf; ++s) {
+            const size_t sb = static_cast<size_t>(8 + s * 8);
+            const double x  = static_cast<double>(f32(sb + 0));
+            const double ap = static_cast<double>(f32(sb + 4));
+            const int flags = static_cast<int>(f32(sb + 6));
+            if (!(ap > 0.0) || !std::isfinite(ap))
+                continue;
+            if ((flags & 1) != 0) {
+                out_x = x;
+                out_radius = ap;
+                return true;
+            }
+            if (ap < best_r) {
+                best_r = ap;
+                out_x = x;
+                out_radius = ap;
+                have = true;
+            }
+        }
+    }
+    return have;
+}
+
+int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
+                                      int max_bounces,
+                                      double min_amplitude,
+                                      int max_rays,
+                                      int shutter_mode,
+                                      double shutter_open,
+                                      double shutter_center_u,
+                                      double shutter_center_v,
+                                      double shutter_softness,
+                                      double exposure_weight)
+{
+    if (!ps || !ps->st || ps->sensor_res <= 0 || ps->sensor_pr <= 0.0f)
+        return 0;
+
+    const int res = ps->sensor_res;
+    const int total = res * res;
+    const int limit = (max_rays > 0) ? std::min(max_rays, total) : total;
+    if (limit <= 0) return 0;
+
+    double target_x = static_cast<double>(ps->sensor_px) - std::max(0.05, 2.0 * static_cast<double>(ps->sensor_pr));
+    double target_r = 0.0;
+    (void)bdpt_find_parametric_stop_target(*ps->st, target_x, target_r);
+    const V3d target(target_x, 0.0, 0.0);
+
+    const int n_bands = std::max(1, std::min(ps->st->n_bands, MAX_SPECTRAL_BANDS));
+    const double pr = static_cast<double>(ps->sensor_pr);
+    const double step = (2.0 * pr) / static_cast<double>(res);
+    const double open_f = std::max(0.0, std::min(1.0, shutter_open));
+    const double cu = std::max(0.0, std::min(1.0, shutter_center_u));
+    const double cv = std::max(0.0, std::min(1.0, shutter_center_v));
+    const double soft = std::max(0.0, shutter_softness);
+    const double exposure_w = std::max(0.0, exposure_weight);
+    if (exposure_w <= 0.0 || shutter_mode == 1 || open_f <= 0.0)
+        return 0;
+
+    auto smooth_gate = [&](double edge) -> double {
+        if (soft <= 1.0e-12)
+            return edge >= 0.0 ? 1.0 : 0.0;
+        const double x = std::max(0.0, std::min(1.0, 0.5 + 0.5 * edge / soft));
+        return x * x * (3.0 - 2.0 * x);
+    };
+    auto shutter_weight_at = [&](double u, double v) -> double {
+        if (shutter_mode == 0) return 1.0;
+        if (shutter_mode == 2) {
+            if (open_f >= 1.0) return 1.0;
+            const double r = 0.5 * std::sqrt(open_f);
+            const double du = u - cu;
+            const double dv = v - cv;
+            return smooth_gate(r - std::sqrt(du*du + dv*dv));
+        }
+        if (shutter_mode == 3) {
+            if (open_f >= 1.0) return 1.0;
+            return smooth_gate(0.5 * open_f - std::abs(u - cu));
+        }
+        if (shutter_mode == 4) {
+            if (open_f >= 1.0) return 1.0;
+            return smooth_gate(0.5 * open_f - std::abs(v - cv));
+        }
+        return 1.0;
+    };
+    std::vector<RayIntent> intents;
+    intents.reserve(static_cast<size_t>(limit));
+
+    for (int pix = 0; pix < total && static_cast<int>(intents.size()) < limit; ++pix) {
+        const int iy = pix / res;
+        const int iz = pix - iy * res;
+        const double y = -pr + (static_cast<double>(iy) + 0.5) * step;
+        const double z = -pr + (static_cast<double>(iz) + 0.5) * step;
+        const double u = (z + pr) / std::max(2.0 * pr, 1.0e-30);
+        const double v = (y + pr) / std::max(2.0 * pr, 1.0e-30);
+        const double shutter_w = shutter_weight_at(u, v);
+        if (!(shutter_w > 0.0) || !std::isfinite(shutter_w))
+            continue;
+        V3d pos(static_cast<double>(ps->sensor_px), y, z);
+        V3d dir = target - pos;
+        if (dir.squaredNorm() <= 1e-24)
+            dir = V3d(-1.0, 0.0, 0.0);
+        else
+            dir.normalize();
+
+        RayIntent ri;
+        ri.pos = pos + dir * (T_SELF * 256.0);
+        ri.dir = dir;
+        ri.amp.resize(n_bands);
+        ri.amp.setConstant(exposure_w * shutter_w);
+        ri.src_id = pix;
+        ri.tag = static_cast<uint64_t>(pix);
+        ri.color_flag = 1u;
+        ri.bounce = 0;
+        ri.bounces_left = std::max(1, max_bounces);
+        ri.min_amplitude = min_amplitude;
+        ri.sensor_origin_y = static_cast<float>(y);
+        ri.sensor_origin_z = static_cast<float>(z);
+        uint32_t sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+        sid = 0x80000000u | (sid & 0x7FFFFFFFu);
+        if (sid == 0u)
+            sid = 0x80000001u;
+        ri.bdpt_subpath_id = sid;
+        ri.bdpt_vertex = 0u;
+        ri.bdpt_stream = BDPT_SIDE_SENSOR;
+        ri.bdpt_strategy = 0u;
+        intents.push_back(std::move(ri));
+    }
+
+    if (intents.empty()) return 0;
+    ray_pipeline_submit(ps, intents.data(), static_cast<int>(intents.size()));
+    return static_cast<int>(intents.size());
 }
 
 void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
@@ -10374,15 +10699,45 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 {
     if (!ps || !ps->st || ps->sensor_res <= 0) return;
 
-    /* Drain side queues atomically — subsequent calls see only new records. */
+    std::vector<BdptVertexRecord>         verts_new;
+    std::vector<BdptSpectralWeightRecord> sweights_new;
+    std::vector<BdptPdfRecord>            pdfs_new;
+    std::vector<BdptOpticalEventRecord>   optical_new;
+    ray_pipeline_drain_bdpt_vertices(ps, verts_new,   ps->cfg.bdpt_max_vertices > 0 ? ps->cfg.bdpt_max_vertices : 2000000);
+    ray_pipeline_drain_bdpt_spectral(ps, sweights_new, ps->cfg.bdpt_max_spectral > 0 ? ps->cfg.bdpt_max_spectral : 4000000);
+    ray_pipeline_drain_bdpt_pdfs    (ps, pdfs_new,     ps->cfg.bdpt_max_pdfs     > 0 ? ps->cfg.bdpt_max_pdfs     : 2000000);
+    ray_pipeline_drain_bdpt_optical (ps, optical_new,  ps->cfg.bdpt_max_optical  > 0 ? ps->cfg.bdpt_max_optical  : 1000000);
+
     std::vector<BdptVertexRecord>         verts;
     std::vector<BdptSpectralWeightRecord> sweights;
     std::vector<BdptPdfRecord>            pdfs;
     std::vector<BdptOpticalEventRecord>   optical;
-    ray_pipeline_drain_bdpt_vertices(ps, verts,   ps->cfg.bdpt_max_vertices > 0 ? ps->cfg.bdpt_max_vertices : 2000000);
-    ray_pipeline_drain_bdpt_spectral(ps, sweights, ps->cfg.bdpt_max_spectral > 0 ? ps->cfg.bdpt_max_spectral : 4000000);
-    ray_pipeline_drain_bdpt_pdfs    (ps, pdfs,     ps->cfg.bdpt_max_pdfs     > 0 ? ps->cfg.bdpt_max_pdfs     : 2000000);
-    ray_pipeline_drain_bdpt_optical (ps, optical,  ps->cfg.bdpt_max_optical  > 0 ? ps->cfg.bdpt_max_optical  : 1000000);
+    {
+        std::lock_guard<std::mutex> pending_lk(ps->bdpt_pending_mu);
+        ps->bdpt_pending_vertices.insert(ps->bdpt_pending_vertices.end(),
+                                         verts_new.begin(), verts_new.end());
+        ps->bdpt_pending_spectral.insert(ps->bdpt_pending_spectral.end(),
+                                         sweights_new.begin(), sweights_new.end());
+        ps->bdpt_pending_pdfs.insert(ps->bdpt_pending_pdfs.end(),
+                                     pdfs_new.begin(), pdfs_new.end());
+        ps->bdpt_pending_optical.insert(ps->bdpt_pending_optical.end(),
+                                        optical_new.begin(), optical_new.end());
+
+        bool have_camera = false;
+        bool have_light  = false;
+        for (const auto& v : ps->bdpt_pending_vertices) {
+            if (v.stream == BDPT_SIDE_SENSOR) have_camera = true;
+            else if (v.stream == BDPT_SIDE_LIGHT) have_light = true;
+            if (have_camera && have_light) break;
+        }
+        if (!have_camera || !have_light)
+            return;
+
+        verts.swap(ps->bdpt_pending_vertices);
+        sweights.swap(ps->bdpt_pending_spectral);
+        pdfs.swap(ps->bdpt_pending_pdfs);
+        optical.swap(ps->bdpt_pending_optical);
+    }
 
     if (verts.empty()) return;
 
@@ -10522,7 +10877,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         return edge_pdf_area_component(from, from, to, false, out_pdf);
     };
 
-    auto diffuse_connection_pdf_area = [&](const BdptVertexRecord& from,
+    auto scatter_connection_pdf_area = [&](const BdptVertexRecord& from,
                                            const BdptVertexRecord& to,
                                            double& out_pdf) -> bool {
         const BdptPdfRecord* pr = pdf_for(from.subpath_id, from.vertex_index);
@@ -10531,7 +10886,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         if (from.mat_idx < 0) return false;
         const double diffuse_p = static_cast<double>(
             mat_cache_diffusion(ps->st->mat_cache, from.mat_idx));
-        if (!(diffuse_p > 0.0)) return false;
+        const double spec_p = std::max(0.0, 1.0 - diffuse_p);
 
         double optical_j = 1.0;
         if (!optical_allows_sampling(from, false, optical_j))
@@ -10551,7 +10906,21 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         const double cos_out = std::max(0.0, n0.dot(d));
         const double cos_to  = std::max(0.0, std::abs(n1.dot(-d)));
         if (cos_out <= 0.0 || cos_to <= 0.0) return false;
-        const double pdf_sa = diffuse_p * cos_out / M_PI;
+        double pdf_sa = 0.0;
+        if ((pr->flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
+            if (!(diffuse_p > 0.0)) return false;
+            pdf_sa = diffuse_p * cos_out / M_PI;
+        } else if ((pr->flags & BDPT_PDF_FLAG_GGX) != 0u) {
+            if (!(spec_p > 0.0)) return false;
+            const double alpha = static_cast<double>(
+                surf_cache_ggx_alpha(ps->st->surf_cache, from.mat_idx));
+            if (!(alpha > 1.0e-3)) return false;
+            const V3d in_dir(from.dir_in[0], from.dir_in[1], from.dir_in[2]);
+            pdf_sa = spec_p * ggx_pdf_solid_angle(n0, in_dir, d, alpha);
+        } else {
+            return false;
+        }
+        if (!(pdf_sa > 0.0) || !std::isfinite(pdf_sa)) return false;
         const double pdf = pdf_sa * cos_to / dist2 * optical_j;
         if (!(pdf > 0.0) || !std::isfinite(pdf)) return false;
         out_pdf = std::max(pdf, 1e-12);
@@ -10668,8 +11037,8 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 ok_f = edge_pdf_area_component(parent, parent, child, false, pf);
                 ok_b = edge_pdf_area_component(parent, child, parent, true, pb);
             } else if (e == ci) {
-                ok_f = diffuse_connection_pdf_area(*chain[e], *chain[e + 1], pf);
-                ok_b = diffuse_connection_pdf_area(*chain[e + 1], *chain[e], pb);
+                ok_f = scatter_connection_pdf_area(*chain[e], *chain[e + 1], pf);
+                ok_b = scatter_connection_pdf_area(*chain[e + 1], *chain[e], pb);
             } else {
                 const size_t light_child_idx = li - (e - ci - 1);
                 if (light_child_idx == 0) return false;
@@ -10812,6 +11181,30 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 }
             }
         }
+    }
+
+    /* Keep the finite camera projection packet resident for the current
+     * exposure.  Light-side records are consumed by this connection pass, but
+     * subsequent light packets still need the same camera-side path family. */
+    {
+        std::unordered_set<uint32_t> camera_sids;
+        camera_sids.reserve(cam_paths.size());
+        for (const auto& kv : cam_paths)
+            camera_sids.insert(kv.first);
+
+        std::lock_guard<std::mutex> pending_lk(ps->bdpt_pending_mu);
+        for (const auto& v : verts)
+            if (v.stream == BDPT_SIDE_SENSOR)
+                ps->bdpt_pending_vertices.push_back(v);
+        for (const auto& sw : sweights)
+            if (camera_sids.find(sw.subpath_id) != camera_sids.end())
+                ps->bdpt_pending_spectral.push_back(sw);
+        for (const auto& pr : pdfs)
+            if (camera_sids.find(pr.subpath_id) != camera_sids.end())
+                ps->bdpt_pending_pdfs.push_back(pr);
+        for (const auto& oe : optical)
+            if (camera_sids.find(oe.subpath_id) != camera_sids.end())
+                ps->bdpt_pending_optical.push_back(oe);
     }
 }
 

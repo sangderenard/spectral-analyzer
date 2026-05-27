@@ -4191,10 +4191,6 @@ class ForwardCppLensBench:
         self._plate_sensor_electrons_accum: Optional[np.ndarray] = None
         self._last_bdpt_records: Optional[np.ndarray] = None
         self._last_bdpt_plate_rgb: Optional[np.ndarray] = None
-        self._bdpt_plate_linear_accum: Optional[np.ndarray] = None
-        self._bdpt_plate_weight_accum: Optional[np.ndarray] = None
-        self._bdpt_plate_sample_count: int = 0
-        self._bdpt_bwd_cursor: int = 0
         self._bdpt_endpoints: BdptEndpointStore = BdptEndpointStore()
         self._bdpt_segments: BdptSegmentStore = BdptSegmentStore(max_rows=2_000_000)
         self._optical_transfers: OpticalTransferStore = OpticalTransferStore(max_rows=2_000_000)
@@ -4223,10 +4219,7 @@ class ForwardCppLensBench:
         self._async_backward_launched_count: int = 0
         self._async_backward_strike_count: int = 0
         self._async_backward_skip_reason: str = ""
-        self._bdpt_shadow_batch_cap: int = 1_000_000
-        self._bdpt_shadow_max_fwd_per_bwd: int = 8
-        self._bdpt_shadow_tag_base: int = 0xBD00000000000000
-        self.bdpt_last_shadow_stats: Dict[str, float] = {}
+        self.bdpt_last_connection_stats: Dict[str, float] = {}
         # Lens assembly descriptor — owns camera representation state (NONE | LUT | MLP),
         # registration, and rendering.  Replaces the former scattered _neural_assembly_*,
         # and _transfer_grid attributes.
@@ -5139,341 +5132,6 @@ class ForwardCppLensBench:
         self._async_forward_launched_count += int(total)
         return total
 
-    def trace_sensor_cast(
-        self,
-        rays_per_sensor: int,
-        seed: int,
-        max_bounces: int = 6,
-    ) -> int:
-        """Back-cast a requested budget of sensor samples through the lens.
-
-        ``rays_per_sensor`` is treated as the total reverse-ray budget for this
-        call.  Samples are distributed over all valid sensor pixels with
-        sub-pixel jitter and independent aperture samples, so increasing the
-        count increases film/aperture coverage instead of multiplying a fixed
-        square launch lattice.
-
-        NON-STANDARD BDPT NOTE:
-        A normal BDPT camera subpath samples a continuous film coordinate and
-        lens sample, stores the camera PDF/throughput, and later splats through
-        a reconstruction filter.  This path now preserves continuous film UV
-        in the ray tag and endpoint cache, records launch-domain camera PDFs,
-        and feeds a provisional endpoint PDF into the connector.  Full lens
-        Jacobians and multi-strategy MIS are still pending.
-        """
-        plate   = self.scene.image_plate
-        res     = int(max(4, plate.sensor_res))
-        # The mesh build and optics setup may update the assembly after the
-        # scene fields are cloned.  Refresh the real reverse-ray target here so
-        # sensor-cast launches defer to the assembly's current optical extents.
-        _asm = getattr(self, "_lens_assembly", None)
-        if _asm is not None:
-            try:
-                _ap_cen, _ap_r = _asm.backward_ray_target()
-                if _ap_cen is not None and float(_ap_r) > 0.0:
-                    self.aperture_centroid = np.asarray(_ap_cen, dtype=np.float64)
-                    self.aperture_radius = float(_ap_r)
-            except Exception:
-                pass
-        if self.aperture_radius <= 0.0:
-            self._async_backward_skip_reason = "aperture_radius<=0"
-            print(
-                "[sensor-cast-skip]",
-                self._async_backward_skip_reason,
-                f"aperture_radius={float(self.aperture_radius):.6g}",
-                flush=True,
-            )
-            return 0
-        ap_r = float(self.aperture_radius)
-
-        # ── Build circular pixel grid ────────────────────────────────────────
-        # Regular UV cell centres in [-1, 1], clipped to unit disc.
-        u   = np.linspace(-1.0, 1.0, res + 1)
-        um  = 0.5 * (u[:-1] + u[1:])          # cell centres
-        gy, gz = np.meshgrid(um, um, indexing='ij')  # (res, res)
-        gy  = gy.ravel()
-        gz  = gz.ravel()
-        in_disc = (gy ** 2 + gz ** 2) <= 1.0
-        disc_grid_indices = np.where(in_disc)[0]  # row*res+col for each disc pixel
-        n_pixels = int(disc_grid_indices.shape[0])
-        if n_pixels == 0:
-            self._async_backward_skip_reason = "sensor_disc_pixels=0"
-            print("[sensor-cast-skip]", self._async_backward_skip_reason, flush=True)
-            return 0
-
-        plate_x = float(plate.x)
-        n_sensor_channels = 3
-        full_sensor_min = int(n_pixels * n_sensor_channels)
-        if rays_per_sensor > 0:
-            total = int(max(full_sensor_min, rays_per_sensor))
-        else:
-            total = int(max(full_sensor_min, n_pixels * int(max(1, plate.bokeh_rays)) * n_sensor_channels))
-        self._async_backward_attempt_count += int(total)
-
-        # ── Orthonormal basis for aperture disc ──────────────────────────────
-        ap_n = self.aperture_normal / (np.linalg.norm(self.aperture_normal) + 1e-30)
-        tb   = np.array([0.0, 1.0, 0.0], dtype=np.float64)
-        if abs(float(np.dot(ap_n, tb))) > 0.9:
-            tb = np.array([0.0, 0.0, 1.0], dtype=np.float64)
-        tb -= np.dot(tb, ap_n) * ap_n;  tb /= np.linalg.norm(tb) + 1e-30
-        tc   = np.cross(ap_n, tb)
-
-        rng = np.random.default_rng(seed)
-        sample_i = np.arange(total, dtype=np.int64)
-        channel_idx = (sample_i % n_sensor_channels).astype(np.int32)
-
-        # Deterministic raster scan across the disc pixel set with sub-pixel jitter.
-        pix_offset = self._sweep_pixel_offset % max(1, n_pixels)
-        self._sweep_pixel_offset += total // n_sensor_channels
-        pixel_seq = disc_grid_indices[(pix_offset + (sample_i // n_sensor_channels)) % n_pixels].astype(np.int64)
-        pix_y = pixel_seq // res
-        pix_z = pixel_seq % res
-        jy = rng.random(total)
-        jz = rng.random(total)
-        y_norm = ((pix_y.astype(np.float64) + jy) / float(res)) * 2.0 - 1.0
-        z_norm = ((pix_z.astype(np.float64) + jz) / float(res)) * 2.0 - 1.0
-        rr = np.sqrt(y_norm * y_norm + z_norm * z_norm)
-        outside = rr > 1.0
-        if np.any(outside):
-            scale = 0.999999 / np.maximum(rr[outside], 1.0e-30)
-            y_norm[outside] *= scale
-            z_norm[outside] *= scale
-        film_uv = np.column_stack([
-            0.5 * (y_norm + 1.0),
-            0.5 * (z_norm + 1.0),
-        ]).astype(np.float32)
-
-        origins = np.stack(
-            [
-                np.full(total, plate_x, dtype=np.float64),
-                y_norm * float(plate.radius),
-                z_norm * float(plate.radius),
-            ],
-            axis=1,
-        )
-
-        # Independent full-aperture sampling for every ray; the count covers
-        # the complete exit-pupil disc instead of a tiny stencil.
-        eff_ap_r = ap_r
-        ap_ang = rng.uniform(0.0, 2.0 * math.pi, total)
-        ap_rad = np.sqrt(rng.uniform(0.0, 1.0, total)) * eff_ap_r
-        s_cx = ap_rad * np.cos(ap_ang)
-        s_cy = ap_rad * np.sin(ap_ang)
-
-        ap_pts = (self.aperture_centroid
-                  + s_cx[:, None] * tb[None, :]
-                  + s_cy[:, None] * tc[None, :])  # (total, 3)
-
-        # ── Assemble origins / directions ─────────────────────────────────────
-        d          = ap_pts - origins
-        nrm        = np.linalg.norm(d, axis=1, keepdims=True)
-        directions = d / np.maximum(nrm, 1e-30)
-        src_ids    = pixel_seq.astype(np.int32, copy=False)
-        cflag_arr  = np.ones(total, dtype=np.uint8)   # 1 = sensor-cast / reverse
-
-        if not self._sensor_aim_reported:
-            center_origin = np.array([plate_x, 0.0, 0.0], dtype=np.float64)
-            aim_vec = np.asarray(self.aperture_centroid, dtype=np.float64) - center_origin
-            aim_len = float(np.linalg.norm(aim_vec))
-            aim_dir = aim_vec / max(aim_len, 1.0e-30)
-            print(
-                "[sensor-aim]",
-                f"plate_x={plate_x:.6f}",
-                f"plate_radius={float(plate.radius):.6f}",
-                f"target={np.asarray(self.aperture_centroid, dtype=np.float64).tolist()}",
-                f"target_radius={float(ap_r):.6f}",
-                f"center_dir={aim_dir.tolist()}",
-                f"center_distance={aim_len:.6f}",
-                f"pixels={n_pixels}",
-                f"ray_budget={total}",
-                flush=True,
-            )
-            self._sensor_aim_reported = True
-
-        # Reverse paths are launched through RGB sensor sensitivity lobes.  This
-        # makes the sensor an RGB spectral emitter instead of a flat white source.
-        amp_scale = float(self.sensor_amp_gain)
-        sens_rgb = _sensor_rgb_sensitivity_bands(self.freq_hz[:self.n_bands])
-        shutter_w = film_shutter_transmission(plate, film_uv)
-        if not np.any(shutter_w > 0.0):
-            self._async_backward_skip_reason = "shutter_closed"
-            print(
-                "[sensor-cast-skip]",
-                self._async_backward_skip_reason,
-                f"mode={getattr(plate, 'shutter_mode', 'open')}",
-                f"open={float(getattr(plate, 'shutter_open', 1.0)):.3f}",
-                flush=True,
-            )
-            return 0
-        sensor_amps = (amp_scale * shutter_w[:, None] * sens_rgb[channel_idx]).astype(np.complex128, copy=True)
-        live = shutter_w > 0.0
-        if not np.all(live):
-            origins = origins[live]
-            directions = directions[live]
-            ap_pts = ap_pts[live]
-            src_ids = src_ids[live]
-            cflag_arr = cflag_arr[live]
-            channel_idx = channel_idx[live]
-            shutter_w = shutter_w[live]
-            sensor_amps = sensor_amps[live]
-            film_uv = film_uv[live]
-            total = int(origins.shape[0])
-        tag_arr = _pack_bdpt_film_tag(channel_idx, film_uv)
-        camera_batch_id = int(self._camera_sample_batch_id)
-        self._camera_sample_batch_id = int((self._camera_sample_batch_id + 1) & 0xFFFFFFFF)
-        film_area_pdf = 1.0 / max(math.pi * float(plate.radius) * float(plate.radius), 1.0e-30)
-        aperture_area_pdf = 1.0 / max(math.pi * eff_ap_r * eff_ap_r, 1.0e-30)
-        channel_pdf = 1.0 / float(max(1, n_sensor_channels))
-        self._last_backward_film_pdf = float(film_area_pdf)
-        self._last_backward_aperture_pdf = float(aperture_area_pdf)
-        self._last_backward_channel_pdf = float(channel_pdf)
-        self._last_backward_strategy_pdf = float(film_area_pdf) * float(aperture_area_pdf) * float(channel_pdf)
-        cam_film_uv = np.asarray(film_uv, dtype=np.float32).copy()
-        cam_origins = np.asarray(origins, dtype=np.float64).copy()
-        cam_ap_pts = np.asarray(ap_pts, dtype=np.float64).copy()
-        cam_directions = np.asarray(directions, dtype=np.float64).copy()
-        cam_channel_idx = np.asarray(channel_idx, dtype=np.int32).copy()
-        cam_shutter_w = np.asarray(shutter_w, dtype=np.float64).copy()
-        cam_sensor_weights = np.asarray(sens_rgb[channel_idx], dtype=np.float32).copy()
-        cam_jac = np.zeros(total, dtype=np.float32)
-        cam_solid_pdf = np.zeros(total, dtype=np.float32)
-        cam_phase_jac = np.zeros(total, dtype=np.float32)
-        cam_phase_pdf = np.zeros(total, dtype=np.float32)
-
-        if _asm is not None and getattr(_asm, "optics", None) is not None:
-            detailed = _asm.evaluate_transfer_detailed(RayBundle(origins, directions))
-            self._append_optical_transfer_events(detailed, film_uv, stream=1, batch_id=camera_batch_id)
-            result = detailed.result
-            passed = result.status == int(TerminationReason.PASSED.value)
-            n_passed = int(np.count_nonzero(passed))
-            n_absorbed = int(total) - n_passed
-            self._async_backward_parametric_absorbed_count += max(0, n_absorbed)
-            if n_passed <= 0:
-                self._async_backward_skip_reason = "parametric_no_transmit"
-                print(
-                    "[sensor-cast-parametric]",
-                    f"requested={int(total):_}",
-                    f"evaluated={int(total):_}",
-                    "passed=0",
-                    f"absorbed={n_absorbed:_}",
-                    f"attempted_total={self._async_backward_attempt_count:_}",
-                    f"absorbed_total={self._async_backward_parametric_absorbed_count:_}",
-                    f"opt_fail={self.bdpt_last_optical_transfer.get('top_fail_element', -1)}:{self.bdpt_last_optical_transfer.get('top_fail_reason', '')}",
-                    flush=True,
-                )
-                self._append_camera_sample_records(
-                    batch_id=camera_batch_id,
-                    film_uv=cam_film_uv,
-                    film_pos=cam_origins,
-                    aperture_pos=cam_ap_pts,
-                    directions=cam_directions,
-                    channel_idx=cam_channel_idx,
-                    shutter_weight=cam_shutter_w,
-                    sensor_weights=cam_sensor_weights,
-                    film_area_pdf=film_area_pdf,
-                    aperture_area_pdf=aperture_area_pdf,
-                    channel_pdf=channel_pdf,
-                    aperture_to_solid_angle_jac=cam_jac,
-                    solid_angle_pdf=cam_solid_pdf,
-                    phase_space_jac=cam_phase_jac,
-                    phase_space_pdf=cam_phase_pdf,
-                )
-                return 0
-            jac_passed, phase_jac_passed = self._estimate_camera_transfer_jacobians(
-                _asm,
-                cam_origins[passed],
-                cam_ap_pts[passed],
-                np.asarray(result.origins[passed], dtype=np.float64),
-                np.asarray(result.directions[passed], dtype=np.float64),
-                plate_radius=float(plate.radius),
-                tb=tb,
-                tc=tc,
-                aperture_radius=eff_ap_r,
-            )
-            jac_safe = np.maximum(jac_passed, 1.0e-12)
-            bwd_launch_pdf = (float(aperture_area_pdf) / jac_safe).astype(np.float32)
-            phase_safe = np.maximum(phase_jac_passed, 1.0e-20)
-            bwd_phase_pdf = (float(film_area_pdf) * float(aperture_area_pdf) / phase_safe).astype(np.float32)
-            cam_jac[passed] = jac_passed.astype(np.float32, copy=False)
-            cam_solid_pdf[passed] = bwd_launch_pdf
-            cam_phase_jac[passed] = phase_jac_passed.astype(np.float32, copy=False)
-            cam_phase_pdf[passed] = bwd_phase_pdf
-            exit_cos = np.clip(np.abs(np.asarray(result.directions[passed], dtype=np.float64)[:, 0]), 1.0e-4, 1.0)
-            bwd_area_pdf = np.full(n_passed, float(film_area_pdf) * float(aperture_area_pdf), dtype=np.float32)
-            self._last_backward_cos_exit = float(np.mean(exit_cos)) if exit_cos.size else 1.0
-            for _tag, _launch_pdf, _area_pdf, _jac in zip(tag_arr[passed], bwd_launch_pdf, bwd_area_pdf, jac_passed):
-                _key = int(np.uint64(_tag))
-                self._backward_launch_pdf_by_tag[_key] = float(_launch_pdf)
-                self._backward_area_pdf_by_tag[_key] = float(_area_pdf)
-                self._backward_jacobian_by_tag[_key] = float(_jac)
-            origins = np.asarray(result.origins[passed], dtype=np.float64)
-            directions = np.asarray(result.directions[passed], dtype=np.float64)
-            origins = origins + directions * 1.0e-6
-            src_ids = src_ids[passed]
-            tag_arr = tag_arr[passed]
-            cflag_arr = cflag_arr[passed]
-            sensor_amps = sensor_amps[passed]
-            film_uv = film_uv[passed]
-            total = n_passed
-            print(
-                "[sensor-cast-parametric]",
-                f"requested={int(passed.shape[0]):_}",
-                f"evaluated={int(passed.shape[0]):_}",
-                f"passed={n_passed:_}",
-                f"absorbed={n_absorbed:_}",
-                f"attempted_total={self._async_backward_attempt_count:_}",
-                f"absorbed_total={self._async_backward_parametric_absorbed_count:_}",
-                f"opt_fail={self.bdpt_last_optical_transfer.get('top_fail_element', -1)}:{self.bdpt_last_optical_transfer.get('top_fail_reason', '')}",
-                flush=True,
-            )
-
-        self._append_camera_sample_records(
-            batch_id=camera_batch_id,
-            film_uv=cam_film_uv,
-            film_pos=cam_origins,
-            aperture_pos=cam_ap_pts,
-            directions=cam_directions,
-            channel_idx=cam_channel_idx,
-            shutter_weight=cam_shutter_w,
-            sensor_weights=cam_sensor_weights,
-            film_area_pdf=film_area_pdf,
-            aperture_area_pdf=aperture_area_pdf,
-            channel_pdf=channel_pdf,
-            aperture_to_solid_angle_jac=cam_jac,
-            solid_angle_pdf=cam_solid_pdf,
-            phase_space_jac=cam_phase_jac,
-            phase_space_pdf=cam_phase_pdf,
-        )
-
-        _use_gpu = self.compute_mode in ("gpu", "mixed")
-        _all_gpu = self.compute_mode == "gpu"
-        if self.cull_infinite_rays:
-            origins, directions, sensor_amps, src_ids, tag_arr, cflag_arr = _cull_finite_rays(
-                origins, directions, sensor_amps, src_ids, tag_arr, cflag_arr, label="bwd")
-
-        self.tracer.submit_rays(
-            origins=np.ascontiguousarray(origins),
-            directions=np.ascontiguousarray(directions),
-            amplitudes=np.ascontiguousarray(sensor_amps),
-            src_ids=np.ascontiguousarray(src_ids),
-            tags=np.ascontiguousarray(tag_arr),
-            color_flags=np.ascontiguousarray(cflag_arr),
-            max_bounces=int(max_bounces),
-            min_amplitude=float(self.sensor_min_amplitude),
-            # Camera subpaths use one sampled continuation per surface event.
-            # Deterministic two-way splitting from every sensor pixel explodes
-            # as O(2^bounce) and will keep the GPU queue saturated at 256².
-            max_children=1,
-            seed=int(seed ^ 0xBEEF),
-            use_gpu_compute=_use_gpu,
-            gpu_all_stages=_all_gpu,
-            shader_dir=_SHADER_DIR,
-        )
-        self._ensure_drain_loop()
-        self._async_backward_launched_count += int(total)
-        self._async_backward_skip_reason = ""
-        return total
-
     def _fast_bdpt_feed(self, records: dict) -> None:
         """Feed BDPT endpoints immediately from raw drained records.
 
@@ -6270,432 +5928,6 @@ class ForwardCppLensBench:
     def _async_bdpt_backward_count(self) -> int:
         return self._bdpt_endpoints.bwd_count()
 
-    def _pause_drain_loop_and_flush(self) -> None:
-        """Stop the background drain loop before a shadow ray pass.
-
-        We intentionally do NOT pre-flush the tracer output queue here.
-        The _drain_shadow_pass closure already routes any non-shadow records
-        that arrive during the shadow pass to _accumulate_records via the
-        standard path, so a pre-flush would only duplicate that work while
-        burning CPU/GPU on millions of in-flight forward/backward records.
-        """
-        if self._drain_thread is not None and self._drain_thread.is_alive():
-            self._drain_stop.set()
-            self._drain_thread.join(timeout=2.0)
-        self._drain_thread = None
-        self._drain_stop.clear()
-
-    def _run_pipeline_bdpt_shadow_connections(
-        self,
-        records: np.ndarray,
-        n: int,
-        *,
-        seed: int,
-        max_shadow_rays: int,
-        sensor_grid_res: int = 0,
-    ) -> np.ndarray:
-        """Connect forward/backward endpoint records using shadow rays in the live pipeline.
-
-        ``sensor_grid_res`` is retained for older callers; current backward
-        endpoints carry continuous film UV and splat into the ``n×n`` output.
-
-        Contributions are weighted by assemble_bdpt_connection_weight() using
-        provisional endpoint PDFs.  pair_scale = N_fwd/k compensates for
-        sub-sampled forward pairing.  Full lens Jacobians, surface cosine
-        terms, and complete path-strategy PDFs are still pending.
-        """
-        img = np.zeros((n, n, 3), dtype=np.float64)
-        weight_img = np.zeros((n, n), dtype=np.float64)
-        self.bdpt_last_shadow_stats = {
-            "candidates": 0,
-            "shadow_rays": 0,
-            "visible": 0,
-            "blocked": 0,
-            "miss_records": 0,
-            # Stage diagnostics — set at each filter point so the HUD can
-            # report where the pipeline bottoms out.
-            "n_fwd": 0,
-            "n_bwd": 0,
-            "n_bwd_valid": 0,
-            "n_pairs": 0,
-            "n_valid_dist": -1,
-        }
-        if records is None or records.size == 0:
-            return img
-
-        rec = np.ascontiguousarray(records, dtype=BDPT_ENDPOINT_DTYPE)
-        sid = rec["stream"]
-        fwd_mask = sid == 0
-        bwd_mask = sid == 1
-        n_fwd = int(np.count_nonzero(fwd_mask))
-        n_bwd = int(np.count_nonzero(bwd_mask))
-        self.bdpt_last_shadow_stats["n_fwd"] = n_fwd
-        self.bdpt_last_shadow_stats["n_bwd"] = n_bwd
-        if n_fwd == 0 or n_bwd == 0:
-            return img
-
-        fwd_idx_all = np.flatnonzero(fwd_mask)
-        bwd_idx_all = np.flatnonzero(bwd_mask)
-        bwd_uv = np.asarray(rec["film_uv"][bwd_idx_all], dtype=np.float64)
-        bwd_valid = (
-            np.isfinite(bwd_uv[:, 0])
-            & np.isfinite(bwd_uv[:, 1])
-            & (bwd_uv[:, 0] >= 0.0)
-            & (bwd_uv[:, 0] <= 1.0)
-            & (bwd_uv[:, 1] >= 0.0)
-            & (bwd_uv[:, 1] <= 1.0)
-        )
-        n_bwd_valid = int(np.count_nonzero(bwd_valid))
-        self.bdpt_last_shadow_stats["n_bwd_valid"] = n_bwd_valid
-        if n_bwd_valid == 0:
-            return img
-        bwd_idx_all = bwd_idx_all[bwd_valid]
-        bwd_uv = bwd_uv[bwd_valid]
-
-        # NON-STANDARD BDPT NOTE:
-        # Temporary bounded cache connector.  We sample up to k forward
-        # endpoints per backward endpoint instead of enumerating the full
-        # Cartesian product.  The later power scale includes N_forward/k so the
-        # selected pairs estimate the full cached-endpoint sum instead of
-        # becoming merely a top-k/truncated image.  This is still not full BDPT:
-        # the endpoint cache lacks complete per-vertex PDFs/MIS data.
-        n_bwd_act = int(bwd_idx_all.shape[0])
-        n_fwd_act = int(fwd_idx_all.shape[0])
-        max_pairs = int(max(1, min(max_shadow_rays, self._bdpt_shadow_batch_cap)))
-        k = int(max(1, min(self._bdpt_shadow_max_fwd_per_bwd, n_fwd_act)))
-        if n_bwd_act * k > max_pairs:
-            take_bwd = max(1, max_pairs // max(1, k))
-            start = int(self._bdpt_bwd_cursor) % max(1, n_bwd_act)
-            take = (start + np.arange(take_bwd, dtype=np.int64)) % n_bwd_act
-            self._bdpt_bwd_cursor = int((start + take_bwd) % max(1, n_bwd_act))
-            bwd_idx_active = bwd_idx_all[take]
-        else:
-            bwd_idx_active = bwd_idx_all
-        n_bwd_active = int(bwd_idx_active.shape[0])
-        rng = np.random.default_rng(int(seed) ^ 0x5BD7)
-        pair_bwd = np.repeat(bwd_idx_active, k).astype(np.int64, copy=False)
-        if k >= n_fwd_act:
-            pair_fwd = np.tile(fwd_idx_all, n_bwd_active).astype(np.int64, copy=False)
-        else:
-            sampled = rng.choice(fwd_idx_all, size=(n_bwd_active, k), replace=True)
-            pair_fwd = sampled.reshape(-1).astype(np.int64, copy=False)
-        pair_scale = float(n_fwd_act) / float(k)
-        n_pairs_built = int(pair_bwd.shape[0])
-
-        self.bdpt_last_shadow_stats["n_pairs"] = n_pairs_built
-        if n_pairs_built == 0:
-            return img
-        n_pairs = int(pair_fwd.shape[0])
-        if n_pairs <= 0:
-            return img
-
-        p0 = rec["pos"][pair_bwd].astype(np.float64, copy=False)
-        p1 = rec["pos"][pair_fwd].astype(np.float64, copy=False)
-        delta = p1 - p0
-        dist = np.linalg.norm(delta, axis=1)
-        valid = np.isfinite(dist) & (dist > 1.0e-6)
-        _n_valid = int(np.count_nonzero(valid))
-        self.bdpt_last_shadow_stats["n_valid_dist"] = _n_valid
-        # Print every invalid pair so we can see exactly which ones are bad.
-        _invalid_mask = ~valid
-        _n_invalid = int(np.count_nonzero(_invalid_mask))
-        _inv_idx = np.where(_invalid_mask)[0]
-        for _ii in _inv_idx[:200]:  # cap at 200 lines
-            print(
-                f"[bdpt-invalid-pair] idx={int(_ii)}"
-                f" dist={float(dist[_ii]):.6e}"
-                f" p0={p0[_ii].tolist()}"
-                f" p1={p1[_ii].tolist()}"
-                f" pair_bwd={int(pair_bwd[_ii])} pair_fwd={int(pair_fwd[_ii])}"
-                f" rec_p0={rec['pos'][pair_bwd[_ii]].tolist()}"
-                f" rec_p1={rec['pos'][pair_fwd[_ii]].tolist()}",
-                flush=True,
-            )
-        print(
-            f"[bdpt-dist] n_pairs={int(dist.shape[0])} n_valid={_n_valid} n_invalid={_n_invalid}"
-            f" dist_min={float(np.nanmin(dist)):.6e} dist_max={float(np.nanmax(dist)):.6e}"
-            f" dist[:5]={dist[:min(5,dist.shape[0])].tolist()}"
-            f" p0[:2]={p0[:min(2,p0.shape[0])].tolist()}"
-            f" p1[:2]={p1[:min(2,p1.shape[0])].tolist()}",
-            flush=True,
-        )
-        if not np.any(valid):
-            # Always print so we can see what the actual positions are.
-            _nb = min(5, int(p0.shape[0]))
-            _nan_p0  = int(np.count_nonzero(~np.isfinite(p0)))
-            _nan_p1  = int(np.count_nonzero(~np.isfinite(p1)))
-            _zero_p0 = int(np.count_nonzero(np.all(p0 == 0.0, axis=1)))
-            _zero_p1 = int(np.count_nonzero(np.all(p1 == 0.0, axis=1)))
-            _inf_d   = int(np.count_nonzero(~np.isfinite(dist)))
-            _tiny_d  = int(np.count_nonzero(np.isfinite(dist) & (dist <= 1e-6)))
-            print(
-                f"[BDPT-INVALID-DIST]"
-                f" n_pairs={int(dist.shape[0])}"
-                f" n_fwd_recs={n_fwd} n_bwd_recs={n_bwd}"
-                f" nan_p0={_nan_p0} nan_p1={_nan_p1}"
-                f" zero_p0={_zero_p0} zero_p1={_zero_p1}"
-                f" inf_dist={_inf_d} tiny_dist(<=1e-6)={_tiny_d}"
-                f"\n  dist[:5]={dist[:_nb]}"
-                f"\n  p0[:5]={p0[:_nb]}"
-                f"\n  p1[:5]={p1[:_nb]}"
-                f"\n  fwd_pos_range x=[{np.nanmin(p1[:,0]):.4f},{np.nanmax(p1[:,0]):.4f}]"
-                f" y=[{np.nanmin(p1[:,1]):.4f},{np.nanmax(p1[:,1]):.4f}]"
-                f" z=[{np.nanmin(p1[:,2]):.4f},{np.nanmax(p1[:,2]):.4f}]"
-                f"\n  bwd_pos_range x=[{np.nanmin(p0[:,0]):.4f},{np.nanmax(p0[:,0]):.4f}]"
-                f" y=[{np.nanmin(p0[:,1]):.4f},{np.nanmax(p0[:,1]):.4f}]"
-                f" z=[{np.nanmin(p0[:,2]):.4f},{np.nanmax(p0[:,2]):.4f}]",
-                flush=True,
-            )
-            return img
-        pair_fwd = pair_fwd[valid]
-        pair_bwd = pair_bwd[valid]
-        p0 = p0[valid]
-        delta = delta[valid]
-        dist = dist[valid]
-        dirs = delta / np.maximum(dist[:, None], 1.0e-30)
-        n_pairs = int(pair_fwd.shape[0])
-
-        # ── Shared drain-loop helper ─────────────────────────────────────────────
-        # Drains records from the tracer, updating first_hit[local_idx] for any
-        # records whose color_flag matches shadow_cflag, and re-routing everything
-        # else into _accumulate_records.  Returns (first_hit, miss_count).
-        _SHADOW_TAG_HI = np.uint64(0xBD)
-
-        def _drain_shadow_pass(
-            n_pts: int,
-            shadow_cflag: int,
-            ray_origins: np.ndarray,
-            _first_hit: np.ndarray,
-        ) -> tuple[np.ndarray, int]:
-            _mc = 0
-            # Each submitted shadow ray produces exactly one "primary" record:
-            # STRIKE (kind=0) for a hit, or MISS (kind=2) for no hit.  Count them
-            # so we can break as soon as every shadow ray has been accounted for,
-            # regardless of what else is in-flight in the main pipeline.
-            # NOTE: GPU-mode MISS rays (no intersection) do NOT emit a MISS record;
-            # they just decrement in_flight silently.  The timeout below catches
-            # these cases — any unaccounted pair keeps first_hit=inf, which maps
-            # to visible=True (correct: nothing blocked the path).
-            _shadow_primary_seen = 0
-            _t_start = time.perf_counter()
-            _last_progress_t = _t_start
-            _last_progress_seen = 0
-            _last_in_flight = self.tracer.in_flight_count()
-
-            def _process_batch(rec: dict, nr: int) -> None:
-                nonlocal _mc, _shadow_primary_seen
-                _rt_all = np.asarray(rec["tag"], dtype=np.uint64)
-                # Identify shadow rays by the 0xBD high-byte tag — NOT by cflag,
-                # because the tracer overwrites cflag with the surface material's value.
-                _sh = (_rt_all >> np.uint64(56)) == _SHADOW_TAG_HI
-                if np.any(_sh):
-                    _rt = _rt_all[_sh]
-                    _lc = (_rt & np.uint64(0x0000FFFFFFFFFFFF)).astype(np.int64)
-                    _ir = (_lc >= 0) & (_lc < n_pts)
-                    _lc = _lc[_ir]
-                    if _lc.size > 0:
-                        _kd = np.asarray(rec["kind"])[_sh][_ir]
-                        _is_strike = _kd == 0   # primary hit record
-                        _is_miss   = _kd == 2   # primary miss record
-                        # TERMINAL (kind=1) records are secondary; don't count them.
-                        _shadow_primary_seen += int(np.count_nonzero(_is_strike | _is_miss))
-                        _mc += int(np.count_nonzero(_is_miss))
-                        if np.any(_is_strike):
-                            _hp = np.asarray(rec["pos"], dtype=np.float32)[_sh][_ir][_is_strike].astype(np.float64)
-                            _hd = np.linalg.norm(_hp - ray_origins[_lc[_is_strike]], axis=1)
-                            np.minimum.at(_first_hit, _lc[_is_strike], _hd)
-                if np.any(~_sh):
-                    _kp = {_k: np.asarray(_v)[~_sh] for _k, _v in rec.items()
-                           if hasattr(_v, "__len__") and len(_v) == nr}
-                    if _kp:
-                        self._fast_bdpt_feed(_kp)
-                        self._accumulate_records(_kp)
-
-            while True:
-                _r = self.tracer.drain_records_slim(max_n=BDPT_PIPELINE_CAP)
-                _nr = int(_r.get("kind", np.array([], dtype=np.uint8)).shape[0]) if _r else 0
-                if _nr > 0:
-                    _process_batch(_r, _nr)
-                # Primary termination: all n_pts shadow rays have had their first
-                # interaction (STRIKE or MISS).  The main pipeline may still have
-                # other rays in-flight — we do NOT wait for those.
-                if _shadow_primary_seen >= n_pts:
-                    break
-                # Fallback: if the entire pipeline goes idle before we see all
-                # expected primary records (e.g. due to dropped rays), drain
-                # whatever remains and stop rather than spinning forever.
-                if self.tracer.in_flight_count() == 0:
-                    _tl = self.tracer.drain_records_slim(max_n=BDPT_PIPELINE_CAP)
-                    _nt = int(_tl.get("kind", np.array([], dtype=np.uint8)).shape[0]) if _tl else 0
-                    if _nt > 0:
-                        _process_batch(_tl, _nt)
-                    break
-                # Progress-stall timeout: reset timer whenever _shadow_primary_seen
-                # advances OR in_flight_count() drops.  GPU-mode miss rays don't
-                # emit MISS records, so seen can plateau while in_flight still ticks
-                # down — without the in_flight check the stall fires after 5 s even
-                # when the GPU is actively processing all shadow rays.
-                _now = time.perf_counter()
-                _cur_in_flight = self.tracer.in_flight_count()
-                if _shadow_primary_seen > _last_progress_seen or _cur_in_flight < _last_in_flight:
-                    _last_progress_t    = _now
-                    _last_progress_seen = _shadow_primary_seen
-                    _last_in_flight     = _cur_in_flight
-                _stall_s = _now - _last_progress_t
-                _total_s = _now - _t_start
-                if _stall_s > 30.0 or _total_s > 120.0:
-                    print(
-                        f"[bdpt-shadow-timeout] seen={_shadow_primary_seen}/{n_pts}"
-                        f" stall={_stall_s:.1f}s total={_total_s:.1f}s"
-                        f" in_flight={self.tracer.in_flight_count()}",
-                        flush=True,
-                    )
-                    _tl = self.tracer.drain_records_slim(max_n=BDPT_PIPELINE_CAP)
-                    _nt = int(_tl.get("kind", np.array([], dtype=np.uint8)).shape[0]) if _tl else 0
-                    if _nt > 0:
-                        _process_batch(_tl, _nt)
-                    break
-                time.sleep(0.001)
-            return _first_hit, _mc
-
-        # ── Pre-compute wavelength→RGB weights (shared by both passes) ───────
-        wl_nm = (C_LIGHT / np.maximum(
-            np.asarray(self.freq_hz[:self.n_bands], dtype=np.float64), EPS)) * 1.0e9
-        rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float64)
-        # Sensor spectral reactance: sens_rgb_w[ch, band] = sensor's response to
-        # that frequency band for RGB channel ch.  Used as the coupling weight
-        # when pairing forward (any band) with backward endpoints.
-        sens_rgb_w = _sensor_rgb_sensitivity_bands(
-            self.freq_hz[:self.n_bands]).astype(np.float64)  # (3, n_bands)
-        flat = img.reshape(-1, 3).astype(np.float64, copy=False)
-
-        # ── Pass 1: fwd↔bwd endpoint pairs ──────────────────────────────────
-        eps = 1.0e-5
-        origins = p0 + dirs * eps
-        target_dist = np.maximum(dist - 2.0 * eps, 0.0)
-        tags = (np.uint64(self._bdpt_shadow_tag_base)
-                | np.arange(n_pairs, dtype=np.uint64))
-        src_ids = np.arange(n_pairs, dtype=np.int32)
-        amps = np.ones((n_pairs, int(self.n_bands)), dtype=np.complex128)
-        cflags = np.full(n_pairs, 2, dtype=np.uint8)
-        first_hit = np.full(n_pairs, np.inf, dtype=np.float64)
-        miss_count = 0
-
-        self._pause_drain_loop_and_flush()
-        try:
-            self.tracer.submit_rays(
-                origins=np.ascontiguousarray(origins),
-                directions=np.ascontiguousarray(dirs),
-                amplitudes=np.ascontiguousarray(amps),
-                src_ids=np.ascontiguousarray(src_ids),
-                tags=np.ascontiguousarray(tags),
-                color_flags=np.ascontiguousarray(cflags),
-                max_bounces=0,
-                min_amplitude=0.0,
-                max_children=0,
-                seed=int(seed ^ 0x51A0),
-                use_gpu_compute=(self.compute_mode in ("gpu", "mixed")),
-                gpu_all_stages=(self.compute_mode == "gpu"),
-                shader_dir=_SHADER_DIR,
-            )
-            first_hit, miss_count = _drain_shadow_pass(n_pairs, 2, origins, first_hit)
-        finally:
-            self._ensure_drain_loop()
-
-        visible = first_hit >= (target_dist - 5.0e-5)
-        _n_vis = int(np.count_nonzero(visible))
-        print(
-            f"[bdpt-shadow1] n_pairs={int(n_pairs)} miss_count={miss_count}"
-            f" visible={_n_vis} blocked={int(n_pairs)-_n_vis}"
-            f" first_hit[:5]={first_hit[:5].tolist()}"
-            f" target_dist[:5]={target_dist[:5].tolist()}",
-            flush=True,
-        )
-        if np.any(visible):
-            vf = pair_fwd[visible]
-            vb = pair_bwd[visible]
-            # Weight by the sensor's spectral reactance at the forward ray's
-            # band.  The backward amplitude encodes sensor importance; the
-            # forward band selects the sensor response curve.
-            bands_fwd = rec["band"][vf].astype(np.int64)
-            bands_clamped = np.clip(bands_fwd, 0, self.n_bands - 1)
-            fa = rec["amp"][vf].astype(np.complex128)
-            ba = rec["amp"][vb].astype(np.complex128)
-            power = assemble_bdpt_connection_weight(
-                fa, ba, dist[visible],
-                fwd_pdf=rec["launch_pdf"][vf].astype(np.float64),
-                bwd_pdf=rec["launch_pdf"][vb].astype(np.float64),
-                pair_scale=pair_scale,
-            )
-            print(
-                f"[bdpt-pass1] visible={_n_vis}"
-                f" power_min={float(np.min(power)):.3e}"
-                f" power_max={float(np.max(power)):.3e}"
-                f" power_sum={float(np.sum(power)):.3e}"
-                f" p_fwd={float(np.mean(rec['launch_pdf'][vf])):.3e}"
-                f" p_bwd={float(np.mean(rec['launch_pdf'][vb])):.3e}"
-                f" fa[:3]={np.abs(fa[:3]).tolist()}"
-                f" ba[:3]={np.abs(ba[:3]).tolist()}",
-                flush=True,
-            )
-            uv = np.clip(rec["film_uv"][vb].astype(np.float64), 0.0, 1.0 - 1.0e-7)
-            fx = uv[:, 0] * float(max(1, n - 1))
-            fy = uv[:, 1] * float(max(1, n - 1))
-            x0 = np.floor(fx).astype(np.int64)
-            y0 = np.floor(fy).astype(np.int64)
-            x1 = np.clip(x0 + 1, 0, n - 1)
-            y1 = np.clip(y0 + 1, 0, n - 1)
-            tx = fx - x0.astype(np.float64)
-            ty = fy - y0.astype(np.float64)
-            idx00 = y0 * n + x0
-            idx10 = y0 * n + x1
-            idx01 = y1 * n + x0
-            idx11 = y1 * n + x1
-            w00 = (1.0 - tx) * (1.0 - ty)
-            w10 = tx * (1.0 - ty)
-            w01 = (1.0 - tx) * ty
-            w11 = tx * ty
-            for ch in range(3):
-                val = power * sens_rgb_w[ch, bands_clamped]
-                np.add.at(flat[:, ch], idx00, val * w00)
-                np.add.at(flat[:, ch], idx10, val * w10)
-                np.add.at(flat[:, ch], idx01, val * w01)
-                np.add.at(flat[:, ch], idx11, val * w11)
-            weight_flat = weight_img.reshape(-1)
-            np.add.at(weight_flat, idx00, w00)
-            np.add.at(weight_flat, idx10, w10)
-            np.add.at(weight_flat, idx01, w01)
-            np.add.at(weight_flat, idx11, w11)
-            print(
-                f"[bdpt-accum] flat_max={float(np.max(flat)):.3e}"
-                f" flat_nonzero={int(np.count_nonzero(flat))}"
-                f" splat_samples={int(uv.shape[0])}"
-                f" uv_range=[({float(np.min(uv[:,0])):.4f},{float(np.max(uv[:,0])):.4f}),"
-                f"({float(np.min(uv[:,1])):.4f},{float(np.max(uv[:,1])):.4f})]"
-                f" sens_w_max={float(np.max(sens_rgb_w)):.3e}",
-                flush=True,
-            )
-
-        self.bdpt_last_shadow_stats.update({
-            "candidates": int(n_pairs),
-            "shadow_rays": int(n_pairs),
-            "visible": _n_vis,
-            "blocked": int(n_pairs) - _n_vis,
-            "miss_records": int(miss_count),
-            "direct_vis": 0,
-            "direct_total": 0,
-        })
-
-        _out_max = float(np.max(img))
-        _out_nonzero = int(np.count_nonzero(img))
-        print(
-            f"[bdpt-return] img_max={_out_max:.3e} img_nonzero={_out_nonzero}"
-            f" weight_nonzero={int(np.count_nonzero(weight_img))}"
-            f" img_dtype={img.dtype} img_shape={img.shape}",
-            flush=True,
-        )
-        return img.astype(np.float32, copy=False), weight_img.astype(np.float32, copy=False)
-
     def _report_aperture_aim_extrema(self) -> dict:
         """Compute and print the valid backward-ray cone for representative sensor sites.
 
@@ -6993,191 +6225,119 @@ class ForwardCppLensBench:
         n_rays_bdpt: int | None = None,
         camera_mode: int = 2,
     ) -> np.ndarray:
-        """Render the BDPT plate from live async endpoints plus pipeline shadow rays.
+        """Render the C++ BDPT/MIS sensor image.
 
-        Returns
-        -------
-        np.ndarray
-            Shape ``(n, n, 3)``, dtype ``float32``, values in ``[0, 1]``.
+        The historical Python forward/backward endpoint shadow connector is no
+        longer part of the BDPT path.  Forward tracing feeds BDPT side records to
+        the C++ pipeline; this method asks the pipeline to connect pending
+        subpaths and returns its sensor accumulator.
         """
+        _ = (aperture_samples, seed, max_records, max_bounces, leak, n_rays_bdpt, camera_mode)
         with self._trace_lock:
             n = int(max(4, pixels or self.scene.image_plate.pixels))
-            aperture_samples_i = int(max(1, aperture_samples))
             self.bdpt_last_n_px = int(n)
-            self.bdpt_last_aperture_samples = int(aperture_samples_i)
-            sensor_gid = self._ensure_bdpt_plate_sensor_group(
-                n,
-                aperture_samples_i,
-                camera_mode=int(camera_mode),
-            )
-            _ = (max_bounces, leak, n_rays_bdpt)
+            self.bdpt_last_aperture_samples = 1
             self.bdpt_last_launched_rays = 0
+
             async_records = self._bdpt_endpoints.snapshot()
-            # Print endpoint store state + sample positions on every camera render.
-            _snap_none = async_records is None
-            _snap_sz   = 0 if _snap_none else int(async_records.shape[0])
-            _snap_fwd  = 0 if _snap_none else int(np.count_nonzero(async_records["stream"] == 0))
-            _snap_bwd  = 0 if _snap_none else int(np.count_nonzero(async_records["stream"] == 1))
-            if not _snap_none and _snap_sz > 0:
-                _fwd_rows = async_records[async_records["stream"] == 0]
-                _bwd_rows = async_records[async_records["stream"] == 1]
-                _fwd_pos3 = _fwd_rows["pos"][:3]
-                _bwd_pos3 = _bwd_rows["pos"][:3]
-                _zero_fwd = int(np.count_nonzero(np.all(_fwd_rows["pos"] == 0.0, axis=1)))
-                _zero_bwd = int(np.count_nonzero(np.all(_bwd_rows["pos"] == 0.0, axis=1)))
-                _nan_fwd  = int(np.count_nonzero(~np.isfinite(_fwd_rows["pos"])))
-                _nan_bwd  = int(np.count_nonzero(~np.isfinite(_bwd_rows["pos"])))
-                print(
-                    f"[bdpt-snap] rows={_snap_sz} fwd={_snap_fwd} bwd={_snap_bwd}"
-                    f" | fwd_zero_pos={_zero_fwd} fwd_nan_pos={_nan_fwd}"
-                    f" | bwd_zero_pos={_zero_bwd} bwd_nan_pos={_nan_bwd}"
-                    f"\n  fwd_pos_sample={_fwd_pos3.tolist()}"
-                    f"\n  bwd_pos_sample={_bwd_pos3.tolist()}",
-                    flush=True,
-                )
-            else:
-                print(f"[bdpt-snap] is_none={_snap_none} rows={_snap_sz}", flush=True)
             if async_records is None or async_records.size == 0:
-                records = np.zeros(0, dtype=BDPT_ENDPOINT_DTYPE)
                 self._last_bdpt_records = None
+                self.bdpt_last_records = 0
+                stream_fwd_count = 0
+                stream_sensor_count = 0
             else:
                 records = np.array(async_records, dtype=BDPT_ENDPOINT_DTYPE, copy=True)
                 self._last_bdpt_records = records
-            self.bdpt_last_records = int(records.shape[0])
+                self.bdpt_last_records = int(records.shape[0])
+                stream_fwd_count = int(np.count_nonzero(records["stream"] == 0))
+                stream_sensor_count = int(np.count_nonzero(records["stream"] == 1))
+
             self.bdpt_last_volume_records = 0
             self.bdpt_last_volume_power = 0.0
-
-            # ── Stream-type validation counts ──────────────────────────────
-            # Classify endpoint records by stream origin.  Primary: read the
-            # stream_id field (ENDPOINT_DTYPE col-15, float32) written by the
-            # C++ kernel — 0.0 = BDPT_SIDE_LIGHT (forward), 1.0 =
-            # BDPT_SIDE_SENSOR (backward/PIXEL_CONE).  Fallback: use the
-            # vertex_index sign heuristic (col-3 int32) for records produced
-            # by older builds that still have the _pad field.
-            #   forward light:   stream_id == 0.0  (or vertex_index < 0)
-            #   backward sensor: stream_id == 1.0  (or vertex_index >= 0)
-            _stream_fwd_count  = 0
-            _stream_bwd_count  = 0
-            _stream_pixcone_count = 0
-            _fwd_mask = None
-            _bwd_mask = None
-            if self._last_bdpt_records is not None and self._last_bdpt_records.shape[0] > 0:
-                _r = self._last_bdpt_records
-                _sids  = _r["id"]
-                _sid = _r["stream"]
-                _fwd_mask = _sid == 0
-                _bwd_mask = _sid == 1
-                _stream_fwd_count  = int(np.count_nonzero(_fwd_mask))
-                _stream_bwd_count  = int(np.count_nonzero(_bwd_mask))
-                _pixel_cap = int(n) * int(n)
-                _stream_pixcone_count = int(np.count_nonzero(_sids < np.uint32(_pixel_cap)))
             self.bdpt_last_stream_counts = {
-                "forward_light":     _stream_fwd_count,
-                "backward_sensor":   _stream_bwd_count,
-                "pixel_cone":        _stream_pixcone_count,
-                "field_deposit_blocked": _stream_bwd_count,
+                "forward_light": stream_fwd_count,
+                "sensor_stream": stream_sensor_count,
+                "legacy_backward_sensor": 0,
+                "field_deposit_blocked": 0,
             }
 
-            _sensor_grid_res = int(max(4, self.scene.image_plate.sensor_res))
-            _shadow_n            = n
-            _shadow_seed         = int(seed)
-            _shadow_max_rays     = int(max(1, max_records))
-            _shadow_sgr          = _sensor_grid_res
-            # Snapshot is taken; release _trace_lock before running the shadow
-            # connection pipeline.  Shadow passes pause the drain loop internally
-            # and can take seconds — holding the lock for that entire time would
-            # starve the main _trace thread of its forward/backward submissions.
+            try:
+                self.tracer.run_bdpt_connection()
+            except Exception as exc:
+                print(f"[bdpt-cpp] connection pass failed: {exc}", flush=True)
 
-        # ── Shadow connection pipeline — runs WITHOUT _trace_lock ────────────
-        out_result = self._run_pipeline_bdpt_shadow_connections(
-            records,
-            _shadow_n,
-            seed=_shadow_seed,
-            max_shadow_rays=_shadow_max_rays,
-            sensor_grid_res=_shadow_sgr,
-        )
-        if isinstance(out_result, tuple):
-            out, out_weight = out_result
-        else:
-            out = out_result
-            out_weight = np.zeros((_shadow_n, _shadow_n), dtype=np.float32)
+            try:
+                stats = dict(self.tracer.get_bdpt_stats())
+            except Exception:
+                stats = {}
+            try:
+                overflow = dict(self.tracer.get_bdpt_overflow())
+            except Exception:
+                overflow = {}
 
-        self.bdpt_last_survivor_records = int(self.bdpt_last_shadow_stats.get("visible", 0))
-        if self.bdpt_last_survivor_records <= 0:
-            self.bdpt_consecutive_no_survivor_frames += 1
-        else:
-            self.bdpt_consecutive_no_survivor_frames = 0
-        out_lin = np.asarray(out, dtype=np.float64)
-        if self._bdpt_plate_linear_accum is None or self._bdpt_plate_linear_accum.shape != out_lin.shape:
-            self._bdpt_plate_linear_accum = np.zeros_like(out_lin, dtype=np.float64)
-            self._bdpt_plate_weight_accum = np.zeros(out_lin.shape[:2], dtype=np.float64)
-            self._bdpt_plate_sample_count = 0
-            self._bdpt_bwd_cursor = 0
-        if int(np.count_nonzero(out_lin)) > 0:
-            self._bdpt_plate_linear_accum += out_lin
-            if self._bdpt_plate_weight_accum is not None:
-                self._bdpt_plate_weight_accum += np.asarray(out_weight, dtype=np.float64)
-            self._bdpt_plate_sample_count += int(self.bdpt_last_shadow_stats.get("shadow_rays", 0))
+            img = np.asarray(self.tracer.get_sensor_image(), dtype=np.float32)
+            if img.ndim != 3 or img.shape[2] < 3 or img.shape[0] <= 0 or img.shape[1] <= 0:
+                img = np.zeros((n, n, 3), dtype=np.float32)
+            else:
+                img = np.ascontiguousarray(img[:, :, :3], dtype=np.float32)
+                if img.shape[0] != n or img.shape[1] != n:
+                    yy = np.linspace(0, img.shape[0] - 1, n).astype(np.int64)
+                    xx = np.linspace(0, img.shape[1] - 1, n).astype(np.int64)
+                    img = np.ascontiguousarray(img[np.ix_(yy, xx)], dtype=np.float32)
 
-        accum_lin = self._bdpt_plate_linear_accum
-        accum_w = self._bdpt_plate_weight_accum
-        self.bdpt_last_sensor_photons = float(np.sum(np.asarray(accum_lin, dtype=np.float64)))
-        self.bdpt_last_sensor_power = self.bdpt_last_sensor_photons
-        self.bdpt_last_telemetry = {
-            "kept_records": self.bdpt_last_survivor_records,
-            "shadow_candidates": int(self.bdpt_last_shadow_stats.get("candidates", 0)),
-            "shadow_rays": int(self.bdpt_last_shadow_stats.get("shadow_rays", 0)),
-            "shadow_blocked": int(self.bdpt_last_shadow_stats.get("blocked", 0)),
-            "optical_events": int(self.bdpt_last_optical_transfer.get("events", 0)),
-            "optical_failed_rays": int(self.bdpt_last_optical_transfer.get("failed_rays", 0)),
-            "camera_samples": int(self.bdpt_last_camera_samples.get("samples", 0)),
-        }
+            lit_mask = np.sum(np.asarray(img, dtype=np.float64), axis=2) > 1.0e-8
+            lit_pixels = int(np.count_nonzero(lit_mask))
+            lit_fraction = float(lit_pixels) / float(max(1, n * n))
+            self.bdpt_last_survivor_records = int(stats.get("exact_snaps", 0)) if isinstance(stats, dict) else 0
+            if self.bdpt_last_survivor_records <= 0:
+                self.bdpt_consecutive_no_survivor_frames += 1
+            else:
+                self.bdpt_consecutive_no_survivor_frames = 0
 
-        lit_mask = np.sum(np.asarray(accum_lin, dtype=np.float64), axis=2) > 1.0e-8
-        lit_pixels = int(np.count_nonzero(lit_mask))
-        lit_fraction = float(lit_pixels) / float(max(1, _shadow_n * _shadow_n))
-        self.bdpt_debug_print_counter += 1
-        print(
-            "[bdpt-debug]",
-            f"call={self.bdpt_debug_print_counter}",
-            f"launched={self.bdpt_last_launched_rays}",
-            f"endpoint_records={self.bdpt_last_records}",
-            f"fwd={_stream_fwd_count}",
-            f"bwd={_stream_bwd_count}(pixcone={_stream_pixcone_count})",
-            f"field_blocked={self.bdpt_last_stream_counts['field_deposit_blocked']}",
-            f"shadow={int(self.bdpt_last_shadow_stats.get('shadow_rays', 0))}",
-            f"visible={self.bdpt_last_survivor_records}",
-            f"blocked={int(self.bdpt_last_shadow_stats.get('blocked', 0))}",
-            f"lit_pixels={lit_pixels}",
-            f"lit_frac={lit_fraction:.4f}",
-            f"sensor_gid={sensor_gid}",
-            f"bwd_emit={self.bdpt_last_backward_transport.get('found_emission', 0)}",
-            f"bwd_noemit={self.bdpt_last_backward_transport.get('terminated_no_emission', 0)}",
-            f"bwd_miss={self.bdpt_last_backward_transport.get('missed_scene', 0)}",
-            f"cam_samples={int(self.bdpt_last_camera_samples.get('samples', 0))}",
-            f"cam_pdf={float(self.bdpt_last_camera_samples.get('strategy_pdf_mean', 0.0)):.3e}",
-            f"opt_events={int(self.bdpt_last_optical_transfer.get('events', 0))}",
-            f"opt_fail={self.bdpt_last_optical_transfer.get('top_fail_element', -1)}:{self.bdpt_last_optical_transfer.get('top_fail_reason', '')}",
-            f"photons={self.bdpt_last_sensor_photons:.3e}",
-            f"sensor_power={self.bdpt_last_sensor_power:.3e}",
-            f"integrated_shadow_samples={self._bdpt_plate_sample_count}",
-            flush=True,
-        )
-        # Display is tone-mapped from the persistent linear BDPT image.  The
-        # linear buffer is never replaced by a single frame, so every accepted
-        # connection sample remains in the image history.
-        disp = np.zeros_like(accum_lin, dtype=np.float64)
-        if accum_w is not None:
-            display_lin = accum_lin / np.maximum(accum_w[:, :, None], 1.0e-12)
-        else:
-            display_lin = accum_lin
-        pos_vals = display_lin[display_lin > 0.0]
-        if pos_vals.size > 0:
-            white = float(np.percentile(pos_vals, 99.0))
-            disp[:] = np.log1p(np.maximum(display_lin, 0.0) / max(white, 1.0e-30) * 6.0) / np.log1p(6.0)
-        self._last_bdpt_plate_rgb = np.ascontiguousarray(np.clip(disp, 0.0, 1.0), dtype=np.float32)
-        return self._last_bdpt_plate_rgb
+            self.bdpt_last_sensor_photons = float(np.sum(np.asarray(img, dtype=np.float64)))
+            self.bdpt_last_sensor_power = self.bdpt_last_sensor_photons
+            self.bdpt_last_connection_stats = {
+                "forward_records": stream_fwd_count,
+                "sensor_records": stream_sensor_count,
+                "lit_pixels": lit_pixels,
+                "lit_fraction": lit_fraction,
+                "nearest_dist_m": float(stats.get("nearest_dist_m", -1.0)) if isinstance(stats, dict) else -1.0,
+                "best_collinearity": float(stats.get("best_collinearity", 0.0)) if isinstance(stats, dict) else 0.0,
+                "exact_snaps": int(stats.get("exact_snaps", 0)) if isinstance(stats, dict) else 0,
+                "near_miss_count": int(stats.get("near_miss_count", 0)) if isinstance(stats, dict) else 0,
+                "overflow_vertices": int(overflow.get("vertices", 0)) if isinstance(overflow, dict) else 0,
+                "overflow_spectral": int(overflow.get("spectral", 0)) if isinstance(overflow, dict) else 0,
+                "overflow_pdfs": int(overflow.get("pdfs", 0)) if isinstance(overflow, dict) else 0,
+                "overflow_optical": int(overflow.get("optical", 0)) if isinstance(overflow, dict) else 0,
+                "overflow_connections": int(overflow.get("connections", 0)) if isinstance(overflow, dict) else 0,
+            }
+            self.bdpt_last_telemetry = {
+                "kept_records": self.bdpt_last_survivor_records,
+                "connection_lit_pixels": lit_pixels,
+                "connection_lit_fraction": lit_fraction,
+                "optical_events": int(self.bdpt_last_optical_transfer.get("events", 0)),
+                "optical_failed_rays": int(self.bdpt_last_optical_transfer.get("failed_rays", 0)),
+                "camera_samples": int(self.bdpt_last_camera_samples.get("samples", 0)),
+            }
 
+            self.bdpt_debug_print_counter += 1
+            print(
+                "[bdpt-cpp]",
+                f"call={self.bdpt_debug_print_counter}",
+                f"endpoint_records={self.bdpt_last_records}",
+                f"fwd={stream_fwd_count}",
+                f"sensor_records={stream_sensor_count}",
+                f"exact={self.bdpt_last_connection_stats['exact_snaps']}",
+                f"near={self.bdpt_last_connection_stats['near_miss_count']}",
+                f"lit_pixels={lit_pixels}",
+                f"lit_frac={lit_fraction:.4f}",
+                f"overflow_conn={self.bdpt_last_connection_stats['overflow_connections']}",
+                f"photons={self.bdpt_last_sensor_photons:.3e}",
+                flush=True,
+            )
+
+            self._last_bdpt_plate_rgb = np.ascontiguousarray(np.clip(img, 0.0, 1.0), dtype=np.float32)
+            return self._last_bdpt_plate_rgb
     def _do_register_neural_assembly_group(self) -> None:
         """Re-register neural assembly after clear_tri_groups().  No-op if no MLP loaded."""
         if self._lens_assembly is None or self._lens_assembly.mode != LensAssemblySpec.MODE_MLP:
@@ -7263,7 +6423,7 @@ class ForwardCppLensBench:
 
         # Clear display accumulators on lens move so the image refreshes.
         # Do NOT clear _bdpt_endpoints: it holds physically-valid hit positions
-        # that remain usable by the shadow connection pass across lens nudges.
+        # that remain useful for forward/BDPT diagnostics across lens nudges.
         self._forward_img_accum[:] = 0.0
         self._reverse_img_accum[:] = 0.0
         if isinstance(self._backward_transport_accum, dict):
@@ -7272,10 +6432,6 @@ class ForwardCppLensBench:
                     v[:] = 0.0
         self._last_bdpt_plate_rgb = None
         self._last_bdpt_records = None
-        self._bdpt_plate_linear_accum = None
-        self._bdpt_plate_weight_accum = None
-        self._bdpt_plate_sample_count = 0
-        self._bdpt_bwd_cursor = 0
         self._bdpt_segments.clear()
         self._optical_transfers.clear()
         self._camera_samples.clear()
@@ -7292,7 +6448,7 @@ class ForwardCppLensBench:
         self._async_backward_parametric_absorbed_count = 0
         self._async_backward_launched_count = 0
         self._async_backward_strike_count = 0
-        self.bdpt_last_shadow_stats = {}
+        self.bdpt_last_connection_stats = {}
         self.bdpt_last_optical_transfer = {}
         self.bdpt_last_camera_samples = {}
         self._bdpt_sensor_cfg = None
@@ -9346,8 +8502,7 @@ def run(
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, _hud_blank)
 
-    # PIP viewports: bdpt image + reverse sensor feed + forward strike image.
-    # Three pips left-to-right: [bdpt | backward | forward]
+    # PIP viewports: C++ BDPT image + forward strike image.
     _pip_dim = int(min(W * 0.22, H * 0.22))
     _pip_gap = 10
     _bdpt_pip_vx = (W - (3 * _pip_dim + 2 * _pip_gap)) // 2
@@ -9456,58 +8611,40 @@ def run(
         # Pipeline camera label above left (violet) PIP.
         _draw_hud([mode_str], [(180, 140, 255)], _bdpt_pip_vx)
 
-        # ── Backward transport stats above center (cyan) PIP ───────────────
-        _sh_stats   = bench.bdpt_last_shadow_stats
-        _sh_cands   = int(_sh_stats.get("candidates",  0))
-        _sh_tested  = int(_sh_stats.get("shadow_rays", 0))
-        _sh_clear   = int(_sh_stats.get("visible",     0))
-        _sh_blocked = int(_sh_stats.get("blocked",     0))
-        _sh_n_fwd   = int(_sh_stats.get("n_fwd",       0))
-        _sh_n_bwd   = int(_sh_stats.get("n_bwd",       0))
-        _sh_n_valid = int(_sh_stats.get("n_bwd_valid", 0))
-        _sh_n_pairs = int(_sh_stats.get("n_pairs",     0))
-        _sh_d_vis   = int(_sh_stats.get("direct_vis",   0))
-        _sh_d_tot   = int(_sh_stats.get("direct_total", 0))
-        _sh_den     = max(1, _sh_tested)
-        _sh_clear_pct   = 100.0 * _sh_clear   / _sh_den
-        _sh_blocked_pct = 100.0 * _sh_blocked / _sh_den
-        # Stage label: show the first stage that is 0 to pinpoint the bottleneck.
-        if _sh_n_fwd == 0:
-            _stage_lbl = "STALL:no-fwd-records"
-        elif _sh_n_bwd == 0:
-            _stage_lbl = "STALL:no-bwd-records"
-        elif _sh_n_valid == 0:
-            _stage_lbl = "STALL:bwd-pix-cap-drop"
-        elif _sh_n_pairs == 0:
-            _stage_lbl = "STALL:no-band-overlap"
-        elif int(_sh_stats.get("n_valid_dist", -1)) == 0:
-            _stage_lbl = "STALL:pairs-invalid-dist"
-        elif _sh_tested == 0:
-            _stage_lbl = "shadow-in-progress"
+        # ── C++ BDPT connection stats above center (cyan) PIP ──────────────
+        _cx_stats = bench.bdpt_last_connection_stats
+        _cx_fwd   = int(_cx_stats.get("forward_records", 0))
+        _cx_sens  = int(_cx_stats.get("sensor_records", 0))
+        _cx_exact = int(_cx_stats.get("exact_snaps", 0))
+        _cx_near  = int(_cx_stats.get("near_miss_count", 0))
+        _cx_lit   = int(_cx_stats.get("lit_pixels", 0))
+        _cx_frac  = float(_cx_stats.get("lit_fraction", 0.0))
+        _cx_ovc   = int(_cx_stats.get("overflow_connections", 0))
+        _cx_ovv   = int(_cx_stats.get("overflow_vertices", 0))
+        if _cx_fwd == 0:
+            _stage_lbl = "WAIT:forward-records"
+        elif _cx_exact == 0 and _cx_lit == 0:
+            _stage_lbl = "BDPT:connecting"
         else:
-            _stage_lbl = f"shadow {_sh_tested:_}"
-        _d_pct = 100.0 * _sh_d_vis / max(1, _sh_d_tot)
+            _stage_lbl = f"BDPT exact {_cx_exact:_}"
         tracking_lines = [
             f"{dist_str} col {bc:.3f}",
-            f"async fwd {bench._async_bdpt_forward_count()} bwd {bench._async_bdpt_backward_count()}",
-            f"bwd try {bench._async_backward_attempt_count:_} abs {bench._async_backward_parametric_absorbed_count:_}",
+            f"async fwd {bench._async_bdpt_forward_count()}",
+            f"records fwd {_cx_fwd:_} sensor {_cx_sens:_}",
             f"cam samp {int(bench.bdpt_last_camera_samples.get('samples', 0)):_} pdf {float(bench.bdpt_last_camera_samples.get('strategy_pdf_mean', 0.0)):.1e}",
             f"optic ev {int(bench.bdpt_last_optical_transfer.get('events', 0)):_} fail {int(bench.bdpt_last_optical_transfer.get('failed_rays', 0)):_}",
             f"optic top e{bench.bdpt_last_optical_transfer.get('top_fail_element', -1)} {bench.bdpt_last_optical_transfer.get('top_fail_reason', '')}",
-            f"endpts fwd {_sh_n_fwd} bwd {_sh_n_bwd} valid {_sh_n_valid}",
-            f"pairs {_sh_n_pairs}  {_stage_lbl}",
-            f"clear {_sh_clear:_} ({_sh_clear_pct:.1f}%)  blk {_sh_blocked_pct:.1f}%",
-            f"direct {_sh_d_vis:_}/{_sh_d_tot:_} ({_d_pct:.1f}% lit)",
+            f"{_stage_lbl}",
+            f"lit {_cx_lit:_} ({100.0 * _cx_frac:.1f}%) near {_cx_near:_}",
+            f"overflow vtx {_cx_ovv:_} conn {_cx_ovc:_}",
         ]
-        _stall = _sh_tested == 0 and _sh_d_vis == 0
         tracking_cols  = [(80, 210, 255)] * 3 + [
             (120, 255, 160) if int(bench.bdpt_last_camera_samples.get("samples", 0)) > 0 else (160, 160, 160),
             (255, 180, 90) if int(bench.bdpt_last_optical_transfer.get("failed_rays", 0)) > 0 else (120, 255, 160),
             (255, 150, 90) if int(bench.bdpt_last_optical_transfer.get("failed_rays", 0)) > 0 else (160, 160, 160),
-            (200, 200, 100),
-            (255, 80, 80) if (_sh_tested == 0) else (120, 255, 160),
-            (255, 160, 100),
-            (100, 220, 255) if _sh_d_vis > 0 else (160, 160, 160),
+            (120, 255, 160) if _cx_exact > 0 else (255, 180, 90),
+            (100, 220, 255) if _cx_lit > 0 else (160, 160, 160),
+            (255, 150, 90) if (_cx_ovv > 0 or _cx_ovc > 0) else (160, 160, 160),
         ]
         _draw_hud(tracking_lines, tracking_cols, _pip_vx)
 
@@ -10219,7 +9356,7 @@ def run(
 
     def _trace(rpe: int, sd: int, mb: int):
         import time as _t
-        if bench._async_bdpt_backward_count() > 0 or bench._async_bdpt_forward_count() > 0:
+        if bench._async_bdpt_forward_count() > 0:
             _fire_pipeline_camera_render()
         while not closing.is_set() and bench.tracer.in_flight_count() > _MAX_IN_FLIGHT:
             _t.sleep(0.002)   # back off; let drain-loop consume Q_intent
@@ -10238,7 +9375,6 @@ def run(
                         "[bdpt-forward-warmup]",
                         f"forward_launched={fwd_have:_}/{fwd_target:_}",
                         f"fwd_retained={bench._async_bdpt_forward_count():_}",
-                        f"bwd_retained={bench._async_bdpt_backward_count():_}",
                         f"fwd_strikes={bench._async_forward_strike_count:_}",
                         f"lens_hits={bench._async_forward_lens_hit_count:_}",
                         f"lens_after_bounce={bench._async_forward_lens_hit_after_bounce_count:_}",
@@ -10247,27 +9383,18 @@ def run(
                     )
                 return
             bench.trace_forward(rpe, sd, max_bounces=mb)
-            submitted_bwd = bench.trace_sensor_cast(rpe, sd ^ 0x5A5A, max_bounces=mb)
             if frame % 30 == 0:
-                _s = bench.bdpt_last_shadow_stats
+                _s = bench.bdpt_last_connection_stats
                 print(
                     "[pipeline-trace]",
                     f"forward_launched={bench._async_forward_launched_count:_}",
-                    f"backward_attempted={bench._async_backward_attempt_count:_}",
-                    f"backward_absorbed={bench._async_backward_parametric_absorbed_count:_}",
-                    f"backward_launched={bench._async_backward_launched_count:_}",
                     f"fwd_retained={bench._async_bdpt_forward_count():_}",
-                    f"bwd_retained={bench._async_bdpt_backward_count():_}",
-                    f"bwd_strikes={bench._async_backward_strike_count:_}",
                     f"submit_rpe={rpe:_}",
-                    f"submit_bwd={int(submitted_bwd):_}",
-                    f"bwd_skip={bench._async_backward_skip_reason or '-'}",
-                    f"endpts_fwd={_s.get('n_fwd',0)}",
-                    f"endpts_bwd={_s.get('n_bwd',0)}",
-                    f"bwd_valid={_s.get('n_bwd_valid',0)}",
-                    f"pairs={_s.get('n_pairs',0)}",
-                    f"shadow={_s.get('shadow_rays',0)}",
-                    f"visible={_s.get('visible',0)}",
+                    f"cpp_fwd={_s.get('forward_records',0)}",
+                    f"cpp_sensor={_s.get('sensor_records',0)}",
+                    f"exact={_s.get('exact_snaps',0)}",
+                    f"lit={_s.get('lit_pixels',0)}",
+                    f"overflow_conn={_s.get('overflow_connections',0)}",
                     flush=True,
                 )
 
@@ -10671,7 +9798,6 @@ def run_uv_smoke(
         for step in range(int(max(1, steps))):
             seed = 20260516 + step * 101
             bench.trace_forward(1, seed, max_bounces=1)
-            bench.trace_sensor_cast(1, seed ^ 0x5A5A, max_bounces=1)
 
             t0 = time.perf_counter()
             t_last_probe = 0.0

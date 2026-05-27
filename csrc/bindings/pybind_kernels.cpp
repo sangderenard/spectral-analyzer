@@ -1914,7 +1914,8 @@ struct PyRayTracer
      *   float32 numpy array of shape (n, REFINED_HIT_STRIDE) using the layout
      *   defined in ray_material.comp.glsl.
      *
-     *   REFINED_HIT_STRIDE = 26 + 2*MAX_BANDS  (MAX_BANDS = 16 → stride = 58)
+     *   REFINED_HIT_STRIDE = 27 + 2*MAX_BANDS  (MAX_BANDS = 16 -> stride = 59)
+     *   row[58] carries bdpt_subpath_id as uintBitsToFloat.
      *
      *   Returns shape (0,) when the queue is empty.
      *
@@ -1929,7 +1930,7 @@ struct PyRayTracer
      * run the GPU shader instead of the C++ worker, or to hybridise. */
 
     static constexpr int _GPU_MAX_BANDS     = 16;
-    static constexpr int _REFINED_HIT_STRIDE = 26 + 2 * _GPU_MAX_BANDS;  /* 58 */
+    static constexpr int _REFINED_HIT_STRIDE = 27 + 2 * _GPU_MAX_BANDS;  /* 59 */
     static constexpr int _INTENT_STRIDE      = 20 + 2 * _GPU_MAX_BANDS;  /* 52 */
 
     py::array_t<float> drain_refined_hits(int max_n = 256) {
@@ -2015,6 +2016,8 @@ struct PyRayTracer
                 row[26 + b] = 0.0f;
                 row[26 + _GPU_MAX_BANDS + b] = 0.0f;
             }
+            uint32_t bdpt_sid = hr.ray.bdpt_subpath_id;
+            std::memcpy(&row[58], &bdpt_sid, sizeof(float));
         }
         return arr;
     }
@@ -2051,6 +2054,14 @@ struct PyRayTracer
             ri.priority = row[16];
             ri.sensor_origin_y = row[17];
             ri.sensor_origin_z = row[18];
+            uint32_t bdpt_sid = 0u;
+            std::memcpy(&bdpt_sid, &row[19], sizeof(uint32_t));
+            ri.bdpt_subpath_id = bdpt_sid;
+            ri.bdpt_vertex = (ri.bounce < 0)
+                ? 0u
+                : static_cast<uint16_t>(std::min(ri.bounce, 0xFFFF));
+            ri.bdpt_stream = (ri.color_flag == 1u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
+            ri.bdpt_strategy = 0u;
             ri.amp.resize(nb);
             for (int b = 0; b < nb; ++b)
                 ri.amp[b] = std::complex<double>(

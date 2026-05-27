@@ -27,7 +27,7 @@
  *    [20..35] amp_re[MAX_GPU_BANDS]
  *    [36..51] amp_im[MAX_GPU_BANDS]
  *
- *  HitBuf  (REFINED_HIT_STRIDE = 58 floats, written by this shader):
+ *  HitBuf  (REFINED_HIT_STRIDE = 59 floats, written by this shader):
  *    [0..2]   refined_pos xyz  (= hit_pos, T2 may update for parametric)
  *    [3..5]   refined_n xyz    (= oriented tri normal, T2 may update)
  *    [6..8]   incoming_dir xyz

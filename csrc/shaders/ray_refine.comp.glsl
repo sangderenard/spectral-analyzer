@@ -16,7 +16,8 @@
  *
  * Flat buffer layouts (same bindings as T1 but shared HitBuf is now input):
  *
- *  HitBuf  (REFINED_HIT_STRIDE = 58 floats): in-place update of [0..8], [12], [16], [26..57]
+ *  HitBuf  (REFINED_HIT_STRIDE = 59 floats): in-place update of [0..8], [12], [16], [26..57]
+ *    [58] = bdpt_subpath_id, carried through untouched from T1 to T3
  *
  *  TriFullBuf  (TRI_FULL_STRIDE = 16 floats):
  *    [0..2] v0   [3..5] edge1  [6..8] edge2  [9..11] normal
@@ -49,7 +50,7 @@ layout(local_size_x = 64) in;
 
 /* ── Layout constants ───────────────────────────────────────────────────── */
 #define MAX_GPU_BANDS         16
-#define HIT_STRIDE            58
+#define HIT_STRIDE            59
 #define TRI_FULL_STRIDE       16
 #define GROUP_PAYLOAD_STRIDE  16
 #define MAX_NEURAL_DIM        512   /* max hidden_dim supported */

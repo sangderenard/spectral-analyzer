@@ -528,6 +528,29 @@ class ImagePlateConfig:
 
 
 @dataclass
+class FlashModifierConfig:
+    """Light modifier applied per-ray inside the C++ emitter submission.
+
+    mode : "none"  – all cosine-hemisphere rays submitted (no limiting).
+           "snoot" – conic tube: each emitter point aims a cone at the exit
+                     disk defined by the interaction target.  Rays that miss
+                     the disk are culled.  This replaces the legacy sphere
+                     intersection test with geometrically correct disk clipping.
+           "grid"  – egg-crate square cells placed at the emitter face.  Each
+                     cell is a small tube; only rays that exit through their
+                     own cell's aperture are submitted.
+           "scrim" – translucent attenuator: each ray is accepted with
+                     probability = scrim_transmittance.
+    """
+    mode: str = "snoot"
+    # GRID: square cell side = 2 × half-radius; depth sets the cutoff angle.
+    grid_cell_mm: float = 5.0
+    grid_depth_mm: float = 25.0
+    # SCRIM: acceptance probability in [0, 1].
+    scrim_transmittance: float = 0.5
+
+
+@dataclass
 class CameraLightBurstConfig:
     """Camera-owned exposure packet for mounted emitters."""
     enabled: bool = True
@@ -1127,6 +1150,7 @@ class SceneConfig:
     ring_light_width_m: float = 0.018      # radial width of the emitting annulus (m)
     ring_light_emission: float = 50.0      # emission scale (relative to source material)
     ring_light_n_sectors: int = 72         # angular tessellation segments
+    flash_modifier: FlashModifierConfig = field(default_factory=FlashModifierConfig)
     camera_light_burst: CameraLightBurstConfig = field(default_factory=CameraLightBurstConfig)
     # Exit pupil / field stop aperture between last lens and sensor. When enabled
     # this limits light transmission post-optics, letting you tune spectral content
@@ -5111,6 +5135,22 @@ class ForwardCppLensBench:
     def _configure_cpp_sensor_image(self, res: int, bdpt_eps: float = 0.008) -> None:
         target_x = float(np.asarray(getattr(self, "aperture_centroid", np.zeros(3, dtype=np.float64)), dtype=np.float64)[0])
         target_r = float(getattr(self, "aperture_radius", 0.0))
+        # Fallback: if the aperture target wasn't set (radius=0), use the
+        # front face of the first lens group so sensor rays have somewhere to aim.
+        if target_r <= 0.0:
+            _lensasm = getattr(self, "_lens_assembly", None)
+            if _lensasm is not None:
+                _cen, _r = _lensasm.backward_ray_target()
+                if _cen is not None and _r > 0.0:
+                    target_x = float(_cen[0])
+                    target_r = float(_r)
+            if target_r <= 0.0:
+                # Last resort: use the first lens group front face from the scene spec
+                _lstack = getattr(self.scene, "lens_stack", None)
+                if _lstack and len(_lstack) > 0:
+                    _front = _lstack[0]
+                    target_x = float(getattr(_front, "center_x", 1.0)) - float(getattr(_front, "thickness", 0.04)) * 0.5
+                    target_r = float(getattr(_front, "aperture_radius", 0.018))
         self.tracer.configure_sensor_image(
             float(self.scene.image_plate.x),
             float(self.scene.image_plate.radius),
@@ -5205,6 +5245,19 @@ class ForwardCppLensBench:
 
         if bake_origins is None:
             n_rays = int(max(1, rays_per_emitter))
+            _mod = getattr(self.scene, "flash_modifier", None)
+            if _mod is not None:
+                _mode_map = {"none": 0, "snoot": 1, "grid": 2, "scrim": 3}
+                _mtype = _mode_map.get(str(getattr(_mod, "mode", "snoot")).lower(), 1)
+                if _mtype == 2:    # GRID
+                    _mp0 = float(getattr(_mod, "grid_cell_mm", 5.0))
+                    _mp1 = float(getattr(_mod, "grid_depth_mm", 25.0))
+                elif _mtype == 3:  # SCRIM
+                    _mp0 = float(getattr(_mod, "scrim_transmittance", 0.5))
+                    _mp1 = 0.0
+                else:
+                    _mp0 = _mp1 = 0.0
+                self.tracer.set_flash_modifier(_mtype, _mp0, _mp1)
             submitted = int(self.tracer.submit_emissive_triangles(
                 self._emitter_tri_ids_i32,
                 n_rays,
@@ -5219,6 +5272,7 @@ class ForwardCppLensBench:
                 _SHADER_DIR,
                 *self._emitter_interaction_target(),
             ))
+            self.tracer.signal_flash_dispatched()
             self._ensure_drain_loop()
             self._async_forward_launched_count += int(submitted)
             return submitted
@@ -6495,6 +6549,21 @@ class ForwardCppLensBench:
                     self._bdpt_native_sensor_sweep_started = self.bdpt_last_launched_rays > 0
                     self._bdpt_camera_sweep_stage += 1
                     self._bdpt_native_sensor_sweep_rays += int(self.bdpt_last_launched_rays)
+                    self.tracer.signal_sensor_dispatched()
+                    if not getattr(self, "_sensor_sweep_diag_done", False):
+                        _tgt_r = float(getattr(self, "aperture_radius", 0.0))
+                        _tgt_x = float(np.asarray(getattr(
+                            self, "aperture_centroid", np.zeros(3)), dtype=np.float64)[0])
+                        print(
+                            "[sensor-sweep-first-call]",
+                            f"launched={self.bdpt_last_launched_rays}",
+                            f"sensor_px={float(self.scene.image_plate.x):.4f}",
+                            f"target_x={_tgt_x:.4f}",
+                            f"target_r={_tgt_r*1e3:.2f}mm",
+                            f"stage={self._bdpt_camera_sweep_stage}/{stage_count}",
+                            flush=True,
+                        )
+                        self._sensor_sweep_diag_done = True
                 else:
                     self.bdpt_last_launched_rays = 0
             except Exception as exc:
@@ -6996,16 +7065,19 @@ class ForwardCppLensBench:
 
                 # Remap entrance/exit GID hits to display classes 4 (red) and 5 (green).
                 # Classes 4/5 are always kept — no amplitude threshold applied to them.
+                # Sensor-stream records (class 3) are NOT remapped: they must stay
+                # visible in pts[3] even when they land on the entrance/exit face.
                 _asm = getattr(self, "_lens_assembly", None)
                 if _asm is not None:
                     _ap = _asm.acceptance_params()
                     if _ap is not None:
                         _ent_gid = int(_ap["entrance_gid"])
                         _exit_gid = int(_ap["exit_gid"])
+                        _fwd_mask = (cls_v != 3)  # don't remap sensor strikes
                         if _ent_gid >= 0:
-                            cls_v = np.where(gid_v == _ent_gid, 4, cls_v)
+                            cls_v = np.where((gid_v == _ent_gid) & _fwd_mask, 4, cls_v)
                         if _exit_gid >= 0:
-                            cls_v = np.where(gid_v == _exit_gid, 5, cls_v)
+                            cls_v = np.where((gid_v == _exit_gid) & _fwd_mask, 5, cls_v)
 
             # Amplitude threshold for volume/field points only (cls 1, 2).
             # Strike points (cls 0, 3, 4, 5) are always kept.
@@ -8101,7 +8173,6 @@ def run(
     # ── Configure C++ sensor image accumulator ─────────────────────────────
     _pip_res = int(max(16, scene.image_plate.sensor_res))
     bench._configure_cpp_sensor_image(_pip_res, 0.008)
-    bench.tracer.set_bdpt_sweep_trigger(_pip_res * _pip_res)
     if neural_payload_in:
         # ── Load pre-trained payload(s) and register immediately ──────────────
         _loaded_payload = np.load(neural_payload_in).astype(np.float32)
@@ -8867,6 +8938,23 @@ def run(
         _cx_frac  = float(_cx_stats.get("lit_fraction", 0.0))
         _cx_ovc   = int(_cx_stats.get("overflow_connections", 0))
         _cx_ovv   = int(_cx_stats.get("overflow_vertices", 0))
+        try:
+            _latch = bench.tracer.get_bdpt_latch_state()
+        except Exception:
+            _latch = {"flash_dispatched": 0, "sensor_dispatched": 0,
+                      "t5_fired": 0, "connection_running": False}
+        _lt_flash  = int(_latch.get("flash_dispatched", 0))
+        _lt_sensor = int(_latch.get("sensor_dispatched", 0))
+        _lt_t5     = int(_latch.get("t5_fired", 0))
+        _lt_run    = bool(_latch.get("connection_running", False))
+        # Progress bar: each █ = one completed T5 cycle; gap shows pending
+        _BAR_W  = 12
+        _lt_min = min(_lt_flash, _lt_sensor)
+        _lt_gap = max(0, _lt_min - _lt_t5)   # cycles ready but T5 not yet consumed
+        _filled = min(_BAR_W, _lt_t5 % (_BAR_W + 1)) if _lt_t5 > 0 else 0
+        _bar    = ("█" * _filled).ljust(_BAR_W, "░")
+        _t5_lbl = ("RUN" if _lt_run else f"+{_lt_gap}" if _lt_gap > 0 else "  .")
+        _latch_str = f"F{_lt_flash} S{_lt_sensor} T{_lt_t5} [{_bar}]{_t5_lbl}"
         if _cx_fwd == 0:
             _stage_lbl = "WAIT:forward-records"
         elif _cx_exact == 0 and _cx_lit == 0:
@@ -8877,6 +8965,7 @@ def run(
             f"{dist_str} col {bc:.3f}",
             f"async fwd {bench._async_bdpt_forward_count()}",
             f"records fwd {_cx_fwd:_} sensor {_cx_sens:_}",
+            _latch_str,
             f"cam samp {int(bench.bdpt_last_camera_samples.get('samples', 0)):_} pdf {float(bench.bdpt_last_camera_samples.get('strategy_pdf_mean', 0.0)):.1e}",
             f"optic ev {int(bench.bdpt_last_optical_transfer.get('events', 0)):_} fail {int(bench.bdpt_last_optical_transfer.get('failed_rays', 0)):_}",
             f"optic top e{bench.bdpt_last_optical_transfer.get('top_fail_element', -1)} {bench.bdpt_last_optical_transfer.get('top_fail_reason', '')}",
@@ -8885,6 +8974,7 @@ def run(
             f"overflow vtx {_cx_ovv:_} conn {_cx_ovc:_}",
         ]
         tracking_cols  = [(80, 210, 255)] * 3 + [
+            (120, 255, 160) if _lt_run else (255, 200, 80) if _lt_gap > 0 else (160, 160, 160),
             (120, 255, 160) if int(bench.bdpt_last_camera_samples.get("samples", 0)) > 0 else (160, 160, 160),
             (255, 180, 90) if int(bench.bdpt_last_optical_transfer.get("failed_rays", 0)) > 0 else (120, 255, 160),
             (255, 150, 90) if int(bench.bdpt_last_optical_transfer.get("failed_rays", 0)) > 0 else (160, 160, 160),
@@ -9607,6 +9697,10 @@ def run(
         if bench._async_bdpt_forward_count() > 0:
             _fire_pipeline_camera_render()
         if getattr(bench, "_camera_exposure_complete", False):
+            # One exposure cycle done; reset so the next cycle can begin.
+            bench._camera_exposure_complete = False
+            bench._camera_exposure_forward_stage = 0
+            bench._bdpt_camera_sweep_stage = 0
             return
         while not closing.is_set() and bench.tracer.in_flight_count() > _MAX_IN_FLIGHT:
             _t.sleep(0.002)   # back off; let drain-loop consume Q_intent
@@ -9650,6 +9744,8 @@ def run(
                     f"submit_rpe={submit_rpe:_}",
                     f"cpp_fwd={_s.get('forward_records',0)}",
                     f"cpp_sensor={_s.get('sensor_records',0)}",
+                    f"sensor_rays_total={bench._bdpt_native_sensor_sweep_rays:_}",
+                    f"sensor_strikes={bench._async_backward_strike_count:_}",
                     f"exact={_s.get('exact_snaps',0)}",
                     f"lit={_s.get('lit_pixels',0)}",
                     f"overflow_conn={_s.get('overflow_connections',0)}",
@@ -9709,7 +9805,6 @@ def run(
                 pass
         _new_pip_res = int(max(16, scene.image_plate.sensor_res))
         bench._configure_cpp_sensor_image(_new_pip_res, 0.008)
-        bench.tracer.set_bdpt_sweep_trigger(_new_pip_res * _new_pip_res)
         # Derive and print the new f-number from EFL and entrance pupil radius
         _efl = float(getattr(getattr(scene, "optical_design", None),
                               "effective_focal_length_m", 0.0) or 0.0)
@@ -10039,7 +10134,6 @@ def run_uv_smoke(
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
     _batch_pip_res = int(max(16, scene.image_plate.sensor_res))
     bench._configure_cpp_sensor_image(_batch_pip_res, 0.008)
-    bench.tracer.set_bdpt_sweep_trigger(_batch_pip_res * _batch_pip_res)
 
     rc = 1
     try:

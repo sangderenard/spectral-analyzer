@@ -507,6 +507,34 @@ struct WaveArena {
     std::mutex         mu;
 };
 
+/* ── T5 BDPT connection strategy ─────────────────────────────────────────── */
+enum class T5Strategy : int {
+    FULL_SEARCH = 0,  /* complete O(N×M×D²) all-pairs reference; never approximated */
+    HASH_GRID   = 1,  /* spatial hash of light vertices; default                     */
+};
+
+/* ── Flash light modifier ─────────────────────────────────────────────────
+ * Applied per-ray inside submit_emissive_triangles.  All modes use the same
+ * interaction target (target_x/y/z/r) as the reference geometry.
+ *
+ * NONE  : no modification; cosine-hemisphere rays all submitted.
+ * SNOOT : conic tube from each emitter point to the exit disk at the target.
+ *         Rays that miss the disk are culled (replaces legacy sphere test).
+ *         param0 unused; set target_r to control exit-disk radius.
+ * GRID  : egg-crate square grid placed at the emitter face.
+ *         param0 = cell diameter in mm (default 5).
+ *         param1 = grid tube depth in mm (default 25).
+ *         Rays that cannot exit their cell's square aperture are culled.
+ * SCRIM : translucent attenuating diffuser.
+ *         param0 = transmittance in [0,1] (default 0.5).
+ *         Rays are accepted with probability = transmittance. */
+enum class FlashModifierType : int {
+    NONE  = 0,
+    SNOOT = 1,
+    GRID  = 2,
+    SCRIM = 3,
+};
+
 /* ─── Pipeline config ───────────────────────────────────────────────────── */
 
 struct RayPipelineConfig {
@@ -538,13 +566,23 @@ struct RayPipelineConfig {
     int    bdpt_max_optical  = 1000000;  /* BdptOpticalEventRecord cap */
     int    bdpt_max_connections = 2000000; /* BdptConnectionRecord cap */
 
-    /* ── BDPT sweep auto-trigger ────────────────────────────────────────────
-     * When bdpt_sweep_trigger > 0, pipeline_material fires
-     * ray_pipeline_run_bdpt_connection() automatically once per sweep:
-     * the trigger fires when bdpt_cam_vertex_count reaches this value.
-     * 0 = disabled (call run_bdpt_connection() manually from Python).
-     * Typical value: sensor_pip_res² (one vertex per pixel per sweep). */
-    int    bdpt_sweep_trigger = 0;
+    /* ── T5 connection strategy ──────────────────────────────────────────
+     * FULL_SEARCH: complete all-pairs reference; no approximation.
+     * HASH_GRID (default): spatial hash of connectable light vertices.
+     *   t5_grid_cell_size: cell side length in metres.  The worker queries
+     *   a (2×t5_grid_radius_cells+1)³ cube, so the hard connection radius
+     *   is sqrt(3)×cell_size×radius_cells.  Pairs outside this cube are
+     *   never evaluated.  t5_min_geom replaces the legacy 1e-20 floor with
+     *   a tighter value that skips near-grazing and very distant pairs. */
+    T5Strategy t5_strategy          = T5Strategy::HASH_GRID;
+    float      t5_grid_cell_size    = 0.25f;  /* metres */
+    int        t5_grid_radius_cells = 1;       /* 1 → 3×3×3 cube search */
+    float      t5_min_geom          = 1e-8f;  /* geometry-term floor    */
+
+    /* ── Flash modifier ─────────────────────────────────────────────────── */
+    FlashModifierType flash_modifier_type   = FlashModifierType::SNOOT;
+    float             flash_modifier_param0 = 0.0f;  /* GRID: cell_mm  SCRIM: transmittance */
+    float             flash_modifier_param1 = 0.0f;  /* GRID: depth_mm                      */
 
     /* ── GPU compute dispatch ────────────────────────────────────────────
      * When use_gpu_compute=true a GlPipelineDispatch thread is spawned that
@@ -675,9 +713,25 @@ void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
  * Call once per sensor sweep after ray_pipeline_wait_idle(). */
 void ray_pipeline_run_bdpt_connection(RayPipelineState* ps);
 
-/* Update the bdpt_sweep_trigger threshold on a running pipeline.
- * 0 = disable auto-trigger; >0 = fire once per sweep (n camera vertices). */
-void ray_pipeline_set_bdpt_sweep_trigger(RayPipelineState* ps, int n);
+/* Signal that the camera has finished dispatching emissive-triangle (flash)
+ * rays for the current exposure substage.  T5 fires once both
+ * signal_flash_dispatched and signal_sensor_dispatched have been called for
+ * the same substage — firing is serialised on a dedicated T5 thread. */
+void ray_pipeline_signal_flash_dispatched(RayPipelineState* ps);
+
+/* Signal that the camera has finished dispatching sensor-sweep rays for the
+ * current exposure substage.  Mirrors signal_flash_dispatched. */
+void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps);
+
+/* Live-update T5 connection-pass configuration. */
+void ray_pipeline_set_t5_strategy(RayPipelineState* ps, T5Strategy s);
+void ray_pipeline_set_t5_grid_cell_size(RayPipelineState* ps, float v);
+void ray_pipeline_set_t5_grid_radius_cells(RayPipelineState* ps, int r);
+void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
+
+/* Live-update the flash light modifier applied in submit_emissive_triangles. */
+void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType type,
+                                      float param0, float param1);
 
 /* Submit one native sensor-frame sweep into the same T1->T2->T3 pipeline as
  * light paths.  The sweep uses the configured sensor image grid and stamps all
@@ -789,3 +843,15 @@ void ray_pipeline_get_bdpt_stats(
     float*    out_best_collinearity,
     uint64_t* out_exact_snaps,
     uint64_t* out_near_miss_count);
+
+/* Snapshot of the four BDPT latch counters — all lock-free relaxed reads.
+ * flash_dispatched: incremented once per trace_forward() call.
+ * sensor_dispatched: incremented once per submit_sensor_sweep() call.
+ * t5_fired: incremented at the end of each connection pass.
+ * connection_running: 1 while a T5 thread is active, 0 otherwise. */
+void ray_pipeline_get_bdpt_latch_state(
+    const RayPipelineState* ps,
+    uint32_t* out_flash_dispatched,
+    uint32_t* out_sensor_dispatched,
+    uint32_t* out_t5_fired,
+    int*      out_connection_running);

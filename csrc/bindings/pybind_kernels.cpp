@@ -552,8 +552,18 @@ struct PyRayTracer
     float _sensor_bdpt_eps     = 0.008f;
     float _sensor_target_x     = 0.0f;
     float _sensor_target_r     = 0.0f;
-    int   _bdpt_sweep_trigger  = 0;
     std::atomic<uint32_t> _bdpt_subpath_counter{1u};
+
+    /* T5 strategy config */
+    int   _t5_strategy          = static_cast<int>(T5Strategy::HASH_GRID);
+    float _t5_grid_cell_size    = 0.25f;
+    int   _t5_grid_radius_cells = 1;
+    float _t5_min_geom          = 1e-8f;
+
+    /* Flash modifier config */
+    int   _flash_modifier_type   = static_cast<int>(FlashModifierType::SNOOT);
+    float _flash_modifier_param0 = 0.0f;
+    float _flash_modifier_param1 = 0.0f;
 
     /* GPU compute config — stored before pipeline creation so first submit_rays
      * can enable the GPU backend.  Ignored after the pipeline is created. */
@@ -574,12 +584,18 @@ struct PyRayTracer
             cfg.seed                = seed;
             cfg.min_amplitude       = _default_min_amplitude;
             cfg.max_intent_queue    = _max_intent_queue;
-            cfg.bdpt_sweep_trigger  = _bdpt_sweep_trigger;
-            cfg.use_gpu_compute     = _use_gpu_compute;
-            cfg.gpu_all_stages   = _gpu_all_stages;
-            cfg.shader_dir       = _shader_dir;
-            cfg.gl_display_hglrc = _gl_display_hglrc;
-            cfg.gl_display_hdc   = _gl_display_hdc;
+            cfg.use_gpu_compute         = _use_gpu_compute;
+            cfg.gpu_all_stages          = _gpu_all_stages;
+            cfg.shader_dir              = _shader_dir;
+            cfg.gl_display_hglrc        = _gl_display_hglrc;
+            cfg.gl_display_hdc          = _gl_display_hdc;
+            cfg.t5_strategy             = static_cast<T5Strategy>(_t5_strategy);
+            cfg.t5_grid_cell_size       = _t5_grid_cell_size;
+            cfg.t5_grid_radius_cells    = _t5_grid_radius_cells;
+            cfg.t5_min_geom             = _t5_min_geom;
+            cfg.flash_modifier_type     = static_cast<FlashModifierType>(_flash_modifier_type);
+            cfg.flash_modifier_param0   = _flash_modifier_param0;
+            cfg.flash_modifier_param1   = _flash_modifier_param1;
             _pipeline = ray_pipeline_create(handle, &cfg);
             if (!_pipeline)
                 throw std::runtime_error("ray_pipeline_create failed");
@@ -2182,6 +2198,18 @@ struct PyRayTracer
         return d;
     }
 
+    py::dict get_bdpt_latch_state() const {
+        uint32_t flash = 0, sensor = 0, fired = 0;
+        int running = 0;
+        ray_pipeline_get_bdpt_latch_state(_pipeline, &flash, &sensor, &fired, &running);
+        py::dict d;
+        d["flash_dispatched"]   = static_cast<int>(flash);
+        d["sensor_dispatched"]  = static_cast<int>(sensor);
+        d["t5_fired"]           = static_cast<int>(fired);
+        d["connection_running"] = running != 0;
+        return d;
+    }
+
     /* ── BDPT side-data drains ─────────────────────────────────────────────
      *
      * Each function returns a uint8 ndarray of shape (n, sizeof(Record)).
@@ -2310,10 +2338,38 @@ struct PyRayTracer
             shutter_softness, exposure_weight);
     }
 
-    void set_bdpt_sweep_trigger(int n) {
-        _bdpt_sweep_trigger = n;
-        if (_pipeline)
-            ray_pipeline_set_bdpt_sweep_trigger(_pipeline, n);
+    void signal_flash_dispatched() {
+        if (_pipeline) ray_pipeline_signal_flash_dispatched(_pipeline);
+    }
+
+    void signal_sensor_dispatched() {
+        if (_pipeline) ray_pipeline_signal_sensor_dispatched(_pipeline);
+    }
+
+    void set_t5_strategy(int s) {
+        _t5_strategy = s;
+        ray_pipeline_set_t5_strategy(_pipeline, static_cast<T5Strategy>(s));
+    }
+    void set_t5_grid_cell_size(float v) {
+        _t5_grid_cell_size = v;
+        ray_pipeline_set_t5_grid_cell_size(_pipeline, v);
+    }
+    void set_t5_grid_radius_cells(int r) {
+        _t5_grid_radius_cells = r;
+        ray_pipeline_set_t5_grid_radius_cells(_pipeline, r);
+    }
+    void set_t5_min_geom(float v) {
+        _t5_min_geom = v;
+        ray_pipeline_set_t5_min_geom(_pipeline, v);
+    }
+
+    void set_flash_modifier(int type_int, float param0, float param1) {
+        _flash_modifier_type   = type_int;
+        _flash_modifier_param0 = param0;
+        _flash_modifier_param1 = param1;
+        ray_pipeline_set_flash_modifier(_pipeline,
+                                         static_cast<FlashModifierType>(type_int),
+                                         param0, param1);
     }
 
     int in_flight_count() const
@@ -5404,6 +5460,14 @@ R"doc(Return a dict of live BDPT convergence diagnostics (lock-free snapshot):
   best_collinearity  (float)  — |cos θ| between incoming directions at best pair [0,1].
   exact_snaps        (int)    — cumulative exact-match (ch2) pixel accumulations.
   near_miss_count    (int)    — cumulative near-miss (ch3) pixel accumulations.)doc")
+        .def("get_bdpt_latch_state",
+             &PyRayTracer::get_bdpt_latch_state,
+R"doc(Return a dict of the four BDPT pipeline latch counters (lock-free relaxed reads):
+  flash_dispatched   (int)   — number of trace_forward() calls completed.
+  sensor_dispatched  (int)   — number of submit_sensor_sweep() calls completed.
+  t5_fired           (int)   — number of T5 connection passes completed.
+  connection_running (bool)  — True while a T5 thread is actively running.
+T5 fires when min(flash_dispatched, sensor_dispatched) > t5_fired.)doc")
         .def("drain_bdpt_vertices",
              &PyRayTracer::drain_bdpt_vertices,
              py::arg("max_n") = 100000,
@@ -5468,13 +5532,48 @@ R"doc(Submit a native BDPT sensor-frame sweep into the persistent pipeline.
 Uses the configured sensor image grid and stamps all rays as BDPT_SIDE_SENSOR.
 shutter_mode: 0=open, 1=closed, 2=iris, 3=sliding_x, 4=sliding_y.
 max_rays <= 0 submits the full grid after shutter masking.)doc")
-        .def("set_bdpt_sweep_trigger",
-             &PyRayTracer::set_bdpt_sweep_trigger,
-             py::arg("n"),
-R"doc(Set the BDPT sweep auto-trigger threshold.
-n > 0: pipeline_material auto-fires run_bdpt_connection() once per sweep
-       when bdpt_cam_vertex_count reaches n (typical: sensor_res*sensor_res).
-n = 0: disable auto-trigger; call run_bdpt_connection() manually.)doc")
+        .def("signal_flash_dispatched",
+             &PyRayTracer::signal_flash_dispatched,
+R"doc(Signal that all emissive-triangle (flash) rays for the current exposure
+substage have been submitted.  T5 fires once both signal_flash_dispatched and
+signal_sensor_dispatched have been called for the same substage.)doc")
+        .def("signal_sensor_dispatched",
+             &PyRayTracer::signal_sensor_dispatched,
+R"doc(Signal that all sensor-sweep rays for the current exposure substage have
+been submitted.  Mirrors signal_flash_dispatched.)doc")
+        .def("set_t5_strategy",
+             &PyRayTracer::set_t5_strategy,
+             py::arg("strategy"),
+R"doc(Select T5 BDPT connection strategy.
+0 = FULL_SEARCH — complete O(N×M×D²) all-pairs reference; never approximated.
+1 = HASH_GRID   — spatial hash of light vertices; default.  Pairs outside
+    the (2×radius_cells+1)³ cube around the camera vertex are not evaluated.)doc")
+        .def("set_t5_grid_cell_size",
+             &PyRayTracer::set_t5_grid_cell_size,
+             py::arg("metres"),
+R"doc(Set HASH_GRID cell size in metres (default 0.25).
+Connection radius ≈ sqrt(3) × cell_size × radius_cells.)doc")
+        .def("set_t5_grid_radius_cells",
+             &PyRayTracer::set_t5_grid_radius_cells,
+             py::arg("r"),
+R"doc(Set HASH_GRID search half-width in cells (default 1 → 3×3×3 cube).)doc")
+        .def("set_t5_min_geom",
+             &PyRayTracer::set_t5_min_geom,
+             py::arg("threshold"),
+R"doc(Set minimum geometry term to evaluate a connection (default 1e-8).
+Replaces the legacy 1e-20 floor in both FULL_SEARCH and HASH_GRID.)doc")
+        .def("set_flash_modifier",
+             &PyRayTracer::set_flash_modifier,
+             py::arg("type_int"),
+             py::arg("param0") = 0.0f,
+             py::arg("param1") = 0.0f,
+R"doc(Set the flash light modifier applied inside submit_emissive_triangles.
+type_int: 0=NONE, 1=SNOOT (default), 2=GRID, 3=SCRIM.
+SNOOT  : conic disk test — rays must reach the exit disk at the interaction target.
+         No extra params; target_r controls exit-disk radius.
+GRID   : egg-crate square cells.  param0=cell_diameter_mm (default 5),
+         param1=tube_depth_mm (default 25).
+SCRIM  : stochastic attenuator.  param0=transmittance in [0,1] (default 0.5).)doc")
         .def("add_scale_context", &PyRayTracer::add_scale_context,
              py::arg("pos"),
              py::arg("radius"),

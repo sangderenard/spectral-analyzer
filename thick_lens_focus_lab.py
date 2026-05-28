@@ -4260,7 +4260,8 @@ class ForwardCppLensBench:
     view_h: int
     view_w: int
     sidecar: FreeFrequencySidecar | None = None
-    field_capture: bool = True
+    field_capture: bool = False
+    enable_uv_splat: bool = False
 
     def __post_init__(self) -> None:
         self._trace_lock = threading.Lock()
@@ -4771,12 +4772,14 @@ class ForwardCppLensBench:
                 clear_existing=True,
             )
         else:
-            print("[field-capture] disabled via --no-field", flush=True)
+            print("[field-capture] disabled", flush=True)
 
-        self._build_uv_page_bank()
+        if self.enable_uv_splat:
+            self._build_uv_page_bank()
         n_lens_param = self._register_lens_parametric_groups()
         print(f"[parametric-register] lens_surface_groups={n_lens_param}", flush=True)
-        self._register_uv_page_bank()
+        if self.enable_uv_splat:
+            self._register_uv_page_bank()
 
         _t0_physics = float(getattr(self.scene, "subject_time_s", 0.0))
         self._scene_version_cache.commit_version(
@@ -8124,7 +8127,8 @@ def run(
     emitter_amp_gain: float = 1.0,
     compute_mode: str = "gpu",
     profile: bool = False,
-    field_capture: bool = True,
+    field_capture: bool = False,
+    enable_uv_splat: bool = False,
     bake_noodles: int = 0,
     focus_steps: int = 1,
     focus_range_mm: float = 2.0,
@@ -8227,6 +8231,7 @@ def run(
         view_w=view_w,
         sidecar=sidecar,
         field_capture=field_capture,
+        enable_uv_splat=enable_uv_splat,
     )
     # Wire the display HGLRC and HDC to the tracer BEFORE the first submit_rays.
     if _gl_display_hglrc:
@@ -8797,13 +8802,12 @@ def run(
     _gl_renderer = BaseGLRenderer(bench.material_db)
     _gl_renderer.init_gl()
     _gl_renderer.set_emit_uv_texture_id(int(tex_uv_pages))
-    _scene_vao: list = [None]  # lazily built once uv_page_bank groups are ready
+    _scene_vao: list = [None]  # lazily built on first draw_uv_mesh call
 
     def _build_scene_vao() -> None:
-        bank = bench.uv_page_bank
-        if bank is None or not bank.groups:
-            return
         n_tris = bench.n_tris
+        if n_tris <= 0:
+            return
         tv = bench.tri_vertices  # (N, 3, 3) float64 xyz
         # Normalise into [0, 1]³ — same mapping as _ensure_mesh_vbo.
         x0  = float(scene.x_min);  x1  = float(scene.x_max)
@@ -8827,16 +8831,19 @@ def run(
         # shader.  The renderer's derive_emissive_area_lights will pick those up
         # and handle illumination — no manual light setup needed here.
         mat_flat = np.repeat(bench.tri_mat_ids, 3)               # (N*3,) ints
-        # Group IDs for self-exclusion in the fragment shader.
+        # Group IDs for self-exclusion in the fragment shader; all-zero when
+        # UV page bank is not active (no per-group self-exclusion needed).
         gid_flat = np.zeros(n_tris * 3, dtype=np.int32)
-        for g in bank.groups:
-            if g.tri_ids.size <= 0:
-                continue
-            if g.group_id < 0:
-                continue
-            for tid in g.tri_ids:
-                base = int(tid) * 3
-                gid_flat[base:base + 3] = int(g.group_id)
+        bank = bench.uv_page_bank
+        if bank is not None:
+            for g in bank.groups:
+                if g.tri_ids.size <= 0:
+                    continue
+                if g.group_id < 0:
+                    continue
+                for tid in g.tri_ids:
+                    base = int(tid) * 3
+                    gid_flat[base:base + 3] = int(g.group_id)
         mat_v  = np.ascontiguousarray(mat_flat, dtype=np.int32)
         gid_v  = np.ascontiguousarray(gid_flat, dtype=np.int32)
         # Build verts8: [x, y, z, nx, ny, nz, u, v]
@@ -9628,71 +9635,66 @@ def run(
         return True
 
     def draw_uv_mesh(gain: float, t_now: float) -> None:
-        if not _ensure_mesh_vbo():
-            return
+        # ── UV-splat section: only runs when UV page bank is active ──────────
         bank = bench.uv_page_bank
-        if bank is None:
-            return
+        if bank is not None and _ensure_mesh_vbo():
+            # Lazily discover the shared GPU texture ID from the C++ blit shader.
+            if _uv_shared_tex_id[0] == 0:
+                try:
+                    tid = bench.tracer.get_uv_pages_tex_id()
+                    if tid:
+                        _uv_shared_tex_id[0] = int(tid)
+                        _gl_renderer.set_emit_uv_texture_id(int(tid))
+                        print(f"[gl-share] GPU-direct UV tex id={tid} active", flush=True)
+                except Exception:
+                    pass
 
-        # Lazily build the BaseGLRenderer VAO from the UV page bank geometry.
+            if _uv_shared_tex_id[0]:
+                active_tex = _uv_shared_tex_id[0]
+            else:
+                if t_now - _uv_last_update_s[0] >= 0.05:
+                    pages = bank.update_from_tracer(bench.tracer, bench.freq_hz, mode=_uv_mode[0])
+                    glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
+                    glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0,
+                                    int(pages.shape[2]), int(pages.shape[1]), int(pages.shape[0]),
+                                    GL_RGBA, GL_FLOAT, np.ascontiguousarray(pages, dtype=np.float32))
+                    _uv_last_update_s[0] = float(t_now)
+                active_tex = tex_uv_pages
+            glEnable(GL_DEPTH_TEST)
+            glDepthMask(True)
+            glUseProgram(mesh_prog)
+            glUniform1f(glGetUniformLocation(mesh_prog, "u_time"), float(t_now))
+            glUniform1f(glGetUniformLocation(mesh_prog, "u_mode"), 0.0)
+            glUniform1f(glGetUniformLocation(mesh_prog, "u_gain"), float(gain))
+            glActiveTexture(GL_TEXTURE0)
+            glBindTexture(GL_TEXTURE_2D_ARRAY, active_tex)
+            glUniform1i(glGetUniformLocation(mesh_prog, "u_uv_pages"), 0)
+            glEnable(GL_BLEND)
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+            vbos = _mesh_vbo[0]
+            glBindBuffer(GL_ARRAY_BUFFER, vbos[0])
+            glEnableVertexAttribArray(_mesh_loc_pos)
+            glVertexAttribPointer(_mesh_loc_pos, 3, GL_FLOAT, GL_FALSE, 0, None)
+            glBindBuffer(GL_ARRAY_BUFFER, vbos[1])
+            glEnableVertexAttribArray(_mesh_loc_uv)
+            glVertexAttribPointer(_mesh_loc_uv,  2, GL_FLOAT, GL_FALSE, 0, None)
+            glBindBuffer(GL_ARRAY_BUFFER, vbos[2])
+            glEnableVertexAttribArray(_mesh_loc_layer)
+            glVertexAttribPointer(_mesh_loc_layer, 1, GL_FLOAT, GL_FALSE, 0, None)
+            glBindBuffer(GL_ARRAY_BUFFER, 0)
+            glDrawArrays(GL_TRIANGLES, 0, _mesh_n_verts[0])
+            glDisableVertexAttribArray(_mesh_loc_pos)
+            glDisableVertexAttribArray(_mesh_loc_uv)
+            glDisableVertexAttribArray(_mesh_loc_layer)
+            glDisable(GL_BLEND)
+            glDepthMask(False)
+            glDisable(GL_DEPTH_TEST)
+            glUseProgram(0)
+
+        # ── BaseGLRenderer / phong section: always runs ───────────────────────
+        # Lazily build the scene VAO the first time (does not require UV bank).
         if _scene_vao[0] is None:
             _build_scene_vao()
-
-        # Lazily discover the shared GPU texture ID from the C++ blit shader.
-        if _uv_shared_tex_id[0] == 0:
-            try:
-                tid = bench.tracer.get_uv_pages_tex_id()
-                if tid:
-                    _uv_shared_tex_id[0] = int(tid)
-                    _gl_renderer.set_emit_uv_texture_id(int(tid))
-                    print(f"[gl-share] GPU-direct UV tex id={tid} active", flush=True)
-            except Exception:
-                pass
-
-        if _uv_shared_tex_id[0]:
-            # GPU-direct path: C++ blit shader already wrote RGBA16F into the
-            # shared texture.  No CPU round-trip needed; just bind and draw.
-            active_tex = _uv_shared_tex_id[0]
-        else:
-            # CPU fallback path: readback → NumPy → glTexSubImage3D.
-            if t_now - _uv_last_update_s[0] >= 0.05:
-                pages = bank.update_from_tracer(bench.tracer, bench.freq_hz, mode=_uv_mode[0])
-                glBindTexture(GL_TEXTURE_2D_ARRAY, tex_uv_pages)
-                glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 0,
-                                int(pages.shape[2]), int(pages.shape[1]), int(pages.shape[0]),
-                                GL_RGBA, GL_FLOAT, np.ascontiguousarray(pages, dtype=np.float32))
-                _uv_last_update_s[0] = float(t_now)
-            active_tex = tex_uv_pages
-        glEnable(GL_DEPTH_TEST)
-        glDepthMask(True)
-        glUseProgram(mesh_prog)
-        glUniform1f(glGetUniformLocation(mesh_prog, "u_time"), float(t_now))
-        glUniform1f(glGetUniformLocation(mesh_prog, "u_mode"), 0.0)
-        glUniform1f(glGetUniformLocation(mesh_prog, "u_gain"), float(gain))
-        glActiveTexture(GL_TEXTURE0)
-        glBindTexture(GL_TEXTURE_2D_ARRAY, active_tex)
-        glUniform1i(glGetUniformLocation(mesh_prog, "u_uv_pages"), 0)
-        glEnable(GL_BLEND)
-        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
-        vbos = _mesh_vbo[0]
-        glBindBuffer(GL_ARRAY_BUFFER, vbos[0])
-        glEnableVertexAttribArray(_mesh_loc_pos)
-        glVertexAttribPointer(_mesh_loc_pos, 3, GL_FLOAT, GL_FALSE, 0, None)
-        glBindBuffer(GL_ARRAY_BUFFER, vbos[1])
-        glEnableVertexAttribArray(_mesh_loc_uv)
-        glVertexAttribPointer(_mesh_loc_uv,  2, GL_FLOAT, GL_FALSE, 0, None)
-        glBindBuffer(GL_ARRAY_BUFFER, vbos[2])
-        glEnableVertexAttribArray(_mesh_loc_layer)
-        glVertexAttribPointer(_mesh_loc_layer, 1, GL_FLOAT, GL_FALSE, 0, None)
-        glBindBuffer(GL_ARRAY_BUFFER, 0)
-        glDrawArrays(GL_TRIANGLES, 0, _mesh_n_verts[0])
-        glDisableVertexAttribArray(_mesh_loc_pos)
-        glDisableVertexAttribArray(_mesh_loc_uv)
-        glDisableVertexAttribArray(_mesh_loc_layer)
-        glDisable(GL_BLEND)
-        glDepthMask(False)
-        glDisable(GL_DEPTH_TEST)
-        glUseProgram(0)
 
         # Drive BaseGLRenderer: fly-camera perspective when fly_mode is active,
         # otherwise use a fixed orthographic X/Y view.
@@ -10104,6 +10106,7 @@ def run(
             view_w=view_w,
             sidecar=sidecar,
             field_capture=field_capture,
+            enable_uv_splat=enable_uv_splat,
         )
         _wire_rebuilt_bench(bench)
         bench.begin_scene_camera_step()
@@ -10153,6 +10156,7 @@ def run(
             view_w=view_w,
             sidecar=sidecar,
             field_capture=field_capture,
+            enable_uv_splat=enable_uv_splat,
         )
         _wire_rebuilt_bench(bench)
         # Derive and print the new f-number from EFL and entrance pupil radius
@@ -10334,7 +10338,7 @@ def run(
 
             _display_frame += 1
             _display_now = time.perf_counter()
-            if (_display_records_interval_s <= 0.0 or
+            if bench.field_capture and (_display_records_interval_s <= 0.0 or
                     (_display_now - _display_records_last_t) >= _display_records_interval_s):
                 _display_records_last_t = _display_now
                 try:
@@ -10688,9 +10692,14 @@ if __name__ == "__main__":
         help="Print rolling Python frame timings and pipeline readback counters",
     )
     _ap.add_argument(
-        "--no-field",
+        "--field",
         action="store_true",
-        help="Disable volumetric field capture (saves ~128×64×64 complex grid memory per frame)",
+        help="Enable volumetric field capture and ray-march display (128×64×64 grid; off by default)",
+    )
+    _ap.add_argument(
+        "--uv-splat",
+        action="store_true",
+        help="Enable UV page bank and ray-splatted surface illumination (off by default)",
     )
     _ap.add_argument(
         "--bake-noodles",
@@ -10790,7 +10799,8 @@ if __name__ == "__main__":
         emitter_amp_gain=_args.emitter_gain,
         compute_mode=_args.compute_mode,
         profile=bool(_args.profile),
-        field_capture=not _args.no_field,
+        field_capture=bool(_args.field),
+        enable_uv_splat=bool(_args.uv_splat),
         bake_noodles=_args.bake_noodles,
         focus_steps=_args.focus_steps,
         focus_range_mm=_args.focus_range_mm,

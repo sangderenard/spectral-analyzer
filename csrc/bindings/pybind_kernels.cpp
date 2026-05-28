@@ -555,11 +555,8 @@ struct PyRayTracer
     float _sensor_target_r     = 0.0f;
     std::atomic<uint32_t> _bdpt_subpath_counter{1u};
 
-    /* T5 strategy config */
-    int   _t5_strategy          = static_cast<int>(T5Strategy::HASH_GRID);
-    float _t5_grid_cell_size    = 0.25f;
-    int   _t5_grid_radius_cells = 1;
-    float _t5_min_geom          = 1e-8f;
+    /* T5 connection config */
+    float _t5_min_geom = 1e-8f;
 
     /* Flash modifier config */
     int   _flash_modifier_type   = static_cast<int>(FlashModifierType::SNOOT);
@@ -590,9 +587,6 @@ struct PyRayTracer
             cfg.shader_dir              = _shader_dir;
             cfg.gl_display_hglrc        = _gl_display_hglrc;
             cfg.gl_display_hdc          = _gl_display_hdc;
-            cfg.t5_strategy             = static_cast<T5Strategy>(_t5_strategy);
-            cfg.t5_grid_cell_size       = _t5_grid_cell_size;
-            cfg.t5_grid_radius_cells    = _t5_grid_radius_cells;
             cfg.t5_min_geom             = _t5_min_geom;
             cfg.flash_modifier_type     = static_cast<FlashModifierType>(_flash_modifier_type);
             cfg.flash_modifier_param0   = _flash_modifier_param0;
@@ -2357,18 +2351,6 @@ struct PyRayTracer
         }
     }
 
-    void set_t5_strategy(int s) {
-        _t5_strategy = s;
-        ray_pipeline_set_t5_strategy(_pipeline, static_cast<T5Strategy>(s));
-    }
-    void set_t5_grid_cell_size(float v) {
-        _t5_grid_cell_size = v;
-        ray_pipeline_set_t5_grid_cell_size(_pipeline, v);
-    }
-    void set_t5_grid_radius_cells(int r) {
-        _t5_grid_radius_cells = r;
-        ray_pipeline_set_t5_grid_radius_cells(_pipeline, r);
-    }
     void set_t5_min_geom(float v) {
         _t5_min_geom = v;
         ray_pipeline_set_t5_min_geom(_pipeline, v);
@@ -5559,27 +5541,11 @@ been submitted.  Mirrors signal_flash_dispatched.)doc")
 R"doc(Block (releasing the GIL) until the T5 worker thread finishes.
 Call after signal_sensor_dispatched + signal_flash_dispatched to guarantee
 sensor_accum ch2 (BDPT radiance) is fully written before get_sensor_image().)doc")
-        .def("set_t5_strategy",
-             &PyRayTracer::set_t5_strategy,
-             py::arg("strategy"),
-R"doc(Select T5 BDPT connection strategy.
-0 = FULL_SEARCH — complete O(N×M×D²) all-pairs reference; never approximated.
-1 = HASH_GRID   — spatial hash of light vertices; default.  Pairs outside
-    the (2×radius_cells+1)³ cube around the camera vertex are not evaluated.)doc")
-        .def("set_t5_grid_cell_size",
-             &PyRayTracer::set_t5_grid_cell_size,
-             py::arg("metres"),
-R"doc(Set HASH_GRID cell size in metres (default 0.25).
-Connection radius ≈ sqrt(3) × cell_size × radius_cells.)doc")
-        .def("set_t5_grid_radius_cells",
-             &PyRayTracer::set_t5_grid_radius_cells,
-             py::arg("r"),
-R"doc(Set HASH_GRID search half-width in cells (default 1 → 3×3×3 cube).)doc")
         .def("set_t5_min_geom",
              &PyRayTracer::set_t5_min_geom,
              py::arg("threshold"),
 R"doc(Set minimum geometry term to evaluate a connection (default 1e-8).
-Replaces the legacy 1e-20 floor in both FULL_SEARCH and HASH_GRID.)doc")
+Replaces the legacy 1e-20 floor.)doc")
         .def("set_flash_modifier",
              &PyRayTracer::set_flash_modifier,
              py::arg("type_int"),

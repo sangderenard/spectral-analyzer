@@ -12,18 +12,19 @@
  *
  * Exposes:
  *   BdptSubpathView       — sorted, deduplicated per-subpath pointer view
- *   LightVertRef          — light vertex reference for the hash-grid path
+ *   LightVertRef          — light vertex back-reference
  *   BdptCandidateScratch  — reusable per-chain MIS scratch storage
  *   T5ThreadAccum         — per-worker pixel + connection accumulator
  *   T5ConnContext         — all per-pass state + connection helper methods
- *   run_t5_allpairs()     — FULL_SEARCH strategy dispatched via ThreadPool
- *   run_t5_hash()         — HASH_GRID  strategy dispatched via ThreadPool
+ *   T5GpuParams           — GPU params block for t5_full_connect.comp.glsl
+ *   run_t5_allpairs()     — full brute-force ThreadPool dispatch (CPU fallback)
  */
 #pragma once
 
-#include "ray_pipeline.h"   /* RayPipelineState, T5Strategy, GlPipelineDispatch */
-#include "t5_hash_grid.h"   /* T5HashGrid, T5_LGV_STRIDE, T5_CGV_STRIDE, … */
+#include "ray_pipeline.h"   /* RayPipelineState, GlPipelineDispatch */
 #include "thread_pool.h"    /* ThreadPool */
+
+/* T5_LGV_STRIDE, T5_CGV_STRIDE, T5GpuParams — defined in ray_pipeline.h */
 
 #include <Eigen/Dense>
 
@@ -57,8 +58,8 @@ struct BdptSubpathView {
 /* ─────────────────────────────────────────────────────────────────────────
  * LightVertRef
  *
- * Back-reference from a T5HashGrid sorted slot to its logical subpath and
- * vertex index.  Used exclusively on the HASH_GRID path.
+ * Back-reference from a light vert flat-array slot to its logical subpath and
+ * vertex index.
  * ───────────────────────────────────────────────────────────────────────── */
 struct LightVertRef {
     const BdptVertexRecord* rec;
@@ -693,133 +694,3 @@ inline void run_t5_allpairs(
     if (ep) std::rethrow_exception(ep);
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
- * run_t5_hash  —  HASH_GRID: query (2·radius+1)³ cells per camera vertex.
- *
- * Uses the pre-built T5HashGrid for contiguous array scan (replaces the old
- * unordered_multimap chain traversal).  Same chunk/pool pattern as allpairs.
- * ───────────────────────────────────────────────────────────────────────── */
-inline void run_t5_hash(
-    T5ConnContext&                              ctx,
-    const std::vector<const BdptSubpathView*>& cam_items,
-    const std::vector<LightVertRef>&           light_verts_flat,
-    const T5HashGrid&                          hg,
-    int   radius_cells,
-    float inv_cell_size,
-    std::vector<T5ThreadAccum>&                accums,
-    ThreadPool&                                pool)
-{
-    const size_t nw    = accums.size();
-    const size_t n_cam = cam_items.size();
-    if (n_cam == 0 || nw == 0) return;
-
-    ctx.hb_total = n_cam;
-    ctx.hb_done.store(0, std::memory_order_relaxed);
-
-    std::atomic<bool> hb_stop{false};
-    auto hb_fut = std::async(std::launch::async, [&]() {
-        using namespace std::chrono_literals;
-        while (!hb_stop.load(std::memory_order_relaxed)) {
-            std::this_thread::sleep_for(1s);
-            if (hb_stop.load(std::memory_order_relaxed)) break;
-            const size_t done  = ctx.hb_done.load(std::memory_order_relaxed);
-            const size_t total = ctx.hb_total;
-            double   energy = 0.0;
-            uint64_t exact  = 0;
-            for (const auto& a : accums) {
-                if (!a.sensor_r.empty()) {
-                    energy +=
-                        Eigen::Map<const Eigen::ArrayXd>(
-                            a.sensor_r.data(), (Eigen::Index)a.sensor_r.size()).sum()
-                      + Eigen::Map<const Eigen::ArrayXd>(
-                            a.sensor_g.data(), (Eigen::Index)a.sensor_g.size()).sum()
-                      + Eigen::Map<const Eigen::ArrayXd>(
-                            a.sensor_b.data(), (Eigen::Index)a.sensor_b.size()).sum();
-                }
-                exact += a.exact_count;
-            }
-            fprintf(stderr, "[T5-hb] hash %zu/%zu  energy=%.3e  exact=%llu\n",
-                    done, total, energy, (unsigned long long)exact);
-            fflush(stderr);
-        }
-    });
-
-    const size_t chunk = (n_cam + nw - 1) / nw;
-    std::vector<std::future<void>> futs;
-    futs.reserve(nw);
-
-    for (size_t t = 0; t < nw; ++t) {
-        const size_t lo = t * chunk;
-        const size_t hi = std::min(n_cam, lo + chunk);
-        if (lo >= hi) break;
-
-        futs.push_back(pool.enqueue(
-            [&ctx, &cam_items, &light_verts_flat, &hg,
-             radius_cells, inv_cell_size, &accums, t, lo, hi]()
-        {
-            T5ThreadAccum& acc = accums[t];
-            BdptCandidateScratch scratch;
-            const int   r    = ctx.res;
-            const float iw   = ctx.inv_w;
-            const float ih   = ctx.inv_h;
-            const int   rc   = radius_cells;
-            const float ics  = inv_cell_size;
-
-            for (size_t ck = lo; ck < hi; ++ck) {
-                const BdptSubpathView& cam = *cam_items[ck];
-                for (size_t ci = 0; ci < cam.v.size(); ++ci) {
-                    const BdptVertexRecord& c = *cam.v[ci];
-                    if (!ctx.vertex_connectable(c)) continue;
-                    if (!cam.prefix_valid[ci])      continue;
-                    const int iy = static_cast<int>((c.sensor_origin_y + ctx.ps->sensor_half_w) * iw);
-                    const int iz = static_cast<int>((c.sensor_origin_z + ctx.ps->sensor_half_h) * ih);
-                    if (iy < 0 || iy >= r || iz < 0 || iz >= r) continue;
-                    const double beta_cam = ctx.beta_scalar_val(c);
-                    if (beta_cam < 1e-15) continue;
-
-                    const int gx0 = static_cast<int>(std::floor(c.pos[0] * ics));
-                    const int gy0 = static_cast<int>(std::floor(c.pos[1] * ics));
-                    const int gz0 = static_cast<int>(std::floor(c.pos[2] * ics));
-
-                    double pixel_accum = 0.0;
-                    for (int dix = -rc; dix <= rc; ++dix) {
-                        for (int diy = -rc; diy <= rc; ++diy) {
-                            for (int diz = -rc; diz <= rc; ++diz) {
-                                const uint64_t cell_key = T5HashGrid::encode_cell(
-                                    gx0+dix, gy0+diy, gz0+diz);
-                                auto [lo_s, hi_s] = hg.cpu_range(cell_key);
-                                for (size_t s = lo_s; s < hi_s; ++s) {
-                                    const uint32_t orig =
-                                        hg.sorted_kvs[s].second;
-                                    const LightVertRef& lv =
-                                        light_verts_flat[orig];
-                                    ctx.try_connect_pair(
-                                        cam, ci, c, beta_cam,
-                                        *lv.sp, lv.li,
-                                        scratch, acc, pixel_accum);
-                                }
-                            }
-                        }
-                    }
-
-                    if (pixel_accum > 0.0) {
-                        ctx.accum_pixel_color(c, pixel_accum, acc,
-                                               static_cast<size_t>(iy * r + iz));
-                        ++acc.exact_count;
-                    }
-                }
-                ++ctx.hb_done;
-            }
-            ctx.flush_connections(acc);
-        }));
-    }
-
-    std::exception_ptr ep = nullptr;
-    for (auto& f : futs) {
-        try { f.get(); }
-        catch (...) { if (!ep) ep = std::current_exception(); }
-    }
-    hb_stop.store(true, std::memory_order_relaxed);
-    hb_fut.get();
-    if (ep) std::rethrow_exception(ep);
-}

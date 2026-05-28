@@ -54,7 +54,7 @@
 #include "thread_pool.h"
 #include "optical_handlers.h"
 #include "bdpt_record.h"
-#include "t5_hash_grid.h"
+/* t5_hash_grid.h removed — full brute-force GPU path; no hash needed */
 
 #include <mutex>
 #include <thread>
@@ -7599,17 +7599,15 @@ public:
 
     /* Shader programs for each stage */
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
-    /* T5 BDPT connection pass (t5_hash_connect.comp.glsl) — non-fatal if absent */
+    /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
     GLuint prog_t5 = 0;
 
     /* T5 persistent SSBOs — allocated on first use, grown as needed */
     GLuint ssbo_t5_light  = 0;  /* binding 0: T5LightVertBuf  (float)  */
-    GLuint ssbo_t5_hash   = 0;  /* binding 1: T5HashBuf       (uint)   */
-    GLuint ssbo_t5_cam    = 0;  /* binding 2: T5CamVertBuf    (float)  */
-    GLuint ssbo_t5_pix    = 0;  /* binding 3: T5PixelBuf      (uint)   */
-    GLuint ssbo_t5_params = 0;  /* binding 4: T5ParamsBuf     (48 B)   */
+    GLuint ssbo_t5_cam    = 0;  /* binding 1: T5CamVertBuf    (float)  */
+    GLuint ssbo_t5_pix    = 0;  /* binding 2: T5PixelBuf      (uint)   */
+    GLuint ssbo_t5_params = 0;  /* binding 3: T5ParamsBuf     (32 B)   */
     int    cap_t5_light   = 0;  /* floats */
-    int    cap_t5_hash    = 0;  /* uint32 */
     int    cap_t5_cam     = 0;  /* floats */
     int    cap_t5_pix     = 0;  /* uint32 */
 
@@ -7617,8 +7615,11 @@ public:
      * The BDPT connection thread submits a job and blocks on the future;  *
      * the GPU thread services it between T1/T2/T3 batches.               */
     struct T5Job {
-        const T5HashGrid*                   hg;       /* owned by caller — stays alive while waiting */
-        std::promise<std::vector<uint32_t>> promise;  /* fulfilled with pixel accum uint32 bits */
+        std::vector<float>    light_verts;   /* flat, T5_LGV_STRIDE each   */
+        std::vector<float>    cam_verts;     /* flat, T5_CGV_STRIDE each   */
+        std::vector<uint32_t> pixel_accum;   /* 3 × res², zeroed           */
+        T5GpuParams           params;
+        std::promise<std::vector<uint32_t>> promise;
     };
     std::mutex              t5_job_mu;
     std::condition_variable t5_job_cv;
@@ -7977,11 +7978,11 @@ public:
         if (!load("ray_refine.comp.glsl",             prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
         if (!load("ray_material.comp.glsl",           prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
         if (!load("ray_wave_bpm.comp.glsl",           prog_t4)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
-        /* T5 hash-connect shader — compiled with BVH shadow preamble injected.
+        /* T5 full-connect shader — compiled with BVH shadow preamble injected.
          * BvhBuf→binding 5, TriIdBuf→binding 6, TriFullBuf→binding 7.
          * Non-fatal; GPU T5 path disabled if absent or compilation fails. */
-        if (!load_with_shadow_bvh("t5_hash_connect.comp.glsl", prog_t5, 5, 6, 7)) {
-            fprintf(stderr, "[gpu-dispatch] t5_hash_connect.comp.glsl not loaded (%s) — GPU T5 disabled\n", err);
+        if (!load_with_shadow_bvh("t5_full_connect.comp.glsl", prog_t5, 5, 6, 7)) {
+            fprintf(stderr, "[gpu-dispatch] t5_full_connect.comp.glsl not loaded (%s) — GPU T5 disabled\n", err);
             fflush(stderr);
             prog_t5 = 0;
         }
@@ -9184,9 +9185,8 @@ public:
     }
 
     /* ── service_t5_job: runs on the GPU thread when t5_job_ready is set ── *
-     * Uploads the five T5 SSBOs (bindings 0-4), dispatches                 *
-     * t5_hash_connect.comp.glsl, barriers, reads back the pixel accum      *
-     * buffer and fulfills the caller's promise so it can unblock.          */
+     * Uploads T5 SSBOs (bindings 0-3), dispatches t5_full_connect.comp.glsl,*
+     * barriers, reads back the pixel accum buffer, fulfills the promise.    */
     void service_t5_job() {
         std::unique_ptr<T5Job> job;
         {
@@ -9194,28 +9194,21 @@ public:
             job = std::move(t5_job_pending);
             t5_job_ready.store(false, std::memory_order_release);
         }
-        if (!job || !job->hg) return;
-        const T5HashGrid& hg = *job->hg;
+        if (!job) return;
 
-        const auto& lv  = hg.gpu_light_verts;  /* float, T5_LGV_STRIDE each */
-        const auto& ht  = hg.gpu_hash_table;   /* uint32, T5_HASH_SLOT each  */
-        const auto& cv  = hg.gpu_cam_verts;    /* float, T5_CGV_STRIDE each  */
-        const auto& pix = hg.gpu_pixel_accum;  /* uint32, zeroed by caller   */
-        const auto& par = hg.gpu_params;       /* T5GpuParams, 48 bytes      */
+        const auto& lv  = job->light_verts;
+        const auto& cv  = job->cam_verts;
+        const auto& pix = job->pixel_accum;
+        T5GpuParams par = job->params;  /* mutable copy — light_offset updated per batch */
 
         const int nlv = (int)lv.size();
-        const int nht = (int)ht.size();
         const int ncv = (int)cv.size();
         const int npi = (int)pix.size();
 
-        /* ── Ensure / allocate SSBOs ─────────────────────────────────── */
+        /* ── Ensure / grow SSBOs ──────────────────────────────────────── */
         if (nlv > cap_t5_light) {
             cap_t5_light = nlv * 2;
             ensure_ssbo(ssbo_t5_light, (GLsizeiptr)(cap_t5_light * sizeof(float)));
-        }
-        if (nht > cap_t5_hash) {
-            cap_t5_hash = nht * 2;
-            ensure_ssbo(ssbo_t5_hash, (GLsizeiptr)(cap_t5_hash * sizeof(uint32_t)));
         }
         if (ncv > cap_t5_cam) {
             cap_t5_cam = ncv * 2;
@@ -9229,42 +9222,57 @@ public:
             ensure_ssbo(ssbo_t5_params, sizeof(T5GpuParams));
         }
 
-        /* ── Upload data ─────────────────────────────────────────────── */
+        /* ── Upload data ──────────────────────────────────────────────── */
         auto upload = [&](GLuint ssbo, const void* data, GLsizeiptr bytes) {
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, data);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         };
         if (nlv) upload(ssbo_t5_light,  lv.data(),  (GLsizeiptr)(nlv * sizeof(float)));
-        if (nht) upload(ssbo_t5_hash,   ht.data(),  (GLsizeiptr)(nht * sizeof(uint32_t)));
         if (ncv) upload(ssbo_t5_cam,    cv.data(),  (GLsizeiptr)(ncv * sizeof(float)));
-               upload(ssbo_t5_pix,    pix.data(), (GLsizeiptr)(npi * sizeof(uint32_t)));
-               upload(ssbo_t5_params, &par,        sizeof(T5GpuParams));
+                 upload(ssbo_t5_pix,    pix.data(), (GLsizeiptr)(npi * sizeof(uint32_t)));
+                 upload(ssbo_t5_params, &par,        sizeof(T5GpuParams));
 
-        /* ── Dispatch ────────────────────────────────────────────────── */
-        const uint32_t n_cam = par.n_cam_verts;
+        /* ── Batched dispatch: loop through light verts in fixed-size chunks ─ *
+         * Each dispatch covers [light_offset, light_offset+light_batch_size). *
+         * Pixel accum stays in VRAM between batches — only params re-uploaded.*
+         * Batch size keeps each dispatch well under the Windows 2-second TDR. */
+        static constexpr uint32_t T5_LIGHT_BATCH = 4096;
+        const uint32_t n_cam      = par.n_cam_verts;
+        const uint32_t n_light    = par.n_light_verts;
+        const GLuint   wg_x       = (GLuint)((n_cam + 63u) / 64u);
+        const uint32_t n_batches  = (n_light + T5_LIGHT_BATCH - 1u) / T5_LIGHT_BATCH;
+
         glc_UseProgram(prog_t5);
         bind_ssbo(ssbo_t5_light,  0);
-        bind_ssbo(ssbo_t5_hash,   1);
-        bind_ssbo(ssbo_t5_cam,    2);
-        bind_ssbo(ssbo_t5_pix,    3);
-        bind_ssbo(ssbo_t5_params, 4);
-        /* BVH shadow buffers — same GPU data used by T1, rebound at T5 slots */
-        bind_ssbo(ssbo_bvh,      5);
-        bind_ssbo(ssbo_tri_id,   6);
-        bind_ssbo(ssbo_tri_full, 7);
-        glc_DispatchCompute((GLuint)((n_cam + 63u) / 64u), 1u, 1u);
-        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        bind_ssbo(ssbo_t5_cam,    1);
+        bind_ssbo(ssbo_t5_pix,    2);
+        bind_ssbo(ssbo_t5_params, 3);
+        bind_ssbo(ssbo_bvh,       5);
+        bind_ssbo(ssbo_tri_id,    6);
+        bind_ssbo(ssbo_tri_full,  7);
 
-        /* ── Readback pixel accum via GetBufferSubData ──────────────── */
+        fprintf(stderr, "[T5-gpu] starting: n_cam=%u n_light=%u batches=%u res=%d\n",
+                n_cam, n_light, n_batches, par.sensor_res);
+        fflush(stderr);
+
+        for (uint32_t b = 0; b < n_batches; ++b) {
+            par.light_offset     = b * T5_LIGHT_BATCH;
+            par.light_batch_size = std::min(T5_LIGHT_BATCH, n_light - par.light_offset);
+            /* Re-upload only the params block (40 bytes) — all other SSBOs stay */
+            upload(ssbo_t5_params, &par, sizeof(T5GpuParams));
+            glc_DispatchCompute(wg_x, 1u, 1u);
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        }
+
+        /* ── Single readback after all batches ───────────────────────────── */
         std::vector<uint32_t> result(static_cast<size_t>(npi));
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
         glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
                              (GLsizeiptr)(npi * sizeof(uint32_t)), result.data());
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-        fprintf(stderr, "[T5-gpu] dispatch done: n_cam=%u n_light=%u pix=%u\n",
-                n_cam, par.n_light_verts, (unsigned)npi);
+        fprintf(stderr, "[T5-gpu] done: %u batches  pix=%u\n", n_batches, (unsigned)npi);
         fflush(stderr);
 
         job->promise.set_value(std::move(result));
@@ -9273,18 +9281,26 @@ public:
     /* ── submit_t5_connect: called from BDPT connection thread ─────────── *
      * Enqueues a T5 GPU job, blocks until the GPU thread fulfills it, and  *
      * returns the pixel accum buffer (3×res² uint32 bit-cast from float).  */
-    std::vector<uint32_t> submit_t5_connect(const T5HashGrid& hg) {
+    std::vector<uint32_t> submit_t5_connect(
+        std::vector<float>    light_verts,
+        std::vector<float>    cam_verts,
+        std::vector<uint32_t> pixel_accum,
+        T5GpuParams           params)
+    {
         if (!prog_t5) return {};
         auto job = std::make_unique<T5Job>();
-        job->hg = &hg;
+        job->light_verts  = std::move(light_verts);
+        job->cam_verts    = std::move(cam_verts);
+        job->pixel_accum  = std::move(pixel_accum);
+        job->params       = params;
         std::future<std::vector<uint32_t>> fut = job->promise.get_future();
         {
             std::lock_guard<std::mutex> lk(t5_job_mu);
             t5_job_pending = std::move(job);
             t5_job_ready.store(true, std::memory_order_release);
         }
-        t5_job_cv.notify_one(); /* wake GPU thread if it were waiting (belt+suspenders) */
-        return fut.get(); /* blocks until service_t5_job fulfills the promise */
+        t5_job_cv.notify_one();
+        return fut.get();
     }
 };
 
@@ -11096,7 +11112,7 @@ void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
 }
 
 /* t5_connection.h provides T5ConnContext, BdptSubpathView, LightVertRef,
- * BdptCandidateScratch, T5ThreadAccum, run_t5_allpairs(), run_t5_hash().
+ * BdptCandidateScratch, T5ThreadAccum, T5GpuParams, run_t5_allpairs().
  * Must be included here (after RayTracerState, BVHNode, etc. are defined). */
 #include "t5_connection.h"
 
@@ -11316,56 +11332,44 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     ThreadPool t5_pool(nw);
 
-    /* ── HASH_GRID: build modular T5HashGrid ────────────────────────────── */
-    const float cs  = (ps->cfg.t5_grid_cell_size > 0.0f)
-                      ? ps->cfg.t5_grid_cell_size : 0.25f;
-    const float ics = 1.0f / cs;
-    const int   rc  = std::max(1, ps->cfg.t5_grid_radius_cells);
-
+    /* ── Collect and pack connectable light verts (flat, unsorted) ─────── */
     std::vector<LightVertRef> light_verts_flat;
-    T5HashGrid t5_hg;
-
-    if (ps->cfg.t5_strategy == T5Strategy::HASH_GRID) {
-        for (const auto* lsp : light_items) {
-            for (uint32_t li = 0; li < static_cast<uint32_t>(lsp->v.size()); ++li) {
-                const BdptVertexRecord* lv = lsp->v[li];
-                if (!ctx.vertex_connectable(*lv)) continue;
-                if (!lsp->prefix_valid[li]) continue;
-                if (lv->throughput_scalar < 1e-15f) continue;
-                light_verts_flat.push_back({lv, lsp, li});
-            }
+    for (const auto* lsp : light_items) {
+        for (uint32_t li = 0; li < static_cast<uint32_t>(lsp->v.size()); ++li) {
+            const BdptVertexRecord* lv = lsp->v[li];
+            if (!ctx.vertex_connectable(*lv)) continue;
+            if (!lsp->prefix_valid[li]) continue;
+            if (lv->throughput_scalar < 1e-15f) continue;
+            light_verts_flat.push_back({lv, lsp, li});
         }
+    }
+    const uint32_t n_lv = static_cast<uint32_t>(light_verts_flat.size());
 
-        const uint32_t n_lv = static_cast<uint32_t>(light_verts_flat.size());
-        std::vector<float> light_packed(static_cast<size_t>(n_lv) * T5_LGV_STRIDE, 0.0f);
-        for (uint32_t i = 0; i < n_lv; ++i) {
-            const BdptVertexRecord& lr = *light_verts_flat[i].rec;
-            float* p = light_packed.data() + static_cast<size_t>(i) * T5_LGV_STRIDE;
-            p[0]  = lr.pos[0];    p[1]  = lr.pos[1];    p[2]  = lr.pos[2];
-            p[3]  = lr.normal[0]; p[4]  = lr.normal[1]; p[5]  = lr.normal[2];
-            p[6]  = lr.throughput_scalar;
-            std::memcpy(&p[7], &lr.flags,         sizeof(uint32_t));
-            std::memcpy(&p[8], &lr.subpath_id,    sizeof(uint32_t));
-            const uint32_t vinfo = (uint32_t)lr.vertex_index | ((uint32_t)lr.stream << 16);
-            std::memcpy(&p[9], &vinfo,             sizeof(uint32_t));
-            p[10] = static_cast<float>(ctx.beta_scalar_val(lr));
-            p[11] = 0.0f;
-        }
-        t5_hg.build_light(light_packed.data(), n_lv, cs);
+    std::vector<float> light_packed(static_cast<size_t>(n_lv) * T5_LGV_STRIDE, 0.0f);
+    for (uint32_t i = 0; i < n_lv; ++i) {
+        const BdptVertexRecord& lr = *light_verts_flat[i].rec;
+        float* p = light_packed.data() + static_cast<size_t>(i) * T5_LGV_STRIDE;
+        p[0]  = lr.pos[0];    p[1]  = lr.pos[1];    p[2]  = lr.pos[2];
+        p[3]  = lr.normal[0]; p[4]  = lr.normal[1]; p[5]  = lr.normal[2];
+        p[6]  = lr.throughput_scalar;
+        std::memcpy(&p[7], &lr.flags,      sizeof(uint32_t));
+        std::memcpy(&p[8], &lr.subpath_id, sizeof(uint32_t));
+        const uint32_t vinfo = (uint32_t)lr.vertex_index | ((uint32_t)lr.stream << 16);
+        std::memcpy(&p[9], &vinfo,          sizeof(uint32_t));
+        p[10] = static_cast<float>(ctx.beta_scalar_val(lr));
+        p[11] = 0.0f;
     }
 
-    /* ── Dispatch: GPU or CPU strategy ─────────────────────────────────── */
-    const bool use_hash  = (ps->cfg.t5_strategy == T5Strategy::HASH_GRID);
-    const bool gpu_t5_ok = use_hash
-                        && ps->gpu_dispatch != nullptr
+    /* ── GPU path: full brute-force dispatch ────────────────────────────── */
+    const bool gpu_t5_ok = ps->gpu_dispatch != nullptr
                         && ps->gpu_dispatch->prog_t5 != 0
-                        && !cam_items.empty()
-                        && !light_verts_flat.empty();
+                        && n_lv > 0
+                        && !cam_items.empty();
 
     std::vector<uint32_t> gpu_pixel_result;
 
     if (gpu_t5_ok) {
-        /* ── GPU T5 path: pack camera verts, set params, submit ─────── */
+        /* Count and pack camera verts */
         uint32_t n_cv = 0;
         for (const auto* csp : cam_items)
             for (size_t ci = 0; ci < csp->v.size(); ++ci)
@@ -11396,32 +11400,29 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             }
         }
 
-        t5_hg.set_cam_verts(cam_packed.data(), ci_flat);
-        t5_hg.init_pixel_accum(res);
-        t5_hg.gpu_params.cell_size       = cs;
-        t5_hg.gpu_params.inv_cell_size   = ics;
-        t5_hg.gpu_params.min_geom        = (ps->cfg.t5_min_geom > 0.0f)
-                                           ? ps->cfg.t5_min_geom : 1e-8f;
-        t5_hg.gpu_params.sensor_half_w   = ps->sensor_half_w;
-        t5_hg.gpu_params.sensor_half_h   = ps->sensor_half_h;
-        t5_hg.gpu_params.n_light_verts   = t5_hg.n_light_verts();
-        t5_hg.gpu_params.n_cam_verts     = ci_flat;
-        t5_hg.gpu_params.radius_cells    = rc;
-        t5_hg.gpu_params.sensor_res      = res;
+        const uint32_t npix = static_cast<uint32_t>(res) * static_cast<uint32_t>(res);
+        std::vector<uint32_t> pixel_accum(3u * npix, 0u);
+
+        T5GpuParams par{};
+        par.min_geom      = (ps->cfg.t5_min_geom > 0.0f) ? ps->cfg.t5_min_geom : 1e-8f;
+        par.sensor_half_w = ps->sensor_half_w;
+        par.sensor_half_h = ps->sensor_half_h;
+        par.n_light_verts = n_lv;
+        par.n_cam_verts   = ci_flat;
+        par.sensor_res    = res;
 
         fprintf(stderr, "[T5-gpu] submitting: n_cam=%u n_light=%u res=%d\n",
-                ci_flat, t5_hg.n_light_verts(), res);
+                ci_flat, n_lv, res);
         fflush(stderr);
 
-        gpu_pixel_result = ps->gpu_dispatch->submit_t5_connect(t5_hg);
-
+        gpu_pixel_result = ps->gpu_dispatch->submit_t5_connect(
+            std::move(light_packed),
+            std::move(cam_packed),
+            std::move(pixel_accum),
+            par);
     } else {
-        /* ── CPU strategy dispatch (ThreadPool-based) ───────────────── */
-        if (use_hash)
-            run_t5_hash(ctx, cam_items, light_verts_flat, t5_hg,
-                        rc, ics, accums, t5_pool);
-        else
-            run_t5_allpairs(ctx, cam_items, light_items, accums, t5_pool);
+        /* CPU fallback: full brute-force via ThreadPool */
+        run_t5_allpairs(ctx, cam_items, light_items, accums, t5_pool);
     }
 
     uint64_t exact_total = 0;
@@ -11619,18 +11620,6 @@ static void band_to_display_rgb(int b, int n_bands,
     wr *= edge; wg *= edge; wb *= edge;
 }
 
-void ray_pipeline_set_t5_strategy(RayPipelineState* ps, T5Strategy s)
-{
-    if (ps) ps->cfg.t5_strategy = s;
-}
-void ray_pipeline_set_t5_grid_cell_size(RayPipelineState* ps, float v)
-{
-    if (ps) ps->cfg.t5_grid_cell_size = v;
-}
-void ray_pipeline_set_t5_grid_radius_cells(RayPipelineState* ps, int r)
-{
-    if (ps) ps->cfg.t5_grid_radius_cells = r;
-}
 void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v)
 {
     if (ps) ps->cfg.t5_min_geom = v;

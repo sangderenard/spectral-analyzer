@@ -535,11 +535,25 @@ struct WaveArena {
     std::mutex         mu;
 };
 
-/* ── T5 BDPT connection strategy ─────────────────────────────────────────── */
-enum class T5Strategy : int {
-    FULL_SEARCH = 0,  /* complete O(N×M×D²) all-pairs reference; never approximated */
-    HASH_GRID   = 1,  /* spatial hash of light vertices; default                     */
+/* ── T5 GPU connection pass types ────────────────────────────────────────── */
+static constexpr int T5_LGV_STRIDE = 12;  /* light vertex, floats (must match shader) */
+static constexpr int T5_CGV_STRIDE = 14;  /* camera vertex, floats (must match shader) */
+
+/* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl.
+ * std430 layout, 32 bytes. */
+struct T5GpuParams {
+    float    min_geom;         /* geometry-term floor                   */
+    float    sensor_half_w;    /* sensor half-width  (Y axis, metres)   */
+    float    sensor_half_h;    /* sensor half-height (Z axis, metres)   */
+    float    _pad0;
+    uint32_t n_light_verts;    /* total light vertices                  */
+    uint32_t n_cam_verts;
+    int32_t  sensor_res;       /* pixel grid side (res×res image)       */
+    uint32_t light_batch_size; /* light verts per dispatch (TDR guard)  */
+    uint32_t light_offset;     /* first light vert index in this batch  */
+    uint32_t _pad1;
 };
+static_assert(sizeof(T5GpuParams) == 40, "T5GpuParams layout mismatch");
 
 /* ── Flash light modifier ─────────────────────────────────────────────────
  * Applied per-ray inside submit_emissive_triangles.  All modes use the same
@@ -595,18 +609,11 @@ struct RayPipelineConfig {
     int    bdpt_max_optical  = 1000000;  /* BdptOpticalEventRecord cap */
     int    bdpt_max_connections = 2000000; /* BdptConnectionRecord cap */
 
-    /* ── T5 connection strategy ──────────────────────────────────────────
-     * FULL_SEARCH: complete all-pairs reference; no approximation.
-     * HASH_GRID (default): spatial hash of connectable light vertices.
-     *   t5_grid_cell_size: cell side length in metres.  The worker queries
-     *   a (2×t5_grid_radius_cells+1)³ cube, so the hard connection radius
-     *   is sqrt(3)×cell_size×radius_cells.  Pairs outside this cube are
-     *   never evaluated.  t5_min_geom replaces the legacy 1e-20 floor with
-     *   a tighter value that skips near-grazing and very distant pairs. */
-    T5Strategy t5_strategy          = T5Strategy::HASH_GRID;
-    float      t5_grid_cell_size    = 0.25f;  /* metres */
-    int        t5_grid_radius_cells = 1;       /* 1 → 3×3×3 cube search */
-    float      t5_min_geom          = 1e-8f;  /* geometry-term floor    */
+    /* ── T5 connection ───────────────────────────────────────────────────
+     * GPU path: t5_full_connect.comp.glsl — O(N_cam × N_light) brute force.
+     * CPU fallback: run_t5_allpairs() via ThreadPool.
+     * t5_min_geom: geometry-term floor; pairs below this are skipped. */
+    float      t5_min_geom = 1e-8f;
 
     /* ── Flash modifier ─────────────────────────────────────────────────── */
     FlashModifierType flash_modifier_type   = FlashModifierType::SNOOT;
@@ -758,9 +765,6 @@ void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps);
 void ray_pipeline_join_t5(RayPipelineState* ps);
 
 /* Live-update T5 connection-pass configuration. */
-void ray_pipeline_set_t5_strategy(RayPipelineState* ps, T5Strategy s);
-void ray_pipeline_set_t5_grid_cell_size(RayPipelineState* ps, float v);
-void ray_pipeline_set_t5_grid_radius_cells(RayPipelineState* ps, int r);
 void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
 
 /* Live-update the flash light modifier applied in submit_emissive_triangles. */

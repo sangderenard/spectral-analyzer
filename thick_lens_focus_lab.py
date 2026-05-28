@@ -8904,7 +8904,7 @@ def run(
         # the scene; there is no manual light setup.
         _gl_renderer.derive_emissive_area_lights(verts8, mat_v, gid_v, min_emitter_group_id=-999)
         print(f"[gl-renderer] scene VAO built: {n_tris*3} verts, "
-              f"{len(bank.groups)} UV groups", flush=True)
+              f"{len(bank.groups) if bank is not None else 0} UV groups", flush=True)
 
     # PIP viewports: C++ BDPT image + forward strike image.
     _pip_dim = int(min(W * 0.22, H * 0.22))
@@ -9731,6 +9731,11 @@ def run(
             _gl_renderer.draw_mesh(vao_id, n_verts, mvp_col, mv_col)
             glDepthMask(False)
             glDisable(GL_DEPTH_TEST)
+            # Restore full viewport and clean texture unit after phong render
+            # so that draw_pip() / draw_acceptance_cones() get a known-good state.
+            glViewport(0, 0, W, H)
+            glActiveTexture(GL_TEXTURE0)
+            glUseProgram(0)
 
     # ── Clip plane helpers ───────────────────────────────────────── #
     r         = float(scene.view_radius)

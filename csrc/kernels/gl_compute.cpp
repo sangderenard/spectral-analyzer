@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 /* ── Global function pointer storage ────────────────────────────────────── */
 
@@ -357,6 +358,67 @@ GLuint gl_compute_build_program(const char* glsl_source, char* err_out, int err_
     return prog;
 }
 
+/* Two-source variant: splits main_source at the end of its #version line,
+ * then passes [version_line, preamble, rest_of_shader] as three source strings
+ * so the driver sees one compilation unit with preamble declarations available
+ * throughout the main shader body.  If preamble is nullptr, falls back to the
+ * single-source path. */
+GLuint gl_compute_build_program2(const char* main_source, const char* preamble,
+                                  char* err_out, int err_sz) {
+    if (!preamble || preamble[0] == '\0')
+        return gl_compute_build_program(main_source, err_out, err_sz);
+
+    /* Find end of first line (the #version directive). */
+    const char* nl = main_source;
+    while (*nl && *nl != '\n') ++nl;
+    if (*nl == '\n') ++nl;  /* include the newline in the version string */
+
+    /* version_part = everything up to and including the first newline.
+     * rest_part    = everything after it. */
+    std::string version_part(main_source, static_cast<size_t>(nl - main_source));
+    const char* rest_part = nl;
+
+    GLuint shader = glc_CreateShader(GL_COMPUTE_SHADER);
+    if (!shader) {
+        if (err_out) snprintf(err_out, err_sz, "glCreateShader failed");
+        return 0;
+    }
+
+    const GLchar* srcs[3] = {
+        version_part.c_str(),
+        preamble,
+        rest_part
+    };
+    glc_ShaderSource(shader, 3, srcs, nullptr);
+    glc_CompileShader(shader);
+
+    GLint status = 0;
+    glc_GetShaderiv(shader, GL_COMPILE_STATUS, &status);
+    if (!status) {
+        if (err_out) glc_GetShaderInfoLog(shader, err_sz, nullptr, err_out);
+        glc_DeleteShader(shader);
+        return 0;
+    }
+
+    GLuint prog = glc_CreateProgram();
+    if (!prog) {
+        glc_DeleteShader(shader);
+        if (err_out) snprintf(err_out, err_sz, "glCreateProgram failed");
+        return 0;
+    }
+    glc_AttachShader(prog, shader);
+    glc_LinkProgram(prog);
+    glc_DeleteShader(shader);
+
+    glc_GetProgramiv(prog, GL_LINK_STATUS, &status);
+    if (!status) {
+        if (err_out) glc_GetProgramInfoLog(prog, err_sz, nullptr, err_out);
+        glc_DeleteProgram(prog);
+        return 0;
+    }
+    return prog;
+}
+
 #else  /* !_WIN32 — stub implementation for non-Windows platforms */
 
 bool gl_compute_create_context(GlComputeContext* ctx, void* /*hShareContext*/) {
@@ -369,5 +431,6 @@ void gl_compute_release_current(void) {}
 void gl_compute_destroy_context(GlComputeContext*) {}
 bool gl_compute_load_procs(void) { return false; }
 GLuint gl_compute_build_program(const char*, char*, int) { return 0; }
+GLuint gl_compute_build_program2(const char*, const char*, char*, int) { return 0; }
 
 #endif /* _WIN32 */

@@ -547,7 +547,8 @@ struct PyRayTracer
     /* Sensor image parameters — cached so configure_sensor_image() can be
      * called before the pipeline is created (lazy init on first submit_rays). */
     float _sensor_plate_x      = 0.0f;
-    float _sensor_plate_r      = 0.0f;
+    float _sensor_plate_half_w = 0.0f;
+    float _sensor_plate_half_h = 0.0f;
     int   _sensor_res          = 0;
     float _sensor_bdpt_eps     = 0.008f;
     float _sensor_target_x     = 0.0f;
@@ -602,7 +603,7 @@ struct PyRayTracer
             /* Apply sensor image config that may have been set before pipeline existed. */
             if (_sensor_res > 0)
                 ray_pipeline_configure_sensor_image(
-                    _pipeline, _sensor_plate_x, _sensor_plate_r,
+                    _pipeline, _sensor_plate_x, _sensor_plate_half_w, _sensor_plate_half_h,
                     _sensor_res, _sensor_bdpt_eps,
                     _sensor_target_x, _sensor_target_r);
             if (_uv_blit_n_bands > 0)
@@ -1964,19 +1965,22 @@ struct PyRayTracer
      * plate_x, plate_r: world-space sensor plane position and disc radius.
      * res: pixel grid side length (res×res).
      * bdpt_eps: YZ proximity threshold in metres for BDPT snap. */
-    void configure_sensor_image(float plate_x, float plate_r, int res, float bdpt_eps,
+    void configure_sensor_image(float plate_x, float plate_half_w, float plate_half_h,
+                                int res, float bdpt_eps,
                                 float target_x = 0.0f, float target_r = 0.0f) {
         /* Cache params unconditionally — pipeline may not exist yet (it is
          * created lazily on the first submit_rays call).  _get_pipeline will
          * apply these stored values when it constructs the pipeline. */
-        _sensor_plate_x  = plate_x;
-        _sensor_plate_r  = plate_r;
-        _sensor_res      = res;
-        _sensor_bdpt_eps = bdpt_eps;
-        _sensor_target_x = target_x;
-        _sensor_target_r = target_r;
+        _sensor_plate_x      = plate_x;
+        _sensor_plate_half_w = plate_half_w;
+        _sensor_plate_half_h = plate_half_h;
+        _sensor_res          = res;
+        _sensor_bdpt_eps     = bdpt_eps;
+        _sensor_target_x     = target_x;
+        _sensor_target_r     = target_r;
         if (_pipeline)
-            ray_pipeline_configure_sensor_image(_pipeline, plate_x, plate_r, res, bdpt_eps,
+            ray_pipeline_configure_sensor_image(_pipeline, plate_x, plate_half_w, plate_half_h,
+                                                res, bdpt_eps,
                                                 target_x, target_r);
     }
 
@@ -2344,6 +2348,13 @@ struct PyRayTracer
 
     void signal_sensor_dispatched() {
         if (_pipeline) ray_pipeline_signal_sensor_dispatched(_pipeline);
+    }
+
+    void join_t5() {
+        if (_pipeline) {
+            py::gil_scoped_release release;
+            ray_pipeline_join_t5(_pipeline);
+        }
     }
 
     void set_t5_strategy(int s) {
@@ -5417,10 +5428,12 @@ giving diffusion across both depth and breadth.  Can be changed at any time.\n
 Typical values: 0.0 (off), 0.25 (mild), 0.75 (strong).)doc")
         .def("configure_sensor_image",
              &PyRayTracer::configure_sensor_image,
-             py::arg("plate_x"), py::arg("plate_r"), py::arg("res"), py::arg("bdpt_eps"),
+             py::arg("plate_x"), py::arg("plate_half_w"), py::arg("plate_half_h"),
+             py::arg("res"), py::arg("bdpt_eps"),
              py::arg("target_x") = 0.0f, py::arg("target_r") = 0.0f,
 R"doc(Configure sensor-plane image accumulator.
-plate_x: world X of the sensor disc centre; plate_r: disc radius (metres);
+plate_x: world X of the sensor rectangle centre; plate_half_w: half-width (Y axis, metres);
+plate_half_h: half-height (Z axis, metres);
 res: pixel grid side (res×res); bdpt_eps: YZ proximity threshold for BDPT snap.
 target_x/target_r: camera projection target, normally the assembly exit pupil.
 Resets accumulator.  Call before submitting rays.)doc")
@@ -5541,6 +5554,11 @@ signal_sensor_dispatched have been called for the same substage.)doc")
              &PyRayTracer::signal_sensor_dispatched,
 R"doc(Signal that all sensor-sweep rays for the current exposure substage have
 been submitted.  Mirrors signal_flash_dispatched.)doc")
+        .def("join_t5",
+             &PyRayTracer::join_t5,
+R"doc(Block (releasing the GIL) until the T5 worker thread finishes.
+Call after signal_sensor_dispatched + signal_flash_dispatched to guarantee
+sensor_accum ch2 (BDPT radiance) is fully written before get_sensor_image().)doc")
         .def("set_t5_strategy",
              &PyRayTracer::set_t5_strategy,
              py::arg("strategy"),

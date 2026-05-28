@@ -349,6 +349,34 @@ public:
         return n;
     }
 
+    /* Timed batch pop — same as pop_batch but returns -1 on timeout instead
+     * of blocking indefinitely.  The caller can service side-channel work
+     * (e.g. a T5 GPU job) and then loop back.  Returns 0 only when done.  */
+    int pop_batch_timed(std::vector<T>& out, int max_n,
+                        int timeout_ms = 5) {
+        for (int s = 0; s < 8; ++s) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (done_) return 0;
+                if (!q_.empty()) {
+                    int n = std::min(max_n, (int)q_.size());
+                    for (int i = 0; i < n; ++i) { out.push_back(std::move(q_.front())); q_.pop_front(); }
+                    return n;
+                }
+            }
+            std::this_thread::yield();
+        }
+        std::unique_lock<std::mutex> lk(mu_);
+        const bool fired = cv_.wait_for(
+            lk, std::chrono::milliseconds(timeout_ms),
+            [this]{ return !q_.empty() || done_; });
+        if (done_ && q_.empty()) return 0;
+        if (!fired || q_.empty()) return -1;   /* timeout — nothing yet */
+        int n = std::min(max_n, (int)q_.size());
+        for (int i = 0; i < n; ++i) { out.push_back(std::move(q_.front())); q_.pop_front(); }
+        return n;
+    }
+
     /* Non-blocking drain — takes up to max_n items immediately.
      * Appends to out.  Returns count taken (0 if empty). */
     int drain(std::vector<T>& out, int max_n) {
@@ -548,10 +576,11 @@ struct RayPipelineConfig {
     /* Intent-queue shuffle lever (0 = FIFO, 1 = fully random window). */
     float  intent_queue_shuffle = 0.0f;
     /* Sensor image accumulator: world-space plate geometry.
-     * plate_x: sensor X position; plate_r: disc radius; pip_res: pixel grid
-     * side (res×res); bdpt_eps: Y/Z proximity for BDPT snap in metres. */
-    float  sensor_plate_x   = 0.0f;
-    float  sensor_plate_r   = 0.0f;
+     * plate_x: sensor X position; plate_half_w/h: rectangular half-extents (Y/Z);
+     * pip_res: pixel grid side (res×res); bdpt_eps: Y/Z proximity for BDPT snap in metres. */
+    float  sensor_plate_x      = 0.0f;
+    float  sensor_plate_half_w = 0.0f;
+    float  sensor_plate_half_h = 0.0f;
     int    sensor_pip_res   = 0;      /* 0 = disabled */
     float  sensor_bdpt_eps  = 0.008f;
 
@@ -723,6 +752,11 @@ void ray_pipeline_signal_flash_dispatched(RayPipelineState* ps);
  * current exposure substage.  Mirrors signal_flash_dispatched. */
 void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps);
 
+/* Block until the T5 worker thread has finished.  Call after signalling both
+ * flash and sensor to ensure ch2 of sensor_accum is fully written before
+ * reading the sensor image. */
+void ray_pipeline_join_t5(RayPipelineState* ps);
+
 /* Live-update T5 connection-pass configuration. */
 void ray_pipeline_set_t5_strategy(RayPipelineState* ps, T5Strategy s);
 void ray_pipeline_set_t5_grid_cell_size(RayPipelineState* ps, float v);
@@ -804,12 +838,12 @@ void ray_pipeline_precompute_epsilon_flags(RayPipelineState* ps);
 void ray_pipeline_set_shuffle(RayPipelineState* ps, float shuffle_frac);
 
 /* Configure sensor image accumulator.  Call before submitting rays.
- * plate_x: world X of sensor plane; plate_r: disc radius; res: pixel grid side
- * (res×res RGB); bdpt_eps: world-space YZ proximity for BDPT snap.
+ * plate_x: world X of sensor plane; plate_half_w/h: rectangular half-extents (Y/Z);
+ * res: pixel grid side (res×res RGB); bdpt_eps: world-space YZ proximity for BDPT snap.
  * Resets the accumulator buffer. */
 void ray_pipeline_configure_sensor_image(
     RayPipelineState* ps,
-    float plate_x, float plate_r,
+    float plate_x, float plate_half_w, float plate_half_h,
     int   res,
     float bdpt_eps,
     float target_x,

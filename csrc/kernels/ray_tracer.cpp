@@ -54,6 +54,7 @@
 #include "thread_pool.h"
 #include "optical_handlers.h"
 #include "bdpt_record.h"
+#include "t5_hash_grid.h"
 
 #include <mutex>
 #include <thread>
@@ -7510,16 +7511,20 @@ struct RayPipelineState {
 
     /* ── Sensor image accumulator ─────────────────────────────────────────
      * Three-channel float64 buffer, res×res, layout [ch][iy][iz].
-     * ch0 = forward plate hits; ch1 = backward emissive paths; ch2 = BDPT snap.
+     * ch0 = R  (red-weighted spectral sum, all path types)
+     * ch1 = G  (green-weighted)
+     * ch2 = B  (blue-weighted)
+     * ch3 = near-miss accumulator (debug only, not displayed)
      * Protected by sensor_mu; read by ray_pipeline_get_sensor_image(). */
     mutable std::mutex        sensor_mu;
     int                       sensor_res  = 0;   /* 0 = disabled */
     float                     sensor_px   = 0.0f;
-    float                     sensor_pr   = 0.0f;
+    float                     sensor_half_w = 0.0f;
+    float                     sensor_half_h = 0.0f;
     float                     sensor_eps  = 0.008f;
     float                     sensor_target_x = 0.0f;
     float                     sensor_target_r = 0.0f;
-    std::vector<double>       sensor_accum;       /* res*res*4 doubles: ch0=fwd, ch1=bwd-emis, ch2=exact-BDPT, ch3=near-miss */
+    std::vector<double>       sensor_accum;       /* res*res*4 doubles: ch0=R, ch1=G, ch2=B (spectral), ch3=near-miss */
     std::vector<float>        priority_map;       /* res*res sugar-auxin field (1.0 = baseline) */
     mutable double            sensor_peak[4]      = {1e-30, 1e-30, 1e-30, 1e-30}; /* running per-channel max, never decreases */
 
@@ -7552,6 +7557,11 @@ struct RayPipelineState {
     std::mutex                bdpt_t5_spawn_mu;
     std::thread               bdpt_t5_worker;
 };
+
+/* CIE-approximate spectral locus — forward declaration; definition is near ray_pipeline_join_t5 */
+static void band_to_display_rgb(int b, int n_bands,
+                                 const Eigen::VectorXd& freq_hz_vec,
+                                 double& wr, double& wg, double& wb);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * GlPipelineDispatch — GPU compute backend for all four pipeline stages.
@@ -7589,6 +7599,31 @@ public:
 
     /* Shader programs for each stage */
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
+    /* T5 BDPT connection pass (t5_hash_connect.comp.glsl) — non-fatal if absent */
+    GLuint prog_t5 = 0;
+
+    /* T5 persistent SSBOs — allocated on first use, grown as needed */
+    GLuint ssbo_t5_light  = 0;  /* binding 0: T5LightVertBuf  (float)  */
+    GLuint ssbo_t5_hash   = 0;  /* binding 1: T5HashBuf       (uint)   */
+    GLuint ssbo_t5_cam    = 0;  /* binding 2: T5CamVertBuf    (float)  */
+    GLuint ssbo_t5_pix    = 0;  /* binding 3: T5PixelBuf      (uint)   */
+    GLuint ssbo_t5_params = 0;  /* binding 4: T5ParamsBuf     (48 B)   */
+    int    cap_t5_light   = 0;  /* floats */
+    int    cap_t5_hash    = 0;  /* uint32 */
+    int    cap_t5_cam     = 0;  /* floats */
+    int    cap_t5_pix     = 0;  /* uint32 */
+
+    /* ── T5 GPU job queue ─────────────────────────────────────────────── *
+     * The BDPT connection thread submits a job and blocks on the future;  *
+     * the GPU thread services it between T1/T2/T3 batches.               */
+    struct T5Job {
+        const T5HashGrid*                   hg;       /* owned by caller — stays alive while waiting */
+        std::promise<std::vector<uint32_t>> promise;  /* fulfilled with pixel accum uint32 bits */
+    };
+    std::mutex              t5_job_mu;
+    std::condition_variable t5_job_cv;
+    std::unique_ptr<T5Job>  t5_job_pending;           /* null = no pending job */
+    std::atomic<bool>       t5_job_ready{false};
 
     /* UV blit shader + shared display textures (valid only when WGL context sharing
      * is active — i.e. ps.cfg.gl_display_hglrc != 0 and prog_uv_blit != 0). */
@@ -7704,7 +7739,7 @@ public:
     std::vector<RayIntent> stg_children; /* child intents for push_many                */
     std::vector<uint32_t>  stg_uv_acc;  /* UV accumulator readback                    */
     std::vector<VXcd>      stg_amp_recycle; /* Eigen amp allocs harvested from prior batch */
-    struct SensorUpdate { int iy, iz; double ch1, ch2; };
+    struct SensorUpdate { int iy, iz; double r, g, b; };
     std::vector<SensorUpdate> stg_sensor_updates; /* precomputed sensor updates, outside lock */
     std::chrono::steady_clock::time_point last_uv_readback_t = std::chrono::steady_clock::now();
     std::atomic<double> uv_readback_interval_s{1.0};
@@ -7888,7 +7923,9 @@ public:
 
         /* Compile all four compute shaders */
         char err[1024];
-        auto load = [&](const std::string& name, GLuint& prog) -> bool {
+
+        /* Helper: read a file from shader_dir into a std::string. */
+        auto read_shader_file = [&](const std::string& name, std::string& out) -> bool {
             std::string path = resolve_shader(shader_dir, name);
             FILE* f = nullptr;
 #ifdef _MSC_VER
@@ -7898,16 +7935,56 @@ public:
 #endif
             if (!f) { snprintf(err, sizeof(err), "Cannot open %s", path.c_str()); return false; }
             fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-            std::string src(static_cast<size_t>(sz), '\0');
-            fread(&src[0], 1, static_cast<size_t>(sz), f); fclose(f);
+            out.assign(static_cast<size_t>(sz), '\0');
+            fread(&out[0], 1, static_cast<size_t>(sz), f); fclose(f);
+            return true;
+        };
+
+        auto load = [&](const std::string& name, GLuint& prog) -> bool {
+            std::string src;
+            if (!read_shader_file(name, src)) return false;
             prog = gl_compute_build_program(src.c_str(), err, sizeof(err));
             return prog != 0;
         };
 
-        if (!load("ray_bvh_intersect.comp.glsl", prog_t1)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
-        if (!load("ray_refine.comp.glsl",        prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
-        if (!load("ray_material.comp.glsl",      prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
-        if (!load("ray_wave_bpm.comp.glsl",      prog_t4)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        /* load_with_preamble: injects bvh_shadow.glsl.inc (with binding #defines
+         * prepended) into the shader after its #version line, using the native
+         * multi-source glShaderSource path in gl_compute_build_program2. */
+        auto load_with_shadow_bvh = [&](const std::string& name, GLuint& prog,
+                                        int bvh_bind, int tri_id_bind, int tri_full_bind) -> bool {
+            std::string src, inc;
+            if (!read_shader_file(name, src)) return false;
+            if (!read_shader_file("bvh_shadow.glsl.inc", inc)) {
+                /* Missing .inc is non-fatal: fall back to plain load (no shadow test). */
+                fprintf(stderr, "[gpu-dispatch] bvh_shadow.glsl.inc not found (%s) — shadow test disabled\n", err);
+                fflush(stderr);
+                prog = gl_compute_build_program(src.c_str(), err, sizeof(err));
+                return prog != 0;
+            }
+            /* Build the macro-define block that sets the three binding points. */
+            char defines[256];
+            snprintf(defines, sizeof(defines),
+                "#define SHADOW_BVH_BINDING      %d\n"
+                "#define SHADOW_TRI_ID_BINDING   %d\n"
+                "#define SHADOW_TRI_FULL_BINDING %d\n",
+                bvh_bind, tri_id_bind, tri_full_bind);
+            std::string preamble = std::string(defines) + inc;
+            prog = gl_compute_build_program2(src.c_str(), preamble.c_str(), err, sizeof(err));
+            return prog != 0;
+        };
+
+        if (!load("ray_bvh_intersect.comp.glsl",   prog_t1)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("ray_refine.comp.glsl",             prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("ray_material.comp.glsl",           prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("ray_wave_bpm.comp.glsl",           prog_t4)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        /* T5 hash-connect shader — compiled with BVH shadow preamble injected.
+         * BvhBuf→binding 5, TriIdBuf→binding 6, TriFullBuf→binding 7.
+         * Non-fatal; GPU T5 path disabled if absent or compilation fails. */
+        if (!load_with_shadow_bvh("t5_hash_connect.comp.glsl", prog_t5, 5, 6, 7)) {
+            fprintf(stderr, "[gpu-dispatch] t5_hash_connect.comp.glsl not loaded (%s) — GPU T5 disabled\n", err);
+            fflush(stderr);
+            prog_t5 = 0;
+        }
 
         /* Load UV blit shader — non-fatal, falls back to CPU path silently */
         if (display_context_shared) {
@@ -8479,7 +8556,7 @@ public:
         glc_Uniform1i (uloc_t3.max_children,         max_children);
         glc_Uniform1i (uloc_t3.max_children_per_hit, ps.cfg.max_children);
         glc_Uniform1i (uloc_t3.sensor_res,            0);
-        glc_Uniform1f (uloc_t3.sensor_pr,             ps.sensor_pr);
+        glc_Uniform1f (uloc_t3.sensor_pr,             ps.sensor_half_w);
         glc_Uniform1f (uloc_t3.sensor_px,             ps.sensor_px);
         glc_Uniform1i (uloc_t3.n_uv_groups,           n_uv_groups);
         glc_Uniform1i (uloc_t3.uv_group_id_base,      uv_group_id_base);
@@ -8631,7 +8708,8 @@ public:
                                  tbuf.data());
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
             const int    res       = ps.sensor_res;
-            const float  inv_r     = (float)res / (2.0f * ps.sensor_pr);
+            const float  inv_w     = (float)res / (2.0f * ps.sensor_half_w);
+            const float  inv_h     = (float)res / (2.0f * ps.sensor_half_h);
             /* Pre-compute sensor updates outside the lock so get_sensor_image()
              * is not blocked for the entire terminal scan. */
             auto& sensor_updates = stg_sensor_updates;
@@ -8644,25 +8722,31 @@ public:
                 uint32_t cflag; memcpy(&cflag, rec + 16, 4);
                 if (cflag != 1u) continue;
                 const float soy = rec[23], soz = rec[24];
-                const int iy = (int)((soy + ps.sensor_pr) * inv_r);
-                const int iz = (int)((soz + ps.sensor_pr) * inv_r);
+                const int iy = (int)((soy + ps.sensor_half_w) * inv_w);
+                const int iz = (int)((soz + ps.sensor_half_h) * inv_h);
                 if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
-                double amp_mag = 0.0;
+                double cr = 0.0, cg = 0.0, cb = 0.0;
                 for (int b = 0; b < nb && b < 16; ++b) {
                     const double re = (double)rec[26 + b], im = (double)rec[42 + b];
-                    amp_mag += std::sqrt(re*re + im*im);
+                    const double amp = std::sqrt(re*re + im*im);
+                    double wr, wg, wb;
+                    band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
+                    cr += amp * wr; cg += amp * wg; cb += amp * wb;
                 }
-                sensor_updates.push_back({iy, iz, 1.0, amp_mag});
+                sensor_updates.push_back({iy, iz, cr, cg, cb});
             }
             /* Apply all updates under a short-held lock, tracking peaks
              * incrementally so get_sensor_image() skips the O(res²) scan. */
             if (!sensor_updates.empty()) {
                 std::lock_guard<std::mutex> lk(ps.sensor_mu);
                 for (const auto& u : sensor_updates) {
-                    const double v1 = (ps.sensor_accum[(size_t)(1*res*res + u.iy*res + u.iz)] += u.ch1);
-                    const double v2 = (ps.sensor_accum[(size_t)(2*res*res + u.iy*res + u.iz)] += u.ch2);
-                    if (v1 > ps.sensor_peak[1]) ps.sensor_peak[1] = v1;
-                    if (v2 > ps.sensor_peak[2]) ps.sensor_peak[2] = v2;
+                    const size_t px = (size_t)(u.iy * res + u.iz);
+                    const double vr = (ps.sensor_accum[0*(size_t)res*res + px] += u.r);
+                    const double vg = (ps.sensor_accum[1*(size_t)res*res + px] += u.g);
+                    const double vb = (ps.sensor_accum[2*(size_t)res*res + px] += u.b);
+                    if (vr > ps.sensor_peak[0]) ps.sensor_peak[0] = vr;
+                    if (vg > ps.sensor_peak[1]) ps.sensor_peak[1] = vg;
+                    if (vb > ps.sensor_peak[2]) ps.sensor_peak[2] = vb;
                 }
             }
         }
@@ -9029,17 +9113,27 @@ public:
         std::vector<WaveIntent> wave_batch;
 
         while (true) {
-            /* Block on Q_intent — the primary work source.  Returns 0 only
-             * when set_done() has been called AND the queue is empty.      */
+            /* Timed pop — returns -1 on timeout so we can service a pending
+             * T5 GPU job even when Q_intent is momentarily empty (avoids the
+             * deadlock where the T5 connection thread blocks on fut.get()
+             * while the GPU thread is stuck in an infinite cv_.wait).      */
             batch.clear();
             int gpu_bsz = ps.stats[0].batch_sz_gpu.load(std::memory_order_relaxed);
-            int n = ps.Q_intent.pop_batch(batch, gpu_bsz);
+            int n = ps.Q_intent.pop_batch_timed(batch, gpu_bsz, /*ms=*/5);
 
             /* Non-blocking drain of Q_wave — never stall here; the CPU T4
              * worker is absent when use_gpu_compute=true so we opportunistically
              * pick up any wave intents that have accumulated.              */
             wave_batch.clear();
             ps.Q_wave.drain(wave_batch, gpu_bsz);
+
+            /* Timeout: Q_intent has nothing yet but is not done.
+             * Service a pending T5 job if present, then loop back.        */
+            if (n < 0) {
+                if (t5_job_ready.load(std::memory_order_acquire))
+                    service_t5_job();
+                continue;
+            }
 
             /* Exit only when Q_intent is exhausted-and-done (n==0); do one
              * final wave drain before leaving so nothing is orphaned.     */
@@ -9051,6 +9145,9 @@ public:
                         dispatch_t4_step(ps, ps.arenas[static_cast<size_t>(wi.arena_id)]);
                     ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
                 }
+                /* Service any outstanding T5 job before exiting */
+                if (t5_job_ready.load(std::memory_order_acquire))
+                    service_t5_job();
                 break;
             }
 
@@ -9079,7 +9176,115 @@ public:
                     dispatch_t4_step(ps, ps.arenas[static_cast<size_t>(wi.arena_id)]);
                 ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
             }
+
+            /* Service T5 connection job if one arrived during this batch */
+            if (t5_job_ready.load(std::memory_order_acquire))
+                service_t5_job();
         }
+    }
+
+    /* ── service_t5_job: runs on the GPU thread when t5_job_ready is set ── *
+     * Uploads the five T5 SSBOs (bindings 0-4), dispatches                 *
+     * t5_hash_connect.comp.glsl, barriers, reads back the pixel accum      *
+     * buffer and fulfills the caller's promise so it can unblock.          */
+    void service_t5_job() {
+        std::unique_ptr<T5Job> job;
+        {
+            std::lock_guard<std::mutex> lk(t5_job_mu);
+            job = std::move(t5_job_pending);
+            t5_job_ready.store(false, std::memory_order_release);
+        }
+        if (!job || !job->hg) return;
+        const T5HashGrid& hg = *job->hg;
+
+        const auto& lv  = hg.gpu_light_verts;  /* float, T5_LGV_STRIDE each */
+        const auto& ht  = hg.gpu_hash_table;   /* uint32, T5_HASH_SLOT each  */
+        const auto& cv  = hg.gpu_cam_verts;    /* float, T5_CGV_STRIDE each  */
+        const auto& pix = hg.gpu_pixel_accum;  /* uint32, zeroed by caller   */
+        const auto& par = hg.gpu_params;       /* T5GpuParams, 48 bytes      */
+
+        const int nlv = (int)lv.size();
+        const int nht = (int)ht.size();
+        const int ncv = (int)cv.size();
+        const int npi = (int)pix.size();
+
+        /* ── Ensure / allocate SSBOs ─────────────────────────────────── */
+        if (nlv > cap_t5_light) {
+            cap_t5_light = nlv * 2;
+            ensure_ssbo(ssbo_t5_light, (GLsizeiptr)(cap_t5_light * sizeof(float)));
+        }
+        if (nht > cap_t5_hash) {
+            cap_t5_hash = nht * 2;
+            ensure_ssbo(ssbo_t5_hash, (GLsizeiptr)(cap_t5_hash * sizeof(uint32_t)));
+        }
+        if (ncv > cap_t5_cam) {
+            cap_t5_cam = ncv * 2;
+            ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)(cap_t5_cam * sizeof(float)));
+        }
+        if (npi > cap_t5_pix) {
+            cap_t5_pix = npi * 2;
+            ensure_ssbo(ssbo_t5_pix, (GLsizeiptr)(cap_t5_pix * sizeof(uint32_t)));
+        }
+        if (!ssbo_t5_params) {
+            ensure_ssbo(ssbo_t5_params, sizeof(T5GpuParams));
+        }
+
+        /* ── Upload data ─────────────────────────────────────────────── */
+        auto upload = [&](GLuint ssbo, const void* data, GLsizeiptr bytes) {
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, data);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        };
+        if (nlv) upload(ssbo_t5_light,  lv.data(),  (GLsizeiptr)(nlv * sizeof(float)));
+        if (nht) upload(ssbo_t5_hash,   ht.data(),  (GLsizeiptr)(nht * sizeof(uint32_t)));
+        if (ncv) upload(ssbo_t5_cam,    cv.data(),  (GLsizeiptr)(ncv * sizeof(float)));
+               upload(ssbo_t5_pix,    pix.data(), (GLsizeiptr)(npi * sizeof(uint32_t)));
+               upload(ssbo_t5_params, &par,        sizeof(T5GpuParams));
+
+        /* ── Dispatch ────────────────────────────────────────────────── */
+        const uint32_t n_cam = par.n_cam_verts;
+        glc_UseProgram(prog_t5);
+        bind_ssbo(ssbo_t5_light,  0);
+        bind_ssbo(ssbo_t5_hash,   1);
+        bind_ssbo(ssbo_t5_cam,    2);
+        bind_ssbo(ssbo_t5_pix,    3);
+        bind_ssbo(ssbo_t5_params, 4);
+        /* BVH shadow buffers — same GPU data used by T1, rebound at T5 slots */
+        bind_ssbo(ssbo_bvh,      5);
+        bind_ssbo(ssbo_tri_id,   6);
+        bind_ssbo(ssbo_tri_full, 7);
+        glc_DispatchCompute((GLuint)((n_cam + 63u) / 64u), 1u, 1u);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        /* ── Readback pixel accum via GetBufferSubData ──────────────── */
+        std::vector<uint32_t> result(static_cast<size_t>(npi));
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
+        glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                             (GLsizeiptr)(npi * sizeof(uint32_t)), result.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        fprintf(stderr, "[T5-gpu] dispatch done: n_cam=%u n_light=%u pix=%u\n",
+                n_cam, par.n_light_verts, (unsigned)npi);
+        fflush(stderr);
+
+        job->promise.set_value(std::move(result));
+    }
+
+    /* ── submit_t5_connect: called from BDPT connection thread ─────────── *
+     * Enqueues a T5 GPU job, blocks until the GPU thread fulfills it, and  *
+     * returns the pixel accum buffer (3×res² uint32 bit-cast from float).  */
+    std::vector<uint32_t> submit_t5_connect(const T5HashGrid& hg) {
+        if (!prog_t5) return {};
+        auto job = std::make_unique<T5Job>();
+        job->hg = &hg;
+        std::future<std::vector<uint32_t>> fut = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(t5_job_mu);
+            t5_job_pending = std::move(job);
+            t5_job_ready.store(true, std::memory_order_release);
+        }
+        t5_job_cv.notify_one(); /* wake GPU thread if it were waiting (belt+suspenders) */
+        return fut.get(); /* blocks until service_t5_job fulfills the promise */
     }
 };
 
@@ -9476,20 +9681,28 @@ static void pipeline_intersector(RayPipelineState& ps)
                 const float hy = static_cast<float>(hit_pos.y());
                 const float hz = static_cast<float>(hit_pos.z());
                 if (std::abs(hx - ps.sensor_px) < 0.004f) {
-                    const float inv_r = static_cast<float>(ps.sensor_res) / (2.0f * ps.sensor_pr);
-                    const int   iy    = static_cast<int>((hy + ps.sensor_pr) * inv_r);
-                    const int   iz    = static_cast<int>((hz + ps.sensor_pr) * inv_r);
+                    const float inv_w = static_cast<float>(ps.sensor_res) / (2.0f * ps.sensor_half_w);
+                    const float inv_h = static_cast<float>(ps.sensor_res) / (2.0f * ps.sensor_half_h);
+                    const int   iy    = static_cast<int>((hy + ps.sensor_half_w) * inv_w);
+                    const int   iz    = static_cast<int>((hz + ps.sensor_half_h) * inv_h);
                     const int   res   = ps.sensor_res;
                     if (iy >= 0 && iy < res && iz >= 0 && iz < res) {
-                        double amp_mag = 0.0;
+                        double cr = 0.0, cg = 0.0, cb = 0.0;
                         for (int b = 0; b < nb; ++b) {
                             const double re = amp_prop[b].real(), im = amp_prop[b].imag();
-                            amp_mag += std::sqrt(re*re + im*im);
+                            const double amp = std::sqrt(re*re + im*im);
+                            double wr, wg, wb;
+                            band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
+                            cr += amp * wr; cg += amp * wg; cb += amp * wb;
                         }
-                        const int idx = 0 * res * res + iy * res + iz;  /* ch0 only */
+                        const size_t px0 = static_cast<size_t>(iy * res + iz);
                         std::lock_guard<std::mutex> lk(ps.sensor_mu);
-                        const double nv = (ps.sensor_accum[static_cast<size_t>(idx)] += amp_mag);
-                        if (nv > ps.sensor_peak[0]) ps.sensor_peak[0] = nv;
+                        const double nr = (ps.sensor_accum[0*(size_t)res*res + px0] += cr);
+                        const double ng = (ps.sensor_accum[1*(size_t)res*res + px0] += cg);
+                        const double nb_ = (ps.sensor_accum[2*(size_t)res*res + px0] += cb);
+                        if (nr  > ps.sensor_peak[0]) ps.sensor_peak[0] = nr;
+                        if (ng  > ps.sensor_peak[1]) ps.sensor_peak[1] = ng;
+                        if (nb_ > ps.sensor_peak[2]) ps.sensor_peak[2] = nb_;
                     }
                 }
             }
@@ -9813,9 +10026,10 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 const float sy    = hr.ray.sensor_origin_y;
                 const float sz    = hr.ray.sensor_origin_z;
                 const int   res   = ps.sensor_res;
-                const float inv_r = static_cast<float>(res) / (2.0f * ps.sensor_pr);
-                const int   iy    = static_cast<int>((sy + ps.sensor_pr) * inv_r);
-                const int   iz    = static_cast<int>((sz + ps.sensor_pr) * inv_r);
+                const float inv_w = static_cast<float>(res) / (2.0f * ps.sensor_half_w);
+                const float inv_h = static_cast<float>(res) / (2.0f * ps.sensor_half_h);
+                const int   iy    = static_cast<int>((sy + ps.sensor_half_w) * inv_w);
+                const int   iz    = static_cast<int>((sz + ps.sensor_half_h) * inv_h);
                 if (iy >= 0 && iy < res && iz >= 0 && iz < res) {
                     /* Physical amplitude carried by this ray at the emissive. */
                     double amp_mag = 0.0;
@@ -9833,8 +10047,10 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                     const int idx1 = 1 * res * res + iy * res + iz;
                     const int idx2 = 2 * res * res + iy * res + iz;
                     std::lock_guard<std::mutex> lk(ps.sensor_mu);
-                    ps.sensor_accum[static_cast<size_t>(idx1)] += 1.0;
-                    ps.sensor_accum[static_cast<size_t>(idx2)] += amp_mag;
+                    const double v1 = (ps.sensor_accum[static_cast<size_t>(idx1)] += 1.0);
+                    const double v2 = (ps.sensor_accum[static_cast<size_t>(idx2)] += amp_mag);
+                    if (v1 > ps.sensor_peak[1]) ps.sensor_peak[1] = v1;
+                    if (v2 > ps.sensor_peak[2]) ps.sensor_peak[2] = v2;
                 }
             }
             continue;
@@ -10004,17 +10220,20 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                                     const float sy    = hr.ray.sensor_origin_y;
                                     const float sz    = hr.ray.sensor_origin_z;
                                     const int   res_s = ps.sensor_res;
-                                    const float inv_r = static_cast<float>(res_s)
-                                                        / (2.0f * ps.sensor_pr);
+                                    const float inv_w = static_cast<float>(res_s)
+                                                        / (2.0f * ps.sensor_half_w);
+                                    const float inv_h = static_cast<float>(res_s)
+                                                        / (2.0f * ps.sensor_half_h);
                                     const int   iy = static_cast<int>(
-                                        (sy + ps.sensor_pr) * inv_r);
+                                        (sy + ps.sensor_half_w) * inv_w);
                                     const int   iz = static_cast<int>(
-                                        (sz + ps.sensor_pr) * inv_r);
+                                        (sz + ps.sensor_half_h) * inv_h);
                                     if (iy >= 0 && iy < res_s && iz >= 0 && iz < res_s) {
                                         const int idx2 = 2 * res_s * res_s + iy * res_s + iz;
                                         std::lock_guard<std::mutex> lk(ps.sensor_mu);
-                                        ps.sensor_accum[static_cast<size_t>(idx2)]
-                                            += contrib_mag;
+                                        const double nv = (ps.sensor_accum[static_cast<size_t>(idx2)]
+                                            += contrib_mag);
+                                        if (nv > ps.sensor_peak[2]) ps.sensor_peak[2] = nv;
                                     }
                                 }
                                 /* Scale down to coherent fraction. */
@@ -10760,7 +10979,7 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
                                       double shutter_softness,
                                       double exposure_weight)
 {
-    if (!ps || !ps->st || ps->sensor_res <= 0 || ps->sensor_pr <= 0.0f)
+    if (!ps || !ps->st || ps->sensor_res <= 0 || ps->sensor_half_w <= 0.0f || ps->sensor_half_h <= 0.0f)
         return 0;
 
     const int res = ps->sensor_res;
@@ -10775,8 +10994,10 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     const V3d target(target_x, 0.0, 0.0);
 
     const int n_bands = std::max(1, std::min(ps->st->n_bands, MAX_SPECTRAL_BANDS));
-    const double pr = static_cast<double>(ps->sensor_pr);
-    const double step = (2.0 * pr) / static_cast<double>(res);
+    const double half_w = static_cast<double>(ps->sensor_half_w);
+    const double half_h = static_cast<double>(ps->sensor_half_h);
+    const double step_w = (2.0 * half_w) / static_cast<double>(res);
+    const double step_h = (2.0 * half_h) / static_cast<double>(res);
     const double open_f = std::max(0.0, std::min(1.0, shutter_open));
     const double cu = std::max(0.0, std::min(1.0, shutter_center_u));
     const double cv = std::max(0.0, std::min(1.0, shutter_center_v));
@@ -10816,10 +11037,10 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     for (int pix = 0; pix < total && static_cast<int>(intents.size()) < limit; ++pix) {
         const int iy = pix / res;
         const int iz = pix - iy * res;
-        const double y = -pr + (static_cast<double>(iy) + 0.5) * step;
-        const double z = -pr + (static_cast<double>(iz) + 0.5) * step;
-        const double u = (z + pr) / std::max(2.0 * pr, 1.0e-30);
-        const double v = (y + pr) / std::max(2.0 * pr, 1.0e-30);
+        const double y = -half_w + (static_cast<double>(iy) + 0.5) * step_w;
+        const double z = -half_h + (static_cast<double>(iz) + 0.5) * step_h;
+        const double u = (z + half_h) / std::max(2.0 * half_h, 1.0e-30);
+        const double v = (y + half_w) / std::max(2.0 * half_w, 1.0e-30);
         const double shutter_w = shutter_weight_at(u, v);
         if (!(shutter_w > 0.0) || !std::isfinite(shutter_w))
             continue;
@@ -10873,6 +11094,11 @@ void ray_pipeline_get_bdpt_overflow(const RayPipelineState* ps,
     if (out_optical)  *out_optical  = ps->bdpt_overflow_optical .load(std::memory_order_relaxed);
     if (out_connections) *out_connections = ps->bdpt_overflow_connections.load(std::memory_order_relaxed);
 }
+
+/* t5_connection.h provides T5ConnContext, BdptSubpathView, LightVertRef,
+ * BdptCandidateScratch, T5ThreadAccum, run_t5_allpairs(), run_t5_hash().
+ * Must be included here (after RayTracerState, BVHNode, etc. are defined). */
+#include "t5_connection.h"
 
 /* ── BDPT connection pass with balance-heuristic MIS ─────────────────────────
  *
@@ -10935,6 +11161,9 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     ray_pipeline_drain_bdpt_pdfs    (ps, pdfs_new,     ps->cfg.bdpt_max_pdfs     > 0 ? ps->cfg.bdpt_max_pdfs     : 2000000);
     ray_pipeline_drain_bdpt_optical (ps, optical_new,  ps->cfg.bdpt_max_optical  > 0 ? ps->cfg.bdpt_max_optical  : 1000000);
     t5_work_items = verts_new.size() + sweights_new.size() + pdfs_new.size() + optical_new.size();
+    fprintf(stderr, "[T5-conn] drained: verts=%zu sweights=%zu pdfs=%zu optical=%zu\n",
+            verts_new.size(), sweights_new.size(), pdfs_new.size(), optical_new.size());
+    fflush(stderr);
 
     std::vector<BdptVertexRecord>         verts;
     std::vector<BdptSpectralWeightRecord> sweights;
@@ -10958,8 +11187,15 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             else if (v.stream == BDPT_SIDE_LIGHT) have_light = true;
             if (have_camera && have_light) break;
         }
-        if (!have_camera || !have_light)
+        fprintf(stderr, "[T5-conn] pending after merge: total=%zu have_camera=%d have_light=%d\n",
+                ps->bdpt_pending_vertices.size(), (int)have_camera, (int)have_light);
+        fflush(stderr);
+        if (!have_camera || !have_light) {
+            fprintf(stderr, "[T5-conn] EARLY RETURN — missing %s%s\n",
+                    have_camera ? "" : "camera ", have_light ? "" : "light");
+            fflush(stderr);
             return;
+        }
 
         verts.swap(ps->bdpt_pending_vertices);
         sweights.swap(ps->bdpt_pending_spectral);
@@ -10999,212 +11235,36 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         optical_lut[k].push_back(oe);
     }
 
-    auto optical_for = [&](const BdptVertexRecord& v) -> const std::vector<BdptOpticalEventRecord>* {
-        const uint64_t k = ((uint64_t)v.subpath_id << 32)
-                         | ((uint64_t)v.vertex_index << 16)
-                         | (uint64_t)v.stream;
-        auto it = optical_lut.find(k);
-        return (it == optical_lut.end()) ? nullptr : &it->second;
-    };
+    /* ── Pass parameters ──────────────────────────────────────────────────── */
+    const int   res   = ps->sensor_res;
+    const float inv_w = static_cast<float>(res) / (2.0f * ps->sensor_half_w);
+    const float inv_h = static_cast<float>(res) / (2.0f * ps->sensor_half_h);
 
-    auto pdf_for = [&](uint32_t sid, uint16_t vi) -> const BdptPdfRecord* {
-        const uint64_t base = ((uint64_t)sid << 32) | ((uint64_t)vi << 16);
-        const uint64_t domains[] = {
-            BDPT_DOMAIN_PROJ_SOLID_ANGLE,
-            BDPT_DOMAIN_SOLID_ANGLE,
-            BDPT_DOMAIN_AREA,
-            BDPT_DOMAIN_UNKNOWN
-        };
-        for (uint64_t d : domains) {
-            auto it = pdf_lut.find(base | d);
-            if (it != pdf_lut.end()) return &it->second;
-        }
-        return nullptr;
-    };
+    /* Determine n_bands from spectral weight records (fall back to scalar). */
+    uint16_t max_band = 0;
+    for (const auto& sw : sweights)
+        if (sw.band_id > max_band) max_band = sw.band_id;
+    const int n_bands = (int)max_band + 1;
 
-    auto beta_scalar = [&](const BdptVertexRecord& v, int n_bands) -> double {
-        double beta = 0.0;
-        bool have = false;
-        for (int b = 0; b < n_bands; ++b) {
-            const uint64_t k = ((uint64_t)v.subpath_id << 32)
-                             | ((uint64_t)v.vertex_index << 16)
-                             | (uint64_t)b;
-            auto it = beta_lut.find(k);
-            if (it == beta_lut.end()) break;
-            beta += std::abs(it->second);
-            have = true;
-        }
-        return have ? beta : (double)v.throughput_scalar;
-    };
+    const Eigen::VectorXd& t5_freq_hz = ps->st
+        ? ps->st->freq_hz_vec : Eigen::VectorXd{};
+    const float t5_min_geom = (ps->cfg.t5_min_geom > 0.0f)
+        ? ps->cfg.t5_min_geom : 1e-20f;
+    std::mutex connection_flush_mu;
 
-    auto optical_allows_sampling = [&](const BdptVertexRecord& v, bool reverse,
-                                       double& out_jacobian) -> bool {
-        out_jacobian = 1.0;
-        const auto* oes = optical_for(v);
-        if (oes) {
-            for (const auto& oe : *oes) {
-                if (oe.reason == BDPT_OPT_ABSORPTION ||
-                    oe.reason == BDPT_OPT_APERTURE_CLIP ||
-                    oe.reason == BDPT_OPT_VIGNETTE_CLIP ||
-                    oe.reason == BDPT_OPT_TIR)
-                    return false;
-                if (oe.phase_space_jacobian > 0.0f && std::isfinite(oe.phase_space_jacobian)) {
-                    const double j = static_cast<double>(oe.phase_space_jacobian);
-                    out_jacobian *= reverse ? (1.0 / j) : j;
-                }
-            }
-        }
-        return out_jacobian > 0.0 && std::isfinite(out_jacobian);
-    };
+    /* ── Build T5ConnContext (all helper methods live here) ────────────────── */
+    T5ConnContext ctx{beta_lut, pdf_lut, optical_lut, ps,
+                     n_bands, res, inv_w, inv_h, t5_min_geom, t5_freq_hz,
+                     connection_flush_mu};
 
-    auto edge_pdf_area_component = [&](const BdptVertexRecord& pdf_vertex,
-                                       const BdptVertexRecord& sampler_from,
-                                       const BdptVertexRecord& target,
-                                       bool reverse_pdf,
-                                       double& out_pdf) -> bool {
-        const BdptPdfRecord* pr = pdf_for(pdf_vertex.subpath_id, pdf_vertex.vertex_index);
-        if (!pr) return false;
-
-        double optical_j = 1.0;
-        if (!optical_allows_sampling(pdf_vertex, reverse_pdf, optical_j))
-            return false;
-
-        double pdf = 0.0;
-        const float pdf_component = reverse_pdf ? pr->pdf_rev : pr->pdf_fwd;
-        const float pdf_solid = reverse_pdf ? pr->pdf_rev : pr->pdf_solid_angle;
-        if (!reverse_pdf && pr->pdf_area > 0.0f && std::isfinite(pr->pdf_area)) {
-            pdf = (double)pr->pdf_area;
-        } else {
-            const V3d p0(sampler_from.pos[0], sampler_from.pos[1], sampler_from.pos[2]);
-            const V3d p1(target.pos[0], target.pos[1], target.pos[2]);
-            V3d d = p1 - p0;
-            const double dist2 = d.squaredNorm();
-            if (dist2 <= 1e-18) {
-                out_pdf = 1e-12;
-                return true;
-            }
-            d /= std::sqrt(dist2);
-
-            const V3d n1(target.normal[0], target.normal[1], target.normal[2]);
-            const double cos_to = std::max(0.0, std::abs(n1.dot(-d)));
-            if (cos_to <= 0.0) return false;
-            if (pdf_solid > 0.0f)
-                pdf = (double)pdf_solid * cos_to / dist2;
-            else if (pdf_component > 0.0f)
-                pdf = (double)pdf_component * cos_to / dist2;
-        }
-
-        pdf *= optical_j;
-        if (!(pdf > 0.0) || !std::isfinite(pdf)) return false;
-        out_pdf = std::max(pdf, 1e-12);
-        return true;
-    };
-
-    auto edge_pdf_area = [&](const BdptVertexRecord& from,
-                             const BdptVertexRecord& to,
-                             double& out_pdf) -> bool {
-        return edge_pdf_area_component(from, from, to, false, out_pdf);
-    };
-
-    auto scatter_connection_pdf_area = [&](const BdptVertexRecord& from,
-                                           const BdptVertexRecord& to,
-                                           double& out_pdf) -> bool {
-        const BdptPdfRecord* pr = pdf_for(from.subpath_id, from.vertex_index);
-        if (!pr) return false;
-        if ((pr->flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
-        if (from.mat_idx < 0) return false;
-        const double diffuse_p = static_cast<double>(
-            mat_cache_diffusion(ps->st->mat_cache, from.mat_idx));
-        const double spec_p = std::max(0.0, 1.0 - diffuse_p);
-
-        double optical_j = 1.0;
-        if (!optical_allows_sampling(from, false, optical_j))
-            return false;
-
-        const V3d p0(from.pos[0], from.pos[1], from.pos[2]);
-        const V3d p1(to.pos[0], to.pos[1], to.pos[2]);
-        V3d d = p1 - p0;
-        const double dist2 = d.squaredNorm();
-        if (dist2 <= 1e-18) {
-            out_pdf = 1e-12;
-            return true;
-        }
-        d /= std::sqrt(dist2);
-        const V3d n0(from.normal[0], from.normal[1], from.normal[2]);
-        const V3d n1(to.normal[0], to.normal[1], to.normal[2]);
-        const double cos_out = std::max(0.0, n0.dot(d));
-        const double cos_to  = std::max(0.0, std::abs(n1.dot(-d)));
-        if (cos_out <= 0.0 || cos_to <= 0.0) return false;
-        double pdf_sa = 0.0;
-        if ((pr->flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
-            if (!(diffuse_p > 0.0)) return false;
-            pdf_sa = diffuse_p * cos_out / M_PI;
-        } else if ((pr->flags & BDPT_PDF_FLAG_GGX) != 0u) {
-            if (!(spec_p > 0.0)) return false;
-            const double alpha = static_cast<double>(
-                surf_cache_ggx_alpha(ps->st->surf_cache, from.mat_idx));
-            if (!(alpha > 1.0e-3)) return false;
-            const V3d in_dir(from.dir_in[0], from.dir_in[1], from.dir_in[2]);
-            pdf_sa = spec_p * ggx_pdf_solid_angle(n0, in_dir, d, alpha);
-        } else {
-            return false;
-        }
-        if (!(pdf_sa > 0.0) || !std::isfinite(pdf_sa)) return false;
-        const double pdf = pdf_sa * cos_to / dist2 * optical_j;
-        if (!(pdf > 0.0) || !std::isfinite(pdf)) return false;
-        out_pdf = std::max(pdf, 1e-12);
-        return true;
-    };
-
-    auto vertex_connectable = [&](const BdptVertexRecord& v) -> bool {
-        if (v.tri_id < 0) return false;
-        if ((v.flags & MAT_FLAG_APERTURE_STOP) != 0) return false;
-        const auto* oes = optical_for(v);
-        if (oes) {
-            for (const auto& oe : *oes) {
-                if (oe.reason == BDPT_OPT_ABSORPTION ||
-                    oe.reason == BDPT_OPT_APERTURE_CLIP ||
-                    oe.reason == BDPT_OPT_VIGNETTE_CLIP ||
-                    oe.reason == BDPT_OPT_TIR)
-                    return false;
-            }
-        }
-        const BdptPdfRecord* pr = pdf_for(v.subpath_id, v.vertex_index);
-        if (pr && (pr->flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
-        return true;
-    };
-
-    auto visible = [&](const BdptVertexRecord& a, const BdptVertexRecord& b) -> bool {
-        const RayTracerState& st = *ps->st;
-        if (st.bvh_nodes.empty()) return true;
-        V3d p0(a.pos[0], a.pos[1], a.pos[2]);
-        V3d p1(b.pos[0], b.pos[1], b.pos[2]);
-        V3d d = p1 - p0;
-        const double dist = d.norm();
-        if (dist <= 1e-9) return false;
-        d /= dist;
-        const V3d orig = p0 + d * (T_SELF * 16.0);
-        const V3d inv(1.0 / d.x(), 1.0 / d.y(), 1.0 / d.z());
-        double t_min = std::max(0.0, dist - T_SELF * 32.0);
-        int hit_tri = -1;
-        bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris, orig, d, inv, t_min, hit_tri);
-        if (hit_tri < 0) return true;
-        return hit_tri == a.tri_id || hit_tri == b.tri_id;
-    };
-
-    struct BdptSubpathView {
-        std::vector<const BdptVertexRecord*> v;
-        std::vector<double> prefix_pdf;
-        std::vector<uint8_t> prefix_valid;
-    };
-
+    /* ── Build subpath views ────────────────────────────────────────────── */
     std::unordered_map<uint32_t, BdptSubpathView> cam_paths, light_paths;
     for (const auto& v : verts) {
         auto& paths = (v.stream == BDPT_SIDE_SENSOR) ? cam_paths : light_paths;
         paths[v.subpath_id].v.push_back(&v);
     }
 
-    auto prepare_paths = [&](std::unordered_map<uint32_t, BdptSubpathView>& paths) {
+    auto prepare_paths = [&ctx](std::unordered_map<uint32_t, BdptSubpathView>& paths) {
         for (auto& kv : paths) {
             auto& sp = kv.second;
             std::sort(sp.v.begin(), sp.v.end(),
@@ -11223,11 +11283,11 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             for (size_t i = 0; i < sp.v.size(); ++i) {
                 if (i > 0) {
                     double edge_pdf = 0.0;
-                    valid = valid && edge_pdf_area(*sp.v[i - 1], *sp.v[i], edge_pdf);
+                    valid = valid && ctx.edge_pdf_area(*sp.v[i-1], *sp.v[i], edge_pdf);
                     if (valid) accum *= edge_pdf;
                 }
                 sp.prefix_valid[i] = valid ? 1u : 0u;
-                sp.prefix_pdf[i] = valid ? std::max(accum, 1e-300) : 0.0;
+                sp.prefix_pdf[i]   = valid ? std::max(accum, 1e-300) : 0.0;
             }
         }
     };
@@ -11237,403 +11297,179 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     if (cam_paths.empty() || light_paths.empty()) return;
 
-    struct BdptCandidateScratch {
-        std::vector<const BdptVertexRecord*> chain;
-        std::vector<double> edge_fwd;
-        std::vector<double> edge_bwd;
-        std::vector<uint8_t> edge_fwd_ok;
-        std::vector<uint8_t> edge_bwd_ok;
-        std::vector<double> prefix_fwd;
-        std::vector<double> suffix_bwd;
-        std::vector<uint8_t> prefix_ok;
-        std::vector<uint8_t> suffix_ok;
-
-        BdptCandidateScratch() {
-            chain.reserve(32);
-            edge_fwd.reserve(31);
-            edge_bwd.reserve(31);
-            edge_fwd_ok.reserve(31);
-            edge_bwd_ok.reserve(31);
-            prefix_fwd.reserve(32);
-            suffix_bwd.reserve(32);
-            prefix_ok.reserve(32);
-            suffix_ok.reserve(32);
-        }
-    };
-
-    auto candidate_strategy_density = [&](const BdptSubpathView& cam,
-                                          size_t ci,
-                                          const BdptSubpathView& light,
-                                          size_t li,
-                                          BdptCandidateScratch& scratch,
-                                          double& out_selected_pdf,
-                                          double& out_denom) -> bool {
-        auto& chain = scratch.chain;
-        chain.clear();
-        chain.reserve(ci + li + 2);
-        for (size_t i = 0; i <= ci; ++i)
-            chain.push_back(cam.v[i]);
-        for (size_t n = 0; n <= li; ++n)
-            chain.push_back(light.v[li - n]);
-
-        const size_t N = chain.size();
-        if (N < 2) return false;
-        auto& edge_fwd = scratch.edge_fwd;
-        auto& edge_bwd = scratch.edge_bwd;
-        auto& edge_fwd_ok = scratch.edge_fwd_ok;
-        auto& edge_bwd_ok = scratch.edge_bwd_ok;
-        edge_fwd.resize(N - 1);
-        edge_bwd.resize(N - 1);
-        edge_fwd_ok.resize(N - 1);
-        edge_bwd_ok.resize(N - 1);
-        std::fill(edge_fwd.begin(), edge_fwd.end(), 0.0);
-        std::fill(edge_bwd.begin(), edge_bwd.end(), 0.0);
-        std::fill(edge_fwd_ok.begin(), edge_fwd_ok.end(), 0u);
-        std::fill(edge_bwd_ok.begin(), edge_bwd_ok.end(), 0u);
-
-        for (size_t e = 0; e + 1 < N; ++e) {
-            double pf = 0.0, pb = 0.0;
-            bool ok_f = false, ok_b = false;
-            if (e < ci) {
-                const auto& parent = *cam.v[e];
-                const auto& child  = *cam.v[e + 1];
-                ok_f = edge_pdf_area_component(parent, parent, child, false, pf);
-                ok_b = edge_pdf_area_component(parent, child, parent, true, pb);
-            } else if (e == ci) {
-                ok_f = scatter_connection_pdf_area(*chain[e], *chain[e + 1], pf);
-                ok_b = scatter_connection_pdf_area(*chain[e + 1], *chain[e], pb);
-            } else {
-                const size_t light_child_idx = li - (e - ci - 1);
-                if (light_child_idx == 0) return false;
-                const auto& parent = *light.v[light_child_idx - 1];
-                const auto& child  = *light.v[light_child_idx];
-                ok_f = edge_pdf_area_component(parent, child, parent, true, pf);
-                ok_b = edge_pdf_area_component(parent, parent, child, false, pb);
-            }
-            if (ok_f) {
-                edge_fwd[e] = pf;
-                edge_fwd_ok[e] = 1u;
-            }
-            if (ok_b) {
-                edge_bwd[e] = pb;
-                edge_bwd_ok[e] = 1u;
-            }
-        }
-
-        auto& prefix_fwd = scratch.prefix_fwd;
-        auto& suffix_bwd = scratch.suffix_bwd;
-        auto& prefix_ok = scratch.prefix_ok;
-        auto& suffix_ok = scratch.suffix_ok;
-        prefix_fwd.resize(N);
-        suffix_bwd.resize(N);
-        prefix_ok.resize(N);
-        suffix_ok.resize(N);
-        std::fill(prefix_fwd.begin(), prefix_fwd.end(), 0.0);
-        std::fill(suffix_bwd.begin(), suffix_bwd.end(), 0.0);
-        std::fill(prefix_ok.begin(), prefix_ok.end(), 0u);
-        std::fill(suffix_ok.begin(), suffix_ok.end(), 0u);
-        prefix_fwd[0] = 1.0;
-        prefix_ok[0] = 1u;
-        for (size_t i = 1; i < N; ++i) {
-            prefix_ok[i] = (prefix_ok[i - 1] && edge_fwd_ok[i - 1]) ? 1u : 0u;
-            prefix_fwd[i] = prefix_ok[i]
-                ? std::max(prefix_fwd[i - 1] * edge_fwd[i - 1], 1e-300)
-                : 0.0;
-        }
-        suffix_bwd[N - 1] = 1.0;
-        suffix_ok[N - 1] = 1u;
-        for (size_t i = N - 1; i-- > 0;) {
-            suffix_ok[i] = (suffix_ok[i + 1] && edge_bwd_ok[i]) ? 1u : 0u;
-            suffix_bwd[i] = suffix_ok[i]
-                ? std::max(suffix_bwd[i + 1] * edge_bwd[i], 1e-300)
-                : 0.0;
-        }
-
-        const size_t selected_cut = ci + 1;
-        if (selected_cut == 0 || selected_cut >= N) return false;
-        if (!prefix_ok[selected_cut - 1] || !suffix_ok[selected_cut])
-            return false;
-
-        out_selected_pdf = std::max(prefix_fwd[selected_cut - 1] *
-                                    suffix_bwd[selected_cut], 1e-300);
-        out_denom = 0.0;
-        for (size_t cut = 1; cut < N; ++cut) {
-            if (!vertex_connectable(*chain[cut - 1])) continue;
-            if (!vertex_connectable(*chain[cut])) continue;
-            if (!prefix_ok[cut - 1] || !suffix_ok[cut]) continue;
-            const double p = prefix_fwd[cut - 1] * suffix_bwd[cut];
-            if (p > 0.0 && std::isfinite(p))
-                out_denom += p;
-        }
-        return out_selected_pdf > 0.0 && out_denom > 0.0 && std::isfinite(out_denom);
-    };
-
-    const int   res   = ps->sensor_res;
-    const float inv_r = static_cast<float>(res) / (2.0f * ps->sensor_pr);
-
-    /* Determine n_bands from the spectral weight records (or fall back to scalar). */
-    uint16_t max_band = 0;
-    for (const auto& sw : sweights)
-        if (sw.band_id > max_band) max_band = sw.band_id;
-    const int n_bands = (int)max_band + 1;
-
+    /* ── Flat cam/light item vectors ────────────────────────────────────── */
     std::vector<const BdptSubpathView*> cam_items;
     std::vector<const BdptSubpathView*> light_items;
     cam_items.reserve(cam_paths.size());
     light_items.reserve(light_paths.size());
-    for (const auto& kv : cam_paths) cam_items.push_back(&kv.second);
+    for (const auto& kv : cam_paths)  cam_items.push_back(&kv.second);
     for (const auto& kv : light_paths) light_items.push_back(&kv.second);
 
+    /* ── Per-thread accumulators + ThreadPool ───────────────────────────── */
     const size_t pix = static_cast<size_t>(res) * static_cast<size_t>(res);
     const unsigned hw = std::max(1u, std::thread::hardware_concurrency());
-    const size_t nw = std::max<size_t>(1, std::min<size_t>(cam_items.size(), hw));
-    std::vector<std::vector<double>> local_sensor(nw, std::vector<double>(pix, 0.0));
-    std::vector<uint64_t> local_exact(nw, 0);
-    std::mutex connection_flush_mu;
+    const size_t nw = std::max<size_t>(1, std::min<size_t>(cam_items.size(), (size_t)hw));
 
-    auto flush_connections = [&](std::vector<BdptConnectionRecord>& batch) {
-        if (batch.empty()) return;
-        std::lock_guard<std::mutex> lk(connection_flush_mu);
-        for (auto& cr : batch)
-            ps->push_bdpt_connection(std::move(cr));
-        batch.clear();
-    };
+    std::vector<T5ThreadAccum> accums;
+    accums.reserve(nw);
+    for (size_t t = 0; t < nw; ++t) accums.emplace_back(pix);
 
-    /* ── try_connect_pair: evaluate one camera vertex vs one light vertex ─
-     * Shared by both FULL_SEARCH and HASH_GRID workers.  Appends a
-     * BdptConnectionRecord and accumulates the visible contribution into
-     * pixel_accum.  Returns without side-effects if the pair fails any
-     * filter.  The geometry-term floor is configurable (t5_min_geom). */
-    const float t5_min_geom = (ps->cfg.t5_min_geom > 0.0f)
-                                ? ps->cfg.t5_min_geom : 1e-20f;
+    ThreadPool t5_pool(nw);
 
-    auto try_connect_pair = [&](
-        const BdptSubpathView&  cam,      size_t ci,
-        const BdptVertexRecord& c,        double beta_cam,
-        const BdptSubpathView&  light,    size_t li,
-        BdptCandidateScratch&   scratch,
-        std::vector<BdptConnectionRecord>& conn_batch,
-        double&                 pixel_accum) -> void
-    {
-        const BdptVertexRecord& l = *light.v[li];
-        if (!vertex_connectable(l)) return;
-        if (!light.prefix_valid[li]) return;
-
-        const float dx    = l.pos[0] - c.pos[0];
-        const float dy    = l.pos[1] - c.pos[1];
-        const float dz    = l.pos[2] - c.pos[2];
-        const float dist2 = dx*dx + dy*dy + dz*dz;
-        if (dist2 < 1e-12f) return;
-        const float dist  = std::sqrt(dist2);
-        const float cx    = dx/dist, cy = dy/dist, cz = dz/dist;
-        const float cos_c = std::abs(c.normal[0]*cx  + c.normal[1]*cy  + c.normal[2]*cz);
-        const float cos_l = std::abs(l.normal[0]*(-cx)+ l.normal[1]*(-cy)+ l.normal[2]*(-cz));
-        const float geom  = cos_c * cos_l / dist2;
-        if (geom < t5_min_geom) return;
-
-        const double beta_light = beta_scalar(l, n_bands);
-        if (beta_light < 1e-15) return;
-
-        const bool is_visible = visible(c, l);
-
-        double strategy_pdf = 0.0, denom = 0.0;
-        if (!candidate_strategy_density(cam, ci, light, li, scratch, strategy_pdf, denom))
-            return;
-        const double mis_weight = strategy_pdf / denom;
-
-        BdptConnectionRecord cr{};
-        cr.camera_subpath_id   = c.subpath_id;
-        cr.light_subpath_id    = l.subpath_id;
-        cr.camera_vertex_index = c.vertex_index;
-        cr.light_vertex_index  = l.vertex_index;
-        cr.strategy_s          = static_cast<uint16_t>(std::min<size_t>(ci + 1, 0xFFFFu));
-        cr.strategy_t          = static_cast<uint16_t>(std::min<size_t>(li + 1, 0xFFFFu));
-        cr.flags               = is_visible ? 0u : (1u << 0);
-        cr.p0[0] = c.pos[0]; cr.p0[1] = c.pos[1]; cr.p0[2] = c.pos[2];
-        cr.p1[0] = l.pos[0]; cr.p1[1] = l.pos[1]; cr.p1[2] = l.pos[2];
-        cr.dist2               = dist2;
-        cr.cos_camera          = cos_c;
-        cr.cos_light           = cos_l;
-        cr.geometry_term       = geom;
-        cr.visibility          = is_visible ? 1.0f : 0.0f;
-        cr.strategy_pdf        = static_cast<float>(
-            std::min(strategy_pdf, (double)std::numeric_limits<float>::max()));
-        cr.mis_weight          = static_cast<float>(mis_weight);
-        conn_batch.push_back(cr);
-        if (conn_batch.size() >= 4096) flush_connections(conn_batch);
-        if (!is_visible) return;
-
-        pixel_accum += beta_cam * beta_light * (double)geom / strategy_pdf * mis_weight;
-    };
-
-    /* ── FULL_SEARCH worker: test every cam×light subpath pair ─────────── */
-    auto worker_full = [&](size_t tid, size_t c_begin, size_t c_end) {
-        BdptCandidateScratch scratch;
-        std::vector<BdptConnectionRecord> conn_batch;
-        conn_batch.reserve(4096);
-        auto& sensor_local = local_sensor[tid];
-        uint64_t exact_local = 0;
-
-        for (size_t ck = c_begin; ck < c_end; ++ck) {
-            const BdptSubpathView& cam = *cam_items[ck];
-            for (const BdptSubpathView* light_ptr : light_items) {
-                const BdptSubpathView& light = *light_ptr;
-                for (size_t ci = 0; ci < cam.v.size(); ++ci) {
-                    const BdptVertexRecord& c = *cam.v[ci];
-                    if (!vertex_connectable(c)) continue;
-                    if (!cam.prefix_valid[ci]) continue;
-                    const int iy = static_cast<int>((c.sensor_origin_y + ps->sensor_pr) * inv_r);
-                    const int iz = static_cast<int>((c.sensor_origin_z + ps->sensor_pr) * inv_r);
-                    if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
-                    const double beta_cam = beta_scalar(c, n_bands);
-                    if (beta_cam < 1e-15) continue;
-
-                    double pixel_accum = 0.0;
-                    for (size_t li = 0; li < light.v.size(); ++li)
-                        try_connect_pair(cam, ci, c, beta_cam, light, li,
-                                         scratch, conn_batch, pixel_accum);
-
-                    if (pixel_accum > 0.0) {
-                        sensor_local[static_cast<size_t>(iy * res + iz)] += pixel_accum;
-                        ++exact_local;
-                    }
-                }
-            }
-        }
-        flush_connections(conn_batch);
-        local_exact[tid] = exact_local;
-    };
-
-    /* ── HASH_GRID: build flat connectable light vertex list + cell hash ── */
-    struct LightVertRef {
-        const BdptVertexRecord* rec;
-        const BdptSubpathView*  sp;
-        uint32_t                li;
-    };
-    std::vector<LightVertRef> light_verts_flat;
-    std::unordered_multimap<uint64_t, uint32_t> light_grid;
-
+    /* ── HASH_GRID: build modular T5HashGrid ────────────────────────────── */
     const float cs  = (ps->cfg.t5_grid_cell_size > 0.0f)
                       ? ps->cfg.t5_grid_cell_size : 0.25f;
     const float ics = 1.0f / cs;
     const int   rc  = std::max(1, ps->cfg.t5_grid_radius_cells);
 
-    auto encode_cell = [](int gx, int gy, int gz) -> uint64_t {
-        /* 21-bit per axis, biased by 1<<20 to handle negative coordinates. */
-        return (static_cast<uint64_t>(gx + (1 << 20)) << 42)
-             | (static_cast<uint64_t>(gy + (1 << 20)) << 21)
-             |  static_cast<uint64_t>(gz + (1 << 20));
-    };
+    std::vector<LightVertRef> light_verts_flat;
+    T5HashGrid t5_hg;
 
     if (ps->cfg.t5_strategy == T5Strategy::HASH_GRID) {
         for (const auto* lsp : light_items) {
             for (uint32_t li = 0; li < static_cast<uint32_t>(lsp->v.size()); ++li) {
                 const BdptVertexRecord* lv = lsp->v[li];
-                if (!vertex_connectable(*lv)) continue;
+                if (!ctx.vertex_connectable(*lv)) continue;
                 if (!lsp->prefix_valid[li]) continue;
                 if (lv->throughput_scalar < 1e-15f) continue;
                 light_verts_flat.push_back({lv, lsp, li});
             }
         }
-        light_grid.reserve(light_verts_flat.size() * 2);
-        for (uint32_t i = 0; i < static_cast<uint32_t>(light_verts_flat.size()); ++i) {
-            const float* p = light_verts_flat[i].rec->pos;
-            light_grid.emplace(
-                encode_cell(static_cast<int>(std::floor(p[0] * ics)),
-                            static_cast<int>(std::floor(p[1] * ics)),
-                            static_cast<int>(std::floor(p[2] * ics))),
-                i);
+
+        const uint32_t n_lv = static_cast<uint32_t>(light_verts_flat.size());
+        std::vector<float> light_packed(static_cast<size_t>(n_lv) * T5_LGV_STRIDE, 0.0f);
+        for (uint32_t i = 0; i < n_lv; ++i) {
+            const BdptVertexRecord& lr = *light_verts_flat[i].rec;
+            float* p = light_packed.data() + static_cast<size_t>(i) * T5_LGV_STRIDE;
+            p[0]  = lr.pos[0];    p[1]  = lr.pos[1];    p[2]  = lr.pos[2];
+            p[3]  = lr.normal[0]; p[4]  = lr.normal[1]; p[5]  = lr.normal[2];
+            p[6]  = lr.throughput_scalar;
+            std::memcpy(&p[7], &lr.flags,         sizeof(uint32_t));
+            std::memcpy(&p[8], &lr.subpath_id,    sizeof(uint32_t));
+            const uint32_t vinfo = (uint32_t)lr.vertex_index | ((uint32_t)lr.stream << 16);
+            std::memcpy(&p[9], &vinfo,             sizeof(uint32_t));
+            p[10] = static_cast<float>(ctx.beta_scalar_val(lr));
+            p[11] = 0.0f;
         }
+        t5_hg.build_light(light_packed.data(), n_lv, cs);
     }
 
-    /* ── HASH_GRID worker: query (2rc+1)³ cells per camera vertex ───────── */
-    auto worker_hash = [&](size_t tid, size_t c_begin, size_t c_end) {
-        BdptCandidateScratch scratch;
-        std::vector<BdptConnectionRecord> conn_batch;
-        conn_batch.reserve(4096);
-        auto& sensor_local = local_sensor[tid];
-        uint64_t exact_local = 0;
+    /* ── Dispatch: GPU or CPU strategy ─────────────────────────────────── */
+    const bool use_hash  = (ps->cfg.t5_strategy == T5Strategy::HASH_GRID);
+    const bool gpu_t5_ok = use_hash
+                        && ps->gpu_dispatch != nullptr
+                        && ps->gpu_dispatch->prog_t5 != 0
+                        && !cam_items.empty()
+                        && !light_verts_flat.empty();
 
-        for (size_t ck = c_begin; ck < c_end; ++ck) {
-            const BdptSubpathView& cam = *cam_items[ck];
-            for (size_t ci = 0; ci < cam.v.size(); ++ci) {
-                const BdptVertexRecord& c = *cam.v[ci];
-                if (!vertex_connectable(c)) continue;
-                if (!cam.prefix_valid[ci]) continue;
-                const int iy = static_cast<int>((c.sensor_origin_y + ps->sensor_pr) * inv_r);
-                const int iz = static_cast<int>((c.sensor_origin_z + ps->sensor_pr) * inv_r);
-                if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
-                const double beta_cam = beta_scalar(c, n_bands);
-                if (beta_cam < 1e-15) continue;
+    std::vector<uint32_t> gpu_pixel_result;
 
-                const int gx0 = static_cast<int>(std::floor(c.pos[0] * ics));
-                const int gy0 = static_cast<int>(std::floor(c.pos[1] * ics));
-                const int gz0 = static_cast<int>(std::floor(c.pos[2] * ics));
+    if (gpu_t5_ok) {
+        /* ── GPU T5 path: pack camera verts, set params, submit ─────── */
+        uint32_t n_cv = 0;
+        for (const auto* csp : cam_items)
+            for (size_t ci = 0; ci < csp->v.size(); ++ci)
+                if (ctx.vertex_connectable(*csp->v[ci]) && csp->prefix_valid[ci]
+                    && ctx.beta_scalar_val(*csp->v[ci]) >= 1e-15)
+                    ++n_cv;
 
-                double pixel_accum = 0.0;
-                for (int dix = -rc; dix <= rc; ++dix) {
-                    for (int diy = -rc; diy <= rc; ++diy) {
-                        for (int diz = -rc; diz <= rc; ++diz) {
-                            auto [beg, end] = light_grid.equal_range(
-                                encode_cell(gx0+dix, gy0+diy, gz0+diz));
-                            for (auto it = beg; it != end; ++it) {
-                                const LightVertRef& lv = light_verts_flat[it->second];
-                                try_connect_pair(cam, ci, c, beta_cam,
-                                                 *lv.sp, lv.li,
-                                                 scratch, conn_batch, pixel_accum);
-                            }
-                        }
-                    }
-                }
-                if (pixel_accum > 0.0) {
-                    sensor_local[static_cast<size_t>(iy * res + iz)] += pixel_accum;
-                    ++exact_local;
-                }
+        std::vector<float> cam_packed(static_cast<size_t>(n_cv) * T5_CGV_STRIDE, 0.0f);
+        uint32_t ci_flat = 0;
+        for (const auto* csp : cam_items) {
+            for (size_t ci = 0; ci < csp->v.size(); ++ci) {
+                const BdptVertexRecord& c = *csp->v[ci];
+                if (!ctx.vertex_connectable(c)) continue;
+                if (!csp->prefix_valid[ci]) continue;
+                const double bc = ctx.beta_scalar_val(c);
+                if (bc < 1e-15) continue;
+                float* p = cam_packed.data() + static_cast<size_t>(ci_flat++) * T5_CGV_STRIDE;
+                p[0]  = c.pos[0];    p[1]  = c.pos[1];    p[2]  = c.pos[2];
+                p[3]  = c.normal[0]; p[4]  = c.normal[1]; p[5]  = c.normal[2];
+                p[6]  = c.throughput_scalar;
+                std::memcpy(&p[7],  &c.flags,        sizeof(uint32_t));
+                std::memcpy(&p[8],  &c.subpath_id,   sizeof(uint32_t));
+                std::memcpy(&p[9],  &c.vertex_index, sizeof(uint32_t));
+                p[10] = static_cast<float>(bc);
+                p[11] = c.sensor_origin_y;
+                p[12] = c.sensor_origin_z;
+                p[13] = 0.0f;
             }
         }
-        flush_connections(conn_batch);
-        local_exact[tid] = exact_local;
-    };
 
-    /* ── Dispatch workers ────────────────────────────────────────────────── */
-    const bool use_hash = (ps->cfg.t5_strategy == T5Strategy::HASH_GRID);
-    auto dispatch_worker = [&](size_t tid, size_t lo, size_t hi) {
-        if (use_hash) worker_hash(tid, lo, hi);
-        else          worker_full(tid, lo, hi);
-    };
+        t5_hg.set_cam_verts(cam_packed.data(), ci_flat);
+        t5_hg.init_pixel_accum(res);
+        t5_hg.gpu_params.cell_size       = cs;
+        t5_hg.gpu_params.inv_cell_size   = ics;
+        t5_hg.gpu_params.min_geom        = (ps->cfg.t5_min_geom > 0.0f)
+                                           ? ps->cfg.t5_min_geom : 1e-8f;
+        t5_hg.gpu_params.sensor_half_w   = ps->sensor_half_w;
+        t5_hg.gpu_params.sensor_half_h   = ps->sensor_half_h;
+        t5_hg.gpu_params.n_light_verts   = t5_hg.n_light_verts();
+        t5_hg.gpu_params.n_cam_verts     = ci_flat;
+        t5_hg.gpu_params.radius_cells    = rc;
+        t5_hg.gpu_params.sensor_res      = res;
 
-    if (nw == 1) {
-        dispatch_worker(0, 0, cam_items.size());
+        fprintf(stderr, "[T5-gpu] submitting: n_cam=%u n_light=%u res=%d\n",
+                ci_flat, t5_hg.n_light_verts(), res);
+        fflush(stderr);
+
+        gpu_pixel_result = ps->gpu_dispatch->submit_t5_connect(t5_hg);
+
     } else {
-        std::vector<std::thread> workers;
-        workers.reserve(nw);
-        const size_t chunk = (cam_items.size() + nw - 1) / nw;
-        for (size_t t = 0; t < nw; ++t) {
-            const size_t lo = t * chunk;
-            const size_t hi = std::min(cam_items.size(), lo + chunk);
-            if (lo >= hi) break;
-            workers.emplace_back([&, t, lo, hi] { dispatch_worker(t, lo, hi); });
-        }
-        for (auto& th : workers)
-            if (th.joinable()) th.join();
+        /* ── CPU strategy dispatch (ThreadPool-based) ───────────────── */
+        if (use_hash)
+            run_t5_hash(ctx, cam_items, light_verts_flat, t5_hg,
+                        rc, ics, accums, t5_pool);
+        else
+            run_t5_allpairs(ctx, cam_items, light_items, accums, t5_pool);
     }
 
     uint64_t exact_total = 0;
     {
         std::lock_guard<std::mutex> lk(ps->sensor_mu);
-        const size_t ch2 = 2 * pix;
+
+        /* ── GPU pixel accum merge ───────────────────────────────────── *
+         * The GPU shader packs R[res²] G[res²] B[res²] as uint32 bit-   *
+         * casts of float.  Use neutral 1/3:1/3:1/3 weighting (same as  *
+         * the shader's channel split) since spectral colourisation is   *
+         * deferred to the CPU post-pass.                                */
+        if (gpu_t5_ok && !gpu_pixel_result.empty()) {
+            const size_t pix2 = static_cast<size_t>(res) * res;
+            for (size_t i = 0; i < pix2; ++i) {
+                float fr, fg, fb;
+                uint32_t ur = gpu_pixel_result[i];
+                uint32_t ug = gpu_pixel_result[pix2 + i];
+                uint32_t ub = gpu_pixel_result[2*pix2 + i];
+                std::memcpy(&fr, &ur, sizeof(float));
+                std::memcpy(&fg, &ug, sizeof(float));
+                std::memcpy(&fb, &ub, sizeof(float));
+                if (fr + fg + fb <= 0.0f) continue;
+                const double nr = (ps->sensor_accum[0 * pix2 + i] += (double)fr);
+                const double ng = (ps->sensor_accum[1 * pix2 + i] += (double)fg);
+                const double nb = (ps->sensor_accum[2 * pix2 + i] += (double)fb);
+                if (nr > ps->sensor_peak[0]) ps->sensor_peak[0] = nr;
+                if (ng > ps->sensor_peak[1]) ps->sensor_peak[1] = ng;
+                if (nb > ps->sensor_peak[2]) ps->sensor_peak[2] = nb;
+            }
+        }
+
         for (size_t t = 0; t < nw; ++t) {
-            exact_total += local_exact[t];
-            const auto& src = local_sensor[t];
+            exact_total += accums[t].exact_count;
             for (size_t i = 0; i < pix; ++i) {
-                const double v = src[i];
-                if (v <= 0.0) continue;
-                const double nv = (ps->sensor_accum[ch2 + i] += v);
-                if (nv > ps->sensor_peak[2])
-                    ps->sensor_peak[2] = nv;
+                const double r = accums[t].sensor_r[i];
+                const double g = accums[t].sensor_g[i];
+                const double b = accums[t].sensor_b[i];
+                if (r + g + b <= 0.0) continue;
+                const double nr = (ps->sensor_accum[0 * pix + i] += r);
+                const double ng = (ps->sensor_accum[1 * pix + i] += g);
+                const double nb = (ps->sensor_accum[2 * pix + i] += b);
+                if (nr > ps->sensor_peak[0]) ps->sensor_peak[0] = nr;
+                if (ng > ps->sensor_peak[1]) ps->sensor_peak[1] = ng;
+                if (nb > ps->sensor_peak[2]) ps->sensor_peak[2] = nb;
             }
         }
     }
+
     if (exact_total > 0)
         ps->bdpt_exact_snaps.fetch_add(exact_total, std::memory_order_relaxed);
 
@@ -11663,6 +11499,12 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     /* Increment before the BdptConnectionRunGuard destructs so that
      * _fire_t5_if_ready cannot re-trigger before bdpt_connection_running
      * has been cleared. */
+    fprintf(stderr, "[T5-conn] PASS COMPLETE  exact_snaps=%lu near_miss=%lu overflow_conn=%lu  t5_fired→%u\n",
+            (unsigned long)ps->bdpt_exact_snaps.load(std::memory_order_relaxed),
+            (unsigned long)ps->bdpt_near_miss_count.load(std::memory_order_relaxed),
+            (unsigned long)ps->bdpt_overflow_connections.load(std::memory_order_relaxed),
+            ps->bdpt_t5_fired.load(std::memory_order_relaxed) + 1u);
+    fflush(stderr);
     ps->bdpt_t5_fired.fetch_add(1u, std::memory_order_release);
 }
 
@@ -11671,22 +11513,37 @@ static void _fire_t5_if_ready(RayPipelineState* ps)
     /* Fast pre-check without the mutex. */
     const uint32_t flash  = ps->bdpt_flash_dispatched.load(std::memory_order_acquire);
     const uint32_t sensor = ps->bdpt_sensor_dispatched.load(std::memory_order_acquire);
-    if (std::min(flash, sensor) <= ps->bdpt_t5_fired.load(std::memory_order_acquire))
+    const uint32_t fired0 = ps->bdpt_t5_fired.load(std::memory_order_acquire);
+    if (std::min(flash, sensor) <= fired0) {
+        fprintf(stderr, "[T5-fire] SKIP pre-check: flash=%u sensor=%u t5_fired=%u min=%u\n",
+                flash, sensor, fired0, std::min(flash, sensor));
+        fflush(stderr);
         return;
+    }
 
     std::lock_guard<std::mutex> lk(ps->bdpt_t5_spawn_mu);
 
     /* Re-read under the lock to avoid a TOCTOU race with a concurrent signal. */
     const uint32_t f2 = ps->bdpt_flash_dispatched.load(std::memory_order_acquire);
     const uint32_t s2 = ps->bdpt_sensor_dispatched.load(std::memory_order_acquire);
-    if (std::min(f2, s2) <= ps->bdpt_t5_fired.load(std::memory_order_acquire))
+    const uint32_t t2 = ps->bdpt_t5_fired.load(std::memory_order_acquire);
+    if (std::min(f2, s2) <= t2) {
+        fprintf(stderr, "[T5-fire] SKIP locked: flash=%u sensor=%u t5_fired=%u\n", f2, s2, t2);
+        fflush(stderr);
         return;
+    }
 
     /* Skip if a pass is already running; it will observe the updated counts
      * through bdpt_t5_fired once it finishes, and the next signal call will
      * re-enter this path. */
-    if (ps->bdpt_connection_running.load(std::memory_order_acquire))
+    if (ps->bdpt_connection_running.load(std::memory_order_acquire)) {
+        fprintf(stderr, "[T5-fire] SKIP already running: flash=%u sensor=%u t5_fired=%u\n", f2, s2, t2);
+        fflush(stderr);
         return;
+    }
+
+    fprintf(stderr, "[T5-fire] SPAWNING T5: flash=%u sensor=%u t5_fired=%u\n", f2, s2, t2);
+    fflush(stderr);
 
     /* Join the previous T5 thread (already done if we got past the running
      * check above) before starting a new one. */
@@ -11701,7 +11558,12 @@ static void _fire_t5_if_ready(RayPipelineState* ps)
 void ray_pipeline_signal_flash_dispatched(RayPipelineState* ps)
 {
     if (!ps) return;
-    ps->bdpt_flash_dispatched.fetch_add(1u, std::memory_order_release);
+    const uint32_t new_flash = ps->bdpt_flash_dispatched.fetch_add(1u, std::memory_order_release) + 1u;
+    fprintf(stderr, "[T5-signal] flash_dispatched → %u  sensor=%u  t5_fired=%u\n",
+            new_flash,
+            ps->bdpt_sensor_dispatched.load(std::memory_order_acquire),
+            ps->bdpt_t5_fired.load(std::memory_order_acquire));
+    fflush(stderr);
     _fire_t5_if_ready(ps);
 }
 
@@ -11710,7 +11572,51 @@ void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps)
     if (!ps) return;
     /* Only arms the latch. T5 fires from GPU T3 post-processing once sensor
      * vertices are actually in the queue — not here at submission time. */
-    ps->bdpt_sensor_dispatched.fetch_add(1u, std::memory_order_release);
+    const uint32_t new_sensor = ps->bdpt_sensor_dispatched.fetch_add(1u, std::memory_order_release) + 1u;
+    fprintf(stderr, "[T5-signal] sensor_dispatched → %u  flash=%u  t5_fired=%u\n",
+            new_sensor,
+            ps->bdpt_flash_dispatched.load(std::memory_order_acquire),
+            ps->bdpt_t5_fired.load(std::memory_order_acquire));
+    fflush(stderr);
+}
+
+void ray_pipeline_join_t5(RayPipelineState* ps)
+{
+    if (!ps) return;
+    /* Block until the current T5 worker thread (if any) has finished.
+     * Acquires bdpt_t5_spawn_mu so no new T5 can be spawned concurrently. */
+    std::lock_guard<std::mutex> lk(ps->bdpt_t5_spawn_mu);
+    if (ps->bdpt_t5_worker.joinable())
+        ps->bdpt_t5_worker.join();
+}
+
+/* CIE-approximate spectral locus: band index → linear RGB weights.
+ * Uses freq_hz_vec if available; otherwise linearly interpolates 380–700 nm.
+ * Weights are in [0,1]; they do not sum to 1 (spectral colour is not white). */
+static void band_to_display_rgb(int b, int n_bands,
+                                 const Eigen::VectorXd& freq_hz_vec,
+                                 double& wr, double& wg, double& wb)
+{
+    if (n_bands <= 1 || b < 0 || b >= n_bands) { wr = wg = wb = 1.0; return; }
+    double wl_nm = 550.0;
+    if (b < (int)freq_hz_vec.size() && freq_hz_vec[b] > 0.0) {
+        constexpr double C = 299792458.0;
+        wl_nm = std::max(380.0, std::min(700.0, (C / freq_hz_vec[b]) * 1.0e9));
+    } else {
+        const double t = static_cast<double>(b) / static_cast<double>(n_bands - 1);
+        wl_nm = 380.0 + t * 320.0;
+    }
+    wr = wg = wb = 0.0;
+    if      (wl_nm < 440.0) { wr = -(wl_nm-440.0)/60.0; wb = 1.0; }
+    else if (wl_nm < 490.0) { wg =  (wl_nm-440.0)/50.0; wb = 1.0; }
+    else if (wl_nm < 510.0) { wg = 1.0; wb = -(wl_nm-510.0)/20.0; }
+    else if (wl_nm < 580.0) { wr =  (wl_nm-510.0)/70.0; wg = 1.0; }
+    else if (wl_nm < 645.0) { wr = 1.0; wg = -(wl_nm-645.0)/65.0; }
+    else                    { wr = 1.0; }
+    double edge = 1.0;
+    if      (wl_nm < 420.0) edge = 0.3 + 0.7*(wl_nm-380.0)/40.0;
+    else if (wl_nm > 645.0) edge = 0.3 + 0.7*(700.0-wl_nm)/55.0;
+    wr *= edge; wg *= edge; wb *= edge;
 }
 
 void ray_pipeline_set_t5_strategy(RayPipelineState* ps, T5Strategy s)
@@ -11806,7 +11712,7 @@ void ray_pipeline_set_shuffle(RayPipelineState* ps, float shuffle_frac)
 
 void ray_pipeline_configure_sensor_image(
     RayPipelineState* ps,
-    float plate_x, float plate_r,
+    float plate_x, float plate_half_w, float plate_half_h,
     int   res,
     float bdpt_eps,
     float target_x,
@@ -11814,13 +11720,14 @@ void ray_pipeline_configure_sensor_image(
 {
     if (!ps) return;
     std::lock_guard<std::mutex> lk(ps->sensor_mu);
-    ps->sensor_res = res;
-    ps->sensor_px  = plate_x;
-    ps->sensor_pr  = (plate_r > 0.0f) ? plate_r : 0.16f;
-    ps->sensor_eps = (bdpt_eps > 0.0f) ? bdpt_eps : 0.008f;
+    ps->sensor_res    = res;
+    ps->sensor_px     = plate_x;
+    ps->sensor_half_w = (plate_half_w > 0.0f) ? plate_half_w : 0.028f;
+    ps->sensor_half_h = (plate_half_h > 0.0f) ? plate_half_h : 0.028f;
+    ps->sensor_eps    = (bdpt_eps > 0.0f) ? bdpt_eps : 0.008f;
     ps->sensor_target_x = target_x;
     ps->sensor_target_r = target_r;
-    /* 4 channels: ch0=forward hits, ch1=backward emissive, ch2=exact BDPT, ch3=near-miss */
+    /* 4 channels: ch0=R, ch1=G, ch2=B (spectral, all path types), ch3=near-miss */
     ps->sensor_accum.assign(static_cast<size_t>(res) * res * 4, 0.0);
     ps->priority_map.assign(static_cast<size_t>(res) * res, 1.0f);
     /* Reset running peaks so the new accumulator starts fresh. */
@@ -11849,22 +11756,17 @@ void ray_pipeline_get_sensor_image(
     };
     /* Output layout: (res, res, 3) RGB, rows written bottom-first (y-flipped)
      * so the returned NumPy array is already in OpenGL texture order.
-     *   R = ch0  (forward plate hits, irradiance)
-     *   G = ch1 + ch3  (sensor photon count: each emissive connection counts 1,
-     *         plus provisional near-miss ch3 attenuated where ch2 is strong)
-     *   B = ch2 (amplitude-weighted BDPT radiance) */
+     * ch0=R, ch1=G, ch2=B — spectral accumulation via band_to_display_rgb;
+     * all path types (forward, backward emissive, BDPT) contribute to each
+     * channel weighted by their spectral composition. */
     for (int y = 0; y < res; ++y) {
         const int out_y = res - 1 - y;  /* flip for OpenGL bottom-to-top convention */
         for (int z = 0; z < res; ++z) {
             const size_t src_px = static_cast<size_t>(y * res + z);
             const size_t dst_px = static_cast<size_t>(out_y * res + z);
-            const float ch2_n = tone(ps->sensor_accum[2 * pix + src_px], peak[2]);
-            const float attn  = 1.0f - std::min(1.0f, ch2_n);  /* provisional fades as exact grows */
             buf[dst_px * 3 + 0] = tone(ps->sensor_accum[0 * pix + src_px], peak[0]);  /* R */
-            buf[dst_px * 3 + 1] = std::min(1.0f,
-                tone(ps->sensor_accum[1 * pix + src_px], peak[1]) +
-                attn * tone(ps->sensor_accum[3 * pix + src_px], peak[3]));             /* G */
-            buf[dst_px * 3 + 2] = ch2_n;                                               /* B */
+            buf[dst_px * 3 + 1] = tone(ps->sensor_accum[1 * pix + src_px], peak[1]);  /* G */
+            buf[dst_px * 3 + 2] = tone(ps->sensor_accum[2 * pix + src_px], peak[2]);  /* B */
         }
     }
 }

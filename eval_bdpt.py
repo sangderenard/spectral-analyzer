@@ -99,7 +99,8 @@ def run(
 
     bench.tracer.configure_sensor_image(
         float(scene.image_plate.x),
-        float(scene.image_plate.radius),
+        float(scene.image_plate.sensor_half_w),
+        float(scene.image_plate.sensor_half_h),
         int(max(16, scene.image_plate.sensor_res)),
         0.008,
     )

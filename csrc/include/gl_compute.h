@@ -303,4 +303,14 @@ extern PFNGLDELETEVERTEXARRAYSPROC  glc_DeleteVertexArrays;
 #ifdef __cplusplus
 GLuint gl_compute_build_program(const char* glsl_source,
                                  char* err_out, int err_sz);
+
+/**
+ * Two-source variant: driver concatenates preamble + main_source as a single
+ * compilation unit.  preamble must NOT contain a #version directive — the
+ * main_source must start with one.  preamble may be nullptr (falls back to
+ * single-source path).
+ */
+GLuint gl_compute_build_program2(const char* main_source,
+                                  const char* preamble,
+                                  char* err_out, int err_sz);
 #endif

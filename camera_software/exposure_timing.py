@@ -137,7 +137,11 @@ class CameraExposureScheduler:
 
         stages = int(max(1, getattr(burst, "stages", 1)))
         exposure_time = float(getattr(burst, "exposure_time_s", 0.010))
-        if dt_s is not None:
+        # burst.exposure_time_s is authoritative — the scene-coordinator's dt_s
+        # (driven by the display loop) must NOT override the camera program.
+        # dt_s is only a fallback for when no burst is configured or its
+        # exposure_time_s is zero/negative.
+        if exposure_time <= 0.0 and dt_s is not None:
             exposure_time = float(max(0.0, dt_s))
         if exposure_time <= 0.0:
             exposure_time = 0.010
@@ -483,6 +487,7 @@ class ExposureBarrier:
         self._flash_dispatched_through: int = -1
         self.flash_submitted_through: int = -1   # confirmed materialized
         self.sensor_submitted_through: int = -1
+        self.on_flash_materialized = None  # callable(slice_id) — camera software fires sensor
 
     def record_flash_dispatched(self, slice_id: int, submitted: int = 1) -> None:
         self._flash_dispatched_through = max(self._flash_dispatched_through, slice_id)
@@ -492,6 +497,8 @@ class ExposureBarrier:
 
     def confirm_flash_materialized(self, slice_id: int) -> None:
         self.flash_submitted_through = max(self.flash_submitted_through, slice_id)
+        if self.on_flash_materialized is not None:
+            self.on_flash_materialized(slice_id)
 
     def sensor_may_submit(self, slice_id: int) -> bool:
         prereq = self.timeline.prerequisite_flash_slice_for_sensor.get(slice_id, -1)

@@ -4330,6 +4330,7 @@ class ForwardCppLensBench:
         self._plate_sensor_electrons_accum: Optional[np.ndarray] = None
         self._last_bdpt_records: Optional[np.ndarray] = None
         self._last_bdpt_plate_rgb: Optional[np.ndarray] = None
+        self._last_direct_img: Optional[np.ndarray] = None
         self._bdpt_endpoints: BdptEndpointStore = BdptEndpointStore()
         self._bdpt_segments: BdptSegmentStore = BdptSegmentStore(max_rows=2_000_000)
         self._optical_transfers: OpticalTransferStore = OpticalTransferStore(max_rows=2_000_000)
@@ -6723,8 +6724,7 @@ class ForwardCppLensBench:
                 flush=True,
             )
 
-            self._last_bdpt_plate_rgb = np.ascontiguousarray(np.clip(img, 0.0, 1.0), dtype=np.float32)
-            return self._last_bdpt_plate_rgb
+            return np.ascontiguousarray(np.clip(img, 0.0, 1.0), dtype=np.float32)
     def _do_register_neural_assembly_group(self) -> None:
         """Re-register neural assembly after clear_tri_groups().  No-op if no MLP loaded."""
         if self._lens_assembly is None or self._lens_assembly.mode != LensAssemblySpec.MODE_MLP:
@@ -6818,6 +6818,7 @@ class ForwardCppLensBench:
                 if isinstance(v, np.ndarray):
                     v[:] = 0.0
         self._last_bdpt_plate_rgb = None
+        self._last_direct_img = None
         self._last_bdpt_records = None
         self._bdpt_segments.clear()
         self._optical_transfers.clear()
@@ -8790,6 +8791,15 @@ def run(
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, _pip_res, _pip_res, 0,
                  GL_RGB, GL_FLOAT, _pip_blank)
 
+    tex_green_pip = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex_green_pip)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F, _pip_res, _pip_res, 0,
+                 GL_RGB, GL_FLOAT, _pip_blank)
+
     # ── Per-physical-group analytical UV page array ─────────────────────────
     tex_uv_pages = glGenTextures(1)
     _uv_layers = max(1, len(bench.uv_page_bank.groups) if bench.uv_page_bank is not None else 1)
@@ -8913,12 +8923,13 @@ def run(
         print(f"[gl-renderer] scene VAO built: {n_tris*3} verts, "
               f"{len(bank.groups) if bank is not None else 0} UV groups", flush=True)
 
-    # PIP viewports: C++ BDPT image + forward strike image.
+    # PIP viewports: reverse-strikes | direct-illum | forward-strikes | bdpt-plate
     _pip_dim = int(min(W * 0.22, H * 0.22))
     _pip_gap = 10
-    _bdpt_pip_vx = (W - (3 * _pip_dim + 2 * _pip_gap)) // 2
-    _pip_vx      = _bdpt_pip_vx + _pip_dim + _pip_gap
-    _uv_pip_vx   = _pip_vx      + _pip_dim + _pip_gap
+    _bdpt_pip_vx  = (W - (4 * _pip_dim + 3 * _pip_gap)) // 2
+    _pip_vx       = _bdpt_pip_vx  + _pip_dim + _pip_gap
+    _uv_pip_vx    = _pip_vx       + _pip_dim + _pip_gap
+    _green_pip_vx = _uv_pip_vx    + _pip_dim + _pip_gap
     _pip_vy  = 6
 
     # HUD text texture — RGBA8, constrained to one PIP column.
@@ -8959,38 +8970,55 @@ def run(
         glUseProgram(0)
 
     def draw_pip() -> None:
-        # ── Left pip: reverse/light-path strike distribution (violet border) ─
-        rev_img = bench.get_reverse_strike_image()
-        if rev_img.shape[0] > 0:
-            glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
-                         rev_img.shape[1], rev_img.shape[0], 0,
-                         GL_RGB, GL_FLOAT, rev_img)
-        _draw_quad_with_pip_prog(
-            tex_bdpt_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
-            border_col=(0.58, 0.32, 1.00),
-        )
+        def _rot180(arr: np.ndarray) -> np.ndarray:
+            """180° rotation = flip both axes (sensor-view correction)."""
+            return np.ascontiguousarray(arr[::-1, ::-1], dtype=np.float32)
 
-        # ── Centre pip: BDPT sensor plate (cyan border) ─────────────────────
-        bdpt_plate = bench._last_bdpt_plate_rgb
-        if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
-            bdpt_disp = np.ascontiguousarray(bdpt_plate[::-1, :], dtype=np.float32)
-            glBindTexture(GL_TEXTURE_2D, tex_pip)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
-                         bdpt_disp.shape[1], bdpt_disp.shape[0], 0,
-                         GL_RGB, GL_FLOAT, bdpt_disp)
-        _draw_quad_with_pip_prog(tex_pip, _pip_vx, _pip_vy, _pip_dim, _pip_dim)
-
-        # ── Right pip: forward ray strikes (orange border) ──────────────────
+        # ── Pos 0 (leftmost): forward ray strikes — projection map, no rotation ─
         fwd_img = bench.get_forward_strike_image()
         if fwd_img.shape[0] > 0:
             glBindTexture(GL_TEXTURE_2D, tex_forward_pip)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
                          fwd_img.shape[1], fwd_img.shape[0], 0,
-                         GL_RGB, GL_FLOAT, fwd_img)
+                         GL_RGB, GL_FLOAT, np.ascontiguousarray(fwd_img, dtype=np.float32))
         _draw_quad_with_pip_prog(
-            tex_forward_pip, _uv_pip_vx, _pip_vy, _pip_dim, _pip_dim,
+            tex_forward_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(1.00, 0.62, 0.18),
+        )
+
+        # ── Pos 1: backward/reverse strikes — projection map, no rotation ────
+        rev_img = bench.get_reverse_strike_image()
+        if rev_img.shape[0] > 0:
+            glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         rev_img.shape[1], rev_img.shape[0], 0,
+                         GL_RGB, GL_FLOAT, np.ascontiguousarray(rev_img, dtype=np.float32))
+        _draw_quad_with_pip_prog(
+            tex_bdpt_pip, _pip_vx, _pip_vy, _pip_dim, _pip_dim,
+            border_col=(0.58, 0.32, 1.00),
+        )
+
+        # ── Pos 2: direct illum / specular — sensor view, 180° correction ────
+        direct_img = bench._last_direct_img
+        if direct_img is not None and direct_img.shape[0] > 0:
+            glBindTexture(GL_TEXTURE_2D, tex_pip)
+            _di_disp = _rot180(direct_img)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         _di_disp.shape[1], _di_disp.shape[0], 0,
+                         GL_RGB, GL_FLOAT, _di_disp)
+        _draw_quad_with_pip_prog(tex_pip, _uv_pip_vx, _pip_vy, _pip_dim, _pip_dim)
+
+        # ── Pos 3 (rightmost): BDPT plate / processed — sensor view, 180° ────
+        bdpt_plate = bench._last_bdpt_plate_rgb
+        if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
+            glBindTexture(GL_TEXTURE_2D, tex_green_pip)
+            _bp_disp = _rot180(bdpt_plate)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         _bp_disp.shape[1], _bp_disp.shape[0], 0,
+                         GL_RGB, GL_FLOAT, _bp_disp)
+        _draw_quad_with_pip_prog(
+            tex_green_pip, _green_pip_vx, _pip_vy, _pip_dim, _pip_dim,
+            border_col=(0.20, 0.85, 0.30),
         )
 
         # --- BDPT stats text rendered as a texture quad above the PIP ---
@@ -9108,21 +9136,46 @@ def run(
             (255, 180, 90) if int(bench.bdpt_last_optical_transfer.get("failed_rays", 0)) > 0 else (120, 255, 160),
             (255, 150, 90) if (_cx_ovv > 0 or _cx_ovc > 0) else (160, 160, 160),
         ]
-        _draw_hud(tracking_lines, tracking_cols, _bdpt_pip_vx)
+        _draw_hud(tracking_lines, tracking_cols, _pip_vx)
 
-        plate_lines = [
-            "BDPT sensor",
-            f"lit {_cx_lit:_}",
-            f"{100.0 * _cx_frac:.1f}% near {_cx_near:_}",
+        # ── Centre pip HUD: direct illumination stats ───────────────────────
+        _di_arr = bench._last_direct_img
+        _di_lit  = 0
+        _di_mean = 0.0
+        _di_max  = 0.0
+        if _di_arr is not None and _di_arr.size > 0:
+            _di_sum = np.sum(_di_arr, axis=2)
+            _di_lit  = int(np.count_nonzero(_di_sum > 1e-8))
+            _di_mean = float(np.mean(_di_arr))
+            _di_max  = float(np.max(_di_arr))
+        direct_lines = [
+            "direct illum",
+            f"lit {_di_lit:_}",
+            f"mean {_di_mean:.4f}  max {_di_max:.3f}",
+        ]
+        direct_cols = [
+            (80, 210, 255),
+            (120, 255, 160) if _di_lit > 0 else (160, 160, 160),
+            (80, 210, 255)  if _di_mean > 0 else (160, 160, 160),
+        ]
+        _draw_hud(direct_lines, direct_cols, _uv_pip_vx)
+
+        # ── Green pip HUD: BDPT plate + connection stats ─────────────────────
+        green_lines = [
+            "BDPT plate",
+            f"lit {_cx_lit:_}  {100.0 * _cx_frac:.1f}%",
+            f"near {_cx_near:_}",
             f"phot {bench.bdpt_last_sensor_photons:.2e}",
+            f"sens {_cx_sens:_}",
         ]
-        plate_cols = [
-            (100, 220, 255),
-            (120, 255, 160) if _cx_lit > 0 else (160, 160, 160),
-            (100, 220, 255) if _cx_lit > 0 else (160, 160, 160),
+        green_cols = [
+            (60, 210, 100),
+            (120, 255, 160) if _cx_lit  > 0   else (160, 160, 160),
+            (100, 220, 255) if _cx_near > 0   else (160, 160, 160),
             (120, 255, 160) if bench.bdpt_last_sensor_photons > 0.0 else (160, 160, 160),
+            (80,  210, 255),
         ]
-        _draw_hud(plate_lines, plate_cols, _pip_vx)
+        _draw_hud(green_lines, green_cols, _green_pip_vx)
 
         # ── Camera assembly relaxation stats above right (orange) PIP ──────
         _gcc = bench._gid_crossing_counts
@@ -9185,7 +9238,7 @@ def run(
             f"cut f/b {_front_cut:.1f}/{_back_cut:.1f}deg",
         ]
         assembly_cols = [(255, 170, 70)] * len(assembly_lines)
-        _draw_hud(assembly_lines, assembly_cols, _uv_pip_vx)
+        _draw_hud(assembly_lines, assembly_cols, _bdpt_pip_vx)
 
     _vol_tex_size = [bench._field_nx, bench._field_ny, bench._field_nz]  # already allocated at init
 
@@ -10015,6 +10068,7 @@ def run(
                 _di = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
                 if _di.ndim == 3 and _di.shape[2] >= 3 and _di.shape[0] > 0:
                     _direct_img = np.ascontiguousarray(np.clip(_di[:, :, :3], 0.0, 1.0), dtype=np.float32)
+                    bench._last_direct_img = _direct_img
                     _lit_d = int(np.count_nonzero(np.sum(_direct_img, axis=2) > 1e-8))
                     print(f"[exposure] direct-lighting snapshot: lit_px={_lit_d}", flush=True)
             except Exception as _di_exc:
@@ -10129,6 +10183,7 @@ def run(
             bench._forward_img_accum[:] = 0.0
             bench._reverse_img_accum[:] = 0.0
             bench._last_bdpt_plate_rgb = None
+            bench._last_direct_img = None
             bench._camera_exposure_complete = False
             bench._camera_exposure_forward_stage = 0
             bench._bdpt_camera_sweep_stage = 0

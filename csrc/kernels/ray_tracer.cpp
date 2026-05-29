@@ -9235,14 +9235,15 @@ public:
                  upload(ssbo_t5_pix,    pix.data(), (GLsizeiptr)(npi * sizeof(uint32_t)));
                  upload(ssbo_t5_params, &par,        sizeof(T5GpuParams));
 
-        /* ── Batched dispatch: loop through light verts in fixed-size chunks ─ *
-         * Each dispatch covers [light_offset, light_offset+light_batch_size). *
-         * Pixel accum stays in VRAM between batches — only params re-uploaded.*
-         * Batch size keeps each dispatch well under the Windows 2-second TDR. */
+        /* ── Batched 2-D dispatch ─────────────────────────────────────────── *
+         * X axis: camera vert tiles  (TILE_C verts per WG column).          *
+         * Y axis: light vert tiles within the current batch (TILE_L per WG).*
+         * Pixel accum stays in VRAM between batches; only params re-uploaded.*
+         * Batch size keeps each dispatch under the Windows 2-second TDR.    */
         const uint32_t T5_LIGHT_BATCH = t5_light_batch_size ? t5_light_batch_size : 4096u;
         const uint32_t n_cam      = par.n_cam_verts;
         const uint32_t n_light    = par.n_light_verts;
-        const GLuint   wg_x       = (GLuint)((n_cam + 63u) / 64u);
+        const GLuint   wg_x       = (GLuint)((n_cam + (uint32_t)T5_TILE_C - 1u) / (uint32_t)T5_TILE_C);
         const uint32_t n_batches  = (n_light + T5_LIGHT_BATCH - 1u) / T5_LIGHT_BATCH;
 
         glc_UseProgram(prog_t5);
@@ -9264,7 +9265,8 @@ public:
             par.light_batch_size = std::min(T5_LIGHT_BATCH, n_light - par.light_offset);
             /* Re-upload only the params block (40 bytes) — all other SSBOs stay */
             upload(ssbo_t5_params, &par, sizeof(T5GpuParams));
-            glc_DispatchCompute(wg_x, 1u, 1u);
+            const GLuint wg_y = (par.light_batch_size + (uint32_t)T5_TILE_L - 1u) / (uint32_t)T5_TILE_L;
+            glc_DispatchCompute(wg_x, wg_y, 1u);
             glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             /* glFlush after each batch so the driver sees completed work between
              * dispatches — prevents Windows TDR from treating the whole loop as

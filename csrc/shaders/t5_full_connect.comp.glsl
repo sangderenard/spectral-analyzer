@@ -1,16 +1,25 @@
 #version 430 core
 /* ────────────────────────────────────────────────────────────────────────────
- * t5_full_connect.comp.glsl  —  GPU BDPT T5 full brute-force connection pass
+ * t5_full_connect.comp.glsl  —  GPU BDPT T5 tiled connection pass
  *                               with full multi-strategy balance-heuristic MIS.
  *
- * Each invocation = ONE flattened camera vertex.
- * Inner loop iterates every light vertex in T5LightVertBuf — O(N_cam×N_light).
+ * 2-D tiled dispatch: X = camera tile, Y = light tile within current batch.
+ *   Work-group size: TILE_C × TILE_L  (default 8×8 = 64 threads).
+ *   Each invocation handles ONE (cam_vert, light_vert) pair.
  *
- * ALL subpath vertices are packed consecutively (no pre-filter) so the GPU can
- * navigate the full path chain for candidate_strategy_density MIS.
+ * Both tiles are loaded cooperatively into shared memory so every thread in
+ * the work-group reuses the data without redundant SSBO reads.
+ * A per-WG shared accumulator array is reduced before the final atomic write,
+ * cutting atomic-CAS pressure by TILE_L per cam vert per WG.
+ *
+ * ALL subpath vertices are still packed consecutively in the global SSBOs so
+ * candidate_strategy_density can navigate the full chain.
  * Subpath flat base formula: flat_index − vertex_index_in_subpath.
  *
- * Dispatch: glDispatchCompute(ceil(n_cam_verts / 64), 1, 1)
+ * Dispatch (C++): glDispatchCompute(
+ *     ceil(n_cam_verts / TILE_C),
+ *     ceil(light_batch_size / TILE_L),
+ *     1)
  *
  * ── SSBO binding map ──────────────────────────────────────────────────────
  *  binding  buffer          description
@@ -87,7 +96,11 @@
  *   uint   _pad1
  * ────────────────────────────────────────────────────────────────────────── */
 
-layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+/* ── Tile dimensions (must match T5_TILE_C / T5_TILE_L in ray_pipeline.h) ── */
+#define TILE_C  8
+#define TILE_L  8
+
+layout(local_size_x = TILE_C, local_size_y = TILE_L, local_size_z = 1) in;
 
 /* ── Stride and field offsets (mirror ray_pipeline.h) ─────────────────── */
 #define T5_LGV_STRIDE    40
@@ -106,6 +119,17 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define CGV_OPT_JACOBIAN  43
 #define CGV_EDGE_FWD      44
 #define CGV_EDGE_BWD      45
+
+/* ── Shared memory ──────────────────────────────────────────────────────── *
+ * s_cam / s_light: cooperative tile loads of all vertex fields.            *
+ *   Layout: consecutive stride-sized slots, [vert * stride + field].       *
+ * s_lum_*: per-invocation contributions, reduced before atomic write.      *
+ *   Layout: tid = lid_l * TILE_C + lid_c.                                  */
+shared float s_cam  [TILE_C * T5_CGV_STRIDE];   /* 8×56 = 448 floats (1.75 KB) */
+shared float s_light[TILE_L * T5_LGV_STRIDE];   /* 8×40 = 320 floats (1.25 KB) */
+shared float s_lum_r[TILE_C * TILE_L];
+shared float s_lum_g[TILE_C * TILE_L];
+shared float s_lum_b[TILE_C * TILE_L];
 
 /* ── SSBOs ─────────────────────────────────────────────────────────────── */
 layout(std430, binding = 0) readonly buffer T5LightVertBuf {
@@ -398,131 +422,170 @@ void atomic_add_float(uint idx, float val) {
 
 /* ── Main ────────────────────────────────────────────────────────────────── */
 void main() {
-    const uint gid = gl_GlobalInvocationID.x;
-    if (gid >= n_cam_verts) return;
+    const uint lid_c = gl_LocalInvocationID.x;   /* 0..TILE_C-1 */
+    const uint lid_l = gl_LocalInvocationID.y;   /* 0..TILE_L-1 */
+    const uint tid   = lid_l * uint(TILE_C) + lid_c;  /* flat thread index 0..63 */
+    const uint total = uint(TILE_C) * uint(TILE_L);   /* 64 */
 
-    /* ── Load camera vertex ─────────────────────────────────────────────── */
-    const uint  cb       = gid * uint(T5_CGV_STRIDE);
-    const vec3  c_pos    = vec3(cam_verts[cb+0u], cam_verts[cb+1u], cam_verts[cb+2u]);
-    const vec3  c_norm   = vec3(cam_verts[cb+3u], cam_verts[cb+4u], cam_verts[cb+5u]);
-    const float c_beta_r = cam_verts[cb+10u];  /* spectral beta R (band_to_display_rgb) */
-    const float c_beta_g = cam_verts[cb+11u];  /* spectral beta G */
-    const float c_beta_b = cam_verts[cb+12u];  /* spectral beta B */
-    const float c_soy    = cam_verts[cb+13u];  /* sensor_origin_y */
-    const float c_soz    = cam_verts[cb+14u];  /* sensor_origin_z */
+    /* Global tile bases.  light_tile is relative to the current batch origin,
+     * so the absolute light vert index = light_offset + light_tile + lid_l. */
+    const uint cam_tile   = gl_WorkGroupID.x * uint(TILE_C);
+    const uint light_tile = gl_WorkGroupID.y * uint(TILE_L);
 
-    const uint c_vinfo       = floatBitsToUint(cam_verts[cb +  9u]);
-    const uint c_flags       = floatBitsToUint(cam_verts[cb +  7u]);
-    const uint c_pdf_flags   = floatBitsToUint(cam_verts[cb + 17u]);
-    const uint c_optical_blk = floatBitsToUint(cam_verts[cb + 18u]);
+    /* ── Cooperative tile loads ─────────────────────────────────────────── *
+     * Each of the 64 threads strides through the tile arrays.               *
+     * Out-of-bounds verts are zeroed so downstream logic reads clean data.  */
 
-    /* ci = vertex_index within its cam subpath.
-     * cam_flat_base = flat index of subpath vertex 0 = gid - ci. */
-    const uint ci            = c_vinfo & 0x7FFFu;
-    const uint cam_flat_base = gid - ci;
-
-    /* Non-connectable cam verts are still packed (for chain navigation) but
-     * produce no contribution.  Early-exit here keeps invocations cheap. */
-    if (!vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk)) return;
-    if (c_beta_r + c_beta_g + c_beta_b < 1e-15f) return;
-
-    /* BRDF fields for scatter PDF at this cam vert (used in conn_fwd). */
-    const vec3  c_dir_in    = vec3(cam_verts[cb + uint(CGV_DIR_IN_X)    ],
-                                    cam_verts[cb + uint(CGV_DIR_IN_X) + 1u],
-                                    cam_verts[cb + uint(CGV_DIR_IN_X) + 2u]);
-    const float c_diffuse_p = cam_verts[cb + uint(CGV_DIFFUSE_P)];
-    const float c_ggx_alpha = cam_verts[cb + uint(CGV_GGX_ALPHA)];
-    const float c_opt_jac   = cam_verts[cb + uint(CGV_OPT_JACOBIAN)];
-
-    /* ── Pixel index ────────────────────────────────────────────────────── */
-    const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
-    const float inv_h = float(sensor_res) / (2.0f * sensor_half_h);
-    const int iy = int((c_soy + sensor_half_w) * inv_w);
-    const int iz = int((c_soz + sensor_half_h) * inv_h);
-    if (iy < 0 || iy >= sensor_res || iz < 0 || iz >= sensor_res) return;
-    const uint px  = uint(iy * sensor_res + iz);
-    const uint pix = uint(sensor_res) * uint(sensor_res);
-
-    /* ── Scan this batch of light vertices ──────────────────────────────── *
-     * All invocations walk the same [light_offset, light_offset+batch) range*
-     * in lockstep — warps coalesce on every light vert load.               */
-    const uint li_end = min(light_offset + light_batch_size, n_light_verts);
-    float lum_r = 0.0f, lum_g = 0.0f, lum_b = 0.0f;
-
-    for (uint li = light_offset; li < li_end; ++li) {
-        const uint  lb     = li * uint(T5_LGV_STRIDE);
-        const vec3  l_pos  = vec3(light_verts[lb+0u], light_verts[lb+1u], light_verts[lb+2u]);
-        const vec3  l_norm = vec3(light_verts[lb+3u], light_verts[lb+4u], light_verts[lb+5u]);
-        const float l_beta = light_verts[lb+10u];
-
-        if (l_beta < 1e-15f) continue;
-
-        const uint l_vinfo       = floatBitsToUint(light_verts[lb +  9u]);
-        const uint l_flags       = floatBitsToUint(light_verts[lb +  7u]);
-        const uint l_pdf_flags   = floatBitsToUint(light_verts[lb + 13u]);
-        const uint l_optical_blk = floatBitsToUint(light_verts[lb + 14u]);
-
-        if (!vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk)) continue;
-
-        /* li_v = vertex_index within its light subpath.
-         * light_flat_base = flat index of subpath vertex 0 = li - li_v. */
-        const uint li_v            = l_vinfo & 0x7FFFu;
-        const uint light_flat_base = li - li_v;
-
-        /* ── Geometry term ─────────────────────────────────────────────── */
-        const vec3  dv    = l_pos - c_pos;
-        const float dist2 = dot(dv, dv);
-        if (dist2 < 1e-12f) continue;
-        const float dist  = sqrt(dist2);
-        const vec3  wc    = dv / dist;
-        const float geom  = abs(dot(c_norm, wc)) * abs(dot(l_norm, -wc)) / dist2;
-        if (geom < min_geom) continue;
-
-        if (shadow_occluded(c_pos, l_pos)) continue;
-
-        /* ── BRDF fields for this light vert ────────────────────────────── */
-        const vec3  l_dir_in    = vec3(light_verts[lb + uint(LGV_DIR_IN_X)    ],
-                                        light_verts[lb + uint(LGV_DIR_IN_X) + 1u],
-                                        light_verts[lb + uint(LGV_DIR_IN_X) + 2u]);
-        const float l_diffuse_p = light_verts[lb + uint(LGV_DIFFUSE_P)];
-        const float l_ggx_alpha = light_verts[lb + uint(LGV_GGX_ALPHA)];
-        const float l_opt_jac   = light_verts[lb + uint(LGV_OPT_JACOBIAN)];
-
-        /* ── Connection PDFs (area domain) ──────────────────────────────── */
-        /* conn_fwd: scatter PDF at cam[ci] toward light[li_v] */
-        float conn_fwd = scatter_conn_pdf_area(
-            c_pos, c_norm, c_dir_in,
-            c_diffuse_p, c_ggx_alpha, c_pdf_flags, c_opt_jac,
-            l_pos, l_norm);
-
-        /* conn_bwd: scatter PDF at light[li_v] toward cam[ci] */
-        float conn_bwd = scatter_conn_pdf_area(
-            l_pos, l_norm, l_dir_in,
-            l_diffuse_p, l_ggx_alpha, l_pdf_flags, l_opt_jac,
-            c_pos, c_norm);
-
-        /* ── Full MIS: balance heuristic denominator ────────────────────── */
-        float selected_pdf = 0.0f, denom = 0.0f;
-        if (!candidate_strategy_density(
-                ci,   cam_flat_base,
-                li_v, light_flat_base,
-                conn_fwd, conn_bwd,
-                selected_pdf, denom)) continue;
-
-        /* Contribution simplification:
-         *   β_cam × β_light × G × mis_weight / strategy_pdf
-         *   = β_cam × β_light × G × (selected_pdf / denom) / selected_pdf
-         *   = β_cam × β_light × G / denom                                  */
-        const float contrib = l_beta * geom / denom;
-        lum_r += c_beta_r * contrib;
-        lum_g += c_beta_g * contrib;
-        lum_b += c_beta_b * contrib;
+    /* Camera tile: TILE_C × T5_CGV_STRIDE = 448 floats → 7 loads/thread   */
+    for (uint i = tid; i < uint(TILE_C) * uint(T5_CGV_STRIDE); i += total) {
+        const uint v = i / uint(T5_CGV_STRIDE);
+        const uint f = i % uint(T5_CGV_STRIDE);
+        const uint g = cam_tile + v;
+        s_cam[i] = (g < n_cam_verts)
+            ? cam_verts[g * uint(T5_CGV_STRIDE) + f]
+            : 0.0f;
     }
 
-    if (lum_r + lum_g + lum_b > 0.0f) {
-        atomic_add_float(px,           lum_r);
-        atomic_add_float(px + pix,     lum_g);
-        atomic_add_float(px + 2u*pix,  lum_b);
+    /* Light tile: TILE_L × T5_LGV_STRIDE = 320 floats → 5 loads/thread    */
+    for (uint i = tid; i < uint(TILE_L) * uint(T5_LGV_STRIDE); i += total) {
+        const uint v      = i / uint(T5_LGV_STRIDE);
+        const uint f      = i % uint(T5_LGV_STRIDE);
+        const uint g_glob = light_offset + light_tile + v;
+        s_light[i] = (g_glob < n_light_verts)
+            ? light_verts[g_glob * uint(T5_LGV_STRIDE) + f]
+            : 0.0f;
+    }
+
+    /* Init per-invocation accumulators. */
+    s_lum_r[tid] = 0.0f;
+    s_lum_g[tid] = 0.0f;
+    s_lum_b[tid] = 0.0f;
+
+    barrier();
+    memoryBarrierShared();
+
+    /* ── Per-pair contribution ──────────────────────────────────────────── */
+    const uint gid_c = cam_tile + lid_c;
+    const uint gid_l = light_offset + light_tile + lid_l;
+
+    if (gid_c < n_cam_verts && gid_l < n_light_verts) {
+
+        /* Load camera vert from shared memory. */
+        const uint sc = lid_c * uint(T5_CGV_STRIDE);
+        const vec3  c_pos    = vec3(s_cam[sc+0u], s_cam[sc+1u], s_cam[sc+2u]);
+        const vec3  c_norm   = vec3(s_cam[sc+3u], s_cam[sc+4u], s_cam[sc+5u]);
+        const float c_beta_r = s_cam[sc+10u];
+        const float c_beta_g = s_cam[sc+11u];
+        const float c_beta_b = s_cam[sc+12u];
+
+        const uint c_vinfo       = floatBitsToUint(s_cam[sc +  9u]);
+        const uint c_flags       = floatBitsToUint(s_cam[sc +  7u]);
+        const uint c_pdf_flags   = floatBitsToUint(s_cam[sc + 17u]);
+        const uint c_optical_blk = floatBitsToUint(s_cam[sc + 18u]);
+        const uint ci            = c_vinfo & 0x7FFFu;
+        const uint cam_flat_base = gid_c - ci;
+
+        /* Load light vert from shared memory. */
+        const uint sl = lid_l * uint(T5_LGV_STRIDE);
+        const vec3  l_pos  = vec3(s_light[sl+0u], s_light[sl+1u], s_light[sl+2u]);
+        const vec3  l_norm = vec3(s_light[sl+3u], s_light[sl+4u], s_light[sl+5u]);
+        const float l_beta = s_light[sl+10u];
+
+        const uint l_vinfo       = floatBitsToUint(s_light[sl +  9u]);
+        const uint l_flags       = floatBitsToUint(s_light[sl +  7u]);
+        const uint l_pdf_flags   = floatBitsToUint(s_light[sl + 13u]);
+        const uint l_optical_blk = floatBitsToUint(s_light[sl + 14u]);
+        const uint li_v            = l_vinfo & 0x7FFFu;
+        const uint light_flat_base = gid_l - li_v;
+
+        if (vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk) &&
+            vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk) &&
+            c_beta_r + c_beta_g + c_beta_b >= 1e-15f &&
+            l_beta >= 1e-15f)
+        {
+            /* ── Geometry term ─────────────────────────────────────────── */
+            const vec3  dv    = l_pos - c_pos;
+            const float dist2 = dot(dv, dv);
+            if (dist2 >= 1e-12f) {
+                const float dist = sqrt(dist2);
+                const vec3  wc   = dv / dist;
+                const float geom = abs(dot(c_norm, wc)) * abs(dot(l_norm, -wc)) / dist2;
+
+                if (geom >= min_geom && !shadow_occluded(c_pos, l_pos)) {
+
+                    /* BRDF fields from shared memory. */
+                    const vec3  c_dir_in    = vec3(s_cam[sc + uint(CGV_DIR_IN_X)    ],
+                                                   s_cam[sc + uint(CGV_DIR_IN_X)+1u ],
+                                                   s_cam[sc + uint(CGV_DIR_IN_X)+2u ]);
+                    const float c_diffuse_p = s_cam[sc + uint(CGV_DIFFUSE_P)];
+                    const float c_ggx_alpha = s_cam[sc + uint(CGV_GGX_ALPHA)];
+                    const float c_opt_jac   = s_cam[sc + uint(CGV_OPT_JACOBIAN)];
+
+                    const vec3  l_dir_in    = vec3(s_light[sl + uint(LGV_DIR_IN_X)    ],
+                                                   s_light[sl + uint(LGV_DIR_IN_X)+1u ],
+                                                   s_light[sl + uint(LGV_DIR_IN_X)+2u ]);
+                    const float l_diffuse_p = s_light[sl + uint(LGV_DIFFUSE_P)];
+                    const float l_ggx_alpha = s_light[sl + uint(LGV_GGX_ALPHA)];
+                    const float l_opt_jac   = s_light[sl + uint(LGV_OPT_JACOBIAN)];
+
+                    /* ── Connection PDFs ────────────────────────────────── */
+                    float conn_fwd = scatter_conn_pdf_area(
+                        c_pos, c_norm, c_dir_in,
+                        c_diffuse_p, c_ggx_alpha, c_pdf_flags, c_opt_jac,
+                        l_pos, l_norm);
+                    float conn_bwd = scatter_conn_pdf_area(
+                        l_pos, l_norm, l_dir_in,
+                        l_diffuse_p, l_ggx_alpha, l_pdf_flags, l_opt_jac,
+                        c_pos, c_norm);
+
+                    /* ── MIS density (still reads global SSBOs for chain) ─ */
+                    float selected_pdf = 0.0f, denom = 0.0f;
+                    if (candidate_strategy_density(
+                            ci, cam_flat_base, li_v, light_flat_base,
+                            conn_fwd, conn_bwd, selected_pdf, denom))
+                    {
+                        /* β_cam × β_light × G / denom  (selected_pdf cancels) */
+                        const float contrib = l_beta * geom / denom;
+                        s_lum_r[tid] = c_beta_r * contrib;
+                        s_lum_g[tid] = c_beta_g * contrib;
+                        s_lum_b[tid] = c_beta_b * contrib;
+                    }
+                }
+            }
+        }
+    }
+
+    barrier();
+    memoryBarrierShared();
+
+    /* ── Per-cam-vert reduction along the light-tile dimension ─────────── *
+     * Thread (lid_c, 0) sums TILE_L contributions for its cam vert and     *
+     * does a single atomic write — replacing TILE_L separate CAS loops.    */
+    if (lid_l == 0u && gid_c < n_cam_verts) {
+        float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
+        for (uint j = 0u; j < uint(TILE_L); ++j) {
+            const uint idx = j * uint(TILE_C) + lid_c;
+            sum_r += s_lum_r[idx];
+            sum_g += s_lum_g[idx];
+            sum_b += s_lum_b[idx];
+        }
+
+        if (sum_r + sum_g + sum_b > 0.0f) {
+            const uint sc = lid_c * uint(T5_CGV_STRIDE);
+            const float c_soy = s_cam[sc + 13u];
+            const float c_soz = s_cam[sc + 14u];
+            const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
+            const float inv_h = float(sensor_res) / (2.0f * sensor_half_h);
+            const int iy = int((c_soy + sensor_half_w) * inv_w);
+            const int iz = int((c_soz + sensor_half_h) * inv_h);
+            if (iy >= 0 && iy < sensor_res && iz >= 0 && iz < sensor_res) {
+                const uint px  = uint(iy * sensor_res + iz);
+                const uint pix = uint(sensor_res) * uint(sensor_res);
+                atomic_add_float(px,          sum_r);
+                atomic_add_float(px + pix,    sum_g);
+                atomic_add_float(px + 2u*pix, sum_b);
+            }
+        }
     }
 }
 

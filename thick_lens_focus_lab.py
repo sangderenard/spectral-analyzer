@@ -10144,8 +10144,9 @@ def run(
         while not closing.is_set():
             _exposure_count[0] += 1
             print(f"[exposure] starting exposure #{_exposure_count[0]}", flush=True)
+            _n_stages = bench._exposure_stage_count() if hasattr(bench, '_exposure_stage_count') else 1
             _run_one_exposure(_seed_offset)
-            _seed_offset += bench._exposure_stage_count() if hasattr(bench, '_exposure_stage_count') else 1
+            _seed_offset += _n_stages
 
             if closing.is_set():
                 break

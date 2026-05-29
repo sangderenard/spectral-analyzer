@@ -11353,16 +11353,48 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     ThreadPool t5_pool(nw);
 
-    /* ── Collect and pack connectable light verts (flat, unsorted) ─────── */
+    /* ── Per-vertex packing helpers (used for both LGV and CGV) ─────────── */
+    /* These lambdas compute the fields required for per-vertex BRDF PDF and  *
+     * edge-PDF evaluation on the GPU side (t5_full_connect.comp.glsl).       */
+    auto get_diffuse_p = [&](int mat_idx) -> float {
+        return (mat_idx >= 0)
+            ? mat_cache_diffusion(ctx.ps->st->mat_cache, mat_idx)
+            : 0.5f;
+    };
+    auto get_ggx_alpha = [&](int mat_idx) -> float {
+        return (mat_idx >= 0)
+            ? surf_cache_ggx_alpha(ctx.ps->st->surf_cache, mat_idx)
+            : 0.0f;
+    };
+    auto get_opt_jacobian = [&](const BdptVertexRecord& v) -> float {
+        double j = 1.0;
+        ctx.optical_allows_sampling(v, false, j);
+        return (j > 0.0 && std::isfinite(j)) ? static_cast<float>(j) : 1.0f;
+    };
+    /* Forward area PDF: edge v → nxt (forward sampling direction). */
+    auto get_edge_fwd = [&](const BdptVertexRecord& v,
+                             const BdptVertexRecord& nxt) -> float {
+        double pdf = 0.0;
+        if (ctx.edge_pdf_area(v, nxt, pdf)) return static_cast<float>(pdf);
+        return 0.0f;
+    };
+    /* Backward area PDF: reverse pdf at v for arriving from nxt back to v. */
+    auto get_edge_bwd = [&](const BdptVertexRecord& v,
+                             const BdptVertexRecord& nxt) -> float {
+        double pdf = 0.0;
+        if (ctx.edge_pdf_area_component(v, nxt, v, true, pdf))
+            return static_cast<float>(pdf);
+        return 0.0f;
+    };
+
+    /* ── Collect and pack ALL light verts consecutively per subpath ──────── */
+    /* ALL vertices are packed (no pre-filter) so subpath_flat_base =          *
+     * flat_idx − vertex_index is valid and the GPU shader can navigate the   *
+     * full chain needed for candidate_strategy_density MIS.                  */
     std::vector<LightVertRef> light_verts_flat;
     for (const auto* lsp : light_items) {
-        for (uint32_t li = 0; li < static_cast<uint32_t>(lsp->v.size()); ++li) {
-            const BdptVertexRecord* lv = lsp->v[li];
-            if (!ctx.vertex_connectable(*lv)) continue;
-            if (!lsp->prefix_valid[li]) continue;
-            if (lv->throughput_scalar < 1e-15f) continue;
-            light_verts_flat.push_back({lv, lsp, li});
-        }
+        for (uint32_t li = 0; li < static_cast<uint32_t>(lsp->v.size()); ++li)
+            light_verts_flat.push_back({lsp->v[li], lsp, li});
     }
     const uint32_t n_lv = static_cast<uint32_t>(light_verts_flat.size());
 
@@ -11378,15 +11410,22 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         p[6]  = lr.throughput_scalar;
         std::memcpy(&p[7], &lr.flags,      sizeof(uint32_t));
         std::memcpy(&p[8], &lr.subpath_id, sizeof(uint32_t));
-        const uint32_t vinfo = (uint32_t)lr.vertex_index | ((uint32_t)lr.stream << 16);
+        /* vinfo: bits[0..15]=vertex_index, bits[16..30]=stream, bit[31]=tri_valid */
+        const uint32_t vinfo = (uint32_t)lr.vertex_index
+                             | ((uint32_t)lr.stream << 16)
+                             | ((lr.tri_id >= 0 ? 1u : 0u) << 31);
         std::memcpy(&p[9], &vinfo, sizeof(uint32_t));
         p[10] = static_cast<float>(ctx.beta_scalar_val(lr));
         /* pdf_fwd / pdf_rev [11..12] — direct from vertex record */
         p[11] = lr.pdf_fwd;
         p[12] = lr.pdf_rev;
-        /* pdf_flags [13] — bit-cast material flags */
-        std::memcpy(&p[13], &lr.flags, sizeof(uint32_t));
-        /* optical_block [14] — set if any absorption event for this vertex */
+        /* pdf_flags [13] — BdptPdfRecord::flags for delta-specular / diffuse / GGX bits */
+        {
+            const BdptPdfRecord* pr13 = ctx.pdf_for(lr.subpath_id, lr.vertex_index);
+            const uint32_t pf = pr13 ? pr13->flags : 0u;
+            std::memcpy(&p[13], &pf, sizeof(uint32_t));
+        }
+        /* optical_block [14] — set if any blocking optical event (absorb/TIR/clip) */
         {
             uint32_t oblock = 0u;
             const uint64_t ok = ((uint64_t)lr.subpath_id  << 32)
@@ -11395,7 +11434,10 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             auto oit = ctx.optical_lut.find(ok);
             if (oit != ctx.optical_lut.end())
                 for (const auto& oe : oit->second)
-                    if (oe.reason == BDPT_OPT_ABSORPTION) { oblock = 1u; break; }
+                    if (oe.reason == BDPT_OPT_ABSORPTION   ||
+                        oe.reason == BDPT_OPT_TIR          ||
+                        oe.reason == BDPT_OPT_APERTURE_CLIP ||
+                        oe.reason == BDPT_OPT_VIGNETTE_CLIP) { oblock = 1u; break; }
             std::memcpy(&p[14], &oblock, sizeof(uint32_t));
         }
         /* prefix_pdf [15] — cumulative forward-PDF prefix for MIS */
@@ -11411,7 +11453,19 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             p[LGV_BAND_BASE + b] = (it != ctx.beta_lut.end())
                 ? static_cast<float>(std::abs(it->second)) : 0.0f;
         }
-        /* [32..39] remain 0.0f — pad / reserved */
+        /* BRDF + edge PDF fields [LGV_DIR_IN_X .. LGV_EDGE_BWD_AREA] */
+        p[LGV_DIR_IN_X + 0] = lr.dir_in[0];
+        p[LGV_DIR_IN_X + 1] = lr.dir_in[1];
+        p[LGV_DIR_IN_X + 2] = lr.dir_in[2];
+        p[LGV_DIFFUSE_P]     = get_diffuse_p(lr.mat_idx);
+        p[LGV_GGX_ALPHA]     = get_ggx_alpha(lr.mat_idx);
+        p[LGV_OPT_JACOBIAN]  = get_opt_jacobian(lr);
+        if (li + 1u < static_cast<uint32_t>(lsp->v.size())) {
+            const BdptVertexRecord& nxt = *lsp->v[li + 1u];
+            p[LGV_EDGE_FWD_AREA] = get_edge_fwd(lr, nxt);
+            p[LGV_EDGE_BWD_AREA] = get_edge_bwd(lr, nxt);
+        }
+        /* else: edge_fwd_area / edge_bwd_area stay 0.0f (last vert in subpath) */
     }
 
     /* ── GPU path: full brute-force dispatch ────────────────────────────── */
@@ -11423,23 +11477,18 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     std::vector<uint32_t> gpu_pixel_result;
 
     if (gpu_t5_ok) {
-        /* Count and pack camera verts */
+        /* Count and pack ALL camera verts consecutively per subpath.
+         * No pre-filter: ALL verts are packed so subpath_flat_base =
+         * flat_idx − vertex_index is valid for GPU chain navigation. */
         uint32_t n_cv = 0;
         for (const auto* csp : cam_items)
-            for (size_t ci = 0; ci < csp->v.size(); ++ci)
-                if (ctx.vertex_connectable(*csp->v[ci]) && csp->prefix_valid[ci]
-                    && ctx.beta_scalar_val(*csp->v[ci]) >= 1e-15)
-                    ++n_cv;
+            n_cv += static_cast<uint32_t>(csp->v.size());
 
         std::vector<float> cam_packed(static_cast<size_t>(n_cv) * T5_CGV_STRIDE, 0.0f);
         uint32_t ci_flat = 0;
         for (const auto* csp : cam_items) {
             for (size_t ci = 0; ci < csp->v.size(); ++ci) {
                 const BdptVertexRecord& c = *csp->v[ci];
-                if (!ctx.vertex_connectable(c)) continue;
-                if (!csp->prefix_valid[ci]) continue;
-                const double bc = ctx.beta_scalar_val(c);
-                if (bc < 1e-15) continue;
                 /* Compute per-channel spectral beta (R, G, B) using the same
                  * band_to_display_rgb weighting that accum_pixel_color uses.
                  * This lets the GPU shader reproduce spectral material colours. */
@@ -11455,17 +11504,22 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                     band_to_display_rgb(b, ctx.n_bands, ctx.t5_freq_hz, bwr, bwg, bwb);
                     s_wr += bm * bwr; s_wg += bm * bwg; s_wb += bm * bwb;
                 }
-                /* No fallback: if beta_lut has no spectral data for this vertex,
-                 * s_wr/g/b remain 0 and the shader will discard the vertex. */
+                /* If no spectral data the shader discards via beta sum == 0. */
 
                 float* p = cam_packed.data() + static_cast<size_t>(ci_flat++) * T5_CGV_STRIDE;
                 /* base fields [0..14] — geometry + ids + spectral display betas */
                 p[0]  = c.pos[0];    p[1]  = c.pos[1];    p[2]  = c.pos[2];
                 p[3]  = c.normal[0]; p[4]  = c.normal[1]; p[5]  = c.normal[2];
                 p[6]  = c.throughput_scalar;
-                std::memcpy(&p[7],  &c.flags,        sizeof(uint32_t));
-                std::memcpy(&p[8],  &c.subpath_id,   sizeof(uint32_t));
-                std::memcpy(&p[9],  &c.vertex_index, sizeof(uint32_t));
+                std::memcpy(&p[7],  &c.flags,      sizeof(uint32_t));
+                std::memcpy(&p[8],  &c.subpath_id, sizeof(uint32_t));
+                /* vinfo: bits[0..15]=vertex_index, bits[16..30]=stream, bit[31]=tri_valid */
+                {
+                    const uint32_t c_vinfo = (uint32_t)c.vertex_index
+                                           | ((uint32_t)c.stream << 16)
+                                           | ((c.tri_id >= 0 ? 1u : 0u) << 31);
+                    std::memcpy(&p[9], &c_vinfo, sizeof(uint32_t));
+                }
                 p[10] = static_cast<float>(s_wr);   /* spectral beta R */
                 p[11] = static_cast<float>(s_wg);   /* spectral beta G */
                 p[12] = static_cast<float>(s_wb);   /* spectral beta B */
@@ -11474,9 +11528,13 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 /* pdf_fwd / pdf_rev [15..16] — direct from vertex record */
                 p[15] = c.pdf_fwd;
                 p[16] = c.pdf_rev;
-                /* pdf_flags [17] — bit-cast material flags */
-                std::memcpy(&p[17], &c.flags, sizeof(uint32_t));
-                /* optical_block [18] — set if any absorption event for this vertex */
+                /* pdf_flags [17] — BdptPdfRecord::flags for delta-specular / diffuse / GGX bits */
+                {
+                    const BdptPdfRecord* pr17 = ctx.pdf_for(c.subpath_id, c.vertex_index);
+                    const uint32_t pf = pr17 ? pr17->flags : 0u;
+                    std::memcpy(&p[17], &pf, sizeof(uint32_t));
+                }
+                /* optical_block [18] — set if any blocking optical event (absorb/TIR/clip) */
                 {
                     uint32_t oblock = 0u;
                     const uint64_t ok = ((uint64_t)c.subpath_id  << 32)
@@ -11485,13 +11543,16 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                     auto oit = ctx.optical_lut.find(ok);
                     if (oit != ctx.optical_lut.end())
                         for (const auto& oe : oit->second)
-                            if (oe.reason == BDPT_OPT_ABSORPTION) { oblock = 1u; break; }
+                            if (oe.reason == BDPT_OPT_ABSORPTION   ||
+                                oe.reason == BDPT_OPT_TIR          ||
+                                oe.reason == BDPT_OPT_APERTURE_CLIP ||
+                                oe.reason == BDPT_OPT_VIGNETTE_CLIP) { oblock = 1u; break; }
                     std::memcpy(&p[18], &oblock, sizeof(uint32_t));
                 }
-                /* prefix_pdf [19] — cumulative forward-PDF prefix for MIS */
+                /* prefix_pdf [19] — cumulative forward-PDF prefix */
                 p[19] = (ci < csp->prefix_pdf.size() && csp->prefix_valid[ci])
                       ? static_cast<float>(csp->prefix_pdf[ci]) : 0.0f;
-                /* mis_denom_sum [20] — placeholder (0.0 until MIS pass is wired) */
+                /* mis_denom_sum [20] — reserved (computed live on GPU) */
                 p[20] = 0.0f;
                 /* tri_mat_idx [21] — int bits of material index */
                 std::memcpy(&p[21], &c.mat_idx, sizeof(int32_t));
@@ -11505,7 +11566,20 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                     p[CGV_BAND_BASE + b] = (it != ctx.beta_lut.end())
                         ? static_cast<float>(std::abs(it->second)) : 0.0f;
                 }
-                /* [38..55] remain 0.0f — pad / reserved */
+                /* BRDF + edge PDF fields [CGV_DIR_IN_X .. CGV_EDGE_BWD_AREA] */
+                p[CGV_DIR_IN_X + 0] = c.dir_in[0];
+                p[CGV_DIR_IN_X + 1] = c.dir_in[1];
+                p[CGV_DIR_IN_X + 2] = c.dir_in[2];
+                p[CGV_DIFFUSE_P]     = get_diffuse_p(c.mat_idx);
+                p[CGV_GGX_ALPHA]     = get_ggx_alpha(c.mat_idx);
+                p[CGV_OPT_JACOBIAN]  = get_opt_jacobian(c);
+                if (ci + 1u < csp->v.size()) {
+                    const BdptVertexRecord& nxt = *csp->v[ci + 1u];
+                    p[CGV_EDGE_FWD_AREA] = get_edge_fwd(c, nxt);
+                    p[CGV_EDGE_BWD_AREA] = get_edge_bwd(c, nxt);
+                }
+                /* else: edge_fwd_area / edge_bwd_area stay 0.0f (last vert in subpath) */
+                /* [46..55] remain 0.0f */
             }
         }
 

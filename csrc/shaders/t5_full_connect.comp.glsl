@@ -1,66 +1,80 @@
 #version 430 core
 /* ────────────────────────────────────────────────────────────────────────────
  * t5_full_connect.comp.glsl  —  GPU BDPT T5 full brute-force connection pass
+ *                               with full multi-strategy balance-heuristic MIS.
  *
  * Each invocation = ONE flattened camera vertex.
  * Inner loop iterates every light vertex in T5LightVertBuf — O(N_cam×N_light).
- * No spatial index, no hash lookup — flat sequential reads maximise GPU memory
- * bandwidth and keep every warp reading the same light-vert index simultaneously
- * (coalesced L2 access pattern).
+ *
+ * ALL subpath vertices are packed consecutively (no pre-filter) so the GPU can
+ * navigate the full path chain for candidate_strategy_density MIS.
+ * Subpath flat base formula: flat_index − vertex_index_in_subpath.
  *
  * Dispatch: glDispatchCompute(ceil(n_cam_verts / 64), 1, 1)
  *
  * ── SSBO binding map ──────────────────────────────────────────────────────
- *  binding  buffer          access    description
- *  -------  --------------- --------  ---------------------------------------
- *    0      T5LightVertBuf  readonly  Flat light vertices.
- *                                     Stride = T5_LGV_STRIDE = 40 floats.
- *                                       [0..2]   pos xyz
- *                                       [3..5]   normal xyz
- *                                       [6]      throughput_scalar
- *                                       [7]      uintBitsToFloat(flags)
- *                                       [8]      uintBitsToFloat(subpath_id)
- *                                       [9]      uintBitsToFloat(vert_info)
- *                                       [10]     beta_lum
- *                                       [11]     pdf_fwd
- *                                       [12]     pdf_rev
- *                                       [13]     uintBitsToFloat(pdf_flags)
- *                                       [14]     uintBitsToFloat(optical_block)
- *                                       [15]     prefix_pdf
- *                                       [16..31] per-band beta magnitudes [0..15]
- *                                       [32..39] pad
- *    1      T5CamVertBuf    readonly  Flat camera vertices.
- *                                     Stride = T5_CGV_STRIDE = 56 floats.
- *                                       [0..2]   pos xyz
- *                                       [3..5]   normal xyz
- *                                       [6]      throughput_scalar
- *                                       [7]      uintBitsToFloat(flags)
- *                                       [8]      uintBitsToFloat(subpath_id)
- *                                       [9]      uintBitsToFloat(vert_index)
- *                                       [10]     spectral_beta_r (display-weighted)
- *                                       [11]     spectral_beta_g
- *                                       [12]     spectral_beta_b
- *                                       [13]     sensor_origin_y
- *                                       [14]     sensor_origin_z
- *                                       [15]     pdf_fwd
- *                                       [16]     pdf_rev
- *                                       [17]     uintBitsToFloat(pdf_flags)
- *                                       [18]     uintBitsToFloat(optical_block)
- *                                       [19]     prefix_pdf
- *                                       [20]     mis_denom_sum
- *                                       [21]     intBitsToFloat(tri_mat_idx)
- *                                       [22..37] per-band beta magnitudes [0..15]
- *                                       [38..55] pad
- *    2      T5PixelBuf      coherent  Pixel accumulator.
- *                                     3 × res² uint32 bit-cast floats.
- *                                     Layout: R[res²] G[res²] B[res²].
- *                                     Written via float CAS (no ext needed).
- *    3      T5ParamsBuf     readonly  T5GpuParams std430 block (32 bytes).
- *    5      BvhBuf          readonly  BVH nodes          (shadow preamble)
- *    6      TriIdBuf        readonly  BVH triangle IDs   (shadow preamble)
- *    7      TriFullBuf      readonly  full triangle data  (shadow preamble)
+ *  binding  buffer          description
+ *  -------  --------------- -----------------------------------------------
+ *    0      T5LightVertBuf  Flat light vertices. Stride = T5_LGV_STRIDE = 40 floats.
+ *             [0..2]   pos xyz
+ *             [3..5]   normal xyz
+ *             [6]      throughput_scalar
+ *             [7]      uintBitsToFloat(MAT_FLAG_* material flags)
+ *             [8]      uintBitsToFloat(subpath_id)
+ *             [9]      uintBitsToFloat(vinfo): bits[0..14]=vertex_index,
+ *                        bits[16..22]=stream, bit[31]=tri_valid (tri_id>=0)
+ *             [10]     beta_lum (scalar path throughput)
+ *             [11]     pdf_fwd
+ *             [12]     pdf_rev
+ *             [13]     uintBitsToFloat(BdptPdfRecord::flags)
+ *                        bit(1<<16)=DELTA_SPECULAR  bit(1<<18)=DIFFUSE  bit(1<<20)=GGX
+ *             [14]     uintBitsToFloat(optical_block)  non-zero = blocked
+ *             [15]     prefix_pdf  (0 = prefix invalid)
+ *             [16..31] per-band beta magnitudes [band 0..15]
+ *             [32..34] dir_in xyz
+ *             [35]     diffuse_p  (from mat_cache)
+ *             [36]     ggx_alpha  (from surf_cache)
+ *             [37]     optical_jacobian
+ *             [38]     edge_fwd_area  (area-domain PDF: this vert → next in subpath)
+ *             [39]     edge_bwd_area  (reverse area-domain PDF: next → this at this vert)
  *
- * ── T5GpuParams (std430, binding 3, 32 bytes) ─────────────────────────────
+ *    1      T5CamVertBuf    Flat camera vertices. Stride = T5_CGV_STRIDE = 56 floats.
+ *             [0..2]   pos xyz
+ *             [3..5]   normal xyz
+ *             [6]      throughput_scalar
+ *             [7]      uintBitsToFloat(MAT_FLAG_* material flags)
+ *             [8]      uintBitsToFloat(subpath_id)
+ *             [9]      uintBitsToFloat(vinfo): same bit layout as LGV[9]
+ *             [10]     spectral_beta_r  (band_to_display_rgb weighted sum)
+ *             [11]     spectral_beta_g
+ *             [12]     spectral_beta_b
+ *             [13]     sensor_origin_y
+ *             [14]     sensor_origin_z
+ *             [15]     pdf_fwd
+ *             [16]     pdf_rev
+ *             [17]     uintBitsToFloat(BdptPdfRecord::flags)  same layout as LGV[13]
+ *             [18]     uintBitsToFloat(optical_block)         same layout as LGV[14]
+ *             [19]     prefix_pdf
+ *             [20]     reserved (0.0)
+ *             [21]     intBitsToFloat(mat_idx)
+ *             [22..37] per-band beta magnitudes [band 0..15]
+ *             [38..40] dir_in xyz
+ *             [41]     diffuse_p
+ *             [42]     ggx_alpha
+ *             [43]     optical_jacobian
+ *             [44]     edge_fwd_area
+ *             [45]     edge_bwd_area
+ *             [46..55] reserved (0.0)
+ *
+ *    2      T5PixelBuf      Pixel accumulator. 3×res² uint32 float-bits.
+ *                           Layout: R[res²] G[res²] B[res²].
+ *                           Written via float CAS (no ext needed).
+ *    3      T5ParamsBuf     T5GpuParams std430 block.
+ *    5      BvhBuf          BVH nodes          (injected shadow preamble)
+ *    6      TriIdBuf        BVH triangle IDs   (injected shadow preamble)
+ *    7      TriFullBuf      Full triangle data  (injected shadow preamble)
+ *
+ * ── T5GpuParams (std430, binding 3) ───────────────────────────────────────
  *   float  min_geom        geometry-term floor
  *   float  sensor_half_w   sensor half-width  (Y axis, metres)
  *   float  sensor_half_h   sensor half-height (Z axis, metres)
@@ -68,38 +82,306 @@
  *   uint   n_light_verts
  *   uint   n_cam_verts
  *   int    sensor_res      pixel grid side (res×res)
+ *   uint   light_batch_size
+ *   uint   light_offset    first light vert index for this dispatch
  *   uint   _pad1
  * ────────────────────────────────────────────────────────────────────────── */
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-#define T5_LGV_STRIDE  40
-#define T5_CGV_STRIDE  56
+/* ── Stride and field offsets (mirror ray_pipeline.h) ─────────────────── */
+#define T5_LGV_STRIDE    40
+#define T5_CGV_STRIDE    56
 
+#define LGV_DIR_IN_X      32
+#define LGV_DIFFUSE_P     35
+#define LGV_GGX_ALPHA     36
+#define LGV_OPT_JACOBIAN  37
+#define LGV_EDGE_FWD      38
+#define LGV_EDGE_BWD      39
+
+#define CGV_DIR_IN_X      38
+#define CGV_DIFFUSE_P     41
+#define CGV_GGX_ALPHA     42
+#define CGV_OPT_JACOBIAN  43
+#define CGV_EDGE_FWD      44
+#define CGV_EDGE_BWD      45
+
+/* ── SSBOs ─────────────────────────────────────────────────────────────── */
 layout(std430, binding = 0) readonly buffer T5LightVertBuf {
-    float light_verts[];   /* n_light_verts × T5_LGV_STRIDE */
+    float light_verts[];
 };
-
 layout(std430, binding = 1) readonly buffer T5CamVertBuf {
-    float cam_verts[];     /* n_cam_verts × T5_CGV_STRIDE */
+    float cam_verts[];
 };
-
 layout(std430, binding = 2) coherent buffer T5PixelBuf {
-    uint pixel_accum[];    /* 3 × sensor_res² uint32 float-bits */
+    uint pixel_accum[];
 };
-
 layout(std430, binding = 3) readonly buffer T5ParamsBuf {
     float  min_geom;
     float  sensor_half_w;
     float  sensor_half_h;
     float  _pad0;
-    uint   n_light_verts;    /* total (bounds check only)  */
+    uint   n_light_verts;
     uint   n_cam_verts;
     int    sensor_res;
-    uint   light_batch_size; /* how many light verts this dispatch covers */
-    uint   light_offset;     /* first light vert index for this dispatch  */
+    uint   light_batch_size;
+    uint   light_offset;
     uint   _pad1;
 };
+
+/* ── Flag constants (mirror bdpt_record.h / mat_flags_generated.h) ──────── */
+#define MAT_FLAG_APERTURE_STOP        128u
+#define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)
+#define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)
+#define BDPT_PDF_FLAG_GGX             (1u << 20)
+
+#define PI 3.14159265358979323846f
+
+/* ── MIS chain size limit.                                                 *
+ * MAX_CHAIN = 32 supports up to 15 bounces per subpath plus the two       *
+ * endpoints.  Pairs exceeding this are skipped (no energy loss in practice *
+ * since path depths are typically ≤ 8).                                    *
+ * MAX_CHAIN_E = max edge count (N-1 for N=MAX_CHAIN vertices).            *
+ * MAX_CHAIN_N = size of prefix/suffix arrays (N+1 sentinel slot).         */
+#define MAX_CHAIN    32
+#define MAX_CHAIN_E  31
+#define MAX_CHAIN_N  33
+
+/* ── GGX microfacet helpers ──────────────────────────────────────────────── */
+float ggx_D(float alpha, float NoH) {
+    float a  = max(1e-4f, alpha);
+    float a2 = a * a;
+    float d  = NoH * NoH * (a2 - 1.0f) + 1.0f;
+    return a2 / (PI * d * d);
+}
+
+float ggx_G1(float alpha, float NoV) {
+    if (NoV <= 0.0f) return 0.0f;
+    float a  = max(1e-4f, alpha);
+    float a2 = a * a;
+    return (2.0f * NoV) / (NoV + sqrt(a2 + (1.0f - a2) * NoV * NoV));
+}
+
+float ggx_pdf_sa(vec3 n, vec3 in_dir, vec3 out_dir, float alpha) {
+    vec3  V   = normalize(-in_dir);
+    vec3  L   = normalize(out_dir);
+    float NoV = max(0.0f, dot(n, V));
+    float NoL = max(0.0f, dot(n, L));
+    if (NoV <= 0.0f || NoL <= 0.0f) return 0.0f;
+    vec3  H   = normalize(V + L);
+    float NoH = max(0.0f, dot(n, H));
+    float VoH = max(0.0f, dot(V, H));
+    if (NoH <= 0.0f || VoH < 1e-6f) return 0.0f;
+    return ggx_D(alpha, NoH) * ggx_G1(alpha, NoV) / (4.0f * NoV);
+}
+
+/* ── scatter_conn_pdf_area ───────────────────────────────────────────────── *
+ * Area-measure scatter PDF at vertex 'from' toward vertex 'to'.             *
+ * Mirrors T5ConnContext::scatter_connection_pdf_area().                      *
+ * Returns 0.0 if the vertex cannot scatter toward the target.               */
+float scatter_conn_pdf_area(
+    vec3  from_pos,    vec3  from_norm,  vec3  from_dir_in,
+    float diffuse_p,   float ggx_alpha,
+    uint  pdf_flags,   float opt_jac,
+    vec3  to_pos,      vec3  to_norm)
+{
+    if ((pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return 0.0f;
+    if (opt_jac <= 0.0f) return 0.0f;
+
+    vec3  d     = to_pos - from_pos;
+    float dist2 = dot(d, d);
+    if (dist2 < 1e-18f) return 1e-12f;
+    float dist  = sqrt(dist2);
+    d /= dist;
+
+    float cos_out = max(0.0f, dot(from_norm, d));
+    float cos_to  = max(0.0f, abs(dot(to_norm, -d)));
+    if (cos_out <= 0.0f || cos_to <= 0.0f) return 0.0f;
+
+    float spec_p = max(0.0f, 1.0f - diffuse_p);
+    float pdf_sa = 0.0f;
+    if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
+        if (diffuse_p <= 0.0f) return 0.0f;
+        pdf_sa = diffuse_p * cos_out / PI;
+    } else if ((pdf_flags & BDPT_PDF_FLAG_GGX) != 0u) {
+        if (spec_p <= 0.0f || ggx_alpha <= 1e-3f) return 0.0f;
+        pdf_sa = spec_p * ggx_pdf_sa(from_norm, from_dir_in, d, ggx_alpha);
+    } else {
+        return 0.0f;
+    }
+    if (pdf_sa <= 0.0f) return 0.0f;
+
+    float pdf = pdf_sa * cos_to / dist2 * opt_jac;
+    return max(pdf, 1e-12f);
+}
+
+/* ── vertex_connectable ──────────────────────────────────────────────────── *
+ * GPU port of T5ConnContext::vertex_connectable().                           */
+bool vertex_connectable(uint vinfo, uint vflags, uint pdf_flags, uint opt_block) {
+    if ((vinfo     >> 31)                          == 0u) return false; /* tri_id < 0 */
+    if ((vflags    & MAT_FLAG_APERTURE_STOP)       != 0u) return false;
+    if ((pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
+    if ( opt_block                                 != 0u) return false;
+    return true;
+}
+
+/* ── candidate_strategy_density ─────────────────────────────────────────── *
+ * Full multi-strategy balance-heuristic MIS.                                *
+ * Direct GPU port of T5ConnContext::candidate_strategy_density().           *
+ *                                                                            *
+ * ci         = vertex_index of the connection cam vert in its subpath       *
+ * cam_base   = flat index of subpath vertex 0 in cam_verts[]                *
+ * li_v       = vertex_index of the connection light vert in its subpath     *
+ * light_base = flat index of subpath vertex 0 in light_verts[]              *
+ * conn_fwd   = scatter_conn_pdf_area(cam[ci] → light[li_v])                *
+ * conn_bwd   = scatter_conn_pdf_area(light[li_v] → cam[ci])                *
+ *                                                                            *
+ * Outputs:                                                                   *
+ *   out_selected_pdf = prefix_fwd[ci] × suffix_bwd[ci+1]  (selected cut)   *
+ *   out_denom        = sum of prefix×suffix over all valid connectable cuts  *
+ *                                                                            *
+ * Returns false if chain too long, selected cut invalid, or denom is zero.  */
+bool candidate_strategy_density(
+    uint  ci,        uint cam_base,
+    uint  li_v,      uint light_base,
+    float conn_fwd,  float conn_bwd,
+    out float out_selected_pdf,
+    out float out_denom)
+{
+    uint N = ci + li_v + 2u;
+    if (N > uint(MAX_CHAIN)) return false;
+
+    /* ── Build edge PDFs for all N-1 edges in the combined chain ─────────── *
+     * edge_fwd[e] > 0  ⟺  forward edge PDF is valid (non-zero).            *
+     * edge_bwd[e] > 0  ⟺  backward edge PDF is valid.                      *
+     * Zero serves as the "invalid/blocked" sentinel.                        *
+     *                                                                        *
+     * Chain:  cam[0] … cam[ci]  |  light[li_v] … light[0]                  *
+     *                             ↑ connection edge at e=ci                  *
+     *                                                                        *
+     * Within-cam edges (e < ci):                                             *
+     *   fwd = edge_fwd_area packed at cam[e]  (cam[e] → cam[e+1])          *
+     *   bwd = edge_bwd_area packed at cam[e]  (cam[e+1] → cam[e] reverse)  *
+     *                                                                        *
+     * Connection edge (e = ci):                                              *
+     *   fwd = scatter_conn_pdf_area(cam[ci] → light[li_v]) = conn_fwd      *
+     *   bwd = scatter_conn_pdf_area(light[li_v] → cam[ci]) = conn_bwd      *
+     *                                                                        *
+     * Within-light edges reversed (e > ci):                                  *
+     *   e = ci+1+j,  j = e−ci−1,  lci = li_v−j                            *
+     *   parent (in orig subpath) = light[lci−1]                            *
+     *   In the chain direction (reversed), fwd uses orig bwd and vice versa. *
+     *   fwd = edge_bwd_area packed at light[lci−1]                         *
+     *   bwd = edge_fwd_area packed at light[lci−1]                         */
+    float edge_fwd[MAX_CHAIN_E];
+    float edge_bwd[MAX_CHAIN_E];
+
+    for (uint e = 0u; e < N - 1u; ++e) {
+        edge_fwd[e] = 0.0f;
+        edge_bwd[e] = 0.0f;
+
+        if (e < ci) {
+            uint cb_e = (cam_base + e) * uint(T5_CGV_STRIDE);
+            edge_fwd[e] = cam_verts[cb_e + uint(CGV_EDGE_FWD)];
+            edge_bwd[e] = cam_verts[cb_e + uint(CGV_EDGE_BWD)];
+
+        } else if (e == ci) {
+            edge_fwd[e] = conn_fwd;
+            edge_bwd[e] = conn_bwd;
+
+        } else {
+            uint j   = e - ci - 1u;
+            uint lci = li_v - j;
+            if (lci == 0u) return false;
+            uint lb_e   = (light_base + lci - 1u) * uint(T5_LGV_STRIDE);
+            edge_fwd[e] = light_verts[lb_e + uint(LGV_EDGE_BWD)]; /* orig bwd → chain fwd */
+            edge_bwd[e] = light_verts[lb_e + uint(LGV_EDGE_FWD)]; /* orig fwd → chain bwd */
+        }
+    }
+
+    /* ── Prefix products (chain start → each vertex) ────────────────────── *
+     * prefix_fwd[i] = product of edge_fwd[0 .. i-1].                       *
+     * 0.0 encodes "prefix chain is broken" (invalid edge encountered).     */
+    float prefix_fwd[MAX_CHAIN_N];
+    prefix_fwd[0] = 1.0f;
+    for (uint i = 1u; i <= N; ++i) {
+        float ef = edge_fwd[i - 1u];
+        prefix_fwd[i] = (prefix_fwd[i-1u] > 0.0f && ef > 0.0f)
+            ? max(prefix_fwd[i-1u] * ef, 1e-30f)
+            : 0.0f;
+    }
+
+    /* ── Suffix products (each vertex → chain end) ───────────────────────── *
+     * suffix_bwd[i] = product of edge_bwd[i .. N-2].                       *
+     * suffix_bwd[N-1] = 1.0 (no backward edges from the last vertex).      */
+    float suffix_bwd[MAX_CHAIN_N];
+    suffix_bwd[N - 1u] = 1.0f;
+    for (int si = int(N) - 2; si >= 0; si--) {
+        uint  i  = uint(si);
+        float eb = edge_bwd[i];
+        suffix_bwd[i] = (suffix_bwd[i + 1u] > 0.0f && eb > 0.0f)
+            ? max(suffix_bwd[i + 1u] * eb, 1e-30f)
+            : 0.0f;
+    }
+
+    /* ── Selected cut (our (s,t) strategy): between cam[ci] and light[li_v] */
+    uint sc = ci + 1u;
+    if (prefix_fwd[sc - 1u] <= 0.0f || suffix_bwd[sc] <= 0.0f) return false;
+    out_selected_pdf = max(prefix_fwd[sc - 1u] * suffix_bwd[sc], 1e-30f);
+
+    /* ── Denominator: sum prefix×suffix over all connectable cuts ─────────── */
+    out_denom = 0.0f;
+    for (uint cut = 1u; cut < N; ++cut) {
+        float pf = prefix_fwd[cut - 1u];
+        float sb = suffix_bwd[cut];
+        if (pf <= 0.0f || sb <= 0.0f) continue;
+
+        /* Load vinfo/vflags/pdf_flags/opt_block for chain[cut-1] and chain[cut]. */
+        uint vi0, vf0, pf0, ob0;
+        uint vi1, vf1, pf1, ob1;
+
+        /* chain[cut-1]: cam vert if cut-1 <= ci, else light vert. */
+        if (cut - 1u <= ci) {
+            uint cb0 = (cam_base + (cut - 1u)) * uint(T5_CGV_STRIDE);
+            vi0 = floatBitsToUint(cam_verts[cb0 +  9u]);
+            vf0 = floatBitsToUint(cam_verts[cb0 +  7u]);
+            pf0 = floatBitsToUint(cam_verts[cb0 + 17u]);
+            ob0 = floatBitsToUint(cam_verts[cb0 + 18u]);
+        } else {
+            uint j0  = (cut - 1u) - ci - 1u;
+            uint lb0 = (light_base + li_v - j0) * uint(T5_LGV_STRIDE);
+            vi0 = floatBitsToUint(light_verts[lb0 +  9u]);
+            vf0 = floatBitsToUint(light_verts[lb0 +  7u]);
+            pf0 = floatBitsToUint(light_verts[lb0 + 13u]);
+            ob0 = floatBitsToUint(light_verts[lb0 + 14u]);
+        }
+
+        /* chain[cut]: cam vert if cut <= ci, else light vert. */
+        if (cut <= ci) {
+            uint cb1 = (cam_base + cut) * uint(T5_CGV_STRIDE);
+            vi1 = floatBitsToUint(cam_verts[cb1 +  9u]);
+            vf1 = floatBitsToUint(cam_verts[cb1 +  7u]);
+            pf1 = floatBitsToUint(cam_verts[cb1 + 17u]);
+            ob1 = floatBitsToUint(cam_verts[cb1 + 18u]);
+        } else {
+            uint j1  = cut - ci - 1u;
+            uint lb1 = (light_base + li_v - j1) * uint(T5_LGV_STRIDE);
+            vi1 = floatBitsToUint(light_verts[lb1 +  9u]);
+            vf1 = floatBitsToUint(light_verts[lb1 +  7u]);
+            pf1 = floatBitsToUint(light_verts[lb1 + 13u]);
+            ob1 = floatBitsToUint(light_verts[lb1 + 14u]);
+        }
+
+        if (!vertex_connectable(vi0, vf0, pf0, ob0)) continue;
+        if (!vertex_connectable(vi1, vf1, pf1, ob1)) continue;
+
+        float p = pf * sb;
+        if (p > 0.0f && !isinf(p) && !isnan(p)) out_denom += p;
+    }
+
+    return out_selected_pdf > 0.0f && out_denom > 0.0f;
+}
 
 /* ── Float atomic add via CAS spin-loop ─────────────────────────────────── *
  * Avoids GL_EXT_shader_atomic_float.  Standard on all GL 4.3+ hardware.    */
@@ -123,13 +405,34 @@ void main() {
     const uint  cb       = gid * uint(T5_CGV_STRIDE);
     const vec3  c_pos    = vec3(cam_verts[cb+0u], cam_verts[cb+1u], cam_verts[cb+2u]);
     const vec3  c_norm   = vec3(cam_verts[cb+3u], cam_verts[cb+4u], cam_verts[cb+5u]);
-    const float c_beta_r = cam_verts[cb+10u];  /* spectral beta R (band_to_display_rgb weighted) */
+    const float c_beta_r = cam_verts[cb+10u];  /* spectral beta R (band_to_display_rgb) */
     const float c_beta_g = cam_verts[cb+11u];  /* spectral beta G */
     const float c_beta_b = cam_verts[cb+12u];  /* spectral beta B */
-    const float c_soy    = cam_verts[cb+13u];
-    const float c_soz    = cam_verts[cb+14u];
+    const float c_soy    = cam_verts[cb+13u];  /* sensor_origin_y */
+    const float c_soz    = cam_verts[cb+14u];  /* sensor_origin_z */
 
+    const uint c_vinfo       = floatBitsToUint(cam_verts[cb +  9u]);
+    const uint c_flags       = floatBitsToUint(cam_verts[cb +  7u]);
+    const uint c_pdf_flags   = floatBitsToUint(cam_verts[cb + 17u]);
+    const uint c_optical_blk = floatBitsToUint(cam_verts[cb + 18u]);
+
+    /* ci = vertex_index within its cam subpath.
+     * cam_flat_base = flat index of subpath vertex 0 = gid - ci. */
+    const uint ci            = c_vinfo & 0x7FFFu;
+    const uint cam_flat_base = gid - ci;
+
+    /* Non-connectable cam verts are still packed (for chain navigation) but
+     * produce no contribution.  Early-exit here keeps invocations cheap. */
+    if (!vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk)) return;
     if (c_beta_r + c_beta_g + c_beta_b < 1e-15f) return;
+
+    /* BRDF fields for scatter PDF at this cam vert (used in conn_fwd). */
+    const vec3  c_dir_in    = vec3(cam_verts[cb + uint(CGV_DIR_IN_X)    ],
+                                    cam_verts[cb + uint(CGV_DIR_IN_X) + 1u],
+                                    cam_verts[cb + uint(CGV_DIR_IN_X) + 2u]);
+    const float c_diffuse_p = cam_verts[cb + uint(CGV_DIFFUSE_P)];
+    const float c_ggx_alpha = cam_verts[cb + uint(CGV_GGX_ALPHA)];
+    const float c_opt_jac   = cam_verts[cb + uint(CGV_OPT_JACOBIAN)];
 
     /* ── Pixel index ────────────────────────────────────────────────────── */
     const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
@@ -142,19 +445,31 @@ void main() {
 
     /* ── Scan this batch of light vertices ──────────────────────────────── *
      * All invocations walk the same [light_offset, light_offset+batch) range*
-     * in lockstep — warps coalesce on every light vert load.  C++ loops    *
-     * service_t5_job through batches with a tiny params re-upload each time.*
-     * This keeps each dispatch short enough to avoid Windows GPU TDR.       */
+     * in lockstep — warps coalesce on every light vert load.               */
     const uint li_end = min(light_offset + light_batch_size, n_light_verts);
     float lum_r = 0.0f, lum_g = 0.0f, lum_b = 0.0f;
+
     for (uint li = light_offset; li < li_end; ++li) {
         const uint  lb     = li * uint(T5_LGV_STRIDE);
         const vec3  l_pos  = vec3(light_verts[lb+0u], light_verts[lb+1u], light_verts[lb+2u]);
         const vec3  l_norm = vec3(light_verts[lb+3u], light_verts[lb+4u], light_verts[lb+5u]);
-        const float l_beta = light_verts[lb+10u];   /* light path scalar throughput */
+        const float l_beta = light_verts[lb+10u];
 
         if (l_beta < 1e-15f) continue;
 
+        const uint l_vinfo       = floatBitsToUint(light_verts[lb +  9u]);
+        const uint l_flags       = floatBitsToUint(light_verts[lb +  7u]);
+        const uint l_pdf_flags   = floatBitsToUint(light_verts[lb + 13u]);
+        const uint l_optical_blk = floatBitsToUint(light_verts[lb + 14u]);
+
+        if (!vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk)) continue;
+
+        /* li_v = vertex_index within its light subpath.
+         * light_flat_base = flat index of subpath vertex 0 = li - li_v. */
+        const uint li_v            = l_vinfo & 0x7FFFu;
+        const uint light_flat_base = li - li_v;
+
+        /* ── Geometry term ─────────────────────────────────────────────── */
         const vec3  dv    = l_pos - c_pos;
         const float dist2 = dot(dv, dv);
         if (dist2 < 1e-12f) continue;
@@ -165,17 +480,49 @@ void main() {
 
         if (shadow_occluded(c_pos, l_pos)) continue;
 
-        /* Camera spectral betas carry the per-channel colour weight computed by
-         * band_to_display_rgb in C++ — same formula as accum_pixel_color CPU path. */
-        const float contrib = l_beta * geom;
+        /* ── BRDF fields for this light vert ────────────────────────────── */
+        const vec3  l_dir_in    = vec3(light_verts[lb + uint(LGV_DIR_IN_X)    ],
+                                        light_verts[lb + uint(LGV_DIR_IN_X) + 1u],
+                                        light_verts[lb + uint(LGV_DIR_IN_X) + 2u]);
+        const float l_diffuse_p = light_verts[lb + uint(LGV_DIFFUSE_P)];
+        const float l_ggx_alpha = light_verts[lb + uint(LGV_GGX_ALPHA)];
+        const float l_opt_jac   = light_verts[lb + uint(LGV_OPT_JACOBIAN)];
+
+        /* ── Connection PDFs (area domain) ──────────────────────────────── */
+        /* conn_fwd: scatter PDF at cam[ci] toward light[li_v] */
+        float conn_fwd = scatter_conn_pdf_area(
+            c_pos, c_norm, c_dir_in,
+            c_diffuse_p, c_ggx_alpha, c_pdf_flags, c_opt_jac,
+            l_pos, l_norm);
+
+        /* conn_bwd: scatter PDF at light[li_v] toward cam[ci] */
+        float conn_bwd = scatter_conn_pdf_area(
+            l_pos, l_norm, l_dir_in,
+            l_diffuse_p, l_ggx_alpha, l_pdf_flags, l_opt_jac,
+            c_pos, c_norm);
+
+        /* ── Full MIS: balance heuristic denominator ────────────────────── */
+        float selected_pdf = 0.0f, denom = 0.0f;
+        if (!candidate_strategy_density(
+                ci,   cam_flat_base,
+                li_v, light_flat_base,
+                conn_fwd, conn_bwd,
+                selected_pdf, denom)) continue;
+
+        /* Contribution simplification:
+         *   β_cam × β_light × G × mis_weight / strategy_pdf
+         *   = β_cam × β_light × G × (selected_pdf / denom) / selected_pdf
+         *   = β_cam × β_light × G / denom                                  */
+        const float contrib = l_beta * geom / denom;
         lum_r += c_beta_r * contrib;
         lum_g += c_beta_g * contrib;
         lum_b += c_beta_b * contrib;
     }
 
     if (lum_r + lum_g + lum_b > 0.0f) {
-        atomic_add_float(px,          lum_r);
-        atomic_add_float(px + pix,    lum_g);
-        atomic_add_float(px + 2u*pix, lum_b);
+        atomic_add_float(px,           lum_r);
+        atomic_add_float(px + pix,     lum_g);
+        atomic_add_float(px + 2u*pix,  lum_b);
     }
 }
+

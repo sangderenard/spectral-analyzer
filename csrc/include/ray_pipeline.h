@@ -542,6 +542,67 @@ static constexpr int T5_MAX_GPU_BANDS = 16;  /* per-band betas packed into GPU v
 static constexpr int LGV_BAND_BASE    = 16;  /* first per-band beta field in LGV (field index) */
 static constexpr int CGV_BAND_BASE    = 22;  /* first per-band beta field in CGV (field index) */
 
+/* ── LGV named field offsets (stride 40) ────────────────────────────────── *
+ * [0..2]   pos xyz                                                           *
+ * [3..5]   normal xyz                                                        *
+ * [6]      throughput_scalar                                                 *
+ * [7]      flags (MAT_FLAG_*, bit-cast uint)                                 *
+ * [8]      subpath_id (bit-cast uint)                                        *
+ * [9]      vertex_index | (stream<<16)  (bit-cast uint)                      *
+ * [10]     beta_lum  (sum of per-band |beta|, scalar throughput fallback)    *
+ * [11]     pdf_fwd  (BdptVertexRecord::pdf_fwd, raw)                         *
+ * [12]     pdf_rev  (BdptVertexRecord::pdf_rev, raw)                         *
+ * [13]     BdptPdfRecord::flags  (BDPT_PDF_FLAG_*, bit-cast uint)            *
+ * [14]     optical_block  (non-zero = absorb/TIR/clip; bit-cast uint)        *
+ * [15]     prefix_pdf  (cumulative subpath forward-PDF up to this vertex)    *
+ * [16..31] per-band beta magnitudes [band 0..15]  (LGV_BAND_BASE)           *
+ * [32..34] dir_in xyz  (incident direction at this vertex)                   *
+ * [35]     diffuse_p  (mat_cache_diffusion result)                           *
+ * [36]     ggx_alpha  (surf_cache_ggx_alpha result)                          *
+ * [37]     optical_jacobian  (phase-space jacobian product from optical LUT) *
+ * [38]     edge_fwd_area  (area-domain fwd PDF: this vertex → next in path)  *
+ * [39]     edge_bwd_area  (area-domain bwd PDF: next vertex → this in path)  */
+static constexpr int LGV_DIR_IN_X       = 32;
+static constexpr int LGV_DIFFUSE_P      = 35;
+static constexpr int LGV_GGX_ALPHA      = 36;
+static constexpr int LGV_OPT_JACOBIAN   = 37;
+static constexpr int LGV_EDGE_FWD_AREA  = 38;
+static constexpr int LGV_EDGE_BWD_AREA  = 39;
+
+/* ── CGV named field offsets (stride 56) ────────────────────────────────── *
+ * [0..2]   pos xyz                                                           *
+ * [3..5]   normal xyz                                                        *
+ * [6]      throughput_scalar                                                 *
+ * [7]      flags (MAT_FLAG_*, bit-cast uint)                                 *
+ * [8]      subpath_id (bit-cast uint)                                        *
+ * [9]      vertex_index (bit-cast uint)                                      *
+ * [10]     spectral_beta_r  (display-weighted, band_to_display_rgb sum)      *
+ * [11]     spectral_beta_g                                                   *
+ * [12]     spectral_beta_b                                                   *
+ * [13]     sensor_origin_y                                                   *
+ * [14]     sensor_origin_z                                                   *
+ * [15]     pdf_fwd  (BdptVertexRecord::pdf_fwd, raw)                         *
+ * [16]     pdf_rev  (BdptVertexRecord::pdf_rev, raw)                         *
+ * [17]     BdptPdfRecord::flags  (BDPT_PDF_FLAG_*, bit-cast uint)            *
+ * [18]     optical_block  (non-zero = absorb/TIR/clip; bit-cast uint)        *
+ * [19]     prefix_pdf  (cumulative subpath forward-PDF up to this vertex)    *
+ * [20]     mis_denom_sum  (reserved, 0.0)                                    *
+ * [21]     tri_mat_idx  (int bits of material index)                         *
+ * [22..37] per-band beta magnitudes [band 0..15]  (CGV_BAND_BASE)           *
+ * [38..40] dir_in xyz                                                        *
+ * [41]     diffuse_p                                                         *
+ * [42]     ggx_alpha                                                         *
+ * [43]     optical_jacobian                                                  *
+ * [44]     edge_fwd_area                                                     *
+ * [45]     edge_bwd_area                                                     *
+ * [46..55] pad / reserved                                                    */
+static constexpr int CGV_DIR_IN_X       = 38;
+static constexpr int CGV_DIFFUSE_P      = 41;
+static constexpr int CGV_GGX_ALPHA      = 42;
+static constexpr int CGV_OPT_JACOBIAN   = 43;
+static constexpr int CGV_EDGE_FWD_AREA  = 44;
+static constexpr int CGV_EDGE_BWD_AREA  = 45;
+
 /* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl.
  * std430 layout, 32 bytes. */
 struct T5GpuParams {

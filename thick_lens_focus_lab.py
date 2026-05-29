@@ -4260,8 +4260,8 @@ class ForwardCppLensBench:
     view_h: int
     view_w: int
     sidecar: FreeFrequencySidecar | None = None
-    field_capture: bool = False
-    enable_uv_splat: bool = False
+    field_capture: bool = True
+    enable_uv_splat: bool = True
 
     def __post_init__(self) -> None:
         self._trace_lock = threading.Lock()
@@ -8127,8 +8127,8 @@ def run(
     emitter_amp_gain: float = 1.0,
     compute_mode: str = "gpu",
     profile: bool = False,
-    field_capture: bool = False,
-    enable_uv_splat: bool = False,
+    field_capture: bool = True,
+    enable_uv_splat: bool = True,
     bake_noodles: int = 0,
     focus_steps: int = 1,
     focus_range_mm: float = 2.0,
@@ -8959,7 +8959,13 @@ def run(
         glUseProgram(0)
 
     def draw_pip() -> None:
-        # ── Left pip: camera pipeline progress (violet border) ──────────────
+        # ── Left pip: reverse/light-path strike distribution (violet border) ─
+        rev_img = bench.get_reverse_strike_image()
+        if rev_img.shape[0] > 0:
+            glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         rev_img.shape[1], rev_img.shape[0], 0,
+                         GL_RGB, GL_FLOAT, rev_img)
         _draw_quad_with_pip_prog(
             tex_bdpt_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(0.58, 0.32, 1.00),
@@ -9813,7 +9819,13 @@ def run(
     _startup_iris_pending = [True]
     # Unblocked by startup once the first exposure frame is fully set up.
     # The camera thread waits here before starting its slice loop.
-    _camera_ready = threading.Event()
+    _camera_ready    = threading.Event()
+    # Set by the camera loop when an exposure finishes (waiting for spacebar).
+    _exposure_done   = threading.Event()
+    # Set by spacebar to trigger the next exposure.
+    _shutter_event   = threading.Event()
+    # Shared exposure counter (display loop reads it for caption).
+    _exposure_count  = [0]
 
     def _fire_pipeline_camera_render(_materialized_slice_id: int = -1) -> None:
         if _pipeline_camera_busy[0]:
@@ -9962,93 +9974,199 @@ def run(
         seam — the coordinator owns both ends.
         """
         import time as _ct
+        import datetime as _dt
+
+        def _run_one_exposure(seed_offset: int) -> None:
+            """Run one full exposure (all slices → drain → T5 → image refresh → save)."""
+            n_stages = bench._exposure_stage_count()
+            _seed_n = seed_offset
+            for _slice_idx in range(n_stages):
+                if closing.is_set():
+                    return
+                while paused[0] and not closing.is_set():
+                    _ct.sleep(0.005)
+                _tl = getattr(bench, "_camera_timeline", None)
+                _ts = _tl.slices[_slice_idx] if (_tl and _slice_idx < len(_tl.slices)) else None
+                _slice_dt = float(_ts.dt) if _ts is not None else 0.010
+                on_dt_request(_slice_dt)
+                _trace(rays_per_emitter, (seed + _seed_n) & 0x7FFFFFFF, max_bounces)
+                _seed_n += 1
+                while not closing.is_set():
+                    if int(getattr(bench, "_bdpt_camera_sweep_stage", 0)) > _slice_idx:
+                        break
+                    _ct.sleep(0.001)
+
+            # All slices dispatched — drain the pipeline.
+            _t_scene = float(getattr(bench._scene_camera_coordinator, "scene_time_s", 0.0))
+            if not closing.is_set():
+                bench._finish_exposure_frame()
+                while not closing.is_set():
+                    try:
+                        if int(bench.tracer.in_flight_count()) == 0:
+                            break
+                    except Exception:
+                        break
+                    _ct.sleep(0.010)
+
+            # Re-trigger T5 with the complete endpoint set.
+            # Snapshot sensor_accum NOW — before T5 — to capture direct lighting only.
+            _direct_img: Optional[np.ndarray] = None
+            try:
+                _di = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
+                if _di.ndim == 3 and _di.shape[2] >= 3 and _di.shape[0] > 0:
+                    _direct_img = np.ascontiguousarray(np.clip(_di[:, :, :3], 0.0, 1.0), dtype=np.float32)
+                    _lit_d = int(np.count_nonzero(np.sum(_direct_img, axis=2) > 1e-8))
+                    print(f"[exposure] direct-lighting snapshot: lit_px={_lit_d}", flush=True)
+            except Exception as _di_exc:
+                print(f"[exposure] direct-lighting snapshot failed: {_di_exc}", flush=True)
+
+            try:
+                bench.tracer.signal_sensor_dispatched()
+                bench.tracer.signal_flash_dispatched()
+                print("[exposure] T5 re-trigger fired — joining T5 thread…", flush=True)
+                bench.tracer.join_t5()
+                print("[exposure] T5 re-trigger done", flush=True)
+            except Exception as _t5exc:
+                print(f"[exposure] T5 re-trigger failed: {_t5exc}", flush=True)
+
+            # Refresh sensor plate now that T5 has written.
+            try:
+                _final_img = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
+                if _final_img.ndim == 3 and _final_img.shape[2] >= 3 and _final_img.shape[0] > 0:
+                    bench._last_bdpt_plate_rgb = np.ascontiguousarray(
+                        np.clip(_final_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
+                    _lit = int(np.count_nonzero(np.sum(_final_img[:, :, :3], axis=2) > 1e-8))
+                    print(f"[exposure] sensor image refreshed: lit_px={_lit}", flush=True)
+            except Exception as _img_exc:
+                print(f"[exposure] sensor image refresh failed: {_img_exc}", flush=True)
+
+            # Stats.
+            try:
+                _final_stats = dict(bench.tracer.get_bdpt_stats())
+            except Exception:
+                _final_stats = {}
+            try:
+                _final_overflow = dict(bench.tracer.get_bdpt_overflow())
+            except Exception:
+                _final_overflow = {}
+            _fwd = bench._async_bdpt_forward_count()
+            _bwd = bench._async_backward_strike_count
+            _exp_n = _exposure_count[0]
+            print(
+                f"[exposure #{_exp_n}] ── FRAME DONE ──"
+                f"  scene_t={_t_scene:.4f}s"
+                f"  fwd_endpoints={_fwd:_}"
+                f"  bwd_strikes={_bwd:_}"
+                f"  connections={int(_final_stats.get('exact_snaps', 0)):_}"
+                f"  near_miss={int(_final_stats.get('near_miss_count', 0)):_}"
+                f"  overflow={int(_final_overflow.get('connections', 0)):_}",
+                flush=True,
+            )
+
+            # Save all three images for this exposure.
+            try:
+                _stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_exp{_exp_n:03d}"
+
+                def _save_float_rgb_png_inline(arr: np.ndarray, path: str) -> None:
+                    peak = np.percentile(arr, 99.9)
+                    if peak <= 0.0:
+                        peak = arr.max()
+                    if peak <= 0.0:
+                        peak = 1.0
+                    norm = np.clip(arr / peak, 0.0, 1.0)
+                    u8 = (norm * 255.0 + 0.5).astype(np.uint8)
+                    try:
+                        from PIL import Image as _PILImage
+                        _PILImage.fromarray(u8, mode="RGB").save(path)
+                    except ImportError:
+                        import zlib as _zlib, struct as _struct
+                        h, w = u8.shape[:2]
+                        def _png_chunk(tag: bytes, data: bytes) -> bytes:
+                            c = _struct.pack(">I", len(data)) + tag + data
+                            return c + _struct.pack(">I", _zlib.crc32(tag + data) & 0xFFFFFFFF)
+                        rows = b"".join(b"\x00" + u8[y].tobytes() for y in range(h))
+                        raw = _png_chunk(b"IHDR", _struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                        raw += _png_chunk(b"IDAT", _zlib.compress(rows, 6))
+                        raw += _png_chunk(b"IEND", b"")
+                        with open(path, "wb") as _f:
+                            _f.write(b"\x89PNG\r\n\x1a\n" + raw)
+
+                _fwd_arr = bench._forward_img_accum
+                if _fwd_arr is not None and _fwd_arr.ndim == 3 and np.any(_fwd_arr > 0):
+                    _p = f"forward_{_stamp}.png"
+                    _save_float_rgb_png_inline(_fwd_arr, _p)
+                    print(f"[save] forward → {_p}", flush=True)
+
+                _rev_arr = bench._reverse_img_accum
+                if _rev_arr is not None and _rev_arr.ndim == 3 and np.any(_rev_arr > 0):
+                    _p = f"reverse_{_stamp}.png"
+                    _save_float_rgb_png_inline(_rev_arr, _p)
+                    print(f"[save] reverse → {_p}", flush=True)
+
+                # Direct lighting: sensor_accum snapshot taken before T5 ran.
+                # Always saved — non-zero whenever any camera ray hit an emissive surface.
+                if _direct_img is not None and np.any(_direct_img > 0):
+                    _p = f"direct_{_stamp}.png"
+                    _save_float_rgb_png_inline(_direct_img, _p)
+                    print(f"[save] direct  → {_p}", flush=True)
+                else:
+                    print("[save] direct image empty — skipped", flush=True)
+
+                _bdpt_arr = bench._last_bdpt_plate_rgb
+                if _bdpt_arr is not None and _bdpt_arr.ndim == 3 and np.any(_bdpt_arr > 0):
+                    _p = f"bdpt_{_stamp}.png"
+                    _save_float_rgb_png_inline(_bdpt_arr, _p)
+                    print(f"[save] bdpt    → {_p}", flush=True)
+            except Exception as _sv_exc:
+                print(f"[save] PNG export failed: {_sv_exc}", flush=True)
+
+        def _reset_for_next_exposure() -> None:
+            """Clear accumulators and pipeline state ready for a fresh exposure."""
+            try:
+                bench.tracer.reset_pipeline()
+            except Exception:
+                pass
+            bench._forward_img_accum[:] = 0.0
+            bench._reverse_img_accum[:] = 0.0
+            bench._last_bdpt_plate_rgb = None
+            bench._camera_exposure_complete = False
+            bench._camera_exposure_forward_stage = 0
+            bench._bdpt_camera_sweep_stage = 0
+            bench._active_exposure_frame = None
+            bench.begin_scene_camera_step()
+            bench._ensure_camera_timeline()
+
         _camera_ready.wait()
         if closing.is_set():
             return
-        n_stages = bench._exposure_stage_count()
-        _seed_n = 0
-        for _slice_idx in range(n_stages):
+
+        _seed_offset = 0
+        while not closing.is_set():
+            _exposure_count[0] += 1
+            print(f"[exposure] starting exposure #{_exposure_count[0]}", flush=True)
+            _run_one_exposure(_seed_offset)
+            _seed_offset += bench._exposure_stage_count() if hasattr(bench, '_exposure_stage_count') else 1
+
             if closing.is_set():
-                return
-            while paused[0] and not closing.is_set():
-                _ct.sleep(0.005)
-            _tl = getattr(bench, "_camera_timeline", None)
-            _ts = _tl.slices[_slice_idx] if (_tl and _slice_idx < len(_tl.slices)) else None
-            _slice_dt = float(_ts.dt) if _ts is not None else 0.010
-            on_dt_request(_slice_dt)
-            _trace(rays_per_emitter, (seed + _seed_n) & 0x7FFFFFFF, max_bounces)
-            _seed_n += 1
+                break
+
+            # Signal the display loop that we're idle and waiting for shutter.
+            _exposure_done.set()
+            print("[exposure] waiting for SPACE to trigger next exposure…", flush=True)
+
+            # Wait for spacebar (or closing).
+            _shutter_event.clear()
             while not closing.is_set():
-                if int(getattr(bench, "_bdpt_camera_sweep_stage", 0)) > _slice_idx:
+                if _shutter_event.wait(timeout=0.1):
                     break
-                _ct.sleep(0.001)
 
-        # All slices dispatched. Wait for the pipeline to fully drain before
-        # declaring the frame done — dispatched ≠ processed.
-        _t_scene = float(getattr(bench._scene_camera_coordinator, "scene_time_s", 0.0))
-        if not closing.is_set():
-            bench._finish_exposure_frame()
-            while not closing.is_set():
-                try:
-                    if int(bench.tracer.in_flight_count()) == 0:
-                        break
-                except Exception:
-                    break
-                _ct.sleep(0.010)
+            _exposure_done.clear()
 
-        # T5 fires from T3 when sensor vertices first land — before child rays
-        # complete T4.  Re-signal with sensor BEFORE flash so that
-        # min(flash, sensor) advances past t5_fired and T5 runs a second pass
-        # with the complete endpoint set (including all child-bounce vertices).
-        # join_t5() blocks (GIL released) on the actual T5 thread — no polling.
-        # ALWAYS join T5 regardless of closing: it may already be running from
-        # the C++ auto-trigger and destroying the tracer before it finishes
-        # corrupts GPU state and silently drops the frame output.
-        try:
-            bench.tracer.signal_sensor_dispatched()  # sensor first: min gate clears
-            bench.tracer.signal_flash_dispatched()   # flash second: fires _fire_t5_if_ready
-            print("[exposure] T5 re-trigger fired — joining T5 thread…", flush=True)
-            bench.tracer.join_t5()
-            print("[exposure] T5 re-trigger done", flush=True)
-        except Exception as _t5exc:
-            print(f"[exposure] T5 re-trigger failed: {_t5exc}", flush=True)
+            if closing.is_set():
+                break
 
-        # T5 has now written to sensor_accum ch2 (BDPT radiance, the B channel).
-        # The worker's get_sensor_image() ran before T5, so ch2 was empty then.
-        # Refresh the plate image now that ch2 is populated.
-        try:
-            _final_img = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
-            if _final_img.ndim == 3 and _final_img.shape[2] >= 3 and _final_img.shape[0] > 0:
-                bench._last_bdpt_plate_rgb = np.ascontiguousarray(
-                    np.clip(_final_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
-                _lit = int(np.count_nonzero(np.sum(_final_img[:, :, :3], axis=2) > 1e-8))
-                print(f"[exposure] sensor image refreshed: lit_px={_lit}", flush=True)
-        except Exception as _img_exc:
-            print(f"[exposure] sensor image refresh failed: {_img_exc}", flush=True)
-
-        # Read final stats directly from C++ (bdpt_last_connection_stats was set
-        # from the pre-drain sensor sweep call and reflects an empty endpoint table).
-        try:
-            _final_stats = dict(bench.tracer.get_bdpt_stats())
-        except Exception:
-            _final_stats = {}
-        try:
-            _final_overflow = dict(bench.tracer.get_bdpt_overflow())
-        except Exception:
-            _final_overflow = {}
-        _fwd = bench._async_bdpt_forward_count()
-        _bwd = bench._async_backward_strike_count
-        print(
-            f"[exposure] ── FRAME DONE ──"
-            f"  scene_t={_t_scene:.4f}s"
-            f"  fwd_endpoints={_fwd:_}"
-            f"  bwd_strikes={_bwd:_}"
-            f"  connections={int(_final_stats.get('exact_snaps', 0)):_}"
-            f"  near_miss={int(_final_stats.get('near_miss_count', 0)):_}"
-            f"  overflow={int(_final_overflow.get('connections', 0)):_}",
-            flush=True,
-        )
-        closing.set()
+            # Reset accumulators and begin the next exposure frame.
+            _reset_for_next_exposure()
 
     def _coordinator_on_dt_request(dt_s: float) -> None:
         """Coordinator delivers camera dt requests to the physics backend."""
@@ -10259,7 +10377,12 @@ def run(
                                 pygame.mouse.set_visible(True)
                                 pygame.event.set_grab(False)
                         elif k == pygame.K_SPACE and not fly_mode:
-                            paused[0] = not paused[0]
+                            if _exposure_done.is_set():
+                                # Exposure finished — fire next shutter.
+                                print("[shutter] SPACE — triggering next exposure", flush=True)
+                                _shutter_event.set()
+                            else:
+                                paused[0] = not paused[0]
                         elif not fly_mode:
                             if k == pygame.K_x:
                                 projection_axis = 1
@@ -10399,9 +10522,10 @@ def run(
                 shader_mode = 1
                 axis_label = "X/Y"
 
+            _status = "PRESS SPACE for next exposure" if _exposure_done.is_set() else f"exp#{_exposure_count[0]}"
             pygame.display.set_caption(
                 f"Thick Lens — {axis_label} | bounces={max_bounces} | "
-                f"shuffle={bench.intent_shuffle:.2f} ([/] to adjust)"
+                f"shuffle={bench.intent_shuffle:.2f} ([/] to adjust) | {_status}"
             )
 
             # Apply any pending LUT/MLP transition from the background worker.
@@ -10536,6 +10660,14 @@ def run(
                 print(f"[save] forward image → {_fwd_path}", flush=True)
             else:
                 print("[save] forward image empty — skipped", flush=True)
+
+            _rev_arr = bench._reverse_img_accum
+            if _rev_arr is not None and _rev_arr.ndim == 3 and np.any(_rev_arr > 0):
+                _rev_path = f"reverse_{_stamp}.png"
+                _save_float_rgb_png(_rev_arr, _rev_path)
+                print(f"[save] reverse strike image → {_rev_path}", flush=True)
+            else:
+                print("[save] reverse strike image empty — skipped", flush=True)
 
             _bdpt_arr = bench._last_bdpt_plate_rgb
             if _bdpt_arr is not None and _bdpt_arr.ndim == 3 and np.any(_bdpt_arr > 0):
@@ -10730,12 +10862,28 @@ if __name__ == "__main__":
     _ap.add_argument(
         "--field",
         action="store_true",
-        help="Enable volumetric field capture and ray-march display (128×64×64 grid; off by default)",
+        default=True,
+        dest="field",
+        help="Enable volumetric field capture and ray-march display (on by default)",
+    )
+    _ap.add_argument(
+        "--no-field",
+        action="store_false",
+        dest="field",
+        help="Disable volumetric field capture",
     )
     _ap.add_argument(
         "--uv-splat",
         action="store_true",
-        help="Enable UV page bank and ray-splatted surface illumination (off by default)",
+        default=True,
+        dest="uv_splat",
+        help="Enable UV page bank and ray-splatted surface illumination (on by default)",
+    )
+    _ap.add_argument(
+        "--no-uv-splat",
+        action="store_false",
+        dest="uv_splat",
+        help="Disable UV page bank and ray-splatted surface illumination",
     )
     _ap.add_argument(
         "--bake-noodles",

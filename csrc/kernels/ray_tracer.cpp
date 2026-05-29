@@ -11368,17 +11368,50 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     std::vector<float> light_packed(static_cast<size_t>(n_lv) * T5_LGV_STRIDE, 0.0f);
     for (uint32_t i = 0; i < n_lv; ++i) {
-        const BdptVertexRecord& lr = *light_verts_flat[i].rec;
+        const BdptVertexRecord& lr  = *light_verts_flat[i].rec;
+        const BdptSubpathView*  lsp = light_verts_flat[i].sp;
+        const uint32_t          li  = light_verts_flat[i].li;
         float* p = light_packed.data() + static_cast<size_t>(i) * T5_LGV_STRIDE;
+        /* base fields [0..10] — geometry + ids + scalar beta */
         p[0]  = lr.pos[0];    p[1]  = lr.pos[1];    p[2]  = lr.pos[2];
         p[3]  = lr.normal[0]; p[4]  = lr.normal[1]; p[5]  = lr.normal[2];
         p[6]  = lr.throughput_scalar;
         std::memcpy(&p[7], &lr.flags,      sizeof(uint32_t));
         std::memcpy(&p[8], &lr.subpath_id, sizeof(uint32_t));
         const uint32_t vinfo = (uint32_t)lr.vertex_index | ((uint32_t)lr.stream << 16);
-        std::memcpy(&p[9], &vinfo,          sizeof(uint32_t));
+        std::memcpy(&p[9], &vinfo, sizeof(uint32_t));
         p[10] = static_cast<float>(ctx.beta_scalar_val(lr));
-        p[11] = 0.0f;
+        /* pdf_fwd / pdf_rev [11..12] — direct from vertex record */
+        p[11] = lr.pdf_fwd;
+        p[12] = lr.pdf_rev;
+        /* pdf_flags [13] — bit-cast material flags */
+        std::memcpy(&p[13], &lr.flags, sizeof(uint32_t));
+        /* optical_block [14] — set if any absorption event for this vertex */
+        {
+            uint32_t oblock = 0u;
+            const uint64_t ok = ((uint64_t)lr.subpath_id  << 32)
+                              | ((uint64_t)lr.vertex_index << 16)
+                              | (uint64_t)lr.stream;
+            auto oit = ctx.optical_lut.find(ok);
+            if (oit != ctx.optical_lut.end())
+                for (const auto& oe : oit->second)
+                    if (oe.reason == BDPT_OPT_ABSORPTION) { oblock = 1u; break; }
+            std::memcpy(&p[14], &oblock, sizeof(uint32_t));
+        }
+        /* prefix_pdf [15] — cumulative forward-PDF prefix for MIS */
+        p[15] = (li < lsp->prefix_pdf.size() && lsp->prefix_valid[li])
+              ? static_cast<float>(lsp->prefix_pdf[li]) : 0.0f;
+        /* per-band beta magnitudes [LGV_BAND_BASE .. LGV_BAND_BASE+T5_MAX_GPU_BANDS-1] */
+        for (int b = 0; b < T5_MAX_GPU_BANDS; ++b) {
+            if (b >= ctx.n_bands) { p[LGV_BAND_BASE + b] = 0.0f; continue; }
+            const uint64_t k = ((uint64_t)lr.subpath_id  << 32)
+                             | ((uint64_t)lr.vertex_index << 16)
+                             | (uint64_t)b;
+            auto it = ctx.beta_lut.find(k);
+            p[LGV_BAND_BASE + b] = (it != ctx.beta_lut.end())
+                ? static_cast<float>(std::abs(it->second)) : 0.0f;
+        }
+        /* [32..39] remain 0.0f — pad / reserved */
     }
 
     /* ── GPU path: full brute-force dispatch ────────────────────────────── */
@@ -11426,6 +11459,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                  * s_wr/g/b remain 0 and the shader will discard the vertex. */
 
                 float* p = cam_packed.data() + static_cast<size_t>(ci_flat++) * T5_CGV_STRIDE;
+                /* base fields [0..14] — geometry + ids + spectral display betas */
                 p[0]  = c.pos[0];    p[1]  = c.pos[1];    p[2]  = c.pos[2];
                 p[3]  = c.normal[0]; p[4]  = c.normal[1]; p[5]  = c.normal[2];
                 p[6]  = c.throughput_scalar;
@@ -11437,7 +11471,41 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 p[12] = static_cast<float>(s_wb);   /* spectral beta B */
                 p[13] = c.sensor_origin_y;
                 p[14] = c.sensor_origin_z;
-                p[15] = 0.0f;
+                /* pdf_fwd / pdf_rev [15..16] — direct from vertex record */
+                p[15] = c.pdf_fwd;
+                p[16] = c.pdf_rev;
+                /* pdf_flags [17] — bit-cast material flags */
+                std::memcpy(&p[17], &c.flags, sizeof(uint32_t));
+                /* optical_block [18] — set if any absorption event for this vertex */
+                {
+                    uint32_t oblock = 0u;
+                    const uint64_t ok = ((uint64_t)c.subpath_id  << 32)
+                                      | ((uint64_t)c.vertex_index << 16)
+                                      | (uint64_t)c.stream;
+                    auto oit = ctx.optical_lut.find(ok);
+                    if (oit != ctx.optical_lut.end())
+                        for (const auto& oe : oit->second)
+                            if (oe.reason == BDPT_OPT_ABSORPTION) { oblock = 1u; break; }
+                    std::memcpy(&p[18], &oblock, sizeof(uint32_t));
+                }
+                /* prefix_pdf [19] — cumulative forward-PDF prefix for MIS */
+                p[19] = (ci < csp->prefix_pdf.size() && csp->prefix_valid[ci])
+                      ? static_cast<float>(csp->prefix_pdf[ci]) : 0.0f;
+                /* mis_denom_sum [20] — placeholder (0.0 until MIS pass is wired) */
+                p[20] = 0.0f;
+                /* tri_mat_idx [21] — int bits of material index */
+                std::memcpy(&p[21], &c.mat_idx, sizeof(int32_t));
+                /* per-band beta magnitudes [CGV_BAND_BASE .. CGV_BAND_BASE+T5_MAX_GPU_BANDS-1] */
+                for (int b = 0; b < T5_MAX_GPU_BANDS; ++b) {
+                    if (b >= ctx.n_bands) { p[CGV_BAND_BASE + b] = 0.0f; continue; }
+                    const uint64_t k = ((uint64_t)c.subpath_id  << 32)
+                                     | ((uint64_t)c.vertex_index << 16)
+                                     | (uint64_t)b;
+                    auto it = ctx.beta_lut.find(k);
+                    p[CGV_BAND_BASE + b] = (it != ctx.beta_lut.end())
+                        ? static_cast<float>(std::abs(it->second)) : 0.0f;
+                }
+                /* [38..55] remain 0.0f — pad / reserved */
             }
         }
 

@@ -536,8 +536,11 @@ struct WaveArena {
 };
 
 /* ── T5 GPU connection pass types ────────────────────────────────────────── */
-static constexpr int T5_LGV_STRIDE = 12;  /* light vertex, floats (must match shader) */
-static constexpr int T5_CGV_STRIDE = 16;  /* camera vertex, floats (must match shader) */
+static constexpr int T5_LGV_STRIDE    = 40;  /* light vertex, floats (must match shader) */
+static constexpr int T5_CGV_STRIDE    = 56;  /* camera vertex, floats (must match shader) */
+static constexpr int T5_MAX_GPU_BANDS = 16;  /* per-band betas packed into GPU vert buffers */
+static constexpr int LGV_BAND_BASE    = 16;  /* first per-band beta field in LGV (field index) */
+static constexpr int CGV_BAND_BASE    = 22;  /* first per-band beta field in CGV (field index) */
 
 /* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl.
  * std430 layout, 32 bytes. */

@@ -14,29 +14,43 @@
  *  binding  buffer          access    description
  *  -------  --------------- --------  ---------------------------------------
  *    0      T5LightVertBuf  readonly  Flat light vertices.
- *                                     Stride = T5_LGV_STRIDE = 12 floats.
- *                                       [0..2]  pos xyz
- *                                       [3..5]  normal xyz
- *                                       [6]     throughput_scalar
- *                                       [7]     uintBitsToFloat(flags)
- *                                       [8]     uintBitsToFloat(subpath_id)
- *                                       [9]     uintBitsToFloat(vert_info)
- *                                       [10]    beta_lum
- *                                       [11]    0 (pad)
+ *                                     Stride = T5_LGV_STRIDE = 40 floats.
+ *                                       [0..2]   pos xyz
+ *                                       [3..5]   normal xyz
+ *                                       [6]      throughput_scalar
+ *                                       [7]      uintBitsToFloat(flags)
+ *                                       [8]      uintBitsToFloat(subpath_id)
+ *                                       [9]      uintBitsToFloat(vert_info)
+ *                                       [10]     beta_lum
+ *                                       [11]     pdf_fwd
+ *                                       [12]     pdf_rev
+ *                                       [13]     uintBitsToFloat(pdf_flags)
+ *                                       [14]     uintBitsToFloat(optical_block)
+ *                                       [15]     prefix_pdf
+ *                                       [16..31] per-band beta magnitudes [0..15]
+ *                                       [32..39] pad
  *    1      T5CamVertBuf    readonly  Flat camera vertices.
- *                                     Stride = T5_CGV_STRIDE = 16 floats.
- *                                       [0..2]  pos xyz
- *                                       [3..5]  normal xyz
- *                                       [6]     throughput_scalar
- *                                       [7]     uintBitsToFloat(flags)
- *                                       [8]     uintBitsToFloat(subpath_id)
- *                                       [9]     uintBitsToFloat(vert_index)
- *                                       [10]    spectral_beta_r  (band_to_display_rgb weighted)
- *                                       [11]    spectral_beta_g
- *                                       [12]    spectral_beta_b
- *                                       [13]    sensor_origin_y
- *                                       [14]    sensor_origin_z
- *                                       [15]    0 (pad)
+ *                                     Stride = T5_CGV_STRIDE = 56 floats.
+ *                                       [0..2]   pos xyz
+ *                                       [3..5]   normal xyz
+ *                                       [6]      throughput_scalar
+ *                                       [7]      uintBitsToFloat(flags)
+ *                                       [8]      uintBitsToFloat(subpath_id)
+ *                                       [9]      uintBitsToFloat(vert_index)
+ *                                       [10]     spectral_beta_r (display-weighted)
+ *                                       [11]     spectral_beta_g
+ *                                       [12]     spectral_beta_b
+ *                                       [13]     sensor_origin_y
+ *                                       [14]     sensor_origin_z
+ *                                       [15]     pdf_fwd
+ *                                       [16]     pdf_rev
+ *                                       [17]     uintBitsToFloat(pdf_flags)
+ *                                       [18]     uintBitsToFloat(optical_block)
+ *                                       [19]     prefix_pdf
+ *                                       [20]     mis_denom_sum
+ *                                       [21]     intBitsToFloat(tri_mat_idx)
+ *                                       [22..37] per-band beta magnitudes [0..15]
+ *                                       [38..55] pad
  *    2      T5PixelBuf      coherent  Pixel accumulator.
  *                                     3 × res² uint32 bit-cast floats.
  *                                     Layout: R[res²] G[res²] B[res²].
@@ -59,8 +73,8 @@
 
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
-#define T5_LGV_STRIDE  12
-#define T5_CGV_STRIDE  16
+#define T5_LGV_STRIDE  40
+#define T5_CGV_STRIDE  56
 
 layout(std430, binding = 0) readonly buffer T5LightVertBuf {
     float light_verts[];   /* n_light_verts × T5_LGV_STRIDE */

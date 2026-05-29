@@ -8140,6 +8140,7 @@ def run(
     neural_payload_in: str = "",
     neural_payload_out: str = "",
     parametric: bool = False,
+    t5_light_batch: int = 0,
 ) -> None:
     try:
         from OpenGL.GL import (
@@ -8250,6 +8251,12 @@ def run(
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
     bench.emitter_amp_gain     = float(emitter_amp_gain)
     bench.compute_mode         = str(compute_mode)
+
+    _t5_light_batch = int(t5_light_batch)
+    if _t5_light_batch > 0:
+        bench.tracer.set_t5_light_batch_size(_t5_light_batch)
+        print(f"[t5] light batch {_t5_light_batch:_} verts/dispatch", flush=True)
+
     print(f"[bench] tris={bench.n_tris}  bands={bench.n_bands}  "
           f"view={view_w}x{view_h}  sensor_amp_gain={bench.sensor_amp_gain}  "
           f"emitter_amp_gain={bench.emitter_amp_gain}  "
@@ -9956,6 +9963,8 @@ def run(
         """
         import time as _ct
         _camera_ready.wait()
+        if closing.is_set():
+            return
         n_stages = bench._exposure_stage_count()
         _seed_n = 0
         for _slice_idx in range(n_stages):
@@ -9976,8 +9985,8 @@ def run(
 
         # All slices dispatched. Wait for the pipeline to fully drain before
         # declaring the frame done — dispatched ≠ processed.
+        _t_scene = float(getattr(bench._scene_camera_coordinator, "scene_time_s", 0.0))
         if not closing.is_set():
-            _t_scene = float(getattr(bench._scene_camera_coordinator, "scene_time_s", 0.0))
             bench._finish_exposure_frame()
             while not closing.is_set():
                 try:
@@ -9987,56 +9996,59 @@ def run(
                     break
                 _ct.sleep(0.010)
 
-            # T5 fires from T3 when sensor vertices first land — before child rays
-            # complete T4.  Re-signal with sensor BEFORE flash so that
-            # min(flash, sensor) advances past t5_fired and T5 runs a second pass
-            # with the complete endpoint set (including all child-bounce vertices).
-            # join_t5() blocks (GIL released) on the actual T5 thread — no polling.
-            try:
-                bench.tracer.signal_sensor_dispatched()  # sensor first: min gate clears
-                bench.tracer.signal_flash_dispatched()   # flash second: fires _fire_t5_if_ready
-                print("[exposure] T5 re-trigger fired — joining T5 thread…", flush=True)
-                bench.tracer.join_t5()
-                print("[exposure] T5 re-trigger done", flush=True)
-            except Exception as _t5exc:
-                print(f"[exposure] T5 re-trigger failed: {_t5exc}", flush=True)
+        # T5 fires from T3 when sensor vertices first land — before child rays
+        # complete T4.  Re-signal with sensor BEFORE flash so that
+        # min(flash, sensor) advances past t5_fired and T5 runs a second pass
+        # with the complete endpoint set (including all child-bounce vertices).
+        # join_t5() blocks (GIL released) on the actual T5 thread — no polling.
+        # ALWAYS join T5 regardless of closing: it may already be running from
+        # the C++ auto-trigger and destroying the tracer before it finishes
+        # corrupts GPU state and silently drops the frame output.
+        try:
+            bench.tracer.signal_sensor_dispatched()  # sensor first: min gate clears
+            bench.tracer.signal_flash_dispatched()   # flash second: fires _fire_t5_if_ready
+            print("[exposure] T5 re-trigger fired — joining T5 thread…", flush=True)
+            bench.tracer.join_t5()
+            print("[exposure] T5 re-trigger done", flush=True)
+        except Exception as _t5exc:
+            print(f"[exposure] T5 re-trigger failed: {_t5exc}", flush=True)
 
-            # T5 has now written to sensor_accum ch2 (BDPT radiance, the B channel).
-            # The worker's get_sensor_image() ran before T5, so ch2 was empty then.
-            # Refresh the plate image now that ch2 is populated.
-            try:
-                _final_img = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
-                if _final_img.ndim == 3 and _final_img.shape[2] >= 3 and _final_img.shape[0] > 0:
-                    bench._last_bdpt_plate_rgb = np.ascontiguousarray(
-                        np.clip(_final_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
-                    _lit = int(np.count_nonzero(np.sum(_final_img[:, :, :3], axis=2) > 1e-8))
-                    print(f"[exposure] sensor image refreshed: lit_px={_lit}", flush=True)
-            except Exception as _img_exc:
-                print(f"[exposure] sensor image refresh failed: {_img_exc}", flush=True)
+        # T5 has now written to sensor_accum ch2 (BDPT radiance, the B channel).
+        # The worker's get_sensor_image() ran before T5, so ch2 was empty then.
+        # Refresh the plate image now that ch2 is populated.
+        try:
+            _final_img = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
+            if _final_img.ndim == 3 and _final_img.shape[2] >= 3 and _final_img.shape[0] > 0:
+                bench._last_bdpt_plate_rgb = np.ascontiguousarray(
+                    np.clip(_final_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
+                _lit = int(np.count_nonzero(np.sum(_final_img[:, :, :3], axis=2) > 1e-8))
+                print(f"[exposure] sensor image refreshed: lit_px={_lit}", flush=True)
+        except Exception as _img_exc:
+            print(f"[exposure] sensor image refresh failed: {_img_exc}", flush=True)
 
-            # Read final stats directly from C++ (bdpt_last_connection_stats was set
-            # from the pre-drain sensor sweep call and reflects an empty endpoint table).
-            try:
-                _final_stats = dict(bench.tracer.get_bdpt_stats())
-            except Exception:
-                _final_stats = {}
-            try:
-                _final_overflow = dict(bench.tracer.get_bdpt_overflow())
-            except Exception:
-                _final_overflow = {}
-            _fwd = bench._async_bdpt_forward_count()
-            _bwd = bench._async_backward_strike_count
-            print(
-                f"[exposure] ── FRAME DONE ──"
-                f"  scene_t={_t_scene:.4f}s"
-                f"  fwd_endpoints={_fwd:_}"
-                f"  bwd_strikes={_bwd:_}"
-                f"  connections={int(_final_stats.get('exact_snaps', 0)):_}"
-                f"  near_miss={int(_final_stats.get('near_miss_count', 0)):_}"
-                f"  overflow={int(_final_overflow.get('connections', 0)):_}",
-                flush=True,
-            )
-            closing.set()
+        # Read final stats directly from C++ (bdpt_last_connection_stats was set
+        # from the pre-drain sensor sweep call and reflects an empty endpoint table).
+        try:
+            _final_stats = dict(bench.tracer.get_bdpt_stats())
+        except Exception:
+            _final_stats = {}
+        try:
+            _final_overflow = dict(bench.tracer.get_bdpt_overflow())
+        except Exception:
+            _final_overflow = {}
+        _fwd = bench._async_bdpt_forward_count()
+        _bwd = bench._async_backward_strike_count
+        print(
+            f"[exposure] ── FRAME DONE ──"
+            f"  scene_t={_t_scene:.4f}s"
+            f"  fwd_endpoints={_fwd:_}"
+            f"  bwd_strikes={_bwd:_}"
+            f"  connections={int(_final_stats.get('exact_snaps', 0)):_}"
+            f"  near_miss={int(_final_stats.get('near_miss_count', 0)):_}"
+            f"  overflow={int(_final_overflow.get('connections', 0)):_}",
+            flush=True,
+        )
+        closing.set()
 
     def _coordinator_on_dt_request(dt_s: float) -> None:
         """Coordinator delivers camera dt requests to the physics backend."""
@@ -10061,6 +10073,15 @@ def run(
                 old_bench._drain_thread.join(timeout=2.0)
         except Exception as exc:
             print(f"[bench-rebuild] drain stop failed: {exc}", flush=True)
+        # Explicitly destroy the C++ pipeline (GPU dispatch thread + CPU workers)
+        # before the new bench creates its shared WGL context.  CPython reference
+        # cycles on _drain_thread can delay __del__, leaving the old GPU thread
+        # alive and its WGL context current, which blocks the new init on Windows.
+        try:
+            old_bench.tracer.stop_pipeline()
+            print("[bench-rebuild] pipeline stopped", flush=True)
+        except Exception as exc:
+            print(f"[bench-rebuild] pipeline stop failed: {exc}", flush=True)
 
     def _invalidate_scene_gl_cache() -> None:
         _scene_vao[0]           = None
@@ -10074,6 +10095,8 @@ def run(
         new_bench.sensor_min_amplitude = float(sensor_min_amplitude)
         new_bench.emitter_amp_gain     = float(emitter_amp_gain)
         new_bench.compute_mode         = str(compute_mode)
+        if _t5_light_batch > 0:
+            new_bench.tracer.set_t5_light_batch_size(_t5_light_batch)
         if _gl_display_hglrc:
             if _gl_display_hdc:
                 new_bench.tracer.set_gl_display_hdc(_gl_display_hdc)
@@ -10113,7 +10136,9 @@ def run(
             field_capture=field_capture,
             enable_uv_splat=enable_uv_splat,
         )
+        print("[bench-rebuild] ForwardCppLensBench init complete", flush=True)
         _wire_rebuilt_bench(bench)
+        print("[bench-rebuild] _wire_rebuilt_bench complete", flush=True)
         bench.begin_scene_camera_step()
         _t_rebuild = float(snapshot.sample_time)
         bench._scene_version_cache.commit_version(
@@ -10163,7 +10188,9 @@ def run(
             field_capture=field_capture,
             enable_uv_splat=enable_uv_splat,
         )
+        print("[bench-rebuild] ForwardCppLensBench init complete", flush=True)
         _wire_rebuilt_bench(bench)
+        print("[bench-rebuild] _wire_rebuilt_bench complete", flush=True)
         # Derive and print the new f-number from EFL and entrance pupil radius
         _efl = float(getattr(getattr(scene, "optical_design", None),
                               "effective_focal_length_m", 0.0) or 0.0)
@@ -10428,8 +10455,11 @@ def run(
         bench._drain_stop.set()
         if bench._drain_thread is not None:
             bench._drain_thread.join(timeout=2.0)
-        # 2. Wait for camera thread to finish its slice loop.
-        _camera_thread.join(timeout=2.0)
+        # 2. Unblock the camera thread if it never received _camera_ready
+        #    (e.g., startup failed before _camera_ready.set() was called), then
+        #    join it.  No timeout so a running T5 GPU batch is never truncated.
+        _camera_ready.set()
+        _camera_thread.join()
         # 3. Delete GL resources while the display context is still current.
         #    Must happen before del bench: the C++ GPU thread teardown releases
         #    the shared DC, which invalidates the display context on destruction.
@@ -10567,6 +10597,7 @@ def run_uv_smoke(
     bench.compute_mode = str(compute_mode)
     bench.sensor_amp_gain = float(sensor_amp_gain)
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
+
     _batch_pip_res = int(max(16, scene.image_plate.sensor_res))
     bench._configure_cpp_sensor_image(_batch_pip_res, 0.008)
 
@@ -10788,6 +10819,18 @@ if __name__ == "__main__":
             "per ray hit; no baking or training required."
         ),
     )
+    _ap.add_argument(
+        "--t5-light-batch",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Number of light vertices processed per T5 GPU dispatch. "
+            "0 = use built-in default (4096). "
+            "Keep low to avoid Windows TDR: each dispatch must complete in < 2 s. "
+            "Example: --t5-light-batch 2048"
+        ),
+    )
     _args = _ap.parse_args()
     if _args.uv_smoke_exit:
         raise SystemExit(run_uv_smoke(
@@ -10817,4 +10860,5 @@ if __name__ == "__main__":
         neural_payload_in=_args.neural_payload_in,
         neural_payload_out=_args.neural_payload_out,
         parametric=bool(_args.parametric),
+        t5_light_batch=int(_args.t5_light_batch),
     )

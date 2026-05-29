@@ -7607,9 +7607,10 @@ public:
     GLuint ssbo_t5_cam    = 0;  /* binding 1: T5CamVertBuf    (float)  */
     GLuint ssbo_t5_pix    = 0;  /* binding 2: T5PixelBuf      (uint)   */
     GLuint ssbo_t5_params = 0;  /* binding 3: T5ParamsBuf     (32 B)   */
-    int    cap_t5_light   = 0;  /* floats */
-    int    cap_t5_cam     = 0;  /* floats */
-    int    cap_t5_pix     = 0;  /* uint32 */
+    int      cap_t5_light        = 0;  /* floats */
+    int      cap_t5_cam          = 0;  /* floats */
+    int      cap_t5_pix          = 0;  /* uint32 */
+    uint32_t t5_light_batch_size = 0;  /* 0 = use default 20480 */
 
     /* ── T5 GPU job queue ─────────────────────────────────────────────── *
      * The BDPT connection thread submits a job and blocks on the future;  *
@@ -7915,6 +7916,7 @@ public:
         if (cfg.gpu_batch_size_t3 > 0) ps.stats[2].batch_sz_gpu.store(cfg.gpu_batch_size_t3, std::memory_order_relaxed);
         if (cfg.gpu_batch_size_t4 > 0) ps.stats[3].batch_sz_gpu.store(cfg.gpu_batch_size_t4, std::memory_order_relaxed);
         if (cfg.gpu_batch_size_t5 > 0) ps.stats[4].batch_sz_gpu.store(cfg.gpu_batch_size_t5, std::memory_order_relaxed);
+        if (cfg.t5_light_batch_size > 0) t5_light_batch_size = cfg.t5_light_batch_size;
 
         /* Apply pinned GPU fractions (if non-zero in config) */
         if (cfg.gpu_fraction_t1 > 0.0f) ps.stats[0].set_gpu_fraction(cfg.gpu_fraction_t1);
@@ -9237,7 +9239,7 @@ public:
          * Each dispatch covers [light_offset, light_offset+light_batch_size). *
          * Pixel accum stays in VRAM between batches — only params re-uploaded.*
          * Batch size keeps each dispatch well under the Windows 2-second TDR. */
-        static constexpr uint32_t T5_LIGHT_BATCH = 4096;
+        const uint32_t T5_LIGHT_BATCH = t5_light_batch_size ? t5_light_batch_size : 4096u;
         const uint32_t n_cam      = par.n_cam_verts;
         const uint32_t n_light    = par.n_light_verts;
         const GLuint   wg_x       = (GLuint)((n_cam + 63u) / 64u);
@@ -9256,6 +9258,7 @@ public:
                 n_cam, n_light, n_batches, par.sensor_res);
         fflush(stderr);
 
+        bool gpu_ok = true;
         for (uint32_t b = 0; b < n_batches; ++b) {
             par.light_offset     = b * T5_LIGHT_BATCH;
             par.light_batch_size = std::min(T5_LIGHT_BATCH, n_light - par.light_offset);
@@ -9263,16 +9266,34 @@ public:
             upload(ssbo_t5_params, &par, sizeof(T5GpuParams));
             glc_DispatchCompute(wg_x, 1u, 1u);
             glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            /* glFlush after each batch so the driver sees completed work between
+             * dispatches — prevents Windows TDR from treating the whole loop as
+             * one unresponsive command. */
+            glFlush();
+            /* Check for GPU context loss (TDR reset).  GL_INVALID_OPERATION or
+             * any other error here means the context is dead; abort the job
+             * rather than spinning forever or writing garbage. */
+            GLenum gl_err = glGetError();
+            if (gl_err != GL_NO_ERROR) {
+                fprintf(stderr, "[T5-gpu] GL error 0x%04x after batch %u/%u — TDR? aborting job\n",
+                        (unsigned)gl_err, b, n_batches);
+                fflush(stderr);
+                gpu_ok = false;
+                break;
+            }
         }
 
         /* ── Single readback after all batches ───────────────────────────── */
         std::vector<uint32_t> result(static_cast<size_t>(npi));
-        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
-        glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                             (GLsizeiptr)(npi * sizeof(uint32_t)), result.data());
-        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-
-        fprintf(stderr, "[T5-gpu] done: %u batches  pix=%u\n", n_batches, (unsigned)npi);
+        if (gpu_ok) {
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                 (GLsizeiptr)(npi * sizeof(uint32_t)), result.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            fprintf(stderr, "[T5-gpu] done: %u batches  pix=%u\n", n_batches, (unsigned)npi);
+        } else {
+            fprintf(stderr, "[T5-gpu] aborted after GPU error — returning empty result\n");
+        }
         fflush(stderr);
 
         job->promise.set_value(std::move(result));
@@ -11386,6 +11407,24 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 if (!csp->prefix_valid[ci]) continue;
                 const double bc = ctx.beta_scalar_val(c);
                 if (bc < 1e-15) continue;
+                /* Compute per-channel spectral beta (R, G, B) using the same
+                 * band_to_display_rgb weighting that accum_pixel_color uses.
+                 * This lets the GPU shader reproduce spectral material colours. */
+                double s_wr = 0.0, s_wg = 0.0, s_wb = 0.0;
+                for (int b = 0; b < ctx.n_bands; ++b) {
+                    const uint64_t k = ((uint64_t)c.subpath_id  << 32)
+                                     | ((uint64_t)c.vertex_index << 16)
+                                     | (uint64_t)b;
+                    auto it = ctx.beta_lut.find(k);
+                    if (it == ctx.beta_lut.end()) continue;
+                    const double bm = std::abs(it->second);
+                    double bwr, bwg, bwb;
+                    band_to_display_rgb(b, ctx.n_bands, ctx.t5_freq_hz, bwr, bwg, bwb);
+                    s_wr += bm * bwr; s_wg += bm * bwg; s_wb += bm * bwb;
+                }
+                /* No fallback: if beta_lut has no spectral data for this vertex,
+                 * s_wr/g/b remain 0 and the shader will discard the vertex. */
+
                 float* p = cam_packed.data() + static_cast<size_t>(ci_flat++) * T5_CGV_STRIDE;
                 p[0]  = c.pos[0];    p[1]  = c.pos[1];    p[2]  = c.pos[2];
                 p[3]  = c.normal[0]; p[4]  = c.normal[1]; p[5]  = c.normal[2];
@@ -11393,10 +11432,12 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 std::memcpy(&p[7],  &c.flags,        sizeof(uint32_t));
                 std::memcpy(&p[8],  &c.subpath_id,   sizeof(uint32_t));
                 std::memcpy(&p[9],  &c.vertex_index, sizeof(uint32_t));
-                p[10] = static_cast<float>(bc);
-                p[11] = c.sensor_origin_y;
-                p[12] = c.sensor_origin_z;
-                p[13] = 0.0f;
+                p[10] = static_cast<float>(s_wr);   /* spectral beta R */
+                p[11] = static_cast<float>(s_wg);   /* spectral beta G */
+                p[12] = static_cast<float>(s_wb);   /* spectral beta B */
+                p[13] = c.sensor_origin_y;
+                p[14] = c.sensor_origin_z;
+                p[15] = 0.0f;
             }
         }
 
@@ -11623,6 +11664,13 @@ static void band_to_display_rgb(int b, int n_bands,
 void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v)
 {
     if (ps) ps->cfg.t5_min_geom = v;
+}
+
+void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n)
+{
+    if (!ps) return;
+    ps->cfg.t5_light_batch_size = n;
+    if (ps->gpu_dispatch) ps->gpu_dispatch->t5_light_batch_size = n;
 }
 
 void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType type,

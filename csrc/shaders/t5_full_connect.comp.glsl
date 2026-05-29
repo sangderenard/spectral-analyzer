@@ -24,17 +24,19 @@
  *                                       [10]    beta_lum
  *                                       [11]    0 (pad)
  *    1      T5CamVertBuf    readonly  Flat camera vertices.
- *                                     Stride = T5_CGV_STRIDE = 14 floats.
+ *                                     Stride = T5_CGV_STRIDE = 16 floats.
  *                                       [0..2]  pos xyz
  *                                       [3..5]  normal xyz
  *                                       [6]     throughput_scalar
  *                                       [7]     uintBitsToFloat(flags)
  *                                       [8]     uintBitsToFloat(subpath_id)
  *                                       [9]     uintBitsToFloat(vert_index)
- *                                       [10]    beta_lum
- *                                       [11]    sensor_origin_y
- *                                       [12]    sensor_origin_z
- *                                       [13]    0 (pad)
+ *                                       [10]    spectral_beta_r  (band_to_display_rgb weighted)
+ *                                       [11]    spectral_beta_g
+ *                                       [12]    spectral_beta_b
+ *                                       [13]    sensor_origin_y
+ *                                       [14]    sensor_origin_z
+ *                                       [15]    0 (pad)
  *    2      T5PixelBuf      coherent  Pixel accumulator.
  *                                     3 × res² uint32 bit-cast floats.
  *                                     Layout: R[res²] G[res²] B[res²].
@@ -58,7 +60,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #define T5_LGV_STRIDE  12
-#define T5_CGV_STRIDE  14
+#define T5_CGV_STRIDE  16
 
 layout(std430, binding = 0) readonly buffer T5LightVertBuf {
     float light_verts[];   /* n_light_verts × T5_LGV_STRIDE */
@@ -104,14 +106,16 @@ void main() {
     if (gid >= n_cam_verts) return;
 
     /* ── Load camera vertex ─────────────────────────────────────────────── */
-    const uint  cb     = gid * uint(T5_CGV_STRIDE);
-    const vec3  c_pos  = vec3(cam_verts[cb+0u], cam_verts[cb+1u], cam_verts[cb+2u]);
-    const vec3  c_norm = vec3(cam_verts[cb+3u], cam_verts[cb+4u], cam_verts[cb+5u]);
-    const float c_beta = cam_verts[cb+10u];
-    const float c_soy  = cam_verts[cb+11u];
-    const float c_soz  = cam_verts[cb+12u];
+    const uint  cb       = gid * uint(T5_CGV_STRIDE);
+    const vec3  c_pos    = vec3(cam_verts[cb+0u], cam_verts[cb+1u], cam_verts[cb+2u]);
+    const vec3  c_norm   = vec3(cam_verts[cb+3u], cam_verts[cb+4u], cam_verts[cb+5u]);
+    const float c_beta_r = cam_verts[cb+10u];  /* spectral beta R (band_to_display_rgb weighted) */
+    const float c_beta_g = cam_verts[cb+11u];  /* spectral beta G */
+    const float c_beta_b = cam_verts[cb+12u];  /* spectral beta B */
+    const float c_soy    = cam_verts[cb+13u];
+    const float c_soz    = cam_verts[cb+14u];
 
-    if (c_beta < 1e-15f) return;
+    if (c_beta_r + c_beta_g + c_beta_b < 1e-15f) return;
 
     /* ── Pixel index ────────────────────────────────────────────────────── */
     const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
@@ -128,12 +132,12 @@ void main() {
      * service_t5_job through batches with a tiny params re-upload each time.*
      * This keeps each dispatch short enough to avoid Windows GPU TDR.       */
     const uint li_end = min(light_offset + light_batch_size, n_light_verts);
-    float lum = 0.0f;
+    float lum_r = 0.0f, lum_g = 0.0f, lum_b = 0.0f;
     for (uint li = light_offset; li < li_end; ++li) {
         const uint  lb     = li * uint(T5_LGV_STRIDE);
         const vec3  l_pos  = vec3(light_verts[lb+0u], light_verts[lb+1u], light_verts[lb+2u]);
         const vec3  l_norm = vec3(light_verts[lb+3u], light_verts[lb+4u], light_verts[lb+5u]);
-        const float l_beta = light_verts[lb+10u];
+        const float l_beta = light_verts[lb+10u];   /* light path scalar throughput */
 
         if (l_beta < 1e-15f) continue;
 
@@ -147,15 +151,17 @@ void main() {
 
         if (shadow_occluded(c_pos, l_pos)) continue;
 
-        lum += c_beta * l_beta * geom;
+        /* Camera spectral betas carry the per-channel colour weight computed by
+         * band_to_display_rgb in C++ — same formula as accum_pixel_color CPU path. */
+        const float contrib = l_beta * geom;
+        lum_r += c_beta_r * contrib;
+        lum_g += c_beta_g * contrib;
+        lum_b += c_beta_b * contrib;
     }
 
-    /* ── Write to pixel buffer (neutral 1/3 split across channels) ──────── *
-     * CPU post-pass spectral recolour replaces this weight later.           */
-    if (lum > 0.0f) {
-        const float third = lum * (1.0f / 3.0f);
-        atomic_add_float(px,          third);
-        atomic_add_float(px + pix,    third);
-        atomic_add_float(px + 2u*pix, third);
+    if (lum_r + lum_g + lum_b > 0.0f) {
+        atomic_add_float(px,          lum_r);
+        atomic_add_float(px + pix,    lum_g);
+        atomic_add_float(px + 2u*pix, lum_b);
     }
 }

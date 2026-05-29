@@ -556,7 +556,8 @@ struct PyRayTracer
     std::atomic<uint32_t> _bdpt_subpath_counter{1u};
 
     /* T5 connection config */
-    float _t5_min_geom = 1e-8f;
+    float    _t5_min_geom          = 1e-8f;
+    uint32_t _t5_light_batch_size  = 0;
 
     /* Flash modifier config */
     int   _flash_modifier_type   = static_cast<int>(FlashModifierType::SNOOT);
@@ -588,6 +589,7 @@ struct PyRayTracer
             cfg.gl_display_hglrc        = _gl_display_hglrc;
             cfg.gl_display_hdc          = _gl_display_hdc;
             cfg.t5_min_geom             = _t5_min_geom;
+            cfg.t5_light_batch_size     = _t5_light_batch_size;
             cfg.flash_modifier_type     = static_cast<FlashModifierType>(_flash_modifier_type);
             cfg.flash_modifier_param0   = _flash_modifier_param0;
             cfg.flash_modifier_param1   = _flash_modifier_param1;
@@ -2354,6 +2356,19 @@ struct PyRayTracer
     void set_t5_min_geom(float v) {
         _t5_min_geom = v;
         ray_pipeline_set_t5_min_geom(_pipeline, v);
+    }
+
+    void set_t5_light_batch_size(uint32_t n) {
+        _t5_light_batch_size = n;
+        if (_pipeline) ray_pipeline_set_t5_light_batch_size(_pipeline, n);
+    }
+
+    void stop_pipeline() {
+        std::lock_guard<std::mutex> lk(_pipeline_mu);
+        if (_pipeline) {
+            ray_pipeline_destroy(_pipeline);
+            _pipeline = nullptr;
+        }
     }
 
     void set_flash_modifier(int type_int, float param0, float param1) {
@@ -5546,6 +5561,18 @@ sensor_accum ch2 (BDPT radiance) is fully written before get_sensor_image().)doc
              py::arg("threshold"),
 R"doc(Set minimum geometry term to evaluate a connection (default 1e-8).
 Replaces the legacy 1e-20 floor.)doc")
+        .def("stop_pipeline",
+             &PyRayTracer::stop_pipeline,
+R"doc(Explicitly shut down the C++ pipeline — joins the GPU dispatch thread and
+all CPU workers, then releases the WGL context.  Safe to call before bench
+destruction so the old context is gone before a new shared context is created.)doc")
+        .def("set_t5_light_batch_size",
+             &PyRayTracer::set_t5_light_batch_size,
+             py::arg("n"),
+R"doc(Set the number of light vertices processed per T5 GPU dispatch (default 20480).
+Larger values reduce dispatch overhead and improve GPU utilisation; derive from
+--t5-vram-mb as n = vram_mb * 1024^2 / 48 (12 floats × 4 bytes per light vert).
+Safe to call before or after pipeline creation.)doc")
         .def("set_flash_modifier",
              &PyRayTracer::set_flash_modifier,
              py::arg("type_int"),

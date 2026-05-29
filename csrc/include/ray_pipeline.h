@@ -537,7 +537,7 @@ struct WaveArena {
 
 /* ── T5 GPU connection pass types ────────────────────────────────────────── */
 static constexpr int T5_LGV_STRIDE = 12;  /* light vertex, floats (must match shader) */
-static constexpr int T5_CGV_STRIDE = 14;  /* camera vertex, floats (must match shader) */
+static constexpr int T5_CGV_STRIDE = 16;  /* camera vertex, floats (must match shader) */
 
 /* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl.
  * std430 layout, 32 bytes. */
@@ -638,6 +638,7 @@ struct RayPipelineConfig {
     int         gpu_batch_size_t3  = 0;
     int         gpu_batch_size_t4  = 0;
     int         gpu_batch_size_t5  = 0;
+    uint32_t    t5_light_batch_size = 0;   /* 0 = use built-in default (T5_LIGHT_BATCH) */
 
     /* Fraction of work to pin to GPU per stage (0=compete freely, >0=soft target).
      * 0.0 = CPU and GPU compete naturally on the shared queue.
@@ -766,6 +767,7 @@ void ray_pipeline_join_t5(RayPipelineState* ps);
 
 /* Live-update T5 connection-pass configuration. */
 void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
+void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n);
 
 /* Live-update the flash light modifier applied in submit_emissive_triangles. */
 void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType type,

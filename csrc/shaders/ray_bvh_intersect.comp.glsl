@@ -7,7 +7,7 @@
  *
  * Flat buffer layouts (must match GlPipelineDispatch packing):
  *
- *  IntentBuf  (INTENT_STRIDE = 52 floats):
+ *  IntentBuf  (INTENT_STRIDE = 20 + 2*MAX_GPU_BANDS floats = 84 with MAX_GPU_BANDS=32):
  *    [0..2]   pos xyz
  *    [3..5]   dir xyz
  *    [6]      path_len
@@ -24,10 +24,10 @@
  *    [17]     sensor_origin_y
  *    [18]     sensor_origin_z
  *    [19]     _pad
- *    [20..35] amp_re[MAX_GPU_BANDS]
- *    [36..51] amp_im[MAX_GPU_BANDS]
+ *    [20..51] amp_re[MAX_GPU_BANDS]
+ *    [52..83] amp_im[MAX_GPU_BANDS]
  *
- *  HitBuf  (REFINED_HIT_STRIDE = 59 floats, written by this shader):
+ *  HitBuf  (REFINED_HIT_STRIDE = 27 + 2*MAX_GPU_BANDS floats = 91 with MAX_GPU_BANDS=32, written by this shader):
  *    [0..2]   refined_pos xyz  (= hit_pos, T2 may update for parametric)
  *    [3..5]   refined_n xyz    (= oriented tri normal, T2 may update)
  *    [6..8]   incoming_dir xyz
@@ -46,9 +46,9 @@
  *    [23]     sensor_origin_y
  *    [24]     sensor_origin_z
  *    [25]     medium_mat_idx  (intBitsToFloat)
- *    [26..41] amp_re[MAX_GPU_BANDS]  (after amplitude propagation)
- *    [42..57] amp_im[MAX_GPU_BANDS]
- *    [58]     bdpt_subpath_id (uintBitsToFloat; 0=untracked)
+ *    [26..57] amp_re[MAX_GPU_BANDS]  (after amplitude propagation)
+ *    [58..89] amp_im[MAX_GPU_BANDS]
+ *    [26+2*MAX_GPU_BANDS=90]  bdpt_subpath_id (uintBitsToFloat; 0=untracked)
  *
  *  BvhBuf  (BVH_NODE_STRIDE = 10 floats):
  *    [0..2] lo xyz   [3..5] hi xyz
@@ -86,9 +86,9 @@
 layout(local_size_x = 64) in;
 
 /* ── Binding constants ──────────────────────────────────────────────────── */
-#define MAX_GPU_BANDS     16
-#define INTENT_STRIDE     52      /* 20 + 2*MAX_GPU_BANDS */
-#define HIT_STRIDE        59      /* 26 + 2*MAX_GPU_BANDS + 1 (bdpt_sid at [58]) */
+#define MAX_GPU_BANDS     32
+#define INTENT_STRIDE     (20 + 2*MAX_GPU_BANDS)      /* 84 with MAX_GPU_BANDS=32 */
+#define HIT_STRIDE        (27 + 2*MAX_GPU_BANDS)      /* 91 with MAX_GPU_BANDS=32; bdpt_sid at [90] */
 #define BVH_NODE_STRIDE   10
 #define TRI_FULL_STRIDE   16
 #define MAT_BAND_STRIDE   12
@@ -116,7 +116,7 @@ layout(std430, binding = 4) readonly buffer TriIdBuf   { int   tri_ids[];  };
 layout(std430, binding = 5) readonly buffer TriFullBuf { float trifull[];  };
 layout(std430, binding = 6) readonly buffer MatBandBuf { float mat_bands[];};
 layout(std430, binding = 7) readonly buffer SceneBandBuf{ float scene_bands[];};
-/* bdpt_subpath_id is written to hit[58] (as uintBitsToFloat) — no extra binding needed. */
+/* bdpt_subpath_id is written to hit[26+2*MAX_GPU_BANDS] (as uintBitsToFloat) — no extra binding needed. */
 
 /* Wave arenas passed as uniform array (max 16 arenas × 4 floats each).
  * Avoids needing binding slots beyond 7. */
@@ -369,8 +369,8 @@ void main() {
         hit_wf(ob, 26 + b,              amp_re[b]);
         hit_wf(ob, 26 + MAX_GPU_BANDS + b, amp_im[b]);
     }
-    /* bdpt_subpath_id embedded at hit[58] (last slot) so T3 needs no extra binding. */
-    hit_wu(ob, 58, bdpt_sid);
+    /* bdpt_subpath_id embedded at hit[26+2*MAX_GPU_BANDS] (last slot) so T3 needs no extra binding. */
+    hit_wu(ob, 26 + 2*MAX_GPU_BANDS, bdpt_sid);
 
     /* ── Wave intent counter (C++ dispatcher routes these to Q_wave) ─────── */
     if (wave_arena_id >= 0)

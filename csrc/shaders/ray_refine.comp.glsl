@@ -16,8 +16,8 @@
  *
  * Flat buffer layouts (same bindings as T1 but shared HitBuf is now input):
  *
- *  HitBuf  (REFINED_HIT_STRIDE = 59 floats): in-place update of [0..8], [12], [16], [26..57]
- *    [58] = bdpt_subpath_id, carried through untouched from T1 to T3
+ *  HitBuf  (REFINED_HIT_STRIDE = 27+2*MAX_GPU_BANDS floats): in-place update of [0..8], [12], [16], [26..26+2*MAX_GPU_BANDS-1]
+ *    [26+2*MAX_GPU_BANDS] = bdpt_subpath_id, carried through untouched from T1 to T3
  *
  *  TriFullBuf  (TRI_FULL_STRIDE = 16 floats):
  *    [0..2] v0   [3..5] edge1  [6..8] edge2  [9..11] normal
@@ -50,8 +50,8 @@
 layout(local_size_x = 64) in;
 
 /* ── Layout constants ───────────────────────────────────────────────────── */
-#define MAX_GPU_BANDS         16
-#define HIT_STRIDE            59
+#define MAX_GPU_BANDS         32
+#define HIT_STRIDE            (27 + 2*MAX_GPU_BANDS)  /* 91 with MAX_GPU_BANDS=32 */
 #define TRI_FULL_STRIDE       16
 #define GROUP_PAYLOAD_STRIDE  16
 #define MAX_NEURAL_DIM        512   /* max hidden_dim supported */
@@ -159,7 +159,7 @@ void emit_bdpt_optical(int hb, uint reason, uint element_index, uint flags,
                        float transverse_r, float dist_past_aperture,
                        float phase_space_j)
 {
-    uint sid = hit_u(hb, 58);
+    uint sid = hit_u(hb, 26 + 2*MAX_GPU_BANDS);
     if (sid == 0u || bdpt_max_optical <= 0) return;
     uint slot = atomicAdd(counters[4], 1u);
     if (int(slot) >= bdpt_max_optical) return;

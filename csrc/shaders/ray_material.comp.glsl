@@ -97,7 +97,7 @@
 layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 /* ── Compile-time constants ─────────────────────────────────────────────── */
-#define MAX_BANDS           16
+#define MAX_BANDS           32
 #define REFINED_HIT_STRIDE  (27 + 2 * MAX_BANDS)   /* 59: [58]=bdpt_sid at end */
 #define INTENT_STRIDE       (20 + 2 * MAX_BANDS)   /* 52 */
 #define TERMINAL_STRIDE     (26 + 2 * MAX_BANDS)   /* 58: terminals don't carry bdpt_sid */
@@ -353,7 +353,7 @@ int   hit_medium     (uint b) { return floatBitsToInt(HIT(b,25)); }
 float hit_amp_re(uint b, int band) { return HIT(b, 26 + band); }
 float hit_amp_im(uint b, int band) { return HIT(b, 26 + MAX_BANDS + band); }
 float hit_pathatseg(uint b) { return HIT(b, 13); }
-uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 58)); }
+uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 26 + 2 * MAX_BANDS)); }
 
 /* ── BDPT emit helpers ───────────────────────────────────────────────────── */
 #define BDPT_VERTEX_STRIDE   28
@@ -530,12 +530,17 @@ void main() {
     }
     for (int b = nb; b < MAX_BANDS; b++) { amp_re[b] = 0.0; amp_im[b] = 0.0; }
 
-    /* ── BDPT vertex and spectral weight emission ───────────────────────────
-     * Emitted for every hit where bdpt_subpath_id != 0, before any early exits,
-     * so terminal and scatter paths are both recorded. */
-    uint bdpt_sid = hit_bdpt_sid(hbase);
+    /* ── BDPT vertex emission ───────────────────────────────────────────────
+     * Vertex record emitted pre-scatter (position/normal/direction needed).
+     * Spectral weight records are emitted POST-scatter in each scatter branch
+     * so that beta_lut encodes material-weighted amplitude, not arriving flux.
+     * Exception: emissive terminals emit their incoming amplitude as the
+     * emission spectrum (pre-scatter IS the emission in that case). */
+    uint bdpt_sid      = hit_bdpt_sid(hbase);
+    uint bdpt_vi       = uint(bounce) & 0xFFFFu;
+    float bdpt_band_pdf = (nb > 0) ? 1.0 / float(nb) : 1.0;
     if (bdpt_sid != 0u && bdpt_max_verts > 0) {
-        uint vi         = uint(bounce) & 0xFFFFu;
+        uint vi         = bdpt_vi;
         uint stream_bit = (cflag == 1u) ? 1u : 0u;  /* 1=SENSOR, 0=LIGHT */
         uint packed_vi  = (vi << 16) | (stream_bit << 8);  /* sample_domain=0=UNKNOWN */
         int  tri_idx_v  = hit_tri(hbase);
@@ -548,11 +553,7 @@ void main() {
                          pos, nrm, in_dir,
                          path_len, hit_pathatseg(hbase),
                          throughput, soy, soz);
-        float band_pdf = (nb > 0) ? 1.0 / float(nb) : 1.0;
-        for (int b = 0; b < nb; b++) {
-            uint vi_band = (vi << 16) | uint(b);
-            emit_bdpt_spectral(bdpt_sid, vi_band, amp_re[b], amp_im[b], band_pdf);
-        }
+        /* spectral emit moved to post-scatter branches below */
     }
 
     /* Absorb: T2 rejected this ray via parametric acceptance boundary (bit 3).
@@ -673,6 +674,13 @@ void main() {
 
     /* ── Terminal: emissive ── */
     if ((flags & MAT_FLAG_EMISSIVE) != 0) {
+        /* Emitter: incoming amplitude IS the emission spectrum — emit pre-scatter. */
+        if (bdpt_sid != 0u && bdpt_max_verts > 0) {
+            for (int b = 0; b < nb; b++) {
+                uint vi_band = (bdpt_vi << 16) | uint(b);
+                emit_bdpt_spectral(bdpt_sid, vi_band, amp_re[b], amp_im[b], bdpt_band_pdf);
+            }
+        }
         uint tslot = atomicAdd(meta[1], 1u);
         write_terminal(tslot, hbase, true);
         return;
@@ -738,6 +746,12 @@ void main() {
             emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, 1.0, 1.0,
                           uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR,
                           nrm, in_dir, rd);
+            if (bdpt_sid != 0u && bdpt_max_verts > 0) {
+                for (int b = 0; b < nb; b++) {
+                    uint vi_band = (bdpt_vi << 16) | uint(b);
+                    emit_bdpt_spectral(bdpt_sid, vi_band, ra_re[b], ra_im[b], bdpt_band_pdf);
+                }
+            }
             write_intent(islot, pos, rd, path_len, new_med, iflags,
                          src_id, new_bounce, new_bleft, min_amp,
                          tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ra_re, ra_im);
@@ -765,6 +779,12 @@ void main() {
                     emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, R, R,
                                   uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
                                   nrm, in_dir, rd);
+                    if (bdpt_sid != 0u && bdpt_max_verts > 0) {
+                        for (int b = 0; b < nb; b++) {
+                            uint vi_band = (bdpt_vi << 16) | uint(b);
+                            emit_bdpt_spectral(bdpt_sid, vi_band, ra_re[b], ra_im[b], bdpt_band_pdf);
+                        }
+                    }
                     write_intent(islot, pos, rd, path_len, medium, iflags,
                                  src_id, new_bounce, new_bleft, min_amp,
                                  tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ra_re, ra_im);
@@ -781,6 +801,12 @@ void main() {
                                   1.0 - R, 1.0 - R_rev,
                                   uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
                                   nrm, in_dir, refracted);
+                    if (bdpt_sid != 0u && bdpt_max_verts > 0) {
+                        for (int b = 0; b < nb; b++) {
+                            uint vi_band = (bdpt_vi << 16) | uint(b);
+                            emit_bdpt_spectral(bdpt_sid, vi_band, ta_re[b], ta_im[b], bdpt_band_pdf);
+                        }
+                    }
                     write_intent(islot, pos, refracted, path_len, new_med, iflags,
                                  src_id, new_bounce, new_bleft, min_amp,
                                  tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ta_re, ta_im);
@@ -811,6 +837,12 @@ void main() {
                 float pdf_rev = (u < R) ? R : (1.0 - R_rev);
                 emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, pdf_fwd, pdf_rev,
                               uint(flags) | pdf_flags, nrm, in_dir, cdir);
+                if (bdpt_sid != 0u && bdpt_max_verts > 0) {
+                    for (int b = 0; b < nb; b++) {
+                        uint vi_band = (bdpt_vi << 16) | uint(b);
+                        emit_bdpt_spectral(bdpt_sid, vi_band, ca_re[b], ca_im[b], bdpt_band_pdf);
+                    }
+                }
                 write_intent(islot, pos, cdir, path_len, cmed, iflags,
                              src_id, new_bounce, new_bleft, min_amp,
                              tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ca_re, ca_im);
@@ -877,6 +909,13 @@ void main() {
             }
             emit_bdpt_pdf(bdpt_sid, uint(bounce), scatter_domain, scatter_pdf, scatter_pdf_rev,
                           uint(flags) | scatter_flags, nrm, in_dir, new_dir);
+            /* Post-scatter spectral emit: na_re/na_im = amp × mat_refl — encodes material color */
+            if (bdpt_sid != 0u && bdpt_max_verts > 0) {
+                for (int b = 0; b < nb; b++) {
+                    uint vi_band = (bdpt_vi << 16) | uint(b);
+                    emit_bdpt_spectral(bdpt_sid, vi_band, na_re[b], na_im[b], bdpt_band_pdf);
+                }
+            }
             write_intent(islot, pos, new_dir, path_len, medium, iflags,
                          src_id, new_bounce, new_bleft, min_amp,
                          tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, na_re, na_im);

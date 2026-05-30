@@ -103,30 +103,34 @@
 layout(local_size_x = TILE_C, local_size_y = TILE_L, local_size_z = 1) in;
 
 /* ── Stride and field offsets (mirror ray_pipeline.h) ─────────────────── */
-#define T5_LGV_STRIDE    40
-#define T5_CGV_STRIDE    56
+#define T5_LGV_STRIDE    56
+#define T5_CGV_STRIDE    72
 
-#define LGV_DIR_IN_X      32
-#define LGV_DIFFUSE_P     35
-#define LGV_GGX_ALPHA     36
-#define LGV_OPT_JACOBIAN  37
-#define LGV_EDGE_FWD      38
-#define LGV_EDGE_BWD      39
+#define LGV_DIR_IN_X      48
+#define LGV_DIFFUSE_P     51
+#define LGV_GGX_ALPHA     52
+#define LGV_OPT_JACOBIAN  53
+#define LGV_EDGE_FWD      54
+#define LGV_EDGE_BWD      55
 
-#define CGV_DIR_IN_X      38
-#define CGV_DIFFUSE_P     41
-#define CGV_GGX_ALPHA     42
-#define CGV_OPT_JACOBIAN  43
-#define CGV_EDGE_FWD      44
-#define CGV_EDGE_BWD      45
+#define CGV_DIR_IN_X      54
+#define CGV_DIFFUSE_P     57
+#define CGV_GGX_ALPHA     58
+#define CGV_OPT_JACOBIAN  59
+#define CGV_EDGE_FWD      60
+#define CGV_EDGE_BWD      61
+
+#define CGV_BAND_BASE     22    /* per-band beta magnitudes [22..53] (T5_MAX_GPU_BANDS slots) */
+#define LGV_BAND_BASE     16    /* per-band beta magnitudes [16..47] (T5_MAX_GPU_BANDS slots) */
+#define T5_MAX_GPU_BANDS  32
 
 /* ── Shared memory ──────────────────────────────────────────────────────── *
  * s_cam / s_light: cooperative tile loads of all vertex fields.            *
  *   Layout: consecutive stride-sized slots, [vert * stride + field].       *
  * s_lum_*: per-invocation contributions, reduced before atomic write.      *
  *   Layout: tid = lid_l * TILE_C + lid_c.                                  */
-shared float s_cam  [TILE_C * T5_CGV_STRIDE];   /* 8×56 = 448 floats (1.75 KB) */
-shared float s_light[TILE_L * T5_LGV_STRIDE];   /* 8×40 = 320 floats (1.25 KB) */
+shared float s_cam  [TILE_C * T5_CGV_STRIDE];   /* 8×72 = 576 floats (2.25 KB) */
+shared float s_light[TILE_L * T5_LGV_STRIDE];   /* 8×56 = 448 floats (1.75 KB) */
 shared float s_lum_r[TILE_C * TILE_L];
 shared float s_lum_g[TILE_C * TILE_L];
 shared float s_lum_b[TILE_C * TILE_L];
@@ -151,7 +155,12 @@ layout(std430, binding = 3) readonly buffer T5ParamsBuf {
     int    sensor_res;
     uint   light_batch_size;
     uint   light_offset;
-    uint   _pad1;
+    int    n_bands;
+};
+
+/* ── Spectral colour weights (n_bands × 3): [b*3+0]=wr, [b*3+1]=wg, [b*3+2]=wb */
+layout(std430, binding = 4) readonly buffer T5SpectralWeightBuf {
+    float spectral_weights[];
 };
 
 /* ── Flag constants (mirror bdpt_record.h / mat_flags_generated.h) ──────── */
@@ -474,9 +483,20 @@ void main() {
         const uint sc = lid_c * uint(T5_CGV_STRIDE);
         const vec3  c_pos    = vec3(s_cam[sc+0u], s_cam[sc+1u], s_cam[sc+2u]);
         const vec3  c_norm   = vec3(s_cam[sc+3u], s_cam[sc+4u], s_cam[sc+5u]);
-        const float c_beta_r = s_cam[sc+10u];
-        const float c_beta_g = s_cam[sc+11u];
-        const float c_beta_b = s_cam[sc+12u];
+
+        /* Compute spectral camera-side beta by accumulating per-band magnitudes
+         * with their pre-baked colour weights (from the stride-splitter SSBO). */
+        float c_beta_r = 0.0f, c_beta_g = 0.0f, c_beta_b = 0.0f;
+        {
+            const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+            for (int _b = 0; _b < nb; ++_b) {
+                const float bm = s_cam[sc + uint(CGV_BAND_BASE + _b)];
+                if (bm <= 0.0f) continue;
+                c_beta_r += bm * spectral_weights[_b * 3 + 0];
+                c_beta_g += bm * spectral_weights[_b * 3 + 1];
+                c_beta_b += bm * spectral_weights[_b * 3 + 2];
+            }
+        }
 
         const uint c_vinfo       = floatBitsToUint(s_cam[sc +  9u]);
         const uint c_flags       = floatBitsToUint(s_cam[sc +  7u]);

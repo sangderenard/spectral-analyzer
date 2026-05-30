@@ -499,11 +499,17 @@ public:
         return (int)q_.size();
     }
 
+    /* Signal that no new items will be pushed.  Unblocks blocked pops/pop_batch
+     * calls so workers can drain and exit.  Does NOT clear the queue: items
+     * pushed before set_done() remain available for drain() callers.  This is
+     * intentional — clearing accumulated data as a side-effect of signalling
+     * shutdown discards in-flight records (e.g. BDPT PDFs) before consumers
+     * (e.g. T5) have had a chance to read them. */
     void set_done() {
         {
             std::lock_guard<std::mutex> lk(mu_);
             done_ = true;
-            q_.clear();
+            /* DO NOT clear q_ here — see comment above. */
         }
         cv_.notify_all();
     }
@@ -536,11 +542,11 @@ struct WaveArena {
 };
 
 /* ── T5 GPU connection pass types ────────────────────────────────────────── */
-static constexpr int T5_LGV_STRIDE    = 40;  /* light vertex, floats (must match shader) */
-static constexpr int T5_CGV_STRIDE    = 56;  /* camera vertex, floats (must match shader) */
+static constexpr int T5_LGV_STRIDE    = 56;  /* light vertex, floats (must match shader) */
+static constexpr int T5_CGV_STRIDE    = 72;  /* camera vertex, floats (must match shader) */
 static constexpr int T5_TILE_C        =  8;  /* WG X dim: camera verts per tile          */
 static constexpr int T5_TILE_L        =  8;  /* WG Y dim: light verts per tile            */
-static constexpr int T5_MAX_GPU_BANDS = 16;  /* per-band betas packed into GPU vert buffers */
+static constexpr int T5_MAX_GPU_BANDS = 32;  /* per-band betas packed into GPU vert buffers */
 static constexpr int LGV_BAND_BASE    = 16;  /* first per-band beta field in LGV (field index) */
 static constexpr int CGV_BAND_BASE    = 22;  /* first per-band beta field in CGV (field index) */
 
@@ -557,19 +563,19 @@ static constexpr int CGV_BAND_BASE    = 22;  /* first per-band beta field in CGV
  * [13]     BdptPdfRecord::flags  (BDPT_PDF_FLAG_*, bit-cast uint)            *
  * [14]     optical_block  (non-zero = absorb/TIR/clip; bit-cast uint)        *
  * [15]     prefix_pdf  (cumulative subpath forward-PDF up to this vertex)    *
- * [16..31] per-band beta magnitudes [band 0..15]  (LGV_BAND_BASE)           *
- * [32..34] dir_in xyz  (incident direction at this vertex)                   *
- * [35]     diffuse_p  (mat_cache_diffusion result)                           *
- * [36]     ggx_alpha  (surf_cache_ggx_alpha result)                          *
- * [37]     optical_jacobian  (phase-space jacobian product from optical LUT) *
- * [38]     edge_fwd_area  (area-domain fwd PDF: this vertex → next in path)  *
- * [39]     edge_bwd_area  (area-domain bwd PDF: next vertex → this in path)  */
-static constexpr int LGV_DIR_IN_X       = 32;
-static constexpr int LGV_DIFFUSE_P      = 35;
-static constexpr int LGV_GGX_ALPHA      = 36;
-static constexpr int LGV_OPT_JACOBIAN   = 37;
-static constexpr int LGV_EDGE_FWD_AREA  = 38;
-static constexpr int LGV_EDGE_BWD_AREA  = 39;
+ * [16..47] per-band beta magnitudes [band 0..31]  (LGV_BAND_BASE)           *
+ * [48..50] dir_in xyz  (incident direction at this vertex)                   *
+ * [51]     diffuse_p  (mat_cache_diffusion result)                           *
+ * [52]     ggx_alpha  (surf_cache_ggx_alpha result)                          *
+ * [53]     optical_jacobian  (phase-space jacobian product from optical LUT) *
+ * [54]     edge_fwd_area  (area-domain fwd PDF: this vertex → next in path)  *
+ * [55]     edge_bwd_area  (area-domain bwd PDF: next vertex → this in path)  */
+static constexpr int LGV_DIR_IN_X       = 48;
+static constexpr int LGV_DIFFUSE_P      = 51;
+static constexpr int LGV_GGX_ALPHA      = 52;
+static constexpr int LGV_OPT_JACOBIAN   = 53;
+static constexpr int LGV_EDGE_FWD_AREA  = 54;
+static constexpr int LGV_EDGE_BWD_AREA  = 55;
 
 /* ── CGV named field offsets (stride 56) ────────────────────────────────── *
  * [0..2]   pos xyz                                                           *
@@ -590,20 +596,20 @@ static constexpr int LGV_EDGE_BWD_AREA  = 39;
  * [19]     prefix_pdf  (cumulative subpath forward-PDF up to this vertex)    *
  * [20]     mis_denom_sum  (reserved, 0.0)                                    *
  * [21]     tri_mat_idx  (int bits of material index)                         *
- * [22..37] per-band beta magnitudes [band 0..15]  (CGV_BAND_BASE)           *
- * [38..40] dir_in xyz                                                        *
- * [41]     diffuse_p                                                         *
- * [42]     ggx_alpha                                                         *
- * [43]     optical_jacobian                                                  *
- * [44]     edge_fwd_area                                                     *
- * [45]     edge_bwd_area                                                     *
- * [46..55] pad / reserved                                                    */
-static constexpr int CGV_DIR_IN_X       = 38;
-static constexpr int CGV_DIFFUSE_P      = 41;
-static constexpr int CGV_GGX_ALPHA      = 42;
-static constexpr int CGV_OPT_JACOBIAN   = 43;
-static constexpr int CGV_EDGE_FWD_AREA  = 44;
-static constexpr int CGV_EDGE_BWD_AREA  = 45;
+ * [22..53] per-band beta magnitudes [band 0..31]  (CGV_BAND_BASE)           *
+ * [54..56] dir_in xyz                                                        *
+ * [57]     diffuse_p                                                         *
+ * [58]     ggx_alpha                                                         *
+ * [59]     optical_jacobian                                                  *
+ * [60]     edge_fwd_area                                                     *
+ * [61]     edge_bwd_area                                                     *
+ * [62..71] pad / reserved                                                    */
+static constexpr int CGV_DIR_IN_X       = 54;
+static constexpr int CGV_DIFFUSE_P      = 57;
+static constexpr int CGV_GGX_ALPHA      = 58;
+static constexpr int CGV_OPT_JACOBIAN   = 59;
+static constexpr int CGV_EDGE_FWD_AREA  = 60;
+static constexpr int CGV_EDGE_BWD_AREA  = 61;
 
 /* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl.
  * std430 layout, 32 bytes. */
@@ -617,7 +623,7 @@ struct T5GpuParams {
     int32_t  sensor_res;       /* pixel grid side (res×res image)       */
     uint32_t light_batch_size; /* light verts per dispatch (TDR guard)  */
     uint32_t light_offset;     /* first light vert index in this batch  */
-    uint32_t _pad1;
+    int32_t  n_bands;          /* number of spectral bands (≥1)         */
 };
 static_assert(sizeof(T5GpuParams) == 40, "T5GpuParams layout mismatch");
 
@@ -834,6 +840,7 @@ void ray_pipeline_join_t5(RayPipelineState* ps);
 /* Live-update T5 connection-pass configuration. */
 void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
 void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n);
+void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v);
 
 /* Live-update the flash light modifier applied in submit_emissive_triangles. */
 void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType type,

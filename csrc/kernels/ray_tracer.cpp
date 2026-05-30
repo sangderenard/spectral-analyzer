@@ -6968,6 +6968,7 @@ static inline void apply_neural_mlp_from_f32(
  * teleports pos/dir to the assembly exit.  Returns true if the ray was
  * absorbed (vignetted, TIR, degenerate), false if teleported successfully.
  * Optical axis is scene-X (same convention as CompoundLens). */
+#pragma optimize("", off)  /* MSVC ICE workaround: optimizer overflows on this function */
 static inline bool apply_parametric_lens_from_f32(
     const RayTracerState& st,
     const float* p, int payload_bytes,
@@ -7197,6 +7198,7 @@ static inline bool apply_parametric_lens_from_f32(
     if (trace_info) *trace_info = local_trace;
     return false;   /* teleported */
 }
+#pragma optimize("", on)
 
 /* ── apply_manifold_transfer_from_payload ───────────────────────────────────
  * Like apply_manifold_transfer() but reads directly from a raw float payload
@@ -7547,16 +7549,58 @@ struct RayPipelineState {
     std::atomic<bool>         bdpt_connection_running{false};
     std::atomic<uint64_t>     emitter_world_culled{0};
 
-    /* T5 substage-dispatch latch.  Both counters start at 0 and are
-     * incremented once per exposure substage by the respective signal
-     * functions.  T5 fires when min(flash, sensor) > t5_fired, serialised
-     * by bdpt_t5_spawn_mu so only one pass runs at a time. */
+    /* T5 substage-dispatch latch — first-submission markers only.
+     * These record that a family has been submitted this cycle.
+     * They have no bearing on tracing completeness. */
     std::atomic<uint32_t>     bdpt_flash_dispatched{0};
     std::atomic<uint32_t>     bdpt_sensor_dispatched{0};
     std::atomic<uint32_t>     bdpt_t5_fired{0};
     std::mutex                bdpt_t5_spawn_mu;
     std::thread               bdpt_t5_worker;
+
+    /* ── KPN-style T5 completion channel ─────────────────────────────────
+     * Per-family in-flight ray counts.  Decremented when a ray (and all its
+     * bounce descendants) terminates; incremented when children are spawned.
+     * When both hit zero after both families have been submitted, a sentinel
+     * is pushed to Q_t5_ready.  The T5 worker thread blocks reading that
+     * queue — no polling, no timeouts, no ad-hoc condition variables. */
+    std::atomic<int64_t>      bdpt_inflight_flash{0};
+    std::atomic<int64_t>      bdpt_inflight_sensor{0};
+    PipelineQueue<int>         Q_t5_ready;   /* sentinel channel: push 1 → T5 unblocks */
 };
+
+/* bdpt_update_inflight — called after every T3 batch with the net per-family
+ * change (positive = children spawned exceed parents processed; negative = net
+ * terminations).  When both family counters reach zero and both families have
+ * been submitted for this cycle, pushes a sentinel to Q_t5_ready so the T5
+ * worker unblocks.  Only one sentinel per cycle: bdpt_connection_running acts
+ * as the gate so we don't double-fire while T5 is already consuming. */
+static void bdpt_update_inflight(RayPipelineState* ps,
+                                  int64_t delta_flash,
+                                  int64_t delta_sensor)
+{
+    if (delta_flash == 0 && delta_sensor == 0) return;
+    const int64_t nf = ps->bdpt_inflight_flash.fetch_add(delta_flash,
+                           std::memory_order_acq_rel) + delta_flash;
+    const int64_t ns = ps->bdpt_inflight_sensor.fetch_add(delta_sensor,
+                           std::memory_order_acq_rel) + delta_sensor;
+    if (nf != 0 || ns != 0) return;
+
+    /* Both counters just hit zero.  Check whether both families have been
+     * submitted for a new cycle and T5 is not already running. */
+    const uint32_t flash_submitted  = ps->bdpt_flash_dispatched.load(std::memory_order_acquire);
+    const uint32_t sensor_submitted = ps->bdpt_sensor_dispatched.load(std::memory_order_acquire);
+    const uint32_t t5_fired         = ps->bdpt_t5_fired.load(std::memory_order_acquire);
+    if (std::min(flash_submitted, sensor_submitted) <= t5_fired) return;
+    if (ps->bdpt_connection_running.load(std::memory_order_acquire)) return;
+
+    fprintf(stderr, "[T5-kpn] both families exhausted — pushing sentinel "
+            "(flash_if=%lld sensor_if=%lld flash_sub=%u sensor_sub=%u t5_fired=%u)\n",
+            (long long)nf, (long long)ns,
+            flash_submitted, sensor_submitted, t5_fired);
+    fflush(stderr);
+    ps->Q_t5_ready.push(1);
+}
 
 /* CIE-approximate spectral locus — forward declaration; definition is near ray_pipeline_join_t5 */
 static void band_to_display_rgb(int b, int n_bands,
@@ -7590,7 +7634,7 @@ static void band_to_display_rgb(int b, int n_bands,
  *   and the adaptive gpu_fraction EMA so Python callers can observe load split.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void _fire_t5_if_ready(RayPipelineState* ps);  /* defined after run_bdpt_connection */
+static void t5_kpn_worker(RayPipelineState* ps);  /* KPN T5 process — defined after run_bdpt_connection */
 
 class RayPipelineState::GlPipelineDispatch {
 public:
@@ -7603,22 +7647,26 @@ public:
     GLuint prog_t5 = 0;
 
     /* T5 persistent SSBOs — allocated on first use, grown as needed */
-    GLuint ssbo_t5_light  = 0;  /* binding 0: T5LightVertBuf  (float)  */
-    GLuint ssbo_t5_cam    = 0;  /* binding 1: T5CamVertBuf    (float)  */
-    GLuint ssbo_t5_pix    = 0;  /* binding 2: T5PixelBuf      (uint)   */
-    GLuint ssbo_t5_params = 0;  /* binding 3: T5ParamsBuf     (32 B)   */
+    GLuint ssbo_t5_light    = 0;  /* binding 0: T5LightVertBuf       (float)  */
+    GLuint ssbo_t5_cam      = 0;  /* binding 1: T5CamVertBuf         (float)  */
+    GLuint ssbo_t5_pix      = 0;  /* binding 2: T5PixelBuf           (uint)   */
+    GLuint ssbo_t5_params   = 0;  /* binding 3: T5ParamsBuf          (40 B)   */
+    GLuint ssbo_t5_spectral = 0;  /* binding 4: T5SpectralWeightBuf  (float)  */
     int      cap_t5_light        = 0;  /* floats */
     int      cap_t5_cam          = 0;  /* floats */
     int      cap_t5_pix          = 0;  /* uint32 */
+    int      cap_t5_spectral     = 0;  /* floats */
     uint32_t t5_light_batch_size = 0;  /* 0 = use default 20480 */
+    bool     force_cpu_t5        = false; /* --no-gpu-t5: bypass prog_t5, use CPU allpairs */
 
     /* ── T5 GPU job queue ─────────────────────────────────────────────── *
      * The BDPT connection thread submits a job and blocks on the future;  *
      * the GPU thread services it between T1/T2/T3 batches.               */
     struct T5Job {
-        std::vector<float>    light_verts;   /* flat, T5_LGV_STRIDE each   */
-        std::vector<float>    cam_verts;     /* flat, T5_CGV_STRIDE each   */
-        std::vector<uint32_t> pixel_accum;   /* 3 × res², zeroed           */
+        std::vector<float>    light_verts;      /* flat, T5_LGV_STRIDE each   */
+        std::vector<float>    cam_verts;        /* flat, T5_CGV_STRIDE each   */
+        std::vector<uint32_t> pixel_accum;      /* 3 × res², zeroed           */
+        std::vector<float>    spectral_weights; /* n_bands × 3 (wr, wg, wb)   */
         T5GpuParams           params;
         std::promise<std::vector<uint32_t>> promise;
     };
@@ -7700,7 +7748,7 @@ public:
      * pdfs at bdpt_pdf_base, optical at bdpt_optical_base).
      * Vertex/spectral/pdf counts live in MetaBuf at [2+n_mats..2+n_mats+2];
      * GPU T2 optical count lives in CounterBuf[4].
-     * bdpt_sid is embedded in hit[58] by T1 — no separate id SSBO needed. */
+     * bdpt_sid is embedded in hit[26+2*MAX_SPECTRAL_BANDS] by T1 — no separate id SSBO needed. */
     GLuint ssbo_bdpt_output   = 0;
     int    cap_bdpt_output    = 0;  /* in floats */
     /* UV integrator image: merged_uv int32 SSBO at binding 5 contains:
@@ -8037,6 +8085,20 @@ public:
         uloc_t3.bdpt_spectral_base   = glc_GetUniformLocation(prog_t3, "bdpt_spectral_base");
         uloc_t3.bdpt_pdf_base        = glc_GetUniformLocation(prog_t3, "bdpt_pdf_base");
         uloc_t3.n_hits               = glc_GetUniformLocation(prog_t3, "n_hits");
+        /* !!DIAG!! Print T3 BDPT uniform locations.  -1 means the GLSL compiler
+         * dead-stripped that uniform (it considers it unreachable).  If
+         * uloc_max_pdfs=-1 the glUniform upload is a no-op → bdpt_max_pdfs=0
+         * in the shader → emit_bdpt_pdf always returns early → pdfs=0 forever. */
+        fprintf(stderr,
+            "[gpu-t3-uloc] bdpt_max_verts=%d bdpt_max_spectral=%d bdpt_max_pdfs=%d "
+            "bdpt_count_base=%d bdpt_spectral_base=%d bdpt_pdf_base=%d\n",
+            (int)uloc_t3.bdpt_max_verts,
+            (int)uloc_t3.bdpt_max_spectral,
+            (int)uloc_t3.bdpt_max_pdfs,
+            (int)uloc_t3.bdpt_count_base,
+            (int)uloc_t3.bdpt_spectral_base,
+            (int)uloc_t3.bdpt_pdf_base);
+        fflush(stderr);
 
         uloc_t4.mode        = glc_GetUniformLocation(prog_t4, "mode");
         uloc_t4.nx          = glc_GetUniformLocation(prog_t4, "nx");
@@ -8353,7 +8415,9 @@ public:
 
     /* ── dispatch_t1_t2_t3: run one GPU batch through T1→T2→T3 ──────────── */
     int dispatch_t1_t2_t3(RayPipelineState& ps,
-                           const std::vector<RayIntent>& batch)
+                           const std::vector<RayIntent>& batch,
+                           int64_t* out_flash_children = nullptr,
+                           int64_t* out_sensor_children = nullptr)
     {
         using Clock = std::chrono::high_resolution_clock;
         const RayTracerState& st = *ps.st;
@@ -8363,8 +8427,8 @@ public:
         const int na = (int)ps.arenas.size();
         const int nt = (int)st.tris.size();
 
-        /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 52 floats) */
-        static constexpr int INTENT_STRIDE = 52;
+        /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 20 + 2*MAX_SPECTRAL_BANDS floats) */
+        static constexpr int INTENT_STRIDE = 20 + 2 * MAX_SPECTRAL_BANDS;
         if (n > cap_intents) {
             cap_intents = n * 2;
             ensure_ssbo(ssbo_intent, (GLsizeiptr)(cap_intents * INTENT_STRIDE * sizeof(float)));
@@ -8393,10 +8457,10 @@ public:
             row[16] = ri.priority;
             row[17] = ri.sensor_origin_y; row[18] = ri.sensor_origin_z;
             row[19] = rt_u32_as_f32((uint32_t)ri.bdpt_subpath_id); /* bdpt_subpath_id in _pad */
-            const int bands = std::min(nb, 16);
+            const int bands = std::min(nb, MAX_SPECTRAL_BANDS);
             for (int b = 0; b < bands; ++b) {
                 row[20+b] = (float)ri.amp[b].real();
-                row[36+b] = (float)ri.amp[b].imag();
+                row[20+MAX_SPECTRAL_BANDS+b] = (float)ri.amp[b].imag();
             }
         }
         /* Upload intents */
@@ -8404,8 +8468,8 @@ public:
         glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, (GLsizeiptr)(n * INTENT_STRIDE * sizeof(float)), ibuf.data());
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-        /* ── Ensure hit SSBO (HIT_STRIDE = 59 floats; hit[58] = bdpt_subpath_id as uintBitsToFloat) */
-        static constexpr int HIT_STRIDE = 59;
+        /* ── Ensure hit SSBO (HIT_STRIDE = 27 + 2*MAX_SPECTRAL_BANDS floats; bdpt_sid at [26+2*MAX_SPECTRAL_BANDS]) */
+        static constexpr int HIT_STRIDE = 27 + 2 * MAX_SPECTRAL_BANDS;
         int max_hits = n * 4;
         if (max_hits > cap_hits) {
             cap_hits = max_hits * 2;
@@ -8500,11 +8564,11 @@ public:
             glc_Uniform1i(uloc_t2.bdpt_max_optical, max_bdpt_o);
             glc_Uniform1i(uloc_t2.bdpt_optical_base, bdpt_optical_base_f);
             if (uloc_t2.freq_hz >= 0) {
-                float fhz[16] = {};
-                const int nbf = std::min(nb, 16);
+                float fhz[MAX_SPECTRAL_BANDS] = {};
+                const int nbf = std::min(nb, MAX_SPECTRAL_BANDS);
                 for (int i = 0; i < nbf; ++i)
                     fhz[i] = (float)st.freq_hz_vec[i];
-                glc_Uniform1fv(uloc_t2.freq_hz, 16, fhz);
+                glc_Uniform1fv(uloc_t2.freq_hz, MAX_SPECTRAL_BANDS, fhz);
             }
             glc_DispatchCompute((GLuint)((n + 63) / 64), 1, 1);
             glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
@@ -8519,8 +8583,8 @@ public:
             readback_ssbo(ssbo_counter, &cnt0, sizeof(uint32_t));
             n_hits = std::min((int)cnt0, cap_hits);
         }
-        static constexpr int CHILD_STRIDE    = 52;  /* INTENT_STRIDE: 20 + 2*16 */
-        static constexpr int TERMINAL_STRIDE = 58;  /* 26 + 2*16 (MAX_BANDS=16) */
+        static constexpr int CHILD_STRIDE    = 20 + 2 * MAX_SPECTRAL_BANDS;  /* INTENT_STRIDE: 20 + 2*MAX_SPECTRAL_BANDS */
+        static constexpr int TERMINAL_STRIDE = 26 + 2 * MAX_SPECTRAL_BANDS;  /* 26 + 2*MAX_SPECTRAL_BANDS */
         /* Size child buffer for worst-case (all n intents hit and spawn children). */
         int max_children = n * ps.cfg.max_children + 1;
         if (max_children > cap_children) {
@@ -8681,14 +8745,21 @@ public:
                     : static_cast<uint16_t>(std::min(ri.bounce, 0xFFFF));
                 ri.bdpt_stream = (ri.color_flag == 1u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
                 ri.bdpt_strategy = 0u;
-                const int bands = std::min(nb, 16);
+                const int bands = std::min(nb, MAX_SPECTRAL_BANDS);
                 for (int b = 0; b < bands; ++b)
-                    ri.amp[b] = std::complex<double>(row[20+b], row[36+b]);
+                    ri.amp[b] = std::complex<double>(row[20+b], row[20+MAX_SPECTRAL_BANDS+b]);
                 for (int b = bands; b < nb; ++b)
                     ri.amp[b] = std::complex<double>(0.0, 0.0);
                 children.push_back(std::move(ri));
             }
             ps.in_flight.fetch_add((int)children.size(), std::memory_order_relaxed);
+            if (out_flash_children || out_sensor_children) {
+                int64_t cf = 0, cs = 0;
+                for (const auto& ch : children)
+                    if (ch.color_flag == 1) ++cs; else ++cf;
+                if (out_flash_children)  *out_flash_children  = cf;
+                if (out_sensor_children) *out_sensor_children = cs;
+            }
             ps.Q_intent.push_many(children);
         }
         if (t3_post_diag) {
@@ -8697,9 +8768,9 @@ public:
         }
 
         /* Accumulate emissive terminal hits onto the CPU sensor image.
-         * Terminal record layout (TERMINAL_STRIDE=58 floats, MAX_BANDS=16):
+         * Terminal record layout (TERMINAL_STRIDE=26+2*MAX_SPECTRAL_BANDS floats):
          *   [16]=color_flag  [23]=sensor_origin_y  [24]=sensor_origin_z
-         *   [25]=is_emissive_hit  [26..41]=amp_re  [42..57]=amp_im        */
+         *   [25]=is_emissive_hit  [26..26+MAX_SPECTRAL_BANDS-1]=amp_re  [26+MAX_SPECTRAL_BANDS..TERMINAL_STRIDE-1]=amp_im */
         if (nt_term > 0 && ps.sensor_res > 0) {
             /* terminals start at max_children*CHILD_STRIDE floats into the combined buffer */
             GLintptr term_off = (GLintptr)((size_t)max_children * CHILD_STRIDE * sizeof(float));
@@ -8729,8 +8800,8 @@ public:
                 const int iz = (int)((soz + ps.sensor_half_h) * inv_h);
                 if (iy < 0 || iy >= res || iz < 0 || iz >= res) continue;
                 double cr = 0.0, cg = 0.0, cb = 0.0;
-                for (int b = 0; b < nb && b < 16; ++b) {
-                    const double re = (double)rec[26 + b], im = (double)rec[42 + b];
+                for (int b = 0; b < nb && b < MAX_SPECTRAL_BANDS; ++b) {
+                    const double re = (double)rec[26 + b], im = (double)rec[26 + MAX_SPECTRAL_BANDS + b];
                     const double amp = std::sqrt(re*re + im*im);
                     double wr, wg, wb;
                     band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
@@ -8784,7 +8855,7 @@ public:
                     (uint64_t)((size_t)n_rb * HIT_STRIDE * sizeof(float)),
                     std::memory_order_relaxed);
                 ps.gpu_hit_readback_count.fetch_add(1, std::memory_order_relaxed);
-                const int bands = std::min(nb, 16);
+                const int bands = std::min(nb, MAX_SPECTRAL_BANDS);
                 const bool field_done_bulk = do_field
                     && accumulate_field_capture_segments_regular_threaded(*ps.st, hbuf.data(), n_rb, HIT_STRIDE, nb);
                 /* amp_tmp only needed for per-segment field capture fallback */
@@ -8823,7 +8894,7 @@ public:
                         rec.n_bands = bands;
                         for (int b = 0; b < bands; ++b) {
                             rec.amp_re[b] = row[26 + b];
-                            rec.amp_im[b] = row[42 + b];
+                            rec.amp_im[b] = row[26 + MAX_SPECTRAL_BANDS + b];
                         }
                         strike_batch.push_back(std::move(rec));
                     }
@@ -8833,7 +8904,7 @@ public:
                         const V3d seg_s(row[9], row[10], row[11]);
                         const V3d hit_p(row[0], row[1],  row[2]);
                         for (int b = 0; b < bands; ++b)
-                            amp_tmp[b] = std::complex<double>(row[26 + b], row[42 + b]);
+                            amp_tmp[b] = std::complex<double>(row[26 + b], row[26 + MAX_SPECTRAL_BANDS + b]);
                         for (int b = bands; b < nb; ++b)
                             amp_tmp[b] = cd(0.0, 0.0);
                         accumulate_field_capture_segment(*ps.st, seg_s, hit_p, amp_tmp);
@@ -8882,6 +8953,33 @@ public:
             const int ns = std::min((int)bdpt_cnts[1], max_bdpt_s);
             const int np = std::min((int)bdpt_cnts[2], max_bdpt_p);
             const int no = std::min((int)counters[4], max_bdpt_o);
+            /* !!DIAG!! raw GPU-emitted BDPT counts (before clamping to cap).
+             * bdpt_cnts[2]=raw PDF count from meta[2+nm+2].
+             * If raw_pdfs=0 the shader never incremented the PDF counter →
+             *   bdpt_max_pdfs uniform is 0 in shader (dead-stripped or upload failed).
+             * If raw_pdfs>0 but np=0 the cap is wrong.
+             * uloc_t3.bdpt_max_pdfs=-1 means the uniform was not found in the shader. */
+            fprintf(stderr,
+                "[gpu-bdpt-diag] nm=%d bdpt_count_base=%d "
+                "raw_verts=%u raw_spectral=%u raw_pdfs=%u "
+                "cap_v=%d cap_s=%d cap_p=%d "
+                "uloc_max_verts=%d uloc_max_spectral=%d uloc_max_pdfs=%d "
+                "uloc_count_base=%d uloc_spectral_base=%d uloc_pdf_base=%d "
+                "max_bdpt_v=%d max_bdpt_s=%d max_bdpt_p=%d "
+                "bdpt_spectral_base_f=%d bdpt_pdf_base_f=%d\n",
+                nm, bdpt_count_base,
+                bdpt_cnts[0], bdpt_cnts[1], bdpt_cnts[2],
+                nv, ns, np,
+                (int)uloc_t3.bdpt_max_verts,
+                (int)uloc_t3.bdpt_max_spectral,
+                (int)uloc_t3.bdpt_max_pdfs,
+                (int)uloc_t3.bdpt_count_base,
+                (int)uloc_t3.bdpt_spectral_base,
+                (int)uloc_t3.bdpt_pdf_base,
+                max_bdpt_v, max_bdpt_s, max_bdpt_p,
+                bdpt_spectral_base_f, bdpt_pdf_base_f);
+            fflush(stderr);
+            uint64_t batch_cam_count = 0;  /* sensor verts in this batch */
 
             if (nv > 0) {
                 stg_bdpt_verts.resize((size_t)nv * BDPT_VERTEX_STRIDE_F);
@@ -8920,14 +9018,10 @@ public:
                     vr.sensor_origin_y   = row[26];
                     vr.sensor_origin_z   = row[27];
                     ps.push_bdpt_vertex(vr);
-                    if (vr.stream == BDPT_SIDE_SENSOR) ++cam_count;
+                    if (vr.stream == BDPT_SIDE_SENSOR) { ++cam_count; ++batch_cam_count; }
                 }
-                if (cam_count > 0) {
+                if (cam_count > 0)
                     ps.bdpt_cam_vertex_count.fetch_add(cam_count, std::memory_order_relaxed);
-                    /* Sensor vertices just landed in the queue — this is the
-                     * correct moment to fire T5 (both subpaths now in queue). */
-                    _fire_t5_if_ready(&ps);
-                }
             }
 
             if (ns > 0) {
@@ -9029,6 +9123,11 @@ public:
                 }
             }
 
+            /* Data from this batch is now in its queues.  T5 is NOT fired here —
+             * firing per T3 generation is too early; all bounce generations must
+             * complete first.  T5 fires from the timeout path once in_flight==0. */
+            (void)batch_cam_count;
+
         }
 
         return n_hits;
@@ -9070,10 +9169,10 @@ public:
             glc_Uniform1f(uloc_t4.dx,      (float)arena.dx);
             glc_Uniform1f(uloc_t4.dz,      (float)arena.dz);
             /* Upload wavelengths array */
-            float wl[16] = {};
-            for (int b = 0; b < std::min(nb,16); ++b)
+            float wl[MAX_SPECTRAL_BANDS] = {};
+            for (int b = 0; b < std::min(nb, MAX_SPECTRAL_BANDS); ++b)
                 wl[b] = (float)arena.wavelengths_m[b];
-            glc_Uniform1fv(uloc_t4.wavelengths, 16, wl);
+            glc_Uniform1fv(uloc_t4.wavelengths, MAX_SPECTRAL_BANDS, wl);
         };
 
         bind_ssbo(ssbo_wave_re, 0); bind_ssbo(ssbo_wave_im, 1);
@@ -9130,11 +9229,14 @@ public:
             wave_batch.clear();
             ps.Q_wave.drain(wave_batch, gpu_bsz);
 
-            /* Timeout: Q_intent has nothing yet but is not done.
-             * Service a pending T5 job if present, then loop back.        */
+            /* Timeout: Q_intent is empty but pipeline is still running.
+             * If in_flight==0, every ray (all bounce generations) has finished
+             * for this dispatch cycle.  Fire T5 if both families are ready. */
             if (n < 0) {
                 if (t5_job_ready.load(std::memory_order_acquire))
                     service_t5_job();
+                /* T5 is now woken by bdpt_update_inflight via Q_t5_ready.
+                 * Nothing to poll here. */
                 continue;
             }
 
@@ -9156,7 +9258,14 @@ public:
 
             /* T1→T2→T3 batch */
             {
-                int n_hits = dispatch_t1_t2_t3(ps, batch);
+                /* Count parents by family before dispatch. */
+                int64_t flash_parents = 0, sensor_parents = 0;
+                for (const auto& ri : batch)
+                    if (ri.color_flag == 1) ++sensor_parents; else ++flash_parents;
+
+                int64_t flash_children = 0, sensor_children = 0;
+                int n_hits = dispatch_t1_t2_t3(ps, batch,
+                                               &flash_children, &sensor_children);
                 /* Harvest Eigen amp allocations from the just-processed batch into
                  * the recycling pool.  dispatch_t1_t2_t3 has already read all amp
                  * data into the flat ibuf; the VXcd heap blocks are now idle until
@@ -9170,6 +9279,10 @@ public:
                 }
                 for (int i = 0; i < n; ++i)
                     ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+                /* Net per-family inflight change: children spawned minus parents done. */
+                bdpt_update_inflight(&ps,
+                                     flash_children  - flash_parents,
+                                     sensor_children - sensor_parents);
                 (void)n_hits;
             }
 
@@ -9201,11 +9314,13 @@ public:
         const auto& lv  = job->light_verts;
         const auto& cv  = job->cam_verts;
         const auto& pix = job->pixel_accum;
+        const auto& sw  = job->spectral_weights;
         T5GpuParams par = job->params;  /* mutable copy — light_offset updated per batch */
 
         const int nlv = (int)lv.size();
         const int ncv = (int)cv.size();
         const int npi = (int)pix.size();
+        const int nsw = (int)sw.size();
 
         /* ── Ensure / grow SSBOs ──────────────────────────────────────── */
         if (nlv > cap_t5_light) {
@@ -9223,6 +9338,10 @@ public:
         if (!ssbo_t5_params) {
             ensure_ssbo(ssbo_t5_params, sizeof(T5GpuParams));
         }
+        if (nsw > cap_t5_spectral) {
+            cap_t5_spectral = std::max(nsw * 2, T5_MAX_GPU_BANDS * 3);
+            ensure_ssbo(ssbo_t5_spectral, (GLsizeiptr)(cap_t5_spectral * sizeof(float)));
+        }
 
         /* ── Upload data ──────────────────────────────────────────────── */
         auto upload = [&](GLuint ssbo, const void* data, GLsizeiptr bytes) {
@@ -9230,10 +9349,11 @@ public:
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, data);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         };
-        if (nlv) upload(ssbo_t5_light,  lv.data(),  (GLsizeiptr)(nlv * sizeof(float)));
-        if (ncv) upload(ssbo_t5_cam,    cv.data(),  (GLsizeiptr)(ncv * sizeof(float)));
-                 upload(ssbo_t5_pix,    pix.data(), (GLsizeiptr)(npi * sizeof(uint32_t)));
-                 upload(ssbo_t5_params, &par,        sizeof(T5GpuParams));
+        if (nlv) upload(ssbo_t5_light,    lv.data(),  (GLsizeiptr)(nlv * sizeof(float)));
+        if (ncv) upload(ssbo_t5_cam,      cv.data(),  (GLsizeiptr)(ncv * sizeof(float)));
+                 upload(ssbo_t5_pix,      pix.data(), (GLsizeiptr)(npi * sizeof(uint32_t)));
+                 upload(ssbo_t5_params,   &par,        sizeof(T5GpuParams));
+        if (nsw) upload(ssbo_t5_spectral, sw.data(),  (GLsizeiptr)(nsw * sizeof(float)));
 
         /* ── Batched 2-D dispatch ─────────────────────────────────────────── *
          * X axis: camera vert tiles  (TILE_C verts per WG column).          *
@@ -9247,13 +9367,14 @@ public:
         const uint32_t n_batches  = (n_light + T5_LIGHT_BATCH - 1u) / T5_LIGHT_BATCH;
 
         glc_UseProgram(prog_t5);
-        bind_ssbo(ssbo_t5_light,  0);
-        bind_ssbo(ssbo_t5_cam,    1);
-        bind_ssbo(ssbo_t5_pix,    2);
-        bind_ssbo(ssbo_t5_params, 3);
-        bind_ssbo(ssbo_bvh,       5);
-        bind_ssbo(ssbo_tri_id,    6);
-        bind_ssbo(ssbo_tri_full,  7);
+        bind_ssbo(ssbo_t5_light,    0);
+        bind_ssbo(ssbo_t5_cam,      1);
+        bind_ssbo(ssbo_t5_pix,      2);
+        bind_ssbo(ssbo_t5_params,   3);
+        bind_ssbo(ssbo_t5_spectral, 4);
+        bind_ssbo(ssbo_bvh,         5);
+        bind_ssbo(ssbo_tri_id,      6);
+        bind_ssbo(ssbo_tri_full,    7);
 
         fprintf(stderr, "[T5-gpu] starting: n_cam=%u n_light=%u batches=%u res=%d\n",
                 n_cam, n_light, n_batches, par.sensor_res);
@@ -9308,14 +9429,16 @@ public:
         std::vector<float>    light_verts,
         std::vector<float>    cam_verts,
         std::vector<uint32_t> pixel_accum,
+        std::vector<float>    spectral_weights,
         T5GpuParams           params)
     {
         if (!prog_t5) return {};
         auto job = std::make_unique<T5Job>();
-        job->light_verts  = std::move(light_verts);
-        job->cam_verts    = std::move(cam_verts);
-        job->pixel_accum  = std::move(pixel_accum);
-        job->params       = params;
+        job->light_verts      = std::move(light_verts);
+        job->cam_verts        = std::move(cam_verts);
+        job->pixel_accum      = std::move(pixel_accum);
+        job->spectral_weights = std::move(spectral_weights);
+        job->params           = params;
         std::future<std::vector<uint32_t>> fut = job->promise.get_future();
         {
             std::lock_guard<std::mutex> lk(t5_job_mu);
@@ -9499,14 +9622,50 @@ static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src)
 
 /* ── In-flight accounting ─────────────────────────────────────────────────── */
 
-static void pipeline_finish_ray(RayPipelineState& ps)
+/* Update BDPT family counters on the CPU path — mirrors the GPU path's
+ * bdpt_update_inflight() but operates one intent at a time.  color_flag==1
+ * is sensor (camera), everything else is flash (light). */
+static inline void bdpt_family_spawn(RayPipelineState& ps, uint8_t color_flag)
+{
+    if (color_flag == 1)
+        ps.bdpt_inflight_sensor.fetch_add(1, std::memory_order_release);
+    else
+        ps.bdpt_inflight_flash.fetch_add(1, std::memory_order_release);
+}
+
+static void bdpt_family_finish(RayPipelineState& ps, uint8_t color_flag)
+{
+    int64_t nf, ns;
+    if (color_flag == 1) {
+        nf = ps.bdpt_inflight_flash.load(std::memory_order_acquire);
+        ns = ps.bdpt_inflight_sensor.fetch_add(-1, std::memory_order_acq_rel) - 1;
+    } else {
+        nf = ps.bdpt_inflight_flash.fetch_add(-1, std::memory_order_acq_rel) - 1;
+        ns = ps.bdpt_inflight_sensor.load(std::memory_order_acquire);
+    }
+    /* Mirror sentinel logic from bdpt_update_inflight — but only trigger when
+     * both truly zero, and only from the CPU T3 path (GPU already does this). */
+    if (nf != 0 || ns != 0) return;
+    const uint32_t flash_sub = ps.bdpt_flash_dispatched.load(std::memory_order_acquire);
+    const uint32_t sens_sub  = ps.bdpt_sensor_dispatched.load(std::memory_order_acquire);
+    const uint32_t t5_fired  = ps.bdpt_t5_fired.load(std::memory_order_acquire);
+    if (std::min(flash_sub, sens_sub) <= t5_fired) return;
+    if (ps.bdpt_connection_running.load(std::memory_order_acquire)) return;
+    ps.Q_t5_ready.push(1);
+}
+
+static void pipeline_finish_ray(RayPipelineState& ps, uint8_t color_flag = 255)
 {
     ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
+    if (color_flag != 255)
+        bdpt_family_finish(ps, color_flag);
 }
 
 static void pipeline_spawn_child(RayPipelineState& ps, RayIntent child)
 {
+    const uint8_t cf = child.color_flag;
     ++ps.in_flight;
+    bdpt_family_spawn(ps, cf);
     ps.Q_intent.push(std::move(child));
 }
 
@@ -9972,6 +10131,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         for (auto& rh : batch) {
             const HitRecord& hr     = rh.base;
             const Triangle&  tri    = st.tris[static_cast<size_t>(hr.hit_tri)];
+        const uint8_t    ray_cf  = hr.ray.color_flag;   /* cached for family accounting */
         const int        nb     = std::min((int)hr.amp_propagated.size(), st.n_bands);
         const V3d&       hit_n  = rh.refined_n;
         const V3d&       in_dir = hr.incoming_dir;
@@ -10048,7 +10208,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         /* ── Terminal: aperture stop ── */
         if (tri.flags & MAT_FLAG_APERTURE_STOP) {
             push_terminal(hr);
-            pipeline_finish_ray(ps);
+            pipeline_finish_ray(ps, ray_cf);
             continue;
         }
         /* ── Terminal: emissive ── */
@@ -10056,7 +10216,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             HitRecord eh = hr;
             eh.is_emissive_hit = true;
             push_terminal(eh);
-            pipeline_finish_ray(ps);
+            pipeline_finish_ray(ps, ray_cf);
             /* ── Sensor accumulator (T3): backward ray found emissive surface.
              * Use sensor_origin_y/z (set at submit time, propagated through all
              * children) so this works regardless of how many refractions the ray
@@ -10097,7 +10257,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         /* ── Budget exhausted ── */
         if (hr.ray.bounces_left <= 0) {
             push_terminal(hr);
-            pipeline_finish_ray(ps);
+            pipeline_finish_ray(ps, ray_cf);
             continue;
         }
 
@@ -10352,7 +10512,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 static_cast<size_t>(tri.mat_idx) < ps.mat_epsilon_flags.size() &&
                 ps.mat_epsilon_flags[static_cast<size_t>(tri.mat_idx)]) {
                 push_terminal(hr);
-                pipeline_finish_ray(ps);
+                pipeline_finish_ray(ps, ray_cf);
                 continue;
             }
 
@@ -10377,7 +10537,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             }
             if (new_dir.dot(hit_n) <= 0.0) {
                 push_terminal(hr);
-                pipeline_finish_ray(ps);
+                pipeline_finish_ray(ps, ray_cf);
                 continue;
             }
             VXcd na = amp;
@@ -10413,7 +10573,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 }
                 if (!(scatter_pdf > 0.0f) || !(scatter_pdf_rev > 0.0f)) {
                     push_terminal(hr);
-                    pipeline_finish_ray(ps);
+                    pipeline_finish_ray(ps, ray_cf);
                     continue;
                 }
                 emit_scatter(new_dir, na,
@@ -10425,7 +10585,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             }
         }
 
-        pipeline_finish_ray(ps);
+        pipeline_finish_ray(ps, ray_cf);
     }  /* end for rh : batch */
 
         auto t1 = Clock::now();
@@ -10451,7 +10611,7 @@ static void pipeline_wave_solver(RayPipelineState& ps)
 
         for (auto& wi : batch) {
             if (wi.arena_id < 0 || wi.arena_id >= (int)ps.arenas.size()) {
-                pipeline_finish_ray(ps);
+                pipeline_finish_ray(ps, wi.ray.color_flag);
                 continue;
             }
             WaveArena& arena = ps.arenas[static_cast<size_t>(wi.arena_id)];
@@ -10493,7 +10653,7 @@ static void pipeline_wave_solver(RayPipelineState& ps)
             if (max_abs >= wi.ray.min_amplitude && cr.intent.bounces_left > 0)
                 pipeline_spawn_child(ps, std::move(cr.intent));
 
-            pipeline_finish_ray(ps);
+            pipeline_finish_ray(ps, wi.ray.color_flag);
         }
 
         auto t1 = Clock::now();
@@ -10595,6 +10755,11 @@ RayPipelineState* ray_pipeline_create(
         }
     }
 
+    /* Start the persistent KPN T5 worker.  It blocks on Q_t5_ready until
+     * bdpt_update_inflight pushes a sentinel (both families exhausted), then
+     * runs ray_pipeline_run_bdpt_connection and loops back to block again. */
+    ps->bdpt_t5_worker = std::thread(t5_kpn_worker, ps);
+
     return ps;
 }
 
@@ -10610,6 +10775,7 @@ void ray_pipeline_destroy(RayPipelineState* ps)
     ps->Q_bdpt_pdfs.set_done();
     ps->Q_bdpt_optical.set_done();
     ps->Q_bdpt_connections.set_done();
+    ps->Q_t5_ready.set_done();         /* unblocks the KPN T5 worker so it can exit */
     for (auto& t : ps->workers) if (t.joinable()) t.join();
     if (ps->bdpt_t5_worker.joinable()) ps->bdpt_t5_worker.join();
     if (ps->gpu_dispatch) {
@@ -10629,9 +10795,18 @@ void ray_pipeline_submit(
     ps->in_flight.fetch_add(n_intents, std::memory_order_relaxed);
     const int    max_q   = ps->cfg.max_intent_queue;
     const double min_amp = ps->cfg.min_amplitude;
+    /* Count flash/sensor split before publishing to Q_intent.  Workers can pop
+     * and finish an intent before the counter reservation below; incrementing
+     * first ensures the family counter never goes negative and the sentinel
+     * in bdpt_update_inflight cannot fire prematurely. */
+    int64_t delta_flash = 0, delta_sensor = 0;
+    for (int i = 0; i < n_intents; ++i) {
+        if (intents[i].color_flag == 1) ++delta_sensor; else ++delta_flash;
+    }
+    if (delta_flash  > 0) ps->bdpt_inflight_flash.fetch_add(delta_flash,  std::memory_order_release);
+    if (delta_sensor > 0) ps->bdpt_inflight_sensor.fetch_add(delta_sensor, std::memory_order_release);
     for (int i = 0; i < n_intents; ++i) {
         RayIntent ri = intents[i];
-        /* Raise per-ray floor to the pipeline minimum (never lower it). */
         if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
         if (max_q > 0)
             ps->Q_intent.push_bounded(std::move(ri), max_q);
@@ -11233,6 +11408,8 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             fprintf(stderr, "[T5-conn] EARLY RETURN — missing %s%s\n",
                     have_camera ? "" : "camera ", have_light ? "" : "light");
             fflush(stderr);
+            /* Advance fired so join_t5() does not hang on a zero-ray-side cycle. */
+            ps->bdpt_t5_fired.fetch_add(1u, std::memory_order_release);
             return;
         }
 
@@ -11243,7 +11420,10 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         t5_work_items = verts.size() + sweights.size() + pdfs.size() + optical.size();
     }
 
-    if (verts.empty()) return;
+    if (verts.empty()) {
+        ps->bdpt_t5_fired.fetch_add(1u, std::memory_order_release);
+        return;
+    }
 
     /* Build spectral beta LUT: key = subpath_id<<32 | vertex_index<<16 | band_id */
     std::unordered_map<uint64_t, std::complex<float>> beta_lut;
@@ -11279,11 +11459,14 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     const float inv_w = static_cast<float>(res) / (2.0f * ps->sensor_half_w);
     const float inv_h = static_cast<float>(res) / (2.0f * ps->sensor_half_h);
 
-    /* Determine n_bands from spectral weight records (fall back to scalar). */
+    /* Determine n_bands: use authoritative pipeline count when available, fall back
+     * to scanning spectral weight records, then T5_MAX_GPU_BANDS. */
     uint16_t max_band = 0;
     for (const auto& sw : sweights)
         if (sw.band_id > max_band) max_band = sw.band_id;
-    const int n_bands = (int)max_band + 1;
+    const int n_bands = (ps->st && ps->st->n_bands > 0)
+        ? ps->st->n_bands
+        : (!sweights.empty() ? (int)max_band + 1 : T5_MAX_GPU_BANDS);
 
     const Eigen::VectorXd& t5_freq_hz = ps->st
         ? ps->st->freq_hz_vec : Eigen::VectorXd{};
@@ -11412,8 +11595,12 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         p[6]  = lr.throughput_scalar;
         std::memcpy(&p[7], &lr.flags,      sizeof(uint32_t));
         std::memcpy(&p[8], &lr.subpath_id, sizeof(uint32_t));
-        /* vinfo: bits[0..15]=vertex_index, bits[16..30]=stream, bit[31]=tri_valid */
-        const uint32_t vinfo = (uint32_t)lr.vertex_index
+        /* vinfo: bits[0..15]=packed_index, bits[16..30]=stream, bit[31]=tri_valid
+         * Use 'li' (loop index = position in packed array) NOT lr.vertex_index
+         * (which is bdpt_vertex = bounce count including optical traversals).
+         * GPU shader: light_flat_base = gid_l - li_v, so li_v must be the
+         * packed-array position, not the bounce count. */
+        const uint32_t vinfo = (uint32_t)li
                              | ((uint32_t)lr.stream << 16)
                              | ((lr.tri_id >= 0 ? 1u : 0u) << 31);
         std::memcpy(&p[9], &vinfo, sizeof(uint32_t));
@@ -11473,6 +11660,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     /* ── GPU path: full brute-force dispatch ────────────────────────────── */
     const bool gpu_t5_ok = ps->gpu_dispatch != nullptr
                         && ps->gpu_dispatch->prog_t5 != 0
+                        && !ps->gpu_dispatch->force_cpu_t5
                         && n_lv > 0
                         && !cam_items.empty();
 
@@ -11491,22 +11679,9 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         for (const auto* csp : cam_items) {
             for (size_t ci = 0; ci < csp->v.size(); ++ci) {
                 const BdptVertexRecord& c = *csp->v[ci];
-                /* Compute per-channel spectral beta (R, G, B) using the same
-                 * band_to_display_rgb weighting that accum_pixel_color uses.
-                 * This lets the GPU shader reproduce spectral material colours. */
-                double s_wr = 0.0, s_wg = 0.0, s_wb = 0.0;
-                for (int b = 0; b < ctx.n_bands; ++b) {
-                    const uint64_t k = ((uint64_t)c.subpath_id  << 32)
-                                     | ((uint64_t)c.vertex_index << 16)
-                                     | (uint64_t)b;
-                    auto it = ctx.beta_lut.find(k);
-                    if (it == ctx.beta_lut.end()) continue;
-                    const double bm = std::abs(it->second);
-                    double bwr, bwg, bwb;
-                    band_to_display_rgb(b, ctx.n_bands, ctx.t5_freq_hz, bwr, bwg, bwb);
-                    s_wr += bm * bwr; s_wg += bm * bwg; s_wb += bm * bwb;
-                }
-                /* If no spectral data the shader discards via beta sum == 0. */
+                /* Compute per-channel spectral beta (R, G, B) — now handled by GPU
+                 * using per-band slots [CGV_BAND_BASE..] and the spectral_weights SSBO.
+                 * Slots [10..12] are zeroed (legacy CPU pre-computation removed). */
 
                 float* p = cam_packed.data() + static_cast<size_t>(ci_flat++) * T5_CGV_STRIDE;
                 /* base fields [0..14] — geometry + ids + spectral display betas */
@@ -11515,16 +11690,20 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 p[6]  = c.throughput_scalar;
                 std::memcpy(&p[7],  &c.flags,      sizeof(uint32_t));
                 std::memcpy(&p[8],  &c.subpath_id, sizeof(uint32_t));
-                /* vinfo: bits[0..15]=vertex_index, bits[16..30]=stream, bit[31]=tri_valid */
+                /* vinfo: bits[0..15]=packed_index, bits[16..30]=stream, bit[31]=tri_valid
+                 * IMPORTANT: use 'ci' (the loop index = position in packed array), NOT
+                 * c.vertex_index (which is bdpt_vertex = bounce count including optical
+                 * lens traversals that emit no BDPT vertex record).  The GPU shader
+                 * computes cam_flat_base = gid_c - ci, so ci must equal gid_c - base. */
                 {
-                    const uint32_t c_vinfo = (uint32_t)c.vertex_index
+                    const uint32_t c_vinfo = (uint32_t)ci
                                            | ((uint32_t)c.stream << 16)
                                            | ((c.tri_id >= 0 ? 1u : 0u) << 31);
                     std::memcpy(&p[9], &c_vinfo, sizeof(uint32_t));
                 }
-                p[10] = static_cast<float>(s_wr);   /* spectral beta R */
-                p[11] = static_cast<float>(s_wg);   /* spectral beta G */
-                p[12] = static_cast<float>(s_wb);   /* spectral beta B */
+                p[10] = 0.0f;   /* was: spectral beta R (GPU now reads from per-band slots) */
+                p[11] = 0.0f;   /* was: spectral beta G */
+                p[12] = 0.0f;   /* was: spectral beta B */
                 p[13] = c.sensor_origin_y;
                 p[14] = c.sensor_origin_z;
                 /* pdf_fwd / pdf_rev [15..16] — direct from vertex record */
@@ -11588,6 +11767,19 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         const uint32_t npix = static_cast<uint32_t>(res) * static_cast<uint32_t>(res);
         std::vector<uint32_t> pixel_accum(3u * npix, 0u);
 
+        /* Pre-compute spectral colour weights (one RGB triple per band).
+         * The GPU shader reads per-band beta magnitudes from CGV_BAND_BASE slots
+         * and multiplies by these weights to get the display RGB contribution. */
+        const int nb_gpu = std::max(1, std::min(ctx.n_bands, (int)T5_MAX_GPU_BANDS));
+        std::vector<float> spectral_weights(static_cast<size_t>(nb_gpu) * 3);
+        for (int b = 0; b < nb_gpu; ++b) {
+            double wr, wg, wb;
+            band_to_display_rgb(b, ctx.n_bands, ctx.t5_freq_hz, wr, wg, wb);
+            spectral_weights[b * 3 + 0] = static_cast<float>(wr);
+            spectral_weights[b * 3 + 1] = static_cast<float>(wg);
+            spectral_weights[b * 3 + 2] = static_cast<float>(wb);
+        }
+
         T5GpuParams par{};
         par.min_geom      = (ps->cfg.t5_min_geom > 0.0f) ? ps->cfg.t5_min_geom : 1e-8f;
         par.sensor_half_w = ps->sensor_half_w;
@@ -11595,15 +11787,17 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         par.n_light_verts = n_lv;
         par.n_cam_verts   = ci_flat;
         par.sensor_res    = res;
+        par.n_bands       = nb_gpu;
 
-        fprintf(stderr, "[T5-gpu] submitting: n_cam=%u n_light=%u res=%d\n",
-                ci_flat, n_lv, res);
+        fprintf(stderr, "[T5-gpu] submitting: n_cam=%u n_light=%u res=%d n_bands=%d sweights=%zu\n",
+                ci_flat, n_lv, res, nb_gpu, sweights.size());
         fflush(stderr);
 
         gpu_pixel_result = ps->gpu_dispatch->submit_t5_connect(
             std::move(light_packed),
             std::move(cam_packed),
             std::move(pixel_accum),
+            std::move(spectral_weights),
             par);
     } else {
         /* CPU fallback: full brute-force via ThreadPool */
@@ -11694,72 +11888,53 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     ps->bdpt_t5_fired.fetch_add(1u, std::memory_order_release);
 }
 
-static void _fire_t5_if_ready(RayPipelineState* ps)
+/* t5_kpn_worker — persistent Kahn Process Network node for the T5 connection
+ * pass.  Blocks on Q_t5_ready (a single-sentinel FIFO) waiting for the GPU
+ * tracing loop to signal that both ray families have fully terminated.  When
+ * the sentinel arrives, all BDPT data is already in its queues; drain and
+ * connect.  Exits when Q_t5_ready is set_done (pipeline destroy). */
+static void t5_kpn_worker(RayPipelineState* ps)
 {
-    /* Fast pre-check without the mutex. */
-    const uint32_t flash  = ps->bdpt_flash_dispatched.load(std::memory_order_acquire);
-    const uint32_t sensor = ps->bdpt_sensor_dispatched.load(std::memory_order_acquire);
-    const uint32_t fired0 = ps->bdpt_t5_fired.load(std::memory_order_acquire);
-    if (std::min(flash, sensor) <= fired0) {
-        fprintf(stderr, "[T5-fire] SKIP pre-check: flash=%u sensor=%u t5_fired=%u min=%u\n",
-                flash, sensor, fired0, std::min(flash, sensor));
+    std::vector<int> tok;
+    while (true) {
+        tok.clear();
+        int n = ps->Q_t5_ready.pop_batch(tok, 1);   /* BLOCKS until sentinel */
+        if (n == 0) break;                           /* set_done → exit */
+        fprintf(stderr, "[T5-kpn] sentinel received — running connection pass\n");
         fflush(stderr);
-        return;
-    }
-
-    std::lock_guard<std::mutex> lk(ps->bdpt_t5_spawn_mu);
-
-    /* Re-read under the lock to avoid a TOCTOU race with a concurrent signal. */
-    const uint32_t f2 = ps->bdpt_flash_dispatched.load(std::memory_order_acquire);
-    const uint32_t s2 = ps->bdpt_sensor_dispatched.load(std::memory_order_acquire);
-    const uint32_t t2 = ps->bdpt_t5_fired.load(std::memory_order_acquire);
-    if (std::min(f2, s2) <= t2) {
-        fprintf(stderr, "[T5-fire] SKIP locked: flash=%u sensor=%u t5_fired=%u\n", f2, s2, t2);
-        fflush(stderr);
-        return;
-    }
-
-    /* Skip if a pass is already running; it will observe the updated counts
-     * through bdpt_t5_fired once it finishes, and the next signal call will
-     * re-enter this path. */
-    if (ps->bdpt_connection_running.load(std::memory_order_acquire)) {
-        fprintf(stderr, "[T5-fire] SKIP already running: flash=%u sensor=%u t5_fired=%u\n", f2, s2, t2);
-        fflush(stderr);
-        return;
-    }
-
-    fprintf(stderr, "[T5-fire] SPAWNING T5: flash=%u sensor=%u t5_fired=%u\n", f2, s2, t2);
-    fflush(stderr);
-
-    /* Join the previous T5 thread (already done if we got past the running
-     * check above) before starting a new one. */
-    if (ps->bdpt_t5_worker.joinable())
-        ps->bdpt_t5_worker.join();
-
-    ps->bdpt_t5_worker = std::thread([ps]() {
         ray_pipeline_run_bdpt_connection(ps);
-    });
+    }
+    fprintf(stderr, "[T5-kpn] worker exiting\n");
+    fflush(stderr);
 }
+
+/* ray_pipeline_signal_flash_dispatched / ray_pipeline_signal_sensor_dispatched
+ *
+ * These are FIRST-SUBMISSION markers only.  They record that a new batch of
+ * flash or sensor rays has been pushed into Q_intent for the current cycle.
+ * They carry no information about tracing completeness and never trigger T5.
+ *
+ * T5 fires exclusively from the GPU dispatch loop's timeout path, when
+ * in_flight == 0 (every ray in every bounce generation has terminated) AND
+ * both flash and sensor have been submitted ahead of the last t5_fired count.
+ * That is the only moment all subpath data is guaranteed to be in its queues. */
 
 void ray_pipeline_signal_flash_dispatched(RayPipelineState* ps)
 {
     if (!ps) return;
     const uint32_t new_flash = ps->bdpt_flash_dispatched.fetch_add(1u, std::memory_order_release) + 1u;
-    fprintf(stderr, "[T5-signal] flash_dispatched → %u  sensor=%u  t5_fired=%u\n",
+    fprintf(stderr, "[T5-latch] flash first-submission #%u  (sensor=%u t5_fired=%u) — tracing not started\n",
             new_flash,
             ps->bdpt_sensor_dispatched.load(std::memory_order_acquire),
             ps->bdpt_t5_fired.load(std::memory_order_acquire));
     fflush(stderr);
-    _fire_t5_if_ready(ps);
 }
 
 void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps)
 {
     if (!ps) return;
-    /* Only arms the latch. T5 fires from GPU T3 post-processing once sensor
-     * vertices are actually in the queue — not here at submission time. */
     const uint32_t new_sensor = ps->bdpt_sensor_dispatched.fetch_add(1u, std::memory_order_release) + 1u;
-    fprintf(stderr, "[T5-signal] sensor_dispatched → %u  flash=%u  t5_fired=%u\n",
+    fprintf(stderr, "[T5-latch] sensor first-submission #%u  (flash=%u t5_fired=%u) — tracing not started\n",
             new_sensor,
             ps->bdpt_flash_dispatched.load(std::memory_order_acquire),
             ps->bdpt_t5_fired.load(std::memory_order_acquire));
@@ -11769,11 +11944,27 @@ void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps)
 void ray_pipeline_join_t5(RayPipelineState* ps)
 {
     if (!ps) return;
-    /* Block until the current T5 worker thread (if any) has finished.
-     * Acquires bdpt_t5_spawn_mu so no new T5 can be spawned concurrently. */
-    std::lock_guard<std::mutex> lk(ps->bdpt_t5_spawn_mu);
-    if (ps->bdpt_t5_worker.joinable())
-        ps->bdpt_t5_worker.join();
+    /* Wait until T5 has actually completed a pass for this dispatch cycle.
+     *
+     * The old implementation only waited for bdpt_connection_running==false,
+     * which is also false BEFORE T5 starts.  There is a window where the
+     * sentinel has been pushed to Q_t5_ready but t5_kpn_worker hasn't yet
+     * called ray_pipeline_run_bdpt_connection (and set bdpt_connection_running).
+     * In that window the old code returned immediately — before T5 ran at all.
+     *
+     * Correct wait: t5_fired must reach min(flash_dispatched, sensor_dispatched)
+     * (the number of full cycles that should have completed) AND
+     * bdpt_connection_running must be false (not mid-pass). */
+    const uint32_t need = std::min(
+        ps->bdpt_flash_dispatched.load(std::memory_order_acquire),
+        ps->bdpt_sensor_dispatched.load(std::memory_order_acquire));
+    if (need == 0) return;  /* no families submitted yet — nothing to join */
+    for (;;) {
+        const uint32_t fired   = ps->bdpt_t5_fired.load(std::memory_order_acquire);
+        const bool     running = ps->bdpt_connection_running.load(std::memory_order_acquire);
+        if (fired >= need && !running) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
 }
 
 /* CIE-approximate spectral locus: band index → linear RGB weights.
@@ -11815,6 +12006,11 @@ void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n)
     if (!ps) return;
     ps->cfg.t5_light_batch_size = n;
     if (ps->gpu_dispatch) ps->gpu_dispatch->t5_light_batch_size = n;
+}
+
+void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v)
+{
+    if (ps && ps->gpu_dispatch) ps->gpu_dispatch->force_cpu_t5 = v;
 }
 
 void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType type,

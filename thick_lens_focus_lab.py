@@ -418,6 +418,82 @@ def _make_dispersive_lens_bands(
     return bands
 
 
+def _synth_spectral_bands_from_rgb(
+    sidecar: "FreeFrequencySidecar",
+    albedo_rgb: Sequence[float],
+    roughness: float,
+    metallic: float,
+    ior: float = 1.0,
+    transmittance: float = 0.0,
+) -> "List[SpectralBand]":
+    """Synthesize wavelength-dependent SpectralBand list from PBR parameters.
+
+    Opaque path (transmittance == 0 and ior ≈ 1.0):
+      Each band's reflectance = dot(albedo_rgb, w_rgb(λ)) so red objects
+      reflect in red bands, blue in blue bands, etc.  Metallic surfaces
+      get a luminance boost; ior_imag carries a crude extinction term.
+
+    Transmissive path (transmittance > 0 or ior meaningfully != 1.0):
+      Models glass or transparent plastic.  Per-band transmittance is
+      chromatically weighted by the albedo so a blue-tinted acrylic
+      transmits blue wavelengths more than red.  Reflectance is the flat
+      Fresnel term at normal incidence: R₀ = ((n-1)/(n+1))².  diffuse_frac
+      is 0 so the shader routes into the Snell/Fresnel branch, not diffuse.
+    """
+    freq_hz = sidecar.freq_hz
+    bw_hz = _sidecar_bandwidths(freq_hz)
+    wl_nm = np.clip(C_LIGHT / np.maximum(freq_hz, EPS) * 1.0e9, 380.0, 700.0)
+    w_rgb = _wavelength_to_rgb_weights(wl_nm)  # (n_bands, 3)
+
+    ar = float(albedo_rgb[0])
+    ag = float(albedo_rgb[1])
+    ab = float(albedo_rgb[2])
+
+    is_transmissive = transmittance > 0.01
+
+    if is_transmissive:
+        # Flat Fresnel reflectance at normal incidence
+        r0 = float(((ior - 1.0) / (ior + 1.0)) ** 2)
+        reflectances = np.full(len(freq_hz), r0, dtype=np.float64)
+
+        # Chromatically weighted transmittance: albedo_rgb tints which wavelengths
+        # pass through.  A spectrally flat (white) tint gives flat transmittance.
+        chroma = w_rgb[:, 0] * ar + w_rgb[:, 1] * ag + w_rgb[:, 2] * ab
+        chroma_max = float(chroma.max()) if chroma.max() > 1e-12 else 1.0
+        transmittances = transmittance * (chroma / chroma_max)
+        transmittances = np.clip(transmittances, 0.0, 1.0 - reflectances)
+
+        diffuse_frac = 0.0  # pure specular/refractive — Snell branch handles it
+        ior_real = float(ior)
+        ior_imag = 0.0
+    else:
+        reflectances = w_rgb[:, 0] * ar + w_rgb[:, 1] * ag + w_rgb[:, 2] * ab
+        if metallic > 0.0:
+            lum = 0.2126 * ar + 0.7152 * ag + 0.0722 * ab
+            reflectances = reflectances + metallic * np.maximum(0.0, lum - reflectances)
+        reflectances = np.clip(reflectances, 0.0, 1.0)
+        transmittances = np.zeros_like(reflectances)
+
+        diffuse_frac = float(np.clip((1.0 - metallic) * roughness, 0.0, 1.0))
+        ior_real = 1.0
+        ior_imag = float(metallic * 2.0)
+
+    bands: List[SpectralBand] = []
+    for f, bw, r, t in zip(freq_hz, bw_hz, reflectances, transmittances):
+        bands.append(SpectralBand(
+            center_hz=float(f),
+            bandwidth_hz=float(bw),
+            reflectance=float(r),
+            transmittance=float(t),
+            diffuse_frac=diffuse_frac,
+            emission=0.0,
+            reemission=0.0,
+            ior_real=ior_real,
+            ior_imag=ior_imag,
+        ))
+    return bands
+
+
 def _orient_surface_patch_outward(
     tri_arr: np.ndarray,
     tri_ids: Sequence[int],
@@ -1662,6 +1738,7 @@ def _import_subject_scene(
     mats: List[int],
     source_tri_ids: List[int],
     object_tri_ids: List[int],
+    sidecar: Optional["FreeFrequencySidecar"] = None,
 ) -> Dict[int, Tuple[int, int]]:
     """Import the reusable orbiter/saddle demo as the subject in front of the camera.
 
@@ -1702,6 +1779,37 @@ def _import_subject_scene(
         if old_i < 0:
             continue
         material = subject_db._materials[name]
+        # Plain dicts (from test_basic_gl_cpp_window etc.) have no effective_bands()
+        # method, so _fill_spectral leaves their SSBO data zeroed.  Zeroed ior_real=0
+        # makes the shader classify them as transmissive (|0−1|>1e-6), turning them
+        # invisible.  Convert dicts to Material objects with wavelength-dependent
+        # reflectance synthesised from albedo_rgb so the BDPT pipeline sees colour.
+        if isinstance(material, dict) and not hasattr(material, "effective_bands"):
+            albedo = material.get("albedo_rgb", material.get("albedo", [0.5, 0.5, 0.5]))
+            roughness = float(material.get("roughness", 0.5))
+            metallic = float(material.get("metallic", 0.0))
+            ior = float(material.get("ior", 1.0))
+            transmission = float(material.get("transmission", 0.0))
+            emit_rgb = material.get("emission_rgb", [0.0, 0.0, 0.0])
+            existing_bands = material.get("spectral_bands", [])
+            if not existing_bands and sidecar is not None:
+                synth_bands = _synth_spectral_bands_from_rgb(
+                    sidecar, albedo, roughness, metallic,
+                    ior=ior, transmittance=transmission,
+                )
+            else:
+                synth_bands = list(existing_bands)
+            material = Material(
+                name=name,
+                domain="em_optical",
+                albedo=[float(albedo[0]), float(albedo[1]), float(albedo[2])],
+                roughness=roughness,
+                metallic=metallic,
+                emission_rgb=[float(emit_rgb[0]), float(emit_rgb[1]), float(emit_rgb[2])],
+                ior=ior,
+                transmission=transmission,
+                spectral_bands=synth_bands,
+            )
         new_i = db.register(f"subject_{name}", material)
         old_to_new[old_i] = int(new_i)
         emission = np.asarray(
@@ -3108,7 +3216,7 @@ def _build_scene_mesh(
             tri_ids=silver_wall_tri_ids,
         )
     else:
-        _subject_group_tri_map = _import_subject_scene(scene, db, tris, mats, source_tri_ids, object_tri_ids)
+        _subject_group_tri_map = _import_subject_scene(scene, db, tris, mats, source_tri_ids, object_tri_ids, sidecar)
     _iris = getattr(scene, "iris_aperture", None)
     _iris_active = _iris is not None and getattr(_iris, "enabled", False)
     if _iris_active:
@@ -5925,27 +6033,13 @@ class ForwardCppLensBench:
             base_ids[~is_bwd] = np.arange(start, start + n_fwd, dtype=np.uint32)
             self._async_bdpt_next_segment_subpath = start + n_fwd
 
-        # ── drain BdptPdfRecord from C++ and build a join table ───────────────
-        # Key: (subpath_id << 16) | vertex_index  (vertex_index == bounce at
-        # the scatter site).  Records not in the current batch get 0.0, which
-        # is correct for the camera launch vertex that has no scatter PDF.
+        # NOTE: do NOT drain_bdpt_pdfs() here.  C++ T5/MIS owns that queue
+        # and reads it after tracing completes.  Consuming it from Python during
+        # the live drain loop starves the MIS density table and produces a dark
+        # or flat BDPT image.  Leave the PDF join maps empty; the diagnostic
+        # segment records will have pdf_fwd/rev = 0.0, which is acceptable.
         _pdf_fwd_map: dict[int, float] = {}
         _pdf_rev_map: dict[int, float] = {}
-        try:
-            _pdf_chunks = []
-            while True:
-                _chunk = self.tracer.drain_bdpt_pdfs()
-                if _chunk.size == 0:
-                    break
-                _pdf_chunks.append(_chunk.reshape(-1))
-            if _pdf_chunks:
-                _pr = np.concatenate(_pdf_chunks).view(BDPT_PDF_RECORD_DTYPE)
-                for _i in range(len(_pr)):
-                    _k = int(_pr["subpath_id"][_i]) << 16 | int(_pr["vertex_index"][_i])
-                    _pdf_fwd_map[_k] = float(_pr["pdf_fwd"][_i])
-                    _pdf_rev_map[_k] = float(_pr["pdf_rev"][_i])
-        except Exception:
-            pass
 
         rows = np.empty(int(ev_rel.size), dtype=BDPT_SEGMENT_DTYPE)
         rows["subpath_id"] = base_ids[ev_rel]
@@ -8142,6 +8236,7 @@ def run(
     neural_payload_out: str = "",
     parametric: bool = False,
     t5_light_batch: int = 0,
+    no_gpu_t5: bool = False,
 ) -> None:
     try:
         from OpenGL.GL import (
@@ -8257,6 +8352,9 @@ def run(
     if _t5_light_batch > 0:
         bench.tracer.set_t5_light_batch_size(_t5_light_batch)
         print(f"[t5] light batch {_t5_light_batch:_} verts/dispatch", flush=True)
+    if no_gpu_t5:
+        bench.tracer.set_force_cpu_t5(True)
+        print("[t5] GPU T5 disabled — using CPU run_t5_allpairs()", flush=True)
 
     print(f"[bench] tris={bench.n_tris}  bands={bench.n_bands}  "
           f"view={view_w}x{view_h}  sensor_amp_gain={bench.sensor_amp_gain}  "
@@ -8971,8 +9069,10 @@ def run(
 
     def draw_pip() -> None:
         def _rot180(arr: np.ndarray) -> np.ndarray:
-            """180° rotation = flip both axes (sensor-view correction)."""
-            return np.ascontiguousarray(arr[::-1, ::-1], dtype=np.float32)
+            """X-axis flip only: C++ get_sensor_image() already Y-flips for OpenGL
+            convention, and optical physics applies a 180° rotation on the sensor.
+            Combined: Y-flip (display) + Y-flip (physics) cancel → net X-flip only."""
+            return np.ascontiguousarray(arr[:, ::-1], dtype=np.float32)
 
         # ── Pos 0 (leftmost): forward ray strikes — projection map, no rotation ─
         fwd_img = bench.get_forward_strike_image()
@@ -10063,6 +10163,11 @@ def run(
 
             # Re-trigger T5 with the complete endpoint set.
             # Snapshot sensor_accum NOW — before T5 — to capture direct lighting only.
+            # This is the cheap geometric pass: T1 forward rays that physically reached
+            # the sensor plate, and T3 backward sensor rays that landed on emissive
+            # surfaces in one bounce.  No material BRDFs, no MIS, no BDPT connections.
+            # It will be dim/empty when direct single-bounce paths to the sensor are
+            # geometrically rare (e.g. closed tube optics) — that is correct behaviour.
             _direct_img: Optional[np.ndarray] = None
             try:
                 _di = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
@@ -10070,27 +10175,32 @@ def run(
                     _direct_img = np.ascontiguousarray(np.clip(_di[:, :, :3], 0.0, 1.0), dtype=np.float32)
                     bench._last_direct_img = _direct_img
                     _lit_d = int(np.count_nonzero(np.sum(_direct_img, axis=2) > 1e-8))
-                    print(f"[exposure] direct-lighting snapshot: lit_px={_lit_d}", flush=True)
+                    print(f"[exposure] direct-lighting snapshot (pre-T5): lit_px={_lit_d}", flush=True)
             except Exception as _di_exc:
                 print(f"[exposure] direct-lighting snapshot failed: {_di_exc}", flush=True)
 
             try:
-                bench.tracer.signal_sensor_dispatched()
-                bench.tracer.signal_flash_dispatched()
-                print("[exposure] T5 re-trigger fired — joining T5 thread…", flush=True)
+                print("[exposure] joining T5 thread…", flush=True)
                 bench.tracer.join_t5()
-                print("[exposure] T5 re-trigger done", flush=True)
+                print("[exposure] T5 join done", flush=True)
             except Exception as _t5exc:
-                print(f"[exposure] T5 re-trigger failed: {_t5exc}", flush=True)
+                print(f"[exposure] T5 join failed: {_t5exc}", flush=True)
 
-            # Refresh sensor plate now that T5 has written.
+            # Refresh sensor plate now that T5 has written its full BDPT connections
+            # (balance-heuristic MIS, GGX BRDF from material cache, spectral beta,
+            # optical Jacobians, prefix-PDF chains).  This is the proper BDPT result.
+            _t5_lit_px = 0
             try:
                 _final_img = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
                 if _final_img.ndim == 3 and _final_img.shape[2] >= 3 and _final_img.shape[0] > 0:
                     bench._last_bdpt_plate_rgb = np.ascontiguousarray(
                         np.clip(_final_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
-                    _lit = int(np.count_nonzero(np.sum(_final_img[:, :, :3], axis=2) > 1e-8))
-                    print(f"[exposure] sensor image refreshed: lit_px={_lit}", flush=True)
+                    _t5_lit_px = int(np.count_nonzero(np.sum(_final_img[:, :, :3], axis=2) > 1e-8))
+                    _t5_lit_frac = float(_t5_lit_px) / float(max(1, _final_img.shape[0] * _final_img.shape[1]))
+                    # Backfill connection stats so the green pip HUD reflects T5 output.
+                    bench.bdpt_last_connection_stats["lit_pixels"] = _t5_lit_px
+                    bench.bdpt_last_connection_stats["lit_fraction"] = _t5_lit_frac
+                    print(f"[exposure] sensor image refreshed (post-T5 BDPT): lit_px={_t5_lit_px}", flush=True)
             except Exception as _img_exc:
                 print(f"[exposure] sensor image refresh failed: {_img_exc}", flush=True)
 
@@ -10111,7 +10221,8 @@ def run(
                 f"  scene_t={_t_scene:.4f}s"
                 f"  fwd_endpoints={_fwd:_}"
                 f"  bwd_strikes={_bwd:_}"
-                f"  connections={int(_final_stats.get('exact_snaps', 0)):_}"
+                f"  t5_lit={_t5_lit_px:_}"
+                f"  t3_snaps={int(_final_stats.get('exact_snaps', 0)):_}"
                 f"  near_miss={int(_final_stats.get('near_miss_count', 0)):_}"
                 f"  overflow={int(_final_overflow.get('connections', 0)):_}",
                 flush=True,
@@ -10271,6 +10382,8 @@ def run(
         new_bench.compute_mode         = str(compute_mode)
         if _t5_light_batch > 0:
             new_bench.tracer.set_t5_light_batch_size(_t5_light_batch)
+        if no_gpu_t5:
+            new_bench.tracer.set_force_cpu_t5(True)
         if _gl_display_hglrc:
             if _gl_display_hdc:
                 new_bench.tracer.set_gl_display_hdc(_gl_display_hdc)
@@ -11035,6 +11148,15 @@ if __name__ == "__main__":
             "Example: --t5-light-batch 2048"
         ),
     )
+    _ap.add_argument(
+        "--no-gpu-t5",
+        action="store_true",
+        help=(
+            "Force CPU run_t5_allpairs() for the BDPT connection pass, "
+            "bypassing the GPU t5_full_connect.comp.glsl shader. "
+            "Use for A/B comparison against the GPU path."
+        ),
+    )
     _args = _ap.parse_args()
     if _args.uv_smoke_exit:
         raise SystemExit(run_uv_smoke(
@@ -11065,4 +11187,5 @@ if __name__ == "__main__":
         neural_payload_out=_args.neural_payload_out,
         parametric=bool(_args.parametric),
         t5_light_batch=int(_args.t5_light_batch),
+        no_gpu_t5=bool(_args.no_gpu_t5),
     )

@@ -558,6 +558,7 @@ struct PyRayTracer
     /* T5 connection config */
     float    _t5_min_geom          = 1e-8f;
     uint32_t _t5_light_batch_size  = 0;
+    bool     _force_cpu_t5         = false;
 
     /* Flash modifier config */
     int   _flash_modifier_type   = static_cast<int>(FlashModifierType::SNOOT);
@@ -606,6 +607,8 @@ struct PyRayTracer
                 ray_pipeline_set_uv_blit_weights(
                     _pipeline, _uv_blit_weights.data(),
                     _uv_blit_n_bands, _uv_blit_mode);
+            if (_force_cpu_t5)
+                ray_pipeline_set_force_cpu_t5(_pipeline, true);
         }
         return _pipeline;
     }
@@ -1987,7 +1990,7 @@ struct PyRayTracer
      *   float32 numpy array of shape (n, REFINED_HIT_STRIDE) using the layout
      *   defined in ray_material.comp.glsl.
      *
-     *   REFINED_HIT_STRIDE = 27 + 2*MAX_BANDS  (MAX_BANDS = 16 -> stride = 59)
+     *   REFINED_HIT_STRIDE = 27 + 2*MAX_BANDS  (MAX_BANDS = 32 -> stride = 91)
      *   row[58] carries bdpt_subpath_id as uintBitsToFloat.
      *
      *   Returns shape (0,) when the queue is empty.
@@ -1997,12 +2000,12 @@ struct PyRayTracer
      *   produced by the GPU T3 shader — and feeds each record back into the
      *   pipeline as a new child RayIntent.
      *
-     *   INTENT_STRIDE = 20 + 2*MAX_BANDS  (stride = 52)
+     *   INTENT_STRIDE = 20 + 2*MAX_BANDS  (stride = 84)
      *
      * Together these two methods allow Python to intercept the T3 stage and
      * run the GPU shader instead of the C++ worker, or to hybridise. */
 
-    static constexpr int _GPU_MAX_BANDS     = 16;
+    static constexpr int _GPU_MAX_BANDS     = 32;
     static constexpr int _REFINED_HIT_STRIDE = 27 + 2 * _GPU_MAX_BANDS;  /* 59 */
     static constexpr int _INTENT_STRIDE      = 20 + 2 * _GPU_MAX_BANDS;  /* 52 */
 
@@ -2096,7 +2099,7 @@ struct PyRayTracer
     }
 
     /* Feed GPU-processed child intents back into the pipeline.
-     * buf: float32 array of shape (n, INTENT_STRIDE=52).
+     * buf: float32 array of shape (n, INTENT_STRIDE=84).
      * Each row is decoded into a RayIntent and pushed to Q_intent. */
     void submit_intents_flat(py::array_t<float, py::array::c_style> buf) {
         auto* pl = _get_pipeline();
@@ -2361,6 +2364,11 @@ struct PyRayTracer
     void set_t5_light_batch_size(uint32_t n) {
         _t5_light_batch_size = n;
         if (_pipeline) ray_pipeline_set_t5_light_batch_size(_pipeline, n);
+    }
+
+    void set_force_cpu_t5(bool v) {
+        _force_cpu_t5 = v;
+        if (_pipeline) ray_pipeline_set_force_cpu_t5(_pipeline, v);
     }
 
     void stop_pipeline() {
@@ -5573,6 +5581,11 @@ R"doc(Set the number of light vertices processed per T5 GPU dispatch (default 20
 Larger values reduce dispatch overhead and improve GPU utilisation; derive from
 --t5-vram-mb as n = vram_mb * 1024^2 / 48 (12 floats × 4 bytes per light vert).
 Safe to call before or after pipeline creation.)doc")
+        .def("set_force_cpu_t5",
+             &PyRayTracer::set_force_cpu_t5,
+             py::arg("v"),
+R"doc(When True, skip the GPU T5 full-connect shader and fall back to CPU run_t5_allpairs().
+Use --no-gpu-t5 to pass this at startup for A/B comparison against the GPU path.)doc")
         .def("set_flash_modifier",
              &PyRayTracer::set_flash_modifier,
              py::arg("type_int"),

@@ -605,6 +605,9 @@ inline void run_t5_allpairs(
     ctx.hb_total = n_cam;
     ctx.hb_done.store(0, std::memory_order_relaxed);
 
+    /* Heartbeat: only reads the atomic hb_done progress counter while workers
+     * are live.  Reading sensor_r/g/b or exact_count while workers write them
+     * is a data race — those are only safe to read after futures join. */
     std::atomic<bool> hb_stop{false};
     auto hb_fut = std::async(std::launch::async, [&]() {
         using namespace std::chrono_literals;
@@ -613,23 +616,7 @@ inline void run_t5_allpairs(
             if (hb_stop.load(std::memory_order_relaxed)) break;
             const size_t done  = ctx.hb_done.load(std::memory_order_relaxed);
             const size_t total = ctx.hb_total;
-            /* Eigen::Map::sum() is SIMD-vectorized — no scalar loop needed. */
-            double   energy = 0.0;
-            uint64_t exact  = 0;
-            for (const auto& a : accums) {
-                if (!a.sensor_r.empty()) {
-                    energy +=
-                        Eigen::Map<const Eigen::ArrayXd>(
-                            a.sensor_r.data(), (Eigen::Index)a.sensor_r.size()).sum()
-                      + Eigen::Map<const Eigen::ArrayXd>(
-                            a.sensor_g.data(), (Eigen::Index)a.sensor_g.size()).sum()
-                      + Eigen::Map<const Eigen::ArrayXd>(
-                            a.sensor_b.data(), (Eigen::Index)a.sensor_b.size()).sum();
-                }
-                exact += a.exact_count;
-            }
-            fprintf(stderr, "[T5-hb] allpairs %zu/%zu  energy=%.3e  exact=%llu\n",
-                    done, total, energy, (unsigned long long)exact);
+            fprintf(stderr, "[T5-hb] allpairs %zu/%zu\n", done, total);
             fflush(stderr);
         }
     });
@@ -691,6 +678,26 @@ inline void run_t5_allpairs(
     }
     hb_stop.store(true, std::memory_order_relaxed);
     hb_fut.get();
+    /* All worker futures have joined — safe to read accumulator data now. */
+    {
+        double   energy = 0.0;
+        uint64_t exact  = 0;
+        for (const auto& a : accums) {
+            if (!a.sensor_r.empty()) {
+                energy +=
+                    Eigen::Map<const Eigen::ArrayXd>(
+                        a.sensor_r.data(), (Eigen::Index)a.sensor_r.size()).sum()
+                  + Eigen::Map<const Eigen::ArrayXd>(
+                        a.sensor_g.data(), (Eigen::Index)a.sensor_g.size()).sum()
+                  + Eigen::Map<const Eigen::ArrayXd>(
+                        a.sensor_b.data(), (Eigen::Index)a.sensor_b.size()).sum();
+            }
+            exact += a.exact_count;
+        }
+        fprintf(stderr, "[T5-allpairs] done  energy=%.3e  exact=%llu\n",
+                energy, (unsigned long long)exact);
+        fflush(stderr);
+    }
     if (ep) std::rethrow_exception(ep);
 }
 

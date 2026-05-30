@@ -652,6 +652,10 @@ class CameraLightBurstConfig:
     energy_scale: float = 4.0
     duty_cycle: float = 1.0
     profile: str = "steady"
+    # When > 0, overrides bench.uv_emitter_rays: use UV-stratified Halton
+    # origin sampling on the emitter surface instead of C++ stochastic sampling.
+    # Pure density knob — energy is unchanged (amp = emitter_amp_gain / sqrt(N)).
+    uv_emitter_rays: int = 4_000
 
 
 @dataclass
@@ -4370,6 +4374,12 @@ class ForwardCppLensBench:
     sidecar: FreeFrequencySidecar | None = None
     field_capture: bool = True
     enable_uv_splat: bool = True
+    # When > 0, the emissive-triangle forward launch uses a UV-stratified
+    # low-discrepancy origin grid instead of pure stochastic C++ sampling.
+    # Total ray count = uv_emitter_rays (not per-triangle); amplitude per ray
+    # is scaled by 1/sqrt(uv_emitter_rays) so that the total optical power
+    # (∑|amp|²) remains equal to emitter_amp_gain² regardless of ray count.
+    uv_emitter_rays: int = 4_000
 
     def __post_init__(self) -> None:
         self._trace_lock = threading.Lock()
@@ -4926,6 +4936,137 @@ class ForwardCppLensBench:
             uv[:, :, 1] = np.clip((b - bmin) / bspan, 0.0, 1.0).astype(np.float32)
         return np.ascontiguousarray(uv, dtype=np.float32)
 
+    def _build_uv_stratified_emitter_rays(
+        self,
+        n_total: int,
+        seed: int,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Generate UV-stratified forward rays from the emissive source triangles.
+
+        Origins are drawn from a Halton(2,3) low-discrepancy sequence folded onto
+        each triangle's area via the standard barycentric parameterisation
+        (fold the u+v>1 half so the full triangle is covered without bias).
+        Directions are cosine-weighted about the outward triangle normal, also
+        using a Halton(5,7) sequence for the hemisphere sample.
+
+        Amplitude per ray (complex128, per-band) is scaled so that the total
+        optical power is invariant to n_total:
+
+            amp_per_ray = emitter_amp_gain / sqrt(n_total)
+            ∑|amp|² = n_total × (emitter_amp_gain/√n_total)² = emitter_amp_gain²
+
+        Returns
+        -------
+        origins     : (n_total, 3) float64 — ray start points
+        directions  : (n_total, 3) float64 — unit cosine-hemisphere directions
+        amplitudes  : (n_total, n_bands) complex128 — per-ray, per-band amplitude
+        """
+        src_ids = self.source_tri_ids          # emitter (not red-probe) triangles
+        n_src = int(src_ids.size)
+        if n_src == 0 or n_total <= 0:
+            z = np.zeros((0, 3), dtype=np.float64)
+            za = np.zeros((0, self.n_bands), dtype=np.complex128)
+            return z, z, za
+
+        verts = self.tri_vertices[src_ids]     # (N_src, 3, 3) float64
+        e0 = verts[:, 1, :] - verts[:, 0, :]  # (N_src, 3)
+        e1 = verts[:, 2, :] - verts[:, 0, :]
+        cross = np.cross(e0, e1)               # (N_src, 3)
+        double_area = np.linalg.norm(cross, axis=1)                  # (N_src,)
+        area = 0.5 * double_area
+        normals = cross / np.maximum(double_area[:, None], 1.0e-30)  # (N_src, 3) unit
+
+        # Distribute n_total rays across triangles proportional to area.
+        total_area = float(np.sum(area))
+        if total_area < 1.0e-30:
+            counts = np.ones(n_src, dtype=np.int64) * (n_total // n_src)
+            counts[:n_total % n_src] += 1
+        else:
+            frac = area / total_area
+            counts = np.floor(frac * n_total).astype(np.int64)
+            deficit = int(n_total) - int(counts.sum())
+            if deficit > 0:
+                # Assign leftover rays to triangles with the largest fractional part.
+                frac_part = frac * n_total - np.floor(frac * n_total)
+                top = np.argsort(frac_part)[::-1][:deficit]
+                counts[top] += 1
+
+        n_actual = int(counts.sum())
+
+        # --- Halton low-discrepancy sequence helpers ----------------------
+        def _halton_seq(n: int, base: int, offset: int) -> np.ndarray:
+            """Return n Halton samples in [0,1) for the given base, shifted by offset."""
+            idx = np.arange(offset, offset + n, dtype=np.int64)
+            result = np.zeros(n, dtype=np.float64)
+            f = 1.0
+            i = idx.copy()
+            while np.any(i > 0):
+                f /= base
+                result += f * (i % base)
+                i //= base
+            return result
+
+        # Seed offset derived from seed for reproducibility across calls.
+        rng = np.random.default_rng(int(seed))
+        h_offset = int(rng.integers(0, 1 << 24))
+
+        origins_l: list = []
+        dirs_l: list = []
+        ray_flat = 0
+
+        for ti in range(n_src):
+            n_ti = int(counts[ti])
+            if n_ti <= 0:
+                continue
+
+            # UV origins on triangle — Halton(2,3), folded for full coverage.
+            u = _halton_seq(n_ti, 2, h_offset + ray_flat)
+            v = _halton_seq(n_ti, 3, h_offset + ray_flat)
+            fold = (u + v) > 1.0
+            u = np.where(fold, 1.0 - u, u)
+            v = np.where(fold, 1.0 - v, v)
+            o = verts[ti, 0, :] + u[:, None] * e0[ti, :] + v[:, None] * e1[ti, :]  # (n_ti, 3)
+
+            # Cosine-hemisphere directions — Halton(5,7).
+            r1 = _halton_seq(n_ti, 5, h_offset + ray_flat)
+            r2 = _halton_seq(n_ti, 7, h_offset + ray_flat)
+            cos_t = np.sqrt(np.maximum(0.0, r1))          # Lambertian PDF ∝ cos θ
+            sin_t = np.sqrt(np.maximum(0.0, 1.0 - r1))
+            phi = (2.0 * math.pi) * r2
+            lx = sin_t * np.cos(phi)
+            ly = sin_t * np.sin(phi)
+            lz = cos_t
+
+            # Build local ONB around outward normal.
+            n_hat = normals[ti]
+            ref = np.array([1.0, 0.0, 0.0], dtype=np.float64) if abs(n_hat[2]) > 0.9 else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            tx = np.cross(ref, n_hat)
+            tx_norm = float(np.linalg.norm(tx))
+            if tx_norm < 1.0e-12:
+                ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+                tx = np.cross(ref, n_hat)
+                tx_norm = float(np.linalg.norm(tx))
+            tx /= max(tx_norm, 1.0e-30)
+            ty = np.cross(n_hat, tx)
+
+            d = lx[:, None] * tx[None, :] + ly[:, None] * ty[None, :] + lz[:, None] * n_hat[None, :]
+            d_norm = np.linalg.norm(d, axis=1, keepdims=True)
+            d /= np.maximum(d_norm, 1.0e-30)
+
+            origins_l.append(o)
+            dirs_l.append(d)
+            ray_flat += n_ti
+
+        origins = np.ascontiguousarray(np.concatenate(origins_l, axis=0) if origins_l else np.zeros((0, 3), dtype=np.float64), dtype=np.float64)
+        directions = np.ascontiguousarray(np.concatenate(dirs_l, axis=0) if dirs_l else np.zeros((0, 3), dtype=np.float64), dtype=np.float64)
+
+        # Power-compensated amplitude: amp_per_ray = gain / sqrt(n_actual)
+        # so that n_actual × |amp|² = gain², preserving total optical power.
+        amp_val = float(self.emitter_amp_gain) / math.sqrt(max(1, n_actual))
+        amplitudes = np.full((n_actual, self.n_bands), complex(amp_val, 0.0), dtype=np.complex128)
+
+        return origins, directions, amplitudes
+
     def _build_uv_page_bank(self) -> None:
         bank = UvPageBank(self.n_bands, res=UV_PAGE_RES_DEFAULT, hot_limit=UV_HOT_GROUP_LIMIT_DEFAULT)
         bank.add("emitters", "emitter", self.source_tri_ids, self._uv_coords_for_tri_ids(self.source_tri_ids, "yz"))
@@ -5379,6 +5520,21 @@ class ForwardCppLensBench:
             return max(1, int(requested))
         return max(1, int(requested), int(getattr(burst, "rays_per_emitter", 64)))
 
+    def _uv_emitter_ray_count(self) -> int:
+        """Return the active UV-stratified emitter ray count.
+
+        Priority order (highest wins):
+          1. scene.camera_light_burst.uv_emitter_rays — flash burst config
+          2. self.uv_emitter_rays                    — bench-level manual override
+          3. 0 → fall through to stochastic C++ path
+        """
+        burst = getattr(self.scene, "camera_light_burst", None)
+        if burst is not None and bool(getattr(burst, "enabled", True)):
+            burst_n = int(getattr(burst, "uv_emitter_rays", 0))
+            if burst_n > 0:
+                return burst_n
+        return int(getattr(self, "uv_emitter_rays", 0))
+
     def _emitter_interaction_target(self) -> Tuple[float, float, float, float]:
         obj = self.scene.object_plane
         subject_r = float(max(
@@ -5487,6 +5643,41 @@ class ForwardCppLensBench:
                 else:
                     _mp0 = _mp1 = 0.0
                 self.tracer.set_flash_modifier(_mtype, _mp0, _mp1)
+
+            # UV-stratified emitter launch: structured Halton-sequence origins
+            # on the emissive surface with power-compensated amplitude per ray,
+            # submitted via submit_rays() exactly like bake_origins training rays
+            # but non-blocking.  Bypasses C++ stochastic emissive sampling.
+            uv_n = self._uv_emitter_ray_count()
+            if uv_n > 0:
+                uv_origins, uv_dirs, uv_amps = self._build_uv_stratified_emitter_rays(uv_n, int(seed))
+                n_uv = int(uv_origins.shape[0])
+                if n_uv > 0:
+                    _src_ids_uv = np.zeros(n_uv, dtype=np.int32)
+                    _tag_arr_uv = np.arange(n_uv, dtype=np.uint64)
+                    _cflag_uv   = np.zeros(n_uv, dtype=np.uint8)
+                    if self.cull_infinite_rays:
+                        uv_origins, uv_dirs, uv_amps, _src_ids_uv, _cflag_uv, _tag_arr_uv = _cull_finite_rays(
+                            uv_origins, uv_dirs, uv_amps, _src_ids_uv, _cflag_uv, _tag_arr_uv, label="uv_fwd")
+                    self.tracer.submit_rays(
+                        origins=np.ascontiguousarray(uv_origins),
+                        directions=np.ascontiguousarray(uv_dirs),
+                        amplitudes=np.ascontiguousarray(uv_amps),
+                        src_ids=np.ascontiguousarray(_src_ids_uv),
+                        tags=None,
+                        color_flags=np.ascontiguousarray(_cflag_uv),
+                        max_bounces=int(max_bounces),
+                        min_amplitude=float(self._min_amplitude),
+                        max_children=1,
+                        seed=int(seed),
+                        use_gpu_compute=_use_gpu,
+                        gpu_all_stages=_all_gpu,
+                        shader_dir=_SHADER_DIR,
+                    )
+                    self.tracer.signal_flash_dispatched()
+                    self._ensure_drain_loop()
+                    return n_uv
+
             submitted = int(self.tracer.submit_emissive_triangles(
                 self._emitter_tri_ids_i32,
                 n_rays,

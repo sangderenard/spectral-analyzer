@@ -7445,6 +7445,18 @@ struct RayPipelineState {
     std::vector<BdptPdfRecord>              bdpt_pending_pdfs;
     std::vector<BdptOpticalEventRecord>     bdpt_pending_optical;
 
+    /* ── Sensor-batching light-record stash ───────────────────────────────
+     * When bdpt_batching_mode is true, run_bdpt_connection() saves the
+     * light-stream records from the first T5 pass here so subsequent sensor
+     * batches can reuse the same flash light field without re-firing flash.
+     * Cleared by ray_pipeline_end_sensor_batching() at exposure end. */
+    bool                                    bdpt_batching_mode{false};
+    std::mutex                              bdpt_stash_mu;
+    std::vector<BdptVertexRecord>           bdpt_stash_v;
+    std::vector<BdptSpectralWeightRecord>   bdpt_stash_sw;
+    std::vector<BdptPdfRecord>              bdpt_stash_pdf;
+    std::vector<BdptOpticalEventRecord>     bdpt_stash_opt;
+
     /* Overflow counters — incremented when a side queue is full.
      * Never wraps: saturate at UINT64_MAX. */
     std::atomic<uint64_t>     bdpt_overflow_vertices{0};
@@ -7656,8 +7668,9 @@ public:
     int      cap_t5_cam          = 0;  /* floats */
     int      cap_t5_pix          = 0;  /* uint32 */
     int      cap_t5_spectral     = 0;  /* floats */
-    uint32_t t5_light_batch_size = 0;  /* 0 = use default 20480 */
-    bool     force_cpu_t5        = false; /* --no-gpu-t5: bypass prog_t5, use CPU allpairs */
+    uint32_t t5_light_batch_size  = 0;  /* 0 = use default 4096  */
+    uint32_t t5_sensor_tile_size  = 0;  /* 0 = use default 128   */
+    bool     force_cpu_t5         = false; /* --no-gpu-t5: bypass prog_t5, use CPU allpairs */
 
     /* ── T5 GPU job queue ─────────────────────────────────────────────── *
      * The BDPT connection thread submits a job and blocks on the future;  *
@@ -7665,7 +7678,7 @@ public:
     struct T5Job {
         std::vector<float>    light_verts;      /* flat, T5_LGV_STRIDE each   */
         std::vector<float>    cam_verts;        /* flat, T5_CGV_STRIDE each   */
-        std::vector<uint32_t> pixel_accum;      /* 3 × res², zeroed           */
+        std::vector<uint32_t> pixel_accum;      /* unused — service_t5_job allocates per-tile */
         std::vector<float>    spectral_weights; /* n_bands × 3 (wr, wg, wb)   */
         T5GpuParams           params;
         std::promise<std::vector<uint32_t>> promise;
@@ -7964,7 +7977,8 @@ public:
         if (cfg.gpu_batch_size_t3 > 0) ps.stats[2].batch_sz_gpu.store(cfg.gpu_batch_size_t3, std::memory_order_relaxed);
         if (cfg.gpu_batch_size_t4 > 0) ps.stats[3].batch_sz_gpu.store(cfg.gpu_batch_size_t4, std::memory_order_relaxed);
         if (cfg.gpu_batch_size_t5 > 0) ps.stats[4].batch_sz_gpu.store(cfg.gpu_batch_size_t5, std::memory_order_relaxed);
-        if (cfg.t5_light_batch_size > 0) t5_light_batch_size = cfg.t5_light_batch_size;
+        if (cfg.t5_light_batch_size  > 0) t5_light_batch_size  = cfg.t5_light_batch_size;
+        if (cfg.t5_sensor_tile_size  > 0) t5_sensor_tile_size  = cfg.t5_sensor_tile_size;
 
         /* Apply pinned GPU fractions (if non-zero in config) */
         if (cfg.gpu_fraction_t1 > 0.0f) ps.stats[0].set_gpu_fraction(cfg.gpu_fraction_t1);
@@ -9313,14 +9327,16 @@ public:
 
         const auto& lv  = job->light_verts;
         const auto& cv  = job->cam_verts;
-        const auto& pix = job->pixel_accum;
         const auto& sw  = job->spectral_weights;
-        T5GpuParams par = job->params;  /* mutable copy — light_offset updated per batch */
+        T5GpuParams par = job->params;  /* mutable copy — tile/batch params updated per iteration */
 
         const int nlv = (int)lv.size();
         const int ncv = (int)cv.size();
-        const int npi = (int)pix.size();
         const int nsw = (int)sw.size();
+
+        /* Sensor tile side — used to cap the pixel SSBO allocation. */
+        const int STILE_early = t5_sensor_tile_size ? (int)t5_sensor_tile_size : 128;
+        const int npi_tile_max = 3 * STILE_early * STILE_early;
 
         /* ── Ensure / grow SSBOs ──────────────────────────────────────── */
         if (nlv > cap_t5_light) {
@@ -9331,8 +9347,9 @@ public:
             cap_t5_cam = ncv * 2;
             ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)(cap_t5_cam * sizeof(float)));
         }
-        if (npi > cap_t5_pix) {
-            cap_t5_pix = npi * 2;
+        /* Pixel SSBO is sized to the tile, not the full image, to avoid VRAM exhaustion. */
+        if (npi_tile_max > cap_t5_pix) {
+            cap_t5_pix = npi_tile_max * 2;
             ensure_ssbo(ssbo_t5_pix, (GLsizeiptr)(cap_t5_pix * sizeof(uint32_t)));
         }
         if (!ssbo_t5_params) {
@@ -9343,28 +9360,42 @@ public:
             ensure_ssbo(ssbo_t5_spectral, (GLsizeiptr)(cap_t5_spectral * sizeof(float)));
         }
 
-        /* ── Upload data ──────────────────────────────────────────────── */
+        /* ── Upload helper ────────────────────────────────────────────── */
         auto upload = [&](GLuint ssbo, const void* data, GLsizeiptr bytes) {
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, data);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         };
-        if (nlv) upload(ssbo_t5_light,    lv.data(),  (GLsizeiptr)(nlv * sizeof(float)));
-        if (ncv) upload(ssbo_t5_cam,      cv.data(),  (GLsizeiptr)(ncv * sizeof(float)));
-                 upload(ssbo_t5_pix,      pix.data(), (GLsizeiptr)(npi * sizeof(uint32_t)));
-                 upload(ssbo_t5_params,   &par,        sizeof(T5GpuParams));
-        if (nsw) upload(ssbo_t5_spectral, sw.data(),  (GLsizeiptr)(nsw * sizeof(float)));
 
-        /* ── Batched 2-D dispatch ─────────────────────────────────────────── *
-         * X axis: camera vert tiles  (TILE_C verts per WG column).          *
-         * Y axis: light vert tiles within the current batch (TILE_L per WG).*
-         * Pixel accum stays in VRAM between batches; only params re-uploaded.*
-         * Batch size keeps each dispatch under the Windows 2-second TDR.    */
+        /* Light verts and spectral weights are the same for every sensor tile. */
+        if (nlv) upload(ssbo_t5_light,    lv.data(), (GLsizeiptr)(nlv * sizeof(float)));
+        if (nsw) upload(ssbo_t5_spectral, sw.data(), (GLsizeiptr)(nsw * sizeof(float)));
+
+        /* ── Batched 2-D dispatch with outer sensor-tile loop ─────────────── *
+         * The pixel accumulator grows as 3×res² — at large resolutions this   *
+         * alone exceeds GPU VRAM and causes driver crashes/TDR.  The sensor-  *
+         * tile loop partitions the pixel grid into small tiles so each        *
+         * dispatch operates on a compact pixel buffer (3×tw×th).              *
+         *                                                                      *
+         * For each tile:                                                       *
+         *   - Camera subpaths whose sensor origin falls inside the tile are   *
+         *     filtered and packed into a tile-local camera vert SSBO.         *
+         *   - A fresh zeroed pixel accum (3×tw×th) is uploaded.               *
+         *   - The existing light-vertex batch loop runs unchanged as the      *
+         *     inner loop (TDR guard: ≤4096 light verts per dispatch).         *
+         *   - The tile pixel result is read back and scattered into the full  *
+         *     res×res output buffer.                                           *
+         *                                                                      *
+         * X axis: camera vert tiles  (TILE_C verts per WG column).            *
+         * Y axis: light vert tiles within the current batch (TILE_L per WG).  */
         const uint32_t T5_LIGHT_BATCH = t5_light_batch_size ? t5_light_batch_size : 4096u;
-        const uint32_t n_cam      = par.n_cam_verts;
-        const uint32_t n_light    = par.n_light_verts;
-        const GLuint   wg_x       = (GLuint)((n_cam + (uint32_t)T5_TILE_C - 1u) / (uint32_t)T5_TILE_C);
-        const uint32_t n_batches  = (n_light + T5_LIGHT_BATCH - 1u) / T5_LIGHT_BATCH;
+        const uint32_t n_light        = par.n_light_verts;
+        const uint32_t n_batches      = (n_light + T5_LIGHT_BATCH - 1u) / T5_LIGHT_BATCH;
+
+        const int res       = par.sensor_res;
+        const int STILE     = STILE_early;
+        const int n_tiles_y = (res + STILE - 1) / STILE;
+        const int n_tiles_x = (res + STILE - 1) / STILE;
 
         glc_UseProgram(prog_t5);
         bind_ssbo(ssbo_t5_light,    0);
@@ -9376,47 +9407,186 @@ public:
         bind_ssbo(ssbo_tri_id,      6);
         bind_ssbo(ssbo_tri_full,    7);
 
-        fprintf(stderr, "[T5-gpu] starting: n_cam=%u n_light=%u batches=%u res=%d\n",
-                n_cam, n_light, n_batches, par.sensor_res);
+        fprintf(stderr, "[T5-gpu] starting: n_cam=%u n_light=%u lbatches=%u res=%d tiles=%dx%d\n",
+                par.n_cam_verts, n_light, n_batches, res, n_tiles_x, n_tiles_y);
         fflush(stderr);
 
+        /* Full-resolution result assembled tile by tile. */
+        std::vector<uint32_t> result(3u * static_cast<size_t>(res) * res, 0u);
         bool gpu_ok = true;
-        for (uint32_t b = 0; b < n_batches; ++b) {
-            par.light_offset     = b * T5_LIGHT_BATCH;
-            par.light_batch_size = std::min(T5_LIGHT_BATCH, n_light - par.light_offset);
-            /* Re-upload only the params block (40 bytes) — all other SSBOs stay */
-            upload(ssbo_t5_params, &par, sizeof(T5GpuParams));
-            const GLuint wg_y = (par.light_batch_size + (uint32_t)T5_TILE_L - 1u) / (uint32_t)T5_TILE_L;
-            glc_DispatchCompute(wg_x, wg_y, 1u);
-            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            /* glFlush after each batch so the driver sees completed work between
-             * dispatches — prevents Windows TDR from treating the whole loop as
-             * one unresponsive command. */
-            glFlush();
-            /* Check for GPU context loss (TDR reset).  GL_INVALID_OPERATION or
-             * any other error here means the context is dead; abort the job
-             * rather than spinning forever or writing garbage. */
-            GLenum gl_err = glGetError();
-            if (gl_err != GL_NO_ERROR) {
-                fprintf(stderr, "[T5-gpu] GL error 0x%04x after batch %u/%u — TDR? aborting job\n",
-                        (unsigned)gl_err, b, n_batches);
+
+        /* Pre-compute sensor-to-pixel scale factors (mirrors shader logic). */
+        const float inv_wy = (float)res / (2.0f * par.sensor_half_w);
+        const float inv_hz = (float)res / (2.0f * par.sensor_half_h);
+        const int   cv_stride = (int)T5_CGV_STRIDE;  /* floats per cam vert */
+
+        const int n_tiles_total = n_tiles_y * n_tiles_x;
+        int tiles_done = 0;
+        const auto t5_wall_start = std::chrono::steady_clock::now();
+
+        for (int ty = 0; ty < n_tiles_y && gpu_ok; ++ty) {
+            for (int tx = 0; tx < n_tiles_x && gpu_ok; ++tx) {
+                const int tile_y0 = ty * STILE;
+                const int tile_x0 = tx * STILE;
+                const int tile_h  = std::min(STILE, res - tile_y0);
+                const int tile_w  = std::min(STILE, res - tile_x0);
+
+                /* ── Filter camera subpaths whose sensor origin is in this tile ──
+                 * Walk the flat cam_verts array subpath by subpath.  A subpath
+                 * starts whenever ci (vinfo bits[0..14]) is 0.  All verts in the
+                 * subpath share the same sensor_origin_y/z (stored at [13][14]). */
+                std::vector<float> tile_cam;
+                {
+                    const int n_cv_total = ncv / cv_stride;
+                    int v = 0;
+                    while (v < n_cv_total) {
+                        /* Find the end of this subpath: next vert with ci == 0. */
+                        int sp_end = v + 1;
+                        while (sp_end < n_cv_total) {
+                            const float* pe = cv.data() + sp_end * cv_stride;
+                            uint32_t vinf;
+                            std::memcpy(&vinf, &pe[9], sizeof(uint32_t));
+                            if ((vinf & 0x7FFFu) == 0u) break;
+                            ++sp_end;
+                        }
+                        /* Map first vert's sensor origin to a pixel. */
+                        const float* p0  = cv.data() + v * cv_stride;
+                        const float  soy = p0[13];
+                        const float  soz = p0[14];
+                        const int    iy  = (int)((soy + par.sensor_half_w) * inv_wy);
+                        const int    iz  = (int)((soz + par.sensor_half_h) * inv_hz);
+                        if (iy >= tile_y0 && iy < tile_y0 + tile_h &&
+                            iz >= tile_x0 && iz < tile_x0 + tile_w) {
+                            /* ci values inside the subpath are already 0,1,2,…
+                             * so they remain correct when the subpath is appended
+                             * contiguously to tile_cam. */
+                            const float* src = cv.data() + v * cv_stride;
+                            tile_cam.insert(tile_cam.end(), src,
+                                            src + (sp_end - v) * cv_stride);
+                        }
+                        v = sp_end;
+                    }
+                }
+
+                const uint32_t n_tile_cam = (uint32_t)(tile_cam.size() / cv_stride);
+                if (n_tile_cam == 0) {
+                    fprintf(stderr, "[T5-gpu tile(%d,%d) %d/%d] skip — 0 cam verts\n",
+                            tx, ty, tiles_done + 1, n_tiles_total);
+                    fflush(stderr);
+                    ++tiles_done;
+                    continue;
+                }
+
+                const auto tile_t0 = std::chrono::steady_clock::now();
+                fprintf(stderr, "[T5-gpu tile(%d,%d) %d/%d] cam=%u lbatches=%u\n",
+                        tx, ty, tiles_done + 1, n_tiles_total, n_tile_cam, n_batches);
                 fflush(stderr);
-                gpu_ok = false;
-                break;
+
+                /* ── Grow SSBOs for this tile if needed ── */
+                const int ncv_tile = (int)tile_cam.size();
+                if (ncv_tile > cap_t5_cam) {
+                    cap_t5_cam = ncv_tile * 2;
+                    ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)(cap_t5_cam * sizeof(float)));
+                }
+                const size_t n_tile_pix = (size_t)tile_w * tile_h;
+                const int    npi_tile   = (int)(3u * n_tile_pix);
+                if (npi_tile > cap_t5_pix) {
+                    cap_t5_pix = npi_tile * 2;
+                    ensure_ssbo(ssbo_t5_pix, (GLsizeiptr)(cap_t5_pix * sizeof(uint32_t)));
+                }
+
+                /* ── Upload tile camera verts and zero pixel accum ── */
+                upload(ssbo_t5_cam, tile_cam.data(),
+                       (GLsizeiptr)(tile_cam.size() * sizeof(float)));
+                {
+                    std::vector<uint32_t> tile_pix_zero(3u * n_tile_pix, 0u);
+                    upload(ssbo_t5_pix, tile_pix_zero.data(),
+                           (GLsizeiptr)(3u * n_tile_pix * sizeof(uint32_t)));
+                }
+
+                /* ── Update params for this tile ── */
+                par.n_cam_verts = n_tile_cam;
+                par.tile_y0     = tile_y0;
+                par.tile_x0     = tile_x0;
+                par.tile_h      = tile_h;
+                par.tile_w      = tile_w;
+
+                const GLuint wg_x = ((GLuint)n_tile_cam + (GLuint)T5_TILE_C - 1u)
+                                  / (GLuint)T5_TILE_C;
+
+                /* ── Inner light-batch loop (TDR guard) ── */
+                for (uint32_t b = 0; b < n_batches && gpu_ok; ++b) {
+                    par.light_offset     = b * T5_LIGHT_BATCH;
+                    par.light_batch_size = std::min(T5_LIGHT_BATCH,
+                                                    n_light - par.light_offset);
+                    upload(ssbo_t5_params, &par, sizeof(T5GpuParams));
+                    const GLuint wg_y = (par.light_batch_size + (uint32_t)T5_TILE_L - 1u)
+                                      / (uint32_t)T5_TILE_L;
+                    glc_DispatchCompute(wg_x, wg_y, 1u);
+                    glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                    glFlush();
+                    GLenum gl_err = glGetError();
+                    if (gl_err != GL_NO_ERROR) {
+                        fprintf(stderr,
+                                "[T5-gpu] GL error 0x%04x after lbatch %u/%u tile(%d,%d) — TDR? aborting\n",
+                                (unsigned)gl_err, b, n_batches, tx, ty);
+                        fflush(stderr);
+                        gpu_ok = false;
+                        break;
+                    }
+                    /* Heartbeat every 8 batches so a crash can be located. */
+                    if ((b & 7u) == 7u) {
+                        const auto now = std::chrono::steady_clock::now();
+                        const float elapsed = std::chrono::duration<float>(
+                                now - tile_t0).count();
+                        fprintf(stderr, "[T5-gpu tile(%d,%d)] lbatch %u/%u  %.1fs\n",
+                                tx, ty, b + 1u, n_batches, elapsed);
+                        fflush(stderr);
+                    }
+                }
+                if (!gpu_ok) break;
+
+                /* ── Readback tile pixel accum and scatter into full result ── */
+                std::vector<uint32_t> tile_pix(3u * n_tile_pix);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                     (GLsizeiptr)(3u * n_tile_pix * sizeof(uint32_t)),
+                                     tile_pix.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+                const size_t full_pix = static_cast<size_t>(res) * res;
+                for (int row = 0; row < tile_h; ++row) {
+                    for (int col = 0; col < tile_w; ++col) {
+                        const size_t src = static_cast<size_t>(row) * tile_w + col;
+                        const size_t dst = static_cast<size_t>(tile_y0 + row) * res
+                                         + (tile_x0 + col);
+                        result[dst]                = tile_pix[src];
+                        result[dst + full_pix]     = tile_pix[src + n_tile_pix];
+                        result[dst + 2u * full_pix]= tile_pix[src + 2u * n_tile_pix];
+                    }
+                }
+
+                ++tiles_done;
+                {
+                    const float tile_s = std::chrono::duration<float>(
+                            std::chrono::steady_clock::now() - tile_t0).count();
+                    const float wall_s = std::chrono::duration<float>(
+                            std::chrono::steady_clock::now() - t5_wall_start).count();
+                    fprintf(stderr,
+                            "[T5-gpu tile(%d,%d) %d/%d] done %.1fs  wall %.1fs\n",
+                            tx, ty, tiles_done, n_tiles_total, tile_s, wall_s);
+                    fflush(stderr);
+                }
             }
         }
 
-        /* ── Single readback after all batches ───────────────────────────── */
-        std::vector<uint32_t> result(static_cast<size_t>(npi));
-        if (gpu_ok) {
-            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
-            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                                 (GLsizeiptr)(npi * sizeof(uint32_t)), result.data());
-            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-            fprintf(stderr, "[T5-gpu] done: %u batches  pix=%u\n", n_batches, (unsigned)npi);
-        } else {
+        if (gpu_ok)
+            fprintf(stderr, "[T5-gpu] done: %d/%d tiles  res=%d  wall %.1fs\n",
+                    tiles_done, n_tiles_total, res,
+                    std::chrono::duration<float>(
+                        std::chrono::steady_clock::now() - t5_wall_start).count());
+        else
             fprintf(stderr, "[T5-gpu] aborted after GPU error — returning empty result\n");
-        }
         fflush(stderr);
 
         job->promise.set_value(std::move(result));
@@ -11186,6 +11356,8 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
                                       int max_bounces,
                                       double min_amplitude,
                                       int max_rays,
+                                      int pix_offset,
+                                      uint64_t aperture_seed,
                                       int shutter_mode,
                                       double shutter_open,
                                       double shutter_center_u,
@@ -11196,16 +11368,45 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     if (!ps || !ps->st || ps->sensor_res <= 0 || ps->sensor_half_w <= 0.0f || ps->sensor_half_h <= 0.0f)
         return 0;
 
-    const int res = ps->sensor_res;
+    const int res   = ps->sensor_res;
     const int total = res * res;
-    const int limit = (max_rays > 0) ? std::min(max_rays, total) : total;
+    const int start = std::max(0, std::min(pix_offset, total));
+    const int limit = (max_rays > 0) ? std::min(max_rays, total - start) : (total - start);
     if (limit <= 0) return 0;
 
     const double target_x = static_cast<double>(ps->sensor_target_x);
     const double target_r = static_cast<double>(ps->sensor_target_r);
     if (!(target_r > 0.0) || !std::isfinite(target_x))
         return 0;
-    const V3d target(target_x, 0.0, 0.0);
+
+    /* ── Aperture disk sampling ─────────────────────────────────────────────
+     * aperture_seed == 0: all rays aim at the aperture center (backward compat).
+     * aperture_seed >  0: Fibonacci / golden-angle quasi-random aperture point.
+     *
+     * Batch index s maps to a point on the aperture disk via:
+     *   radius   = sqrt(van_der_corput_base2(s)) × target_r   (uniform area)
+     *   angle    = s × golden_angle                            (Fibonacci spiral)
+     *
+     * Van der Corput base-2 reverses the bits of s to produce a perfectly
+     * stratified sequence in [0,1) without needing to know N in advance.
+     * The result covers the aperture disk evenly across any number of batches.
+     */
+    double ap_y = 0.0, ap_z = 0.0;
+    if (aperture_seed > 0 && target_r > 0.0) {
+        static constexpr double kGoldenAngle = 2.39996322972865332; /* 2π/φ² */
+        uint32_t s = static_cast<uint32_t>(aperture_seed);
+        /* Van der Corput base-2 bit reversal */
+        s = ((s & 0x55555555u) << 1) | ((s & 0xAAAAAAAAu) >> 1);
+        s = ((s & 0x33333333u) << 2) | ((s & 0xCCCCCCCCu) >> 2);
+        s = ((s & 0x0F0F0F0Fu) << 4) | ((s & 0xF0F0F0F0u) >> 4);
+        s = ((s & 0x00FF00FFu) << 8) | ((s & 0xFF00FF00u) >> 8);
+        const double r_frac = static_cast<double>(s) / 4294967296.0; /* [0,1) */
+        const double ap_r   = std::sqrt(r_frac) * target_r;
+        const double theta  = static_cast<double>(aperture_seed) * kGoldenAngle;
+        ap_y = ap_r * std::cos(theta);
+        ap_z = ap_r * std::sin(theta);
+    }
+    const V3d target(target_x, ap_y, ap_z);
 
     const int n_bands = std::max(1, std::min(ps->st->n_bands, MAX_SPECTRAL_BANDS));
     const double half_w = static_cast<double>(ps->sensor_half_w);
@@ -11248,7 +11449,7 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     std::vector<RayIntent> intents;
     intents.reserve(static_cast<size_t>(limit));
 
-    for (int pix = 0; pix < total && static_cast<int>(intents.size()) < limit; ++pix) {
+    for (int pix = start; pix < total && static_cast<int>(intents.size()) < limit; ++pix) {
         const int iy = pix / res;
         const int iz = pix - iy * res;
         const double y = -half_w + (static_cast<double>(iy) + 0.5) * step_w;
@@ -11418,6 +11619,45 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         pdfs.swap(ps->bdpt_pending_pdfs);
         optical.swap(ps->bdpt_pending_optical);
         t5_work_items = verts.size() + sweights.size() + pdfs.size() + optical.size();
+    }
+
+    /* ── Sensor-batching stash logic ──────────────────────────────────────
+     * Stash is populated on the first T5 call (when empty) with all light-
+     * stream records.  Subsequent calls prepend the stash so the GPU shader
+     * always sees the full flash light field alongside the fresh camera batch.
+     * Light-stream records are identified by the absence of the 0x80000000
+     * high bit in subpath_id (sensor subpaths set that bit in submit_sensor_sweep). */
+    if (ps->bdpt_batching_mode) {
+        std::lock_guard<std::mutex> stash_lk(ps->bdpt_stash_mu);
+        if (ps->bdpt_stash_v.empty()) {
+            /* First batch: save light-side records to stash. */
+            for (const auto& v : verts)
+                if (v.stream == BDPT_SIDE_LIGHT)
+                    ps->bdpt_stash_v.push_back(v);
+            for (const auto& sw : sweights)
+                if (!(sw.subpath_id & 0x80000000u))
+                    ps->bdpt_stash_sw.push_back(sw);
+            for (const auto& pr : pdfs)
+                if (!(pr.subpath_id & 0x80000000u))
+                    ps->bdpt_stash_pdf.push_back(pr);
+            for (const auto& oe : optical)
+                if (!(oe.subpath_id & 0x80000000u))
+                    ps->bdpt_stash_opt.push_back(oe);
+            fprintf(stderr, "[T5-stash] saved light records: v=%zu sw=%zu pdf=%zu opt=%zu\n",
+                    ps->bdpt_stash_v.size(), ps->bdpt_stash_sw.size(),
+                    ps->bdpt_stash_pdf.size(), ps->bdpt_stash_opt.size());
+            fflush(stderr);
+        } else {
+            /* Subsequent batches: prepend stash light records. */
+            std::vector<BdptVertexRecord> merged;
+            merged.reserve(ps->bdpt_stash_v.size() + verts.size());
+            merged.insert(merged.end(), ps->bdpt_stash_v.begin(), ps->bdpt_stash_v.end());
+            merged.insert(merged.end(), verts.begin(), verts.end());
+            verts = std::move(merged);
+            sweights.insert(sweights.begin(), ps->bdpt_stash_sw.begin(), ps->bdpt_stash_sw.end());
+            pdfs.insert(pdfs.begin(),     ps->bdpt_stash_pdf.begin(), ps->bdpt_stash_pdf.end());
+            optical.insert(optical.begin(), ps->bdpt_stash_opt.begin(), ps->bdpt_stash_opt.end());
+        }
     }
 
     if (verts.empty()) {
@@ -11764,8 +12004,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             }
         }
 
-        const uint32_t npix = static_cast<uint32_t>(res) * static_cast<uint32_t>(res);
-        std::vector<uint32_t> pixel_accum(3u * npix, 0u);
+        std::vector<uint32_t> pixel_accum;  /* zeroed per-tile in service_t5_job */
 
         /* Pre-compute spectral colour weights (one RGB triple per band).
          * The GPU shader reads per-band beta magnitudes from CGV_BAND_BASE slots
@@ -12006,6 +12245,35 @@ void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n)
     if (!ps) return;
     ps->cfg.t5_light_batch_size = n;
     if (ps->gpu_dispatch) ps->gpu_dispatch->t5_light_batch_size = n;
+}
+
+void ray_pipeline_set_t5_sensor_tile_size(RayPipelineState* ps, uint32_t n)
+{
+    if (!ps) return;
+    ps->cfg.t5_sensor_tile_size = n;
+    if (ps->gpu_dispatch) ps->gpu_dispatch->t5_sensor_tile_size = n;
+}
+
+void ray_pipeline_begin_sensor_batching(RayPipelineState* ps)
+{
+    if (!ps) return;
+    std::lock_guard<std::mutex> lk(ps->bdpt_stash_mu);
+    ps->bdpt_batching_mode = true;
+    ps->bdpt_stash_v.clear();
+    ps->bdpt_stash_sw.clear();
+    ps->bdpt_stash_pdf.clear();
+    ps->bdpt_stash_opt.clear();
+}
+
+void ray_pipeline_end_sensor_batching(RayPipelineState* ps)
+{
+    if (!ps) return;
+    std::lock_guard<std::mutex> lk(ps->bdpt_stash_mu);
+    ps->bdpt_batching_mode = false;
+    ps->bdpt_stash_v.clear();
+    ps->bdpt_stash_sw.clear();
+    ps->bdpt_stash_pdf.clear();
+    ps->bdpt_stash_opt.clear();
 }
 
 void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v)

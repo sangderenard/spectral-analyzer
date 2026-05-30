@@ -3238,7 +3238,7 @@ def _build_scene_mesh(
         # exit_pupil_radius : clear opening of the barrel at that face (G4 aperture).
         # Both are set unconditionally so they are correct before mesh triangles
         # are built below — set_optics() also writes them but runs after the mesh.
-        scene.exit_pupil_x = round(float(last_lens.x_back) + 0.005, 6)
+        scene.exit_pupil_x = round(float(last_lens.x_back), 6)
         scene.exit_pupil_radius = round(float(last_lens.aperture_radius), 6)
         bore_r = float(scene.tube_radius)
         lens_housing_r = float(last_lens.aperture_radius + 0.008)
@@ -3486,7 +3486,7 @@ def _build_scene_mesh(
     camera_frustum_tri_ids: list = []
     _build_sensor_aperture_frustum(
         x_aperture=_x_ap,
-        r_aperture=float(scene.exit_pupil_radius),
+        r_aperture=_tube_r,   # match barrel inner wall — no gap between frustum and shell
         x_sensor=_x_sensor,
         r_sensor=_sensor_r,
         n_theta=96,
@@ -6658,6 +6658,58 @@ class ForwardCppLensBench:
             self._plate_rgb_accum = self._accumulate_image(self._plate_rgb_accum, np.asarray(rgb, dtype=np.float32), leak)
             return np.clip(self._plate_rgb_accum, 0.0, 1.0).astype(np.float32, copy=False)
 
+    def run_sensor_batches(
+        self,
+        max_bounces: int = 24,
+        seed: int = 1,
+        n_aperture_samples: int = 4,
+        pixels_per_batch: int = 0,
+        stage_args: "dict | None" = None,
+    ) -> int:
+        """
+        Fire `n_aperture_samples` sensor sweeps against the already-submitted
+        flash, accumulating T5 results into sensor_accum via +=.
+
+        Each sweep uses a different Fibonacci aperture sample (seed+0, seed+1, …)
+        so the aperture disk is evenly covered across samples.  Each sweep can
+        optionally cover only `pixels_per_batch` pixels (0 = all pixels) so the
+        BDPT record cap is never exceeded.
+
+        Returns total rays submitted.
+        """
+        res = int(max(16, self.scene.image_plate.sensor_res))
+        total_px = res * res
+        bsz = pixels_per_batch if pixels_per_batch > 0 else total_px
+        stage_args = stage_args or {}
+        max_bounces = int(max_bounces or 24)
+        total_rays = 0
+
+        self.tracer.begin_sensor_batching()
+        try:
+            for ap in range(n_aperture_samples):
+                ap_seed = seed + ap
+                offset = 0
+                while offset < total_px:
+                    # Signal flash first — ensures the KPN counter is valid
+                    # before rays start draining.  Flash was already submitted
+                    # by the caller; this re-arms the cycle counter for this batch.
+                    self.tracer.signal_flash_dispatched()
+                    rays = self.tracer.submit_sensor_sweep(
+                        max_bounces=max_bounces,
+                        seed=ap_seed,
+                        max_rays=min(bsz, total_px - offset),
+                        pix_offset=offset,
+                        **stage_args,
+                    )
+                    self.tracer.signal_sensor_dispatched()
+                    self.tracer.join_t5()
+                    total_rays += rays
+                    offset += bsz
+        finally:
+            self.tracer.end_sensor_batching()
+
+        return total_rays
+
     def trace_forward_backward_sensor_rgb(
         self,
         pixels: int | None = None,
@@ -6676,11 +6728,14 @@ class ForwardCppLensBench:
         the C++ pipeline; this method asks the pipeline to connect pending
         subpaths and returns its sensor accumulator.
         """
-        _ = (aperture_samples, seed, max_records, max_bounces, leak, n_rays_bdpt, camera_mode)
+        # ── Phase 1: locked setup ─────────────────────────────────────────────
+        # Grab stage state and shutter args while holding the lock, then release
+        # so the HUD (display_pipeline_records) is not starved during GPU compute.
+        _stage_setup: "dict | None" = None
         with self._trace_lock:
             n = int(max(4, pixels or self.scene.image_plate.pixels))
             self.bdpt_last_n_px = int(n)
-            self.bdpt_last_aperture_samples = 1
+            self.bdpt_last_aperture_samples = max(1, int(aperture_samples))
             self.bdpt_last_launched_rays = 0
 
             async_records = self._bdpt_endpoints.snapshot()
@@ -6700,49 +6755,86 @@ class ForwardCppLensBench:
                 if self._bdpt_camera_sweep_stage < stage_count:
                     stage_idx = int(self._bdpt_camera_sweep_stage)
                     stage_args = self._shutter_stage_args(stage_idx, stage_count)
-                    self.bdpt_last_launched_rays = int(
-                        self.tracer.submit_sensor_sweep(
-                            max_bounces=int(max_bounces or 8),
-                            min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
-                            max_rays=0,
-                            seed=int(seed),
-                            **stage_args,
-                        )
+                    _mb = int(max_bounces or 24)
+                    _res = int(max(4, self.scene.image_plate.sensor_res))
+                    _total_px = _res * _res
+                    _bdpt_cap = int(n_rays_bdpt or 0) or 2_000_000
+                    _pix_batch = max(4096, _bdpt_cap // max(1, _mb // 3))
+                    _n_ap = max(1, int(aperture_samples))
+                    _use_batching = (_total_px > _pix_batch) or (_n_ap > 1)
+                    _stage_setup = dict(
+                        stage_idx=stage_idx, stage_count=stage_count,
+                        stage_args=stage_args, mb=_mb,
+                        pix_batch=_pix_batch, n_ap=_n_ap,
+                        use_batching=_use_batching,
+                        seed=int(seed),
+                        min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
                     )
-                    should_launch = (
-                        float(stage_args.get("exposure_weight", 0.0)) > 0.0 and
-                        float(stage_args.get("shutter_open", 0.0)) > 0.0 and
-                        int(stage_args.get("shutter_mode", 0)) != 1
-                    )
-                    if self.bdpt_last_launched_rays <= 0 and should_launch:
-                        print(
-                            f"[bdpt-cpp] WARNING: sensor sweep for stage {stage_idx}/{stage_count}"
-                            f" launched zero rays (args={stage_args})",
-                            flush=True,
-                        )
-                    self._bdpt_native_sensor_sweep_started = self.bdpt_last_launched_rays > 0
-                    self._bdpt_camera_sweep_stage += 1
-                    self._bdpt_native_sensor_sweep_rays += int(self.bdpt_last_launched_rays)
-                    self.tracer.signal_sensor_dispatched()
-                    if not getattr(self, "_sensor_sweep_diag_done", False):
-                        _tgt_r = float(getattr(self, "aperture_radius", 0.0))
-                        _tgt_x = float(np.asarray(getattr(
-                            self, "aperture_centroid", np.zeros(3)), dtype=np.float64)[0])
-                        print(
-                            "[sensor-sweep-first-call]",
-                            f"launched={self.bdpt_last_launched_rays}",
-                            f"sensor_px={float(self.scene.image_plate.x):.4f}",
-                            f"target_x={_tgt_x:.4f}",
-                            f"target_r={_tgt_r*1e3:.2f}mm",
-                            f"stage={self._bdpt_camera_sweep_stage}/{stage_count}",
-                            flush=True,
-                        )
-                        self._sensor_sweep_diag_done = True
-                else:
-                    self.bdpt_last_launched_rays = 0
             except Exception as exc:
                 self.bdpt_last_launched_rays = 0
+                print(f"[bdpt-cpp] camera projection setup failed: {exc}", flush=True)
+
+        # ── Phase 2: GPU compute — lock released so HUD stays live ───────────
+        _launched = 0
+        if _stage_setup is not None:
+            _ss = _stage_setup
+            try:
+                if _ss["use_batching"]:
+                    _launched = self.run_sensor_batches(
+                        max_bounces=_ss["mb"],
+                        seed=_ss["seed"] if _ss["seed"] > 0 else 1,
+                        n_aperture_samples=_ss["n_ap"],
+                        pixels_per_batch=_ss["pix_batch"],
+                        stage_args=_ss["stage_args"],
+                    )
+                else:
+                    _launched = int(self.tracer.submit_sensor_sweep(
+                        max_bounces=_ss["mb"],
+                        min_amplitude=_ss["min_amplitude"],
+                        max_rays=0,
+                        seed=_ss["seed"],
+                        **_ss["stage_args"],
+                    ))
+                    self.tracer.signal_sensor_dispatched()
+            except Exception as exc:
                 print(f"[bdpt-cpp] camera projection submit failed: {exc}", flush=True)
+
+        # ── Phase 3: locked counter update + stats read ───────────────────────
+        with self._trace_lock:
+            if _stage_setup is not None:
+                _ss = _stage_setup
+                should_launch = (
+                    float(_ss["stage_args"].get("exposure_weight", 0.0)) > 0.0 and
+                    float(_ss["stage_args"].get("shutter_open", 0.0)) > 0.0 and
+                    int(_ss["stage_args"].get("shutter_mode", 0)) != 1
+                )
+                if _launched <= 0 and should_launch:
+                    print(
+                        f"[bdpt-cpp] WARNING: sensor sweep for stage"
+                        f" {_ss['stage_idx']}/{_ss['stage_count']}"
+                        f" launched zero rays (args={_ss['stage_args']})",
+                        flush=True,
+                    )
+                self.bdpt_last_launched_rays = _launched
+                self._bdpt_native_sensor_sweep_started = _launched > 0
+                self._bdpt_camera_sweep_stage += 1
+                self._bdpt_native_sensor_sweep_rays += _launched
+                if not getattr(self, "_sensor_sweep_diag_done", False):
+                    _tgt_r = float(getattr(self, "aperture_radius", 0.0))
+                    _tgt_x = float(np.asarray(getattr(
+                        self, "aperture_centroid", np.zeros(3)), dtype=np.float64)[0])
+                    print(
+                        "[sensor-sweep-first-call]",
+                        f"launched={_launched}",
+                        f"sensor_px={float(self.scene.image_plate.x):.4f}",
+                        f"target_x={_tgt_x:.4f}",
+                        f"target_r={_tgt_r*1e3:.2f}mm",
+                        f"stage={self._bdpt_camera_sweep_stage}/{_ss['stage_count']}",
+                        flush=True,
+                    )
+                    self._sensor_sweep_diag_done = True
+            else:
+                self.bdpt_last_launched_rays = 0
 
             try:
                 stats = dict(self.tracer.get_bdpt_stats())
@@ -8236,6 +8328,7 @@ def run(
     neural_payload_out: str = "",
     parametric: bool = False,
     t5_light_batch: int = 0,
+    t5_sensor_tile: int = 0,
     no_gpu_t5: bool = False,
 ) -> None:
     try:
@@ -8352,6 +8445,10 @@ def run(
     if _t5_light_batch > 0:
         bench.tracer.set_t5_light_batch_size(_t5_light_batch)
         print(f"[t5] light batch {_t5_light_batch:_} verts/dispatch", flush=True)
+    _t5_sensor_tile = int(t5_sensor_tile)
+    if _t5_sensor_tile > 0:
+        bench.tracer.set_t5_sensor_tile_size(_t5_sensor_tile)
+        print(f"[t5] sensor tile {_t5_sensor_tile}×{_t5_sensor_tile} px/tile", flush=True)
     if no_gpu_t5:
         bench.tracer.set_force_cpu_t5(True)
         print("[t5] GPU T5 disabled — using CPU run_t5_allpairs()", flush=True)
@@ -9931,7 +10028,7 @@ def run(
 
     field_gain      = 0.6
     field_leak      = 0.0
-    max_bounces     = 8
+    max_bounces     = 24
     rays_per_emitter = 8
     seed            = 13579
     _display_frame  = 0
@@ -9994,11 +10091,11 @@ def run(
         def _worker():
             try:
                 bench.trace_forward_backward_sensor_rgb(
-                    pixels=max(8, min(48, int(scene.image_plate.sensor_res))),
-                    aperture_samples=8,
-                    seed=20260522 + id(bench) % 0xFFFFFF,
-                    max_bounces=8,
-                    n_rays_bdpt=1_000_000,
+                    pixels=int(scene.image_plate.sensor_res),
+                    aperture_samples=4,
+                    seed=max(1, (20260522 + id(bench)) % 0xFFFFF),
+                    max_bounces=max_bounces,
+                    n_rays_bdpt=2_000_000,
                 )
             except Exception as _me:
                 print(f"[pipeline-camera] render error: {_me}", flush=True)
@@ -10382,6 +10479,8 @@ def run(
         new_bench.compute_mode         = str(compute_mode)
         if _t5_light_batch > 0:
             new_bench.tracer.set_t5_light_batch_size(_t5_light_batch)
+        if _t5_sensor_tile > 0:
+            new_bench.tracer.set_t5_sensor_tile_size(_t5_sensor_tile)
         if no_gpu_t5:
             new_bench.tracer.set_force_cpu_t5(True)
         if _gl_display_hglrc:
@@ -10461,8 +10560,10 @@ def run(
             r_inner=round(new_r, 5),
             r_outer=round(max(new_r * 1.55, float(iris.r_outer)), 5),
         )
-        # Reset the optical design spec so the solver re-runs with the new geometry.
-        scene.optical_design = _default_optical_design_spec()
+        # Preserve the existing solved optical_design — the lens groups and EFL
+        # are fixed by the optical prescription and do not move when the iris
+        # opens or closes.  LensAssembly.sync_from_scene() re-reads the new
+        # iris geometry and recomputes the exit-pupil target automatically.
         print("[aperture] rebuilding scene…", flush=True)
         _stop_bench_runtime(bench)
         _invalidate_scene_gl_cache()
@@ -10505,8 +10606,8 @@ def run(
                 _od_s = getattr(scene, "optical_design", None)
                 _efl_s = float(getattr(_od_s, "effective_focal_length_m", 0.0) or 0.0)
                 if _efl_s > 1e-4:
-                    _r_f22 = _efl_s / (2.0 * 5.6)
-                    print(f"[startup] f/5.6 -> r={_r_f22*1e3:.2f}mm  EFL={_efl_s*1e3:.1f}mm", flush=True)
+                    _r_f22 = _efl_s / (2.0 * 1.4)
+                    print(f"[startup] f/1.4 -> r={_r_f22*1e3:.2f}mm  EFL={_efl_s*1e3:.1f}mm", flush=True)
                     _rebuild_bench_with_iris(_r_f22)
                 # Open the first exposure frame before unblocking the camera thread.
                 _startup_iris_pending[0] = False
@@ -11149,6 +11250,19 @@ if __name__ == "__main__":
         ),
     )
     _ap.add_argument(
+        "--t5-sensor-tile",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Sensor tile side length in pixels for the T5 GPU connection pass. "
+            "The pixel grid is solved in N×N tiles so the pixel accum SSBO "
+            "stays at 3×N² instead of 3×res², preventing VRAM crashes on large "
+            "images.  0 = use built-in default (128). "
+            "Example: --t5-sensor-tile 256"
+        ),
+    )
+    _ap.add_argument(
         "--no-gpu-t5",
         action="store_true",
         help=(
@@ -11187,5 +11301,6 @@ if __name__ == "__main__":
         neural_payload_out=_args.neural_payload_out,
         parametric=bool(_args.parametric),
         t5_light_batch=int(_args.t5_light_batch),
+        t5_sensor_tile=int(_args.t5_sensor_tile),
         no_gpu_t5=bool(_args.no_gpu_t5),
     )

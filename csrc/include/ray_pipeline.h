@@ -612,7 +612,7 @@ static constexpr int CGV_EDGE_FWD_AREA  = 60;
 static constexpr int CGV_EDGE_BWD_AREA  = 61;
 
 /* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl.
- * std430 layout, 32 bytes. */
+ * std430 layout, 56 bytes. */
 struct T5GpuParams {
     float    min_geom;         /* geometry-term floor                   */
     float    sensor_half_w;    /* sensor half-width  (Y axis, metres)   */
@@ -624,8 +624,12 @@ struct T5GpuParams {
     uint32_t light_batch_size; /* light verts per dispatch (TDR guard)  */
     uint32_t light_offset;     /* first light vert index in this batch  */
     int32_t  n_bands;          /* number of spectral bands (≥1)         */
+    int32_t  tile_x0;          /* pixel column of tile left edge        */
+    int32_t  tile_y0;          /* pixel row of tile top edge            */
+    int32_t  tile_w;           /* tile width  in pixels (0 = full res)  */
+    int32_t  tile_h;           /* tile height in pixels (0 = full res)  */
 };
-static_assert(sizeof(T5GpuParams) == 40, "T5GpuParams layout mismatch");
+static_assert(sizeof(T5GpuParams) == 56, "T5GpuParams layout mismatch");
 
 /* ── Flash light modifier ─────────────────────────────────────────────────
  * Applied per-ray inside submit_emissive_triangles.  All modes use the same
@@ -710,7 +714,8 @@ struct RayPipelineConfig {
     int         gpu_batch_size_t3  = 0;
     int         gpu_batch_size_t4  = 0;
     int         gpu_batch_size_t5  = 0;
-    uint32_t    t5_light_batch_size = 0;   /* 0 = use built-in default (T5_LIGHT_BATCH) */
+    uint32_t    t5_light_batch_size  = 0;  /* 0 = use built-in default (T5_LIGHT_BATCH) */
+    uint32_t    t5_sensor_tile_size  = 0;  /* 0 = use built-in default (128)            */
 
     /* Fraction of work to pin to GPU per stage (0=compete freely, >0=soft target).
      * 0.0 = CPU and GPU compete naturally on the shared queue.
@@ -840,27 +845,38 @@ void ray_pipeline_join_t5(RayPipelineState* ps);
 /* Live-update T5 connection-pass configuration. */
 void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
 void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n);
+void ray_pipeline_set_t5_sensor_tile_size(RayPipelineState* ps, uint32_t n);
 void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v);
 
 /* Live-update the flash light modifier applied in submit_emissive_triangles. */
 void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType type,
                                       float param0, float param1);
 
-/* Submit one native sensor-frame sweep into the same T1->T2->T3 pipeline as
- * light paths.  The sweep uses the configured sensor image grid and stamps all
- * launched intents as BDPT_SIDE_SENSOR so the normal BDPT vertex/spectral/pdf/
- * optical queues are populated by the existing transport stages.
- * max_rays <= 0 submits the full configured grid.  Returns submitted intents. */
+/* Submit one native sensor-frame sweep into the same T1->T2->T3 pipeline.
+ * pix_offset: first pixel index to submit (0 = start of grid).
+ * max_rays:   cap on pixels submitted (0 = from pix_offset to end of grid).
+ * aperture_seed: 0 = aim at aperture center (backward compat);
+ *               >0 = Fibonacci-spiral aperture sample for this batch index.
+ * Returns number of submitted intents. */
 int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
                                      int max_bounces,
                                      double min_amplitude,
                                      int max_rays,
+                                     int pix_offset,
+                                     uint64_t aperture_seed,
                                      int shutter_mode,
                                      double shutter_open,
                                      double shutter_center_u,
                                      double shutter_center_v,
                                      double shutter_softness,
                                      double exposure_weight);
+
+/* Sensor-batching: call begin before multi-pass sensor sweeps on the same
+ * flash, end (or frame reset) when done.  begin clears any stash; end clears
+ * it again.  Between begin and end, run_bdpt_connection() automatically
+ * stashes light records on the first pass and reuses them on subsequent ones. */
+void ray_pipeline_begin_sensor_batching(RayPipelineState* ps);
+void ray_pipeline_end_sensor_batching(RayPipelineState* ps);
 
 RayPipelineState* ray_pipeline_create(
     RayTracerState*          st,

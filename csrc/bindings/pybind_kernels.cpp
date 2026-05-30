@@ -558,6 +558,7 @@ struct PyRayTracer
     /* T5 connection config */
     float    _t5_min_geom          = 1e-8f;
     uint32_t _t5_light_batch_size  = 0;
+    uint32_t _t5_sensor_tile_size  = 0;
     bool     _force_cpu_t5         = false;
 
     /* Flash modifier config */
@@ -591,6 +592,7 @@ struct PyRayTracer
             cfg.gl_display_hdc          = _gl_display_hdc;
             cfg.t5_min_geom             = _t5_min_geom;
             cfg.t5_light_batch_size     = _t5_light_batch_size;
+            cfg.t5_sensor_tile_size     = _t5_sensor_tile_size;
             cfg.flash_modifier_type     = static_cast<FlashModifierType>(_flash_modifier_type);
             cfg.flash_modifier_param0   = _flash_modifier_param0;
             cfg.flash_modifier_param1   = _flash_modifier_param1;
@@ -2325,8 +2327,9 @@ struct PyRayTracer
     int submit_sensor_sweep(int max_bounces = 8,
                             double min_amplitude = 1e-6,
                             int max_rays = 0,
+                            int pix_offset = 0,
                             int max_children = 2,
-                            int seed = 42,
+                            int seed = 0,
                             int shutter_mode = 0,
                             double shutter_open = 1.0,
                             double shutter_center_u = 0.5,
@@ -2337,8 +2340,17 @@ struct PyRayTracer
         py::gil_scoped_release release;
         return ray_pipeline_submit_sensor_sweep(
             ps, max_bounces, min_amplitude, max_rays,
+            pix_offset, static_cast<uint64_t>(static_cast<uint32_t>(seed)),
             shutter_mode, shutter_open, shutter_center_u, shutter_center_v,
             shutter_softness, exposure_weight);
+    }
+
+    void begin_sensor_batching() {
+        if (_pipeline) ray_pipeline_begin_sensor_batching(_pipeline);
+    }
+
+    void end_sensor_batching() {
+        if (_pipeline) ray_pipeline_end_sensor_batching(_pipeline);
     }
 
     void signal_flash_dispatched() {
@@ -2364,6 +2376,11 @@ struct PyRayTracer
     void set_t5_light_batch_size(uint32_t n) {
         _t5_light_batch_size = n;
         if (_pipeline) ray_pipeline_set_t5_light_batch_size(_pipeline, n);
+    }
+
+    void set_t5_sensor_tile_size(uint32_t n) {
+        _t5_sensor_tile_size = n;
+        if (_pipeline) ray_pipeline_set_t5_sensor_tile_size(_pipeline, n);
     }
 
     void set_force_cpu_t5(bool v) {
@@ -5538,8 +5555,9 @@ Call once per sensor sweep after the pipeline is idle.)doc")
              py::arg("max_bounces") = 8,
              py::arg("min_amplitude") = 1e-6,
              py::arg("max_rays") = 0,
+             py::arg("pix_offset") = 0,
              py::arg("max_children") = 2,
-             py::arg("seed") = 42,
+             py::arg("seed") = 0,
              py::arg("shutter_mode") = 0,
              py::arg("shutter_open") = 1.0,
              py::arg("shutter_center_u") = 0.5,
@@ -5547,9 +5565,11 @@ Call once per sensor sweep after the pipeline is idle.)doc")
              py::arg("shutter_softness") = 0.0,
              py::arg("exposure_weight") = 1.0,
 R"doc(Submit a native BDPT sensor-frame sweep into the persistent pipeline.
-Uses the configured sensor image grid and stamps all rays as BDPT_SIDE_SENSOR.
-shutter_mode: 0=open, 1=closed, 2=iris, 3=sliding_x, 4=sliding_y.
-max_rays <= 0 submits the full grid after shutter masking.)doc")
+pix_offset: first pixel index (0 = full grid from start).
+max_rays:   cap on pixels (0 = all from pix_offset onward).
+seed: 0 = all rays aim at aperture center (backward compat);
+      N > 0 = Fibonacci-spiral aperture sample for batch N (golden-angle quasi-random disk).
+shutter_mode: 0=open, 1=closed, 2=iris, 3=sliding_x, 4=sliding_y.)doc")
         .def("signal_flash_dispatched",
              &PyRayTracer::signal_flash_dispatched,
 R"doc(Signal that all emissive-triangle (flash) rays for the current exposure
@@ -5564,6 +5584,16 @@ been submitted.  Mirrors signal_flash_dispatched.)doc")
 R"doc(Block (releasing the GIL) until the T5 worker thread finishes.
 Call after signal_sensor_dispatched + signal_flash_dispatched to guarantee
 sensor_accum ch2 (BDPT radiance) is fully written before get_sensor_image().)doc")
+        .def("begin_sensor_batching",
+             &PyRayTracer::begin_sensor_batching,
+R"doc(Enter sensor-batching mode for the current exposure.
+In batching mode run_bdpt_connection / the T5 worker stashes light-stream
+records on the first pass and reuses them for all subsequent sensor batches,
+so flash rays only need to be fired once.  Clears any prior stash.)doc")
+        .def("end_sensor_batching",
+             &PyRayTracer::end_sensor_batching,
+R"doc(Exit sensor-batching mode and clear the light-record stash.
+Call once after the final join_t5() for the last sensor batch.)doc")
         .def("set_t5_min_geom",
              &PyRayTracer::set_t5_min_geom,
              py::arg("threshold"),
@@ -5581,6 +5611,14 @@ R"doc(Set the number of light vertices processed per T5 GPU dispatch (default 20
 Larger values reduce dispatch overhead and improve GPU utilisation; derive from
 --t5-vram-mb as n = vram_mb * 1024^2 / 48 (12 floats × 4 bytes per light vert).
 Safe to call before or after pipeline creation.)doc")
+        .def("set_t5_sensor_tile_size",
+             &PyRayTracer::set_t5_sensor_tile_size,
+             py::arg("n"),
+R"doc(Set the sensor tile side length for the T5 GPU connection pass (default 512).
+The sensor grid is partitioned into n×n tiles; each tile is solved with a
+compact pixel accum buffer (3×n² instead of 3×res²), avoiding VRAM exhaustion
+at large resolutions.  Smaller tiles reduce peak VRAM at the cost of more tile
+overhead; 0 restores the default (128).  Safe to call before or after pipeline creation.)doc")
         .def("set_force_cpu_t5",
              &PyRayTracer::set_force_cpu_t5,
              py::arg("v"),

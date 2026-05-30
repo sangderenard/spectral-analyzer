@@ -93,7 +93,11 @@
  *   int    sensor_res      pixel grid side (res×res)
  *   uint   light_batch_size
  *   uint   light_offset    first light vert index for this dispatch
- *   uint   _pad1
+ *   int    n_bands
+ *   int    tile_x0         pixel column of tile left edge
+ *   int    tile_y0         pixel row of tile top edge
+ *   int    tile_w          tile width  in pixels (0 = full res)
+ *   int    tile_h          tile height in pixels (0 = full res)
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* ── Tile dimensions (must match T5_TILE_C / T5_TILE_L in ray_pipeline.h) ── */
@@ -156,6 +160,10 @@ layout(std430, binding = 3) readonly buffer T5ParamsBuf {
     uint   light_batch_size;
     uint   light_offset;
     int    n_bands;
+    int    tile_x0;
+    int    tile_y0;
+    int    tile_w;
+    int    tile_h;
 };
 
 /* ── Spectral colour weights (n_bands × 3): [b*3+0]=wr, [b*3+1]=wg, [b*3+2]=wb */
@@ -598,9 +606,16 @@ void main() {
             const float inv_h = float(sensor_res) / (2.0f * sensor_half_h);
             const int iy = int((c_soy + sensor_half_w) * inv_w);
             const int iz = int((c_soz + sensor_half_h) * inv_h);
-            if (iy >= 0 && iy < sensor_res && iz >= 0 && iz < sensor_res) {
-                const uint px  = uint(iy * sensor_res + iz);
-                const uint pix = uint(sensor_res) * uint(sensor_res);
+            /* Tile-local pixel addressing.  When tile_w > 0 the pixel buffer
+             * covers only [tile_y0..tile_y0+tile_h) × [tile_x0..tile_x0+tile_w);
+             * otherwise treat the whole sensor_res×sensor_res grid as one tile. */
+            const int tw  = (tile_w > 0) ? tile_w  : sensor_res;
+            const int th  = (tile_h > 0) ? tile_h  : sensor_res;
+            const int tx0 = (tile_w > 0) ? tile_x0 : 0;
+            const int ty0 = (tile_h > 0) ? tile_y0 : 0;
+            if (iy >= ty0 && iy < ty0 + th && iz >= tx0 && iz < tx0 + tw) {
+                const uint px  = uint((iy - ty0) * tw + (iz - tx0));
+                const uint pix = uint(tw) * uint(th);
                 atomic_add_float(px,          sum_r);
                 atomic_add_float(px + pix,    sum_g);
                 atomic_add_float(px + 2u*pix, sum_b);

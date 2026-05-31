@@ -9429,6 +9429,28 @@ def run(
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _HUD_W, _HUD_H, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, _hud_blank)
 
+    # Button panel texture — RGBA8, fixed size covering f-stop column + focus row.
+    _BTN_W, _BTN_H = 56, 200   # width: one button column; height: 8 stops + focus row
+    tex_btn_panel = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex_btn_panel)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _BTN_W, _BTN_H, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, np.zeros((_BTN_H, _BTN_W, 4), dtype=np.uint8))
+
+    # Focus-row panel — wider, drawn below the f-stop column.
+    _FROW_W, _FROW_H = 280, 24
+    tex_focus_panel = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex_focus_panel)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _FROW_W, _FROW_H, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, np.zeros((_FROW_H, _FROW_W, 4), dtype=np.uint8))
+
     # Lazy font for PIP stats overlay – created on first draw to avoid init cost.
     _pip_font: list = [None]  # mutable container so closure can write it
     _u_border      = glGetUniformLocation(pip_prog, "u_border")
@@ -9541,6 +9563,98 @@ def run(
                 _HUD_H,
                 hud_mode=True,
             )
+
+        # ── Control button panels (top-right corner) ─────────────────────
+        # Rendered to a pygame Surface each frame, uploaded as a GL texture,
+        # drawn via the pip quad shader.  _click_buttons stores screen-space
+        # rects (y from top) for MOUSEBUTTONDOWN hit testing.
+        _click_buttons.clear()
+
+        def _surf_to_gl_arr(surf: "pygame.Surface", w: int, h: int) -> np.ndarray:
+            s = surf.convert_alpha()
+            arr = np.zeros((h, w, 4), dtype=np.uint8)
+            arr[:, :, :3] = np.transpose(pygame.surfarray.array3d(s), (1, 0, 2))
+            arr[:, :,  3] = np.transpose(pygame.surfarray.array_alpha(s), (1, 0))
+            return arr[::-1].copy()   # flip for GL (bottom-up)
+
+        try:
+            _btn_font = (_pip_font[0] or
+                         pygame.font.SysFont("monospace", 11) or
+                         pygame.font.Font(None, 13))
+        except Exception:
+            _btn_font = pygame.font.Font(None, 13)
+
+        _iris_r    = float(getattr(getattr(bench.scene, "iris_aperture", None), "r_inner", 0.0))
+        _efl_btn   = float(getattr(getattr(bench.scene, "optical_design", None),
+                                    "effective_focal_length_m", 0.085) or 0.085)
+        _focus_now = float(getattr(bench.scene, "focus_distance_m", 0.0) or 1.0)
+        if _focus_now <= 0.0:
+            _focus_now = 1.0
+
+        # f-stop column ─────────────────────────────────────────────────────
+        _fstops = [1.4, 2.0, 2.8, 4.0, 5.6, 8.0, 11.0, 16.0]
+        _bw, _bh, _bgap = _BTN_W - 8, 20, 2
+        _fsurf = pygame.Surface((_BTN_W, _BTN_H), pygame.SRCALPHA)
+        _fsurf.fill((0, 0, 0, 0))
+        _spy = 4
+        for _fn in _fstops:
+            _r = _efl_btn / (2.0 * _fn)
+            _active = _iris_r > 0.0 and abs(_iris_r - _r) < _r * 0.09
+            _cbg = (40, 90, 140, 210) if _active else (22, 24, 30, 180)
+            _cbd = (80, 160, 220) if _active else (50, 53, 62)
+            _ctxt = (210, 230, 255) if _active else (130, 135, 150)
+            pygame.draw.rect(_fsurf, _cbg, (4, _spy, _bw, _bh))
+            pygame.draw.rect(_fsurf, _cbd, (4, _spy, _bw, _bh), 1)
+            _lbl = _btn_font.render(f"f/{_fn}", True, _ctxt)
+            _fsurf.blit(_lbl, (4 + (_bw - _lbl.get_width()) // 2,
+                                _spy + (_bh - _lbl.get_height()) // 2))
+            # Screen hit rect: top-right origin at (W - _BTN_W - 4, 4)
+            _sx = W - _BTN_W - 4 + 4
+            _sy = 4 + _spy
+            _r_cap = _r
+            _click_buttons.append(((_sx, _sy, _bw, _bh),
+                                    lambda r=_r_cap: _rebuild_bench_with_iris(r)))
+            _spy += _bh + _bgap
+
+        glBindTexture(GL_TEXTURE_2D, tex_btn_panel)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _BTN_W, _BTN_H, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, _surf_to_gl_arr(_fsurf, _BTN_W, _BTN_H))
+        # vx = right-align; vy from bottom = H - (4 + _BTN_H)
+        _btn_vx = W - _BTN_W - 4
+        _btn_vy = H - (4 + _BTN_H)
+        _draw_quad_with_pip_prog(tex_btn_panel, _btn_vx, _btn_vy,
+                                 _BTN_W, _BTN_H, hud_mode=True)
+
+        # focus row ─────────────────────────────────────────────────────────
+        _focus_presets = [("0.5m", 0.5), ("0.7m", 0.7), ("1m", 1.0),
+                          ("1.5m", 1.5), ("2m", 2.0), ("3m", 3.0), ("∞m", 50.0)]
+        _fbw, _fbh = _FROW_W // len(_focus_presets) - 2, _FROW_H - 6
+        _frsurf = pygame.Surface((_FROW_W, _FROW_H), pygame.SRCALPHA)
+        _frsurf.fill((0, 0, 0, 0))
+        _frx = 2
+        for _flabel, _fdist in _focus_presets:
+            _active = abs(_focus_now - _fdist) < 0.06 * max(1.0, _fdist)
+            _cbg = (40, 90, 140, 210) if _active else (22, 24, 30, 180)
+            _cbd = (80, 160, 220) if _active else (50, 53, 62)
+            _ctxt = (210, 230, 255) if _active else (130, 135, 150)
+            pygame.draw.rect(_frsurf, _cbg, (_frx, 3, _fbw, _fbh))
+            pygame.draw.rect(_frsurf, _cbd, (_frx, 3, _fbw, _fbh), 1)
+            _lbl = _btn_font.render(_flabel, True, _ctxt)
+            _frsurf.blit(_lbl, (_frx + (_fbw - _lbl.get_width()) // 2,
+                                3 + (_fbh - _lbl.get_height()) // 2))
+            _frow_origin_x = W - _FROW_W - 4
+            _frow_origin_y = 4 + _BTN_H + 4
+            _click_buttons.append(((_frow_origin_x + _frx, _frow_origin_y + 3, _fbw, _fbh),
+                                    lambda d=_fdist: _rebuild_bench_with_focus(d)))
+            _frx += _fbw + 2
+
+        glBindTexture(GL_TEXTURE_2D, tex_focus_panel)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _FROW_W, _FROW_H, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, _surf_to_gl_arr(_frsurf, _FROW_W, _FROW_H))
+        _frow_vx = W - _FROW_W - 4
+        _frow_vy = H - (4 + _BTN_H + 4 + _FROW_H)
+        _draw_quad_with_pip_prog(tex_focus_panel, _frow_vx, _frow_vy,
+                                 _FROW_W, _FROW_H, hud_mode=True)
 
         # ── C++ BDPT connection/progress stats under left violet PIP ───────
         _cx_stats = bench.bdpt_last_connection_stats
@@ -11074,74 +11188,6 @@ def run(
                 print(f"[pip] {_pip_exc}", flush=True)
             if frame_profiler is not None:
                 frame_profiler.end("draw_pip")
-                frame_profiler.begin("buttons")
-
-            # ── Control button panel (top-right corner) ──────────────────────
-            # Drawn into a pygame overlay surface then blitted so GL state is
-            # not disturbed.  _click_buttons is rebuilt every frame so rects
-            # stay valid after window resize.
-            _click_buttons.clear()
-            _btn_surf = pygame.Surface((W, H), pygame.SRCALPHA)
-
-            def _draw_btn(label: str, bx: int, by: int, bw: int, bh: int,
-                          active: bool, cb) -> None:
-                col_bg  = (40, 90, 140) if active else (28, 30, 36)
-                col_bd  = (80, 160, 220) if active else (55, 58, 68)
-                col_txt = (210, 230, 255) if active else (140, 145, 160)
-                pygame.draw.rect(_btn_surf, col_bg,  (bx, by, bw, bh))
-                pygame.draw.rect(_btn_surf, col_bd,  (bx, by, bw, bh), 1)
-                _lbl = _btn_font.render(label, True, col_txt)
-                _btn_surf.blit(_lbl, (bx + (bw - _lbl.get_width()) // 2,
-                                      by + (bh - _lbl.get_height()) // 2))
-                _click_buttons.append(((bx, by, bw, bh), cb))
-
-            try:
-                _btn_font = pygame.font.SysFont("monospace", 11)
-            except Exception:
-                _btn_font = pygame.font.Font(None, 13)
-
-            _iris_now  = getattr(bench.scene, "iris_aperture", None)
-            _iris_r    = float(getattr(_iris_now, "r_inner", 0.0)) if _iris_now else 0.0
-            _efl_now   = float(getattr(getattr(bench.scene, "optical_design", None),
-                                        "effective_focal_length_m", 0.085) or 0.085)
-            _focus_now = float(getattr(bench.scene, "focus_distance_m", 1.0) or 1.0)
-
-            # f-stop column  (standard full-stop series for 85mm)
-            _fstops = [1.4, 2.0, 2.8, 4.0, 5.6, 8.0, 11.0, 16.0]
-            _bw, _bh, _gap = 44, 18, 2
-            _px = W - _bw - 6
-            _py = 6
-            for _fn in _fstops:
-                _r = _efl_now / (2.0 * _fn)
-                _active = abs(_iris_r - _r) < _r * 0.08 if _iris_r > 0 else False
-                _fn_label = f"f/{_fn}"
-                _r_capture = _r
-                _draw_btn(_fn_label, _px, _py, _bw, _bh, _active,
-                           lambda r=_r_capture: _rebuild_bench_with_iris(r))
-                _py += _bh + _gap
-
-            # Focus distance row below f-stops
-            _focus_presets = [("0.5m", 0.5), ("0.7m", 0.7), ("1m", 1.0),
-                              ("1.5m", 1.5), ("2m", 2.0), ("3m", 3.0), ("∞", 50.0)]
-            _fbw, _fbh = 36, 18
-            _frow_total = len(_focus_presets) * (_fbw + _gap) - _gap
-            _fpx = W - _frow_total - 6
-            _fpy = _py + 4
-            for _flabel, _fdist in _focus_presets:
-                _active = abs(_focus_now - _fdist) < 0.05 * _fdist
-                _draw_btn(_flabel, _fpx, _fpy, _fbw, _fbh, _active,
-                           lambda d=_fdist: _rebuild_bench_with_focus(d))
-                _fpx += _fbw + _gap
-
-            # Blit the overlay (GL → pygame surface)
-            glDisable(GL_DEPTH_TEST)
-            _scr = pygame.display.get_surface()
-            if _scr is not None:
-                _scr.blit(_btn_surf, (0, 0))
-            glEnable(GL_DEPTH_TEST)
-
-            if frame_profiler is not None:
-                frame_profiler.end("buttons")
                 frame_profiler.begin("flip")
             pygame.display.flip()
             if frame_profiler is not None:

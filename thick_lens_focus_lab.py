@@ -64,6 +64,7 @@ from camera_software.exposure_timing import (
     SceneSnapshot,
 )
 from camera_software.scene_version import SceneVersionCache
+from camera_software.sdcard import SDCard as _SDCard
 from physics_backend import PhysicsBackend
 try:
     import torch
@@ -8519,6 +8520,7 @@ def run(
     neural_payload_out: str = "",
     parametric: bool = False,
     t5_light_batch: int = 0,
+    t5_cam_batch: int = 0,
     t5_sensor_tile: int = 0,
     no_gpu_t5: bool = False,
 ) -> None:
@@ -8636,13 +8638,16 @@ def run(
     if _t5_light_batch > 0:
         bench.tracer.set_t5_light_batch_size(_t5_light_batch)
         print(f"[t5] light batch {_t5_light_batch:_} verts/dispatch", flush=True)
+    _t5_cam_batch = int(t5_cam_batch)
+    if _t5_cam_batch > 0:
+        bench.tracer.set_t5_cam_batch_size(_t5_cam_batch)
+        print(f"[t5] cam batch {_t5_cam_batch:_} verts/dispatch", flush=True)
     _t5_sensor_tile = int(t5_sensor_tile)
     if _t5_sensor_tile > 0:
         bench.tracer.set_t5_sensor_tile_size(_t5_sensor_tile)
         print(f"[t5] sensor tile {_t5_sensor_tile}×{_t5_sensor_tile} px/tile", flush=True)
     if no_gpu_t5:
-        bench.tracer.set_force_cpu_t5(True)
-        print("[t5] GPU T5 disabled — using CPU run_t5_allpairs()", flush=True)
+        print("[t5] --no-gpu-t5 flag is no longer honoured — GPU T5 always active when compute_mode=gpu", flush=True)
 
     print(f"[bench] tris={bench.n_tris}  bands={bench.n_bands}  "
           f"view={view_w}x{view_h}  sensor_amp_gain={bench.sensor_amp_gain}  "
@@ -10516,62 +10521,23 @@ def run(
                 flush=True,
             )
 
-            # Save all three images for this exposure.
+            # Save all three images for this exposure via the camera SD card.
             try:
                 _stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_exp{_exp_n:03d}"
-
-                def _save_float_rgb_png_inline(arr: np.ndarray, path: str) -> None:
-                    peak = np.percentile(arr, 99.9)
-                    if peak <= 0.0:
-                        peak = arr.max()
-                    if peak <= 0.0:
-                        peak = 1.0
-                    norm = np.clip(arr / peak, 0.0, 1.0)
-                    u8 = (norm * 255.0 + 0.5).astype(np.uint8)
-                    try:
-                        from PIL import Image as _PILImage
-                        _PILImage.fromarray(u8, mode="RGB").save(path)
-                    except ImportError:
-                        import zlib as _zlib, struct as _struct
-                        h, w = u8.shape[:2]
-                        def _png_chunk(tag: bytes, data: bytes) -> bytes:
-                            c = _struct.pack(">I", len(data)) + tag + data
-                            return c + _struct.pack(">I", _zlib.crc32(tag + data) & 0xFFFFFFFF)
-                        rows = b"".join(b"\x00" + u8[y].tobytes() for y in range(h))
-                        raw = _png_chunk(b"IHDR", _struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-                        raw += _png_chunk(b"IDAT", _zlib.compress(rows, 6))
-                        raw += _png_chunk(b"IEND", b"")
-                        with open(path, "wb") as _f:
-                            _f.write(b"\x89PNG\r\n\x1a\n" + raw)
-
-                _fwd_arr = bench._forward_img_accum
-                if _fwd_arr is not None and _fwd_arr.ndim == 3 and np.any(_fwd_arr > 0):
-                    _p = f"forward_{_stamp}.png"
-                    _save_float_rgb_png_inline(_fwd_arr, _p)
-                    print(f"[save] forward → {_p}", flush=True)
-
-                _rev_arr = bench._reverse_img_accum
-                if _rev_arr is not None and _rev_arr.ndim == 3 and np.any(_rev_arr > 0):
-                    _p = f"reverse_{_stamp}.png"
-                    _save_float_rgb_png_inline(_rev_arr, _p)
-                    print(f"[save] reverse → {_p}", flush=True)
-
-                # Direct lighting: sensor_accum snapshot taken before T5 ran.
-                # Always saved — non-zero whenever any camera ray hit an emissive surface.
-                if _direct_img is not None and np.any(_direct_img > 0):
-                    _p = f"direct_{_stamp}.png"
-                    _save_float_rgb_png_inline(_direct_img, _p)
-                    print(f"[save] direct  → {_p}", flush=True)
-                else:
-                    print("[save] direct image empty — skipped", flush=True)
-
-                _bdpt_arr = bench._last_bdpt_plate_rgb
-                if _bdpt_arr is not None and _bdpt_arr.ndim == 3 and np.any(_bdpt_arr > 0):
-                    _p = f"bdpt_{_stamp}.png"
-                    _save_float_rgb_png_inline(_bdpt_arr, _p)
-                    print(f"[save] bdpt    → {_p}", flush=True)
+                _sdcard = _SDCard()
+                _sdcard.save_exposure(
+                    _stamp,
+                    {
+                        "forward": bench._forward_img_accum,
+                        "reverse": bench._reverse_img_accum,
+                        "direct":  _direct_img,
+                        "bdpt":    bench._last_bdpt_plate_rgb,
+                    },
+                    tonemap="log1p",
+                    disc_tags={"bdpt"},
+                )
             except Exception as _sv_exc:
-                print(f"[save] PNG export failed: {_sv_exc}", flush=True)
+                print(f"[sdcard] exposure save failed: {_sv_exc}", flush=True)
 
         def _reset_for_next_exposure() -> None:
             """Clear accumulators and pipeline state ready for a fresh exposure."""
@@ -10670,10 +10636,10 @@ def run(
         new_bench.compute_mode         = str(compute_mode)
         if _t5_light_batch > 0:
             new_bench.tracer.set_t5_light_batch_size(_t5_light_batch)
+        if _t5_cam_batch > 0:
+            new_bench.tracer.set_t5_cam_batch_size(_t5_cam_batch)
         if _t5_sensor_tile > 0:
             new_bench.tracer.set_t5_sensor_tile_size(_t5_sensor_tile)
-        if no_gpu_t5:
-            new_bench.tracer.set_force_cpu_t5(True)
         if _gl_display_hglrc:
             if _gl_display_hdc:
                 new_bench.tracer.set_gl_display_hdc(_gl_display_hdc)
@@ -10684,6 +10650,19 @@ def run(
                 new_bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
             except Exception as exc:
                 print(f"[bench-rebuild] blit weight upload failed: {exc}", flush=True)
+        # Pre-create the pipeline with GPU settings so submit_sensor_sweep (which
+        # fires before trace_forward on the first exposure tick) does not create
+        # a CPU pipeline by calling _get_pipeline while _use_gpu_compute is still
+        # false (new PyRayTracer defaults to use_gpu_compute=False).
+        if compute_mode in ("gpu", "mixed"):
+            new_bench.tracer.ensure_pipeline(
+                max_children=2,
+                seed=13579,
+                min_amplitude=float(new_bench._min_amplitude),
+                use_gpu_compute=True,
+                gpu_all_stages=(compute_mode == "gpu"),
+                shader_dir=_SHADER_DIR,
+            )
         _new_pip_res = int(max(16, scene.image_plate.sensor_res))
         new_bench._configure_cpp_sensor_image(_new_pip_res, 0.008)
 
@@ -11081,84 +11060,8 @@ def run(
             glDeleteShader(mfs)
         except Exception as _gl_exc:
             print(f"[cleanup] GL shader delete warning: {_gl_exc}", flush=True)
-        # 4. Save final forward and BDPT images as PNGs for post-run inspection.
-        try:
-            import datetime as _dt
-            _stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-            def _save_float_rgb_png(arr: np.ndarray, path: str) -> None:
-                """Save a float HxWx3 accumulator array to a PNG file.
-                Normalises by the 99.9th-percentile peak so the image is
-                exposed correctly regardless of the raw photon-count scale."""
-                peak = np.percentile(arr, 99.9)
-                if peak <= 0.0:
-                    peak = arr.max()
-                if peak <= 0.0:
-                    peak = 1.0
-                norm = np.clip(arr / peak, 0.0, 1.0)
-                u8 = (norm * 255.0 + 0.5).astype(np.uint8)
-                try:
-                    from PIL import Image as _PILImage
-                    _PILImage.fromarray(u8, mode="RGB").save(path)
-                except ImportError:
-                    # Fallback: write a minimal PNG using only stdlib + numpy.
-                    import zlib as _zlib, struct as _struct
-                    h, w = u8.shape[:2]
-                    def _png_chunk(tag: bytes, data: bytes) -> bytes:
-                        c = _struct.pack(">I", len(data)) + tag + data
-                        return c + _struct.pack(">I", _zlib.crc32(tag + data) & 0xFFFFFFFF)
-                    rows = b"".join(b"\x00" + u8[y].tobytes() for y in range(h))
-                    raw = _png_chunk(b"IHDR", _struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
-                    raw += _png_chunk(b"IDAT", _zlib.compress(rows, 6))
-                    raw += _png_chunk(b"IEND", b"")
-                    with open(path, "wb") as _f:
-                        _f.write(b"\x89PNG\r\n\x1a\n" + raw)
-
-            _fwd_arr = bench._forward_img_accum
-            if _fwd_arr is not None and _fwd_arr.ndim == 3 and np.any(_fwd_arr > 0):
-                _fwd_path = f"forward_{_stamp}.png"
-                _save_float_rgb_png(_fwd_arr, _fwd_path)
-                print(f"[save] forward image → {_fwd_path}", flush=True)
-            else:
-                print("[save] forward image empty — skipped", flush=True)
-
-            _rev_arr = bench._reverse_img_accum
-            if _rev_arr is not None and _rev_arr.ndim == 3 and np.any(_rev_arr > 0):
-                _rev_path = f"reverse_{_stamp}.png"
-                _save_float_rgb_png(_rev_arr, _rev_path)
-                print(f"[save] reverse strike image → {_rev_path}", flush=True)
-            else:
-                print("[save] reverse strike image empty — skipped", flush=True)
-
-            _bdpt_arr = bench._last_bdpt_plate_rgb
-            if _bdpt_arr is not None and _bdpt_arr.ndim == 3 and np.any(_bdpt_arr > 0):
-                _bdpt_path = f"bdpt_{_stamp}.png"
-                # Mask pixels outside the inscribed disc (the physical sensor aperture).
-                # The n×n pixel grid tiles the sensor plane; the valid area is the circle
-                # of radius n/2 centred on the tile — corners are outside the sensor.
-                _bh, _bw = _bdpt_arr.shape[:2]
-                _cy, _cx = (_bh - 1) * 0.5, (_bw - 1) * 0.5
-                _r2 = (min(_bh, _bw) * 0.5) ** 2
-                _yy, _xx = np.ogrid[:_bh, :_bw]
-                _disc_mask = ((_yy - _cy) ** 2 + (_xx - _cx) ** 2) <= _r2  # (H, W) bool
-                _masked = _bdpt_arr.copy()
-                _masked[~_disc_mask] = 0.0
-                # Normalise using only in-disc pixels so corner artefacts cannot drive
-                # the scale and black out the valid image centre.
-                _disc_vals = _masked[_disc_mask]
-                _peak = float(np.percentile(_disc_vals, 99.9)) if _disc_vals.size else 0.0
-                if _peak <= 0.0:
-                    _peak = float(_disc_vals.max()) if _disc_vals.size else 0.0
-                if _peak <= 0.0:
-                    _peak = 1.0
-                _save_float_rgb_png(np.clip(_masked / _peak, 0.0, 1.0), _bdpt_path)
-                print(f"[save] BDPT image → {_bdpt_path}", flush=True)
-            else:
-                print("[save] BDPT image empty — skipped", flush=True)
-        except Exception as _save_exc:
-            print(f"[save] PNG export failed: {_save_exc}", flush=True)
-
-        # 5. Destroy the C++ pipeline and its worker threads.
+        # 4. Destroy the C++ pipeline and its worker threads.
         #    PyRayTracer.__del__ calls ray_pipeline_destroy() which joins all std::threads.
         del bench
         gc.collect()

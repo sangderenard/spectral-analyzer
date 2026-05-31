@@ -71,6 +71,12 @@ from .scene_version import (
     SceneVersion,
     SceneVersionCache,
 )
+from .sdcard import (
+    SDCard,
+    tonemap_log1p,
+    tonemap_percentile,
+    DEFAULT_SDCARD_ROOT,
+)
 __all__ = [
     "SpeedSpline",
     "MotorDrive",
@@ -145,4 +151,8 @@ __all__ = [
     "PhysicsActor",
     "SceneVersion",
     "SceneVersionCache",
+    "SDCard",
+    "tonemap_log1p",
+    "tonemap_percentile",
+    "DEFAULT_SDCARD_ROOT",
 ]

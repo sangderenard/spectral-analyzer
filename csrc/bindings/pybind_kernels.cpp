@@ -558,8 +558,9 @@ struct PyRayTracer
     /* T5 connection config */
     float    _t5_min_geom          = 1e-8f;
     uint32_t _t5_light_batch_size  = 0;
+    uint32_t _t5_cam_batch_size    = 0;
     uint32_t _t5_sensor_tile_size  = 0;
-    bool     _force_cpu_t5         = false;
+
 
     /* Flash modifier config */
     int   _flash_modifier_type   = static_cast<int>(FlashModifierType::SNOOT);
@@ -592,6 +593,7 @@ struct PyRayTracer
             cfg.gl_display_hdc          = _gl_display_hdc;
             cfg.t5_min_geom             = _t5_min_geom;
             cfg.t5_light_batch_size     = _t5_light_batch_size;
+            cfg.t5_cam_batch_size       = _t5_cam_batch_size;
             cfg.t5_sensor_tile_size     = _t5_sensor_tile_size;
             cfg.flash_modifier_type     = static_cast<FlashModifierType>(_flash_modifier_type);
             cfg.flash_modifier_param0   = _flash_modifier_param0;
@@ -609,8 +611,7 @@ struct PyRayTracer
                 ray_pipeline_set_uv_blit_weights(
                     _pipeline, _uv_blit_weights.data(),
                     _uv_blit_n_bands, _uv_blit_mode);
-            if (_force_cpu_t5)
-                ray_pipeline_set_force_cpu_t5(_pipeline, true);
+
         }
         return _pipeline;
     }
@@ -2378,15 +2379,17 @@ struct PyRayTracer
         if (_pipeline) ray_pipeline_set_t5_light_batch_size(_pipeline, n);
     }
 
+    void set_t5_cam_batch_size(uint32_t n) {
+        _t5_cam_batch_size = n;
+        if (_pipeline) ray_pipeline_set_t5_cam_batch_size(_pipeline, n);
+    }
+
     void set_t5_sensor_tile_size(uint32_t n) {
         _t5_sensor_tile_size = n;
         if (_pipeline) ray_pipeline_set_t5_sensor_tile_size(_pipeline, n);
     }
 
-    void set_force_cpu_t5(bool v) {
-        _force_cpu_t5 = v;
-        if (_pipeline) ray_pipeline_set_force_cpu_t5(_pipeline, v);
-    }
+    void set_force_cpu_t5(bool /*v*/) {}
 
     void stop_pipeline() {
         std::lock_guard<std::mutex> lk(_pipeline_mu);
@@ -2443,6 +2446,16 @@ struct PyRayTracer
         out["gpu_uv_readback_count"] = static_cast<unsigned long long>(s.gpu_uv_readback_count);
         out["gpu_hit_readback_mb"] = static_cast<double>(s.gpu_hit_readback_bytes) / (1024.0 * 1024.0);
         out["gpu_hit_readback_count"] = static_cast<unsigned long long>(s.gpu_hit_readback_count);
+        /* GPU dispatch health:
+         *   0=disabled  1=init_failed  2=thread_spawned
+         *   3=thread_running  4=thread_failed  5=thread_exited_ok */
+        int gds = ray_pipeline_gpu_dispatch_state(_pipeline);
+        out["gpu_dispatch_state"] = gds;
+        static const char* const _gds_names[] = {
+            "disabled", "init_failed", "thread_spawned",
+            "thread_running", "thread_failed", "thread_exited_ok"};
+        out["gpu_dispatch_status"] = (gds >= 0 && gds <= 5) ? _gds_names[gds] : "unknown";
+        out["gpu_ok"] = (gds == 3 || gds == 5);
         return out;
     }
 
@@ -5610,6 +5623,14 @@ destruction so the old context is gone before a new shared context is created.)d
 R"doc(Set the number of light vertices processed per T5 GPU dispatch (default 20480).
 Larger values reduce dispatch overhead and improve GPU utilisation; derive from
 --t5-vram-mb as n = vram_mb * 1024^2 / 48 (12 floats × 4 bytes per light vert).
+Safe to call before or after pipeline creation.)doc")
+        .def("set_t5_cam_batch_size",
+             &PyRayTracer::set_t5_cam_batch_size,
+             py::arg("n"),
+R"doc(Set the number of camera vertices processed per T5 GPU dispatch (default 8192).
+Splitting the X-dispatch dimension prevents Windows TDR watchdog kills when
+n_cam is large. Smaller values reduce per-dispatch GPU time at the cost of
+more dispatch overhead. 0 restores the default (8192).
 Safe to call before or after pipeline creation.)doc")
         .def("set_t5_sensor_tile_size",
              &PyRayTracer::set_t5_sensor_tile_size,

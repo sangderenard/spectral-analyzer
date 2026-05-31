@@ -617,9 +617,9 @@ struct T5GpuParams {
     float    min_geom;         /* geometry-term floor                   */
     float    sensor_half_w;    /* sensor half-width  (Y axis, metres)   */
     float    sensor_half_h;    /* sensor half-height (Z axis, metres)   */
-    float    _pad0;
+    uint32_t cam_offset;       /* first cam vert index for this cbatch  */
     uint32_t n_light_verts;    /* total light vertices                  */
-    uint32_t n_cam_verts;
+    uint32_t n_cam_verts;      /* upper bound: cam_offset + cbatch size */
     int32_t  sensor_res;       /* pixel grid side (res×res image)       */
     uint32_t light_batch_size; /* light verts per dispatch (TDR guard)  */
     uint32_t light_offset;     /* first light vert index in this batch  */
@@ -715,6 +715,7 @@ struct RayPipelineConfig {
     int         gpu_batch_size_t4  = 0;
     int         gpu_batch_size_t5  = 0;
     uint32_t    t5_light_batch_size  = 0;  /* 0 = use built-in default (T5_LIGHT_BATCH) */
+    uint32_t    t5_cam_batch_size    = 0;  /* 0 = use built-in default (8192)           */
     uint32_t    t5_sensor_tile_size  = 0;  /* 0 = use built-in default (128)            */
 
     /* Fraction of work to pin to GPU per stage (0=compete freely, >0=soft target).
@@ -842,9 +843,19 @@ void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps);
  * reading the sensor image. */
 void ray_pipeline_join_t5(RayPipelineState* ps);
 
+/* GPU dispatch health state (safe to call from any thread / Python):
+ *   0 = disabled (use_gpu_compute=false)
+ *   1 = init failed (GL context creation or shader compile error)
+ *   2 = thread spawned, make_current not yet attempted
+ *   3 = thread running (make_current succeeded, scene uploaded)
+ *   4 = thread failed (make_current failed in worker thread)
+ *   5 = thread exited normally (Q_intent exhausted) */
+int ray_pipeline_gpu_dispatch_state(const RayPipelineState* ps);
+
 /* Live-update T5 connection-pass configuration. */
 void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
 void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n);
+void ray_pipeline_set_t5_cam_batch_size(RayPipelineState* ps, uint32_t n);
 void ray_pipeline_set_t5_sensor_tile_size(RayPipelineState* ps, uint32_t n);
 void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v);
 

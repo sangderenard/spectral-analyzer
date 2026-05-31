@@ -87,9 +87,9 @@
  *   float  min_geom        geometry-term floor
  *   float  sensor_half_w   sensor half-width  (Y axis, metres)
  *   float  sensor_half_h   sensor half-height (Z axis, metres)
- *   float  _pad0
+ *   uint   cam_offset       first cam vert index for this cbatch
  *   uint   n_light_verts
- *   uint   n_cam_verts
+ *   uint   n_cam_verts      upper bound: cam_offset + cbatch size
  *   int    sensor_res      pixel grid side (res×res)
  *   uint   light_batch_size
  *   uint   light_offset    first light vert index for this dispatch
@@ -153,7 +153,7 @@ layout(std430, binding = 3) readonly buffer T5ParamsBuf {
     float  min_geom;
     float  sensor_half_w;
     float  sensor_half_h;
-    float  _pad0;
+    uint   cam_offset;
     uint   n_light_verts;
     uint   n_cam_verts;
     int    sensor_res;
@@ -445,8 +445,9 @@ void main() {
     const uint total = uint(TILE_C) * uint(TILE_L);   /* 64 */
 
     /* Global tile bases.  light_tile is relative to the current batch origin,
-     * so the absolute light vert index = light_offset + light_tile + lid_l. */
-    const uint cam_tile   = gl_WorkGroupID.x * uint(TILE_C);
+     * so the absolute light vert index = light_offset + light_tile + lid_l.
+     * cam_offset shifts the X-axis base for camera-vertex batching (cbatch). */
+    const uint cam_tile   = cam_offset + gl_WorkGroupID.x * uint(TILE_C);
     const uint light_tile = gl_WorkGroupID.y * uint(TILE_L);
 
     /* ── Cooperative tile loads ─────────────────────────────────────────── *

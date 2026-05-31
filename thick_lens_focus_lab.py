@@ -1257,7 +1257,8 @@ class SceneConfig:
     exit_pupil_x: float = 1.85
     exit_pupil_radius: float = 0.008   # 8 mm radius
     exit_pupil_thickness: float = 0.0003  # 0.3 mm — blade aperture
-    lens_hood_front_radius: float = 0.115
+    lens_hood_front_radius: float = 0.115  # legacy override; ignored when camera_barrel_r is set
+    camera_barrel_r: float = 0.0           # outer barrel radius (m); auto-set from lens design
     # Optional supplementary macro lens (close focus helper): inserted at the front
     # to extend working distance and achieve extreme magnification.
     # Leave None to use standard lens stack; set to a LensConfig to add macro element.
@@ -1337,6 +1338,7 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
                 # scene.tube_radius is a scene scale.  Keep it stable so camera
                 # placement does not stretch the rest of the world.
                 camera_barrel_r = float(design.max_group_radius_m + 0.012)
+                scene.camera_barrel_r = camera_barrel_r
 
                 design = _dc.replace(
                     design,
@@ -3271,16 +3273,64 @@ def _build_scene_mesh(
         else:
             # Camera-owned lens hood: a conic frustum from the front mouth into
             # the first lens seat, with no imported stage walls or light tubes.
-            hood_depth = float(min(0.030, max(0.010, 0.35 * first_lens.aperture_radius)))
+            #
+            # ── Hood sizing from scene-side acceptance angle ───────────────────
+            # The hood must pass every ray from the object plane that can reach
+            # the entrance element clear aperture.  The maximum such angle is:
+            #
+            #   tan(θ_accept) = (r_entrance + r_field) / z_object_to_lens
+            #
+            # where r_entrance is the first-element clear aperture, r_field is
+            # the image-plate radius (scene field half-height proxy), and
+            # z_object_to_lens is the object-to-entrance-element distance.
+            # This is a SCENE-SIDE angle, independent of aperture stop setting.
+            #
+            # DO NOT use the image-side FOV angle (image_plate.radius /
+            # (sensor_x - first_lens.x_front)) — that is the image half-angle,
+            # ~3× too wide here, and causes the hood mouth to be grossly
+            # oversized, which in turn forces the ring light far outside the
+            # barrel and lets out-of-FOV scene rays escape at wide apertures.
+            _x_obj = float(getattr(getattr(scene, "object_plane", None), "x", None)
+                           or getattr(scene, "source_x", 0.0) or 0.0)
+            _z_obj = max(float(first_lens.x_front) - _x_obj, 1.0e-3)
+            _r_field = float(scene.image_plate.radius)
+            _r_entrance = float(first_lens.aperture_radius)
+            # tan of the widest scene-side acceptance angle the hood must pass
+            _tan_accept = (_r_entrance + _r_field) / _z_obj
+
+            hood_depth = float(min(0.030, max(0.010, 0.35 * _r_entrance)))
             hood_x0 = float(first_lens.x_front - hood_depth)
             hood_x1 = float(first_lens.x_front - 0.002)
-            hood_r1 = float(max(lens_housing_r, first_lens.aperture_radius + 0.004))
-            _hood_depth = max(float(first_lens.x_front) - float(hood_x0), 1.0e-5)
-            _tan_half_fov = float(scene.image_plate.radius) / max(float(scene.image_plate.x) - float(first_lens.x_front), 1.0e-5)
-            _hood_r_fov = float(first_lens.aperture_radius) + _hood_depth * _tan_half_fov
-            hood_clear_r0 = float(max(scene.lens_hood_front_radius, hood_r1 + 0.010, _hood_r_fov))
-            hood_wall = float(max(0.004, 0.035 * hood_clear_r0))
+            # Throat: sized to the barrel bore / housing radius at the first lens seat
+            hood_r1 = float(max(lens_housing_r, _r_entrance + 0.004))
+            # Mouth clear radius: entrance aperture + hood depth × acceptance tan
+            hood_clear_r0 = float(_r_entrance + hood_depth * _tan_accept)
+            hood_clear_r0 = float(max(hood_clear_r0, hood_r1 + 0.004))
+            hood_wall = float(max(0.004, 0.025 * hood_clear_r0))
             hood_r0 = float(hood_clear_r0 + hood_wall)
+
+            # ── Barrel outer radius: source of truth for ring/hood anatomy ────
+            # Prefer the value stored from the solver; fall back to first-lens
+            # aperture + nominal wall margins so the geometry is always consistent.
+            _barrel_outer_r = float(getattr(scene, "camera_barrel_r", 0.0))
+            if _barrel_outer_r < _r_entrance:
+                _barrel_outer_r = float(_r_entrance + 0.020)
+
+            # ── Barrel anatomy diagnostic ─────────────────────────────────────
+            print(
+                "[barrel-anatomy]",
+                f"portal_x={first_lens.x_front:.4f}",
+                f"barrel_outer_r={_barrel_outer_r*1e3:.1f}mm",
+                f"entrance_r={_r_entrance*1e3:.1f}mm",
+                f"accept_tan={_tan_accept:.4f}",
+                f"accept_deg={math.degrees(math.atan(_tan_accept)):.2f}°",
+                f"hood_depth={hood_depth*1e3:.1f}mm",
+                f"hood_mouth_clear_r={hood_clear_r0*1e3:.1f}mm",
+                f"ring_mount_x={first_lens.x_front:.4f}",
+                f"ring_r_inner={(_barrel_outer_r+0.003)*1e3:.1f}mm",
+                flush=True,
+            )
+
             _build_sensor_aperture_frustum(
                 hood_x0,
                 hood_r0,
@@ -3302,13 +3352,20 @@ def _build_scene_mesh(
                 idx_aperture_black,
                 tri_ids=black_wall_tri_ids,
             )
-            # ── Ring light: emissive annulus flush with the front face of the hood ──
+            # ── Ring light: emissive annulus at the barrel scene-side portal ──
+            # Mounted at first_lens.x_front (scene-facing face of the barrel),
+            # wrapping around the outside of the barrel.  NOT at the hood mouth:
+            # placing the ring at the hood mouth puts it in free air 25-30 mm
+            # forward of the barrel, where its rays can enter the acceptance cone
+            # at field extrema.  At the barrel portal the ring's forward-facing
+            # rays are nearly perpendicular to the optical axis (≥ 87°) and
+            # cannot enter the scene-side acceptance cone (≤ 5°).
             if bool(getattr(scene, "ring_light_enabled", True)):
-                _rl_r_inner = hood_r0
+                _rl_x       = float(first_lens.x_front)
+                _rl_r_inner = float(_barrel_outer_r + 0.003)
                 _rl_r_outer = _rl_r_inner + float(getattr(scene, "ring_light_width_m", 0.018))
-                _rl_x = hood_x0
-                _rl_n = int(getattr(scene, "ring_light_n_sectors", 72))
-                _rl_before = len(tris)
+                _rl_n       = int(getattr(scene, "ring_light_n_sectors", 72))
+                _rl_before  = len(tris)
                 _build_ring_light(
                     x_pos=_rl_x,
                     r_inner=_rl_r_inner,

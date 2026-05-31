@@ -2341,7 +2341,7 @@ struct PyRayTracer
         py::gil_scoped_release release;
         return ray_pipeline_submit_sensor_sweep(
             ps, max_bounces, min_amplitude, max_rays,
-            pix_offset, static_cast<uint64_t>(static_cast<uint32_t>(seed)),
+            pix_offset, static_cast<uint64_t>(static_cast<unsigned int>(seed)),
             shutter_mode, shutter_open, shutter_center_u, shutter_center_v,
             shutter_softness, exposure_weight);
     }

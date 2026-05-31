@@ -8764,6 +8764,9 @@ public:
             glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ssbo_counter);
             glc_DispatchComputeIndirect((GLintptr)(5 * sizeof(uint32_t)));
             glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+            /* Drain GL error here so any error (e.g. 0-workgroup indirect) is
+             * attributed to T3, not silently queued until the next T1:BVH check. */
+            gpu_check_dispatch("T3:material-indirect", 0, 0, 0);
         } else {
             /* Fallback: CPU-side count (prog_dispatch_prep failed to compile at init) */
             uint32_t cnt0 = 0u;
@@ -9429,6 +9432,21 @@ public:
             t5_job_ready.store(false, std::memory_order_release);
         }
         if (!job) return;
+        /* Wrap everything so an unhandled exception fulfills the promise with
+         * an error (unblocking the caller) rather than escaping the GPU thread
+         * and triggering std::terminate(). */
+        try {
+        service_t5_job_impl(job);
+        } catch (...) {
+            fprintf(stderr, "[T5-gpu] FATAL exception in T5 GPU job — fulfilling promise with error\n");
+            fflush(stderr);
+            try { job->promise.set_exception(std::current_exception()); }
+            catch (...) {}
+            throw;  /* re-throw so the GPU thread's outer try-catch can log it */
+        }
+    }
+
+    void service_t5_job_impl(std::unique_ptr<T5Job>& job) {
 
         const auto& lv  = job->light_verts;
         const auto& cv  = job->cam_verts;
@@ -9664,6 +9682,8 @@ public:
                 if (!gpu_ok) break;
 
                 /* ── Readback tile pixel accum and scatter into full result ── */
+                fprintf(stderr, "[T5-gpu tile(%d,%d)] readback start\n", tx, ty);
+                fflush(stderr);
                 std::vector<uint32_t> tile_pix(3u * n_tile_pix);
                 glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
                 glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
@@ -11031,7 +11051,24 @@ RayPipelineState* ray_pipeline_create(
             ps->gpu_dispatch_state.store(2, std::memory_order_release);
             gl_compute_release_current();   /* transfer ownership to the GPU worker thread */
             ps->workers.emplace_back([ps]() {
-                ps->gpu_dispatch->thread_main(*ps);
+                try {
+                    ps->gpu_dispatch->thread_main(*ps);
+                } catch (const std::bad_alloc&) {
+                    fprintf(stderr, "[gpu-dispatch] FATAL std::bad_alloc — out of memory\n");
+                    fflush(stderr);
+                    ps->gpu_dispatch_state.store(4, std::memory_order_release);
+                    ps->Q_intent.set_done();
+                } catch (const std::exception& e) {
+                    fprintf(stderr, "[gpu-dispatch] FATAL exception: %s\n", e.what());
+                    fflush(stderr);
+                    ps->gpu_dispatch_state.store(4, std::memory_order_release);
+                    ps->Q_intent.set_done();
+                } catch (...) {
+                    fprintf(stderr, "[gpu-dispatch] FATAL unknown exception\n");
+                    fflush(stderr);
+                    ps->gpu_dispatch_state.store(4, std::memory_order_release);
+                    ps->Q_intent.set_done();
+                }
             });
         } else {
             fprintf(stderr, "[gpu-dispatch] GL init FAILED (%s) — falling back to CPU\n",
@@ -11507,24 +11544,19 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
 
     /* ── Aperture disk sampling ─────────────────────────────────────────────
      * aperture_seed == 0: all rays aim at the aperture center (backward compat).
-     * aperture_seed >  0: random aperture point, seeded from aperture_seed.
+     * aperture_seed >  0: per-pixel random point within the aperture disc.
      *
-     * Two independent splitmix64 hashes give uniform area coverage across
-     * independent sweeps without any regular spiral structure, which prevents
-     * the discrete multi-lobe bokeh artifacts that Fibonacci / golden-angle
-     * quasi-random sequences produce.
+     * The aperture target is computed INSIDE the pixel loop so each pixel gets
+     * an independent sample.  The pixel index is mixed into the seed via the
+     * Fibonacci hash constant so consecutive pixels map to well-spread aperture
+     * positions, and different sweep calls (different aperture_seed values) visit
+     * different but non-overlapping regions of the disc.
+     *
+     * A single pre-call target is kept only for the aperture_seed==0 (center)
+     * path so the loop body stays the same in that case.
      */
-    double ap_y = 0.0, ap_z = 0.0;
-    if (aperture_seed > 0 && target_r > 0.0) {
-        uint64_t h = rt_splitmix64(aperture_seed);
-        const double r_frac = static_cast<double>(h >> 32) / 4294967296.0; /* [0,1) */
-        h = rt_splitmix64(h);
-        const double theta  = 2.0 * M_PI * (static_cast<double>(h >> 32) / 4294967296.0);
-        const double ap_r   = std::sqrt(r_frac) * target_r;
-        ap_y = ap_r * std::cos(theta);
-        ap_z = ap_r * std::sin(theta);
-    }
-    const V3d target(target_x, ap_y, ap_z);
+    const bool do_aperture_jitter = (aperture_seed > 0 && target_r > 0.0);
+    const V3d target_center(target_x, 0.0, 0.0); /* used when aperture_seed==0 */
 
     const int n_bands = std::max(1, std::min(ps->st->n_bands, MAX_SPECTRAL_BANDS));
     const double half_w = static_cast<double>(ps->sensor_half_w);
@@ -11578,6 +11610,18 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         if (!(shutter_w > 0.0) || !std::isfinite(shutter_w))
             continue;
         V3d pos(static_cast<double>(ps->sensor_px), y, z);
+        /* Per-pixel aperture target: mix pixel index into seed so each pixel
+         * independently samples the aperture disc.  0x9E3779B97F4A7C15 is the
+         * 64-bit Fibonacci hash constant — consecutive pix values spread widely. */
+        V3d target = target_center;
+        if (do_aperture_jitter) {
+            uint64_t h = rt_splitmix64(aperture_seed ^ (static_cast<uint64_t>(pix) * 0x9E3779B97F4A7C15ULL));
+            const double r_frac = static_cast<double>(h >> 32) / 4294967296.0;
+            h = rt_splitmix64(h);
+            const double theta = 2.0 * M_PI * (static_cast<double>(h >> 32) / 4294967296.0);
+            const double ap_r  = std::sqrt(r_frac) * target_r;
+            target = V3d(target_x, ap_r * std::cos(theta), ap_r * std::sin(theta));
+        }
         V3d dir = target - pos;
         if (dir.squaredNorm() <= 1e-24)
             dir = V3d(-1.0, 0.0, 0.0);
@@ -12267,7 +12311,21 @@ static void t5_kpn_worker(RayPipelineState* ps)
         if (n == 0) break;                           /* set_done → exit */
         fprintf(stderr, "[T5-kpn] sentinel received — running connection pass\n");
         fflush(stderr);
-        ray_pipeline_run_bdpt_connection(ps);
+        try {
+            ray_pipeline_run_bdpt_connection(ps);
+        } catch (const std::bad_alloc&) {
+            fprintf(stderr, "[T5-kpn] FATAL std::bad_alloc in connection pass — out of memory\n");
+            fflush(stderr);
+            break;
+        } catch (const std::exception& e) {
+            fprintf(stderr, "[T5-kpn] FATAL exception in connection pass: %s\n", e.what());
+            fflush(stderr);
+            break;
+        } catch (...) {
+            fprintf(stderr, "[T5-kpn] FATAL unknown exception in connection pass\n");
+            fflush(stderr);
+            break;
+        }
     }
     fprintf(stderr, "[T5-kpn] worker exiting\n");
     fflush(stderr);

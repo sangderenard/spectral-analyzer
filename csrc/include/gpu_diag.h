@@ -102,6 +102,7 @@ static inline const char* gpu_gl_err_str(unsigned err) {
         case 0x0502: return "GL_INVALID_OPERATION";
         case 0x0505: return "GL_OUT_OF_MEMORY";
         case 0x0506: return "GL_INVALID_FRAMEBUFFER_OPERATION";
+        case 0x0507: return "GL_CONTEXT_LOST (TDR reset)";
         case 0x8031: return "GL_TABLE_TOO_LARGE";
         default:     return "GL_UNKNOWN_ERROR";
     }

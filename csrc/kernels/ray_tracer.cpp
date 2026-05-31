@@ -11617,6 +11617,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         RayPipelineState* ps;
         std::chrono::steady_clock::time_point start;
         size_t* work_items;
+        bool used_gpu = false;   /* set to true after GPU dispatch is confirmed */
         ~BdptT5StatsGuard() {
             const auto t1 = std::chrono::steady_clock::now();
             const uint64_t ns = static_cast<uint64_t>(
@@ -11624,7 +11625,10 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             const int n = static_cast<int>(std::min<size_t>(
                 std::max<size_t>(1, *work_items),
                 static_cast<size_t>(std::numeric_limits<int>::max())));
-            ps->stats[4].record(n, ns, 0);
+            if (used_gpu)
+                ps->stats[4].record_gpu(n, ns, 0);
+            else
+                ps->stats[4].record(n, ns, 0);
         }
     } t5_stats{ps, t5_start, &t5_work_items};
 
@@ -12098,8 +12102,13 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             std::move(pixel_accum),
             std::move(spectral_weights),
             par);
+        t5_stats.used_gpu = true;  /* GPU dispatch was attempted — count against GPU counter */
     } else {
         /* CPU fallback: full brute-force via ThreadPool */
+        fprintf(stderr, "[T5-conn] WARNING: GPU unavailable (use_gpu=%d dispatch=%p n_lv=%u cam=%zu) — running CPU fallback\n",
+                (int)ps->cfg.use_gpu_compute, (void*)ps->gpu_dispatch,
+                n_lv, cam_items.size());
+        fflush(stderr);
         run_t5_allpairs(ctx, cam_items, light_items, accums, t5_pool);
     }
 

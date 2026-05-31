@@ -38,7 +38,7 @@ Usage
         emitter_transform     = None,      # 4×4 world transform or None = identity
         n_spatial_samples     = 4,         # disc sample points per component
         n_rays_per_source     = 512,
-        max_bounces           = 6,
+        max_bounces           = 8,
         min_amplitude         = 1e-4,
         seed                  = 0,
     )
@@ -642,7 +642,7 @@ class RayOrder:
         emitter_transform:    Optional[np.ndarray] = None,
         n_spatial_samples:    int   = 1,
         n_rays_per_source:    int   = 512,
-        max_bounces:          int   = 6,
+        max_bounces:          int   = 8,
         min_amplitude:        float = 1e-4,
         seed:                 int   = 0,
         aim_point:            Optional[np.ndarray] = None,

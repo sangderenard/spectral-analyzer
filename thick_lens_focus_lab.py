@@ -5594,7 +5594,7 @@ class ForwardCppLensBench:
         self,
         rays_per_emitter: int,
         seed: int,
-        max_bounces: int = 6,
+        max_bounces: int = 8,
         decay: float = 0.97,
         tags: Optional[np.ndarray] = None,
         blocking: bool = False,
@@ -6852,7 +6852,7 @@ class ForwardCppLensBench:
 
     def run_sensor_batches(
         self,
-        max_bounces: int = 24,
+        max_bounces: int = 8,
         seed: int = 1,
         n_aperture_samples: int = 4,
         pixels_per_batch: int = 0,
@@ -6873,7 +6873,7 @@ class ForwardCppLensBench:
         total_px = res * res
         bsz = pixels_per_batch if pixels_per_batch > 0 else total_px
         stage_args = stage_args or {}
-        max_bounces = int(max_bounces or 24)
+        max_bounces = int(max_bounces or 8)
         total_rays = 0
 
         self.tracer.begin_sensor_batching()
@@ -6947,7 +6947,7 @@ class ForwardCppLensBench:
                 if self._bdpt_camera_sweep_stage < stage_count:
                     stage_idx = int(self._bdpt_camera_sweep_stage)
                     stage_args = self._shutter_stage_args(stage_idx, stage_count)
-                    _mb = int(max_bounces or 24)
+                    _mb = int(max_bounces or 8)
                     _res = int(max(4, self.scene.image_plate.sensor_res))
                     _total_px = _res * _res
                     _bdpt_cap = int(n_rays_bdpt or 0) or 2_000_000

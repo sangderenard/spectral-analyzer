@@ -1259,6 +1259,7 @@ class SceneConfig:
     exit_pupil_thickness: float = 0.0003  # 0.3 mm — blade aperture
     lens_hood_front_radius: float = 0.115  # legacy override; ignored when camera_barrel_r is set
     camera_barrel_r: float = 0.0           # outer barrel radius (m); auto-set from lens design
+    focus_distance_m: float = 0.0          # object focus distance override (m); 0 = use design default
     # Optional supplementary macro lens (close focus helper): inserted at the front
     # to extend working distance and achieve extreme magnification.
     # Leave None to use standard lens stack; set to a LensConfig to add macro element.
@@ -1305,7 +1306,13 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
                 # sensor plane instead of hundreds of mm past it.
                 obj_x   = float(scene.object_plane.x)
                 f_m     = float(design.target_focal_length_m)
-                u_m     = float(max(design.focus_distance_m, f_m * 1.05))
+                # Allow scene.focus_distance_m to override the design spec at
+                # rebuild time (set by the focus buttons before calling rebuild).
+                _focus_override = float(getattr(scene, "focus_distance_m", 0.0))
+                u_m = float(max(
+                    _focus_override if _focus_override > f_m * 1.05 else design.focus_distance_m,
+                    f_m * 1.05,
+                ))
 
                 # Optional macro supplementary: adjust effective focus distance.
                 macro_cfg = getattr(scene, "macro_lens", None)
@@ -10801,6 +10808,40 @@ def run(
         )
         _restore_display_gl_context()
 
+    def _rebuild_bench_with_focus(new_focus_m: float) -> None:
+        """Full scene rebuild with a new focus distance (metres).
+
+        Changing focus distance changes v (image distance), which moves the
+        sensor and the rear body — a full rebuild is required.  The iris
+        setting is preserved across the rebuild.
+        """
+        nonlocal bench
+        _efl = float(getattr(getattr(scene, "optical_design", None),
+                              "effective_focal_length_m", 0.085) or 0.085)
+        new_focus = float(max(new_focus_m, _efl * 1.05))
+        scene.focus_distance_m = round(new_focus, 4)
+        print(f"[focus] rebuilding scene for u={new_focus*1e3:.0f}mm…", flush=True)
+        _stop_bench_runtime(bench)
+        _invalidate_scene_gl_cache()
+        bench = ForwardCppLensBench(
+            scene=scene,
+            freq_hz=bench.freq_hz.copy(),
+            view_h=view_h,
+            view_w=view_w,
+            sidecar=sidecar,
+            field_capture=field_capture,
+            enable_uv_splat=enable_uv_splat,
+        )
+        print("[bench-rebuild] ForwardCppLensBench init complete", flush=True)
+        _wire_rebuilt_bench(bench)
+        print(f"[focus] rebuild done  u={new_focus*1e3:.0f}mm  tris={bench.n_tris}", flush=True)
+        _restore_display_gl_context()
+
+    # ── Click-button state ────────────────────────────────────────────────────
+    # Registered at draw time, read at event time.  Each entry:
+    #   (rect, callback)  where rect is (x, y, w, h) in display pixels.
+    _click_buttons: list = []
+
     try:
         while True:
             if closing.is_set():
@@ -10827,6 +10868,13 @@ def run(
                     if ev.type == pygame.QUIT:
                         closing.set()
                         break
+                    if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1 and not fly_mode:
+                        mx, my = ev.pos
+                        for _brect, _bcb in _click_buttons:
+                            _bx, _by, _bw, _bh = _brect
+                            if _bx <= mx < _bx + _bw and _by <= my < _by + _bh:
+                                _bcb()
+                                break
                     if ev.type == pygame.MOUSEMOTION and fly_mode:
                         dx, dy = ev.rel
                         fly_yaw   += math.radians(dx * _FLY_SENS)
@@ -11026,6 +11074,74 @@ def run(
                 print(f"[pip] {_pip_exc}", flush=True)
             if frame_profiler is not None:
                 frame_profiler.end("draw_pip")
+                frame_profiler.begin("buttons")
+
+            # ── Control button panel (top-right corner) ──────────────────────
+            # Drawn into a pygame overlay surface then blitted so GL state is
+            # not disturbed.  _click_buttons is rebuilt every frame so rects
+            # stay valid after window resize.
+            _click_buttons.clear()
+            _btn_surf = pygame.Surface((W, H), pygame.SRCALPHA)
+
+            def _draw_btn(label: str, bx: int, by: int, bw: int, bh: int,
+                          active: bool, cb) -> None:
+                col_bg  = (40, 90, 140) if active else (28, 30, 36)
+                col_bd  = (80, 160, 220) if active else (55, 58, 68)
+                col_txt = (210, 230, 255) if active else (140, 145, 160)
+                pygame.draw.rect(_btn_surf, col_bg,  (bx, by, bw, bh))
+                pygame.draw.rect(_btn_surf, col_bd,  (bx, by, bw, bh), 1)
+                _lbl = _btn_font.render(label, True, col_txt)
+                _btn_surf.blit(_lbl, (bx + (bw - _lbl.get_width()) // 2,
+                                      by + (bh - _lbl.get_height()) // 2))
+                _click_buttons.append(((bx, by, bw, bh), cb))
+
+            try:
+                _btn_font = pygame.font.SysFont("monospace", 11)
+            except Exception:
+                _btn_font = pygame.font.Font(None, 13)
+
+            _iris_now  = getattr(bench.scene, "iris_aperture", None)
+            _iris_r    = float(getattr(_iris_now, "r_inner", 0.0)) if _iris_now else 0.0
+            _efl_now   = float(getattr(getattr(bench.scene, "optical_design", None),
+                                        "effective_focal_length_m", 0.085) or 0.085)
+            _focus_now = float(getattr(bench.scene, "focus_distance_m", 1.0) or 1.0)
+
+            # f-stop column  (standard full-stop series for 85mm)
+            _fstops = [1.4, 2.0, 2.8, 4.0, 5.6, 8.0, 11.0, 16.0]
+            _bw, _bh, _gap = 44, 18, 2
+            _px = W - _bw - 6
+            _py = 6
+            for _fn in _fstops:
+                _r = _efl_now / (2.0 * _fn)
+                _active = abs(_iris_r - _r) < _r * 0.08 if _iris_r > 0 else False
+                _fn_label = f"f/{_fn}"
+                _r_capture = _r
+                _draw_btn(_fn_label, _px, _py, _bw, _bh, _active,
+                           lambda r=_r_capture: _rebuild_bench_with_iris(r))
+                _py += _bh + _gap
+
+            # Focus distance row below f-stops
+            _focus_presets = [("0.5m", 0.5), ("0.7m", 0.7), ("1m", 1.0),
+                              ("1.5m", 1.5), ("2m", 2.0), ("3m", 3.0), ("∞", 50.0)]
+            _fbw, _fbh = 36, 18
+            _frow_total = len(_focus_presets) * (_fbw + _gap) - _gap
+            _fpx = W - _frow_total - 6
+            _fpy = _py + 4
+            for _flabel, _fdist in _focus_presets:
+                _active = abs(_focus_now - _fdist) < 0.05 * _fdist
+                _draw_btn(_flabel, _fpx, _fpy, _fbw, _fbh, _active,
+                           lambda d=_fdist: _rebuild_bench_with_focus(d))
+                _fpx += _fbw + _gap
+
+            # Blit the overlay (GL → pygame surface)
+            glDisable(GL_DEPTH_TEST)
+            _scr = pygame.display.get_surface()
+            if _scr is not None:
+                _scr.blit(_btn_surf, (0, 0))
+            glEnable(GL_DEPTH_TEST)
+
+            if frame_profiler is not None:
+                frame_profiler.end("buttons")
                 frame_profiler.begin("flip")
             pygame.display.flip()
             if frame_profiler is not None:

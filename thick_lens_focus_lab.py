@@ -10533,7 +10533,7 @@ def run(
                         "direct":  _direct_img,
                         "bdpt":    bench._last_bdpt_plate_rgb,
                     },
-                    tonemap="log1p",
+                    tonemap="reinhard",
                     disc_tags={"bdpt"},
                 )
             except Exception as _sv_exc:

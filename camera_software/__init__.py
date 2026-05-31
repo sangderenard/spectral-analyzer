@@ -73,8 +73,10 @@ from .scene_version import (
 )
 from .sdcard import (
     SDCard,
+    tonemap_reinhard,
     tonemap_log1p,
     tonemap_percentile,
+    TONEMAP_MODES,
     DEFAULT_SDCARD_ROOT,
 )
 __all__ = [
@@ -152,7 +154,9 @@ __all__ = [
     "SceneVersion",
     "SceneVersionCache",
     "SDCard",
+    "tonemap_reinhard",
     "tonemap_log1p",
     "tonemap_percentile",
+    "TONEMAP_MODES",
     "DEFAULT_SDCARD_ROOT",
 ]

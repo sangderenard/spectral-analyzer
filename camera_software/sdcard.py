@@ -49,8 +49,10 @@ from typing import Callable, Dict, Optional, Union
 import numpy as np
 
 __all__ = [
+    "tonemap_reinhard",
     "tonemap_log1p",
     "tonemap_percentile",
+    "TONEMAP_MODES",
     "SDCard",
     "DEFAULT_SDCARD_ROOT",
 ]
@@ -62,6 +64,39 @@ DEFAULT_SDCARD_ROOT: Path = Path(__file__).resolve().parent.parent / "camera" / 
 # ---------------------------------------------------------------------------
 # Tonemappers
 # ---------------------------------------------------------------------------
+
+def tonemap_reinhard(
+    linear: np.ndarray,
+    white_percentile: float = 99.0,
+) -> np.ndarray:
+    """Extended Reinhard tonemapper: ``y = x / (1 + x)``.
+
+    Highlights are gently compressed toward white rather than clipped,
+    so over-exposed areas retain visible detail.  Black maps exactly to
+    black (0 → 0), so shadow structure is fully preserved.
+
+    The linear array is normalised by its *white_percentile* value
+    before the Reinhard curve is applied so the curve midpoint sits at
+    a meaningful scene brightness rather than an arbitrary photon count.
+
+    Input: any float (H,W,3) in linear light.
+    Output: float32 in [0, 1)  (Reinhard never reaches 1.0 exactly,
+            but np.clip ensures the range is safe for 8-bit output).
+    """
+    arr = np.asarray(linear, dtype=np.float64)
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        raise ValueError(f"tonemap_reinhard expects (H,W,3), got {arr.shape}")
+
+    white = float(np.percentile(arr, float(white_percentile)))
+    if white < 1e-8:
+        white = float(arr.max())
+    if white < 1e-8:
+        white = 1.0
+
+    x = np.maximum(arr, 0.0) / white
+    y = x / (1.0 + x)           # extended Reinhard
+    return np.clip(y, 0.0, 1.0).astype(np.float32)
+
 
 def tonemap_log1p(
     linear: np.ndarray,
@@ -180,10 +215,18 @@ def _write_png(arr_f32: np.ndarray, path: Union[str, Path]) -> None:
 # SDCard
 # ---------------------------------------------------------------------------
 
-_TONEMAP_FNS: Dict[str, Callable] = {
+# Registry of all available tonemappers.  Keys are the string names accepted
+# by SDCard.save_png / save_exposure.  Add new entries here to extend.
+TONEMAP_MODES: Dict[str, Callable] = {
+    "reinhard":   tonemap_reinhard,
     "log1p":      tonemap_log1p,
     "percentile": tonemap_percentile,
 }
+
+DEFAULT_TONEMAP: str = "reinhard"
+
+# Back-compat alias kept for any callers that imported the private name.
+_TONEMAP_FNS = TONEMAP_MODES
 
 
 class SDCard:
@@ -227,7 +270,7 @@ class SDCard:
         stamp: str,
         tag: str,
         arr: np.ndarray,
-        tonemap: str = "log1p",
+        tonemap: str = DEFAULT_TONEMAP,
         disc_mask: bool = False,
     ) -> Path:
         """Tonemap *arr* and write a PNG.
@@ -235,18 +278,36 @@ class SDCard:
         Parameters
         ----------
         tonemap :
-            ``"log1p"`` (default) or ``"percentile"``.
+            Name of the tonemapper to use.  Must be a key in
+            ``TONEMAP_MODES``.  Defaults to ``DEFAULT_TONEMAP``
+            (currently ``"reinhard"``).  Available modes:
+
+            ``"reinhard"``   — extended Reinhard; highlights compress
+                               smoothly, blacks preserved exactly.
+            ``"log1p"``      — log1p compander with Reinhard knee;
+                               mirrors the C++ reduction curve.
+            ``"percentile"`` — simple percentile normalise.
         disc_mask :
-            When True, zero out and exclude corners from the white-point
-            calculation (use for circular physical sensor apertures).
+            When True, the white-point is computed only over the
+            inscribed circular disc (physical sensor aperture), then
+            corners are zeroed.  Applies regardless of *tonemap*.
 
         Returns the path written.
         """
         self._ensure_dirs()
         path = self._png_dir / f"{stamp}_{tag}.png"
-        fn = _TONEMAP_FNS.get(tonemap, tonemap_log1p)
+        fn = TONEMAP_MODES.get(tonemap, tonemap_reinhard)
         if disc_mask:
-            mapped = tonemap_percentile(arr, disc_mask=True)
+            # Build an inscribed-disc mask, zero corners, then tonemap.
+            src = np.asarray(arr, dtype=np.float64)
+            h, w = src.shape[:2]
+            cy, cx = (h - 1) * 0.5, (w - 1) * 0.5
+            r2 = (min(h, w) * 0.5) ** 2
+            yy, xx = np.ogrid[:h, :w]
+            mask = ((yy - cy) ** 2 + (xx - cx) ** 2) <= r2
+            src[~mask] = 0.0
+            mapped = fn(src)
+            mapped[~mask] = 0.0
         else:
             mapped = fn(arr)
         _write_png(mapped, path)
@@ -260,7 +321,7 @@ class SDCard:
         self,
         stamp: str,
         images: Dict[str, Optional[np.ndarray]],
-        tonemap: str = "log1p",
+        tonemap: str = DEFAULT_TONEMAP,
         disc_tags: Optional[set] = None,
     ) -> Dict[str, str]:
         """Save raw + PNG for every non-empty array in *images*.

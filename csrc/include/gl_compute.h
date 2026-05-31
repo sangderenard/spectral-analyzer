@@ -73,8 +73,17 @@ typedef unsigned int   GLbitfield;
 #ifndef GL_SHADER_STORAGE_BARRIER_BIT
 #  define GL_SHADER_STORAGE_BARRIER_BIT   0x00002000
 #endif
+#ifndef GL_COMMAND_BARRIER_BIT
+#  define GL_COMMAND_BARRIER_BIT          0x00000040
+#endif
 #ifndef GL_ALL_BARRIER_BITS
 #  define GL_ALL_BARRIER_BITS             0xFFFFFFFF
+#endif
+#ifndef GL_DISPATCH_INDIRECT_BUFFER
+#  define GL_DISPATCH_INDIRECT_BUFFER     0x90EE
+#endif
+#ifndef GL_SYNC_FLUSH_COMMANDS_BIT
+#  define GL_SYNC_FLUSH_COMMANDS_BIT      0x00000001
 #endif
 #ifndef GL_TEXTURE_2D_ARRAY
 #  define GL_TEXTURE_2D_ARRAY             0x8C1A
@@ -224,6 +233,7 @@ typedef void    (APIENTRY* PFNGLUNIFORM4FVPROC)(GLint location, GLsizei count, c
 typedef void    (APIENTRY* PFNGLUNIFORM2IVPROC)(GLint location, GLsizei count, const GLint* value);
 
 typedef void    (APIENTRY* PFNGLDISPATCHCOMPUTEPROC)(GLuint num_groups_x, GLuint num_groups_y, GLuint num_groups_z);
+typedef void    (APIENTRY* PFNGLDISPATCHCOMPUTEINDIRECTPROC)(GLintptr indirect);
 typedef void    (APIENTRY* PFNGLMEMORYBARRIERPROC)(GLbitfield barriers);
 typedef GLsync  (APIENTRY* PFNGLFENCESYNCPROC)(GLenum condition, GLbitfield flags);
 typedef GLenum  (APIENTRY* PFNGLCLIENTWAITSYNCPROC)(GLsync sync, GLbitfield flags, uint64_t timeout);
@@ -278,7 +288,8 @@ extern PFNGLUNIFORM3FVPROC          glc_Uniform3fv;
 extern PFNGLUNIFORM4FVPROC          glc_Uniform4fv;
 extern PFNGLUNIFORM2IVPROC          glc_Uniform2iv;
 
-extern PFNGLDISPATCHCOMPUTEPROC     glc_DispatchCompute;
+extern PFNGLDISPATCHCOMPUTEPROC          glc_DispatchCompute;
+extern PFNGLDISPATCHCOMPUTEINDIRECTPROC  glc_DispatchComputeIndirect;
 extern PFNGLMEMORYBARRIERPROC       glc_MemoryBarrier;
 extern PFNGLFENCESYNCPROC           glc_FenceSync;
 extern PFNGLCLIENTWAITSYNCPROC      glc_ClientWaitSync;

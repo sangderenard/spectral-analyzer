@@ -51,8 +51,9 @@ PFNGLUNIFORM3FVPROC         glc_Uniform3fv         = nullptr;
 PFNGLUNIFORM4FVPROC         glc_Uniform4fv         = nullptr;
 PFNGLUNIFORM2IVPROC         glc_Uniform2iv         = nullptr;
 
-PFNGLDISPATCHCOMPUTEPROC    glc_DispatchCompute    = nullptr;
-PFNGLMEMORYBARRIERPROC      glc_MemoryBarrier      = nullptr;
+PFNGLDISPATCHCOMPUTEPROC         glc_DispatchCompute         = nullptr;
+PFNGLDISPATCHCOMPUTEINDIRECTPROC glc_DispatchComputeIndirect = nullptr;
+PFNGLMEMORYBARRIERPROC           glc_MemoryBarrier           = nullptr;
 PFNGLFENCESYNCPROC          glc_FenceSync          = nullptr;
 PFNGLCLIENTWAITSYNCPROC     glc_ClientWaitSync     = nullptr;
 PFNGLDELETESYNCPROC         glc_DeleteSync         = nullptr;
@@ -298,8 +299,9 @@ bool gl_compute_load_procs(void) {
     LOAD(glc_Uniform4fv,       PFNGLUNIFORM4FVPROC,       glUniform4fv)
     LOAD(glc_Uniform2iv,       PFNGLUNIFORM2IVPROC,       glUniform2iv)
 
-    LOAD(glc_DispatchCompute,  PFNGLDISPATCHCOMPUTEPROC,  glDispatchCompute)
-    LOAD(glc_MemoryBarrier,    PFNGLMEMORYBARRIERPROC,    glMemoryBarrier)
+    LOAD(glc_DispatchCompute,         PFNGLDISPATCHCOMPUTEPROC,         glDispatchCompute)
+    LOAD(glc_DispatchComputeIndirect, PFNGLDISPATCHCOMPUTEINDIRECTPROC, glDispatchComputeIndirect)
+    LOAD(glc_MemoryBarrier,           PFNGLMEMORYBARRIERPROC,           glMemoryBarrier)
     LOAD(glc_FenceSync,        PFNGLFENCESYNCPROC,         glFenceSync)
     LOAD(glc_ClientWaitSync,   PFNGLCLIENTWAITSYNCPROC,    glClientWaitSync)
     LOAD(glc_DeleteSync,       PFNGLDELETESYNCPROC,        glDeleteSync)

@@ -649,14 +649,14 @@ class CameraLightBurstConfig:
     enabled: bool = True
     exposure_time_s: float = 0.010
     stages: int = 1
-    rays_per_emitter: int = 64
+    rays_per_emitter: int = 512
     energy_scale: float = 4.0
     duty_cycle: float = 1.0
     profile: str = "steady"
     # When > 0, overrides bench.uv_emitter_rays: use UV-stratified Halton
     # origin sampling on the emitter surface instead of C++ stochastic sampling.
     # Pure density knob — energy is unchanged (amp = emitter_amp_gain / sqrt(N)).
-    uv_emitter_rays: int = 4_000
+    uv_emitter_rays: int = 32_000
 
 
 @dataclass
@@ -4380,7 +4380,7 @@ class ForwardCppLensBench:
     # Total ray count = uv_emitter_rays (not per-triangle); amplitude per ray
     # is scaled by 1/sqrt(uv_emitter_rays) so that the total optical power
     # (∑|amp|²) remains equal to emitter_amp_gain² regardless of ray count.
-    uv_emitter_rays: int = 4_000
+    uv_emitter_rays: int = 32_000
 
     def __post_init__(self) -> None:
         self._trace_lock = threading.Lock()
@@ -4486,10 +4486,15 @@ class ForwardCppLensBench:
         # GPU/CPU compute mode: 'gpu', 'cpu', or 'mixed'.
         # Controls use_gpu_compute and gpu_all_stages in submit_rays.
         self.compute_mode: str = "gpu"
-        # Persistent-pipeline drain loop
+        # Persistent-pipeline drain loop (fast) + vis accumulation loop (slow)
         self._drain_thread: Optional[threading.Thread] = None
+        self._vis_thread:   Optional[threading.Thread] = None
         self._drain_stop  = threading.Event()
         self._segs_lock   = threading.Lock()
+        # Bounded queue between fast drain thread and slow vis thread.
+        # maxsize=8: ~8 × 1M records = up to 8 buffered batches before dropping.
+        # Drops only affect visualization; BDPT accumulation is always done first.
+        self._vis_queue:  queue.Queue = queue.Queue(maxsize=8)
         # Bounded ring buffer of raw hit positions for the point overlay.
         # Each row: (x, y, z, amplitude, display_class, hit_group_id).
         # 2M rows × 6 floats × 4 bytes = 48 MB.  No spatial quantization.
@@ -5808,26 +5813,34 @@ class ForwardCppLensBench:
         self._drain_thread = threading.Thread(
             target=self._drain_loop, daemon=True, name="pipeline-drain")
         self._drain_thread.start()
+        self._vis_thread = threading.Thread(
+            target=self._vis_loop, daemon=True, name="pipeline-vis")
+        self._vis_thread.start()
 
     def _drain_loop(self) -> None:
+        """Fast drain thread: pulls records from C++ pipeline, feeds BDPT immediately,
+        then hands raw records to _vis_loop via _vis_queue for heavy accumulation."""
         import time
         _max_batch = 1_000_000
-        # Batch size is fixed at the maximum — no wall-clock throughput EMA.
-        # The drain loop is purely data-driven: request as much as is available,
-        # sleep only when genuinely idle so as not to spin the CPU.
-        _PROFILE_WARMUP  = 8
-        _gpu_profile_n   = 0  # snapshot count (no time gate)
-        _empty_polls     = 0
+        _PROFILE_WARMUP = 8
+        _gpu_profile_n  = 0
+        _empty_polls    = 0
         while not self._drain_stop.is_set():
             try:
                 records = self.tracer.drain_records_slim(max_n=_max_batch)
                 n       = int(records["kind"].shape[0]) if records else 0
                 if n > 0:
                     _empty_polls = 0
+                    # BDPT endpoint accumulation must run immediately — correctness path
                     self._fast_bdpt_feed(records)
-                    self._accumulate_records(records)
+                    # Hand off to vis thread; drop the frame if the queue is full so
+                    # the drain thread never blocks waiting for visualization.
+                    try:
+                        self._vis_queue.put_nowait(records)
+                    except queue.Full:
+                        pass
 
-                    # ── Live GPU profiling (count-gated, not time-gated) ─────
+                    # ── Live GPU profiling (count-gated) ─────────────────────
                     if not self._gpu_calibrated:
                         _gpu_profile_n += 1
                         if _gpu_profile_n % 64 == 0:
@@ -5845,7 +5858,6 @@ class ForwardCppLensBench:
                                 if len(self._gpu_profile_snapshots) >= _PROFILE_WARMUP:
                                     self._print_gpu_calibration_report()
                                     self._gpu_calibrated = True
-                    # If we drained a full batch, more is likely waiting.
                     if n >= _max_batch * 3 // 4:
                         continue
                 else:
@@ -5858,6 +5870,21 @@ class ForwardCppLensBench:
             except Exception as _drain_exc:
                 print(f"[drain-loop ERROR] {_drain_exc}", flush=True)
                 time.sleep(0.1)
+
+    def _vis_loop(self) -> None:
+        """Slow vis thread: consumes raw records from _vis_queue and accumulates them
+        into display buffers.  Runs independently of the fast drain thread so heavy
+        numpy work (bincount, einsum) never stalls the BDPT-critical drain path."""
+        import time
+        while not self._drain_stop.is_set():
+            try:
+                records = self._vis_queue.get(timeout=0.020)
+            except queue.Empty:
+                continue
+            try:
+                self._accumulate_records(records)
+            except Exception as _vis_exc:
+                print(f"[vis-loop ERROR] {_vis_exc}", flush=True)
 
     def _print_gpu_calibration_report(self) -> None:
         """Print a live calibration report from accumulated pipeline stat snapshots."""
@@ -6017,12 +6044,18 @@ class ForwardCppLensBench:
                 iy = np.clip(((p_img[:, 1] + vr) / (2.0 * vr) * res).astype(np.int32), 0, res - 1)
                 iz = np.clip(((p_img[:, 2] + vr) / (2.0 * vr) * res).astype(np.int32), 0, res - 1)
                 flat_idx = (iy * res + iz).astype(np.int64)
+                # Compute bincount deltas outside the lock — O(N) work with no shared state.
+                # Only the short O(res²) array-add is done under the lock.
+                deltas = [
+                    np.bincount(
+                        flat_idx, weights=rgb[:, ch].astype(np.float64),
+                        minlength=res * res,
+                    ).reshape(res, res).astype(np.float32)
+                    for ch in range(3)
+                ]
                 with self._segs_lock:
                     for ch in range(3):
-                        dst[:, :, ch] += np.bincount(
-                            flat_idx, weights=rgb[:, ch].astype(np.float64),
-                            minlength=res * res,
-                        ).reshape(res, res).astype(np.float32)
+                        dst[:, :, ch] += deltas[ch]
 
         # Pure preview feeds: project all strike records into the image-plane Y/Z
         # grid.  Do not require the ray to hit the image plate; this is a live
@@ -6777,16 +6810,13 @@ class ForwardCppLensBench:
             )
 
             pix_pts = np.repeat(pix_pts[:, :, None, :], n_ap, axis=2)
-            ai = np.broadcast_to(np.arange(n_ap, dtype=np.float64)[None, None, :], (n_py, n_px, n_ap))
 
             rng = np.random.Generator(np.random.PCG64(int(seed) & ((1 << 63) - 1)))
             j1 = rng.random((n_py, n_px, n_ap), dtype=np.float64)
             j2 = rng.random((n_py, n_px, n_ap), dtype=np.float64)
 
-            q = (ai + j1) / float(max(1, n_ap))
-            r = np.sqrt(np.clip(q, 0.0, 1.0)) * float(stop_radius_m)
-            golden = 2.39996322972865332
-            th = golden * ai + 2.0 * math.pi * j2
+            r = np.sqrt(j1) * float(stop_radius_m)
+            th = 2.0 * math.pi * j2
 
             ap_pts = (
                 aperture_centre[None, None, None, :]
@@ -9391,17 +9421,7 @@ def run(
             border_col=(0.58, 0.32, 1.00),
         )
 
-        # ── Pos 2: direct illum / specular — sensor view, 180° correction ────
-        direct_img = bench._last_direct_img
-        if direct_img is not None and direct_img.shape[0] > 0:
-            glBindTexture(GL_TEXTURE_2D, tex_pip)
-            _di_disp = _rot180(direct_img)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
-                         _di_disp.shape[1], _di_disp.shape[0], 0,
-                         GL_RGB, GL_FLOAT, _di_disp)
-        _draw_quad_with_pip_prog(tex_pip, _uv_pip_vx, _pip_vy, _pip_dim, _pip_dim)
-
-        # ── Pos 3 (rightmost): BDPT plate / processed — sensor view, 180° ────
+        # ── Pos 2 (rightmost): BDPT plate / processed — sensor view, 180° ────
         bdpt_plate = bench._last_bdpt_plate_rgb
         if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
             glBindTexture(GL_TEXTURE_2D, tex_green_pip)
@@ -9530,28 +9550,6 @@ def run(
             (255, 150, 90) if (_cx_ovv > 0 or _cx_ovc > 0) else (160, 160, 160),
         ]
         _draw_hud(tracking_lines, tracking_cols, _pip_vx)
-
-        # ── Centre pip HUD: direct illumination stats ───────────────────────
-        _di_arr = bench._last_direct_img
-        _di_lit  = 0
-        _di_mean = 0.0
-        _di_max  = 0.0
-        if _di_arr is not None and _di_arr.size > 0:
-            _di_sum = np.sum(_di_arr, axis=2)
-            _di_lit  = int(np.count_nonzero(_di_sum > 1e-8))
-            _di_mean = float(np.mean(_di_arr))
-            _di_max  = float(np.max(_di_arr))
-        direct_lines = [
-            "direct illum",
-            f"lit {_di_lit:_}",
-            f"mean {_di_mean:.4f}  max {_di_max:.3f}",
-        ]
-        direct_cols = [
-            (80, 210, 255),
-            (120, 255, 160) if _di_lit > 0 else (160, 160, 160),
-            (80, 210, 255)  if _di_mean > 0 else (160, 160, 160),
-        ]
-        _draw_hud(direct_lines, direct_cols, _uv_pip_vx)
 
         # ── Green pip HUD: BDPT plate + connection stats ─────────────────────
         green_lines = [
@@ -10454,24 +10452,6 @@ def run(
                         break
                     _ct.sleep(0.010)
 
-            # Re-trigger T5 with the complete endpoint set.
-            # Snapshot sensor_accum NOW — before T5 — to capture direct lighting only.
-            # This is the cheap geometric pass: T1 forward rays that physically reached
-            # the sensor plate, and T3 backward sensor rays that landed on emissive
-            # surfaces in one bounce.  No material BRDFs, no MIS, no BDPT connections.
-            # It will be dim/empty when direct single-bounce paths to the sensor are
-            # geometrically rare (e.g. closed tube optics) — that is correct behaviour.
-            _direct_img: Optional[np.ndarray] = None
-            try:
-                _di = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
-                if _di.ndim == 3 and _di.shape[2] >= 3 and _di.shape[0] > 0:
-                    _direct_img = np.ascontiguousarray(np.clip(_di[:, :, :3], 0.0, 1.0), dtype=np.float32)
-                    bench._last_direct_img = _direct_img
-                    _lit_d = int(np.count_nonzero(np.sum(_direct_img, axis=2) > 1e-8))
-                    print(f"[exposure] direct-lighting snapshot (pre-T5): lit_px={_lit_d}", flush=True)
-            except Exception as _di_exc:
-                print(f"[exposure] direct-lighting snapshot failed: {_di_exc}", flush=True)
-
             try:
                 print("[exposure] joining T5 thread…", flush=True)
                 bench.tracer.join_t5()
@@ -10521,7 +10501,7 @@ def run(
                 flush=True,
             )
 
-            # Save all three images for this exposure via the camera SD card.
+            # Save images for this exposure via the camera SD card.
             try:
                 _stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_exp{_exp_n:03d}"
                 _sdcard = _SDCard()
@@ -10530,11 +10510,9 @@ def run(
                     {
                         "forward": bench._forward_img_accum,
                         "reverse": bench._reverse_img_accum,
-                        "direct":  _direct_img,
                         "bdpt":    bench._last_bdpt_plate_rgb,
                     },
                     tonemap="reinhard",
-                    disc_tags={"bdpt"},
                 )
             except Exception as _sv_exc:
                 print(f"[sdcard] exposure save failed: {_sv_exc}", flush=True)

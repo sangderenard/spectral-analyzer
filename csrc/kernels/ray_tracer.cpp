@@ -7664,7 +7664,14 @@ public:
     bool             ready = false;
 
     /* Shader programs for each stage */
+    /* HIT_STRIDE_BYTES: floats-per-record × sizeof(float).
+     * Matches dispatch_t1_t2_t3's local HIT_STRIDE = 27 + 2*MAX_SPECTRAL_BANDS. */
+    static constexpr int HIT_STRIDE_BYTES =
+        (27 + 2 * MAX_SPECTRAL_BANDS) * static_cast<int>(sizeof(float));
+
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
+    GLuint prog_dispatch_prep = 0;
+    struct { GLint bdpt_count_base = -1; } uloc_prep;
     /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
     GLuint prog_t5 = 0;
 
@@ -7753,8 +7760,11 @@ public:
     GLuint ssbo_scene_band  = 0; /* k_real + atmo_abs */
     GLuint ssbo_wave_arena  = 0; /* arena center+radius */
     GLuint ssbo_tri_sensor  = 0; /* per-tri sensor group id */
-    /* T1/T2 outputs */
-    GLuint ssbo_hit         = 0; /* RefinedHit layout (T1 out / T2 in-place) */
+    /* T1/T2 outputs — double-buffered so CPU readback of bounce N overlaps T1 of bounce N+1 */
+    GLuint ssbo_hit         = 0; /* current write buffer (T1 writes, T3 reads) */
+    GLuint ssbo_hit_b       = 0; /* alternate buffer for ping-pong               */
+    bool   hit_flip         = false; /* which ssbo_hit* T1/T2/T3 currently use    */
+    GLsync fence_hit[2]     = {nullptr, nullptr}; /* per-buffer fence after T3     */
     GLuint ssbo_counter     = 0; /* {hit_count, miss_count, wave_count, cpu_refine} uint */
     /* T2 refinement */
     GLuint ssbo_tri_param   = 0; /* per-tri parametric group id */
@@ -7792,7 +7802,7 @@ public:
 
     /* Capacities to know when realloc is needed */
     int cap_intents  = 0;
-    int cap_hits     = 0;
+    int cap_hits     = 0;     /* capacity of both ssbo_hit and ssbo_hit_b (kept in lockstep) */
     int cap_children = 0; /* also gates terminal capacity: buffer = cap*(INTENT_STRIDE+TERMINAL_STRIDE) */
     int cap_wave_pix = 0; /* per band */
 
@@ -7828,6 +7838,17 @@ public:
      * re-uploading the large MLP weight buffer when payloads haven't changed. */
     size_t neural_pay_floats_uploaded = 0;
 
+    /* Version stamp for upload_param_groups_data dirty tracking.
+     * Combines tri_param_group_of_tri size, kind vector hash, and neural payload
+     * size into one uint64.  Matches param_groups_version_uploaded on no-change → skip. */
+    uint64_t param_groups_version_uploaded = UINT64_MAX;  /* force upload on first call */
+
+    /* Invalidate the dirty cache — call whenever the host modifies tri group
+     * registration (clear_tri_groups, register_tri_group, etc.). */
+    void invalidate_param_groups_cache() noexcept {
+        param_groups_version_uploaded = UINT64_MAX;
+    }
+
     /* ── helpers ──────────────────────────────────────────────────────────── */
 
     static std::string resolve_shader(const std::string& dir, const std::string& name) {
@@ -7846,6 +7867,20 @@ public:
 
     void bind_ssbo(GLuint id, GLuint binding) {
         glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, id);
+    }
+
+    /* Return the hit SSBO that T1/T2/T3 should write to this bounce. */
+    GLuint active_hit_ssbo() const noexcept { return hit_flip ? ssbo_hit_b : ssbo_hit; }
+    /* Return the hit SSBO that CPU should read from (the just-completed bounce). */
+    GLuint prev_hit_ssbo()   const noexcept { return hit_flip ? ssbo_hit   : ssbo_hit_b; }
+
+    /* Grow both hit SSBOs together so cap_hits is always valid for both. */
+    void ensure_hit_ssbos(int required) {
+        if (required <= cap_hits) return;
+        cap_hits = required * 2;
+        const GLsizeiptr sz = (GLsizeiptr)((size_t)cap_hits * HIT_STRIDE_BYTES);
+        ensure_ssbo(ssbo_hit,   sz);
+        ensure_ssbo(ssbo_hit_b, sz);
     }
 
     /* Upload data to an SSBO (auto-grows if needed). */
@@ -7874,6 +7909,24 @@ public:
     void upload_param_groups_data(const RayTracerState& st) {
         const int nt = (int)st.tris.size();
         const int ng = (int)st.tri_group_parametric_kind.size();
+
+        /* Cheap version stamp: combine nt, ng, and neural_pay size.
+         * If unchanged since last upload, skip the PCIe transfers entirely.
+         * neural_pay_floats_uploaded is updated at the end of this function
+         * (inside the payload block), so its value before this function body
+         * reflects the PREVIOUS upload — include it in the stamp for detection. */
+        {
+            uint64_t v = (uint64_t)(uint32_t)nt
+                       ^ ((uint64_t)(uint32_t)ng << 32)
+                       ^ (neural_pay_floats_uploaded * 0x9e3779b97f4a7c15ULL);
+            /* Mix in a hash of the kind vector (first 8 entries, or all if small) */
+            const int nk = std::min(ng, 8);
+            for (int i = 0; i < nk; ++i)
+                v ^= (uint64_t)(uint32_t)st.tri_group_parametric_kind[static_cast<size_t>(i)] << (i * 8 % 48);
+            if (v == param_groups_version_uploaded)
+                return;
+            param_groups_version_uploaded = v;
+        }
         static constexpr int GPS = 16;
 
         if (!st.tri_param_group_of_tri.empty()) {
@@ -8054,6 +8107,11 @@ public:
         if (!load("ray_refine.comp.glsl",             prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
         if (!load("ray_material.comp.glsl",           prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
         if (!load("ray_wave_bpm.comp.glsl",           prog_t4)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("dispatch_prep.comp.glsl",   prog_dispatch_prep)) {
+            fprintf(stderr, "[gpu-dispatch] dispatch_prep.comp.glsl failed (%s) — falling back to CPU n_hits readback\n", err);
+            fflush(stderr);
+            prog_dispatch_prep = 0;
+        }
         /* T5 full-connect shader — compiled with BVH shadow preamble injected.
          * BvhBuf→binding 5, TriIdBuf→binding 6, TriFullBuf→binding 7.
          * Non-fatal; GPU T5 path disabled if absent or compilation fails. */
@@ -8110,7 +8168,13 @@ public:
         uloc_t3.bdpt_count_base      = glc_GetUniformLocation(prog_t3, "bdpt_count_base");
         uloc_t3.bdpt_spectral_base   = glc_GetUniformLocation(prog_t3, "bdpt_spectral_base");
         uloc_t3.bdpt_pdf_base        = glc_GetUniformLocation(prog_t3, "bdpt_pdf_base");
-        uloc_t3.n_hits               = glc_GetUniformLocation(prog_t3, "n_hits");
+        /* n_hits is no longer a uniform — T3 reads it from MetaBuf[bdpt_count_base+3]
+         * written by dispatch_prep.comp.glsl.  The slot is kept in the struct as -1
+         * so any accidental uniform set is a harmless no-op. */
+        uloc_t3.n_hits               = -1;
+
+        if (prog_dispatch_prep)
+            uloc_prep.bdpt_count_base = glc_GetUniformLocation(prog_dispatch_prep, "bdpt_count_base");
         /* !!DIAG!! Print T3 BDPT uniform locations.  -1 means the GLSL compiler
          * dead-stripped that uniform (it considers it unreachable).  If
          * uloc_max_pdfs=-1 the glUniform upload is a no-op → bdpt_max_pdfs=0
@@ -8235,14 +8299,15 @@ public:
          * eps_flags are written here and survive across dispatches. */
         {
             const int nm2 = std::max(1, st.mat_n_mats);  /* at least 1 so the SSBO is non-empty */
-            /* +3 tail slots: [2+nm2..2+nm2+2] = bdpt_vert_count, bdpt_spectral_count, bdpt_pdf_count.
+            /* +4 tail slots: [2+nm2..2+nm2+2] = bdpt vert/spectral/pdf counts;
+             * [2+nm2+3] = n_hits written by dispatch_prep.comp.glsl for T3's guard.
              * Zeroed before each dispatch; eps_flags [2..2+nm2) persist across dispatches. */
-            std::vector<uint32_t> meta(2 + nm2 + 3, 0u);
+            std::vector<uint32_t> meta(2 + nm2 + 4, 0u);
             const auto& ef = ps.mat_epsilon_flags;
             for (int i = 0; i < nm2 && i < (int)ef.size(); ++i)
                 meta[2 + i] = ef[i] ? 1u : 0u;
             upload_ssbo(ssbo_t3_meta, meta.data(),
-                        (GLsizeiptr)((2 + nm2 + 3) * sizeof(uint32_t)));
+                        (GLsizeiptr)((2 + nm2 + 4) * sizeof(uint32_t)));
         }
 
         {
@@ -8452,6 +8517,8 @@ public:
         const int nm = st.mat_n_mats;
         const int na = (int)ps.arenas.size();
         const int nt = (int)st.tris.size();
+        /* Hoisted so dispatch_prep (before T3 bindings) can reference it */
+        const int bdpt_count_base  = 2 + nm;   /* MetaBuf tail: [2+nm..2+nm+2] BDPT counts */
 
         /* ── GPU-resident bounce loop ─────────────────────────────────────────
          * Generation 0: pack batch from CPU → ssbo_intent and upload.
@@ -8460,10 +8527,22 @@ public:
          * in INTENT_STRIDE format, no PCIe transfer between generations.         */
         bool first_gen    = true;
         int  total_n_hits = 0;
-        /* BDPT vertex/spectral/pdf counts accumulate across bounces in ssbo_t3_meta.
-         * ssbo_counter[4] (optical write pointer) also accumulates.  Track the
-         * previous totals so we read only the new delta records each bounce.   */
+        /* BDPT layout constants — derived from ps.cfg, invariant across bounces.
+         * Hoisted so post-loop readback block can reference them after loop exit. */
+        static constexpr int BDPT_VERTEX_STRIDE_F   = 28;
+        static constexpr int BDPT_SPECTRAL_STRIDE_F =  8;
+        static constexpr int BDPT_PDF_STRIDE_F      = 12;
+        static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;
+        const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 2000000;
+        const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 4000000;
+        const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 2000000;
+        const int max_bdpt_o = (ps.cfg.bdpt_max_optical > 0) ? ps.cfg.bdpt_max_optical : 1000000;
+        const int  bdpt_spectral_base_f = max_bdpt_v * BDPT_VERTEX_STRIDE_F;
+        const int  bdpt_pdf_base_f      = bdpt_spectral_base_f + max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
+        const int  bdpt_optical_base_f  = bdpt_pdf_base_f + max_bdpt_p * BDPT_PDF_STRIDE_F;
+        /* prev_no: running optical write pointer; prev_nv/ns/np unused (BDPT deferred). */
         int prev_nv = 0, prev_ns = 0, prev_np = 0, prev_no = 0;
+        (void)prev_nv; (void)prev_ns; (void)prev_np;
         for (;;) {  /* ── bounce loop ── */
 
         /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 20 + 2*MAX_SPECTRAL_BANDS floats) */
@@ -8511,32 +8590,19 @@ public:
         /* else: ssbo_intent was swapped from old ssbo_child_int; child intents
          * are already GPU-resident in INTENT_STRIDE format — no upload needed. */
 
-        /* ── Ensure hit SSBO (HIT_STRIDE = 27 + 2*MAX_SPECTRAL_BANDS floats; bdpt_sid at [26+2*MAX_SPECTRAL_BANDS]) */
+        /* ── Ensure hit SSBOs (double-buffered; HIT_STRIDE_BYTES is a class constant) */
         static constexpr int HIT_STRIDE = 27 + 2 * MAX_SPECTRAL_BANDS;
-        int max_hits = n * 4;
-        if (max_hits > cap_hits) {
-            cap_hits = max_hits * 2;
-            ensure_ssbo(ssbo_hit, (GLsizeiptr)(cap_hits * HIT_STRIDE * sizeof(float)));
-        }
+        static_assert(HIT_STRIDE * (int)sizeof(float) == HIT_STRIDE_BYTES, "HIT_STRIDE mismatch");
+        ensure_hit_ssbos(n * 4);  /* grows both ssbo_hit and ssbo_hit_b if needed */
 
         /* ── Ensure BDPT output SSBO (single buffer, binding 7) ─────────── *
-         * Layout: [verts 0..bdpt_spectral_base_f) ++ [spectral ..bdpt_pdf_base_f) ++ [pdfs ..)
-         * Counts live in MetaBuf tail at [2+nm..2+nm+2] (no separate counter SSBO). */
-        static constexpr int BDPT_VERTEX_STRIDE_F   = 28;  /* floats per BdptVertexRecord */
-        static constexpr int BDPT_SPECTRAL_STRIDE_F =  8;  /* floats per BdptSpectralWeightRecord */
-        static constexpr int BDPT_PDF_STRIDE_F      = 12;  /* floats per BdptPdfRecord */
-        static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;  /* floats per BdptOpticalEventRecord */
-        const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 2000000;
-        const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 4000000;
-        const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 2000000;
-        const int max_bdpt_o = (ps.cfg.bdpt_max_optical > 0) ? ps.cfg.bdpt_max_optical : 1000000;
-        const int  bdpt_spectral_base_f = max_bdpt_v * BDPT_VERTEX_STRIDE_F;
-        const int  bdpt_pdf_base_f      = bdpt_spectral_base_f + max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
-        const int  bdpt_optical_base_f  = bdpt_pdf_base_f + max_bdpt_p * BDPT_PDF_STRIDE_F;
-        const int64_t bdpt_total_f      = (int64_t)bdpt_optical_base_f + (int64_t)max_bdpt_o * BDPT_OPTICAL_STRIDE_F;
-        if (bdpt_total_f > cap_bdpt_output) {
-            cap_bdpt_output = (int)bdpt_total_f;
-            ensure_ssbo(ssbo_bdpt_output, (GLsizeiptr)(bdpt_total_f * sizeof(float)));
+         * Layout, strides, max_bdpt_* and base offsets hoisted to function scope above. */
+        {
+            const int64_t bdpt_total_f = (int64_t)bdpt_optical_base_f + (int64_t)max_bdpt_o * BDPT_OPTICAL_STRIDE_F;
+            if (bdpt_total_f > cap_bdpt_output) {
+                cap_bdpt_output = (int)bdpt_total_f;
+                ensure_ssbo(ssbo_bdpt_output, (GLsizeiptr)(bdpt_total_f * sizeof(float)));
+            }
         }
 
         /* Zero per-bounce counters.  On first gen: zero all 8 (including [4]=optical
@@ -8566,7 +8632,7 @@ public:
         /* ── T1 dispatch ──────────────────────────────────────────────═ */
         auto t1_start = Clock::now();
         glc_UseProgram(prog_t1);
-        bind_ssbo(ssbo_intent,     0); bind_ssbo(ssbo_hit,       1);
+        bind_ssbo(ssbo_intent,     0); bind_ssbo(active_hit_ssbo(), 1);
         bind_ssbo(ssbo_counter,    2); bind_ssbo(ssbo_bvh,       3);
         bind_ssbo(ssbo_tri_id,     4); bind_ssbo(ssbo_tri_full,  5);
         bind_ssbo(ssbo_mat_band,   6); bind_ssbo(ssbo_scene_band,7);
@@ -8578,11 +8644,21 @@ public:
         if (uloc_t1.u_arenas >= 0 && na > 0)
             glc_Uniform4fv(uloc_t1.u_arenas, na, arena_uniform_data.data());
         GLC_DISPATCH_CHECKED("T1:BVH", (GLuint)((n + 63) / 64), 1, 1);
-        /* Shader-storage barrier only — no CPU readback here.
-         * T2 and T3 read n_hits from counters[0] in the SSBO so we can
-         * dispatch T1→T2→T3 as a single GPU command sequence with only
-         * one CPU sync point (after T3).  This halves GPU↔CPU round-trips. */
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        /* ── dispatch_prep: GPU writes indirect T3 params + n_hits into SSBOs ──
+         * Replaces the CPU readback of counters[0] that used to gate T3.
+         * Writes counters[5..7] = {(n_hits+63)/64,1,1} for glDispatchComputeIndirect
+         * and meta[bdpt_count_base+3] = n_hits for T3's per-invocation guard.
+         * Falls back to CPU readback if the shader failed to compile at init. */
+        if (prog_dispatch_prep) {
+            glc_UseProgram(prog_dispatch_prep);
+            bind_ssbo(ssbo_counter, 0);
+            bind_ssbo(ssbo_t3_meta, 1);
+            glc_Uniform1i(uloc_prep.bdpt_count_base, bdpt_count_base);
+            GLC_DISPATCH_CHECKED("prep:indirect", 1, 1, 1);
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        }
 
         /* ── T2 dispatch (in-place on ssbo_hit) ─────────────────────────═
          * Re-sync parametric SSBOs from current CPU state before every T2 dispatch.
@@ -8602,7 +8678,7 @@ public:
                 glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
             }
             glc_UseProgram(prog_t2);
-            bind_ssbo(ssbo_hit,        0); bind_ssbo(ssbo_tri_full,  1);
+            bind_ssbo(active_hit_ssbo(), 0); bind_ssbo(ssbo_tri_full,  1);
             bind_ssbo(ssbo_tri_param,  2); bind_ssbo(ssbo_group_kind,3);
             bind_ssbo(ssbo_group_pay,  4); bind_ssbo(ssbo_counter,   5);
             bind_ssbo(ssbo_neural_pay, 6);
@@ -8625,14 +8701,11 @@ public:
         }
 
         /* ── T3 dispatch ──────────────────────────────────────────────═ */
-        /* CounterBuf is absent from T3 (all 8 bindings used); read n_hits now via CPU sync.
-         * Cost: one GPU→CPU 4-byte transfer after T1/T2 barriers are already in flight. */
-        int n_hits = 0;
-        {
-            uint32_t cnt0 = 0u;
-            readback_ssbo(ssbo_counter, &cnt0, sizeof(uint32_t));
-            n_hits = std::min((int)cnt0, cap_hits);
-        }
+        /* n_hits is resolved GPU-side by dispatch_prep.comp.glsl (above) into
+         * counters[5..7] (indirect params) and meta[bdpt_count_base+3] (T3 guard).
+         * No CPU readback before T3.  n_hits is read from counters[0] in the
+         * full counter readback below, after GL_ALL_BARRIER_BITS. */
+        int n_hits = 0;  /* set from counters[0] after post-T3 full readback */
         static constexpr int CHILD_STRIDE    = 20 + 2 * MAX_SPECTRAL_BANDS;  /* INTENT_STRIDE: 20 + 2*MAX_SPECTRAL_BANDS */
         static constexpr int TERMINAL_STRIDE = 26 + 2 * MAX_SPECTRAL_BANDS;  /* 26 + 2*MAX_SPECTRAL_BANDS */
         /* Size child buffer for worst-case (all n intents hit and spawn children). */
@@ -8656,7 +8729,7 @@ public:
         /* Bindings match ray_material.comp.glsl (8 slots, 0-7 — GL_MAX_COMPUTE_SHADER_STORAGE_BLOCKS=8):
          * 0=RefinedHitBuf  1=OutBuf  2=MetaBuf     3=TriangleBuf
          * 4=MatBandBuf     5=MergedUvBuf  6=UvAccumBuf  7=BdptOutputBuf */
-        bind_ssbo(ssbo_hit,         0);
+        bind_ssbo(active_hit_ssbo(), 0);
         bind_ssbo(ssbo_child_int,   1);
         bind_ssbo(ssbo_t3_meta,     2);
         bind_ssbo(ssbo_tri_full,    3);
@@ -8667,7 +8740,7 @@ public:
         const int n_uv_groups      = (int)st.group_uv_res.size();
         const int uv_group_id_base = nt * 6;   /* MergedUvBuf section 2: per-tri group IDs */
         const int uv_meta_base     = nt * 7;   /* MergedUvBuf section 3: group metadata */
-        const int bdpt_count_base  = 2 + nm;   /* MetaBuf tail: [2+nm..2+nm+2] BDPT counts */
+        /* bdpt_count_base declared at function top (hoisted for dispatch_prep) */
         glc_Uniform1i (uloc_t3.n_bands,              nb);
         glc_Uniform1i (uloc_t3.n_mats,               nm);
         glc_Uniform1i (uloc_t3.max_children,         max_children);
@@ -8685,17 +8758,40 @@ public:
         glc_Uniform1i (uloc_t3.bdpt_count_base,       bdpt_count_base);
         glc_Uniform1i (uloc_t3.bdpt_spectral_base,    bdpt_spectral_base_f);
         glc_Uniform1i (uloc_t3.bdpt_pdf_base,         bdpt_pdf_base_f);
-        glc_Uniform1i (uloc_t3.n_hits,                n_hits);
-        GLC_DISPATCH_CHECKED("T3:material", (GLuint)((n + 63) / 64), 1, 1);
+        /* n_hits uniform intentionally omitted — T3 reads from MetaBuf[bdpt_count_base+3] */
+        if (prog_dispatch_prep) {
+            /* Indirect dispatch: workgroup count written by dispatch_prep into counters[5..7] */
+            glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ssbo_counter);
+            glc_DispatchComputeIndirect((GLintptr)(5 * sizeof(uint32_t)));
+            glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+        } else {
+            /* Fallback: CPU-side count (prog_dispatch_prep failed to compile at init) */
+            uint32_t cnt0 = 0u;
+            readback_ssbo(ssbo_counter, &cnt0, sizeof(uint32_t));
+            n_hits = std::min((int)cnt0, cap_hits);
+            GLC_DISPATCH_CHECKED("T3:material", (GLuint)((n + 63) / 64), 1, 1);
+        }
 
-        /* Single full barrier + readback covers ALL of T1/T2/T3 output in one
-         * GPU→CPU sync.  GL_ALL_BARRIER_BITS ensures CPU-side GetBufferSubData
-         * visibility of the atomic writes from all three stages. */
+        /* Single full barrier — ensures CPU-side visibility of all T1/T2/T3 writes. */
         glc_MemoryBarrier(GL_ALL_BARRIER_BITS);
 
-        /* Read full counter block for stats; n_hits was resolved before T3 dispatch. */
+        /* ── Double-buffer hit SSBO: fence current bounce, flip for next bounce ──
+         * fence_hit[idx] marks when the current active buffer's GPU writes are done.
+         * The CPU may only read it after waiting on this fence.
+         * The alternate buffer is now free for T1 of the next bounce to write into. */
+        const int cur_idx = hit_flip ? 1 : 0;
+        if (fence_hit[cur_idx]) {
+            glc_DeleteSync(fence_hit[cur_idx]);
+            fence_hit[cur_idx] = nullptr;
+        }
+        fence_hit[cur_idx] = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        hit_flip = !hit_flip;  /* next bounce will write to the OTHER buffer */
+
+        /* Full counter readback — counters[0] = n_hits from T1, available here
+         * after the barrier regardless of which T3 dispatch path was taken. */
         uint32_t counters[8] = {};
         readback_ssbo(ssbo_counter, counters, 8 * sizeof(uint32_t));
+        n_hits = std::min((int)counters[0], cap_hits);
 
         ps.stats[0].record_gpu(n, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
             Clock::now() - t1_start).count(), ps.Q_intent.size());
@@ -8843,10 +8939,18 @@ public:
             fflush(stderr);
         }
         /* ── Post-T3: STRIKE records → Q_out + field grid (one readback) ──
-         * ssbo_hit still holds T2-refined positions (T3 reads it, never writes).
-         * Combining both purposes into one PCIe transfer halves the readback cost
-         * vs doing them separately. */
+         * Read from prev_hit_ssbo() — the buffer that T3 JUST finished writing,
+         * now flipped away from the active write side.  Wait on its fence first
+         * so the CPU sees coherent data even if the GL driver batches commands. */
         {
+            const int prev_idx = hit_flip ? 0 : 1;  /* complement of current hit_flip */
+            if (fence_hit[prev_idx]) {
+                glc_ClientWaitSync(fence_hit[prev_idx],
+                                   GL_SYNC_FLUSH_COMMANDS_BIT, 50'000'000 /* 50 ms */);
+                glc_DeleteSync(fence_hit[prev_idx]);
+                fence_hit[prev_idx] = nullptr;
+            }
+
             const bool do_field = ps.cfg.gpu_segment_field_capture
                                   && ps.st && ps.st->camera_field_grid;
             static constexpr int Q_OUT_VIS_CAP = 4'000'000;
@@ -8863,7 +8967,7 @@ public:
                 const int n_rb    = do_field ? n_hits : std::max(n_vis, n_stats);
                 stg_hbuf.resize((size_t)n_rb * HIT_STRIDE);
                 auto& hbuf = stg_hbuf;
-                readback_ssbo(ssbo_hit, hbuf.data(),
+                readback_ssbo(prev_hit_ssbo(), hbuf.data(),
                               (GLsizeiptr)((size_t)n_rb * HIT_STRIDE * sizeof(float)));
                 ps.gpu_hit_readback_bytes.fetch_add(
                     (uint64_t)((size_t)n_rb * HIT_STRIDE * sizeof(float)),
@@ -8954,202 +9058,16 @@ public:
             fflush(stderr);
         }
 
-        /* ── BDPT side-data readback: push GPU-emitted records to CPU queues ──
-         * Counts in MetaBuf tail [2+nm..2+nm+2] accumulate across bounces; we
-         * read only the delta (new records since prev_nv/ns/np/no) each bounce.
-         * counter[4] (optical write pointer) similarly accumulates.          */
+        /* ── BDPT side-data: deferred to post-loop single batch readback ──
+         * Previously read deltas every bounce (4×N GetBufferSubData calls).
+         * Now we skip the per-bounce readback entirely; the post-loop block
+         * below does one batch read of ALL records after all bounces complete.
+         * The optical write pointer (counters[4]) is captured now from the
+         * already-read counters[] so we don't need an extra SSBO read at end.
+         * prev_no tracks the running optical pointer for the post-loop clamping. */
         {
-            uint32_t bdpt_cnts[3] = {};
-            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
-            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                                 (GLintptr)((2 + nm) * sizeof(uint32_t)),
-                                 3 * sizeof(uint32_t), bdpt_cnts);
-            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-            const int total_nv = std::min((int)bdpt_cnts[0], max_bdpt_v);
-            const int total_ns = std::min((int)bdpt_cnts[1], max_bdpt_s);
-            const int total_np = std::min((int)bdpt_cnts[2], max_bdpt_p);
-            const int total_no = std::min((int)counters[4], max_bdpt_o);
-            const int nv = total_nv - prev_nv;  /* delta: records added this bounce */
-            const int ns = total_ns - prev_ns;
-            const int np = total_np - prev_np;
-            const int no = total_no - prev_no;
-            /* !!DIAG!! raw GPU-emitted BDPT counts (before clamping to cap).
-             * bdpt_cnts[2]=raw PDF count from meta[2+nm+2].
-             * If raw_pdfs=0 the shader never incremented the PDF counter →
-             *   bdpt_max_pdfs uniform is 0 in shader (dead-stripped or upload failed).
-             * If raw_pdfs>0 but np=0 the cap is wrong.
-             * uloc_t3.bdpt_max_pdfs=-1 means the uniform was not found in the shader. */
-            fprintf(stderr,
-                "[gpu-bdpt-diag] nm=%d bdpt_count_base=%d "
-                "raw_verts=%u raw_spectral=%u raw_pdfs=%u "
-                "cap_v=%d cap_s=%d cap_p=%d "
-                "uloc_max_verts=%d uloc_max_spectral=%d uloc_max_pdfs=%d "
-                "uloc_count_base=%d uloc_spectral_base=%d uloc_pdf_base=%d "
-                "max_bdpt_v=%d max_bdpt_s=%d max_bdpt_p=%d "
-                "bdpt_spectral_base_f=%d bdpt_pdf_base_f=%d\n",
-                nm, bdpt_count_base,
-                bdpt_cnts[0], bdpt_cnts[1], bdpt_cnts[2],
-                nv, ns, np,
-                (int)uloc_t3.bdpt_max_verts,
-                (int)uloc_t3.bdpt_max_spectral,
-                (int)uloc_t3.bdpt_max_pdfs,
-                (int)uloc_t3.bdpt_count_base,
-                (int)uloc_t3.bdpt_spectral_base,
-                (int)uloc_t3.bdpt_pdf_base,
-                max_bdpt_v, max_bdpt_s, max_bdpt_p,
-                bdpt_spectral_base_f, bdpt_pdf_base_f);
-            fflush(stderr);
-            uint64_t batch_cam_count = 0;  /* sensor verts in this batch */
-
-            if (nv > 0) {
-                stg_bdpt_verts.resize((size_t)nv * BDPT_VERTEX_STRIDE_F);
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
-                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                                     (GLintptr)((size_t)prev_nv * BDPT_VERTEX_STRIDE_F * sizeof(float)),
-                                     (GLsizeiptr)((size_t)nv * BDPT_VERTEX_STRIDE_F * sizeof(float)),
-                                     stg_bdpt_verts.data());
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-                uint64_t cam_count = 0;
-                for (int i = 0; i < nv; ++i) {
-                    const float* row = stg_bdpt_verts.data() + (size_t)i * BDPT_VERTEX_STRIDE_F;
-                    BdptVertexRecord vr{};
-                    memcpy(&vr.subpath_id,  row +  0, 4);
-                    {
-                        uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
-                        vr.vertex_index  = (uint16_t)(pk >> 16);
-                        vr.stream        = (uint8_t)((pk >> 8) & 0xFFu);
-                        vr.sample_domain = (uint8_t)(pk & 0xFFu);
-                    }
-                    memcpy(&vr.flags,      row +  2, 4);
-                    /* row[3] = strategy_id = 0 */
-                    memcpy(&vr.tri_id,     row +  4, 4);
-                    vr.group_id = -1;  /* row[5] written as -1 by shader */
-                    memcpy(&vr.mat_idx,    row +  6, 4);
-                    vr.pos[0] = row[7];  vr.pos[1] = row[8];  vr.pos[2] = row[9];
-                    vr.normal[0] = row[10]; vr.normal[1] = row[11]; vr.normal[2] = row[12];
-                    vr.dir_in[0] = row[13]; vr.dir_in[1] = row[14]; vr.dir_in[2] = row[15];
-                    /* dir_out = 0 (row[16..18]) */
-                    vr.path_len          = row[19];
-                    vr.path_at_seg_start = row[20];
-                    vr.pdf_fwd           = row[21];
-                    vr.pdf_rev           = row[22];
-                    vr.pdf_area          = row[23];
-                    vr.pdf_solid_angle   = row[24];
-                    vr.throughput_scalar = row[25];
-                    vr.sensor_origin_y   = row[26];
-                    vr.sensor_origin_z   = row[27];
-                    ps.push_bdpt_vertex(vr);
-                    if (vr.stream == BDPT_SIDE_SENSOR) { ++cam_count; ++batch_cam_count; }
-                }
-                if (cam_count > 0)
-                    ps.bdpt_cam_vertex_count.fetch_add(cam_count, std::memory_order_relaxed);
-            }
-
-            if (ns > 0) {
-                stg_bdpt_spectral.resize((size_t)ns * BDPT_SPECTRAL_STRIDE_F);
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
-                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                                     (GLintptr)((bdpt_spectral_base_f + (size_t)prev_ns * BDPT_SPECTRAL_STRIDE_F) * sizeof(float)),
-                                     (GLsizeiptr)((size_t)ns * BDPT_SPECTRAL_STRIDE_F * sizeof(float)),
-                                     stg_bdpt_spectral.data());
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-                for (int i = 0; i < ns; ++i) {
-                    const float* row = stg_bdpt_spectral.data() + (size_t)i * BDPT_SPECTRAL_STRIDE_F;
-                    BdptSpectralWeightRecord sw{};
-                    memcpy(&sw.subpath_id, row + 0, 4);
-                    {
-                        uint32_t vb = 0u; memcpy(&vb, row + 1, 4);
-                        sw.vertex_index = (uint16_t)(vb >> 16);
-                        sw.band_id      = (uint16_t)(vb & 0xFFFFu);
-                    }
-                    sw.beta_re               = row[2];
-                    sw.beta_im               = row[3];
-                    sw.wavelength_or_center  = row[4];
-                    sw.band_pdf              = row[5];
-                    sw.sensor_rgb_weight     = row[6];
-                    ps.push_bdpt_spectral(sw);
-                }
-            }
-
-            if (np > 0) {
-                stg_bdpt_pdfs.resize((size_t)np * BDPT_PDF_STRIDE_F);
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
-                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                                     (GLintptr)((bdpt_pdf_base_f + (size_t)prev_np * BDPT_PDF_STRIDE_F) * sizeof(float)),
-                                     (GLsizeiptr)((size_t)np * BDPT_PDF_STRIDE_F * sizeof(float)),
-                                     stg_bdpt_pdfs.data());
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-                for (int i = 0; i < np; ++i) {
-                    const float* row = stg_bdpt_pdfs.data() + (size_t)i * BDPT_PDF_STRIDE_F;
-                    BdptPdfRecord pr{};
-                    memcpy(&pr.subpath_id, row + 0, 4);
-                    {
-                        uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
-                        pr.vertex_index  = (uint16_t)(pk & 0xFFFFu);
-                        pr.sample_domain = (uint8_t)((pk >> 16) & 0xFFu);
-                        pr.measure       = (uint8_t)((pk >> 24) & 0xFFu);
-                    }
-                    pr.pdf_fwd         = row[2];
-                    pr.pdf_rev         = row[3];
-                    pr.pdf_area        = row[4];
-                    pr.pdf_solid_angle = row[5];
-                    pr.jacobian_det    = row[6];
-                    pr.geometry_term   = row[7];
-                    memcpy(&pr.flags, row + 8, 4);
-                    ps.push_bdpt_pdf(pr);
-                }
-            }
-
-            if (no > 0) {
-                stg_bdpt_optical.resize((size_t)no * BDPT_OPTICAL_STRIDE_F);
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
-                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
-                                     (GLintptr)((bdpt_optical_base_f + (size_t)prev_no * BDPT_OPTICAL_STRIDE_F) * sizeof(float)),
-                                     (GLsizeiptr)((size_t)no * BDPT_OPTICAL_STRIDE_F * sizeof(float)),
-                                     stg_bdpt_optical.data());
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-                for (int i = 0; i < no; ++i) {
-                    const float* row = stg_bdpt_optical.data() + (size_t)i * BDPT_OPTICAL_STRIDE_F;
-                    BdptOpticalEventRecord oe{};
-                    memcpy(&oe.subpath_id, row + 0, 4);
-                    {
-                        uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
-                        oe.vertex_index  = (uint16_t)(pk & 0xFFFFu);
-                        oe.element_index = (uint16_t)((pk >> 16) & 0xFFFFu);
-                    }
-                    {
-                        uint32_t pk = 0u; memcpy(&pk, row + 2, 4);
-                        oe.reason = (uint8_t)(pk & 0xFFu);
-                        oe.stream = (uint8_t)((pk >> 8) & 0xFFu);
-                        oe.flags  = (uint16_t)((pk >> 16) & 0xFFFFu);
-                    }
-                    oe.pos[0] = row[3];  oe.pos[1] = row[4];  oe.pos[2] = row[5];
-                    oe.normal[0] = row[6]; oe.normal[1] = row[7]; oe.normal[2] = row[8];
-                    oe.dir_in[0] = row[9]; oe.dir_in[1] = row[10]; oe.dir_in[2] = row[11];
-                    oe.dir_out[0] = row[12]; oe.dir_out[1] = row[13]; oe.dir_out[2] = row[14];
-                    oe.cos_incident         = row[15];
-                    oe.cos_transmitted      = row[16];
-                    oe.eta_i                = row[17];
-                    oe.eta_t                = row[18];
-                    oe.fresnel_reflectance  = row[19];
-                    oe.transmittance        = row[20];
-                    oe.throughput_multiplier = row[21];
-                    oe.opl                  = row[22];
-                    oe.geom_len             = row[23];
-                    oe.aperture_radius      = row[24];
-                    oe.transverse_radius    = row[25];
-                    oe.dist_past_aperture   = row[26];
-                    oe.phase_space_jacobian = row[27];
-                    ps.push_bdpt_optical(oe);
-                }
-            }
-
-            /* Data from this batch is now in its queues.  T5 is NOT fired here —
-             * firing per T3 generation is too early; all bounce generations must
-             * complete first.  T5 fires from the timeout path once in_flight==0. */
-            (void)batch_cam_count;
-            /* Advance incremental BDPT read positions for the next bounce. */
-            prev_nv = total_nv; prev_ns = total_ns; prev_np = total_np; prev_no = total_no;
+            /* Track running optical count for post-loop deferred readback. */
+            prev_no = std::min((int)counters[4], max_bdpt_o);
         }
 
         total_n_hits += n_hits;
@@ -9165,6 +9083,153 @@ public:
         first_gen = false;
 
         }  /* end bounce loop */
+
+        /* ── Post-loop BDPT side-data readback: one batch for ALL bounces ──
+         * ssbo_t3_meta[bdpt_count_base..+2] = total vert/spectral/pdf counts.
+         * counters[4] (optical) = running total captured in prev_no on last bounce.
+         * Read all records in one GetBufferSubData per type. */
+        {
+            uint32_t bdpt_cnts[3] = {};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                 (GLintptr)(bdpt_count_base * sizeof(uint32_t)),
+                                 3 * sizeof(uint32_t), bdpt_cnts);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            const int nv = std::min((int)bdpt_cnts[0], max_bdpt_v);
+            const int ns = std::min((int)bdpt_cnts[1], max_bdpt_s);
+            const int np = std::min((int)bdpt_cnts[2], max_bdpt_p);
+            const int no = prev_no;  /* captured from counters[4] on last bounce */
+
+            if (nv > 0) {
+                stg_bdpt_verts.resize((size_t)nv * BDPT_VERTEX_STRIDE_F);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                     (GLsizeiptr)((size_t)nv * BDPT_VERTEX_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_verts.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                uint64_t cam_count = 0;
+                for (int i = 0; i < nv; ++i) {
+                    const float* row = stg_bdpt_verts.data() + (size_t)i * BDPT_VERTEX_STRIDE_F;
+                    BdptVertexRecord vr{};
+                    memcpy(&vr.subpath_id,  row +  0, 4);
+                    { uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
+                      vr.vertex_index  = (uint16_t)(pk >> 16);
+                      vr.stream        = (uint8_t)((pk >> 8) & 0xFFu);
+                      vr.sample_domain = (uint8_t)(pk & 0xFFu); }
+                    memcpy(&vr.flags,   row +  2, 4);
+                    memcpy(&vr.tri_id,  row +  4, 4);
+                    vr.group_id = -1;
+                    memcpy(&vr.mat_idx, row +  6, 4);
+                    vr.pos[0] = row[7];  vr.pos[1] = row[8];  vr.pos[2] = row[9];
+                    vr.normal[0] = row[10]; vr.normal[1] = row[11]; vr.normal[2] = row[12];
+                    vr.dir_in[0] = row[13]; vr.dir_in[1] = row[14]; vr.dir_in[2] = row[15];
+                    vr.path_len          = row[19];
+                    vr.path_at_seg_start = row[20];
+                    vr.pdf_fwd           = row[21];
+                    vr.pdf_rev           = row[22];
+                    vr.pdf_area          = row[23];
+                    vr.pdf_solid_angle   = row[24];
+                    vr.throughput_scalar = row[25];
+                    vr.sensor_origin_y   = row[26];
+                    vr.sensor_origin_z   = row[27];
+                    ps.push_bdpt_vertex(vr);
+                    if (vr.stream == BDPT_SIDE_SENSOR) ++cam_count;
+                }
+                if (cam_count > 0)
+                    ps.bdpt_cam_vertex_count.fetch_add(cam_count, std::memory_order_relaxed);
+            }
+
+            if (ns > 0) {
+                stg_bdpt_spectral.resize((size_t)ns * BDPT_SPECTRAL_STRIDE_F);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                     (GLintptr)((size_t)bdpt_spectral_base_f * sizeof(float)),
+                                     (GLsizeiptr)((size_t)ns * BDPT_SPECTRAL_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_spectral.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                for (int i = 0; i < ns; ++i) {
+                    const float* row = stg_bdpt_spectral.data() + (size_t)i * BDPT_SPECTRAL_STRIDE_F;
+                    BdptSpectralWeightRecord sw{};
+                    memcpy(&sw.subpath_id, row + 0, 4);
+                    { uint32_t vb = 0u; memcpy(&vb, row + 1, 4);
+                      sw.vertex_index = (uint16_t)(vb >> 16);
+                      sw.band_id      = (uint16_t)(vb & 0xFFFFu); }
+                    sw.beta_re              = row[2];
+                    sw.beta_im              = row[3];
+                    sw.wavelength_or_center = row[4];
+                    sw.band_pdf             = row[5];
+                    sw.sensor_rgb_weight    = row[6];
+                    ps.push_bdpt_spectral(sw);
+                }
+            }
+
+            if (np > 0) {
+                stg_bdpt_pdfs.resize((size_t)np * BDPT_PDF_STRIDE_F);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                     (GLintptr)((size_t)bdpt_pdf_base_f * sizeof(float)),
+                                     (GLsizeiptr)((size_t)np * BDPT_PDF_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_pdfs.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                for (int i = 0; i < np; ++i) {
+                    const float* row = stg_bdpt_pdfs.data() + (size_t)i * BDPT_PDF_STRIDE_F;
+                    BdptPdfRecord pr{};
+                    memcpy(&pr.subpath_id, row + 0, 4);
+                    { uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
+                      pr.vertex_index  = (uint16_t)(pk & 0xFFFFu);
+                      pr.sample_domain = (uint8_t)((pk >> 16) & 0xFFu);
+                      pr.measure       = (uint8_t)((pk >> 24) & 0xFFu); }
+                    pr.pdf_fwd         = row[2];
+                    pr.pdf_rev         = row[3];
+                    pr.pdf_area        = row[4];
+                    pr.pdf_solid_angle = row[5];
+                    pr.jacobian_det    = row[6];
+                    pr.geometry_term   = row[7];
+                    memcpy(&pr.flags, row + 8, 4);
+                    ps.push_bdpt_pdf(pr);
+                }
+            }
+
+            if (no > 0) {
+                stg_bdpt_optical.resize((size_t)no * BDPT_OPTICAL_STRIDE_F);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                     (GLintptr)((size_t)bdpt_optical_base_f * sizeof(float)),
+                                     (GLsizeiptr)((size_t)no * BDPT_OPTICAL_STRIDE_F * sizeof(float)),
+                                     stg_bdpt_optical.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                for (int i = 0; i < no; ++i) {
+                    const float* row = stg_bdpt_optical.data() + (size_t)i * BDPT_OPTICAL_STRIDE_F;
+                    BdptOpticalEventRecord oe{};
+                    memcpy(&oe.subpath_id, row + 0, 4);
+                    { uint32_t pk = 0u; memcpy(&pk, row + 1, 4);
+                      oe.vertex_index  = (uint16_t)(pk & 0xFFFFu);
+                      oe.element_index = (uint16_t)((pk >> 16) & 0xFFFFu); }
+                    { uint32_t pk = 0u; memcpy(&pk, row + 2, 4);
+                      oe.reason = (uint8_t)(pk & 0xFFu);
+                      oe.stream = (uint8_t)((pk >> 8) & 0xFFu);
+                      oe.flags  = (uint16_t)((pk >> 16) & 0xFFFFu); }
+                    oe.pos[0]    = row[3];  oe.pos[1]    = row[4];  oe.pos[2]    = row[5];
+                    oe.normal[0] = row[6];  oe.normal[1] = row[7];  oe.normal[2] = row[8];
+                    oe.dir_in[0] = row[9];  oe.dir_in[1] = row[10]; oe.dir_in[2] = row[11];
+                    oe.dir_out[0] = row[12]; oe.dir_out[1] = row[13]; oe.dir_out[2] = row[14];
+                    oe.cos_incident          = row[15];
+                    oe.cos_transmitted       = row[16];
+                    oe.eta_i                 = row[17];
+                    oe.eta_t                 = row[18];
+                    oe.fresnel_reflectance   = row[19];
+                    oe.transmittance         = row[20];
+                    oe.throughput_multiplier = row[21];
+                    oe.opl                   = row[22];
+                    oe.geom_len              = row[23];
+                    oe.aperture_radius       = row[24];
+                    oe.transverse_radius     = row[25];
+                    oe.dist_past_aperture    = row[26];
+                    oe.phase_space_jacobian  = row[27];
+                    ps.push_bdpt_optical(oe);
+                }
+            }
+        }
 
         /* Children were fully consumed GPU-resident; none escaped to Q_intent. */
         if (out_flash_children)  *out_flash_children  = 0;
@@ -11442,28 +11507,20 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
 
     /* ── Aperture disk sampling ─────────────────────────────────────────────
      * aperture_seed == 0: all rays aim at the aperture center (backward compat).
-     * aperture_seed >  0: Fibonacci / golden-angle quasi-random aperture point.
+     * aperture_seed >  0: random aperture point, seeded from aperture_seed.
      *
-     * Batch index s maps to a point on the aperture disk via:
-     *   radius   = sqrt(van_der_corput_base2(s)) × target_r   (uniform area)
-     *   angle    = s × golden_angle                            (Fibonacci spiral)
-     *
-     * Van der Corput base-2 reverses the bits of s to produce a perfectly
-     * stratified sequence in [0,1) without needing to know N in advance.
-     * The result covers the aperture disk evenly across any number of batches.
+     * Two independent splitmix64 hashes give uniform area coverage across
+     * independent sweeps without any regular spiral structure, which prevents
+     * the discrete multi-lobe bokeh artifacts that Fibonacci / golden-angle
+     * quasi-random sequences produce.
      */
     double ap_y = 0.0, ap_z = 0.0;
     if (aperture_seed > 0 && target_r > 0.0) {
-        static constexpr double kGoldenAngle = 2.39996322972865332; /* 2π/φ² */
-        uint32_t s = static_cast<uint32_t>(aperture_seed);
-        /* Van der Corput base-2 bit reversal */
-        s = ((s & 0x55555555u) << 1) | ((s & 0xAAAAAAAAu) >> 1);
-        s = ((s & 0x33333333u) << 2) | ((s & 0xCCCCCCCCu) >> 2);
-        s = ((s & 0x0F0F0F0Fu) << 4) | ((s & 0xF0F0F0F0u) >> 4);
-        s = ((s & 0x00FF00FFu) << 8) | ((s & 0xFF00FF00u) >> 8);
-        const double r_frac = static_cast<double>(s) / 4294967296.0; /* [0,1) */
+        uint64_t h = rt_splitmix64(aperture_seed);
+        const double r_frac = static_cast<double>(h >> 32) / 4294967296.0; /* [0,1) */
+        h = rt_splitmix64(h);
+        const double theta  = 2.0 * M_PI * (static_cast<double>(h >> 32) / 4294967296.0);
         const double ap_r   = std::sqrt(r_frac) * target_r;
-        const double theta  = static_cast<double>(aperture_seed) * kGoldenAngle;
         ap_y = ap_r * std::cos(theta);
         ap_z = ap_r * std::sin(theta);
     }

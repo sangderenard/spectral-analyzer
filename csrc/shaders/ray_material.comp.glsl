@@ -151,7 +151,6 @@ layout(std430, binding = 7) coherent buffer BdptOutputBuf { float bdpt_out[];  }
 layout(r32ui, binding = 7) coherent volatile uniform uimage2DArray sensor_image;
 
 /* ── Uniforms ────────────────────────────────────────────────────────────── */
-uniform int   n_hits;             /* exact hit count from T1 (replaces CounterBuf read) */
 uniform int   n_bands;
 uniform int   n_mats;
 uniform int   max_children;
@@ -499,6 +498,9 @@ void write_intent(uint slot,
 /* ── Main ────────────────────────────────────────────────────────────────── */
 void main() {
     uint gid = gl_GlobalInvocationID.x;
+    /* n_hits written by dispatch_prep.comp.glsl into meta[bdpt_count_base+3];
+     * no CPU readback or uniform needed for the guard. */
+    int n_hits = int(meta[uint(bdpt_count_base) + 3u]);
     if (int(gid) >= n_hits) return;
 
     uint hbase = gid * uint(REFINED_HIT_STRIDE);

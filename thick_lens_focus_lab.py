@@ -64,7 +64,7 @@ from camera_software.exposure_timing import (
     SceneSnapshot,
 )
 from camera_software.scene_version import SceneVersionCache
-from camera_software.sdcard import SDCard as _SDCard
+from camera_software.sdcard import SDCard as _SDCard, DEFAULT_SDCARD_ROOT as _SDCARD_ROOT
 from physics_backend import PhysicsBackend
 try:
     import torch
@@ -4409,6 +4409,11 @@ class SensorRayCache:
             self.channel_idx = np.zeros((0,), dtype=np.uint8)
             self.cursor = 0
             self.signature: Optional[Tuple[object, ...]] = None
+            self._has_completed = False
+
+    @property
+    def complete(self) -> bool:
+        return self._has_completed
 
     def load_arrays(
         self,
@@ -4445,6 +4450,7 @@ class SensorRayCache:
                 self.cursor %= n
             else:
                 self.cursor = 0
+            self._has_completed = False
 
     def count(self) -> int:
         with self._lock:
@@ -4469,6 +4475,8 @@ class SensorRayCache:
                 "channel_idx": np.ascontiguousarray(self.channel_idx[idx], dtype=np.uint8),
             }
             if advance:
+                if int(self.cursor) + n_take >= total:
+                    self._has_completed = True
                 self.cursor = int((self.cursor + n_take) % total)
             return out
 
@@ -5922,7 +5930,15 @@ class ForwardCppLensBench:
         seed: int = 1,
         save_path: Optional[str] = None,
     ) -> int:
-        """Build reusable backward camera rays as a packageable tensor cache."""
+        """Build reusable backward camera rays as a packageable tensor cache.
+
+        Checks ``camera/sdcard/sensor_ray_cache/`` for a pre-built file whose
+        name encodes the camera configuration; loads it instantly when found.
+        On a fresh build the result is saved there so subsequent runs skip the
+        compute entirely.  The filename is a hash of the full configuration
+        signature so different camera settings never collide.
+        """
+        import hashlib as _hl
         plate = self.scene.image_plate
         res = int(max(4, pixels or plate.sensor_res))
         n_ap = int(max(1, aperture_samples))
@@ -5930,6 +5946,29 @@ class ForwardCppLensBench:
         target_center = np.asarray(target_spec.center, dtype=np.float64).reshape(3)
         target_r = float(max(1.0e-5, target_spec.radius))
         signature = self._sensor_ray_cache_signature(res, n_ap)
+
+        _sig_hash  = _hl.sha256(repr(signature).encode()).hexdigest()[:16]
+        _cache_dir  = _SDCARD_ROOT / "sensor_ray_cache"
+        _cache_file = _cache_dir / f"src_px{res}_ap{n_ap}_{_sig_hash}.npz"
+
+        # Load from disk when available.
+        if _cache_file.exists():
+            try:
+                self._sensor_ray_cache.load_npz(str(_cache_file), signature=signature)
+                n = self._sensor_ray_cache.count()
+                self._sensor_viewfinder_last_cache_count = n
+                self.bdpt_last_camera_samples = {
+                    "samples": n, "cache_count": n, "pixels": res,
+                    "aperture_samples": n_ap,
+                    "target_kind": str(target_spec.kind),
+                    "target_mode": str(target_spec.direction_mode),
+                }
+                print(f"[sensor-ray-cache] loaded {n:_} rays from {_cache_file.name}", flush=True)
+                if save_path:
+                    self._sensor_ray_cache.save_npz(save_path)
+                return n
+            except Exception as _e:
+                print(f"[sensor-ray-cache] disk load failed ({_e}), rebuilding", flush=True)
 
         half_y = float(max(1.0e-9, plate.sensor_half_w))
         half_z = float(max(1.0e-9, plate.sensor_half_h))
@@ -5994,6 +6033,15 @@ class ForwardCppLensBench:
             "target_kind": str(target_spec.kind),
             "target_mode": str(target_spec.direction_mode),
         }
+
+        # Persist so the same configuration loads from disk on next run.
+        try:
+            _cache_dir.mkdir(parents=True, exist_ok=True)
+            self._sensor_ray_cache.save_npz(str(_cache_file))
+            print(f"[sensor-ray-cache] saved {n:_} rays → {_cache_file.name}", flush=True)
+        except Exception as _e:
+            print(f"[sensor-ray-cache] disk save failed: {_e}", flush=True)
+
         if save_path:
             self._sensor_ray_cache.save_npz(save_path)
         return n
@@ -6082,6 +6130,8 @@ class ForwardCppLensBench:
         sig = self._sensor_ray_cache_signature(res, n_ap)
         if self._sensor_ray_cache.count() <= 0 or self._sensor_ray_cache.signature != sig:
             self.rebuild_sensor_ray_cache(pixels=res, aperture_samples=n_ap, seed=seed)
+        if self._sensor_ray_cache.complete:
+            return 0
         launched = self.submit_sensor_ray_cache_package(
             rays=int(rays),
             max_bounces=int(max_bounces),
@@ -10022,11 +10072,12 @@ def run(
         # ── Pos 2: camera perspective before BDPT/MIS — sensor view, 180° ──
         try:
             _vf_res = int(max(16, scene.image_plate.sensor_res))
-            _vf_pkg = int(max(2048, min(16384, _vf_res * _vf_res)))
+            _vf_ap  = 32
+            _vf_pkg = int(max(4096, _vf_res * _vf_res * _vf_ap))
             bench.refresh_sensor_viewfinder(
                 rays=_vf_pkg,
                 pixels=_vf_res,
-                aperture_samples=1,
+                aperture_samples=_vf_ap,
                 max_bounces=int(max_bounces),
                 seed=(int(seed) + int(_display_frame) * 17) & 0x7FFFFFFF,
                 min_interval_s=0.020,
@@ -11285,6 +11336,18 @@ def run(
             bench._ensure_camera_timeline()
 
         _camera_ready.wait()
+        if closing.is_set():
+            return
+
+        # Wait for spacebar before firing the first exposure so sensor rays
+        # can accumulate naturally via the viewfinder stream.
+        _exposure_done.set()
+        print("[exposure] ready — press SPACE to begin first exposure…", flush=True)
+        _shutter_event.clear()
+        while not closing.is_set():
+            if _shutter_event.wait(timeout=0.1):
+                break
+        _exposure_done.clear()
         if closing.is_set():
             return
 

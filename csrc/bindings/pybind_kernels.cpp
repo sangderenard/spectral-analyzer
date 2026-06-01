@@ -1749,6 +1749,8 @@ struct PyRayTracer
      *   arena_id     int32   (FIELD)
      *   is_sensor    bool
      *   sensor_gid   int32
+     *   sensor_origin_y float32
+     *   sensor_origin_z float32
      *   amp_re       float32 (N, n_bands)
      *   amp_im       float32 (N, n_bands)
      */
@@ -1782,6 +1784,8 @@ struct PyRayTracer
         py::array_t<int32_t>  sensor_gid_arr(N);
         py::array_t<float>    bary_u_arr(N);
         py::array_t<float>    bary_v_arr(N);
+        py::array_t<float>    sensor_origin_y_arr(N);
+        py::array_t<float>    sensor_origin_z_arr(N);
         py::array_t<uint8_t>  color_flag_arr(N);
         py::array_t<float>    amp_re_arr({(py::ssize_t)N, (py::ssize_t)nb});
         py::array_t<float>    amp_im_arr({(py::ssize_t)N, (py::ssize_t)nb});
@@ -1804,6 +1808,8 @@ struct PyRayTracer
             auto* sg  = sensor_gid_arr.mutable_data();
             auto* bu  = bary_u_arr    .mutable_data();
             auto* bv  = bary_v_arr    .mutable_data();
+            auto* soy = sensor_origin_y_arr.mutable_data();
+            auto* soz = sensor_origin_z_arr.mutable_data();
             auto* cf  = color_flag_arr.mutable_data();
             auto* re  = amp_re_arr    .mutable_data();
             auto* im  = amp_im_arr    .mutable_data();
@@ -1827,6 +1833,8 @@ struct PyRayTracer
                 sg[i]  = r.sensor_group_id;
                 bu[i]  = r.bary_u;
                 bv[i]  = r.bary_v;
+                soy[i] = r.sensor_origin_y;
+                soz[i] = r.sensor_origin_z;
                 cf[i]  = r.color_flag;
                 const int cap = std::min((int)r.n_bands, nb);
                 for (int b = 0; b < cap; ++b) {
@@ -1858,6 +1866,8 @@ struct PyRayTracer
         out["sensor_gid"] = sensor_gid_arr;
         out["bary_u"]      = bary_u_arr;
         out["bary_v"]      = bary_v_arr;
+        out["sensor_origin_y"] = sensor_origin_y_arr;
+        out["sensor_origin_z"] = sensor_origin_z_arr;
         out["color_flag"]  = color_flag_arr;
         out["amp_re"]      = amp_re_arr;
         out["amp_im"]     = amp_im_arr;
@@ -1868,7 +1878,7 @@ struct PyRayTracer
      * Allocates ~5× less memory than drain_records() per call.
      * Keys: kind (uint8), tag (uint64), bounce (int32), seg_start (N,3 f32),
      *       pos (N,3 f32), color_flag (uint8), hit_tri (int32), mat_idx (int32),
-     *       amp_re (N,n_bands f32), amp_im. */
+     *       sensor_origin_y/z (float32), amp_re (N,n_bands f32), amp_im. */
     py::dict drain_records_slim(int max_n = 50000)
     {
         const int nb = _n_bands;
@@ -1889,6 +1899,8 @@ struct PyRayTracer
         py::array_t<int32_t> hit_tri_arr(N);
         py::array_t<int32_t> hit_group_id_arr(N);
         py::array_t<int32_t> mat_idx_arr(N);
+        py::array_t<float>   sensor_origin_y_arr(N);
+        py::array_t<float>   sensor_origin_z_arr(N);
         py::array_t<float>   amp_re_arr({(py::ssize_t)N, (py::ssize_t)nb});
         py::array_t<float>   amp_im_arr({(py::ssize_t)N, (py::ssize_t)nb});
 
@@ -1902,6 +1914,8 @@ struct PyRayTracer
             auto* ht = hit_tri_arr    .mutable_data();
             auto* hg = hit_group_id_arr.mutable_data();
             auto* mi = mat_idx_arr    .mutable_data();
+            auto* soy = sensor_origin_y_arr.mutable_data();
+            auto* soz = sensor_origin_z_arr.mutable_data();
             auto* re = amp_re_arr     .mutable_data();
             auto* im = amp_im_arr     .mutable_data();
             for (int i = 0; i < N; ++i) {
@@ -1915,6 +1929,8 @@ struct PyRayTracer
                 ht[i] = r.hit_tri;
                 hg[i] = r.hit_group_id;
                 mi[i] = r.mat_idx;
+                soy[i] = r.sensor_origin_y;
+                soz[i] = r.sensor_origin_z;
                 const int cap = std::min((int)r.n_bands, nb);
                 for (int b = 0;   b < cap; ++b) { re[i*nb+b]=r.amp_re[b]; im[i*nb+b]=r.amp_im[b]; }
                 for (int b = cap; b < nb;  ++b) { re[i*nb+b]=0.f;         im[i*nb+b]=0.f; }
@@ -1930,6 +1946,8 @@ struct PyRayTracer
         out["hit_tri"]     = hit_tri_arr;
         out["hit_group_id"]= hit_group_id_arr;
         out["mat_idx"]     = mat_idx_arr;
+        out["sensor_origin_y"] = sensor_origin_y_arr;
+        out["sensor_origin_z"] = sensor_origin_z_arr;
         out["amp_re"]      = amp_re_arr;
         out["amp_im"]      = amp_im_arr;
         return out;
@@ -5439,7 +5457,7 @@ updates, while stable frames cautiously restore throughput.)doc")
              py::arg("max_n") = 50000,
 R"doc(Non-blocking slim drain: returns only the 7 arrays needed for voxel accumulation.
 ~5x less allocation than drain_records(). Keys: kind, bounce, seg_start, pos,
-color_flag, amp_re, amp_im.)doc")
+color_flag, hit_tri, hit_group_id, mat_idx, sensor_origin_y/z, amp_re, amp_im.)doc")
         .def("set_min_amplitude", &PyRayTracer::set_min_amplitude,
              py::arg("eps"),
 R"doc(Set the pipeline-wide amplitude floor.  Rays with per-ray min_amplitude below this

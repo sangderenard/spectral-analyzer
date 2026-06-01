@@ -265,18 +265,18 @@ def make_color_uv_layers() -> np.ndarray:
 # ── Material registry ─────────────────────────────────────────────────────────
 
 ORBIT_MATS = [
+    "ruby_emit",     # glowing red glass
+    "emerald_emit",  # glowing green glass
+    "sapphire_emit", # glowing blue glass
+    "amber_lobe",    # warm directional glow
+    "emit_pattern",  # textured glow
+    "acrylic",       # clear dielectric
+    "frosted_glass", # clear/frosted scatter
+    "color_mosaic",  # color UV texture
     "chrome",        # pure metallic
     "copper",        # warm metallic
     "gold",          # metallic + enamel
-    "acrylic",       # semi-transparent dielectric
-    "color_mosaic",  # color UV texture
     "jade_sss",      # translucent SSS
-    "frosted_glass", # frosted scatter
-    "chrome",        # repeat: metallic
-    "copper",        # repeat: warm metallic
-    "gold",          # repeat: metallic
-    "acrylic",       # repeat: dielectric
-    "jade_sss",      # repeat: SSS
 ]
 N_ORBIT = len(ORBIT_MATS)
 C_RASTER_MAX_LIGHTS = 100

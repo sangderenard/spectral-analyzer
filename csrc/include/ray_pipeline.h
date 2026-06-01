@@ -256,6 +256,8 @@ struct RayRecord {
     float         amp_re[RAY_RECORD_MAX_BANDS] = {};
     float         amp_im[RAY_RECORD_MAX_BANDS] = {};
     uint8_t       color_flag        = 0;   /* propagated from submitting RayIntent */
+    float         sensor_origin_y   = 0.f; /* camera-stream launch site on sensor */
+    float         sensor_origin_z   = 0.f;
 };
 
 /* ─── Thread-safe pipeline queue ────────────────────────────────────────── */

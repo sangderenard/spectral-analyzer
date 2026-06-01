@@ -9012,6 +9012,8 @@ public:
                         memcpy(&rec.mat_idx, row + 15, 4);
                         uint32_t cflag; memcpy(&cflag, row + 16, 4);
                         rec.color_flag = (uint8_t)cflag;
+                        rec.sensor_origin_y = row[23];
+                        rec.sensor_origin_z = row[24];
                         rec.n_bands = bands;
                         for (int b = 0; b < bands; ++b) {
                             rec.amp_re[b] = row[26 + b];
@@ -10033,6 +10035,8 @@ static void pipeline_intersector(RayPipelineState& ps)
                 rec.dir[2]    = static_cast<float>(dir.z());
                 rec.path_len  = static_cast<float>(intent.path_len);
                 rec.color_flag = intent.color_flag;
+                rec.sensor_origin_y = intent.sensor_origin_y;
+                rec.sensor_origin_z = intent.sensor_origin_z;
                 ps.Q_out.push(std::move(rec));
                 pipeline_finish_ray(ps);
                 continue;
@@ -10130,6 +10134,8 @@ static void pipeline_intersector(RayPipelineState& ps)
                 rec.bary_u            = bu;
                 rec.bary_v            = bv;
                 rec.color_flag        = intent.color_flag;
+                rec.sensor_origin_y   = intent.sensor_origin_y;
+                rec.sensor_origin_z   = intent.sensor_origin_z;
                 const int rnb = std::min(nb, RAY_RECORD_MAX_BANDS);
                 rec.n_bands = rnb;
                 for (int b = 0; b < rnb; ++b) {
@@ -10417,6 +10423,8 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         rec.mat_idx           = (h.hit_tri >= 0)
             ? st.tris[static_cast<size_t>(h.hit_tri)].mat_idx : -1;
         rec.color_flag        = h.ray.color_flag;
+        rec.sensor_origin_y   = h.ray.sensor_origin_y;
+        rec.sensor_origin_z   = h.ray.sensor_origin_z;
         const int nb = std::min((int)h.amp_propagated.size(), RAY_RECORD_MAX_BANDS);
         rec.n_bands = nb;
         for (int b = 0; b < nb; ++b) {
@@ -10937,6 +10945,8 @@ static void pipeline_wave_solver(RayPipelineState& ps)
                 rec.bounce     = wi.ray.bounce;
                 rec.arena_id   = wi.arena_id;
                 rec.color_flag = wi.ray.color_flag;
+                rec.sensor_origin_y = wi.ray.sensor_origin_y;
+                rec.sensor_origin_z = wi.ray.sensor_origin_z;
                 rec.pos[0]   = static_cast<float>(wi.ray.pos.x());
                 rec.pos[1]   = static_cast<float>(wi.ray.pos.y());
                 rec.pos[2]   = static_cast<float>(wi.ray.pos.z());

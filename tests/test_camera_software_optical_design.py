@@ -65,13 +65,18 @@ def test_four_group_solver_can_apply_to_thick_lens_scene_and_parametric_chain():
 
 def test_thick_lens_scene_defaults_to_semantic_optical_design():
     from camera_software import SolvedOpticalTrain
-    from thick_lens_focus_lab import SceneConfig, _scene_lenses
+    from thick_lens_focus_lab import SceneConfig, _compound_lens_from_scene, _scene_lenses
 
     scene = SceneConfig()
     lenses = _scene_lenses(scene)
+    optics = _compound_lens_from_scene(scene)
 
     assert len(lenses) == 4
     assert isinstance(scene.optical_design, SolvedOpticalTrain)
+    assert np.isclose(scene.image_plate.sensor_half_w, 0.028)
+    assert np.isclose(scene.image_plate.sensor_half_h, 0.028)
+    assert abs(scene.optical_design.spec.target_focal_length_m - 0.060) < 1.0e-12
+    assert abs(optics.f_eff - 0.060) < 1.0e-3
     assert scene.exit_pupil_radius > 0.0
     assert scene.aperture_model == "geometry"
 
@@ -118,7 +123,8 @@ def test_default_scene_imports_subject_without_legacy_stage():
     assert scene.include_legacy_stage is False
     assert len(tris) > 0
     assert len(object_ids) == len(tris)
-    assert len(source_ids) > 0
+    assert len(mats) == len(tris)
+    assert len(set(mats)) > 1
     assert any(name.startswith("subject_") for name in db._order)
 
 
@@ -158,7 +164,7 @@ def test_default_solved_lens_mesh_radii_are_geometrically_valid():
 
     assert len(lenses) == 4
     assert all(_lens_is_valid(lens) for lens in lenses)
-    assert 0.045 <= max(lens.aperture_radius for lens in lenses) <= 0.065
+    assert 0.025 <= max(lens.aperture_radius for lens in lenses) <= 0.035
     assert all((b.x_front - a.x_back) > 0.0 for a, b in zip(lenses, lenses[1:]))
 
 
@@ -196,3 +202,16 @@ def test_image_distance_for_object_is_finite_for_solution():
 
     assert np.isfinite(img_d)
     assert img_d > 0.0
+
+
+def test_scene_sensor_tracks_exact_compound_focus_after_physical_clamps():
+    from thick_lens_focus_lab import SceneConfig, _compound_lens_from_scene, _paraxial_image_x, _scene_lenses
+
+    scene = SceneConfig()
+    _scene_lenses(scene)
+
+    optics = _compound_lens_from_scene(scene)
+    exact_focus_x = _paraxial_image_x(optics, scene.object_plane.x)
+
+    assert np.isfinite(exact_focus_x)
+    assert abs(float(scene.image_plate.x) - exact_focus_x) < 5.0e-6

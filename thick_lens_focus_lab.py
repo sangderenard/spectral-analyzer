@@ -1161,8 +1161,8 @@ class IrisApertureConfig:
 def _default_optical_design_spec():
     from camera_software.optical_design import OpticalDesignSpec
     return OpticalDesignSpec(
-        focal_length_range_m=(0.075, 0.100),  # 120 6×6: ~80mm normal FOV
-        zoom=0.40,
+        focal_length_range_m=(0.060, 0.060),  # 120 6x6 camera with a 60mm lens
+        zoom=0.0,
         focus_distance_m=1.0,
         f_number=2.8,
         entrance_x_m=1.08,
@@ -1171,7 +1171,7 @@ def _default_optical_design_spec():
         image_radius_m=0.040,                 # matches ImagePlateConfig.radius
         min_air_gap_m=0.008,
         group_thickness_m=0.018,
-        max_group_radius_m=0.075,             # medium format needs larger elements
+        max_group_radius_m=0.031,             # simplified clear optics; film gate stays 56mm square
     )
 
 
@@ -1396,6 +1396,7 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
                         f"r_inner={ap_r*1e3:.2f}mm",
                         flush=True,
                     )
+                _sync_scene_sensor_to_exact_focus(scene)
         except Exception as exc:
             print(f"[optical-design] solve/apply failed: {exc}", flush=True)
             scene.optical_design = None
@@ -1429,6 +1430,50 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
         )
 
     return lenses
+
+
+def _sync_scene_sensor_to_exact_focus(scene: SceneConfig) -> None:
+    """Place the sensor at the exact compound-lens paraxial focus.
+
+    The first-order design solver works with thin paraxial groups.  The visible
+    and traced camera uses finite-thickness conic surfaces, and group radii can
+    be clamped for manufacturable sag.  Those clamps change optical power, so
+    the solver image distance is only a proposal.  This final sync keeps the
+    moving camera back at the focus plane of the physical `CompoundLens`.
+    """
+    try:
+        optics = _compound_lens_from_stack(
+            list(getattr(scene, "lens_stack", []) or []),
+            getattr(scene, "iris_aperture", None),
+        )
+        exact_x = _paraxial_image_x(optics, float(scene.object_plane.x))
+    except Exception:
+        return
+    if not math.isfinite(exact_x):
+        return
+    min_sensor_x = max(
+        (float(l.x_back) for l in getattr(scene, "lens_stack", []) or []),
+        default=float(getattr(scene, "exit_pupil_x", 0.0)),
+    ) + 1.0e-3
+    max_sensor_x = float(getattr(scene, "x_max", exact_x + 1.0))
+    if exact_x <= min_sensor_x or exact_x >= max_sensor_x:
+        return
+
+    plate = getattr(scene, "image_plate", None)
+    if plate is not None and hasattr(plate, "x"):
+        old_x = float(plate.x)
+        new_x = round(float(exact_x), 6)
+        if abs(old_x - new_x) > 1.0e-7:
+            plate.x = new_x
+            scene.screen_x = new_x
+            scene.tube_x1 = float(max(float(scene.tube_x1), new_x))
+            print(
+                "[exact-focus-sync]",
+                f"sensor_x={new_x:.6f}",
+                f"delta={(new_x - old_x)*1e3:+.2f}mm",
+                f"f_eff_exact={float(optics.f_eff)*1e3:.1f}mm",
+                flush=True,
+            )
 
 
 def _auto_fit_scene_view_to_mesh(scene: SceneConfig, tri_arr: np.ndarray) -> None:
@@ -4287,6 +4332,114 @@ class CameraSampleStore:
         self._count = 0
 
 
+class SensorRayCache:
+    """Reusable backward camera launch rays, independent of BDPT accumulation."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.clear()
+
+    def clear(self) -> None:
+        with self._lock:
+            self.origins = np.zeros((0, 3), dtype=np.float64)
+            self.directions = np.zeros((0, 3), dtype=np.float64)
+            self.amplitudes = np.zeros((0, 0), dtype=np.complex128)
+            self.tags = np.zeros((0,), dtype=np.uint64)
+            self.film_uv = np.zeros((0, 2), dtype=np.float32)
+            self.channel_idx = np.zeros((0,), dtype=np.uint8)
+            self.cursor = 0
+            self.signature: Optional[Tuple[object, ...]] = None
+
+    def load_arrays(
+        self,
+        *,
+        origins: np.ndarray,
+        directions: np.ndarray,
+        amplitudes: np.ndarray,
+        tags: np.ndarray,
+        film_uv: np.ndarray,
+        channel_idx: np.ndarray,
+        signature: Optional[Tuple[object, ...]] = None,
+        reset_cursor: bool = True,
+    ) -> None:
+        o = np.ascontiguousarray(origins, dtype=np.float64).reshape(-1, 3)
+        d = np.ascontiguousarray(directions, dtype=np.float64).reshape(-1, 3)
+        a = np.ascontiguousarray(amplitudes, dtype=np.complex128)
+        t = np.ascontiguousarray(tags, dtype=np.uint64).reshape(-1)
+        uv = np.ascontiguousarray(film_uv, dtype=np.float32).reshape(-1, 2)
+        ch = np.ascontiguousarray(channel_idx, dtype=np.uint8).reshape(-1)
+        n = int(o.shape[0])
+        if d.shape[0] != n or a.shape[0] != n or t.shape[0] != n or uv.shape[0] != n or ch.shape[0] != n:
+            raise ValueError("sensor ray cache arrays must share the same first dimension")
+        with self._lock:
+            self.origins = o
+            self.directions = d
+            self.amplitudes = a
+            self.tags = t
+            self.film_uv = uv
+            self.channel_idx = ch
+            self.signature = signature
+            if reset_cursor:
+                self.cursor = 0
+            elif n > 0:
+                self.cursor %= n
+            else:
+                self.cursor = 0
+
+    def count(self) -> int:
+        with self._lock:
+            return int(self.origins.shape[0])
+
+    def package(self, n: int, *, wrap: bool = True, advance: bool = True) -> Optional[Dict[str, np.ndarray]]:
+        n_req = int(max(0, n))
+        with self._lock:
+            total = int(self.origins.shape[0])
+            if total <= 0 or n_req <= 0:
+                return None
+            n_take = n_req if wrap else min(n_req, total - self.cursor)
+            if n_take <= 0:
+                return None
+            idx = (np.arange(n_take, dtype=np.int64) + int(self.cursor)) % total
+            out = {
+                "origins": np.ascontiguousarray(self.origins[idx], dtype=np.float64),
+                "directions": np.ascontiguousarray(self.directions[idx], dtype=np.float64),
+                "amplitudes": np.ascontiguousarray(self.amplitudes[idx], dtype=np.complex128),
+                "tags": np.ascontiguousarray(self.tags[idx], dtype=np.uint64),
+                "film_uv": np.ascontiguousarray(self.film_uv[idx], dtype=np.float32),
+                "channel_idx": np.ascontiguousarray(self.channel_idx[idx], dtype=np.uint8),
+            }
+            if advance:
+                self.cursor = int((self.cursor + n_take) % total)
+            return out
+
+    def snapshot(self) -> Dict[str, np.ndarray]:
+        with self._lock:
+            return {
+                "origins": np.ascontiguousarray(self.origins, dtype=np.float64),
+                "directions": np.ascontiguousarray(self.directions, dtype=np.float64),
+                "amplitudes": np.ascontiguousarray(self.amplitudes, dtype=np.complex128),
+                "tags": np.ascontiguousarray(self.tags, dtype=np.uint64),
+                "film_uv": np.ascontiguousarray(self.film_uv, dtype=np.float32),
+                "channel_idx": np.ascontiguousarray(self.channel_idx, dtype=np.uint8),
+            }
+
+    def save_npz(self, path: str) -> None:
+        snap = self.snapshot()
+        np.savez_compressed(path, **snap)
+
+    def load_npz(self, path: str, *, signature: Optional[Tuple[object, ...]] = None) -> None:
+        with np.load(path, allow_pickle=False) as data:
+            self.load_arrays(
+                origins=data["origins"],
+                directions=data["directions"],
+                amplitudes=data["amplitudes"],
+                tags=data["tags"],
+                film_uv=data["film_uv"],
+                channel_idx=data["channel_idx"],
+                signature=signature,
+            )
+
+
 class OpticalTransferStore:
     """Parametric lens event records emitted before/after GPU scene tracing."""
 
@@ -4518,7 +4671,11 @@ class ForwardCppLensBench:
         self._bdpt_segments: BdptSegmentStore = BdptSegmentStore(max_rows=2_000_000)
         self._optical_transfers: OpticalTransferStore = OpticalTransferStore(max_rows=2_000_000)
         self._camera_samples: CameraSampleStore = CameraSampleStore(max_rows=2_000_000)
+        self._sensor_ray_cache: SensorRayCache = SensorRayCache()
         self._camera_sample_batch_id: int = 0
+        self._sensor_viewfinder_last_submit_t: float = 0.0
+        self._sensor_viewfinder_last_launched: int = 0
+        self._sensor_viewfinder_last_cache_count: int = 0
         self._last_backward_film_pdf: float = 0.0
         self._last_backward_aperture_pdf: float = 0.0
         self._last_backward_channel_pdf: float = 0.0
@@ -4573,6 +4730,7 @@ class ForwardCppLensBench:
         self._forward_img_gain = 0.035
         self._reverse_img_accum = np.zeros_like(self._forward_img_accum)
         self._reverse_img_gain = 0.035
+        self._camera_perspective_accum = np.zeros_like(self._forward_img_accum)
         # Tunable amplitude floor: rays (and child spawns) below this threshold
         # are terminated.  Also used for material epsilon-kill pre-flagging.
         self._min_amplitude: float = 1e-5
@@ -5655,6 +5813,209 @@ class ForwardCppLensBench:
             flush=True,
         )
 
+    def _sensor_ray_cache_target(self) -> Tuple[float, float]:
+        """Return the current backward ray target plane and aperture radius."""
+        target_x = float(np.asarray(getattr(self, "aperture_centroid", np.zeros(3, dtype=np.float64)), dtype=np.float64)[0])
+        target_r = float(getattr(self, "aperture_radius", 0.0))
+        if target_r <= 0.0:
+            _lensasm = getattr(self, "_lens_assembly", None)
+            if _lensasm is not None:
+                _cen, _r = _lensasm.backward_ray_target()
+                if _cen is not None and _r > 0.0:
+                    target_x = float(_cen[0])
+                    target_r = float(_r)
+        if target_r <= 0.0:
+            _lstack = getattr(self.scene, "lens_stack", None)
+            if _lstack and len(_lstack) > 0:
+                _front = _lstack[0]
+                target_x = float(getattr(_front, "center_x", 1.0)) - float(getattr(_front, "thickness", 0.04)) * 0.5
+                target_r = float(getattr(_front, "aperture_radius", 0.018))
+        return target_x, float(max(1.0e-5, target_r))
+
+    def _sensor_ray_cache_signature(self, pixels: int, aperture_samples: int) -> Tuple[object, ...]:
+        plate = self.scene.image_plate
+        target_x, target_r = self._sensor_ray_cache_target()
+        return (
+            int(pixels),
+            int(aperture_samples),
+            int(self.n_bands),
+            round(float(plate.x), 9),
+            round(float(plate.sensor_half_w), 9),
+            round(float(plate.sensor_half_h), 9),
+            round(float(target_x), 9),
+            round(float(target_r), 9),
+        )
+
+    def rebuild_sensor_ray_cache(
+        self,
+        *,
+        pixels: Optional[int] = None,
+        aperture_samples: int = 1,
+        seed: int = 1,
+        save_path: Optional[str] = None,
+    ) -> int:
+        """Build reusable backward camera rays as a packageable tensor cache."""
+        plate = self.scene.image_plate
+        res = int(max(4, pixels or plate.sensor_res))
+        n_ap = int(max(1, aperture_samples))
+        target_x, target_r = self._sensor_ray_cache_target()
+        signature = self._sensor_ray_cache_signature(res, n_ap)
+
+        half_y = float(max(1.0e-9, plate.sensor_half_w))
+        half_z = float(max(1.0e-9, plate.sensor_half_h))
+        py_grid, px_grid = np.indices((res, res), dtype=np.float64)
+        film_u = (px_grid + 0.5) / float(res)
+        film_v = (py_grid + 0.5) / float(res)
+        sensor_y = (film_v - 0.5) * (2.0 * half_y)
+        sensor_z = (0.5 - film_u) * (2.0 * half_z)
+
+        film_uv = np.stack([film_u, film_v], axis=2).reshape(-1, 2).astype(np.float32)
+        origins_1 = np.empty((res * res, 3), dtype=np.float64)
+        origins_1[:, 0] = float(plate.x)
+        origins_1[:, 1] = sensor_y.reshape(-1)
+        origins_1[:, 2] = sensor_z.reshape(-1)
+
+        rng = np.random.Generator(np.random.PCG64(int(seed) & ((1 << 63) - 1)))
+        total = int(origins_1.shape[0] * n_ap)
+        origins = np.repeat(origins_1, n_ap, axis=0)
+        film_uv_all = np.repeat(film_uv, n_ap, axis=0)
+
+        j1 = rng.random(total, dtype=np.float64)
+        j2 = rng.random(total, dtype=np.float64)
+        rr = np.sqrt(j1) * float(target_r)
+        th = 2.0 * math.pi * j2
+        aperture = np.empty((total, 3), dtype=np.float64)
+        aperture[:, 0] = float(target_x)
+        aperture[:, 1] = rr * np.sin(th)
+        aperture[:, 2] = rr * np.cos(th)
+
+        directions = aperture - origins
+        dn = np.linalg.norm(directions, axis=1)
+        valid = np.isfinite(dn) & (dn > EPS)
+        directions[valid] /= dn[valid, None]
+        origins = origins[valid]
+        directions = directions[valid]
+        film_uv_all = film_uv_all[valid]
+
+        n = int(origins.shape[0])
+        channel_idx = np.zeros(n, dtype=np.uint8)
+        tags = _pack_bdpt_film_tag(channel_idx, film_uv_all)
+        amp_val = float(max(0.0, self.sensor_amp_gain))
+        amplitudes = np.full((n, int(self.n_bands)), complex(amp_val, 0.0), dtype=np.complex128)
+
+        self._sensor_ray_cache.load_arrays(
+            origins=origins,
+            directions=directions,
+            amplitudes=amplitudes,
+            tags=tags,
+            film_uv=film_uv_all,
+            channel_idx=channel_idx,
+            signature=signature,
+        )
+        self._sensor_viewfinder_last_cache_count = n
+        self.bdpt_last_camera_samples = {
+            "samples": n,
+            "cache_count": n,
+            "pixels": res,
+            "aperture_samples": n_ap,
+        }
+        if save_path:
+            self._sensor_ray_cache.save_npz(save_path)
+        return n
+
+    def clear_sensor_ray_cache(self) -> None:
+        self._sensor_ray_cache.clear()
+        self._sensor_viewfinder_last_cache_count = 0
+
+    def save_sensor_ray_cache(self, path: str) -> None:
+        self._sensor_ray_cache.save_npz(path)
+
+    def load_sensor_ray_cache(self, path: str) -> int:
+        self._sensor_ray_cache.load_npz(path)
+        n = self._sensor_ray_cache.count()
+        self._sensor_viewfinder_last_cache_count = n
+        return n
+
+    def submit_sensor_ray_cache_package(
+        self,
+        *,
+        rays: int,
+        max_bounces: int = 8,
+        seed: int = 1,
+    ) -> int:
+        pkg = self._sensor_ray_cache.package(int(rays))
+        if pkg is None:
+            return 0
+        n = int(pkg["origins"].shape[0])
+        if n <= 0:
+            return 0
+        origins = pkg["origins"]
+        directions = pkg["directions"]
+        amplitudes = pkg["amplitudes"]
+        src_ids = np.zeros(n, dtype=np.int32)
+        cflag_arr = np.ones(n, dtype=np.uint8)
+        tag_arr = pkg["tags"]
+        if self.cull_infinite_rays:
+            origins, directions, amplitudes, src_ids, cflag_arr, tag_arr = _cull_finite_rays(
+                origins, directions, amplitudes, src_ids, cflag_arr, tag_arr, label="sensor-cache")
+            n = int(origins.shape[0])
+            if n <= 0:
+                return 0
+        _use_gpu = self.compute_mode in ("gpu", "mixed")
+        _all_gpu = self.compute_mode == "gpu"
+        self.tracer.submit_rays(
+            origins=np.ascontiguousarray(origins),
+            directions=np.ascontiguousarray(directions),
+            amplitudes=np.ascontiguousarray(amplitudes),
+            src_ids=np.ascontiguousarray(src_ids),
+            tags=np.ascontiguousarray(tag_arr),
+            color_flags=np.ascontiguousarray(cflag_arr),
+            max_bounces=int(max_bounces),
+            min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
+            max_children=1,
+            seed=int(seed),
+            use_gpu_compute=_use_gpu,
+            gpu_all_stages=_all_gpu,
+            shader_dir=_SHADER_DIR,
+        )
+        self._sensor_viewfinder_last_launched = n
+        self._ensure_drain_loop()
+        return n
+
+    def refresh_sensor_viewfinder(
+        self,
+        *,
+        rays: int = 8192,
+        pixels: Optional[int] = None,
+        aperture_samples: int = 1,
+        max_bounces: int = 8,
+        seed: int = 1,
+        min_interval_s: float = 0.020,
+    ) -> int:
+        """Submit one small cached backward-ray package for the live camera PIP."""
+        now = time.perf_counter()
+        if now - float(self._sensor_viewfinder_last_submit_t) < float(min_interval_s):
+            return 0
+        try:
+            if int(self.tracer.in_flight_count()) > int(max(4 * rays, 50_000)):
+                return 0
+        except Exception:
+            pass
+
+        res = int(max(4, pixels or self.scene.image_plate.sensor_res))
+        n_ap = int(max(1, aperture_samples))
+        sig = self._sensor_ray_cache_signature(res, n_ap)
+        if self._sensor_ray_cache.count() <= 0 or self._sensor_ray_cache.signature != sig:
+            self.rebuild_sensor_ray_cache(pixels=res, aperture_samples=n_ap, seed=seed)
+        launched = self.submit_sensor_ray_cache_package(
+            rays=int(rays),
+            max_bounces=int(max_bounces),
+            seed=int(seed),
+        )
+        if launched > 0:
+            self._sensor_viewfinder_last_submit_t = now
+        return launched
+
     def _shutter_stage_args(self, stage_idx: int, stage_count: int) -> dict:
         _ = stage_count
         return self._exposure_slice(stage_idx).sensor_submit_args()
@@ -5799,7 +6160,8 @@ class ForwardCppLensBench:
         if blocking:
             _DRAIN_KEYS = ("kind", "tag", "pos", "dir", "seg_start", "path_len",
                            "bounce", "is_sensor", "hit_tri", "mat_idx", "color_flag",
-                           "hit_group_id", "amp_re", "amp_im")
+                           "hit_group_id", "sensor_origin_y", "sensor_origin_z",
+                           "amp_re", "amp_im")
             acc: Dict[str, list] = {k: [] for k in _DRAIN_KEYS}
             while True:
                 recs = self.tracer.drain_records(max_n=100_000)
@@ -6121,6 +6483,62 @@ class ForwardCppLensBench:
                     for ch in range(3):
                         dst[:, :, ch] += deltas[ch]
 
+        def _records_to_camera_perspective(mask: np.ndarray) -> None:
+            if not np.any(mask):
+                return
+            raw_sy = records.get("sensor_origin_y", None)
+            raw_sz = records.get("sensor_origin_z", None)
+            if raw_sy is None or raw_sz is None:
+                return
+            sy_all = np.asarray(raw_sy, dtype=np.float32)[vis_mask]
+            sz_all = np.asarray(raw_sz, dtype=np.float32)[vis_mask]
+
+            htri_m = vm_hit_tri[mask]
+            tri_kind = getattr(self, "tri_kind", None)
+            if tri_kind is not None and htri_m.size > 0 and len(tri_kind) > 0:
+                safe = np.clip(htri_m, 0, len(tri_kind) - 1)
+                kind_m = np.where(htri_m >= 0, tri_kind[safe], TRI_KIND_DEFAULT)
+                is_optic = (kind_m == TRI_KIND_LENS) | (kind_m == TRI_KIND_APERTURE) | (kind_m == TRI_KIND_SENSOR)
+                valid_hit = ~is_optic
+            else:
+                valid_hit = htri_m >= 0
+
+            sy = sy_all[mask]
+            sz = sz_all[mask]
+            plate = self.scene.image_plate
+            half_w = float(max(1.0e-9, getattr(plate, "sensor_half_w", getattr(plate, "radius", 0.0))))
+            half_h = float(max(1.0e-9, getattr(plate, "sensor_half_h", getattr(plate, "radius", 0.0))))
+            in_sensor = (np.abs(sy) <= half_w) & (np.abs(sz) <= half_h)
+            m_img = valid_hit & in_sensor
+            if not np.any(m_img):
+                return
+
+            re_img = vm_re[mask][m_img]
+            im_img = vm_im[mask][m_img]
+            nb_img = min(int(re_img.shape[1]), self.n_bands)
+            if nb_img > 0:
+                mag = np.sqrt(np.maximum(0.0, re_img[:, :nb_img] ** 2 + im_img[:, :nb_img] ** 2))
+                wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:nb_img], dtype=np.float64), EPS)) * 1.0e9
+                rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
+                rgb = np.einsum("nb,bc->nc", mag, rgb_w[:nb_img], optimize=True).astype(np.float32)
+            else:
+                rgb = np.repeat(amp_v[mask][m_img, None], 3, axis=1).astype(np.float32)
+
+            res = int(self._forward_img_res)
+            iy = np.clip(((sy[m_img] + half_w) / (2.0 * half_w) * res).astype(np.int32), 0, res - 1)
+            iz = np.clip(((sz[m_img] + half_h) / (2.0 * half_h) * res).astype(np.int32), 0, res - 1)
+            flat_idx = (iy * res + iz).astype(np.int64)
+            deltas = [
+                np.bincount(
+                    flat_idx, weights=rgb[:, ch].astype(np.float64),
+                    minlength=res * res,
+                ).reshape(res, res).astype(np.float32)
+                for ch in range(3)
+            ]
+            with self._segs_lock:
+                for ch in range(3):
+                    self._camera_perspective_accum[:, :, ch] += deltas[ch]
+
         # Pure preview feeds: project all strike records into the image-plane Y/Z
         # grid.  Do not require the ray to hit the image plate; this is a live
         # diagnostic of the forward/reverse ray distributions before final image
@@ -6129,6 +6547,7 @@ class ForwardCppLensBench:
         rev_strike = (vm_kinds == 0) & (vm_cflags == 1)
         _records_to_preview(fwd_strike, self._forward_img_accum)
         _records_to_preview(rev_strike, self._reverse_img_accum)
+        _records_to_camera_perspective(rev_strike)
 
         # Pack raw hit positions into ring-buffer rows: (x, y, z, amp, class, gid)
         pts = np.empty((vm_pos_all.shape[0], 6), dtype=np.float32)
@@ -6810,6 +7229,19 @@ class ForwardCppLensBench:
         disp = np.log1p(np.maximum(img, 0.0) * float(self._reverse_img_gain))
         return np.ascontiguousarray(disp / (1.0 + disp), dtype=np.float32)
 
+    def get_camera_perspective_image(self) -> np.ndarray:
+        """Return backward camera strikes binned by their launch site on the sensor."""
+        with self._segs_lock:
+            img = self._camera_perspective_accum.copy()
+        flat = np.asarray(img, dtype=np.float64).ravel()
+        pos = flat[flat > 0.0]
+        if pos.size == 0:
+            return np.zeros(img.shape, dtype=np.float32)
+        white = float(np.percentile(pos, 99.0))
+        white = max(white, 1.0e-30)
+        y = np.log1p(np.maximum(img, 0.0) / white * 6.0) / np.log1p(6.0)
+        return np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
+
     def build_all_prospective_reverse_segments(
         self,
         seed: int,
@@ -7285,6 +7717,8 @@ class ForwardCppLensBench:
         # that remain useful for forward/BDPT diagnostics across lens nudges.
         self._forward_img_accum[:] = 0.0
         self._reverse_img_accum[:] = 0.0
+        self._camera_perspective_accum[:] = 0.0
+        self.clear_sensor_ray_cache()
         if isinstance(self._backward_transport_accum, dict):
             for v in self._backward_transport_accum.values():
                 if isinstance(v, np.ndarray):
@@ -7361,27 +7795,23 @@ class ForwardCppLensBench:
 
     @property
     def focal_plane_x(self) -> float:
-        """Design focal plane x — where the solver placed focus relative to the sensor.
+        """Exact paraxial focal plane x for the active physical lens assembly.
 
-        Uses the optical design solver's thin-lens group model, which is the same
-        computation used to place the sensor, so the result is within sensor_error
-        (~0.02mm) of image_plate.x at startup.  After manual lens adjustments the
-        orange probe ring (from _focus_probe_result) shows the new traced focus;
-        this yellow-ring property stays at the design position for reference.
+        The design solver is thin-group paraxial, while the renderer traces the
+        finite-thickness conic `CompoundLens`.  Prefer the exact compound matrix
+        so the range-finder ring and sensor placement agree with transported rays.
 
         Returns float('inf') if not computable.
         """
-        fp = _solver_focal_plane_x(self.scene)
-        if math.isfinite(fp):
-            return fp
-        # Fallback: compound-lens paraxial matrix (may differ from solver's model)
         optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
-        if optics is None:
-            return float("inf")
-        try:
-            return _paraxial_image_x(optics, float(self.scene.object_plane.x))
-        except Exception:
-            return float("inf")
+        if optics is not None:
+            try:
+                fp = _paraxial_image_x(optics, float(self.scene.object_plane.x))
+                if math.isfinite(fp):
+                    return fp
+            except Exception:
+                pass
+        return _solver_focal_plane_x(self.scene)
 
     def _start_progressive_refinement(self) -> None:
         """Start parametric→LUT→MLP background refinement if in PARAMETRIC mode."""
@@ -9408,7 +9838,7 @@ def run(
         print(f"[gl-renderer] scene VAO built: {n_tris*3} verts, "
               f"{len(bank.groups) if bank is not None else 0} UV groups", flush=True)
 
-    # PIP viewports: reverse-strikes | direct-illum | forward-strikes | bdpt-plate
+    # PIP viewports: emitter/forward strikes | sensor coverage | sensor view | BDPT plate
     _pip_dim = int(min(W * 0.22, H * 0.22))
     _pip_gap = 10
     _bdpt_pip_vx  = (W - (4 * _pip_dim + 3 * _pip_gap)) // 2
@@ -9507,7 +9937,37 @@ def run(
             border_col=(0.58, 0.32, 1.00),
         )
 
-        # ── Pos 2 (rightmost): BDPT plate / processed — sensor view, 180° ────
+        # ── Pos 2: camera perspective before BDPT/MIS — sensor view, 180° ──
+        try:
+            _vf_res = int(max(16, scene.image_plate.sensor_res))
+            _vf_pkg = int(max(2048, min(16384, _vf_res * _vf_res)))
+            bench.refresh_sensor_viewfinder(
+                rays=_vf_pkg,
+                pixels=_vf_res,
+                aperture_samples=1,
+                max_bounces=int(max_bounces),
+                seed=(int(seed) + int(_display_frame) * 17) & 0x7FFFFFFF,
+                min_interval_s=0.020,
+            )
+        except Exception as _vf_exc:
+            if not getattr(bench, "_sensor_viewfinder_diag_failed", False):
+                print(f"[sensor-viewfinder] refresh failed: {_vf_exc}", flush=True)
+                bench._sensor_viewfinder_diag_failed = True
+        sensor_view = bench.get_camera_perspective_image()
+        if sensor_view is not None and sensor_view.shape[0] > 0:
+            bench._last_direct_img = np.ascontiguousarray(
+                np.clip(sensor_view[:, :, :3], 0.0, 1.0), dtype=np.float32)
+            glBindTexture(GL_TEXTURE_2D, tex_pip)
+            _dp_disp = _rot180(bench._last_direct_img)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                         _dp_disp.shape[1], _dp_disp.shape[0], 0,
+                         GL_RGB, GL_FLOAT, _dp_disp)
+        _draw_quad_with_pip_prog(
+            tex_pip, _uv_pip_vx, _pip_vy, _pip_dim, _pip_dim,
+            border_col=(0.20, 0.78, 1.00),
+        )
+
+        # ── Pos 3 (rightmost): BDPT plate / processed — sensor view, 180° ────
         bdpt_plate = bench._last_bdpt_plate_rgb
         if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
             glBindTexture(GL_TEXTURE_2D, tex_green_pip)
@@ -9728,6 +10188,33 @@ def run(
             (255, 150, 90) if (_cx_ovv > 0 or _cx_ovc > 0) else (160, 160, 160),
         ]
         _draw_hud(tracking_lines, tracking_cols, _pip_vx)
+
+        # ── Blue pip HUD: camera perspective before BDPT ────────────────────
+        _direct_img = bench._last_direct_img
+        if _direct_img is not None and getattr(_direct_img, "size", 0) > 0:
+            _direct_luma = np.sum(np.asarray(_direct_img, dtype=np.float32), axis=2)
+            _direct_lit = int(np.count_nonzero(_direct_luma > 1.0e-8))
+            _direct_frac = float(_direct_lit) / float(max(1, _direct_luma.size))
+            _direct_peak = float(np.max(_direct_luma)) if _direct_luma.size else 0.0
+        else:
+            _direct_lit = 0
+            _direct_frac = 0.0
+            _direct_peak = 0.0
+        direct_lines = [
+            "sensor view",
+            "camera pre-BDPT",
+            f"lit {_direct_lit:_}  {100.0 * _direct_frac:.1f}%",
+            f"cache {int(getattr(bench, '_sensor_viewfinder_last_cache_count', 0)):_}",
+            f"pkg {int(getattr(bench, '_sensor_viewfinder_last_launched', 0)):_}  peak {_direct_peak:.3f}",
+        ]
+        direct_cols = [
+            (80, 210, 255),
+            (80, 210, 255),
+            (120, 255, 160) if _direct_lit > 0 else (160, 160, 160),
+            (120, 255, 160) if int(getattr(bench, "_sensor_viewfinder_last_cache_count", 0)) > 0 else (160, 160, 160),
+            (120, 255, 160) if _direct_peak > 0.0 else (160, 160, 160),
+        ]
+        _draw_hud(direct_lines, direct_cols, _uv_pip_vx)
 
         # ── Green pip HUD: BDPT plate + connection stats ─────────────────────
         green_lines = [
@@ -10688,6 +11175,7 @@ def run(
                     {
                         "forward": bench._forward_img_accum,
                         "reverse": bench._reverse_img_accum,
+                        "camera":  bench._camera_perspective_accum,
                         "bdpt":    bench._last_bdpt_plate_rgb,
                     },
                     tonemap="reinhard",
@@ -10703,6 +11191,8 @@ def run(
                 pass
             bench._forward_img_accum[:] = 0.0
             bench._reverse_img_accum[:] = 0.0
+            bench._camera_perspective_accum[:] = 0.0
+            bench.clear_sensor_ray_cache()
             bench._last_bdpt_plate_rgb = None
             bench._last_direct_img = None
             bench._camera_exposure_complete = False

@@ -3432,7 +3432,7 @@ def _build_scene_mesh(
             # cannot enter the scene-side acceptance cone (≤ 5°).
             if bool(getattr(scene, "ring_light_enabled", True)):
                 _rl_x       = float(first_lens.x_front)
-                _rl_r_inner = float(_barrel_outer_r + 0.003)
+                _rl_r_inner = float(_barrel_outer_r)
                 _rl_r_outer = _rl_r_inner + float(getattr(scene, "ring_light_width_m", 0.018))
                 _rl_thick   = float(max(1.0e-5, getattr(scene, "ring_light_thickness_m", 0.006)))
                 _rl_n       = int(getattr(scene, "ring_light_n_sectors", 72))
@@ -3453,7 +3453,7 @@ def _build_scene_mesh(
                 print(
                     "[ring-light]",
                     f"x={_rl_x:.4f}",
-                    f"r_inner={_rl_r_inner*1e3:.1f}mm",
+                    f"r_inner={_rl_r_inner*1e3:.1f}mm  (flush against barrel outer surface)",
                     f"r_outer={_rl_r_outer*1e3:.1f}mm",
                     f"thickness={_rl_thick*1e3:.1f}mm",
                     f"sectors={_rl_n}",
@@ -3461,6 +3461,43 @@ def _build_scene_mesh(
                     f"housing_tris={(len(tris)-_rl_before)-(len(source_tri_ids)-_rl_src_before)}",
                     flush=True,
                 )
+            # ── Outer barrel sleeve: cylindrical wall + front and rear end caps ──
+            # The lens_housing_pipe (built below) models only the inner bore surface.
+            # Build the outer wall and annular caps so the barrel is a closed sheath
+            # — the ring-light collar sits flush against this outer surface with zero
+            # radial gap.  Without this the ring floated in free air beyond the bore.
+            _build_sensor_aperture_frustum(
+                float(first_lens.x_front - 0.002),
+                _barrel_outer_r,
+                float(last_lens.x_back + 0.002),
+                _barrel_outer_r,
+                96,
+                tris,
+                mats,
+                idx_stage_grey,
+                black_wall_tri_ids,
+            )
+            # Front annular cap: scene-facing face of the barrel wall (bore→outer)
+            _build_baffle_annulus(
+                float(first_lens.x_front - 0.002), lens_housing_r, _barrel_outer_r,
+                96, tris, mats, idx_stage_grey,
+                tri_ids=black_wall_tri_ids, thickness=0.0,
+            )
+            # Rear annular cap: camera-facing face of the barrel wall (bore→outer)
+            _build_baffle_annulus(
+                float(last_lens.x_back + 0.002), lens_housing_r, _barrel_outer_r,
+                96, tris, mats, idx_stage_grey,
+                tri_ids=black_wall_tri_ids, thickness=0.0,
+            )
+            print(
+                "[barrel-sleeve]",
+                f"outer_r={_barrel_outer_r*1e3:.1f}mm",
+                f"inner_r={lens_housing_r*1e3:.1f}mm",
+                f"wall={(_barrel_outer_r - lens_housing_r)*1e3:.1f}mm",
+                f"z_front={float(first_lens.x_front - 0.002):.4f}",
+                f"z_back={float(last_lens.x_back + 0.002):.4f}",
+                flush=True,
+            )
         # Lens housing sleeve: keeps the lens mechanically inset in a bore rather
         # than visually floating in open space.
         # Tighten the housing bore to last lens aperture to prevent rear light escape.

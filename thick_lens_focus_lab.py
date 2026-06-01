@@ -1247,6 +1247,7 @@ class SceneConfig:
     # matte so light only exits toward the subject.
     ring_light_enabled: bool = True
     ring_light_width_m: float = 0.018      # radial width of the emitting annulus (m)
+    ring_light_thickness_m: float = 0.006  # axial housing depth behind the emissive face
     ring_light_emission: float = 200.0     # emission scale (relative to source material)
     ring_light_n_sectors: int = 72         # angular tessellation segments
     flash_modifier: FlashModifierConfig = field(default_factory=FlashModifierConfig)
@@ -2884,6 +2885,7 @@ def _build_ring_light(
     x_pos: float,
     r_inner: float,
     r_outer: float,
+    thickness: float,
     n_sectors: int,
     tri_list: List[np.ndarray],
     mat_ids: List[int],
@@ -2891,32 +2893,48 @@ def _build_ring_light(
     mat_back: int,
     source_tri_ids: List[int],
 ) -> None:
-    """Flat annular ring light flush with the front of the lens barrel.
+    """Shallow housed annular ring light flush with the front of the lens barrel.
 
     Scene-facing side (-X normal, toward subject) is emissive and registered as a
-    light source.  Camera-body side (+X normal) is black matte — no light exits
-    toward the sensor.  Camera looks in -X so the scene is at smaller X values.
+    light source.  Rear and radial side walls are black matte housing so the ring
+    reads as a mounted object in profile instead of a zero-thickness plane.
+    Camera looks in -X so the scene is at smaller X values.
     """
     n = max(6, int(n_sectors))
+    x_front = float(x_pos)
+    x_back = float(x_pos) + float(max(1.0e-5, thickness))
     for i in range(n):
         a0 = 2.0 * math.pi * i       / n
         a1 = 2.0 * math.pi * (i + 1) / n
         ca0, sa0 = math.cos(a0), math.sin(a0)
         ca1, sa1 = math.cos(a1), math.sin(a1)
-        # Four corners of the quad (in YZ plane at x_pos)
-        p_i0 = np.array([x_pos, r_inner * ca0, r_inner * sa0], dtype=np.float64)
-        p_i1 = np.array([x_pos, r_inner * ca1, r_inner * sa1], dtype=np.float64)
-        p_o0 = np.array([x_pos, r_outer * ca0, r_outer * sa0], dtype=np.float64)
-        p_o1 = np.array([x_pos, r_outer * ca1, r_outer * sa1], dtype=np.float64)
+        # Four front corners and matching rear corners of one annular sector.
+        f_i0 = np.array([x_front, r_inner * ca0, r_inner * sa0], dtype=np.float64)
+        f_i1 = np.array([x_front, r_inner * ca1, r_inner * sa1], dtype=np.float64)
+        f_o0 = np.array([x_front, r_outer * ca0, r_outer * sa0], dtype=np.float64)
+        f_o1 = np.array([x_front, r_outer * ca1, r_outer * sa1], dtype=np.float64)
+        b_i0 = np.array([x_back, r_inner * ca0, r_inner * sa0], dtype=np.float64)
+        b_i1 = np.array([x_back, r_inner * ca1, r_inner * sa1], dtype=np.float64)
+        b_o0 = np.array([x_back, r_outer * ca0, r_outer * sa0], dtype=np.float64)
+        b_o1 = np.array([x_back, r_outer * ca1, r_outer * sa1], dtype=np.float64)
+
         # Scene-facing side: -X normal (toward subject, camera looks in -X).
         # Reversed winding so normal points in -X direction.
         source_tri_ids.append(len(tri_list))
-        _append_tri(tri_list, mat_ids, p_i1, p_o0, p_i0, mat_emissive)
+        _append_tri(tri_list, mat_ids, f_i1, f_o0, f_i0, mat_emissive)
         source_tri_ids.append(len(tri_list))
-        _append_tri(tri_list, mat_ids, p_i1, p_o1, p_o0, mat_emissive)
-        # Camera-body side: +X normal (black matte, no light exits toward sensor)
-        _append_tri(tri_list, mat_ids, p_i0, p_o0, p_i1, mat_back)
-        _append_tri(tri_list, mat_ids, p_o0, p_o1, p_i1, mat_back)
+        _append_tri(tri_list, mat_ids, f_i1, f_o1, f_o0, mat_emissive)
+
+        # Camera-body rear annulus: +X normal, black matte.
+        _append_tri(tri_list, mat_ids, b_i0, b_o0, b_i1, mat_back)
+        _append_tri(tri_list, mat_ids, b_o0, b_o1, b_i1, mat_back)
+
+        # Inner and outer radial housing walls.  These make the ring visible
+        # from profile and block edge leaks around the emissive strip.
+        _append_tri(tri_list, mat_ids, f_i0, b_i0, f_i1, mat_back)
+        _append_tri(tri_list, mat_ids, f_i1, b_i0, b_i1, mat_back)
+        _append_tri(tri_list, mat_ids, f_o1, b_o0, f_o0, mat_back)
+        _append_tri(tri_list, mat_ids, f_o1, b_o1, b_o0, mat_back)
 
 
 def _build_scene_mesh(
@@ -3416,12 +3434,15 @@ def _build_scene_mesh(
                 _rl_x       = float(first_lens.x_front)
                 _rl_r_inner = float(_barrel_outer_r + 0.003)
                 _rl_r_outer = _rl_r_inner + float(getattr(scene, "ring_light_width_m", 0.018))
+                _rl_thick   = float(max(1.0e-5, getattr(scene, "ring_light_thickness_m", 0.006)))
                 _rl_n       = int(getattr(scene, "ring_light_n_sectors", 72))
                 _rl_before  = len(tris)
+                _rl_src_before = len(source_tri_ids)
                 _build_ring_light(
                     x_pos=_rl_x,
                     r_inner=_rl_r_inner,
                     r_outer=_rl_r_outer,
+                    thickness=_rl_thick,
                     n_sectors=_rl_n,
                     tri_list=tris,
                     mat_ids=mats,
@@ -3434,8 +3455,10 @@ def _build_scene_mesh(
                     f"x={_rl_x:.4f}",
                     f"r_inner={_rl_r_inner*1e3:.1f}mm",
                     f"r_outer={_rl_r_outer*1e3:.1f}mm",
+                    f"thickness={_rl_thick*1e3:.1f}mm",
                     f"sectors={_rl_n}",
-                    f"emission_tris={len(tris)-_rl_before}",
+                    f"source_tris={len(source_tri_ids)-_rl_src_before}",
+                    f"housing_tris={(len(tris)-_rl_before)-(len(source_tri_ids)-_rl_src_before)}",
                     flush=True,
                 )
         # Lens housing sleeve: keeps the lens mechanically inset in a bore rather
@@ -8682,6 +8705,11 @@ def _clone_scene_with_lenses(scene: SceneConfig, lenses: Sequence[LensConfig]) -
         stage_probe_y=scene.stage_probe_y,
         stage_probe_z=scene.stage_probe_z,
         stage_probe_radius=scene.stage_probe_radius,
+        ring_light_enabled=scene.ring_light_enabled,
+        ring_light_width_m=scene.ring_light_width_m,
+        ring_light_thickness_m=scene.ring_light_thickness_m,
+        ring_light_emission=scene.ring_light_emission,
+        ring_light_n_sectors=scene.ring_light_n_sectors,
         lens_hood_front_radius=scene.lens_hood_front_radius,
         disable_optics=scene.disable_optics,
         lens=lenses[0] if lenses else scene.lens,

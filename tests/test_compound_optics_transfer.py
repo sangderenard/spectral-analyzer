@@ -2,7 +2,7 @@ import numpy as np
 
 from camera_designer.camera_preset import simple_doublet_preset
 from camera_designer.compound_optics import CompoundLens, RayBundle, TerminationReason
-from camera_designer.lens_assembly import LensAssemblySpec
+from camera_designer.lens_assembly import ApertureSpec, LensAssemblySpec, StraightBoxSpec
 
 
 def test_compound_lens_batch_transfer_matches_scalar_trace():
@@ -51,6 +51,36 @@ def test_backward_parametric_payload_stays_canonical():
     bwd = assembly.build_parametric_payload_backward()
 
     assert np.array_equal(bwd, fwd)
+
+
+def test_backward_ray_target_reports_virtual_pupil_without_iris_fallback():
+    class FakeOptics:
+        exit_pupil = (1.45, 0.070)
+
+    assembly = LensAssemblySpec()
+    assembly.optics = FakeOptics()
+    assembly.straight_section = StraightBoxSpec(
+        half_w=0.040,
+        half_h=0.040,
+        z_front=1.275,
+        depth=0.038,
+        sensor_z_offset=0.0,
+    )
+    assembly.aperture = ApertureSpec(z=1.150, r_clear=0.021)
+
+    spec = assembly.backward_ray_target_spec()
+    target, radius = assembly.backward_ray_target()
+    gate, gate_radius = assembly.backward_physical_gate_target()
+
+    assert spec is not None
+    assert spec.kind == "virtual_exit_pupil"
+    assert spec.direction_mode == "away_from_virtual"
+    assert np.allclose(spec.center, [1.45, 0.0, 0.0])
+    assert np.allclose(target, [1.45, 0.0, 0.0])
+    assert radius == 0.070
+    assert gate is not None
+    assert np.allclose(gate, [1.150, 0.0, 0.0])
+    assert gate_radius == 0.021
 
 
 def test_side_bundle_sampling_and_failure_short_circuit():

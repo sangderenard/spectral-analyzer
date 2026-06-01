@@ -27,7 +27,7 @@ from camera_designer.compound_optics import (
     RayBundle,
     TerminationReason,
 )
-from camera_designer.lens_assembly import LensAssemblySpec
+from camera_designer.lens_assembly import BackwardRayTargetSpec, LensAssemblySpec
 
 # Directory containing the GLSL compute shaders (ray_bvh_intersect.comp.glsl etc.)
 _SHADER_DIR: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "shaders")
@@ -4995,18 +4995,30 @@ class ForwardCppLensBench:
         # the surrogate solver's heuristic exit-pupil fields.
         self._lens_assembly.sync_from_scene(self.scene)
 
-        # ── Optical exit pupil: where backward rays must be AIMED ─────────────
-        # This can be a virtual pupil (x < G1) for telephoto layouts — physically
-        # correct.  It drives aperture_centroid/radius (the ray-direction target)
-        # but must NOT drive physical camera-body mesh positions.
-        _ap_cen, _ap_r = self._lens_assembly.backward_ray_target()
-        if _ap_cen is not None and _ap_r > 0.0:
-            self.aperture_centroid = np.asarray(_ap_cen, dtype=np.float64)
-            self.aperture_radius = float(_ap_r)
+        # ── Backward launch ownership ────────────────────────────────────────
+        # The optical target may be a real exit pupil or a virtual pupil behind
+        # the sensor.  Keep that target on the assembly/cache path.  The finite
+        # physical gate remains aperture_centroid/radius for C++ PIXEL_CONE and
+        # diagnostics that can only aim at a real disk.
+        _target_spec = self._lens_assembly.backward_ray_target_spec()
+        self._backward_optical_target = _target_spec
+        if _target_spec is not None and float(_target_spec.radius) > 0.0:
             print(
-                "[assembly-optical-ep]",
-                f"x={float(_ap_cen[0]):.4f}",
-                f"r={_ap_r*1e3:.2f}mm",
+                "[assembly-backward-target]",
+                f"kind={_target_spec.kind}",
+                f"mode={_target_spec.direction_mode}",
+                f"x={float(_target_spec.center[0]):.4f}",
+                f"r={float(_target_spec.radius)*1e3:.2f}mm",
+                flush=True,
+            )
+        _gate_cen, _gate_r = self._lens_assembly.backward_physical_gate_target()
+        if _gate_cen is not None and _gate_r > 0.0:
+            self.aperture_centroid = np.asarray(_gate_cen, dtype=np.float64)
+            self.aperture_radius = float(_gate_r)
+            print(
+                "[assembly-physical-gate]",
+                f"x={float(_gate_cen[0]):.4f}",
+                f"r={_gate_r*1e3:.2f}mm",
                 flush=True,
             )
 
@@ -5475,7 +5487,7 @@ class ForwardCppLensBench:
         stop_plane_x = float(last_lens.center_x)
         stop_radius_m = float(max(0.001, first_lens.aperture_radius))
         if self._lens_assembly is not None:
-            _bdpt_cen, _bdpt_r = self._lens_assembly.backward_ray_target()
+            _bdpt_cen, _bdpt_r = self._lens_assembly.backward_physical_gate_target()
             if _bdpt_cen is not None and _bdpt_r > 0.0:
                 stop_plane_x = float(_bdpt_cen[0])
                 stop_radius_m = float(_bdpt_r)
@@ -5731,16 +5743,7 @@ class ForwardCppLensBench:
         """Zero the C++ sensor_accum so the next exposure frame starts clean."""
         plate = self.scene.image_plate
         res   = int(max(16, plate.sensor_res))
-        target_x = float(np.asarray(
-            getattr(self, "aperture_centroid", np.zeros(3, dtype=np.float64)),
-            dtype=np.float64)[0])
-        target_r = float(getattr(self, "aperture_radius", 0.0))
-        if target_r <= 0.0:
-            _lensasm = getattr(self, "_lens_assembly", None)
-            if _lensasm is not None:
-                _cen, _r = _lensasm.backward_ray_target()
-                if _cen is not None and _r > 0.0:
-                    target_x, target_r = float(_cen[0]), float(_r)
+        target_x, target_r = self._physical_sensor_gate_target()
         self.tracer.configure_sensor_image(
             float(plate.x), float(plate.sensor_half_w), float(plate.sensor_half_h), res, 0.008, target_x, target_r,
         )
@@ -5801,24 +5804,10 @@ class ForwardCppLensBench:
         )
 
     def _configure_cpp_sensor_image(self, res: int, bdpt_eps: float = 0.008) -> None:
-        target_x = float(np.asarray(getattr(self, "aperture_centroid", np.zeros(3, dtype=np.float64)), dtype=np.float64)[0])
-        target_r = float(getattr(self, "aperture_radius", 0.0))
-        # Fallback: if the aperture target wasn't set (radius=0), use the
-        # front face of the first lens group so sensor rays have somewhere to aim.
-        if target_r <= 0.0:
-            _lensasm = getattr(self, "_lens_assembly", None)
-            if _lensasm is not None:
-                _cen, _r = _lensasm.backward_ray_target()
-                if _cen is not None and _r > 0.0:
-                    target_x = float(_cen[0])
-                    target_r = float(_r)
-            if target_r <= 0.0:
-                # Last resort: use the first lens group front face from the scene spec
-                _lstack = getattr(self.scene, "lens_stack", None)
-                if _lstack and len(_lstack) > 0:
-                    _front = _lstack[0]
-                    target_x = float(getattr(_front, "center_x", 1.0)) - float(getattr(_front, "thickness", 0.04)) * 0.5
-                    target_r = float(getattr(_front, "aperture_radius", 0.018))
+        # The C++ PIXEL_CONE path only accepts a finite disk to aim at.  Use the
+        # physical gate explicitly; virtual exit pupils are handled by the
+        # Python sensor-ray cache, which can launch away from a virtual origin.
+        target_x, target_r = self._physical_sensor_gate_target()
         self.tracer.configure_sensor_image(
             float(self.scene.image_plate.x),
             float(self.scene.image_plate.sensor_half_w),
@@ -5833,20 +5822,20 @@ class ForwardCppLensBench:
             f"sensor_x={float(self.scene.image_plate.x):.4f}",
             f"target_x={target_x:.4f}",
             f"target_r={target_r*1e3:.2f}mm",
+            f"mode=physical-gate",
             flush=True,
         )
 
-    def _sensor_ray_cache_target(self) -> Tuple[float, float]:
-        """Return the current backward ray target plane and aperture radius."""
+    def _physical_sensor_gate_target(self) -> Tuple[float, float]:
+        """Finite physical gate for C++ paths that cannot represent virtual pupils."""
         target_x = float(np.asarray(getattr(self, "aperture_centroid", np.zeros(3, dtype=np.float64)), dtype=np.float64)[0])
         target_r = float(getattr(self, "aperture_radius", 0.0))
-        if target_r <= 0.0:
-            _lensasm = getattr(self, "_lens_assembly", None)
-            if _lensasm is not None:
-                _cen, _r = _lensasm.backward_ray_target()
-                if _cen is not None and _r > 0.0:
-                    target_x = float(_cen[0])
-                    target_r = float(_r)
+        _lensasm = getattr(self, "_lens_assembly", None)
+        if _lensasm is not None:
+            _cen, _r = _lensasm.backward_physical_gate_target()
+            if _cen is not None and _r > 0.0:
+                target_x = float(_cen[0])
+                target_r = float(_r)
         if target_r <= 0.0:
             _lstack = getattr(self.scene, "lens_stack", None)
             if _lstack and len(_lstack) > 0:
@@ -5855,9 +5844,26 @@ class ForwardCppLensBench:
                 target_r = float(getattr(_front, "aperture_radius", 0.018))
         return target_x, float(max(1.0e-5, target_r))
 
+    def _sensor_ray_cache_target_spec(self):
+        """Optical target spec for cached sensor rays, including virtual pupils."""
+        _lensasm = getattr(self, "_lens_assembly", None)
+        if _lensasm is not None:
+            spec = _lensasm.backward_ray_target_spec()
+            if spec is not None and float(spec.radius) > 0.0:
+                return spec
+        target_x, target_r = self._physical_sensor_gate_target()
+        return BackwardRayTargetSpec(
+            center=np.array([target_x, 0.0, 0.0], dtype=np.float64),
+            radius=float(target_r),
+            kind="physical_aperture",
+            direction_mode="toward",
+            sensor_x=float(self.scene.image_plate.x),
+        )
+
     def _sensor_ray_cache_signature(self, pixels: int, aperture_samples: int) -> Tuple[object, ...]:
         plate = self.scene.image_plate
-        target_x, target_r = self._sensor_ray_cache_target()
+        target_spec = self._sensor_ray_cache_target_spec()
+        target = np.asarray(target_spec.center, dtype=np.float64)
         return (
             int(pixels),
             int(aperture_samples),
@@ -5865,8 +5871,10 @@ class ForwardCppLensBench:
             round(float(plate.x), 9),
             round(float(plate.sensor_half_w), 9),
             round(float(plate.sensor_half_h), 9),
-            round(float(target_x), 9),
-            round(float(target_r), 9),
+            round(float(target[0]), 9),
+            round(float(target_spec.radius), 9),
+            str(target_spec.kind),
+            str(target_spec.direction_mode),
         )
 
     def rebuild_sensor_ray_cache(
@@ -5881,7 +5889,9 @@ class ForwardCppLensBench:
         plate = self.scene.image_plate
         res = int(max(4, pixels or plate.sensor_res))
         n_ap = int(max(1, aperture_samples))
-        target_x, target_r = self._sensor_ray_cache_target()
+        target_spec = self._sensor_ray_cache_target_spec()
+        target_center = np.asarray(target_spec.center, dtype=np.float64).reshape(3)
+        target_r = float(max(1.0e-5, target_spec.radius))
         signature = self._sensor_ray_cache_signature(res, n_ap)
 
         half_y = float(max(1.0e-9, plate.sensor_half_w))
@@ -5907,12 +5917,15 @@ class ForwardCppLensBench:
         j2 = rng.random(total, dtype=np.float64)
         rr = np.sqrt(j1) * float(target_r)
         th = 2.0 * math.pi * j2
-        aperture = np.empty((total, 3), dtype=np.float64)
-        aperture[:, 0] = float(target_x)
-        aperture[:, 1] = rr * np.sin(th)
-        aperture[:, 2] = rr * np.cos(th)
+        target_pts = np.empty((total, 3), dtype=np.float64)
+        target_pts[:, 0] = float(target_center[0])
+        target_pts[:, 1] = float(target_center[1]) + rr * np.sin(th)
+        target_pts[:, 2] = float(target_center[2]) + rr * np.cos(th)
 
-        directions = aperture - origins
+        if str(target_spec.direction_mode) == "away_from_virtual":
+            directions = origins - target_pts
+        else:
+            directions = target_pts - origins
         dn = np.linalg.norm(directions, axis=1)
         valid = np.isfinite(dn) & (dn > EPS)
         directions[valid] /= dn[valid, None]
@@ -5941,6 +5954,8 @@ class ForwardCppLensBench:
             "cache_count": n,
             "pixels": res,
             "aperture_samples": n_ap,
+            "target_kind": str(target_spec.kind),
+            "target_mode": str(target_spec.direction_mode),
         }
         if save_path:
             self._sensor_ray_cache.save_npz(save_path)
@@ -7291,13 +7306,15 @@ class ForwardCppLensBench:
                 stop_plane_x = float(iris_cfg.x_pos)
                 stop_radius_m = float(max(1.0e-4, iris_cfg.r_inner))
             # Prefer the optical exit pupil (assembly-computed) over the physical
-            # body position stored in scene.exit_pupil_x, which may be the G4
-            # back face rather than where rays should actually be aimed.
+            # target held by the assembly.  Virtual image-side pupils are handled
+            # as virtual origins, not as finite disks to aim at.
+            target_mode = "toward"
             if self._lens_assembly is not None:
-                _bdpt_cen, _bdpt_r = self._lens_assembly.backward_ray_target()
-                if _bdpt_cen is not None and _bdpt_r > 0.0:
-                    stop_plane_x = float(_bdpt_cen[0])
-                    stop_radius_m = float(_bdpt_r)
+                _bdpt_spec = self._lens_assembly.backward_ray_target_spec()
+                if _bdpt_spec is not None and float(_bdpt_spec.radius) > 0.0:
+                    stop_plane_x = float(_bdpt_spec.center[0])
+                    stop_radius_m = float(_bdpt_spec.radius)
+                    target_mode = str(_bdpt_spec.direction_mode)
             else:
                 exit_pupil_radius = float(getattr(self.scene, "exit_pupil_radius", 0.0))
                 if exit_pupil_radius > 0.0:
@@ -7343,7 +7360,7 @@ class ForwardCppLensBench:
                 + r[..., None] * np.sin(th)[..., None] * up[None, None, None, :]
             )
 
-            d = ap_pts - pix_pts
+            d = pix_pts - ap_pts if target_mode == "away_from_virtual" else ap_pts - pix_pts
             nd = np.linalg.norm(d, axis=3)
             valid = nd > EPS
             if not np.any(valid):

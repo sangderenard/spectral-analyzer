@@ -39,7 +39,7 @@ __all__ = [
     "ElementPose",
     "BaffleSpec", "CasingSpec", "ApertureSpec",
     "ConicFrustumSpec", "StraightBoxSpec", "FilterSpec",
-    "LensAssemblySpec",
+    "BackwardRayTargetSpec", "LensAssemblySpec",
     "tessellate_frustum", "tessellate_baffle", "tessellate_box_walls",
 ]
 
@@ -130,9 +130,9 @@ class StraightBoxSpec:
     The inner walls are absorbers.  The sensor back is a sensor-group
     plane that can travel along the optical axis within the tube depth.
 
-    z_front        : open (lens-facing) end of the tube
+    z_front        : high-coordinate rear/sensor end of the tube in this scene
     depth          : tube length along the optical axis
-    sensor_z_offset: how far the sensor has been racked back from z_front
+    sensor_z_offset: how far the sensor has been racked forward from z_front
                      sensor plane is at  z_front - sensor_z_offset
                      must be in [0, depth]
     """
@@ -151,6 +151,29 @@ class FilterSpec:
     z_back:  float
     r:       float
     pose:    ElementPose = field(default_factory=ElementPose)
+
+
+@dataclass
+class BackwardRayTargetSpec:
+    """Optical launch target for sensor-side rays.
+
+    direction_mode:
+      - "toward": launch direction is target_point - sensor_point.
+      - "away_from_virtual": target is a virtual image-side pupil behind the
+        sensor; launch direction is sensor_point - sampled_virtual_pupil_point.
+    """
+
+    center: np.ndarray
+    radius: float
+    kind: Literal[
+        "real_exit_pupil",
+        "virtual_exit_pupil",
+        "physical_aperture",
+        "last_lens_face",
+        "sensor_box_front",
+    ]
+    direction_mode: Literal["toward", "away_from_virtual"]
+    sensor_x: Optional[float] = None
 
 
 # ── Main class ────────────────────────────────────────────────────────────────
@@ -302,11 +325,9 @@ class LensAssemblySpec:
                 pass
         if x_exit is None:
             x_exit = sensor_x - 0.05
-        # StraightBoxSpec z_front is the lens-facing end; sensor_z_offset is how far
-        # the sensor is racked back from that face (sensor_plane = z_front − offset).
-        # In our scene x-coords x_exit < sensor_x, so offset must be negative of
-        # (sensor_x − x_exit).  We store depth = sensor_x − x_exit and set
-        # z_front = sensor_x so sensor_z_offset = 0 keeps sensor_x() correct.
+        # StraightBoxSpec uses the higher-coordinate rear/sensor plane as z_front
+        # and depth extends forward toward the lens/body entrance.  In this scene
+        # x_exit < sensor_x, so z_front=sensor_x and depth=sensor_x-x_exit.
         depth = max(1.0e-4, float(sensor_x) - float(x_exit))
         self.straight_section = StraightBoxSpec(
             half_w=float(sensor_r),
@@ -330,29 +351,79 @@ class LensAssemblySpec:
                 r_clear=float(iris.r_inner),
             )
 
-    def backward_ray_target(self) -> Tuple[Optional[np.ndarray], float]:
-        """Return (centroid_xyz, radius) — where sensor backward rays must aim.
+    def backward_ray_target_spec(self) -> Optional[BackwardRayTargetSpec]:
+        """Return the optical launch target for sensor-side rays.
 
         When a physical iris is present, we target the EXIT PUPIL — the image of
         the iris through whatever lens groups lie between it and the sensor.  That
-        is the cone vertex that backward rays from the sensor actually converge on,
-        so aiming there avoids the camera-body frustum blocking them before they
-        reach the scene.
+        target can be real or virtual.  A real image-side pupil in front of the
+        sensor is a finite disk to aim toward.  A virtual pupil behind the sensor
+        is not a disk to aim at; rays must launch away from it as if they had
+        originated there and crossed the sensor plane.
 
         Precedence:
-          1. Exit pupil computed by optics (requires iris encoded in CompoundLens)
-          2. Physical iris position (fallback when no optics or EP is degenerate)
+          1. Exit pupil computed by optics (real or virtual)
+          2. Physical iris position when no valid optical pupil is available
           3. Exit face of the last lens group
           4. Front face of the straight_section
         """
+        sensor_x = self.sensor_x()
         if self.optics is not None:
             try:
                 x_ep, r_ep = self.optics.exit_pupil
                 if r_ep > 0.0:
-                    return (np.array([float(x_ep), 0.0, 0.0], dtype=np.float64),
-                            float(r_ep))
+                    x_ep = float(x_ep)
+                    if sensor_x is not None and x_ep >= float(sensor_x) - 1.0e-9:
+                        return BackwardRayTargetSpec(
+                            center=np.array([x_ep, 0.0, 0.0], dtype=np.float64),
+                            radius=float(r_ep),
+                            kind="virtual_exit_pupil",
+                            direction_mode="away_from_virtual",
+                            sensor_x=float(sensor_x),
+                        )
+                    return BackwardRayTargetSpec(
+                        center=np.array([x_ep, 0.0, 0.0], dtype=np.float64),
+                        radius=float(r_ep),
+                        kind="real_exit_pupil",
+                        direction_mode="toward",
+                        sensor_x=None if sensor_x is None else float(sensor_x),
+                    )
             except Exception:
                 pass
+        if self.aperture is not None and self.aperture.r_clear > 0.0:
+            return BackwardRayTargetSpec(
+                center=np.array([self.aperture.z, 0.0, 0.0], dtype=np.float64),
+                radius=float(self.aperture.r_clear),
+                kind="physical_aperture",
+                direction_mode="toward",
+                sensor_x=None if sensor_x is None else float(sensor_x),
+            )
+        if self.optics is not None:
+            try:
+                back = self.optics.side("back")
+                if back.radius > 0.0:
+                    return BackwardRayTargetSpec(
+                        center=np.array([float(back.x_pos), 0.0, 0.0], dtype=np.float64),
+                        radius=float(back.radius),
+                        kind="last_lens_face",
+                        direction_mode="toward",
+                        sensor_x=None if sensor_x is None else float(sensor_x),
+                    )
+            except Exception:
+                pass
+        if self.straight_section is not None:
+            s = self.straight_section
+            return BackwardRayTargetSpec(
+                center=np.array([float(s.z_front - s.depth), 0.0, 0.0], dtype=np.float64),
+                radius=float(max(s.half_w, s.half_h)),
+                kind="sensor_box_front",
+                direction_mode="toward",
+                sensor_x=None if sensor_x is None else float(sensor_x),
+            )
+        return None
+
+    def backward_physical_gate_target(self) -> Tuple[Optional[np.ndarray], float]:
+        """Return a finite physical gate for launch systems that cannot encode a virtual pupil."""
         if self.aperture is not None and self.aperture.r_clear > 0.0:
             return (np.array([self.aperture.z, 0.0, 0.0], dtype=np.float64),
                     float(self.aperture.r_clear))
@@ -366,9 +437,20 @@ class LensAssemblySpec:
                 pass
         if self.straight_section is not None:
             s = self.straight_section
-            return (np.array([float(s.z_front), 0.0, 0.0], dtype=np.float64),
+            return (np.array([float(s.z_front - s.depth), 0.0, 0.0], dtype=np.float64),
                     float(max(s.half_w, s.half_h)))
         return None, 0.0
+
+    def backward_ray_target(self) -> Tuple[Optional[np.ndarray], float]:
+        """Compatibility wrapper returning the optical target center/radius.
+
+        Use backward_ray_target_spec() when constructing directions; virtual
+        pupils require direction_mode="away_from_virtual" and must not be aimed at.
+        """
+        spec = self.backward_ray_target_spec()
+        if spec is None:
+            return None, 0.0
+        return np.asarray(spec.center, dtype=np.float64), float(spec.radius)
 
     def sensor_x(self) -> Optional[float]:
         """Axial position of the sensor plane (z_front − sensor_z_offset)."""

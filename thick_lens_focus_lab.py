@@ -1161,18 +1161,50 @@ class IrisApertureConfig:
 def _default_optical_design_spec():
     from camera_software.optical_design import OpticalDesignSpec
     return OpticalDesignSpec(
-        focal_length_range_m=(0.060, 0.060),  # 120 6x6 camera with a 60mm lens
-        zoom=0.0,
+        focal_length_range_m=(0.055, 0.110),  # 55-110mm standard zoom for 6×6
+        zoom=0.5,                              # start at ~82mm midpoint
         focus_distance_m=1.0,
-        f_number=2.8,
+        f_number=4.0,
         entrance_x_m=1.08,
         sensor_x_m=1.25,
         sensor_clearance_m=0.030,
         image_radius_m=0.040,                 # matches ImagePlateConfig.radius
         min_air_gap_m=0.008,
         group_thickness_m=0.018,
-        max_group_radius_m=0.031,             # simplified clear optics; film gate stays 56mm square
+        max_group_radius_m=0.080,             # upper bound; actual aperture derived post-solve
     )
+
+
+# Named lens presets.
+# (label, focal_length_range_m, max_aperture_f_number, default_zoom)
+# The solver scales barrel and glass from image_radius_m + f_number, so every
+# preset works regardless of sensor size — just rebuild with the scene's current
+# image_plate dimensions and the solver re-derives all glass geometry.
+_LENS_PRESETS_6x6 = [
+    # ── Medium format primes ──────────────────────────────────────────────
+    ("50/2",    (0.050, 0.050), 2.0,  0.0),   # wide prime
+    ("80/1.4",  (0.080, 0.080), 1.4,  0.0),   # standard "Planar" prime
+    ("150/2.8", (0.150, 0.150), 2.8,  0.0),   # portrait prime
+    # ── Zooms ────────────────────────────────────────────────────────────
+    ("55-110",  (0.055, 0.110), 4.0,  0.5),   # standard zoom
+    ("80-160",  (0.080, 0.160), 4.5,  0.5),   # portrait zoom
+    # ── Macro primes (close-focus optimised; use 0.3-0.5m focus presets) ────
+    # Optically identical to regular primes; the 1:1 working distance is just
+    # a matter of where you set the focus slider — no special lens prescription.
+    ("65Macro", (0.065, 0.065), 2.8,  0.0),   # short macro, generous DOF
+    ("120Macro",(0.120, 0.120), 2.8,  0.0),   # medium macro, more working room
+    # ── Fisheye: ultra-short focal, front dome element protrudes from barrel ─
+    # The solver produces a very wide front element because aperture_radius +
+    # image_radius both grow relative to focal_length; that's the fisheye dome.
+    ("FishEye", (0.020, 0.020), 2.8,  0.0),   # ~180° diagonal FOV on 6×6
+    # ── Microscope objectives (scale to sensor via image_radius_m) ────────
+    # These are infinite-conjugate designs needing a tube lens, but the four-
+    # group surrogate approximates the glass geometry well enough for rendering.
+    # Working distance is very short — set focus to 0.01-0.05m.
+    ("4×/0.1",  (0.045, 0.045), 10.0, 0.0),   # 4×  NA 0.10 ~45mm EFL
+    ("10×/0.25",(0.018, 0.018), 4.0,  0.0),   # 10× NA 0.25 ~18mm EFL
+    ("40×/0.65",(0.0045,0.0045),1.5,  0.0),   # 40× NA 0.65 ~4.5mm EFL
+]
 
 
 @dataclass
@@ -1378,6 +1410,20 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
                     flush=True,
                 )
                 groups = getattr(solved, "groups", ())
+                # Re-derive barrel radius from the actual solved apertures now that we
+                # know them.  The pre-solve estimate used max_group_radius_m (the hard
+                # cap, often 60 mm) which grossly over-sizes the barrel relative to the
+                # glass, making the front element look far too narrow and placing the ring
+                # light far outside the optical path.
+                if groups:
+                    _actual_max_ap = max(float(g.aperture_radius_m) for g in groups)
+                    scene.camera_barrel_r = float(_actual_max_ap + 0.012)
+                    print(
+                        "[barrel-update]",
+                        f"actual_max_ap={_actual_max_ap*1e3:.1f}mm",
+                        f"camera_barrel_r={scene.camera_barrel_r*1e3:.1f}mm",
+                        flush=True,
+                    )
                 if len(groups) >= 3 and getattr(scene, "iris_aperture", None) is None:
                     g2 = groups[1]
                     g3 = groups[2]
@@ -3318,7 +3364,10 @@ def _build_scene_mesh(
         scene.exit_pupil_x = round(float(last_lens.x_back), 6)
         scene.exit_pupil_radius = round(float(last_lens.aperture_radius), 6)
         bore_r = float(scene.tube_radius)
-        lens_housing_r = float(last_lens.aperture_radius + 0.008)
+        # Bore must accommodate the WIDEST group (front group is largest at fast
+        # f-numbers), not just the last group.  Using last_lens here previously
+        # let G1 extend past the bore wall when the solver un-capped apertures.
+        lens_housing_r = float(max(l.aperture_radius for l in lenses) + 0.008)
         if bool(getattr(scene, "include_legacy_stage", False)):
             # Legacy pre-lens bore with CSG openings for authored light tubes.
             host_pipe = PipeCSGSpec(
@@ -3513,7 +3562,7 @@ def _build_scene_mesh(
             lens_housing_pipe,
             tris,
             mats,
-            idx_stage_grey,
+            idx_aperture_black,
             n_axial=64,
             n_profile=64,
             cutters=stage_light_cutters,
@@ -3523,18 +3572,18 @@ def _build_scene_mesh(
         # Lens-edge sealing lip: slightly overlaps the lens edge to prevent a
         # grazing light skirt from bypassing around the lens perimeter.
         # Tighter inner edge seal to prevent light leaks.
-        lens_lip_inner_r = max(0.0, min(scene.tube_radius - 1.0e-4, first_lens.aperture_radius - 0.001))
+        lens_lip_inner_r = max(0.0, min(_barrel_outer_r - 1.0e-4, first_lens.aperture_radius - 0.001))
         # Lens seal lip (front): hard-stop perimeter bypass around lens edge.
-        _build_baffle_annulus(first_lens.x_front - 0.002, lens_lip_inner_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
+        _build_baffle_annulus(first_lens.x_front - 0.002, lens_lip_inner_r, _barrel_outer_r, 72, tris, mats, idx_black, tri_ids=None)
         for lens in lenses:
             # Tighter clearances on per-lens mechanical stage to seal light escape paths.
-            stage_clear_r = min(scene.tube_radius - 1.0e-4, lens.aperture_radius + 0.004)
-            stage_lip_r = max(0.0, min(scene.tube_radius - 1.0e-4, lens.aperture_radius - 0.0008))
+            stage_clear_r = min(_barrel_outer_r - 1.0e-4, lens.aperture_radius + 0.004)
+            stage_lip_r = max(0.0, min(_barrel_outer_r - 1.0e-4, lens.aperture_radius - 0.0008))
             # Per-lens mechanical stage: seat + front/back sealing flanges.
-            _build_baffle_annulus(lens.x_front - 0.010, stage_clear_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
-            _build_baffle_annulus(lens.x_front - 0.002, stage_lip_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
-            _build_baffle_annulus(lens.x_back + 0.002, stage_lip_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
-            _build_baffle_annulus(lens.x_back + 0.010, stage_clear_r, scene.tube_radius, 72, tris, mats, idx_black, tri_ids=None)
+            _build_baffle_annulus(lens.x_front - 0.010, stage_clear_r, _barrel_outer_r, 72, tris, mats, idx_black, tri_ids=None)
+            _build_baffle_annulus(lens.x_front - 0.002, stage_lip_r, _barrel_outer_r, 72, tris, mats, idx_black, tri_ids=None)
+            _build_baffle_annulus(lens.x_back + 0.002, stage_lip_r, _barrel_outer_r, 72, tris, mats, idx_black, tri_ids=None)
+            _build_baffle_annulus(lens.x_back + 0.010, stage_clear_r, _barrel_outer_r, 72, tris, mats, idx_black, tri_ids=None)
             _f_start = len(lens_front_tri_ids)
             _b_start = len(lens_back_tri_ids)
             _build_lens_mesh(
@@ -5449,8 +5498,8 @@ class ForwardCppLensBench:
     def _configure_sensor_film_pipeline(self) -> None:
         db = SensorFilmDatabase.instance()
         plate = self.scene.image_plate
-        sensor_w_mm = float(2.0 * plate.radius * 1000.0)
-        sensor_h_mm = float(2.0 * plate.radius * 1000.0)
+        sensor_w_mm = float(2.0 * plate.sensor_half_w * 1000.0)
+        sensor_h_mm = float(2.0 * plate.sensor_half_h * 1000.0)
         pixel_pitch_um = float((sensor_w_mm / max(1, int(plate.pixels))) * 1000.0)
         focal_mm = float(max(1.0e-3, (plate.x - _scene_lenses(self.scene)[-1].center_x) * 1000.0))
         aperture_diam_mm = float(max(1.0e-3, 2.0 * _scene_lenses(self.scene)[0].aperture_radius * 1000.0))
@@ -5583,8 +5632,13 @@ class ForwardCppLensBench:
                     "pos": np.array([plate.x, 0.0, 0.0], dtype=np.float64),
                     "fwd": np.array([-1.0, 0.0, 0.0], dtype=np.float64),
                     "up": np.array([0.0, 1.0, 0.0], dtype=np.float64),
-                    "sensor_w_m": float(2.0 * plate.radius),
-                    "sensor_h_m": float(2.0 * plate.radius),
+                    # Use the actual rectangular frame dimensions, NOT 2×plate.radius.
+                    # plate.radius is the circumscribed circle (for the disc mesh); the
+                    # 80mm-diameter grid it implies extends into the barrel corners outside
+                    # the 56×56mm frame, causing those corner phantom pixels to shoot
+                    # backward rays through barrel internals and contaminate the image.
+                    "sensor_w_m": float(2.0 * plate.sensor_half_w),
+                    "sensor_h_m": float(2.0 * plate.sensor_half_h),
                     # Kept for ABI compatibility; backend uses this as the
                     # explicit aperture radius (0 => hemisphere launch).
                     "focal_m": float(max(0.05, plate.x - stop_plane_x)),
@@ -7415,8 +7469,8 @@ class ForwardCppLensBench:
             right /= max(float(np.linalg.norm(right)), EPS)
             up /= max(float(np.linalg.norm(up)), EPS)
 
-            sensor_w = float(2.0 * plate.radius)
-            sensor_h = float(2.0 * plate.radius)
+            sensor_w = float(2.0 * plate.sensor_half_w)
+            sensor_h = float(2.0 * plate.sensor_half_h)
             focal_m = float(max(0.05, plate.x - stop_plane_x))
             aperture_centre = sensor_pos + fwd * focal_m
             pix_w = sensor_w / float(max(1, n_px))
@@ -10003,7 +10057,7 @@ def run(
                  GL_RGBA, GL_UNSIGNED_BYTE, np.zeros((_BTN_H, _BTN_W, 4), dtype=np.uint8))
 
     # Focus-row panel — wider, drawn below the f-stop column.
-    _FROW_W, _FROW_H = 280, 24
+    _FROW_W, _FROW_H = 320, 24
     tex_focus_panel = glGenTextures(1)
     glBindTexture(GL_TEXTURE_2D, tex_focus_panel)
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
@@ -10012,6 +10066,31 @@ def run(
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _FROW_W, _FROW_H, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, np.zeros((_FROW_H, _FROW_W, 4), dtype=np.uint8))
+
+    # Zoom-row panel — same width as focus row, drawn below the focus row.
+    _ZROW_W, _ZROW_H = 320, 24
+    tex_zoom_panel = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex_zoom_panel)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _ZROW_W, _ZROW_H, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, np.zeros((_ZROW_H, _ZROW_W, 4), dtype=np.uint8))
+
+    # Lens-selector row — drawn below the zoom row.
+    # Width is computed so each preset gets a fixed 48px button.
+    _LBTN_W = 48
+    _LROW_H = 24
+    _LROW_W = len(_LENS_PRESETS_6x6) * (_LBTN_W + 2)
+    tex_lens_panel = glGenTextures(1)
+    glBindTexture(GL_TEXTURE_2D, tex_lens_panel)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE)
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE)
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _LROW_W, _LROW_H, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, np.zeros((_LROW_H, _LROW_W, 4), dtype=np.uint8))
 
     # Lazy font for PIP stats overlay – created on first draw to avoid init cost.
     _pip_font: list = [None]  # mutable container so closure can write it
@@ -10219,8 +10298,9 @@ def run(
                                  _BTN_W, _BTN_H, hud_mode=True)
 
         # focus row ─────────────────────────────────────────────────────────
-        _focus_presets = [("0.5m", 0.5), ("0.7m", 0.7), ("1m", 1.0),
-                          ("1.5m", 1.5), ("2m", 2.0), ("3m", 3.0), ("∞m", 50.0)]
+        _focus_presets = [("10mm", 0.01), ("20mm", 0.02), ("50mm", 0.05),
+                          ("0.5m", 0.5), ("1m", 1.0), ("2m", 2.0),
+                          ("3m", 3.0), ("∞m", 50.0)]
         _fbw, _fbh = _FROW_W // len(_focus_presets) - 2, _FROW_H - 6
         _frsurf = pygame.Surface((_FROW_W, _FROW_H), pygame.SRCALPHA)
         _frsurf.fill((0, 0, 0, 0))
@@ -10248,6 +10328,90 @@ def run(
         _frow_vy = H - (4 + _BTN_H + 4 + _FROW_H)
         _draw_quad_with_pip_prog(tex_focus_panel, _frow_vx, _frow_vy,
                                  _FROW_W, _FROW_H, hud_mode=True)
+
+        # zoom row ──────────────────────────────────────────────────────────
+        _od_z = getattr(bench.scene, "optical_design", None)
+        _fl_range = getattr(_od_z, "focal_length_range_m",
+                            getattr(getattr(_od_z, "spec", None), "focal_length_range_m",
+                                    (0.070, 0.160)))
+        _zoom_now  = float(getattr(_od_z, "zoom",
+                                   getattr(getattr(_od_z, "spec", None), "zoom", 0.5)))
+        _fl_now_m  = float(_fl_range[0] + (_fl_range[1] - _fl_range[0]) * _zoom_now)
+        _fl_min_mm = float(_fl_range[0] * 1000.0)
+        _fl_max_mm = float(_fl_range[1] * 1000.0)
+        # Build evenly-spaced focal length presets spanning the zoom range.
+        _n_zpresets = 7
+        _zoom_presets = [
+            (f"{round(_fl_min_mm + (_fl_max_mm - _fl_min_mm) * i / (_n_zpresets - 1)):.0f}mm",
+             float(_fl_min_mm + (_fl_max_mm - _fl_min_mm) * i / (_n_zpresets - 1)) / 1000.0)
+            for i in range(_n_zpresets)
+        ]
+        _zbw = _ZROW_W // len(_zoom_presets) - 2
+        _zbh = _ZROW_H - 6
+        _zrsurf = pygame.Surface((_ZROW_W, _ZROW_H), pygame.SRCALPHA)
+        _zrsurf.fill((0, 0, 0, 0))
+        _zrx = 2
+        _zrow_origin_x = W - _ZROW_W - 4
+        _zrow_origin_y = 4 + _BTN_H + 4 + _FROW_H + 4
+        for _zlabel, _zfl_m in _zoom_presets:
+            _active = abs(_fl_now_m - _zfl_m) < (_fl_max_mm - _fl_min_mm) * 0.001 * 80.0
+            _cbg = (40, 90, 140, 210) if _active else (22, 24, 30, 180)
+            _cbd = (80, 160, 220) if _active else (50, 53, 62)
+            _ctxt = (210, 230, 255) if _active else (130, 135, 150)
+            pygame.draw.rect(_zrsurf, _cbg, (_zrx, 3, _zbw, _zbh))
+            pygame.draw.rect(_zrsurf, _cbd, (_zrx, 3, _zbw, _zbh), 1)
+            _zlbl = _btn_font.render(_zlabel, True, _ctxt)
+            _zrsurf.blit(_zlbl, (_zrx + (_zbw - _zlbl.get_width()) // 2,
+                                 3 + (_zbh - _zlbl.get_height()) // 2))
+            _zfl_cap = _zfl_m
+            _click_buttons.append(((_zrow_origin_x + _zrx, _zrow_origin_y + 3, _zbw, _zbh),
+                                    lambda zf=_zfl_cap: _rebuild_bench_with_zoom(zf)))
+            _zrx += _zbw + 2
+
+        glBindTexture(GL_TEXTURE_2D, tex_zoom_panel)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _ZROW_W, _ZROW_H, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, _surf_to_gl_arr(_zrsurf, _ZROW_W, _ZROW_H))
+        _zrow_vx = W - _ZROW_W - 4
+        _zrow_vy = H - (4 + _BTN_H + 4 + _FROW_H + 4 + _ZROW_H)
+        _draw_quad_with_pip_prog(tex_zoom_panel, _zrow_vx, _zrow_vy,
+                                 _ZROW_W, _ZROW_H, hud_mode=True)
+
+        # lens selector row ─────────────────────────────────────────────────
+        _od_l = getattr(bench.scene, "optical_design", None)
+        _cur_fl_range = getattr(_od_l, "focal_length_range_m",
+                                getattr(getattr(_od_l, "spec", None), "focal_length_range_m",
+                                        (0.055, 0.110)))
+        _lbw = _LBTN_W
+        _lbh = _LROW_H - 6
+        _lrsurf = pygame.Surface((_LROW_W, _LROW_H), pygame.SRCALPHA)
+        _lrsurf.fill((0, 0, 0, 0))
+        _lrx = 2
+        _lrow_origin_x = W - _LROW_W - 4
+        _lrow_origin_y = 4 + _BTN_H + 4 + _FROW_H + 4 + _ZROW_H + 4
+        for _ll, _lfl, _lfn, _lz0 in _LENS_PRESETS_6x6:
+            _active = (abs(_cur_fl_range[0] - _lfl[0]) < 1e-4 and
+                       abs(_cur_fl_range[1] - _lfl[1]) < 1e-4)
+            _cbg = (55, 40, 100, 210) if _active else (22, 24, 30, 180)
+            _cbd = (160, 100, 220) if _active else (50, 53, 62)
+            _ctxt = (220, 200, 255) if _active else (130, 135, 150)
+            pygame.draw.rect(_lrsurf, _cbg, (_lrx, 3, _lbw, _lbh))
+            pygame.draw.rect(_lrsurf, _cbd, (_lrx, 3, _lbw, _lbh), 1)
+            _llbl = _btn_font.render(_ll, True, _ctxt)
+            _lrsurf.blit(_llbl, (_lrx + (_lbw - _llbl.get_width()) // 2,
+                                  3 + (_lbh - _llbl.get_height()) // 2))
+            _lfl_cap, _lfn_cap, _lz_cap = _lfl, _lfn, _lz0
+            _click_buttons.append(((_lrow_origin_x + _lrx, _lrow_origin_y + 3, _lbw, _lbh),
+                                    lambda f=_lfl_cap, n=_lfn_cap, z=_lz_cap:
+                                        _rebuild_bench_with_lens(f, n, z)))
+            _lrx += _lbw + 2
+
+        glBindTexture(GL_TEXTURE_2D, tex_lens_panel)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, _LROW_W, _LROW_H, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, _surf_to_gl_arr(_lrsurf, _LROW_W, _LROW_H))
+        _lrow_vx = W - _LROW_W - 4
+        _lrow_vy = H - (4 + _BTN_H + 4 + _FROW_H + 4 + _ZROW_H + 4 + _LROW_H)
+        _draw_quad_with_pip_prog(tex_lens_panel, _lrow_vx, _lrow_vy,
+                                 _LROW_W, _LROW_H, hud_mode=True)
 
         # ── C++ BDPT connection/progress stats under left violet PIP ───────
         _cx_stats = bench.bdpt_last_connection_stats
@@ -11068,6 +11232,11 @@ def run(
     _shutter_event   = threading.Event()
     # Shared exposure counter (display loop reads it for caption).
     _exposure_count  = [0]
+    # Set by _stop_bench_runtime before any rebuild; cleared after the new bench
+    # is wired and ready.  The camera thread checks this at every wait point and
+    # aborts the current exposure slice / drain loop immediately so the old bench
+    # is never accessed after stop_pipeline() returns.
+    _rebuild_in_progress = threading.Event()
 
     def _fire_pipeline_camera_render(_materialized_slice_id: int = -1) -> None:
         if _pipeline_camera_busy[0]:
@@ -11223,26 +11392,30 @@ def run(
             n_stages = bench._exposure_stage_count()
             _seed_n = seed_offset
             for _slice_idx in range(n_stages):
-                if closing.is_set():
+                if closing.is_set() or _rebuild_in_progress.is_set():
                     return
-                while paused[0] and not closing.is_set():
+                while paused[0] and not closing.is_set() and not _rebuild_in_progress.is_set():
                     _ct.sleep(0.005)
+                if _rebuild_in_progress.is_set():
+                    return
                 _tl = getattr(bench, "_camera_timeline", None)
                 _ts = _tl.slices[_slice_idx] if (_tl and _slice_idx < len(_tl.slices)) else None
                 _slice_dt = float(_ts.dt) if _ts is not None else 0.010
                 on_dt_request(_slice_dt)
                 _trace(rays_per_emitter, (seed + _seed_n) & 0x7FFFFFFF, max_bounces)
                 _seed_n += 1
-                while not closing.is_set():
+                while not closing.is_set() and not _rebuild_in_progress.is_set():
                     if int(getattr(bench, "_bdpt_camera_sweep_stage", 0)) > _slice_idx:
                         break
                     _ct.sleep(0.001)
+                if _rebuild_in_progress.is_set():
+                    return
 
             # All slices dispatched — drain the pipeline.
             _t_scene = float(getattr(bench._scene_camera_coordinator, "scene_time_s", 0.0))
-            if not closing.is_set():
+            if not closing.is_set() and not _rebuild_in_progress.is_set():
                 bench._finish_exposure_frame()
-                while not closing.is_set():
+                while not closing.is_set() and not _rebuild_in_progress.is_set():
                     try:
                         if int(bench.tracer.in_flight_count()) == 0:
                             break
@@ -11250,6 +11423,8 @@ def run(
                         break
                     _ct.sleep(0.010)
 
+            if _rebuild_in_progress.is_set():
+                return
             try:
                 print("[exposure] joining T5 thread…", flush=True)
                 bench.tracer.join_t5()
@@ -11353,6 +11528,15 @@ def run(
 
         _seed_offset = 0
         while not closing.is_set():
+            # Block here while a scene rebuild is in progress.  The rebuild
+            # sets _rebuild_in_progress BEFORE stopping the old pipeline, so
+            # any in-flight exposure aborted early (via the checks above)
+            # will reach this point and wait until the new bench is wired.
+            while _rebuild_in_progress.is_set() and not closing.is_set():
+                _ct.sleep(0.010)
+            if closing.is_set():
+                break
+
             _exposure_count[0] += 1
             print(f"[exposure] starting exposure #{_exposure_count[0]}", flush=True)
             _n_stages = bench._exposure_stage_count() if hasattr(bench, '_exposure_stage_count') else 1
@@ -11392,6 +11576,13 @@ def run(
     _camera_thread.start()
 
     def _stop_bench_runtime(old_bench: ForwardCppLensBench) -> None:
+        # Signal the camera thread to abort the current exposure immediately.
+        # This must happen BEFORE stop_pipeline() so the thread stops accessing
+        # the old bench's tracer before we tear it down.
+        _rebuild_in_progress.set()
+        import time as _sb_time
+        # Give the camera thread a brief window to reach a safe return point.
+        _sb_time.sleep(0.030)
         try:
             if old_bench._lens_assembly is not None:
                 old_bench._lens_assembly.stop_progressive_refinement()
@@ -11412,6 +11603,18 @@ def run(
             print("[bench-rebuild] pipeline stopped", flush=True)
         except Exception as exc:
             print(f"[bench-rebuild] pipeline stop failed: {exc}", flush=True)
+        # Explicitly zero accumulators and drop large buffer references so Python's
+        # reference counter can reclaim the GPU/CPU memory before the new bench
+        # allocates its own.  Without this the old buffers stay alive until the
+        # next GC cycle, doubling peak RAM during every rebuild.
+        try:
+            old_bench._forward_img_accum[:] = 0.0
+            old_bench._reverse_img_accum[:] = 0.0
+            old_bench._camera_perspective_accum[:] = 0.0
+            old_bench._last_bdpt_plate_rgb = None
+            old_bench._last_direct_img = None
+        except Exception:
+            pass
 
     def _invalidate_scene_gl_cache() -> None:
         _scene_vao[0]           = None
@@ -11420,7 +11623,7 @@ def run(
         _uv_last_update_s[0]    = -1.0
         _uv_shared_tex_id[0]    = 0
 
-    def _wire_rebuilt_bench(new_bench: ForwardCppLensBench) -> None:
+    def _wire_rebuilt_bench(new_bench: ForwardCppLensBench, *, finalize: bool = True) -> None:
         new_bench.sensor_amp_gain      = float(sensor_amp_gain)
         new_bench.sensor_min_amplitude = float(sensor_min_amplitude)
         new_bench.emitter_amp_gain     = float(emitter_amp_gain)
@@ -11456,6 +11659,21 @@ def run(
             )
         _new_pip_res = int(max(16, scene.image_plate.sensor_res))
         new_bench._configure_cpp_sensor_image(_new_pip_res, 0.008)
+        if finalize:
+            # Set the new bench up for a fresh exposure so the camera thread starts
+            # cleanly from a known state rather than inheriting stale slice indices.
+            try:
+                new_bench.begin_scene_camera_step()
+                new_bench._ensure_camera_timeline()
+            except Exception as exc:
+                print(f"[bench-rebuild] exposure-init failed: {exc}", flush=True)
+            # Force a GC pass so the old bench's GPU/CPU buffers are released before
+            # the camera thread starts accumulating into the new bench.
+            import gc as _gc
+            _gc.collect()
+            # Unblock the camera thread — it was spin-waiting on _rebuild_in_progress.
+            _rebuild_in_progress.clear()
+            print("[bench-rebuild] rebuild complete — camera thread unblocked", flush=True)
 
     def _rebuild_bench_for_snapshot(snapshot: SceneSnapshot, reason: str) -> None:
         """Rebuild static BVH-backed geometry for a coordinator scene snapshot."""
@@ -11484,9 +11702,9 @@ def run(
             enable_uv_splat=enable_uv_splat,
         )
         print("[bench-rebuild] ForwardCppLensBench init complete", flush=True)
-        _wire_rebuilt_bench(bench)
+        _wire_rebuilt_bench(bench, finalize=False)
         print("[bench-rebuild] _wire_rebuilt_bench complete", flush=True)
-        bench.begin_scene_camera_step()
+        # Complete snapshot-specific state BEFORE unblocking the camera thread.
         _t_rebuild = float(snapshot.sample_time)
         bench._scene_version_cache.commit_version(
             _t_rebuild,
@@ -11499,6 +11717,16 @@ def run(
             bench.tri_vertices,
             bench._subject_group_tri_map,
         )
+        # Now safe to start a fresh exposure and unblock the camera thread.
+        try:
+            bench.begin_scene_camera_step()
+            bench._ensure_camera_timeline()
+        except Exception as exc:
+            print(f"[bench-rebuild] snapshot exposure-init failed: {exc}", flush=True)
+        import gc as _gc
+        _gc.collect()
+        _rebuild_in_progress.clear()
+        print("[bench-rebuild] snapshot rebuild complete — camera thread unblocked", flush=True)
         _restore_display_gl_context()
 
     def _rebuild_bench_with_iris(new_r_inner: float) -> None:
@@ -11585,6 +11813,100 @@ def run(
         _wire_rebuilt_bench(bench)
         print(f"[focus] rebuild done  u={new_focus*1e3:.0f}mm  tris={bench.n_tris}", flush=True)
         _restore_display_gl_context()
+
+    def _rebuild_bench_with_zoom(new_focal_m: float) -> None:
+        """Full scene rebuild at a new focal length (zoom position).
+
+        Replaces the optical_design spec with the new zoom value derived from
+        the focal length, preserving f-number by scaling the iris aperture radius
+        proportionally to the new EFL.
+        """
+        nonlocal bench
+        od = getattr(scene, "optical_design", None)
+        if od is None:
+            print("[zoom] no optical_design on scene; cannot rebuild", flush=True)
+            return
+        # Resolve spec whether od is a SolvedOpticalTrain or raw OpticalDesignSpec.
+        spec = getattr(od, "spec", od)
+        fl_min, fl_max = spec.focal_length_range_m
+        fl_range = max(fl_max - fl_min, 1.0e-6)
+        new_zoom = float(np.clip((new_focal_m - fl_min) / fl_range, 0.0, 1.0))
+        # Compute current f-number so we can re-apply it after rebuild.
+        _cur_efl = float(getattr(od, "effective_focal_length_m", 0.0) or 0.0)
+        _cur_iris = getattr(scene, "iris_aperture", None)
+        _cur_r = float(getattr(_cur_iris, "r_inner", 0.0)) if _cur_iris is not None else 0.0
+        _cur_fnum = (_cur_efl / (2.0 * _cur_r)) if _cur_r > 1e-6 and _cur_efl > 1e-6 else 2.8
+        import dataclasses as _dc
+        scene.optical_design = _dc.replace(spec, zoom=round(new_zoom, 6))
+        scene.iris_aperture = None  # let solver re-derive iris position for new focal
+        scene.focus_distance_m = float(getattr(scene, "focus_distance_m", 1.0) or 1.0)
+        print(f"[zoom] fl={new_focal_m*1e3:.0f}mm  zoom={new_zoom:.3f}  f/{_cur_fnum:.1f}  rebuilding…", flush=True)
+        _stop_bench_runtime(bench)
+        _invalidate_scene_gl_cache()
+        bench = ForwardCppLensBench(
+            scene=scene,
+            freq_hz=bench.freq_hz.copy(),
+            view_h=view_h,
+            view_w=view_w,
+            sidecar=sidecar,
+            field_capture=field_capture,
+            enable_uv_splat=enable_uv_splat,
+        )
+        _wire_rebuilt_bench(bench, finalize=False)
+        # Re-apply the preserved f-number at the new focal length.
+        # finalize=False keeps _rebuild_in_progress set so the camera thread
+        # doesn't briefly start between the zoom rebuild and the iris rebuild.
+        _new_efl = float(getattr(getattr(scene, "optical_design", None),
+                                  "effective_focal_length_m", new_focal_m) or new_focal_m)
+        _new_iris_r = _new_efl / (2.0 * max(_cur_fnum, 0.5))
+        _rebuild_bench_with_iris(_new_iris_r)
+        print(f"[zoom] rebuild done  fl={new_focal_m*1e3:.0f}mm  tris={bench.n_tris}", flush=True)
+
+    def _rebuild_bench_with_lens(focal_range_m, target_f_number, zoom_start=0.5) -> None:
+        """Switch to a different lens prescription and rebuild the scene."""
+        nonlocal bench
+        from camera_software.optical_design import OpticalDesignSpec
+        od = getattr(scene, "optical_design", None)
+        spec = getattr(od, "spec", od) if od is not None else None
+        new_spec = OpticalDesignSpec(
+            focal_length_range_m=tuple(float(v) for v in focal_range_m),
+            zoom=float(zoom_start),
+            focus_distance_m=float(getattr(scene, "focus_distance_m", 1.0) or 1.0),
+            f_number=float(target_f_number),
+            image_radius_m=float(scene.image_plate.radius),
+            sensor_clearance_m=float(getattr(spec, "sensor_clearance_m", 0.030) if spec is not None else 0.030),
+            min_air_gap_m=float(getattr(spec, "min_air_gap_m", 0.008) if spec is not None else 0.008),
+            group_thickness_m=float(getattr(spec, "group_thickness_m", 0.018) if spec is not None else 0.018),
+            max_group_radius_m=0.120,
+        )
+        scene.optical_design = new_spec
+        scene.iris_aperture = None
+        fl_label = (f"{focal_range_m[0]*1e3:.0f}mm"
+                    if focal_range_m[0] == focal_range_m[1]
+                    else f"{focal_range_m[0]*1e3:.0f}-{focal_range_m[1]*1e3:.0f}mm")
+        print(f"[lens] switching to {fl_label} f/{target_f_number}  rebuilding…", flush=True)
+        _stop_bench_runtime(bench)
+        _invalidate_scene_gl_cache()
+        bench = ForwardCppLensBench(
+            scene=scene,
+            freq_hz=bench.freq_hz.copy(),
+            view_h=view_h,
+            view_w=view_w,
+            sidecar=sidecar,
+            field_capture=field_capture,
+            enable_uv_splat=enable_uv_splat,
+        )
+        _wire_rebuilt_bench(bench, finalize=False)
+        # Apply the new lens's max aperture.  finalize=False keeps the rebuild
+        # gate held across the two-stage rebuild so the camera thread only
+        # unblocks once both the lens prescription and the iris are in place.
+        _new_efl = float(getattr(getattr(scene, "optical_design", None),
+                                  "effective_focal_length_m",
+                                  float(focal_range_m[0] + focal_range_m[1]) * 0.5) or
+                         float(focal_range_m[0] + focal_range_m[1]) * 0.5)
+        _iris_r = _new_efl / (2.0 * max(float(target_f_number), 0.5))
+        _rebuild_bench_with_iris(_iris_r)
+        print(f"[lens] done  {fl_label}  f/{target_f_number}  tris={bench.n_tris}", flush=True)
 
     # ── Click-button state ────────────────────────────────────────────────────
     # Registered at draw time, read at event time.  Each entry:

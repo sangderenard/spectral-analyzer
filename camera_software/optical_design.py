@@ -256,8 +256,15 @@ def _candidate_groups(spec: OpticalDesignSpec, xs: Sequence[float], powers: Sequ
     image_r = float(max(1.0e-5, spec.image_radius_m))
     envelope = max(float(spec.sensor_x_m) - float(spec.entrance_x_m), 1.0e-5)
     field_tan = image_r / max(f, 1.0e-5)
-    front_field_r = min(spec.max_group_radius_m, image_r + 0.18 * envelope * field_tan)
-    ap = min(spec.max_group_radius_m, max(spec.aperture_radius_m, 0.22 * f, front_field_r))
+    # Physical minimum front aperture: must pass both the marginal ray bundle
+    # (aperture_radius_m) and the chief ray swing across the group span
+    # (field coverage term).  Do NOT cap by max_group_radius_m — that is a
+    # manufacturing-intent upper bound, not a physics floor.  Capping it here
+    # produces glass that is geometrically too small to support the requested
+    # f-number and field angle (e.g. f/1.4 on a 6×6 sensor needs ~63 mm radius
+    # front element, but a 31 mm cap silently produces an undersized lens).
+    front_field_r = image_r + 0.18 * envelope * field_tan
+    ap = max(spec.aperture_radius_m, 0.22 * f, front_field_r)
     groups = []
     for i, (x, power) in enumerate(zip(xs, powers)):
         ior = _seq_value(spec.group_iors, i, spec.default_ior)

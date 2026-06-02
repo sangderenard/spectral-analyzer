@@ -11302,21 +11302,21 @@ def run(
         _draw_quad_with_pip_prog(tex_lens_panel, _lrow_vx, _lrow_vy,
                                  _LROW_W, _LROW_H, hud_mode=True)
 
-        # Sensor PIP (green border) click → PDAF focus at clicked pixel.
-        # Registered here, after _click_buttons.clear(), so it survives to the
-        # next frame's event loop.  glViewport y is from BOTTOM; pygame y from TOP.
-        _gpx = int(_green_pip_vx)
-        _gpy = int(H - _pip_vy - _pip_dim)
-        _gpd = int(_pip_dim)
-        _click_buttons.append((
-            (_gpx, _gpy, _gpd, _gpd),
-            lambda _bench=bench, _gx=_gpx, _gy=_gpy, _gd=_gpd: (
-                lambda mx, my: _bench.pdaf_focus_at_film_uv(
-                    film_u=float(mx - _gx) / float(max(1, _gd)),
-                    film_v=float(my - _gy) / float(max(1, _gd)),
-                )
-            )(*pygame.mouse.get_pos()),
-        ))
+        # Both sensor PIPs (blue = live viewfinder, green = BDPT plate) click
+        # → PDAF focus at the clicked pixel.  Both show sensor perspective so
+        # either is valid.  glViewport y is from BOTTOM; pygame y from TOP.
+        _sensor_pip_y = int(H - _pip_vy - _pip_dim)
+        _sensor_pip_d = int(_pip_dim)
+        for _spx in (int(_uv_pip_vx), int(_green_pip_vx)):
+            _click_buttons.append((
+                (_spx, _sensor_pip_y, _sensor_pip_d, _sensor_pip_d),
+                lambda _bench=bench, _gx=_spx, _gy=_sensor_pip_y, _gd=_sensor_pip_d: (
+                    lambda mx, my: _bench.pdaf_focus_at_film_uv(
+                        film_u=float(mx - _gx) / float(max(1, _gd)),
+                        film_v=float(my - _gy) / float(max(1, _gd)),
+                    )
+                )(*pygame.mouse.get_pos()),
+            ))
 
         # ── C++ BDPT connection/progress stats under left violet PIP ───────
         _cx_stats = bench.bdpt_last_connection_stats

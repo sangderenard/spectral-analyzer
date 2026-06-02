@@ -1953,6 +1953,148 @@ struct PyRayTracer
         return out;
     }
 
+    py::array_t<uint8_t> drain_records_raw(int max_n = 50000)
+    {
+        std::vector<RayRecord> recs;
+        if (_pipeline) {
+            recs.reserve(std::min(max_n, 4096));
+            py::gil_scoped_release release;
+            ray_pipeline_drain(_pipeline, recs, max_n);
+        }
+        const py::ssize_t n = static_cast<py::ssize_t>(recs.size());
+        py::array_t<uint8_t> out({n, static_cast<py::ssize_t>(sizeof(RayRecord))});
+        if (n > 0) {
+            std::memcpy(out.mutable_data(), recs.data(), recs.size() * sizeof(RayRecord));
+        }
+        return out;
+    }
+
+    py::dict drain_records_display(
+        int max_n,
+        int image_res,
+        float view_radius,
+        float sensor_half_w,
+        float sensor_half_h,
+        py::array_t<int8_t, py::array::c_style | py::array::forcecast> tri_kind,
+        py::array_t<float, py::array::c_style | py::array::forcecast> rgb_weights)
+    {
+        std::vector<RayRecord> recs;
+        if (_pipeline) {
+            recs.reserve(std::min(max_n, 4096));
+            py::gil_scoped_release release;
+            ray_pipeline_drain(_pipeline, recs, max_n);
+        }
+
+        const int N = static_cast<int>(recs.size());
+        const int res = std::max(1, image_res);
+        const int nb = _n_bands;
+        const float vr = std::max(1.0e-9f, view_radius);
+        const float half_w = std::max(1.0e-9f, sensor_half_w);
+        const float half_h = std::max(1.0e-9f, sensor_half_h);
+
+        auto tk_req = tri_kind.request();
+        const int8_t* tk = static_cast<const int8_t*>(tk_req.ptr);
+        const int n_tk = static_cast<int>(tk_req.size);
+
+        auto w_req = rgb_weights.request();
+        const float* w = static_cast<const float*>(w_req.ptr);
+        const int w_rows = (w_req.ndim >= 2) ? static_cast<int>(w_req.shape[0]) : 0;
+        const int w_cols = (w_req.ndim >= 2) ? static_cast<int>(w_req.shape[1]) : 0;
+        const int use_bands = std::min(nb, w_rows);
+
+        py::array_t<float> forward_arr({res, res, 3});
+        py::array_t<float> reverse_arr({res, res, 3});
+        py::array_t<float> camera_arr ({res, res, 3});
+        float* fwd = forward_arr.mutable_data();
+        float* rev = reverse_arr.mutable_data();
+        float* cam = camera_arr .mutable_data();
+        std::fill(fwd, fwd + static_cast<size_t>(res) * res * 3, 0.0f);
+        std::fill(rev, rev + static_cast<size_t>(res) * res * 3, 0.0f);
+        std::fill(cam, cam + static_cast<size_t>(res) * res * 3, 0.0f);
+
+        int fwd_strikes = 0;
+        int rev_strikes = 0;
+        int fwd_lens_hits = 0;
+        int fwd_lens_after_bounce = 0;
+
+        auto tri_is_optic = [&](int htri) -> bool {
+            if (htri < 0 || n_tk <= 0) return false;
+            const int safe = std::min(std::max(htri, 0), n_tk - 1);
+            const int8_t k = tk[safe];
+            return k == 1 || k == 2 || k == 4; /* LENS/APERTURE/SENSOR from Python constants */
+        };
+        auto tri_is_lens = [&](int htri) -> bool {
+            if (htri < 0 || n_tk <= 0) return false;
+            const int safe = std::min(std::max(htri, 0), n_tk - 1);
+            return tk[safe] == 1;
+        };
+        auto add_rgb = [&](float* dst, int flat, const RayRecord& r) {
+            float rgb[3] = {0.0f, 0.0f, 0.0f};
+            const int cap = std::min({static_cast<int>(r.n_bands), use_bands, RAY_RECORD_MAX_BANDS});
+            if (cap > 0 && w_cols >= 3) {
+                for (int b = 0; b < cap; ++b) {
+                    const float mag = std::sqrt(std::max(0.0f, r.amp_re[b] * r.amp_re[b] + r.amp_im[b] * r.amp_im[b]));
+                    rgb[0] += mag * w[b * w_cols + 0];
+                    rgb[1] += mag * w[b * w_cols + 1];
+                    rgb[2] += mag * w[b * w_cols + 2];
+                }
+            } else {
+                rgb[0] = rgb[1] = rgb[2] = 1.0f;
+            }
+            const size_t base = static_cast<size_t>(flat) * 3u;
+            dst[base + 0] += rgb[0];
+            dst[base + 1] += rgb[1];
+            dst[base + 2] += rgb[2];
+        };
+
+        for (const RayRecord& r : recs) {
+            if (r.kind != RayRecordKind::STRIKE)
+                continue;
+            if (r.color_flag == 0 && r.hit_tri >= 0) {
+                ++fwd_strikes;
+                if (tri_is_lens(r.hit_tri)) {
+                    ++fwd_lens_hits;
+                    if (r.bounce > 0) ++fwd_lens_after_bounce;
+                }
+            } else if (r.color_flag == 1 && r.hit_tri >= 0) {
+                ++rev_strikes;
+            }
+
+            const bool optic = tri_is_optic(r.hit_tri);
+            if (!optic) {
+                if (std::fabs(r.pos[1]) <= vr && std::fabs(r.pos[2]) <= vr) {
+                    const int iy = std::min(std::max(static_cast<int>(((r.pos[1] + vr) / (2.0f * vr)) * res), 0), res - 1);
+                    const int iz = std::min(std::max(static_cast<int>(((r.pos[2] + vr) / (2.0f * vr)) * res), 0), res - 1);
+                    const int flat = iy * res + iz;
+                    if (r.color_flag == 0) {
+                        add_rgb(fwd, flat, r);
+                    } else if (r.color_flag == 1) {
+                        add_rgb(rev, flat, r);
+                    }
+                }
+            }
+
+            if (r.color_flag == 1 && !optic && r.hit_tri >= 0 &&
+                std::fabs(r.sensor_origin_y) <= half_w &&
+                std::fabs(r.sensor_origin_z) <= half_h) {
+                const int iy = std::min(std::max(static_cast<int>(((r.sensor_origin_y + half_w) / (2.0f * half_w)) * res), 0), res - 1);
+                const int iz = std::min(std::max(static_cast<int>(((r.sensor_origin_z + half_h) / (2.0f * half_h)) * res), 0), res - 1);
+                add_rgb(cam, iy * res + iz, r);
+            }
+        }
+
+        py::dict out;
+        out["n"] = N;
+        out["forward"] = forward_arr;
+        out["reverse"] = reverse_arr;
+        out["camera"] = camera_arr;
+        out["fwd_strikes"] = fwd_strikes;
+        out["rev_strikes"] = rev_strikes;
+        out["fwd_lens_hits"] = fwd_lens_hits;
+        out["fwd_lens_after_bounce"] = fwd_lens_after_bounce;
+        return out;
+    }
+
     /* Set pipeline-wide amplitude floor and rebuild material epsilon flags.
      * Safe to call before or after the pipeline is created. */
     void set_min_amplitude(double eps) {
@@ -5458,6 +5600,21 @@ updates, while stable frames cautiously restore throughput.)doc")
 R"doc(Non-blocking slim drain: returns only the 7 arrays needed for voxel accumulation.
 ~5x less allocation than drain_records(). Keys: kind, bounce, seg_start, pos,
 color_flag, hit_tri, hit_group_id, mat_idx, sensor_origin_y/z, amp_re, amp_im.)doc")
+        .def("drain_records_raw", &PyRayTracer::drain_records_raw,
+             py::arg("max_n") = 50000,
+R"doc(Non-blocking raw drain: returns uint8 bytes with shape (N, sizeof(RayRecord)).
+Use a ctypes/NumPy structured view on the Python side instead of dict-of-arrays.)doc")
+        .def("drain_records_display", &PyRayTracer::drain_records_display,
+             py::arg("max_n"),
+             py::arg("image_res"),
+             py::arg("view_radius"),
+             py::arg("sensor_half_w"),
+             py::arg("sensor_half_h"),
+             py::arg("tri_kind"),
+             py::arg("rgb_weights"),
+R"doc(Non-blocking display drain: consumes RayRecord batches and returns only small
+forward/reverse/camera RGB accumulation deltas plus counters. This avoids
+materializing million-row Python record dictionaries for the live display path.)doc")
         .def("set_min_amplitude", &PyRayTracer::set_min_amplitude,
              py::arg("eps"),
 R"doc(Set the pipeline-wide amplitude floor.  Rays with per-ray min_amplitude below this
@@ -6493,6 +6650,19 @@ pipeline has not been initialised or no completed generation is ready yet.
 When non-zero the texture is already owned by the shared GL namespace and the
 fence for that generation has signaled; bind it directly in the display context
 for zero-copy UV visualisation.)doc")
+        .def("get_field_display_tex_id",
+             [](PyRayTracer& self) -> uint64_t {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 return ray_pipeline_get_field_display_tex_id(self._pipeline);
+             },
+             R"doc(Return the OpenGL texture object ID of the shared field-display
+GL_TEXTURE_3D (RGBA32F). Returns 0 if GPU field display is unavailable.)doc")
+        .def("request_field_display_clear",
+             [](PyRayTracer& self) {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 ray_pipeline_request_field_display_clear(self._pipeline);
+             },
+             R"doc(Request clearing the GPU field-display accumulator on the GPU thread.)doc")
         .def("set_uv_blit_weights",
              [](PyRayTracer& self,
                 py::array_t<float, py::array::c_style | py::array::forcecast> weights,

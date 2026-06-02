@@ -91,8 +91,41 @@ typedef unsigned int   GLbitfield;
 #ifndef GL_RGBA16F
 #  define GL_RGBA16F                      0x881A
 #endif
+#ifndef GL_RGBA32F
+#  define GL_RGBA32F                      0x8814
+#endif
+#ifndef GL_RGBA
+#  define GL_RGBA                         0x1908
+#endif
+#ifndef GL_TEXTURE_3D
+#  define GL_TEXTURE_3D                   0x806F
+#endif
+#ifndef GL_TEXTURE_MIN_FILTER
+#  define GL_TEXTURE_MIN_FILTER           0x2801
+#endif
+#ifndef GL_TEXTURE_MAG_FILTER
+#  define GL_TEXTURE_MAG_FILTER           0x2800
+#endif
+#ifndef GL_TEXTURE_WRAP_S
+#  define GL_TEXTURE_WRAP_S               0x2802
+#endif
+#ifndef GL_TEXTURE_WRAP_T
+#  define GL_TEXTURE_WRAP_T               0x2803
+#endif
+#ifndef GL_TEXTURE_WRAP_R
+#  define GL_TEXTURE_WRAP_R               0x8072
+#endif
+#ifndef GL_CLAMP_TO_EDGE
+#  define GL_CLAMP_TO_EDGE                0x812F
+#endif
+#ifndef GL_LINEAR
+#  define GL_LINEAR                       0x2601
+#endif
 #ifndef GL_SHADER_IMAGE_ACCESS_BARRIER_BIT
 #  define GL_SHADER_IMAGE_ACCESS_BARRIER_BIT  0x00000020
+#endif
+#ifndef GL_TEXTURE_FETCH_BARRIER_BIT
+#  define GL_TEXTURE_FETCH_BARRIER_BIT        0x00000008
 #endif
 #ifndef GL_SYNC_GPU_COMMANDS_COMPLETE
 #  define GL_SYNC_GPU_COMMANDS_COMPLETE 0x9117

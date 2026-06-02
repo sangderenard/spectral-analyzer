@@ -7670,6 +7670,7 @@ public:
         (27 + 2 * MAX_SPECTRAL_BANDS) * static_cast<int>(sizeof(float));
 
     GLuint prog_t1 = 0, prog_t2 = 0, prog_t3 = 0, prog_t4 = 0;
+    GLuint prog_field_accum = 0, prog_field_resolve = 0;
     GLuint prog_dispatch_prep = 0;
     struct { GLint bdpt_count_base = -1; } uloc_prep;
     /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
@@ -7828,6 +7829,15 @@ public:
     std::chrono::steady_clock::time_point last_uv_readback_t = std::chrono::steady_clock::now();
     std::atomic<double> uv_readback_interval_s{1.0};
 
+    GLuint ssbo_field_display_accum = 0; /* signed fixed-point complex per band/cell */
+    GLuint tex_field_display_rgb = 0;    /* shared GL_TEXTURE_3D, RGBA32F */
+    int field_display_nx = 0, field_display_ny = 0, field_display_nz = 0;
+    int field_display_bands = 0;
+    uint64_t field_display_generation = 0;
+    mutable std::mutex field_display_mu;
+    std::atomic<bool> field_display_clear_requested{false};
+    static constexpr float FIELD_DISPLAY_FIXED_SCALE = 1048576.0f;
+
     /* Scene data uploaded once */
     bool scene_uploaded = false;
 
@@ -7898,6 +7908,137 @@ public:
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, id);
         glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, bytes, dst);
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    }
+
+    bool ensure_field_display_volume(const RayTracerState& st) {
+        if (!display_context_shared || prog_field_accum == 0 || prog_field_resolve == 0)
+            return false;
+        if (!st.camera_field_grid)
+            return false;
+        int nx = 0, ny = 0, nz = 0;
+        if (field_grid_regular_dims(st.camera_field_grid, &nx, &ny, &nz) != SK_OK)
+            return false;
+        if (nx <= 0 || ny <= 0 || nz <= 0)
+            return false;
+        const int nb = std::max(1, std::min(st.n_bands, MAX_SPECTRAL_BANDS));
+        const int64_t n_cells64 = (int64_t)nx * (int64_t)ny * (int64_t)nz;
+        if (n_cells64 <= 0 || n_cells64 > (int64_t)INT_MAX)
+            return false;
+
+        const bool changed = (nx != field_display_nx || ny != field_display_ny ||
+                              nz != field_display_nz || nb != field_display_bands ||
+                              ssbo_field_display_accum == 0 || tex_field_display_rgb == 0);
+        if (!changed)
+            return true;
+
+        field_display_nx = nx;
+        field_display_ny = ny;
+        field_display_nz = nz;
+        field_display_bands = nb;
+        const size_t accum_count = (size_t)n_cells64 * (size_t)nb * 2u;
+        ensure_ssbo(ssbo_field_display_accum, (GLsizeiptr)(accum_count * sizeof(int32_t)));
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_field_display_accum);
+        std::vector<int32_t> zeros(accum_count, 0);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)(zeros.size() * sizeof(int32_t)), zeros.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        if (tex_field_display_rgb) {
+            glDeleteTextures(1, &tex_field_display_rgb);
+            tex_field_display_rgb = 0;
+        }
+        if (!tex_field_display_rgb)
+            glGenTextures(1, &tex_field_display_rgb);
+        glBindTexture(GL_TEXTURE_3D, tex_field_display_rgb);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+        glc_TexStorage3D(GL_TEXTURE_3D, 1, GL_RGBA32F, nx, ny, nz);
+        glBindTexture(GL_TEXTURE_3D, 0);
+        {
+            std::lock_guard<std::mutex> lk(field_display_mu);
+            ++field_display_generation;
+        }
+        return glGetError() == GL_NO_ERROR;
+    }
+
+    void clear_field_display_volume() {
+        if (ssbo_field_display_accum && field_display_nx > 0 && field_display_ny > 0 &&
+            field_display_nz > 0 && field_display_bands > 0) {
+            const size_t n_cells = (size_t)field_display_nx * (size_t)field_display_ny * (size_t)field_display_nz;
+            const size_t accum_count = n_cells * (size_t)field_display_bands * 2u;
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_field_display_accum);
+            std::vector<int32_t> zeros(accum_count, 0);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                              (GLsizeiptr)(zeros.size() * sizeof(int32_t)), zeros.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+        field_display_clear_requested.store(false, std::memory_order_release);
+    }
+
+    bool dispatch_field_display_from_hits(RayPipelineState& ps, GLuint hit_ssbo, int n_hits, int n_bands) {
+        if (n_hits <= 0 || !ps.st || !ensure_field_display_volume(*ps.st))
+            return false;
+        if (field_display_clear_requested.load(std::memory_order_acquire))
+            clear_field_display_volume();
+
+        const float* bmin = field_grid_bmin(ps.st->camera_field_grid);
+        const float* bmax = field_grid_bmax(ps.st->camera_field_grid);
+        if (!bmin || !bmax) return false;
+        const int nb = std::max(1, std::min({n_bands, ps.st->n_bands, MAX_SPECTRAL_BANDS}));
+        const int n_cells = field_display_nx * field_display_ny * field_display_nz;
+
+        glc_UseProgram(prog_field_accum);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, hit_ssbo);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, ssbo_field_display_accum);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_accum, "n_hits"), n_hits);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_accum, "hit_stride"), HIT_STRIDE_BYTES / (int)sizeof(float));
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_accum, "n_bands"), nb);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_accum, "nx"), field_display_nx);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_accum, "ny"), field_display_ny);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_accum, "nz"), field_display_nz);
+        glc_Uniform3fv(glc_GetUniformLocation(prog_field_accum, "bmin"), 1, bmin);
+        glc_Uniform3fv(glc_GetUniformLocation(prog_field_accum, "bmax"), 1, bmax);
+        glc_Uniform1f(glc_GetUniformLocation(prog_field_accum, "fixed_scale"), FIELD_DISPLAY_FIXED_SCALE);
+        glc_DispatchCompute((GLuint)((n_hits + 127) / 128), 1u, 1u);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        std::array<float, MAX_SPECTRAL_BANDS * 3> weights{};
+        for (int b = 0; b < nb; ++b) {
+            double wr = 0.0, wg = 0.0, wb = 0.0;
+            band_to_display_rgb(b, ps.st->n_bands, ps.st->freq_hz_vec, wr, wg, wb);
+            weights[(size_t)b * 3 + 0] = (float)wr;
+            weights[(size_t)b * 3 + 1] = (float)wg;
+            weights[(size_t)b * 3 + 2] = (float)wb;
+        }
+
+        glc_UseProgram(prog_field_resolve);
+        glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo_field_display_accum);
+        glc_BindImageTexture(0, tex_field_display_rgb, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_resolve, "n_cells"), n_cells);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_resolve, "n_bands"), nb);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_resolve, "nx"), field_display_nx);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_resolve, "ny"), field_display_ny);
+        glc_Uniform1i(glc_GetUniformLocation(prog_field_resolve, "nz"), field_display_nz);
+        glc_Uniform1f(glc_GetUniformLocation(prog_field_resolve, "inv_fixed_scale"), 1.0f / FIELD_DISPLAY_FIXED_SCALE);
+        glc_Uniform3fv(glc_GetUniformLocation(prog_field_resolve, "rgb_w"), nb, weights.data());
+        glc_DispatchCompute((GLuint)((n_cells + 127) / 128), 1u, 1u);
+        glc_MemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT | GL_SHADER_STORAGE_BARRIER_BIT);
+        glc_UseProgram(0);
+        {
+            std::lock_guard<std::mutex> lk(field_display_mu);
+            ++field_display_generation;
+        }
+        return glGetError() == GL_NO_ERROR;
+    }
+
+    uint64_t published_field_display_texture() const {
+        std::lock_guard<std::mutex> lk(field_display_mu);
+        return (field_display_nx > 0 && field_display_ny > 0 && field_display_nz > 0)
+            ? static_cast<uint64_t>(tex_field_display_rgb)
+            : 0u;
     }
 
     /* Re-sync parametric SSBOs from current CPU state.
@@ -8080,14 +8221,17 @@ public:
         /* load_with_preamble: injects bvh_shadow.glsl.inc (with binding #defines
          * prepended) into the shader after its #version line, using the native
          * multi-source glShaderSource path in gl_compute_build_program2. */
+        const bool gpu_required = cfg.gpu_all_stages;
+
         auto load_with_shadow_bvh = [&](const std::string& name, GLuint& prog,
                                         int bvh_bind, int tri_id_bind, int tri_full_bind) -> bool {
             std::string src, inc;
             if (!read_shader_file(name, src)) return false;
             if (!read_shader_file("bvh_shadow.glsl.inc", inc)) {
-                /* Missing .inc is non-fatal: fall back to plain load (no shadow test). */
-                fprintf(stderr, "[gpu-dispatch] bvh_shadow.glsl.inc not found (%s) — shadow test disabled\n", err);
+                fprintf(stderr, "[gpu-dispatch] bvh_shadow.glsl.inc not found (%s)%s\n",
+                        err, gpu_required ? "" : " — shadow test disabled");
                 fflush(stderr);
+                if (gpu_required) return false;
                 prog = gl_compute_build_program(src.c_str(), err, sizeof(err));
                 return prog != 0;
             }
@@ -8103,29 +8247,37 @@ public:
             return prog != 0;
         };
 
-        if (!load("ray_bvh_intersect.comp.glsl",   prog_t1)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
-        if (!load("ray_refine.comp.glsl",             prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
-        if (!load("ray_material.comp.glsl",           prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
-        if (!load("ray_wave_bpm.comp.glsl",           prog_t4)) { snprintf(ctx.error, sizeof(ctx.error), "%s", err); return false; }
+        if (!load("ray_bvh_intersect.comp.glsl", prog_t1)) { snprintf(ctx.error, sizeof(ctx.error), "ray_bvh_intersect.comp.glsl: %s", err); return false; }
+        if (!load("ray_refine.comp.glsl", prog_t2)) { snprintf(ctx.error, sizeof(ctx.error), "ray_refine.comp.glsl: %s", err); return false; }
+        if (!load("ray_material.comp.glsl", prog_t3)) { snprintf(ctx.error, sizeof(ctx.error), "ray_material.comp.glsl: %s", err); return false; }
+        if (!load("ray_wave_bpm.comp.glsl", prog_t4)) { snprintf(ctx.error, sizeof(ctx.error), "ray_wave_bpm.comp.glsl: %s", err); return false; }
+        if (!load("field_display_accum.comp.glsl", prog_field_accum)) { snprintf(ctx.error, sizeof(ctx.error), "field_display_accum.comp.glsl: %s", err); return false; }
+        if (!load("field_display_resolve.comp.glsl", prog_field_resolve)) { snprintf(ctx.error, sizeof(ctx.error), "field_display_resolve.comp.glsl: %s", err); return false; }
         if (!load("dispatch_prep.comp.glsl",   prog_dispatch_prep)) {
-            fprintf(stderr, "[gpu-dispatch] dispatch_prep.comp.glsl failed (%s) — falling back to CPU n_hits readback\n", err);
+            fprintf(stderr, "[gpu-dispatch] dispatch_prep.comp.glsl failed (%s)%s\n",
+                    err, gpu_required ? "" : " — falling back to CPU n_hits readback");
             fflush(stderr);
+            if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "dispatch_prep.comp.glsl: %s", err); return false; }
             prog_dispatch_prep = 0;
         }
         /* T5 full-connect shader — compiled with BVH shadow preamble injected.
          * BvhBuf→binding 5, TriIdBuf→binding 6, TriFullBuf→binding 7.
          * Non-fatal; GPU T5 path disabled if absent or compilation fails. */
         if (!load_with_shadow_bvh("t5_full_connect.comp.glsl", prog_t5, 5, 6, 7)) {
-            fprintf(stderr, "[gpu-dispatch] t5_full_connect.comp.glsl not loaded (%s) — GPU T5 disabled\n", err);
+            fprintf(stderr, "[gpu-dispatch] t5_full_connect.comp.glsl not loaded (%s)%s\n",
+                    err, gpu_required ? "" : " — GPU T5 disabled");
             fflush(stderr);
+            if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "t5_full_connect.comp.glsl: %s", err); return false; }
             prog_t5 = 0;
         }
 
         /* Load UV blit shader — non-fatal, falls back to CPU path silently */
         if (display_context_shared) {
             if (!load("uv_blit.comp.glsl", prog_uv_blit)) {
-                fprintf(stderr, "[gpu-dispatch] uv_blit.comp.glsl not loaded (%s) — GPU blit disabled\n", err);
+                fprintf(stderr, "[gpu-dispatch] uv_blit.comp.glsl not loaded (%s)%s\n",
+                        err, gpu_required ? "" : " — GPU blit disabled");
                 fflush(stderr);
+                if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "uv_blit.comp.glsl: %s", err); return false; }
                 prog_uv_blit = 0;
             } else {
                 uloc_blit.n_uv_groups  = glc_GetUniformLocation(prog_uv_blit, "n_uv_groups");
@@ -8961,8 +9113,11 @@ public:
                 fence_hit[prev_idx] = nullptr;
             }
 
+            const bool gpu_field_display_done =
+                dispatch_field_display_from_hits(ps, prev_hit_ssbo(), n_hits, nb);
             const bool do_field = ps.cfg.gpu_segment_field_capture
-                                  && ps.st && ps.st->camera_field_grid;
+                                  && ps.st && ps.st->camera_field_grid
+                                  && !gpu_field_display_done;
             static constexpr int Q_OUT_VIS_CAP = 4'000'000;
             /* Skip the hit readback entirely when Q_out is already full, field
              * capture is disabled, and there are no parametric groups to count. */
@@ -11101,11 +11256,25 @@ RayPipelineState* ray_pipeline_create(
                 }
             });
         } else {
+            const char* gpu_err = ps->gpu_dispatch->ctx.error[0] ? ps->gpu_dispatch->ctx.error : "unknown error";
+            if (ps->cfg.gpu_all_stages) {
+                fprintf(stderr, "[gpu-dispatch] GL init FAILED (%s) — GPU required, aborting pipeline creation\n",
+                        gpu_err);
+                fflush(stderr);
+                printf("[gpu-dispatch] GL init FAILED (%s) — GPU required, aborting pipeline creation\n",
+                       gpu_err);
+                fflush(stdout);
+                ps->gpu_dispatch_state.store(4, std::memory_order_release);
+                delete ps->gpu_dispatch;
+                ps->gpu_dispatch = nullptr;
+                delete ps;
+                return nullptr;
+            }
             fprintf(stderr, "[gpu-dispatch] GL init FAILED (%s) — falling back to CPU\n",
-                    ps->gpu_dispatch->ctx.error[0] ? ps->gpu_dispatch->ctx.error : "unknown error");
+                    gpu_err);
             fflush(stderr);
             printf("[gpu-dispatch] GL init FAILED (%s) — falling back to CPU\n",
-                   ps->gpu_dispatch->ctx.error[0] ? ps->gpu_dispatch->ctx.error : "unknown error");
+                   gpu_err);
             fflush(stdout);
             ps->gpu_dispatch_state.store(1, std::memory_order_release);
             delete ps->gpu_dispatch;
@@ -12526,6 +12695,18 @@ uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps)
 {
     if (!ps || !ps->gpu_dispatch) return 0;
     return const_cast<RayPipelineState::GlPipelineDispatch*>(ps->gpu_dispatch)->get_uv_pages_tex_id();
+}
+
+uint64_t ray_pipeline_get_field_display_tex_id(const RayPipelineState* ps)
+{
+    if (!ps || !ps->gpu_dispatch) return 0;
+    return const_cast<RayPipelineState::GlPipelineDispatch*>(ps->gpu_dispatch)->published_field_display_texture();
+}
+
+void ray_pipeline_request_field_display_clear(RayPipelineState* ps)
+{
+    if (!ps || !ps->gpu_dispatch) return;
+    ps->gpu_dispatch->field_display_clear_requested.store(true, std::memory_order_release);
 }
 
 void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,

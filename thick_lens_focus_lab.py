@@ -16,6 +16,7 @@ import threading
 import ctypes
 import time
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -76,6 +77,38 @@ C_LIGHT = 299_792_458.0
 BDPT_PIPELINE_CAP = 25_000_000
 DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 380e-9, MAX_SPECTRAL_BANDS)).astype(np.float64)
 DEBUG_BDPT_BACKTRACE_ONLY_DEFAULT = False
+RAY_RECORD_MAX_BANDS = 32
+
+
+class RayRecordC(ctypes.Structure):
+    _fields_ = [
+        ("kind", ctypes.c_uint8),
+        ("tag", ctypes.c_uint64),
+        ("src_id", ctypes.c_int32),
+        ("bounce", ctypes.c_int32),
+        ("seg_start", ctypes.c_float * 3),
+        ("pos", ctypes.c_float * 3),
+        ("dir", ctypes.c_float * 3),
+        ("normal", ctypes.c_float * 3),
+        ("path_len", ctypes.c_float),
+        ("path_at_seg_start", ctypes.c_float),
+        ("hit_tri", ctypes.c_int32),
+        ("hit_group_id", ctypes.c_int32),
+        ("mat_idx", ctypes.c_int32),
+        ("bary_u", ctypes.c_float),
+        ("bary_v", ctypes.c_float),
+        ("arena_id", ctypes.c_int32),
+        ("is_sensor", ctypes.c_bool),
+        ("sensor_group_id", ctypes.c_int32),
+        ("n_bands", ctypes.c_int32),
+        ("amp_re", ctypes.c_float * RAY_RECORD_MAX_BANDS),
+        ("amp_im", ctypes.c_float * RAY_RECORD_MAX_BANDS),
+        ("color_flag", ctypes.c_uint8),
+        ("sensor_origin_y", ctypes.c_float),
+        ("sensor_origin_z", ctypes.c_float),
+    ]
+
+
 # When False (the default), backward-sensor sub-path records (PIXEL_CONE /
 # APERTURE_PUPIL) are NOT deposited into the physical 3-D field grid because
 # they are unresolved half-paths.  Set True only to restore legacy behaviour
@@ -191,6 +224,57 @@ def _wavelength_to_rgb_weights(wl_nm: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(out, dtype=np.float64)
 
 
+@lru_cache(maxsize=32)
+def _rgb_weights_for_freq_key(freq_key: bytes, n_bands: int, dtype_str: str, clip_visible: bool) -> np.ndarray:
+    freq = np.frombuffer(freq_key, dtype=np.float64, count=int(n_bands))
+    wl_nm = (C_LIGHT / np.maximum(freq, EPS)) * 1.0e9
+    if clip_visible:
+        wl_nm = np.clip(wl_nm, 380.0, 700.0)
+    weights = _wavelength_to_rgb_weights(wl_nm)
+    return np.ascontiguousarray(weights.astype(np.dtype(dtype_str), copy=False))
+
+
+def _rgb_weights_for_freq(
+    freq_hz: np.ndarray,
+    n_bands: int | None = None,
+    dtype=np.float64,
+    *,
+    clip_visible: bool = False,
+) -> np.ndarray:
+    f = np.ascontiguousarray(np.asarray(freq_hz, dtype=np.float64).reshape(-1), dtype=np.float64)
+    n = int(f.size if n_bands is None else min(int(n_bands), int(f.size)))
+    if n <= 0:
+        return np.zeros((0, 3), dtype=np.dtype(dtype))
+    f = np.ascontiguousarray(f[:n], dtype=np.float64)
+    return _rgb_weights_for_freq_key(f.tobytes(), n, np.dtype(dtype).str, bool(clip_visible))
+
+
+def _lookup_tag_values(tags: np.ndarray, mapping: Dict[int, float], fallback: float, dtype=np.float32) -> np.ndarray:
+    """Vectorized exact lookup for packed ray tags with scalar fallback."""
+    tag_arr = np.asarray(tags, dtype=np.uint64).reshape(-1)
+    out_dtype = np.dtype(dtype)
+    if tag_arr.size == 0:
+        return np.zeros(0, dtype=out_dtype)
+    if not mapping:
+        return np.full(tag_arr.shape[0], fallback, dtype=out_dtype)
+
+    keys = np.fromiter(mapping.keys(), dtype=np.uint64, count=len(mapping))
+    vals = np.fromiter(mapping.values(), dtype=out_dtype, count=len(mapping))
+    order = np.argsort(keys)
+    keys = keys[order]
+    vals = vals[order]
+
+    pos = np.searchsorted(keys, tag_arr)
+    hit = pos < keys.shape[0]
+    if np.any(hit):
+        hit_idx = np.nonzero(hit)[0]
+        hit[hit_idx] = keys[pos[hit_idx]] == tag_arr[hit_idx]
+    out = np.full(tag_arr.shape[0], fallback, dtype=out_dtype)
+    if np.any(hit):
+        out[hit] = vals[pos[hit]]
+    return out
+
+
 def _sensor_rgb_sensitivity_bands(freq_hz: np.ndarray) -> np.ndarray:
     """Return RGB sensor emission spectra as (3, n_bands), normalized per row."""
     f = np.asarray(freq_hz, dtype=np.float64).reshape(-1)
@@ -249,8 +333,7 @@ def _free_frequency_hits_to_rgb(
     if f.size <= 0:
         return np.zeros((n, n, 3), dtype=np.float32)
 
-    wl_nm = np.clip(C_LIGHT / np.maximum(f, EPS) * 1.0e9, 380.0, 700.0)
-    w_rgb = _wavelength_to_rgb_weights(wl_nm)
+    w_rgb = _rgb_weights_for_freq(f, clip_visible=True)
 
     rgb_lin = np.zeros((n * n, 3), dtype=np.float64)
     pr = np.asarray(power, dtype=np.float64)
@@ -280,8 +363,7 @@ def _spectral_image_to_rgb(image_b_h_w: np.ndarray, freq_hz: np.ndarray) -> np.n
     if n_b <= 0:
         return np.zeros((p.shape[1], p.shape[2], 3), dtype=np.float32)
 
-    wl_nm = np.clip(C_LIGHT / np.maximum(f[:n_b], EPS) * 1.0e9, 380.0, 700.0)
-    w_rgb = _wavelength_to_rgb_weights(wl_nm)
+    w_rgb = _rgb_weights_for_freq(f, n_b, clip_visible=True)
     rgb = np.tensordot(p[:n_b], w_rgb, axes=(0, 0))
 
     white = float(np.percentile(rgb, 99.8)) if rgb.size else 0.0
@@ -3876,8 +3958,7 @@ class UvPageBank:
         for g in self.groups:
             if g.warm_page is not None:
                 tex[g.layer] = np.asarray(g.warm_page, dtype=np.float32)
-        wl_nm = (C_LIGHT / np.maximum(np.asarray(freq_hz, dtype=np.float64)[:self.n_bands], EPS)) * 1.0e9
-        rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
+        rgb_w = _rgb_weights_for_freq(freq_hz, self.n_bands, np.float32)
         for g in self.groups:
             if g.group_id < 0:
                 continue
@@ -4456,6 +4537,8 @@ class SensorRayCache:
             self.tags = np.zeros((0,), dtype=np.uint64)
             self.film_uv = np.zeros((0, 2), dtype=np.float32)
             self.channel_idx = np.zeros((0,), dtype=np.uint8)
+            self.src_ids = np.zeros((0,), dtype=np.int32)
+            self.color_flags = np.zeros((0,), dtype=np.uint8)
             self.cursor = 0
             self.signature: Optional[Tuple[object, ...]] = None
             self._has_completed = False
@@ -4492,6 +4575,8 @@ class SensorRayCache:
             self.tags = t
             self.film_uv = uv
             self.channel_idx = ch
+            self.src_ids = np.zeros(n, dtype=np.int32)
+            self.color_flags = np.ones(n, dtype=np.uint8)
             self.signature = signature
             if reset_cursor:
                 self.cursor = 0
@@ -4514,15 +4599,32 @@ class SensorRayCache:
             n_take = n_req if wrap else min(n_req, total - self.cursor)
             if n_take <= 0:
                 return None
-            idx = (np.arange(n_take, dtype=np.int64) + int(self.cursor)) % total
-            out = {
-                "origins": np.ascontiguousarray(self.origins[idx], dtype=np.float64),
-                "directions": np.ascontiguousarray(self.directions[idx], dtype=np.float64),
-                "amplitudes": np.ascontiguousarray(self.amplitudes[idx], dtype=np.complex128),
-                "tags": np.ascontiguousarray(self.tags[idx], dtype=np.uint64),
-                "film_uv": np.ascontiguousarray(self.film_uv[idx], dtype=np.float32),
-                "channel_idx": np.ascontiguousarray(self.channel_idx[idx], dtype=np.uint8),
-            }
+            start = int(self.cursor)
+            stop = start + n_take
+            if stop <= total:
+                sl = slice(start, stop)
+                out = {
+                    "origins": self.origins[sl],
+                    "directions": self.directions[sl],
+                    "amplitudes": self.amplitudes[sl],
+                    "tags": self.tags[sl],
+                    "film_uv": self.film_uv[sl],
+                    "channel_idx": self.channel_idx[sl],
+                    "src_ids": self.src_ids[sl],
+                    "color_flags": self.color_flags[sl],
+                }
+            else:
+                n1 = stop - total
+                out = {
+                    "origins": np.ascontiguousarray(np.concatenate([self.origins[start:], self.origins[:n1]], axis=0), dtype=np.float64),
+                    "directions": np.ascontiguousarray(np.concatenate([self.directions[start:], self.directions[:n1]], axis=0), dtype=np.float64),
+                    "amplitudes": np.ascontiguousarray(np.concatenate([self.amplitudes[start:], self.amplitudes[:n1]], axis=0), dtype=np.complex128),
+                    "tags": np.ascontiguousarray(np.concatenate([self.tags[start:], self.tags[:n1]], axis=0), dtype=np.uint64),
+                    "film_uv": np.ascontiguousarray(np.concatenate([self.film_uv[start:], self.film_uv[:n1]], axis=0), dtype=np.float32),
+                    "channel_idx": np.ascontiguousarray(np.concatenate([self.channel_idx[start:], self.channel_idx[:n1]], axis=0), dtype=np.uint8),
+                    "src_ids": np.ascontiguousarray(np.concatenate([self.src_ids[start:], self.src_ids[:n1]], axis=0), dtype=np.int32),
+                    "color_flags": np.ascontiguousarray(np.concatenate([self.color_flags[start:], self.color_flags[:n1]], axis=0), dtype=np.uint8),
+                }
             if advance:
                 if int(self.cursor) + n_take >= total:
                     self._has_completed = True
@@ -4786,6 +4888,8 @@ class ForwardCppLensBench:
         self._last_direct_img: Optional[np.ndarray] = None
         self._bdpt_endpoints: BdptEndpointStore = BdptEndpointStore()
         self._bdpt_segments: BdptSegmentStore = BdptSegmentStore(max_rows=2_000_000)
+        self.enable_python_bdpt_diagnostics: bool = False
+        self.enable_cpp_display_drain: bool = True
         self._optical_transfers: OpticalTransferStore = OpticalTransferStore(max_rows=2_000_000)
         self._camera_samples: CameraSampleStore = CameraSampleStore(max_rows=2_000_000)
         self._sensor_ray_cache: SensorRayCache = SensorRayCache()
@@ -4864,6 +4968,7 @@ class ForwardCppLensBench:
         # Cull rays with non-finite (inf/NaN) origins or directions before GPU
         # submission.  Default on; set False only for debugging.
         self.cull_infinite_rays: bool = True
+        self.cull_sensor_cache_rays: bool = False
         self._sensor_aim_reported: bool = False
         # Whether the pipeline has been configured with adaptive thresholds yet
         self._pipeline_configured: bool = False
@@ -5367,26 +5472,31 @@ class ForwardCppLensBench:
         rng = np.random.default_rng(int(seed))
         h_offset = int(rng.integers(0, 1 << 24))
 
-        origins_l: list = []
-        dirs_l: list = []
+        origins = np.empty((n_actual, 3), dtype=np.float64)
+        directions = np.empty((n_actual, 3), dtype=np.float64)
+        h2 = _halton_seq(n_actual, 2, h_offset)
+        h3 = _halton_seq(n_actual, 3, h_offset)
+        h5 = _halton_seq(n_actual, 5, h_offset)
+        h7 = _halton_seq(n_actual, 7, h_offset)
         ray_flat = 0
 
         for ti in range(n_src):
             n_ti = int(counts[ti])
             if n_ti <= 0:
                 continue
+            sl = slice(ray_flat, ray_flat + n_ti)
 
             # UV origins on triangle — Halton(2,3), folded for full coverage.
-            u = _halton_seq(n_ti, 2, h_offset + ray_flat)
-            v = _halton_seq(n_ti, 3, h_offset + ray_flat)
+            u = h2[sl]
+            v = h3[sl]
             fold = (u + v) > 1.0
             u = np.where(fold, 1.0 - u, u)
             v = np.where(fold, 1.0 - v, v)
-            o = verts[ti, 0, :] + u[:, None] * e0[ti, :] + v[:, None] * e1[ti, :]  # (n_ti, 3)
+            origins[sl] = verts[ti, 0, :] + u[:, None] * e0[ti, :] + v[:, None] * e1[ti, :]
 
             # Cosine-hemisphere directions — Halton(5,7).
-            r1 = _halton_seq(n_ti, 5, h_offset + ray_flat)
-            r2 = _halton_seq(n_ti, 7, h_offset + ray_flat)
+            r1 = h5[sl]
+            r2 = h7[sl]
             cos_t = np.sqrt(np.maximum(0.0, r1))          # Lambertian PDF ∝ cos θ
             sin_t = np.sqrt(np.maximum(0.0, 1.0 - r1))
             phi = (2.0 * math.pi) * r2
@@ -5409,13 +5519,8 @@ class ForwardCppLensBench:
             d = lx[:, None] * tx[None, :] + ly[:, None] * ty[None, :] + lz[:, None] * n_hat[None, :]
             d_norm = np.linalg.norm(d, axis=1, keepdims=True)
             d /= np.maximum(d_norm, 1.0e-30)
-
-            origins_l.append(o)
-            dirs_l.append(d)
+            directions[sl] = d
             ray_flat += n_ti
-
-        origins = np.ascontiguousarray(np.concatenate(origins_l, axis=0) if origins_l else np.zeros((0, 3), dtype=np.float64), dtype=np.float64)
-        directions = np.ascontiguousarray(np.concatenate(dirs_l, axis=0) if dirs_l else np.zeros((0, 3), dtype=np.float64), dtype=np.float64)
 
         # Power-compensated amplitude: amp_per_ray = gain / sqrt(n_actual)
         # so that n_actual × |amp|² = gain², preserving total optical power.
@@ -5792,6 +5897,8 @@ class ForwardCppLensBench:
                 capture_strikes=True,
                 clear_existing=True,
             )
+            if hasattr(self.tracer, "request_field_display_clear"):
+                self.tracer.request_field_display_clear()
 
     @staticmethod
     def _accumulate_image(previous: Optional[np.ndarray], current: np.ndarray, leak: float) -> np.ndarray:
@@ -6120,7 +6227,7 @@ class ForwardCppLensBench:
         max_bounces: int = 8,
         seed: int = 1,
     ) -> int:
-        pkg = self._sensor_ray_cache.package(int(rays))
+        pkg = self._sensor_ray_cache.package(int(rays), wrap=False)
         if pkg is None:
             return 0
         n = int(pkg["origins"].shape[0])
@@ -6129,10 +6236,10 @@ class ForwardCppLensBench:
         origins = pkg["origins"]
         directions = pkg["directions"]
         amplitudes = pkg["amplitudes"]
-        src_ids = np.zeros(n, dtype=np.int32)
-        cflag_arr = np.ones(n, dtype=np.uint8)
+        src_ids = pkg.get("src_ids", np.zeros(n, dtype=np.int32))
+        cflag_arr = pkg.get("color_flags", np.ones(n, dtype=np.uint8))
         tag_arr = pkg["tags"]
-        if self.cull_infinite_rays:
+        if self.cull_infinite_rays and self.cull_sensor_cache_rays:
             origins, directions, amplitudes, src_ids, cflag_arr, tag_arr = _cull_finite_rays(
                 origins, directions, amplitudes, src_ids, cflag_arr, tag_arr, label="sensor-cache")
             n = int(origins.shape[0])
@@ -6367,6 +6474,8 @@ class ForwardCppLensBench:
         Called as the very first operation on every drain batch so BDPT
         accumulates endpoints with zero pipeline delay.
         """
+        if not bool(getattr(self, "enable_python_bdpt_diagnostics", False)):
+            return
         self._append_bdpt_segment_records(records)
         kinds   = np.asarray(records["kind"], dtype=np.uint8)
         strike  = kinds == 0
@@ -6432,18 +6541,40 @@ class ForwardCppLensBench:
         _empty_polls    = 0
         while not self._drain_stop.is_set():
             try:
-                records = self.tracer.drain_records_slim(max_n=_max_batch)
-                n       = int(records["kind"].shape[0]) if records else 0
+                use_cpp_display = (
+                    bool(getattr(self, "enable_cpp_display_drain", True)) and
+                    not bool(getattr(self, "enable_python_bdpt_diagnostics", False)) and
+                    hasattr(self.tracer, "drain_records_display")
+                )
+                if use_cpp_display:
+                    plate = self.scene.image_plate
+                    records = self.tracer.drain_records_display(
+                        int(_max_batch),
+                        int(self._forward_img_res),
+                        float(self.scene.view_radius),
+                        float(max(1.0e-9, getattr(plate, "sensor_half_w", getattr(plate, "radius", 0.0)))),
+                        float(max(1.0e-9, getattr(plate, "sensor_half_h", getattr(plate, "radius", 0.0)))),
+                        np.ascontiguousarray(getattr(self, "tri_kind", np.zeros(0, dtype=np.int8)), dtype=np.int8),
+                        _rgb_weights_for_freq(self.freq_hz, self.n_bands, np.float32),
+                    )
+                    n = int(records.get("n", 0)) if records else 0
+                else:
+                    records = self.tracer.drain_records_slim(max_n=_max_batch)
+                    n       = int(records["kind"].shape[0]) if records else 0
                 if n > 0:
                     _empty_polls = 0
-                    # BDPT endpoint accumulation must run immediately — correctness path
-                    self._fast_bdpt_feed(records)
-                    # Hand off to vis thread; drop the frame if the queue is full so
-                    # the drain thread never blocks waiting for visualization.
-                    try:
-                        self._vis_queue.put_nowait(records)
-                    except queue.Full:
-                        pass
+                    if use_cpp_display:
+                        self._accumulate_display_drain(records)
+                    else:
+                        # BDPT endpoint accumulation must run immediately when
+                        # Python diagnostics are explicitly enabled.
+                        self._fast_bdpt_feed(records)
+                        # Hand off to vis thread; drop the frame if the queue is full so
+                        # the drain thread never blocks waiting for visualization.
+                        try:
+                            self._vis_queue.put_nowait(records)
+                        except queue.Full:
+                            pass
 
                     # ── Live GPU profiling (count-gated) ─────────────────────
                     if not self._gpu_calibrated:
@@ -6475,6 +6606,24 @@ class ForwardCppLensBench:
             except Exception as _drain_exc:
                 print(f"[drain-loop ERROR] {_drain_exc}", flush=True)
                 time.sleep(0.1)
+
+    def _accumulate_display_drain(self, drained: dict) -> None:
+        if not drained:
+            return
+        fwd = np.asarray(drained.get("forward", []), dtype=np.float32)
+        rev = np.asarray(drained.get("reverse", []), dtype=np.float32)
+        cam = np.asarray(drained.get("camera", []), dtype=np.float32)
+        with self._segs_lock:
+            if fwd.shape == self._forward_img_accum.shape:
+                self._forward_img_accum += fwd
+            if rev.shape == self._reverse_img_accum.shape:
+                self._reverse_img_accum += rev
+            if cam.shape == self._camera_perspective_accum.shape:
+                self._camera_perspective_accum += cam
+            self._async_forward_strike_count += int(drained.get("fwd_strikes", 0))
+            self._async_backward_strike_count += int(drained.get("rev_strikes", 0))
+            self._async_forward_lens_hit_count += int(drained.get("fwd_lens_hits", 0))
+            self._async_forward_lens_hit_after_bounce_count += int(drained.get("fwd_lens_after_bounce", 0))
 
     def _vis_loop(self) -> None:
         """Slow vis thread: consumes raw records from _vis_queue and accumulates them
@@ -6640,8 +6789,7 @@ class ForwardCppLensBench:
                 nb_img = min(int(re_img.shape[1]), self.n_bands)
                 if nb_img > 0:
                     mag = np.sqrt(np.maximum(0.0, re_img[:, :nb_img] ** 2 + im_img[:, :nb_img] ** 2))
-                    wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:nb_img], dtype=np.float64), EPS)) * 1.0e9
-                    rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
+                    rgb_w = _rgb_weights_for_freq(self.freq_hz, nb_img, np.float32)
                     rgb = np.einsum("nb,bc->nc", mag, rgb_w[:nb_img], optimize=True).astype(np.float32)
                 else:
                     rgb = np.repeat(amp_v[mask][m_img, None], 3, axis=1).astype(np.float32)
@@ -6697,8 +6845,7 @@ class ForwardCppLensBench:
             nb_img = min(int(re_img.shape[1]), self.n_bands)
             if nb_img > 0:
                 mag = np.sqrt(np.maximum(0.0, re_img[:, :nb_img] ** 2 + im_img[:, :nb_img] ** 2))
-                wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:nb_img], dtype=np.float64), EPS)) * 1.0e9
-                rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
+                rgb_w = _rgb_weights_for_freq(self.freq_hz, nb_img, np.float32)
                 rgb = np.einsum("nb,bc->nc", mag, rgb_w[:nb_img], optimize=True).astype(np.float32)
             else:
                 rgb = np.repeat(amp_v[mask][m_img, None], 3, axis=1).astype(np.float32)
@@ -6843,10 +6990,11 @@ class ForwardCppLensBench:
             if film_uv.ndim == 2 and film_uv.shape[0] == vm_pos.shape[0] and film_uv.shape[1] >= 2:
                 new["film_uv"] = np.clip(film_uv[event_idx, :2], 0.0, 1.0)
         tag_event = np.asarray(vm_tags[event_idx], dtype=np.uint64)
-        bwd_lookup = np.fromiter(
-            (self._backward_launch_pdf_by_tag.get(int(t), self._last_backward_aperture_pdf) for t in tag_event),
-            dtype=np.float32,
-            count=int(tag_event.shape[0]),
+        bwd_lookup = _lookup_tag_values(
+            tag_event,
+            self._backward_launch_pdf_by_tag,
+            self._last_backward_aperture_pdf,
+            np.float32,
         )
         new["launch_pdf"] = np.where(
             base_is_bwd[ev_rel],
@@ -6946,24 +7094,19 @@ class ForwardCppLensBench:
         rows["path_len"] = path_len[event_idx].astype(np.float32, copy=False)
         is_bwd_ev = cflags[event_idx] == 1
         tag_event = np.asarray(tags[event_idx], dtype=np.uint64)
-        bwd_strat = np.fromiter(
-            (self._backward_launch_pdf_by_tag.get(int(t), self._last_backward_aperture_pdf) for t in tag_event),
-            dtype=np.float32,
-            count=int(tag_event.shape[0]),
+        bwd_strat = _lookup_tag_values(
+            tag_event,
+            self._backward_launch_pdf_by_tag,
+            self._last_backward_aperture_pdf,
+            np.float32,
         )
-        bwd_area = np.fromiter(
-            (self._backward_area_pdf_by_tag.get(
-                int(t),
-                self._last_backward_film_pdf * self._last_backward_aperture_pdf,
-            ) for t in tag_event),
-            dtype=np.float32,
-            count=int(tag_event.shape[0]),
+        bwd_area = _lookup_tag_values(
+            tag_event,
+            self._backward_area_pdf_by_tag,
+            self._last_backward_film_pdf * self._last_backward_aperture_pdf,
+            np.float32,
         )
-        bwd_jac = np.fromiter(
-            (self._backward_jacobian_by_tag.get(int(t), 0.0) for t in tag_event),
-            dtype=np.float32,
-            count=int(tag_event.shape[0]),
-        )
+        bwd_jac = _lookup_tag_values(tag_event, self._backward_jacobian_by_tag, 0.0, np.float32)
 
         # Build scatter-PDF columns from the BdptPdfRecord join; fall back to
         # the camera launch PDF for backward rays without a scatter match.
@@ -8168,11 +8311,12 @@ class ForwardCppLensBench:
     def display_pipeline_records(
         self,
         field_gain: float = 1.0,
-    ) -> Tuple[np.ndarray, List[np.ndarray]]:
+    ) -> Tuple[Optional[np.ndarray], List[np.ndarray]]:
         """Return field texels and per-class surface-hit vertices from pipeline records.
 
         Returns:
-            field_rgb : float32 (Z, Y, X, 3) — 3D texture for volume raycasting
+            field_rgb : float32 (Z, Y, X, 3), or None when the GPU display
+                path owns a shared persistent GL_TEXTURE_3D for volume raycasting.
             verts_by_class : list of 4 float32 (N, 4) arrays, one per display class:
                 [0] forward strikes (emissive → surface)
                 [1] forward volume  (emissive → wave arena)
@@ -8183,23 +8327,31 @@ class ForwardCppLensBench:
         _empty4 = np.zeros((0, 4), dtype=np.float32)
 
         with self._trace_lock:
-            grid = np.asarray(self.tracer.get_field_capture_grid_reim(), dtype=np.float32)
-            if grid.ndim != 3 or grid.shape[2] != 2:
-                raise RuntimeError("field capture grid has unexpected shape")
-            n_vox = int(self._field_nx * self._field_ny * self._field_nz)
-            if int(grid.shape[1]) != n_vox:
-                raise RuntimeError("field capture grid size does not match configured volume")
+            gpu_field_tex = 0
+            if self.compute_mode == "gpu" and hasattr(self.tracer, "get_field_display_tex_id"):
+                try:
+                    gpu_field_tex = int(self.tracer.get_field_display_tex_id())
+                except Exception:
+                    gpu_field_tex = 0
+            if gpu_field_tex > 0:
+                field_rgb = None
+            else:
+                grid = np.asarray(self.tracer.get_field_capture_grid_reim(), dtype=np.float32)
+                if grid.ndim != 3 or grid.shape[2] != 2:
+                    raise RuntimeError("field capture grid has unexpected shape")
+                n_vox = int(self._field_nx * self._field_ny * self._field_nz)
+                if int(grid.shape[1]) != n_vox:
+                    raise RuntimeError("field capture grid size does not match configured volume")
 
-            amp = np.sqrt(np.maximum(0.0, grid[..., 0] ** 2 + grid[..., 1] ** 2))
-            # Keep the field texture in raw persistent exposure units.  Do not
-            # percentile-normalize per frame: that makes accumulated light appear
-            # to fade whenever a newer/brighter voxel changes the white point.
-            bands = min(int(amp.shape[0]), int(self.freq_hz.shape[0]))
-            wl_nm = (C_LIGHT / np.maximum(np.asarray(self.freq_hz[:bands], dtype=np.float64), EPS)) * 1.0e9
-            rgb_w = _wavelength_to_rgb_weights(wl_nm).astype(np.float32)
-            rgb_flat = np.einsum("bn,bc->nc", amp[:bands], rgb_w, optimize=True)
-            field_rgb = rgb_flat.reshape((self._field_nz, self._field_ny, self._field_nx, 3))
-            field_rgb = np.maximum(field_rgb, 0.0) * float(max(0.0, field_gain))
+                amp = np.sqrt(np.maximum(0.0, grid[..., 0] ** 2 + grid[..., 1] ** 2))
+                # Keep the field texture in raw persistent exposure units.  Do not
+                # percentile-normalize per frame: that makes accumulated light appear
+                # to fade whenever a newer/brighter voxel changes the white point.
+                bands = min(int(amp.shape[0]), int(self.freq_hz.shape[0]))
+                rgb_w = _rgb_weights_for_freq(self.freq_hz, bands, np.float32)
+                rgb_flat = np.einsum("bn,bc->nc", amp[:bands], rgb_w, optimize=True)
+                field_rgb = rgb_flat.reshape((self._field_nz, self._field_ny, self._field_nx, 3))
+                field_rgb = np.maximum(field_rgb, 0.0) * float(max(0.0, field_gain))
 
         # ── Build per-class vertex arrays from the pipeline ring buffer ──────
         x_span  = max(EPS, float(self.scene.x_max - self.scene.x_min))
@@ -8276,7 +8428,7 @@ class ForwardCppLensBench:
                 verts_by_class[cls] = np.ascontiguousarray(v)
                 n_by_class[cls]     = v.shape[0]
 
-        field_nonzero = int(np.count_nonzero(np.maximum.reduce(field_rgb, axis=3)))
+        field_nonzero = -1 if field_rgb is None else int(np.count_nonzero(np.maximum.reduce(field_rgb, axis=3)))
         self._display_report_call_count += 1
         report_now = (self._display_report_call_count % 256 == 1)
         t_report = 0.0  # unused
@@ -8305,14 +8457,14 @@ class ForwardCppLensBench:
 
             print(
                 "[display-records]",
-                f"field_nonzero={field_nonzero}",
+                f"field_nonzero={field_nonzero if field_nonzero >= 0 else 'gpu'}",
                 f"pts={[n_by_class[c] for c in range(6)]}",
                 f"pipeline={self._display_last_pipeline_summary}",
                 flush=True,
             )
 
         return (
-            np.ascontiguousarray(np.maximum(field_rgb, 0.0).astype(np.float32)),
+            None if field_rgb is None else np.ascontiguousarray(np.maximum(field_rgb, 0.0).astype(np.float32)),
             verts_by_class,
         )
 
@@ -9333,8 +9485,7 @@ def run(
         bench.tracer.set_gl_display_hglrc(_gl_display_hglrc)
         # Pre-upload RGB weights for the GPU blit shader.
         try:
-            _wl_nm = np.clip(C_LIGHT / np.maximum(bench.freq_hz, EPS) * 1.0e9, 380.0, 700.0)
-            _blit_w = _wavelength_to_rgb_weights(_wl_nm).astype(np.float32)
+            _blit_w = _rgb_weights_for_freq(bench.freq_hz, dtype=np.float32, clip_visible=True)
             bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
             print(f"[gl-share] UV blit weights uploaded ({len(bench.freq_hz)} bands)", flush=True)
         except Exception as _bw_err:
@@ -10152,7 +10303,7 @@ def run(
         try:
             _vf_res = int(max(16, scene.image_plate.sensor_res))
             _vf_ap  = 32
-            _vf_pkg = int(max(4096, _vf_res * _vf_res * _vf_ap))
+            _vf_pkg = int(min(max(4096, _vf_res * _vf_res * _vf_ap), 65_536))
             bench.refresh_sensor_viewfinder(
                 rays=_vf_pkg,
                 pixels=_vf_res,
@@ -11639,8 +11790,7 @@ def run(
                 new_bench.tracer.set_gl_display_hdc(_gl_display_hdc)
             new_bench.tracer.set_gl_display_hglrc(_gl_display_hglrc)
             try:
-                _wl_nm = np.clip(C_LIGHT / np.maximum(new_bench.freq_hz, EPS) * 1.0e9, 380.0, 700.0)
-                _blit_w = _wavelength_to_rgb_weights(_wl_nm).astype(np.float32)
+                _blit_w = _rgb_weights_for_freq(new_bench.freq_hz, dtype=np.float32, clip_visible=True)
                 new_bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
             except Exception as exc:
                 print(f"[bench-rebuild] blit weight upload failed: {exc}", flush=True)
@@ -12097,8 +12247,13 @@ def run(
                     if frame_profiler is not None:
                         frame_profiler.end("display_records")
                         frame_profiler.begin("upload_volume")
-                    upload_volume(tex_field, field_texels)
-                    _gl_renderer.set_field_volume_texture(int(tex_field), field_gain)
+                    if field_texels is None and hasattr(bench.tracer, "get_field_display_tex_id"):
+                        _gpu_field_tex = int(bench.tracer.get_field_display_tex_id())
+                        if _gpu_field_tex > 0:
+                            _gl_renderer.set_field_volume_texture(_gpu_field_tex, field_gain)
+                    elif field_texels is not None:
+                        upload_volume(tex_field, field_texels)
+                        _gl_renderer.set_field_volume_texture(int(tex_field), field_gain)
                     if frame_profiler is not None:
                         frame_profiler.end("upload_volume")
                     for _ci in range(6):

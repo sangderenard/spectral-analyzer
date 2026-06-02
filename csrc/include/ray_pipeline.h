@@ -728,18 +728,18 @@ struct RayPipelineConfig {
     float       gpu_fraction_t3    = 0.0f;
     float       gpu_fraction_t5    = 0.0f;
 
-    /* When true the GPU worker reads back hit records after T1 and feeds them
-     * into accumulate_field_capture_segment — matching the CPU T1 path so that
-     * camera_field_grid receives contributions from GPU-processed segments.
-     * When false the field grid only sees segments traced by CPU T1 workers. */
-    bool        gpu_segment_field_capture = true;
+    /* Optional legacy CPU field-grid updater for GPU hit segments.  When true
+     * the GPU worker reads hit records back to CPU and feeds full segments into
+     * accumulate_field_capture_segment.  Off by default: the GPU display path
+     * accumulates from GPU hit records without a full CPU field-grid walk. */
+    bool        gpu_segment_field_capture = false;
 
     /* When true (and use_gpu_compute=true) the CPU T1/T2/T3 workers are NOT
      * spawned; the GPU handles all intent→hit→material work exclusively.
      * This eliminates CPU/GPU competition and prevents CPU thrashing when the
      * GPU is capable of processing all work.  T4 wave-solver still runs on GPU
-     * when use_gpu_compute=true.  If GPU init fails, CPU workers are spawned as
-     * a fallback regardless of this flag. */
+     * when use_gpu_compute=true.  If GPU init or required shader loading fails,
+     * this mode fails pipeline creation instead of falling back to CPU. */
     bool        gpu_all_stages = false;
 
     /* Handle to the display GL context (e.g. Pygame's HGLRC on Windows).
@@ -765,6 +765,12 @@ int ray_pipeline_n_bands(const RayPipelineState* ps);
 
 /* Return the latest completed shared UV texture object ID (0 if none is ready). */
 uint64_t ray_pipeline_get_uv_pages_tex_id(const RayPipelineState* ps);
+
+/* Return the latest shared GPU field-display volume texture (GL_TEXTURE_3D), or 0. */
+uint64_t ray_pipeline_get_field_display_tex_id(const RayPipelineState* ps);
+
+/* Ask the GPU dispatch thread to clear the field-display accumulator. */
+void ray_pipeline_request_field_display_clear(RayPipelineState* ps);
 
 /* Upload per-band RGB weights for the GPU UV blit shader.
  * weights : float array of length n_bands*3 (interleaved r,g,b per band).

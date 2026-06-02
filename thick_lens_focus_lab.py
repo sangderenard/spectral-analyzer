@@ -11082,17 +11082,19 @@ def run(
         )
 
         # Sensor PIP click → PDAF focus at clicked pixel.
-        # Registers as a transparent "button" covering the green PIP quad so
-        # that clicking any pixel in the sensor image drives phase-difference AF.
-        _gpx, _gpy = int(_green_pip_vx), int(_pip_vy)
-        _gpd = int(_pip_dim)
+        # glViewport uses OpenGL coords (y from BOTTOM); pygame mouse uses y from TOP.
+        # Convert: pygame_y = H - opengl_y_bottom - height.
+        _gpx  = int(_green_pip_vx)
+        _gpy  = int(H - _pip_vy - _pip_dim)   # OpenGL → pygame y
+        _gpd  = int(_pip_dim)
         _click_buttons.append((
             (_gpx, _gpy, _gpd, _gpd),
-            lambda _mx=None, _my=None, _bench=bench, _gx=_gpx, _gy=_gpy, _gd=_gpd:
-                _bench.pdaf_focus_at_film_uv(
-                    film_u = float((_mx if _mx is not None else _gx + _gd // 2) - _gx) / float(max(1, _gd)),
-                    film_v = float((_my if _my is not None else _gy + _gd // 2) - _gy) / float(max(1, _gd)),
-                ) if True else None,
+            lambda _bench=bench, _gx=_gpx, _gy=_gpy, _gd=_gpd: (
+                lambda mx, my: _bench.pdaf_focus_at_film_uv(
+                    film_u = float(mx - _gx) / float(max(1, _gd)),
+                    film_v = float(my - _gy) / float(max(1, _gd)),
+                )
+            )(*pygame.mouse.get_pos()),
         ))
 
         # --- BDPT stats text rendered as a texture quad above the PIP ---
@@ -12846,15 +12848,7 @@ def run(
                         for _brect, _bcb in _click_buttons:
                             _bx, _by, _bw, _bh = _brect
                             if _bx <= mx < _bx + _bw and _by <= my < _by + _bh:
-                                try:
-                                    import inspect as _ins
-                                    _sig = _ins.signature(_bcb)
-                                    if "_mx" in _sig.parameters:
-                                        _bcb(_mx=mx, _my=my)
-                                    else:
-                                        _bcb()
-                                except Exception:
-                                    _bcb()
+                                _bcb()
                                 break
                     if ev.type == pygame.MOUSEMOTION and fly_mode:
                         dx, dy = ev.rel

@@ -8129,6 +8129,258 @@ class ForwardCppLensBench:
 
         # Fast focus probe: trace a ray bundle to measure actual CoC and true focus.
         optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Live optical reconfiguration — no BVH rebuild
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _reconfigure_optics_live(self) -> None:
+        """Re-register source/aperture/sensor/lens groups after a live lens or
+        sensor-position change.  The BVH mesh stays in place; only payloads and
+        the PIXEL-CONE config are updated.  Must be called with the GIL held
+        (i.e., from the main thread, not from inside a drain callback).
+        """
+        with self._trace_lock:
+            # Invalidate the cached sensor-group config so _ensure_bdpt_plate_sensor_group
+            # unconditionally re-registers with the current plate.x and exit pupil.
+            self._bdpt_sensor_cfg = None
+
+            n_px  = int(max(4, self.scene.image_plate.sensor_res))
+            n_ap  = int(max(1, self.bdpt_last_aperture_samples))
+
+            # _ensure_bdpt_plate_sensor_group calls _scene_lenses which would
+            # re-solve the optical_design and overwrite scene.lens_stack.
+            # Suppress the solve while we hold the live positions.
+            saved_design = getattr(self.scene, "optical_design", None)
+            self.scene.optical_design = None
+            try:
+                self._ensure_bdpt_plate_sensor_group(n_px, n_ap)
+            finally:
+                self.scene.optical_design = saved_design
+
+            # Update the C++ sensor image accumulator with the new sensor position.
+            self._configure_cpp_sensor_image(n_px, 0.008)
+
+        # Clear display accumulators — stale image data must not persist.
+        self._forward_img_accum[:] = 0.0
+        self._reverse_img_accum[:] = 0.0
+        self._camera_perspective_accum[:] = 0.0
+        self.clear_sensor_ray_cache()
+        if isinstance(self._backward_transport_accum, dict):
+            for v in self._backward_transport_accum.values():
+                if isinstance(v, np.ndarray):
+                    v[:] = 0.0
+        self._last_bdpt_plate_rgb = None
+        self._last_direct_img = None
+        self._last_bdpt_records = None
+        self._bdpt_segments.clear()
+        self._optical_transfers.clear()
+        self._camera_samples.clear()
+        self._bdpt_native_sensor_sweep_started = False
+        self._bdpt_native_sensor_sweep_rays = 0
+        self._bdpt_camera_sweep_stage = 0
+        self._camera_exposure_complete = False
+        self._camera_timeline = None
+        self._exposure_barrier = None
+
+    def set_focus_distance_live(self, u_m: float) -> bool:
+        """Focus at object distance ``u_m`` (metres from G1 front face) by
+        moving the rear focus group (G4) while leaving the sensor fixed.
+
+        This is the physically correct model: the sensor is the film plane
+        and G4 racks forward/back to bring the image to it.  The BVH mesh
+        is not rebuilt; the parametric teleport's conic-surface rollback
+        (±10 mm per surface) absorbs typical G4 travel.  Returns True on
+        success, False if no valid G4 position was found.
+
+        For displacements larger than ``_FOCUS_MESH_TOLERANCE`` a warning is
+        printed; the caller should schedule a full rebuild when convenient.
+        """
+        _FOCUS_MESH_TOLERANCE = 0.020  # 20 mm: beyond this the mesh diverges too much
+        import dataclasses as _dc
+
+        u = float(max(u_m, 0.005))
+        lenses = list(getattr(self.scene, "lens_stack", None) or [])
+        if len(lenses) < 2:
+            return False
+
+        iris = getattr(self.scene, "iris_aperture", None)
+        g4_idx = len(lenses) - 1
+
+        first_front = float(lenses[0].x_front)
+        obj_x = first_front - u
+        sensor_x = float(self.scene.image_plate.x)
+
+        # Bisect on G4 center_x to find the position that images obj_x onto sensor_x.
+        g3_back  = float(lenses[g4_idx - 1].x_back) if g4_idx > 0 else first_front
+        g4_half  = float(lenses[g4_idx].thickness) * 0.5
+        g4_min   = g3_back + g4_half + float(getattr(self.scene, "_min_air_gap_m", 0.005))
+        g4_max   = sensor_x - g4_half - 0.002  # keep 2 mm clearance to sensor
+
+        if g4_min >= g4_max:
+            return False
+
+        def image_x_for_g4(g4_center: float) -> float:
+            trial = list(lenses)
+            trial[g4_idx] = _dc.replace(lenses[g4_idx], center_x=round(g4_center, 8))
+            optics = _compound_lens_from_stack(trial, iris)
+            return _paraxial_image_x(optics, obj_x)
+
+        # Evaluate at bounds to check if a root exists.
+        f_min = image_x_for_g4(g4_min) - sensor_x
+        f_max = image_x_for_g4(g4_max) - sensor_x
+        if f_min * f_max > 0.0:
+            # Root not bracketed — use the end that minimises the residual.
+            g4_best = g4_min if abs(f_min) < abs(f_max) else g4_max
+        else:
+            # Bisection: 40 iterations → < 1 µm accuracy for any 10 m range.
+            lo, hi = g4_min, g4_max
+            for _ in range(40):
+                mid = 0.5 * (lo + hi)
+                if (image_x_for_g4(mid) - sensor_x) * f_min < 0.0:
+                    hi = mid
+                else:
+                    lo = mid
+                if (hi - lo) < 1.0e-9:
+                    break
+            g4_best = 0.5 * (lo + hi)
+
+        g4_orig = float(lenses[g4_idx].center_x)
+        displacement = abs(g4_best - g4_orig)
+        if displacement > _FOCUS_MESH_TOLERANCE:
+            print(
+                f"[focus-live] G4 displacement {displacement*1e3:.1f} mm exceeds mesh tolerance"
+                f" ({_FOCUS_MESH_TOLERANCE*1e3:.0f} mm) — full rebuild recommended.",
+                flush=True,
+            )
+
+        new_lenses = list(lenses)
+        new_lenses[g4_idx] = _dc.replace(lenses[g4_idx], center_x=round(g4_best, 6))
+        self.scene.lens_stack = new_lenses
+        self.scene.focus_distance_m = round(u, 4)
+
+        # Rebuild CompoundLens from the updated stack and push a new payload.
+        if self._lens_assembly is not None and \
+                self._lens_assembly.mode == LensAssemblySpec.MODE_PARAMETRIC:
+            new_cl = _compound_lens_from_stack(new_lenses, iris)
+            self._lens_assembly.set_optics(new_cl)
+
+        self._reconfigure_optics_live()
+
+        fp = self.focal_plane_x
+        print(
+            f"[focus-live] u={u*1e3:.0f}mm"
+            f"  G4: {g4_orig*1e3:.2f}→{g4_best*1e3:.2f} mm"
+            f"  (Δ{displacement*1e3:+.2f} mm)"
+            f"  focal_plane={fp:.5f}",
+            flush=True,
+        )
+        return True
+
+    def adjust_focus_live(self, delta_m: float) -> bool:
+        """Shift focus by ``delta_m`` metres (positive = focus further away).
+
+        Reads the current focus distance from ``scene.focus_distance_m`` and
+        delegates to :meth:`set_focus_distance_live`.
+        """
+        current_u = float(getattr(self.scene, "focus_distance_m", None) or 1.0)
+        return self.set_focus_distance_live(current_u + float(delta_m))
+
+    def set_zoom_live(self, zoom_0_1: float) -> bool:
+        """Move all lens groups to the position for zoom parameter ``zoom_0_1``
+        ∈ [0, 1] without rebuilding the BVH.
+
+        Uses the same paraxial solver as the full rebuild path but skips mesh
+        generation.  The parametric teleport rolls back to the nearest conic
+        surface on each hit, so results are exact as long as group displacement
+        stays within ~10 mm of the mesh positions.  Returns True on success.
+
+        For larger displacements (telephoto→wide or preset jumps) the caller
+        should follow this with a full rebuild to realign the mesh.
+        """
+        _ZOOM_MESH_TOLERANCE = 0.015  # 15 mm per group
+        import dataclasses as _dc
+        from camera_software.optical_design import solve_four_group_zoom_surrogate
+
+        od = getattr(self.scene, "optical_design", None)
+        if od is None:
+            return False
+        spec = getattr(od, "spec", od)
+        if not hasattr(spec, "focal_length_range_m"):
+            return False
+
+        new_zoom = float(np.clip(zoom_0_1, 0.0, 1.0))
+        new_spec = _dc.replace(spec, zoom=round(new_zoom, 6))
+
+        # Solve the new group positions using the paraxial surrogate.
+        solved = solve_four_group_zoom_surrogate(new_spec)
+        new_lenses = solved.to_lens_configs()
+
+        # Check displacement vs mesh tolerance.
+        old_lenses = list(getattr(self.scene, "lens_stack", None) or [])
+        max_disp = 0.0
+        for i, (nl, ol) in enumerate(zip(new_lenses, old_lenses)):
+            max_disp = max(max_disp, abs(nl.center_x - ol.center_x))
+        if max_disp > _ZOOM_MESH_TOLERANCE:
+            print(
+                f"[zoom-live] max group displacement {max_disp*1e3:.1f} mm"
+                f" exceeds mesh tolerance ({_ZOOM_MESH_TOLERANCE*1e3:.0f} mm)"
+                " — full rebuild recommended.",
+                flush=True,
+            )
+
+        self.scene.lens_stack = new_lenses
+
+        # Re-position the iris aperture between G2 and G3 as groups move.
+        iris = getattr(self.scene, "iris_aperture", None)
+        if iris is not None and len(new_lenses) >= 3:
+            g2_back  = float(new_lenses[1].x_back)
+            g3_front = float(new_lenses[2].x_front)
+            new_iris_x = round(0.5 * (g2_back + g3_front), 6)
+            import dataclasses as _dc2
+            self.scene.iris_aperture = _dc2.replace(iris, x_pos=new_iris_x)
+            iris = self.scene.iris_aperture
+
+        # Sensor position: paraxial image of the current focus distance on the
+        # new CompoundLens.  The sensor is the fixed film plane; we move it to
+        # where the image actually forms for this zoom + focus combination.
+        new_cl = _compound_lens_from_stack(new_lenses, iris)
+        u_m = float(getattr(self.scene, "focus_distance_m", 1.0) or 1.0)
+        first_front = float(new_lenses[0].x_front)
+        new_sensor_x = _paraxial_image_x(new_cl, first_front - u_m)
+        if math.isfinite(new_sensor_x):
+            lo_bound = float(new_lenses[-1].x_back) + 1.0e-3
+            hi_bound = float(getattr(self.scene, "x_max", new_sensor_x + 1.0))
+            if lo_bound < new_sensor_x < hi_bound:
+                self.scene.image_plate.x = round(new_sensor_x, 6)
+                self.scene.screen_x = float(new_sensor_x)
+
+        # Write the paraxial pupil positions directly rather than calling
+        # apply_to_scene, which would re-overwrite lens_stack and plate.x from
+        # the thin-lens solver values (losing the CompoundLens-corrected sensor_x).
+        self.scene.exit_pupil_x      = float(solved.exit_pupil_x_m)
+        self.scene.exit_pupil_radius = float(solved.exit_pupil_radius_m)
+        self.scene.entrance_pupil_x      = float(solved.entrance_pupil_x_m)
+        self.scene.entrance_pupil_radius = float(solved.entrance_pupil_radius_m)
+        # Record the new spec so future full rebuilds start from this zoom.
+        # (SolvedOpticalTrain is replaced by its spec so _scene_lenses will re-solve
+        # cleanly rather than calling apply_to_scene with stale group positions.)
+        self.scene.optical_design = _dc.replace(spec, zoom=round(new_zoom, 6))
+
+        if self._lens_assembly is not None and \
+                self._lens_assembly.mode == LensAssemblySpec.MODE_PARAMETRIC:
+            self._lens_assembly.set_optics(new_cl)
+
+        self._reconfigure_optics_live()
+
+        efl = float(getattr(new_cl, "f_eff", 0.0))
+        print(
+            f"[zoom-live] zoom={new_zoom:.3f}"
+            f"  EFL={efl*1e3:.1f}mm"
+            f"  max_group_disp={max_disp*1e3:.1f}mm",
+            flush=True,
+        )
+        return True
         if optics is not None:
             _ap_r = float(getattr(lenses[0], "aperture_radius", 0.015)) if lenses else 0.015
             _iris = getattr(self.scene, "iris_aperture", None)

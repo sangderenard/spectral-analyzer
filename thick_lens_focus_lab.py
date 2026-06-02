@@ -4801,6 +4801,9 @@ class SensorRayCache:
             self.channel_idx = np.zeros((0,), dtype=np.uint8)
             self.src_ids = np.zeros((0,), dtype=np.int32)
             self.color_flags = np.zeros((0,), dtype=np.uint8)
+            # Aperture class for every ray: 0 = left half (split_coord < 0),
+            # 1 = right half (split_coord >= 0).  Used by PDAF phase analysis.
+            self.aperture_half = np.zeros((0,), dtype=np.uint8)
             self.cursor = 0
             self.signature: Optional[Tuple[object, ...]] = None
             self._has_completed = False
@@ -4818,6 +4821,7 @@ class SensorRayCache:
         tags: np.ndarray,
         film_uv: np.ndarray,
         channel_idx: np.ndarray,
+        aperture_half: Optional[np.ndarray] = None,
         signature: Optional[Tuple[object, ...]] = None,
         reset_cursor: bool = True,
     ) -> None:
@@ -4830,6 +4834,8 @@ class SensorRayCache:
         n = int(o.shape[0])
         if d.shape[0] != n or a.shape[0] != n or t.shape[0] != n or uv.shape[0] != n or ch.shape[0] != n:
             raise ValueError("sensor ray cache arrays must share the same first dimension")
+        ah = (np.ascontiguousarray(aperture_half, dtype=np.uint8).reshape(-1)
+              if aperture_half is not None else np.zeros(n, dtype=np.uint8))
         with self._lock:
             self.origins = o
             self.directions = d
@@ -4837,6 +4843,7 @@ class SensorRayCache:
             self.tags = t
             self.film_uv = uv
             self.channel_idx = ch
+            self.aperture_half = ah
             self.src_ids = np.zeros(n, dtype=np.int32)
             self.color_flags = np.ones(n, dtype=np.uint8)
             self.signature = signature
@@ -6447,9 +6454,13 @@ class ForwardCppLensBench:
         dn = np.linalg.norm(directions, axis=1)
         valid = np.isfinite(dn) & (dn > EPS)
         directions[valid] /= dn[valid, None]
-        origins = origins[valid]
+        origins    = origins[valid]
         directions = directions[valid]
         film_uv_all = film_uv_all[valid]
+        # Aperture class: 0 = left split-axis coord < 0, 1 = right (≥ 0).
+        # Uses the y-coordinate of the exit-pupil sample (horizontal PDAF default).
+        _split_coord = target_pts[valid, 1]  # y-component of the aperture sample
+        aperture_half_arr = (_split_coord >= 0.0).astype(np.uint8)
 
         n = int(origins.shape[0])
         channel_idx = np.zeros(n, dtype=np.uint8)
@@ -6464,8 +6475,34 @@ class ForwardCppLensBench:
             tags=tags,
             film_uv=film_uv_all,
             channel_idx=channel_idx,
+            aperture_half=aperture_half_arr,
             signature=signature,
         )
+
+        # Auto-populate PDAF grid whenever the cache is rebuilt.
+        # Uses the same optics/exit-pupil that drive the cache directions so the
+        # phase measurement is always consistent with the launched rays.
+        if self._pdaf_grid.is_configured:
+            _lasm = self._lens_assembly
+            _optics = getattr(_lasm, "optics", None) if _lasm is not None else None
+            _ep_spec = (_lasm.backward_ray_target_spec()
+                        if _lasm is not None else None)
+            if (_optics is not None and _ep_spec is not None
+                    and float(_ep_spec.radius) > 0.0):
+                self._pdaf_grid.measure(
+                    optics            = _optics,
+                    object_x          = float(self.scene.object_plane.x),
+                    exit_pupil_center = np.asarray(_ep_spec.center, dtype=np.float64),
+                    exit_pupil_radius = float(_ep_spec.radius),
+                    wavelength_m      = getattr(self, "_pdaf_wavelength_m", 550e-9),
+                    n_aperture        = min(int(n_ap), 64),
+                    rng_seed          = int(seed),
+                )
+                print(
+                    f"[pdaf] grid updated: mean_ΔΦ={self._pdaf_grid.focus_error:.4f} rad"
+                    f"  Δu_est={self.get_pdaf_defocus_estimate_m()*1e3:+.2f} mm",
+                    flush=True,
+                )
         self._sensor_viewfinder_last_cache_count = n
         self.bdpt_last_camera_samples = {
             "samples": n,
@@ -8665,46 +8702,86 @@ class ForwardCppLensBench:
             flush=True,
         )
 
-    def measure_pdaf(
+    def pdaf_focus_at_film_uv(
         self,
-        wavelength_m:    float = 550e-9,
-        n_aperture:      int   = 64,
-        rng_seed:        int   = 0,
-    ) -> None:
-        """Trace a ray bundle to measure the phase at all PDAF sites.
+        film_u: float,
+        film_v: float,
+        wavelength_m: float = 550e-9,
+        n_aperture:   int   = 64,
+        gain:         float = 0.8,
+        max_delta_m:  float = 0.100,
+    ) -> float:
+        """Configure a 1×1 PDAF site at the given film coordinate, measure the
+        phase difference, estimate the defocus, and apply a focus correction.
 
-        For every site the method fires ``n_aperture`` forward rays from the
-        scene object plane, through the current exit pupil disk, through the
-        CompoundLens (via ``evaluate_bundle``), and computes the full OPL to
-        the site pixel.  The OPL is converted to a complex phasor and split
-        by aperture half (left y < 0 / right y ≥ 0 for split_axis='y').
+        This is the primary entry point for click-driven autofocus on the
+        sensor PIP.  The PDAF grid is temporarily reconfigured to a single
+        site at the clicked pixel.
 
-        Call ``get_pdaf_phase_map()`` or ``get_pdaf_focus_error()`` after.
+        film_u, film_v: normalised [0, 1] coordinates (origin = top-left corner
+        of the sensor image as rendered in the PIP).
+
+        Returns the applied focus-distance change in metres.
         """
-        if not self._pdaf_grid.is_configured:
-            print("[pdaf] grid not configured — call configure_pdaf_grid() first", flush=True)
-            return
-        optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
-        if optics is None:
-            print("[pdaf] no CompoundLens available", flush=True)
-            return
+        plate = self.scene.image_plate
+        # Invert the film UV → sensor plane position mapping used in rebuild_sensor_ray_cache.
+        site_y = (float(film_v) - 0.5) * (2.0 * float(plate.sensor_half_w))
+        site_z = (0.5 - float(film_u)) * (2.0 * float(plate.sensor_half_h))
+
+        split_axis = getattr(self._pdaf_grid, "_split_axis", "y")
+        self._pdaf_grid.configure(
+            sensor_x      = float(plate.x),
+            sensor_half_y = float(plate.sensor_half_w),
+            sensor_half_z = float(plate.sensor_half_h),
+            ny            = 1,
+            nz            = 1,
+            split_axis    = split_axis,
+        )
+        # Override the single site to exactly the clicked position.
+        if self._pdaf_grid._sites:
+            self._pdaf_grid._sites[0].y_m = site_y
+            self._pdaf_grid._sites[0].z_m = site_z
+
+        self._pdaf_wavelength_m = float(wavelength_m)
+
+        # Populate phase via the same evaluate_bundle path that rebuild_sensor_ray_cache uses.
         lasm = self._lens_assembly
+        optics = getattr(lasm, "optics", None) if lasm is not None else None
         ep_spec = lasm.backward_ray_target_spec() if lasm is not None else None
-        if ep_spec is None or float(ep_spec.radius) <= 0.0:
-            print("[pdaf] no valid exit pupil — cannot measure phase", flush=True)
-            return
-        ep_center = np.asarray(ep_spec.center, dtype=np.float64)
-        ep_radius = float(ep_spec.radius)
+        if optics is None or ep_spec is None or float(ep_spec.radius) <= 0.0:
+            print("[pdaf] no valid optics/exit-pupil", flush=True)
+            return 0.0
 
         self._pdaf_grid.measure(
-            optics          = optics,
-            object_x        = float(self.scene.object_plane.x),
-            exit_pupil_center = ep_center,
-            exit_pupil_radius = ep_radius,
-            wavelength_m    = float(wavelength_m),
-            n_aperture      = int(max(4, n_aperture)),
-            rng_seed        = int(rng_seed),
+            optics            = optics,
+            object_x          = float(self.scene.object_plane.x),
+            exit_pupil_center = np.asarray(ep_spec.center, dtype=np.float64),
+            exit_pupil_radius = float(ep_spec.radius),
+            wavelength_m      = float(wavelength_m),
+            n_aperture        = int(max(4, n_aperture)),
+            rng_seed          = 0,
         )
+
+        err_rad = self._pdaf_grid.focus_error
+        delta_m = self.get_pdaf_defocus_estimate_m(wavelength_m)
+        delta_m = float(np.clip(delta_m * float(gain), -float(max_delta_m), float(max_delta_m)))
+
+        print(
+            f"[pdaf] pixel u={film_u:.3f} v={film_v:.3f}"
+            f"  site=({site_y*1e3:.1f}, {site_z*1e3:.1f}) mm"
+            f"  ΔΦ={err_rad:.4f} rad"
+            f"  Δu_raw={self.get_pdaf_defocus_estimate_m(wavelength_m)*1e3:+.2f} mm"
+            f"  Δu_applied={delta_m*1e3:+.2f} mm",
+            flush=True,
+        )
+
+        if abs(delta_m) > 1.0e-5:
+            current_u = float(getattr(self.scene, "focus_distance_m", 1.0) or 1.0)
+            self.set_focus_distance_live(current_u + delta_m)
+        else:
+            print("[pdaf] already in focus — no adjustment needed", flush=True)
+
+        return delta_m
 
     def get_pdaf_phase_map(self) -> np.ndarray:
         """Return (ny, nz) array of per-site phase differences (radians).
@@ -8747,34 +8824,33 @@ class ForwardCppLensBench:
     def autofocus_pdaf_step(
         self,
         wavelength_m: float = 550e-9,
-        n_aperture:   int   = 64,
         gain:         float = 0.8,
         max_delta_m:  float = 0.100,
     ) -> float:
-        """Run one PDAF measurement and apply a focus correction step.
+        """Apply one closed-loop PDAF focus step using the current grid data.
 
-        Measures the phase difference, converts it to a defocus estimate,
-        then calls ``set_focus_distance_live`` to move G4 by the correction.
-        Returns the applied focus-distance change (metres).
-
-        ``gain`` scales the estimated correction (0 < gain < 1 for damped
-        convergence).  ``max_delta_m`` clips the correction to avoid hunting.
+        The PDAF grid is populated automatically when the sensor ray cache is
+        rebuilt (configure_pdaf_grid must have been called first).  This method
+        reads the already-accumulated phase data and drives G4.  Returns the
+        applied focus-distance change (metres).
         """
         if not self._pdaf_grid.is_configured:
             self.configure_pdaf_grid()
-        self.measure_pdaf(wavelength_m=wavelength_m, n_aperture=n_aperture)
+            # Force a cache rebuild so the grid gets populated immediately.
+            self._sensor_ray_cache.clear()
+            self.clear_sensor_ray_cache()
         delta = float(np.clip(
             self.get_pdaf_defocus_estimate_m(wavelength_m) * float(gain),
             -float(max_delta_m),
             float(max_delta_m),
         ))
         if abs(delta) < 1.0e-5:
+            print(f"[pdaf] already in focus (ΔΦ={self._pdaf_grid.focus_error:.4f} rad)", flush=True)
             return 0.0
         current_u = float(getattr(self.scene, "focus_distance_m", 1.0) or 1.0)
         self.set_focus_distance_live(current_u + delta)
         print(
-            f"[pdaf-af] ΔΦ={self._pdaf_grid.focus_error:.4f} rad"
-            f"  Δu={delta*1e3:+.2f}mm",
+            f"[pdaf] ΔΦ={self._pdaf_grid.focus_error:.4f} rad  Δu={delta*1e3:+.2f} mm",
             flush=True,
         )
         return delta
@@ -11005,6 +11081,20 @@ def run(
             border_col=(0.20, 0.85, 0.30),
         )
 
+        # Sensor PIP click → PDAF focus at clicked pixel.
+        # Registers as a transparent "button" covering the green PIP quad so
+        # that clicking any pixel in the sensor image drives phase-difference AF.
+        _gpx, _gpy = int(_green_pip_vx), int(_pip_vy)
+        _gpd = int(_pip_dim)
+        _click_buttons.append((
+            (_gpx, _gpy, _gpd, _gpd),
+            lambda _mx=None, _my=None, _bench=bench, _gx=_gpx, _gy=_gpy, _gd=_gpd:
+                _bench.pdaf_focus_at_film_uv(
+                    film_u = float((_mx if _mx is not None else _gx + _gd // 2) - _gx) / float(max(1, _gd)),
+                    film_v = float((_my if _my is not None else _gy + _gd // 2) - _gy) / float(max(1, _gd)),
+                ) if True else None,
+        ))
+
         # --- BDPT stats text rendered as a texture quad above the PIP ---
         try:
             stats = bench.tracer.get_bdpt_stats()
@@ -12756,7 +12846,15 @@ def run(
                         for _brect, _bcb in _click_buttons:
                             _bx, _by, _bw, _bh = _brect
                             if _bx <= mx < _bx + _bw and _by <= my < _by + _bh:
-                                _bcb()
+                                try:
+                                    import inspect as _ins
+                                    _sig = _ins.signature(_bcb)
+                                    if "_mx" in _sig.parameters:
+                                        _bcb(_mx=mx, _my=my)
+                                    else:
+                                        _bcb()
+                                except Exception:
+                                    _bcb()
                                 break
                     if ev.type == pygame.MOUSEMOTION and fly_mode:
                         dx, dy = ev.rel

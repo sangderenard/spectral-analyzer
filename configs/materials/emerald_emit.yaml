@@ -1,0 +1,21 @@
+# emerald_emit — glowing green glass gem (Cr³⁺/Cu²⁺ emission)
+albedo_rgb: [0.02, 0.48, 0.20]
+roughness: 0.22
+metallic: 0.0
+ior: 1.58
+opacity: 0.95
+emission_rgb: [0.05, 1.9, 0.62]
+# Cr³⁺/Cu²⁺ green emission: dominant ~520 nm, yellow-green shoulder ~570 nm
+spectral_bands:
+  - center_hz: 5.765e14
+    bandwidth_hz: {type: q_factor, q: 12.0}
+    reflectance: 0.33
+    diffuse_frac: 0.22
+    ior_real: 1.58
+    emission: 1.9
+  - center_hz: 5.261e14
+    bandwidth_hz: {type: q_factor, q: 8.0}
+    reflectance: 0.22
+    diffuse_frac: 0.22
+    ior_real: 1.58
+    emission: 0.62

@@ -1,0 +1,21 @@
+# sapphire_emit — glowing blue corundum gem (Ti³⁺ emission)
+albedo_rgb: [0.04, 0.16, 0.62]
+roughness: 0.20
+metallic: 0.0
+ior: 1.76
+opacity: 0.95
+emission_rgb: [0.08, 0.36, 2.2]
+# Ti³⁺ blue emission: dominant ~450 nm, cyan shoulder ~480 nm
+spectral_bands:
+  - center_hz: 6.662e14
+    bandwidth_hz: {type: q_factor, q: 12.0}
+    reflectance: 0.15
+    diffuse_frac: 0.20
+    ior_real: 1.76
+    emission: 2.2
+  - center_hz: 6.246e14
+    bandwidth_hz: {type: q_factor, q: 8.0}
+    reflectance: 0.12
+    diffuse_frac: 0.20
+    ior_real: 1.76
+    emission: 0.36

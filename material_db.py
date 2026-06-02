@@ -428,11 +428,27 @@ def _fill_ray_from_mat11_dict(rec: RayMatRecord, d: dict) -> None:
 
 
 def _fill_spectral(rec: SpectralRecord, mat: Any) -> None:
-    """Fill SpectralRecord from Material.effective_bands() or leave zeroed."""
-    if not hasattr(mat, 'effective_bands'):
+    """Fill SpectralRecord from Material.effective_bands(), a dict 'bands' list, or leave zeroed."""
+    if isinstance(mat, dict):
+        bands_raw = mat.get('bands', mat.get('spectral_bands', []))
+        if not bands_raw:
+            rec.n_bands = 0
+            return
+        from spectral_material import SpectralBand as _SpectralBand
+        bands = [
+            (_SpectralBand.from_dict(b) if isinstance(b, dict) else b)
+            for b in bands_raw[:MAX_SPECTRAL_BANDS]
+        ]
+    elif hasattr(mat, 'effective_bands'):
+        bands = mat.effective_bands(n_synthetic=MAX_SPECTRAL_BANDS)[:MAX_SPECTRAL_BANDS]
+    else:
         rec.n_bands = 0
         return
-    bands = mat.effective_bands(n_synthetic=MAX_SPECTRAL_BANDS)[:MAX_SPECTRAL_BANDS]
+    # Normalize: effective_bands() may return raw dicts if Material.spectral_bands
+    # was populated with dicts rather than SpectralBand objects.
+    if any(isinstance(b, dict) for b in bands):
+        from spectral_material import SpectralBand as _SpectralBand
+        bands = [_SpectralBand.from_dict(b) if isinstance(b, dict) else b for b in bands]
     rec.n_bands = len(bands)
     for i, b in enumerate(bands):
         br = rec.bands[i]

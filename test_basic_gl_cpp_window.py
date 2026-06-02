@@ -372,21 +372,9 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
             "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
         },
 
-        # ── Emitters (profile 0 standard) ─────────────────────────────────
-        "ruby_emit": {
-            "albedo_rgb": [0.62, 0.04, 0.08], "roughness": 0.18, "metallic": 0.0,
-            "ior": 1.76, "opacity": 0.92, "emission_rgb": [2.3, 0.15, 0.08],
-            "enamel": {"thickness_nm": 380.0, "ior_real": 1.52,
-                       "color_rgb": [1.0, 0.65, 0.65]},
-        },
-        "emerald_emit": {
-            "albedo_rgb": [0.02, 0.48, 0.20], "roughness": 0.22, "metallic": 0.0,
-            "ior": 1.58, "opacity": 0.95, "emission_rgb": [0.05, 1.9, 0.62],
-        },
-        "sapphire_emit": {
-            "albedo_rgb": [0.04, 0.16, 0.62], "roughness": 0.20, "metallic": 0.0,
-            "ior": 1.76, "opacity": 0.95, "emission_rgb": [0.08, 0.36, 2.2],
-        },
+        # ── Emitters — loaded from configs/materials/ ──────────────────────
+        # (ruby_emit, emerald_emit, sapphire_emit, amber_lobe are registered
+        #  below via _register_yaml_material after the inline mats loop)
         # ── Metallic ──────────────────────────────────────────────────────
         "chrome": {
             "albedo_rgb": [0.85, 0.87, 0.90], "roughness": 0.08, "metallic": 1.0,
@@ -428,6 +416,11 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
                 "emit_uv_layer": 0.0,
                 "emit_gain": 2.5,
             },
+            # Warm broadband white: single lobe centred near yellow-green (~560 nm)
+            "bands": [
+                {"center_hz": 5.353e14, "bandwidth_hz": {"type": "q_factor", "q": 5.0},
+                 "reflectance": 0.12, "diffuse_frac": 0.50, "ior_real": 1.5, "emission": 0.82},
+            ],
         },
 
         # ── Calibration materials (explicit BW + RGB chain checks) ─────
@@ -442,14 +435,26 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
         "calib_red_emit": {
             "albedo_rgb": [0.2, 0.0, 0.0], "roughness": 0.2, "metallic": 0.0,
             "ior": 1.5, "opacity": 1.0, "emission_rgb": [2.5, 0.0, 0.0],
+            "bands": [
+                {"center_hz": 4.759e14, "bandwidth_hz": {"type": "q_factor", "q": 15.0},
+                 "reflectance": 0.04, "diffuse_frac": 0.20, "ior_real": 1.5, "emission": 2.5},
+            ],
         },
         "calib_green_emit": {
             "albedo_rgb": [0.0, 0.2, 0.0], "roughness": 0.2, "metallic": 0.0,
             "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 2.5, 0.0],
+            "bands": [
+                {"center_hz": 5.657e14, "bandwidth_hz": {"type": "q_factor", "q": 15.0},
+                 "reflectance": 0.04, "diffuse_frac": 0.20, "ior_real": 1.5, "emission": 2.5},
+            ],
         },
         "calib_blue_emit": {
             "albedo_rgb": [0.0, 0.0, 0.2], "roughness": 0.2, "metallic": 0.0,
             "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 2.5],
+            "bands": [
+                {"center_hz": 6.662e14, "bandwidth_hz": {"type": "q_factor", "q": 15.0},
+                 "reflectance": 0.04, "diffuse_frac": 0.20, "ior_real": 1.5, "emission": 2.5},
+            ],
         },
 
         # ── Calibration step wedge ───────────────────────────────────────
@@ -486,20 +491,7 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
             "ior": 1.5, "opacity": 1.0, "emission_rgb": [0.0, 0.0, 0.0],
         },
 
-        # ── Profile 1: emissive forward cone with bulb darkening ─────────
-        # depth_uv layer 3: R=depth (scaled by depth_scale_mm), A=bulb_radius (raw)
-        # Lorentzian applied to emission: full at pole center, dark at extremes.
-        "amber_lobe": {
-            "albedo_rgb": [0.35, 0.20, 0.05], "roughness": 0.25, "metallic": 0.0,
-            "ior": 1.55, "opacity": 1.0, "emission_rgb": [2.0, 1.1, 0.25],
-            "texture_stack": {
-                "model_flags": 1.0,
-                "direct_lobe_power": 7.0,
-                "emit_gain": 1.0,
-                "depth_uv_layer": 3.0,
-                "depth_scale_mm": 0.5,
-            },
-        },
+        # amber_lobe: loaded from configs/materials/amber_lobe.yaml below
 
         # ── Profile 2: translucent SSS ────────────────────────────────────
         "jade_sss": {
@@ -527,6 +519,9 @@ def register_materials() -> tuple[MaterialDatabase, dict[str, int]]:
         },
     }
     idx = {name: db.register(name, mat) for name, mat in mats.items()}
+    # Physical emitters — spectral emission bands live in their YAML files.
+    for _yaml_name in ("ruby_emit", "emerald_emit", "sapphire_emit", "amber_lobe"):
+        idx[_yaml_name] = _register_yaml_material(db, _yaml_name)
     idx["cavity_receiver"] = _register_yaml_material(db, "painted_plaster_wall")
     idx["tungsten_bulb_emit"] = _register_yaml_material(db, "tungsten_filament")
     return db, idx

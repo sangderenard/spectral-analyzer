@@ -1,0 +1,25 @@
+# ruby_emit — glowing red glass gem (Cr³⁺ emission)
+albedo_rgb: [0.62, 0.04, 0.08]
+roughness: 0.18
+metallic: 0.0
+ior: 1.76
+opacity: 0.92
+emission_rgb: [2.3, 0.15, 0.08]
+enamel:
+  thickness_nm: 380.0
+  ior_real: 1.52
+  color_rgb: [1.0, 0.65, 0.65]
+# Cr³⁺ red fluorescence: dominant ~630 nm, weak deep-red shoulder ~700 nm
+spectral_bands:
+  - center_hz: 4.759e14
+    bandwidth_hz: {type: q_factor, q: 12.0}
+    reflectance: 0.15
+    diffuse_frac: 0.18
+    ior_real: 1.76
+    emission: 2.3
+  - center_hz: 4.283e14
+    bandwidth_hz: {type: q_factor, q: 8.0}
+    reflectance: 0.08
+    diffuse_frac: 0.18
+    ior_real: 1.76
+    emission: 0.08

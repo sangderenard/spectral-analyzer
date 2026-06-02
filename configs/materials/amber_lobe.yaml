@@ -1,0 +1,27 @@
+# amber_lobe — warm amber emissive with directional lobe (profile 1)
+albedo_rgb: [0.35, 0.20, 0.05]
+roughness: 0.25
+metallic: 0.0
+ior: 1.55
+opacity: 1.0
+emission_rgb: [2.0, 1.1, 0.25]
+texture_stack:
+  model_flags: 1.0
+  direct_lobe_power: 7.0
+  emit_gain: 1.0
+  depth_uv_layer: 3.0
+  depth_scale_mm: 0.5
+# Warm amber: orange primary ~590 nm, red secondary ~630 nm
+spectral_bands:
+  - center_hz: 5.081e14
+    bandwidth_hz: {type: q_factor, q: 8.0}
+    reflectance: 0.20
+    diffuse_frac: 0.25
+    ior_real: 1.55
+    emission: 2.0
+  - center_hz: 4.759e14
+    bandwidth_hz: {type: q_factor, q: 8.0}
+    reflectance: 0.15
+    diffuse_frac: 0.25
+    ior_real: 1.55
+    emission: 1.1

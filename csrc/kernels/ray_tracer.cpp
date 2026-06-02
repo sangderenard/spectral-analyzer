@@ -8920,7 +8920,13 @@ public:
                     band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
                     cr += amp * wr; cg += amp * wg; cb += amp * wb;
                 }
-                sensor_updates.push_back({iy, iz, cr, cg, cb});
+                /* Scale down backward-sensor splat so it doesn't swamp the scene.
+                 * Each hit carries amplitude ~0.5–1.0; with many sensor rays the
+                 * raw accumulation saturates and obscures geometry. */
+                static constexpr double SENSOR_SPLAT_SCALE = 0.10;
+                sensor_updates.push_back({iy, iz, cr * SENSOR_SPLAT_SCALE,
+                                                  cg * SENSOR_SPLAT_SCALE,
+                                                  cb * SENSOR_SPLAT_SCALE});
             }
             /* Apply all updates under a short-held lock, tracking peaks
              * incrementally so get_sensor_image() skips the O(res²) scan. */
@@ -10560,26 +10566,22 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 const int   iy    = static_cast<int>((sy + ps.sensor_half_w) * inv_w);
                 const int   iz    = static_cast<int>((sz + ps.sensor_half_h) * inv_h);
                 if (iy >= 0 && iy < res && iz >= 0 && iz < res) {
-                    /* Physical amplitude carried by this ray at the emissive. */
-                    double amp_mag = 0.0;
+                    double cr = 0.0, cg = 0.0, cb = 0.0;
                     for (int b = 0; b < nb; ++b) {
                         const double re = amp[b].real(), im = amp[b].imag();
-                        amp_mag += std::sqrt(re*re + im*im);
+                        const double a  = std::sqrt(re*re + im*im);
+                        double wr, wg, wb;
+                        band_to_display_rgb(b, nb, st.freq_hz_vec, wr, wg, wb);
+                        cr += a * wr; cg += a * wg; cb += a * wb;
                     }
-                    /* ch1 = photon-count: each successful sensor→emissive connection
-                     * contributes exactly 1.0 regardless of optical attenuation.
-                     * This is the single-photon-detector model: every photon that
-                     * arrives at an emissive surface is counted once.  Amplitude
-                     * variations from Fresnel/Beer are recorded separately in ch2.
-                     *
-                     * ch2 = physically weighted (amp_mag) for the radiance view. */
-                    const int idx1 = 1 * res * res + iy * res + iz;
-                    const int idx2 = 2 * res * res + iy * res + iz;
+                    const size_t px0 = static_cast<size_t>(iy * res + iz);
                     std::lock_guard<std::mutex> lk(ps.sensor_mu);
-                    const double v1 = (ps.sensor_accum[static_cast<size_t>(idx1)] += 1.0);
-                    const double v2 = (ps.sensor_accum[static_cast<size_t>(idx2)] += amp_mag);
-                    if (v1 > ps.sensor_peak[1]) ps.sensor_peak[1] = v1;
-                    if (v2 > ps.sensor_peak[2]) ps.sensor_peak[2] = v2;
+                    const double nr  = (ps.sensor_accum[0*(size_t)res*res + px0] += cr);
+                    const double ng  = (ps.sensor_accum[1*(size_t)res*res + px0] += cg);
+                    const double nb_ = (ps.sensor_accum[2*(size_t)res*res + px0] += cb);
+                    if (nr  > ps.sensor_peak[0]) ps.sensor_peak[0] = nr;
+                    if (ng  > ps.sensor_peak[1]) ps.sensor_peak[1] = ng;
+                    if (nb_ > ps.sensor_peak[2]) ps.sensor_peak[2] = nb_;
                 }
             }
             continue;

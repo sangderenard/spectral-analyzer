@@ -4536,6 +4536,254 @@ class CameraSampleStore:
         self._count = 0
 
 
+class PhaseSensorSite:
+    """One phase-detection AF site — a single sensor pixel that compares
+    the total optical path length (OPL) from two aperture halves to the
+    scene in order to measure wavefront tilt = focus error.
+
+    For each aperture sample the caller supplies:
+      aperture_y  — signed y-coordinate of the aperture point (metres)
+      total_opl   — full OPL from scene object → aperture → lens → this site
+      wavelength  — wavelength in metres
+
+    The site accumulates a complex phasor per aperture half.  The angle of
+    conj(E_left) * E_right is zero when the sensor is at the conjugate focus
+    of the scene object and non-zero otherwise.
+    """
+
+    __slots__ = ("y_m", "z_m", "_E_left", "_E_right", "_n_left", "_n_right")
+
+    def __init__(self, y_m: float, z_m: float) -> None:
+        self.y_m = float(y_m)
+        self.z_m = float(z_m)
+        self._E_left:  complex = 0j
+        self._E_right: complex = 0j
+        self._n_left:  int = 0
+        self._n_right: int = 0
+
+    def accumulate(self, aperture_y: float, total_opl: float, wavelength_m: float) -> None:
+        """Add one aperture-path contribution.
+
+        aperture_y < 0 → left half; aperture_y >= 0 → right half.
+        """
+        import cmath as _cmath
+        phasor = _cmath.exp(2j * math.pi * total_opl / wavelength_m)
+        if aperture_y < 0.0:
+            self._E_left  += phasor
+            self._n_left  += 1
+        else:
+            self._E_right += phasor
+            self._n_right += 1
+
+    @property
+    def phase_difference(self) -> float:
+        """ΔΦ = arg(E_left* · E_right).
+
+        Zero → in focus.  Positive → object too close (near-focus); negative →
+        object too far (far-focus).  Returns NaN when either half has no samples.
+        """
+        if self._n_left == 0 or self._n_right == 0:
+            return float("nan")
+        import cmath as _cmath
+        return float(_cmath.phase(self._E_left.conjugate() * self._E_right))
+
+    def clear(self) -> None:
+        self._E_left  = 0j
+        self._E_right = 0j
+        self._n_left  = 0
+        self._n_right = 0
+
+
+class PhaseSensorGrid:
+    """Grid of PhaseSensorSite objects covering the sensor plane.
+
+    Usage
+    -----
+    1.  Call ``configure()`` once when the bench is (re-)built.
+    2.  Call ``measure()`` after any focus change to populate the phasors.
+    3.  Read ``phase_map`` or ``focus_error`` to drive the focus motor.
+
+    The ``measure()`` method traces forward rays from the scene object through
+    the CompoundLens to the sensor via ``evaluate_bundle``, then extends the
+    ray straight to each site to compute the full OPL.  Aperture samples are
+    split at the exit-pupil y = 0 plane (horizontal PDAF); set
+    ``split_axis='z'`` for vertical PDAF.
+    """
+
+    def __init__(self) -> None:
+        self._sites:      List["PhaseSensorSite"] = []
+        self._ny:         int   = 0
+        self._nz:         int   = 0
+        self._sensor_x:   float = 0.0
+        self._split_axis: str   = "y"
+
+    def configure(
+        self,
+        sensor_x:      float,
+        sensor_half_y: float,
+        sensor_half_z: float,
+        ny:            int = 8,
+        nz:            int = 8,
+        split_axis:    str = "y",
+    ) -> None:
+        """Place ny × nz sites uniformly across the sensor plane."""
+        self._sensor_x   = float(sensor_x)
+        self._ny         = int(max(1, ny))
+        self._nz         = int(max(1, nz))
+        self._split_axis = str(split_axis)
+        self._sites.clear()
+        for iy in range(self._ny):
+            for iz in range(self._nz):
+                y = float(sensor_half_y) * (2.0 * (iy + 0.5) / self._ny - 1.0)
+                z = float(sensor_half_z) * (2.0 * (iz + 0.5) / self._nz - 1.0)
+                self._sites.append(PhaseSensorSite(y, z))
+
+    def clear(self) -> None:
+        for s in self._sites:
+            s.clear()
+
+    def measure(
+        self,
+        optics,
+        object_x:          float,
+        exit_pupil_center: np.ndarray,
+        exit_pupil_radius: float,
+        wavelength_m:      float = 550e-9,
+        n_aperture:        int   = 64,
+        rng_seed:          int   = 0,
+    ) -> None:
+        """Populate each site's phase accumulators by tracing rays.
+
+        For each site the method:
+          1.  Generates ``n_aperture`` points uniformly on the exit-pupil disk.
+          2.  Creates forward rays from the scene object toward each aperture
+              point, then traces them through ``optics`` (CompoundLens).
+          3.  Extends each exit ray to the sensor pixel to compute the total OPL.
+          4.  Calls ``site.accumulate(aperture_coord, total_opl, wavelength)``.
+
+        Split axis: ``'y'`` separates left (ay < 0) from right (ay ≥ 0);
+        ``'z'`` separates top from bottom.
+        """
+        from camera_designer.compound_optics import RayBundle, TerminationReason
+
+        if not self._sites or optics is None:
+            return
+
+        self.clear()
+
+        ep = np.asarray(exit_pupil_center, dtype=np.float64).reshape(3)
+        ep_r = float(max(1.0e-6, exit_pupil_radius))
+        obj_pt = np.array([float(object_x), 0.0, 0.0], dtype=np.float64)
+
+        rng = np.random.default_rng(int(rng_seed))
+        r_sq = rng.uniform(0.0, 1.0, n_aperture)
+        th   = rng.uniform(0.0, 2.0 * math.pi, n_aperture)
+        r    = np.sqrt(r_sq) * ep_r
+        # Aperture sample positions on the exit-pupil disk (in y-z plane at ep_x)
+        ap_y = r * np.cos(th)
+        ap_z = r * np.sin(th)
+        ap_pts = np.column_stack([
+            np.full(n_aperture, ep[0]),
+            ep[1] + ap_y,
+            ep[2] + ap_z,
+        ])  # (n_aperture, 3)
+
+        # Split coordinate for the two aperture halves
+        split_coord = ap_y if self._split_axis == "y" else ap_z
+
+        # Trace once per site: origins are always obj_pt, directions vary per site
+        # because the rays converge at the site pixel on the sensor (reverse tracing).
+        # For maximum accuracy we treat each site independently, but to amortise the
+        # bundle cost we build one batch per aperture sample across all sites.
+        #
+        # Forward trace: object → aperture → lens → (sensor side)
+        # The OPL from evaluate_bundle covers the path from obj_pt through the lens
+        # assembly to the last optical surface (G4 exit face).
+        # We then add the free-space leg from the G4 exit to the sensor pixel.
+
+        n_sites = len(self._sites)
+
+        # Build origins (n_aperture × 1 broadcast) and directions toward aperture points
+        # These are the SAME for all sites since they go from the same object to the same
+        # aperture disk.  The site-specific part is only the final leg to the pixel.
+        origins    = np.tile(obj_pt, (n_aperture, 1))     # (n_aperture, 3)
+        directions = ap_pts - obj_pt                       # (n_aperture, 3)
+
+        bundle = RayBundle(origins=origins, directions=directions)
+        result = optics.evaluate_bundle(bundle)
+
+        passed_mask = (result.status == int(TerminationReason.PASSED.value))
+        if not np.any(passed_mask):
+            return
+
+        opl_through_lens = result.opl           # (n_aperture,)
+        exit_pos         = result.origins        # (n_aperture, 3)  — G4 exit surface
+        exit_dir         = result.directions     # (n_aperture, 3)
+
+        # For each site: compute the final-leg OPL from exit surface to site pixel.
+        sensor_x = self._sensor_x
+        for site in self._sites:
+            s_pt = np.array([sensor_x, site.y_m, site.z_m], dtype=np.float64)
+
+            for k in range(n_aperture):
+                if not passed_mask[k]:
+                    continue
+
+                # Straight-line OPL from G4 exit to sensor pixel (n=1 air).
+                opl_to_pixel = float(np.linalg.norm(s_pt - exit_pos[k]))
+                total_opl    = float(opl_through_lens[k]) + opl_to_pixel
+
+                site.accumulate(
+                    aperture_y   = float(split_coord[k]),
+                    total_opl    = total_opl,
+                    wavelength_m = float(wavelength_m),
+                )
+
+    @property
+    def phase_map(self) -> np.ndarray:
+        """Return (ny, nz) array of ΔΦ values (radians)."""
+        arr = np.full((self._ny, self._nz), float("nan"), dtype=np.float64)
+        for i, site in enumerate(self._sites):
+            iy = i // self._nz
+            iz = i %  self._nz
+            arr[iy, iz] = site.phase_difference
+        return arr
+
+    @property
+    def focus_error(self) -> float:
+        """Mean ΔΦ over all valid sites (radians).
+
+        Positive → too near (sensor too close to lens); negative → too far.
+        Zero → in focus.  Convert to metres via: Δu ≈ -ΔΦ * f²λ / (π * r_ap²).
+        """
+        vals = [s.phase_difference for s in self._sites
+                if not math.isnan(s.phase_difference)]
+        return float(np.mean(vals)) if vals else 0.0
+
+    @property
+    def is_configured(self) -> bool:
+        return len(self._sites) > 0
+
+    def defocus_estimate_m(
+        self,
+        effective_focal_m: float,
+        aperture_radius_m: float,
+        wavelength_m:      float = 550e-9,
+    ) -> float:
+        """Convert mean ΔΦ to an estimated defocus (metres).
+
+        Uses the paraxial split-pupil formula:
+          Δu ≈ ΔΦ * f² * λ / (π * r_ap²)
+        where f is the effective focal length and r_ap the half-aperture.
+        Positive → object too near; negative → too far.
+        """
+        denom = math.pi * float(aperture_radius_m) ** 2
+        if denom < 1.0e-20 or effective_focal_m == 0.0:
+            return 0.0
+        return (self.focus_error * float(effective_focal_m) ** 2
+                * float(wavelength_m) / denom)
+
+
 class SensorRayCache:
     """Reusable backward camera launch rays, independent of BDPT accumulation."""
 
@@ -4907,6 +5155,7 @@ class ForwardCppLensBench:
         self._optical_transfers: OpticalTransferStore = OpticalTransferStore(max_rows=2_000_000)
         self._camera_samples: CameraSampleStore = CameraSampleStore(max_rows=2_000_000)
         self._sensor_ray_cache: SensorRayCache = SensorRayCache()
+        self._pdaf_grid: PhaseSensorGrid = PhaseSensorGrid()
         self._camera_sample_batch_id: int = 0
         self._sensor_viewfinder_last_submit_t: float = 0.0
         self._sensor_viewfinder_last_launched: int = 0
@@ -8381,25 +8630,154 @@ class ForwardCppLensBench:
             flush=True,
         )
         return True
-        if optics is not None:
-            _ap_r = float(getattr(lenses[0], "aperture_radius", 0.015)) if lenses else 0.015
-            _iris = getattr(self.scene, "iris_aperture", None)
-            if _iris is not None and bool(getattr(_iris, "enabled", False)):
-                _ap_r = min(_ap_r, float(getattr(_iris, "r_inner", _ap_r)))
-            _probe = _probe_focus_coc(
-                optics,
-                float(self.scene.object_plane.x),
-                float(getattr(getattr(self.scene, "image_plate", None), "x", 0.0)),
-                _ap_r,
-            )
-            self._focus_probe_result = _probe
-            print(
-                f"[focus-probe] traced_focus={_probe['min_coc_x']:.5f}"
-                f"  min_coc={_probe['min_coc_mm']:.3f}mm"
-                f"  coc@sensor={_probe['coc_at_sensor_mm']:.3f}mm"
-                f"  ({_probe['n_passed']} rays passed)",
-                flush=True,
-            )
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Phase-detection autofocus (PDAF)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def configure_pdaf_grid(
+        self,
+        ny: int = 8,
+        nz: int = 8,
+        split_axis: str = "y",
+    ) -> None:
+        """Set up a ny × nz phase-detection grid on the sensor.
+
+        After this call, ``measure_pdaf()`` can be called at any time to
+        populate the phase accumulators without touching the BVH or rebuild.
+
+        split_axis: ``'y'`` for horizontal PDAF (left/right aperture halves),
+                    ``'z'`` for vertical PDAF (top/bottom aperture halves).
+        """
+        plate = self.scene.image_plate
+        self._pdaf_grid.configure(
+            sensor_x      = float(plate.x),
+            sensor_half_y = float(plate.sensor_half_w),
+            sensor_half_z = float(plate.sensor_half_h),
+            ny            = int(ny),
+            nz            = int(nz),
+            split_axis    = str(split_axis),
+        )
+        print(
+            f"[pdaf] configured {ny}×{nz} sites"
+            f"  split_axis={split_axis}"
+            f"  sensor_x={float(plate.x):.5f}",
+            flush=True,
+        )
+
+    def measure_pdaf(
+        self,
+        wavelength_m:    float = 550e-9,
+        n_aperture:      int   = 64,
+        rng_seed:        int   = 0,
+    ) -> None:
+        """Trace a ray bundle to measure the phase at all PDAF sites.
+
+        For every site the method fires ``n_aperture`` forward rays from the
+        scene object plane, through the current exit pupil disk, through the
+        CompoundLens (via ``evaluate_bundle``), and computes the full OPL to
+        the site pixel.  The OPL is converted to a complex phasor and split
+        by aperture half (left y < 0 / right y ≥ 0 for split_axis='y').
+
+        Call ``get_pdaf_phase_map()`` or ``get_pdaf_focus_error()`` after.
+        """
+        if not self._pdaf_grid.is_configured:
+            print("[pdaf] grid not configured — call configure_pdaf_grid() first", flush=True)
+            return
+        optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
+        if optics is None:
+            print("[pdaf] no CompoundLens available", flush=True)
+            return
+        lasm = self._lens_assembly
+        ep_spec = lasm.backward_ray_target_spec() if lasm is not None else None
+        if ep_spec is None or float(ep_spec.radius) <= 0.0:
+            print("[pdaf] no valid exit pupil — cannot measure phase", flush=True)
+            return
+        ep_center = np.asarray(ep_spec.center, dtype=np.float64)
+        ep_radius = float(ep_spec.radius)
+
+        self._pdaf_grid.measure(
+            optics          = optics,
+            object_x        = float(self.scene.object_plane.x),
+            exit_pupil_center = ep_center,
+            exit_pupil_radius = ep_radius,
+            wavelength_m    = float(wavelength_m),
+            n_aperture      = int(max(4, n_aperture)),
+            rng_seed        = int(rng_seed),
+        )
+
+    def get_pdaf_phase_map(self) -> np.ndarray:
+        """Return (ny, nz) array of per-site phase differences (radians).
+
+        Each element is ΔΦ = arg(E_left* · E_right).  NaN for sites with
+        fewer than one sample per half.  Call ``measure_pdaf()`` first.
+        """
+        return self._pdaf_grid.phase_map
+
+    def get_pdaf_focus_error(self) -> float:
+        """Return mean ΔΦ over all valid sites as a scalar (radians).
+
+        Positive → sensor too close to lens (near-focus); negative → too far.
+        Zero → in focus.  Typical magnitude at ±1 dioptre defocus is ~0.5 rad
+        for a 50 mm f/2 lens at λ = 550 nm.
+        """
+        return self._pdaf_grid.focus_error
+
+    def get_pdaf_defocus_estimate_m(self, wavelength_m: float = 550e-9) -> float:
+        """Convert the PDAF phase error to an estimated defocus in metres.
+
+        Uses the paraxial formula Δu ≈ ΔΦ·f²·λ / (π·r_ap²).
+        Positive → focus group needs to rack forward (closer object);
+        negative → rack back (farther object).
+        """
+        optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
+        if optics is None:
+            return 0.0
+        try:
+            f_eff = float(optics.f_eff)
+            _, r_ep = optics.exit_pupil
+        except Exception:
+            return 0.0
+        return self._pdaf_grid.defocus_estimate_m(
+            effective_focal_m = f_eff,
+            aperture_radius_m = r_ep,
+            wavelength_m      = float(wavelength_m),
+        )
+
+    def autofocus_pdaf_step(
+        self,
+        wavelength_m: float = 550e-9,
+        n_aperture:   int   = 64,
+        gain:         float = 0.8,
+        max_delta_m:  float = 0.100,
+    ) -> float:
+        """Run one PDAF measurement and apply a focus correction step.
+
+        Measures the phase difference, converts it to a defocus estimate,
+        then calls ``set_focus_distance_live`` to move G4 by the correction.
+        Returns the applied focus-distance change (metres).
+
+        ``gain`` scales the estimated correction (0 < gain < 1 for damped
+        convergence).  ``max_delta_m`` clips the correction to avoid hunting.
+        """
+        if not self._pdaf_grid.is_configured:
+            self.configure_pdaf_grid()
+        self.measure_pdaf(wavelength_m=wavelength_m, n_aperture=n_aperture)
+        delta = float(np.clip(
+            self.get_pdaf_defocus_estimate_m(wavelength_m) * float(gain),
+            -float(max_delta_m),
+            float(max_delta_m),
+        ))
+        if abs(delta) < 1.0e-5:
+            return 0.0
+        current_u = float(getattr(self.scene, "focus_distance_m", 1.0) or 1.0)
+        self.set_focus_distance_live(current_u + delta)
+        print(
+            f"[pdaf-af] ΔΦ={self._pdaf_grid.focus_error:.4f} rad"
+            f"  Δu={delta*1e3:+.2f}mm",
+            flush=True,
+        )
+        return delta
 
     @property
     def focal_plane_x(self) -> float:

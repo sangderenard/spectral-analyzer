@@ -9670,8 +9670,23 @@ public:
                             gpu_ok = false;
                             break;
                         }
-                        /* Heartbeat every 8 lbatches so a crash can be located. */
-                        if ((b & 7u) == 7u) {
+                        /* Sync every 8 lbatches: drain the GPU command queue so
+                         * TDR protection applies per-batch, not per-full-run.
+                         * glFlush/glGetError above are non-blocking; glFinish here
+                         * is the actual CPU-GPU sync that makes accumulated work
+                         * safe to extend beyond. */
+                        const bool is_heartbeat = ((b & 7u) == 7u) || (b + 1u == n_batches);
+                        if (is_heartbeat) {
+                            glFinish();
+                            GLenum finish_err = glGetError();
+                            if (finish_err != GL_NO_ERROR) {
+                                fprintf(stderr,
+                                        "[T5-gpu] GL error 0x%04x after glFinish cbatch %u/%u lbatch %u/%u tile(%d,%d) — device lost? aborting\n",
+                                        (unsigned)finish_err, c + 1u, n_cbatches, b + 1u, n_batches, tx, ty);
+                                fflush(stderr);
+                                gpu_ok = false;
+                                break;
+                            }
                             const auto now = std::chrono::steady_clock::now();
                             const float elapsed = std::chrono::duration<float>(
                                     now - tile_t0).count();

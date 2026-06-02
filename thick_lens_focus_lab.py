@@ -80,6 +80,20 @@ DEBUG_BDPT_BACKTRACE_ONLY_DEFAULT = False
 RAY_RECORD_MAX_BANDS = 32
 
 
+def _spread_bits(v: np.ndarray) -> np.ndarray:
+    v = np.asarray(v, dtype=np.uint32)
+    v = (v | (v << np.uint32(8))) & np.uint32(0x00FF00FF)
+    v = (v | (v << np.uint32(4))) & np.uint32(0x0F0F0F0F)
+    v = (v | (v << np.uint32(2))) & np.uint32(0x33333333)
+    v = (v | (v << np.uint32(1))) & np.uint32(0x55555555)
+    return v
+
+
+def _morton_encode(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Interleave x and y pixel indices into a Morton (Z-order) code."""
+    return _spread_bits(x) | (_spread_bits(y) << np.uint32(1))
+
+
 class RayRecordC(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_uint8),
@@ -6133,17 +6147,20 @@ class ForwardCppLensBench:
 
         half_y = float(max(1.0e-9, plate.sensor_half_w))
         half_z = float(max(1.0e-9, plate.sensor_half_h))
-        py_grid, px_grid = np.indices((res, res), dtype=np.float64)
+        py_idx, px_idx = np.indices((res, res), dtype=np.int32)
+        morton_order = np.argsort(_morton_encode(px_idx, py_idx).reshape(-1), kind='stable')
+        py_grid = py_idx.astype(np.float64)
+        px_grid = px_idx.astype(np.float64)
         film_u = (px_grid + 0.5) / float(res)
         film_v = (py_grid + 0.5) / float(res)
         sensor_y = (film_v - 0.5) * (2.0 * half_y)
         sensor_z = (0.5 - film_u) * (2.0 * half_z)
 
-        film_uv = np.stack([film_u, film_v], axis=2).reshape(-1, 2).astype(np.float32)
+        film_uv = np.stack([film_u, film_v], axis=2).reshape(-1, 2).astype(np.float32)[morton_order]
         origins_1 = np.empty((res * res, 3), dtype=np.float64)
         origins_1[:, 0] = float(plate.x)
-        origins_1[:, 1] = sensor_y.reshape(-1)
-        origins_1[:, 2] = sensor_z.reshape(-1)
+        origins_1[:, 1] = sensor_y.reshape(-1)[morton_order]
+        origins_1[:, 2] = sensor_z.reshape(-1)[morton_order]
 
         rng = np.random.Generator(np.random.PCG64(int(seed) & ((1 << 63) - 1)))
         total = int(origins_1.shape[0] * n_ap)

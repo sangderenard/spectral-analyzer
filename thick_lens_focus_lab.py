@@ -11081,22 +11081,6 @@ def run(
             border_col=(0.20, 0.85, 0.30),
         )
 
-        # Sensor PIP click → PDAF focus at clicked pixel.
-        # glViewport uses OpenGL coords (y from BOTTOM); pygame mouse uses y from TOP.
-        # Convert: pygame_y = H - opengl_y_bottom - height.
-        _gpx  = int(_green_pip_vx)
-        _gpy  = int(H - _pip_vy - _pip_dim)   # OpenGL → pygame y
-        _gpd  = int(_pip_dim)
-        _click_buttons.append((
-            (_gpx, _gpy, _gpd, _gpd),
-            lambda _bench=bench, _gx=_gpx, _gy=_gpy, _gd=_gpd: (
-                lambda mx, my: _bench.pdaf_focus_at_film_uv(
-                    film_u = float(mx - _gx) / float(max(1, _gd)),
-                    film_v = float(my - _gy) / float(max(1, _gd)),
-                )
-            )(*pygame.mouse.get_pos()),
-        ))
-
         # --- BDPT stats text rendered as a texture quad above the PIP ---
         try:
             stats = bench.tracer.get_bdpt_stats()
@@ -11317,6 +11301,22 @@ def run(
         _lrow_vy = H - (4 + _BTN_H + 4 + _FROW_H + 4 + _ZROW_H + 4 + _LROW_H)
         _draw_quad_with_pip_prog(tex_lens_panel, _lrow_vx, _lrow_vy,
                                  _LROW_W, _LROW_H, hud_mode=True)
+
+        # Sensor PIP (green border) click → PDAF focus at clicked pixel.
+        # Registered here, after _click_buttons.clear(), so it survives to the
+        # next frame's event loop.  glViewport y is from BOTTOM; pygame y from TOP.
+        _gpx = int(_green_pip_vx)
+        _gpy = int(H - _pip_vy - _pip_dim)
+        _gpd = int(_pip_dim)
+        _click_buttons.append((
+            (_gpx, _gpy, _gpd, _gpd),
+            lambda _bench=bench, _gx=_gpx, _gy=_gpy, _gd=_gpd: (
+                lambda mx, my: _bench.pdaf_focus_at_film_uv(
+                    film_u=float(mx - _gx) / float(max(1, _gd)),
+                    film_v=float(my - _gy) / float(max(1, _gd)),
+                )
+            )(*pygame.mouse.get_pos()),
+        ))
 
         # ── C++ BDPT connection/progress stats under left violet PIP ───────
         _cx_stats = bench.bdpt_last_connection_stats

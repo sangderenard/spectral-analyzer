@@ -8461,6 +8461,7 @@ public:
         glc_Uniform1i(uloc_blit.uv_blit_mode,  blit_mode);
         glc_Uniform3fv(uloc_blit.rgb_w, std::min(nb, MAX_SPECTRAL_BANDS), blit_rgb_weights.data());
 
+        if (n_uv_groups <= 0) return;
         const unsigned int gx = (unsigned int)((res + 7) / 8);
         const unsigned int gy = (unsigned int)((res + 7) / 8);
         const unsigned int gz = (unsigned int)n_uv_groups;
@@ -9255,6 +9256,8 @@ public:
         const int ny     = arena.nz;    /* WaveArena uses nz for the second dim */
         const int nb     = arena.n_bands;
         const int n_pix  = nx * ny * nb;
+
+        if (n_pix <= 0 || nb <= 0) return;
 
         if (n_pix > cap_wave_pix) {
             cap_wave_pix = n_pix * 2;

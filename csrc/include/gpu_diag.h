@@ -125,10 +125,15 @@ static inline GLenum gpu_check_dispatch(
     static std::atomic<uint64_t> seq{0};
     const uint64_t n = seq.fetch_add(1u, std::memory_order_relaxed);
 
-    GLenum err = glGetError();
-    if (err != GL_NO_ERROR) {
-        using Clock = std::chrono::steady_clock;
-        static const Clock::time_point t0 = Clock::now();
+    using Clock = std::chrono::steady_clock;
+    static const Clock::time_point t0 = Clock::now();
+
+    /* Drain ALL pending GL errors so none leak into the next dispatch check.
+     * glGetError() returns one error per call; loop until the queue is empty. */
+    GLenum first_err = GL_NO_ERROR;
+    GLenum err;
+    while ((err = glGetError()) != GL_NO_ERROR) {
+        if (first_err == GL_NO_ERROR) first_err = err;
         const float t_s = std::chrono::duration<float>(Clock::now() - t0).count();
         fprintf(stderr,
             "[GPU-ERR] #%llu  t=%.3fs  %-22s  wg=(%u,%u,%u)  0x%04X %s\n",
@@ -137,7 +142,7 @@ static inline GLenum gpu_check_dispatch(
             (unsigned)err, gpu_gl_err_str((unsigned)err));
         fflush(stderr);
     }
-    return err;
+    return first_err;
 }
 
 /* ── Convenience macro ──────────────────────────────────────────────────── */

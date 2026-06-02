@@ -22,8 +22,12 @@ uniform int bdpt_count_base;   /* = 2 + n_mats; matches T3's bdpt_count_base */
 void main() {
     uint n_hits = counters[0];
 
-    /* Indirect dispatch params for T3 at CounterBuf[5..7] */
-    counters[5] = (n_hits + 63u) / 64u;
+    /* Indirect dispatch params for T3 at CounterBuf[5..7].
+     * Always write at least 1 so glDispatchComputeIndirect never receives a
+     * zero workgroup count (some drivers generate GL_INVALID_VALUE for that).
+     * T3 guards each invocation with "if (gid >= n_hits) return;" so the
+     * extra workgroup when n_hits==0 is harmless. */
+    counters[5] = max(1u, (n_hits + 63u) / 64u);
     counters[6] = 1u;
     counters[7] = 1u;
 

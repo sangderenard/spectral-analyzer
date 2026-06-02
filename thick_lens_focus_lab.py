@@ -5700,10 +5700,24 @@ class ForwardCppLensBench:
         stop_plane_x = float(last_lens.center_x)
         stop_radius_m = float(max(0.001, first_lens.aperture_radius))
         if self._lens_assembly is not None:
-            _bdpt_cen, _bdpt_r = self._lens_assembly.backward_physical_gate_target()
-            if _bdpt_cen is not None and _bdpt_r > 0.0:
-                stop_plane_x = float(_bdpt_cen[0])
-                stop_radius_m = float(_bdpt_r)
+            # Prefer the optical exit pupil: it is the correct image-side virtual
+            # aperture from which all chief rays appear to diverge, giving the right
+            # FOV mapping and depth-of-field angles after the parametric teleport.
+            # The physical iris and exit pupil coincide only for thin lenses; for a
+            # zoom/telephoto train they differ, and using the iris produces a
+            # compressed cone that does not match the lens's actual field coverage.
+            # Fall back to the physical iris for virtual exit pupils (behind sensor)
+            # since the C++ PIXEL_CONE cannot represent a diverging virtual source.
+            _ep_spec = self._lens_assembly.backward_ray_target_spec()
+            if _ep_spec is not None and float(_ep_spec.radius) > 0.0 and \
+                    str(_ep_spec.kind) not in ("virtual_exit_pupil",):
+                stop_plane_x = float(_ep_spec.center[0])
+                stop_radius_m = float(_ep_spec.radius)
+            else:
+                _bdpt_cen, _bdpt_r = self._lens_assembly.backward_physical_gate_target()
+                if _bdpt_cen is not None and _bdpt_r > 0.0:
+                    stop_plane_x = float(_bdpt_cen[0])
+                    stop_radius_m = float(_bdpt_r)
 
         role_emissive = int(getattr(_sk, "TRI_GROUP_ROLE_EMISSIVE", 1))
         role_sensor = int(getattr(_sk, "TRI_GROUP_ROLE_SENSOR", 2))
@@ -5758,8 +5772,9 @@ class ForwardCppLensBench:
                     # backward rays through barrel internals and contaminate the image.
                     "sensor_w_m": float(2.0 * plate.sensor_half_w),
                     "sensor_h_m": float(2.0 * plate.sensor_half_h),
-                    # Kept for ABI compatibility; backend uses this as the
-                    # explicit aperture radius (0 => hemisphere launch).
+                    # sensor_pos + focal_m * fwd places the virtual aperture disk at
+                    # stop_plane_x (exit pupil or iris).  focal_m is the sensor-to-aperture
+                    # distance and sets both the cone angle per pixel and the aperture centre.
                     "focal_m": float(max(0.05, plate.x - stop_plane_x)),
                     "aperture_radius_m": float(stop_radius_m),
                     "n_px": int(n_px),

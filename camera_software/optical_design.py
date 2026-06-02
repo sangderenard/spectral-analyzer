@@ -88,6 +88,61 @@ class ParaxialGroup:
         return 1.0 / self.focal_length_m if abs(self.focal_length_m) > _EPS else 0.0
 
 
+def _paraxial_pupils(
+    groups: Sequence[ParaxialGroup],
+    aperture_x: float,
+    aperture_r: float,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    """Return ((x_enp, r_enp), (x_ep, r_ep)) entrance and exit pupils.
+
+    Both are computed from the thin-lens paraxial model.  The entrance pupil
+    (no-parallax point for panoramic rotation) is the image of the aperture
+    stop through the front groups; the exit pupil is its image through the
+    rear groups.
+    """
+    gs = sorted(groups, key=lambda g: float(g.x_m))
+    if not gs:
+        return (aperture_x, aperture_r), (aperture_x, aperture_r)
+
+    front_gs = [g for g in gs if float(g.x_m) <= aperture_x + _EPS]
+    rear_gs  = [g for g in gs if float(g.x_m) >  aperture_x + _EPS]
+
+    # ── Entrance pupil: image of stop through front groups (reversed) ─────────
+    if front_gs:
+        x_first = float(front_gs[0].x_m)
+        M_f = paraxial_system_matrix(front_gs)
+        d_extra = aperture_x - float(front_gs[-1].x_m)
+        if abs(d_extra) > _EPS:
+            M_f = _translation(d_extra) @ M_f   # extend to aperture plane
+        A_f = float(M_f[0, 0])
+        B_f = float(M_f[0, 1])
+        D_f = float(M_f[1, 1])
+        # Chief ray back-traced: apparent crossing = x_first + B/A
+        x_enp = x_first + (B_f / A_f if abs(A_f) > _EPS else 0.0)
+        # Magnification of stop → entrance pupil image: 1/A_f (unit-det system)
+        r_enp = abs(aperture_r / A_f) if abs(A_f) > _EPS else aperture_r
+    else:
+        x_enp = float(gs[0].x_m)
+        r_enp = aperture_r
+
+    # ── Exit pupil: image of stop through rear groups ─────────────────────────
+    if rear_gs:
+        d_to_rear = float(rear_gs[0].x_m) - aperture_x
+        M_r = paraxial_system_matrix(rear_gs)
+        if abs(d_to_rear) > _EPS:
+            M_r = M_r @ _translation(d_to_rear)  # free-space from stop to first rear group
+        B_r = float(M_r[0, 1])
+        D_r = float(M_r[1, 1])
+        d_ep = (-B_r / D_r) if abs(D_r) > _EPS else 0.0
+        x_ep = float(rear_gs[-1].x_m) + d_ep
+        r_ep = abs(aperture_r / D_r) if abs(D_r) > _EPS else aperture_r
+    else:
+        x_ep = float(gs[-1].x_m)
+        r_ep = aperture_r
+
+    return (x_enp, r_enp), (x_ep, r_ep)
+
+
 @dataclass(frozen=True)
 class SolvedOpticalTrain:
     """Solved group positions plus first-order diagnostics."""
@@ -97,6 +152,11 @@ class SolvedOpticalTrain:
     aperture_radius_m: float
     assembly_front_x_m: float
     assembly_back_x_m: float
+    # Optical pupils from paraxial ABCD analysis (not heuristic).
+    # entrance_pupil = no-parallax point for panoramic rotation.
+    # exit_pupil     = image-side conjugate of the aperture stop.
+    entrance_pupil_x_m: float
+    entrance_pupil_radius_m: float
     exit_pupil_x_m: float
     exit_pupil_radius_m: float
     effective_focal_length_m: float
@@ -125,8 +185,13 @@ class SolvedOpticalTrain:
         scene.lens_stack = self.to_lens_configs()
         scene.tube_x0 = float(min(scene.tube_x0, self.assembly_front_x_m))
         scene.tube_x1 = float(max(scene.tube_x1, self.assembly_back_x_m))
+        # Optical pupils: physically meaningful positions derived from paraxial ABCD.
+        # exit_pupil_x  — used by backward-ray target selection and FOV computation.
+        # entrance_pupil_x — no-parallax rotation center for panoramic camera rigs.
         scene.exit_pupil_x = float(self.exit_pupil_x_m)
         scene.exit_pupil_radius = float(self.exit_pupil_radius_m)
+        scene.entrance_pupil_x = float(self.entrance_pupil_x_m)
+        scene.entrance_pupil_radius = float(self.entrance_pupil_radius_m)
         # Sync the sensor plane to the solved sensor position.  The image_plate
         # must live exactly where the solver put the focus, not at a stale default.
         plate = getattr(scene, "image_plate", None)
@@ -538,16 +603,19 @@ def solve_four_group_zoom_surrogate(spec: Optional[OpticalDesignSpec] = None) ->
     sensor_d = xsensor - float(groups[-1].x_m)
 
     aperture_x = float(groups[1].x_m)
-    exit_x = float(min(xsensor - 0.02, rear_limit, float(groups[-1].x_m) + max(0.25 * sensor_d, 0.015)))
+    aperture_r = float(spec.aperture_radius_m)
+    (x_enp, r_enp), (x_ep, r_ep) = _paraxial_pupils(groups, aperture_x, aperture_r)
     return SolvedOpticalTrain(
         spec=spec,
         groups=tuple(groups),
         aperture_x_m=aperture_x,
-        aperture_radius_m=float(spec.aperture_radius_m),
+        aperture_radius_m=aperture_r,
         assembly_front_x_m=float(assembly_front),
         assembly_back_x_m=float(assembly_back),
-        exit_pupil_x_m=exit_x,
-        exit_pupil_radius_m=float(spec.aperture_radius_m),
+        entrance_pupil_x_m=x_enp,
+        entrance_pupil_radius_m=r_enp,
+        exit_pupil_x_m=x_ep,
+        exit_pupil_radius_m=r_ep,
         effective_focal_length_m=float(efl),
         image_distance_m=float(img_d),
         sensor_error_m=float(img_d - sensor_d),

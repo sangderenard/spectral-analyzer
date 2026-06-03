@@ -11744,11 +11744,13 @@ def run(
             border_col=(0.20, 0.78, 1.00),
         )
 
-        # ── Pos 3 (rightmost): BDPT plate / processed — sensor view, 180° ────
+        # ── Pos 3 (rightmost): BDPT plate / processed ────────────────────────
+        # get_sensor_image() outputs rows bottom-first (GL bottom-to-top) so
+        # no vertical flip is needed.  Horizontal mirror matches sensor coords.
         bdpt_plate = bench._last_bdpt_plate_rgb
         if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
             glBindTexture(GL_TEXTURE_2D, tex_green_pip)
-            _bp_disp = _rot180(bdpt_plate)
+            _bp_disp = np.ascontiguousarray(bdpt_plate[:, ::-1], dtype=np.float32)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
                          _bp_disp.shape[1], _bp_disp.shape[0], 0,
                          GL_RGB, GL_FLOAT, _bp_disp)

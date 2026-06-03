@@ -7512,6 +7512,8 @@ struct RayPipelineState {
     std::vector<BdptSpectralWeightRecord>   bdpt_pending_spectral;
     std::vector<BdptPdfRecord>              bdpt_pending_pdfs;
     std::vector<BdptOpticalEventRecord>     bdpt_pending_optical;
+    std::atomic<int>                        pending_has_camera{0};
+    std::atomic<int>                        pending_has_light{0};
 
     /* ── Sensor-batching light-record stash ───────────────────────────────
      * When bdpt_batching_mode is true, run_bdpt_connection() saves the
@@ -7534,12 +7536,50 @@ struct RayPipelineState {
     std::atomic<uint64_t>     bdpt_overflow_connections{0};
 
     /* Bounded push helpers — drop + count when at cap. */
+    void mark_bdpt_stream_pending(uint8_t stream) {
+        if (stream == BDPT_SIDE_SENSOR)
+            pending_has_camera.store(1, std::memory_order_release);
+        else if (stream == BDPT_SIDE_LIGHT)
+            pending_has_light.store(1, std::memory_order_release);
+    }
+
+    template<typename T>
+    void push_bdpt_many(std::vector<T>& items,
+                        int cap,
+                        PipelineQueue<T>& queue,
+                        std::atomic<uint64_t>& overflow) {
+        if (items.empty()) return;
+        if (cap <= 0) {
+            queue.push_many(items);
+            return;
+        }
+        const int room = cap - queue.size();
+        if (room <= 0) {
+            overflow.fetch_add(static_cast<uint64_t>(items.size()), std::memory_order_relaxed);
+            items.clear();
+            return;
+        }
+        if (room >= static_cast<int>(items.size())) {
+            queue.push_many(items);
+            return;
+        }
+        std::vector<T> accepted;
+        accepted.reserve(static_cast<size_t>(room));
+        for (int i = 0; i < room; ++i)
+            accepted.push_back(std::move(items[static_cast<size_t>(i)]));
+        queue.push_many(accepted);
+        overflow.fetch_add(static_cast<uint64_t>(items.size() - static_cast<size_t>(room)),
+                           std::memory_order_relaxed);
+        items.clear();
+    }
+
     void push_bdpt_vertex(BdptVertexRecord r) {
         int cap = cfg.bdpt_max_vertices;
         if (cap > 0 && Q_bdpt_vertices.size() >= cap) {
             bdpt_overflow_vertices.fetch_add(1, std::memory_order_relaxed);
             return;
         }
+        mark_bdpt_stream_pending(r.stream);
         Q_bdpt_vertices.push(std::move(r));
     }
     void push_bdpt_spectral(BdptSpectralWeightRecord r) {
@@ -7550,6 +7590,9 @@ struct RayPipelineState {
         }
         Q_bdpt_spectral.push(std::move(r));
     }
+    void push_bdpt_spectral_many(std::vector<BdptSpectralWeightRecord>& items) {
+        push_bdpt_many(items, cfg.bdpt_max_spectral, Q_bdpt_spectral, bdpt_overflow_spectral);
+    }
     void push_bdpt_pdf(BdptPdfRecord r) {
         int cap = cfg.bdpt_max_pdfs;
         if (cap > 0 && Q_bdpt_pdfs.size() >= cap) {
@@ -7557,6 +7600,9 @@ struct RayPipelineState {
             return;
         }
         Q_bdpt_pdfs.push(std::move(r));
+    }
+    void push_bdpt_pdf_many(std::vector<BdptPdfRecord>& items) {
+        push_bdpt_many(items, cfg.bdpt_max_pdfs, Q_bdpt_pdfs, bdpt_overflow_pdfs);
     }
     void push_bdpt_optical(BdptOpticalEventRecord r) {
         int cap = cfg.bdpt_max_optical;
@@ -7597,8 +7643,8 @@ struct RayPipelineState {
      * ch1 = G  (green-weighted)
      * ch2 = B  (blue-weighted)
      * ch3 = near-miss accumulator (debug only, not displayed)
-     * Protected by sensor_mu; read by ray_pipeline_get_sensor_image(). */
-    mutable std::mutex        sensor_mu;
+     * Protected by sensor_mu[channel]; read by ray_pipeline_get_sensor_image(). */
+    mutable std::mutex        sensor_mu[4];
     int                       sensor_res  = 0;   /* 0 = disabled */
     float                     sensor_px   = 0.0f;
     float                     sensor_half_w = 0.0f;
@@ -9151,7 +9197,7 @@ public:
             /* Apply all updates under a short-held lock, tracking peaks
              * incrementally so get_sensor_image() skips the O(res²) scan. */
             if (!sensor_updates.empty()) {
-                std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                std::scoped_lock lk(ps.sensor_mu[0], ps.sensor_mu[1], ps.sensor_mu[2]);
                 for (const auto& u : sensor_updates) {
                     const size_t px = (size_t)(u.iy * res + u.iz);
                     const double vr = (ps.sensor_accum[0*(size_t)res*res + px] += u.r);
@@ -10017,6 +10063,7 @@ static void wave_arena_build(
     arena.id     = id;
     arena.center = V3d(ctx.center[0], ctx.center[1], ctx.center[2]);
     arena.radius = ctx.radius;
+    arena.radius_sq = arena.radius * arena.radius;
     arena.n_real = (ctx.n_real > 0.0) ? ctx.n_real : 1.0;
     arena.dz     = (ctx.dt_m > 0.0) ? ctx.dt_m : cfg.wave_grid_dx_m * 0.5;
     arena.nz     = (ctx.n_substeps > 0) ? ctx.n_substeps
@@ -10232,6 +10279,10 @@ static void pipeline_intersector(RayPipelineState& ps)
     RayTracerState& st      = *ps.st;
     const bool      has_bvh = !st.bvh_nodes.empty();
     std::vector<RayIntent> batch;
+    std::vector<RayRecord> out_batch;
+    std::vector<HitRecord> hit_batch;
+    std::vector<WaveIntent> wave_batch;
+    int finish_count = 0;
     std::mt19937 t1_rng(static_cast<uint32_t>(ps.cfg.seed) ^ 0xDEADBEEFu);
 
     while (true) {
@@ -10247,6 +10298,13 @@ static void pipeline_intersector(RayPipelineState& ps)
         if (n == 0) break;
 
         auto t0 = Clock::now();
+        out_batch.clear();
+        hit_batch.clear();
+        wave_batch.clear();
+        finish_count = 0;
+        out_batch.reserve(static_cast<size_t>(n));
+        hit_batch.reserve(static_cast<size_t>(n));
+        wave_batch.reserve(static_cast<size_t>(n));
 
         for (auto& intent : batch) {
             const V3d pos0 = intent.pos;
@@ -10283,8 +10341,8 @@ static void pipeline_intersector(RayPipelineState& ps)
                 rec.color_flag = intent.color_flag;
                 rec.sensor_origin_y = intent.sensor_origin_y;
                 rec.sensor_origin_z = intent.sensor_origin_z;
-                ps.Q_out.push(std::move(rec));
-                pipeline_finish_ray(ps);
+                out_batch.push_back(std::move(rec));
+                ++finish_count;
                 continue;
             }
 
@@ -10318,8 +10376,8 @@ static void pipeline_intersector(RayPipelineState& ps)
 
             int wave_id = -1;
             for (int ai = 0; ai < (int)ps.arenas.size(); ++ai) {
-                if ((hit_pos - ps.arenas[static_cast<size_t>(ai)].center).norm()
-                        <= ps.arenas[static_cast<size_t>(ai)].radius) {
+                const WaveArena& arena = ps.arenas[static_cast<size_t>(ai)];
+                if ((hit_pos - arena.center).squaredNorm() <= arena.radius_sq) {
                     wave_id = ai;
                     break;
                 }
@@ -10388,7 +10446,7 @@ static void pipeline_intersector(RayPipelineState& ps)
                     rec.amp_re[b] = static_cast<float>(amp_prop[b].real());
                     rec.amp_im[b] = static_cast<float>(amp_prop[b].imag());
                 }
-                ps.Q_out.push(std::move(rec));
+                out_batch.push_back(std::move(rec));
             }
 
             /* ── BDPT vertex record (T1) ─────────────────────────────────
@@ -10453,7 +10511,7 @@ static void pipeline_intersector(RayPipelineState& ps)
                             cr += amp * wr; cg += amp * wg; cb += amp * wb;
                         }
                         const size_t px0 = static_cast<size_t>(iy * res + iz);
-                        std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                        std::scoped_lock lk(ps.sensor_mu[0], ps.sensor_mu[1], ps.sensor_mu[2]);
                         const double nr = (ps.sensor_accum[0*(size_t)res*res + px0] += cr);
                         const double ng = (ps.sensor_accum[1*(size_t)res*res + px0] += cg);
                         const double nb_ = (ps.sensor_accum[2*(size_t)res*res + px0] += cb);
@@ -10471,11 +10529,17 @@ static void pipeline_intersector(RayPipelineState& ps)
                 wi.ray.path_len = tot_len;
                 wi.ray.interaction_flags |= (1u << SCALE_CONTEXT_KIND_WAVE_HELMHOLTZ);
                 wi.arena_id = wave_id;
-                ps.Q_wave.push(std::move(wi));
+                wave_batch.push_back(std::move(wi));
             } else {
-                ps.Q_hit.push(std::move(hr));
+                hit_batch.push_back(std::move(hr));
             }
         }
+
+        ps.Q_out.push_many(out_batch);
+        ps.Q_wave.push_many(wave_batch);
+        ps.Q_hit.push_many(hit_batch);
+        for (int i = 0; i < finish_count; ++i)
+            pipeline_finish_ray(ps);
 
         auto t1 = Clock::now();
         ps.stats[0].record(n,
@@ -10643,8 +10707,13 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
     RayTracerState& st = *ps.st;
     std::mt19937_64 rng(rng_seed);
     std::uniform_real_distribution<double> U01(0.0, 1.0);
+    std::vector<RayRecord> out_batch;
+    std::vector<RayIntent> child_batch;
+    std::vector<uint8_t> finish_batch;
+    thread_local std::vector<BdptPdfRecord> bdpt_pdf_batch;
+    thread_local std::vector<BdptSpectralWeightRecord> bdpt_spectral_batch;
 
-    /* Build a TERMINAL RayRecord from a HitRecord and push to Q_out. */
+    /* Build a TERMINAL RayRecord from a HitRecord and stage it for Q_out. */
     auto push_terminal = [&](const HitRecord& h) {
         RayRecord rec;
         rec.kind              = RayRecordKind::TERMINAL;
@@ -10677,7 +10746,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             rec.amp_re[b] = static_cast<float>(h.amp_propagated[b].real());
             rec.amp_im[b] = static_cast<float>(h.amp_propagated[b].imag());
         }
-        ps.Q_out.push(std::move(rec));
+        out_batch.push_back(std::move(rec));
     };
 
     std::vector<RefinedHit> batch;
@@ -10688,6 +10757,24 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         int n   = ps.Q_refined.pop_batch(batch, bsz);
         if (n == 0) break;
         auto t0 = Clock::now();
+        out_batch.clear();
+        child_batch.clear();
+        finish_batch.clear();
+        bdpt_pdf_batch.clear();
+        bdpt_spectral_batch.clear();
+        out_batch.reserve(static_cast<size_t>(n));
+        child_batch.reserve(static_cast<size_t>(n) * static_cast<size_t>(std::max(1, ps.cfg.max_children)));
+        finish_batch.reserve(static_cast<size_t>(n));
+
+        auto enqueue_child = [&](RayIntent child) {
+            const uint8_t cf = child.color_flag;
+            ++ps.in_flight;
+            bdpt_family_spawn(ps, cf);
+            child_batch.push_back(std::move(child));
+        };
+        auto finish_later = [&](uint8_t color_flag) {
+            finish_batch.push_back(color_flag);
+        };
 
         for (auto& rh : batch) {
             const HitRecord& hr     = rh.base;
@@ -10769,7 +10856,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         /* ── Terminal: aperture stop ── */
         if (tri.flags & MAT_FLAG_APERTURE_STOP) {
             push_terminal(hr);
-            pipeline_finish_ray(ps, ray_cf);
+            finish_later(ray_cf);
             continue;
         }
         /* ── Terminal: emissive ── */
@@ -10777,7 +10864,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             HitRecord eh = hr;
             eh.is_emissive_hit = true;
             push_terminal(eh);
-            pipeline_finish_ray(ps, ray_cf);
+            finish_later(ray_cf);
             /* ── Sensor accumulator (T3): backward ray found emissive surface.
              * Use sensor_origin_y/z (set at submit time, propagated through all
              * children) so this works regardless of how many refractions the ray
@@ -10800,7 +10887,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                         cr += a * wr; cg += a * wg; cb += a * wb;
                     }
                     const size_t px0 = static_cast<size_t>(iy * res + iz);
-                    std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                    std::scoped_lock lk(ps.sensor_mu[0], ps.sensor_mu[1], ps.sensor_mu[2]);
                     const double nr  = (ps.sensor_accum[0*(size_t)res*res + px0] += cr);
                     const double ng  = (ps.sensor_accum[1*(size_t)res*res + px0] += cg);
                     const double nb_ = (ps.sensor_accum[2*(size_t)res*res + px0] += cb);
@@ -10814,7 +10901,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         /* ── Budget exhausted ── */
         if (hr.ray.bounces_left <= 0) {
             push_terminal(hr);
-            pipeline_finish_ray(ps, ray_cf);
+            finish_later(ray_cf);
             continue;
         }
 
@@ -10869,7 +10956,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             pr.jacobian_det  = 1.0f;
             pr.geometry_term = geom;
             pr.flags         = tri.flags | extra_flags;
-            ps.push_bdpt_pdf(pr);
+            bdpt_pdf_batch.push_back(std::move(pr));
             /* Per-band spectral weights. */
             for (int _b = 0; _b < nb; ++_b) {
                 BdptSpectralWeightRecord sw{};
@@ -10882,7 +10969,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                     ? static_cast<float>(st.freq_hz_vec[static_cast<size_t>(_b)]) : 0.0f;
                 sw.band_pdf           = (nb > 0) ? 1.0f / static_cast<float>(nb) : 1.0f;
                 sw.sensor_rgb_weight  = tp;
-                ps.push_bdpt_spectral(sw);
+                bdpt_spectral_batch.push_back(std::move(sw));
             }
         };
 
@@ -10986,7 +11073,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                                         (sz + ps.sensor_half_h) * inv_h);
                                     if (iy >= 0 && iy < res_s && iz >= 0 && iz < res_s) {
                                         const int idx2 = 2 * res_s * res_s + iy * res_s + iz;
-                                        std::lock_guard<std::mutex> lk(ps.sensor_mu);
+                                        std::lock_guard<std::mutex> lk(ps.sensor_mu[2]);
                                         const double nv = (ps.sensor_accum[static_cast<size_t>(idx2)]
                                             += contrib_mag);
                                         if (nv > ps.sensor_peak[2]) ps.sensor_peak[2] = nv;
@@ -11009,7 +11096,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                     ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
                 emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE, 1.0f, 1.0f,
                              BDPT_PDF_FLAG_DELTA_SPECULAR);
-                pipeline_spawn_child(ps, make_child(rd, ra));
+                enqueue_child(make_child(rd, ra));
             } else {
                 const double sin2_t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
                 const double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
@@ -11029,7 +11116,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                         emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE,
                                      static_cast<float>(R), static_cast<float>(R),
                                      BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
-                        pipeline_spawn_child(ps, make_child(rd, ra));
+                        enqueue_child(make_child(rd, ra));
                     }
                     {
                         VXcd ta = amp;
@@ -11040,7 +11127,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                                      static_cast<float>(1.0 - R),
                                      static_cast<float>(1.0 - R_rev),
                                      BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
-                        pipeline_spawn_child(ps, make_child(refracted, ta, new_med));
+                        enqueue_child(make_child(refracted, ta, new_med));
                     }
                 } else {
                     /* Russian roulette: one lobe sampled with probability R. */
@@ -11052,14 +11139,14 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                         emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE,
                                      static_cast<float>(R), static_cast<float>(R),
                                      BDPT_PDF_FLAG_DELTA_SPECULAR);
-                        pipeline_spawn_child(ps, make_child(rd, ra));
+                        enqueue_child(make_child(rd, ra));
                     } else {
                         VXcd ta = amp;
                         emit_scatter(refracted, ta, BDPT_DOMAIN_SOLID_ANGLE,
                                      static_cast<float>(1.0 - R),
                                      static_cast<float>(1.0 - R_rev),
                                      BDPT_PDF_FLAG_DELTA_SPECULAR);
-                        pipeline_spawn_child(ps, make_child(refracted, ta, new_med));
+                        enqueue_child(make_child(refracted, ta, new_med));
                     }
                 }
             }
@@ -11069,7 +11156,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 static_cast<size_t>(tri.mat_idx) < ps.mat_epsilon_flags.size() &&
                 ps.mat_epsilon_flags[static_cast<size_t>(tri.mat_idx)]) {
                 push_terminal(hr);
-                pipeline_finish_ray(ps, ray_cf);
+                finish_later(ray_cf);
                 continue;
             }
 
@@ -11094,7 +11181,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             }
             if (new_dir.dot(hit_n) <= 0.0) {
                 push_terminal(hr);
-                pipeline_finish_ray(ps, ray_cf);
+                finish_later(ray_cf);
                 continue;
             }
             VXcd na = amp;
@@ -11130,20 +11217,27 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 }
                 if (!(scatter_pdf > 0.0f) || !(scatter_pdf_rev > 0.0f)) {
                     push_terminal(hr);
-                    pipeline_finish_ray(ps, ray_cf);
+                    finish_later(ray_cf);
                     continue;
                 }
                 emit_scatter(new_dir, na,
                              chose_diffuse ? BDPT_DOMAIN_PROJ_SOLID_ANGLE : BDPT_DOMAIN_SOLID_ANGLE,
                              scatter_pdf, scatter_pdf_rev, scatter_flags);
-                pipeline_spawn_child(ps, make_child(new_dir, na));
+                enqueue_child(make_child(new_dir, na));
             } else {
                 push_terminal(hr);  /* amplitude extinguished */
             }
         }
 
-        pipeline_finish_ray(ps, ray_cf);
+        finish_later(ray_cf);
     }  /* end for rh : batch */
+
+        ps.push_bdpt_pdf_many(bdpt_pdf_batch);
+        ps.push_bdpt_spectral_many(bdpt_spectral_batch);
+        ps.Q_out.push_many(out_batch);
+        ps.Q_intent.push_many(child_batch);
+        for (uint8_t cf : finish_batch)
+            pipeline_finish_ray(ps, cf);
 
         auto t1 = Clock::now();
         ps.stats[2].record(n,
@@ -11263,6 +11357,7 @@ RayPipelineState* ray_pipeline_create(
 
     const uint64_t base  = static_cast<uint64_t>(ps->cfg.seed);
     const int      n_hw  = std::max(1, (int)std::thread::hardware_concurrency());
+    const int      n_t1  = std::max(2, n_hw / 4);
     const int      n_t3  = std::max(1, n_hw / 2);
 
     /* Pre-compute epsilon material flags before any CPU/GPU worker can consume
@@ -11275,7 +11370,8 @@ RayPipelineState* ray_pipeline_create(
     const bool defer_cpu = ps->cfg.use_gpu_compute && ps->cfg.gpu_all_stages;
 
     auto spawn_cpu_stages = [&]() {
-        ps->workers.emplace_back([ps](){ pipeline_intersector(*ps); });
+        for (int i = 0; i < n_t1; ++i)
+            ps->workers.emplace_back([ps](){ pipeline_intersector(*ps); });
         ps->workers.emplace_back([ps](){ pipeline_refiner(*ps); });
         for (int i = 0; i < n_t3; ++i) {
             uint64_t seed_i = base ^ (static_cast<uint64_t>(0xDEADBEEFULL) * static_cast<uint64_t>(i + 1));
@@ -11759,10 +11855,75 @@ int ray_pipeline_submit_emissive_triangles(
             uint32_t sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
             if (sid == 0u)
                 sid = ps->bdpt_next_subpath_id.fetch_add(1u, std::memory_order_relaxed);
+
+            V3d bdpt_emit_n = emit_n;
+            if (bdpt_emit_n.dot(dir) < 0.0)
+                bdpt_emit_n = -bdpt_emit_n;
+            const double cos_emit = std::max(0.0, bdpt_emit_n.dot(dir));
+            const float pdf_emit_sa = static_cast<float>(std::max(cos_emit / M_PI, 1.0e-12));
+            const int grp = (tri_id >= 0 && static_cast<size_t>(tri_id) < st.tri_param_group_of_tri.size())
+                ? st.tri_param_group_of_tri[static_cast<size_t>(tri_id)] : -1;
+
+            BdptVertexRecord vr{};
+            vr.subpath_id        = sid;
+            vr.vertex_index      = 0u;
+            vr.stream            = BDPT_SIDE_LIGHT;
+            vr.sample_domain     = BDPT_DOMAIN_AREA;
+            vr.flags             = T.flags;
+            vr.strategy_id       = 0u;
+            vr.tri_id            = tri_id;
+            vr.group_id          = grp;
+            vr.mat_idx           = mat;
+            vr.pos[0]            = static_cast<float>(origin.x());
+            vr.pos[1]            = static_cast<float>(origin.y());
+            vr.pos[2]            = static_cast<float>(origin.z());
+            vr.normal[0]         = static_cast<float>(bdpt_emit_n.x());
+            vr.normal[1]         = static_cast<float>(bdpt_emit_n.y());
+            vr.normal[2]         = static_cast<float>(bdpt_emit_n.z());
+            vr.dir_in[0]         = static_cast<float>(-dir.x());
+            vr.dir_in[1]         = static_cast<float>(-dir.y());
+            vr.dir_in[2]         = static_cast<float>(-dir.z());
+            vr.dir_out[0]        = static_cast<float>(dir.x());
+            vr.dir_out[1]        = static_cast<float>(dir.y());
+            vr.dir_out[2]        = static_cast<float>(dir.z());
+            vr.pdf_fwd           = pdf_emit_sa;
+            vr.pdf_rev           = pdf_emit_sa;
+            vr.pdf_solid_angle   = pdf_emit_sa;
+            vr.throughput_scalar = static_cast<float>(emit_sum);
+            ps->push_bdpt_vertex(vr);
+
+            BdptPdfRecord pr{};
+            pr.subpath_id        = sid;
+            pr.vertex_index      = 0u;
+            pr.sample_domain     = BDPT_DOMAIN_PROJ_SOLID_ANGLE;
+            pr.measure           = BDPT_DOMAIN_PROJ_SOLID_ANGLE;
+            pr.pdf_fwd           = pdf_emit_sa;
+            pr.pdf_rev           = pdf_emit_sa;
+            pr.pdf_solid_angle   = pdf_emit_sa;
+            pr.jacobian_det      = 1.0f;
+            pr.geometry_term     = static_cast<float>(cos_emit);
+            pr.flags             = T.flags | BDPT_PDF_FLAG_EMISSION;
+            ps->push_bdpt_pdf(pr);
+
+            for (int b = 0; b < nb; ++b) {
+                BdptSpectralWeightRecord sw{};
+                sw.subpath_id           = sid;
+                sw.vertex_index         = 0u;
+                sw.band_id              = static_cast<uint16_t>(b);
+                sw.beta_re              = static_cast<float>(emit[static_cast<size_t>(b)].real());
+                sw.beta_im              = static_cast<float>(emit[static_cast<size_t>(b)].imag());
+                sw.wavelength_or_center = (b < static_cast<int>(st.freq_hz_vec.size()))
+                    ? static_cast<float>(st.freq_hz_vec[static_cast<size_t>(b)]) : 0.0f;
+                sw.band_pdf             = (nb > 0) ? 1.0f / static_cast<float>(nb) : 1.0f;
+                sw.sensor_rgb_weight    = 1.0f;
+                ps->push_bdpt_spectral(sw);
+            }
+
             ri.bdpt_subpath_id = sid;
-            ri.bdpt_vertex = 0u;
+            ri.bdpt_vertex = 1u;
             ri.bdpt_stream = BDPT_SIDE_LIGHT;
             ri.bdpt_strategy = 0u;
+            ri.bounce = 1;
             schedule.push_back(MortonIntent{static_cast<uint32_t>(j), morton_key, static_cast<uint32_t>(di), seq++, std::move(ri)});
             ++submitted;
             }
@@ -12250,13 +12411,8 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         ps->bdpt_pending_optical.insert(ps->bdpt_pending_optical.end(),
                                         optical_new.begin(), optical_new.end());
 
-        bool have_camera = false;
-        bool have_light  = false;
-        for (const auto& v : ps->bdpt_pending_vertices) {
-            if (v.stream == BDPT_SIDE_SENSOR) have_camera = true;
-            else if (v.stream == BDPT_SIDE_LIGHT) have_light = true;
-            if (have_camera && have_light) break;
-        }
+        const bool have_camera = ps->pending_has_camera.load(std::memory_order_acquire) != 0;
+        const bool have_light  = ps->pending_has_light.load(std::memory_order_acquire) != 0;
         fprintf(stderr, "[T5-conn] pending after merge: total=%zu have_camera=%d have_light=%d\n",
                 ps->bdpt_pending_vertices.size(), (int)have_camera, (int)have_light);
         fflush(stderr);
@@ -12273,6 +12429,8 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         sweights.swap(ps->bdpt_pending_spectral);
         pdfs.swap(ps->bdpt_pending_pdfs);
         optical.swap(ps->bdpt_pending_optical);
+        ps->pending_has_camera.store(0, std::memory_order_release);
+        ps->pending_has_light.store(0, std::memory_order_release);
         t5_work_items = verts.size() + sweights.size() + pdfs.size() + optical.size();
     }
 
@@ -12309,9 +12467,21 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             merged.insert(merged.end(), ps->bdpt_stash_v.begin(), ps->bdpt_stash_v.end());
             merged.insert(merged.end(), verts.begin(), verts.end());
             verts = std::move(merged);
-            sweights.insert(sweights.begin(), ps->bdpt_stash_sw.begin(), ps->bdpt_stash_sw.end());
-            pdfs.insert(pdfs.begin(),     ps->bdpt_stash_pdf.begin(), ps->bdpt_stash_pdf.end());
-            optical.insert(optical.begin(), ps->bdpt_stash_opt.begin(), ps->bdpt_stash_opt.end());
+            std::vector<BdptSpectralWeightRecord> merged_sw;
+            merged_sw.reserve(ps->bdpt_stash_sw.size() + sweights.size());
+            merged_sw.insert(merged_sw.end(), ps->bdpt_stash_sw.begin(), ps->bdpt_stash_sw.end());
+            merged_sw.insert(merged_sw.end(), sweights.begin(), sweights.end());
+            sweights = std::move(merged_sw);
+            std::vector<BdptPdfRecord> merged_pdf;
+            merged_pdf.reserve(ps->bdpt_stash_pdf.size() + pdfs.size());
+            merged_pdf.insert(merged_pdf.end(), ps->bdpt_stash_pdf.begin(), ps->bdpt_stash_pdf.end());
+            merged_pdf.insert(merged_pdf.end(), pdfs.begin(), pdfs.end());
+            pdfs = std::move(merged_pdf);
+            std::vector<BdptOpticalEventRecord> merged_opt;
+            merged_opt.reserve(ps->bdpt_stash_opt.size() + optical.size());
+            merged_opt.insert(merged_opt.end(), ps->bdpt_stash_opt.begin(), ps->bdpt_stash_opt.end());
+            merged_opt.insert(merged_opt.end(), optical.begin(), optical.end());
+            optical = std::move(merged_opt);
         }
     }
 
@@ -12330,14 +12500,15 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         beta_lut[k] = {sw.beta_re, sw.beta_im};
     }
 
-    /* Build PDF LUT: key = subpath_id<<32 | vertex_index<<16 | sample_domain */
-    std::unordered_map<uint64_t, BdptPdfRecord> pdf_lut;
+    /* Build PDF LUT: key = subpath_id<<32 | vertex_index.  The value keeps
+     * any domain-specific records for that vertex and pdf_for() selects the
+     * preferred domain with one hash probe. */
+    std::unordered_map<uint64_t, std::vector<BdptPdfRecord>> pdf_lut;
     pdf_lut.reserve(pdfs.size());
     for (const auto& pr : pdfs) {
         const uint64_t k = ((uint64_t)pr.subpath_id << 32)
-                         | ((uint64_t)pr.vertex_index << 16)
-                         | (uint64_t)pr.sample_domain;
-        pdf_lut[k] = pr;
+                         | (uint64_t)pr.vertex_index;
+        pdf_lut[k].push_back(pr);
     }
 
     std::unordered_map<uint64_t, std::vector<BdptOpticalEventRecord>> optical_lut;
@@ -12704,7 +12875,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     uint64_t exact_total = 0;
     {
-        std::lock_guard<std::mutex> lk(ps->sensor_mu);
+        std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2]);
 
         /* ── GPU pixel accum merge ───────────────────────────────────── *
          * The GPU shader packs R[res²] G[res²] B[res²] as uint32 bit-   *
@@ -12762,8 +12933,10 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
         std::lock_guard<std::mutex> pending_lk(ps->bdpt_pending_mu);
         for (const auto& v : verts)
-            if (v.stream == BDPT_SIDE_SENSOR)
+            if (v.stream == BDPT_SIDE_SENSOR) {
                 ps->bdpt_pending_vertices.push_back(v);
+                ps->mark_bdpt_stream_pending(v.stream);
+            }
         for (const auto& sw : sweights)
             if (camera_sids.find(sw.subpath_id) != camera_sids.end())
                 ps->bdpt_pending_spectral.push_back(sw);
@@ -13067,7 +13240,7 @@ void ray_pipeline_configure_sensor_image(
     float target_r)
 {
     if (!ps) return;
-    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+    std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2], ps->sensor_mu[3]);
     ps->sensor_res    = res;
     ps->sensor_px     = plate_x;
     ps->sensor_half_w = (plate_half_w > 0.0f) ? plate_half_w : 0.028f;
@@ -13089,7 +13262,7 @@ void ray_pipeline_get_sensor_image(
 {
     if (out_res) *out_res = 0;
     if (!ps || ps->sensor_res <= 0) return;
-    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+    std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2]);
     const int res = ps->sensor_res;
     if (out_res) *out_res = res;
     if (!buf) return;
@@ -13126,7 +13299,7 @@ void ray_pipeline_get_priority_map(
 {
     if (out_res) *out_res = 0;
     if (!ps || ps->sensor_res <= 0) return;
-    std::lock_guard<std::mutex> lk(ps->sensor_mu);
+    std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2], ps->sensor_mu[3]);
     const int res = ps->sensor_res;
     if (out_res) *out_res = res;
     if (!buf || ps->priority_map.empty()) return;

@@ -176,6 +176,7 @@ layout(std430, binding = 4) readonly buffer T5SpectralWeightBuf {
 #define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)
 #define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)
 #define BDPT_PDF_FLAG_GGX             (1u << 20)
+#define BDPT_PDF_FLAG_EMISSION        (1u << 21)
 
 #define PI 3.14159265358979323846f
 
@@ -242,7 +243,9 @@ float scatter_conn_pdf_area(
 
     float spec_p = max(0.0f, 1.0f - diffuse_p);
     float pdf_sa = 0.0f;
-    if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
+    if ((pdf_flags & BDPT_PDF_FLAG_EMISSION) != 0u) {
+        pdf_sa = cos_out / PI;
+    } else if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
         if (diffuse_p <= 0.0f) return 0.0f;
         pdf_sa = diffuse_p * cos_out / PI;
     } else if ((pdf_flags & BDPT_PDF_FLAG_GGX) != 0u) {
@@ -511,7 +514,7 @@ void main() {
         const uint c_flags       = floatBitsToUint(s_cam[sc +  7u]);
         const uint c_pdf_flags   = floatBitsToUint(s_cam[sc + 17u]);
         const uint c_optical_blk = floatBitsToUint(s_cam[sc + 18u]);
-        const uint ci            = c_vinfo & 0x7FFFu;
+        const uint ci            = c_vinfo & 0xFFFFu;
         const uint cam_flat_base = gid_c - ci;
 
         /* Load light vert from shared memory. */
@@ -519,18 +522,30 @@ void main() {
         const vec3  l_pos  = vec3(s_light[sl+0u], s_light[sl+1u], s_light[sl+2u]);
         const vec3  l_norm = vec3(s_light[sl+3u], s_light[sl+4u], s_light[sl+5u]);
         const float l_beta = s_light[sl+10u];
+        float l_beta_r = 0.0f, l_beta_g = 0.0f, l_beta_b = 0.0f;
+        {
+            const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+            for (int _b = 0; _b < nb; ++_b) {
+                const float bm = s_light[sl + uint(LGV_BAND_BASE + _b)];
+                if (bm <= 0.0f) continue;
+                l_beta_r += bm * spectral_weights[_b * 3 + 0];
+                l_beta_g += bm * spectral_weights[_b * 3 + 1];
+                l_beta_b += bm * spectral_weights[_b * 3 + 2];
+            }
+        }
 
         const uint l_vinfo       = floatBitsToUint(s_light[sl +  9u]);
         const uint l_flags       = floatBitsToUint(s_light[sl +  7u]);
         const uint l_pdf_flags   = floatBitsToUint(s_light[sl + 13u]);
         const uint l_optical_blk = floatBitsToUint(s_light[sl + 14u]);
-        const uint li_v            = l_vinfo & 0x7FFFu;
+        const uint li_v            = l_vinfo & 0xFFFFu;
         const uint light_flat_base = gid_l - li_v;
 
         if (vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk) &&
             vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk) &&
             c_beta_r + c_beta_g + c_beta_b >= 1e-15f &&
-            l_beta >= 1e-15f)
+            l_beta >= 1e-15f &&
+            l_beta_r + l_beta_g + l_beta_b >= 1e-15f)
         {
             /* ── Geometry term ─────────────────────────────────────────── */
             const vec3  dv    = l_pos - c_pos;
@@ -574,10 +589,10 @@ void main() {
                             conn_fwd, conn_bwd, selected_pdf, denom))
                     {
                         /* β_cam × β_light × G / denom  (selected_pdf cancels) */
-                        const float contrib = l_beta * geom / denom;
-                        s_lum_r[tid] = c_beta_r * contrib;
-                        s_lum_g[tid] = c_beta_g * contrib;
-                        s_lum_b[tid] = c_beta_b * contrib;
+                        const float contrib = geom / denom;
+                        s_lum_r[tid] = c_beta_r * l_beta_r * contrib;
+                        s_lum_g[tid] = c_beta_g * l_beta_g * contrib;
+                        s_lum_b[tid] = c_beta_b * l_beta_b * contrib;
                     }
                 }
             }
@@ -624,4 +639,3 @@ void main() {
         }
     }
 }
-

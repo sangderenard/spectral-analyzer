@@ -125,7 +125,7 @@ struct T5ConnContext {
     /* ── LUT references (non-owning; lifetime == enclosing function scope) */
     const std::unordered_map<uint64_t, std::complex<float>>&
         beta_lut;
-    const std::unordered_map<uint64_t, BdptPdfRecord>&
+    const std::unordered_map<uint64_t, std::vector<BdptPdfRecord>>&
         pdf_lut;
     const std::unordered_map<uint64_t, std::vector<BdptOpticalEventRecord>>&
         optical_lut;
@@ -155,7 +155,7 @@ struct T5ConnContext {
     /* ── Constructor ──────────────────────────────────────────────────── */
     T5ConnContext(
         const std::unordered_map<uint64_t, std::complex<float>>&              bl,
-        const std::unordered_map<uint64_t, BdptPdfRecord>&                    pl,
+        const std::unordered_map<uint64_t, std::vector<BdptPdfRecord>>&       pl,
         const std::unordered_map<uint64_t, std::vector<BdptOpticalEventRecord>>& ol,
         RayPipelineState*      pipeline_state,
         int    nb,
@@ -187,18 +187,20 @@ struct T5ConnContext {
     const BdptPdfRecord*
     pdf_for(uint32_t sid, uint16_t vi) const
     {
-        const uint64_t base = ((uint64_t)sid << 32) | ((uint64_t)vi << 16);
-        const uint64_t domains[] = {
+        const uint64_t k = ((uint64_t)sid << 32) | (uint64_t)vi;
+        auto it = pdf_lut.find(k);
+        if (it == pdf_lut.end() || it->second.empty()) return nullptr;
+
+        const uint8_t domains[] = {
             BDPT_DOMAIN_PROJ_SOLID_ANGLE,
             BDPT_DOMAIN_SOLID_ANGLE,
             BDPT_DOMAIN_AREA,
             BDPT_DOMAIN_UNKNOWN
         };
-        for (uint64_t d : domains) {
-            auto it = pdf_lut.find(base | d);
-            if (it != pdf_lut.end()) return &it->second;
-        }
-        return nullptr;
+        for (uint8_t d : domains)
+            for (const auto& pr : it->second)
+                if (pr.sample_domain == d) return &pr;
+        return &it->second.front();
     }
 
     double beta_scalar_val(const BdptVertexRecord& v) const
@@ -324,7 +326,9 @@ struct T5ConnContext {
         if (cos_out <= 0.0 || cos_to <= 0.0) return false;
 
         double pdf_sa = 0.0;
-        if ((pr->flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
+        if ((pr->flags & BDPT_PDF_FLAG_EMISSION) != 0u) {
+            pdf_sa = cos_out / M_PI;
+        } else if ((pr->flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
             if (!(diffuse_p > 0.0)) return false;
             pdf_sa = diffuse_p * cos_out / M_PI;
         } else if ((pr->flags & BDPT_PDF_FLAG_GGX) != 0u) {

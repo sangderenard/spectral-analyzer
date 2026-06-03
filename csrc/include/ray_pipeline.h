@@ -123,7 +123,7 @@ struct StageStats {
     /* CPU */
     std::atomic<uint64_t> n_processed{0};
     std::atomic<uint64_t> ns_active{0};       /* total ns spent on CPU          */
-    std::atomic<int>      batch_sz{16};        /* adaptive CPU pop batch size    */
+    std::atomic<int>      batch_sz{64};        /* adaptive CPU pop batch size    */
     std::atomic<int>      q_depth{0};          /* last observed upstream q len   */
     /* GPU */
     std::atomic<uint64_t> n_gpu{0};            /* items processed by GPU dispatch */
@@ -529,6 +529,7 @@ struct WaveArena {
     int              id      = -1;
     Eigen::Vector3d  center;
     double           radius  = 0.0;
+    double           radius_sq = 0.0;
     double           n_real  = 1.0;
     Eigen::Vector3d  axis_z;
     Eigen::Vector3d  axis_x, axis_y;

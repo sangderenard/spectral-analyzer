@@ -2490,6 +2490,7 @@ struct PyRayTracer
                             int max_rays = 0,
                             int pix_offset = 0,
                             int max_children = 2,
+                            int aperture_samples = 1,
                             int seed = 0,
                             int shutter_mode = 0,
                             double shutter_open = 1.0,
@@ -2501,7 +2502,7 @@ struct PyRayTracer
         py::gil_scoped_release release;
         return ray_pipeline_submit_sensor_sweep(
             ps, max_bounces, min_amplitude, max_rays,
-            pix_offset, static_cast<uint64_t>(static_cast<unsigned int>(seed)),
+            pix_offset, aperture_samples, static_cast<uint64_t>(static_cast<unsigned int>(seed)),
             shutter_mode, shutter_open, shutter_center_u, shutter_center_v,
             shutter_softness, exposure_weight);
     }
@@ -5563,8 +5564,12 @@ Call drain_records() to collect output records.)doc")
              py::arg("interaction_target_z") = 0.0,
              py::arg("interaction_target_r") = 0.0,
 R"doc(Non-blocking native forward-light submit.
-Samples authored emissive triangles in C++ using mat_buf band emission, creates
-RayIntents, and submits them directly to the persistent pipeline.  The optional
+Builds emissive UV domains from the supplied triangles, fills each domain with
+a complete Mortonized UV/angle ray budget, creates RayIntents from mat_buf band emission,
+and submits them directly to the persistent pipeline.  The rays_per_tri argument
+is kept for ABI compatibility but is interpreted as the per-emissive-domain UV
+budget.
+The optional
 interaction target is a world-space sphere; sampled emitter rays that cannot
 intersect it are not launched.)doc")
         .def("ensure_pipeline", &PyRayTracer::ensure_pipeline,
@@ -5745,6 +5750,7 @@ Call once per sensor sweep after the pipeline is idle.)doc")
              py::arg("max_rays") = 0,
              py::arg("pix_offset") = 0,
              py::arg("max_children") = 2,
+             py::arg("aperture_samples") = 1,
              py::arg("seed") = 0,
              py::arg("shutter_mode") = 0,
              py::arg("shutter_open") = 1.0,
@@ -5753,8 +5759,9 @@ Call once per sensor sweep after the pipeline is idle.)doc")
              py::arg("shutter_softness") = 0.0,
              py::arg("exposure_weight") = 1.0,
 R"doc(Submit a native BDPT sensor-frame sweep into the persistent pipeline.
-pix_offset: first pixel index (0 = full grid from start).
-max_rays:   cap on pixels (0 = all from pix_offset onward).
+pix_offset: first tiled-Morton schedule index (0 = full grid from start).
+max_rays:   cap on tiled-Morton pixels (0 = all from pix_offset onward).
+aperture_samples: deterministic pupil placements interleaved per film sample.
 seed: 0 = all rays aim at aperture center (backward compat);
       N > 0 = Fibonacci-spiral aperture sample for batch N (golden-angle quasi-random disk).
 shutter_mode: 0=open, 1=closed, 2=iris, 3=sliding_x, 4=sliding_y.)doc")

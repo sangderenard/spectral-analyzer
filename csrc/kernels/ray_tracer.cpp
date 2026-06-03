@@ -123,6 +123,73 @@ static constexpr double T_SELF     = 1e-10;
 static constexpr int    BVH_LEAF_MAX = 4;   /* triangles per BVH leaf */
 static constexpr bool    RT_ENABLE_PROFILE = false;
 
+static inline uint32_t rt_morton_quant8(double v) {
+    if (!std::isfinite(v)) v = 0.0;
+    v = std::max(0.0, std::min(1.0 - 1.0e-12, v));
+    return static_cast<uint32_t>(std::floor(v * 256.0)) & 0xFFu;
+}
+
+static inline uint32_t rt_morton_encode4_8(double a, double b, double c, double d) {
+    const uint32_t q[4] = {
+        rt_morton_quant8(a), rt_morton_quant8(b),
+        rt_morton_quant8(c), rt_morton_quant8(d)
+    };
+    uint32_t key = 0u;
+    for (uint32_t bit = 0u; bit < 8u; ++bit) {
+        key |= ((q[0] >> bit) & 1u) << (4u * bit + 0u);
+        key |= ((q[1] >> bit) & 1u) << (4u * bit + 1u);
+        key |= ((q[2] >> bit) & 1u) << (4u * bit + 2u);
+        key |= ((q[3] >> bit) & 1u) << (4u * bit + 3u);
+    }
+    return key;
+}
+
+static inline double rt_radical_inverse(uint32_t n, uint32_t base) {
+    double inv_base = 1.0 / static_cast<double>(base);
+    double inv = inv_base;
+    double out = 0.0;
+    while (n > 0u) {
+        const uint32_t digit = n % base;
+        out += static_cast<double>(digit) * inv;
+        n /= base;
+        inv *= inv_base;
+    }
+    return out;
+}
+
+static inline void rt_frame_from_normal(const V3d& n_in, V3d& t, V3d& b, V3d& n) {
+    n = n_in;
+    if (n.norm() < 1.0e-12) n = V3d(1.0, 0.0, 0.0);
+    n.normalize();
+    const V3d up = (std::abs(n.x()) < 0.9) ? V3d(1, 0, 0) : V3d(0, 1, 0);
+    t = n.cross(up);
+    if (t.norm() < 1.0e-12)
+        t = V3d(0.0, 1.0, 0.0);
+    else
+        t.normalize();
+    b = n.cross(t);
+}
+
+static inline V3d rt_cosine_dir_from_disk(const V3d& n_in, double dx, double dy) {
+    V3d t, b, n;
+    rt_frame_from_normal(n_in, t, b, n);
+    const double r2 = std::min(1.0, dx * dx + dy * dy);
+    const double z = std::sqrt(std::max(0.0, 1.0 - r2));
+    return (dx * t + dy * b + z * n).normalized();
+}
+
+static inline void rt_progressive_disk(uint64_t idx, double seed_phase,
+                                       double& x, double& y,
+                                       double& au, double& av) {
+    const double golden = M_PI * (3.0 - std::sqrt(5.0));
+    const double r = std::sqrt(rt_radical_inverse(static_cast<uint32_t>(idx + 1u), 2u));
+    const double theta = static_cast<double>(idx) * golden + seed_phase;
+    x = r * std::cos(theta);
+    y = r * std::sin(theta);
+    au = std::max(0.0, std::min(1.0, 0.5 + 0.5 * x));
+    av = std::max(0.0, std::min(1.0, 0.5 + 0.5 * y));
+}
+
 static thread_local std::string g_rt_alloc_table;
 
 struct RtProfileScope {
@@ -11374,6 +11441,15 @@ int ray_pipeline_submit_emissive_triangles(
     static constexpr int SUBMIT_CHUNK = 262144;
     std::vector<RayIntent> batch;
     batch.reserve(SUBMIT_CHUNK);
+    struct MortonIntent {
+        uint32_t layer;
+        uint32_t morton_key;
+        uint32_t domain_ord;
+        uint64_t seq;
+        RayIntent intent;
+    };
+    std::vector<MortonIntent> schedule;
+    schedule.reserve(static_cast<size_t>(std::max(0, rays_per_tri)));
 
     std::mt19937_64 rng(static_cast<uint64_t>(seed) * 6364136223846793005ULL
                         + 1442695040888963407ULL);
@@ -11473,58 +11549,210 @@ int ray_pipeline_submit_emissive_triangles(
         }
     };
 
-    int submitted = 0;
+    struct EmitterTri {
+        int tri_id = -1;
+        double uv_area = 0.0;
+        double geom_area = 0.0;
+        double uv[6] = {0.0, 0.0, 1.0, 0.0, 0.0, 1.0};
+    };
+    struct EmitterDomain {
+        int key = 0;
+        std::vector<EmitterTri> tris;
+        std::vector<double> cdf;
+        double uv_area = 0.0;
+        double geom_area = 0.0;
+    };
+    auto tri_uv = [&](int tri_id, double out_uv[6]) -> bool {
+        if (tri_id >= 0
+                && tri_id < static_cast<int>(st.tri_uv_group_of_tri.size())
+                && static_cast<size_t>(tri_id) * 6u + 5u < st.tri_uv_data.size()) {
+            const int uv_gid = st.tri_uv_group_of_tri[static_cast<size_t>(tri_id)];
+            if (uv_gid >= 0 && uv_gid < static_cast<int>(st.group_uv_res.size())) {
+                const float* uv = st.tri_uv_data.data() + static_cast<size_t>(tri_id) * 6u;
+                for (int i = 0; i < 6; ++i) out_uv[i] = static_cast<double>(uv[i]);
+                return true;
+            }
+        }
+        out_uv[0] = 0.0; out_uv[1] = 0.0;
+        out_uv[2] = 1.0; out_uv[3] = 0.0;
+        out_uv[4] = 0.0; out_uv[5] = 1.0;
+        return false;
+    };
+    auto uv_area_of = [](const double uv[6]) -> double {
+        const double ax = uv[2] - uv[0], ay = uv[3] - uv[1];
+        const double bx = uv[4] - uv[0], by = uv[5] - uv[1];
+        return 0.5 * std::abs(ax * by - ay * bx);
+    };
+    auto bary_for_uv = [](const double uv[6], double u, double v,
+                          double& b0, double& b1, double& b2) -> bool {
+        const double x0 = uv[0], y0 = uv[1];
+        const double x1 = uv[2], y1 = uv[3];
+        const double x2 = uv[4], y2 = uv[5];
+        const double den = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+        if (std::abs(den) < 1.0e-18) return false;
+        b0 = ((y1 - y2) * (u - x2) + (x2 - x1) * (v - y2)) / den;
+        b1 = ((y2 - y0) * (u - x2) + (x0 - x2) * (v - y2)) / den;
+        b2 = 1.0 - b0 - b1;
+        return b0 >= -1.0e-9 && b1 >= -1.0e-9 && b2 >= -1.0e-9;
+    };
+    auto domain_key_for_tri = [&](int tri_id, int mat) -> int {
+        if (tri_id >= 0 && tri_id < static_cast<int>(st.tri_uv_group_of_tri.size())) {
+            const int uv_gid = st.tri_uv_group_of_tri[static_cast<size_t>(tri_id)];
+            if (uv_gid >= 0) return uv_gid;
+        }
+        return -1 - std::max(0, mat);
+    };
+
+    std::map<int, EmitterDomain> domain_map;
     for (int si = 0; si < n_tris; ++si) {
         const int tri_id = tri_ids[si];
         if (tri_id < 0 || tri_id >= n_scene_tris) continue;
         const Triangle& T = st.tris[static_cast<size_t>(tri_id)];
         const int mat = T.mat_idx;
         if (mat < 0 || mat >= st.mat_n_mats) continue;
-
-        const double area = (tri_id < static_cast<int>(st.tri_areas.size()))
+        bool emits = false;
+        for (int b = 0; b < nb; ++b) {
+            if (std::max(0.0, static_cast<double>(mat_band_record(st, mat, b)[5])) > 0.0) {
+                emits = true;
+                break;
+            }
+        }
+        if (!emits) continue;
+        const double geom_area = (tri_id < static_cast<int>(st.tri_areas.size()))
             ? std::max(0.0, st.tri_areas[static_cast<size_t>(tri_id)])
             : 0.5 * T.edge1.cross(T.edge2).norm();
-        if (!(area > 0.0)) continue;
+        if (!(geom_area > 0.0)) continue;
 
-        std::vector<cd> emit(static_cast<size_t>(nb), cd(0.0, 0.0));
-        double emit_sum = 0.0;
-        for (int b = 0; b < nb; ++b) {
-            const double e = std::max(0.0, static_cast<double>(mat_band_record(st, mat, b)[5]));
-            const double a = scale * area * e / static_cast<double>(rays_per_tri);
-            emit[static_cast<size_t>(b)] = cd(a, 0.0);
-            emit_sum += a;
+        EmitterTri et;
+        et.tri_id = tri_id;
+        et.geom_area = geom_area;
+        tri_uv(tri_id, et.uv);
+        et.uv_area = std::max(uv_area_of(et.uv), 1.0e-12);
+        const int key = domain_key_for_tri(tri_id, mat);
+        EmitterDomain& d = domain_map[key];
+        d.key = key;
+        d.uv_area += et.uv_area;
+        d.geom_area += et.geom_area;
+        d.cdf.push_back(d.uv_area);
+        d.tris.push_back(et);
+    }
+    std::vector<EmitterDomain*> domains;
+    domains.reserve(domain_map.size());
+    double total_domain_uv_area = 0.0;
+    for (auto& kv : domain_map) {
+        if (!kv.second.tris.empty() && kv.second.uv_area > 0.0) {
+            domains.push_back(&kv.second);
+            total_domain_uv_area += kv.second.uv_area;
         }
-        if (!(emit_sum > 0.0)) continue;
+    }
+    if (domains.empty() || !(total_domain_uv_area > 0.0)) return 0;
 
-        V3d n = T.normal;
-        if (n.norm() < 1.0e-12)
-            n = T.edge1.cross(T.edge2);
-        if (n.norm() < 1.0e-12) continue;
-        n.normalize();
+    int submitted = 0;
+    uint64_t seq = 0u;
+    for (size_t di = 0; di < domains.size(); ++di) {
+        EmitterDomain& domain = *domains[di];
+        const int n_domain = rays_per_tri;
+        if (n_domain <= 0) continue;
+        std::vector<int> counts(domain.tris.size(), 0);
+        std::vector<std::pair<double, size_t>> frac;
+        frac.reserve(domain.tris.size());
+        int assigned = 0;
+        for (size_t ti = 0; ti < domain.tris.size(); ++ti) {
+            const double exact = static_cast<double>(n_domain) * domain.tris[ti].uv_area / domain.uv_area;
+            const int base = std::max(1, static_cast<int>(std::floor(exact)));
+            counts[ti] = base;
+            assigned += base;
+            frac.push_back({exact - std::floor(exact), ti});
+        }
+        if (assigned > n_domain) {
+            for (size_t ti = 0; assigned > n_domain && ti < counts.size(); ++ti) {
+                if (counts[ti] > 1) {
+                    --counts[ti];
+                    --assigned;
+                }
+            }
+        } else if (assigned < n_domain) {
+            std::sort(frac.begin(), frac.end(),
+                      [](const auto& a, const auto& b) { return a.first > b.first; });
+            for (int add = n_domain - assigned, i = 0; add > 0; --add, ++i)
+                ++counts[frac[static_cast<size_t>(i) % frac.size()].second];
+        }
 
-        for (int r = 0; r < rays_per_tri; ++r) {
-            double u = U(rng);
-            double v = U(rng);
-            if (u + v > 1.0) { u = 1.0 - u; v = 1.0 - v; }
-            V3d origin = T.v0 + u * T.edge1 + v * T.edge2;
+        for (size_t ti = 0; ti < domain.tris.size(); ++ti) {
+            const EmitterTri& etv = domain.tris[ti];
+            const int n_tri = counts[ti];
+            if (n_tri <= 0) continue;
+            for (int j = 0; j < n_tri; ++j) {
+                const uint32_t sample_idx = static_cast<uint32_t>(
+                    (static_cast<uint64_t>(di + 1u) * 0x9E3779B9u)
+                    ^ (static_cast<uint64_t>(ti + 1u) * 0x85EBCA6Bu)
+                    ^ static_cast<uint64_t>(j + 1u));
+                double b1 = rt_radical_inverse(sample_idx, 2u);
+                double b2 = rt_radical_inverse(sample_idx, 3u);
+                if (b1 + b2 > 1.0) { b1 = 1.0 - b1; b2 = 1.0 - b2; }
+                const double b0 = 1.0 - b1 - b2;
+                const double eu = std::max(0.0, std::min(1.0,
+                    b0 * etv.uv[0] + b1 * etv.uv[2] + b2 * etv.uv[4]));
+                const double ev = std::max(0.0, std::min(1.0,
+                    b0 * etv.uv[1] + b1 * etv.uv[3] + b2 * etv.uv[5]));
+                const EmitterTri* et = &etv;
+            const int tri_id = et->tri_id;
+            const Triangle& T = st.tris[static_cast<size_t>(tri_id)];
+            V3d n = T.normal;
+            if (n.norm() < 1.0e-12)
+                n = T.edge1.cross(T.edge2);
+            if (n.norm() < 1.0e-12) continue;
+            n.normalize();
+            V3d origin = T.v0 + b1 * T.edge1 + b2 * T.edge2;
             V3d emit_n = n;
             apply_parametric_surface_point(st, tri_id, origin, origin, emit_n);
             if (emit_n.norm() < 1.0e-12) emit_n = n;
             emit_n.normalize();
 
-            V3d dir = cosine_hemisphere(emit_n, rng);
-            if (!modifier.accept(origin, dir, rng)) {
+            double dx = 0.0, dy = 0.0, au = 0.5, av = 0.5;
+            rt_progressive_disk(static_cast<uint64_t>(sample_idx - 1u),
+                                static_cast<double>(seed) * 0.013,
+                                dx, dy, au, av);
+            V3d dir;
+            if (has_target) {
+                const V3d target(interaction_target_x,
+                                 interaction_target_y + interaction_target_r * dx,
+                                 interaction_target_z + interaction_target_r * dy);
+                dir = target - origin;
+                if (dir.squaredNorm() <= 1.0e-24)
+                    dir = emit_n;
+                else
+                    dir.normalize();
+            } else {
+                dir = rt_cosine_dir_from_disk(emit_n, dx, dy);
+            }
+            const bool accepted = has_target
+                ? (modifier.type == FlashModifierType::SCRIM ? modifier.accept(origin, dir, rng) : true)
+                : modifier.accept(origin, dir, rng);
+            if (!accepted) {
                 ++culled;
                 continue;
             }
+            const uint32_t morton_key = rt_morton_encode4_8(eu, ev, au, av);
+            const int mat = T.mat_idx;
+            std::vector<cd> emit(static_cast<size_t>(nb), cd(0.0, 0.0));
+            double emit_sum = 0.0;
+            for (int b = 0; b < nb; ++b) {
+                const double e = std::max(0.0, static_cast<double>(mat_band_record(st, mat, b)[5]));
+                const double a = scale * domain.geom_area * e / static_cast<double>(std::max(1, n_domain));
+                emit[static_cast<size_t>(b)] = cd(a, 0.0);
+                emit_sum += a;
+            }
+            if (!(emit_sum > 0.0)) continue;
             RayIntent ri{};
             ri.pos = origin + dir * (EPS * 200.0);
             ri.dir = dir;
             ri.amp.resize(nb);
             for (int b = 0; b < nb; ++b)
                 ri.amp[b] = emit[static_cast<size_t>(b)];
-            ri.src_id = si;
-            ri.tag = 0u;
+            ri.src_id = static_cast<int>(di);
+            ri.tag = (static_cast<uint64_t>(static_cast<uint32_t>(tri_id)) << 32)
+                   | static_cast<uint64_t>(morton_key);
             ri.color_flag = 0u;
             ri.bounces_left = max_bounces;
             ri.min_amplitude = min_amplitude;
@@ -11535,13 +11763,24 @@ int ray_pipeline_submit_emissive_triangles(
             ri.bdpt_vertex = 0u;
             ri.bdpt_stream = BDPT_SIDE_LIGHT;
             ri.bdpt_strategy = 0u;
-            batch.push_back(std::move(ri));
+            schedule.push_back(MortonIntent{static_cast<uint32_t>(j), morton_key, static_cast<uint32_t>(di), seq++, std::move(ri)});
             ++submitted;
-            if (static_cast<int>(batch.size()) >= SUBMIT_CHUNK)
-                flush_batch();
+            }
         }
     }
 
+    std::stable_sort(schedule.begin(), schedule.end(),
+                     [](const MortonIntent& a, const MortonIntent& b) {
+                         if (a.layer != b.layer) return a.layer < b.layer;
+                         if (a.domain_ord != b.domain_ord) return a.domain_ord < b.domain_ord;
+                         if (a.morton_key != b.morton_key) return a.morton_key < b.morton_key;
+                         return a.seq < b.seq;
+                     });
+    for (MortonIntent& mi : schedule) {
+        batch.push_back(std::move(mi.intent));
+        if (static_cast<int>(batch.size()) >= SUBMIT_CHUNK)
+            flush_batch();
+    }
     flush_batch();
     if (culled > 0)
         ps->emitter_world_culled.fetch_add(culled, std::memory_order_relaxed);
@@ -11719,6 +11958,7 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
                                       double min_amplitude,
                                       int max_rays,
                                       int pix_offset,
+                                      int aperture_samples,
                                       uint64_t aperture_seed,
                                       int shutter_mode,
                                       double shutter_open,
@@ -11732,8 +11972,10 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
 
     const int res   = ps->sensor_res;
     const int total = res * res;
-    const int start = std::max(0, std::min(pix_offset, total));
-    const int limit = (max_rays > 0) ? std::min(max_rays, total - start) : (total - start);
+    const int n_ap = std::max(1, aperture_samples);
+    const int schedule_total = total * n_ap;
+    const int start = std::max(0, std::min(pix_offset, schedule_total));
+    const int limit = (max_rays > 0) ? std::min(max_rays, schedule_total - start) : (schedule_total - start);
     if (limit <= 0) return 0;
 
     const double target_x = static_cast<double>(ps->sensor_target_x);
@@ -11741,21 +11983,16 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     if (!(target_r > 0.0) || !std::isfinite(target_x))
         return 0;
 
-    /* ── Aperture disk sampling ─────────────────────────────────────────────
-     * aperture_seed == 0: all rays aim at the aperture center (backward compat).
-     * aperture_seed >  0: per-pixel random point within the aperture disc.
-     *
-     * The aperture target is computed INSIDE the pixel loop so each pixel gets
-     * an independent sample.  The pixel index is mixed into the seed via the
-     * Fibonacci hash constant so consecutive pixels map to well-spread aperture
-     * positions, and different sweep calls (different aperture_seed values) visit
-     * different but non-overlapping regions of the disc.
-     *
-     * A single pre-call target is kept only for the aperture_seed==0 (center)
-     * path so the loop body stays the same in that case.
-     */
-    const bool do_aperture_jitter = (aperture_seed > 0 && target_r > 0.0);
-    const V3d target_center(target_x, 0.0, 0.0); /* used when aperture_seed==0 */
+    auto aperture_sample_at = [&](int ap_idx, double& dx, double& dy, double& au, double& av) {
+        dx = dy = 0.0;
+        au = av = 0.5;
+        if (target_r > 0.0 && (aperture_seed > 0 || n_ap > 1)) {
+            const uint64_t base = (aperture_seed > 0) ? (aperture_seed - 1u) : 0u;
+            rt_progressive_disk(base * static_cast<uint64_t>(n_ap)
+                                + static_cast<uint64_t>(std::max(0, ap_idx)),
+                                0.0, dx, dy, au, av);
+        }
+    };
 
     const int n_bands = std::max(1, std::min(ps->st->n_bands, MAX_SPECTRAL_BANDS));
     const double half_w = static_cast<double>(ps->sensor_half_w);
@@ -11798,7 +12035,69 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     std::vector<RayIntent> intents;
     intents.reserve(static_cast<size_t>(limit));
 
-    for (int pix = start; pix < total && static_cast<int>(intents.size()) < limit; ++pix) {
+    struct MortonPixel {
+        uint32_t local_key;
+        uint32_t ap_key;
+        uint32_t coarse_key;
+        int pix;
+        int ap_idx;
+    };
+    std::vector<MortonPixel> pixels;
+    pixels.reserve(static_cast<size_t>(schedule_total));
+    const int film_limit = std::max(1, std::min(limit, total));
+    const int coverage_stride = (film_limit > 0)
+        ? static_cast<int>(std::ceil(static_cast<double>(total) / static_cast<double>(film_limit)))
+        : 1;
+    const int tile_side = std::max(1, static_cast<int>(
+        std::ceil(std::sqrt(static_cast<double>(std::max(1, coverage_stride))))));
+    const int tiles_y = std::max(1, (res + tile_side - 1) / tile_side);
+    const int tiles_z = tiles_y;
+    for (int pix = 0; pix < total; ++pix) {
+        const int iy = pix / res;
+        const int iz = pix - iy * res;
+        const int ly = iy % tile_side;
+        const int lz = iz % tile_side;
+        const int ty = iy / tile_side;
+        const int tz = iz / tile_side;
+        const double lu = (static_cast<double>(lz) + 0.5) / static_cast<double>(tile_side);
+        const double lv = (static_cast<double>(ly) + 0.5) / static_cast<double>(tile_side);
+        const double cu = (static_cast<double>(tz) + 0.5) / static_cast<double>(tiles_z);
+        const double cv = (static_cast<double>(ty) + 0.5) / static_cast<double>(tiles_y);
+        const uint32_t local_key = rt_morton_encode4_8(lu, lv, 0.5, 0.5);
+        const uint32_t coarse_key = rt_morton_encode4_8(cu, cv, 0.5, 0.5);
+        for (int ap = 0; ap < n_ap; ++ap) {
+            double adx = 0.0, ady = 0.0, au = 0.5, av = 0.5;
+            aperture_sample_at(ap, adx, ady, au, av);
+            const uint32_t ap_key = rt_morton_encode4_8(0.5, 0.5, au, av);
+            pixels.push_back(MortonPixel{local_key, ap_key, coarse_key, pix, ap});
+        }
+    }
+    std::stable_sort(pixels.begin(), pixels.end(),
+                     [](const MortonPixel& a, const MortonPixel& b) {
+                         if (a.local_key != b.local_key) return a.local_key < b.local_key;
+                         if (a.ap_key != b.ap_key) return a.ap_key < b.ap_key;
+                         if (a.coarse_key != b.coarse_key) return a.coarse_key < b.coarse_key;
+                         return a.pix < b.pix;
+                     });
+
+    static constexpr uint64_t BDPT_FILM_TAG_FLAG = (uint64_t(1) << 63);
+    static constexpr int BDPT_FILM_TAG_UV_BITS = 30;
+    static constexpr int BDPT_FILM_TAG_UV_SHIFT = BDPT_FILM_TAG_UV_BITS;
+    static constexpr int BDPT_FILM_TAG_CHANNEL_SHIFT = 60;
+    static constexpr uint64_t BDPT_FILM_TAG_MASK = (uint64_t(1) << BDPT_FILM_TAG_UV_BITS) - uint64_t(1);
+    auto pack_film_tag = [&](double u, double v) -> uint64_t {
+        const double q = static_cast<double>(BDPT_FILM_TAG_MASK);
+        const uint64_t qu = static_cast<uint64_t>(std::llround(
+            std::max(0.0, std::min(1.0, u)) * q)) & BDPT_FILM_TAG_MASK;
+        const uint64_t qv = static_cast<uint64_t>(std::llround(
+            std::max(0.0, std::min(1.0, v)) * q)) & BDPT_FILM_TAG_MASK;
+        const uint64_t ch = (uint64_t(0) & uint64_t(0x3)) << BDPT_FILM_TAG_CHANNEL_SHIFT;
+        return BDPT_FILM_TAG_FLAG | ch | (qu << BDPT_FILM_TAG_UV_SHIFT) | qv;
+    };
+
+    for (int ord = start; ord < schedule_total && static_cast<int>(intents.size()) < limit; ++ord) {
+        const MortonPixel& mp = pixels[static_cast<size_t>(ord)];
+        const int pix = mp.pix;
         const int iy = pix / res;
         const int iz = pix - iy * res;
         const double y = -half_w + (static_cast<double>(iy) + 0.5) * step_w;
@@ -11809,18 +12108,9 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         if (!(shutter_w > 0.0) || !std::isfinite(shutter_w))
             continue;
         V3d pos(static_cast<double>(ps->sensor_px), y, z);
-        /* Per-pixel aperture target: mix pixel index into seed so each pixel
-         * independently samples the aperture disc.  0x9E3779B97F4A7C15 is the
-         * 64-bit Fibonacci hash constant — consecutive pix values spread widely. */
-        V3d target = target_center;
-        if (do_aperture_jitter) {
-            uint64_t h = rt_splitmix64(aperture_seed ^ (static_cast<uint64_t>(pix) * 0x9E3779B97F4A7C15ULL));
-            const double r_frac = static_cast<double>(h >> 32) / 4294967296.0;
-            h = rt_splitmix64(h);
-            const double theta = 2.0 * M_PI * (static_cast<double>(h >> 32) / 4294967296.0);
-            const double ap_r  = std::sqrt(r_frac) * target_r;
-            target = V3d(target_x, ap_r * std::cos(theta), ap_r * std::sin(theta));
-        }
+        double ap_dx = 0.0, ap_dy = 0.0, ap_u = 0.5, ap_v = 0.5;
+        aperture_sample_at(mp.ap_idx, ap_dx, ap_dy, ap_u, ap_v);
+        V3d target(target_x, target_r * ap_dx, target_r * ap_dy);
         V3d dir = target - pos;
         if (dir.squaredNorm() <= 1e-24)
             dir = V3d(-1.0, 0.0, 0.0);
@@ -11833,7 +12123,7 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         ri.amp.resize(n_bands);
         ri.amp.setConstant(exposure_w * shutter_w);
         ri.src_id = pix;
-        ri.tag = static_cast<uint64_t>(pix);
+        ri.tag = pack_film_tag(u, v);
         ri.color_flag = 1u;
         ri.bounce = 0;
         ri.bounces_left = std::max(1, max_bounces);

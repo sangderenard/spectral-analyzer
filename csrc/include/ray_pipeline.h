@@ -872,16 +872,17 @@ void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType typ
                                       float param0, float param1);
 
 /* Submit one native sensor-frame sweep into the same T1->T2->T3 pipeline.
- * pix_offset: first pixel index to submit (0 = start of grid).
- * max_rays:   cap on pixels submitted (0 = from pix_offset to end of grid).
- * aperture_seed: 0 = aim at aperture center (backward compat);
- *               >0 = Fibonacci-spiral aperture sample for this batch index.
+ * pix_offset: first tiled-Morton film/pupil schedule index.
+ * max_rays:   cap on schedule entries submitted (0 = from pix_offset onward).
+ * aperture_samples: number of deterministic pupil placements interleaved per film.
+ * aperture_seed: 0 = center if aperture_samples == 1, otherwise schedule base.
  * Returns number of submitted intents. */
 int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
                                      int max_bounces,
                                      double min_amplitude,
                                      int max_rays,
                                      int pix_offset,
+                                     int aperture_samples,
                                      uint64_t aperture_seed,
                                      int shutter_mode,
                                      double shutter_open,

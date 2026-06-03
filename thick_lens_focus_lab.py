@@ -15,7 +15,7 @@ import sys
 import threading
 import ctypes
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -651,6 +651,55 @@ def _synth_spectral_bands_from_rgb(
             ior_imag=ior_imag,
         ))
     return bands
+
+
+def _with_spectral_emission_profile(
+    sidecar: "FreeFrequencySidecar",
+    bands: Sequence[SpectralBand],
+    emission_rgb: Sequence[float],
+) -> List[SpectralBand]:
+    """Return bands with emission defined spectrally, not via PBR emission_rgb."""
+    er = float(emission_rgb[0])
+    eg = float(emission_rgb[1])
+    eb = float(emission_rgb[2])
+    if max(abs(er), abs(eg), abs(eb)) <= 1.0e-12:
+        return list(bands)
+
+    out: List[SpectralBand] = []
+    for band in bands:
+        if isinstance(band, dict):
+            center_hz = float(band.get("center_hz", band.get("frequency_hz", 0.0)))
+        else:
+            center_hz = float(band.center_hz)
+        wl_nm = np.asarray([C_LIGHT / max(center_hz, EPS) * 1.0e9], dtype=np.float64)
+        w = _wavelength_to_rgb_weights(np.clip(wl_nm, 380.0, 700.0))[0]
+        emission = max(0.0, float(w[0]) * er + float(w[1]) * eg + float(w[2]) * eb)
+        if isinstance(band, dict):
+            b = dict(band)
+            b["emission"] = emission
+            bw_raw = b.get("bandwidth_hz", b.get("bandwidth", 0.0))
+            if isinstance(bw_raw, dict):
+                bw_raw = bw_raw.get("hz", bw_raw.get("value", 0.0))
+            try:
+                bw_hz = float(bw_raw)
+            except Exception:
+                bw_hz = 0.0
+            if bw_hz <= 0.0:
+                bw_hz = max(center_hz * 0.05, 1.0)
+            out.append(SpectralBand(
+                center_hz=float(b.get("center_hz", b.get("frequency_hz", 0.0))),
+                bandwidth_hz=float(bw_hz),
+                reflectance=float(b.get("reflectance", 0.0)),
+                transmittance=float(b.get("transmittance", b.get("transmission", 0.0))),
+                diffuse_frac=float(b.get("diffuse_frac", b.get("diffuse", 0.0))),
+                emission=float(b.get("emission", 0.0)),
+                reemission=float(b.get("reemission", 0.0)),
+                ior_real=float(b.get("ior_real", b.get("ior", 1.0))),
+                ior_imag=float(b.get("ior_imag", 0.0)),
+            ))
+        else:
+            out.append(replace(band, emission=emission))
+    return out
 
 
 def _orient_surface_patch_outward(
@@ -2043,6 +2092,11 @@ def _import_subject_scene(
         if old_i < 0:
             continue
         material = subject_db._materials[name]
+        source_emission_rgb = (
+            material.get("emission_rgb", [0.0, 0.0, 0.0])
+            if isinstance(material, dict)
+            else getattr(material, "emission_rgb", [0.0, 0.0, 0.0])
+        )
         # Plain dicts (from test_basic_gl_cpp_window etc.) have no effective_bands()
         # method, so _fill_spectral leaves their SSBO data zeroed.  Zeroed ior_real=0
         # makes the shader classify them as transmissive (|0−1|>1e-6), turning them
@@ -2063,23 +2117,22 @@ def _import_subject_scene(
                 )
             else:
                 synth_bands = list(existing_bands)
+            if sidecar is not None:
+                synth_bands = _with_spectral_emission_profile(sidecar, synth_bands, emit_rgb)
             material = Material(
                 name=name,
                 domain="em_optical",
                 albedo=[float(albedo[0]), float(albedo[1]), float(albedo[2])],
                 roughness=roughness,
                 metallic=metallic,
-                emission_rgb=[float(emit_rgb[0]), float(emit_rgb[1]), float(emit_rgb[2])],
+                emission_rgb=[0.0, 0.0, 0.0],
                 ior=ior,
                 transmission=transmission,
                 spectral_bands=synth_bands,
             )
         new_i = db.register(f"subject_{name}", material)
         old_to_new[old_i] = int(new_i)
-        emission = np.asarray(
-            material.get("emission_rgb", [0.0, 0.0, 0.0]) if isinstance(material, dict) else getattr(material, "emission_rgb", [0.0, 0.0, 0.0]),
-            dtype=np.float64,
-        )
+        emission = np.asarray(source_emission_rgb, dtype=np.float64)
         if emission.size >= 3 and float(np.max(np.abs(emission[:3]))) > 1.0e-8:
             emissive_old.add(old_i)
 
@@ -3220,7 +3273,7 @@ def _build_scene_mesh(
             albedo=[1.0, 1.0, 1.0],
             roughness=0.0,
             metallic=0.0,
-            emission_rgb=[1.0, 1.0, 1.0],
+            emission_rgb=[0.0, 0.0, 0.0],
             ior=1.0,
             transmission=0.0,
             radiance=RadianceProfile(
@@ -3249,7 +3302,7 @@ def _build_scene_mesh(
             albedo=[1.0, 0.98, 0.94],
             roughness=0.0,
             metallic=0.0,
-            emission_rgb=[1.0, 0.98, 0.94],
+            emission_rgb=[0.0, 0.0, 0.0],
             ior=1.0,
             transmission=0.0,
             radiance=RadianceProfile(
@@ -5274,6 +5327,7 @@ class ForwardCppLensBench:
         self.bdpt_last_launched_rays = 0
         self._bdpt_native_sensor_sweep_started = False
         self._bdpt_native_sensor_sweep_rays = 0
+        self._bdpt_native_sensor_schedule_offset = 0
         self._bdpt_camera_sweep_stage = 0
         self._camera_exposure_forward_stage = 0
         self._camera_exposure_complete = False
@@ -5386,6 +5440,7 @@ class ForwardCppLensBench:
         self._vis_thread:   Optional[threading.Thread] = None
         self._drain_stop  = threading.Event()
         self._segs_lock   = threading.Lock()
+        self._pipeline_reset_epoch = 0
         # Bounded queue between fast drain thread and slow vis thread.
         # maxsize=8: ~8 × 1M records = up to 8 buffered batches before dropping.
         # Drops only affect visualization; BDPT accumulation is always done first.
@@ -5511,6 +5566,7 @@ class ForwardCppLensBench:
         mat_names = list(tensors.get('index', {}).keys())
         self._mat_index = tensors.get('index', {})
         mat_name_by_idx = {int(v): str(k) for k, v in self._mat_index.items()}
+        self._mat_name_by_idx = dict(mat_name_by_idx)
         diffuser_idx = self._mat_index.get('light_room_diffuser', -1)
         self._diffuser_mat_idx = diffuser_idx
         stage_grey_idx = self._mat_index.get('stage_calibration_grey', -1)
@@ -5754,6 +5810,16 @@ class ForwardCppLensBench:
         # Drive forward tracing from authored emissive source geometry.
         self.src_pos = np.ascontiguousarray(self.tri_centroids[self.emitter_tri_ids], dtype=np.float64)
         self._emitter_tri_ids_i32 = np.ascontiguousarray(self.emitter_tri_ids, dtype=np.int32)
+        _emitter_mats = self.tri_mat_ids[self.emitter_tri_ids] if self.emitter_tri_ids.size else np.zeros((0,), dtype=np.int32)
+        _flash_mat_names = {"calib_source", "ring_light_emitter"}
+        _is_flash_emitter = np.array([
+            self._mat_name_by_idx.get(int(mid), "") in _flash_mat_names
+            for mid in np.asarray(_emitter_mats, dtype=np.int32).reshape(-1)
+        ], dtype=bool)
+        self._flash_emitter_tri_ids_i32 = np.ascontiguousarray(
+            self.emitter_tri_ids[_is_flash_emitter], dtype=np.int32)
+        self._natural_emitter_tri_ids_i32 = np.ascontiguousarray(
+            self.emitter_tri_ids[~_is_flash_emitter], dtype=np.int32)
         src_n = int(self.src_pos.shape[0])
         src_normals = np.ascontiguousarray(normals[self.emitter_tri_ids], dtype=np.float64)
         # Emitter area PDF: uniform area sampling over all emitter triangles.
@@ -5770,6 +5836,8 @@ class ForwardCppLensBench:
             f"source={self.source_tri_ids.size}",
             f"debug_probe=removed",
             f"total={self.emitter_tri_ids.size}",
+            f"flash={self._flash_emitter_tri_ids_i32.size}",
+            f"natural={self._natural_emitter_tri_ids_i32.size}",
             flush=True,
         )
         print(
@@ -6042,8 +6110,27 @@ class ForwardCppLensBench:
         return n
 
     def _build_uv_page_bank(self) -> None:
-        bank = UvPageBank(self.n_bands, res=UV_PAGE_RES_DEFAULT, hot_limit=UV_HOT_GROUP_LIMIT_DEFAULT)
-        bank.add("emitters", "emitter", self.source_tri_ids, self._uv_coords_for_tri_ids(self.source_tri_ids, "yz"))
+        src_ids = np.asarray(self.source_tri_ids, dtype=np.int32).reshape(-1)
+        n_emitter_mats = 0
+        if src_ids.size > 0:
+            n_emitter_mats = int(np.unique(np.asarray(self.tri_mat_ids[src_ids], dtype=np.int32).reshape(-1)).size)
+        bank = UvPageBank(
+            self.n_bands,
+            res=UV_PAGE_RES_DEFAULT,
+            hot_limit=max(UV_HOT_GROUP_LIMIT_DEFAULT, n_emitter_mats + 8),
+        )
+        if src_ids.size > 0:
+            src_mats = np.asarray(self.tri_mat_ids[src_ids], dtype=np.int32).reshape(-1)
+            for mat_id in sorted(int(m) for m in np.unique(src_mats)):
+                ids = src_ids[src_mats == mat_id]
+                if ids.size <= 0:
+                    continue
+                bank.add(
+                    f"emitter_mat_{mat_id}",
+                    "emitter",
+                    ids,
+                    self._uv_coords_for_tri_ids(ids, "yz"),
+                )
         bank.add("object_plane", "object", self.object_tri_ids, self._uv_coords_for_tri_ids(self.object_tri_ids, "yz"))
         bank.add("sensor_plate", "sensor", self.image_plate_tri_ids, self._uv_coords_for_tri_ids(self.image_plate_tri_ids, "yz"))
         bank.add("aperture_or_iris", "aperture", self.aperture_stop_tri_ids, self._uv_coords_for_tri_ids(self.aperture_stop_tri_ids, "yz"))
@@ -6311,6 +6398,7 @@ class ForwardCppLensBench:
         self._do_register_lut_assembly()
 
         self._bdpt_sensor_cfg = cfg
+        self._bdpt_native_sensor_schedule_offset = 0
         print(
             "[bdpt-register]",
             f"source_gid={self._bdpt_source_gid}",
@@ -6945,7 +7033,7 @@ class ForwardCppLensBench:
             raise RuntimeError("blocking Python forward launch is only supported for explicit bake_origins training rays")
 
         if bake_origins is None:
-            n_rays = int(max(1, rays_per_emitter))
+            n_rays = int(max(1, self._uv_emitter_ray_count() or rays_per_emitter))
             _mod = getattr(self.scene, "flash_modifier", None)
             if _mod is not None:
                 _mode_map = {"none": 0, "snoot": 1, "grid": 2, "scrim": 3}
@@ -6960,68 +7048,39 @@ class ForwardCppLensBench:
                     _mp0 = _mp1 = 0.0
                 self.tracer.set_flash_modifier(_mtype, _mp0, _mp1)
 
-            # UV-stratified emitter launch: structured Halton-sequence origins
-            # on the emissive surface with power-compensated amplitude per ray,
-            # submitted via submit_rays() exactly like bake_origins training rays
-            # but non-blocking.  Bypasses C++ stochastic emissive sampling.
-            uv_n = self._uv_emitter_ray_count()
-            if uv_n > 0:
-                exposure_scale = float(max(0.0, exposure_weight))
-                if exposure_scale <= 0.0:
-                    return 0
-                self._ensure_ordered_emitter_ray_cache(uv_n)
-                chunk_rays = int(max(1, getattr(self, "bdpt_ordered_emitter_batch_rays", 8_192)))
-                pkg = self._emitter_ray_cache.package(chunk_rays, wrap=False)
-                if pkg is None:
-                    self._emitter_ray_cache.rewind()
-                    pkg = self._emitter_ray_cache.package(chunk_rays, wrap=False)
-                if pkg is not None:
-                    uv_origins = pkg["origins"]
-                    uv_dirs = pkg["directions"]
-                    uv_amps = pkg["amplitudes"] * exposure_scale
-                    n_uv = int(uv_origins.shape[0])
-                    _src_ids_uv = np.zeros(n_uv, dtype=np.int32)
-                    _tag_arr_uv = np.arange(n_uv, dtype=np.uint64)
-                    _cflag_uv = np.zeros(n_uv, dtype=np.uint8)
-                    if self.cull_infinite_rays:
-                        uv_origins, uv_dirs, uv_amps, _src_ids_uv, _cflag_uv, _tag_arr_uv = _cull_finite_rays(
-                            uv_origins, uv_dirs, uv_amps, _src_ids_uv, _cflag_uv, _tag_arr_uv, label="uv_fwd")
-                    n_uv = int(uv_origins.shape[0])
-                    if n_uv <= 0:
-                        return 0
-                    self.tracer.submit_rays(
-                        origins=np.ascontiguousarray(uv_origins),
-                        directions=np.ascontiguousarray(uv_dirs),
-                        amplitudes=np.ascontiguousarray(uv_amps),
-                        src_ids=np.ascontiguousarray(_src_ids_uv),
-                        tags=None,
-                        color_flags=np.ascontiguousarray(_cflag_uv),
-                        max_bounces=int(max_bounces),
-                        min_amplitude=float(self._min_amplitude),
-                        max_children=1,
-                        seed=int(seed),
-                        use_gpu_compute=_use_gpu,
-                        gpu_all_stages=_all_gpu,
-                        shader_dir=_SHADER_DIR,
-                    )
-                    self._ensure_drain_loop()
-                    self.tracer.signal_flash_dispatched()
-                    return int(n_uv)
-
-            submitted = int(self.tracer.submit_emissive_triangles(
-                self._emitter_tri_ids_i32,
-                n_rays,
-                float(max(0.0, exposure_weight)),
-                float(self.emitter_amp_gain),
-                int(max_bounces),
-                float(self._min_amplitude),
-                2,
-                int(seed),
-                bool(_use_gpu),
-                bool(_all_gpu),
-                _SHADER_DIR,
-                *self._emitter_interaction_target(),
-            ))
+            submitted = 0
+            flash_ids = getattr(self, "_flash_emitter_tri_ids_i32", self._emitter_tri_ids_i32)
+            natural_ids = getattr(self, "_natural_emitter_tri_ids_i32", np.zeros((0,), dtype=np.int32))
+            if int(np.asarray(flash_ids).size) > 0:
+                submitted += int(self.tracer.submit_emissive_triangles(
+                    np.ascontiguousarray(flash_ids, dtype=np.int32),
+                    n_rays,
+                    float(max(0.0, exposure_weight)),
+                    float(self.emitter_amp_gain),
+                    int(max_bounces),
+                    float(self._min_amplitude),
+                    2,
+                    int(seed),
+                    bool(_use_gpu),
+                    bool(_all_gpu),
+                    _SHADER_DIR,
+                    *self._emitter_interaction_target(),
+                ))
+            if int(np.asarray(natural_ids).size) > 0:
+                submitted += int(self.tracer.submit_emissive_triangles(
+                    np.ascontiguousarray(natural_ids, dtype=np.int32),
+                    n_rays,
+                    float(max(0.0, exposure_weight)),
+                    float(self.emitter_amp_gain),
+                    int(max_bounces),
+                    float(self._min_amplitude),
+                    2,
+                    int(seed ^ 0x5A17),
+                    bool(_use_gpu),
+                    bool(_all_gpu),
+                    _SHADER_DIR,
+                    0.0, 0.0, 0.0, 0.0,
+                ))
             self.tracer.signal_flash_dispatched()
             self._ensure_drain_loop()
             return submitted
@@ -7081,12 +7140,14 @@ class ForwardCppLensBench:
         self._ensure_drain_loop()
         return total
 
-    def _fast_bdpt_feed(self, records: dict) -> None:
+    def _fast_bdpt_feed(self, records: dict, drain_epoch: Optional[int] = None) -> None:
         """Feed BDPT endpoints immediately from raw drained records.
 
         Called as the very first operation on every drain batch so BDPT
         accumulates endpoints with zero pipeline delay.
         """
+        if drain_epoch is not None and int(drain_epoch) != int(getattr(self, "_pipeline_reset_epoch", 0)):
+            return
         if bool(getattr(self, "enable_python_bdpt_diagnostics", False)):
             self._append_bdpt_segment_records(records)
         kinds   = np.asarray(records["kind"], dtype=np.uint8)
@@ -7112,6 +7173,8 @@ class ForwardCppLensBench:
         htri    = np.asarray(htri_r, dtype=np.int32) if htri_r is not None \
                   else np.full(kinds.shape[0], -1, dtype=np.int32)
         nb = min(int(amp_re.shape[1]), int(self.n_bands))
+        if drain_epoch is not None and int(drain_epoch) != int(getattr(self, "_pipeline_reset_epoch", 0)):
+            return
         self._append_async_bdpt_records(
             vm_kinds   = kinds[stream_ok],
             vm_cflags  = cflags[stream_ok].astype(np.int32),
@@ -7153,6 +7216,7 @@ class ForwardCppLensBench:
         _empty_polls    = 0
         while not self._drain_stop.is_set():
             try:
+                drain_epoch = int(getattr(self, "_pipeline_reset_epoch", 0))
                 use_cpp_display = (
                     bool(getattr(self, "enable_cpp_display_drain", True)) and
                     not bool(getattr(self, "enable_python_bdpt_diagnostics", False)) and
@@ -7175,16 +7239,18 @@ class ForwardCppLensBench:
                     n       = int(records["kind"].shape[0]) if records else 0
                 if n > 0:
                     _empty_polls = 0
+                    if drain_epoch != int(getattr(self, "_pipeline_reset_epoch", 0)):
+                        continue
                     if use_cpp_display:
-                        self._accumulate_display_drain(records)
+                        self._accumulate_display_drain(records, drain_epoch=drain_epoch)
                     else:
                         # BDPT endpoint accumulation must run immediately when
                         # Python diagnostics are explicitly enabled.
-                        self._fast_bdpt_feed(records)
+                        self._fast_bdpt_feed(records, drain_epoch=drain_epoch)
                         # Hand off to vis thread; drop the frame if the queue is full so
                         # the drain thread never blocks waiting for visualization.
                         try:
-                            self._vis_queue.put_nowait(records)
+                            self._vis_queue.put_nowait((drain_epoch, records))
                         except queue.Full:
                             pass
 
@@ -7219,13 +7285,15 @@ class ForwardCppLensBench:
                 print(f"[drain-loop ERROR] {_drain_exc}", flush=True)
                 time.sleep(0.1)
 
-    def _accumulate_display_drain(self, drained: dict) -> None:
+    def _accumulate_display_drain(self, drained: dict, drain_epoch: Optional[int] = None) -> None:
         if not drained:
             return
         fwd = np.asarray(drained.get("forward", []), dtype=np.float32)
         rev = np.asarray(drained.get("reverse", []), dtype=np.float32)
         cam = np.asarray(drained.get("camera", []), dtype=np.float32)
         with self._segs_lock:
+            if drain_epoch is not None and int(drain_epoch) != int(getattr(self, "_pipeline_reset_epoch", 0)):
+                return
             if fwd.shape == self._forward_img_accum.shape:
                 self._forward_img_accum += fwd
             if rev.shape == self._reverse_img_accum.shape:
@@ -7244,10 +7312,16 @@ class ForwardCppLensBench:
         import time
         while not self._drain_stop.is_set():
             try:
-                records = self._vis_queue.get(timeout=0.020)
+                item = self._vis_queue.get(timeout=0.020)
             except queue.Empty:
                 continue
             try:
+                if isinstance(item, tuple) and len(item) == 2:
+                    item_epoch, records = item
+                    if int(item_epoch) != int(getattr(self, "_pipeline_reset_epoch", 0)):
+                        continue
+                else:
+                    records = item
                 self._accumulate_records(records)
             except Exception as _vis_exc:
                 print(f"[vis-loop ERROR] {_vis_exc}", flush=True)
@@ -7424,11 +7498,11 @@ class ForwardCppLensBench:
 
         def _records_to_camera_perspective(mask: np.ndarray) -> None:
             if not np.any(mask):
-                return
+                return False
             raw_sy = records.get("sensor_origin_y", None)
             raw_sz = records.get("sensor_origin_z", None)
             if raw_sy is None or raw_sz is None:
-                return
+                return False
             sy_all = np.asarray(raw_sy, dtype=np.float32)[vis_mask]
             sz_all = np.asarray(raw_sz, dtype=np.float32)[vis_mask]
 
@@ -7450,7 +7524,7 @@ class ForwardCppLensBench:
             in_sensor = (np.abs(sy) <= half_w) & (np.abs(sz) <= half_h)
             m_img = valid_hit & in_sensor
             if not np.any(m_img):
-                return
+                return False
 
             re_img = vm_re[mask][m_img]
             im_img = vm_im[mask][m_img]
@@ -7476,6 +7550,7 @@ class ForwardCppLensBench:
             with self._segs_lock:
                 for ch in range(3):
                     self._camera_perspective_pending[:, :, ch] += deltas[ch]
+            return True
 
         # Pure preview feeds: project all strike records into the image-plane Y/Z
         # grid.  Do not require the ray to hit the image plate; this is a live
@@ -7485,7 +7560,8 @@ class ForwardCppLensBench:
         rev_strike = (vm_kinds == 0) & (vm_cflags == 1)
         _records_to_preview(fwd_strike, self._forward_img_accum)
         _records_to_preview(rev_strike, self._reverse_img_accum)
-        _records_to_camera_perspective(rev_strike)
+        if _records_to_camera_perspective(rev_strike):
+            self.publish_camera_perspective_package()
 
         # Pack raw hit positions into ring-buffer rows: (x, y, z, amp, class, gid)
         pts = np.empty((vm_pos_all.shape[0], 6), dtype=np.float32)
@@ -8333,83 +8409,59 @@ class ForwardCppLensBench:
         pixels_per_batch: int = 0,
         stage_args: "dict | None" = None,
     ) -> int:
-        """
-        Fire one ordered cached sensor-ray chunk against the already-submitted
-        flash, accumulating T5 results into sensor_accum via +=.
-
-        The cache is Mortonized across film UV and aperture angle.  One call
-        consumes exactly one compact full-space package; when the stream is
-        exhausted, the next call starts the next Morton round.  This keeps T5
-        producing a full-color result after every package pair.
-
-        Returns total rays submitted.
-        """
+        """Submit one native tiled-Morton sensor package for the current stage."""
         res = int(max(16, self.scene.image_plate.sensor_res))
         n_ap = int(max(1, n_aperture_samples))
         stage_args = stage_args or {}
         max_bounces = int(max_bounces or 8)
         total_rays = 0
-        expected_sig = self._sensor_ray_cache_signature(res, n_ap)
-        if self._sensor_ray_cache.signature != expected_sig or self._sensor_ray_cache.count() <= 0:
-            self.rebuild_sensor_ray_cache(pixels=res, aperture_samples=n_ap, seed=0)
         if pixels_per_batch > 0:
             rays_per_batch = int(max(1, pixels_per_batch)) * n_ap
         else:
             rays_per_batch = int(max(1, getattr(self, "bdpt_ordered_sensor_batch_rays", 8_192)))
-        _use_gpu = self.compute_mode in ("gpu", "mixed")
-        _all_gpu = self.compute_mode == "gpu"
+        schedule_total = int(res * res * n_ap)
+        if schedule_total <= 0:
+            return 0
+        rays_per_batch = int(max(1, min(rays_per_batch, schedule_total)))
 
         self.tracer.begin_sensor_batching()
         try:
-            pkg = self._sensor_ray_cache.package(rays_per_batch, wrap=False)
-            if pkg is None:
-                self._sensor_ray_cache.rewind()
-                pkg = self._sensor_ray_cache.package(rays_per_batch, wrap=False)
-            if pkg is None:
-                return 0
-            n = int(pkg["origins"].shape[0])
-            if n <= 0:
-                return 0
-            weights = self._stage_sensor_weight_for_uv(pkg["film_uv"], stage_args)
-            active = np.isfinite(weights) & (weights > 0.0)
-            if not np.any(active):
-                return 0
-
-            origins = pkg["origins"][active]
-            directions = pkg["directions"][active]
-            amplitudes = pkg["amplitudes"][active] * weights[active, None]
-            src_ids = pkg.get("src_ids", np.zeros(n, dtype=np.int32))[active]
-            cflag_arr = pkg.get("color_flags", np.ones(n, dtype=np.uint8))[active]
-            tag_arr = pkg["tags"][active]
-            if self.cull_infinite_rays and self.cull_sensor_cache_rays:
-                origins, directions, amplitudes, src_ids, cflag_arr, tag_arr = _cull_finite_rays(
-                    origins, directions, amplitudes, src_ids, cflag_arr, tag_arr, label="sensor-bdpt-cache")
-            n_submit = int(origins.shape[0])
-            if n_submit <= 0:
-                return 0
-
-            # Signal flash first: the flash path was submitted by the caller;
-            # this re-arms the counter for this complete sensor package.
             self.tracer.signal_flash_dispatched()
-            self.tracer.submit_rays(
-                origins=np.ascontiguousarray(origins),
-                directions=np.ascontiguousarray(directions),
-                amplitudes=np.ascontiguousarray(amplitudes),
-                src_ids=np.ascontiguousarray(src_ids),
-                tags=np.ascontiguousarray(tag_arr),
-                color_flags=np.ascontiguousarray(cflag_arr),
-                max_bounces=int(max_bounces),
-                min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
-                max_children=1,
-                seed=int(seed),
-                use_gpu_compute=_use_gpu,
-                gpu_all_stages=_all_gpu,
-                shader_dir=_SHADER_DIR,
-            )
+            n_submit_total = 0
+            pix_offset = 0
+            while pix_offset < schedule_total:
+                n_submit = int(self.tracer.submit_sensor_sweep(
+                    max_bounces=int(max_bounces),
+                    min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
+                    max_rays=int(min(rays_per_batch, schedule_total - pix_offset)),
+                    pix_offset=int(pix_offset),
+                    max_children=2,
+                    aperture_samples=int(n_ap),
+                    seed=int(seed),
+                    shutter_mode=int(stage_args.get("shutter_mode", 0)),
+                    shutter_open=float(stage_args.get("shutter_open", 1.0)),
+                    shutter_center_u=float(stage_args.get("shutter_center_u", 0.5)),
+                    shutter_center_v=float(stage_args.get("shutter_center_v", 0.5)),
+                    shutter_softness=float(stage_args.get("shutter_softness", 0.0)),
+                    exposure_weight=float(stage_args.get("exposure_weight", 1.0)),
+                ))
+                if n_submit <= 0:
+                    break
+                n_submit_total += n_submit
+                pix_offset += n_submit
+                self._ensure_drain_loop()
+                # Blue PIP is direct camera perspective and may update during
+                # saturation.  Green/BDPT is gated below on the complete grid.
+                time.sleep(0.002)
+                self.publish_camera_perspective_package()
+            if n_submit_total < schedule_total:
+                return 0
+            self._bdpt_native_sensor_schedule_offset = 0
             self.tracer.signal_sensor_dispatched()
             self._ensure_drain_loop()
-            # Publish exactly this one sensor Morton package to the blue PIP
-            # before the next package can be submitted. T5/green follows.
+
+            # T5/green is only valid after the full Morton grid has been
+            # saturated.  Do not expose partial BDPT images as final output.
             _deadline = time.perf_counter() + 2.0
             while time.perf_counter() < _deadline:
                 try:
@@ -8418,13 +8470,21 @@ class ForwardCppLensBench:
                 except Exception:
                     break
                 time.sleep(0.002)
-            # Give the drain/vis handoff one short slice to move terminal
-            # records into the pending blue buffer, then publish that package.
-            time.sleep(0.005)
-            self.publish_camera_perspective_package()
             self.tracer.join_t5()
-            total_rays += n_submit
-            self._sensor_viewfinder_last_launched = n_submit
+            try:
+                _cur_img = np.asarray(self.tracer.get_sensor_image(), dtype=np.float32)
+                if _cur_img.ndim == 3 and _cur_img.shape[2] >= 3 and _cur_img.shape[0] > 0:
+                    self._last_bdpt_plate_rgb = np.ascontiguousarray(
+                        np.clip(_cur_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
+                    _lit_px = int(np.count_nonzero(np.sum(_cur_img[:, :, :3], axis=2) > 1.0e-8))
+                    self.bdpt_last_connection_stats["lit_pixels"] = _lit_px
+                    self.bdpt_last_connection_stats["lit_fraction"] = (
+                        float(_lit_px) / float(max(1, _cur_img.shape[0] * _cur_img.shape[1]))
+                    )
+            except Exception as _img_exc:
+                print(f"[bdpt-pip] native full-grid refresh failed: {_img_exc}", flush=True)
+            total_rays += n_submit_total
+            self._sensor_viewfinder_last_launched = n_submit_total
         finally:
             self.tracer.end_sensor_batching()
 
@@ -8664,6 +8724,59 @@ class ForwardCppLensBench:
             _scene_lenses(self.scene),
         )
 
+    def _reset_native_morton_schedules(
+        self,
+        *,
+        reset_pipeline: bool = False,
+        reason: str = "schedule",
+    ) -> None:
+        """Restart progressive native Morton schedules.
+
+        Optical changes must also flush the native pipeline; otherwise queued
+        rays and the C++ sensor image can keep reporting the previous focus.
+        """
+        if reset_pipeline:
+            try:
+                self._pipeline_reset_epoch += 1
+                # RayTracer owns a persistent C++ pipeline.  It has no in-place
+                # reset API; destruction is the native flush, and the next
+                # submit/ensure call recreates it with the current config.
+                if hasattr(self.tracer, "end_sensor_batching"):
+                    try:
+                        self.tracer.end_sensor_batching()
+                    except Exception:
+                        pass
+                if hasattr(self.tracer, "stop_pipeline"):
+                    self.tracer.stop_pipeline()
+                if hasattr(self.tracer, "clear_rays"):
+                    self.tracer.clear_rays()
+                if hasattr(self.tracer, "request_field_display_clear"):
+                    self.tracer.request_field_display_clear()
+                try:
+                    while True:
+                        self._vis_queue.get_nowait()
+                except queue.Empty:
+                    pass
+                with self._segs_lock:
+                    if hasattr(self, "_forward_img_accum"):
+                        self._forward_img_accum[:] = 0.0
+                    if hasattr(self, "_reverse_img_accum"):
+                        self._reverse_img_accum[:] = 0.0
+                    if hasattr(self, "_camera_perspective_accum"):
+                        self._camera_perspective_accum[:] = 0.0
+                    if hasattr(self, "_camera_perspective_pending"):
+                        self._camera_perspective_pending[:] = 0.0
+                print(f"[pipeline-reset] reason={reason}", flush=True)
+            except Exception as exc:
+                print(f"[pipeline-reset] reason={reason} failed: {exc}", flush=True)
+        self._bdpt_native_sensor_schedule_offset = 0
+        self._bdpt_camera_sweep_stage = 0
+        self._camera_exposure_forward_stage = 0
+        self._camera_exposure_complete = False
+        self._active_exposure_frame = None
+        self._camera_timeline = None
+        self._exposure_barrier = None
+
     def _adjust_lens_element(self, idx: int, delta_x: float) -> None:
         """Shift lens element `idx` along X by `delta_x` metres and recast all ray correlation.
 
@@ -8678,25 +8791,27 @@ class ForwardCppLensBench:
         lenses[idx] = _dc.replace(lenses[idx], center_x=round(lenses[idx].center_x + delta_x, 6))
         self.scene.lens_stack = lenses
 
-        if self._lens_assembly is not None and self._lens_assembly.mode == LensAssemblySpec.MODE_PARAMETRIC:
-            new_cl = _compound_lens_from_stack(lenses, getattr(self.scene, "iris_aperture", None))
-            self._lens_assembly.set_optics(new_cl)
-            lsg = getattr(self, "lens_surface_groups", None)
-            if lsg:
-                saved_design = getattr(self.scene, "optical_design", None)
-                self.scene.optical_design = None
-                try:
-                    self.tracer.clear_tri_groups()
-                    self._lens_assembly.register(
-                        self.tracer,
-                        lsg,
-                        self.tri_vertices,
-                        self.tri_centroids,
-                        _scene_lenses(self.scene),
-                    )
-                finally:
-                    self.scene.optical_design = saved_design
-                self._start_progressive_refinement()
+        with self._trace_lock:
+            self._reset_native_morton_schedules(reset_pipeline=True, reason="lens-live")
+            if self._lens_assembly is not None and self._lens_assembly.mode == LensAssemblySpec.MODE_PARAMETRIC:
+                new_cl = _compound_lens_from_stack(lenses, getattr(self.scene, "iris_aperture", None))
+                self._lens_assembly.set_optics(new_cl)
+                lsg = getattr(self, "lens_surface_groups", None)
+                if lsg:
+                    saved_design = getattr(self.scene, "optical_design", None)
+                    self.scene.optical_design = None
+                    try:
+                        self.tracer.clear_tri_groups()
+                        self._lens_assembly.register(
+                            self.tracer,
+                            lsg,
+                            self.tri_vertices,
+                            self.tri_centroids,
+                            _scene_lenses(self.scene),
+                        )
+                    finally:
+                        self.scene.optical_design = saved_design
+                    self._start_progressive_refinement()
 
         # Clear display and endpoint accumulators on lens move so PDAF and the
         # sensor view cannot reuse hit depths from the previous optical state.
@@ -8734,12 +8849,6 @@ class ForwardCppLensBench:
         self._bdpt_sensor_cfg = None
         self._bdpt_native_sensor_sweep_started = False
         self._bdpt_native_sensor_sweep_rays = 0
-        self._bdpt_camera_sweep_stage = 0
-        self._camera_exposure_forward_stage = 0
-        self._camera_exposure_complete = False
-        self._active_exposure_frame = None
-        self._camera_timeline = None
-        self._exposure_barrier = None
         self._scene_camera_coordinator.reset(float(getattr(self.scene, "subject_time_s", 0.0)))
         self._last_scene_camera_step = None
         self._last_scene_snapshot = None
@@ -8772,6 +8881,8 @@ class ForwardCppLensBench:
         (i.e., from the main thread, not from inside a drain callback).
         """
         with self._trace_lock:
+            self._reset_native_morton_schedules(reset_pipeline=True, reason="optics-live")
+
             # Invalidate the cached sensor-group config so _ensure_bdpt_plate_sensor_group
             # unconditionally re-registers with the current plate.x and exit pupil.
             self._bdpt_sensor_cfg = None
@@ -8811,10 +8922,6 @@ class ForwardCppLensBench:
         self._camera_samples.clear()
         self._bdpt_native_sensor_sweep_started = False
         self._bdpt_native_sensor_sweep_rays = 0
-        self._bdpt_camera_sweep_stage = 0
-        self._camera_exposure_complete = False
-        self._camera_timeline = None
-        self._exposure_barrier = None
 
     def set_focus_distance_live(self, u_m: float) -> bool:
         """Focus at object distance ``u_m`` (metres from G1 front face) by
@@ -11420,10 +11527,8 @@ def run(
         norms = (raw_n / np.where(nlen > 1e-12, nlen, 1.0)).astype(np.float32)
         norm_flat = np.repeat(norms, 3, axis=0)                  # (N*3, 3)
         uv_flat = np.zeros((n_tris * 3, 2), dtype=np.float32)
-        # Use the actual scene material IDs so that emissive source surfaces
-        # carry their real emission_rgb into the fragment
-        # shader.  The renderer's derive_emissive_area_lights will pick those up
-        # and handle illumination — no manual light setup needed here.
+        # Use the actual scene material IDs for renderer-side material lookup.
+        # BDPT emission is defined by spectral_bands in the MaterialDatabase.
         mat_flat = np.repeat(bench.tri_mat_ids, 3)               # (N*3,) ints
         # Group IDs for self-exclusion in the fragment shader; all-zero when
         # UV page bank is not active (no per-group self-exclusion needed).
@@ -11595,10 +11700,8 @@ def run(
 
     def draw_pip() -> None:
         def _rot180(arr: np.ndarray) -> np.ndarray:
-            """X-axis flip only: C++ get_sensor_image() already Y-flips for OpenGL
-            convention, and optical physics applies a 180° rotation on the sensor.
-            Combined: Y-flip (display) + Y-flip (physics) cancel → net X-flip only."""
-            return np.ascontiguousarray(arr[:, ::-1], dtype=np.float32)
+            """Display sensor-order images as a 180-degree rotated view."""
+            return np.ascontiguousarray(arr[::-1, ::-1], dtype=np.float32)
 
         # ── Pos 0 (leftmost): forward ray strikes — projection map, no rotation ─
         fwd_img = bench.get_forward_strike_image()
@@ -12989,10 +13092,7 @@ def run(
 
         def _reset_for_next_exposure() -> None:
             """Clear accumulators and pipeline state ready for a fresh exposure."""
-            try:
-                bench.tracer.reset_pipeline()
-            except Exception:
-                pass
+            bench._reset_native_morton_schedules(reset_pipeline=True, reason="exposure-reset")
             bench._forward_img_accum[:] = 0.0
             bench._reverse_img_accum[:] = 0.0
             bench._camera_perspective_accum[:] = 0.0
@@ -13001,9 +13101,6 @@ def run(
             bench._last_bdpt_plate_rgb = None
             bench._last_direct_img = None
             bench._camera_exposure_complete = False
-            bench._camera_exposure_forward_stage = 0
-            bench._bdpt_camera_sweep_stage = 0
-            bench._active_exposure_frame = None
             bench.begin_scene_camera_step()
             bench._ensure_camera_timeline()
 
@@ -13040,10 +13137,7 @@ def run(
 
             # Advance only the exposure scheduler state.  Do not reset pipeline
             # or image accumulators; the next pass adds more Mortonized detail.
-            bench._camera_exposure_complete = False
-            bench._camera_exposure_forward_stage = 0
-            bench._bdpt_camera_sweep_stage = 0
-            bench._active_exposure_frame = None
+            bench._reset_native_morton_schedules()
             bench.begin_scene_camera_step()
             bench._ensure_camera_timeline()
 

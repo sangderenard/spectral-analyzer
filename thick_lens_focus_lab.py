@@ -1635,7 +1635,12 @@ def _scene_lenses(scene: SceneConfig) -> List[LensConfig]:
                     g2 = groups[1]
                     g3 = groups[2]
                     ap_x = float(0.5 * (float(g2.x_m) + float(g3.x_m)))
-                    ap_r = float(max(1.0e-4, getattr(solved.spec, "aperture_radius_m", 0.018)))
+                    _spec_fnum = float(getattr(solved.spec, "f_number", 0.0))
+                    _spec_efl  = float(getattr(solved, "effective_focal_length_m", 0.0))
+                    if _spec_fnum > 0.5 and _spec_efl > 1e-4:
+                        ap_r = float(max(1.0e-4, _spec_efl / (2.0 * _spec_fnum)))
+                    else:
+                        ap_r = float(max(1.0e-4, getattr(solved.spec, "aperture_radius_m", 0.018)))
                     ap_outer = float(min(float(scene.tube_radius), ap_r * 1.55))
                     scene.iris_aperture = IrisApertureConfig(
                         enabled=True,
@@ -7189,6 +7194,8 @@ class ForwardCppLensBench:
         )
 
     def _ensure_drain_loop(self) -> None:
+        if self._drain_stop.is_set():
+            return  # Shutdown in progress — do not restart the drain thread.
         if self._drain_thread is not None and self._drain_thread.is_alive():
             return
         # First pipeline start: configure adaptive thresholds
@@ -8429,7 +8436,7 @@ class ForwardCppLensBench:
             self.tracer.signal_flash_dispatched()
             n_submit_total = 0
             pix_offset = 0
-            while pix_offset < schedule_total:
+            while pix_offset < schedule_total and not self._drain_stop.is_set():
                 n_submit = int(self.tracer.submit_sensor_sweep(
                     max_bounces=int(max_bounces),
                     min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
@@ -8454,7 +8461,7 @@ class ForwardCppLensBench:
                 # saturation.  Green/BDPT is gated below on the complete grid.
                 time.sleep(0.002)
                 self.publish_camera_perspective_package()
-            if n_submit_total < schedule_total:
+            if self._drain_stop.is_set() or n_submit_total < schedule_total:
                 return 0
             self._bdpt_native_sensor_schedule_offset = 0
             self.tracer.signal_sensor_dispatched()
@@ -8463,13 +8470,15 @@ class ForwardCppLensBench:
             # T5/green is only valid after the full Morton grid has been
             # saturated.  Do not expose partial BDPT images as final output.
             _deadline = time.perf_counter() + 2.0
-            while time.perf_counter() < _deadline:
+            while time.perf_counter() < _deadline and not self._drain_stop.is_set():
                 try:
                     if int(self.tracer.in_flight_count()) == 0:
                         break
                 except Exception:
                     break
                 time.sleep(0.002)
+            if self._drain_stop.is_set():
+                return 0
             self.tracer.join_t5()
             try:
                 _cur_img = np.asarray(self.tracer.get_sensor_image(), dtype=np.float32)
@@ -12927,9 +12936,10 @@ def run(
         submitted = 0
         if _flash_active:
             import time as _bp_t
-            while not closing.is_set() and int(bench.tracer.in_flight_count()) > _MAX_IN_FLIGHT:
+            while (not closing.is_set() and not _rebuild_in_progress.is_set()
+                   and int(bench.tracer.in_flight_count()) > _MAX_IN_FLIGHT):
                 _bp_t.sleep(0.002)
-            if closing.is_set():
+            if closing.is_set() or _rebuild_in_progress.is_set():
                 return
             submitted = bench.trace_forward(_submit_rpe, sd,
                                             max_bounces=mb,
@@ -13160,28 +13170,42 @@ def run(
         # the old bench's tracer before we tear it down.
         _rebuild_in_progress.set()
         import time as _sb_time
-        # Give the camera thread a brief window to reach a safe return point.
-        _sb_time.sleep(0.030)
+        # Brief yield so the camera thread can exit any in-flight slice check.
+        # stop_pipeline() below unblocks blocking C++ calls immediately, so 5ms
+        # is sufficient rather than the previous 30ms.
+        _sb_time.sleep(0.005)
         try:
             if old_bench._lens_assembly is not None:
                 old_bench._lens_assembly.stop_progressive_refinement()
         except Exception as exc:
             print(f"[bench-rebuild] lens assembly stop failed: {exc}", flush=True)
+        # Explicitly destroy the C++ pipeline BEFORE joining the drain thread.
+        # The drain thread blocks inside drain_records_display() (a C++ call);
+        # setting _drain_stop alone cannot unblock it — only stop_pipeline() can.
+        # If we join first, the 2-second timeout always expires and the old drain
+        # thread keeps running alongside the new bench, causing the "previous work
+        # still being undertaken" symptom.
         try:
             old_bench._drain_stop.set()
-            if old_bench._drain_thread is not None:
-                old_bench._drain_thread.join(timeout=2.0)
-        except Exception as exc:
-            print(f"[bench-rebuild] drain stop failed: {exc}", flush=True)
-        # Explicitly destroy the C++ pipeline (GPU dispatch thread + CPU workers)
-        # before the new bench creates its shared WGL context.  CPython reference
-        # cycles on _drain_thread can delay __del__, leaving the old GPU thread
-        # alive and its WGL context current, which blocks the new init on Windows.
-        try:
             old_bench.tracer.stop_pipeline()
             print("[bench-rebuild] pipeline stopped", flush=True)
         except Exception as exc:
             print(f"[bench-rebuild] pipeline stop failed: {exc}", flush=True)
+        try:
+            if old_bench._drain_thread is not None:
+                old_bench._drain_thread.join(timeout=2.0)
+            if old_bench._vis_thread is not None:
+                old_bench._vis_thread.join(timeout=0.5)
+        except Exception as exc:
+            print(f"[bench-rebuild] drain stop failed: {exc}", flush=True)
+        # Wait for the old sensor worker to finish and clear _pipeline_camera_busy.
+        # With _drain_stop set, run_sensor_batches exits its submission loop on the
+        # next iteration check, so this wait is typically < 5ms.  Force-clear after
+        # 200ms so a stuck worker never blocks the rebuild indefinitely.
+        _t_wait = _sb_time.perf_counter()
+        while _pipeline_camera_busy[0] and _sb_time.perf_counter() - _t_wait < 0.200:
+            _sb_time.sleep(0.002)
+        _pipeline_camera_busy[0] = False
         # Explicitly zero accumulators and drop large buffer references so Python's
         # reference counter can reclaim the GPU/CPU memory before the new bench
         # allocates its own.  Without this the old buffers stay alive until the
@@ -13414,7 +13438,10 @@ def run(
         _cur_r = float(getattr(_cur_iris, "r_inner", 0.0)) if _cur_iris is not None else 0.0
         _cur_fnum = (_cur_efl / (2.0 * _cur_r)) if _cur_r > 1e-6 and _cur_efl > 1e-6 else 2.8
         import dataclasses as _dc
-        scene.optical_design = _dc.replace(spec, zoom=round(new_zoom, 6))
+        # Embed the current f-number so the iris auto-placement during bench init
+        # uses the correct aperture radius, avoiding a second rebuild.
+        scene.optical_design = _dc.replace(spec, zoom=round(new_zoom, 6),
+                                           f_number=round(_cur_fnum, 3))
         scene.iris_aperture = None  # let solver re-derive iris position for new focal
         scene.focus_distance_m = float(getattr(scene, "focus_distance_m", 1.0) or 1.0)
         print(f"[zoom] fl={new_focal_m*1e3:.0f}mm  zoom={new_zoom:.3f}  f/{_cur_fnum:.1f}  rebuilding…", flush=True)
@@ -13429,15 +13456,9 @@ def run(
             field_capture=field_capture,
             enable_uv_splat=enable_uv_splat,
         )
-        _wire_rebuilt_bench(bench, finalize=False)
-        # Re-apply the preserved f-number at the new focal length.
-        # finalize=False keeps _rebuild_in_progress set so the camera thread
-        # doesn't briefly start between the zoom rebuild and the iris rebuild.
-        _new_efl = float(getattr(getattr(scene, "optical_design", None),
-                                  "effective_focal_length_m", new_focal_m) or new_focal_m)
-        _new_iris_r = _new_efl / (2.0 * max(_cur_fnum, 0.5))
-        _rebuild_bench_with_iris(_new_iris_r)
+        _wire_rebuilt_bench(bench)
         print(f"[zoom] rebuild done  fl={new_focal_m*1e3:.0f}mm  tris={bench.n_tris}", flush=True)
+        _restore_display_gl_context()
 
     def _rebuild_bench_with_lens(focal_range_m, target_f_number, zoom_start=0.5) -> None:
         """Switch to a different lens prescription and rebuild the scene."""
@@ -13461,6 +13482,8 @@ def run(
         fl_label = (f"{focal_range_m[0]*1e3:.0f}mm"
                     if focal_range_m[0] == focal_range_m[1]
                     else f"{focal_range_m[0]*1e3:.0f}-{focal_range_m[1]*1e3:.0f}mm")
+        # OpticalDesignSpec carries f_number; the bench init iris auto-placement
+        # reads it via solved EFL to size the aperture correctly in one pass.
         print(f"[lens] switching to {fl_label} f/{target_f_number}  rebuilding…", flush=True)
         _stop_bench_runtime(bench)
         _invalidate_scene_gl_cache()
@@ -13473,17 +13496,9 @@ def run(
             field_capture=field_capture,
             enable_uv_splat=enable_uv_splat,
         )
-        _wire_rebuilt_bench(bench, finalize=False)
-        # Apply the new lens's max aperture.  finalize=False keeps the rebuild
-        # gate held across the two-stage rebuild so the camera thread only
-        # unblocks once both the lens prescription and the iris are in place.
-        _new_efl = float(getattr(getattr(scene, "optical_design", None),
-                                  "effective_focal_length_m",
-                                  float(focal_range_m[0] + focal_range_m[1]) * 0.5) or
-                         float(focal_range_m[0] + focal_range_m[1]) * 0.5)
-        _iris_r = _new_efl / (2.0 * max(float(target_f_number), 0.5))
-        _rebuild_bench_with_iris(_iris_r)
+        _wire_rebuilt_bench(bench)
         print(f"[lens] done  {fl_label}  f/{target_f_number}  tris={bench.n_tris}", flush=True)
+        _restore_display_gl_context()
 
     # ── Click-button state ────────────────────────────────────────────────────
     # Registered at draw time, read at event time.  Each entry:

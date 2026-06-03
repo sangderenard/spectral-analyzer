@@ -7656,6 +7656,10 @@ struct RayPipelineState {
     std::vector<float>        priority_map;       /* res*res sugar-auxin field (1.0 = baseline) */
     mutable double            sensor_peak[4]      = {1e-30, 1e-30, 1e-30, 1e-30}; /* running per-channel max, never decreases */
 
+    /* Set by ray_pipeline_destroy before set_done(); checked by T5 inner loop
+     * and gpu_dispatch thread_main to exit without finishing in-flight work. */
+    std::atomic<bool>         cancel{false};
+
     /* ── GPU compute dispatch (nullptr = CPU-only) ─────────────────────────── */
     class GlPipelineDispatch;                       /* forward-declared below    */
     GlPipelineDispatch*       gpu_dispatch = nullptr;
@@ -8811,6 +8815,12 @@ public:
         (void)prev_nv; (void)prev_ns; (void)prev_np;
         for (;;) {  /* ── bounce loop ── */
 
+        if (ps.cancel.load(std::memory_order_relaxed)) {
+            if (out_flash_children)  *out_flash_children  = 0;
+            if (out_sensor_children) *out_sensor_children = 0;
+            return total_n_hits;
+        }
+
         /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 20 + 2*MAX_SPECTRAL_BANDS floats) */
         static constexpr int INTENT_STRIDE = 20 + 2 * MAX_SPECTRAL_BANDS;
         if (n > cap_intents) {
@@ -9634,7 +9644,7 @@ public:
              * for this dispatch cycle.  Fire T5 if both families are ready. */
             if (n < 0) {
                 if (t5_job_ready.load(std::memory_order_acquire))
-                    service_t5_job();
+                    service_t5_job(ps);
                 /* T5 is now woken by bdpt_update_inflight via Q_t5_ready.
                  * Nothing to poll here. */
                 continue;
@@ -9652,7 +9662,7 @@ public:
                 }
                 /* Service any outstanding T5 job before exiting */
                 if (t5_job_ready.load(std::memory_order_acquire))
-                    service_t5_job();
+                    service_t5_job(ps);
                 break;
             }
 
@@ -9695,7 +9705,7 @@ public:
 
             /* Service T5 connection job if one arrived during this batch */
             if (t5_job_ready.load(std::memory_order_acquire))
-                service_t5_job();
+                service_t5_job(ps);
         }
         ps.gpu_dispatch_state.store(5, std::memory_order_release);
     }
@@ -9703,7 +9713,7 @@ public:
     /* ── service_t5_job: runs on the GPU thread when t5_job_ready is set ── *
      * Uploads T5 SSBOs (bindings 0-3), dispatches t5_full_connect.comp.glsl,*
      * barriers, reads back the pixel accum buffer, fulfills the promise.    */
-    void service_t5_job() {
+    void service_t5_job(RayPipelineState& ps) {
         std::unique_ptr<T5Job> job;
         {
             std::lock_guard<std::mutex> lk(t5_job_mu);
@@ -9711,11 +9721,15 @@ public:
             t5_job_ready.store(false, std::memory_order_release);
         }
         if (!job) return;
+        if (ps.cancel.load(std::memory_order_relaxed)) {
+            try { job->promise.set_value({}); } catch (...) {}
+            return;
+        }
         /* Wrap everything so an unhandled exception fulfills the promise with
          * an error (unblocking the caller) rather than escaping the GPU thread
          * and triggering std::terminate(). */
         try {
-        service_t5_job_impl(job);
+        service_t5_job_impl(job, ps);
         } catch (...) {
             fprintf(stderr, "[T5-gpu] FATAL exception in T5 GPU job — fulfilling promise with error\n");
             fflush(stderr);
@@ -9725,7 +9739,7 @@ public:
         }
     }
 
-    void service_t5_job_impl(std::unique_ptr<T5Job>& job) {
+    void service_t5_job_impl(std::unique_ptr<T5Job>& job, RayPipelineState& ps) {
 
         const auto& lv  = job->light_verts;
         const auto& cv  = job->cam_verts;
@@ -9928,7 +9942,8 @@ public:
                                       / (uint32_t)T5_TILE_C;
 
                     /* ── Inner light-batch loop (TDR guard for Y-dispatch) ── */
-                    for (uint32_t b = 0; b < n_batches && gpu_ok; ++b) {
+                    for (uint32_t b = 0; b < n_batches && gpu_ok
+                                        && !ps.cancel.load(std::memory_order_relaxed); ++b) {
                         par.light_offset     = b * T5_LIGHT_BATCH;
                         par.light_batch_size = std::min(T5_LIGHT_BATCH,
                                                         n_light - par.light_offset);
@@ -10011,6 +10026,12 @@ public:
             }
         }
 
+        if (ps.cancel.load(std::memory_order_relaxed)) {
+            fprintf(stderr, "[T5-gpu] cancelled — fulfilling promise with empty result\n");
+            fflush(stderr);
+            job->promise.set_value({});
+            return;
+        }
         if (gpu_ok)
             fprintf(stderr, "[T5-gpu] done: %d/%d tiles  res=%d  wall %.1fs\n",
                     tiles_done, n_tiles_total, res,
@@ -11461,6 +11482,10 @@ RayPipelineState* ray_pipeline_create(
 void ray_pipeline_destroy(RayPipelineState* ps)
 {
     if (!ps) return;
+    /* Signal cancel before set_done() so the T5 inner light-batch loop and the
+     * gpu_dispatch thread_main see it on the very next iteration check and exit
+     * without waiting for all queued GPU work to finish. */
+    ps->cancel.store(true, std::memory_order_release);
     ps->Q_intent.set_done();
     ps->Q_hit.set_done();
     ps->Q_refined.set_done();

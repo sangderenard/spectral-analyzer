@@ -94,6 +94,68 @@ def _morton_encode(x: np.ndarray, y: np.ndarray) -> np.ndarray:
     return _spread_bits(x) | (_spread_bits(y) << np.uint32(1))
 
 
+def _morton_encode4(a: np.ndarray, b: np.ndarray, c: np.ndarray, d: np.ndarray) -> np.ndarray:
+    """Interleave four 8-bit coordinates into one 32-bit Morton code."""
+    a = np.asarray(a, dtype=np.uint32) & np.uint32(0xFF)
+    b = np.asarray(b, dtype=np.uint32) & np.uint32(0xFF)
+    c = np.asarray(c, dtype=np.uint32) & np.uint32(0xFF)
+    d = np.asarray(d, dtype=np.uint32) & np.uint32(0xFF)
+    out = np.zeros(np.broadcast(a, b, c, d).shape, dtype=np.uint32)
+    for bit in range(8):
+        shift = np.uint32(bit)
+        out |= ((a >> shift) & np.uint32(1)) << np.uint32(4 * bit + 0)
+        out |= ((b >> shift) & np.uint32(1)) << np.uint32(4 * bit + 1)
+        out |= ((c >> shift) & np.uint32(1)) << np.uint32(4 * bit + 2)
+        out |= ((d >> shift) & np.uint32(1)) << np.uint32(4 * bit + 3)
+    return out
+
+
+def _quantize_unit_for_morton(v: np.ndarray, levels: int = 256) -> np.ndarray:
+    """Quantize normalized coordinates for Morton ordering."""
+    arr = np.asarray(v, dtype=np.float64)
+    n = int(max(2, min(256, levels)))
+    return np.clip(np.floor(np.clip(arr, 0.0, 1.0 - 1.0e-12) * n), 0, n - 1).astype(np.uint32)
+
+
+def _spatio_angular_morton_order(
+    uv0: np.ndarray,
+    uv1: np.ndarray,
+    ang0: np.ndarray,
+    ang1: np.ndarray,
+    *,
+    levels: int = 256,
+) -> np.ndarray:
+    """Return a stable 4D Morton order over surface position and angular sample.
+
+    The first two axes are film/emitter UV position; the second two are aperture
+    or direction-space coordinates.  This makes finite batches fill local
+    neighborhoods in both where rays start and where they point.
+    """
+    q0 = _quantize_unit_for_morton(uv0, levels)
+    q1 = _quantize_unit_for_morton(uv1, levels)
+    q2 = _quantize_unit_for_morton(ang0, levels)
+    q3 = _quantize_unit_for_morton(ang1, levels)
+    return np.argsort(_morton_encode4(q0, q1, q2, q3), kind="stable")
+
+
+def _golden_disk_samples(n: int, seed: int = 0) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Deterministic progressive disk samples plus normalized angular coordinates."""
+    count = int(max(0, n))
+    if count <= 0:
+        z = np.zeros((0,), dtype=np.float64)
+        return z, z, z, z
+    i = np.arange(count, dtype=np.float64)
+    golden = math.pi * (3.0 - math.sqrt(5.0))
+    r = np.sqrt((i + 0.5) / float(count))
+    theta = i * golden + float(seed) * 0.013
+    x = r * np.cos(theta)
+    y = r * np.sin(theta)
+    # Unit-square angular coordinates preserve both radial and azimuthal locality.
+    au = np.clip(0.5 + 0.5 * x, 0.0, 1.0)
+    av = np.clip(0.5 + 0.5 * y, 0.0, 1.0)
+    return x, y, au, av
+
+
 class RayRecordC(ctypes.Structure):
     _fields_ = [
         ("kind", ctypes.c_uint8),
@@ -4537,21 +4599,19 @@ class CameraSampleStore:
 
 
 class PhaseSensorSite:
-    """One phase-detection AF site — a single sensor pixel that compares
-    the total optical path length (OPL) from two aperture halves to the
-    scene in order to measure wavefront tilt = focus error.
+    """One phase-detection AF site.
 
-    For each aperture sample the caller supplies:
-      aperture_y  — signed y-coordinate of the aperture point (metres)
-      total_opl   — full OPL from scene object → aperture → lens → this site
-      wavelength  — wavelength in metres
-
-    The site accumulates a complex phasor per aperture half.  The angle of
-    conj(E_left) * E_right is zero when the sensor is at the conjugate focus
-    of the scene object and non-zero otherwise.
+    The current PDAF path stores a geometric split-pupil estimate derived from
+    this sensor pixel's own backward ray family.  The older coherent phasor
+    accumulator is kept as a fallback for callers that still provide OPL
+    samples directly.
     """
 
-    __slots__ = ("y_m", "z_m", "_E_left", "_E_right", "_n_left", "_n_right")
+    __slots__ = (
+        "y_m", "z_m",
+        "_E_left", "_E_right", "_n_left", "_n_right",
+        "_geom_phase", "_geom_defocus_m", "_geom_confidence",
+    )
 
     def __init__(self, y_m: float, z_m: float) -> None:
         self.y_m = float(y_m)
@@ -4560,6 +4620,9 @@ class PhaseSensorSite:
         self._E_right: complex = 0j
         self._n_left:  int = 0
         self._n_right: int = 0
+        self._geom_phase:      float = float("nan")
+        self._geom_defocus_m:  float = float("nan")
+        self._geom_confidence: float = 0.0
 
     def accumulate(self, aperture_y: float, total_opl: float, wavelength_m: float) -> None:
         """Add one aperture-path contribution.
@@ -4575,23 +4638,49 @@ class PhaseSensorSite:
             self._E_right += phasor
             self._n_right += 1
 
+    def set_geometric_focus(
+        self,
+        *,
+        phase_like_rad: float,
+        defocus_m: float,
+        confidence: float,
+    ) -> None:
+        """Store a split-pupil geometric PDAF estimate for this site."""
+        self._geom_phase = float(phase_like_rad)
+        self._geom_defocus_m = float(defocus_m)
+        self._geom_confidence = float(max(0.0, confidence))
+
     @property
     def phase_difference(self) -> float:
-        """ΔΦ = arg(E_left* · E_right).
+        """Return this site's phase-like split-pupil focus error.
 
-        Zero → in focus.  Positive → object too close (near-focus); negative →
-        object too far (far-focus).  Returns NaN when either half has no samples.
+        Geometric PDAF returns atan(split-disparity / scene-range).  Legacy OPL
+        samples fall back to ΔΦ = arg(E_left* · E_right).  Returns NaN when no
+        valid split-pupil estimate exists.
         """
+        if math.isfinite(self._geom_phase) and self._geom_confidence > 0.0:
+            return float(self._geom_phase)
         if self._n_left == 0 or self._n_right == 0:
             return float("nan")
         import cmath as _cmath
         return float(_cmath.phase(self._E_left.conjugate() * self._E_right))
+
+    @property
+    def geometric_defocus_m(self) -> float:
+        return float(self._geom_defocus_m)
+
+    @property
+    def focus_confidence(self) -> float:
+        return float(self._geom_confidence)
 
     def clear(self) -> None:
         self._E_left  = 0j
         self._E_right = 0j
         self._n_left  = 0
         self._n_right = 0
+        self._geom_phase = float("nan")
+        self._geom_defocus_m = float("nan")
+        self._geom_confidence = 0.0
 
 
 class PhaseSensorGrid:
@@ -4600,14 +4689,14 @@ class PhaseSensorGrid:
     Usage
     -----
     1.  Call ``configure()`` once when the bench is (re-)built.
-    2.  Call ``measure()`` after any focus change to populate the phasors.
+    2.  Call ``measure()`` after any focus change to populate site estimates.
     3.  Read ``phase_map`` or ``focus_error`` to drive the focus motor.
 
-    The ``measure()`` method traces forward rays from the scene object through
-    the CompoundLens to the sensor via ``evaluate_bundle``, then extends the
-    ray straight to each site to compute the full OPL.  Aperture samples are
-    split at the exit-pupil y = 0 plane (horizontal PDAF); set
-    ``split_axis='z'`` for vertical PDAF.
+    The ``measure()`` method launches backward rays from each configured sensor
+    site through the current pupil target, traces through the CompoundLens, and
+    compares where the two pupil halves converge on the scene-side focus
+    surface.  This lets off-axis sites carry their own focus state instead of
+    reusing an axial object point.
     """
 
     def __init__(self) -> None:
@@ -4648,21 +4737,21 @@ class PhaseSensorGrid:
         object_x:          float,
         exit_pupil_center: np.ndarray,
         exit_pupil_radius: float,
+        target_direction_mode: str = "toward",
         wavelength_m:      float = 550e-9,
         n_aperture:        int   = 64,
         rng_seed:          int   = 0,
     ) -> None:
-        """Populate each site's phase accumulators by tracing rays.
+        """Populate each site's PDAF estimate from its own sensor ray family.
 
-        For each site the method:
-          1.  Generates ``n_aperture`` points uniformly on the exit-pupil disk.
-          2.  Creates forward rays from the scene object toward each aperture
-              point, then traces them through ``optics`` (CompoundLens).
-          3.  Extends each exit ray to the sensor pixel to compute the total OPL.
-          4.  Calls ``site.accumulate(aperture_coord, total_opl, wavelength)``.
+        Each site launches rays from the sensor pixel through the current
+        image-side pupil target, traces them backward through the compound lens,
+        and intersects the object-side rays with the current scene focus surface
+        (``object_x`` plane).  The split-pupil focus signal is the weighted
+        left/right convergence mismatch for that individual sensor site.
 
-        Split axis: ``'y'`` separates left (ay < 0) from right (ay ≥ 0);
-        ``'z'`` separates top from bottom.
+        Split axis: ``'y'`` separates left/right pupil halves; ``'z'`` separates
+        top/bottom halves.
         """
         from camera_designer.compound_optics import RayBundle, TerminationReason
 
@@ -4673,7 +4762,7 @@ class PhaseSensorGrid:
 
         ep = np.asarray(exit_pupil_center, dtype=np.float64).reshape(3)
         ep_r = float(max(1.0e-6, exit_pupil_radius))
-        obj_pt = np.array([float(object_x), 0.0, 0.0], dtype=np.float64)
+        object_x_f = float(object_x)
 
         rng = np.random.default_rng(int(rng_seed))
         r_sq = rng.uniform(0.0, 1.0, n_aperture)
@@ -4690,25 +4779,22 @@ class PhaseSensorGrid:
 
         # Split coordinate for the two aperture halves
         split_coord = ap_y if self._split_axis == "y" else ap_z
-
-        # Trace once per site: origins are always obj_pt, directions vary per site
-        # because the rays converge at the site pixel on the sensor (reverse tracing).
-        # For maximum accuracy we treat each site independently, but to amortise the
-        # bundle cost we build one batch per aperture sample across all sites.
-        #
-        # Forward trace: object → aperture → lens → (sensor side)
-        # The OPL from evaluate_bundle covers the path from obj_pt through the lens
-        # assembly to the last optical surface (G4 exit face).
-        # We then add the free-space leg from the G4 exit to the sensor pixel.
-
+        half_class = split_coord >= 0.0
         n_sites = len(self._sites)
+        origins = np.empty((n_sites * n_aperture, 3), dtype=np.float64)
+        aperture_points = np.tile(ap_pts, (n_sites, 1))
+        for i, site in enumerate(self._sites):
+            start = i * n_aperture
+            stop = start + n_aperture
+            origins[start:stop, 0] = self._sensor_x
+            origins[start:stop, 1] = site.y_m
+            origins[start:stop, 2] = site.z_m
 
-        # Build origins (n_aperture × 1 broadcast) and directions toward aperture points
-        # These are the SAME for all sites since they go from the same object to the same
-        # aperture disk.  The site-specific part is only the final leg to the pixel.
-        origins    = np.tile(obj_pt, (n_aperture, 1))     # (n_aperture, 3)
-        directions = ap_pts - obj_pt                       # (n_aperture, 3)
-
+        mode = str(target_direction_mode)
+        if mode == "away_from_virtual":
+            directions = origins - aperture_points
+        else:
+            directions = aperture_points - origins
         bundle = RayBundle(origins=origins, directions=directions)
         result = optics.evaluate_bundle(bundle)
 
@@ -4716,32 +4802,92 @@ class PhaseSensorGrid:
         if not np.any(passed_mask):
             return
 
-        opl_through_lens = result.opl           # (n_aperture,)
-        exit_pos         = result.origins        # (n_aperture, 3)  — G4 exit surface
-        exit_dir         = result.directions     # (n_aperture, 3)
+        out_pos = np.asarray(result.origins, dtype=np.float64)
+        out_dir = np.asarray(result.directions, dtype=np.float64)
 
-        # For each site: compute the final-leg OPL from exit surface to site pixel.
-        sensor_x = self._sensor_x
-        for site in self._sites:
-            s_pt = np.array([sensor_x, site.y_m, site.z_m], dtype=np.float64)
+        def _weighted_line(origin_arr: np.ndarray, dir_arr: np.ndarray,
+                           weight_arr: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            wsum = float(np.sum(weight_arr))
+            if wsum <= 1.0e-30:
+                return np.zeros(3, dtype=np.float64), np.array([-1.0, 0.0, 0.0], dtype=np.float64)
+            o_mean = np.sum(origin_arr * weight_arr[:, None], axis=0) / wsum
+            d_mean = np.sum(dir_arr * weight_arr[:, None], axis=0) / wsum
+            dn = float(np.linalg.norm(d_mean))
+            if dn <= 1.0e-30:
+                d_mean = np.array([-1.0, 0.0, 0.0], dtype=np.float64)
+            else:
+                d_mean = d_mean / dn
+            return o_mean, d_mean
 
-            for k in range(n_aperture):
-                if not passed_mask[k]:
-                    continue
+        def _closest_axis_x(o0: np.ndarray, d0: np.ndarray,
+                            o1: np.ndarray, d1: np.ndarray) -> float:
+            r0 = o0 - o1
+            a = float(np.dot(d0, d0))
+            b = float(np.dot(d0, d1))
+            c = float(np.dot(d1, d1))
+            d = float(np.dot(d0, r0))
+            e = float(np.dot(d1, r0))
+            denom = a * c - b * b
+            if abs(denom) <= 1.0e-18:
+                return float("nan")
+            t0 = (b * e - c * d) / denom
+            t1 = (a * e - b * d) / denom
+            p0 = o0 + t0 * d0
+            p1 = o1 + t1 * d1
+            return float(0.5 * (p0[0] + p1[0]))
 
-                # Straight-line OPL from G4 exit to sensor pixel (n=1 air).
-                opl_to_pixel = float(np.linalg.norm(s_pt - exit_pos[k]))
-                total_opl    = float(opl_through_lens[k]) + opl_to_pixel
+        coord_idx = 1 if self._split_axis == "y" else 2
+        sensor_to_scene = abs(float(self._sensor_x) - object_x_f)
+        phase_scale = max(sensor_to_scene, 1.0e-6)
 
-                site.accumulate(
-                    aperture_y   = float(split_coord[k]),
-                    total_opl    = total_opl,
-                    wavelength_m = float(wavelength_m),
-                )
+        for site_idx, site in enumerate(self._sites):
+            start = site_idx * n_aperture
+            stop = start + n_aperture
+            ok = passed_mask[start:stop]
+            dirs = out_dir[start:stop]
+            poss = out_pos[start:stop]
+            dx = dirs[:, 0]
+            t = np.full(n_aperture, np.nan, dtype=np.float64)
+            dx_ok = np.abs(dx) > 1.0e-12
+            t[dx_ok] = (object_x_f - poss[dx_ok, 0]) / dx[dx_ok]
+            ok = ok & np.isfinite(t) & (t > 0.0)
+            if not np.any(ok & ~half_class) or not np.any(ok & half_class):
+                continue
+
+            hits = poss + t[:, None] * dirs
+            rho = np.sqrt(ap_y * ap_y + ap_z * ap_z) / ep_r
+            relaxation = np.clip(1.0 - 0.35 * rho * rho, 0.25, 1.0)
+            weights = np.abs(dx) * relaxation
+            weights = np.where(ok & np.isfinite(weights), weights, 0.0)
+
+            left = ok & ~half_class
+            right = ok & half_class
+            wl = weights[left]
+            wr = weights[right]
+            if float(np.sum(wl)) <= 1.0e-30 or float(np.sum(wr)) <= 1.0e-30:
+                continue
+
+            c_left = np.sum(hits[left] * wl[:, None], axis=0) / float(np.sum(wl))
+            c_right = np.sum(hits[right] * wr[:, None], axis=0) / float(np.sum(wr))
+            disparity = float(c_right[coord_idx] - c_left[coord_idx])
+
+            lo, ld = _weighted_line(poss[left], dirs[left], wl)
+            ro, rd = _weighted_line(poss[right], dirs[right], wr)
+            converge_x = _closest_axis_x(lo, ld, ro, rd)
+            defocus_m = float(converge_x - object_x_f) if math.isfinite(converge_x) else 0.0
+            valid_count = int(np.count_nonzero(ok))
+            balance = min(float(np.sum(wl)), float(np.sum(wr))) / max(float(np.sum(wl)) + float(np.sum(wr)), 1.0e-30)
+            confidence = float(valid_count / max(1, n_aperture)) * float(2.0 * balance)
+            phase_like = math.atan2(disparity, phase_scale)
+            site.set_geometric_focus(
+                phase_like_rad=phase_like,
+                defocus_m=defocus_m,
+                confidence=confidence,
+            )
 
     @property
     def phase_map(self) -> np.ndarray:
-        """Return (ny, nz) array of ΔΦ values (radians)."""
+        """Return (ny, nz) array of phase-like focus values."""
         arr = np.full((self._ny, self._nz), float("nan"), dtype=np.float64)
         for i, site in enumerate(self._sites):
             iy = i // self._nz
@@ -4751,13 +4897,22 @@ class PhaseSensorGrid:
 
     @property
     def focus_error(self) -> float:
-        """Mean ΔΦ over all valid sites (radians).
+        """Weighted mean phase-like split-pupil error over valid sites.
 
-        Positive → too near (sensor too close to lens); negative → too far.
-        Zero → in focus.  Convert to metres via: Δu ≈ -ΔΦ * f²λ / (π * r_ap²).
+        The geometric PDAF path reports ``atan(split_disparity / scene_range)``
+        for display compatibility.  The focus motor uses
+        :meth:`defocus_estimate_m`, which returns the direct geometric estimate.
         """
-        vals = [s.phase_difference for s in self._sites
-                if not math.isnan(s.phase_difference)]
+        weighted: list[tuple[float, float]] = [
+            (s.phase_difference, s.focus_confidence)
+            for s in self._sites
+            if not math.isnan(s.phase_difference) and s.focus_confidence > 0.0
+        ]
+        if weighted:
+            vals_w = np.asarray([v for v, _w in weighted], dtype=np.float64)
+            w = np.asarray([_w for _v, _w in weighted], dtype=np.float64)
+            return float(np.sum(vals_w * w) / max(float(np.sum(w)), 1.0e-30))
+        vals = [s.phase_difference for s in self._sites if not math.isnan(s.phase_difference)]
         return float(np.mean(vals)) if vals else 0.0
 
     @property
@@ -4770,13 +4925,22 @@ class PhaseSensorGrid:
         aperture_radius_m: float,
         wavelength_m:      float = 550e-9,
     ) -> float:
-        """Convert mean ΔΦ to an estimated defocus (metres).
+        """Return the weighted geometric defocus estimate in metres.
 
-        Uses the paraxial split-pupil formula:
-          Δu ≈ ΔΦ * f² * λ / (π * r_ap²)
-        where f is the effective focal length and r_ap the half-aperture.
-        Positive → object too near; negative → too far.
+        Positive means the current ray bundle converges closer to the lens than
+        the target scene surface, so increasing focus distance should move the
+        rig toward that surface.  If no geometric estimate is available, falls
+        back to the legacy paraxial phase formula.
         """
+        weighted = [
+            (s.geometric_defocus_m, s.focus_confidence)
+            for s in self._sites
+            if math.isfinite(s.geometric_defocus_m) and s.focus_confidence > 0.0
+        ]
+        if weighted:
+            vals = np.asarray([v for v, _w in weighted], dtype=np.float64)
+            w = np.asarray([_w for _v, _w in weighted], dtype=np.float64)
+            return float(np.sum(vals * w) / max(float(np.sum(w)), 1.0e-30))
         denom = math.pi * float(aperture_radius_m) ** 2
         if denom < 1.0e-20 or effective_focal_m == 0.0:
             return 0.0
@@ -4859,11 +5023,18 @@ class SensorRayCache:
         with self._lock:
             return int(self.origins.shape[0])
 
+    def rewind(self) -> None:
+        with self._lock:
+            self.cursor = 0
+            self._has_completed = False
+
     def package(self, n: int, *, wrap: bool = True, advance: bool = True) -> Optional[Dict[str, np.ndarray]]:
         n_req = int(max(0, n))
         with self._lock:
             total = int(self.origins.shape[0])
             if total <= 0 or n_req <= 0:
+                return None
+            if not wrap and self._has_completed:
                 return None
             n_take = n_req if wrap else min(n_req, total - self.cursor)
             if n_take <= 0:
@@ -4897,7 +5068,10 @@ class SensorRayCache:
             if advance:
                 if int(self.cursor) + n_take >= total:
                     self._has_completed = True
-                self.cursor = int((self.cursor + n_take) % total)
+                if wrap:
+                    self.cursor = int((self.cursor + n_take) % total)
+                else:
+                    self.cursor = int(min(total, self.cursor + n_take))
             return out
 
     def snapshot(self) -> Dict[str, np.ndarray]:
@@ -5155,14 +5329,23 @@ class ForwardCppLensBench:
         self._last_bdpt_records: Optional[np.ndarray] = None
         self._last_bdpt_plate_rgb: Optional[np.ndarray] = None
         self._last_direct_img: Optional[np.ndarray] = None
+        self._backward_transport_accum: Dict[str, np.ndarray] = {}
         self._bdpt_endpoints: BdptEndpointStore = BdptEndpointStore()
         self._bdpt_segments: BdptSegmentStore = BdptSegmentStore(max_rows=2_000_000)
         self.enable_python_bdpt_diagnostics: bool = False
-        self.enable_cpp_display_drain: bool = True
+        # The C++ display drain returns only binned preview images.  Keep the
+        # record-bearing drain as the default so visible sensor perspective and
+        # click-focus share the same per-hit data.
+        self.enable_cpp_display_drain: bool = False
         self._optical_transfers: OpticalTransferStore = OpticalTransferStore(max_rows=2_000_000)
         self._camera_samples: CameraSampleStore = CameraSampleStore(max_rows=2_000_000)
         self._sensor_ray_cache: SensorRayCache = SensorRayCache()
+        self._emitter_ray_cache: SensorRayCache = SensorRayCache()
         self._pdaf_grid: PhaseSensorGrid = PhaseSensorGrid()
+        # Ordered BDPT flow: submit complete Mortonized chunks instead of
+        # full-frame/full-emitter launches, so downstream transport stays small.
+        self.bdpt_ordered_sensor_batch_rays: int = 8_192
+        self.bdpt_ordered_emitter_batch_rays: int = 8_192
         self._camera_sample_batch_id: int = 0
         self._sensor_viewfinder_last_submit_t: float = 0.0
         self._sensor_viewfinder_last_launched: int = 0
@@ -5222,6 +5405,8 @@ class ForwardCppLensBench:
         self._reverse_img_accum = np.zeros_like(self._forward_img_accum)
         self._reverse_img_gain = 0.035
         self._camera_perspective_accum = np.zeros_like(self._forward_img_accum)
+        self._camera_perspective_pending = np.zeros_like(self._forward_img_accum)
+        self._camera_perspective_publish_count: int = 0
         # Tunable amplitude floor: rays (and child spawns) below this threshold
         # are terminated.  Also used for material epsilon-kill pre-flagging.
         self._min_amplitude: float = 1e-5
@@ -5744,6 +5929,11 @@ class ForwardCppLensBench:
 
         origins = np.empty((n_actual, 3), dtype=np.float64)
         directions = np.empty((n_actual, 3), dtype=np.float64)
+        emitter_uv = self._uv_coords_for_tri_ids(src_ids, "yz")
+        emit_u_all = np.empty(n_actual, dtype=np.float64)
+        emit_v_all = np.empty(n_actual, dtype=np.float64)
+        ang_u_all = np.empty(n_actual, dtype=np.float64)
+        ang_v_all = np.empty(n_actual, dtype=np.float64)
         h2 = _halton_seq(n_actual, 2, h_offset)
         h3 = _halton_seq(n_actual, 3, h_offset)
         h5 = _halton_seq(n_actual, 5, h_offset)
@@ -5763,6 +5953,12 @@ class ForwardCppLensBench:
             u = np.where(fold, 1.0 - u, u)
             v = np.where(fold, 1.0 - v, v)
             origins[sl] = verts[ti, 0, :] + u[:, None] * e0[ti, :] + v[:, None] * e1[ti, :]
+            uv0 = emitter_uv[ti, 0, :]
+            uv_e0 = emitter_uv[ti, 1, :] - uv0
+            uv_e1 = emitter_uv[ti, 2, :] - uv0
+            ray_uv = uv0[None, :] + u[:, None] * uv_e0[None, :] + v[:, None] * uv_e1[None, :]
+            emit_u_all[sl] = np.clip(ray_uv[:, 0], 0.0, 1.0)
+            emit_v_all[sl] = np.clip(ray_uv[:, 1], 0.0, 1.0)
 
             # Cosine-hemisphere directions — Halton(5,7).
             r1 = h5[sl]
@@ -5790,7 +5986,15 @@ class ForwardCppLensBench:
             d_norm = np.linalg.norm(d, axis=1, keepdims=True)
             d /= np.maximum(d_norm, 1.0e-30)
             directions[sl] = d
+            ang_u_all[sl] = np.clip(0.5 + 0.5 * lx, 0.0, 1.0)
+            ang_v_all[sl] = np.clip(0.5 + 0.5 * ly, 0.0, 1.0)
             ray_flat += n_ti
+
+        order = _spatio_angular_morton_order(
+            emit_u_all, emit_v_all, ang_u_all, ang_v_all,
+        )
+        origins = origins[order]
+        directions = directions[order]
 
         # Power-compensated amplitude: amp_per_ray = gain / sqrt(n_actual)
         # so that n_actual × |amp|² = gain², preserving total optical power.
@@ -5798,6 +6002,44 @@ class ForwardCppLensBench:
         amplitudes = np.full((n_actual, self.n_bands), complex(amp_val, 0.0), dtype=np.complex128)
 
         return origins, directions, amplitudes
+
+    def _ensure_ordered_emitter_ray_cache(self, n_total: int) -> int:
+        """Build or reuse the persistent Mortonized emitter ray stream."""
+        n_req = int(max(0, n_total))
+        if n_req <= 0:
+            self._emitter_ray_cache.clear()
+            return 0
+        sig = (
+            "uv_emitter_spatio_angular_morton_v1",
+            n_req,
+            int(self.n_bands),
+            float(self.emitter_amp_gain),
+            int(np.asarray(self.source_tri_ids, dtype=np.int64).size),
+            int(np.asarray(self.source_tri_ids, dtype=np.int64).sum()) if np.asarray(self.source_tri_ids).size else 0,
+        )
+        if self._emitter_ray_cache.signature == sig and self._emitter_ray_cache.count() > 0:
+            return self._emitter_ray_cache.count()
+
+        origins, directions, amplitudes = self._build_uv_stratified_emitter_rays(n_req, 0)
+        n = int(origins.shape[0])
+        if n <= 0:
+            self._emitter_ray_cache.clear()
+            return 0
+        tags = np.arange(n, dtype=np.uint64)
+        film_uv = np.zeros((n, 2), dtype=np.float32)
+        channel_idx = np.zeros(n, dtype=np.uint8)
+        self._emitter_ray_cache.load_arrays(
+            origins=origins,
+            directions=directions,
+            amplitudes=amplitudes,
+            tags=tags,
+            film_uv=film_uv,
+            channel_idx=channel_idx,
+            signature=sig,
+            reset_cursor=True,
+        )
+        print(f"[emitter-ray-cache] built {n:_} Mortonized UV/direction rays", flush=True)
+        return n
 
     def _build_uv_page_bank(self) -> None:
         bank = UvPageBank(self.n_bands, res=UV_PAGE_RES_DEFAULT, hot_limit=UV_HOT_GROUP_LIMIT_DEFAULT)
@@ -5944,10 +6186,6 @@ class ForwardCppLensBench:
         print(f"[sensor-back] {self._sensor_back.hook_summary()}", flush=True)
 
     def _ensure_bdpt_plate_sensor_group(self, n_px: int, n_aperture_samples: int, camera_mode: int = 2) -> int:
-        cfg = (int(n_px), int(n_aperture_samples), int(camera_mode))
-        if self._bdpt_sensor_cfg == cfg and self.bdpt_last_sensor_gid >= 0:
-            return int(self.bdpt_last_sensor_gid)
-
         plate = self.scene.image_plate
         lenses = _scene_lenses(self.scene)
         first_lens = lenses[0]
@@ -5974,6 +6212,24 @@ class ForwardCppLensBench:
                 if _bdpt_cen is not None and _bdpt_r > 0.0:
                     stop_plane_x = float(_bdpt_cen[0])
                     stop_radius_m = float(_bdpt_r)
+
+        effective_focal_m = float(max(1.0e-3, plate.x - lens_stack_center_x))
+        focus_distance_m = float(max(1.0e-3, lens_stack_center_x - self.scene.object_plane.x))
+        cfg = (
+            int(n_px),
+            int(n_aperture_samples),
+            int(camera_mode),
+            round(float(plate.x), 9),
+            round(float(plate.sensor_half_w), 9),
+            round(float(plate.sensor_half_h), 9),
+            round(float(stop_plane_x), 9),
+            round(float(stop_radius_m), 9),
+            round(float(lens_stack_center_x), 9),
+            round(float(effective_focal_m), 9),
+            round(float(focus_distance_m), 9),
+        )
+        if self._bdpt_sensor_cfg == cfg and self.bdpt_last_sensor_gid >= 0:
+            return int(self.bdpt_last_sensor_gid)
 
         role_emissive = int(getattr(_sk, "TRI_GROUP_ROLE_EMISSIVE", 1))
         role_sensor = int(getattr(_sk, "TRI_GROUP_ROLE_SENSOR", 2))
@@ -6037,8 +6293,8 @@ class ForwardCppLensBench:
                     "n_py": int(n_px),
                     "n_aperture_samples": int(max(self.n_bands, n_aperture_samples)),
                     "aperture_stop_group_id": int(aperture_stop_gid),
-                    "effective_focal_m": float(max(1.0e-3, plate.x - lens_stack_center_x)),
-                    "focus_distance_m": float(max(1.0e-3, lens_stack_center_x - self.scene.object_plane.x)),
+                    "effective_focal_m": float(effective_focal_m),
+                    "focus_distance_m": float(focus_distance_m),
                     "lens_center": np.array([lens_stack_center_x, 0.0, 0.0], dtype=np.float64),
                     "lens_fwd": np.array([-1.0, 0.0, 0.0], dtype=np.float64),
                     "camera_mode": int(camera_mode),
@@ -6356,6 +6612,7 @@ class ForwardCppLensBench:
         target_spec = self._sensor_ray_cache_target_spec()
         target = np.asarray(target_spec.center, dtype=np.float64)
         return (
+            "spatio_angular_morton_v1",
             int(pixels),
             int(aperture_samples),
             int(self.n_bands),
@@ -6419,7 +6676,6 @@ class ForwardCppLensBench:
         half_y = float(max(1.0e-9, plate.sensor_half_w))
         half_z = float(max(1.0e-9, plate.sensor_half_h))
         py_idx, px_idx = np.indices((res, res), dtype=np.int32)
-        morton_order = np.argsort(_morton_encode(px_idx, py_idx).reshape(-1), kind='stable')
         py_grid = py_idx.astype(np.float64)
         px_grid = px_idx.astype(np.float64)
         film_u = (px_grid + 0.5) / float(res)
@@ -6427,25 +6683,25 @@ class ForwardCppLensBench:
         sensor_y = (film_v - 0.5) * (2.0 * half_y)
         sensor_z = (0.5 - film_u) * (2.0 * half_z)
 
-        film_uv = np.stack([film_u, film_v], axis=2).reshape(-1, 2).astype(np.float32)[morton_order]
+        film_uv = np.stack([film_u, film_v], axis=2).reshape(-1, 2).astype(np.float32)
         origins_1 = np.empty((res * res, 3), dtype=np.float64)
         origins_1[:, 0] = float(plate.x)
-        origins_1[:, 1] = sensor_y.reshape(-1)[morton_order]
-        origins_1[:, 2] = sensor_z.reshape(-1)[morton_order]
+        origins_1[:, 1] = sensor_y.reshape(-1)
+        origins_1[:, 2] = sensor_z.reshape(-1)
 
-        rng = np.random.Generator(np.random.PCG64(int(seed) & ((1 << 63) - 1)))
         total = int(origins_1.shape[0] * n_ap)
         origins = np.repeat(origins_1, n_ap, axis=0)
-        film_uv_all = np.repeat(film_uv, n_ap, axis=0)
+        film_uv_all = np.repeat(film_uv.reshape(-1, 2), n_ap, axis=0)
 
-        j1 = rng.random(total, dtype=np.float64)
-        j2 = rng.random(total, dtype=np.float64)
-        rr = np.sqrt(j1) * float(target_r)
-        th = 2.0 * math.pi * j2
+        disk_x, disk_y, ang_u_one, ang_v_one = _golden_disk_samples(n_ap, int(seed))
+        ang_u = np.tile(ang_u_one, origins_1.shape[0])
+        ang_v = np.tile(ang_v_one, origins_1.shape[0])
+        disk_x_all = np.tile(disk_x, origins_1.shape[0])
+        disk_y_all = np.tile(disk_y, origins_1.shape[0])
         target_pts = np.empty((total, 3), dtype=np.float64)
         target_pts[:, 0] = float(target_center[0])
-        target_pts[:, 1] = float(target_center[1]) + rr * np.sin(th)
-        target_pts[:, 2] = float(target_center[2]) + rr * np.cos(th)
+        target_pts[:, 1] = float(target_center[1]) + float(target_r) * disk_y_all
+        target_pts[:, 2] = float(target_center[2]) + float(target_r) * disk_x_all
 
         if str(target_spec.direction_mode) == "away_from_virtual":
             directions = origins - target_pts
@@ -6457,10 +6713,20 @@ class ForwardCppLensBench:
         origins    = origins[valid]
         directions = directions[valid]
         film_uv_all = film_uv_all[valid]
+        ang_u = ang_u[valid]
+        ang_v = ang_v[valid]
         # Aperture class: 0 = left split-axis coord < 0, 1 = right (≥ 0).
         # Uses the y-coordinate of the exit-pupil sample (horizontal PDAF default).
         _split_coord = target_pts[valid, 1]  # y-component of the aperture sample
         aperture_half_arr = (_split_coord >= 0.0).astype(np.uint8)
+
+        order = _spatio_angular_morton_order(
+            film_uv_all[:, 0], film_uv_all[:, 1], ang_u, ang_v,
+        )
+        origins = origins[order]
+        directions = directions[order]
+        film_uv_all = film_uv_all[order]
+        aperture_half_arr = aperture_half_arr[order]
 
         n = int(origins.shape[0])
         channel_idx = np.zeros(n, dtype=np.uint8)
@@ -6479,30 +6745,12 @@ class ForwardCppLensBench:
             signature=signature,
         )
 
-        # Auto-populate PDAF grid whenever the cache is rebuilt.
-        # Uses the same optics/exit-pupil that drive the cache directions so the
-        # phase measurement is always consistent with the launched rays.
+        # Do not auto-populate PDAF from the scene anchor.  PDAF needs an
+        # observed scene depth from sensor/backward hit data; object_plane.x is
+        # only a scene construction reference, not a valid focus target.
         if self._pdaf_grid.is_configured:
-            _lasm = self._lens_assembly
-            _optics = getattr(_lasm, "optics", None) if _lasm is not None else None
-            _ep_spec = (_lasm.backward_ray_target_spec()
-                        if _lasm is not None else None)
-            if (_optics is not None and _ep_spec is not None
-                    and float(_ep_spec.radius) > 0.0):
-                self._pdaf_grid.measure(
-                    optics            = _optics,
-                    object_x          = float(self.scene.object_plane.x),
-                    exit_pupil_center = np.asarray(_ep_spec.center, dtype=np.float64),
-                    exit_pupil_radius = float(_ep_spec.radius),
-                    wavelength_m      = getattr(self, "_pdaf_wavelength_m", 550e-9),
-                    n_aperture        = min(int(n_ap), 64),
-                    rng_seed          = int(seed),
-                )
-                print(
-                    f"[pdaf] grid updated: mean_ΔΦ={self._pdaf_grid.focus_error:.4f} rad"
-                    f"  Δu_est={self.get_pdaf_defocus_estimate_m()*1e3:+.2f} mm",
-                    flush=True,
-                )
+            self._pdaf_grid.clear()
+            print("[pdaf] grid pending sensor hit depth; object_plane ignored", flush=True)
         self._sensor_viewfinder_last_cache_count = n
         self.bdpt_last_camera_samples = {
             "samples": n,
@@ -6624,6 +6872,39 @@ class ForwardCppLensBench:
         _ = stage_count
         return self._exposure_slice(stage_idx).sensor_submit_args()
 
+    def _stage_sensor_weight_for_uv(self, film_uv: np.ndarray, stage_args: Optional[dict]) -> np.ndarray:
+        """Match submit_sensor_sweep's film-domain shutter/exposure weighting."""
+        uv = np.asarray(film_uv, dtype=np.float64).reshape(-1, 2)
+        args = stage_args or {}
+        n = int(uv.shape[0])
+        if n <= 0:
+            return np.zeros((0,), dtype=np.float64)
+        mode = int(args.get("shutter_mode", 0))
+        open_f = float(np.clip(args.get("shutter_open", 1.0), 0.0, 1.0))
+        exposure_w = float(max(0.0, args.get("exposure_weight", 1.0)))
+        if exposure_w <= 0.0 or mode == 1 or open_f <= 0.0:
+            return np.zeros((n,), dtype=np.float64)
+        if mode == 0:
+            return np.full((n,), exposure_w, dtype=np.float64)
+
+        cu = float(np.clip(args.get("shutter_center_u", 0.5), 0.0, 1.0))
+        cv = float(np.clip(args.get("shutter_center_v", 0.5), 0.0, 1.0))
+        soft = float(max(0.0, args.get("shutter_softness", 0.0)))
+        if open_f >= 1.0 and mode in (2, 3, 4):
+            return np.full((n,), exposure_w, dtype=np.float64)
+        if mode == 2:
+            r = 0.5 * math.sqrt(open_f)
+            du = uv[:, 0] - cu
+            dv = uv[:, 1] - cv
+            gate = _smooth_gate(r - np.sqrt(du * du + dv * dv), soft)
+        elif mode == 3:
+            gate = _smooth_gate(0.5 * open_f - np.abs(uv[:, 0] - cu), soft)
+        elif mode == 4:
+            gate = _smooth_gate(0.5 * open_f - np.abs(uv[:, 1] - cv), soft)
+        else:
+            gate = np.ones((n,), dtype=np.float64)
+        return exposure_w * np.asarray(gate, dtype=np.float64)
+
     def trace_forward(
         self,
         rays_per_emitter: int,
@@ -6685,15 +6966,29 @@ class ForwardCppLensBench:
             # but non-blocking.  Bypasses C++ stochastic emissive sampling.
             uv_n = self._uv_emitter_ray_count()
             if uv_n > 0:
-                uv_origins, uv_dirs, uv_amps = self._build_uv_stratified_emitter_rays(uv_n, int(seed))
-                n_uv = int(uv_origins.shape[0])
-                if n_uv > 0:
+                exposure_scale = float(max(0.0, exposure_weight))
+                if exposure_scale <= 0.0:
+                    return 0
+                self._ensure_ordered_emitter_ray_cache(uv_n)
+                chunk_rays = int(max(1, getattr(self, "bdpt_ordered_emitter_batch_rays", 8_192)))
+                pkg = self._emitter_ray_cache.package(chunk_rays, wrap=False)
+                if pkg is None:
+                    self._emitter_ray_cache.rewind()
+                    pkg = self._emitter_ray_cache.package(chunk_rays, wrap=False)
+                if pkg is not None:
+                    uv_origins = pkg["origins"]
+                    uv_dirs = pkg["directions"]
+                    uv_amps = pkg["amplitudes"] * exposure_scale
+                    n_uv = int(uv_origins.shape[0])
                     _src_ids_uv = np.zeros(n_uv, dtype=np.int32)
                     _tag_arr_uv = np.arange(n_uv, dtype=np.uint64)
-                    _cflag_uv   = np.zeros(n_uv, dtype=np.uint8)
+                    _cflag_uv = np.zeros(n_uv, dtype=np.uint8)
                     if self.cull_infinite_rays:
                         uv_origins, uv_dirs, uv_amps, _src_ids_uv, _cflag_uv, _tag_arr_uv = _cull_finite_rays(
                             uv_origins, uv_dirs, uv_amps, _src_ids_uv, _cflag_uv, _tag_arr_uv, label="uv_fwd")
+                    n_uv = int(uv_origins.shape[0])
+                    if n_uv <= 0:
+                        return 0
                     self.tracer.submit_rays(
                         origins=np.ascontiguousarray(uv_origins),
                         directions=np.ascontiguousarray(uv_dirs),
@@ -6709,9 +7004,9 @@ class ForwardCppLensBench:
                         gpu_all_stages=_all_gpu,
                         shader_dir=_SHADER_DIR,
                     )
-                    self.tracer.signal_flash_dispatched()
                     self._ensure_drain_loop()
-                    return n_uv
+                    self.tracer.signal_flash_dispatched()
+                    return int(n_uv)
 
             submitted = int(self.tracer.submit_emissive_triangles(
                 self._emitter_tri_ids_i32,
@@ -6792,9 +7087,8 @@ class ForwardCppLensBench:
         Called as the very first operation on every drain batch so BDPT
         accumulates endpoints with zero pipeline delay.
         """
-        if not bool(getattr(self, "enable_python_bdpt_diagnostics", False)):
-            return
-        self._append_bdpt_segment_records(records)
+        if bool(getattr(self, "enable_python_bdpt_diagnostics", False)):
+            self._append_bdpt_segment_records(records)
         kinds   = np.asarray(records["kind"], dtype=np.uint8)
         strike  = kinds == 0
         if not np.any(strike):
@@ -6936,8 +7230,8 @@ class ForwardCppLensBench:
                 self._forward_img_accum += fwd
             if rev.shape == self._reverse_img_accum.shape:
                 self._reverse_img_accum += rev
-            if cam.shape == self._camera_perspective_accum.shape:
-                self._camera_perspective_accum += cam
+            if cam.shape == self._camera_perspective_pending.shape:
+                self._camera_perspective_pending += cam
             self._async_forward_strike_count += int(drained.get("fwd_strikes", 0))
             self._async_backward_strike_count += int(drained.get("rev_strikes", 0))
             self._async_forward_lens_hit_count += int(drained.get("fwd_lens_hits", 0))
@@ -7181,7 +7475,7 @@ class ForwardCppLensBench:
             ]
             with self._segs_lock:
                 for ch in range(3):
-                    self._camera_perspective_accum[:, :, ch] += deltas[ch]
+                    self._camera_perspective_pending[:, :, ch] += deltas[ch]
 
         # Pure preview feeds: project all strike records into the image-plane Y/Z
         # grid.  Do not require the ray to hit the image plate; this is a live
@@ -7882,6 +8176,19 @@ class ForwardCppLensBench:
         y = np.log1p(np.maximum(img, 0.0) / white * 6.0) / np.log1p(6.0)
         return np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
 
+    def publish_camera_perspective_package(self) -> int:
+        """Expose the pending blue-PIP update for the current sensor package."""
+        with self._segs_lock:
+            if self._camera_perspective_pending.shape != self._camera_perspective_accum.shape:
+                return 0
+            pending_power = float(np.sum(self._camera_perspective_pending, dtype=np.float64))
+            if pending_power <= 0.0:
+                return 0
+            self._camera_perspective_accum += self._camera_perspective_pending
+            self._camera_perspective_pending[:] = 0.0
+            self._camera_perspective_publish_count += 1
+            return int(self._camera_perspective_publish_count)
+
     def build_all_prospective_reverse_segments(
         self,
         seed: int,
@@ -8027,44 +8334,97 @@ class ForwardCppLensBench:
         stage_args: "dict | None" = None,
     ) -> int:
         """
-        Fire `n_aperture_samples` sensor sweeps against the already-submitted
+        Fire one ordered cached sensor-ray chunk against the already-submitted
         flash, accumulating T5 results into sensor_accum via +=.
 
-        Each sweep uses a different Fibonacci aperture sample (seed+0, seed+1, …)
-        so the aperture disk is evenly covered across samples.  Each sweep can
-        optionally cover only `pixels_per_batch` pixels (0 = all pixels) so the
-        BDPT record cap is never exceeded.
+        The cache is Mortonized across film UV and aperture angle.  One call
+        consumes exactly one compact full-space package; when the stream is
+        exhausted, the next call starts the next Morton round.  This keeps T5
+        producing a full-color result after every package pair.
 
         Returns total rays submitted.
         """
         res = int(max(16, self.scene.image_plate.sensor_res))
-        total_px = res * res
-        bsz = pixels_per_batch if pixels_per_batch > 0 else total_px
+        n_ap = int(max(1, n_aperture_samples))
         stage_args = stage_args or {}
         max_bounces = int(max_bounces or 8)
         total_rays = 0
+        expected_sig = self._sensor_ray_cache_signature(res, n_ap)
+        if self._sensor_ray_cache.signature != expected_sig or self._sensor_ray_cache.count() <= 0:
+            self.rebuild_sensor_ray_cache(pixels=res, aperture_samples=n_ap, seed=0)
+        if pixels_per_batch > 0:
+            rays_per_batch = int(max(1, pixels_per_batch)) * n_ap
+        else:
+            rays_per_batch = int(max(1, getattr(self, "bdpt_ordered_sensor_batch_rays", 8_192)))
+        _use_gpu = self.compute_mode in ("gpu", "mixed")
+        _all_gpu = self.compute_mode == "gpu"
 
         self.tracer.begin_sensor_batching()
         try:
-            for ap in range(n_aperture_samples):
-                ap_seed = seed + ap
-                offset = 0
-                while offset < total_px:
-                    # Signal flash first — ensures the KPN counter is valid
-                    # before rays start draining.  Flash was already submitted
-                    # by the caller; this re-arms the cycle counter for this batch.
-                    self.tracer.signal_flash_dispatched()
-                    rays = self.tracer.submit_sensor_sweep(
-                        max_bounces=max_bounces,
-                        seed=ap_seed,
-                        max_rays=min(bsz, total_px - offset),
-                        pix_offset=offset,
-                        **stage_args,
-                    )
-                    self.tracer.signal_sensor_dispatched()
-                    self.tracer.join_t5()
-                    total_rays += rays
-                    offset += bsz
+            pkg = self._sensor_ray_cache.package(rays_per_batch, wrap=False)
+            if pkg is None:
+                self._sensor_ray_cache.rewind()
+                pkg = self._sensor_ray_cache.package(rays_per_batch, wrap=False)
+            if pkg is None:
+                return 0
+            n = int(pkg["origins"].shape[0])
+            if n <= 0:
+                return 0
+            weights = self._stage_sensor_weight_for_uv(pkg["film_uv"], stage_args)
+            active = np.isfinite(weights) & (weights > 0.0)
+            if not np.any(active):
+                return 0
+
+            origins = pkg["origins"][active]
+            directions = pkg["directions"][active]
+            amplitudes = pkg["amplitudes"][active] * weights[active, None]
+            src_ids = pkg.get("src_ids", np.zeros(n, dtype=np.int32))[active]
+            cflag_arr = pkg.get("color_flags", np.ones(n, dtype=np.uint8))[active]
+            tag_arr = pkg["tags"][active]
+            if self.cull_infinite_rays and self.cull_sensor_cache_rays:
+                origins, directions, amplitudes, src_ids, cflag_arr, tag_arr = _cull_finite_rays(
+                    origins, directions, amplitudes, src_ids, cflag_arr, tag_arr, label="sensor-bdpt-cache")
+            n_submit = int(origins.shape[0])
+            if n_submit <= 0:
+                return 0
+
+            # Signal flash first: the flash path was submitted by the caller;
+            # this re-arms the counter for this complete sensor package.
+            self.tracer.signal_flash_dispatched()
+            self.tracer.submit_rays(
+                origins=np.ascontiguousarray(origins),
+                directions=np.ascontiguousarray(directions),
+                amplitudes=np.ascontiguousarray(amplitudes),
+                src_ids=np.ascontiguousarray(src_ids),
+                tags=np.ascontiguousarray(tag_arr),
+                color_flags=np.ascontiguousarray(cflag_arr),
+                max_bounces=int(max_bounces),
+                min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
+                max_children=1,
+                seed=int(seed),
+                use_gpu_compute=_use_gpu,
+                gpu_all_stages=_all_gpu,
+                shader_dir=_SHADER_DIR,
+            )
+            self.tracer.signal_sensor_dispatched()
+            self._ensure_drain_loop()
+            # Publish exactly this one sensor Morton package to the blue PIP
+            # before the next package can be submitted. T5/green follows.
+            _deadline = time.perf_counter() + 2.0
+            while time.perf_counter() < _deadline:
+                try:
+                    if int(self.tracer.in_flight_count()) == 0:
+                        break
+                except Exception:
+                    break
+                time.sleep(0.002)
+            # Give the drain/vis handoff one short slice to move terminal
+            # records into the pending blue buffer, then publish that package.
+            time.sleep(0.005)
+            self.publish_camera_perspective_package()
+            self.tracer.join_t5()
+            total_rays += n_submit
+            self._sensor_viewfinder_last_launched = n_submit
         finally:
             self.tracer.end_sensor_batching()
 
@@ -8116,17 +8476,11 @@ class ForwardCppLensBench:
                     stage_idx = int(self._bdpt_camera_sweep_stage)
                     stage_args = self._shutter_stage_args(stage_idx, stage_count)
                     _mb = int(max_bounces or 8)
-                    _res = int(max(4, self.scene.image_plate.sensor_res))
-                    _total_px = _res * _res
-                    _bdpt_cap = int(n_rays_bdpt or 0) or 2_000_000
-                    _pix_batch = max(4096, _bdpt_cap // max(1, _mb // 3))
                     _n_ap = max(1, int(aperture_samples))
-                    _use_batching = (_total_px > _pix_batch) or (_n_ap > 1)
                     _stage_setup = dict(
                         stage_idx=stage_idx, stage_count=stage_count,
                         stage_args=stage_args, mb=_mb,
-                        pix_batch=_pix_batch, n_ap=_n_ap,
-                        use_batching=_use_batching,
+                        pix_batch=0, n_ap=_n_ap,
                         seed=int(seed),
                         min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
                     )
@@ -8139,23 +8493,13 @@ class ForwardCppLensBench:
         if _stage_setup is not None:
             _ss = _stage_setup
             try:
-                if _ss["use_batching"]:
-                    _launched = self.run_sensor_batches(
-                        max_bounces=_ss["mb"],
-                        seed=_ss["seed"] if _ss["seed"] > 0 else 1,
-                        n_aperture_samples=_ss["n_ap"],
-                        pixels_per_batch=_ss["pix_batch"],
-                        stage_args=_ss["stage_args"],
-                    )
-                else:
-                    _launched = int(self.tracer.submit_sensor_sweep(
-                        max_bounces=_ss["mb"],
-                        min_amplitude=_ss["min_amplitude"],
-                        max_rays=0,
-                        seed=_ss["seed"],
-                        **_ss["stage_args"],
-                    ))
-                    self.tracer.signal_sensor_dispatched()
+                _launched = self.run_sensor_batches(
+                    max_bounces=_ss["mb"],
+                    seed=_ss["seed"] if _ss["seed"] > 0 else 1,
+                    n_aperture_samples=_ss["n_ap"],
+                    pixels_per_batch=_ss["pix_batch"],
+                    stage_args=_ss["stage_args"],
+                )
             except Exception as exc:
                 print(f"[bdpt-cpp] camera projection submit failed: {exc}", flush=True)
 
@@ -8354,12 +8698,13 @@ class ForwardCppLensBench:
                     self.scene.optical_design = saved_design
                 self._start_progressive_refinement()
 
-        # Clear display accumulators on lens move so the image refreshes.
-        # Do NOT clear _bdpt_endpoints: it holds physically-valid hit positions
-        # that remain useful for forward/BDPT diagnostics across lens nudges.
+        # Clear display and endpoint accumulators on lens move so PDAF and the
+        # sensor view cannot reuse hit depths from the previous optical state.
         self._forward_img_accum[:] = 0.0
         self._reverse_img_accum[:] = 0.0
         self._camera_perspective_accum[:] = 0.0
+        self._camera_perspective_pending[:] = 0.0
+        self._bdpt_endpoints.clear()
         self.clear_sensor_ray_cache()
         if isinstance(self._backward_transport_accum, dict):
             for v in self._backward_transport_accum.values():
@@ -8451,6 +8796,8 @@ class ForwardCppLensBench:
         self._forward_img_accum[:] = 0.0
         self._reverse_img_accum[:] = 0.0
         self._camera_perspective_accum[:] = 0.0
+        self._camera_perspective_pending[:] = 0.0
+        self._bdpt_endpoints.clear()
         self.clear_sensor_ray_cache()
         if isinstance(self._backward_transport_accum, dict):
             for v in self._backward_transport_accum.values():
@@ -8680,8 +9027,9 @@ class ForwardCppLensBench:
     ) -> None:
         """Set up a ny × nz phase-detection grid on the sensor.
 
-        After this call, ``measure_pdaf()`` can be called at any time to
-        populate the phase accumulators without touching the BVH or rebuild.
+        After this call, sensor-ray cache rebuilds leave the grid ready but
+        unmeasured.  PDAF focus is measured only when sensor hit data supplies
+        a real scene depth.
 
         split_axis: ``'y'`` for horizontal PDAF (left/right aperture halves),
                     ``'z'`` for vertical PDAF (top/bottom aperture halves).
@@ -8712,7 +9060,7 @@ class ForwardCppLensBench:
         max_delta_m:  float = 0.100,
     ) -> float:
         """Configure a 1×1 PDAF site at the given film coordinate, measure the
-        phase difference, estimate the defocus, and apply a focus correction.
+        split-pupil convergence error, and apply a focus correction.
 
         This is the primary entry point for click-driven autofocus on the
         sensor PIP.  The PDAF grid is temporarily reconfigured to a single
@@ -8744,7 +9092,7 @@ class ForwardCppLensBench:
 
         self._pdaf_wavelength_m = float(wavelength_m)
 
-        # Populate phase via the same evaluate_bundle path that rebuild_sensor_ray_cache uses.
+        # Populate focus via the same pupil target that rebuild_sensor_ray_cache uses.
         lasm = self._lens_assembly
         optics = getattr(lasm, "optics", None) if lasm is not None else None
         ep_spec = lasm.backward_ray_target_spec() if lasm is not None else None
@@ -8752,11 +9100,36 @@ class ForwardCppLensBench:
             print("[pdaf] no valid optics/exit-pupil", flush=True)
             return 0.0
 
+        focus_x, focus_source, focus_hits = self._pdaf_scene_x_for_film_uv(
+            float(film_u), float(film_v),
+        )
+        if focus_x is None:
+            launched = self._pdaf_inject_sensor_depth_probe(
+                float(film_u), float(film_v),
+                n_rays=max(128, int(n_aperture) * 4),
+                max_bounces=8,
+                seed=0,
+            )
+            if launched > 0:
+                focus_x, focus_source, focus_hits = self._pdaf_wait_for_scene_x(
+                    float(film_u), float(film_v),
+                    timeout_s=1.5,
+                )
+            if focus_x is None:
+                print(
+                    f"[pdaf] pixel u={film_u:.3f} v={film_v:.3f}"
+                    f"  depth_probe_rays={launched}"
+                    "  no sensor hit depth; focus skipped",
+                    flush=True,
+                )
+                return 0.0
+
         self._pdaf_grid.measure(
             optics            = optics,
-            object_x          = float(self.scene.object_plane.x),
+            object_x          = float(focus_x),
             exit_pupil_center = np.asarray(ep_spec.center, dtype=np.float64),
             exit_pupil_radius = float(ep_spec.radius),
+            target_direction_mode = str(getattr(ep_spec, "direction_mode", "toward")),
             wavelength_m      = float(wavelength_m),
             n_aperture        = int(max(4, n_aperture)),
             rng_seed          = 0,
@@ -8769,6 +9142,7 @@ class ForwardCppLensBench:
         print(
             f"[pdaf] pixel u={film_u:.3f} v={film_v:.3f}"
             f"  site=({site_y*1e3:.1f}, {site_z*1e3:.1f}) mm"
+            f"  scene_x={focus_x:.4f}({focus_source}:{focus_hits})"
             f"  ΔΦ={err_rad:.4f} rad"
             f"  Δu_raw={self.get_pdaf_defocus_estimate_m(wavelength_m)*1e3:+.2f} mm"
             f"  Δu_applied={delta_m*1e3:+.2f} mm",
@@ -8783,29 +9157,243 @@ class ForwardCppLensBench:
 
         return delta_m
 
-    def get_pdaf_phase_map(self) -> np.ndarray:
-        """Return (ny, nz) array of per-site phase differences (radians).
+    def _pdaf_inject_sensor_depth_probe(
+        self,
+        film_u: float,
+        film_v: float,
+        *,
+        n_rays: int = 256,
+        max_bounces: int = 8,
+        seed: int = 0,
+    ) -> int:
+        """Launch deterministic sensor rays for one clicked PDAF site."""
+        lasm = self._lens_assembly
+        target_spec = lasm.backward_ray_target_spec() if lasm is not None else None
+        if target_spec is None or float(target_spec.radius) <= 0.0:
+            return 0
 
-        Each element is ΔΦ = arg(E_left* · E_right).  NaN for sites with
-        fewer than one sample per half.  Call ``measure_pdaf()`` first.
+        plate = self.scene.image_plate
+        n = int(max(8, n_rays))
+        site_y = (float(film_v) - 0.5) * (2.0 * float(plate.sensor_half_w))
+        site_z = (0.5 - float(film_u)) * (2.0 * float(plate.sensor_half_h))
+        origins = np.empty((n, 3), dtype=np.float64)
+        origins[:, 0] = float(plate.x)
+        origins[:, 1] = site_y
+        origins[:, 2] = site_z
+
+        center = np.asarray(target_spec.center, dtype=np.float64).reshape(3)
+        radius = float(target_spec.radius)
+        idx = np.arange(n, dtype=np.float64)
+        golden = math.pi * (3.0 - math.sqrt(5.0))
+        rr = radius * np.sqrt((idx + 0.5) / float(n))
+        th = idx * golden + float(seed) * 0.013
+        target_pts = np.empty((n, 3), dtype=np.float64)
+        target_pts[:, 0] = center[0]
+        target_pts[:, 1] = center[1] + rr * np.cos(th)
+        target_pts[:, 2] = center[2] + rr * np.sin(th)
+
+        if str(target_spec.direction_mode) == "away_from_virtual":
+            directions = origins - target_pts
+        else:
+            directions = target_pts - origins
+        dn = np.linalg.norm(directions, axis=1)
+        valid = np.isfinite(dn) & (dn > EPS)
+        if not np.any(valid):
+            return 0
+        origins = origins[valid]
+        directions = directions[valid] / dn[valid, None]
+        n = int(origins.shape[0])
+
+        # Fresh probe data only: PDAF should not use old hit depths after focus/zoom.
+        self._bdpt_endpoints.clear()
+        self._bdpt_segments.clear()
+
+        film_uv = np.tile(
+            np.asarray([[float(film_u), float(film_v)]], dtype=np.float32),
+            (n, 1),
+        )
+        channel_idx = np.zeros(n, dtype=np.uint8)
+        tags = _pack_bdpt_film_tag(channel_idx, film_uv)
+        amplitudes = np.full(
+            (n, int(self.n_bands)),
+            complex(float(max(0.0, self.sensor_amp_gain)), 0.0),
+            dtype=np.complex128,
+        )
+        src_ids = np.zeros(n, dtype=np.int32)
+        color_flags = np.ones(n, dtype=np.uint8)
+        _use_gpu = self.compute_mode in ("gpu", "mixed")
+        _all_gpu = self.compute_mode == "gpu"
+        self.tracer.submit_rays(
+            origins=np.ascontiguousarray(origins),
+            directions=np.ascontiguousarray(directions),
+            amplitudes=np.ascontiguousarray(amplitudes),
+            src_ids=np.ascontiguousarray(src_ids),
+            tags=np.ascontiguousarray(tags),
+            color_flags=np.ascontiguousarray(color_flags),
+            max_bounces=int(max_bounces),
+            min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
+            max_children=1,
+            seed=int(seed),
+            use_gpu_compute=_use_gpu,
+            gpu_all_stages=_all_gpu,
+            shader_dir=_SHADER_DIR,
+        )
+        try:
+            self.tracer.signal_sensor_dispatched()
+        except Exception:
+            pass
+        self._ensure_drain_loop()
+        self._sensor_viewfinder_last_launched = n
+        return n
+
+    def _pdaf_wait_for_scene_x(
+        self,
+        film_u: float,
+        film_v: float,
+        *,
+        timeout_s: float = 1.5,
+    ) -> tuple[Optional[float], str, int]:
+        """Wait for the just-injected PDAF depth probe to produce a scene hit."""
+        deadline = time.perf_counter() + float(max(0.0, timeout_s))
+        last: tuple[Optional[float], str, int] = (None, "no_sensor_hits", 0)
+        while time.perf_counter() < deadline:
+            last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
+            if last[0] is not None:
+                return last
+            try:
+                if int(self.tracer.in_flight_count()) == 0:
+                    # Give the drain thread one more small slice to pull terminal records.
+                    time.sleep(0.020)
+                    last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
+                    if last[0] is not None:
+                        return last
+            except Exception:
+                pass
+            time.sleep(0.015)
+        return last
+
+    def _pdaf_scene_x_for_film_uv(
+        self,
+        film_u: float,
+        film_v: float,
+        *,
+        radius_uv: float = 0.015,
+        min_hits: int = 4,
+    ) -> tuple[Optional[float], str, int]:
+        """Estimate clicked scene depth from recent backward camera hits.
+
+        This is the current bridge from rendered scene content to PDAF.  If the
+        BDPT segment store has camera-side hits near the clicked film coordinate,
+        use their scene-space x coordinate as the focus surface.  If no sensor
+        hit data exists, PDAF has no target and must not focus.
+        """
+        try:
+            endpoints = self._bdpt_endpoints.snapshot()
+        except Exception:
+            endpoints = None
+        focus_x, source, hits = self._pdaf_scene_x_from_rows(
+            endpoints, float(film_u), float(film_v),
+            radius_uv=float(radius_uv), min_hits=int(min_hits),
+            source_name="endpoint",
+        )
+        if focus_x is not None:
+            return focus_x, source, hits
+
+        try:
+            rows = self.get_bdpt_segments()
+        except Exception:
+            rows = None
+        return self._pdaf_scene_x_from_rows(
+            rows, float(film_u), float(film_v),
+            radius_uv=float(radius_uv), min_hits=int(min_hits),
+            source_name="segment",
+        )
+
+    def _pdaf_scene_x_from_rows(
+        self,
+        rows: Optional[np.ndarray],
+        film_u: float,
+        film_v: float,
+        *,
+        radius_uv: float,
+        min_hits: int,
+        source_name: str,
+    ) -> tuple[Optional[float], str, int]:
+        """Shared PDAF depth reducer for endpoint and segment record arrays."""
+        if rows is None or rows.size == 0:
+            return None, "no_sensor_hits", 0
+
+        try:
+            names = rows.dtype.names or ()
+            uv = np.asarray(rows["film_uv"], dtype=np.float64)
+            pos_field = "p1" if "p1" in names else "pos"
+            p1 = np.asarray(rows[pos_field], dtype=np.float64)
+            mask = (
+                (np.asarray(rows["stream"], dtype=np.uint8) == 1)
+                & np.all(np.isfinite(uv), axis=1)
+                & np.all(np.isfinite(p1), axis=1)
+            )
+            if "sample_domain" in names:
+                mask &= np.asarray(rows["sample_domain"], dtype=np.uint8) == int(BDPT_SAMPLE_DOMAIN_FILM_APERTURE)
+            if "hit_tri" in names:
+                htri = np.asarray(rows["hit_tri"], dtype=np.int32)
+                mask &= htri >= 0
+                tri_kind = getattr(self, "tri_kind", None)
+                if tri_kind is not None and getattr(tri_kind, "shape", (0,))[0] > 0:
+                    safe = np.clip(htri, 0, int(tri_kind.shape[0]) - 1)
+                    mask &= np.asarray(tri_kind[safe], dtype=np.int8) == TRI_KIND_DEFAULT
+
+            if not np.any(mask):
+                return None, "no_sensor_hits", 0
+
+            du = uv[:, 0] - float(film_u)
+            dv = uv[:, 1] - float(film_v)
+            d2 = du * du + dv * dv
+            local = mask & (d2 <= float(radius_uv) * float(radius_uv))
+            local_count = int(np.count_nonzero(local))
+            if local_count <= 0:
+                return None, "no_sensor_hits", 0
+            elif local_count > 256:
+                idx = np.flatnonzero(local)
+                order = idx[np.argsort(d2[idx], kind="stable")[:256]]
+                local = np.zeros(rows.shape[0], dtype=bool)
+                local[order] = True
+
+            sigma2 = max((0.5 * float(radius_uv)) ** 2, 1.0e-8)
+            amp = np.asarray(rows["amp"], dtype=np.complex64)
+            power = np.maximum(np.abs(amp).astype(np.float64) ** 2, 1.0e-12)
+            w = np.exp(-0.5 * d2[local] / sigma2) * power[local]
+            x = p1[local, 0]
+            finite = np.isfinite(x) & np.isfinite(w) & (w > 0.0)
+            if not np.any(finite):
+                return None, "no_sensor_hits", 0
+            focus_x = float(np.sum(x[finite] * w[finite]) / max(float(np.sum(w[finite])), 1.0e-30))
+            return focus_x, source_name, int(np.count_nonzero(finite))
+        except Exception:
+            return None, "no_sensor_hits", 0
+
+    def get_pdaf_phase_map(self) -> np.ndarray:
+        """Return (ny, nz) array of per-site phase-like focus differences.
+
+        Geometric PDAF stores atan(split-disparity / scene-range) for display;
+        NaN means a site did not have valid samples in both pupil halves.
         """
         return self._pdaf_grid.phase_map
 
     def get_pdaf_focus_error(self) -> float:
-        """Return mean ΔΦ over all valid sites as a scalar (radians).
+        """Return weighted mean phase-like focus error over valid sites.
 
-        Positive → sensor too close to lens (near-focus); negative → too far.
-        Zero → in focus.  Typical magnitude at ±1 dioptre defocus is ~0.5 rad
-        for a 50 mm f/2 lens at λ = 550 nm.
+        The focus motor should use ``get_pdaf_defocus_estimate_m()``; this value
+        is primarily for plotting and logging.
         """
         return self._pdaf_grid.focus_error
 
     def get_pdaf_defocus_estimate_m(self, wavelength_m: float = 550e-9) -> float:
-        """Convert the PDAF phase error to an estimated defocus in metres.
+        """Return PDAF defocus in metres.
 
-        Uses the paraxial formula Δu ≈ ΔΦ·f²·λ / (π·r_ap²).
-        Positive → focus group needs to rack forward (closer object);
-        negative → rack back (farther object).
+        The geometric path returns the weighted split-pupil convergence error
+        directly.  Positive increases the configured focus distance; negative
+        decreases it.  The legacy paraxial phase conversion is only a fallback.
         """
         optics = getattr(getattr(self, "_lens_assembly", None), "optics", None)
         if optics is None:
@@ -8829,10 +9417,9 @@ class ForwardCppLensBench:
     ) -> float:
         """Apply one closed-loop PDAF focus step using the current grid data.
 
-        The PDAF grid is populated automatically when the sensor ray cache is
-        rebuilt (configure_pdaf_grid must have been called first).  This method
-        reads the already-accumulated phase data and drives G4.  Returns the
-        applied focus-distance change (metres).
+        This method reads an already-measured PDAF grid and drives G4.  The
+        grid is not populated from scene anchors; use click-driven PDAF after
+        sensor hit data exists to establish a measured target.
         """
         if not self._pdaf_grid.is_configured:
             self.configure_pdaf_grid()
@@ -11038,22 +11625,8 @@ def run(
         )
 
         # ── Pos 2: camera perspective before BDPT/MIS — sensor view, 180° ──
-        try:
-            _vf_res = int(max(16, scene.image_plate.sensor_res))
-            _vf_ap  = 32
-            _vf_pkg = int(min(max(4096, _vf_res * _vf_res * _vf_ap), 65_536))
-            bench.refresh_sensor_viewfinder(
-                rays=_vf_pkg,
-                pixels=_vf_res,
-                aperture_samples=_vf_ap,
-                max_bounces=int(max_bounces),
-                seed=(int(seed) + int(_display_frame) * 17) & 0x7FFFFFFF,
-                min_interval_s=0.020,
-            )
-        except Exception as _vf_exc:
-            if not getattr(bench, "_sensor_viewfinder_diag_failed", False):
-                print(f"[sensor-viewfinder] refresh failed: {_vf_exc}", flush=True)
-                bench._sensor_viewfinder_diag_failed = True
+        # Display only. Sensor rays are launched by the staged Morton pass, not
+        # from draw_pip(), so the blue PIP cannot outrun the BDPT exposure gate.
         sensor_view = bench.get_camera_perspective_image()
         if sensor_view is not None and sensor_view.shape[0] > 0:
             bench._last_direct_img = np.ascontiguousarray(
@@ -11408,6 +11981,7 @@ def run(
             f"lit {_direct_lit:_}  {100.0 * _direct_frac:.1f}%",
             f"cache {int(getattr(bench, '_sensor_viewfinder_last_cache_count', 0)):_}",
             f"pkg {int(getattr(bench, '_sensor_viewfinder_last_launched', 0)):_}  peak {_direct_peak:.3f}",
+            f"pub {int(getattr(bench, '_camera_perspective_publish_count', 0)):_} package",
         ]
         direct_cols = [
             (80, 210, 255),
@@ -11415,6 +11989,7 @@ def run(
             (120, 255, 160) if _direct_lit > 0 else (160, 160, 160),
             (120, 255, 160) if int(getattr(bench, "_sensor_viewfinder_last_cache_count", 0)) > 0 else (160, 160, 160),
             (120, 255, 160) if _direct_peak > 0.0 else (160, 160, 160),
+            (120, 255, 160) if int(getattr(bench, "_camera_perspective_publish_count", 0)) > 0 else (160, 160, 160),
         ]
         _draw_hud(direct_lines, direct_cols, _uv_pip_vx)
 
@@ -12137,6 +12712,7 @@ def run(
     _shutter_event   = threading.Event()
     # Shared exposure counter (display loop reads it for caption).
     _exposure_count  = [0]
+    _saved_snapshot_count = [0]
     # Set by _stop_bench_runtime before any rebuild; cleared after the new bench
     # is wired and ready.  The camera thread checks this at every wait point and
     # aborts the current exposure slice / drain loop immediately so the old bench
@@ -12271,10 +12847,56 @@ def run(
             # not need to wait for drain output before sensor submission.
             if _barrier is not None:
                 _barrier.record_sensor_submitted(_slice_idx)
-            # Sensor sweep was already fired in step 1.  Re-fire here only as
-            # a safety net in case the step-1 call was a no-op (busy flag was
-            # set by a previous sweep that just finished between steps 1 and 3).
-            _fire_pipeline_camera_render()
+
+    def _refresh_current_bdpt_plate(label: str = "live") -> int:
+        """Pull the current full-color BDPT sensor accumulator into the green PIP."""
+        try:
+            _cur_img = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
+            if _cur_img.ndim == 3 and _cur_img.shape[2] >= 3 and _cur_img.shape[0] > 0:
+                bench._last_bdpt_plate_rgb = np.ascontiguousarray(
+                    np.clip(_cur_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
+                _lit_px = int(np.count_nonzero(np.sum(_cur_img[:, :, :3], axis=2) > 1e-8))
+                _lit_frac = float(_lit_px) / float(max(1, _cur_img.shape[0] * _cur_img.shape[1]))
+                bench.bdpt_last_connection_stats["lit_pixels"] = _lit_px
+                bench.bdpt_last_connection_stats["lit_fraction"] = _lit_frac
+                print(f"[bdpt-pip] refreshed {label}: lit_px={_lit_px}", flush=True)
+                return _lit_px
+        except Exception as _img_exc:
+            print(f"[bdpt-pip] refresh failed ({label}): {_img_exc}", flush=True)
+        return 0
+
+    def _save_current_accumulated_version(reason: str = "manual") -> bool:
+        """Persist the live accumulated buffers since the last reset/rebuild."""
+        import datetime as _dt
+        try:
+            _refresh_current_bdpt_plate("pre-save")
+
+            _saved_snapshot_count[0] += 1
+            _stamp = (
+                _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                + f"_live{_saved_snapshot_count[0]:03d}"
+            )
+            _sdcard = _SDCard()
+            _sdcard.save_exposure(
+                _stamp,
+                {
+                    "forward": np.asarray(bench._forward_img_accum, dtype=np.float32).copy(),
+                    "reverse": np.asarray(bench._reverse_img_accum, dtype=np.float32).copy(),
+                    "camera":  np.asarray(bench._camera_perspective_accum, dtype=np.float32).copy(),
+                    "bdpt":    None if bench._last_bdpt_plate_rgb is None
+                               else np.asarray(bench._last_bdpt_plate_rgb, dtype=np.float32).copy(),
+                },
+                tonemap="reinhard",
+            )
+            print(
+                f"[sdcard] saved live accumulated version {_stamp}"
+                f" reason={reason} cycles={int(_exposure_count[0])}",
+                flush=True,
+            )
+            return True
+        except Exception as _sv_exc:
+            print(f"[sdcard] live save failed: {_sv_exc}", flush=True)
+            return False
 
     def _camera_loop(on_dt_request) -> None:
         """Camera thread: drives slice-by-slice exposure sequencing.
@@ -12290,10 +12912,9 @@ def run(
         seam — the coordinator owns both ends.
         """
         import time as _ct
-        import datetime as _dt
 
         def _run_one_exposure(seed_offset: int) -> None:
-            """Run one full exposure (all slices → drain → T5 → image refresh → save)."""
+            """Run one progressive cycle (forward → sensor scan → T5 → PIP refresh)."""
             n_stages = bench._exposure_stage_count()
             _seed_n = seed_offset
             for _slice_idx in range(n_stages):
@@ -12315,6 +12936,7 @@ def run(
                     _ct.sleep(0.001)
                 if _rebuild_in_progress.is_set():
                     return
+                _refresh_current_bdpt_plate(f"stage {_slice_idx}")
 
             # All slices dispatched — drain the pipeline.
             _t_scene = float(getattr(bench._scene_camera_coordinator, "scene_time_s", 0.0))
@@ -12337,23 +12959,9 @@ def run(
             except Exception as _t5exc:
                 print(f"[exposure] T5 join failed: {_t5exc}", flush=True)
 
-            # Refresh sensor plate now that T5 has written its full BDPT connections
-            # (balance-heuristic MIS, GGX BRDF from material cache, spectral beta,
-            # optical Jacobians, prefix-PDF chains).  This is the proper BDPT result.
-            _t5_lit_px = 0
-            try:
-                _final_img = np.asarray(bench.tracer.get_sensor_image(), dtype=np.float32)
-                if _final_img.ndim == 3 and _final_img.shape[2] >= 3 and _final_img.shape[0] > 0:
-                    bench._last_bdpt_plate_rgb = np.ascontiguousarray(
-                        np.clip(_final_img[:, :, :3], 0.0, 1.0), dtype=np.float32)
-                    _t5_lit_px = int(np.count_nonzero(np.sum(_final_img[:, :, :3], axis=2) > 1e-8))
-                    _t5_lit_frac = float(_t5_lit_px) / float(max(1, _final_img.shape[0] * _final_img.shape[1]))
-                    # Backfill connection stats so the green pip HUD reflects T5 output.
-                    bench.bdpt_last_connection_stats["lit_pixels"] = _t5_lit_px
-                    bench.bdpt_last_connection_stats["lit_fraction"] = _t5_lit_frac
-                    print(f"[exposure] sensor image refreshed (post-T5 BDPT): lit_px={_t5_lit_px}", flush=True)
-            except Exception as _img_exc:
-                print(f"[exposure] sensor image refresh failed: {_img_exc}", flush=True)
+            # Final refresh is usually redundant because every stage refreshes
+            # after its Morton package, but it keeps stats current on edge cases.
+            _t5_lit_px = _refresh_current_bdpt_plate("cycle-final")
 
             # Stats.
             try:
@@ -12379,23 +12987,6 @@ def run(
                 flush=True,
             )
 
-            # Save images for this exposure via the camera SD card.
-            try:
-                _stamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S") + f"_exp{_exp_n:03d}"
-                _sdcard = _SDCard()
-                _sdcard.save_exposure(
-                    _stamp,
-                    {
-                        "forward": bench._forward_img_accum,
-                        "reverse": bench._reverse_img_accum,
-                        "camera":  bench._camera_perspective_accum,
-                        "bdpt":    bench._last_bdpt_plate_rgb,
-                    },
-                    tonemap="reinhard",
-                )
-            except Exception as _sv_exc:
-                print(f"[sdcard] exposure save failed: {_sv_exc}", flush=True)
-
         def _reset_for_next_exposure() -> None:
             """Clear accumulators and pipeline state ready for a fresh exposure."""
             try:
@@ -12405,6 +12996,7 @@ def run(
             bench._forward_img_accum[:] = 0.0
             bench._reverse_img_accum[:] = 0.0
             bench._camera_perspective_accum[:] = 0.0
+            bench._camera_perspective_pending[:] = 0.0
             bench.clear_sensor_ray_cache()
             bench._last_bdpt_plate_rgb = None
             bench._last_direct_img = None
@@ -12419,17 +13011,10 @@ def run(
         if closing.is_set():
             return
 
-        # Wait for spacebar before firing the first exposure so sensor rays
-        # can accumulate naturally via the viewfinder stream.
-        _exposure_done.set()
-        print("[exposure] ready — press SPACE to begin first exposure…", flush=True)
-        _shutter_event.clear()
-        while not closing.is_set():
-            if _shutter_event.wait(timeout=0.1):
-                break
+        # Start immediately: SPACE now snapshots the accumulated live version
+        # since the last reset/rebuild instead of acting as a shutter trigger.
         _exposure_done.clear()
-        if closing.is_set():
-            return
+        print("[exposure] progressive loop running — press SPACE to save current version", flush=True)
 
         _seed_offset = 0
         while not closing.is_set():
@@ -12450,24 +13035,17 @@ def run(
 
             if closing.is_set():
                 break
+            if _rebuild_in_progress.is_set():
+                continue
 
-            # Signal the display loop that we're idle and waiting for shutter.
-            _exposure_done.set()
-            print("[exposure] waiting for SPACE to trigger next exposure…", flush=True)
-
-            # Wait for spacebar (or closing).
-            _shutter_event.clear()
-            while not closing.is_set():
-                if _shutter_event.wait(timeout=0.1):
-                    break
-
-            _exposure_done.clear()
-
-            if closing.is_set():
-                break
-
-            # Reset accumulators and begin the next exposure frame.
-            _reset_for_next_exposure()
+            # Advance only the exposure scheduler state.  Do not reset pipeline
+            # or image accumulators; the next pass adds more Mortonized detail.
+            bench._camera_exposure_complete = False
+            bench._camera_exposure_forward_stage = 0
+            bench._bdpt_camera_sweep_stage = 0
+            bench._active_exposure_frame = None
+            bench.begin_scene_camera_step()
+            bench._ensure_camera_timeline()
 
     def _coordinator_on_dt_request(dt_s: float) -> None:
         """Coordinator delivers camera dt requests to the physics backend."""
@@ -12516,6 +13094,7 @@ def run(
             old_bench._forward_img_accum[:] = 0.0
             old_bench._reverse_img_accum[:] = 0.0
             old_bench._camera_perspective_accum[:] = 0.0
+            old_bench._camera_perspective_pending[:] = 0.0
             old_bench._last_bdpt_plate_rgb = None
             old_bench._last_direct_img = None
         except Exception:
@@ -12548,10 +13127,8 @@ def run(
                 new_bench.tracer.set_uv_blit_weights(_blit_w, mode=0)
             except Exception as exc:
                 print(f"[bench-rebuild] blit weight upload failed: {exc}", flush=True)
-        # Pre-create the pipeline with GPU settings so submit_sensor_sweep (which
-        # fires before trace_forward on the first exposure tick) does not create
-        # a CPU pipeline by calling _get_pipeline while _use_gpu_compute is still
-        # false (new PyRayTracer defaults to use_gpu_compute=False).
+        # Pre-create the pipeline with GPU settings so the first ordered sensor
+        # package does not create a CPU pipeline before compute_mode is applied.
         if compute_mode in ("gpu", "mixed"):
             new_bench.tracer.ensure_pipeline(
                 max_children=2,
@@ -12834,7 +13411,7 @@ def run(
                 _startup_iris_pending[0] = False
                 bench.begin_scene_camera_step()
                 bench._ensure_camera_timeline()
-                print("[startup] bench ready — pressing shutter", flush=True)
+                print("[startup] bench ready — progressive capture loop unblocked", flush=True)
                 _camera_ready.set()   # camera thread may now start its slice loop
 
             if frame_profiler is not None:
@@ -12875,12 +13452,8 @@ def run(
                                 pygame.mouse.set_visible(True)
                                 pygame.event.set_grab(False)
                         elif k == pygame.K_SPACE and not fly_mode:
-                            if _exposure_done.is_set():
-                                # Exposure finished — fire next shutter.
-                                print("[shutter] SPACE — triggering next exposure", flush=True)
-                                _shutter_event.set()
-                            else:
-                                paused[0] = not paused[0]
+                            print("[snapshot] SPACE — saving current accumulated version", flush=True)
+                            _save_current_accumulated_version("space")
                         elif not fly_mode:
                             if k == pygame.K_x:
                                 projection_axis = 1
@@ -13025,7 +13598,7 @@ def run(
                 shader_mode = 1
                 axis_label = "X/Y"
 
-            _status = "PRESS SPACE for next exposure" if _exposure_done.is_set() else f"exp#{_exposure_count[0]}"
+            _status = f"cycle#{_exposure_count[0]}  SPACE saves current version"
             pygame.display.set_caption(
                 f"Thick Lens — {axis_label} | bounces={max_bounces} | "
                 f"shuffle={bench.intent_shuffle:.2f} ([/] to adjust) | {_status}"

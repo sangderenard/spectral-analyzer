@@ -212,6 +212,8 @@ struct RayPipelineStats {
         double   gpu_active_ms;    /* cumulative GPU stage wall time */
     } t1, t2, t3, t4, t5;
     int output_queue_depth;
+    int intent_queue_depth;
+    int intent_queue_done;
     int in_flight;
     uint64_t gpu_uv_readback_bytes;
     uint64_t gpu_uv_readback_count;
@@ -265,13 +267,14 @@ struct RayRecord {
 template<typename T>
 class PipelineQueue {
 public:
-    void push(T item) {
+    bool push(T item) {
         {
             std::lock_guard<std::mutex> lk(mu_);
-            if (done_) return;
+            if (done_) return false;
             q_.push_back(std::move(item));
         }
         cv_.notify_one();
+        return true;
     }
 
     void push_many(std::vector<T>& items) {
@@ -292,22 +295,22 @@ public:
     /* Bounded push: blocks (spin-sleep 500 µs) until size < max_size.
      * Provides backpressure on the submit thread without busy-spinning the CPU.
      * max_size <= 0 falls through to unbounded push. */
-    void push_bounded(T item, int max_size) {
+    bool push_bounded(T item, int max_size) {
         if (max_size > 0) {
             for (;;) {
                 {
                     std::lock_guard<std::mutex> lk(mu_);
-                    if (done_) return;
+                    if (done_) return false;
                     if ((int)q_.size() < max_size) {
                         q_.push_back(std::move(item));
                         cv_.notify_one();
-                        return;
+                        return true;
                     }
                 }
                 std::this_thread::sleep_for(std::chrono::microseconds(500));
             }
         }
-        push(std::move(item));
+        return push(std::move(item));
     }
 
     /* Blocking pop.  Brief spin before sleeping — reduces CV overhead on hot queues.
@@ -501,6 +504,11 @@ public:
         return (int)q_.size();
     }
 
+    bool is_done() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return done_;
+    }
+
     /* Signal that no new items will be pushed.  Unblocks blocked pops/pop_batch
      * calls so workers can drain and exit.  Does NOT clear the queue: items
      * pushed before set_done() remain available for drain() callers.  This is
@@ -682,11 +690,11 @@ struct RayPipelineConfig {
      * the corresponding overflow counter is incremented.  0 = unlimited
      * (not recommended for production — will grow unbounded for any scene).
      * Typical small-scene budget: 1–4 M entries per queue. */
-    int    bdpt_max_vertices = 2000000;  /* BdptVertexRecord cap */
-    int    bdpt_max_spectral = 4000000;  /* BdptSpectralWeightRecord cap */
-    int    bdpt_max_pdfs     = 2000000;  /* BdptPdfRecord cap */
-    int    bdpt_max_optical  = 1000000;  /* BdptOpticalEventRecord cap */
-    int    bdpt_max_connections = 2000000; /* BdptConnectionRecord cap */
+    int    bdpt_max_vertices = 10000000; /* BdptVertexRecord cap */
+    int    bdpt_max_spectral = 25000000; /* BdptSpectralWeightRecord cap */
+    int    bdpt_max_pdfs     = 10000000; /* BdptPdfRecord cap */
+    int    bdpt_max_optical  = 10000000; /* BdptOpticalEventRecord cap */
+    int    bdpt_max_connections = 10000000; /* BdptConnectionRecord cap */
 
     /* ── T5 connection ───────────────────────────────────────────────────
      * GPU path: t5_full_connect.comp.glsl — O(N_cam × N_light) brute force.

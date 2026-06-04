@@ -364,6 +364,7 @@ uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 26 + 2 * MAX_BANDS))
 #define BDPT_PDF_FLAG_SPLIT           (1u << 17)
 #define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)
 #define BDPT_PDF_FLAG_GGX             (1u << 20)
+#define BDPT_PDF_FLAG_EMISSION        (1u << 21)
 
 void emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, int mat_id,
                       vec3 pos, vec3 nrm, vec3 dir_in,
@@ -676,7 +677,18 @@ void main() {
 
     /* ── Terminal: emissive ── */
     if ((flags & MAT_FLAG_EMISSIVE) != 0) {
-        /* Emitter: incoming amplitude IS the emission spectrum — emit pre-scatter. */
+        /* Emitter: incoming amplitude IS the emission spectrum — emit pre-scatter.
+         * Also emit a PDF record so T5 can evaluate scatter_conn_pdf_area for
+         * the (s=1, t=k) strategy where this camera vertex sits on the emitter.
+         * Without the PDF record pdf_flags=0 → scatter_conn_pdf_area returns 0
+         * → candidate_strategy_density fails → emitter pixels appear black. */
+        float cos_i = max(0.0, -dot(in_dir, nrm));
+        emit_bdpt_pdf(bdpt_sid, uint(bounce),
+                      BDPT_DOMAIN_PROJ_SOLID_ANGLE,
+                      cos_i / 3.141592653589793,
+                      cos_i / 3.141592653589793,
+                      uint(flags) | BDPT_PDF_FLAG_EMISSION,
+                      nrm, in_dir, in_dir);
         if (bdpt_sid != 0u && bdpt_max_verts > 0) {
             for (int b = 0; b < nb; b++) {
                 uint vi_band = (bdpt_vi << 16) | uint(b);

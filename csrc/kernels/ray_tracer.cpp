@@ -8803,10 +8803,10 @@ public:
         static constexpr int BDPT_SPECTRAL_STRIDE_F =  8;
         static constexpr int BDPT_PDF_STRIDE_F      = 12;
         static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;
-        const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 2000000;
-        const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 4000000;
-        const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 2000000;
-        const int max_bdpt_o = (ps.cfg.bdpt_max_optical > 0) ? ps.cfg.bdpt_max_optical : 1000000;
+        const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 10000000;
+        const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 25000000;
+        const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 10000000;
+        const int max_bdpt_o = (ps.cfg.bdpt_max_optical > 0) ? ps.cfg.bdpt_max_optical : 10000000;
         const int  bdpt_spectral_base_f = max_bdpt_v * BDPT_VERTEX_STRIDE_F;
         const int  bdpt_pdf_base_f      = bdpt_spectral_base_f + max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
         const int  bdpt_optical_base_f  = bdpt_pdf_base_f + max_bdpt_p * BDPT_PDF_STRIDE_F;
@@ -11512,26 +11512,28 @@ void ray_pipeline_submit(
     int                n_intents)
 {
     if (!ps || !intents || n_intents <= 0) return;
-    ps->in_flight.fetch_add(n_intents, std::memory_order_relaxed);
     const int    max_q   = ps->cfg.max_intent_queue;
     const double min_amp = ps->cfg.min_amplitude;
-    /* Count flash/sensor split before publishing to Q_intent.  Workers can pop
-     * and finish an intent before the counter reservation below; incrementing
-     * first ensures the family counter never goes negative and the sentinel
-     * in bdpt_update_inflight cannot fire prematurely. */
-    int64_t delta_flash = 0, delta_sensor = 0;
-    for (int i = 0; i < n_intents; ++i) {
-        if (intents[i].color_flag == 1) ++delta_sensor; else ++delta_flash;
-    }
-    if (delta_flash  > 0) ps->bdpt_inflight_flash.fetch_add(delta_flash,  std::memory_order_release);
-    if (delta_sensor > 0) ps->bdpt_inflight_sensor.fetch_add(delta_sensor, std::memory_order_release);
+
     for (int i = 0; i < n_intents; ++i) {
         RayIntent ri = intents[i];
         if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
-        if (max_q > 0)
-            ps->Q_intent.push_bounded(std::move(ri), max_q);
+        const uint8_t color_flag = ri.color_flag;
+        ps->in_flight.fetch_add(1, std::memory_order_release);
+        if (color_flag == 1u)
+            ps->bdpt_inflight_sensor.fetch_add(1, std::memory_order_release);
         else
-            ps->Q_intent.push(std::move(ri));
+            ps->bdpt_inflight_flash.fetch_add(1, std::memory_order_release);
+        const bool accepted = (max_q > 0)
+            ? ps->Q_intent.push_bounded(std::move(ri), max_q)
+            : ps->Q_intent.push(std::move(ri));
+        if (!accepted) {
+            ps->in_flight.fetch_sub(1, std::memory_order_acq_rel);
+            if (color_flag == 1u)
+                ps->bdpt_inflight_sensor.fetch_sub(1, std::memory_order_acq_rel);
+            else
+                ps->bdpt_inflight_flash.fetch_sub(1, std::memory_order_acq_rel);
+        }
     }
 }
 
@@ -12010,6 +12012,8 @@ void ray_pipeline_get_stats(const RayPipelineState* ps, RayPipelineStats* out)
     snap(ps->stats[3], out->t4);
     snap(ps->stats[4], out->t5);
     out->output_queue_depth = ps->Q_out.size();
+    out->intent_queue_depth = ps->Q_intent.size();
+    out->intent_queue_done  = ps->Q_intent.is_done() ? 1 : 0;
     out->in_flight          = ps->in_flight.load(std::memory_order_relaxed);
     out->gpu_uv_readback_bytes = ps->gpu_uv_readback_bytes.load(std::memory_order_relaxed);
     out->gpu_uv_readback_count = ps->gpu_uv_readback_count.load(std::memory_order_relaxed);
@@ -12412,10 +12416,10 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
     std::vector<BdptSpectralWeightRecord> sweights_new;
     std::vector<BdptPdfRecord>            pdfs_new;
     std::vector<BdptOpticalEventRecord>   optical_new;
-    ray_pipeline_drain_bdpt_vertices(ps, verts_new,   ps->cfg.bdpt_max_vertices > 0 ? ps->cfg.bdpt_max_vertices : 2000000);
-    ray_pipeline_drain_bdpt_spectral(ps, sweights_new, ps->cfg.bdpt_max_spectral > 0 ? ps->cfg.bdpt_max_spectral : 4000000);
-    ray_pipeline_drain_bdpt_pdfs    (ps, pdfs_new,     ps->cfg.bdpt_max_pdfs     > 0 ? ps->cfg.bdpt_max_pdfs     : 2000000);
-    ray_pipeline_drain_bdpt_optical (ps, optical_new,  ps->cfg.bdpt_max_optical  > 0 ? ps->cfg.bdpt_max_optical  : 1000000);
+    ray_pipeline_drain_bdpt_vertices(ps, verts_new,   ps->cfg.bdpt_max_vertices > 0 ? ps->cfg.bdpt_max_vertices : 10000000);
+    ray_pipeline_drain_bdpt_spectral(ps, sweights_new, ps->cfg.bdpt_max_spectral > 0 ? ps->cfg.bdpt_max_spectral : 25000000);
+    ray_pipeline_drain_bdpt_pdfs    (ps, pdfs_new,     ps->cfg.bdpt_max_pdfs     > 0 ? ps->cfg.bdpt_max_pdfs     : 10000000);
+    ray_pipeline_drain_bdpt_optical (ps, optical_new,  ps->cfg.bdpt_max_optical  > 0 ? ps->cfg.bdpt_max_optical  : 10000000);
     t5_work_items = verts_new.size() + sweights_new.size() + pdfs_new.size() + optical_new.size();
     fprintf(stderr, "[T5-conn] drained: verts=%zu sweights=%zu pdfs=%zu optical=%zu\n",
             verts_new.size(), sweights_new.size(), pdfs_new.size(), optical_new.size());
@@ -12854,6 +12858,35 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
             }
         }
 
+        /* ── Diagnostic: beta presence in packed vertex buffers ─────────── */
+        {
+            uint32_t lv_zero = 0, lv_nonzero = 0, lv_zero_pdf = 0;
+            for (uint32_t i = 0; i < n_lv; ++i) {
+                const float* p = light_packed.data() + static_cast<size_t>(i) * T5_LGV_STRIDE;
+                float s = 0.0f;
+                const int _nb = std::min(ctx.n_bands, (int)T5_MAX_GPU_BANDS);
+                for (int b = 0; b < _nb; ++b) s += p[LGV_BAND_BASE + b];
+                if (s < 1e-30f) ++lv_zero; else ++lv_nonzero;
+                uint32_t pf = 0u; std::memcpy(&pf, &p[13], 4);
+                if (pf == 0u) ++lv_zero_pdf;
+            }
+            uint32_t cv_zero = 0, cv_nonzero = 0, cv_emission = 0;
+            for (uint32_t i = 0; i < ci_flat; ++i) {
+                const float* p = cam_packed.data() + static_cast<size_t>(i) * T5_CGV_STRIDE;
+                float s = 0.0f;
+                const int _nb = std::min(ctx.n_bands, (int)T5_MAX_GPU_BANDS);
+                for (int b = 0; b < _nb; ++b) s += p[CGV_BAND_BASE + b];
+                if (s < 1e-30f) ++cv_zero; else ++cv_nonzero;
+                uint32_t pf = 0u; std::memcpy(&pf, &p[17], 4);
+                if (pf & (1u << 21)) ++cv_emission;
+            }
+            fprintf(stderr,
+                "[T5-diag] lv=%u nonzero=%u zero=%u zero_pdf=%u | cv=%u nonzero=%u zero=%u emission_pdf=%u\n",
+                n_lv, lv_nonzero, lv_zero, lv_zero_pdf,
+                ci_flat, cv_nonzero, cv_zero, cv_emission);
+            fflush(stderr);
+        }
+
         std::vector<uint32_t> pixel_accum;  /* zeroed per-tile in service_t5_job */
 
         /* Pre-compute spectral colour weights (one RGB triple per band).
@@ -13033,7 +13066,7 @@ void ray_pipeline_signal_flash_dispatched(RayPipelineState* ps)
 {
     if (!ps) return;
     const uint32_t new_flash = ps->bdpt_flash_dispatched.fetch_add(1u, std::memory_order_release) + 1u;
-    fprintf(stderr, "[T5-latch] flash first-submission #%u  (sensor=%u t5_fired=%u) — tracing not started\n",
+    fprintf(stderr, "[T5-latch] flash first-submission #%u  (sensor=%u t5_fired=%u) - tracing not started\n",
             new_flash,
             ps->bdpt_sensor_dispatched.load(std::memory_order_acquire),
             ps->bdpt_t5_fired.load(std::memory_order_acquire));
@@ -13044,7 +13077,7 @@ void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps)
 {
     if (!ps) return;
     const uint32_t new_sensor = ps->bdpt_sensor_dispatched.fetch_add(1u, std::memory_order_release) + 1u;
-    fprintf(stderr, "[T5-latch] sensor first-submission #%u  (flash=%u t5_fired=%u) — tracing not started\n",
+    fprintf(stderr, "[T5-latch] sensor first-submission #%u  (flash=%u t5_fired=%u) - tracing not started\n",
             new_sensor,
             ps->bdpt_flash_dispatched.load(std::memory_order_acquire),
             ps->bdpt_t5_fired.load(std::memory_order_acquire));

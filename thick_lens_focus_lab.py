@@ -4209,6 +4209,9 @@ BDPT_FILM_TAG_UV_BITS = 30
 BDPT_FILM_TAG_CHANNEL_SHIFT = np.uint64(60)
 BDPT_FILM_TAG_UV_SHIFT = np.uint64(BDPT_FILM_TAG_UV_BITS)
 BDPT_FILM_TAG_MASK = np.uint64((1 << BDPT_FILM_TAG_UV_BITS) - 1)
+# Bit 62 carries the aperture half (0 = left, 1 = right) so the label survives
+# through all GPU bounces without a separate per-ray side-channel.
+BDPT_FILM_TAG_APERTURE_HALF_BIT = np.uint64(1) << np.uint64(62)
 
 
 def _pack_bdpt_film_tag(channel_idx: np.ndarray, film_uv: np.ndarray) -> np.ndarray:
@@ -4296,8 +4299,9 @@ BDPT_SEGMENT_DTYPE = np.dtype([
     ("pdf_solid_angle", "f4"),   # solid-angle PDF (0 when Jacobian is missing; see flags)
     ("strategy_id", "u2"),       # CAMERA_STRATEGY_SENSOR_APERTURE or 0
     ("sample_domain", "u1"),     # BDPT_SAMPLE_DOMAIN_*
-    ("stream", "u1"),       # 0 = light/forward, 1 = camera/backward
-    ("kind", "u1"),         # RayRecordKind from C++
+    ("stream", "u1"),        # 0 = light/forward, 1 = camera/backward
+    ("kind", "u1"),          # RayRecordKind from C++
+    ("aperture_half", "u1"), # 0 = left aperture half, 1 = right (from tag bit 62)
     ("bounce", "i4"),
     ("hit_group_id", "i4"),
     ("hit_tri", "i4"),
@@ -5321,6 +5325,7 @@ class ForwardCppLensBench:
 
     def __post_init__(self) -> None:
         self._trace_lock = threading.Lock()
+        self._pipeline_drain_lock = threading.Lock()
         self._mobile_lens_idx: int = 0
         self.bdpt_consecutive_no_survivor_frames = 0
         self.bdpt_debug_print_counter = 0
@@ -6823,7 +6828,8 @@ class ForwardCppLensBench:
 
         n = int(origins.shape[0])
         channel_idx = np.zeros(n, dtype=np.uint8)
-        tags = _pack_bdpt_film_tag(channel_idx, film_uv_all)
+        tags = (_pack_bdpt_film_tag(channel_idx, film_uv_all)
+                | (aperture_half_arr.astype(np.uint64) << np.uint64(62)))
         amp_val = float(max(0.0, self.sensor_amp_gain))
         amplitudes = np.full((n, int(self.n_bands)), complex(amp_val, 0.0), dtype=np.complex128)
 
@@ -7153,8 +7159,7 @@ class ForwardCppLensBench:
         """
         if drain_epoch is not None and int(drain_epoch) != int(getattr(self, "_pipeline_reset_epoch", 0)):
             return
-        if bool(getattr(self, "enable_python_bdpt_diagnostics", False)):
-            self._append_bdpt_segment_records(records)
+        self._append_bdpt_segment_records(records)
         kinds   = np.asarray(records["kind"], dtype=np.uint8)
         strike  = kinds == 0
         if not np.any(strike):
@@ -7224,26 +7229,23 @@ class ForwardCppLensBench:
         while not self._drain_stop.is_set():
             try:
                 drain_epoch = int(getattr(self, "_pipeline_reset_epoch", 0))
-                use_cpp_display = (
-                    bool(getattr(self, "enable_cpp_display_drain", True)) and
-                    not bool(getattr(self, "enable_python_bdpt_diagnostics", False)) and
-                    hasattr(self.tracer, "drain_records_display")
-                )
-                if use_cpp_display:
-                    plate = self.scene.image_plate
-                    records = self.tracer.drain_records_display(
-                        int(_max_batch),
-                        int(self._forward_img_res),
-                        float(self.scene.view_radius),
-                        float(max(1.0e-9, getattr(plate, "sensor_half_w", getattr(plate, "radius", 0.0)))),
-                        float(max(1.0e-9, getattr(plate, "sensor_half_h", getattr(plate, "radius", 0.0)))),
-                        np.ascontiguousarray(getattr(self, "tri_kind", np.zeros(0, dtype=np.int8)), dtype=np.int8),
-                        _rgb_weights_for_freq(self.freq_hz, self.n_bands, np.float32),
-                    )
-                    n = int(records.get("n", 0)) if records else 0
-                else:
-                    records = self.tracer.drain_records_slim(max_n=_max_batch)
-                    n       = int(records["kind"].shape[0]) if records else 0
+                use_cpp_display = False
+                with self._pipeline_drain_lock:
+                    if use_cpp_display:
+                        plate = self.scene.image_plate
+                        records = self.tracer.drain_records_display(
+                            int(_max_batch),
+                            int(self._forward_img_res),
+                            float(self.scene.view_radius),
+                            float(max(1.0e-9, getattr(plate, "sensor_half_w", getattr(plate, "radius", 0.0)))),
+                            float(max(1.0e-9, getattr(plate, "sensor_half_h", getattr(plate, "radius", 0.0)))),
+                            np.ascontiguousarray(getattr(self, "tri_kind", np.zeros(0, dtype=np.int8)), dtype=np.int8),
+                            _rgb_weights_for_freq(self.freq_hz, self.n_bands, np.float32),
+                        )
+                        n = int(records.get("n", 0)) if records else 0
+                    else:
+                        records = self.tracer.drain_records_slim(max_n=_max_batch)
+                        n       = int(records["kind"].shape[0]) if records else 0
                 if n > 0:
                     _empty_polls = 0
                     if drain_epoch != int(getattr(self, "_pipeline_reset_epoch", 0)):
@@ -7837,6 +7839,7 @@ class ForwardCppLensBench:
         ).astype(np.uint8)
         rows["stream"] = np.where(cflags[event_idx] == 1, 1, 0).astype(np.uint8, copy=False)
         rows["kind"] = kinds[event_idx].astype(np.uint8, copy=False)
+        rows["aperture_half"] = ((tag_event >> np.uint64(62)) & np.uint64(1)).astype(np.uint8)
         rows["bounce"] = bounces[event_idx].astype(np.int32, copy=False)
         rows["hit_group_id"] = gid[event_idx].astype(np.int32, copy=False)
         rows["hit_tri"] = htri[event_idx].astype(np.int32, copy=False)
@@ -8433,7 +8436,6 @@ class ForwardCppLensBench:
 
         self.tracer.begin_sensor_batching()
         try:
-            self.tracer.signal_flash_dispatched()
             n_submit_total = 0
             pix_offset = 0
             while pix_offset < schedule_total and not self._drain_stop.is_set():
@@ -9174,6 +9176,7 @@ class ForwardCppLensBench:
         n_aperture:   int   = 64,
         gain:         float = 0.8,
         max_delta_m:  float = 0.100,
+        apply_focus:  bool  = True,
     ) -> float:
         """Configure a 1×1 PDAF site at the given film coordinate, measure the
         split-pupil convergence error, and apply a focus correction.
@@ -9208,7 +9211,9 @@ class ForwardCppLensBench:
 
         self._pdaf_wavelength_m = float(wavelength_m)
 
-        # Populate focus via the same pupil target that rebuild_sensor_ray_cache uses.
+        # Populate focus from the visible sensor stream.  The pre-BDPT PIP is
+        # produced by the native sensor sweep, which uses the finite physical
+        # gate, so the click-specific probe below must use that same launch cone.
         lasm = self._lens_assembly
         optics = getattr(lasm, "optics", None) if lasm is not None else None
         ep_spec = lasm.backward_ray_target_spec() if lasm is not None else None
@@ -9216,29 +9221,28 @@ class ForwardCppLensBench:
             print("[pdaf] no valid optics/exit-pupil", flush=True)
             return 0.0
 
-        focus_x, focus_source, focus_hits = self._pdaf_scene_x_for_film_uv(
+        self._pdaf_pending_focus_distance_m = None
+        launched = self._pdaf_inject_sensor_depth_probe(
             float(film_u), float(film_v),
+            n_rays=max(128, int(n_aperture) * 4),
+            max_bounces=8,
+            seed=0,
         )
-        if focus_x is None:
-            launched = self._pdaf_inject_sensor_depth_probe(
+        focus_x, focus_source, focus_hits = (None, "probe", 0)
+        if launched > 0:
+            focus_x, focus_source, focus_hits = self._pdaf_wait_for_scene_x(
                 float(film_u), float(film_v),
-                n_rays=max(128, int(n_aperture) * 4),
-                max_bounces=8,
-                seed=0,
+                timeout_s=None,
             )
-            if launched > 0:
-                focus_x, focus_source, focus_hits = self._pdaf_wait_for_scene_x(
-                    float(film_u), float(film_v),
-                    timeout_s=1.5,
-                )
-            if focus_x is None:
-                print(
-                    f"[pdaf] pixel u={film_u:.3f} v={film_v:.3f}"
-                    f"  depth_probe_rays={launched}"
-                    "  no sensor hit depth; focus skipped",
-                    flush=True,
-                )
-                return 0.0
+        if focus_x is None:
+            print(
+                f"[pdaf] pixel u={film_u:.3f} v={film_v:.3f}"
+                f"  depth_probe_rays={launched}"
+                "  no sensor hit depth; focus skipped",
+                flush=True,
+            )
+            self._pdaf_pending_focus_distance_m = None
+            return 0.0
 
         self._pdaf_grid.measure(
             optics            = optics,
@@ -9252,23 +9256,39 @@ class ForwardCppLensBench:
         )
 
         err_rad = self._pdaf_grid.focus_error
-        delta_m = self.get_pdaf_defocus_estimate_m(wavelength_m)
-        delta_m = float(np.clip(delta_m * float(gain), -float(max_delta_m), float(max_delta_m)))
+
+        # Use scene depth directly (same reference as set_focus_distance_live) so the
+        # compound-lens principal-plane offset doesn't inflate the converge_x estimate.
+        current_u = float(getattr(self.scene, "focus_distance_m", 1.0) or 1.0)
+        _lenses = list(getattr(self.scene, "lens_stack", None) or [])
+        if _lenses:
+            _ref_x = float(_lenses[0].x_front)
+            _u_target = _ref_x - float(focus_x)
+            _raw_delta = (_u_target - current_u) * float(gain)
+        else:
+            _raw_delta = self.get_pdaf_defocus_estimate_m(wavelength_m) * float(gain)
+        delta_m = float(np.clip(_raw_delta, -float(max_delta_m), float(max_delta_m)))
 
         print(
             f"[pdaf] pixel u={film_u:.3f} v={film_v:.3f}"
             f"  site=({site_y*1e3:.1f}, {site_z*1e3:.1f}) mm"
             f"  scene_x={focus_x:.4f}({focus_source}:{focus_hits})"
             f"  ΔΦ={err_rad:.4f} rad"
-            f"  Δu_raw={self.get_pdaf_defocus_estimate_m(wavelength_m)*1e3:+.2f} mm"
+            f"  Δu_raw={_raw_delta/float(gain)*1e3:+.2f} mm"
             f"  Δu_applied={delta_m*1e3:+.2f} mm",
             flush=True,
         )
 
-        if abs(delta_m) > 1.0e-5:
-            current_u = float(getattr(self.scene, "focus_distance_m", 1.0) or 1.0)
+        if abs(delta_m) > 1.0e-5 and bool(apply_focus):
             self.set_focus_distance_live(current_u + delta_m)
+        elif abs(delta_m) > 1.0e-5:
+            self._pdaf_pending_focus_distance_m = float(current_u + delta_m)
+            print(
+                f"[pdaf] pending focus rebuild u={float(current_u + delta_m)*1e3:.0f}mm",
+                flush=True,
+            )
         else:
+            self._pdaf_pending_focus_distance_m = None
             print("[pdaf] already in focus — no adjustment needed", flush=True)
 
         return delta_m
@@ -9283,12 +9303,26 @@ class ForwardCppLensBench:
         seed: int = 0,
     ) -> int:
         """Launch deterministic sensor rays for one clicked PDAF site."""
+        plate = self.scene.image_plate
         lasm = self._lens_assembly
-        target_spec = lasm.backward_ray_target_spec() if lasm is not None else None
-        if target_spec is None or float(target_spec.radius) <= 0.0:
+        target_center = None
+        target_radius = 0.0
+        if lasm is not None:
+            try:
+                gate_center, gate_radius = lasm.backward_physical_gate_target()
+                if gate_center is not None and float(gate_radius) > 0.0:
+                    target_center = np.asarray(gate_center, dtype=np.float64).reshape(3)
+                    target_radius = float(gate_radius)
+            except Exception:
+                target_center = None
+                target_radius = 0.0
+        if target_center is None or target_radius <= 0.0:
+            target_x, target_r = self._physical_sensor_gate_target()
+            target_center = np.asarray([target_x, 0.0, 0.0], dtype=np.float64)
+            target_radius = float(target_r)
+        if target_radius <= 0.0:
             return 0
 
-        plate = self.scene.image_plate
         n = int(max(8, n_rays))
         site_y = (float(film_v) - 0.5) * (2.0 * float(plate.sensor_half_w))
         site_z = (0.5 - float(film_u)) * (2.0 * float(plate.sensor_half_h))
@@ -9297,8 +9331,8 @@ class ForwardCppLensBench:
         origins[:, 1] = site_y
         origins[:, 2] = site_z
 
-        center = np.asarray(target_spec.center, dtype=np.float64).reshape(3)
-        radius = float(target_spec.radius)
+        center = target_center
+        radius = float(target_radius)
         idx = np.arange(n, dtype=np.float64)
         golden = math.pi * (3.0 - math.sqrt(5.0))
         rr = radius * np.sqrt((idx + 0.5) / float(n))
@@ -9308,16 +9342,16 @@ class ForwardCppLensBench:
         target_pts[:, 1] = center[1] + rr * np.cos(th)
         target_pts[:, 2] = center[2] + rr * np.sin(th)
 
-        if str(target_spec.direction_mode) == "away_from_virtual":
-            directions = origins - target_pts
-        else:
-            directions = target_pts - origins
+        directions = target_pts - origins
         dn = np.linalg.norm(directions, axis=1)
         valid = np.isfinite(dn) & (dn > EPS)
         if not np.any(valid):
             return 0
         origins = origins[valid]
         directions = directions[valid] / dn[valid, None]
+        # Match native submit_sensor_sweep(): start just past the sensor plane
+        # along the launch direction so the probe does not self-hit the plate.
+        origins = origins + directions * 2.56e-8
         n = int(origins.shape[0])
 
         # Fresh probe data only: PDAF should not use old hit depths after focus/zoom.
@@ -9329,7 +9363,9 @@ class ForwardCppLensBench:
             (n, 1),
         )
         channel_idx = np.zeros(n, dtype=np.uint8)
-        tags = _pack_bdpt_film_tag(channel_idx, film_uv)
+        aperture_half_arr = ((target_pts[valid, 1] - center[1]) >= 0.0).astype(np.uint64)
+        tags = (_pack_bdpt_film_tag(channel_idx, film_uv)
+                | (aperture_half_arr << np.uint64(62)))
         amplitudes = np.full(
             (n, int(self.n_bands)),
             complex(float(max(0.0, self.sensor_amp_gain)), 0.0),
@@ -9339,6 +9375,33 @@ class ForwardCppLensBench:
         color_flags = np.ones(n, dtype=np.uint8)
         _use_gpu = self.compute_mode in ("gpu", "mixed")
         _all_gpu = self.compute_mode == "gpu"
+        try:
+            stats_before = self.tracer.pipeline_stats()
+            t1_before = int(stats_before.get("t1", {}).get("gpu_processed", 0)) + int(stats_before.get("t1", {}).get("processed", 0))
+            t3_before = int(stats_before.get("t3", {}).get("gpu_processed", 0)) + int(stats_before.get("t3", {}).get("processed", 0))
+            inflight_before = int(stats_before.get("in_flight", self.tracer.in_flight_count()))
+            q_before = int(stats_before.get("intent_queue_depth", -1))
+            q_done_before = int(stats_before.get("intent_queue_done", -1))
+            gpu_state = str(stats_before.get("gpu_dispatch_status", "?"))
+        except Exception:
+            t1_before = t3_before = 0
+            inflight_before = int(self.tracer.in_flight_count())
+            q_before = -1
+            q_done_before = -1
+            gpu_state = "?"
+        print(
+            "[pdaf-probe]",
+            f"rays={n}",
+            f"site=({site_y*1e3:.1f},{site_z*1e3:.1f})mm",
+            f"target_x={float(center[0]):.4f}",
+            f"target_r={float(radius)*1e3:.2f}mm",
+            "mode=physical-gate",
+            f"inflight_before={inflight_before}",
+            f"q_before={q_before}",
+            f"q_done={q_done_before}",
+            f"gpu={gpu_state}",
+            flush=True,
+        )
         self.tracer.submit_rays(
             origins=np.ascontiguousarray(origins),
             directions=np.ascontiguousarray(directions),
@@ -9355,38 +9418,196 @@ class ForwardCppLensBench:
             shader_dir=_SHADER_DIR,
         )
         try:
-            self.tracer.signal_sensor_dispatched()
+            inflight_after = int(self.tracer.in_flight_count())
+            stats_after_submit = self.tracer.pipeline_stats()
+            q_after = int(stats_after_submit.get("intent_queue_depth", -1))
+            q_done_after = int(stats_after_submit.get("intent_queue_done", -1))
         except Exception:
-            pass
+            inflight_after = -1
+            q_after = -1
+            q_done_after = -1
+        self._pdaf_probe_submit_diag = {
+            "rays": int(n),
+            "t1_before": int(t1_before),
+            "t3_before": int(t3_before),
+            "inflight_before": int(inflight_before),
+            "inflight_after": int(inflight_after),
+            "q_before": int(q_before),
+            "q_after": int(q_after),
+            "q_done_before": int(q_done_before),
+            "q_done_after": int(q_done_after),
+        }
+        print(
+            "[pdaf-probe-submit]",
+            f"rays={n}",
+            f"inflight_before={inflight_before}",
+            f"inflight_after={inflight_after}",
+            f"q_before={q_before}",
+            f"q_after={q_after}",
+            f"q_done={q_done_after}",
+            flush=True,
+        )
         self._ensure_drain_loop()
         self._sensor_viewfinder_last_launched = n
         return n
+
+    def _drain_pdaf_probe_records_once(self, film_u: float, film_v: float) -> tuple[int, int, int]:
+        """Synchronously drain native records for PDAF instead of waiting on the
+        background drain thread.  Returns (records, sensor_records, local_records)."""
+        try:
+            with self._pipeline_drain_lock:
+                records = self.tracer.drain_records_slim(max_n=1_000_000)
+        except Exception as exc:
+            print(f"[pdaf-drain] drain failed: {exc}", flush=True)
+            return 0, 0, 0
+        n = int(records["kind"].shape[0]) if records else 0
+        if n <= 0:
+            return 0, 0, 0
+        self._fast_bdpt_feed(records, drain_epoch=int(getattr(self, "_pipeline_reset_epoch", 0)))
+        try:
+            cflags = np.asarray(records.get("color_flag", []), dtype=np.uint8)
+            tags = np.asarray(records.get("tag", []), dtype=np.uint64)
+            sensor_n = int(np.count_nonzero(cflags == 1))
+            _valid, uv = _unpack_bdpt_film_tag(tags)
+            d2 = (uv[:, 0].astype(np.float64) - float(film_u)) ** 2 + (
+                uv[:, 1].astype(np.float64) - float(film_v)
+            ) ** 2
+            local_n = int(np.count_nonzero((cflags == 1) & (d2 <= 0.015 ** 2)))
+        except Exception:
+            sensor_n = 0
+            local_n = 0
+        return n, sensor_n, local_n
 
     def _pdaf_wait_for_scene_x(
         self,
         film_u: float,
         film_v: float,
         *,
-        timeout_s: float = 1.5,
+        timeout_s: Optional[float] = None,
     ) -> tuple[Optional[float], str, int]:
-        """Wait for the just-injected PDAF depth probe to produce a scene hit."""
-        deadline = time.perf_counter() + float(max(0.0, timeout_s))
+        """Barrier for the just-injected PDAF depth probe.
+
+        With timeout_s=None this only returns after the probe has produced a
+        usable clicked depth, or after the submitted primary rays have been
+        demonstrably processed and drained.
+        """
+        deadline = None
+        if timeout_s is not None and float(timeout_s) > 0.0:
+            deadline = time.perf_counter() + float(timeout_s)
         last: tuple[Optional[float], str, int] = (None, "no_sensor_hits", 0)
-        while time.perf_counter() < deadline:
+        drained_total = 0
+        sensor_total = 0
+        local_total = 0
+        polls = 0
+        last_heartbeat = time.perf_counter()
+        while True:
+            n_rec, n_sensor, n_local = self._drain_pdaf_probe_records_once(float(film_u), float(film_v))
+            drained_total += int(n_rec)
+            sensor_total += int(n_sensor)
+            local_total += int(n_local)
             last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
             if last[0] is not None:
+                self._print_pdaf_probe_wait_diag(
+                    drained_total, sensor_total, local_total, polls, found=True)
                 return last
             try:
-                if int(self.tracer.in_flight_count()) == 0:
-                    # Give the drain thread one more small slice to pull terminal records.
-                    time.sleep(0.020)
+                stats_now = self.tracer.pipeline_stats()
+                before = getattr(self, "_pdaf_probe_submit_diag", {}) or {}
+                rays = int(before.get("rays", 0))
+                t1_now = int(stats_now.get("t1", {}).get("gpu_processed", 0)) + int(stats_now.get("t1", {}).get("processed", 0))
+                t3_now = int(stats_now.get("t3", {}).get("gpu_processed", 0)) + int(stats_now.get("t3", {}).get("processed", 0))
+                t1_delta = t1_now - int(before.get("t1_before", 0))
+                t3_delta = t3_now - int(before.get("t3_before", 0))
+                records_seen = drained_total > 0 or sensor_total > 0 or local_total > 0
+                if records_seen and rays > 0 and (t1_delta >= rays or t3_delta >= rays):
+                    n_rec, n_sensor, n_local = self._drain_pdaf_probe_records_once(float(film_u), float(film_v))
+                    drained_total += int(n_rec)
+                    sensor_total += int(n_sensor)
+                    local_total += int(n_local)
                     last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
-                    if last[0] is not None:
+                    self._print_pdaf_probe_wait_diag(
+                        drained_total, sensor_total, local_total, polls, found=last[0] is not None)
+                    return last
+            except Exception:
+                pass
+            try:
+                if int(self.tracer.in_flight_count()) == 0:
+                    n_rec, n_sensor, n_local = self._drain_pdaf_probe_records_once(float(film_u), float(film_v))
+                    drained_total += int(n_rec)
+                    sensor_total += int(n_sensor)
+                    local_total += int(n_local)
+                    last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
+                    before = getattr(self, "_pdaf_probe_submit_diag", {}) or {}
+                    stats_now = self.tracer.pipeline_stats()
+                    rays = int(before.get("rays", 0))
+                    t1_now = int(stats_now.get("t1", {}).get("gpu_processed", 0)) + int(stats_now.get("t1", {}).get("processed", 0))
+                    t3_now = int(stats_now.get("t3", {}).get("gpu_processed", 0)) + int(stats_now.get("t3", {}).get("processed", 0))
+                    t1_delta = t1_now - int(before.get("t1_before", 0))
+                    t3_delta = t3_now - int(before.get("t3_before", 0))
+                    records_seen = drained_total > 0 or sensor_total > 0 or local_total > 0
+                    processed = rays > 0 and (t1_delta >= rays or t3_delta >= rays)
+                    if records_seen or processed:
+                        self._print_pdaf_probe_wait_diag(
+                            drained_total, sensor_total, local_total, polls, found=last[0] is not None)
                         return last
             except Exception:
                 pass
+            if deadline is not None and time.perf_counter() >= deadline:
+                self._print_pdaf_probe_wait_diag(
+                    drained_total, sensor_total, local_total, polls, found=False)
+                return last
+            now = time.perf_counter()
+            if now - last_heartbeat >= 1.0:
+                self._print_pdaf_probe_wait_diag(
+                    drained_total, sensor_total, local_total, polls, found=False)
+                last_heartbeat = now
+            polls += 1
             time.sleep(0.015)
-        return last
+
+    def _print_pdaf_probe_wait_diag(
+        self,
+        drained_total: int,
+        sensor_total: int,
+        local_total: int,
+        polls: int,
+        *,
+        found: bool,
+    ) -> None:
+        try:
+            stats_after = self.tracer.pipeline_stats()
+            t1_after = int(stats_after.get("t1", {}).get("gpu_processed", 0)) + int(stats_after.get("t1", {}).get("processed", 0))
+            t3_after = int(stats_after.get("t3", {}).get("gpu_processed", 0)) + int(stats_after.get("t3", {}).get("processed", 0))
+            inflight = int(stats_after.get("in_flight", self.tracer.in_flight_count()))
+            q_depth = int(stats_after.get("intent_queue_depth", -1))
+            q_done = int(stats_after.get("intent_queue_done", -1))
+            gpu_state = str(stats_after.get("gpu_dispatch_status", "?"))
+        except Exception:
+            t1_after = t3_after = 0
+            inflight = int(self.tracer.in_flight_count())
+            q_depth = -1
+            q_done = -1
+            gpu_state = "?"
+        before = getattr(self, "_pdaf_probe_submit_diag", {}) or {}
+        t1_delta = int(t1_after) - int(before.get("t1_before", 0))
+        t3_delta = int(t3_after) - int(before.get("t3_before", 0))
+        rows = self.get_bdpt_segments()
+        seg_rows = 0 if rows is None else int(rows.shape[0])
+        print(
+            "[pdaf-wait]",
+            f"found={int(bool(found))}",
+            f"polls={int(polls)}",
+            f"native_drained={int(drained_total)}",
+            f"sensor_records={int(sensor_total)}",
+            f"local_records={int(local_total)}",
+            f"segment_rows={seg_rows}",
+            f"t1_delta={t1_delta}",
+            f"t3_delta={t3_delta}",
+            f"inflight={inflight}",
+            f"q_depth={q_depth}",
+            f"q_done={q_done}",
+            f"gpu={gpu_state}",
+            flush=True,
+        )
 
     def _pdaf_scene_x_for_film_uv(
         self,
@@ -9398,31 +9619,15 @@ class ForwardCppLensBench:
     ) -> tuple[Optional[float], str, int]:
         """Estimate clicked scene depth from recent backward camera hits.
 
-        This is the current bridge from rendered scene content to PDAF.  If the
-        BDPT segment store has camera-side hits near the clicked film coordinate,
-        use their scene-space x coordinate as the focus surface.  If no sensor
-        hit data exists, PDAF has no target and must not focus.
+        Prefers bounce-0 segment records (first scene intersection of each
+        backward camera ray) — these are the only bounce that encodes the
+        depth of the visible surface at the clicked pixel.  Falls back to
+        the endpoint store (all bounces) only when segments are unavailable.
         """
-        try:
-            endpoints = self._bdpt_endpoints.snapshot()
-        except Exception:
-            endpoints = None
-        focus_x, source, hits = self._pdaf_scene_x_from_rows(
-            endpoints, float(film_u), float(film_v),
-            radius_uv=float(radius_uv), min_hits=int(min_hits),
-            source_name="endpoint",
-        )
-        if focus_x is not None:
-            return focus_x, source, hits
-
-        try:
-            rows = self.get_bdpt_segments()
-        except Exception:
-            rows = None
+        rows = self.get_bdpt_segments()
         return self._pdaf_scene_x_from_rows(
             rows, float(film_u), float(film_v),
             radius_uv=float(radius_uv), min_hits=int(min_hits),
-            source_name="segment",
         )
 
     def _pdaf_scene_x_from_rows(
@@ -9433,60 +9638,67 @@ class ForwardCppLensBench:
         *,
         radius_uv: float,
         min_hits: int,
-        source_name: str,
     ) -> tuple[Optional[float], str, int]:
-        """Shared PDAF depth reducer for endpoint and segment record arrays."""
         if rows is None or rows.size == 0:
             return None, "no_sensor_hits", 0
 
-        try:
-            names = rows.dtype.names or ()
-            uv = np.asarray(rows["film_uv"], dtype=np.float64)
-            pos_field = "p1" if "p1" in names else "pos"
-            p1 = np.asarray(rows[pos_field], dtype=np.float64)
-            mask = (
-                (np.asarray(rows["stream"], dtype=np.uint8) == 1)
-                & np.all(np.isfinite(uv), axis=1)
-                & np.all(np.isfinite(p1), axis=1)
+        uv   = np.asarray(rows["film_uv"], dtype=np.float64)
+        p1   = np.asarray(rows["p1"],      dtype=np.float64)
+        mask = (
+            (np.asarray(rows["stream"],        dtype=np.uint8)  == 1)
+            & (np.asarray(rows["sample_domain"], dtype=np.uint8) == int(BDPT_SAMPLE_DOMAIN_FILM_APERTURE))
+            & np.all(np.isfinite(uv), axis=1)
+            & np.all(np.isfinite(p1), axis=1)
+        )
+        htri     = np.asarray(rows["hit_tri"], dtype=np.int32)
+        mask    &= htri >= 0
+        tri_kind = getattr(self, "tri_kind", None)
+        if tri_kind is not None and tri_kind.shape[0] > 0:
+            safe  = np.clip(htri, 0, tri_kind.shape[0] - 1)
+            kind = np.asarray(tri_kind[safe], dtype=np.int8)
+            optic_or_sensor = (
+                (kind == TRI_KIND_LENS)
+                | (kind == TRI_KIND_APERTURE)
+                | (kind == TRI_KIND_SENSOR)
             )
-            if "sample_domain" in names:
-                mask &= np.asarray(rows["sample_domain"], dtype=np.uint8) == int(BDPT_SAMPLE_DOMAIN_FILM_APERTURE)
-            if "hit_tri" in names:
-                htri = np.asarray(rows["hit_tri"], dtype=np.int32)
-                mask &= htri >= 0
-                tri_kind = getattr(self, "tri_kind", None)
-                if tri_kind is not None and getattr(tri_kind, "shape", (0,))[0] > 0:
-                    safe = np.clip(htri, 0, int(tri_kind.shape[0]) - 1)
-                    mask &= np.asarray(tri_kind[safe], dtype=np.int8) == TRI_KIND_DEFAULT
+            mask &= ~optic_or_sensor
 
-            if not np.any(mask):
-                return None, "no_sensor_hits", 0
-
-            du = uv[:, 0] - float(film_u)
-            dv = uv[:, 1] - float(film_v)
-            d2 = du * du + dv * dv
-            local = mask & (d2 <= float(radius_uv) * float(radius_uv))
-            local_count = int(np.count_nonzero(local))
-            if local_count <= 0:
-                return None, "no_sensor_hits", 0
-            elif local_count > 256:
-                idx = np.flatnonzero(local)
-                order = idx[np.argsort(d2[idx], kind="stable")[:256]]
-                local = np.zeros(rows.shape[0], dtype=bool)
-                local[order] = True
-
-            sigma2 = max((0.5 * float(radius_uv)) ** 2, 1.0e-8)
-            amp = np.asarray(rows["amp"], dtype=np.complex64)
-            power = np.maximum(np.abs(amp).astype(np.float64) ** 2, 1.0e-12)
-            w = np.exp(-0.5 * d2[local] / sigma2) * power[local]
-            x = p1[local, 0]
-            finite = np.isfinite(x) & np.isfinite(w) & (w > 0.0)
-            if not np.any(finite):
-                return None, "no_sensor_hits", 0
-            focus_x = float(np.sum(x[finite] * w[finite]) / max(float(np.sum(w[finite])), 1.0e-30))
-            return focus_x, source_name, int(np.count_nonzero(finite))
-        except Exception:
+        if not np.any(mask):
             return None, "no_sensor_hits", 0
+
+        du    = uv[:, 0] - float(film_u)
+        dv    = uv[:, 1] - float(film_v)
+        d2    = du * du + dv * dv
+        local = mask & (d2 <= float(radius_uv) ** 2)
+        if int(np.count_nonzero(local)) < int(min_hits):
+            return None, "no_sensor_hits", 0
+        if int(np.count_nonzero(local)) > 256:
+            idx   = np.flatnonzero(local)
+            order = idx[np.argsort(d2[idx], kind="stable")[:256]]
+            local = np.zeros(rows.shape[0], dtype=bool)
+            local[order] = True
+
+        x     = p1[local, 0]
+        amp_v = np.asarray(rows["amp"], dtype=np.complex64)
+        power = np.maximum(np.abs(amp_v[local]).astype(np.float64) ** 2, 1.0e-12)
+        half  = np.asarray(rows["aperture_half"], dtype=np.uint8)[local]
+        finite = np.isfinite(x) & np.isfinite(power) & (power > 0.0)
+        if not np.any(finite):
+            return None, "no_sensor_hits", 0
+
+        left  = finite & (half == 0)
+        right = finite & (half == 1)
+        if np.any(left) and np.any(right):
+            w_l = power[left]
+            w_r = power[right]
+            x_l = float(np.sum(x[left] * w_l) / np.sum(w_l))
+            x_r = float(np.sum(x[right] * w_r) / np.sum(w_r))
+            focus_x = 0.5 * (x_l + x_r)
+            return focus_x, "segment_ap", int(np.count_nonzero(finite))
+
+        w = power[finite]
+        focus_x = float(np.sum(x[finite] * w) / np.sum(w))
+        return focus_x, "segment", int(np.count_nonzero(finite))
 
     def get_pdaf_phase_map(self) -> np.ndarray:
         """Return (ny, nz) array of per-site phase-like focus differences.
@@ -11989,21 +12201,44 @@ def run(
         _draw_quad_with_pip_prog(tex_lens_panel, _lrow_vx, _lrow_vy,
                                  _LROW_W, _LROW_H, hud_mode=True)
 
-        # Both sensor PIPs (blue = live viewfinder, green = BDPT plate) click
-        # → PDAF focus at the clicked pixel.  Both show sensor perspective so
-        # either is valid.  glViewport y is from BOTTOM; pygame y from TOP.
+        # Both sensor PIPs click → PDAF focus.  Account for both the CPU-side
+        # display transform and OpenGL's bottom-up texture rows.
+        #   Blue PIP: _rot180 display lands as direct top-left film UV.
+        #   Green PIP: horizontal mirror only; top-left y is already film v=0.
         _sensor_pip_y = int(H - _pip_vy - _pip_dim)
         _sensor_pip_d = int(_pip_dim)
-        for _spx in (int(_uv_pip_vx), int(_green_pip_vx)):
-            _click_buttons.append((
-                (_spx, _sensor_pip_y, _sensor_pip_d, _sensor_pip_d),
-                lambda _bench=bench, _gx=_spx, _gy=_sensor_pip_y, _gd=_sensor_pip_d: (
-                    lambda mx, my: _bench.pdaf_focus_at_film_uv(
-                        film_u=float(mx - _gx) / float(max(1, _gd)),
-                        film_v=float(my - _gy) / float(max(1, _gd)),
-                    )
-                )(*pygame.mouse.get_pos()),
-            ))
+
+        def _pdaf_click_from_pip(_bench, label: str, film_u: float, film_v: float) -> None:
+            fu = float(np.clip(film_u, 0.0, 1.0))
+            fv = float(np.clip(film_v, 0.0, 1.0))
+            print(f"[pdaf-click] pip={label} film_u={fu:.3f} film_v={fv:.3f}", flush=True)
+            _bench.pdaf_focus_at_film_uv(fu, fv, apply_focus=False)
+            target_u = getattr(_bench, "_pdaf_pending_focus_distance_m", None)
+            if target_u is not None and math.isfinite(float(target_u)):
+                _rebuild_bench_with_focus(float(target_u))
+
+        _click_buttons.append((
+            (int(_uv_pip_vx), _sensor_pip_y, _sensor_pip_d, _sensor_pip_d),
+            lambda _bench=bench, _gx=int(_uv_pip_vx), _gy=_sensor_pip_y, _gd=_sensor_pip_d: (
+                lambda mx, my: _pdaf_click_from_pip(
+                    _bench,
+                    "blue",
+                    float(mx - _gx) / float(max(1, _gd)),
+                    float(my - _gy) / float(max(1, _gd)),
+                )
+            )(*pygame.mouse.get_pos()),
+        ))
+        _click_buttons.append((
+            (int(_green_pip_vx), _sensor_pip_y, _sensor_pip_d, _sensor_pip_d),
+            lambda _bench=bench, _gx=int(_green_pip_vx), _gy=_sensor_pip_y, _gd=_sensor_pip_d: (
+                lambda mx, my: _pdaf_click_from_pip(
+                    _bench,
+                    "green",
+                    film_u=1.0 - float(mx - _gx) / float(max(1, _gd)),
+                    film_v=float(my - _gy) / float(max(1, _gd)),
+                )
+            )(*pygame.mouse.get_pos()),
+        ))
 
         # ── C++ BDPT connection/progress stats under left violet PIP ───────
         _cx_stats = bench.bdpt_last_connection_stats
@@ -12442,52 +12677,103 @@ def run(
         # Physical iris / aperture stop: fetched here so the bowtie below can use it.
         _iris_overlay = getattr(scene, "iris_aperture", None)
 
-        # Sensor FOV bowtie: marginal rays from sensor edge through aperture stop edge.
-        # When the iris is present, lines graze its rim and continue with the same slope
-        # into the scene (crossing the axis beyond the lens — correct bowtie geometry).
-        # Fallback: chief-ray bowtie converging to the entrance pupil axis point.
+        # Sensor broadcast envelope.  This replaces the old straight-line
+        # "bowtie": sample the sensor perimeter and physical gate perimeter,
+        # trace those rays through the compound lens transfer, then draw only
+        # the rays that bound the subject plane.  No passed lens ray means no
+        # overlay, because a synthetic cone would lie about the sensor image.
         _r_s   = float(getattr(getattr(scene, "image_plate", None), "radius", 0.0))
         _x_sen = float(getattr(getattr(scene, "image_plate", None), "x",      0.0))
-        _fov_half = obj_half
-        if hasattr(_asm, "optics") and _asm.optics is not None and _r_s > 1e-9:
-            _f_e = abs(float(_asm.optics.f_eff))
-            if _f_e > 1e-9:
-                _fov_half = math.atan2(_r_s, _f_e)
-        _h_fov = float(math.tan(_fov_half) * extent / yz_span)
         if _r_s > 1e-9 and _x_sen > 1e-9:
-            _x_s_n = _nx(_x_sen)
-            _h_s_n = _r_s / yz_span
-            _iris_ok = (_iris_overlay is not None
-                        and bool(getattr(_iris_overlay, "enabled", False))
-                        and abs(_nx(float(_iris_overlay.x_pos)) - _x_s_n) > 1e-6)
-            if _iris_ok:
-                _x_pinch   = _nx(float(_iris_overlay.x_pos))
-                _r_pinch_n = _nr(float(_iris_overlay.r_inner))
-                _ddx   = _x_pinch - _x_s_n
-                _slope = (_r_pinch_n - _h_s_n) / _ddx if abs(_ddx) > 1e-9 else 0.0
-                _h_far = _r_pinch_n + _slope * (x_obj_far - _x_pinch)
-                _fov_bowtie = np.array([
-                    [_x_s_n, 0.5 + _h_s_n, 0.5],       [_x_pinch, 0.5 + _r_pinch_n, 0.5],
-                    [_x_pinch, 0.5 + _r_pinch_n, 0.5],  [x_obj_far, 0.5 + _h_far, 0.5],
-                    [_x_s_n, 0.5 - _h_s_n, 0.5],       [_x_pinch, 0.5 - _r_pinch_n, 0.5],
-                    [_x_pinch, 0.5 - _r_pinch_n, 0.5],  [x_obj_far, 0.5 - _h_far, 0.5],
-                    [_x_s_n, 0.5, 0.5 + _h_s_n],       [_x_pinch, 0.5, 0.5 + _r_pinch_n],
-                    [_x_pinch, 0.5, 0.5 + _r_pinch_n],  [x_obj_far, 0.5, 0.5 + _h_far],
-                    [_x_s_n, 0.5, 0.5 - _h_s_n],       [_x_pinch, 0.5, 0.5 - _r_pinch_n],
-                    [_x_pinch, 0.5, 0.5 - _r_pinch_n],  [x_obj_far, 0.5, 0.5 - _h_far],
-                ], dtype=np.float32)
-            else:
-                _fov_bowtie = np.array([
-                    [_x_s_n, 0.5 + _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
-                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 + _h_fov, 0.5],
-                    [_x_s_n, 0.5 - _h_s_n, 0.5],  [_x_ep, 0.5, 0.5],
-                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5 - _h_fov, 0.5],
-                    [_x_s_n, 0.5, 0.5 + _h_s_n],  [_x_ep, 0.5, 0.5],
-                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 + _h_fov],
-                    [_x_s_n, 0.5, 0.5 - _h_s_n],  [_x_ep, 0.5, 0.5],
-                    [_x_ep, 0.5, 0.5],              [x_obj_far, 0.5, 0.5 - _h_fov],
-                ], dtype=np.float32)
-            _draw_lines(_fov_bowtie, 0.88, 0.88, 0.88)
+            try:
+                _gate_c, _gate_r = _asm.backward_physical_gate_target()
+            except Exception:
+                _gate_c, _gate_r = (None, 0.0)
+            _plate = getattr(scene, "image_plate", None)
+            _shw = float(getattr(_plate, "sensor_half_w", _r_s))
+            _shh = float(getattr(_plate, "sensor_half_h", _r_s))
+            if (_gate_c is not None and float(_gate_r) > 1e-9
+                    and _shw > 1e-9 and _shh > 1e-9
+                    and getattr(_asm, "optics", None) is not None):
+                _gate_c = np.asarray(_gate_c, dtype=np.float64).reshape(3)
+                _sensor_pts = []
+                _edge_n = 5
+                _lin_y = np.linspace(-_shw, _shw, _edge_n)
+                _lin_z = np.linspace(-_shh, _shh, _edge_n)
+                for _yy in _lin_y:
+                    _sensor_pts.append([_x_sen, float(_yy), -_shh])
+                    _sensor_pts.append([_x_sen, float(_yy),  _shh])
+                for _zz in _lin_z[1:-1]:
+                    _sensor_pts.append([_x_sen, -_shw, float(_zz)])
+                    _sensor_pts.append([_x_sen,  _shw, float(_zz)])
+                _gate_pts = []
+                _gate_n = 12
+                for _th in np.linspace(0.0, 2.0 * math.pi, _gate_n, endpoint=False):
+                    _gate_pts.append([
+                        float(_gate_c[0]),
+                        float(_gate_c[1]) + float(_gate_r) * math.cos(float(_th)),
+                        float(_gate_c[2]) + float(_gate_r) * math.sin(float(_th)),
+                    ])
+                _orig = np.repeat(np.asarray(_sensor_pts, dtype=np.float64), _gate_n, axis=0)
+                _apt = np.tile(np.asarray(_gate_pts, dtype=np.float64), (len(_sensor_pts), 1))
+                _dirs = _apt - _orig
+                _dn = np.linalg.norm(_dirs, axis=1)
+                _ok_dir = np.isfinite(_dn) & (_dn > 1.0e-12)
+                _orig = _orig[_ok_dir]
+                _apt = _apt[_ok_dir]
+                _dirs = _dirs[_ok_dir] / _dn[_ok_dir, None]
+                if _orig.shape[0] > 0:
+                    try:
+                        _res = _asm.optics.evaluate_bundle(RayBundle(_orig, _dirs))
+                    except Exception:
+                        _res = None
+                    if _res is None:
+                        _passed = np.zeros((_orig.shape[0],), dtype=bool)
+                    else:
+                        _passed = np.asarray(_res.status, dtype=np.int32) == int(TerminationReason.PASSED.value)
+                    if np.any(_passed):
+                        _o2 = np.asarray(_res.origins, dtype=np.float64)[_passed]
+                        _d2 = np.asarray(_res.directions, dtype=np.float64)[_passed]
+                        _s0 = _orig[_passed]
+                        _a0 = _apt[_passed]
+                        _x_subject = float(getattr(getattr(scene, "object_plane", None), "x", x_obj_far_w))
+                        _den = _d2[:, 0]
+                        _t_subject = (_x_subject - _o2[:, 0]) / np.where(np.abs(_den) > 1.0e-12, _den, np.nan)
+                        _valid_subject = np.isfinite(_t_subject) & (_t_subject > 0.0)
+                        if np.any(_valid_subject):
+                            _idx_all = np.flatnonzero(_valid_subject)
+                            _p_subject = _o2[_valid_subject] + _t_subject[_valid_subject, None] * _d2[_valid_subject]
+                            _pick = {
+                                int(_idx_all[int(np.argmin(_p_subject[:, 1]))]),
+                                int(_idx_all[int(np.argmax(_p_subject[:, 1]))]),
+                                int(_idx_all[int(np.argmin(_p_subject[:, 2]))]),
+                                int(_idx_all[int(np.argmax(_p_subject[:, 2]))]),
+                            }
+                            _near_x = max(float(scene.x_min), min(_x_subject, float(scene.x_min)))
+                            _scene_x = float(scene.x_min)
+                            _in_lines = []
+                            _out_lines = []
+                            for _ii in sorted(_pick):
+                                _sx = _s0[_ii]
+                                _gx = _a0[_ii]
+                                _oo = _o2[_ii]
+                                _dd = _d2[_ii]
+                                _t_scene = (_scene_x - float(_oo[0])) / float(_dd[0]) if abs(float(_dd[0])) > 1.0e-12 else float("nan")
+                                if not math.isfinite(_t_scene) or _t_scene <= 0.0:
+                                    _t_scene = _t_subject[_ii]
+                                _far = _oo + float(_t_scene) * _dd
+                                _in_lines.extend([
+                                    [_nx(float(_sx[0])), 0.5 + float(_sx[1]) / yz_span, 0.5 + float(_sx[2]) / yz_span],
+                                    [_nx(float(_gx[0])), 0.5 + float(_gx[1]) / yz_span, 0.5 + float(_gx[2]) / yz_span],
+                                ])
+                                _out_lines.extend([
+                                    [_nx(float(_oo[0])), 0.5 + float(_oo[1]) / yz_span, 0.5 + float(_oo[2]) / yz_span],
+                                    [_nx(float(_far[0])), 0.5 + float(_far[1]) / yz_span, 0.5 + float(_far[2]) / yz_span],
+                                ])
+                            if _in_lines:
+                                _draw_lines(np.asarray(_in_lines, dtype=np.float32), 0.35, 0.52, 0.62)
+                            if _out_lines:
+                                _draw_lines(np.asarray(_out_lines, dtype=np.float32), 0.90, 0.96, 1.0)
 
         # 10 cm scale stick at object plane (orange), perpendicular to axis.
         # Gives a real-world reference to judge how wide the FOV cone actually is.
@@ -13718,7 +14004,15 @@ def run(
             # Apply any pending LUT/MLP transition from the background worker.
             bench._poll_assembly_mode_switch()
 
-            glClearColor(8/255, 8/255, 10/255, 1.0)
+            try:
+                glClearColor(8/255, 8/255, 10/255, 1.0)
+            except Exception as _gl_ctx_err:
+                # Display GL context was invalidated by the WGL-shared hidden
+                # compute context (typically after a pipeline reset during live
+                # focus/zoom).  All shaders and VAOs are stale — exit cleanly.
+                print(f"[gl-ctx] display context lost ({_gl_ctx_err}) — exiting", flush=True)
+                closing.set()
+                continue
             glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
             glDepthFunc(GL_LEQUAL)
             glViewport(0, 0, W, H)

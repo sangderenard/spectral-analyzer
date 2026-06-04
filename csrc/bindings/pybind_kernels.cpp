@@ -2602,6 +2602,8 @@ struct PyRayTracer
         out["t4"]                 = stage_dict(s.t4);
         out["t5"]                 = stage_dict(s.t5);
         out["output_queue_depth"] = s.output_queue_depth;
+        out["intent_queue_depth"] = s.intent_queue_depth;
+        out["intent_queue_done"]  = s.intent_queue_done;
         out["in_flight"]          = s.in_flight;
         out["gpu_uv_readback_mb"] = static_cast<double>(s.gpu_uv_readback_bytes) / (1024.0 * 1024.0);
         out["gpu_uv_readback_count"] = static_cast<unsigned long long>(s.gpu_uv_readback_count);

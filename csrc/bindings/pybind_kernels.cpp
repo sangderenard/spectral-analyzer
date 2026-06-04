@@ -1643,6 +1643,9 @@ struct PyRayTracer
             ri.src_id        = sp ? sp[i] : i;
             ri.tag           = tp ? tp[i] : static_cast<uint64_t>(i);
             ri.color_flag    = cp ? cp[i] : 0u;
+            const uint8_t film_channel = static_cast<uint8_t>((ri.tag >> 60) & 0x3u);
+            if (ri.color_flag == 1u && film_channel == 1u)
+                ri.priority = 1.0e9f;
             ri.bounces_left  = max_bounces;
             ri.min_amplitude = min_amplitude;
             uint32_t bdpt_sid = _bdpt_subpath_counter.fetch_add(1u, std::memory_order_relaxed);
@@ -1876,7 +1879,7 @@ struct PyRayTracer
 
     /* Slim drain: returns only the 7 arrays needed by the voxel accumulator.
      * Allocates ~5× less memory than drain_records() per call.
-     * Keys: kind (uint8), tag (uint64), bounce (int32), seg_start (N,3 f32),
+     * Keys: kind (uint8), tag (uint64), src_id (int32), bounce (int32), seg_start (N,3 f32),
      *       pos (N,3 f32), color_flag (uint8), hit_tri (int32), mat_idx (int32),
      *       sensor_origin_y/z (float32), amp_re (N,n_bands f32), amp_im. */
     py::dict drain_records_slim(int max_n = 50000)
@@ -1892,6 +1895,7 @@ struct PyRayTracer
 
         py::array_t<uint8_t> kind_arr(N);
         py::array_t<uint64_t> tag_arr(N);
+        py::array_t<int32_t> src_id_arr(N);
         py::array_t<int32_t> bounce_arr(N);
         py::array_t<float>   seg_start_arr({(py::ssize_t)N, (py::ssize_t)3});
         py::array_t<float>   pos_arr      ({(py::ssize_t)N, (py::ssize_t)3});
@@ -1907,6 +1911,7 @@ struct PyRayTracer
         if (N > 0) {
             auto* k  = kind_arr       .mutable_data();
             auto* tg = tag_arr        .mutable_data();
+            auto* si = src_id_arr     .mutable_data();
             auto* bo = bounce_arr     .mutable_data();
             auto* ss = seg_start_arr  .mutable_data();
             auto* po = pos_arr        .mutable_data();
@@ -1922,6 +1927,7 @@ struct PyRayTracer
                 const RayRecord& r = recs[i];
                 k[i]  = static_cast<uint8_t>(r.kind);
                 tg[i] = r.tag;
+                si[i] = r.src_id;
                 bo[i] = r.bounce;
                 ss[i*3+0]=r.seg_start[0]; ss[i*3+1]=r.seg_start[1]; ss[i*3+2]=r.seg_start[2];
                 po[i*3+0]=r.pos[0];       po[i*3+1]=r.pos[1];       po[i*3+2]=r.pos[2];
@@ -1939,6 +1945,7 @@ struct PyRayTracer
         py::dict out;
         out["kind"]        = kind_arr;
         out["tag"]         = tag_arr;
+        out["src_id"]      = src_id_arr;
         out["bounce"]      = bounce_arr;
         out["seg_start"]   = seg_start_arr;
         out["pos"]         = pos_arr;

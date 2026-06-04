@@ -277,6 +277,16 @@ public:
         return true;
     }
 
+    bool push_front(T item) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (done_) return false;
+            q_.push_front(std::move(item));
+        }
+        cv_.notify_one();
+        return true;
+    }
+
     void push_many(std::vector<T>& items) {
         if (items.empty()) return;
         {
@@ -286,6 +296,34 @@ public:
                 return;
             }
             for (T& item : items)
+                q_.push_back(std::move(item));
+        }
+        cv_.notify_one();
+        items.clear();
+    }
+
+    template<typename KeyFn>
+    void push_many_priority(std::vector<T>& items, KeyFn key_fn, float front_threshold = 1.0f) {
+        if (items.empty()) return;
+        std::vector<T> high;
+        std::vector<T> normal;
+        high.reserve(items.size());
+        normal.reserve(items.size());
+        for (T& item : items) {
+            if (key_fn(item) > front_threshold)
+                high.push_back(std::move(item));
+            else
+                normal.push_back(std::move(item));
+        }
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (done_) {
+                items.clear();
+                return;
+            }
+            for (auto it = high.rbegin(); it != high.rend(); ++it)
+                q_.push_front(std::move(*it));
+            for (T& item : normal)
                 q_.push_back(std::move(item));
         }
         cv_.notify_one();
@@ -382,12 +420,149 @@ public:
         return n;
     }
 
+    template<typename KeyFn>
+    int pop_batch_exclusive_priority(std::vector<T>& out, int max_n, KeyFn key_fn,
+                                     float threshold = 1.0f) {
+        if (max_n <= 0) return 0;
+        for (int s = 0; s < 8; ++s) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (done_) return 0;
+                if (!q_.empty()) goto take;
+            }
+            std::this_thread::yield();
+        }
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [this]{ return !q_.empty() || done_; });
+            if (done_ || q_.empty()) return 0;
+        }
+    take:
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (done_) return 0;
+            bool has_hi = false;
+            for (const T& item : q_) {
+                if (key_fn(item) > threshold) {
+                    has_hi = true;
+                    break;
+                }
+            }
+            int n = 0;
+            if (has_hi) {
+                for (auto it = q_.begin(); it != q_.end() && n < max_n; ) {
+                    if (key_fn(*it) > threshold) {
+                        out.push_back(std::move(*it));
+                        it = q_.erase(it);
+                        ++n;
+                    } else {
+                        ++it;
+                    }
+                }
+            } else {
+                n = std::min(max_n, (int)q_.size());
+                for (int i = 0; i < n; ++i) {
+                    out.push_back(std::move(q_.front()));
+                    q_.pop_front();
+                }
+            }
+            return n;
+        }
+    }
+
+    template<typename KeyFn>
+    int pop_batch_exclusive_priority_timed(std::vector<T>& out, int max_n, KeyFn key_fn,
+                                           int timeout_ms = 5, float threshold = 1.0f) {
+        if (max_n <= 0) return 0;
+        for (int s = 0; s < 8; ++s) {
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                if (done_) return 0;
+                if (!q_.empty()) goto take;
+            }
+            std::this_thread::yield();
+        }
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            const bool fired = cv_.wait_for(
+                lk, std::chrono::milliseconds(timeout_ms),
+                [this]{ return !q_.empty() || done_; });
+            if (done_ && q_.empty()) return 0;
+            if (!fired || q_.empty()) return -1;
+        }
+    take:
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (done_ && q_.empty()) return 0;
+            if (q_.empty()) return -1;
+            bool has_hi = false;
+            for (const T& item : q_) {
+                if (key_fn(item) > threshold) {
+                    has_hi = true;
+                    break;
+                }
+            }
+            int n = 0;
+            if (has_hi) {
+                for (auto it = q_.begin(); it != q_.end() && n < max_n; ) {
+                    if (key_fn(*it) > threshold) {
+                        out.push_back(std::move(*it));
+                        it = q_.erase(it);
+                        ++n;
+                    } else {
+                        ++it;
+                    }
+                }
+            } else {
+                n = std::min(max_n, (int)q_.size());
+                for (int i = 0; i < n; ++i) {
+                    out.push_back(std::move(q_.front()));
+                    q_.pop_front();
+                }
+            }
+            return n;
+        }
+    }
+
     /* Non-blocking drain — takes up to max_n items immediately.
      * Appends to out.  Returns count taken (0 if empty). */
     int drain(std::vector<T>& out, int max_n) {
         std::lock_guard<std::mutex> lk(mu_);
         int n = std::min(max_n, (int)q_.size());
         for (int i = 0; i < n; ++i) { out.push_back(std::move(q_.front())); q_.pop_front(); }
+        return n;
+    }
+
+    template<typename KeyFn>
+    int drain_exclusive_priority(std::vector<T>& out, int max_n, KeyFn key_fn,
+                                 float threshold = 1.0f) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (max_n <= 0 || q_.empty()) return 0;
+        bool has_hi = false;
+        for (const T& item : q_) {
+            if (key_fn(item) > threshold) {
+                has_hi = true;
+                break;
+            }
+        }
+        int n = 0;
+        if (has_hi) {
+            for (auto it = q_.begin(); it != q_.end() && n < max_n; ) {
+                if (key_fn(*it) > threshold) {
+                    out.push_back(std::move(*it));
+                    it = q_.erase(it);
+                    ++n;
+                } else {
+                    ++it;
+                }
+            }
+        } else {
+            n = std::min(max_n, (int)q_.size());
+            for (int i = 0; i < n; ++i) {
+                out.push_back(std::move(q_.front()));
+                q_.pop_front();
+            }
+        }
         return n;
     }
 

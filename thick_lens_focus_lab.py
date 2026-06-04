@@ -4212,6 +4212,8 @@ BDPT_FILM_TAG_MASK = np.uint64((1 << BDPT_FILM_TAG_UV_BITS) - 1)
 # Bit 62 carries the aperture half (0 = left, 1 = right) so the label survives
 # through all GPU bounces without a separate per-ray side-channel.
 BDPT_FILM_TAG_APERTURE_HALF_BIT = np.uint64(1) << np.uint64(62)
+BDPT_SENSOR_CHANNEL_DEFAULT = np.uint8(0)
+BDPT_SENSOR_CHANNEL_PDAF_PROBE = np.uint8(1)
 
 
 def _pack_bdpt_film_tag(channel_idx: np.ndarray, film_uv: np.ndarray) -> np.ndarray:
@@ -4221,6 +4223,11 @@ def _pack_bdpt_film_tag(channel_idx: np.ndarray, film_uv: np.ndarray) -> np.ndar
     v = np.rint(uv[:, 1] * q).astype(np.uint64) & BDPT_FILM_TAG_MASK
     ch = (np.asarray(channel_idx, dtype=np.uint64) & np.uint64(0x3)) << BDPT_FILM_TAG_CHANNEL_SHIFT
     return BDPT_FILM_TAG_FLAG | ch | (u << BDPT_FILM_TAG_UV_SHIFT) | v
+
+
+def _bdpt_film_tag_channel(tags: np.ndarray) -> np.ndarray:
+    t = np.asarray(tags, dtype=np.uint64)
+    return ((t >> BDPT_FILM_TAG_CHANNEL_SHIFT) & np.uint64(0x3)).astype(np.uint8)
 
 
 def _unpack_bdpt_film_tag(tags: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -4292,6 +4299,7 @@ BDPT_SEGMENT_DTYPE = np.dtype([
     ("dir", "f4", (3,)),
     ("amp", "c8"),
     ("film_uv", "f4", (2,)),
+    ("tag", "u8"),
     ("path_len", "f4"),
     ("pdf_fwd", "f4"),
     ("pdf_rev", "f4"),
@@ -5406,6 +5414,9 @@ class ForwardCppLensBench:
         self._sensor_ray_cache: SensorRayCache = SensorRayCache()
         self._emitter_ray_cache: SensorRayCache = SensorRayCache()
         self._pdaf_grid: PhaseSensorGrid = PhaseSensorGrid()
+        self._pdaf_probe_launched: int = 0
+        self._pdaf_probe_seen_src_ids: set[int] = set()
+        self._pdaf_probe_terminal_src_ids: set[int] = set()
         # Ordered BDPT flow: submit complete Mortonized chunks instead of
         # full-frame/full-emitter launches, so downstream transport stays small.
         self.bdpt_ordered_sensor_batch_rays: int = 8_192
@@ -7773,6 +7784,7 @@ class ForwardCppLensBench:
         _pdf_fwd_map: dict[int, float] = {}
         _pdf_rev_map: dict[int, float] = {}
 
+        tag_event = np.asarray(tags[event_idx], dtype=np.uint64)
         rows = np.empty(int(ev_rel.size), dtype=BDPT_SEGMENT_DTYPE)
         rows["subpath_id"] = base_ids[ev_rel]
         rows["band"] = band_ids.astype(np.uint32, copy=False)
@@ -7788,9 +7800,9 @@ class ForwardCppLensBench:
             np.clip(film_uv[event_idx], 0.0, 1.0),
             np.zeros((event_idx.shape[0], 2), dtype=np.float32),
         )
+        rows["tag"] = tag_event
         rows["path_len"] = path_len[event_idx].astype(np.float32, copy=False)
         is_bwd_ev = cflags[event_idx] == 1
-        tag_event = np.asarray(tags[event_idx], dtype=np.uint64)
         bwd_strat = _lookup_tag_values(
             tag_event,
             self._backward_launch_pdf_by_tag,
@@ -9362,7 +9374,7 @@ class ForwardCppLensBench:
             np.asarray([[float(film_u), float(film_v)]], dtype=np.float32),
             (n, 1),
         )
-        channel_idx = np.zeros(n, dtype=np.uint8)
+        channel_idx = np.full(n, int(BDPT_SENSOR_CHANNEL_PDAF_PROBE), dtype=np.uint8)
         aperture_half_arr = ((target_pts[valid, 1] - center[1]) >= 0.0).astype(np.uint64)
         tags = (_pack_bdpt_film_tag(channel_idx, film_uv)
                 | (aperture_half_arr << np.uint64(62)))
@@ -9371,8 +9383,11 @@ class ForwardCppLensBench:
             complex(float(max(0.0, self.sensor_amp_gain)), 0.0),
             dtype=np.complex128,
         )
-        src_ids = np.zeros(n, dtype=np.int32)
+        src_ids = np.arange(n, dtype=np.int32)
         color_flags = np.ones(n, dtype=np.uint8)
+        self._pdaf_probe_launched = int(n)
+        self._pdaf_probe_seen_src_ids = set()
+        self._pdaf_probe_terminal_src_ids = set()
         _use_gpu = self.compute_mode in ("gpu", "mixed")
         _all_gpu = self.compute_mode == "gpu"
         try:
@@ -9422,10 +9437,18 @@ class ForwardCppLensBench:
             stats_after_submit = self.tracer.pipeline_stats()
             q_after = int(stats_after_submit.get("intent_queue_depth", -1))
             q_done_after = int(stats_after_submit.get("intent_queue_done", -1))
+            t1_after_submit = int(stats_after_submit.get("t1", {}).get("gpu_processed", 0)) + int(stats_after_submit.get("t1", {}).get("processed", 0))
         except Exception:
             inflight_after = -1
             q_after = -1
             q_done_after = -1
+            t1_after_submit = t1_before
+        queued_delta = max(0, q_after - q_before) if q_after >= 0 and q_before >= 0 else -1
+        started_delta = max(0, int(t1_after_submit) - int(t1_before))
+        queued_or_started = (
+            int(queued_delta if queued_delta >= 0 else 0)
+            + int(min(n, started_delta))
+        )
         self._pdaf_probe_submit_diag = {
             "rays": int(n),
             "t1_before": int(t1_before),
@@ -9436,14 +9459,19 @@ class ForwardCppLensBench:
             "q_after": int(q_after),
             "q_done_before": int(q_done_before),
             "q_done_after": int(q_done_after),
+            "queued_delta": int(queued_delta),
+            "queued_or_started": int(queued_or_started),
         }
         print(
             "[pdaf-probe-submit]",
             f"rays={n}",
+            "priority=exclusive-front",
             f"inflight_before={inflight_before}",
             f"inflight_after={inflight_after}",
             f"q_before={q_before}",
             f"q_after={q_after}",
+            f"queued_delta={queued_delta}",
+            f"queued_or_started={queued_or_started}/{n}",
             f"q_done={q_done_after}",
             flush=True,
         )
@@ -9453,7 +9481,7 @@ class ForwardCppLensBench:
 
     def _drain_pdaf_probe_records_once(self, film_u: float, film_v: float) -> tuple[int, int, int]:
         """Synchronously drain native records for PDAF instead of waiting on the
-        background drain thread.  Returns (records, sensor_records, local_records)."""
+        background drain thread.  Returns (records, probe_records, local_records)."""
         try:
             with self._pipeline_drain_lock:
                 records = self.tracer.drain_records_slim(max_n=1_000_000)
@@ -9465,18 +9493,37 @@ class ForwardCppLensBench:
             return 0, 0, 0
         self._fast_bdpt_feed(records, drain_epoch=int(getattr(self, "_pipeline_reset_epoch", 0)))
         try:
+            kinds = np.asarray(records.get("kind", []), dtype=np.uint8)
             cflags = np.asarray(records.get("color_flag", []), dtype=np.uint8)
             tags = np.asarray(records.get("tag", []), dtype=np.uint64)
-            sensor_n = int(np.count_nonzero(cflags == 1))
-            _valid, uv = _unpack_bdpt_film_tag(tags)
+            src_ids = np.asarray(
+                records.get("src_id", np.full(tags.shape[0], -1, dtype=np.int32)),
+                dtype=np.int32,
+            )
+            tag_channel = _bdpt_film_tag_channel(tags)
+            valid_tag, uv = _unpack_bdpt_film_tag(tags)
+            probe_mask = (
+                (cflags == 1)
+                & valid_tag
+                & (tag_channel == int(BDPT_SENSOR_CHANNEL_PDAF_PROBE))
+            )
+            probe_n = int(np.count_nonzero(probe_mask))
+            if probe_n > 0 and src_ids.shape[0] == tags.shape[0]:
+                launched = int(getattr(self, "_pdaf_probe_launched", 0))
+                valid_src = probe_mask & (src_ids >= 0)
+                if launched > 0:
+                    valid_src &= src_ids < launched
+                self._pdaf_probe_seen_src_ids.update(int(x) for x in np.unique(src_ids[valid_src]))
+                terminal_mask = valid_src & ((kinds == 1) | (kinds == 2))
+                self._pdaf_probe_terminal_src_ids.update(int(x) for x in np.unique(src_ids[terminal_mask]))
             d2 = (uv[:, 0].astype(np.float64) - float(film_u)) ** 2 + (
                 uv[:, 1].astype(np.float64) - float(film_v)
             ) ** 2
-            local_n = int(np.count_nonzero((cflags == 1) & (d2 <= 0.015 ** 2)))
+            local_n = int(np.count_nonzero(probe_mask & (d2 <= 0.015 ** 2)))
         except Exception:
-            sensor_n = 0
+            probe_n = 0
             local_n = 0
-        return n, sensor_n, local_n
+        return n, probe_n, local_n
 
     def _pdaf_wait_for_scene_x(
         self,
@@ -9488,78 +9535,42 @@ class ForwardCppLensBench:
         """Barrier for the just-injected PDAF depth probe.
 
         With timeout_s=None this only returns after the probe has produced a
-        usable clicked depth, or after the submitted primary rays have been
-        demonstrably processed and drained.
+        usable clicked depth, or after terminal/miss records have arrived for
+        every ray in the PDAF-tagged probe bundle.
         """
         deadline = None
         if timeout_s is not None and float(timeout_s) > 0.0:
             deadline = time.perf_counter() + float(timeout_s)
         last: tuple[Optional[float], str, int] = (None, "no_sensor_hits", 0)
         drained_total = 0
-        sensor_total = 0
+        probe_total = 0
         local_total = 0
         polls = 0
         last_heartbeat = time.perf_counter()
         while True:
-            n_rec, n_sensor, n_local = self._drain_pdaf_probe_records_once(float(film_u), float(film_v))
+            n_rec, n_probe, n_local = self._drain_pdaf_probe_records_once(float(film_u), float(film_v))
             drained_total += int(n_rec)
-            sensor_total += int(n_sensor)
+            probe_total += int(n_probe)
             local_total += int(n_local)
             last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
             if last[0] is not None:
                 self._print_pdaf_probe_wait_diag(
-                    drained_total, sensor_total, local_total, polls, found=True)
+                    drained_total, probe_total, local_total, polls, found=True)
                 return last
-            try:
-                stats_now = self.tracer.pipeline_stats()
-                before = getattr(self, "_pdaf_probe_submit_diag", {}) or {}
-                rays = int(before.get("rays", 0))
-                t1_now = int(stats_now.get("t1", {}).get("gpu_processed", 0)) + int(stats_now.get("t1", {}).get("processed", 0))
-                t3_now = int(stats_now.get("t3", {}).get("gpu_processed", 0)) + int(stats_now.get("t3", {}).get("processed", 0))
-                t1_delta = t1_now - int(before.get("t1_before", 0))
-                t3_delta = t3_now - int(before.get("t3_before", 0))
-                records_seen = drained_total > 0 or sensor_total > 0 or local_total > 0
-                if records_seen and rays > 0 and (t1_delta >= rays or t3_delta >= rays):
-                    n_rec, n_sensor, n_local = self._drain_pdaf_probe_records_once(float(film_u), float(film_v))
-                    drained_total += int(n_rec)
-                    sensor_total += int(n_sensor)
-                    local_total += int(n_local)
-                    last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
-                    self._print_pdaf_probe_wait_diag(
-                        drained_total, sensor_total, local_total, polls, found=last[0] is not None)
-                    return last
-            except Exception:
-                pass
-            try:
-                if int(self.tracer.in_flight_count()) == 0:
-                    n_rec, n_sensor, n_local = self._drain_pdaf_probe_records_once(float(film_u), float(film_v))
-                    drained_total += int(n_rec)
-                    sensor_total += int(n_sensor)
-                    local_total += int(n_local)
-                    last = self._pdaf_scene_x_for_film_uv(float(film_u), float(film_v))
-                    before = getattr(self, "_pdaf_probe_submit_diag", {}) or {}
-                    stats_now = self.tracer.pipeline_stats()
-                    rays = int(before.get("rays", 0))
-                    t1_now = int(stats_now.get("t1", {}).get("gpu_processed", 0)) + int(stats_now.get("t1", {}).get("processed", 0))
-                    t3_now = int(stats_now.get("t3", {}).get("gpu_processed", 0)) + int(stats_now.get("t3", {}).get("processed", 0))
-                    t1_delta = t1_now - int(before.get("t1_before", 0))
-                    t3_delta = t3_now - int(before.get("t3_before", 0))
-                    records_seen = drained_total > 0 or sensor_total > 0 or local_total > 0
-                    processed = rays > 0 and (t1_delta >= rays or t3_delta >= rays)
-                    if records_seen or processed:
-                        self._print_pdaf_probe_wait_diag(
-                            drained_total, sensor_total, local_total, polls, found=last[0] is not None)
-                        return last
-            except Exception:
-                pass
+            launched = int(getattr(self, "_pdaf_probe_launched", 0))
+            completed = len(getattr(self, "_pdaf_probe_terminal_src_ids", set()))
+            if launched > 0 and completed >= launched:
+                self._print_pdaf_probe_wait_diag(
+                    drained_total, probe_total, local_total, polls, found=False)
+                return last
             if deadline is not None and time.perf_counter() >= deadline:
                 self._print_pdaf_probe_wait_diag(
-                    drained_total, sensor_total, local_total, polls, found=False)
+                    drained_total, probe_total, local_total, polls, found=False)
                 return last
             now = time.perf_counter()
             if now - last_heartbeat >= 1.0:
                 self._print_pdaf_probe_wait_diag(
-                    drained_total, sensor_total, local_total, polls, found=False)
+                    drained_total, probe_total, local_total, polls, found=False)
                 last_heartbeat = now
             polls += 1
             time.sleep(0.015)
@@ -9567,7 +9578,7 @@ class ForwardCppLensBench:
     def _print_pdaf_probe_wait_diag(
         self,
         drained_total: int,
-        sensor_total: int,
+        probe_total: int,
         local_total: int,
         polls: int,
         *,
@@ -9597,8 +9608,10 @@ class ForwardCppLensBench:
             f"found={int(bool(found))}",
             f"polls={int(polls)}",
             f"native_drained={int(drained_total)}",
-            f"sensor_records={int(sensor_total)}",
+            f"probe_records={int(probe_total)}",
             f"local_records={int(local_total)}",
+            f"probe_seen={len(getattr(self, '_pdaf_probe_seen_src_ids', set()))}/{int(getattr(self, '_pdaf_probe_launched', 0))}",
+            f"probe_done={len(getattr(self, '_pdaf_probe_terminal_src_ids', set()))}/{int(getattr(self, '_pdaf_probe_launched', 0))}",
             f"segment_rows={seg_rows}",
             f"t1_delta={t1_delta}",
             f"t3_delta={t3_delta}",
@@ -9642,11 +9655,19 @@ class ForwardCppLensBench:
         if rows is None or rows.size == 0:
             return None, "no_sensor_hits", 0
 
+        names = rows.dtype.names or ()
+        if "tag" not in names:
+            return None, "no_sensor_hits", 0
+        tags = np.asarray(rows["tag"], dtype=np.uint64)
+        valid_tag, _ = _unpack_bdpt_film_tag(tags)
+        probe_channel = _bdpt_film_tag_channel(tags) == int(BDPT_SENSOR_CHANNEL_PDAF_PROBE)
         uv   = np.asarray(rows["film_uv"], dtype=np.float64)
         p1   = np.asarray(rows["p1"],      dtype=np.float64)
         mask = (
             (np.asarray(rows["stream"],        dtype=np.uint8)  == 1)
             & (np.asarray(rows["sample_domain"], dtype=np.uint8) == int(BDPT_SAMPLE_DOMAIN_FILM_APERTURE))
+            & valid_tag
+            & probe_channel
             & np.all(np.isfinite(uv), axis=1)
             & np.all(np.isfinite(p1), axis=1)
         )

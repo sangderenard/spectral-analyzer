@@ -9631,13 +9631,22 @@ public:
              * while the GPU thread is stuck in an infinite cv_.wait).      */
             batch.clear();
             int gpu_bsz = ps.stats[0].batch_sz_gpu.load(std::memory_order_relaxed);
-            int n = ps.Q_intent.pop_batch_timed(batch, gpu_bsz, /*ms=*/5);
+            int n = ps.Q_intent.pop_batch_exclusive_priority_timed(
+                batch,
+                gpu_bsz,
+                [](const RayIntent& ri) { return ri.priority; },
+                /*ms=*/5,
+                1.0f);
 
             /* Non-blocking drain of Q_wave — never stall here; the CPU T4
              * worker is absent when use_gpu_compute=true so we opportunistically
              * pick up any wave intents that have accumulated.              */
             wave_batch.clear();
-            ps.Q_wave.drain(wave_batch, gpu_bsz);
+            ps.Q_wave.drain_exclusive_priority(
+                wave_batch,
+                gpu_bsz,
+                [](const WaveIntent& wi) { return wi.ray.priority; },
+                1.0f);
 
             /* Timeout: Q_intent is empty but pipeline is still running.
              * If in_flight==0, every ray (all bounce generations) has finished
@@ -9654,7 +9663,11 @@ public:
              * final wave drain before leaving so nothing is orphaned.     */
             if (n == 0) {
                 /* Final wave drain */
-                ps.Q_wave.drain(wave_batch, gpu_bsz);
+                ps.Q_wave.drain_exclusive_priority(
+                    wave_batch,
+                    gpu_bsz,
+                    [](const WaveIntent& wi) { return wi.ray.priority; },
+                    1.0f);
                 for (auto& wi : wave_batch) {
                     if (wi.arena_id >= 0 && wi.arena_id < (int)ps.arenas.size())
                         dispatch_t4_step(ps, ps.arenas[static_cast<size_t>(wi.arena_id)]);
@@ -10289,7 +10302,10 @@ static void pipeline_spawn_child(RayPipelineState& ps, RayIntent child)
     const uint8_t cf = child.color_flag;
     ++ps.in_flight;
     bdpt_family_spawn(ps, cf);
-    ps.Q_intent.push(std::move(child));
+    if (child.priority > 1.0f)
+        ps.Q_intent.push_front(std::move(child));
+    else
+        ps.Q_intent.push(std::move(child));
 }
 
 /* ── T1: intersector ──────────────────────────────────────────────────────── */
@@ -10304,18 +10320,14 @@ static void pipeline_intersector(RayPipelineState& ps)
     std::vector<HitRecord> hit_batch;
     std::vector<WaveIntent> wave_batch;
     int finish_count = 0;
-    std::mt19937 t1_rng(static_cast<uint32_t>(ps.cfg.seed) ^ 0xDEADBEEFu);
-
     while (true) {
         batch.clear();
         int bsz = ps.stats[0].batch_sz.load(std::memory_order_relaxed);
-        float shuf = ps.cfg.intent_queue_shuffle;
-        int n;
-        if (shuf > 0.0f) {
-            n = ps.Q_intent.pop_batch_shuffled(batch, bsz, shuf, t1_rng);
-        } else {
-            n = ps.Q_intent.pop_batch(batch, bsz);
-        }
+        int n = ps.Q_intent.pop_batch_exclusive_priority(
+            batch,
+            bsz,
+            [](const RayIntent& ri) { return ri.priority; },
+            1.0f);
         if (n == 0) break;
 
         auto t0 = Clock::now();
@@ -10580,7 +10592,11 @@ static void pipeline_refiner(RayPipelineState& ps)
     while (true) {
         batch.clear();
         int bsz = ps.stats[1].batch_sz.load(std::memory_order_relaxed);
-        int n   = ps.Q_hit.pop_batch(batch, bsz);
+        int n   = ps.Q_hit.pop_batch_exclusive_priority(
+            batch,
+            bsz,
+            [](const HitRecord& hr) { return hr.ray.priority; },
+            1.0f);
         if (n == 0) break;
         auto t0 = Clock::now();
 
@@ -10704,7 +10720,10 @@ static void pipeline_refiner(RayPipelineState& ps)
                     ri.amp            = std::move(tamp);
                     ri.path_len       = tpl;
                     ri.medium_mat_idx = -1;
-                    ps.Q_intent.push(std::move(ri));
+                    if (ri.priority > 1.0f)
+                        ps.Q_intent.push_front(std::move(ri));
+                    else
+                        ps.Q_intent.push(std::move(ri));
                     continue;  /* skip refined_batch; don't touch in_flight */
                 }
             }
@@ -10775,7 +10794,11 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
     while (true) {
         batch.clear();
         int bsz = ps.stats[2].batch_sz.load(std::memory_order_relaxed);
-        int n   = ps.Q_refined.pop_batch(batch, bsz);
+        int n   = ps.Q_refined.pop_batch_exclusive_priority(
+            batch,
+            bsz,
+            [](const RefinedHit& rh) { return rh.base.ray.priority; },
+            1.0f);
         if (n == 0) break;
         auto t0 = Clock::now();
         out_batch.clear();
@@ -11256,7 +11279,10 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
         ps.push_bdpt_pdf_many(bdpt_pdf_batch);
         ps.push_bdpt_spectral_many(bdpt_spectral_batch);
         ps.Q_out.push_many(out_batch);
-        ps.Q_intent.push_many(child_batch);
+        ps.Q_intent.push_many_priority(
+            child_batch,
+            [](const RayIntent& ri) { return ri.priority; },
+            1.0f);
         for (uint8_t cf : finish_batch)
             pipeline_finish_ray(ps, cf);
 
@@ -11277,7 +11303,11 @@ static void pipeline_wave_solver(RayPipelineState& ps)
     while (true) {
         batch.clear();
         int bsz = ps.stats[3].batch_sz.load(std::memory_order_relaxed);
-        int n   = ps.Q_wave.pop_batch(batch, bsz);
+        int n   = ps.Q_wave.pop_batch_exclusive_priority(
+            batch,
+            bsz,
+            [](const WaveIntent& wi) { return wi.ray.priority; },
+            1.0f);
         if (n == 0) break;
         auto t0 = Clock::now();
 
@@ -11524,9 +11554,12 @@ void ray_pipeline_submit(
             ps->bdpt_inflight_sensor.fetch_add(1, std::memory_order_release);
         else
             ps->bdpt_inflight_flash.fetch_add(1, std::memory_order_release);
-        const bool accepted = (max_q > 0)
-            ? ps->Q_intent.push_bounded(std::move(ri), max_q)
-            : ps->Q_intent.push(std::move(ri));
+        const bool high_priority = ri.priority > 1.0f;
+        const bool accepted = high_priority
+            ? ps->Q_intent.push_front(std::move(ri))
+            : ((max_q > 0)
+                ? ps->Q_intent.push_bounded(std::move(ri), max_q)
+                : ps->Q_intent.push(std::move(ri)));
         if (!accepted) {
             ps->in_flight.fetch_sub(1, std::memory_order_acq_rel);
             if (color_flag == 1u)

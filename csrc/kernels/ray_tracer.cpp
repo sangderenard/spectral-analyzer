@@ -7651,10 +7651,20 @@ struct RayPipelineState {
     float                     sensor_half_h = 0.0f;
     float                     sensor_eps  = 0.008f;
     float                     sensor_target_x = 0.0f;
+    float                     sensor_target_y = 0.0f;
+    float                     sensor_target_z = 0.0f;
     float                     sensor_target_r = 0.0f;
+    int                       sensor_target_mode = 0; /* 0=toward, 1=away_from_virtual */
     std::vector<double>       sensor_accum;       /* res*res*4 doubles: ch0=R, ch1=G, ch2=B (spectral), ch3=near-miss */
     std::vector<float>        priority_map;       /* res*res sugar-auxin field (1.0 = baseline) */
     mutable double            sensor_peak[4]      = {1e-30, 1e-30, 1e-30, 1e-30}; /* running per-channel max, never decreases */
+
+    /* GPU sensor shadow — updated by the GPU thread from ssbo_sensor_rgb at
+     * display cadence; read by ray_pipeline_get_sensor_image() when the
+     * gpu_skip_record_readback production mode is active. */
+    mutable std::mutex        sensor_gpu_mu;
+    std::vector<uint32_t>     sensor_accum_gpu;   /* 3 × res² float-CAS uint32 shadow */
+    mutable double            sensor_peak_gpu[3]  = {1e-30, 1e-30, 1e-30};
 
     /* Set by ray_pipeline_destroy before set_done(); checked by T5 inner loop
      * and gpu_dispatch thread_main to exit without finishing in-flight work. */
@@ -7663,6 +7673,10 @@ struct RayPipelineState {
     /* ── GPU compute dispatch (nullptr = CPU-only) ─────────────────────────── */
     class GlPipelineDispatch;                       /* forward-declared below    */
     GlPipelineDispatch*       gpu_dispatch = nullptr;
+
+    /* Set by bdpt_update_inflight when production mode && both inflight == 0.
+     * Checked by the GPU thread to trigger service_gpu_native_t5(). */
+    std::atomic<bool>         bdpt_gpu_t5_pending{false};
 
     /* GPU dispatch health state (atomic, readable from any thread/Python):
      *   0 = disabled (use_gpu_compute=false)
@@ -7739,6 +7753,11 @@ static void bdpt_update_inflight(RayPipelineState* ps,
             flash_submitted, sensor_submitted, t5_fired);
     fflush(stderr);
     ps->Q_t5_ready.push(1);
+
+    /* Production GPU mode: set the pending flag so the GPU thread runs
+     * sort+pack+connect directly, bypassing the CPU BDPT connection path. */
+    if (ps->cfg.gpu_skip_record_readback)
+        ps->bdpt_gpu_t5_pending.store(true, std::memory_order_release);
 }
 
 /* CIE-approximate spectral locus — forward declaration; definition is near ray_pipeline_join_t5 */
@@ -7792,6 +7811,44 @@ public:
     struct { GLint bdpt_count_base = -1; } uloc_prep;
     /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
     GLuint prog_t5 = 0;
+    /* Cached from first dispatch_t1_t2_t3 call — stable for the pipeline lifetime. */
+    int    cached_bdpt_count_base = 2;  /* 2 + n_mats; default safe until scene upload */
+    int    cached_max_bdpt_v      = 0;  /* 0 = use ps.cfg.bdpt_max_vertices or 10M     */
+
+    /* post_t3_prep: GPU-driven bounce control, eliminates per-bounce CPU readbacks */
+    GLuint prog_post_t3_prep  = 0;
+    GLuint ssbo_splat_indirect = 0;  /* 3 uint32 indirect dispatch args for terminal splat */
+
+    /* GPU-native T5: sort + pack shaders and scratch SSBOs */
+    GLuint prog_sort_init  = 0;  /* bdpt_sort_init.comp.glsl  */
+    GLuint prog_sort_step  = 0;  /* bdpt_sort_step.comp.glsl  */
+    GLuint prog_pack_t5    = 0;  /* bdpt_pack_t5.comp.glsl    */
+    GLuint ssbo_sort_keys  = 0;  /* 2 uint32 per padded vertex slot   */
+    GLuint ssbo_sort_idx   = 0;  /* 1 uint32 per padded vertex slot   */
+    GLuint ssbo_sort_counts= 0;  /* [0]=n_lv, [1]=n_cv (uint32 × 2)  */
+    int    cap_sort        = 0;  /* current padded allocation (# slots) */
+    int    bdpt_betas_base_f = 0; /* float offset in ssbo_bdpt_output for betas */
+    struct {
+        GLint nv = -1, npad = -1;
+    } uloc_sort_init;
+    struct {
+        GLint k = -1, j = -1, npad = -1;
+    } uloc_sort_step;
+    struct {
+        GLint nv = -1, n_lv = -1, bdpt_betas_base = -1, n_bands = -1;
+        GLint sensor_half_w = -1, sensor_half_h = -1;
+    } uloc_pack_t5;
+
+    /* Pass B: GPU-resident backward-sensor terminal accumulator */
+    GLuint prog_sensor_splat = 0;
+    GLuint ssbo_sensor_rgb   = 0;  /* 3 × res × res float-CAS uint32 */
+    int    sensor_rgb_res    = 0;  /* resolution ssbo_sensor_rgb was allocated for */
+    std::atomic<bool> clear_sensor_rgb_requested{false};
+    struct {
+        GLint term_float_base = -1;
+        GLint sensor_half_w = -1, sensor_half_h = -1, sensor_res_u = -1;
+        GLint n_bands = -1, splat_scale = -1, rgb_w = -1;
+    } uloc_splat;
 
     /* T5 persistent SSBOs — allocated on first use, grown as needed */
     GLuint ssbo_t5_light    = 0;  /* binding 0: T5LightVertBuf       (float)  */
@@ -7823,6 +7880,19 @@ public:
     std::condition_variable t5_job_cv;
     std::unique_ptr<T5Job>  t5_job_pending;           /* null = no pending job */
     std::atomic<bool>       t5_job_ready{false};
+
+    /* ── Pass E: explicit debug readback jobs ───────────────────────────── *
+     * Never called from the normal frame loop.  Serviced on the GPU thread *
+     * during Q_intent idle timeouts so no GL state is disturbed mid-batch. */
+    enum class DbgKind { HITS, TERMINALS, BDPT_VERTS };
+    struct DebugReadbackJob {
+        DbgKind  kind  = DbgKind::HITS;
+        int      max_n = 0;
+        std::promise<std::vector<float>> promise;
+    };
+    std::mutex                         dbg_job_mu;
+    std::unique_ptr<DebugReadbackJob>  dbg_job_pending;
+    std::atomic<bool>                  dbg_job_ready{false};
 
     /* UV blit shader + shared display textures (valid only when WGL context sharing
      * is active — i.e. ps.cfg.gl_display_hglrc != 0 and prog_uv_blit != 0). */
@@ -7863,8 +7933,9 @@ public:
                    n_uv_groups, uv_group_id_base, uv_meta_base, rng_seed,
                    bdpt_max_verts, bdpt_max_spectral, bdpt_max_pdfs,
                    bdpt_count_base, bdpt_spectral_base, bdpt_pdf_base,
+                   bdpt_betas_base,
                    n_hits; }
-        uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
+        uloc_t3 = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     struct { GLint mode, nx, ny, n_bands, dx, dz, wavelengths; }
         uloc_t4 = {-1,-1,-1,-1,-1,-1,-1};
 
@@ -7940,7 +8011,6 @@ public:
     std::vector<RayRecord> stg_strike;   /* STRIKE records for Q_out                   */
     std::vector<RayIntent> stg_children; /* child intents for push_many                */
     std::vector<uint32_t>  stg_uv_acc;  /* UV accumulator readback                    */
-    std::vector<VXcd>      stg_amp_recycle; /* Eigen amp allocs harvested from prior batch */
     struct SensorUpdate { int iy, iz; double r, g, b; };
     std::vector<SensorUpdate> stg_sensor_updates; /* precomputed sensor updates, outside lock */
     std::chrono::steady_clock::time_point last_uv_readback_t = std::chrono::steady_clock::now();
@@ -8008,6 +8078,370 @@ public:
         const GLsizeiptr sz = (GLsizeiptr)((size_t)cap_hits * HIT_STRIDE_BYTES);
         ensure_ssbo(ssbo_hit,   sz);
         ensure_ssbo(ssbo_hit_b, sz);
+    }
+
+    /* ── Pass B/C helpers: GPU-resident sensor accumulator ─────────────────── */
+
+    /* Allocate or reallocate ssbo_sensor_rgb for the given resolution.
+     * Buffer is zeroed on (re)allocation.  No-op when res == sensor_rgb_res. */
+    void ensure_sensor_rgb_ssbo(int res) {
+        if (res <= 0 || res == sensor_rgb_res) return;
+        const GLsizeiptr sz = (GLsizeiptr)(3u * (size_t)res * res * sizeof(uint32_t));
+        if (!ssbo_sensor_rgb) glc_GenBuffers(1, &ssbo_sensor_rgb);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
+        glc_BufferData(GL_SHADER_STORAGE_BUFFER, sz, nullptr, GL_DYNAMIC_COPY);
+        /* Zero — upload via a staging vector (same pattern as UV accum zeroing). */
+        std::vector<uint32_t> zero(3u * (size_t)res * res, 0u);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, zero.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        sensor_rgb_res = res;
+    }
+
+    /* Zero ssbo_sensor_rgb without reallocating.  Called when sensor image is reset. */
+    void clear_sensor_rgb() {
+        if (!ssbo_sensor_rgb || sensor_rgb_res <= 0) return;
+        const GLsizeiptr sz = (GLsizeiptr)(3u * (size_t)sensor_rgb_res * sensor_rgb_res
+                                           * sizeof(uint32_t));
+        std::vector<uint32_t> zero(3u * (size_t)sensor_rgb_res * sensor_rgb_res, 0u);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sz, zero.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+    }
+
+    /* Dispatch terminal splat shader — GPU-side replacement for the CPU terminal
+     * readback + sensor_accum update.  Must be called from the GPU thread with
+     * the GL context current, after T3 has completed its dispatch for this bounce.
+     * ssbo_sensor_rgb must already be allocated at the correct resolution.
+     *
+     * Uses glDispatchComputeIndirect from ssbo_splat_indirect (written by
+     * post_t3_prep) so nt_term never crosses to the CPU.  ssbo_t3_meta is bound
+     * at slot 2 so the shader reads nt_term directly for its own bounds check. */
+    void dispatch_terminal_splat(RayPipelineState& ps, int max_children, int nb) {
+        if (!prog_sensor_splat || ps.sensor_res <= 0 || !ssbo_sensor_rgb || !ssbo_splat_indirect)
+            return;
+        static constexpr int INTENT_STRIDE_VAL = 20 + 2 * MAX_SPECTRAL_BANDS;
+        const int term_float_base = max_children * INTENT_STRIDE_VAL;
+
+        glc_UseProgram(prog_sensor_splat);
+        bind_ssbo(ssbo_child_int,  0);
+        bind_ssbo(ssbo_sensor_rgb, 1);
+        bind_ssbo(ssbo_t3_meta,    2);   /* splat shader reads nt_term from meta[1] */
+
+        if (uloc_splat.term_float_base >= 0)
+            glc_Uniform1i(uloc_splat.term_float_base, term_float_base);
+        if (uloc_splat.sensor_half_w >= 0)
+            glc_Uniform1f(uloc_splat.sensor_half_w, ps.sensor_half_w);
+        if (uloc_splat.sensor_half_h >= 0)
+            glc_Uniform1f(uloc_splat.sensor_half_h, ps.sensor_half_h);
+        if (uloc_splat.sensor_res_u >= 0)
+            glc_Uniform1i(uloc_splat.sensor_res_u, ps.sensor_res);
+        if (uloc_splat.n_bands >= 0)
+            glc_Uniform1i(uloc_splat.n_bands, nb);
+        if (uloc_splat.splat_scale >= 0)
+            glc_Uniform1f(uloc_splat.splat_scale, 0.10f);
+        if (uloc_splat.rgb_w >= 0) {
+            if (blit_n_bands_stored > 0) {
+                glc_Uniform3fv(uloc_splat.rgb_w, blit_n_bands_stored,
+                               blit_rgb_weights.data());
+            } else {
+                float flat[MAX_SPECTRAL_BANDS * 3];
+                for (int i = 0; i < MAX_SPECTRAL_BANDS * 3; ++i)
+                    flat[i] = 1.0f / 3.0f;
+                glc_Uniform3fv(uloc_splat.rgb_w, MAX_SPECTRAL_BANDS, flat);
+            }
+        }
+
+        /* Indirect dispatch — x workgroup count written to ssbo_splat_indirect[0]
+         * by post_t3_prep.  No CPU readback of nt_term needed. */
+        glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ssbo_splat_indirect);
+        glc_DispatchComputeIndirect(0);
+        glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+    }
+
+    /* Download ssbo_sensor_rgb to the CPU shadow (ps.sensor_accum_gpu).
+     * Rate-limited: call at most once per shadow_interval_s from the GPU thread. */
+    void refresh_sensor_gpu_shadow(RayPipelineState& ps) {
+        if (!ssbo_sensor_rgb || sensor_rgb_res <= 0) return;
+        const int    res  = sensor_rgb_res;
+        const size_t pix2 = (size_t)res * res;
+        std::vector<uint32_t> tmp(3u * pix2);
+
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
+        glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                             (GLsizeiptr)(3u * pix2 * sizeof(uint32_t)),
+                             tmp.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        /* Compute per-channel peaks inline (avoids extra pass in get_sensor_image). */
+        double pr = 1e-30, pg = 1e-30, pb = 1e-30;
+        for (size_t i = 0; i < pix2; ++i) {
+            float fr, fg, fb;
+            std::memcpy(&fr, &tmp[i],          sizeof(float));
+            std::memcpy(&fg, &tmp[i + pix2],   sizeof(float));
+            std::memcpy(&fb, &tmp[i + 2*pix2], sizeof(float));
+            if (fr > (float)pr) pr = fr;
+            if (fg > (float)pg) pg = fg;
+            if (fb > (float)pb) pb = fb;
+        }
+
+        std::lock_guard<std::mutex> lk(ps.sensor_gpu_mu);
+        ps.sensor_accum_gpu   = std::move(tmp);
+        ps.sensor_peak_gpu[0] = pr;
+        ps.sensor_peak_gpu[1] = pg;
+        ps.sensor_peak_gpu[2] = pb;
+    }
+
+    /* ── Pass E: service a pending debug readback job ─────────────────────── *
+     * Called from thread_main during Q_intent idle timeouts.                  *
+     * Reads bounded data from the last completed GPU batch's SSBOs.           */
+    void service_debug_readback_job(RayPipelineState& ps) {
+        std::unique_ptr<DebugReadbackJob> job;
+        {
+            std::lock_guard<std::mutex> lk(dbg_job_mu);
+            job = std::move(dbg_job_pending);
+            dbg_job_ready.store(false, std::memory_order_release);
+        }
+        if (!job) return;
+        if (ps.cancel.load(std::memory_order_relaxed)) {
+            try { job->promise.set_value({}); } catch (...) {}
+            return;
+        }
+        try {
+            std::vector<float> result;
+            static constexpr int HIT_STRIDE_DBG = 27 + 2 * MAX_SPECTRAL_BANDS;
+            static constexpr int INTENT_STRIDE_DBG = 20 + 2 * MAX_SPECTRAL_BANDS;
+            static constexpr int TERMINAL_STRIDE_DBG = 26 + 2 * MAX_SPECTRAL_BANDS;
+            static constexpr int BDPT_VERTEX_STRIDE_DBG = 28;
+
+            if (job->kind == DbgKind::HITS && ssbo_hit != 0) {
+                /* Read n_hits from counter SSBO, then cap to max_n. */
+                uint32_t cnt = 0;
+                if (ssbo_counter) readback_ssbo(ssbo_counter, &cnt, sizeof(uint32_t));
+                const int n = std::min(std::min((int)cnt, job->max_n), cap_hits);
+                if (n > 0) {
+                    result.resize((size_t)n * HIT_STRIDE_DBG);
+                    readback_ssbo(prev_hit_ssbo(), result.data(),
+                                  (GLsizeiptr)((size_t)n * HIT_STRIDE_DBG * sizeof(float)));
+                }
+            } else if (job->kind == DbgKind::TERMINALS && ssbo_child_int != 0) {
+                /* Read nt_term from t3_meta, then cap to max_n. */
+                uint32_t meta[2] = {};
+                if (ssbo_t3_meta) readback_ssbo(ssbo_t3_meta, meta, 2 * sizeof(uint32_t));
+                const int nt = std::min(std::min((int)meta[1], job->max_n),
+                                        cap_children > 0 ? cap_children : 1000000);
+                const int nc = std::min((int)meta[0],
+                                        cap_children > 0 ? cap_children : 1000000);
+                const int term_off_f = nc * INTENT_STRIDE_DBG;
+                if (nt > 0) {
+                    result.resize((size_t)nt * TERMINAL_STRIDE_DBG);
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_child_int);
+                    glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                         (GLintptr)((size_t)term_off_f * sizeof(float)),
+                                         (GLsizeiptr)((size_t)nt * TERMINAL_STRIDE_DBG * sizeof(float)),
+                                         result.data());
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                }
+            } else if (job->kind == DbgKind::BDPT_VERTS && ssbo_bdpt_output != 0) {
+                /* Read vertex count from t3_meta, then cap to max_n. */
+                uint32_t cnts[3] = {};
+                if (ssbo_t3_meta && cached_bdpt_count_base > 0) {
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
+                    glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                         (GLintptr)(cached_bdpt_count_base * sizeof(uint32_t)),
+                                         3 * sizeof(uint32_t), cnts);
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                }
+                const int max_v = cached_max_bdpt_v > 0 ? cached_max_bdpt_v : 10000000;
+                const int nv = std::min(std::min((int)cnts[0], job->max_n), max_v);
+                if (nv > 0) {
+                    result.resize((size_t)nv * BDPT_VERTEX_STRIDE_DBG);
+                    readback_ssbo(ssbo_bdpt_output, result.data(),
+                                  (GLsizeiptr)((size_t)nv * BDPT_VERTEX_STRIDE_DBG * sizeof(float)));
+                }
+            }
+            job->promise.set_value(std::move(result));
+        } catch (...) {
+            try { job->promise.set_exception(std::current_exception()); } catch (...) {}
+        }
+    }
+
+    /* Submit a debug readback job from any thread; blocks until GPU fulfills it. */
+    std::vector<float> submit_debug_readback(DbgKind kind, int max_n) {
+        auto job = std::make_unique<DebugReadbackJob>();
+        job->kind  = kind;
+        job->max_n = max_n;
+        auto fut = job->promise.get_future();
+        {
+            std::lock_guard<std::mutex> lk(dbg_job_mu);
+            dbg_job_pending = std::move(job);
+            dbg_job_ready.store(true, std::memory_order_release);
+        }
+        return fut.get();
+    }
+
+    /* ── service_gpu_native_t5: GPU-resident BDPT connection pass ────────── *
+     * Called from thread_main when gpu_t5_trigger fires (production mode).   *
+     * 1. Reads vertex count nv (tiny readback — one uint32).                 *
+     * 2. Sorts vertices to subpath-consecutive order via bitonic sort.        *
+     * 3. Packs sorted vertices into ssbo_t5_light / ssbo_t5_cam.             *
+     * 4. Dispatches t5_full_connect with ssbo_sensor_rgb as output.          */
+    void service_gpu_native_t5(RayPipelineState& ps) {
+        ps.bdpt_gpu_t5_pending.store(false, std::memory_order_release);
+        if (!prog_sort_init || !prog_sort_step || !prog_pack_t5 || !prog_t5) return;
+        if (!ssbo_bdpt_output) return;
+
+        /* Read vertex count — one uint32 from ssbo_t3_meta at bdpt_count_base. */
+        uint32_t nv_raw = 0;
+        if (ssbo_t3_meta && cached_bdpt_count_base > 0) {
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                  (GLintptr)(cached_bdpt_count_base * sizeof(uint32_t)),
+                                  sizeof(uint32_t), &nv_raw);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+        const int nv = (cached_max_bdpt_v > 0)
+            ? std::min((int)nv_raw, cached_max_bdpt_v) : (int)nv_raw;
+        if (nv <= 0) return;
+
+        /* Compute padded size (next power of 2 >= nv) for bitonic sort. */
+        int npad = 1;
+        while (npad < nv) npad <<= 1;
+
+        /* Ensure sort SSBOs. */
+        if (npad > cap_sort) {
+            cap_sort = npad * 2;
+            ensure_ssbo(ssbo_sort_keys,   (GLsizeiptr)(cap_sort * 2 * sizeof(uint32_t)));
+            ensure_ssbo(ssbo_sort_idx,    (GLsizeiptr)(cap_sort     * sizeof(uint32_t)));
+        }
+        if (!ssbo_sort_counts)
+            ensure_ssbo(ssbo_sort_counts, 2 * sizeof(uint32_t));
+
+        /* Zero sort_counts. */
+        {
+            uint32_t z[2] = {};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sort_counts);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 2 * sizeof(uint32_t), z);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+
+        /* ── Step 1: sort_init — build keys and count light/cam verts ── */
+        glc_UseProgram(prog_sort_init);
+        bind_ssbo(ssbo_bdpt_output, 0);
+        bind_ssbo(ssbo_sort_keys,   1);
+        bind_ssbo(ssbo_sort_idx,    2);
+        bind_ssbo(ssbo_sort_counts, 3);
+        if (uloc_sort_init.nv   >= 0) glc_Uniform1i(uloc_sort_init.nv,   nv);
+        if (uloc_sort_init.npad >= 0) glc_Uniform1i(uloc_sort_init.npad, npad);
+        glc_DispatchCompute((GLuint)((npad + 63) / 64), 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        /* Read n_lv (needed by pack shader to compute cam output offset). */
+        uint32_t n_lv_raw = 0;
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sort_counts);
+        glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(uint32_t), &n_lv_raw);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        const int n_lv = (int)n_lv_raw;
+        const int n_cv = nv - n_lv;
+        if (n_lv == 0 || n_cv == 0) return;  /* nothing to connect */
+
+        /* ── Step 2: bitonic sort (npad/2 threads per step) ── */
+        glc_UseProgram(prog_sort_step);
+        bind_ssbo(ssbo_sort_keys, 0);
+        bind_ssbo(ssbo_sort_idx,  1);
+        const GLuint sort_wgs = (GLuint)((npad / 2 + 63) / 64);
+        for (int k = 2; k <= npad; k *= 2) {
+            for (int j = k / 2; j >= 1; j /= 2) {
+                if (uloc_sort_step.k    >= 0) glc_Uniform1i(uloc_sort_step.k,    k);
+                if (uloc_sort_step.j    >= 0) glc_Uniform1i(uloc_sort_step.j,    j);
+                if (uloc_sort_step.npad >= 0) glc_Uniform1i(uloc_sort_step.npad, npad);
+                glc_DispatchCompute(sort_wgs, 1, 1);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            }
+        }
+
+        /* ── Step 3: pack sorted vertices into T5 format ── */
+        /* Ensure t5_light and t5_cam are large enough for the sorted output. */
+        {
+            const int need_lgv = n_lv * (int)T5_LGV_STRIDE;
+            const int need_cgv = n_cv * (int)T5_CGV_STRIDE;
+            if (need_lgv > cap_t5_light) {
+                cap_t5_light = need_lgv * 2;
+                ensure_ssbo(ssbo_t5_light, (GLsizeiptr)(cap_t5_light * sizeof(float)));
+            }
+            if (need_cgv > cap_t5_cam) {
+                cap_t5_cam = need_cgv * 2;
+                ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)(cap_t5_cam * sizeof(float)));
+            }
+        }
+        glc_UseProgram(prog_pack_t5);
+        bind_ssbo(ssbo_sort_keys,   0);
+        bind_ssbo(ssbo_sort_idx,    1);
+        bind_ssbo(ssbo_bdpt_output, 2);
+        bind_ssbo(ssbo_t5_light,    3);
+        bind_ssbo(ssbo_t5_cam,      4);
+        bind_ssbo(ssbo_mat_band,    5);
+        if (uloc_pack_t5.nv              >= 0) glc_Uniform1i(uloc_pack_t5.nv,              nv);
+        if (uloc_pack_t5.n_lv            >= 0) glc_Uniform1i(uloc_pack_t5.n_lv,            n_lv);
+        if (uloc_pack_t5.n_bands         >= 0) glc_Uniform1i(uloc_pack_t5.n_bands,
+                                                               ps.st ? (int)ps.st->freq_hz_vec.size() : 1);
+        if (uloc_pack_t5.sensor_half_w   >= 0) glc_Uniform1f(uloc_pack_t5.sensor_half_w, ps.sensor_half_w);
+        if (uloc_pack_t5.sensor_half_h   >= 0) glc_Uniform1f(uloc_pack_t5.sensor_half_h, ps.sensor_half_h);
+        glc_DispatchCompute((GLuint)((nv + 63) / 64), 1, 1);
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        /* ── Step 4: T5 connection dispatch (Pass C path — writes to ssbo_sensor_rgb) ── */
+        if (!ssbo_sensor_rgb || sensor_rgb_res != ps.sensor_res) return;
+
+        const uint32_t T5_LIGHT_BATCH_NT = t5_light_batch_size ? t5_light_batch_size : 4096u;
+        const uint32_t T5_CAM_BATCH_NT   = t5_cam_batch_size   ? t5_cam_batch_size   : 8192u;
+        const uint32_t n_lv_u = (uint32_t)n_lv;
+        const uint32_t n_cv_u = (uint32_t)n_cv;
+        const uint32_t n_lbatches = (n_lv_u + T5_LIGHT_BATCH_NT - 1u) / T5_LIGHT_BATCH_NT;
+        const uint32_t n_cbatches = (n_cv_u + T5_CAM_BATCH_NT   - 1u) / T5_CAM_BATCH_NT;
+
+        T5GpuParams par{};
+        par.min_geom     = (float)ps.cfg.t5_min_geom;
+        par.sensor_half_w = ps.sensor_half_w;
+        par.sensor_half_h = ps.sensor_half_h;
+        par.sensor_res   = ps.sensor_res;
+        par.n_light_verts = n_lv_u;
+        par.n_cam_verts   = n_cv_u;
+        par.tile_w = 0; par.tile_h = 0; par.tile_x0 = 0; par.tile_y0 = 0;
+        par.n_bands = ps.st ? (int)ps.st->freq_hz_vec.size() : 1;
+
+        glc_UseProgram(prog_t5);
+        bind_ssbo(ssbo_t5_light,    0);
+        bind_ssbo(ssbo_t5_cam,      1);
+        bind_ssbo(ssbo_sensor_rgb,  2);
+        bind_ssbo(ssbo_t5_params,   3);
+        bind_ssbo(ssbo_t5_spectral, 4);
+        bind_ssbo(ssbo_bvh,         5);
+        bind_ssbo(ssbo_tri_id,      6);
+        bind_ssbo(ssbo_tri_full,    7);
+
+        bool ok = true;
+        for (uint32_t c = 0; c < n_cbatches && ok; ++c) {
+            par.cam_offset = c * T5_CAM_BATCH_NT;
+            for (uint32_t b = 0; b < n_lbatches && ok; ++b) {
+                par.light_offset     = b * T5_LIGHT_BATCH_NT;
+                par.light_batch_size = T5_LIGHT_BATCH_NT;
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_params);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(T5GpuParams), &par);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                const uint32_t nc_b = std::min(T5_CAM_BATCH_NT,   n_cv_u - par.cam_offset);
+                const uint32_t nl_b = std::min(T5_LIGHT_BATCH_NT, n_lv_u - par.light_offset);
+                glc_DispatchCompute((nc_b + 7u) / 8u, (nl_b + 7u) / 8u, 1);
+                GLsync fn = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                GLenum fe = glc_ClientWaitSync(fn, GL_SYNC_FLUSH_COMMANDS_BIT, 2'000'000'000u);
+                glc_DeleteSync(fn);
+                if (fe == GL_TIMEOUT_EXPIRED || fe == GL_WAIT_FAILED) ok = false;
+            }
+        }
+        if (ok) glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        fprintf(stderr, "[T5-gpu-native] done: nv=%d n_lv=%d n_cv=%d %s\n",
+                nv, n_lv, n_cv, ok ? "ok" : "ABORTED");
+        fflush(stderr);
     }
 
     /* Upload data to an SSBO (auto-grows if needed). */
@@ -8377,6 +8811,21 @@ public:
             if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "dispatch_prep.comp.glsl: %s", err); return false; }
             prog_dispatch_prep = 0;
         }
+        if (!load("post_t3_prep.comp.glsl", prog_post_t3_prep)) {
+            fprintf(stderr, "[gpu-dispatch] post_t3_prep.comp.glsl failed (%s)%s\n",
+                    err, gpu_required ? "" : " — falling back to per-bounce CPU readback");
+            fflush(stderr);
+            if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "post_t3_prep.comp.glsl: %s", err); return false; }
+            prog_post_t3_prep = 0;
+        }
+        /* Allocate splat indirect buffer (3 uint32s; populated by post_t3_prep) */
+        if (!ssbo_splat_indirect) {
+            ensure_ssbo(ssbo_splat_indirect, 3 * sizeof(uint32_t));
+            uint32_t ones[3] = {1u, 1u, 1u};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_splat_indirect);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(ones), ones);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
         /* T5 full-connect shader — compiled with BVH shadow preamble injected.
          * BvhBuf→binding 5, TriIdBuf→binding 6, TriFullBuf→binding 7.
          * Non-fatal; GPU T5 path disabled if absent or compilation fails. */
@@ -8386,6 +8835,54 @@ public:
             fflush(stderr);
             if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "t5_full_connect.comp.glsl: %s", err); return false; }
             prog_t5 = 0;
+        }
+
+        /* Pass B: GPU-resident terminal splat shader — non-fatal */
+        if (!load("sensor_terminal_splat.comp.glsl", prog_sensor_splat)) {
+            fprintf(stderr, "[gpu-dispatch] sensor_terminal_splat.comp.glsl failed (%s)%s\n",
+                    err, gpu_required ? "" : " — GPU terminal splat disabled");
+            fflush(stderr);
+            if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error),
+                "sensor_terminal_splat.comp.glsl: %s", err); return false; }
+            prog_sensor_splat = 0;
+        }
+        if (prog_sensor_splat) {
+            uloc_splat.term_float_base = glc_GetUniformLocation(prog_sensor_splat, "term_float_base");
+            uloc_splat.sensor_half_w   = glc_GetUniformLocation(prog_sensor_splat, "sensor_half_w");
+            uloc_splat.sensor_half_h   = glc_GetUniformLocation(prog_sensor_splat, "sensor_half_h");
+            uloc_splat.sensor_res_u    = glc_GetUniformLocation(prog_sensor_splat, "sensor_res");
+            uloc_splat.n_bands         = glc_GetUniformLocation(prog_sensor_splat, "n_bands");
+            uloc_splat.splat_scale     = glc_GetUniformLocation(prog_sensor_splat, "splat_scale");
+            uloc_splat.rgb_w           = glc_GetUniformLocation(prog_sensor_splat, "rgb_w");
+        }
+
+        /* GPU-native T5: sort and pack shaders — non-fatal */
+        auto load_nonfatal = [&](const std::string& name, GLuint& prog) {
+            if (!load(name, prog)) {
+                fprintf(stderr, "[gpu-dispatch] %s failed (%s) — GPU-native T5 disabled\n",
+                        name.c_str(), err);
+                fflush(stderr);
+                prog = 0;
+            }
+        };
+        load_nonfatal("bdpt_sort_init.comp.glsl",  prog_sort_init);
+        load_nonfatal("bdpt_sort_step.comp.glsl",  prog_sort_step);
+        load_nonfatal("bdpt_pack_t5.comp.glsl",    prog_pack_t5);
+        if (prog_sort_init) {
+            uloc_sort_init.nv   = glc_GetUniformLocation(prog_sort_init, "nv");
+            uloc_sort_init.npad = glc_GetUniformLocation(prog_sort_init, "npad");
+        }
+        if (prog_sort_step) {
+            uloc_sort_step.k    = glc_GetUniformLocation(prog_sort_step, "k");
+            uloc_sort_step.j    = glc_GetUniformLocation(prog_sort_step, "j");
+            uloc_sort_step.npad = glc_GetUniformLocation(prog_sort_step, "npad");
+        }
+        if (prog_pack_t5) {
+            uloc_pack_t5.nv               = glc_GetUniformLocation(prog_pack_t5, "nv");
+            uloc_pack_t5.n_lv             = glc_GetUniformLocation(prog_pack_t5, "n_lv");
+            uloc_pack_t5.n_bands          = glc_GetUniformLocation(prog_pack_t5, "n_bands");
+            uloc_pack_t5.sensor_half_w    = glc_GetUniformLocation(prog_pack_t5, "sensor_half_w");
+            uloc_pack_t5.sensor_half_h    = glc_GetUniformLocation(prog_pack_t5, "sensor_half_h");
         }
 
         /* Load UV blit shader — non-fatal, falls back to CPU path silently */
@@ -8437,6 +8934,7 @@ public:
         uloc_t3.bdpt_count_base      = glc_GetUniformLocation(prog_t3, "bdpt_count_base");
         uloc_t3.bdpt_spectral_base   = glc_GetUniformLocation(prog_t3, "bdpt_spectral_base");
         uloc_t3.bdpt_pdf_base        = glc_GetUniformLocation(prog_t3, "bdpt_pdf_base");
+        uloc_t3.bdpt_betas_base      = glc_GetUniformLocation(prog_t3, "bdpt_betas_base");
         /* n_hits is no longer a uniform — T3 reads it from MetaBuf[bdpt_count_base+3]
          * written by dispatch_prep.comp.glsl.  The slot is kept in the struct as -1
          * so any accidental uniform set is a harmless no-op. */
@@ -8560,8 +9058,11 @@ public:
          * clear_tri_groups() + re-registration (see dispatch_t1_t2_t3). */
         upload_param_groups_data(st);
 
-        /* Counter SSBO: 8 uints — allocate once, zeroed on each dispatch */
-        ensure_ssbo(ssbo_counter, 8 * sizeof(uint32_t));
+        /* Counter SSBO: 12 uints (extended from 8).
+         * [0..7]: existing hit/miss/wave/refine counters + T3 indirect args
+         * [8]   : nc (child count for next T1, written by post_t3_prep)
+         * [9..11]: T1 indirect dispatch args {ceil(nc/64), 1, 1} */
+        ensure_ssbo(ssbo_counter, 12 * sizeof(uint32_t));
 
         /* T3 meta SSBO: [0]=intent_count [1]=terminal_count [2..2+nm-1]=eps_flags
          * Allocate as 2+nm uints.  Counters are zeroed before each dispatch;
@@ -8789,6 +9290,7 @@ public:
         const int nt = (int)st.tris.size();
         /* Hoisted so dispatch_prep (before T3 bindings) can reference it */
         const int bdpt_count_base  = 2 + nm;   /* MetaBuf tail: [2+nm..2+nm+2] BDPT counts */
+        cached_bdpt_count_base = bdpt_count_base;  /* cache for debug readback tap */
 
         /* ── GPU-resident bounce loop ─────────────────────────────────────────
          * Generation 0: pack batch from CPU → ssbo_intent and upload.
@@ -8804,6 +9306,7 @@ public:
         static constexpr int BDPT_PDF_STRIDE_F      = 12;
         static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;
         const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 10000000;
+        cached_max_bdpt_v = max_bdpt_v;
         const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 25000000;
         const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 10000000;
         const int max_bdpt_o = (ps.cfg.bdpt_max_optical > 0) ? ps.cfg.bdpt_max_optical : 10000000;
@@ -8813,7 +9316,17 @@ public:
         /* prev_no: running optical write pointer; prev_nv/ns/np unused (BDPT deferred). */
         int prev_nv = 0, prev_ns = 0, prev_np = 0, prev_no = 0;
         (void)prev_nv; (void)prev_ns; (void)prev_np;
+        /* Production GPU-resident mode: post_t3_prep drives T1/T2 indirectly so
+         * neither counters[0] nor meta[0..1] ever need to cross to CPU.
+         * Debug mode keeps the existing per-bounce readback path unchanged. */
+        const bool use_gpu_resident = ps.cfg.gpu_skip_record_readback && prog_post_t3_prep != 0;
+
+        /* Maximum bounce iterations for the GPU-resident path (no nc-based exit). */
+        static constexpr int MAX_GPU_BOUNCES = 12;
+        int _bounce_iter = 0;
         for (;;) {  /* ── bounce loop ── */
+
+        if (use_gpu_resident && _bounce_iter++ >= MAX_GPU_BOUNCES) break;
 
         if (ps.cancel.load(std::memory_order_relaxed)) {
             if (out_flash_children)  *out_flash_children  = 0;
@@ -8821,11 +9334,21 @@ public:
             return total_n_hits;
         }
 
+        /* Service deferred sensor-RGB clear request (posted by configure_sensor_image). */
+        if (clear_sensor_rgb_requested.load(std::memory_order_acquire)) {
+            clear_sensor_rgb_requested.store(false, std::memory_order_release);
+            clear_sensor_rgb();
+        }
+
         /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 20 + 2*MAX_SPECTRAL_BANDS floats) */
         static constexpr int INTENT_STRIDE = 20 + 2 * MAX_SPECTRAL_BANDS;
         if (n > cap_intents) {
             cap_intents = n * 2;
-            ensure_ssbo(ssbo_intent, (GLsizeiptr)(cap_intents * INTENT_STRIDE * sizeof(float)));
+            /* Allocate with combined (CHILD+TERMINAL) stride so ssbo_intent and
+             * ssbo_child_int can be freely ping-ponged without a resize after swap. */
+            static constexpr int COMBINED_STRIDE = (20 + 2 * MAX_SPECTRAL_BANDS)
+                                                 + (26 + 2 * MAX_SPECTRAL_BANDS);
+            ensure_ssbo(ssbo_intent, (GLsizeiptr)(cap_intents * COMBINED_STRIDE * sizeof(float)));
         }
 
         if (first_gen) {
@@ -8853,9 +9376,19 @@ public:
             row[17] = ri.sensor_origin_y; row[18] = ri.sensor_origin_z;
             row[19] = rt_u32_as_f32((uint32_t)ri.bdpt_subpath_id); /* bdpt_subpath_id in _pad */
             const int bands = std::min(nb, MAX_SPECTRAL_BANDS);
-            for (int b = 0; b < bands; ++b) {
-                row[20+b] = (float)ri.amp[b].real();
-                row[20+MAX_SPECTRAL_BANDS+b] = (float)ri.amp[b].imag();
+            if (ri.amp_n_bands > 0) {
+                /* Scalar fast-path: all bands carry (amp_scalar, 0i) — no heap pointer.
+                 * fill_n + memset are SIMD-vectorized by the compiler. */
+                std::fill_n(&row[20], bands, ri.amp_scalar);
+                std::memset(&row[20 + MAX_SPECTRAL_BANDS], 0, (size_t)bands * sizeof(float));
+            } else {
+                const std::complex<double>* acd = ri.amp.data();
+                float* re_dst = &row[20];
+                float* im_dst = &row[20 + MAX_SPECTRAL_BANDS];
+                for (int b = 0; b < bands; ++b) {
+                    re_dst[b] = (float)acd[b].real();
+                    im_dst[b] = (float)acd[b].imag();
+                }
             }
         }
         /* Upload intents */
@@ -8872,9 +9405,13 @@ public:
         ensure_hit_ssbos(n * 4);  /* grows both ssbo_hit and ssbo_hit_b if needed */
 
         /* ── Ensure BDPT output SSBO (single buffer, binding 7) ─────────── *
-         * Layout, strides, max_bdpt_* and base offsets hoisted to function scope above. */
+         * Layout: verts | spectral | pdfs | optical.
+         * Betas (|amp[b]|) are no longer stored here — the pack shader derives them
+         * from throughput (already in the vertex record) using equal-weight per band. */
         {
-            const int64_t bdpt_total_f = (int64_t)bdpt_optical_base_f + (int64_t)max_bdpt_o * BDPT_OPTICAL_STRIDE_F;
+            const int64_t bdpt_total_f = (int64_t)bdpt_optical_base_f
+                                         + (int64_t)max_bdpt_o * BDPT_OPTICAL_STRIDE_F;
+            bdpt_betas_base_f = 0;  /* disabled — pack shader uses throughput/nb */
             if (bdpt_total_f > cap_bdpt_output) {
                 cap_bdpt_output = (int)bdpt_total_f;
                 ensure_ssbo(ssbo_bdpt_output, (GLsizeiptr)(bdpt_total_f * sizeof(float)));
@@ -8906,20 +9443,49 @@ public:
         }
 
         /* ── T1 dispatch ──────────────────────────────────────────────═ */
+        /* T1 shader reads n_intents from counters[8].  Always write it:
+         *  - All modes, bounce 0: write n (initial batch size).
+         *  - Non-gpu-resident, bounce>0: n was updated to nc at end of prev bounce.
+         *  - gpu-resident, bounce>0: post_t3_prep already wrote nc — do NOT overwrite.
+         * Also write counters[9..11] for gpu-resident indirect dispatch when applicable. */
+        if (first_gen || !use_gpu_resident) {
+            const uint32_t n_u32 = (uint32_t)n;
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
+            if (use_gpu_resident) {
+                /* bounce 0 gpu-resident: write all 4 slots for indirect T1 */
+                uint32_t t1_args[4] = {n_u32, (uint32_t)((n+63)/64), 1u, 1u};
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                  8 * (GLintptr)sizeof(uint32_t),
+                                  4 * (GLsizeiptr)sizeof(uint32_t), t1_args);
+            } else {
+                /* non-gpu-resident any bounce: only counters[8]=n needed */
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                  8 * (GLintptr)sizeof(uint32_t),
+                                  sizeof(uint32_t), &n_u32);
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
         auto t1_start = Clock::now();
         glc_UseProgram(prog_t1);
         bind_ssbo(ssbo_intent,     0); bind_ssbo(active_hit_ssbo(), 1);
         bind_ssbo(ssbo_counter,    2); bind_ssbo(ssbo_bvh,       3);
         bind_ssbo(ssbo_tri_id,     4); bind_ssbo(ssbo_tri_full,  5);
         bind_ssbo(ssbo_mat_band,   6); bind_ssbo(ssbo_scene_band,7);
-        glc_Uniform1i(uloc_t1.n_intents, n);
+        glc_Uniform1i(uloc_t1.n_intents, n);   /* debug-mode fallback; production reads counters[8] */
         glc_Uniform1i(uloc_t1.n_bands,   nb);
         glc_Uniform1i(uloc_t1.n_mats,    nm);
         glc_Uniform1i(uloc_t1.n_arenas,  na);
         glc_Uniform1i(uloc_t1.n_tris,    nt);
         if (uloc_t1.u_arenas >= 0 && na > 0)
             glc_Uniform4fv(uloc_t1.u_arenas, na, arena_uniform_data.data());
-        GLC_DISPATCH_CHECKED("T1:BVH", (GLuint)((n + 63) / 64), 1, 1);
+        if (use_gpu_resident) {
+            /* Indirect dispatch: x workgroup count at counters[9] */
+            glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ssbo_counter);
+            glc_DispatchComputeIndirect((GLintptr)(9 * sizeof(uint32_t)));
+            glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+        } else {
+            GLC_DISPATCH_CHECKED("T1:BVH", (GLuint)((n + 63) / 64), 1, 1);
+        }
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
         /* ── dispatch_prep: GPU writes indirect T3 params + n_hits into SSBOs ──
@@ -8972,7 +9538,15 @@ public:
                     fhz[i] = (float)st.freq_hz_vec[i];
                 glc_Uniform1fv(uloc_t2.freq_hz, MAX_SPECTRAL_BANDS, fhz);
             }
-            GLC_DISPATCH_CHECKED("T2:refine", (GLuint)((n + 63) / 64), 1, 1);
+            if (use_gpu_resident) {
+                /* T2 indirect: same counters[5..7] as T3 — dispatch_prep wrote (n_hits+63)/64.
+                 * T2 internally guards via counters[0]; extra invocations return early. */
+                glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, ssbo_counter);
+                glc_DispatchComputeIndirect((GLintptr)(5 * sizeof(uint32_t)));
+                glc_BindBuffer(GL_DISPATCH_INDIRECT_BUFFER, 0);
+            } else {
+                GLC_DISPATCH_CHECKED("T2:refine", (GLuint)((n + 63) / 64), 1, 1);
+            }
             glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         }
 
@@ -8981,7 +9555,12 @@ public:
          * counters[5..7] (indirect params) and meta[bdpt_count_base+3] (T3 guard).
          * No CPU readback before T3.  n_hits is read from counters[0] in the
          * full counter readback below, after GL_ALL_BARRIER_BITS. */
-        int n_hits = 0;  /* set from counters[0] after post-T3 full readback */
+        /* Production GPU-resident mode: post_t3_prep drives T1/T2 indirectly so
+         * neither counter[0] nor meta[0..1] ever need to cross to CPU.
+         * debug mode keeps the existing per-bounce readback path unchanged. */
+        const bool use_gpu_resident = ps.cfg.gpu_skip_record_readback && prog_post_t3_prep != 0;
+
+        int n_hits = 0;  /* populated from counter readback in debug mode; 0 in production */
         static constexpr int CHILD_STRIDE    = 20 + 2 * MAX_SPECTRAL_BANDS;  /* INTENT_STRIDE: 20 + 2*MAX_SPECTRAL_BANDS */
         static constexpr int TERMINAL_STRIDE = 26 + 2 * MAX_SPECTRAL_BANDS;  /* 26 + 2*MAX_SPECTRAL_BANDS */
         /* Size child buffer for worst-case (all n intents hit and spawn children). */
@@ -9063,14 +9642,28 @@ public:
             glc_DeleteSync(fence_hit[cur_idx]);
             fence_hit[cur_idx] = nullptr;
         }
-        fence_hit[cur_idx] = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!use_gpu_resident)
+            fence_hit[cur_idx] = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
         hit_flip = !hit_flip;  /* next bounce will write to the OTHER buffer */
 
-        /* Full counter readback — counters[0] = n_hits from T1, available here
-         * after the barrier regardless of which T3 dispatch path was taken. */
+        /* Post-T3 GPU prep (production mode): drive next T1 dispatch and terminal
+         * splat indirectly.  Reads meta[0]=nc and meta[1]=nt_term, writes counters[8..11]
+         * and ssbo_splat_indirect — no CPU readback of either value. */
+        if (use_gpu_resident) {
+            glc_UseProgram(prog_post_t3_prep);
+            bind_ssbo(ssbo_counter,        0);
+            bind_ssbo(ssbo_t3_meta,        1);
+            bind_ssbo(ssbo_splat_indirect, 2);
+            glc_DispatchCompute(1, 1, 1);
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
+        }
+
+        /* Counter readback (debug mode only) — n_hits for stats + loop exit. */
         uint32_t counters[8] = {};
-        readback_ssbo(ssbo_counter, counters, 8 * sizeof(uint32_t));
-        n_hits = std::min((int)counters[0], cap_hits);
+        if (!use_gpu_resident) {
+            readback_ssbo(ssbo_counter, counters, 8 * sizeof(uint32_t));
+            n_hits = std::min((int)counters[0], cap_hits);
+        }
 
         ps.stats[0].record_gpu(n, (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
             Clock::now() - t1_start).count(), ps.Q_intent.size());
@@ -9096,7 +9689,7 @@ public:
             }
         }
 
-        if (n_hits <= 0) break;
+        if (!use_gpu_resident && n_hits <= 0) break;
 
         /* Merge GPU UV accumulator into the CPU-side uv_accum_cpu and re-zero
          * the GPU SSBO.  This is intentionally rate-limited: with physical
@@ -9131,11 +9724,15 @@ public:
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         }
 
-        /* Read back meta[0]=intent_count  meta[1]=terminal_count */
+        /* Meta readback (debug mode only) — nc for ping-pong, nt_term for splat size.
+         * Production mode drives both from counters[8] / ssbo_splat_indirect. */
         uint32_t t3_meta_rb[2] = {};
-        readback_ssbo(ssbo_t3_meta, t3_meta_rb, 2 * sizeof(uint32_t));
-        int nc      = (int)std::min(t3_meta_rb[0], (uint32_t)cap_children);
-        int nt_term = (int)std::min(t3_meta_rb[1], (uint32_t)cap_children);
+        int nc = 0, nt_term = 0;
+        if (!use_gpu_resident) {
+            readback_ssbo(ssbo_t3_meta, t3_meta_rb, 2 * sizeof(uint32_t));
+            nc      = (int)std::min(t3_meta_rb[0], (uint32_t)cap_children);
+            nt_term = (int)std::min(t3_meta_rb[1], (uint32_t)cap_children);
+        }
         static bool t3_post_diag_once = true;
         const bool t3_post_diag = t3_post_diag_once;
         if (t3_post_diag) {
@@ -9160,7 +9757,7 @@ public:
          * Terminal record layout (TERMINAL_STRIDE=26+2*MAX_SPECTRAL_BANDS floats):
          *   [16]=color_flag  [23]=sensor_origin_y  [24]=sensor_origin_z
          *   [25]=is_emissive_hit  [26..26+MAX_SPECTRAL_BANDS-1]=amp_re  [26+MAX_SPECTRAL_BANDS..TERMINAL_STRIDE-1]=amp_im */
-        if (nt_term > 0 && ps.sensor_res > 0) {
+        if (nt_term > 0 && ps.sensor_res > 0 && !ps.cfg.gpu_skip_record_readback) {
             /* terminals start at max_children*CHILD_STRIDE floats into the combined buffer */
             GLintptr term_off = (GLintptr)((size_t)max_children * CHILD_STRIDE * sizeof(float));
             stg_tbuf.resize((size_t)nt_term * TERMINAL_STRIDE);
@@ -9223,6 +9820,16 @@ public:
             fprintf(stderr, "[gpu-T3-post] terminal readback done\n");
             fflush(stderr);
         }
+
+        /* Pass B: GPU-resident terminal splat.
+         * Production mode: indirect dispatch — nt_term comes from ssbo_t3_meta[1]
+         *   (post_t3_prep already wrote the indirect args to ssbo_splat_indirect).
+         * Debug mode: direct dispatch — nt_term known from meta readback above. */
+        if (ps.sensor_res > 0 && ps.cfg.gpu_skip_record_readback) {
+            ensure_sensor_rgb_ssbo(ps.sensor_res);
+            dispatch_terminal_splat(ps, max_children, nb);  /* always indirect now */
+        }
+
         /* ── Post-T3: STRIKE records → Q_out + field grid (one readback) ──
          * Read from prev_hit_ssbo() — the buffer that T3 JUST finished writing,
          * now flipped away from the active write side.  Wait on its fence first
@@ -9236,7 +9843,7 @@ public:
                 fence_hit[prev_idx] = nullptr;
             }
 
-            const bool gpu_field_display_done =
+            const bool gpu_field_display_done = use_gpu_resident ? false :
                 dispatch_field_display_from_hits(ps, prev_hit_ssbo(), n_hits, nb);
             const bool do_field = ps.cfg.gpu_segment_field_capture
                                   && ps.st && ps.st->camera_field_grid
@@ -9246,7 +9853,7 @@ public:
              * capture is disabled, and there are no parametric groups to count. */
             const int  q_space   = Q_OUT_VIS_CAP - (int)ps.Q_out.size();
             const bool do_stats  = ps.st && !ps.st->gid_manifold_stats.empty();
-            if (q_space > 0 || do_field || do_stats) {
+            if ((q_space > 0 || do_field || do_stats) && !ps.cfg.gpu_skip_record_readback) {
                 /* Readback window: vis cap for STRIKE, Q_OUT_VIS_CAP for stats
                  * (bounded so stats-only mode stays within the same PCIe budget),
                  * n_hits only for field capture. */
@@ -9356,8 +9963,10 @@ public:
          * already-read counters[] so we don't need an extra SSBO read at end.
          * prev_no tracks the running optical pointer for the post-loop clamping. */
         {
-            /* Track running optical count for post-loop deferred readback. */
-            prev_no = std::min((int)counters[4], max_bdpt_o);
+            /* Track running optical count for post-loop deferred readback.
+             * Only valid in debug mode where the counter readback ran. */
+            if (!use_gpu_resident)
+                prev_no = std::min((int)counters[4], max_bdpt_o);
         }
 
         total_n_hits += n_hits;
@@ -9366,10 +9975,13 @@ public:
          * (OutBuf head) in INTENT_STRIDE layout \u2014 identical to T1's input format.
          * Swap the SSBO handles so T1 reads them directly on the next bounce;
          * no data is moved across PCIe between generations.                    */
-        if (nc <= 0) break;
+        /* Debug mode: exit when T3 produced no children.
+         * Production mode: always swap — next T1 gets nc from counters[8];
+         * if nc==0 it dispatches 1 workgroup that returns immediately (free). */
+        if (!use_gpu_resident && nc <= 0) break;
         std::swap(ssbo_intent, ssbo_child_int);
-        cap_intents = cap_children;  /* reflect new ssbo_intent's capacity */
-        n = nc;
+        cap_intents = cap_children;
+        if (!use_gpu_resident) n = nc;  /* production: T1 reads n_intents from counters[8] */
         first_gen = false;
 
         }  /* end bounce loop */
@@ -9377,7 +9989,10 @@ public:
         /* ── Post-loop BDPT side-data readback: one batch for ALL bounces ──
          * ssbo_t3_meta[bdpt_count_base..+2] = total vert/spectral/pdf counts.
          * counters[4] (optical) = running total captured in prev_no on last bounce.
-         * Read all records in one GetBufferSubData per type. */
+         * Skipped in production GPU mode (Pass D): BDPT vertex records remain in
+         * ssbo_bdpt_output; the connection pass is a no-op until a GPU-native T5
+         * path reads them directly. */
+        if (!ps.cfg.gpu_skip_record_readback)
         {
             uint32_t bdpt_cnts[3] = {};
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
@@ -9521,6 +10136,17 @@ public:
             }
         }
 
+        /* Pass B: rate-limited GPU→CPU shadow readback for get_sensor_image().
+         * Capped at ~20 Hz so display stays responsive without thrashing PCIe. */
+        if (ps.cfg.gpu_skip_record_readback && ssbo_sensor_rgb != 0) {
+            static auto last_shadow_t = std::chrono::steady_clock::time_point{};
+            const auto  now_t = std::chrono::steady_clock::now();
+            if (std::chrono::duration<float>(now_t - last_shadow_t).count() >= 0.050f) {
+                last_shadow_t = now_t;
+                refresh_sensor_gpu_shadow(ps);
+            }
+        }
+
         /* Children were fully consumed GPU-resident; none escaped to Q_intent. */
         if (out_flash_children)  *out_flash_children  = 0;
         if (out_sensor_children) *out_sensor_children = 0;
@@ -9654,6 +10280,10 @@ public:
             if (n < 0) {
                 if (t5_job_ready.load(std::memory_order_acquire))
                     service_t5_job(ps);
+                if (dbg_job_ready.load(std::memory_order_acquire))
+                    service_debug_readback_job(ps);
+                if (ps.bdpt_gpu_t5_pending.load(std::memory_order_acquire))
+                    service_gpu_native_t5(ps);
                 /* T5 is now woken by bdpt_update_inflight via Q_t5_ready.
                  * Nothing to poll here. */
                 continue;
@@ -9673,9 +10303,13 @@ public:
                         dispatch_t4_step(ps, ps.arenas[static_cast<size_t>(wi.arena_id)]);
                     ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
                 }
-                /* Service any outstanding T5 job before exiting */
+                /* Service any outstanding T5 / debug / native-T5 jobs before exiting */
                 if (t5_job_ready.load(std::memory_order_acquire))
                     service_t5_job(ps);
+                if (dbg_job_ready.load(std::memory_order_acquire))
+                    service_debug_readback_job(ps);
+                if (ps.bdpt_gpu_t5_pending.load(std::memory_order_acquire))
+                    service_gpu_native_t5(ps);
                 break;
             }
 
@@ -9689,17 +10323,6 @@ public:
                 int64_t flash_children = 0, sensor_children = 0;
                 int n_hits = dispatch_t1_t2_t3(ps, batch,
                                                &flash_children, &sensor_children);
-                /* Harvest Eigen amp allocations from the just-processed batch into
-                 * the recycling pool.  dispatch_t1_t2_t3 has already read all amp
-                 * data into the flat ibuf; the VXcd heap blocks are now idle until
-                 * batch.clear() would free them.  Moving them into the pool lets
-                 * the next child-intent build reuse them without new malloc calls. */
-                {
-                    const int bsz = (int)batch.size();
-                    if ((int)stg_amp_recycle.size() < bsz) stg_amp_recycle.resize(bsz);
-                    for (int i = 0; i < bsz; ++i)
-                        stg_amp_recycle[i] = std::move(batch[i].amp);
-                }
                 for (int i = 0; i < n; ++i)
                     ps.in_flight.fetch_sub(1, std::memory_order_acq_rel);
                 /* Net per-family inflight change: children spawned minus parents done. */
@@ -9799,6 +10422,86 @@ public:
         /* Light verts and spectral weights are the same for every sensor tile. */
         if (nlv) upload(ssbo_t5_light,    lv.data(), (GLsizeiptr)(nlv * sizeof(float)));
         if (nsw) upload(ssbo_t5_spectral, sw.data(), (GLsizeiptr)(nsw * sizeof(float)));
+
+        /* ── Pass C: GPU-resident T5 accumulation ─────────────────────────── *
+         * Skip the tile loop entirely.  Bind ssbo_sensor_rgb at binding 2 so   *
+         * the T5 shader writes directly into the global sensor accumulator.     *
+         * tile_w = 0 / tile_h = 0 tells the shader to use full global coords.  *
+         * Returns an empty pixel vector — the caller's merge guard at            *
+         *   if (gpu_t5_ok && !gpu_pixel_result.empty())                         *
+         * already skips the merge, so CPU sensor_accum is untouched.           */
+        if (ps.cfg.gpu_skip_record_readback && prog_t5) {
+            ensure_sensor_rgb_ssbo(par.sensor_res);
+        }
+        if (ps.cfg.gpu_skip_record_readback && ssbo_sensor_rgb != 0
+                && sensor_rgb_res == par.sensor_res && prog_t5)
+        {
+            const uint32_t T5_LIGHT_BATCH_C = t5_light_batch_size ? t5_light_batch_size : 4096u;
+            const uint32_t T5_CAM_BATCH_C   = t5_cam_batch_size   ? t5_cam_batch_size   : 8192u;
+            const uint32_t n_light_c  = par.n_light_verts;
+            const uint32_t n_batches_c = (n_light_c + T5_LIGHT_BATCH_C - 1u) / T5_LIGHT_BATCH_C;
+            const uint32_t n_cv_total  = (uint32_t)(ncv / (int)T5_CGV_STRIDE);
+            const uint32_t n_cbatches_c = (n_cv_total + T5_CAM_BATCH_C - 1u) / T5_CAM_BATCH_C;
+
+            /* Upload all cam verts at once — no tile filtering in production mode. */
+            if (ncv > cap_t5_cam) {
+                cap_t5_cam = ncv * 2;
+                ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)(cap_t5_cam * sizeof(float)));
+            }
+            upload(ssbo_t5_cam, cv.data(), (GLsizeiptr)(ncv * sizeof(float)));
+
+            glc_UseProgram(prog_t5);
+            bind_ssbo(ssbo_t5_light,    0);
+            bind_ssbo(ssbo_t5_cam,      1);
+            bind_ssbo(ssbo_sensor_rgb,  2);   /* global accumulator, not tile-local */
+            bind_ssbo(ssbo_t5_params,   3);
+            bind_ssbo(ssbo_t5_spectral, 4);
+            bind_ssbo(ssbo_bvh,         5);
+            bind_ssbo(ssbo_tri_id,      6);
+            bind_ssbo(ssbo_tri_full,    7);
+
+            /* tile_w = 0 / tile_h = 0 → shader uses global pixel coords */
+            T5GpuParams par_c = par;
+            par_c.tile_w = 0; par_c.tile_h = 0;
+            par_c.tile_x0 = 0; par_c.tile_y0 = 0;
+            par_c.n_light_verts = n_light_c;
+            par_c.n_cam_verts   = n_cv_total;
+
+            bool c_ok = true;
+            for (uint32_t c = 0; c < n_cbatches_c && c_ok; ++c) {
+                const uint32_t cam_off = c * T5_CAM_BATCH_C;
+                par_c.cam_offset = cam_off;
+                for (uint32_t b = 0; b < n_batches_c && c_ok; ++b) {
+                    par_c.light_offset     = b * T5_LIGHT_BATCH_C;
+                    par_c.light_batch_size = T5_LIGHT_BATCH_C;
+                    upload(ssbo_t5_params, &par_c, sizeof(T5GpuParams));
+
+                    const uint32_t n_c = std::min(T5_CAM_BATCH_C, n_cv_total - cam_off);
+                    const uint32_t n_l = std::min(T5_LIGHT_BATCH_C,
+                                                  n_light_c - b * T5_LIGHT_BATCH_C);
+                    const GLuint wg_c = (n_c + 7u) / 8u;
+                    const GLuint wg_l = (n_l + 7u) / 8u;
+                    glc_DispatchCompute(wg_c, wg_l, 1);
+
+                    GLsync fence_c = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                    GLenum finish_err = glc_ClientWaitSync(
+                        fence_c, GL_SYNC_FLUSH_COMMANDS_BIT, 2'000'000'000u);
+                    glc_DeleteSync(fence_c);
+                    if (finish_err == GL_TIMEOUT_EXPIRED || finish_err == GL_WAIT_FAILED) {
+                        fprintf(stderr, "[T5-gpu-C] TDR cbatch=%u lbatch=%u\n", c, b);
+                        fflush(stderr);
+                        c_ok = false;
+                    }
+                }
+            }
+
+            if (c_ok) glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            fprintf(stderr, "[T5-gpu-C] done: %u cam × %u light batches → ssbo_sensor_rgb\n",
+                    n_cbatches_c, n_batches_c);
+            fflush(stderr);
+            job->promise.set_value({});   /* empty result — caller skips CPU merge */
+            return;
+        }
 
         /* ── Batched 2-D dispatch with outer sensor-tile loop ─────────────── *
          * The pixel accumulator grows as 3×res² — at large resolutions this   *
@@ -10003,25 +10706,30 @@ public:
                 }
                 if (!gpu_ok) break;
 
-                /* ── Readback tile pixel accum and scatter into full result ── */
-                fprintf(stderr, "[T5-gpu tile(%d,%d)] readback start\n", tx, ty);
-                fflush(stderr);
-                std::vector<uint32_t> tile_pix(3u * n_tile_pix);
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
-                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
-                                     (GLsizeiptr)(3u * n_tile_pix * sizeof(uint32_t)),
-                                     tile_pix.data());
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                /* ── Readback tile pixel accum and scatter into full result ── *
+                 * Skipped in production GPU mode; result stays zeroed and the   *
+                 * caller receives an empty accumulation until a GPU-resident     *
+                 * sensor buffer is wired (Pass C).                               */
+                if (!ps.cfg.gpu_skip_record_readback) {
+                    fprintf(stderr, "[T5-gpu tile(%d,%d)] readback start\n", tx, ty);
+                    fflush(stderr);
+                    std::vector<uint32_t> tile_pix(3u * n_tile_pix);
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_pix);
+                    glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                         (GLsizeiptr)(3u * n_tile_pix * sizeof(uint32_t)),
+                                         tile_pix.data());
+                    glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 
-                const size_t full_pix = static_cast<size_t>(res) * res;
-                for (int row = 0; row < tile_h; ++row) {
-                    for (int col = 0; col < tile_w; ++col) {
-                        const size_t src = static_cast<size_t>(row) * tile_w + col;
-                        const size_t dst = static_cast<size_t>(tile_y0 + row) * res
-                                         + (tile_x0 + col);
-                        result[dst]                = tile_pix[src];
-                        result[dst + full_pix]     = tile_pix[src + n_tile_pix];
-                        result[dst + 2u * full_pix]= tile_pix[src + 2u * n_tile_pix];
+                    const size_t full_pix = static_cast<size_t>(res) * res;
+                    for (int row = 0; row < tile_h; ++row) {
+                        for (int col = 0; col < tile_w; ++col) {
+                            const size_t src = static_cast<size_t>(row) * tile_w + col;
+                            const size_t dst = static_cast<size_t>(tile_y0 + row) * res
+                                             + (tile_x0 + col);
+                            result[dst]                = tile_pix[src];
+                            result[dst + full_pix]     = tile_pix[src + n_tile_pix];
+                            result[dst + 2u * full_pix]= tile_pix[src + 2u * n_tile_pix];
+                        }
                     }
                 }
 
@@ -11545,6 +12253,35 @@ void ray_pipeline_submit(
     const int    max_q   = ps->cfg.max_intent_queue;
     const double min_amp = ps->cfg.min_amplitude;
 
+    /* Fast path: unbounded queue, no high-priority rays — common for sensor sweeps.
+     * Batch all intents into a single push_many so the queue takes one mutex lock
+     * and emits one notify_one instead of N (eliminates 1M+ lock cycles per sweep). */
+    if (max_q <= 0) {
+        bool any_high_prio = false;
+        for (int i = 0; i < n_intents; ++i) {
+            if (intents[i].priority > 1.0f) { any_high_prio = true; break; }
+        }
+        if (!any_high_prio) {
+            int64_t n_sensor = 0, n_flash = 0;
+            std::vector<RayIntent> batch;
+            batch.reserve(static_cast<size_t>(n_intents));
+            for (int i = 0; i < n_intents; ++i) {
+                RayIntent ri = intents[i];
+                if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
+                if (ri.color_flag == 1u) ++n_sensor; else ++n_flash;
+                batch.push_back(std::move(ri));
+            }
+            ps->in_flight.fetch_add(n_intents, std::memory_order_release);
+            if (n_sensor > 0)
+                ps->bdpt_inflight_sensor.fetch_add(n_sensor, std::memory_order_release);
+            if (n_flash > 0)
+                ps->bdpt_inflight_flash.fetch_add(n_flash, std::memory_order_release);
+            ps->Q_intent.push_many(batch);  /* single mutex lock + notify */
+            return;
+        }
+    }
+
+    /* Slow path: bounded queue, high-priority items, or mixed batch. */
     for (int i = 0; i < n_intents; ++i) {
         RayIntent ri = intents[i];
         if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
@@ -11597,15 +12334,20 @@ int ray_pipeline_submit_emissive_triangles(
     static constexpr int SUBMIT_CHUNK = 262144;
     std::vector<RayIntent> batch;
     batch.reserve(SUBMIT_CHUNK);
-    struct MortonIntent {
+    /* Key-index sort: sort 24-byte keys, not full RayIntent structs.
+     * Moving a RayIntent during sort copies ~200 bytes + a VXcd pointer swap;
+     * for large n this dominates.  Instead sort tiny keys and reorder once. */
+    struct MortonKey {
         uint32_t layer;
         uint32_t morton_key;
         uint32_t domain_ord;
         uint64_t seq;
-        RayIntent intent;
+        uint32_t idx;
     };
-    std::vector<MortonIntent> schedule;
-    schedule.reserve(static_cast<size_t>(std::max(0, rays_per_tri)));
+    std::vector<MortonKey>   sched_keys;
+    std::vector<RayIntent>   sched_intents;
+    sched_keys.reserve(static_cast<size_t>(std::max(0, rays_per_tri)));
+    sched_intents.reserve(static_cast<size_t>(std::max(0, rays_per_tri)));
 
     std::mt19937_64 rng(static_cast<uint64_t>(seed) * 6364136223846793005ULL
                         + 1442695040888963407ULL);
@@ -11891,21 +12633,33 @@ int ray_pipeline_submit_emissive_triangles(
             }
             const uint32_t morton_key = rt_morton_encode4_8(eu, ev, au, av);
             const int mat = T.mat_idx;
-            std::vector<cd> emit(static_cast<size_t>(nb), cd(0.0, 0.0));
+            cd emit[MAX_SPECTRAL_BANDS] = {};
             double emit_sum = 0.0;
             for (int b = 0; b < nb; ++b) {
                 const double e = std::max(0.0, static_cast<double>(mat_band_record(st, mat, b)[5]));
                 const double a = scale * domain.geom_area * e / static_cast<double>(std::max(1, n_domain));
-                emit[static_cast<size_t>(b)] = cd(a, 0.0);
+                emit[b] = cd(a, 0.0);
                 emit_sum += a;
             }
             if (!(emit_sum > 0.0)) continue;
             RayIntent ri{};
             ri.pos = origin + dir * (EPS * 200.0);
             ri.dir = dir;
-            ri.amp.resize(nb);
-            for (int b = 0; b < nb; ++b)
-                ri.amp[b] = emit[static_cast<size_t>(b)];
+            /* Use scalar fast-path when all bands have equal real amplitude and zero imag.
+             * This is always the case for nb==1 and common for uniform-emitter materials. */
+            {
+                bool all_same = true;
+                for (int b = 1; b < nb && all_same; ++b)
+                    all_same = (emit[b] == emit[0]);
+                if (all_same && emit[0].imag() == 0.0) {
+                    ri.amp_scalar  = static_cast<float>(emit[0].real());
+                    ri.amp_n_bands = static_cast<int8_t>(std::min(nb, (int)std::numeric_limits<int8_t>::max()));
+                } else {
+                    ri.amp.resize(nb);
+                    for (int b = 0; b < nb; ++b)
+                        ri.amp[b] = emit[static_cast<size_t>(b)];
+                }
+            }
             ri.src_id = static_cast<int>(di);
             ri.tag = (static_cast<uint64_t>(static_cast<uint32_t>(tri_id)) << 32)
                    | static_cast<uint64_t>(morton_key);
@@ -11984,21 +12738,24 @@ int ray_pipeline_submit_emissive_triangles(
             ri.bdpt_stream = BDPT_SIDE_LIGHT;
             ri.bdpt_strategy = 0u;
             ri.bounce = 1;
-            schedule.push_back(MortonIntent{static_cast<uint32_t>(j), morton_key, static_cast<uint32_t>(di), seq++, std::move(ri)});
+            sched_keys.push_back(MortonKey{static_cast<uint32_t>(j), morton_key, static_cast<uint32_t>(di), seq++,
+                                            static_cast<uint32_t>(sched_intents.size())});
+            sched_intents.push_back(std::move(ri));
             ++submitted;
             }
         }
     }
 
-    std::stable_sort(schedule.begin(), schedule.end(),
-                     [](const MortonIntent& a, const MortonIntent& b) {
-                         if (a.layer != b.layer) return a.layer < b.layer;
-                         if (a.domain_ord != b.domain_ord) return a.domain_ord < b.domain_ord;
-                         if (a.morton_key != b.morton_key) return a.morton_key < b.morton_key;
-                         return a.seq < b.seq;
-                     });
-    for (MortonIntent& mi : schedule) {
-        batch.push_back(std::move(mi.intent));
+    /* seq is unique, so std::sort is equivalent to stable_sort here. */
+    std::sort(sched_keys.begin(), sched_keys.end(),
+              [](const MortonKey& a, const MortonKey& b) {
+                  if (a.layer     != b.layer)     return a.layer     < b.layer;
+                  if (a.domain_ord != b.domain_ord) return a.domain_ord < b.domain_ord;
+                  if (a.morton_key != b.morton_key) return a.morton_key < b.morton_key;
+                  return a.seq < b.seq;
+              });
+    for (const MortonKey& mk : sched_keys) {
+        batch.push_back(std::move(sched_intents[mk.idx]));
         if (static_cast<int>(batch.size()) >= SUBMIT_CHUNK)
             flush_batch();
     }
@@ -12202,8 +12959,11 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     if (limit <= 0) return 0;
 
     const double target_x = static_cast<double>(ps->sensor_target_x);
+    const double target_y = static_cast<double>(ps->sensor_target_y);
+    const double target_z = static_cast<double>(ps->sensor_target_z);
     const double target_r = static_cast<double>(ps->sensor_target_r);
-    if (!(target_r > 0.0) || !std::isfinite(target_x))
+    const int target_mode = ps->sensor_target_mode;
+    if (!(target_r > 0.0) || !std::isfinite(target_x) || !std::isfinite(target_y) || !std::isfinite(target_z))
         return 0;
 
     auto aperture_sample_at = [&](int ap_idx, double& dx, double& dy, double& au, double& av) {
@@ -12265,43 +13025,70 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         int pix;
         int ap_idx;
     };
-    std::vector<MortonPixel> pixels;
-    pixels.reserve(static_cast<size_t>(schedule_total));
     const int film_limit = std::max(1, std::min(limit, total));
-    const int coverage_stride = (film_limit > 0)
-        ? static_cast<int>(std::ceil(static_cast<double>(total) / static_cast<double>(film_limit)))
-        : 1;
-    const int tile_side = std::max(1, static_cast<int>(
-        std::ceil(std::sqrt(static_cast<double>(std::max(1, coverage_stride))))));
-    const int tiles_y = std::max(1, (res + tile_side - 1) / tile_side);
-    const int tiles_z = tiles_y;
-    for (int pix = 0; pix < total; ++pix) {
-        const int iy = pix / res;
-        const int iz = pix - iy * res;
-        const int ly = iy % tile_side;
-        const int lz = iz % tile_side;
-        const int ty = iy / tile_side;
-        const int tz = iz / tile_side;
-        const double lu = (static_cast<double>(lz) + 0.5) / static_cast<double>(tile_side);
-        const double lv = (static_cast<double>(ly) + 0.5) / static_cast<double>(tile_side);
-        const double cu = (static_cast<double>(tz) + 0.5) / static_cast<double>(tiles_z);
-        const double cv = (static_cast<double>(ty) + 0.5) / static_cast<double>(tiles_y);
-        const uint32_t local_key = rt_morton_encode4_8(lu, lv, 0.5, 0.5);
-        const uint32_t coarse_key = rt_morton_encode4_8(cu, cv, 0.5, 0.5);
-        for (int ap = 0; ap < n_ap; ++ap) {
-            double adx = 0.0, ady = 0.0, au = 0.5, av = 0.5;
-            aperture_sample_at(ap, adx, ady, au, av);
-            const uint32_t ap_key = rt_morton_encode4_8(0.5, 0.5, au, av);
-            pixels.push_back(MortonPixel{local_key, ap_key, coarse_key, pix, ap});
+
+    /* Pixel schedule cache — the full sorted list is identical across all
+     * batch calls within a sweep (same res/n_ap/seed/film_limit).  Rebuild
+     * only when any of those parameters change; reuse on every subsequent
+     * batch call so the O(n log n) sort runs once per sweep, not once per
+     * batch.  Static is safe because only one pipeline submits at a time. */
+    struct PixSchedCache {
+        int      res        = -1;
+        int      n_ap       = 0;
+        uint64_t seed       = ~uint64_t(0);
+        int      film_limit = -1;
+        std::vector<MortonPixel> pixels;
+    };
+    static PixSchedCache s_pix_sched;
+
+    if (s_pix_sched.res        != res        ||
+        s_pix_sched.n_ap       != n_ap       ||
+        s_pix_sched.seed       != aperture_seed ||
+        s_pix_sched.film_limit != film_limit) {
+
+        const int coverage_stride = (film_limit > 0)
+            ? static_cast<int>(std::ceil(static_cast<double>(total) / static_cast<double>(film_limit)))
+            : 1;
+        const int tile_side = std::max(1, static_cast<int>(
+            std::ceil(std::sqrt(static_cast<double>(std::max(1, coverage_stride))))));
+        const int tiles_y = std::max(1, (res + tile_side - 1) / tile_side);
+        const int tiles_z = tiles_y;
+
+        s_pix_sched.pixels.clear();
+        s_pix_sched.pixels.reserve(static_cast<size_t>(schedule_total));
+        for (int pix = 0; pix < total; ++pix) {
+            const int iy = pix / res;
+            const int iz = pix - iy * res;
+            const int ly = iy % tile_side;
+            const int lz = iz % tile_side;
+            const int ty = iy / tile_side;
+            const int tz = iz / tile_side;
+            const double lu = (static_cast<double>(lz) + 0.5) / static_cast<double>(tile_side);
+            const double lv = (static_cast<double>(ly) + 0.5) / static_cast<double>(tile_side);
+            const double cu = (static_cast<double>(tz) + 0.5) / static_cast<double>(tiles_z);
+            const double cv = (static_cast<double>(ty) + 0.5) / static_cast<double>(tiles_y);
+            const uint32_t local_key  = rt_morton_encode4_8(lu, lv, 0.5, 0.5);
+            const uint32_t coarse_key = rt_morton_encode4_8(cu, cv, 0.5, 0.5);
+            for (int ap = 0; ap < n_ap; ++ap) {
+                double adx = 0.0, ady = 0.0, au = 0.5, av = 0.5;
+                aperture_sample_at(ap, adx, ady, au, av);
+                const uint32_t ap_key = rt_morton_encode4_8(0.5, 0.5, au, av);
+                s_pix_sched.pixels.push_back(MortonPixel{local_key, ap_key, coarse_key, pix, ap});
+            }
         }
+        std::stable_sort(s_pix_sched.pixels.begin(), s_pix_sched.pixels.end(),
+                         [](const MortonPixel& a, const MortonPixel& b) {
+                             if (a.local_key  != b.local_key)  return a.local_key  < b.local_key;
+                             if (a.ap_key     != b.ap_key)     return a.ap_key     < b.ap_key;
+                             if (a.coarse_key != b.coarse_key) return a.coarse_key < b.coarse_key;
+                             return a.pix < b.pix;
+                         });
+        s_pix_sched.res        = res;
+        s_pix_sched.n_ap       = n_ap;
+        s_pix_sched.seed       = aperture_seed;
+        s_pix_sched.film_limit = film_limit;
     }
-    std::stable_sort(pixels.begin(), pixels.end(),
-                     [](const MortonPixel& a, const MortonPixel& b) {
-                         if (a.local_key != b.local_key) return a.local_key < b.local_key;
-                         if (a.ap_key != b.ap_key) return a.ap_key < b.ap_key;
-                         if (a.coarse_key != b.coarse_key) return a.coarse_key < b.coarse_key;
-                         return a.pix < b.pix;
-                     });
+    const std::vector<MortonPixel>& pixels = s_pix_sched.pixels;
 
     static constexpr uint64_t BDPT_FILM_TAG_FLAG = (uint64_t(1) << 63);
     static constexpr int BDPT_FILM_TAG_UV_BITS = 30;
@@ -12333,8 +13120,8 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         V3d pos(static_cast<double>(ps->sensor_px), y, z);
         double ap_dx = 0.0, ap_dy = 0.0, ap_u = 0.5, ap_v = 0.5;
         aperture_sample_at(mp.ap_idx, ap_dx, ap_dy, ap_u, ap_v);
-        V3d target(target_x, target_r * ap_dx, target_r * ap_dy);
-        V3d dir = target - pos;
+        V3d target(target_x, target_y + target_r * ap_dx, target_z + target_r * ap_dy);
+        V3d dir = (target_mode == 1) ? (pos - target) : (target - pos);
         if (dir.squaredNorm() <= 1e-24)
             dir = V3d(-1.0, 0.0, 0.0);
         else
@@ -12343,8 +13130,8 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         RayIntent ri;
         ri.pos = pos + dir * (T_SELF * 256.0);
         ri.dir = dir;
-        ri.amp.resize(n_bands);
-        ri.amp.setConstant(exposure_w * shutter_w);
+        ri.amp_scalar  = static_cast<float>(exposure_w * shutter_w);
+        ri.amp_n_bands = static_cast<int8_t>(std::min(n_bands, (int)std::numeric_limits<int8_t>::max()));
         ri.src_id = pix;
         ri.tag = pack_film_tag(u, v);
         ri.color_flag = 1u;
@@ -13263,6 +14050,37 @@ void ray_pipeline_request_field_display_clear(RayPipelineState* ps)
     ps->gpu_dispatch->field_display_clear_requested.store(true, std::memory_order_release);
 }
 
+void ray_pipeline_set_skip_record_readback(RayPipelineState* ps, bool skip)
+{
+    if (!ps) return;
+    ps->cfg.gpu_skip_record_readback = skip;
+}
+
+/* ── Pass E: bounded debug readback functions ──────────────────────────── *
+ * Never call these from the frame loop.  They block until the GPU thread   *
+ * fulfills the request (serviced on the next Q_intent idle timeout ≤5ms).  */
+static std::vector<float> _debug_readback_impl(
+    RayPipelineState* ps,
+    RayPipelineState::GlPipelineDispatch::DbgKind kind,
+    int max_n)
+{
+    if (!ps || !ps->gpu_dispatch || max_n <= 0) return {};
+    return ps->gpu_dispatch->submit_debug_readback(kind, max_n);
+}
+
+std::vector<float> ray_pipeline_debug_read_hits(RayPipelineState* ps, int max_n) {
+    using K = RayPipelineState::GlPipelineDispatch::DbgKind;
+    return _debug_readback_impl(ps, K::HITS, max_n);
+}
+std::vector<float> ray_pipeline_debug_read_terminals(RayPipelineState* ps, int max_n) {
+    using K = RayPipelineState::GlPipelineDispatch::DbgKind;
+    return _debug_readback_impl(ps, K::TERMINALS, max_n);
+}
+std::vector<float> ray_pipeline_debug_read_bdpt_vertices(RayPipelineState* ps, int max_n) {
+    using K = RayPipelineState::GlPipelineDispatch::DbgKind;
+    return _debug_readback_impl(ps, K::BDPT_VERTS, max_n);
+}
+
 void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,
                                        const float* weights,
                                        int n_bands,
@@ -13328,7 +14146,10 @@ void ray_pipeline_configure_sensor_image(
     int   res,
     float bdpt_eps,
     float target_x,
-    float target_r)
+    float target_r,
+    float target_y,
+    float target_z,
+    int   target_mode)
 {
     if (!ps) return;
     std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2], ps->sensor_mu[3]);
@@ -13338,12 +14159,24 @@ void ray_pipeline_configure_sensor_image(
     ps->sensor_half_h = (plate_half_h > 0.0f) ? plate_half_h : 0.028f;
     ps->sensor_eps    = (bdpt_eps > 0.0f) ? bdpt_eps : 0.008f;
     ps->sensor_target_x = target_x;
+    ps->sensor_target_y = target_y;
+    ps->sensor_target_z = target_z;
     ps->sensor_target_r = target_r;
+    ps->sensor_target_mode = (target_mode == 1) ? 1 : 0;
     /* 4 channels: ch0=R, ch1=G, ch2=B (spectral, all path types), ch3=near-miss */
     ps->sensor_accum.assign(static_cast<size_t>(res) * res * 4, 0.0);
     ps->priority_map.assign(static_cast<size_t>(res) * res, 1.0f);
     /* Reset running peaks so the new accumulator starts fresh. */
     for (int _c = 0; _c < 4; ++_c) ps->sensor_peak[_c] = 1e-30;
+    /* Clear GPU shadow so the next get_sensor_image doesn't serve stale data. */
+    {
+        std::lock_guard<std::mutex> lk_gpu(ps->sensor_gpu_mu);
+        ps->sensor_accum_gpu.clear();
+        for (int _c = 0; _c < 3; ++_c) ps->sensor_peak_gpu[_c] = 1e-30;
+    }
+    /* Request GPU buffer clear (executed on GPU thread via flag, avoids cross-thread GL calls). */
+    if (ps->gpu_dispatch && ps->cfg.gpu_skip_record_readback)
+        ps->gpu_dispatch->clear_sensor_rgb_requested.store(true, std::memory_order_release);
 }
 
 void ray_pipeline_get_sensor_image(
@@ -13353,32 +14186,58 @@ void ray_pipeline_get_sensor_image(
 {
     if (out_res) *out_res = 0;
     if (!ps || ps->sensor_res <= 0) return;
-    std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2]);
     const int res = ps->sensor_res;
     if (out_res) *out_res = res;
     if (!buf) return;
     const size_t pix = static_cast<size_t>(res) * res;
-    /* Peaks are now tracked incrementally at each write to sensor_accum,
-     * so no O(res²) scan is needed here. */
-    const double* peak = ps->sensor_peak;
     const double inv_log10 = 1.0 / std::log(10.0);
     auto tone = [&](double v, double pk) -> float {
         double n = v / pk;
         return static_cast<float>(std::log1p(n * 9.0) * inv_log10);
     };
-    /* Output layout: (res, res, 3) RGB, rows written bottom-first (y-flipped)
-     * so the returned NumPy array is already in OpenGL texture order.
-     * ch0=R, ch1=G, ch2=B — spectral accumulation via band_to_display_rgb;
-     * all path types (forward, backward emissive, BDPT) contribute to each
-     * channel weighted by their spectral composition. */
+
+    /* Pass B/C: GPU shadow path — used when the production readback-skip mode
+     * is active.  Reads from the CPU shadow of ssbo_sensor_rgb (float bit-cast
+     * uint32).  Falls through to the CPU sensor_accum path if shadow is empty. */
+    if (ps->cfg.gpu_skip_record_readback) {
+        std::lock_guard<std::mutex> lk_gpu(ps->sensor_gpu_mu);
+        if (!ps->sensor_accum_gpu.empty()
+                && (int)ps->sensor_accum_gpu.size() >= (int)(3 * pix))
+        {
+            const double* peak = ps->sensor_peak_gpu;
+            const uint32_t* src = ps->sensor_accum_gpu.data();
+            for (int y = 0; y < res; ++y) {
+                const int out_y = res - 1 - y;
+                for (int z = 0; z < res; ++z) {
+                    const size_t sp = static_cast<size_t>(y * res + z);
+                    const size_t dp = static_cast<size_t>(out_y * res + z);
+                    float fr, fg, fb;
+                    std::memcpy(&fr, &src[sp],          sizeof(float));
+                    std::memcpy(&fg, &src[sp + pix],    sizeof(float));
+                    std::memcpy(&fb, &src[sp + 2*pix],  sizeof(float));
+                    buf[dp * 3 + 0] = tone((double)fr, peak[0]);
+                    buf[dp * 3 + 1] = tone((double)fg, peak[1]);
+                    buf[dp * 3 + 2] = tone((double)fb, peak[2]);
+                }
+            }
+            return;
+        }
+    }
+
+    /* CPU path: authoritative when gpu_skip_record_readback is false,
+     * or as a fallback before the first GPU shadow is populated. */
+    std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2]);
+    /* Peaks are tracked incrementally at each write to sensor_accum. */
+    const double* peak = ps->sensor_peak;
+    /* Output layout: (res, res, 3) RGB, rows written bottom-first (y-flipped). */
     for (int y = 0; y < res; ++y) {
-        const int out_y = res - 1 - y;  /* flip for OpenGL bottom-to-top convention */
+        const int out_y = res - 1 - y;
         for (int z = 0; z < res; ++z) {
             const size_t src_px = static_cast<size_t>(y * res + z);
             const size_t dst_px = static_cast<size_t>(out_y * res + z);
-            buf[dst_px * 3 + 0] = tone(ps->sensor_accum[0 * pix + src_px], peak[0]);  /* R */
-            buf[dst_px * 3 + 1] = tone(ps->sensor_accum[1 * pix + src_px], peak[1]);  /* G */
-            buf[dst_px * 3 + 2] = tone(ps->sensor_accum[2 * pix + src_px], peak[2]);  /* B */
+            buf[dst_px * 3 + 0] = tone(ps->sensor_accum[0 * pix + src_px], peak[0]);
+            buf[dst_px * 3 + 1] = tone(ps->sensor_accum[1 * pix + src_px], peak[1]);
+            buf[dst_px * 3 + 2] = tone(ps->sensor_accum[2 * pix + src_px], peak[2]);
         }
     }
 }

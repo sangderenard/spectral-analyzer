@@ -817,7 +817,7 @@ class ImagePlateConfig:
     sensor_half_w: float = 0.028   # half-width  (Y axis) of sensor rectangle, metres
     sensor_half_h: float = 0.028   # half-height (Z axis) of sensor rectangle, metres
     pixels: int = 64          # mesh tessellation rings (polar disc)
-    sensor_res: int = 64      # pixel-grid side length; ~π/4·res² sites active in disc
+    sensor_res: int = 64      # recorded rectangular pixel-grid side length
     bokeh_rays: int = 4       # stencil rays fired per pixel site per call
     bokeh_stencil_frac: float = 0.25  # stencil radius = this fraction of aperture radius
     shutter_mode: str = "open"        # open | closed | iris | sliding_x | sliding_y
@@ -5404,6 +5404,7 @@ class ForwardCppLensBench:
         self._backward_transport_accum: Dict[str, np.ndarray] = {}
         self._bdpt_endpoints: BdptEndpointStore = BdptEndpointStore()
         self._bdpt_segments: BdptSegmentStore = BdptSegmentStore(max_rows=2_000_000)
+        self._collect_bdpt_diagnostics: bool = False  # off by default; enabled only during PDAF probes
         self.enable_python_bdpt_diagnostics: bool = False
         # The C++ display drain returns only binned preview images.  Keep the
         # record-bearing drain as the default so visible sensor perspective and
@@ -6599,9 +6600,18 @@ class ForwardCppLensBench:
         """Zero the C++ sensor_accum so the next exposure frame starts clean."""
         plate = self.scene.image_plate
         res   = int(max(16, plate.sensor_res))
-        target_x, target_r = self._physical_sensor_gate_target()
+        target_center, target_r, target_mode, _target_kind, _target_dir = self._cpp_sensor_target_config()
         self.tracer.configure_sensor_image(
-            float(plate.x), float(plate.sensor_half_w), float(plate.sensor_half_h), res, 0.008, target_x, target_r,
+            float(plate.x),
+            float(plate.sensor_half_w),
+            float(plate.sensor_half_h),
+            res,
+            0.008,
+            float(target_center[0]),
+            float(target_r),
+            float(target_center[1]),
+            float(target_center[2]),
+            int(target_mode),
         )
 
     def _ensure_camera_timeline(self) -> CameraTimeline:
@@ -6660,27 +6670,65 @@ class ForwardCppLensBench:
         )
 
     def _configure_cpp_sensor_image(self, res: int, bdpt_eps: float = 0.008) -> None:
-        # The C++ PIXEL_CONE path only accepts a finite disk to aim at.  Use the
-        # physical gate explicitly; virtual exit pupils are handled by the
-        # Python sensor-ray cache, which can launch away from a virtual origin.
-        target_x, target_r = self._physical_sensor_gate_target()
+        target_center, target_r, target_mode, target_kind, target_dir = self._cpp_sensor_target_config()
         self.tracer.configure_sensor_image(
             float(self.scene.image_plate.x),
             float(self.scene.image_plate.sensor_half_w),
             float(self.scene.image_plate.sensor_half_h),
             int(res),
             float(bdpt_eps),
-            target_x,
-            target_r,
+            float(target_center[0]),
+            float(target_r),
+            float(target_center[1]),
+            float(target_center[2]),
+            int(target_mode),
         )
+        gate_x, gate_r = self._physical_sensor_gate_target()
+        self._sensor_sweep_target_diag = {
+            "sensor_x": float(self.scene.image_plate.x),
+            "target_x": float(target_center[0]),
+            "target_y": float(target_center[1]),
+            "target_z": float(target_center[2]),
+            "target_r": float(target_r),
+            "target_kind": str(target_kind),
+            "target_dir": str(target_dir),
+            "target_mode": int(target_mode),
+            "physical_gate_x": float(gate_x),
+            "physical_gate_r": float(gate_r),
+        }
         print(
             "[sensor-sweep-target]",
             f"sensor_x={float(self.scene.image_plate.x):.4f}",
-            f"target_x={target_x:.4f}",
-            f"target_r={target_r*1e3:.2f}mm",
-            f"mode=physical-gate",
+            f"target_x={float(target_center[0]):.4f}",
+            f"target_y={float(target_center[1])*1e3:.2f}mm",
+            f"target_z={float(target_center[2])*1e3:.2f}mm",
+            f"target_r={float(target_r)*1e3:.2f}mm",
+            f"kind={target_kind}",
+            f"mode={target_dir}",
+            f"physical_gate_x={gate_x:.4f}",
+            f"physical_gate_r={gate_r*1e3:.2f}mm",
             flush=True,
         )
+
+    def _cpp_sensor_target_config(self):
+        """Return native sensor-sweep target center/radius plus launch mode."""
+        target_spec = self._sensor_ray_cache_target_spec()
+        center = np.asarray(target_spec.center, dtype=np.float64).reshape(3)
+        radius = float(target_spec.radius)
+        direction_mode = str(target_spec.direction_mode)
+        kind = str(target_spec.kind)
+        if (
+            radius <= 0.0
+            or not np.all(np.isfinite(center))
+            or direction_mode not in ("toward", "away_from_virtual")
+        ):
+            target_x, target_r = self._physical_sensor_gate_target()
+            center = np.asarray([target_x, 0.0, 0.0], dtype=np.float64)
+            radius = float(target_r)
+            direction_mode = "toward"
+            kind = "physical_aperture"
+        target_mode = 1 if direction_mode == "away_from_virtual" else 0
+        return center, float(max(1.0e-5, radius)), int(target_mode), kind, direction_mode
 
     def _physical_sensor_gate_target(self) -> Tuple[float, float]:
         """Finite physical gate for C++ paths that cannot represent virtual pupils."""
@@ -6729,6 +6777,8 @@ class ForwardCppLensBench:
             round(float(plate.sensor_half_w), 9),
             round(float(plate.sensor_half_h), 9),
             round(float(target[0]), 9),
+            round(float(target[1]), 9),
+            round(float(target[2]), 9),
             round(float(target_spec.radius), 9),
             str(target_spec.kind),
             str(target_spec.direction_mode),
@@ -7166,9 +7216,13 @@ class ForwardCppLensBench:
         """Feed BDPT endpoints immediately from raw drained records.
 
         Called as the very first operation on every drain batch so BDPT
-        accumulates endpoints with zero pipeline delay.
+        accumulates endpoints with zero pipeline delay.  Diagnostic segment
+        and endpoint collection only runs when _collect_bdpt_diagnostics is
+        True (set during PDAF probes).
         """
         if drain_epoch is not None and int(drain_epoch) != int(getattr(self, "_pipeline_reset_epoch", 0)):
+            return
+        if not getattr(self, "_collect_bdpt_diagnostics", False):
             return
         self._append_bdpt_segment_records(records)
         kinds   = np.asarray(records["kind"], dtype=np.uint8)
@@ -7557,7 +7611,7 @@ class ForwardCppLensBench:
                 rgb = np.repeat(amp_v[mask][m_img, None], 3, axis=1).astype(np.float32)
 
             res = int(self._forward_img_res)
-            iy = np.clip(((sy[m_img] + half_w) / (2.0 * half_w) * res).astype(np.int32), 0, res - 1)
+            iy = np.clip(((half_w - sy[m_img]) / (2.0 * half_w) * res).astype(np.int32), 0, res - 1)
             iz = np.clip(((sz[m_img] + half_h) / (2.0 * half_h) * res).astype(np.int32), 0, res - 1)
             flat_idx = (iy * res + iz).astype(np.int64)
             deltas = [
@@ -8098,8 +8152,8 @@ class ForwardCppLensBench:
     def _report_aperture_aim_extrema(self) -> dict:
         """Compute and print the valid backward-ray cone for representative sensor sites.
 
-        For a pixel at transverse height h from the optical axis, and an aperture
-        disk at axial distance d with clear radius r_ap, the valid backward ray
+        For a pixel at transverse height h from the optical axis, and an optical
+        target disk at axial distance d with radius r_ap, the valid backward ray
         directions are those that intersect the disk.  In the meridional plane the
         cone spans [theta_near, theta_far]:
 
@@ -8113,23 +8167,52 @@ class ForwardCppLensBench:
 
         Results are stored in self._aperture_aim_extrema and printed once.
         """
-        ap_cen = getattr(self, "aperture_centroid", None)
-        ap_r   = float(getattr(self, "aperture_radius", 0.0))
+        try:
+            target_spec = self._sensor_ray_cache_target_spec()
+            ap_cen = np.asarray(target_spec.center, dtype=np.float64).reshape(3)
+            ap_r = float(target_spec.radius)
+            target_kind = str(target_spec.kind)
+            target_mode = str(target_spec.direction_mode)
+        except Exception:
+            ap_cen = getattr(self, "aperture_centroid", None)
+            ap_r = float(getattr(self, "aperture_radius", 0.0))
+            target_kind = "physical_aperture"
+            target_mode = "toward"
         plate  = self.scene.image_plate
         plate_x = float(plate.x)
-        plate_r = float(plate.radius)
+        half_w = float(max(1.0e-9, getattr(plate, "sensor_half_w", getattr(plate, "radius", 0.0))))
+        half_h = float(max(1.0e-9, getattr(plate, "sensor_half_h", getattr(plate, "radius", 0.0))))
+        active_corner_r = float(math.hypot(half_w, half_h))
+        physical_back_r = float(getattr(plate, "radius", active_corner_r))
 
         if ap_cen is None or ap_r <= 0.0:
-            print("[aim-extrema] aperture not yet set", flush=True)
+            print("[aim-extrema] sensor target not yet set", flush=True)
             self._aperture_aim_extrema = {}
             return {}
 
         ap_x = float(np.asarray(ap_cen, dtype=np.float64)[0])
         d = abs(plate_x - ap_x)
         if d < 1.0e-6:
-            print("[aim-extrema] aperture and sensor are coplanar", flush=True)
+            print("[aim-extrema] sensor target and sensor are coplanar", flush=True)
             self._aperture_aim_extrema = {}
             return {}
+        gate_x, gate_r = self._physical_sensor_gate_target()
+        print(
+            "[sensor-aim-audit]",
+            f"optical_kind={target_kind}",
+            f"optical_mode={target_mode}",
+            f"target_x={ap_x:.4f}",
+            f"target_r={ap_r*1e3:.2f}mm",
+            f"physical_gate_x={gate_x:.4f}",
+            f"physical_gate_r={gate_r*1e3:.2f}mm",
+            f"recording_half=({half_w*1e3:.1f},{half_h*1e3:.1f})mm",
+            f"recording_corner_r={active_corner_r*1e3:.1f}mm",
+            f"physical_back_r={physical_back_r*1e3:.1f}mm",
+            f"back_margin={(physical_back_r - active_corner_r)*1e3:+.1f}mm",
+            f"dx={(ap_x - gate_x)*1e3:+.2f}mm",
+            f"dr={(ap_r - gate_r)*1e3:+.2f}mm",
+            flush=True,
+        )
 
         # Check camera-frustum constraint: backward rays must also pass through
         # the frustum aperture at scene.exit_pupil_x / scene.exit_pupil_radius.
@@ -8140,8 +8223,10 @@ class ForwardCppLensBench:
         results = {}
         labels_and_heights = [
             ("center", 0.0),
-            ("mid",    0.5 * plate_r),
-            ("edge",   plate_r),
+            ("mid-y", 0.5 * half_w),
+            ("edge-y", half_w),
+            ("edge-z", half_h),
+            ("corner", active_corner_r),
         ]
         for label, h in labels_and_heights:
             theta_near  = math.atan2(h - ap_r, d)
@@ -8172,8 +8257,10 @@ class ForwardCppLensBench:
 
             entry = {
                 "h_sensor_m": h,
-                "ap_x_m": ap_x,
-                "ap_r_m": ap_r,
+                "target_x_m": ap_x,
+                "target_r_m": ap_r,
+                "target_kind": target_kind,
+                "target_mode": target_mode,
                 "d_m": d,
                 "theta_near_rad":  theta_near,
                 "theta_far_rad":   theta_far,
@@ -8186,7 +8273,8 @@ class ForwardCppLensBench:
             print(
                 f"[aim-extrema:{label}]"
                 f"  h={h*1e3:.1f}mm"
-                f"  ap_x={ap_x:.3f}  r={ap_r*1e3:.1f}mm  d={d:.3f}"
+                f"  target_x={ap_x:.3f}  r={ap_r*1e3:.1f}mm  d={d:.3f}"
+                f"  kind={target_kind} mode={target_mode}"
                 f"  near={math.degrees(theta_near):.1f}°"
                 f"  chief={math.degrees(theta_chief):.1f}°"
                 f"  far={math.degrees(theta_far):.1f}°"
@@ -8471,9 +8559,6 @@ class ForwardCppLensBench:
                 n_submit_total += n_submit
                 pix_offset += n_submit
                 self._ensure_drain_loop()
-                # Blue PIP is direct camera perspective and may update during
-                # saturation.  Green/BDPT is gated below on the complete grid.
-                time.sleep(0.002)
                 self.publish_camera_perspective_package()
             if self._drain_stop.is_set() or n_submit_total < schedule_total:
                 return 0
@@ -8607,15 +8692,28 @@ class ForwardCppLensBench:
                 self._bdpt_camera_sweep_stage += 1
                 self._bdpt_native_sensor_sweep_rays += _launched
                 if not getattr(self, "_sensor_sweep_diag_done", False):
-                    _tgt_r = float(getattr(self, "aperture_radius", 0.0))
-                    _tgt_x = float(np.asarray(getattr(
-                        self, "aperture_centroid", np.zeros(3)), dtype=np.float64)[0])
+                    _diag = getattr(self, "_sensor_sweep_target_diag", None)
+                    if not isinstance(_diag, dict):
+                        _center, _r, _mode, _kind, _dir = self._cpp_sensor_target_config()
+                        _diag = {
+                            "target_x": float(_center[0]),
+                            "target_y": float(_center[1]),
+                            "target_z": float(_center[2]),
+                            "target_r": float(_r),
+                            "target_kind": str(_kind),
+                            "target_dir": str(_dir),
+                            "target_mode": int(_mode),
+                        }
                     print(
                         "[sensor-sweep-first-call]",
                         f"launched={_launched}",
                         f"sensor_px={float(self.scene.image_plate.x):.4f}",
-                        f"target_x={_tgt_x:.4f}",
-                        f"target_r={_tgt_r*1e3:.2f}mm",
+                        f"target_x={float(_diag.get('target_x', 0.0)):.4f}",
+                        f"target_y={float(_diag.get('target_y', 0.0))*1e3:.2f}mm",
+                        f"target_z={float(_diag.get('target_z', 0.0))*1e3:.2f}mm",
+                        f"target_r={float(_diag.get('target_r', 0.0))*1e3:.2f}mm",
+                        f"kind={_diag.get('target_kind', '?')}",
+                        f"mode={_diag.get('target_dir', '?')}",
                         f"stage={self._bdpt_camera_sweep_stage}/{_ss['stage_count']}",
                         flush=True,
                     )
@@ -9316,22 +9414,7 @@ class ForwardCppLensBench:
     ) -> int:
         """Launch deterministic sensor rays for one clicked PDAF site."""
         plate = self.scene.image_plate
-        lasm = self._lens_assembly
-        target_center = None
-        target_radius = 0.0
-        if lasm is not None:
-            try:
-                gate_center, gate_radius = lasm.backward_physical_gate_target()
-                if gate_center is not None and float(gate_radius) > 0.0:
-                    target_center = np.asarray(gate_center, dtype=np.float64).reshape(3)
-                    target_radius = float(gate_radius)
-            except Exception:
-                target_center = None
-                target_radius = 0.0
-        if target_center is None or target_radius <= 0.0:
-            target_x, target_r = self._physical_sensor_gate_target()
-            target_center = np.asarray([target_x, 0.0, 0.0], dtype=np.float64)
-            target_radius = float(target_r)
+        target_center, target_radius, target_mode, target_kind, target_dir = self._cpp_sensor_target_config()
         if target_radius <= 0.0:
             return 0
 
@@ -9354,7 +9437,10 @@ class ForwardCppLensBench:
         target_pts[:, 1] = center[1] + rr * np.cos(th)
         target_pts[:, 2] = center[2] + rr * np.sin(th)
 
-        directions = target_pts - origins
+        if int(target_mode) == 1:
+            directions = origins - target_pts
+        else:
+            directions = target_pts - origins
         dn = np.linalg.norm(directions, axis=1)
         valid = np.isfinite(dn) & (dn > EPS)
         if not np.any(valid):
@@ -9409,8 +9495,11 @@ class ForwardCppLensBench:
             f"rays={n}",
             f"site=({site_y*1e3:.1f},{site_z*1e3:.1f})mm",
             f"target_x={float(center[0]):.4f}",
+            f"target_y={float(center[1])*1e3:.2f}mm",
+            f"target_z={float(center[2])*1e3:.2f}mm",
             f"target_r={float(radius)*1e3:.2f}mm",
-            "mode=physical-gate",
+            f"kind={target_kind}",
+            f"mode={target_dir}",
             f"inflight_before={inflight_before}",
             f"q_before={q_before}",
             f"q_done={q_done_before}",
@@ -9491,7 +9580,12 @@ class ForwardCppLensBench:
         n = int(records["kind"].shape[0]) if records else 0
         if n <= 0:
             return 0, 0, 0
-        self._fast_bdpt_feed(records, drain_epoch=int(getattr(self, "_pipeline_reset_epoch", 0)))
+        _prev_diag = self._collect_bdpt_diagnostics
+        self._collect_bdpt_diagnostics = True
+        try:
+            self._fast_bdpt_feed(records, drain_epoch=int(getattr(self, "_pipeline_reset_epoch", 0)))
+        finally:
+            self._collect_bdpt_diagnostics = _prev_diag
         try:
             kinds = np.asarray(records.get("kind", []), dtype=np.uint8)
             cflags = np.asarray(records.get("color_flag", []), dtype=np.uint8)

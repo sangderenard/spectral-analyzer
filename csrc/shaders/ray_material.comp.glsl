@@ -366,14 +366,16 @@ uint  hit_bdpt_sid (uint b) { return floatBitsToUint(HIT(b, 26 + 2 * MAX_BANDS))
 #define BDPT_PDF_FLAG_GGX             (1u << 20)
 #define BDPT_PDF_FLAG_EMISSION        (1u << 21)
 
-void emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, int mat_id,
-                      vec3 pos, vec3 nrm, vec3 dir_in,
-                      float path_len, float path_at_seg, float throughput,
-                      float soy, float soz)
+/* Returns the assigned slot index, or -1 if the buffer is full / BDPT disabled.
+ * The caller uses the slot to write pdf and betas after scatter computation. */
+int emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, int mat_id,
+                     vec3 pos, vec3 nrm, vec3 dir_in,
+                     float path_len, float path_at_seg, float throughput,
+                     float soy, float soz)
 {
-    if (bdpt_max_verts <= 0) return;
+    if (bdpt_max_verts <= 0) return -1;
     uint slot = atomicAdd(meta[bdpt_count_base + 0], 1u);
-    if (int(slot) >= bdpt_max_verts) return;
+    if (int(slot) >= bdpt_max_verts) return -1;
     uint vb = slot * uint(BDPT_VERTEX_STRIDE);
     bdpt_out[vb +  0] = uintBitsToFloat(sid);
     bdpt_out[vb +  1] = uintBitsToFloat(packed_vi);
@@ -388,6 +390,9 @@ void emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, in
     bdpt_out[vb + 16] = 0.0;     bdpt_out[vb + 17] = 0.0;     bdpt_out[vb + 18] = 0.0;
     bdpt_out[vb + 19] = path_len;
     bdpt_out[vb + 20] = path_at_seg;
+    /* [21] pdf_fwd   — filled by fill_bdpt_vertex_pdf() after scatter         */
+    /* [22] pdf_rev   — filled by fill_bdpt_vertex_pdf()                       */
+    /* [23] pdf_flags — filled by fill_bdpt_vertex_pdf()                       */
     bdpt_out[vb + 21] = 0.0;
     bdpt_out[vb + 22] = 0.0;
     bdpt_out[vb + 23] = 0.0;
@@ -395,6 +400,18 @@ void emit_bdpt_vertex(uint sid, uint packed_vi, uint tri_flags_u, int tri_id, in
     bdpt_out[vb + 25] = throughput;
     bdpt_out[vb + 26] = soy;
     bdpt_out[vb + 27] = soz;
+    return int(slot);
+}
+
+/* Write pdf_fwd, pdf_rev, and flags into the vertex record AFTER scatter.
+ * Betas (|amp[b]|) are computed in the pack shader from throughput — not stored here. */
+void fill_bdpt_vertex_pdf(int slot, float pdf_fwd, float pdf_rev, uint flags)
+{
+    if (slot < 0) return;
+    uint vb = uint(slot) * uint(BDPT_VERTEX_STRIDE);
+    bdpt_out[vb + 21] = pdf_fwd;
+    bdpt_out[vb + 22] = pdf_rev;
+    bdpt_out[vb + 23] = uintBitsToFloat(flags);
 }
 
 void emit_bdpt_spectral(uint sid, uint vi_band, float re, float im, float band_pdf)
@@ -542,6 +559,7 @@ void main() {
     uint bdpt_sid      = hit_bdpt_sid(hbase);
     uint bdpt_vi       = uint(bounce) & 0xFFFFu;
     float bdpt_band_pdf = (nb > 0) ? 1.0 / float(nb) : 1.0;
+    int g_bdpt_slot = -1;  /* vertex slot returned by emit_bdpt_vertex, used by fill_bdpt_vertex_pdf */
     if (bdpt_sid != 0u && bdpt_max_verts > 0) {
         uint vi         = bdpt_vi;
         uint stream_bit = (cflag == 1u) ? 1u : 0u;  /* 1=SENSOR, 0=LIGHT */
@@ -552,11 +570,12 @@ void main() {
         float throughput = 0.0;
         for (int b = 0; b < nb; b++)
             throughput += sqrt(amp_re[b] * amp_re[b] + amp_im[b] * amp_im[b]);
-        emit_bdpt_vertex(bdpt_sid, packed_vi, tflags_u, tri_idx_v, mat_id_v,
-                         pos, nrm, in_dir,
-                         path_len, hit_pathatseg(hbase),
-                         throughput, soy, soz);
-        /* spectral emit moved to post-scatter branches below */
+        g_bdpt_slot = emit_bdpt_vertex(bdpt_sid, packed_vi, tflags_u, tri_idx_v, mat_id_v,
+                                       pos, nrm, in_dir,
+                                       path_len, hit_pathatseg(hbase),
+                                       throughput, soy, soz);
+        /* spectral emit moved to post-scatter branches below.
+         * fill_bdpt_vertex_pdf() is called at each branch once pdf values are known. */
     }
 
     /* Absorb: T2 rejected this ray via parametric acceptance boundary (bit 3).
@@ -689,6 +708,9 @@ void main() {
                       cos_i / 3.141592653589793,
                       uint(flags) | BDPT_PDF_FLAG_EMISSION,
                       nrm, in_dir, in_dir);
+        fill_bdpt_vertex_pdf(g_bdpt_slot,
+                             cos_i / 3.141592653589793, cos_i / 3.141592653589793,
+                             uint(flags) | BDPT_PDF_FLAG_EMISSION);
         if (bdpt_sid != 0u && bdpt_max_verts > 0) {
             for (int b = 0; b < nb; b++) {
                 uint vi_band = (bdpt_vi << 16) | uint(b);
@@ -760,6 +782,9 @@ void main() {
             emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, 1.0, 1.0,
                           uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR,
                           nrm, in_dir, rd);
+            fill_bdpt_vertex_pdf(g_bdpt_slot, 1.0, 1.0,
+                                 uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR);
+            g_bdpt_slot = -1;
             if (bdpt_sid != 0u && bdpt_max_verts > 0) {
                 for (int b = 0; b < nb; b++) {
                     uint vi_band = (bdpt_vi << 16) | uint(b);
@@ -793,6 +818,9 @@ void main() {
                     emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, R, R,
                                   uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
                                   nrm, in_dir, rd);
+                    fill_bdpt_vertex_pdf(g_bdpt_slot, R, R,
+                                        uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
+                    g_bdpt_slot = -1;
                     if (bdpt_sid != 0u && bdpt_max_verts > 0) {
                         for (int b = 0; b < nb; b++) {
                             uint vi_band = (bdpt_vi << 16) | uint(b);
@@ -851,6 +879,9 @@ void main() {
                 float pdf_rev = (u < R) ? R : (1.0 - R_rev);
                 emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, pdf_fwd, pdf_rev,
                               uint(flags) | pdf_flags, nrm, in_dir, cdir);
+                fill_bdpt_vertex_pdf(g_bdpt_slot, pdf_fwd, pdf_rev,
+                                     uint(flags) | pdf_flags);
+                g_bdpt_slot = -1;
                 if (bdpt_sid != 0u && bdpt_max_verts > 0) {
                     for (int b = 0; b < nb; b++) {
                         uint vi_band = (bdpt_vi << 16) | uint(b);
@@ -923,6 +954,9 @@ void main() {
             }
             emit_bdpt_pdf(bdpt_sid, uint(bounce), scatter_domain, scatter_pdf, scatter_pdf_rev,
                           uint(flags) | scatter_flags, nrm, in_dir, new_dir);
+            fill_bdpt_vertex_pdf(g_bdpt_slot, scatter_pdf, scatter_pdf_rev,
+                                 uint(flags) | scatter_flags);
+            g_bdpt_slot = -1;
             /* Post-scatter spectral emit: na_re/na_im = amp × mat_refl — encodes material color */
             if (bdpt_sid != 0u && bdpt_max_verts > 0) {
                 for (int b = 0; b < nb; b++) {

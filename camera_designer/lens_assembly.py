@@ -310,13 +310,16 @@ class LensAssemblySpec:
         """Register the sensor plate as a part of this assembly (StraightBoxSpec).
 
         After this call straight_section encodes the sensor plane position and
-        half-size, derived from scene.image_plate and optics.side("back").
+        active recording half-size, derived from scene.image_plate and
+        optics.side("back").  scene.image_plate.radius is the physical back
+        disc/circumscribed image circle, not the managed recording rectangle.
         """
         plate = getattr(scene, "image_plate", None)
         if plate is None:
             return
         sensor_x = float(plate.x)
-        sensor_r = float(getattr(plate, "radius", 0.0))
+        sensor_half_w = float(getattr(plate, "sensor_half_w", getattr(plate, "radius", 0.0)))
+        sensor_half_h = float(getattr(plate, "sensor_half_h", getattr(plate, "radius", 0.0)))
         x_exit: Optional[float] = None
         if self.optics is not None:
             try:
@@ -330,8 +333,8 @@ class LensAssemblySpec:
         # x_exit < sensor_x, so z_front=sensor_x and depth=sensor_x-x_exit.
         depth = max(1.0e-4, float(sensor_x) - float(x_exit))
         self.straight_section = StraightBoxSpec(
-            half_w=float(sensor_r),
-            half_h=float(sensor_r),
+            half_w=float(sensor_half_w),
+            half_h=float(sensor_half_h),
             z_front=float(sensor_x),
             depth=float(depth),
             sensor_z_offset=0.0,            # sensor plane = z_front = sensor_x

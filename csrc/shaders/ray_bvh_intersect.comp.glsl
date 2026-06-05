@@ -123,7 +123,11 @@ layout(std430, binding = 7) readonly buffer SceneBandBuf{ float scene_bands[];};
 uniform vec4  u_arenas[16];   /* xyz=center, w=radius */
 
 /* ── Uniforms ───────────────────────────────────────────────────────────── */
-uniform int   n_intents;
+/* n_intents is now read from counters[8] (written by post_t3_prep for bounce>0
+ * and by the C++ host for bounce 0).  The uniform is kept as a compile-time
+ * fallback (value -1) so old pipelined paths that do not set counters[8]
+ * continue to work via the counters[0]-based guard in T3. */
+uniform int   n_intents;  /* unused at runtime — counters[8] is the live source */
 uniform int   n_bands;
 uniform int   n_mats;
 uniform int   n_arenas;
@@ -205,7 +209,9 @@ float mat_n_imag_gpu(int mat, int b) {
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
-    if (int(gid) >= n_intents) return;
+    /* counters[8] = n_intents: written by C++ host before every T1 dispatch.
+     * gpu-resident bounce>0: post_t3_prep updates it to nc after T3. */
+    if (gid >= counters[8]) return;
 
     int ib = int(gid) * INTENT_STRIDE;
 

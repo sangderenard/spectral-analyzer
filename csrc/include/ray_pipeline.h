@@ -68,6 +68,13 @@ struct RayIntent {
     uint16_t         bdpt_vertex       = 0u;
     uint8_t          bdpt_stream       = 0u;
     uint8_t          bdpt_strategy     = 0u;
+
+    /* Scalar amplitude fast-path: when amp_n_bands > 0 the amp Eigen vector
+     * is NOT allocated.  All bands carry (amp_scalar, 0i).  Only valid for
+     * initial submissions; GPU child intents are packed directly from SSBO.
+     * The GPU dispatch pack loop checks this and skips the heap pointer. */
+    float            amp_scalar        = 0.0f;
+    int8_t           amp_n_bands       = 0;    /* 0 = use amp VXcd; >0 = use amp_scalar */
 };
 
 struct HitRecord {
@@ -282,6 +289,7 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             if (done_) return false;
             q_.push_front(std::move(item));
+            ++n_high_priority_;
         }
         cv_.notify_one();
         return true;
@@ -441,19 +449,15 @@ public:
         {
             std::lock_guard<std::mutex> lk(mu_);
             if (done_) return 0;
-            bool has_hi = false;
-            for (const T& item : q_) {
-                if (key_fn(item) > threshold) {
-                    has_hi = true;
-                    break;
-                }
-            }
+            /* Skip O(n) scan when no push_front items exist in queue. */
+            const bool has_hi = n_high_priority_ > 0;
             int n = 0;
             if (has_hi) {
                 for (auto it = q_.begin(); it != q_.end() && n < max_n; ) {
                     if (key_fn(*it) > threshold) {
                         out.push_back(std::move(*it));
                         it = q_.erase(it);
+                        --n_high_priority_;
                         ++n;
                     } else {
                         ++it;
@@ -495,19 +499,15 @@ public:
             std::lock_guard<std::mutex> lk(mu_);
             if (done_ && q_.empty()) return 0;
             if (q_.empty()) return -1;
-            bool has_hi = false;
-            for (const T& item : q_) {
-                if (key_fn(item) > threshold) {
-                    has_hi = true;
-                    break;
-                }
-            }
+            /* Skip O(n) scan when no push_front items exist in queue. */
+            const bool has_hi = n_high_priority_ > 0;
             int n = 0;
             if (has_hi) {
                 for (auto it = q_.begin(); it != q_.end() && n < max_n; ) {
                     if (key_fn(*it) > threshold) {
                         out.push_back(std::move(*it));
                         it = q_.erase(it);
+                        --n_high_priority_;
                         ++n;
                     } else {
                         ++it;
@@ -538,19 +538,14 @@ public:
                                  float threshold = 1.0f) {
         std::lock_guard<std::mutex> lk(mu_);
         if (max_n <= 0 || q_.empty()) return 0;
-        bool has_hi = false;
-        for (const T& item : q_) {
-            if (key_fn(item) > threshold) {
-                has_hi = true;
-                break;
-            }
-        }
+        const bool has_hi = n_high_priority_ > 0;
         int n = 0;
         if (has_hi) {
             for (auto it = q_.begin(); it != q_.end() && n < max_n; ) {
                 if (key_fn(*it) > threshold) {
                     out.push_back(std::move(*it));
                     it = q_.erase(it);
+                    --n_high_priority_;
                     ++n;
                 } else {
                     ++it;
@@ -704,6 +699,7 @@ private:
     std::condition_variable cv_;
     std::deque<T>           q_;
     bool                    done_ = false;
+    int                     n_high_priority_ = 0;  /* items pushed via push_front */
 };
 
 /* ─── Wave solver arena ─────────────────────────────────────────────────── */
@@ -926,6 +922,13 @@ struct RayPipelineConfig {
      * this mode fails pipeline creation instead of falling back to CPU. */
     bool        gpu_all_stages = false;
 
+    /* When true, skip per-bounce terminal-record, hit-record, and T5 tile
+     * readbacks to CPU.  Enabled for production GPU-resident rendering; the
+     * display image goes dark until a GPU-side sensor accumulator is wired
+     * (Pass B/C).  Has no effect when use_gpu_compute is false.
+     * Settable at runtime via ray_pipeline_set_skip_record_readback(). */
+    bool        gpu_skip_record_readback = false;
+
     /* Handle to the display GL context (e.g. Pygame's HGLRC on Windows).
      * When non-zero the compute context is created as a share partner of this
      * context so all GL objects (SSBOs, textures) are visible in both.
@@ -964,6 +967,18 @@ void ray_pipeline_set_uv_blit_weights(RayPipelineState* ps,
                                        const float* weights,
                                        int n_bands,
                                        int mode);
+
+/* Toggle the production readback-skip flag at runtime.
+ * Safe to call concurrently; takes effect on the next GPU bounce. */
+void ray_pipeline_set_skip_record_readback(RayPipelineState* ps, bool skip);
+
+/* ── Pass E: explicit debug readback taps ──────────────────────────────── *
+ * Returns a flat float32 buffer from the last completed GPU batch.        *
+ * Blocks until the GPU thread services the request (≤ ~5 ms idle window). *
+ * Never call from the normal frame loop.                                  */
+std::vector<float> ray_pipeline_debug_read_hits        (RayPipelineState* ps, int max_n);
+std::vector<float> ray_pipeline_debug_read_terminals   (RayPipelineState* ps, int max_n);
+std::vector<float> ray_pipeline_debug_read_bdpt_vertices(RayPipelineState* ps, int max_n);
 
 /* Feed display frame timing back into the GPU producer governor.
  * frame_ms  : most recent interactive frame time.
@@ -1146,7 +1161,10 @@ void ray_pipeline_configure_sensor_image(
     int   res,
     float bdpt_eps,
     float target_x,
-    float target_r);
+    float target_r,
+    float target_y,
+    float target_z,
+    int   target_mode);
 
 /* Copy current sensor image into caller-owned float32 buffer.
  * buf must hold res*res*3 floats (row-major RGB).

@@ -552,7 +552,10 @@ struct PyRayTracer
     int   _sensor_res          = 0;
     float _sensor_bdpt_eps     = 0.008f;
     float _sensor_target_x     = 0.0f;
+    float _sensor_target_y     = 0.0f;
+    float _sensor_target_z     = 0.0f;
     float _sensor_target_r     = 0.0f;
+    int   _sensor_target_mode  = 0;
     std::atomic<uint32_t> _bdpt_subpath_counter{1u};
 
     /* T5 connection config */
@@ -571,6 +574,7 @@ struct PyRayTracer
      * can enable the GPU backend.  Ignored after the pipeline is created. */
     bool        _use_gpu_compute = false;
     bool        _gpu_all_stages  = false;
+    bool        _gpu_skip_record_readback = false;
     std::string _shader_dir;
     uint64_t    _gl_display_hglrc = 0;  /* Pygame display HGLRC for WGL object sharing */
     uint64_t    _gl_display_hdc   = 0;  /* Pygame display HDC for pixel-format matching */
@@ -586,9 +590,10 @@ struct PyRayTracer
             cfg.seed                = seed;
             cfg.min_amplitude       = _default_min_amplitude;
             cfg.max_intent_queue    = _max_intent_queue;
-            cfg.use_gpu_compute         = _use_gpu_compute;
-            cfg.gpu_all_stages          = _gpu_all_stages;
-            cfg.shader_dir              = _shader_dir;
+            cfg.use_gpu_compute             = _use_gpu_compute;
+            cfg.gpu_all_stages              = _gpu_all_stages;
+            cfg.gpu_skip_record_readback    = _gpu_skip_record_readback;
+            cfg.shader_dir                  = _shader_dir;
             cfg.gl_display_hglrc        = _gl_display_hglrc;
             cfg.gl_display_hdc          = _gl_display_hdc;
             cfg.t5_min_geom             = _t5_min_geom;
@@ -606,7 +611,8 @@ struct PyRayTracer
                 ray_pipeline_configure_sensor_image(
                     _pipeline, _sensor_plate_x, _sensor_plate_half_w, _sensor_plate_half_h,
                     _sensor_res, _sensor_bdpt_eps,
-                    _sensor_target_x, _sensor_target_r);
+                    _sensor_target_x, _sensor_target_r,
+                    _sensor_target_y, _sensor_target_z, _sensor_target_mode);
             if (_uv_blit_n_bands > 0)
                 ray_pipeline_set_uv_blit_weights(
                     _pipeline, _uv_blit_weights.data(),
@@ -1929,8 +1935,8 @@ struct PyRayTracer
                 tg[i] = r.tag;
                 si[i] = r.src_id;
                 bo[i] = r.bounce;
-                ss[i*3+0]=r.seg_start[0]; ss[i*3+1]=r.seg_start[1]; ss[i*3+2]=r.seg_start[2];
-                po[i*3+0]=r.pos[0];       po[i*3+1]=r.pos[1];       po[i*3+2]=r.pos[2];
+                std::memcpy(&ss[i*3], r.seg_start, 3*sizeof(float));
+                std::memcpy(&po[i*3], r.pos,       3*sizeof(float));
                 cf[i] = r.color_flag;
                 ht[i] = r.hit_tri;
                 hg[i] = r.hit_group_id;
@@ -1938,8 +1944,10 @@ struct PyRayTracer
                 soy[i] = r.sensor_origin_y;
                 soz[i] = r.sensor_origin_z;
                 const int cap = std::min((int)r.n_bands, nb);
-                for (int b = 0;   b < cap; ++b) { re[i*nb+b]=r.amp_re[b]; im[i*nb+b]=r.amp_im[b]; }
-                for (int b = cap; b < nb;  ++b) { re[i*nb+b]=0.f;         im[i*nb+b]=0.f; }
+                std::memcpy(&re[i*nb], r.amp_re, (size_t)cap * sizeof(float));
+                if (cap < nb) std::memset(&re[i*nb+cap], 0, (size_t)(nb-cap) * sizeof(float));
+                std::memcpy(&im[i*nb], r.amp_im, (size_t)cap * sizeof(float));
+                if (cap < nb) std::memset(&im[i*nb+cap], 0, (size_t)(nb-cap) * sizeof(float));
             }
         }
         py::dict out;
@@ -2136,7 +2144,9 @@ struct PyRayTracer
      * bdpt_eps: YZ proximity threshold in metres for BDPT snap. */
     void configure_sensor_image(float plate_x, float plate_half_w, float plate_half_h,
                                 int res, float bdpt_eps,
-                                float target_x = 0.0f, float target_r = 0.0f) {
+                                float target_x = 0.0f, float target_r = 0.0f,
+                                float target_y = 0.0f, float target_z = 0.0f,
+                                int target_mode = 0) {
         /* Cache params unconditionally — pipeline may not exist yet (it is
          * created lazily on the first submit_rays call).  _get_pipeline will
          * apply these stored values when it constructs the pipeline. */
@@ -2146,11 +2156,15 @@ struct PyRayTracer
         _sensor_res          = res;
         _sensor_bdpt_eps     = bdpt_eps;
         _sensor_target_x     = target_x;
+        _sensor_target_y     = target_y;
+        _sensor_target_z     = target_z;
         _sensor_target_r     = target_r;
+        _sensor_target_mode  = (target_mode == 1) ? 1 : 0;
         if (_pipeline)
             ray_pipeline_configure_sensor_image(_pipeline, plate_x, plate_half_w, plate_half_h,
                                                 res, bdpt_eps,
-                                                target_x, target_r);
+                                                target_x, target_r,
+                                                target_y, target_z, target_mode);
     }
 
     /* ── GPU T3 bridge ─────────────────────────────────────────────────────
@@ -5655,11 +5669,15 @@ Typical values: 0.0 (off), 0.25 (mild), 0.75 (strong).)doc")
              py::arg("plate_x"), py::arg("plate_half_w"), py::arg("plate_half_h"),
              py::arg("res"), py::arg("bdpt_eps"),
              py::arg("target_x") = 0.0f, py::arg("target_r") = 0.0f,
+             py::arg("target_y") = 0.0f, py::arg("target_z") = 0.0f,
+             py::arg("target_mode") = 0,
 R"doc(Configure sensor-plane image accumulator.
 plate_x: world X of the sensor rectangle centre; plate_half_w: half-width (Y axis, metres);
 plate_half_h: half-height (Z axis, metres);
 res: pixel grid side (res×res); bdpt_eps: YZ proximity threshold for BDPT snap.
 target_x/target_r: camera projection target, normally the assembly exit pupil.
+target_y/target_z: transverse centre of that target disk.
+target_mode: 0 launches toward the target disk; 1 launches away from a virtual target.
 Resets accumulator.  Call before submitting rays.)doc")
         .def("get_sensor_image",
              &PyRayTracer::get_sensor_image,
@@ -6635,6 +6653,62 @@ cos_avg  : float32 (n_tris,)         mean |cos θ| of incidence; use 1.0 for
              },
              "List UV accumulator groups with cheap telemetry.")
         /* ── WGL context sharing / GPU-direct UV blit ─────────────────────── */
+        .def("set_gpu_skip_record_readback",
+             [](PyRayTracer& self, bool skip) {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 self._gpu_skip_record_readback = skip;
+                 if (self._pipeline)
+                     ray_pipeline_set_skip_record_readback(self._pipeline, skip);
+             },
+             py::arg("skip"),
+             R"doc(Toggle production GPU mode: skip per-bounce terminal, hit-record, and
+T5 tile readbacks to CPU.  When True the display image goes dark until a
+GPU-resident sensor accumulator is wired.  Safe to call at any time;
+takes effect on the next GPU bounce.)doc")
+        /* ── Pass E: explicit debug readback taps ──────────────────────────── */
+        .def("debug_read_hits",
+             [](PyRayTracer& self, int max_n) -> py::array_t<float> {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 if (!self._pipeline) return py::array_t<float>();
+                 auto data = ray_pipeline_debug_read_hits(self._pipeline, max_n);
+                 if (data.empty()) return py::array_t<float>();
+                 py::array_t<float> out({(py::ssize_t)data.size()});
+                 std::copy(data.begin(), data.end(), out.mutable_data());
+                 return out;
+             },
+             py::arg("max_n") = 4096,
+             R"doc(Bounded readback of the last GPU hit-record buffer (HIT_STRIDE floats each).
+Returns a 1-D float32 array of length n_actual × HIT_STRIDE.
+Never call from the normal frame loop — for diagnostics only.
+Blocks ≤ ~5 ms for the GPU thread to service the request.)doc")
+        .def("debug_read_terminals",
+             [](PyRayTracer& self, int max_n) -> py::array_t<float> {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 if (!self._pipeline) return py::array_t<float>();
+                 auto data = ray_pipeline_debug_read_terminals(self._pipeline, max_n);
+                 if (data.empty()) return py::array_t<float>();
+                 py::array_t<float> out({(py::ssize_t)data.size()});
+                 std::copy(data.begin(), data.end(), out.mutable_data());
+                 return out;
+             },
+             py::arg("max_n") = 4096,
+             R"doc(Bounded readback of T3 terminal records (TERMINAL_STRIDE floats each).
+Returns a 1-D float32 array of length n_actual × TERMINAL_STRIDE.
+Never call from the normal frame loop — for diagnostics only.)doc")
+        .def("debug_read_bdpt_vertices",
+             [](PyRayTracer& self, int max_n) -> py::array_t<float> {
+                 std::lock_guard<std::mutex> lk(self._pipeline_mu);
+                 if (!self._pipeline) return py::array_t<float>();
+                 auto data = ray_pipeline_debug_read_bdpt_vertices(self._pipeline, max_n);
+                 if (data.empty()) return py::array_t<float>();
+                 py::array_t<float> out({(py::ssize_t)data.size()});
+                 std::copy(data.begin(), data.end(), out.mutable_data());
+                 return out;
+             },
+             py::arg("max_n") = 4096,
+             R"doc(Bounded readback of BDPT vertex records from the GPU (28 floats each).
+Returns a 1-D float32 array of length n_actual × 28.
+Never call from the normal frame loop — for diagnostics only.)doc")
         .def("set_gl_display_hglrc",
              [](PyRayTracer& self, uint64_t h) {
                  std::lock_guard<std::mutex> lk(self._pipeline_mu);

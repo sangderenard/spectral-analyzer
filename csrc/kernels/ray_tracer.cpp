@@ -7819,6 +7819,7 @@ public:
     /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
     GLuint prog_t5 = 0;
     GLint  uloc_t5_profile_mode = -1;
+    GLint  uloc_t5_n_mats = -1;
     bool   warned_t5_profile_unavailable = false;
     /* Cached from first dispatch_t1_t2_t3 call — stable for the pipeline lifetime. */
     int    cached_bdpt_count_base = 2;  /* 2 + n_mats; default safe until scene upload */
@@ -9105,6 +9106,9 @@ public:
         bind_ssbo(ssbo_bvh,         5);
         bind_ssbo(ssbo_tri_id,      6);
         bind_ssbo(ssbo_tri_full,    7);
+        bind_ssbo(ssbo_mat_band,    8);
+        if (uloc_t5_n_mats >= 0)
+            glc_Uniform1i(uloc_t5_n_mats, ps.st ? ps.st->mat_n_mats : 0);
         if (ps.cfg.t5_profile && !wait_t5_profile_fence(T5_NATIVE_LABEL, "pre-connect-queue")) {
             fprintf(stderr, "[%s-profile] aborted before connect profile after queue-drain timeout\n",
                     T5_NATIVE_LABEL);
@@ -9462,7 +9466,7 @@ public:
 
         auto load_with_shadow_bvh = [&](const std::string& name, GLuint& prog,
                                         int bvh_bind, int tri_id_bind, int tri_full_bind) -> bool {
-            std::string src, inc;
+            std::string src, inc, mat_inc;
             if (!read_shader_file(name, src)) return false;
             if (!read_shader_file("bvh_shadow.glsl.inc", inc)) {
                 fprintf(stderr, "[gpu-dispatch] bvh_shadow.glsl.inc not found (%s)%s\n",
@@ -9472,14 +9476,28 @@ public:
                 prog = gl_compute_build_program(src.c_str(), err, sizeof(err));
                 return prog != 0;
             }
+            if (!read_shader_file("ray_material_eval.glsl.inc", mat_inc)) {
+                fprintf(stderr, "[gpu-dispatch] ray_material_eval.glsl.inc not found (%s)%s\n",
+                        err, gpu_required ? "" : " — material eval disabled");
+                fflush(stderr);
+                if (gpu_required) return false;
+                mat_inc.clear();
+            }
             /* Build the macro-define block that sets the three binding points. */
-            char defines[256];
+            char defines[512];
             snprintf(defines, sizeof(defines),
                 "#define SHADOW_BVH_BINDING      %d\n"
                 "#define SHADOW_TRI_ID_BINDING   %d\n"
-                "#define SHADOW_TRI_FULL_BINDING %d\n",
-                bvh_bind, tri_id_bind, tri_full_bind);
-            std::string preamble = std::string(defines) + inc;
+                "#define SHADOW_TRI_FULL_BINDING %d\n"
+                "#define MAT_EVAL_MAX_BANDS      %d\n"
+                "#define MAT_EVAL_BAND_STRIDE    %d\n"
+                "#define MAT_EVAL_MAT_BINDING    %d\n",
+                bvh_bind, tri_id_bind, tri_full_bind,
+                MAX_SPECTRAL_BANDS, 12, 8);
+            std::string preamble = std::string(defines)
+                                 + inc
+                                 + "\n"
+                                 + mat_inc;
             prog = gl_compute_build_program2(src.c_str(), preamble.c_str(), err, sizeof(err));
             return prog != 0;
         };
@@ -9522,8 +9540,10 @@ public:
             if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "t5_full_connect.comp.glsl: %s", err); return false; }
             prog_t5 = 0;
         }
-        if (prog_t5)
+        if (prog_t5) {
             uloc_t5_profile_mode = glc_GetUniformLocation(prog_t5, "t5_profile_mode");
+            uloc_t5_n_mats       = glc_GetUniformLocation(prog_t5, "t5_n_mats");
+        }
 
         /* Pass B: GPU-resident terminal splat shader — non-fatal */
         if (!load("sensor_terminal_splat.comp.glsl", prog_sensor_splat)) {
@@ -11179,6 +11199,9 @@ public:
             bind_ssbo(ssbo_bvh,         5);
             bind_ssbo(ssbo_tri_id,      6);
             bind_ssbo(ssbo_tri_full,    7);
+            bind_ssbo(ssbo_mat_band,    8);
+            if (uloc_t5_n_mats >= 0)
+                glc_Uniform1i(uloc_t5_n_mats, ps.st ? ps.st->mat_n_mats : 0);
 
             /* tile_w = 0 / tile_h = 0 → shader uses global pixel coords */
             T5GpuParams par_c = par;
@@ -11243,6 +11266,9 @@ public:
         bind_ssbo(ssbo_bvh,         5);
         bind_ssbo(ssbo_tri_id,      6);
         bind_ssbo(ssbo_tri_full,    7);
+        bind_ssbo(ssbo_mat_band,    8);
+        if (uloc_t5_n_mats >= 0)
+            glc_Uniform1i(uloc_t5_n_mats, ps.st ? ps.st->mat_n_mats : 0);
 
         fprintf(stderr, "[T5-gpu] starting: n_cam=%u n_light=%u lbatches=%u cbatch_sz=%u res=%d tiles=%dx%d\n",
                 par.n_cam_verts, n_light, n_batches, T5_CAM_BATCH, res, n_tiles_x, n_tiles_y);
@@ -14227,7 +14253,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                              | ((uint32_t)lr.stream << 16)
                              | ((lr.tri_id >= 0 ? 1u : 0u) << 31);
         std::memcpy(&p[9], &vinfo, sizeof(uint32_t));
-        p[10] = static_cast<float>(ctx.beta_scalar_val(lr));
+        std::memcpy(&p[10], &lr.mat_idx, sizeof(int32_t));
         /* pdf_fwd / pdf_rev [11..12] — direct from vertex record */
         p[11] = lr.pdf_fwd;
         p[12] = lr.pdf_rev;

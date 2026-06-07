@@ -153,7 +153,7 @@ void main() {
         t5_light[ob +  7] = uintBitsToFloat(tflags_u);
         t5_light[ob +  8] = uintBitsToFloat(sid);
         t5_light[ob +  9] = uintBitsToFloat(vinfo);
-        t5_light[ob + 10] = beta_lum;
+        t5_light[ob + 10] = intBitsToFloat(mat_id);
         t5_light[ob + 11] = pdf_fwd;
         t5_light[ob + 12] = pdf_rev;
         t5_light[ob + 13] = uintBitsToFloat(pdf_flags);

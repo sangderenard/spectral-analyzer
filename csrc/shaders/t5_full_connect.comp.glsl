@@ -110,6 +110,7 @@ layout(local_size_x = TILE_C, local_size_y = TILE_L, local_size_z = 1) in;
 #define T5_LGV_STRIDE    56
 #define T5_CGV_STRIDE    72
 
+#define LGV_MAT_ID        10
 #define LGV_DIR_IN_X      48
 #define LGV_DIFFUSE_P     51
 #define LGV_GGX_ALPHA     52
@@ -117,6 +118,7 @@ layout(local_size_x = TILE_C, local_size_y = TILE_L, local_size_z = 1) in;
 #define LGV_EDGE_FWD      54
 #define LGV_EDGE_BWD      55
 
+#define CGV_MAT_ID        21
 #define CGV_DIR_IN_X      54
 #define CGV_DIFFUSE_P     57
 #define CGV_GGX_ALPHA     58
@@ -177,10 +179,18 @@ uniform int t5_profile_mode;
 
 /* ── Flag constants (mirror bdpt_record.h / mat_flags_generated.h) ──────── */
 #define MAT_FLAG_APERTURE_STOP        128u
+#ifndef BDPT_PDF_FLAG_DELTA_SPECULAR
 #define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)
+#endif
+#ifndef BDPT_PDF_FLAG_DIFFUSE
 #define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)
+#endif
+#ifndef BDPT_PDF_FLAG_GGX
 #define BDPT_PDF_FLAG_GGX             (1u << 20)
+#endif
+#ifndef BDPT_PDF_FLAG_EMISSION
 #define BDPT_PDF_FLAG_EMISSION        (1u << 21)
+#endif
 
 #define PI 3.14159265358979323846f
 
@@ -482,6 +492,33 @@ float light_beta_sum(uint sl) {
     return total;
 }
 
+void connection_spectral_rgb(uint sc, uint sl,
+                             vec3 c_norm, vec3 c_dir_in, uint c_pdf_flags,
+                             int c_mat, vec3 c_to_l,
+                             vec3 l_norm, vec3 l_dir_in, uint l_pdf_flags,
+                             int l_mat, vec3 l_to_c,
+                             out float r, out float g, out float b) {
+    r = 0.0f;
+    g = 0.0f;
+    b = 0.0f;
+    const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+    for (int _b = 0; _b < nb; ++_b) {
+        const float cb = s_cam[sc + uint(CGV_BAND_BASE + _b)];
+        const float lb = s_light[sl + uint(LGV_BAND_BASE + _b)];
+        if (cb <= 0.0f || lb <= 0.0f) continue;
+
+        const float cf = meval_endpoint_response(
+            c_mat, _b, c_pdf_flags, c_norm, c_dir_in, c_to_l);
+        const float lf = meval_endpoint_response(
+            l_mat, _b, l_pdf_flags, l_norm, l_dir_in, l_to_c);
+        const float v = cb * lb * cf * lf;
+        if (v <= 0.0f || isnan(v) || isinf(v)) continue;
+        r += v * spectral_weights[_b * 3 + 0];
+        g += v * spectral_weights[_b * 3 + 1];
+        b += v * spectral_weights[_b * 3 + 2];
+    }
+}
+
 /* ── Float atomic add via CAS spin-loop ─────────────────────────────────── *
  * Avoids GL_EXT_shader_atomic_float.  Standard on all GL 4.3+ hardware.    */
 void atomic_add_float(uint idx, float val) {
@@ -611,6 +648,7 @@ void main() {
         const float c_beta_sum = cam_beta_sum(sc);
 
         const int  c_tri_id      = floatBitsToInt(s_cam[sc +  6u]);
+        const int  c_mat_id      = floatBitsToInt(s_cam[sc + uint(CGV_MAT_ID)]);
         const uint c_vinfo       = floatBitsToUint(s_cam[sc +  9u]);
         const uint c_flags       = floatBitsToUint(s_cam[sc +  7u]);
         const uint c_pdf_flags   = floatBitsToUint(s_cam[sc + 17u]);
@@ -625,6 +663,7 @@ void main() {
         const float l_beta_sum = light_beta_sum(sl);
 
         const int  l_tri_id      = floatBitsToInt(s_light[sl +  6u]);
+        const int  l_mat_id      = floatBitsToInt(s_light[sl + uint(LGV_MAT_ID)]);
         const uint l_vinfo       = floatBitsToUint(s_light[sl +  9u]);
         const uint l_flags       = floatBitsToUint(s_light[sl +  7u]);
         const uint l_pdf_flags   = floatBitsToUint(s_light[sl + 13u]);
@@ -683,18 +722,23 @@ void main() {
                     if (t5_profile_mode == 5) return;
                     if (mis_ok)
                     {
-                        /* Match CPU T5: scalar transport is beta_cam * beta_light,
-                         * then camera spectral colour is applied once per pixel. */
-                        const float contrib = c_beta_sum * l_beta_sum * geom / denom;
+                        float spec_r = 0.0f, spec_g = 0.0f, spec_b = 0.0f;
+                        connection_spectral_rgb(
+                            sc, sl,
+                            c_norm, c_dir_in, c_pdf_flags, c_mat_id, wc,
+                            l_norm, l_dir_in, l_pdf_flags, l_mat_id, -wc,
+                            spec_r, spec_g, spec_b);
+
+                        const float scale = geom / denom;
+                        const float contrib = (spec_r + spec_g + spec_b) * scale;
                         if (contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
                             const bool occluded = shadow_occluded_except(
                                 c_pos, l_pos, c_tri_id, l_tri_id);
                             if (t5_profile_mode == 6) return;
                             if (!occluded) {
-                                const float inv_c = 1.0f / max(c_beta_sum, 1e-30f);
-                                s_lum_r[tid] = c_beta_r * inv_c * contrib;
-                                s_lum_g[tid] = c_beta_g * inv_c * contrib;
-                                s_lum_b[tid] = c_beta_b * inv_c * contrib;
+                                s_lum_r[tid] = spec_r * scale;
+                                s_lum_g[tid] = spec_g * scale;
+                                s_lum_b[tid] = spec_b * scale;
                             }
                         }
                     }

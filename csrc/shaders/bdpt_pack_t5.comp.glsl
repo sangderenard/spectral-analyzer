@@ -7,24 +7,31 @@
  * This shader reads each sorted vertex and writes it into ssbo_t5_light or
  * ssbo_t5_cam at the correct stride expected by t5_full_connect.comp.glsl.
  *
- * vinfo[0..14] = vertex_index_in_subpath (from packed_vi>>16).  The T5 shader
- * uses  flat_base = gid - li_v  to navigate the subpath chain; since vertices
- * are in subpath-consecutive order this is exactly correct.
+ * vinfo[0..14] = packed vertex position within the sorted subpath.  The raw
+ * BDPT vertex_index may have gaps from optical/lens traversal; T5 needs the
+ * dense packed index so flat_base = gid - li_v navigates the actual arrays.
+ *
+ * This pass is intentionally O(vertices).  Per-band spectral records and
+ * optical event records are scattered into the packed rows by bdpt_scatter_t5
+ * after this pass.  Do not linearly scan side-record sections here: at normal
+ * counts that is hundreds of billions of probes and trips Windows TDR.
  *
  * Approximations vs CPU path:
- *   - pdf_fwd / pdf_rev: read from vertex record [21][22] (T3 now writes them).
- *   - pdf_flags: read from vertex record [23] (T3 now writes them).
- *   - optical_block: forced 0 (conservative — treats every path as unblocked).
- *   - optical_jacobian: forced 1.0.
- *   - prefix_pdf: set to pdf_fwd of current vertex (not cumulative product).
- *   - spectral_beta_rgb: equal-weight 1/3 per channel across all bands.
- *   - edge_fwd/bwd_area: computed from consecutive vertex geometry (diffuse approx).
+ *   - pdf_fwd / pdf_rev / pdf_flags: read from the vertex record, which T3
+ *     fills from the sampling event.
+ *   - prefix_pdf: initialized only; T5 builds MIS products from edge PDFs.
+ *   - spectral_beta: initialized from scalar throughput here, then overwritten
+ *     per band by bdpt_scatter_t5.
+ *   - optical_block / optical_jacobian: initialized here, then updated by
+ *     bdpt_scatter_t5 from optical records.
+ *   - edge_fwd/bwd_area: initialized to zero, then filled from PDF side
+ *     records by bdpt_scatter_t5.
  *   - diffuse_p / ggx_alpha: read from mat_buf[mat_idx, band 0].
  *
  * Bindings:
  *   0  SortKeysBuf  sort_keys  readonly
  *   1  SortIdxBuf   sort_idx   readonly
- *   2  BdptVertBuf  ssbo_bdpt_output  readonly  (verts only; betas derived from throughput)
+ *   2  BdptVertBuf  ssbo_bdpt_output  readonly  (verts + spectral/pdf/optical sections)
  *   3  T5LightBuf   ssbo_t5_light     writeonly
  *   4  T5CamBuf     ssbo_t5_cam       writeonly
  *   5  MatBandBuf   ssbo_mat_band     readonly  (diffuse_p, ggx_alpha lookup)
@@ -62,15 +69,6 @@ float mat_ggx_alpha(int mat_idx) {
     return mat_bands[mat_idx * MAT_FULL_BANDS * MAT_BAND_STRIDE + 10]; /* band 0 field [10] */
 }
 
-/* Diffuse area PDF for edge from v0 (pos0, nrm0) to v1 (pos1).
- * p_area(v0→v1) = cos(theta_out) / pi / dist² */
-float edge_pdf_area_diffuse(vec3 pos0, vec3 nrm0, vec3 pos1) {
-    vec3 d = pos1 - pos0;
-    float dist2 = max(dot(d, d), 1e-12);
-    float cos_out = max(0.0, dot(nrm0, normalize(d)));
-    return cos_out / (3.141592653589793 * dist2);
-}
-
 void main() {
     int P = int(gl_GlobalInvocationID.x);
     if (P >= nv) return;
@@ -99,55 +97,48 @@ void main() {
     uint vi          = (packed_vi >> 16) & 0xFFFFu;   /* vertex_index in subpath */
     bool tri_valid   = (tflags_u & 0x01u) != 0u || floatBitsToInt(bdpt_verts[vb + 4]) >= 0;
 
-    /* vinfo: same layout as CPU — li_v (flat subpath position) | stream<<16 | tri_valid<<31 */
-    uint vinfo = vi | (stream << 16) | (tri_valid ? (1u << 31) : 0u);
+    /* vinfo: same layout as CPU — packed subpath position | stream<<16 | tri_valid<<31.
+     * Count earlier sorted rows in the same (stream, sid) group.  The subpath depth is
+     * small, so this avoids adding another GPU pass while preserving the CPU contract. */
+    uint key_hi = sort_keys[P * 2 + 0];
+    uint packed_pos = 0u;
+    for (int q = P - 1; q >= 0; --q) {
+        if (sort_keys[q * 2 + 0] != key_hi) break;
+        packed_pos += 1u;
+    }
+    uint vinfo = packed_pos | (stream << 16) | (tri_valid ? (1u << 31) : 0u);
 
-    /* Per-band betas: throughput is sum(|amp[b]|) stored in vertex record.
-     * Distribute uniformly across bands (equal-weight approximation). */
+    /* O(vertices) initialization.  bdpt_scatter_t5 overwrites per-band values
+     * from spectral side records after this pack pass. */
     const int nb = min(n_bands, MAX_BANDS);
-    float beta_lum = throughput;
-    float beta_per_band = (nb > 0) ? throughput / float(nb) : 0.0;
     float betas[MAX_BANDS];
     for (int b = 0; b < MAX_BANDS; ++b)
-        betas[b] = (b < nb) ? beta_per_band : 0.0;
-    float beta_r = throughput / 3.0;
-    float beta_g = throughput / 3.0;
-    float beta_b = throughput / 3.0;
+        betas[b] = 0.0;
+    if (nb > 0) {
+        float beta_per_band = throughput / float(nb);
+        for (int b = 0; b < nb; ++b)
+            betas[b] = beta_per_band;
+    }
+    float beta_lum = 0.0;
+    for (int b = 0; b < nb; ++b)
+        beta_lum += betas[b];
+    float beta_r = beta_lum / 3.0;
+    float beta_g = beta_lum / 3.0;
+    float beta_b = beta_lum / 3.0;
+
+    uint optical_block = 0u;
+    float optical_jacobian = 1.0;
 
     /* Material properties */
     float diffuse_p = mat_diffuse_p(mat_id);
     float ggx_alpha = mat_ggx_alpha(mat_id);
 
-    /* Edge PDFs: read next sorted vertex in same subpath (P+1 if same subpath) */
+    /* Edge PDFs are filled later by bdpt_scatter_t5 from BdptPdfRecord rows.
+     * Do not scan the PDF side section here; this pass must remain O(vertices). */
     float edge_fwd = 0.0, edge_bwd = 0.0;
-    if (P + 1 < nv) {
-        int nxt_idx = int(sort_idx[P + 1]);
-        int nxt_vb  = nxt_idx * BDPT_VERTEX_STRIDE;
-        uint nxt_sid = floatBitsToUint(bdpt_verts[nxt_vb + 0]);
-        uint nxt_vi  = (floatBitsToUint(bdpt_verts[nxt_vb + 1]) >> 16) & 0xFFFFu;
-        if (nxt_sid == sid && nxt_vi == vi + 1u) {
-            vec3 nxt_pos = vec3(bdpt_verts[nxt_vb+7], bdpt_verts[nxt_vb+8], bdpt_verts[nxt_vb+9]);
-            vec3 nxt_nrm = vec3(bdpt_verts[nxt_vb+10],bdpt_verts[nxt_vb+11],bdpt_verts[nxt_vb+12]);
-            edge_fwd = edge_pdf_area_diffuse(pos, nrm, nxt_pos);
-            edge_bwd = edge_pdf_area_diffuse(nxt_pos, nxt_nrm, pos);
-        }
-    }
 
-    /* prefix_pdf: cumulative product of pdf_fwd values along the subpath.
-     * After the sort, all vertices of this subpath are at consecutive sorted positions
-     * [P - vi .. P].  Walk back from P to the subpath start multiplying pdf_fwd.
-     * This is O(vi) per thread (max vi ≈ 16), fully parallel, no extra pass. */
+    /* T5 currently computes prefix/suffix products from edge fields directly. */
     float prefix_pdf = 1.0;
-    for (int k = int(vi); k >= 0; --k) {
-        int pk = P - k;
-        if (pk < 0 || pk >= nv) { prefix_pdf = 0.0; break; }
-        /* Verify we're still in the same subpath (same stream + subpath_id) */
-        uint pk_hi = sort_keys[pk * 2 + 0];
-        if (pk_hi != sort_keys[P * 2 + 0]) { prefix_pdf = 0.0; break; }
-        float pf = bdpt_verts[int(sort_idx[pk]) * BDPT_VERTEX_STRIDE + 21];
-        if (pf <= 0.0) { prefix_pdf = 0.0; break; }
-        prefix_pdf *= pf;
-    }
 
     if (stream == 0u) {
         /* ── Light vertex → ssbo_t5_light[P * T5_LGV_STRIDE] ── */
@@ -158,7 +149,7 @@ void main() {
         t5_light[ob +  3] = nrm.x;
         t5_light[ob +  4] = nrm.y;
         t5_light[ob +  5] = nrm.z;
-        t5_light[ob +  6] = throughput;
+        t5_light[ob +  6] = intBitsToFloat(floatBitsToInt(bdpt_verts[vb + 4]));
         t5_light[ob +  7] = uintBitsToFloat(tflags_u);
         t5_light[ob +  8] = uintBitsToFloat(sid);
         t5_light[ob +  9] = uintBitsToFloat(vinfo);
@@ -166,7 +157,7 @@ void main() {
         t5_light[ob + 11] = pdf_fwd;
         t5_light[ob + 12] = pdf_rev;
         t5_light[ob + 13] = uintBitsToFloat(pdf_flags);
-        t5_light[ob + 14] = 0.0;                /* optical_block = 0 */
+        t5_light[ob + 14] = uintBitsToFloat(optical_block);
         t5_light[ob + 15] = prefix_pdf;
         for (int b = 0; b < MAX_BANDS; ++b)
             t5_light[ob + 16 + b] = betas[b];   /* [16..47] */
@@ -175,7 +166,7 @@ void main() {
         t5_light[ob + 50] = dir_in.z;
         t5_light[ob + 51] = diffuse_p;
         t5_light[ob + 52] = ggx_alpha;
-        t5_light[ob + 53] = 1.0;                /* optical_jacobian */
+        t5_light[ob + 53] = optical_jacobian;
         t5_light[ob + 54] = edge_fwd;
         t5_light[ob + 55] = edge_bwd;
     } else {
@@ -187,7 +178,7 @@ void main() {
         t5_cam[ob +  3] = nrm.x;
         t5_cam[ob +  4] = nrm.y;
         t5_cam[ob +  5] = nrm.z;
-        t5_cam[ob +  6] = throughput;
+        t5_cam[ob +  6] = intBitsToFloat(floatBitsToInt(bdpt_verts[vb + 4]));
         t5_cam[ob +  7] = uintBitsToFloat(tflags_u);
         t5_cam[ob +  8] = uintBitsToFloat(sid);
         t5_cam[ob +  9] = uintBitsToFloat(vinfo);
@@ -199,7 +190,7 @@ void main() {
         t5_cam[ob + 15] = pdf_fwd;
         t5_cam[ob + 16] = pdf_rev;
         t5_cam[ob + 17] = uintBitsToFloat(pdf_flags);
-        t5_cam[ob + 18] = 0.0;                  /* optical_block */
+        t5_cam[ob + 18] = uintBitsToFloat(optical_block);
         t5_cam[ob + 19] = prefix_pdf;
         t5_cam[ob + 20] = 0.0;
         t5_cam[ob + 21] = intBitsToFloat(mat_id);
@@ -210,7 +201,7 @@ void main() {
         t5_cam[ob + 56] = dir_in.z;
         t5_cam[ob + 57] = diffuse_p;
         t5_cam[ob + 58] = ggx_alpha;
-        t5_cam[ob + 59] = 1.0;                  /* optical_jacobian */
+        t5_cam[ob + 59] = optical_jacobian;
         t5_cam[ob + 60] = edge_fwd;
         t5_cam[ob + 61] = edge_bwd;
         for (int i = 62; i < T5_CGV_STRIDE; ++i)

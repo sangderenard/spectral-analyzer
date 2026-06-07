@@ -726,8 +726,8 @@ struct WaveArena {
 /* ── T5 GPU connection pass types ────────────────────────────────────────── */
 static constexpr int T5_LGV_STRIDE    = 56;  /* light vertex, floats (must match shader) */
 static constexpr int T5_CGV_STRIDE    = 72;  /* camera vertex, floats (must match shader) */
-static constexpr int T5_TILE_C        =  8;  /* WG X dim: camera verts per tile          */
-static constexpr int T5_TILE_L        =  8;  /* WG Y dim: light verts per tile            */
+static constexpr int T5_TILE_C        =  1;  /* WG X dim: camera verts per tile          */
+static constexpr int T5_TILE_L        =  1;  /* WG Y dim: light verts per tile            */
 static constexpr int T5_MAX_GPU_BANDS = 32;  /* per-band betas packed into GPU vert buffers */
 static constexpr int LGV_BAND_BASE    = 16;  /* first per-band beta field in LGV (field index) */
 static constexpr int CGV_BAND_BASE    = 22;  /* first per-band beta field in CGV (field index) */
@@ -735,7 +735,7 @@ static constexpr int CGV_BAND_BASE    = 22;  /* first per-band beta field in CGV
 /* ── LGV named field offsets (stride 40) ────────────────────────────────── *
  * [0..2]   pos xyz                                                           *
  * [3..5]   normal xyz                                                        *
- * [6]      throughput_scalar                                                 *
+ * [6]      intBitsToFloat(tri_id) for endpoint visibility skip               *
  * [7]      flags (MAT_FLAG_*, bit-cast uint)                                 *
  * [8]      subpath_id (bit-cast uint)                                        *
  * [9]      vertex_index | (stream<<16)  (bit-cast uint)                      *
@@ -762,7 +762,7 @@ static constexpr int LGV_EDGE_BWD_AREA  = 55;
 /* ── CGV named field offsets (stride 56) ────────────────────────────────── *
  * [0..2]   pos xyz                                                           *
  * [3..5]   normal xyz                                                        *
- * [6]      throughput_scalar                                                 *
+ * [6]      intBitsToFloat(tri_id) for endpoint visibility skip               *
  * [7]      flags (MAT_FLAG_*, bit-cast uint)                                 *
  * [8]      subpath_id (bit-cast uint)                                        *
  * [9]      vertex_index (bit-cast uint)                                      *
@@ -899,6 +899,7 @@ struct RayPipelineConfig {
     uint32_t    t5_light_batch_size  = 0;  /* 0 = use built-in default (T5_LIGHT_BATCH) */
     uint32_t    t5_cam_batch_size    = 0;  /* 0 = use built-in default (8192)           */
     uint32_t    t5_sensor_tile_size  = 0;  /* 0 = use built-in default (128)            */
+    bool        t5_profile           = false; /* profile cumulative T5 shader stages      */
 
     /* Fraction of work to pin to GPU per stage (0=compete freely, >0=soft target).
      * 0.0 = CPU and GPU compete naturally on the shared queue.
@@ -1064,6 +1065,7 @@ void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
 void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n);
 void ray_pipeline_set_t5_cam_batch_size(RayPipelineState* ps, uint32_t n);
 void ray_pipeline_set_t5_sensor_tile_size(RayPipelineState* ps, uint32_t n);
+void ray_pipeline_set_t5_profile(RayPipelineState* ps, bool v);
 void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v);
 
 /* Live-update the flash light modifier applied in submit_emissive_triangles. */

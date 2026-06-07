@@ -260,6 +260,7 @@ float mat_refl_re  (int mat, int b) { return mat_refl_complex(mat, b).x; }
 float mat_refl_im  (int mat, int b) { return mat_refl_complex(mat, b).y; }
 float mat_ior_real       (int mat, int b) { return mat_band_field(mat, b, 7, 1.0); }
 float mat_transmittance  (int mat, int b) { return mat_band_field(mat, b, 3, 0.0); }
+float mat_emission       (int mat, int b) { return max(0.0, mat_band_field(mat, b, 5, 0.0)); }
 float mat_diffusion(int mat)              { return clamp(mat_band_field(mat, 0, 4, 0.0), 0.0, 1.0); }
 float mat_ggx_alpha(int mat)              { return clamp(mat_band_field(mat, 0, 10, 0.0), 0.0, 1.0); }
 bool  mat_is_transmissive(int mat) {
@@ -714,7 +715,10 @@ void main() {
         if (bdpt_sid != 0u && bdpt_max_verts > 0) {
             for (int b = 0; b < nb; b++) {
                 uint vi_band = (bdpt_vi << 16) | uint(b);
-                emit_bdpt_spectral(bdpt_sid, vi_band, amp_re[b], amp_im[b], bdpt_band_pdf);
+                float le = (mat_id >= 0) ? mat_emission(mat_id, b) : 1.0;
+                emit_bdpt_spectral(bdpt_sid, vi_band,
+                                   amp_re[b] * le, amp_im[b] * le,
+                                   bdpt_band_pdf);
             }
         }
         uint tslot = atomicAdd(meta[1], 1u);

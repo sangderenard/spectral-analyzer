@@ -57,6 +57,10 @@ layout(std430, binding = 2) readonly buffer MetaBuf {
     uint splat_meta[];
 };
 
+layout(std430, binding = 3) readonly buffer MatBandBuf {
+    float mat_bands[];
+};
+
 /* Per-band display RGB weights: n_bands × 3 packed as vec3[32].
  * Index b: r = rgb_w[b].x, g = rgb_w[b].y, b_ = rgb_w[b].z */
 uniform vec3  rgb_w[MAX_BANDS];
@@ -68,11 +72,18 @@ uniform float sensor_half_w;    /* sensor plate half-width  (Y axis, metres)    
 uniform float sensor_half_h;    /* sensor plate half-height (Z axis, metres)       */
 uniform int   sensor_res;       /* pixel grid side (sensor_res × sensor_res)       */
 uniform int   n_bands;          /* number of active spectral bands (≤ MAX_BANDS)   */
-uniform float splat_scale;      /* SENSOR_SPLAT_SCALE = 0.10                       */
+uniform int   n_mats;           /* material count for emission lookup              */
+uniform float splat_scale;      /* direct visible-emitter scale; normally 1.0      */
+
+float mat_emission(int mat, int b) {
+    if (mat < 0 || mat >= n_mats || b < 0 || b >= MAX_BANDS) return 1.0f;
+    return max(0.0f, mat_bands[(mat * MAX_BANDS + b) * 12 + 5]);
+}
 
 /* Float atomic-add via CAS spin-loop — no GL_EXT_shader_atomic_float needed.
  * Same pattern as t5_full_connect.comp.glsl. */
 void atomic_add_float(uint idx, float val) {
+    if (val <= 0.0f || isnan(val) || isinf(val)) return;
     uint expected = sensor_rgb[idx];
     for (int i = 0; i < 64; ++i) {
         float fexp    = uintBitsToFloat(expected);
@@ -80,6 +91,52 @@ void atomic_add_float(uint idx, float val) {
         uint  actual  = atomicCompSwap(sensor_rgb[idx], expected, desired);
         if (actual == expected) return;
         expected = actual;
+    }
+}
+
+void splat_sensor_tent(float soy, float soz, float cr, float cg, float cb) {
+    if (cr + cg + cb <= 0.0f) return;
+
+    const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
+    const float inv_h = float(sensor_res) / (2.0f * sensor_half_h);
+    const float fy = (soy + sensor_half_w) * inv_w - 0.5f;
+    const float fz = (soz + sensor_half_h) * inv_h - 0.5f;
+    const int y0 = int(floor(fy));
+    const int z0 = int(floor(fz));
+
+    float wsum = 0.0f;
+    float ws[4];
+    int ys[4];
+    int zs[4];
+    int k = 0;
+    for (int dy = 0; dy <= 1; ++dy) {
+        for (int dz = 0; dz <= 1; ++dz) {
+            const int iy = y0 + dy;
+            const int iz = z0 + dz;
+            const float wy = max(0.0f, 1.0f - abs(float(iy) - fy));
+            const float wz = max(0.0f, 1.0f - abs(float(iz) - fz));
+            const float w = wy * wz;
+            ys[k] = iy;
+            zs[k] = iz;
+            ws[k] = w;
+            if (w > 0.0f && iy >= 0 && iy < sensor_res && iz >= 0 && iz < sensor_res)
+                wsum += w;
+            ++k;
+        }
+    }
+    if (wsum <= 0.0f) return;
+
+    const uint pix = uint(sensor_res) * uint(sensor_res);
+    for (int i = 0; i < 4; ++i) {
+        const int iy = ys[i];
+        const int iz = zs[i];
+        const float w = ws[i] / wsum;
+        if (w <= 0.0f || iy < 0 || iy >= sensor_res || iz < 0 || iz >= sensor_res)
+            continue;
+        const uint px = uint(iy * sensor_res + iz);
+        atomic_add_float(px,          cr * w);
+        atomic_add_float(px + pix,    cg * w);
+        atomic_add_float(px + 2u*pix, cb * w);
     }
 }
 
@@ -94,15 +151,11 @@ void main() {
     const uint color_flag  = floatBitsToUint(child_int_buf[base + 16]);
     const uint is_emissive = floatBitsToUint(child_int_buf[base + 25]);
     if (is_emissive == 0u || color_flag != 1u) return;
+    const int mat_id = floatBitsToInt(child_int_buf[base + 15]);
 
-    /* Map sensor-space origin to pixel coordinates */
+    /* Map sensor-space origin to film coordinates */
     const float soy   = child_int_buf[base + 23];
     const float soz   = child_int_buf[base + 24];
-    const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
-    const float inv_h = float(sensor_res) / (2.0f * sensor_half_h);
-    const int   iy    = int((soy + sensor_half_w) * inv_w);
-    const int   iz    = int((soz + sensor_half_h) * inv_h);
-    if (iy < 0 || iy >= sensor_res || iz < 0 || iz >= sensor_res) return;
 
     /* Spectral → display RGB (matches band_to_display_rgb + SENSOR_SPLAT_SCALE) */
     float cr = 0.0f, cg = 0.0f, cb = 0.0f;
@@ -110,7 +163,7 @@ void main() {
     for (int b = 0; b < nb; ++b) {
         const float re  = child_int_buf[base + 26 + b];
         const float im  = child_int_buf[base + 26 + MAX_BANDS + b];
-        const float amp = sqrt(re * re + im * im);
+        const float amp = sqrt(re * re + im * im) * mat_emission(mat_id, b);
         cr += amp * rgb_w[b].x;
         cg += amp * rgb_w[b].y;
         cb += amp * rgb_w[b].z;
@@ -120,10 +173,5 @@ void main() {
     cb *= splat_scale;
     if (cr + cg + cb <= 0.0f) return;
 
-    /* Accumulate into global sensor buffer: R[res²] G[res²] B[res²] */
-    const uint px  = uint(iy * sensor_res + iz);
-    const uint pix = uint(sensor_res) * uint(sensor_res);
-    atomic_add_float(px,          cr);
-    atomic_add_float(px + pix,    cg);
-    atomic_add_float(px + 2u*pix, cb);
+    splat_sensor_tent(soy, soz, cr, cg, cb);
 }

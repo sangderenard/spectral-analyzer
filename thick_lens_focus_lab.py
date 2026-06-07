@@ -5484,6 +5484,19 @@ class ForwardCppLensBench:
         self._camera_perspective_accum = np.zeros_like(self._forward_img_accum)
         self._camera_perspective_pending = np.zeros_like(self._forward_img_accum)
         self._camera_perspective_publish_count: int = 0
+        # Version counters — incremented whenever the corresponding accumulator changes.
+        # Image getter functions cache their output and skip re-computation when unchanged.
+        self._forward_img_version:   int = 0
+        self._reverse_img_version:   int = 0
+        self._camera_persp_version:  int = 0
+        self._forward_img_cache:     "np.ndarray | None" = None
+        self._forward_img_cache_ver: int = -1
+        self._reverse_img_cache:     "np.ndarray | None" = None
+        self._reverse_img_cache_ver: int = -1
+        self._camera_persp_cache:    "np.ndarray | None" = None
+        self._camera_persp_cache_ver: int = -1
+        # Set to True by run_app when --profile is active; enables thread profiling.
+        self._py_profile: bool = False
         # Tunable amplitude floor: rays (and child spawns) below this threshold
         # are terminated.  Also used for material epsilon-kill pre-flagging.
         self._min_amplitude: float = 1e-5
@@ -7291,10 +7304,15 @@ class ForwardCppLensBench:
         _PROFILE_WARMUP = 8
         _gpu_profile_n  = 0
         _empty_polls    = 0
+        _prof_drain_n   = 0
+        _prof_drain_t   = 0.0
+        _prof_bdpt_t    = 0.0
+        _PROF_REPORT    = 120
         while not self._drain_stop.is_set():
             try:
                 drain_epoch = int(getattr(self, "_pipeline_reset_epoch", 0))
                 use_cpp_display = False
+                _t0_drain = time.perf_counter() if self._py_profile else 0.0
                 with self._pipeline_drain_lock:
                     if use_cpp_display:
                         plate = self.scene.image_plate
@@ -7311,6 +7329,8 @@ class ForwardCppLensBench:
                     else:
                         records = self.tracer.drain_records_slim(max_n=_max_batch)
                         n       = int(records["kind"].shape[0]) if records else 0
+                if self._py_profile:
+                    _prof_drain_t += (time.perf_counter() - _t0_drain) * 1e3
                 if n > 0:
                     _empty_polls = 0
                     if drain_epoch != int(getattr(self, "_pipeline_reset_epoch", 0)):
@@ -7320,13 +7340,28 @@ class ForwardCppLensBench:
                     else:
                         # BDPT endpoint accumulation must run immediately when
                         # Python diagnostics are explicitly enabled.
+                        _t0_bdpt = time.perf_counter() if self._py_profile else 0.0
                         self._fast_bdpt_feed(records, drain_epoch=drain_epoch)
+                        if self._py_profile:
+                            _prof_bdpt_t += (time.perf_counter() - _t0_bdpt) * 1e3
                         # Hand off to vis thread; drop the frame if the queue is full so
                         # the drain thread never blocks waiting for visualization.
                         try:
                             self._vis_queue.put_nowait((drain_epoch, records))
                         except queue.Full:
                             pass
+                    if self._py_profile:
+                        _prof_drain_n += 1
+                        if _prof_drain_n % _PROF_REPORT == 0:
+                            print(
+                                f"[py-profile drain n={_prof_drain_n}]"
+                                f"  drain_slim={_prof_drain_t/_PROF_REPORT:.2f}ms"
+                                f"  bdpt_feed={_prof_bdpt_t/_PROF_REPORT:.2f}ms"
+                                f"  records={n}",
+                                flush=True,
+                            )
+                            _prof_drain_t = 0.0
+                            _prof_bdpt_t  = 0.0
 
                     # ── Live GPU profiling (count-gated) ─────────────────────
                     if not self._gpu_calibrated:
@@ -7370,8 +7405,10 @@ class ForwardCppLensBench:
                 return
             if fwd.shape == self._forward_img_accum.shape:
                 self._forward_img_accum += fwd
+                self._forward_img_version += 1
             if rev.shape == self._reverse_img_accum.shape:
                 self._reverse_img_accum += rev
+                self._reverse_img_version += 1
             if cam.shape == self._camera_perspective_pending.shape:
                 self._camera_perspective_pending += cam
             self._async_forward_strike_count += int(drained.get("fwd_strikes", 0))
@@ -7384,6 +7421,9 @@ class ForwardCppLensBench:
         into display buffers.  Runs independently of the fast drain thread so heavy
         numpy work (bincount, einsum) never stalls the BDPT-critical drain path."""
         import time
+        _prof_vis_n  = 0
+        _prof_vis_t  = 0.0
+        _PROF_REPORT = 60
         while not self._drain_stop.is_set():
             try:
                 item = self._vis_queue.get(timeout=0.020)
@@ -7396,7 +7436,20 @@ class ForwardCppLensBench:
                         continue
                 else:
                     records = item
+                _t0_vis = time.perf_counter() if self._py_profile else 0.0
                 self._accumulate_records(records)
+                if self._py_profile:
+                    _prof_vis_t += (time.perf_counter() - _t0_vis) * 1e3
+                    _prof_vis_n += 1
+                    n_rec = int(records["kind"].shape[0]) if records and "kind" in records else 0
+                    if _prof_vis_n % _PROF_REPORT == 0:
+                        print(
+                            f"[py-profile vis n={_prof_vis_n}]"
+                            f"  accumulate_records={_prof_vis_t/_PROF_REPORT:.2f}ms"
+                            f"  records={n_rec}",
+                            flush=True,
+                        )
+                        _prof_vis_t = 0.0
             except Exception as _vis_exc:
                 print(f"[vis-loop ERROR] {_vis_exc}", flush=True)
 
@@ -7569,6 +7622,10 @@ class ForwardCppLensBench:
                 with self._segs_lock:
                     for ch in range(3):
                         dst[:, :, ch] += deltas[ch]
+                    if dst is self._forward_img_accum:
+                        self._forward_img_version += 1
+                    elif dst is self._reverse_img_accum:
+                        self._reverse_img_version += 1
 
         def _records_to_camera_perspective(mask: np.ndarray) -> None:
             if not np.any(mask):
@@ -7611,7 +7668,7 @@ class ForwardCppLensBench:
                 rgb = np.repeat(amp_v[mask][m_img, None], 3, axis=1).astype(np.float32)
 
             res = int(self._forward_img_res)
-            iy = np.clip(((half_w - sy[m_img]) / (2.0 * half_w) * res).astype(np.int32), 0, res - 1)
+            iy = np.clip(((sy[m_img] + half_w) / (2.0 * half_w) * res).astype(np.int32), 0, res - 1)
             iz = np.clip(((sz[m_img] + half_h) / (2.0 * half_h) * res).astype(np.int32), 0, res - 1)
             flat_idx = (iy * res + iz).astype(np.int64)
             deltas = [
@@ -8329,38 +8386,58 @@ class ForwardCppLensBench:
 
     def get_forward_strike_image(self) -> np.ndarray:
         """Return the pure forward-traced image-plate accumulation preview."""
+        cur_ver = self._forward_img_version
+        if self._forward_img_cache is not None and self._forward_img_cache_ver == cur_ver:
+            return self._forward_img_cache
         with self._segs_lock:
             img = self._forward_img_accum.copy()
-        flat = np.asarray(img, dtype=np.float64).ravel()
+            ver_snap = self._forward_img_version
+        flat = img.ravel().astype(np.float64)
         pos = flat[flat > 0.0]
         if pos.size == 0:
-            return np.zeros(img.shape, dtype=np.float32)
-        # Auto-normalise to 99th-percentile so the projection becomes visible
-        # as soon as any hits arrive, regardless of absolute amplitude scale.
-        white = float(np.percentile(pos, 99.0))
-        white = max(white, 1.0e-30)
-        y = np.log1p(np.maximum(img, 0.0) / white * 6.0) / np.log1p(6.0)
-        return np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
+            result = np.zeros(img.shape, dtype=np.float32)
+        else:
+            white = max(float(np.percentile(pos, 99.0)), 1.0e-30)
+            y = np.log1p(np.maximum(img, 0.0) * (6.0 / white)) / np.log1p(6.0)
+            result = np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
+        self._forward_img_cache = result
+        self._forward_img_cache_ver = ver_snap
+        return result
 
     def get_reverse_strike_image(self) -> np.ndarray:
         """Return the pure reverse-traced strike distribution preview."""
+        cur_ver = self._reverse_img_version
+        if self._reverse_img_cache is not None and self._reverse_img_cache_ver == cur_ver:
+            return self._reverse_img_cache
         with self._segs_lock:
             img = self._reverse_img_accum.copy()
-        disp = np.log1p(np.maximum(img, 0.0) * float(self._reverse_img_gain))
-        return np.ascontiguousarray(disp / (1.0 + disp), dtype=np.float32)
+            ver_snap = self._reverse_img_version
+        g = float(self._reverse_img_gain)
+        disp = np.log1p(np.maximum(img, 0.0) * g)
+        result = np.ascontiguousarray(disp / (1.0 + disp), dtype=np.float32)
+        self._reverse_img_cache = result
+        self._reverse_img_cache_ver = ver_snap
+        return result
 
     def get_camera_perspective_image(self) -> np.ndarray:
         """Return backward camera strikes binned by their launch site on the sensor."""
+        cur_ver = self._camera_persp_version
+        if self._camera_persp_cache is not None and self._camera_persp_cache_ver == cur_ver:
+            return self._camera_persp_cache
         with self._segs_lock:
             img = self._camera_perspective_accum.copy()
-        flat = np.asarray(img, dtype=np.float64).ravel()
+            ver_snap = self._camera_persp_version
+        flat = img.ravel().astype(np.float64)
         pos = flat[flat > 0.0]
         if pos.size == 0:
-            return np.zeros(img.shape, dtype=np.float32)
-        white = float(np.percentile(pos, 99.0))
-        white = max(white, 1.0e-30)
-        y = np.log1p(np.maximum(img, 0.0) / white * 6.0) / np.log1p(6.0)
-        return np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
+            result = np.zeros(img.shape, dtype=np.float32)
+        else:
+            white = max(float(np.percentile(pos, 99.0)), 1.0e-30)
+            y = np.log1p(np.maximum(img, 0.0) * (6.0 / white)) / np.log1p(6.0)
+            result = np.ascontiguousarray(np.clip(y, 0.0, 1.0), dtype=np.float32)
+        self._camera_persp_cache = result
+        self._camera_persp_cache_ver = ver_snap
+        return result
 
     def publish_camera_perspective_package(self) -> int:
         """Expose the pending blue-PIP update for the current sensor package."""
@@ -8373,6 +8450,7 @@ class ForwardCppLensBench:
             self._camera_perspective_accum += self._camera_perspective_pending
             self._camera_perspective_pending[:] = 0.0
             self._camera_perspective_publish_count += 1
+            self._camera_persp_version += 1
             return int(self._camera_perspective_publish_count)
 
     def build_all_prospective_reverse_segments(
@@ -8568,7 +8646,8 @@ class ForwardCppLensBench:
 
             # T5/green is only valid after the full Morton grid has been
             # saturated.  Do not expose partial BDPT images as final output.
-            _deadline = time.perf_counter() + 2.0
+            _t0_wait = time.perf_counter()
+            _deadline = _t0_wait + 2.0
             while time.perf_counter() < _deadline and not self._drain_stop.is_set():
                 try:
                     if int(self.tracer.in_flight_count()) == 0:
@@ -8578,7 +8657,13 @@ class ForwardCppLensBench:
                 time.sleep(0.002)
             if self._drain_stop.is_set():
                 return 0
+            if self._py_profile:
+                _wait_ms = (time.perf_counter() - _t0_wait) * 1e3
+                print(f"[py-profile sensor]  in_flight_wait={_wait_ms:.2f}ms", flush=True)
+            _t0_t5 = time.perf_counter() if self._py_profile else 0.0
             self.tracer.join_t5()
+            if self._py_profile:
+                print(f"[py-profile sensor]  join_t5={( time.perf_counter() - _t0_t5)*1e3:.2f}ms", flush=True)
             try:
                 _cur_img = np.asarray(self.tracer.get_sensor_image(), dtype=np.float32)
                 if _cur_img.ndim == 3 and _cur_img.shape[2] >= 3 and _cur_img.shape[0] > 0:
@@ -8887,6 +8972,10 @@ class ForwardCppLensBench:
                         self._camera_perspective_accum[:] = 0.0
                     if hasattr(self, "_camera_perspective_pending"):
                         self._camera_perspective_pending[:] = 0.0
+                    if hasattr(self, "_forward_img_version"):
+                        self._forward_img_version  += 1
+                        self._reverse_img_version  += 1
+                        self._camera_persp_version += 1
                 print(f"[pipeline-reset] reason={reason}", flush=True)
             except Exception as exc:
                 print(f"[pipeline-reset] reason={reason} failed: {exc}", flush=True)
@@ -8940,6 +9029,9 @@ class ForwardCppLensBench:
         self._reverse_img_accum[:] = 0.0
         self._camera_perspective_accum[:] = 0.0
         self._camera_perspective_pending[:] = 0.0
+        self._forward_img_version  += 1
+        self._reverse_img_version  += 1
+        self._camera_persp_version += 1
         self._bdpt_endpoints.clear()
         self.clear_sensor_ray_cache()
         if isinstance(self._backward_transport_accum, dict):
@@ -9029,6 +9121,9 @@ class ForwardCppLensBench:
         self._reverse_img_accum[:] = 0.0
         self._camera_perspective_accum[:] = 0.0
         self._camera_perspective_pending[:] = 0.0
+        self._forward_img_version  += 1
+        self._reverse_img_version  += 1
+        self._camera_persp_version += 1
         self._bdpt_endpoints.clear()
         self.clear_sensor_ray_cache()
         if isinstance(self._backward_transport_accum, dict):
@@ -11153,6 +11248,7 @@ def run(
     t5_cam_batch: int = 0,
     t5_sensor_tile: int = 0,
     no_gpu_t5: bool = False,
+    gpu_resident: bool = False,
 ) -> None:
     try:
         from OpenGL.GL import (
@@ -11262,6 +11358,13 @@ def run(
     bench.sensor_min_amplitude = float(sensor_min_amplitude)
     bench.emitter_amp_gain     = float(emitter_amp_gain)
     bench.compute_mode         = str(compute_mode)
+    bench._py_profile          = bool(profile)
+    if profile:
+        if hasattr(bench.tracer, "set_t5_profile"):
+            bench.tracer.set_t5_profile(True)
+            print("[t5-profile] enabled staged GPU T5 shader profiling", flush=True)
+        else:
+            print("[t5-profile] unavailable: loaded _spectral_kernels lacks set_t5_profile; rebuild/reload the extension", flush=True)
 
     _t5_light_batch = int(t5_light_batch)
     if _t5_light_batch > 0:
@@ -11277,6 +11380,9 @@ def run(
         print(f"[t5] sensor tile {_t5_sensor_tile}×{_t5_sensor_tile} px/tile", flush=True)
     if no_gpu_t5:
         print("[t5] --no-gpu-t5 flag is no longer honoured — GPU T5 always active when compute_mode=gpu", flush=True)
+    if gpu_resident and compute_mode in ("gpu", "mixed"):
+        bench.tracer.set_gpu_skip_record_readback(True)
+        print("[gpu] gpu-resident mode enabled — bounce loop stays GPU-side, no per-bounce CPU readback", flush=True)
 
     print(f"[bench] tris={bench.n_tris}  bands={bench.n_bands}  "
           f"view={view_w}x{view_h}  sensor_amp_gain={bench.sensor_amp_gain}  "
@@ -12034,6 +12140,14 @@ def run(
         glDisable(GL_BLEND)
         glUseProgram(0)
 
+    # Mutable single-element lists so draw_pip() can track last-uploaded textures
+    # without needing nonlocal declarations.  Texture re-upload is skipped when
+    # the getter returns the same cached array object (image unchanged).
+    _pip_last_fwd:    list = [None]   # last fwd_img id() uploaded
+    _pip_last_rev:    list = [None]   # last rev_img id() uploaded
+    _pip_last_sensor: list = [None]   # last sensor_view id() uploaded
+    _pip_last_bdpt:   list = [None]   # last bdpt_plate id() uploaded
+
     def draw_pip() -> None:
         def _rot180(arr: np.ndarray) -> np.ndarray:
             """Display sensor-order images as a 180-degree rotated view."""
@@ -12041,11 +12155,12 @@ def run(
 
         # ── Pos 0 (leftmost): forward ray strikes — projection map, no rotation ─
         fwd_img = bench.get_forward_strike_image()
-        if fwd_img.shape[0] > 0:
+        if fwd_img.shape[0] > 0 and id(fwd_img) != _pip_last_fwd[0]:
             glBindTexture(GL_TEXTURE_2D, tex_forward_pip)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
                          fwd_img.shape[1], fwd_img.shape[0], 0,
-                         GL_RGB, GL_FLOAT, np.ascontiguousarray(fwd_img, dtype=np.float32))
+                         GL_RGB, GL_FLOAT, fwd_img)
+            _pip_last_fwd[0] = id(fwd_img)
         _draw_quad_with_pip_prog(
             tex_forward_pip, _bdpt_pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(1.00, 0.62, 0.18),
@@ -12053,11 +12168,12 @@ def run(
 
         # ── Pos 1: backward/reverse strikes — projection map, no rotation ────
         rev_img = bench.get_reverse_strike_image()
-        if rev_img.shape[0] > 0:
+        if rev_img.shape[0] > 0 and id(rev_img) != _pip_last_rev[0]:
             glBindTexture(GL_TEXTURE_2D, tex_bdpt_pip)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
                          rev_img.shape[1], rev_img.shape[0], 0,
-                         GL_RGB, GL_FLOAT, np.ascontiguousarray(rev_img, dtype=np.float32))
+                         GL_RGB, GL_FLOAT, rev_img)
+            _pip_last_rev[0] = id(rev_img)
         _draw_quad_with_pip_prog(
             tex_bdpt_pip, _pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(0.58, 0.32, 1.00),
@@ -12068,13 +12184,14 @@ def run(
         # from draw_pip(), so the blue PIP cannot outrun the BDPT exposure gate.
         sensor_view = bench.get_camera_perspective_image()
         if sensor_view is not None and sensor_view.shape[0] > 0:
-            bench._last_direct_img = np.ascontiguousarray(
-                np.clip(sensor_view[:, :, :3], 0.0, 1.0), dtype=np.float32)
-            glBindTexture(GL_TEXTURE_2D, tex_pip)
-            _dp_disp = _rot180(bench._last_direct_img)
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
-                         _dp_disp.shape[1], _dp_disp.shape[0], 0,
-                         GL_RGB, GL_FLOAT, _dp_disp)
+            if id(sensor_view) != _pip_last_sensor[0]:
+                bench._last_direct_img = sensor_view  # already clipped [0,1] by getter
+                _dp_disp = _rot180(bench._last_direct_img)
+                glBindTexture(GL_TEXTURE_2D, tex_pip)
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
+                             _dp_disp.shape[1], _dp_disp.shape[0], 0,
+                             GL_RGB, GL_FLOAT, _dp_disp)
+                _pip_last_sensor[0] = id(sensor_view)
         _draw_quad_with_pip_prog(
             tex_pip, _uv_pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(0.20, 0.78, 1.00),
@@ -12084,12 +12201,13 @@ def run(
         # get_sensor_image() outputs rows bottom-first (GL bottom-to-top) so
         # no vertical flip is needed.  Horizontal mirror matches sensor coords.
         bdpt_plate = bench._last_bdpt_plate_rgb
-        if bdpt_plate is not None and bdpt_plate.shape[0] > 0:
-            glBindTexture(GL_TEXTURE_2D, tex_green_pip)
+        if bdpt_plate is not None and bdpt_plate.shape[0] > 0 and id(bdpt_plate) != _pip_last_bdpt[0]:
             _bp_disp = np.ascontiguousarray(bdpt_plate[:, ::-1], dtype=np.float32)
+            glBindTexture(GL_TEXTURE_2D, tex_green_pip)
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB32F,
                          _bp_disp.shape[1], _bp_disp.shape[0], 0,
                          GL_RGB, GL_FLOAT, _bp_disp)
+            _pip_last_bdpt[0] = id(bdpt_plate)
         _draw_quad_with_pip_prog(
             tex_green_pip, _green_pip_vx, _pip_vy, _pip_dim, _pip_dim,
             border_col=(0.20, 0.85, 0.30),
@@ -13510,6 +13628,9 @@ def run(
             bench._reverse_img_accum[:] = 0.0
             bench._camera_perspective_accum[:] = 0.0
             bench._camera_perspective_pending[:] = 0.0
+            bench._forward_img_version  += 1
+            bench._reverse_img_version  += 1
+            bench._camera_persp_version += 1
             bench.clear_sensor_ray_cache()
             bench._last_bdpt_plate_rgb = None
             bench._last_direct_img = None
@@ -13633,6 +13754,13 @@ def run(
         new_bench.sensor_min_amplitude = float(sensor_min_amplitude)
         new_bench.emitter_amp_gain     = float(emitter_amp_gain)
         new_bench.compute_mode         = str(compute_mode)
+        new_bench._py_profile          = bool(profile)
+        if profile:
+            if hasattr(new_bench.tracer, "set_t5_profile"):
+                new_bench.tracer.set_t5_profile(True)
+                print("[t5-profile] enabled staged GPU T5 shader profiling on rebuilt bench", flush=True)
+            else:
+                print("[t5-profile] unavailable on rebuilt bench: loaded _spectral_kernels lacks set_t5_profile", flush=True)
         if _t5_light_batch > 0:
             new_bench.tracer.set_t5_light_batch_size(_t5_light_batch)
         if _t5_cam_batch > 0:
@@ -13659,6 +13787,8 @@ def run(
                 gpu_all_stages=(compute_mode == "gpu"),
                 shader_dir=_SHADER_DIR,
             )
+            if gpu_resident:
+                new_bench.tracer.set_gpu_skip_record_readback(True)
         _new_pip_res = int(max(16, scene.image_plate.sensor_res))
         new_bench._configure_cpp_sensor_image(_new_pip_res, 0.008)
         if finalize:
@@ -14521,6 +14651,14 @@ if __name__ == "__main__":
             "Use for A/B comparison against the GPU path."
         ),
     )
+    _ap.add_argument(
+        "--gpu-resident",
+        action="store_true",
+        help=(
+            "Enable GPU-resident bounce loop: child rays stay GPU-side between bounces, "
+            "eliminating per-bounce CPU readback. Requires compute_mode=gpu."
+        ),
+    )
     _args = _ap.parse_args()
     if _args.uv_smoke_exit:
         raise SystemExit(run_uv_smoke(
@@ -14553,4 +14691,5 @@ if __name__ == "__main__":
         t5_light_batch=int(_args.t5_light_batch),
         t5_sensor_tile=int(_args.t5_sensor_tile),
         no_gpu_t5=bool(_args.no_gpu_t5),
+        gpu_resident=bool(_args.gpu_resident),
     )

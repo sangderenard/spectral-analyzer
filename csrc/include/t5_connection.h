@@ -365,8 +365,6 @@ struct T5ConnContext {
                     return false;
             }
         }
-        const BdptPdfRecord* pr = pdf_for(v.subpath_id, v.vertex_index);
-        if (pr && (pr->flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
         return true;
     }
 

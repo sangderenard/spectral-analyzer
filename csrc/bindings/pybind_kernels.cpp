@@ -563,6 +563,7 @@ struct PyRayTracer
     uint32_t _t5_light_batch_size  = 0;
     uint32_t _t5_cam_batch_size    = 0;
     uint32_t _t5_sensor_tile_size  = 0;
+    bool     _t5_profile           = false;
 
 
     /* Flash modifier config */
@@ -600,6 +601,7 @@ struct PyRayTracer
             cfg.t5_light_batch_size     = _t5_light_batch_size;
             cfg.t5_cam_batch_size       = _t5_cam_batch_size;
             cfg.t5_sensor_tile_size     = _t5_sensor_tile_size;
+            cfg.t5_profile              = _t5_profile;
             cfg.flash_modifier_type     = static_cast<FlashModifierType>(_flash_modifier_type);
             cfg.flash_modifier_param0   = _flash_modifier_param0;
             cfg.flash_modifier_param1   = _flash_modifier_param1;
@@ -2569,6 +2571,11 @@ struct PyRayTracer
     void set_t5_sensor_tile_size(uint32_t n) {
         _t5_sensor_tile_size = n;
         if (_pipeline) ray_pipeline_set_t5_sensor_tile_size(_pipeline, n);
+    }
+
+    void set_t5_profile(bool v) {
+        _t5_profile = v;
+        if (_pipeline) ray_pipeline_set_t5_profile(_pipeline, v);
     }
 
     void set_force_cpu_t5(bool /*v*/) {}
@@ -5849,6 +5856,11 @@ The sensor grid is partitioned into n×n tiles; each tile is solved with a
 compact pixel accum buffer (3×n² instead of 3×res²), avoiding VRAM exhaustion
 at large resolutions.  Smaller tiles reduce peak VRAM at the cost of more tile
 overhead; 0 restores the default (128).  Safe to call before or after pipeline creation.)doc")
+        .def("set_t5_profile",
+             &PyRayTracer::set_t5_profile,
+             py::arg("v"),
+R"doc(When True, run staged one-pair T5 shader profiling before the first T5 dispatch
+of each pass and print per-stage fence timing / 1s timeout diagnostics.)doc")
         .def("set_force_cpu_t5",
              &PyRayTracer::set_force_cpu_t5,
              py::arg("v"),

@@ -4,7 +4,7 @@
  *                               with full multi-strategy balance-heuristic MIS.
  *
  * 2-D tiled dispatch: X = camera tile, Y = light tile within current batch.
- *   Work-group size: TILE_C × TILE_L  (default 8×8 = 64 threads).
+ *   Work-group size: TILE_C × TILE_L  (diagnostic 1×1 = 1 thread).
  *   Each invocation handles ONE (cam_vert, light_vert) pair.
  *
  * Both tiles are loaded cooperatively into shared memory so every thread in
@@ -27,7 +27,7 @@
  *    0      T5LightVertBuf  Flat light vertices. Stride = T5_LGV_STRIDE = 40 floats.
  *             [0..2]   pos xyz
  *             [3..5]   normal xyz
- *             [6]      throughput_scalar
+ *             [6]      intBitsToFloat(tri_id) for endpoint visibility skip
  *             [7]      uintBitsToFloat(MAT_FLAG_* material flags)
  *             [8]      uintBitsToFloat(subpath_id)
  *             [9]      uintBitsToFloat(vinfo): bits[0..14]=vertex_index,
@@ -50,7 +50,7 @@
  *    1      T5CamVertBuf    Flat camera vertices. Stride = T5_CGV_STRIDE = 56 floats.
  *             [0..2]   pos xyz
  *             [3..5]   normal xyz
- *             [6]      throughput_scalar
+ *             [6]      intBitsToFloat(tri_id) for endpoint visibility skip
  *             [7]      uintBitsToFloat(MAT_FLAG_* material flags)
  *             [8]      uintBitsToFloat(subpath_id)
  *             [9]      uintBitsToFloat(vinfo): same bit layout as LGV[9]
@@ -101,8 +101,8 @@
  * ────────────────────────────────────────────────────────────────────────── */
 
 /* ── Tile dimensions (must match T5_TILE_C / T5_TILE_L in ray_pipeline.h) ── */
-#define TILE_C  8
-#define TILE_L  8
+#define TILE_C  1
+#define TILE_L  1
 
 layout(local_size_x = TILE_C, local_size_y = TILE_L, local_size_z = 1) in;
 
@@ -170,6 +170,10 @@ layout(std430, binding = 3) readonly buffer T5ParamsBuf {
 layout(std430, binding = 4) readonly buffer T5SpectralWeightBuf {
     float spectral_weights[];
 };
+
+/* Diagnostic mode, normally 0:
+ * 1=load only, 2=spectral, 3=geometry, 4=connection PDFs, 5=MIS, 6=shadow. */
+uniform int t5_profile_mode;
 
 /* ── Flag constants (mirror bdpt_record.h / mat_flags_generated.h) ──────── */
 #define MAT_FLAG_APERTURE_STOP        128u
@@ -265,7 +269,6 @@ float scatter_conn_pdf_area(
 bool vertex_connectable(uint vinfo, uint vflags, uint pdf_flags, uint opt_block) {
     if ((vinfo     >> 31)                          == 0u) return false; /* tri_id < 0 */
     if ((vflags    & MAT_FLAG_APERTURE_STOP)       != 0u) return false;
-    if ((pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return false;
     if ( opt_block                                 != 0u) return false;
     return true;
 }
@@ -424,12 +427,65 @@ bool candidate_strategy_density(
         if (p > 0.0f && !isinf(p) && !isnan(p)) out_denom += p;
     }
 
-    return out_selected_pdf > 0.0f && out_denom > 0.0f;
+    if (out_denom < out_selected_pdf)
+        out_denom = out_selected_pdf;
+    return out_selected_pdf > 1e-20f &&
+           out_denom        > 1e-20f &&
+           !isinf(out_denom) && !isnan(out_denom);
+}
+
+void cam_spectral_rgb(uint sc, out float r, out float g, out float b) {
+    r = 0.0f;
+    g = 0.0f;
+    b = 0.0f;
+    const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+    for (int _b = 0; _b < nb; ++_b) {
+        const float bm = s_cam[sc + uint(CGV_BAND_BASE + _b)];
+        if (bm <= 0.0f) continue;
+        r += bm * spectral_weights[_b * 3 + 0];
+        g += bm * spectral_weights[_b * 3 + 1];
+        b += bm * spectral_weights[_b * 3 + 2];
+    }
+}
+
+float cam_beta_sum(uint sc) {
+    float total = 0.0f;
+    const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+    for (int _b = 0; _b < nb; ++_b) {
+        const float bm = s_cam[sc + uint(CGV_BAND_BASE + _b)];
+        if (bm > 0.0f) total += bm;
+    }
+    return total;
+}
+
+void light_spectral_rgb(uint sl, out float r, out float g, out float b) {
+    r = 0.0f;
+    g = 0.0f;
+    b = 0.0f;
+    const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+    for (int _b = 0; _b < nb; ++_b) {
+        const float bm = s_light[sl + uint(LGV_BAND_BASE + _b)];
+        if (bm <= 0.0f) continue;
+        r += bm * spectral_weights[_b * 3 + 0];
+        g += bm * spectral_weights[_b * 3 + 1];
+        b += bm * spectral_weights[_b * 3 + 2];
+    }
+}
+
+float light_beta_sum(uint sl) {
+    float total = 0.0f;
+    const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+    for (int _b = 0; _b < nb; ++_b) {
+        const float bm = s_light[sl + uint(LGV_BAND_BASE + _b)];
+        if (bm > 0.0f) total += bm;
+    }
+    return total;
 }
 
 /* ── Float atomic add via CAS spin-loop ─────────────────────────────────── *
  * Avoids GL_EXT_shader_atomic_float.  Standard on all GL 4.3+ hardware.    */
 void atomic_add_float(uint idx, float val) {
+    if (val <= 0.0f || isnan(val) || isinf(val)) return;
     uint expected = pixel_accum[idx];
     for (int i = 0; i < 64; ++i) {
         float fexp    = uintBitsToFloat(expected);
@@ -437,6 +493,57 @@ void atomic_add_float(uint idx, float val) {
         uint  actual  = atomicCompSwap(pixel_accum[idx], expected, desired);
         if (actual == expected) return;
         expected = actual;
+    }
+}
+
+void splat_sensor_tent(float sensor_y, float sensor_z,
+                       float val_r, float val_g, float val_b) {
+    if (val_r + val_g + val_b <= 0.0f) return;
+    const int tw  = (tile_w > 0) ? tile_w  : sensor_res;
+    const int th  = (tile_h > 0) ? tile_h  : sensor_res;
+    const int tx0 = (tile_w > 0) ? tile_x0 : 0;
+    const int ty0 = (tile_h > 0) ? tile_y0 : 0;
+    const uint pix = uint(tw) * uint(th);
+
+    const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
+    const float inv_h = float(sensor_res) / (2.0f * sensor_half_h);
+    const float fy = (sensor_y + sensor_half_w) * inv_w - 0.5f;
+    const float fz = (sensor_z + sensor_half_h) * inv_h - 0.5f;
+    const int y0 = int(floor(fy));
+    const int z0 = int(floor(fz));
+
+    float wsum = 0.0f;
+    float ws[4];
+    int ys[4];
+    int zs[4];
+    int k = 0;
+    for (int dy = 0; dy <= 1; ++dy) {
+        for (int dz = 0; dz <= 1; ++dz) {
+            const int iy = y0 + dy;
+            const int iz = z0 + dz;
+            const float wy = max(0.0f, 1.0f - abs(float(iy) - fy));
+            const float wz = max(0.0f, 1.0f - abs(float(iz) - fz));
+            const float w = wy * wz;
+            ys[k] = iy;
+            zs[k] = iz;
+            ws[k] = w;
+            if (w > 0.0f && iy >= ty0 && iy < ty0 + th && iz >= tx0 && iz < tx0 + tw)
+                wsum += w;
+            ++k;
+        }
+    }
+    if (wsum <= 0.0f) return;
+
+    for (int i = 0; i < 4; ++i) {
+        const int iy = ys[i];
+        const int iz = zs[i];
+        const float w = ws[i] / wsum;
+        if (w <= 0.0f || iy < ty0 || iy >= ty0 + th || iz < tx0 || iz >= tx0 + tw)
+            continue;
+        const uint px = uint((iy - ty0) * tw + (iz - tx0));
+        atomic_add_float(px,          val_r * w);
+        atomic_add_float(px + pix,    val_g * w);
+        atomic_add_float(px + 2u*pix, val_b * w);
     }
 }
 
@@ -484,6 +591,7 @@ void main() {
 
     barrier();
     memoryBarrierShared();
+    if (t5_profile_mode == 1) return;
 
     /* ── Per-pair contribution ──────────────────────────────────────────── */
     const uint gid_c = cam_tile + lid_c;
@@ -499,17 +607,10 @@ void main() {
         /* Compute spectral camera-side beta by accumulating per-band magnitudes
          * with their pre-baked colour weights (from the stride-splitter SSBO). */
         float c_beta_r = 0.0f, c_beta_g = 0.0f, c_beta_b = 0.0f;
-        {
-            const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
-            for (int _b = 0; _b < nb; ++_b) {
-                const float bm = s_cam[sc + uint(CGV_BAND_BASE + _b)];
-                if (bm <= 0.0f) continue;
-                c_beta_r += bm * spectral_weights[_b * 3 + 0];
-                c_beta_g += bm * spectral_weights[_b * 3 + 1];
-                c_beta_b += bm * spectral_weights[_b * 3 + 2];
-            }
-        }
+        cam_spectral_rgb(sc, c_beta_r, c_beta_g, c_beta_b);
+        const float c_beta_sum = cam_beta_sum(sc);
 
+        const int  c_tri_id      = floatBitsToInt(s_cam[sc +  6u]);
         const uint c_vinfo       = floatBitsToUint(s_cam[sc +  9u]);
         const uint c_flags       = floatBitsToUint(s_cam[sc +  7u]);
         const uint c_pdf_flags   = floatBitsToUint(s_cam[sc + 17u]);
@@ -521,19 +622,9 @@ void main() {
         const uint sl = lid_l * uint(T5_LGV_STRIDE);
         const vec3  l_pos  = vec3(s_light[sl+0u], s_light[sl+1u], s_light[sl+2u]);
         const vec3  l_norm = vec3(s_light[sl+3u], s_light[sl+4u], s_light[sl+5u]);
-        const float l_beta = s_light[sl+10u];
-        float l_beta_r = 0.0f, l_beta_g = 0.0f, l_beta_b = 0.0f;
-        {
-            const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
-            for (int _b = 0; _b < nb; ++_b) {
-                const float bm = s_light[sl + uint(LGV_BAND_BASE + _b)];
-                if (bm <= 0.0f) continue;
-                l_beta_r += bm * spectral_weights[_b * 3 + 0];
-                l_beta_g += bm * spectral_weights[_b * 3 + 1];
-                l_beta_b += bm * spectral_weights[_b * 3 + 2];
-            }
-        }
+        const float l_beta_sum = light_beta_sum(sl);
 
+        const int  l_tri_id      = floatBitsToInt(s_light[sl +  6u]);
         const uint l_vinfo       = floatBitsToUint(s_light[sl +  9u]);
         const uint l_flags       = floatBitsToUint(s_light[sl +  7u]);
         const uint l_pdf_flags   = floatBitsToUint(s_light[sl + 13u]);
@@ -541,11 +632,12 @@ void main() {
         const uint li_v            = l_vinfo & 0xFFFFu;
         const uint light_flat_base = gid_l - li_v;
 
+        if (t5_profile_mode == 2) return;
+
         if (vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk) &&
             vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk) &&
-            c_beta_r + c_beta_g + c_beta_b >= 1e-15f &&
-            l_beta >= 1e-15f &&
-            l_beta_r + l_beta_g + l_beta_b >= 1e-15f)
+            c_beta_sum >= 1e-15f &&
+            l_beta_sum >= 1e-15f)
         {
             /* ── Geometry term ─────────────────────────────────────────── */
             const vec3  dv    = l_pos - c_pos;
@@ -554,9 +646,9 @@ void main() {
                 const float dist = sqrt(dist2);
                 const vec3  wc   = dv / dist;
                 const float geom = abs(dot(c_norm, wc)) * abs(dot(l_norm, -wc)) / dist2;
+                if (t5_profile_mode == 3) return;
 
-                if (geom >= min_geom && !shadow_occluded(c_pos, l_pos)) {
-
+                if (geom >= min_geom) {
                     /* BRDF fields from shared memory. */
                     const vec3  c_dir_in    = vec3(s_cam[sc + uint(CGV_DIR_IN_X)    ],
                                                    s_cam[sc + uint(CGV_DIR_IN_X)+1u ],
@@ -581,18 +673,30 @@ void main() {
                         l_pos, l_norm, l_dir_in,
                         l_diffuse_p, l_ggx_alpha, l_pdf_flags, l_opt_jac,
                         c_pos, c_norm);
+                    if (t5_profile_mode == 4) return;
 
                     /* ── MIS density (still reads global SSBOs for chain) ─ */
                     float selected_pdf = 0.0f, denom = 0.0f;
-                    if (candidate_strategy_density(
+                    bool mis_ok = candidate_strategy_density(
                             ci, cam_flat_base, li_v, light_flat_base,
-                            conn_fwd, conn_bwd, selected_pdf, denom))
+                            conn_fwd, conn_bwd, selected_pdf, denom);
+                    if (t5_profile_mode == 5) return;
+                    if (mis_ok)
                     {
-                        /* β_cam × β_light × G / denom  (selected_pdf cancels) */
-                        const float contrib = geom / denom;
-                        s_lum_r[tid] = c_beta_r * l_beta_r * contrib;
-                        s_lum_g[tid] = c_beta_g * l_beta_g * contrib;
-                        s_lum_b[tid] = c_beta_b * l_beta_b * contrib;
+                        /* Match CPU T5: scalar transport is beta_cam * beta_light,
+                         * then camera spectral colour is applied once per pixel. */
+                        const float contrib = c_beta_sum * l_beta_sum * geom / denom;
+                        if (contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
+                            const bool occluded = shadow_occluded_except(
+                                c_pos, l_pos, c_tri_id, l_tri_id);
+                            if (t5_profile_mode == 6) return;
+                            if (!occluded) {
+                                const float inv_c = 1.0f / max(c_beta_sum, 1e-30f);
+                                s_lum_r[tid] = c_beta_r * inv_c * contrib;
+                                s_lum_g[tid] = c_beta_g * inv_c * contrib;
+                                s_lum_b[tid] = c_beta_b * inv_c * contrib;
+                            }
+                        }
                     }
                 }
             }
@@ -601,11 +705,13 @@ void main() {
 
     barrier();
     memoryBarrierShared();
+    if (t5_profile_mode != 0) return;
 
     /* ── Per-cam-vert reduction along the light-tile dimension ─────────── *
      * Thread (lid_c, 0) sums TILE_L contributions for its cam vert and     *
      * does a single atomic write — replacing TILE_L separate CAS loops.    */
     if (lid_l == 0u && gid_c < n_cam_verts) {
+        const uint sc = lid_c * uint(T5_CGV_STRIDE);
         float sum_r = 0.0f, sum_g = 0.0f, sum_b = 0.0f;
         for (uint j = 0u; j < uint(TILE_L); ++j) {
             const uint idx = j * uint(TILE_C) + lid_c;
@@ -615,27 +721,9 @@ void main() {
         }
 
         if (sum_r + sum_g + sum_b > 0.0f) {
-            const uint sc = lid_c * uint(T5_CGV_STRIDE);
             const float c_soy = s_cam[sc + 13u];
             const float c_soz = s_cam[sc + 14u];
-            const float inv_w = float(sensor_res) / (2.0f * sensor_half_w);
-            const float inv_h = float(sensor_res) / (2.0f * sensor_half_h);
-            const int iy = int((c_soy + sensor_half_w) * inv_w);
-            const int iz = int((c_soz + sensor_half_h) * inv_h);
-            /* Tile-local pixel addressing.  When tile_w > 0 the pixel buffer
-             * covers only [tile_y0..tile_y0+tile_h) × [tile_x0..tile_x0+tile_w);
-             * otherwise treat the whole sensor_res×sensor_res grid as one tile. */
-            const int tw  = (tile_w > 0) ? tile_w  : sensor_res;
-            const int th  = (tile_h > 0) ? tile_h  : sensor_res;
-            const int tx0 = (tile_w > 0) ? tile_x0 : 0;
-            const int ty0 = (tile_h > 0) ? tile_y0 : 0;
-            if (iy >= ty0 && iy < ty0 + th && iz >= tx0 && iz < tx0 + tw) {
-                const uint px  = uint((iy - ty0) * tw + (iz - tx0));
-                const uint pix = uint(tw) * uint(th);
-                atomic_add_float(px,          sum_r);
-                atomic_add_float(px + pix,    sum_g);
-                atomic_add_float(px + 2u*pix, sum_b);
-            }
+            splat_sensor_tent(c_soy, c_soz, sum_r, sum_g, sum_b);
         }
     }
 }

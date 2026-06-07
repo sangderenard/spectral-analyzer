@@ -7747,17 +7747,24 @@ static void bdpt_update_inflight(RayPipelineState* ps,
     if (std::min(flash_submitted, sensor_submitted) <= t5_fired) return;
     if (ps->bdpt_connection_running.load(std::memory_order_acquire)) return;
 
+    /* Production GPU mode: set the pending flag so the GPU thread runs
+     * sort+pack+connect directly, bypassing the CPU BDPT connection path. */
+    if (ps->cfg.gpu_skip_record_readback) {
+        fprintf(stderr, "[T5-gpu-native] both families exhausted — scheduling GPU T5 "
+                "(flash_if=%lld sensor_if=%lld flash_sub=%u sensor_sub=%u t5_fired=%u)\n",
+                (long long)nf, (long long)ns,
+                flash_submitted, sensor_submitted, t5_fired);
+        fflush(stderr);
+        ps->bdpt_gpu_t5_pending.store(true, std::memory_order_release);
+        return;
+    }
+
     fprintf(stderr, "[T5-kpn] both families exhausted — pushing sentinel "
             "(flash_if=%lld sensor_if=%lld flash_sub=%u sensor_sub=%u t5_fired=%u)\n",
             (long long)nf, (long long)ns,
             flash_submitted, sensor_submitted, t5_fired);
     fflush(stderr);
     ps->Q_t5_ready.push(1);
-
-    /* Production GPU mode: set the pending flag so the GPU thread runs
-     * sort+pack+connect directly, bypassing the CPU BDPT connection path. */
-    if (ps->cfg.gpu_skip_record_readback)
-        ps->bdpt_gpu_t5_pending.store(true, std::memory_order_release);
 }
 
 /* CIE-approximate spectral locus — forward declaration; definition is near ray_pipeline_join_t5 */
@@ -7811,9 +7818,15 @@ public:
     struct { GLint bdpt_count_base = -1; } uloc_prep;
     /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
     GLuint prog_t5 = 0;
+    GLint  uloc_t5_profile_mode = -1;
+    bool   warned_t5_profile_unavailable = false;
     /* Cached from first dispatch_t1_t2_t3 call — stable for the pipeline lifetime. */
     int    cached_bdpt_count_base = 2;  /* 2 + n_mats; default safe until scene upload */
     int    cached_max_bdpt_v      = 0;  /* 0 = use ps.cfg.bdpt_max_vertices or 10M     */
+    int    cached_max_bdpt_s      = 0;  /* 0 = use ps.cfg.bdpt_max_spectral fallback   */
+    int    cached_max_bdpt_p      = 0;  /* 0 = use ps.cfg.bdpt_max_pdfs fallback       */
+    int    cached_max_bdpt_o      = 0;  /* 0 = use ps.cfg.bdpt_max_optical fallback    */
+    uint32_t bdpt_gpu_accum_cycle = 0;  /* GPU-resident BDPT record reset generation   */
 
     /* post_t3_prep: GPU-driven bounce control, eliminates per-bounce CPU readbacks */
     GLuint prog_post_t3_prep  = 0;
@@ -7823,6 +7836,7 @@ public:
     GLuint prog_sort_init  = 0;  /* bdpt_sort_init.comp.glsl  */
     GLuint prog_sort_step  = 0;  /* bdpt_sort_step.comp.glsl  */
     GLuint prog_pack_t5    = 0;  /* bdpt_pack_t5.comp.glsl    */
+    GLuint prog_scatter_t5 = 0;  /* bdpt_scatter_t5.comp.glsl */
     GLuint ssbo_sort_keys  = 0;  /* 2 uint32 per padded vertex slot   */
     GLuint ssbo_sort_idx   = 0;  /* 1 uint32 per padded vertex slot   */
     GLuint ssbo_sort_counts= 0;  /* [0]=n_lv, [1]=n_cv (uint32 × 2)  */
@@ -7836,8 +7850,16 @@ public:
     } uloc_sort_step;
     struct {
         GLint nv = -1, n_lv = -1, bdpt_betas_base = -1, n_bands = -1;
+        GLint bdpt_spectral_base = -1, n_spectral = -1;
+        GLint bdpt_pdf_base = -1, n_pdfs = -1;
+        GLint bdpt_optical_base = -1, n_optical = -1;
         GLint sensor_half_w = -1, sensor_half_h = -1;
     } uloc_pack_t5;
+    struct {
+        GLint scatter_mode = -1, nv = -1, n_lv = -1, n_records = -1, n_bands = -1;
+        GLint record_offset = -1;
+        GLint bdpt_spectral_base = -1, bdpt_pdf_base = -1, bdpt_optical_base = -1;
+    } uloc_scatter_t5;
 
     /* Pass B: GPU-resident backward-sensor terminal accumulator */
     GLuint prog_sensor_splat = 0;
@@ -7847,7 +7869,7 @@ public:
     struct {
         GLint term_float_base = -1;
         GLint sensor_half_w = -1, sensor_half_h = -1, sensor_res_u = -1;
-        GLint n_bands = -1, splat_scale = -1, rgb_w = -1;
+        GLint n_bands = -1, n_mats = -1, splat_scale = -1, rgb_w = -1;
     } uloc_splat;
 
     /* T5 persistent SSBOs — allocated on first use, grown as needed */
@@ -8126,6 +8148,7 @@ public:
         bind_ssbo(ssbo_child_int,  0);
         bind_ssbo(ssbo_sensor_rgb, 1);
         bind_ssbo(ssbo_t3_meta,    2);   /* splat shader reads nt_term from meta[1] */
+        bind_ssbo(ssbo_mat_band,   3);
 
         if (uloc_splat.term_float_base >= 0)
             glc_Uniform1i(uloc_splat.term_float_base, term_float_base);
@@ -8137,8 +8160,10 @@ public:
             glc_Uniform1i(uloc_splat.sensor_res_u, ps.sensor_res);
         if (uloc_splat.n_bands >= 0)
             glc_Uniform1i(uloc_splat.n_bands, nb);
+        if (uloc_splat.n_mats >= 0)
+            glc_Uniform1i(uloc_splat.n_mats, ps.st ? ps.st->mat_n_mats : 0);
         if (uloc_splat.splat_scale >= 0)
-            glc_Uniform1f(uloc_splat.splat_scale, 0.10f);
+            glc_Uniform1f(uloc_splat.splat_scale, 1.0f);
         if (uloc_splat.rgb_w >= 0) {
             if (blit_n_bands_stored > 0) {
                 glc_Uniform3fv(uloc_splat.rgb_w, blit_n_bands_stored,
@@ -8175,6 +8200,8 @@ public:
 
         /* Compute per-channel peaks inline (avoids extra pass in get_sensor_image). */
         double pr = 1e-30, pg = 1e-30, pb = 1e-30;
+        double sum_rgb = 0.0, peak_rgb = 1e-30;
+        size_t lit_px = 0;
         for (size_t i = 0; i < pix2; ++i) {
             float fr, fg, fb;
             std::memcpy(&fr, &tmp[i],          sizeof(float));
@@ -8183,6 +8210,24 @@ public:
             if (fr > (float)pr) pr = fr;
             if (fg > (float)pg) pg = fg;
             if (fb > (float)pb) pb = fb;
+            const double rgb = (double)fr + (double)fg + (double)fb;
+            if (rgb > 0.0 && std::isfinite(rgb)) {
+                ++lit_px;
+                sum_rgb += rgb;
+                if (rgb > peak_rgb) peak_rgb = rgb;
+            }
+        }
+        {
+            static auto last_log = std::chrono::steady_clock::time_point{};
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last_log >= std::chrono::seconds(1)) {
+                const double hot_frac = (sum_rgb > 0.0) ? (peak_rgb / sum_rgb) : 0.0;
+                fprintf(stderr,
+                        "[T5-shadow] lit_px=%zu sum=%.3e peak=%.3e hot_frac=%.6f peaks=(%.3e %.3e %.3e)\n",
+                        lit_px, sum_rgb, peak_rgb, hot_frac, pr, pg, pb);
+                fflush(stderr);
+                last_log = now;
+            }
         }
 
         std::lock_guard<std::mutex> lk(ps.sensor_gpu_mu);
@@ -8280,6 +8325,302 @@ public:
         return fut.get();
     }
 
+    struct T5DispatchStats {
+        uint32_t dispatches = 0;
+        uint32_t reductions = 0;
+        uint64_t start_pair_cap = 0;
+        uint64_t final_pair_cap = 0;
+        uint64_t max_pairs = 0;
+        uint32_t max_cam = 0;
+        uint32_t max_light = 0;
+        double   max_ms = 0.0;
+    };
+
+    bool wait_t5_profile_fence(const char* label, const char* stage) {
+        static constexpr uint64_t PROFILE_TIMEOUT_NS = 1000ull * 1000ull * 1000ull;
+        if (!(glc_FenceSync && glc_ClientWaitSync && glc_DeleteSync)) {
+            fprintf(stderr,
+                    "[%s-profile] unavailable: GL sync entrypoints missing; cannot time %s\n",
+                    label ? label : "T5", stage ? stage : "stage");
+            fflush(stderr);
+            return true;
+        }
+        fprintf(stderr, "[%s-profile] begin %s timeout=1000ms\n",
+                label ? label : "T5", stage ? stage : "stage");
+        fflush(stderr);
+        const auto t0 = std::chrono::steady_clock::now();
+        GLsync fence = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        GLenum rc = fence ? glc_ClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, PROFILE_TIMEOUT_NS)
+                          : GL_WAIT_FAILED;
+        const auto t1 = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (rc == GL_TIMEOUT_EXPIRED || rc == GL_WAIT_FAILED) {
+            fprintf(stderr, "[%s-profile] TIMEOUT %s after %.1fms rc=0x%x\n",
+                    label ? label : "T5", stage ? stage : "stage", ms, (unsigned)rc);
+            fflush(stderr);
+            if (fence)
+                glc_DeleteSync(fence);
+            return false;
+        }
+        fprintf(stderr, "[%s-profile] ok %s %.3fms\n",
+                label ? label : "T5", stage ? stage : "stage", ms);
+        fflush(stderr);
+        if (fence)
+            glc_DeleteSync(fence);
+        return true;
+    }
+
+    bool profile_t5_pair_stages(uint32_t cam_n, uint32_t light_n, const char* label) {
+        if (uloc_t5_profile_mode < 0) {
+            if (!warned_t5_profile_unavailable) {
+                fprintf(stderr,
+                        "[%s-profile] unavailable: t5_profile_mode uniform was not found; running normal T5 dispatch\n",
+                        label ? label : "T5");
+                fflush(stderr);
+                warned_t5_profile_unavailable = true;
+            }
+            return true;
+        }
+        struct Stage { int mode; const char* name; };
+        static constexpr Stage stages[] = {
+            {1, "load"},
+            {2, "spectral"},
+            {3, "geometry"},
+            {4, "connection-pdfs"},
+            {5, "mis"},
+            {6, "shadow"},
+        };
+        static constexpr uint64_t PROFILE_TIMEOUT_NS = 1000ull * 1000ull * 1000ull;
+        const GLuint wg_x = (cam_n + (uint32_t)T5_TILE_C - 1u) / (uint32_t)T5_TILE_C;
+        const GLuint wg_y = (light_n + (uint32_t)T5_TILE_L - 1u) / (uint32_t)T5_TILE_L;
+        for (const Stage& s : stages) {
+            glc_Uniform1i(uloc_t5_profile_mode, s.mode);
+            fprintf(stderr, "[%s-profile] begin %s chunk=%ux%u wg=%ux%u timeout=1000ms\n",
+                    label ? label : "T5", s.name, cam_n, light_n, wg_x, wg_y);
+            fflush(stderr);
+            const auto t0 = std::chrono::steady_clock::now();
+            glc_DispatchCompute(wg_x, wg_y, 1);
+            GLenum rc = GL_ALREADY_SIGNALED;
+            GLsync fence = (glc_FenceSync && glc_ClientWaitSync && glc_DeleteSync)
+                         ? glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0) : nullptr;
+            if (fence)
+                rc = glc_ClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, PROFILE_TIMEOUT_NS);
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (rc == GL_TIMEOUT_EXPIRED || rc == GL_WAIT_FAILED) {
+                fprintf(stderr, "[%s-profile] TIMEOUT %s after %.1fms rc=0x%x\n",
+                        label ? label : "T5", s.name, ms, (unsigned)rc);
+                fflush(stderr);
+                if (fence)
+                    glc_DeleteSync(fence);
+                glc_Uniform1i(uloc_t5_profile_mode, 0);
+                return false;
+            } else {
+                fprintf(stderr, "[%s-profile] ok %s %.3fms\n",
+                        label ? label : "T5", s.name, ms);
+                fflush(stderr);
+            }
+            if (fence)
+                glc_DeleteSync(fence);
+        }
+        glc_Uniform1i(uloc_t5_profile_mode, 0);
+        return true;
+    }
+
+    T5DispatchStats dispatch_t5_pair_chunks(RayPipelineState& ps,
+                                            T5GpuParams& par,
+                                            uint32_t n_cv_total,
+                                            uint32_t n_lv_total,
+                                            uint32_t cam_target,
+                                            uint32_t light_target,
+                                            const char* label) {
+        T5DispatchStats st{};
+        if (n_cv_total == 0 || n_lv_total == 0)
+            return st;
+        cam_target = std::max(1u, cam_target);
+        light_target = std::max(1u, light_target);
+
+        static constexpr uint64_t T5_START_PAIR_CAP  = 1024ull;
+        static constexpr uint64_t T5_MIN_PAIR_CAP    = 256ull;
+        static constexpr uint64_t T5_MAX_PAIR_CAP    = 1048576ull;
+        static constexpr uint64_t T5_FENCE_BUDGET_NS = 750ull * 1000ull * 1000ull;
+        static constexpr uint64_t T5_FENCE_POLL_NS   = 50ull * 1000ull * 1000ull;
+        static constexpr double   T5_GROW_TARGET_MS  = 350.0;
+        static constexpr double   T5_GROW_MAX_STEP   = 2.0;
+        static constexpr double   T5_GROW_MIN_STEP   = 1.25;
+        const uint64_t target_pairs = std::max<uint64_t>(
+            1ull, (uint64_t)cam_target * (uint64_t)light_target);
+        const uint64_t max_pair_cap = std::min<uint64_t>(target_pairs, T5_MAX_PAIR_CAP);
+        const uint64_t total_pairs = (uint64_t)n_cv_total * (uint64_t)n_lv_total;
+        uint64_t pair_cap = std::min<uint64_t>(target_pairs, T5_START_PAIR_CAP);
+        st.start_pair_cap = pair_cap;
+        bool profile_done = false;
+        uint64_t pairs_done = 0;
+        auto progress_t0 = std::chrono::steady_clock::now();
+        auto progress_last = progress_t0;
+        fprintf(stderr,
+                "[%s] connect begin: cam=%u light=%u total_pairs=%llu target=%ux%u pair_cap=%llu fence=%.1fms\n",
+                label ? label : "T5",
+                n_cv_total, n_lv_total,
+                (unsigned long long)total_pairs,
+                cam_target, light_target,
+                (unsigned long long)pair_cap,
+                (double)T5_FENCE_BUDGET_NS / 1000000.0);
+        fflush(stderr);
+
+        auto shrink_to_cap = [&](uint32_t cam_rem, uint32_t light_rem,
+                                 uint32_t& cam_n, uint32_t& light_n) {
+            cam_n = std::max(1u, std::min(cam_target, cam_rem));
+            light_n = std::max(1u, std::min(light_target, light_rem));
+            while ((uint64_t)cam_n * (uint64_t)light_n > pair_cap) {
+                if (cam_n >= light_n && cam_n > (uint32_t)T5_TILE_C)
+                    cam_n = std::max((uint32_t)T5_TILE_C, (cam_n + 1u) / 2u);
+                else if (light_n > (uint32_t)T5_TILE_L)
+                    light_n = std::max((uint32_t)T5_TILE_L, (light_n + 1u) / 2u);
+                else
+                    break;
+            }
+        };
+
+        for (uint32_t cam_base = 0; cam_base < n_cv_total; ) {
+            const uint32_t cam_rem = n_cv_total - cam_base;
+            uint32_t cam_n = 1, light_probe = 1;
+            shrink_to_cap(cam_rem, n_lv_total, cam_n, light_probe);
+
+            par.cam_offset = cam_base;
+            for (uint32_t light_base = 0; light_base < n_lv_total; ) {
+                uint32_t light_n = std::max(1u, std::min(light_target,
+                                                          n_lv_total - light_base));
+                while ((uint64_t)cam_n * (uint64_t)light_n > pair_cap &&
+                       light_n > (uint32_t)T5_TILE_L)
+                    light_n = std::max((uint32_t)T5_TILE_L, (light_n + 1u) / 2u);
+
+                par.cam_offset = cam_base;
+                par.light_offset = light_base;
+                par.light_batch_size = light_n;
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_params);
+                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                  sizeof(T5GpuParams), &par);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+                const uint64_t pairs = (uint64_t)cam_n * (uint64_t)light_n;
+                st.max_pairs = std::max(st.max_pairs, pairs);
+                st.max_cam = std::max(st.max_cam, cam_n);
+                st.max_light = std::max(st.max_light, light_n);
+
+                if (ps.cfg.t5_profile && !profile_done) {
+                    if (!profile_t5_pair_stages(cam_n, light_n, label)) {
+                        st.final_pair_cap = pair_cap;
+                        fprintf(stderr,
+                                "[%s-profile] aborted normal T5 dispatch after profile timeout; rerun without --profile to render\n",
+                                label ? label : "T5");
+                        fflush(stderr);
+                        return st;
+                    }
+                    profile_done = true;
+                }
+
+                const auto t0 = std::chrono::steady_clock::now();
+                glc_DispatchCompute((cam_n + (uint32_t)T5_TILE_C - 1u) / (uint32_t)T5_TILE_C,
+                                    (light_n + (uint32_t)T5_TILE_L - 1u) / (uint32_t)T5_TILE_L,
+                                    1);
+
+                bool shrink_after = false;
+                if (glc_FenceSync && glc_ClientWaitSync && glc_DeleteSync) {
+                    GLsync fence = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                    GLenum rc = fence ? glc_ClientWaitSync(fence,
+                                                           GL_SYNC_FLUSH_COMMANDS_BIT,
+                                                           T5_FENCE_BUDGET_NS)
+                                      : GL_ALREADY_SIGNALED;
+                    if (rc == GL_TIMEOUT_EXPIRED || rc == GL_WAIT_FAILED) {
+                        shrink_after = true;
+                        ++st.reductions;
+                        fprintf(stderr,
+                                "[%s] rechunk: dispatch %u (%u cam x %u light, %llu pairs) exceeded %.1fms; shrinking later chunks\n",
+                                label ? label : "T5",
+                                st.dispatches + 1u, cam_n, light_n,
+                                (unsigned long long)pairs,
+                                (double)T5_FENCE_BUDGET_NS / 1000000.0);
+                        fflush(stderr);
+                    }
+                    while (fence && rc == GL_TIMEOUT_EXPIRED && !ps.cancel.load(std::memory_order_relaxed)) {
+                        rc = glc_ClientWaitSync(fence,
+                                                GL_SYNC_FLUSH_COMMANDS_BIT,
+                                                T5_FENCE_POLL_NS);
+                    }
+                    if (fence)
+                        glc_DeleteSync(fence);
+                }
+
+                const auto t1 = std::chrono::steady_clock::now();
+                const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+                st.max_ms = std::max(st.max_ms, ms);
+                if (ms > 1200.0)
+                    shrink_after = true;
+                if (shrink_after && pair_cap > T5_MIN_PAIR_CAP) {
+                    const uint64_t old_cap = pair_cap;
+                    pair_cap = std::max<uint64_t>(T5_MIN_PAIR_CAP, pair_cap / 2ull);
+                    fprintf(stderr,
+                            "[%s] retune: pair_cap %llu->%llu last_ms=%.1f target_ms=%.1f reason=shrink\n",
+                            label ? label : "T5",
+                            (unsigned long long)old_cap,
+                            (unsigned long long)pair_cap,
+                            ms, T5_GROW_TARGET_MS);
+                    fflush(stderr);
+                } else if (!shrink_after && ms > 0.0 && ms < T5_GROW_TARGET_MS &&
+                           pair_cap < max_pair_cap) {
+                    const uint64_t old_cap = pair_cap;
+                    double step = T5_GROW_TARGET_MS / std::max(ms, 1.0);
+                    step = std::min(T5_GROW_MAX_STEP, std::max(T5_GROW_MIN_STEP, step));
+                    uint64_t next_cap = (uint64_t)((double)pair_cap * step);
+                    next_cap = std::max<uint64_t>(next_cap, pair_cap + T5_MIN_PAIR_CAP);
+                    pair_cap = std::min<uint64_t>(max_pair_cap, next_cap);
+                    if (pair_cap != old_cap) {
+                        fprintf(stderr,
+                                "[%s] retune: pair_cap %llu->%llu last_ms=%.1f target_ms=%.1f reason=grow\n",
+                                label ? label : "T5",
+                                (unsigned long long)old_cap,
+                                (unsigned long long)pair_cap,
+                                ms, T5_GROW_TARGET_MS);
+                        fflush(stderr);
+                    }
+                }
+
+                ++st.dispatches;
+                pairs_done += pairs;
+                const auto now = std::chrono::steady_clock::now();
+                if (now - progress_last >= std::chrono::seconds(1) || pairs_done >= total_pairs) {
+                    const double elapsed_s = std::chrono::duration<double>(now - progress_t0).count();
+                    const double pct = total_pairs > 0
+                        ? 100.0 * (double)pairs_done / (double)total_pairs : 100.0;
+                    const double mpairs_s = elapsed_s > 0.0
+                        ? ((double)pairs_done / 1000000.0) / elapsed_s : 0.0;
+                    fprintf(stderr,
+                            "[%s] connect progress: dispatches=%u pairs=%llu/%llu %.3f%% rate=%.3fM/s chunk=%ux%u pair_cap=%llu max_ms=%.1f reductions=%u\n",
+                            label ? label : "T5",
+                            st.dispatches,
+                            (unsigned long long)pairs_done,
+                            (unsigned long long)total_pairs,
+                            pct, mpairs_s,
+                            cam_n, light_n,
+                            (unsigned long long)pair_cap,
+                            st.max_ms, st.reductions);
+                    fflush(stderr);
+                    progress_last = now;
+                }
+                light_base += light_n;
+                if (ps.cancel.load(std::memory_order_relaxed))
+                    break;
+            }
+            cam_base += cam_n;
+            if (ps.cancel.load(std::memory_order_relaxed))
+                break;
+        }
+
+        st.final_pair_cap = pair_cap;
+        return st;
+    }
+
     /* ── service_gpu_native_t5: GPU-resident BDPT connection pass ────────── *
      * Called from thread_main when gpu_t5_trigger fires (production mode).   *
      * 1. Reads vertex count nv (tiny readback — one uint32).                 *
@@ -8287,21 +8628,220 @@ public:
      * 3. Packs sorted vertices into ssbo_t5_light / ssbo_t5_cam.             *
      * 4. Dispatches t5_full_connect with ssbo_sensor_rgb as output.          */
     void service_gpu_native_t5(RayPipelineState& ps) {
+        static constexpr const char* T5_NATIVE_LABEL = "T5-gpu-native";
         ps.bdpt_gpu_t5_pending.store(false, std::memory_order_release);
-        if (!prog_sort_init || !prog_sort_step || !prog_pack_t5 || !prog_t5) return;
+        bool expected_running = false;
+        if (!ps.bdpt_connection_running.compare_exchange_strong(
+                expected_running, true,
+                std::memory_order_acq_rel,
+                std::memory_order_relaxed))
+            return;
+        struct NativeT5RunGuard {
+            RayPipelineState& ps;
+            const char* label;
+            bool completed = false;
+            ~NativeT5RunGuard() {
+                ps.bdpt_connection_running.store(false, std::memory_order_release);
+                ps.bdpt_t5_fired.fetch_add(1u, std::memory_order_release);
+                fprintf(stderr, "[%s] PASS %s  t5_fired->%u\n",
+                        label ? label : "T5-gpu-native",
+                        completed ? "COMPLETE" : "ABORTED",
+                        ps.bdpt_t5_fired.load(std::memory_order_relaxed));
+                fflush(stderr);
+            }
+        } run_guard{ps, T5_NATIVE_LABEL};
+        if (!prog_sort_init || !prog_sort_step || !prog_pack_t5 || !prog_scatter_t5 || !prog_t5) return;
         if (!ssbo_bdpt_output) return;
 
-        /* Read vertex count — one uint32 from ssbo_t3_meta at bdpt_count_base. */
-        uint32_t nv_raw = 0;
+        /* Read BDPT record counts accumulated for the current flash+sensor cycle. */
+        uint32_t bdpt_counts[3] = {};
         if (ssbo_t3_meta && cached_bdpt_count_base > 0) {
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
             glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
                                   (GLintptr)(cached_bdpt_count_base * sizeof(uint32_t)),
-                                  sizeof(uint32_t), &nv_raw);
+                                  sizeof(bdpt_counts), bdpt_counts);
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         }
-        const int nv = (cached_max_bdpt_v > 0)
-            ? std::min((int)nv_raw, cached_max_bdpt_v) : (int)nv_raw;
+        uint32_t no_raw = 0;
+        if (ssbo_counter) {
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER,
+                                  (GLintptr)(4 * sizeof(uint32_t)),
+                                  sizeof(uint32_t), &no_raw);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+        const int max_v = cached_max_bdpt_v > 0 ? cached_max_bdpt_v : 10000000;
+        const int max_s = cached_max_bdpt_s > 0 ? cached_max_bdpt_s : 25000000;
+        const int max_p = cached_max_bdpt_p > 0 ? cached_max_bdpt_p : 10000000;
+        const int max_o = cached_max_bdpt_o > 0 ? cached_max_bdpt_o : 10000000;
+        static constexpr int BDPT_VERTEX_STRIDE_F   = 28;
+        static constexpr int BDPT_SPECTRAL_STRIDE_F = 8;
+        static constexpr int BDPT_PDF_STRIDE_F      = 12;
+        static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;
+        const int bdpt_spectral_base_f = max_v * BDPT_VERTEX_STRIDE_F;
+        const int bdpt_pdf_base_f = bdpt_spectral_base_f + max_s * BDPT_SPECTRAL_STRIDE_F;
+        const int bdpt_optical_base_f = bdpt_pdf_base_f + max_p * BDPT_PDF_STRIDE_F;
+        uint32_t nv_raw = std::min(bdpt_counts[0], (uint32_t)max_v);
+        uint32_t ns_raw = std::min(bdpt_counts[1], (uint32_t)max_s);
+        uint32_t np_raw = std::min(bdpt_counts[2], (uint32_t)max_p);
+        no_raw = std::min(no_raw, (uint32_t)max_o);
+
+        /* CPU-side launch records (emissive sources, and any camera/software
+         * seed records) are not emitted by T3, but they are required T5 vertices.
+         * Append them into the GPU BDPT sections before sort/pack. */
+        std::vector<BdptVertexRecord> cpu_v;
+        std::vector<BdptSpectralWeightRecord> cpu_sw;
+        std::vector<BdptPdfRecord> cpu_pdf;
+        std::vector<BdptOpticalEventRecord> cpu_opt;
+        ray_pipeline_drain_bdpt_vertices(&ps, cpu_v, std::max(0, max_v - (int)nv_raw));
+        ray_pipeline_drain_bdpt_spectral(&ps, cpu_sw, std::max(0, max_s - (int)ns_raw));
+        ray_pipeline_drain_bdpt_pdfs    (&ps, cpu_pdf, std::max(0, max_p - (int)np_raw));
+        ray_pipeline_drain_bdpt_optical (&ps, cpu_opt, std::max(0, max_o - (int)no_raw));
+
+        if (!cpu_v.empty()) {
+            std::vector<float> rows(cpu_v.size() * BDPT_VERTEX_STRIDE_F, 0.0f);
+            for (size_t i = 0; i < cpu_v.size(); ++i) {
+                const auto& v = cpu_v[i];
+                float* row = rows.data() + i * BDPT_VERTEX_STRIDE_F;
+                const uint32_t packed_vi = ((uint32_t)v.vertex_index << 16)
+                                         | ((uint32_t)v.stream << 8)
+                                         | (uint32_t)v.sample_domain;
+                row[0] = rt_u32_as_f32(v.subpath_id);
+                row[1] = rt_u32_as_f32(packed_vi);
+                row[2] = rt_u32_as_f32(v.flags);
+                row[3] = rt_u32_as_f32(v.strategy_id);
+                row[4] = rt_i32_as_f32(v.tri_id);
+                row[5] = rt_i32_as_f32(v.group_id);
+                row[6] = rt_i32_as_f32(v.mat_idx);
+                row[7] = v.pos[0];       row[8] = v.pos[1];       row[9] = v.pos[2];
+                row[10] = v.normal[0];   row[11] = v.normal[1];   row[12] = v.normal[2];
+                row[13] = v.dir_in[0];   row[14] = v.dir_in[1];   row[15] = v.dir_in[2];
+                row[16] = v.dir_out[0];  row[17] = v.dir_out[1];  row[18] = v.dir_out[2];
+                row[19] = v.path_len;
+                row[20] = v.path_at_seg_start;
+                row[21] = v.pdf_fwd;
+                row[22] = v.pdf_rev;
+                row[23] = 0.0f;
+                row[24] = v.pdf_solid_angle;
+                row[25] = v.throughput_scalar;
+                row[26] = v.sensor_origin_y;
+                row[27] = v.sensor_origin_z;
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                              (GLintptr)((size_t)nv_raw * BDPT_VERTEX_STRIDE_F * sizeof(float)),
+                              (GLsizeiptr)(rows.size() * sizeof(float)), rows.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            nv_raw += (uint32_t)cpu_v.size();
+        }
+
+        if (!cpu_sw.empty()) {
+            std::vector<float> rows(cpu_sw.size() * BDPT_SPECTRAL_STRIDE_F, 0.0f);
+            for (size_t i = 0; i < cpu_sw.size(); ++i) {
+                const auto& sw = cpu_sw[i];
+                float* row = rows.data() + i * BDPT_SPECTRAL_STRIDE_F;
+                const uint32_t vi_band = ((uint32_t)sw.vertex_index << 16) | (uint32_t)sw.band_id;
+                row[0] = rt_u32_as_f32(sw.subpath_id);
+                row[1] = rt_u32_as_f32(vi_band);
+                row[2] = sw.beta_re;
+                row[3] = sw.beta_im;
+                row[4] = sw.wavelength_or_center;
+                row[5] = sw.band_pdf;
+                row[6] = sw.sensor_rgb_weight;
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                              (GLintptr)(((size_t)bdpt_spectral_base_f
+                                         + (size_t)ns_raw * BDPT_SPECTRAL_STRIDE_F) * sizeof(float)),
+                              (GLsizeiptr)(rows.size() * sizeof(float)), rows.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            ns_raw += (uint32_t)cpu_sw.size();
+        }
+
+        if (!cpu_pdf.empty()) {
+            std::vector<float> rows(cpu_pdf.size() * BDPT_PDF_STRIDE_F, 0.0f);
+            for (size_t i = 0; i < cpu_pdf.size(); ++i) {
+                const auto& pr = cpu_pdf[i];
+                float* row = rows.data() + i * BDPT_PDF_STRIDE_F;
+                const uint32_t packed_vm = ((uint32_t)pr.measure << 24)
+                                         | ((uint32_t)pr.sample_domain << 16)
+                                         | (uint32_t)pr.vertex_index;
+                row[0] = rt_u32_as_f32(pr.subpath_id);
+                row[1] = rt_u32_as_f32(packed_vm);
+                row[2] = pr.pdf_fwd;
+                row[3] = pr.pdf_rev;
+                row[4] = pr.pdf_area;
+                row[5] = pr.pdf_solid_angle;
+                row[6] = pr.jacobian_det;
+                row[7] = pr.geometry_term;
+                row[8] = rt_u32_as_f32(pr.flags);
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                              (GLintptr)(((size_t)bdpt_pdf_base_f
+                                         + (size_t)np_raw * BDPT_PDF_STRIDE_F) * sizeof(float)),
+                              (GLsizeiptr)(rows.size() * sizeof(float)), rows.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            np_raw += (uint32_t)cpu_pdf.size();
+        }
+
+        if (!cpu_opt.empty()) {
+            std::vector<float> rows(cpu_opt.size() * BDPT_OPTICAL_STRIDE_F, 0.0f);
+            for (size_t i = 0; i < cpu_opt.size(); ++i) {
+                const auto& oe = cpu_opt[i];
+                float* row = rows.data() + i * BDPT_OPTICAL_STRIDE_F;
+                const uint32_t packed_ve = ((uint32_t)oe.element_index << 16) | (uint32_t)oe.vertex_index;
+                const uint32_t packed_rf = ((uint32_t)oe.flags << 16)
+                                         | ((uint32_t)oe.stream << 8)
+                                         | (uint32_t)oe.reason;
+                row[0] = rt_u32_as_f32(oe.subpath_id);
+                row[1] = rt_u32_as_f32(packed_ve);
+                row[2] = rt_u32_as_f32(packed_rf);
+                row[3] = oe.pos[0];       row[4] = oe.pos[1];       row[5] = oe.pos[2];
+                row[6] = oe.normal[0];    row[7] = oe.normal[1];    row[8] = oe.normal[2];
+                row[9] = oe.dir_in[0];    row[10] = oe.dir_in[1];   row[11] = oe.dir_in[2];
+                row[12] = oe.dir_out[0];  row[13] = oe.dir_out[1];  row[14] = oe.dir_out[2];
+                row[15] = oe.cos_incident;
+                row[16] = oe.cos_transmitted;
+                row[17] = oe.eta_i;
+                row[18] = oe.eta_t;
+                row[19] = oe.fresnel_reflectance;
+                row[20] = oe.transmittance;
+                row[21] = oe.throughput_multiplier;
+                row[22] = oe.opl;
+                row[23] = oe.geom_len;
+                row[24] = oe.aperture_radius;
+                row[25] = oe.transverse_radius;
+                row[26] = oe.dist_past_aperture;
+                row[27] = oe.phase_space_jacobian;
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_bdpt_output);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                              (GLintptr)(((size_t)bdpt_optical_base_f
+                                         + (size_t)no_raw * BDPT_OPTICAL_STRIDE_F) * sizeof(float)),
+                              (GLsizeiptr)(rows.size() * sizeof(float)), rows.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            no_raw += (uint32_t)cpu_opt.size();
+        }
+
+        if (!cpu_v.empty() || !cpu_sw.empty() || !cpu_pdf.empty() || !cpu_opt.empty()) {
+            uint32_t merged_counts[3] = { nv_raw, ns_raw, np_raw };
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
+                              (GLintptr)(cached_bdpt_count_base * sizeof(uint32_t)),
+                              sizeof(merged_counts), merged_counts);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+        fprintf(stderr,
+                "[%s] records: nv=%u ns=%u np=%u no=%u cpu_v=%zu cpu_sw=%zu cpu_pdf=%zu cpu_opt=%zu\n",
+                T5_NATIVE_LABEL, nv_raw, ns_raw, np_raw, no_raw,
+                cpu_v.size(), cpu_sw.size(), cpu_pdf.size(), cpu_opt.size());
+        fflush(stderr);
+
+        const int nv = (int)nv_raw;
+        const int ns = (int)ns_raw;
+        const int np = (int)np_raw;
+        const int no = (int)no_raw;
         if (nv <= 0) return;
 
         /* Compute padded size (next power of 2 >= nv) for bitonic sort. */
@@ -8326,6 +8866,9 @@ public:
         }
 
         /* ── Step 1: sort_init — build keys and count light/cam verts ── */
+        fprintf(stderr, "[%s] stage sort-init: nv=%d npad=%d\n",
+                T5_NATIVE_LABEL, nv, npad);
+        fflush(stderr);
         glc_UseProgram(prog_sort_init);
         bind_ssbo(ssbo_bdpt_output, 0);
         bind_ssbo(ssbo_sort_keys,   1);
@@ -8335,6 +8878,12 @@ public:
         if (uloc_sort_init.npad >= 0) glc_Uniform1i(uloc_sort_init.npad, npad);
         glc_DispatchCompute((GLuint)((npad + 63) / 64), 1, 1);
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        if (ps.cfg.t5_profile && !wait_t5_profile_fence(T5_NATIVE_LABEL, "sort-init")) {
+            fprintf(stderr, "[%s-profile] aborted before sort-count readback after profile timeout\n",
+                    T5_NATIVE_LABEL);
+            fflush(stderr);
+            return;
+        }
 
         /* Read n_lv (needed by pack shader to compute cam output offset). */
         uint32_t n_lv_raw = 0;
@@ -8344,8 +8893,14 @@ public:
         const int n_lv = (int)n_lv_raw;
         const int n_cv = nv - n_lv;
         if (n_lv == 0 || n_cv == 0) return;  /* nothing to connect */
+        fprintf(stderr, "[%s] stage sort-init done: light=%d cam=%d\n",
+                T5_NATIVE_LABEL, n_lv, n_cv);
+        fflush(stderr);
 
         /* ── Step 2: bitonic sort (npad/2 threads per step) ── */
+        fprintf(stderr, "[%s] stage sort-bitonic: npad=%d workgroups=%u\n",
+                T5_NATIVE_LABEL, npad, (unsigned)((npad / 2 + 63) / 64));
+        fflush(stderr);
         glc_UseProgram(prog_sort_step);
         bind_ssbo(ssbo_sort_keys, 0);
         bind_ssbo(ssbo_sort_idx,  1);
@@ -8359,8 +8914,17 @@ public:
                 glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             }
         }
+        if (ps.cfg.t5_profile && !wait_t5_profile_fence(T5_NATIVE_LABEL, "sort-bitonic")) {
+            fprintf(stderr, "[%s-profile] aborted before pack after profile timeout\n",
+                    T5_NATIVE_LABEL);
+            fflush(stderr);
+            return;
+        }
 
         /* ── Step 3: pack sorted vertices into T5 format ── */
+        fprintf(stderr, "[%s] stage pack-t5: verts=%d light=%d cam=%d\n",
+                T5_NATIVE_LABEL, nv, n_lv, n_cv);
+        fflush(stderr);
         /* Ensure t5_light and t5_cam are large enough for the sorted output. */
         {
             const int need_lgv = n_lv * (int)T5_LGV_STRIDE;
@@ -8385,20 +8949,116 @@ public:
         if (uloc_pack_t5.n_lv            >= 0) glc_Uniform1i(uloc_pack_t5.n_lv,            n_lv);
         if (uloc_pack_t5.n_bands         >= 0) glc_Uniform1i(uloc_pack_t5.n_bands,
                                                                ps.st ? (int)ps.st->freq_hz_vec.size() : 1);
+        if (uloc_pack_t5.bdpt_spectral_base >= 0) glc_Uniform1i(uloc_pack_t5.bdpt_spectral_base,
+                                                               bdpt_spectral_base_f);
+        if (uloc_pack_t5.n_spectral      >= 0) glc_Uniform1i(uloc_pack_t5.n_spectral, ns);
+        if (uloc_pack_t5.bdpt_pdf_base   >= 0) glc_Uniform1i(uloc_pack_t5.bdpt_pdf_base,
+                                                               bdpt_pdf_base_f);
+        if (uloc_pack_t5.n_pdfs          >= 0) glc_Uniform1i(uloc_pack_t5.n_pdfs, np);
+        if (uloc_pack_t5.bdpt_optical_base >= 0) glc_Uniform1i(uloc_pack_t5.bdpt_optical_base,
+                                                               bdpt_optical_base_f);
+        if (uloc_pack_t5.n_optical       >= 0) glc_Uniform1i(uloc_pack_t5.n_optical, no);
         if (uloc_pack_t5.sensor_half_w   >= 0) glc_Uniform1f(uloc_pack_t5.sensor_half_w, ps.sensor_half_w);
         if (uloc_pack_t5.sensor_half_h   >= 0) glc_Uniform1f(uloc_pack_t5.sensor_half_h, ps.sensor_half_h);
         glc_DispatchCompute((GLuint)((nv + 63) / 64), 1, 1);
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        if (ps.cfg.t5_profile && !wait_t5_profile_fence(T5_NATIVE_LABEL, "pack-t5")) {
+            fprintf(stderr, "[%s-profile] aborted before connect after profile timeout\n",
+                    T5_NATIVE_LABEL);
+            fflush(stderr);
+            return;
+        }
 
-        /* ── Step 4: T5 connection dispatch (Pass C path — writes to ssbo_sensor_rgb) ── */
+        /* ── Step 4: scatter side records into packed T5 rows ───────────── */
+        fprintf(stderr, "[%s] stage scatter-t5: spectral=%d optical=%d batch=65536\n",
+                T5_NATIVE_LABEL, ns, no);
+        fflush(stderr);
+        glc_UseProgram(prog_scatter_t5);
+        bind_ssbo(ssbo_sort_keys,   0);
+        bind_ssbo(ssbo_bdpt_output, 1);
+        bind_ssbo(ssbo_t5_light,    2);
+        bind_ssbo(ssbo_t5_cam,      3);
+        if (uloc_scatter_t5.nv >= 0) glc_Uniform1i(uloc_scatter_t5.nv, nv);
+        if (uloc_scatter_t5.n_lv >= 0) glc_Uniform1i(uloc_scatter_t5.n_lv, n_lv);
+        if (uloc_scatter_t5.n_bands >= 0) glc_Uniform1i(uloc_scatter_t5.n_bands,
+                                                        ps.st ? (int)ps.st->freq_hz_vec.size() : 1);
+        if (uloc_scatter_t5.bdpt_spectral_base >= 0) glc_Uniform1i(uloc_scatter_t5.bdpt_spectral_base,
+                                                                   bdpt_spectral_base_f);
+        if (uloc_scatter_t5.bdpt_pdf_base >= 0) glc_Uniform1i(uloc_scatter_t5.bdpt_pdf_base,
+                                                              bdpt_pdf_base_f);
+        if (uloc_scatter_t5.bdpt_optical_base >= 0) glc_Uniform1i(uloc_scatter_t5.bdpt_optical_base,
+                                                                  bdpt_optical_base_f);
+        auto dispatch_scatter_records = [&](int mode, int count, const char* stage) -> bool {
+            if (count <= 0) return true;
+            static constexpr int SCATTER_RECORD_BATCH = 65536;
+            if (uloc_scatter_t5.scatter_mode >= 0) glc_Uniform1i(uloc_scatter_t5.scatter_mode, mode);
+            if (uloc_scatter_t5.n_records >= 0) glc_Uniform1i(uloc_scatter_t5.n_records, count);
+            for (int off = 0; off < count; off += SCATTER_RECORD_BATCH) {
+                const int n_this = std::min(SCATTER_RECORD_BATCH, count - off);
+                if (uloc_scatter_t5.record_offset >= 0) glc_Uniform1i(uloc_scatter_t5.record_offset, off);
+                glc_DispatchCompute((GLuint)((n_this + 63) / 64), 1, 1);
+                glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+                if (ps.cfg.t5_profile) {
+                    char stage_buf[96];
+                    snprintf(stage_buf, sizeof(stage_buf), "%s[%d..%d)", stage, off, off + n_this);
+                    if (!wait_t5_profile_fence(T5_NATIVE_LABEL, stage_buf))
+                        return false;
+                }
+            }
+            return true;
+        };
+        if (ns > 0) {
+            fprintf(stderr, "[%s] scatter-spectral queue: records=%d chunks=%d\n",
+                    T5_NATIVE_LABEL, ns, (ns + 65535) / 65536);
+            fflush(stderr);
+            if (uloc_scatter_t5.scatter_mode >= 0) glc_Uniform1i(uloc_scatter_t5.scatter_mode, 0);
+            if (uloc_scatter_t5.n_records >= 0) glc_Uniform1i(uloc_scatter_t5.n_records, ns);
+            if (!dispatch_scatter_records(0, ns, "scatter-spectral")) {
+                fprintf(stderr, "[%s-profile] aborted before connect after spectral scatter timeout\n",
+                        T5_NATIVE_LABEL);
+                fflush(stderr);
+                return;
+            }
+        }
+        if (np > 0) {
+            fprintf(stderr, "[%s] scatter-pdf queue: records=%d chunks=%d\n",
+                    T5_NATIVE_LABEL, np, (np + 65535) / 65536);
+            fflush(stderr);
+            if (uloc_scatter_t5.scatter_mode >= 0) glc_Uniform1i(uloc_scatter_t5.scatter_mode, 2);
+            if (uloc_scatter_t5.n_records >= 0) glc_Uniform1i(uloc_scatter_t5.n_records, np);
+            if (!dispatch_scatter_records(2, np, "scatter-pdf")) {
+                fprintf(stderr, "[%s-profile] aborted before connect after pdf scatter timeout\n",
+                        T5_NATIVE_LABEL);
+                fflush(stderr);
+                return;
+            }
+        }
+        if (no > 0) {
+            fprintf(stderr, "[%s] scatter-optical queue: records=%d chunks=%d\n",
+                    T5_NATIVE_LABEL, no, (no + 65535) / 65536);
+            fflush(stderr);
+            if (uloc_scatter_t5.scatter_mode >= 0) glc_Uniform1i(uloc_scatter_t5.scatter_mode, 1);
+            if (uloc_scatter_t5.n_records >= 0) glc_Uniform1i(uloc_scatter_t5.n_records, no);
+            if (!dispatch_scatter_records(1, no, "scatter-optical")) {
+                fprintf(stderr, "[%s-profile] aborted before connect after optical scatter timeout\n",
+                        T5_NATIVE_LABEL);
+                fflush(stderr);
+                return;
+            }
+        }
+        fprintf(stderr, "[%s] stage scatter-t5 queued; preparing connect\n",
+                T5_NATIVE_LABEL);
+        fflush(stderr);
+
+        /* ── Step 5: T5 connection dispatch (writes to ssbo_sensor_rgb) ── */
+        if (ps.sensor_res > 0)
+            ensure_sensor_rgb_ssbo(ps.sensor_res);
         if (!ssbo_sensor_rgb || sensor_rgb_res != ps.sensor_res) return;
 
         const uint32_t T5_LIGHT_BATCH_NT = t5_light_batch_size ? t5_light_batch_size : 4096u;
         const uint32_t T5_CAM_BATCH_NT   = t5_cam_batch_size   ? t5_cam_batch_size   : 8192u;
         const uint32_t n_lv_u = (uint32_t)n_lv;
         const uint32_t n_cv_u = (uint32_t)n_cv;
-        const uint32_t n_lbatches = (n_lv_u + T5_LIGHT_BATCH_NT - 1u) / T5_LIGHT_BATCH_NT;
-        const uint32_t n_cbatches = (n_cv_u + T5_CAM_BATCH_NT   - 1u) / T5_CAM_BATCH_NT;
 
         T5GpuParams par{};
         par.min_geom     = (float)ps.cfg.t5_min_geom;
@@ -8410,6 +9070,32 @@ public:
         par.tile_w = 0; par.tile_h = 0; par.tile_x0 = 0; par.tile_y0 = 0;
         par.n_bands = ps.st ? (int)ps.st->freq_hz_vec.size() : 1;
 
+        if (!ssbo_t5_params)
+            ensure_ssbo(ssbo_t5_params, sizeof(T5GpuParams));
+        const int nb_gpu = std::max(1, std::min(par.n_bands, (int)T5_MAX_GPU_BANDS));
+        const int nsw = nb_gpu * 3;
+        if (nsw > cap_t5_spectral) {
+            cap_t5_spectral = std::max(nsw * 2, (int)T5_MAX_GPU_BANDS * 3);
+            ensure_ssbo(ssbo_t5_spectral, (GLsizeiptr)(cap_t5_spectral * sizeof(float)));
+        }
+        std::vector<float> spectral_weights((size_t)nsw);
+        for (int band = 0; band < nb_gpu; ++band) {
+            double wr = 0.0, wg = 0.0, wb = 0.0;
+            band_to_display_rgb(band, nb_gpu,
+                                ps.st ? ps.st->freq_hz_vec : Eigen::VectorXd{},
+                                wr, wg, wb);
+            spectral_weights[(size_t)band * 3 + 0] = (float)wr;
+            spectral_weights[(size_t)band * 3 + 1] = (float)wg;
+            spectral_weights[(size_t)band * 3 + 2] = (float)wb;
+        }
+        if (ssbo_t5_spectral && !spectral_weights.empty()) {
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_spectral);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                              (GLsizeiptr)(spectral_weights.size() * sizeof(float)),
+                              spectral_weights.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+
         glc_UseProgram(prog_t5);
         bind_ssbo(ssbo_t5_light,    0);
         bind_ssbo(ssbo_t5_cam,      1);
@@ -8419,29 +9105,29 @@ public:
         bind_ssbo(ssbo_bvh,         5);
         bind_ssbo(ssbo_tri_id,      6);
         bind_ssbo(ssbo_tri_full,    7);
-
-        bool ok = true;
-        for (uint32_t c = 0; c < n_cbatches && ok; ++c) {
-            par.cam_offset = c * T5_CAM_BATCH_NT;
-            for (uint32_t b = 0; b < n_lbatches && ok; ++b) {
-                par.light_offset     = b * T5_LIGHT_BATCH_NT;
-                par.light_batch_size = T5_LIGHT_BATCH_NT;
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_params);
-                glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(T5GpuParams), &par);
-                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-                const uint32_t nc_b = std::min(T5_CAM_BATCH_NT,   n_cv_u - par.cam_offset);
-                const uint32_t nl_b = std::min(T5_LIGHT_BATCH_NT, n_lv_u - par.light_offset);
-                glc_DispatchCompute((nc_b + 7u) / 8u, (nl_b + 7u) / 8u, 1);
-                GLsync fn = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                GLenum fe = glc_ClientWaitSync(fn, GL_SYNC_FLUSH_COMMANDS_BIT, 2'000'000'000u);
-                glc_DeleteSync(fn);
-                if (fe == GL_TIMEOUT_EXPIRED || fe == GL_WAIT_FAILED) ok = false;
-            }
+        if (ps.cfg.t5_profile && !wait_t5_profile_fence(T5_NATIVE_LABEL, "pre-connect-queue")) {
+            fprintf(stderr, "[%s-profile] aborted before connect profile after queue-drain timeout\n",
+                    T5_NATIVE_LABEL);
+            fflush(stderr);
+            return;
         }
-        if (ok) glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-        fprintf(stderr, "[T5-gpu-native] done: nv=%d n_lv=%d n_cv=%d %s\n",
-                nv, n_lv, n_cv, ok ? "ok" : "ABORTED");
+
+        const T5DispatchStats t5_stats =
+            dispatch_t5_pair_chunks(ps, par, n_cv_u, n_lv_u,
+                                    T5_CAM_BATCH_NT, T5_LIGHT_BATCH_NT,
+                                    "T5-gpu-native");
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        fprintf(stderr,
+                "[T5-gpu-native] submitted: nv=%d n_lv=%d n_cv=%d target=%ux%u dispatches=%u pair_cap=%llu->%llu max_chunk=%ux%u max_pairs=%llu max_ms=%.1f reductions=%u\n",
+                nv, n_lv, n_cv, T5_CAM_BATCH_NT, T5_LIGHT_BATCH_NT,
+                t5_stats.dispatches,
+                (unsigned long long)t5_stats.start_pair_cap,
+                (unsigned long long)t5_stats.final_pair_cap,
+                t5_stats.max_cam, t5_stats.max_light,
+                (unsigned long long)t5_stats.max_pairs,
+                t5_stats.max_ms, t5_stats.reductions);
         fflush(stderr);
+        run_guard.completed = true;
     }
 
     /* Upload data to an SSBO (auto-grows if needed). */
@@ -8836,6 +9522,8 @@ public:
             if (gpu_required) { snprintf(ctx.error, sizeof(ctx.error), "t5_full_connect.comp.glsl: %s", err); return false; }
             prog_t5 = 0;
         }
+        if (prog_t5)
+            uloc_t5_profile_mode = glc_GetUniformLocation(prog_t5, "t5_profile_mode");
 
         /* Pass B: GPU-resident terminal splat shader — non-fatal */
         if (!load("sensor_terminal_splat.comp.glsl", prog_sensor_splat)) {
@@ -8852,6 +9540,7 @@ public:
             uloc_splat.sensor_half_h   = glc_GetUniformLocation(prog_sensor_splat, "sensor_half_h");
             uloc_splat.sensor_res_u    = glc_GetUniformLocation(prog_sensor_splat, "sensor_res");
             uloc_splat.n_bands         = glc_GetUniformLocation(prog_sensor_splat, "n_bands");
+            uloc_splat.n_mats          = glc_GetUniformLocation(prog_sensor_splat, "n_mats");
             uloc_splat.splat_scale     = glc_GetUniformLocation(prog_sensor_splat, "splat_scale");
             uloc_splat.rgb_w           = glc_GetUniformLocation(prog_sensor_splat, "rgb_w");
         }
@@ -8868,6 +9557,7 @@ public:
         load_nonfatal("bdpt_sort_init.comp.glsl",  prog_sort_init);
         load_nonfatal("bdpt_sort_step.comp.glsl",  prog_sort_step);
         load_nonfatal("bdpt_pack_t5.comp.glsl",    prog_pack_t5);
+        load_nonfatal("bdpt_scatter_t5.comp.glsl", prog_scatter_t5);
         if (prog_sort_init) {
             uloc_sort_init.nv   = glc_GetUniformLocation(prog_sort_init, "nv");
             uloc_sort_init.npad = glc_GetUniformLocation(prog_sort_init, "npad");
@@ -8881,8 +9571,25 @@ public:
             uloc_pack_t5.nv               = glc_GetUniformLocation(prog_pack_t5, "nv");
             uloc_pack_t5.n_lv             = glc_GetUniformLocation(prog_pack_t5, "n_lv");
             uloc_pack_t5.n_bands          = glc_GetUniformLocation(prog_pack_t5, "n_bands");
+            uloc_pack_t5.bdpt_spectral_base = glc_GetUniformLocation(prog_pack_t5, "bdpt_spectral_base");
+            uloc_pack_t5.n_spectral       = glc_GetUniformLocation(prog_pack_t5, "n_spectral");
+            uloc_pack_t5.bdpt_pdf_base    = glc_GetUniformLocation(prog_pack_t5, "bdpt_pdf_base");
+            uloc_pack_t5.n_pdfs           = glc_GetUniformLocation(prog_pack_t5, "n_pdfs");
+            uloc_pack_t5.bdpt_optical_base = glc_GetUniformLocation(prog_pack_t5, "bdpt_optical_base");
+            uloc_pack_t5.n_optical        = glc_GetUniformLocation(prog_pack_t5, "n_optical");
             uloc_pack_t5.sensor_half_w    = glc_GetUniformLocation(prog_pack_t5, "sensor_half_w");
             uloc_pack_t5.sensor_half_h    = glc_GetUniformLocation(prog_pack_t5, "sensor_half_h");
+        }
+        if (prog_scatter_t5) {
+            uloc_scatter_t5.scatter_mode = glc_GetUniformLocation(prog_scatter_t5, "scatter_mode");
+            uloc_scatter_t5.nv = glc_GetUniformLocation(prog_scatter_t5, "nv");
+            uloc_scatter_t5.n_lv = glc_GetUniformLocation(prog_scatter_t5, "n_lv");
+            uloc_scatter_t5.n_records = glc_GetUniformLocation(prog_scatter_t5, "n_records");
+            uloc_scatter_t5.record_offset = glc_GetUniformLocation(prog_scatter_t5, "record_offset");
+            uloc_scatter_t5.n_bands = glc_GetUniformLocation(prog_scatter_t5, "n_bands");
+            uloc_scatter_t5.bdpt_spectral_base = glc_GetUniformLocation(prog_scatter_t5, "bdpt_spectral_base");
+            uloc_scatter_t5.bdpt_pdf_base = glc_GetUniformLocation(prog_scatter_t5, "bdpt_pdf_base");
+            uloc_scatter_t5.bdpt_optical_base = glc_GetUniformLocation(prog_scatter_t5, "bdpt_optical_base");
         }
 
         /* Load UV blit shader — non-fatal, falls back to CPU path silently */
@@ -9310,6 +10017,9 @@ public:
         const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 25000000;
         const int max_bdpt_p = (ps.cfg.bdpt_max_pdfs > 0) ? ps.cfg.bdpt_max_pdfs : 10000000;
         const int max_bdpt_o = (ps.cfg.bdpt_max_optical > 0) ? ps.cfg.bdpt_max_optical : 10000000;
+        cached_max_bdpt_s = max_bdpt_s;
+        cached_max_bdpt_p = max_bdpt_p;
+        cached_max_bdpt_o = max_bdpt_o;
         const int  bdpt_spectral_base_f = max_bdpt_v * BDPT_VERTEX_STRIDE_F;
         const int  bdpt_pdf_base_f      = bdpt_spectral_base_f + max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
         const int  bdpt_optical_base_f  = bdpt_pdf_base_f + max_bdpt_p * BDPT_PDF_STRIDE_F;
@@ -9320,6 +10030,14 @@ public:
          * neither counters[0] nor meta[0..1] ever need to cross to CPU.
          * Debug mode keeps the existing per-bounce readback path unchanged. */
         const bool use_gpu_resident = ps.cfg.gpu_skip_record_readback && prog_post_t3_prep != 0;
+        const uint32_t gpu_bdpt_cycle = std::max(
+            ps.bdpt_flash_dispatched.load(std::memory_order_acquire),
+            ps.bdpt_sensor_dispatched.load(std::memory_order_acquire));
+        const bool reset_bdpt_records = !use_gpu_resident
+            || gpu_bdpt_cycle == 0
+            || gpu_bdpt_cycle != bdpt_gpu_accum_cycle;
+        if (use_gpu_resident && reset_bdpt_records && gpu_bdpt_cycle != 0)
+            bdpt_gpu_accum_cycle = gpu_bdpt_cycle;
 
         /* Maximum bounce iterations for the GPU-resident path (no nc-based exit). */
         static constexpr int MAX_GPU_BOUNCES = 12;
@@ -9418,12 +10136,12 @@ public:
             }
         }
 
-        /* Zero per-bounce counters.  On first gen: zero all 8 (including [4]=optical
-         * write pointer).  On subsequent gens: zero only [0..3] (hit/miss/wave/cpu_refine)
-         * — counter[4] must keep accumulating so T2's append offset is preserved.   */
+        /* Zero per-bounce counters.  Optical counter [4] is also the BDPT optical
+         * record write pointer; in GPU-resident mode it must survive the second
+         * family dispatch for the same BDPT cycle so T5 receives both streams. */
         {
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_counter);
-            if (first_gen) {
+            if (first_gen && reset_bdpt_records) {
                 uint32_t zeros[8] = {};
                 glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, 8 * sizeof(uint32_t), zeros);
             } else {
@@ -9432,8 +10150,10 @@ public:
             }
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         }
-        /* Zero BDPT count slots in MetaBuf tail once — they accumulate across bounces. */
-        if (first_gen) {
+        /* Zero BDPT count slots only at the start of a BDPT cycle.  Flash and
+         * sensor batches may be separate dispatch_t1_t2_t3() calls; clearing
+         * here unconditionally drops the first family before T5 can pack it. */
+        if (first_gen && reset_bdpt_records) {
             uint32_t bzeros[3] = {};
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t3_meta);
             glc_BufferSubData(GL_SHADER_STORAGE_BUFFER,
@@ -9692,13 +10412,15 @@ public:
         if (!use_gpu_resident && n_hits <= 0) break;
 
         /* Merge GPU UV accumulator into the CPU-side uv_accum_cpu and re-zero
-         * the GPU SSBO.  This is intentionally rate-limited: with physical
+         * the GPU SSBO only in readback/debug mode.  This is intentionally rate-limited:
+         * with physical
          * 512x512 pages and 11+5*bands channels, the flat accumulator can be
          * >1 GB for the default hot set.  Per-dispatch readback makes GPU mode
          * PCIe/CPU-bound; the GPU buffer is allowed to keep accumulating until
          * the next scheduled readback.                                      */
         const auto uv_now = Clock::now();
-        const bool do_uv_readback = n_uv_groups > 0 && st.uv_accum_total > 0
+        const bool do_uv_readback = !use_gpu_resident
+            && n_uv_groups > 0 && st.uv_accum_total > 0
             && std::chrono::duration<double>(uv_now - last_uv_readback_t).count() >=
                uv_readback_interval_s.load(std::memory_order_relaxed);
         if (do_uv_readback) {
@@ -9821,13 +10543,13 @@ public:
             fflush(stderr);
         }
 
-        /* Pass B: GPU-resident terminal splat.
-         * Production mode: indirect dispatch — nt_term comes from ssbo_t3_meta[1]
-         *   (post_t3_prep already wrote the indirect args to ssbo_splat_indirect).
-         * Debug mode: direct dispatch — nt_term known from meta readback above. */
-        if (ps.sensor_res > 0 && ps.cfg.gpu_skip_record_readback) {
+        /* Direct camera-visible emissive surfaces do not need a T5 vertex pair:
+         * sensor_terminal_splat filters to backward sensor rays whose terminal
+         * record is an emissive material hit, then accumulates the recorded
+         * terminal spectrum into the GPU film. */
+        if (ps.cfg.gpu_skip_record_readback && ps.sensor_res > 0 && prog_sensor_splat) {
             ensure_sensor_rgb_ssbo(ps.sensor_res);
-            dispatch_terminal_splat(ps, max_children, nb);  /* always indirect now */
+            dispatch_terminal_splat(ps, max_children, nb);
         }
 
         /* ── Post-T3: STRIKE records → Q_out + field grid (one readback) ──
@@ -10439,9 +11161,7 @@ public:
             const uint32_t T5_LIGHT_BATCH_C = t5_light_batch_size ? t5_light_batch_size : 4096u;
             const uint32_t T5_CAM_BATCH_C   = t5_cam_batch_size   ? t5_cam_batch_size   : 8192u;
             const uint32_t n_light_c  = par.n_light_verts;
-            const uint32_t n_batches_c = (n_light_c + T5_LIGHT_BATCH_C - 1u) / T5_LIGHT_BATCH_C;
             const uint32_t n_cv_total  = (uint32_t)(ncv / (int)T5_CGV_STRIDE);
-            const uint32_t n_cbatches_c = (n_cv_total + T5_CAM_BATCH_C - 1u) / T5_CAM_BATCH_C;
 
             /* Upload all cam verts at once — no tile filtering in production mode. */
             if (ncv > cap_t5_cam) {
@@ -10467,37 +11187,21 @@ public:
             par_c.n_light_verts = n_light_c;
             par_c.n_cam_verts   = n_cv_total;
 
-            bool c_ok = true;
-            for (uint32_t c = 0; c < n_cbatches_c && c_ok; ++c) {
-                const uint32_t cam_off = c * T5_CAM_BATCH_C;
-                par_c.cam_offset = cam_off;
-                for (uint32_t b = 0; b < n_batches_c && c_ok; ++b) {
-                    par_c.light_offset     = b * T5_LIGHT_BATCH_C;
-                    par_c.light_batch_size = T5_LIGHT_BATCH_C;
-                    upload(ssbo_t5_params, &par_c, sizeof(T5GpuParams));
+            const T5DispatchStats t5_stats =
+                dispatch_t5_pair_chunks(ps, par_c, n_cv_total, n_light_c,
+                                        T5_CAM_BATCH_C, T5_LIGHT_BATCH_C,
+                                        "T5-gpu-C");
 
-                    const uint32_t n_c = std::min(T5_CAM_BATCH_C, n_cv_total - cam_off);
-                    const uint32_t n_l = std::min(T5_LIGHT_BATCH_C,
-                                                  n_light_c - b * T5_LIGHT_BATCH_C);
-                    const GLuint wg_c = (n_c + 7u) / 8u;
-                    const GLuint wg_l = (n_l + 7u) / 8u;
-                    glc_DispatchCompute(wg_c, wg_l, 1);
-
-                    GLsync fence_c = glc_FenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-                    GLenum finish_err = glc_ClientWaitSync(
-                        fence_c, GL_SYNC_FLUSH_COMMANDS_BIT, 2'000'000'000u);
-                    glc_DeleteSync(fence_c);
-                    if (finish_err == GL_TIMEOUT_EXPIRED || finish_err == GL_WAIT_FAILED) {
-                        fprintf(stderr, "[T5-gpu-C] TDR cbatch=%u lbatch=%u\n", c, b);
-                        fflush(stderr);
-                        c_ok = false;
-                    }
-                }
-            }
-
-            if (c_ok) glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-            fprintf(stderr, "[T5-gpu-C] done: %u cam × %u light batches → ssbo_sensor_rgb\n",
-                    n_cbatches_c, n_batches_c);
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            fprintf(stderr,
+                    "[T5-gpu-C] done: target=%ux%u dispatches=%u pair_cap=%llu->%llu max_chunk=%ux%u max_pairs=%llu max_ms=%.1f reductions=%u -> ssbo_sensor_rgb\n",
+                    T5_CAM_BATCH_C, T5_LIGHT_BATCH_C,
+                    t5_stats.dispatches,
+                    (unsigned long long)t5_stats.start_pair_cap,
+                    (unsigned long long)t5_stats.final_pair_cap,
+                    t5_stats.max_cam, t5_stats.max_light,
+                    (unsigned long long)t5_stats.max_pairs,
+                    t5_stats.max_ms, t5_stats.reductions);
             fflush(stderr);
             job->promise.set_value({});   /* empty result — caller skips CPU merge */
             return;
@@ -10995,6 +11699,10 @@ static void bdpt_family_finish(RayPipelineState& ps, uint8_t color_flag)
     const uint32_t t5_fired  = ps.bdpt_t5_fired.load(std::memory_order_acquire);
     if (std::min(flash_sub, sens_sub) <= t5_fired) return;
     if (ps.bdpt_connection_running.load(std::memory_order_acquire)) return;
+    if (ps.cfg.gpu_skip_record_readback) {
+        ps.bdpt_gpu_t5_pending.store(true, std::memory_order_release);
+        return;
+    }
     ps.Q_t5_ready.push(1);
 }
 
@@ -13507,7 +14215,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
         /* base fields [0..10] — geometry + ids + scalar beta */
         p[0]  = lr.pos[0];    p[1]  = lr.pos[1];    p[2]  = lr.pos[2];
         p[3]  = lr.normal[0]; p[4]  = lr.normal[1]; p[5]  = lr.normal[2];
-        p[6]  = lr.throughput_scalar;
+        std::memcpy(&p[6], &lr.tri_id, sizeof(int32_t));
         std::memcpy(&p[7], &lr.flags,      sizeof(uint32_t));
         std::memcpy(&p[8], &lr.subpath_id, sizeof(uint32_t));
         /* vinfo: bits[0..15]=packed_index, bits[16..30]=stream, bit[31]=tri_valid
@@ -13601,7 +14309,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 /* base fields [0..14] — geometry + ids + spectral display betas */
                 p[0]  = c.pos[0];    p[1]  = c.pos[1];    p[2]  = c.pos[2];
                 p[3]  = c.normal[0]; p[4]  = c.normal[1]; p[5]  = c.normal[2];
-                p[6]  = c.throughput_scalar;
+                std::memcpy(&p[6], &c.tri_id, sizeof(int32_t));
                 std::memcpy(&p[7],  &c.flags,      sizeof(uint32_t));
                 std::memcpy(&p[8],  &c.subpath_id, sizeof(uint32_t));
                 /* vinfo: bits[0..15]=packed_index, bits[16..30]=stream, bit[31]=tri_valid
@@ -13997,6 +14705,11 @@ void ray_pipeline_set_t5_sensor_tile_size(RayPipelineState* ps, uint32_t n)
     if (!ps) return;
     ps->cfg.t5_sensor_tile_size = n;
     if (ps->gpu_dispatch) ps->gpu_dispatch->t5_sensor_tile_size = n;
+}
+
+void ray_pipeline_set_t5_profile(RayPipelineState* ps, bool v)
+{
+    if (ps) ps->cfg.t5_profile = v;
 }
 
 void ray_pipeline_begin_sensor_batching(RayPipelineState* ps)

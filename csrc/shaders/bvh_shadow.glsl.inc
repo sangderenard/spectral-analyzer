@@ -108,7 +108,7 @@ float _shd_mt(vec3 v0, vec3 e1, vec3 e2, vec3 org, vec3 dir) {
  * connections are not falsely blocked by refractive surfaces.               *
  * Aperture-stop triangles are treated as opaque — they are physical blockers.*/
 
-bool shadow_occluded(vec3 p0, vec3 p1) {
+bool shadow_occluded_except(vec3 p0, vec3 p1, int skip_tri0, int skip_tri1) {
     vec3  d    = p1 - p0;
     float dist = length(d);
     if (dist < 2.0 * SHADOW_T_SELF) return false;   /* degenerate segment */
@@ -134,6 +134,7 @@ bool shadow_occluded(vec3 p0, vec3 p1) {
             int te = _shd_bvh_tri_end(node);
             for (int k = ts; k < te; ++k) {
                 int ti  = shadow_tri_ids[k];
+                if (ti == skip_tri0 || ti == skip_tri1) continue;
                 int tb  = ti * TRI_FULL_STRIDE;
                 uint tf = floatBitsToUint(shadow_trifull[tb + 12]);
                 /* Skip transmissive surfaces — glass does not block BDPT paths */
@@ -152,4 +153,8 @@ bool shadow_occluded(vec3 p0, vec3 p1) {
         }
     }
     return false;
+}
+
+bool shadow_occluded(vec3 p0, vec3 p1) {
+    return shadow_occluded_except(p0, p1, -1, -1);
 }

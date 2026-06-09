@@ -555,6 +555,15 @@ struct T5ConnContext {
         if (acc.conn_batch.size() >= 4096) flush_connections(acc);
         if (!is_visible) return;
 
+        /* ── B.0 INVARIANT: betas are carried UN-NORMALISED ──────────────────
+         * beta_cam / beta_light are raw amplitude magnitudes — T3 scaled them
+         * by interface factors only, never dividing by the scatter PDF (see the
+         * dispersive-split site in ray_tracer.cpp).  This accumulation is the
+         * balance-heuristic estimator: geom/strategy_pdf · mis_weight collapses
+         * to geom/denom (mis_weight = strategy_pdf/denom), i.e. all sampling-PDF
+         * normalisation is deferred to this single division.  The T3 amplitude
+         * scale and this `/denom` are a MATCHED PAIR — dividing betas by a PDF
+         * in T3 would double-count; change one only if you change the other. */
         pixel_accum += beta_cam * beta_light * (double)geom / strategy_pdf * mis_weight;
     }
 

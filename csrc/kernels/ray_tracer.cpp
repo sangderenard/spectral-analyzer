@@ -828,11 +828,13 @@ static inline void rt_maybe_emit_pulse(
  *   [8] ior_imag    [9..11] pad
  * Row stride per band: 12; per material: MAX_SPECTRAL_BANDS * 12 = 384.
  *
- * Complex reflectance derivation: amplitude is the authored `reflectance_mag`;
- * phase comes from Fresnel at normal incidence using complex IOR
- *   r_F = (1 - n_complex) / (1 + n_complex),  n_complex = ior_real + i·ior_imag
- *   r_used = mag · exp(i · arg(r_F))
- * This matches the GLSL inline derivation (Phase 2c) for both backends.
+ * Complex reflectance derivation: for a CONDUCTOR (ior_imag k > 0) the complex
+ * Fresnel amplitude r_F = (1 - n_complex)/(1 + n_complex) is used DIRECTLY — its
+ * magnitude |r_F| = sqrt(((n-1)^2+k^2)/((n+1)^2+k^2)) is the measured amplitude
+ * reflectance, so per-band (n,k) drive both brightness and colour (B.3a).  For a
+ * DIELECTRIC (k≈0) the amplitude is the authored `reflectance_mag` and only the
+ * Fresnel phase is taken: r_used = mag · exp(i · arg(r_F)).
+ * This matches the GLSL inline derivation for both backends.
  */
 static constexpr int MAT_BUF_BAND_STRIDE = 12;
 static constexpr int MAT_BUF_MAT_STRIDE  = MAT_BUF_BAND_STRIDE * MAX_SPECTRAL_BANDS;
@@ -852,12 +854,22 @@ static inline const float* mat_band_record(const RayTracerState& st, int mat_idx
 
 static inline cd mat_refl_complex(const RayTracerState& st, int mat_idx, int b) {
     const float* r = mat_band_record(st, mat_idx, b);
-    double mag  = static_cast<double>(r[2]);
     double n_re = static_cast<double>(r[7]);
     double n_im = static_cast<double>(r[8]);
     cd n_complex(n_re, n_im);
     cd one(1.0, 0.0);
     cd r_fresnel = (one - n_complex) / (one + n_complex);
+    if (n_im > 0.1) {
+        /* B.3a — Conductor (k > 0.1; true metals have k~1-10, weakly-absorbing
+         * dielectrics have k<<0.1 and stay dielectric).
+         * |r_F| = sqrt(R_power) IS the physical amplitude
+         * reflectance, so measured per-band (n,k) drive brightness AND colour.
+         * Return r_F directly; do NOT rescale to the authored scalar (that made
+         * k inert once betas are reduced to magnitudes). */
+        return r_fresnel;
+    }
+    /* Dielectric: authored amplitude magnitude, Fresnel phase only. */
+    double mag  = static_cast<double>(r[2]);
     double phase = (std::abs(r_fresnel) > 1e-12) ? std::arg(r_fresnel) : 0.0;
     return cd(mag * std::cos(phase), mag * std::sin(phase));
 }
@@ -1427,6 +1439,11 @@ static inline bool apply_parametric_surface_point(
 
 static inline bool tri_material_is_transmissive(const RayTracerState& st, const Triangle& tri, int band = 0)
 {
+    /* A conductor (ior_imag k > 0.1) is an opaque reflector — never refracts,
+     * even though its ior_real differs from 1.  Excluding it here keeps silver/
+     * gold/etc. in the opaque-reflection branch (B.3a).  Weakly-absorbing
+     * dielectrics (k<<0.1) still refract and attenuate via Beer-Lambert. */
+    if (mat_n_imag(st, tri.mat_idx, band) > 0.1) return false;
     return (mat_transmittance(st, tri.mat_idx, band) > 1e-6)
         || (std::abs(mat_n_real(st, tri.mat_idx, band) - 1.0) > 1e-6);
 }
@@ -8687,6 +8704,50 @@ public:
         uint32_t np_raw = std::min(bdpt_counts[2], (uint32_t)max_p);
         no_raw = std::min(no_raw, (uint32_t)max_o);
 
+        /* B.1b: the T3 spectral emitter (`emit_bdpt_spectral`) bumps its slot
+         * with an unconditional atomicAdd and only *writes* while the slot is
+         * under `bdpt_max_spectral`; surplus slots are dropped.  The clamps
+         * above therefore HIDE the loss: every vertex whose per-band records
+         * were dropped silently keeps the flat luminance split the pack pass
+         * wrote (`betas[b] = throughput/nb`), i.e. it desaturates to grey.
+         * bdpt_counts[*] still holds the *requested* high-water counts, so
+         * recover the dropped totals, record them into the same overflow
+         * atomics the CPU path uses (surfaced via get_bdpt_overflow()), and
+         * warn loudly — a silent grey-out is exactly the failure mode the
+         * audit flags.  The buffer can then be resized from the high-water. */
+        if (bdpt_counts[1] > (uint32_t)max_s) {
+            const uint64_t dropped = (uint64_t)bdpt_counts[1] - (uint64_t)max_s;
+            ps.bdpt_overflow_spectral.fetch_add(dropped, std::memory_order_relaxed);
+            fprintf(stderr,
+                    "[%s] WARNING: spectral-record OVERFLOW — requested %u, cap %d, "
+                    "DROPPED %llu records. Affected vertices desaturate to GREY "
+                    "(flat luminance split). Raise bdpt_max_spectral to >= %u to "
+                    "preserve chroma.\n",
+                    T5_NATIVE_LABEL, bdpt_counts[1], max_s,
+                    (unsigned long long)dropped, bdpt_counts[1]);
+            fflush(stderr);
+        }
+        if (bdpt_counts[0] > (uint32_t)max_v) {
+            const uint64_t dropped = (uint64_t)bdpt_counts[0] - (uint64_t)max_v;
+            ps.bdpt_overflow_vertices.fetch_add(dropped, std::memory_order_relaxed);
+            fprintf(stderr,
+                    "[%s] WARNING: vertex-record OVERFLOW — requested %u, cap %d, "
+                    "DROPPED %llu. Raise bdpt_max_vertices to >= %u.\n",
+                    T5_NATIVE_LABEL, bdpt_counts[0], max_v,
+                    (unsigned long long)dropped, bdpt_counts[0]);
+            fflush(stderr);
+        }
+        if (bdpt_counts[2] > (uint32_t)max_p) {
+            const uint64_t dropped = (uint64_t)bdpt_counts[2] - (uint64_t)max_p;
+            ps.bdpt_overflow_pdfs.fetch_add(dropped, std::memory_order_relaxed);
+            fprintf(stderr,
+                    "[%s] WARNING: pdf-record OVERFLOW — requested %u, cap %d, "
+                    "DROPPED %llu. Raise bdpt_max_pdfs to >= %u.\n",
+                    T5_NATIVE_LABEL, bdpt_counts[2], max_p,
+                    (unsigned long long)dropped, bdpt_counts[2]);
+            fflush(stderr);
+        }
+
         /* CPU-side launch records (emissive sources, and any camera/software
          * seed records) are not emitted by T3, but they are required T5 vertices.
          * Append them into the GPU BDPT sections before sort/pack. */
@@ -12574,66 +12635,110 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                 }
             }
 
-            if (!can_refract) {
-                /* TIR: pure reflection (delta lobe). */
-                V3d  rd = (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
+            const int new_med = has_pair ? medium_to
+                : ((hr.ray.medium_mat_idx == tri.mat_idx) ? -1 : tri.mat_idx);
+            const V3d reflect_dir =
+                (in_dir - 2.0 * in_dir.dot(hit_n) * hit_n).normalized();
+
+            if (ps.cfg.max_children >= 2) {
+                /* ── Deterministic per-band dispersive split ─────────────────
+                 * One ray carries one direction, so true chromatic dispersion
+                 * needs one transmitted ray PER band, each refracted at its own
+                 * Snell angle from that band's ior_real.  The reflection lobe is
+                 * a single ray weighted per band by √R_b; a band in total
+                 * internal reflection (sin²θt > 1) reflects fully (R_b = 1) and
+                 * spawns no transmitted ray.  Produces lateral colour / chromatic
+                 * focus shift through the lens.  Mirrors GPU ray_material.comp.
+                 * Callers MUST size max_children = 1 + n_bands so every active
+                 * band gets its own transmit child (no achromatic fallback). */
+                {
+                    VXcd ra = amp;
+                    double R0 = 0.0;
+                    /* ── B.0 INVARIANT: propagate amplitude UN-NORMALISED ────
+                     * Each child amplitude is scaled by the interface factor
+                     * ONLY (reflection ×√R_b, transmission ×√(1-R_b)) and NEVER
+                     * divided by the scatter/sampling PDF.  The MIS density is
+                     * recorded separately (emit_scatter) and all normalisation
+                     * is deferred to T5's single `contrib = f / denom`.  This
+                     * T3 amplitude scale and the T5 `/denom` are a MATCHED PAIR
+                     * — dividing the beta by a PDF here double-counts and biases
+                     * the estimator.  Change one only if you change the other. */
+                    for (int b = 0; b < nb; ++b) {
+                        const double n1b = has_pair ? medium_n_real(st, medium_from, b)
+                            : ((hr.ray.medium_mat_idx >= 0)
+                               ? mat_n_real(st, hr.ray.medium_mat_idx, b) : 1.0);
+                        const double n2b = has_pair ? medium_n_real(st, medium_to, b)
+                            : (front_face ? mat_n_real(st, tri.mat_idx, b) : 1.0);
+                        const double s2 = (n1b/n2b)*(n1b/n2b)*(1.0 - cos_i*cos_i);
+                        double Rb;
+                        if (s2 > 1.0) {
+                            Rb = 1.0;                         /* TIR: full reflection */
+                        } else {
+                            const double ctb = std::sqrt(std::max(0.0, 1.0 - s2));
+                            Rb = fresnel_R(cos_i, ctb, n1b, n2b);
+                        }
+                        if (b == 0) R0 = Rb;
+                        ra[b] *= std::sqrt(Rb) * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                    }
+                    emit_scatter(reflect_dir, ra, BDPT_DOMAIN_SOLID_ANGLE,
+                                 static_cast<float>(R0), static_cast<float>(R0),
+                                 BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
+                    enqueue_child(make_child(reflect_dir, ra));
+                }
+                /* One transmitted child per active, non-TIR band. */
+                for (int b = 0; b < nb; ++b) {
+                    if (std::abs(amp[b]) <= 0.0) continue;     /* inactive band */
+                    const double n1b = has_pair ? medium_n_real(st, medium_from, b)
+                        : ((hr.ray.medium_mat_idx >= 0)
+                           ? mat_n_real(st, hr.ray.medium_mat_idx, b) : 1.0);
+                    const double n2b = has_pair ? medium_n_real(st, medium_to, b)
+                        : (front_face ? mat_n_real(st, tri.mat_idx, b) : 1.0);
+                    V3d refracted_b;
+                    if (!snell_refract(in_dir, hit_n, n1b, n2b, refracted_b))
+                        continue;                             /* TIR: reflected above */
+                    const double s2  = (n1b/n2b)*(n1b/n2b)*(1.0 - cos_i*cos_i);
+                    const double ctb = std::sqrt(std::max(0.0, 1.0 - s2));
+                    const double Rb     = fresnel_R(cos_i, ctb, n1b, n2b);
+                    const double Rb_rev = fresnel_R(ctb, cos_i, n2b, n1b);
+                    VXcd ta = VXcd::Zero(amp.size());
+                    ta[b] = std::sqrt(std::max(0.0, 1.0 - Rb)) * amp[b];
+                    emit_scatter(refracted_b, ta, BDPT_DOMAIN_SOLID_ANGLE,
+                                 static_cast<float>(1.0 - Rb),
+                                 static_cast<float>(1.0 - Rb_rev),
+                                 BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
+                    enqueue_child(make_child(refracted_b, ta, new_med));
+                }
+            } else if (!can_refract) {
+                /* TIR (band 0): pure reflection (delta lobe). */
                 VXcd ra = amp;
                 for (int b = 0; b < nb; ++b)
                     ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
-                emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE, 1.0f, 1.0f,
+                emit_scatter(reflect_dir, ra, BDPT_DOMAIN_SOLID_ANGLE, 1.0f, 1.0f,
                              BDPT_PDF_FLAG_DELTA_SPECULAR);
-                enqueue_child(make_child(rd, ra));
+                enqueue_child(make_child(reflect_dir, ra));
             } else {
+                /* Russian-roulette single child (achromatic, band 0).  One ray
+                 * cannot carry per-band directions; use the deterministic split
+                 * (max_children >= 2) for true dispersion. */
                 const double sin2_t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
                 const double cos_t  = std::sqrt(std::max(0.0, 1.0 - sin2_t));
                 const double R      = fresnel_R(cos_i, cos_t, n1, n2);
                 const double R_rev  = fresnel_R(cos_t, cos_i, n2, n1);
-                const int    new_med = has_pair ? medium_to
-                    : ((hr.ray.medium_mat_idx == tri.mat_idx) ? -1 : tri.mat_idx);
-
-                if (ps.cfg.max_children >= 2) {
-                    /* Deterministic split: both lobes launched with √R/√T weights. */
-                    {
-                        V3d  rd = (in_dir - 2.0*in_dir.dot(hit_n)*hit_n).normalized();
-                        VXcd ra = amp;
-                        double rs = std::sqrt(R);
-                        for (int b = 0; b < nb; ++b)
-                            ra[b] *= rs * mat_cache_refl(st.mat_cache, tri.mat_idx, b);
-                        emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE,
-                                     static_cast<float>(R), static_cast<float>(R),
-                                     BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
-                        enqueue_child(make_child(rd, ra));
-                    }
-                    {
-                        VXcd ta = amp;
-                        double ts = std::sqrt(1.0 - R);
-                        for (int b = 0; b < nb; ++b)
-                            ta[b] *= ts;
-                        emit_scatter(refracted, ta, BDPT_DOMAIN_SOLID_ANGLE,
-                                     static_cast<float>(1.0 - R),
-                                     static_cast<float>(1.0 - R_rev),
-                                     BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
-                        enqueue_child(make_child(refracted, ta, new_med));
-                    }
+                if (U01(rng) < R) {
+                    VXcd ra = amp;
+                    for (int b = 0; b < nb; ++b)
+                        ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
+                    emit_scatter(reflect_dir, ra, BDPT_DOMAIN_SOLID_ANGLE,
+                                 static_cast<float>(R), static_cast<float>(R),
+                                 BDPT_PDF_FLAG_DELTA_SPECULAR);
+                    enqueue_child(make_child(reflect_dir, ra));
                 } else {
-                    /* Russian roulette: one lobe sampled with probability R. */
-                    if (U01(rng) < R) {
-                        V3d  rd = (in_dir - 2.0*in_dir.dot(hit_n)*hit_n).normalized();
-                        VXcd ra = amp;
-                        for (int b = 0; b < nb; ++b)
-                            ra[b] *= mat_cache_refl(st.mat_cache, tri.mat_idx, b);
-                        emit_scatter(rd, ra, BDPT_DOMAIN_SOLID_ANGLE,
-                                     static_cast<float>(R), static_cast<float>(R),
-                                     BDPT_PDF_FLAG_DELTA_SPECULAR);
-                        enqueue_child(make_child(rd, ra));
-                    } else {
-                        VXcd ta = amp;
-                        emit_scatter(refracted, ta, BDPT_DOMAIN_SOLID_ANGLE,
-                                     static_cast<float>(1.0 - R),
-                                     static_cast<float>(1.0 - R_rev),
-                                     BDPT_PDF_FLAG_DELTA_SPECULAR);
-                        enqueue_child(make_child(refracted, ta, new_med));
-                    }
+                    VXcd ta = amp;
+                    emit_scatter(refracted, ta, BDPT_DOMAIN_SOLID_ANGLE,
+                                 static_cast<float>(1.0 - R),
+                                 static_cast<float>(1.0 - R_rev),
+                                 BDPT_PDF_FLAG_DELTA_SPECULAR);
+                    enqueue_child(make_child(refracted, ta, new_med));
                 }
             }
         } else {

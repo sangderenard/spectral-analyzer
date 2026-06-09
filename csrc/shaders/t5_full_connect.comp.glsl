@@ -24,7 +24,7 @@
  * ── SSBO binding map ──────────────────────────────────────────────────────
  *  binding  buffer          description
  *  -------  --------------- -----------------------------------------------
- *    0      T5LightVertBuf  Flat light vertices. Stride = T5_LGV_STRIDE = 40 floats.
+ *    0      T5LightVertBuf  Flat light vertices. Stride = T5_LGV_STRIDE = 56 floats.
  *             [0..2]   pos xyz
  *             [3..5]   normal xyz
  *             [6]      intBitsToFloat(tri_id) for endpoint visibility skip
@@ -32,7 +32,7 @@
  *             [8]      uintBitsToFloat(subpath_id)
  *             [9]      uintBitsToFloat(vinfo): bits[0..14]=vertex_index,
  *                        bits[16..22]=stream, bit[31]=tri_valid (tri_id>=0)
- *             [10]     beta_lum (scalar path throughput)
+ *             [10]     intBitsToFloat(mat_idx)
  *             [11]     pdf_fwd
  *             [12]     pdf_rev
  *             [13]     uintBitsToFloat(BdptPdfRecord::flags)
@@ -47,16 +47,16 @@
  *             [38]     edge_fwd_area  (area-domain PDF: this vert → next in subpath)
  *             [39]     edge_bwd_area  (reverse area-domain PDF: next → this at this vert)
  *
- *    1      T5CamVertBuf    Flat camera vertices. Stride = T5_CGV_STRIDE = 56 floats.
+ *    1      T5CamVertBuf    Flat camera vertices. Stride = T5_CGV_STRIDE = 72 floats.
  *             [0..2]   pos xyz
  *             [3..5]   normal xyz
  *             [6]      intBitsToFloat(tri_id) for endpoint visibility skip
  *             [7]      uintBitsToFloat(MAT_FLAG_* material flags)
  *             [8]      uintBitsToFloat(subpath_id)
  *             [9]      uintBitsToFloat(vinfo): same bit layout as LGV[9]
- *             [10]     spectral_beta_r  (band_to_display_rgb weighted sum)
- *             [11]     spectral_beta_g
- *             [12]     spectral_beta_b
+ *             [10..12] RESERVED (legacy luminance-RGB beta slots, B.1c dead —
+ *                      camera colour comes from per-band CGV_BAND_BASE [22..53]
+ *                      via cam_spectral_rgb; these are written 0 and never read)
  *             [13]     sensor_origin_y
  *             [14]     sensor_origin_z
  *             [15]     pdf_fwd
@@ -179,20 +179,9 @@ uniform int t5_profile_mode;
 
 /* ── Flag constants (mirror bdpt_record.h / mat_flags_generated.h) ──────── */
 #define MAT_FLAG_APERTURE_STOP        128u
-#ifndef BDPT_PDF_FLAG_DELTA_SPECULAR
-#define BDPT_PDF_FLAG_DELTA_SPECULAR  (1u << 16)
-#endif
-#ifndef BDPT_PDF_FLAG_DIFFUSE
-#define BDPT_PDF_FLAG_DIFFUSE         (1u << 18)
-#endif
-#ifndef BDPT_PDF_FLAG_GGX
-#define BDPT_PDF_FLAG_GGX             (1u << 20)
-#endif
-#ifndef BDPT_PDF_FLAG_EMISSION
-#define BDPT_PDF_FLAG_EMISSION        (1u << 21)
-#endif
 
-#define PI 3.14159265358979323846f
+/* BDPT_PDF_FLAG_* and MEVAL_PI are defined by the ray_material_eval.glsl.inc
+ * preamble injected by load_with_shadow_bvh in the shader loader.            */
 
 /* ── MIS chain size limit.                                                 *
  * MAX_CHAIN = 32 supports up to 15 bounces per subpath plus the two       *
@@ -204,38 +193,11 @@ uniform int t5_profile_mode;
 #define MAX_CHAIN_E  31
 #define MAX_CHAIN_N  33
 
-/* ── GGX microfacet helpers ──────────────────────────────────────────────── */
-float ggx_D(float alpha, float NoH) {
-    float a  = max(1e-4f, alpha);
-    float a2 = a * a;
-    float d  = NoH * NoH * (a2 - 1.0f) + 1.0f;
-    return a2 / (PI * d * d);
-}
-
-float ggx_G1(float alpha, float NoV) {
-    if (NoV <= 0.0f) return 0.0f;
-    float a  = max(1e-4f, alpha);
-    float a2 = a * a;
-    return (2.0f * NoV) / (NoV + sqrt(a2 + (1.0f - a2) * NoV * NoV));
-}
-
-float ggx_pdf_sa(vec3 n, vec3 in_dir, vec3 out_dir, float alpha) {
-    vec3  V   = normalize(-in_dir);
-    vec3  L   = normalize(out_dir);
-    float NoV = max(0.0f, dot(n, V));
-    float NoL = max(0.0f, dot(n, L));
-    if (NoV <= 0.0f || NoL <= 0.0f) return 0.0f;
-    vec3  H   = normalize(V + L);
-    float NoH = max(0.0f, dot(n, H));
-    float VoH = max(0.0f, dot(V, H));
-    if (NoH <= 0.0f || VoH < 1e-6f) return 0.0f;
-    return ggx_D(alpha, NoH) * ggx_G1(alpha, NoV) / (4.0f * NoV);
-}
-
 /* ── scatter_conn_pdf_area ───────────────────────────────────────────────── *
  * Area-measure scatter PDF at vertex 'from' toward vertex 'to'.             *
  * Mirrors T5ConnContext::scatter_connection_pdf_area().                      *
- * Returns 0.0 if the vertex cannot scatter toward the target.               */
+ * Returns 0.0 if the vertex cannot scatter toward the target.               *
+ * Solid-angle PDF is delegated to meval_scatter_pdf_sa (ray_material_eval). */
 float scatter_conn_pdf_area(
     vec3  from_pos,    vec3  from_norm,  vec3  from_dir_in,
     float diffuse_p,   float ggx_alpha,
@@ -251,27 +213,14 @@ float scatter_conn_pdf_area(
     float dist  = sqrt(dist2);
     d /= dist;
 
-    float cos_out = max(0.0f, dot(from_norm, d));
-    float cos_to  = max(0.0f, abs(dot(to_norm, -d)));
-    if (cos_out <= 0.0f || cos_to <= 0.0f) return 0.0f;
+    float cos_to = max(0.0f, abs(dot(to_norm, -d)));
+    if (cos_to <= 0.0f) return 0.0f;
 
-    float spec_p = max(0.0f, 1.0f - diffuse_p);
-    float pdf_sa = 0.0f;
-    if ((pdf_flags & BDPT_PDF_FLAG_EMISSION) != 0u) {
-        pdf_sa = cos_out / PI;
-    } else if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
-        if (diffuse_p <= 0.0f) return 0.0f;
-        pdf_sa = diffuse_p * cos_out / PI;
-    } else if ((pdf_flags & BDPT_PDF_FLAG_GGX) != 0u) {
-        if (spec_p <= 0.0f || ggx_alpha <= 1e-3f) return 0.0f;
-        pdf_sa = spec_p * ggx_pdf_sa(from_norm, from_dir_in, d, ggx_alpha);
-    } else {
-        return 0.0f;
-    }
+    float pdf_sa = meval_scatter_pdf_sa(from_norm, from_dir_in, d,
+                                        diffuse_p, ggx_alpha, pdf_flags);
     if (pdf_sa <= 0.0f) return 0.0f;
 
-    float pdf = pdf_sa * cos_to / dist2 * opt_jac;
-    return max(pdf, 1e-12f);
+    return max(pdf_sa * cos_to / dist2 * opt_jac, 1e-12f);
 }
 
 /* ── vertex_connectable ──────────────────────────────────────────────────── *
@@ -492,26 +441,156 @@ float light_beta_sum(uint sl) {
     return total;
 }
 
+/* ── Refractive (glass) connection handling ──────────────────────────────── *
+ * A BDPT connection segment that crosses one or more refractive interfaces is
+ * NOT a vacuum path: at every glass surface the light is partially reflected
+ * (Fresnel) and, beyond the critical angle, totally internally reflected so no
+ * transmitted connection exists at all.  bvh_shadow.glsl.inc deliberately lets
+ * the segment pass the *visibility* test through glass; here we recover the
+ * physics it skipped and weight the connection by the real per-interface
+ * Fresnel transmittance, using the identical Snell/Fresnel math and per-band
+ * ior_real as the T3 forward pass (meval_ior_real(mat, band)).
+ * Matching T3 exactly is what keeps the multi-strategy MIS estimator unbiased:
+ * a connection that traverses the lens is attenuated by the same Fresnel factor
+ * a forward-traced ray would lose at those surfaces, and a band that hits TIR
+ * at any interface drops out of that band's connection (no transmitted path).
+ *
+ * The crossing geometry (incidence cosine, medium materials on each side) is
+ * gathered ONCE per vertex pair; the Fresnel transmittance is then evaluated
+ * PER band (glass_transmittance_band), since each wavelength refracts at its
+ * own Snell angle and may individually total-internally-reflect.              */
+#define GLASS_MAX_CROSS 8
+
+int gather_glass_crossings(vec3 p0, vec3 p1, int skip0, int skip1,
+                           out float cos_i[GLASS_MAX_CROSS],
+                           out int   mat_from[GLASS_MAX_CROSS],
+                           out int   mat_to[GLASS_MAX_CROSS])
+{
+    vec3  d    = p1 - p0;
+    float dist = length(d);
+    if (dist < 2.0 * SHADOW_T_SELF) return 0;
+    vec3 dir     = d / dist;
+    vec3 inv_dir = vec3(1.0) / dir;
+    float t_max  = dist - SHADOW_T_SELF;
+
+    int n = 0;
+    int stack[SHADOW_STACK_SIZE];
+    int sp = 0;
+    stack[sp++] = 0;  /* root */
+
+    while (sp > 0) {
+        int node = stack[--sp];
+        if (node < 0) continue;
+        if (!_shd_aabb_hit(_shd_bvh_lo(node), _shd_bvh_hi(node),
+                           p0, inv_dir, t_max)) continue;
+
+        int left = _shd_bvh_left(node);
+        if (left == -1) {
+            int ts = _shd_bvh_tri_start(node);
+            int te = _shd_bvh_tri_end(node);
+            for (int k = ts; k < te; ++k) {
+                int ti = shadow_tri_ids[k];
+                if (ti == skip0 || ti == skip1) continue;
+                int tb = ti * TRI_FULL_STRIDE;
+                uint tf = floatBitsToUint(shadow_trifull[tb + 12]);
+                /* Only refractive surfaces matter here; opaque blockers are
+                 * handled by the separate shadow_occluded_except() test. */
+                if ((tf & SHADOW_MAT_FLAG_TRANSMISSIVE) == 0u) continue;
+                vec3 v0 = vec3(shadow_trifull[tb],   shadow_trifull[tb+1], shadow_trifull[tb+2]);
+                vec3 e1 = vec3(shadow_trifull[tb+3], shadow_trifull[tb+4], shadow_trifull[tb+5]);
+                vec3 e2 = vec3(shadow_trifull[tb+6], shadow_trifull[tb+7], shadow_trifull[tb+8]);
+                float t = _shd_mt(v0, e1, e2, p0, dir);
+                if (t <= SHADOW_T_SELF || t >= t_max) continue;
+                if (n >= GLASS_MAX_CROSS) continue;
+                vec3 tn = normalize(vec3(shadow_trifull[tb+9],
+                                         shadow_trifull[tb+10],
+                                         shadow_trifull[tb+11]));
+                int med_pos = floatBitsToInt(shadow_trifull[tb + 14]);
+                int med_neg = floatBitsToInt(shadow_trifull[tb + 15]);
+                /* front: segment travels against the geometric normal, i.e. it
+                 * enters from the +normal (med_pos) side — same convention as T3. */
+                bool front = dot(dir, tn) < 0.0;
+                cos_i[n]    = abs(dot(dir, tn));
+                mat_from[n] = front ? med_pos : med_neg;
+                mat_to[n]   = front ? med_neg : med_pos;
+                n++;
+            }
+        } else {
+            if (sp + 1 < SHADOW_STACK_SIZE) {
+                stack[sp++] = left;
+                stack[sp++] = _shd_bvh_right(node);
+            }
+        }
+    }
+    return n;
+}
+
+/* Per-band Fresnel amplitude-transmittance product across all gathered glass
+ * interfaces, evaluated from band `band`'s ior_real.  Returns 0 if ANY interface
+ * is in total internal reflection FOR THIS BAND — there is then no transmitted
+ * connection for that wavelength, exactly as T3's per-band snell_refract failure
+ * sends that band entirely into reflection.
+ *
+ * This MUST mirror the T3 forward pass to keep the BDPT estimator unbiased: T3
+ * now refracts per band (each band uses its own ior_real / Snell angle) and
+ * applies a per-band amplitude transmittance ts_b = sqrt(1-R_b).  The T5 betas
+ * are amplitude magnitudes (the pixel reduction sums magnitude products
+ * linearly), so sqrt(1-R_b) — not the power transmittance (1-R_b) — is correct. */
+float glass_transmittance_band(int band, int n_cross,
+                               float cos_i[GLASS_MAX_CROSS],
+                               int   mat_from[GLASS_MAX_CROSS],
+                               int   mat_to[GLASS_MAX_CROSS])
+{
+    float T = 1.0f;
+    for (int i = 0; i < n_cross; ++i) {
+        float n1 = meval_ior_real(mat_from[i], band);
+        float n2 = meval_ior_real(mat_to[i],   band);
+        float ci = clamp(cos_i[i], 0.0f, 1.0f);
+        float sin2_t = (n1 / n2) * (n1 / n2) * (1.0f - ci * ci);
+        if (sin2_t > 1.0f) return 0.0f;               /* TIR for this band */
+        float ct = sqrt(max(0.0f, 1.0f - sin2_t));
+        float R  = meval_fresnel_R(ci, ct, n1, n2);
+        T *= sqrt(max(0.0f, 1.0f - R));               /* amplitude transmittance */
+        if (T <= 0.0f) return 0.0f;
+    }
+    return T;
+}
+
 void connection_spectral_rgb(uint sc, uint sl,
                              vec3 c_norm, vec3 c_dir_in, uint c_pdf_flags,
                              int c_mat, vec3 c_to_l,
                              vec3 l_norm, vec3 l_dir_in, uint l_pdf_flags,
                              int l_mat, vec3 l_to_c,
+                             int n_glass,
+                             float g_cos[GLASS_MAX_CROSS],
+                             int   g_from[GLASS_MAX_CROSS],
+                             int   g_to[GLASS_MAX_CROSS],
                              out float r, out float g, out float b) {
     r = 0.0f;
     g = 0.0f;
     b = 0.0f;
+
     const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
     for (int _b = 0; _b < nb; ++_b) {
         const float cb = s_cam[sc + uint(CGV_BAND_BASE + _b)];
         const float lb = s_light[sl + uint(LGV_BAND_BASE + _b)];
         if (cb <= 0.0f || lb <= 0.0f) continue;
 
+        /* Per-band Fresnel transmittance of any glass the straight connection
+         * segment crosses (1.0 in vacuum).  Evaluated per band because each
+         * wavelength refracts at its own Snell angle and may individually hit
+         * total internal reflection — matching the per-band T3 forward split.
+         * A band that TIRs anywhere along the segment contributes nothing. */
+        const float glassT = (n_glass > 0)
+            ? glass_transmittance_band(_b, n_glass, g_cos, g_from, g_to)
+            : 1.0f;
+        if (glassT <= 0.0f) continue;
+
         const float cf = meval_endpoint_response(
             c_mat, _b, c_pdf_flags, c_norm, c_dir_in, c_to_l);
         const float lf = meval_endpoint_response(
             l_mat, _b, l_pdf_flags, l_norm, l_dir_in, l_to_c);
-        const float v = cb * lb * cf * lf;
+        const float v = cb * lb * cf * lf * glassT;
         if (v <= 0.0f || isnan(v) || isinf(v)) continue;
         r += v * spectral_weights[_b * 3 + 0];
         g += v * spectral_weights[_b * 3 + 1];
@@ -520,11 +599,14 @@ void connection_spectral_rgb(uint sc, uint sl,
 }
 
 /* ── Float atomic add via CAS spin-loop ─────────────────────────────────── *
- * Avoids GL_EXT_shader_atomic_float.  Standard on all GL 4.3+ hardware.    */
+ * Avoids GL_EXT_shader_atomic_float.  Standard on all GL 4.3+ hardware.
+ * Unbounded on purpose: a fixed retry cap silently dropped energy on the
+ * brightest, highest-contention pixels.  compareAndSwap guarantees global
+ * progress, so the loop always terminates. */
 void atomic_add_float(uint idx, float val) {
     if (val <= 0.0f || isnan(val) || isinf(val)) return;
     uint expected = pixel_accum[idx];
-    for (int i = 0; i < 64; ++i) {
+    while (true) {
         float fexp    = uintBitsToFloat(expected);
         uint  desired = floatBitsToUint(fexp + val);
         uint  actual  = atomicCompSwap(pixel_accum[idx], expected, desired);
@@ -687,6 +769,11 @@ void main() {
                 const float geom = abs(dot(c_norm, wc)) * abs(dot(l_norm, -wc)) / dist2;
                 if (t5_profile_mode == 3) return;
 
+                /* B.4b: `min_geom` is a host-exposed QUALITY KNOB, not a fixed
+                 * constant.  It makes empty space cheap, but it also biases out
+                 * legitimate faint long-range / grazing connections (low geom).
+                 * Tune via RayTracer.set_t5_min_geom (cfg.t5_min_geom): lower
+                 * preserves faint distant transport, higher is faster/noisier. */
                 if (geom >= min_geom) {
                     /* BRDF fields from shared memory. */
                     const vec3  c_dir_in    = vec3(s_cam[sc + uint(CGV_DIR_IN_X)    ],
@@ -722,16 +809,39 @@ void main() {
                     if (t5_profile_mode == 5) return;
                     if (mis_ok)
                     {
+                        /* Gather the refractive interfaces this connection segment
+                         * crosses once (geometry is band-independent); the achromatic
+                         * Fresnel transmittance / TIR test is applied inside
+                         * connection_spectral_rgb so glass attenuates the connection
+                         * exactly as T3's forward refraction does, instead of being
+                         * silently ignored. */
+                        float g_cos[GLASS_MAX_CROSS];
+                        int   g_from[GLASS_MAX_CROSS];
+                        int   g_to[GLASS_MAX_CROSS];
+                        int   n_glass = gather_glass_crossings(
+                            c_pos, l_pos, c_tri_id, l_tri_id, g_cos, g_from, g_to);
+
                         float spec_r = 0.0f, spec_g = 0.0f, spec_b = 0.0f;
                         connection_spectral_rgb(
                             sc, sl,
                             c_norm, c_dir_in, c_pdf_flags, c_mat_id, wc,
                             l_norm, l_dir_in, l_pdf_flags, l_mat_id, -wc,
+                            n_glass, g_cos, g_from, g_to,
                             spec_r, spec_g, spec_b);
 
+                        /* ── B.0 INVARIANT: betas are carried UN-NORMALISED ──
+                         * `contrib = f / denom` is the balance-heuristic MIS
+                         * estimator f/Σpᵢ.  It is unbiased ONLY because the
+                         * spectral betas (spec_r/g/b) arrive un-normalised:
+                         * T3 propagates amplitude as `amp *= reflectance` with
+                         * NO division by the scatter PDF (see ray_material.comp
+                         * .glsl scatter sites).  All sampling-PDF normalisation
+                         * is DEFERRED to this single `/ denom` here.
+                         * DO NOT divide betas by a sampling PDF in T3: doing so
+                         * double-counts and MUST be paired with removing this
+                         * `/ denom`.  The two sites are a matched pair. */
                         const float scale = geom / denom;
-                        const float contrib = (spec_r + spec_g + spec_b) * scale;
-                        if (contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
+                        const float contrib = (spec_r + spec_g + spec_b) * scale;                        if (contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
                             const bool occluded = shadow_occluded_except(
                                 c_pos, l_pos, c_tri_id, l_tri_id);
                             if (t5_profile_mode == 6) return;

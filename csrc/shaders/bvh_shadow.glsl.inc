@@ -137,7 +137,11 @@ bool shadow_occluded_except(vec3 p0, vec3 p1, int skip_tri0, int skip_tri1) {
                 if (ti == skip_tri0 || ti == skip_tri1) continue;
                 int tb  = ti * TRI_FULL_STRIDE;
                 uint tf = floatBitsToUint(shadow_trifull[tb + 12]);
-                /* Skip transmissive surfaces — glass does not block BDPT paths */
+                /* Skip transmissive surfaces — glass does not block visibility for
+                 * BDPT connections.  The refractive bend (Snell) and attenuation
+                 * (Fresnel) of a segment crossing glass is accounted for separately
+                 * by the optical-connection path in t5_full_connect, which solves
+                 * for the true refracted route rather than the straight segment. */
                 if ((tf & SHADOW_MAT_FLAG_TRANSMISSIVE) != 0u) continue;
                 vec3 v0 = vec3(shadow_trifull[tb],   shadow_trifull[tb+1], shadow_trifull[tb+2]);
                 vec3 e1 = vec3(shadow_trifull[tb+3], shadow_trifull[tb+4], shadow_trifull[tb+5]);

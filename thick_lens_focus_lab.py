@@ -547,16 +547,69 @@ def _make_red_only_spectral_bands(
     return bands
 
 
+# Measured optical-glass dispersion as Sellmeier coefficients (Schott / Ohara
+# catalog data).  n²(λ) = 1 + Σ Bᵢ·λ²/(λ² − Cᵢ), with λ in µm and Cᵢ in µm².
+# These reproduce the manufacturer index tables to ~1e-5 across the visible, so a
+# named glass gives true measured chromatic dispersion instead of a single
+# hand-tuned Cauchy coefficient (audit B.3b).
+_GLASS_SELLMEIER_CATALOG: Dict[str, Tuple[float, float, float, float, float, float]] = {
+    # key: (B1, B2, B3, C1, C2, C3)
+    "N-BK7":        (1.03961212, 0.231792344, 1.01046945,
+                     6.00069867e-3, 2.00179144e-2, 1.03560653e2),
+    "N-SF11":       (1.73759695, 0.313747346, 1.89878101,
+                     1.3188707e-2, 6.23068142e-2, 1.5523629e2),
+    "N-SF2":        (1.40301821, 0.231767504, 0.939056586,
+                     1.05795466e-2, 4.93226978e-2, 1.12405955e2),
+    "N-F2":         (1.39757037, 0.159201403, 1.26865430,
+                     9.95906143e-3, 5.46931752e-2, 1.19248346e2),
+    "N-SF6":        (1.77931763, 0.338149866, 2.08734474,
+                     1.33714182e-2, 6.17533621e-2, 1.74017590e2),
+    "FUSED-SILICA": (0.6961663, 0.4079426, 0.8974794,
+                     4.679148e-3, 1.351206e-2, 9.7934003e1),
+    "N-LASF9":      (2.00029547, 0.298926886, 1.80691843,
+                     1.21426017e-2, 5.38736236e-2, 1.56530829e2),
+}
+
+
+def _sellmeier_n(glass: str, wl_um: np.ndarray) -> np.ndarray:
+    """Measured refractive index n(λ) from Sellmeier coefficients (λ in µm)."""
+    key = glass.strip().upper()
+    if key not in _GLASS_SELLMEIER_CATALOG:
+        raise KeyError(
+            f"unknown glass {glass!r}; known: {sorted(_GLASS_SELLMEIER_CATALOG)}"
+        )
+    b1, b2, b3, c1, c2, c3 = _GLASS_SELLMEIER_CATALOG[key]
+    l2 = np.asarray(wl_um, dtype=np.float64) ** 2
+    n2 = 1.0 + b1 * l2 / (l2 - c1) + b2 * l2 / (l2 - c2) + b3 * l2 / (l2 - c3)
+    return np.sqrt(np.maximum(n2, 1.0))
+
+
 def _make_dispersive_lens_bands(
     sidecar: FreeFrequencySidecar,
     *,
     base_ior: float,
     reflectance: float = 0.02,
     transmittance: float = 0.98,
+    glass: str = "N-BK7",
 ) -> List[SpectralBand]:
-    # Keep lens IOR spectrally constant here.  The previous Python-side Cauchy
-    # term injected artificial chromatic fringing in this lab path.
-    ior = np.full_like(np.asarray(sidecar.wavelength_nm, dtype=np.float64), float(base_ior), dtype=np.float64)
+    # Physical dispersion n(λ) from the measured Sellmeier curve of the named
+    # glass (B.3b).  The absolute index is anchored so n(λ_ref) == base_ior at the
+    # d-line (589 nm) — this preserves the lens design's nominal IOR/focus while
+    # carrying the real measured dispersion *shape*, which is what produces
+    # genuine chromatic aberration / lateral colour.  If the glass is unknown we
+    # fall back to a BK7-like Cauchy ramp rather than silently dropping dispersion.
+    LAMBDA_REF_UM = 0.589      # d-line reference wavelength
+    wl_nm = np.asarray(sidecar.wavelength_nm, dtype=np.float64)
+    wl_um = np.maximum(wl_nm, 1.0) * 1.0e-3
+    try:
+        n_glass = _sellmeier_n(glass, wl_um)
+        n_ref = float(_sellmeier_n(glass, np.array([LAMBDA_REF_UM]))[0])
+        ior = float(base_ior) + (n_glass - n_ref)
+    except KeyError:
+        CAUCHY_B_UM2 = 0.00420     # BK7-like dispersion coefficient (µm²)
+        ior = float(base_ior) + CAUCHY_B_UM2 * (
+            1.0 / (wl_um * wl_um) - 1.0 / (LAMBDA_REF_UM * LAMBDA_REF_UM))
+    ior = np.ascontiguousarray(ior, dtype=np.float64)
     bands: List[SpectralBand] = []
     freq_hz = sidecar.freq_hz
     bw_hz = _sidecar_bandwidths(freq_hz)
@@ -577,6 +630,109 @@ def _make_dispersive_lens_bands(
     return bands
 
 
+# Measured complex refractive index (n, k) for common conductors, sampled across
+# the visible spectrum.  Sources: silver / gold / copper from Johnson & Christy,
+# "Optical Constants of the Noble Metals," Phys. Rev. B 6, 4370 (1972); aluminum
+# from Rakić, "Algorithm for the determination of intrinsic optical constants of
+# metal films," Appl. Opt. 34, 4755 (1995).  Each row is (wavelength_nm, n, k) in
+# ascending-wavelength order.  The amplitude reflectance the ray tracer derives
+# from these is |r| = sqrt(((n-1)^2+k^2)/((n+1)^2+k^2)), so brightness AND colour
+# follow the measured spectrum (B.3a) instead of two hand-authored constants.
+_CONDUCTOR_NK_CATALOG: Dict[str, np.ndarray] = {
+    # Silver: small n, k rising with wavelength → near-flat ~0.86→0.97 reflectance
+    # (slightly warm), the characteristic high-purity mirror.
+    "silver": np.array([
+        [387.0, 0.173, 1.95],
+        [428.0, 0.145, 2.11],
+        [459.0, 0.130, 2.31],
+        [496.0, 0.124, 2.53],
+        [539.0, 0.118, 2.78],
+        [590.0, 0.114, 3.05],
+        [653.0, 0.117, 3.34],
+        [729.0, 0.130, 3.69],
+    ], dtype=np.float64),
+    # Gold: absorptive in blue (low R), bright in red/IR → the warm gold tint.
+    "gold": np.array([
+        [400.0, 1.66, 1.96],
+        [450.0, 1.47, 1.95],
+        [500.0, 0.84, 1.84],
+        [550.0, 0.34, 2.46],
+        [600.0, 0.21, 2.93],
+        [650.0, 0.14, 3.37],
+        [700.0, 0.13, 3.84],
+    ], dtype=np.float64),
+    # Copper: blue/green absorption with a sharp rise near 570 nm → reddish.
+    "copper": np.array([
+        [400.0, 1.18, 2.21],
+        [450.0, 1.13, 2.40],
+        [500.0, 1.12, 2.60],
+        [550.0, 0.76, 2.92],
+        [600.0, 0.21, 3.24],
+        [650.0, 0.21, 3.75],
+        [700.0, 0.21, 4.05],
+    ], dtype=np.float64),
+    # Aluminum: large k, near-flat ~0.92 reflectance → neutral broadband mirror.
+    "aluminum": np.array([
+        [400.0, 0.49, 4.86],
+        [500.0, 0.77, 6.08],
+        [600.0, 1.20, 7.26],
+        [700.0, 1.83, 8.31],
+    ], dtype=np.float64),
+}
+
+
+def _make_conductor_spectral_bands(
+    sidecar: FreeFrequencySidecar,
+    metal: str,
+    *,
+    diffuse_frac: float = 0.0,
+    reemission: float = 0.0,
+) -> List[SpectralBand]:
+    """Per-band ``SpectralBand`` list for a CONDUCTOR from measured (n, k).
+
+    ``ior_real`` / ``ior_imag`` carry the measured complex index interpolated
+    onto the sidecar wavelengths.  ``reflectance`` is set to the normal-incidence
+    power reflectance for reference/debug, but the ray tracer reads (n, k)
+    directly via ``mat_refl_complex`` to compute the amplitude reflectance, so a
+    conductor's brightness and colour both come from the spectrum (audit B.3a).
+    A non-zero ``ior_imag`` is what flags the material as an opaque reflector in
+    the tracer (it never enters the Snell/refraction branch).
+    """
+    key = metal.strip().lower()
+    if key not in _CONDUCTOR_NK_CATALOG:
+        raise KeyError(
+            f"unknown conductor {metal!r}; known: {sorted(_CONDUCTOR_NK_CATALOG)}"
+        )
+    table = _CONDUCTOR_NK_CATALOG[key]
+    wl_tab = np.ascontiguousarray(table[:, 0], dtype=np.float64)
+    n_tab = np.ascontiguousarray(table[:, 1], dtype=np.float64)
+    k_tab = np.ascontiguousarray(table[:, 2], dtype=np.float64)
+    wl_nm = np.asarray(sidecar.wavelength_nm, dtype=np.float64)
+    # np.interp clamps to the table endpoints outside the measured range, which is
+    # the physically sensible behaviour for the visible-edge bands.
+    n_re = np.interp(wl_nm, wl_tab, n_tab)
+    n_im = np.interp(wl_nm, wl_tab, k_tab)
+    refl_power = ((n_re - 1.0) ** 2 + n_im ** 2) / ((n_re + 1.0) ** 2 + n_im ** 2)
+    freq_hz = sidecar.freq_hz
+    bw_hz = _sidecar_bandwidths(freq_hz)
+    bands: List[SpectralBand] = []
+    for freq, bw, nr, ni, rp in zip(freq_hz, bw_hz, n_re, n_im, refl_power):
+        bands.append(
+            SpectralBand(
+                center_hz=float(freq),
+                bandwidth_hz=float(bw),
+                reflectance=float(rp),
+                transmittance=0.0,
+                diffuse_frac=float(diffuse_frac),
+                emission=0.0,
+                reemission=float(reemission),
+                ior_real=float(nr),
+                ior_imag=float(ni),
+            )
+        )
+    return bands
+
+
 def _synth_spectral_bands_from_rgb(
     sidecar: "FreeFrequencySidecar",
     albedo_rgb: Sequence[float],
@@ -590,13 +746,16 @@ def _synth_spectral_bands_from_rgb(
     Opaque path (transmittance == 0 and ior ≈ 1.0):
       Each band's reflectance = dot(albedo_rgb, w_rgb(λ)) so red objects
       reflect in red bands, blue in blue bands, etc.  Metallic surfaces
-      get a luminance boost; ior_imag carries a crude extinction term.
+      get a luminance boost.  ior_imag stays 0 (no measured complex index);
+      named conductors use `_make_conductor_spectral_bands` instead.
 
     Transmissive path (transmittance > 0 or ior meaningfully != 1.0):
       Models glass or transparent plastic.  Per-band transmittance is
       chromatically weighted by the albedo so a blue-tinted acrylic
-      transmits blue wavelengths more than red.  Reflectance is the flat
-      Fresnel term at normal incidence: R₀ = ((n-1)/(n+1))².  diffuse_frac
+      transmits blue wavelengths more than red.  The index is per-band
+      dispersive (BK7-like Cauchy ramp anchored to `ior` at 589 nm) and the
+      reflectance is the per-band Fresnel term R₀(λ) = ((n(λ)-1)/(n(λ)+1))²,
+      so refraction and Fresnel both vary with wavelength (B.3b).  diffuse_frac
       is 0 so the shader routes into the Snell/Fresnel branch, not diffuse.
     """
     freq_hz = sidecar.freq_hz
@@ -611,9 +770,19 @@ def _synth_spectral_bands_from_rgb(
     is_transmissive = transmittance > 0.01
 
     if is_transmissive:
-        # Flat Fresnel reflectance at normal incidence
-        r0 = float(((ior - 1.0) / (ior + 1.0)) ** 2)
-        reflectances = np.full(len(freq_hz), r0, dtype=np.float64)
+        # B.3b: even an RGB-only transparent subject gets a per-band dispersive
+        # index instead of one flat scalar.  A BK7-like Cauchy ramp
+        #   n(λ) = ior + B·(1/λ² − 1/λ_ref²)
+        # is anchored so n(589 nm) == the requested `ior`, giving blue-high /
+        # red-low dispersion consistent with the per-band refraction in T3.
+        LAMBDA_REF_UM = 0.589
+        CAUCHY_B_UM2 = 0.00420
+        wl_um = np.maximum(wl_nm, 1.0) * 1.0e-3
+        ior_band = float(ior) + CAUCHY_B_UM2 * (
+            1.0 / (wl_um * wl_um) - 1.0 / (LAMBDA_REF_UM * LAMBDA_REF_UM))
+        ior_band = np.ascontiguousarray(ior_band, dtype=np.float64)
+        # Per-band Fresnel reflectance at normal incidence from the dispersive n.
+        reflectances = ((ior_band - 1.0) / (ior_band + 1.0)) ** 2
 
         # Chromatically weighted transmittance: albedo_rgb tints which wavelengths
         # pass through.  A spectrally flat (white) tint gives flat transmittance.
@@ -623,7 +792,7 @@ def _synth_spectral_bands_from_rgb(
         transmittances = np.clip(transmittances, 0.0, 1.0 - reflectances)
 
         diffuse_frac = 0.0  # pure specular/refractive — Snell branch handles it
-        ior_real = float(ior)
+        ior_real = ior_band   # per-band dispersive index (array)
         ior_imag = 0.0
     else:
         reflectances = w_rgb[:, 0] * ar + w_rgb[:, 1] * ag + w_rgb[:, 2] * ab
@@ -634,11 +803,18 @@ def _synth_spectral_bands_from_rgb(
         transmittances = np.zeros_like(reflectances)
 
         diffuse_frac = float(np.clip((1.0 - metallic) * roughness, 0.0, 1.0))
-        ior_real = 1.0
-        ior_imag = float(metallic * 2.0)
+        ior_real = np.ones(len(freq_hz), dtype=np.float64)
+        # ior_imag MUST stay 0 here: a non-zero k now flags a material as an
+        # opaque CONDUCTOR whose reflectance is derived from measured (n, k)
+        # (B.3a).  This RGB-synthesized path has no measured index — its colour
+        # lives in the per-band `reflectance` field — so leave k=0 and keep it a
+        # coloured dielectric reflector.  Named metals use
+        # `_make_conductor_spectral_bands` instead.
+        ior_imag = 0.0
 
+    ior_real = np.ascontiguousarray(np.broadcast_to(ior_real, (len(freq_hz),)), dtype=np.float64)
     bands: List[SpectralBand] = []
-    for f, bw, r, t in zip(freq_hz, bw_hz, reflectances, transmittances):
+    for f, bw, r, t, nre in zip(freq_hz, bw_hz, reflectances, transmittances, ior_real):
         bands.append(SpectralBand(
             center_hz=float(f),
             bandwidth_hz=float(bw),
@@ -647,7 +823,7 @@ def _synth_spectral_bands_from_rgb(
             diffuse_frac=diffuse_frac,
             emission=0.0,
             reemission=0.0,
-            ior_real=ior_real,
+            ior_real=float(nre),
             ior_imag=ior_imag,
         ))
     return bands
@@ -791,6 +967,7 @@ class LensConfig:
     radius_front: float
     radius_back: float
     ior: float
+    glass: str = "N-BK7"  # Sellmeier catalog key for measured dispersion (B.3b)
 
     @property
     def x_front(self) -> float:
@@ -3267,6 +3444,7 @@ def _build_scene_mesh(
                 base_ior=float(scene.lens.ior),
                 reflectance=0.02,
                 transmittance=0.98,
+                glass=str(getattr(scene.lens, "glass", "N-BK7") or "N-BK7"),
             ),
         ),
     )
@@ -3350,9 +3528,11 @@ def _build_scene_mesh(
             ),
         ),
     )
-    # Silver mirror: high specular reflectance, nearly zero diffuse, no transmission.
-    # ior_real=1.0 keeps mat_transmissive=False; ior_imag=3.0 gives ~120° Fresnel phase
-    # matching silver at visible wavelengths.
+    # Silver mirror: measured Johnson-Christy complex index n(λ),k(λ) drives both
+    # brightness and colour (B.3a).  ior_imag (k) > 0 flags it as an opaque
+    # conductor so it stays in the reflection branch (never refracts).  The flat
+    # ad-hoc ior_real=1.0 / ior_imag=3.0 it used before made k inert in the
+    # magnitude reduction and was not metallic at all.
     idx_silver = db.register(
         "silver_mirror",
         Material(
@@ -3364,14 +3544,10 @@ def _build_scene_mesh(
             emission_rgb=[0.0, 0.0, 0.0],
             ior=1.0,
             transmission=0.0,
-            spectral_bands=_make_sidecar_spectral_bands(
+            spectral_bands=_make_conductor_spectral_bands(
                 sidecar,
-                reflectance=0.97,
-                transmittance=0.0,
+                "silver",
                 diffuse_frac=0.01,
-                emission_scale=0.0,
-                ior_real=1.0,
-                ior_imag=3.0,
             ),
         ),
     )
@@ -8622,7 +8798,9 @@ class ForwardCppLensBench:
                     min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
                     max_rays=int(min(rays_per_batch, schedule_total - pix_offset)),
                     pix_offset=int(pix_offset),
-                    max_children=2,
+                    # 1 reflection lobe + one transmit child per band → real
+                    # per-band chromatic dispersion through the lens.
+                    max_children=1 + int(self.n_bands),
                     aperture_samples=int(n_ap),
                     seed=int(seed),
                     shutter_mode=int(stage_args.get("shutter_mode", 0)),
@@ -8857,6 +9035,37 @@ class ForwardCppLensBench:
                 "overflow_optical": int(overflow.get("optical", 0)) if isinstance(overflow, dict) else 0,
                 "overflow_connections": int(overflow.get("connections", 0)) if isinstance(overflow, dict) else 0,
             }
+            # B.1b: a spectral-record overflow is NOT cosmetic — every dropped
+            # record forces the affected vertex back onto the flat luminance
+            # split (betas[b] = throughput/nb), i.e. it desaturates to grey.
+            # Surface it loudly instead of letting chroma silently vanish under
+            # load.  The cap to raise is `bdpt_max_spectral`.  Overflow atomics
+            # are cumulative, so warn only on the *increase* (new drops this
+            # call) to avoid latched per-frame spam.
+            _ov_spec = self.bdpt_last_connection_stats["overflow_spectral"]
+            _ov_vert = self.bdpt_last_connection_stats["overflow_vertices"]
+            _ov_pdf = self.bdpt_last_connection_stats["overflow_pdfs"]
+            _d_spec = _ov_spec - int(getattr(self, "_bdpt_prev_overflow_spectral", 0))
+            _d_vert = _ov_vert - int(getattr(self, "_bdpt_prev_overflow_vertices", 0))
+            _d_pdf = _ov_pdf - int(getattr(self, "_bdpt_prev_overflow_pdfs", 0))
+            self._bdpt_prev_overflow_spectral = _ov_spec
+            self._bdpt_prev_overflow_vertices = _ov_vert
+            self._bdpt_prev_overflow_pdfs = _ov_pdf
+            if _d_spec > 0:
+                print(
+                    f"[bdpt-cpp][WARNING] SPECTRAL OVERFLOW: {_d_spec} per-band "
+                    f"records DROPPED this call ({_ov_spec} total) -> affected "
+                    f"vertices desaturate to GREY (flat luminance split). "
+                    f"Raise bdpt_max_spectral.",
+                    flush=True,
+                )
+            if _d_vert > 0 or _d_pdf > 0:
+                print(
+                    f"[bdpt-cpp][WARNING] BDPT buffer overflow this call: "
+                    f"vertices={_d_vert} pdfs={_d_pdf} records DROPPED. "
+                    f"Raise bdpt_max_vertices / bdpt_max_pdfs.",
+                    flush=True,
+                )
             self.bdpt_last_telemetry = {
                 "kept_records": self.bdpt_last_survivor_records,
                 "connection_lit_pixels": lit_pixels,
@@ -11247,6 +11456,7 @@ def run(
     t5_light_batch: int = 0,
     t5_cam_batch: int = 0,
     t5_sensor_tile: int = 0,
+    t5_min_geom: float = -1.0,
     no_gpu_t5: bool = False,
     gpu_resident: bool = False,
 ) -> None:
@@ -11378,6 +11588,20 @@ def run(
     if _t5_sensor_tile > 0:
         bench.tracer.set_t5_sensor_tile_size(_t5_sensor_tile)
         print(f"[t5] sensor tile {_t5_sensor_tile}×{_t5_sensor_tile} px/tile", flush=True)
+    # B.4b: `min_geom` is the geometry-term floor — connections whose geometric
+    # coupling G = cosθ·cosθ'/dist² falls below it are skipped.  It makes empty
+    # space cheap, but it is a BIAS/VARIANCE QUALITY KNOB, not a fixed constant:
+    # too high and legitimate faint long-range / grazing transport is culled
+    # (darkened distant detail); too low and the all-pairs grind keeps low-yield
+    # pairs (slower, noisier).  Default (-1) leaves the C++ default (1e-8).  Set
+    # a smaller value (e.g. 1e-12) to preserve faint long-range light at the cost
+    # of speed, or larger to trade fidelity for throughput.
+    _t5_min_geom = float(t5_min_geom)
+    if _t5_min_geom > 0.0 and hasattr(bench.tracer, "set_t5_min_geom"):
+        bench.tracer.set_t5_min_geom(_t5_min_geom)
+        print(f"[t5] min_geom floor = {_t5_min_geom:.3e} (quality knob: "
+              f"lower keeps faint long-range transport, higher is faster)",
+              flush=True)
     if no_gpu_t5:
         print("[t5] --no-gpu-t5 flag is no longer honoured — GPU T5 always active when compute_mode=gpu", flush=True)
     if gpu_resident and compute_mode in ("gpu", "mixed"):
@@ -11616,7 +11840,7 @@ def run(
     if compute_mode in ("gpu", "mixed"):
         try:
             bench.tracer.ensure_pipeline(
-                max_children=2,
+                max_children=1 + int(bench.n_bands),
                 seed=13579,
                 min_amplitude=float(bench._min_amplitude),
                 use_gpu_compute=True,
@@ -13767,6 +13991,8 @@ def run(
             new_bench.tracer.set_t5_cam_batch_size(_t5_cam_batch)
         if _t5_sensor_tile > 0:
             new_bench.tracer.set_t5_sensor_tile_size(_t5_sensor_tile)
+        if _t5_min_geom > 0.0 and hasattr(new_bench.tracer, "set_t5_min_geom"):
+            new_bench.tracer.set_t5_min_geom(_t5_min_geom)
         if _gl_display_hglrc:
             if _gl_display_hdc:
                 new_bench.tracer.set_gl_display_hdc(_gl_display_hdc)
@@ -13780,7 +14006,7 @@ def run(
         # package does not create a CPU pipeline before compute_mode is applied.
         if compute_mode in ("gpu", "mixed"):
             new_bench.tracer.ensure_pipeline(
-                max_children=2,
+                max_children=1 + int(new_bench.n_bands),
                 seed=13579,
                 min_amplitude=float(new_bench._min_amplitude),
                 use_gpu_compute=True,
@@ -14643,6 +14869,21 @@ if __name__ == "__main__":
         ),
     )
     _ap.add_argument(
+        "--t5-min-geom",
+        type=float,
+        default=-1.0,
+        metavar="G",
+        help=(
+            "Geometry-term floor for the T5 BDPT connection pass (quality knob, "
+            "B.4b).  A camera<->light connection is skipped when its geometric "
+            "coupling G = cos(theta)*cos(theta')/dist^2 falls below this value. "
+            "It makes empty space cheap but biases out faint long-range/grazing "
+            "transport.  <=0 = use built-in default (1e-8).  Lower (e.g. 1e-12) "
+            "preserves faint distant light at the cost of speed; higher trades "
+            "fidelity for throughput. Example: --t5-min-geom 1e-12"
+        ),
+    )
+    _ap.add_argument(
         "--no-gpu-t5",
         action="store_true",
         help=(
@@ -14690,6 +14931,7 @@ if __name__ == "__main__":
         parametric=bool(_args.parametric),
         t5_light_batch=int(_args.t5_light_batch),
         t5_sensor_tile=int(_args.t5_sensor_tile),
+        t5_min_geom=float(_args.t5_min_geom),
         no_gpu_t5=bool(_args.no_gpu_t5),
         gpu_resident=bool(_args.gpu_resident),
     )

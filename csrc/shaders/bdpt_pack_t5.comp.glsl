@@ -61,12 +61,12 @@ uniform float sensor_half_h;
 
 float mat_diffuse_p(int mat_idx) {
     if (mat_idx < 0) return 0.5;
-    return mat_bands[mat_idx * MAT_FULL_BANDS * MAT_BAND_STRIDE + 4];  /* band 0 field [4] */
+    return clamp(mat_bands[mat_idx * MAT_FULL_BANDS * MAT_BAND_STRIDE + 4], 0.0, 1.0);
 }
 
 float mat_ggx_alpha(int mat_idx) {
     if (mat_idx < 0) return 0.0;
-    return mat_bands[mat_idx * MAT_FULL_BANDS * MAT_BAND_STRIDE + 10]; /* band 0 field [10] */
+    return clamp(mat_bands[mat_idx * MAT_FULL_BANDS * MAT_BAND_STRIDE + 10], 0.0, 1.0);
 }
 
 void main() {
@@ -98,14 +98,25 @@ void main() {
     bool tri_valid   = (tflags_u & 0x01u) != 0u || floatBitsToInt(bdpt_verts[vb + 4]) >= 0;
 
     /* vinfo: same layout as CPU — packed subpath position | stream<<16 | tri_valid<<31.
-     * Count earlier sorted rows in the same (stream, sid) group.  The subpath depth is
-     * small, so this avoids adding another GPU pass while preserving the CPU contract. */
+     * packed_pos = number of earlier sorted rows in the same (stream, sid)
+     * group, i.e. this vertex's dense index within its subpath.
+     *
+     * B.4c: the bitonic sort orders rows ascending by the full key (key_hi
+     * then key_lo), so all rows sharing this key_hi are CONTIGUOUS and this
+     * row sits at global position P inside that run.  packed_pos is therefore
+     * P minus the run's start index.  The previous code found the start with a
+     * per-thread O(group) backward scan whose cost grew with subpath length;
+     * replace it with an exact O(log nv) binary search (lower_bound of key_hi).
+     * Result is identical — only the start index is needed. */
     uint key_hi = sort_keys[P * 2 + 0];
-    uint packed_pos = 0u;
-    for (int q = P - 1; q >= 0; --q) {
-        if (sort_keys[q * 2 + 0] != key_hi) break;
-        packed_pos += 1u;
+    int lo = 0;
+    int hi = P;                       /* group start cannot exceed P          */
+    while (lo < hi) {
+        int mid = (lo + hi) >> 1;
+        if (sort_keys[mid * 2 + 0] < key_hi) lo = mid + 1;
+        else                                 hi = mid;
     }
+    uint packed_pos = uint(P - lo);   /* == count of equal-key_hi predecessors */
     uint vinfo = packed_pos | (stream << 16) | (tri_valid ? (1u << 31) : 0u);
 
     /* O(vertices) initialization.  bdpt_scatter_t5 overwrites per-band values
@@ -119,12 +130,6 @@ void main() {
         for (int b = 0; b < nb; ++b)
             betas[b] = beta_per_band;
     }
-    float beta_lum = 0.0;
-    for (int b = 0; b < nb; ++b)
-        beta_lum += betas[b];
-    float beta_r = beta_lum / 3.0;
-    float beta_g = beta_lum / 3.0;
-    float beta_b = beta_lum / 3.0;
 
     uint optical_block = 0u;
     float optical_jacobian = 1.0;
@@ -182,9 +187,15 @@ void main() {
         t5_cam[ob +  7] = uintBitsToFloat(tflags_u);
         t5_cam[ob +  8] = uintBitsToFloat(sid);
         t5_cam[ob +  9] = uintBitsToFloat(vinfo);
-        t5_cam[ob + 10] = beta_r;
-        t5_cam[ob + 11] = beta_g;
-        t5_cam[ob + 12] = beta_b;
+        /* [10..12] RESERVED — legacy per-vertex luminance-RGB beta slots.
+         * B.1c: these are DEAD.  t5_full_connect derives camera colour from the
+         * per-band slots (CGV_BAND_BASE [22..53]) via cam_spectral_rgb, and
+         * bdpt_scatter_t5 only overwrites those per-band slots — nothing ever
+         * reads [10..12].  Zero them for deterministic buffer contents; do not
+         * resurrect the flat beta_lum/3 split (it desaturated camera colour). */
+        t5_cam[ob + 10] = 0.0;
+        t5_cam[ob + 11] = 0.0;
+        t5_cam[ob + 12] = 0.0;
         t5_cam[ob + 13] = soy;
         t5_cam[ob + 14] = soz;
         t5_cam[ob + 15] = pdf_fwd;

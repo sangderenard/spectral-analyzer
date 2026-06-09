@@ -236,14 +236,12 @@ float mat_band_field(int mat, int b, int field, float fallback) {
 }
 
 vec2 mat_refl_complex(int mat, int b) {
-    float mag = max(0.0, mat_band_field(mat, b, 2, 0.0));
     float nr  = mat_band_field(mat, b, 7, 1.0);
     float ni  = mat_band_field(mat, b, 8, 0.0);
 
-    /* CPU equivalent:
-     *   r_F = (1 - (nr+i*ni)) / (1 + (nr+i*ni))
-     *   reflectance = authored_mag * exp(i * arg(r_F))
-     */
+    /* Complex amplitude Fresnel at normal incidence (N = nr + i·ni):
+     *   r_F = (1 - N) / (1 + N)
+     * |r_F| = sqrt(R_power) is the physical amplitude reflectance. */
     float ar = 1.0 - nr;
     float ai = -ni;
     float br = 1.0 + nr;
@@ -251,6 +249,20 @@ vec2 mat_refl_complex(int mat, int b) {
     float den = max(br * br + bi * bi, 1.0e-20);
     float rr = (ar * br + ai * bi) / den;
     float ri = (ai * br - ar * bi) / den;
+
+    if (ni > 0.1) {
+        /* B.3a — Conductor (extinction k > 0.1; true metals have k~1-10, while
+         * weakly-absorbing dielectrics have k<<0.1 and must stay dielectric).
+         * Return the TRUE complex Fresnel. Its magnitude
+         * |r_F| = sqrt(((n-1)^2+k^2)/((n+1)^2+k^2)) is the measured amplitude
+         * reflectance, so per-band (n,k) drive BOTH brightness and colour.
+         * (The old path discarded |r_F| and rescaled to the authored scalar
+         * reflectance, making k inert in the magnitude reduction.) */
+        return vec2(rr, ri);
+    }
+    /* Dielectric (k≈0): authored amplitude reflectance magnitude, Fresnel
+     * phase only — preserves RGB-tinted reflectance for non-metals. */
+    float mag = max(0.0, mat_band_field(mat, b, 2, 0.0));
     float len = sqrt(rr * rr + ri * ri);
     if (len <= 1.0e-12) return vec2(mag, 0.0);
     return mag * vec2(rr, ri) / len;
@@ -265,11 +277,22 @@ float mat_diffusion(int mat)              { return clamp(mat_band_field(mat, 0, 
 float mat_ggx_alpha(int mat)              { return clamp(mat_band_field(mat, 0, 10, 0.0), 0.0, 1.0); }
 bool  mat_is_transmissive(int mat) {
     if (mat < 0 || mat >= n_mats) return false;
+    /* Conductor (ior_imag k > 0.1): opaque reflector, never refracts (B.3a).
+     * Weakly-absorbing dielectrics (k<<0.1) still refract + Beer-Lambert. */
+    if (mat_band_field(mat, 0, 8, 0.0) > 0.1) return false;
     return mat_transmittance(mat, 0) > 1.0e-6 || abs(mat_ior_real(mat, 0) - 1.0) > 1.0e-6;
 }
 float medium_n_real(int mat) {
     if (mat < 0 || mat >= n_mats) return 1.0;
     float n = mat_ior_real(mat, 0);
+    return (n > 1.0e-10) ? n : 1.0;
+}
+/* Per-band medium index for chromatic dispersion: identical to medium_n_real
+ * but reads the requested spectral band's ior_real (field 7) instead of band 0.
+ * This is what lets each wavelength refract at its own Snell angle. */
+float medium_n_real_b(int mat, int b) {
+    if (mat < 0 || mat >= n_mats) return 1.0;
+    float n = mat_ior_real(mat, b);
     return (n > 1.0e-10) ? n : 1.0;
 }
 
@@ -556,8 +579,10 @@ void main() {
      * the endpoint material response for its actual connection direction; using
      * a post-scatter beta here would bake in whatever direction this T3 bounce
      * happened to sample and makes arbitrary T5 connections lose material meaning.
-     * Emissive terminals append a later same-key spectral record with Le applied,
-     * which intentionally overwrites this arrival beta in the scatter-to-T5 pass. */
+     * For emissive surfaces the emission spectrum Le is folded into this single
+     * arrival record here.  Emitting a second same-key spectral record from the
+     * emissive terminal would race with this one in the scatter-to-T5 pass
+     * (plain store, no ordering) and resolve last-writer-wins, so we do not. */
     uint bdpt_sid      = hit_bdpt_sid(hbase);
     uint bdpt_vi       = uint(bounce) & 0xFFFFu;
     float bdpt_band_pdf = (nb > 0) ? 1.0 / float(nb) : 1.0;
@@ -576,9 +601,13 @@ void main() {
                                        pos, nrm, in_dir,
                                        path_len, hit_pathatseg(hbase),
                                        throughput, soy, soz);
+        /* Fold emission Le into the arrival beta for emissive surfaces so the
+         * emitter spectrum lives in this single record (no racing duplicate). */
+        bool is_emissive_v = (tri_idx_v >= 0) && ((tflags_u & MAT_FLAG_EMISSIVE) != 0u);
         for (int b = 0; b < nb; b++) {
             uint vi_band = (bdpt_vi << 16) | uint(b);
-            emit_bdpt_spectral(bdpt_sid, vi_band, amp_re[b], amp_im[b], bdpt_band_pdf);
+            float le = (is_emissive_v && mat_id_v >= 0) ? mat_emission(mat_id_v, b) : 1.0;
+            emit_bdpt_spectral(bdpt_sid, vi_band, amp_re[b] * le, amp_im[b] * le, bdpt_band_pdf);
         }
         /* fill_bdpt_vertex_pdf() is called at each branch once pdf values are known. */
     }
@@ -716,15 +745,8 @@ void main() {
         fill_bdpt_vertex_pdf(g_bdpt_slot,
                              cos_i / 3.141592653589793, cos_i / 3.141592653589793,
                              uint(flags) | BDPT_PDF_FLAG_EMISSION);
-        if (bdpt_sid != 0u && bdpt_max_verts > 0) {
-            for (int b = 0; b < nb; b++) {
-                uint vi_band = (bdpt_vi << 16) | uint(b);
-                float le = (mat_id >= 0) ? mat_emission(mat_id, b) : 1.0;
-                emit_bdpt_spectral(bdpt_sid, vi_band,
-                                   amp_re[b] * le, amp_im[b] * le,
-                                   bdpt_band_pdf);
-            }
-        }
+        /* Le is already folded into the pre-scatter spectral record above; emitting
+         * it again here would create a racing same-key record in scatter_spectral. */
         uint tslot = atomicAdd(meta[1], 1u);
         write_terminal(tslot, hbase, true);
         return;
@@ -767,89 +789,138 @@ void main() {
             }
         }
 
-        float n1 = has_pair ? medium_n_real(medium_from) : medium_n_real(medium);
-        float n2 = has_pair ? medium_n_real(medium_to)
-                            : (front_face ? medium_n_real(mat_id) : 1.0);
-
+        /* cos_i and the reflection direction are achromatic (geometry only). */
         float cos_i  = max(0.0, -dot(in_dir, nrm));
-        vec3  refracted;
-        bool  can_refract = snell_refract(in_dir, nrm, n1, n2, refracted);
+        vec3  rdir   = normalize(in_dir - 2.0 * dot(in_dir, nrm) * nrm);
+        int   new_med = has_pair ? medium_to : (front_face ? mat_id : -1);
 
-        if (!can_refract) {
-            vec3 rd = normalize(in_dir - 2.0 * dot(in_dir, nrm) * nrm);
+        if (max_children_per_hit >= 2) {
+            /* ── Deterministic per-band dispersive split ─────────────────────
+             * One ray carries one direction, so true chromatic dispersion needs
+             * one transmitted ray PER band — each refracted at its own Snell
+             * angle from that band's ior_real.  The reflection lobe stays a
+             * single ray (the law of reflection is wavelength-independent) but
+             * is weighted per band by sqrt(R_b); a band in total internal
+             * reflection (sin²θt > 1) reflects fully (R_b = 1) and spawns no
+             * transmitted ray.  This is what produces lateral colour / chromatic
+             * focus shift through the lens.  Callers MUST size
+             * max_children = 1 + n_bands so every active band gets its own
+             * transmit child (no achromatic fallback). */
             float ra_re[MAX_BANDS], ra_im[MAX_BANDS];
+            float R0 = 0.0;   /* band-0 reflectance → representative vertex pdf */
+            /* ── B.0 INVARIANT: propagate amplitude UN-NORMALISED ───────────
+             * Each child amplitude is scaled by the interface factor ONLY
+             * (reflection: ×sqrt(R_b); transmission below: ×sqrt(1-R_b)) and
+             * NEVER divided by the scatter/sampling PDF.  The MIS sampling
+             * density is recorded separately via emit_bdpt_pdf and the whole
+             * normalisation is deferred to T5's single `contrib = f / denom`.
+             * Dividing the beta by a PDF here would double-count and silently
+             * bias the estimator — the T3 amplitude scale and the T5 `/denom`
+             * are a MATCHED PAIR; change one only if you change the other. */
             for (int b = 0; b < nb; b++) {
+                float n1b = medium_n_real_b(has_pair ? medium_from : medium, b);
+                float n2b = has_pair ? medium_n_real_b(medium_to, b)
+                                     : (front_face ? medium_n_real_b(mat_id, b) : 1.0);
+                float s2  = (n1b / n2b) * (n1b / n2b) * (1.0 - cos_i * cos_i);
+                float Rb;
+                if (s2 > 1.0) {
+                    Rb = 1.0;                                 /* TIR: full reflection */
+                } else {
+                    float ctb = sqrt(max(0.0, 1.0 - s2));
+                    Rb = fresnel_R(cos_i, ctb, n1b, n2b);
+                }
+                if (b == 0) R0 = Rb;
+                float rs = sqrt(Rb);
                 float rr = (mat_id >= 0) ? mat_refl_re(mat_id, b) : 1.0;
                 float ri = (mat_id >= 0) ? mat_refl_im(mat_id, b) : 0.0;
-                ra_re[b] = amp_re[b]*rr - amp_im[b]*ri;
-                ra_im[b] = amp_re[b]*ri + amp_im[b]*rr;
+                ra_re[b] = rs * (amp_re[b]*rr - amp_im[b]*ri);
+                ra_im[b] = rs * (amp_re[b]*ri + amp_im[b]*rr);
             }
             for (int b = nb; b < MAX_BANDS; b++) { ra_re[b]=0.0; ra_im[b]=0.0; }
-            uint islot = atomicAdd(meta[0], 1u);
-            int new_med = has_pair ? medium_from : (front_face ? mat_id : -1);
-            emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, 1.0, 1.0,
-                          uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR,
-                          nrm, in_dir, rd);
-            fill_bdpt_vertex_pdf(g_bdpt_slot, 1.0, 1.0,
-                                 uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR);
-            g_bdpt_slot = -1;
-            write_intent(islot, pos, rd, path_len, new_med, iflags,
-                         src_id, new_bounce, new_bleft, min_amp,
-                         tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ra_re, ra_im);
+            {
+                uint islot = atomicAdd(meta[0], 1u);
+                emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, R0, R0,
+                              uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
+                              nrm, in_dir, rdir);
+                fill_bdpt_vertex_pdf(g_bdpt_slot, R0, R0,
+                                     uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
+                g_bdpt_slot = -1;
+                write_intent(islot, pos, rdir, path_len, medium, iflags,
+                             src_id, new_bounce, new_bleft, min_amp,
+                             tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ra_re, ra_im);
+            }
+            /* One transmitted child per active, non-TIR band.  Callers size
+             * max_children = 1 + n_bands, so every active band fits without
+             * dropping energy. */
+            for (int b = 0; b < nb; b++) {
+                float mag = sqrt(amp_re[b]*amp_re[b] + amp_im[b]*amp_im[b]);
+                if (mag <= 0.0) continue;                     /* inactive band */
+                float n1b = medium_n_real_b(has_pair ? medium_from : medium, b);
+                float n2b = has_pair ? medium_n_real_b(medium_to, b)
+                                     : (front_face ? medium_n_real_b(mat_id, b) : 1.0);
+                vec3 refracted_b;
+                if (!snell_refract(in_dir, nrm, n1b, n2b, refracted_b))
+                    continue;                                 /* TIR: reflected above */
+                float s2  = (n1b / n2b) * (n1b / n2b) * (1.0 - cos_i * cos_i);
+                float ctb = sqrt(max(0.0, 1.0 - s2));
+                float Rb     = fresnel_R(cos_i, ctb, n1b, n2b);
+                float Rb_rev = fresnel_R(ctb, cos_i, n2b, n1b);
+                float ts = sqrt(max(0.0, 1.0 - Rb));
+                float ta_re[MAX_BANDS], ta_im[MAX_BANDS];
+                for (int k = 0; k < MAX_BANDS; k++) { ta_re[k]=0.0; ta_im[k]=0.0; }
+                ta_re[b] = ts * amp_re[b];
+                ta_im[b] = ts * amp_im[b];
+                uint islot = atomicAdd(meta[0], 1u);
+                emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE,
+                              1.0 - Rb, 1.0 - Rb_rev,
+                              uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
+                              nrm, in_dir, refracted_b);
+                write_intent(islot, pos, refracted_b, path_len, new_med, iflags,
+                             src_id, new_bounce, new_bleft, min_amp,
+                             tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ta_re, ta_im);
+            }
         } else {
-            float sin2_t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
-            float cos_t  = sqrt(max(0.0, 1.0 - sin2_t));
-            float R      = fresnel_R(cos_i, cos_t, n1, n2);
-            float R_rev  = fresnel_R(cos_t, cos_i, n2, n1);
-            int   new_med = has_pair ? medium_to : (front_face ? mat_id : -1);
+            /* ── Stochastic single-child fast path (achromatic, band 0) ───────
+             * One ray cannot represent per-band directions; this path keeps the
+             * band-0 refraction.  Use the deterministic split (max_children >= 2)
+             * for true dispersion. */
+            float n1 = has_pair ? medium_n_real(medium_from) : medium_n_real(medium);
+            float n2 = has_pair ? medium_n_real(medium_to)
+                                : (front_face ? medium_n_real(mat_id) : 1.0);
+            vec3  refracted;
+            bool  can_refract = snell_refract(in_dir, nrm, n1, n2, refracted);
 
-            if (max_children_per_hit >= 2) {
-                float rs = sqrt(R);
-                float ts = sqrt(max(0.0, 1.0 - R));
-                {
-                    vec3  rd = normalize(in_dir - 2.0 * dot(in_dir, nrm) * nrm);
-                    float ra_re[MAX_BANDS], ra_im[MAX_BANDS];
-                    for (int b = 0; b < nb; b++) {
-                        float rr = (mat_id >= 0) ? mat_refl_re(mat_id, b) : 1.0;
-                        float ri = (mat_id >= 0) ? mat_refl_im(mat_id, b) : 0.0;
-                        ra_re[b] = rs * (amp_re[b]*rr - amp_im[b]*ri);
-                        ra_im[b] = rs * (amp_re[b]*ri + amp_im[b]*rr);
-                    }
-                    for (int b = nb; b < MAX_BANDS; b++) { ra_re[b]=0.0; ra_im[b]=0.0; }
-                    uint islot = atomicAdd(meta[0], 1u);
-                    emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, R, R,
-                                  uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
-                                  nrm, in_dir, rd);
-                    fill_bdpt_vertex_pdf(g_bdpt_slot, R, R,
-                                        uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT);
-                    g_bdpt_slot = -1;
-                    write_intent(islot, pos, rd, path_len, medium, iflags,
-                                 src_id, new_bounce, new_bleft, min_amp,
-                                 tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ra_re, ra_im);
+            if (!can_refract) {
+                float ca_re[MAX_BANDS], ca_im[MAX_BANDS];
+                for (int b = 0; b < nb; b++) {
+                    float rr = (mat_id >= 0) ? mat_refl_re(mat_id, b) : 1.0;
+                    float ri = (mat_id >= 0) ? mat_refl_im(mat_id, b) : 0.0;
+                    ca_re[b] = amp_re[b]*rr - amp_im[b]*ri;
+                    ca_im[b] = amp_re[b]*ri + amp_im[b]*rr;
                 }
-                {
-                    float ta_re[MAX_BANDS], ta_im[MAX_BANDS];
-                    for (int b = 0; b < nb; b++) {
-                        ta_re[b] = ts * amp_re[b];
-                        ta_im[b] = ts * amp_im[b];
-                    }
-                    for (int b = nb; b < MAX_BANDS; b++) { ta_re[b]=0.0; ta_im[b]=0.0; }
-                    uint islot = atomicAdd(meta[0], 1u);
-                    emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE,
-                                  1.0 - R, 1.0 - R_rev,
-                                  uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR | BDPT_PDF_FLAG_SPLIT,
-                                  nrm, in_dir, refracted);
-                    write_intent(islot, pos, refracted, path_len, new_med, iflags,
-                                 src_id, new_bounce, new_bleft, min_amp,
-                                 tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ta_re, ta_im);
-                }
+                for (int b = nb; b < MAX_BANDS; b++) { ca_re[b]=0.0; ca_im[b]=0.0; }
+                uint islot = atomicAdd(meta[0], 1u);
+                int new_med_tir = has_pair ? medium_from : (front_face ? mat_id : -1);
+                emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, 1.0, 1.0,
+                              uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR,
+                              nrm, in_dir, rdir);
+                fill_bdpt_vertex_pdf(g_bdpt_slot, 1.0, 1.0,
+                                     uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR);
+                g_bdpt_slot = -1;
+                write_intent(islot, pos, rdir, path_len, new_med_tir, iflags,
+                             src_id, new_bounce, new_bleft, min_amp,
+                             tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ca_re, ca_im);
             } else {
+                float sin2_t = (n1/n2)*(n1/n2)*(1.0 - cos_i*cos_i);
+                float cos_t  = sqrt(max(0.0, 1.0 - sin2_t));
+                float R      = fresnel_R(cos_i, cos_t, n1, n2);
+                float R_rev  = fresnel_R(cos_t, cos_i, n2, n1);
                 float u = rand_next(rng);
                 float ca_re[MAX_BANDS], ca_im[MAX_BANDS];
                 vec3  cdir;
                 int   cmed;
                 if (u < R) {
-                    cdir = normalize(in_dir - 2.0 * dot(in_dir, nrm) * nrm);
+                    cdir = rdir;
                     cmed = medium;
                     for (int b = 0; b < nb; b++) {
                         float rr = (mat_id >= 0) ? mat_refl_re(mat_id, b) : 1.0;
@@ -864,13 +935,12 @@ void main() {
                 }
                 for (int b = nb; b < MAX_BANDS; b++) { ca_re[b]=0.0; ca_im[b]=0.0; }
                 uint islot = atomicAdd(meta[0], 1u);
-                uint pdf_flags = BDPT_PDF_FLAG_DELTA_SPECULAR;
                 float pdf_fwd = (u < R) ? R : (1.0 - R);
                 float pdf_rev = (u < R) ? R : (1.0 - R_rev);
                 emit_bdpt_pdf(bdpt_sid, uint(bounce), BDPT_DOMAIN_SOLID_ANGLE, pdf_fwd, pdf_rev,
-                              uint(flags) | pdf_flags, nrm, in_dir, cdir);
+                              uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR, nrm, in_dir, cdir);
                 fill_bdpt_vertex_pdf(g_bdpt_slot, pdf_fwd, pdf_rev,
-                                     uint(flags) | pdf_flags);
+                                     uint(flags) | BDPT_PDF_FLAG_DELTA_SPECULAR);
                 g_bdpt_slot = -1;
                 write_intent(islot, pos, cdir, path_len, cmed, iflags,
                              src_id, new_bounce, new_bleft, min_amp,

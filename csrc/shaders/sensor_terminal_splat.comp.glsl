@@ -81,11 +81,13 @@ float mat_emission(int mat, int b) {
 }
 
 /* Float atomic-add via CAS spin-loop — no GL_EXT_shader_atomic_float needed.
- * Same pattern as t5_full_connect.comp.glsl. */
+ * Same pattern as t5_full_connect.comp.glsl.  Unbounded on purpose: a fixed
+ * retry cap silently lost energy on the brightest, highest-contention pixels.
+ * compareAndSwap guarantees global progress, so the loop always terminates. */
 void atomic_add_float(uint idx, float val) {
     if (val <= 0.0f || isnan(val) || isinf(val)) return;
     uint expected = sensor_rgb[idx];
-    for (int i = 0; i < 64; ++i) {
+    while (true) {
         float fexp    = uintBitsToFloat(expected);
         uint  desired = floatBitsToUint(fexp + val);
         uint  actual  = atomicCompSwap(sensor_rgb[idx], expected, desired);

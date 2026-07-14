@@ -1,0 +1,43 @@
+{
+  "order": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\configs\\scene_orders\\token_axe_red_gloss.json",
+  "runtime": {
+    "width": 64,
+    "height": 64,
+    "focal_mm": 35.0,
+    "aperture_mm": 25.0,
+    "iso": 100.0,
+    "exposure_time_s": 0.016666666666666666,
+    "pair_budget": 20000000
+  },
+  "compile": {
+    "job_id": "token_AXE",
+    "token": "AXE",
+    "plane_triangles": 12,
+    "glyph_triangles": 4458,
+    "retained_base_triangles": 98080,
+    "total_triangles": 102550,
+    "material_names": [
+      "matte_black",
+      "glossy_red"
+    ],
+    "flash_scale": 1.0,
+    "removed_subject_emitters": 2640
+  },
+  "bounds_min": [
+    -0.014000000432133675,
+    -0.25999999046325684,
+    -0.20999999344348907
+  ],
+  "bounds_max": [
+    1.357699990272522,
+    0.25999999046325684,
+    0.20999999344348907
+  ],
+  "source_triangles": 144,
+  "camera_groups": {
+    "sensor": 24384,
+    "aperture_blocker": 29184,
+    "thin_lens": 24576,
+    "object": 4470
+  }
+}

@@ -54,6 +54,7 @@ layout(std430, binding = 5) readonly buffer MatBandBuf  { float mat_bands[];  };
 #define MAT_BAND_STRIDE    12
 
 uniform int   nv;               /* actual vertex count                        */
+uniform int   base_idx;         /* chunk offset for split dispatches          */
 uniform int   n_lv;             /* light vertex count (= sort_counts[0])      */
 uniform int   n_bands;          /* active spectral bands                      */
 uniform float sensor_half_w;    /* sensor half-width for spectral_beta_rgb    */
@@ -70,7 +71,7 @@ float mat_ggx_alpha(int mat_idx) {
 }
 
 void main() {
-    int P = int(gl_GlobalInvocationID.x);
+    int P = base_idx + int(gl_GlobalInvocationID.x);
     if (P >= nv) return;
 
     int   idx  = int(sort_idx[P]);
@@ -118,6 +119,8 @@ void main() {
     }
     uint packed_pos = uint(P - lo);   /* == count of equal-key_hi predecessors */
     uint vinfo = packed_pos | (stream << 16) | (tri_valid ? (1u << 31) : 0u);
+    if (stream == 1u && packed_pos == 0u)
+        pdf_flags |= (1u << 22); /* BDPT_PDF_FLAG_SENSOR */
 
     /* O(vertices) initialization.  bdpt_scatter_t5 overwrites per-band values
      * from spectral side records after this pack pass. */

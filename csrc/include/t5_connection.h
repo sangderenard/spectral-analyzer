@@ -99,6 +99,11 @@ struct T5ThreadAccum {
     std::vector<double>              sensor_r, sensor_g, sensor_b;
     std::vector<BdptConnectionRecord> conn_batch;
     uint64_t                         exact_count = 0;
+    uint64_t                         visible_pairs = 0;
+    uint64_t                         overlapping_bands = 0;
+    uint64_t                         camera_response_bands = 0;
+    uint64_t                         light_response_bands = 0;
+    uint64_t                         positive_bands = 0;
 
     explicit T5ThreadAccum(size_t pix)
         : sensor_r(pix, 0.0), sensor_g(pix, 0.0), sensor_b(pix, 0.0)
@@ -219,6 +224,15 @@ struct T5ConnContext {
         return have ? beta : (double)v.throughput_scalar;
     }
 
+    double beta_band_val(const BdptVertexRecord& v, int band) const
+    {
+        const uint64_t k = ((uint64_t)v.subpath_id << 32)
+                         | ((uint64_t)v.vertex_index << 16)
+                         | (uint64_t)band;
+        auto it = beta_lut.find(k);
+        return (it == beta_lut.end()) ? 0.0 : std::abs(it->second);
+    }
+
     /* ─── Core path-transport helpers ────────────────────────────────── */
 
     bool optical_allows_sampling(const BdptVertexRecord& v, bool reverse,
@@ -261,7 +275,14 @@ struct T5ConnContext {
         const float pdf_component = reverse_pdf ? pr->pdf_rev : pr->pdf_fwd;
         const float pdf_solid     = reverse_pdf ? pr->pdf_rev : pr->pdf_solid_angle;
 
-        if (!reverse_pdf && pr->pdf_area > 0.0f && std::isfinite(pr->pdf_area)) {
+        /* Delta-specular sampling (including stochastic Fresnel refraction)
+         * has a discrete probability mass.  It must not acquire the
+         * cos(theta)/distance^2 Jacobian used to convert continuous
+         * solid-angle densities to area measure. */
+        if ((pr->flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) {
+            if (pdf_component > 0.0f && std::isfinite(pdf_component))
+                pdf = (double)pdf_component;
+        } else if (!reverse_pdf && pr->pdf_area > 0.0f && std::isfinite(pr->pdf_area)) {
             pdf = (double)pr->pdf_area;
         } else {
             const Eigen::Vector3d p0(sampler_from.pos[0],
@@ -328,20 +349,19 @@ struct T5ConnContext {
         double pdf_sa = 0.0;
         if ((pr->flags & BDPT_PDF_FLAG_EMISSION) != 0u) {
             pdf_sa = cos_out / M_PI;
-        } else if ((pr->flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
-            if (!(diffuse_p > 0.0)) return false;
-            pdf_sa = diffuse_p * cos_out / M_PI;
-        } else if ((pr->flags & BDPT_PDF_FLAG_GGX) != 0u) {
-            if (!(spec_p > 0.0)) return false;
+        } else {
+            if ((pr->flags & BDPT_PDF_FLAG_DIFFUSE) != 0u && diffuse_p > 0.0)
+                pdf_sa += diffuse_p * cos_out / M_PI;
+            if ((pr->flags & BDPT_PDF_FLAG_GGX) != 0u && spec_p > 0.0) {
             const double alpha = static_cast<double>(
                 surf_cache_ggx_alpha(ps->st->surf_cache, from.mat_idx));
-            if (!(alpha > 1.0e-3)) return false;
-            const Eigen::Vector3d in_dir(from.dir_in[0],
-                                         from.dir_in[1],
-                                         from.dir_in[2]);
-            pdf_sa = spec_p * ggx_pdf_solid_angle(n0, in_dir, d, alpha);
-        } else {
-            return false;
+                if (alpha > 1.0e-3) {
+                    const Eigen::Vector3d in_dir(from.dir_in[0],
+                                                 from.dir_in[1],
+                                                 from.dir_in[2]);
+                    pdf_sa += spec_p * ggx_pdf_solid_angle(n0, in_dir, d, alpha);
+                }
+            }
         }
 
         if (!(pdf_sa > 0.0) || !std::isfinite(pdf_sa)) return false;
@@ -368,9 +388,59 @@ struct T5ConnContext {
         return true;
     }
 
-    bool visible(const BdptVertexRecord& a, const BdptVertexRecord& b) const
+    double endpoint_response(const BdptVertexRecord& v, int band,
+                             const Eigen::Vector3d& out_dir,
+                             bool sensor_endpoint = false) const
+    {
+        const BdptPdfRecord* pr = pdf_for(v.subpath_id, v.vertex_index);
+        if (!pr) return 0.0;
+        /* The camera endpoint is a measurement response, not a surface BRDF.
+         * Its directional support is represented by the launch PDF/MIS chain. */
+        if (sensor_endpoint) return 1.0;
+        if (v.mat_idx < 0) return 1.0;
+        Eigen::Vector3d n(v.normal[0], v.normal[1], v.normal[2]);
+        Eigen::Vector3d wi(v.dir_in[0], v.dir_in[1], v.dir_in[2]);
+        const Eigen::Vector3d wo = out_dir.normalized();
+        const double cos_out = std::max(0.0, n.dot(wo));
+        if (cos_out <= 0.0) return 0.0;
+        if ((pr->flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) return 0.0;
+        if ((pr->flags & BDPT_PDF_FLAG_EMISSION) != 0u) return 1.0;
+
+        const double refl = std::abs(mat_cache_refl(ps->st->mat_cache, v.mat_idx, band));
+        if (!(refl > 0.0)) return 0.0;
+        const double dp = std::clamp(
+            static_cast<double>(mat_cache_diffusion(ps->st->mat_cache, v.mat_idx)), 0.0, 1.0);
+        double response = 0.0;
+        if ((pr->flags & BDPT_PDF_FLAG_DIFFUSE) != 0u && dp > 0.0)
+            response += refl * dp / M_PI;
+        if ((pr->flags & BDPT_PDF_FLAG_GGX) != 0u) {
+            const double sp = std::max(0.0, 1.0 - dp);
+            const double alpha = static_cast<double>(
+                surf_cache_ggx_alpha(ps->st->surf_cache, v.mat_idx));
+            const Eigen::Vector3d V = (-wi).normalized();
+            const double NoV = std::max(0.0, n.dot(V));
+            const double NoL = std::max(0.0, n.dot(wo));
+            Eigen::Vector3d H = V + wo;
+            const double h2 = H.squaredNorm();
+            if (sp > 0.0 && alpha > 1.0e-3 && NoV > 0.0 && NoL > 0.0 && h2 > 1.0e-20) {
+                H /= std::sqrt(h2);
+                const double NoH = std::max(0.0, n.dot(H));
+                const double VoH = std::max(0.0, V.dot(H));
+                if (NoH > 0.0 && VoH > 1.0e-12) {
+                    const double D = ggx_D(alpha, NoH);
+                    const double G = ggx_G1(alpha, NoV) * ggx_G1(alpha, NoL);
+                    response += sp * refl * D * G / std::max(4.0 * NoV * NoL, 1.0e-12);
+                }
+            }
+        }
+        return (response > 0.0 && std::isfinite(response)) ? response : 0.0;
+    }
+
+    bool visible_with_glass(const BdptVertexRecord& a, const BdptVertexRecord& b,
+                            std::vector<double>& glass_t) const
     {
         const RayTracerState& st = *ps->st;
+        glass_t.assign(static_cast<size_t>(n_bands), 1.0);
         if (st.bvh_nodes.empty()) return true;
         Eigen::Vector3d p0(a.pos[0], a.pos[1], a.pos[2]);
         Eigen::Vector3d p1(b.pos[0], b.pos[1], b.pos[2]);
@@ -378,14 +448,37 @@ struct T5ConnContext {
         const double dist = d.norm();
         if (dist <= 1e-9) return false;
         d /= dist;
-        const Eigen::Vector3d orig = p0 + d * (T_SELF * 16.0);
         const Eigen::Vector3d inv(1.0 / d.x(), 1.0 / d.y(), 1.0 / d.z());
-        double t_min = std::max(0.0, dist - T_SELF * 32.0);
-        int hit_tri = -1;
-        bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
-                  orig, d, inv, t_min, hit_tri);
-        if (hit_tri < 0) return true;
-        return hit_tri == a.tri_id || hit_tri == b.tri_id;
+        Eigen::Vector3d orig = p0 + d * (T_SELF * 16.0);
+        double remaining = std::max(0.0, dist - T_SELF * 32.0);
+        for (int crossing = 0; crossing < 64 && remaining > T_SELF; ++crossing) {
+            double t_hit = remaining;
+            int hit_tri = -1;
+            bvh_query(st.bvh_nodes, st.bvh_tri_ids, st.tris,
+                      orig, d, inv, t_hit, hit_tri);
+            if (hit_tri < 0) return true;
+            const Triangle& tri = st.tris[static_cast<size_t>(hit_tri)];
+            if (hit_tri != a.tri_id && hit_tri != b.tri_id) {
+                if ((tri.flags & MAT_FLAG_TRANSMISSIVE) == 0) return false;
+                const bool front = d.dot(tri.normal) < 0.0;
+                const int m1 = front ? tri.medium_pos_mat_idx : tri.medium_neg_mat_idx;
+                const int m2 = front ? tri.medium_neg_mat_idx : tri.medium_pos_mat_idx;
+                const double ci = std::clamp(std::abs(d.dot(tri.normal)), 0.0, 1.0);
+                for (int band = 0; band < n_bands; ++band) {
+                    const double n1 = (m1 >= 0) ? std::max(1.0e-10, (double)mat_band_record(st,m1,band)[7]) : 1.0;
+                    const double n2 = (m2 >= 0) ? std::max(1.0e-10, (double)mat_band_record(st,m2,band)[7]) : 1.0;
+                    const double sin2_t = (n1/n2)*(n1/n2)*(1.0-ci*ci);
+                    if (sin2_t > 1.0) { glass_t[static_cast<size_t>(band)] = 0.0; continue; }
+                    const double ct = std::sqrt(std::max(0.0, 1.0-sin2_t));
+                    glass_t[static_cast<size_t>(band)] *=
+                        std::sqrt(std::max(0.0, 1.0-fresnel_R(ci,ct,n1,n2)));
+                }
+            }
+            const double advance = t_hit + T_SELF * 16.0;
+            orig += d * advance;
+            remaining -= advance;
+        }
+        return remaining <= T_SELF;
     }
 
     /* ─── MIS density ────────────────────────────────────────────────── */
@@ -498,11 +591,11 @@ struct T5ConnContext {
      * into pixel_accum.  Returns without side-effects if any filter fails. */
     void try_connect_pair(
         const BdptSubpathView&  cam,      size_t ci,
-        const BdptVertexRecord& c,        double beta_cam,
+        const BdptVertexRecord& c,
         const BdptSubpathView&  light,    size_t li,
         BdptCandidateScratch&   scratch,
         T5ThreadAccum&          acc,
-        double&                 pixel_accum) const
+        double& out_r, double& out_g, double& out_b) const
     {
         const BdptVertexRecord& l = *light.v[li];
         if (!vertex_connectable(l))  return;
@@ -520,16 +613,14 @@ struct T5ConnContext {
         const float geom  = cos_c * cos_l / dist2;
         if (geom < t5_min_geom) return;
 
-        const double beta_light = beta_scalar_val(l);
-        if (beta_light < 1e-15) return;
-
-        const bool is_visible = visible(c, l);
-
         double strategy_pdf = 0.0, denom = 0.0;
         if (!candidate_strategy_density(cam, ci, light, li, scratch,
                                          strategy_pdf, denom))
             return;
         const double mis_weight = strategy_pdf / denom;
+
+        std::vector<double> glass_t;
+        const bool is_visible = visible_with_glass(c, l, glass_t);
 
         BdptConnectionRecord cr{};
         cr.camera_subpath_id   = c.subpath_id;
@@ -554,41 +645,61 @@ struct T5ConnContext {
         acc.conn_batch.push_back(cr);
         if (acc.conn_batch.size() >= 4096) flush_connections(acc);
         if (!is_visible) return;
+        ++acc.visible_pairs;
 
-        /* ── B.0 INVARIANT: betas are carried UN-NORMALISED ──────────────────
-         * beta_cam / beta_light are raw amplitude magnitudes — T3 scaled them
-         * by interface factors only, never dividing by the scatter PDF (see the
-         * dispersive-split site in ray_tracer.cpp).  This accumulation is the
-         * balance-heuristic estimator: geom/strategy_pdf · mis_weight collapses
-         * to geom/denom (mis_weight = strategy_pdf/denom), i.e. all sampling-PDF
-         * normalisation is deferred to this single division.  The T3 amplitude
-         * scale and this `/denom` are a MATCHED PAIR — dividing betas by a PDF
-         * in T3 would double-count; change one only if you change the other. */
-        pixel_accum += beta_cam * beta_light * (double)geom / strategy_pdf * mis_weight;
+        /* Identical spectral contract to t5_full_connect: bands overlap by
+         * index, both endpoint BSDFs are evaluated for the actual connection
+         * direction, and transmissive crossings apply per-band Fresnel
+         * amplitude.  Cross-band scalar products are forbidden. */
+        const Eigen::Vector3d c_to_l(cx, cy, cz);
+        const Eigen::Vector3d l_to_c(-cx, -cy, -cz);
+        const double scale = (double)geom / strategy_pdf * mis_weight;
+        for (int band = 0; band < n_bands; ++band) {
+            const double cb = beta_band_val(c, band);
+            const double lb = beta_band_val(l, band);
+            if (!(cb > 0.0 && lb > 0.0)) continue;
+            ++acc.overlapping_bands;
+            const double cf = endpoint_response(c, band, c_to_l,
+                                                 ci == 0 && c.stream == BDPT_SIDE_SENSOR);
+            const double lf = endpoint_response(l, band, l_to_c);
+            if (cf > 0.0) ++acc.camera_response_bands;
+            if (lf > 0.0) ++acc.light_response_bands;
+            const double gt = glass_t[static_cast<size_t>(band)];
+            const double value = cb * lb * cf * lf * gt * scale;
+            if (!(value > 0.0) || !std::isfinite(value)) continue;
+            ++acc.positive_bands;
+            double wr=0.0, wg=0.0, wb=0.0;
+            band_to_display_rgb(band, n_bands, t5_freq_hz, wr, wg, wb);
+            out_r += value * wr;
+            out_g += value * wg;
+            out_b += value * wb;
+        }
     }
 
-    /* Per-camera-vertex spectral colourisation then pixel accumulation. */
-    void accum_pixel_color(const BdptVertexRecord& c, double pixel_accum,
-                            T5ThreadAccum& acc, size_t px) const
+    /* Same normalized 2x2 sensor tent as the GPU shader. */
+    void splat_sensor_tent(const BdptVertexRecord& c, double r, double g, double b,
+                           T5ThreadAccum& acc) const
     {
-        double wr = 0.0, wg = 0.0, wb = 0.0, total_b = 0.0;
-        for (int b = 0; b < n_bands; ++b) {
-            const uint64_t k = ((uint64_t)c.subpath_id   << 32)
-                             | ((uint64_t)c.vertex_index  << 16)
-                             | (uint64_t)b;
-            auto it = beta_lut.find(k);
-            if (it == beta_lut.end()) continue;
-            const double bm = std::abs(it->second);
-            double bwr, bwg, bwb;
-            band_to_display_rgb(b, n_bands, t5_freq_hz, bwr, bwg, bwb);
-            wr += bm * bwr; wg += bm * bwg; wb += bm * bwb;
-            total_b += bm;
+        if (!(r + g + b > 0.0)) return;
+        const double fy = (c.sensor_origin_y + ps->sensor_half_w) * inv_w - 0.5;
+        const double fz = (c.sensor_origin_z + ps->sensor_half_h) * inv_h - 0.5;
+        const int y0 = (int)std::floor(fy), z0 = (int)std::floor(fz);
+        double wsum = 0.0;
+        for (int dy=0; dy<=1; ++dy) for (int dz=0; dz<=1; ++dz) {
+            const int iy=y0+dy, iz=z0+dz;
+            if (iy<0 || iy>=res || iz<0 || iz>=res) continue;
+            wsum += std::max(0.0,1.0-std::abs((double)iy-fy))
+                  * std::max(0.0,1.0-std::abs((double)iz-fz));
         }
-        if (total_b > 1e-30) { wr /= total_b; wg /= total_b; wb /= total_b; }
-        else                 { wr = wg = wb = 1.0 / 3.0; }
-        acc.sensor_r[px] += pixel_accum * wr;
-        acc.sensor_g[px] += pixel_accum * wg;
-        acc.sensor_b[px] += pixel_accum * wb;
+        if (!(wsum > 0.0)) return;
+        for (int dy=0; dy<=1; ++dy) for (int dz=0; dz<=1; ++dz) {
+            const int iy=y0+dy, iz=z0+dz;
+            if (iy<0 || iy>=res || iz<0 || iz>=res) continue;
+            const double w=(std::max(0.0,1.0-std::abs((double)iy-fy))
+                           *std::max(0.0,1.0-std::abs((double)iz-fz)))/wsum;
+            const size_t px=(size_t)iy*(size_t)res+(size_t)iz;
+            acc.sensor_r[px]+=r*w; acc.sensor_g[px]+=g*w; acc.sensor_b[px]+=b*w;
+        }
     }
 };
 
@@ -658,20 +769,17 @@ inline void run_t5_allpairs(
                         const BdptVertexRecord& c = *cam.v[ci];
                         if (!ctx.vertex_connectable(c)) continue;
                         if (!cam.prefix_valid[ci])      continue;
-                        const int iy = static_cast<int>((c.sensor_origin_y + ctx.ps->sensor_half_w) * iw);
-                        const int iz = static_cast<int>((c.sensor_origin_z + ctx.ps->sensor_half_h) * ih);
-                        if (iy < 0 || iy >= r || iz < 0 || iz >= r) continue;
-                        const double beta_cam = ctx.beta_scalar_val(c);
-                        if (beta_cam < 1e-15) continue;
+                        const double fy = (c.sensor_origin_y + ctx.ps->sensor_half_w) * iw - 0.5;
+                        const double fz = (c.sensor_origin_z + ctx.ps->sensor_half_h) * ih - 0.5;
+                        if (fy < -1.0 || fy > r || fz < -1.0 || fz > r) continue;
 
-                        double pixel_accum = 0.0;
+                        double pixel_r = 0.0, pixel_g = 0.0, pixel_b = 0.0;
                         for (size_t li = 0; li < light.v.size(); ++li)
-                            ctx.try_connect_pair(cam, ci, c, beta_cam, light, li,
-                                                  scratch, acc, pixel_accum);
+                            ctx.try_connect_pair(cam, ci, c, light, li,
+                                                  scratch, acc, pixel_r, pixel_g, pixel_b);
 
-                        if (pixel_accum > 0.0) {
-                            ctx.accum_pixel_color(c, pixel_accum, acc,
-                                                   static_cast<size_t>(iy * r + iz));
+                        if (pixel_r + pixel_g + pixel_b > 0.0) {
+                            ctx.splat_sensor_tent(c, pixel_r, pixel_g, pixel_b, acc);
                             ++acc.exact_count;
                         }
                     }
@@ -691,8 +799,9 @@ inline void run_t5_allpairs(
     hb_fut.get();
     /* All worker futures have joined — safe to read accumulator data now. */
     {
-        double   energy = 0.0;
-        uint64_t exact  = 0;
+        double energy = 0.0;
+        uint64_t exact = 0, visible = 0, overlap = 0;
+        uint64_t camera_response = 0, light_response = 0, positive = 0;
         for (const auto& a : accums) {
             if (!a.sensor_r.empty()) {
                 energy +=
@@ -704,9 +813,22 @@ inline void run_t5_allpairs(
                         a.sensor_b.data(), (Eigen::Index)a.sensor_b.size()).sum();
             }
             exact += a.exact_count;
+            visible += a.visible_pairs;
+            overlap += a.overlapping_bands;
+            camera_response += a.camera_response_bands;
+            light_response += a.light_response_bands;
+            positive += a.positive_bands;
         }
-        fprintf(stderr, "[T5-allpairs] done  energy=%.3e  exact=%llu\n",
-                energy, (unsigned long long)exact);
+        fprintf(stderr,
+                "[T5-allpairs] done energy_rgb=%.3e visible_pairs=%llu "
+                "overlap_bands=%llu camera_response=%llu light_response=%llu "
+                "positive_bands=%llu legacy_exact=%llu\n",
+                energy, (unsigned long long)visible,
+                (unsigned long long)overlap,
+                (unsigned long long)camera_response,
+                (unsigned long long)light_response,
+                (unsigned long long)positive,
+                (unsigned long long)exact);
         fflush(stderr);
     }
     if (ep) std::rethrow_exception(ep);

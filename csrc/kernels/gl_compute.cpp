@@ -65,6 +65,8 @@ PFNGLGENVERTEXARRAYSPROC    glc_GenVertexArrays    = nullptr;
 PFNGLBINDVERTEXARRAYPROC    glc_BindVertexArray    = nullptr;
 PFNGLDELETEVERTEXARRAYSPROC glc_DeleteVertexArrays = nullptr;
 
+PFNGLGETINTEGERI_VPROC      glc_GetIntegeri_v      = nullptr;
+
 /* ── Platform-specific implementation ───────────────────────────────────── */
 
 #ifdef _WIN32
@@ -313,6 +315,8 @@ bool gl_compute_load_procs(void) {
     LOAD(glc_BindVertexArray,  PFNGLBINDVERTEXARRAYPROC,  glBindVertexArray)
     LOAD(glc_DeleteVertexArrays,PFNGLDELETEVERTEXARRAYSPROC,glDeleteVertexArrays)
 #undef LOAD
+    /* Best-effort (GL 3.0 core; never gate context creation on it). */
+    glc_GetIntegeri_v = (PFNGLGETINTEGERI_VPROC)gl_get_proc("glGetIntegeri_v");
     return true;
 }
 

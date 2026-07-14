@@ -1,0 +1,42 @@
+{
+  "order": "C:\\Users\\alber\\Downloads\\spectral-analyzer\\configs\\scene_orders\\glyph_a_red_gloss.json",
+  "runtime": {
+    "width": 64,
+    "height": 64,
+    "focal_mm": 35.0,
+    "aperture_mm": 25.0,
+    "iso": 100.0,
+    "exposure_time_s": 0.016666666666666666,
+    "pair_budget": 20000000
+  },
+  "compile": {
+    "job_id": "glyph_A",
+    "token": "A",
+    "plane_triangles": 12,
+    "glyph_triangles": 2136,
+    "retained_base_triangles": 100720,
+    "total_triangles": 102868,
+    "material_names": [
+      "matte_black",
+      "glossy_red"
+    ],
+    "flash_scale": 1.0
+  },
+  "bounds_min": [
+    -0.01600000075995922,
+    -0.25999999046325684,
+    -0.344400018453598
+  ],
+  "bounds_max": [
+    1.357699990272522,
+    0.25999999046325684,
+    0.20999999344348907
+  ],
+  "source_triangles": 2784,
+  "camera_groups": {
+    "sensor": 24384,
+    "aperture_blocker": 29184,
+    "thin_lens": 24576,
+    "object": 2148
+  }
+}

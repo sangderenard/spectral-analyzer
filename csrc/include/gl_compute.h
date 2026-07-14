@@ -163,6 +163,9 @@ typedef unsigned int   GLbitfield;
 #ifndef GL_UNSIGNED_INT
 #  define GL_UNSIGNED_INT                 0x1405
 #endif
+#ifndef GL_MAX_COMPUTE_WORK_GROUP_COUNT
+#  define GL_MAX_COMPUTE_WORK_GROUP_COUNT 0x91BE
+#endif
 
 typedef ptrdiff_t  GLintptr;
 typedef ptrdiff_t  GLsizeiptr;
@@ -285,6 +288,9 @@ typedef void    (APIENTRY* PFNGLGENVERTEXARRAYSPROC)(GLsizei n, GLuint* arrays);
 typedef void    (APIENTRY* PFNGLBINDVERTEXARRAYPROC)(GLuint array);
 typedef void    (APIENTRY* PFNGLDELETEVERTEXARRAYSPROC)(GLsizei n, const GLuint* arrays);
 
+/* GL 3.0 indexed-integer query */
+typedef void    (APIENTRY* PFNGLGETINTEGERI_VPROC)(GLenum target, GLuint index, GLint* data);
+
 /* ── Extern declarations for each function pointer ──────────────────────── */
 
 extern PFNGLGENBUFFERSPROC          glc_GenBuffers;
@@ -334,6 +340,10 @@ extern PFNGLTEXSTORAGE3DPROC        glc_TexStorage3D;
 extern PFNGLGENVERTEXARRAYSPROC     glc_GenVertexArrays;
 extern PFNGLBINDVERTEXARRAYPROC     glc_BindVertexArray;
 extern PFNGLDELETEVERTEXARRAYSPROC  glc_DeleteVertexArrays;
+
+/* Indexed-integer query (GL 3.0+) — used for GL_MAX_COMPUTE_WORK_GROUP_COUNT.
+ * Loaded best-effort: may be nullptr on exotic drivers; callers must check. */
+extern PFNGLGETINTEGERI_VPROC       glc_GetIntegeri_v;
 
 /* ── Convenience aliases matching standard GL names ─────────────────────── */
 /* Use the glc_ prefix to avoid symbol conflicts with any other GL headers. */

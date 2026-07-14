@@ -74,11 +74,84 @@ import traceback
 import tracemalloc
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Optional
 
 import numpy as np
 
 import _spectral_kernels as _sk  # type: ignore[import]
+
+
+def _verify_native_bdpt_contract() -> None:
+    """Fail loudly if a stale native module predating the BDPT parity fixes loaded."""
+    required = ("BDPT_PDF_FLAG_SENSOR", "MAT_FLAG_TRANSMISSIVE")
+    missing = [name for name in required if not hasattr(_sk, name)]
+    module_path = os.path.abspath(str(getattr(_sk, "__file__", "<unknown>")))
+    if missing:
+        raise RuntimeError(
+            f"stale _spectral_kernels at {module_path}; missing {', '.join(missing)}. "
+            "Rebuild the Release _spectral_kernels target before rendering."
+        )
+    if int(_sk.BDPT_PDF_FLAG_SENSOR) != (1 << 22):
+        raise RuntimeError(f"incompatible BDPT sensor endpoint ABI in {module_path}")
+    print(f"[native-module] {module_path} bdpt_contract=sensor-endpoint-v1", flush=True)
+
+
+def _native_bdpt_work_units(width: int, height: int, aperture_samples: int,
+                            requested_packages: int = 1,
+                            primary_ray_cap: int = 200_000) -> tuple[list[tuple[int, int]], dict[str, int]]:
+    """Partition one immutable pixel×aperture sweep on whole-pixel boundaries.
+
+    Offsets are schedule ordinals consumed by ``submit_sensor_sweep``.  Keeping
+    all pupil samples for a pixel in one unit makes the native 32×32 Morton
+    work tiles spatially coherent and prevents package boundaries from changing
+    the light field halfway through a pixel.
+    """
+    w = int(max(1, width))
+    h = int(max(1, height))
+    n_ap = int(max(1, aperture_samples))
+    pixels = int(w * h)
+    cap = int(max(n_ap, primary_ray_cap))
+    cap_pixels = int(max(1, cap // n_ap))
+    auto_packages = int(max(1, math.ceil(pixels / cap_pixels)))
+    n_packages = int(min(pixels, max(1, requested_packages, auto_packages)))
+    pixels_per_unit = int(max(1, math.ceil(pixels / n_packages)))
+    # The ceil distribution can exceed cap_pixels if the requested package
+    # count happened to land awkwardly.  Use the hard cap as the final arbiter.
+    pixels_per_unit = int(min(pixels_per_unit, cap_pixels))
+    units: list[tuple[int, int]] = []
+    for pixel_start in range(0, pixels, pixels_per_unit):
+        pixel_count = min(pixels_per_unit, pixels - pixel_start)
+        units.append((int(pixel_start * n_ap), int(pixel_count * n_ap)))
+    return units, {
+        "pixels": pixels,
+        "aperture_samples": n_ap,
+        "schedule_rays": int(pixels * n_ap),
+        "work_units": len(units),
+        "pixels_per_unit": pixels_per_unit,
+        "max_primary_rays_per_unit": int(pixels_per_unit * n_ap),
+        "sensor_rgb_bytes": int(pixels * 3 * np.dtype(np.float32).itemsize),
+    }
+
+def _native_sensor_to_display(img: np.ndarray) -> np.ndarray:
+    """Reorient the native square sensor accumulator into display convention.
+
+    The native GPU/CPU sensor buffer is Y-major: element [iy, iz] holds the
+    sensor-plane position (y, z) where iy runs along world +Y (camera right)
+    and iz along world +Z (camera up) — see sensor_terminal_splat.comp.glsl
+    (`pix = iy * sensor_res + iz`) and ray_pipeline_submit_sensor_sweep.
+        Display convention uses Z as rows and Y as columns.  Therefore the only
+        storage conversion is D[row_z, column_y] = img[iy, iz].  An earlier
+        horizontal flip happened to leave a single "A" looking plausible but
+        reversed multi-glyph text ("AXE" became "EXA").  Optical inversion is
+        already represented by the traced paths; applying it again at readback is
+        incorrect.  This is a pure storage reorientation; transport is untouched.
+    """
+    a = np.asarray(img)
+    if a.ndim != 3 or a.shape[0] != a.shape[1]:
+        return a
+    return np.ascontiguousarray(a.transpose(1, 0, 2))
+
 
 from camera_exposure_budget import (
     CameraOptics,
@@ -289,6 +362,7 @@ DEFAULT_FILM = FilmExposure(
 # visible) so RAM stays manageable; the unified mat_buf still allocates 32
 # slots per material with the unused tail zeroed.
 DEFAULT_FREQ_HZ = (C_LIGHT / np.linspace(700e-9, 400e-9, 8)).astype(np.float64)
+_SHADER_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "csrc", "shaders")
 
 ENABLE_EXPOSURE_PROFILING = False
 
@@ -474,6 +548,12 @@ class TracerScene:
             self.total_emissive_power_W, self.total_emissive_area_m2)
 
 
+# Optional subject-scene override compiled from a declarative scene order.
+# It still contains the proven thick-lens lab camera/lens/flash groups; only
+# the replaceable subject geometry and authored materials differ.
+_ORDERED_THICK_LENS_SCENE: Optional[TracerScene] = None
+
+
 _LUMA = np.array([0.2126, 0.7152, 0.0722], np.float32)
 
 
@@ -598,6 +678,262 @@ def _build_camera_rig_mesh(
     return verts_flat, normals, mat_idx, groups_np
 
 
+def _build_thick_lens_lab_tracer_scene() -> TracerScene:
+    """Materialise the articulated thick-lens lab scene as a TracerScene.
+
+    This is intentionally sourced from thick_lens_focus_lab.py instead of the
+    orbiters/basic-rasterizer adapter, so exposure_render_demo can exercise the
+    same material database, lens geometry, iris/aperture blocker, image plate,
+    and emissive source set as the real lab simulator.
+    """
+    if _ORDERED_THICK_LENS_SCENE is not None:
+        return _ORDERED_THICK_LENS_SCENE
+
+    import thick_lens_focus_lab as tll
+
+    cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".spectral_cache")
+    cache_path = os.path.join(cache_dir, "thick_lens_exposure_scene_v3.npz")
+    cache_stamp = np.asarray([
+        3.0,
+        float(os.path.getmtime(tll.__file__)),
+        float(DEFAULT_FREQ_HZ.size),
+    ], dtype=np.float64)
+    try:
+        with np.load(cache_path, allow_pickle=False) as cached:
+            if np.array_equal(cached["cache_stamp"], cache_stamp):
+                print(f"[scene-cache] loaded {cache_path}", flush=True)
+                return TracerScene(
+                    verts=np.ascontiguousarray(cached["verts"]),
+                    normals=np.ascontiguousarray(cached["normals"]),
+                    mat_idx=np.ascontiguousarray(cached["mat_idx"]),
+                    mat_buf=np.ascontiguousarray(cached["mat_buf"]),
+                    mat_n_mats=int(cached["mat_n_mats"][0]),
+                    src_pos=np.ascontiguousarray(cached["src_pos"]),
+                    src_dir=np.ascontiguousarray(cached["src_dir"]),
+                    src_directivity=np.ascontiguousarray(cached["src_directivity"]),
+                    src_area_m2=np.ascontiguousarray(cached["src_area_m2"]),
+                    src_emit_W=np.ascontiguousarray(cached["src_emit_W"]),
+                    src_emit_rgb_W=np.ascontiguousarray(cached["src_emit_rgb_W"]),
+                    src_tri_idx=np.ascontiguousarray(cached["src_tri_idx"]),
+                    bounds_min=np.ascontiguousarray(cached["bounds_min"]),
+                    bounds_max=np.ascontiguousarray(cached["bounds_max"]),
+                    camera_tri_groups={
+                        "sensor": np.ascontiguousarray(cached["group_sensor"]),
+                        "aperture_blocker": np.ascontiguousarray(cached["group_aperture"]),
+                        "thin_lens": np.ascontiguousarray(cached["group_lens"]),
+                        "object": np.ascontiguousarray(cached["group_object"]),
+                    },
+                )
+    except (OSError, KeyError, ValueError) as exc:
+        print(f"[scene-cache] rebuild required: {exc}", flush=True)
+
+    lab_scene = tll.SceneConfig()
+    sidecar = tll.FreeFrequencySidecar.lazy_prepare(int(DEFAULT_FREQ_HZ.size))
+    (
+        verts_flat, normals, mat_idx, tri_arr, db,
+        source_ids, lens_front_ids, lens_back_ids, image_plate_ids,
+        aperture_stop_ids, _tube_wall_ids, _lens_surface_groups,
+        object_ids, _tube_baffle_ids, _camera_barrel_ids,
+        _camera_rear_cap_ids, _camera_front_cap_ids, _camera_frustum_ids,
+        red_probe_ids, _diffuser_wave_specs, _subject_group_tri_map,
+    ) = tll._build_scene_mesh(lab_scene, sidecar)
+
+    verts_flat = np.ascontiguousarray(verts_flat, dtype=np.float64)
+    normals = np.ascontiguousarray(normals, dtype=np.float64)
+    mat_idx = np.ascontiguousarray(mat_idx, dtype=np.int32)
+    tri_arr = np.ascontiguousarray(tri_arr, dtype=np.float64)
+    mat_buf = np.ascontiguousarray(db.build_mat_buf(), dtype=np.float32)
+    mat_n_mats = int(mat_buf.shape[0] // MAX_SPECTRAL_BANDS)
+
+    source_ids = np.asarray(source_ids, dtype=np.int32).reshape(-1)
+    red_probe_ids = np.asarray(red_probe_ids, dtype=np.int32).reshape(-1)
+    emitter_ids = np.unique(
+        np.concatenate([source_ids, red_probe_ids]).astype(np.int32, copy=False)
+    )
+    emitter_ids = emitter_ids[(emitter_ids >= 0) & (emitter_ids < int(tri_arr.shape[0]))]
+    if emitter_ids.size == 0:
+        raise RuntimeError("thick-lens lab scene produced no emissive source triangles")
+
+    e1 = tri_arr[:, 1] - tri_arr[:, 0]
+    e2 = tri_arr[:, 2] - tri_arr[:, 0]
+    cr = np.cross(e1, e2)
+    area = (0.5 * np.linalg.norm(cr, axis=1)).astype(np.float64)
+    centroid = tri_arr.mean(axis=1).astype(np.float64)
+
+    pts_all = tri_arr.reshape(-1, 3)
+    mat_safe = mat_idx.clip(0, max(0, int(mat_n_mats) - 1))
+    mat_rows = mat_buf.reshape(mat_n_mats, MAX_SPECTRAL_BANDS, -1)
+    n_active_bands = int(DEFAULT_FREQ_HZ.size)
+    spectral_emission = mat_rows[mat_safe, :n_active_bands, 5].astype(np.float64, copy=False)
+    src_spectral_power = spectral_emission[emitter_ids] * area[emitter_ids, None]
+    src_power = np.sum(np.maximum(src_spectral_power, 0.0), axis=1)
+    if not np.any(src_power > 0.0):
+        raise RuntimeError("thick-lens lab scene produced emissive triangles with zero spectral emission")
+    src_rgb = _bands_to_rgb(src_spectral_power.T[:, :, None], DEFAULT_FREQ_HZ)[:, 0, :].astype(np.float64)
+    src_rgb *= src_power[:, None]
+    camera_tri_groups = {
+        "sensor": np.ascontiguousarray(image_plate_ids, dtype=np.int32),
+        "aperture_blocker": np.ascontiguousarray(aperture_stop_ids, dtype=np.int32),
+        "thin_lens": np.ascontiguousarray(
+            np.unique(np.concatenate([
+                np.asarray(lens_front_ids, dtype=np.int32).reshape(-1),
+                np.asarray(lens_back_ids, dtype=np.int32).reshape(-1),
+            ])),
+            dtype=np.int32,
+        ),
+        "object": np.ascontiguousarray(object_ids, dtype=np.int32),
+    }
+
+    result = TracerScene(
+        verts=verts_flat,
+        normals=normals,
+        mat_idx=mat_idx,
+        mat_buf=mat_buf,
+        mat_n_mats=mat_n_mats,
+        src_pos=np.ascontiguousarray(centroid[emitter_ids], dtype=np.float64),
+        src_dir=np.ascontiguousarray(normals[emitter_ids], dtype=np.float64),
+        src_directivity=np.ones(emitter_ids.size, dtype=np.float64),
+        src_area_m2=np.ascontiguousarray(area[emitter_ids], dtype=np.float64),
+        src_emit_W=np.ascontiguousarray(src_power, dtype=np.float64),
+        src_emit_rgb_W=np.ascontiguousarray(src_rgb, dtype=np.float64),
+        src_tri_idx=np.ascontiguousarray(emitter_ids, dtype=np.int32),
+        bounds_min=np.ascontiguousarray(pts_all.min(axis=0), dtype=np.float32),
+        bounds_max=np.ascontiguousarray(pts_all.max(axis=0), dtype=np.float32),
+        camera_tri_groups=camera_tri_groups,
+    )
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        np.savez_compressed(
+            cache_path,
+            cache_stamp=cache_stamp,
+            verts=result.verts, normals=result.normals, mat_idx=result.mat_idx,
+            mat_buf=result.mat_buf,
+            mat_n_mats=np.asarray([result.mat_n_mats], np.int32),
+            src_pos=result.src_pos, src_dir=result.src_dir,
+            src_directivity=result.src_directivity, src_area_m2=result.src_area_m2,
+            src_emit_W=result.src_emit_W, src_emit_rgb_W=result.src_emit_rgb_W,
+            src_tri_idx=result.src_tri_idx,
+            bounds_min=result.bounds_min, bounds_max=result.bounds_max,
+            group_sensor=camera_tri_groups["sensor"],
+            group_aperture=camera_tri_groups["aperture_blocker"],
+            group_lens=camera_tri_groups["thin_lens"],
+            group_object=camera_tri_groups["object"],
+        )
+        print(f"[scene-cache] wrote {cache_path}", flush=True)
+    except OSError as exc:
+        print(f"[scene-cache] write skipped: {exc}", flush=True)
+    return result
+
+
+def _is_thick_lens_lab_scene_mode(scene_mode: str) -> bool:
+    return str(scene_mode) in ("thick-lens", "thick-lens-lab", "thick_lens_lab")
+
+
+def _build_thick_lens_lab_camera_package(
+    scene: TracerScene,
+    width: int,
+    height: int,
+    optics: CameraOptics,
+) -> tuple[PhysicalCameraRig, Any]:
+    cam_groups = scene.camera_tri_groups
+    sensor_ids = np.asarray(cam_groups.get("sensor", np.zeros((0,), np.int32)), dtype=np.int32)
+    if sensor_ids.size == 0:
+        raise RuntimeError("thick-lens lab camera requires non-empty sensor tri group")
+    sensor_pts = scene.verts[sensor_ids].reshape(-1, 3)
+    sensor_center = sensor_pts.mean(axis=0).astype(np.float64)
+    sensor_half_w = 0.5 * float(np.max(sensor_pts[:, 1]) - np.min(sensor_pts[:, 1]))
+    sensor_half_h = 0.5 * float(np.max(sensor_pts[:, 2]) - np.min(sensor_pts[:, 2]))
+
+    aperture_ids = np.asarray(cam_groups.get("aperture_blocker", np.zeros((0,), np.int32)), dtype=np.int32)
+    if aperture_ids.size > 0:
+        aperture_pts = scene.verts[aperture_ids].reshape(-1, 3)
+        aperture_center = aperture_pts.mean(axis=0).astype(np.float64)
+        aperture_center[1] = 0.0
+        aperture_center[2] = 0.0
+        aperture_radial = np.linalg.norm(aperture_pts[:, 1:3] - aperture_center[1:3], axis=1)
+        positive = aperture_radial[aperture_radial > 1.0e-6]
+        aperture_radius_m = float(np.min(positive)) if positive.size else float(optics.aperture_mm) * 0.5e-3
+    else:
+        aperture_center = np.array([sensor_center[0] - max(float(optics.focal_mm) * 1.0e-3, 1.0e-3), 0.0, 0.0], np.float64)
+        aperture_radius_m = float(optics.aperture_mm) * 0.5e-3
+
+    fwd = np.array([-1.0, 0.0, 0.0], np.float64)
+    up = np.array([0.0, 0.0, 1.0], np.float64)
+    focal_m = max(1.0e-4, float(sensor_center[0] - aperture_center[0]))
+    sensor_w_m = max(1.0e-4, 2.0 * sensor_half_w)
+    sensor_h_m = max(1.0e-4, 2.0 * sensor_half_h)
+    fov_y = 2.0 * math.atan2(sensor_h_m * 0.5, focal_m)
+    focus_distance_m = max(1.0e-4, float(sensor_center[0] - scene.bounds_min[0]))
+
+    cam = PhysicalCameraRig(
+        pos=np.ascontiguousarray(sensor_center, dtype=np.float64),
+        fwd=fwd,
+        up=up,
+        fov_y_rad=float(fov_y),
+        width=int(width),
+        height=int(height),
+        sensor_plane_offset_m=0.0,
+        aperture_plane_offset_m=float(focal_m),
+        focal_m=float(focal_m),
+        aperture_radius_m=max(1.0e-6, float(aperture_radius_m)),
+    )
+    cam.sensor_w_m = float(sensor_w_m)
+    cam.sensor_h_m = float(sensor_h_m)
+
+    error_degree = SimpleNamespace(
+        pinhole_target_sensor_z_m=0.0,
+        pinhole_comparison_mm=0.0,
+        overall=0.0,
+        thin_lens_target_sensor_z_m=0.0,
+        pinhole_comparison_degree=0.0,
+        sensor_plane_degree=0.0,
+        focus_distance_degree=0.0,
+        coc_degree=0.0,
+        ev_degree=0.0,
+        thin_lens_residual_diopter=0.0,
+    )
+    solved = SimpleNamespace(
+        camera=cam,
+        iterations=0,
+        sanity_input=SimpleNamespace(
+            sensor_plane_z_m=0.0,
+            aperture_rail_z_m=float(focal_m),
+            aperture_plane_offset_m=float(focal_m),
+            aperture_radius_m=float(aperture_radius_m),
+            aperture_shift_x_mm=0.0,
+            aperture_shift_y_mm=0.0,
+            focus_distance_m=float(focus_distance_m),
+            lens_center_z_m=float(focal_m),
+            lens_front_shift_x_mm=0.0,
+            lens_front_shift_y_mm=0.0,
+            lens_front_tilt_x_deg=0.0,
+            lens_front_tilt_y_deg=0.0,
+            sensor_shift_x_mm=0.0,
+            sensor_shift_y_mm=0.0,
+            lens_front_plane_z_m=float(focal_m),
+            lens_rear_plane_z_m=float(focal_m),
+            sensor_corner_tl_mm=0.0,
+            sensor_corner_tr_mm=0.0,
+            sensor_corner_bl_mm=0.0,
+            sensor_corner_br_mm=0.0,
+        ),
+        sanity_report=SimpleNamespace(
+            status="lab_native",
+            geometry_ok=True,
+            circle_of_confusion_um=0.0,
+            sensor_adjustment_needed_mm=0.0,
+            warnings=[],
+            failures=[],
+            planes=SimpleNamespace(
+                effective_focal_m=float(focal_m),
+                focal_plane_z_m=float(focus_distance_m),
+            ),
+            error_degree=error_degree,
+        ),
+    )
+    return cam, solved
+
+
 def _build_tracer_scene(t: float, scene_mode: str = "orbiters",
                         cam: Optional[PhysicalCameraRig] = None,
                         solved: Optional[Any] = None,
@@ -609,6 +945,9 @@ def _build_tracer_scene(t: float, scene_mode: str = "orbiters",
     buffer that both backends index by ``mat_idx[tri] * MAX_SPECTRAL_BANDS
     + band``.
     """
+    if _is_thick_lens_lab_scene_mode(scene_mode):
+        return _build_thick_lens_lab_tracer_scene()
+
     preview_gems = (scene_mode == CAMERA_SOLVE_PREVIEW_SCENE)
     base_scene_mode = "orbiters" if preview_gems else scene_mode
 
@@ -1062,6 +1401,8 @@ class CppExposureBackend(ExposureBackend):
         self._adaptive_mode = str(kw.pop("adaptive_mode", "stochastic")).strip().lower()
         if self._adaptive_mode not in ("stochastic", "quota", "uniform"):
             self._adaptive_mode = "stochastic"
+        self._t5_min_geom = float(kw.pop("t5_min_geom", -1.0))
+        self._gpu_resident = bool(kw.pop("gpu_resident", False))
         self._bdpt_intermediate_mode = str(kw.pop("bdpt_intermediate_mode", "memory")).strip().lower()
         if self._bdpt_intermediate_mode not in ("memory", "file"):
             self._bdpt_intermediate_mode = "memory"
@@ -1087,6 +1428,14 @@ class CppExposureBackend(ExposureBackend):
             speed_m_s  = float(C_LIGHT),
             atmo_abs   = self.atmo_abs,
         )
+
+        if self._t5_min_geom > 0.0 and hasattr(self.tracer, "set_t5_min_geom"):
+            self.tracer.set_t5_min_geom(self._t5_min_geom)
+            print(f"[config] C++ tracer t5_min_geom={self._t5_min_geom:.1e}")
+        if self._gpu_resident and hasattr(self.tracer, "set_gpu_skip_record_readback"):
+            self.tracer.set_gpu_skip_record_readback(True)
+            print("[config] C++ tracer GPU-resident BDPT enabled")
+
         self._src_tri_verts = np.ascontiguousarray(
             self.scene.verts[self.scene.src_tri_idx].reshape(-1, 3, 3),
             np.float64,
@@ -1096,6 +1445,7 @@ class CppExposureBackend(ExposureBackend):
         self._sensor_camera_desc: Optional[dict] = None
         self._bdpt_dynamic_cap_hint: int = int(self._bdpt_initial_cap_hint)
         self._bdpt_last_overflow_path: Optional[str] = None
+        self._native_sensor_image: Optional[np.ndarray] = None
         self.sensor_uv_hits = np.zeros((cam.height, cam.width), np.float32)
         self.sensor_uv_thin_lens_hits = np.zeros((cam.height, cam.width), np.float32)
         
@@ -1106,6 +1456,7 @@ class CppExposureBackend(ExposureBackend):
 
     def reset_exposure(self) -> None:
         super().reset_exposure()
+        self._native_sensor_image = None
         self.sensor_uv_hits.fill(0.0)
         self.sensor_uv_thin_lens_hits.fill(0.0)
 
@@ -1449,6 +1800,190 @@ class CppExposureBackend(ExposureBackend):
             self.cleanup_overflow_temp_file()
             cap = int(next_cap)
 
+    def run_thick_lens_native_bdpt(self,
+                                   *,
+                                   emitter_tri_ids: np.ndarray,
+                                   total_rays: int,
+                                   sensor_rays_per_batch: int,
+                                   n_aperture_samples: int,
+                                   max_children: int,
+                                   seed: int,
+                                   exposure_weight: float = 1.0,
+                                   sweep_offset: int = 0,
+                                   sweep_count: int = 0) -> np.ndarray:
+        """Run one lab-standard native BDPT package and return sensor RGB.
+
+        sweep_offset/sweep_count select a slice of the (pixel × aperture)
+        schedule so callers can split one exposure into several flash+sensor
+        T5 cycles.  One cycle's BDPT records must fit the GPU record caps
+        (~6.9M vertices); a full sweep at high render res (e.g. 1024² × 8
+        aperture samples = 8.4M rays) overflows them, which silently drops
+        pdf records, invalidates the MIS chains, and zeroes the connect
+        output.  sweep_count=0 sweeps the full remaining grid (legacy).
+        """
+        required = (
+            "submit_emissive_triangles",
+            "signal_flash_dispatched",
+            "begin_sensor_batching",
+            "submit_sensor_sweep",
+            "signal_sensor_dispatched",
+            "join_t5",
+            "end_sensor_batching",
+            "get_sensor_image",
+        )
+        missing = [name for name in required if not hasattr(self.tracer, name)]
+        if missing:
+            raise RuntimeError(
+                "native thick-lens BDPT requires RayTracer methods: " + ", ".join(missing)
+            )
+
+        tri_ids = np.ascontiguousarray(emitter_tri_ids, dtype=np.int32).reshape(-1)
+        if tri_ids.size <= 0:
+            raise RuntimeError("native thick-lens BDPT requires at least one emissive triangle")
+        if self._sensor_camera_desc is None:
+            raise RuntimeError("native thick-lens BDPT requires a registered sensor camera descriptor")
+
+        n_ap = int(max(1, n_aperture_samples))
+        n_px = int(self._sensor_camera_desc.get("n_px", self.cam.width))
+        n_py = int(self._sensor_camera_desc.get("n_py", self.cam.height))
+        schedule_total = int(max(1, n_px) * max(1, n_py) * n_ap)
+        # submit_emissive_triangles consumes its ray count PER UV DOMAIN (UV
+        # group of emitter tris), NOT per triangle.  This scene's 2784 emitter
+        # tris span ~6 UV domains, so dividing total_rays by tri count (the old
+        # code) launched ~1 ray per tri (~3K rays total) and produced almost no
+        # light-subpath vertices — the T5 connect had nothing to connect to.
+        # The lab uses uv_emitter_rays = 32_000 per domain ("Total ray count =
+        # uv_emitter_rays (not per-triangle)", thick_lens_focus_lab.py:5505),
+        # yielding ~1.1M light vertices per cycle.  Match it.
+        emitter_rays_per_domain = 32_000
+        slice_start = int(max(0, min(int(sweep_offset), schedule_total)))
+        slice_end = (schedule_total if int(sweep_count) <= 0
+                     else int(min(schedule_total, slice_start + int(sweep_count))))
+        slice_total = int(max(0, slice_end - slice_start))
+        if slice_total <= 0:
+            raise RuntimeError(
+                f"native thick-lens BDPT sweep slice is empty "
+                f"(offset={slice_start} count={sweep_count} schedule={schedule_total})"
+            )
+        sensor_batch = int(max(1, min(int(sensor_rays_per_batch), slice_total)))
+        max_children = int(max(1, max_children))
+        if hasattr(self.tracer, "set_max_children"):
+            self.tracer.set_max_children(max_children)
+
+        print(
+            "  [bdpt-native-lab] workload "
+            f"sensor={n_px}x{n_py} aperture_samples={n_ap} "
+            f"primary_camera_rays={slice_total:,}/{schedule_total:,} "
+            f"emit_tris={int(tri_ids.size)} rays_per_domain={emitter_rays_per_domain} "
+            f"slice={slice_start:,}..{slice_end:,} batch={sensor_batch:,}"
+        )
+
+        # min_amplitude=0.0 is the lab's single-photon mode (--sensor-min-amp
+        # default): bounce chains are never amplitude-killed, so faint light
+        # subpaths survive to become connectable vertices.  The session-level
+        # self.min_amplitude (1e-3) is for the streaming integrators, not this
+        # lab-parity path.
+        submitted_flash = int(self.tracer.submit_emissive_triangles(
+            tri_ids,
+            int(emitter_rays_per_domain),
+            float(max(0.0, exposure_weight)),
+            1.0,
+            int(self.max_bounces),
+            0.0,
+            int(max_children),
+            int(seed),
+            bool(self._gpu_resident),
+            bool(self._gpu_resident),
+            _SHADER_DIR,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        ))
+        self.tracer.signal_flash_dispatched()
+        if submitted_flash <= 0:
+            raise RuntimeError("native thick-lens BDPT submitted no flash rays")
+
+        submitted_sensor = 0
+        self.tracer.begin_sensor_batching()
+        try:
+            pix_offset = slice_start
+            while pix_offset < slice_end:
+                n_submit = int(self.tracer.submit_sensor_sweep(
+                    max_bounces=int(self.max_bounces),
+                    min_amplitude=0.0,  # lab single-photon mode (see flash submit)
+                    max_rays=int(min(sensor_batch, slice_end - pix_offset)),
+                    pix_offset=int(pix_offset),
+                    max_children=int(max_children),
+                    aperture_samples=int(n_ap),
+                    seed=int(seed),
+                    exposure_weight=float(max(0.0, exposure_weight)),
+                ))
+                if n_submit <= 0:
+                    break
+                submitted_sensor += n_submit
+                pix_offset += n_submit
+            if submitted_sensor < slice_total:
+                raise RuntimeError(
+                    "native thick-lens BDPT sensor sweep did not cover its slice "
+                    f"({submitted_sensor}/{slice_total}, slice {slice_start}..{slice_end})"
+                )
+            self.tracer.signal_sensor_dispatched()
+            if hasattr(self.tracer, "in_flight_count"):
+                deadline = time.perf_counter() + 10.0
+                while time.perf_counter() < deadline:
+                    if int(self.tracer.in_flight_count()) == 0:
+                        break
+                    time.sleep(0.002)
+            self.tracer.join_t5()
+            latch = (self.tracer.get_bdpt_latch_state()
+                     if hasattr(self.tracer, "get_bdpt_latch_state") else {})
+            img = _native_sensor_to_display(
+                np.asarray(self.tracer.get_sensor_image(), dtype=np.float32))
+            valid_shape = img.ndim == 3 and img.shape[2] >= 3
+            rgb = img[..., :3] if valid_shape else np.empty((0, 0, 3), np.float32)
+            finite = bool(rgb.size and np.all(np.isfinite(rgb)))
+            energy = np.sum(np.maximum(rgb, 0.0), axis=2) if finite else np.empty(0, np.float32)
+            lit_px = int(np.count_nonzero(energy > 1.0e-8)) if energy.size else 0
+            total_px = int(energy.size)
+            peak = float(np.max(rgb)) if finite and rgb.size else 0.0
+            mean = float(np.mean(rgb)) if finite and rgb.size else 0.0
+            print(
+                "  [bdpt-native-lab] sensor result "
+                f"shape={tuple(img.shape)} finite={finite} "
+                f"lit={lit_px}/{total_px} ({100.0 * lit_px / max(1, total_px):.2f}%) "
+                f"mean={mean:.3e} peak={peak:.3e} latch={dict(latch)}",
+                flush=True,
+            )
+            if not valid_shape or not finite or lit_px == 0:
+                # An empty sensor for one pass must NOT abort a multi-frame run.
+                # The T5 connect can complete (millions of pairs) yet land no
+                # signal in the sensor readback for a given frame; degrade to the
+                # last good image (or black) and keep going instead of raising.
+                print(
+                    "  [bdpt-native-lab] FAILED: transport produced no usable sensor pixels "
+                    f"(flash={submitted_flash} sensor={submitted_sensor} "
+                    f"latch={dict(latch)}). Displaying the previous frame or black; "
+                    "this is not a completed render.",
+                    flush=True,
+                )
+                if (getattr(self, "_native_sensor_image", None) is not None
+                        and np.asarray(self._native_sensor_image).size > 0):
+                    return self._native_sensor_image
+                _res = int(img.shape[0]) if (img.ndim == 3 and img.shape[0] > 0) else 1
+                self._native_sensor_image = np.zeros((_res, _res, 3), dtype=np.float32)
+                return self._native_sensor_image
+            self._native_sensor_image = np.ascontiguousarray(np.clip(img[..., :3], 0.0, 1.0), dtype=np.float32)
+            self.n_rays_accumulated += int(submitted_flash) + int(submitted_sensor)
+            print(
+                "  [bdpt-native-lab] usable image "
+                f"flash={submitted_flash:,} sensor={submitted_sensor:,} "
+                f"lit={lit_px}/{total_px} mean={mean:.3e} peak={peak:.3e}"
+            )
+            return self._native_sensor_image
+        finally:
+            self.tracer.end_sensor_batching()
+
     def scatter_bdpt_records(self, recs: np.ndarray, sensor_group_id: int) -> None:
         """Scatter EndpointRecord rows into surf_accum (sensor hits) and field_accum (scene).
 
@@ -1674,6 +2209,7 @@ class ExposureFrameResult:
     n_rays_emitted:     int
     n_batches:          int
     measured_H_J:       float
+    measurement_status: str
     target_H_J:         float
     gain_linear:        float
     gain_db:            float
@@ -1690,6 +2226,7 @@ class ExposureFrameResult:
     field_capture_strikes_path: str
     summary_path:       str
     frame_config_summary: dict
+    native_sensor_evidence: dict
     image_data:         Optional[np.ndarray] = None  # (H, W, 3) float32 [0,1]
     image16_data:       Optional[np.ndarray] = None  # (H, W, 3) uint16 for 16-bit
     field_integrated_data: Optional[np.ndarray] = None  # (B, H, W)
@@ -2399,7 +2936,14 @@ class ExposureSession:
                  bdpt_intermediate_mode: str = "file",
                  bdpt_intermediate_max_bytes: int = 0,
                  retain_bdpt_intermediate: bool = False,
-                 bdpt_intermediate_dir: Optional[str] = None):
+                 bdpt_intermediate_dir: Optional[str] = None,
+                 t5_min_geom: float = -1.0,
+                 t5_pair_budget: int = 200_000_000,
+                 vcm_enabled: bool = True,
+                 vcm_radius_mm: float = 2.0,
+                 vcm_radius_alpha: float = 0.7,
+                 gpu_resident: bool = False,
+                 bdpt_native_packages: int = 1):
         self.optics = optics
         self.film   = film
         self.width  = int(width)
@@ -2414,6 +2958,10 @@ class ExposureSession:
         self.integrator = str(integrator)
         requested_bdpt_cap = int(bdpt_records_cap)
         self.scene_mode = str(scene_mode)
+        self.t5_pair_budget = max(0, int(t5_pair_budget))
+        self.vcm_enabled = bool(vcm_enabled)
+        self.vcm_radius_mm = max(1.0e-4, float(vcm_radius_mm))
+        self.vcm_radius_alpha = min(1.0, max(1.0e-4, float(vcm_radius_alpha)))
         self.scene_mode_schedule = tuple(str(s) for s in scene_mode_schedule) if scene_mode_schedule else None
         self.profile_enabled = bool(profile_enabled)
         self._profiler = StageProfiler(self.profile_enabled)
@@ -2470,6 +3018,14 @@ class ExposureSession:
         )
         self.retain_bdpt_intermediate = bool(retain_bdpt_intermediate)
         self.bdpt_intermediate_dir = str(bdpt_intermediate_dir or out_dir)
+        self.t5_min_geom = float(t5_min_geom)
+        self.gpu_resident = bool(gpu_resident)
+        # Number of flash+sensor packages per exposure in the native thick-lens
+        # path.  >1 splits the ray budget over repeated cycles in the SAME
+        # accumulation, so each cycle adds new data points and the C++ T5
+        # backlog can work previously deferred high-score pairs with a budget
+        # share that grows with backlog age.
+        self.bdpt_native_packages = int(max(1, bdpt_native_packages))
         hard_cap_records = max(1, _bdpt_cap_from_bytes(_BDPT_INTERMEDIATE_HARD_CAP_BYTES))
         if requested_bdpt_cap > 0:
             self.bdpt_records_cap = max(4096, min(requested_bdpt_cap, hard_cap_records))
@@ -2983,6 +3539,8 @@ class ExposureSession:
                 bdpt_intermediate_max_bytes = self.bdpt_intermediate_max_bytes,
                 retain_bdpt_intermediate = self.retain_bdpt_intermediate,
                 bdpt_initial_cap_hint = self._bdpt_cap_hint_global,
+                t5_min_geom = self.t5_min_geom,
+                gpu_resident = self.gpu_resident,
             )
             if hasattr(cpp_b.tracer, "set_camera_visibility"):
                 cv = frame_cfg.camera_visibility
@@ -2997,6 +3555,22 @@ class ExposureSession:
                     cpp_b.tracer.set_profile_pulse(True, 2.0)
                 except Exception as exc:
                     print(f"  [warn] native profile pulse enable failed: {exc}")
+            if self.profile_enabled and hasattr(cpp_b.tracer, "set_t5_profile"):
+                cpp_b.tracer.set_t5_profile(True)
+                print("  [t5-profile] GPU connection rejection counters enabled")
+            if hasattr(cpp_b.tracer, "set_t5_pair_budget"):
+                cpp_b.tracer.set_t5_pair_budget(self.t5_pair_budget)
+                print(f"[config] C++ tracer t5_pair_budget={self.t5_pair_budget:,}")
+            if hasattr(cpp_b.tracer, "set_vcm"):
+                cpp_b.tracer.set_vcm(
+                    self.vcm_enabled,
+                    self.vcm_radius_mm * 1.0e-3,
+                    self.vcm_radius_alpha,
+                )
+                print(
+                    f"[config] spectral VCM={'on' if self.vcm_enabled else 'off'} "
+                    f"radius={self.vcm_radius_mm:g} mm alpha={self.vcm_radius_alpha:g}"
+                )
             fc = frame_cfg.field_capture
             if fc.enabled and hasattr(cpp_b.tracer, "enable_field_capture_regular"):
                 bmin = np.asarray(scene.bounds_min, np.float32)
@@ -3052,6 +3626,41 @@ class ExposureSession:
                     raise RuntimeError(detail) from exc
             backends["cpp"] = cpp_b
         if "glsl" in self.backends_requested:
+            # GLSL backend is a scaffold — not yet implemented for ray tracing.
+            # When BDPT/backward/forward is the integrator and no cpp backend
+            # was explicitly requested, inject a shadow C++ backend to provide
+            # the actual BDPT computation. The GLSL backend mirrors its
+            # accumulators and the output loop suppresses the cpp output file.
+            if (self.integrator in ("forward", "backward", "bdpt")
+                    and cpp_b is None):
+                print("  [glsl-bdpt] GLSL backend is a scaffold; "
+                      "injecting shadow C++ backend for ray computation")
+                try:
+                    cpp_b = CppExposureBackend(
+                        scene, cam, self.freq_hz,
+                        max_bounces              = self.max_bounces,
+                        min_amplitude            = 1.0e-3,
+                        atmo_abs_db_per_m        = 0.0,
+                        adaptive_mode            = self.adaptive_allocation_mode,
+                        bdpt_intermediate_mode   = self.bdpt_intermediate_mode,
+                        bdpt_intermediate_dir    = self.bdpt_intermediate_dir,
+                        bdpt_intermediate_max_bytes = self.bdpt_intermediate_max_bytes,
+                        retain_bdpt_intermediate = self.retain_bdpt_intermediate,
+                        bdpt_initial_cap_hint    = self._bdpt_cap_hint_global,
+                        t5_min_geom              = self.t5_min_geom,
+                        gpu_resident             = self.gpu_resident,
+                    )
+                    if hasattr(cpp_b.tracer, "set_camera_visibility"):
+                        cv = frame_cfg.camera_visibility
+                        cpp_b.tracer.set_camera_visibility(
+                            camera_vis_mode    = int(cv.camera_vis_mode),
+                            transparent_mode   = int(cv.transparent_mode),
+                            depth_cull_enabled = bool(cv.depth_cull_enabled),
+                            depth_cull_m       = float(cv.depth_cull_m),
+                        )
+                    backends["cpp"] = cpp_b
+                except Exception as exc:
+                    print(f"  [warn] shadow C++ backend creation failed: {exc}")
             backends["glsl"] = GlslExposureBackend(
                 scene, cam, self.freq_hz,
                 max_bounces  = self.max_bounces,
@@ -3520,13 +4129,39 @@ class ExposureSession:
                     img = sensor_rgb
                     rgb_linear = sensor_rgb.copy()
             elif self.rgb_source == "sensor":
-                self._warn_missing_rgb_source_once(
-                    source="sensor",
-                    backend=str(backend_name),
-                    context=f"batch={int(batch_index)}",
-                )
-                img = np.zeros_like(img, dtype=np.float32)
-                rgb_linear = np.zeros_like(rgb_linear, dtype=np.float32)
+                # GPU-resident native path: surf_accum stays empty (no CPU
+                # PIXEL_CONE scatter), so there is no sensor integral object —
+                # but the tracer's native sensor image IS the sensor result.
+                # Mirror the fallback used by the final-save path instead of
+                # forcing the per-batch snapshot to black.
+                _native_img = None
+                _snap_cpp = back
+                if (isinstance(back, GlslExposureBackend)
+                        and isinstance(getattr(back, "_mirror", None), CppExposureBackend)
+                        and bool(getattr(back._mirror, "_gpu_resident", False))):
+                    _snap_cpp = back._mirror
+                if (isinstance(_snap_cpp, CppExposureBackend)
+                        and bool(getattr(_snap_cpp, "_gpu_resident", False))):
+                    _snap_tracer = getattr(_snap_cpp, "tracer", None)
+                    if _snap_tracer is not None and hasattr(_snap_tracer, "get_sensor_image"):
+                        _cached = getattr(_snap_cpp, "_native_sensor_image", None)
+                        _cand = (np.asarray(_cached) if _cached is not None
+                                 else _native_sensor_to_display(
+                                     np.asarray(_snap_tracer.get_sensor_image())))
+                        if _cand.ndim == 3 and _cand.shape[2] >= 3 and np.any(_cand[..., :3]):
+                            _native_img = np.clip(_cand[..., :3], 0.0, 1.0).astype(
+                                np.float32, copy=False)
+                if _native_img is not None:
+                    img = _native_img
+                    rgb_linear = _native_img.copy()
+                else:
+                    self._warn_missing_rgb_source_once(
+                        source="sensor",
+                        backend=str(backend_name),
+                        context=f"batch={int(batch_index)}",
+                    )
+                    img = np.zeros_like(img, dtype=np.float32)
+                    rgb_linear = np.zeros_like(rgb_linear, dtype=np.float32)
 
             if self._pinhole_accum is not None and self._pinhole_accum.size > 0:
                 try:
@@ -3611,6 +4246,15 @@ class ExposureSession:
                 return None
 
             if surf_accum is None or surf_accum.size == 0 or not np.any(surf_accum):
+                native_img = getattr(back, "_native_sensor_image", None)
+                if native_img is not None and np.asarray(native_img).ndim == 3 and np.any(np.asarray(native_img)[..., :3]):
+                    return None
+                # GLSL scaffold backed by a gpu-resident C++ mirror: the output
+                # loop fetches the image from the mirror's tracer, so no warning.
+                if (isinstance(back, GlslExposureBackend)
+                        and isinstance(getattr(back, "_mirror", None), CppExposureBackend)
+                        and bool(getattr(back._mirror, "_gpu_resident", False))):
+                    return None
                 print("  [warn] surf_accum empty; proper PIXEL_CONE sensor path unavailable")
                 return None
 
@@ -3941,6 +4585,7 @@ class ExposureSession:
             frame_cfg.surface_spline = SurfaceSplineConfig(enabled=False)
 
         scene_mode = self._scene_mode_for_frame()
+        prebuilt_scene: Optional[TracerScene] = None
         if scene_mode == CAMERA_SOLVE_PREVIEW_SCENE:
             frame_cfg = FrameConfig(
                 field_capture=FieldCaptureConfig(
@@ -3969,51 +4614,67 @@ class ExposureSession:
                 detail_level=1,
             )
         with self._profiler.section("build_camera"):
-            _scene_center = np.asarray(scene_mod.SCENE_CENTER, np.float64)
-            _eye_base = np.array([0.0, 0.0, 0.0], np.float64)
-            _to_scene = _scene_center - _eye_base
-            _to_scene_norm = float(np.linalg.norm(_to_scene))
-            if _to_scene_norm > 1.0e-12:
-                _eye_dir = -(_to_scene / _to_scene_norm)
+            if _is_thick_lens_lab_scene_mode(scene_mode):
+                prebuilt_scene = _build_tracer_scene(
+                    t,
+                    scene_mode=scene_mode,
+                    cam=None,
+                    solved=None,
+                    optics=self.optics,
+                )
+                cam, solved = _build_thick_lens_lab_camera_package(
+                    prebuilt_scene,
+                    self.width,
+                    self.height,
+                    self.optics,
+                )
+                self._camera_pinhole_target_sensor_z_m = 0.0
             else:
-                _eye_dir = np.array([0.0, 0.0, -1.0], np.float64)
-            # Move the camera 1.5 m farther from the scene center.
-            _eye = _eye_base + (1.5 * _eye_dir)
+                _scene_center = np.asarray(scene_mod.SCENE_CENTER, np.float64)
+                _eye_base = np.array([0.0, 0.0, 0.0], np.float64)
+                _to_scene = _scene_center - _eye_base
+                _to_scene_norm = float(np.linalg.norm(_to_scene))
+                if _to_scene_norm > 1.0e-12:
+                    _eye_dir = -(_to_scene / _to_scene_norm)
+                else:
+                    _eye_dir = np.array([0.0, 0.0, -1.0], np.float64)
+                # Move the camera 1.5 m farther from the scene center.
+                _eye = _eye_base + (1.5 * _eye_dir)
 
-            solved = solve_sane_camera_rig(
-                camera_cls=PhysicalCameraRig,
-                width=self.width,
-                height=self.height,
-                optics=self.optics,
-                film=self.film,
-                scene_center=_scene_center,
-                eye=_eye,
-                max_iters=self.camera_solve_max_iters,
-                seed=self.camera_solve_seed_base,
-                rail_model=self.camera_rail_model,
-            )
-            cam = solved.camera
-            cam.sensor_plane_offset_m = float(solved.sanity_input.sensor_plane_z_m)
-            cam.aperture_plane_offset_m = float(
-                solved.sanity_input.aperture_rail_z_m
-                if solved.sanity_input.aperture_rail_z_m is not None
-                else solved.sanity_input.aperture_plane_offset_m
-            )
-            cam.focal_m = float(solved.sanity_report.planes.effective_focal_m)
-            cam.aperture_radius_m = max(
-                1.0e-6,
-                float(
-                    solved.sanity_input.aperture_radius_m
-                    if solved.sanity_input.aperture_radius_m is not None
-                    else (float(self.optics.aperture_mm) * 0.5 * 1.0e-3)
-                ),
-            )
-            self._camera_pinhole_target_sensor_z_m = float(
-                solved.sanity_report.error_degree.pinhole_target_sensor_z_m
-            )
+                solved = solve_sane_camera_rig(
+                    camera_cls=PhysicalCameraRig,
+                    width=self.width,
+                    height=self.height,
+                    optics=self.optics,
+                    film=self.film,
+                    scene_center=_scene_center,
+                    eye=_eye,
+                    max_iters=self.camera_solve_max_iters,
+                    seed=self.camera_solve_seed_base,
+                    rail_model=self.camera_rail_model,
+                )
+                cam = solved.camera
+                cam.sensor_plane_offset_m = float(solved.sanity_input.sensor_plane_z_m)
+                cam.aperture_plane_offset_m = float(
+                    solved.sanity_input.aperture_rail_z_m
+                    if solved.sanity_input.aperture_rail_z_m is not None
+                    else solved.sanity_input.aperture_plane_offset_m
+                )
+                cam.focal_m = float(solved.sanity_report.planes.effective_focal_m)
+                cam.aperture_radius_m = max(
+                    1.0e-6,
+                    float(
+                        solved.sanity_input.aperture_radius_m
+                        if solved.sanity_input.aperture_radius_m is not None
+                        else (float(self.optics.aperture_mm) * 0.5 * 1.0e-3)
+                    ),
+                )
+                self._camera_pinhole_target_sensor_z_m = float(
+                    solved.sanity_report.error_degree.pinhole_target_sensor_z_m
+                )
             self._active_cam = cam
         with self._profiler.section("build_scene"):
-            scene = _build_tracer_scene(
+            scene = prebuilt_scene if prebuilt_scene is not None else _build_tracer_scene(
                 t,
                 scene_mode=scene_mode,
                 cam=cam,
@@ -4135,12 +4796,16 @@ class ExposureSession:
         _stream_cover_complete: bool = True
         _stream_covered_n: int = 1
         _stream_hard_cap_batches: int = max(1, int(plan.n_batches))
+        _bdpt_native_lab_active = False
+        _bdpt_native_emitter_tri_ids = np.zeros((0,), dtype=np.int32)
+        _bdpt_native_n_aperture_samples = 1
         if self.integrator in ("forward", "backward", "bdpt") and "cpp" in backs:
             cpp_back = backs["cpp"]  # type: ignore[assignment]
             tracer = getattr(cpp_back, "tracer", None)
             if tracer is not None and hasattr(tracer, "register_tri_group"):
                 tracer.clear_tri_groups()
                 emissive_tris = np.ascontiguousarray(scene.src_tri_idx, dtype=np.int32)
+                _bdpt_native_emitter_tri_ids = emissive_tris.copy()
 
                 # ── Surface spline fitting ────────────────────────────────
                 ss_cfg = frame_cfg.surface_spline
@@ -4296,8 +4961,8 @@ class ExposureSession:
                             "camera tri-group 'sensor' is empty; sensor group registration aborted"
                         )
                     aperture_tris = np.ascontiguousarray(cam_groups.get("aperture_blocker", np.zeros((0,), np.int32)), dtype=np.int32)
-                    sensor_w_m = float(self.optics.sensor_w_mm) * 1.0e-3
-                    sensor_h_m = float(self.optics.sensor_h_mm) * 1.0e-3
+                    sensor_w_m = float(getattr(cam, "sensor_w_m", float(self.optics.sensor_w_mm) * 1.0e-3))
+                    sensor_h_m = float(getattr(cam, "sensor_h_m", float(self.optics.sensor_h_mm) * 1.0e-3))
                     focal_m = max(1.0e-4, float(cam.focal_m))
                     aperture_radius_m = max(1.0e-6, float(cam.aperture_radius_m))
 
@@ -4324,6 +4989,7 @@ class ExposureSession:
                     if n_ap_samples != int(n_ap_requested):
                         print(f"  [bdpt] aperture samples scaled: requested={int(n_ap_requested)} -> using={int(n_ap_samples)}")
                     self._camera_last_n_aperture_samples = int(n_ap_samples)
+                    _bdpt_native_n_aperture_samples = int(n_ap_samples)
                     self._camera_last_cone_half_angle_deg = float(cone_half_deg)
                     self._camera_last_cone_solid_angle_sr = float(cone_solid_angle_sr)
 
@@ -4358,7 +5024,7 @@ class ExposureSession:
                         "fwd": np.asarray(cam.fwd, np.float64),
                         "up":  np.asarray(cam.up,  np.float64),
                         "sensor_w_m":         float(sensor_w_m),
-                        "sensor_h_m":         float(sensor_w_m) * float(self.height) / float(self.width),
+                        "sensor_h_m":         float(sensor_h_m),
                         "focal_m":            float(max(focal_m, 1.0e-3)),
                         "aperture_radius_m":  float(aperture_radius_m),
                         "n_px":               int(self.width),
@@ -4439,6 +5105,37 @@ class ExposureSession:
                     cpp_back = backs.get("cpp")
                     if isinstance(cpp_back, CppExposureBackend):
                         cpp_back._sensor_camera_desc = dict(self._sensor_camera_desc)
+                        if (
+                            bool(getattr(cpp_back, "_gpu_resident", False))
+                            and self.integrator in ("backward", "bdpt")
+                            and hasattr(tracer, "configure_sensor_image")
+                        ):
+                            target_center = np.asarray(
+                                _cam_desc_base.get(
+                                    "lens_center",
+                                    _cam_pos_w + np.asarray(cam.fwd, np.float64) * float(focal_m),
+                                ),
+                                np.float64,
+                            ).reshape(3)
+                            sensor_image_res = int(max(16, int(max(self.width, self.height))))
+                            tracer.configure_sensor_image(
+                                float(_cam_pos_w[0]),
+                                float(sensor_w_m * 0.5),
+                                float(sensor_h_m * 0.5),
+                                int(sensor_image_res),
+                                0.008,
+                                float(target_center[0]),
+                                float(aperture_radius_m),
+                                float(target_center[1]),
+                                float(target_center[2]),
+                                0,
+                            )
+                            print(
+                                "  [gpu-resident] native sensor image configured "
+                                f"res={sensor_image_res} plate_x={float(_cam_pos_w[0]):.4f} "
+                                f"target_x={float(target_center[0]):.4f} "
+                                f"target_r={float(aperture_radius_m)*1e3:.2f}mm"
+                            )
                         
                         # Create optical assembly for this frame's camera configuration
                         try:
@@ -4498,6 +5195,18 @@ class ExposureSession:
                     _stream_cover_complete = (_stream_divisor <= 1)
                     _stream_covered_n = int(_stream_divisor if _stream_cover_complete else 0)
                     _stream_hard_cap_batches = int(max(plan.n_batches, plan.n_batches + max(8, 2 * _stream_divisor)))
+                    _bdpt_native_lab_active = bool(
+                        self.integrator == "bdpt"
+                        and _is_thick_lens_lab_scene_mode(scene_mode)
+                        and isinstance(cpp_back, CppExposureBackend)
+                        and bool(getattr(cpp_back, "_gpu_resident", False))
+                    )
+                    if _bdpt_native_lab_active:
+                        _stream_divisor = 1
+                        _stream_seen = np.ones((1,), dtype=bool)
+                        _stream_cover_complete = True
+                        _stream_covered_n = 1
+                        print("  BDPT: thick-lens lab using native flash/sensor/T5 package")
                     print(f"  {self.integrator.upper()}: streaming {n_emit_pre} emitter groups, "
                           f"~{_bdpt_target_total:_} rays/batch target")
                     print(f"  {self.integrator.upper()}: stream coverage target {max(1, _stream_divisor)} phases before exposure sign-off")
@@ -4547,37 +5256,101 @@ class ExposureSession:
             if _bdpt_stream_active:
                 _cpp = backs.get("cpp")
                 if _cpp is not None:
-                    _emit_rays = self._allocate_bdpt_emit_rays(
-                        cpp_back=_cpp,
-                        emitter_centers=_bdpt_emitter_centers,
-                        target_total_rays=_bdpt_target_total,
-                        seed=int(seed),
-                    )
-                    # Previous batch records are only needed through adaptive
-                    # allocation. Release them before tracing the next batch.
-                    self._discard_last_bdpt_records(clear_emit_counts=True)
-                    _recs = np.ascontiguousarray(_cpp.run_bdpt_batch(_emit_rays, seed), dtype=np.float32)
-                    self._bdpt_cap_hint_global = max(
-                        int(self._bdpt_cap_hint_global),
-                        int(getattr(_cpp, "_bdpt_dynamic_cap_hint", 0)),
-                    )
-                    try:
-                        _cpp.scatter_bdpt_records(_recs, self._sensor_group_id)
-                        self._accumulate_pinhole_records(_recs)
-                    finally:
-                        _cpp.cleanup_overflow_temp_file()
-                    # Store last batch's records for adaptive allocator only.
-                    # Do NOT call _stage_bdpt_records here — it would overwrite
-                    # the intermediary file every batch (the cause of narrow
-                    # noise bands / blank first frame in streaming BDPT mode).
-                    self._last_bdpt_records = _recs
-                    self._last_bdpt_emit_counts = np.asarray(_emit_rays, np.int32)
-                    for _b in backs.values():
-                        if isinstance(_b, GlslExposureBackend):
-                            _b.surf_accum[:]      = _cpp.surf_accum
-                            _b.field_accum[:]     = _cpp.field_accum
-                            _b.accum[:]           = _cpp.accum
-                            _b.n_rays_accumulated = _cpp.n_rays_accumulated
+                    if _bdpt_native_lab_active:
+                        if not isinstance(_cpp, CppExposureBackend):
+                            raise RuntimeError("native thick-lens BDPT requires the C++ exposure backend")
+                        self._discard_last_bdpt_records(clear_emit_counts=True)
+                        # Native work units: each is one flash+sensor T5 cycle
+                        # accumulating into the same global sensor.  The immutable
+                        # pixel×aperture sweep is partitioned on WHOLE-PIXEL
+                        # boundaries so a single cycle's BDPT records stay under
+                        # the GPU record caps —
+                        # one full sweep at high render res (1024²×8 ap = 8.4M
+                        # rays) overflows the ~6.9M vertex cap, drops pdf
+                        # records, invalidates MIS chains, and zeroes the
+                        # connect.  Auto-grow the package count so each slice
+                        # stays cap-safe; --bdpt-native-packages raises it
+                        # further if the user wants more accumulation cycles.
+                        _nap_native = int(max(1, _bdpt_native_n_aperture_samples))
+                        _work_units, _work_plan = _native_bdpt_work_units(
+                            int(self.width), int(self.height), _nap_native,
+                            requested_packages=int(self.bdpt_native_packages),
+                            primary_ray_cap=200_000,
+                        )
+                        _sched_total = int(_work_plan["schedule_rays"])
+                        # Native launchers sample one spectral band per path and
+                        # use a stochastic, band-dispersive Fresnel decision, so
+                        # record growth is linear rather than exponential.
+                        _n_pkgs = len(_work_units)
+                        if b_idx == 0:
+                            print(
+                                "  [bdpt-native-lab] spatial work plan "
+                                f"image={self.width}x{self.height} pixels={_work_plan['pixels']:,} "
+                                f"aperture={_nap_native} schedule={_sched_total:,} "
+                                f"units={_n_pkgs:,} pixels/unit<={_work_plan['pixels_per_unit']:,} "
+                                f"primary/unit<={_work_plan['max_primary_rays_per_unit']:,} "
+                                f"global_sensor={_work_plan['sensor_rgb_bytes'] / (1024.0**2):.2f} MiB; "
+                                "scheduler metadata scales with pixels, not pixel×aperture",
+                                flush=True,
+                            )
+                        _slice_offset, _slice_count = _work_units[int(b_idx)]
+                        if _n_pkgs > 1:
+                            print(f"  [bdpt-native-lab] spatial unit {b_idx + 1}/{_n_pkgs} "
+                                  f"schedule={_slice_offset:,}..{_slice_offset + _slice_count:,} "
+                                  f"({int(_slice_count // _nap_native):,} whole pixels)")
+                        _lab_max_children = 1
+                        _cpp.run_thick_lens_native_bdpt(
+                            emitter_tri_ids=_bdpt_native_emitter_tri_ids,
+                            total_rays=int(max(1, self.total_rays // _n_pkgs)),
+                            sensor_rays_per_batch=int(max(1, rays_per_batch_total)),
+                            n_aperture_samples=_nap_native,
+                            max_children=int(_lab_max_children),
+                            seed=int(seed),
+                            exposure_weight=1.0,
+                            sweep_offset=_slice_offset,
+                            sweep_count=_slice_count,
+                        )
+                        self._last_bdpt_records = np.zeros((0, 16), dtype=np.float32)
+                        self._last_bdpt_emit_counts = np.zeros((0,), dtype=np.int32)
+                        batches_executed = b_idx + 1
+                        b_idx += 1
+                        if b_idx >= _n_pkgs:
+                            _stream_cover_complete = True
+                            _stream_covered_n = 1
+                            break
+                        continue
+                    else:
+                        _emit_rays = self._allocate_bdpt_emit_rays(
+                            cpp_back=_cpp,
+                            emitter_centers=_bdpt_emitter_centers,
+                            target_total_rays=_bdpt_target_total,
+                            seed=int(seed),
+                        )
+                        # Previous batch records are only needed through adaptive
+                        # allocation. Release them before tracing the next batch.
+                        self._discard_last_bdpt_records(clear_emit_counts=True)
+                        _recs = np.ascontiguousarray(_cpp.run_bdpt_batch(_emit_rays, seed), dtype=np.float32)
+                        self._bdpt_cap_hint_global = max(
+                            int(self._bdpt_cap_hint_global),
+                            int(getattr(_cpp, "_bdpt_dynamic_cap_hint", 0)),
+                        )
+                        try:
+                            _cpp.scatter_bdpt_records(_recs, self._sensor_group_id)
+                            self._accumulate_pinhole_records(_recs)
+                        finally:
+                            _cpp.cleanup_overflow_temp_file()
+                        # Store last batch's records for adaptive allocator only.
+                        # Do NOT call _stage_bdpt_records here — it would overwrite
+                        # the intermediary file every batch (the cause of narrow
+                        # noise bands / blank first frame in streaming BDPT mode).
+                        self._last_bdpt_records = _recs
+                        self._last_bdpt_emit_counts = np.asarray(_emit_rays, np.int32)
+                        for _b in backs.values():
+                            if isinstance(_b, GlslExposureBackend):
+                                _b.surf_accum[:]      = _cpp.surf_accum
+                                _b.field_accum[:]     = _cpp.field_accum
+                                _b.accum[:]           = _cpp.accum
+                                _b.n_rays_accumulated = _cpp.n_rays_accumulated
 
                     if _stream_seen is not None and _stream_divisor > 0:
                         _phase = int(seed % int(_stream_divisor))
@@ -4807,6 +5580,8 @@ class ExposureSession:
         # ── Per-backend calibration + dump ───────────────────────────────
         results: list[ExposureFrameResult] = []
         for name, back in backs.items():
+            if name not in self.backends_requested:
+                continue  # shadow backend; skip output
             with self._profiler.section(f"backend_{name}_measure"):
                 measured = back.measured_radiant_exposure_J(plan.energy_per_ray_J)
             with self._profiler.section(f"backend_{name}_gain"):
@@ -4833,6 +5608,58 @@ class ExposureSession:
                 if sensor_obj is not None:
                     img = self._sensor_display_rgb(sensor_obj)
                     rgb_linear = img.copy()
+                elif (
+                    isinstance(back, CppExposureBackend)
+                    and bool(getattr(back, "_gpu_resident", False))
+                    and tracer_obj is not None
+                    and hasattr(tracer_obj, "get_sensor_image")
+                ):
+                    cached_native_img = getattr(back, "_native_sensor_image", None)
+                    native_img = np.asarray(cached_native_img if cached_native_img is not None else tracer_obj.get_sensor_image())
+                    if native_img.ndim == 3 and native_img.shape[2] >= 3 and np.any(native_img[..., :3]):
+                        img = np.clip(native_img[..., :3], 0.0, 1.0).astype(np.float32, copy=False)
+                        rgb_linear = img.copy()
+                    else:
+                        self._warn_missing_rgb_source_once(
+                            source="sensor",
+                            backend=str(name),
+                            context=f"frame={int(self._frame_index)} gpu-resident native sensor image empty",
+                        )
+                        img = np.zeros_like(img, dtype=np.float32)
+                        rgb_linear = np.zeros_like(rgb_linear, dtype=np.float32)
+                elif (
+                    isinstance(back, GlslExposureBackend)
+                    and isinstance(getattr(back, "_mirror", None), CppExposureBackend)
+                    and bool(getattr(back._mirror, "_gpu_resident", False))
+                ):
+                    # GLSL scaffold backed by a shadow C++ backend in gpu-resident
+                    # mode — borrow the native sensor image from the mirror.
+                    _cpp_mirror = back._mirror
+                    _cpp_tracer = getattr(_cpp_mirror, "tracer", None)
+                    if _cpp_tracer is not None and hasattr(_cpp_tracer, "get_sensor_image"):
+                        _cached = getattr(_cpp_mirror, "_native_sensor_image", None)
+                        _native_img = np.asarray(
+                            _cached if _cached is not None else _cpp_tracer.get_sensor_image()
+                        )
+                        if _native_img.ndim == 3 and _native_img.shape[2] >= 3 and np.any(_native_img[..., :3]):
+                            img = np.clip(_native_img[..., :3], 0.0, 1.0).astype(np.float32, copy=False)
+                            rgb_linear = img.copy()
+                        else:
+                            self._warn_missing_rgb_source_once(
+                                source="sensor",
+                                backend=str(name),
+                                context=f"frame={int(self._frame_index)} glsl-mirror native sensor image empty",
+                            )
+                            img = np.zeros_like(img, dtype=np.float32)
+                            rgb_linear = np.zeros_like(rgb_linear, dtype=np.float32)
+                    else:
+                        self._warn_missing_rgb_source_once(
+                            source="sensor",
+                            backend=str(name),
+                            context=f"frame={int(self._frame_index)} glsl-mirror tracer unavailable",
+                        )
+                        img = np.zeros_like(img, dtype=np.float32)
+                        rgb_linear = np.zeros_like(rgb_linear, dtype=np.float32)
                 else:
                     self._warn_missing_rgb_source_once(
                         source="sensor",
@@ -4952,6 +5779,34 @@ class ExposureSession:
                     field_capture_grid_path = ""
                     field_capture_strikes_path = ""
 
+            _native_sensor_mode = bool(
+                isinstance(back, CppExposureBackend)
+                and bool(getattr(back, "_gpu_resident", False))
+                and self.rgb_source == "sensor"
+            )
+            _native_evidence: dict[str, Any] = {}
+            _measurement_status = "radiometric_accumulator"
+            if _native_sensor_mode:
+                _rgb_ev = np.asarray(rgb_linear, dtype=np.float64)
+                _energy_ev = np.sum(np.maximum(_rgb_ev, 0.0), axis=2)
+                _native_evidence = {
+                    "units": "normalized_native_sensor_rgb",
+                    "radiometrically_calibrated": False,
+                    "shape": [int(v) for v in _rgb_ev.shape],
+                    "finite": bool(np.all(np.isfinite(_rgb_ev))),
+                    "lit_pixels": int(np.count_nonzero(_energy_ev > 1.0e-8)),
+                    "total_pixels": int(_energy_ev.size),
+                    "mean": float(np.mean(_rgb_ev)) if _rgb_ev.size else 0.0,
+                    "peak": float(np.max(_rgb_ev)) if _rgb_ev.size else 0.0,
+                    "channel_sums": [float(v) for v in np.sum(_rgb_ev, axis=(0, 1))],
+                }
+                if tracer_obj is not None and hasattr(tracer_obj, "get_bdpt_latch_state"):
+                    _native_evidence["bdpt_latch"] = dict(tracer_obj.get_bdpt_latch_state())
+                _measurement_status = "native_sensor_nonradiometric"
+                frame_config_summary["optical_event_telemetry_status"] = (
+                    "not populated by GPU-resident native BDPT; use native_sensor_evidence"
+                )
+
             r = ExposureFrameResult(
                 frame_index        = self._frame_index,
                 backend            = name,
@@ -4959,6 +5814,7 @@ class ExposureSession:
                 n_rays_emitted     = int(back.n_rays_accumulated),
                 n_batches          = int(batches_executed),
                 measured_H_J       = float(measured),
+                measurement_status = _measurement_status,
                 target_H_J         = float(plan.target_H_J),
                 gain_linear        = float(gain),
                 gain_db            = float(gain_db),
@@ -4975,6 +5831,7 @@ class ExposureSession:
                 field_capture_strikes_path = field_capture_strikes_path,
                 summary_path       = json_path,
                 frame_config_summary = frame_config_summary,
+                native_sensor_evidence = _native_evidence,
                 camera_event_telemetry = back.camera_event_telemetry.to_dict(),
             )
             r.frame_config_summary["convergence_target_pct"] = float(conv_target_pct)
@@ -4985,8 +5842,9 @@ class ExposureSession:
             r.frame_config_summary["convergence_drive_batches"] = bool(conv_drive_batches)
             r.frame_config_summary["optical_event_telemetry"] = back.camera_event_telemetry.to_dict()
 
-            # Burn frame details into the standard preview PNG (8-bit only).
-            # Keep the 16-bit output pristine for numeric post-processing.
+            # HUD text belongs to the live preview only. Saved primary images
+            # remain pristine at every resolution, including tiny acceptance
+            # renders where an overlay would cover the entire frame.
             detail_lv = int(r.frame_config_summary.get("detail_level", 0))
             preview_lines = _make_hud_lines(r, detail_lv) if self.show_hud else []
             img_preview = _burn_overlay_into_preview(img, preview_lines)
@@ -5016,7 +5874,7 @@ class ExposureSession:
             # Only save files if explicitly enabled via --save-files
             if self.save_files:
                 with self._profiler.section(f"backend_{name}_write_files"):
-                    _write_png(png_path, img_preview)
+                    _write_png(png_path, img)
                     _write_png16(png16_path, img)
                     np.save(linear_path, rgb_linear)
 
@@ -5025,10 +5883,18 @@ class ExposureSession:
                 with open(json_path, "w", encoding="utf-8") as fh:
                     json.dump(r_dict, fh, indent=2)
             results.append(r)
-            print(f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
-                f"H_meas={measured:.3e} J  H_targ={plan.target_H_J:.3e} J  "
-                f"gain={gain:.3e}x ({gain_db:+.2f} dB)  "
-                f"photons/pix={photons_per_pix:.2e}  SNR~{snr:.2f}")
+            if _native_sensor_mode:
+                print(
+                    f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
+                    f"native_sensor={_native_evidence['lit_pixels']}/{_native_evidence['total_pixels']} lit  "
+                    f"mean={_native_evidence['mean']:.3e} peak={_native_evidence['peak']:.3e}  "
+                    "H_meas=n/a (native sensor RGB is not radiometrically calibrated)"
+                )
+            else:
+                print(f"  [{name:>4}] N_rays={r.n_rays_emitted:_}  "
+                    f"H_meas={measured:.3e} J  H_targ={plan.target_H_J:.3e} J  "
+                    f"gain={gain:.3e}x ({gain_db:+.2f} dB)  "
+                    f"photons/pix={photons_per_pix:.2e}  SNR~{snr:.2f}")
             if self.save_files:
                 print(f"        -> {png_path}")
             else:
@@ -5046,11 +5912,21 @@ class ExposureSession:
 # ─────────────────────────────────────────────────────────────────────────────
 # Tiny PNG writer — pure stdlib, no Pillow dependency
 # ─────────────────────────────────────────────────────────────────────────────
+def _linear_display_to_srgb(img_hw3: np.ndarray) -> np.ndarray:
+    """Encode linear display RGB with the standard sRGB transfer function."""
+    x = np.clip(np.asarray(img_hw3, dtype=np.float32), 0.0, 1.0)
+    return np.where(
+        x <= np.float32(0.0031308),
+        x * np.float32(12.92),
+        np.float32(1.055) * np.power(x, np.float32(1.0 / 2.4)) - np.float32(0.055),
+    ).astype(np.float32, copy=False)
+
+
 def _write_png(path: str, img_hw3: np.ndarray) -> None:
-    """Encode (H, W, 3) float32 in [0,1] as 8-bit RGB PNG via stdlib zlib."""
+    """Encode linear (H, W, 3) display RGB as an sRGB 8-bit PNG."""
     import struct
     import zlib
-    img = (np.clip(img_hw3, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
+    img = (_linear_display_to_srgb(img_hw3) * 255.0 + 0.5).astype(np.uint8)
     h, w = img.shape[:2]
     raw = b"".join(b"\x00" + img[r].tobytes() for r in range(h))
     def _chunk(tag: bytes, data: bytes) -> bytes:
@@ -5061,15 +5937,15 @@ def _write_png(path: str, img_hw3: np.ndarray) -> None:
     idat = zlib.compress(raw, 9)
     iend = b""
     with open(path, "wb") as fh:
-        fh.write(sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat)
+        fh.write(sig + _chunk(b"IHDR", ihdr) + _chunk(b"sRGB", b"\x00") + _chunk(b"IDAT", idat)
                  + _chunk(b"IEND", iend))
 
 
 def _write_png16(path: str, img_hw3: np.ndarray) -> None:
-    """Encode (H, W, 3) float32 in [0,1] as 16-bit RGB PNG via stdlib zlib."""
+    """Encode linear (H, W, 3) display RGB as an sRGB 16-bit PNG."""
     import struct
     import zlib
-    img = (np.clip(img_hw3, 0.0, 1.0) * 65535.0 + 0.5).astype(">u2", copy=False)
+    img = (_linear_display_to_srgb(img_hw3) * 65535.0 + 0.5).astype(">u2", copy=False)
     h, w = img.shape[:2]
     # PNG 16-bit channels are network-byte-order, already satisfied by >u2.
     raw = b"".join(b"\x00" + img[r].tobytes() for r in range(h))
@@ -5082,7 +5958,7 @@ def _write_png16(path: str, img_hw3: np.ndarray) -> None:
     ihdr = struct.pack(">IIBBBBB", w, h, 16, 2, 0, 0, 0)  # 16-bit RGB
     idat = zlib.compress(raw, 9)
     with open(path, "wb") as fh:
-        fh.write(sig + _chunk(b"IHDR", ihdr) + _chunk(b"IDAT", idat)
+        fh.write(sig + _chunk(b"IHDR", ihdr) + _chunk(b"sRGB", b"\x00") + _chunk(b"IDAT", idat)
                  + _chunk(b"IEND", b""))
 
 
@@ -5821,7 +6697,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
                         "backward = ray tracing from camera pixels (PIXEL_CONE). "
                         "bdpt = bidirectional path tracing with both passes.")
     p.add_argument("--sequence-mode",  choices=("single", "forward-backward-bdpt"),
-                    default="forward-backward-bdpt",
+                    default="single",
                     help="single = use --integrator only. "
                         "forward-backward-bdpt = run forward, backward, then bdpt in sequence.")
     p.add_argument("--bdpt-records-cap", type=int, default=0,
@@ -5839,17 +6715,44 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--bdpt-intermediate-dir", default=None,
                    help="Directory for BDPT file-backed intermediates"
                         " (default: out-dir).")
+    p.add_argument("--t5-min-geom", type=float, default=-1.0,
+                   help="GPU BDPT T5 geometry term floor. Pairs with geometry term < this limit "
+                        "are dropped. Bias/variance knob: trades noise reduction on unoccluded "
+                        "fidelity for throughput. Example: --t5-min-geom 1e-12")
+    p.add_argument("--t5-pair-budget", type=int, default=200_000_000,
+                   help="Maximum full-domain T5 camera-light pairs evaluated per pass; "
+                        "unevaluated work remains explicitly deferred (0 = unlimited).")
+    p.add_argument("--no-vcm", action="store_true",
+                   help="Disable spectral vertex merging and run connection-only BDPT.")
+    p.add_argument("--vcm-radius-mm", type=float, default=2.0,
+                   help="Initial world-space VCM merge radius in millimetres (default 2).")
+    p.add_argument("--vcm-radius-alpha", type=float, default=0.7,
+                   help="Progressive VCM radius parameter in (0,1]; 1 keeps a fixed radius.")
+    p.add_argument("--gpu-resident", action="store_true",
+                   help="Enable GPU-resident BDPT/T5 mode, matching thick_lens_focus_lab's "
+                        "--gpu-resident path. This is required to exercise native GPU T5 scheduling.")
+    p.add_argument("--bdpt-native-packages", type=int, default=1,
+                   help="Native thick-lens BDPT: number of flash+sensor packages per "
+                        "exposure (ray budget split across them, same accumulation). "
+                        ">1 gives the T5 backlog scheduler repeated passes so deferred "
+                        "high-score pairs from earlier packages are worked with an "
+                        "age-growing share of the pair budget (default: 1).")
     p.add_argument("--calibration-scene", action="store_true",
                    help="Use the tungsten-cavity blackbody calibration "
                         "scene instead of the default orbiters scene. "
                         "Equivalent to --scene-mode tungsten-cavity.")
     p.add_argument("--scene-mode",     default=None,
-                   help="Scene mode passed to scene_mod.scene_for_phase "
-                        "(default: orbiters; tungsten-cavity for blackbody "
-                        "calibration; also supports calib-rgb-diagram / calib-bw-rgb "
+                   help="Scene mode passed to the exposure scene builder "
+                        "(default: thick-lens-lab; tungsten-cavity for blackbody "
+                        "calibration; also supports orbiters, calib-rgb-diagram / calib-bw-rgb "
                         "for black-white-primary chain validation, and calib-grid / "
                         "calib-step-wedge / calib-prism-backplate for grid, wedge, "
-                        "and prism comparator scenes). Overrides --calibration-scene.")
+                         "and prism comparator scenes). Overrides --calibration-scene.")
+    p.add_argument("--scene-order", default=None,
+                   help="JSON scene-order package. Compiles its selected job into the "
+                        "proven thick-lens lab camera/flash scene.")
+    p.add_argument("--scene-job", default=None,
+                   help="Job id inside --scene-order (required when the package has multiple jobs).")
     p.add_argument("--backend",        choices=("cpp", "glsl", "both"),
                    default="cpp")
     p.add_argument("--exposure-time-s", type=float, default=DEFAULT_FILM.exposure_time_s)
@@ -5980,7 +6883,45 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    global _ORDERED_THICK_LENS_SCENE
+    _verify_native_bdpt_contract()
     args = _parse_args(argv if argv is not None else sys.argv[1:])
+
+    order_job = None
+    order_report = None
+    if args.scene_order:
+        from scene_orders import compile_job, load_order, order_runtime_settings, resolved_jobs
+        order_package = load_order(str(args.scene_order))
+        order_jobs = resolved_jobs(order_package, args.scene_job)
+        if len(order_jobs) != 1:
+            ids = ", ".join(str(job["id"]) for job in order_jobs)
+            raise ValueError(
+                f"--scene-order contains multiple jobs ({ids}); select one with --scene-job"
+            )
+        order_job = order_jobs[0]
+        runtime = order_runtime_settings(order_job)
+        args.width = runtime["width"]
+        args.height = runtime["height"]
+        args.focal_mm = runtime["focal_mm"]
+        args.aperture_mm = runtime["aperture_mm"]
+        args.iso = runtime["iso"]
+        args.exposure_time_s = runtime["exposure_time_s"]
+        args.t5_pair_budget = runtime["pair_budget"]
+        args.scene_mode = "thick-lens-lab"
+        args.frames = 1
+        # Build the canonical scene while no override is installed, then replace
+        # only its subject group with the order compiler's result.
+        _ORDERED_THICK_LENS_SCENE = None
+        base_scene = _build_thick_lens_lab_tracer_scene()
+        _ORDERED_THICK_LENS_SCENE, order_report = compile_job(base_scene, order_job)
+        print(
+            f"[scene-order] job={order_report.job_id!r} token={order_report.token!r} "
+            f"triangles={order_report.total_triangles:,} "
+            f"(glyph={order_report.glyph_triangles:,} planes={order_report.plane_triangles:,}) "
+            f"materials={list(order_report.material_names)} flash_scale={order_report.flash_scale:g} "
+            f"image={args.width}x{args.height}",
+            flush=True,
+        )
 
     if bool(args.camera_solve_preview):
         default_preview_modes = (
@@ -6068,10 +7009,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     input_scale = max(1.0e-6, float(args.input_size_scale))
     oversample = max(1, int(args.output_oversample))
     oversample_stencil = str(args.oversample_stencil)
-    if bool(args.save_files) and int(args.output_oversample) == 1 and str(args.oversample_stencil) == "box":
-        oversample = 4
-        oversample_stencil = "polar"
-        print("  [defaults] --save-files detected: using output oversample 4x with polar stencil")
+    # Saving is an output operation and must not silently alter ray count,
+    # aperture coverage, scene sampling, or image resolution.  Oversampling is
+    # available only through the explicit --output-oversample option.
     
     # Check if sequence mode is active for simplified setup
     sequence_mode = str(args.sequence_mode)
@@ -6137,11 +7077,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         bdpt_intermediate_max_bytes = int(max(0.0, args.bdpt_intermediate_max_gb) * (1024 ** 3)),
         retain_bdpt_intermediate = bool(args.retain_bdpt_intermediate),
         bdpt_intermediate_dir = args.bdpt_intermediate_dir,
-        scene_mode     = (args.scene_mode if args.scene_mode is not None
-                          else ("tungsten-cavity" if args.calibration_scene
-                                else "orbiters")),
-          scene_mode_schedule = scene_mode_schedule,
-          profile_enabled = profile_enabled,
+                scene_mode     = (args.scene_mode if args.scene_mode is not None
+                                                    else ("tungsten-cavity" if args.calibration_scene
+                                                                else "thick-lens-lab")),
+                scene_mode_schedule = scene_mode_schedule,
+                profile_enabled = profile_enabled,
         integral_split = IntegralSplitConfig(
             field_integrate_frac   = 0.0,  # Disabled for sequence mode
             field_bookkeep_frac    = 0.0,
@@ -6175,6 +7115,13 @@ def main(argv: Optional[list[str]] = None) -> int:
         camera_cone_samples_max = int(args.camera_cone_samples_max),
         camera_cone_ref_half_angle_deg = float(args.camera_cone_ref_half_angle_deg),
         camera_cone_angle_exponent = float(args.camera_cone_angle_exponent),
+        t5_min_geom     = float(args.t5_min_geom),
+        t5_pair_budget  = int(args.t5_pair_budget),
+        vcm_enabled     = not bool(args.no_vcm),
+        vcm_radius_mm   = float(args.vcm_radius_mm),
+        vcm_radius_alpha = float(args.vcm_radius_alpha),
+        gpu_resident    = bool(args.gpu_resident),
+        bdpt_native_packages = int(args.bdpt_native_packages),
         save_files       = args.save_files,
     )
 
@@ -6257,4 +7204,3 @@ def main(argv: Optional[list[str]] = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

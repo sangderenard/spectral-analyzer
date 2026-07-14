@@ -81,6 +81,7 @@ static_assert(sizeof(FilmRecord) == 64 * sizeof(float),
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <iomanip>
 #include <map>
 #include <memory>
@@ -7727,6 +7728,7 @@ struct RayPipelineState {
     std::atomic<uint32_t>     bdpt_t5_fired{0};
     std::mutex                bdpt_t5_spawn_mu;
     std::thread               bdpt_t5_worker;
+    std::atomic<bool>         bdpt_t5_queued{false};
 
     /* ── KPN-style T5 completion channel ─────────────────────────────────
      * Per-family in-flight ray counts.  Decremented when a ray (and all its
@@ -7745,15 +7747,10 @@ struct RayPipelineState {
  * been submitted for this cycle, pushes a sentinel to Q_t5_ready so the T5
  * worker unblocks.  Only one sentinel per cycle: bdpt_connection_running acts
  * as the gate so we don't double-fire while T5 is already consuming. */
-static void bdpt_update_inflight(RayPipelineState* ps,
-                                  int64_t delta_flash,
-                                  int64_t delta_sensor)
+static void bdpt_try_schedule_t5(RayPipelineState* ps)
 {
-    if (delta_flash == 0 && delta_sensor == 0) return;
-    const int64_t nf = ps->bdpt_inflight_flash.fetch_add(delta_flash,
-                           std::memory_order_acq_rel) + delta_flash;
-    const int64_t ns = ps->bdpt_inflight_sensor.fetch_add(delta_sensor,
-                           std::memory_order_acq_rel) + delta_sensor;
+    const int64_t nf = ps->bdpt_inflight_flash.load(std::memory_order_acquire);
+    const int64_t ns = ps->bdpt_inflight_sensor.load(std::memory_order_acquire);
     if (nf != 0 || ns != 0) return;
 
     /* Both counters just hit zero.  Check whether both families have been
@@ -7767,14 +7764,24 @@ static void bdpt_update_inflight(RayPipelineState* ps,
     /* Production GPU mode: set the pending flag so the GPU thread runs
      * sort+pack+connect directly, bypassing the CPU BDPT connection path. */
     if (ps->cfg.gpu_skip_record_readback) {
+        bool expected = false;
+        if (!ps->bdpt_gpu_t5_pending.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel,
+                std::memory_order_relaxed))
+            return;
         fprintf(stderr, "[T5-gpu-native] both families exhausted — scheduling GPU T5 "
                 "(flash_if=%lld sensor_if=%lld flash_sub=%u sensor_sub=%u t5_fired=%u)\n",
                 (long long)nf, (long long)ns,
                 flash_submitted, sensor_submitted, t5_fired);
         fflush(stderr);
-        ps->bdpt_gpu_t5_pending.store(true, std::memory_order_release);
         return;
     }
+
+    bool expected = false;
+    if (!ps->bdpt_t5_queued.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+        return;
 
     fprintf(stderr, "[T5-kpn] both families exhausted — pushing sentinel "
             "(flash_if=%lld sensor_if=%lld flash_sub=%u sensor_sub=%u t5_fired=%u)\n",
@@ -7782,6 +7789,17 @@ static void bdpt_update_inflight(RayPipelineState* ps,
             flash_submitted, sensor_submitted, t5_fired);
     fflush(stderr);
     ps->Q_t5_ready.push(1);
+}
+
+static void bdpt_update_inflight(RayPipelineState* ps,
+                                  int64_t delta_flash,
+                                  int64_t delta_sensor)
+{
+    if (delta_flash != 0)
+        ps->bdpt_inflight_flash.fetch_add(delta_flash, std::memory_order_acq_rel);
+    if (delta_sensor != 0)
+        ps->bdpt_inflight_sensor.fetch_add(delta_sensor, std::memory_order_acq_rel);
+    bdpt_try_schedule_t5(ps);
 }
 
 /* CIE-approximate spectral locus — forward declaration; definition is near ray_pipeline_join_t5 */
@@ -7836,8 +7854,17 @@ public:
     /* T5 BDPT connection pass (t5_full_connect.comp.glsl) — non-fatal if absent */
     GLuint prog_t5 = 0;
     GLint  uloc_t5_profile_mode = -1;
+    GLint  uloc_t5_debug_enabled = -1;
     GLint  uloc_t5_n_mats = -1;
     bool   warned_t5_profile_unavailable = false;
+    /* VCM hashed-grid build + merge pass.  Optional at shader-load time, but
+     * when enabled both programs must be present; we never run a partial VCM. */
+    GLuint prog_vcm_grid = 0, prog_vcm_merge = 0;
+    GLuint ssbo_vcm_heads = 0, ssbo_vcm_next = 0, ssbo_vcm_debug = 0;
+    uint32_t cap_vcm_heads = 0, cap_vcm_next = 0;
+    uint64_t vcm_pass_index = 0;
+    struct { GLint nlight=-1, mask=-1, radius=-1, base=-1; } uloc_vcm_grid;
+    struct { GLint mask=-1, radius=-1, nmats=-1, base=-1; } uloc_vcm_merge;
     /* Cached from first dispatch_t1_t2_t3 call — stable for the pipeline lifetime. */
     int    cached_bdpt_count_base = 2;  /* 2 + n_mats; default safe until scene upload */
     int    cached_max_bdpt_v      = 0;  /* 0 = use ps.cfg.bdpt_max_vertices or 10M     */
@@ -7845,6 +7872,31 @@ public:
     int    cached_max_bdpt_p      = 0;  /* 0 = use ps.cfg.bdpt_max_pdfs fallback       */
     int    cached_max_bdpt_o      = 0;  /* 0 = use ps.cfg.bdpt_max_optical fallback    */
     uint32_t bdpt_gpu_accum_cycle = 0;  /* GPU-resident BDPT record reset generation   */
+    /* Pending BDPT record-cap raises, set when T5 detects overflow (requested
+     * high-water > cap).  Applied at the next BDPT cycle start only — the
+     * record SSBO section layout must never shift mid-cycle. */
+    int    pend_max_bdpt_v = 0, pend_max_bdpt_s = 0;
+    int    pend_max_bdpt_p = 0, pend_max_bdpt_o = 0;
+    /* GL_MAX_COMPUTE_WORK_GROUP_COUNT dim 0 (queried once; 65535 floor if the
+     * query fails).  Large 1-D dispatches are split into chunks of this size —
+     * exceeding it makes glDispatchCompute a silent GL_INVALID_VALUE no-op. */
+    GLint  gl_max_wg_x = 0;
+    /* VRAM-derived budget for records+packed T5 verts (floats; 0 = unqueried)
+     * and the VRAM-derived clamp on the GPU pop batch size (0 = unqueried). */
+    uint64_t auto_budget_floats = 0;
+    int      gpu_batch_clamp    = 0;
+
+    /* T5 prepass (batch_score.comp.glsl) — batch-efficiency triage */
+    GLuint prog_batch_score = 0;
+    GLint  u_bs_ncam = -1, u_bs_nlight = -1, u_bs_cbsz = -1, u_bs_lbsz = -1;
+    GLint  u_bs_nbands = -1, u_bs_ksamp = -1, u_bs_mingeom = -1, u_bs_seed = -1;
+    GLint  u_bs_wA = -1, u_bs_wB = -1, u_bs_wC = -1;
+    GLint  u_bs_nA = -1, u_bs_nB = -1, u_bs_nC = -1;
+    GLuint ssbo_batch_score = 0;
+    GLsizeiptr cap_batch_score = 0;
+    float    T5_SCORE_wA = 1.0f, T5_SCORE_wB = 0.0f, T5_SCORE_wC = 0.0f;
+    float    T5_SCORE_nA = 1.0f, T5_SCORE_nB = 1.0f, T5_SCORE_nC = 1.0f;
+    uint32_t T5_SCORE_KSAMPLES = 256u;
 
     /* post_t3_prep: GPU-driven bounce control, eliminates per-bounce CPU readbacks */
     GLuint prog_post_t3_prep  = 0;
@@ -7861,13 +7913,13 @@ public:
     int    cap_sort        = 0;  /* current padded allocation (# slots) */
     int    bdpt_betas_base_f = 0; /* float offset in ssbo_bdpt_output for betas */
     struct {
-        GLint nv = -1, npad = -1;
+        GLint nv = -1, npad = -1, base_idx = -1;
     } uloc_sort_init;
     struct {
-        GLint k = -1, j = -1, npad = -1;
+        GLint k = -1, j = -1, npad = -1, base_idx = -1;
     } uloc_sort_step;
     struct {
-        GLint nv = -1, n_lv = -1, bdpt_betas_base = -1, n_bands = -1;
+        GLint nv = -1, base_idx = -1, n_lv = -1, bdpt_betas_base = -1, n_bands = -1;
         GLint bdpt_spectral_base = -1, n_spectral = -1;
         GLint bdpt_pdf_base = -1, n_pdfs = -1;
         GLint bdpt_optical_base = -1, n_optical = -1;
@@ -7896,6 +7948,7 @@ public:
     GLuint ssbo_t5_pix      = 0;  /* binding 2: T5PixelBuf           (uint)   */
     GLuint ssbo_t5_params   = 0;  /* binding 3: T5ParamsBuf          (40 B)   */
     GLuint ssbo_t5_spectral = 0;  /* binding 4: T5SpectralWeightBuf  (float)  */
+    GLuint ssbo_t5_debug    = 0;  /* binding 9: optional rejection counters */
     int      cap_t5_light        = 0;  /* floats */
     int      cap_t5_cam          = 0;  /* floats */
     int      cap_t5_pix          = 0;  /* uint32 */
@@ -8013,7 +8066,7 @@ public:
      * GPU T2 optical count lives in CounterBuf[4].
      * bdpt_sid is embedded in hit[26+2*MAX_SPECTRAL_BANDS] by T1 — no separate id SSBO needed. */
     GLuint ssbo_bdpt_output   = 0;
-    int    cap_bdpt_output    = 0;  /* in floats */
+    int64_t cap_bdpt_output   = 0;  /* in floats */
     /* UV integrator image: merged_uv int32 SSBO at binding 5 contains:
      *   [0 .. n_tris*6)            UV vertex coords as floatBitsToInt (6 per tri)
      *   [n_tris*6 .. n_tris*7)     per-tri UV group IDs (int; -1=no group)
@@ -8102,6 +8155,154 @@ public:
         return (glGetError() == GL_NO_ERROR);
     }
 
+    /* Max workgroup count for dispatch dim 0, queried lazily (context must be
+     * current).  Dispatching more groups than this is a silent
+     * GL_INVALID_VALUE no-op — the spec minimum is 65535. */
+    GLint max_wg_x() {
+        if (gl_max_wg_x <= 0) {
+            GLint v = 0;
+            if (glc_GetIntegeri_v) {
+                while (glGetError() != GL_NO_ERROR) {}  /* clear stale errors */
+                glc_GetIntegeri_v(GL_MAX_COMPUTE_WORK_GROUP_COUNT, 0, &v);
+                if (glGetError() != GL_NO_ERROR) v = 0;
+            }
+            gl_max_wg_x = (v > 0) ? v : 65535;
+            fprintf(stderr, "[gpu-dispatch] max compute workgroups (dim 0) = %d\n",
+                    (int)gl_max_wg_x);
+            fflush(stderr);
+        }
+        return gl_max_wg_x;
+    }
+
+    /* Dispatch a 1-D compute pass of n_threads total (local_size_x = 64),
+     * splitting into sequential chunks when the workgroup count would exceed
+     * the GL limit.  base_loc is the shader's `base_idx` uniform location;
+     * when it is -1 the shader cannot be offset, so the dispatch is capped
+     * (with a loud error) rather than silently no-opped by the driver. */
+    void dispatch_1d_chunked(int64_t n_threads, GLint base_loc, const char* what) {
+        if (n_threads <= 0) return;
+        const int64_t max_threads = (int64_t)max_wg_x() * 64ll;
+        if (n_threads <= max_threads) {
+            if (base_loc >= 0) glc_Uniform1i(base_loc, 0);
+            glc_DispatchCompute((GLuint)((n_threads + 63) / 64), 1, 1);
+            return;
+        }
+        if (base_loc < 0) {
+            fprintf(stderr,
+                    "[gpu-dispatch] ERROR: %s needs %lld threads but the shader "
+                    "has no base_idx uniform; capping at %lld (results will be "
+                    "incomplete)\n",
+                    what ? what : "dispatch",
+                    (long long)n_threads, (long long)max_threads);
+            fflush(stderr);
+            glc_DispatchCompute((GLuint)(max_threads / 64), 1, 1);
+            return;
+        }
+        for (int64_t base = 0; base < n_threads; base += max_threads) {
+            const int64_t n_this = std::min(max_threads, n_threads - base);
+            glc_Uniform1i(base_loc, (GLint)base);
+            glc_DispatchCompute((GLuint)((n_this + 63) / 64), 1, 1);
+        }
+        glc_Uniform1i(base_loc, 0);
+    }
+
+    /* ── BDPT record-cap policy ──────────────────────────────────────────
+     * Keeps the four record caps (vertices / spectral / pdfs / optical)
+     * inside the float budget AND inside int32 shader indexing, and — at a
+     * cycle start only — applies any pending overflow-driven growth that
+     * service_gpu_native_t5 scheduled.  Mid-cycle the section layout must
+     * never move, so growth always waits for the next reset_bdpt_records. */
+    void apply_bdpt_cap_policy(RayPipelineState& ps, bool at_cycle_start) {
+        RayPipelineConfig& cfg = ps.cfg;
+        /* Budget weights are the FULL downstream float cost per record, not
+         * just the record-SSBO section: every vertex that survives the cap is
+         * also packed into ssbo_t5_cam (72 floats worst case) for the connect
+         * pass.  Ignoring that is how a 10M-vertex cap turned into a ~5.7 GiB
+         * cam buffer on top of the 3.4 GiB record buffer and drowned the
+         * display GPU at larger sensor resolutions. */
+        static constexpr int64_t W_V = 28 + 72, W_S = 8, W_P = 12, W_O = 28;
+        static constexpr int64_t CAP_MIN = 1 << 16;
+        int64_t v = cfg.bdpt_max_vertices > 0 ? cfg.bdpt_max_vertices : 10000000;
+        int64_t s = cfg.bdpt_max_spectral > 0 ? cfg.bdpt_max_spectral : 25000000;
+        int64_t p = cfg.bdpt_max_pdfs     > 0 ? cfg.bdpt_max_pdfs     : 10000000;
+        int64_t o = cfg.bdpt_max_optical  > 0 ? cfg.bdpt_max_optical  : 10000000;
+        const int64_t v0 = v, s0 = s, p0 = p, o0 = o;
+        if (at_cycle_start) {
+            if (pend_max_bdpt_v > 0) v = std::max<int64_t>(v, pend_max_bdpt_v);
+            if (pend_max_bdpt_s > 0) s = std::max<int64_t>(s, pend_max_bdpt_s);
+            if (pend_max_bdpt_p > 0) p = std::max<int64_t>(p, pend_max_bdpt_p);
+            if (pend_max_bdpt_o > 0) o = std::max<int64_t>(o, pend_max_bdpt_o);
+            pend_max_bdpt_v = pend_max_bdpt_s = 0;
+            pend_max_bdpt_p = pend_max_bdpt_o = 0;
+        }
+        /* VRAM-derived ceiling, queried once (NVX extension; falls back to a
+         * conservative 6 GiB assumption when unavailable).  ~35% of dedicated
+         * VRAM goes to records+packed verts; the rest is for scene, hit
+         * buffers, intents, sort scratch and the driver. */
+        if (auto_budget_floats == 0) {
+            static constexpr GLenum DEDICATED_VIDMEM_NVX = 0x9047;
+            GLint vram_kb = 0;
+            glGetIntegerv(DEDICATED_VIDMEM_NVX, &vram_kb);
+            while (glGetError() != GL_NO_ERROR) {}  /* unsupported pname → clear */
+            const uint64_t vram_bytes = vram_kb > 0
+                ? (uint64_t)vram_kb * 1024ull : (6ull << 30);
+            auto_budget_floats = std::max<uint64_t>(
+                150000000ull, vram_bytes * 35ull / 100ull / sizeof(float));
+            fprintf(stderr,
+                    "[gpu-bounce] BDPT record budget: VRAM %s%.1f GiB -> "
+                    "%llu floats (%.2f GiB records+packed)\n",
+                    vram_kb > 0 ? "" : "(unknown, assuming) ",
+                    (double)vram_bytes / (1024.0*1024.0*1024.0),
+                    (unsigned long long)auto_budget_floats,
+                    (double)auto_budget_floats * sizeof(float)
+                        / (1024.0*1024.0*1024.0));
+            fflush(stderr);
+        }
+        int64_t budget = (int64_t)std::min<uint64_t>(
+            std::min<uint64_t>(
+                cfg.bdpt_record_float_budget > 0 ? cfg.bdpt_record_float_budget
+                                                 : 1100000000ull,
+                auto_budget_floats),
+            (uint64_t)INT32_MAX);
+        int64_t total = v * W_V + s * W_S + p * W_P + o * W_O;
+        if (total > budget) {
+            /* Proportional shrink by demand ratio, floor each cap. */
+            const double r = (double)budget / (double)total;
+            v = std::max<int64_t>(CAP_MIN, (int64_t)((double)v * r));
+            s = std::max<int64_t>(CAP_MIN, (int64_t)((double)s * r));
+            p = std::max<int64_t>(CAP_MIN, (int64_t)((double)p * r));
+            o = std::max<int64_t>(CAP_MIN, (int64_t)((double)o * r));
+            /* Floors can leave a small excess — shave the largest section. */
+            total = v * W_V + s * W_S + p * W_P + o * W_O;
+            while (total > budget) {
+                int64_t* big = &v; int64_t w = W_V;
+                if (s * W_S > *big * w) { big = &s; w = W_S; }
+                if (p * W_P > *big * w) { big = &p; w = W_P; }
+                if (o * W_O > *big * w) { big = &o; w = W_O; }
+                const int64_t need = (total - budget + w - 1) / w;
+                if (*big - need < CAP_MIN) { *big = CAP_MIN; }
+                else                       { *big -= need;   }
+                const int64_t new_total = v * W_V + s * W_S + p * W_P + o * W_O;
+                if (new_total >= total) break;  /* all at floor — give up */
+                total = new_total;
+            }
+        }
+        if (v != v0 || s != s0 || p != p0 || o != o0) {
+            fprintf(stderr,
+                    "[gpu-bounce] BDPT record caps -> v=%lld s=%lld p=%lld o=%lld "
+                    "(%.2f GiB of %.2f GiB budget)%s\n",
+                    (long long)v, (long long)s, (long long)p, (long long)o,
+                    (double)total * sizeof(float) / (1024.0*1024.0*1024.0),
+                    (double)budget * sizeof(float) / (1024.0*1024.0*1024.0),
+                    at_cycle_start ? "" : " [budget clamp]");
+            fflush(stderr);
+        }
+        cfg.bdpt_max_vertices = (int)v;
+        cfg.bdpt_max_spectral = (int)s;
+        cfg.bdpt_max_pdfs     = (int)p;
+        cfg.bdpt_max_optical  = (int)o;
+    }
+
     void bind_ssbo(GLuint id, GLuint binding) {
         glc_BindBufferBase(GL_SHADER_STORAGE_BUFFER, binding, id);
     }
@@ -8114,7 +8315,10 @@ public:
     /* Grow both hit SSBOs together so cap_hits is always valid for both. */
     void ensure_hit_ssbos(int required) {
         if (required <= cap_hits) return;
-        cap_hits = required * 2;
+        /* +12.5% headroom, NOT ×2: these are double-buffered multi-hundred-MB
+         * buffers (HIT_STRIDE_BYTES per row, two copies) — doubling them at
+         * megabatch sizes alone exceeds a 6 GiB card. */
+        cap_hits = required + required / 8;
         const GLsizeiptr sz = (GLsizeiptr)((size_t)cap_hits * HIT_STRIDE_BYTES);
         ensure_ssbo(ssbo_hit,   sz);
         ensure_ssbo(ssbo_hit_b, sz);
@@ -8139,6 +8343,9 @@ public:
 
     /* Zero ssbo_sensor_rgb without reallocating.  Called when sensor image is reset. */
     void clear_sensor_rgb() {
+        /* A sensor clear starts a new exposure — deferred pairs from the old
+         * exposure must not splat into the fresh accumulator. */
+        clear_t5_backlog("sensor accumulator cleared");
         if (!ssbo_sensor_rgb || sensor_rgb_res <= 0) return;
         const GLsizeiptr sz = (GLsizeiptr)(3u * (size_t)sensor_rgb_res * sensor_rgb_res
                                            * sizeof(uint32_t));
@@ -8187,10 +8394,18 @@ public:
                 glc_Uniform3fv(uloc_splat.rgb_w, blit_n_bands_stored,
                                blit_rgb_weights.data());
             } else {
-                float flat[MAX_SPECTRAL_BANDS * 3];
-                for (int i = 0; i < MAX_SPECTRAL_BANDS * 3; ++i)
-                    flat[i] = 1.0f / 3.0f;
-                glc_Uniform3fv(uloc_splat.rgb_w, MAX_SPECTRAL_BANDS, flat);
+                float physical[MAX_SPECTRAL_BANDS * 3] = {};
+                const int active = std::max(1, std::min(nb, MAX_SPECTRAL_BANDS));
+                for (int b = 0; b < active; ++b) {
+                    double wr = 0.0, wg = 0.0, wb = 0.0;
+                    band_to_display_rgb(b, active,
+                                        ps.st ? ps.st->freq_hz_vec : Eigen::VectorXd{},
+                                        wr, wg, wb);
+                    physical[b * 3 + 0] = (float)wr;
+                    physical[b * 3 + 1] = (float)wg;
+                    physical[b * 3 + 2] = (float)wb;
+                }
+                glc_Uniform3fv(uloc_splat.rgb_w, MAX_SPECTRAL_BANDS, physical);
             }
         }
 
@@ -8346,6 +8561,12 @@ public:
     struct T5DispatchStats {
         uint32_t dispatches = 0;
         uint32_t reductions = 0;
+        size_t   active_units = 0;
+        size_t   deferred_units = 0;
+        size_t   units_consumed = 0;   /* units fully dispatched this call    */
+        uint64_t active_pairs = 0;
+        uint64_t deferred_pairs = 0;
+        uint64_t pairs_done = 0;       /* pairs actually dispatched this call */
         uint64_t start_pair_cap = 0;
         uint64_t final_pair_cap = 0;
         uint64_t max_pairs = 0;
@@ -8353,6 +8574,57 @@ public:
         uint32_t max_light = 0;
         double   max_ms = 0.0;
     };
+
+    /* ── T5 deferred-pair backlog ────────────────────────────────────────
+     * When the pair budget defers units, the pass snapshots its packed
+     * light/cam vertex buffers + the remaining score-ordered unit list to
+     * host memory.  Subsequent passes spend a growing slice of the budget
+     * (∝ backlog age in passes) re-uploading and working these snapshots
+     * highest-score-first, so old high-value work is never simply lost. */
+    struct T5BacklogSnapshot {
+        std::vector<float>    light, cam;   /* packed LGV/CGV rows           */
+        uint32_t n_lv = 0, n_cv = 0;
+        uint32_t cam_target = 0, light_target = 0;
+        std::vector<uint32_t> units;        /* remaining unit ids, score-desc */
+        std::vector<float>    scores;       /* parallel to units              */
+        size_t   cursor = 0;                /* units[0..cursor) already done  */
+        T5GpuParams par{};
+        uint32_t created_pass = 0;
+        uint64_t bytes = 0;
+
+        float next_score() const {
+            return cursor < scores.size() ? scores[cursor] : -1.0e30f;
+        }
+        uint64_t pairs_remaining() const {
+            uint64_t n = 0;
+            for (size_t k = cursor; k < units.size(); ++k)
+                n += unit_pairs(units[k]);
+            return n;
+        }
+        uint64_t unit_pairs(uint32_t unit) const {
+            const uint32_t n_lb = (n_lv + light_target - 1u) / light_target;
+            const uint32_t c = unit / n_lb, b = unit % n_lb;
+            const uint32_t cb = c * cam_target, lb = b * light_target;
+            const uint32_t cn = cb < n_cv ? std::min(cam_target, n_cv - cb) : 0u;
+            const uint32_t ln = lb < n_lv ? std::min(light_target, n_lv - lb) : 0u;
+            return (uint64_t)cn * (uint64_t)ln;
+        }
+    };
+    std::deque<T5BacklogSnapshot> t5_backlog;
+    uint64_t t5_backlog_bytes = 0;
+
+    void clear_t5_backlog(const char* why) {
+        if (t5_backlog.empty()) return;
+        uint64_t pairs = 0;
+        for (const auto& b : t5_backlog) pairs += b.pairs_remaining();
+        fprintf(stderr,
+                "[T5-backlog] cleared %zu snapshot(s), %llu pairs, %.1f MiB (%s)\n",
+                t5_backlog.size(), (unsigned long long)pairs,
+                (double)t5_backlog_bytes / (1024.0*1024.0), why ? why : "");
+        fflush(stderr);
+        t5_backlog.clear();
+        t5_backlog_bytes = 0;
+    }
 
     bool wait_t5_profile_fence(const char* label, const char* stage) {
         static constexpr uint64_t PROFILE_TIMEOUT_NS = 1000ull * 1000ull * 1000ull;
@@ -8445,14 +8717,39 @@ public:
         return true;
     }
 
+    /* budget_pairs: max pairs to dispatch this call (0 = unlimited).
+     * io_pair_cap: optional shared chunk-size retune state so consecutive
+     *   calls in one pass (fresh work + backlog) keep the tuned cap.
+     * preset_units/n_preset: when given, skip scoring entirely and dispatch
+     *   exactly these unit ids in order (backlog replay path); the unit grid
+     *   is derived from the totals/targets, which must match the grid the
+     *   ids were created against.
+     * out_deferred_units/scores: filled with the score-ordered units (and
+     *   their scores) that did NOT fit the budget this call. */
     T5DispatchStats dispatch_t5_pair_chunks(RayPipelineState& ps,
                                             T5GpuParams& par,
                                             uint32_t n_cv_total,
                                             uint32_t n_lv_total,
                                             uint32_t cam_target,
                                             uint32_t light_target,
-                                            const char* label) {
+                                            const char* label,
+                                            uint64_t budget_pairs,
+                                            uint64_t* io_pair_cap = nullptr,
+                                            const uint32_t* preset_units = nullptr,
+                                            size_t n_preset = 0,
+                                            std::vector<uint32_t>* out_deferred_units = nullptr,
+                                            std::vector<float>* out_deferred_scores = nullptr,
+                                            float min_accept_score = -3.4e38f) {
+        /* min_accept_score: a unit is accepted only if its score is >= this
+         * floor.  Used by the fresh pass to refuse new units that score below
+         * the best already-deferred (backlog) unit, so high-value deferred work
+         * is never starved by lower-value new work — the deferred unit runs
+         * instead (it is picked up by the backlog drain with the leftover
+         * budget).  Default -inf = accept purely by budget (legacy behaviour,
+         * e.g. the backlog replay path which is already score-filtered). */
         T5DispatchStats st{};
+        if (out_deferred_units)  out_deferred_units->clear();
+        if (out_deferred_scores) out_deferred_scores->clear();
         if (n_cv_total == 0 || n_lv_total == 0)
             return st;
         cam_target = std::max(1u, cam_target);
@@ -8471,6 +8768,9 @@ public:
         const uint64_t max_pair_cap = std::min<uint64_t>(target_pairs, T5_MAX_PAIR_CAP);
         const uint64_t total_pairs = (uint64_t)n_cv_total * (uint64_t)n_lv_total;
         uint64_t pair_cap = std::min<uint64_t>(target_pairs, T5_START_PAIR_CAP);
+        if (io_pair_cap && *io_pair_cap > 0)
+            pair_cap = std::max(T5_MIN_PAIR_CAP,
+                                std::min(*io_pair_cap, max_pair_cap));
         st.start_pair_cap = pair_cap;
         bool profile_done = false;
         uint64_t pairs_done = 0;
@@ -8484,6 +8784,149 @@ public:
                 cam_target, light_target,
                 (unsigned long long)pair_cap,
                 (double)T5_FENCE_BUDGET_NS / 1000000.0);
+        fflush(stderr);
+
+        const uint32_t n_cbatches = (n_cv_total + cam_target - 1u) / cam_target;
+        const uint32_t n_lbatches = (n_lv_total + light_target - 1u) / light_target;
+        const size_t n_units = (size_t)n_cbatches * (size_t)n_lbatches;
+        auto unit_pair_count = [&](uint32_t unit) -> uint64_t {
+            const uint32_t c = unit / n_lbatches;
+            const uint32_t b = unit % n_lbatches;
+            const uint32_t cam_base = c * cam_target;
+            const uint32_t light_base = b * light_target;
+            const uint32_t cam_n = cam_base < n_cv_total
+                ? std::min(cam_target, n_cv_total - cam_base) : 0u;
+            const uint32_t light_n = light_base < n_lv_total
+                ? std::min(light_target, n_lv_total - light_base) : 0u;
+            return (uint64_t)cam_n * (uint64_t)light_n;
+        };
+        std::vector<float> unit_S(n_units, 0.0f);
+        bool scored = false;
+        if (!preset_units && prog_batch_score && n_units > 0) {
+            const GLsizeiptr need = (GLsizeiptr)(n_units * 4u * sizeof(float));
+            if (need > cap_batch_score) {
+                cap_batch_score = need * 2;
+                ensure_ssbo(ssbo_batch_score, cap_batch_score);
+            }
+            glc_UseProgram(prog_batch_score);
+            bind_ssbo(ssbo_t5_light,    0);
+            bind_ssbo(ssbo_t5_cam,      1);
+            bind_ssbo(ssbo_batch_score, 9);
+            if (u_bs_ncam    >= 0) glc_Uniform1ui(u_bs_ncam,    n_cv_total);
+            if (u_bs_nlight  >= 0) glc_Uniform1ui(u_bs_nlight,  n_lv_total);
+            if (u_bs_cbsz    >= 0) glc_Uniform1ui(u_bs_cbsz,    cam_target);
+            if (u_bs_lbsz    >= 0) glc_Uniform1ui(u_bs_lbsz,    light_target);
+            if (u_bs_nbands  >= 0) glc_Uniform1i (u_bs_nbands,  par.n_bands);
+            if (u_bs_ksamp   >= 0) glc_Uniform1ui(u_bs_ksamp,   T5_SCORE_KSAMPLES);
+            if (u_bs_mingeom >= 0) glc_Uniform1f (u_bs_mingeom, par.min_geom);
+            if (u_bs_seed    >= 0) glc_Uniform1ui(u_bs_seed,    0x5EED1234u);
+            if (u_bs_wA      >= 0) glc_Uniform1f (u_bs_wA,      T5_SCORE_wA);
+            if (u_bs_wB      >= 0) glc_Uniform1f (u_bs_wB,      T5_SCORE_wB);
+            if (u_bs_wC      >= 0) glc_Uniform1f (u_bs_wC,      T5_SCORE_wC);
+            if (u_bs_nA      >= 0) glc_Uniform1f (u_bs_nA,      T5_SCORE_nA);
+            if (u_bs_nB      >= 0) glc_Uniform1f (u_bs_nB,      T5_SCORE_nB);
+            if (u_bs_nC      >= 0) glc_Uniform1f (u_bs_nC,      T5_SCORE_nC);
+            glc_DispatchCompute(n_cbatches, n_lbatches, 1u);
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            glFinish();
+
+            std::vector<float> host_scores(n_units * 4u);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_batch_score);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                 (GLsizeiptr)(host_scores.size() * sizeof(float)),
+                                 host_scores.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            for (size_t u = 0; u < n_units; ++u)
+                unit_S[u] = host_scores[u * 4u + 3u];
+            scored = true;
+        }
+
+        std::vector<uint32_t> order;
+        if (preset_units) {
+            order.assign(preset_units, preset_units + n_preset);
+        } else {
+            order.resize(n_units);
+            for (size_t u = 0; u < n_units; ++u)
+                order[u] = (uint32_t)u;
+            if (scored) {
+                std::stable_sort(order.begin(), order.end(),
+                    [&](uint32_t a, uint32_t b) { return unit_S[a] > unit_S[b]; });
+            }
+        }
+        const size_t n_order = order.size();
+        uint64_t order_pairs = 0;
+        for (size_t k = 0; k < n_order; ++k)
+            order_pairs += unit_pair_count(order[k]);
+        const uint64_t pair_budget = budget_pairs;
+        size_t active_units = n_order;
+        uint64_t active_pairs = order_pairs;
+        uint64_t deferred_pairs = 0;
+        if (pair_budget > 0 && order_pairs > pair_budget) {
+            active_units = 0;
+            active_pairs = 0;
+            for (size_t k = 0; k < n_order; ++k) {
+                /* Score gate: `order` is score-descending, so once a new unit
+                 * scores below the best already-deferred unit, stop accepting —
+                 * the remaining budget is reserved for that higher-value
+                 * deferred work, which the backlog drain runs with the leftover.
+                 * (scored=false on the backlog-replay path → gate is inert.) */
+                if (scored && unit_S[order[k]] < min_accept_score)
+                    break;
+                const uint64_t u_pairs = unit_pair_count(order[k]);
+                if (active_units > 0 && active_pairs + u_pairs > pair_budget)
+                    break;
+                active_pairs += u_pairs;
+                ++active_units;
+            }
+            /* Force at least one unit so the pass always makes progress — but
+             * NOT when the score gate legitimately refused everything (all new
+             * work ranks below the best deferred work; let the backlog run). */
+            if (active_units == 0 && n_order > 0
+                && (!scored || unit_S[order[0]] >= min_accept_score)) {
+                active_units = 1;
+                active_pairs = unit_pair_count(order[0]);
+            }
+        }
+        if (active_units < n_order)
+            deferred_pairs = order_pairs > active_pairs ? order_pairs - active_pairs : 0;
+        st.active_units = active_units;
+        st.deferred_units = n_order > active_units ? n_order - active_units : 0;
+        if (out_deferred_units) {
+            out_deferred_units->assign(order.begin() + active_units, order.end());
+            if (out_deferred_scores) {
+                out_deferred_scores->resize(out_deferred_units->size());
+                for (size_t k = 0; k < out_deferred_units->size(); ++k)
+                    (*out_deferred_scores)[k] =
+                        scored ? unit_S[(*out_deferred_units)[k]] : 0.0f;
+            }
+        }
+        st.active_pairs = active_pairs;
+        st.deferred_pairs = deferred_pairs;
+        glc_UseProgram(prog_t5);
+        bind_ssbo(ssbo_t5_light,    0);
+        bind_ssbo(ssbo_t5_cam,      1);
+        bind_ssbo(ssbo_sensor_rgb,  2);
+        bind_ssbo(ssbo_t5_params,   3);
+        bind_ssbo(ssbo_t5_spectral, 4);
+        bind_ssbo(ssbo_bvh,         5);
+        bind_ssbo(ssbo_tri_id,      6);
+        bind_ssbo(ssbo_tri_full,    7);
+        bind_ssbo(ssbo_mat_band,    8);
+        if (ssbo_t5_debug) bind_ssbo(ssbo_t5_debug, 9);
+        if (uloc_t5_debug_enabled >= 0)
+            glc_Uniform1i(uloc_t5_debug_enabled, ps.cfg.t5_profile ? 1 : 0);
+        if (uloc_t5_n_mats >= 0)
+            glc_Uniform1i(uloc_t5_n_mats, ps.st ? ps.st->mat_n_mats : 0);
+        fprintf(stderr,
+                "[%s] scheduler units=%zu active=%zu deferred=%zu active_pairs=%llu deferred_pairs=%llu budget=%llu (cbatch=%u x lbatch=%u) %s\n",
+                label ? label : "T5", n_units,
+                active_units, st.deferred_units,
+                (unsigned long long)active_pairs,
+                (unsigned long long)deferred_pairs,
+                (unsigned long long)pair_budget,
+                n_cbatches, n_lbatches,
+                preset_units ? "score-ordered(backlog-replay)"
+                             : (scored ? "score-sorted" : "row-major(fallback)"));
         fflush(stderr);
 
         auto shrink_to_cap = [&](uint32_t cam_rem, uint32_t light_rem,
@@ -8500,19 +8943,10 @@ public:
             }
         };
 
-        for (uint32_t cam_base = 0; cam_base < n_cv_total; ) {
-            const uint32_t cam_rem = n_cv_total - cam_base;
-            uint32_t cam_n = 1, light_probe = 1;
-            shrink_to_cap(cam_rem, n_lv_total, cam_n, light_probe);
-
-            par.cam_offset = cam_base;
-            for (uint32_t light_base = 0; light_base < n_lv_total; ) {
-                uint32_t light_n = std::max(1u, std::min(light_target,
-                                                          n_lv_total - light_base));
-                while ((uint64_t)cam_n * (uint64_t)light_n > pair_cap &&
-                       light_n > (uint32_t)T5_TILE_L)
-                    light_n = std::max((uint32_t)T5_TILE_L, (light_n + 1u) / 2u);
-
+        auto dispatch_chunk = [&](uint32_t cam_base,
+                                  uint32_t light_base,
+                                  uint32_t cam_n,
+                                  uint32_t light_n) -> bool {
                 par.cam_offset = cam_base;
                 par.light_offset = light_base;
                 par.light_batch_size = light_n;
@@ -8533,7 +8967,7 @@ public:
                                 "[%s-profile] aborted normal T5 dispatch after profile timeout; rerun without --profile to render\n",
                                 label ? label : "T5");
                         fflush(stderr);
-                        return st;
+                        return false;
                     }
                     profile_done = true;
                 }
@@ -8593,7 +9027,7 @@ public:
                     uint64_t next_cap = (uint64_t)((double)pair_cap * step);
                     next_cap = std::max<uint64_t>(next_cap, pair_cap + T5_MIN_PAIR_CAP);
                     pair_cap = std::min<uint64_t>(max_pair_cap, next_cap);
-                    if (pair_cap != old_cap) {
+                    if (pair_cap != old_cap && ps.cfg.t5_profile) {
                         fprintf(stderr,
                                 "[%s] retune: pair_cap %llu->%llu last_ms=%.1f target_ms=%.1f reason=grow\n",
                                 label ? label : "T5",
@@ -8607,35 +9041,73 @@ public:
                 ++st.dispatches;
                 pairs_done += pairs;
                 const auto now = std::chrono::steady_clock::now();
-                if (now - progress_last >= std::chrono::seconds(1) || pairs_done >= total_pairs) {
+                const uint64_t progress_total = active_pairs > 0 ? active_pairs : total_pairs;
+                if (now - progress_last >= std::chrono::seconds(5) || pairs_done >= progress_total) {
                     const double elapsed_s = std::chrono::duration<double>(now - progress_t0).count();
-                    const double pct = total_pairs > 0
-                        ? 100.0 * (double)pairs_done / (double)total_pairs : 100.0;
+                    const double pct = progress_total > 0
+                        ? 100.0 * (double)pairs_done / (double)progress_total : 100.0;
                     const double mpairs_s = elapsed_s > 0.0
                         ? ((double)pairs_done / 1000000.0) / elapsed_s : 0.0;
                     fprintf(stderr,
-                            "[%s] connect progress: dispatches=%u pairs=%llu/%llu %.3f%% rate=%.3fM/s chunk=%ux%u pair_cap=%llu max_ms=%.1f reductions=%u\n",
+                            "[%s] connect progress: dispatches=%u active_pairs=%llu/%llu %.3f%% deferred_pairs=%llu rate=%.3fM/s chunk=%ux%u pair_cap=%llu max_ms=%.1f reductions=%u\n",
                             label ? label : "T5",
                             st.dispatches,
                             (unsigned long long)pairs_done,
-                            (unsigned long long)total_pairs,
-                            pct, mpairs_s,
+                            (unsigned long long)progress_total,
+                            pct,
+                            (unsigned long long)st.deferred_pairs,
+                            mpairs_s,
                             cam_n, light_n,
                             (unsigned long long)pair_cap,
                             st.max_ms, st.reductions);
                     fflush(stderr);
                     progress_last = now;
                 }
-                light_base += light_n;
-                if (ps.cancel.load(std::memory_order_relaxed))
-                    break;
-            }
-            cam_base += cam_n;
+                return true;
+        };
+
+        for (size_t k = 0; k < active_units; ++k) {
+            const uint32_t unit = order[k];
             if (ps.cancel.load(std::memory_order_relaxed))
                 break;
+            const uint32_t c = unit / n_lbatches;
+            const uint32_t b = unit % n_lbatches;
+            const uint32_t cam_end = std::min(n_cv_total, c * cam_target + cam_target);
+            const uint32_t light_end = std::min(n_lv_total, b * light_target + light_target);
+            bool unit_complete = true;
+            for (uint32_t cam_base = c * cam_target; cam_base < cam_end; ) {
+                uint32_t cam_n = 1, light_probe = 1;
+                shrink_to_cap(cam_end - cam_base, light_end - b * light_target, cam_n, light_probe);
+                for (uint32_t light_base = b * light_target; light_base < light_end; ) {
+                    uint32_t light_n = std::max(1u, std::min(light_target, light_end - light_base));
+                while ((uint64_t)cam_n * (uint64_t)light_n > pair_cap &&
+                       light_n > (uint32_t)T5_TILE_L)
+                    light_n = std::max((uint32_t)T5_TILE_L, (light_n + 1u) / 2u);
+                    if (!dispatch_chunk(cam_base, light_base, cam_n, light_n)) {
+                        st.pairs_done = pairs_done;
+                        st.final_pair_cap = pair_cap;
+                        if (io_pair_cap) *io_pair_cap = pair_cap;
+                        return st;
+                    }
+                light_base += light_n;
+                if (ps.cancel.load(std::memory_order_relaxed)) {
+                    unit_complete = (light_base >= light_end);
+                    break;
+                }
+            }
+            cam_base += cam_n;
+            if (ps.cancel.load(std::memory_order_relaxed)) {
+                unit_complete = unit_complete && (cam_base >= cam_end);
+                break;
+            }
+            }
+            if (unit_complete)
+                ++st.units_consumed;
         }
 
+        st.pairs_done = pairs_done;
         st.final_pair_cap = pair_cap;
+        if (io_pair_cap) *io_pair_cap = pair_cap;
         return st;
     }
 
@@ -8647,24 +9119,30 @@ public:
      * 4. Dispatches t5_full_connect with ssbo_sensor_rgb as output.          */
     void service_gpu_native_t5(RayPipelineState& ps) {
         static constexpr const char* T5_NATIVE_LABEL = "T5-gpu-native";
-        ps.bdpt_gpu_t5_pending.store(false, std::memory_order_release);
         bool expected_running = false;
         if (!ps.bdpt_connection_running.compare_exchange_strong(
                 expected_running, true,
                 std::memory_order_acq_rel,
                 std::memory_order_relaxed))
             return;
+        /* Keep pending asserted until running is visible so a concurrent
+         * zero-work submission cannot enqueue the same cycle twice. */
+        ps.bdpt_gpu_t5_pending.store(false, std::memory_order_release);
         struct NativeT5RunGuard {
             RayPipelineState& ps;
             const char* label;
-            bool completed = false;
+            const char* status = "ABORTED";
+            bool count_pass = true;
             ~NativeT5RunGuard() {
                 ps.bdpt_connection_running.store(false, std::memory_order_release);
-                ps.bdpt_t5_fired.fetch_add(1u, std::memory_order_release);
-                fprintf(stderr, "[%s] PASS %s  t5_fired->%u\n",
+                uint32_t fired = ps.bdpt_t5_fired.load(std::memory_order_relaxed);
+                if (count_pass)
+                    fired = ps.bdpt_t5_fired.fetch_add(1u, std::memory_order_release) + 1u;
+                fprintf(stderr, "[%s] PASS %s  t5_fired->%u%s\n",
                         label ? label : "T5-gpu-native",
-                        completed ? "COMPLETE" : "ABORTED",
-                        ps.bdpt_t5_fired.load(std::memory_order_relaxed));
+                        status ? status : "ABORTED",
+                        fired,
+                        count_pass ? "" : " (not consumed)");
                 fflush(stderr);
             }
         } run_guard{ps, T5_NATIVE_LABEL};
@@ -8696,9 +9174,9 @@ public:
         static constexpr int BDPT_SPECTRAL_STRIDE_F = 8;
         static constexpr int BDPT_PDF_STRIDE_F      = 12;
         static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;
-        const int bdpt_spectral_base_f = max_v * BDPT_VERTEX_STRIDE_F;
-        const int bdpt_pdf_base_f = bdpt_spectral_base_f + max_s * BDPT_SPECTRAL_STRIDE_F;
-        const int bdpt_optical_base_f = bdpt_pdf_base_f + max_p * BDPT_PDF_STRIDE_F;
+        const int64_t bdpt_spectral_base_f = (int64_t)max_v * BDPT_VERTEX_STRIDE_F;
+        const int64_t bdpt_pdf_base_f = bdpt_spectral_base_f + (int64_t)max_s * BDPT_SPECTRAL_STRIDE_F;
+        const int64_t bdpt_optical_base_f = bdpt_pdf_base_f + (int64_t)max_p * BDPT_PDF_STRIDE_F;
         uint32_t nv_raw = std::min(bdpt_counts[0], (uint32_t)max_v);
         uint32_t ns_raw = std::min(bdpt_counts[1], (uint32_t)max_s);
         uint32_t np_raw = std::min(bdpt_counts[2], (uint32_t)max_p);
@@ -8715,36 +9193,50 @@ public:
          * atomics the CPU path uses (surfaced via get_bdpt_overflow()), and
          * warn loudly — a silent grey-out is exactly the failure mode the
          * audit flags.  The buffer can then be resized from the high-water. */
+        /* Overflow → schedule a cap raise (requested + 25% headroom) that
+         * apply_bdpt_cap_policy applies at the next cycle start, rebalanced
+         * to the float budget.  The current pass still runs truncated, but
+         * recurring truncation self-heals instead of nagging forever. */
+        auto grow_pending = [](int& pend, uint32_t requested) {
+            const uint64_t want = std::min<uint64_t>(
+                (uint64_t)requested + (uint64_t)requested / 4u, (uint64_t)INT32_MAX);
+            pend = std::max(pend, (int)want);
+        };
         if (bdpt_counts[1] > (uint32_t)max_s) {
             const uint64_t dropped = (uint64_t)bdpt_counts[1] - (uint64_t)max_s;
             ps.bdpt_overflow_spectral.fetch_add(dropped, std::memory_order_relaxed);
+            grow_pending(pend_max_bdpt_s, bdpt_counts[1]);
             fprintf(stderr,
                     "[%s] WARNING: spectral-record OVERFLOW — requested %u, cap %d, "
                     "DROPPED %llu records. Affected vertices desaturate to GREY "
-                    "(flat luminance split). Raise bdpt_max_spectral to >= %u to "
-                    "preserve chroma.\n",
+                    "(flat luminance split). Auto-raising bdpt_max_spectral to %d "
+                    "at the next cycle (budget-permitting).\n",
                     T5_NATIVE_LABEL, bdpt_counts[1], max_s,
-                    (unsigned long long)dropped, bdpt_counts[1]);
+                    (unsigned long long)dropped, pend_max_bdpt_s);
             fflush(stderr);
         }
         if (bdpt_counts[0] > (uint32_t)max_v) {
             const uint64_t dropped = (uint64_t)bdpt_counts[0] - (uint64_t)max_v;
             ps.bdpt_overflow_vertices.fetch_add(dropped, std::memory_order_relaxed);
+            grow_pending(pend_max_bdpt_v, bdpt_counts[0]);
             fprintf(stderr,
                     "[%s] WARNING: vertex-record OVERFLOW — requested %u, cap %d, "
-                    "DROPPED %llu. Raise bdpt_max_vertices to >= %u.\n",
+                    "DROPPED %llu. Auto-raising bdpt_max_vertices to %d "
+                    "at the next cycle (budget-permitting).\n",
                     T5_NATIVE_LABEL, bdpt_counts[0], max_v,
-                    (unsigned long long)dropped, bdpt_counts[0]);
+                    (unsigned long long)dropped, pend_max_bdpt_v);
             fflush(stderr);
         }
         if (bdpt_counts[2] > (uint32_t)max_p) {
             const uint64_t dropped = (uint64_t)bdpt_counts[2] - (uint64_t)max_p;
             ps.bdpt_overflow_pdfs.fetch_add(dropped, std::memory_order_relaxed);
+            grow_pending(pend_max_bdpt_p, bdpt_counts[2]);
             fprintf(stderr,
                     "[%s] WARNING: pdf-record OVERFLOW — requested %u, cap %d, "
-                    "DROPPED %llu. Raise bdpt_max_pdfs to >= %u.\n",
+                    "DROPPED %llu. Auto-raising bdpt_max_pdfs to %d "
+                    "at the next cycle (budget-permitting).\n",
                     T5_NATIVE_LABEL, bdpt_counts[2], max_p,
-                    (unsigned long long)dropped, bdpt_counts[2]);
+                    (unsigned long long)dropped, pend_max_bdpt_p);
             fflush(stderr);
         }
 
@@ -8912,9 +9404,9 @@ public:
 
         /* Ensure sort SSBOs. */
         if (npad > cap_sort) {
-            cap_sort = npad * 2;
-            ensure_ssbo(ssbo_sort_keys,   (GLsizeiptr)(cap_sort * 2 * sizeof(uint32_t)));
-            ensure_ssbo(ssbo_sort_idx,    (GLsizeiptr)(cap_sort     * sizeof(uint32_t)));
+            cap_sort = npad;   /* npad is already a power-of-2 ceiling — no extra headroom */
+            ensure_ssbo(ssbo_sort_keys,   (GLsizeiptr)((size_t)cap_sort * 2 * sizeof(uint32_t)));
+            ensure_ssbo(ssbo_sort_idx,    (GLsizeiptr)((size_t)cap_sort     * sizeof(uint32_t)));
         }
         if (!ssbo_sort_counts)
             ensure_ssbo(ssbo_sort_counts, 2 * sizeof(uint32_t));
@@ -8938,7 +9430,7 @@ public:
         bind_ssbo(ssbo_sort_counts, 3);
         if (uloc_sort_init.nv   >= 0) glc_Uniform1i(uloc_sort_init.nv,   nv);
         if (uloc_sort_init.npad >= 0) glc_Uniform1i(uloc_sort_init.npad, npad);
-        glc_DispatchCompute((GLuint)((npad + 63) / 64), 1, 1);
+        dispatch_1d_chunked((int64_t)npad, uloc_sort_init.base_idx, "sort-init");
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         if (ps.cfg.t5_profile && !wait_t5_profile_fence(T5_NATIVE_LABEL, "sort-init")) {
             fprintf(stderr, "[%s-profile] aborted before sort-count readback after profile timeout\n",
@@ -8954,7 +9446,25 @@ public:
         glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         const int n_lv = (int)n_lv_raw;
         const int n_cv = nv - n_lv;
-        if (n_lv == 0 || n_cv == 0) return;  /* nothing to connect */
+        if (n_lv == 0 || n_cv == 0) {
+            /* This pass cannot produce connections — but it MUST still count.
+             * The T5 trigger only re-fires on an inflight zero-transition, so
+             * a non-counted failure here leaves t5_fired < dispatched forever
+             * and join_t5() spins for eternity (the "hangs with no apparent
+             * BDPT processing" symptom).  Count the pass and fail loudly; the
+             * Python driver then sees an empty sensor image and raises. */
+            run_guard.status = "FAILED-MISSING-SIDE";
+            fprintf(stderr,
+                "[%s] EARLY RETURN — missing %s%s after sort-init "
+                "(nv=%d light=%d cam=%d). Records are corrupt or were dropped "
+                "(check record-cap / SSBO allocation warnings above).\n",
+                T5_NATIVE_LABEL,
+                (n_lv == 0) ? "light " : "",
+                (n_cv == 0) ? "camera" : "",
+                nv, n_lv, n_cv);
+            fflush(stderr);
+            return;
+        }
         fprintf(stderr, "[%s] stage sort-init done: light=%d cam=%d\n",
                 T5_NATIVE_LABEL, n_lv, n_cv);
         fflush(stderr);
@@ -8966,13 +9476,13 @@ public:
         glc_UseProgram(prog_sort_step);
         bind_ssbo(ssbo_sort_keys, 0);
         bind_ssbo(ssbo_sort_idx,  1);
-        const GLuint sort_wgs = (GLuint)((npad / 2 + 63) / 64);
         for (int k = 2; k <= npad; k *= 2) {
             for (int j = k / 2; j >= 1; j /= 2) {
                 if (uloc_sort_step.k    >= 0) glc_Uniform1i(uloc_sort_step.k,    k);
                 if (uloc_sort_step.j    >= 0) glc_Uniform1i(uloc_sort_step.j,    j);
                 if (uloc_sort_step.npad >= 0) glc_Uniform1i(uloc_sort_step.npad, npad);
-                glc_DispatchCompute(sort_wgs, 1, 1);
+                dispatch_1d_chunked((int64_t)npad / 2, uloc_sort_step.base_idx,
+                                    "sort-bitonic");
                 glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             }
         }
@@ -8991,13 +9501,16 @@ public:
         {
             const int need_lgv = n_lv * (int)T5_LGV_STRIDE;
             const int need_cgv = n_cv * (int)T5_CGV_STRIDE;
+            /* Linear headroom, not ×2: at the vertex cap the cam buffer is
+             * already n_cv × 288 B (multi-GiB); doubling it is what pushed the
+             * 6 GiB display GPU into pagefile death at larger sensor-res. */
             if (need_lgv > cap_t5_light) {
-                cap_t5_light = need_lgv * 2;
-                ensure_ssbo(ssbo_t5_light, (GLsizeiptr)(cap_t5_light * sizeof(float)));
+                cap_t5_light = need_lgv + need_lgv / 8;
+                ensure_ssbo(ssbo_t5_light, (GLsizeiptr)((size_t)cap_t5_light * sizeof(float)));
             }
             if (need_cgv > cap_t5_cam) {
-                cap_t5_cam = need_cgv * 2;
-                ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)(cap_t5_cam * sizeof(float)));
+                cap_t5_cam = need_cgv + need_cgv / 8;
+                ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)((size_t)cap_t5_cam * sizeof(float)));
             }
         }
         glc_UseProgram(prog_pack_t5);
@@ -9012,17 +9525,17 @@ public:
         if (uloc_pack_t5.n_bands         >= 0) glc_Uniform1i(uloc_pack_t5.n_bands,
                                                                ps.st ? (int)ps.st->freq_hz_vec.size() : 1);
         if (uloc_pack_t5.bdpt_spectral_base >= 0) glc_Uniform1i(uloc_pack_t5.bdpt_spectral_base,
-                                                               bdpt_spectral_base_f);
+                                                               (int)bdpt_spectral_base_f);
         if (uloc_pack_t5.n_spectral      >= 0) glc_Uniform1i(uloc_pack_t5.n_spectral, ns);
         if (uloc_pack_t5.bdpt_pdf_base   >= 0) glc_Uniform1i(uloc_pack_t5.bdpt_pdf_base,
-                                                               bdpt_pdf_base_f);
+                                                               (int)bdpt_pdf_base_f);
         if (uloc_pack_t5.n_pdfs          >= 0) glc_Uniform1i(uloc_pack_t5.n_pdfs, np);
         if (uloc_pack_t5.bdpt_optical_base >= 0) glc_Uniform1i(uloc_pack_t5.bdpt_optical_base,
-                                                               bdpt_optical_base_f);
+                                                               (int)bdpt_optical_base_f);
         if (uloc_pack_t5.n_optical       >= 0) glc_Uniform1i(uloc_pack_t5.n_optical, no);
         if (uloc_pack_t5.sensor_half_w   >= 0) glc_Uniform1f(uloc_pack_t5.sensor_half_w, ps.sensor_half_w);
         if (uloc_pack_t5.sensor_half_h   >= 0) glc_Uniform1f(uloc_pack_t5.sensor_half_h, ps.sensor_half_h);
-        glc_DispatchCompute((GLuint)((nv + 63) / 64), 1, 1);
+        dispatch_1d_chunked((int64_t)nv, uloc_pack_t5.base_idx, "pack-t5");
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
         if (ps.cfg.t5_profile && !wait_t5_profile_fence(T5_NATIVE_LABEL, "pack-t5")) {
             fprintf(stderr, "[%s-profile] aborted before connect after profile timeout\n",
@@ -9045,11 +9558,11 @@ public:
         if (uloc_scatter_t5.n_bands >= 0) glc_Uniform1i(uloc_scatter_t5.n_bands,
                                                         ps.st ? (int)ps.st->freq_hz_vec.size() : 1);
         if (uloc_scatter_t5.bdpt_spectral_base >= 0) glc_Uniform1i(uloc_scatter_t5.bdpt_spectral_base,
-                                                                   bdpt_spectral_base_f);
+                                                                   (int)bdpt_spectral_base_f);
         if (uloc_scatter_t5.bdpt_pdf_base >= 0) glc_Uniform1i(uloc_scatter_t5.bdpt_pdf_base,
-                                                              bdpt_pdf_base_f);
+                                                              (int)bdpt_pdf_base_f);
         if (uloc_scatter_t5.bdpt_optical_base >= 0) glc_Uniform1i(uloc_scatter_t5.bdpt_optical_base,
-                                                                  bdpt_optical_base_f);
+                                                                  (int)bdpt_optical_base_f);
         auto dispatch_scatter_records = [&](int mode, int count, const char* stage) -> bool {
             if (count <= 0) return true;
             static constexpr int SCATTER_RECORD_BATCH = 65536;
@@ -9060,9 +9573,12 @@ public:
                 if (uloc_scatter_t5.record_offset >= 0) glc_Uniform1i(uloc_scatter_t5.record_offset, off);
                 glc_DispatchCompute((GLuint)((n_this + 63) / 64), 1, 1);
                 glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-                if (ps.cfg.t5_profile) {
+                /* One fence at the end profiles and validates the whole queue.
+                 * Per-chunk fences serialized 74 tiny dispatches and emitted
+                 * hundreds of low-value log lines. */
+                if (ps.cfg.t5_profile && off + n_this >= count) {
                     char stage_buf[96];
-                    snprintf(stage_buf, sizeof(stage_buf), "%s[%d..%d)", stage, off, off + n_this);
+                    snprintf(stage_buf, sizeof(stage_buf), "%s (%d records)", stage, count);
                     if (!wait_t5_profile_fence(T5_NATIVE_LABEL, stage_buf))
                         return false;
                 }
@@ -9117,7 +9633,17 @@ public:
             ensure_sensor_rgb_ssbo(ps.sensor_res);
         if (!ssbo_sensor_rgb || sensor_rgb_res != ps.sensor_res) return;
 
-        const uint32_t T5_LIGHT_BATCH_NT = t5_light_batch_size ? t5_light_batch_size : 4096u;
+        /* Unit = cam_target × light_target pairs is the acceptance granularity:
+         * the score-budget keeps whole top-scoring units, so coarse units make
+         * the budget cover very few light-batches per pass (poor coverage; the
+         * backlog then drains ~1 coarse unit/pass and evicts the rest).  A finer
+         * light batch (1024 vs the old 4096) quarters the per-unit pair count, so
+         * the same t5_pair_budget accepts ~4× more light-batches per pass and
+         * every camera vertex accumulates connections from more light vertices.
+         * The GPU connect cost is unchanged — dispatch_t5_pair_chunks sizes the
+         * actual dispatch by the pair_cap retune, independent of light_target.
+         * Tunable via RayTracer.set_t5_light_batch_size (0 = this default). */
+        const uint32_t T5_LIGHT_BATCH_NT = t5_light_batch_size ? t5_light_batch_size : 1024u;
         const uint32_t T5_CAM_BATCH_NT   = t5_cam_batch_size   ? t5_cam_batch_size   : 8192u;
         const uint32_t n_lv_u = (uint32_t)n_lv;
         const uint32_t n_cv_u = (uint32_t)n_cv;
@@ -9131,9 +9657,18 @@ public:
         par.n_cam_verts   = n_cv_u;
         par.tile_w = 0; par.tile_h = 0; par.tile_x0 = 0; par.tile_y0 = 0;
         par.n_bands = ps.st ? (int)ps.st->freq_hz_vec.size() : 1;
+        par.light_sample_stride = 0u;
+        par.light_sample_weight = 1.0f;
 
         if (!ssbo_t5_params)
             ensure_ssbo(ssbo_t5_params, sizeof(T5GpuParams));
+        if (ps.cfg.t5_profile) {
+            if (!ssbo_t5_debug) ensure_ssbo(ssbo_t5_debug, 68 * sizeof(uint32_t));
+            uint32_t zeros[68] = {};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_debug);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zeros), zeros);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
         const int nb_gpu = std::max(1, std::min(par.n_bands, (int)T5_MAX_GPU_BANDS));
         const int nsw = nb_gpu * 3;
         if (nsw > cap_t5_spectral) {
@@ -9158,6 +9693,21 @@ public:
             glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
         }
 
+        /* VCM grid build MUST precede the T5 connection dispatch: the merge
+         * kernel area (pi r^2) enters T5's balance-heuristic denominator as
+         * the weld-technique density.  If no merge pass will run (disabled,
+         * missing programs, empty light set) vm_area stays 0 and T5 reduces
+         * to pure vertex-connection MIS.  Radius follows the progressive
+         * photon-mapping schedule; the SAME radius is used by the merge
+         * dispatch after T5 so the two estimators stay mutually consistent. */
+        const float vcm_alpha = std::max(1.0e-4f, std::min(1.0f, ps.cfg.vcm_radius_alpha));
+        const float vcm_radius = ps.cfg.vcm_merge_radius_m * std::pow(
+            static_cast<float>(vcm_pass_index + 1u), 0.5f * (vcm_alpha - 1.0f));
+        const uint32_t vcm_buckets = prepare_vcm_grid(
+            ps, n_lv_u, std::max(vcm_radius, 1.0e-7f));
+        par.vm_area = vcm_buckets
+            ? static_cast<float>(M_PI) * vcm_radius * vcm_radius : 0.0f;
+
         glc_UseProgram(prog_t5);
         bind_ssbo(ssbo_t5_light,    0);
         bind_ssbo(ssbo_t5_cam,      1);
@@ -9177,22 +9727,376 @@ public:
             return;
         }
 
-        const T5DispatchStats t5_stats =
-            dispatch_t5_pair_chunks(ps, par, n_cv_u, n_lv_u,
+        /* Profile-only transport isolation.  The sensor buffer already contains
+         * terminal camera-path splats when T5 starts, so an end-of-pass total
+         * cannot identify energy added by the connection pass.  Snapshot the
+         * exact float-bit accumulator and subtract it after all T5 dispatches.
+         * This readback does not alter transport, sampling, or PDF decisions. */
+        std::vector<uint32_t> t5_sensor_before;
+        if (ps.cfg.t5_profile && ssbo_sensor_rgb && sensor_rgb_res > 0) {
+            const size_t words = 3u * (size_t)sensor_rgb_res * (size_t)sensor_rgb_res;
+            t5_sensor_before.resize(words);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                 (GLsizeiptr)(words * sizeof(uint32_t)),
+                                 t5_sensor_before.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        }
+
+        /* ── Unified score policy: fresh vs deferred compete by score ─────
+         * Scores are sensor-independent (beta·beta·geom), so a unit's score is
+         * comparable across passes.  Policy (no fixed share):
+         *   1. The fresh pass gets the FULL pair budget but is score-gated: it
+         *      refuses any new unit scoring below the best already-deferred
+         *      unit, so high-value deferred work is never starved by lower-value
+         *      new work — deferred runs ANY time its score exceeds new work.
+         *   2. The backlog then gets whatever budget the fresh pass did NOT
+         *      consume — so deferred work also runs whenever the budget isn't
+         *      fully spent on new work (idle capacity drains the backlog). */
+        const uint64_t pair_budget = ps.cfg.t5_pair_budget;
+        const uint32_t pass_now =
+            ps.bdpt_t5_fired.load(std::memory_order_relaxed) + 1u;
+
+        /* A bounded render must estimate the complete light domain, not return
+         * a deterministically truncated score-sorted prefix.  Sample a
+         * stratified set of light vertices for every camera vertex and apply
+         * the inverse selection probability in the shader.  Exhaustive mode
+         * remains available with pair_budget=0 (or when the full domain fits). */
+        const uint64_t full_pair_count = (uint64_t)n_cv_u * (uint64_t)n_lv_u;
+        const bool sampled_estimate = pair_budget > 0 && full_pair_count > pair_budget;
+        uint32_t dispatch_n_lv = n_lv_u;
+        if (sampled_estimate) {
+            clear_t5_backlog("switching to inverse-probability sampled estimate");
+            const uint64_t affordable = std::max<uint64_t>(1ull, pair_budget / n_cv_u);
+            dispatch_n_lv = (uint32_t)std::min<uint64_t>(n_lv_u, affordable);
+            par.light_sample_stride = std::max<uint32_t>(
+                1u, (n_lv_u + dispatch_n_lv - 1u) / dispatch_n_lv);
+            par.light_sample_weight = (float)n_lv_u / (float)dispatch_n_lv;
+            fprintf(stderr,
+                    "[T5-sampling] full=%u camera x %u light = %llu pairs; "
+                    "dispatching %u stratified light samples/camera (%llu pairs), "
+                    "inverse_probability=%.9g status=SAMPLED-ESTIMATE\n",
+                    n_cv_u, n_lv_u, (unsigned long long)full_pair_count,
+                    dispatch_n_lv,
+                    (unsigned long long)((uint64_t)n_cv_u * dispatch_n_lv),
+                    par.light_sample_weight);
+            fflush(stderr);
+        }
+
+        float best_backlog_score = -3.4e38f;
+        for (const auto& b : t5_backlog) {
+            if (b.created_pass == pass_now) continue;     /* not yet eligible   */
+            if (b.cursor >= b.units.size()) continue;     /* already drained    */
+            best_backlog_score = std::max(best_backlog_score, b.next_score());
+        }
+
+        uint64_t pair_cap_state = 0;   /* shared chunk retune across fresh+backlog */
+        std::vector<uint32_t> deferred_units;
+        std::vector<float>    deferred_scores;
+        T5DispatchStats t5_stats =
+            dispatch_t5_pair_chunks(ps, par, n_cv_u, dispatch_n_lv,
                                     T5_CAM_BATCH_NT, T5_LIGHT_BATCH_NT,
-                                    "T5-gpu-native");
+                                    "T5-gpu-native",
+                                    sampled_estimate ? 0ull : pair_budget, &pair_cap_state,
+                                    nullptr, 0,
+                                    &deferred_units, &deferred_scores,
+                                    best_backlog_score);
+
+        /* Backlog drains the leftover budget the fresh pass didn't use. */
+        uint64_t backlog_budget;
+        if (pair_budget == 0)
+            backlog_budget = t5_backlog.empty() ? 0ull : UINT64_MAX;
+        else
+            backlog_budget = pair_budget > t5_stats.active_pairs
+                           ? pair_budget - t5_stats.active_pairs : 0ull;
+        if (!t5_backlog.empty() || best_backlog_score > -3.0e38f) {
+            fprintf(stderr,
+                    "[T5-backlog] policy: best_deferred=%.3g fresh_used=%llu "
+                    "backlog_budget=%llu of %llu (snapshots=%zu)\n",
+                    best_backlog_score,
+                    (unsigned long long)t5_stats.active_pairs,
+                    (unsigned long long)backlog_budget,
+                    (unsigned long long)pair_budget,
+                    t5_backlog.size());
+            fflush(stderr);
+        }
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+
+        /* Vertex merging uses the complete packed light population even when
+         * the connection estimator uses a pair-budgeted stratified subset.
+         * The hash query is local, so this is both the correct VM estimator
+         * and dramatically cheaper than another all-pairs pass.
+         * vcm_radius/vcm_buckets were computed BEFORE the T5 dispatch above so
+         * the weld density pi*r^2 could enter T5's MIS denominator. */
+        if (vcm_buckets) {
+            fprintf(stderr, "[VCM-native] pass=%llu radius=%.6g m light_vertices=%u buckets=%u\n",
+                    (unsigned long long)(vcm_pass_index + 1u), vcm_radius,
+                    n_lv_u, vcm_buckets);
+            fflush(stderr);
+            dispatch_vcm_merge(ps, par, n_cv_u, vcm_buckets, vcm_radius);
+            ++vcm_pass_index;
+            if (ps.cfg.t5_profile && ssbo_vcm_debug) {
+                uint32_t vd[8] = {};
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_vcm_debug);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(vd), vd);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                fprintf(stderr,
+                        "[VCM-debug] stored=%u receivers=%u hash-visits=%u "
+                        "surface-matches=%u spectral-merges=%u splatted-receivers=%u\n",
+                        vd[0], vd[1], vd[2], vd[3], vd[4], vd[5]);
+                fflush(stderr);
+            }
+        }
+        if (ps.cfg.t5_profile && ssbo_t5_debug) {
+            uint32_t d[68] = {};
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_debug);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(d), d);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+            fprintf(stderr,
+                    "[T5-debug] pairs=%u camera-connectable=%u light-connectable=%u "
+                    "both+beta=%u geometry=%u connection-pdfs=%u mis=%u "
+                    "spectral=%u visible=%u overlap=%u glass=%u camera-bsdf=%u light-bsdf=%u "
+                    "emitter-pairs=%u emitter-spectral=%u emitter-visible=%u\n",
+                    d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7], d[8],
+                    d[9], d[10], d[11], d[12], d[13], d[14], d[15]);
+            fflush(stderr);
+            fprintf(stderr, "[T5-debug] contrib-log2/4 bins[-64..63]:");
+            for (int i = 0; i < 32; ++i) fprintf(stderr, " %u", d[16 + i]);
+            fprintf(stderr, "\n[T5-debug] denom-log2/8 bins[-64..63]:");
+            for (int i = 0; i < 16; ++i) fprintf(stderr, " %u", d[48 + i]);
+            fprintf(stderr,
+                    "\n[T5-debug] mis-cuts=%u delta-adjacent-cuts=%u (%.2f%%)\n",
+                    d[64], d[65], d[64] ? 100.0 * (double)d[65] / (double)d[64] : 0.0);
+            fprintf(stderr,
+                    "[T5-debug] delta-endpoint-tests camera=%u light=%u\n",
+                    d[66], d[67]);
+            fflush(stderr);
+        }
         fprintf(stderr,
-                "[T5-gpu-native] submitted: nv=%d n_lv=%d n_cv=%d target=%ux%u dispatches=%u pair_cap=%llu->%llu max_chunk=%ux%u max_pairs=%llu max_ms=%.1f reductions=%u\n",
+            "[T5-gpu-native] submitted: sensor=%dx%d verts(total/light/camera)=%d/%d/%d batch_caps(camera/light)=%u/%u dispatches=%u active_units=%zu deferred_units=%zu active_pairs=%llu deferred_pairs=%llu pair_cap=%llu->%llu max_chunk=%ux%u max_pairs=%llu max_ms=%.1f reductions=%u\n",
+                ps.sensor_res, ps.sensor_res,
                 nv, n_lv, n_cv, T5_CAM_BATCH_NT, T5_LIGHT_BATCH_NT,
                 t5_stats.dispatches,
+            t5_stats.active_units, t5_stats.deferred_units,
+            (unsigned long long)t5_stats.active_pairs,
+            (unsigned long long)t5_stats.deferred_pairs,
                 (unsigned long long)t5_stats.start_pair_cap,
                 (unsigned long long)t5_stats.final_pair_cap,
                 t5_stats.max_cam, t5_stats.max_light,
                 (unsigned long long)t5_stats.max_pairs,
                 t5_stats.max_ms, t5_stats.reductions);
         fflush(stderr);
-        run_guard.completed = true;
+
+        /* ── Snapshot this pass's deferred units for later passes ───────── */
+        if (!deferred_units.empty() && ps.cfg.t5_backlog_max_snapshots > 0
+            && !ps.cancel.load(std::memory_order_relaxed)) {
+            T5BacklogSnapshot snap;
+            snap.n_lv = n_lv_u;
+            snap.n_cv = n_cv_u;
+            snap.cam_target = T5_CAM_BATCH_NT;
+            snap.light_target = T5_LIGHT_BATCH_NT;
+            snap.units = std::move(deferred_units);
+            snap.scores = std::move(deferred_scores);
+            snap.par = par;
+            snap.created_pass = pass_now;
+            const uint64_t light_floats = (uint64_t)n_lv_u * (uint64_t)T5_LGV_STRIDE;
+            const uint64_t cam_floats   = (uint64_t)n_cv_u * (uint64_t)T5_CGV_STRIDE;
+            snap.bytes = (light_floats + cam_floats) * sizeof(float)
+                       + snap.units.size() * (sizeof(uint32_t) + sizeof(float));
+            if (snap.bytes > ps.cfg.t5_backlog_max_bytes) {
+                fprintf(stderr,
+                        "[T5-backlog] snapshot too large to retain "
+                        "(%.1f MiB > %.1f MiB cap) — %zu deferred units dropped\n",
+                        (double)snap.bytes / (1024.0*1024.0),
+                        (double)ps.cfg.t5_backlog_max_bytes / (1024.0*1024.0),
+                        snap.units.size());
+                fflush(stderr);
+            } else {
+                snap.light.resize((size_t)light_floats);
+                snap.cam.resize((size_t)cam_floats);
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_light);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                     (GLsizeiptr)(light_floats * sizeof(float)),
+                                     snap.light.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_cam);
+                glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                     (GLsizeiptr)(cam_floats * sizeof(float)),
+                                     snap.cam.data());
+                glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+                t5_backlog_bytes += snap.bytes;
+                t5_backlog.push_back(std::move(snap));
+                /* Evict least-valuable snapshots beyond the count/byte caps. */
+                while (t5_backlog.size() > (size_t)ps.cfg.t5_backlog_max_snapshots
+                       || t5_backlog_bytes > ps.cfg.t5_backlog_max_bytes) {
+                    size_t worst = 0;
+                    for (size_t i = 1; i < t5_backlog.size(); ++i)
+                        if (t5_backlog[i].next_score() < t5_backlog[worst].next_score())
+                            worst = i;
+                    fprintf(stderr,
+                            "[T5-backlog] EVICT snapshot pass=%u (%zu units, "
+                            "%.1f MiB, best_score=%.3g) — backlog over caps\n",
+                            t5_backlog[worst].created_pass,
+                            t5_backlog[worst].units.size() - t5_backlog[worst].cursor,
+                            (double)t5_backlog[worst].bytes / (1024.0*1024.0),
+                            (double)t5_backlog[worst].next_score());
+                    fflush(stderr);
+                    t5_backlog_bytes -= t5_backlog[worst].bytes;
+                    t5_backlog.erase(t5_backlog.begin() + (ptrdiff_t)worst);
+                }
+                const auto& just = t5_backlog.back();
+                fprintf(stderr,
+                        "[T5-backlog] snapshot pass=%u: %zu units, %llu pairs, "
+                        "%.1f MiB (backlog now %zu snapshots, %.1f MiB)\n",
+                        pass_now, just.units.size(),
+                        (unsigned long long)just.pairs_remaining(),
+                        (double)just.bytes / (1024.0*1024.0),
+                        t5_backlog.size(),
+                        (double)t5_backlog_bytes / (1024.0*1024.0));
+                fflush(stderr);
+            }
+        }
+
+        /* ── Work the backlog (excluding the snapshot just taken) ───────── */
+        uint64_t backlog_pairs_worked = 0;
+        uint32_t backlog_units_worked = 0;
+        while (backlog_budget > 0 && !t5_backlog.empty()
+               && !ps.cancel.load(std::memory_order_relaxed)) {
+            /* Pick the snapshot with the best next (remaining) score; skip
+             * the one created this pass — it already had its budget chance. */
+            size_t best = t5_backlog.size();
+            for (size_t i = 0; i < t5_backlog.size(); ++i) {
+                if (t5_backlog[i].created_pass == pass_now) continue;
+                if (t5_backlog[i].cursor >= t5_backlog[i].units.size()) continue;
+                if (best == t5_backlog.size()
+                    || t5_backlog[i].next_score() > t5_backlog[best].next_score())
+                    best = i;
+            }
+            if (best == t5_backlog.size()) break;
+            T5BacklogSnapshot& bs = t5_backlog[best];
+
+            /* Re-upload the snapshot's packed vertex buffers and re-point the
+             * T5 program at them (grow capacity members alongside). */
+            const int need_lgv = (int)bs.light.size();
+            const int need_cgv = (int)bs.cam.size();
+            if (need_lgv > cap_t5_light) {
+                cap_t5_light = need_lgv + need_lgv / 8;
+                ensure_ssbo(ssbo_t5_light, (GLsizeiptr)((size_t)cap_t5_light * sizeof(float)));
+            }
+            if (need_cgv > cap_t5_cam) {
+                cap_t5_cam = need_cgv + need_cgv / 8;
+                ensure_ssbo(ssbo_t5_cam, (GLsizeiptr)((size_t)cap_t5_cam * sizeof(float)));
+            }
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_light);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                              (GLsizeiptr)(bs.light.size() * sizeof(float)),
+                              bs.light.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_cam);
+            glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                              (GLsizeiptr)(bs.cam.size() * sizeof(float)),
+                              bs.cam.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+            T5GpuParams bpar = bs.par;
+            fprintf(stderr,
+                    "[T5-backlog] replay snapshot pass=%u: %zu units pending, "
+                    "budget=%llu pairs\n",
+                    bs.created_pass, bs.units.size() - bs.cursor,
+                    (unsigned long long)backlog_budget);
+            fflush(stderr);
+            const T5DispatchStats bstats =
+                dispatch_t5_pair_chunks(ps, bpar, bs.n_cv, bs.n_lv,
+                                        bs.cam_target, bs.light_target,
+                                        "T5-backlog",
+                                        backlog_budget, &pair_cap_state,
+                                        bs.units.data() + bs.cursor,
+                                        bs.units.size() - bs.cursor,
+                                        nullptr, nullptr);
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            backlog_pairs_worked += bstats.pairs_done;
+            backlog_units_worked += (uint32_t)bstats.units_consumed;
+            bs.cursor += bstats.units_consumed;
+            backlog_budget = backlog_budget > bstats.pairs_done
+                           ? backlog_budget - bstats.pairs_done : 0ull;
+            if (bs.cursor >= bs.units.size()) {
+                fprintf(stderr,
+                        "[T5-backlog] snapshot pass=%u DRAINED\n", bs.created_pass);
+                fflush(stderr);
+                t5_backlog_bytes -= bs.bytes;
+                t5_backlog.erase(t5_backlog.begin() + (ptrdiff_t)best);
+            }
+            if (bstats.units_consumed == 0)
+                break;   /* cancelled or profile-aborted — don't spin */
+        }
+
+        uint64_t backlog_pairs_left = 0;
+        for (const auto& b : t5_backlog)
+            backlog_pairs_left += b.pairs_remaining();
+        if (backlog_pairs_worked > 0 || backlog_pairs_left > 0) {
+            fprintf(stderr,
+                    "[T5-backlog] pass summary: worked %u units / %llu pairs; "
+                    "remaining %zu snapshots / %llu pairs\n",
+                    backlog_units_worked,
+                    (unsigned long long)backlog_pairs_worked,
+                    t5_backlog.size(),
+                    (unsigned long long)backlog_pairs_left);
+            fflush(stderr);
+        }
+        run_guard.status = sampled_estimate ? "SAMPLED-ESTIMATE" :
+            ((t5_stats.deferred_pairs > 0 || t5_stats.deferred_units > 0
+                            || backlog_pairs_left > 0)
+            ? "PARTIAL-DEFERRED" : "COMPLETE");
+
+        if (!t5_sensor_before.empty()) {
+            std::vector<uint32_t> after(t5_sensor_before.size());
+            glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_sensor_rgb);
+            glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                                 (GLsizeiptr)(after.size() * sizeof(uint32_t)),
+                                 after.data());
+            glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+            const size_t pixels = after.size() / 3u;
+            double base_sum = 0.0, delta_sum = 0.0, delta_peak = 0.0;
+            double delta_rgb[3] = {};
+            size_t base_lit = 0, delta_lit = 0, negative_words = 0;
+            for (size_t i = 0; i < pixels; ++i) {
+                double base_px = 0.0, delta_px = 0.0;
+                for (size_t c = 0; c < 3u; ++c) {
+                    float f0 = 0.0f, f1 = 0.0f;
+                    const size_t k = i + c * pixels;
+                    std::memcpy(&f0, &t5_sensor_before[k], sizeof(float));
+                    std::memcpy(&f1, &after[k], sizeof(float));
+                    if (!std::isfinite(f0) || !std::isfinite(f1)) continue;
+                    const double d = (double)f1 - (double)f0;
+                    base_px += (double)f0;
+                    delta_px += d;
+                    delta_rgb[c] += d;
+                    if (d < 0.0) ++negative_words;
+                }
+                if (base_px > 0.0) ++base_lit;
+                if (delta_px > 0.0) {
+                    ++delta_lit;
+                    delta_sum += delta_px;
+                    delta_peak = std::max(delta_peak, delta_px);
+                }
+                base_sum += base_px;
+            }
+            fprintf(stderr,
+                    "[%s-profile] sensor-isolation base_lit=%zu/%zu base_sum=%.9e "
+                    "t5_lit=%zu/%zu t5_sum=%.9e t5_peak=%.9e "
+                    "t5_rgb=(%.9e %.9e %.9e) negative_words=%zu\n",
+                    T5_NATIVE_LABEL, base_lit, pixels, base_sum,
+                    delta_lit, pixels, delta_sum, delta_peak,
+                    delta_rgb[0], delta_rgb[1], delta_rgb[2], negative_words);
+            fflush(stderr);
+        }
+
+        /* Push the accumulated sensor image to the CPU shadow so
+         * get_sensor_image() returns the T5 results immediately after join_t5()
+         * returns.  Without this, sensor_accum_gpu only reflects data from the
+         * last in-bounce refresh (before T5 ran) and the image is all zeros. */
+        if (ssbo_sensor_rgb && sensor_rgb_res > 0)
+            refresh_sensor_gpu_shadow(ps);
     }
 
     /* Upload data to an SSBO (auto-grows if needed). */
@@ -9603,7 +10507,55 @@ public:
         }
         if (prog_t5) {
             uloc_t5_profile_mode = glc_GetUniformLocation(prog_t5, "t5_profile_mode");
+            uloc_t5_debug_enabled = glc_GetUniformLocation(prog_t5, "t5_debug_enabled");
             uloc_t5_n_mats       = glc_GetUniformLocation(prog_t5, "t5_n_mats");
+        }
+
+        bool vcm_grid_ok = load("vcm_grid_build.comp.glsl", prog_vcm_grid);
+        if (!vcm_grid_ok)
+            fprintf(stderr, "[gpu-dispatch] vcm_grid_build.comp.glsl failed (%s)\n", err);
+        bool vcm_merge_ok = load_with_shadow_bvh(
+            "vcm_merge.comp.glsl", prog_vcm_merge, 5, 6, 7);
+        if (!vcm_merge_ok)
+            fprintf(stderr, "[gpu-dispatch] vcm_merge.comp.glsl failed (%s)\n", err);
+        if (!vcm_grid_ok || !vcm_merge_ok) {
+            prog_vcm_grid = prog_vcm_merge = 0;
+            if (ps.cfg.vcm_enabled) {
+                snprintf(ctx.error, sizeof(ctx.error),
+                         "VCM enabled but its GPU shaders did not compile: %s", err);
+                return false;
+            }
+        } else {
+            uloc_vcm_grid.nlight = glc_GetUniformLocation(prog_vcm_grid, "n_light_verts");
+            uloc_vcm_grid.mask   = glc_GetUniformLocation(prog_vcm_grid, "hash_mask");
+            uloc_vcm_grid.radius = glc_GetUniformLocation(prog_vcm_grid, "merge_radius");
+            uloc_vcm_grid.base   = glc_GetUniformLocation(prog_vcm_grid, "dispatch_base");
+            uloc_vcm_merge.mask   = glc_GetUniformLocation(prog_vcm_merge, "hash_mask");
+            uloc_vcm_merge.radius = glc_GetUniformLocation(prog_vcm_merge, "merge_radius");
+            uloc_vcm_merge.nmats  = glc_GetUniformLocation(prog_vcm_merge, "vcm_n_mats");
+            uloc_vcm_merge.base   = glc_GetUniformLocation(prog_vcm_merge, "dispatch_base");
+        }
+
+        /* T5 triage batch score shader (optional prepass) */
+        if (!load("batch_score.comp.glsl", prog_batch_score)) {
+            fprintf(stderr, "[gpu-dispatch] batch_score.comp.glsl not loaded — triage disabled\n");
+            prog_batch_score = 0;
+        }
+        if (prog_batch_score) {
+            u_bs_ncam    = glc_GetUniformLocation(prog_batch_score, "n_cam_verts");
+            u_bs_nlight  = glc_GetUniformLocation(prog_batch_score, "n_light_verts");
+            u_bs_cbsz    = glc_GetUniformLocation(prog_batch_score, "cam_batch_sz");
+            u_bs_lbsz    = glc_GetUniformLocation(prog_batch_score, "light_batch_sz");
+            u_bs_nbands  = glc_GetUniformLocation(prog_batch_score, "n_bands");
+            u_bs_ksamp   = glc_GetUniformLocation(prog_batch_score, "k_samples");
+            u_bs_mingeom = glc_GetUniformLocation(prog_batch_score, "min_geom");
+            u_bs_seed    = glc_GetUniformLocation(prog_batch_score, "seed");
+            u_bs_wA      = glc_GetUniformLocation(prog_batch_score, "wA");
+            u_bs_wB      = glc_GetUniformLocation(prog_batch_score, "wB");
+            u_bs_wC      = glc_GetUniformLocation(prog_batch_score, "wC");
+            u_bs_nA      = glc_GetUniformLocation(prog_batch_score, "normA");
+            u_bs_nB      = glc_GetUniformLocation(prog_batch_score, "normB");
+            u_bs_nC      = glc_GetUniformLocation(prog_batch_score, "normC");
         }
 
         /* Pass B: GPU-resident terminal splat shader — non-fatal */
@@ -9642,14 +10594,17 @@ public:
         if (prog_sort_init) {
             uloc_sort_init.nv   = glc_GetUniformLocation(prog_sort_init, "nv");
             uloc_sort_init.npad = glc_GetUniformLocation(prog_sort_init, "npad");
+            uloc_sort_init.base_idx = glc_GetUniformLocation(prog_sort_init, "base_idx");
         }
         if (prog_sort_step) {
             uloc_sort_step.k    = glc_GetUniformLocation(prog_sort_step, "k");
             uloc_sort_step.j    = glc_GetUniformLocation(prog_sort_step, "j");
             uloc_sort_step.npad = glc_GetUniformLocation(prog_sort_step, "npad");
+            uloc_sort_step.base_idx = glc_GetUniformLocation(prog_sort_step, "base_idx");
         }
         if (prog_pack_t5) {
             uloc_pack_t5.nv               = glc_GetUniformLocation(prog_pack_t5, "nv");
+            uloc_pack_t5.base_idx         = glc_GetUniformLocation(prog_pack_t5, "base_idx");
             uloc_pack_t5.n_lv             = glc_GetUniformLocation(prog_pack_t5, "n_lv");
             uloc_pack_t5.n_bands          = glc_GetUniformLocation(prog_pack_t5, "n_bands");
             uloc_pack_t5.bdpt_spectral_base = glc_GetUniformLocation(prog_pack_t5, "bdpt_spectral_base");
@@ -9880,6 +10835,8 @@ public:
                 root.left, root.right);
             fflush(stderr);
         }
+        /* New scene geometry invalidates any retained deferred-pair work. */
+        clear_t5_backlog("scene re-uploaded");
 
         /* UV integrator image SSBOs.
          * MergedUvBuf (binding 5) layout: [n_tris*6 UV coords as int-bits] ++
@@ -10087,12 +11044,38 @@ public:
          * in INTENT_STRIDE format, no PCIe transfer between generations.         */
         bool first_gen    = true;
         int  total_n_hits = 0;
+        uint32_t profile_initial_hits = 0;
+        uint32_t profile_initial_misses = 0;
         /* BDPT layout constants — derived from ps.cfg, invariant across bounces.
          * Hoisted so post-loop readback block can reference them after loop exit. */
         static constexpr int BDPT_VERTEX_STRIDE_F   = 28;
         static constexpr int BDPT_SPECTRAL_STRIDE_F =  8;
         static constexpr int BDPT_PDF_STRIDE_F      = 12;
         static constexpr int BDPT_OPTICAL_STRIDE_F  = 28;
+        /* Production GPU-resident mode: post_t3_prep drives T1/T2 indirectly so
+         * neither counters[0] nor meta[0..1] ever need to cross to CPU.
+         * Debug mode keeps the existing per-bounce readback path unchanged. */
+        const bool use_gpu_resident = ps.cfg.gpu_skip_record_readback && prog_post_t3_prep != 0;
+        /* BDPT record cycle = everything between two T5 passes.  Derive the
+         * cycle id from t5_fired, NOT from the flash/sensor dispatch signals:
+         * the signals are raised by the submitting (Python) thread and RACE the
+         * GPU thread.  A flash batch popped before signal_flash_dispatched()
+         * lands traced under the old cycle id; the first batch after the signal
+         * then saw a "new" cycle and reset the record counters MID-CYCLE,
+         * silently overwriting the entire flash (light) family — T5 then saw a
+         * missing/empty light side (the demo's black-image root cause; the lab
+         * only survived by re-submitting flash every display frame).  t5_fired
+         * only advances on the GPU thread itself, so this is race-free. */
+        const uint32_t gpu_bdpt_cycle =
+            ps.bdpt_t5_fired.load(std::memory_order_acquire) + 1u;
+        const bool reset_bdpt_records = !use_gpu_resident
+            || gpu_bdpt_cycle != bdpt_gpu_accum_cycle;
+        if (use_gpu_resident && reset_bdpt_records)
+            bdpt_gpu_accum_cycle = gpu_bdpt_cycle;
+        /* Record caps: budget-clamped, and — only at a cycle start, when the
+         * section layout may legally change — raised by any pending overflow
+         * growth scheduled by the previous T5 pass. */
+        apply_bdpt_cap_policy(ps, /*at_cycle_start=*/reset_bdpt_records);
         const int max_bdpt_v = (ps.cfg.bdpt_max_vertices > 0) ? ps.cfg.bdpt_max_vertices : 10000000;
         cached_max_bdpt_v = max_bdpt_v;
         const int max_bdpt_s = (ps.cfg.bdpt_max_spectral > 0) ? ps.cfg.bdpt_max_spectral : 25000000;
@@ -10101,24 +11084,12 @@ public:
         cached_max_bdpt_s = max_bdpt_s;
         cached_max_bdpt_p = max_bdpt_p;
         cached_max_bdpt_o = max_bdpt_o;
-        const int  bdpt_spectral_base_f = max_bdpt_v * BDPT_VERTEX_STRIDE_F;
-        const int  bdpt_pdf_base_f      = bdpt_spectral_base_f + max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
-        const int  bdpt_optical_base_f  = bdpt_pdf_base_f + max_bdpt_p * BDPT_PDF_STRIDE_F;
+        const int64_t bdpt_spectral_base_f = (int64_t)max_bdpt_v * BDPT_VERTEX_STRIDE_F;
+        const int64_t bdpt_pdf_base_f      = bdpt_spectral_base_f + (int64_t)max_bdpt_s * BDPT_SPECTRAL_STRIDE_F;
+        const int64_t bdpt_optical_base_f  = bdpt_pdf_base_f + (int64_t)max_bdpt_p * BDPT_PDF_STRIDE_F;
         /* prev_no: running optical write pointer; prev_nv/ns/np unused (BDPT deferred). */
         int prev_nv = 0, prev_ns = 0, prev_np = 0, prev_no = 0;
         (void)prev_nv; (void)prev_ns; (void)prev_np;
-        /* Production GPU-resident mode: post_t3_prep drives T1/T2 indirectly so
-         * neither counters[0] nor meta[0..1] ever need to cross to CPU.
-         * Debug mode keeps the existing per-bounce readback path unchanged. */
-        const bool use_gpu_resident = ps.cfg.gpu_skip_record_readback && prog_post_t3_prep != 0;
-        const uint32_t gpu_bdpt_cycle = std::max(
-            ps.bdpt_flash_dispatched.load(std::memory_order_acquire),
-            ps.bdpt_sensor_dispatched.load(std::memory_order_acquire));
-        const bool reset_bdpt_records = !use_gpu_resident
-            || gpu_bdpt_cycle == 0
-            || gpu_bdpt_cycle != bdpt_gpu_accum_cycle;
-        if (use_gpu_resident && reset_bdpt_records && gpu_bdpt_cycle != 0)
-            bdpt_gpu_accum_cycle = gpu_bdpt_cycle;
 
         /* Maximum bounce iterations for the GPU-resident path (no nc-based exit). */
         static constexpr int MAX_GPU_BOUNCES = 12;
@@ -10142,7 +11113,7 @@ public:
         /* ── Ensure intent SSBO is large enough (INTENT_STRIDE = 20 + 2*MAX_SPECTRAL_BANDS floats) */
         static constexpr int INTENT_STRIDE = 20 + 2 * MAX_SPECTRAL_BANDS;
         if (n > cap_intents) {
-            cap_intents = n * 2;
+            cap_intents = n + n / 8;   /* linear headroom — see ensure_hit_ssbos */
             /* Allocate with combined (CHILD+TERMINAL) stride so ssbo_intent and
              * ssbo_child_int can be freely ping-ponged without a resize after swap. */
             static constexpr int COMBINED_STRIDE = (20 + 2 * MAX_SPECTRAL_BANDS)
@@ -10212,8 +11183,29 @@ public:
                                          + (int64_t)max_bdpt_o * BDPT_OPTICAL_STRIDE_F;
             bdpt_betas_base_f = 0;  /* disabled — pack shader uses throughput/nb */
             if (bdpt_total_f > cap_bdpt_output) {
-                cap_bdpt_output = (int)bdpt_total_f;
-                ensure_ssbo(ssbo_bdpt_output, (GLsizeiptr)(bdpt_total_f * sizeof(float)));
+                if (!ensure_ssbo(ssbo_bdpt_output,
+                                 (GLsizeiptr)(bdpt_total_f * sizeof(float)))) {
+                    /* Allocation failed (GL_OUT_OF_MEMORY): continuing would
+                     * make every record write a silent no-op and T5 would see
+                     * zeroed garbage (the classic "all vertices classify as
+                     * light, cam=0" failure).  Keep the old cap and scream. */
+                    fprintf(stderr,
+                            "[gpu-bounce] ERROR: BDPT record SSBO allocation of "
+                            "%.2f GiB FAILED — keeping previous capacity %.2f GiB. "
+                            "Lower bdpt_record_float_budget / record caps.\n",
+                            (double)bdpt_total_f * sizeof(float) / (1024.0*1024.0*1024.0),
+                            (double)cap_bdpt_output * sizeof(float) / (1024.0*1024.0*1024.0));
+                    fflush(stderr);
+                    if (cap_bdpt_output > 0)
+                        ensure_ssbo(ssbo_bdpt_output,
+                                    (GLsizeiptr)(cap_bdpt_output * sizeof(float)));
+                    /* Pull the budget down so the next cycle rebalances the
+                     * caps to a size this GPU can actually allocate. */
+                    ps.cfg.bdpt_record_float_budget = (uint64_t)std::max<int64_t>(
+                        cap_bdpt_output > 0 ? cap_bdpt_output : 100000000, 100000000);
+                } else {
+                    cap_bdpt_output = bdpt_total_f;
+                }
             }
         }
 
@@ -10288,6 +11280,12 @@ public:
             GLC_DISPATCH_CHECKED("T1:BVH", (GLuint)((n + 63) / 64), 1, 1);
         }
         glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        if (first_gen && ps.cfg.t5_profile) {
+            uint32_t hm[2] = {};
+            readback_ssbo(ssbo_counter, hm, 2 * sizeof(uint32_t));
+            profile_initial_hits = hm[0];
+            profile_initial_misses = hm[1];
+        }
 
         /* ── dispatch_prep: GPU writes indirect T3 params + n_hits into SSBOs ──
          * Replaces the CPU readback of counters[0] that used to gate T3.
@@ -10331,7 +11329,7 @@ public:
             glc_Uniform1i(uloc_t2.n_groups, n_param_groups);
             glc_Uniform1i(uloc_t2.n_bands,  nb);
             glc_Uniform1i(uloc_t2.bdpt_max_optical, max_bdpt_o);
-            glc_Uniform1i(uloc_t2.bdpt_optical_base, bdpt_optical_base_f);
+            glc_Uniform1i(uloc_t2.bdpt_optical_base, (int)bdpt_optical_base_f);
             if (uloc_t2.freq_hz >= 0) {
                 float fhz[MAX_SPECTRAL_BANDS] = {};
                 const int nbf = std::min(nb, MAX_SPECTRAL_BANDS);
@@ -10412,8 +11410,8 @@ public:
         glc_Uniform1i (uloc_t3.bdpt_max_spectral,     max_bdpt_s);
         glc_Uniform1i (uloc_t3.bdpt_max_pdfs,         max_bdpt_p);
         glc_Uniform1i (uloc_t3.bdpt_count_base,       bdpt_count_base);
-        glc_Uniform1i (uloc_t3.bdpt_spectral_base,    bdpt_spectral_base_f);
-        glc_Uniform1i (uloc_t3.bdpt_pdf_base,         bdpt_pdf_base_f);
+        glc_Uniform1i (uloc_t3.bdpt_spectral_base,    (int)bdpt_spectral_base_f);
+        glc_Uniform1i (uloc_t3.bdpt_pdf_base,         (int)bdpt_pdf_base_f);
         /* n_hits uniform intentionally omitted — T3 reads from MetaBuf[bdpt_count_base+3] */
         if (prog_dispatch_prep) {
             /* Indirect dispatch: workgroup count written by dispatch_prep into counters[5..7] */
@@ -10455,7 +11453,7 @@ public:
             bind_ssbo(ssbo_counter,        0);
             bind_ssbo(ssbo_t3_meta,        1);
             bind_ssbo(ssbo_splat_indirect, 2);
-            glc_DispatchCompute(1, 1, 1);
+            GLC_DISPATCH_CHECKED("post-t3-prep", 1, 1, 1);
             glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
         }
 
@@ -10951,6 +11949,17 @@ public:
         }
 
         /* Children were fully consumed GPU-resident; none escaped to Q_intent. */
+        if (ps.cfg.t5_profile) {
+            int64_t input_flash = 0, input_sensor = 0;
+            for (const auto& ri : batch)
+                ((ri.color_flag & 1u) != 0u ? input_sensor : input_flash)++;
+            fprintf(stderr,
+                    "[gpu-path-profile] input(light/camera)=%lld/%lld "
+                    "primary_hit/miss=%u/%u host_visible_hits=%d\n",
+                    (long long)input_flash, (long long)input_sensor,
+                    profile_initial_hits, profile_initial_misses, total_n_hits);
+            fflush(stderr);
+        }
         if (out_flash_children)  *out_flash_children  = 0;
         if (out_sensor_children) *out_sensor_children = 0;
         return total_n_hits;
@@ -11060,6 +12069,31 @@ public:
              * while the GPU thread is stuck in an infinite cv_.wait).      */
             batch.clear();
             int gpu_bsz = ps.stats[0].batch_sz_gpu.load(std::memory_order_relaxed);
+            /* Clamp the adaptive pop size so the per-batch GPU footprint
+             * (intent buffer + 4 double-buffered hit rows per intent) stays
+             * within ~20% of dedicated VRAM.  The unclamped doubling reached
+             * 1M intents ≈ 4+ GiB of hit buffers at large sensor-res. */
+            if (gpu_batch_clamp == 0) {
+                static constexpr GLenum DEDICATED_VIDMEM_NVX = 0x9047;
+                GLint vram_kb = 0;
+                glGetIntegerv(DEDICATED_VIDMEM_NVX, &vram_kb);
+                while (glGetError() != GL_NO_ERROR) {}
+                const double vram_bytes = vram_kb > 0
+                    ? (double)vram_kb * 1024.0 : 6.0 * 1073741824.0;
+                static constexpr double COMBINED_INTENT_B =
+                    (46.0 + 4.0 * MAX_SPECTRAL_BANDS) * 4.0;
+                static constexpr double HIT_ROWS_B =
+                    4.0 * 2.0 * (double)HIT_STRIDE_BYTES;  /* 4 hits × 2 buffers */
+                const double per_intent = (COMBINED_INTENT_B + HIT_ROWS_B) * 1.125;
+                gpu_batch_clamp = std::max(65536,
+                    (int)(vram_bytes * 0.20 / per_intent));
+                fprintf(stderr,
+                        "[gpu-dispatch] batch clamp: VRAM %.1f GiB -> max %d "
+                        "intents/batch (%.0f B per intent)\n",
+                        vram_bytes / 1073741824.0, gpu_batch_clamp, per_intent);
+                fflush(stderr);
+            }
+            gpu_bsz = std::min(gpu_bsz, gpu_batch_clamp);
             int n = ps.Q_intent.pop_batch_exclusive_priority_timed(
                 batch,
                 gpu_bsz,
@@ -11081,6 +12115,24 @@ public:
              * If in_flight==0, every ray (all bounce generations) has finished
              * for this dispatch cycle.  Fire T5 if both families are ready. */
             if (n < 0) {
+                /* Q_intent is empty and the global count is authoritative for
+                 * all resident bounce generations.  Reconcile the diagnostic
+                 * per-family counters here: GPU-resident children never return
+                 * to Q_intent, so an accounting drift must not strand T5. */
+                if (ps.in_flight.load(std::memory_order_acquire) == 0) {
+                    const int64_t stale_f = ps.bdpt_inflight_flash.exchange(
+                        0, std::memory_order_acq_rel);
+                    const int64_t stale_s = ps.bdpt_inflight_sensor.exchange(
+                        0, std::memory_order_acq_rel);
+                    if (stale_f != 0 || stale_s != 0) {
+                        fprintf(stderr,
+                            "[T5-accounting] reconciled idle family counters "
+                            "flash=%lld sensor=%lld\n",
+                            (long long)stale_f, (long long)stale_s);
+                        fflush(stderr);
+                    }
+                    bdpt_try_schedule_t5(&ps);
+                }
                 if (t5_job_ready.load(std::memory_order_acquire))
                     service_t5_job(ps);
                 if (dbg_job_ready.load(std::memory_order_acquire))
@@ -11121,7 +12173,7 @@ public:
                 /* Count parents by family before dispatch. */
                 int64_t flash_parents = 0, sensor_parents = 0;
                 for (const auto& ri : batch)
-                    if (ri.color_flag == 1) ++sensor_parents; else ++flash_parents;
+                    if ((ri.color_flag & 1u) != 0u) ++sensor_parents; else ++flash_parents;
 
                 int64_t flash_children = 0, sensor_children = 0;
                 int n_hits = dispatch_t1_t2_t3(ps, batch,
@@ -11147,6 +12199,59 @@ public:
                 service_t5_job(ps);
         }
         ps.gpu_dispatch_state.store(5, std::memory_order_release);
+    }
+
+    uint32_t prepare_vcm_grid(RayPipelineState& ps, uint32_t nlight, float radius) {
+        if (!ps.cfg.vcm_enabled || !prog_vcm_grid || !prog_vcm_merge || nlight == 0u)
+            return 0u;
+        uint32_t buckets = 1024u;
+        while (buckets < nlight * 2u && buckets < (1u << 30)) buckets <<= 1u;
+        if (buckets > cap_vcm_heads) {
+            ensure_ssbo(ssbo_vcm_heads, (GLsizeiptr)buckets * sizeof(uint32_t));
+            cap_vcm_heads = buckets;
+        }
+        if (nlight > cap_vcm_next) {
+            ensure_ssbo(ssbo_vcm_next, (GLsizeiptr)nlight * sizeof(uint32_t));
+            cap_vcm_next = nlight;
+        }
+        if (!ssbo_vcm_debug) ensure_ssbo(ssbo_vcm_debug, 8 * sizeof(uint32_t));
+        std::vector<uint32_t> empty_heads(buckets, 0xffffffffu);
+        uint32_t zero_dbg[8] = {};
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_vcm_heads);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
+                          (GLsizeiptr)empty_heads.size() * sizeof(uint32_t), empty_heads.data());
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_vcm_debug);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(zero_dbg), zero_dbg);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+        glc_UseProgram(prog_vcm_grid);
+        bind_ssbo(ssbo_t5_light, 0); bind_ssbo(ssbo_vcm_heads, 10);
+        bind_ssbo(ssbo_vcm_next, 11); bind_ssbo(ssbo_vcm_debug, 12);
+        glc_Uniform1ui(uloc_vcm_grid.nlight, nlight);
+        glc_Uniform1ui(uloc_vcm_grid.mask, buckets - 1u);
+        glc_Uniform1f(uloc_vcm_grid.radius, radius);
+        dispatch_1d_chunked(nlight, uloc_vcm_grid.base, "vcm-grid-build");
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        return buckets;
+    }
+
+    void dispatch_vcm_merge(RayPipelineState& ps, const T5GpuParams& par,
+                            uint32_t ncam, uint32_t buckets, float radius) {
+        if (!ps.cfg.vcm_enabled || !prog_vcm_merge || buckets == 0u || ncam == 0u) return;
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_t5_params);
+        glc_BufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(T5GpuParams), &par);
+        glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+        glc_UseProgram(prog_vcm_merge);
+        bind_ssbo(ssbo_t5_light,0); bind_ssbo(ssbo_t5_cam,1);
+        bind_ssbo((ps.cfg.gpu_skip_record_readback ? ssbo_sensor_rgb : ssbo_t5_pix),2);
+        bind_ssbo(ssbo_t5_params,3); bind_ssbo(ssbo_t5_spectral,4);
+        bind_ssbo(ssbo_mat_band,8); bind_ssbo(ssbo_vcm_heads,10);
+        bind_ssbo(ssbo_vcm_next,11); bind_ssbo(ssbo_vcm_debug,12);
+        glc_Uniform1ui(uloc_vcm_merge.mask,buckets-1u);
+        glc_Uniform1f(uloc_vcm_merge.radius,radius);
+        glc_Uniform1i(uloc_vcm_merge.nmats,ps.st ? ps.st->mat_n_mats : 0);
+        dispatch_1d_chunked(ncam,uloc_vcm_merge.base,"vcm-merge");
+        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     }
 
     /* ── service_t5_job: runs on the GPU thread when t5_job_ready is set ── *
@@ -11226,6 +12331,27 @@ public:
         if (nlv) upload(ssbo_t5_light,    lv.data(), (GLsizeiptr)(nlv * sizeof(float)));
         if (nsw) upload(ssbo_t5_spectral, sw.data(), (GLsizeiptr)(nsw * sizeof(float)));
 
+        /* Progressive VCM radius.  alpha=1 leaves the user radius fixed;
+         * alpha<1 shrinks it asymptotically without changing any camera,
+         * material, Fresnel, or delta-scatter mechanics. */
+        const float vcm_alpha = std::max(1.0e-4f, std::min(1.0f, ps.cfg.vcm_radius_alpha));
+        const float vcm_radius = ps.cfg.vcm_merge_radius_m * std::pow(
+            static_cast<float>(vcm_pass_index + 1u), 0.5f * (vcm_alpha - 1.0f));
+        const uint32_t vcm_buckets = prepare_vcm_grid(
+            ps, par.n_light_verts, std::max(vcm_radius, 1.0e-7f));
+        /* Weld-technique density for the T5 MIS denominator (0 = no merge
+         * pass, connection-only estimator).  Must match the radius used by
+         * the merge dispatches below. */
+        par.vm_area = vcm_buckets
+            ? static_cast<float>(M_PI) * vcm_radius * vcm_radius : 0.0f;
+        if (vcm_buckets) {
+            fprintf(stderr, "[VCM] pass=%llu radius=%.6g m photons=%u buckets=%u alpha=%.3f\n",
+                    (unsigned long long)(vcm_pass_index + 1u), vcm_radius,
+                    par.n_light_verts, vcm_buckets, vcm_alpha);
+            fflush(stderr);
+            ++vcm_pass_index;
+        }
+
         /* ── Pass C: GPU-resident T5 accumulation ─────────────────────────── *
          * Skip the tile loop entirely.  Bind ssbo_sensor_rgb at binding 2 so   *
          * the T5 shader writes directly into the global sensor accumulator.     *
@@ -11274,7 +12400,10 @@ public:
             const T5DispatchStats t5_stats =
                 dispatch_t5_pair_chunks(ps, par_c, n_cv_total, n_light_c,
                                         T5_CAM_BATCH_C, T5_LIGHT_BATCH_C,
-                                        "T5-gpu-C");
+                                        "T5-gpu-C",
+                                        ps.cfg.t5_pair_budget);
+
+            dispatch_vcm_merge(ps, par_c, n_cv_total, vcm_buckets, vcm_radius);
 
             glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
             fprintf(stderr,
@@ -11432,70 +12561,17 @@ public:
                 par.tile_h      = tile_h;
                 par.tile_w      = tile_w;
 
-                const uint32_t n_cbatches = (n_tile_cam + T5_CAM_BATCH - 1u) / T5_CAM_BATCH;
-
-                fprintf(stderr, "[T5-gpu tile(%d,%d) %d/%d] cam=%u lbatches=%u cbatches=%u\n",
-                        tx, ty, tiles_done + 1, n_tiles_total, n_tile_cam, n_batches, n_cbatches);
-                fflush(stderr);
-
-                /* ── Outer camera-batch loop (TDR guard for X-dispatch) ── */
-                for (uint32_t c = 0; c < n_cbatches && gpu_ok; ++c) {
-                    const uint32_t cam_batch_actual = std::min(T5_CAM_BATCH,
-                                                               n_tile_cam - c * T5_CAM_BATCH);
-                    par.cam_offset  = c * T5_CAM_BATCH;
-                    par.n_cam_verts = par.cam_offset + cam_batch_actual; /* upper bound */
-
-                    const GLuint wg_x = (cam_batch_actual + (uint32_t)T5_TILE_C - 1u)
-                                      / (uint32_t)T5_TILE_C;
-
-                    /* ── Inner light-batch loop (TDR guard for Y-dispatch) ── */
-                    for (uint32_t b = 0; b < n_batches && gpu_ok
-                                        && !ps.cancel.load(std::memory_order_relaxed); ++b) {
-                        par.light_offset     = b * T5_LIGHT_BATCH;
-                        par.light_batch_size = std::min(T5_LIGHT_BATCH,
-                                                        n_light - par.light_offset);
-                        upload(ssbo_t5_params, &par, sizeof(T5GpuParams));
-                        const GLuint wg_y = (par.light_batch_size + (uint32_t)T5_TILE_L - 1u)
-                                          / (uint32_t)T5_TILE_L;
-                        glc_DispatchCompute(wg_x, wg_y, 1u);
-                        glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-                        glFlush();
-                        GLenum gl_err = gpu_check_dispatch("T5:connect", wg_x, wg_y, 1u);
-                        if (gl_err != GL_NO_ERROR) {
-                            fprintf(stderr,
-                                    "[T5-gpu] GL error 0x%04x after cbatch %u/%u lbatch %u/%u tile(%d,%d) — TDR? aborting\n",
-                                    (unsigned)gl_err, c, n_cbatches, b, n_batches, tx, ty);
-                            fflush(stderr);
-                            gpu_ok = false;
-                            break;
-                        }
-                        /* Sync every 8 lbatches: drain the GPU command queue so
-                         * TDR protection applies per-batch, not per-full-run.
-                         * glFlush/glGetError above are non-blocking; glFinish here
-                         * is the actual CPU-GPU sync that makes accumulated work
-                         * safe to extend beyond. */
-                        const bool is_heartbeat = ((b & 7u) == 7u) || (b + 1u == n_batches);
-                        if (is_heartbeat) {
-                            glFinish();
-                            GLenum finish_err = glGetError();
-                            if (finish_err != GL_NO_ERROR) {
-                                fprintf(stderr,
-                                        "[T5-gpu] GL error 0x%04x after glFinish cbatch %u/%u lbatch %u/%u tile(%d,%d) — device lost? aborting\n",
-                                        (unsigned)finish_err, c + 1u, n_cbatches, b + 1u, n_batches, tx, ty);
-                                fflush(stderr);
-                                gpu_ok = false;
-                                break;
-                            }
-                            const auto now = std::chrono::steady_clock::now();
-                            const float elapsed = std::chrono::duration<float>(
-                                    now - tile_t0).count();
-                            fprintf(stderr, "[T5-gpu tile(%d,%d)] cbatch %u/%u lbatch %u/%u  %.1fs\n",
-                                    tx, ty, c + 1u, n_cbatches, b + 1u, n_batches, elapsed);
-                            fflush(stderr);
-                        }
-                    }
-                }
+        #include "t5_schedule_connect.cpp.inc"
                 if (!gpu_ok) break;
+
+                /* VM is a range query over every stored light subpath, so it
+                 * is independent of the VC pair budget and runs once per
+                 * camera vertex after the score-scheduled connection pass. */
+                par.cam_offset = 0u;
+                par.n_cam_verts = n_tile_cam;
+                par.light_offset = 0u;
+                par.light_batch_size = n_light;
+                dispatch_vcm_merge(ps, par, n_tile_cam, vcm_buckets, vcm_radius);
 
                 /* ── Readback tile pixel accum and scatter into full result ── *
                  * Skipped in production GPU mode; result stays zeroed and the   *
@@ -11762,7 +12838,7 @@ static ChildRay wave_arena_extract(const WaveArena& arena, const RayIntent& src)
  * is sensor (camera), everything else is flash (light). */
 static inline void bdpt_family_spawn(RayPipelineState& ps, uint8_t color_flag)
 {
-    if (color_flag == 1)
+    if ((color_flag & 1u) != 0u)
         ps.bdpt_inflight_sensor.fetch_add(1, std::memory_order_release);
     else
         ps.bdpt_inflight_flash.fetch_add(1, std::memory_order_release);
@@ -11771,7 +12847,7 @@ static inline void bdpt_family_spawn(RayPipelineState& ps, uint8_t color_flag)
 static void bdpt_family_finish(RayPipelineState& ps, uint8_t color_flag)
 {
     int64_t nf, ns;
-    if (color_flag == 1) {
+    if ((color_flag & 1u) != 0u) {
         nf = ps.bdpt_inflight_flash.load(std::memory_order_acquire);
         ns = ps.bdpt_inflight_sensor.fetch_add(-1, std::memory_order_acq_rel) - 1;
     } else {
@@ -11903,7 +12979,7 @@ static void pipeline_intersector(RayPipelineState& ps)
                  * physical power carriers — skip 1/r² spherical spread so they
                  * are not culled by the amplitude threshold before reaching the
                  * scene emitters on the far side of the lens stack. */
-                double spread = (intent.color_flag == 1) ? 1.0 : 1.0 / (1.0 + tot_len);
+                double spread = ((intent.color_flag & 1u) != 0u) ? 1.0 : 1.0 / (1.0 + tot_len);
                 amp_prop[b] *= std::polar(atten * spread, -k_med * t_hit);
             }
 
@@ -12027,7 +13103,7 @@ static void pipeline_intersector(RayPipelineState& ps)
              * on an emissive surface (T3 path).  Counting backward hits at the
              * plate from reflections would produce spurious sensor image
              * saturation before any emitter is found. */
-            if (ps.sensor_res > 0 && intent.color_flag == 0) {
+            if (ps.sensor_res > 0 && ((intent.color_flag & 1u) == 0u)) {
                 const float hx = static_cast<float>(hit_pos.x());
                 const float hy = static_cast<float>(hit_pos.y());
                 const float hz = static_cast<float>(hit_pos.z());
@@ -12385,7 +13461,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
                     add_signed(UV_CH_NORMAL_Y, hit_n.y());
                     add_signed(UV_CH_NORMAL_Z, hit_n.z());
                     const int split_base = UV_N_HDR_CHANNELS
-                        + ((hr.ray.color_flag == 1) ? 4 : 3) * st.n_bands;
+                        + (((hr.ray.color_flag & 1u) != 0u) ? 4 : 3) * st.n_bands;
                     for (int b = 0; b < nb; ++b) {
                         const std::complex<double> a = amp[b];
                         const double mag = std::abs(a);
@@ -12416,7 +13492,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
              * Use sensor_origin_y/z (set at submit time, propagated through all
              * children) so this works regardless of how many refractions the ray
              * passed through on its way from the sensor to the source. */
-            if (ps.sensor_res > 0 && hr.ray.color_flag == 1) {
+            if (ps.sensor_res > 0 && ((hr.ray.color_flag & 1u) != 0u)) {
                 const float sy    = hr.ray.sensor_origin_y;
                 const float sz    = hr.ray.sensor_origin_z;
                 const int   res   = ps.sensor_res;
@@ -12537,7 +13613,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
             const bool can_refract = snell_refract(in_dir, hit_n, n1, n2, refracted);
 
             /* ── BSSRDF forward: accumulate illumination (color_flag==0) ─────── */
-            if (hr.ray.color_flag == 0 && !st.tri_illum_accum.empty()) {
+            if (((hr.ray.color_flag & 1u) == 0u) && !st.tri_illum_accum.empty()) {
                 const float d_frac_il = mat_cache_diffusion(st.mat_cache, tri.mat_idx);
                 if (d_frac_il > 0.0f) {
                     const int nb_il  = st.tri_illum_nb;
@@ -12567,7 +13643,7 @@ static void pipeline_material(RayPipelineState& ps, uint64_t rng_seed)
              * directly into the sensor pixel accumulator.  The backward amplitude
              * is scaled by (1 − diffuse_frac) so the coherent refracted children
              * spawned below carry only the remaining coherent energy. */
-            if (hr.ray.color_flag == 1 && !st.tri_illum_accum.empty()) {
+            if (((hr.ray.color_flag & 1u) != 0u) && !st.tri_illum_accum.empty()) {
                 const float d_frac_bk = mat_cache_diffusion(st.mat_cache, tri.mat_idx);
                 if (d_frac_bk > 0.0f) {
                     const int nb_il  = st.tri_illum_nb;
@@ -13107,7 +14183,7 @@ void ray_pipeline_submit(
             for (int i = 0; i < n_intents; ++i) {
                 RayIntent ri = intents[i];
                 if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
-                if (ri.color_flag == 1u) ++n_sensor; else ++n_flash;
+                if ((ri.color_flag & 1u) != 0u) ++n_sensor; else ++n_flash;
                 batch.push_back(std::move(ri));
             }
             ps->in_flight.fetch_add(n_intents, std::memory_order_release);
@@ -13126,7 +14202,7 @@ void ray_pipeline_submit(
         if (min_amp > ri.min_amplitude) ri.min_amplitude = min_amp;
         const uint8_t color_flag = ri.color_flag;
         ps->in_flight.fetch_add(1, std::memory_order_release);
-        if (color_flag == 1u)
+        if ((color_flag & 1u) != 0u)
             ps->bdpt_inflight_sensor.fetch_add(1, std::memory_order_release);
         else
             ps->bdpt_inflight_flash.fetch_add(1, std::memory_order_release);
@@ -13138,7 +14214,7 @@ void ray_pipeline_submit(
                 : ps->Q_intent.push(std::move(ri)));
         if (!accepted) {
             ps->in_flight.fetch_sub(1, std::memory_order_acq_rel);
-            if (color_flag == 1u)
+            if ((color_flag & 1u) != 0u)
                 ps->bdpt_inflight_sensor.fetch_sub(1, std::memory_order_acq_rel);
             else
                 ps->bdpt_inflight_flash.fetch_sub(1, std::memory_order_acq_rel);
@@ -13474,9 +14550,20 @@ int ray_pipeline_submit_emissive_triangles(
             const int mat = T.mat_idx;
             cd emit[MAX_SPECTRAL_BANDS] = {};
             double emit_sum = 0.0;
+            /* Spectral path sampling: one wavelength per geometric path.
+             * Carrying every band in every ray forces a deterministic
+             * reflection+transmission split at each lens surface and grows
+             * exponentially through a compound lens.  The emitter already
+             * launches many stratified samples, so assign them round-robin to
+             * bands and compensate by nb.  The expectation is the original
+             * full spectrum, while each path retains its exact band IOR. */
+            const int sampled_band = static_cast<int>(seq++ % static_cast<uint64_t>(nb));
             for (int b = 0; b < nb; ++b) {
                 const double e = std::max(0.0, static_cast<double>(mat_band_record(st, mat, b)[5]));
-                const double a = scale * domain.geom_area * e / static_cast<double>(std::max(1, n_domain));
+                const double a = (b == sampled_band)
+                    ? scale * domain.geom_area * e * static_cast<double>(nb)
+                        / static_cast<double>(std::max(1, n_domain))
+                    : 0.0;
                 emit[b] = cd(a, 0.0);
                 emit_sum += a;
             }
@@ -13858,43 +14945,39 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     intents.reserve(static_cast<size_t>(limit));
 
     struct MortonPixel {
+        uint32_t tile_key;
         uint32_t local_key;
-        uint32_t ap_key;
-        uint32_t coarse_key;
         int pix;
-        int ap_idx;
     };
-    const int film_limit = std::max(1, std::min(limit, total));
 
-    /* Pixel schedule cache — the full sorted list is identical across all
-     * batch calls within a sweep (same res/n_ap/seed/film_limit).  Rebuild
-     * only when any of those parameters change; reuse on every subsequent
-     * batch call so the O(n log n) sort runs once per sweep, not once per
-     * batch.  Static is safe because only one pipeline submits at a time. */
+    /* Stable spatial pixel schedule.  Keep aperture samples out of this
+     * vector: a 1024^2 film at 192 pupil samples previously allocated and
+     * sorted ~201 million MortonPixel entries before tracing.  Aperture is the
+     * inner dimension now, so schedule ordinal `ord` maps to
+     * pixels[ord / n_ap], ap_idx=ord % n_ap.  Memory is therefore O(pixels),
+     * not O(pixels*aperture_samples).
+     *
+     * The old cache also included `film_limit`, which was derived from the
+     * CURRENT submit size.  A short final batch consequently rebuilt a
+     * different order while retaining its old pix_offset, duplicating some
+     * samples and omitting others.  This order depends only on resolution and
+     * a fixed work-tile side, so every slice is an exact partition of one
+     * immutable global schedule. */
+    static constexpr int SENSOR_WORK_TILE_SIDE = 32;
     struct PixSchedCache {
         int      res        = -1;
-        int      n_ap       = 0;
-        uint64_t seed       = ~uint64_t(0);
-        int      film_limit = -1;
+        int      tile_side  = 0;
         std::vector<MortonPixel> pixels;
     };
     static PixSchedCache s_pix_sched;
 
-    if (s_pix_sched.res        != res        ||
-        s_pix_sched.n_ap       != n_ap       ||
-        s_pix_sched.seed       != aperture_seed ||
-        s_pix_sched.film_limit != film_limit) {
-
-        const int coverage_stride = (film_limit > 0)
-            ? static_cast<int>(std::ceil(static_cast<double>(total) / static_cast<double>(film_limit)))
-            : 1;
-        const int tile_side = std::max(1, static_cast<int>(
-            std::ceil(std::sqrt(static_cast<double>(std::max(1, coverage_stride))))));
+    if (s_pix_sched.res != res || s_pix_sched.tile_side != SENSOR_WORK_TILE_SIDE) {
+        const int tile_side = SENSOR_WORK_TILE_SIDE;
         const int tiles_y = std::max(1, (res + tile_side - 1) / tile_side);
         const int tiles_z = tiles_y;
 
         s_pix_sched.pixels.clear();
-        s_pix_sched.pixels.reserve(static_cast<size_t>(schedule_total));
+        s_pix_sched.pixels.reserve(static_cast<size_t>(total));
         for (int pix = 0; pix < total; ++pix) {
             const int iy = pix / res;
             const int iz = pix - iy * res;
@@ -13906,26 +14989,18 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
             const double lv = (static_cast<double>(ly) + 0.5) / static_cast<double>(tile_side);
             const double cu = (static_cast<double>(tz) + 0.5) / static_cast<double>(tiles_z);
             const double cv = (static_cast<double>(ty) + 0.5) / static_cast<double>(tiles_y);
-            const uint32_t local_key  = rt_morton_encode4_8(lu, lv, 0.5, 0.5);
-            const uint32_t coarse_key = rt_morton_encode4_8(cu, cv, 0.5, 0.5);
-            for (int ap = 0; ap < n_ap; ++ap) {
-                double adx = 0.0, ady = 0.0, au = 0.5, av = 0.5;
-                aperture_sample_at(ap, adx, ady, au, av);
-                const uint32_t ap_key = rt_morton_encode4_8(0.5, 0.5, au, av);
-                s_pix_sched.pixels.push_back(MortonPixel{local_key, ap_key, coarse_key, pix, ap});
-            }
+            const uint32_t local_key = rt_morton_encode4_8(lu, lv, 0.5, 0.5);
+            const uint32_t tile_key  = rt_morton_encode4_8(cu, cv, 0.5, 0.5);
+            s_pix_sched.pixels.push_back(MortonPixel{tile_key, local_key, pix});
         }
         std::stable_sort(s_pix_sched.pixels.begin(), s_pix_sched.pixels.end(),
                          [](const MortonPixel& a, const MortonPixel& b) {
-                             if (a.local_key  != b.local_key)  return a.local_key  < b.local_key;
-                             if (a.ap_key     != b.ap_key)     return a.ap_key     < b.ap_key;
-                             if (a.coarse_key != b.coarse_key) return a.coarse_key < b.coarse_key;
+                             if (a.tile_key  != b.tile_key)  return a.tile_key  < b.tile_key;
+                             if (a.local_key != b.local_key) return a.local_key < b.local_key;
                              return a.pix < b.pix;
                          });
-        s_pix_sched.res        = res;
-        s_pix_sched.n_ap       = n_ap;
-        s_pix_sched.seed       = aperture_seed;
-        s_pix_sched.film_limit = film_limit;
+        s_pix_sched.res       = res;
+        s_pix_sched.tile_side = tile_side;
     }
     const std::vector<MortonPixel>& pixels = s_pix_sched.pixels;
 
@@ -13945,7 +15020,9 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
     };
 
     for (int ord = start; ord < schedule_total && static_cast<int>(intents.size()) < limit; ++ord) {
-        const MortonPixel& mp = pixels[static_cast<size_t>(ord)];
+        const int pixel_ord = ord / n_ap;
+        const int ap_idx = ord - pixel_ord * n_ap;
+        const MortonPixel& mp = pixels[static_cast<size_t>(pixel_ord)];
         const int pix = mp.pix;
         const int iy = pix / res;
         const int iz = pix - iy * res;
@@ -13958,7 +15035,7 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
             continue;
         V3d pos(static_cast<double>(ps->sensor_px), y, z);
         double ap_dx = 0.0, ap_dy = 0.0, ap_u = 0.5, ap_v = 0.5;
-        aperture_sample_at(mp.ap_idx, ap_dx, ap_dy, ap_u, ap_v);
+        aperture_sample_at(ap_idx, ap_dx, ap_dy, ap_u, ap_v);
         V3d target(target_x, target_y + target_r * ap_dx, target_z + target_r * ap_dy);
         V3d dir = (target_mode == 1) ? (pos - target) : (target - pos);
         if (dir.squaredNorm() <= 1e-24)
@@ -13969,8 +15046,17 @@ int ray_pipeline_submit_sensor_sweep(RayPipelineState* ps,
         RayIntent ri;
         ri.pos = pos + dir * (T_SELF * 256.0);
         ri.dir = dir;
-        ri.amp_scalar  = static_cast<float>(exposure_w * shutter_w);
-        ri.amp_n_bands = static_cast<int8_t>(std::min(n_bands, (int)std::numeric_limits<int8_t>::max()));
+        /* Spectral path sampling, paired with the stochastic dispersive
+         * interface path in ray_material.comp.glsl.  With n_ap aperture
+         * samples, every band receives floor/ceil(n_ap/n_bands) positions on
+         * every pixel's physical aperture disk.  Multiplication by n_bands is
+         * the 1/pdf wavelength-sampling weight. */
+        const int sampled_band = ap_idx % n_bands;
+        ri.amp = Eigen::VectorXcd::Zero(n_bands);
+        ri.amp[sampled_band] =
+            cd(exposure_w * shutter_w * static_cast<double>(n_bands), 0.0);
+        ri.amp_scalar  = 0.0f;
+        ri.amp_n_bands = 0;
         ri.src_id = pix;
         ri.tag = pack_film_tag(u, v);
         ri.color_flag = 1u;
@@ -14413,6 +15499,7 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
 
     /* ── GPU path: full brute-force dispatch ────────────────────────────── */
     const bool gpu_t5_ok = ps->cfg.use_gpu_compute
+                        && !ps->cfg.force_cpu_t5
                         && ps->gpu_dispatch != nullptr
                         && n_lv > 0
                         && !cam_items.empty();
@@ -14465,7 +15552,9 @@ void ray_pipeline_run_bdpt_connection(RayPipelineState* ps)
                 /* pdf_flags [17] — BdptPdfRecord::flags for delta-specular / diffuse / GGX bits */
                 {
                     const BdptPdfRecord* pr17 = ctx.pdf_for(c.subpath_id, c.vertex_index);
-                    const uint32_t pf = pr17 ? pr17->flags : 0u;
+                    uint32_t pf = pr17 ? pr17->flags : 0u;
+                    if (ci == 0 && c.stream == BDPT_SIDE_SENSOR)
+                        pf |= BDPT_PDF_FLAG_SENSOR;
                     std::memcpy(&p[17], &pf, sizeof(uint32_t));
                 }
                 /* optical_block [18] — set if any blocking optical event (absorb/TIR/clip) */
@@ -14688,6 +15777,7 @@ static void t5_kpn_worker(RayPipelineState* ps)
         tok.clear();
         int n = ps->Q_t5_ready.pop_batch(tok, 1);   /* BLOCKS until sentinel */
         if (n == 0) break;                           /* set_done → exit */
+        ps->bdpt_t5_queued.store(false, std::memory_order_release);
         fprintf(stderr, "[T5-kpn] sentinel received — running connection pass\n");
         fflush(stderr);
         try {
@@ -14730,6 +15820,7 @@ void ray_pipeline_signal_flash_dispatched(RayPipelineState* ps)
             ps->bdpt_sensor_dispatched.load(std::memory_order_acquire),
             ps->bdpt_t5_fired.load(std::memory_order_acquire));
     fflush(stderr);
+    bdpt_try_schedule_t5(ps);
 }
 
 void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps)
@@ -14741,6 +15832,7 @@ void ray_pipeline_signal_sensor_dispatched(RayPipelineState* ps)
             ps->bdpt_flash_dispatched.load(std::memory_order_acquire),
             ps->bdpt_t5_fired.load(std::memory_order_acquire));
     fflush(stderr);
+    bdpt_try_schedule_t5(ps);
 }
 
 void ray_pipeline_join_t5(RayPipelineState* ps)
@@ -14761,6 +15853,13 @@ void ray_pipeline_join_t5(RayPipelineState* ps)
         ps->bdpt_flash_dispatched.load(std::memory_order_acquire),
         ps->bdpt_sensor_dispatched.load(std::memory_order_acquire));
     if (need == 0) return;  /* no families submitted yet — nothing to join */
+    /* Watchdog: if the whole pipeline goes idle (no rays in flight, no T5
+     * scheduled or running) while fired < need, no zero-transition will ever
+     * re-arm the trigger — waiting longer cannot succeed.  30 s of contiguous
+     * idle ⇒ diagnostic + return, converting a silent hang into a loud,
+     * recoverable failure (caller sees an empty sensor image and raises). */
+    auto idle_t0 = std::chrono::steady_clock::now();
+    bool was_idle = false;
     for (;;) {
         /* If the GPU dispatch thread failed to start (make_current error),
          * rays will never be processed and T5 will never fire.  Bail out
@@ -14773,6 +15872,25 @@ void ray_pipeline_join_t5(RayPipelineState* ps)
         const uint32_t fired   = ps->bdpt_t5_fired.load(std::memory_order_acquire);
         const bool     running = ps->bdpt_connection_running.load(std::memory_order_acquire);
         if (fired >= need && !running) break;
+        const bool pending = ps->bdpt_gpu_t5_pending.load(std::memory_order_acquire);
+        const bool idle = !running && !pending
+                       && ps->in_flight.load(std::memory_order_acquire) == 0;
+        const auto now = std::chrono::steady_clock::now();
+        if (!idle) {
+            was_idle = false;
+        } else if (!was_idle) {
+            was_idle = true;
+            idle_t0 = now;
+        } else if (now - idle_t0 > std::chrono::seconds(30)) {
+            fprintf(stderr,
+                    "[join-t5] WATCHDOG: pipeline idle 30s with t5_fired=%u < "
+                    "need=%u (no rays in flight, no T5 pending/running) — a T5 "
+                    "pass was lost. Returning without it; expect an empty/partial "
+                    "sensor image this cycle.\n",
+                    fired, need);
+            fflush(stderr);
+            return;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 }
@@ -14838,9 +15956,48 @@ void ray_pipeline_set_t5_sensor_tile_size(RayPipelineState* ps, uint32_t n)
     if (ps->gpu_dispatch) ps->gpu_dispatch->t5_sensor_tile_size = n;
 }
 
+void ray_pipeline_set_t5_pair_budget(RayPipelineState* ps, uint64_t n)
+{
+    if (!ps) return;
+    ps->cfg.t5_pair_budget = n;
+}
+
+void ray_pipeline_set_t5_backlog_policy(RayPipelineState* ps,
+                                        float share_base, float share_max,
+                                        int max_snapshots, uint64_t max_bytes)
+{
+    if (!ps) return;
+    ps->cfg.t5_backlog_share_base    = std::max(0.0f, share_base);
+    ps->cfg.t5_backlog_share_max     = std::min(0.95f, std::max(0.0f, share_max));
+    ps->cfg.t5_backlog_max_snapshots = std::max(0, max_snapshots);
+    ps->cfg.t5_backlog_max_bytes     = max_bytes;
+}
+
+void ray_pipeline_set_bdpt_record_float_budget(RayPipelineState* ps, uint64_t n_floats)
+{
+    if (!ps) return;
+    ps->cfg.bdpt_record_float_budget = n_floats;
+}
+
 void ray_pipeline_set_t5_profile(RayPipelineState* ps, bool v)
 {
     if (ps) ps->cfg.t5_profile = v;
+}
+
+void ray_pipeline_set_vcm(RayPipelineState* ps, bool enabled,
+                          float merge_radius_m, float radius_alpha)
+{
+    if (!ps || !(merge_radius_m > 0.0f) || !std::isfinite(merge_radius_m) ||
+        !(radius_alpha > 0.0f && radius_alpha <= 1.0f) || !std::isfinite(radius_alpha))
+        return;
+    ps->cfg.vcm_enabled = enabled;
+    ps->cfg.vcm_merge_radius_m = merge_radius_m;
+    ps->cfg.vcm_radius_alpha = radius_alpha;
+}
+
+void ray_pipeline_set_max_children(RayPipelineState* ps, int n)
+{
+    if (ps) ps->cfg.max_children = std::max(1, n);
 }
 
 void ray_pipeline_begin_sensor_batching(RayPipelineState* ps)
@@ -14865,7 +16022,10 @@ void ray_pipeline_end_sensor_batching(RayPipelineState* ps)
     ps->bdpt_stash_opt.clear();
 }
 
-void ray_pipeline_set_force_cpu_t5(RayPipelineState* /*ps*/, bool /*v*/) {}
+void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v)
+{
+    if (ps) ps->cfg.force_cpu_t5 = v;
+}
 
 void ray_pipeline_set_flash_modifier(RayPipelineState* ps, FlashModifierType type,
                                       float param0, float param1)
@@ -15050,6 +16210,25 @@ void ray_pipeline_get_sensor_image(
         {
             const double* peak = ps->sensor_peak_gpu;
             const uint32_t* src = ps->sensor_accum_gpu.data();
+            std::vector<float> positive_scale;
+            positive_scale.reserve(pix);
+            for (size_t i = 0; i < pix; ++i) {
+                float fr, fg, fb;
+                std::memcpy(&fr, &src[i],         sizeof(float));
+                std::memcpy(&fg, &src[i + pix],   sizeof(float));
+                std::memcpy(&fb, &src[i + 2*pix], sizeof(float));
+                const float m = std::max({fr, fg, fb});
+                if (m > 0.0f && std::isfinite(m)) positive_scale.push_back(m);
+            }
+            double common_peak = std::max({peak[0], peak[1], peak[2], 1.0e-30});
+            if (!positive_scale.empty()) {
+                const size_t q = std::min(positive_scale.size() - 1,
+                    (size_t)std::floor(0.99 * (double)(positive_scale.size() - 1)));
+                std::nth_element(positive_scale.begin(), positive_scale.begin() + q,
+                                 positive_scale.end());
+                common_peak = std::max((double)positive_scale[q], 1.0e-30);
+            }
+            size_t dbg_lit = 0;
             for (int y = 0; y < res; ++y) {
                 const int out_y = res - 1 - y;
                 for (int z = 0; z < res; ++z) {
@@ -15059,10 +16238,20 @@ void ray_pipeline_get_sensor_image(
                     std::memcpy(&fr, &src[sp],          sizeof(float));
                     std::memcpy(&fg, &src[sp + pix],    sizeof(float));
                     std::memcpy(&fb, &src[sp + 2*pix],  sizeof(float));
-                    buf[dp * 3 + 0] = tone((double)fr, peak[0]);
-                    buf[dp * 3 + 1] = tone((double)fg, peak[1]);
-                    buf[dp * 3 + 2] = tone((double)fb, peak[2]);
+                    if (std::isfinite(fr + fg + fb) && fr + fg + fb > 0.0f)
+                        ++dbg_lit;
+                    buf[dp * 3 + 0] = tone((double)fr, common_peak);
+                    buf[dp * 3 + 1] = tone((double)fg, common_peak);
+                    buf[dp * 3 + 2] = tone((double)fb, common_peak);
                 }
+            }
+            if (ps->cfg.t5_profile) {
+                fprintf(stderr,
+                        "[sensor-readback] source=gpu-shadow lit=%zu/%zu exposure_p99=%.3e peaks=(%.3e %.3e %.3e) fired=%u running=%d\n",
+                        dbg_lit, pix, common_peak, peak[0], peak[1], peak[2],
+                        ps->bdpt_t5_fired.load(std::memory_order_acquire),
+                        ps->bdpt_connection_running.load(std::memory_order_acquire) ? 1 : 0);
+                fflush(stderr);
             }
             return;
         }
@@ -15073,15 +16262,31 @@ void ray_pipeline_get_sensor_image(
     std::scoped_lock lk(ps->sensor_mu[0], ps->sensor_mu[1], ps->sensor_mu[2]);
     /* Peaks are tracked incrementally at each write to sensor_accum. */
     const double* peak = ps->sensor_peak;
+    std::vector<double> positive_scale;
+    positive_scale.reserve(pix);
+    for (size_t i = 0; i < pix; ++i) {
+        const double m = std::max({ps->sensor_accum[i],
+                                   ps->sensor_accum[pix + i],
+                                   ps->sensor_accum[2*pix + i]});
+        if (m > 0.0 && std::isfinite(m)) positive_scale.push_back(m);
+    }
+    double common_peak = std::max({peak[0], peak[1], peak[2], 1.0e-30});
+    if (!positive_scale.empty()) {
+        const size_t q = std::min(positive_scale.size() - 1,
+            (size_t)std::floor(0.99 * (double)(positive_scale.size() - 1)));
+        std::nth_element(positive_scale.begin(), positive_scale.begin() + q,
+                         positive_scale.end());
+        common_peak = std::max(positive_scale[q], 1.0e-30);
+    }
     /* Output layout: (res, res, 3) RGB, rows written bottom-first (y-flipped). */
     for (int y = 0; y < res; ++y) {
         const int out_y = res - 1 - y;
         for (int z = 0; z < res; ++z) {
             const size_t src_px = static_cast<size_t>(y * res + z);
             const size_t dst_px = static_cast<size_t>(out_y * res + z);
-            buf[dst_px * 3 + 0] = tone(ps->sensor_accum[0 * pix + src_px], peak[0]);
-            buf[dst_px * 3 + 1] = tone(ps->sensor_accum[1 * pix + src_px], peak[1]);
-            buf[dst_px * 3 + 2] = tone(ps->sensor_accum[2 * pix + src_px], peak[2]);
+            buf[dst_px * 3 + 0] = tone(ps->sensor_accum[0 * pix + src_px], common_peak);
+            buf[dst_px * 3 + 1] = tone(ps->sensor_accum[1 * pix + src_px], common_peak);
+            buf[dst_px * 3 + 2] = tone(ps->sensor_accum[2 * pix + src_px], common_peak);
         }
     }
 }

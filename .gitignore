@@ -34,3 +34,6 @@ build/
 
 csrc_bin/
 csrc_build/
+
+# Runtime logs
+*.log

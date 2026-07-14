@@ -21,12 +21,13 @@ layout(local_size_x = 64) in;
 layout(std430, binding = 0) coherent buffer SortKeysBuf { uint sort_keys[]; };
 layout(std430, binding = 1) coherent buffer SortIdxBuf  { uint sort_idx[];  };
 
-uniform int k;    /* outer loop step (power of 2) */
-uniform int j;    /* inner loop stride (power of 2) */
-uniform int npad; /* padded array length             */
+uniform int k;        /* outer loop step (power of 2) */
+uniform int j;        /* inner loop stride (power of 2) */
+uniform int npad;     /* padded array length             */
+uniform int base_idx; /* chunk offset for split dispatches */
 
 void main() {
-    int t = int(gl_GlobalInvocationID.x);
+    int t = base_idx + int(gl_GlobalInvocationID.x);
     if (t >= npad / 2) return;
 
     /* Compute the pair (lo, hi) for this thread using the standard bitonic formula. */

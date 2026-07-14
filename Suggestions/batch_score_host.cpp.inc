@@ -2,10 +2,14 @@
  * batch_score_host.cpp.inc  —  harness to dispatch batch_score.comp.glsl and
  * read the per-(cam-batch, light-batch) scores back to disk for inspection.
  *
- * This is the "scoring shader first" path: it does NOT yet reorder or skip any
- * T5 dispatch. It runs the prepass, dumps scores.bin, and (optionally) prints a
- * now/idle split preview so you can choose wA/wB/wC and a cut point before we
- * wire the drain-when-empty scheduler into the hot loop.
+ * This is the "scoring shader first" path: it does NOT reorder or skip any T5
+ * dispatch.  It runs the prepass, dumps scores.bin, and prints a now/idle split
+ * preview so you can choose wA/wB/wC and a cut point.
+ *
+ * >>> THIS FILE ALONE DOES NOT CHANGE RENDER BEHAVIOUR. <<<
+ * Prioritization at runtime requires t5_schedule_connect.cpp.inc, which uses
+ * the scores produced here to drive the dispatch order.  If you only apply this
+ * file, the image renders identically to today — that is expected.
  *
  * ── One-time setup (next to where prog_t5 is created, ~line 9536) ───────────
  *
@@ -14,7 +18,6 @@
  *     if (!load_compute_program("batch_score.comp.glsl", prog_batch_score)) {
  *         fprintf(stderr, "[batch-score] not loaded — triage disabled\n");
  *     }
- *     // Cache uniform locations once:
  *     const GLint u_bs_ncam   = glGetUniformLocation(prog_batch_score, "n_cam_verts");
  *     const GLint u_bs_nlight = glGetUniformLocation(prog_batch_score, "n_light_verts");
  *     const GLint u_bs_cbsz   = glGetUniformLocation(prog_batch_score, "cam_batch_sz");
@@ -33,7 +36,7 @@
  *     GLsizeiptr cap_batch_score = 0;
  *
  * `load_compute_program` is the non-BVH twin of load_with_shadow_bvh; if you
- * don't have one, just compile+link the single stage the way load_with_shadow_bvh
+ * don't have one, compile+link the single stage the way load_with_shadow_bvh
  * does internally but skip the shadow preamble injection.
  *
  * ── Per-tile call: paste INSIDE the tile loop, AFTER n_tile_cam is known and
@@ -47,7 +50,6 @@ if (prog_batch_score && n_tile_cam > 0) {
     const size_t   n_units  = (size_t)n_cbatch * n_lbatch;
     const GLsizeiptr need   = (GLsizeiptr)(n_units * 4u * sizeof(float));
 
-    /* Grow / (re)create the score SSBO. */
     if (need > cap_batch_score) {
         cap_batch_score = need * 2;
         ensure_ssbo(ssbo_batch_score, cap_batch_score);
@@ -66,8 +68,6 @@ if (prog_batch_score && n_tile_cam > 0) {
     if (u_bs_ksamp  >= 0) glc_Uniform1ui(u_bs_ksamp,  256u);          /* tune */
     if (u_bs_mingeom>= 0) glc_Uniform1f (u_bs_mingeom, par.min_geom);
     if (u_bs_seed   >= 0) glc_Uniform1ui(u_bs_seed,   (GLuint)(tx*2654435761u ^ ty*40503u ^ 0x1234u));
-    /* Raw A/B/C are always emitted; these only shape the combined column S.
-     * Start neutral (all weight on A, no normalisation) and retune from the histogram. */
     if (u_bs_wA >= 0) glc_Uniform1f(u_bs_wA, 1.0f);
     if (u_bs_wB >= 0) glc_Uniform1f(u_bs_wB, 0.0f);
     if (u_bs_wC >= 0) glc_Uniform1f(u_bs_wC, 0.0f);
@@ -75,12 +75,10 @@ if (prog_batch_score && n_tile_cam > 0) {
     if (u_bs_nB >= 0) glc_Uniform1f(u_bs_nB, 1.0f);
     if (u_bs_nC >= 0) glc_Uniform1f(u_bs_nC, 1.0f);
 
-    /* One work-group per (cam-batch, light-batch) unit. */
     glc_DispatchCompute(n_cbatch, n_lbatch, 1u);
     glc_MemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     glFinish();
 
-    /* Read back and append to scores.bin (header: c,b counts as uint32). */
     std::vector<float> host_scores(n_units * 4u);
     glc_BindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo_batch_score);
     glc_GetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0,
@@ -95,8 +93,6 @@ if (prog_batch_score && n_tile_cam > 0) {
         std::fclose(f);
     }
 
-    /* Optional inline preview: how many units clear a trial cut on column S.
-     * "Never discard" means this is only a RUN-ORDER split, not a kill. */
     {
         const float trial_cut = 0.0f;     /* set after first histogram pass */
         size_t now_units = 0, idle_units = 0;
@@ -113,12 +109,3 @@ if (prog_batch_score && n_tile_cam > 0) {
         fflush(stderr);
     }
 }
-
-/* ── Next step once the histogram looks right ────────────────────────────────
- * The drain-when-empty scheduler then becomes: build an index array of the
- * n_units work cells, std::stable_sort it by host_scores[u*4+3] DESCENDING, and
- * drive the existing (c,b) dispatch from that order instead of the raw nested
- * loops. Nothing is dropped — low-score cells simply dispatch last, so a long
- * render keeps refining the "nothing" regions only after the high-yield ones
- * are done. The TDR heartbeat (glFinish every 8) carries over unchanged.
- * ───────────────────────────────────────────────────────────────────────────*/

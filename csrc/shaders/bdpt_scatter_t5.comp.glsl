@@ -23,6 +23,7 @@ layout(std430, binding = 3)          buffer T5CamBuf    { float t5_cam[];     };
 #define LGV_EDGE_BWD         55
 #define CGV_EDGE_FWD         60
 #define CGV_EDGE_BWD         61
+#define BDPT_PDF_FLAG_DELTA_SPECULAR (1u << 16)
 #define BDPT_OPT_TIR         2u
 #define BDPT_OPT_APERTURE_CLIP 3u
 #define BDPT_OPT_VIGNETTE_CLIP 4u
@@ -81,8 +82,19 @@ void scatter_spectral(uint r) {
     }
 }
 
-float pdf_area_to_target(float pf, float pr, float pa, float ps, bool reverse_pdf,
+float pdf_area_to_target(float pf, float pr, float pa, float ps, uint flags,
+                         bool reverse_pdf,
                          vec3 sampler_pos, vec3 target_pos, vec3 target_nrm) {
+    /* A delta-specular event is sampled in a discrete measure.  Its Fresnel
+     * reflection/transmission probability is a probability mass, not a
+     * solid-angle density.  Converting it with cos(theta)/distance^2 creates
+     * artificial inverse-square factors at every closely-spaced lens surface
+     * and drives the thick-lens MIS denominator to enormous values. */
+    if ((flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) {
+        float p_delta = reverse_pdf ? pr : pf;
+        return (p_delta > 0.0 && !isnan(p_delta) && !isinf(p_delta))
+            ? max(p_delta, 1e-12) : 0.0;
+    }
     if (!reverse_pdf && pa > 0.0 && !isnan(pa) && !isinf(pa))
         return pa;
 
@@ -105,7 +117,20 @@ float pdf_area_to_target(float pf, float pr, float pa, float ps, bool reverse_pd
 void scatter_pdf_to_stream(uint stream, uint sid, uint vi,
                            float pf, float pr, float pa, float ps, uint flags) {
     int p = find_sorted_pos(stream, sid, vi);
-    if (p < 0 || p + 1 >= nv) return;
+    if (p < 0) return;
+    /* Endpoint metadata is valid without a following edge. */
+    if (stream == 0u && p < n_lv) {
+        int ob = p * T5_LGV_STRIDE;
+        t5_light[ob + 11] = pf;
+        t5_light[ob + 12] = pr;
+        t5_light[ob + 13] = uintBitsToFloat(flags);
+    } else if (stream == 1u && p >= n_lv) {
+        int ob = (p - n_lv) * T5_CGV_STRIDE;
+        t5_cam[ob + 15] = pf;
+        t5_cam[ob + 16] = pr;
+        t5_cam[ob + 17] = uintBitsToFloat(flags);
+    }
+    if (p + 1 >= nv) return;
     uint key_hi = sort_keys[p * 2 + 0];
     if (sort_keys[(p + 1) * 2 + 0] != key_hi) return;
 
@@ -120,9 +145,9 @@ void scatter_pdf_to_stream(uint stream, uint sid, uint vi,
         t5_light[ob + 11] = pf;
         t5_light[ob + 12] = pr;
         t5_light[ob + 13] = uintBitsToFloat(flags);
-        t5_light[ob + LGV_EDGE_FWD] = pdf_area_to_target(pf, pr, pa, ps, false,
+        t5_light[ob + LGV_EDGE_FWD] = pdf_area_to_target(pf, pr, pa, ps, flags, false,
                                                           pos, nxt_pos, nxt_nrm);
-        t5_light[ob + LGV_EDGE_BWD] = pdf_area_to_target(pf, pr, pa, ps, true,
+        t5_light[ob + LGV_EDGE_BWD] = pdf_area_to_target(pf, pr, pa, ps, flags, true,
                                                           nxt_pos, pos, nrm);
     } else {
         if (p < n_lv) return;
@@ -135,9 +160,9 @@ void scatter_pdf_to_stream(uint stream, uint sid, uint vi,
         t5_cam[ob + 15] = pf;
         t5_cam[ob + 16] = pr;
         t5_cam[ob + 17] = uintBitsToFloat(flags);
-        t5_cam[ob + CGV_EDGE_FWD] = pdf_area_to_target(pf, pr, pa, ps, false,
+        t5_cam[ob + CGV_EDGE_FWD] = pdf_area_to_target(pf, pr, pa, ps, flags, false,
                                                         pos, nxt_pos, nxt_nrm);
-        t5_cam[ob + CGV_EDGE_BWD] = pdf_area_to_target(pf, pr, pa, ps, true,
+        t5_cam[ob + CGV_EDGE_BWD] = pdf_area_to_target(pf, pr, pa, ps, flags, true,
                                                         nxt_pos, pos, nrm);
     }
 }

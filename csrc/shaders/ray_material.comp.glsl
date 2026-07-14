@@ -589,7 +589,7 @@ void main() {
     int g_bdpt_slot = -1;  /* vertex slot returned by emit_bdpt_vertex, used by fill_bdpt_vertex_pdf */
     if (bdpt_sid != 0u && bdpt_max_verts > 0) {
         uint vi         = bdpt_vi;
-        uint stream_bit = (cflag == 1u) ? 1u : 0u;  /* 1=SENSOR, 0=LIGHT */
+        uint stream_bit = ((cflag & 1u) != 0u) ? 1u : 0u;  /* 1=SENSOR, 0=LIGHT */
         uint packed_vi  = (vi << 16) | (stream_bit << 8);  /* sample_domain=0=UNKNOWN */
         int  tri_idx_v  = hit_tri(hbase);
         int  mat_id_v   = hit_mat(hbase);
@@ -713,7 +713,7 @@ void main() {
                               uint(int(clamp(re * 32768.0, -UV_SAFE, UV_SAFE))));
                     atomicAdd(uv_accum[offset + (11 + 2 * n_bands + b) * n2 + texel],
                               uint(int(clamp(im * 32768.0, -UV_SAFE, UV_SAFE))));
-                    int split_base = 11 + ((cflag == 1u) ? 4 : 3) * n_bands;
+                    int split_base = 11 + (((cflag & 1u) != 0u) ? 4 : 3) * n_bands;
                     atomicAdd(uv_accum[offset + (split_base + b) * n2 + texel],
                               uint(clamp(mag * 65536.0, 0.0, float(0xFFFFFFFFu))));
                 }
@@ -754,6 +754,24 @@ void main() {
 
     /* ── Terminal: budget exhausted ── */
     if (bleft <= 0) {
+        /* The vertex remains a valid T5 connection endpoint even though this
+         * subpath will not spawn another sampled edge.  Previously it kept
+         * pdf_flags=0, causing endpoint BSDF evaluation to reject scene
+         * surfaces reached on the final allowed bounce (common after a thick
+         * lens consumes the preceding interactions).  Record every authored
+         * non-delta lobe; no outgoing-edge PDF is fabricated. */
+        float endpoint_diffuse = (mat_id >= 0) ? mat_diffusion(mat_id) : 0.0;
+        float endpoint_spec_p = max(0.0, 1.0 - endpoint_diffuse);
+        float endpoint_alpha = (mat_id >= 0) ? mat_ggx_alpha(mat_id) : 0.0;
+        uint endpoint_lobes = 0u;
+        if (endpoint_diffuse > 0.0)
+            endpoint_lobes |= BDPT_PDF_FLAG_DIFFUSE;
+        if (endpoint_spec_p > 0.0 && endpoint_alpha > 1.0e-3)
+            endpoint_lobes |= BDPT_PDF_FLAG_GGX;
+        else if (endpoint_spec_p > 0.0)
+            endpoint_lobes |= BDPT_PDF_FLAG_DELTA_SPECULAR;
+        fill_bdpt_vertex_pdf(g_bdpt_slot, 0.0, 0.0,
+                             uint(flags) | endpoint_lobes);
         uint tslot = atomicAdd(meta[1], 1u);
         write_terminal(tslot, hbase, false);
         return;
@@ -880,13 +898,21 @@ void main() {
                              tag_lo, tag_hi, cflag, 1.0, soy, soz, bdpt_sid, ta_re, ta_im);
             }
         } else {
-            /* ── Stochastic single-child fast path (achromatic, band 0) ───────
-             * One ray cannot represent per-band directions; this path keeps the
-             * band-0 refraction.  Use the deterministic split (max_children >= 2)
-             * for true dispersion. */
-            float n1 = has_pair ? medium_n_real(medium_from) : medium_n_real(medium);
-            float n2 = has_pair ? medium_n_real(medium_to)
-                                : (front_face ? medium_n_real(mat_id) : 1.0);
+            /* ── Stochastic single-child spectral path ───────────────────────
+             * Native camera/emitter launchers sample one wavelength per path.
+             * Use that active band's measured IOR, then sample Fresnel
+             * reflection/transmission.  This retains chromatic dispersion and
+             * unbiased Fresnel transport without exponentially duplicating a
+             * path at every surface of a compound lens. */
+            int active_band = 0;
+            float active_mag = -1.0;
+            for (int b = 0; b < nb; ++b) {
+                float m = amp_re[b]*amp_re[b] + amp_im[b]*amp_im[b];
+                if (m > active_mag) { active_mag = m; active_band = b; }
+            }
+            float n1 = medium_n_real_b(has_pair ? medium_from : medium, active_band);
+            float n2 = has_pair ? medium_n_real_b(medium_to, active_band)
+                                : (front_face ? medium_n_real_b(mat_id, active_band) : 1.0);
             vec3  refracted;
             bool  can_refract = snell_refract(in_dir, nrm, n1, n2, refracted);
 

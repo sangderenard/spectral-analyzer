@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "defaults": {
+    "image": {
+      "width": 64,
+      "height": 64
+    },
+    "camera": {
+      "focal_mm": 35.0,
+      "aperture_mm": 25.0
+    },
+    "exposure": {
+      "time_s": 0.016666666666666666,
+      "iso": 100.0,
+      "t5_pair_budget": 20000000
+    },
+    "flash": {
+      "intensity_scale": 1.0
+    },
+    "font": {
+      "family": "DejaVu Sans",
+      "weight": "bold",
+      "style": "normal"
+    },
+    "planes": [
+      {
+        "id": "backplate",
+        "center_m": [0.0, 0.0, 0.0],
+        "normal": [1.0, 0.0, 0.0],
+        "up": [0.0, 0.0, 1.0],
+        "size_m": [0.52, 0.42],
+        "thickness_m": 0.012,
+        "material": "matte_black"
+      }
+    ],
+    "materials": {
+      "matte_black": {
+        "albedo_rgb": [0.002, 0.002, 0.002],
+        "reflectivity": 0.012,
+        "diffusion": 0.94,
+        "absorption": 0.97,
+        "roughness": 0.9,
+        "metallic": 0.0
+      },
+      "glossy_red": {
+        "albedo_rgb": [0.78, 0.006, 0.004],
+        "reflectivity": 0.5,
+        "diffusion": 0.18,
+        "absorption": 0.31,
+        "roughness": 0.065,
+        "metallic": 0.08,
+        "ior": 1.52
+      }
+    },
+    "geometry": {
+      "embed_plane": "backplate",
+      "height_m": 0.2,
+      "depth_m": 0.032,
+      "embed_fraction": 0.5,
+      "offset_m": [0.0, 0.0],
+      "profile": "circular",
+      "profile_segments": 10,
+      "profile_bulge": 0.055,
+      "outline_subdivisions": 2,
+      "cap_grid": 30,
+      "material": "glossy_red"
+    }
+  },
+  "jobs": [
+    {
+      "id": "glyph_A",
+      "token": "A"
+    }
+  ]
+}

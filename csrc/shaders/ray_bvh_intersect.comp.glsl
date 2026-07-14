@@ -317,7 +317,7 @@ void main() {
         float alpha    = atmo_b + k_real_b * n_im;
         float atten    = exp(-alpha * best_t);
         /* Backward rays (color_flag==1): no geometric spreading (importance sampling) */
-        float spread   = (color_flag == 1u) ? 1.0 : 1.0 / (1.0 + tot_len);
+        float spread   = ((color_flag & 1u) != 0u) ? 1.0 : 1.0 / (1.0 + tot_len);
         float amp_scale = atten * spread;
         float phase     = -k_med * best_t;
         float cos_p     = cos(phase);

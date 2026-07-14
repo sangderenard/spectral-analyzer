@@ -166,7 +166,7 @@ void emit_bdpt_optical(int hb, uint reason, uint element_index, uint flags,
 
     uint vi = uint(max(0, hit_i(hb, 17))) & 0xFFFFu;
     uint cflag = hit_u(hb, 16);
-    uint stream = (cflag == 1u) ? 1u : 0u;
+    uint stream = ((cflag & 1u) != 0u) ? 1u : 0u;
     uint packed_ve = vi | ((element_index & 0xFFFFu) << 16);
     uint packed_rf = (reason & 0xFFu) | ((stream & 0xFFu) << 8) | ((flags & 0xFFFFu) << 16);
 
@@ -351,7 +351,7 @@ void parametric_lens_teleport(int hb, int pay_off)
 
     vec3 ray_pos = vec3(hit_f(hb, 0), hit_f(hb, 1), hit_f(hb, 2));
     vec3 ray_dir = normalize(vec3(hit_f(hb, 6), hit_f(hb, 7), hit_f(hb, 8)));
-    bool is_backward = (hit_u(hb, 16) == 1u);
+    bool is_backward = ((hit_u(hb, 16) & 1u) != 0u);
 
     /* Lens hood: project to hood opening plane and check radius */
     if (!is_backward && hood_r > 0.0 && abs(ray_dir.x) > EPS) {

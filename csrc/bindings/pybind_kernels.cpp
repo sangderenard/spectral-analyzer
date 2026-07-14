@@ -563,7 +563,16 @@ struct PyRayTracer
     uint32_t _t5_light_batch_size  = 0;
     uint32_t _t5_cam_batch_size    = 0;
     uint32_t _t5_sensor_tile_size  = 0;
+    uint64_t _t5_pair_budget       = 200000000ull;  /* per-pass connect budget (tunable via set_t5_pair_budget) */
+    float    _t5_backlog_share_base    = 0.15f;
+    float    _t5_backlog_share_max     = 0.60f;
+    int      _t5_backlog_max_snapshots = 8;
+    uint64_t _t5_backlog_max_bytes     = 6ull << 30;
+    uint64_t _bdpt_record_float_budget = 1100000000ull;
     bool     _t5_profile           = false;
+    bool     _vcm_enabled          = true;
+    float    _vcm_merge_radius_m   = 0.002f;
+    float    _vcm_radius_alpha     = 0.7f;
 
 
     /* Flash modifier config */
@@ -574,6 +583,7 @@ struct PyRayTracer
     /* GPU compute config — stored before pipeline creation so first submit_rays
      * can enable the GPU backend.  Ignored after the pipeline is created. */
     bool        _use_gpu_compute = false;
+    bool        _force_cpu_t5 = false;
     bool        _gpu_all_stages  = false;
     bool        _gpu_skip_record_readback = false;
     std::string _shader_dir;
@@ -592,6 +602,7 @@ struct PyRayTracer
             cfg.min_amplitude       = _default_min_amplitude;
             cfg.max_intent_queue    = _max_intent_queue;
             cfg.use_gpu_compute             = _use_gpu_compute;
+            cfg.force_cpu_t5                = _force_cpu_t5;
             cfg.gpu_all_stages              = _gpu_all_stages;
             cfg.gpu_skip_record_readback    = _gpu_skip_record_readback;
             cfg.shader_dir                  = _shader_dir;
@@ -601,7 +612,16 @@ struct PyRayTracer
             cfg.t5_light_batch_size     = _t5_light_batch_size;
             cfg.t5_cam_batch_size       = _t5_cam_batch_size;
             cfg.t5_sensor_tile_size     = _t5_sensor_tile_size;
+            cfg.t5_pair_budget          = _t5_pair_budget;
+            cfg.t5_backlog_share_base    = _t5_backlog_share_base;
+            cfg.t5_backlog_share_max     = _t5_backlog_share_max;
+            cfg.t5_backlog_max_snapshots = _t5_backlog_max_snapshots;
+            cfg.t5_backlog_max_bytes     = _t5_backlog_max_bytes;
+            cfg.bdpt_record_float_budget = _bdpt_record_float_budget;
             cfg.t5_profile              = _t5_profile;
+            cfg.vcm_enabled             = _vcm_enabled;
+            cfg.vcm_merge_radius_m      = _vcm_merge_radius_m;
+            cfg.vcm_radius_alpha        = _vcm_radius_alpha;
             cfg.flash_modifier_type     = static_cast<FlashModifierType>(_flash_modifier_type);
             cfg.flash_modifier_param0   = _flash_modifier_param0;
             cfg.flash_modifier_param1   = _flash_modifier_param1;
@@ -1652,7 +1672,7 @@ struct PyRayTracer
             ri.tag           = tp ? tp[i] : static_cast<uint64_t>(i);
             ri.color_flag    = cp ? cp[i] : 0u;
             const uint8_t film_channel = static_cast<uint8_t>((ri.tag >> 60) & 0x3u);
-            if (ri.color_flag == 1u && film_channel == 1u)
+            if (((ri.color_flag & 1u) != 0u) && film_channel == 1u)
                 ri.priority = 1.0e9f;
             ri.bounces_left  = max_bounces;
             ri.min_amplitude = min_amplitude;
@@ -1661,11 +1681,11 @@ struct PyRayTracer
                 bdpt_sid = _bdpt_subpath_counter.fetch_add(1u, std::memory_order_relaxed);
             ri.bdpt_subpath_id = bdpt_sid;
             ri.bdpt_vertex     = 0u;
-            ri.bdpt_stream     = (ri.color_flag == 1u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
+            ri.bdpt_stream     = ((ri.color_flag & 1u) != 0u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
             ri.bdpt_strategy   = 0u;
             /* For backward (sensor-cast) rays, record the pixel origin so it
              * can be used to splat the sensor image after any number of bounces. */
-            if (ri.color_flag == 1) {
+            if ((ri.color_flag & 1u) != 0u) {
                 ri.sensor_origin_y = static_cast<float>(op[i*3+1]);
                 ri.sensor_origin_z = static_cast<float>(op[i*3+2]);
             }
@@ -2067,13 +2087,13 @@ struct PyRayTracer
         for (const RayRecord& r : recs) {
             if (r.kind != RayRecordKind::STRIKE)
                 continue;
-            if (r.color_flag == 0 && r.hit_tri >= 0) {
+            if (((r.color_flag & 1u) == 0u) && r.hit_tri >= 0) {
                 ++fwd_strikes;
                 if (tri_is_lens(r.hit_tri)) {
                     ++fwd_lens_hits;
                     if (r.bounce > 0) ++fwd_lens_after_bounce;
                 }
-            } else if (r.color_flag == 1 && r.hit_tri >= 0) {
+            } else if (((r.color_flag & 1u) != 0u) && r.hit_tri >= 0) {
                 ++rev_strikes;
             }
 
@@ -2083,15 +2103,15 @@ struct PyRayTracer
                     const int iy = std::min(std::max(static_cast<int>(((r.pos[1] + vr) / (2.0f * vr)) * res), 0), res - 1);
                     const int iz = std::min(std::max(static_cast<int>(((r.pos[2] + vr) / (2.0f * vr)) * res), 0), res - 1);
                     const int flat = iy * res + iz;
-                    if (r.color_flag == 0) {
+                    if ((r.color_flag & 1u) == 0u) {
                         add_rgb(fwd, flat, r);
-                    } else if (r.color_flag == 1) {
+                    } else if ((r.color_flag & 1u) != 0u) {
                         add_rgb(rev, flat, r);
                     }
                 }
             }
 
-            if (r.color_flag == 1 && !optic && r.hit_tri >= 0 &&
+            if (((r.color_flag & 1u) != 0u) && !optic && r.hit_tri >= 0 &&
                 std::fabs(r.sensor_origin_y) <= half_w &&
                 std::fabs(r.sensor_origin_z) <= half_h) {
                 const int iy = std::min(std::max(static_cast<int>(((r.sensor_origin_y + half_w) / (2.0f * half_w)) * res), 0), res - 1);
@@ -2322,7 +2342,7 @@ struct PyRayTracer
             ri.bdpt_vertex = (ri.bounce < 0)
                 ? 0u
                 : static_cast<uint16_t>(std::min(ri.bounce, 0xFFFF));
-            ri.bdpt_stream = (ri.color_flag == 1u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
+            ri.bdpt_stream = ((ri.color_flag & 1u) != 0u) ? BDPT_SIDE_SENSOR : BDPT_SIDE_LIGHT;
             ri.bdpt_strategy = 0u;
             ri.amp.resize(nb);
             for (int b = 0; b < nb; ++b)
@@ -2573,12 +2593,53 @@ struct PyRayTracer
         if (_pipeline) ray_pipeline_set_t5_sensor_tile_size(_pipeline, n);
     }
 
+    void set_t5_pair_budget(uint64_t n) {
+        _t5_pair_budget = n;
+        if (_pipeline) ray_pipeline_set_t5_pair_budget(_pipeline, n);
+    }
+
+    void set_t5_backlog_policy(float share_base, float share_max,
+                               int max_snapshots, uint64_t max_bytes) {
+        _t5_backlog_share_base    = share_base;
+        _t5_backlog_share_max     = share_max;
+        _t5_backlog_max_snapshots = max_snapshots;
+        _t5_backlog_max_bytes     = max_bytes;
+        if (_pipeline)
+            ray_pipeline_set_t5_backlog_policy(_pipeline, share_base, share_max,
+                                               max_snapshots, max_bytes);
+    }
+
+    void set_bdpt_record_float_budget(uint64_t n_floats) {
+        _bdpt_record_float_budget = n_floats;
+        if (_pipeline)
+            ray_pipeline_set_bdpt_record_float_budget(_pipeline, n_floats);
+    }
+
     void set_t5_profile(bool v) {
         _t5_profile = v;
         if (_pipeline) ray_pipeline_set_t5_profile(_pipeline, v);
     }
 
-    void set_force_cpu_t5(bool /*v*/) {}
+    void set_vcm(bool enabled, float merge_radius_m, float radius_alpha = 0.7f) {
+        if (!(merge_radius_m > 0.0f) || !std::isfinite(merge_radius_m))
+            throw std::invalid_argument("VCM merge radius must be finite and > 0 metres");
+        if (!(radius_alpha > 0.0f && radius_alpha <= 1.0f) || !std::isfinite(radius_alpha))
+            throw std::invalid_argument("VCM radius alpha must be finite and in (0, 1]");
+        _vcm_enabled = enabled;
+        _vcm_merge_radius_m = merge_radius_m;
+        _vcm_radius_alpha = radius_alpha;
+        if (_pipeline)
+            ray_pipeline_set_vcm(_pipeline, enabled, merge_radius_m, radius_alpha);
+    }
+
+    void set_max_children(int n) {
+        if (_pipeline) ray_pipeline_set_max_children(_pipeline, std::max(1, n));
+    }
+
+    void set_force_cpu_t5(bool v) {
+        _force_cpu_t5 = v;
+        if (_pipeline) ray_pipeline_set_force_cpu_t5(_pipeline, v);
+    }
 
     void stop_pipeline() {
         std::lock_guard<std::mutex> lk(_pipeline_mu);
@@ -5856,11 +5917,51 @@ The sensor grid is partitioned into n×n tiles; each tile is solved with a
 compact pixel accum buffer (3×n² instead of 3×res²), avoiding VRAM exhaustion
 at large resolutions.  Smaller tiles reduce peak VRAM at the cost of more tile
 overhead; 0 restores the default (128).  Safe to call before or after pipeline creation.)doc")
+        .def("set_t5_pair_budget",
+             &PyRayTracer::set_t5_pair_budget,
+             py::arg("n"),
+    R"doc(Set the maximum score-sorted T5 camera-light pairs to process in one native pass.
+    0 drains all scored units. Nonzero values process a high-score active prefix and
+    leave the remainder explicitly logged as deferred.)doc")
+        .def("set_t5_backlog_policy",
+             &PyRayTracer::set_t5_backlog_policy,
+             py::arg("share_base") = 0.15f,
+             py::arg("share_max") = 0.60f,
+             py::arg("max_snapshots") = 3,
+             py::arg("max_bytes") = (uint64_t)(6ull << 30),
+R"doc(Configure the T5 deferred-pair backlog.  Units deferred by the pair budget are
+snapshotted (packed vertices + score-ordered unit list) and re-worked by later
+passes highest-score-first.  Each pass spends share = min(share_max,
+share_base * backlog_age_in_passes) of its pair budget on the backlog, so back
+work takes proportionally more time the longer it has been accumulating.
+max_snapshots / max_bytes bound the host memory retained; least-valuable
+snapshots are evicted (loudly) beyond them.  share_base=0 disables.)doc")
+        .def("set_bdpt_record_float_budget",
+             &PyRayTracer::set_bdpt_record_float_budget,
+             py::arg("n_floats"),
+R"doc(Total float budget for the GPU BDPT record SSBO (vertex+spectral+pdf+optical
+sections).  Record caps auto-grow from observed overflow high-water marks and
+are rebalanced by demand to fit this budget (hard-clamped to INT32_MAX floats
+for shader indexing).  1 float = 4 bytes of VRAM; default 1.1e9 ≈ 4.4 GiB.)doc")
         .def("set_t5_profile",
              &PyRayTracer::set_t5_profile,
              py::arg("v"),
 R"doc(When True, run staged one-pair T5 shader profiling before the first T5 dispatch
 of each pass and print per-stage fence timing / 1s timeout diagnostics.)doc")
+        .def("set_vcm",
+             &PyRayTracer::set_vcm,
+             py::arg("enabled") = true,
+             py::arg("merge_radius_m") = 0.002f,
+             py::arg("radius_alpha") = 0.7f,
+R"doc(Configure spectral vertex connection and merging. The merge radius is in
+world metres. Delta surfaces remain non-connectable; merging occurs only when
+a light subpath has completed its specular chain and lands on a compatible
+non-delta receiver. radius_alpha controls progressive radius reduction.)doc")
+        .def("set_max_children",
+             &PyRayTracer::set_max_children,
+             py::arg("count"),
+R"doc(Set the live per-hit child cap for subsequent native batches. This avoids
+initialization order coupling with field/display setup.)doc")
         .def("set_force_cpu_t5",
              &PyRayTracer::set_force_cpu_t5,
              py::arg("v"),
@@ -7230,6 +7331,8 @@ Uses staggered trilinear interpolation — phase-exact, no approximation.
     m.attr("MAT_FLAG_NO_SHADOW")     = (int)MAT_FLAG_NO_SHADOW;
     m.attr("MAT_FLAG_MANIFOLD")      = (int)MAT_FLAG_MANIFOLD;
     m.attr("MAT_FLAG_PARAMETRIC")    = (int)MAT_FLAG_PARAMETRIC;
+    m.attr("MAT_FLAG_TRANSMISSIVE")  = (int)MAT_FLAG_TRANSMISSIVE;
+    m.attr("BDPT_PDF_FLAG_SENSOR")   = (int)BDPT_PDF_FLAG_SENSOR;
     m.attr("MAT_FLAG_APERTURE_STOP") = (int)MAT_FLAG_APERTURE_STOP;
     m.attr("MAT_FLAG_PICKING_ONLY")  = (int)MAT_FLAG_PICKING_ONLY;
     m.attr("MAX_SPECTRAL_BANDS")     = (int)MAX_SPECTRAL_BANDS;

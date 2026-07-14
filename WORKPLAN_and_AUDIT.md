@@ -1,4 +1,9 @@
-# BDPT Batch-Triage Work Plan + Algorithm Audit
+# BDPT Batch-Triage Work Plan + Algorithm Audit (historical)
+
+> Superseded as run guidance by `THICK_LENS_RENDER_ACCEPTANCE.md`. This file is
+> retained as a June 2026 audit record; its status statements and line numbers
+> describe the implementation at that time and are not current acceptance
+> evidence.
 
 **Author:** prepared for handoff to the rendering team
 **Scope:** (1) a batch-efficiency triage layer for the T5 BDPT connection pass, delivered as a scoring prepass; (2) a deep correctness audit of the optical, material, and spectral paths as currently implemented.

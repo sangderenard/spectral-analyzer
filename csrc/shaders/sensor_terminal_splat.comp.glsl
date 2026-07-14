@@ -152,7 +152,7 @@ void main() {
     /* Only accumulate backward sensor rays that hit an emissive surface */
     const uint color_flag  = floatBitsToUint(child_int_buf[base + 16]);
     const uint is_emissive = floatBitsToUint(child_int_buf[base + 25]);
-    if (is_emissive == 0u || color_flag != 1u) return;
+    if (is_emissive == 0u || ((color_flag & 1u) == 0u)) return;
     const int mat_id = floatBitsToInt(child_int_buf[base + 15]);
 
     /* Map sensor-space origin to film coordinates */

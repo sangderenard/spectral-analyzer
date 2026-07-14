@@ -39,6 +39,21 @@ except Exception as exc:
     raise RuntimeError("pygame is required. Install with: pip install pygame") from exc
 
 import _spectral_kernels as _sk
+
+
+def _verify_native_bdpt_contract() -> None:
+    """Fail loudly if this diagnostic loaded a stale pre-parity native module."""
+    required = ("BDPT_PDF_FLAG_SENSOR", "MAT_FLAG_TRANSMISSIVE")
+    missing = [name for name in required if not hasattr(_sk, name)]
+    module_path = os.path.abspath(str(getattr(_sk, "__file__", "<unknown>")))
+    if missing:
+        raise RuntimeError(
+            f"stale _spectral_kernels at {module_path}; missing {', '.join(missing)}. "
+            "Rebuild the Release _spectral_kernels target before running the lens lab."
+        )
+    if int(_sk.BDPT_PDF_FLAG_SENSOR) != (1 << 22):
+        raise RuntimeError(f"incompatible BDPT sensor endpoint ABI in {module_path}")
+    print(f"[native-module] {module_path} bdpt_contract=sensor-endpoint-v1", flush=True)
 from base_gl_renderer import BaseGLRenderer
 from material_db import MAX_SPECTRAL_BANDS, MaterialDatabase
 from sensor_film_db import MAX_SENSOR_FILM_SLOTS, SensorFilmDatabase
@@ -8788,19 +8803,46 @@ class ForwardCppLensBench:
             return 0
         rays_per_batch = int(max(1, min(rays_per_batch, schedule_total)))
 
+        # One frame's sweep must keep its BDPT records inside the GPU record
+        # caps (~6.9M vertices, VRAM-budget-bound).  Records scale with rays ×
+        # children (1 + n_bands), so a full sweep at sensor res ≳ 256 overflows
+        # the caps — pdf records get dropped, the MIS chains go invalid, and
+        # the T5 connect silently contributes nothing ("rendering doesn't
+        # happen" at high res).  Above the cap, sweep a slice per frame and
+        # resume from the persistent cursor next frame — the progressive
+        # accumulation across frames already builds the image this way.
+        # At the default res 64 (16K rays) this changes nothing.
+        # ~14-22 BDPT verts per ray with max_children=1+n_bands (measured in
+        # both benches); 200K rays keeps one frame's records under the ~6.9M
+        # vertex cap with room for ~1M flash-side light verts.
+        _CAP_SAFE_RAYS_PER_FRAME = 200_000
+        slice_start = 0
+        slice_target = schedule_total
+        if schedule_total > _CAP_SAFE_RAYS_PER_FRAME:
+            slice_start = int(self._bdpt_native_sensor_schedule_offset) % schedule_total
+            slice_target = int(min(_CAP_SAFE_RAYS_PER_FRAME, schedule_total - slice_start))
+            print(
+                f"[sensor-sweep] cap-safe slice {slice_start}..{slice_start + slice_target}"
+                f" of {schedule_total} (full sweep would overflow BDPT record caps)",
+                flush=True,
+            )
+
         self.tracer.begin_sensor_batching()
         try:
+            if hasattr(self.tracer, "set_max_children"):
+                self.tracer.set_max_children(1)
             n_submit_total = 0
-            pix_offset = 0
-            while pix_offset < schedule_total and not self._drain_stop.is_set():
+            pix_offset = slice_start
+            slice_end = slice_start + slice_target
+            while pix_offset < slice_end and not self._drain_stop.is_set():
                 n_submit = int(self.tracer.submit_sensor_sweep(
                     max_bounces=int(max_bounces),
                     min_amplitude=float(max(0.0, self.sensor_min_amplitude)),
-                    max_rays=int(min(rays_per_batch, schedule_total - pix_offset)),
+                    max_rays=int(min(rays_per_batch, slice_end - pix_offset)),
                     pix_offset=int(pix_offset),
-                    # 1 reflection lobe + one transmit child per band → real
-                    # per-band chromatic dispersion through the lens.
-                    max_children=1 + int(self.n_bands),
+                    # One sampled wavelength and one stochastic Fresnel child;
+                    # dispersion remains band-specific without path explosion.
+                    max_children=1,
                     aperture_samples=int(n_ap),
                     seed=int(seed),
                     shutter_mode=int(stage_args.get("shutter_mode", 0)),
@@ -8816,9 +8858,14 @@ class ForwardCppLensBench:
                 pix_offset += n_submit
                 self._ensure_drain_loop()
                 self.publish_camera_perspective_package()
-            if self._drain_stop.is_set() or n_submit_total < schedule_total:
+            if self._drain_stop.is_set() or n_submit_total < slice_target:
                 return 0
-            self._bdpt_native_sensor_schedule_offset = 0
+            # Advance the persistent cursor; wrap to 0 once the grid is covered
+            # so the next frame starts a fresh pass over the sensor.
+            _next = slice_start + n_submit_total
+            self._bdpt_native_sensor_schedule_offset = (
+                0 if _next >= schedule_total else _next
+            )
             self.tracer.signal_sensor_dispatched()
             self._ensure_drain_loop()
 
@@ -11840,7 +11887,7 @@ def run(
     if compute_mode in ("gpu", "mixed"):
         try:
             bench.tracer.ensure_pipeline(
-                max_children=1 + int(bench.n_bands),
+                max_children=1,
                 seed=13579,
                 min_amplitude=float(bench._min_amplitude),
                 use_gpu_compute=True,
@@ -13834,7 +13881,7 @@ def run(
             _bwd = bench._async_backward_strike_count
             _exp_n = _exposure_count[0]
             print(
-                f"[exposure #{_exp_n}] ── FRAME DONE ──"
+                f"[exposure #{_exp_n}] -- FRAME DONE --"
                 f"  scene_t={_t_scene:.4f}s"
                 f"  fwd_endpoints={_fwd:_}"
                 f"  bwd_strikes={_bwd:_}"
@@ -14006,7 +14053,7 @@ def run(
         # package does not create a CPU pipeline before compute_mode is applied.
         if compute_mode in ("gpu", "mixed"):
             new_bench.tracer.ensure_pipeline(
-                max_children=1 + int(new_bench.n_bands),
+                max_children=1,
                 seed=13579,
                 min_amplitude=float(new_bench._min_amplitude),
                 use_gpu_compute=True,
@@ -14678,6 +14725,7 @@ def run_uv_smoke(
 
 
 if __name__ == "__main__":
+    _verify_native_bdpt_contract()
     import argparse
     _ap = argparse.ArgumentParser(description="Spectral lens bench")
     _ap.add_argument(

@@ -272,6 +272,7 @@ typedef struct {
 #define BDPT_PDF_FLAG_ABSORBED        (1u << 19)  /* path terminated here */
 #define BDPT_PDF_FLAG_GGX             (1u << 20)  /* rough microfacet reflection */
 #define BDPT_PDF_FLAG_EMISSION        (1u << 21)  /* emissive surface launch */
+#define BDPT_PDF_FLAG_SENSOR          (1u << 22)  /* camera measurement endpoint */
 
 /* ── Layout sanity checks ────────────────────────────────────────────────── */
 #ifdef __cplusplus

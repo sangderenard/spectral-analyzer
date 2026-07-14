@@ -44,6 +44,9 @@
 #ifndef BDPT_PDF_FLAG_EMISSION
 #define BDPT_PDF_FLAG_EMISSION        (1u << 21)
 #endif
+#ifndef BDPT_PDF_FLAG_SENSOR
+#define BDPT_PDF_FLAG_SENSOR          (1u << 22)
+#endif
 
 #define MEVAL_PI 3.14159265358979323846f
 
@@ -232,18 +235,16 @@ float meval_scatter_pdf_sa(vec3 n, vec3 in_dir, vec3 out_dir,
 
     float spec_p = max(0.0f, 1.0f - diffuse_p);
 
-    if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
-        if (diffuse_p <= 0.0f) return 0.0f;
+    float pdf = 0.0f;
+    if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u && diffuse_p > 0.0f) {
         float cos_out = max(0.0f, dot(n, normalize(out_dir)));
-        return diffuse_p * cos_out / MEVAL_PI;
+        pdf += diffuse_p * cos_out / MEVAL_PI;
     }
-
-    if ((pdf_flags & BDPT_PDF_FLAG_GGX) != 0u) {
-        if (spec_p <= 0.0f || ggx_alpha <= 1.0e-3f) return 0.0f;
-        return spec_p * meval_ggx_pdf_sa(n, in_dir, out_dir, ggx_alpha);
+    if ((pdf_flags & BDPT_PDF_FLAG_GGX) != 0u &&
+        spec_p > 0.0f && ggx_alpha > 1.0e-3f) {
+        pdf += spec_p * meval_ggx_pdf_sa(n, in_dir, out_dir, ggx_alpha);
     }
-
-    return 0.0f;
+    return pdf;
 }
 
 /* ── Endpoint BRDF evaluation ───────────────────────────────────────────── *
@@ -257,6 +258,9 @@ float meval_scatter_pdf_sa(vec3 n, vec3 in_dir, vec3 out_dir,
 
 float meval_endpoint_response(int mat, int band, uint pdf_flags,
                               vec3 n, vec3 in_dir, vec3 out_dir) {
+    /* Sensor launch support is already carried by the camera PDF chain; the
+     * endpoint itself is a measurement response, never the sensor mesh BRDF. */
+    if ((pdf_flags & BDPT_PDF_FLAG_SENSOR) != 0u) return 1.0f;
     if (mat < 0) return 1.0f;
 
     float cos_out = max(0.0f, dot(n, normalize(out_dir)));
@@ -269,21 +273,17 @@ float meval_endpoint_response(int mat, int band, uint pdf_flags,
     float refl = meval_reflectance(mat, band);
     if (refl <= 0.0f) return 0.0f;
 
-    if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u) {
-        float dp = meval_diffuse_p(mat);
-        if (dp <= 0.0f) return 0.0f;
-        return refl * dp / MEVAL_PI;
-    }
-
+    float response = 0.0f;
+    float dp = meval_diffuse_p(mat);
+    if ((pdf_flags & BDPT_PDF_FLAG_DIFFUSE) != 0u && dp > 0.0f)
+        response += refl * dp / MEVAL_PI;
     if ((pdf_flags & BDPT_PDF_FLAG_GGX) != 0u) {
-        float spec_p = max(0.0f, 1.0f - meval_diffuse_p(mat));
+        float spec_p = max(0.0f, 1.0f - dp);
         float alpha  = meval_ggx_alpha(mat);
-        if (spec_p <= 0.0f || alpha <= 1.0e-3f) return 0.0f;
-        return spec_p * meval_ggx_brdf(n, in_dir, out_dir, alpha, refl);
+        if (spec_p > 0.0f && alpha > 1.0e-3f)
+            response += spec_p * meval_ggx_brdf(n, in_dir, out_dir, alpha, refl);
     }
-
-    /* No recognised lobe flag — conservatively zero rather than guessing. */
-    return 0.0f;
+    return response;
 }
 
 #endif /* RAY_MATERIAL_EVAL_GLSL_INC */

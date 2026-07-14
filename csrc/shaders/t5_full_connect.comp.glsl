@@ -166,16 +166,25 @@ layout(std430, binding = 3) readonly buffer T5ParamsBuf {
     int    tile_y0;
     int    tile_w;
     int    tile_h;
+    uint   light_sample_stride;
+    float  light_sample_weight;
+    /* pi*r^2 of the VCM merge kernel for the vertex-merging pass paired with
+     * this connection pass.  0 disables the weld terms (connection-only). */
+    float  vm_area;
 };
 
 /* ── Spectral colour weights (n_bands × 3): [b*3+0]=wr, [b*3+1]=wg, [b*3+2]=wb */
 layout(std430, binding = 4) readonly buffer T5SpectralWeightBuf {
     float spectral_weights[];
 };
+layout(std430, binding = 9) coherent buffer T5DebugBuf {
+    uint debug_counts[];
+};
 
 /* Diagnostic mode, normally 0:
  * 1=load only, 2=spectral, 3=geometry, 4=connection PDFs, 5=MIS, 6=shadow. */
 uniform int t5_profile_mode;
+uniform int t5_debug_enabled;
 
 /* ── Flag constants (mirror bdpt_record.h / mat_flags_generated.h) ──────── */
 #define MAT_FLAG_APERTURE_STOP        128u
@@ -382,8 +391,53 @@ bool candidate_strategy_density(
         if (!vertex_connectable(vi0, vf0, pf0, ob0)) continue;
         if (!vertex_connectable(vi1, vf1, pf1, ob1)) continue;
 
+        if (t5_debug_enabled != 0) {
+            atomicAdd(debug_counts[64], 1u);
+            if (((pf0 | pf1) & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u)
+                atomicAdd(debug_counts[65], 1u);
+        }
+
         float p = pf * sb;
         if (p > 0.0f && !isinf(p) && !isnan(p)) out_denom += p;
+    }
+
+    /* ── Vertex-merging (VCM weld) technique densities ────────────────── *
+     * When a VCM merge pass runs alongside this connection pass, the same     *
+     * physical path can also be produced by welding a light photon into a     *
+     * non-delta interior vertex m.  Its density on this path is               *
+     *   prefix_fwd[m] * suffix_bwd[m] * (pi r^2)                              *
+     * (all N-1 edges sampled; the uniform-disk kernel supplies pi r^2 —      *
+     * mirrors vcm_density() in vcm_merge.comp.glsl exactly).  Omitting these  *
+     * terms would double count energy between the VC and VM estimators.      *
+     * vm_area == 0 when no merge pass runs, restoring pure BDPT MIS.         */
+    if (vm_area > 0.0f) {
+        for (uint m = 1u; m + 1u < N; ++m) {
+            float pf = prefix_fwd[m];
+            float sb = suffix_bwd[m];
+            if (pf <= 0.0f || sb <= 0.0f) continue;
+
+            uint vim, vfm, pfm, obm;
+            if (m <= ci) {
+                uint cbm = (cam_base + m) * uint(T5_CGV_STRIDE);
+                vim = floatBitsToUint(cam_verts[cbm +  9u]);
+                vfm = floatBitsToUint(cam_verts[cbm +  7u]);
+                pfm = floatBitsToUint(cam_verts[cbm + 17u]);
+                obm = floatBitsToUint(cam_verts[cbm + 18u]);
+            } else {
+                uint jm  = m - ci - 1u;
+                uint lbm = (light_base + li_v - jm) * uint(T5_LGV_STRIDE);
+                vim = floatBitsToUint(light_verts[lbm +  9u]);
+                vfm = floatBitsToUint(light_verts[lbm +  7u]);
+                pfm = floatBitsToUint(light_verts[lbm + 13u]);
+                obm = floatBitsToUint(light_verts[lbm + 14u]);
+            }
+            /* A weld requires a real, unblocked, non-delta receiving surface. */
+            if (!vertex_connectable(vim, vfm, pfm, obm)) continue;
+            if ((pfm & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u) continue;
+
+            float p = pf * sb * vm_area;
+            if (p > 0.0f && !isinf(p) && !isnan(p)) out_denom += p;
+        }
     }
 
     if (out_denom < out_selected_pdf)
@@ -571,10 +625,15 @@ void connection_spectral_rgb(uint sc, uint sl,
     b = 0.0f;
 
     const int nb = clamp(n_bands, 1, T5_MAX_GPU_BANDS);
+    bool any_overlap = false;
+    bool any_camera_response = false;
+    bool any_light_response = false;
+    bool any_glass_pass = false;
     for (int _b = 0; _b < nb; ++_b) {
         const float cb = s_cam[sc + uint(CGV_BAND_BASE + _b)];
         const float lb = s_light[sl + uint(LGV_BAND_BASE + _b)];
         if (cb <= 0.0f || lb <= 0.0f) continue;
+        any_overlap = true;
 
         /* Per-band Fresnel transmittance of any glass the straight connection
          * segment crosses (1.0 in vacuum).  Evaluated per band because each
@@ -585,17 +644,24 @@ void connection_spectral_rgb(uint sc, uint sl,
             ? glass_transmittance_band(_b, n_glass, g_cos, g_from, g_to)
             : 1.0f;
         if (glassT <= 0.0f) continue;
+        any_glass_pass = true;
 
         const float cf = meval_endpoint_response(
             c_mat, _b, c_pdf_flags, c_norm, c_dir_in, c_to_l);
         const float lf = meval_endpoint_response(
             l_mat, _b, l_pdf_flags, l_norm, l_dir_in, l_to_c);
+        if (cf > 0.0f) any_camera_response = true;
+        if (lf > 0.0f) any_light_response = true;
         const float v = cb * lb * cf * lf * glassT;
         if (v <= 0.0f || isnan(v) || isinf(v)) continue;
         r += v * spectral_weights[_b * 3 + 0];
         g += v * spectral_weights[_b * 3 + 1];
         b += v * spectral_weights[_b * 3 + 2];
     }
+    if (t5_debug_enabled != 0 && any_overlap) atomicAdd(debug_counts[9], 1u);
+    if (t5_debug_enabled != 0 && any_glass_pass) atomicAdd(debug_counts[10], 1u);
+    if (t5_debug_enabled != 0 && any_camera_response) atomicAdd(debug_counts[11], 1u);
+    if (t5_debug_enabled != 0 && any_light_response) atomicAdd(debug_counts[12], 1u);
 }
 
 /* ── Float atomic add via CAS spin-loop ─────────────────────────────────── *
@@ -667,6 +733,26 @@ void splat_sensor_tent(float sensor_y, float sensor_z,
 }
 
 /* ── Main ────────────────────────────────────────────────────────────────── */
+uint t5_hash_u32(uint x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
+uint sampled_light_vertex(uint logical, uint camera_tile) {
+    if (light_sample_stride == 0u || n_light_verts == 0u)
+        return logical;
+    /* Each camera tile receives a randomized rotation of a stratified walk
+     * through the complete packed light-vertex population.  Every logical
+     * sample is marginally uniform; light_sample_weight supplies its inverse
+     * probability on the host. */
+    const uint rotation = t5_hash_u32(camera_tile ^ n_light_verts ^ 0x9e3779b9u);
+    return (logical * light_sample_stride + rotation) % n_light_verts;
+}
+
 void main() {
     const uint lid_c = gl_LocalInvocationID.x;   /* 0..TILE_C-1 */
     const uint lid_l = gl_LocalInvocationID.y;   /* 0..TILE_L-1 */
@@ -697,8 +783,11 @@ void main() {
     for (uint i = tid; i < uint(TILE_L) * uint(T5_LGV_STRIDE); i += total) {
         const uint v      = i / uint(T5_LGV_STRIDE);
         const uint f      = i % uint(T5_LGV_STRIDE);
-        const uint g_glob = light_offset + light_tile + v;
-        s_light[i] = (g_glob < n_light_verts)
+        const uint logical = light_offset + light_tile + v;
+        const uint g_glob = sampled_light_vertex(logical, cam_tile);
+        const bool logical_valid = logical >= light_offset &&
+                                   logical < light_offset + light_batch_size;
+        s_light[i] = (logical_valid && g_glob < n_light_verts)
             ? light_verts[g_glob * uint(T5_LGV_STRIDE) + f]
             : 0.0f;
     }
@@ -714,9 +803,13 @@ void main() {
 
     /* ── Per-pair contribution ──────────────────────────────────────────── */
     const uint gid_c = cam_tile + lid_c;
-    const uint gid_l = light_offset + light_tile + lid_l;
+    const uint logical_l = light_offset + light_tile + lid_l;
+    const uint gid_l = sampled_light_vertex(logical_l, cam_tile);
 
-    if (gid_c < n_cam_verts && gid_l < n_light_verts) {
+    if (gid_c < n_cam_verts &&
+        logical_l >= light_offset && logical_l < light_offset + light_batch_size &&
+        gid_l < n_light_verts) {
+        if (t5_debug_enabled != 0) atomicAdd(debug_counts[0], 1u);
 
         /* Load camera vert from shared memory. */
         const uint sc = lid_c * uint(T5_CGV_STRIDE);
@@ -755,11 +848,20 @@ void main() {
 
         if (t5_profile_mode == 2) return;
 
-        if (vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk) &&
-            vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk) &&
-            c_beta_sum >= 1e-15f &&
-            l_beta_sum >= 1e-15f)
+        const bool c_ok = vertex_connectable(c_vinfo, c_flags, c_pdf_flags, c_optical_blk);
+        const bool l_ok = vertex_connectable(l_vinfo, l_flags, l_pdf_flags, l_optical_blk);
+        if (t5_debug_enabled != 0 && c_ok) atomicAdd(debug_counts[1], 1u);
+        if (t5_debug_enabled != 0 && l_ok) atomicAdd(debug_counts[2], 1u);
+        if (t5_debug_enabled != 0 && c_ok &&
+            (c_pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u)
+            atomicAdd(debug_counts[66], 1u);
+        if (t5_debug_enabled != 0 && l_ok &&
+            (l_pdf_flags & BDPT_PDF_FLAG_DELTA_SPECULAR) != 0u)
+            atomicAdd(debug_counts[67], 1u);
+        if (c_ok && l_ok && c_beta_sum >= 1e-15f && l_beta_sum >= 1e-15f)
         {
+            if (t5_debug_enabled != 0) atomicAdd(debug_counts[3], 1u);
+            if (t5_debug_enabled != 0 && li_v == 0u) atomicAdd(debug_counts[13], 1u);
             /* ── Geometry term ─────────────────────────────────────────── */
             const vec3  dv    = l_pos - c_pos;
             const float dist2 = dot(dv, dv);
@@ -775,6 +877,7 @@ void main() {
                  * Tune via RayTracer.set_t5_min_geom (cfg.t5_min_geom): lower
                  * preserves faint distant transport, higher is faster/noisier. */
                 if (geom >= min_geom) {
+                    if (t5_debug_enabled != 0) atomicAdd(debug_counts[4], 1u);
                     /* BRDF fields from shared memory. */
                     const vec3  c_dir_in    = vec3(s_cam[sc + uint(CGV_DIR_IN_X)    ],
                                                    s_cam[sc + uint(CGV_DIR_IN_X)+1u ],
@@ -799,6 +902,8 @@ void main() {
                         l_pos, l_norm, l_dir_in,
                         l_diffuse_p, l_ggx_alpha, l_pdf_flags, l_opt_jac,
                         c_pos, c_norm);
+                    if (t5_debug_enabled != 0 && conn_fwd > 0.0f && conn_bwd > 0.0f)
+                        atomicAdd(debug_counts[5], 1u);
                     if (t5_profile_mode == 4) return;
 
                     /* ── MIS density (still reads global SSBOs for chain) ─ */
@@ -809,6 +914,7 @@ void main() {
                     if (t5_profile_mode == 5) return;
                     if (mis_ok)
                     {
+                        if (t5_debug_enabled != 0) atomicAdd(debug_counts[6], 1u);
                         /* Gather the refractive interfaces this connection segment
                          * crosses once (geometry is band-independent); the achromatic
                          * Fresnel transmittance / TIR test is applied inside
@@ -840,12 +946,27 @@ void main() {
                          * DO NOT divide betas by a sampling PDF in T3: doing so
                          * double-counts and MUST be paired with removing this
                          * `/ denom`.  The two sites are a matched pair. */
-                        const float scale = geom / denom;
-                        const float contrib = (spec_r + spec_g + spec_b) * scale;                        if (contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
+                        const float scale = (geom / denom) * max(light_sample_weight, 1.0f);
+                        const float contrib = (spec_r + spec_g + spec_b) * scale;
+                        if (t5_debug_enabled != 0 && contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
+                            int ebin = clamp((int(floor(log2(contrib))) + 64) / 4, 0, 31);
+                            atomicAdd(debug_counts[16 + ebin], 1u);
+                        }
+                        if (t5_debug_enabled != 0 && denom > 0.0f && !isinf(denom) && !isnan(denom)) {
+                            int dbin = clamp((int(floor(log2(denom))) + 64) / 8, 0, 15);
+                            atomicAdd(debug_counts[48 + dbin], 1u);
+                        }
+                        if (t5_debug_enabled != 0 && contrib > 0.0f && !isinf(contrib) && !isnan(contrib))
+                            atomicAdd(debug_counts[7], 1u);
+                        if (t5_debug_enabled != 0 && li_v == 0u && contrib > 0.0f && !isinf(contrib) && !isnan(contrib))
+                            atomicAdd(debug_counts[14], 1u);
+                        if (contrib > 0.0f && !isinf(contrib) && !isnan(contrib)) {
                             const bool occluded = shadow_occluded_except(
                                 c_pos, l_pos, c_tri_id, l_tri_id);
                             if (t5_profile_mode == 6) return;
                             if (!occluded) {
+                                if (t5_debug_enabled != 0) atomicAdd(debug_counts[8], 1u);
+                                if (t5_debug_enabled != 0 && li_v == 0u) atomicAdd(debug_counts[15], 1u);
                                 s_lum_r[tid] = spec_r * scale;
                                 s_lum_g[tid] = spec_g * scale;
                                 s_lum_b[tid] = spec_b * scale;

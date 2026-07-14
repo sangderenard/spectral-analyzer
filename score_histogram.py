@@ -92,7 +92,9 @@ def main():
     ascii_hist(B, "B  connectable density (fraction)", log_x=False)
     ascii_hist(C, "C  peak geom potential (max geom)", log_x=True)
     ascii_hist(S, "S  combined (wA*A + wB*B + wC*C)", log_x=True)
+    # If S is flat (e.g. only wA used and equals A), the sweep still works.
     split_sweep(S if np.ptp(S) > 0 else A, A)
+    # Quick "how much is nothing" headline.
     dead = np.mean((A <= 0) & (C <= 0)) * 100.0
     print(f"headline: {dead:.1f}% of work units sampled as pure nothing "
           f"(no connectable pair with positive geom). These are exactly the "

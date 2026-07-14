@@ -793,8 +793,7 @@ static constexpr int CGV_OPT_JACOBIAN   = 59;
 static constexpr int CGV_EDGE_FWD_AREA  = 60;
 static constexpr int CGV_EDGE_BWD_AREA  = 61;
 
-/* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl.
- * std430 layout, 56 bytes. */
+/* GPU params block uploaded to binding 3 of t5_full_connect.comp.glsl. */
 struct T5GpuParams {
     float    min_geom;         /* geometry-term floor                   */
     float    sensor_half_w;    /* sensor half-width  (Y axis, metres)   */
@@ -810,8 +809,14 @@ struct T5GpuParams {
     int32_t  tile_y0;          /* pixel row of tile top edge            */
     int32_t  tile_w;           /* tile width  in pixels (0 = full res)  */
     int32_t  tile_h;           /* tile height in pixels (0 = full res)  */
+    uint32_t light_sample_stride; /* 0=contiguous; else stratified index stride */
+    float    light_sample_weight; /* inverse probability for sampled lights     */
+    float    vm_area;          /* pi*r^2 of the VCM merge kernel for THIS pass; —
+                                * 0 when no vertex-merging pass will run, which
+                                * removes the weld techniques from the T5 MIS
+                                * denominator (connection-only estimator).     */
 };
-static_assert(sizeof(T5GpuParams) == 56, "T5GpuParams layout mismatch");
+static_assert(sizeof(T5GpuParams) == 68, "T5GpuParams layout mismatch");
 
 /* ── Flash light modifier ─────────────────────────────────────────────────
  * Applied per-ray inside submit_emissive_triangles.  All modes use the same
@@ -860,12 +865,26 @@ struct RayPipelineConfig {
      * When a side queue reaches the cap the incoming record is dropped and
      * the corresponding overflow counter is incremented.  0 = unlimited
      * (not recommended for production — will grow unbounded for any scene).
-     * Typical small-scene budget: 1–4 M entries per queue. */
-    int    bdpt_max_vertices = 10000000; /* BdptVertexRecord cap */
-    int    bdpt_max_spectral = 25000000; /* BdptSpectralWeightRecord cap */
-    int    bdpt_max_pdfs     = 10000000; /* BdptPdfRecord cap */
-    int    bdpt_max_optical  = 10000000; /* BdptOpticalEventRecord cap */
+     *
+     * These are STARTING caps, not hard ceilings: when the GPU-resident T5
+     * pass observes an overflow (requested high-water > cap) it schedules a
+     * cap raise that takes effect at the next BDPT cycle start, so recurring
+     * truncation is self-healing.  Growth is bounded by
+     * bdpt_record_float_budget below.  NOTE: do not set these huge a priori —
+     * the GPU record SSBO is sized cap_v*28 + cap_s*8 + cap_p*12 + cap_o*28
+     * floats up front, and base offsets must stay below INT32_MAX floats for
+     * shader indexing. */
+    int    bdpt_max_vertices = 10000000;  /* BdptVertexRecord cap */
+    int    bdpt_max_spectral = 25000000;  /* BdptSpectralWeightRecord cap */
+    int    bdpt_max_pdfs     = 10000000;  /* BdptPdfRecord cap */
+    int    bdpt_max_optical  = 10000000;  /* BdptOpticalEventRecord cap */
     int    bdpt_max_connections = 10000000; /* BdptConnectionRecord cap */
+
+    /* Total float budget for the GPU BDPT record SSBO (verts+spectral+pdfs+
+     * optical sections combined).  Auto-grown caps are rebalanced to fit this
+     * budget by demand ratio.  Hard-clamped to INT32_MAX floats regardless
+     * (shader int indexing).  1.1e9 floats ≈ 4.4 GiB. */
+    uint64_t bdpt_record_float_budget = 1100000000ull;
 
     /* ── T5 connection ───────────────────────────────────────────────────
      * GPU path: t5_full_connect.comp.glsl — O(N_cam × N_light) brute force.
@@ -890,6 +909,7 @@ struct RayPipelineConfig {
      * gpu_batch_size_t{1,2,3,4,5}: initial GPU pop batch size per stage.
      *   0 = use the StageStats default (262144). */
     bool        use_gpu_compute    = false;
+    bool        force_cpu_t5       = false; /* keep GPU T1-T4 but run host T5 fallback */
     std::string shader_dir;
     int         gpu_batch_size_t1  = 0;
     int         gpu_batch_size_t2  = 0;
@@ -899,7 +919,36 @@ struct RayPipelineConfig {
     uint32_t    t5_light_batch_size  = 0;  /* 0 = use built-in default (T5_LIGHT_BATCH) */
     uint32_t    t5_cam_batch_size    = 0;  /* 0 = use built-in default (8192)           */
     uint32_t    t5_sensor_tile_size  = 0;  /* 0 = use built-in default (128)            */
+    uint64_t    t5_pair_budget       = 200000000ull; /* per-pass connect budget; 0 = drain all scored units this pass */
     bool        t5_profile           = false; /* profile cumulative T5 shader stages      */
+
+    /* Spectral vertex connection and merging (VCM).  This augments BDPT with
+     * a physically valid density estimator for paths that contain one or more
+     * specular events.  It never makes a delta vertex arbitrarily connectable:
+     * photons are merged only after they land on a non-delta receiving surface.
+     * The radius is in world metres and follows the progressive photon-mapping
+     * update R_k = R_0 sqrt((k + alpha)/(k + 1)). */
+    bool  vcm_enabled          = true;
+    float vcm_merge_radius_m   = 0.002f;
+    float vcm_radius_alpha     = 0.7f;
+
+    /* ── T5 deferred-pair backlog ────────────────────────────────────────
+     * When t5_pair_budget defers units, the pass snapshots the un-dispatched
+     * (cam-batch × light-batch) units (with their packed vertex buffers) to
+     * host memory.  Each subsequent T5 pass spends a slice of its pair budget
+     * working the backlog highest-score-first.  The slice grows with how long
+     * the backlog has been accumulating:
+     *   share = min(t5_backlog_share_max,
+     *               t5_backlog_share_base * age_in_passes)
+     * so back work takes proportionally more time the longer it has waited. */
+    float    t5_backlog_share_base    = 0.15f;
+    float    t5_backlog_share_max     = 0.60f;
+    /* Retain more deferred snapshots before evicting the lowest-score one: with
+     * finer units the per-snapshot byte cost is unchanged but each snapshot holds
+     * more (smaller) units, so eviction was discarding high-value deferred work
+     * before the backlog could drain it.  8 × ~300 MiB stays within max_bytes. */
+    int      t5_backlog_max_snapshots = 8;            /* oldest evicted beyond this */
+    uint64_t t5_backlog_max_bytes     = 6ull << 30;   /* host-memory cap for snapshots */
 
     /* Fraction of work to pin to GPU per stage (0=compete freely, >0=soft target).
      * 0.0 = CPU and GPU compete naturally on the shared queue.
@@ -1065,7 +1114,15 @@ void ray_pipeline_set_t5_min_geom(RayPipelineState* ps, float v);
 void ray_pipeline_set_t5_light_batch_size(RayPipelineState* ps, uint32_t n);
 void ray_pipeline_set_t5_cam_batch_size(RayPipelineState* ps, uint32_t n);
 void ray_pipeline_set_t5_sensor_tile_size(RayPipelineState* ps, uint32_t n);
+void ray_pipeline_set_t5_pair_budget(RayPipelineState* ps, uint64_t n);
+void ray_pipeline_set_t5_backlog_policy(RayPipelineState* ps,
+                                        float share_base, float share_max,
+                                        int max_snapshots, uint64_t max_bytes);
+void ray_pipeline_set_bdpt_record_float_budget(RayPipelineState* ps, uint64_t n_floats);
 void ray_pipeline_set_t5_profile(RayPipelineState* ps, bool v);
+void ray_pipeline_set_vcm(RayPipelineState* ps, bool enabled,
+                          float merge_radius_m, float radius_alpha);
+void ray_pipeline_set_max_children(RayPipelineState* ps, int n);
 void ray_pipeline_set_force_cpu_t5(RayPipelineState* ps, bool v);
 
 /* Live-update the flash light modifier applied in submit_emissive_triangles. */
